@@ -406,8 +406,11 @@ def _evaluation(scenario, graphs, report, graph_id, tier, prepared=None):
     return _ReplayEvaluation(
         graph_id, scenario.step, tier, report["duration_ms"], tuple(rows), pipelines,
         _wave_breakdown_from_report(report), report.get("engine_backend") or "",
-        int(evidence.get("native_steps", 0)), evidence, dict(service),
-        _representative_cohorts(cohort_replicas), cohort_replicas,
+        int(evidence.get("native_steps", 0)),
+        execution_evidence=evidence,
+        service_intervals=dict(service),
+        cohort_intervals=_representative_cohorts(cohort_replicas),
+        cohort_replicas=cohort_replicas,
     )
 
 def _combine_replays(rows):

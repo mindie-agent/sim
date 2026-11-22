@@ -737,6 +737,7 @@ def _resolve_collective_startup_and_hbm(
         float(topology.collective_device_step_us(
             collective, group, alpha_us=float(band.startup_us), stack=stack,
             phase_count=max(1, len(phases)), total_rounds=total_rounds,
+            startup_scope=str(getattr(band, "startup_scope", "step") or "step"),
         ))
         if hasattr(topology, "collective_device_step_us") else 0.0
     )

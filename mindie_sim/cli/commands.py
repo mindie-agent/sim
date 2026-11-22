@@ -247,6 +247,30 @@ def _dispatch_sdk(args: argparse.Namespace) -> object | None:
                     "draft_prepare": args.draft_prepare,
                     "deployment_scope": "first_independent_dp_cohort",
                 }
+        if view == "graph":
+            from mindie_sim.prediction.graph_analysis import graph_costs
+            from mindie_sim.prediction.operator_analysis import target_graphs
+            case = parse_case(raw)
+            ops = target_graphs(
+                case, phase=args.phase, tokens=args.tokens, context=args.context,
+                sequences=args.sequences, scope=args.scope,
+                media_tokens_per_sequence=args.media_tokens_per_sequence,
+                draft_prepare=args.draft_prepare,
+            )
+            with PrimitiveStore(args.primitives) if args.primitives else nullcontext(None) as store:
+                return {
+                    **graph_costs(
+                        case, ops, primitives=store,
+                        include_submission=bool(args.include_submission),
+                        isolated=bool(args.isolated),
+                    ),
+                    "graph_scope": args.scope,
+                    "tokens_per_sequence": args.tokens,
+                    "sequences": args.sequences,
+                    "sequences_per_replica": args.sequences,
+                    "draft_prepare": args.draft_prepare,
+                    "deployment_scope": "first_independent_dp_cohort",
+                }
         req = StepRequest(
             phase=args.phase,
             tokens=args.tokens,

@@ -287,13 +287,15 @@ def solve_five_level_ladder(
     case, request: StepRequest, *, spine=None, replay: ReplayOptions = ReplayOptions(),
     primitives=None, primitive_table: CapacityTable | None = None,
     stack_id: str = "cann93_va_main", max_trials: int = DEFAULT_LADDER_TRIALS,
+    allow_unbound_formula: bool = False,
 ) -> FiveLevelReport:
     from mindie_sim.rewrite.oracle import EvalBudget, ScenarioRequest, _baseline, prepare_scenario
     from mindie_sim.rewrite.verify import SoundnessInversionError
 
     scenario_request = ScenarioRequest(case, request, stack_id, replay, primitive_table=primitive_table)
     dossier = prepare_scenario(scenario_request, budget=EvalBudget(deadline_mono=replay.deadline_mono),
-                               spine=spine, primitives=primitives, primitive_table=primitive_table)
+                               spine=spine, primitives=primitives, primitive_table=primitive_table,
+                               allow_unbound_formula=bool(allow_unbound_formula))
     scenario = _resolved(dossier)
     program, dag, names = build_dual_inputs_from_scenario(scenario)
     _, pricing = certify_lower_bound(program, dag)
@@ -311,7 +313,7 @@ def solve_five_level_ladder(
                           tight_resources=tuple(names_by_index[name] for name in subgradient.tight_resources))
     lower_bound = certificate.l_star_lean_ns
     hw_bound = None
-    if primitive_table is not None:
+    if primitive_table not in (None, False):
         hw_prog, hw_dag, _ = build_dual_inputs_from_scenario(
             resolved, primitive_table=primitive_table, rate_mode="certified_upper_capacity", **binding,
         )

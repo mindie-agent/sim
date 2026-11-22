@@ -517,11 +517,17 @@ def test_vector_modes_follow_device_and_machine_overrides_without_moving_mte1():
     assert Case.from_mapping(explicit_mach.to_dict()) == explicit_mach
     for role, amt in (("ub_copy", 1e9), ("reg_issue_slots", 1e6)):
         r0 = dict(die0.service_modes)[role][1]
-        before, after = one_owner_ms(base, role, amt), one_owner_ms(half, role, amt)
+        before = one_owner_ms(base, role, amt, primitive_table=False)
+        after = one_owner_ms(half, role, amt, primitive_table=False)
         assert before == pytest.approx(amt * aiv / r0 * 1000) and after == pytest.approx(2 * before)
         for case in (explicit_dev, explicit_mach):
-            assert one_owner_ms(case, role, amt) == pytest.approx(before if role == "ub_copy" else after)
-    assert one_owner_ms(base, "mte1", AMOUNT) == one_owner_ms(half, "mte1", AMOUNT)
+            assert one_owner_ms(case, role, amt, primitive_table=False) == pytest.approx(
+                before if role == "ub_copy" else after
+            )
+    assert (
+        one_owner_ms(base, "mte1", AMOUNT, primitive_table=False)
+        == one_owner_ms(half, "mte1", AMOUNT, primitive_table=False)
+    )
 
 
 def test_split_mte_convenience_explicit_roles_and_neutral_pipe_aliases_reach_engine():

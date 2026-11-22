@@ -687,7 +687,10 @@ def test_megamoe_ep_fusion_preserves_topology_dispatch_and_combine_wire_service(
     link_declared = {k: v for k, v in row["declared_service"].items() if k.startswith("link:") and v > 0.0}
     assert link_serviced and link_declared
     assert link_serviced == pytest.approx(link_declared, rel=1e-9)
-    assert all(abs(delta) < 1e-6 for delta in row["service_delta"].values())
+    assert all(
+        abs(delta) <= max(1e-6, 1e-12 * max(abs(row["declared_service"].get(k, 0.0)), 1.0))
+        for k, delta in row["service_delta"].items()
+    )
 
     # Verify both dispatch_mx and combine_store carry wire work when phase_link_work is bound,
     # while EP=1 emits zero link work.

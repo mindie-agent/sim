@@ -618,7 +618,7 @@ def _evaluate_pd_stages(
     p_dp = int(p_parsed.runtime.parallel.dp)
     p_dcp_ok, p_dcp_reason = validate_vllm_ascend_dcp_codomain(p_parsed.model, p_parsed.runtime.parallel)
     prefill_role_error = None if p_dcp_ok else f"prefill:{p_dcp_reason}"
-    hit_tokens = int(math.floor(prompt * hit_r)) if mode == "pooled_dram_ssd" else 0
+    hit_tokens = min(int(math.floor(prompt * hit_r)), max(0, prompt - 1)) if mode == "pooled_dram_ssd" else 0
     compute_tokens = max(0, prompt - hit_tokens)
     p_mem, prefill_hbm_ok, p_slots, p_step = _measure_prefill_stage(
         p_parsed, prompt=prompt, compute_tokens=compute_tokens, hit_tokens=hit_tokens,

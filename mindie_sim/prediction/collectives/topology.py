@@ -422,6 +422,7 @@ class Topology(_TopologyPlansMixin):
     def collective_device_step_us(
         self, collective: str, group: tuple[int, ...], *,
         alpha_us: float, stack: str, phase_count: int = 1, total_rounds: int = 1,
+        startup_scope: str = "step",
     ) -> float:
         """Derive collective startup from sealed P15/P16/P17/P20 STARS/AIV steps."""
         if not self._has_primitive_table or not group or len(group) < 2:
@@ -434,15 +435,26 @@ class Topology(_TopologyPlansMixin):
             return 0.0
         min_ar_rounds = ALLREDUCE_DEVICE_PHASES if (collective == "allreduce" and len(group) == 2) else 1
         eff_rounds = max(int(total_rounds), int(phase_count), min_ar_rounds)
-        entry_us = (
-            STARS_SYNC_EVENTS_PER_STEP * ev
-            + first
-            + issue
-            + float(alpha_us)
-        )
-        round_comm_us = STARS_SYNC_EVENTS_PER_STEP * ev + float(alpha_us)
+        scope = str(startup_scope or "step").strip().lower()
+        if scope == "phase":
+            entry_us = STARS_SYNC_EVENTS_PER_STEP * ev + first + issue
+            round_comm_us = STARS_SYNC_EVENTS_PER_STEP * ev
+            alpha_total_us = float(max(1, int(phase_count))) * float(alpha_us)
+        elif scope == "collective":
+            entry_us = STARS_SYNC_EVENTS_PER_STEP * ev + first + issue
+            round_comm_us = STARS_SYNC_EVENTS_PER_STEP * ev
+            alpha_total_us = float(alpha_us)
+        else:
+            entry_us = (
+                STARS_SYNC_EVENTS_PER_STEP * ev
+                + first
+                + issue
+                + float(alpha_us)
+            )
+            round_comm_us = STARS_SYNC_EVENTS_PER_STEP * ev + float(alpha_us)
+            alpha_total_us = 0.0
         kernel_us = vec * float(ALLREDUCE_DEVICE_PHASES if collective == "allreduce" else 1)
-        total_us = entry_us + float(eff_rounds) * round_comm_us + kernel_us
+        total_us = entry_us + float(eff_rounds) * round_comm_us + alpha_total_us + kernel_us
         if stack == "eager":
             host_sync_us = self._p17_eager_sync_us or self._p20_pinned_d2h_startup_us
             eff_phases = max(1, int(phase_count))

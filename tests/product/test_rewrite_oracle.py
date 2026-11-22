@@ -404,8 +404,12 @@ def _catalog_case():
     return compose_case("qwen3-32b", REPRESENTATIVE_SKUS["a5"], tp=1, dp=1, layers=1)
 
 
-def _replay_plans(case, ops, proposals):
-    dossier = prepare_scenario(ScenarioRequest(case, StepRequest("decode")), spine=_DeclaredGraphSpine(*ops))
+def _replay_plans(case, ops, proposals, *, primitive_table=None):
+    dossier = prepare_scenario(
+        ScenarioRequest(case, StepRequest("decode"), primitive_table=primitive_table),
+        spine=_DeclaredGraphSpine(*ops),
+        primitive_table=primitive_table,
+    )
     handle = dossier.handle
     path = handle.scenario.datapath
     for (operation,), spec in proposals(ops, path, path.aic_count, path.aiv_count):
@@ -458,7 +462,7 @@ def test_catalog_replay_preserves_directional_hbm_service(alpha):
     die = replace(die, hbm_read_bytes_per_s=rate, hbm_write_bytes_per_s=rate, hbm_rw_alpha=alpha,
                   rates=tuple(dict(die.rates, hbm=rate).items()))
     case = replace(case, machine=replace(case.machine, dies=(die,)))
-    handle, plan, spec = next(_replay_plans(case, (op,), _catlass_proposals))
+    handle, plan, spec = next(_replay_plans(case, (op,), _catlass_proposals, primitive_table=False))
     full = _replay_checked(handle, plan)
     context = handle.evaluation_context
     execution = Execution(case, context.cost, recipes=handle.recipe_book, bindings=context.bindings,

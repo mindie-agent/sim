@@ -202,12 +202,12 @@ def test_unmerge_winner_has_empty_leave_one_out_despite_shipping_regression():
     case = _case(REPRESENTATIVE_SKUS["a5"], tp=1)
     step = StepRequest("prefill", tokens=64)
     dossier = prepare_scenario(ScenarioRequest(case, step))
-    report = api.optimize_ladder(case, step)
+    report = api.optimize_ladder(case, step, max_trials=0)
     assert report.dsl_plan == dossier.unmerge_plan and not report.dsl_plan.edits
     assert report.waterfall.loo_impacts == ()
     regression = report.waterfall.shipping_regression
     assert regression == report.verification.shipping_regression
-    assert regression.delta_ns == dossier.m_wall_ns - dossier.u_wall_ns == 8658
+    assert regression.delta_ns == dossier.m_wall_ns - dossier.u_wall_ns == 8937
     assert report.ladder.delta_shipping_ns == -regression.delta_ns
     assert regression.loo_culprits == ((SHIPPING_OVERLAY, -regression.delta_ns),)
 

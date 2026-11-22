@@ -106,8 +106,12 @@ def op(name: str, recipe: str, stream: str = "main") -> OpSpec:
                   recipe=recipe, stream=stream, dtype="bf16")
 
 
-def run(case, ops, recipes, **kwargs) -> dict:
-    result = graph_costs(case, tuple(ops), recipes=RecipeBook(recipes),
+def run(case, ops, recipes, *, primitive_table=None, **kwargs) -> dict:
+    book = RecipeBook(recipes)
+    if primitive_table is not None and "evaluation" not in kwargs:
+        from mindie_sim.prediction.evaluation import EvaluationContext
+        kwargs["evaluation"] = EvaluationContext.create(case, book, primitive_table=primitive_table)
+    result = graph_costs(case, tuple(ops), recipes=book,
                          isolated=False, trace_limit=200, **kwargs)
     assert result["execution"]["live_tasks"] == 0
     assert result["execution"]["live_programs"] == 0
@@ -115,8 +119,8 @@ def run(case, ops, recipes, **kwargs) -> dict:
     return result
 
 
-def one_owner_ms(case, role: str, amount: float, owner: int = 0) -> float:
-    return run(case, (op(role, role),), {role: OneMode(role, amount, owner)})["duration_ms"]
+def one_owner_ms(case, role: str, amount: float, owner: int = 0, **kwargs) -> float:
+    return run(case, (op(role, role),), {role: OneMode(role, amount, owner)}, **kwargs)["duration_ms"]
 
 
 class OneMode:

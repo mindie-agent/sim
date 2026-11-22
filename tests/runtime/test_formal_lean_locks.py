@@ -517,10 +517,10 @@ def test_edited_collective_schedule_preserves_certified_bound():
     scenario = dossier.handle.scenario
     collective = next(op for op in scenario.atomic_ops[0].ops if op.family == "allreduce")
     route, = scenario.case.machine.links
-    edit = Edit("ring", operation=CollectiveTransform(OpRef("atom", collective.op_id), "ring", route.name))
+    edit = Edit("oneshot", operation=CollectiveTransform(OpRef("atom", collective.op_id), "oneshot", route.name))
     edited = finalize_plan(dossier.handle, replace(dossier.unmerge_plan, edits=(edit,)))
     row = next(row for row in edited.step_eval.operators if row.occurrence.op_id == collective.op_id)
-    assert edited.verification.passed and row.implementation == "RingCollective"
+    assert edited.verification.passed and row.implementation == "OneShotCollective"
     assert 0 < ladder.l_star_lean_ns == edited.verification.l_star_ns <= edited.wall_ns
     assert edited.wall_ns != dossier.u_wall_ns
 

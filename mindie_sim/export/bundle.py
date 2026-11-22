@@ -1719,11 +1719,14 @@ def _build_bundle_memory_and_sla(
         max((int(getattr(req, "output_tokens", 0) or 0) for req in parsed.workload.requests), default=0)
         if parsed.workload.requests else 0
     )
+    req_ctx = int(step_req.context)
+    if req_ctx <= 0 and step_req.requests:
+        req_ctx = max((int(getattr(v, "context", 0) or 0) for v in step_req.requests), default=0)
     horizon_tokens = (
         max(int(step_req.tokens), declared_out)
         if step_req.phase == "decode" else int(step_req.tokens)
     )
-    ledger_seq_len = max(int(step_req.context) + horizon_tokens, int(step_req.tokens))
+    ledger_seq_len = max(req_ctx + horizon_tokens, int(step_req.tokens))
     mem_ledger = compute_memory_quant_ledger(
         parsed, phase=step_req.phase,
         seq_len=ledger_seq_len,

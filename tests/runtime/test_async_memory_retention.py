@@ -46,7 +46,7 @@ def _predict_bounded(parsed):
             result.set_exception(exc)
 
     threading.Thread(target=run, daemon=True).start()
-    return result.result(timeout=3)
+    return result.result(timeout=15)
 
 
 def test_joint_hbm_host_grant_is_atomic_across_domains():

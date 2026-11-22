@@ -319,6 +319,9 @@ def _auto_solve_report_layout(
     dep = "colocated" if deployment_mode == "colocated" else (
         "pd_disaggregated" if deployment_mode.startswith("pd_") else "auto"
     )
+    if dep == "pd_disaggregated" and int(num_devices) < 2:
+        from mindie_sim.schema.common import ModelingError
+        raise ModelingError(f"pd_disaggregated_requires_at_least_two_devices:{int(num_devices)}")
     pooling = {"pd_pooled": True, "pd_unpooled": False}.get(deployment_mode)
     solved = solve_optimal_deployment(
         model,

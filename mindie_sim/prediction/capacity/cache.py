@@ -70,7 +70,7 @@ class _MemoryCacheMixin:
         """
         base = list(
             self.cache_bytes(tokens, padded=padded)
-            if query_tokens is None
+            if query_tokens is None or max(1, int(query_tokens)) == self.query_tokens
             else self.cache_bytes(tokens, padded=padded, query_tokens=query_tokens)
         )
         p = self.case.runtime.parallel

@@ -99,8 +99,8 @@ def test_dispatch_projects_prepared_work_from_declared_architecture(hardware, sp
 def _iteration(op, *others, replay_scope="none"):
     plan = IterationPlan((RequestView("r", 1, 0, True, "prefill"),))
     return IterationWork((op, *others), plan, 1, 1, 1, None, "prefill", "source", replay_scope=replay_scope)
-def _execute(case, book, iteration):
-    execution = Execution(case, CostModel(case), recipes=book)
+def _execute(case, book, iteration, *, bindings=None):
+    execution = Execution(case, CostModel(case), recipes=book, bindings=bindings)
     done = execution.add(iteration, 0, 0).completion
     execution.engine.advance(until=(done,))
     return done.time, execution
@@ -348,11 +348,13 @@ def test_resource_envelope_cannot_execute_even_when_bound_to_a_recipe():
         operator_costs(hardware_case(), (op,), recipes=RecipeBook({op.recipe: ResourceEnvelope()}))
 @pytest.mark.parametrize("name", (*EXTENSIONS[:3], "moe_align"))
 def test_bound_source_work_matches_iteration_and_expansion_is_idempotent(name):
+    from mindie_sim.prediction.evaluation import EvaluationContext
     module, op, case = _source_case(name)
     expand = getattr(module, "kernels", None)
     book = RecipeBook({op.recipe: PlannedRecipe(module.build, expand)})
     isolated = operator_costs(case, (op,), recipes=book)
-    duration, execution = _execute(case, book, _iteration(op))
+    bindings = EvaluationContext.create(case, book).bindings
+    duration, execution = _execute(case, book, _iteration(op), bindings=bindings)
     assert duration == pytest.approx(isolated["operator_sum_ms"]) and duration > 0
     expected = Counter()
     for row in isolated["operators"]:

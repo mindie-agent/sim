@@ -277,10 +277,10 @@ class StepEvaluation:
     accel_backend: str = ""
     native_steps: int = 0
     primitive_table: object | None = field(
-        default=None, repr=False, compare=False, metadata={"wire": False},
+        default=None, repr=False, compare=False, kw_only=True, metadata={"wire": False},
     )
     streams: tuple[StreamPlan, ...] = field(
-        default=(), repr=False, compare=False, metadata={"wire": False},
+        default=(), repr=False, compare=False, kw_only=True, metadata={"wire": False},
     )
 
     def __reduce__(self):

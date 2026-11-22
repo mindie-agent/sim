@@ -95,7 +95,8 @@ def _capacity_fixture(monkeypatch, *, async_scheduling: bool = True,
     raw["machine"]["device"]["memory_bytes"] = int(fixed + budget_kib * 1024)
     parsed = parse_case(raw)
 
-    def page_bytes(self, tokens, *, padded=True):
+    def page_bytes(self, tokens, *, padded=True, query_tokens=None):
+        _ = query_tokens
         rows = (math.ceil(max(1, int(tokens)) / 128) * 128
                 if padded else max(1, int(tokens)))
         return tuple([float(rows * 1024)]

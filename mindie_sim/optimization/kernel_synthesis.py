@@ -928,11 +928,19 @@ def _extract_hardware_supply(
         if overlay.hbm_rw21_bytes_per_s is not None:
             service_modes["hbm_rw21_dram"] = ("hbm", overlay.hbm_rw21_bytes_per_s)
 
-    link_bps = 0.0
+    link_bps = float(rates.get("link") or 0.0)
     link_lat_us = 0.0
     if links:
-        best = max(links, key=lambda item: float(getattr(item, "capacity_gbps", 0.0) or 0.0))
-        link_bps = float(getattr(best, "capacity_gbps", 0.0) or 0.0) * BYTES_PER_GB
+        def _link_bps(item: Any) -> float:
+            b_per_ms = float(getattr(item, "capacity_bytes_per_ms", 0.0) or 0.0)
+            if b_per_ms > 0.0:
+                return b_per_ms * MS_PER_SECOND
+            return float(getattr(item, "capacity_gbps", 0.0) or 0.0) * BYTES_PER_GB
+
+        best = max(links, key=_link_bps)
+        best_bps = _link_bps(best)
+        if best_bps > 0.0:
+            link_bps = best_bps
         link_lat_us = float(getattr(best, "latency_us", 0.0) or 0.0)
     return datapath, rates, peaks, service_modes, launch_vec, launch_cube, link_bps, link_lat_us
 
