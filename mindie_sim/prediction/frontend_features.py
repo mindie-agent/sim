@@ -551,7 +551,7 @@ class FeatureConfig:
     def max_bucket(self) -> int: return max(self.graph_buckets) if self.graph_buckets else 0
 
     def project(self, *, tp: int = 0, dp: int = 0, ep: int = 0, pp: int = 0,
-                cores: int = 0, graph_buckets: Iterable[int] | None = None,
+                cores: int | None = None, graph_buckets: Iterable[int] | None = None,
                 kv_dtype: str = "", kv_bf16_override: bool = False) -> "FeatureConfig":
         tp_v, dp_v = max(1, tp or self.tp), max(1, dp or self.dp)
         ep_v = max(1, int(ep or self.ep))
@@ -567,7 +567,7 @@ class FeatureConfig:
                                                       if graph_buckets is None or not tuple(graph_buckets)
                                                       else tuple(graph_buckets)),
                                        metadata=tuple(sorted(meta.items())))
-        if cores > 0: updates["cores"] = int(cores)
+        if cores is not None and cores > 0: updates["cores"] = int(cores)
         if kv_dtype: updates["kv_dtype"] = kv_dtype
         return replace(self, **updates)
 

@@ -13,14 +13,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Mapping
 
-from mindie_sim.schema.common import dtype_bytes
+from mindie_sim.schema.common import ModelingError, dtype_bytes
 from mindie_sim.schema.operators import OpSpec
 from mindie_sim.prediction.mechanism import Geometry
 
 FP32_ACCUMULATOR_BYTES = int(dtype_bytes("fp32"))
 VARLEN_QUERY_INDEX_BITS = 32
 MAX_EXPLICIT_HOST_TOKEN_BLOCKS = 128
-DEFAULT_AIC_CORES = 32
 
 IMPLEMENTATION = "causal_conv1d_arch35_fn"
 
@@ -37,8 +36,6 @@ DIM_ALIGN_ELEMS = 16
 MAX_DIM_TILE_SIZE = 4096
 UB_RESERVED_BYTES = 512
 FN_UB_RESERVED_BYTES = 512
-DEFAULT_CORE_NUM = 64
-DEFAULT_UB_BYTES = 253952
 ASCENDC_RESERVED_WORKSPACE_SIZE = 16 * 1024 * 1024
 INIT_STATE_SYNC_BYTES_PER_BLOCK = 32
 PAIR_TOKENS = 2
@@ -502,14 +499,67 @@ def _config_from_op(op: OpSpec) -> _Config:
     )
 
 
-def make_op(params: dict) -> OpSpec:
+def _require_positive_hw_int(value, reason: str) -> int:
+    if value is None or isinstance(value, bool):
+        raise ModelingError(reason)
+    try:
+        number = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ModelingError(reason) from exc
+    if number <= 0:
+        raise ModelingError(reason)
+    return number
+
+
+def _resolve_cores_and_ub(geometry, core_num, ub_bytes) -> tuple[int, int]:
+    if geometry is not None:
+        raw_cores = geometry.resource_units.get("vector", geometry.compute_units)
+        raw_ub = geometry.buffers.get("ub") if hasattr(geometry, "buffers") else None
+        if core_num is None:
+            core_num = raw_cores
+        if ub_bytes is None:
+            ub_bytes = raw_ub
+    resolved_cores = _require_positive_hw_int(core_num, "causal_conv_requires_explicit_cores")
+    resolved_ub = _require_positive_hw_int(ub_bytes, "causal_conv_requires_explicit_ub_bytes")
+    return resolved_cores, resolved_ub
+
+
+def make_op(
+    params: dict, *, geometry=None, core_num: int | None = None, ub_bytes: int | None = None,
+) -> OpSpec:
     """Explicit geometry adapter for the native arch35 FN varlen branch."""
     cfg = _parse_params(params)
-    host = _host_tiling(cfg, DEFAULT_CORE_NUM, DEFAULT_UB_BYTES)
-    if not host["valid"]:
-        raise ValueError("native causal_conv1d FN cannot tile this geometry")
+    has_hw = geometry is not None or core_num is not None or ub_bytes is not None
+    if has_hw:
+        resolved_cores, resolved_ub = _resolve_cores_and_ub(geometry, core_num, ub_bytes)
+        host: dict | None = _host_tiling(cfg, resolved_cores, resolved_ub)
+        if not host["valid"]:
+            raise ValueError("native causal_conv1d FN cannot tile this geometry")
+        execution_plan = host["execution_plan"]
+        has_init_flag = bool(host["has_initial_state"])
+        has_init_workspace = bool(host["has_init_state_workspace"])
+        has_explicit_ranges = bool(host["has_explicit_token_seq_ranges"])
+        workspace_bytes = host["workspace_bytes"]
+        sync_workspace_bytes = host["sync_workspace_bytes"]
+        snapshot_workspace_bytes = host["snapshot_workspace_bytes"]
+        padded_tokens = host["token_block_count"] * host["token_block_size"]
+    else:
+        host = None
+        execution_plan = "CUTBS" if cfg.dim <= MAX_DIM_TILE_SIZE else "CUTBSD"
+        has_init_flag = bool(cfg.has_init_flag)
+        has_init_workspace = bool(cfg.has_init_workspace)
+        has_explicit_ranges = False
+        snapshot_workspace_bytes = (
+            cfg.batch * cfg.history_count * cfg.dim * 2 if has_init_workspace else 0
+        )
+        sync_workspace_bytes = 0
+        workspace_bytes = (
+            ASCENDC_RESERVED_WORKSPACE_SIZE + snapshot_workspace_bytes
+            if has_init_workspace else 0
+        )
+        padded_tokens = cfg.cu_seqlen
     width_key = cfg.width - 1
-    fn_plan_key = 1 if host["execution_plan"] == "CUTBS" else 2
+    fn_plan_key = 1 if execution_plan == "CUTBS" else 2
     dispatch = {
         "implementation": IMPLEMENTATION,
         "source_branch": "arch35_fn_varlen",
@@ -519,7 +569,7 @@ def make_op(params: dict) -> OpSpec:
         "has_bias": cfg.bias,
         "run_mode": 0,
         "input_mode": "varlen",
-        "execution_plan": host["execution_plan"],
+        "execution_plan": execution_plan,
         "fn_plan_key": fn_plan_key,
         "width": cfg.width,
         "width_key": width_key,
@@ -527,9 +577,9 @@ def make_op(params: dict) -> OpSpec:
         "metadata_placement": cfg.metadata_placement,
         "has_cache_indices": cfg.cache_index_present,
         "cache_index_bound": cfg.cache_index_bound,
-        "has_initial_state": bool(host["has_initial_state"]),
-        "has_init_state_workspace": bool(host["has_init_state_workspace"]),
-        "has_explicit_token_seq_ranges": bool(host["has_explicit_token_seq_ranges"]),
+        "has_initial_state": has_init_flag,
+        "has_init_state_workspace": has_init_workspace,
+        "has_explicit_token_seq_ranges": has_explicit_ranges,
         "has_num_accepted_tokens": False,
         "head_num": 0,
         "has_conv_states": bool(cfg.has_conv_states),
@@ -542,7 +592,7 @@ def make_op(params: dict) -> OpSpec:
         "rolling_cost": "source_register_capacity_projection",
         "null_block_id": cfg.null_block_id,
         "pad_slot_id": cfg.pad_slot_id,
-        "sync_all": bool(host["has_init_state_workspace"]),
+        "sync_all": has_init_workspace,
         "one_native_launch": True,
     }
     metadata = {
@@ -575,22 +625,19 @@ def make_op(params: dict) -> OpSpec:
         "pad_slot_id": cfg.pad_slot_id,
         "dispatch": dispatch,
         "host_tiling": host,
-        "default_core_num": DEFAULT_CORE_NUM,
-        "default_ub_bytes": DEFAULT_UB_BYTES,
         "run_mode": 0,
         "head_num": 0,
         "source_kernel_launches": 1,
         "state_update": "sequence_tail",
-        "workspace_enabled": bool(host["has_init_state_workspace"]),
+        "workspace_enabled": has_init_workspace,
         "workspace_pool": "workspace",
         "workspace_lifetime": "first_acquire_to_last_conv_block",
-        "workspace_bytes": host["workspace_bytes"],
-        "sync_workspace_bytes": host["sync_workspace_bytes"],
-        "snapshot_workspace_bytes": host["snapshot_workspace_bytes"],
+        "workspace_bytes": workspace_bytes,
+        "sync_workspace_bytes": sync_workspace_bytes,
+        "snapshot_workspace_bytes": snapshot_workspace_bytes,
         "reserved_workspace_bytes": (ASCENDC_RESERVED_WORKSPACE_SIZE
-                                     if host["has_init_state_workspace"] else 0),
+                                     if has_init_workspace else 0),
     }
-    padded_tokens = host["token_block_count"] * host["token_block_size"]
     semantic = (cfg.cu_seqlen, cfg.dim)
     padded = (padded_tokens, cfg.dim)
     return OpSpec(
@@ -603,25 +650,11 @@ def make_op(params: dict) -> OpSpec:
     )
 
 
-def _default_geometry():
-    return Geometry(DEFAULT_AIC_CORES, {"vector": DEFAULT_CORE_NUM}, {"ub": DEFAULT_UB_BYTES},
-                    {"ub": DEFAULT_CORE_NUM})
-
-
 def host_tiling(op_or_params, geometry=None, *, core_num=None, ub_bytes=None) -> dict:
-    """Public host-tiling projection for independent comparison.
-
-    ``geometry`` supplies AIV count and UB size.  With no geometry, the source
-    hardware defaults (64 AIV, 253952 UB) are used; these are the values behind
-    the coordinator's fixed expected_planner entries.
-    """
+    """Public host-tiling projection requiring explicit die cores and UB capacity."""
     if isinstance(op_or_params, OpSpec):
         cfg = _config_from_op(op_or_params)
     else:
         cfg = _parse_params(op_or_params)
-    if geometry is not None:
-        core_num = geometry.resource_units.get("vector", geometry.compute_units)
-        ub_bytes = geometry.buffers.get("ub", DEFAULT_UB_BYTES)
-    return _host_tiling(cfg,
-                        DEFAULT_CORE_NUM if core_num is None else int(core_num),
-                        DEFAULT_UB_BYTES if ub_bytes is None else int(ub_bytes))
+    resolved_cores, resolved_ub = _resolve_cores_and_ub(geometry, core_num, ub_bytes)
+    return _host_tiling(cfg, resolved_cores, resolved_ub)

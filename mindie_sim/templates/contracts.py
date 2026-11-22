@@ -82,8 +82,8 @@ def attn_res_ub_footprint(d, tile_t, depth):
     )
 
 
-def attn_res_tiling(tokens, aiv, ub_bytes=ATTN_RES_UB_BYTES):
-    if min(tokens, aiv) < 1:
+def attn_res_tiling(tokens, aiv, ub_bytes):
+    if min(tokens, aiv, ub_bytes) < 1:
         raise ModelingError("attn_res_problem_invalid")
     rows = ceil_div(tokens, aiv)
     d = ATTN_RES_HIDDEN_SIZE

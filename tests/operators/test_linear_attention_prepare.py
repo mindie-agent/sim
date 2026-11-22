@@ -206,7 +206,7 @@ def test_historical_conv_call_retains_bias_device_flags_and_real_state_rows():
     assert metadata["bias"] is True and metadata["has_initial_state"] == (False,)
     assert metadata["cache_indices"] == (1,)
     assert (metadata["state_rows"], metadata["state_history_slots"]) == (2, 3)
-    assert convolution.host_tiling(op)["has_init_state_workspace"] == 1
+    assert convolution.host_tiling(op, core_num=64, ub_bytes=253952)["has_init_state_workspace"] == 1
     base = dict(conv_width=16, kernel=4, bias=True, cache_indices=(0, 1), state_cache_rows="batch+1")
     explicit = make_call("conv_prefill", dict(base, lengths=(1, 3), cu_seqlens=(0, 1, 4)))
     cumulative = make_call("conv_prefill", dict(base, cu_seqlens=(0, 1, 4)))

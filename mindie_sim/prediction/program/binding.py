@@ -39,7 +39,6 @@ from ..runtime.prepared_terms import (
 from .stages import KernelProgram, ParallelProgram, Program, Stage
 
 _MS_PER_SECOND = 1000.0
-_DEFAULT_VECTOR_CLOCK_HZ = 1_000_000_000.0
 _DATACOPY_PRIMITIVE = "P01_datacopy"
 
 
@@ -479,11 +478,18 @@ class RecipeContext:
             if rname in self.rates:
                 pipe_rates[pipe] = float(self.rates[rname])
                 res_map[pipe] = rname
-        resolved_clock = (
-            float(clock_hz)
+        raw_clock = (
+            clock_hz
             if clock_hz is not None
-            else float(getattr(self.compute_arch, "clock_hz", _DEFAULT_VECTOR_CLOCK_HZ))
+            else getattr(self.compute_arch, "clock_hz", None)
         )
+        if raw_clock is None and self.datapath is not None:
+            raw_clock = getattr(self.datapath, "clock_hz", None)
+        if raw_clock is None or isinstance(raw_clock, bool):
+            raise ModelingError("bind_vector_clock_hz_missing")
+        resolved_clock = float(raw_clock)
+        if not math.isfinite(resolved_clock) or resolved_clock <= 0.0:
+            raise ModelingError("bind_vector_clock_hz_missing")
         return bind_vector_groups(
             groups,
             issue_rate_per_ms=float(self.rates[issue_name]),

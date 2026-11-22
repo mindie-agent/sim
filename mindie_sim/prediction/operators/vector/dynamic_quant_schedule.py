@@ -660,11 +660,13 @@ def _cached_timeline(rate_key: tuple, unit_key: tuple, rows: int, row_len: int,
 def quant_timeline(*, rates: Mapping[str, float], units: Mapping[str, int],
                    rows: int, row_len: int, source_bytes: float, y_bytes: float,
                    scale_bytes: float, ub_bytes: int, has_smooth: bool = False,
-                   aiv: int = 1) -> dict[str, Any]:
+                   aiv: int) -> dict[str, Any]:
     """Per-owner CopyIn, dependent VFs, and y/scale writes.
 
     The cache is the engine run for one physical shape. It is not a report.
     """
+    if isinstance(aiv, bool) or not isinstance(aiv, int) or aiv <= 0:
+        raise ModelingError("dynamic_quant_requires_positive_aiv")
     raw = _cached_timeline(
         _freeze_pairs(rates, float), _freeze_pairs(units, int),
         int(rows), int(row_len), float(source_bytes), float(y_bytes),
@@ -688,7 +690,7 @@ def quant_timeline(*, rates: Mapping[str, float], units: Mapping[str, int],
 def quant_program_result(*, rates: Mapping[str, float], units: Mapping[str, int],
                          rows: int, row_len: int, source_bytes: float,
                          y_bytes: float, scale_bytes: float, ub_bytes: int,
-                         has_smooth: bool = False, aiv: int = 1,
+                         has_smooth: bool = False, aiv: int,
                          ) -> tuple[float, str, tuple[str, ...], tuple[tuple[str, Fraction], ...]]:
     """Four-tuple elapsed program. The fifth ledger element is intentionally absent.
 

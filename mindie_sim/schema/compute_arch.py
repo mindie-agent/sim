@@ -230,6 +230,7 @@ class ComputeArchSpec:
     casts: tuple[CastCapability, ...] = ()
     paths: tuple[DataPath, ...] = ()
     runtimes: tuple[RuntimeCapability, ...] = ()
+    clock_hz: float | None = None
 
     # ---- capability queries ------------------------------------------------
     def has_capabilities(self) -> bool:
@@ -397,6 +398,14 @@ class ComputeArchSpec:
             preset_name = str(preset_name)
         else:
             effective = declared
+        raw_clock = effective.get("clock_hz")
+        clock_hz: float | None = None
+        if raw_clock is not None:
+            if isinstance(raw_clock, bool) or not isinstance(raw_clock, (int, float)):
+                raise ModelingError(f"compute_arch_clock_hz_invalid:{raw_clock}")
+            clock_hz = float(raw_clock)
+            if not math.isfinite(clock_hz) or clock_hz <= 0.0:
+                raise ModelingError(f"compute_arch_clock_hz_invalid:{raw_clock}")
         services = _parse_instruction_services(effective.get("instruction_services", {}))
         representations = _parse_representations(effective.get("representations", {}))
         native_modes = _parse_native_modes(effective.get("native_compute", {}))
@@ -412,6 +421,7 @@ class ComputeArchSpec:
             paths=tuple(sorted(paths, key=lambda item: (item.source, item.target,
                                                         item.name))),
             runtimes=tuple(sorted(runtimes, key=lambda item: item.name)),
+            clock_hz=clock_hz,
         )
         spec._validate_declarations()
         return spec
@@ -501,6 +511,8 @@ class ComputeArchSpec:
         result = {}
         if self.preset:
             result["preset"] = self.preset
+        if self.clock_hz is not None:
+            result["clock_hz"] = self.clock_hz
         if self.instruction_services:
             result["instruction_services"] = {
                 item.name: item.to_dict() for item in self.instruction_services}

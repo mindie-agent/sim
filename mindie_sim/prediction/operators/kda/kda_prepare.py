@@ -46,7 +46,6 @@ from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.operators import OpSpec
 from mindie_sim.prediction.operators.vector.mixed_core import placement, require_pair, phase_stages
 
-SOURCE_DEFAULT_AIC_CORES = 32
 SCORE_BLOCK_COUNT = 3
 SOLVE_DIAG_BLOCK_TOKENS = 16
 SOLVE_MERGE_BLOCK_TOKENS = 32
@@ -164,7 +163,31 @@ class Params:
     def gate_tasks(self) -> int:
         return len(self.lengths) * self.heads
 
-    def metadata(self, cores: int = SOURCE_DEFAULT_AIC_CORES) -> dict[str, Any]:
+    def metadata(self, cores: int | None = None) -> dict[str, Any]:
+        core_fields: dict[str, Any] = {}
+        if cores is not None:
+            cores = _positive_int(cores, "kda_prepare_requires_positive_compute_units")
+            core_fields = {
+                "gate_active_aiv": min(self.gate_tasks, 2 * cores),
+                "paired_task_stride": cores,
+                "paired_tasks_per_core": tuple(
+                    _ceil_div(max(0, self.paired_tasks - core), cores)
+                    for core in range(min(cores, self.paired_tasks))),
+            }
+        prepare_scratch: dict[str, Any] = {
+            "aqk_fp32_bytes": self.total_tokens * self.heads * self.chunk * _FP32,
+            "akk_fp32_bytes": self.total_tokens * self.heads * self.chunk * _FP32,
+            "post_wu_separate_bytes": self.total_tokens * self.heads * self.dk * _FP32,
+        }
+        if cores is not None:
+            prepare_scratch["solve_bytes"] = (
+                cores * WORKSPACE_HEADS_PER_CORE * SOLVE_WORKSPACE_MATRICES
+                * self.chunk * self.chunk * _FP32
+            )
+            prepare_scratch["score_bytes"] = (
+                cores * WORKSPACE_HEADS_PER_CORE * SCORE_BLOCK_COUNT
+                * self.chunk * self.dk * _BF16
+            )
         return {
             "lengths": self.lengths,
             "heads": self.heads,
@@ -196,11 +219,7 @@ class Params:
             "headchunks": self.headchunks,
             "paired_tasks": self.paired_tasks,
             "gate_tasks": self.gate_tasks,
-            "gate_active_aiv": min(self.gate_tasks, 2 * cores),
-            "paired_task_stride": cores,
-            "paired_tasks_per_core": tuple(
-                _ceil_div(max(0, self.paired_tasks - core), cores)
-                for core in range(min(cores, self.paired_tasks))),
+            **core_fields,
             "score_block_bf16_flops_per_head": (
                 _SCORE_BF16_HEAD // SCORE_BLOCK_COUNT, 2 * _SCORE_BF16_HEAD // SCORE_BLOCK_COUNT),
             "solve_bf16_flops_absent": True,
@@ -226,14 +245,7 @@ class Params:
             "gate_aux_read_bytes_per_task": GATE_AUX_READ_BYTES,
             "gate_chunk_reset_vector_ops": _GATE_ROW_ELEMENTS,
             "gate_barrier": "global_SyncAll_after_cumsum_before_prepare",
-            "prepare_scratch": {
-                "aqk_fp32_bytes": self.total_tokens * self.heads * self.chunk * _FP32,
-                "akk_fp32_bytes": self.total_tokens * self.heads * self.chunk * _FP32,
-                "solve_bytes": cores * WORKSPACE_HEADS_PER_CORE * SOLVE_WORKSPACE_MATRICES * self.chunk * self.chunk * _FP32,
-                "score_bytes": cores * WORKSPACE_HEADS_PER_CORE * SCORE_BLOCK_COUNT * self.chunk * self.dk * _BF16,
-                "post_wu_separate_bytes": (
-                    self.total_tokens * self.heads * self.dk * _FP32),
-            },
+            "prepare_scratch": prepare_scratch,
             "gm_assumption": "declared_GM_traffic_charged_HBM_no_cache_model; direct_UB_excluded",
             "store_qg": True,
             "factor_vector_lanes_per_head": _FACTOR_VECTOR_HEAD,
@@ -383,8 +395,10 @@ def paired_work() -> Work:
     return headchunk_work().scaled(2)
 
 
-def source_work(params: Params, cores: int = SOURCE_DEFAULT_AIC_CORES) -> Work:
+def source_work(params: Params, cores: int | None = None) -> Work:
     """Conserved aggregate for the whole stage, independent of core count."""
+    if cores is not None:
+        _positive_int(cores, "kda_prepare_requires_positive_compute_units")
     prepare = paired_work().scaled(params.paired_tasks)
     gate = gate_work(params)
     total = gate + prepare
@@ -580,7 +594,7 @@ def make_op(params: Mapping[str, Any], *, op_id: str = "kda_gate_prepare",
             notes: tuple[str, ...] = ()) -> OpSpec:
     parsed = parse_params(params)
     meta = parsed.metadata()
-    total = source_work(parsed, SOURCE_DEFAULT_AIC_CORES)
+    total = source_work(parsed)
     semantic = (parsed.total_tokens, parsed.heads, parsed.dk, parsed.dv)
     return OpSpec(
         op_id=op_id, family="recurrent_local", phase=phase, stage=stage,

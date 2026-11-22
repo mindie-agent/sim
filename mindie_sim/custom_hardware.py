@@ -344,6 +344,15 @@ def _device_mapping(
         raise ModelingError("custom_hardware_capability_must_be_mapping")
     else:
         compute_arch = dict(capability)
+    if compute_arch.get("clock_hz") is None:
+        if explicit.get("clock_hz") is not None:
+            compute_arch["clock_hz"] = _positive_float(explicit["clock_hz"], "clock_hz")
+        elif explicit.get("clock_mhz") is not None:
+            compute_arch["clock_hz"] = _positive_float(explicit["clock_mhz"], "clock_mhz") * 1e6
+        elif merged.get("clock_hz") is not None:
+            compute_arch["clock_hz"] = _positive_float(merged["clock_hz"], "clock_hz")
+        elif merged.get("clock_mhz") is not None:
+            compute_arch["clock_hz"] = _positive_float(merged["clock_mhz"], "clock_mhz") * 1e6
     aiv = int(merged["aiv_count"])
     aic = int(merged["aic_count"])
     buffers = {

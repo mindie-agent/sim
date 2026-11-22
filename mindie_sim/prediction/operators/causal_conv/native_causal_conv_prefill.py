@@ -12,6 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Mapping
 
+from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.operators import OpSpec
 from mindie_sim.prediction.instructions import REGISTER_WORK_ROLES
 from mindie_sim.prediction.mechanism import Geometry, OperatorPlan, Work
@@ -20,9 +21,9 @@ from mindie_sim.prediction.program import KernelProgram, PipelineProgram, Stage
 from mindie_sim.prediction.operators.vector.mixed_core import read_role, split_reads
 from mindie_sim.prediction.operators.causal_conv import native_conv_registers as registers
 from .native_causal_conv_spec import (
-    IMPLEMENTATION, DEFAULT_UB_BYTES, MAX_WIDTH, PAIR_TOKENS,
+    IMPLEMENTATION, MAX_WIDTH, PAIR_TOKENS,
     TOKEN_PIPELINE_SLOTS, UB_RESIDENT_BYTES, _ceil_div, _config_from_op,
-    _default_geometry, _dtype_width, _host_tiling, _parse_params,
+    _dtype_width, _host_tiling, _parse_params, _resolve_cores_and_ub,
     host_tiling, make_op,
 )
 
@@ -592,10 +593,7 @@ def _snapshot_program(context, cfg, host, block, owners):
 
 def build(op: OpSpec, geometry: Geometry) -> OperatorPlan:
     cfg = _config_from_op(op)
-    owners = int(geometry.resource_units.get("vector", geometry.compute_units))
-    ub_bytes = int(geometry.buffers.get("ub", DEFAULT_UB_BYTES))
-    if owners <= 0:
-        raise ValueError("geometry must declare positive vector-unit ownership")
+    owners, ub_bytes = _resolve_cores_and_ub(geometry, None, None)
     if ub_bytes < UB_RESIDENT_BYTES:
         raise ValueError(
             f"UB capacity {ub_bytes} is smaller than the source resident "
@@ -663,15 +661,15 @@ def build(op: OpSpec, geometry: Geometry) -> OperatorPlan:
     return OperatorPlan(work, program)
 
 
-def source_ledger(op_or_params, geometry=None) -> dict:
+def source_ledger(op_or_params, geometry) -> dict:
     """Return deterministic source accounting without executing the program."""
     if isinstance(op_or_params, OpSpec):
         cfg = _config_from_op(op_or_params)
     else:
         cfg = _parse_params(op_or_params)
-    geometry = geometry or _default_geometry()
-    owners = int(geometry.resource_units.get("vector", geometry.compute_units))
-    ub_bytes = int(geometry.buffers.get("ub", DEFAULT_UB_BYTES))
+    if geometry is None:
+        raise ModelingError("causal_conv_requires_explicit_geometry")
+    owners, ub_bytes = _resolve_cores_and_ub(geometry, None, None)
     if ub_bytes < UB_RESIDENT_BYTES:
         raise ValueError(
             f"UB capacity {ub_bytes} is smaller than the source resident "

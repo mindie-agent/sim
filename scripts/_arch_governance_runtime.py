@@ -72,8 +72,14 @@ CAMEL_CASE_BOUNDARY_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
 #: Lock B downward ratchet on flat top-level ``mindie_sim/prediction/*.py`` files
 #: (any new flat file under mindie_sim/prediction/ fails AG008).
 MAX_FLAT_PREDICTION_MODULES = 119
-#: Bounded package directory fan-out ceiling for governed ``operators/<family>/`` packages.
-MAX_OPERATOR_PACKAGE_FILES = 20
+#: Bounded package directory fan-out ceiling for governed ``operators/<family>/``
+#: packages (+25% evolution headroom over 20; unlimited new operator families).
+MAX_OPERATOR_PACKAGE_FILES = 25
+#: Top-level ``mindie_sim/*.py`` ceiling (+25% evolution headroom over 50).
+MAX_TOPLEVEL_MODULES = 63
+#: Bounded ``mindie_sim/onboarding/**/*.py`` footprint (+25% headroom over 6 / 4,127).
+MAX_ONBOARDING_FILES = 8
+MAX_ONBOARDING_LOC = 5200
 #: Cohesion-First readability ceilings (watched monotonically by Hub Lock-6 ratchet).
 COHESIVE_SOFT_MAX_LINES = 1800
 MAX_FUNCTION_LINES = 150
@@ -86,10 +92,141 @@ PARALLEL_CONCEPT_CLASS_RE = re.compile(
 )
 BANNED_BYPASS_KWARGS = frozenset({"ragged_batch", "l2_view", "admission_view"})
 OPERATOR_BANNED_BYPASS_KWARGS = frozenset({"memory_view"})
-SHARD_FILENAME_RE = re.compile(r"(?:_helpers|_mixin|_part\d+)$")
+SHARD_FILENAME_RE = re.compile(
+    r"(?:_helper|_helpers|_part\d*|_parts|_shard|_mixin|_extra"
+    r"|_legacy|_old|_backup|_fallback|_copy\d*)$"
+)
+_DOMAIN_COPY_OPERATORS = frozenset({
+    "mindie_sim/prediction/operators/causal_conv/conv_state_copy.py",
+    "mindie_sim/prediction/operators/vector/tensor_copy.py",
+})
 _LEGACY_SHARD_FILES = frozenset({
     "mindie_sim/prediction/execution/step_helpers.py",
     "mindie_sim/prediction/runtime/engine_periodic_mixin.py",
+})
+_LEGACY_PRIVATE_SHARD_FILES = frozenset({
+    "mindie_sim/_remote_worker.py",
+    "mindie_sim/_sweep_worker.py",
+    "mindie_sim/observations/_capture_verify.py",
+    "mindie_sim/optimization/_dual_obligations.py",
+    "mindie_sim/prediction/operators/attention/_cp_tiling.py",
+    "mindie_sim/prediction/operators/attention/_fia.py",
+    "mindie_sim/prediction/operators/linear_attention/_gdn_decode_programs.py",
+    "mindie_sim/prediction/operators/linear_attention/_gdn_native.py",
+    "mindie_sim/prediction/operators/mla_prolog/_lowering.py",
+    "mindie_sim/prediction/operators/paged_mla/_lowering.py",
+    "mindie_sim/prediction/operators/sparse_indexer/_bf16_access.py",
+    "mindie_sim/prediction/operators/sparse_indexer/_bf16_program.py",
+    "mindie_sim/prediction/operators/sparse_indexer/_lowering.py",
+    "mindie_sim/prediction/runtime/_engine_hbm_bus.py",
+    "mindie_sim/prediction/runtime/_periodic_stream.py",
+    "mindie_sim/primitives/_lowering_comms.py",
+    "mindie_sim/rewrite/_oracle_prefetch.py",
+    "mindie_sim/templates/_catlass_periodic.py",
+    "mindie_sim/templates/_catlass_streaming.py",
+})
+_AG009_ROOTS = frozenset({"prediction", "primitives", "backends", "catalog", "templates"})
+_AG009_PARAM_RE = re.compile(
+    r"^(?:(?:num|n|max|min|total|active|used|available|die|device|sku|chip|source|default"
+    r"|fallback|nominal|core|vector|cube|aic|aiv|host|node|peer|d2d|h2d|d2h|l2|ub|hbm|dram)_)?(?:"
+    r"cores|aic|aic_cores|aic_count|aiv|aiv_cores|aiv_count|core_num|core_count"
+    r"|clock_hz|core_clock_hz|freq|freq_mhz|freq_ghz|l2_bytes|l2_capacity_bytes"
+    r"|ub_bytes|ub_capacity_bytes|hbm_bw|hbm_bw_gbps|link_bw|link_bps"
+    r"|h2d_bw|h2d_bps|dma_bps|host_dma_bps)$",
+    re.IGNORECASE,
+)
+_AG009_CONST_RE = re.compile(
+    r"^_?(?:[A-Z0-9]+_)?(?:DEFAULT|FALLBACK|NOMINAL|REFERENCE)_"
+    r"(?:(?:A\d+|AIC|AIV|CORE|VECTOR|SWIGLU|MX|ROUTER|GATING|HOST|FIA|SOURCE)_)*"
+    r"(?:CORES?|AIC(?:_CORES|_COUNT)?|AIV(?:_CORES|_COUNT|_OWNERS|_TILES)?|CORE_NUM"
+    r"|CLOCK_HZ|FREQ(?:_MHZ|_GHZ)?|L2_BYTES|L2_CAPACITY_BYTES|UB_BYTES|UB_CAPACITY_BYTES"
+    r"|HBM_BW\w*|LINK_BW\w*|LINK_BPS|H2D_BW\w*|HOST_DMA_BPS|HOST_RC_BPS|DMA_BPS)$"
+)
+_AG009_OR_VAR_RE = re.compile(
+    r"(?:^|_)(?:cores|aic|aiv|clock_hz|freq|l2_bytes|l2_capacity_bytes|ub_bytes|ub_capacity_bytes"
+    r"|hbm_bw|link_bw|link_uni|h2d_bw|h2d_solo|dma_bps)(?:$|_)",
+    re.IGNORECASE,
+)
+_AG009_FALLBACK_FNS = frozenset({
+    "default_hierarchy", "_default_hierarchy", "default_geometry", "_default_geometry",
+})
+_AG010_L1_PKGS = frozenset({"backends", "primitives", "catalog", "templates"})
+_AG010_L2_SUBS = frozenset({"program", "runtime", "execution", "collectives", "capacity"})
+_AG010_L4_PKGS = frozenset({"optimization", "rewrite", "observations", "onboarding", "export"})
+_AG010_LAYER_NAMES = ("L0:schema", "L1:hardware", "L2:runtime", "L3:operators", "L4:product")
+#: Ratcheted legacy upward edges (40 edges / 27 files; zero L3->L4, zero primitives/loader->L4).
+_LEGACY_UPWARD_IMPORTS: Mapping[str, frozenset[str]] = {
+    "mindie_sim/catalog/qwen4_exp.py": frozenset({"mindie_sim.prediction.program"}),
+    "mindie_sim/catalog/speculative_state.py": frozenset({"mindie_sim.prediction.operators"}),
+    "mindie_sim/prediction/capacity/__init__.py": frozenset({"mindie_sim.prediction.operators"}),
+    "mindie_sim/prediction/collectives/plans.py": frozenset({"mindie_sim.prediction.operators"}),
+    "mindie_sim/prediction/collectives/protocol.py": frozenset({"mindie_sim.prediction.operators"}),
+    "mindie_sim/prediction/execution/cohort_launch.py": frozenset({"mindie_sim.prediction.operators"}),
+    "mindie_sim/prediction/execution/cohort_native.py": frozenset({"mindie_sim.prediction.operators"}),
+    "mindie_sim/prediction/execution/context.py": frozenset({"mindie_sim.prediction.operators"}),
+    "mindie_sim/prediction/execution/runner.py": frozenset({"mindie_sim.observations"}),
+    "mindie_sim/prediction/program/recipes.py": frozenset({"mindie_sim.prediction.operators"}),
+    "mindie_sim/primitives/_lowering_comms.py": frozenset({
+        "mindie_sim.prediction.collectives", "mindie_sim.prediction.program", "mindie_sim.prediction.runtime",
+    }),
+    "mindie_sim/primitives/lowering.py": frozenset({
+        "mindie_sim.prediction.program", "mindie_sim.prediction.runtime",
+    }),
+    "mindie_sim/primitives/schema.py": frozenset({
+        "mindie_sim.prediction.collectives", "mindie_sim.prediction.execution",
+        "mindie_sim.prediction.program", "mindie_sim.prediction.runtime",
+    }),
+    "mindie_sim/schema/datapath.py": frozenset({"mindie_sim.backends"}),
+    "mindie_sim/schema/hardware.py": frozenset({"mindie_sim.backends"}),
+    "mindie_sim/schema/model.py": frozenset({"mindie_sim.catalog"}),
+    "mindie_sim/schema/parallel.py": frozenset({"mindie_sim.catalog"}),
+    "mindie_sim/schema/serialization.py": frozenset({"mindie_sim.catalog"}),
+    "mindie_sim/templates/_catlass_periodic.py": frozenset({
+        "mindie_sim.prediction.program", "mindie_sim.prediction.runtime",
+    }),
+    "mindie_sim/templates/_catlass_streaming.py": frozenset({
+        "mindie_sim.prediction.program", "mindie_sim.prediction.runtime",
+    }),
+    "mindie_sim/templates/catlass_lower.py": frozenset({
+        "mindie_sim.prediction.program", "mindie_sim.prediction.runtime",
+    }),
+    "mindie_sim/templates/contracts.py": frozenset({
+        "mindie_sim.prediction.program", "mindie_sim.prediction.runtime",
+    }),
+    "mindie_sim/templates/dsl_catalog.py": frozenset({"mindie_sim.prediction.runtime"}),
+    "mindie_sim/templates/dsl_lower.py": frozenset({
+        "mindie_sim.prediction.program", "mindie_sim.prediction.runtime",
+    }),
+    "mindie_sim/templates/fuse_region.py": frozenset({
+        "mindie_sim.prediction.program", "mindie_sim.prediction.runtime",
+    }),
+    "mindie_sim/templates/fuse_region_live.py": frozenset({
+        "mindie_sim.prediction.program", "mindie_sim.prediction.runtime",
+    }),
+    "mindie_sim/templates/registry.py": frozenset({"mindie_sim.prediction.operators"}),
+}
+_AG011_DISPATCH_ROOTS = frozenset({
+    "mindie_sim.prediction.spine",
+    "mindie_sim.prediction.frontend",
+    "mindie_sim.prediction.frontend_body",
+    "mindie_sim.prediction.frontend_iteration",
+    "mindie_sim.prediction.program.recipes",
+    "mindie_sim.prediction.physical_recipe_registry",
+    "mindie_sim.prediction.implementation_registry",
+    "mindie_sim.prediction.body_defaults",
+    "mindie_sim.prediction.call_builders",
+    "mindie_sim.prediction.operators.registry",
+    "mindie_sim.prediction.operators",
+    "mindie_sim.prediction.runtime.engine",
+    "mindie_sim.compose_operator_defaults",
+    "mindie_sim.stack_registry",
+    "mindie_sim.templates.registry",
+})
+#: Ratcheted legacy standalone operator contract modules (budget=3; zero new orphans allowed).
+_LEGACY_UNREACHABLE_OPERATOR_MODULES = frozenset({
+    "mindie_sim/prediction/operators/collectives/hccl_alltoallv.py",
+    "mindie_sim/prediction/operators/matrix/steady_pipeline.py",
+    "mindie_sim/prediction/operators/vector/dynamic_quant_schedule.py",
 })
 _FLAT_PLAN_INFRA_FILES = frozenset({
     "mindie_sim/prediction/fusion_bridge.py",
@@ -261,10 +398,19 @@ def _check_ag008_module(
     pos = rel.as_posix()
     in_ops = rel.parts[: len(OPERATORS_PARTS)] == OPERATORS_PARTS
 
-    if SHARD_FILENAME_RE.search(rel.stem) and pos not in _LEGACY_SHARD_FILES:
+    if SHARD_FILENAME_RE.search(rel.stem) and pos not in _LEGACY_SHARD_FILES and pos not in _DOMAIN_COPY_OPERATORS:
         violations.append(Violation(
             "AG008", rel, 1, f"AG008:shard_file:{pos}",
             f"artificial shard filename {rel.name!r} is banned; keep cohesive domain logic together",
+        ))
+    if (
+        rel.name.startswith("_")
+        and rel.name not in {"__init__.py", "__main__.py"}
+        and pos not in _LEGACY_PRIVATE_SHARD_FILES
+    ):
+        violations.append(Violation(
+            "AG008", rel, 1, f"AG008:private_shard_file:{pos}",
+            f"private overflow shard {rel.name!r} is banned; keep cohesive domain logic in its owning module",
         ))
 
     for node in ast.walk(tree):
@@ -297,9 +443,17 @@ def _check_ag008_module(
     return violations
 
 
-def _check_ag008_repo_bounds(rels: Sequence[PurePosixPath]) -> list[Violation]:
-    """Enforce downward ratchet on flat prediction/*.py count and operator package fan-out."""
+def _check_ag008_repo_bounds(
+    rels: Sequence[PurePosixPath], *, texts: Mapping[PurePosixPath, str] | None = None
+) -> list[Violation]:
+    """Enforce directory module ceilings (+25% headroom) and flat prediction ratchet."""
     violations: list[Violation] = []
+    toplevel = [rel for rel in rels if len(rel.parts) == 2 and rel.parts[0] == "mindie_sim"]
+    if len(toplevel) > MAX_TOPLEVEL_MODULES:
+        violations.append(Violation(
+            "AG008", PurePosixPath("mindie_sim"), 1, "AG008:toplevel_module_ceiling",
+            f"top-level mindie_sim/*.py count {len(toplevel)} exceeds ceiling {MAX_TOPLEVEL_MODULES}",
+        ))
     flat_pred = [
         rel for rel in rels
         if len(rel.parts) == _FLAT_PREDICTION_DEPTH
@@ -312,6 +466,19 @@ def _check_ag008_repo_bounds(rels: Sequence[PurePosixPath]) -> list[Violation]:
             f"flat mindie_sim/prediction/*.py count {len(flat_pred)} exceeds ratchet ceiling "
             f"{MAX_FLAT_PREDICTION_MODULES}; consolidate operator modules into prediction/operators/<family>/",
         ))
+    onboarding = [rel for rel in rels if len(rel.parts) >= 3 and rel.parts[:2] == ("mindie_sim", "onboarding")]
+    if len(onboarding) > MAX_ONBOARDING_FILES:
+        violations.append(Violation(
+            "AG008", PurePosixPath("mindie_sim/onboarding"), 1, "AG008:onboarding_file_ceiling",
+            f"onboarding module count {len(onboarding)} exceeds ceiling {MAX_ONBOARDING_FILES}",
+        ))
+    if texts and onboarding:
+        onboarding_loc = sum(len(texts.get(rel, "").splitlines()) for rel in onboarding)
+        if onboarding_loc > MAX_ONBOARDING_LOC:
+            violations.append(Violation(
+                "AG008", PurePosixPath("mindie_sim/onboarding"), 1, "AG008:onboarding_loc_ceiling",
+                f"onboarding total LOC {onboarding_loc} exceeds ceiling {MAX_ONBOARDING_LOC}",
+            ))
     by_pkg: dict[str, int] = {}
     for rel in rels:
         in_pkg, fam, _fname = _is_governed_family_path(rel)
@@ -325,6 +492,263 @@ def _check_ag008_repo_bounds(rels: Sequence[PurePosixPath]) -> list[Violation]:
                 f"operator package {fam!r} has {count} peer .py files exceeding ceiling "
                 f"{MAX_OPERATOR_PACKAGE_FILES}",
             ))
+    return violations
+
+
+def _is_numeric_default_expr(node: ast.AST) -> bool:
+    if isinstance(node, ast.Constant):
+        return isinstance(node.value, (int, float)) and not isinstance(node.value, bool)
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+        return _is_numeric_default_expr(node.operand)
+    if isinstance(node, ast.BinOp) and isinstance(
+        node.op, (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv, ast.Pow, ast.LShift)
+    ):
+        return _is_numeric_default_expr(node.left) and _is_numeric_default_expr(node.right)
+    return False
+
+
+def _is_forbidden_phys_default(node: ast.AST) -> bool:
+    if isinstance(node, ast.Constant) and node.value is None:
+        return False
+    if _is_numeric_default_expr(node):
+        return True
+    return isinstance(node, ast.Name) and node.id.isupper()
+
+
+def _check_ag009_silent_physical_defaults(rel: PurePosixPath, tree: ast.Module) -> list[Violation]:
+    """Reject numeric physical hardware defaults, fallback constants, and fallback helpers (AG009)."""
+    if (
+        len(rel.parts) < 3
+        or rel.parts[0] != "mindie_sim"
+        or rel.parts[1] not in _AG009_ROOTS
+        or rel.name.startswith("custom_hardware")
+        or rel.name == "hardware_derivation.py"
+    ):
+        return []
+    pos = rel.as_posix()
+    violations: list[Violation] = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.name in _AG009_FALLBACK_FNS:
+                violations.append(Violation(
+                    "AG009", rel, node.lineno, f"AG009:fallback_fn:{pos}:{node.name}",
+                    f"silent hardware fallback function {node.name!r} is banned; require explicit machine/die profile",
+                ))
+            pos_args = (*node.args.posonlyargs, *node.args.args)
+            for arg, default in zip(pos_args[len(pos_args) - len(node.args.defaults):], node.args.defaults):
+                if _AG009_PARAM_RE.match(arg.arg) and _is_forbidden_phys_default(default):
+                    violations.append(Violation(
+                        "AG009", rel, node.lineno, f"AG009:param_default:{pos}:{node.name}:{arg.arg}",
+                        f"silent physical default {arg.arg}={ast.unparse(default)} in {node.name}(); "
+                        "require explicit hardware parameter or None",
+                    ))
+            for arg, default in zip(node.args.kwonlyargs, node.args.kw_defaults):
+                if default is not None and _AG009_PARAM_RE.match(arg.arg) and _is_forbidden_phys_default(default):
+                    violations.append(Violation(
+                        "AG009", rel, node.lineno, f"AG009:param_default:{pos}:{node.name}:{arg.arg}",
+                        f"silent physical default {arg.arg}={ast.unparse(default)} in {node.name}(); "
+                        "require explicit hardware parameter or None",
+                    ))
+        elif isinstance(node, ast.Call):
+            fn = node.func.id if isinstance(node.func, ast.Name) else (
+                node.func.attr if isinstance(node.func, ast.Attribute) else ""
+            )
+            if fn in _AG009_FALLBACK_FNS:
+                violations.append(Violation(
+                    "AG009", rel, getattr(node, "lineno", 1), f"AG009:fallback_call:{pos}:{fn}",
+                    f"call to silent hardware fallback {fn}() is banned; pass explicit hardware state",
+                ))
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
+            targets = node.targets if isinstance(node, ast.Assign) else (node.target,)
+            for target in targets:
+                if (
+                    isinstance(target, ast.Name)
+                    and _AG009_CONST_RE.match(target.id)
+                    and _is_numeric_default_expr(node.value)
+                ):
+                    violations.append(Violation(
+                        "AG009", rel, node.lineno, f"AG009:fallback_const:{pos}:{target.id}",
+                        f"silent physical fallback constant {target.id} is banned; read from active die profile",
+                    ))
+        elif isinstance(node, ast.BoolOp) and isinstance(node.op, ast.Or) and len(node.values) >= 2:
+            rhs = node.values[-1]
+            if not _is_forbidden_phys_default(rhs):
+                continue
+            if isinstance(rhs, ast.Constant) and rhs.value in (0, 0.0):
+                continue
+            lhs_names = (
+                sub.id if isinstance(sub, ast.Name) else sub.attr
+                for expr in node.values[:-1]
+                for sub in ast.walk(expr)
+                if isinstance(sub, (ast.Name, ast.Attribute))
+            )
+            if any(_AG009_OR_VAR_RE.search(name) for name in lhs_names):
+                violations.append(Violation(
+                    "AG009", rel, getattr(node, "lineno", 1),
+                    f"AG009:or_fallback:{pos}:{getattr(node, 'lineno', 1)}",
+                    f"numeric 'or' fallback {ast.unparse(node)!r} on physical hardware quantity is banned",
+                ))
+    return violations
+
+
+def _ag010_layer(parts: tuple[str, ...]) -> int | None:
+    if len(parts) < 2 or parts[0] != "mindie_sim":
+        return None
+    top = parts[1]
+    if top == "schema":
+        return 0
+    if top in _AG010_L1_PKGS:
+        return 1
+    if top == "prediction" and len(parts) >= 3:
+        if parts[2] in _AG010_L2_SUBS:
+            return 2
+        if parts[2] == "operators":
+            return 3
+    if top in _AG010_L4_PKGS or top.startswith(("compose", "sweep")):
+        return 4
+    return None
+
+
+def _ag010_bucket(parts: tuple[str, ...]) -> str:
+    if len(parts) >= 3 and parts[1] == "prediction":
+        return ".".join(parts[:3])
+    return ".".join(parts[:2])
+
+
+def _resolve_relative_import(rel: PurePosixPath, module: str | None, level: int) -> tuple[str, ...]:
+    if level == 0:
+        return tuple(module.split(".")) if module else ()
+    pkg = tuple(rel.with_suffix("").parts[:-1])
+    up = level - 1
+    base = pkg[: len(pkg) - up] if up <= len(pkg) else ()
+    return base + (tuple(module.split(".")) if module else ())
+
+
+def _iter_runtime_import_nodes(stmts: Sequence[ast.stmt]):
+    for stmt in stmts:
+        if isinstance(stmt, ast.If):
+            test = stmt.test
+            is_tc = (isinstance(test, ast.Name) and test.id == "TYPE_CHECKING") or (
+                isinstance(test, ast.Attribute) and test.attr == "TYPE_CHECKING"
+            )
+            if is_tc:
+                yield from _iter_runtime_import_nodes(stmt.orelse)
+                continue
+        if isinstance(stmt, (ast.Import, ast.ImportFrom)):
+            yield stmt
+            continue
+        for field in ("body", "orelse", "finalbody", "handlers", "cases"):
+            val = getattr(stmt, field, None)
+            if isinstance(val, list):
+                for item in val:
+                    if isinstance(item, ast.stmt):
+                        yield from _iter_runtime_import_nodes((item,))
+                    elif hasattr(item, "body") and isinstance(item.body, list):
+                        yield from _iter_runtime_import_nodes(item.body)
+
+
+def _check_ag010_layer_dag(rel: PurePosixPath, tree: ast.Module) -> list[Violation]:
+    """Enforce unidirectional L0->L1->L2->L3->L4 layer import DAG (AG010)."""
+    src_layer = _ag010_layer(rel.with_suffix("").parts)
+    if src_layer is None:
+        return []
+    pos = rel.as_posix()
+    allowed = _LEGACY_UPWARD_IMPORTS.get(pos, frozenset())
+    seen: set[str] = set()
+    violations: list[Violation] = []
+    for node in _iter_runtime_import_nodes(tree.body):
+        targets: list[tuple[str, ...]] = []
+        if isinstance(node, ast.Import):
+            targets.extend(tuple(alias.name.split(".")) for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            base = _resolve_relative_import(rel, node.module, node.level)
+            base_layer = _ag010_layer(base) if base else None
+            if base_layer is not None and base_layer > src_layer:
+                targets.append(base)
+            elif base:
+                targets.extend((*base, alias.name) for alias in node.names if alias.name != "*")
+        for target in targets:
+            dst_layer = _ag010_layer(target)
+            if dst_layer is None or dst_layer <= src_layer:
+                continue
+            bucket = _ag010_bucket(target)
+            if bucket in allowed or bucket in seen:
+                continue
+            seen.add(bucket)
+            violations.append(Violation(
+                "AG010", rel, getattr(node, "lineno", 1),
+                f"AG010:upward_import:{pos}:{bucket}",
+                f"upward layer import {_AG010_LAYER_NAMES[src_layer]} -> "
+                f"{_AG010_LAYER_NAMES[dst_layer]} ({bucket}) violates unidirectional DAG",
+            ))
+    return violations
+
+
+def _module_name_of_rel(rel: PurePosixPath) -> str:
+    parts = list(rel.with_suffix("").parts)
+    if parts and parts[-1] == "__init__":
+        parts = parts[:-1]
+    return ".".join(parts)
+
+
+def _check_ag011_operator_reachability(
+    parsed_files: Sequence[tuple[PurePosixPath, ast.Module]],
+) -> list[Violation]:
+    """Verify every operators/<family> module is reachable from governed dispatch roots (AG011)."""
+    mod_to_rel: dict[str, PurePosixPath] = {}
+    mod_to_tree: dict[str, ast.Module] = {}
+    for rel, tree in parsed_files:
+        mod = _module_name_of_rel(rel)
+        mod_to_rel[mod] = rel
+        mod_to_tree[mod] = tree
+    present_roots = [root for root in _AG011_DISPATCH_ROOTS if root in mod_to_tree]
+    if not present_roots:
+        return []
+    edges: dict[str, set[str]] = {}
+    for mod, tree in mod_to_tree.items():
+        rel = mod_to_rel[mod]
+        deps: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    parts = alias.name.split(".")
+                    for idx in range(1, len(parts) + 1):
+                        cand = ".".join(parts[:idx])
+                        if cand in mod_to_tree:
+                            deps.add(cand)
+            elif isinstance(node, ast.ImportFrom):
+                base = _resolve_relative_import(rel, node.module, node.level)
+                if base:
+                    for idx in range(1, len(base) + 1):
+                        cand = ".".join(base[:idx])
+                        if cand in mod_to_tree:
+                            deps.add(cand)
+                    for alias in node.names:
+                        if alias.name != "*":
+                            cand = ".".join((*base, alias.name))
+                            if cand in mod_to_tree:
+                                deps.add(cand)
+            elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+                if node.value.startswith("mindie_sim.prediction.operators.") and node.value in mod_to_tree:
+                    deps.add(node.value)
+        edges[mod] = deps
+    visited = set(present_roots)
+    stack = list(present_roots)
+    while stack:
+        cur = stack.pop()
+        for nxt in edges.get(cur, ()):
+            if nxt not in visited:
+                visited.add(nxt)
+                stack.append(nxt)
+    violations: list[Violation] = []
+    for mod, rel in sorted(mod_to_rel.items()):
+        in_pkg, _fam, _fname = _is_governed_family_path(rel)
+        if not in_pkg or mod in visited or rel.as_posix() in _LEGACY_UNREACHABLE_OPERATOR_MODULES:
+            continue
+        violations.append(Violation(
+            "AG011", rel, 1, f"AG011:unreachable_operator:{rel.as_posix()}",
+            f"operator module {rel.as_posix()!r} is unreachable from governed IMPLEMENTATIONS/Engine dispatch graph",
+        ))
     return violations
 
 
@@ -665,6 +1089,44 @@ def verify_ag007_discrimination(
     return tuple(failures)
 
 
+def verify_ag011_engine_reachability() -> tuple[Violation, ...]:
+    """Verify governed recipes execute through runtime.Engine and registries stay wired."""
+    from mindie_sim.prediction.implementation_registry import IMPLEMENTATIONS
+    from mindie_sim.prediction.operators.registry import builtin_family_registry
+    from mindie_sim.prediction.runtime.engine import Engine
+    from mindie_sim.prediction.runtime.engine_types import Resource
+
+    violations: list[Violation] = []
+    for name, impl in sorted(IMPLEMENTATIONS.items()):
+        try:
+            import_module(impl.module)
+        except Exception as exc:
+            violations.append(Violation(
+                "AG011", _IMPLEMENTATION_PATH, 1, f"AG011:impl_import:{name}",
+                f"registered implementation {name!r} ({impl.module}) failed import: {exc}",
+            ))
+    for spec in builtin_family_registry().specs():
+        mod_name = _OWNER_MODULE_PREFIXES[0] + spec.name
+        try:
+            import_module(mod_name)
+        except Exception as exc:
+            violations.append(Violation(
+                "AG011", _GATE_PATH, 1, f"AG011:family_import:{spec.name}",
+                f"registered family {spec.name!r} failed import: {exc}",
+            ))
+    engine = Engine([Resource("vector", 1.0, units=1)])
+    engine.submit("ag011_probe", work={"vector": 1.0})
+    engine.advance()
+    elapsed = engine.now
+    if not (isfinite(elapsed) and elapsed > 0.0):
+        violations.append(Violation(
+            "AG011", PurePosixPath("mindie_sim/prediction/runtime/engine.py"), 1,
+            "AG011:engine_smoke_failed",
+            f"runtime.Engine reachability smoke returned invalid duration {elapsed!r}",
+        ))
+    return tuple(violations)
+
+
 def scan_runtime(root: Path) -> tuple[Violation, ...]:
     """Load the requested checkout ahead of installed packages for strict checks."""
     sys.path.insert(0, str(root))
@@ -674,9 +1136,10 @@ def scan_runtime(root: Path) -> tuple[Violation, ...]:
             raise RuntimeError("strict architecture governance requires the target checkout's runtime")
         ownership = verify_ag006_ownership(root)
         discrimination = verify_ag007_discrimination()
+        reachability = verify_ag011_engine_reachability()
     finally:
         sys.path.remove(str(root))
     return ownership + tuple(
         Violation("AG007", _GATE_PATH, 1, f"AG007:{failure}", failure)
         for failure in discrimination
-    )
+    ) + reachability

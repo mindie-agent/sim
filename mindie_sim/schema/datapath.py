@@ -118,6 +118,11 @@ class DatapathCapabilitySpec:
     def arch_id(self) -> ArchId:
         return self.compute_arch.arch_id
 
+    @property
+    def clock_hz(self) -> float | None:
+        declared = self.compute_arch.declared
+        return declared.clock_hz if declared is not None else None
+
     def cube_peak(self, dtype: str) -> float:
         """Return the declared matrix peak (FLOP/s) for ``dtype`` without profile guessing."""
         from .compute_peak_aliases import resolve_compute_peak_name

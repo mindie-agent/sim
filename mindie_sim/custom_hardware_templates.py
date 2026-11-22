@@ -36,7 +36,7 @@ HARDWARE_ARCHETYPE_TEMPLATES: dict[str, dict[str, Any]] = {
         "inter_pod_bw_gbps": 100.0, "intra_node_bw_util": 0.85,
         "inter_node_bw_util": 0.80, "intra_package_latency_us": 0.9,
         "intra_node_latency_us": 1.5, "inter_node_latency_us": 4.5,
-        "inter_pod_latency_us": 10.0, "launch_us": 4.0,
+        "inter_pod_latency_us": 10.0, "launch_us": 4.0, "clock_mhz": 1650.0,
     },
     "ascend_dual_die_server": {
         "arch_family": "Custom_Ascend_Server", "dies_per_package": 2, "ranks_per_node": 16,
@@ -48,7 +48,8 @@ HARDWARE_ARCHETYPE_TEMPLATES: dict[str, dict[str, Any]] = {
         "intra_bw_8p_gbps": 392.0, "intra_node_bw_gbps": 392.0,
         "inter_node_bw_gbps": 50.0, "intra_node_bw_util": 0.80,
         "inter_node_bw_util": 0.80, "intra_package_latency_us": 1.0,
-        "intra_node_latency_us": 1.5, "inter_node_latency_us": 5.0, "launch_us": 4.0,
+        "intra_node_latency_us": 1.5, "inter_node_latency_us": 5.0,
+        "launch_us": 4.0, "clock_mhz": 1800.0,
     },
     "ascend_single_die": {
         "arch_family": "Custom_Ascend_SingleDie", "dies_per_package": 1,
@@ -59,7 +60,7 @@ HARDWARE_ARCHETYPE_TEMPLATES: dict[str, dict[str, Any]] = {
         "l0b_kb": 64.0, "l0c_kb": 128.0, "intra_node_bw_gbps": 196.0,
         "inter_node_bw_gbps": 25.0, "intra_node_bw_util": 0.70,
         "inter_node_bw_util": 0.80, "intra_node_latency_us": 2.0,
-        "inter_node_latency_us": 10.0, "launch_us": 4.5,
+        "inter_node_latency_us": 10.0, "launch_us": 4.5, "clock_mhz": 1800.0,
     },
     "gpu_nvlink_server": {
         "arch_family": "Custom_GPU", "dies_per_package": 1, "ranks_per_node": 8,
@@ -69,7 +70,8 @@ HARDWARE_ARCHETYPE_TEMPLATES: dict[str, dict[str, Any]] = {
         "l0a_kb": 64.0, "l0b_kb": 64.0, "l0c_kb": 128.0,
         "intra_node_bw_gbps": 450.0, "inter_node_bw_gbps": 50.0,
         "intra_node_bw_util": 0.85, "inter_node_bw_util": 0.80,
-        "intra_node_latency_us": 1.5, "inter_node_latency_us": 5.0, "launch_us": 3.5,
+        "intra_node_latency_us": 1.5, "inter_node_latency_us": 5.0,
+        "launch_us": 3.5, "clock_mhz": 1800.0,
     },
     "generic_accelerator": {
         "arch_family": "Custom_Accelerator", "dies_per_package": 1,
@@ -80,7 +82,7 @@ HARDWARE_ARCHETYPE_TEMPLATES: dict[str, dict[str, Any]] = {
         "l0b_kb": 64.0, "l0c_kb": 128.0, "intra_node_bw_gbps": 300.0,
         "inter_node_bw_gbps": 50.0, "intra_node_bw_util": 0.80,
         "inter_node_bw_util": 0.80, "intra_node_latency_us": 2.0,
-        "inter_node_latency_us": 5.0, "launch_us": 4.0,
+        "inter_node_latency_us": 5.0, "launch_us": 4.0, "clock_mhz": 1650.0,
     },
 }
 
@@ -100,6 +102,7 @@ _FIELD_DOCS: dict[str, str] = {
     "cube_int4_tflops": "Optional INT4 matrix throughput in TFLOPS; sets the int4 peak.",
     "fp4_tflops": "Alias for cube_int4_tflops for agents that label the format FP4.",
     "vector_fp32_tflops": "Declared FP32 vector throughput in 10^12 elementary ops/s.",
+    "clock_mhz": "Core clock frequency in MHz (materialized onto compute_arch.clock_hz).",
     "aic_count": "Matrix compute units per die (cube scheduling owners).",
     "aiv_count": "Vector compute units per die (vector scheduling owners).",
     "l2_mb": "Shared L2 capacity per die in MiB (2^20 bytes).",

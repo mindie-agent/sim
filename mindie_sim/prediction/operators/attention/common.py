@@ -411,7 +411,7 @@ def _selection_runs(addresses: Iterable[int], row_bytes: int) -> AddressRunPlan:
 def c8_gather_accounting(
     selection_lists: Iterable[Iterable[int] | AddressRunPlan] | None = None, *,
     quant_mode: int = QUANT_MODE_INT8_C8, query_tokens: int = 1, selected_tokens: int = 0,
-    ctx: OperatorPlanningContext | None = None, l2_capacity_bytes: int = 0,
+    ctx: OperatorPlanningContext | None = None, l2_capacity_bytes: int | None = None,
     tensor_id: str = "kv", die: int = 0, owner: int = 0,
 ) -> GatherAccounting:
     """Replay byte-address selections in query order through admission memory.
@@ -419,7 +419,8 @@ def c8_gather_accounting(
     Geometry-only queries have independent cold traffic. An explicit list
     can share resident sectors in a caller-supplied or local admission view.
     """
-    if quant_mode not in C8_MODES or min(query_tokens, selected_tokens, l2_capacity_bytes) < 0:
+    l2_cap = 0 if l2_capacity_bytes is None else l2_capacity_bytes
+    if quant_mode not in C8_MODES or min(query_tokens, selected_tokens, l2_cap) < 0:
         raise ModelingError("attention_c8_gather_geometry_invalid")
     row_bytes = TQ4_ROW_BYTES if quant_mode == QUANT_MODE_TQ4 else C8_ROW_BYTES
     stride = ceil(row_bytes / SECTOR_BYTES) * SECTOR_BYTES
@@ -428,8 +429,8 @@ def c8_gather_accounting(
         run = AddressRun(0, selected_tokens, row_bytes, stride)
         selection_lists = (AddressRunPlan((run,), alignment_bytes=SECTOR_BYTES) for _ in range(query_tokens))
     view = ctx.admission_memory_view if proven_addresses and ctx is not None else None
-    if proven_addresses and view is None and l2_capacity_bytes:
-        view = AdmissionMemoryView({die: l2_capacity_bytes})
+    if proven_addresses and view is None and l2_cap:
+        view = AdmissionMemoryView({die: l2_cap})
     key = ReuseKey(die, tensor_id, 0)
     bus = HbmBusSpec(die, 1, 1, 0)
     rows = sectors = aligned = hits = dram = 0

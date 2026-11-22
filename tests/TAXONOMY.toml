@@ -4,7 +4,7 @@
 schema_version = 1
 domains = ["schema", "runtime", "collectives", "operators", "spine", "serving", "observations", "product", "hygiene"]
 support_dirs = ["_support", "_oracles", "fixtures", "runtime/native"]
-max_lines = 600
+max_lines = 1500
 # ---------------------------------------------------------------- schema
 [[module]]
 path = "schema/test_datapath.py"

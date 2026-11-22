@@ -13,6 +13,8 @@ import site
 import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
+from fractions import Fraction
+import math
 from pathlib import Path
 from typing import Any, Literal
 
@@ -30,8 +32,28 @@ AIV_MIN_TILE_BYTES = 2048
 MIX_AIC_AIV_BARRIER_ROUNDS = 6.0
 MIX_AIC_AIC_BARRIER_ROUNDS = 2.0
 MIX_AIC_PAIRED_SYNC_ROUNDS = 5.0
-DEFAULT_CORE_CLOCK_HZ = 1_650_000_000.0
+_GIGA = 1_000_000_000
+_GIBI = 1024 * 1024 * 1024
+_CAPACITY_UNIT_SCALE = {
+    **dict.fromkeys(("b/s", "byte/s", "bytes/s", "flop/s", "flops/s", "ops/s", "elements/s"), 1),
+    **dict.fromkeys(("b/ms", "byte/ms", "bytes/ms", "flop/ms", "flops/ms", "ops/ms",
+                     "elements/ms", "kb/s"), 1000),
+    **dict.fromkeys(("gb/s", "gflop/s", "gops/s"), _GIGA),
+    **dict.fromkeys(("tb/s", "tflop/s", "tops/s"), 1000 * _GIGA),
+    "mb/s": 1000 * 1000,
+    "kib/s": 1024,
+    "mib/s": 1024 * 1024,
+    "gib/s": _GIBI,
+    "tib/s": 1024 * _GIBI,
+}
 RateRole = Literal["sim", "dual"]
+
+
+def _normalize_capacity_per_second(value: float, unit: str) -> Fraction:
+    scale = _CAPACITY_UNIT_SCALE.get(unit.strip().lower())
+    if scale is None:
+        raise ValueError(f"unknown primitive capacity unit: {unit!r}")
+    return Fraction(str(value)) * scale
 
 
 def default_primitives_dir() -> Path:
@@ -329,7 +351,6 @@ def resolve_sim_rate_overlay(
     if sku:
         validate_table_sku_compatibility(table, sku)
     if not isinstance(table, PrimitiveTable):
-        from mindie_sim.optimization.contracts import normalize_capacity_per_second
         entries = getattr(table, "entries", ())
         if isinstance(entries, Mapping):
             entries = tuple(entries.values())
@@ -342,7 +363,7 @@ def resolve_sim_rate_overlay(
             unit = getattr(entry, "unit", None)
             if p50 is None or unit is None:
                 continue
-            val = float(normalize_capacity_per_second(float(p50), str(unit)))
+            val = float(_normalize_capacity_per_second(float(p50), str(unit)))
             if pid in {"hbm_bus_r", "P01_hbm_read"}:
                 hbm_r = min(val, datapath.hbm_read_bytes_per_s) if datapath.hbm_read_bytes_per_s > 0.0 else val
             elif pid in {"hbm_bus_w", "P01_hbm_write"}:
@@ -506,7 +527,15 @@ def resolve_dispatch_envelope(
     if flag_ns is not None and flag_ns > 0.0:
         clock_period_ms = (flag_ns / P12_FLAG_CYCLES) / NS_PER_MS
     else:
-        clock_period_ms = MS_PER_SECOND / DEFAULT_CORE_CLOCK_HZ
+        raw_clock = getattr(datapath, "clock_hz", None)
+        if raw_clock is None and getattr(datapath, "compute_arch", None) is not None:
+            raw_clock = getattr(datapath.compute_arch.declared, "clock_hz", None)
+        if raw_clock is None or isinstance(raw_clock, bool):
+            raise ModelingError("dispatch_envelope_clock_hz_missing")
+        clock_hz = float(raw_clock)
+        if not math.isfinite(clock_hz) or clock_hz <= 0.0:
+            raise ModelingError("dispatch_envelope_clock_hz_missing")
+        clock_period_ms = MS_PER_SECOND / clock_hz
     p13_params = table.cell("P13_crosscore_sync").parameters or {}
     issue_ms = issue_ns / NS_PER_MS
     first_issue_ms = (

@@ -19,7 +19,6 @@ RECIPE = 'hccl_aiv_source_phase'
 GROUP_BUFFER = 'hccl_aiv_copy_queue'
 UB_BATCH = 95 * 1024
 UB_RESIDENCY = 190 * 1024 + 2560
-DEFAULT_AIV_OWNERS = 64
 _ATOMIC_COPY_HBM_TRANSFERS = 3  # Source read, destination read and destination write.
 _TWOSHOT_SCRATCH_PAYLOADS = 4
 
@@ -76,7 +75,9 @@ def jobs(selection, available, rank=0):
     return result, count, chunks
 
 
-def contract(selection, available=DEFAULT_AIV_OWNERS, rank=0):
+def contract(selection, available, rank=0):
+    if isinstance(available, bool) or not isinstance(available, int) or available <= 0:
+        raise ModelingError('hccl_aiv_requires_positive_available_owners')
     owner_jobs, count, chunks = jobs(selection, available, rank)
     phases, previous = [], ()
     for name, owners in owner_jobs.items():

@@ -247,7 +247,8 @@ def test_batched_context_parallel_selection_conserves_rank_local_work():
     ops = gqa(prefix="probe", plan=plan, views=views, stage=0, deps=("input",),
               model=case.model, parallel=parallel, quant=case.model.quant, mode="decode",
               padded_tokens=4, policy=AttentionPolicy(), cp_interleave_size=4,
-              runtime=case.runtime, cache_ids={}, stage_of=lambda _: 0).ops
+              runtime=case.runtime, cache_ids={}, stage_of=lambda _: 0,
+              machine=case.machine).ops
     meta = dict(next(op for op in ops if op.family == "attention").metadata)
     assert meta["cp_per_rank_pairs"] == (13.0, 12.0)
     assert meta["cp_per_rank_sweeps"] == (5, 6) and meta["kv_sweeps"] == 6

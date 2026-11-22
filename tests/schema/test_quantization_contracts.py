@@ -185,7 +185,7 @@ def component(name, overrides=None, *, partial=False):
     result = builder(prefix="gqa", plan=plan, model=case.model, quant=case.model.quant,
         parallel=case.runtime.parallel, views=(RequestView("r", 256, 4096, True, "decode"),),
         stage=0, deps="analysis_input", mode="decode", padded_tokens=256,
-        cache_ids={}, stage_of=lambda _: 0)
+        cache_ids={}, stage_of=lambda _: 0, machine=case.machine)
     ops = activation_quantization(result.ops, case.model.activation_dtype)
     return case, plan, ops, {op.recipe: op for op in ops
                             if op.recipe in {"qkv_projection", "attention_output"}}

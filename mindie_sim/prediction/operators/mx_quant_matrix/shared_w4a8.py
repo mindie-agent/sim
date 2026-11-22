@@ -26,8 +26,8 @@ from .mxfp4_geometry import (
     geometry_ledger, panel_sizes, tile_runs,
 )
 from .mxfp4_grouped import (
-    B8_NATIVE_I8_PER_CYCLE_PER_VF, B8_PROLOGUE_DUPLICATE, B8_VF_OWNERS,
-    L0_ACCUMULATOR_BYTES, L0_OPERAND_BYTES, L1_BYTES, NOMINAL_CLOCK_HZ, UB_BYTES,
+    B8_NATIVE_I8_PER_CYCLE_PER_VF, B8_PROLOGUE_DUPLICATE,
+    L0_ACCUMULATOR_BYTES, L0_OPERAND_BYTES, L1_BYTES, UB_BYTES, _US_PER_SECOND,
 )
 from .mxfp4_panels import compiled_panels
 from .mxfp4_registers import B8_WIDEN_BLOCK_ELEMENTS, CLASSES, TABLES
@@ -170,7 +170,7 @@ def build(op, geometry):
     if any(geometry.buffers.get(pool, 0) < size for pool, size in pools.items()):
         raise ModelingError("shared_w4a8_source_static_buffers_exceed_device_capacity")
 
-    ledger = geometry_ledger(config, cores, True, False)
+    ledger = geometry_ledger(config, cores, True, False, l2_bytes=0)
     total, inventory, counts, runs = ledger.work, ledger.inventory, ledger.counts, ledger.runs
     owner_signatures = [tuple(tile_runs(config, owner, cores, True))
                         for owner in range(cores)]
@@ -229,10 +229,17 @@ def build(op, geometry):
         return ParallelProgram(tuple(owner_program(context, owner)
                                      for owner in range(cores)))
 
-    b8_lanes_per_second = B8_NATIVE_I8_PER_CYCLE_PER_VF * B8_VF_OWNERS * NOMINAL_CLOCK_HZ
+    clock_hz = getattr(geometry.compute_arch, "clock_hz", None)
+    b8_lanes_per_second = (
+        B8_NATIVE_I8_PER_CYCLE_PER_VF * aivs * float(clock_hz)
+        if clock_hz is not None and float(clock_hz) > 0.0 else None
+    )
     b8 = {
         op: {"raw_lanes": count.active_lanes,
-             "bound_us": count.active_lanes / b8_lanes_per_second * 1e6}
+             "bound_us": (
+                 count.active_lanes / b8_lanes_per_second * _US_PER_SECOND
+                 if b8_lanes_per_second is not None else None
+             )}
         for op, count in inventory.counts.items()
         if op in {"ShiftRightB8", "ShiftLeftB8", "SelectB8", "AndB8"}
     }
@@ -270,8 +277,8 @@ def build(op, geometry):
                     if op in {"ShiftRightB8", "ShiftLeftB8", "SelectB8", "AndB8"}),
                 "per_opcode": b8,
                 "native_i8_per_cycle_per_vf": B8_NATIVE_I8_PER_CYCLE_PER_VF,
-                "vf_owners": B8_VF_OWNERS,
-                "nominal_clock_hz": NOMINAL_CLOCK_HZ,
+                "vf_owners": aivs,
+                "nominal_clock_hz": clock_hz,
                 "prologue": {"CreateMask": 2, "DuplicateB8": B8_PROLOGUE_DUPLICATE,
                              "width_elements": B8_WIDEN_BLOCK_ELEMENTS, "once_per_invocation": True},
                 "single_port_charge": False,

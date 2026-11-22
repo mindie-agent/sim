@@ -20,9 +20,6 @@ from mindie_sim.schema.physical_mechanisms import MemoryHierarchySpec
 
 
 DEFAULT_QUERY_TILE = 128
-DEFAULT_A5_L2_BYTES = 134217728
-DEFAULT_L2_FRACTION = 0.75
-DEFAULT_CACHE_LINE = 128
 BYTES_PER_ELEMENT = {"bf16": 2, "fp16": 2, "fp32": 4, "int8": 1,
                      "fp8": 1, "fp8_e4m3": 1, "fp8_e5m2": 1}
 
@@ -303,12 +300,18 @@ def apply_traffic_plan(op, traffic: TrafficPlan):
     )
 
 
-def default_hierarchy(*, l2_capacity_bytes: int = DEFAULT_A5_L2_BYTES) -> MemoryHierarchySpec:
-    """Frontend declaration when no device cohort is attached yet."""
-    return MemoryHierarchySpec(
-        l2_capacity_bytes=l2_capacity_bytes,
-        l2_effective_fraction=DEFAULT_L2_FRACTION,
-        cache_line_bytes=DEFAULT_CACHE_LINE,
-        write_allocate=True,
-        provenance={"basis": "frontend_default_a5_l2", "calibrated": False},
-    )
+def require_machine_memory_hierarchy(
+    machine, *, hierarchy: MemoryHierarchySpec | None = None,
+) -> MemoryHierarchySpec:
+    """Return explicit machine/caller memory hierarchy or fail closed."""
+    if hierarchy is not None:
+        if not isinstance(hierarchy, MemoryHierarchySpec) or hierarchy.l2_capacity_bytes < 0:
+            raise ModelingError("machine_memory_hierarchy_missing")
+        return hierarchy
+    if machine is not None and getattr(machine, "dies", ()):
+        die_hierarchy = getattr(
+            machine.dies[0].physical_mechanisms, "memory_hierarchy", None
+        )
+        if isinstance(die_hierarchy, MemoryHierarchySpec) and die_hierarchy.l2_capacity_bytes >= 0:
+            return die_hierarchy
+    raise ModelingError("machine_memory_hierarchy_missing")

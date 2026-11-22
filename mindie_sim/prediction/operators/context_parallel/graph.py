@@ -1221,7 +1221,7 @@ def _bind_dcp_merge_dram(context: Any) -> Any:
 
 
 def expand_dcp_lse_eager_kernels(
-    op: OpSpec, *, l2_bytes: int = 0, include_stack: bool = False, local_ids: bool = False,
+    op: OpSpec, *, l2_bytes: int, include_stack: bool = False, local_ids: bool = False,
 ) -> tuple[OpSpec, ...]:
     """Expand a ``dcp_lse_merge`` call into the 9-kernel eager LSE combine chain."""
     meta = dict(op.metadata)

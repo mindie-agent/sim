@@ -129,7 +129,8 @@ def test_qkv_fusion_partitions_projection_and_materializes_gather_inputs(gate, p
     plan = dense_layer(0, qk_norm=True, q_output_gate=gate)
     ops = gqa(prefix="attention", plan=plan, views=(RequestView("r", 3, 0, True, "prefill"),),
               stage=0, deps="input", model=case.model, quant=case.model.quant, mode="prefill",
-              padded_tokens=3, parallel=replace(case.runtime.parallel, pcp=pcp, cp_plan="auto")).ops
+              padded_tokens=3, parallel=replace(case.runtime.parallel, pcp=pcp, cp_plan="auto"),
+              machine=case.machine).ops
     by_id = {op.op_id: op for op in ops}
     declaration = dict(by_id["attention.rope"].metadata)["structure_subgraphs"][0]
     addresses = [
@@ -266,7 +267,7 @@ def test_shipping_prefill_reuses_three_slots_and_drains_every_tile():
 def test_frontend_ragged_prefill_roundtrips_to_physical_work():
     case = dense_case()
     views = (RequestView("a", 3, 5, False, "prefill"), RequestView("b", 5, 2, False, "prefill"))
-    ops, _ = Frontend().body(case.model, case.runtime, views, ready="input", tokens=8, mode="prefill")
+    ops, _ = Frontend().body(case.model, case.runtime, views, ready="input", tokens=8, mode="prefill", machine=case.machine)
     semantic = next(op for op in ops if op.family == "attention")
     sequences = tuple((view.q_len, view.context + view.q_len) for view in views)
     contract = governed.AttentionContract(8, 4, 2, 16, 16, sequences=sequences, phase="prefill", causal=True)

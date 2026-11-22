@@ -12,15 +12,19 @@ from __future__ import annotations
 
 from mindie_sim.catalog.types import QuantSpec
 from mindie_sim.schema.case import Case, Software
+from mindie_sim.schema.compute_arch import ComputeArchSpec
 from mindie_sim.schema.hardware import Device, Hardware, Link
 from mindie_sim.schema.model import LayerPlan, ModelSpec, RequestSpec, WorkloadSpec
 from mindie_sim.schema.parallel import ParallelSpec
+from mindie_sim.schema.physical_mechanisms import default_physical_mechanisms
 from mindie_sim.schema.workload import IterationPlan, RequestView
 
 DEFAULT_PEAKS = (("bf16", 1.0e12), ("fp32", 5.0e11), ("fp8_e4m3", 2.0e12))
 DEFAULT_RATES = (("hbm", 1.0e12), ("memory", 1.0e12), ("vector", 1.0e12))
 DEFAULT_MEMORY_BYTES = 1 << 30
+DEFAULT_L2_BYTES = 16 * 1024 * 1024
 DEFAULT_UB_BYTES = 1024
+DEFAULT_CLOCK_HZ = 1.0e9
 DEFAULT_FABRIC_BYTES_PER_MS = 1.0e6
 
 
@@ -33,6 +37,8 @@ def device(
     compute_units: int = 4,
     vector_units: int = 8,
     memory_bytes: int = DEFAULT_MEMORY_BYTES,
+    l2_bytes: int = DEFAULT_L2_BYTES,
+    clock_hz: float = DEFAULT_CLOCK_HZ,
     package: int = 0,
 ) -> Device:
     return Device(
@@ -44,8 +50,10 @@ def device(
         node=int(node),
         package=int(package),
         resource_units=(("vector", int(vector_units)),),
-        buffer_units=(("ub", int(vector_units)),),
-        buffers=(("ub", DEFAULT_UB_BYTES),),
+        buffer_units=(("l2", 1), ("ub", int(vector_units))),
+        buffers=(("l2", int(l2_bytes)), ("ub", DEFAULT_UB_BYTES)),
+        compute_arch=ComputeArchSpec(clock_hz=float(clock_hz)),
+        physical_mechanisms=default_physical_mechanisms(l2_capacity_bytes=int(l2_bytes)),
         launch_us=0.0,
     )
 

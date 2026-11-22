@@ -94,7 +94,7 @@ def _unequal_graphs(case, rows):
     graphs = {}
     for replica, count in enumerate(rows):
         views = (RequestView(f"r{replica}", count, 0, False, "prefill"),) if count else ()
-        ops, _ = Frontend().body(case.model, case.runtime, views, ready="analysis_input", tokens=count, mode="prefill", global_tokens=sum(rows))
+        ops, _ = Frontend().body(case.model, case.runtime, views, ready="analysis_input", tokens=count, mode="prefill", global_tokens=sum(rows), machine=case.machine)
         graphs[replica] = lower_implementations(ops, case.runtime, case.model.activation_dtype, local_tokens=count)
     return bind_cohort_traffic(case, graphs)
 def _check_structure(case, graphs, rows, *, phase="prefill"):
@@ -501,7 +501,7 @@ def test_complete_source_graph_slices_attention_and_preserves_padded_ffn(batch):
 def test_graph_bucket_rows_are_preserved_but_sp_rows_do_not_reach_attention():
     parsed = parse_case(_sp_case(1)); views = (RequestView("r", 1, 4096, False, "decode"),); plan = select(parsed.runtime, parsed.model, views, tokens=4, global_tokens=8)
     assert (plan.valid_global, plan.attention_tokens, plan.physical_global) == (1, 4, 8)
-    graph, _ = Frontend().body(parsed.model, parsed.runtime, views, ready="input", tokens=4, mode="decode", global_tokens=8); by_id = {op.op_id: op for op in graph}
+    graph, _ = Frontend().body(parsed.model, parsed.runtime, views, ready="input", tokens=4, mode="decode", global_tokens=8, machine=parsed.machine); by_id = {op.op_id: op for op in graph}
     assert (by_id.get("s0.l0.linear_q") or by_id["s0.l0.linear_qkvbfg_a"]).local_shape[0] == 4 and by_id["s0.l3.q_a"].local_shape[0] == 4 and by_id["s0.l0.attention.sp_input_view"].local_shape == (4, 7168)
     pad = by_id["s0.l0.linear_reduce.reduce_scatter.pad"]; assert (pad.mte2_bytes, pad.mte3_bytes) == (4 * 7168 * 2, 8 * 7168 * 2) and dict(by_id["s0.l0.recurrent_scan0"].metadata)["sequence_tokens"] == (1,)
 @pytest.mark.parametrize("batch", [1, 8])
@@ -525,7 +525,7 @@ def test_decode_keeps_sp_branch_but_does_not_claim_prefill_cache():
     case = _combined_case(layers=2); graphs = target_graphs(case, phase="decode", tokens=1, sequences=8, context=64, scope="body")
     assert {row["local_rows"] for row in _check_structure(case, graphs, (8,) * 4, phase="decode")} == {1}
 def test_idle_exception_does_not_hide_nonidle_unmatched_source_selection():
-    case = _combined_case(layers=2); ops, _ = Frontend().body(case.model, case.runtime, (), ready="analysis_input", tokens=0, global_tokens=32, mode="prefill"); original = deepcopy(ops)
+    case = _combined_case(layers=2); ops, _ = Frontend().body(case.model, case.runtime, (), ready="analysis_input", tokens=0, global_tokens=32, mode="prefill", machine=case.machine); original = deepcopy(ops)
     lower_implementations(ops, case.runtime, case.model.activation_dtype, local_tokens=0); assert ops == original
     with pytest.raises(ModelingError, match="matrix_wrapper_projection_recipes_unmatched"): lower_implementations(ops, case.runtime, case.model.activation_dtype, local_tokens=8)
 @pytest.mark.parametrize("rows,physical,valid_per_tp", [(1, 8, (1, 0, 0, 0, 0, 0, 0, 0)), (4, 8, (1, 1, 1, 1, 0, 0, 0, 0)), (9, 16, (2, 2, 2, 2, 1, 0, 0, 0)), (16, 16, (2, 2, 2, 2, 2, 2, 2, 2))])
@@ -562,7 +562,7 @@ def test_padding_executes_alltoall_router_rows_but_is_not_valid_token_count(full
 def test_unequal_and_idle_dp_keep_per_replica_padding_and_inverse_traffic():
     parsed = _padding_case(); populations = (1, 4, 9, 0); groups = tuple(_padding_views(n, f"r{i}") for i, n in enumerate(populations)); assert cohort_padded_tokens(groups, parsed.runtime) == 8 + 8 + 16; graphs = {}
     for replica, group in enumerate(groups):
-        ops, _ = Frontend().body(parsed.model, parsed.runtime, group, ready="input", tokens=populations[replica], mode="decode", global_tokens=28); graphs[replica] = lower_implementations(tuple(op for op in ops if op.layer in (0, 1) or op.op_id == "sp_shard"), parsed.runtime, parsed.model.activation_dtype, resource_fusion=False)
+        ops, _ = Frontend().body(parsed.model, parsed.runtime, group, ready="input", tokens=populations[replica], mode="decode", global_tokens=28, machine=parsed.machine); graphs[replica] = lower_implementations(tuple(op for op in ops if op.layer in (0, 1) or op.op_id == "sp_shard"), parsed.runtime, parsed.model.activation_dtype, resource_fusion=False)
     graphs = bind_cohort_traffic(parsed, graphs); row_bytes = 16 * 3584 * 2 * 31 / 32
     for replica, ops in graphs.items():
         assert next(op for op in ops if op.recipe == "expert_dispatch").link_bytes == (1, 1, 2, 0)[replica] * row_bytes; routing = dict(next(op for op in ops if op.family == "grouped_gemm").metadata)["routing_realization"]

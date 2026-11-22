@@ -195,7 +195,7 @@ def selected(lengths, stride, *, padded_tokens=None):
         "implementation": "vllm_ascend_gdn_decode",
         "options": {"cache_index_row_stride": stride}}}}
     parsed = replace(parsed, runtime=replace(parsed.runtime, kernels=kernels))
-    ops, _ = Frontend().body(parsed.model, parsed.runtime, views, mode="decode", tokens=padded_tokens)
+    ops, _ = Frontend().body(parsed.model, parsed.runtime, views, mode="decode", tokens=padded_tokens, machine=parsed.machine)
     return parsed, views, ops
 
 @pytest.mark.parametrize("lengths,padding", (((4,) * 4, 32), ((1,) * 4, 16), ((4, 2, 3, 4), 32)))
@@ -222,7 +222,7 @@ def test_contiguous_or_singleton_index_view_needs_no_materialization(lengths, st
 
 def _ops(parsed, views, mode, tokens):
     ops, _ = Frontend().body(parsed.model, parsed.runtime, views, mode=mode,
-                             tokens=tokens)
+                             tokens=tokens, machine=parsed.machine)
     return ops
 
 def _by_recipe(ops, recipe):

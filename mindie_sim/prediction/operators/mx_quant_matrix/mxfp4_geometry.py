@@ -65,8 +65,15 @@ class Config:
             raise ModelingError("mxa8w4_nznk_requires_integer_expert_histogram")
 
 
+def _require_positive_cores(cores) -> int:
+    if isinstance(cores, bool) or not isinstance(cores, int) or cores <= 0:
+        raise ModelingError("mx_quant_requires_positive_cores")
+    return cores
+
+
 def columns(config, cores):
     """CalcResplitTiling uses declared groups, including inactive groups."""
+    cores = _require_positive_cores(cores)
     n, groups = config.n, len(config.rows)
     if n % (cores * N_TILE_COLUMNS) == 0:
         widths = [N_TILE_COLUMNS] * (n // N_TILE_COLUMNS)
@@ -87,28 +94,35 @@ def columns(config, cores):
             units, extra = divmod(n // NZ_N_GRANULE, tasks)
             widths = ([units * NZ_N_GRANULE] * (tasks - extra)
                       + [(units + 1) * NZ_N_GRANULE] * extra)
+    result = []
     offset = 0
     for width in widths:
         actual = min(width, n - offset)
         if actual:
-            yield offset, actual
+            result.append((offset, actual))
         offset += width
+    return tuple(result)
 
 
 def owner_tiles(config, owner, cores):
     """Rolling output-tile index across experts, then M and N."""
-    ntiles = tuple(columns(config, cores))
-    start = 0
-    for expert, rows in enumerate(config.rows):
-        if not rows:
-            continue
-        mstep = ceildiv(rows, ceildiv(rows, M_TILE_ROWS))
-        count = ceildiv(rows, mstep) * len(ntiles)
-        for local in range((owner - start) % cores, count, cores):
-            mi, ni = divmod(local, len(ntiles))
-            column, n = ntiles[ni]
-            yield expert, mi * mstep, column, min(mstep, rows - mi * mstep), n
-        start += count
+    cores = _require_positive_cores(cores)
+    ntiles = columns(config, cores)
+
+    def _iter():
+        start = 0
+        for expert, rows in enumerate(config.rows):
+            if not rows:
+                continue
+            mstep = ceildiv(rows, ceildiv(rows, M_TILE_ROWS))
+            count = ceildiv(rows, mstep) * len(ntiles)
+            for local in range((owner - start) % cores, count, cores):
+                mi, ni = divmod(local, len(ntiles))
+                column, n = ntiles[ni]
+                yield expert, mi * mstep, column, min(mstep, rows - mi * mstep), n
+            start += count
+
+    return _iter()
 
 
 def tile_runs(config, owner, cores, compact):
@@ -132,7 +146,6 @@ def panel_sizes(m, n):
     return kb, ka, micro
 
 
-DEFAULT_CORES = 32
 GEOMETRY_CACHE_SIZE = 128
 M_TILE_ROWS = 256
 #: Declared arch3510 L2 efficiency used only when a caller supplies no typed
@@ -163,29 +176,32 @@ def m_tile_repeats(config):
     return repeats, passes
 
 
-def owner_panel_bytes(config, cores=DEFAULT_CORES):
-    """Concurrent 32-owner 256-column B panel set, including MX scale pairs."""
+def owner_panel_bytes(config, cores):
+    """Concurrent multi-owner 256-column B panel set, including MX scale pairs."""
+    cores = _require_positive_cores(cores)
     width = max((width for _, width in columns(config, cores)), default=config.n)
     payload = config.k * width // 2
     scales = config.k * width // MX_SCALE_GROUP
     return float(cores * (payload + scales))
 
 
-def resplit_columns(config, cores=DEFAULT_CORES):
+def resplit_columns(config, cores):
     """True when ``CalcResplitTiling`` narrows the declared 256-column tiling."""
+    cores = _require_positive_cores(cores)
     if config.n <= cores * N_TILE_RESPLIT_COLUMNS:
         return False
     return any(width < N_TILE_COLUMNS for _, width in columns(config, cores))
 
 
-def weight_l2_fraction(config, cores=DEFAULT_CORES, l2_bytes=0):
+def weight_l2_fraction(config, cores, l2_bytes):
     """Share of a repeated 256-column B panel served by resident L2.
 
-    The declared working set is the concurrent 32-owner panel set plus one
+    The declared working set is the concurrent multi-owner panel set plus one
     activation slice.  When that set fits in effective L2, a second M-tile pass
     re-reads its B panel on chip; the fraction is the repeated-pass share
     scaled by how much of the concurrent set the die can retain.
     """
+    cores = _require_positive_cores(cores)
     if l2_bytes <= 0:
         return 0.0
     repeats, passes = m_tile_repeats(config)
@@ -196,13 +212,14 @@ def weight_l2_fraction(config, cores=DEFAULT_CORES, l2_bytes=0):
     return retention * repeats / passes
 
 
-def activation_l2_fraction(config, cores=DEFAULT_CORES, l2_bytes=0):
+def activation_l2_fraction(config, cores, l2_bytes):
     """Share of a column pass whose activation slice is served by resident L2.
 
     ``CalcResplitTiling`` reads one ``[m_e, K]`` slice per output column tile;
     the first pass fills L2 and the remaining passes hit it while the full
     slice fits the declared effective capacity.
     """
+    _require_positive_cores(cores)
     if l2_bytes <= 0:
         return 0.0
     slice_bytes = activation_bank_bytes(config)
@@ -265,8 +282,9 @@ def panel_work(config, m, n, offset):
     return a + a_scale, vectors, micros
 
 
-def tile_work(config, m, n, *, cores=DEFAULT_CORES, directional_mte1=False,
+def tile_work(config, m, n, *, cores, directional_mte1=False,
               activation_l2=0.0, weight_l2=0.0):
+    _require_positive_cores(cores)
     total = Work()
     share = float(activation_l2)
     wshare = float(weight_l2)
@@ -313,7 +331,8 @@ class GeometryLedger:
 
 @lru_cache(maxsize=GEOMETRY_CACHE_SIZE)
 def geometry_ledger(config: Config, cores: int, compact: bool = True,
-                    directional_mte1: bool = False, l2_bytes: int = 0) -> GeometryLedger:
+                    directional_mte1: bool = False,
+                    l2_bytes: int | None = None) -> GeometryLedger:
     """Reuse exact source work for repeated layer geometry, independent of rates.
 
     The source has two AIVs per AIC. InitMx reads its 256-byte permutation on
@@ -323,13 +342,17 @@ def geometry_ledger(config: Config, cores: int, compact: bool = True,
     are read-only; Work.apply/scaled and inventory conversion create fresh
     caller-owned outputs instead of exposing mutable cache state.
     """
+    cores = _require_positive_cores(cores)
+    resolved_l2 = 0 if l2_bytes is None else int(l2_bytes)
+    if resolved_l2 < 0:
+        raise ModelingError("mx_quant_requires_nonnegative_l2_bytes")
     aivs = 2 * cores
     init_bytes = TRANSPOSE_INDEX_BYTES * aivs
     work = Work(resources={"hbm": init_bytes, "mte2_aiv": init_bytes})
     inventory = InstructionInventory({})
     counts, runs = [], []
-    activation_l2 = activation_l2_fraction(config, cores, l2_bytes)
-    weight_l2 = weight_l2_fraction(config, cores, l2_bytes)
+    activation_l2 = activation_l2_fraction(config, cores, resolved_l2)
+    weight_l2 = weight_l2_fraction(config, cores, resolved_l2)
     for owner in range(cores):
         count = sum(1 for _ in owner_tiles(config, owner, cores))
         run_count = 0

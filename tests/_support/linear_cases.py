@@ -226,7 +226,7 @@ def gdn_decode_source_case(
         RequestView(str(i), q, 4096, False, "decode")
         for i, q in enumerate(lengths)
     )
-    ops, _ = Frontend().body(parsed.model, parsed.runtime, views, mode="decode")
+    ops, _ = Frontend().body(parsed.model, parsed.runtime, views, mode="decode", machine=parsed.machine)
     return parsed, views, ops
 
 

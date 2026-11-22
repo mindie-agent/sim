@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Architecture governance gate (AG001..AG008) for ``mindie_sim``.
+"""Architecture governance gate (AG001..AG011) for ``mindie_sim``.
 
 [Role] Enforce governed ``mindie_sim/prediction/operators/<family>/`` package
   boundaries, forbid flat ISA/CANN filename sprawl under ``mindie_sim/**/*.py``,
   block direct leaf imports, block ``service_modes`` / ``compute_peaks``
-  capability sniffing, verify ISA provenance, and check dispatched recipe
-  ownership and physical work conservation.
+  capability sniffing, verify ISA provenance, check dispatched recipe ownership
+  and physical work conservation, reject silent physical hardware defaults,
+  enforce unidirectional layer imports, and ensure operator Engine reachability.
 [Invariants] ``AG001`` scans strictly ``mindie_sim/**/*.py`` so model catalog
   JSON files (e.g. ``qwen3.5-35b-a3b.json``) are never flagged. Governed
   ``operators/<family>/**`` modules allow zero violations in every mode.
@@ -29,25 +30,31 @@ import sys
 from types import MappingProxyType
 
 if __package__:
-    from ._arch_governance_runtime import (
+    from ._arch_governance_runtime import (  # noqa: F401
         DOCSTRING_HEADER_MAX_LINE, FAMILY_PKG_DEPTH, GOVERNED_PATH_DEPTH,
-        MAX_FLAT_PREDICTION_MODULES, MAX_OPERATOR_PACKAGE_FILES, OPERATORS_PARTS, Violation,
+        MAX_FLAT_PREDICTION_MODULES, MAX_ONBOARDING_FILES, MAX_ONBOARDING_LOC,
+        MAX_OPERATOR_PACKAGE_FILES, MAX_TOPLEVEL_MODULES, OPERATORS_PARTS, Violation,
         _check_ag006_flat_prediction, _check_ag007, _check_ag008_module, _check_ag008_repo_bounds,
-        _is_governed_family_path, scan_runtime, verify_ag007_discrimination,
+        _check_ag009_silent_physical_defaults, _check_ag010_layer_dag,
+        _check_ag011_operator_reachability, _is_governed_family_path, scan_runtime,
+        verify_ag007_discrimination, verify_ag011_engine_reachability,
     )
 else:
-    from _arch_governance_runtime import (
+    from _arch_governance_runtime import (  # noqa: F401
         DOCSTRING_HEADER_MAX_LINE, FAMILY_PKG_DEPTH, GOVERNED_PATH_DEPTH,
-        MAX_FLAT_PREDICTION_MODULES, MAX_OPERATOR_PACKAGE_FILES, OPERATORS_PARTS, Violation,
+        MAX_FLAT_PREDICTION_MODULES, MAX_ONBOARDING_FILES, MAX_ONBOARDING_LOC,
+        MAX_OPERATOR_PACKAGE_FILES, MAX_TOPLEVEL_MODULES, OPERATORS_PARTS, Violation,
         _check_ag006_flat_prediction, _check_ag007, _check_ag008_module, _check_ag008_repo_bounds,
-        _is_governed_family_path, scan_runtime, verify_ag007_discrimination,
+        _check_ag009_silent_physical_defaults, _check_ag010_layer_dag,
+        _check_ag011_operator_reachability, _is_governed_family_path, scan_runtime,
+        verify_ag007_discrimination, verify_ag011_engine_reachability,
     )
 
 SIM_PACKAGE_ROOT = "mindie_sim"
-GOVERNED_LEAF_NAMES = frozenset({"arch22.py", "arch35.py"})
-GOVERNED_LEAF_STEMS = frozenset({"arch22", "arch35"})
+GOVERNED_LEAF_NAME_RE = re.compile(r"^arch\d+\.py$")
+GOVERNED_LEAF_STEM_RE = re.compile(r"^arch\d+$")
 AG001_STEM_RE = re.compile(
-    r"(?:arch22|arch35|cann|(?:^|_)(?:a2|a3|a5)(?:$|_))",
+    r"(?:arch\d+|cann|(?:^|_)(?:a2|a3|a5)(?:$|_))",
     re.IGNORECASE,
 )
 UPSTREAM_ABI_RE = re.compile(r"^\s*Upstream-ABI:\s*(\S+)", re.MULTILINE)
@@ -95,6 +102,16 @@ CANONICAL_CONCEPT_OWNERS: Mapping[str, tuple[str, ...]] = MappingProxyType({
     "certify_lower_bound": ("mindie_sim/optimization/dual_bound.py",),
     "OperatorPlanningContext": ("mindie_sim/prediction/operators/contracts.py",),
     "OptimalityCertificate": ("mindie_sim/optimization/dual_bound.py",),
+    "Engine": ("mindie_sim/prediction/runtime/engine.py",),
+    "ParallelSpec": ("mindie_sim/schema/parallel.py",),
+    "MemoryHierarchySpec": ("mindie_sim/schema/physical_mechanisms.py",),
+    "PhysicalMechanismSpec": ("mindie_sim/schema/physical_mechanisms.py",),
+    "DatapathCapabilitySpec": ("mindie_sim/schema/datapath.py",),
+    "ComputeArchSpec": ("mindie_sim/schema/compute_arch.py",),
+    "CalibratedDispatchEnvelope": ("mindie_sim/primitives/loader.py",),
+    "RecipeBook": ("mindie_sim/prediction/program/recipes.py",),
+    "RecipeContext": ("mindie_sim/prediction/program/binding.py",),
+    "PredictionSpine": ("mindie_sim/prediction/spine.py",),
 })
 
 def _is_allowed_isa_leaf(rel: PurePosixPath) -> bool:
@@ -102,7 +119,7 @@ def _is_allowed_isa_leaf(rel: PurePosixPath) -> bool:
     return (
         in_pkg and len(rel.parts) == GOVERNED_PATH_DEPTH
         and family is not None
-        and filename in GOVERNED_LEAF_NAMES
+        and bool(GOVERNED_LEAF_NAME_RE.match(filename))
         and family.isidentifier()
         and not keyword.iskeyword(family)
         and not AG001_STEM_RE.search(family)
@@ -176,7 +193,7 @@ def _resolve_import_from(rel: PurePosixPath, module: str | None, level: int) -> 
 def _is_leaf_parts(parts: tuple[str, ...]) -> tuple[bool, str | None]:
     idx = len(OPERATORS_PARTS)
     if len(parts) >= GOVERNED_PATH_DEPTH and parts[:idx] == OPERATORS_PARTS:
-        if parts[idx + 1] in GOVERNED_LEAF_STEMS:
+        if GOVERNED_LEAF_STEM_RE.match(parts[idx + 1]):
             return True, parts[idx]
     return False, None
 
@@ -238,7 +255,7 @@ def _check_ag001(rel: PurePosixPath) -> list[Violation]:
         return []
     msg = (
         f"unmanaged ISA/CANN filename {rel.name!r}; only "
-        "mindie_sim/prediction/operators/<family>/{arch22,arch35}.py allowed"
+        "mindie_sim/prediction/operators/<family>/arch<N>.py allowed"
     )
     return [Violation("AG001", rel, 1, f"AG001:{rel.as_posix()}", msg)]
 
@@ -249,7 +266,7 @@ def _check_ag002(rel: PurePosixPath, tree: ast.Module, parents: dict[ast.AST, as
     is_family_init = in_pkg and len(rel.parts) == GOVERNED_PATH_DEPTH and filename == "__init__.py"
     str_consts = _module_string_constants(tree)
     family_aliases: dict[str, str] = {}
-    leaf_export_names: set[str] = set(GOVERNED_LEAF_STEMS)
+    leaf_export_names: set[str] = set()
     dynamic_imports: set[str] = {"__import__"}
     importlib_aliases: set[str] = set()
 
@@ -286,7 +303,7 @@ def _check_ag002(rel: PurePosixPath, tree: ast.Module, parents: dict[ast.AST, as
                 continue
             fam_pkg = _family_pkg_name(base)
             for alias in node.names:
-                if fam_pkg is not None and alias.name in GOVERNED_LEAF_STEMS:
+                if fam_pkg is not None and GOVERNED_LEAF_STEM_RE.match(alias.name):
                     if is_family_init and own_family == fam_pkg:
                         leaf_export_names.add(alias.asname or alias.name)
                     reject(fam_pkg, alias.name, node, "static")
@@ -294,7 +311,7 @@ def _check_ag002(rel: PurePosixPath, tree: ast.Module, parents: dict[ast.AST, as
                     family_aliases[alias.asname or alias.name] = alias.name
         elif isinstance(node, ast.Attribute):
             if (
-                node.attr in GOVERNED_LEAF_STEMS
+                GOVERNED_LEAF_STEM_RE.match(node.attr)
                 and isinstance(node.value, ast.Name)
                 and node.value.id in family_aliases
             ):
@@ -309,7 +326,7 @@ def _check_ag002(rel: PurePosixPath, tree: ast.Module, parents: dict[ast.AST, as
                 and node.args[0].id in family_aliases
             ):
                 attr = _fold_string(node.args[1], str_consts)
-                if attr in GOVERNED_LEAF_STEMS:
+                if attr is not None and GOVERNED_LEAF_STEM_RE.match(attr):
                     reject(family_aliases[node.args[0].id], attr, node, "getattr")
             is_dyn = (
                 (isinstance(func, ast.Name) and func.id in dynamic_imports)
@@ -346,7 +363,11 @@ def _check_ag002(rel: PurePosixPath, tree: ast.Module, parents: dict[ast.AST, as
                 seq_node = stmt.value
             if isinstance(seq_node, (ast.List, ast.Tuple, ast.Set)):
                 for elt in seq_node.elts:
-                    if isinstance(elt, ast.Constant) and elt.value in leaf_export_names:
+                    if (
+                        isinstance(elt, ast.Constant)
+                        and isinstance(elt.value, str)
+                        and (elt.value in leaf_export_names or bool(GOVERNED_LEAF_STEM_RE.match(elt.value)))
+                    ):
                         fp = _fingerprint("AG002", rel, "<module>", stmt)
                         msg = f"family __init__.py must not re-export leaf {elt.value!r} in __all__"
                         violations.append(Violation("AG002", rel, stmt.lineno, fp, msg))
@@ -658,7 +679,10 @@ def scan_repository(
     """Return the sorted static findings under ``mindie_sim/**/*.py``."""
     violations: list[Violation] = []
     files = _enumerate_py_files(root, revision=revision)
+    parsed_files: list[tuple[PurePosixPath, ast.Module]] = []
+    texts: dict[PurePosixPath, str] = {}
     for rel, text in files:
+        texts[rel] = text
         violations.extend(_check_ag001(rel))
         try:
             tree = ast.parse(text, filename=rel.as_posix())
@@ -668,6 +692,7 @@ def scan_repository(
                 f"AG005:{rel.as_posix()}:syntax_error", f"syntax_error:{exc.msg}",
             ))
             continue
+        parsed_files.append((rel, tree))
         parents = _parents(tree)
         violations.extend(_check_ag002(rel, tree, parents))
         violations.extend(_check_ag003_ag004(rel, tree, parents))
@@ -675,7 +700,10 @@ def scan_repository(
         violations.extend(_check_ag006_flat_prediction(rel, tree))
         violations.extend(_check_ag007(rel, tree))
         violations.extend(_check_ag008_module(rel, text, tree, CANONICAL_CONCEPT_OWNERS))
-    violations.extend(_check_ag008_repo_bounds([rel for rel, _ in files]))
+        violations.extend(_check_ag009_silent_physical_defaults(rel, tree))
+        violations.extend(_check_ag010_layer_dag(rel, tree))
+    violations.extend(_check_ag008_repo_bounds([rel for rel, _ in files], texts=texts))
+    violations.extend(_check_ag011_operator_reachability(parsed_files))
     violations.sort(key=lambda v: (v.path.as_posix(), v.line, v.rule, v.message))
     return tuple(violations)
 

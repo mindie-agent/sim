@@ -12,7 +12,7 @@ from dataclasses import asdict, dataclass
 from math import ceil
 
 from mindie_sim.schema.common import ModelingError
-from .hccl_aiv import DEFAULT_AIV_OWNERS, GROUP_BUFFER, UB_BATCH, UB_RESIDENCY
+from .hccl_aiv import GROUP_BUFFER, UB_BATCH, UB_RESIDENCY
 from .hccl_contracts import HcclPhase, HcclPlan, HcclSelection, SOURCE, SOURCE_REVISION
 from mindie_sim.prediction.mechanism import OperatorPlan, Work
 from mindie_sim.prediction.program import KernelProgram, PipelineProgram, Stage
@@ -40,8 +40,10 @@ def _partition(n, count):
     return tuple(q+(i < remainder) for i in range(count))
 
 
-def jobs(s, available=DEFAULT_AIV_OWNERS, rank=0):
+def jobs(s, available, rank=0):
     """Ordered owner actions for a single normal-kernel executor slice."""
+    if isinstance(available, bool) or not isinstance(available, int) or available <= 0:
+        raise ModelingError('hccl_aiv_gather_requires_positive_available_owners')
     if (s.expansion != 'AIV' or s.collective != 'allgather' or s.template != 'mesh'
             or s.topology != 'MESH_1D' or s.topology_levels not in {1, 2}
             or s.source_revision != SOURCE_REVISION or s.buffer_mode != 'separate'
@@ -101,7 +103,7 @@ def jobs(s, available=DEFAULT_AIV_OWNERS, rank=0):
     }
 
 
-def contract(selection, available=DEFAULT_AIV_OWNERS, rank=0):
+def contract(selection, available, rank=0):
     owner_jobs, count, details = jobs(selection,available,rank)
     r,n = selection.ranks,selection.payload_bytes
     phases, previous, all_counts = [], (), {}

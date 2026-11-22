@@ -55,7 +55,6 @@ OFFLOAD_INDEX_ELEMENT_BYTES = 4
 REFERENCE_ARCH22_PCIE_GBPS = 50.0
 REFERENCE_ARCH35_D2H_GBPS = 100.15
 REFERENCE_ARCH35_H2D_GBPS = 100.01
-REFERENCE_UB_CAPACITY_BYTES = 196608
 TOPK_INDEX_BYTES = 4
 WIDE_OFFLOAD_MIN_UB_BYTES = 131072
 WIDE_OFFLOAD_UB_BYTES = 122880
@@ -348,7 +347,9 @@ def _build_memfabric_sparse_copy(op: OpSpec, geometry: Geometry, *, direction: s
     payload_bytes = float(spec.get("payload_bytes", op.hbm_bytes))
     entries = max(1, int(spec.get("entries", max(1, op.local_shape[0] if op.local_shape else 1))))
     aiv_units = int(geometry.resource_units.get("vector", max(1, geometry.compute_units * 2)))
-    ub_capacity = int(geometry.buffers.get("ub", REFERENCE_UB_CAPACITY_BYTES))
+    if "ub" not in geometry.buffers or int(geometry.buffers["ub"]) <= 0:
+        raise ModelingError("sparse_kv_offload_requires_explicit_ub_bytes")
+    ub_capacity = int(geometry.buffers["ub"])
     # memfabric_hybrid acc_offload_sparse_copy.h:
     # entries < aiv_units -> OffloadMoeSparseCopyKernel; entries >= aiv_units -> OffloadKVSparseCopyKernel.
     kernel_mode = "OffloadMoeSparseCopyKernel" if entries < aiv_units else "OffloadKVSparseCopyKernel"
@@ -430,7 +431,9 @@ def _build_memfabric_kv_exchange(op: OpSpec, geometry: Geometry) -> OperatorPlan
     payload_bytes = float(spec.get("payload_bytes", op.hbm_bytes))
     pages = max(1, int(spec.get("pages", 1)))
     aiv_units = int(geometry.resource_units.get("vector", max(2, geometry.compute_units * 2)))
-    ub_capacity = int(geometry.buffers.get("ub", REFERENCE_UB_CAPACITY_BYTES))
+    if "ub" not in geometry.buffers or int(geometry.buffers["ub"]) <= 0:
+        raise ModelingError("sparse_kv_offload_requires_explicit_ub_bytes")
+    ub_capacity = int(geometry.buffers["ub"])
     # acc_offload_kv_exchange.h: only the last 2 AIV cores (subBlockNum-2, subBlockNum-1) execute!
     active_owners = min(2, aiv_units)
     owner_indices = tuple(range(max(0, aiv_units - active_owners), aiv_units))
@@ -497,7 +500,9 @@ def _build_memfabric_entry_gather(op: OpSpec, geometry: Geometry) -> OperatorPla
     payload_bytes = float(spec.get("payload_bytes", op.hbm_bytes))
     rows = max(1, int(spec.get("rows", max(1, op.local_shape[0] if op.local_shape else 1))))
     aiv_units = int(geometry.resource_units.get("vector", max(1, geometry.compute_units * 2)))
-    ub_capacity = int(geometry.buffers.get("ub", REFERENCE_UB_CAPACITY_BYTES))
+    if "ub" not in geometry.buffers or int(geometry.buffers["ub"]) <= 0:
+        raise ModelingError("sparse_kv_offload_requires_explicit_ub_bytes")
+    ub_capacity = int(geometry.buffers["ub"])
     # acc_offload_entry_gather.h: 120 KiB ping-pong UB on >=128 KiB UB, else 88 KiB.
     ub_per_owner = WIDE_OFFLOAD_UB_BYTES if ub_capacity >= WIDE_OFFLOAD_MIN_UB_BYTES else min(BASELINE_OFFLOAD_UB_BYTES, ub_capacity)
     active_owners = min(aiv_units, rows)

@@ -135,7 +135,7 @@ def test_singleton_compatible_z_reshape_is_a_view(lengths, heads):
 
 def test_source_z_reshape_uses_padded_projection_rows_without_padding_recurrence():
     parsed, views, _ = source_case(lengths=(1,), keys=4, heads=12)
-    ops, _ = Frontend().body(parsed.model, parsed.runtime, views, mode="decode", tokens=16)
+    ops, _ = Frontend().body(parsed.model, parsed.runtime, views, mode="decode", tokens=16, machine=parsed.machine)
     copy = next(op for op in ops if op.recipe == "z_norm_materialize")
     assert copy.hbm_bytes == 16 * 1536 * 4
     recurrence = next(op for op in ops if op.family == "recurrent_vector")

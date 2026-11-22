@@ -267,7 +267,7 @@ def test_decode_source_binds_normalization_and_conserves_repeated_gate_work(leng
     lowerings = parsed.runtime.kernels["lowerings"]
     options = {**lowerings["gdn_decode"]["options"], "recurrent_implementation": "arch35_fp32"}
     kernels = {"lowerings": {"gdn_decode": dict(lowerings["gdn_decode"], options=options)}}
-    ops, _ = Frontend().body(parsed.model, replace(parsed.runtime, kernels=kernels), views, mode="decode")
+    ops, _ = Frontend().body(parsed.model, replace(parsed.runtime, kernels=kernels), views, mode="decode", machine=parsed.machine)
     by_recipe = {op.recipe: op for op in ops}
     assert {CONV, GATING, "decode_q_l2norm", "decode_k_l2norm", "ascend_recurrent_gdn_fp32_state"} <= by_recipe.keys()
     for role in ("decode_q_l2norm", "decode_k_l2norm"):
@@ -286,7 +286,7 @@ def test_serving_prefill_orders_state_gather_scan_and_publish():
     parsed, _, _ = gdn_decode_source_case((1,), keys=1, heads=3)
     runtime = replace(parsed.runtime, kernels={"lowerings": {"gdn_prefill": "gdn_prefill_arch35"}})
     views = (RequestView("new", 64, 0, False, "prefill"), RequestView("prior", 17, 32, True, "prefill"))
-    ops, _ = Frontend().body(parsed.model, runtime, views, mode="prefill")
+    ops, _ = Frontend().body(parsed.model, runtime, views, mode="prefill", machine=parsed.machine)
     by = {op.family: op for op in ops}
     assert by["state_gather"].op_id in by["gdn_state"].deps
     assert by["gdn_state"].op_id in by["state_scatter"].deps

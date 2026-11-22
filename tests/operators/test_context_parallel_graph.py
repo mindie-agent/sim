@@ -460,7 +460,7 @@ def test_window_compressed_pcp_ring_refuses_dcp_and_gqa_chunked_window():
         views=(RequestView("r0", 16, 256, False, "prefill"),), stage=0, deps=("analysis_input",),
         model=cs_gqa.model, parallel=cs_gqa.runtime.parallel, quant=cs_gqa.model.quant,
         mode="prefill", padded_tokens=16, policy=AttentionPolicy(), cp_interleave_size=128,
-        runtime=cs_gqa.runtime, cache_ids={}, stage_of=lambda _: 0,
+        runtime=cs_gqa.runtime, cache_ids={}, stage_of=lambda _: 0, machine=cs_gqa.machine,
     )
     assert any(op.recipe == "pcp_query_allgather" and op.stream == CP_CHUNKED_PREFILL_STREAM for op in res_chk.ops)
     # Disjoint sliding window history pairs: q=16, ctx=1024, window=128 -> exact 2048 total pairs (0 excess).
@@ -471,6 +471,7 @@ def test_window_compressed_pcp_ring_refuses_dcp_and_gqa_chunked_window():
         model=cs_gqa.model, parallel=replace(cs_gqa.runtime.parallel, pcp=1, cp=2, dcp=2, cp_plan="dcp"),
         quant=cs_gqa.model.quant, mode="prefill", padded_tokens=16, policy=AttentionPolicy(),
         cp_interleave_size=128, runtime=cs_gqa.runtime, cache_ids={}, stage_of=lambda _: 0,
+        machine=cs_gqa.machine,
     )
     attn_flops = sum(op.flops for op in res_win.ops if op.family == "attention")
     head_flops = (win_plan.num_heads // 2) * (2.0 * (win_plan.head_dim + win_plan.head_dim))

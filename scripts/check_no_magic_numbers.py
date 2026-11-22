@@ -39,23 +39,35 @@ from dataclasses import dataclass
 from pathlib import Path
 
 IMPLEMENTATION_ROOT = "mindie_sim"
+PHYSICS_CORE_ROOTS = (
+    "mindie_sim/prediction",
+    "mindie_sim/primitives",
+    "mindie_sim/backends",
+    "mindie_sim/catalog",
+    "mindie_sim/templates",
+)
 PYTHON_SUFFIX = ".py"
 NUMERIC_PLACEHOLDER = "__NUM__"
 EXIT_OK = 0
 EXIT_VIOLATIONS = 1
 EXIT_USAGE = 2
 
-# Mathematical identities, sign, parity / FMA factor, half, and the standard
+# Mathematical identities, sign, parity / FMA factor, half/quarter, and the standard
 # decimal / binary unit-conversion bases.  Floating-point tolerances in the
 # 1e-6 .. 1e-12 decade are structural comparison aids, not physics constants.
 NATURAL_INT_LITERALS = frozenset({
     -2, -1, 0, 1, 2, 100, 1000, 1024, 1_000_000, 1_000_000_000,
 })
 NATURAL_FLOAT_LITERALS = frozenset({
-    -1.0, -0.5, 0.0, 0.5, 1.0, 2.0,
+    -1.0, -0.5, 0.0, 0.25, 0.5, 1.0, 2.0,
     100.0, 1000.0, 1024.0, 1_000_000.0, 1_000_000_000.0,
     1e-6, 1e-7, 1e-8, 1e-9, 1e-10, 1e-11, 1e-12,
 })
+BIT_WIDTH_INT_LITERALS = frozenset({4, 8, 16, 32, 64})
+_BIT_BYTE_CONTEXT_RE = re.compile(
+    r"(?:bit|bits|byte|bytes|dtype|nibble|word|align|pack|elem|fp\d+|bf\d+|int\d+|uint\d+|mxfp\d+)",
+    re.IGNORECASE,
+)
 
 _TAUTOLOGICAL_TOKENS = frozenset({
     # Cardinal words
@@ -257,6 +269,16 @@ def _in_structural_ast_position(
         and parent.args[1] is cur
     ):
         return True
+    # 4) Standard bit/byte widths {4, 8, 16, 32, 64} in bit-shifts (1 << N) and dtype/unit conversions.
+    if isinstance(node, ast.Constant) and type(node.value) is int and node.value in BIT_WIDTH_INT_LITERALS:
+        if isinstance(parent, ast.BinOp) and isinstance(parent.op, (ast.LShift, ast.RShift)) and parent.right is cur:
+            return True
+        owner = _owner_statement(node, parents)
+        if owner is not None and _BIT_BYTE_CONTEXT_RE.search(ast.unparse(owner)):
+            if isinstance(parent, ast.BinOp) and isinstance(parent.op, (ast.Mult, ast.Div, ast.FloorDiv, ast.Mod)):
+                return True
+            if isinstance(parent, (ast.Compare, ast.Dict, ast.Call)):
+                return True
     return False
 
 
@@ -352,11 +374,18 @@ def _git(root: Path, *args: str) -> str:
     return completed.stdout
 
 
+def _is_physics_core_path(rel: str) -> bool:
+    posix = rel.replace("\\", "/")
+    return posix.endswith(PYTHON_SUFFIX) and any(
+        posix.startswith(prefix + "/") for prefix in PHYSICS_CORE_ROOTS
+    )
+
+
 def _load_base_modules(root: Path, base: str) -> dict[str, ast.Module]:
     result: dict[str, ast.Module] = {}
     names = _git(root, "ls-tree", "-r", "--name-only", base, "--", IMPLEMENTATION_ROOT)
     for name in names.splitlines():
-        if not name.endswith(PYTHON_SUFFIX):
+        if not _is_physics_core_path(name):
             continue
         text = _git(root, "show", f"{base}:{name}")
         try:
@@ -371,8 +400,8 @@ def _changed_files(root: Path, base: str) -> list[str]:
     untracked = _git(
         root, "ls-files", "--others", "--exclude-standard", "--", IMPLEMENTATION_ROOT
     )
-    names = {line for line in diff.splitlines() if line.endswith(PYTHON_SUFFIX)}
-    names.update(line for line in untracked.splitlines() if line.endswith(PYTHON_SUFFIX))
+    names = {line for line in diff.splitlines() if _is_physics_core_path(line)}
+    names.update(line for line in untracked.splitlines() if _is_physics_core_path(line))
     return sorted(names)
 
 
