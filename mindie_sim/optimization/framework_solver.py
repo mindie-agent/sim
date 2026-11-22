@@ -478,11 +478,8 @@ def _stream_candidates(scenario, ops, op_refs=()):
     counts = tuple(sorted({int(value) for op in ops
                           if (value := dict(op.metadata).get("tile_count", 0)) > 0}))
 
-    def schedule(assignment, point):
+    def prepare_assignment(assignment):
         lane_ids = set(assignment.values()) | {MAIN_STREAM}
-        lanes = tuple(lane for lane in point.lanes if lane.stream_id in lane_ids)
-        if {lane.stream_id for lane in lanes} != lane_ids:
-            return
         grouped = defaultdict(list)
         for op in ops:
             target = assignment.get(op.op_id, MAIN_STREAM)
@@ -493,37 +490,57 @@ def _stream_candidates(scenario, ops, op_refs=()):
         events = tuple(StreamEvent(f"event_{i}", source, dep, target, tuple(dict.fromkeys(wait)))
                        for i, ((dep, source, target), wait) in enumerate(grouped.items()))
         raw = tuple(assignment.items())
+        refs = tuple((handles.get(op_id, OpRef("atom", op_id)), lane) for op_id, lane in raw)
+        lane_needs: dict[str, tuple[bool, bool, bool]] = {}
+        for op_id, (needs_cube, needs_vec) in kinds.items():
+            lane = assignment.get(op_id, MAIN_STREAM)
+            prev_c, prev_v, prev_cv = lane_needs.get(lane, (False, False, False))
+            lane_needs[lane] = (
+                prev_c or needs_cube,
+                prev_v or needs_vec,
+                prev_cv or (needs_cube and needs_vec),
+            )
+        return lane_ids, events, raw, refs, lane_needs
+
+    def schedule(prepared, point, edges_verified):
+        lane_ids, events, raw, refs, lane_needs = prepared
+        lanes = tuple(lane for lane in point.lanes if lane.stream_id in lane_ids)
+        if {lane.stream_id for lane in lanes} != lane_ids:
+            return None, edges_verified
         try:
+            plan = None
             for rank, path in paths:
                 plan = StreamPlan(rank, lanes, raw, events)
                 owners = bind_stream_owners(plan, path)
-                for op_id, (needs_cube, needs_vec) in kinds.items():
-                    lane = assignment.get(op_id, MAIN_STREAM)
+                for lane, (needs_cube, needs_vec, needs_both) in lane_needs.items():
                     bound = owners[lane]
                     if (needs_cube and not bound.aic_limit) or (needs_vec and not bound.aiv_limit):
-                        return
-                    if needs_cube and needs_vec and bound.isolation == "disjoint":
+                        return None, edges_verified
+                    if needs_both and bound.isolation == "disjoint":
                         proportional_coupled_placement(bound, path, stream_id=lane)
-            lower_stream_edges(ops, plan)
+            if not edges_verified and plan is not None:
+                lower_stream_edges(ops, plan)
+                edges_verified = True
         except ModelingError:
-            return
-        refs = tuple((handles.get(op_id, OpRef("atom", op_id)), lane) for op_id, lane in raw)
-        return StreamSchedule(lanes, refs, events)
+            return None, edges_verified
+        return StreamSchedule(lanes, refs, events), edges_verified
 
     groups = []
     for assignment in layouts:
+        prepared = prepare_assignment(assignment)
         with_aux = "csa" in assignment.values()
         points = generate_gcd_core_lattice(aic, aiv, counts, include_three_stream=with_aux)
         for isolation in ("shared_cap", "disjoint"):
-            groups.append((assignment, iter(tuple(p for p in points if p.isolation == isolation))))
+            groups.append((prepared, iter(tuple(p for p in points if p.isolation == isolation)), [False]))
     while groups:
         pending = []
-        for assignment, points in groups:
+        for prepared, points, verified_flag in groups:
             for point in points:
-                candidate = schedule(assignment, point)
+                candidate, verified = schedule(prepared, point, verified_flag[0])
+                verified_flag[0] = verified
                 if candidate is not None:
                     yield candidate
-                    pending.append((assignment, points))
+                    pending.append((prepared, points, verified_flag))
                     break
         groups = pending
 
@@ -586,9 +603,13 @@ def solve_framework(
     def proposals(base, scenario, stage):
         ops = _atomic_ops(scenario)
         if stage == "F3_stream_core":
-            cands = tuple(_stream_candidates(scenario, ops))
-            search.note_eligible(1 if cands else 0)
-            yield from (_stream_plan(base, stage, op) for op in cands)
+            stream_iter = _stream_candidates(scenario, ops)
+            first = next(stream_iter, None)
+            search.note_eligible(1 if first is not None else 0)
+            if first is not None:
+                yield _stream_plan(base, stage, first)
+                for op in stream_iter:
+                    yield _stream_plan(base, stage, op)
             return
         operations = tuple(_local_operations(scenario, ops, mainline) if stage == "F1_local_k1"
                            else _collective_operations(ops, dual_report) if stage == "F2_collective_dbo"

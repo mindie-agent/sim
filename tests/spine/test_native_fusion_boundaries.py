@@ -479,7 +479,7 @@ def test_native_keypool_preserves_an_explicit_caller_category_override():
     overrides = dict(prepare_model(model, case.runtime, binding).quant.category_overrides)
     assert dict(overrides['indexer.pool_gate'])['weight_format'] == 'fp8_e4m3'
 def test_shared_prefix_keypool_plan_matches_the_published_op_bytes():
-    case = pool_case(tail_capacity=25, concurrency=4, prompt_tokens=131_201, prefix_tokens=131_072,
+    case = pool_case(tail_capacity=25, concurrency=4, prompt_tokens=131_201, output_tokens=16, prefix_tokens=131_072,
                      prefix_cache_mode='shared', prefix_read_mode='batch_shared', prefix_cache_key='shared_doc')
     ops = _ops(case, phase='decode', tokens=20, context=131_201, sequences=4)
     scored = find(ops, recipe='cann_pool_key_indexer')

@@ -420,6 +420,14 @@ def operator_costs(case, ops, *, recipes=None, primitives=None, replay_scope=Non
         engine = execution.engine
         ready = engine.submit("input_ready", release=input_ready_ms)
         program = execution.lower_program(context, recipe)
+        cp_binding = getattr(context, "collective_plan", None)
+        cp_plan = getattr(cp_binding, "plan", None) if cp_binding is not None else None
+        if (cp_plan is not None
+                and hasattr(cp_plan, "lower_with_local_work")
+                and getattr(recipe, "algorithm", None) is None
+                and getattr(cp_binding, "algorithm", None) != "direct_mesh"
+                and context.joint_native_service is None):
+            program = cp_plan.lower_with_local_work(context, program)
         program = execution._apply_resource_service_program(context, program)
         program = execution._apply_stream_owners_program(context, program)
         from .program import NativeProgram

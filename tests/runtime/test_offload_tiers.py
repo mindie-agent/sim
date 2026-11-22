@@ -50,7 +50,7 @@ from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.operators import OpSpec
 from mindie_sim.schema.workload import IterationPlan, RequestView
 pytestmark = pytest.mark.tier0
-TIER = OffloadPolicy(kvc_ddr_ratio=0.5, kvc_ssd_ratio=0.25)
+TIER = OffloadPolicy(kvc_ddr_ratio=0.5, kvc_ssd_ratio=0.25, ddr_bw_gbps=200.0, ssd_bw_gbps=14.0)
 INVALID_POLICIES = ({"expert_ddr_ratio": -0.01}, {"expert_ddr_ratio": 1.01}, {"ddr_bw_util": 1.5},
                     {"ssd_bw_util": 0.0}, {"ddr_bw_gbps": 0.0}, {"ddr_latency_us": -1.0},
                     {"kvc_prefetch_version": "v5"}, {"expert_offload_enabled": 1},
@@ -69,10 +69,9 @@ def catalog_case(**overrides):
 def tight_case(gpu_memory_utilization=0.03, **overrides):
     case = catalog_case(**overrides); case["runtime"]["gpu_memory_utilization"] = gpu_memory_utilization; case["runtime"]["max_model_len"] = 131072
     return case
-def with_offload(case_spec, *, ddr=0.5, ssd=0.25):
-    metadata = tuple(dict(case_spec.runtime.metadata).items()) + (
-        ("offload", {"kvc_ddr_ratio": ddr, "kvc_ssd_ratio": ssd}),)
-    return replace(case_spec, runtime=replace(case_spec.runtime, metadata=metadata))
+def with_offload(case_spec, *, ddr=0.5, ssd=0.25, ddr_bw_gbps=200.0, ssd_bw_gbps=14.0):
+    cfg = {"kvc_ddr_ratio": ddr, "kvc_ssd_ratio": ssd, **({"ddr_bw_gbps": ddr_bw_gbps} if ddr > 0 and ddr_bw_gbps is not None else {}), **({"ssd_bw_gbps": ssd_bw_gbps} if ssd > 0 else {})}
+    return replace(case_spec, runtime=replace(case_spec.runtime, metadata=tuple(dict(case_spec.runtime.metadata).items()) + (("offload", cfg),)))
 def execution(case_spec):
     return Execution(case_spec, CostModel(case_spec), include_serving_io=False)
 def work(views=None, ops=()):
@@ -101,10 +100,10 @@ def test_offload_policy_defaults_and_rebuild():
     assert (policy.expert_offload_enabled, policy.force_expert_offload,
             policy.expert_ddr_ratio, policy.kvc_ddr_ratio, policy.kvc_ssd_ratio) == (
         False, False, 0.0, 0.0, 0.0)
-    assert (policy.ddr_bw_gbps, policy.ddr_bw_util, policy.ddr_latency_us) == pytest.approx(
-        (200.0, 0.70, 5.0))
-    assert (policy.ssd_bw_gbps, policy.ssd_bw_util, policy.ssd_latency_us) == pytest.approx(
-        (14.0, 0.70, 80.0))
+    assert policy.ddr_bw_gbps is None and (policy.ddr_bw_util, policy.ddr_latency_us) == pytest.approx((0.70, 5.0))
+    assert policy.ssd_bw_gbps is None and (policy.ssd_bw_util, policy.ssd_latency_us) == pytest.approx((0.70, 80.0))
+    with pytest.raises(ValueError, match="missing_required_scenario_fields:ssd_bw_gbps"):
+        OffloadPolicy(kvc_ssd_ratio=0.25)
     assert (policy.kvc_prefetch_version, policy.mtp_ffn_hit_rate,
             policy.mtp_kvc_hit_rate) == ("v3", 0.0, 0.0)
     rebuilt = OffloadPolicy.from_mapping({
@@ -143,7 +142,7 @@ def test_memory_offload_metadata_and_resident_weight_shares():
     headroom = offloaded["physical_rank_headroom_bytes_per_replica_stage"]
     assert all(value >= 0 for replica in headroom for stage in replica for value in stage)
 def test_kvc_ratio_scales_resize_and_capacity_is_bounded():
-    parsed = parse_case(tight_case(gpu_memory_utilization=0.048, layers=8)); no_kvc = Memory(parsed, MemoryPolicy(expert_ddr_ratio=0.75)); with_kvc = Memory(parsed, MemoryPolicy(expert_ddr_ratio=0.75, kvc_ddr_ratio=0.5))
+    parsed = parse_case(tight_case(gpu_memory_utilization=0.048, layers=8, mtp_proposal_tokens=0)); no_kvc = Memory(parsed, MemoryPolicy(expert_ddr_ratio=0.75)); with_kvc = Memory(parsed, MemoryPolicy(expert_ddr_ratio=0.75, kvc_ddr_ratio=0.5))
     assert no_kvc.to_dict()["status"] == with_kvc.to_dict()["status"] == "feasible"
     context = 2 * 327680; raw, scaled = no_kvc.cache_bytes(context), with_kvc.cache_bytes(context)
     assert scaled == raw

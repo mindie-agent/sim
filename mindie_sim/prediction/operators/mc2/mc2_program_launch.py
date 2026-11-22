@@ -76,10 +76,12 @@ class _Mc2Program(Mc2ProgramState):
             for hop_index, hop in enumerate(message.hops):
                 demand = {str(name): float(amount)
                           for name, amount in hop.demand.items() if amount}
+                src_rank = group[_si] if (group and 0 <= _si < len(group)) else source
+                dst_rank = group[_di] if (group and 0 <= _di < len(group)) else destination
                 if (endpoint
                         and hop_index == len(message.hops) - 1
                         and source != destination
-                        and (not group or group[source] != group[destination])):
+                        and src_rank != dst_rank):
                     demand[endpoint] = demand.get(endpoint, 0.0) + float(useful)
                 service = engine.submit(
                     f"{name}:{phase.name}:{source}->{destination}:"
@@ -118,7 +120,7 @@ class _Mc2Program(Mc2ProgramState):
             frames += int(cell_frames)
             edges += 1
             useful_bytes += float(useful)
-            if not count and source in local_indices:
+            if not count and (_si in local_indices or source in local_indices):
                 peer_events[destination] = {
                     "send": first_service, "arrival": arrival,
                     "receive": None, "check": None,

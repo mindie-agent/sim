@@ -21,11 +21,15 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import replace
+import difflib
 import json
 from pathlib import Path
 from typing import Any
 
-from mindie_sim.backends.ascend import profiles as ascend_profiles
+from mindie_sim.backends.ascend import (
+    ASCEND_TOPOLOGY_PRESETS,
+    profiles as ascend_profiles,
+)
 from mindie_sim.backends.nvidia import profiles as nvidia_profiles
 from mindie_sim.catalog.specs import build_model_spec
 from mindie_sim.catalog.types import AuxiliarySpec, DraftSpec, QuantSpec, merge_source
@@ -46,6 +50,7 @@ MAX_METADATA_MIB = 50
 BYTES_PER_KIB = 1024
 BYTES_PER_GIB = BYTES_PER_KIB * BYTES_PER_KIB * BYTES_PER_KIB
 MX_EXPERT_BLOCK_GROUP = 32
+MX_SCALE_PACK = 2
 NEXTN_DEFAULT_HEAD_DIM = 192
 PP_CAP_DEFAULT = (1, 2, 4, 8, 16)
 A5_DT_425_AIC_CORES = 28
@@ -87,9 +92,15 @@ HARDWARE_ALIASES: dict[str, str] = {
     "950pr_958b": "Ascend950PR_958b", "ascend950pr_958b": "Ascend950PR_958b",
     "h20": "NVIDIA_H20", "h800": "NVIDIA_H800", "h200": "NVIDIA_H200",
     "b300": "NVIDIA_B300",
-    "800i-a2": "Ascend910B4", "800i-a3": "Ascend910_9392",
-    "800i-a3-8p": "Ascend910_9392", "800i-a3-16p": "Ascend910_9392",
+    "800i-a2": "Ascend910B4", "a2-8p": "Ascend910B4",
+    "800i-a3": "Ascend910_9392",
+    "800i-a3-8p": "Ascend910_9392", "a3-8p": "Ascend910_9392",
+    "800i-a3-16p": "Ascend910_9392", "a3-16p": "Ascend910_9392",
     "a3-pod": "Ascend910_9392",
+    "950dt-96g": "Ascend950DT_9582", "950dt-96g-pod": "Ascend950DT_9582",
+    "a5-96g-pod": "Ascend950DT_9582",
+    "950dt-144g": "Ascend950DT_9581", "950dt-144g-pod": "Ascend950DT_9581",
+    "a5-144g-pod": "Ascend950DT_9581",
     "a5-pod-dt": "Ascend950DT_9581", "a5-pod-pr": "Ascend950PR_9579",
     "a5-server-dt": "Ascend950DT_9581", "a5-server-pr": "Ascend950PR_9579",
     "a5-server-pr-pcie-16p": "Ascend950PR_9579",
@@ -123,18 +134,41 @@ for _canon_dt, _short_dt in (
 
 HARDWARE_TOPOLOGY_ALIASES: dict[str, tuple[str, str]] = {
     "800i-a2": ("Ascend910B4", "a2_standard"),
+    "a2-8p": ("Ascend910B4", "a2_standard"),
     "800i-a3": ("Ascend910_9392", "a3_16p"),
     "800i-a3-8p": ("Ascend910_9392", "a3_8p"),
+    "a3-8p": ("Ascend910_9392", "a3_8p"),
     "800i-a3-16p": ("Ascend910_9392", "a3_16p"),
+    "a3-16p": ("Ascend910_9392", "a3_16p"),
     "a3-pod": ("Ascend910_9392", "a3_superpod"),
     "a5-pod": ("Ascend950DT_9581", "a5_pod"),
     "atlas-950-superpod": ("Ascend950DT_9581", "a5_pod"),
+    "950dt-96g-pod": ("Ascend950DT_9582", "a5_pod"),
+    "a5-96g-pod": ("Ascend950DT_9582", "a5_pod"),
+    "950dt-144g-pod": ("Ascend950DT_9581", "a5_pod"),
+    "a5-144g-pod": ("Ascend950DT_9581", "a5_pod"),
     "a5-pod-dt": ("Ascend950DT_9581", "a5_pod"),
     "a5-pod-pr": ("Ascend950PR_9579", "a5_pod"),
     "a5-server-dt": ("Ascend950DT_9581", "a5_server"),
     "a5-server-pr": ("Ascend950PR_9579", "a5_server"),
     "a5-server-pr-pcie-16p": ("Ascend950PR_9579", "a5_pcie_16p"),
 }
+
+_QUANT_ALIASES: dict[str, str] = {
+    "w4a8_mxfp": "mxfp4",
+    "w4a8-mxfp": "mxfp4",
+    "w4a8_mxfp4": "mxfp4",
+    "w4a8-mxfp4": "mxfp4",
+    "mxfp4_w4a8": "mxfp4",
+    "w8a8_mxfp": "mxfp8",
+    "w8a8-mxfp": "mxfp8",
+    "w8a8_mxfp8": "mxfp8",
+    "w8a8-mxfp8": "mxfp8",
+    "c8": "int8",
+}
+
+_SUGGESTION_LIMIT = 5
+_SUGGESTION_CUTOFF = 0.35
 
 _EXTRA_QUANT_SPECS: dict[str, QuantSpec] = {
     "fp16": QuantSpec(
@@ -147,8 +181,35 @@ _EXTRA_QUANT_SPECS: dict[str, QuantSpec] = {
         expert_weight_format="mxfp4",
         weight_block=(1, MX_EXPERT_BLOCK_GROUP),
         expert_block=MX_EXPERT_BLOCK_GROUP,
-        scale_format="fp8_e8m0", scale_bytes=1.0, kv_dtype="bf16",
-        index_dtype="bf16", index_scale_dtype="none",
+        scale_format="fp8_e8m0", scale_bytes=1.0,
+        activation_group_size=MX_EXPERT_BLOCK_GROUP,
+        activation_scale_format="fp8_e8m0",
+        activation_scale_pack=MX_SCALE_PACK,
+        kv_dtype="bf16", index_dtype="bf16", index_scale_dtype="none",
+    ),
+    "mxfp4_all": QuantSpec(
+        name="MXFP4", weight_format="mxfp4", activation_format="fp8_e4m3",
+        expert_weight_format="mxfp4",
+        weight_block=(1, MX_EXPERT_BLOCK_GROUP),
+        expert_block=MX_EXPERT_BLOCK_GROUP,
+        scale_format="fp8_e8m0", scale_bytes=1.0,
+        activation_group_size=MX_EXPERT_BLOCK_GROUP,
+        activation_scale_format="fp8_e8m0",
+        activation_scale_pack=MX_SCALE_PACK,
+        kv_dtype="bf16", index_dtype="bf16", index_scale_dtype="none",
+    ),
+    "mxfp4_routed_only": QuantSpec(
+        name="mxfp4_routed_only", weight_format="bf16", activation_format="bf16",
+        expert_weight_format="mxfp4",
+        weight_block=(0, 0),
+        expert_block=MX_EXPERT_BLOCK_GROUP,
+        scale_format="fp8_e8m0", scale_bytes=1.0,
+        kv_dtype="bf16", index_dtype="bf16", index_scale_dtype="none",
+        exclusions=(
+            "attn", "mla", "kda", "shared_expert", "dense_mlp",
+            "router", "lm_head", "embedding", "norm", "mhc",
+            "vision", "projector", "conv_weight_f32",
+        ),
     ),
 }
 
@@ -165,11 +226,56 @@ def _ensure_registered_profiles() -> dict[str, Any]:
     return ascend_profiles()
 
 
+def _sku_hbm_gib(sku: str, reg: Mapping[str, Any]) -> int | None:
+    entry = reg.get(sku)
+    if not isinstance(entry, Mapping):
+        return None
+    mem = entry.get("memory_bytes")
+    if mem is None and isinstance(entry.get("device"), Mapping):
+        mem = entry["device"].get("memory_bytes")
+    return int(round(float(mem) / BYTES_PER_GIB)) if mem else None
+
+
+def _format_sku_suggestions(raw: str, reg: Mapping[str, Any]) -> str:
+    pool = sorted(set(reg) | set(HARDWARE_ALIASES))
+    matches = difflib.get_close_matches(
+        str(raw).strip(), pool, n=_SUGGESTION_LIMIT, cutoff=_SUGGESTION_CUTOFF,
+    )
+    if not matches:
+        matches = ["Ascend950DT_9582", "Ascend950DT_9581", "Ascend910_9392", "Ascend910B4", "950dt-96g-pod"]
+    parts: list[str] = []
+    for item in matches:
+        canon = HARDWARE_ALIASES.get(item.lower(), item)
+        gib = _sku_hbm_gib(canon, reg)
+        preset = HARDWARE_TOPOLOGY_ALIASES.get(item.lower(), ("", ""))[1]
+        detail = ", ".join(p for p in (f"{gib}GiB" if gib else "", f"preset={preset}" if preset else "") if p)
+        parts.append(f"{item} ({detail})" if detail else item)
+    presets = ", ".join(sorted(ASCEND_TOPOLOGY_PRESETS))
+    return f"closest valid: {', '.join(parts)}; presets: {presets}"
+
+
+def _format_model_suggestions(raw: str) -> str:
+    pool = sorted(set(CATALOG) | set(MODEL_ALIASES) | set(ARCHITECTURE_PRESET_CATALOG))
+    matches = difflib.get_close_matches(
+        str(raw).strip().lower(), pool, n=_SUGGESTION_LIMIT, cutoff=_SUGGESTION_CUTOFF,
+    ) or sorted(CATALOG)[:_SUGGESTION_LIMIT]
+    return f"closest valid: {', '.join(matches)}"
+
+
+def _format_quant_suggestions(raw: str) -> str:
+    from mindie_sim.catalog.quant import QUANTIZATION_PRESETS
+    pool = sorted(set(QUANTIZATION_PRESETS) | set(_EXTRA_QUANT_SPECS) | set(_QUANT_ALIASES))
+    matches = difflib.get_close_matches(
+        str(raw).strip().lower(), pool, n=_SUGGESTION_LIMIT, cutoff=_SUGGESTION_CUTOFF,
+    ) or ["bf16", "fp16", "w8a8", "w4a8", "mxfp8", "mxfp4", "fp8"]
+    return f"closest valid: {', '.join(matches)}"
+
+
 def resolve_hardware_sku(hardware: str) -> str:
     """Resolve a hardware alias or exact SKU name against registered profiles."""
-    if not isinstance(hardware, str) or not hardware.strip():
-        raise ModelingError(f"unknown_hardware_sku:{hardware}")
     reg = {**_ensure_registered_profiles(), **DERIVED_ASCEND_SKUS, **nvidia_profiles()}
+    if not isinstance(hardware, str) or not hardware.strip():
+        raise ModelingError(f"unknown_hardware_sku:{hardware} — {_format_sku_suggestions(str(hardware), reg)}")
     raw = hardware.strip()
     lower = raw.lower()
     if lower in HARDWARE_ALIASES:
@@ -185,7 +291,7 @@ def resolve_hardware_sku(hardware: str) -> str:
     custom = resolve_custom_hardware_sku(raw)
     if custom is not None:
         return str(custom["sku"])
-    raise ModelingError(f"unknown_hardware_sku:{hardware}")
+    raise ModelingError(f"unknown_hardware_sku:{hardware} — {_format_sku_suggestions(raw, reg)}")
 
 
 def _hardware_backend(sku: str) -> str:
@@ -262,7 +368,10 @@ def _resolve_model_spec(model: str | Path | Mapping[str, Any]) -> ModelSpec:
     cfg_candidate = CONFIG_DIR / (key if key.endswith(".json") else f"{key}.json")
     if cfg_candidate.is_file():
         return _resolve_model_spec(cfg_candidate)
-    return load_model(key)
+    try:
+        return load_model(key)
+    except (KeyError, ValueError, ModelingError) as exc:
+        raise ModelingError(f"unknown_model:{key} — {_format_model_suggestions(key)}") from exc
 
 
 def _apply_quant_override(
@@ -280,20 +389,34 @@ def _apply_quant_override(
                 return apply_model_overrides(model_spec, {"quantization": "w8a8"})
         return model_spec
     if isinstance(quant, str):
-        qkey = quant.strip().lower()
+        raw_key = quant.strip().lower()
+        qkey = _QUANT_ALIASES.get(raw_key, raw_key)
+        native_q = model_spec.quant
+        native_mxfp4_excluded = (
+            native_q is not None
+            and str(native_q.expert_weight_format) == "mxfp4"
+            and bool(native_q.exclusions)
+        )
+        if qkey in {"mxfp4", "mxfp4_routed_only"} and native_mxfp4_excluded:
+            return model_spec
         if qkey in _EXTRA_QUANT_SPECS:
             qspec = _EXTRA_QUANT_SPECS[qkey]
             return apply_model_overrides(
                 model_spec, {"quant": qspec.to_dict(), "kv_dtype": qspec.kv_dtype},
             )
-        return apply_model_overrides(model_spec, {"quantization": qkey})
+        try:
+            return apply_model_overrides(model_spec, {"quantization": qkey})
+        except (ValueError, ModelingError) as exc:
+            raise ModelingError(
+                f"invalid_quant_override:{quant} — {_format_quant_suggestions(raw_key)}"
+            ) from exc
     if isinstance(quant, Mapping):
         qdict = dict(quant)
         return apply_model_overrides(
             model_spec,
             {"quant": qdict, "kv_dtype": str(qdict.get("kv_dtype", model_spec.kv_dtype))},
         )
-    raise ModelingError(f"invalid_quant_override:{quant}")
+    raise ModelingError(f"invalid_quant_override:{quant} — {_format_quant_suggestions(str(quant))}")
 
 
 def _resolve_max_position_embeddings(

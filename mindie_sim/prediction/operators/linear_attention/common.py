@@ -11,6 +11,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import InitVar, dataclass, field, replace
+import math
 from types import MappingProxyType, SimpleNamespace
 from typing import Any, Literal
 
@@ -243,7 +244,16 @@ def validate_contract(op: OpSpec, ctx: OperatorPlanningContext) -> LinearAttenti
     if use_requests:
         lengths = tuple(length for length in request_lengths(ctx.requests) if length)
     else:
-        lengths = _lengths(metadata.get("lengths", metadata.get("sequence_lengths", metadata.get("sequence_tokens", ()))))
+        raw_lengths = metadata.get("lengths", metadata.get("sequence_lengths", metadata.get("sequence_tokens", ())))
+        if not raw_lengths:
+            views = getattr(ctx, "requests", ()) or getattr(ctx, "request_views", ()) or ()
+            raw_lengths = tuple(
+                int(getattr(v, "logical_q_len", getattr(v, "q_len", 0)) or 0)
+                for v in views
+                if not getattr(v, "padding", False)
+                and int(getattr(v, "logical_q_len", getattr(v, "q_len", 0)) or 0) > 0
+            )
+        lengths = _lengths(raw_lengths)
     dtype = metadata.get("dtype", op.dtype or "bf16")
     if operation == "causal_conv1d":
         channels, width = metadata.get("channels"), metadata.get("width", metadata.get("taps"))
@@ -722,15 +732,79 @@ def build_causal_conv1d_plan(contract: CausalConvContract, ctx: OperatorPlanning
                                "state_len": c.state_len, "state_offsets": c.state_offsets,
                                "speculative_width": c.speculative_width})
 
+def _resolve_recover_ssm_window(
+    c: LinearAttentionContract, ctx: OperatorPlanningContext,
+) -> int:
+    m = c.metadata
+    if "q" in m:
+        return m["q"]
+    if c.operation == "recover_ssm_verify":
+        return max(c.lengths)
+    q = min(c.lengths)
+    if q > 1:
+        return q
+    qt = m.get("query_tokens")
+    if isinstance(qt, int) and not isinstance(qt, bool) and qt > len(c.lengths):
+        return max(q, qt // len(c.lengths))
+    proposals = [
+        int(getattr(v, "draft_proposal_tokens", 0) or 0)
+        for v in (getattr(ctx, "requests", ()) or ())
+        if not getattr(v, "padding", False)
+    ]
+    return max(q, 1 + max(proposals)) if proposals and max(proposals) > 0 else q
+
+
+def _resolve_recover_ssm_accepted(
+    m: Mapping[str, Any], ctx: OperatorPlanningContext, q: int,
+) -> Any:
+    raw_a = m.get("a", m.get("accepted", m.get("accepted_tokens")))
+    if raw_a is None:
+        committed = m.get("committed_tokens")
+        if isinstance(committed, (tuple, list)) and committed:
+            counts = [
+                item[1] if isinstance(item, (tuple, list)) and len(item) >= 2 else item
+                for item in committed
+            ]
+            nums = [
+                float(v) for v in counts
+                if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(float(v))
+            ]
+            if nums:
+                raw_a = sum(nums) / len(nums)
+    if raw_a is None:
+        views = [
+            v for v in (getattr(ctx, "requests", ()) or getattr(ctx, "request_views", ()) or ())
+            if not getattr(v, "padding", False)
+        ]
+        if views:
+            adv = [int(getattr(v, "draft_advanced_tokens", 0) or 0) for v in views]
+            vals = adv if any(v > 0 for v in adv) else [
+                int(getattr(v, "draft_accepted_tokens", 0) or 0) for v in views
+            ]
+            raw_a = sum(vals) / len(vals)
+    if isinstance(raw_a, float) and not isinstance(raw_a, bool) and math.isfinite(raw_a):
+        return max(0, min(q, int(round(raw_a))))
+    return raw_a
+
+
 def build_recover_ssm_plan(contract: LinearAttentionContract, ctx: OperatorPlanningContext, *,
                            sources: tuple[SourceRef, ...] = (),
                            replay_bytes: Callable[[RecoverSsmCommitPlan], int] | None = None) -> OperatorPlan:
     c = contract
     m = c.metadata
-    q = m.get("q", max(c.lengths) if c.operation == "recover_ssm_verify" else min(c.lengths))
+    q = _resolve_recover_ssm_window(c, ctx)
     options = dict(q=q, heads=c.hv, sequences=len(c.lengths), state_dtype=c.state_dtype,
                    kg_dtype=m.get("kg_dtype", "bf16"), gated=m.get("gated", False), factors=m.get("factors"))
-    family = m.get("ssm_family", m.get("transition_family", m.get("family", "kda" if c.abi == "commit_recurrent_kda" else "gdn")))
+    family = m.get(
+        "ssm_family",
+        m.get(
+            "transition_family",
+            m.get(
+                "family",
+                m.get("recurrent_attention_kind", "kda" if c.abi == "commit_recurrent_kda" else "gdn"),
+            ),
+        ),
+    )
     owners = len(c.lengths) * c.hv * ceil_div(c.dv, c.bv)
     if c.operation == "recover_ssm_verify":
         verify = build_recover_ssm_verify(family, c.dk, c.dv, **options)
@@ -761,8 +835,9 @@ def build_recover_ssm_plan(contract: LinearAttentionContract, ctx: OperatorPlann
         result = {"q": q, "single_checkpoint": checkpoint, "output_tokens": tokens}
         transition = verify.transition
     else:
+        accepted = _resolve_recover_ssm_accepted(m, ctx, q)
         commit = build_recover_ssm_commit(
-            family, c.dk, c.dv, a=m.get("a", m.get("accepted")),
+            family, c.dk, c.dv, a=accepted,
             base_version=m.get("base_version", 0),
             boundary_checkpoints=m.get("boundary_checkpoints", m.get("boundaries", ())), **options,
         )

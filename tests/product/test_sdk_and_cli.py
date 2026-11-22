@@ -117,7 +117,7 @@ def test_typed_sdk_service_sla_sweep_and_production_capture_resolution():
     from dataclasses import replace
     from mindie_sim.prediction.results import SlaRequest, SweepRequest
     from mindie_sim.stack_registry import LoweringRequest, default_stack_registry
-    options = dict(SDK_DEFAULTS, prompt_tokens=32, output_tokens=2, concurrency=1)
+    options = dict(SDK_DEFAULTS, prompt_tokens=32, output_tokens=2, concurrency=1, ttft_slo_ms=5000.0)
     case = sdk_api.compose_case("qwen3-32b", hardware=REPRESENTATIVE_SKUS["a2"], options=options)
     service = sdk_api.evaluate_service(case)
     assert service.completed_requests >= 1 and service.emitted_tokens >= 2 and service.span_ms > 0
@@ -245,13 +245,13 @@ def test_cli_compose_efficiency_and_sla_end_to_end(tmp_path):
 
 def test_cli_sweep_modes(tmp_path):
     case_path = tmp_path / "case.json"
-    case = compose_raw_case("qwen3.5-35b-a3b", "a3", tp=2, dp=2, ep=4, layers=1)
+    case = compose_raw_case("qwen3.5-35b-a3b", "a3", tp=2, dp=2, ep=4, layers=1, prompt_tokens=128, output_tokens=16)
     case["runtime"]["max_num_seqs"] = 4
     case_path.write_text(json.dumps(case), encoding="utf-8")
     args = ("sweep", str(case_path), "--mode")
-    topo = _cli_json(tmp_path / "topo.json", *args, "topology", "--num-devices", "4", "--context", "512", "--sla-ms", "0.5")
+    topo = _cli_json(tmp_path / "topo.json", *args, "topology", "--num-devices", "4", "--context", "512", "--sla-ms", "0.5", "--output-budget", "16")
     pd = _cli_json(tmp_path / "pd.json", *args, "pd", "--num-devices", "8", "--prompt-tokens", "128",
-                   "--output-tokens", "16", "--tpot-sla-ms", "0.5")
+                   "--output-tokens", "16", "--ttft-sla-ms", "2000.0", "--tpot-sla-ms", "0.5")
     assert topo["schema"] == "mindie-sim.topology-sweep/1" and "pd" in pd["schema"]
 
 EXCHANGE_LATENCY_US = (("a5-pod-dt", (8.364917647058823, 16.222870588235295), (9.864917647058826, 17.7228705882353)),
@@ -261,7 +261,8 @@ EXCHANGE_LATENCY_US = (("a5-pod-dt", (8.364917647058823, 16.222870588235295), (9
 def test_expert_exchange_charges_payload_and_topology(hardware, ideal_us, duration_us):
     case = compose_raw_case("glm5.3", hardware, dp=64, tp=1, ep=64, layers=4,
                             prompt_tokens=131072, output_tokens=1024, concurrency=1216,
-                            mtp_proposal_tokens=5, mtp_acceptance_length=4.5, tpot_slo_ms=20.0)
+                            mtp_proposal_tokens=5, mtp_acceptance_length=4.5, tpot_slo_ms=20.0,
+                            exclude_optimizations=("cann_megamoe_fusion",))
     report = analyze_network_efficiency(case, **(DECODE | dict(tokens=6, context=131072)), sequences=19, run_graph=False)
     rows = {row["recipe"]: row for row in report["operators"]}
     # Remote rows/rank multiply the FP8-plus-scale dispatch or BF16 combine payload.
@@ -592,7 +593,7 @@ def test_token_quota_preserves_declared_request_length():
 def test_isolated_worker_runs_and_times_out():
     from mindie_sim.sweep import sweep_topologies_iter
     raw = compose_raw_case("qwen3-32b", "a3", tp=1, ep=1, pp=1, num_devices=1, layers=2, prompt_tokens=8, output_tokens=2, concurrency=1, max_num_seqs=1)
-    kw = {"context": 8, "output_budget": 2, "max_sequences_per_dp": 1}
+    kw = {"sla_ms": 30.0, "context": 8, "output_budget": 2, "max_sequences_per_dp": 1}
     rows = list(sweep_topologies_iter(raw, two_stage=True, finalist_top_k=1, isolate_workers=True, candidate_timeout_s=120.0, num_devices=1, **kw))
     assert any(row["evaluation_stage"] == "b1_screen" for row in rows) and any(row["evaluation_stage"] == "full_sla" for row in rows)
     timed_out = list(sweep_topologies_iter(raw, isolate_workers=True, candidate_timeout_s=1e-9, num_devices=1, **kw))

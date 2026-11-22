@@ -10,6 +10,7 @@
 import math
 from collections import defaultdict
 
+from mindie_sim.catalog.cache import layer_cache_components
 from mindie_sim.coverage import combine_coverage
 from mindie_sim.schema.common import ModelingError
 
@@ -79,13 +80,15 @@ def predict_pd(raw, *, primitives=None, recipes=None, submission=None, memory_po
     # The direct PD entry enforces the same structural timing gate as predict.
     from ..unmodeled_gate import assert_timing_supported
     assert_timing_supported(raw, entry="predict")
-    if scope == "body":
+    has_geometry = any(v is not None for v in (phase, tokens, context, sequences))
+    if scope in {"body", "model"} or (scope == "serving" and has_geometry):
         from ..api import predict
-        return predict(raw, scope=scope, phase=phase, tokens=tokens, context=context,
+        resolved_scope = "model" if scope == "model" else "body"
+        return predict(raw, scope=resolved_scope, phase=phase, tokens=tokens, context=context,
                        sequences=sequences, primitives=primitives, recipes=recipes,
                        lower=lower, event_limit=event_limit)
-    if scope != "serving" or any(v is not None for v in (phase, tokens, context, sequences)):
-        raise ModelingError("prediction_geometry_requires_body_scope")
+    if scope != "serving":
+        raise ModelingError(f"invalid_prediction_scope:{scope}")
     pools = raw["pools"]
     common = {key: value for key, value in raw.items() if key not in {"pools", "connector"}}
     cases = {name: parse_case({**common, **pools[name], "model": raw["model"], "workload": raw["workload"]})
@@ -165,7 +168,18 @@ def predict_pd(raw, *, primitives=None, recipes=None, submission=None, memory_po
             if memory["decode"].sparse_offload:
                 volume, decode_local = memory["decode"].pd_handoff_volume_and_stage_hbm(state.computed)
             else:
-                decode_local = memory["decode"].cache_bytes(state.computed, padded=False)
+                target_stage = [0.0] * max(1, int(p.pp))
+                d_case = cases["decode"]
+                d_mem = memory["decode"]
+                for layer in d_case.model.layer_plans:
+                    comps = layer_cache_components(
+                        d_case.model, layer, p, state.computed,
+                        capacity_padded=False, interleave=d_case.runtime.kv_block_size,
+                    )
+                    target_stage[d_mem.layer_stage[layer.index]] += sum(
+                        float(v) for v in comps.values()
+                    )
+                decode_local = tuple(target_stage)
                 volume = sum(decode_local) * p.tp * p.pcp
             demands = {}
             for pool in ("prefill", "decode"):

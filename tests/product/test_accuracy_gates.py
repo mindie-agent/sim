@@ -277,16 +277,12 @@ def _rel(actual: float, measured: float) -> float:
 def _case(model, hardware, *, quant=None, tp=1, dp=1, ep=1, pp=1, pcp=1, sp=False,
           rpn=None, layers=2, experts=8, topk=2, mtp=0, accept=1.0, shared=False, recipe=None):
     kw = dict(model=model, hardware=hardware, tp=tp, dp=dp, ep=ep, pp=pp, pcp=pcp, sp=sp,
-        layers=layers, n_routed_experts=experts, num_experts_per_tok=topk,
-        prompt_tokens=64, output_tokens=8, concurrency=1, max_model_len=131072,
-        enable_shared_expert_dp=shared,)
-    if quant is not None:
-        kw["quant"] = quant
-    if rpn is not None:
-        kw["ranks_per_node"] = rpn
-    if mtp:
-        kw["mtp_proposal_tokens"] = mtp
-        kw["mtp_acceptance_length"] = accept
+        layers=layers, n_routed_experts=experts, num_experts_per_tok=topk, prompt_tokens=64,
+        output_tokens=8, concurrency=1, max_model_len=131072, enable_shared_expert_dp=shared,
+        multistream_overlap_shared_expert=False, enable_fused_mc2=0, mtp_proposal_tokens=mtp)
+    if quant is not None: kw["quant"] = quant
+    if rpn is not None: kw["ranks_per_node"] = rpn
+    if mtp: kw["mtp_acceptance_length"] = accept
     case = compose_case(**kw)
     if recipe:
         case["runtime"]["moe_recipe"] = recipe
@@ -294,12 +290,13 @@ def _case(model, hardware, *, quant=None, tp=1, dp=1, ep=1, pp=1, pcp=1, sp=Fals
     return case
 
 def _row_case(row, **overrides):
-    _, model, hardware, quant, _, tp, dp, ep, rpn, layers, experts, *_ = row
+    _, model, hardware, quant, _, tp, dp, ep, rpn, layers, experts, phase, *_ = row
     options = dict(quant=quant, tp=tp, dp=dp, ep=ep, layers=layers, n_routed_experts=experts,
                    num_experts_per_tok=2, prompt_tokens=64, output_tokens=8, concurrency=1,
-                   max_model_len=131072)
-    if rpn is not None:
-        options["ranks_per_node"] = rpn
+                   max_model_len=131072, multistream_overlap_shared_expert=False,
+                   engram_cpu_offload=False, enable_shared_expert_dp=False, mtp_proposal_tokens=0)
+    if phase == "decode": options["exclude_optimizations"] = ("cann_megamoe_fusion",)
+    if rpn is not None: options["ranks_per_node"] = rpn
     return compose_case(model, hardware, **(options | overrides))
 
 def _step(case, phase, tokens, context, sequences):

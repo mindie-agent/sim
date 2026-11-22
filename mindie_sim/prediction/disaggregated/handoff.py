@@ -517,3 +517,156 @@ def _register_consumer_release(engine, request, releases, device_complete,
                       "request_id": request, "rank": rank},
             on_complete=lambda _event, target=release, rank=rank:
                 _consumer_release_done(engine, target, on_consumer, rank))
+
+
+class _CohortStageTopology:
+    """Minimal disjoint stage-rank topology over one request's P or D shard cohort."""
+
+    def __init__(self, parallel, *, rank_offset: int = 0) -> None:
+        self._pp = max(1, int(parallel.pp))
+        dcp_dp = max(1, int(getattr(parallel, "dcp_dp_width", 1) or 1))
+        self._width = max(1, int(parallel.tp) * int(parallel.pcp) * dcp_dp)
+        self._offset = int(rank_offset)
+
+    def ranks(self, replica: int, stage: int) -> tuple[int, ...]:
+        base = self._offset + (int(replica) * self._pp + int(stage)) * self._width
+        return tuple(range(base, base + self._width))
+
+
+def _union_interval_length(intervals) -> float:
+    """Exact total length of the union of half-open ``(lo, hi)`` byte intervals."""
+    ordered = sorted(
+        (float(lo), float(hi)) for lo, hi in intervals if float(hi) > float(lo)
+    )
+    if not ordered:
+        return 0.0
+    total = 0.0
+    cur_lo, cur_hi = ordered[0]
+    for lo, hi in ordered[1:]:
+        if lo <= cur_hi:
+            cur_hi = max(cur_hi, hi)
+        else:
+            total += cur_hi - cur_lo
+            cur_lo, cur_hi = lo, hi
+    return total + (cur_hi - cur_lo)
+
+
+def compute_pd_handoff_plan(
+    prefill_case,
+    decode_case,
+    *,
+    tokens: int,
+    prefill_memory=None,
+    decode_memory=None,
+) -> dict:
+    """Compute exact shard-aware PD KV/Indexer handoff bytes via ``_pd_handoff_binding``.
+
+    Accounts for TP, DCP (including ``dcp_dp_width > 1`` cohorts), PCP, PP,
+    sliding-window clipping, MLA/GQA/Indexer components, and sparse offload,
+    returning both direct D2D transfer totals and deduplicated unique KV bytes
+    for three-tier HBM/DRAM/SSD KV pooling.
+    """
+    from collections import defaultdict as _defaultdict
+    from types import SimpleNamespace
+    from ..capacity import Memory
+    from ..structure import parse_case
+
+    p_case = parse_case(prefill_case)
+    d_case = parse_case(decode_case)
+    p_mem = prefill_memory if prefill_memory is not None else Memory(p_case)
+    d_mem = decode_memory if decode_memory is not None else Memory(d_case)
+    n_tokens = max(0, int(tokens))
+    if n_tokens <= 0:
+        return {
+            "total_transfer_bytes": 0.0,
+            "unique_kv_bytes": 0.0,
+            "hbm_transfer_bytes": 0.0,
+            "host_transfer_bytes": 0.0,
+            "per_layer_bytes": {},
+            "tail_layer_bytes": 0.0,
+            "source_rank_bytes": {},
+            "destination_rank_bytes": {},
+            "unique_source_rank_bytes": {},
+            "source_ranks": (),
+            "destination_ranks": (),
+            "transfer_count": 0,
+        }
+    p_topo = _CohortStageTopology(p_case.runtime.parallel, rank_offset=0)
+    p_span = p_topo._pp * p_topo._width
+    d_topo = _CohortStageTopology(d_case.runtime.parallel, rank_offset=p_span)
+    execution = {
+        "prefill": SimpleNamespace(topology=p_topo),
+        "decode": SimpleNamespace(topology=d_topo),
+    }
+    d_par = d_case.runtime.parallel
+    d_cohort_width = d_par.tp * d_par.pcp * max(1, int(d_par.dcp_dp_width))
+    if d_mem.sparse_offload:
+        volume, decode_local = d_mem.pd_handoff_volume_and_stage_hbm(n_tokens)
+        draft_kv_bytes = 0.0
+    else:
+        target_stage = [0.0] * max(1, int(d_par.pp))
+        for layer in d_case.model.layer_plans:
+            comps = layer_cache_components(
+                d_case.model, layer, d_par, n_tokens,
+                capacity_padded=False, interleave=d_case.runtime.kv_block_size,
+            )
+            target_stage[d_mem.layer_stage[layer.index]] += sum(
+                float(v) for v in comps.values()
+            )
+        decode_local = tuple(target_stage)
+        volume = float(sum(decode_local)) * float(d_cohort_width)
+        full_decode_bytes = float(sum(d_mem.cache_bytes(n_tokens, padded=False))) * float(d_cohort_width)
+        both_draft = bool(
+            dict(p_case.runtime.metadata).get("draft_proposal_tokens", 0)
+            and dict(d_case.runtime.metadata).get("draft_proposal_tokens", 0)
+        )
+        draft_kv_bytes = max(0.0, full_decode_bytes - volume) if both_draft else 0.0
+    req_id = "__pd_handoff__"
+    placement = {("prefill", req_id): 0, ("decode", req_id): 0}
+    handoff, src_ranks, dst_ranks = _pd_handoff_binding(
+        req_id, n_tokens, placement,
+        {"prefill": p_case, "decode": d_case},
+        {"prefill": p_mem, "decode": d_mem},
+        execution, decode_local, volume, {},
+    )
+    src_bytes: dict[int, float] = _defaultdict(float)
+    dst_bytes: dict[int, float] = _defaultdict(float)
+    per_layer: dict[int, float] = _defaultdict(float)
+    unique_ranges: dict[tuple[int, str], list[tuple[float, float]]] = _defaultdict(list)
+    hbm_total = 0.0
+    host_total = 0.0
+    for item in handoff.transfers:
+        payload = float(item.payload_bytes)
+        src_bytes[int(item.source_rank)] += payload
+        dst_bytes[int(item.destination_rank)] += payload
+        if item.destination_tier == "host":
+            host_total += payload
+        else:
+            hbm_total += payload
+        for layer_idx in item.source_layers or (0,):
+            per_layer[int(layer_idx)] += payload / float(max(1, len(item.source_layers or (0,))))
+        if item.source_byte_range:
+            unique_ranges[(int(item.source_rank), str(item.source_storage))].append(
+                (float(item.source_byte_range[0]), float(item.source_byte_range[1]))
+            )
+    unique_by_src: dict[int, float] = _defaultdict(float)
+    for (s_rank, _storage), spans in unique_ranges.items():
+        unique_by_src[s_rank] += _union_interval_length(spans)
+    total_bytes = hbm_total + host_total
+    unique_total = sum(unique_by_src.values()) if unique_by_src else total_bytes
+    tail_bytes = float(per_layer[max(per_layer)]) if per_layer else 0.0
+    return {
+        "total_transfer_bytes": float(total_bytes),
+        "unique_kv_bytes": float(unique_total),
+        "draft_kv_bytes": float(draft_kv_bytes),
+        "hbm_transfer_bytes": float(hbm_total),
+        "host_transfer_bytes": float(host_total),
+        "per_layer_bytes": {k: float(v) for k, v in sorted(per_layer.items())},
+        "tail_layer_bytes": float(tail_bytes),
+        "source_rank_bytes": {k: float(v) for k, v in sorted(src_bytes.items())},
+        "destination_rank_bytes": {k: float(v) for k, v in sorted(dst_bytes.items())},
+        "unique_source_rank_bytes": {k: float(v) for k, v in sorted(unique_by_src.items())},
+        "source_ranks": tuple(int(r) for r in src_ranks),
+        "destination_ranks": tuple(int(r) for r in dst_ranks),
+        "transfer_count": len(handoff.transfers),
+    }

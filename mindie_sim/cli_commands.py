@@ -23,13 +23,16 @@ from . import api as sdk_api
 from . import predict
 from .cli_onboarding import ONBOARDING_COMMANDS, run_onboarding_command
 from .cli_sku import SKU_COMMANDS, run_sku_command
+from .prediction.offload.policy import missing_scenario_error
 from .prediction.primitives import PrimitiveKey, PrimitiveStore
 from .prediction.results import ReplayOptions, StepRequest, json_payload
 from .prediction.structure import parse_case
 
 MIB_BYTES = 1024 * 1024
 MAX_CLI_JSON_BYTES = 50 * MIB_BYTES
-DEFAULT_PD_DIES = 16
+BYTES_PER_TB = 1e12
+GIB_DECIMALS = 1
+TBPS_DECIMALS = 3
 
 
 class CliUsageError(RuntimeError):
@@ -307,19 +310,52 @@ def _dispatch_sweep(args: argparse.Namespace) -> object:
         case_overrides,
         load_hardware_derivations,
     )
-    from .sweep import sweep_pd_disaggregation_ratios, sweep_topologies
+    from .sweep import (
+        solve_optimal_deployment,
+        sweep_pd_disaggregation_ratios,
+        sweep_topologies,
+    )
 
     case_data = apply_case_mapping_overrides(read_json(args.case), case_overrides(args))
-    if args.mode == "pd":
-        decode_data = read_json(args.decode_case) if args.decode_case else case_data
-        return sweep_pd_disaggregation_ratios(
-            case_data,
-            decode_data,
-            total_dies=args.num_devices or DEFAULT_PD_DIES,
+    if args.mode == "auto":
+        parsed = parse_case(case_data)
+        return solve_optimal_deployment(
+            parsed.model.to_dict(),
+            parsed.machine.to_dict(),
+            num_devices=args.num_devices,
             prompt_tokens=args.prompt_tokens,
             output_tokens=args.output_tokens,
             ttft_sla_ms=args.ttft_sla_ms,
             tpot_sla_ms=args.tpot_sla_ms,
+            deployment=str(getattr(args, "deployment", "auto") or "auto"),
+            pd_transfer_mode=getattr(args, "pd_transfer_mode", None),
+            kv_transfer_bw_gbps=getattr(args, "kv_transfer_bw_gbps", None),
+            pool_dram_ratio=getattr(args, "pool_dram_ratio", None),
+            pool_ssd_ratio=float(getattr(args, "pool_ssd_ratio", 0.0) or 0.0),
+            pool_prefix_hit_ratio=float(getattr(args, "pool_prefix_hit_ratio", 0.0) or 0.0),
+            ddr_bw_gbps=getattr(args, "ddr_bw_gbps", None),
+            ssd_bw_gbps=getattr(args, "ssd_bw_gbps", None),
+        )
+    if args.mode == "pd":
+        if args.num_devices is None:
+            raise missing_scenario_error(("num_devices",))
+        decode_data = read_json(args.decode_case) if args.decode_case else case_data
+        pd_mode = getattr(args, "pd_transfer_mode", None) or "direct_blocking_d2d"
+        return sweep_pd_disaggregation_ratios(
+            case_data,
+            decode_data,
+            total_dies=int(args.num_devices),
+            prompt_tokens=args.prompt_tokens,
+            output_tokens=args.output_tokens,
+            ttft_sla_ms=args.ttft_sla_ms,
+            tpot_sla_ms=args.tpot_sla_ms,
+            kv_transfer_bw_gbps=getattr(args, "kv_transfer_bw_gbps", None),
+            pd_transfer_mode=pd_mode,
+            pool_dram_ratio=getattr(args, "pool_dram_ratio", None),
+            pool_ssd_ratio=float(getattr(args, "pool_ssd_ratio", 0.0) or 0.0),
+            pool_prefix_hit_ratio=float(getattr(args, "pool_prefix_hit_ratio", 0.0) or 0.0),
+            ddr_bw_gbps=getattr(args, "ddr_bw_gbps", None),
+            ssd_bw_gbps=getattr(args, "ssd_bw_gbps", None),
         )
     if args.resume and not (args.output_jsonl or args.checkpoint_jsonl):
         raise CliUsageError("--resume requires --checkpoint-jsonl or --output-jsonl")
@@ -379,6 +415,26 @@ def _dispatch_sla(args: argparse.Namespace) -> object:
     from .prediction.efficiency import DEFAULT_SLA_SCENARIOS, solve_sla_sizing
 
     case_data = apply_case_mapping_overrides(read_json(args.case), case_overrides(args))
+    parsed = parse_case(case_data)
+    resolved_sla = args.sla_ms
+    if resolved_sla is None:
+        resolved_sla = parsed.slo.ttft_ms if args.phase == "prefill" else parsed.slo.tpot_ms
+    resolved_output = args.output_budget
+    if resolved_output is None:
+        meta = dict(parsed.runtime.metadata)
+        reqs = tuple(parsed.workload.requests or ())
+        if (meta.get("scenario_declared", True) is not False
+                and reqs and reqs[0].request_id != "__structure_probe__"):
+            resolved_output = int(reqs[0].output_tokens)
+    missing = [
+        name for name, val in (
+            ("sla_ms", resolved_sla),
+            ("context", args.context),
+            ("output_budget", resolved_output),
+        ) if val is None
+    ]
+    if missing:
+        raise missing_scenario_error(missing)
     has_custom_scale = any(
         v is not None for v in (
             args.hbm_bw_scale, args.cube_flops_scale, args.vector_ops_scale,
@@ -411,14 +467,14 @@ def _dispatch_sla(args: argparse.Namespace) -> object:
     )
     result = solve_sla_sizing(
         case_data,
-        sla_ms=args.sla_ms,
-        context=args.context,
+        sla_ms=float(resolved_sla),
+        context=int(args.context),
         tokens_per_seq=args.tokens_per_seq,
         emitted_tokens_per_seq=args.emitted_tokens_per_seq,
         max_sequences_per_dp=args.max_sequences_per_dp,
         phase=args.phase,
         scope=args.scope,
-        output_budget=args.output_budget,
+        output_budget=int(resolved_output),
         scenarios=scenarios,
         sensitivity=args.sensitivity,
         jobs=jobs,
@@ -426,6 +482,113 @@ def _dispatch_sla(args: argparse.Namespace) -> object:
     result["sensitivity"] = args.sensitivity
     result["jobs"] = jobs
     return result
+
+
+def _dispatch_catalog(args: argparse.Namespace) -> object:
+    """Fast (< 50ms) discovery for models, hardware SKUs, topology presets, and quant modes."""
+    want_hw = bool(getattr(args, "hardware", False))
+    want_presets = bool(getattr(args, "presets", False))
+    want_quant = bool(getattr(args, "quant", False))
+    if not (want_hw or want_presets or want_quant):
+        from .model_catalog import list_models, load_model
+        return load_model(args.name).to_dict() if args.name else list_models()
+
+    out: dict[str, Any] = {"schema": "mindie-sim.catalog/1"}
+    if want_hw:
+        from .backends.ascend import profiles as ascend_profiles
+        from .backends.nvidia import profiles as nvidia_profiles
+        from .compose_inputs import (
+            BYTES_PER_GIB,
+            DERIVED_ASCEND_SKUS,
+            HARDWARE_ALIASES,
+            HARDWARE_TOPOLOGY_ALIASES,
+        )
+        from .primitives import load_manifest
+
+        calibrated = set((load_manifest().get("tables") or {}).keys())
+        aliases_by_sku: dict[str, list[str]] = {}
+        for alias, target in sorted(HARDWARE_ALIASES.items()):
+            aliases_by_sku.setdefault(target, []).append(alias)
+        for alias, (target, preset) in sorted(HARDWARE_TOPOLOGY_ALIASES.items()):
+            tag = f"{alias} ({preset})"
+            if tag not in aliases_by_sku.setdefault(target, []):
+                aliases_by_sku[target].append(tag)
+        skus: list[dict[str, Any]] = []
+        reg = {**ascend_profiles(), **nvidia_profiles()}
+        for sku_name, prof in sorted(reg.items()):
+            dev = prof.get("device") or {}
+            mem_b = float(dev.get("memory_bytes") or 0.0)
+            hbm_bps = float((dev.get("rates") or {}).get("memory") or 0.0)
+            res_units = dev.get("resource_units") or {}
+            skus.append({
+                "sku": sku_name,
+                "architecture": prof.get("architecture", ""),
+                "hbm_gib": round(mem_b / float(BYTES_PER_GIB), GIB_DECIMALS) if mem_b else None,
+                "aic_count": dev.get("compute_units"),
+                "aiv_count": res_units.get("vector"),
+                "hbm_bw_tbps": round(hbm_bps / BYTES_PER_TB, TBPS_DECIMALS) if hbm_bps else None,
+                "l0_calibrated": sku_name in calibrated,
+                "aliases": aliases_by_sku.get(sku_name, []),
+            })
+        for sku_name, spec in sorted(DERIVED_ASCEND_SKUS.items()):
+            skus.append({
+                "sku": sku_name,
+                "architecture": "derived",
+                "base_sku": spec["base"],
+                "hbm_gib": round(float(spec["memory_bytes"]) / float(BYTES_PER_GIB), GIB_DECIMALS),
+                "aic_count": spec.get("aic_count"),
+                "l0_calibrated": spec["base"] in calibrated,
+                "aliases": aliases_by_sku.get(sku_name, []),
+            })
+        out["hardware"] = skus
+    if want_presets:
+        from .backends.ascend import ASCEND_TOPOLOGY_PRESETS
+        out["presets"] = {name: dict(cfg) for name, cfg in sorted(ASCEND_TOPOLOGY_PRESETS.items())}
+    if want_quant:
+        from .catalog.quant import QUANTIZATION_PRESETS
+        from .compose_inputs import _EXTRA_QUANT_SPECS, _QUANT_ALIASES
+        out["quant"] = {
+            "presets": sorted(set(QUANTIZATION_PRESETS) | set(_EXTRA_QUANT_SPECS)),
+            "aliases": dict(sorted(_QUANT_ALIASES.items())),
+            "cache_dtypes": ["bf16", "fp16", "fp8_e4m3", "fp8", "int8", "c8"],
+        }
+    return out
+
+
+def _dispatch_solve(args: argparse.Namespace) -> object:
+    from .solve import solve_deployment
+    return solve_deployment(
+        args.model,
+        args.hardware,
+        num_devices=args.num_devices,
+        prompt_tokens=args.prompt_tokens,
+        output_tokens=args.output_tokens,
+        tpot_slo_ms=args.tpot_slo_ms,
+        ttft_slo_ms=args.ttft_slo_ms,
+        mtp_tokens=args.mtp_tokens,
+        mtp_accept=args.mtp_accept,
+        kv_pooling=args.kv_pooling,
+        deployment=args.deployment,
+        quant=args.quant,
+        kv_cache_dtype=args.kv_cache_dtype,
+        indexer_kv_dtype=args.indexer_kv_dtype,
+        topology_preset=args.topology_preset,
+        ranks_per_node=args.ranks_per_node,
+        layers=args.layers,
+        max_sequences_per_dp=args.max_sequences_per_dp,
+        ablate_prs=bool(args.ablate_prs),
+        pool_dram_ratio=args.pool_dram_ratio,
+        pool_ssd_ratio=float(args.pool_ssd_ratio or 0.0),
+        pool_prefix_hit_ratio=float(args.pool_prefix_hit_ratio or 0.0),
+        ddr_bw_gbps=args.ddr_bw_gbps,
+        ssd_bw_gbps=args.ssd_bw_gbps,
+        kv_transfer_bw_gbps=args.kv_transfer_bw_gbps,
+        raw_eager=bool(args.raw_eager),
+        xlsx_path=getattr(args, "xlsx", None),
+        trace_path=getattr(args, "trace", None),
+        compare_track=str(getattr(args, "compare_track", None) or "unmerged_pr"),
+        target_track=str(getattr(args, "target_track", None) or "expected_ideal"),
+    )
 
 
 def dispatch(args: argparse.Namespace, /) -> object:
@@ -539,8 +702,9 @@ def dispatch(args: argparse.Namespace, /) -> object:
     if cmd == "inspect":
         return _inspect_case(read_json(args.case))
     if cmd == "catalog":
-        from .model_catalog import list_models, load_model
-        return load_model(args.name).to_dict() if args.name else list_models()
+        return _dispatch_catalog(args)
+    if cmd == "solve":
+        return _dispatch_solve(args)
     if cmd == "observations":
         from .observations.store import ObservationIndex
         with ObservationIndex(args.index) as index:
@@ -593,17 +757,33 @@ def dispatch(args: argparse.Namespace, /) -> object:
             **compose_case_kwargs(args),
         )
     if cmd == "feature-tracks":
+        from .cli_options import _linear_tp
         from .feature_waterfall import compare_feature_tracks
+        ft_kw: dict[str, Any] = dict(
+            tp=args.tp or 1, dp=args.dp or 1, ep=args.ep or 1,
+            pp=args.pp or 1, pcp=args.pcp or 1, dcp=args.dcp or 1,
+            num_devices=args.num_devices, ranks_per_node=args.ranks_per_node,
+            layers=args.layers, quant=args.quant,
+            kv_cache_dtype=args.kv_cache_dtype,
+            indexer_kv_dtype=args.indexer_kv_dtype,
+            topology_preset=args.topology_preset,
+            mtp_proposal_tokens=args.mtp_tokens or 0,
+            linear_proj_tp=_linear_tp(args),
+        )
+        if args.mtp_accept is not None:
+            ft_kw["mtp_acceptance_length"] = float(args.mtp_accept)
+        for key in ("q_proj_tp", "o_proj_tp", "dcp_linear_tp",
+                    "mlp_tp", "shared_expert_tp", "lm_head_tp"):
+            val = getattr(args, key, None)
+            if val is not None:
+                ft_kw[key] = int(val)
         return compare_feature_tracks(
             args.model, args.hardware,
             runtime_stack=(args.stack_manifest or args.stack),
             phase=args.phase, tokens=args.tokens, context=args.context,
             sequences=args.sequences, scope=args.scope,
             ablate_prs=bool(args.ablate_prs),
-            tp=args.tp or 1, dp=args.dp or 1, ep=args.ep or 1,
-            pp=args.pp or 1, pcp=args.pcp or 1, dcp=args.dcp or 1,
-            num_devices=args.num_devices, layers=args.layers,
-            quant=args.quant, mtp_proposal_tokens=args.mtp_tokens or 0,
+            **ft_kw,
         )
     if cmd == "sweep":
         return _dispatch_sweep(args)

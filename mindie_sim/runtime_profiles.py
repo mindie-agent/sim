@@ -188,13 +188,15 @@ VA_RECOMMENDED_PROFILES = {
         tutorial_flags={"enable_flashcomm1": True},
     ),
     "kimi-k3.1": _p(
-        {"a3": "w4a8"}, MTP_STANDARD_PROPOSAL_TOKENS,
+        {"a3": "w4a8", "a5": "mxfp4_routed_only"}, MTP_STANDARD_PROPOSAL_TOKENS,
         "Kimi-K3.1-Pro.md", mlapo=True, mso=True,
         kv_block_size=PAIRED_SFA_DOC_BLOCK_SIZE,
         topologies={
             "a5": _topo(
-                pd_prefill={"dp": 1, "tp": 1, "pp": 4, "pcp": 8, "ep": 8, "block_size": 1536, "kv_cache_dtype": "fp8"},
-                pd_decode={"dp": 1, "tp": 8, "dcp": 8, "ep": 8, "block_size": 1536, "kv_cache_dtype": "fp8"},
+                pd_prefill={"dp": 1, "tp": 1, "pp": 4, "pcp": 8, "ep": 8, "block_size": 1536,
+                            "kv_cache_dtype": "fp8", "indexer_kv_dtype": "fp8"},
+                pd_decode={"dp": 1, "tp": 8, "dcp": 8, "ep": 8, "block_size": 1536,
+                           "kv_cache_dtype": "fp8", "indexer_kv_dtype": "fp8"},
             ),
             "a3": _topo(
                 pd_prefill={"dp": 1, "tp": 1, "pp": 4, "pcp": 4, "ep": 4, "block_size": 768, "kv_cache_dtype": "int8"},

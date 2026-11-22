@@ -258,7 +258,7 @@ def test_index_pool_residency_and_projection_formats_follow_checkpoint_ownership
 def test_causal_tail_writes_only_owned_ring_slots(query, context, ranges, span):
     raw = index_pool_case()
     if ranges:
-        raw["runtime"].setdefault("metadata", {})["offload"] = {"kvc_ddr_ratio": .5, "kvc_ssd_ratio": .25}
+        raw["runtime"].setdefault("metadata", {})["offload"] = {"kvc_ddr_ratio": .5, "kvc_ssd_ratio": .25, "ssd_bw_gbps": 14.0}
         raw["model"].setdefault("quant", {}).update(index_dtype="fp8_e4m3", index_scale_dtype="fp16")
         raw["model"].setdefault("metadata", {})["cache_representations"] = {
             "index_k": {"dtype": "fp8_e4m3", "group_size": 32, "scale_dtype": "fp16"}}
@@ -279,7 +279,7 @@ def test_causal_tail_writes_only_owned_ring_slots(query, context, ranges, span):
         access, = (binding.access for binding in accesses)
         assert (access.span, access.bytes, access.state_version) == (span, expected, 7)
         tier, = project_state_tiers(index_pool.state_accesses(tail),
-                                    OffloadPolicy(kvc_ddr_ratio=.5, kvc_ssd_ratio=.25), expected_bytes=expected)
+                                    OffloadPolicy(kvc_ddr_ratio=.5, kvc_ssd_ratio=.25, ssd_bw_gbps=14.0), expected_bytes=expected)
         assert (tier["hbm_bytes"], sum(row.bytes for row in _accesses_from_ops(work))) == (expected * .75, expected)
     if ranges:
         execution = Execution(case, CostModel(case), include_serving_io=False)

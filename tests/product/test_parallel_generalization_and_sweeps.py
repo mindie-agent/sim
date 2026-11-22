@@ -241,7 +241,7 @@ def test_per_sku_tutorial_profiles_kpool_dtypes_and_gated_pr_mechanisms():
     c_a5 = compose_case("glm-5.3-flash", hardware="a5", dp=1, tp=8, ep=8, num_devices=8, layers=AUDIT_LAYERS, va_recommended=True)
     c_a5_ovr = compose_case("glm-5.3-flash", hardware="a5", dp=1, tp=8, ep=8, num_devices=8, layers=AUDIT_LAYERS, va_recommended=True, kv_cache_dtype="bf16", indexer_kv_dtype="auto")
     assert c_a3["model"]["quant"]["kv_dtype"] == "int8" and c_a3["model"]["quant"]["index_dtype"] == "bf16"
-    assert c_a5["model"]["quant"]["kv_dtype"] == "fp8" and c_a5["model"]["quant"]["index_dtype"] == "fp8"
+    assert c_a5["model"]["quant"]["kv_dtype"] == "fp8_e4m3" and c_a5["model"]["quant"]["index_dtype"] == "fp8_e4m3"
     assert c_a5_ovr["model"]["quant"]["kv_dtype"] == "bf16" and c_a5_ovr["model"]["quant"]["index_dtype"] == "bf16"
     assert max(Memory(parse_case(c_a5)).cache_bytes(1024, padded=False)) < max(Memory(parse_case(c_a5_ovr)).cache_bytes(1024, padded=False))
 
