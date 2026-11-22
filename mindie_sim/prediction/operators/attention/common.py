@@ -538,6 +538,7 @@ class AttentionPhase:
     after: tuple[str, ...]
     slot: int | None = None
     memory: object = None
+    pages: int = 0
 
 
 @dataclass(frozen=True, slots=True)

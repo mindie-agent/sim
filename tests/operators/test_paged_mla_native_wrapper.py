@@ -541,3 +541,37 @@ def test_mla_prolog_without_query_norm_output_has_no_scale_shape():
     assert view["query_norm_output"] is False
     assert view["query_norm_scale_dtype"] == "fp8_e8m0"
     assert view["query_norm_scale_shape"] == ()
+
+
+def test_indexed_attention_cast_ratio_and_paired_sync_helpers():
+    from types import SimpleNamespace
+    from mindie_sim.prediction.operators.paged_mla.indexed_attention import (
+        _dequant_cast_scale, _indexed_phase_sync_ms,
+    )
+    from mindie_sim.prediction.operators.sharedkv.l0_sync import p09_cast_to_alu_op_ratio
+    from mindie_sim.schema.common import ModelingError
+
+    uncal = SimpleNamespace(primitive_table=None)
+    assert p09_cast_to_alu_op_ratio(uncal) == 1.0
+    assert _dequant_cast_scale(uncal) == 1.0
+    assert _indexed_phase_sync_ms(uncal, "scores", 512) == 0.0
+
+    cells = {
+        "P07_vec_alu": {"vec_alu_ops_per_s_per_aiv": 34e9},
+        "P09_vec_reduce_cast": {"cast_bytes_per_s_per_aiv": 388e9},
+        "P03_fixpipe": {"setup_ns": 170.0},
+        "P13_crosscore_sync": {"mode2_paired_ns": 560.0},
+    }
+
+    def _cell(cid):
+        if cid not in cells:
+            raise ModelingError(cid)
+        return SimpleNamespace(band=lambda m: SimpleNamespace(p50=cells[cid].get(m)))
+
+    cal = SimpleNamespace(primitive_table=SimpleNamespace(cell=_cell))
+    ratio = p09_cast_to_alu_op_ratio(cal)
+    assert 0.3 < ratio < 0.4
+    assert 0.55 < _dequant_cast_scale(cal) < 0.65
+    assert _indexed_phase_sync_ms(cal, "scores", 512) == pytest.approx((560.0 + 4 * 170.0) / 1e6)
+    assert _indexed_phase_sync_ms(cal, "partial", 512) == pytest.approx((560.0 + 4 * 170.0) / 1e6)
+    assert _indexed_phase_sync_ms(cal, "gather", 512) == 0.0

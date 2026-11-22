@@ -26,6 +26,10 @@ from ...runtime.ring_buffer import RingBuffer, lower_generation
 from ..attention.common import AttentionMemoryRead, planning_sequence_spans, sequence_layout_metadata
 from ..contracts import OperatorPlanningContext
 from ..matrix.refill_steady import compact_periodic_pipeline
+from ..sharedkv.l0_sync import (
+    p01_gather_v2_cold_bps, p01_hbm_scatter_row_open_bytes, p01_paged_copy_setup_ms,
+    p01_strided_cold_bps, p02_l0b_load_factor, p03_fixpipe_setup_ms, p13_syncall_ms,
+)
 from ..sharedkv.split_core import p01_cold_mte2_aic_cap
 from .common import (
     ACLNN_MQS_DATA_BYTES, ACLNN_MQS_INLINE_ROW_BYTES, ACLNN_MQS_SCALE_BYTES, ACLNN_MQS_SEPARATE_SCALE_MODE,
@@ -52,7 +56,77 @@ NATIVE_FD_REDUCE_HEAD_TILE = 64
 FD_REDUCE_HEAD_GRAIN = 8
 MLA_COMPACT_THRESHOLD = 32
 MLA_COMPACT_MIN_KEY_TILE = 128
+# Arch22 FIA MLA cube tiling constants (fia_block_cube_nonquant_mla.h:590-655, 872-918).
+# kL1=0 and kL1=1 load [0..512) and [512..1024) of each 1024 B NoPE row back-to-back.
+ARCH22_MLA_NL1_SPLIT = 128
+ARCH22_MLA_MM1_KL1_LOOPS = 2
+ARCH22_MLA_NOPE_ROW_BYTES = 1024
+ARCH22_MLA_STRIDE_PROBE_BYTES = 2048
+# Arch35 FIA MLA CopyKeyAndRopeTile issues two plane copies (fia_block_cube_noquant_mla.h:257,270).
+ARCH35_MLA_PLANE_COPY_CALLS = 2
+MS_PER_SECOND_MLA = 1000.0
 RowCuts = dict[tuple[int, int], tuple[int, ...]]
+
+
+def _mla_kv_cold_caps(
+    ctx: RecipeContext, active_owners: int, c: PagedMlaContract, layout: PipelineLayout, dtype: str,
+) -> dict[str, float]:
+    """Per-owner MTE2-AIC / HBM cold cap from P01 active-core scaling + strided/gather surface."""
+    caps = dict(p01_cold_mte2_aic_cap(ctx, active_owners, include_hbm=True))
+    if c.abi != FIA_ABI or c.mixed_quant or active_owners < 1:
+        return caps
+    die_bps: float | None = None
+    if layout.gm_workspace:
+        die_bps = p01_strided_cold_bps(ctx, ARCH22_MLA_NOPE_ROW_BYTES, ARCH22_MLA_STRIDE_PROBE_BYTES)
+    else:
+        elem = int(dtype_bytes(dtype))
+        nope_b = c.latent_dim * elem
+        rope_b = c.rope_dim * elem
+        bw_nope = p01_gather_v2_cold_bps(ctx, nope_b, scatter=True)
+        bw_rope = p01_gather_v2_cold_bps(ctx, rope_b, scatter=True) if rope_b > 0 else bw_nope
+        if bw_nope is not None and bw_rope is not None and (nope_b + rope_b) > 0:
+            die_bps = float(nope_b + rope_b) / (nope_b / bw_nope + rope_b / bw_rope)
+    if die_bps is None or die_bps <= 0.0:
+        return caps
+    per_owner_ms = die_bps / (MS_PER_SECOND_MLA * float(active_owners))
+    for role in ("mte2_aic", "hbm"):
+        res_name = ctx.resource_names.get(role)
+        if not res_name:
+            continue
+        prev = caps.get(res_name)
+        caps[res_name] = min(prev, per_owner_ms) if prev is not None else per_owner_ms
+    return caps
+
+
+def _mla_step_latency_ms(
+    step: str, c: PagedMlaContract, layout: PipelineLayout, keys: int, pages: int,
+    base_sync_ms: float, fix_setup_ms: float, page_setup_ms: float,
+) -> float:
+    """Per-tile sync, Fixpipe command setup, and paged blockTable+ND2NZ setup latency (ms)."""
+    lat = base_sync_ms
+    if c.abi != FIA_ABI or c.mixed_quant:
+        return lat
+    if fix_setup_ms > 0.0:
+        if step == "score_store":
+            calls = ceil_div(keys, ARCH22_MLA_NL1_SPLIT) if layout.gm_workspace else 1
+            lat += float(calls) * fix_setup_ms
+        elif step == "partial":
+            calls = ceil_div(c.dv, ARCH22_MLA_NL1_SPLIT) if layout.gm_workspace else 1
+            lat += float(calls) * fix_setup_ms
+    if c.kv_layout == "PA_BLK_BSND" and page_setup_ms > 0.0 and pages > 0:
+        if layout.gm_workspace:
+            # attn_copy_gm_to_l1.h:343,431: each 128-row N_L1 slice issues 1 cold GetBlockIdx in
+            # ProcessMm1 (kL1=0); sub-128 pages fragment every kL1 (2x) and nL1 (4x) ND2NZ copy.
+            extra_frags = max(0, pages - ceil_div(keys, ARCH22_MLA_NL1_SPLIT))
+            if step == "kv_load":
+                lookups = pages + ARCH22_MLA_MM1_KL1_LOOPS * extra_frags
+                lat += float(lookups) * page_setup_ms
+            elif step == "pv_load" and not layout.resident_latent and extra_frags > 0:
+                lookups = ceil_div(c.dv, ARCH22_MLA_NL1_SPLIT) * extra_frags
+                lat += float(lookups) * page_setup_ms
+        elif step == "kv_load":
+            lat += float(ARCH35_MLA_PLANE_COPY_CALLS * pages) * page_setup_ms
+    return lat
 
 
 def fixpipe_rectangle_bytes(rows: int, columns: int) -> int:
@@ -260,7 +334,8 @@ class _PagedMlaProgramBuilder:
 
     def _demand(self, step: str, live: int, *, seq: int = 0, query: int = 0, heads: int = 0,
                 start: int = 0, keys: int = 0, first: bool = False, last: bool = False,
-                partials: int = 0, mm2_offset: int = 0, head_start: int = 0) -> _Demand:
+                partials: int = 0, mm2_offset: int = 0, head_start: int = 0,
+                l0b_factor: float = 1.0) -> _Demand:
         c, layout = self.contract, self.layout
         elem = int(dtype_bytes(self.dtype))
         qk_width, v_width = c.dqk * elem, c.dv * elem
@@ -294,7 +369,7 @@ class _PagedMlaProgramBuilder:
             d.add(pipe, align_bytes(keys * qk_width, alignment))
         elif step == "qk_operands":
             q_mult = ARCH22_MLA_L0A_RELOAD_PANELS if layout.gm_workspace else 1
-            d.add("mte1", (heads * q_mult + keys) * qk_width)
+            d.add("mte1", heads * q_mult * qk_width + keys * qk_width * l0b_factor)
         elif step == "qk":
             d.flops = 2 * heads * keys * c.dqk
         elif step in {"score_store", "probability", "partial"}:
@@ -325,7 +400,7 @@ class _PagedMlaProgramBuilder:
                          l2_hit_fraction=v_hit)
         elif step == "pv_operands":
             p_mult = ARCH22_MLA_L0A_RELOAD_PANELS if layout.gm_workspace else 1
-            d.add("mte1", probs * p_mult + keys * v_width)
+            d.add("mte1", probs * p_mult + keys * v_width * l0b_factor)
         elif step in {"pv", "pv0", "pv1"}:
             columns = layout.pv_panel_width if step != "pv" else c.dv
             d.flops = 2 * heads * keys * columns
@@ -403,11 +478,11 @@ class _PagedMlaProgramBuilder:
         return start, min(width, extent - start)
 
     def _tile_demand(self, step, seq, query, heads, live, index, offset, count, partials,
-                     mm2_offset=0, head_start=0):
+                     mm2_offset=0, head_start=0, *, l0b_factor: float = 1.0):
         start, keys = self._tile_extent(seq, query, offset + index)
         return self._demand(step, live, seq=seq, query=query, heads=heads, start=start, keys=keys,
                             first=index == 0, last=index + 1 == count, partials=partials,
-                            mm2_offset=mm2_offset, head_start=head_start)
+                            mm2_offset=mm2_offset, head_start=head_start, l0b_factor=l0b_factor)
 
     def _finish_steps(self, partials):
         merge = ("merge_read", "merge") if partials > 1 else ()
@@ -522,7 +597,8 @@ class _PagedMlaProgramBuilder:
             stages.append(Stage(f"aiv{aiv}", work, placement=placement, keep_empty=True))
         return KernelProgram(tuple(stages))
 
-    def _split_program(self, ctx, seq, query, heads, live, pair, offset, count, partials, interval, head_start):
+    def _split_program(self, ctx, seq, query, heads, live, pair, offset, count, partials, interval, head_start,
+                       *, active_owners: int | None = None):
         layout = self.layout
         aivs = pair[1]
         aiv_owners = ",".join(map(str, aivs)) if layout.pv_panel_width else ""
@@ -543,7 +619,21 @@ class _PagedMlaProgramBuilder:
         def name(step, index):
             return f"{step}:{index % period}"
 
-        split_cold_caps = p01_cold_mte2_aic_cap(ctx, len(self.owners), include_hbm=True)
+        eff_owners = active_owners if active_owners is not None else len(self.owners)
+        split_cold_caps = _mla_kv_cold_caps(ctx, eff_owners, self.contract, layout, self.dtype)
+        l0b_factor = p02_l0b_load_factor(ctx) if (self.contract.abi == FIA_ABI and not self.contract.mixed_quant) else 1.0
+        fix_setup_ms = p03_fixpipe_setup_ms(ctx)
+        page_setup_ms = p01_paged_copy_setup_ms(ctx, is_arch35=not layout.gm_workspace)
+        scatter_open_bytes = (
+            p01_hbm_scatter_row_open_bytes(ctx)
+            if (self.contract.abi == FIA_ABI and not layout.gm_workspace
+                and not self.contract.mixed_quant and self.contract.kv_layout == "PA_BLK_BSND")
+            else 0
+        )
+        base_sync_by_step = {
+            step: mla_step_crosscore_ms(ctx, step, gm_workspace=layout.gm_workspace, abi=self.contract.abi)
+            for step in phases
+        }
 
         def _build_cycle(clock: int, *, compact_names: bool) -> tuple[Stage, ...]:
             stages: list[Stage] = []
@@ -612,15 +702,23 @@ class _PagedMlaProgramBuilder:
                     if not compact_names:
                         metadata[f"{region}_slot"] = index % depth
                         metadata[f"{region}_generation"] = index // depth
-                demand = self._tile_demand(step, seq, query, heads, live, index, offset, count, partials,
-                                           mm2_offset, head_start)
+                start, keys = self._tile_extent(seq, query, offset + index)
+                demand = self._demand(step, live, seq=seq, query=query, heads=heads, start=start, keys=keys,
+                                      first=index == 0, last=index + 1 == count, partials=partials,
+                                      mm2_offset=mm2_offset, head_start=head_start, l0b_factor=l0b_factor)
                 edges = dict(after=tuple(dict.fromkeys(deps)), previous=tuple(dict.fromkeys(prev)))
                 st_name = step if compact_names else name(step, index)
                 if step in {"release0", "release1"}:
                     stages.append(Stage(st_name, program=self._panel_release(ctx, demand, aivs, heads),
                                         metadata=metadata, **edges))
                 else:
-                    sync_lat = mla_step_crosscore_ms(ctx, step, gm_workspace=layout.gm_workspace, abi=self.contract.abi)
+                    pages = (ceil_div(start + keys, self.contract.page_size) - start // self.contract.page_size) if keys else 0
+                    if step == "kv_load" and scatter_open_bytes > 0 and pages > 0:
+                        demand.add("hbm", ARCH35_MLA_PLANE_COPY_CALLS * pages * scatter_open_bytes)
+                    sync_lat = _mla_step_latency_ms(
+                        step, self.contract, layout, keys, pages,
+                        base_sync_by_step[step], fix_setup_ms, page_setup_ms,
+                    )
                     stages.append(self._stage(ctx, demand, pair, st_name, metadata=metadata, latency=sync_lat, cold_caps=split_cold_caps, **edges))
             by_name = {stage.name: stage for stage in stages}
             order = TopologicalSorter({stage.name: stage.after for stage in stages})
@@ -629,6 +727,7 @@ class _PagedMlaProgramBuilder:
         slots = len(layout.clocks)
         can_compact = (
             count > MLA_COMPACT_THRESHOLD
+            and eff_owners == 1
             and layout.gm_workspace
             and layout.key_tile >= MLA_COMPACT_MIN_KEY_TILE
             and not self.contract.mixed_quant
@@ -679,17 +778,22 @@ class _PagedMlaProgramBuilder:
             live = min(heads, max(0, c.logical_heads - head_start))
             tiles, partials = self._counts(seq, query)
 
+            active_groups = min(groups_per_wave, prefix[-1])
+            wave_owners = min(len(self.owners), active_groups * min(lanes, max(1, partials)))
+
             def wave(index):
                 for local in range(min(lanes, partials - index * lanes)):
                     split = index * lanes + local
                     offset, count = self._split_extent(seq, query, tiles, split)
                     program = self._split_program(
                         context, seq, query, heads, live, self.owners[owner_start + local], offset, count, partials,
-                        owner_interval(group_index, local) + index, head_start,
+                        owner_interval(group_index, local) + index, head_start, active_owners=wave_owners,
                     )
                     yield Stage(f"split{local}", program=program, metadata={"split": split})
 
             stages = [Stage("splits", program=PipelineProgram(ceil_div(partials, lanes), 1, wave))]
+            if partials > 1 and (syncall_ms := p13_syncall_ms(context)) > 0.0:
+                stages.append(Stage("fd_syncall", after=(stages[-1].name,), latency=syncall_ms, keep_empty=True))
             if (c.abi == FIA_ABI and partials > 1 and lanes > 1
                     and layout.head_tile >= NATIVE_FD_REDUCE_HEAD_TILE and live > FD_REDUCE_HEAD_GRAIN):
                 n_chunks = min(lanes, ceil_div(live, FD_REDUCE_HEAD_GRAIN))

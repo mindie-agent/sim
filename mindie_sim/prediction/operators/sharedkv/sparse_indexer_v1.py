@@ -41,9 +41,8 @@ from ..sparse_indexer.common import (
     SCORE_SLOTS,
     SparseIndexerContract,
     request_contracts,
-    sort_ops,
 )
-from .l0_sync import p12_flag_ms, p13_paired_ms, p13_syncall_ms
+from .l0_sync import p03_fixpipe_setup_ms, p10_sort_to_alu_op_ratio, p12_flag_ms, p13_paired_ms, p13_syncall_ms
 
 ARCH35_V1_TILE_ROWS = 128
 ARCH35_V1_S1_BASE = 4
@@ -54,11 +53,17 @@ ARCH35_V1_RADIX_ALIGN = 256
 ARCH35_V1_RADIX_PASSES = 2
 COMPACT_TILE_THRESHOLD = 48
 ARCH35_VEC_OPS_PER_HEAD = 4  # Relu + Cast + MulWeight + ReduceSum (service_vector_arch35.h:312)
-ARCH22_VEC_OPS_PER_HEAD = 3  # Relu + MulWeight + ReduceSum
+# lightning_indexer_service_cube_arch22.h:388 sets Fixpipe reluPre=1;
+# lightning_indexer_vector.h:98-111 DoScale + DoReduce runs Mul + Add = 2 * heads - 1 ops/row.
+ARCH22_VEC_OPS_PER_HEAD = 2
 RADIX_OPS_PER_ITEM = 5  # Histogram + prefix-sum + scatter + trunk merge
 FLOPS_PER_FMA = 2
 TOPK_MERGE_STRIDE_MULT = 2
 ARCH22_K_PANEL_ROWS = 256  # lightning_indexer_service_cube_arch22.h:43
+ARCH22_KEY_L1_SLOTS = 3  # lightning_indexer_service_cube_arch22.h:43 KEY_BUF_NUM = 3
+ARCH22_FIXPIPE_PANEL_ROWS = 128  # lightning_indexer_service_cube_arch22.h:126 S2_BASIC_BLOCK_L0
+# lightning_indexer_service_vector_arch22.h:380 Sort32 + 2 MrgSort4 passes on 512 items = 3 elem-passes.
+ARCH22_SORT512_PASSES = 3
 ARCH22_INIT_OPS_PER_SLOT = 4  # index seed + padded topk buffer init (service_vector_arch22.h:154)
 ARCH22_ENTRY_EXIT_CREDITS = 2  # Cube/Vector entry+exit credits (kernel_arch22.h:665)
 
@@ -343,19 +348,26 @@ class _Arch22V1Program:
     aiv_count: int
     score_l2: bool
     has_l2_rate: bool
+    group_s2_owners: tuple[int, ...] = ()
 
-    def _tile_works(self, valid: int, n_owner_tiles: int) -> dict[str, Work]:
+    def _tile_works(self, valid: int, n_owner_tiles: int, *, sort_ratio: float = 1.0) -> dict[str, Work]:
         c = self.contract
         qr = self.q_rows_per_block
         key_b = valid * c.cache_row_bytes
         heads = qr * c.index_heads
         score_b = valid * heads * FP32_BYTES
         w_b = heads * BF16_BYTES if c.has_head_weights else 0
-        flush_ops_per_tile = DEFAULT_S2_TILE + (
-            (DEFAULT_S2_TILE + ARCH22_TOPK_LIMIT * TOPK_MERGE_STRIDE_MULT // ARCH22_FLUSH_BLOCKS)
+        # lightning_indexer_service_vector_arch22.h:380-404: 512-item Sort32+MrgSort4 (3 passes)
+        # + 4-block MrgBasicBlock (2048/4) + retained SparseTopK (4096/4) on P10_sort_topk;
+        # line 396 DataCopy copyback (2048/4) stays on UB copy (1x), not Sort.
+        flush_sort_passes = DEFAULT_S2_TILE + (
+            (ARCH22_TOPK_LIMIT * TOPK_MERGE_STRIDE_MULT // ARCH22_FLUSH_BLOCKS)
             if n_owner_tiles > ARCH22_FLUSH_BLOCKS else 0
         )
-        vec_ops = valid * (ARCH22_VEC_OPS_PER_HEAD * heads - qr) + qr * (sort_ops(DEFAULT_S2_TILE) + flush_ops_per_tile)
+        flush_copy_ops = DEFAULT_S2_TILE if n_owner_tiles > ARCH22_FLUSH_BLOCKS else 0
+        sort_passes = ARCH22_SORT512_PASSES * DEFAULT_S2_TILE + flush_sort_passes
+        alu_ops = valid * (ARCH22_VEC_OPS_PER_HEAD * heads - qr) + qr * flush_copy_ops
+        vec_ops = alu_ops + int(round(qr * sort_passes * sort_ratio))
         return {
             "key_load": Work(resources={self.aic_read: key_b, "hbm": key_b}),
             "cube_mma": Work(
@@ -386,27 +398,33 @@ class _Arch22V1Program:
             "mte3": size, **_mem_work(size, l2_resident=self.score_l2, has_l2_rate=self.has_l2_rate),
         })
 
-    def _query_merge_works(self) -> dict[str, Work]:
+    def _query_merge_works(self, n_split_owners: int | None = None, *, sort_ratio: float = 1.0) -> dict[str, Work]:
         c = self.contract
         if not c.fused_topk:
             return {}
+        owners_cnt = self.s2_owners_per_group if n_split_owners is None else n_split_owners
         out_b = c.topk_items * INT32_BYTES
         res: dict[str, Work] = {"index_store": Work(resources={"mte3": out_b, "hbm": out_b})}
-        if self.s2_owners_per_group > 1:
+        if owners_cnt > 1:
             ret = self._owner_retained_items()
-            size = self.s2_owners_per_group * (ret * PAIR_BYTES + ARCH22_SPLIT_RECORD_BYTES)
-            merges = self.s2_owners_per_group - 1
+            size = owners_cnt * (ret * PAIR_BYTES + ARCH22_SPLIT_RECORD_BYTES)
+            merges = owners_cnt - 1
             groups, tail = divmod(merges, MERGE_FAN_IN - 1)
             entries = groups * MERGE_FAN_IN + (tail + 1 if tail else 0)
             passes = groups + int(bool(tail))
             res["split_list_load"] = Work(resources={
                 self.aiv_read: size, **_mem_work(size, l2_resident=self.score_l2, has_l2_rate=self.has_l2_rate),
             })
-            res["split_topk_merge"] = Work(resources={"vector": (entries + passes) * ret})
+            # service_vector_arch22.h:611-630: MrgSort4 runs on P10_sort_topk; DataCopy copyback is 1x.
+            merge_ops = int(round(entries * ret * sort_ratio)) + passes * ret
+            res["split_topk_merge"] = Work(resources={"vector": merge_ops})
         return res
 
     def __call__(self, ctx: RecipeContext) -> KernelProgram:
         c = self.contract
+        sort_ratio = p10_sort_to_alu_op_ratio(ctx)
+        fix_setup_ms = p03_fixpipe_setup_ms(ctx)
+        tile_sync_ms = p13_paired_ms(ctx)
         q_b = self.q_rows_per_block * c.index_heads * c.cache_row_bytes
         q_w = Work(resources={self.aic_read: q_b, "hbm": q_b})
         store_w = self._split_store_work()
@@ -420,34 +438,45 @@ class _Arch22V1Program:
             core_q_w = q_w.scaled(max(1, q_loads))
 
             def _tile_for_rows(valid: int, aic=aic, aivs=aivs, n_blks=n_blks):
-                ws = self._tile_works(valid, n_blks)
-                # service_cube_arch22.h:43: triple-buffered 256-row K panels; service_vector_arch22.h:325: ping-pong score reads.
+                ws = self._tile_works(valid, n_blks, sort_ratio=sort_ratio)
+                fix_lat = ceil_div(valid, ARCH22_FIXPIPE_PANEL_ROWS) * fix_setup_ms
+                # service_cube_arch22.h:43: KEY_BUF_NUM=3 triple-buffered 256-row K panels;
+                # kernel_arch22.h:665-671: per-tile CrossCoreWaitFlag/SetFlag<MODE2> (P13);
+                # service_vector_arch22.h:325: ping-pong score reads overlap vec_sort across tiles.
+                sync_stages = (
+                    (Stage("tile_sync", after=("score_handoff",), previous=("vec_sort",),
+                           latency=tile_sync_ms, keep_empty=True),)
+                    if tile_sync_ms > 0.0 else ()
+                )
+                vec_after = ("score_read", "tile_sync") if sync_stages else ("score_read",)
                 if valid > ARCH22_K_PANEL_ROWS:
                     frac0 = ARCH22_K_PANEL_ROWS / float(valid)
                     frac1 = 1.0 - frac0
                     k0, k1 = ws["key_load"].scaled(frac0), ws["key_load"].scaled(frac1)
                     m0, m1 = ws["cube_mma"].scaled(frac0), ws["cube_mma"].scaled(frac1)
-                    s0 = Stage("key_load_0", ctx.bind(k0), placement=_place_aic(ctx, aic, self.aic_count, k0), previous=("cube_mma_0",))
+                    s0 = Stage("key_load_0", ctx.bind(k0), placement=_place_aic(ctx, aic, self.aic_count, k0))
                     s1 = Stage("cube_mma_0", ctx.bind(m0), after=("key_load_0",), placement=_place_aic(ctx, aic, self.aic_count, m0))
-                    s2 = Stage("key_load_1", ctx.bind(k1), after=("key_load_0",), placement=_place_aic(ctx, aic, self.aic_count, k1), previous=("cube_mma_1",))
+                    s2 = Stage("key_load_1", ctx.bind(k1), after=("key_load_0",), placement=_place_aic(ctx, aic, self.aic_count, k1))
                     s3 = Stage("cube_mma_1", ctx.bind(m1), after=("cube_mma_0", "key_load_1"), placement=_place_aic(ctx, aic, self.aic_count, m1))
-                    s4 = Stage("score_handoff", ctx.bind(ws["score_handoff"]), after=("cube_mma_1",), placement=_place_aic(ctx, aic, self.aic_count, ws["score_handoff"]))
-                    s5 = Stage("score_read", ctx.bind(ws["score_read"]), after=("score_handoff",), placement=_place_aivs(ctx, aivs, self.aiv_count, ws["score_read"]))
-                    s6 = Stage("vec_sort", ctx.bind(ws["vec_sort"]), after=("score_read",), placement=_place_aivs(ctx, aivs, self.aiv_count, ws["vec_sort"]), previous=("vec_sort",))
-                    return (s0, s1, s2, s3, s4, s5, s6)
+                    s4 = Stage("score_handoff", ctx.bind(ws["score_handoff"]), after=("cube_mma_1",),
+                               placement=_place_aic(ctx, aic, self.aic_count, ws["score_handoff"]), latency=fix_lat)
+                    s5 = Stage("score_read", ctx.bind(ws["score_read"]), after=("score_handoff",),
+                               placement=_place_aivs(ctx, aivs, self.aiv_count, ws["score_read"]))
+                    s6 = Stage("vec_sort", ctx.bind(ws["vec_sort"]), after=vec_after,
+                               placement=_place_aivs(ctx, aivs, self.aiv_count, ws["vec_sort"]), previous=("vec_sort",))
+                    return (s0, s1, s2, s3, s4, s5, *sync_stages, s6)
                 s0 = Stage("key_load", ctx.bind(ws["key_load"]),
-                           placement=_place_aic(ctx, aic, self.aic_count, ws["key_load"]),
-                           previous=("cube_mma",))
+                           placement=_place_aic(ctx, aic, self.aic_count, ws["key_load"]))
                 s1 = Stage("cube_mma", ctx.bind(ws["cube_mma"]), after=("key_load",),
                            placement=_place_aic(ctx, aic, self.aic_count, ws["cube_mma"]))
                 s2 = Stage("score_handoff", ctx.bind(ws["score_handoff"]), after=("cube_mma",),
-                           placement=_place_aic(ctx, aic, self.aic_count, ws["score_handoff"]))
+                           placement=_place_aic(ctx, aic, self.aic_count, ws["score_handoff"]), latency=fix_lat)
                 s3 = Stage("score_read", ctx.bind(ws["score_read"]), after=("score_handoff",),
                            placement=_place_aivs(ctx, aivs, self.aiv_count, ws["score_read"]))
-                s4 = Stage("vec_sort", ctx.bind(ws["vec_sort"]), after=("score_read",),
+                s4 = Stage("vec_sort", ctx.bind(ws["vec_sort"]), after=vec_after,
                            placement=_place_aivs(ctx, aivs, self.aiv_count, ws["vec_sort"]),
                            previous=("vec_sort",))
-                return (s0, s1, s2, s3, s4)
+                return (s0, s1, s2, s3, *sync_stages, s4)
 
             credit_ms = ARCH22_ENTRY_EXIT_CREDITS * p13_paired_ms(ctx)
             st = [
@@ -459,7 +488,7 @@ class _Arch22V1Program:
                 prev_local = "entry_credits"
             if n_full > 0:
                 loop = compact_periodic_pipeline(
-                    ctx, n_full, SCORE_SLOTS, lambda _ti, fn=_tile_for_rows: fn(DEFAULT_S2_TILE),
+                    ctx, n_full, ARCH22_KEY_L1_SLOTS, lambda _ti, fn=_tile_for_rows: fn(DEFAULT_S2_TILE),
                     head=1, tail=1, threshold=COMPACT_TILE_THRESHOLD,
                 )
                 st.append(Stage("s2_tiles", after=(prev_local,), program=loop))
@@ -477,43 +506,51 @@ class _Arch22V1Program:
 
         stages: list[Stage] = [Stage("s2_owners", program=ParallelProgram(tuple(branches)))]
         prev = "s2_owners"
-        m_ws = self._query_merge_works()
         barrier_ms = p13_syncall_ms(ctx) or p13_paired_ms(ctx)
         if self.s2_owners_per_group > 1 and barrier_ms > 0.0:
             stages.append(Stage("split_barrier", after=(prev,), latency=barrier_ms, keep_empty=True))
             prev = "split_barrier"
-        if m_ws:
-            n_m_lanes = min(len(self.owners), self.n_q_groups)
-            q_per_lane_base, q_per_lane_rem = divmod(c.query_tokens, n_m_lanes)
+        if c.fused_topk:
+            g_owners = self.group_s2_owners or ((self.s2_owners_per_group,) * self.n_q_groups)
+            n_m_lanes = min(len(self.owners), len(g_owners))
+            q_per_group_base, q_per_group_rem = divmod(c.query_tokens, len(g_owners))
             m_branches = []
             for lane in range(n_m_lanes):
-                q_cnt = q_per_lane_base + (1 if lane < q_per_lane_rem else 0)
                 _, raw_aivs = self.owners[lane]
                 merge_aivs = raw_aivs[:1]
                 m_st: list[Stage] = []
-                for name in ("split_list_load", "split_topk_merge", "index_store"):
-                    if name in m_ws:
-                        w = m_ws[name].scaled(q_cnt)
-                        m_st.append(Stage(
-                            name, ctx.bind(w), after=(m_st[-1].name,) if m_st else (),
-                            placement=_place_aivs(ctx, merge_aivs, self.aiv_count, w),
-                        ))
-                m_branches.append(KernelProgram(tuple(m_st)))
-            stages.append(Stage("query_exit", after=(prev,), program=ParallelProgram(tuple(m_branches))))
+                for gid in range(lane, len(g_owners), n_m_lanes):
+                    q_cnt = q_per_group_base + (1 if gid < q_per_group_rem else 0)
+                    if q_cnt <= 0:
+                        continue
+                    m_ws = self._query_merge_works(g_owners[gid], sort_ratio=sort_ratio)
+                    for name in ("split_list_load", "split_topk_merge", "index_store"):
+                        if name in m_ws:
+                            w = m_ws[name].scaled(q_cnt)
+                            st_name = f"{name}_{gid}" if len(g_owners) > n_m_lanes else name
+                            m_st.append(Stage(
+                                st_name, ctx.bind(w), after=(m_st[-1].name,) if m_st else (),
+                                placement=_place_aivs(ctx, merge_aivs, self.aiv_count, w),
+                            ))
+                if m_st:
+                    m_branches.append(KernelProgram(tuple(m_st)))
+            if m_branches:
+                stages.append(Stage("query_exit", after=(prev,), program=ParallelProgram(tuple(m_branches))))
         return KernelProgram(tuple(stages))
 
 
 def _assign_block_runs(
-    runs: list[tuple[int, int, int]], active: int,
-) -> tuple[tuple[int, ...], tuple[tuple[int, ...], ...], tuple[int, ...]]:
-    """Distribute ``(group_id, count, valid_rows)`` runs evenly across ``active`` cores with exact query-load counts."""
+    runs: list[tuple[int, int, int]], active: int, n_groups: int = 0,
+) -> tuple[tuple[int, ...], tuple[tuple[int, ...], ...], tuple[int, ...], tuple[int, ...]]:
+    """Distribute ``(group_id, count, valid_rows)`` runs across ``active`` cores with exact group owner counts."""
     total_blocks = sum(cnt for _, cnt, _ in runs)
     if active <= 0 or total_blocks <= 0:
-        return (), (), ()
+        return (), (), (), ()
     base, rem_cores = divmod(total_blocks, active)
     full_counts: list[int] = []
     tail_lists: list[tuple[int, ...]] = []
     q_loads: list[int] = []
+    group_owners = [0] * max(n_groups, max((gid for gid, _, _ in runs), default=0) + 1)
     run_idx = 0
     run_rem = runs[0][1] if runs else 0
     for core_i in range(active):
@@ -534,10 +571,12 @@ def _assign_block_runs(
             if run_rem == 0:
                 run_idx += 1
                 run_rem = runs[run_idx][1] if run_idx < len(runs) else 0
+        for gid in seen_groups:
+            group_owners[gid] += 1
         full_counts.append(c_full)
         tail_lists.append(tuple(c_tails))
         q_loads.append(max(1, len(seen_groups)) if (c_full or c_tails) else 0)
-    return tuple(full_counts), tuple(tail_lists), tuple(q_loads)
+    return tuple(full_counts), tuple(tail_lists), tuple(q_loads), tuple(max(1, c) for c in group_owners)
 
 
 def build_arch22_v1_lightning(
@@ -559,11 +598,8 @@ def build_arch22_v1_lightning(
         seq_tiles.append(n_full + int(rem > 0))
     total_blocks = sum(seq_tiles)
     active = min(len(owners), total_blocks) if total_blocks > 0 else 0
-    max_tiles = max(seq_tiles, default=1)
-    s2_owners_per_group = min(max_tiles, max(1, active // n_q_groups)) if max_tiles > 1 else 1
-    if len(set(seq_tiles)) > 1 and max_tiles > 1:
-        s2_owners_per_group = min(active, max_tiles)
-    core_full_counts, core_tail_rows, core_q_loads = _assign_block_runs(runs, active)
+    core_full_counts, core_tail_rows, core_q_loads, group_s2_owners = _assign_block_runs(runs, active, n_q_groups)
+    s2_owners_per_group = max(group_s2_owners, default=1)
     slot_ws = active * SCORE_SLOTS * DEFAULT_S2_TILE * q_rows_per_block * contract.index_heads * FP32_BYTES
     l2_cap = _l2_capacity(ctx)
     score_l2 = l2_cap > 0 and slot_ws <= l2_cap
@@ -574,6 +610,7 @@ def build_arch22_v1_lightning(
         contract, owners, core_full_counts, core_tail_rows, core_q_loads, q_rows_per_block,
         s2_owners_per_group, n_q_groups, aic_r, aiv_r,
         ctx.datapath.aic_count, ctx.datapath.aiv_count, score_l2, has_l2,
+        group_s2_owners=group_s2_owners,
     )
     totals: dict[str, Work] = {}
     q_b = q_rows_per_block * contract.index_heads * contract.cache_row_bytes
@@ -592,8 +629,14 @@ def build_arch22_v1_lightning(
                 _acc(totals, k, w, 1)
         if store_w.resources:
             _acc(totals, "split_list_store", store_w)
-    for k, w in prog._query_merge_works().items():
-        _acc(totals, k, w, contract.query_tokens)
+    g_owners = group_s2_owners or ((s2_owners_per_group,) * n_q_groups)
+    q_base, q_rem = divmod(contract.query_tokens, len(g_owners))
+    for gid, g_cnt in enumerate(g_owners):
+        q_cnt = q_base + (1 if gid < q_rem else 0)
+        if q_cnt <= 0:
+            continue
+        for k, w in prog._query_merge_works(g_cnt).items():
+            _acc(totals, k, w, q_cnt)
     return _finalize_plan(
         ctx, contract, totals, prog, sources,
         tiling="arch22_v1_split_core", tile_size=DEFAULT_S2_TILE,

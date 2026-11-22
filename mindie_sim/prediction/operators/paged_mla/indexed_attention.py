@@ -16,7 +16,12 @@ from functools import lru_cache, partial
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.catalog.index_pool import selected_tokens
 from mindie_sim.prediction.mechanism import OperatorPlan, PlannedRecipe, Work
-from mindie_sim.prediction.operators.sharedkv.l0_sync import p13_syncall_ms
+from mindie_sim.prediction.operators.sharedkv.l0_sync import (
+    p03_fixpipe_setup_ms,
+    p09_cast_to_alu_op_ratio,
+    p13_paired_ms,
+    p13_syncall_ms,
+)
 from mindie_sim.prediction.operators.sparse_indexer.sparse_attention import selected_query_owners
 from mindie_sim.prediction.program import KernelProgram, ParallelProgram, Stage
 
@@ -44,6 +49,12 @@ SINGLE_AIV_HEAD_LIMIT = 16
 SOFTMAX_OPS_PER_SCORE = 8
 SOFTMAX_STATE_OPS_PER_HEAD = 26
 TILE_CACHE_ENTRIES = 2048
+# sparse_flash_attention_kernel_mla.h:1153: 4 Cube<->Vector paired flag handoffs per tile.
+INDEXED_PAIRED_SYNC_PHASES = frozenset({"publish", "scores", "probability", "partial"})
+# kv_quant_sparse_flash_attention_service_vector_mla.h:2609-2667:
+# dequantize = 1.5 ALU/Copy ops (Mul f32 + Copy bf16) + 2.5 Cast ops (i8->f16, f16->f32, f32->bf16).
+INDEXED_DEQUANT_NONCAST_OPS = 1.5
+INDEXED_DEQUANT_CAST_OPS = 2.5
 
 
 SOURCE = {
@@ -509,6 +520,27 @@ def _plan(sequences, topk, heads, latent, rope, compute_units,
     return OperatorPlan(total, lower)
 
 
+def _indexed_phase_sync_ms(ctx, name: str, keys: int) -> float:
+    """Calibrated per-tile paired CV sync (P13) and Fixpipe panel setup (P03)."""
+    sync_ms = p13_paired_ms(ctx) if name in INDEXED_PAIRED_SYNC_PHASES else 0.0
+    fix_ms = p03_fixpipe_setup_ms(ctx)
+    if fix_ms > 0.0:
+        if name == "scores":
+            sync_ms += ((keys + CUBE_PANEL_COLUMNS - 1) // CUBE_PANEL_COLUMNS) * fix_ms
+        elif name == "partial":
+            sync_ms += ((INDEXED_LATENT_DIM + CUBE_PANEL_COLUMNS - 1) // CUBE_PANEL_COLUMNS) * fix_ms
+    return sync_ms
+
+
+def _dequant_cast_scale(ctx) -> float:
+    """Ratio of typed Cast+ALU dequant service to pure FP32 ALU service via P09."""
+    cast_ratio = p09_cast_to_alu_op_ratio(ctx)
+    if cast_ratio <= 0.0 or cast_ratio >= 1.0:
+        return 1.0
+    total = INDEXED_DEQUANT_NONCAST_OPS + INDEXED_DEQUANT_CAST_OPS
+    return (INDEXED_DEQUANT_NONCAST_OPS + INDEXED_DEQUANT_CAST_OPS * cast_ratio) / total
+
+
 def _compact_owner_program(
     ctx, owner, owner_work, bind, phase_unit_weights, heads, tile_keys, phases, nominal, slots,
     phase_caps, duration, _vector_weights, compute_units, buffers,
@@ -531,6 +563,8 @@ def _compact_owner_program(
         all_placement = {resource: tuple(sorted(units))
                          for resource, units in actual_units.items()}
     if owner not in nominal:
+        vec_res = ctx.resource_names.get("vector")
+        dq_scale = _dequant_cast_scale(ctx)
         phase_times = {}
         stream_tail = {}
         retired = [0.0] * slots
@@ -541,8 +575,16 @@ def _compact_owner_program(
                 for name, phase in phases(key):
                     work, placement = bind(phase, name, key)
                     caps = phase_caps(work, name, key)
-                    times.append((name, max(duration(work, placement),
-                        max((work[r] / cap for r, cap in caps.items()), default=0))))
+                    eff_work = (
+                        {r: (v * dq_scale if r == vec_res else v) for r, v in work.items()}
+                        if (name == "dequantize" and dq_scale < 1.0 and vec_res in work)
+                        else work
+                    )
+                    base_dur = max(
+                        duration(eff_work, placement),
+                        max((eff_work[r] / cap for r, cap in caps.items()), default=0.0),
+                    )
+                    times.append((name, base_dur + _indexed_phase_sync_ms(ctx, name, key[0])))
                 phase_times[key] = tuple(times)
             ready = retired[count % slots]
             prior_partial = stream_tail.get("partial", 0)
@@ -554,6 +596,7 @@ def _compact_owner_program(
             retired[count % slots] = ready
             end = max(end, ready)
         unit_demand = Counter()
+        eff_unit_demand = Counter()
         for key, count in Counter(tile_keys(owner)).items():
             for name, phase in phases(key):
                 work, placement = bind(phase, name, key)
@@ -561,24 +604,31 @@ def _compact_owner_program(
                     value for value in fractions if value)
                     for role, fractions in _vector_weights(name, key).items()}
                 for resource, units in placement.items():
+                    raw_amt = work.get(resource, 0) * count
+                    eff_amt = raw_amt * dq_scale if (name == "dequantize" and resource == vec_res and dq_scale < 1.0) else raw_amt
                     fractions = weights.get(resource, (1 / len(units),) * len(units))
                     for unit, fraction in zip(units, fractions):
-                        unit_demand[resource, unit] += work.get(resource, 0) * count * fraction
-        for (resource, _), amount in unit_demand.items():
+                        unit_demand[resource, unit] += raw_amt * fraction
+                        eff_unit_demand[resource, unit] += eff_amt * fraction
+        for (resource, _), amount in eff_unit_demand.items():
             role = next(role for role, name in ctx.resource_names.items()
                         if name == resource)
             end = max(end, amount * ctx.resource_units.get(
                 role, compute_units) / ctx.rates[resource])
-        nominal[owner] = (max(end, duration(all_work, all_placement)), dict(unit_demand))
-    end, u_demand = nominal[owner]
-    caps = {key: amount / end for key, amount in all_work.items()} if end else {}
+        eff_all_work = {
+            r: (sum(v for (res, _), v in eff_unit_demand.items() if res == r) if r == vec_res and dq_scale < 1.0 else amt)
+            for r, amt in all_work.items()
+        }
+        nominal[owner] = (max(end, duration(eff_all_work, all_placement)), dict(eff_unit_demand), eff_all_work)
+    end, u_demand, eff_all_work = nominal[owner]
+    caps = {key: amount / end for key, amount in eff_all_work.items()} if end else {}
     has_two_vector_aivs = len(all_placement.get(ctx.resource_names.get("vector", "vector"), ())) == 2
     if has_two_vector_aivs:
         branches = []
         for idx in range(2):
             b_work = {}
             b_place = {}
-            for res, amt in all_work.items():
+            for res, amt in eff_all_work.items():
                 units = all_placement.get(res, ())
                 if len(units) == 2:
                     share = u_demand.get((res, units[idx]), 0.0)
@@ -596,7 +646,7 @@ def _compact_owner_program(
                 f"aiv{idx}", b_work, caps=b_caps, placement=b_place, coupled=True),)))
         pipe_stage = Stage("pipeline", after=("reserve",), program=ParallelProgram(tuple(branches)))
     else:
-        pipe_stage = Stage("pipeline", all_work, after=("reserve",), caps=caps,
+        pipe_stage = Stage("pipeline", eff_all_work, after=("reserve",), caps=caps,
                            placement=all_placement, coupled=True)
     return KernelProgram((
         Stage("reserve", acquire=buffers),
@@ -726,9 +776,12 @@ def _lower_indexed_attention(
                              for role in ("mte1_l0a", "mte1_l0b")):
         raise ModelingError("indexed_attention_operands_must_share_mte1")
 
-    signature = tuple(tuple(sorted(mapping.items())) for mapping in (
-        ctx.rates, ctx.resource_names, ctx.resource_units,
-        ctx.service_modes, ctx.compute_peaks))
+    signature = (
+        *tuple(tuple(sorted(mapping.items())) for mapping in (
+            ctx.rates, ctx.resource_names, ctx.resource_units,
+            ctx.service_modes, ctx.compute_peaks)),
+        p13_paired_ms(ctx), p03_fixpipe_setup_ms(ctx), _dequant_cast_scale(ctx),
+    )
     if signature not in nominal_cache:
         nominal_cache[signature] = {}
         if len(nominal_cache) > 4:

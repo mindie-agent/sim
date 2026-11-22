@@ -31,8 +31,17 @@ from ...runtime.memory_physics import (
 )
 from ..contracts import OperatorPlanningContext
 from ..matrix.refill_steady import compact_periodic_pipeline
+from ..sharedkv.l0_sync import (
+    p01_hbm_scatter_row_open_bytes,
+    p01_strided_cold_bps,
+    p02_load_setup_ms,
+    p03_fixpipe_setup_ms,
+    p13_mode4_ms,
+    p13_syncall_ms,
+)
 from ..sharedkv.split_core import (
     CorePartition,
+    _p01_active_core_bps,
     compact_arch35_preload_s2,
     p01_cold_mte2_aic_cap,
     resolve_arch22_fia_gqa_tiling,
@@ -55,11 +64,87 @@ ARCH22_DECODE_M_LIMIT = 32
 ARCH35_DECODE_M_LIMIT = 64
 ARCH22_WS_SCORE_PROB_BYTES = 6
 ARCH22_WS_OUT_BYTES = 8
-COMPACT_TILE_THRESHOLD = 16
+COMPACT_TILE_THRESHOLD = 24
 ARCH22_VEC1_UB_SLICE_BYTES = 3 * 16 * 1024  # fia_block_vec_nonquant.h:483 (3 * 16 KiB per AIV)
 AIV_SUBBLOCKS_PER_AIC = 2
 DAV_2201_HBM_BURST_BYTES = 512
 DAV_3510_HBM_BURST_BYTES = 256
+# Arch35 CopyInL1.h:330 scalar blockTableGm.GetValue + DataCopyGmNDToL1 per-page issue (~5x P02.setup_ns).
+ARCH35_FIA_PAGE_CMD_MULT = 5.0
+# Arch35 flash_attention_noquant_kernel_infer.h:119 non-paged ND2NZ DataCopy command setup per K/V load (~4x P02.setup_ns).
+ARCH35_FIA_ND2NZ_SETUP_MULT = 4.0
+# Arch22 attn_copy_gm_to_l1.h:343 scalar GetOffset + CopySingleMatrixNDToNZ per-page issue (~1x P03.setup_ns).
+ARCH22_FIA_PAGE_CMD_FALLBACK_MULT = 10.0
+MS_PER_SECOND_FIA = 1000.0
+
+
+def _bsh_strided_cold_caps(
+    context, base_caps: dict[str, float], contract: AttentionContract,
+    *, gm_workspace: bool, burst_bytes: int, active_owners: int, total_aics: int,
+) -> dict[str, float]:
+    """Arch22 token-major BSH/TND strided cold MTE2/HBM cap from P01 strided_cold_surface."""
+    if (not gm_workspace or contract.kv_layout not in TOKEN_MAJOR_LAYOUTS
+            or contract.num_kv_heads <= 1 or active_owners < 1):
+        return base_caps
+    row_bytes = contract.head_dim * BF16_BYTES
+    if row_bytes >= burst_bytes:
+        return base_caps
+    stride_bytes = contract.num_kv_heads * row_bytes
+    strided_die = p01_strided_cold_bps(context, row_bytes, stride_bytes)
+    if strided_die is None or strided_die <= 0.0:
+        return base_caps
+    full_cold = _p01_active_core_bps(context, max(1, total_aics), warm=False)
+    act_cold = _p01_active_core_bps(context, active_owners, warm=False)
+    scale = (act_cold / full_cold) if (full_cold and act_cold and full_cold > 0.0) else 1.0
+    # Adjacent KV heads share each 512 B burst (burst_bytes / row_bytes peer coalescing).
+    coalesce = max(1.0, float(burst_bytes) / float(row_bytes))
+    eff_die_bps = strided_die * coalesce * min(1.0, scale)
+    per_owner_ms = eff_die_bps / (MS_PER_SECOND_FIA * float(active_owners))
+    caps = dict(base_caps)
+    for role in ("mte2_aic", "hbm"):
+        res_name = context.resource_names.get(role)
+        if not res_name:
+            continue
+        prev = caps.get(res_name)
+        # mte2_aic carries burst-amplified copy bytes (coalesce * logical), so its
+        # per-owner ceiling scales by coalesce while HBM carries logical bytes (1x).
+        target = per_owner_ms * (coalesce if role == "mte2_aic" else 1.0)
+        caps[res_name] = min(prev, target) if prev is not None else target
+    return caps
+
+
+def _weighted_contiguous_rect_partition(rects: tuple[_FiaRect, ...], owners: int) -> tuple[tuple[int, ...], ...]:
+    """CANN SplitNBSeq weighted contiguous rectangle assignment (tiling_impl.cpp:638)."""
+    n_rects = len(rects)
+    if n_rects <= 0 or owners <= 0:
+        return ()
+    weights = [max(1, r.end - r.first) for r in rects]
+    total = sum(weights)
+    out: list[tuple[int, ...]] = []
+    idx = 0
+    unassigned = total
+    for core in range(owners):
+        if idx >= n_rects:
+            break
+        cores_left = owners - core
+        limit = unassigned // cores_left
+        cur: list[int] = []
+        cur_w = 0
+        while idx < n_rects:
+            w = weights[idx]
+            if not cur or cur_w + w <= limit + w // 2:
+                cur.append(idx)
+                cur_w += w
+                idx += 1
+            else:
+                break
+        if core == owners - 1 and idx < n_rects:
+            cur.extend(range(idx, n_rects))
+            idx = n_rects
+        unassigned -= cur_w
+        if cur:
+            out.append(tuple(cur))
+    return tuple(out)
 
 
 def _fixpipe_bytes(rows: int, columns: int) -> int:
@@ -306,25 +391,36 @@ class _FiaLoop:
         ws_l2 = self.ws_l2_resident
         stages = []
 
-        def add(name, work, after=None, slot=None, memory=None):
+        def add(name, work, after=None, slot=None, memory=None, pages: int = 0):
             deps = (stages[-1].name,) if after is None and stages else after or ()
-            stages.append(AttentionPhase(name, work, deps, slot, memory))
+            stages.append(AttentionPhase(name, work, deps, slot, memory, pages))
 
+        tile_pages = ceil((start % c.block_size + n) / c.block_size) if c.kv_layout in PAGED_LAYOUTS else 0
+        is_a35_dec = (not self.gm_workspace) and (rect.m <= ARCH35_DECODE_M_LIMIT)
         if c.kv_layout in PAGED_LAYOUTS:
-            pages = ceil((start % c.block_size + n) / c.block_size)
-            add("block_table", read_work(self.ctx, pages * INDEX_BYTES, aiv=True))
+            add("block_table", read_work(self.ctx, tile_pages * INDEX_BYTES, aiv=True))
         k_root = (stages[-1].name,) if stages else ()
+        if tile_pages > 0:
+            add("k_page_cmd", Work(), k_root, pages=tile_pages)
+        if is_a35_dec:
+            add("k_nd2nz_issue", Work(), k_root)
         offset = 0
         depth = min(p.k_l1_slots, p.l0b_slots)
         for index, width in enumerate(p.k_panels):
             load, compute = f"k_panel_{index}_load", f"qk_panel_{index}_accumulate"
             slot = index % p.l0b_slots
-            ready = (f"qk_panel_{index - depth}_accumulate",) if index >= depth else k_root
+            if index >= depth:
+                ready = (f"qk_panel_{index - depth}_accumulate",)
+            elif is_a35_dec and index == 0:
+                ready = ("k_nd2nz_issue",)
+            else:
+                ready = k_root
             previous = (f"qk_panel_{index - 1}_accumulate",) if index else ()
             work, memory = self._kv(rect, start, n, c.head_dim, width, offset, "key")
-            add(load, work, ready, slot, memory)
+            add(load, work, ready, slot, memory, pages=tile_pages)
+            comp_deps = (load, *previous, *(("k_page_cmd",) if (tile_pages > 0 and index == 0) else ()))
             add(compute, Work({self.dtype: 2 * pairs * width},
-                              {"mte1": (rect.m + n) * width * BF16_BYTES}), (load, *previous), slot)
+                              {"mte1": (rect.m + n) * width * BF16_BYTES}), comp_deps, slot)
             offset += width
         if self.gm_workspace:
             add("score_fixpipe", workspace_write_work(self.ctx, "fixpipe", score, l2_resident=ws_l2))
@@ -351,17 +447,27 @@ class _FiaLoop:
             v_root = (prob_ready,)
         else:
             v_root = (f"k_panel_{len(p.k_panels) - 1}_load",) if p.k_panels else k_root
+        if tile_pages > 0:
+            add("v_page_cmd", Work(), ("k_page_cmd",), pages=tile_pages)
+        if is_a35_dec:
+            add("v_nd2nz_issue", Work(), v_root)
         offset = 0
         depth = min(p.v_l1_slots, p.l0b_slots)
         for index, width in enumerate(p.v_panels):
             load, compute = f"v_panel_{index}_load", f"pv_panel_{index}"
             slot = index % p.l0b_slots
-            ready = (f"pv_panel_{index - depth}",) if index >= depth else v_root
+            if index >= depth:
+                ready = (f"pv_panel_{index - depth}",)
+            elif is_a35_dec and index == 0:
+                ready = ("v_nd2nz_issue",)
+            else:
+                ready = v_root
             previous = prob_ready if index == 0 else stages[-1].name
             work, memory = self._kv(rect, start, n, c.v_head_dim, width, offset, "value")
-            add(load, work, ready, slot, memory)
+            add(load, work, ready, slot, memory, pages=tile_pages)
+            pv_deps = (load, previous, *(("v_page_cmd",) if (tile_pages > 0 and index == 0) else ()))
             add(compute, Work({self.dtype: 2 * pairs * width},
-                              {"mte1": probability + n * width * BF16_BYTES}), (load, previous), slot)
+                              {"mte1": probability + n * width * BF16_BYTES}), pv_deps, slot)
             if not shipping_ub:
                 partial = rect.m * width * FP32_BYTES
                 if self.gm_workspace:
@@ -485,30 +591,61 @@ class _FiaLoop:
         die = self.ctx.geometry.rank or 0
 
         ragged_kv = len({kv for _, kv in self.contract.sequences}) > 1
-        if ragged_kv:
-            # Ragged batches finish short sequences early; cap each owner at 1-core P01 cold supply
-            # rather than dividing a 32-core ceiling across 8 straggler cores.
-            cold_kv_caps = p01_cold_mte2_aic_cap(context, 1, include_hbm=True)
+        if self.fd_segments:
+            active_owners = max(1, min(owners, len(self.fd_segments)))
+        elif self.row_ends[-1] > 0:
+            splits_0 = 1 if ragged_kv else max(1, len(tuple(self.ranges(self.rectangle(0)))))
+            active_owners = max(1, min(owners, self.row_ends[-1] * splits_0))
         else:
-            if self.fd_segments:
-                active_owners = max(1, min(owners, len(self.fd_segments)))
-            elif self.row_ends[-1] > 0:
-                splits_0 = max(1, len(tuple(self.ranges(self.rectangle(0)))))
-                active_owners = max(1, min(owners, self.row_ends[-1] * splits_0))
-            else:
-                active_owners = max(1, owners)
-            cold_kv_caps = p01_cold_mte2_aic_cap(
-                context, active_owners, include_hbm=True,
-                hbm_only=(self.kv_reuse_hit_frac > 0.0),
-            )
+            active_owners = max(1, owners)
+        cold_kv_caps = p01_cold_mte2_aic_cap(
+            context, active_owners, include_hbm=True,
+            hbm_only=(self.kv_reuse_hit_frac > 0.0),
+        )
+        cold_kv_caps = _bsh_strided_cold_caps(
+            context, cold_kv_caps, self.contract, gm_workspace=self.gm_workspace,
+            burst_bytes=self.burst_bytes, active_owners=active_owners, total_aics=datapath.aic_count,
+        )
+        paged_kv = self.contract.kv_layout in PAGED_LAYOUTS
+        page_cmd_ms = (
+            (p03_fixpipe_setup_ms(context) or (ARCH22_FIA_PAGE_CMD_FALLBACK_MULT * p02_load_setup_ms(context)))
+            if self.gm_workspace
+            else (ARCH35_FIA_PAGE_CMD_MULT * p02_load_setup_ms(context))
+        ) if paged_kv else 0.0
+        scatter_open_bytes = (
+            p01_hbm_scatter_row_open_bytes(context)
+            if (paged_kv and not self.gm_workspace) else 0
+        )
+        group = self.contract.num_heads // self.contract.num_kv_heads
+        max_q_m = max((q * group for q, _ in self.sequences), default=1)
+        is_a35_decode = (not self.gm_workspace) and max_q_m <= ARCH35_DECODE_M_LIMIT
+        a35_decode_fix_ms = (p03_fixpipe_setup_ms(context) + p13_mode4_ms(context)) if is_a35_decode else 0.0
+        a35_nd2nz_setup_ms = (
+            (ARCH35_FIA_ND2NZ_SETUP_MULT * p02_load_setup_ms(context))
+            if is_a35_decode else 0.0
+        )
 
         def lower_phase(phase, place):
+            if phase.name in {"k_page_cmd", "v_page_cmd"}:
+                lat = float(phase.pages) * page_cmd_ms if (page_cmd_ms > 0.0 and phase.pages > 0) else 0.0
+                prev = ("v_page_cmd",) if (phase.name == "k_page_cmd" and self.gm_workspace) else ()
+                return Stage(phase.name, after=phase.after, previous=prev, latency=lat, keep_empty=True)
+            if phase.name in {"k_nd2nz_issue", "v_nd2nz_issue"}:
+                return Stage(phase.name, after=phase.after, latency=a35_nd2nz_setup_ms, keep_empty=True)
             if not (phase.memory and (capacity or self.ctx.admission_memory_view is not None)
                     and l2 in context.rates and hbm in context.rates):
-                st = _stage(context, phase, place)
-                if (cold_kv_caps and phase.work.resources.get("hbm", 0) > 0
-                        and phase.name.endswith("_load") and not phase.name.startswith("probability")):
-                    return replace(st, caps={**st.caps, **cold_kv_caps})
+                eff_phase = phase
+                is_kv_load = phase.name.endswith("_load") and not phase.name.startswith("probability")
+                if is_kv_load and scatter_open_bytes > 0 and phase.pages > 0 and hbm:
+                    extra_hbm = phase.pages * scatter_open_bytes
+                    eff_phase = replace(phase, work=phase.work + Work(resources={"hbm": extra_hbm}))
+                st = _stage(context, eff_phase, place)
+                if self.gm_workspace and phase.name == "k_panel_0_load":
+                    st = replace(st, previous=("k_panel_0_load",))
+                if cold_kv_caps and eff_phase.work.resources.get("hbm", 0) > 0 and is_kv_load:
+                    st = replace(st, caps={**st.caps, **cold_kv_caps})
+                if a35_decode_fix_ms > 0.0 and phase.name in {"score_fixpipe", "pv_fixpipe"}:
+                    st = replace(st, latency=max(st.latency, a35_decode_fix_ms))
                 return st
             runs, rules, tensor = phase.memory
             pipe = context.resource_names.get("mte2_aic", context.resource_names.get("mte2"))
@@ -558,6 +695,13 @@ class _FiaLoop:
             largest = max((ceil(kv / self.s2_tile) for _, kv in self.sequences), default=1)
             lanes = min(owners, self.effective_splits, max(1, largest))
             return attention_owner_waves(self.row_ends[-1], owners, lanes, row)
+        if ragged_kv and self.effective_splits == 1 and self.row_ends[-1] > owners:
+            rects_all = tuple(self.rectangle(i) for i in range(self.row_ends[-1]))
+            core_slices = _weighted_contiguous_rect_partition(rects_all, owners)
+            return ParallelProgram(tuple(
+                PipelineProgram(len(indices), 1, lambda i, core=core, indices=indices: (row(indices[i], core),))
+                for core, indices in enumerate(core_slices) if indices
+            ))
         return ParallelProgram(tuple(
             PipelineProgram(len(indices), 1, lambda i, core=core, indices=indices: (row(indices[i], core),))
             for core in range(owners) if (indices := range(core, self.row_ends[-1], owners))
@@ -618,6 +762,13 @@ class _FiaLoop:
             PipelineProgram(len(fps), 1, lambda i, fps=fps: (Stage("finish", program=fps[i]),))
             for fps in fin_by_core if fps
         )
+        syncall_ms = p13_syncall_ms(context)
+        if syncall_ms > 0.0:
+            return KernelProgram((
+                Stage("fd_partials", program=ParallelProgram(prod_programs)),
+                Stage("fd_syncall", after=("fd_partials",), latency=syncall_ms, keep_empty=True),
+                Stage("fd_merge", after=("fd_syncall",), program=ParallelProgram(fin_programs)),
+            ))
         return KernelProgram((
             Stage("fd_partials", program=ParallelProgram(prod_programs)),
             Stage("fd_merge", after=("fd_partials",), program=ParallelProgram(fin_programs)),

@@ -24,7 +24,7 @@ from ..kda.triton_kda import (
     TRITON_KDA_CHUNK_ABIS, TRITON_KDA_RECURRENT_ABIS, build_triton_chunk_kda, build_triton_recurrent_kda,
 )
 from ..matrix.refill_steady import compact_periodic_pipeline
-from ..sharedkv.l0_sync import p12_flag_ms, p13_paired_ms, p13_syncall_ms
+from ..sharedkv.l0_sync import p03_fixpipe_setup_ms, p12_flag_ms, p13_paired_ms, p13_syncall_ms
 from ..sharedkv.split_core import p01_cold_hbm_group_cap
 from ._gdn_native import RECURRENT_GDN_ABI, build_native_recurrent_gdn
 from .common import (
@@ -75,9 +75,12 @@ ARCH22_STAGE1_EXP_SCORE_MULT = 3  # 3*C^2 + 3*C + 1 exp ops across stages 1-3 (s
 ARCH22_STAGE1_EXP_SFU_WEIGHT = 4  # P07/P08 SFU ratio fallback
 ARCH22_STAGE1_CROSSCORE_BATCH = 4
 ARCH22_STAGE1_CROSSCORE_SYNCS = 6  # 6 CrossCore notifications per 4-head-chunk batch
+ARCH22_STAGE1_MATMULS_PER_HEAD_CHUNK = 5  # kkt, qkt, offdiag_inv, kcd, u (stage1_arch22.h)
 ARCH22_STAGE3_CROSSCORE_SYNCS = 2  # 2 CrossCore notifications per head-chunk (stage3_arch22.h:114)
+ARCH22_STAGE3_MATMULS_PER_HEAD_CHUNK = 1  # masked_qkt @ v_inner (stage3_arch22.h:178)
 ARCH22_STAGE3_MASK_OPS_PER_SCORE = 12
-ARCH22_STAGE2_PAIRED_SYNCS_PER_CHUNK = 3  # 3 CrossCore flags per chunk (stage2_arch22.h)
+ARCH22_STAGE2_PAIRED_SYNCS_PER_CHUNK = 2  # 3 one-way CrossCore flags -> 2 paired handoffs (stage2_arch22.h:116-135)
+ARCH22_STAGE2_MATMULS_PER_CHUNK = 3  # CalVPrime, CalAttnInter, CalStateNew (stage2_arch22.h:126-131)
 ARCH22_STAGE2_AIV_CAST_MUL_OPS = 3  # AIV0 bf16->fp32->mul->bf16 (stage2_arch22.h:157)
 ARCH22_COMPACT_GROUP_THRESHOLD = 20
 ARCH22_COMPACT_WINDOW = 2
@@ -105,10 +108,12 @@ def _rolling_chunk_phases(c: LinearAttentionContract, ctx: OperatorPlanningConte
               + Work({c.dtype: heads * (w.r_flops + w.o_inter_flops)}, {
                   "mte1": 2 * key + value + 2 * state_bytes, "fixpipe": 2 * value, "hbm": 2 * value,
               }), ("read_rolling_state",)),
-        Phase("write_decayed_state",
-              transfer(ctx, write=state_bytes)
-              + Work(resources={"vector": heads * (w.cast_ops + w.state_update_ops + ARCH22_STAGE2_AIV_CAST_MUL_OPS * c.dk * c.dv)}),
+        Phase("cal_decayed_state",
+              Work(resources={"vector": heads * (w.cast_ops + w.state_update_ops + ARCH22_STAGE2_AIV_CAST_MUL_OPS * c.dk * c.dv)}),
               ("R_O_inter",)),
+        Phase("write_decayed_state",
+              transfer(ctx, write=state_bytes),
+              ("cal_decayed_state",)),
         Phase("write_rolling_state",
               transfer(ctx, read=key + state_bytes, aiv=False) + Work({c.dtype: heads * w.delta_flops}, {
                   "mte1": key + value, "fixpipe": state_bytes, "hbm": state_bytes,
@@ -245,7 +250,11 @@ def _lower_rolling_group(
     stage3_aiv0 = tuple(peers[0] for _, peers in used)
     stage2_caps = p01_cold_hbm_group_cap(rc, len(stage2_cores))
     full_caps = p01_cold_hbm_group_cap(rc, len(cores))
-    chunk_sync_ms = ARCH22_STAGE2_PAIRED_SYNCS_PER_CHUNK * p13_paired_ms(rc)
+    fixpipe_setup_ms = p03_fixpipe_setup_ms(rc)
+    chunk_sync_ms = (
+        ARCH22_STAGE2_PAIRED_SYNCS_PER_CHUNK * p13_paired_ms(rc)
+        + ARCH22_STAGE2_MATMULS_PER_CHUNK * fixpipe_setup_ms
+    )
     sync_all_ms = p13_syncall_ms(rc)
     slot_bytes = c.dk * c.dv * element_bytes("bf16")
     slot = {"state_slot": "rolling_final_state", "sequence": sequence,
@@ -287,7 +296,10 @@ def _lower_rolling_group(
         if groups > ARCH22_COMPACT_GROUP_THRESHOLD else PipelineProgram(chunks, 1, chunk_tile)
     )
     stage1_jobs_per_core = ceil_div(chunks * c.hv, max(1, len(used)))
-    stage1_cc_ms = ceil_div(stage1_jobs_per_core, ARCH22_STAGE1_CROSSCORE_BATCH) * ARCH22_STAGE1_CROSSCORE_SYNCS * p13_paired_ms(rc)
+    stage1_cc_ms = (
+        ceil_div(stage1_jobs_per_core, ARCH22_STAGE1_CROSSCORE_BATCH) * ARCH22_STAGE1_CROSSCORE_SYNCS * p13_paired_ms(rc)
+        + stage1_jobs_per_core * ARCH22_STAGE1_MATMULS_PER_HEAD_CHUNK * fixpipe_setup_ms
+    )
     stage1_sync_ms = stage1_jobs_per_core * ARCH22_STAGE1_INV_FLAG_ROUNDS * p12_flag_ms(rc) + stage1_cc_ms
     s1_capped = _with_caps(bound[0], full_caps)
     stage1_bound = (
@@ -297,7 +309,10 @@ def _lower_rolling_group(
         ))) if stage1_sync_ms > 0.0 else s1_capped
     )
     stage2 = replace(bound[2], work={}, placement={}, program=stage2_prog)
-    stage3_cc_ms = stage1_jobs_per_core * ARCH22_STAGE3_CROSSCORE_SYNCS * p13_paired_ms(rc)
+    stage3_cc_ms = stage1_jobs_per_core * (
+        ARCH22_STAGE3_CROSSCORE_SYNCS * p13_paired_ms(rc)
+        + ARCH22_STAGE3_MATMULS_PER_HEAD_CHUNK * fixpipe_setup_ms
+    )
     s3_raw = _with_caps(bind_phase(phases[4], rc, ctx, cores, stage3_aiv0), full_caps)
     stage3 = (
         Stage(s3_raw.name, after=s3_raw.after, program=KernelProgram((
