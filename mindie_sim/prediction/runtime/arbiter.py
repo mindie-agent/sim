@@ -164,7 +164,8 @@ def _partition_coupled_components(resources, tasks, active):
 
 def component_rates(resources, tasks, active, *, coupled_solver=None,
                     coupled_active: int | None = None,
-                    placed_active: int | None = None) -> dict[str, dict[int, float]]:
+                    placed_active: int | None = None,
+                    allow_native: bool = True) -> dict[str, dict[int, float]]:
     """Return {physical_resource: {task_sequence: native_work/ms}}."""
     if not active:
         return {}
@@ -178,6 +179,7 @@ def component_rates(resources, tasks, active, *, coupled_solver=None,
                     coupled_solver=coupled_solver,
                     coupled_active=len(c_keys),
                     placed_active=placed_active,
+                    allow_native=allow_native,
                 )
                 for rname, sub in r_c.items():
                     out[rname] = dict(sub)
@@ -186,6 +188,7 @@ def component_rates(resources, tasks, active, *, coupled_solver=None,
                 coupled_solver=None,
                 coupled_active=0,
                 placed_active=placed_active,
+                allow_native=allow_native,
             )
             for rname, sub in r_u.items():
                 out.setdefault(rname, {}).update(sub)
@@ -212,7 +215,9 @@ def component_rates(resources, tasks, active, *, coupled_solver=None,
     if need_tier:
         if coupled_solver is not None and any(
                 tasks[key].coupled and tasks[key].remaining for key in active):
-            return _tiered_coupled(resources, tasks, active, coupled_solver)
+            return _tiered_coupled(
+                resources, tasks, active, coupled_solver,
+                allow_native=allow_native)
         return _tiered_simple(resources, tasks, active)
     if coupled_active != 0 and coupled_solver is not None:
         n_active = len(active)

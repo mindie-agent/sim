@@ -28,15 +28,15 @@ from .graph_projection import (
 from .operator_analysis import cohort_operator_costs, operator_costs, physical_id, _replay_scope
 from .native_binding import bind_native_call
 from .program import RecipeBook
-
-#: A multi-layer graph that amortizes eager callback-free native adoption.
-EAGER_GRAPH_MIN_OPS = 512
 from .structure import parse_case
 from .exposed_breakdown import (
     CLOCK_GAP_ABS_FLOOR_MS, CLOCK_GAP_LIMIT_FRACTION, ExposedClocks,
     communication_clocks, control_clocks, cube_clocks, finish_breakdown,
     memory_clocks, unavailable_breakdown, vector_clocks)
 from .resource_attribution import realized_clock_dag
+
+#: A multi-layer graph that amortizes eager callback-free native adoption.
+EAGER_GRAPH_MIN_OPS = 16
 
 ZERO = 0
 ONE = 1
@@ -333,14 +333,23 @@ def _run_graph(
         implementation_selections=graph_selections(items),
     ) for r, items in graphs.items()}
     steps = {}
-    for group in groups:
-        selected = {r: works[r] for r in group if r in works}
-        if len(selected) > 1:
-            steps.update(execution.add_group(selected, input_ready_ms, external_inputs=inputs))
-        elif selected:
-            r, work = next(iter(selected.items()))
-            steps[r] = execution.add(work, r, input_ready_ms, external_inputs=inputs[r])
-    engine.advance(until=tuple(step.completion for step in steps.values()), first=False)
+    if len(works) > 1 and len(groups) > 1:
+        from .runtime.dp_cohort_dedup import is_symmetric_dp_cohort
+        if is_symmetric_dp_cohort(execution, works, external_inputs=inputs):
+            steps.update(execution.add_group(works, input_ready_ms, external_inputs=inputs))
+    if not steps:
+        for group in groups:
+            selected = {r: works[r] for r in group if r in works}
+            if len(selected) > 1:
+                steps.update(execution.add_group(selected, input_ready_ms, external_inputs=inputs))
+            elif selected:
+                r, work = next(iter(selected.items()))
+                steps[r] = execution.add(work, r, input_ready_ms, external_inputs=inputs[r])
+    unique_completions = tuple(dict.fromkeys(step.completion for step in steps.values()))
+    engine.advance(until=unique_completions, first=False)
+    if not fast_span_only and getattr(execution, "_dedup_cohorts", None):
+        from .runtime.dp_cohort_dedup import expand_dedup_graph_artifacts
+        expand_dedup_graph_artifacts(execution, records, graphs)
     return execution, engine, records, steps, stream_plans
 
 
@@ -791,7 +800,6 @@ def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=Non
     } for name, amount in engine.serviced.items()
         if amount and "stream_quota@" not in name]
     resources.sort(key=lambda row: row["capacity_bound_ms"], reverse=True)
-    accel_view = engine.accel_status()
     accel_view = engine.accel_status()
     head = {
         "schema": "mindie-sim.graph/1",

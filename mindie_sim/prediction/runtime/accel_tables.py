@@ -84,7 +84,11 @@ def _is_inert_builtin(obj, depth: int = _ROOT_DEPTH) -> bool:
             or kind is str or kind is bytes):
         return True
     if kind is tuple:
-        return all(_is_inert_builtin(item, depth + 1) for item in obj)
+        nxt = depth + 1
+        for item in obj:
+            if not _is_inert_builtin(item, nxt):
+                return False
+        return True
     return False
 
 
@@ -92,8 +96,12 @@ def _inert_mapping(mapping) -> bool:
     """One exact private ``dict`` whose keys and values are inert built-ins."""
     if type(mapping) is not dict:
         return False
-    return all(_is_inert_builtin(key) and _is_inert_builtin(value)
-               for key, value in mapping.items())
+    if not mapping:
+        return True
+    for key, value in mapping.items():
+        if not (_is_inert_builtin(key) and _is_inert_builtin(value)):
+            return False
+    return True
 
 
 def _eligible_metadata(metadata) -> bool:
@@ -105,17 +113,21 @@ def _inert_scalar_mapping(mapping) -> bool:
     """Exact private ``str`` -> exact ``int``/``float`` dictionary."""
     if type(mapping) is not dict:
         return False
+    if not mapping:
+        return True
     for key, value in mapping.items():
         if type(key) is not str:
             return False
-        if type(value) is not int and type(value) is not float:
+        vt = type(value)
+        if vt is not float and vt is not int:
             return False
     return True
 
 
 def _exact_number_or_none(value) -> bool:
     """No numeric subclass may own a finalizer behind a task cell."""
-    return value is None or type(value) is int or type(value) is float
+    vt = type(value)
+    return value is None or vt is float or vt is int
 
 
 def _inert_pool_set(pools, engine=None) -> bool:
@@ -130,15 +142,27 @@ def _inert_pool_set(pools, engine=None) -> bool:
     if type(pools) is not frozenset:
         return False
     if pools is not _ENGINE_EMPTY_FROZENSET and not (
-            engine is not None and pools is engine._memory_pools_frozen):
+            engine is not None and (
+                pools is engine._memory_pools_frozen
+                or id(pools) in engine._engine_pool_set_ids
+            )):
         return False
-    return (weakref.getweakrefcount(pools) == 0
-            and all(type(pool) is str for pool in pools))
+    if weakref.getweakrefcount(pools) != 0:
+        return False
+    for pool in pools:
+        if type(pool) is not str:
+            return False
+    return True
 
 
 def _inert_str_tuple(value) -> bool:
     """An engine-owned tuple of exact allocation names."""
-    return type(value) is tuple and all(type(item) is str for item in value)
+    if type(value) is not tuple:
+        return False
+    for item in value:
+        if type(item) is not str:
+            return False
+    return True
 
 
 def _event_is_stable(event) -> bool:
@@ -151,7 +175,10 @@ def _event_is_stable(event) -> bool:
         return False
     if event._callbacks is not None or type(event._waiters) is not list:
         return False
-    return all(type(key) is int for key in event._waiters)
+    for key in event._waiters:
+        if type(key) is not int:
+            return False
+    return True
 
 
 def _contains_mutable_container(obj, depth: int = _ROOT_DEPTH) -> bool:
@@ -470,7 +497,10 @@ def install_signatures(library: ctypes.CDLL) -> None:
         P(ctypes.c_uint32), ctypes.c_size_t, P(ctypes.c_int32), P(ctypes.c_int32),
         ctypes.c_size_t, P(ctypes.c_int32), ctypes.c_size_t,
         P(ctypes.c_int32), ctypes.c_size_t]
-    for name in ("msim_ctx_deliver", "msim_ctx_drop", "msim_ctx_mark_external"):
+    for name in (
+        "msim_ctx_deliver", "msim_ctx_drop",
+        "msim_ctx_mark_external", "msim_ctx_mark_callback",
+    ):
         fn = getattr(library, name)
         fn.restype = ctypes.c_int32
         fn.argtypes = [ctypes.c_void_p, P(ctypes.c_int32), ctypes.c_size_t,
@@ -488,6 +518,15 @@ def install_signatures(library: ctypes.CDLL) -> None:
         P(ctypes.c_int32), ctypes.c_size_t, P(ctypes.c_double), ctypes.c_size_t,
         P(ctypes.c_uint64), ctypes.c_size_t, P(ctypes.c_double), ctypes.c_size_t,
         P(ctypes.c_uint64), ctypes.c_size_t]
+    if hasattr(library, "msim_fast_single_tier_coupled"):
+        library.msim_fast_single_tier_coupled.restype = ctypes.c_int32
+        library.msim_fast_single_tier_coupled.argtypes = [
+            ctypes.c_int32, P(ctypes.c_double), P(ctypes.c_int32),
+            ctypes.c_int32, P(ctypes.c_uint8), P(ctypes.c_int32), P(ctypes.c_int32),
+            ctypes.c_int32, P(ctypes.c_int32), P(ctypes.c_double), P(ctypes.c_double),
+            P(ctypes.c_uint8), P(ctypes.c_uint8), P(ctypes.c_int32), P(ctypes.c_int32),
+            P(ctypes.c_double), P(ctypes.c_int32),
+        ]
 
 
 def _grow(array: ctypes.Array, needed: int, elem):
@@ -515,7 +554,7 @@ class Arena:
     __slots__ = (
         "library", "ctx", "ctx_box", "rows", "links", "place", "hdr", "st",
         "io", "comp", "svc", "started", "out_slots", "res_names", "closed",
-        "nres", "last_held", "_finalizer", "__weakref__",
+        "nres", "last_held", "_busy_buf", "_serv_buf", "_finalizer", "__weakref__",
     )
 
     def __init__(self, library: ctypes.CDLL) -> None:
@@ -541,6 +580,8 @@ class Arena:
         self.closed = False
         self.nres = 0
         self.last_held = False
+        self._busy_buf = (F64_T * 1)()
+        self._serv_buf = (F64_T * 1)()
 
     # -- lifecycle -----------------------------------------------------
     def close(self) -> None:
@@ -566,20 +607,27 @@ class Arena:
         if rc != 0:
             raise KernelFault(int(self.st[1]), "configure", f"nres={n}")
         self.nres = n
+        self._busy_buf = (F64_T * n)()
+        self._serv_buf = (F64_T * n)()
 
     def seed(self, busy, serv) -> None:
         n = self.nres
-        b = (F64_T * n)(*[float(x) for x in busy])
-        s = (F64_T * n)(*[float(x) for x in serv])
+        b = self._busy_buf
+        s = self._serv_buf
+        for i in range(n):
+            b[i] = float(busy[i])
+            s[i] = float(serv[i])
         if self.library.msim_ctx_seed(self.ctx, b, s, n) != 0:
             raise KernelFault(E_VALUE, "seed")
 
-    def counters(self):
+    def counters_raw(self):
         n = self.nres
-        b = (F64_T * n)()
-        s = (F64_T * n)()
-        if self.library.msim_ctx_counters(self.ctx, b, s, n) != 0:
+        if self.library.msim_ctx_counters(self.ctx, self._busy_buf, self._serv_buf, n) != 0:
             raise KernelFault(E_VALUE, "counters")
+        return self._busy_buf, self._serv_buf
+
+    def counters(self):
+        b, s = self.counters_raw()
         return list(b), list(s)
 
     # -- submission ----------------------------------------------------

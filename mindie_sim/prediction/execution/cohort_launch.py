@@ -406,13 +406,14 @@ def launch_native_cohort(engine, launches, *, name_prefix="native_cohort",
                     transport=item.get("transport"))
                 engine.submit(item["name"] + ":parent_finish", after=(finish,),
                               owner=owner,
-                              on_complete=lambda _e: engine.resolve(promise))
+                              on_complete=lambda _e: engine.resolve(promise),
+                              native_hook=True)
                 remaining_starts[0] -= 1
                 if remaining_starts[0] == 0:
                     placeholders.clear()
 
             engine.submit(name + ":begin", after=(info["ready"],), owner=owner,
-                          on_complete=begin)
+                          on_complete=begin, native_hook=True)
         parents = {names_by_rank[rank]: item["parent"]
                    for rank, item in cohort.items()}
         starts = {names_by_rank[rank]: item["start"]

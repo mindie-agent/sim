@@ -414,7 +414,9 @@ def _progressive_unit_fill(flows, unit_remaining, *, orig_capacity=None,
     return alphas
 
 
-def _tiered_coupled(resources, tasks, active, solver) -> dict[str, dict[int, float]]:
+def _tiered_coupled(
+    resources, tasks, active, solver, *, allow_native: bool = True,
+) -> dict[str, dict[int, float]]:
     """Strict priority tiers solved collectively against per-unit residuals.
 
     Coupled contenders in one tier are never clipped independently: the whole
@@ -427,7 +429,8 @@ def _tiered_coupled(resources, tasks, active, solver) -> dict[str, dict[int, flo
     per-unit fill must own the computation to see the owner dimension.
     """
     del solver
-    fast = fast_single_tier_coupled(resources, tasks, active)
+    fast = fast_single_tier_coupled(
+        resources, tasks, active, allow_native=allow_native)
     if fast is not None:
         return fast
     # One immutable physical ledger for the whole tier walk.  ``orig_capacity``

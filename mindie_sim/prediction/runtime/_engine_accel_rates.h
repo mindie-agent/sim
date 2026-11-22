@@ -556,15 +556,18 @@ static int32_t rates_coupled(msim_ctx *c)
 
 static int32_t compute_rates(msim_ctx *c)
 {
-    int32_t *idx = c->idx, r, i, any_c = 0, any_u = 0;
-    for (i = 0; i < c->nl; i++) { c->link[i].rate = 0.0; c->link[i].mode = -1; }
-    for (i = 0; i < c->act_n; i++) {
-        msim_task *t = &c->task[c->act[i]];
-        int32_t k, has_rem = 0;
+    int32_t *idx = c->idx, r, i, a, k, ri, n_act_res = 0, any_c = 0, any_u = 0;
+    for (a = 0; a < c->act_n; a++) {
+        msim_task *t = &c->task[c->act[a]];
+        int32_t has_rem = 0;
         t->coupled_comp = 0;
         if (t->state != 1) continue;
-        for (k = 0; k < (int32_t)t->nlink; k++)
-            if (c->link[t->lstart + k].rem > 0.0) { has_rem = 1; break; }
+        for (k = 0; k < (int32_t)t->nlink; k++) {
+            msim_link *l = &c->link[t->lstart + k];
+            l->rate = 0.0;
+            l->mode = -1;
+            if (l->rem > 0.0) has_rem = 1;
+        }
         if (!has_rem) continue;
         if (t->flags & MSIM_F_COUPLED) { t->coupled_comp = 1; any_c = 1; }
         else any_u = 1;
@@ -628,24 +631,51 @@ static int32_t compute_rates(msim_ctx *c)
         rc = rates_coupled(c);
         if (rc != 0) return rc;
     }
-    for (r = 0; r < c->nres; r++) {
-        msim_res *res = &c->res[r];
-        int32_t n = 0, placed = 0;
-        for (i = 0; i < c->nl; i++)
-            if (c->link[i].res == r && c->link[i].rem > 0.0
-                    && c->task[c->link[i].task].state == 1
-                    && !c->task[c->link[i].task].coupled_comp) {
-                if (n >= MSIM_MAX_L) return MSIM_E_ARITH;
-                idx[n++] = i;
+    if (!any_u) return 0;
+    memset(c->res_seen, 0, (size_t)c->nres);
+    for (a = 0; a < c->act_n; a++) {
+        msim_task *t = &c->task[c->act[a]];
+        if (t->state != 1 || t->coupled_comp) continue;
+        for (k = 0; k < (int32_t)t->nlink; k++) {
+            msim_link *l = &c->link[t->lstart + k];
+            if (l->rem > 0.0 && !c->res_seen[l->res]) {
+                c->res_seen[l->res] = 1;
+                c->act_res[n_act_res++] = l->res;
             }
+        }
+    }
+    for (ri = 0; ri < n_act_res; ri++) {
+        msim_res *res;
+        int32_t n = 0, placed = 0;
+        r = c->act_res[ri];
+        res = &c->res[r];
+        for (a = 0; a < c->act_n; a++) {
+            msim_task *t = &c->task[c->act[a]];
+            if (t->state != 1 || t->coupled_comp) continue;
+            for (k = 0; k < (int32_t)t->nlink; k++) {
+                int32_t li = (int32_t)t->lstart + k;
+                msim_link *l = &c->link[li];
+                if (l->res == r && l->rem > 0.0) {
+                    if (n >= MSIM_MAX_L) return MSIM_E_ARITH;
+                    idx[n++] = li;
+                    if (l->plen > 0) placed = 1;
+                }
+            }
+        }
         if (n == 0) continue;
         if (res->policy == 1) { rates_fifo(c, idx, n, res->rate); res->mode = 1; continue; }
-        for (i = 0; i < n; i++) if (c->link[idx[i]].plen > 0) { placed = 1; break; }
-        if (placed && rates_partition(c, idx, n, res)) {
-            if (!any_c) res->mode = 2;
-            continue;
-        }
         if (placed) {
+            int32_t j;
+            for (i = 1; i < n; i++) {
+                int32_t key = idx[i];
+                j = i - 1;
+                while (j >= 0 && idx[j] > key) { idx[j + 1] = idx[j]; j--; }
+                idx[j + 1] = key;
+            }
+            if (rates_partition(c, idx, n, res)) {
+                if (!any_c) res->mode = 2;
+                continue;
+            }
             if (!rates_overlap(c, idx, n, res)) return MSIM_E_ARITH;
             if (!any_c) res->mode = 3;
             continue;

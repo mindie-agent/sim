@@ -286,14 +286,18 @@ class PipelineProgram:
             def begin_one(trigger: Event) -> None:
                 sinks = submit_tile0(trigger)
                 if len(sinks) == 1:
-                    engine.on_complete(sinks[0], lambda _e: engine.resolve(complete_one))
+                    engine.on_complete(
+                        sinks[0], lambda _e: engine.resolve(complete_one),
+                        native_hook=True,
+                    )
                 else:
                     engine.submit(
                         f"{name}:tile0:retire", after=sinks,
-                        on_complete=lambda _e: engine.resolve(complete_one), owner=owner,
+                        on_complete=lambda _e: engine.resolve(complete_one),
+                        owner=owner, native_hook=True,
                     )
 
-            engine.on_complete(ready, begin_one)
+            engine.on_complete(ready, begin_one, native_hook=True)
             return complete_one
 
         complete = engine.future(name + ":pipeline_complete")
@@ -359,10 +363,11 @@ class PipelineProgram:
                             engine.resolve(complete)
                             return
                         continue
-                    engine.on_complete(sink, retire)
+                    engine.on_complete(sink, retire, native_hook=True)
                     return
                 engine.submit(
-                    f"{name}:tile{index}:retire", after=sinks, on_complete=retire, owner=owner
+                    f"{name}:tile{index}:retire", after=sinks, on_complete=retire,
+                    owner=owner, native_hook=True,
                 )
                 return
 
@@ -377,11 +382,14 @@ class PipelineProgram:
             if setup.done and setup.time <= engine.now:
                 begin(setup)
             else:
-                engine.on_complete(setup, begin)
+                engine.on_complete(setup, begin, native_hook=True)
             if observation is None:
                 return complete
         else:
-            engine.submit(name + ":begin", after=(setup,), on_complete=begin, owner=owner)
+            engine.submit(
+                name + ":begin", after=(setup,), on_complete=begin,
+                owner=owner, native_hook=True,
+            )
         return engine.submit(
             name + ":complete",
             after=(complete, observation) if observation is not None else (complete,),

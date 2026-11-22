@@ -55,6 +55,7 @@ JOB_TIMEOUT = 300.0
 JOB_GRACE = 30.0
 PROBE_TTL = 60.0
 REMOTE_CANDIDATE_THRESHOLD = 4
+AUTO_REMOTE_BATCH_THRESHOLD = 8
 LEASE_HANDOFF_TIMEOUT = STAGE_TIMEOUT + JOB_GRACE
 PRIVATE_DIR = 0o700
 PRIVATE_FILE = 0o600
@@ -79,7 +80,10 @@ PUBLIC_REASONS = frozenset({
     "endpoint_configuration", "no_authorized_endpoint", "probe_unavailable",
     "stage_unavailable", "transport_not_sent", "transport_lost", "warm_local_c11",
 })
-ENTRYPOINTS = frozenset({"run_step", "evaluate_three_tiers", "solve_sla", "sweep_topology", "optimize_ladder"})
+ENTRYPOINTS = frozenset({
+    "run_step", "evaluate_three_tiers", "solve_sla", "sweep_topology",
+    "optimize_ladder", "batch_call",
+})
 
 class RemoteExecUnavailableError(RuntimeError):
     submission_state = "not_sent"
@@ -207,8 +211,14 @@ def _endpoint(value) -> _Endpoint:
             or (ep.container is not None and not ALIAS_TOKEN.fullmatch(ep.container))):
         raise ValueError("invalid endpoint")
     return ep
-def _user_endpoint_files() -> tuple[Path, Path]:
-    return tuple(Path.home() / folder / "endpoints.json" for folder in (".mindie", ".mindie-coordinator"))
+def _user_endpoint_files() -> tuple[Path, ...]:
+    paths = [Path.home() / folder / "endpoints.json" for folder in (".mindie", ".mindie-coordinator")]
+    cfg = os.environ.get("MINDIE_CONFIG_HOME")
+    if cfg:
+        candidate = Path(cfg).expanduser() / "endpoints.json"
+        if candidate not in paths:
+            paths.append(candidate)
+    return tuple(paths)
 def _read_config(path: Path, *, private=False, exact_mode: int | None = None):
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | (getattr(os, "O_NOFOLLOW", 0) if private else 0)
     try:
@@ -241,7 +251,11 @@ def _load_endpoints(cwd: Path):
            os.getenv("REMOTE_DEV_ENDPOINTS_FILE", "").split(os.pathsep) if item.strip())
     return _merge_endpoints((*_user_endpoint_files(), *env, cwd / "endpoints.json", cwd / "endpoints.local.json"))
 def _authorized_pairs(policy: RemoteExecPolicy) -> set[tuple[str, str]]:
-    path = policy.policy_path or Path.home() / ".mindie/sim_remote_policy.json"
+    cfg = os.environ.get("MINDIE_CONFIG_HOME")
+    cfg_policy = (Path(cfg).expanduser() / "sim_remote_policy.json") if cfg else None
+    default_path = (cfg_policy if (cfg_policy is not None and cfg_policy.exists())
+                    else Path.home() / ".mindie/sim_remote_policy.json")
+    path = policy.policy_path or default_path
     config = _read_config(Path(path).expanduser(), private=True, exact_mode=PRIVATE_FILE)
     rows = config.get("authorized_endpoints", config.get("authorized_aliases", ()))
     if isinstance(rows, dict):
@@ -797,3 +811,11 @@ class RemoteDispatcher:
     def optimize_ladder(self, case: CaseInput, candidates: Sequence[Mapping], *, local_runner=None, deadline_s=None):
         """Dispatch candidates with a StepRequest, optional replay, and ladder options under `options`."""
         return self.dispatch_batch("optimize_ladder", case, candidates, local_runner=local_runner, deadline_s=deadline_s)
+
+
+def execute_batch_with_auto_remote(
+    tasks_or_fn, tasks: Sequence | None = None, *, remote: str = "auto", **kwargs,
+) -> tuple[list, RemoteExecReceipt]:
+    """Run a batch remotely over SSH when eligible, else via local ProcessPoolExecutor."""
+    from mindie_sim._remote_worker import execute_batch_with_auto_remote as _run_batch
+    return _run_batch(tasks_or_fn, tasks, remote=remote, **kwargs)

@@ -14,7 +14,9 @@
 """
 from __future__ import annotations
 
+import ctypes
 import math
+import threading
 
 _MIN_RATE_PER_MS = 1e-12
 _HALF_STEP = 0.5
@@ -24,9 +26,278 @@ _NEXTAFTER_STEPS = 64
 _MAX_ATTEMPTS = 256
 _UNIT_RANGE_CACHE: dict[int, tuple[int, ...]] = {}
 
+_FAULT_OK = 0
+_FAULT_SCALE_UNDERFLOW = 1
+_FAULT_OVERALLOCATED = 2
+_FAULT_CELLS = 3
+_FAULT_CODE_IDX = 0
+_FAULT_RES_IDX = 1
+_FAULT_UNIT_IDX = 2
+_INITIAL_SCRATCH_CAP = 64
+_SCRATCH_GROWTH_FACTOR = 2
+_MIN_UNIT_COUNT = 1
 
-def fast_single_tier_coupled(resources, tasks, active) -> dict[str, dict[int, float]] | None:
+_NATIVE_FN_CACHE: dict[str, object] = {}
+_NATIVE_FN_LOCK = threading.Lock()
+_THREAD_SCRATCH = threading.local()
+
+
+class _CoupledScratch:
+    """Reusable growable ctypes buffers avoiding per-call heap churn."""
+
+    __slots__ = (
+        "res_cap", "res_rate", "res_units",
+        "task_cap", "task_coupled", "task_cohort", "task_link_off",
+        "link_cap", "link_res", "link_rem", "link_cap_arr",
+        "link_widened", "link_unplaced", "link_place_off", "out_rate",
+        "place_cap", "place_units", "out_fault",
+    )
+
+    def __init__(self) -> None:
+        cap = _INITIAL_SCRATCH_CAP
+        self.res_cap = cap
+        self.res_rate = (ctypes.c_double * cap)()
+        self.res_units = (ctypes.c_int32 * cap)()
+        self.task_cap = cap
+        self.task_coupled = (ctypes.c_uint8 * cap)()
+        self.task_cohort = (ctypes.c_int32 * cap)()
+        self.task_link_off = (ctypes.c_int32 * (cap + _MIN_UNIT_COUNT))()
+        self.link_cap = cap
+        self.link_res = (ctypes.c_int32 * cap)()
+        self.link_rem = (ctypes.c_double * cap)()
+        self.link_cap_arr = (ctypes.c_double * cap)()
+        self.link_widened = (ctypes.c_uint8 * cap)()
+        self.link_unplaced = (ctypes.c_uint8 * cap)()
+        self.link_place_off = (ctypes.c_int32 * (cap + _MIN_UNIT_COUNT))()
+        self.out_rate = (ctypes.c_double * cap)()
+        self.place_cap = cap
+        self.place_units = (ctypes.c_int32 * cap)()
+        self.out_fault = (ctypes.c_int32 * _FAULT_CELLS)()
+
+    def ensure_res(self, need: int) -> None:
+        if need <= self.res_cap:
+            return
+        cap = max(need, self.res_cap * _SCRATCH_GROWTH_FACTOR)
+        self.res_cap = cap
+        self.res_rate, self.res_units = (ctypes.c_double * cap)(), (ctypes.c_int32 * cap)()
+
+    def ensure_tasks(self, need: int) -> None:
+        if need <= self.task_cap:
+            return
+        cap = max(need, self.task_cap * _SCRATCH_GROWTH_FACTOR)
+        self.task_cap = cap
+        self.task_coupled, self.task_cohort = (ctypes.c_uint8 * cap)(), (ctypes.c_int32 * cap)()
+        self.task_link_off = (ctypes.c_int32 * (cap + _MIN_UNIT_COUNT))()
+
+    def ensure_links(self, need: int) -> None:
+        if need <= self.link_cap:
+            return
+        cap = max(need, self.link_cap * _SCRATCH_GROWTH_FACTOR)
+        self.link_cap = cap
+        self.link_res, self.link_rem = (ctypes.c_int32 * cap)(), (ctypes.c_double * cap)()
+        self.link_cap_arr, self.out_rate = (ctypes.c_double * cap)(), (ctypes.c_double * cap)()
+        self.link_widened, self.link_unplaced = (ctypes.c_uint8 * cap)(), (ctypes.c_uint8 * cap)()
+        self.link_place_off = (ctypes.c_int32 * (cap + _MIN_UNIT_COUNT))()
+
+    def ensure_place(self, need: int) -> None:
+        if need <= self.place_cap:
+            return
+        cap = max(need, self.place_cap * _SCRATCH_GROWTH_FACTOR)
+        self.place_cap, self.place_units = cap, (ctypes.c_int32 * cap)()
+
+
+def _get_scratch() -> _CoupledScratch:
+    scratch = getattr(_THREAD_SCRATCH, "buf", None)
+    if scratch is None:
+        scratch = _CoupledScratch()
+        _THREAD_SCRATCH.buf = scratch
+    return scratch
+
+
+def _get_native_coupled_fn():
+    """Return bound C11 ``msim_fast_single_tier_coupled`` or ``None``."""
+    from . import accel_build, accel_loader, accel_sync
+
+    if accel_sync.resolve_mode(None) == "python":
+        return None
+    cache_key = str(accel_build.cache_root())
+    with _NATIVE_FN_LOCK:
+        if cache_key in _NATIVE_FN_CACHE:
+            return _NATIVE_FN_CACHE[cache_key]
+    fn = None
+    try:
+        _status, lib = accel_loader.load_accel_cdll()
+        candidate = getattr(lib, "msim_fast_single_tier_coupled", None)
+        if candidate is not None:
+            fn = candidate
+    except TimeoutError:
+        raise
+    except (accel_loader.AccelUnavailable, OSError, RuntimeError):
+        fn = None
+    with _NATIVE_FN_LOCK:
+        _NATIVE_FN_CACHE[cache_key] = fn
+    return fn
+
+
+def reset_native_coupled_cache() -> None:
+    """Clear process-local native coupled-arbiter handle memo (tests only)."""
+    with _NATIVE_FN_LOCK:
+        _NATIVE_FN_CACHE.clear()
+
+
+def _collect_single_tier(tasks, active) -> list[int] | None:
+    """Return sorted active task keys if single-priority, else ``None``."""
+    first_prio = None
+    tier: list[int] = []
+    for key in active:
+        task = tasks[key]
+        if not task.remaining:
+            continue
+        prio = task.priority
+        if first_prio is None:
+            first_prio = prio
+        elif prio != first_prio:
+            return None
+        tier.append(key)
+    if len(tier) > _MIN_UNIT_COUNT:
+        tier.sort()
+    return tier
+
+
+def fast_single_tier_coupled_c(
+    resources, tasks, active, *, native_fn=None,
+) -> dict[str, dict[int, float]] | None:
+    """Native C11 fast path for single-priority non-FIFO coupled tiers."""
+    tier = _collect_single_tier(tasks, active)
+    if tier is None:
+        return None
+    if not tier:
+        return {}
+    fn = _get_native_coupled_fn() if native_fn is None else native_fn
+    if fn is None:
+        return fast_single_tier_coupled_py(resources, tasks, active)
+
+    res_ids: dict[str, int] = {}
+    res_names: list[str] = []
+    n_links = 0
+    n_place = 0
+    for key in tier:
+        task = tasks[key]
+        pl = task.placement
+        for name, amount in task.remaining.items():
+            if amount <= 0.0:
+                continue
+            if name not in res_ids:
+                res = resources[name]
+                if res.policy == "fifo":
+                    return None
+                res_ids[name] = len(res_names)
+                res_names.append(name)
+            n_links += _MIN_UNIT_COUNT
+            if pl:
+                decl = pl.get(name)
+                if decl is not None:
+                    n_place += len(decl)
+    if not n_links:
+        return {}
+
+    buf = _get_scratch()
+    n_res = len(res_names)
+    n_tasks = len(tier)
+    buf.ensure_res(n_res)
+    buf.ensure_tasks(n_tasks)
+    buf.ensure_links(n_links)
+    buf.ensure_place(max(_MIN_UNIT_COUNT, n_place))
+
+    for ri, name in enumerate(res_names):
+        res = resources[name]
+        buf.res_rate[ri] = float(res.rate)
+        buf.res_units[ri] = max(_MIN_UNIT_COUNT, int(res.units))
+
+    link_res_names: list[str] = []
+    link_task_keys: list[int] = []
+    li = 0
+    pi = 0
+    inf = math.inf
+    for ti, key in enumerate(tier):
+        task = tasks[key]
+        buf.task_coupled[ti] = _MIN_UNIT_COUNT if task.coupled else _FAULT_OK
+        cohort = int(task.cohort_size or _MIN_UNIT_COUNT)
+        buf.task_cohort[ti] = cohort if cohort >= _MIN_UNIT_COUNT else _MIN_UNIT_COUNT
+        buf.task_link_off[ti] = li
+        pl = task.placement
+        caps_map = task.caps
+        widened = getattr(task, "cohort_widened", ())
+        for name, amount in task.remaining.items():
+            if amount <= 0.0:
+                continue
+            buf.link_res[li] = res_ids[name]
+            buf.link_rem[li] = float(amount)
+            cap_val = caps_map.get(name) if caps_map else None
+            buf.link_cap_arr[li] = inf if cap_val is None else float(cap_val)
+            buf.link_widened[li] = _MIN_UNIT_COUNT if (widened and name in widened) else _FAULT_OK
+            decl = pl.get(name) if pl else None
+            buf.link_place_off[li] = pi
+            if decl is None:
+                buf.link_unplaced[li] = _MIN_UNIT_COUNT
+            else:
+                buf.link_unplaced[li] = _FAULT_OK
+                for unit in decl:
+                    buf.place_units[pi] = int(unit)
+                    pi += _MIN_UNIT_COUNT
+            link_res_names.append(name)
+            link_task_keys.append(key)
+            li += _MIN_UNIT_COUNT
+    buf.task_link_off[n_tasks] = li
+    buf.link_place_off[li] = pi
+
+    rc = int(fn(
+        n_res, buf.res_rate, buf.res_units,
+        n_tasks, buf.task_coupled, buf.task_cohort, buf.task_link_off,
+        li, buf.link_res, buf.link_rem, buf.link_cap_arr,
+        buf.link_widened, buf.link_unplaced, buf.link_place_off, buf.place_units,
+        buf.out_rate, buf.out_fault,
+    ))
+    fault_code = int(buf.out_fault[_FAULT_CODE_IDX])
+    if rc != _FAULT_OK:
+        if fault_code == _FAULT_SCALE_UNDERFLOW:
+            raise ZeroDivisionError("coupled_scale_underflow")
+        if fault_code == _FAULT_OVERALLOCATED:
+            r_idx = int(buf.out_fault[_FAULT_RES_IDX])
+            u_idx = int(buf.out_fault[_FAULT_UNIT_IDX])
+            r_name = res_names[r_idx] if 0 <= r_idx < n_res else str(r_idx)
+            raise AssertionError(f"unit_service_overallocated:{r_name}:{u_idx}")
+        return fast_single_tier_coupled_py(resources, tasks, active)
+
+    result: dict[str, dict[int, float]] = {}
+    out_rate = buf.out_rate
+    for idx in range(li):
+        rate = float(out_rate[idx])
+        if rate <= 0.0:
+            continue
+        rname = link_res_names[idx]
+        tkey = link_task_keys[idx]
+        target = result.get(rname)
+        if target is None:
+            result[rname] = {tkey: rate}
+        else:
+            target[tkey] = target.get(tkey, 0.0) + rate
+    return result
+
+
+def fast_single_tier_coupled(
+    resources, tasks, active, *, allow_native: bool = True,
+) -> dict[str, dict[int, float]] | None:
     """Fast path for single-priority non-FIFO cohorts; ``None`` delegates out."""
+    if allow_native:
+        fn = _get_native_coupled_fn()
+        if fn is not None:
+            return fast_single_tier_coupled_c(resources, tasks, active, native_fn=fn)
+    return fast_single_tier_coupled_py(resources, tasks, active)
+
+
+def fast_single_tier_coupled_py(resources, tasks, active) -> dict[str, dict[int, float]] | None:
+    """Pure-Python reference for single-priority non-FIFO coupled tiers."""
     ni, zi, oi, ti = -1, 0, 1, 2
     zf, of, tf = 0.0, 1.0, 2.0
 

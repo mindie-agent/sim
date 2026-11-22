@@ -145,32 +145,37 @@ static bool is_consumer(const msim_ctx *c, const msim_link *l)
 static int32_t build_order(msim_ctx *c, int32_t r, int32_t *n_out)
 {
     msim_res *res = &c->res[r];
-    int32_t *order = c->idx, n = 0, i, j;
-    for (i = 0; i < c->nl; i++) {
-        msim_link *l = &c->link[i];
-        if (l->res != r || !is_consumer(c, l)) continue;
-        j = n;
-        while (j > 0) {
-            msim_link *p = &c->link[order[j - 1]];
-            bool less;
-            if (res->mode == 4 || res->mode == 3) {
-                less = c->task[p->task].seq > c->task[l->task].seq;
-            } else if (res->mode == 2) {
-                int32_t gp = p->mode >= 0 ? p->mode : 0;
-                int32_t gl = l->mode >= 0 ? l->mode : 0;
-                if (gp != gl) less = gp > gl;
-                else if (p->cap != l->cap) less = p->cap > l->cap;
-                else less = c->task[p->task].seq > c->task[l->task].seq;
-            } else {
-                if (p->cap != l->cap) less = p->cap > l->cap;
-                else less = c->task[p->task].seq > c->task[l->task].seq;
+    int32_t *order = c->idx, n = 0, a, k, j;
+    for (a = 0; a < c->act_n; a++) {
+        msim_task *t = &c->task[c->act[a]];
+        if (t->state != 1) continue;
+        for (k = 0; k < (int32_t)t->nlink; k++) {
+            int32_t li = (int32_t)t->lstart + k;
+            msim_link *l = &c->link[li];
+            if (l->res != r || !is_consumer(c, l)) continue;
+            j = n;
+            while (j > 0) {
+                msim_link *p = &c->link[order[j - 1]];
+                bool less;
+                if (res->mode == 4 || res->mode == 3) {
+                    less = c->task[p->task].seq > c->task[l->task].seq;
+                } else if (res->mode == 2) {
+                    int32_t gp = p->mode >= 0 ? p->mode : 0;
+                    int32_t gl = l->mode >= 0 ? l->mode : 0;
+                    if (gp != gl) less = gp > gl;
+                    else if (p->cap != l->cap) less = p->cap > l->cap;
+                    else less = c->task[p->task].seq > c->task[l->task].seq;
+                } else {
+                    if (p->cap != l->cap) less = p->cap > l->cap;
+                    else less = c->task[p->task].seq > c->task[l->task].seq;
+                }
+                if (!less) break;
+                order[j] = order[j - 1];
+                j--;
             }
-            if (!less) break;
-            order[j] = order[j - 1];
-            j--;
+            order[j] = li;
+            n++;
         }
-        order[j] = i;
-        n++;
     }
     *n_out = n;
     return 0;
@@ -178,4 +183,5 @@ static int32_t build_order(msim_ctx *c, int32_t r, int32_t *n_out)
 
 #include "_engine_accel_submit.h"
 #include "_engine_accel_terms.h"
+#include "_engine_accel_coupled.h"
 #include "_engine_accel_abi.h"

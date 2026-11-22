@@ -461,13 +461,18 @@ class _EngineSubmitMixin:
             for callback in callbacks:
                 callback(event)
 
-    def on_complete(self, event: Event, callback: Callable[[Event], None]) -> None:
+    def on_complete(
+        self, event: Event, callback: Callable[[Event], None], *,
+        native_hook: bool = False,
+    ) -> None:
         """Observe one event's completion without adding a resolver task.
 
         A live task appends to its own callback chain; a promise stores the
         callback and fires it exactly at ``resolve``; an already finished event
         fires immediately at the current call boundary.  No event time, order
-        or dependency changes.
+        or dependency changes.  ``native_hook=True`` marks a pure framework
+        boundary observer so the C11 kernel halts at that completion instant
+        instead of handing back the whole frontier.
         """
         if event.time is not None:
             callback(event)
@@ -477,8 +482,17 @@ class _EngineSubmitMixin:
             previous = task.callback
             task.callback = (callback if previous is None
                              else _chain_callbacks(previous, callback))
+            if native_hook:
+                if previous is None:
+                    task.native_hook = True
+            else:
+                task.native_hook = False
             if previous is None and self._accel is not None:
-                self._accel.on_callback_registered(self, event)
+                self._accel.on_callback_registered(
+                    self, event, native_hook=native_hook)
+            elif not native_hook and self._accel is not None:
+                self._accel.on_callback_registered(
+                    self, event, native_hook=False)
             return
         if event.sequence in self._promises:
             if event._callbacks is None:

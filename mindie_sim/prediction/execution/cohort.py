@@ -73,6 +73,16 @@ class _CohortMixin(_CohortNativeMixin):
                 return value[replica]
             return value
 
+        from ..runtime.dp_cohort_dedup import is_symmetric_dp_cohort
+        if is_symmetric_dp_cohort(
+            self, works, external_inputs=external_inputs,
+            emitted_tokens=emitted_tokens, memory_bindings=memory_bindings,
+            state_accesses=state_accesses,
+        ):
+            return self._add_symmetric_group(
+                works, release_ms, external_inputs=external_inputs,
+            )
+
         steps = {replica: self.add(
             work, replica, release_ms,
             external_inputs=(external_inputs or {}).get(replica),
@@ -156,10 +166,314 @@ class _CohortMixin(_CohortNativeMixin):
                     self.engine.resolve(item)
 
             self.engine.submit(f"group:{key}", after=completions,
-                               on_complete=release, owner="expert_group")
+                               on_complete=release, owner="expert_group",
+                               native_hook=True)
         self._collectives = None
         self._cohort_views = None
         return steps
+
+    def _collective_peer_replicas(self, item0, replicas):
+        """Exact participating DP replicas for one canonical collective op."""
+        meta = dict(item0.context.op.metadata)
+        axis = meta.get("group_axis")
+        src_stage = int(meta.get("source_stage", item0.context.op.stage))
+        if axis == "local_tp" and meta.get("group_ranks"):
+            group_set = {int(rk) for rk in meta["group_ranks"]}
+            return tuple(
+                r for r in replicas
+                if set(self.topology.ranks(r, src_stage)) & group_set
+            )
+        if axis in {"cp", "dcp_dp", "dcp_a2a"}:
+            groups = self.topology.groups(axis, item0.replica, src_stage, metadata=meta)
+            rank_set = {int(rk) for grp in groups for rk in grp}
+            if rank_set:
+                matched = tuple(
+                    r for r in replicas
+                    if any(int(rk) in rank_set for rk in self.topology.ranks(r, src_stage))
+                )
+                if matched:
+                    return matched
+        if axis == "ep":
+            from ..dispatch import cohorts
+            for grp in cohorts(self.case.runtime.parallel, self.case.machine):
+                if item0.replica in grp:
+                    return tuple(r for r in replicas if r in grp)
+        return replicas
+
+    def _synthesize_cohort_participants(self, item0, works, peer_replicas):
+        """Build full-cohort CollectiveParticipants sharing canonical ready."""
+        op_id = item0.context.op.op_id
+        out = []
+        for rep in peer_replicas:
+            if rep == item0.replica:
+                out.append(item0)
+                continue
+            wr = works[rep]
+            op_r = next((op for op in wr.ops if op.op_id == op_id), item0.context.op)
+            ctx_r = self._context(op_r, rep, wr.replay_scope)
+            name_r = f"{self.namespace}r{rep}:i{wr.plan.iteration}:{op_r.op_id}"
+            comp_r = self.engine.future(name_r + ":collective")
+            out.append(CollectiveParticipant(
+                rep, item0.ready, ctx_r, item0.recipe, name_r, comp_r,
+            ))
+        return out
+
+    def _add_symmetric_group(self, works, release_ms, *, external_inputs=None):
+        """Execute one canonical replica for a provably symmetric DP cohort."""
+        from ..runtime.dp_cohort_dedup import (
+            can_dedup_collective_to_canonical,
+            is_symmetric_native_program,
+            mirror_deduplicated_step,
+            scale_dedup_accounting,
+        )
+        replicas = tuple(sorted(works))
+        r0 = replicas[0]
+        peers = replicas[1:]
+        base_work = dict(self.work)
+        base_recipes = dict(self.recipes_used)
+        base_cost_counts = dict(self.cost.counts)
+
+        step0 = self.add(
+            works[r0], r0, release_ms,
+            external_inputs=(external_inputs or {}).get(r0),
+        )
+        can_r0_only = can_dedup_collective_to_canonical(self.topology, self.engine)
+        used_r0_only_links = False
+
+        for key, participants in self._collectives.items():
+            item0 = participants[0]
+            peer_replicas = self._collective_peer_replicas(item0, replicas)
+            if getattr(item0.recipe, "algorithm", None):
+                synth = self._synthesize_cohort_participants(item0, works, peer_replicas)
+                self._start_joint_collective(key, synth)
+                continue
+            if getattr(item0.recipe, "native", False):
+                if can_r0_only and self._schedule_canonical_native_cohort(
+                    key, item0, peer_replicas, is_symmetric_native_program,
+                ):
+                    used_r0_only_links = True
+                    continue
+                synth = self._synthesize_cohort_participants(item0, works, peer_replicas)
+                self._schedule_native_cohort(key, synth)
+                continue
+            if item0.context.op.family == "mc2_transport":
+                prog0 = self.lower_program(item0.context, item0.recipe)
+                from ..program import NativeProgram
+                if (isinstance(prog0, NativeProgram)
+                        and hasattr(prog0.program, "start_with_handles")):
+                    if can_r0_only and is_symmetric_native_program(prog0, len(peer_replicas)):
+                        if self._start_canonical_native_cohort(
+                            key, item0, prog0, peer_replicas,
+                        ):
+                            used_r0_only_links = True
+                            continue
+                    synth = self._synthesize_cohort_participants(item0, works, peer_replicas)
+                    progs = {
+                        p.replica: (prog0 if p.replica == r0
+                                    else self.lower_program(p.context, p.recipe))
+                        for p in synth
+                    }
+                    if self._start_native_cohort(key, synth, progs):
+                        continue
+            if can_r0_only:
+                comp0 = self._start_program(
+                    item0.context, item0.recipe, item0.name, item0.ready,
+                    owner="expert_group", replica=item0.replica,
+                )
+                self.engine.on_complete(
+                    comp0,
+                    lambda _ev, promise=item0.completion: self.engine.resolve(promise),
+                    native_hook=True,
+                )
+                used_r0_only_links = True
+            else:
+                synth = self._synthesize_cohort_participants(item0, works, peer_replicas)
+                ready = self.engine.submit(
+                    f"group:{key}:ready", after=(item0.ready,), owner="expert_group",
+                )
+                completions = [
+                    self._start_program(
+                        p.context, p.recipe, p.name, ready,
+                        owner="expert_group", replica=p.replica,
+                    )
+                    for p in synth
+                ]
+                promises = tuple(p.completion for p in synth)
+
+                def _release(_ev, events=promises):
+                    for ev in events:
+                        self.engine.resolve(ev)
+
+                self.engine.submit(
+                    f"group:{key}", after=completions,
+                    on_complete=_release, owner="expert_group", native_hook=True,
+                )
+
+        scale_dedup_accounting(
+            self, base_work, base_recipes, base_cost_counts, len(replicas),
+        )
+        dedup_list = getattr(self, "_dedup_cohorts", None)
+        if dedup_list is None:
+            dedup_list = []
+            self._dedup_cohorts = dedup_list
+        dedup_list.append({
+            "canonical": r0,
+            "peers": peers,
+            "mirror_links": used_r0_only_links,
+        })
+        self._collectives = None
+        self._cohort_views = None
+        steps = {r0: step0}
+        for rep in peers:
+            steps[rep] = mirror_deduplicated_step(step0, rep, works[rep])
+        return steps
+
+    def _schedule_canonical_native_cohort(
+        self, key, item0, peer_replicas, is_symmetric_fn,
+    ) -> bool:
+        """Defer-launch one canonical native MC2 rank when routing is symmetric."""
+        prog0 = self.lower_program(item0.context, item0.recipe)
+        from ..program import NativeProgram
+        if not (isinstance(prog0, NativeProgram)
+                and is_symmetric_fn(prog0, len(peer_replicas))):
+            return False
+        return self._start_canonical_native_cohort(
+            key, item0, prog0, peer_replicas, defer=True,
+        )
+
+    def _start_canonical_native_cohort(
+        self, key, item0, prog0, peer_replicas, *, defer: bool = False,
+    ) -> bool:
+        """Launch canonical rank-0 MC2 program with full-cohort peer fan-out."""
+        from mindie_sim.prediction.operators.mc2.mc2_program import Mc2LaunchView
+
+        source_stage = int(dict(item0.context.op.metadata).get(
+            "source_stage", item0.context.op.stage))
+        rank0 = self.participant_rank_index(item0.replica, source_stage)
+        if rank0 is None:
+            return False
+        inner = prog0.program
+        peer_count = int(getattr(inner, "peer_count", 0) or len(peer_replicas))
+        if peer_count <= 0 or not 0 <= rank0 < peer_count:
+            return False
+        res_names = self.native_resource_names(
+            item0.context, prog0, rank=rank0, replica=item0.replica)
+        transport = dict(self.native_transport(item0.context.op, item0.replica))
+        r0_ranks = tuple(self.topology.ranks(item0.replica, source_stage))
+        if r0_ranks and transport.get("destination_memory"):
+            r0_mems = tuple(
+                self.destination_window_resource(int(rk), source_stage)
+                for rk in r0_ranks
+            )
+            group_ranks = tuple(transport.get("group") or ())
+            if group_ranks and any(r0_mems):
+                transport["destination_memory"] = {
+                    int(rk): r0_mems[idx % len(r0_mems)]
+                    for idx, rk in enumerate(group_ranks)
+                }
+        bound = _bind_native_resource_view(prog0, res_names, self.engine)
+        source_view = getattr(bound.program, "view", None)
+        labels = tuple(i for i in range(peer_count) if i != rank0)
+        node = int(getattr(self.case.machine, "ranks_per_node", 0))
+        frames_for = getattr(bound.program, "frames_for", None)
+        frames_raw = frames_for(rank0) if callable(frames_for) else getattr(source_view, "payload_frames", None)
+        if isinstance(frames_raw, _AbcMapping):
+            p_frames = tuple(sorted((int(p), int(f)) for p, f in frames_raw.items() if int(f) > 0))
+        elif frames_raw:
+            p_frames = tuple(sorted((int(x[0]), int(x[1])) for x in frames_raw if int(x[1]) > 0))
+        else:
+            p_frames = ()
+        basis_for = getattr(bound.program, "payload_basis_for", None)
+        p_basis = str(basis_for(rank0) if callable(basis_for)
+                      else getattr(source_view, "payload_basis", "unknown"))
+        local_for = getattr(bound.program, "local_frames_for", None)
+        p_local = int((local_for(rank0) if callable(local_for)
+                       else getattr(source_view, "payload_local_frames", 0)) or 0)
+        view = Mc2LaunchView(
+            rank=rank0, peer_labels=labels,
+            peer_classes=tuple(getattr(source_view, "peer_classes", ()) if source_view and source_view.rank == rank0 else ()),
+            peer_weights=tuple(getattr(source_view, "peer_weights", ()) if source_view and source_view.rank == rank0 else ()),
+            node_ranks=node,
+            intra_latency_ms=getattr(source_view, "intra_latency_ms", 0) if source_view is not None else 0,
+            inter_latency_ms=getattr(source_view, "inter_latency_ms", 0) if source_view is not None else 0,
+            resource_names=tuple(sorted((str(k), str(v)) for k, v in dict(res_names).items())),
+            payload_frames=p_frames,
+            payload_packet_bytes=int(getattr(source_view, "payload_packet_bytes", 0) or 0) if source_view is not None else 0,
+            payload_basis=p_basis,
+            payload_local_frames=p_local,
+        )
+        name0 = f"group:{key}:r{item0.replica}"
+        phase_names = tuple(p.name for p in getattr(bound.program, "phases", ()))
+
+        def _launch(_event=None):
+            placeholders = {}
+            owned_futures = []
+            for pname in phase_names:
+                for peer in labels:
+                    ev_p = self.engine.future(
+                        f"{name0}:sym_send:{rank0}->{peer}:{pname}")
+                    owned_futures.append(ev_p)
+                    placeholders[(rank0, peer, pname)] = ev_p
+                    placeholders[(peer, rank0, pname)] = ev_p
+            rank_eng = _RankEngine(self.engine, res_names)
+            finish, _handles = bound.start_with_handles(
+                rank_eng, name0, item0.ready,
+                launch=view, send_placeholders=placeholders, transport=transport,
+            )
+
+            def _complete_canonical(_e, promise=item0.completion, pending=tuple(owned_futures)):
+                for ev_p in pending:
+                    if not ev_p.done:
+                        self.engine.resolve(ev_p)
+                self.engine.resolve(promise)
+
+            self.engine.on_complete(finish, _complete_canonical, native_hook=True)
+
+        if defer:
+            self.engine.submit(
+                name0 + ":begin", after=(item0.ready,),
+                owner="expert_group", on_complete=_launch, native_hook=True,
+            )
+        else:
+            _launch()
+
+        payload, count = (bound.program.transport_account(transport)
+                          if hasattr(bound.program, "transport_account") else ({}, {}))
+        n_peers = len(peer_replicas)
+        phases_set = {p.name for p in getattr(bound.program, "phases", ())}
+        p_edges = int(payload.get("edges", 0)) * n_peers
+        c_edges = (int(count.get("edges", 0)) * n_peers) if "count_status_exchange" in phases_set else 0
+        p_frames_tot = int(payload.get("frames", 0)) * n_peers
+        c_frames_tot = (int(count.get("frames", 0)) * n_peers) if "count_status_exchange" in phases_set else 0
+        tx_b = (float(payload.get("tx_bytes", 0.0)) + (float(count.get("tx_bytes", 0.0)) if "count_status_exchange" in phases_set else 0.0)) * n_peers
+        rx_b = (float(payload.get("rx_bytes", 0.0)) + (float(count.get("rx_bytes", 0.0)) if "count_status_exchange" in phases_set else 0.0)) * n_peers
+        raw = dict(item0.context.op.metadata).get("mc2_phase", {})
+        self.native_group_launches[key] = {
+            "op_id": key,
+            "kind": str(raw.get("kind", "")),
+            "launch_mode": "cohort",
+            "ranks": tuple(range(n_peers)),
+            "payload_basis": {f"group:{key}:r{r}": p_basis for r in peer_replicas},
+            "payload_packet_bytes": {f"group:{key}:r{r}": view.payload_packet_bytes for r in peer_replicas},
+            "payload_frames": {f"group:{key}:r{r}": dict(p_frames) for r in peer_replicas},
+            "link_by_phase_by_rank": {},
+            "work_by_rank": {},
+            "transport_by_rank": {},
+            "transport_work_by_rank": {},
+            "transport_tx_bytes": tx_b,
+            "transport_rx_bytes": rx_b,
+            "transport_frames": p_frames_tot + c_frames_tot,
+            "transport_edges": p_edges,
+            "total_edges": p_edges + c_edges,
+            "payload_edges": p_edges,
+            "count_edges": c_edges,
+            "directed_edges": p_edges,
+            "directed_frames": p_frames_tot,
+            "protocol_edges": 0,
+            "unresolved_edges": 0,
+            "partial": (),
+        }
+        return True
 
     def _begin_joint_observation(self, op, key, participants, ready_by_rank,
                                  source_stage):
@@ -315,7 +629,8 @@ class _CohortMixin(_CohortNativeMixin):
 
             self.engine.submit(
                 item.name + ":cohort_complete", after=dependencies,
-                owner=f"replica:{item.replica}", on_complete=cohort_complete)
+                owner=f"replica:{item.replica}", on_complete=cohort_complete,
+                native_hook=True)
         return completions
 
     def _finish_joint_collective(self, observation: dict) -> None:
