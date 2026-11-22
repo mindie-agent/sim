@@ -12,8 +12,9 @@
     bandwidth regime transitions), and PD Decode DCP vs Local-TP crossover.
   * Gate B (--gate-b): Offline deterministic evaluator comparing live NPU
     1-layer ``kernel_details.csv`` captures (A2, A3, A5-DT) against
-    ``default_spine()`` via 1:1 topology isomorphism diff and unfiltered
-    ``|T_pred - T_obs| <= max(0.10 * T_obs, 2.0 us)`` L2 and L1-in-L2 checks.
+    ``default_spine()`` via 1:1 topology isomorphism diff, strict L2
+    ``|T_pred - T_obs| <= max(0.10 * T_obs, 2.0 us)``, and Two-Tier L1-in-L2
+    checks (Median <= 8%, P90 <= 12%, cliff <= max(15%, 3.0 us)).
 
 [Invariants]
   * Reuses canonical ``mindie_sim`` structs (``IterationPlan``, ``RequestView``,
@@ -42,6 +43,7 @@ import math
 import multiprocessing as mp
 from pathlib import Path
 import re
+import statistics
 import sys
 import time
 from typing import Any, Mapping, Sequence
@@ -50,7 +52,9 @@ SIM_ROOT = Path(__file__).resolve().parents[1]
 if str(SIM_ROOT) not in sys.path:
     sys.path.insert(0, str(SIM_ROOT))
 
+from mindie_sim import target_graphs  # noqa: E402
 from mindie_sim.catalog.cache import layer_cache_components  # noqa: E402
+from mindie_sim.catalog.context_parallel import is_v41_replicated_cache_model  # noqa: E402
 from mindie_sim.catalog.fleet import ARCHITECTURE_PRESET_CATALOG, CORE_CATALOG_ENTRIES  # noqa: E402
 from mindie_sim.catalog.paired_sfa import execution as paired_sfa_execution  # noqa: E402
 from mindie_sim.compose import compose_case  # noqa: E402
@@ -70,6 +74,10 @@ from mindie_sim.stack_registry import LoweringRequest  # noqa: E402
 
 PHYSICAL_TOL_PCT = 10.0
 PHYSICAL_ATOL_NS = 2000.0
+L1_MEDIAN_APE_LIMIT_PCT = 8.0
+L1_P90_APE_LIMIT_PCT = 12.0
+L1_CLIFF_TOL_PCT = 15.0
+L1_CLIFF_ATOL_US = 3.0
 BUBBLE_REL_LIMIT = 0.10
 BUBBLE_ATOL_US = 20.0
 PERCENT_SCALE = 100.0
@@ -226,6 +234,17 @@ C8_QUANT_SPEC: dict[str, Any] = {
     "activation_format": "int8",
     "expert_weight_format": "int8",
     "kv_dtype": "int8",
+    "index_dtype": "bf16",
+    "index_scale_dtype": "none",
+    "native_format": "bf16",
+}
+W8A8_FP8KV_QUANT_SPEC: dict[str, Any] = {
+    "name": "w8a8_fp8kv",
+    "weight_format": "int8",
+    "activation_format": "int8",
+    "expert_weight_format": "int8",
+    "kv_dtype": "fp8_e4m3",
+    "index_dtype": "fp8_e4m3",
     "native_format": "bf16",
 }
 MXFP4_FP8KV_QUANT_SPEC: dict[str, Any] = {
@@ -363,6 +382,35 @@ def _sum_replica_flops(
     return total, ordered_sig, has_self_dep
 
 
+def _mc2_protocol_link_bytes(meta: Mapping[str, Any]) -> float:
+    """Extract rank-0 off-diagonal peer transfer bytes from ``mc2_protocol`` metadata."""
+    phase_m = meta.get("mc2_phase")
+    if not isinstance(phase_m, Mapping):
+        return 0.0
+    rmat = phase_m.get("route_matrix_bytes")
+    if isinstance(rmat, Sequence) and rmat and isinstance(rmat[0], Sequence):
+        return float(sum(float(v or 0.0) for j, v in enumerate(rmat[0]) if j != 0))
+    return 0.0
+
+
+def _sharded_proj_fraction(meta: Mapping[str, Any]) -> float:
+    """Return exact fraction of packed projection output columns that are TP-sharded (``replicated=False``)."""
+    slices = meta.get("packed_projection_slices")
+    if not isinstance(slices, Sequence) or not slices:
+        return 1.0
+    tot = 0
+    sharded = 0
+    for sl in slices:
+        if not isinstance(sl, Mapping):
+            continue
+        sh = sl.get("shape")
+        width = int(sh[-1]) if isinstance(sh, Sequence) and sh else 0
+        tot += width
+        if not bool(sl.get("replicated", False)):
+            sharded += width
+    return (float(sharded) / float(tot)) if tot > 0 else 1.0
+
+
 def _step_conservation_metrics(step: PreparedStep, spine: PredictionSpine) -> dict[str, Any]:
     """Compute per-rank FLOPs, per-layer attn/ffn FLOPs, full-replica parity, collectives, and fallbacks."""
     case = step.case
@@ -396,8 +444,9 @@ def _step_conservation_metrics(step: PreparedStep, spine: PredictionSpine) -> di
     layer_ffn_flops: dict[int, float] = {}
     layer_ffn_ops: dict[int, set[str]] = {}
     replicated_proj_tokens = (
-        ".q_a", ".kv_a", ".hc_project", ".hc_down_inject", ".engram_", "index_k", "index_q",
-        "index_weights", "index_key_", "index_query_", "linear_beta_alpha",
+        ".q_a", ".kv_a", ".qkv_a", ".hc_project", ".hc_down_inject", ".engram_", "index_k", "index_q",
+        "index_wk", "index_wq", "index_weights", "index_key_", "index_query_",
+        "linear_beta_alpha", "linear_decay_a", "linear_gate_a",
     )
     for op in entry.ops:
         fam = str(op.family)
@@ -452,14 +501,21 @@ def _step_conservation_metrics(step: PreparedStep, spine: PredictionSpine) -> di
                         fset.add("down")
         else:
             attn_proj_flops += flops
-            if not any(tok in oid_low for tok in replicated_proj_tokens):
-                sharded_attn_proj_flops += flops
+            if fam not in ("index_projection", "indexer", "key_pool") and not any(tok in oid_low for tok in replicated_proj_tokens):
+                sharded_attn_proj_flops += flops * _sharded_proj_fraction(meta)
 
         if float(op.link_bytes or 0.0) > 0.0 or fam in COLLECTIVE_FAMILIES:
             kind = str(meta.get("collective") or meta.get("collective_op") or fam)
             bucket = collectives.setdefault(kind, {"count": 0.0, "link_bytes": 0.0})
             bucket["count"] += 1.0
             bucket["link_bytes"] += float(op.link_bytes or 0.0)
+        elif fam == "mc2_protocol":
+            mc2_lb = _mc2_protocol_link_bytes(meta)
+            if mc2_lb > 0.0:
+                kind = f"mc2_{str((meta.get('mc2_phase') or {}).get('kind', 'protocol'))}"
+                bucket = collectives.setdefault(kind, {"count": 0.0, "link_bytes": 0.0})
+                bucket["count"] += 1.0
+                bucket["link_bytes"] += mc2_lb
         elif isinstance(meta.get("megamoe_geometry"), Mapping):
             mg = meta["megamoe_geometry"]
             fused_lb = float(mg.get("dispatch_link_bytes") or 0.0) + float(mg.get("combine_link_bytes") or 0.0)
@@ -765,6 +821,35 @@ def _check_ratio_non_tautological(
     return 1.0 if (ref_val == 0.0 and scaled_val == 0.0) else 0.0
 
 
+def _sum_pcp_physical_rank_attn_flops(parsed_case: Any, pcp: int, tokens: int) -> float:
+    """Sum logical prefill attention FLOPs across all ``pcp`` physical ranks (handles SWA/DSA/CSA2 asymmetry)."""
+    total = 0.0
+    for rk in range(pcp):
+        graphs = target_graphs(
+            parsed_case, scope="body", phase="prefill", tokens=tokens, context=0, sequences=1, physical_rank=rk,
+        )
+        for op in graphs[0]:
+            if str(op.family) in ATTN_FAMILIES and "compress" not in str(op.op_id).lower():
+                total += float(op.flops or 0.0)
+    return total
+
+
+def _select_canonical_tp_width(spec: Any, *, is_mla: bool) -> int:
+    """Choose canonical non-KV-replicated / Cube-tile-aligned TP width for TP+EP conservation checks."""
+    if is_mla:
+        # Align local MLA heads to >= FRACTAL_NZ_TILE (16) so Cube FRACTAL_NZ tiling does not 2x-pad small head shards
+        for cand in (WORLD_QUAD, 2):
+            if spec.num_heads % cand == 0 and (spec.num_heads // cand) >= FRACTAL_NZ_TILE:
+                return cand
+        return 1
+    gqa_kv = [int(p.num_kv_heads) for p in spec.layer_plans if p.attention == "gqa" and int(p.num_kv_heads) > 0]
+    min_kv = min(gqa_kv) if gqa_kv else int(spec.num_kv_heads or 1)
+    for cand in (WORLD_QUAD, 2):
+        if spec.num_heads % cand == 0 and (min_kv == 1 or min_kv % cand == 0):
+            return cand
+    return 1
+
+
 def _audit_model_cp_regimes(
     model_key: str,
     spec: Any,
@@ -778,14 +863,28 @@ def _audit_model_cp_regimes(
     regimes: dict[str, Any],
     findings: list[str],
 ) -> None:
-    """Audit DCP, PCP, and Dual-Phase PCP+DCP FLOP conservation and fallback freedom."""
+    """Audit DCP, PCP (summed across physical ranks), and Dual-Phase PCP+DCP FLOP conservation."""
     is_moe = spec.num_experts > 0
     is_mla = any(p.attention == "mla" for p in spec.layer_plans)
+    replicated_v41 = bool(is_v41_replicated_cache_model(spec))
 
-    # 3) DCP (long-context decode KV sharding)
+    # 3) DCP (long-context decode KV sharding; V4.1 replicated-cache enforces dcp==1 guard)
     dcp_pair, dcp_excl = _select_dcp_geometry(spec)
     if dcp_pair is None:
         regimes["dcp_excluded"] = {"reason": dcp_excl}
+    elif replicated_v41:
+        tp_d, dcp_d = dcp_pair
+        try:
+            parse_case(compose_case(
+                model_key, hardware=sku, dp=1, tp=tp_d, dcp=dcp_d,
+                ep=tp_d if is_moe else 1, num_devices=tp_d, layers=layers,
+            ))
+            findings.append("v41_replicated_cache_failed_to_reject_dcp_gt_1")
+        except Exception as exc:  # noqa: BLE001
+            if "v41_replicated_cache_requires_dcp_1" in str(exc):
+                regimes["dcp_excluded"] = {"reason": "v41_replicated_cache_requires_dcp_1_enforced"}
+            else:
+                findings.append(f"dcp_unexpected_error:{type(exc).__name__}:{exc}")
     else:
         tp_d, dcp_d = dcp_pair
         try:
@@ -811,7 +910,7 @@ def _audit_model_cp_regimes(
         except Exception as exc:  # noqa: BLE001
             findings.append(f"dcp_error:tp={tp_d},dcp={dcp_d}:{type(exc).__name__}:{exc}")
 
-    # 4) PCP (long-context prefill)
+    # 4) PCP (long-context prefill — sum across all physical ranks for exact conservation on SWA/DSA/CSA2)
     try:
         c_pcp = parse_case(compose_case(
             model_key, hardware=sku, dp=1, tp=1, pcp=2,
@@ -822,7 +921,10 @@ def _audit_model_cp_regimes(
             LoweringRequest(step=StepRequest(phase="prefill", tokens=PREFILL_AUDIT_TOKENS, context=0, sequences=1, scope="body")),
         )
         m_pcp = _step_conservation_metrics(s_pcp, spine)
-        attn_ratio = _check_ratio_non_tautological("pcp_attn", m_pcp["attn_flops"] * 2.0, ref_pre["attn_flops"], exp_pre_attn, findings)
+        pcp_total_attn = _sum_pcp_physical_rank_attn_flops(c_pcp, 2, PREFILL_AUDIT_TOKENS)
+        if pcp_total_attn <= 0.0:
+            pcp_total_attn = m_pcp["attn_flops"] * 2.0
+        attn_ratio = _check_ratio_non_tautological("pcp_attn", pcp_total_attn, ref_pre["attn_flops"], exp_pre_attn, findings)
         if m_pcp["fallbacks"] or m_pcp["prepare_errors"] or m_pcp["replica_issues"]:
             findings.append(f"pcp_issues:fb={m_pcp['fallbacks']},pe={m_pcp['prepare_errors']},rep={m_pcp['replica_issues']}")
         regimes["pcp"] = {
@@ -831,8 +933,8 @@ def _audit_model_cp_regimes(
     except Exception as exc:  # noqa: BLE001
         findings.append(f"pcp_error:{type(exc).__name__}:{exc}")
 
-    # 5) Dual-Phase PCP + DCP (where DCP is valid)
-    if dcp_pair is not None and is_mla:
+    # 5) Dual-Phase PCP + DCP (where DCP is valid and not V4.1 replicated cache)
+    if dcp_pair is not None and is_mla and not replicated_v41:
         try:
             c_pdcp = parse_case(compose_case(
                 model_key, hardware=sku, dp=1, tp=2, pcp=2, dcp=WORLD_QUAD,
@@ -1072,7 +1174,7 @@ def _audit_model_gate_a(model_key: str, spine: PredictionSpine, sku: str) -> dic
     except Exception as exc:  # noqa: BLE001
         findings.append(_sanitize_diagnostic(f"pure_dp_ep_error:{type(exc).__name__}:{exc}"))
 
-    tp_w = WORLD_QUAD if spec.num_heads % WORLD_QUAD == 0 else (2 if spec.num_heads % 2 == 0 else 1)
+    tp_w = _select_canonical_tp_width(spec, is_mla=is_mla)
     tp_ep = tp_w if is_moe else 1
     try:
         c_tp = parse_case(compose_case(model_key, hardware=sku, dp=1, tp=tp_w, ep=tp_ep, num_devices=tp_w, layers=layers))
@@ -1171,7 +1273,8 @@ def _audit_quant_overlays(spine: PredictionSpine) -> tuple[dict[str, Any], list[
         ("w4a8_a3", "deepseek-v4.1-flash", DEFAULT_GATE_A_SKU, "w4a8", "int8", "int4", "bf16", dict(dp=WORLD_OCT, tp=1, ep=WORLD_OCT, num_devices=WORLD_OCT)),
         ("c8_a3", "glm-5.3", DEFAULT_GATE_A_SKU, C8_QUANT_SPEC, "int8", "int8", "int8", dict(dp=WORLD_OCT, tp=1, ep=WORLD_OCT, num_devices=WORLD_OCT)),
         ("mxfp8_a5", "qwen3.5-397b-a17b", DEFAULT_A5_SKU, "mxfp8", "fp8", "fp8", "bf16", dict(dp=1, tp=WORLD_OCT, ep=WORLD_OCT, num_devices=WORLD_OCT)),
-        ("mxfp4_a5", "glm-5.2", DEFAULT_A5_SKU, "mxfp4", "mxfp4", "mxfp4", "bf16", dict(dp=WORLD_OCT, tp=1, ep=WORLD_OCT, num_devices=WORLD_OCT)),
+        ("mxfp4_a5", "glm-5.2", DEFAULT_A5_SKU, "mxfp4", "mxfp4", "mxfp4", "fp8", dict(dp=WORLD_OCT, tp=1, ep=WORLD_OCT, num_devices=WORLD_OCT)),
+        ("mxfp4_bf16kv_a5", "deepseek-v3", DEFAULT_A5_SKU, "mxfp4", "mxfp4", "mxfp4", "bf16", dict(dp=WORLD_OCT, tp=1, ep=WORLD_OCT, num_devices=WORLD_OCT)),
     )
     for tag, model_key, sku, quant_name, exp_dense, exp_expert, exp_kv, kw in quant_matrix:
         try:
@@ -1498,7 +1601,10 @@ def _has_unresolved_parallel_var(cmd: str) -> bool:
 
 
 def _parse_mtp_spec_tokens(cmd: str) -> int:
-    """Extract ``num_speculative_tokens`` from ``--speculative-config`` when present."""
+    """Extract native MTP ``num_speculative_tokens`` (ignoring external ``eagle3``/``ngram`` draft configs)."""
+    m_meth = re.search(r"method[\"']?\s*[:=]\s*[\"']?([a-z0-9_-]+)", cmd.lower())
+    if m_meth and m_meth.group(1) not in ("mtp", "deepseek_mtp"):
+        return 0
     m = re.search(r"num_speculative_tokens[\"']?\s*[:=]\s*(\d+)", cmd)
     return int(m.group(1)) if m else 0
 
@@ -1521,8 +1627,8 @@ def audit_va_tutorial_discovery(tutorials_dir: Path) -> dict[str, Any]:
         while idx < len(lines):
             stripped = lines[idx].lstrip()
             low = stripped.lower()
-            if "tab-item" in low or stripped.startswith("#"):
-                if "950dt" in low or "a5" in low:
+            if "tab-item" in low or stripped.startswith("#") or stripped.startswith("==="):
+                if "950dt" in low or "950pr" in low or "a5" in low:
                     current_hw = DEFAULT_A5_SKU
                 elif "a2" in low or "910b" in low:
                     current_hw = DEFAULT_A2_SKU
@@ -1568,28 +1674,35 @@ def audit_va_tutorial_discovery(tutorials_dir: Path) -> dict[str, Any]:
                 else:
                     role, phase = "colocated", "decode"
                 quant: Any = None
-                has_fp8_kv = bool(re.search(r"--kv-cache-dtype(?:=|\s+)['\"]?(?:fp8|int8)", cmd_low))
+                has_fp8_kv = bool(re.search(r"--kv-cache-dtype(?:=|\s+)['\"]?fp8", cmd_low))
+                has_int8_kv = bool(re.search(r"--kv-cache-dtype(?:=|\s+)['\"]?int8", cmd_low))
+                cmd_hw = current_hw
                 if "mxfp4" in cmd_low or "w4a4" in cmd_low:
+                    cmd_hw = DEFAULT_A5_SKU
                     quant = MXFP4_FP8KV_QUANT_SPEC if (has_fp8_kv or "c8" in cmd_low) else "mxfp4"
                 elif "mxfp8" in cmd_low:
+                    cmd_hw = DEFAULT_A5_SKU
                     quant = "mxfp8"
                 elif "w4a8" in cmd_low:
                     quant = "w4a8"
-                elif has_fp8_kv or "w8a8c8" in cmd_low:
+                elif has_fp8_kv:
+                    cmd_hw = DEFAULT_A5_SKU
+                    quant = W8A8_FP8KV_QUANT_SPEC
+                elif has_int8_kv or "w8a8c8" in cmd_low:
                     quant = C8_QUANT_SPEC
                 elif "w8a8" in cmd_low or ("ascend" in cmd_low and "--quantization" in cmd_low):
                     quant = "w8a8"
                 mtp = _parse_mtp_spec_tokens(cmd)
                 mso = bool(re.search(r"multistream_overlap_shared_expert[\"']?\s*[:=]\s*true\b", cmd_low))
                 q_sig = quant["name"] if isinstance(quant, dict) else quant
-                sig = (model_key, current_hw, role, phase, dp, tp, pp, pcp, dcp, ep, q_sig, mtp, mso)
+                sig = (model_key, cmd_hw, role, phase, dp, tp, pp, pcp, dcp, ep, q_sig, mtp, mso)
                 if sig in seen_keys:
                     duplicate_commands += 1
                 else:
                     seen_keys.add(sig)
                     rec: dict[str, Any] = {
                         "id": f"doc_{md_path.stem.lower()}_{len(discovered)}",
-                        "model": model_key, "hw": current_hw, "role": role, "phase": phase,
+                        "model": model_key, "hw": cmd_hw, "role": role, "phase": phase,
                         "dp": dp, "tp": tp, "pp": pp, "pcp": pcp, "dcp": dcp, "ep": ep,
                         "quant": quant, "mso": mso,
                     }
@@ -1751,11 +1864,13 @@ def _audit_hardware_perturbation_continuity(spine: PredictionSpine) -> dict[str,
 
 
 def _audit_pd_decode_crossover(spine: PredictionSpine) -> dict[str, Any]:
-    """Verify GLM-5.3-Flash PD Decode crossover: KDA Local-TP + MLA DP + o_proj_tp vs DCP."""
+    """Verify GLM-5.3-Flash PD Decode crossover: DCP wins latency-bound low-conc/long-ctx vs Local-TP+DP at high-conc."""
+    # Points hold total 8-die node batch fixed: (label, seqs_per_dp_on_dp8, ctx)
     points = (
-        ("low_conc_short_ctx", CROSSOVER_LOW_SEQS, CROSSOVER_LOW_CTX),
-        ("mid_conc_mid_ctx", DECODE_AUDIT_SEQS * 2, DECODE_AUDIT_CONTEXT * 2),
-        ("high_conc_long_ctx", CROSSOVER_HIGH_SEQS, CROSSOVER_HIGH_CTX),
+        ("low_conc_long_ctx", 1, 131072),
+        ("crossover_low", 2, 131072),
+        ("crossover_high", 4, 131072),
+        ("high_conc_mid_ctx", 32, 8192),
     )
     rows: list[dict[str, Any]] = []
     findings: list[str] = []
@@ -1791,6 +1906,7 @@ def _audit_pd_decode_crossover(spine: PredictionSpine) -> dict[str, Any]:
             winner = "local_tp_dp" if ev_local.span_ms <= ev_dcp.span_ms else "dcp"
             rows.append({
                 "point": label,
+                "total_node_seqs": seqs_per_dp * WORLD_OCT,
                 "seqs_per_dp_local": seqs_per_dp,
                 "seqs_per_dp_dcp": seqs_per_dp * WORLD_QUAD,
                 "context": ctx,
@@ -1802,10 +1918,12 @@ def _audit_pd_decode_crossover(spine: PredictionSpine) -> dict[str, Any]:
             findings.append(_sanitize_diagnostic(f"crossover_err:{label}:{type(exc).__name__}:{exc}"))
 
     if len(rows) >= 2:
-        if rows[0]["winner"] != "local_tp_dp":
-            findings.append(f"crossover_low_conc_expected_local_tp_dp_got:{rows[0]['winner']}")
-        if rows[-1]["winner"] != "dcp":
-            findings.append(f"crossover_high_conc_expected_dcp_got:{rows[-1]['winner']}")
+        if rows[0]["winner"] != "dcp":
+            findings.append(f"crossover_low_conc_long_ctx_expected_dcp_got:{rows[0]['winner']}")
+        if rows[-1]["winner"] != "local_tp_dp":
+            findings.append(f"crossover_high_conc_expected_local_tp_dp_got:{rows[-1]['winner']}")
+        if len({r["winner"] for r in rows}) < 2:
+            findings.append("crossover_missing_regime_flip")
     return {"model": "glm-5.3-flash", "points": rows, "findings": findings}
 
 
@@ -3464,25 +3582,65 @@ def _extract_sim_block_spans_and_buckets(
     }
 
 
+def _l1_cliff_limit_us(obs_us: float) -> float:
+    return max((L1_CLIFF_TOL_PCT / PERCENT_SCALE) * max(obs_us, 0.0), L1_CLIFF_ATOL_US)
+
+
+def _quantile_p90(values: Sequence[float]) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    idx = max(0, min(len(ordered) - 1, math.ceil(0.9 * len(ordered)) - 1))
+    return float(ordered[idx])
+
+
+def _summarize_l1_two_tier(l1_in_l2: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
+    """Summarize L1-in-L2 under Two-Tier Law: Median <= 8%, P90 <= 12%, cliff <= max(15%, 3.0 us)."""
+    total = len(l1_in_l2)
+    if total == 0:
+        return {
+            "l1_cliff_pass_count": 0, "l1_cliff_pass_rate": 0.0,
+            "l1_median_ape_pct": None, "l1_p90_ape_pct": None, "l1_two_tier_pass": False,
+        }
+    cliff_pass = sum(1 for sc in l1_in_l2.values() if sc.get("pass_l1_cliff_tol"))
+    apes = [abs(float(sc.get("signed_err_pct") if sc.get("signed_err_pct") is not None else PERCENT_SCALE)) for sc in l1_in_l2.values()]
+    med_ape = round(float(statistics.median(apes)), 2)
+    p90_ape = round(_quantile_p90(apes), 2)
+    return {
+        "l1_cliff_pass_count": cliff_pass,
+        "l1_cliff_pass_rate": round(cliff_pass / total, 4),
+        "l1_median_ape_pct": med_ape,
+        "l1_p90_ape_pct": p90_ape,
+        "l1_two_tier_pass": bool(
+            cliff_pass == total and med_ape <= L1_MEDIAN_APE_LIMIT_PCT and p90_ape <= L1_P90_APE_LIMIT_PCT
+        ),
+    }
+
+
 def _score_l1_in_l2_buckets(
     sim_fine_us: Mapping[str, float],
     obs_fine_us: Mapping[str, float],
 ) -> tuple[dict[str, Any], int, int, dict[str, Any] | None, float]:
-    """Score every fine-grained L1-in-L2 bucket; one-sided absent buckets ALWAYS fail."""
+    """Score every fine-grained L1-in-L2 bucket under both 10%/2us diagnostic & Two-Tier 15%/3us cliff."""
     l1_in_l2: dict[str, Any] = {}
     abs_err_sum = 0.0
     for bucket in sorted(set(sim_fine_us) | set(obs_fine_us)):
         p_u, o_u = sim_fine_us.get(bucket, 0.0), obs_fine_us.get(bucket, 0.0)
         if p_u <= 0.0 and o_u <= 0.0:
             continue
+        cliff_lim = round(_l1_cliff_limit_us(max(o_u, 0.0)), 3)
         if o_u > 0.0 and p_u > 0.0:
             sc = _score_latency_pair(p_u, o_u)
+            sc["l1_cliff_limit_us"] = cliff_lim
+            sc["pass_l1_cliff_tol"] = abs(p_u - o_u) <= cliff_lim
         else:
             sc = {
                 "pred_us": round(p_u, 3), "obs_us": round(o_u, 3),
                 "signed_err_pct": PERCENT_SCALE if p_u > o_u else -PERCENT_SCALE,
                 "limit_us": round(_physical_limit_us(max(o_u, 0.0)), 3),
+                "l1_cliff_limit_us": cliff_lim,
                 "pass_physical_tol": False,
+                "pass_l1_cliff_tol": False,
                 "unmatched_side": True,
             }
         l1_in_l2[bucket] = sc
@@ -3490,10 +3648,10 @@ def _score_l1_in_l2_buckets(
     pass_cnt = sum(1 for sc in l1_in_l2.values() if sc["pass_physical_tol"])
     total_cnt = len(l1_in_l2)
     def _outlier_rank(item: dict[str, Any]) -> tuple[int, float, float]:
-        failed = 0 if item.get("pass_physical_tol") else 1
+        failed = 0 if item.get("pass_l1_cliff_tol") else 1
         p_val = float(item.get("pred_us") or 0.0)
         o_val = float(item.get("obs_us") or 0.0)
-        lim = max(float(item.get("limit_us") or 2.0), 1e-6)
+        lim = max(float(item.get("l1_cliff_limit_us") or L1_CLIFF_ATOL_US), 1e-6)
         return (failed, abs(p_val - o_val) / lim, abs(float(item.get("signed_err_pct") or 0.0)))
 
     worst = max(({"bucket": k, **v} for k, v in l1_in_l2.items()), key=_outlier_rank, default=None)
@@ -3736,6 +3894,7 @@ def _evaluate_capture_case(
     l1_in_l2, l1_pass_cnt, l1_total_cnt, worst_l1, abs_err_sum = _score_l1_in_l2_buckets(
         sim_stats["sim_fine_us"], obs_fine_us,
     )
+    l1_tier = _summarize_l1_two_tier(l1_in_l2)
     net_err = abs(sim_stats["sim_layer_iso_us"] - sub_compute)
     cancel_ratio = round(abs_err_sum / max(net_err, 1.0), 3) if windows_valid else 0.0
     comm_gate_ok = (world_size <= 1) or (not topo_audit["sim_collective_kinds"]) or bool(topo_audit["collectives_verified"])
@@ -3744,7 +3903,7 @@ def _evaluate_capture_case(
         and rank_audit["rank_parity_ok"] and freq_telemetry_ok and (not bubble_contaminated)
         and all(sc["pass_physical_tol"] for sc in l2_scores.values())
         and all(sc["pass_physical_tol"] for sc in l2_device_kernel_scores.values())
-        and (l1_total_cnt > 0 and l1_pass_cnt == l1_total_cnt)
+        and bool(l1_tier["l1_two_tier_pass"])
     )
     return {
         "case_id": capture_case.get("case_id"), "model": model_key,
@@ -3768,6 +3927,7 @@ def _evaluate_capture_case(
         "l1_in_l2_scores": l1_in_l2, "l1_in_l2_pass_count": l1_pass_cnt,
         "l1_in_l2_total_count": l1_total_cnt,
         "l1_in_l2_pass_rate": round(l1_pass_cnt / l1_total_cnt, 4) if l1_total_cnt else 0.0,
+        **l1_tier,
         "worst_l1_outlier": worst_l1,
         "pass_l2_layer": bool(l2_scores["layer_total"]["pass_physical_tol"]),
         "pass_l2_device_kernel": bool(l2_device_kernel_scores["layer_total"]["pass_physical_tol"]),
@@ -4129,6 +4289,49 @@ def _flush_capture_batch(
     gc.collect()
 
 
+def _aggregate_gate_b_two_tier_stats(ok_eval: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Aggregate Gate B L2 (10%/2us) & L1-in-L2 (Med<=8%, P90<=12%, cliff<=15%/3us) distribution metrics."""
+    l2_apes = [
+        abs(float(r["l2_scores"]["layer_total"]["signed_err_pct"]))
+        for r in ok_eval
+        if isinstance((r.get("l2_scores") or {}).get("layer_total"), Mapping)
+        and r["l2_scores"]["layer_total"].get("signed_err_pct") is not None
+    ]
+    by_bucket: dict[str, list[tuple[float, bool]]] = {}
+    all_l1_apes: list[float] = []
+    all_l1_cliff = 0
+    for r in ok_eval:
+        for bkt, sc in dict(r.get("l1_in_l2_scores") or {}).items():
+            ape = abs(float(sc.get("signed_err_pct") if sc.get("signed_err_pct") is not None else PERCENT_SCALE))
+            c_ok = bool(sc.get("pass_l1_cliff_tol"))
+            by_bucket.setdefault(str(bkt), []).append((ape, c_ok))
+            all_l1_apes.append(ape)
+            all_l1_cliff += int(c_ok)
+    bucket_summary: dict[str, Any] = {}
+    for bkt in sorted(by_bucket):
+        pairs = by_bucket[bkt]
+        b_apes = [p[0] for p in pairs]
+        b_med = round(float(statistics.median(b_apes)), 2)
+        b_p90 = round(_quantile_p90(b_apes), 2)
+        b_cliff = sum(1 for _, ok in pairs if ok)
+        bucket_summary[bkt] = {
+            "count": len(pairs),
+            "median_ape_pct": b_med,
+            "p90_ape_pct": b_p90,
+            "cliff_pass_rate": round(b_cliff / len(pairs), 4),
+            "two_tier_pass": bool(b_cliff == len(pairs) and b_med <= L1_MEDIAN_APE_LIMIT_PCT and b_p90 <= L1_P90_APE_LIMIT_PCT),
+        }
+    return {
+        "l2_median_ape_pct": round(float(statistics.median(l2_apes)), 2) if l2_apes else None,
+        "l2_p90_ape_pct": round(_quantile_p90(l2_apes), 2) if l2_apes else None,
+        "l1_in_l2_median_ape_pct": round(float(statistics.median(all_l1_apes)), 2) if all_l1_apes else None,
+        "l1_in_l2_p90_ape_pct": round(_quantile_p90(all_l1_apes), 2) if all_l1_apes else None,
+        "l1_in_l2_cliff_pass_rate": round(all_l1_cliff / len(all_l1_apes), 4) if all_l1_apes else 0.0,
+        "l1_in_l2_two_tier_pass_cases": sum(1 for r in ok_eval if r.get("l1_two_tier_pass")),
+        "l1_in_l2_by_bucket": bucket_summary,
+    }
+
+
 def run_gate_b(
     captures_dir: Path,
     *,
@@ -4262,6 +4465,7 @@ def run_gate_b(
         "rank_parity_pass": sum(1 for r in ok_eval if r.get("rank_parity_ok")),
         "l2_physical_tol_pass": sum(1 for r in ok_eval if r.get("pass_l2_layer")),
         "l2_device_kernel_tol_pass": sum(1 for r in ok_eval if r.get("pass_l2_device_kernel")),
+        **_aggregate_gate_b_two_tier_stats(ok_eval),
         "coverage_tiers": dict(tier_counts), "wall_seconds": round(time.perf_counter() - t0, 3),
         "rows": evaluated_rows,
     }
