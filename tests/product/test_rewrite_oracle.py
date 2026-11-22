@@ -703,3 +703,146 @@ def test_formula_kernel_sdk_prices_whitebox_l0_pipes_and_fp32_sram():
     assert res_cube.sram_verified is True
     assert res_cube.projected_us >= res_cube.l_star_us > 0.0
     assert res_cube.l1_peak_bytes > 0 and res_cube.l0_peak_bytes > 0
+
+
+def test_formula_kernel_and_oracle_reject_ub_infeasible_row_reduction():
+    from mindie_sim.optimization import FormulaKernelSpec, FormulaTensorSpec, evaluate_formula_kernel
+    from mindie_sim.rewrite import FuseRegion, KernelBoundary, OpRef, evaluate_rewrites
+    from mindie_sim.schema.operators import OpSpec
+
+    # 32,768-wide BF16 row reduction requires 32768 * 4 * 3 = 393,216 B FP32 UB (> 237,568 B usable on A5).
+    rows, hidden = 4, 32768
+    shape = (rows, hidden)
+    tensor_bytes = float(rows * hidden * 2)
+    a5_case = compose_case("qwen3-32b", REPRESENTATIVE_SKUS["a5"], tp=1, dp=1, layers=1)
+    parsed_a5 = parse_case(a5_case)
+
+    wide_spec = FormulaKernelSpec(
+        name="wide_row_norm_quant",
+        equations=("t1 = RMSNorm(x; gamma)", "y, s = DynamicQuant(t1)"),
+        inputs=(FormulaTensorSpec("x", shape, "bf16", "input"),),
+        outputs=(FormulaTensorSpec("y", shape, "fp8", "output"),),
+        vector_ops_fp32=float(rows * hidden * 7),
+        row_reduction=True,
+    )
+    eval_res = evaluate_formula_kernel(wide_spec, parsed_a5)
+    assert eval_res.sram_verified is False
+    assert eval_res.tile_algorithm == "ub_infeasible"
+    assert eval_res.ub_peak_bytes > eval_res.ub_budget_bytes
+
+    norm_op = OpSpec(
+        op_id="wide_norm", family="rmsnorm", phase="decode", stage=0, layer=0,
+        requests=(), semantic_shape=shape, local_shape=shape, padded_shape=shape, launch_shape=shape,
+        dtype="bf16", vector_ops=float(rows * hidden * 4),
+        mte2_bytes=tensor_bytes, mte3_bytes=tensor_bytes, hbm_bytes=2.0 * tensor_bytes,
+    )
+    quant_op = OpSpec(
+        op_id="wide_quant", family="quantize", phase="decode", stage=0, layer=0,
+        requests=(), semantic_shape=shape, local_shape=shape, padded_shape=shape, launch_shape=shape,
+        deps=("wide_norm",), dtype="fp8", vector_ops=float(rows * hidden * 3),
+        mte2_bytes=tensor_bytes, mte3_bytes=tensor_bytes * 0.5, hbm_bytes=1.5 * tensor_bytes,
+    )
+    dossier = prepare_scenario(
+        ScenarioRequest(a5_case, StepRequest("decode", tokens=rows, context=64)),
+        spine=_DeclaredGraphSpine(norm_op, quant_op),
+    )
+    refs = (OpRef("atom", "wide_norm"), OpRef("atom", "wide_quant"))
+    plan = replace(dossier.unmerge_plan, edits=(Edit("fuse_wide", operation=FuseRegion(
+        members=refs, preserve_ports=(),
+        kernel_boundaries=(KernelBoundary("WideUnboundNormQuant", refs),),
+        fusion_tier="K3_dsl_pipeline",
+    )),))
+    batch = evaluate_rewrites(dossier.handle, (plan,), allow_unbound_formula=True)
+    assert batch.results[0].status == "invalid"
+    assert "MULTI_POOL_CAPACITY" in batch.results[0].reason
+    with pytest.raises(ModelingError, match="MULTI_POOL_CAPACITY"):
+        finalize_plan(dossier.handle, plan, allow_unbound_formula=True)
+
+
+def test_formula_dag_equations_and_pipe_stage_ordering():
+    from mindie_sim.optimization import FormulaKernelSpec, FusedPipelineRecipe
+    from mindie_sim.prediction.program.binding import RecipeContext
+    from mindie_sim.schema.operators import OpSpec
+
+    m_dim, n_dim, k_dim = 16, 2048, 4096
+    act_b = float(m_dim * k_dim * 2)
+    wt_b = float(n_dim * k_dim * 2)
+    out_b = float(m_dim * n_dim * 2)
+    gemm_flops = float(2 * m_dim * n_dim * k_dim)
+
+    # 1) Sibling projections sharing one external activation input MUST produce parallel equations.
+    q_op = OpSpec(
+        op_id="s0.l0.q_proj", family="gemm", phase="decode", stage=0, layer=0, requests=(),
+        deps=("s0.l0.norm",), semantic_shape=(m_dim, n_dim, k_dim), local_shape=(m_dim, n_dim, k_dim),
+        padded_shape=(m_dim, n_dim, k_dim), launch_shape=(m_dim, n_dim, k_dim),
+        dtype="bf16", flops=gemm_flops, mte2_bytes=act_b + wt_b, mte3_bytes=out_b, hbm_bytes=act_b + wt_b + out_b,
+        metadata=(("typed_inputs", ({"producer": "s0.l0.norm", "port": "out", "version": 0},)),),
+    )
+    k_op = replace(q_op, op_id="s0.l0.k_proj")
+    sib_spec = FormulaKernelSpec.from_ops((q_op, k_op), name="parallel_qk")
+    assert len(sib_spec.inputs) == 1 and sib_spec.inputs[0].name == "x"
+    assert [o.name for o in sib_spec.outputs] == ["y0", "y1"]
+    assert any(eq.startswith("y0 = x @ W_") for eq in sib_spec.equations)
+    assert any(eq.startswith("y1 = x @ W_") for eq in sib_spec.equations)
+    assert not any("t1" in eq for eq in sib_spec.equations)
+
+    def _recipe_ctx(op):
+        res_names = {"hbm": "hbm", "mte2": "mte2", "mte3": "mte3", "cube": "cube", "vector": "vector", "link": "link"}
+        rates = {"hbm": 1.6e9, "mte2": 1.6e9, "mte3": 1.6e9, "cube": 1.0, "vector": 1.0e10, "link": 2.0e8}
+        work = {"hbm": op.hbm_bytes, "mte2": op.mte2_bytes, "mte3": op.mte3_bytes}
+        if op.flops > 0:
+            work["cube"] = 0.05
+        if op.vector_ops > 0:
+            work["vector"] = op.vector_ops
+        if op.link_bytes > 0:
+            work["link"] = op.link_bytes
+        return RecipeContext(
+            op=op, work=work, resource_names=res_names, rates=rates, core_count=24,
+        )
+
+    # 2) RMSNorm -> GEMM orders AIV vector pipe strictly BEFORE Cube MMA pipe.
+    norm_op = OpSpec(
+        op_id="s0.l0.norm", family="rmsnorm", phase="decode", stage=0, layer=0, requests=(),
+        semantic_shape=(m_dim, k_dim), local_shape=(m_dim, k_dim),
+        padded_shape=(m_dim, k_dim), launch_shape=(m_dim, k_dim),
+        dtype="bf16", vector_ops=float(m_dim * k_dim * 4),
+        mte2_bytes=act_b, mte3_bytes=act_b, hbm_bytes=2.0 * act_b,
+    )
+    ng_spec = FormulaKernelSpec.from_ops((norm_op, q_op), name="norm_then_gemm")
+    vec_st = next(s for s in ng_spec.pipe_stages if s.pipe_kind == "vector")
+    cube_st = next(s for s in ng_spec.pipe_stages if s.pipe_kind == "cube")
+    assert vec_st.name in cube_st.after
+    assert cube_st.name not in vec_st.after
+    def _tile_stages(prog):
+        for st in prog.stages:
+            if getattr(st, "program", None) is not None and hasattr(st.program, "tile"):
+                return list(st.program.tile(0))
+        return list(prog.stages)
+
+    ng_op = replace(q_op, op_id="fused_ng", vector_ops=norm_op.vector_ops)
+    ng_prog = FusedPipelineRecipe(
+        pipe_stages=ng_spec.pipe_stages,
+    ).lower(_recipe_ctx(ng_op))
+    ng_after = {st.name: st.after for st in _tile_stages(ng_prog)}
+    assert "cube_mma" in ng_after and any("aiv" in pred for pred in ng_after["cube_mma"])
+
+    # 3) AllGather -> GEMM orders Link pipe strictly BEFORE Cube MMA pipe.
+    ag_op = OpSpec(
+        op_id="s0.l0.allgather", family="allgather", phase="decode", stage=0, layer=0, requests=(),
+        semantic_shape=(m_dim, k_dim), local_shape=(m_dim, k_dim),
+        padded_shape=(m_dim, k_dim), launch_shape=(m_dim, k_dim),
+        dtype="bf16", link_bytes=act_b, link_scope="tp",
+        mte2_bytes=act_b, mte3_bytes=act_b, hbm_bytes=2.0 * act_b,
+    )
+    q_after_ag = replace(q_op, deps=("s0.l0.allgather",), metadata=())
+    ag_spec = FormulaKernelSpec.from_ops((ag_op, q_after_ag), name="ag_then_gemm")
+    link_st = next(s for s in ag_spec.pipe_stages if s.pipe_kind == "link")
+    cube_st2 = next(s for s in ag_spec.pipe_stages if s.pipe_kind == "cube")
+    assert link_st.name in cube_st2.after
+    assert cube_st2.name not in link_st.after
+    ag_fused_op = replace(q_after_ag, op_id="fused_ag_mm", link_bytes=act_b, link_scope="tp")
+    ag_prog = FusedPipelineRecipe(
+        pipe_stages=ag_spec.pipe_stages,
+    ).lower(_recipe_ctx(ag_fused_op))
+    ag_after = {st.name: st.after for st in _tile_stages(ag_prog)}
+    assert "cube_mma" in ag_after and "link_pipe" in ag_after["cube_mma"]

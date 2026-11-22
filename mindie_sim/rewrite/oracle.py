@@ -20,38 +20,8 @@ from time import monotonic
 from typing import Any, Literal
 
 from mindie_sim.catalog.ops import comm_op
+from mindie_sim.prediction.collectives import OneShotCollective
 from mindie_sim.prediction.collectives.ring_pairwise import PairwiseCollective, RingCollective
-try:
-    from mindie_sim.prediction.collectives import OneShotCollective
-except ImportError:
-    @dataclass(frozen=True)
-    class OneShotCollective:  # type: ignore[no-redef]
-        """L0 link-alpha + wire-rate one-shot collective fallback recipe."""
-
-        path_model: str = "direct"
-
-        def lower(self, context):
-            link_work = {
-                name: float(val) for name, val in dict(context.work).items()
-                if float(val) > 0.0 and ("link" in str(name).split(":") or str(name).startswith("link"))
-            }
-            local_work = {
-                name: float(val) for name, val in dict(context.work).items()
-                if float(val) > 0.0 and name not in link_work
-                and not str(name).startswith(("host", "scheduler@"))
-            }
-            stages: list[Stage] = []
-            if context.setup_ms > 0.0:
-                stages.append(Stage("oneshot_alpha", latency=context.setup_ms))
-            prev = ("oneshot_alpha",) if stages else ()
-            if link_work:
-                stages.append(Stage("oneshot_transfer", link_work, after=prev, coupled=False))
-                prev = ("oneshot_transfer",)
-            if local_work:
-                stages.append(Stage("oneshot_reduce", local_work, after=prev))
-            if not stages:
-                return KernelProgram((), minimum_ms=context.minimum_ms)
-            return KernelProgram(tuple(stages), minimum_ms=context.minimum_ms)
 from mindie_sim.prediction.evaluation import ACTIVE_DEADLINE_MONO, EvaluationContext
 from mindie_sim.prediction.execution.split_barrier import DEFAULT_SPLIT_DTYPE_BYTES
 from mindie_sim.prediction.execution.runner import EAGER_MOE_DISPATCH_RECIPES
@@ -579,15 +549,23 @@ def _bind_formula_fused_recipe(scenario, atomic_entry, op, applied):
     absorbed_ops = tuple(by_id[oid] for oid in absorbed_ids if oid in by_id) or (op,)
     formula = FormulaKernelSpec.from_ops(absorbed_ops, name=op.recipe or op.op_id)
     datapath = scenario.datapath
-    depth = 1
-    if datapath is not None:
-        _, _, _, _, _, _, _, _, _, solved_depth, _ = _solve_formula_sram(formula, datapath)
-        depth = max(1, int(solved_depth))
+    if datapath is None:
+        raise ModelingError(f"MULTI_POOL_CAPACITY:{op.op_id}:ub_datapath_missing")
+    _, algo, _, ub_pk, ub_cap, l1_pk, l1_cap, l0_pk, l0_cap, solved_depth, sram_ok = (
+        _solve_formula_sram(formula, datapath)
+    )
+    if not sram_ok:
+        raise ModelingError(
+            f"MULTI_POOL_CAPACITY:{op.op_id}:{algo}:ub={ub_pk}>{ub_cap}"
+            f":l1={l1_pk}/{l1_cap}:l0={l0_pk}/{l0_cap}"
+        )
+    depth = max(1, int(solved_depth))
     return FusedPipelineRecipe(
         slots=depth,
         row_reduction=formula.row_reduction,
         abi_signature_id=formula.resolved_abi_signature(),
         binding_state="unbound_formula_projection",
+        pipe_stages=formula.pipe_stages,
     )
 
 

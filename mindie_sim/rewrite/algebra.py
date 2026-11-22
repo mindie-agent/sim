@@ -26,7 +26,6 @@ from enum import Enum
 from math import prod
 from typing import Any, Literal
 
-from mindie_sim.prediction.fusion.ports import input_port_entries
 from mindie_sim.prediction.runtime import tile_solver
 from mindie_sim.prediction.runtime.tile_solver import (
     DEFAULT_POOL_GRANULE_BYTES,
@@ -42,6 +41,8 @@ from mindie_sim.schema.operators import OpSpec
 from .apply import (
     SIMT_UB_CARVEOUT_BYTES,
     ResolvedScenario,
+    _activation_port_signature,
+    _activation_quant_key,
     _convex,
     _dependencies,
     _successors,
@@ -147,10 +148,31 @@ _NONLINEAR_RECIPE_TOKENS = (
 _VIEW_RECIPE_TOKENS = (
     "contiguous", "_flat", "concatenate", "_copy", "materialize", "zero", "_pack",
 )
-_MLA_PROLOG_SUB_ROLES = frozenset({
-    "q_a", "kv_a", "qkv_a", "q_norm", "q_b", "kv_norm", "rotary",
-    "q_rotary", "kv_rotary", "kv_store", "kv_scatter", "q_absorb",
-})
+_TYPED_MLA_ROLE_MAP = {
+    "mla.q_a": "q_a",
+    "q_a": "q_a",
+    "mla.kv_a": "kv_a",
+    "kv_a": "kv_a",
+    "mla.qkv_a": "qkv_a",
+    "qkv_a": "qkv_a",
+    "mla.q_b": "q_b",
+    "q_b": "q_b",
+    "mla_absorb": "q_absorb",
+    "mla.q_absorb": "q_absorb",
+    "q_absorb": "q_absorb",
+    "key_absorption": "q_absorb",
+    "mla.q_norm": "q_norm",
+    "q_norm": "q_norm",
+    "mla.kv_norm": "kv_norm",
+    "kv_norm": "kv_norm",
+    "mla.rotary": "rotary",
+    "rotary": "rotary",
+    "q_rotary": "rotary",
+    "kv_rotary": "rotary",
+    "mla.kv_store": "kv_store",
+    "kv_store": "kv_store",
+    "kv_scatter": "kv_store",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -442,7 +464,7 @@ def _resolve_symbolic_kind(
         return "attn_res"
     if fam == "mhc":
         return "mhc_mix"
-    if fam == "rotary" or "rotary" in rec:
+    if fam == "rotary" or "rotary" in rec or "rope" in rec or "partial_rotary_work" in meta:
         return "rotary"
     if fam in {"cache_store", "kv_compress_epilog", "kv_cache_write", "indexer_quant_cache"}:
         return "kv_scatter"
@@ -527,14 +549,11 @@ def _resolve_primary_trait(
 ) -> tuple[AlgebraicTrait, Literal["", "SUM", "CONCAT", "PERMUTE"], bool, int | None]:
     if fam in _CONTROL_BARRIER_FAMILIES:
         return AlgebraicTrait.CONTROL_BARRIER, "", False, None
-    if fam in _SUM_COLLECTIVE_FAMILIES or (
-        fam in _PERMUTE_COLLECTIVE_FAMILIES and ("combine" in rec or "unpack" in op.op_id.lower())
+    col_meta = str(dict(op.metadata).get("collective_op") or "").strip().upper() if op.metadata else ""
+    if fam in _SUM_COLLECTIVE_FAMILIES or col_meta == "SUM" or (
+        fam in _PERMUTE_COLLECTIVE_FAMILIES and ("combine" in rec or "unpack" in rec)
     ):
-        col: Literal["", "SUM", "CONCAT", "PERMUTE"] = (
-            "SUM" if (fam in _SUM_COLLECTIVE_FAMILIES or "combine" in rec or "unpack" in op.op_id.lower())
-            else "PERMUTE"
-        )
-        return AlgebraicTrait.ASSOCIATIVE_COLLECTIVE, col, False, None
+        return AlgebraicTrait.ASSOCIATIVE_COLLECTIVE, "SUM", False, None
     if fam in _CONCAT_COLLECTIVE_FAMILIES:
         return AlgebraicTrait.ASSOCIATIVE_COLLECTIVE, "CONCAT", False, None
     if fam in _PERMUTE_COLLECTIVE_FAMILIES:
@@ -628,6 +647,17 @@ def _check_ub_chain_fits(
         return False, peak_single, budget
 
 
+def _output_shape_bytes(op: OpSpec, tr: OpTraitInfo) -> float:
+    """Return logical output tensor bytes for ``op`` (``(M, N)`` for 3D MatMul)."""
+    if not op.local_shape:
+        return 0.0
+    if tr.trait == AlgebraicTrait.BILINEAR_MATMUL and len(op.local_shape) == MATMUL_SHAPE_RANK:
+        elems = int(op.local_shape[0]) * int(op.local_shape[1])
+    else:
+        elems = prod(int(d) for d in op.local_shape if int(d) > 0)
+    return float(max(0, elems)) * _safe_dtype_bytes(tr.output_dtype)
+
+
 def _avoidable_hbm_bytes(members: Sequence[OpSpec], traits: Mapping[str, OpTraitInfo]) -> int:
     if len(members) < MIN_FUSE_MEMBERS:
         return 0
@@ -636,13 +666,41 @@ def _avoidable_hbm_bytes(members: Sequence[OpSpec], traits: Mapping[str, OpTrait
         tr = traits[op.op_id]
         if tr.trait == AlgebraicTrait.VIEW_METADATA:
             saved += float(op.hbm_bytes or 0.0)
+            continue
+        shape_bytes = _output_shape_bytes(op, tr)
+        op_hbm = float(op.hbm_bytes or 0.0)
+        op_mte3 = float(op.mte3_bytes or 0.0)
+        out_bytes = min(op_mte3, shape_bytes) if (op_mte3 > 0.0 and shape_bytes > 0.0) else (
+            shape_bytes if shape_bytes > 0.0 else op_mte3
+        )
+        saved += min(op_hbm, out_bytes * 2.0) if out_bytes > 0.0 else op_hbm * 0.5
+    return int(round(max(0.0, saved)))
+
+
+def _law2_avoidable_read_bytes(siblings: Sequence[OpSpec], traits: Mapping[str, OpTraitInfo]) -> int:
+    """Compute exact shared input activation bytes ``(S - 1) * M * K * elem_bytes`` saved by Law 2."""
+    if len(siblings) < MIN_FUSE_MEMBERS:
+        return 0
+    first = siblings[0]
+    if len(first.local_shape) != MATMUL_SHAPE_RANK:
+        return 0
+    m_dim, k_dim = int(first.local_shape[0]), int(first.local_shape[2])
+    if m_dim <= 0 or k_dim <= 0:
+        return 0
+    a_dt, _, _ = _activation_quant_key(first)
+    act_bytes = float(m_dim * k_dim) * _safe_dtype_bytes(a_dt)
+    saved = 0.0
+    for sib in siblings[1:]:
+        mte2 = float(sib.mte2_bytes or 0.0)
+        mte3 = float(sib.mte3_bytes or 0.0)
+        hbm = float(sib.hbm_bytes or 0.0)
+        if mte2 > 0.0:
+            avail = min(mte2, max(0.0, hbm - mte3)) if hbm > 0.0 else mte2
+        elif hbm > 0.0:
+            avail = max(0.0, hbm - mte3)
         else:
-            shape_bytes = (
-                prod(int(d) for d in op.local_shape if int(d) > 0) * _safe_dtype_bytes(tr.output_dtype)
-                if op.local_shape else 0.0
-            )
-            op_hbm = float(op.hbm_bytes or 0.0)
-            saved += min(op_hbm, shape_bytes * 2.0) if shape_bytes > 0.0 else op_hbm * 0.5
+            avail = act_bytes
+        saved += min(act_bytes, max(0.0, avail))
     return int(round(max(0.0, saved)))
 
 
@@ -650,34 +708,14 @@ def _same_domain(a: OpSpec, b: OpSpec) -> bool:
     return (a.stage, a.phase, a.stream or "main", a.layer) == (b.stage, b.phase, b.stream or "main", b.layer)
 
 
-def _strip_layer_tag(op_id: str) -> str:
-    parts = str(op_id or "").split(".")
-    for idx, part in enumerate(parts):
-        if part.startswith("l") and part[1:].isdigit():
-            return ".".join(parts[idx + 1 :])
-    return parts[-1] if parts else op_id
-
-
-def _producer_port_key(op: OpSpec, op_ids: set[str]) -> tuple[str, str, int] | None:
-    meta = dict(op.metadata) if op.metadata else {}
-    typed_inputs = meta.get("typed_inputs", ())
-    if isinstance(typed_inputs, Sequence) and not isinstance(typed_inputs, (str, bytes)):
-        for entry in typed_inputs:
-            if isinstance(entry, Mapping):
-                dep = entry.get("producer")
-                if isinstance(dep, str) and dep in op_ids:
-                    port = str(entry.get("port") or entry.get("output") or entry.get("name") or "output")
-                    raw_ver = entry.get("version", entry.get("state_version", 0))
-                    ver = int(raw_ver) if isinstance(raw_ver, int) and not isinstance(raw_ver, bool) else 0
-                    return dep, port, ver
-    explicit = input_port_entries(op.metadata)
-    if explicit:
-        dep, port = explicit[0]
-        if dep in op_ids:
-            return dep, port, 0
-    deps = [d for d in op.deps if d in op_ids]
-    if len(deps) == 1:
-        return deps[0], "output", 0
+def _producer_port_key(
+    op: OpSpec, op_ids: set[str], by_id: Mapping[str, OpSpec] | None = None,
+) -> tuple[tuple[str, str, int], ...] | None:
+    sig = _activation_port_signature(op, all_ops=by_id)
+    if not sig:
+        return None
+    if all(prod_id in op_ids for prod_id, _, _ in sig):
+        return sig
     return None
 
 
@@ -702,13 +740,54 @@ def _is_ancestor(src: str, dst: str, succ: Mapping[str, Sequence[str]]) -> bool:
     return False
 
 
+def _typed_mla_role(op: OpSpec) -> str:
+    """Resolve typed MLA Prolog structural role purely from metadata (zero op_id checks)."""
+    meta = dict(op.metadata) if op.metadata else {}
+    for key in ("mla_prolog_role", "abi_role", "structural_role"):
+        raw = str(meta.get(key) or "").strip().lower()
+        if raw in _TYPED_MLA_ROLE_MAP:
+            return _TYPED_MLA_ROLE_MAP[raw]
+
+    slices = meta.get("packed_projection_slices", ())
+    if isinstance(slices, Sequence) and not isinstance(slices, (str, bytes)):
+        slice_cats = {
+            str(item.get("category") or "").strip().lower()
+            for item in slices if isinstance(item, Mapping)
+        }
+        slice_roles = {
+            str(item.get("role") or "").strip().lower()
+            for item in slices if isinstance(item, Mapping)
+        }
+        has_qa = "mla.q_a" in slice_cats or "q_a" in slice_roles
+        has_kva = "mla.kv_a" in slice_cats or "kv_a" in slice_roles
+        if has_qa and has_kva:
+            return "qkv_a"
+        if has_qa:
+            return "q_a"
+        if has_kva:
+            return "kv_a"
+
+    cat = str(meta.get("quant_category") or meta.get("catalog_category") or "").strip().lower()
+    if cat in _TYPED_MLA_ROLE_MAP:
+        return _TYPED_MLA_ROLE_MAP[cat]
+    if str(meta.get("role") or "").strip().lower() == "key_absorption":
+        return "q_absorb"
+
+    fused_m = meta.get("fused_members", ())
+    if isinstance(fused_m, Sequence) and not isinstance(fused_m, (str, bytes)):
+        if any(str(item).strip().lower() == "qkv_a" for item in fused_m):
+            return "qkv_a"
+    return ""
+
+
 def _match_law4_mla_prolog(
     ordered: Sequence[OpSpec],
     traits: Mapping[str, OpTraitInfo],
     claimed: set[str],
     deps: Mapping[str, set[str]],
+    succ: Mapping[str, list[str]],
 ) -> list[AlgebraicCandidate]:
-    """Match shipping ``aclnnMlaPrologV3`` on BOTH Target and Draft MLA subgraphs."""
+    """Match shipping ``aclnnMlaPrologV3`` via typed ABI roles and DAG topology."""
     by_scope_layer: dict[tuple[str, int, int, str], list[OpSpec]] = defaultdict(list)
     for op in ordered:
         if op.op_id in claimed:
@@ -716,8 +795,7 @@ def _match_law4_mla_prolog(
         meta = dict(op.metadata) if op.metadata else {}
         is_draft = (
             str(meta.get("model_scope") or "").strip().lower() == "draft"
-            or "draft" in op.op_id.lower().split(".")
-            or op.op_id.lower().startswith("draft")
+            or str(meta.get("structure_model_scope") or "").strip().lower() == "draft"
         )
         scope = "draft" if is_draft else "target"
         by_scope_layer[(scope, op.stage, op.layer, op.stream or "main")].append(op)
@@ -725,26 +803,65 @@ def _match_law4_mla_prolog(
     pred = SHIPPING_ABI_PREDICATES["aclnnMlaPrologV3"]
     found: list[AlgebraicCandidate] = []
     for (scope, stage, layer, _stream), ops in by_scope_layer.items():
-        members: list[OpSpec] = []
-        for op in ops:
-            role = _strip_layer_tag(op.op_id).lower()
-            if role in _MLA_PROLOG_SUB_ROLES:
-                members.append(op)
-        if len(members) < MIN_MLA_PROLOG_MEMBERS:
+        roles = {op.op_id: _typed_mla_role(op) for op in ops}
+        q_entries = {oid for oid, role in roles.items() if role in {"q_a", "qkv_a"}}
+        kv_entries = {oid for oid, role in roles.items() if role in {"kv_a", "qkv_a"}}
+        q_bs = {oid for oid, role in roles.items() if role == "q_b"}
+        if not (q_entries and kv_entries and q_bs):
             continue
-        roles = {_strip_layer_tag(op.op_id).lower() for op in members}
-        has_q = bool({"q_a", "qkv_a"} & roles) and "q_b" in roles
-        has_kv = bool({"kv_a", "qkv_a"} & roles) and bool({"kv_norm", "rotary"} & roles)
-        if not (has_q and has_kv):
+        q_norms = {
+            op.op_id for op in ops
+            if roles[op.op_id] == "q_norm" or (
+                traits[op.op_id].symbolic_op_kind in {"rmsnorm", "layernorm"}
+                and bool(deps.get(op.op_id, set()) & q_entries)
+                and bool(set(succ.get(op.op_id, ())) & q_bs)
+            )
+        }
+        kv_norms = {
+            op.op_id for op in ops
+            if op.op_id not in q_norms and (
+                roles[op.op_id] == "kv_norm" or (
+                    traits[op.op_id].symbolic_op_kind in {"rmsnorm", "layernorm"}
+                    and bool(deps.get(op.op_id, set()) & kv_entries)
+                )
+            )
+        }
+        rot_sources = q_bs | q_norms | kv_norms | kv_entries
+        rotaries = {
+            op.op_id for op in ops
+            if roles[op.op_id] == "rotary" or (
+                traits[op.op_id].symbolic_op_kind == "rotary"
+                and bool(deps.get(op.op_id, set()) & rot_sources)
+            )
+        }
+        absorb_sources = q_bs | rotaries | q_norms | q_entries
+        q_absorbs = {
+            op.op_id for op in ops
+            if roles[op.op_id] == "q_absorb"
+            and (not deps.get(op.op_id) or bool(deps.get(op.op_id, set()) & absorb_sources))
+        }
+        store_sources = kv_norms | rotaries | kv_entries
+        kv_stores = {
+            op.op_id for op in ops
+            if roles[op.op_id] == "kv_store" or (
+                traits[op.op_id].symbolic_op_kind == "kv_scatter"
+                and bool(deps.get(op.op_id, set()) & store_sources)
+            )
+        }
+        if not (kv_norms or rotaries):
+            continue
+        member_set = q_entries | kv_entries | q_norms | q_bs | kv_norms | rotaries | q_absorbs | kv_stores
+        members = [op for op in ops if op.op_id in member_set]
+        if len(members) < MIN_MLA_PROLOG_MEMBERS:
             continue
         if not all(pred.supports_dtype(traits[op.op_id].input_dtype) for op in members):
             continue
         member_ids = tuple(op.op_id for op in members)
-        if not _convex(ordered, set(member_ids)):
+        if not _convex(ordered, member_set):
             continue
         preserve = tuple(
             op.op_id for op in members[:-1]
-            if any(op.op_id in deps[other.op_id] for other in ordered if other.op_id not in set(member_ids))
+            if any(op.op_id in deps[other.op_id] for other in ordered if other.op_id not in member_set)
         )
         claimed.update(member_ids)
         found.append(AlgebraicCandidate(
@@ -847,8 +964,9 @@ def _discover_law2_block_matmul(
     succ: Mapping[str, list[str]],
 ) -> tuple[list[AlgebraicCandidate], list[tuple[str, str]]]:
     """Law 2: Block-Matrix Right-Distributivity ``x W1, x W2 -> x [W1 | W2]``."""
-    op_ids = {op.op_id for op in ordered}
-    by_producer: dict[tuple[str, str, int], list[OpSpec]] = defaultdict(list)
+    by_id = {op.op_id: op for op in ordered}
+    op_ids = set(by_id)
+    by_producer: dict[tuple[tuple[str, str, int], ...], list[OpSpec]] = defaultdict(list)
     for op in ordered:
         if op.op_id in claimed:
             continue
@@ -857,21 +975,22 @@ def _discover_law2_block_matmul(
             continue
         if len(op.local_shape) != MATMUL_SHAPE_RANK:
             continue
-        prod_port = _producer_port_key(op, op_ids)
+        prod_port = _producer_port_key(op, op_ids, by_id=by_id)
         if prod_port is not None:
             by_producer[prod_port].append(op)
 
     found: list[AlgebraicCandidate] = []
     rejected: list[tuple[str, str]] = []
-    for (_prod_id, _port, _ver), siblings in by_producer.items():
+    for _prod_ports, siblings in by_producer.items():
         if len(siblings) < MIN_FUSE_MEMBERS:
             continue
         buckets: dict[tuple[Any, ...], list[OpSpec]] = defaultdict(list)
         for op in siblings:
             tr = traits[op.op_id]
+            a_dt, group_size, scale_fmt = _activation_quant_key(op)
             key = (
                 op.stage, op.phase, op.stream or "main", op.layer,
-                tr.input_dtype, tr.group_size, tr.weight_dtype,
+                a_dt, group_size, scale_fmt, tr.weight_dtype,
                 _sharding_key(op),
                 int(op.local_shape[0]), int(op.local_shape[2]),
             )
@@ -907,7 +1026,7 @@ def _discover_law2_block_matmul(
                 member_ids=m_ids,
                 preserve_port_ids=m_ids,
                 shipping_supported=True,
-                avoidable_hbm_bytes=_avoidable_hbm_bytes(independent, traits),
+                avoidable_hbm_bytes=_law2_avoidable_read_bytes(independent, traits),
                 traits=("BILINEAR_MATMUL",),
             ))
     return found, rejected
@@ -1303,7 +1422,7 @@ def discover_algebraic_rewrites_for_ops(
     claimed: set[str] = set()
     candidates: list[AlgebraicCandidate] = []
     # Law 4a: Shipping composite MLA Prolog (Target + Draft).
-    candidates.extend(_match_law4_mla_prolog(ordered, traits, claimed, deps))
+    candidates.extend(_match_law4_mla_prolog(ordered, traits, claimed, deps, succ))
     # Law 3: Bilinear MatMul x Associative Collective Pipelining (MC2).
     candidates.extend(_discover_law3_mc2(ordered, traits, claimed, deps, succ, allow_mc2=allow_mc2))
     # Law 2: Block-Matrix Right-Distributivity.

@@ -9,7 +9,7 @@
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
 from graphlib import CycleError, TopologicalSorter
 from heapq import heappop, heappush
@@ -376,21 +376,76 @@ def _tile_fits_resident_pool(
     return False
 
 
-def _sibling_activation_dedup_bytes(members, kernel_for) -> float:
+def _activation_port_signature(op: OpSpec, all_ops: Mapping[str, OpSpec] | None = None) -> tuple[tuple[str, str, int], ...] | None:
+    """Return canonical activation ``PortRef`` tuple ``((producer, port, version), ...)`` or ``None``."""
+    typed = _typed_inputs(op)
+    if typed:
+        ports: list[tuple[str, str, int]] = []
+        for _, entry in typed:
+            if str(entry.get("role") or "").strip().lower() == "weight":
+                continue
+            producer = entry.get("producer")
+            if not isinstance(producer, str) or not producer:
+                continue
+            name, ver = _port_key(entry)
+            norm = "output" if name == "out" else str(name)
+            ports.append((producer, norm, int(ver)))
+        return tuple(ports) if ports else None
+    explicit = input_port_entries(op.metadata)
+    if explicit:
+        ports = [
+            (dep, _positional_name(dep, port), 0)
+            for dep, port in explicit
+            if dep and _positional_name(dep, port) != "weight"
+        ]
+        return tuple(ports) if ports else None
+    if len(op.deps) == 1:
+        dep = op.deps[0]
+        if all_ops is not None:
+            producer_op = all_ops.get(dep)
+            if producer_op is not None and len(set(producer_op.returns)) > 1:
+                return None
+        return ((dep, "output", 0),)
+    return None
+
+
+def _activation_quant_key(op: OpSpec) -> tuple[str, int | None, str]:
+    """Return canonical ``(a_dtype, group_size, scale_format)`` activation contract."""
+    meta = dict(op.metadata)
+    a_dt = str(
+        meta.get("activation_format") or meta.get("input_format") or meta.get("dtype_a") or op.dtype or "bf16"
+    ).strip().lower()
+    raw_gs = meta.get("activation_group_size", meta.get("quant_group_size"))
+    group_size = int(raw_gs) if isinstance(raw_gs, int) and not isinstance(raw_gs, bool) and raw_gs > 0 else None
+    scale_fmt = str(meta.get("activation_scale_format") or meta.get("quant_scale_dtype") or "").strip().lower()
+    return a_dt, group_size, scale_fmt
+
+
+def _sibling_activation_dedup_bytes(members, kernel_for, all_ops=None) -> float:
     """Compute duplicate input activation HBM read bytes eliminated by Law-2 sibling GEMM fusion."""
     member_ids = {op.op_id for op in members}
     groups: dict[tuple, list[OpSpec]] = {}
     for op in members:
         if not (op.flops > 0 and not op.link_bytes and len(op.local_shape) == _GEMM_SHAPE_RANK):
             continue
-        if any(dep in member_ids for dep in op.deps) or not op.deps:
+        if any(dep in member_ids for dep in op.deps):
             continue
-        meta = dict(op.metadata)
-        a_dt = str(meta.get("activation_format") or meta.get("dtype_a") or op.dtype or "bf16").lower()
-        key = (kernel_for[op.op_id], tuple(op.deps), int(op.local_shape[0]), int(op.local_shape[2]), a_dt)
+        act_ports = _activation_port_signature(op, all_ops=all_ops)
+        if not act_ports or any(prod_id in member_ids for prod_id, _, _ in act_ports):
+            continue
+        a_dt, group_size, scale_fmt = _activation_quant_key(op)
+        key = (
+            kernel_for[op.op_id],
+            act_ports,
+            int(op.local_shape[0]),
+            int(op.local_shape[2]),
+            a_dt,
+            group_size,
+            scale_fmt,
+        )
         groups.setdefault(key, []).append(op)
     saved = 0.0
-    for (_, _, m_dim, k_dim, a_dt), siblings in groups.items():
+    for (_, _, m_dim, k_dim, a_dt, _, _), siblings in groups.items():
         if len(siblings) < 2 or m_dim <= 0 or k_dim <= 0:
             continue
         try:
@@ -399,12 +454,67 @@ def _sibling_activation_dedup_bytes(members, kernel_for) -> float:
             elem_b = 2.0
         act_bytes = float(m_dim * k_dim) * elem_b
         for sib in siblings[1:]:
-            avail = max(0.0, min(float(sib.mte2_bytes), float(sib.hbm_bytes)) - float(sib.mte3_bytes))
-            saved += min(act_bytes, avail)
+            avail = min(float(sib.mte2_bytes), max(0.0, float(sib.hbm_bytes) - float(sib.mte3_bytes)))
+            saved += min(act_bytes, max(0.0, avail))
     return saved
 
 
-def _resident_savings(members, kernel_for, preserved, external_reads, path):
+def _law2_matrix_metadata(
+    ordered: Sequence[OpSpec],
+    fused_shape: tuple[int, ...],
+    fused_mte2: float,
+) -> list[tuple[str, Any]]:
+    """Preserve matrix precision/weight/epilogue metadata across Law-2 sibling GEMM fusion."""
+    member_metas = [dict(op.metadata) for op in ordered]
+    out: list[tuple[str, Any]] = []
+    for mkey in (
+        "weight_format", "weight_dtype", "weight_layout", "weight_representation",
+        "activation_format", "input_format", "output_format", "compute_format",
+        "execution_compute_format", "activation_group_size",
+        "activation_scale_format", "weight_scale_format",
+        "dequant", "dequant_before_compute", "matrix_groups",
+    ):
+        vals = [m.get(mkey) for m in member_metas if m.get(mkey) is not None]
+        if len(vals) == len(member_metas) and len(set(vals)) == 1:
+            out.append((mkey, vals[0]))
+    packed_vals = [m.get("packed_weight_bytes") for m in member_metas if isinstance(m.get("packed_weight_bytes"), (int, float))]
+    weight_vals = [m.get("weight_bytes") for m in member_metas if isinstance(m.get("weight_bytes"), (int, float))]
+    if len(packed_vals) == len(member_metas):
+        packed_b = float(sum(packed_vals))
+    elif len(weight_vals) == len(member_metas):
+        packed_b = float(sum(weight_vals))
+    elif len(fused_shape) == _GEMM_SHAPE_RANK:
+        m_dim, n_dim, k_dim = int(fused_shape[0]), int(fused_shape[1]), int(fused_shape[2])
+        a_dt, _, _ = _activation_quant_key(ordered[0])
+        w_dt = str(member_metas[0].get("weight_format") or member_metas[0].get("weight_dtype") or ordered[0].dtype or "bf16")
+        act_b = float(m_dim * k_dim) * _safe_elem_bytes(a_dt)
+        dense_w = float(n_dim * k_dim) * _safe_elem_bytes(w_dt)
+        packed_b = min(dense_w, max(0.0, float(fused_mte2) - act_b))
+    else:
+        packed_b = 0.0
+    if packed_b > 0.0:
+        out.append(("packed_weight_bytes", packed_b))
+        if len(weight_vals) == len(member_metas):
+            out.append(("weight_bytes", float(sum(weight_vals))))
+    for skey in ("column_scale_bytes",):
+        svals = [m.get(skey) for m in member_metas if isinstance(m.get(skey), (int, float))]
+        if len(svals) == len(member_metas):
+            out.append((skey, float(sum(svals))))
+    rscales = [m.get("row_scale_bytes") for m in member_metas if isinstance(m.get("row_scale_bytes"), (int, float))]
+    if len(rscales) == len(member_metas):
+        out.append(("row_scale_bytes", float(max(rscales))))
+    epilogues = [m.get("matrix_epilogue") for m in member_metas if isinstance(m.get("matrix_epilogue"), Mapping)]
+    if len(epilogues) == len(member_metas) and len({e.get("kind") for e in epilogues}) == 1:
+        out.append(("matrix_epilogue", {
+            "kind": epilogues[0].get("kind"),
+            "row_scale_bytes": float(max(float(e.get("row_scale_bytes", 0.0) or 0.0) for e in epilogues)),
+            "column_scale_bytes": float(sum(float(e.get("column_scale_bytes", 0.0) or 0.0) for e in epilogues)),
+            "operations_per_output": float(epilogues[0].get("operations_per_output", 0.0) or 0.0),
+        }))
+    return out
+
+
+def _resident_savings(members, kernel_for, preserved, external_reads, path, all_ops=None):
     """Elide on-chip intermediate HBM round-trips verified by datapath + TileSolver."""
     saved_read = saved_write = 0.0
     for source in members:
@@ -458,7 +568,7 @@ def _resident_savings(members, kernel_for, preserved, external_reads, path):
         if route and 0.0 < handoff <= min(float(target.hbm_bytes), float(target.mte2_bytes)):
             saved_read += handoff
             saved_write += handoff
-    saved_read += _sibling_activation_dedup_bytes(members, kernel_for)
+    saved_read += _sibling_activation_dedup_bytes(members, kernel_for, all_ops=all_ops)
     max_m2 = sum(float(op.mte2_bytes) for op in members)
     max_m3 = sum(float(op.mte3_bytes) for op in members)
     max_hbm = sum(float(op.hbm_bytes) for op in members)
@@ -633,7 +743,7 @@ class _RankDraft:
         if fused_id in self.ops:
             raise ModelingError(f"rewrite_duplicate_fused_id:{fused_id}")
         path = _path(scenario, self.replica, tail.stage)
-        read, write = _resident_savings(ordered, kernel_for, preserved, readers, path)
+        read, write = _resident_savings(ordered, kernel_for, preserved, readers, path, all_ops=self.ops)
         matrix = Counter()
         for op in ordered:
             for dtype, amount in (op.matrix_flops or (((op.dtype, op.flops),) if op.flops else ())):
@@ -657,23 +767,27 @@ class _RankDraft:
                                "port": outputs[key], "output": outputs[key], "name": outputs[key], "version": key[-1]}
                               for key in sorted(typed_keys))
         fused_shape = tail.local_shape
-        if (
+        is_law2_sibling_gemm = (
             len(ordered) >= 2
             and all(op.flops > 0 and not op.link_bytes and len(op.local_shape) == _GEMM_SHAPE_RANK for op in ordered)
             and all(not (set(op.deps) & keys) for op in ordered)
             and len({(int(op.local_shape[0]), int(op.local_shape[2])) for op in ordered}) == 1
-        ):
+        )
+        if is_law2_sibling_gemm:
             fused_shape = (
                 int(ordered[0].local_shape[0]),
                 sum(int(op.local_shape[1]) for op in ordered),
                 int(ordered[0].local_shape[2]),
             )
+        fused_mte2 = sum(op.mte2_bytes for op in ordered) - read
         extra_meta: list[tuple[str, Any]] = [
             ("fusion_tier", spec.fusion_tier),
             ("kernel_abi", abi),
             ("gm_round_trip_eliminated_bytes", read + write),
             ("fusion_route", "resident" if read or write else "gm_spill"),
         ]
+        if is_law2_sibling_gemm:
+            extra_meta.extend(_law2_matrix_metadata(ordered, fused_shape, fused_mte2))
         for op in ordered:
             axis = dict(op.metadata).get("group_axis")
             if isinstance(axis, str) and axis:
@@ -681,14 +795,17 @@ class _RankDraft:
                 break
         fused = replace(
             tail, op_id=fused_id, family="rewrite_fused", recipe=abi, source_boundary="",
+            semantic_shape=fused_shape if is_law2_sibling_gemm else tail.semantic_shape,
             local_shape=fused_shape,
+            padded_shape=fused_shape if is_law2_sibling_gemm else tail.padded_shape,
+            launch_shape=fused_shape if is_law2_sibling_gemm else tail.launch_shape,
             returns=tuple(dict.fromkeys((*tail.returns, *(ref.name for ref in spec.preserve_ports),
                                         *outputs.values()))),
             flops=sum(op.flops for op in ordered), matrix_flops=tuple(sorted(matrix.items())),
             vector_ops=sum(op.vector_ops for op in ordered),
             link_bytes=sum(op.link_bytes for op in ordered), link_scope=link_scope,
             hbm_bytes=sum(op.hbm_bytes for op in ordered) - read - write,
-            mte2_bytes=sum(op.mte2_bytes for op in ordered) - read,
+            mte2_bytes=fused_mte2,
             mte3_bytes=sum(op.mte3_bytes for op in ordered) - write,
             metadata=tuple(extra_meta),
         )

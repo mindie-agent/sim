@@ -776,3 +776,366 @@ def test_solve_target_graph_enforces_mode_separation_and_whitebox_l0_pricing():
     assert fused.dur_us < 80.0 and fused.dur_us >= fused.l_star_lean_us
     assert mod_res.synthesis_specs[0].sram_verified is True
     assert any("beta=1.5" in eq for eq in mod_res.synthesis_specs[0].symbolic_equations)
+
+
+def _mk_target_node(
+    ordinal: int,
+    op_spec,
+    *,
+    archetype_id: str = "arch0",
+    repeat_count: int = 1,
+    task_type: str = "AIV",
+    predecessors: tuple = (),
+    start_us: float = 0.0,
+    dur_us: float = 20.0,
+    l_star_us: float = 2.0,
+    bound: str = "memory_bound",
+    kernel: str = "",
+):
+    from mindie_sim.optimization import TargetOpNode
+    from mindie_sim.prediction.results import OpOccurrence
+
+    occ = OpOccurrence(replica=0, stage=op_spec.stage, rank=0, op_id=op_spec.op_id)
+    mte2 = float(op_spec.mte2_bytes)
+    mte3 = float(op_spec.mte3_bytes)
+    hbm = float(op_spec.hbm_bytes)
+    return TargetOpNode(
+        ordinal, occ, op_spec.op_id, archetype_id, repeat_count, op_spec.family, op_spec.recipe or op_spec.family,
+        op_spec.stream or "main", op_spec.stage, task_type, op_spec.local_shape, op_spec.dtype or "bf16",
+        predecessors, start_us, start_us + dur_us, dur_us, dur_us, False, "",
+        float(op_spec.flops), float(op_spec.vector_ops), mte2, mte3, hbm, mte2, mte3, 0.0,
+        float(op_spec.link_bytes), bound, bound, l_star_us, max(0.0, dur_us - l_star_us),
+        (dur_us / l_star_us) if l_star_us > 0.0 else None,
+        min(1.0, l_star_us / dur_us) if dur_us > 0.0 and l_star_us > 0.0 else None,
+        (op_spec.op_id,), (op_spec.op_id,), op_spec.family, kernel or op_spec.family, "CANN",
+        "", False, "", op_spec.op_id, spec=op_spec,
+    )
+
+
+def test_strict_simulation_mode_never_calls_formula_evaluator_and_prices_bound_law2(monkeypatch):
+    import mindie_sim.optimization.kernel_synthesis as ks
+    from mindie_sim.optimization import solve_target_graph
+    from mindie_sim.prediction.structure import parse_case
+    from mindie_sim.rewrite import Edit, FuseRegion, KernelBoundary, OpRef, RewritePlan
+    from mindie_sim.schema.common import ModelingError
+    from mindie_sim.schema.operators import OpSpec
+
+    def _forbid_formula(*args, **kwargs):
+        raise AssertionError("evaluate_formula_kernel must not be called in strict Simulation Mode")
+
+    monkeypatch.setattr(ks, "evaluate_formula_kernel", _forbid_formula)
+
+    case = parse_case(compose_case("qwen3-32b", REPRESENTATIVE_SKUS["a3"], tp=1, dp=1, layers=1))
+    die = case.machine.dies[0]
+    peaks = {0: {"hbm_peak_bytes_per_s": dict(die.rates)["hbm"]}}
+
+    # (A) Positive-duration AIV op keeps its bound duration and never calls formula projection.
+    shape_v = (16, 4096)
+    tb_v = float(16 * 4096 * 2)
+    norm_op = OpSpec(
+        op_id="s0.l0.norm", family="rmsnorm", phase="decode", stage=0, layer=0, requests=(),
+        semantic_shape=shape_v, local_shape=shape_v, padded_shape=shape_v, launch_shape=shape_v,
+        dtype="bf16", vector_ops=float(16 * 4096 * 4),
+        mte2_bytes=tb_v, mte3_bytes=tb_v, hbm_bytes=2.0 * tb_v,
+    )
+    n_norm = _mk_target_node(0, norm_op, dur_us=25.0, l_star_us=2.0)
+    res_aiv = solve_target_graph((n_norm,), ((0, 2000, 1000, 1000, 0),), case, peaks, allow_unbound_formula=False)
+    assert res_aiv.has_unbound_formula_ops is False
+    assert res_aiv.binding_state == "bound_implementation"
+    assert res_aiv.nodes[0].dur_us == pytest.approx(25.0)
+    assert res_aiv.verification_passed is True
+
+    # (B) Law-2 sibling GEMMs sharing PortRef price via bound RecipeBook with exact directional traffic.
+    m_dim, n_dim, k_dim = 1, 4096, 4096
+    act_b = float(m_dim * k_dim * 2)
+    wt_b = float(n_dim * k_dim * 2)
+    out_b = float(m_dim * n_dim * 2)
+    mte2 = act_b + wt_b
+    hbm = mte2 + out_b
+    flops = float(2 * m_dim * n_dim * k_dim)
+    g_meta = (
+        ("typed_inputs", ({"producer": "s0.l0.norm", "port": "out", "version": 0},)),
+        ("activation_format", "bf16"), ("weight_format", "bf16"),
+        ("output_format", "bf16"), ("compute_format", "bf16"),
+    )
+    g1 = OpSpec(
+        op_id="s0.l0.q_proj", family="gemm", recipe="gemm", phase="decode", stage=0, layer=0, requests=(),
+        deps=("s0.l0.norm",), semantic_shape=(m_dim, n_dim, k_dim), local_shape=(m_dim, n_dim, k_dim),
+        padded_shape=(m_dim, n_dim, k_dim), launch_shape=(m_dim, n_dim, k_dim),
+        dtype="bf16", flops=flops, mte2_bytes=mte2, mte3_bytes=out_b, hbm_bytes=hbm, metadata=g_meta,
+    )
+    g2 = replace(g1, op_id="s0.l0.k_proj")
+    n_src = _mk_target_node(0, replace(norm_op, local_shape=(m_dim, k_dim), semantic_shape=(m_dim, k_dim),
+                                       padded_shape=(m_dim, k_dim), launch_shape=(m_dim, k_dim),
+                                       mte2_bytes=act_b, mte3_bytes=act_b, hbm_bytes=2.0 * act_b),
+                            dur_us=10.0, l_star_us=1.0)
+    n_g1 = _mk_target_node(1, g1, task_type="AIC", predecessors=(n_src.occurrence,), start_us=10.0, dur_us=80.0, l_star_us=25.0)
+    n_g2 = _mk_target_node(2, g2, task_type="AIC", predecessors=(n_src.occurrence,), start_us=90.0, dur_us=80.0, l_star_us=25.0)
+    dems = ((0, 500, 500, 500, 0), (1000, 0, 25000, 100, 0), (1000, 0, 25000, 100, 0))
+    res_l2 = solve_target_graph((n_src, n_g1, n_g2), dems, case, peaks, allow_unbound_formula=False)
+    assert res_l2.has_unbound_formula_ops is False
+    assert res_l2.binding_state == "bound_implementation"
+    assert res_l2.verification_passed is True
+    fused_l2 = next(n for n in res_l2.nodes if len(n.absorbed_source_ops) == 2)
+    assert fused_l2.binding_state in {"bound_implementation", "bound_measured"}
+    assert fused_l2.mte2_bytes == pytest.approx(2.0 * mte2 - act_b)
+    assert fused_l2.mte3_bytes == pytest.approx(2.0 * out_b)
+    assert fused_l2.hbm_total_bytes == pytest.approx(2.0 * hbm - act_b)
+    assert fused_l2.synthesis_spec is not None and fused_l2.synthesis_spec.elided_hbm_bytes == int(act_b)
+
+    # (C) Explicit caller unbound FuseRegion fails fast under allow_unbound_formula=False.
+    quant_op = OpSpec(
+        op_id="s0.l0.quant", family="quantize", phase="decode", stage=0, layer=0, requests=(),
+        deps=("s0.l0.norm",), semantic_shape=shape_v, local_shape=shape_v, padded_shape=shape_v, launch_shape=shape_v,
+        dtype="fp8", vector_ops=float(16 * 4096 * 3),
+        mte2_bytes=tb_v, mte3_bytes=tb_v * 0.5, hbm_bytes=1.5 * tb_v,
+    )
+    n_q = _mk_target_node(1, quant_op, predecessors=(n_norm.occurrence,), start_us=25.0, dur_us=25.0, l_star_us=2.0)
+    refs = (OpRef("atom", "s0.l0.norm"), OpRef("atom", "s0.l0.quant"))
+    unbound_plan = RewritePlan(edits=(Edit("u_fuse", operation=FuseRegion(
+        members=refs, preserve_ports=(),
+        kernel_boundaries=(KernelBoundary("UnboundCustomFusion", refs),),
+        fusion_tier="K3_dsl_pipeline",
+    )),))
+    with pytest.raises(ModelingError, match="rewrite_fusion_recipe_unbound"):
+        solve_target_graph(
+            (n_norm, n_q), ((0, 2000, 1000, 1000, 0), (0, 1500, 1000, 500, 0)),
+            case, peaks, rewrite_plan=unbound_plan, allow_unbound_formula=False,
+        )
+
+
+def test_solve_target_graph_executes_all_supported_opcodes_and_rejects_unsupported():
+    from mindie_sim.optimization import solve_target_graph
+    from mindie_sim.prediction.structure import parse_case
+    from mindie_sim.rewrite import CollectiveTransform, Edit, OpRef, PipelineTiles, RewritePlan, SelectTemplate
+    from mindie_sim.schema.common import ModelingError
+    from mindie_sim.schema.operators import OpSpec
+
+    case = parse_case(compose_case("qwen3-32b", REPRESENTATIVE_SKUS["a5"], tp=2, dp=1, layers=1))
+    die = case.machine.dies[0]
+    peaks = {0: {"hbm_peak_bytes_per_s": dict(die.rates)["hbm"]}}
+    route = case.machine.links[0].name
+
+    m_dim, n_dim, k_dim = 16, 2048, 2048
+    wt_b = float(n_dim * k_dim * 2)
+    gemm_op = OpSpec(
+        op_id="s0.l0.gemm", family="gemm", recipe="gemm", phase="decode", stage=0, layer=0, requests=(),
+        semantic_shape=(m_dim, n_dim, k_dim), local_shape=(m_dim, n_dim, k_dim),
+        padded_shape=(m_dim, n_dim, k_dim), launch_shape=(m_dim, n_dim, k_dim),
+        dtype="bf16", flops=float(2 * m_dim * n_dim * k_dim),
+        mte2_bytes=float(m_dim * k_dim * 2) + wt_b,
+        mte3_bytes=float(m_dim * n_dim * 2),
+        hbm_bytes=float(m_dim * k_dim * 2) + wt_b + float(m_dim * n_dim * 2),
+        metadata=(("packed_weight_bytes", wt_b),),
+    )
+    comm_op = OpSpec(
+        op_id="s0.l0.ar", family="allreduce", phase="decode", stage=0, layer=0, requests=(),
+        deps=("s0.l0.gemm",), semantic_shape=(m_dim, n_dim), local_shape=(m_dim, n_dim),
+        padded_shape=(m_dim, n_dim), launch_shape=(m_dim, n_dim),
+        dtype="bf16", link_bytes=float(m_dim * n_dim * 2), link_scope="tp",
+        metadata=(("group_axis", "tp"),),
+    )
+    n_gemm = _mk_target_node(0, gemm_op, task_type="AIC", dur_us=999.0, l_star_us=5.0)
+    n_comm = _mk_target_node(1, comm_op, task_type="HCCL", predecessors=(n_gemm.occurrence,), start_us=999.0, dur_us=500.0, l_star_us=1.0)
+    dems = ((5000, 0, 5000, 500, 0), (0, 0, 0, 0, 1000))
+
+    # SelectTemplate + CollectiveTransform both execute via canonical apply_plan + verify_plan.
+    plan_ok = RewritePlan(edits=(
+        Edit("sel_gemm", operation=SelectTemplate(OpRef("atom", "s0.l0.gemm"), "K1", "balanced_grouped_gate_up")),
+        Edit("col_os", operation=CollectiveTransform(OpRef("atom", "s0.l0.ar"), "oneshot", route)),
+    ))
+    solved = solve_target_graph((n_gemm, n_comm), dems, case, peaks, rewrite_plan=plan_ok, allow_unbound_formula=False)
+    assert solved.verification_passed is True
+    assert len(solved.applied_plan.edits) >= 2
+    g_out = next(n for n in solved.nodes if n.op_id == "s0.l0.gemm")
+    c_out = next(n for n in solved.nodes if n.op_id == "s0.l0.ar")
+    assert g_out.dur_us < 999.0 and g_out.recipe == "balanced_grouped_gate_up"
+    assert c_out.dur_us < 500.0 and "oneshot" in c_out.ascend_kernel
+
+    # Unknown template ID MUST raise ModelingError (never silently ignored).
+    plan_bad_tpl = RewritePlan(edits=(
+        Edit("bad_tpl", operation=SelectTemplate(OpRef("atom", "s0.l0.gemm"), "K1", "nonexistent_recipe_xyz")),
+    ))
+    with pytest.raises(ModelingError, match="rewrite_template_recipe_unbound"):
+        solve_target_graph((n_gemm, n_comm), dems, case, peaks, rewrite_plan=plan_bad_tpl, allow_unbound_formula=False)
+
+    # Unknown topology route MUST raise ModelingError.
+    plan_bad_route = RewritePlan(edits=(
+        Edit("bad_rt", operation=CollectiveTransform(OpRef("atom", "s0.l0.ar"), "oneshot", "nonexistent_link")),
+    ))
+    with pytest.raises(ModelingError, match="rewrite_collective_route_unknown"):
+        solve_target_graph((n_gemm, n_comm), dems, case, peaks, rewrite_plan=plan_bad_route, allow_unbound_formula=False)
+
+    # Unsupported opcode (PipelineTiles) MUST fail explicitly instead of silently returning verification_passed=True.
+    plan_unsupported = RewritePlan(edits=(
+        Edit("pipe_tile", operation=PipelineTiles(OpRef("atom", "s0.l0.gemm"))),
+    ))
+    with pytest.raises(ModelingError, match="REWRITE_PLAN_UNSUPPORTED_OPCODE"):
+        solve_target_graph((n_gemm, n_comm), dems, case, peaks, rewrite_plan=plan_unsupported, allow_unbound_formula=False)
+
+
+def test_oneshot_collective_pricing_respects_switched_egress_wire_demand():
+    from mindie_sim.optimization import solve_target_graph
+    from mindie_sim.optimization.kernel_synthesis import _TargetPricingContext, _price_collective_on_topology
+    from mindie_sim.prediction.structure import parse_case
+    from mindie_sim.schema.operators import OpSpec
+
+    case = parse_case(compose_case("qwen3-32b", REPRESENTATIVE_SKUS["a3"], tp=8, dp=1, layers=1))
+    die = case.machine.dies[0]
+    peaks = {0: {"hbm_peak_bytes_per_s": dict(die.rates)["hbm"]}}
+    ctx = _TargetPricingContext(case)
+
+    # Large 8 MiB AllReduce on TP=8 switched fabric: ring wire = 1.75*M (14 MiB), oneshot egress = 7*M (56 MiB).
+    msg_large = float(8 * 1024 * 1024)
+    ring_link_large = msg_large * (2.0 * 7.0 / 8.0)
+    ar_large = OpSpec(
+        op_id="s0.l0.ar_large", family="allreduce", phase="decode", stage=0, layer=0, requests=(),
+        semantic_shape=(1024, 4096), local_shape=(1024, 4096), padded_shape=(1024, 4096), launch_shape=(1024, 4096),
+        dtype="bf16", link_bytes=ring_link_large, link_scope="tp", metadata=(("group_axis", "tp"),),
+    )
+    ring_us = _price_collective_on_topology(ar_large, ctx, case, mode="ring")
+    oneshot_us = _price_collective_on_topology(ar_large, ctx, case, mode="oneshot")
+    assert ring_us is not None and oneshot_us is not None
+    assert oneshot_us > ring_us * 2.0
+
+    # Target solver MUST NOT falsely credit OneShot gain when OneShot is slower than ring baseline.
+    n_large = _mk_target_node(0, ar_large, task_type="HCCL", dur_us=ring_us, l_star_us=ring_us * 0.8, bound="link_bound")
+    res_large = solve_target_graph(
+        (n_large,), ((0, 0, 0, 0, int(ring_us * 800.0)),), case, peaks, allow_unbound_formula=False,
+    )
+    assert res_large.nodes[0].dur_us == pytest.approx(ring_us)
+    assert "One-Shot" not in res_large.nodes[0].ascend_kernel
+
+    # Small 4 KiB AllReduce on TP=8: OneShot beats 14-hop ring latency and legitimately improves duration.
+    msg_small = float(4 * 1024)
+    ring_link_small = msg_small * (2.0 * 7.0 / 8.0)
+    ar_small = replace(ar_large, op_id="s0.l0.ar_small", local_shape=(1, 2048), link_bytes=ring_link_small)
+    ring_small_us = _price_collective_on_topology(ar_small, ctx, case, mode="ring")
+    oneshot_small_us = _price_collective_on_topology(ar_small, ctx, case, mode="oneshot")
+    assert ring_small_us is not None and oneshot_small_us is not None
+    assert oneshot_small_us < ring_small_us
+    n_small = _mk_target_node(0, ar_small, task_type="HCCL", dur_us=ring_small_us, l_star_us=0.5, bound="link_bound")
+    res_small = solve_target_graph((n_small,), ((0, 0, 0, 0, 500),), case, peaks, allow_unbound_formula=False)
+    assert res_small.nodes[0].dur_us < ring_small_us
+    assert "One-Shot" in res_small.nodes[0].ascend_kernel
+
+    # AllGather on TP=8 splits M/(G-1) per peer so oneshot stays well-defined and finite.
+    ag_op = replace(ar_small, op_id="s0.l0.ag", family="allgather", link_bytes=msg_large * (7.0 / 8.0))
+    ag_os_us = _price_collective_on_topology(ag_op, ctx, case, mode="oneshot")
+    assert ag_os_us is not None and ag_os_us > 0.0
+
+
+def test_solve_target_graph_rejects_ub_infeasible_aiv_projection():
+    from mindie_sim.optimization import solve_target_graph
+    from mindie_sim.prediction.structure import parse_case
+    from mindie_sim.schema.operators import OpSpec
+
+    case = parse_case(compose_case("qwen3-32b", REPRESENTATIVE_SKUS["a5"], tp=1, dp=1, layers=1))
+    die = case.machine.dies[0]
+    peaks = {0: {"hbm_peak_bytes_per_s": dict(die.rates)["hbm"]}}
+    # 32,768-wide BF16 row reduction exceeds 237,568 B usable A5 UB -> sram_verified=False -> no overwrite.
+    shape = (4, 32768)
+    tb = float(4 * 32768 * 2)
+    wide_norm = OpSpec(
+        op_id="s0.l0.wide_norm", family="rmsnorm", phase="decode", stage=0, layer=0, requests=(),
+        semantic_shape=shape, local_shape=shape, padded_shape=shape, launch_shape=shape,
+        dtype="bf16", vector_ops=float(4 * 32768 * 4),
+        mte2_bytes=tb, mte3_bytes=tb, hbm_bytes=2.0 * tb,
+    )
+    n_wide = _mk_target_node(0, wide_norm, dur_us=95.0, l_star_us=5.0)
+    res = solve_target_graph((n_wide,), ((0, 5000, 2000, 2000, 0),), case, peaks, allow_unbound_formula=True)
+    assert res.nodes[0].dur_us == pytest.approx(95.0)
+    assert res.has_unbound_formula_ops is False
+
+
+def test_attribute_node_overlap_conserves_step_time_across_archetypes():
+    from mindie_sim.optimization import attribute_node_overlap
+    from mindie_sim.schema.operators import OpSpec
+
+    op_a = OpSpec(op_id="s0.l0.compute", family="gemm", phase="decode", stage=0, layer=0, requests=(),
+                  semantic_shape=(16, 1024, 1024), local_shape=(16, 1024, 1024),
+                  padded_shape=(16, 1024, 1024), launch_shape=(16, 1024, 1024), dtype="bf16", flops=1e9)
+    op_b = replace(op_a, op_id="s0.l1.prefetch", family="copy", layer=1, flops=0.0)
+    op_c = replace(op_a, op_id="s0.l1.tail", family="rmsnorm", layer=1, flops=0.0)
+
+    # Full containment across different archetypes: [0, 20] + [5, 15] -> total exposed == 20.0 (not 30.0).
+    n0 = _mk_target_node(0, op_a, archetype_id="arch0", start_us=0.0, dur_us=20.0)
+    n1 = _mk_target_node(1, op_b, archetype_id="arch1", start_us=5.0, dur_us=10.0)
+    attributed, spans = attribute_node_overlap((n0, n1))
+    assert attributed[0].exposed_dur_us == pytest.approx(20.0)
+    assert attributed[1].exposed_dur_us == pytest.approx(0.0)
+    assert spans["arch0"] == pytest.approx(20.0)
+    assert spans["arch1"] == pytest.approx(0.0)
+    assert sum(spans.values()) == pytest.approx(20.0)
+
+    # Partial cross-archetype overlap (primary first): [0, 20] + [10, 25] -> exposed 20.0 + 5.0 == 25.0 == T_step.
+    n2 = _mk_target_node(1, op_c, archetype_id="arch1", start_us=10.0, dur_us=15.0)
+    attr2, spans2 = attribute_node_overlap((n0, n2))
+    assert attr2[0].exposed_dur_us == pytest.approx(20.0)
+    assert attr2[1].exposed_dur_us == pytest.approx(5.0)
+    assert sum(spans2.values()) == pytest.approx(25.0)
+
+    # Partial tail-covered overlap (tail node claims first): [0, 20] + [10, 25] -> exposed 10.0 + 15.0 == 25.0.
+    n0_eq = _mk_target_node(0, replace(op_a, flops=0.0), archetype_id="arch0", start_us=0.0, dur_us=20.0)
+    attr3, spans3 = attribute_node_overlap((n0_eq, n2))
+    assert attr3[0].exposed_dur_us == pytest.approx(10.0)
+    assert attr3[1].exposed_dur_us == pytest.approx(15.0)
+    assert sum(spans3.values()) == pytest.approx(25.0)
+
+
+def test_mla_prolog_matching_uses_typed_metadata_without_op_name_heuristics(real_graph):
+    from mindie_sim.rewrite import discover_algebraic_rewrites_for_ops
+    from mindie_sim.schema.operators import OpSpec
+
+    scenario, _ = real_graph
+    path = scenario.datapath
+
+    def _op(op_id, family, shape, **kw):
+        return OpSpec(op_id=op_id, family=family, phase="decode", stage=0, layer=0, requests=(),
+                      semantic_shape=shape, local_shape=shape, padded_shape=shape, launch_shape=shape, **kw)
+
+    # Obfuscated op_ids with ZERO name hints ("q_a"/"kv_a"/"q_b"/"absorb"/"unpack") — matched purely via typed metadata.
+    x_norm = _op("s0.l0.step0", "rmsnorm", (16, 7168), dtype="bf16", vector_ops=float(16 * 7168 * 4), hbm_bytes=458752.0)
+    step1 = _op("s0.l0.step1", "gemm", (16, 1536, 7168), deps=("s0.l0.step0",), dtype="bf16",
+                flops=float(2 * 16 * 1536 * 7168), hbm_bytes=22020096.0,
+                metadata=(("quant_category", "mla.q_a"),))
+    step2 = _op("s0.l0.step2", "gemm", (16, 576, 7168), deps=("s0.l0.step0",), dtype="bf16",
+                flops=float(2 * 16 * 576 * 7168), hbm_bytes=8257536.0,
+                metadata=(("quant_category", "mla.kv_a"),))
+    step3 = _op("s0.l0.step3", "rmsnorm", (16, 1536), deps=("s0.l0.step1",), dtype="bf16",
+                vector_ops=float(16 * 1536 * 4), hbm_bytes=98304.0)
+    step4 = _op("s0.l0.step4", "gemm", (16, 24576, 1536), deps=("s0.l0.step3",), dtype="bf16",
+                flops=float(2 * 16 * 24576 * 1536), hbm_bytes=75497472.0,
+                metadata=(("quant_category", "mla.q_b"),))
+    step5 = _op("s0.l0.step5", "rotary", (16, 64), deps=("s0.l0.step4",), dtype="bf16",
+                vector_ops=float(16 * 64 * 4), hbm_bytes=8192.0)
+    step6 = _op("s0.l0.step6", "gemm", (16, 512, 128), deps=("s0.l0.step5",), dtype="bf16",
+                flops=float(2 * 16 * 512 * 128), hbm_bytes=131072.0,
+                metadata=(("role", "key_absorption"),))
+    draft_step = _op("s0.l0.step7", "gemm", (16, 1536, 7168), deps=("s0.l0.step0",), dtype="bf16",
+                     flops=float(2 * 16 * 1536 * 7168), hbm_bytes=22020096.0,
+                     metadata=(("quant_category", "mla.q_a"), ("model_scope", "draft")))
+
+    res = discover_algebraic_rewrites_for_ops(
+        (x_norm, step1, step2, step3, step4, step5, step6, draft_step), datapath=path,
+    )
+    mla = [c for c in res.candidates if c.abi_id == "aclnnMlaPrologV3"]
+    assert len(mla) == 1
+    assert set(mla[0].member_ids) == {"s0.l0.step1", "s0.l0.step2", "s0.l0.step3", "s0.l0.step4", "s0.l0.step5", "s0.l0.step6"}
+    assert "s0.l0.step7" not in mla[0].member_ids
+
+
+def test_target_graph_multi_archetype_model_scope_end_to_end():
+    from mindie_sim.export import build_export_bundle, compose_export_case
+
+    raw_after, auto_req = compose_export_case(
+        "qwen3-32b", "a5-pod", feature_track="expected_ideal",
+        dp=1, tp=2, ep=1, prompt_tokens=512, output_tokens=32,
+    )
+    step_req = StepRequest(
+        phase="decode", tokens=auto_req.tokens, context=auto_req.context,
+        sequences=auto_req.sequences, scope="model",
+    )
+    bundle = build_export_bundle(raw_after, request=step_req)
+    assert bundle.rewrite_verification_passed is True
+    assert bundle.step_span_us > 0.0
