@@ -1043,8 +1043,11 @@ class Execution(_ContextMixin, _CohortMixin, _LazySubmitMixin):
         self.topology = (
             bindings.topology
             if bindings is not None and bindings.topology is not None and not namespace
-            else Topology(case.machine, p, namespace,
-                          collective_startup_mode=case.runtime.collective_startup_mode))
+            else Topology(
+                case.machine, p, namespace,
+                collective_startup_mode=case.runtime.collective_startup_mode,
+                primitive_table=getattr(bindings, "primitive_table", None),
+            ))
         if selected_replica is None:
             resources.extend(self.topology.resources())
         else:

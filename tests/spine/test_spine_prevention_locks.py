@@ -911,3 +911,37 @@ def test_anti_two_skin_calibration_basis_and_serving_parity() -> None:
     assert float(srv["metrics"]["makespan_ms"]) != float(srv_raw["metrics"]["makespan_ms"])
     ev_srv = sdk_api.evaluate_service(raw)
     assert float(ev_srv.span_ms) == pytest.approx(float(srv["metrics"]["makespan_ms"]), rel=1e-9)
+
+
+def test_namespaced_topology_preserves_primitive_table_and_sha_mismatch_propagates(monkeypatch) -> None:
+    """#478 Items 1 & 2: namespaced Topology keeps primitive_table; SHA mismatch fails closed."""
+    from mindie_sim.compose import compose_case
+    from mindie_sim.prediction.evaluation import EvaluationContext, _bundled_calibrated_primitive_table
+    from mindie_sim.prediction.execution import Execution
+    from mindie_sim.prediction.structure import parse_case
+    from mindie_sim.primitives import loader as prim_loader
+    from mindie_sim.schema.common import ModelingError
+
+    # Item 1: namespaced Execution (disaggregated prefill:/decode: pools) preserves primitive_table on Topology.
+    parsed = parse_case(compose_case("qwen3-32b", "Ascend950DT_9582", tp=2, dp=1, layers=1))
+    ev = EvaluationContext.create(parsed)
+    assert ev.bindings.primitive_table is not None
+    exec_ns = Execution(
+        parsed, ev.cost, ledger=ev.cost.ledger, namespace="decode:",
+        bindings=ev.bindings, evaluation=ev,
+    )
+    assert exec_ns.topology._has_primitive_table is True
+    assert exec_ns.topology.p18_startup_us == ev.bindings.topology.p18_startup_us
+    assert exec_ns.topology._p16_stream_event_us == ev.bindings.topology._p16_stream_event_us
+
+    # Item 2: _bundled_calibrated_primitive_table propagates integrity errors instead of masking them as None.
+    _bundled_calibrated_primitive_table.cache_clear()
+    try:
+        def _tampered(*_args, **_kwargs):
+            raise ModelingError("primitive_table_sha256_mismatch")
+
+        monkeypatch.setattr(prim_loader, "load_primitives", _tampered)
+        with pytest.raises(ModelingError, match="primitive_table_sha256_mismatch"):
+            _bundled_calibrated_primitive_table("Ascend950DT_9582")
+    finally:
+        _bundled_calibrated_primitive_table.cache_clear()

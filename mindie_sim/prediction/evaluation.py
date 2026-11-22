@@ -317,8 +317,14 @@ def _bundled_calibrated_primitive_table(sku: str) -> Any:
 
     try:
         return load_primitives(sku, require_calibrated=True)
-    except ModelingError:
-        return None
+    except ModelingError as exc:
+        reason = str(getattr(exc, "reason", exc))
+        if (
+            reason.startswith("primitive_table_sku_unknown_or_ambiguous:")
+            or reason == "primitive_table_uncalibrated"
+        ):
+            return None
+        raise
 
 
 #: Relative tolerance under which a declared die rate equals the registered
