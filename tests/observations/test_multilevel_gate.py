@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import gzip
 import hashlib
 import importlib.util
 import json
@@ -22,9 +23,8 @@ import pytest
 from mindie_sim.observations.multilevel_gate import (
     DEFAULT_ATOL_NS, CaptureBoundary, CohortKey, EngineInterval, EngineRunReceipt, FrozenFitManifest,
     FrozenFitParameter, GateCase, MS_TO_NS, Manifest, Residual, bind_engine_interval,
-    bind_engine_rung_interval, evaluate, evaluate_vertical_drilldown, exceeds_physical_tolerance, gate_decision, parse_gate_case, run_l1,
-    run_l2, run_l3, sanitize_capture_uri, sanitize_source_ref, stream_jsonl,
-    stream_manifest, summarize_cohorts, validate_lineage,
+    bind_engine_rung_interval, evaluate, exceeds_physical_tolerance, gate_decision, parse_gate_case, run_l1,
+    run_l2, sanitize_capture_uri, sanitize_source_ref, stream_jsonl, stream_manifest, summarize_cohorts, validate_lineage,
 )
 from mindie_sim.prediction.runtime.engine import Engine, Resource
 from mindie_sim.schema.common import ModelingError
@@ -95,7 +95,6 @@ def _live_interval(case: GateCase, predicted_ns: int, **kw: Any) -> EngineInterv
 class _LiveEngineRunner:
     def __init__(self, overrides: dict[str, EngineInterval] | None = None, scale: float = 1.05) -> None:
         self._overrides, self._scale = overrides or {}, scale
-
     def _run(self, case: GateCase) -> EngineInterval:
         if case.case_id in self._overrides:
             return self._overrides[case.case_id]
@@ -109,7 +108,6 @@ class _LiveEngineRunner:
                 arm_b=_run_engine_for_ns(case.boundary.start_event, case.boundary.end_event, pb),
             )
         return _live_interval(case, max(1, int(round((case.measured_ns or 1000) * self._scale))))
-
     run_l1 = run_l2 = run_l3 = _run
 def test_lineage_case_normalization_event_scoping_and_fit_closure(tmp_path: Path) -> None:
     c_train = _case("c_train", split="train", tag="a", acq="acq-train", run="run-train")
@@ -139,12 +137,11 @@ def test_lineage_case_normalization_event_scoping_and_fit_closure(tmp_path: Path
     clean_fit = FrozenFitManifest("f_ok", "1", (FrozenFitParameter("p_bw", (_sha("1").upper(),), "capture://fits/bw"),))
     idx_fit = validate_lineage(event_manifest, clean_fit)
     assert idx_fit.root_for("tr_ev") in idx_fit.fit_ancestor_components["p_bw"]
-    cap_dir = tmp_path / "suite"
-    cap_dir.mkdir()
     cap_doc = {"device_ranks": [0], "clock_domain": "device_monotonic", "start_event": "k_start", "end_event": "k_end", "event_ids": ["ev-ok"]}
-    cap_path = cap_dir / "cap_ok.json"
+    cap_path = tmp_path / "cap_ok.json"
     cap_path.write_text(json.dumps(cap_doc), encoding="utf-8")
-    good_case = _case("cap_ok", tag="4", raw_sha=hashlib.sha256(cap_path.read_bytes()).hexdigest(), events=("ev-ok",), uri="capture://suite/cap_ok.json")
+    good_case = _case("cap_ok", kind="native_composite", tag="4", raw_sha=hashlib.sha256(cap_path.read_bytes()).hexdigest(),
+                      events=("ev-ok",), uri="capture://cap_ok.json")
     disk_manifest = Manifest("m_disk", "1", (good_case,))
     validate_lineage(disk_manifest, EMPTY_FITS, capture_root=tmp_path, require_capture_files=True)
     with pytest.raises(ModelingError, match="capture_file_missing"):
@@ -162,9 +159,9 @@ def test_lineage_case_normalization_event_scoping_and_fit_closure(tmp_path: Path
         ("bad_se.json", {**cap_doc, "start_event": "wrong_start"}, "capture_event_mismatch"),
         ("unrel.json", {"summary": "unrelated_without_events"}, "capture_event_mismatch"),
     ):
-        fp = cap_dir / fname
+        fp = tmp_path / fname
         fp.write_text(bad_payload if isinstance(bad_payload, str) else json.dumps(bad_payload), encoding="utf-8")
-        c_bad = _case(fname, tag="5", raw_sha=hashlib.sha256(fp.read_bytes()).hexdigest(), events=("ev-ok",), uri=f"capture://suite/{fname}")
+        c_bad = _case(fname, tag="5", raw_sha=hashlib.sha256(fp.read_bytes()).hexdigest(), events=("ev-ok",), uri=f"capture://{fname}")
         c_bad = replace(c_bad, boundary=replace(c_bad.boundary, clock_operator="busy_union"))
         with pytest.raises(ModelingError, match=err):
             validate_lineage(Manifest(f"m_{fname}", "1", (c_bad,)), EMPTY_FITS, capture_root=tmp_path, require_capture_files=True)
@@ -293,9 +290,10 @@ def test_pointwise_outlier_blocks_release() -> None:
     assert verdict["pointwise_threshold_exceeded"] == [outlier.cohort.as_id()]
     assert gate_decision(summaries, plan_only=True, calibrated_count=0)["status"] == "fail"
     planned = tuple(case.case_id for case in cases)
-    omitted = gate_decision(summarize_cohorts(rows[:-1]), required_levels=("L1",),
-                            expected_case_ids=planned, evaluated_case_ids=planned)
-    assert omitted["status"] == "insufficient_evidence" and omitted["missing_planned_cases"] == [outlier.case_id]
+    for partial in (rows[:-1], [*rows[:-1], replace(rows[-1], status="missing_evidence")]):
+        summaries = summarize_cohorts(partial)
+        omitted = gate_decision(summaries, required_levels=("L1",), expected_case_ids=planned, evaluated_case_ids=planned)
+        assert omitted["status"] == "insufficient_evidence" and omitted["missing_planned_cases"] == [outlier.case_id]
 def test_physical_tolerance_boundaries_and_release() -> None:
     assert DEFAULT_ATOL_NS == 2000
     atol = {"atol_ns": DEFAULT_ATOL_NS}
@@ -316,7 +314,7 @@ def test_physical_tolerance_boundaries_and_release() -> None:
     summary = summaries[short.cohort]
     assert summary.passed and summary.atol_ns == DEFAULT_ATOL_NS and summary.pointwise_failed_count == 0
     assert summary.max_ape_pct > 10.0 and summary.tail_case_ids == ()
-    decision = gate_decision(summaries, required_levels=("L1",), **atol)
+    decision = gate_decision(summaries, required_levels=("L1",), expected_case_ids=("short", "long"), **atol)
     assert decision["status"] == "pass" and decision["tail_warning_cohorts"] == decision["pointwise_threshold_exceeded"] == []
     assert all(not exceeds_physical_tolerance(row.predicted_ns, row.measured_ns, **atol) for row in rows)
     ape = (DEFAULT_ATOL_NS + 1) / SHORT_KERNEL_NS
@@ -328,45 +326,48 @@ def test_physical_tolerance_boundaries_and_release() -> None:
     assert failed[summary.cohort].passed
     verdict = gate_decision(failed, required_levels=("L1",), **atol)
     assert verdict["status"] == "fail" and verdict["pointwise_threshold_exceeded"] == [summary.cohort.as_id()]
-def test_vertical_drilldown_exposes_cancelled_component_errors() -> None:
-    assert evaluate_vertical_drilldown(200_000, 200_000, [])["failure_reason"] == "empty_component_census"
-    inner = tuple(_case(name, level=level, tag="a", measured_ns=duration, events=events, debug_cross_level=True)
-                  for name, level, duration, events in (("first", "L1", 100_000, ("a",)),
-                  ("second", "L1", 100_000, ("b",)), ("third", "L1", 100_000, ("c",)),
-                  ("block", "L2", 300_000, ("a", "b", "c"))))
-    step = replace(_case("step", level="L3", tag="a", events=("a", "b", "c"), measured_ns=300_000),
-                   payload=(("component_case_ids", tuple(case.case_id for case in inner)),))
-    runner = _LiveEngineRunner({case.case_id: _live_interval(case, ns) for case, ns in
-                               zip(inner, (140_000, 60_000, 100_000, 300_000))}, scale=1)
-    rows = list(evaluate(Manifest("step", "1", (step, *inner)), EMPTY_FITS, runner))
-    verdict = gate_decision(summarize_cohorts(rows), required_levels=("L3",))
-    report = verdict["vertical_drilldowns"][step.case_id]
-    assert verdict["status"] == "fail" and report["step_passed"] and not report["passed"]
-    assert report["levels"]["L1_in_L3"]["cancellation_ratio"] == 1
-    assert [part["name"] for part in report["failed_components"]] == ["first", "second"]
-    good = [replace(row, predicted_ns=row.measured_ns) for row in rows]
-    assert gate_decision(summarize_cohorts(good), required_levels=("L3",))["status"] == "pass"
-    shortened = [replace(rows[0], expected_components=("third", "block")), *rows[-2:]]
-    partial_block = replace(good[-1], capture_events=frozenset({"c"}))
-    rank_mismatch = [replace(row, capture_ranks=frozenset({0, 1})) for row in good]
-    rank_mismatch[1] = replace(rank_mismatch[1], capture_ranks=frozenset({0}))
-    for incomplete, reason in ((good[:-1], "component_census_mismatch"),
-                               *((rows, "component_events_incomplete") for rows in
-                                 (shortened, [*good[:-1], partial_block], rank_mismatch))):
-        verdict = gate_decision(summarize_cohorts(incomplete), required_levels=("L3",))
+@pytest.mark.parametrize("capture_format", ("csv", "csv.gz", "trace", "json", "jsonl"))
+def test_vertical_drilldown_requires_physical_kernel_census(tmp_path, capture_format):
+    suffix = "json" if capture_format == "trace" else capture_format
+    path = tmp_path / f"step.{suffix}"
+    events = ("a", "b", "c", "d")
+    runs = tuple(zip(events, (0, 100, 240, 300), (100, 140, 60, 100)))
+    if capture_format.startswith("csv"):
+        data = "Rank ID,Name,Start Time(us),Duration(us)\n" + "".join(f"0,{e},{s},{d}\n" for e, s, d in runs)
+        path.write_bytes(gzip.compress(data.encode()) if suffix == "csv.gz" else data.encode())
+    elif capture_format == "trace":
+        path.write_text(json.dumps({"traceEvents": [
+            {"ph": "X", "device_id": 0, "name": e, "ts": s, "dur": d} for e, s, d in runs]}))
+    else:
+        kernels = [{"rank": 0, "event_id": e, "start_us": s, "duration_us": d} for e, s, d in runs]
+        path.write_text(json.dumps({"events": kernels}) if suffix == "json" else "\n".join(map(json.dumps, kernels)))
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    def measured(name, level, selected, duration):
+        case = _case(name, level=level, raw_sha=digest, events=selected, measured_ns=duration * 1000,
+                     debug_cross_level=level != "L3")
+        return replace(case, boundary=replace(case.boundary, start_event=selected[0], end_event=selected[-1]))
+    operators = tuple(measured(e, "L1", (e,), d) for e, _, d in runs)
+    endpoints = (events[0], events[-1])
+    def score(inner, runner, *, raw=True):
+        step = replace(measured("step", "L3", endpoints, 400),
+                       payload=(("component_case_ids", tuple(case.case_id for case in inner)),))
+        rows = evaluate(Manifest("step", "1", (step, *inner)), EMPTY_FITS, runner, capture_files={digest: path} if raw else None)
+        verdict = gate_decision(summarize_cohorts(rows), required_levels=("L3",))
+        return verdict, verdict["vertical_drilldowns"]["step"]
+    good = _LiveEngineRunner(scale=1)
+    full_block = measured("block", "L2", events, 400)
+    short_block = measured("block", "L2", endpoints, 400)
+    assert score((*operators, full_block), good)[0]["status"] == "pass"
+    bad = _LiveEngineRunner({case.case_id: _live_interval(case, 100_000) for case in operators}, scale=1)
+    verdict, report = score((*operators, full_block), bad)
+    assert verdict["status"] == "fail" and report["step_passed"] and report["levels"]["L1_in_L3"]["cancellation_ratio"] == 1
+    assert [part["name"] for part in report["failed_components"]] == ["b", "c"]
+    edge_operators = (operators[0], operators[-1])
+    for inner in ((*edge_operators, short_block), (*edge_operators, full_block), (*operators, short_block)):
+        verdict, report = score(inner, good)
         assert verdict["status"] == "insufficient_evidence"
-        assert verdict["vertical_drilldowns"]["step"]["failure_reason"] == reason
-def test_missing_planned_case_blocks_release() -> None:
-    case = _case("evaluated")
-    rows = list(evaluate(Manifest("grid", "1", (case,)), EMPTY_FITS, _LiveEngineRunner()))
-    summaries = summarize_cohorts(rows)
-    planned = ("evaluated", "missing_cell")
-    assert gate_decision(summaries, required_levels=("L1",), expected_case_ids=planned[:1],
-                         evaluated_case_ids=[case.case_id])["status"] == "pass"
-    missing = replace(rows[0], case_id="missing_cell", status="missing_evidence")
-    verdict = gate_decision(summaries, required_levels=("L1",), expected_case_ids=planned, evaluated_case_ids=[*rows, missing])
-    assert verdict["status"] == "insufficient_evidence" and verdict["missing_planned_cases"] == ["missing_cell"]
-    assert summarize_cohorts([*rows, missing])[case.cohort].status == "insufficient_evidence"
+        assert report["failure_reason"] == "component_physical_kernels_incomplete"
+    assert score((*operators, full_block), good, raw=False)[1]["failure_reason"] == "step_physical_census_unavailable"
 def test_busy_union_clock_matches_capture_and_merges_clipped_trace() -> None:
     case = _case("clock")
     eng = Engine([Resource(name, MS_TO_NS, "ns", "fifo") for name in ("device", "aux", "host@r0:s0")], trace_limit=TRACE_LIMIT)
@@ -454,12 +455,11 @@ def test_two_pass_streaming_past_64k_header_and_provenance(tmp_path: Path, monke
     row, = evaluate(jsonl_path, EMPTY_FITS, _LiveEngineRunner(scale=1.02))
     assert row.status == "ok"
     base_case = _raw_case("bad", "heldout", "c")
-    with pytest.raises(ModelingError, match="raw_sha256_invalid"):
-        parse_gate_case({**base_case, "boundary": {**base_case["boundary"], "raw_sha256": "not_a_sha"}})
+    for key, value, reason in (("raw_sha256", "not_a_sha", "raw_sha256_invalid"), ("device_ranks", [0, 0], "device_rank_invalid")):
+        with pytest.raises(ModelingError, match=reason):
+            parse_gate_case({**base_case, "boundary": {**base_case["boundary"], key: value}})
     with pytest.raises(ModelingError, match="measured_duration_must_be_positive"):
         parse_gate_case({**base_case, "measured_duration": 0})
-    with pytest.raises(ModelingError, match="device_rank_invalid"):
-        parse_gate_case({**base_case, "boundary": {**base_case["boundary"], "device_ranks": [0, 0]}})
     for bad_uri, err in (
         ("capture://bad/" + "/".join(("", "Users", "alice", "trace.json")), "private_host_path_rejected"),
         ("capture://bad/" + "/".join(("", "tmp", "run", "trace.json")), "private_host_path_rejected"),

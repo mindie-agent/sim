@@ -519,32 +519,32 @@ def test_program_facade_reexports_and_stage_builtin_metadata_guards():
     with pytest.raises(ModelingError, match="stage_cohort_widened_invalid"):
         Stage("bad_w", cohort_widened=(123,))  # type: ignore[arg-type]
 
-@pytest.mark.parametrize("tails,count,load,latency,expected", [
-    ((1, 7), 32, 0.25, 0, 32), ((1, 3), 20, 0.365, 0, 29.2), ((1, 1), 32, 0.25, 0.125, 32)])
-def test_refill_peers_match_literal_service(tails, count, load, latency, expected):
-    context = RecipeContext(None, {}, {"hbm": "hbm", "cube": "cube"}, {"hbm": 1, "cube": 2}, 2,
-                            resource_units={"cube": 2})
+@pytest.mark.parametrize("tails,count,load,latency,cube,expected", [
+    ((1, 7), 32, 0.25, 0, 0, 32), ((1, 3), 20, 0.365, 0, 0, 29.2), ((1, 1), 32, 0.25, 0.125, 0.5, 32),
+    pytest.param((1,) * 32, 32, 0.25, 0, 2, 320, id="shared_hbm_burst_then_private_compute")])
+def test_refill_peers_match_literal_service(tails, count, load, latency, cube, expected):
+    peers = len(tails)
+    context = RecipeContext(None, {}, {"hbm": "hbm", "cube": "cube"}, {"hbm": 1, "cube": peers}, peers, resource_units={"cube": peers})
     def tile(index, peer, tail):
         read = Stage("load", {"hbm": load}, latency=latency if peer and index == count - 1 else 0)
-        if latency:
-            return read, Stage("compute", {"cube": 0.5}, after=("load",), placement={"cube": (peer,)})
+        if cube:
+            return read, Stage("compute", {"cube": cube}, after=("load",), placement={"cube": (peer,)})
         if index < count - tail:
             return read, Stage("compute", after=("load",), latency=2 * load)
         return read, Stage("store", after=("load",), latency=load), Stage("drain", after=("store",), latency=load)
     def run(programs):
-        engine = Engine([Resource("hbm", 1), Resource("cube", 2, units=2)], backend="python")
+        engine = Engine([Resource("hbm", 1), Resource("cube", peers, units=peers)], backend="python")
         ready = engine.submit("ready")
         ends = tuple(pipe.start(engine, f"peer{idx}", ready) for idx, pipe in enumerate(programs))
         dependent = engine.submit("dependent", after=(ends[-1],), latency=10)
         engine.advance(until=(*ends, dependent), first=False)
         return max(end.time for end in ends), dependent.time, engine.serviced["hbm"]
-    specs = tuple(refill_steady.PeriodicPipelineSpec(count, 1, lambda j, i=i, tail=tail: tile(j, i, tail), tail=tail)
-                  for i, tail in enumerate(tails))
+    specs = tuple(refill_steady.PeriodicPipelineSpec(count, 1, lambda j, i=i: tile(j, i, tails[i]), tail=tails[i]) for i in range(peers))
     literal = run(spec.literal() for spec in specs)
-    assert literal == pytest.approx((expected, expected + 10, 2 * count * load))
+    assert literal == pytest.approx((expected, expected + 10, peers * count * load))
     group = refill_steady.compact_periodic_peer_group(context, specs)
     individual = tuple(refill_steady.compact_periodic_pipeline(
-        context, count, spec.slots, spec.tile_fn, tail=spec.tail, peer_counts=(count, count), peer_tails=tails,
+        context, count, spec.slots, spec.tile_fn, tail=spec.tail, peer_counts=(count,) * peers, peer_tails=tails,
     ) for spec in specs)
     assert group == individual == tuple(spec.literal() for spec in specs)
     assert run(group) == literal

@@ -33,6 +33,7 @@ from mindie_sim.observations.accuracy import (
     extract_observed_aicore_freq_mhz,
 )
 from mindie_sim.prediction.execution.context import _ContextMixin
+from mindie_sim.prediction.execution.submission import is_zero_kernel_view
 from mindie_sim.prediction.mechanism import Geometry, OperatorPlan
 from mindie_sim.prediction.operators import attention, linear_attention
 from mindie_sim.prediction.operators.attention.attention_pipeline import TiledAttentionRecipe
@@ -190,9 +191,11 @@ def test_single_spine_live_execution_trace_across_architectures(
     seen_prepare_views = []
     seen_context_views = []
     seen_seq_requests: list[tuple[str, tuple[RequestView, ...]]] = []
+    serviced_operators: set[str] = set()
 
     orig_prepare = RecipeBook.prepare
     orig_context = _ContextMixin._context
+    orig_complete = Engine._complete
 
     def traced_prepare(self, op, geometry):
         selected = self.select(op)
@@ -210,13 +213,33 @@ def test_single_spine_live_execution_trace_across_architectures(
             seen_seq_requests.append((op.op_id, tuple(ctx.requests)))
         return ctx
 
+    def traced_complete(self, task, moment=None, native=False):
+        orig_complete(self, task, moment, native)
+        if any(amount > 0.0 for amount in task.service.values()):
+            # Device task names extend the replica:iteration:operator prefix.
+            serviced_operators.add(":".join(task.event.name.split(":", 3)[:3]))
+
     spine = PredictionSpine()
     prepared = spine.lower(case, LoweringRequest(step=step_req, tier="mainline"))
     monkeypatch.setattr(RecipeBook, "prepare", traced_prepare)
     monkeypatch.setattr(_ContextMixin, "_context", traced_context)
+    monkeypatch.setattr(Engine, "_complete", traced_complete)
     evaluation = spine.run_step(prepared, ReplayOptions(isolated=False))
 
     assert evaluation.span_ms > 0.0
+    timeline = {(row.occurrence.replica, row.occurrence.op_id): row for row in evaluation.operators}
+    for rank_ops in prepared.graph.executable:
+        for op in rank_ops.ops:
+            key = (rank_ops.replica, op.op_id)
+            assert key in timeline, f"operator {key} missing from the engine timeline"
+            row = timeline[key]
+            assert row.start_ms is not None and row.end_ms is not None, f"operator {key} did not complete"
+            if op.family == "barrier" or is_zero_kernel_view(op):
+                continue
+            assert row.end_ms - row.start_ms > 0.0, f"operator {key} had no positive engine duration"
+            assert f"r{rank_ops.replica}:i0:{op.op_id}" in serviced_operators, (
+                f"operator {key} completed without positive engine resource service"
+            )
     assert dispatched_recipes, "expected live operator dispatches during step replay"
     assert traced_plan_programs, "expected executed OperatorPlan.program callbacks"
     outside = [

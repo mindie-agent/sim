@@ -446,7 +446,12 @@ def test_law(value):
     assert only.code == "TO008" and f"{path}::test_law[invalid]" in only.message
 
 
-@pytest.mark.parametrize("mark", ("marks.skip", "marks.skipif", "marks.skip(reason='unavailable')"))
+@pytest.mark.parametrize("mark", (
+    "marks.skip",
+    "marks.skipif",
+    "marks.skip(reason='unavailable')",
+    "pytest.mark.skipif(True, reason='heldout')",
+))
 @pytest.mark.parametrize("folder", ("tests", "tests/schema"))
 def test_gate_rejects_silent_parameter_marks_at_any_test_depth(tmp_path, monkeypatch, mark, folder):
     path = f"{folder}/test_profiles.py"

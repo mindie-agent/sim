@@ -22,7 +22,9 @@ import statistics
 from types import MappingProxyType
 from typing import Any, Literal, Protocol, overload, runtime_checkable
 
-from mindie_sim.observations._capture_verify import verify_capture_file_consistency as _verify_capture
+from mindie_sim.observations._capture_verify import (
+    L3_BOUNDARY_KINDS, CaptureVerificationReceipt, verify_capture_file_consistency as _verify_capture,
+)
 from mindie_sim.observations.multilevel_drilldown import DRILLDOWN_LEVELS, score_vertical_drilldown
 from mindie_sim.observations.multilevel_stream import (
     CAPTURE_URI_SCHEME, MS_TO_NS, SHA256_HEX_LENGTH, SOURCE_REF_KEYS, STREAM_CHUNK_BYTES,
@@ -56,7 +58,6 @@ L1_BOUNDARY_KINDS = frozenset({"device_kernel", "native_composite", "hccl_api", 
                                "single_operator", "collective_call", "npu_event_call"})
 L2_BOUNDARY_KINDS = frozenset({"fx_region", "dispatch_gmm_combine", "periodic_block",
                                "paired_rung_delta", "subgraph_block", "npu_event_burst"})
-L3_BOUNDARY_KINDS = frozenset({"model_step", "service_step", "e2e_step", "device_only_step", "host_device_step"})
 FORBIDDEN_L2_BOUNDARY_KINDS = L3_BOUNDARY_KINDS | {"layer_step_quotient", "step_divided_by_layers", "l3_clone"}
 
 Level = Literal["L1", "L2", "L3"]
@@ -145,6 +146,7 @@ class Residual:
     capture_events: frozenset[str] = frozenset()
     capture_ranks: frozenset[int] = frozenset()
     expected_components: tuple[str, ...] = ()
+    capture_verification: CaptureVerificationReceipt | None = None
     def to_dict(self) -> dict[str, Any]:
         out = asdict(self)
         out["signed_error"] = None if math.isnan(self.signed_error) else self.signed_error
@@ -152,6 +154,10 @@ class Residual:
         out["regime_dims"] = dict(self.regime_dims)
         out["capture_events"] = sorted(self.capture_events)
         out["capture_ranks"] = sorted(self.capture_ranks)
+        if (verification := out["capture_verification"]) is not None:
+            verification["selected_kernels"] = sorted(verification["selected_kernels"])
+            if verification["window_kernels"] is not None:
+                verification["window_kernels"] = sorted(verification["window_kernels"])
         return out
 
 
@@ -190,6 +196,7 @@ class SplitIndex:
     heldout_roots_by_level: Mapping[str, frozenset[str]]
     debug_only_cases: frozenset[str]
     fit_ancestor_components: Mapping[str, frozenset[str]]
+    capture_receipts: Mapping[str, CaptureVerificationReceipt] = field(default_factory=dict)
     def root_for(self, case_id: str) -> str:
         return self.case_roots[case_id]
 
@@ -442,8 +449,8 @@ def stream_manifest(
     )
 
 
-def _verify_case_capture(case: GateCase, path: Path) -> None:
-    _verify_capture(
+def _verify_case_capture(case: GateCase, path: Path) -> CaptureVerificationReceipt | None:
+    return _verify_capture(
         case.case_id, case.boundary, path, measured_ns=case.measured_ns, ijson_mod=ijson,
         digest_fn=digest_file_streaming, stream_chunk_bytes=STREAM_CHUNK_BYTES,
         extract_meta_fn=_extract_capture_meta,
@@ -461,6 +468,7 @@ def validate_lineage(
     cap_root = Path(capture_root) if capture_root is not None else None
     uf, seen_cases, acq_uids = _UnionFind(), set(), set()
     compact_rows: list[tuple[str, str, str, bool, str, str, tuple[str, ...]]] = []
+    capture_receipts: dict[str, CaptureVerificationReceipt] = {}
 
     for case in resolved.cases:
         if case.case_id in seen_cases:
@@ -479,8 +487,8 @@ def validate_lineage(
             if cap_path is None:
                 if require_capture_files:
                     raise ModelingError(f"capture_file_missing:{case.case_id}")
-            else:
-                _verify_case_capture(case, cap_path)
+            elif (receipt := _verify_case_capture(case, cap_path)) is not None:
+                capture_receipts[case.case_id] = receipt
             if cap_root is not None and b.source_ref:
                 ref_map = dict(b.source_ref)
                 ref_path = cap_root / PurePosixPath(ref_map["relative_path"])
@@ -554,6 +562,7 @@ def validate_lineage(
         train_components=frozenset(train_comps), heldout_components=frozenset(heldout_comps),
         heldout_roots_by_level=MappingProxyType({k: frozenset(v) for k, v in heldout_roots_by_level.items()}),
         debug_only_cases=frozenset(debug_only), fit_ancestor_components=MappingProxyType(fit_ancestors),
+        capture_receipts=MappingProxyType(capture_receipts),
     )
 
 
@@ -594,6 +603,7 @@ def _make_residual(
     signed_error: float = math.nan, status: ResidualStatus = "ok",
     excluded_reason: str = "", signed_delta_ns: int | None = None,
     arm_a_err: float | None = None, arm_b_err: float | None = None,
+    capture_verification: CaptureVerificationReceipt | None = None,
 ) -> Residual:
     scope, events, ranks, expected = (), frozenset(), frozenset(), ()
     if case.level == "L3" or case.debug_cross_level:
@@ -610,7 +620,7 @@ def _make_residual(
         signed_error, math.nan if math.isnan(signed_error) else abs(signed_error),
         status, excluded_reason, case.boundary.boundary_kind, signed_delta_ns, arm_a_err, arm_b_err, case.regime_dims,
         case.boundary.clock_operator, interval.elapsed_span_ns if interval else None, interval.busy_union_ns if interval else None,
-        scope, events, ranks, expected,
+        scope, events, ranks, expected, capture_verification,
     )
 
 
@@ -626,7 +636,7 @@ def evaluate(
 
     A step declares its L1 and L2 case IDs in payload.component_case_ids.
     The inner cases are debug_cross_level rows from the same raw capture and
-    session. Each level covers the step's full rank and event census.
+    session. Each level must cover the physical kernel census from the capture.
     """
     resolved = stream_manifest(manifest) if isinstance(manifest, (str, Path)) else manifest
     split_index = validate_lineage(
@@ -640,6 +650,7 @@ def evaluate(
             continue
         root = split_index.root_for(case.case_id)
         is_debug = case.debug_cross_level or case.case_id in split_index.debug_only_cases
+        capture_verification = split_index.capture_receipts.get(case.case_id)
         if case.is_counterfactual and not case.has_matched_capture:
             yield _make_residual(case, root, measured_ns=int(case.measured_ns or 0), status="counterfactual_excluded", excluded_reason="counterfactual_without_matched_capture")
             continue
@@ -674,6 +685,7 @@ def evaluate(
                 status=status, excluded_reason=reason, signed_delta_ns=delta_ns,
                 arm_a_err=(interval.arm_a_predicted_ns - arm_a) / float(arm_a),
                 arm_b_err=(interval.arm_b_predicted_ns - arm_b) / float(arm_b),
+                capture_verification=capture_verification,
             )
         else:
             yield _make_residual(
@@ -681,6 +693,7 @@ def evaluate(
                 signed_error=(interval.predicted_ns - measured_ns) / float(measured_ns),
                 status="debug_only" if is_debug else "ok",
                 excluded_reason="debug_cross_level_not_blind_acceptance" if is_debug else "",
+                capture_verification=capture_verification,
             )
 
 
@@ -711,32 +724,37 @@ def evaluate_vertical_drilldown(
 
 def _step_census(step: Residual, candidates: Iterable[Residual]) -> tuple[str, list[tuple[str, str, int, int]]]:
     expected = set(step.expected_components)
-    if not expected or len(expected) != len(step.expected_components) or not step.capture_events:
+    if not expected or len(expected) != len(step.expected_components):
         return "missing_or_invalid_component_census", []
-    inner = [row for row in candidates if row.case_id in expected
-             or row.capture_events and row.capture_events <= step.capture_events]
-    in_step = [
-        row for row in inner if row.capture_events and row.capture_events <= step.capture_events
-        and row.capture_ranks and row.capture_ranks <= step.capture_ranks
-    ]
-    verified = [row for row in in_step if row.status == "debug_only" and row.engine_receipt and row.measured_ns > 0]
+    receipt = step.capture_verification
+    if receipt is None or not (census := receipt.window_kernels):
+        return "step_physical_census_unavailable", []
+    inner, verified = [], []
+    coverage = {level: set() for level in DRILLDOWN_LEVELS}
+    outside_step = False
+    for row in candidates:
+        proof = row.capture_verification
+        kernels = proof.selected_kernels if proof else frozenset()
+        in_window = bool(kernels) and kernels <= census
+        if row.case_id not in expected and not in_window:
+            continue
+        inner.append(row.case_id)
+        if not (in_window and row.status == "debug_only" and row.engine_receipt and row.measured_ns > 0):
+            outside_step |= bool(kernels) and not in_window
+            continue
+        verified.append(row)
+        coverage[f"{row.level}_in_L3"].update(kernels)
     parts = [(f"{row.level}_in_L3", row.case_id, row.predicted_ns, row.measured_ns) for row in verified]
-    if {row.case_id for row in inner} != expected or len(inner) != len(expected):
+    if set(inner) != expected or len(inner) != len(expected):
         return "component_census_mismatch", parts
-    if len(in_step) != len(inner):
-        return "component_events_or_ranks_outside_step", parts
+    if outside_step:
+        return "component_kernels_outside_step", parts
     if len(verified) != len(inner):
         return "component_evidence_unavailable", parts
     if {part[0] for part in parts} != set(DRILLDOWN_LEVELS):
         return "component_levels_missing", parts
-    for level_tag in DRILLDOWN_LEVELS:
-        coverage = {rank: set() for rank in step.capture_ranks}
-        for row in verified:
-            if f"{row.level}_in_L3" == level_tag:
-                for rank in row.capture_ranks:
-                    coverage[rank].update(row.capture_events)
-        if any(events != step.capture_events for events in coverage.values()):
-            return "component_events_incomplete", parts
+    if any(kernels != census for kernels in coverage.values()):
+        return "component_physical_kernels_incomplete", parts
     return "", parts
 
 

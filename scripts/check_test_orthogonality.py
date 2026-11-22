@@ -50,7 +50,8 @@ XFAIL_SOURCE = re.compile(r"(?<![\w/])([\w./-]+\.[A-Za-z][\w]*):([1-9]\d*)\b")
 BROAD_XFAIL_EXCEPTIONS = frozenset({"BaseException", "Exception", "AssertionError"})
 XFAIL_MARK = "pytest.mark.xfail"
 SKIP_MARK = "pytest.mark.skip"
-RESTRICTED_MARKS = {XFAIL_MARK, SKIP_MARK, "pytest.mark.skipif"}
+SKIPIF_MARK = "pytest.mark.skipif"
+RESTRICTED_MARKS = {XFAIL_MARK, SKIP_MARK, SKIPIF_MARK}
 TIERS = ("tier0", "tier1", "live_npu")
 TIER0_BANNED_IMPORTS = ("subprocess", "multiprocessing", "socket", "venv")
 TIER0_BANNED_CALLS = {("time", "sleep"), ("os", "fork"), ("os", "system")}
@@ -210,6 +211,14 @@ def _cites_source_line(root: Path, reason: ast.AST | None) -> bool:
     return False
 
 
+def _check_skipif_call(rel: str, call: ast.Call) -> Finding | None:
+    conditions = call.args or [next((kw.value for kw in call.keywords if kw.arg == "condition"), None)]
+    if all(cond is not None and re.search(r"sys\.platform|os\.name|platform\.system", ast.unparse(cond))
+           for cond in conditions):
+        return None
+    return Finding(rel, call.lineno, "TO008", "skipif only on platform conditions; use requires_* markers otherwise")
+
+
 def _pytest_mark_findings(root: Path, rel: str, tree: ast.Module) -> list[Finding]:
     """Check restricted marks wherever they occur, including legacy root modules."""
     aliases = {}
@@ -236,17 +245,17 @@ def _pytest_mark_findings(root: Path, rel: str, tree: ast.Module) -> list[Findin
     def keywords(call: ast.Call) -> dict:
         return {kw.arg: kw.value for kw in call.keywords}
 
-    def mark_nodes(expr: ast.AST):
+    def mark_nodes(expr: ast.AST, mark_name: str):
         expr = unbound(expr)
         if isinstance(expr, (ast.List, ast.Tuple)):
             for mark in expr.elts:
-                yield from mark_nodes(mark)
-        elif resolve(expr.func if isinstance(expr, ast.Call) else expr) == XFAIL_MARK:
+                yield from mark_nodes(mark, mark_name)
+        elif resolve(expr.func if isinstance(expr, ast.Call) else expr) == mark_name:
             yield expr
 
     owners = {}
     for name, deco in _test_decorators(tree):
-        for mark in mark_nodes(deco):
+        for mark in mark_nodes(deco, XFAIL_MARK):
             owners.setdefault(mark, set()).add(f"{rel}::{name}")
         if not isinstance(deco, ast.Call) or resolve(deco.func) != "pytest.mark.parametrize":
             continue
@@ -260,7 +269,7 @@ def _pytest_mark_findings(root: Path, rel: str, tree: ast.Module) -> list[Findin
             kw = keywords(row)
             row_id = kw.get("id")
             if isinstance(row_id, ast.Constant) and isinstance(row_id.value, str):
-                for mark in mark_nodes(kw.get("marks")):
+                for mark in mark_nodes(kw.get("marks"), XFAIL_MARK):
                     owners.setdefault(mark, set()).add(f"{rel}::{name}[{row_id.value}]")
 
     parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
@@ -268,6 +277,10 @@ def _pytest_mark_findings(root: Path, rel: str, tree: ast.Module) -> list[Findin
     for node in ast.walk(tree):
         if isinstance(node, ast.Call):
             name = resolve(node.func)
+            if name == "pytest.param":
+                for mark in mark_nodes(keywords(node).get("marks"), SKIPIF_MARK):
+                    if isinstance(mark, ast.Call) and (finding := _check_skipif_call(rel, mark)):
+                        findings.append(finding)
             if name == SKIP_MARK:
                 findings.append(Finding(rel, node.lineno, "TO008", f"{name}() is banned"))
             if name != XFAIL_MARK:
@@ -371,12 +384,10 @@ class ModuleCheck(ast.NodeVisitor):
         if not isinstance(deco, ast.Call):
             return
         name = dotted(deco.func)
-        kw = {k.arg: k.value for k in deco.keywords}
-        if name == "pytest.mark.skipif":
-            cond = deco.args[0] if deco.args else kw.get("condition")
-            text = ast.unparse(cond) if cond is not None else ""
-            if not re.search(r"sys\.platform|os\.name|platform\.system", text):
-                self.add(deco, "TO008", "skipif only on platform conditions; use requires_* markers otherwise")
+        if name == SKIPIF_MARK:
+            finding = _check_skipif_call(self.rel, deco)
+            if finding is not None:
+                self.findings.append(finding)
         elif name == "pytest.mark.parametrize":
             for sub in ast.walk(deco):
                 if isinstance(sub, ast.Constant) and isinstance(sub.value, str) and SKU_LITERAL.match(sub.value):

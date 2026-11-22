@@ -205,7 +205,6 @@ def test_descriptive_residual_does_not_promote_unassigned_samples_to_validation(
     assert report["validation"]["coverage"]["paired_heldout_points"] == 0
     assert report["validation"]["tolerance_outcomes"]["within"] == 0
 
-
 @pytest.mark.parametrize("reinterpreted_first", [False, True])
 def test_duplicate_source_cannot_drop_newly_identified_missing_semantics(reinterpreted_first, profiler_api):
     current = next(iter_observations(served_protocol()))
@@ -485,18 +484,15 @@ def test_real_vector_rows_retain_first_transition_and_device_work_separately():
     assert report["kernel_descriptors"]["Block Num"] == ["8"]
     assert report["kernel_descriptors"]["Accelerator Core"] == ["AI_VECTOR_CORE"]
 
-
-def _verify_capture(path, *, level="L1", events=("gemm",), ranks=(1,), measured=60_023, operator="elapsed_span"):
-    boundary = gate.CaptureBoundary(
-        gate.digest_file_streaming(path), "acq", "session", (), events, ranks, "device", events[0], events[-1],
-        {"L1": "device_kernel", "L2": "periodic_block", "L3": "model_step"}[level], "ns",
-        clock_operator=operator,
-    )
+def _verify_capture(path, *, level="L1", events=("gemm",), ranks=(1,), measured=60_023, operator="elapsed_span", endpoints=None):
+    start, end = endpoints or (events[0], events[-1])
+    kind = {"L1": "device_kernel", "L2": "periodic_block", "L3": "model_step"}[level]
+    boundary = gate.CaptureBoundary(gate.digest_file_streaming(path), "acq", "session", (), events, ranks,
+                                    "device", start, end, kind, "ns", clock_operator=operator)
     cohort = gate.CohortKey(level, "timing", "device", "decode", "eager", "shape", "tp1")
     item = gate.GateCase("capture", level, "heldout", boundary, "inputs", "stack", "impl", cohort, measured)
     gate.validate_lineage(gate.Manifest("native", "1", (item,)), gate.FrozenFitManifest("empty", "1", ()),
                           capture_files={item.case_id: path}, require_capture_files=True)
-
 
 @pytest.mark.parametrize("level", ("L1", "L2", "L3"))
 def test_native_csv_binds_rank_events_and_duration(tmp_path, level):
@@ -507,8 +503,8 @@ def test_native_csv_binds_rank_events_and_duration(tmp_path, level):
         "2,44,gemm,1793296125087346.271,548.894\n",
         encoding="utf-8",
     )
-    _verify_capture(path, level=level)
-    _verify_capture(path, level=level, ranks=(2,), measured=548_894)
+    for ranks, duration in (((1,), 60_023), ((2,), 548_894), ((1, 2), 548_894)):
+        _verify_capture(path, level=level, ranks=ranks, measured=duration)
     for change, cause in (({"ranks": (999,)}, "capture_rank_mismatch"),
                           ({"events": ("nonexistent",)}, "capture_event_mismatch"),
                           ({"measured": 100_000}, "capture_duration_mismatch")):
@@ -518,13 +514,18 @@ def test_native_csv_binds_rank_events_and_duration(tmp_path, level):
     with pytest.raises(ModelingError, match="rank_column_absent"):
         _verify_capture(path, level=level)
 
-
-def test_profiler_rows_preserve_elapsed_and_busy_clock_boundaries(tmp_path):
+def test_profiler_rows_preserve_clock_and_single_kernel_boundaries(tmp_path):
     path = tmp_path / "summary.csv"
-    path.write_text("Rank ID,OP Name,Start Time(us),Duration(us)\n1,first,20,5\n1,last,30,7\n")
-    events = ("first", "last")
-    _verify_capture(path, events=events, measured=17_000)
-    _verify_capture(path, events=events, measured=12_000, operator="busy_union")
+    path.write_text("Rank ID,Name,Start Time(us),Duration(us)\n1,a,0,140\n1,b,140,60\n1,c,210,100\n")
+    _verify_capture(path, level="L2", events=("a", "b", "c"), measured=310_000)
+    _verify_capture(path, level="L2", events=("a", "b", "c"), measured=300_000, operator="busy_union")
+    for endpoints in (None, ("a", "a")):
+        with pytest.raises(ModelingError, match="capture_device_kernel_requires_one_occurrence"):
+            _verify_capture(path, events=("a", "b"), endpoints=endpoints, measured=200_000)
+    _verify_capture(path, events=("a", "row=1"), endpoints=("a", "a"), measured=140_000)
+    path.write_text(path.read_text().replace("1,b,140,60", "1,b,80,60"))
+    with pytest.raises(ModelingError, match="capture_device_kernel_multiple_occurrences"):
+        _verify_capture(path, events=("a",), measured=140_000)
     path.write_text("Device_id,Task ID,Name,Start Time(us),Duration(us)\n1,44,gemm,20,5\n1,44,gemm,30,7\n")
     with pytest.raises(ModelingError, match="ambiguous_endpoint"):
         _verify_capture(path, events=("44",))
@@ -540,7 +541,6 @@ def test_profiler_rows_preserve_elapsed_and_busy_clock_boundaries(tmp_path):
     path.write_text("Device_id,Name\n1,gemm\n")
     with pytest.raises(ModelingError, match="csv_schema_unsupported"):
         _verify_capture(path)
-
 
 def test_json_capture_filters_unrelated_events_while_streaming(tmp_path, monkeypatch):
     monkeypatch.setattr(gate, "ijson", None)  # Exercise the stdlib fallback directly.
@@ -558,34 +558,36 @@ def test_json_capture_filters_unrelated_events_while_streaming(tmp_path, monkeyp
     finally:
         tracemalloc.stop()
     assert peak < 2 * 1024 * 1024
-
-
 @pytest.mark.parametrize("level", ("L1", "L2", "L3"))
 def test_native_trace_binds_rank_unique_events_and_duration(tmp_path, level):
     path = tmp_path / "trace_view.json"
     # Ascend Hardware PIDs encode device IDs. The TID identifies a stream.
-    first = {"ph": "X", "pid": 175552, "tid": 61, "name": "MatMulV3",
-             "ts": "1793296747273951.897", "dur": 1.888, "args": {"Task Id": 38}}
-    last = {**first, "ts": "1793296747273955.897", "dur": 2.814, "args": {"Task Id": 39}}
+    first = {"ph": "X", "pid": 175552, "tid": 61, "name": "MatMulV3", "ts": "1793296747273951.897",
+             "dur": 1.888, "args": {"Task Id": 38, "Physic Stream Id": 61, "connection_id": 99}}
+    last = {**first, "ts": "1793296747273955.897", "dur": 2.814, "args": {"Task Id": 39, "Connection Id": 38}}
     tracks = [{"ph": "M", "pid": pid, "name": "process_name", "args": {"name": "Ascend Hardware"}}
               for pid in (175552, 175553)]
     rows = [first, {**first, "pid": 175553, "dur": 100}, last, *tracks]
     path.write_text(json.dumps({"traceEvents": rows}))
-    _verify_capture(path, level=level, events=("38",), ranks=(0,), measured=1888)
-    _verify_capture(path, level=level, events=("38", "39"), ranks=(0,), measured=6814)
-    _verify_capture(path, level=level, events=("38", "39"), ranks=(0,), measured=4702, operator="busy_union")
+    for selector in ("task:38", "stream:61:task:38", "dev:0:stream:61:task:38", "row:1", "conn:99"):
+        _verify_capture(path, level=level, events=(selector,), ranks=(0,), measured=1888)
+    _verify_capture(path, level=level, events=("conn:38",), ranks=(0,), measured=2814)
+    endpoints = ("task:38", "stream:61:task:39")
+    if level != "L1":
+        _verify_capture(path, level=level, events=endpoints, ranks=(0,), measured=6814)
+        _verify_capture(path, level=level, events=endpoints, ranks=(0,), measured=4702, operator="busy_union")
     for changes, cause in (({"ranks": (999,)}, "capture_rank_mismatch"),
-                           ({"events": ("38", "39"), "ranks": (1,)}, "capture_event_mismatch"),
+                           ({"events": ("task:39",), "ranks": (1,)}, "capture_event_mismatch"),
+                           ({"events": ("task:99",)}, "capture_event_mismatch"),
+                           ({"events": ("38",)}, "capture_trace_ambiguous_event"),
                            ({"events": ("MatMulV3",)}, "capture_trace_ambiguous_event"),
                            ({"measured": 100_000}, "capture_duration_mismatch")):
-        claim = {"events": ("38",), "ranks": (0,), "measured": 1888, **changes}
+        claim = {"events": ("task:38",), "ranks": (0,), "measured": 1888, **changes}
         with pytest.raises(ModelingError, match=cause):
             _verify_capture(path, level=level, **claim)
     path.write_text(json.dumps(rows[:3]))
     with pytest.raises(ModelingError, match="capture_rank_mismatch"):
         _verify_capture(path, level=level, events=("38",), ranks=(0,), measured=1888)
-
-
 def test_capture_envelope_clock_reaches_canonical_device_configuration():
     path = REPO_ROOT / "data/primitives/captures/arch22_a3_9362.capture.json"
     envelope = json.loads(path.read_text(encoding="utf-8"))

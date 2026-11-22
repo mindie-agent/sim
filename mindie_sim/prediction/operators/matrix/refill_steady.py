@@ -2,8 +2,9 @@
 
 [Role] Preserve a producer DAG and a two-stream consumer's nominal K period.
 [Invariants] One real producer prologue and final consumer remain explicit.
-  Interior work and physical owners are conserved in a coupled fluid phase;
-  no measured duration, fitted rate or model identity enters compilation.
+  Interior work and physical owners are conserved in a coupled fluid phase.
+  Peer groups fold only after verifying joint literal recurrence and completion.
+  No measured duration, fitted rate or model identity enters compilation.
 [Timeouts & Locks] Cached finite producer controls and bounded cycle recurrence;
   no K-panel history. No threads, locks or I/O.
 [Side-Effect Policy] Nominal producer controls use the same Engine in isolation;
@@ -12,9 +13,9 @@
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, replace
 from functools import lru_cache
-from math import inf
+from math import inf, lcm
 
-from mindie_sim.prediction.engine import Allocation, Engine, Resource
+from mindie_sim.prediction.engine import Allocation, Engine, ExecutionError, Resource
 from .matrix_cycle import periodic_matrix_cycle
 from mindie_sim.prediction.program import KernelProgram, ParallelProgram, PipelineProgram, Stage
 
@@ -154,6 +155,10 @@ def _periodic_probe(resources, pools, slots, head_records, steady_records, tail_
 
 _PERIODIC_CACHE_SIZE = 1024
 _ONE_TILE = 1; _TWO_FACTOR = 2; _THREE_FACTOR = 3; _FOUR_TILES = 4; _DEFAULT_THRESHOLD = 8
+_JOINT_RECURRENCE_REL_TOL = 1e-6
+_JOINT_TIME_EPS_MS = 1e-9
+_JOINT_WARMUP_PERIODS = (2, 12, 24)
+_JOINT_PROBE_TILE_LIMIT = 128
 
 
 @lru_cache(maxsize=_PERIODIC_CACHE_SIZE)
@@ -477,6 +482,101 @@ class PeriodicPipelineSpec:
         return PipelineProgram(self.count, self.slots, self.tile_fn)
 
 
+def _truncated_peer_pipeline(spec, removed):
+    count = spec.count - removed
+    tail_start = count - spec.tail
+
+    def tile(index):
+        # The omitted span covers whole slot periods. Tail tiles keep their
+        # original work, placement, stage dependencies and buffer parity.
+        return spec.tile_fn(index if index < tail_start else index + removed)
+
+    return PipelineProgram(count, spec.slots, tile)
+
+
+def _probe_boundaries(spec):
+    if spec.slots != _ONE_TILE:
+        return spec
+    steady = tuple(spec.tile_fn(spec.head))
+    tail = max(_ONE_TILE, spec.tail)
+    if all(tuple(spec.tile_fn(index)) == steady
+           for boundary in (range(spec.head), range(spec.count - tail, spec.count)) for index in boundary):
+        # A uniform serial loop has no distinct fill or drain. Probe its
+        # empty baseline and successive real tiles from the same ready event.
+        return replace(spec, head=0, tail=0)
+    return spec
+
+
+def _peer_group_times(engine, specs, programs):
+    start = engine.now
+    ready = engine.submit("ready")
+    ends = []
+    for index, (spec, program) in enumerate(zip(specs, programs, strict=True)):
+        if spec.resident:
+            program = KernelProgram((Stage(
+                "resident", program=program, acquire=spec.resident, free=spec.resident,
+            ),))
+        ends.append(program.start(engine, f"peer{index}", ready))
+    engine.advance(until=tuple(ends), first=False)
+    if engine.allocations:
+        raise ExecutionError("periodic_peer_probe_left_live_allocations")
+    times = tuple(end.time - start for end in ends)
+    # Individual completions can release downstream work before the group's end.
+    return (*times, max(times))
+
+
+def _joint_recurrence_matches(context, specs, candidates):
+    """Validate a fold against the shared-engine recurrence and finite drain."""
+    specs = tuple(map(_probe_boundaries, specs))
+    uniform_serial = all(spec.slots == _ONE_TILE and not (spec.head or spec.tail) for spec in specs)
+    step = _ONE_TILE if uniform_serial else lcm(_TWO_FACTOR, *(spec.slots for spec in specs))
+    # Remove the same number of periods from every peer, preserving any
+    # one-tile difference between owners and the phase of each boundary.
+    periods = min((spec.count - spec.head - spec.tail) // step for spec in specs)
+    if periods < _TWO_FACTOR:
+        return False
+    host = context.resource_names.get("host")
+    resources = tuple(Resource(name, context.rates[name], policy="fifo" if name == host else "fair", units=units)
+                      for name, units in _units(context).items())
+    pools = {name: context.pool_capacities[role] for role, name in context.pool_names.items()
+             if role in context.pool_capacities}
+    pool_units = {name: context.pool_units.get(role, _ONE_TILE) for role, name in context.pool_names.items()}
+    literal_engine = Engine(resources, pools=pools, pool_units=pool_units, backend="python")
+    max_count = max(spec.count for spec in specs)
+    warmups = (0, *_JOINT_WARMUP_PERIODS) if uniform_serial else _JOINT_WARMUP_PERIODS
+    try:
+        for warmup in warmups:
+            last_probe = warmup + _TWO_FACTOR
+            if (last_probe > periods
+                    or max_count - (periods - last_probe) * step > _JOINT_PROBE_TILE_LIMIT):
+                break
+            first, second, third = (
+                _peer_group_times(literal_engine, specs, (
+                    _truncated_peer_pipeline(spec, (periods - probe) * step) for spec in specs
+                ))
+                for probe in range(warmup, last_probe + _ONE_TILE)
+            )
+            early = tuple(b - a for a, b in zip(first, second, strict=True))
+            late = tuple(c - b for b, c in zip(second, third, strict=True))
+            if not all(delta > 0 and _joint_times_match(previous, delta)
+                       for previous, delta in zip(early, late, strict=True)):
+                continue
+            remaining = periods - warmup - _ONE_TILE
+            expected = (b + remaining * delta for b, delta in zip(second, late, strict=True))
+            candidate_engine = Engine(resources, pools=pools, pool_units=pool_units, backend="python")
+            compacted = _peer_group_times(candidate_engine, specs, candidates)
+            return all(_joint_times_match(actual, extrapolated)
+                       for actual, extrapolated in zip(compacted, expected, strict=True))
+    except ExecutionError:
+        # Simultaneous reservations may exceed a shared pool's capacity.
+        return False
+    return False
+
+
+def _joint_times_match(actual, expected):
+    return abs(actual - expected) <= _JOINT_RECURRENCE_REL_TOL * max(expected, _JOINT_TIME_EPS_MS)
+
+
 def compact_periodic_peer_group(
     context, specs: Iterable[PeriodicPipelineSpec], *, compactor=compact_periodic_pipeline,
 ) -> tuple[KernelProgram | PipelineProgram, ...]:
@@ -500,6 +600,9 @@ def compact_periodic_peer_group(
         ) if spec.count > 0 else KernelProgram(())
         for spec in specs
     )
-    if all(isinstance(program, KernelProgram) for program in candidates):
-        return candidates
-    return literal
+    if not all(isinstance(program, KernelProgram) for program in candidates):
+        return literal
+    active_candidates = tuple(program for spec, program in zip(specs, candidates, strict=True) if spec.count > 0)
+    if len(active) > 1 and not _joint_recurrence_matches(context, active, active_candidates):
+        return literal
+    return candidates

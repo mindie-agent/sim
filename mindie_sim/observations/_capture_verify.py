@@ -12,8 +12,9 @@
 """
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 import csv
+from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from functools import partial
 import gzip
@@ -32,17 +33,54 @@ _NS_PER_US = 1000
 _NS_PER_MS = 1000 * _NS_PER_US
 _CSV_TIME_SCALE = {"ns": 1, "us": _NS_PER_US, "ms": _NS_PER_MS}
 _CAPTURE_ROUNDING_NS = 1
+_FIRST_SOURCE_ROW = 1
 # msprof packs the device ID below the track type and host PID.
 _ASCEND_DEVICE_ID_MASK = 0x1F
 _ASCEND_TRACK_TYPE_MASK = 0x3E0
 _ASCEND_HARDWARE_TRACK = 0x1C0
 _TRACE_DEVICE_LABEL = re.compile(r"(?:device|npu|rank)(?: id)?[ _:-]+(?P<rank>[0-9]+)", re.IGNORECASE)
-_TRACE_RANK_KEYS = ("device_rank", "rank_id", "rank", "device_id", "Device_id", "Device Id", "Device ID")
-_TRACE_EVENT_ID_KEYS = ("event_id", "id", "name", "Task Id", "connection_id")
+_TRACE_RANK_KEYS = ("device_rank", "rank_id", "rank", "device_id", "device", "Device_id", "Device Id", "Device ID")
+_EVENT_ID_KEYS = ("event_id", "id", "name")
+_TASK_ID_KEYS = ("Task Id", "Task ID", "task_id", "taskId")
+_CONNECTION_ID_KEYS = ("Connection Id", "Connection ID", "connection_id", "connectionId")
+_STREAM_ID_KEYS = ("Stream Id", "Stream ID", "Physic Stream Id", "stream_id", "streamId", "stream")
+_JSON_ROW_KEYS = frozenset((*_EVENT_ID_KEYS, *_TRACE_RANK_KEYS, *_TASK_ID_KEYS, *_CONNECTION_ID_KEYS,
+                            *_STREAM_ID_KEYS, "ph", "pid", "tid", "args"))
+_SELECTOR_PREFIXES = ("row:", "task:", "conn:", "stream:", "dev:")
+_JSON_START_KEYS = ("start_time", "start_ts", "start", "timestamp", "ts")
+_JSON_END_KEYS = ("end_time", "end_ts", "end")
+_JSON_DURATION_KEYS = ("duration", "dur")
+_JSON_TIME_KEYS = frozenset(
+    field for names in (_JSON_START_KEYS, _JSON_END_KEYS, _JSON_DURATION_KEYS)
+    for name in names for field in (name, *(f"{name}_{unit}" for unit in _CSV_TIME_SCALE))
+) | {"unit", "time_unit"}
 _CAPTURE_META_KEYS = frozenset({
     "device_ranks", "ranks", "profiled_ranks", "device_rank", "rank",
     "clock_domain", "clock_operator", "start_event", "end_event",
 })
+L3_BOUNDARY_KINDS = frozenset({"model_step", "service_step", "e2e_step", "device_only_step", "host_device_step"})
+
+_KernelOccurrence = tuple[int, int]  # (device rank, one-based source row)
+_RankWindows = Mapping[int, tuple[Decimal, Decimal]]
+
+
+@dataclass(frozen=True, slots=True)
+class CaptureVerificationReceipt:
+    selected_kernels: frozenset[_KernelOccurrence]
+    window_kernels: frozenset[_KernelOccurrence] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _CaptureRow:
+    rank: int
+    record: int
+    names: frozenset[str]
+    start: Decimal | None
+    end: Decimal
+
+    @property
+    def occurrence(self) -> _KernelOccurrence:
+        return self.rank, self.record
 
 
 def resolve_capture_file(
@@ -127,12 +165,12 @@ def _iter_capture_rows(
 ) -> Iterator[tuple[bool, Mapping[str, Any]]]:
     """Yield individual trace rows and compact headers from the streaming parser."""
     if first[0] == "start_array":
-        if trace:
-            yield True, {}
         while (item := next(events))[0] != "end_array":
             row = read_value(events, item)
             if isinstance(row, Mapping):
-                yield trace or "ph" in row and ("pid" in row or "ts" in row), row
+                yield trace or _is_trace_row(row), row
+            elif trace:
+                raise ModelingError("capture_trace_requires_object_rows")
             elif isinstance(row, str) and not trace:
                 yield False, {"event_id": row}
         return
@@ -142,7 +180,7 @@ def _iter_capture_rows(
     while (entry := next(events))[0] != "end_map":
         key, item = str(entry[1]), next(events)
         kind, _ = item
-        if key in _CAPTURE_META_KEYS or key in {"event_id", "id", "name"}:
+        if key in _CAPTURE_META_KEYS or key in _JSON_ROW_KEYS or key in _JSON_TIME_KEYS:
             header[key] = read_value(events, item)
         elif key == "traceEvents":
             if kind != "start_array":
@@ -155,7 +193,21 @@ def _iter_capture_rows(
         else:
             skip_value(events, item)
     if header:
-        yield False, header
+        yield _is_trace_row(header), header
+
+
+def _is_trace_row(row: Mapping[str, Any]) -> bool:
+    return "ph" in row and ("pid" in row or "ts" in row)
+
+
+def _iter_jsonl_capture_rows(rows: Iterator[Mapping[str, Any]]) -> Iterator[tuple[bool, Mapping[str, Any]]]:
+    for row in rows:
+        yield _is_trace_row(row), row
+        for key in ("events", "traceEvents"):
+            if isinstance(nested := row.get(key), list):
+                for item in nested:
+                    if isinstance(item, Mapping):
+                        yield key == "traceEvents" or _is_trace_row(item), item
 
 
 def _trace_args(row: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -203,6 +255,9 @@ def _capture_metadata(
                     if processes.setdefault(pid, rank) != rank:
                         raise ModelingError("capture_rank_mismatch:conflicting_trace_process_ranks")
             continue
+        if _json_kernel_start(row) is not None:
+            meta["_timed_json_rows"] = True
+            continue
         ev_names, row_clocks, item_clocks, has_boundary = _row_event_and_clock_info(row)
         matched = ev_names if target_events is None else ev_names & target_events
         is_header = has_boundary or not any(key in row for key in ("event_id", "id", "name"))
@@ -215,6 +270,8 @@ def _capture_metadata(
         ):
             meta["_clock_mismatch"] = True
         if is_header:
+            if (ranks := _capture_ranks(row)) is not None:
+                meta["_header_ranks"] = ranks
             for key in _CAPTURE_META_KEYS & row.keys():
                 if key in meta and meta[key] != row[key] and key != "clock_operator":
                     kind = {"start_event": "event", "end_event": "event", "clock_domain": "clock_domain"}.get(key, "rank")
@@ -249,13 +306,16 @@ def _extract_capture_meta(
     target_events: frozenset[str] | None = None,
     expected_clock_operator: str | None = None,
 ) -> dict[str, Any]:
-    if path.suffix.lower() in _JSONL_SUFFIXES:
-        return _capture_metadata(((False, row) for row in stream_jsonl_fn(path)), target_events, expected_clock_operator)
-    rows = partial(_read_capture_rows, path, ijson_mod=ijson_mod, iter_json_events_fn=iter_json_events_fn,
-                   read_value_fn=read_value_fn, skip_value_fn=skip_value_fn)
+    def rows() -> Iterator[tuple[bool, Mapping[str, Any]]]:
+        if path.suffix.lower() in _JSONL_SUFFIXES:
+            yield from _iter_jsonl_capture_rows(stream_jsonl_fn(path))
+        else:
+            yield from _read_capture_rows(path, ijson_mod=ijson_mod, iter_json_events_fn=iter_json_events_fn,
+                                          read_value_fn=read_value_fn, skip_value_fn=skip_value_fn)
+
     meta = _capture_metadata(rows(), target_events, expected_clock_operator)
-    if "_trace_processes" in meta:
-        meta["_trace_rows"] = rows
+    if "_trace_processes" in meta or meta.get("_timed_json_rows"):
+        meta["_capture_rows"] = rows
     return meta
 
 
@@ -284,17 +344,10 @@ def _csv_time_field(fields: Mapping[str, str], kinds: tuple[str, ...]) -> tuple[
     return None
 
 
-def _csv_time_ns(row: Mapping[str, str], field: tuple[str, int]) -> Decimal:
-    column, scale = field
-    value = Decimal(row[column].strip()) * scale
-    if not value.is_finite():
-        raise ValueError("non_finite_csv_time")
-    return value
-
-
 def _csv_capture_rows(
-    path: Path, case_id: str, ranks: set[int], target_events: frozenset[str],
-) -> Iterator[tuple[int, frozenset[str], Decimal | None, Decimal]]:
+    path: Path, case_id: str, ranks: tuple[int, ...], target_events: frozenset[str], seen_ranks: set[int],
+    windows: _RankWindows | None,
+) -> Iterator[_CaptureRow]:
     open_csv = gzip.open if path.suffix.lower() == ".gz" else Path.open
     with open_csv(path, "rt", encoding="utf-8-sig", newline="") as handle:
         reader = csv.DictReader(handle, strict=True)
@@ -314,133 +367,224 @@ def _csv_capture_rows(
             start_col and (duration_col or end_col) or total_col and "count" in fields
         ):
             raise ModelingError(f"capture_csv_schema_unsupported:{case_id}")
-        seen_ranks = set()
-        for record, row in enumerate(reader, start=1):
+        for record, row in enumerate(reader, start=_FIRST_SOURCE_ROW):
             rank = int(row[rank_col].strip())
             if rank not in ranks:
                 continue
             seen_ranks.add(rank)
-            row_id = f"row={record}"
-            names = target_events.intersection(row[col].strip() for col in event_cols)
-            if row_id in target_events:
-                names = names | {row_id}
-            if not names:
-                continue
+            names = frozenset()
+            if windows is None:
+                names = target_events.intersection((f"row={record}", *(row[col].strip() for col in event_cols)))
+                if not names:
+                    continue
             if not start_col:
                 if int(row[fields["count"]]) != 1 or total_col is None:
                     raise ModelingError(f"capture_csv_aggregate_event:{case_id}")
-                yield rank, names, None, _csv_time_ns(row, total_col)
+                yield _CaptureRow(rank, record, names, None, _capture_time_ns(row, total_col))
                 continue
-            start = _csv_time_ns(row, start_col)
-            end = _csv_time_ns(row, end_col) if end_col else start + _csv_time_ns(row, duration_col)
-            if duration_col and abs(end - start - _csv_time_ns(row, duration_col)) > _CAPTURE_ROUNDING_NS:
+            start = _capture_time_ns(row, start_col)
+            if not _in_window(windows, rank, start):
+                continue
+            end = _capture_time_ns(row, end_col) if end_col else start + _capture_time_ns(row, duration_col)
+            if duration_col and abs(end - start - _capture_time_ns(row, duration_col)) > _CAPTURE_ROUNDING_NS:
                 raise ModelingError(f"capture_csv_interval_inconsistent:{case_id}")
-            yield rank, names, start, end
-        if ranks - seen_ranks:
-            raise ModelingError(f"capture_rank_mismatch:{case_id}:missing={sorted(ranks - seen_ranks)}")
+            yield _CaptureRow(rank, record, names, start, end)
 
 
-def _csv_capture_duration(
-    case_id: str, boundary: Any, path: Path, target_events: frozenset[str],
-) -> int:
-    start_name, end_name = boundary.start_event.strip(), boundary.end_event.strip()
-    ranks = set(boundary.device_ranks)
-    if not ranks:
-        raise ModelingError(f"capture_rank_mismatch:{case_id}:requested_ranks_absent")
-    timed = {rank: [] for rank in ranks}
-    untimed = []
-    found: dict[int, set[str]] = {rank: set() for rank in ranks}
-    endpoint_counts: set[tuple[int, str]] = set()
-    for rank, names, start, end in _csv_capture_rows(path, case_id, ranks, target_events):
-        if start is None:
-            untimed.append(end)
-        else:
-            timed[rank].append((names, start, end))
-        if end <= (start if start is not None else 0):
-            raise ModelingError(f"capture_csv_nonpositive_duration:{case_id}")
-        found[rank].update(names)
-        for name in names & {start_name, end_name}:
-            key = (rank, name)
-            if key in endpoint_counts:
-                raise ModelingError(f"capture_csv_ambiguous_endpoint:{case_id}:{name}")
-            endpoint_counts.add(key)
-    for rank, names in found.items():
-        if missing := target_events - names:
-            raise ModelingError(f"capture_event_mismatch:{case_id}:rank={rank}:missing={','.join(sorted(missing))}")
-    if untimed:
-        if len(untimed) != 1 or len(target_events) != 1 or any(timed.values()):
-            raise ModelingError(f"capture_csv_timestamps_absent:{case_id}")
-        return round(untimed[0])
-
-    return round(max(_timed_rank_duration(case_id, "csv", boundary.clock_operator, start_name, end_name, rows)
-                     for rows in timed.values()))
+def _in_window(windows: _RankWindows | None, rank: int, start: Decimal) -> bool:
+    if windows is None:
+        return True
+    left, right = windows[rank]
+    # A launch at the endpoint belongs to the following window.
+    return left <= start < right
 
 
 def _timed_rank_duration(
-    case_id: str, format_name: str, clock_operator: str, start_name: str, end_name: str,
-    rows: list[tuple[frozenset[str], Decimal, Decimal]],
+    case_id: str, format_name: str, clock_operator: str, left: Decimal, right: Decimal,
+    intervals: Iterable[tuple[Decimal, Decimal]],
 ) -> Decimal:
-    left = next(start for names, start, _ in rows if start_name in names)
-    right = next(end for names, _, end in rows if end_name in names)
-    if any(start < left or end > right for _, start, end in rows) or right <= left:
-        raise ModelingError(f"capture_{format_name}_event_outside_boundary:{case_id}")
     if clock_operator == "elapsed_span":
         return right - left
     if clock_operator != "busy_union":
         raise ModelingError(f"capture_{format_name}_clock_unsupported:{case_id}")
     busy, cursor = Decimal(0), left
-    for start, end in sorted((start, end) for _, start, end in rows):
+    for start, end in sorted(intervals):
+        end = min(end, right)
         busy += max(0, end - max(start, cursor))
         cursor = max(cursor, end)
     return busy
 
 
-def _trace_capture_duration(
-    case_id: str, boundary: Any, meta: Mapping[str, Any], target_events: frozenset[str],
-) -> int:
-    ranks = set(boundary.device_ranks)
-    if not ranks:
-        raise ModelingError(f"capture_rank_mismatch:{case_id}:requested_ranks_absent")
-    timed = {rank: [] for rank in ranks}
-    found: dict[int, set[str]] = {rank: set() for rank in ranks}
-    seen_ranks = set()
-    for trace, row in meta["_trace_rows"]():
-        if not trace or row.get("ph") != "X":
+def _event_field_values(sources: Iterable[Mapping[str, Any]], keys: Iterable[str]) -> set[str]:
+    return {str(value).strip() for source in sources for key in keys
+            if type(value := source.get(key)) in (str, int) and str(value).strip()}
+
+
+def _json_event_names(
+    row: Mapping[str, Any], record: int, rank: int, target_events: frozenset[str],
+) -> frozenset[str]:
+    sources = (row, _trace_args(row))
+    tasks = _event_field_values(sources, _TASK_ID_KEYS)
+    connections = _event_field_values(sources, _CONNECTION_ID_KEYS)
+    streams = _event_field_values(sources, _STREAM_ID_KEYS) or _event_field_values((row,), ("tid",))
+    raw = _event_field_values(sources, _EVENT_ID_KEYS) | tasks | connections
+    qualified = {
+        f"row:{record}", *(f"task:{task}" for task in tasks), *(f"conn:{conn}" for conn in connections),
+        *(selector for stream in streams for task in tasks
+          for selector in (f"stream:{stream}:task:{task}", f"dev:{rank}:stream:{stream}:task:{task}")),
+    }
+    return target_events.intersection(qualified | {name for name in raw if not name.startswith(_SELECTOR_PREFIXES)})
+
+
+def _json_time_field(row: Mapping[str, Any], keys: tuple[str, ...]) -> tuple[str, int] | None:
+    for unit, scale in _CSV_TIME_SCALE.items():
+        for key in keys:
+            if (field := f"{key}_{unit}") in row:
+                return field, scale
+    for key in keys:
+        if key in row:
+            unit = row.get("time_unit", row.get("unit", "us" if "ts" in row and "dur" in row else "ns"))
+            return key, _CSV_TIME_SCALE[str(unit).lower()]
+    return None
+
+
+def _json_kernel_start(row: Mapping[str, Any]) -> tuple[str, int] | None:
+    if ("start_event" in row or "end_event" in row) and not any(key in row for key in _EVENT_ID_KEYS):
+        return None
+    return _json_time_field(row, _JSON_START_KEYS)
+
+
+def _capture_time_ns(row: Mapping[str, Any], field: tuple[str, int] | None) -> Decimal:
+    if field is None:
+        raise ValueError("capture_time_field_absent")
+    column, scale = field
+    value = Decimal(str(row[column]).strip()) * scale
+    if not value.is_finite():
+        raise ValueError("non_finite_capture_time")
+    return value
+
+
+def _json_capture_rows(
+    case_id: str, boundary: Any, meta: Mapping[str, Any], target_events: frozenset[str], trace_format: bool,
+    seen_ranks: set[int], windows: _RankWindows | None,
+) -> Iterator[_CaptureRow]:
+    processes = meta.get("_trace_processes", {})
+    header_ranks = meta.get("_header_ranks", ())
+    default_rank = next(iter(header_ranks)) if len(header_ranks) == 1 and not trace_format else None
+    source = (row for trace, row in meta["_capture_rows"]() if trace == trace_format)
+    for record, row in enumerate(source, start=_FIRST_SOURCE_ROW):
+        if trace_format and row.get("ph") != "X":
             continue
-        process_rank = meta["_trace_processes"].get(row.get("pid"))
+        start_field = ("ts", _NS_PER_US) if trace_format else _json_kernel_start(row)
+        if start_field is None:
+            continue
+        process_rank = processes.get(row.get("pid"), default_rank)
         explicit_rank = _trace_rank(row)
         rank = explicit_rank if explicit_rank is not None else process_rank
-        if rank not in ranks:
+        if rank is None and not trace_format:
+            raise ModelingError(f"capture_rank_mismatch:{case_id}:timed_json_event_rank_absent")
+        if rank not in boundary.device_ranks:
             continue
         seen_ranks.add(rank)
-        names = target_events.intersection(
-            str(value).strip() for source in (row, _trace_args(row)) for key in _TRACE_EVENT_ID_KEYS
-            if isinstance(value := source.get(key), (str, int)) and not isinstance(value, bool)
-        )
-        if not names:
-            continue
-        if process_rank is not None and rank != process_rank:
+        if trace_format and process_rank is not None and rank != process_rank:
             raise ModelingError(f"capture_rank_mismatch:{case_id}:trace_process_conflict")
-        if row.get("clock_operator", boundary.clock_operator) != boundary.clock_operator:
-            raise ModelingError(f"capture_clock_operator_mismatch:{case_id}:expected={boundary.clock_operator}")
-        if row.get("clock_domain", boundary.clock_domain) != boundary.clock_domain:
-            raise ModelingError(f"capture_clock_domain_mismatch:{case_id}:expected={boundary.clock_domain}")
-        if repeated := names & found[rank]:
-            raise ModelingError(f"capture_trace_ambiguous_event:{case_id}:{','.join(sorted(repeated))}")
-        start = Decimal(str(row["ts"])) * _NS_PER_US
-        duration = Decimal(str(row["dur"])) * _NS_PER_US
-        if not start.is_finite() or not duration.is_finite() or duration.is_signed() or duration.is_zero():
-            raise ModelingError(f"capture_trace_invalid_interval:{case_id}")
-        found[rank].update(names)
-        timed[rank].append((names, start, start + duration))
-    if missing_ranks := ranks - seen_ranks:
+        names = _json_event_names(row, record, rank, target_events) if windows is None else frozenset()
+        if windows is None and not names:
+            continue
+        for key in ("clock_operator", "clock_domain"):
+            expected = getattr(boundary, key)
+            if names and row.get(key, expected) != expected:
+                raise ModelingError(f"capture_{key}_mismatch:{case_id}:expected={expected}")
+        start = _capture_time_ns(row, start_field)
+        if not _in_window(windows, rank, start):
+            continue
+        end_field = None if trace_format else _json_time_field(row, _JSON_END_KEYS)
+        dur_field = ("dur", _NS_PER_US) if trace_format else _json_time_field(row, _JSON_DURATION_KEYS)
+        end = _capture_time_ns(row, end_field) if end_field else start + _capture_time_ns(row, dur_field)
+        if end_field and dur_field and abs(end - start - _capture_time_ns(row, dur_field)) > _CAPTURE_ROUNDING_NS:
+            raise ModelingError(f"capture_json_interval_inconsistent:{case_id}")
+        yield _CaptureRow(rank, record, names, start, end)
+
+
+def _selected_rows(
+    case_id: str, format_name: str, boundary: Any, target_events: frozenset[str],
+    rows: Iterable[_CaptureRow], seen_ranks: set[int],
+) -> dict[int, list[_CaptureRow]]:
+    selected: dict[int, list[_CaptureRow]] = {rank: [] for rank in boundary.device_ranks}
+    found: dict[int, set[str]] = {rank: set() for rank in selected}
+    endpoints = {boundary.start_event.strip(), boundary.end_event.strip()}
+    for row in rows:
+        if row.end <= (row.start if row.start is not None else 0):
+            reason = "invalid_interval" if format_name == "trace" else "nonpositive_duration"
+            raise ModelingError(f"capture_{format_name}_{reason}:{case_id}")
+        if repeated := row.names & found[row.rank]:
+            if format_name != "csv" or (repeated := repeated & endpoints):
+                reason = "ambiguous_endpoint" if format_name == "csv" else "ambiguous_event"
+                raise ModelingError(f"capture_{format_name}_{reason}:{case_id}:{','.join(sorted(repeated))}")
+        selected[row.rank].append(row)
+        found[row.rank].update(row.names)
+    if missing_ranks := selected.keys() - seen_ranks:
         raise ModelingError(f"capture_rank_mismatch:{case_id}:missing={sorted(missing_ranks)}")
     for rank, names in found.items():
         if missing := target_events - names:
             raise ModelingError(f"capture_event_mismatch:{case_id}:rank={rank}:missing={','.join(sorted(missing))}")
-    return round(max(_timed_rank_duration(case_id, "trace", boundary.clock_operator,
-                                         boundary.start_event.strip(), boundary.end_event.strip(), rows)
-                     for rows in timed.values()))
+    return selected
+
+
+def _verify_kernel_count(case_id: str, rank: int, count: int) -> None:
+    if count != 1:
+        raise ModelingError(f"capture_device_kernel_requires_one_occurrence:{case_id}:rank={rank}:count={count}")
+
+
+def _verify_timed_capture(
+    case_id: str, boundary: Any, format_name: str, target_events: frozenset[str],
+    rows: Callable[[_RankWindows | None], Iterator[_CaptureRow]], seen_ranks: set[int],
+) -> tuple[int, CaptureVerificationReceipt]:
+    if not boundary.device_ranks:
+        raise ModelingError(f"capture_rank_mismatch:{case_id}:requested_ranks_absent")
+    start_name, end_name = boundary.start_event.strip(), boundary.end_event.strip()
+    kind = getattr(boundary, "boundary_kind", "")
+    single_kernel, step = kind == "device_kernel", kind in L3_BOUNDARY_KINDS
+    selected = _selected_rows(case_id, format_name, boundary, target_events, rows(None), seen_ranks)
+    if single_kernel:
+        for rank, local_rows in selected.items():
+            _verify_kernel_count(case_id, rank, len(local_rows))
+        if start_name != end_name:
+            raise ModelingError(f"capture_device_kernel_endpoint_mismatch:{case_id}")
+    occurrences = frozenset(row.occurrence for local_rows in selected.values() for row in local_rows)
+    if any(row.start is None for local_rows in selected.values() for row in local_rows):
+        if not single_kernel and (len(occurrences) != 1 or len(target_events) != 1):
+            raise ModelingError(f"capture_csv_timestamps_absent:{case_id}")
+        return round(max(row.end for local_rows in selected.values() for row in local_rows)), CaptureVerificationReceipt(occurrences)
+
+    windows: dict[int, tuple[Decimal, Decimal]] = {}
+    for rank, local_rows in selected.items():
+        left = next(row.start for row in local_rows if start_name in row.names)
+        right = next(row.end for row in local_rows if end_name in row.names)
+        if right <= left or any(row.start < left or row.end > right for row in local_rows):
+            raise ModelingError(f"capture_{format_name}_event_outside_boundary:{case_id}")
+        windows[rank] = left, right
+
+    operator = boundary.clock_operator
+    census: set[_KernelOccurrence] = set()
+    spans: dict[int, list[tuple[Decimal, Decimal]]] = {rank: [] for rank in windows}
+    if single_kernel or step:
+        for row in rows(windows):
+            if row.end < row.start:
+                raise ModelingError(f"capture_{format_name}_nonpositive_duration:{case_id}")
+            if row.end == row.start:
+                continue
+            if single_kernel and row.occurrence not in occurrences:
+                raise ModelingError(f"capture_device_kernel_multiple_occurrences:{case_id}:rank={row.rank}")
+            if step:
+                census.add(row.occurrence)
+                if operator == "busy_union":
+                    spans[row.rank].append((row.start, row.end))
+    if not step and operator == "busy_union":
+        spans = {rank: [(row.start, row.end) for row in local_rows] for rank, local_rows in selected.items()}
+    duration = round(max(_timed_rank_duration(case_id, format_name, operator, left, right, spans[rank])
+                         for rank, (left, right) in windows.items()))
+    return duration, CaptureVerificationReceipt(occurrences, frozenset(census) if step else None)
 
 
 def _verify_duration(case_id: str, observed_ns: int, measured_ns: int | None) -> None:
@@ -454,12 +598,13 @@ def verify_capture_file_consistency(
     stream_chunk_bytes: int,
     extract_meta_fn: Callable[..., dict[str, Any]],
     measured_ns: int | None = None,
-) -> None:
+) -> CaptureVerificationReceipt | None:
     """Verify the linked raw capture before scoring the declared observation.
 
-    Chrome and CSV timing are compared in nanoseconds. A CSV row=N event selects
-    the Nth data record when native task names or IDs repeat. For multiple
-    ranks, the longest verified local window represents the capture duration.
+    For multiple ranks, the longest verified local window represents the capture
+    duration. CSV ``row=N`` and trace ``row:N`` are one-based source records.
+    Trace ``task:``, ``conn:``, ``stream:<id>:task:``, and
+    ``dev:<rank>:stream:<id>:task:`` selectors are tied to their source fields.
     """
     try:
         actual_sha = digest_fn(path)
@@ -475,11 +620,14 @@ def verify_capture_file_consistency(
     read_errors = (OSError, EOFError, StopIteration, ValueError, InvalidOperation, csv.Error, AttributeError, KeyError)
     if json_error := getattr(ijson_mod, "JSONError", None):
         read_errors += (json_error,)
+    receipt = None
+    seen_ranks: set[int] = set()
     try:
         if path.name.lower().endswith((".csv", ".csv.gz")):
-            duration = _csv_capture_duration(case_id, boundary, path, target_events)
+            rows = partial(_csv_capture_rows, path, case_id, boundary.device_ranks, target_events, seen_ranks)
+            duration, receipt = _verify_timed_capture(case_id, boundary, "csv", target_events, rows, seen_ranks)
             _verify_duration(case_id, duration, measured_ns)
-            return
+            return receipt
         if path.suffix.lower() not in _JSON_SUFFIXES:
             with path.open("rb") as handle:
                 if not handle.read(stream_chunk_bytes).lstrip().startswith((b"{", b"[")):
@@ -489,8 +637,12 @@ def verify_capture_file_consistency(
             target_events=target_events,
             expected_clock_operator=boundary.clock_operator,
         )
-        if "_trace_rows" in meta:
-            duration = _trace_capture_duration(case_id, boundary, meta, target_events)
+        if "_capture_rows" in meta:
+            trace_format = "_trace_processes" in meta
+            rows = partial(_json_capture_rows, case_id, boundary, meta, target_events, trace_format, seen_ranks)
+            duration, receipt = _verify_timed_capture(
+                case_id, boundary, "trace" if trace_format else "json", target_events, rows, seen_ranks,
+            )
             _verify_duration(case_id, duration, measured_ns)
             meta["event_ids"] = sorted(target_events)
     except TimeoutError:
@@ -536,3 +688,6 @@ def verify_capture_file_consistency(
         known = cap_events | ({start_name} if matched_start else set()) | ({end_name} if matched_end else set())
         if missing := [ev for ev in boundary.event_ids if ev.strip() not in known]:
             raise ModelingError(f"capture_event_mismatch:{case_id}:missing={','.join(missing)}")
+    if receipt is None and getattr(boundary, "boundary_kind", "") == "device_kernel":
+        raise ModelingError(f"capture_device_kernel_occurrence_unavailable:{case_id}")
+    return receipt
