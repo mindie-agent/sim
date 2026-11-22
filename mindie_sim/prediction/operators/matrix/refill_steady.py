@@ -525,8 +525,48 @@ def _peer_group_times(engine, specs, programs):
     return (*times, max(times))
 
 
-def _joint_recurrence_matches(context, specs, candidates):
-    """Validate a fold against the shared-engine recurrence and finite drain."""
+def _cap_steady_span(program: KernelProgram, target_span: float) -> KernelProgram:
+    """Cap steady-stage supply rates to the verified joint-engine span."""
+    return KernelProgram(tuple(
+        replace(stage, caps={
+            k: min(cap, stage.work[k] / target_span) if k in stage.work else cap
+            for k, cap in stage.caps.items()
+        })
+        if stage.name.startswith("steady_pipeline") and stage.caps else stage
+        for stage in program.stages
+    ))
+
+
+def _has_disjoint_peer_units(candidates) -> bool:
+    """Return True iff every candidate claims non-empty, pairwise-disjoint units."""
+    seen = set()
+    for program in candidates:
+        claimed = {
+            (res, unit)
+            for stage in program.stages if stage.name.startswith("steady_pipeline")
+            for res, units in stage.placement.items() for unit in units
+        }
+        if not claimed or not seen.isdisjoint(claimed):
+            return False
+        seen.update(claimed)
+    return True
+
+
+def _calibrate_joint_candidates(specs, candidates, compacted, expected, setup_ms):
+    """Derive joint-rate-capped candidates for concurrent multi-slot peer groups."""
+    if not all(spec.slots >= _TWO_FACTOR for spec in specs) or not _has_disjoint_peer_units(candidates):
+        return None
+    calibrated = []
+    for program, actual, target in zip(candidates, compacted, expected, strict=True):
+        actual_span, target_span = actual - setup_ms, target - setup_ms
+        if actual_span <= 0.0 or target_span < actual_span:
+            return None
+        calibrated.append(_cap_steady_span(program, target_span))
+    return tuple(calibrated)
+
+
+def _resolve_joint_candidates(context, specs, candidates):
+    """Validate or calibrate a multi-peer fold against the shared-engine recurrence."""
     specs = tuple(map(_probe_boundaries, specs))
     uniform_serial = all(spec.slots == _ONE_TILE and not (spec.head or spec.tail) for spec in specs)
     step = _ONE_TILE if uniform_serial else lcm(_TWO_FACTOR, *(spec.slots for spec in specs))
@@ -534,7 +574,7 @@ def _joint_recurrence_matches(context, specs, candidates):
     # one-tile difference between owners and the phase of each boundary.
     periods = min((spec.count - spec.head - spec.tail) // step for spec in specs)
     if periods < _TWO_FACTOR:
-        return False
+        return None
     host = context.resource_names.get("host")
     resources = tuple(Resource(name, context.rates[name], policy="fifo" if name == host else "fair", units=units)
                       for name, units in _units(context).items())
@@ -562,15 +602,27 @@ def _joint_recurrence_matches(context, specs, candidates):
                        for previous, delta in zip(early, late, strict=True)):
                 continue
             remaining = periods - warmup - _ONE_TILE
-            expected = (b + remaining * delta for b, delta in zip(second, late, strict=True))
+            expected = tuple(b + remaining * delta for b, delta in zip(second, late, strict=True))
             candidate_engine = Engine(resources, pools=pools, pool_units=pool_units, backend="python")
             compacted = _peer_group_times(candidate_engine, specs, candidates)
-            return all(_joint_times_match(actual, extrapolated)
-                       for actual, extrapolated in zip(compacted, expected, strict=True))
+            if all(_joint_times_match(actual, extrapolated)
+                   for actual, extrapolated in zip(compacted, expected, strict=True)):
+                return candidates
+            calibrated = _calibrate_joint_candidates(
+                specs, candidates, compacted[:-1], expected[:-1], context.setup_ms,
+            )
+            if calibrated is None:
+                return None
+            verify_engine = Engine(resources, pools=pools, pool_units=pool_units, backend="python")
+            verified = _peer_group_times(verify_engine, specs, calibrated)
+            if all(_joint_times_match(actual, extrapolated)
+                   for actual, extrapolated in zip(verified, expected, strict=True)):
+                return calibrated
+            return None
     except ExecutionError:
         # Simultaneous reservations may exceed a shared pool's capacity.
-        return False
-    return False
+        return None
+    return None
 
 
 def _joint_times_match(actual, expected):
@@ -603,6 +655,10 @@ def compact_periodic_peer_group(
     if not all(isinstance(program, KernelProgram) for program in candidates):
         return literal
     active_candidates = tuple(program for spec, program in zip(specs, candidates, strict=True) if spec.count > 0)
-    if len(active) > 1 and not _joint_recurrence_matches(context, active, active_candidates):
+    if len(active) <= 1:
+        return candidates
+    resolved = _resolve_joint_candidates(context, active, active_candidates)
+    if resolved is None:
         return literal
-    return candidates
+    resolved_iter = iter(resolved)
+    return tuple(next(resolved_iter) if spec.count > 0 else KernelProgram(()) for spec in specs)

@@ -566,3 +566,33 @@ def test_router_payload_width_is_independent_of_projection_compute(dtype, width)
     meta = dict(router.metadata)
     assert {meta[k] for k in ("weight_format", "activation_format", "compute_format")} == {router.dtype} == {"bf16"}
     assert meta["output_format"] == dtype and router.mte3_bytes == scores.mte2_bytes == 4 * 16 * width
+
+
+def test_pipelined_peer_group_calibration_matches_literal_in_o1():
+    from mindie_sim.prediction.operators.matrix import refill_steady
+    from mindie_sim.prediction.program import KernelProgram, PipelineProgram, Stage
+
+    peers, count = 4, 64
+    ctx = RecipeContext(None, {}, {"hbm": "hbm", "cube": "cube"}, {"hbm": 1.0, "cube": float(peers)}, peers,
+                        resource_units={"cube": peers})
+    def tile(peer):
+        return lambda _idx: (Stage("load", {"hbm": 0.25}),
+                             Stage("compute", {"cube": 0.5}, after=("load",), placement={"cube": (peer,)}))
+    def run(programs):
+        eng = Engine([Resource("hbm", 1.0), Resource("cube", float(peers), units=peers)], backend="python")
+        ready = eng.submit("ready")
+        ends = tuple(prog.start(eng, f"p{i}", ready) for i, prog in enumerate(programs))
+        eng.advance(until=ends, first=False)
+        return tuple(e.time for e in ends), dict(eng.serviced)
+
+    pipelined = tuple(refill_steady.PeriodicPipelineSpec(count, 2, tile(i)) for i in range(peers))
+    calibrated = refill_steady.compact_periodic_peer_group(ctx, pipelined)
+    assert all(isinstance(p, KernelProgram) for p in calibrated)
+    cal_t, cal_s = run(calibrated)
+    lit_t, lit_s = run(s.literal() for s in pipelined)
+    assert cal_t == pytest.approx(lit_t, rel=1e-6) and cal_s == pytest.approx(lit_s, rel=1e-12)
+    serial = tuple(refill_steady.PeriodicPipelineSpec(count, 1, tile(i)) for i in range(peers))
+    assert all(isinstance(p, PipelineProgram) for p in refill_steady.compact_periodic_peer_group(ctx, serial))
+    shared_owner = tuple(refill_steady.PeriodicPipelineSpec(count, 2, tile(0)) for _ in range(peers))
+    assert all(isinstance(p, PipelineProgram) for p in refill_steady.compact_periodic_peer_group(ctx, shared_owner))
+
