@@ -41,8 +41,7 @@ from mindie_sim.schema.hardware_links import UNCALIBRATED_SKU_WARNING
 pytestmark = pytest.mark.tier0
 
 PRIMITIVES_DIR = default_primitives_dir()
-HOST_DMA_SKU = "Ascend910_9362"
-CALIBRATED_REGISTER_SKU = "Ascend950DT_9582"
+HOST_DMA_SKU, CALIBRATED_REGISTER_SKU, UNMEASURED_REGISTER_SKU = "Ascend910_9362", "Ascend950DT_9582", "Ascend950PR_9579"
 PRIVATE_SOURCE = re.compile(r'(?<![\d.])(?:\d{1,3}[._-]){3}\d{1,3}(?![\d.])'
                             r'|@|/(?:Users|home|root)/|\$\{?HOME\b|\b(?:username|user_name)\b')
 
@@ -232,16 +231,15 @@ def test_full_envelope_digest_detects_mutation_and_manifest_rejects_resealing(tm
 def test_primitive_declarations_require_matching_datapath_and_explicit_unmeasured_rates(memory_device, register_device):
     memory, old_dp = memory_device
     register, _ = register_device
-    with pytest.raises(ModelingError, match="^primitive_table_arch_mismatch$"):
-        load_primitives(register.sku, datapath=old_dp)
-    with pytest.raises(ModelingError, match="^primitive_table_uncalibrated$"):
-        load_primitives(memory.sku, datapath=old_dp, require_calibrated=True)
-    for table in (memory, register):
-        pid, metric = "P02_load_data", "l1_to_l0a_bytes_per_s_per_aic"
+    uncal_dp = _datapath(UNMEASURED_REGISTER_SKU)
+    uncal = load_primitives(UNMEASURED_REGISTER_SKU, datapath=uncal_dp)
+    with pytest.raises(ModelingError, match="^primitive_table_arch_mismatch$"): load_primitives(register.sku, datapath=old_dp)
+    with pytest.raises(ModelingError, match="^primitive_table_uncalibrated$"): load_primitives(UNMEASURED_REGISTER_SKU, datapath=uncal_dp, require_calibrated=True)
+    for table in (memory, register, uncal):
+        pid, metric = "P19_direct_peer_window", "peer_bytes_per_s"
         rate, warnings = resolve_primitive_rate(table, pid, metric, allow_uncalibrated_declaration=True)
         assert rate == table.cell(pid).band(metric).certified_upper_capacity > 0 and warnings == (UNCALIBRATED_SKU_WARNING,)
-        with pytest.raises(ModelingError, match="^primitive_unmeasured_requires_declaration:"):
-            resolve_primitive_rate(table, pid, metric, allow_uncalibrated_declaration=False)
+        with pytest.raises(ModelingError, match="^primitive_unmeasured_requires_declaration:"): resolve_primitive_rate(table, pid, metric, allow_uncalibrated_declaration=False)
 
 
 def test_uncertainty_bounds_enclose_the_required_quantile():
@@ -286,9 +284,9 @@ def test_datacopy_strided_sector_union_and_live_l2_admission(register_device):
 
 def test_load_data_separate_fractal_operands_follow_serial_setup(register_device):
     table, dp = register_device
-    pid = "P02_load_data"
+    pid, uncal_dp = "P02_load_data", _datapath(UNMEASURED_REGISTER_SKU)
     with pytest.raises(ModelingError, match="^primitive_unmeasured_requires_declaration:"):
-        lower_primitive(pid, {"m": 17, "n": 33, "k": 31}, table, datapath=dp)
+        lower_primitive(pid, {"m": 17, "n": 33, "k": 31}, load_primitives(UNMEASURED_REGISTER_SKU, datapath=uncal_dp), datapath=uncal_dp)
     table = _with_latencies(table, pid, setup_ns=750)
     result = _lower(pid, {"m": 17, "n": 33, "k": 31}, table, datapath=dp)
     engine = _run(result)
@@ -440,7 +438,7 @@ def test_sortall_merge_fan_in_and_masked_histogram_trunks(memory_device, registe
             _lower(pid, {"n": n}, old_table, datapath=old_dp)
     trunk, splits, k = 16384, 3, 7
     n = 2 * trunk + 1
-    engine = _run(_lower(pid, dict(n=n, splits=splits, k=k), table, datapath=dp))
+    engine = _run(_lower(pid, dict(n=n, splits=splits, k=k, algorithm="masked_hist256"), table, datapath=dp))
     for offset, width in ((0, trunk), (trunk, trunk), (2 * trunk, 1)):
         assert _trace(engine, f"masked_low_histogram:{offset}")["serviced"]["vhist256"] == pytest.approx(width)
     assert engine.serviced["vhist256"] == pytest.approx(3 * n + 3 * 256 + splits * k)
@@ -511,7 +509,8 @@ def test_stream_budgets_bind_disjoint_owners_and_derive_nested_span(register_dev
     context = RecipeContext(None, {}, {"vector": "vector"}, rates, dp.aic_count, resource_units=units)
     program = KernelProgram((Stage("vector_work", {"vector": 4}),))
     derived = _lower(pid, {"program": KernelProgram((Stage("a", {"r": 4.0}, caps={"r": 1.0}), Stage("b", {"r": 4.0}, caps={"r": 1.0})))}, table, datapath=dp)
-    assert derived.analytical_ms == pytest.approx(8.0)
+    ev_ms = table.sim_rate_p50(pid, "stream_event_ns", allow_uncalibrated_declaration=True) * 1e-6
+    assert derived.analytical_ms == pytest.approx(8.0 + ev_ms)
     for mode in ("disjoint", "shared_cap"):
         plan = StreamPlan(0, tuple(StreamLane(s, StreamCoreBudget(1, cap, mode)) for s in ("main", "aux")))
         results = [_lower(pid, dict(mode=mode, stream_plan=plan, stream_id=s, program=program),
@@ -597,4 +596,4 @@ def test_bench_idle_npu_parser_rejects_prefix_match_and_die_mismatch(register_de
     assert not PRIVATE_SOURCE.search(canonical_capture_bytes(CALIBRATED_REGISTER_SKU, {"meta": "192.0.2.7 /home" + "/u user@h"}).decode())
     with pytest.raises(ValueError, match="bench_sample_sku_mismatch"):
         build_primitive_table_payload(sku=CALIBRATED_REGISTER_SKU, cann_version="9", endpoint_alias="lab", campaign_id="c", raw_measurements={"device_name": REPRESENTATIVE_SKUS["a5"]})
-    assert register_device[0].cell("P20_host_dma_sync").band("host_h2d_bytes_per_s").certified_upper_capacity == pytest.approx(100.01e9) and not load_primitives("Ascend910_9382", datapath=_datapath("Ascend910_9382")).provenance.calibrated
+    assert register_device[0].cell("P20_host_dma_sync").band("host_h2d_bytes_per_s").certified_upper_capacity == pytest.approx(64.0e9) and not load_primitives(UNMEASURED_REGISTER_SKU, datapath=_datapath(UNMEASURED_REGISTER_SKU)).provenance.calibrated

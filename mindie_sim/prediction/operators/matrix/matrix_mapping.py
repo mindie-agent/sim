@@ -307,6 +307,9 @@ def mapping_bound(context, recipe, *, geometry=None):
                + ((weight + epilogue.column_scale_bytes) *
                   (1 if recipe.reuse_weights else math.ceil(m / recipe.tile_m)))
                + context.op.mte3_bytes)
+    declared_hbm = float(getattr(context.op, "hbm_bytes", 0.0) or 0.0)
+    if declared_hbm > 0.0:
+        hbm = min(hbm, declared_hbm)
     bound = hbm / _declared_rate(context, names["hbm"])
     demands = {}
     for role, values in (
@@ -375,7 +378,7 @@ def _op_matrix_key(op):
     meta = dict(op.metadata)
     return (
         op.local_shape, op.semantic_shape, op.padded_shape,
-        op.dtype, op.mte2_bytes, op.mte3_bytes, op.vector_ops,
+        op.dtype, op.hbm_bytes, op.mte2_bytes, op.mte3_bytes, op.vector_ops,
         meta.get("matrix_groups", 1), meta.get("compute_format"), meta.get("output_format"),
         meta.get("packed_weight_bytes", 0), meta.get("row_scale_bytes", 0),
         meta.get("column_scale_bytes", 0), meta.get("epilogue_ops_per_element", 0),
@@ -483,6 +486,21 @@ class MappedMatmul:
             exceeded = {pool: size for pool, size in buffers.items()
                         if pool in context.pool_capacities and size > context.pool_capacities[pool]}
             bound = None if exceeded else mapping_bound(context, recipe, geometry=geometry)
+            if bound is not None and split_k > 1:
+                names = context.resource_names
+                hbm_r = _declared_rate(context, names["hbm"])
+                vec_r = _declared_rate(context, names["vector"]) if "vector" in names else 0.0
+                partial_bytes = float(2 * FP32_BYTES * split_k * geometry.local_shape[0] * geometry.local_shape[1])
+                merge_ops = float((split_k - 1) * geometry.local_shape[0] * geometry.local_shape[1])
+                split_bound = bound / split_k + partial_bytes / hbm_r + (merge_ops / vec_r if vec_r > 0.0 else 0.0)
+                if split_bound >= bound:
+                    split_k = 1
+                    recipe = HierarchicalMatmul(
+                        tm, tn, tk, cm, cn,
+                        self.slots, self.compute_slots, self.reuse_inputs,
+                        self.reuse_weights, split_k)
+                else:
+                    bound = split_bound
             waves = math.ceil(math.ceil(m / tm) * math.ceil(n / tn) * groups / context.core_count)
             records.append({"tile": [tm, tn, tk], "split_k": split_k,
                             "footprint_bytes_per_owner": buffers,

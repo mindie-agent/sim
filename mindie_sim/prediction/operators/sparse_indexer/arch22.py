@@ -18,6 +18,7 @@ from mindie_sim.schema.operators import OpSpec
 
 from ...mechanism import OperatorPlan
 from ..contracts import OperatorPlanningContext
+from ..sharedkv.sparse_indexer_v1 import build_arch22_v1_lightning
 from ._lowering import S2Partition
 from .common import (
     ARCH22_FLUSH_BLOCKS, ARCH22_SMALL_QUERY_MAX, ARCH22_TOPK_LIMIT, BF16_BYTES, DEFAULT_S2_TILE,
@@ -261,6 +262,8 @@ class _Arch22Strategy:
             datapath.route("l0c", "gm", "fp32")
             datapath.route("gm", "ub", "fp32")
         owners = owner_pairs(ctx, 1)
+        if contract.native_split_core and contract.abi == UPSTREAM_ABI:
+            return build_arch22_v1_lightning(op, ctx, contract, owner_pairs(ctx, 2) or owners, LIGHTNING_SOURCES)
         qsa = contract.abi == QSA_ABI
         sources = LIGHTNING_SOURCES
         if qsa:

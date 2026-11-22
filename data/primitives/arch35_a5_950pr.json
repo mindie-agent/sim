@@ -1,12 +1,20 @@
 {
   "arch_preset": "npu_arch_3510",
   "cann_version": "unmeasured",
-  "envelope_sha256": "8995e5120a9c8c21c87038001c6794b8c52df8c1676dd540e49ddfef482f8c57",
+  "envelope_sha256": "7c2d64346d0ec991f935c7ba69c9cb9f8be869084e294cde9c82d7bfc00b8651",
   "primitives": {
     "P01_datacopy": {
       "evidence_id": "",
       "metrics": {
         "hbm_read_bytes_per_s": {
+          "bound_kind": "rate_upper",
+          "certified_upper_capacity": 1600000000000.0
+        },
+        "hbm_rw11_bytes_per_s": {
+          "bound_kind": "rate_upper",
+          "certified_upper_capacity": 1600000000000.0
+        },
+        "hbm_rw21_bytes_per_s": {
           "bound_kind": "rate_upper",
           "certified_upper_capacity": 1600000000000.0
         },
@@ -20,18 +28,67 @@
         },
         "mte2_aic_hit_bytes_per_s_per_core": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 409600000000.0
+          "certified_upper_capacity": 165000000000.0
         },
         "mte2_aiv_hit_bytes_per_s_per_core": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 102400000000.0
+          "certified_upper_capacity": 165000000000.0
         }
       },
       "modes": {},
       "parameters": {
+        "bisheng_version": "",
         "burst_turn_penalty": [],
+        "core_clock_scale_ratio": 1.0,
+        "gather_v2_cold_surface": {},
+        "gm_alignment_cold_bps": {},
+        "hbm_burst_granule_bytes": 256,
+        "hbm_read_datacopy_blocked_bps_p50": null,
+        "hbm_scatter_row_open_bytes": 2048,
+        "ini_filename": "Ascend950PR_9579.ini",
+        "ini_sha256": "",
+        "l2_cache_ctl_mechanism": "va_bits_62_60",
         "l2_cache_ctl_supported": true,
-        "sector_bytes": 32
+        "metric_diagnostics": {
+          "hbm_read_bytes_per_s": {
+            "nominal_bound": 1600000000000.0,
+            "status": "unmeasured"
+          },
+          "hbm_rw11_bytes_per_s": {
+            "nominal_bound": 1600000000000.0,
+            "status": "unmeasured"
+          },
+          "hbm_rw21_bytes_per_s": {
+            "nominal_bound": 1600000000000.0,
+            "status": "unmeasured"
+          },
+          "hbm_rw_alpha": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          },
+          "hbm_write_bytes_per_s": {
+            "nominal_bound": 1600000000000.0,
+            "status": "unmeasured"
+          },
+          "mte2_aic_hit_bytes_per_s_per_core": {
+            "nominal_bound": 165000000000.0,
+            "status": "unmeasured"
+          },
+          "mte2_aiv_hit_bytes_per_s_per_core": {
+            "nominal_bound": 165000000000.0,
+            "status": "unmeasured"
+          }
+        },
+        "mte2_aic_cold_scaling_bps": {},
+        "mte2_aic_warm_scaling_bps": {},
+        "nominal_cube_freq_mhz": 1650.0,
+        "observed_aicore_freq_mhz": null,
+        "observed_cur_freq_mhz": null,
+        "payload_ramp_bytes_per_s": {},
+        "runtime_cann_version": "",
+        "sector_bytes": 32,
+        "strided_cold_surface": [],
+        "unmeasured_reason": "no_reachable_physical_hardware"
       },
       "status": "unmeasured",
       "units": {
@@ -47,9 +104,17 @@
           "bound_kind": "rate_upper",
           "certified_upper_capacity": 422400000000.0
         },
+        "l1_to_l0a_transpose_bytes_per_s_per_aic": {
+          "bound_kind": "rate_upper",
+          "certified_upper_capacity": 422400000000.0
+        },
         "l1_to_l0b_bytes_per_s_per_aic": {
           "bound_kind": "rate_upper",
           "certified_upper_capacity": 422400000000.0
+        },
+        "l1_to_l0b_transpose_bytes_per_s_per_aic": {
+          "bound_kind": "rate_upper",
+          "certified_upper_capacity": 211200000000.0
         },
         "setup_ns": {
           "bound_kind": "latency_lower",
@@ -59,8 +124,35 @@
       "modes": {},
       "parameters": {
         "fractal_bytes": 512,
+        "measured_l0a_transpose_ratio": null,
+        "measured_l0b_transpose_ratio": null,
+        "metric_diagnostics": {
+          "l1_to_l0a_bytes_per_s_per_aic": {
+            "nominal_bound": 422400000000.0,
+            "status": "unmeasured"
+          },
+          "l1_to_l0a_transpose_bytes_per_s_per_aic": {
+            "nominal_bound": 422400000000.0,
+            "status": "unmeasured"
+          },
+          "l1_to_l0b_bytes_per_s_per_aic": {
+            "nominal_bound": 422400000000.0,
+            "status": "unmeasured"
+          },
+          "l1_to_l0b_transpose_bytes_per_s_per_aic": {
+            "nominal_bound": 211200000000.0,
+            "status": "unmeasured"
+          },
+          "setup_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          }
+        },
+        "mx_scale_bytes_per_cyc": 32,
         "mx_scale_supported": true,
-        "transpose_factor": 1.0
+        "transpose_factor": 1.0,
+        "transpose_l0b_factor": 0.5,
+        "unmeasured_reason": "no_reachable_physical_hardware"
       },
       "status": "unmeasured",
       "units": {
@@ -73,7 +165,7 @@
       "metrics": {
         "fixpipe_in_bytes_per_s_per_aic": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 211200000000.0
+          "certified_upper_capacity": 422400000000.0
         },
         "fixpipe_out_bytes_per_s_per_aic": {
           "bound_kind": "rate_upper",
@@ -86,9 +178,27 @@
       },
       "modes": {},
       "parameters": {
+        "dual_target_ub_supported": true,
         "has_l0c_to_l1": true,
         "has_l0c_to_ub": true,
-        "ub_split_n_align_elems": 32
+        "metric_diagnostics": {
+          "fixpipe_in_bytes_per_s_per_aic": {
+            "nominal_bound": 422400000000.0,
+            "status": "unmeasured"
+          },
+          "fixpipe_out_bytes_per_s_per_aic": {
+            "nominal_bound": 211200000000.0,
+            "status": "unmeasured"
+          },
+          "setup_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          }
+        },
+        "nz2dn_stride_gt1_div": 4,
+        "split_m_supported": true,
+        "ub_split_n_align_elems": 32,
+        "unmeasured_reason": "no_reachable_physical_hardware"
       },
       "status": "unmeasured",
       "units": {
@@ -109,7 +219,7 @@
         },
         "mte3_store_bytes_per_s_per_aiv": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 211200000000.0
+          "certified_upper_capacity": 132000000000.0
         },
         "setup_ns": {
           "bound_kind": "latency_lower",
@@ -118,7 +228,36 @@
       },
       "modes": {},
       "parameters": {
-        "has_ub_to_l1": true
+        "has_ub_to_l1": true,
+        "indexed_update_diagnostic": {
+          "band": {
+            "bound_kind": "rate_upper",
+            "certified_upper_capacity": 11827200000000.0
+          },
+          "diagnostic": {
+            "nominal_bound": 11827200000000.0,
+            "status": "unmeasured"
+          }
+        },
+        "metric_diagnostics": {
+          "atomic_contention_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          },
+          "atomic_rmw_bytes_per_s": {
+            "nominal_bound": 308800000000.0,
+            "status": "unmeasured"
+          },
+          "mte3_store_bytes_per_s_per_aiv": {
+            "nominal_bound": 132000000000.0,
+            "status": "unmeasured"
+          },
+          "setup_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          }
+        },
+        "unmeasured_reason": "no_reachable_physical_hardware"
       },
       "status": "unmeasured",
       "units": {
@@ -131,7 +270,7 @@
       "metrics": {
         "l2_die_bytes_per_s": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 13107200000000.0
+          "certified_upper_capacity": 11827200000000.0
         },
         "l2_effective_fraction": {
           "bound_kind": "rate_upper",
@@ -141,9 +280,25 @@
       "modes": {},
       "parameters": {
         "buffer_units_l2": 1,
+        "cache_disable_mechanism": "va_bits_62_60",
         "cache_disable_supported": true,
+        "cache_persistent_supported": true,
         "granule_bytes": 128,
         "l2_bytes": 134217728,
+        "l2_line_bytes": 512,
+        "l2_sector_bytes": 128,
+        "l2_stride_conflict": [],
+        "metric_diagnostics": {
+          "l2_die_bytes_per_s": {
+            "nominal_bound": 11827200000000.0,
+            "status": "unmeasured"
+          },
+          "l2_effective_fraction": {
+            "nominal_bound": 1.0,
+            "status": "unmeasured"
+          }
+        },
+        "unmeasured_reason": "no_reachable_physical_hardware",
         "ws_sweep_bytes_per_s": {}
       },
       "status": "unmeasured",
@@ -163,10 +318,12 @@
       },
       "modes": {
         "bf16": {
+          "cube_k": 16,
           "cube_only_rate": {
             "bound_kind": "rate_upper",
             "certified_upper_capacity": 13516800000000.0
           },
+          "k_0": 16,
           "m_iss": 16,
           "status": "unmeasured",
           "tile_k": 16,
@@ -174,10 +331,12 @@
           "tile_n": 16
         },
         "fp16": {
+          "cube_k": 16,
           "cube_only_rate": {
             "bound_kind": "rate_upper",
             "certified_upper_capacity": 13516800000000.0
           },
+          "k_0": 16,
           "m_iss": 16,
           "status": "unmeasured",
           "tile_k": 16,
@@ -185,10 +344,12 @@
           "tile_n": 16
         },
         "fp32": {
+          "cube_k": 1,
           "cube_only_rate": {
             "bound_kind": "rate_upper",
             "certified_upper_capacity": 844800000000.0
           },
+          "k_0": 8,
           "m_iss": 16,
           "status": "unmeasured",
           "tile_k": 8,
@@ -196,10 +357,51 @@
           "tile_n": 16
         },
         "fp8_e4m3": {
+          "cube_k": 32,
           "cube_only_rate": {
             "bound_kind": "rate_upper",
             "certified_upper_capacity": 27033600000000.0
           },
+          "k_0": 32,
+          "m_iss": 16,
+          "status": "unmeasured",
+          "tile_k": 32,
+          "tile_m": 16,
+          "tile_n": 16
+        },
+        "fp8_e5m2": {
+          "cube_k": 32,
+          "cube_only_rate": {
+            "bound_kind": "rate_upper",
+            "certified_upper_capacity": 27033600000000.0
+          },
+          "k_0": 32,
+          "m_iss": 16,
+          "status": "unmeasured",
+          "tile_k": 32,
+          "tile_m": 16,
+          "tile_n": 16
+        },
+        "hf32": {
+          "cube_k": 8,
+          "cube_only_rate": {
+            "bound_kind": "rate_upper",
+            "certified_upper_capacity": 6758400000000.0
+          },
+          "k_0": 8,
+          "m_iss": 16,
+          "status": "unmeasured",
+          "tile_k": 8,
+          "tile_m": 16,
+          "tile_n": 16
+        },
+        "hifloat8": {
+          "cube_k": 32,
+          "cube_only_rate": {
+            "bound_kind": "rate_upper",
+            "certified_upper_capacity": 27033600000000.0
+          },
+          "k_0": 32,
           "m_iss": 16,
           "status": "unmeasured",
           "tile_k": 32,
@@ -207,10 +409,12 @@
           "tile_n": 16
         },
         "int8": {
+          "cube_k": 32,
           "cube_only_rate": {
             "bound_kind": "rate_upper",
             "certified_upper_capacity": 27033600000000.0
           },
+          "k_0": 32,
           "m_iss": 16,
           "status": "unmeasured",
           "tile_k": 32,
@@ -218,10 +422,12 @@
           "tile_n": 16
         },
         "mxfp4": {
+          "cube_k": 64,
           "cube_only_rate": {
             "bound_kind": "rate_upper",
             "certified_upper_capacity": 54067200000000.0
           },
+          "k_0": 64,
           "m_iss": 16,
           "scale_group": 32,
           "status": "unmeasured",
@@ -230,10 +436,12 @@
           "tile_n": 16
         },
         "mxfp8": {
+          "cube_k": 32,
           "cube_only_rate": {
             "bound_kind": "rate_upper",
             "certified_upper_capacity": 27033600000000.0
           },
+          "k_0": 32,
           "m_iss": 16,
           "scale_group": 32,
           "status": "unmeasured",
@@ -243,8 +451,81 @@
         }
       },
       "parameters": {
+        "fp32_allow_hf32_recorded": true,
+        "gemm_e2e_flops_per_s_per_aic": {},
+        "metric_diagnostics": {
+          "pipe_m_barrier_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          }
+        },
+        "mode_coverage": {
+          "calibrated_count": 0,
+          "calibrated_modes": [],
+          "conflict_modes": [],
+          "mode_diagnostics": {
+            "bf16": {
+              "nominal_bound": 13516800000000.0,
+              "status": "unmeasured"
+            },
+            "fp16": {
+              "nominal_bound": 13516800000000.0,
+              "status": "unmeasured"
+            },
+            "fp32": {
+              "nominal_bound": 844800000000.0,
+              "status": "unmeasured"
+            },
+            "fp8_e4m3": {
+              "nominal_bound": 27033600000000.0,
+              "status": "unmeasured"
+            },
+            "fp8_e5m2": {
+              "nominal_bound": 27033600000000.0,
+              "status": "unmeasured"
+            },
+            "hf32": {
+              "nominal_bound": 6758400000000.0,
+              "status": "unmeasured"
+            },
+            "hifloat8": {
+              "nominal_bound": 27033600000000.0,
+              "status": "unmeasured"
+            },
+            "int8": {
+              "nominal_bound": 27033600000000.0,
+              "status": "unmeasured"
+            },
+            "mxfp4": {
+              "nominal_bound": 54067200000000.0,
+              "status": "unmeasured"
+            },
+            "mxfp8": {
+              "nominal_bound": 27033600000000.0,
+              "status": "unmeasured"
+            }
+          },
+          "supported_count": 10,
+          "unmeasured_modes": [
+            "bf16",
+            "fp16",
+            "fp32",
+            "hf32",
+            "int8",
+            "fp8_e4m3",
+            "fp8_e5m2",
+            "hifloat8",
+            "mxfp8",
+            "mxfp4"
+          ],
+          "unsupported_modes": [
+            "int4"
+          ]
+        },
         "pipe_m_barrier_fractal_threshold": 10,
-        "small_m_bf16_ns": {}
+        "small_m_bf16_ns": {},
+        "small_m_bf16_warm_ns": {},
+        "unmeasured_reason": "no_reachable_physical_hardware"
       },
       "status": "unmeasured",
       "units": {
@@ -268,6 +549,20 @@
       "parameters": {
         "bf16_lanes": 128,
         "fp32_lanes": 64,
+        "metric_diagnostics": {
+          "raw_latency_cycles": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          },
+          "vec_alu_ops_per_s_per_aiv": {
+            "nominal_bound": 211200000000.0,
+            "status": "unmeasured"
+          }
+        },
+        "ub_bank_groups": 8,
+        "ub_bank_size_bytes": 16384,
+        "ub_banks_per_group": 2,
+        "unmeasured_reason": "no_reachable_physical_hardware",
         "vector_width_bytes": 256
       },
       "status": "unmeasured",
@@ -284,13 +579,27 @@
         },
         "vec_sfu_ops_per_s_per_aiv": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 52800000000.0
+          "certified_upper_capacity": 105600000000.0
         }
       },
       "modes": {},
       "parameters": {
         "bf16_lanes": 128,
         "fp32_lanes": 64,
+        "metric_diagnostics": {
+          "raw_latency_cycles": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          },
+          "vec_sfu_ops_per_s_per_aiv": {
+            "nominal_bound": 105600000000.0,
+            "status": "unmeasured"
+          }
+        },
+        "ub_bank_groups": 8,
+        "ub_bank_size_bytes": 16384,
+        "ub_banks_per_group": 2,
+        "unmeasured_reason": "no_reachable_physical_hardware",
         "vector_width_bytes": 256
       },
       "status": "unmeasured",
@@ -312,8 +621,22 @@
       },
       "modes": {},
       "parameters": {
+        "metric_diagnostics": {
+          "cast_bytes_per_s_per_aiv": {
+            "nominal_bound": 422400000000.0,
+            "status": "unmeasured"
+          },
+          "vec_reduce_ops_per_s_per_aiv": {
+            "nominal_bound": 105600000000.0,
+            "status": "unmeasured"
+          }
+        },
         "mx_dynamic_quant_supported": true,
-        "mx_scale_group": 32
+        "mx_scale_group": 32,
+        "ub_bank_groups": 8,
+        "ub_bank_size_bytes": 16384,
+        "ub_banks_per_group": 2,
+        "unmeasured_reason": "no_reachable_physical_hardware"
       },
       "status": "unmeasured",
       "units": {
@@ -326,13 +649,45 @@
       "metrics": {
         "sort_elems_per_s": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 6758400000000.0
+          "certified_upper_capacity": 105600000000.0
+        },
+        "sort_elems_per_s_per_aiv": {
+          "bound_kind": "rate_upper",
+          "certified_upper_capacity": 105600000000.0
         }
       },
-      "modes": {},
+      "modes": {
+        "masked_hist256": {
+          "sort_elems_per_s_per_aiv": {
+            "bound_kind": "rate_upper",
+            "certified_upper_capacity": 105600000000.0
+          },
+          "status": "unmeasured",
+          "unmeasured_reason": "requires_histogram_microkernel"
+        },
+        "sort32_mrgsort4": {
+          "sort_elems_per_s_per_aiv": {
+            "bound_kind": "rate_upper",
+            "certified_upper_capacity": 105600000000.0
+          },
+          "status": "unmeasured"
+        }
+      },
       "parameters": {
         "histogram_trunk_elems": 16384,
-        "sort_algorithm": "masked_hist256",
+        "masked_hist256_supported": true,
+        "metric_diagnostics": {
+          "sort_elems_per_s": {
+            "nominal_bound": 105600000000.0,
+            "status": "unmeasured"
+          },
+          "sort_elems_per_s_per_aiv": {
+            "nominal_bound": 105600000000.0,
+            "status": "unmeasured"
+          }
+        },
+        "sort_algorithm": "sort32_mrgsort4",
+        "sort_die_elems_per_s_p50": null,
         "supported_sortall_lengths": [
           64,
           128,
@@ -340,11 +695,12 @@
           512,
           1024,
           2048
-        ]
+        ],
+        "unmeasured_reason": "no_reachable_physical_hardware"
       },
       "status": "unmeasured",
       "units": {
-        "rate": "elems_per_s"
+        "rate": "elems_per_s_per_aiv"
       }
     },
     "P11_simt": {
@@ -356,7 +712,11 @@
         },
         "simt_ops_per_s_per_aiv": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 105600000000.0
+          "certified_upper_capacity": 6600000000.0
+        },
+        "simt_warp_instructions_per_s_per_aiv": {
+          "bound_kind": "rate_upper",
+          "certified_upper_capacity": 6600000000.0
         },
         "syncthreads_ns": {
           "bound_kind": "latency_lower",
@@ -366,21 +726,59 @@
       "modes": {},
       "parameters": {
         "catlass_max_threads": 1024,
-        "simt_ub_carveout_bytes": 16384,
+        "metric_diagnostics": {
+          "simt_launch_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          },
+          "simt_ops_per_s_per_aiv": {
+            "nominal_bound": 6600000000.0,
+            "status": "unmeasured"
+          },
+          "simt_warp_instructions_per_s_per_aiv": {
+            "nominal_bound": 6600000000.0,
+            "status": "unmeasured"
+          },
+          "syncthreads_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          }
+        },
+        "simt_scalar_flops_per_s_per_aiv_p50": null,
+        "simt_ub_carveout_bytes": 32768,
+        "simt_ub_carveout_min_bytes": 32768,
         "supported": true,
         "tla_max_threads": 2048,
+        "unmeasured_reason": "requires_ascendc_simt_kernel",
+        "warp_schedulers": 4,
         "warp_size": 32
       },
       "status": "unmeasured",
       "units": {
         "latency": "ns",
-        "rate": "ops_per_s_per_aiv"
+        "rate": "warp_instructions_per_s_per_aiv"
       }
     },
     "P12_intracore_flag": {
       "evidence_id": "",
       "metrics": {
+        "flag_m_fix_ns": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0
+        },
+        "flag_mte2_v_ns": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0
+        },
         "flag_ns": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0
+        },
+        "flag_v_mte3_ns": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0
+        },
+        "pipe_v_barrier_ns": {
           "bound_kind": "latency_lower",
           "certified_upper_capacity": 0.0
         },
@@ -392,7 +790,34 @@
       "modes": {},
       "parameters": {
         "event_ids": 8,
-        "unit_flag_requires_single_l0c_stage": true
+        "metric_diagnostics": {
+          "flag_m_fix_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          },
+          "flag_mte2_v_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          },
+          "flag_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          },
+          "flag_v_mte3_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          },
+          "pipe_v_barrier_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          },
+          "unitflag_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          }
+        },
+        "unit_flag_requires_single_l0c_stage": true,
+        "unmeasured_reason": "no_reachable_physical_hardware"
       },
       "status": "unmeasured",
       "units": {
@@ -417,6 +842,10 @@
         "mode2_paired_ns": {
           "bound_kind": "latency_lower",
           "certified_upper_capacity": 0.0
+        },
+        "mode4_intra_block_ns": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0
         }
       },
       "modes": {},
@@ -424,8 +853,33 @@
         "aic_inter_block_barrier_id": 9,
         "aiv_inter_block_barrier_id": 8,
         "ffts_max_flag_id": 7,
+        "hw_flag_ids": 16,
         "intra_subblock_barrier_id": 10,
-        "reverse_depth": 15
+        "metric_diagnostics": {
+          "mode0_aic_barrier_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          },
+          "mode0_aiv_barrier_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          },
+          "mode1_subblock_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          },
+          "mode2_paired_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          },
+          "mode4_intra_block_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          }
+        },
+        "mode4_supported": true,
+        "reverse_depth": 15,
+        "unmeasured_reason": "no_reachable_physical_hardware"
       },
       "status": "unmeasured",
       "units": {
@@ -442,8 +896,17 @@
       },
       "modes": {},
       "parameters": {
+        "hw_mutex_ids": 32,
         "max_mutex_ids": 28,
-        "unit_flag_requires_single_l0c_stage": true
+        "metric_diagnostics": {
+          "mutex_overhead_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          }
+        },
+        "supported": true,
+        "unit_flag_requires_single_l0c_stage": true,
+        "unmeasured_reason": "no_reachable_physical_hardware"
       },
       "status": "unmeasured",
       "units": {
@@ -461,6 +924,10 @@
           "bound_kind": "latency_lower",
           "certified_upper_capacity": 0.0
         },
+        "host_submit_burst_ns": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0
+        },
         "host_submit_ns": {
           "bound_kind": "latency_lower",
           "certified_upper_capacity": 0.0
@@ -468,13 +935,45 @@
         "issue_interval_ns": {
           "bound_kind": "latency_lower",
           "certified_upper_capacity": 0.0
+        },
+        "npugraph_issue_ns": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0
         }
       },
       "modes": {},
       "parameters": {
+        "first_issue_includes_min_kernel": true,
         "lanes": 1,
+        "metric_diagnostics": {
+          "aic_first_issue_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          },
+          "aiv_first_issue_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          },
+          "host_submit_burst_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          },
+          "host_submit_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          },
+          "issue_interval_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          },
+          "npugraph_issue_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          }
+        },
         "queue_depth": 64,
-        "queue_scope": "die"
+        "queue_scope": "die",
+        "unmeasured_reason": "no_reachable_physical_hardware"
       },
       "status": "unmeasured",
       "units": {
@@ -495,10 +994,21 @@
       },
       "modes": {},
       "parameters": {
+        "metric_diagnostics": {
+          "set_limit_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          },
+          "stream_event_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          }
+        },
         "modes": [
           "disjoint",
           "shared_cap"
-        ]
+        ],
+        "unmeasured_reason": "no_reachable_physical_hardware"
       },
       "status": "unmeasured",
       "units": {
@@ -527,7 +1037,26 @@
       },
       "modes": {},
       "parameters": {
-        "aclgraph_cacheable": true
+        "aclgraph_cacheable": true,
+        "metric_diagnostics": {
+          "aicpu_base_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          },
+          "eager_d2h_sync_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          },
+          "gm_pub_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          },
+          "host_select_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          }
+        },
+        "unmeasured_reason": "no_reachable_physical_hardware"
       },
       "status": "unmeasured",
       "units": {
@@ -541,6 +1070,10 @@
           "bound_kind": "rate_upper",
           "certified_upper_capacity": 56000000000.0
         },
+        "startup_blocked_ns": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0
+        },
         "startup_ns": {
           "bound_kind": "latency_lower",
           "certified_upper_capacity": 0.0
@@ -548,9 +1081,32 @@
       },
       "modes": {},
       "parameters": {
-        "payload_bytes_per_frame": 480,
+        "bandwidth_definition": "two_rank_allreduce_busbw_equals_algbw",
+        "curves_by_topology": {},
+        "group_max": 2,
+        "group_min": 2,
+        "mc2_contention": {},
+        "measured_collective": "all_reduce",
+        "measured_scope": "node",
+        "measured_world_size": 2,
+        "metric_diagnostics": {
+          "link_bytes_per_s": {
+            "nominal_bound": 56000000000.0,
+            "status": "unmeasured"
+          },
+          "startup_blocked_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          },
+          "startup_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          }
+        },
+        "payload_bytes_per_frame": 1024,
         "short_final_frame_policy": "exact_plus_header",
-        "wire_bytes_per_frame": 512
+        "unmeasured_reason": "no_reachable_physical_hardware",
+        "wire_bytes_per_frame": 1024
       },
       "status": "unmeasured",
       "units": {
@@ -572,9 +1128,22 @@
       },
       "modes": {},
       "parameters": {
+        "curves_by_topology": {},
+        "hccl_duplex_diagnostics": {},
+        "metric_diagnostics": {
+          "peer_bytes_per_s": {
+            "nominal_bound": 56000000000.0,
+            "status": "unmeasured"
+          },
+          "status_sync_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          }
+        },
         "token_payload_bytes_per_frame": 480,
         "token_wire_bytes_per_frame": 512,
-        "transport": "a5_ub_shmem_mte"
+        "transport": "a5_ub_shmem_mte",
+        "unmeasured_reason": "no_reachable_physical_hardware"
       },
       "status": "unmeasured",
       "units": {
@@ -591,11 +1160,11 @@
         },
         "host_d2h_bytes_per_s": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 100150000000.0
+          "certified_upper_capacity": 64000000000.0
         },
         "host_h2d_bytes_per_s": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 100010000000.0
+          "certified_upper_capacity": 64000000000.0
         },
         "host_rc_d2h_bytes_per_s": {
           "bound_kind": "rate_upper",
@@ -605,18 +1174,82 @@
           "bound_kind": "rate_upper",
           "certified_upper_capacity": 400000000000.0
         },
+        "pageable_d2h_startup_ns": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0
+        },
         "pageable_dma_startup_ns": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0
+        },
+        "pageable_h2d_startup_ns": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0
+        },
+        "pinned_d2h_startup_ns": {
           "bound_kind": "latency_lower",
           "certified_upper_capacity": 0.0
         },
         "pinned_dma_startup_ns": {
           "bound_kind": "latency_lower",
           "certified_upper_capacity": 0.0
+        },
+        "pinned_h2d_startup_ns": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0
         }
       },
       "modes": {},
       "parameters": {
-        "contention_scope": "root_complex"
+        "contention_scope": "root_complex",
+        "dma_curve_by_size": {},
+        "metric_diagnostics": {
+          "eager_d2h_sync_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          },
+          "host_d2h_bytes_per_s": {
+            "nominal_bound": 64000000000.0,
+            "status": "unmeasured"
+          },
+          "host_h2d_bytes_per_s": {
+            "nominal_bound": 64000000000.0,
+            "status": "unmeasured"
+          },
+          "host_rc_d2h_bytes_per_s": {
+            "nominal_bound": 400000000000.0,
+            "status": "unmeasured"
+          },
+          "host_rc_h2d_bytes_per_s": {
+            "nominal_bound": 400000000000.0,
+            "status": "unmeasured"
+          },
+          "pageable_d2h_startup_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          },
+          "pageable_dma_startup_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          },
+          "pageable_h2d_startup_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          },
+          "pinned_d2h_startup_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          },
+          "pinned_dma_startup_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          },
+          "pinned_h2d_startup_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          }
+        },
+        "unmeasured_reason": "no_reachable_physical_hardware"
       },
       "status": "unmeasured",
       "units": {
@@ -627,10 +1260,15 @@
   },
   "provenance": {
     "calibrated": false,
-    "campaign_id": "camp-202611-l0-a5pr",
-    "capture_uri": "capture://lab-a5-950pr/camp-202611-l0-a5pr/7e9b2da7383afdd9e1678c01f9812162a9b74a3dddf6fe770488727344677e0a",
-    "collected_utc": "2026-11-21T01:05:25Z",
-    "endpoint_alias": "lab-a5-950pr",
+    "campaign_id": "camp-202611-l0",
+    "capture_uri": "capture://ascend950pr_9579/camp-202611-l0/7e9b2da7383afdd9e1678c01f9812162a9b74a3dddf6fe770488727344677e0a",
+    "clock_calibration": {
+      "core_clock_scale_ratio": 1.0,
+      "nominal_cube_freq_mhz": 1650.0,
+      "observed_aicore_freq_mhz": null
+    },
+    "collected_utc": "2026-11-22T00:14:44Z",
+    "endpoint_alias": "ascend950pr_9579",
     "silicon_fingerprint": {
       "aic_count": 28,
       "aiv_count": 56,

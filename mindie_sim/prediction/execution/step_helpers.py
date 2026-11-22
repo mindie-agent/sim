@@ -58,6 +58,9 @@ def _stars_controller_id(spec, replica: int, stage: int, die) -> str:
     return f"r{int(replica)}:s{int(stage)}"
 
 
+NS_PER_US = 1000.0
+
+
 def _stars_is_noop_placeholder(spec) -> bool:
     """True only for the uncalibrated default profile placeholder."""
     return (
@@ -69,8 +72,29 @@ def _stars_is_noop_placeholder(spec) -> bool:
     )
 
 
+def _calibrated_stars_spec(spec, primitive_table):
+    """Bind calibrated P15 STARS descriptor cadence when available."""
+    if primitive_table is None:
+        return None
+    from dataclasses import replace as _replace
+    from mindie_sim.primitives.loader import _table_band_p50
+
+    interval_ns = _table_band_p50(primitive_table, "P15_rts_stars", "issue_interval_ns")
+    if interval_ns is None or interval_ns <= 0.0:
+        return None
+    first_ns = _table_band_p50(primitive_table, "P15_rts_stars", "aiv_first_issue_ns")
+    first_extra_us = max(0.0, (first_ns - interval_ns) / NS_PER_US) if (first_ns is not None and first_ns > interval_ns) else 0.0
+    return _replace(
+        spec,
+        issue_interval_us=float(interval_ns) / NS_PER_US,
+        first_issue_us=float(first_extra_us),
+        release_policy="stream_predecessor_done",
+        evidence_id=f"p15:{primitive_table.sku}:{primitive_table.canonical_envelope_sha256()[:12]}",
+    )
+
+
 def build_stars_queues(
-    stage_profiles, namespace: str
+    stage_profiles, namespace: str, *, include_submission: bool = False,
 ) -> dict[tuple[int, int], tuple[tuple[int, StarsDescriptorQueue], ...]]:
     """Build per-die STARS queues for every active ``StarsSpec``.
 
@@ -84,8 +108,14 @@ def build_stars_queues(
     for key, profile in stage_profiles.items():
         datapath = getattr(profile, "datapath", None)
         spec = getattr(datapath, "stars_spec", None)
-        if spec is None or _stars_is_noop_placeholder(spec):
+        if spec is None:
             continue
+        if _stars_is_noop_placeholder(spec):
+            if not include_submission:
+                continue
+            spec = _calibrated_stars_spec(spec, getattr(profile, "primitive_table", None))
+            if spec is None:
+                continue
         replica, stage = key
         dies = profile.dies or ()
         entries: list[tuple[int, StarsDescriptorQueue]] = []
@@ -114,7 +144,9 @@ def build_stars_queues(
 def attach_stars_queues(execution) -> None:
     """Build and register STARS queues/pools on ``execution.engine``."""
     execution.stars_queues = build_stars_queues(
-        execution.stage_profiles, execution.namespace
+        execution.stage_profiles,
+        execution.namespace,
+        include_submission=bool(getattr(execution, "include_submission", False)),
     )
     seen: set[int] = set()
     for entries in execution.stars_queues.values():

@@ -25,6 +25,16 @@ from ...ownership import unit_group
 from ...program import KernelProgram, ParallelProgram, PipelineProgram, RecipeContext, Stage
 from ...runtime.ring_buffer import RingBuffer, lower_generation
 from ..contracts import OperatorPlanningContext
+from ._gdn_native import (
+    ARCH35_GDN_AIC_MTE2_QK_PANELS,
+    ARCH35_GDN_AIV_MTE2_QKV_PANELS,
+    RECURRENT_GDN_ABI,
+    arch35_gdn_chunk_sync_ms,
+    arch35_gdn_extra_sync_stage,
+    arch35_gdn_vf_vector_ops,
+    build_native_recurrent_gdn,
+    compact_lane_pipeline,
+)
 from .common import (
     CHUNK32_KERNELS, CHUNK32_LEAVES, DIAG_BLOCK_WIDTH, FLASH_KDA_TEMPLATE_BY_ABI, FLA_GDN_ABIS,
     FP32_BYTES, GDN_CHUNK64_TOKENS, KDA_MAX_AIC_CORES, KDA_WORKSPACE_SLOTS,
@@ -170,17 +180,29 @@ def _chunk_phases(c: LinearAttentionContract, ctx: OperatorPlanningContext, rows
     initialize = transfer(ctx, read=state * state_elem * c.use_initial_state) + Work(resources={
         "vector": state if c.use_initial_state else 2 * state, "mte3": state * elem,
     })
+    vf_gate, vf_inv, vf_cast, vf_state = (
+        arch35_gdn_vf_vector_ops(rows, c.dk, c.dv) if gdn_wy else (0, 0, 0, 0)
+    )
+    gate_vec = vf_gate if gdn_wy else (w.gate_ops + (2 * rows * (gate_width - 1) if kda else 0))
+    inv_vec = vf_inv if gdn_wy else (w.mask_ops + diagonal)
+    load_work = (
+        transfer(ctx, read=inputs) + Work(resources={
+            "mte2_aic": ARCH35_GDN_AIC_MTE2_QK_PANELS * key * elem,
+            "mte2_aiv": ARCH35_GDN_AIV_MTE2_QKV_PANELS * key * elem,
+        })
+        if gdn_wy else transfer(ctx, read=inputs)
+    )
     return (
         Phase("state_begin", initialize),
-        Phase("load_tokens", transfer(ctx, read=inputs)),
+        Phase("load_tokens", load_work),
         Phase("KKT_QKT", Work({cube_dtype: issued.kkt_flops + issued.qkt_flops},
                               {"mte1": 2 * cube_key * elem, "fixpipe": 2 * cube_score * FP32_BYTES}), ("load_tokens",)),
         Phase("gate_operands", Work(resources={
-            "vector": w.gate_ops + (2 * rows * (gate_width - 1) if kda else 0),
+            "vector": gate_vec,
             "mte3": (WY_PREPROCESSED_KEY_PANELS * key + value) * elem,
         }), ("load_tokens",)),
         Phase("mask_and_diagonal_inverse", Work(resources={
-            "vector": w.mask_ops + diagonal, "mte3": 2 * score * elem,
+            "vector": inv_vec, "mte3": 2 * score * elem,
         }), ("KKT_QKT", "gate_operands")),
         Phase("offdiagonal_inverse", Work({inverse_dtype: inverse}, {
             "mte1": inverse_operand_bytes, "fixpipe": inverse_operand_bytes // 2,
@@ -194,7 +216,7 @@ def _chunk_phases(c: LinearAttentionContract, ctx: OperatorPlanningContext, rows
         Phase("R_O_inter", Work({cube_dtype: issued.r_flops + issued.o_inter_flops}, {
             "mte1": (2 * cube_key + cube_state) * elem, "fixpipe": cube_value * FP32_BYTES,
         }), ("Kcd_U", "save_entry_state")),
-        Phase("R32_to_R16_UB_to_L1", Work(resources={"vector": w.cast_ops, "mte3": value * elem}),
+        Phase("R32_to_R16_UB_to_L1", Work(resources={"vector": vf_cast if gdn_wy else w.cast_ops, "mte3": value * elem}),
               ("R_O_inter",)),
         Phase("delta_L0C_to_UB", Work({cube_dtype: issued.delta_flops}, {
             "mte1": (cube_value + cube_key) * elem, "fixpipe": cube_state * FP32_BYTES,
@@ -203,7 +225,8 @@ def _chunk_phases(c: LinearAttentionContract, ctx: OperatorPlanningContext, rows
             "mte1": (cube_score + cube_value) * elem, "fixpipe": value * elem, "hbm": value * elem,
         }), ("delta_L0C_to_UB",)),
         Phase("S_next", Work(resources={
-            "vector": w.state_update_ops + state * (snapshot or kda), "mte3": state * elem * snapshot,
+            "vector": vf_state if gdn_wy else (w.state_update_ops + state * (snapshot or kda)),
+            "mte3": state * elem * snapshot,
         }), ("delta_L0C_to_UB",)),
         Phase("state_end", transfer(ctx, write=state * state_elem * c.output_final_state),
               ("S_next", "O_L0C_to_GM", "save_matrices")),
@@ -295,10 +318,16 @@ def _build_persistent(c: LinearAttentionContract, ctx: OperatorPlanningContext,
                     elif stage.name == "state_begin" and first:
                         stage = replace(stage, previous=("state_end",))
                     stages.append(stage)
+                chunk_sync_ms = arch35_gdn_chunk_sync_ms(rc) if (not kda and c.bt == GDN_CHUNK64_TOKENS) else 0.0
+                if chunk_sync_ms > 0.0:
+                    stages.append(arch35_gdn_extra_sync_stage("chunk_crosscore_sync", chunk_sync_ms, after=("S_next",)))
+                    for s_i, st in enumerate(stages):
+                        if st.name in {"R_O_inter", "save_entry_state"}:
+                            stages[s_i] = replace(st, previous=("chunk_crosscore_sync",))
                 stages.extend((replace(read, after=("state_end",)), last))
                 return tuple(stages)
 
-            pipe = PipelineProgram(ends[-1], CHUNK_RING_DEPTH, tile)
+            pipe = compact_lane_pipeline(rc, ends[-1], CHUNK_RING_DEPTH, tile)
             allocations = []
             for pool, size, kind, ids in (
                 ("ub", report.owner_ub_bytes, ctx.datapath.aiv_count, aivs),
@@ -697,6 +726,8 @@ class Arch35LinearAttentionStrategy:
         if not c.lengths:
             return make_plan(ctx, c.abi or c.operation, (),
                              metadata={"total_chunks": 0, "state_contraction_ops": 0})
+        if c.abi == RECURRENT_GDN_ABI:
+            return build_native_recurrent_gdn(c, ctx)
         if c.operation.endswith("_recurrent"):
             return _build_recurrent(c, ctx)
         if c.operation == "gdn_prefill" and c.bt != DIAG_BLOCK_WIDTH:

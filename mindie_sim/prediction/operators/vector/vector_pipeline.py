@@ -39,7 +39,13 @@ class AIVTiledVectorAndGatherRecipe:
 
     def bind_context(self, context):
         """Use declared sustainable DRAM service on the shared HBM bus."""
-        dram_rate = context.service_rate("mte2_aiv_dram")
+        submode = self.submode(context.op)
+        read_share = io_weight(context, "hbm_read")
+        write_share = io_weight(context, "hbm_write")
+        if submode != "write_only" and read_share > 0.0 and write_share > 0.0:
+            dram_rate = context.service_rate("hbm_rw21_dram") or context.service_rate("mte2_aiv_dram")
+        else:
+            dram_rate = context.service_rate("mte2_aiv_dram")
         if dram_rate is None:
             return context
         # Only service units change. Native HBM bytes and on-chip MTE2
@@ -89,7 +95,7 @@ class AIVTiledVectorAndGatherRecipe:
 
     def lower(self, context):
         submode = self.submode(context.op)
-        read_share = io_weight(context, "hbm")
+        read_share = io_weight(context, "hbm_read")
         write_share = io_weight(context, "hbm_write")
         if submode == "write_only":
             phases = (

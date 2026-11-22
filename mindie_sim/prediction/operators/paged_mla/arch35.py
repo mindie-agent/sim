@@ -20,6 +20,7 @@ from ...runtime.tile_solver import (
     LiveBufferSpec, TileCandidate, TileInfeasibleError, TilePipelineSpec, TileShape, solve,
 )
 from ..contracts import ArchStrategy, OperatorPlanningContext
+from ..sharedkv.split_core import resolve_fia_mla_tiling
 from ._lowering import SOFTMAX_STATE_SCALARS, PipelineLayout, RowCuts, fixpipe_rectangle_bytes, make_plan, owner_pairs
 from .common import (
     DSL_FLASH_ABI, DSL_MQS_ABI, FIA_ABI, FP32_BYTES, MQS_ABI,
@@ -373,6 +374,17 @@ class _DirectStrategy:
             ("probability", kvp_depth, "probability", "pv_operands"),
         )
         clocks = FLASH_CLOCKS if panel_width else DSL_MQS_CLOCKS if c.sinks else CLOCKS
+        if (c.abi == FIA_ABI and c.splits == 1 and not ctx.requests
+                and c.physical_heads >= FIA_M_TILE and max_extent > key_tile):
+            tiling = resolve_fia_mla_tiling(
+                sequences=c.sequences, physical_heads=c.physical_heads,
+                aic_count=ctx.effective_aic_cores, is_arch35=True,
+            )
+            head_groups = ceil_div(c.physical_heads, heads)
+            max_splits_per_group = max(1, ctx.effective_aic_cores // max(1, head_groups))
+            eff_splits = min(tiling.fd_splits_per_row, max_splits_per_group)
+            if eff_splits > 1:
+                c = replace(c, splits=eff_splits)
         layout = PipelineLayout(
             clocks, rings, heads, key_tile, resident_latent=resident,
             matrix_output=(direct.path.unit, direct.path.alignment_bytes),

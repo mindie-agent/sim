@@ -223,7 +223,8 @@ class ExecutionBindings:
         geometry = _stage_geometry(case, hardware)
         topology = Topology(
             case.machine, case.runtime.parallel, "",
-            collective_startup_mode=case.runtime.collective_startup_mode)
+            collective_startup_mode=case.runtime.collective_startup_mode,
+            primitive_table=primitive_table)
         datapaths = tuple(
             (
                 int(die.rank),

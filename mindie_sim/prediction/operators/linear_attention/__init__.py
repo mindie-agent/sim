@@ -108,7 +108,13 @@ def resolve_operator_plan(op: OpSpec, ctx: OperatorPlanningContext) -> ResolvedO
         else:
             plan = build_recover_ssm_plan(contract, ctx)
     else:
-        plan = strategy.build(op, ctx)
+        cann_ver = str(dict(op.metadata).get("cann_version", "") or "")
+        if strategy is _ARCH35 and contract.operation == "gdn_prefill" and cann_ver.startswith("9.2"):
+            # CANN 9.2.0 Arch35 OPP (chunk_gated_delta_rule_arch35.h) executes the 3-stage GM rolling kernel.
+            from .arch22 import _build_staged as _build_staged_gm
+            plan = _build_staged_gm(contract, ctx)
+        else:
+            plan = strategy.build(op, ctx)
     descriptor = describe(op, ctx, plan)
     return ResolvedOperator(ctx.occurrence, op, plan, descriptor.implementation,
                             descriptor.sources, descriptor)

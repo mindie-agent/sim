@@ -4,33 +4,29 @@
 [Role] Plane-1 offline calibration producer executing bounded synthetic NPU
   micro-benchmarks on idle physical Ascend A2/A3/A5 dies via endpoint alias
   and emitting full-envelope SHA-256 sealed ``data/primitives/*.json`` tables
-  plus ``data/primitives/manifest.json``.
+  plus ``data/primitives/manifest.json`` with honest SKU x CANN x primitive x
+  mode x metric coverage.
 [Invariants] Strictly offline Plane-1 tool outside ``mindie_sim/``. Checks
-  ``npu-smi info`` before touching any NPU so only idle cards (0% AICore,
-  zero competing processes) are used; caps synthetic HBM allocations <= 4 GiB;
-  runs 30-GEMM DVFS lock, >= 3x L2 cold rotating rings vs L2-hot single buffer,
-  and 2.5 ms StreamBlocker saturation; enforces cv_pct <= 5.0% and
-  certified_upper_capacity >= p99; never emits raw IPs, hostnames, usernames,
-  or host $HOME paths into JSON artifacts.
+  ``npu-smi info`` before touching any die (including peer die for HCCL
+  P18/P19); caps HBM <= 4 GiB; enforces cv_pct <= 5.0% and
+  certified_upper_capacity >= p99; surfaces any p99 > nominal conflict loudly
+  in ``metric_diagnostics`` without silently inflating bounds; never emits
+  raw IPs, hostnames, usernames, or host $HOME paths.
 [Timeouts & Locks] Bounded SSH/remote subprocess execution with unconditional
   remote temporary directory cleanup on exit; targets idle NPU dies only.
-[Side-Effect Policy] Writes only the requested ``--out`` JSON table and
-  ``--manifest`` index; cleans up remote temporary files unconditionally.
+[Side-Effect Policy] Writes only the requested ``--out`` JSON table, sibling
+  ``captures/*.capture.json``, and ``--manifest`` index.
 """
 from __future__ import annotations
 
 import argparse
-import base64
 from datetime import datetime, timezone
 import hashlib
 import json
 import math
-from pathlib import Path
 import os
-import re
-import shlex
+from pathlib import Path
 import statistics
-import subprocess
 import sys
 from typing import Any
 
@@ -38,30 +34,99 @@ _PARENTS = Path(__file__).resolve().parents
 REPO_ROOT = _PARENTS[1] if len(_PARENTS) > 1 else _PARENTS[0]
 if (REPO_ROOT / "mindie_sim").is_dir() and str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-PRIMITIVE_SCHEMA_VERSION = "mindie-l0-primitives/1"
-RESULT_MARKER = "__MINDIE_L0_BENCH_JSON__:"
-MAX_CALIBRATED_CV_PCT = 5.0
-MAX_IDLE_AICORE_UTIL_PCT = 2
-MAX_IDLE_HBM_UTIL_PCT = 10
-WARMUP_GEMM_ITERS = 30
-WARMUP_GEMM_DIM = 4096
-BLOCKER_TARGET_MS = 2.5
-MIN_SINGLE_GEMM_MS = 0.05
-DEFAULT_WARMUP = 8
-DEFAULT_REPEATS = 32
-TRIM_FRACTION = 0.10
-MIB = 1024 * 1024
-GIB = 1024 * 1024 * 1024
-SSH_CONNECT_TIMEOUT_S = 8
-REMOTE_BENCH_TIMEOUT_S = 360
-IPV4_QUAD_RE = re.compile(r"(?<!\d)\d{1,3}(?:[._-]\d{1,3}){3}(?!\d)")
-PRIVATE_CAPTURE_RE = re.compile(
-    r"(?<![\d.])(?:\d{1,3}[._-]){3}\d{1,3}(?![\d.])|/(?:Users|home|root)/[^\s\"']*|[^\s\"']*@[^\s\"']+|\$\{?HOME\}?"
+from _bench_l0_bounds import (
+    MAX_CALIBRATED_CV_PCT,
+    ROUND_METRIC_DIGITS,
+    SIMT_UB_CARVEOUT_MIN_BYTES,
+    SIMT_WARP_SCHEDULERS,
+    TWO,
+    apply_core_clock_scale as _apply_core_clock_scale,
+    derive_burst_turn_rules as _derive_burst_turn_rules,
+    load_sku_hardware_spec as _load_sku_hardware_spec,
+    summarize_metric,
+    summarize_samples,
 )
-SAFE_ALIAS_RE = re.compile(r"[^a-z0-9._-]+")
-SAFE_CONTAINER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
-SAFE_VISIBLE_RE = re.compile(r"^[0-9]+(?:,[0-9]+)*$")
+from _bench_l0_probes import DEFAULT_REPEATS, DEFAULT_WARMUP, RESULT_MARKER, run_local_npu_microbenchmarks
+from _bench_l0_remote import (
+    JSON_INDENT,
+    PRIMITIVE_SCHEMA_VERSION,
+    assert_no_privacy_leak,
+    canonical_capture_bytes,
+    check_idle_die as _check_idle_die,
+    check_local_idle_die as _check_local_idle_die,
+    coverage_summary as _coverage_summary,
+    load_endpoint as _load_endpoint,
+    parse_npu_smi_idle_die,
+    run_remote_calibration as _run_remote_calibration,
+    sanitize_capture_obj as _sanitize_capture_obj,
+    sanitize_record_alias,
+    ssh_run as _ssh_run,
+    unwrap_raw_measurements,
+    update_manifest,
+    validate_quantitative_curves,
+)
+
+SECTOR_BYTES = 32
+FRACTAL_BYTES = 512
+UB_SPLIT_N_ALIGN = 32
+L2_LINE_BYTES = 512
+ARCH22_L2_GRANULE_BYTES = 512
+ARCH35_L2_GRANULE_BYTES = 128
+ARCH22_HBM_BURST_GRANULE_BYTES = 512
+ARCH35_HBM_BURST_GRANULE_BYTES = 256
+ARCH35_HBM_SCATTER_ROW_OPEN_BYTES = 2048
+FIXPIPE_IN_TO_OUT_RATIO = 2.0
+ARCH35_NZ2DN_STRIDE_GT1_DIV = 4
+ARCH35_TRANSPOSE_L0B_FACTOR = 0.5
+ARCH35_MX_SCALE_BYTES_PER_CYC = 32
+HCCL_TWO_RANK_GROUP = 2
+ADMISSIBLE_ALPHA_MAX = 1.0
+TILE_1 = 1
+TILE_4 = 4
+TILE_8 = 8
+TILE_16 = 16
+TILE_32 = 32
+TILE_64 = 64
+DAV22_FP32_RATIO_VS_BF16 = 4.0
+DAV35_FP32_RATIO_VS_BF16 = 16.0
+HF32_RATIO_VS_BF16 = 2.0
+PIPE_M_BARRIER_FRACTALS = 10
+VEC_WIDTH_BYTES = 256
+FP32_LANES = 64
+BF16_LANES = 128
+DAV22_UB_BANK_GROUPS = 16
+DAV22_UB_BANKS_PER_GROUP = 3
+DAV22_UB_BANK_SIZE_BYTES = 4096
+DAV35_UB_BANK_GROUPS = 8
+DAV35_UB_BANKS_PER_GROUP = 2
+DAV35_UB_BANK_SIZE_BYTES = 16384
+MX_SCALE_GROUP = 32
+ARCH35_HIST_TRUNK = 16384
+SORTALL_LENGTHS = (64, 128, 256, 512, 1024, 2048)
+TLA_MAX_THREADS = 2048
+CATLASS_MAX_THREADS = 1024
+SIMT_WARP_SIZE = 32
+EVENT_IDS_COUNT = 8
+AIV_BARRIER_ID = 8
+AIC_BARRIER_ID = 9
+INTRA_SUBBLOCK_BARRIER_ID = 10
+FFTS_MAX_FLAG_ID = 7
+FFTS_HW_FLAG_IDS = 16
+FFTS_REVERSE_DEPTH = 15
+HW_MUTEX_IDS = 32
+MAX_MUTEX_IDS = 28
+STARS_QUEUE_DEPTH = 64
+ARCH35_FRAME_PAYLOAD = 480
+ARCH35_FRAME_WIRE = 512
+ARCH22_FRAME_BYTES = 1024
+DEFAULT_L2_ARG = 134217728
+DEFAULT_AIC_ARG = 32
+DEFAULT_AIV_ARG = 64
+ARCH22_CORE_MODES = ("bf16", "fp16", "fp32", "int8")
+ARCH35_EXTRA_MODES = ("fp8_e4m3", "fp8_e5m2", "hifloat8", "mxfp8", "mxfp4")
 
 SKU_DEFAULT_FILES = {
     "Ascend910B4": "arch22_a2_910b4.json",
@@ -76,345 +141,6 @@ def compute_envelope_sha256(payload: dict[str, Any]) -> str:
     body = {k: v for k, v in payload.items() if k != "envelope_sha256"}
     raw = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
     return hashlib.sha256(raw).hexdigest()
-
-
-def sanitize_record_alias(alias: str, sku: str) -> str:
-    """Return a clean public endpoint alias with zero raw IPv4 quads or host paths."""
-    cleaned = IPV4_QUAD_RE.sub("", alias.lower()).strip("._-")
-    cleaned = SAFE_ALIAS_RE.sub("-", cleaned).strip("-")
-    if not cleaned or cleaned in {"a2", "a3", "a5", "host", "default"}:
-        return f"lab-{SAFE_ALIAS_RE.sub('-', sku.lower()).strip('-')}"
-    return cleaned
-
-
-def _quantile(sorted_vals: list[float], q: float) -> float:
-    if not sorted_vals:
-        return 0.0
-    if len(sorted_vals) == 1:
-        return float(sorted_vals[0])
-    pos = q * (len(sorted_vals) - 1)
-    lo, hi = int(math.floor(pos)), int(math.ceil(pos))
-    return float(sorted_vals[lo]) if lo == hi else float(sorted_vals[lo] * (1.0 - (pos - lo)) + sorted_vals[hi] * (pos - lo))
-
-
-def summarize_samples(samples: list[float], *, certified_bound: float, bound_kind: str = "rate_upper") -> dict[str, Any]:
-    """Compute untrimmed (p05,p50,p95,p99,cv_pct) + 10%-trimmed stats under hardware ceiling."""
-    clean = sorted(float(x) for x in samples if math.isfinite(x) and x >= 0.0)
-    nom = round(float(certified_bound), 6)
-    if not clean:
-        return {"certified_upper_capacity": nom, "bound_kind": bound_kind}
-    n = len(clean)
-    mean_v = sum(clean) / n
-    cv_pct = (100.0 * statistics.stdev(clean) / mean_v) if (n >= 2 and mean_v > 0.0) else 0.0
-    trim_k = int(math.floor(n * TRIM_FRACTION))
-    trimmed = clean[trim_k : n - trim_k] if n - 2 * trim_k >= 2 else clean
-    t_mean = sum(trimmed) / len(trimmed)
-    t_cv = (100.0 * statistics.stdev(trimmed) / t_mean) if (len(trimmed) >= 2 and t_mean > 0.0) else 0.0
-    p05, p50, p95, p99 = (_quantile(clean, q) for q in (0.05, 0.50, 0.95, 0.99))
-    # Never silently inflate a rate ceiling above the owning hardware declaration.
-    exceeded = (p99 > float(certified_bound) or p05 <= 0.0) if bound_kind == "rate_upper" else (p05 < float(certified_bound))
-    if exceeded:
-        return {"certified_upper_capacity": nom, "bound_kind": bound_kind}
-    return {
-        "p05": round(p05, 6), "p50": round(p50, 6), "p95": round(p95, 6), "p99": round(p99, 6),
-        "trimmed_mean": round(t_mean, 6), "trimmed_cv_pct": round(t_cv, 4),
-        "cv_pct": round(cv_pct, 4), "n_samples": n,
-        "certified_upper_capacity": nom, "bound_kind": bound_kind,
-    }
-
-
-def _load_sku_hardware_spec(sku: str) -> dict[str, Any]:
-    from mindie_sim.backends import ascend
-    from mindie_sim.schema.datapath import datapath_for_die
-    from mindie_sim.schema.hardware import Hardware
-
-    hw = Hardware.from_mapping(ascend({"sku": sku, "num_devices": 1}))
-    die = hw.dies[0]
-    dp = datapath_for_die(die)
-    bufs, rates, sm = dict(die.buffers), dict(die.rates), dict(die.service_modes)
-    tc = {k: dict(v) for k, v in hw.transfer_channels}
-    h2d, d2h, d2d = tc.get("h2d", {}), tc.get("d2h", {}), tc.get("d2d_intra_node", {})
-    h2d_solo = float(h2d.get("solo_effective_uni_bw_gbps") or h2d.get("uni_peak_bw_gbps") or 0.0) * 1e9
-    d2h_solo = float(d2h.get("solo_effective_uni_bw_gbps") or d2h.get("uni_peak_bw_gbps") or 0.0) * 1e9
-    h2d_rc = float(h2d.get("node_peak_bw_gbps") or 0.0) * 1e9 or h2d_solo
-    d2h_rc = float(d2h.get("node_peak_bw_gbps") or 0.0) * 1e9 or d2h_solo
-    link_uni = float(d2d.get("uni_peak_bw_gbps") or d2d.get("effective_uni_bw_gbps") or 0.0) * 1e9
-    return {
-        "sku": sku, "arch_preset": str(die.compute_arch.preset or "npu_arch_2201"),
-        "aic_count": int(dp.aic_count), "aiv_count": int(dp.aiv_count),
-        "hbm_gib": int(die.memory_bytes // GIB),
-        "l2_bytes": int(bufs.get("l2", 0)), "ub_bytes": int(bufs.get("ub", 0)),
-        "l1_bytes": int(bufs.get("l1", 0)), "l0a_bytes": int(bufs.get("l0a", 0)),
-        "l0b_bytes": int(bufs.get("l0b", 0)), "l0c_bytes": int(bufs.get("l0c", 0)),
-        "has_l0c_to_ub": bool(dp.has_l0c_to_ub), "has_ub_to_l1": bool(dp.has_ub_to_l1),
-        "simt_ub_carveout_bytes": int(dp.simt_ub_carveout_bytes),
-        "hbm_read_bytes_per_s": float(dp.hbm_read_bytes_per_s or rates.get("hbm", 0.0)),
-        "hbm_write_bytes_per_s": float(dp.hbm_write_bytes_per_s or rates.get("hbm", 0.0)),
-        "l2_bytes_per_s": float(rates.get("l2", rates.get("mte2_aiv", 0.0) * 2.0)),
-        "mte1_l0a_bytes_per_s": float(sm["mte1_l0a"][1]) if "mte1_l0a" in sm else float(rates.get("mte1", 0.0)),
-        "mte1_l0b_bytes_per_s": float(sm["mte1_l0b"][1]) if "mte1_l0b" in sm else float(rates.get("mte1", 0.0)),
-        "mte2_aic_bytes_per_s": float(sm["mte2_aic_l2"][1]) if "mte2_aic_l2" in sm else float(rates.get("mte2_aic", 0.0)),
-        "mte2_aiv_bytes_per_s": float(sm["mte2_aiv_l2"][1]) if "mte2_aiv_l2" in sm else float(rates.get("mte2_aiv", 0.0)),
-        "mte3_bytes_per_s": float(rates.get("mte3", 0.0)),
-        "atomic_rmw_bytes_per_s": float(sm["hbm_atomic_rmw"][1]) if "hbm_atomic_rmw" in sm else float(dp.hbm_write_bytes_per_s or rates.get("hbm", 0.0)),
-        "fixpipe_bytes_per_s": float(rates.get("fixpipe", 0.0)),
-        "vector_ops_per_s": float(rates.get("vector", 0.0)),
-        "vec_alu_ops_per_s": float(rates.get("reg_alu_lanes", rates.get("vector", 0.0) * 2.0)),
-        "vec_sfu_ops_per_s": float(rates.get("reg_special_lanes", rates.get("vector", 0.0))),
-        "vec_reduce_ops_per_s": float(rates.get("reg_reduce_lanes", rates.get("vector", 0.0))),
-        "cast_bytes_per_s": float(rates.get("ub_write_bytes", rates.get("mte2_aiv", 0.0))),
-        "link_bytes_per_s": link_uni or 2.5e10,
-        "host_h2d_bytes_per_s": h2d_solo or 3.15e10,
-        "host_d2h_bytes_per_s": d2h_solo or 3.15e10,
-        "host_rc_h2d_bytes_per_s": h2d_rc or 2.0e11,
-        "host_rc_d2h_bytes_per_s": d2h_rc or 2.0e11,
-        "peaks": {str(k): float(v) for k, v in dict(die.compute_peaks).items()},
-    }
-
-
-def run_local_npu_microbenchmarks(
-    *, device_id: int, l2_bytes: int, aic_count: int, aiv_count: int,
-    arch_preset: str, warmup: int = DEFAULT_WARMUP, repeats: int = DEFAULT_REPEATS,
-) -> dict[str, Any]:
-    """Execute bounded live Ascend NPU micro-benchmarks on one idle device."""
-    import time
-    import torch
-    import torch_npu
-
-    del arch_preset
-    torch.npu.set_device(device_id)
-    dev = torch.device(f"npu:{device_id}")
-    wa = torch.randn((WARMUP_GEMM_DIM, WARMUP_GEMM_DIM), dtype=torch.bfloat16, device=dev)
-    wb = torch.randn((WARMUP_GEMM_DIM, WARMUP_GEMM_DIM), dtype=torch.bfloat16, device=dev)
-    for _ in range(WARMUP_GEMM_ITERS):
-        _ = torch.matmul(wa, wb)
-    torch.npu.synchronize()
-
-    s0, e0 = torch.npu.Event(enable_timing=True), torch.npu.Event(enable_timing=True)
-    s0.record()
-    _ = torch.matmul(wa, wb)
-    e0.record()
-    torch.npu.synchronize()
-    blocker_reps = max(1, math.ceil(BLOCKER_TARGET_MS / max(MIN_SINGLE_GEMM_MS, float(s0.elapsed_time(e0)))))
-
-    def _time_ms(fn, *, inner: int = 1, blocker: bool = False) -> list[float]:
-        for i in range(warmup):
-            fn(i)
-        torch.npu.synchronize()
-        if blocker:
-            evs = [(torch.npu.Event(enable_timing=True), torch.npu.Event(enable_timing=True)) for _ in range(repeats)]
-            for _ in range(blocker_reps):
-                _ = torch.matmul(wa, wb)
-            for idx, (se, ee) in enumerate(evs):
-                se.record()
-                for k in range(inner):
-                    fn(idx * inner + k)
-                ee.record()
-            torch.npu.synchronize()
-            return [max(1e-6, float(se.elapsed_time(ee)) / inner) for se, ee in evs]
-        out: list[float] = []
-        for idx in range(repeats):
-            se, ee = torch.npu.Event(enable_timing=True), torch.npu.Event(enable_timing=True)
-            se.record()
-            for k in range(inner):
-                fn(idx * inner + k)
-            ee.record()
-            torch.npu.synchronize()
-            out.append(max(1e-6, float(se.elapsed_time(ee)) / inner))
-        return out
-
-    raw: dict[str, Any] = {"device_name": str(torch.npu.get_device_name(device_id)), "torch_version": str(torch.__version__), "torch_npu_version": str(torch_npu.__version__), "blocker_reps": blocker_reps}
-
-    slab = 64 * MIB
-    n_slots = min(14, max(6, math.ceil(max(3 * l2_bytes, 384 * MIB) / slab)))
-    ring_a = [torch.ones((slab // 2,), dtype=torch.bfloat16, device=dev) for _ in range(n_slots)]
-    ring_b = [torch.ones((slab // 2,), dtype=torch.bfloat16, device=dev) for _ in range(n_slots)]
-    ring_c = [torch.empty((slab // 2,), dtype=torch.bfloat16, device=dev) for _ in range(n_slots)]
-    w_ms = _time_ms(lambda i: ring_c[i % n_slots].fill_(1.0), inner=2, blocker=True)
-    rw11_ms = _time_ms(lambda i: ring_c[i % n_slots].copy_(ring_a[i % n_slots]), inner=2, blocker=True)
-    rw21_ms = _time_ms(lambda i: torch.add(ring_a[i % n_slots], ring_b[i % n_slots], out=ring_c[i % n_slots]), inner=2, blocker=True)
-    rd_ms = _time_ms(lambda i: torch.amax(ring_a[i % n_slots]), inner=2, blocker=True)
-    hbm_w = [slab / (t * 1e-3) for t in w_ms]
-    hbm_rw11, hbm_rw21 = [(2.0 * slab) / (t * 1e-3) for t in rw11_ms], [(3.0 * slab) / (t * 1e-3) for t in rw21_ms]
-    hbm_r = [max(slab / (tr * 1e-3), (2.0 / 3.0) * rw) for tr, rw in zip(rd_ms, hbm_rw21)]
-    t_r1, t_w1 = slab / max(1.0, statistics.median(hbm_r)) * 1e3, slab / max(1.0, statistics.median(hbm_w)) * 1e3
-    alphas = [max(0.0, min(1.0, (t11 - max(t_r1, t_w1)) / max(1e-9, min(t_r1, t_w1)))) for t11 in rw11_ms]
-    s_src, s_dst = ring_a[0][: 32768 * 1024].view(32768, 1024), torch.empty((32768, 256), dtype=torch.bfloat16, device=dev)
-    strided_bps = [(2.0 * 32768 * 512.0) / (t * 1e-3) for t in _time_ms(lambda _i: s_dst.copy_(s_src[:, :256]), inner=2, blocker=True)]
-    del ring_a, ring_b, ring_c, s_src, s_dst
-    torch.npu.empty_cache()
-
-    warm_bytes = min(32 * MIB, max(8 * MIB, l2_bytes // 4))
-    w_src, w_dst = torch.ones((warm_bytes // 2,), dtype=torch.bfloat16, device=dev), torch.empty((warm_bytes // 2,), dtype=torch.bfloat16, device=dev)
-    l2_bps = [(2.0 * warm_bytes) / (t * 1e-3) for t in _time_ms(lambda _i: w_dst.copy_(w_src), inner=8, blocker=True)]
-    mte3_warm = [(warm_bytes / (t * 1e-3)) / max(1, aiv_count) for t in _time_ms(lambda _i: w_dst.fill_(1.0), inner=8, blocker=True)]
-    a_dst, a_idx, a_src = torch.zeros((65536,), dtype=torch.float32, device=dev), torch.arange(262144, dtype=torch.int64, device=dev) % 65536, torch.ones((262144,), dtype=torch.float32, device=dev)
-    atom_bps = [(2.0 * 262144 * 4.0) / (t * 1e-3) for t in _time_ms(lambda _i: a_dst.index_add_(0, a_idx, a_src), inner=8, blocker=True)]
-    del w_src, w_dst, a_dst, a_idx, a_src
-    torch.npu.empty_cache()
-    raw["P01_datacopy"] = {"hbm_read_bytes_per_s": hbm_r, "hbm_write_bytes_per_s": hbm_w, "hbm_rw11_bytes_per_s": hbm_rw11, "hbm_rw21_bytes_per_s": hbm_rw21, "hbm_rw_alpha": alphas, "strided_512b_bytes_per_s": strided_bps, "l2_die_bytes_per_s": l2_bps, "mte2_aiv_hit_bytes_per_s_per_core": [bw / max(1, aiv_count) for bw in l2_bps]}
-    raw["P04_mte3_store"] = {"mte3_warm_bytes_per_s_per_aiv": mte3_warm, "atomic_rmw_bytes_per_s": atom_bps}
-
-    # P05: L2 working-set sweep with independent per-trial interpolated knees (no duplicated scalars)
-    ws_curve: dict[str, float] = {}
-    ws_trials: dict[int, list[float]] = {}
-    ws_list = (8, 32, 64, 96, 128, 160, 192, 256, 320)
-    for ws_mib in ws_list:
-        xb = torch.ones(((ws_mib * MIB) // 4,), dtype=torch.bfloat16, device=dev)
-        yb = torch.empty_like(xb)
-        ts = _time_ms(lambda _i: yb.copy_(xb), inner=4 if ws_mib <= 64 else 1, blocker=True)
-        bws = [(ws_mib * MIB) / (t * 1e-3) for t in ts]
-        ws_trials[ws_mib] = bws
-        ws_curve[f"{ws_mib}MiB"] = round(statistics.median(bws), 2)
-        del xb, yb
-    torch.npu.empty_cache()
-    eff_fracs: list[float] = []
-    for idx in range(repeats):
-        trial_bws = [ws_trials[m][idx] for m in ws_list]
-        t_peak, t_cold = max(trial_bws), trial_bws[-1]
-        t_thr = t_cold + 0.5 * max(0.0, t_peak - t_cold)
-        knee_mib = float(ws_list[0])
-        for pos in range(len(ws_list) - 1):
-            b0, b1 = trial_bws[pos], trial_bws[pos + 1]
-            if b0 >= t_thr:
-                knee_mib = float(ws_list[pos])
-                if b1 < t_thr and b0 > b1:
-                    frac = (b0 - t_thr) / (b0 - b1)
-                    knee_mib = float(ws_list[pos]) + frac * float(ws_list[pos + 1] - ws_list[pos])
-        eff_fracs.append(min(1.0, max(0.05, (knee_mib * MIB) / max(1, l2_bytes))))
-    raw["P05_l2_residency_reuse"] = {
-        "ws_sweep_bytes_per_s": ws_curve, "ws_sweep_grid_mib": list(ws_list),
-        "l2_knee_mib": round(statistics.median(eff_fracs) * l2_bytes / MIB, 2),
-        "l2_effective_fraction": eff_fracs, "l2_die_bytes_per_s": l2_bps,
-    }
-
-    # P06: Cube Mmad saturation + small-M sweep
-    mm_flops = 2.0 * (4096 ** 3)
-    mm_modes: dict[str, list[float]] = {}
-    for m_name, dt in (("bf16", torch.bfloat16), ("fp16", torch.float16), ("fp32", torch.float32)):
-        ma = torch.randn((4096, 4096), dtype=dt, device=dev)
-        mb = torch.randn((4096, 4096), dtype=dt, device=dev)
-        mm_modes[m_name] = [(mm_flops / (t * 1e-3)) / max(1, aic_count) for t in _time_ms(lambda _i: torch.matmul(ma, mb), inner=2, blocker=True)]
-        del ma, mb
-    try:
-        if hasattr(torch_npu, "npu_quant_matmul"):
-            qa = torch.randint(-8, 8, (4096, 4096), dtype=torch.int8, device=dev)
-            qb = torch.randint(-8, 8, (4096, 4096), dtype=torch.int8, device=dev)
-            sc = torch.ones((4096,), dtype=torch.float32, device=dev)
-            mm_modes["int8"] = [(mm_flops / (t * 1e-3)) / max(1, aic_count) for t in _time_ms(
-                lambda _i: torch_npu.npu_quant_matmul(qa, qb, sc, output_dtype=torch.bfloat16), inner=2, blocker=True)]
-            del qa, qb, sc
-    except Exception:
-        pass
-    sm_ns: dict[str, float] = {}
-    mb_sm = torch.randn((4096, 4096), dtype=torch.bfloat16, device=dev)
-    for mv in (1, 16, 32, 64, 128, 256):
-        ma_sm = torch.randn((mv, 4096), dtype=torch.bfloat16, device=dev)
-        sm_ns[str(mv)] = round(statistics.median(_time_ms(lambda _i: torch.matmul(ma_sm, mb_sm), inner=4, blocker=True)) * 1e6, 2)
-        del ma_sm
-    del mb_sm
-    torch.npu.empty_cache()
-    raw["P06_mmad"] = {"modes": mm_modes, "small_m_bf16_ns": sm_ns}
-
-    # P07 / P08 / P09 / P10: Vector & Sort/TopK
-    va = torch.randn((2048, 2048), dtype=torch.float32, device=dev)
-    vb = torch.randn((2048, 2048), dtype=torch.float32, device=dev)
-    vc = torch.empty_like(va)
-    elems = 2048 * 2048
-    raw["P07_vec_alu"] = {"vec_alu_ops_per_s_per_aiv": [
-        (2.0 * elems / (t * 1e-3)) / max(1, aiv_count) for t in _time_ms(lambda _i: torch.addcmul(va, va, vb, out=vc), inner=8, blocker=True)]}
-    raw["P08_vec_sfu"] = {"vec_sfu_ops_per_s_per_aiv": [
-        (elems / (t * 1e-3)) / max(1, aiv_count) for t in _time_ms(lambda _i: torch.exp(va, out=vc), inner=8, blocker=True)]}
-    raw["P09_vec_reduce_cast"] = {
-        "vec_reduce_ops_per_s_per_aiv": [(elems / (t * 1e-3)) / max(1, aiv_count) for t in _time_ms(lambda _i: torch.sum(va, dim=-1), inner=8, blocker=True)],
-        "cast_bytes_per_s_per_aiv": [(elems * 6.0 / (t * 1e-3)) / max(1, aiv_count) for t in _time_ms(lambda _i: va.to(torch.bfloat16), inner=8, blocker=True)],
-    }
-    del va, vb, vc
-    sx = torch.randn((256, 2048), dtype=torch.float32, device=dev)
-    raw["P10_sort_topk"] = {"sort_elems_per_s": [
-        (256 * 2048) / (t * 1e-3) for t in _time_ms(lambda _i: torch.topk(sx, k=128, dim=-1), inner=4, blocker=True)]}
-    del sx
-    torch.npu.empty_cache()
-
-    # P15 & P16: STARS / RTS & Multi-stream Event
-    ta, tb, to = torch.ones((1,), dtype=torch.bfloat16, device=dev), torch.ones((1,), dtype=torch.bfloat16, device=dev), torch.empty((1,), dtype=torch.bfloat16, device=dev)
-    aa, ab = torch.ones((1, 16), dtype=torch.bfloat16, device=dev), torch.ones((16, 16), dtype=torch.bfloat16, device=dev)
-    for _ in range(warmup):
-        torch.add(ta, tb, out=to)
-    torch.npu.synchronize()
-    host_ns: list[float] = []
-    for _ in range(repeats):
-        t0 = time.perf_counter_ns()
-        for _ in range(64):
-            torch.add(ta, tb, out=to)
-        host_ns.append((time.perf_counter_ns() - t0) / 64.0)
-    torch.npu.synchronize()
-    aiv_f = [t * 1e6 for t in _time_ms(lambda _i: torch.add(ta, tb, out=to), inner=1, blocker=True)]
-    aic_f = [t * 1e6 for t in _time_ms(lambda _i: torch.matmul(aa, ab), inner=1, blocker=True)]
-    b16 = _time_ms(lambda _i: torch.add(ta, tb, out=to), inner=16, blocker=True)
-    b64 = _time_ms(lambda _i: torch.add(ta, tb, out=to), inner=64, blocker=True)
-    # Independent marginal per-descriptor start delta: (T(64) - T(16)) / 48.
-    q_ns = [max(1.0, ((t64 * 64.0) - (t16 * 16.0)) / 48.0 * 1e6) for t16, t64 in zip(b16, b64)]
-    raw["P15_rts_stars"] = {"host_submit_ns": host_ns, "issue_interval_ns": q_ns, "aiv_first_issue_ns": aiv_f, "aic_first_issue_ns": aic_f}
-
-    s_alt, ev_sync = torch.npu.Stream(device=dev), torch.npu.Event(enable_timing=False)
-    for _ in range(warmup):
-        ev_sync.record()
-        s_alt.wait_event(ev_sync)
-    torch.npu.synchronize()
-    se_ns = [t * 1e6 for t in _time_ms(lambda _i: (ev_sync.record(), s_alt.wait_event(ev_sync)), inner=32, blocker=True)]
-    raw["P16_multistream_core_control"] = {"stream_event_ns": se_ns}
-
-    # P20: Host-Device H2D/D2H DMA & Eager D2H sync
-    dma_bytes = 32 * MIB
-    h_pin = torch.ones((dma_bytes // 4,), dtype=torch.float32).pin_memory()
-    d_buf = torch.empty((dma_bytes // 4,), dtype=torch.float32, device=dev)
-    for _ in range(warmup):
-        d_buf.copy_(h_pin, non_blocking=False)
-        h_pin.copy_(d_buf, non_blocking=False)
-    torch.npu.synchronize()
-    h2d_bps, d2h_bps = [], []
-    for _ in range(repeats):
-        t0 = time.perf_counter_ns()
-        for _ in range(4):
-            d_buf.copy_(h_pin, non_blocking=False)
-        torch.npu.synchronize()
-        h2d_bps.append((4.0 * dma_bytes) / max(1e-9, (time.perf_counter_ns() - t0) * 1e-9))
-        t0 = time.perf_counter_ns()
-        for _ in range(4):
-            h_pin.copy_(d_buf, non_blocking=False)
-        torch.npu.synchronize()
-        d2h_bps.append((4.0 * dma_bytes) / max(1e-9, (time.perf_counter_ns() - t0) * 1e-9))
-    sp_pin, sp_page = torch.ones((1024,), dtype=torch.float32).pin_memory(), torch.ones((1024,), dtype=torch.float32)
-    sp_dev = torch.empty((1024,), dtype=torch.float32, device=dev)
-    pin_ns, page_ns, eager_ns = [], [], []
-    for _ in range(warmup):
-        sp_dev.copy_(sp_pin, non_blocking=False)
-        sp_dev.copy_(sp_page, non_blocking=False)
-        _ = float(ta.item())
-    torch.npu.synchronize()
-    for _ in range(repeats):
-        t0 = time.perf_counter_ns()
-        for _ in range(8):
-            sp_dev.copy_(sp_pin, non_blocking=False)
-        torch.npu.synchronize()
-        pin_ns.append((time.perf_counter_ns() - t0) / 8.0)
-        t0 = time.perf_counter_ns()
-        for _ in range(8):
-            sp_dev.copy_(sp_page, non_blocking=False)
-        torch.npu.synchronize()
-        page_ns.append((time.perf_counter_ns() - t0) / 8.0)
-        t0 = time.perf_counter_ns()
-        for _ in range(8):
-            _ = float(ta.item())
-        eager_ns.append((time.perf_counter_ns() - t0) / 8.0)
-    raw["P20_host_dma_sync"] = {
-        "host_h2d_bytes_per_s": h2d_bps, "host_d2h_bytes_per_s": d2h_bps,
-        "pinned_dma_startup_ns": pin_ns, "pageable_dma_startup_ns": page_ns, "eager_d2h_sync_ns": eager_ns,
-    }
-    del wa, wb, h_pin, d_buf, sp_pin, sp_page, sp_dev, ta, tb, to, aa, ab
-    torch.npu.empty_cache()
-    return raw
 
 
 def _cell_status(bands: dict[str, dict[str, Any]]) -> str:
@@ -432,40 +158,453 @@ def _clean_band(b: dict[str, Any]) -> dict[str, Any]:
     return {"certified_upper_capacity": b["certified_upper_capacity"], "bound_kind": b.get("bound_kind", "rate_upper")}
 
 
-def _sanitize_capture_obj(obj: Any) -> Any:
-    if isinstance(obj, str):
-        return PRIVATE_CAPTURE_RE.sub("redacted", obj)
-    if isinstance(obj, dict):
-        return {PRIVATE_CAPTURE_RE.sub("redacted", str(k)): _sanitize_capture_obj(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return [_sanitize_capture_obj(v) for v in obj]
-    return obj
-
-
-def canonical_capture_bytes(sku: str, raw_measurements: dict[str, Any] | None) -> bytes:
-    """Serialize sanitized raw calibration samples/summary to canonical JSON bytes."""
-    payload = _sanitize_capture_obj(raw_measurements) if raw_measurements else {"sku": sku, "status": "unmeasured"}
-    body = {"tag": "campaign", "payload": payload}
-    return (json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=True) + "\n").encode("utf-8")
-
-
 def _bound_only(value: float, kind: str = "rate_upper") -> dict[str, Any]:
-    return {"certified_upper_capacity": round(float(value), 6), "bound_kind": kind}
+    return {"certified_upper_capacity": round(float(value), ROUND_METRIC_DIGITS), "bound_kind": kind}
+
+
+def _peer_transport_name(dies_per_package: int, is_arch35: bool) -> str:
+    if is_arch35:
+        return "a5_ub_shmem_mte"
+    return "a3_sio_hccs" if dies_per_package >= 2 else "a2_hccs_mesh"
+
+
+def _filter_p01_scaling_curve(
+    raw_curve: Any, *, hbm_cap: float, mte2_cap: float, warm: bool, allow_core: bool,
+) -> tuple[dict[str, float], dict[str, Any]]:
+    """Validate active-core scaling points against certified bounds and profile consistency."""
+    if not isinstance(raw_curve, dict) or not raw_curve:
+        return {}, {}
+    if not allow_core:
+        return {}, {"status": "quarantined_silicon_profile_conflict"}
+    eps = 1.0 + 1e-6
+    clean: dict[str, float] = {}
+    for k, v in raw_curve.items():
+        if not str(k).isdigit() or not isinstance(v, (int, float)) or isinstance(v, bool):
+            return {}, {"status": "quarantined_invalid_entry", "key": str(k)}
+        kc, fv = int(k), float(v)
+        if kc < 1 or not math.isfinite(fv) or fv <= 0.0:
+            return {}, {"status": "quarantined_nonpositive", "key": str(k)}
+        if not warm and hbm_cap > 0.0 and fv > hbm_cap * eps:
+            return {}, {"status": "quarantined_exceeds_hbm_capacity", "key": str(k), "observed": fv, "capacity": hbm_cap}
+        if mte2_cap > 0.0 and fv > kc * mte2_cap * eps:
+            return {}, {"status": "quarantined_exceeds_mte2_capacity", "key": str(k), "observed": fv, "capacity": kc * mte2_cap}
+        clean[str(kc)] = fv
+    return clean, {}
+
+
+def _make_cell(
+    units: dict[str, str], params: dict[str, Any],
+    core: dict[str, tuple[dict[str, Any], dict[str, Any]]],
+    extra: dict[str, tuple[dict[str, Any], dict[str, Any]]] | None = None,
+    *, top_capture: str, status_override: str | None = None,
+    modes: dict[str, Any] | None = None, unmeasured_reason: str = "",
+) -> dict[str, Any]:
+    core_bands = {k: pair[0] for k, pair in core.items()}
+    diags = {k: pair[1] for k, pair in core.items()}
+    st = status_override if status_override is not None else _cell_status(core_bands)
+    merged = {k: (v if st == "calibrated" else _clean_band(v)) for k, v in core_bands.items()}
+    for k, (eb, ed) in (extra or {}).items():
+        merged[k] = _clean_band(eb)
+        diags[k] = ed
+    p_out = dict(params)
+    if diags:
+        p_out["metric_diagnostics"] = diags
+    if st == "unmeasured" and unmeasured_reason:
+        p_out["unmeasured_reason"] = unmeasured_reason
+    return {
+        "status": st, "units": units, "parameters": p_out, "metrics": merged,
+        "modes": modes or {}, "evidence_id": top_capture if st == "calibrated" else "",
+    }
+
+
+def _build_memory_primitives(
+    ctx: dict[str, Any], raw: dict[str, Any],
+) -> dict[str, Any]:
+    spec, aic, aiv, is_arch35 = ctx["spec"], ctx["aic"], ctx["aiv"], ctx["is_arch35"]
+    _m, _u, _cell = ctx["m"], ctx["u"], ctx["cell"]
+    conflict_meta, ini_meta, unm_hw = ctx["conflict_meta"], ctx["ini_meta"], ctx["unm_hw"]
+    p01r, p02r, p03r, p04r, p05r = (
+        raw.get(k, {}) for k in ("P01_datacopy", "P02_load_data", "P03_fixpipe", "P04_mte3_store", "P05_l2_residency_reuse")
+    )
+    hbm_gran = ARCH35_HBM_BURST_GRANULE_BYTES if is_arch35 else ARCH22_HBM_BURST_GRANULE_BYTES
+    l2_gran = ARCH35_L2_GRANULE_BYTES if is_arch35 else ARCH22_L2_GRANULE_BYTES
+    cache_mech = "va_bits_62_60" if is_arch35 else "l2_cache_alter_dual_va"
+    rd_samples = p01r.get("hbm_read_bytes_per_s") or []
+    peak_rd = statistics.median(rd_samples) if rd_samples else spec["hbm_read_bytes_per_s"]
+    bt_rules = _derive_burst_turn_rules(
+        p01r.get("strided_cold_surface"), peak_read_bps=peak_rd, granule_bytes=hbm_gran, evidence_id=ctx["top_capture"],
+    )
+    fixp_out_aic = spec["fixpipe_bytes_per_s"] / aic
+    fixp_in_aic = fixp_out_aic * FIXPIPE_IN_TO_OUT_RATIO
+    idx_upd_band, idx_upd_diag = _m(p04r.get("indexed_update_bytes_per_s"), spec["l2_bytes_per_s"])
+    mte2_aic_cap = spec["mte2_aic_bytes_per_s"] / aic
+    cold_curve, cold_diag = _filter_p01_scaling_curve(
+        p01r.get("mte2_aic_cold_scaling_bps"),
+        hbm_cap=spec["hbm_read_bytes_per_s"], mte2_cap=mte2_aic_cap, warm=False, allow_core=ctx["allow_core"],
+    )
+    warm_curve, warm_diag = _filter_p01_scaling_curve(
+        p01r.get("mte2_aic_warm_scaling_bps"),
+        hbm_cap=spec["hbm_read_bytes_per_s"], mte2_cap=mte2_aic_cap, warm=True, allow_core=ctx["allow_core"],
+    )
+    curve_diags = {k: v for k, v in (("cold", cold_diag), ("warm", warm_diag)) if v}
+    return {
+        "P01_datacopy": _cell(
+            {"rate": "bytes_per_s", "penalty": "bytes", "alpha": "dimensionless"},
+            {"sector_bytes": SECTOR_BYTES, "hbm_burst_granule_bytes": hbm_gran,
+             "hbm_scatter_row_open_bytes": ARCH35_HBM_SCATTER_ROW_OPEN_BYTES if is_arch35 else 0,
+             "l2_cache_ctl_supported": True, "l2_cache_ctl_mechanism": cache_mech,
+             "burst_turn_penalty": bt_rules, "strided_cold_surface": p01r.get("strided_cold_surface", []),
+             "gm_alignment_cold_bps": p01r.get("gm_alignment_cold_bps", {}),
+             "hbm_read_datacopy_blocked_bps_p50": p01r.get("hbm_read_datacopy_blocked_bps_p50"),
+             "payload_ramp_bytes_per_s": p01r.get("payload_ramp_bytes_per_s", {}),
+             "gather_v2_cold_surface": p01r.get("gather_v2_cold_surface", {}),
+             "mte2_aic_cold_scaling_bps": cold_curve,
+             "mte2_aic_warm_scaling_bps": warm_curve,
+             **({"scaling_curve_diagnostics": curve_diags} if curve_diags else {}),
+             **ini_meta, **conflict_meta},
+            {"hbm_read_bytes_per_s": _m(p01r.get("hbm_read_bytes_per_s"), spec["hbm_read_bytes_per_s"]),
+             "hbm_write_bytes_per_s": _m(p01r.get("hbm_write_bytes_per_s"), spec["hbm_write_bytes_per_s"]),
+             "mte2_aiv_hit_bytes_per_s_per_core": _m(p01r.get("mte2_aiv_hit_bytes_per_s_per_core"), spec["mte2_aiv_bytes_per_s"] / aiv, per_core=True)},
+            {"hbm_rw_alpha": _m(p01r.get("hbm_rw_alpha"), 0.0, "latency_lower", max_admissible=ADMISSIBLE_ALPHA_MAX, allow_zero=True),
+             "hbm_rw11_bytes_per_s": _m(p01r.get("hbm_rw11_bytes_per_s"), spec["hbm_read_bytes_per_s"]),
+             "hbm_rw21_bytes_per_s": _m(p01r.get("hbm_rw21_bytes_per_s"), spec["hbm_read_bytes_per_s"]),
+             "mte2_aic_hit_bytes_per_s_per_core": _m(p01r.get("mte2_aic_hit_bytes_per_s_per_core"), mte2_aic_cap, per_core=True)},
+            unmeasured_reason=unm_hw,
+        ),
+        "P02_load_data": _cell(
+            {"rate": "bytes_per_s_per_aic", "latency": "ns"},
+            {"fractal_bytes": FRACTAL_BYTES, "mx_scale_supported": is_arch35,
+             "mx_scale_bytes_per_cyc": ARCH35_MX_SCALE_BYTES_PER_CYC if is_arch35 else 0,
+             "transpose_factor": max(1.0, float(p02r.get("transpose_factor", 1.0))),
+             "measured_l0a_transpose_ratio": p02r.get("measured_l0a_transpose_ratio"),
+             "measured_l0b_transpose_ratio": p02r.get("measured_l0b_transpose_ratio"),
+             "transpose_l0b_factor": ARCH35_TRANSPOSE_L0B_FACTOR if is_arch35 else 1.0, **conflict_meta},
+            {"l1_to_l0a_bytes_per_s_per_aic": _m(p02r.get("l1_to_l0a_bytes_per_s_per_aic"), spec["mte1_l0a_bytes_per_s"] / aic, per_core=True),
+             "l1_to_l0b_bytes_per_s_per_aic": _m(p02r.get("l1_to_l0b_bytes_per_s_per_aic"), spec["mte1_l0b_bytes_per_s"] / aic, per_core=True)},
+            {"l1_to_l0a_transpose_bytes_per_s_per_aic": _m(p02r.get("l1_to_l0a_transpose_bytes_per_s_per_aic"), spec["mte1_l0a_bytes_per_s"] / aic, per_core=True),
+             "l1_to_l0b_transpose_bytes_per_s_per_aic": _m(p02r.get("l1_to_l0b_transpose_bytes_per_s_per_aic"), spec["mte1_l0b_transpose_bytes_per_s"] / aic, per_core=True),
+             "setup_ns": _m(p02r.get("setup_ns"), 0.0, "latency_lower")},
+            unmeasured_reason=unm_hw,
+        ),
+        "P03_fixpipe": _cell(
+            {"rate": "bytes_per_s_per_aic", "latency": "ns"},
+            {"has_l0c_to_ub": spec["has_l0c_to_ub"], "has_l0c_to_l1": True, "ub_split_n_align_elems": UB_SPLIT_N_ALIGN,
+             "dual_target_ub_supported": is_arch35, "split_m_supported": is_arch35,
+             "nz2dn_stride_gt1_div": ARCH35_NZ2DN_STRIDE_GT1_DIV if is_arch35 else 1, **conflict_meta},
+            {"fixpipe_in_bytes_per_s_per_aic": _m(p03r.get("fixpipe_in_bytes_per_s_per_aic"), fixp_in_aic, per_core=True),
+             "fixpipe_out_bytes_per_s_per_aic": _m(p03r.get("fixpipe_out_bytes_per_s_per_aic"), fixp_out_aic, per_core=True)},
+            {"setup_ns": _m(p03r.get("setup_ns"), 0.0, "latency_lower")},
+            unmeasured_reason=unm_hw,
+        ),
+        "P04_mte3_store": _cell(
+            {"rate": "bytes_per_s", "latency": "ns"},
+            {"has_ub_to_l1": spec["has_ub_to_l1"],
+             "indexed_update_diagnostic": {"band": idx_upd_band, "diagnostic": idx_upd_diag}, **conflict_meta},
+            {"mte3_store_bytes_per_s_per_aiv": _m(p04r.get("mte3_warm_bytes_per_s_per_aiv"), spec["mte3_bytes_per_s"] / aiv, per_core=True)},
+            {"atomic_rmw_bytes_per_s": _m(p04r.get("hbm_atomic_native_bytes_per_s"), spec["atomic_rmw_bytes_per_s"]),
+             "setup_ns": _u(0.0, "latency_lower"), "atomic_contention_ns": _u(0.0, "latency_lower")},
+            unmeasured_reason=unm_hw,
+        ),
+        "P05_l2_residency_reuse": _cell(
+            {"rate": "bytes_per_s", "fraction": "dimensionless", "capacity": "bytes"},
+            {"l2_bytes": spec["l2_bytes"], "l2_line_bytes": L2_LINE_BYTES, "l2_sector_bytes": l2_gran,
+             "granule_bytes": l2_gran, "buffer_units_l2": 1,
+             "cache_disable_supported": True, "cache_disable_mechanism": cache_mech,
+             "cache_persistent_supported": is_arch35,
+             "ws_sweep_bytes_per_s": p05r.get("ws_sweep_bytes_per_s", {}),
+             "l2_stride_conflict": p05r.get("l2_stride_conflict", []), **conflict_meta},
+            {"l2_die_bytes_per_s": _m(p05r.get("l2_die_bytes_per_s"), spec["l2_bytes_per_s"])},
+            {"l2_effective_fraction": _m(p05r.get("l2_effective_fraction"), 1.0)},
+            unmeasured_reason=unm_hw,
+        ),
+    }
+
+
+def _build_compute_primitives(
+    ctx: dict[str, Any], raw: dict[str, Any],
+) -> dict[str, Any]:
+    spec, aic, aiv, is_arch35 = ctx["spec"], ctx["aic"], ctx["aiv"], ctx["is_arch35"]
+    _m, _u, _cell, top_capture = ctx["m"], ctx["u"], ctx["cell"], ctx["top_capture"]
+    conflict_meta, unm_hw = ctx["conflict_meta"], ctx["unm_hw"]
+    p06r, p09r, p10r, p11r = (raw.get(k, {}) for k in ("P06_mmad", "P09_vec_reduce_cast", "P10_sort_topk", "P11_simt"))
+    ub_meta = {
+        "ub_bank_groups": DAV35_UB_BANK_GROUPS if is_arch35 else DAV22_UB_BANK_GROUPS,
+        "ub_banks_per_group": DAV35_UB_BANKS_PER_GROUP if is_arch35 else DAV22_UB_BANKS_PER_GROUP,
+        "ub_bank_size_bytes": DAV35_UB_BANK_SIZE_BYTES if is_arch35 else DAV22_UB_BANK_SIZE_BYTES,
+    }
+    p06_modes: dict[str, Any] = {}
+    cal_modes, unm_modes, conf_modes = [], [], []
+    unsupported_modes = ["int4"] if is_arch35 else list(ARCH35_EXTRA_MODES)
+    bf16_cap = spec["peaks"].get("bf16", 0.0) / aic
+    int8_cap = spec["peaks"].get("int8", 0.0) / aic
+    fp32_cube_k = TILE_1 if is_arch35 else TILE_4
+    fp32_cap = (bf16_cap / DAV35_FP32_RATIO_VS_BF16) if is_arch35 else max(spec["peaks"].get("fp32", 0.0) / aic, bf16_cap / DAV22_FP32_RATIO_VS_BF16)
+    hf32_cap = bf16_cap / HF32_RATIO_VS_BF16
+    mode_defs = [
+        ("bf16", TILE_16, TILE_16, TILE_16, TILE_16, TILE_16, TILE_16, bf16_cap),
+        ("fp16", TILE_16, TILE_16, TILE_16, TILE_16, TILE_16, TILE_16, spec["peaks"].get("fp16", 0.0) / aic),
+        ("fp32", TILE_16, TILE_16, TILE_8, fp32_cube_k, TILE_8, TILE_16, fp32_cap),
+        ("hf32", TILE_16, TILE_16, TILE_8, TILE_8, TILE_8, TILE_16, hf32_cap),
+        ("int8", TILE_16, TILE_16, TILE_32, TILE_32, TILE_32, TILE_16, int8_cap),
+    ]
+    if is_arch35:
+        fp8_cap = spec["peaks"].get("fp8_e4m3", spec["peaks"].get("int8", 0.0)) / aic
+        fp8_e5_cap = spec["peaks"].get("fp8_e5m2", fp8_cap * aic) / aic
+        mode_defs.extend([
+            ("fp8_e4m3", TILE_16, TILE_16, TILE_32, TILE_32, TILE_32, TILE_16, fp8_cap),
+            ("fp8_e5m2", TILE_16, TILE_16, TILE_32, TILE_32, TILE_32, TILE_16, fp8_e5_cap),
+            ("hifloat8", TILE_16, TILE_16, TILE_32, TILE_32, TILE_32, TILE_16, fp8_cap),
+            ("mxfp8", TILE_16, TILE_16, TILE_32, TILE_32, TILE_32, TILE_16, fp8_cap),
+            ("mxfp4", TILE_16, TILE_16, TILE_64, TILE_64, TILE_64, TILE_16, fp8_cap * TWO),
+        ])
+    else:
+        mode_defs.append(("int4", TILE_16, TILE_16, TILE_64, TILE_64, TILE_64, TILE_16, int8_cap * TWO))
+    p06_mode_diags: dict[str, Any] = {}
+    gemm_e2e_summary: dict[str, Any] = {}
+    raw_cube_modes = p06r.get("cube_only_modes") or {}
+    raw_e2e_modes = p06r.get("gemm_e2e_modes") or p06r.get("modes") or {}
+    for m_name, tm, tn, tk, ck, k0, miss, cap in mode_defs:
+        if cap <= 0.0:
+            continue
+        if m_name in raw_e2e_modes:
+            eb, ed = _m(raw_e2e_modes.get(m_name), cap, per_core=True)
+            gemm_e2e_summary[m_name] = {"band": eb, "diagnostic": ed}
+        b, d = _m(raw_cube_modes.get(m_name), cap, per_core=True)
+        ms = _cell_status({"r": b})
+        p06_mode_diags[m_name] = d
+        if ms == "calibrated":
+            cal_modes.append(m_name)
+        elif d.get("status") == "p99_exceeds_nominal_conflict":
+            conf_modes.append(m_name)
+        else:
+            unm_modes.append(m_name)
+        entry: dict[str, Any] = {
+            "status": ms, "tile_m": tm, "tile_n": tn, "tile_k": tk,
+            "cube_k": ck, "k_0": k0, "m_iss": miss,
+            "cube_only_rate": b if ms == "calibrated" else _clean_band(b),
+        }
+        if ms == "calibrated":
+            entry["evidence_id"] = top_capture
+        if m_name in {"mxfp8", "mxfp4"}:
+            entry["scale_group"] = MX_SCALE_GROUP
+        p06_modes[m_name] = entry
+    core_p06_ok = all(m in cal_modes for m in ARCH22_CORE_MODES) and not conf_modes
+    p06_cov = {
+        "calibrated_modes": cal_modes, "unmeasured_modes": unm_modes, "unsupported_modes": unsupported_modes,
+        "conflict_modes": conf_modes, "calibrated_count": len(cal_modes), "supported_count": len(p06_modes),
+        "mode_diagnostics": p06_mode_diags,
+    }
+    sort_per_aiv_cap = spec["vector_ops_per_s"] / aiv
+    sort_band, sort_diag = _m(p10r.get("sort_elems_per_s_per_aiv"), sort_per_aiv_cap, per_core=True)
+    sort_st = _cell_status({"r": sort_band})
+    p10_modes: dict[str, Any] = {
+        "sort32_mrgsort4": {
+            "status": sort_st,
+            "sort_elems_per_s_per_aiv": sort_band if sort_st == "calibrated" else _clean_band(sort_band),
+            **({"evidence_id": top_capture} if sort_st == "calibrated" else {}),
+        },
+    }
+    if is_arch35:
+        p10_modes["masked_hist256"] = {
+            "status": "unmeasured",
+            "sort_elems_per_s_per_aiv": _bound_only(sort_per_aiv_cap),
+            "unmeasured_reason": "requires_histogram_microkernel",
+        }
+    simt_cap = max(1.0, spec["simt_warp_insts_per_s_per_aiv"]) if is_arch35 else 0.0
+    simt_samples = p11r.get("simt_warp_instructions_per_s_per_aiv")
+    return {
+        "P06_mmad": _cell(
+            {"rate": "flops_per_s_per_aic", "latency": "ns"},
+            {"pipe_m_barrier_fractal_threshold": PIPE_M_BARRIER_FRACTALS, "fp32_allow_hf32_recorded": True,
+             "gemm_e2e_flops_per_s_per_aic": gemm_e2e_summary,
+             "small_m_bf16_ns": p06r.get("small_m_bf16_ns", {}),
+             "small_m_bf16_warm_ns": p06r.get("small_m_bf16_warm_ns", {}), "mode_coverage": p06_cov, **conflict_meta},
+            {}, {"pipe_m_barrier_ns": _m(p06r.get("pipe_m_barrier_ns"), 0.0, "latency_lower")},
+            status_override="calibrated" if core_p06_ok else "unmeasured", modes=p06_modes, unmeasured_reason=unm_hw,
+        ),
+        "P07_vec_alu": _cell(
+            {"rate": "ops_per_s_per_aiv"},
+            {"vector_width_bytes": VEC_WIDTH_BYTES, "fp32_lanes": FP32_LANES, "bf16_lanes": BF16_LANES, **ub_meta, **conflict_meta},
+            {"vec_alu_ops_per_s_per_aiv": _m(raw.get("P07_vec_alu", {}).get("vec_alu_ops_per_s_per_aiv"), spec["vec_alu_ops_per_s"] / aiv, per_core=True)},
+            {"raw_latency_cycles": _u(0.0, "latency_lower")}, unmeasured_reason=unm_hw,
+        ),
+        "P08_vec_sfu": _cell(
+            {"rate": "ops_per_s_per_aiv"},
+            {"vector_width_bytes": VEC_WIDTH_BYTES, "fp32_lanes": FP32_LANES, "bf16_lanes": BF16_LANES, **ub_meta, **conflict_meta},
+            {"vec_sfu_ops_per_s_per_aiv": _m(raw.get("P08_vec_sfu", {}).get("vec_sfu_ops_per_s_per_aiv"), spec["vec_sfu_ops_per_s"] / aiv, per_core=True)},
+            {"raw_latency_cycles": _u(0.0, "latency_lower")}, unmeasured_reason=unm_hw,
+        ),
+        "P09_vec_reduce_cast": _cell(
+            {"rate": "ops_per_s_per_aiv", "cast_rate": "bytes_per_s_per_aiv"},
+            {"mx_scale_group": MX_SCALE_GROUP, "mx_dynamic_quant_supported": is_arch35, **ub_meta, **conflict_meta},
+            {"vec_reduce_ops_per_s_per_aiv": _m(p09r.get("vec_reduce_ops_per_s_per_aiv"), spec["vec_reduce_ops_per_s"] / aiv, per_core=True),
+             "cast_bytes_per_s_per_aiv": _m(p09r.get("cast_bytes_per_s_per_aiv"), spec["cast_bytes_per_s"] / aiv, per_core=True)},
+            unmeasured_reason=unm_hw,
+        ),
+        "P10_sort_topk": _cell(
+            {"rate": "elems_per_s_per_aiv"},
+            {"sort_algorithm": "sort32_mrgsort4", "masked_hist256_supported": is_arch35,
+             "supported_sortall_lengths": list(SORTALL_LENGTHS),
+             "histogram_trunk_elems": ARCH35_HIST_TRUNK if is_arch35 else 0,
+             "sort_die_elems_per_s_p50": p10r.get("sort_die_elems_per_s_p50"), **conflict_meta},
+            {"sort_elems_per_s_per_aiv": (sort_band, sort_diag)},
+            {"sort_elems_per_s": _u(sort_per_aiv_cap)},
+            modes=p10_modes, unmeasured_reason=unm_hw,
+        ),
+        "P11_simt": _cell(
+            {"rate": "warp_instructions_per_s_per_aiv", "latency": "ns"},
+            {"supported": is_arch35, "simt_ub_carveout_bytes": spec["simt_ub_carveout_bytes"],
+             "simt_ub_carveout_min_bytes": SIMT_UB_CARVEOUT_MIN_BYTES if is_arch35 else 0,
+             "warp_schedulers": SIMT_WARP_SCHEDULERS if is_arch35 else 0,
+             "tla_max_threads": TLA_MAX_THREADS if is_arch35 else 0,
+             "catlass_max_threads": CATLASS_MAX_THREADS if is_arch35 else 0, "warp_size": SIMT_WARP_SIZE,
+             "simt_scalar_flops_per_s_per_aiv_p50": p11r.get("simt_scalar_flops_per_s_per_aiv_p50"), **conflict_meta},
+            {"simt_warp_instructions_per_s_per_aiv": _m(simt_samples, simt_cap, per_core=True),
+             "syncthreads_ns": _m(p11r.get("syncthreads_ns"), 0.0, "latency_lower"),
+             "simt_launch_ns": _m(p11r.get("simt_launch_ns"), 0.0, "latency_lower")} if is_arch35 else {},
+            {"simt_ops_per_s_per_aiv": _m(simt_samples, simt_cap, per_core=True)} if is_arch35 else {
+                "simt_warp_instructions_per_s_per_aiv": _u(0.0), "simt_ops_per_s_per_aiv": _u(0.0),
+                "syncthreads_ns": _u(0.0, "latency_lower"), "simt_launch_ns": _u(0.0, "latency_lower"),
+            },
+            status_override=None if is_arch35 else "unsupported", unmeasured_reason="requires_ascendc_simt_kernel" if is_arch35 else "",
+        ),
+    }
+
+
+def _build_sync_and_link_primitives(
+    ctx: dict[str, Any], raw: dict[str, Any],
+) -> dict[str, Any]:
+    spec, sku, is_arch35 = ctx["spec"], ctx["sku"], ctx["is_arch35"]
+    _m, _u, _cell = ctx["m"], ctx["u"], ctx["cell"]
+    conflict_meta, unm_hw, has_raw = ctx["conflict_meta"], ctx["unm_hw"], ctx["has_raw"]
+    p12r, p13r, p15r, p17r = (raw.get(k, {}) for k in ("P12_intracore_flag", "P13_crosscore_sync", "P15_rts_stars", "P17_aicpu_metadata_launch"))
+    p18r, p19r, p20r = (raw.get(k, {}) for k in ("P18_hccl_collective_band", "P19_direct_peer_window", "P20_host_dma_sync"))
+    p13_extra: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {
+        "mode1_subblock_ns": _u(0.0, "latency_lower"),
+        "mode0_aic_barrier_ns": _m(p13r.get("mode0_aic_barrier_ns"), 0.0, "latency_lower"),
+    }
+    if is_arch35:
+        p13_extra["mode4_intra_block_ns"] = _m(p13r.get("mode4_intra_block_ns"), 0.0, "latency_lower")
+    p18_curves = validate_quantitative_curves(p18r.get("curves_by_topology"), max_bw_bps=spec["link_bytes_per_s"])
+    p19_curves = validate_quantitative_curves(p19r.get("curves_by_topology"), max_bw_bps=spec["link_bytes_per_s"])
+    p20_curves = validate_quantitative_curves(p20r.get("dma_curve_by_size"), max_bw_bps=max(spec["host_h2d_bytes_per_s"], spec["host_d2h_bytes_per_s"]))
+    p19_duplex_diag = {}
+    for dk, bnd, kind in (
+        ("hccl_duplex_bytes_per_s", spec["link_bytes_per_s"], "rate_upper"),
+        ("hccl_duplex_4k_ns", 0.0, "latency_lower"),
+        ("hccl_duplex_4k_blocked_ns", 0.0, "latency_lower"),
+    ):
+        if p19r.get(dk):
+            db, dd = _m(p19r.get(dk), bnd, kind)
+            p19_duplex_diag[dk] = {"band": db, "diagnostic": dd}
+    return {
+        "P12_intracore_flag": _cell(
+            {"latency": "ns"}, {"event_ids": EVENT_IDS_COUNT, "unit_flag_requires_single_l0c_stage": True, **conflict_meta},
+            {"flag_ns": _m(p12r.get("flag_ns"), 0.0, "latency_lower")},
+            {"unitflag_ns": _u(0.0, "latency_lower"), "flag_mte2_v_ns": _m(p12r.get("flag_mte2_v_ns"), 0.0, "latency_lower"),
+             "flag_v_mte3_ns": _m(p12r.get("flag_v_mte3_ns"), 0.0, "latency_lower"), "flag_m_fix_ns": _m(p12r.get("flag_m_fix_ns"), 0.0, "latency_lower"),
+             "pipe_v_barrier_ns": _m(p12r.get("pipe_v_barrier_ns"), 0.0, "latency_lower")},
+            unmeasured_reason=unm_hw,
+        ),
+        "P13_crosscore_sync": _cell(
+            {"latency": "ns"},
+            {"aiv_inter_block_barrier_id": AIV_BARRIER_ID, "aic_inter_block_barrier_id": AIC_BARRIER_ID,
+             "intra_subblock_barrier_id": INTRA_SUBBLOCK_BARRIER_ID, "ffts_max_flag_id": FFTS_MAX_FLAG_ID,
+             "hw_flag_ids": FFTS_HW_FLAG_IDS, "reverse_depth": FFTS_REVERSE_DEPTH, "mode4_supported": is_arch35, **conflict_meta},
+            {"mode2_paired_ns": _m(p13r.get("mode2_paired_ns"), 0.0, "latency_lower"),
+             "mode0_aiv_barrier_ns": _m(p13r.get("mode0_aiv_barrier_ns"), 0.0, "latency_lower")},
+            p13_extra, unmeasured_reason=unm_hw,
+        ),
+        "P14_mutex_block_mmad": _cell(
+            {"latency": "ns"},
+            {"supported": is_arch35, "hw_mutex_ids": HW_MUTEX_IDS if is_arch35 else 0,
+             "max_mutex_ids": MAX_MUTEX_IDS if is_arch35 else 0, "unit_flag_requires_single_l0c_stage": True},
+            {}, {"mutex_overhead_ns": _u(0.0, "latency_lower")},
+            status_override="unmeasured" if is_arch35 else "unsupported", unmeasured_reason=unm_hw if is_arch35 else "",
+        ),
+        "P15_rts_stars": _cell(
+            {"latency": "ns"}, {"queue_scope": "die", "queue_depth": STARS_QUEUE_DEPTH, "lanes": 1, "first_issue_includes_min_kernel": True, **conflict_meta},
+            {"issue_interval_ns": _m(p15r.get("issue_interval_ns"), 0.0, "latency_lower"),
+             "aiv_first_issue_ns": _m(p15r.get("aiv_first_issue_ns"), 0.0, "latency_lower"),
+             "aic_first_issue_ns": _m(p15r.get("aic_first_issue_ns"), 0.0, "latency_lower")},
+            {"host_submit_ns": _m(p15r.get("host_submit_ns"), 0.0, "latency_lower"),
+             "host_submit_burst_ns": _m(p15r.get("host_submit_burst_ns"), 0.0, "latency_lower"),
+             "npugraph_issue_ns": _m(p15r.get("npugraph_issue_ns"), 0.0, "latency_lower")},
+            unmeasured_reason=unm_hw,
+        ),
+        "P16_multistream_core_control": _cell(
+            {"latency": "ns"}, {"modes": ["disjoint", "shared_cap"], **conflict_meta},
+            {"stream_event_ns": _m(raw.get("P16_multistream_core_control", {}).get("stream_event_ns"), 0.0, "latency_lower")},
+            {"set_limit_ns": _u(0.0, "latency_lower")}, unmeasured_reason=unm_hw,
+        ),
+        "P17_aicpu_metadata_launch": _cell(
+            {"latency": "ns"}, {"aclgraph_cacheable": True, **conflict_meta},
+            {"host_select_ns": _m(p17r.get("metadata_select_ns"), 0.0, "latency_lower")},
+            {"aicpu_base_ns": _u(0.0, "latency_lower"), "gm_pub_ns": _u(0.0, "latency_lower"),
+             "eager_d2h_sync_ns": _m(p20r.get("eager_d2h_sync_ns"), 0.0, "latency_lower")},
+            unmeasured_reason="requires_aicpu_metadata_select_probe" if has_raw else unm_hw,
+        ),
+        "P18_hccl_collective_band": _cell(
+            {"rate": "bytes_per_s", "latency": "ns"},
+            {"payload_bytes_per_frame": ARCH22_FRAME_BYTES, "wire_bytes_per_frame": ARCH22_FRAME_BYTES,
+             "short_final_frame_policy": "exact_plus_header",
+             "group_min": HCCL_TWO_RANK_GROUP, "group_max": HCCL_TWO_RANK_GROUP,
+             "measured_world_size": int(p18r.get("measured_world_size") or HCCL_TWO_RANK_GROUP),
+             "measured_collective": str(p18r.get("measured_collective") or "all_reduce"),
+             "measured_scope": "package" if int(spec.get("dies_per_package", 1)) >= 2 else "node",
+             "bandwidth_definition": "two_rank_allreduce_busbw_equals_algbw",
+             "curves_by_topology": p18_curves,
+             "mc2_contention": p18r.get("mc2_contention", {}), **conflict_meta},
+            {"link_bytes_per_s": _m(p18r.get("link_bytes_per_s"), spec["link_bytes_per_s"]),
+             "startup_ns": _m(p18r.get("startup_ns"), 0.0, "latency_lower")},
+            {"startup_blocked_ns": _m(p18r.get("startup_blocked_ns"), 0.0, "latency_lower")},
+            unmeasured_reason="requires_multirank_peer_die" if has_raw else unm_hw,
+        ),
+        "P19_direct_peer_window": _cell(
+            {"rate": "bytes_per_s", "latency": "ns"},
+            {"transport": _peer_transport_name(int(spec.get("dies_per_package", 1)), is_arch35),
+             "token_payload_bytes_per_frame": ARCH35_FRAME_PAYLOAD if is_arch35 else ARCH22_FRAME_BYTES,
+             "token_wire_bytes_per_frame": ARCH35_FRAME_WIRE if is_arch35 else ARCH22_FRAME_BYTES,
+             "hccl_duplex_diagnostics": p19_duplex_diag,
+             "curves_by_topology": p19_curves, **conflict_meta},
+            {"peer_bytes_per_s": _m(p19r.get("direct_window_peer_bytes_per_s"), spec["link_bytes_per_s"]),
+             "status_sync_ns": _m(p19r.get("direct_window_status_sync_ns"), 0.0, "latency_lower")},
+            unmeasured_reason="requires_direct_window_kernel" if has_raw else unm_hw,
+        ),
+        "P20_host_dma_sync": _cell(
+            {"rate": "bytes_per_s", "latency": "ns"},
+            {"contention_scope": "root_complex", "dma_curve_by_size": p20_curves, **conflict_meta},
+            {"host_h2d_bytes_per_s": _m(p20r.get("host_h2d_bytes_per_s"), spec["host_h2d_bytes_per_s"]),
+             "host_d2h_bytes_per_s": _m(p20r.get("host_d2h_bytes_per_s"), spec["host_d2h_bytes_per_s"])},
+            {"host_rc_h2d_bytes_per_s": _u(spec["host_rc_h2d_bytes_per_s"]),
+             "host_rc_d2h_bytes_per_s": _u(spec["host_rc_d2h_bytes_per_s"]),
+             "pinned_h2d_startup_ns": _m(p20r.get("pinned_h2d_startup_ns"), 0.0, "latency_lower"),
+             "pinned_d2h_startup_ns": _m(p20r.get("pinned_d2h_startup_ns"), 0.0, "latency_lower"),
+             "pageable_h2d_startup_ns": _m(p20r.get("pageable_h2d_startup_ns"), 0.0, "latency_lower"),
+             "pageable_d2h_startup_ns": _m(p20r.get("pageable_d2h_startup_ns"), 0.0, "latency_lower"),
+             "pinned_dma_startup_ns": _m(p20r.get("pinned_dma_startup_ns"), 0.0, "latency_lower"),
+             "pageable_dma_startup_ns": _m(p20r.get("pageable_dma_startup_ns"), 0.0, "latency_lower"),
+             "eager_d2h_sync_ns": _m(p20r.get("eager_d2h_sync_ns"), 0.0, "latency_lower")},
+            unmeasured_reason=unm_hw,
+        ),
+    }
 
 
 def build_primitive_table_payload(
     *, sku: str, cann_version: str, endpoint_alias: str, campaign_id: str,
     raw_measurements: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    """Assemble a full-envelope SHA-256 sealed mindie-l0-primitives/1 table."""
-    spec = _load_sku_hardware_spec(sku)
+    """Assemble a full-envelope SHA-256 sealed mindie-l0-primitives/1 table with RC-1 coverage."""
+    base_spec = _load_sku_hardware_spec(sku)
     alias = sanitize_record_alias(endpoint_alias, sku)
-    aic, aiv = max(1, spec["aic_count"]), max(1, spec["aiv_count"])
-    is_arch35 = spec["arch_preset"] == "npu_arch_3510"
-    raw = raw_measurements or {}
+    aic, aiv = max(1, base_spec["aic_count"]), max(1, base_spec["aiv_count"])
+    raw = _sanitize_capture_obj(raw_measurements) if raw_measurements else {}
     sample_dev = str(raw.get("device_name") or "").strip()
     if sample_dev and sample_dev != sku:
         raise ValueError(f"bench_sample_sku_mismatch:expected={sku}:got={sample_dev}")
+    rt_cann = str(raw.get("runtime_cann_version") or "").strip()
+    if rt_cann and cann_version and cann_version != "unmeasured" and cann_version != rt_cann:
+        raise ValueError(f"bench_cann_version_mismatch:runtime={rt_cann}:arg={cann_version}")
     obs = raw.get("observed_silicon") if isinstance(raw.get("observed_silicon"), dict) else {}
     obs_aic = obs.get("observed_aic_count")
     core_mismatch = isinstance(obs_aic, int) and obs_aic > 0 and obs_aic != aic
@@ -475,301 +614,98 @@ def build_primitive_table_payload(
             "observed_aicore_freq_mhz": obs.get("observed_aicore_freq_mhz"),
         }} if core_mismatch else {}
     )
+    spec, clock_meta = _apply_core_clock_scale(base_spec, obs.get("observed_aicore_freq_mhz"))
+    raw_ini = str(raw.get("ini_filename") or f"{sku}.ini")
+    ini_name = os.path.basename(raw_ini.replace("\\", "/")) or f"{sku}.ini"
+    ini_meta = {
+        "ini_sha256": str(raw.get("ini_sha256") or ""),
+        "ini_filename": ini_name,
+        "runtime_cann_version": rt_cann,
+        "bisheng_version": str(raw.get("bisheng_version") or ""),
+        "observed_cur_freq_mhz": obs.get("observed_cur_freq_mhz"),
+        **clock_meta,
+    }
     cap_bytes = canonical_capture_bytes(sku, raw_measurements)
     top_capture = f"capture://{alias}/{campaign_id}/{hashlib.sha256(cap_bytes).hexdigest()}"
-
-    def _band(samples: list[float] | None, bound: float, *, kind: str = "rate_upper", allow_meas: bool = True) -> dict[str, Any]:
-        return summarize_samples(samples, certified_bound=bound, bound_kind=kind) if (samples and allow_meas) else _bound_only(bound, kind)
-
-    def _make_cell(pid: str, units: dict[str, str], params: dict[str, Any],
-                   core_metrics: dict[str, dict[str, Any]], extra_metrics: dict[str, dict[str, Any]] | None = None,
-                   *, status_override: str | None = None, modes: dict[str, Any] | None = None) -> dict[str, Any]:
-        st = status_override if status_override is not None else _cell_status(core_metrics)
-        merged = {k: (v if st == "calibrated" else _clean_band(v)) for k, v in core_metrics.items()}
-        for k, v in (extra_metrics or {}).items():
-            merged[k] = _clean_band(v)
-        ev = top_capture if st == "calibrated" else ""
-        return {"status": st, "units": units, "parameters": params, "metrics": merged, "modes": modes or {}, "evidence_id": ev}
-
+    allow_core = not core_mismatch
+    ctx = {
+        "sku": sku, "spec": spec, "aic": aic, "aiv": aiv, "top_capture": top_capture,
+        "is_arch35": spec["arch_preset"] == "npu_arch_3510", "allow_core": allow_core,
+        "conflict_meta": conflict_meta, "ini_meta": ini_meta, "has_raw": bool(raw_measurements),
+        "unm_hw": "no_reachable_physical_hardware" if not raw_measurements else "requires_ascendc_microkernel",
+        "m": lambda s, b, kind="rate_upper", *, per_core=False, max_admissible=None, allow_zero=False: summarize_metric(
+            s, certified_bound=b, bound_kind=kind, allow_meas=(allow_core if per_core else True),
+            max_admissible=max_admissible, allow_zero=allow_zero,
+        ),
+        "u": lambda b, kind="rate_upper": (_bound_only(b, kind), {"status": "unmeasured", "nominal_bound": round(float(b), ROUND_METRIC_DIGITS)}),
+        "cell": lambda units, params, core, extra=None, **kw: _make_cell(units, params, core, extra, top_capture=top_capture, **kw),
+    }
     p: dict[str, Any] = {}
-    p01r, p04r, p05r, p06r = (raw.get(k, {}) for k in ("P01_datacopy", "P04_mte3_store", "P05_l2_residency_reuse", "P06_mmad"))
-    p09r, p15r, p20r = (raw.get(k, {}) for k in ("P09_vec_reduce_cast", "P15_rts_stars", "P20_host_dma_sync"))
-    allow = not core_mismatch
-    p["P01_datacopy"] = _make_cell(
-        "P01_datacopy", {"rate": "bytes_per_s", "penalty": "bytes", "alpha": "dimensionless"},
-        {"sector_bytes": 32, "l2_cache_ctl_supported": is_arch35, "burst_turn_penalty": [], **conflict_meta},
-        {"hbm_read_bytes_per_s": _band(p01r.get("hbm_read_bytes_per_s"), spec["hbm_read_bytes_per_s"], allow_meas=allow),
-         "hbm_write_bytes_per_s": _band(p01r.get("hbm_write_bytes_per_s"), spec["hbm_write_bytes_per_s"], allow_meas=allow),
-         "mte2_aiv_hit_bytes_per_s_per_core": _band(p01r.get("mte2_aiv_hit_bytes_per_s_per_core"), spec["mte2_aiv_bytes_per_s"] / aiv, allow_meas=allow)},
-        {"hbm_rw_alpha": _band(p01r.get("hbm_rw_alpha"), 0.0, kind="latency_lower", allow_meas=allow),
-         "mte2_aic_hit_bytes_per_s_per_core": _bound_only(spec["mte2_aic_bytes_per_s"] / aic)},
-    )
-    p["P02_load_data"] = _make_cell(
-        "P02_load_data", {"rate": "bytes_per_s_per_aic", "latency": "ns"},
-        {"fractal_bytes": 512, "mx_scale_supported": is_arch35, "transpose_factor": 1.0}, {},
-        {"l1_to_l0a_bytes_per_s_per_aic": _bound_only(spec["mte1_l0a_bytes_per_s"] / aic),
-         "l1_to_l0b_bytes_per_s_per_aic": _bound_only(spec["mte1_l0b_bytes_per_s"] / aic),
-         "setup_ns": _bound_only(0.0, "latency_lower")}, status_override="unmeasured",
-    )
-    fixp_aic = spec["fixpipe_bytes_per_s"] / aic
-    p["P03_fixpipe"] = _make_cell(
-        "P03_fixpipe", {"rate": "bytes_per_s_per_aic", "latency": "ns"},
-        {"has_l0c_to_ub": spec["has_l0c_to_ub"], "has_l0c_to_l1": True, "ub_split_n_align_elems": 32}, {},
-        {"fixpipe_in_bytes_per_s_per_aic": _bound_only(fixp_aic), "fixpipe_out_bytes_per_s_per_aic": _bound_only(fixp_aic), "setup_ns": _bound_only(0.0, "latency_lower")},
-        status_override="unmeasured",
-    )
-    p["P04_mte3_store"] = _make_cell(
-        "P04_mte3_store", {"rate": "bytes_per_s", "latency": "ns"}, {"has_ub_to_l1": spec["has_ub_to_l1"], **conflict_meta},
-        {"mte3_store_bytes_per_s_per_aiv": _band(p04r.get("mte3_warm_bytes_per_s_per_aiv"), spec["mte3_bytes_per_s"] / aiv, allow_meas=allow),
-         "atomic_rmw_bytes_per_s": _band(p04r.get("atomic_rmw_bytes_per_s"), spec["atomic_rmw_bytes_per_s"], allow_meas=allow)},
-        {"setup_ns": _bound_only(0.0, "latency_lower"), "atomic_contention_ns": _bound_only(0.0, "latency_lower")},
-    )
-    p["P05_l2_residency_reuse"] = _make_cell(
-        "P05_l2_residency_reuse", {"rate": "bytes_per_s", "fraction": "dimensionless", "capacity": "bytes"},
-        {"l2_bytes": spec["l2_bytes"], "granule_bytes": 128, "buffer_units_l2": 1, "cache_disable_supported": is_arch35, "ws_sweep_bytes_per_s": p05r.get("ws_sweep_bytes_per_s", {}), **conflict_meta},
-        {"l2_die_bytes_per_s": _band(p05r.get("l2_die_bytes_per_s"), spec["l2_bytes_per_s"], allow_meas=allow),
-         "l2_effective_fraction": _band(p05r.get("l2_effective_fraction"), 1.0, allow_meas=allow)},
-    )
-    p06_modes, any_p06 = {}, False
-    mode_defs = [("bf16", 16, 16, 16, 16, spec["peaks"].get("bf16", 0.0) / aic), ("fp16", 16, 16, 16, 16, spec["peaks"].get("fp16", 0.0) / aic),
-                 ("fp32", 16, 16, 8, 16, spec["peaks"].get("fp32", 0.0) / aic), ("int8", 16, 16, 32, 16, spec["peaks"].get("int8", 0.0) / aic)]
-    if is_arch35:
-        fp8_cap = spec["peaks"].get("fp8_e4m3", spec["peaks"].get("int8", 0.0)) / aic
-        mode_defs.extend([("fp8_e4m3", 16, 16, 32, 16, fp8_cap), ("mxfp8", 16, 16, 32, 16, fp8_cap), ("mxfp4", 16, 16, 64, 16, fp8_cap * 2.0)])
-    for m_name, tm, tn, tk, miss, cap in mode_defs:
-        if cap <= 0.0:
-            continue
-        b = _band(p06r.get("modes", {}).get(m_name), cap, allow_meas=allow)
-        ms = _cell_status({"r": b})
-        any_p06 = any_p06 or (ms == "calibrated")
-        entry = {"status": ms, "tile_m": tm, "tile_n": tn, "tile_k": tk, "m_iss": miss, "cube_only_rate": b if ms == "calibrated" else _clean_band(b)}
-        if m_name in {"mxfp8", "mxfp4"}:
-            entry["scale_group"] = 32
-        p06_modes[m_name] = entry
-    p["P06_mmad"] = _make_cell(
-        "P06_mmad", {"rate": "flops_per_s_per_aic", "latency": "ns"},
-        {"pipe_m_barrier_fractal_threshold": 10, "small_m_bf16_ns": p06r.get("small_m_bf16_ns", {}), **conflict_meta}, {},
-        {"pipe_m_barrier_ns": _bound_only(0.0, "latency_lower")}, status_override="calibrated" if any_p06 else "unmeasured", modes=p06_modes,
-    )
-    p["P07_vec_alu"] = _make_cell("P07_vec_alu", {"rate": "ops_per_s_per_aiv"}, {"vector_width_bytes": 256, "fp32_lanes": 64, "bf16_lanes": 128, **conflict_meta}, {"vec_alu_ops_per_s_per_aiv": _band(raw.get("P07_vec_alu", {}).get("vec_alu_ops_per_s_per_aiv"), spec["vec_alu_ops_per_s"] / aiv, allow_meas=allow)}, {"raw_latency_cycles": _bound_only(0.0, "latency_lower")})
-    p["P08_vec_sfu"] = _make_cell("P08_vec_sfu", {"rate": "ops_per_s_per_aiv"}, {"vector_width_bytes": 256, "fp32_lanes": 64, "bf16_lanes": 128, **conflict_meta}, {"vec_sfu_ops_per_s_per_aiv": _band(raw.get("P08_vec_sfu", {}).get("vec_sfu_ops_per_s_per_aiv"), spec["vec_sfu_ops_per_s"] / aiv, allow_meas=allow)}, {"raw_latency_cycles": _bound_only(0.0, "latency_lower")})
-    p["P09_vec_reduce_cast"] = _make_cell("P09_vec_reduce_cast", {"rate": "ops_per_s_per_aiv", "cast_rate": "bytes_per_s_per_aiv"}, {"mx_scale_group": 32, "mx_dynamic_quant_supported": is_arch35, **conflict_meta}, {"vec_reduce_ops_per_s_per_aiv": _band(p09r.get("vec_reduce_ops_per_s_per_aiv"), spec["vec_reduce_ops_per_s"] / aiv, allow_meas=allow), "cast_bytes_per_s_per_aiv": _band(p09r.get("cast_bytes_per_s_per_aiv"), spec["cast_bytes_per_s"] / aiv, allow_meas=allow)})
-    p["P10_sort_topk"] = _make_cell("P10_sort_topk", {"rate": "elems_per_s"}, {"sort_algorithm": "masked_hist256" if is_arch35 else "sort32_mrgsort4", "supported_sortall_lengths": [64, 128, 256, 512, 1024, 2048], "histogram_trunk_elems": 16384 if is_arch35 else 0, **conflict_meta}, {"sort_elems_per_s": _band(raw.get("P10_sort_topk", {}).get("sort_elems_per_s"), spec["vector_ops_per_s"], allow_meas=allow)})
-    vec_cap = max(1.0, spec["vector_ops_per_s"] / aiv)
-    p["P11_simt"] = _make_cell("P11_simt", {"rate": "ops_per_s_per_aiv", "latency": "ns"}, {"supported": is_arch35, "simt_ub_carveout_bytes": spec["simt_ub_carveout_bytes"], "tla_max_threads": 2048 if is_arch35 else 0, "catlass_max_threads": 1024 if is_arch35 else 0, "warp_size": 32}, {}, {"simt_ops_per_s_per_aiv": _bound_only(vec_cap if is_arch35 else 0.0), "syncthreads_ns": _bound_only(0.0, "latency_lower"), "simt_launch_ns": _bound_only(0.0, "latency_lower")}, status_override="unmeasured" if is_arch35 else "unsupported")
-    p["P12_intracore_flag"] = _make_cell("P12_intracore_flag", {"latency": "ns"}, {"event_ids": 8, "unit_flag_requires_single_l0c_stage": True}, {}, {"flag_ns": _bound_only(0.0, "latency_lower"), "unitflag_ns": _bound_only(0.0, "latency_lower")}, status_override="unmeasured")
-    p["P13_crosscore_sync"] = _make_cell("P13_crosscore_sync", {"latency": "ns"}, {"aiv_inter_block_barrier_id": 8, "aic_inter_block_barrier_id": 9, "intra_subblock_barrier_id": 10, "ffts_max_flag_id": 7, "reverse_depth": 15}, {}, {"mode2_paired_ns": _bound_only(0.0, "latency_lower"), "mode1_subblock_ns": _bound_only(0.0, "latency_lower"), "mode0_aic_barrier_ns": _bound_only(0.0, "latency_lower"), "mode0_aiv_barrier_ns": _bound_only(0.0, "latency_lower")}, status_override="unmeasured")
-    p["P14_mutex_block_mmad"] = _make_cell("P14_mutex_block_mmad", {"latency": "ns"}, {"max_mutex_ids": 28, "unit_flag_requires_single_l0c_stage": True}, {}, {"mutex_overhead_ns": _bound_only(0.0, "latency_lower")}, status_override="unmeasured")
-    p["P15_rts_stars"] = _make_cell("P15_rts_stars", {"latency": "ns"}, {"queue_scope": "die", "queue_depth": 64, "lanes": 1, **conflict_meta}, {"issue_interval_ns": _band(p15r.get("issue_interval_ns"), 0.0, kind="latency_lower", allow_meas=allow), "aiv_first_issue_ns": _band(p15r.get("aiv_first_issue_ns"), 0.0, kind="latency_lower", allow_meas=allow), "aic_first_issue_ns": _band(p15r.get("aic_first_issue_ns"), 0.0, kind="latency_lower", allow_meas=allow)}, {"host_submit_ns": _band(p15r.get("host_submit_ns"), 0.0, kind="latency_lower", allow_meas=allow)})
-    p["P16_multistream_core_control"] = _make_cell("P16_multistream_core_control", {"latency": "ns"}, {"modes": ["disjoint", "shared_cap"], **conflict_meta}, {"stream_event_ns": _band(raw.get("P16_multistream_core_control", {}).get("stream_event_ns"), 0.0, kind="latency_lower", allow_meas=allow)}, {"set_limit_ns": _bound_only(0.0, "latency_lower")})
-    p["P17_aicpu_metadata_launch"] = _make_cell("P17_aicpu_metadata_launch", {"latency": "ns"}, {"aclgraph_cacheable": True}, {}, {"host_select_ns": _bound_only(0.0, "latency_lower"), "aicpu_base_ns": _bound_only(0.0, "latency_lower"), "gm_pub_ns": _bound_only(0.0, "latency_lower"), "eager_d2h_sync_ns": _bound_only(0.0, "latency_lower")}, status_override="unmeasured")
-    p["P18_hccl_collective_band"] = _make_cell("P18_hccl_collective_band", {"rate": "bytes_per_s", "latency": "ns"}, {"payload_bytes_per_frame": 480 if is_arch35 else 1024, "wire_bytes_per_frame": 512 if is_arch35 else 1024, "short_final_frame_policy": "exact_plus_header"}, {}, {"link_bytes_per_s": _bound_only(spec["link_bytes_per_s"]), "startup_ns": _bound_only(0.0, "latency_lower")}, status_override="unmeasured")
-    p["P19_direct_peer_window"] = _make_cell("P19_direct_peer_window", {"rate": "bytes_per_s", "latency": "ns"}, {"transport": "a5_ub_shmem_mte" if is_arch35 else "a3_sio_hccs", "token_payload_bytes_per_frame": 480, "token_wire_bytes_per_frame": 512}, {}, {"peer_bytes_per_s": _bound_only(spec["link_bytes_per_s"]), "status_sync_ns": _bound_only(0.0, "latency_lower")}, status_override="unmeasured")
-    p["P20_host_dma_sync"] = _make_cell(
-        "P20_host_dma_sync", {"rate": "bytes_per_s", "latency": "ns"}, {"contention_scope": "root_complex", **conflict_meta},
-        {"host_h2d_bytes_per_s": _band(p20r.get("host_h2d_bytes_per_s"), spec["host_h2d_bytes_per_s"], allow_meas=allow),
-         "host_d2h_bytes_per_s": _band(p20r.get("host_d2h_bytes_per_s"), spec["host_d2h_bytes_per_s"], allow_meas=allow)},
-        {"host_rc_h2d_bytes_per_s": _bound_only(spec["host_rc_h2d_bytes_per_s"]), "host_rc_d2h_bytes_per_s": _bound_only(spec["host_rc_d2h_bytes_per_s"]),
-         "pinned_dma_startup_ns": _band(p20r.get("pinned_dma_startup_ns"), 0.0, kind="latency_lower", allow_meas=allow),
-         "pageable_dma_startup_ns": _band(p20r.get("pageable_dma_startup_ns"), 0.0, kind="latency_lower", allow_meas=allow),
-         "eager_d2h_sync_ns": _band(p20r.get("eager_d2h_sync_ns"), 0.0, kind="latency_lower", allow_meas=allow)},
-    )
-
+    p.update(_build_memory_primitives(ctx, raw))
+    p.update(_build_compute_primitives(ctx, raw))
+    p.update(_build_sync_and_link_primitives(ctx, raw))
+    collected_utc = str(raw.get("collected_utc") or "").strip() or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    resolved_cann = rt_cann if (rt_cann and (not cann_version or cann_version == "unmeasured")) else cann_version
     payload: dict[str, Any] = {
         "schema_version": PRIMITIVE_SCHEMA_VERSION,
         "arch_preset": spec["arch_preset"],
         "sku": sku,
-        "cann_version": cann_version,
+        "cann_version": resolved_cann,
         "provenance": {
             "campaign_id": campaign_id, "endpoint_alias": alias, "capture_uri": top_capture,
             "calibrated": any(c["status"] == "calibrated" for c in p.values()),
-            "collected_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "collected_utc": collected_utc,
+            "clock_calibration": clock_meta,
             "silicon_fingerprint": {k: spec[k] for k in ("aic_count", "aiv_count", "hbm_gib", "l2_bytes", "ub_bytes", "l1_bytes", "l0a_bytes", "l0b_bytes", "l0c_bytes")},
         },
         "primitives": p,
     }
     payload["envelope_sha256"] = compute_envelope_sha256(payload)
+    assert_no_privacy_leak(json.dumps(payload, sort_keys=True), label="table")
     return payload
 
 
-def _load_endpoint(alias: str) -> dict[str, Any]:
-    data = json.loads((Path.home() / ".mindie" / "endpoints.json").read_text(encoding="utf-8"))
-    eps = data.get("endpoints", data)
-    if alias not in eps:
-        raise SystemExit(f"Unknown endpoint alias: {alias}")
-    return dict(eps[alias])
-
-
-def _ssh_run(ep: dict[str, Any], remote_cmd: str, *, stdin_text: str | None = None, timeout: int = REMOTE_BENCH_TIMEOUT_S) -> subprocess.CompletedProcess[str]:
-    cmd = [
-        "ssh", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={SSH_CONNECT_TIMEOUT_S}",
-        "-o", "StrictHostKeyChecking=yes", "-o", "LogLevel=ERROR",
-        "-p", str(ep.get("port", 22)),
-    ]
-    if ep.get("identity_file"):
-        cmd.extend(["-i", str(ep["identity_file"])])
-    cmd.extend(["-l", str(ep.get("user", "root")), "--", str(ep["host"]), remote_cmd])
-    try:
-        return subprocess.run(cmd, input=stdin_text, capture_output=True, text=True, timeout=timeout, check=False)
-    except subprocess.TimeoutExpired:
-        raise TimeoutError(f"bench_ssh_timeout:timeout_s={timeout}") from None
-
-
-def parse_npu_smi_idle_die(
-    info_text: str, map_text: str, common_text: str, *,
-    npu_id: int, chip_id: int, device_id: int, visible_devices: str = "",
-) -> dict[str, Any]:
-    """Strictly verify physical die idle state, mapping, util, HBM, and clock."""
-    if not re.search(rf"No running processes found in NPU {npu_id}(?!\d)", info_text):
-        raise RuntimeError(f"bench_npu_not_idle:npu={npu_id}")
-    logic_id: int | None = None
-    has_slot = "Slot ID" in map_text
-    for line in map_text.splitlines():
-        cols = line.split()
-        if len(cols) >= 5 and cols[0].isdigit() and cols[1].isdigit() and cols[2].isdigit() and cols[3].isdigit():
-            c_idx, l_idx = (2, 3) if has_slot else (1, 2)
-            if int(cols[0]) == npu_id and int(cols[c_idx]) == chip_id:
-                logic_id = int(cols[l_idx])
-                break
-    if logic_id is None:
-        raise ValueError(f"bench_npu_mapping_missing:npu={npu_id}:chip={chip_id}")
-    if visible_devices:
-        if not SAFE_VISIBLE_RE.fullmatch(visible_devices):
-            raise ValueError("bench_visible_devices_invalid")
-        vis_list = [int(x) for x in visible_devices.split(",")]
-        if device_id < 0 or device_id >= len(vis_list):
-            raise ValueError("bench_npu_die_mismatch")
-        target_logic = vis_list[device_id]
-    else:
-        target_logic = device_id
-    if target_logic != logic_id:
-        raise ValueError(f"bench_npu_die_mismatch:expected_logic={logic_id}:got={target_logic}")
-    block = common_text
-    if "Chip ID" in common_text:
-        parts = re.split(r"(?m)^\s*Chip ID\s*:\s*", common_text)
-        matched = [part for part in parts[1:] if re.match(rf"^{chip_id}(?!\d)", part.strip())]
-        if not matched:
-            raise ValueError(f"bench_npu_common_missing:chip={chip_id}")
-        block = matched[0]
-    def _int_field(label: str) -> int | None:
-        m = re.search(rf"{re.escape(label)}\s*:\s*(\d+)", block)
-        return int(m.group(1)) if m else None
-    aic_util, hbm_util = _int_field("Aicore Usage Rate(%)"), _int_field("HBM Usage Rate(%)")
-    aic_cnt, aic_freq, cur_freq = _int_field("Aicore Count"), _int_field("Aicore Freq(MHZ)"), _int_field("Aicore curFreq(MHZ)")
-    if aic_util is None or hbm_util is None:
-        raise RuntimeError("bench_npu_telemetry_missing")
-    if aic_cnt is None or aic_cnt <= 0 or aic_freq is None or aic_freq <= 0:
-        raise RuntimeError("bench_npu_clock_missing")
-    if aic_util > MAX_IDLE_AICORE_UTIL_PCT:
-        raise RuntimeError(f"bench_npu_busy:aicore_util={aic_util}")
-    if hbm_util > MAX_IDLE_HBM_UTIL_PCT:
-        raise RuntimeError(f"bench_npu_busy:hbm_util={hbm_util}")
-    return {
-        "npu_id": npu_id, "chip_id": chip_id, "chip_logic_id": target_logic,
-        "aicore_util_pct": aic_util, "hbm_util_pct": hbm_util,
-        "observed_aic_count": aic_cnt, "observed_aicore_freq_mhz": aic_freq, "observed_cur_freq_mhz": cur_freq,
-    }
-
-
-def _check_idle_npu_card(ep: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
-    cmd = f"npu-smi info; echo '__MAP__'; npu-smi info -m; echo '__COMMON__'; npu-smi info -t common -i {int(args.npu_id)}"
-    res = _ssh_run(ep, cmd, timeout=20)
-    if res.returncode != 0:
-        raise RuntimeError(f"bench_npu_smi_failed:rc={res.returncode}")
-    parts = res.stdout.split("__MAP__", 1)
-    if len(parts) != 2 or "__COMMON__" not in parts[1]:
-        raise RuntimeError("bench_npu_smi_parse_failed")
-    info_text = parts[0]
-    map_text, common_text = parts[1].split("__COMMON__", 1)
-    return parse_npu_smi_idle_die(
-        info_text, map_text, common_text,
-        npu_id=int(args.npu_id), chip_id=int(args.chip_id),
-        device_id=int(args.device_id), visible_devices=str(args.visible_devices or ""),
-    )
-
-
 def run_remote_calibration(args: argparse.Namespace) -> dict[str, Any]:
-    ep = _load_endpoint(args.endpoint_alias)
-    obs = _check_idle_npu_card(ep, args)
-    spec = _load_sku_hardware_spec(args.sku)
-    if args.container and not SAFE_CONTAINER_RE.fullmatch(args.container):
-        raise ValueError("bench_container_invalid")
-    script_b64 = base64.b64encode(Path(__file__).read_bytes()).decode("ascii")
-    env_line = f"export ASCEND_RT_VISIBLE_DEVICES={shlex.quote(args.visible_devices)}\n" if args.visible_devices else ""
-    py_cmd = " ".join([
-        shlex.quote(args.python_bin), '"$TMPD/bench_l0.py"', "--local-npu",
-        "--device-id", str(int(args.device_id)), "--l2-bytes", str(int(spec["l2_bytes"])),
-        "--aic-count", str(int(spec["aic_count"])), "--aiv-count", str(int(spec["aiv_count"])),
-        "--arch", shlex.quote(spec["arch_preset"]), "--warmup", str(int(args.warmup)), "--repeats", str(int(args.repeats)),
-    ])
-    bash_script = (
-        "set -euo pipefail\n"
-        "TMPD=$(mktemp -d /tmp/mindie-l0-bench.XXXXXX)\n"
-        "trap 'rm -rf \"$TMPD\"' EXIT\n"
-        f"cat <<'EOF_B64' | base64 -d > \"$TMPD/bench_l0.py\"\n{script_b64}\nEOF_B64\n"
-        "source /usr/local/Ascend/ascend-toolkit/set_env.sh 2>/dev/null || "
-        "source /usr/local/Ascend/cann/set_env.sh 2>/dev/null || true\n"
-        f"{env_line}{py_cmd}\n"
-    )
-    remote_cmd = f"docker exec -i {shlex.quote(args.container)} bash -s" if args.container else "bash -s"
-    completed = _ssh_run(ep, remote_cmd, stdin_text=bash_script, timeout=REMOTE_BENCH_TIMEOUT_S)
-    if completed.returncode != 0:
-        raise RuntimeError(f"remote_calibration_failed:rc={completed.returncode}")
-    for line in reversed(completed.stdout.splitlines()):
-        if line.startswith(RESULT_MARKER):
-            data = json.loads(line[len(RESULT_MARKER):])
-            data["observed_silicon"] = obs
-            return data
-    raise RuntimeError("remote_calibration_missing_result")
-
-
-def update_manifest(manifest_path: Path, table_path: Path, payload: dict[str, Any]) -> None:
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.is_file() else {"schema_version": PRIMITIVE_SCHEMA_VERSION, "tables": {}}
-    sku = payload["sku"]
-    manifest.setdefault("tables", {})[sku] = {
-        "file": table_path.name, "sku": sku, "compatible_skus": [sku],
-        "arch_preset": payload["arch_preset"], "cann_version": payload["cann_version"],
-        "calibrated": bool(payload["provenance"]["calibrated"]),
-        "calibrated_primitive_count": sum(1 for c in payload["primitives"].values() if c["status"] == "calibrated"),
-        "total_primitives": len(payload["primitives"]),
-        "envelope_sha256": payload["envelope_sha256"],
-        "capture_uri": payload["provenance"]["capture_uri"],
-    }
-    manifest_path.parent.mkdir(parents=True, exist_ok=True)
-    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return _run_remote_calibration(args, _load_sku_hardware_spec(args.sku))
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Offline Ascend L0 primitive micro-benchmark calibration suite")
-    parser.add_argument("--local-npu", action="store_true")
-    parser.add_argument("--emit-unmeasured", action="store_true")
-    parser.add_argument("--endpoint-alias", default="")
-    parser.add_argument("--record-alias", default="")
-    parser.add_argument("--container", default="")
-    parser.add_argument("--python-bin", default="python3")
-    parser.add_argument("--npu-id", type=int, default=0)
-    parser.add_argument("--chip-id", type=int, default=0)
-    parser.add_argument("--device-id", type=int, default=0)
-    parser.add_argument("--visible-devices", default="")
-    parser.add_argument("--sku", default="")
-    parser.add_argument("--arch", default="npu_arch_2201")
-    parser.add_argument("--cann-version", default="unmeasured")
-    parser.add_argument("--campaign-id", default="camp-202611-l0")
-    parser.add_argument("--l2-bytes", type=int, default=134217728)
-    parser.add_argument("--aic-count", type=int, default=32)
-    parser.add_argument("--aiv-count", type=int, default=64)
-    parser.add_argument("--warmup", type=int, default=DEFAULT_WARMUP)
-    parser.add_argument("--repeats", type=int, default=DEFAULT_REPEATS)
-    parser.add_argument("--primitives", default="all")
-    parser.add_argument("--out", default="")
-    parser.add_argument("--manifest", default="data/primitives/manifest.json")
+    for flag in ("--local-npu", "--emit-unmeasured"):
+        parser.add_argument(flag, action="store_true")
+    for flag, default in (
+        ("--endpoint-alias", ""), ("--record-alias", ""), ("--container", ""), ("--python-bin", "python3"),
+        ("--visible-devices", ""), ("--sku", ""), ("--arch", "npu_arch_2201"), ("--cann-version", "unmeasured"),
+        ("--campaign-id", "camp-202611-l0"), ("--primitives", "all"), ("--out", ""),
+        ("--manifest", "data/primitives/manifest.json"), ("--from-raw-json", ""),
+    ):
+        parser.add_argument(flag, default=default)
+    for flag, default in (
+        ("--npu-id", 0), ("--chip-id", 0), ("--device-id", 0),
+        ("--peer-npu-id", 0), ("--peer-chip-id", 1), ("--peer-device-id", -1),
+        ("--l2-bytes", DEFAULT_L2_ARG), ("--aic-count", DEFAULT_AIC_ARG), ("--aiv-count", DEFAULT_AIV_ARG),
+        ("--warmup", DEFAULT_WARMUP), ("--repeats", DEFAULT_REPEATS),
+    ):
+        parser.add_argument(flag, type=int, default=default)
     args = parser.parse_args(argv)
 
     if args.local_npu:
+        if not args.sku:
+            raise SystemExit("--sku is required with --local-npu to bind hardware geometry")
+        spec = _load_sku_hardware_spec(args.sku)
+        vis = str(args.visible_devices or "").strip()
+        obs = _check_local_idle_die(int(args.npu_id), int(args.chip_id), int(args.device_id), vis)
+        if int(args.peer_device_id) >= 0:
+            _check_local_idle_die(int(args.peer_npu_id), int(args.peer_chip_id), int(args.peer_device_id), vis)
+        if vis:
+            os.environ["ASCEND_RT_VISIBLE_DEVICES"] = vis
         raw = run_local_npu_microbenchmarks(
-            device_id=args.device_id, l2_bytes=args.l2_bytes, aic_count=args.aic_count,
-            aiv_count=args.aiv_count, arch_preset=args.arch, warmup=args.warmup, repeats=args.repeats,
+            device_id=args.device_id, peer_device_id=args.peer_device_id,
+            l2_bytes=int(spec["l2_bytes"]), aic_count=int(spec["aic_count"]), aiv_count=int(spec["aiv_count"]),
+            arch_preset=str(spec["arch_preset"]), warmup=args.warmup, repeats=args.repeats,
+            primitives=str(args.primitives or "all"),
         )
+        raw["observed_silicon"] = obs
         print(RESULT_MARKER + json.dumps(raw, sort_keys=True, separators=(",", ":")))
         return 0
 
@@ -777,21 +713,30 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("--sku is required")
     out_path = Path(args.out) if args.out else (REPO_ROOT / "data" / "primitives" / SKU_DEFAULT_FILES[args.sku])
     manifest_path = Path(args.manifest) if Path(args.manifest).is_absolute() else (REPO_ROOT / args.manifest)
-    raw_meas = None if args.emit_unmeasured else run_remote_calibration(args)
+    if args.from_raw_json:
+        raw_meas = unwrap_raw_measurements(json.loads(Path(args.from_raw_json).read_text(encoding="utf-8")))
+    else:
+        raw_meas = None if args.emit_unmeasured else run_remote_calibration(args)
     rec_alias = args.record_alias or sanitize_record_alias(args.endpoint_alias or args.sku, args.sku)
     payload = build_primitive_table_payload(
         sku=args.sku, cann_version=args.cann_version, endpoint_alias=rec_alias,
         campaign_id=args.campaign_id, raw_measurements=raw_meas,
     )
+    from mindie_sim.primitives.schema import parse_primitive_table
+
+    parse_primitive_table(payload)
+    cap_bytes = canonical_capture_bytes(args.sku, raw_meas)
+    table_text = json.dumps(payload, indent=JSON_INDENT, sort_keys=True) + "\n"
+    assert_no_privacy_leak(table_text, label="table_write")
     out_path.parent.mkdir(parents=True, exist_ok=True)
     cap_path = out_path.parent / "captures" / f"{out_path.stem}.capture.json"
     cap_path.parent.mkdir(parents=True, exist_ok=True)
-    cap_path.write_bytes(canonical_capture_bytes(args.sku, raw_meas))
-    out_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    cap_path.write_bytes(cap_bytes)
+    out_path.write_text(table_text, encoding="utf-8")
     update_manifest(manifest_path, out_path, payload)
     cal = [k for k, v in payload["primitives"].items() if v["status"] == "calibrated"]
     rel_out = os.path.relpath(out_path, REPO_ROOT) if out_path.resolve().is_relative_to(REPO_ROOT.resolve()) else out_path.name
-    print(json.dumps({"sku": args.sku, "out": rel_out, "calibrated_count": len(cal), "calibrated": cal, "envelope_sha256": payload["envelope_sha256"]}, indent=2))
+    print(json.dumps({"sku": args.sku, "out": rel_out, "calibrated_count": len(cal), "calibrated": cal, "coverage": _coverage_summary(payload), "envelope_sha256": payload["envelope_sha256"]}, indent=JSON_INDENT))
     return 0
 
 

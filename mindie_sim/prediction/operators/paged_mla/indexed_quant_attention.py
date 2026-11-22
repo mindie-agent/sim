@@ -21,14 +21,18 @@ from mindie_sim.prediction.program import KernelProgram, ParallelProgram, Pipeli
 
 AIV_KEY_GROUP_ALIGNMENT = 4
 AIV_STORE_HEADER_BYTES = 512
-DEQUANT_OPS_PER_SCALE = 8
-DEQUANT_OPS_PER_VALUE = 5
+#: Blocked typed vector widths in kv_quant_sparse_flash_attention_service_vector_mla.h:2609-2667:
+#: Cast(i8->f16, 128-wide=0.5) + Cast(f16->f32, 1.0) + Mul(f32, 1.0) + Cast(f32->bf16, 1.0) + Copy(bf16, 0.5) = 4.0;
+#: Brcb issues 1 vector repeat per 4 scales; rotary Copy is 128-wide BF16 (0.5 FP32-eq op/lane).
+DEQUANT_OPS_PER_SCALE = 1
+DEQUANT_OPS_PER_VALUE = 4
+DEQUANT_ROPE_COPY_DIVISOR = 2
 GATHER_INDEX_BYTES_PER_KEY = 8
 INDEXED_LATENT_DIM = 512
 INDEXED_ROPE_DIM = 64
 KV_SCALE_ELEMENT_BYTES = 4
 KV_SCALE_GROUP_SIZE = 128
-MAX_QUANT_INDEXED_HEADS = 64
+MAX_QUANT_INDEXED_HEADS = 128
 
 
 VECTOR_BUFFER_BYTES = (64 + 32 + 32 + 4 + 32 + 8 + 8) * 1024 + (3 * 3 + 2) * 512
@@ -146,7 +150,7 @@ def phases(keys, heads, latent, rope, *, first, last, scratch_policy,
     # These are typed element service counts, not a measured instruction CPI.
     # Rotary data is already BF16. Its source Copy to NZ adds a lane move,
     # not an INT8 dequantization pass.
-    convert = Work(resources={"vector": keys * (DEQUANT_OPS_PER_VALUE * latent + latent // KV_SCALE_GROUP_SIZE * DEQUANT_OPS_PER_SCALE + rope)})
+    convert = Work(resources={"vector": keys * (DEQUANT_OPS_PER_VALUE * latent + latent // KV_SCALE_GROUP_SIZE * DEQUANT_OPS_PER_SCALE + rope // DEQUANT_ROPE_COPY_DIVISOR)})
     return (("gather", gather), ("dequantize", convert), *common[1:])
 
 

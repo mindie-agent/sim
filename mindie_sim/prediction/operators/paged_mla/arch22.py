@@ -9,13 +9,14 @@ Upstream-ABI: aclnnFusedInferAttentionScore
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from mindie_sim.schema.common import ModelingError, dtype_bytes
 from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.schema.operators import OpSpec
 
 from ..contracts import ArchStrategy, OperatorPlanningContext
+from ..sharedkv.split_core import resolve_fia_mla_tiling
 from ._lowering import FIA_WORKSPACE_DEPTH, PipelineLayout, make_plan
 from .common import FP32_BYTES, capability_gap, contract_for
 
@@ -25,6 +26,7 @@ TASK_RECORD_COUNT = 3
 WORKSPACE_DEPTH = FIA_WORKSPACE_DEPTH
 # The source assigns <=16 live M rows to the first AIV subblock.
 HEAD_TILE = 16
+NATIVE_S2_MIN = 512
 CLOCKS = (
     ("q_load", "kv_load", "qk_operands", "qk", "score_store"),
     ("score_read", "softmax", "probability", "pv_load", "pv_operands", "pv",
@@ -87,15 +89,46 @@ class _FiaStrategy:
         if ctx.compute_arch.arch_id != self.arch_id or c.abi != self.abi:
             raise capability_gap("paged_mla_unsupported_abi", c.abi, ctx.compute_arch.arch_id)
         elem = int(dtype_bytes(op.dtype or "bf16"))
-        keys = min(c.s2_base_size, max((kv for q, kv in c.sequences if q), default=0))
-        heads = min(HEAD_TILE, c.physical_heads) if keys or not ctx.requests else 0
+        l2_cap = int(ctx.geometry.buffers.get("l2", dict(ctx.datapath.buffers).get("l2", 0)))
+        native_mla = (
+            c.splits == 1
+            and c.physical_heads > HEAD_TILE
+            and c.s2_base_size >= NATIVE_S2_MIN
+        )
+        head_tile = HEAD_TILE
+        s2_tile = c.s2_base_size
+        used_cores = 1
+        if native_mla:
+            tiling = resolve_fia_mla_tiling(
+                sequences=c.sequences, physical_heads=c.physical_heads,
+                aic_count=ctx.effective_aic_cores, is_arch35=False,
+            )
+            head_tile = min(tiling.m_tile, c.physical_heads)
+            s2_tile = tiling.s2_tile
+            used_cores = tiling.used_cores
+            if tiling.fd_splits_per_row > 1:
+                c = replace(c, splits=tiling.fd_splits_per_row)
+        keys = min(s2_tile, max((kv for q, kv in c.sequences if q), default=0))
+        heads = min(head_tile, c.physical_heads) if keys or not ctx.requests else 0
+        ws_per_core = WORKSPACE_DEPTH * (
+            heads * keys * (FP32_BYTES + elem) + heads * c.dv * (FP32_BYTES + elem)
+        )
+        latent_in_flight = WORKSPACE_DEPTH * keys * c.dqk * elem
+        ws_l2_resident = native_mla and l2_cap > 0 and (ws_per_core * max(1, used_cores)) <= l2_cap
+        latent_l2_hit = (
+            native_mla and bool(c.latent_alias) and l2_cap > 0
+            and ((ws_per_core + latent_in_flight) * max(1, used_cores)) <= l2_cap
+        )
         workspace_regions = (
             ("mm1", WORKSPACE_DEPTH, heads * keys * FP32_BYTES),
             ("vec1", WORKSPACE_DEPTH, heads * keys * elem),
             ("mm2", WORKSPACE_DEPTH, heads * c.dv * FP32_BYTES),
             ("vec2", WORKSPACE_DEPTH, heads * c.dv * elem),
         )
-        layout = PipelineLayout(CLOCKS, WORKSPACE_REGIONS, HEAD_TILE, c.s2_base_size, gm_workspace=True)
+        layout = PipelineLayout(
+            CLOCKS, WORKSPACE_REGIONS, head_tile, s2_tile,
+            gm_workspace=True, ws_l2_resident=ws_l2_resident, latent_l2_hit=latent_l2_hit,
+        )
         return make_plan(
             op, ctx, c, layout, self.sources,
             task_record_count=TASK_RECORD_COUNT, workspace_depth=WORKSPACE_DEPTH,

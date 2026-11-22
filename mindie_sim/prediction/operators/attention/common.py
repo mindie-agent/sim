@@ -38,12 +38,14 @@ from ._cp_tiling import (
 FIA_ABI = "aclnnFusedInferAttentionScore"
 GBSA_ABI = "aclnnGenericBlockSparseAttention"
 C8_ABI = "aclnnKvQuantSparseFlashAttentionV2"
+C8_V1_ABI = "aclnnKvQuantSparseFlashAttention"
+SFA_V1_ABI = "aclnnSparseFlashAttention"
 NOPE_ABI = "aclnnSparseFlashMla"
 MINDIE_V1_ABI = "mindie_sd.block_sparse_attention_v1"
 MINDIE_V2_ABI = "mindie_sd.block_sparse_attention_v2"
 MINDIE_V3_ABI = "mindie_sd.block_sparse_attention_v3"
 MINDIE_ABIS = frozenset({MINDIE_V1_ABI, MINDIE_V2_ABI, MINDIE_V3_ABI})
-SUPPORTED_ABIS = frozenset({FIA_ABI, GBSA_ABI, C8_ABI, NOPE_ABI}) | MINDIE_ABIS
+SUPPORTED_ABIS = frozenset({FIA_ABI, GBSA_ABI, C8_ABI, C8_V1_ABI, SFA_V1_ABI, NOPE_ABI}) | MINDIE_ABIS
 ARCH22 = "npu_arch_2201"
 ARCH35 = "npu_arch_3510"
 QUANT_MODE_BF16 = 0
@@ -676,7 +678,19 @@ def read_work(ctx: OperatorPlanningContext, bytes_: int, *, aiv: bool = False, h
               l2: int = 0) -> Work:
     roles = ctx.geometry.resource_units or ctx.geometry.rates
     pipe = read_role(roles, aiv=0 if aiv else None) if roles else ("mte2_aiv" if aiv else "mte2_aic")
-    return Work(resources={pipe: bytes_, "hbm": bytes_ if hbm is None else hbm, "l2": l2})
+    l2_amt = l2 if (l2 and "l2" in ctx.geometry.rates) else 0
+    return Work(resources={pipe: bytes_, "hbm": bytes_ if hbm is None else hbm, "l2": l2_amt})
+
+
+def workspace_write_work(ctx: OperatorPlanningContext, pipe: str, bytes_: int, *, l2_resident: bool = False) -> Work:
+    if bytes_ <= 0:
+        return Work()
+    if l2_resident:
+        res = {pipe: bytes_}
+        if "l2" in ctx.geometry.rates:
+            res["l2"] = bytes_
+        return Work(resources=res)
+    return Work(resources={pipe: bytes_, "hbm": bytes_})
 
 
 def output_phases(

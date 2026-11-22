@@ -594,9 +594,15 @@ def lower_collective(
 
     band = select_band(
         collective, group, topology, band_payload,
-        stack=stack, expansion_mode=expansion_mode,
+        stack="default" if stack == "eager" else stack, expansion_mode=expansion_mode,
     )
     collective_startup = band.startup_us if band.startup_scope == "collective" else 0.0
+    p18_blk = float(getattr(topology, "p18_startup_us", 0.0) or 0.0)
+    p18_egr = float(getattr(topology, "p18_eager_startup_us", 0.0) or 0.0)
+    if stack == "eager" and p18_egr > 0.0:
+        collective_startup = max(collective_startup, p18_egr)
+    elif p18_blk > 0.0:
+        collective_startup = max(collective_startup, p18_blk)
     phase_startup = band.startup_us if band.startup_scope == "phase" else 0.0
     self_copies: dict[int, float] = {rank: 0.0 for rank in group}
     per_rank_payload: dict[int, float] = {rank: 0.0 for rank in group}
