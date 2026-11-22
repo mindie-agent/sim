@@ -45,42 +45,33 @@ BASE_SKU, DUAL_SKU, MESH_SKU = REPRESENTATIVE_SKUS.values()
 
 def call(abi, peers, *, shape=(), **fields):
     shape = (M, K, N) if abi in (GATHER, SCATTER) else shape
-    return OpSpec("call", "mc2", "decode", 0, 0, (), shape, shape, shape, shape,
-                  dtype="bf16", recipe=f"mc2_{abi}",
-                  metadata=(("mc2", dict(abi=abi, world_size=peers, **fields)),))
+    return OpSpec("call", "mc2", "decode", 0, 0, (), shape, shape, shape, shape, dtype="bf16",
+                  recipe=f"mc2_{abi}", metadata=(("mc2", dict(abi=abi, world_size=peers, **fields)),))
 
 def geometry(sku, peers=1):
     hw = machine(sku, num_devices=peers)
-    return Geometry.from_devices(hw.dies[:1], links=hw.links,
-                                 transfer_channels=hw.transfer_channels)
+    return Geometry.from_devices(hw.dies[:1], links=hw.links, transfer_channels=hw.transfer_channels)
 
 def lower_plan(op, geo, **modes):
     rates = dict.fromkeys(ROLES, RATE)
     units = {role: geo.resource_units.get(role, 1) for role in rates}
-    context = RecipeContext(op, {}, {r: r for r in rates}, rates, geo.compute_units,
-                            resource_units=units, compute_peaks={"bf16": RATE * 1000},
-                            service_modes=modes, datapath=geo.datapath)
+    context = RecipeContext(op, {}, {r: r for r in rates}, rates, geo.compute_units, resource_units=units,
+                            compute_peaks={"bf16": RATE * 1000}, service_modes=modes, datapath=geo.datapath)
     return mc2.build(op, geo), context
 
 def execute(program, rates, units, *, backend="python"):
-    engine = Engine([Resource(r, rate, units=units[r]) for r, rate in rates.items()],
-                    trace_limit=10000, backend=backend)
+    engine = Engine([Resource(r, rate, units=units[r]) for r, rate in rates.items()], trace_limit=10000, backend=backend)
     ready = engine.submit("input", release=RELEASE)
     done = program.start(engine, "call", ready)
     engine.advance(horizon=RELEASE - 1)
     assert not any(engine.serviced.values())
     engine.advance(until=(done,))
     engine.advance()
-    assert engine.summary()["live_tasks"] == engine.summary()["live_programs"] == 0
-    assert not any(engine.allocated.values())
+    assert engine.summary()["live_tasks"] == engine.summary()["live_programs"] == 0 and not any(engine.allocated.values())
     return done.time - RELEASE, engine
 
-def stages(program):
-    return {stage.name: stage for stage in program.stages}
-
-def timings(engine):
-    return {stage["task"].rsplit(":", 1)[-1]: stage for stage in engine.trace}
-
+def stages(program): return {stage.name: stage for stage in program.stages}
+def timings(engine): return {stage["task"].rsplit(":", 1)[-1]: stage for stage in engine.trace}
 def ancestors(graph, name):
     pending, seen = list(graph[name].after), set()
     while pending:
@@ -546,55 +537,63 @@ def test_native_joint_calls_charge_each_channel_once_and_gate_consumer(protocol,
     raw["model"].update(hidden_size=width, head_dim=width // 4)
     raw["machine"]["device"]["launch_us"] = 3
     raw["runtime"]["kernels"]["invocations"] = [
-        {"match": {"kernel": f"MoeDistribute{kind}{'V2' if legacy else 'V3'}"}, "minimum_ms": .030}
-        for kind in ("Dispatch", "Combine")]
+        {"match": {"kernel": f"MoeDistribute{k}{'V2' if legacy else 'V3'}"}, "minimum_ms": .030} for k in ("Dispatch", "Combine")]
     parsed = parse_case(raw)
     if legacy:
         parsed = replace(parsed, model=replace(parsed.model, quant=QuantSpec(
-            "row-int8", weight_format="int8", expert_weight_format="int8",
-            activation_format="int8", scale_format="fp32", scale_bytes=4,
-            exclusions=("router", "norm"))))
+            "row-int8", weight_format="int8", expert_weight_format="int8", activation_format="int8",
+            scale_format="fp32", scale_bytes=4, exclusions=("router", "norm"))))
     graphs = target_graphs(parsed, phase="decode", tokens=1, sequences=sequences, context=128, scope="body")
-    result = graph_costs(parsed, graphs, external_inputs={"analysis_input": RELEASE},
-                         input_ready_ms=RELEASE, isolated=False, include_submission=True)
+    result = graph_costs(parsed, graphs, external_inputs={"analysis_input": RELEASE}, input_ready_ms=RELEASE, isolated=False, include_submission=True)
     x = result["execution"]
     expected = sum(4 if protocol is None and rows == 3 else rows for rows in sequences)
-    expected *= width + 4 + 12 + width * 2 if legacy else 2 * FRAME
-    expected += 16 if legacy else 4 * FLAG
-    assert sum(v for k, v in x["serviced"].items() if k.startswith("link:")) == expected
-    assert x["live_tasks"] == x["live_programs"] == 0
+    expected = expected * (width + 4 + 12 + width * 2 if legacy else 2 * FRAME) + (16 if legacy else 4 * FLAG)
+    assert sum(v for k, v in x["serviced"].items() if k.startswith("link:")) == expected and x["live_tasks"] == x["live_programs"] == 0
     timeline = {row["id"]: row for row in result["timeline"]}
     assert min(row["ready_ms"] for row in timeline.values()) >= RELEASE
     if not legacy:
         native = x["native_groups"]
-        assert len(native) == 2
-        for direction in ("tx", "rx"):
-            assert sum(g[f"transport_{direction}_bytes"] for g in native) == expected
+        assert len(native) == 2 and all(sum(g[f"transport_{d}_bytes"] for g in native) == expected for d in ("tx", "rx"))
     for rank, graph in graphs.items():
         indexed = {op.op_id: op for op in graph}
         dispatch, gate = (indexed["s0.l0." + name] for name in ("dispatch", "expert_up"))
         assert (dict(dispatch.metadata).get("moe_comm_selection", {}).get("mode") == "dynamic") is (protocol is None)
         group = [dict(o.metadata)["device_kernel_group"] for o in graph if "device_kernel_group" in dict(o.metadata)]
         assert sum(g["entry"] for g in group) == sum(g["exit"] for g in group) == 2
-        prefix = f"r{rank}:"
-        assert timeline[prefix + gate.op_id]["ready_ms"] >= timeline[prefix + dispatch.op_id]["complete_ms"]
+        assert timeline[f"r{rank}:" + gate.op_id]["ready_ms"] >= timeline[f"r{rank}:" + dispatch.op_id]["complete_ms"]
         if legacy:
             meta = dict(dispatch.metadata)
-            assert meta["activation_scale_shape"] == (sum(sequences),)
-            assert meta["activation_scale_bytes"] == 4 * sum(sequences)
-            assert meta["assist_info_shape"] == (sum(sequences), 3)
+            assert meta["activation_scale_shape"] == (sum(sequences),) and meta["activation_scale_bytes"] == 4 * sum(sequences)
+            assert meta["assist_info_shape"] == (sum(sequences), 3) and dict(indexed["s0.l0.combine"].metadata)["expand_scales_buffer_producer"] == dispatch.op_id
             assert {"activation_scales", "assist_info", "expert_token_nums", "ep_send_counts", "expand_scales"} <= set(dispatch.returns)
-            assert dict(indexed["s0.l0.combine"].metadata)["expand_scales_buffer_producer"] == dispatch.op_id
 
 @pytest.mark.parametrize("parallel", ({"tp": 1, "ep": 1}, {"dp": 2}, {"ep": 8}))
 def test_partition_requires_matching_expert_and_tensor_placement(parallel):
     fields = {"tp": 4, "ep": 4, "dp": 1, "etp": 1, "cp": 1, "pcp": 1, **parallel}
-    runtime = SimpleNamespace(kernels={"moe_token_partition": {"kind": KIND, "padding": "right_to_tp"}},
-                              moe_recipe="alltoall")
-    placement = dict(parallel=SimpleNamespace(**fields), plan=SimpleNamespace(scope="body", expert_latent_size=0),
-                    model=SimpleNamespace(hidden_size=32), tokens=1)
-    if fields["tp"] == 1:
-        assert select_partition(runtime, **placement) is None
+    rt = SimpleNamespace(kernels={"moe_token_partition": {"kind": KIND, "padding": "right_to_tp"}}, moe_recipe="alltoall")
+    pl = dict(parallel=SimpleNamespace(**fields), plan=SimpleNamespace(scope="body", expert_latent_size=0), model=SimpleNamespace(hidden_size=32), tokens=1)
+    if fields["tp"] == 1: assert select_partition(rt, **pl) is None
     else:
-        with pytest.raises(ModelingError, match="dp1_ep_equals_tp"):
-            select_partition(runtime, **placement)
+        with pytest.raises(ModelingError, match="dp1_ep_equals_tp"): select_partition(rt, **pl)
+
+def test_matmul_all_reduce_multichunk_rdma_and_hbm_coupling():
+    from mindie_sim.prediction.operators.mc2 import megamoe
+    from mindie_sim.prediction.runtime.l2_residency import AdmissionMemoryView
+    for sku, extra in ((BASE_SKU, {"transport_binding": CLIENT_BINDING}), (MESH_SKU, {})):
+        geo = geometry(sku, 4)
+        op = call("matmul_all_reduce", 4, shape=(16, K, N), internal_chunks=4, independent_buffers=True, independent_handles=True, **extra)
+        plan, ctx = lower_plan(op, geo)
+        stgs = stages(plan.program(ctx))
+        _, eng = execute(plan.lower(ctx), ctx.rates, ctx.resource_units)
+        assert plan.metadata["peer_payload_bytes"] == 2 * 3 * (16 // 4) * N * 2 and {s.metadata["slot"] for s in stgs.values() if "slot" in s.metadata} == {0, 1}
+        assert +Counter(eng.serviced) == pytest.approx(+Counter(ctx.bind(plan.work))) and all(("hbm" in s.work) == (sku == BASE_SKU) for s in stgs.values() if "_rs_peer_" in s.name)
+    geo_m, geo_b = geometry(MESH_SKU, 2), geometry(BASE_SKU, 2)
+    roce = mc2.build(call(DISPATCH, 2, width=ROW, transport_abi="a5_roce", assignment_matrix={(0, 1): 2}, status_bytes=0), geo_m)
+    mte = mc2.build(call(DISPATCH, 2, width=ROW, transport_abi=WINDOW, assignment_matrix={(0, 1): 2}, status_bytes=0), geo_m)
+    assert roce.metadata["peer_payload_bytes"] < mte.metadata["peer_payload_bytes"]
+    assert mc2.build(call(DISPATCH, 2, width=ROW, transport_abi="a2_mte", assignment_matrix={(0, 1): 2}, status_bytes=0), geo_b).metadata["transport_abi"] == "a2_mte"
+    mm_op = megamoe.make_op(op_id="mm", tokens=4, hidden=128, moe_inter=256, top_k=2, routed_rows=8.0, w13_bytes=65536.0, w2_bytes=32768.0, ep=2, compute_dtype="bf16")
+    geo_view = replace(geo_m, buffers={"ub": 262144, "l1": 524288, "l0a": 65536, "l0b": 65536, "l0c": 131072, "l2": 1048576}, rates={**geo_m.rates, "l2": RATE}, admission_memory_view=AdmissionMemoryView({0: 512}))
+    mm_plan, mm_ctx = megamoe.build(mm_op, geo_view), lower_plan(call(DISPATCH, 2, width=ROW, assignment_matrix={(0, 1): 1}), geo_view)[1]
+    mm_stgs = {s.name: s for s in mm_plan.program(mm_ctx).programs[0].stages}
+    assert mm_plan.metadata["l2_onchip_activation_bytes"] == 512.0 and mm_stgs["gmm1_gate_up"].work["hbm"] != mm_stgs["gmm2_down"].work["hbm"] and "l2" not in mm_stgs["gmm2_down"].work

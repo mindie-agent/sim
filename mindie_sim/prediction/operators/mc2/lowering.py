@@ -29,8 +29,10 @@ TRIPLE_META_BYTES = 12
 INT8_QUANT_OPS = 7
 FP8_QUANT_OPS = 5
 SIO_HCCS = "a3_sio_hccs"
+A2_MTE = "a2_mte"
 SHMEM = "a5_shmem"
 CCU = "a5_ccu"
+A5_ROCE = "a5_roce"
 MILLISECONDS_PER_SECOND = 1000
 
 @dataclass(frozen=True, slots=True)
@@ -58,6 +60,7 @@ class Transport:
     ccu: bool = False
     aiv_staging: bool = True
     direct_remote_gm: bool = False
+    gm_bounce_hbm: bool = False
     incoming_routes: tuple[PeerRoute, ...] = ()
 
     def peer_bytes(self, payload: int | float) -> int | float:
@@ -88,21 +91,24 @@ def store_work(amount: int | float, *, fixpipe: bool = False, l2: bool = False) 
 
 
 def peer_stages(name: str, after: tuple[str, ...], route: PeerRoute, transport: Transport,
-                amount: int | float, metadata: tuple = (), *, outgoing: bool = True) -> tuple[Phase, ...]:
+                amount: int | float, metadata: tuple = (), *, outgoing: bool = True,
+                couple_gm_bounce: bool = False) -> tuple[Phase, ...]:
     wire = transport.peer_bytes(amount)
     info = (
         ("source_rank", route.source), ("destination_rank", route.destination),
         ("topology_hops", "/".join(route.hops)), ("peer_limit", transport.peer_limit),
         ("wire_padding_bytes", wire - amount),
     )
+    extra_hbm = {"hbm": wire} if (couple_gm_bounce and transport.gm_bounce_hbm and wire) else {}
     if transport.abi != SIO_HCCS:
-        return (Phase(name, after, Work(resources={"link": wire}), metadata=metadata + info,
+        return (Phase(name, after, Work(resources={"link": wire, **extra_hbm}), metadata=metadata + info,
                       service_mode="mc2_peer_" + "_".join(route.hops).lower(),
                       shmem=transport.abi == SHMEM, outgoing=outgoing),)
     phases = []
     for index, hop in enumerate(route.hops):
         stage = name if index == len(route.hops) - 1 else f"{name}_hop_{index}"
-        phases.append(Phase(stage, after, Work(resources={"link": wire}), metadata=metadata + info + (
+        hop_hbm = extra_hbm if index == 0 else {}
+        phases.append(Phase(stage, after, Work(resources={"link": wire, **hop_hbm}), metadata=metadata + info + (
             ("physical_hop", hop), ("hop_index", index), ("hop_bytes", wire),
         ), service_mode=f"mc2_peer_{hop.lower()}", physical_hop=hop))
         after = (stage,)
@@ -288,6 +294,7 @@ class Mc2Program:
         encoded_rows: dict[int, str] = {}
         for phase in self.phases:
             info = dict(phase.metadata)
+            non_link_coupled = False
             if phase.service_mode and phase.work.resources["link"]:
                 pair = _shmem_pair(context, info["source_rank"], info["destination_rank"]) if phase.shmem else None
                 demand, caps = _bind_transfer(phase, context, pair)
@@ -295,6 +302,11 @@ class Mc2Program:
                     injection = _bind_injection(info["source_rank"], pair, context, injection_resources)
                     if injection is not None:
                         demand[injection] = phase.work.resources["link"]
+                non_link = {k: v for k, v in phase.work.resources.items() if k != "link" and v}
+                if non_link:
+                    non_link_coupled = True
+                    for r_name, r_val in context.bind(Work(resources=non_link)).items():
+                        demand[r_name] = demand.get(r_name, 0.0) + r_val
             else:
                 demand, caps = context.bind(phase.work), {}
             placement = {}
@@ -314,7 +326,7 @@ class Mc2Program:
                         encoded_rows[identity] = ",".join(map(str, rows))
                     info[key] = encoded_rows[identity]
             stages.append(Stage(phase.name, demand, phase.after, caps=caps, placement=placement,
-                                coupled=phase.shmem and len(demand) > 1,
+                                coupled=(phase.shmem or non_link_coupled) and len(demand) > 1,
                                 metadata=info, keep_empty=True))
         if injection_resources:
             return _ShmemProgram(tuple(stages), injection_resources=tuple(injection_resources.values()))

@@ -57,7 +57,16 @@ def _aicpu(b):
 
 
 def _collective(b):
-    startup = b.value("startup_ns") * NS_TO_MS
+    stack = str(b.get("stack", "eager") or "eager").strip().lower()
+    if stack not in {"eager", "blocked", "default"}:
+        raise ModelingError(f"primitive_collective_stack_invalid:{stack}")
+    blk_band = b.cell.metrics.get("startup_blocked_ns")
+    startup_metric = (
+        "startup_blocked_ns"
+        if stack == "blocked" and blk_band is not None and blk_band.p50 is not None
+        else "startup_ns"
+    )
+    startup = b.value(startup_metric) * NS_TO_MS
     params = dict(b.cell.parameters)
     if b.arch35 and (params.get("payload_bytes_per_frame"), params.get("wire_bytes_per_frame")) == (
         TOKEN_FRAME_PAYLOAD_BYTES, TOKEN_FRAME_WIRE_BYTES,
@@ -134,7 +143,9 @@ def _peer(b):
 
 
 def _dma(b):
-    direction = b.get("direction", "d2h")
+    direction = str(b.get("direction", "d2h")).strip().lower()
+    if direction not in {"h2d", "d2h"}:
+        raise ModelingError(f"primitive_dma_direction_invalid:{direction}")
     namespace, die = b.get("namespace", ""), b.integer("die")
     root = RootComplexKey(b.integer("node"), b.get("root_complex_id", "0"), direction)
     rate = b.speed(f"host_{direction}_bytes_per_s")
@@ -156,6 +167,7 @@ def _dma(b):
                           (root.resource_name(namespace), amount, shared)), (setup,))
     if direction == "d2h" and b.get("eager_readback", False):
         b.delay("eager_d2h_sync", "eager_d2h_sync_ns", (done,))
+    b.meta.update(direction=direction, startup_metric=startup_metric)
 
 
 def _single_l0c(b):

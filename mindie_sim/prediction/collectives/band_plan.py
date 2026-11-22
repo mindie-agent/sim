@@ -148,7 +148,9 @@ class BandCollectivePlan:
                 int(band.wire_bytes_per_frame),
             )
             hop_startup_ms = (
-                band.startup_us / MS_PER_S if band.startup_scope == "hop" else 0.0
+                0.0
+                if lowered.uses_calibrated_startup
+                else (band.startup_us / MS_PER_S if band.startup_scope == "hop" else 0.0)
             )
             group_setup = lowered.collective_startup_us / MS_PER_S
             for phase in lowered.phases:
@@ -175,11 +177,12 @@ class BandCollectivePlan:
                                 transactions.get(res, 0) + transfer.frames
                             )
                             transaction_frames[res] = frame_pair
-                        hop_lat = (
-                            (hop_startup_ms + hop.switch_propagation_ms)
-                            if band.startup_us > 0.0
-                            else hop.propagation_ms
-                        )
+                        if lowered.uses_calibrated_startup:
+                            hop_lat = hop.switch_propagation_ms
+                        elif band.startup_us > 0.0:
+                            hop_lat = hop_startup_ms + hop.switch_propagation_ms
+                        else:
+                            hop_lat = hop.propagation_ms
                         path_lat += hop_lat
                     max_path_latency = max(max_path_latency, path_lat)
                     round_latencies[transfer.round_index] = max(
@@ -208,15 +211,19 @@ class BandCollectivePlan:
             self.family,
             tuple(
                 (group.ranks, group.lowered.band, group.lowered.api_bytes_per_rank,
-                 group.lowered.total_wire_bytes)
+                 group.lowered.total_wire_bytes, group.lowered.collective_startup_us,
+                 group.lowered.local_hbm_bytes_per_rank)
                 for group in self.groups
             ),
         )
 
     def lower_with_local_work(self, context, base_program):
         """Wrap this lowered collective plan inside preserved local stages."""
+        from ..mechanism import Work
         from ..program import KernelProgram, Stage
 
+        if any(stg.program is self for stg in base_program.stages):
+            return base_program
         link_names = frozenset(self.accounting().wire_by_resource)
         stages_in = base_program.stages
         # Unwrap outer setup -> body container from TopologyCollectiveRecipe
@@ -284,11 +291,28 @@ class BandCollectivePlan:
         plan_name = "band_collective" if "band_collective" not in reserved else "band_collective:plan"
         out.append(Stage(plan_name, after=terminals, program=self, keep_empty=True))
 
-        post_valid: set[str] = {plan_name}
+        post_root = plan_name
+        local_hbm = max(
+            (float(g.lowered.local_hbm_bytes_per_rank) for g in self.groups),
+            default=0.0,
+        )
+        op_hbm = float(getattr(getattr(context, "op", None), "hbm_bytes", 0.0) or 0.0)
+        bind_fn = getattr(context, "bind", None)
+        res_names = getattr(context, "resource_names", ()) or ()
+        if local_hbm > 0.0 and op_hbm <= 0.0 and callable(bind_fn) and "hbm" in res_names:
+            hbm_stage_name = "band_collective:local_hbm"
+            out.append(Stage(
+                hbm_stage_name,
+                work=bind_fn(Work(resources={"hbm": local_hbm})),
+                after=(plan_name,),
+            ))
+            post_root = hbm_stage_name
+
+        post_valid: set[str] = {post_root}
         post_inherited: dict[str, tuple[str, ...]] = {}
         for stg in unpack_stages:
             internal = _remap_after(stg.after, post_inherited, post_valid)
-            eff_after = internal if plan_name in internal else (plan_name, *internal)
+            eff_after = internal if post_root in internal else (post_root, *internal)
             kept = _strip_links(stg, eff_after)
             if kept is None:
                 post_inherited[stg.name] = eff_after
