@@ -293,7 +293,6 @@ class RecipeBook:
         from mindie_sim.prediction.operators.collectives.direct_peer import DirectPeerCollective
         from mindie_sim.prediction.operators.paged_mla.indexed_attention import recipe as indexed_attention
         from mindie_sim.prediction.operators.paged_mla.indexed_quant_attention import recipe as indexed_quant_attention
-        from mindie_sim.prediction.operators.context_parallel.graph import recipes as cp_graph_recipes
         from mindie_sim.prediction.operators.matrix.matrix import HierarchicalMatmul, TiledMatmul
         from mindie_sim.prediction.operators.matrix.matrix_mapping import MappedMatmul
         from mindie_sim.prediction.operators.matrix.matrix_phase import PhaseMatmul
@@ -331,7 +330,7 @@ class RecipeBook:
         from mindie_sim.prediction.operators.kda.family_kda_recurrent import recipes as kda_recurrent_recipes
         from mindie_sim.prediction.operators.collectives.hccl_graph import recipes as hccl_recipes
         from ..implementations import recipes as implementation_recipes
-        from mindie_sim.prediction.operators.mla.latent_dcp import recipes as latent_dcp_recipes
+        from mindie_sim.prediction.operators.context_parallel.graph import recipes as cp_graph_recipes
         from mindie_sim.prediction.operators.mc2.mc2_graph import recipes as native_moe_recipes
         from ..operators import grouped_moe, hyper_connections, linear_attention, mc2
         from ..operators.linear_attention.common import CHUNK32_KERNELS

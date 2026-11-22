@@ -540,10 +540,8 @@ def test_packed_residency_evicts_oldest_sectors_within_one_allocation():
 
 @pytest.mark.parametrize("heads,block,selected,q_scale,kv_scale", [(2, 128, 129, 8, 16), (1, 384, 384, 4, 12)])
 def test_mindie_v3_fp8_consumes_fp32_scales_and_rejects_unknown_mode(heads, block, selected, q_scale, kv_scale):
-    contract = governed.AttentionContract(
-        1, heads, 1, 128, 128, selected_tokens=selected, kv_layout="BNSD", abi=MINDIE_V3_ABI,
-        block_size=block, quant_mode=1,
-    )
+    contract = governed.AttentionContract(1, heads, 1, 128, 128, selected_tokens=selected, kv_layout="BNSD",
+                                          abi=MINDIE_V3_ABI, block_size=block, quant_mode=1)
     op = governed.make_attention_op(contract, op_id="block-sparse")
     plan = governed.build(op, geometry())
     phase = stages(plan)
@@ -557,19 +555,14 @@ def test_mindie_v3_fp8_consumes_fp32_scales_and_rejects_unknown_mode(heads, bloc
     with pytest.raises(UnmodeledCapabilityError, match="quantization 5"):
         replace(contract, quant_mode=5)
 
-
 @pytest.mark.parametrize("mode,dst_type_max", [(2, 0.0), (3, 4.0)])
 def test_mindie_v3_binds_packed_operands_and_eight_bit_scale_planes(mode, dst_type_max):
-    contract = governed.AttentionContract(
-        2, 4, 2, 128, 128, selected_tokens=64, kv_layout="BNSD", abi=MINDIE_V3_ABI,
-        block_size=64, query_block_size=128, quant_mode=mode, dst_type_max=dst_type_max,
-    )
+    contract = governed.AttentionContract(2, 4, 2, 128, 128, selected_tokens=64, kv_layout="BNSD", abi=MINDIE_V3_ABI,
+                                          block_size=64, query_block_size=128, quant_mode=mode, dst_type_max=dst_type_max)
     op = governed.make_attention_op(contract, op_id="block-sparse")
     plan = governed.build(op, geometry())
     phase = stages(plan)
-    assert plan.metadata["quant_mode"] == mode
-    assert plan.metadata["dst_type_max"] == dst_type_max
-    assert plan.metadata["block_shape"] == (128, 64)
+    assert (plan.metadata["quant_mode"], plan.metadata["dst_type_max"], plan.metadata["block_shape"]) == (mode, dst_type_max, (128, 64))
     assert plan.metadata["packed_dtype"] == "fp4_e2m1" and plan.metadata["scale_dtype"] == "fp8_e8m0"
     q_rows, kv_rows = 2 * 4, 2 * 64 * 2
     assert plan.metadata["operand_bytes"] == {"query": q_rows * 64, "key": kv_rows * 64, "value": kv_rows * 64}
@@ -579,26 +572,18 @@ def test_mindie_v3_binds_packed_operands_and_eight_bit_scale_planes(mode, dst_ty
         assert phase[load].work.resources["hbm"] == plan.metadata["operand_bytes"][tensor]
         assert phase[scale].work.resources["hbm"] == plan.metadata["scale_bytes"][tensor]
         assert {load, scale} <= set(phase[compute].after)
-    assert plan.work.matrix == {"mxfp4": 2 * 2 * 64 * 4 * (128 + 128)}
-    assert phase["output"].work.resources["hbm"] == q_rows * 128 * 2
+    assert plan.work.matrix == {"mxfp4": 2 * 2 * 64 * 4 * (128 + 128)} and phase["output"].work.resources["hbm"] == q_rows * 128 * 2
     case = sku_case(REGBASE_SKU)
     (die,) = case.machine.dies
     native = NativeComputeMode("mxfp4_x_mxfp4_acc_fp32", "matrix", ("mxfp4",), "cube", ("fp32",))
-    architecture = replace(die.compute_arch, native_modes=(*die.compute_arch.native_modes, native))
-    die = replace(die, compute_arch=architecture, compute_peaks=(*die.compute_peaks, ("mxfp4", 1e12)))
-    case = replace(case, machine=replace(case.machine, dies=(die,)))
-    audit = verify_operator(case, op, governed.build)
-    assert audit["status"] == "passed"
-
+    die = replace(die, compute_arch=replace(die.compute_arch, native_modes=(*die.compute_arch.native_modes, native)),
+                  compute_peaks=(*die.compute_peaks, ("mxfp4", 1e12)))
+    assert verify_operator(replace(case, machine=replace(case.machine, dies=(die,))), op, governed.build)["status"] == "passed"
     for change, message in (({"return_lse": True}, "no LSE"), ({"block_size": 32}, "64-multiple"),
                             ({"query_block_size": 32}, "64-multiple"), ({"abi": MINDIE_V2_ABI}, "V3")):
         with pytest.raises(UnmodeledCapabilityError, match=message):
             governed.build(governed.make_attention_op(replace(contract, **change), op_id="bad"), geometry())
 
-
 def test_c8_gather_l2_admission_uses_unique_sector_union_not_duplicate_copy_bytes():
-    accounting = governed.c8_gather_accounting(
-        query_tokens=2, selected_tokens=1, selection_lists=((0, 0), (0,)), l2_capacity_bytes=1024,
-    )
-    assert accounting.aligned_transfer_bytes == 3 * 672
-    assert accounting.l2_hit_bytes == 672 and accounting.dram_sector_bytes == 2 * 672
+    accounting = governed.c8_gather_accounting(query_tokens=2, selected_tokens=1, selection_lists=((0, 0), (0,)), l2_capacity_bytes=1024)
+    assert accounting.aligned_transfer_bytes == 3 * 672 and accounting.l2_hit_bytes == 672 and accounting.dram_sector_bytes == 2 * 672

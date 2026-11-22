@@ -24,7 +24,7 @@ from mindie_sim.catalog.cache import cache_row_split, packed_region_row_bytes
 from mindie_sim.catalog.cache_format import cache_format
 from mindie_sim.catalog.types import AuxiliarySpec, DraftSpec
 from mindie_sim.observed_contracts.attention_contracts import observed_attention_contract
-from mindie_sim.prediction.operators.paged_mla import family_mqsmla, mqsmla; from mindie_sim.prediction.operators.mla import latent_dcp
+from mindie_sim.prediction.operators.paged_mla import family_mqsmla, mqsmla; from mindie_sim.prediction.operators.context_parallel import graph as cp_graph
 from mindie_sim.prediction.operators.sharedkv import sharedkv_attention as scfa
 from mindie_sim.prediction.operators.attention.attention import AttentionPolicy
 from mindie_sim.prediction.operators.attention.batch_prefix_attention import BatchPrefixAttention
@@ -523,8 +523,8 @@ def test_padded_latent_attention_producer_writes_the_entire_pack_input():
     member = replace(source_cases._c8_op(((1, 127),), 128, 96, 0), recipe="paired_mla_attention_analytic",
                      mte3_bytes=98304, hbm_bytes=98304, metadata=())
     builder.add(member)
-    latent_dcp.attention_batch(builder, [member.op_id], views, plan=layer,
-                               heads=96, local_heads=12, cp=8, rows=8)
+    cp_graph.paired_sfa_attention_batch(builder, [member.op_id], views, plan=layer,
+                                        heads=96, local_heads=12, cp=8, rows=8)
     ops = {op.op_id.rsplit(".", 1)[-1]: op for op in builder.ops}
     assert ops["latent_attention_batch"].mte3_bytes == ops["dcp_output_pack"].mte2_bytes == 792576
     assert ops["dcp_output_pack"].mte3_bytes == ops["dcp_lse_merge"].mte2_bytes == 792576
