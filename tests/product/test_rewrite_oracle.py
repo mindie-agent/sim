@@ -846,3 +846,204 @@ def test_formula_dag_equations_and_pipe_stage_ordering():
     ).lower(_recipe_ctx(ag_fused_op))
     ag_after = {st.name: st.after for st in _tile_stages(ag_prog)}
     assert "cube_mma" in ag_after and "link_pipe" in ag_after["cube_mma"]
+
+
+def test_oracle_cache_separates_disabled_primitive_table_and_formula_mode_digests():
+    from mindie_sim.rewrite import FuseRegion, KernelBoundary, OpRef
+    from mindie_sim.rewrite._oracle_prefetch import primitive_table_digest_token
+
+    assert primitive_table_digest_token(False) != primitive_table_digest_token(None)
+
+    cache = OracleCache(max_entries=8)
+    raw_case = compose_case("qwen3-32b", REPRESENTATIVE_SKUS["a5"], tp=1, dp=1, layers=1)
+    step = StepRequest("decode", tokens=1, context=64)
+
+    d_auto = prepare_scenario(ScenarioRequest(raw_case, step), cache=cache, primitive_table=None)
+    d_disabled = prepare_scenario(ScenarioRequest(raw_case, step), cache=cache, primitive_table=False)
+    assert d_auto.scenario_digest != d_disabled.scenario_digest
+    assert d_auto.handle is not d_disabled.handle
+    assert cache.get(d_auto.scenario_digest) is d_auto.handle
+    assert cache.get(d_disabled.scenario_digest) is d_disabled.handle
+
+    # Strict vs formula-enabled handles MUST NOT share a scenario_digest or overwrite one another.
+    d_strict = prepare_scenario(
+        ScenarioRequest(raw_case, step), cache=cache, primitive_table=False, allow_unbound_formula=False,
+    )
+    d_formula = prepare_scenario(
+        ScenarioRequest(raw_case, step), cache=cache, primitive_table=False, allow_unbound_formula=True,
+    )
+    assert d_strict.scenario_digest != d_formula.scenario_digest
+    strict_handle = cache.get(d_strict.scenario_digest)
+    formula_handle = cache.get(d_formula.scenario_digest)
+    assert strict_handle is not None and strict_handle.allow_unbound_formula is False
+    assert formula_handle is not None and formula_handle.allow_unbound_formula is True
+
+    ops = strict_handle.scenario.atomic_ops[0].ops
+    pair = next(
+        (ops[i].op_id, ops[i + 1].op_id)
+        for i in range(len(ops) - 1)
+        if ops[i].op_id in ops[i + 1].deps and ops[i].stage == ops[i + 1].stage
+    )
+    refs = (OpRef("atom", pair[0]), OpRef("atom", pair[1]))
+    plan = replace(
+        d_strict.unmerge_plan,
+        edits=(Edit("u_mode", operation=FuseRegion(
+            members=refs, preserve_ports=(),
+            kernel_boundaries=(KernelBoundary("UnboundCacheModeCheck", refs),),
+            fusion_tier="K3_dsl_pipeline",
+        )),),
+    )
+    with pytest.raises(ModelingError, match="rewrite_fusion_recipe_unbound"):
+        finalize_plan(strict_handle, plan)
+
+
+def test_formula_sram_sizes_internal_atomic_ops_and_rejects_unclipped_l0c_overflow():
+    from mindie_sim.optimization import (
+        FormulaKernelSpec,
+        TargetOpNode,
+        evaluate_formula_kernel,
+        synthesize_kernel_spec,
+    )
+    from mindie_sim.prediction.results import OpOccurrence
+    from mindie_sim.rewrite.algebra import classify_op_traits
+    from mindie_sim.schema.datapath import datapath_for_die
+    from mindie_sim.schema.operators import OpSpec
+
+    case = parse_case(compose_case("qwen3-32b", REPRESENTATIVE_SKUS["a3"], tp=1, dp=1, layers=1))
+    die = case.machine.dies[0]
+
+    # Counterexample A: 4 -> 4096 -> RMSNorm -> 4 with UB=24 KiB (8 KiB usable after 16 KiB SIMT carveout).
+    tight_ub_buffers = tuple(("ub", 24 * 1024) if k == "ub" else (k, v) for k, v in die.buffers)
+    tight_ub_die = replace(die, buffers=tight_ub_buffers)
+    op_up = OpSpec(
+        op_id="expand", family="gemm", phase="decode", stage=0, layer=0, requests=(),
+        semantic_shape=(1, 4096, 4), local_shape=(1, 4096, 4), padded_shape=(1, 4096, 4), launch_shape=(1, 4096, 4),
+        dtype="bf16", flops=float(2 * 1 * 4096 * 4), mte2_bytes=32776.0, mte3_bytes=8192.0, hbm_bytes=40968.0,
+    )
+    op_norm = OpSpec(
+        op_id="inner_norm", family="rmsnorm", phase="decode", stage=0, layer=0, requests=(),
+        deps=("expand",), semantic_shape=(1, 4096), local_shape=(1, 4096), padded_shape=(1, 4096), launch_shape=(1, 4096),
+        dtype="bf16", vector_ops=float(4096 * 4), mte2_bytes=8192.0, mte3_bytes=8192.0, hbm_bytes=16384.0,
+    )
+    op_dn = OpSpec(
+        op_id="shrink", family="gemm", phase="decode", stage=0, layer=0, requests=(),
+        deps=("inner_norm",), semantic_shape=(1, 4, 4096), local_shape=(1, 4, 4096),
+        padded_shape=(1, 4, 4096), launch_shape=(1, 4, 4096),
+        dtype="bf16", flops=float(2 * 1 * 4 * 4096), mte2_bytes=40960.0, mte3_bytes=8.0, hbm_bytes=40968.0,
+    )
+    narrow_io_spec = FormulaKernelSpec.from_ops((op_up, op_norm, op_dn), name="narrow_io_wide_norm")
+    assert narrow_io_spec.inputs[0].shape == (1, 4)
+    assert narrow_io_spec.outputs[0].shape == (1, 4)
+    res_ub = evaluate_formula_kernel(narrow_io_spec, tight_ub_die)
+    assert res_ub.sram_verified is False
+    assert res_ub.ub_budget_bytes == 8 * 1024
+    assert res_ub.ub_peak_bytes >= 16 * 1024
+
+    # Counterexample B: 64 KiB L0C accumulator demand MUST NOT be clipped to a 32 KiB L0C budget.
+    tight_l0_buffers = tuple(("l0c", 32 * 1024) if k == "l0c" else (k, v) for k, v in die.buffers)
+    tight_l0_die = replace(die, buffers=tight_l0_buffers)
+    tight_l0_dp = datapath_for_die(tight_l0_die)
+    cube_only = FormulaKernelSpec.from_ops((op_up,), name="l0c_overflow_cube")
+    res_l0 = evaluate_formula_kernel(cube_only, tight_l0_die)
+    assert res_l0.sram_verified is False
+    assert res_l0.l0_budget_bytes == 32 * 1024
+    assert res_l0.l0_peak_bytes == 64 * 1024
+
+    occ = OpOccurrence(replica=0, stage=0, rank=0, op_id=op_up.op_id)
+    node_up = TargetOpNode(
+        0, occ, op_up.op_id, "arch0", 1, op_up.family, "gemm", "main", 0, "AIC", op_up.local_shape, "bf16", (),
+        0.0, 10.0, 10.0, 10.0, False, "", op_up.flops, 0.0, op_up.mte2_bytes, op_up.mte3_bytes, op_up.hbm_bytes,
+        op_up.mte2_bytes, op_up.mte3_bytes, 0.0, 0.0, "cube_bound", "Cube", 2.0, 8.0, 5.0, 0.2,
+        ("expand",), ("expand",), "GEMM", "gemm", "CANN", "", False, "", "expand", spec=op_up,
+    )
+    kspec = synthesize_kernel_spec(
+        spec_id="l0_check", kernel_name="l0_check", abi_tier="K2_epilogue", suggested_backend="CANN",
+        status_tag="test", opt_pillar="pillar1_fusion", members=(node_up,),
+        member_traits=(classify_op_traits(op_up),), datapath=tight_l0_dp,
+        elided_hbm_bytes=0, l_star_us=2.0, before_us=10.0, target_us=8.0,
+    )
+    assert kspec.sram_verified is False
+    assert kspec.l0_peak_bytes == 64 * 1024 and kspec.l0_budget_bytes == 32 * 1024
+
+
+def test_formula_dag_preserves_duplicate_operands_order_and_independent_cube_stages():
+    from mindie_sim.optimization import FormulaKernelSpec, FusedPipelineRecipe
+    from mindie_sim.prediction.engine import Engine, Resource
+    from mindie_sim.prediction.program.binding import RecipeContext
+    from mindie_sim.schema.operators import OpSpec
+
+    # 1) Add(x, x) keeps duplicate operands without inventing an unbound symbol 'r'.
+    add_dup = OpSpec(
+        op_id="s0.l0.add_self", family="add", phase="decode", stage=0, layer=0, requests=(),
+        deps=("s0.l0.ext",), semantic_shape=(16, 128), local_shape=(16, 128),
+        padded_shape=(16, 128), launch_shape=(16, 128), dtype="bf16",
+        vector_ops=2048.0, mte2_bytes=4096.0, mte3_bytes=4096.0, hbm_bytes=8192.0,
+        metadata=(("typed_inputs", (
+            {"producer": "s0.l0.ext", "port": "out", "version": 0},
+            {"producer": "s0.l0.ext", "port": "out", "version": 0},
+        )),),
+    )
+    dup_spec = FormulaKernelSpec.from_ops((add_dup,), name="add_self")
+    assert dup_spec.equations == ("y = x + x [UB FP32]",)
+
+    # 2) Operand ordering preserves external-before-internal operand order.
+    inner_act = OpSpec(
+        op_id="s0.l0.inner", family="silu", phase="decode", stage=0, layer=0, requests=(),
+        deps=("s0.l0.ext",), semantic_shape=(16, 128), local_shape=(16, 128),
+        padded_shape=(16, 128), launch_shape=(16, 128), dtype="bf16",
+        vector_ops=2048.0, mte2_bytes=4096.0, mte3_bytes=4096.0, hbm_bytes=8192.0,
+    )
+    add_ord = OpSpec(
+        op_id="s0.l0.add_ext_first", family="add", phase="decode", stage=0, layer=0, requests=(),
+        deps=("s0.l0.ext", "s0.l0.inner"), semantic_shape=(16, 128), local_shape=(16, 128),
+        padded_shape=(16, 128), launch_shape=(16, 128), dtype="bf16",
+        vector_ops=2048.0, mte2_bytes=8192.0, mte3_bytes=4096.0, hbm_bytes=12288.0,
+        metadata=(("typed_inputs", (
+            {"producer": "s0.l0.ext", "port": "out", "version": 0},
+            {"producer": "s0.l0.inner", "port": "out", "version": 0},
+        )),),
+    )
+    ord_spec = FormulaKernelSpec.from_ops((inner_act, add_ord), name="ext_before_internal")
+    assert ord_spec.equations[-1] == "y = x + t1 [UB FP32]"
+
+    # 3) Independent Cube A (1 us) -> Vec V (10 us) alongside Cube B (9 us) schedules in 11 us (not 20 us).
+    cube_a = OpSpec(
+        op_id="s0.l0.cube_a", family="gemm", phase="decode", stage=0, layer=0, requests=(),
+        semantic_shape=(1, 16, 16), local_shape=(1, 16, 16), padded_shape=(1, 16, 16), launch_shape=(1, 16, 16),
+        dtype="bf16", flops=1.0e6, mte2_bytes=0.0, mte3_bytes=0.0, hbm_bytes=0.0,
+    )
+    cube_b = OpSpec(
+        op_id="s0.l0.cube_b", family="gemm", phase="decode", stage=0, layer=0, requests=(),
+        semantic_shape=(1, 144, 16), local_shape=(1, 144, 16), padded_shape=(1, 144, 16), launch_shape=(1, 144, 16),
+        dtype="bf16", flops=9.0e6, mte2_bytes=0.0, mte3_bytes=0.0, hbm_bytes=0.0,
+    )
+    vec_v = OpSpec(
+        op_id="s0.l0.vec_v", family="silu", phase="decode", stage=0, layer=0, requests=(),
+        deps=("s0.l0.cube_a",), semantic_shape=(1, 16), local_shape=(1, 16),
+        padded_shape=(1, 16), launch_shape=(1, 16), dtype="bf16",
+        vector_ops=10.0e6, mte2_bytes=0.0, mte3_bytes=0.0, hbm_bytes=0.0,
+    )
+    dag_spec = FormulaKernelSpec.from_ops((cube_a, cube_b, vec_v), name="indep_cube_vec")
+    cube_stages = [s for s in dag_spec.pipe_stages if s.pipe_kind == "cube"]
+    vec_stage = next(s for s in dag_spec.pipe_stages if s.pipe_kind == "vector")
+    assert len(cube_stages) == 2
+    assert len(vec_stage.after) == 1
+    dep_cube = next(s for s in cube_stages if s.name == vec_stage.after[0])
+    indep_cube = next(s for s in cube_stages if s.name != vec_stage.after[0])
+    assert dep_cube.share == pytest.approx(0.1)
+    assert indep_cube.share == pytest.approx(0.9)
+
+    fused_op = replace(cube_a, op_id="fused_abv", flops=10.0e6, vector_ops=10.0e6)
+    ctx = RecipeContext(
+        op=fused_op,
+        work={"cube": 0.010, "vector": 0.010},
+        resource_names={"cube": "cube", "vector": "vector"},
+        rates={"cube": 1.0, "vector": 1.0},
+        core_count=1,
+    )
+    prog = FusedPipelineRecipe(slots=1, tile_count=1, pipe_stages=dag_spec.pipe_stages).lower(ctx)
+    eng = Engine([Resource("cube", 1.0, "ms", "fifo", 1), Resource("vector", 1.0, "ms", "fifo", 1)], backend="python")
+    ready = eng.submit("ready")
+    done = prog.start(eng, "abv", ready)
+    eng.advance(until=(done,))
+    assert done.time * 1000.0 == pytest.approx(11.0)

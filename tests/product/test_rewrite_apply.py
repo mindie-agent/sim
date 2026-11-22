@@ -787,3 +787,127 @@ def test_sibling_gemm_activation_dedup_exact_bytes_and_port_contract():
     applied_gs = apply_plan(_plan(scen_gs, Edit("fuse_gs", operation=_fuse("s0.l0.gs1", "s0.l0.gs2"))), scen_gs)
     fused_gs = next(op for op in applied_gs.executable[0].ops if op.op_id == "rewrite:fuse_gs")
     assert dict(fused_gs.metadata)["gm_round_trip_eliminated_bytes"] == 0.0
+    assert dict(fused_gs.metadata).get("law2_block_gemm") is not True
+
+
+def test_law2_rejects_barrier_deps_and_mismatched_sharding_or_distinct_activations():
+    from mindie_sim.prediction.spine import PredictionSpine
+    from mindie_sim.rewrite import discover_algebraic_rewrites_for_ops
+    from mindie_sim.schema.operators import OpSpec
+
+    case = compose_case("qwen3-32b", REPRESENTATIVE_SKUS["a3"], tp=1, dp=1, layers=1)
+
+    class _CustomSpine(PredictionSpine):
+        def __init__(self, ops):
+            super().__init__()
+            self._ops = ops
+
+        def lower(self, parsed, request, **kwargs):
+            prepared = super().lower(parsed, request, **kwargs)
+            rank, = prepared.graph.executable
+            return replace(prepared, graph=replace(prepared.graph, executable=(replace(rank, ops=self._ops),), streams=()))
+
+    # Counterexample: two scalar BF16 GEMMs sharing ONLY a readiness barrier in deps.
+    barrier = OpSpec(
+        op_id="s0.l0.ready_barrier", family="barrier", phase="decode", stage=0, layer=0, requests=(),
+        semantic_shape=(), local_shape=(), padded_shape=(), launch_shape=(), dtype="bf16",
+    )
+    g_a = OpSpec(
+        op_id="s0.l0.scalar_a", family="gemm", phase="decode", stage=0, layer=0, requests=(),
+        deps=("s0.l0.ready_barrier",), semantic_shape=(1, 1, 1), local_shape=(1, 1, 1),
+        padded_shape=(1, 1, 1), launch_shape=(1, 1, 1), dtype="bf16",
+        flops=2.0, mte2_bytes=4.0, mte3_bytes=2.0, hbm_bytes=6.0,
+    )
+    g_b = replace(g_a, op_id="s0.l0.scalar_b")
+    scen_bar = resolve_scenario(case, StepRequest("decode", tokens=1, context=16), spine=_CustomSpine((barrier, g_a, g_b)))
+    alg_bar = discover_algebraic_rewrites_for_ops((barrier, g_a, g_b), datapath=scen_bar.datapath)
+    assert not [c for c in alg_bar.candidates if c.law == "law2_block_matmul"]
+
+    applied_bar = apply_plan(
+        _plan(scen_bar, Edit("fuse_bar", operation=_fuse("s0.l0.scalar_a", "s0.l0.scalar_b"))),
+        scen_bar,
+    )
+    fused_bar = next(op for op in applied_bar.executable[0].ops if op.op_id == "rewrite:fuse_bar")
+    assert dict(fused_bar.metadata)["gm_round_trip_eliminated_bytes"] == 0.0
+    assert dict(fused_bar.metadata).get("law2_block_gemm") is not True
+    assert fused_bar.mte2_bytes == pytest.approx(8.0)
+    assert fused_bar.local_shape == (1, 1, 1)
+
+    # Matching data PortRef + (M, K) but mismatched sharding MUST reject Law-2 dedup and block shape.
+    norm_op = OpSpec(
+        op_id="s0.l0.norm", family="rmsnorm", phase="decode", stage=0, layer=0, requests=(),
+        semantic_shape=(1, 4), local_shape=(1, 4), padded_shape=(1, 4), launch_shape=(1, 4),
+        dtype="bf16", vector_ops=16.0, mte2_bytes=8.0, mte3_bytes=8.0, hbm_bytes=16.0,
+    )
+    s_a = OpSpec(
+        op_id="s0.l0.sh_a", family="gemm", phase="decode", stage=0, layer=0, requests=(),
+        deps=("s0.l0.norm",), semantic_shape=(1, 4, 4), local_shape=(1, 4, 4),
+        padded_shape=(1, 4, 4), launch_shape=(1, 4, 4), dtype="bf16",
+        flops=32.0, mte2_bytes=40.0, mte3_bytes=8.0, hbm_bytes=48.0,
+        metadata=(
+            ("typed_inputs", ({"producer": "s0.l0.norm", "port": "out", "version": 0},)),
+            ("sharding", "col_tp"),
+        ),
+    )
+    s_b = replace(
+        s_a, op_id="s0.l0.sh_b",
+        metadata=(
+            ("typed_inputs", ({"producer": "s0.l0.norm", "port": "out", "version": 0},)),
+            ("sharding", "row_tp"),
+        ),
+    )
+    scen_sh = resolve_scenario(case, StepRequest("decode", tokens=1, context=16), spine=_CustomSpine((norm_op, s_a, s_b)))
+    alg_sh = discover_algebraic_rewrites_for_ops((norm_op, s_a, s_b), datapath=scen_sh.datapath)
+    assert not [c for c in alg_sh.candidates if c.law == "law2_block_matmul"]
+    assert any(reason == "quant_or_sharding_contract_mismatch" for _, reason in alg_sh.rejected_pairs)
+    applied_sh = apply_plan(_plan(scen_sh, Edit("fuse_sh", operation=_fuse("s0.l0.sh_a", "s0.l0.sh_b"))), scen_sh)
+    fused_sh = next(op for op in applied_sh.executable[0].ops if op.op_id == "rewrite:fuse_sh")
+    assert dict(fused_sh.metadata)["gm_round_trip_eliminated_bytes"] == 0.0
+    assert dict(fused_sh.metadata).get("law2_block_gemm") is not True
+    assert fused_sh.local_shape == (1, 4, 4)
+
+
+def test_collective_algebra_respects_explicit_metadata_without_recipe_substrings():
+    from mindie_sim.rewrite.algebra import AlgebraicTrait, classify_op_traits
+    from mindie_sim.schema.operators import OpSpec
+
+    def _comm(recipe: str, family: str = "alltoall", meta: tuple = ()):
+        return OpSpec(
+            op_id="s0.l0.comm", family=family, recipe=recipe, phase="decode", stage=0, layer=0,
+            requests=(), semantic_shape=(16, 4096), local_shape=(16, 4096),
+            padded_shape=(16, 4096), launch_shape=(16, 4096), dtype="bf16",
+            link_bytes=131072.0, metadata=meta,
+        )
+
+    # Renaming transport -> transport_unpack / transport_combine must NEVER flip PERMUTE -> SUM.
+    t_plain = classify_op_traits(_comm("transport"))
+    t_unpack = classify_op_traits(_comm("transport_unpack"))
+    t_combine = classify_op_traits(_comm("transport_combine"))
+    assert t_plain.trait == AlgebraicTrait.ASSOCIATIVE_COLLECTIVE and t_plain.collective_op == "PERMUTE"
+    assert t_unpack.collective_op == "PERMUTE"
+    assert t_combine.collective_op == "PERMUTE"
+
+    # Explicit collective_op metadata takes strict precedence over family/recipe names.
+    t_explicit_perm = classify_op_traits(_comm("transport_unpack", family="allreduce", meta=(("collective_op", "PERMUTE"),)))
+    t_explicit_sum = classify_op_traits(_comm("transport", family="alltoall", meta=(("collective_op", "SUM"),)))
+    t_explicit_cat = classify_op_traits(_comm("transport", family="alltoall", meta=(("collective_op", "CONCAT"),)))
+    assert t_explicit_perm.collective_op == "PERMUTE"
+    assert t_explicit_sum.collective_op == "SUM"
+    assert t_explicit_cat.collective_op == "CONCAT"
+
+
+def test_multi_boundary_fusion_does_not_alias_final_abi_as_single_recipe(dense):
+    qkv, norm = "s0.l0.qkv", "s0.l0.qk_norm"
+    two_bounds = FuseRegion(
+        members=(_atom(qkv), _atom(norm)),
+        preserve_ports=(PortRef(_atom(qkv), "output", 0),),
+        kernel_boundaries=(
+            KernelBoundary("UnknownFirstAbi", (_atom(qkv),)),
+            KernelBoundary("pointwise", (_atom(norm),)),
+        ),
+    )
+    applied = apply_plan(_plan(dense, Edit("two_b", operation=two_bounds)), dense)
+    fused = next(op for op in applied.executable[0].ops if op.op_id == "rewrite:two_b")
+    assert fused.recipe != "pointwise"
+    assert fused.recipe == "UnknownFirstAbi+pointwise"
+    assert dict(fused.metadata)["kernel_boundary_count"] == 2

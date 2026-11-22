@@ -45,6 +45,7 @@ from .apply import (
     _activation_quant_key,
     _convex,
     _dependencies,
+    _law2_sibling_key,
     _successors,
     _topological,
 )
@@ -550,9 +551,13 @@ def _resolve_primary_trait(
     if fam in _CONTROL_BARRIER_FAMILIES:
         return AlgebraicTrait.CONTROL_BARRIER, "", False, None
     col_meta = str(dict(op.metadata).get("collective_op") or "").strip().upper() if op.metadata else ""
-    if fam in _SUM_COLLECTIVE_FAMILIES or col_meta == "SUM" or (
-        fam in _PERMUTE_COLLECTIVE_FAMILIES and ("combine" in rec or "unpack" in rec)
-    ):
+    if col_meta == "SUM":
+        return AlgebraicTrait.ASSOCIATIVE_COLLECTIVE, "SUM", False, None
+    if col_meta == "CONCAT":
+        return AlgebraicTrait.ASSOCIATIVE_COLLECTIVE, "CONCAT", False, None
+    if col_meta == "PERMUTE":
+        return AlgebraicTrait.ASSOCIATIVE_COLLECTIVE, "PERMUTE", False, None
+    if fam in _SUM_COLLECTIVE_FAMILIES:
         return AlgebraicTrait.ASSOCIATIVE_COLLECTIVE, "SUM", False, None
     if fam in _CONCAT_COLLECTIVE_FAMILIES:
         return AlgebraicTrait.ASSOCIATIVE_COLLECTIVE, "CONCAT", False, None
@@ -717,14 +722,6 @@ def _producer_port_key(
     if all(prod_id in op_ids for prod_id, _, _ in sig):
         return sig
     return None
-
-
-def _sharding_key(op: OpSpec) -> tuple[str, str]:
-    meta = dict(op.metadata) if op.metadata else {}
-    return (
-        str(meta.get("sharding") or meta.get("shard_rule") or meta.get("parallel_axis") or ""),
-        str(meta.get("group_axis") or meta.get("output_collective_group") or ""),
-    )
 
 
 def _is_ancestor(src: str, dst: str, succ: Mapping[str, Sequence[str]]) -> bool:
@@ -986,14 +983,10 @@ def _discover_law2_block_matmul(
             continue
         buckets: dict[tuple[Any, ...], list[OpSpec]] = defaultdict(list)
         for op in siblings:
-            tr = traits[op.op_id]
-            a_dt, group_size, scale_fmt = _activation_quant_key(op)
-            key = (
-                op.stage, op.phase, op.stream or "main", op.layer,
-                a_dt, group_size, scale_fmt, tr.weight_dtype,
-                _sharding_key(op),
-                int(op.local_shape[0]), int(op.local_shape[2]),
-            )
+            sib_key = _law2_sibling_key(op, all_ops=by_id)
+            if sib_key is None:
+                continue
+            key = (op.stage, op.phase, op.stream or "main", op.layer, sib_key)
             buckets[key].append(op)
         if len(buckets) > 1:
             names = [op.op_id for op in siblings]
@@ -1021,7 +1014,7 @@ def _discover_law2_block_matmul(
             found.append(AlgebraicCandidate(
                 candidate_id=f"law2_block_mm_{independent[0].op_id}",
                 law="law2_block_matmul",
-                abi_id="FusedBlockMatMul",
+                abi_id="gemm",
                 fusion_tier="K2_epilogue",
                 member_ids=m_ids,
                 preserve_port_ids=m_ids,
