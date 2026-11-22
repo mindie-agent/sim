@@ -247,7 +247,9 @@ def test_quantize_producer_dependency_and_exact_matrix_storage(typed):
         assert epilogue == MatrixEpilogue(16, CAPTURED_COLUMN, 4) and epilogue.operands(matrix) == (4*8704, 5120*8704)
         options["recipes"] = RecipeBook({matrix.recipe: TiledMatmul(128, 128, 128)})
     assert matrix.hbm_bytes == CAPTURED_TOTAL and dict(matrix.metadata)["activation_scale_shape"] == (4,)
-    joint = graph_costs(raw, (producer, matrix), input_ready_ms=0, external_inputs={producer.deps[0]: 0}, **options)
+    from mindie_sim.prediction.evaluation import EvaluationContext
+    nominal = EvaluationContext.create(parse_case(raw), primitive_table=False)
+    joint = graph_costs(raw, (producer, matrix), input_ready_ms=0, external_inputs={producer.deps[0]: 0}, evaluation=nominal, **options)
     rows = {row["op_id"]: row for row in joint["timeline"]}
     assert rows[matrix.op_id]["predecessors"] == [f"r0:{producer.op_id}"]
     assert rows[matrix.op_id]["ready_ms"] == pytest.approx(rows[producer.op_id]["complete_ms"])

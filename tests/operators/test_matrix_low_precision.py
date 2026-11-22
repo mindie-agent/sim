@@ -288,7 +288,7 @@ def test_mx_eight_frontend_runs_grouped_and_fused_source_kernels(mx8_source):
     for a, b in zip(*downs, strict=True):
         assert same_semantics(a, replace(b, deps=a.deps)) and len(b.deps) == 1 and b.deps[0] in calls
     row = price(case, next(iter(calls.values())))
-    assert row["operator"]["flops"] == 4*1024*256*4096 and service(row, "mte3") == 1024*264
+    assert row["operator"]["flops"] == 4*1024*256*4096 and service(row, "mte3") == pytest.approx(1024*264, rel=1e-12)
 def same_semantics(a, b):
     ignored = {"fused_origin_scopes", "input_conversion_subgraphs"}
     strip = lambda op: replace(op, metadata=tuple((k, v) for k, v in op.metadata if k not in ignored))

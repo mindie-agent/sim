@@ -284,19 +284,21 @@ def test_allocation_backpressure_remains_causal_under_startup():
         12, {"wire": 100, "cube": 20}, {"L1": 0}, {"L1": 64})
 
 def test_ordinary_and_quantized_classes_pay_inclusive_minima_once():
+    from mindie_sim.prediction.evaluation import EvaluationContext
     raw = hardware_case()
     raw["machine"] = {"backend": "ascend", "sku": SERVICE_SKU, "num_devices": 1}
+    nominal = EvaluationContext.create(parse_case(raw), primitive_table=False)
     mixed = replace(op("mixed", flops=2), vector_ops=1)
-    small = operator_costs(raw, (mixed,), input_ready_ms=7)["operators"][0]
+    small = operator_costs(raw, (mixed,), input_ready_ms=7, evaluation=nominal)["operators"][0]
     assert all((small["duration_ms"] == pytest.approx(.001237), small["service_before_input"] == {}))
     # A combined Cube/Vector kernel takes one maximum class minimum, not both.
     large = replace(mixed, hbm_bytes=4e8)
-    result = graph_costs(raw, (large,), input_ready_ms=7, trace_limit=100)
+    result = graph_costs(raw, (large,), input_ready_ms=7, trace_limit=100, evaluation=nominal)
     assert result["duration_ms"] == pytest.approx(.1 * DRAM_SERVICE_SCALE)
     assert result["execution"]["serviced"]["memory@r0:s0"] == pytest.approx(
         4e8 * DRAM_SERVICE_SCALE)
     assert not any(event["task"].endswith(":startup") for event in result["events"])
-    dma = operator_costs(raw, (op("dma", memory=400),))["operators"][0]
+    dma = operator_costs(raw, (op("dma", memory=400),), evaluation=nominal)["operators"][0]
     assert dma["duration_ms"] == pytest.approx(1e-7 * DRAM_SERVICE_SCALE)
     assert result["execution"]["live_tasks"] == result["execution"]["live_programs"] == 0
     plain = replace(op("quant", flops=2), vector_ops=4, dtype="int8")
@@ -306,7 +308,7 @@ def test_ordinary_and_quantized_classes_pay_inclusive_minima_once():
     recipes = RecipeBook({"empty": PlannedRecipe(lambda operation, geometry: OperatorPlan(
         Work(), lambda context: KernelProgram(())))})
     for operation, expected in ((plain, .001237), (declared, .003037), (empty, .000439)):
-        report = operator_costs(raw, (operation,), recipes=recipes, input_ready_ms=3)
+        report = operator_costs(raw, (operation,), recipes=recipes, input_ready_ms=3, evaluation=nominal)
         assert all((report["operator_sum_ms"] == pytest.approx(expected), report["operators"][0]["service_before_input"] == {}))
     report = graph_costs(raw, (replace(declared, hbm_bytes=4e8),), input_ready_ms=3, isolated=False)
     assert report["duration_ms"] == pytest.approx(.1 * DRAM_SERVICE_SCALE)

@@ -164,7 +164,7 @@ def test_inclusive_resource_curve_keeps_real_competing_supply_under_outer_respon
                        for i in range(3))
     result = graph_costs(raw, operations, recipes=book, input_ready_ms=7, isolated=False)
     assert result["complete_ms"] == 14
-    assert result["execution"]["serviced"]["memory@r0:s0"] == 6000
+    assert result["execution"]["serviced"]["memory@r0:s0"] == pytest.approx(6000, rel=1e-12)
     clean(result)
 
 def test_coverage_and_overlap_violations_are_rejected():

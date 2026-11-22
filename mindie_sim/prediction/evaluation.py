@@ -171,6 +171,8 @@ def _stage_geometry(case: CaseSpec,
     for replica in range(int(parallel.dp)):
         for stage in range(int(parallel.pp)):
             start = (replica * parallel.pp + stage) * width
+            if start + width > len(hardware.die_signatures):
+                raise ModelingError("placement_exceeds_physical_devices")
             indexes = tuple(range(start, start + width))
             geometry.append((
                 replica, stage, indexes,
@@ -323,6 +325,7 @@ def _bundled_calibrated_primitive_table(sku: str) -> Any:
 #: SKU rate the bundled primitive table was measured against.
 PRIMITIVE_RESCALE_TOLERANCE = 1e-9
 PRIMITIVE_RESCALED_WARNING = "primitive_table_rescaled_to_declared_die"
+_MIB_BYTES = 1024 * 1024
 #: ``(primitive, metric) -> die role`` for whole-die bus rates, and per-owner
 #: rates whose table value is already normalized by the owning core count.
 _DIE_BUS_METRICS = {
@@ -330,15 +333,27 @@ _DIE_BUS_METRICS = {
     ("P01_datacopy", "hbm_write_bytes_per_s"): "hbm_write",
     ("P01_datacopy", "hbm_rw11_bytes_per_s"): "hbm",
     ("P01_datacopy", "hbm_rw21_bytes_per_s"): "hbm",
+    ("P04_mte3_store", "atomic_rmw_bytes_per_s"): "hbm",
     ("P05_l2_residency_reuse", "l2_die_bytes_per_s"): "l2",
+    ("P10_sort_topk", "sort_elems_per_s"): "vector_die",
 }
 _PER_OWNER_METRICS = {
     ("P01_datacopy", "mte2_aic_hit_bytes_per_s_per_core"): "mte2_aic",
     ("P01_datacopy", "mte2_aiv_hit_bytes_per_s_per_core"): "mte2_aiv",
+    ("P02_load_data", "l1_to_l0a_bytes_per_s_per_aic"): "mte1",
+    ("P02_load_data", "l1_to_l0a_transpose_bytes_per_s_per_aic"): "mte1",
+    ("P02_load_data", "l1_to_l0b_bytes_per_s_per_aic"): "mte1",
+    ("P02_load_data", "l1_to_l0b_transpose_bytes_per_s_per_aic"): "mte1",
     ("P03_fixpipe", "fixpipe_in_bytes_per_s_per_aic"): "fixpipe",
+    ("P03_fixpipe", "fixpipe_out_bytes_per_s_per_aic"): "fixpipe",
     ("P04_mte3_store", "mte3_store_bytes_per_s_per_aiv"): "mte3",
     ("P07_vec_alu", "vec_alu_ops_per_s_per_aiv"): "vector",
+    ("P08_vec_sfu", "vec_sfu_ops_per_s_per_aiv"): "vector",
+    ("P09_vec_reduce_cast", "vec_reduce_ops_per_s_per_aiv"): "vector",
+    ("P09_vec_reduce_cast", "cast_bytes_per_s_per_aiv"): "vector",
+    ("P10_sort_topk", "sort_elems_per_s_per_aiv"): "vector",
     ("P11_simt", "simt_ops_per_s_per_aiv"): "simt",
+    ("P11_simt", "simt_warp_instructions_per_s_per_aiv"): "simt",
 }
 _CUBE_PRIMITIVE = "P06_mmad"
 
@@ -391,6 +406,7 @@ def _die_rescale_factors(die: Any, registered: Mapping[str, Any]) -> dict[str, f
         "hbm_read": hbm_read_factor,
         "hbm_write": hbm_write_factor,
         "l2": _ratio(float(die_rates.get("l2", 0.0) or 0.0), float(reg_rates.get("l2", 0.0) or 0.0)),
+        "vector_die": _ratio(float(die_rates.get("vector", 0.0) or 0.0), float(reg_rates.get("vector", 0.0) or 0.0)),
     }
     for role in set(_PER_OWNER_METRICS.values()):
         factors[role] = _ratio(
@@ -465,11 +481,53 @@ def _scale_nested_bps(mapping: Any, field_factors: Mapping[str, float]) -> Any:
     return out
 
 
+def _parse_ws_size_bytes(key: Any) -> int | None:
+    if isinstance(key, int) and not isinstance(key, bool):
+        return key
+    if isinstance(key, str):
+        text = key.strip()
+        if text.endswith("MiB") and text[:-len("MiB")].isdigit():
+            return int(text[:-len("MiB")]) * _MIB_BYTES
+        if text.isdigit():
+            return int(text)
+    return None
+
+
+def _scale_ws_sweep(
+    sweep: Any, orig_l2_bytes: int, l2_factor: float, hbm_r_factor: float,
+) -> Any:
+    """Rescale P05 working-set sweep via harmonic L2/HBM blend so both L2 and HBM perturbations propagate."""
+    if not isinstance(sweep, Mapping) or (l2_factor == 1.0 and hbm_r_factor == 1.0):
+        return sweep
+    if abs(l2_factor - hbm_r_factor) <= PRIMITIVE_RESCALE_TOLERANCE:
+        return _scale_bps_mapping(sweep, l2_factor)
+    parsed: list[tuple[Any, int | None, float]] = []
+    for k, v in sweep.items():
+        if isinstance(v, (int, float)) and not isinstance(v, bool) and float(v) > 0.0:
+            parsed.append((k, _parse_ws_size_bytes(k), float(v)))
+    fitting = [rate for _, sz, rate in parsed if sz is not None and orig_l2_bytes > 0 and sz <= orig_l2_bytes]
+    spill = [rate for _, sz, rate in parsed if sz is not None and orig_l2_bytes > 0 and sz > orig_l2_bytes]
+    warm = max(fitting) if fitting else 0.0
+    cold = min(spill) if spill else 0.0
+    has_blend = 0.0 < cold < warm
+    out: dict[Any, Any] = dict(sweep)
+    for k, sz, rate in parsed:
+        if sz is not None and orig_l2_bytes > 0 and sz <= orig_l2_bytes:
+            out[k] = rate * l2_factor
+        elif has_blend:
+            hit = min(1.0, max(0.0, (1.0 / cold - 1.0 / rate) / (1.0 / cold - 1.0 / warm)))
+            inv_rate = hit / (warm * l2_factor) + (1.0 - hit) / (cold * hbm_r_factor)
+            out[k] = (1.0 / inv_rate) if inv_rate > 0.0 else rate * hbm_r_factor
+        else:
+            out[k] = rate * hbm_r_factor
+    return out
+
+
 def _rescaled_parameters(
     pid: str, params: Mapping[str, Any], factors: Mapping[str, float],
     buffers: Mapping[str, int],
 ) -> dict[str, Any]:
-    """Scale embedded bandwidth lookup surfaces inside P01/P05 cell parameters."""
+    """Scale embedded bandwidth lookup surfaces inside P01/P05/P06/P10/P11 cell parameters."""
     out = dict(params)
     hbm = float(factors.get("hbm", 1.0))
     hbm_r = float(factors.get("hbm_read", hbm))
@@ -490,9 +548,26 @@ def _rescaled_parameters(
             out.get("payload_ramp_bytes_per_s"),
             {"read_bps": hbm_r, "write_bps": hbm_w, "rw11_bps": hbm})
     elif pid == "P05_l2_residency_reuse":
+        orig_l2 = int(out.get("l2_bytes") or buffers.get("l2") or 0)
+        if "ws_sweep_bytes_per_s" in out:
+            out["ws_sweep_bytes_per_s"] = _scale_ws_sweep(out.get("ws_sweep_bytes_per_s"), orig_l2, l2, hbm_r)
+        if "l2_service_curve" in out:
+            out["l2_service_curve"] = _scale_ws_sweep(out.get("l2_service_curve"), orig_l2, l2, hbm_r)
         if "l2" in buffers:
             out["l2_bytes"] = int(buffers["l2"])
         out["l2_stride_conflict"] = _scale_bps_records(out.get("l2_stride_conflict"), l2)
+    elif pid == "P06_mmad":
+        cube_bf16 = float(factors.get("cube:bf16", 1.0))
+        if isinstance(out.get("gemm_e2e_flops_per_s_per_aic"), (int, float)) and cube_bf16 != 1.0:
+            out["gemm_e2e_flops_per_s_per_aic"] = float(out["gemm_e2e_flops_per_s_per_aic"]) * cube_bf16
+    elif pid == "P10_sort_topk":
+        vec_die = float(factors.get("vector_die", 1.0))
+        if isinstance(out.get("sort_die_elems_per_s_p50"), (int, float)) and vec_die != 1.0:
+            out["sort_die_elems_per_s_p50"] = float(out["sort_die_elems_per_s_p50"]) * vec_die
+    elif pid == "P11_simt":
+        simt = float(factors.get("simt", 1.0))
+        if isinstance(out.get("simt_scalar_flops_per_s_per_aiv_p50"), (int, float)) and simt != 1.0:
+            out["simt_scalar_flops_per_s_per_aiv_p50"] = float(out["simt_scalar_flops_per_s_per_aiv_p50"]) * simt
     return out
 
 

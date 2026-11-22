@@ -421,13 +421,15 @@ def test_frontend_grouped_mla_traffic_and_source_binding():
     assert len({owner for row in compute for owner in row["placement"]["matrix@r0:s0"]}) == 16
     assert min(r["start_ms"] for r in compute) >= 7
 
-def _price(m=128, n=288, k=4096, *, groups=1, options=None, scale=1, dtype="fp32"):
+def _price(m=128, n=288, k=4096, *, groups=1, options=None, scale=1, dtype="fp32", primitive_table=None):
+    from mindie_sim.prediction.evaluation import EvaluationContext
     raw = json.loads((REPO_ROOT / "examples/quickstart.json").read_text())
     raw["machine"] = dict(backend="ascend", sku=OWNER_GRID_PROFILE, num_devices=1, device={"compute_peaks": {"fp32": FP32_PEAK * scale}})
     raw["runtime"]["kernels"] = {"programs": {"matmul": {"kind": "steady_matmul", **(options or {})}}}
     op = _op(m, n, k, groups, deps=("input",), phase="decode",
              quant=QuantSpec(dtype, weight_format=dtype, activation_format=dtype, weight_block=(128, 128)))
-    result = graph_costs(raw, (op,), external_inputs={"input": 7}, isolated=False)
+    ev = EvaluationContext.create(parse_case(raw), primitive_table=primitive_table) if primitive_table is not None else None
+    result = graph_costs(raw, (op,), external_inputs={"input": 7}, isolated=False, evaluation=ev)
     assert all(row["ready_ms"] >= 7 for row in result["timeline"])
     return result["duration_ms"], result["execution"]["serviced"], result["parameters"]["matrix_mappings"][0]
 @pytest.mark.parametrize("m,n,dtype", [(128, 288, "fp32"), *product((64,), (24, 288), ("bf16", "fp8_e4m3", "int8"))])
@@ -446,7 +448,7 @@ def test_owner_grid_subtiles_and_explicit_domain(m, n, dtype):
         assert work["mte2_aic@r0:s0"] == pytest.approx(coarse["mte2_aic@r0:s0"])
 def test_full_grid_and_compute_sweep_preserve_logical_work():
     assert _price(1024, 4096, 128)[:2] == _price(1024, 4096, 128, options={"underfilled_candidates": ()})[:2]
-    _, work, mapping = _price(57, 145, 319, groups=3)
+    _, work, mapping = _price(57, 145, 319, groups=3, primitive_table=False)
     assert mapping["groups"] == 3 and work["memory@r0:s0"] == pytest.approx(4 * (57*319 + 3*145*319 + 57*145))
     assert work["matrix@r0:s0"] == pytest.approx(2 * 57 * 145 * 319 / FP32_PEAK * 1000)
     fast, slow = (_price(scale=scale) for scale in (2, 0.5))
@@ -454,6 +456,7 @@ def test_full_grid_and_compute_sweep_preserve_logical_work():
 
 @pytest.mark.parametrize("hardware", SKUS)
 def test_small_matrix_service_domain_and_memory_supply(hardware):
+    from mindie_sim.prediction.evaluation import EvaluationContext
     path = "examples/cases/high-concurrency-20261030/kimi-source-complete/a5_kimi_tp8_e16_bf16_c32_p4k_source_complete.json"
     raw = json.loads((REPO_ROOT / path).read_text())
     native = hardware == GENERATION_PROFILE
@@ -465,14 +468,16 @@ def test_small_matrix_service_domain_and_memory_supply(hardware):
         op = replace(next(op for op in ops if op.op_id == "s0.l1.latent_down"), op_id="independent_matrix", deps=(), layer=-1)
         raw["machine"]["device"] = {"hbm_bw_bytes_per_s": rate}
         raw["runtime"]["kernels"].update(regimes)
-        result = graph_costs(raw, (op,), input_ready_ms=7)
+        ev_reg = EvaluationContext.create(parse_case(raw), primitive_table=False)
+        result = graph_costs(raw, (op,), input_ready_ms=7, evaluation=ev_reg)
         raw["runtime"]["kernels"].pop("service_regimes")
         actual, work = result["duration_ms"], result["execution"]["work"]
         assert (work["hbm_bytes"], work["flops"], result["complete_ms"]) == (op.hbm_bytes, op.flops, pytest.approx(7 + actual))
         if native and batch == 32:
             assert actual == pytest.approx(span) if span else actual > 0.027136
         else:
-            assert actual == graph_costs(raw, (op,), input_ready_ms=7)["duration_ms"]
+            ev_plain = EvaluationContext.create(parse_case(raw), primitive_table=False)
+            assert actual == graph_costs(raw, (op,), input_ready_ms=7, evaluation=ev_plain)["duration_ms"]
 @pytest.mark.parametrize("capture,count,gap,duration,blocks", [
     ("bf16_matmulv3_m1_k64_n64.csv", 4, 69.581, 8.091, ("1", "0")),
     ("int8_quantbatchmatmulv3_m1_k512_n512.csv", 3, 0.022, 5.795 + 6.679 + 6.151, ("32", "64")),

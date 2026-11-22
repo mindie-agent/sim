@@ -180,13 +180,15 @@ def test_non_ascend_efficiency_peaks_preserve_declared_fp32_vector_rate():
 # --- pipeline supply on the common Engine ----------------------------------------------
 @pytest.mark.parametrize("sku", SKUS)
 def test_one_mte1_owner_serializes_direction_modes_while_owners_overlap(sku):
+    from mindie_sim.prediction.evaluation import EvaluationContext
     case = sku_case(sku)
+    nominal = EvaluationContext.create(case, primitive_table=False)
     device = case.machine.dies[0]
     modes, units, base = dict(device.service_modes), device.units("mte1"), dict(device.rates)["mte1"]
     a_rate, b_rate = modes["mte1_l0a"][1] / units, modes["mte1_l0b"][1] / units
     ops = (op("a", "a", "stream-a"), op("b", "b", "stream-b"))
-    same = run(case, ops, {"a": OneMode("mte1_l0a", AMOUNT, 0), "b": OneMode("mte1_l0b", AMOUNT, 0)})
-    split = run(case, ops, {"a": OneMode("mte1_l0a", AMOUNT, 0), "b": OneMode("mte1_l0b", AMOUNT, 1)})
+    same = run(case, ops, {"a": OneMode("mte1_l0a", AMOUNT, 0), "b": OneMode("mte1_l0b", AMOUNT, 0)}, evaluation=nominal)
+    split = run(case, ops, {"a": OneMode("mte1_l0a", AMOUNT, 0), "b": OneMode("mte1_l0b", AMOUNT, 1)}, evaluation=nominal)
     assert same["duration_ms"] == pytest.approx((AMOUNT / a_rate + AMOUNT / b_rate) * 1000)
     assert split["duration_ms"] == pytest.approx(max(AMOUNT / a_rate, AMOUNT / b_rate) * 1000)
     # Mode bytes convert to base-pipe work through the owner rate.
@@ -199,31 +201,37 @@ def test_one_mte1_owner_serializes_direction_modes_while_owners_overlap(sku):
 
 @pytest.mark.parametrize("sku", SKUS)
 def test_fixed_owner_cannot_borrow_idle_owners_and_overrides_rescale_it(sku):
+    from mindie_sim.prediction.evaluation import EvaluationContext
     case = sku_case(sku)
+    nominal = EvaluationContext.create(case, primitive_table=False)
     device = case.machine.dies[0]
     for role in ("mte1", "mte3", "fixpipe"):
         owners, rate = device.units(role), dict(device.rates)[role]
-        one = run(case, (op("one", "one"),), {"one": OwnerMoves(role, 4e9, 1)})
-        full = run(case, (op("full", "full"),), {"full": OwnerMoves(role, 4e9, owners)})
+        one = run(case, (op("one", "one"),), {"one": OwnerMoves(role, 4e9, 1)}, evaluation=nominal)
+        full = run(case, (op("full", "full"),), {"full": OwnerMoves(role, 4e9, owners)}, evaluation=nominal)
         assert full["duration_ms"] == pytest.approx(4e9 / rate * 1000)
         assert one["duration_ms"] == pytest.approx(owners * full["duration_ms"])
         assert one["execution"]["serviced"][f"{role}@r0:s0"] == pytest.approx(4e9)
     mte3, fix = dict(device.rates)["mte3"], dict(device.rates)["fixpipe"]
     tuned = sku_case(sku, {"rates": {"mte3": 2 * mte3}, "resource_units": {"fixpipe": 10}})
+    tuned_nominal = EvaluationContext.create(tuned, primitive_table=False)
     for role, owners, rate in (("mte3", device.units("mte3"), 2 * mte3), ("fixpipe", 10, fix)):
         assert (tuned.machine.dies[0].units(role), dict(tuned.machine.dies[0].rates)[role]) == (
             owners, rate)
-        assert run(tuned, (op(role, role),), {role: OwnerMoves(role, AMOUNT, 1)})["duration_ms"] \
+        assert run(tuned, (op(role, role),), {role: OwnerMoves(role, AMOUNT, 1)}, evaluation=tuned_nominal)["duration_ms"] \
             == pytest.approx(AMOUNT * owners / rate * 1000)
 
 
 @pytest.mark.parametrize("sku", SKUS)
 def test_reads_stores_and_fixpipe_writes_contend_on_one_shared_hbm(sku):
+    from mindie_sim.prediction.evaluation import EvaluationContext
     case = sku_case(sku)
+    nominal = EvaluationContext.create(case, primitive_table=False)
     device = case.machine.dies[0]
     roles = ("mte2_aic", "mte2_aiv", "mte3", "fixpipe")
     result = run(case, tuple(op(r, r, r) for r in roles),
-                 {r: ReadMoves(r, device.units(r) * AMOUNT, device.units(r)) for r in roles})
+                 {r: ReadMoves(r, device.units(r) * AMOUNT, device.units(r)) for r in roles},
+                 evaluation=nominal)
     total = sum(device.units(r) for r in roles) * AMOUNT
     serviced = result["execution"]["serviced"]
     assert [k for k, v in serviced.items() if v and k.startswith("memory@")] == ["memory@r0:s0"]
@@ -233,9 +241,11 @@ def test_reads_stores_and_fixpipe_writes_contend_on_one_shared_hbm(sku):
 
 @pytest.mark.parametrize("sku", SKUS)
 def test_direct_fp32_and_hf32_matrix_service_follow_declared_peaks(sku):
+    from mindie_sim.prediction.evaluation import EvaluationContext
     case = sku_case(sku)
+    nominal = EvaluationContext.create(case, primitive_table=False)
     peaks = dict(case.machine.dies[0].compute_peaks)
-    durations = {dtype: run(case, (op(dtype, dtype),), {dtype: Matrix(dtype, 1e12)})["duration_ms"]
+    durations = {dtype: run(case, (op(dtype, dtype),), {dtype: Matrix(dtype, 1e12)}, evaluation=nominal)["duration_ms"]
                  for dtype in ("fp32", "hf32", "bf16")}
     for dtype, duration in durations.items():
         assert duration == pytest.approx(1e12 / peaks[dtype] * 1000)

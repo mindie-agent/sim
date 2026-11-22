@@ -60,6 +60,7 @@ from .streams import (
 )
 
 MS_PER_S = 1000.0
+_RATE_EQ_REL_TOL = 1e-9
 PREPARE_CACHE_LIMIT = 512
 DEVICE_UNITS_CACHE_LIMIT = 64
 SERVICE_IDENTITY_CACHE_LIMIT = 1024
@@ -276,6 +277,7 @@ class StageProfile:
     primitive_identity: tuple = ()
     primitive_coverage_gaps: tuple[str, ...] = ()
     dispatch_envelope: Any = None
+    declared_physical_rates: Mapping[str, Any] | None = None
 
     @property
     def profile_key(self) -> tuple:
@@ -368,21 +370,42 @@ def build_stage_profiles(case: CaseSpec, namespace: str = "", *,
                 pool_units[key] = dies[0].pool_units(pool)
                 stage_pools[str(pool)] = key
             peak_aliases = dict(dies[0].compute_peak_aliases)
-            compute_peaks = {
+            orig_compute_peaks = {
                 dtype: min(die.peak(dtype) for die in dies)
                 for dtype, _ in dies[0].compute_peaks
                 if dtype not in peak_aliases
             }
+            compute_peaks = dict(orig_compute_peaks)
             for dt, peak in overlay_peaks.items():
                 if dt in compute_peaks or dt not in peak_aliases:
                     compute_peaks[dt] = peak
+            orig_service_modes = {
+                mode: (role, min(dict(die.service_modes)[mode][1] for die in dies))
+                for mode, (role, _) in dies[0].service_modes
+            }
+            declared_physical_rates = {
+                "resources": {**orig_rates_s, "cube": MS_PER_S, "host": MS_PER_S},
+                "compute_peaks": orig_compute_peaks,
+                "service_modes": orig_service_modes,
+            }
+            reg_entry = None
+            if dies[0].sku:
+                from mindie_sim.backends.ascend import profiles as ascend_profiles
+                reg_entry = ascend_profiles().get(str(dies[0].sku))
+            reg_dev = reg_entry.get("device") if isinstance(reg_entry, Mapping) else None
+            reg_rates = dict(reg_dev.get("rates") or {}) if isinstance(reg_dev, Mapping) else {}
+            reg_modes = dict(reg_dev.get("service_modes") or {}) if isinstance(reg_dev, Mapping) else {}
             service_modes = {}
-            for mode, (role, _) in dies[0].service_modes:
-                m_rate = min(dict(die.service_modes)[mode][1] for die in dies)
+            for mode, (role, m_rate) in orig_service_modes.items():
                 if mode in {"mte2_aic_dram", "mte2_aiv_dram"} and overlay and overlay.hbm_read_bytes_per_s is not None:
                     m_rate = min(m_rate, overlay.hbm_read_bytes_per_s)
                 elif role in overlay_rates and orig_rates_s.get(role, 0.0) > 0.0:
                     m_rate = m_rate * (overlay_rates[role] / orig_rates_s[role])
+                elif role == "mte1" and orig_rates_s.get(role, 0.0) > 0.0 and float(reg_rates.get(role, 0.0) or 0.0) > 0.0:
+                    reg_mode = reg_modes.get(mode)
+                    reg_m_rate = float(reg_mode.get("rate", 0.0) or 0.0) if isinstance(reg_mode, Mapping) else 0.0
+                    if reg_m_rate > 0.0 and abs(m_rate - reg_m_rate) <= _RATE_EQ_REL_TOL * reg_m_rate:
+                        m_rate = m_rate * (orig_rates_s[role] / float(reg_rates[role]))
                 service_modes[mode] = (role, m_rate)
             hbm_cap_s = orig_rates_s.get("hbm", 0.0)
             if "mte2_aiv_dram" not in service_modes and overlay and overlay.hbm_read_bytes_per_s is not None:
@@ -428,6 +451,7 @@ def build_stage_profiles(case: CaseSpec, namespace: str = "", *,
                 primitive_identity=() if overlay is None else overlay.identity,
                 primitive_coverage_gaps=() if overlay is None else overlay.coverage_gaps,
                 dispatch_envelope=dispatch_envelope,
+                declared_physical_rates=declared_physical_rates,
             ))
     return tuple(profiles)
 
@@ -621,6 +645,7 @@ class _ContextMixin:
             datapath=profile.datapath,
             primitive_table=profile.primitive_table,
             primitive_coverage_gaps=profile.primitive_coverage_gaps,
+            declared_physical_rates=profile.declared_physical_rates,
             admission_memory_view=getattr(self, "admission_memory_view", None),
             allocation_versions=getattr(self, "allocation_versions", {}),
         )

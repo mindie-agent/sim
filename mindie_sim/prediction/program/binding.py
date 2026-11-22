@@ -155,6 +155,7 @@ class RecipeContext:
     stream_owners: object = None
     primitive_table: object = None
     primitive_coverage_gaps: tuple[str, ...] = ()
+    declared_physical_rates: Mapping[str, Any] | None = None
     admission_memory_view: object = None
     allocation_versions: Mapping[str, int] = field(default_factory=dict)
     requests: tuple[Any, ...] = ()

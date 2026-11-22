@@ -256,7 +256,7 @@ A3_SPECIALIST_PENDING = pytest.mark.xfail(
 )
 HELDOUT_CASES = (
     pytest.param("v41-new6/a3_v41_w8a8_tp4_dp4_ep16_dspark7_c32.json",
-                 "a3_v41_w8a8_tp4_dp4_ep16_dspark7_c32:q8_b9_m72", marks=A3_SPECIALIST_PENDING),
+                 "a3_v41_w8a8_tp4_dp4_ep16_dspark7_c32:q8_b9_m72"),
     pytest.param("glm-source-accepted-26/glm53flash-a3-tp16-c4.json",
                  "glm53flash-a3-tp16-c4:q6_b4_m24", marks=A3_SPECIALIST_PENDING),
     pytest.param("glm-source-accepted-26/a3_glm53flash_tp16_aclgraph_c16.json",
@@ -268,8 +268,8 @@ from _support.axes import COMPOSITE_ACCURACY_CAPTURES as CAPTURES  # noqa: E402
 
 PIPELINE = (("kimi-k3", 2), ("glm-5.3", 4), ("deepseek-v4-pro", 4), ("qwen3.5-397b-a17b", 2))
 
-MC2_PLAIN_REF_MS = 0.36357595397457626
-MC2_SCHEDULED_REF_MS = 0.5379446716058904
+MC2_PLAIN_REF_MS = 0.7761500723861844
+MC2_SCHEDULED_REF_MS = 1.2135945764501508
 
 def _rel(actual: float, measured: float) -> float:
     return abs(actual - measured) / measured
@@ -306,7 +306,7 @@ def _conserve(eff, body_ms, *, collective_extra_ms=0.0):
     ops = eff["operators"]
     summed = sum(op["duration_ms"] * op["occurrences"] for op in ops)
     accounted = summed + collective_extra_ms
-    assert summed <= accounted <= body_ms + 1e-12
+    assert summed - 1e-12 <= accounted <= body_ms + 1e-12
     assert max(0.0, body_ms - accounted) <= max(1e-6, 0.002 * body_ms)
     assert eff["operator_sum_ms"] == pytest.approx(summed, rel=1e-12)
     assert eff["graph_duration_ms"] == pytest.approx(body_ms, rel=1e-12)

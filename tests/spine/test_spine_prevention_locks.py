@@ -790,3 +790,82 @@ def test_advance_periodic_clock_matches_literal_loop_and_skips_billions_in_ologn
     t0 = time.perf_counter()
     huge = _advance_periodic_clock(7.0, (1e-6, 2.5e-6), 1 << 31)
     assert time.perf_counter() - t0 < 0.25 and math.isfinite(huge) and huge > 7.0
+
+
+def test_primitive_table_rebind_rescales_fixpipe_out_p05_ws_sweep_and_mte1():
+    from mindie_sim.prediction.evaluation import EvaluationContext, PRIMITIVE_RESCALED_WARNING
+    from mindie_sim.primitives.loader import load_manifest
+
+    sku = next(
+        name for name, entry in load_manifest()["tables"].items()
+        if entry.get("calibrated") and entry.get("arch_preset") == "npu_arch_3510"
+    )
+    base_case = Case.from_mapping(compose_case("qwen3-32b", hardware=sku, layers=1, tp=1))
+    base_tbl = EvaluationContext.create(base_case).bindings.primitive_table
+    assert base_tbl is not None
+    d0 = base_case.machine.dies[0]
+    rates0 = dict(d0.rates)
+
+    # 1) Halve fixpipe & mte1 -> P03 fixpipe_in/fixpipe_out and P02 l1_to_l0a/l0b all halve.
+    half_pipes = replace(
+        base_case,
+        machine=replace(
+            base_case.machine,
+            dies=tuple(
+                replace(
+                    die,
+                    rates=tuple(
+                        (r, v * 0.5 if r in {"fixpipe", "mte1"} else v)
+                        for r, v in die.rates
+                    ),
+                )
+                for die in base_case.machine.dies
+            ),
+        ),
+    )
+    tbl_pipes = EvaluationContext.create(half_pipes).bindings.primitive_table
+    assert tbl_pipes is not None and PRIMITIVE_RESCALED_WARNING in tbl_pipes.warnings
+    for pid, metric in (
+        ("P03_fixpipe", "fixpipe_in_bytes_per_s_per_aic"),
+        ("P03_fixpipe", "fixpipe_out_bytes_per_s_per_aic"),
+        ("P02_load_data", "l1_to_l0a_bytes_per_s_per_aic"),
+        ("P02_load_data", "l1_to_l0b_bytes_per_s_per_aic"),
+    ):
+        assert tbl_pipes.cell(pid).band(metric).p50 == pytest.approx(
+            base_tbl.cell(pid).band(metric).p50 * 0.5, rel=1e-9
+        )
+
+    # 2) Halve HBM + L2 -> every P05 ws_sweep_bytes_per_s sample (incl. 256MiB) halves.
+    half_mem = replace(
+        base_case,
+        machine=replace(
+            base_case.machine,
+            dies=tuple(
+                replace(
+                    die,
+                    rates=tuple(
+                        (r, v * 0.5 if r in {"hbm", "l2"} else v)
+                        for r, v in die.rates
+                    ),
+                    hbm_read_bytes_per_s=(
+                        die.hbm_read_bytes_per_s * 0.5
+                        if die.hbm_read_bytes_per_s is not None
+                        else rates0.get("hbm", 0.0) * 0.5
+                    ),
+                    hbm_write_bytes_per_s=(
+                        die.hbm_write_bytes_per_s * 0.5
+                        if die.hbm_write_bytes_per_s is not None
+                        else rates0.get("hbm", 0.0) * 0.5
+                    ),
+                )
+                for die in base_case.machine.dies
+            ),
+        ),
+    )
+    tbl_mem = EvaluationContext.create(half_mem).bindings.primitive_table
+    assert tbl_mem is not None and PRIMITIVE_RESCALED_WARNING in tbl_mem.warnings
+    base_ws = base_tbl.cell("P05_l2_residency_reuse").parameters["ws_sweep_bytes_per_s"]
+    new_ws = tbl_mem.cell("P05_l2_residency_reuse").parameters["ws_sweep_bytes_per_s"]
+    assert "256MiB" in base_ws
+    for key, val in base_ws.items():
+        assert new_ws[key] == pytest.approx(val * 0.5, rel=1e-9)

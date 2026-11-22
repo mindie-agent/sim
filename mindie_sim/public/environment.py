@@ -178,11 +178,24 @@ class ExecutionEnvironment:
             runtime=self.runtime, slo=SloSpec())
 
     def execution(self, *, recipes: RecipeBook | None = None,
-                  on_operator=None) -> Execution:
+                  on_operator=None, primitive_table: Any = None) -> Execution:
+        from mindie_sim.prediction.evaluation import (
+            ExecutionBindings,
+            _resolve_default_primitive_table,
+        )
+
         case = self.case
+        book = recipes or RecipeBook.from_mapping(case.runtime.kernels)
+        eff_table = (
+            None if primitive_table is False
+            else (primitive_table if primitive_table is not None else _resolve_default_primitive_table(case))
+        )
+        bindings = ExecutionBindings.create(case, book, primitive_table=eff_table)
         return Execution(
-            case, CostModel(case), recipes=recipes, include_submission=False,
+            case, CostModel(case, hardware=bindings.hardware),
+            recipes=recipes, include_submission=False,
             namespace=self.namespace, on_operator=on_operator,
+            bindings=bindings,
         )
 
     def _validate(self, ops: Sequence[OpSpec], *, allow_external_inputs: bool,

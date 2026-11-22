@@ -134,16 +134,22 @@ def test_study_canonicalizes_hardware_overrides_before_merging():
     for row in overrides:
         assert row["operators"]["work"] == base["operators"]["work"]
         assert row["duration_ms"] == overrides[0]["duration_ms"] > base["duration_ms"]
+    from mindie_sim.prediction.evaluation import EvaluationContext
     for declaration, duration in zip(variants[:2], (DRAM_SERVICE_SCALE, 2)):
-        row, = operator_costs(ascend_case({"hbm_bw_bytes_per_s": 4e12} | declaration),
-                              (op("read", memory=4e9),))["operators"]
+        case_case = parse_case(ascend_case({"hbm_bw_bytes_per_s": 4e12} | declaration))
+        row, = operator_costs(
+            case_case, (op("read", memory=4e9),),
+            evaluation=EvaluationContext.create(case_case, primitive_table=False),
+        )["operators"]
         assert row["serviced"]["memory@r0:s0"] >= 4e9 and row["duration_ms"] == pytest.approx(duration)
 
 def test_device_overrides_drive_native_compute_transfer_and_memory_service():
+    from mindie_sim.prediction.evaluation import EvaluationContext
     raw = ascend_case({"cube_flops_per_s": 1e12, "mte1_bw_bytes_per_s": 2e12, "aic_count": 8, "l1_bytes": 65536})
+    nominal = EvaluationContext.create(parse_case(raw), primitive_table=False)
     transfer = replace(op("inner"), family="transfer", metadata=(("resource_work", {"mte1": 4e9}),))
     for node, duration in ((op("compute", flops=1e9), 1), (transfer, 2)):
-        assert operator_costs(raw, (node,))["operator_sum_ms"] == duration
+        assert operator_costs(raw, (node,), evaluation=nominal)["operator_sum_ms"] == duration
     raw["machine"].update(hbm_gib=7, num_devices=2, devices=[
         {"hbm_bw_bytes_per_s": 1e12, "cube_flops_per_s": 1e12, "hbm_gib": 4},
         {"rates": {"memory": 2e12, "hbm": 3e12}, "compute_peaks": {"bf16": 2e12}},

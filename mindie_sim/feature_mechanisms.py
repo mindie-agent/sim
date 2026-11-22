@@ -12,6 +12,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from mindie_sim.prediction.efficiency import analyze_network_efficiency
 from mindie_sim.prediction.operators.linear_attention.gdn_domain import (
     GDN_CHUNK32_TOKENS,
     model_supports_gdn_chunk32,
@@ -1058,7 +1059,6 @@ def _compare_pr_ablations(
     phase, tokens, context, sequences, scope, compose_kwargs,
 ):
     from mindie_sim.compose import compose_case
-    from mindie_sim.prediction.efficiency import analyze_network_efficiency
 
     pr_ablations: list[dict[str, Any]] = []
     loo_ablations: list[dict[str, Any]] = []
@@ -1227,7 +1227,6 @@ def compare_feature_tracks(
 ) -> dict[str, Any]:
     """Return the complete 4-rung software-to-silicon performance waterfall."""
     from mindie_sim.compose import compose_case
-    from mindie_sim.prediction.efficiency import analyze_network_efficiency
 
     cleaned_kwargs = dict(compose_kwargs)
     for key in ("feature_track", "optimizations", "exclude_optimizations", "raw_eager", "_stack_phase"):

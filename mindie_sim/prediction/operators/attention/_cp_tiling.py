@@ -176,7 +176,8 @@ def lower_cp_collectives(
             op_id=f"{op_id}.{plan.caller_site}.{case}.{group}.{axis}", deps=deps, stage=stage, layer=layer,
             requests=requests, family="allgather", phase=plan.phase, recipe="ring_allgather",
             link_bytes=local_bytes * (ranks - 1), shape=(local_bytes * ranks,),
-            metadata=(("group_axis", "cp" if group == "dcp" else group), ("steps", ranks - 1), ("attention_cp_keys", keys),
+            metadata=(("group_axis", "cp" if group == "dcp" else group), ("comm_group_size", int(ranks)),
+                      ("steps", ranks - 1), ("attention_cp_keys", keys),
                       ("input_tensors", tuple((name, shape) for name, shape, _ in tensors)),
                       ("output_tensors", out_shapes), ("restore", restore),
                       ("return_lse", plan.return_lse), ("output_merge", plan.output_merge),
@@ -234,8 +235,8 @@ def cp_decode_suffix(op, contract):
         ops.append(comm_op(
             op_id="output_lse_exchange", deps=deps, **arguments, family="alltoall", recipe=OUTPUT_LSE_EXCHANGE_RECIPE,
             link_bytes=payload * (head_ranks - 1), shape=packed_shape,
-            metadata=(("group_axis", "cp" if group == "dcp" else group), ("collective", "alltoall"),
-                      ("source", "dcp_a2a_fused"), *payload_metadata),
+            metadata=(("group_axis", "cp" if group == "dcp" else group), ("comm_group_size", int(head_ranks)),
+                      ("collective", "alltoall"), ("source", "dcp_a2a_fused"), *payload_metadata),
         ))
         deps = (ops[-1].op_id,)
     if binding.pcp_size > 1:
@@ -243,7 +244,8 @@ def cp_decode_suffix(op, contract):
             op_id="output_lse_pcp_gather", deps=deps, **arguments, family="allgather", recipe="ring_allgather",
             link_bytes=payload * head_ranks * (binding.pcp_size - 1),
             shape=(binding.dcp_size, *packed_shape),
-            metadata=(("group_axis", "pcp"), ("steps", binding.pcp_size - 1), *payload_metadata),
+            metadata=(("group_axis", "pcp"), ("comm_group_size", int(binding.pcp_size)),
+                      ("steps", binding.pcp_size - 1), *payload_metadata),
         ))
         deps = (ops[-1].op_id,)
     ops.append(vector_op(

@@ -80,7 +80,9 @@ def projections(case, phase):
     return graphs, selected
 
 def assert_native_matrix_service(case, ops, input_ready_ms):
-    priced = operator_costs(case, tuple(ops), input_ready_ms=input_ready_ms)
+    from mindie_sim.prediction.evaluation import EvaluationContext
+    nominal = EvaluationContext.create(case, primitive_table=False)
+    priced = operator_costs(case, tuple(ops), input_ready_ms=input_ready_ms, evaluation=nominal)
     peaks = dict(case.machine.dies[0].compute_peaks)
     by_recipe = {op.recipe: op for op in ops}
     for row in priced["operators"]:

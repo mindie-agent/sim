@@ -456,7 +456,8 @@ def lower_index_path(builder, *, plan, model, quant, parallel, views, deps, runt
             gathered = b.communicate(
                 "candidate_gather", (topk,),
                 valid * plan.index_topk * CANDIDATE_BYTES * (eff_dcp - 1),
-                "allgather", "cp", dtype="fp32")
+                "allgather", "cp", dtype="fp32",
+                comm_group_size=int(eff_dcp), dcp_degree=int(eff_dcp))
             topk = b.vector("candidate_merge", (gathered,),
                             valid * plan.index_topk * eff_dcp,
                             math.log2(max(MIN_LOG_TOPK, plan.index_topk)),

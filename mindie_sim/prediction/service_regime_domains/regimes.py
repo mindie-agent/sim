@@ -402,7 +402,8 @@ def _axes(context, *, physical_rates=False):
         # changes. Explicit rate guards keep it in its declared hardware domain.
         # Resource rates are per second; compute peaks and mode rates already
         # use their respective native work units per second.
-        axes["physical_rates"] = {
+        declared = getattr(context, "declared_physical_rates", None)
+        axes["physical_rates"] = declared if declared is not None else {
             "resources": {role: context.rates[name] * 1000
                           for role, name in context.resource_names.items()},
             "compute_peaks": context.compute_peaks,

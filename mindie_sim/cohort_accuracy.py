@@ -959,7 +959,7 @@ def _program_ids(target, kind):
     return _member_ids(target, kind), None
 
 
-def _predict(case, target, kind, by_id, book):
+def _predict(case, target, kind, by_id, book, *, evaluation=None):
     raw_identifiers, selected_boundary = _program_ids(target, kind)
     identifiers = list(dict.fromkeys(raw_identifiers))
     if any(key not in by_id for key in identifiers):
@@ -970,7 +970,7 @@ def _predict(case, target, kind, by_id, book):
     one_program = (len(ops) == 1 and physical_work.get("launches") == 1
                    and ops[0].source_boundary != "call")
     if kind == "node" and len(ops) == 1:
-        result = operator_costs(case, ops, recipes=book, replica=replica)
+        result = operator_costs(case, ops, recipes=book, replica=replica, evaluation=evaluation)
         if result["operator_occurrences"] != 1:
             raise ValueError("cohort_node_expands_to_multiple_device_programs")
         row = result["operators"][0]
@@ -981,7 +981,7 @@ def _predict(case, target, kind, by_id, book):
         external = {dep: 0 for op in ops for dep in op.deps if dep not in local}
         result = graph_costs(
             case, {replica: ops}, recipes=book, external_inputs=external,
-            include_submission=False, isolated=False, trace_limit=0)
+            include_submission=False, isolated=False, trace_limit=0, evaluation=evaluation)
         duration = result["duration_ms"]
         serviced = {item["resource"]: item["work"] for item in result["resources"]}
         parameters = result["parameters"]
@@ -1035,7 +1035,7 @@ def _comparison(cohort, prediction):
     return "compared", "same_declared_single_program_boundary", comparison
 
 
-def compare_cohorts(case, mapping_report):
+def compare_cohorts(case, mapping_report, *, primitive_table=None):
     """Price each homogeneous candidate set once without choosing a layer.
 
     The report is produced by ``mindie_profiler.structure_mapping``. The case
@@ -1095,6 +1095,8 @@ def compare_cohorts(case, mapping_report):
              for replica, operators in graphs.items() for op in book.expand(operators)
              if f"rank:{replica}/{op.op_id}" in needed}
     del graphs
+    from .prediction.evaluation import EvaluationContext
+    eval_ctx = EvaluationContext.create(case, book, primitive_table=primitive_table)
     cache, windows, counts = {}, [], Counter()
     total = 0
     for window in report.get("windows", ()):
@@ -1127,7 +1129,7 @@ def compare_cohorts(case, mapping_report):
             try:
                 _check_symmetric_hardware(case, cohort)
                 if key not in cache:
-                    cache[key] = _predict(case, selected, cohort["target_kind"], by_id, book)
+                    cache[key] = _predict(case, selected, cohort["target_kind"], by_id, book, evaluation=eval_ctx)
                 prediction = cache[key]
             except ValueError as exc:
                 row.update(status="prediction_failed", reason=str(exc))

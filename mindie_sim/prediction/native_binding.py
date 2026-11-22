@@ -112,7 +112,11 @@ def _typed_payload(op, meta, *, include_launch=True):
              "attrs": {key: attrs[key] for key in sorted(attrs)},
              "rank_width": max((len(value) for value in shapes.values()
                                 if isinstance(value, (list, tuple))), default=0)}
-    payload = {**typed, "matrix_flops": _jsonable(getattr(op, "matrix_flops", ()))}
+    payload = (
+        {**typed, "matrix_flops": _jsonable(getattr(op, "matrix_flops", ()))}
+        if include_launch
+        else dict(typed)
+    )
     typed["signature_hash"] = _digest(payload)
     return typed
 
