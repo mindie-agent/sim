@@ -399,7 +399,7 @@ def prepare_scenario(
                      {layer: {rank: _work_totals(ops) for rank, ops in cut.items()} for layer, cut in layers.items()},
                      reference, sum(reference.values()))
 
-    digest = _json_digest((scenario.scenario_sha256, replay_frame))
+    digest = _json_digest((scenario.scenario_sha256, replay_frame, bool(allow_unbound_formula)))
     mainline_digest = _json_digest(("mainline", mainline.graph.executable, mainline.case.runtime.to_dict()),
                                    default=_digest_default)
     u = prepare_seed(scenario, book, "unmerge")
@@ -571,6 +571,8 @@ def _bind_formula_fused_recipe(scenario, atomic_entry, op, applied):
 
 def _resolve_fused_binding(scenario, atomic_entry, op, applied, book, catalog, handle, registered, *, allow_unbound_formula):
     """Enforce 3-tier resolution: UserProfile > Extension/RecipeBook > FormulaKernelSpec."""
+    from mindie_sim.optimization.kernel_synthesis import FusedPipelineRecipe
+
     boundaries = next(
         edit.operation.kernel_boundaries for edit in applied.plan.edits
         if op.op_id == f"rewrite:{edit.edit_id}"
@@ -579,6 +581,18 @@ def _resolve_fused_binding(scenario, atomic_entry, op, applied, book, catalog, h
     if len(boundaries) == 1 and (catalog or op.recipe in book.recipes):
         state = "bound_measured" if (has_measured_store and op.recipe in book.recipes) else "bound_implementation"
         return op, state, False
+    if (
+        len(boundaries) == 1
+        and op.recipe == "gemm"
+        and dict(op.metadata).get("law2_block_gemm") is True
+        and op.flops > 0
+    ):
+        selected = book.select(replace(op, family="gemm", recipe="gemm"))
+        if not isinstance(selected, FusedPipelineRecipe):
+            identifier = f"rewrite_law2_gemm:{atomic_entry.replica}:{op.op_id}"
+            registered[identifier] = selected
+            state = "bound_measured" if has_measured_store else "bound_implementation"
+            return replace(op, recipe=identifier), state, False
     if len(boundaries) != 1 or not allow_unbound_formula:
         raise ModelingError(f"rewrite_fusion_recipe_unbound:{op.op_id}:{op.recipe}")
     identifier = f"rewrite_formula:{atomic_entry.replica}:{op.op_id}:{op.recipe}"
@@ -612,7 +626,12 @@ def _bind_replay(scenario, applied, book, handle, *, allow_unbound_formula: bool
                 summaries.append(summary)
                 op = replace(op, recipe=identifier)
             elif template:
-                if template.template_id not in book.recipes:
+                is_law2_gemm_tpl = (
+                    template.template_id == "gemm"
+                    and op.family == "rewrite_fused"
+                    and dict(op.metadata).get("law2_block_gemm") is True
+                )
+                if template.template_id not in book.recipes and not is_law2_gemm_tpl:
                     raise ModelingError(f"rewrite_template_recipe_unbound:{op.op_id}:{template.template_id}")
                 op = replace(op, recipe=template.template_id)
             if (col_binding := collective.get(op.op_id)) is not None:

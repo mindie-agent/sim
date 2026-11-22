@@ -13,7 +13,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
 from graphlib import CycleError, TopologicalSorter
 from heapq import heappop, heappush
-from math import isfinite
+from math import isfinite, prod
 from types import SimpleNamespace
 from typing import Any, Literal
 
@@ -21,8 +21,8 @@ from mindie_sim.prediction.fusion.control_rewrite import (
     apply_incoming_controls, ordering_prerequisites, rewritten_control_metadata,
 )
 from mindie_sim.prediction.fusion.ports import (
-    CONTROL_METADATA_KEYS, control_value_names, declared_control_order, full_operand_ports,
-    input_port_entries, replace_input_ports,
+    CONTROL_METADATA_KEYS, control_dependency_names, control_value_names, declared_control_order,
+    full_operand_ports, input_port_entries, replace_input_ports,
 )
 from mindie_sim.prediction.results import StepRequest
 from mindie_sim.prediction.runtime import tile_solver
@@ -64,6 +64,11 @@ _COLLECTIVE_FAMILIES = _DBO_FAMILIES | {
     "reduce_scatter", "alltoallv", "p2p", "send", "recv",
 }
 _HOST_SYNC_FAMILIES = frozenset({"eager_split_barrier", "d2h_sync", "host_d2h_sync"})
+_NON_DATA_PRODUCER_FAMILIES = _HOST_SYNC_FAMILIES | frozenset({
+    "barrier", "event", "sync", "control", "acceptance",
+})
+_NON_ACTIVATION_ROLES = frozenset({"weight", "control", "barrier", "event"})
+_GROUPED_MATMUL_FAMILIES = frozenset({"grouped_gemm", "grouped_matmul", "grouped_moe"})
 
 @dataclass(frozen=True, slots=True)
 class ResolvedScenario:
@@ -376,16 +381,45 @@ def _tile_fits_resident_pool(
     return False
 
 
+def _is_non_data_producer(prod_id: str, all_ops: Mapping[str, OpSpec] | None) -> bool:
+    if prod_id.startswith("control:"):
+        return True
+    if all_ops is not None and prod_id in all_ops:
+        fam = str(all_ops[prod_id].family or "").strip().lower()
+        return fam in _NON_DATA_PRODUCER_FAMILIES
+    return False
+
+
+def _producer_matches_gemm_activation(producer_op: OpSpec, consumer_op: OpSpec) -> bool:
+    if not producer_op.local_shape:
+        return False
+    if len(consumer_op.local_shape) != _GEMM_SHAPE_RANK:
+        return True
+    m_dim, _, k_dim = (int(d) for d in consumer_op.local_shape)
+    if m_dim <= 0 or k_dim <= 0:
+        return False
+    if producer_op.flops > 0 and len(producer_op.local_shape) == _GEMM_SHAPE_RANK:
+        out_shape = (int(producer_op.local_shape[0]), int(producer_op.local_shape[1]))
+    else:
+        out_shape = tuple(int(d) for d in producer_op.local_shape)
+    if not out_shape or any(d <= 0 for d in out_shape):
+        return False
+    return out_shape[-1] == k_dim or prod(out_shape) == m_dim * k_dim
+
+
 def _activation_port_signature(op: OpSpec, all_ops: Mapping[str, OpSpec] | None = None) -> tuple[tuple[str, str, int], ...] | None:
-    """Return canonical activation ``PortRef`` tuple ``((producer, port, version), ...)`` or ``None``."""
+    """Return proven non-barrier activation ``PortRef`` tuple ``((producer, port, version), ...)`` or ``None``."""
+    controls = control_dependency_names(op, all_ops)
     typed = _typed_inputs(op)
     if typed:
         ports: list[tuple[str, str, int]] = []
         for _, entry in typed:
-            if str(entry.get("role") or "").strip().lower() == "weight":
+            if str(entry.get("role") or "").strip().lower() in _NON_ACTIVATION_ROLES:
                 continue
             producer = entry.get("producer")
             if not isinstance(producer, str) or not producer:
+                continue
+            if producer in controls or _is_non_data_producer(producer, all_ops):
                 continue
             name, ver = _port_key(entry)
             norm = "output" if name == "out" else str(name)
@@ -396,15 +430,28 @@ def _activation_port_signature(op: OpSpec, all_ops: Mapping[str, OpSpec] | None 
         ports = [
             (dep, _positional_name(dep, port), 0)
             for dep, port in explicit
-            if dep and _positional_name(dep, port) != "weight"
+            if dep and _positional_name(dep, port) != "weight" and not _is_non_data_producer(dep, all_ops)
         ]
         return tuple(ports) if ports else None
-    if len(op.deps) == 1:
-        dep = op.deps[0]
-        if all_ops is not None:
-            producer_op = all_ops.get(dep)
-            if producer_op is not None and len(set(producer_op.returns)) > 1:
-                return None
+    named = {k: v for k, v in _named_inputs(op).items() if "weight" not in k.lower()}
+    if named:
+        ports = [
+            (dep, key, 0)
+            for key, dep in sorted(named.items())
+            if dep and dep not in controls and not _is_non_data_producer(dep, all_ops)
+        ]
+        return tuple(ports) if ports else None
+    data_deps = tuple(
+        d for d in op.deps
+        if d and d not in controls and not _is_non_data_producer(d, all_ops)
+    )
+    if len(data_deps) == 1 and all_ops is not None:
+        dep = data_deps[0]
+        producer_op = all_ops.get(dep)
+        if producer_op is None or len(set(producer_op.returns)) > 1:
+            return None
+        if not _producer_matches_gemm_activation(producer_op, op):
+            return None
         return ((dep, "output", 0),)
     return None
 
@@ -421,31 +468,60 @@ def _activation_quant_key(op: OpSpec) -> tuple[str, int | None, str]:
     return a_dt, group_size, scale_fmt
 
 
+def _sharding_key(op: OpSpec) -> tuple[str, str]:
+    meta = dict(op.metadata) if op.metadata else {}
+    return (
+        str(meta.get("sharding") or meta.get("shard_rule") or meta.get("parallel_axis") or ""),
+        str(meta.get("group_axis") or meta.get("output_collective_group") or ""),
+    )
+
+
+def _weight_dtype_key(op: OpSpec) -> str:
+    meta = dict(op.metadata) if op.metadata else {}
+    return str(meta.get("weight_format") or meta.get("weight_dtype") or op.dtype or "").strip().lower()
+
+
+def _law2_sibling_key(
+    op: OpSpec, all_ops: Mapping[str, OpSpec] | None = None,
+) -> tuple[Any, ...] | None:
+    """Single canonical Law-2 shared-activation predicate over PortRef, (M, K), quant, weight, and sharding."""
+    fam = str(op.family or "").strip().lower()
+    rec = str(op.recipe or "").strip().lower()
+    if fam in _GROUPED_MATMUL_FAMILIES or "grouped" in rec:
+        return None
+    if not (op.flops > 0 and not op.link_bytes and len(op.local_shape) == _GEMM_SHAPE_RANK):
+        return None
+    act_ports = _activation_port_signature(op, all_ops=all_ops)
+    if not act_ports:
+        return None
+    a_dt, group_size, scale_fmt = _activation_quant_key(op)
+    return (
+        act_ports,
+        int(op.local_shape[0]),
+        int(op.local_shape[2]),
+        a_dt,
+        group_size,
+        scale_fmt,
+        _weight_dtype_key(op),
+        _sharding_key(op),
+    )
+
+
 def _sibling_activation_dedup_bytes(members, kernel_for, all_ops=None) -> float:
     """Compute duplicate input activation HBM read bytes eliminated by Law-2 sibling GEMM fusion."""
     member_ids = {op.op_id for op in members}
+    member_deps = _dependencies(tuple(members))
     groups: dict[tuple, list[OpSpec]] = {}
     for op in members:
-        if not (op.flops > 0 and not op.link_bytes and len(op.local_shape) == _GEMM_SHAPE_RANK):
+        if member_deps.get(op.op_id, set()) & member_ids:
             continue
-        if any(dep in member_ids for dep in op.deps):
+        sib_key = _law2_sibling_key(op, all_ops=all_ops)
+        if sib_key is None or any(prod_id in member_ids for prod_id, _, _ in sib_key[0]):
             continue
-        act_ports = _activation_port_signature(op, all_ops=all_ops)
-        if not act_ports or any(prod_id in member_ids for prod_id, _, _ in act_ports):
-            continue
-        a_dt, group_size, scale_fmt = _activation_quant_key(op)
-        key = (
-            kernel_for[op.op_id],
-            act_ports,
-            int(op.local_shape[0]),
-            int(op.local_shape[2]),
-            a_dt,
-            group_size,
-            scale_fmt,
-        )
-        groups.setdefault(key, []).append(op)
+        groups.setdefault((kernel_for[op.op_id], sib_key), []).append(op)
     saved = 0.0
-    for (_, _, m_dim, k_dim, a_dt, _, _), siblings in groups.items():
+    for (_k_idx, sib_key), siblings in groups.items():
+        m_dim, k_dim, a_dt = sib_key[1], sib_key[2], sib_key[3]
         if len(siblings) < 2 or m_dim <= 0 or k_dim <= 0:
             continue
         try:
@@ -454,7 +530,16 @@ def _sibling_activation_dedup_bytes(members, kernel_for, all_ops=None) -> float:
             elem_b = 2.0
         act_bytes = float(m_dim * k_dim) * elem_b
         for sib in siblings[1:]:
+            smeta = dict(sib.metadata)
+            raw_wt = smeta.get("packed_weight_bytes", smeta.get("weight_bytes"))
+            wt_b = (
+                float(raw_wt)
+                if isinstance(raw_wt, (int, float)) and not isinstance(raw_wt, bool) and raw_wt > 0
+                else 0.0
+            )
             avail = min(float(sib.mte2_bytes), max(0.0, float(sib.hbm_bytes) - float(sib.mte3_bytes)))
+            if 0.0 < wt_b <= float(sib.mte2_bytes):
+                avail = min(avail, float(sib.mte2_bytes) - wt_b)
             saved += min(act_bytes, max(0.0, avail))
     return saved
 
@@ -749,7 +834,8 @@ class _RankDraft:
             for dtype, amount in (op.matrix_flops or (((op.dtype, op.flops),) if op.flops else ())):
                 matrix[dtype] += amount
         link_scope = next((item.link_scope for item in ordered if item.link_bytes), tail.link_scope)
-        abi = spec.kernel_boundaries[-1].abi_id
+        boundary_abis = tuple(b.abi_id for b in spec.kernel_boundaries)
+        abi = boundary_abis[0] if len(boundary_abis) == 1 else "+".join(boundary_abis)
         live = consumed | declared | {key for key in retained if key[0] in keys}
         reserved = {name for _, name, _ in live} | set(tail.returns) | {"op", "out"}
         outputs, used = {}, set()
@@ -767,11 +853,14 @@ class _RankDraft:
                                "port": outputs[key], "output": outputs[key], "name": outputs[key], "version": key[-1]}
                               for key in sorted(typed_keys))
         fused_shape = tail.local_shape
+        law2_keys = [_law2_sibling_key(op, all_ops=self.ops) for op in ordered]
         is_law2_sibling_gemm = (
             len(ordered) >= 2
-            and all(op.flops > 0 and not op.link_bytes and len(op.local_shape) == _GEMM_SHAPE_RANK for op in ordered)
-            and all(not (set(op.deps) & keys) for op in ordered)
-            and len({(int(op.local_shape[0]), int(op.local_shape[2])) for op in ordered}) == 1
+            and len(set(kernel_for.values())) == 1
+            and all(not (dependencies[op.op_id] & keys) for op in ordered)
+            and all(k is not None for k in law2_keys)
+            and len(set(law2_keys)) == 1
+            and all(not any(prod_id in keys for prod_id, _, _ in k[0]) for k in law2_keys if k is not None)
         )
         if is_law2_sibling_gemm:
             fused_shape = (
@@ -783,10 +872,12 @@ class _RankDraft:
         extra_meta: list[tuple[str, Any]] = [
             ("fusion_tier", spec.fusion_tier),
             ("kernel_abi", abi),
+            ("kernel_boundary_count", len(spec.kernel_boundaries)),
             ("gm_round_trip_eliminated_bytes", read + write),
             ("fusion_route", "resident" if read or write else "gm_spill"),
         ]
         if is_law2_sibling_gemm:
+            extra_meta.append(("law2_block_gemm", True))
             extra_meta.extend(_law2_matrix_metadata(ordered, fused_shape, fused_mte2))
         for op in ordered:
             axis = dict(op.metadata).get("group_axis")

@@ -1139,3 +1139,214 @@ def test_target_graph_multi_archetype_model_scope_end_to_end():
     bundle = build_export_bundle(raw_after, request=step_req)
     assert bundle.rewrite_verification_passed is True
     assert bundle.step_span_us > 0.0
+
+
+def test_verify_plan_blocks_typed_and_named_producer_non_commutative_fusion():
+    from mindie_sim.prediction.spine import PredictionSpine
+    from mindie_sim.rewrite import RewritePlan
+    from mindie_sim.schema.operators import OpSpec
+
+    def _op(op_id, family, shape, **kw):
+        return OpSpec(op_id=op_id, family=family, phase="decode", stage=0, layer=0, requests=(),
+                      semantic_shape=shape, local_shape=shape, padded_shape=shape, launch_shape=shape, **kw)
+
+    case = compose_case("qwen3-32b", REPRESENTATIVE_SKUS["a5"], tp=2, dp=1, layers=1)
+    ar = _op("s0.l0.allreduce", "allreduce", (16, 4096), dtype="bf16", link_bytes=131072.0,
+             metadata=(("group_axis", "tp"),))
+    norm_typed = _op(
+        "s0.l0.rmsnorm", "rmsnorm", (16, 4096), deps=(), dtype="bf16",
+        vector_ops=262144.0, mte2_bytes=131072.0, mte3_bytes=131072.0, hbm_bytes=262144.0,
+        metadata=(("typed_inputs", ({"producer": "s0.l0.allreduce", "port": "out", "version": 0},)),),
+    )
+    norm_named = _op(
+        "s0.l0.rmsnorm", "rmsnorm", (16, 4096), deps=(), dtype="bf16",
+        vector_ops=262144.0, mte2_bytes=131072.0, mte3_bytes=131072.0, hbm_bytes=262144.0,
+        metadata=(("activation_producer", "s0.l0.allreduce"),),
+    )
+
+    for variant_norm in (norm_typed, norm_named):
+        class _TypedEdgeSpine(PredictionSpine):
+            def __init__(self, ops):
+                super().__init__()
+                self._ops = ops
+
+            def lower(self, parsed, request, **kwargs):
+                prepared = super().lower(parsed, request, **kwargs)
+                ranks = tuple(replace(rank, ops=self._ops) for rank in prepared.graph.executable)
+                return replace(prepared, graph=replace(prepared.graph, executable=ranks, streams=()))
+
+        scenario = resolve_scenario(case, StepRequest("decode", tokens=16, context=64), spine=_TypedEdgeSpine((ar, variant_norm)))
+        refs = (OpRef("atom", "s0.l0.allreduce"), OpRef("atom", "s0.l0.rmsnorm"))
+        bad_plan = RewritePlan(
+            base_graph_sha256=scenario.base_graph_sha256,
+            framing_sha256=scenario.framing_sha256,
+            edits=(Edit("bad_typed_ar_norm", operation=FuseRegion(
+                members=refs, preserve_ports=(),
+                kernel_boundaries=(KernelBoundary("IllegalTypedArNorm", refs),),
+                fusion_tier="K2_epilogue",
+            )),),
+        )
+        receipt = verify_plan(scenario, apply_plan(bad_plan, scenario), scope="archetype")
+        assert not receipt.passed
+        assert any(
+            g.reason == "NON_COMMUTATIVE_REWRITE" and "collective_sum_fusion" in g.detail
+            for g in receipt.gates if not g.passed
+        )
+
+
+def test_strict_mode_rejects_preexisting_unbound_nodes_multi_boundary_and_stale_digests():
+    from mindie_sim.optimization import solve_target_graph
+    from mindie_sim.prediction.structure import parse_case
+    from mindie_sim.rewrite import Edit, FuseRegion, KernelBoundary, OpRef, RewritePlan
+    from mindie_sim.schema.common import ModelingError
+    from mindie_sim.schema.operators import OpSpec
+
+    case = parse_case(compose_case("qwen3-32b", REPRESENTATIVE_SKUS["a3"], tp=1, dp=1, layers=1))
+    die = case.machine.dies[0]
+    peaks = {0: {"hbm_peak_bytes_per_s": dict(die.rates)["hbm"]}}
+
+    # (A) Pre-existing unbound_formula_projection node MUST fail fast in strict Simulation Mode.
+    shape_v = (16, 4096)
+    tb_v = float(16 * 4096 * 2)
+    norm_op = OpSpec(
+        op_id="s0.l0.norm", family="rmsnorm", phase="decode", stage=0, layer=0, requests=(),
+        semantic_shape=shape_v, local_shape=shape_v, padded_shape=shape_v, launch_shape=shape_v,
+        dtype="bf16", vector_ops=float(16 * 4096 * 4), mte2_bytes=tb_v, mte3_bytes=tb_v, hbm_bytes=2.0 * tb_v,
+    )
+    unbound_in = replace(_mk_target_node(0, norm_op, dur_us=10.0, l_star_us=2.0), binding_state="unbound_formula_projection")
+    with pytest.raises(ModelingError, match="strict_simulation_unbound_formula_ops:s0.l0.norm"):
+        solve_target_graph((unbound_in,), ((0, 1000, 1000, 1000, 0),), case, peaks, allow_unbound_formula=False)
+
+    # (B) 2-boundary FuseRegion with unknown boundary 0 MUST be rejected even if boundary 1 is registered.
+    quant_op = OpSpec(
+        op_id="s0.l0.quant", family="quantize", phase="decode", stage=0, layer=0, requests=(),
+        deps=("s0.l0.norm",), semantic_shape=shape_v, local_shape=shape_v, padded_shape=shape_v, launch_shape=shape_v,
+        dtype="fp8", vector_ops=float(16 * 4096 * 3), mte2_bytes=tb_v, mte3_bytes=tb_v * 0.5, hbm_bytes=1.5 * tb_v,
+    )
+    n_norm = _mk_target_node(0, norm_op, dur_us=25.0, l_star_us=2.0)
+    n_quant = _mk_target_node(1, quant_op, predecessors=(n_norm.occurrence,), start_us=25.0, dur_us=25.0, l_star_us=2.0)
+    two_bound_plan = RewritePlan(edits=(Edit("two_b", operation=FuseRegion(
+        members=(OpRef("atom", "s0.l0.norm"), OpRef("atom", "s0.l0.quant")),
+        preserve_ports=(),
+        kernel_boundaries=(
+            KernelBoundary("UnknownBoundaryZero", (OpRef("atom", "s0.l0.norm"),)),
+            KernelBoundary("balanced_grouped_gate_up", (OpRef("atom", "s0.l0.quant"),)),
+        ),
+        fusion_tier="K2_epilogue",
+    )),))
+    for mode_flag in (False, True):
+        with pytest.raises(ModelingError, match="rewrite_fusion_recipe_unbound"):
+            solve_target_graph(
+                (n_norm, n_quant), ((0, 2000, 1000, 1000, 0), (0, 1500, 1000, 500, 0)),
+                case, peaks, rewrite_plan=two_bound_plan, allow_unbound_formula=mode_flag,
+            )
+
+    # (C) Auto-generated Law-2 plan persists bound 'gemm' ABI + real digests and replays strictly.
+    m_dim, n_dim, k_dim = 1, 4096, 4096
+    act_b = float(m_dim * k_dim * 2)
+    wt_b = float(n_dim * k_dim * 2)
+    out_b = float(m_dim * n_dim * 2)
+    mte2 = act_b + wt_b
+    hbm = mte2 + out_b
+    flops = float(2 * m_dim * n_dim * k_dim)
+    g_meta = (
+        ("typed_inputs", ({"producer": "s0.l0.norm", "port": "out", "version": 0},)),
+        ("activation_format", "bf16"), ("weight_format", "bf16"),
+        ("output_format", "bf16"), ("compute_format", "bf16"),
+    )
+    g1 = OpSpec(
+        op_id="s0.l0.q_proj", family="gemm", recipe="gemm", phase="decode", stage=0, layer=0, requests=(),
+        deps=("s0.l0.norm",), semantic_shape=(m_dim, n_dim, k_dim), local_shape=(m_dim, n_dim, k_dim),
+        padded_shape=(m_dim, n_dim, k_dim), launch_shape=(m_dim, n_dim, k_dim),
+        dtype="bf16", flops=flops, mte2_bytes=mte2, mte3_bytes=out_b, hbm_bytes=hbm, metadata=g_meta,
+    )
+    g2 = replace(g1, op_id="s0.l0.k_proj")
+    n_src = _mk_target_node(0, replace(norm_op, local_shape=(m_dim, k_dim), semantic_shape=(m_dim, k_dim),
+                                       padded_shape=(m_dim, k_dim), launch_shape=(m_dim, k_dim),
+                                       mte2_bytes=act_b, mte3_bytes=act_b, hbm_bytes=2.0 * act_b),
+                            dur_us=10.0, l_star_us=1.0)
+    n_g1 = _mk_target_node(1, g1, task_type="AIC", predecessors=(n_src.occurrence,), start_us=10.0, dur_us=80.0, l_star_us=25.0)
+    n_g2 = _mk_target_node(2, g2, task_type="AIC", predecessors=(n_src.occurrence,), start_us=90.0, dur_us=80.0, l_star_us=25.0)
+    dems = ((0, 500, 500, 500, 0), (1000, 0, 25000, 100, 0), (1000, 0, 25000, 100, 0))
+    auto_res = solve_target_graph((n_src, n_g1, n_g2), dems, case, peaks, allow_unbound_formula=False)
+    assert auto_res.applied_plan.edits
+    assert auto_res.applied_plan.base_graph_sha256 and auto_res.applied_plan.framing_sha256
+    assert auto_res.applied_plan.edits[0].operation.kernel_boundaries[0].abi_id == "gemm"
+
+    replay_res = solve_target_graph(
+        (n_src, n_g1, n_g2), dems, case, peaks,
+        rewrite_plan=auto_res.applied_plan, allow_unbound_formula=False,
+    )
+    assert replay_res.has_unbound_formula_ops is False
+    assert replay_res.verification_passed is True
+    assert any(len(n.absorbed_source_ops) == 2 and n.binding_state in {"bound_implementation", "bound_measured"}
+               for n in replay_res.nodes)
+
+    # (D) Stale/forged framing or base_graph digest MUST be rejected (no tautological digest copy).
+    tampered_frame = replace(auto_res.applied_plan, framing_sha256="f" * 64)
+    with pytest.raises(ModelingError, match="rewrite_digest_mismatch:framing_sha256"):
+        solve_target_graph((n_src, n_g1, n_g2), dems, case, peaks, rewrite_plan=tampered_frame, allow_unbound_formula=False)
+    tampered_base = replace(auto_res.applied_plan, base_graph_sha256="e" * 64)
+    with pytest.raises(ModelingError, match="rewrite_digest_mismatch:base_graph_sha256"):
+        solve_target_graph((n_src, n_g1, n_g2), dems, case, peaks, rewrite_plan=tampered_base, allow_unbound_formula=False)
+
+
+def test_oneshot_collective_rejects_local_work_and_conserves_concurrent_link_contention():
+    from mindie_sim.optimization import solve_target_graph
+    from mindie_sim.optimization.kernel_synthesis import _TargetPricingContext, _price_collective_on_topology
+    from mindie_sim.prediction.structure import parse_case
+    from mindie_sim.rewrite import CollectiveTransform, Edit, OpRef, RewritePlan
+    from mindie_sim.schema.common import ModelingError
+    from mindie_sim.schema.operators import OpSpec
+
+    case = parse_case(compose_case("qwen3-32b", REPRESENTATIVE_SKUS["a5"], tp=4, dp=1, layers=1))
+    die = case.machine.dies[0]
+    peaks = {0: {"hbm_peak_bytes_per_s": dict(die.rates)["hbm"]}}
+    route = case.machine.links[0].name
+    ctx = _TargetPricingContext(case)
+
+    # (A) Op carrying 100 us of local compute/HBM work + 5 us transfer MUST NOT lose local work under OneShot.
+    mixed_op = OpSpec(
+        op_id="s0.l0.mixed_comm", family="allreduce", phase="decode", stage=0, layer=0, requests=(),
+        semantic_shape=(16, 4096), local_shape=(16, 4096), padded_shape=(16, 4096), launch_shape=(16, 4096),
+        dtype="bf16", vector_ops=float(16 * 4096 * 8), mte2_bytes=131072.0, mte3_bytes=131072.0, hbm_bytes=262144.0,
+        link_bytes=8192.0, link_scope="tp", metadata=(("group_axis", "tp"),),
+    )
+    n_mixed = _mk_target_node(0, mixed_op, task_type="HCCL", dur_us=105.0, l_star_us=5.0)
+    res_auto_mixed = solve_target_graph((n_mixed,), ((0, 5000, 1000, 1000, 500),), case, peaks, allow_unbound_formula=False)
+    assert res_auto_mixed.nodes[0].dur_us == pytest.approx(105.0)
+
+    bad_col_plan = RewritePlan(edits=(
+        Edit("mixed_os", operation=CollectiveTransform(OpRef("atom", "s0.l0.mixed_comm"), "oneshot", route)),
+    ))
+    with pytest.raises(ModelingError, match="oneshot_collective_requires_transport_only_work"):
+        solve_target_graph(
+            (n_mixed,), ((0, 5000, 1000, 1000, 500),), case, peaks,
+            rewrite_plan=bad_col_plan, allow_unbound_formula=False,
+        )
+
+    # (B) Two concurrent V-byte transfers on separate streams sharing physical links MUST contend (2V/R, not V/R).
+    msg_v = float(8 * 1024 * 1024)
+    ring_link_v = msg_v * (2.0 * 3.0 / 4.0)
+    ar_a = OpSpec(
+        op_id="s0.l0.ar_a", family="allreduce", phase="decode", stage=0, layer=0, requests=(),
+        semantic_shape=(1024, 4096), local_shape=(1024, 4096), padded_shape=(1024, 4096), launch_shape=(1024, 4096),
+        dtype="bf16", stream="comm0", link_bytes=ring_link_v, link_scope="tp", metadata=(("group_axis", "tp"),),
+    )
+    ar_b = replace(ar_a, op_id="s0.l0.ar_b", stream="comm1")
+    single_us = _price_collective_on_topology(ar_a, ctx, case, mode="oneshot")
+    assert single_us is not None and single_us > 0.0
+
+    n_a = replace(_mk_target_node(0, ar_a, task_type="HCCL", start_us=0.0, dur_us=single_us, l_star_us=single_us * 0.5), stream="comm0", stream_index=1)
+    n_b = replace(_mk_target_node(1, ar_b, task_type="HCCL", start_us=0.0, dur_us=single_us, l_star_us=single_us * 0.5), stream="comm1", stream_index=2)
+    conc_plan = RewritePlan(edits=(
+        Edit("os_a", operation=CollectiveTransform(OpRef("atom", "s0.l0.ar_a"), "oneshot", route)),
+        Edit("os_b", operation=CollectiveTransform(OpRef("atom", "s0.l0.ar_b"), "oneshot", route)),
+    ))
+    res_conc = solve_target_graph(
+        (n_a, n_b), ((0, 0, 0, 0, int(single_us * 500.0)), (0, 0, 0, 0, int(single_us * 500.0))),
+        case, peaks, rewrite_plan=conc_plan, allow_unbound_formula=False,
+    )
+    total_span_us = sum(res_conc.archetype_spans_us.values())
+    assert total_span_us > single_us * 1.8
+    assert all(n.dur_us > single_us * 1.8 for n in res_conc.nodes)

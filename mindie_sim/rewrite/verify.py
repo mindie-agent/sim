@@ -33,7 +33,8 @@ from mindie_sim.schema.common import ModelingError
 
 from .algebra import AlgebraicTrait, classify_op_traits
 from .apply import (
-    AppliedPlan, ResolvedScenario, SIMT_UB_CARVEOUT_BYTES, _check_stream, _convex, _die, _path, _solve_tiles, _successors, _topological,
+    AppliedPlan, ResolvedScenario, SIMT_UB_CARVEOUT_BYTES, _check_stream, _convex, _dependencies, _die, _path,
+    _solve_tiles, _successors, _topological,
 )
 from .schema import FuseRegion, HoistOrDeduplicate, QuantizeContract, SelectTemplate, _flat
 
@@ -127,15 +128,16 @@ def compute_overlap_pct(intervals_x, intervals_y) -> float | None:
     return 100 * fsum(intersections) / denominator
 
 
-def _ancestor_masks(ops) -> tuple[dict[str, int], dict[str, int]]:
-    """Compute transitive ancestor bitmasks in O(V + E) topological order."""
+def _ancestor_masks(ops, stream=None) -> tuple[dict[str, int], dict[str, int]]:
+    """Compute transitive ancestor bitmasks over full canonical dependencies in O(V + E)."""
     by_id = {op.op_id: op for op in ops}
     ordered = _topological(by_id)
+    deps_map = _dependencies(ordered, stream)
     bit = {op.op_id: 1 << idx for idx, op in enumerate(ordered)}
     anc: dict[str, int] = {}
     for op in ordered:
         mask = 0
-        for dep in op.deps:
+        for dep in deps_map.get(op.op_id, ()):
             if dep in bit:
                 mask |= bit[dep] | anc.get(dep, 0)
         anc[op.op_id] = mask
@@ -178,12 +180,15 @@ def _is_non_commuting_pair(tr_a, tr_b) -> bool:
     return (strict_red_a and cube_b) or (cube_a and strict_red_b) or (cube_a and cube_b)
 
 
-def _check_algebraic_commutativity(originals, current_ops, regions, applied) -> None:
+def _check_algebraic_commutativity(
+    originals, current_ops, regions, applied, *, orig_stream=None, curr_stream=None,
+) -> None:
     """Reject illegal nonlinear-norm / collective-sum and cross-reduction rewrites."""
     if not originals:
         return
-    if not regions and len(originals) == len(current_ops) and all(
-        a.op_id == b.op_id and a.deps == b.deps for a, b in zip(originals, current_ops)
+    if not regions and orig_stream == curr_stream and len(originals) == len(current_ops) and all(
+        a.op_id == b.op_id and a.deps == b.deps and a.metadata == b.metadata
+        for a, b in zip(originals, current_ops)
     ):
         return
     by_id = {op.op_id: op for op in current_ops}
@@ -192,8 +197,8 @@ def _check_algebraic_commutativity(originals, current_ops, regions, applied) -> 
         if region in by_id for atom in atoms
     }
     traits = {op.op_id: classify_op_traits(op) for op in originals}
-    orig_bit, orig_anc = _ancestor_masks(originals)
-    curr_bit, curr_anc = _ancestor_masks(current_ops)
+    orig_bit, orig_anc = _ancestor_masks(originals, orig_stream)
+    curr_bit, curr_anc = _ancestor_masks(current_ops, curr_stream)
     boundary_pos = _boundary_order_by_region(applied)
 
     sum_collectives = [
@@ -219,14 +224,14 @@ def _check_algebraic_commutativity(originals, current_ops, regions, applied) -> 
             if c_before_n:
                 if rc == rn:
                     raise ModelingError(f"NON_COMMUTATIVE_REWRITE:collective_sum_fusion:{c_id}:{n_id}")
-                if rc in curr_bit and rn in curr_bit and (curr_anc.get(rc, 0) & curr_bit[rn]):
+                if rc in curr_bit and rn in curr_bit and not (curr_anc.get(rn, 0) & curr_bit[rc]):
                     raise ModelingError(f"NON_COMMUTATIVE_REWRITE:collective_sum_reorder:{n_id}_before_{c_id}")
             elif n_before_c:
                 if rc == rn and rc in boundary_pos:
                     pos = boundary_pos[rc]
                     if c_id in pos and n_id in pos and pos[c_id] < pos[n_id]:
                         raise ModelingError(f"NON_COMMUTATIVE_REWRITE:collective_sum_reorder:{c_id}_before_{n_id}")
-                if rc in curr_bit and rn in curr_bit and (curr_anc.get(rn, 0) & curr_bit[rc]):
+                if rc != rn and rc in curr_bit and rn in curr_bit and not (curr_anc.get(rc, 0) & curr_bit[rn]):
                     raise ModelingError(f"NON_COMMUTATIVE_REWRITE:collective_sum_reorder:{c_id}_before_{n_id}")
 
     # Guard 2: Never reverse causal order across non-commuting reductions or Cube boundaries.
@@ -249,7 +254,7 @@ def _check_algebraic_commutativity(originals, current_ops, regions, applied) -> 
             if not _is_non_commuting_pair(tr_a, traits[b_id]):
                 continue
             rb = replacements.get(b_id, b_id)
-            if ra != rb and ra in curr_bit and rb in curr_bit and (curr_anc.get(ra, 0) & curr_bit[rb]):
+            if ra != rb and ra in curr_bit and rb in curr_bit and not (curr_anc.get(rb, 0) & curr_bit[ra]):
                 raise ModelingError(f"NON_COMMUTATIVE_REWRITE:non_commuting_reorder:{b_id}_before_{a_id}")
             if ra == rb and ra in boundary_pos:
                 pos = boundary_pos[ra]
@@ -270,6 +275,7 @@ def _structure(scenario, applied):
         raise ModelingError("CREDIT_CYCLE:zero_credit_wait") from error
 
     original = {rank.replica: rank.ops for rank in scenario.atomic_ops}
+    orig_streams = {stream.rank: stream for stream in scenario.stream_plans}
     streams = {stream.rank: stream for stream in applied.streams}
     regions = dict(applied.absorbed_atoms)
     seen = set()
@@ -287,7 +293,11 @@ def _structure(scenario, applied):
                 raise ModelingError(f"NON_CONVEX_REGION:{region}")
             claimed.update(atoms)
             seen.add(region)
-        _check_algebraic_commutativity(originals, rank.ops, regions, applied)
+        _check_algebraic_commutativity(
+            originals, rank.ops, regions, applied,
+            orig_stream=orig_streams.get(rank.replica),
+            curr_stream=streams.get(rank.replica),
+        )
         original_users = _successors(originals) if applied.in_place_aliases else {}
         replacements = {atom: region for region, atoms in regions.items()
                         if region in by_id for atom in atoms}

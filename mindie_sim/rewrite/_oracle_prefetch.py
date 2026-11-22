@@ -22,6 +22,7 @@ from mindie_sim.prediction.execution.weight_prefetch import PrefetchDecision
 from mindie_sim.schema.common import ModelingError
 
 PREFETCH_PRIORITY = 10
+DISABLED_PRIMITIVE_TABLE_TOKEN = "__primitive_table_disabled__"
 
 
 def bind_prefetch_ops(case, replica, ops, book, leases, hardware):
@@ -122,7 +123,9 @@ def die_placements_for_case(case) -> tuple[tuple[int, tuple[int, int]], ...]:
 
 
 def primitive_table_digest_token(primitive_table):
-    """Return a deterministic content digest token for ``primitive_table`` or ``None``."""
+    """Return a deterministic content digest token for ``primitive_table``."""
+    if primitive_table is False:
+        return DISABLED_PRIMITIVE_TABLE_TOKEN
     if primitive_table is None:
         return None
     canonical = getattr(primitive_table, "canonical_envelope_sha256", None)
