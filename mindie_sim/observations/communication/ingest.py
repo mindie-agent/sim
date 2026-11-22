@@ -577,8 +577,8 @@ def _bf16_chains(document, campaign, origin, observed, requested, evidence,
     ):
         stages = by_condition[condition]
 
-        def pick(kind, stage):
-            values = [value for value in (stages.get(kind, {}).get(stage) or {}).values()
+        def pick(kind, stage, *, _stages=stages):
+            values = [value for value in (_stages.get(kind, {}).get(stage) or {}).values()
                       if isinstance(value, (int, float))]
             return median(values) if values else None
 

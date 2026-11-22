@@ -25,14 +25,19 @@ from ..operator_analysis import operator_costs, target_graphs
 from ..efficiency.resource_attribution import attribute_stage_dag
 from ..scheduler import DraftPolicy
 from ..structure import parse_case
-from .analysis import analyze_network_efficiency, occurrence_work_graph, scale_case_hardware
+from .analysis import (
+    analyze_network_efficiency,
+    executed_occurrence_work_graph,
+    occurrence_work_graph,
+    scale_case_hardware,
+)
 from .capacity_window import (
     HBM_BYTES_PRECISION_DIGITS, HBM_UTILIZATION_PRECISION_DIGITS,
     _resolve_speculative_tokens, _vram_max_sequences_per_dp, capacity_window,
 )
 from .peaks import (
     DEFAULT_CONTEXT, DEFAULT_OUTPUT_BUDGET, _SCALE_KEYS, _check_pos_float,
-    _validate_geometry,
+    _validate_geometry, resolve_efficiency_scope,
 )
 
 
@@ -53,7 +58,7 @@ def _pkg_attr(name: str, default: Any) -> Any:
     return getattr(pkg, name, default) if pkg is not None else default
 
 
-def _lower_and_run_graph(case: CaseSpec, *, phase: str, tokens: int, context: int, sequences: int, scope: str, run_graph: bool = True, lowered_graphs: Any | None = None, include_submission: bool = False, overlap_async_scheduler: bool = False, evaluation_context: Any | None = None, fast_span_only: bool = False) -> tuple[Any, CaseSpec, dict[str, Any] | None]:
+def _lower_and_run_graph(case: CaseSpec, *, phase: str, tokens: int, context: int, sequences: int, scope: str, run_graph: bool = True, lowered_graphs: Any | None = None, include_submission: bool = False, overlap_async_scheduler: bool = False, evaluation_context: Any | None = None, fast_span_only: bool = False, timeline_replicas: Any = None) -> tuple[Any, CaseSpec, dict[str, Any] | None]:
     graphs = lowered_graphs if lowered_graphs is not None else _pkg_attr("target_graphs", target_graphs)(case, phase=phase, tokens=tokens, context=context, sequences=sequences, scope=scope)
     eff_case, has_kg = consume_target_declaration(case, graphs), any("device_kernel_group" in dict(op.metadata) for op in graphs[0])
     if not run_graph:
@@ -72,11 +77,12 @@ def _lower_and_run_graph(case: CaseSpec, *, phase: str, tokens: int, context: in
     report = graph_costs(eff_case, sg, external_inputs=ext_in,
                          include_submission=include_submission, isolated=False,
                          evaluation=evaluation_context,
-                         fast_span_only=fast_span_only)
+                         fast_span_only=fast_span_only,
+                         timeline_replicas=timeline_replicas)
     return graphs, eff_case, report
 
 
-def _fast_operator_and_graph_reports(case: CaseSpec, *, phase: str, tokens: int, context: int, sequences: int, scope: str, run_graph: bool = True, precomputed_graph: tuple[Any, CaseSpec, dict[str, Any]] | None = None, evaluation_context: Any | None = None) -> tuple[dict[str, Any], dict[str, Any] | None]:
+def _fast_operator_and_graph_reports(case: CaseSpec, *, phase: str, tokens: int, context: int, sequences: int, scope: str, run_graph: bool = True, precomputed_graph: tuple[Any, CaseSpec, dict[str, Any]] | None = None, evaluation_context: Any | None = None, timeline_replicas: Any = None) -> tuple[dict[str, Any], dict[str, Any] | None]:
     """Lower target graphs once and price both reports from one evaluation.
 
     Every call executes the frontend and Engine fresh in its own
@@ -90,7 +96,7 @@ def _fast_operator_and_graph_reports(case: CaseSpec, *, phase: str, tokens: int,
         graphs, eff_case, graph_rep = _pkg_attr("_lower_and_run_graph", _lower_and_run_graph)(
             case, phase=phase, tokens=tokens, context=context,
             sequences=sequences, scope=scope, run_graph=run_graph,
-            evaluation_context=ctx)
+            evaluation_context=ctx, timeline_replicas=timeline_replicas)
     else:
         graphs, eff_case, graph_rep = precomputed_graph
         ctx = evaluation_context or EvaluationContext.create(eff_case)
@@ -281,9 +287,10 @@ def attribute_program(graph_report: Mapping[str, Any] | None, operator_rows: Seq
     if occurrence_graph is None:
         occurrence_graph = occurrence_work_graph(graph_report, operator_rows)
     stage_clock = None
-    if occurrence_graph is not None:
+    stage_dag_graph = executed_occurrence_work_graph(graph_report, operator_rows or ()) or occurrence_graph
+    if stage_dag_graph is not None:
         stage_clock = dict(attribute_stage_dag(
-            occurrence_graph,
+            stage_dag_graph,
             boundary=str(graph_report.get("boundary", "device_graph")),
             duration_ms=span))
         # The public attribution is a JSON report; per-node clock objects stay
@@ -342,10 +349,11 @@ def attribute_program(graph_report: Mapping[str, Any] | None, operator_rows: Seq
     }
 
 
-def prepare_fixed_plan(case: CaseSpec | Mapping[str, Any], *, phase: str = "decode", tokens: int = 1, context: int = DEFAULT_CONTEXT, sequences: int = 1, scope: str = "body") -> dict[str, Any]:
+def prepare_fixed_plan(case: CaseSpec | Mapping[str, Any], *, phase: str = "decode", tokens: int = 1, context: int = DEFAULT_CONTEXT, sequences: int = 1, scope: str | None = None) -> dict[str, Any]:
     """Lower a target program once so baseline and counterfactual share one plan."""
-    _validate_geometry(phase, tokens, context, sequences, scope)
     parsed = parse_case(case)
+    scope = resolve_efficiency_scope(parsed, scope)
+    _validate_geometry(phase, tokens, context, sequences, scope)
     graphs = _pkg_attr("target_graphs", target_graphs)(parsed, phase=phase, tokens=tokens, context=context, sequences=sequences, scope=scope)
     return {"graphs": graphs, "case": parsed, "selection": "baseline_case",
             "geometry": {"phase": phase, "tokens": tokens, "context": context, "sequences": sequences, "scope": scope}}
@@ -373,7 +381,7 @@ def stage_hbm_bytes(case: CaseSpec) -> list[float]:
     return result
 
 
-def capacity_feedback(case: CaseSpec | Mapping[str, Any], *, phase: str = "decode", tokens: int = 1, context: int = DEFAULT_CONTEXT, sequences: int = 1, scope: str = "body", output_budget: int = DEFAULT_OUTPUT_BUDGET, emitted_tokens_per_seq: float | None = None) -> dict[str, Any]:
+def capacity_feedback(case: CaseSpec | Mapping[str, Any], *, phase: str = "decode", tokens: int = 1, context: int = DEFAULT_CONTEXT, sequences: int = 1, scope: str | None = None, output_budget: int = DEFAULT_OUTPUT_BUDGET, emitted_tokens_per_seq: float | None = None) -> dict[str, Any]:
     """Report HBM/KV capacity from one shared per-rank window projection.
 
     The requested candidate's executing window and its complete-service
@@ -381,6 +389,7 @@ def capacity_feedback(case: CaseSpec | Mapping[str, Any], *, phase: str = "decod
     labelled separately from the complete simultaneous peak; downstream
     guardrails must use the latter.
     """
+    scope = resolve_efficiency_scope(case, scope)
     _validate_geometry(phase, tokens, context, sequences, scope)
     if isinstance(output_budget, bool) or not isinstance(output_budget, int) or output_budget < 0:
         raise ValueError(f"output_budget_must_be_nonnegative_int:{output_budget}")
@@ -474,7 +483,7 @@ def capacity_feedback(case: CaseSpec | Mapping[str, Any], *, phase: str = "decod
     }
 
 
-def evaluate_fixed_plan(case: CaseSpec | Mapping[str, Any], *, plan: Mapping[str, Any] | None = None, phase: str = "decode", tokens: int = 1, context: int = DEFAULT_CONTEXT, sequences: int = 1, scope: str = "body",
+def evaluate_fixed_plan(case: CaseSpec | Mapping[str, Any], *, plan: Mapping[str, Any] | None = None, phase: str = "decode", tokens: int = 1, context: int = DEFAULT_CONTEXT, sequences: int = 1, scope: str | None = None,
                         hbm_bw_scale: float = 1.0, cube_flops_scale: float = 1.0, vector_ops_scale: float = 1.0, link_bw_scale: float = 1.0, hbm_capacity_scale: float = 1.0,
                         include_submission: bool = False, overlap_async_scheduler: bool = False,
                         include_capacity: bool = False, output_budget: int = DEFAULT_OUTPUT_BUDGET, emitted_tokens_per_seq: float | None = None) -> dict[str, Any]:
@@ -490,8 +499,10 @@ def evaluate_fixed_plan(case: CaseSpec | Mapping[str, Any], *, plan: Mapping[str
         plan = dict(plan)
         geometry = dict(plan.get("geometry") or {})
         phase, tokens, context = geometry.get("phase", phase), geometry.get("tokens", tokens), geometry.get("context", context)
-        sequences, scope = geometry.get("sequences", sequences), geometry.get("scope", scope)
+        sequences = geometry.get("sequences", sequences)
+        scope = resolve_efficiency_scope(parsed, geometry.get("scope", scope))
     else:
+        scope = resolve_efficiency_scope(parsed, scope)
         geometry = {"phase": phase, "tokens": tokens, "context": context, "sequences": sequences, "scope": scope}
         plan = prepare_fixed_plan(parsed, **geometry)
     _validate_geometry(phase, tokens, context, sequences, scope)
@@ -529,7 +540,7 @@ def _declared_plan_work(plan: Mapping[str, Any]) -> dict[str, float]:
     return totals
 
 
-def evaluate_resource_counterfactual(case: CaseSpec | Mapping[str, Any], *, resource: str, factor: float, phase: str = "decode", tokens: int = 1, context: int = DEFAULT_CONTEXT, sequences: int = 1, scope: str = "body",
+def evaluate_resource_counterfactual(case: CaseSpec | Mapping[str, Any], *, resource: str, factor: float, phase: str = "decode", tokens: int = 1, context: int = DEFAULT_CONTEXT, sequences: int = 1, scope: str | None = None,
                                      plan: Mapping[str, Any] | None = None, include_submission: bool = False, overlap_async_scheduler: bool = False,
                                      include_capacity: bool = True, output_budget: int = DEFAULT_OUTPUT_BUDGET, emitted_tokens_per_seq: float | None = None) -> dict[str, Any]:
     """Change one hardware rate or capacity and re-evaluate the same program; never rescale a graph by isolated sums."""
@@ -540,6 +551,8 @@ def evaluate_resource_counterfactual(case: CaseSpec | Mapping[str, Any], *, reso
     if canonical is None:
         raise ValueError(f"unsupported_counterfactual_resource:{resource}")
     _check_pos_float("resource_factor", factor)
+    if plan is None or "geometry" not in plan:
+        scope = resolve_efficiency_scope(case, scope)
     if plan is not None:
         plan = dict(plan)
         geometry = dict(plan.get("geometry") or {"phase": phase, "tokens": tokens, "context": context, "sequences": sequences, "scope": scope})

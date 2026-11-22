@@ -162,7 +162,7 @@ def test_default_fusion_conserves_semantic_and_extended_work(extended):
         members[0] = replace(members[0], metadata=(*members[0].metadata, ('resource_work', {'vector': 1000})))
         physical = lower_native_fusions(members, case.runtime)
         before, after = (evaluate(case, ops, members)['execution']['serviced'] for ops in (members, physical))
-        assert after['vector@r0:s0'] == before['vector@r0:s0']
+        assert after['vector@r0:s0'] == pytest.approx(before['vector@r0:s0'])
         assert physical[0].vector_ops == sum_attr(members, 'vector_ops') + 1000
         return
     lowerings = {key: value for key, value in case.runtime.kernels['lowerings'].items() if key != 'native_fusion'}

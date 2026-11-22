@@ -660,6 +660,11 @@ from .binding import DEFAULT_ACTIVE_AIV_BLOCKS
 
 DEFAULT_TOTAL_AIV_UNITS = 64
 _CONTENTION_UTIL_CAP = 4.0
+# Diagnostic-only contention weighting coefficients for offline MC2 chain
+# summaries (``compute_a5_contention_slowdown`` / ``evaluate_a5_mc2_chains``).
+# Never consumed by production Engine simulation or roofline pricing; pending
+# live A5 multi-stream contention sweeps (see ``contention:live_sweeps`` in
+# ``build_a5_followup_manifest``).
 _MTE_SELF_CONTENTION = 0.55
 _MTE_VECTOR_CONTENTION = 0.10
 _MTE_CUBE_CONTENTION = 0.05
@@ -773,6 +778,8 @@ def evaluate_a5_mc2_chains(ingested=None):
         legs = chain.get("legs_ms") or {}
         chain_ms = float(chain["chain_p50_ms"])
         sum_ms = float(chain.get("sum_leg_p50_ms") or sum(legs.values()))
+        if not math.isfinite(sum_ms) or sum_ms <= 0.0:
+            raise ModelingError(f"a5_mc2_chain_nonpositive_sum:{chain.get('condition')}")
         ratio = chain_ms / sum_ms
         concurrent = max(_MIN_MC2_CONCURRENT_UTIL, min(1.0, 1.0 - min(1.0, ratio)))
         if any(key in chain for key in ("observed_expansion_mode",

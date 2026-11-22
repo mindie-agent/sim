@@ -33,14 +33,28 @@ _ROLE_NEEDED_EVIDENCE = (
 _ROLE_SERVICE_BOUNDARIES = frozenset({"resource_phase", "device_kernel"})
 
 
+_HASH_CHUNK_BYTES = 1024 * 1024
+
+
+def _sha256_file(path):
+    import hashlib
+    from pathlib import Path
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        while chunk := handle.read(_HASH_CHUNK_BYTES):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def load_role_ledger(path):
     """Read a JSONL cohort ledger without opening any referenced capture."""
     import json
     from pathlib import Path
     records = []
-    for line in Path(path).read_text().splitlines():
-        if line.strip():
-            records.append(json.loads(line))
+    with Path(path).open(encoding="utf-8") as handle:
+        for line in handle:
+            if line.strip():
+                records.append(json.loads(line))
     return tuple(records)
 
 
@@ -1610,53 +1624,9 @@ def _join_actual_capture_rows(selected, native_by_cohort, capture_files, raw_by_
     return joined
 
 
-def build_actual_evidence(role_records, native_validation, *,
-                          with_sha256=False, max_cohorts=None,
-                          role="in_sample"):
-    """Join role ledger -> T03 validation -> same-boundary raw PMU rows.
-
-    The function reads only ``in_sample`` captures.  Frozen-transfer and
-    not-declared cohorts are registered but their raw captures are not opened.
-    Every join check, participation record, exclusion, duplicate counter and
-    source hash is returned so the training set is reproducible.
-    """
-    import hashlib
-    if isinstance(native_validation, Mapping):
-        native_rows = list(native_validation.get("rows") or ())
-        native_meta = {key: native_validation.get(key)
-                       for key in ("path", "sha256", "bytes", "count", "counts")}
-    else:
-        native_rows = list(native_validation)
-        native_meta = {"path": None, "sha256": None, "bytes": None,
-                       "count": len(native_rows), "counts": {}}
-    native_by_cohort = {str(row.get("cohort_id")): row for row in native_rows}
-    partition = calibration_role_partitions(role_records)
-    selected = list(partition["in_sample"])
-    if max_cohorts is not None:
-        selected = selected[:int(max_cohorts)]
-    registration = {
-        "role_counts": dict(partition["counts"]),
-        "total": partition["total"],
-        **{f"{name}_ids": [record["cohort_id"] for record in partition[name]]
-           for name in ("in_sample", "frozen_transfer", "not_declared")},
-        "policy": partition["policy"],
-        "read_capture_roles": [role],
-    }
-    excluded = []
-    for name, reason in (
-        ("frozen_transfer", "role_frozen_transfer_not_training"),
-        ("not_declared", "role_not_declared_neither_training_nor_holdout"),
-    ):
-        excluded.extend({
-            "cohort_id": record["cohort_id"], "role": record.get("role"),
-            "reason": reason, "source_path": record.get("source_path"),
-        } for record in partition[name])
-    capture_files, raw_by_key = _read_actual_capture_groups(
-        selected, native_by_cohort, excluded, with_sha256=with_sha256)
-    joined = _join_actual_capture_rows(selected, native_by_cohort, capture_files, raw_by_key)
+def _summarize_actual_evidence_groups_and_pairs(joined):
     groups = {}
     for item in joined:
-        plan = item["native_plan"]
         key = (str(item["capture_image"].get("image_id")),
                str(item["raw_measurement"]["scheduling"].get("kernel_type")),
                str(item["native_validation"].get("contract_match_status")))
@@ -1701,6 +1671,54 @@ def build_actual_evidence(role_records, native_validation, *,
             "reason": ("overlapping_joint_kernel_window; different_work_and_"
                        "owner_conditions; measured_pipe_aggregation_not_declared"),
         })
+    return list(groups.values()), pairs
+
+
+def build_actual_evidence(role_records, native_validation, *,
+                          with_sha256=False, max_cohorts=None,
+                          role="in_sample"):
+    """Join role ledger -> T03 validation -> same-boundary raw PMU rows.
+
+    The function reads only ``in_sample`` captures.  Frozen-transfer and
+    not-declared cohorts are registered but their raw captures are not opened.
+    Every join check, participation record, exclusion, duplicate counter and
+    source hash is returned so the training set is reproducible.
+    """
+    import hashlib
+    if isinstance(native_validation, Mapping):
+        native_rows = list(native_validation.get("rows") or ())
+        native_meta = {key: native_validation.get(key)
+                       for key in ("path", "sha256", "bytes", "count", "counts")}
+    else:
+        native_rows = list(native_validation)
+        native_meta = {"path": None, "sha256": None, "bytes": None,
+                       "count": len(native_rows), "counts": {}}
+    native_by_cohort = {str(row.get("cohort_id")): row for row in native_rows}
+    partition = calibration_role_partitions(role_records)
+    selected = list(partition["in_sample"])
+    if max_cohorts is not None:
+        selected = selected[:int(max_cohorts)]
+    registration = {
+        "role_counts": dict(partition["counts"]),
+        "total": partition["total"],
+        **{f"{name}_ids": [record["cohort_id"] for record in partition[name]]
+           for name in ("in_sample", "frozen_transfer", "not_declared")},
+        "policy": partition["policy"],
+        "read_capture_roles": [role],
+    }
+    excluded = []
+    for name, reason in (
+        ("frozen_transfer", "role_frozen_transfer_not_training"),
+        ("not_declared", "role_not_declared_neither_training_nor_holdout"),
+    ):
+        excluded.extend({
+            "cohort_id": record["cohort_id"], "role": record.get("role"),
+            "reason": reason, "source_path": record.get("source_path"),
+        } for record in partition[name])
+    capture_files, raw_by_key = _read_actual_capture_groups(
+        selected, native_by_cohort, excluded, with_sha256=with_sha256)
+    joined = _join_actual_capture_rows(selected, native_by_cohort, capture_files, raw_by_key)
+    group_rows, pairs = _summarize_actual_evidence_groups_and_pairs(joined)
     counts = {}
     for item in joined:
         key = item["native_validation"].get("contract_match_status")
@@ -1738,7 +1756,7 @@ def build_actual_evidence(role_records, native_validation, *,
             "abi_slot_compaction": sum(
                 1 for item in joined if item.get("abi_slot_compaction")),
         },
-        "groups": list(groups.values()),
+        "groups": group_rows,
         "real_pairs": pairs,
         "training_inputs": training_inputs,
         "service": None,
@@ -1790,7 +1808,7 @@ def fit_actual_training_evidence(role_path, native_validation_path, *,
         max_cohorts=max_cohorts)
     evidence["role_ledger"] = {
         "path": str(role_path),
-        "sha256": hashlib.sha256(role_path.read_bytes()).hexdigest(),
+        "sha256": _sha256_file(role_path),
         "bytes": role_path.stat().st_size,
         "count": len(records),
     }

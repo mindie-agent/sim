@@ -249,8 +249,8 @@ from mindie_sim.prediction.call_builders import (
 from mindie_sim.schema.common import ModelingError
 
 
-PRODUCER_SHA256 = "ea76c64cd935e2d35c849f957f2179701d81d72c951a738a430260de4b251136"
-PRODUCER_PATH = (
+ACTIVATION_PRODUCER_SHA256 = "ea76c64cd935e2d35c849f957f2179701d81d72c951a738a430260de4b251136"
+ACTIVATION_PRODUCER_PATH = (
     "repository://mindie-agent/.workstreams/composability/scripts/bench_activation.py"
 )
 
@@ -269,7 +269,7 @@ def bind_activation_condition(condition) -> ActivationBinding:
     """Return a conditional boundary binding, not an accuracy prediction row."""
     identity = condition["identity"]
     implementation = identity["implementation"]
-    if implementation.get("producer_sha256") != PRODUCER_SHA256:
+    if implementation.get("producer_sha256") != ACTIVATION_PRODUCER_SHA256:
         raise ModelingError("activation_binding_requires_audited_producer")
     variant = implementation["variant"]
     spec = ActivationCallSpec(
@@ -301,7 +301,7 @@ def bind_activation_condition(condition) -> ActivationBinding:
     call = build_activation_call(spec)
     ledger = {
         "binding": "retained_activation_api_closure/1",
-        "producer": {"path": PRODUCER_PATH, "sha256": PRODUCER_SHA256},
+        "producer": {"path": ACTIVATION_PRODUCER_PATH, "sha256": ACTIVATION_PRODUCER_SHA256},
         "timed_region": {
             "starts": "event_record_before_first_api",
             "ends": "event_record_after_last_api",
@@ -445,7 +445,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 
 from mindie_sim.prediction.operators.grouped_moe.call_grouped import (
-    API, NZ_LAYOUT, PRODUCER_SHA256, QuantizedGroupedCall,
+    API, NZ_LAYOUT, PRODUCER_SHA256 as GROUPED_PRODUCER_SHA256, QuantizedGroupedCall,
     build_quantized_grouped_call,
 )
 from mindie_sim.schema.common import ModelingError
@@ -499,7 +499,7 @@ def _identity_contract(identity):
     implementation = identity.get("implementation")
     if not isinstance(implementation, dict):
         raise ModelingError("grouped_binding_requires_implementation_identity")
-    if implementation.get("producer_sha256") != PRODUCER_SHA256:
+    if implementation.get("producer_sha256") != GROUPED_PRODUCER_SHA256:
         raise ModelingError("grouped_binding_requires_audited_producer")
     if implementation.get("api") != API:
         raise ModelingError("grouped_binding_api_differs_from_producer")
@@ -832,7 +832,6 @@ def resource_service_binding(service, *, resource_role=None, phase=None,
                           "applied_once": True},
         "startup_once": True,
         "fixed_once": True,
-        "formula": service.formula,
         "source": source,
         "production_prediction": True,
         "legacy": False,

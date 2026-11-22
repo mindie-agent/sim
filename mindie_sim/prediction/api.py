@@ -32,7 +32,6 @@ from mindie_sim.prediction.operators.attention.attention import AttentionPolicy
 from .structure import parse_case
 from mindie_sim.coverage import model_coverage
 
-ZERO = 0
 DEFAULT_TRACE_LIMIT = 2
 DEFAULT_EVENT_LIMIT = 256
 MAX_COHORT_BINDINGS = 256
@@ -318,10 +317,38 @@ def _submit_ready_cohorts(
     return logical_steps, iterations
 
 
+def _commit_completed_steps(in_flight, schedulers, engine, assembly,
+                            scheduler_feedback, bindings, tails, traces,
+                            trace_limit, observer, model_steps):
+    for replica, step in list(in_flight.items()):
+        if not step.completion.done:
+            continue
+        schedulers[replica].commit_batch(step)
+        scheduler_feedback[replica] = schedulers[replica].feedback(
+            engine.now, include_done=schedulers[replica].done)
+        assembly["declared_commits"] += len(getattr(step, "declared_commits", {}))
+        assembly["fallback_commits"] += len(getattr(step, "fallback_commits", {}))
+        assembly["host_submits"] += len(getattr(step, "host_submits", ()))
+        if len(bindings) > MAX_COHORT_BINDINGS:
+            del bindings[:len(bindings) - MAX_COHORT_BINDINGS]
+        tails.update(getattr(step, "host_results", {}).values())
+        tails.update(getattr(step, "client_deliveries", {}).values())
+        if _event_pending(getattr(step, "offload_release", None)):
+            tails.add(step.offload_release)
+        if step.mode != "retire":
+            model_steps += 1
+            if observer is not None:
+                observer(step)
+            if len(traces) < trace_limit:
+                traces.append(step.to_dict())
+        del in_flight[replica]
+    return model_steps
+
+
 def run_cohort(case, execution, schedulers, memory, lower, *, trace_limit=DEFAULT_TRACE_LIMIT,
                max_model_steps=None, observer=None, token_quotas=None,
-               selected_allocations=None, selected_replica: int = ZERO,
-               selected_stage: int = ZERO):
+               selected_allocations=None, selected_replica: int = 0,
+               selected_stage: int = 0):
     """Event-driven cohort frontier shared by predict/service/assemble adapters.
 
     The caller owns Execution, Scheduler/Memory and the lowerer. This function
@@ -375,28 +402,9 @@ def run_cohort(case, execution, schedulers, memory, lower, *, trace_limit=DEFAUL
 
     while True:
         # 1. Commit only completed actual steps and remove their callbacks.
-        for replica, step in list(in_flight.items()):
-            if not step.completion.done:
-                continue
-            schedulers[replica].commit_batch(step)
-            scheduler_feedback[replica] = schedulers[replica].feedback(
-                engine.now, include_done=schedulers[replica].done)
-            assembly["declared_commits"] += len(getattr(step, "declared_commits", {}))
-            assembly["fallback_commits"] += len(getattr(step, "fallback_commits", {}))
-            assembly["host_submits"] += len(getattr(step, "host_submits", ()))
-            if len(bindings) > MAX_COHORT_BINDINGS:
-                del bindings[:len(bindings) - MAX_COHORT_BINDINGS]
-            tails.update(getattr(step, "host_results", {}).values())
-            tails.update(getattr(step, "client_deliveries", {}).values())
-            if _event_pending(getattr(step, "offload_release", None)):
-                tails.add(step.offload_release)
-            if step.mode != "retire":
-                model_steps += 1
-                if observer is not None:
-                    observer(step)
-                if len(traces) < trace_limit:
-                    traces.append(step.to_dict())
-            del in_flight[replica]
+        model_steps = _commit_completed_steps(
+            in_flight, schedulers, engine, assembly, scheduler_feedback,
+            bindings, tails, traces, trace_limit, observer, model_steps)
 
         real_done = all(scheduler.done for scheduler in schedulers)
         cap_reached = (max_model_steps is not None
@@ -501,7 +509,7 @@ def predict(
     max_model_steps: int | None = None, window=None, observer=None,
     include_submission: bool = True, resource_fusion: bool = True,
     memory: Memory | None = None, selected_allocations=None,
-    memory_replica: int = ZERO, memory_stage: int = ZERO,
+    memory_replica: int = 0, memory_stage: int = 0,
     token_quotas: Mapping[str, int] | None = None,
 ) -> dict[str, Any]:
     # A declared attention core without a physical model may be inspected

@@ -31,6 +31,7 @@ from ..structure import parse_case
 from .peaks import (
     DEFAULT_CONTEXT, DEFAULT_SEQUENCES, DEFAULT_TOKENS, _BOUNDS, _KINDS,
     _SCALE_KEYS, _check_pos_float, _role_scale_factor, _validate_geometry,
+    resolve_efficiency_scope,
     analyze_operator_row, extract_hardware_peaks, legacy_service_regime_diagnostics,
 )
 
@@ -74,6 +75,107 @@ def occurrence_work_graph(graph_report: Mapping[str, Any] | None,
                 matched = relative.get(normalize_reference(
                     op_id, int(match.group(1)), int(match.group(2))))
         rows.append({**item, **(matched or {})})
+    return graph_from_occurrences(rows)
+
+
+def _causal_split(timeline: Sequence[Mapping[str, Any]], input_ready_ms: float) -> list[tuple[float, float]]:
+    """Per-row ``(causal wait, executed service)`` split of one realized timeline.
+
+    The wait runs from the latest in-timeline predecessor completion (roots: the
+    graph input boundary) to readiness; service runs from the later of the two
+    to completion, so every node's realized clock equals its completion.
+    """
+    complete = {str(item["id"]): float(item["complete_ms"])
+                for item in timeline
+                if item.get("id") is not None and item.get("complete_ms") is not None}
+    split = []
+    for item in timeline:
+        if item.get("ready_ms") is not None and item.get("complete_ms") is not None:
+            ready = float(item["ready_ms"])
+            done = float(item["complete_ms"])
+            floor = max((complete[str(pred)] for pred in item.get("predecessors", ()) or ()
+                         if str(pred) in complete), default=float(input_ready_ms))
+            split.append((max(0.0, ready - floor), max(0.0, done - max(ready, floor))))
+        else:
+            split.append((0.0, max(0.0, float(item.get("elapsed_ms", 0.0) or 0.0))))
+    return split
+
+
+def _priced_pipes(operator_rows: Sequence[Mapping[str, Any]]) -> tuple[dict, dict]:
+    service: dict[str, dict[str, float]] = {}
+    relative: dict[str, dict[str, float]] = {}
+    for row in operator_rows or ():
+        op = row.get("operator") if isinstance(row.get("operator"), Mapping) else row
+        op_id = str(op.get("op_id") or row.get("op_id") or "")
+        if not op_id:
+            continue
+        metrics = {
+            "cube_ms": float(row.get("t_cube_ideal_ms", 0.0) or 0.0),
+            "vector_ms": float(row.get("t_vec_ideal_ms", 0.0) or 0.0),
+            "hbm_ms": float(row.get("t_hbm_ideal_ms", 0.0) or 0.0),
+            "link_ms": float(row.get("t_link_ideal_ms", 0.0) or 0.0),
+            "fixed_ms": float(row.get("fixed_ms", 0.0) or 0.0),
+        }
+        service[op_id] = metrics
+        relative.setdefault(normalize_reference(
+            op_id, int(row.get("stage", 0)), int(row.get("layer", 0))), metrics)
+    return service, relative
+
+
+def _reconciled_pipes(matched: Mapping[str, float] | None, elapsed: float, wait: float) -> dict[str, float]:
+    """Distribute one executed span over its priced pipes plus attributed wait.
+
+    Fixed/launch service is kept; the remaining executed service scales the
+    priced pipe vector so its dominant pipe equals the remainder.  A causal
+    wait is peer rendezvous skew on a link-dominant occurrence, otherwise
+    dispatch/launch control (``fixed_ms``).
+    """
+    idle = {"cube_ms": 0.0, "vector_ms": 0.0, "hbm_ms": 0.0, "link_ms": 0.0,
+            "fixed_ms": elapsed + wait}
+    if matched is None:
+        return idle
+    fixed = min(max(0.0, float(matched["fixed_ms"])), elapsed)
+    rem = max(0.0, elapsed - fixed)
+    pipes = [float(matched[key]) for key in ("cube_ms", "vector_ms", "hbm_ms", "link_ms")]
+    peak = max(pipes)
+    if peak <= 0.0 or rem <= 0.0:
+        return idle
+    pipes = [value * rem / peak for value in pipes]
+    if pipes[3] >= rem:
+        pipes[3] += wait
+    else:
+        fixed += wait
+    return {"cube_ms": pipes[0], "vector_ms": pipes[1], "hbm_ms": pipes[2],
+            "link_ms": pipes[3], "fixed_ms": fixed}
+
+
+def executed_occurrence_work_graph(
+    graph_report: Mapping[str, Any] | None,
+    operator_rows: Sequence[Mapping[str, Any]],
+):
+    """Realized occurrence DAG reconciled to the Engine's executed spans.
+
+    Each timeline occurrence carries its executed service (priced pipe mix
+    rescaled to the Engine span, fixed/launch kept) plus its attributed causal
+    wait, so the DAG's realized span equals the executed boundary.
+    """
+    if not graph_report:
+        return None
+    timeline = tuple(graph_report.get("timeline", ()) or ())
+    if not timeline:
+        return None
+    service, relative = _priced_pipes(operator_rows)
+    input_ready = float(graph_report.get("input_ready_ms", 0.0) or 0.0)
+    rows = []
+    for item, (wait, elapsed) in zip(timeline, _causal_split(timeline, input_ready)):
+        op_id = str(item.get("op_id") or "")
+        matched = service.get(op_id)
+        if matched is None and op_id:
+            match = _OCCURRENCE_IDENTITY.search(op_id)
+            if match is not None:
+                matched = relative.get(normalize_reference(
+                    op_id, int(match.group(1)), int(match.group(2))))
+        rows.append({**item, **_reconciled_pipes(matched, elapsed, wait)})
     return graph_from_occurrences(rows)
 
 
@@ -159,15 +261,17 @@ def _occurrence_dag_graph(payload):
 
 
 def analyze_network_efficiency(
-    case: CaseSpec | Mapping[str, Any], *, phase: str = "decode", tokens: int = DEFAULT_TOKENS, context: int = DEFAULT_CONTEXT, sequences: int = DEFAULT_SEQUENCES, scope: str = "body",
+    case: CaseSpec | Mapping[str, Any], *, phase: str = "decode", tokens: int = DEFAULT_TOKENS, context: int = DEFAULT_CONTEXT, sequences: int = DEFAULT_SEQUENCES, scope: str | None = None,
     operator_report: Mapping[str, Any] | None = None, graph_report: Mapping[str, Any] | None = None,
     observed_durations_ms: Mapping[str, float] | None = None, pmu_by_op: Mapping[str, Mapping[str, float]] | None = None,
     run_graph: bool = True, _precomputed_graph: tuple[Any, CaseSpec, dict[str, Any]] | None = None,
     evaluation_context: Any | None = None, _retain_graph: bool = False,
+    timeline_replicas: Any = None,
 ) -> dict[str, Any]:
     """Compute whole-network 4D MFU/MBU/CV efficiency and bottleneck breakdowns."""
-    _validate_geometry(phase, tokens, context, sequences, scope)
     parsed = parse_case(case)
+    scope = resolve_efficiency_scope(parsed, scope)
+    _validate_geometry(phase, tokens, context, sequences, scope)
     # A supplied report is not an escape hatch: its rows must be modeled too.
     from ..efficiency.unmodeled_gate import assert_report_supported, assert_timing_supported
     from .attribution import _fast_operator_and_graph_reports, attribute_program
@@ -193,7 +297,8 @@ def analyze_network_efficiency(
             parsed, phase=phase, tokens=tokens, context=context,
             sequences=sequences, scope=scope, run_graph=run_graph,
             precomputed_graph=_precomputed_graph,
-            evaluation_context=evaluation_context or evaluation)
+            evaluation_context=evaluation_context or evaluation,
+            **({"timeline_replicas": timeline_replicas} if timeline_replicas is not None else {}))
         graph_report = auto_graph if graph_report is None else graph_report
 
     raw_rows = [r for r in operator_report["operators"] if r.get("replica", 0) == 0] or list(operator_report["operators"])
@@ -331,7 +436,7 @@ def _decompose_operator_pipes(op: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def fit_case_roofline_regimes(case: CaseSpec | Mapping[str, Any], *, phase: str = "decode", tokens: int = 1, context: int = DEFAULT_CONTEXT, sequences: int = 1, scope: str = "body", observed_durations_ms: Mapping[str, float] | None = None, baseline_analysis: Mapping[str, Any] | None = None) -> dict[str, Any]:
+def fit_case_roofline_regimes(case: CaseSpec | Mapping[str, Any], *, phase: str = "decode", tokens: int = 1, context: int = DEFAULT_CONTEXT, sequences: int = 1, scope: str | None = None, observed_durations_ms: Mapping[str, float] | None = None, baseline_analysis: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """Fit multi-pipe roofline parameters (fixed_us, effective_mbu/cube_mfu/vec_mfu) per operator."""
     pkg = sys.modules.get(__package__ or "")
     analyze_fn = getattr(pkg, "analyze_network_efficiency", analyze_network_efficiency) if pkg is not None else analyze_network_efficiency
