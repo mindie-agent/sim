@@ -83,11 +83,7 @@ def validate(*, plan, parallel, model, quant, lowering_passes,
             or (quant.kv_dtype not in BF16_CACHE_DTYPES and not packed)
             or quant.format_for("mla") not in {"bf16", "int8", "fp8_e4m3"}):
         raise ModelingError("mla_prolog_v3_declared_operand_domain_unsupported")
-    if not packed and quant.format_for("mla") == MXFP8_FORMAT:
-        # V3 admits BF16 and legacy INT8 projection weights. FP8/MXFP8
-        # projection operands are the A5 V4 contract.
-        raise ModelingError("mla_prolog_v3_rejects_fp8_projection_weights")
-    # The V3 prolog owns one fused Q-A reduction; its source kernel is
+    # The V3/V4 prolog owns one fused Q-A reduction; its source kernel is
     # admitted only for the two declared LoRA ranks.
     if (plan.q_lora_rank
             and plan.q_lora_rank not in MLA_PROLOG_QUERY_LORA_RANKS):
@@ -108,7 +104,8 @@ def validate(*, plan, parallel, model, quant, lowering_passes,
 
 def _native_kind(packed, quant):
     from .mla_prolog_packed import NATIVE_KIND_V3, NATIVE_KIND_V4, MXFP8_QUERY_FORMAT
-    if packed and quant.format_for("mla") == MXFP8_QUERY_FORMAT:
+    del packed
+    if quant.format_for("mla") == MXFP8_QUERY_FORMAT:
         return NATIVE_KIND_V4
     return NATIVE_KIND_V3
 
@@ -193,6 +190,77 @@ def declare(ops, *, prefix, plan, model, parallel, quant, tokens, members,
             },
         },
         source=source,
+        fusion_status="fused_framework_enable",
+        fusion_reason=("mla_prolog_v4_selected_lowering"
+                       if mxfp8_query else "mla_prolog_v3_selected_lowering"),
+    )
+
+
+def declare_semantic(ops, *, prefix, plan, model, parallel, quant, tokens, members,
+                     q_a, q_b, kv_a, q_absorb=None, anchor=None, reason="mla_prolog_unfused"):
+    """Declare semantic ``mla_prolog`` subgraph even when V3/V4 fusion is not selected."""
+    by_id = {op.op_id: op for op in ops}
+    filtered = tuple(dict.fromkeys(op_id for op_id in members if op_id in by_id))
+    if not filtered:
+        return
+    entries = tuple(dict.fromkeys(op_id for op_id in (q_a, kv_a) if op_id in by_id))
+    if not entries:
+        entries = (filtered[0],)
+    target_anchor = anchor if anchor in by_id else filtered[-1]
+    qa = dict(by_id[q_a].metadata) if q_a in by_id else {}
+    qb = dict(by_id[q_b].metadata) if q_b in by_id else {}
+    kva = dict(by_id[kv_a].metadata) if kv_a in by_id else {}
+    absorb = dict(by_id[q_absorb].metadata) if q_absorb and q_absorb in by_id else {}
+    native_kind = _native_kind(False, quant)
+    query_norm_output = bool(
+        plan.indexer or plan.owns_topk or plan.index_query_per_layer)
+    default_fmt = quant.format_for("mla")
+    declare_group(
+        ops, key=prefix + ".mla_prolog_semantic", role="mla_prolog", family="mla",
+        members=filtered, entries=entries, anchor=target_anchor,
+        view={
+            "tokens": tokens, "hidden": model.hidden_size,
+            "heads": max(1, plan.num_heads // max(1, parallel.tp)),
+            "query_rank": plan.q_lora_rank, "latent_rank": plan.kv_lora_rank,
+            "nope_width": plan.qk_nope_head_dim, "rope_width": plan.qk_rope_head_dim,
+            "token_dtype": qa.get("activation_format", model.activation_dtype),
+            "projection_weight_dtypes": (
+                qa.get("weight_format", default_fmt),
+                qb.get("weight_format", default_fmt),
+                kva.get("weight_format", default_fmt),
+            ),
+            "absorbed_weight_dtype": absorb.get("weight_format"),
+            "norm_dtype": model.activation_dtype, "cache_dtype": quant.kv_dtype,
+            "query_norm_dtype": qb.get("activation_format", model.activation_dtype),
+            "query_norm_output": query_norm_output,
+            "do_rope": bool(plan.mla_do_rope),
+            "parallel_cp": int(parallel.cp),
+            "query_quant_mode": (MXFP8_QUERY_QUANT_MODE
+                                 if default_fmt == MXFP8_FORMAT
+                                 else BF16_QUERY_QUANT_MODE),
+        },
+        implementation={
+            "native_kind": native_kind,
+            "native_kinds": (
+                (native_kind, "MlaPrologV4WeightNz", "MlaPrologV4")
+                if native_kind.endswith("V4WeightNz")
+                else (native_kind, "MlaPrologV3")
+            ),
+            "selection": None,
+            "conditions": {
+                "cache_mode": plan.cache_kind,
+                "mla_variant": plan.mla_variant,
+                "do_rope": bool(plan.mla_do_rope),
+                "data_parallel_context": int(parallel.cp),
+                "query_norm_output": query_norm_output,
+                "timing_boundary": "unfused_semantic_mla_prolog_decomposition",
+            },
+        },
+        source={"kind": "semantic_builder",
+                "module": "mindie_sim.prediction.operators.mla.mla"},
+        fusion_status="unfused_decomposed",
+        fusion_reason=reason,
+        native_fusion_eligible=False,
     )
 
 

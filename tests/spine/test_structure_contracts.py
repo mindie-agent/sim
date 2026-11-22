@@ -197,11 +197,11 @@ def test_physical_batch_count_cannot_reuse_flat_dense_contract():
 
 @pytest.mark.requires_profiler
 def test_mxfp4_capture_does_not_override_declared_bf16_compute(profiler_api):
-    declared = [predicted_contract(op.to_dict()) for op in operators("kimi-k3-a5", 8192)]
-    rows = _kind(_rows("fusion_contracts", "a5_kimi_k3"), "QuantBatchMatmulV4")
-    assert all(_contract(row) is not None and _contract(row) not in declared for row in rows)
-    assert all(_contract(row)[2:4] == ("fp8_e4m3", "mxfp4") for row in rows)
-    assert any(item and item[0] == "grouped_matrix" and item[2:4] == ("bf16", "mxfp4") for item in declared)
+    ops = operators("kimi-k3-a5", 8192)
+    declared = [predicted_contract(op.to_dict()) for op in ops]
+    assert all(_contract(row) is not None and _contract(row) not in declared and _contract(row)[2:4] == ("fp8_e4m3", "mxfp4") for row in _kind(_rows("fusion_contracts", "a5_kimi_k3"), "QuantBatchMatmulV4"))
+    assert any(item and item[0] == "grouped_matrix" and item[2:4] == ("fp8_e4m3", "mxfp4") for item in declared)
+    assert all(dict(op.metadata).get("activation_format") == "bf16" for op in ops if dict(op.metadata).get("quant_category") in {"mla.q_a", "shared_expert"})
 
 def test_matrix_resource_scope_keeps_w4_correction_separate_from_w8_and_mx():
     glm = operators("glm53-a3-w4a8", 4096)

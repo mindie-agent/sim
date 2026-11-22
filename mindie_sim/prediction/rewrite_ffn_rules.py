@@ -335,17 +335,59 @@ def declare_gate_up_fusion_group(*, ops, runtime, prefix, activation, gate_ops,
                                  gate, down, local_experts, latent, expert_width,
                                  routing_metadata, model):
     """Declare the on-chip grouped gate-up + activation/quantization interface."""
-    if not (dict(down.metadata).get("activation_scale_bytes") and runtime
-            and "activation_quantization" in runtime.lowering_passes):
+    gate_meta, down_meta = dict(gate.metadata), dict(down.metadata)
+    rt_meta = dict(getattr(runtime, "metadata", ()) or ())
+    raw_eager = bool(
+        rt_meta.get("raw_eager")
+        or (rt_meta.get("execution_policy") or {}).get("raw_eager")
+    )
+    has_quant_pass = bool(runtime and "activation_quantization" in runtime.lowering_passes)
+    has_routed_mx_scales = bool(
+        down_meta.get("activation_scale_bytes")
+        and down_meta.get("activation_scale_format") == "fp8_e8m0"
+        and not raw_eager
+    )
+    if not (down_meta.get("activation_scale_bytes") and (has_quant_pass or has_routed_mx_scales)):
+        group_role = "grouped_gate_up_act"
+        group_key = prefix + "." + group_role
+        reason = ("unquantized_expert_activation"
+                  if has_quant_pass else "activation_quantization_pass_disabled")
+        declare_group(
+            ops, key=group_key, role=group_role, family="moe",
+            members=(*(g.op_id for g in gate_ops), activation.op_id),
+            entries=(gate_ops[0].op_id,),
+            anchor=activation.op_id, block="ffn", scope_role="body",
+            view={"input_width": latent, "intermediate_width": expert_width,
+                  "local_experts": local_experts,
+                  "routing_basis": dict(routing_metadata)["routing_basis"],
+                  "input_dtype": gate_meta.get("activation_format", model.activation_dtype),
+                  "output_dtype": down_meta.get("activation_format", model.activation_dtype),
+                  "weight_dtype": gate_meta.get("weight_format", model.quant.expert_weight_format),
+                  "intermediate_dtype": gate_meta.get("output_format", model.activation_dtype),
+                  "weight_scale_group_size": model.quant.expert_block,
+                  "activation": dict(activation.metadata)},
+            implementation={"native_kinds": (
+                ["GroupedMatmulSitu"] if activation.family == "situ" else
+                ["GroupedMatmulSwiglu", "GroupedMatmul"]),
+                "conditions": {"scope": "expert_gate_up_activation_unquantized",
+                               "down_projection_external": True}},
+            source=(SITU_SOURCE if activation.family == "situ" else source_reference(
+                "vllm_ascend/ops/fused_moe/moe_mlp.py", "grouped_matmul_swiglu_quant_v2")),
+            coverage={"kind": "complete_subgraph",
+                      "limitations": ["expected_expert_counts_are_not_observed_routing"]},
+            fusion_status="unfused_decomposed",
+            fusion_reason=reason,
+            native_fusion_eligible=False,
+        )
         return False
     group_role = ("grouped_gate_up_situ_quant" if activation.family == "situ"
                   else "grouped_gate_up_activation_quant")
     group_key = prefix + "." + group_role
     # The output quantizer is inserted by the ordinary lowering pass, and
     # belongs to the fused gate-up interface rather than the down GEMM.
-    ops[-1] = replace(down, metadata=down.metadata + (
-        ("input_conversion_subgraphs", (group_key,)),))
-    gate_meta, down_meta = dict(gate.metadata), dict(down.metadata)
+    if has_quant_pass:
+        ops[-1] = replace(down, metadata=down.metadata + (
+            ("input_conversion_subgraphs", (group_key,)),))
     situ_mx_domain = (
         activation.family == "situ" and activation.dtype == gate_meta["output_format"] == "bf16"
         and gate_meta["activation_format"] == down_meta["activation_format"] == "fp8_e4m3"
@@ -405,6 +447,11 @@ def declare_gate_up_fusion_group(*, ops, runtime, prefix, activation, gate_ops,
                            else "complete_subgraph"),
                   "limitations": ["native_binary_and_scalar_flags_not_established",
                                   "expected_expert_counts_are_not_observed_routing"]},
+        fusion_status=("fused_new_kernel_required"
+                       if activation.family == "situ" else "fused_framework_enable"),
+        fusion_reason=("situ_mx_grouped_gate_up_target_fusion"
+                       if activation.family == "situ"
+                       else "grouped_matmul_swiglu_quant_eligible"),
     )
     return True
 

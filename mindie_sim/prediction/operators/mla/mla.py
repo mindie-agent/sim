@@ -665,6 +665,26 @@ def _project_mla_inputs(
             tokens=q, members=tuple(dict.fromkeys(
                 (q_a, q_norm, q_b, kv_a, kv, rotary, produced, q_ready))),
             q_a=q_a, q_b=q_b, kv_a=kv_a, q_absorb=q_ready, **prolog.options)
+    elif plan.q_lora_rank:
+        from mindie_sim.prediction.operators.mla_prolog import family_mla_prolog
+        rt_meta = dict(getattr(runtime, "metadata", ()) or ())
+        if rt_meta.get("raw_eager") or (rt_meta.get("execution_policy") or {}).get("raw_eager"):
+            reason = "raw_eager_unfused_mla_prolog"
+        elif plan.mla_variant != "latent_mla":
+            reason = f"mla_variant_{plan.mla_variant}_unfused"
+        elif plan.cache_kind != "dense":
+            reason = f"cache_kind_{plan.cache_kind}_unfused"
+        elif plan.q_lora_rank not in family_mla_prolog.MLA_PROLOG_QUERY_LORA_RANKS:
+            reason = f"query_lora_rank_{plan.q_lora_rank}_outside_v3_v4_domain"
+        else:
+            reason = "mla_prolog_lowering_not_selected"
+        family_mla_prolog.declare_semantic(
+            b.ops, prefix=b.prefix, plan=plan, model=model, parallel=parallel, quant=quant,
+            tokens=q,
+            members=(q_a, q_norm, q_b, kv_a, kv, rotary, produced, q_ready),
+            q_a=q_a, q_b=q_b, kv_a=kv_a,
+            q_absorb=q_ready if latent else None,
+            anchor=q_ready, reason=reason)
     q_local, rotary_local = q_ready, rotary
     q_dcp, rotary_dcp, dcp_heads = q_local, rotary_local, (proj_heads if decode_dcp else heads)
     if decode_dcp and (tp_gather > 1 or dp_width > 1):

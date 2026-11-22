@@ -31,6 +31,7 @@ from mindie_sim.schema.operators import OpSpec
 from .batch_prefix_indexer import apply_indexer_prefix_reads
 from mindie_sim.prediction.operators.mla.generic_latent_attention import index_key_window, visible_parts
 from mindie_sim.prediction.implementation_selection import is_caller_pinned_binding
+from mindie_sim.prediction.structure_groups import declare_group
 
 try:
     from mindie_sim.prediction.operators.sparse_indexer.index_cache_writer import emit_index_cache_write
@@ -232,10 +233,64 @@ def lower_gqa_indexer(
             metadata=(("selection_output_dtype", "int32"),),
         )
         ops.extend((idx_wq, idx_wk, *store_ops, *pcp_idx_ops, idx_scores, idx_topk))
+        _declare_gqa_indexer_group(
+            ops, prefix=prefix, plan=plan, parallel=parallel, model=model,
+            quant=quant, views=views, padded_tokens=padded_tokens,
+            idx_heads=idx_heads, idx_dim=idx_dim, sel_topk=sel_topk,
+            idx_ratio=idx_ratio, scores_id=idx_scores.op_id, topk_id=idx_topk.op_id,
+        )
         index_store_id, topk_id = idx_store_id, idx_topk.op_id
     elif idx_owner >= 0:
         index_store_id = (index_cache_ids or {}).get(idx_owner)
     return eff_topk, sel_topk, block_size, index_store_id, topk_id, candidate_id
+
+
+def _declare_gqa_indexer_group(
+    ops, *, prefix, plan, parallel, model, quant, views, padded_tokens,
+    idx_heads, idx_dim, sel_topk, idx_ratio, scores_id, topk_id,
+):
+    """Unconditionally declare the GQA sparse indexer semantic subgraph."""
+    quantized = quant.index_dtype not in {"bf16", "fp16"}
+    if int(plan.index_kpool or 1) > 1:
+        role, family, native_kind = "pool_key_indexer", "pooled_indexer", "PoolKeyIndexer"
+    elif quantized:
+        role, family, native_kind = (
+            "quant_lightning_indexer", "dsa", "VllmAscendQuantLightningIndexerV2")
+    else:
+        role, family, native_kind = "lightning_indexer", "dsa", "LightningIndexer"
+    partition = tuple(
+        {"query": v.q_len, "context": v.context, "kv_length": v.kv_len}
+        for v in views
+    )
+    declare_group(
+        ops, key=prefix + "." + role, role=role, family=family,
+        members=(scores_id, topk_id), entries=(scores_id,), anchor=topk_id,
+        block="attention",
+        view={
+            "tokens": sum(v.q_len for v in views), "physical_tokens": padded_tokens,
+            "sequence_partition": partition, "compression_ratio": max(1, idx_ratio),
+            "heads": idx_heads, "width": idx_dim, "topk": sel_topk,
+            "query_dtype": quant.index_dtype,
+            "weight_dtype": "fp16" if quant.index_dtype == "int8" else model.activation_dtype,
+            "cache_dtype": quant.index_dtype,
+            "selection_output_dtype": "int32",
+            "scale_dtype": quant.index_scale_dtype,
+        },
+        implementation={
+            "native_kind": native_kind,
+            "conditions": {
+                "cp": int(parallel.cp), "pcp": int(parallel.pcp),
+                "candidate_filter": bool(plan.candidate_filter),
+                "source_selection": "gqa_semantic_score_and_topk_projection",
+                "timing_boundary": "separate_declared_operators",
+            },
+        },
+        source={"kind": "semantic_builder",
+                "module": "mindie_sim.prediction.operators.sparse_indexer.gqa_indexer"},
+        fusion_status="unfused_decomposed",
+        fusion_reason="gqa_indexer_separate_score_and_topk",
+        native_fusion_eligible=False,
+    )
 
 
 def _index_view_work(model, plan, views, idx_ratio, valid, block_size):

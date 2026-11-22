@@ -31,12 +31,14 @@ from .prediction.program import RecipeBook
 from .prediction.structure import parse_case
 from .structure_contracts import comparison_scope, predicted_contract
 from .structure_implementations import (
-    native_implementation, operator_structure, region_structure,
+    native_implementation, operator_birth_certificate, operator_structure,
+    region_structure,
 )
 from .structure_physical import node_physical, subgraph_physical
 from .subgraph_math import attach_subgraph_math
 from .structure_subgraphs import (
-    export_subgraphs, layer_structure, metadata, subgraph_comparison_scope,
+    export_subgraphs, layer_structure, metadata, resolve_subgraph_fusion_status,
+    subgraph_comparison_scope,
 )
 
 
@@ -134,10 +136,16 @@ def _node_id(replica, op_id):
     return f"rank:{replica}/{op_id}"
 
 
-def _block(op):
-    if metadata(op).get("structure_block"):
-        return metadata(op)["structure_block"]
-    return _FAMILY_BLOCKS.get(op.family)
+def _block(op, cert=None):
+    meta = metadata(op)
+    if meta.get("structure_block"):
+        return meta["structure_block"]
+    if op.op_id.endswith(".final_norm") or op.recipe == "final_norm":
+        return "logits"
+    if cert is not None:
+        return cert.block
+    return _FAMILY_BLOCKS.get(op.family) or operator_birth_certificate(
+        op.to_dict(include_work=False)).block
 
 
 def _semantic_refs(op, replica, *, parent=None, block=None):
@@ -208,13 +216,19 @@ def _node(op, replica, *, source_call=None, block=None, role=None, structure=Non
             binding = bind_native_call(op, contract=contract, plan=plan,
                                        prepared=op if plan is not None else None)
 
+    cert = structure_record["birth_certificate"]
+    resolved_block = block if block is not None else _block(op, cert)
     payload = {
         "node_id": node_id,
         "op_id": op.op_id,
         "replica": replica,
         "layer": op.layer,
         "stage": op.stage,
-        "block": block if block is not None else _block(op),
+        "block": resolved_block,
+        "submodule": cert.submodule,
+        "backend_stack": cert.backend_stack,
+        "readiness": cert.readiness,
+        "source_ref": cert.source_ref,
         "role": role if role is not None else metadata(op).get("structure_role"),
         "structure": structure or {},
         "family": op.family,
@@ -283,6 +297,11 @@ def _export_resource_operators(resource_graphs, resource_geometries, subgraphs, 
                         "operator_ids": [resource["node_id"]],
                         "kind": "selected_native_fusion"}
             group["resource_boundary"] = boundary
+            f_status, f_reason = resolve_subgraph_fusion_status(
+                group, [by_id[member_id] for member_id in group["node_ids"]],
+                resource_bound=True)
+            group["fusion_status"] = f_status
+            group["fusion_reason"] = f_reason
             group.update({field: resource[field]
                           for field in ("physical_work", "physical_signature")})
             group["contract_scope"] = subgraph_comparison_scope(

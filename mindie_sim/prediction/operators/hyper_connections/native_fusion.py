@@ -406,7 +406,8 @@ def _check_required_roles(roles, matched_roles, original, groups, local_tokens):
             or op.op_id.startswith("draft.")
             for op in original):
         absent = {role for role in ("hc_pre", "hc_post", "mla_prolog")
-                  if not any(d["role"] == role for d, _ in groups)}
+                  if not any(d["role"] == role and d.get("native_fusion_eligible", True) is not False
+                             for d, _ in groups)}
         required_roles = required_roles - absent
     realized_rows = None
     for op in original:
@@ -478,7 +479,7 @@ def lower_native_fusions(ops, runtime, *, local_tokens=None, public_outputs=()):
     consumer_map = consumer_index(original)
     groups = list(_groups(original))
     for declaration, members in groups:
-        if declaration["role"] not in roles:
+        if declaration["role"] not in roles or declaration.get("native_fusion_eligible", True) is False:
             continue
         view = declaration.get("tensor_view", {})
         gate_members = [op for op in members

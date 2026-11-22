@@ -511,8 +511,18 @@ def test_situ_declarations_replace_swiglu_and_bound_mx_quant_operands() -> None:
         assert op.vector_ops == pytest.approx(12 * elements)
         assert op.mte2_bytes == pytest.approx(4 * elements)
     graph = export_structure(case, phase="prefill", tokens=8, scope="body")
-    assert not any(group["role"] in {"situ_quant", "grouped_gate_up_situ_quant", "grouped_gate_up_activation_quant"}
+    # Routed MXFP4 experts declare FP8 E4M3 + E8M0 microscale grouped SiTU
+    # fusion; excluded shared/dense BF16 paths do not emit situ_quant.
+    assert not any(group["role"] in {"situ_quant", "grouped_gate_up_activation_quant"}
                    for group in graph["subgraphs"])
+    routed_default = [group for group in graph["subgraphs"]
+                      if group["role"] == "grouped_gate_up_situ_quant"]
+    assert routed_default and all(
+        group["contract"] is not None
+        and group["contract"][:2] == ["grouped_mlp_parameters_active", "GroupedMatmulSituQuant"]
+        and group["contract"][3] == ["fp8_e4m3", "mxfp4", "fp8_e4m3"]
+        and group["coverage"]["kind"] == "complete_subgraph"
+        for group in routed_default)
 
     quant = replace(case.model.quant, weight_format="fp8_e4m3",
                     expert_weight_format="fp8_e4m3", activation_format="fp8_e4m3",

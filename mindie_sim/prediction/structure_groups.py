@@ -27,7 +27,8 @@ _SOURCE_FILES = {
 
 def declare_group(ops, *, key, role, family, members, entries, anchor, view,
                   implementation, source=None, block="attention", scope_role=None,
-                  coverage=None):
+                  coverage=None, fusion_status=None, fusion_reason=None,
+                  native_fusion_eligible=True):
     declaration = {
         "key": key, "role": role, "family": family,
         "op_ids": tuple(members), "entry_op_ids": tuple(entries),
@@ -35,6 +36,12 @@ def declare_group(ops, *, key, role, family, members, entries, anchor, view,
     }
     if coverage is not None:
         declaration["coverage"] = coverage
+    if fusion_status is not None:
+        declaration["fusion_status"] = fusion_status
+    if fusion_reason is not None:
+        declaration["fusion_reason"] = fusion_reason
+    if not native_fusion_eligible:
+        declaration["native_fusion_eligible"] = False
     selected = set(members)
     for index, op in enumerate(ops):
         if op.op_id not in selected:

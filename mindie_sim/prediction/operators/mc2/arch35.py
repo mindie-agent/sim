@@ -523,6 +523,12 @@ def _try_lower_megamoe(
     )
     rebuilt = []
     inserted = False
+    absorbed_groups = [
+        dict(group)
+        for item in ops if item.op_id in removed_ids
+        for group in dict(item.metadata).get("structure_subgraphs", ())
+        if isinstance(group, dict) and str(group.get("role", "")).startswith("grouped_gate_up")
+    ]
     for item in ops:
         if item.op_id == target_id:
             rebuilt.append(mega_op)
@@ -532,6 +538,23 @@ def _try_lower_megamoe(
         else:
             rebuilt.append(item)
     if inserted:
+        if absorbed_groups:
+            from mindie_sim.prediction.structure_groups import declare_group
+            for group in absorbed_groups:
+                impl = dict(group.get("implementation") or {})
+                impl["native_kind"] = mc2_megamoe.NATIVE_KIND
+                declare_group(
+                    rebuilt, key=group["key"], role=group["role"],
+                    family=group.get("family", "moe"),
+                    members=(mega_op.op_id,), entries=(mega_op.op_id,),
+                    anchor=mega_op.op_id, block="ffn", scope_role="body",
+                    view=group.get("tensor_view", {}),
+                    implementation=impl, source=group.get("source"),
+                    coverage=group.get("coverage"),
+                    fusion_status="fused_existing",
+                    fusion_reason="megamoe_arch35_fused_mc2_kernel",
+                    native_fusion_eligible=False,
+                )
         return rebuilt
 
 

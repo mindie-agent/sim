@@ -62,25 +62,28 @@ def batched_matrix_metadata(*, tokens, heads, input_width, output_width, role):
 
 
 NATIVE_LAYER_NORM_KIND = "aclnnLayerNorm"
+NATIVE_LAYER_NORM_KINDS = ("LayerNormV3", "aclnnLayerNorm")
 NATIVE_LAYER_NORM_OPS = 8
 FP32_BYTES = int(dtype_bytes("fp32"))
 
 
 def index_layer_norm(builder, *, source, rows, width, input_dtype=None,
-                     output_dtype=None, native=True):
+                     output_dtype=None, native=True, explicit_fp32_wrapper=None):
     """Normalize the indexer key with one declared producer.
 
-    ``aclnnLayerNorm`` (``LayerNormV3``) consumes the activation dtype and
-    writes it back while accumulating mean/variance in FP32 in UB; gamma and
-    beta stay FP32 parameters.  No external cast operator exists on that path.
-    The explicit ``raw_eager`` decomposition keeps the upstream PyTorch FP32
-    wrapper as its own two casts.
+    Standard ``torch.nn.functional.layer_norm(x_bf16, ...)`` on ``torch_npu``
+    dispatches directly to one ``aclnnLayerNorm`` (``LayerNormV3``) kernel that
+    accumulates mean/variance in FP32 inside UB while keeping gamma/beta FP32
+    and writing ``output_dtype`` directly, with zero external ``Cast`` ops.
+    External FP32 casts are emitted only when an upstream Python caller
+    explicitly wraps ``F.layer_norm`` in ``x.float()``.
     """
     dtype = input_dtype or builder.model.activation_dtype
     output_dtype = output_dtype or dtype
     elements = rows * width
     parameters = {"gamma": width * FP32_BYTES, "beta": width * FP32_BYTES}
-    if native:
+    use_single_kernel = bool(native) or (explicit_fp32_wrapper is False)
+    if use_single_kernel:
         return builder.vector(
             "index_norm", (source,), elements, NATIVE_LAYER_NORM_OPS,
             family="layernorm", dtype=dtype, shape=(rows, width),
@@ -94,6 +97,7 @@ def index_layer_norm(builder, *, source, rows, width, input_dtype=None,
                       ("norm_gamma_runtime_bytes", parameters["gamma"]),
                       ("output_format", output_dtype),
                       ("native_kind", NATIVE_LAYER_NORM_KIND),
+                      ("native_kinds", NATIVE_LAYER_NORM_KINDS),
                       ("zero_external_casts", True),
                       ("native_source", LAYER_NORM_SOURCE)))
     ready = source
@@ -104,6 +108,7 @@ def index_layer_norm(builder, *, source, rows, width, input_dtype=None,
             read_bytes_override=elements * dtype_bytes(dtype),
             write_bytes_override=elements * FP32_BYTES,
             metadata=(("input_format", dtype), ("output_format", "fp32"),
+                      ("explicit_fp32_wrapper", True),
                       ("native_source", LAYER_NORM_SOURCE)))
     ready = builder.vector(
         "index_norm", (ready,), elements, NATIVE_LAYER_NORM_OPS, family="layernorm",
@@ -112,7 +117,10 @@ def index_layer_norm(builder, *, source, rows, width, input_dtype=None,
         write_bytes_override=elements * FP32_BYTES,
         metadata=(("reduction_width", width), ("norm_has_weight", True),
                   ("norm_has_bias", True), ("norm_eps", 1e-6),
-                  ("norm_parameter_dtype", "fp32"), ("native_source", LAYER_NORM_SOURCE)))
+                  ("norm_parameter_dtype", "fp32"),
+                  ("native_kinds", NATIVE_LAYER_NORM_KINDS),
+                  ("explicit_fp32_wrapper", True),
+                  ("native_source", LAYER_NORM_SOURCE)))
     if output_dtype != "fp32":
         ready = builder.vector(
             "index_norm_output_cast", (ready,), elements, 1, family="cast",
@@ -120,5 +128,6 @@ def index_layer_norm(builder, *, source, rows, width, input_dtype=None,
             read_bytes_override=elements * FP32_BYTES,
             write_bytes_override=elements * dtype_bytes(output_dtype),
             metadata=(("input_format", "fp32"), ("output_format", output_dtype),
+                      ("explicit_fp32_wrapper", True),
                       ("native_source", LAYER_NORM_SOURCE)))
     return ready

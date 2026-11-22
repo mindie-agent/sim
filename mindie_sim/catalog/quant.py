@@ -70,6 +70,13 @@ def projection_quant(quant: QuantSpec, plan) -> QuantSpec:
 #: Routed MXFP4 experts keep the 32-element group regardless of the plain
 #: linear weight block (128 for V4, 32 for V4.1).
 MX_EXPERT_BLOCK = 32
+MX_EXPERT_SCALE_PACK = 2
+_MXFP4_ROUTED_ACTIVATION = {
+    "activation_format": "fp8_e4m3",
+    "activation_group_size": MX_EXPERT_BLOCK,
+    "activation_scale_format": "fp8_e8m0",
+    "activation_scale_pack": MX_EXPERT_SCALE_PACK,
+}
 
 
 def _quant_deepseek(c: Mapping[str, Any], *, v41: bool) -> QuantSpec:
@@ -142,15 +149,20 @@ def _quant_kimi(c: Mapping[str, Any]) -> QuantSpec:
         name="mxfp4_routed_only",
         weight_format="bf16", activation_format="bf16",
         expert_weight_format="mxfp4",
-        weight_block=(0, 0), expert_block=32,
+        weight_block=(0, 0), expert_block=MX_EXPERT_BLOCK,
         scale_format="fp8_e8m0", scale_bytes=1.0,
         kv_dtype="bf16", index_dtype="bf16", index_scale_dtype="none",
+        category_overrides={
+            "routed_expert": _MXFP4_ROUTED_ACTIVATION,
+            "dspark_routed_expert": _MXFP4_ROUTED_ACTIVATION,
+        },
         exclusions=("attn", "mla", "kda", "shared_expert", "dense_mlp",
                     "router", "lm_head", "embedding", "norm", "mhc",
                     "vision", "projector", "conv_weight_f32"),
         source=merge_source({"quant_method": q.get("quant_method", "compressed-tensors"),
                              "format": q.get("format", "mxfp4-pack-quantized")}),
-        notes=("MXFP4 group32 applies to routed expert matrices only; "
+        notes=("MXFP4 group32 applies to routed expert matrices only with "
+               "FP8 E4M3 activations and E8M0 microscales; "
                "attention/shared/dense/LM-head/vision stay BF16",),
     )
 
@@ -303,6 +315,8 @@ QUANTIZATION_PRESETS: dict[str, Any] = {
     "w8a8-mxfp8": _quant_qwen_mxfp8,
     "mxfp8": _quant_qwen_mxfp8,
     "fp8_mxfp8": _quant_qwen_mxfp8,
+    "mxfp4": lambda: _quant_kimi({}),
+    "mxfp4_routed_only": lambda: _quant_kimi({}),
     "w8a8_dynamic": _quant_w8a8_dynamic,
     "w8a8": _quant_w8a8_dynamic,
     "w8a8_int8": _quant_w8a8_dynamic,

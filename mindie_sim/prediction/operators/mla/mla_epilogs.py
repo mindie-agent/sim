@@ -29,6 +29,7 @@ from .generic_latent_attention import (
 from mindie_sim.prediction.implementations import produced_values, select, set_input_ports
 from mindie_sim.prediction.operators.sparse_indexer.indexer_representation import index_representation
 from .mla_native import index_layer_norm
+from .mla_structure import declare_indexer
 
 INDEXER_QUANT_CACHE = "aclnnIndexerQuantCache"
 INDEXER_TOP_K_KIND = "aclnnQuantLightningIndexerV2"
@@ -544,12 +545,21 @@ def _produce_index_cache(
                 and select(dict(getattr(runtime, "kernels", {}).get("lowerings", {}) or {}),
                            "quant_lightning_indexer") is not None
             )
+            rt_meta = dict(getattr(runtime, "metadata", ()) or ())
+            raw_eager = bool(
+                rt_meta.get("raw_eager")
+                or (rt_meta.get("execution_policy") or {}).get("raw_eager")
+            )
+            fp32_wrapper = (
+                not raw_eager
+                and not _is_a5_runtime(runtime)
+                and not explicit_quant_indexer
+                and quant.index_dtype in {"bf16", "fp16"}
+            )
             normalized = index_layer_norm(
                 b, source=projected, rows=index_rows, width=plan.index_dim,
-                native=native_indexer and (
-                    _is_a5_runtime(runtime)
-                    or explicit_quant_indexer
-                    or quant.index_dtype not in {"bf16", "fp16", "fp32"}))
+                native=not fp32_wrapper,
+                explicit_fp32_wrapper=fp32_wrapper)
             if index_rope:
                 normalized = b.vector(
                     "index_rotary", (normalized,), index_rows * index_rope, ROPE_OPS,
@@ -636,6 +646,10 @@ def _select_index_rows(
                 b, deps=selection_deps, views=views, plan=plan,
                 quant=quant, parallel=parallel, prefix_cache_mode=runtime.prefix_cache_mode,
                 **quant_indexer.options)
+            declare_indexer(
+                b.ops, prefix=b.prefix, plan=plan, parallel=parallel,
+                model=model, quant=quant, views=views, padded_tokens=q,
+                scores=topk, topk=topk)
             # This explicit arch22 source owns its per-query key/scale
             # ledger. Shared capacity does not establish batch read reuse.
         elif (bf16_indexer is not None and len(views) == 1
@@ -659,6 +673,10 @@ def _select_index_rows(
                 binding_revision=str(getattr(runtime, "vllm_version", "unknown")),
                 runtime_version=str(getattr(runtime, "vllm_version", "unknown")),
             ))
+            declare_indexer(
+                b.ops, prefix=b.prefix, plan=plan, parallel=parallel,
+                model=model, quant=quant, views=views, padded_tokens=q,
+                scores=topk, topk=topk)
         else:
             topk = semantic_index_selection(
                 b, deps=selection_deps, views=views, plan=plan, model=model,

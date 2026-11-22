@@ -55,6 +55,13 @@ POWER_CUBIC = 3
 TRIANGULAR_SOLVE_FLOP_COEFFICIENT = 2.0 / POWER_CUBIC
 QK_INPUT_COUNT = 2
 L2_NORM_OPS = 5
+EAGER_NORM_CAST_OPS = 1
+EAGER_NORM_POW_OPS = 1
+EAGER_NORM_MEAN_OPS = 2
+EAGER_NORM_ADD_OPS = 1
+EAGER_NORM_RSQRT_OPS = 1
+EAGER_NORM_MUL_OPS = 1
+EAGER_NORM_SIGMOID_OPS = 4
 
 
 def _sum_valid_powers(tokens: int, chunk: int, power: int) -> int:
@@ -721,24 +728,169 @@ def _fuse_gdn_decode_scans(b, outputs, *, heads, dk, dv):
     return outputs
 
 
+def _is_raw_eager(runtime) -> bool:
+    meta = dict(getattr(runtime, "metadata", ()) or ())
+    return bool(
+        meta.get("raw_eager")
+        or (meta.get("execution_policy") or {}).get("raw_eager")
+    )
+
+
+def _lower_output_norm_gate(b, *, outputs, output_gate, tokens, heads, dv, value_width,
+                            plan, model, projection_group, runtime):
+    """Emit 1 fused Triton gated-RMSNorm kernel or its 11-op PyTorch eager chain."""
+    act_dtype = model.activation_dtype
+    act_bytes = dtype_bytes(act_dtype)
+    elems = tokens * value_width
+    rows = tokens * heads
+    shape = (rows, dv)
+    if _is_raw_eager(runtime):
+        fp32_full = elems * FP32_BYTES
+        fp32_row = rows * FP32_BYTES
+        act_full = elems * act_bytes
+        x_f32 = b.vector(
+            "linear_output_norm_cast_in", outputs, elems, EAGER_NORM_CAST_OPS,
+            family="cast", dtype="fp32", shape=shape,
+            read_bytes_override=act_full, write_bytes_override=fp32_full,
+            metadata=(("input_format", act_dtype), ("output_format", "fp32"),
+                      ("eager_norm_gate_step", "cast_x")))
+        sq = b.vector(
+            "linear_output_norm_pow", (x_f32,), elems, EAGER_NORM_POW_OPS,
+            family="elementwise", dtype="fp32", shape=shape,
+            read_bytes_override=fp32_full, write_bytes_override=fp32_full,
+            metadata=(("native_kind", "Pows"), ("eager_norm_gate_step", "pow2")))
+        mean = b.vector(
+            "linear_output_norm_mean", (sq,), elems, EAGER_NORM_MEAN_OPS,
+            family="elementwise", dtype="fp32", shape=(rows, 1),
+            read_bytes_override=fp32_full, write_bytes_override=fp32_row,
+            metadata=(("native_kind", "ReduceMean"), ("eager_norm_gate_step", "mean")))
+        eps = b.vector(
+            "linear_output_norm_add_eps", (mean,), rows, EAGER_NORM_ADD_OPS,
+            family="elementwise", dtype="fp32", shape=(rows, 1),
+            read_bytes_override=fp32_row, write_bytes_override=fp32_row,
+            metadata=(("native_kind", "Adds"), ("eager_norm_gate_step", "add_eps")))
+        rsq = b.vector(
+            "linear_output_norm_rsqrt", (eps,), rows, EAGER_NORM_RSQRT_OPS,
+            family="elementwise", dtype="fp32", shape=(rows, 1),
+            read_bytes_override=fp32_row, write_bytes_override=fp32_row,
+            metadata=(("native_kind", "Rsqrt"), ("eager_norm_gate_step", "rsqrt")))
+        normed = b.vector(
+            "linear_output_norm_mul", (x_f32, rsq), elems, EAGER_NORM_MUL_OPS,
+            family="elementwise", dtype="fp32", shape=shape,
+            read_bytes_override=fp32_full + fp32_row, write_bytes_override=fp32_full,
+            metadata=(("native_kind", "Mul"), ("eager_norm_gate_step", "norm_mul")))
+        weighted = b.vector(
+            "linear_output_norm_weight_mul", (normed,), elems, EAGER_NORM_MUL_OPS,
+            family="elementwise", dtype="fp32", shape=shape,
+            read_bytes_override=fp32_full + dv * FP32_BYTES, write_bytes_override=fp32_full,
+            metadata=(("native_kind", "Mul"), ("eager_norm_gate_step", "weight_mul")))
+        g_f32 = b.vector(
+            "linear_output_gate_cast_in", (output_gate,), elems, EAGER_NORM_CAST_OPS,
+            family="cast", dtype="fp32", shape=shape,
+            read_bytes_override=act_full, write_bytes_override=fp32_full,
+            metadata=(("input_format", act_dtype), ("output_format", "fp32"),
+                      ("eager_norm_gate_step", "cast_gate")))
+        sig = b.vector(
+            "linear_output_gate_sigmoid", (g_f32,), elems, EAGER_NORM_SIGMOID_OPS,
+            family="elementwise", dtype="fp32", shape=shape,
+            read_bytes_override=fp32_full, write_bytes_override=fp32_full,
+            metadata=(("native_kind", "Sigmoid"), ("eager_norm_gate_step", "sigmoid")))
+        gated = b.vector(
+            "linear_output_gate_mul", (weighted, sig), elems, EAGER_NORM_MUL_OPS,
+            family="elementwise", dtype="fp32", shape=shape,
+            read_bytes_override=2 * fp32_full, write_bytes_override=fp32_full,
+            metadata=(("native_kind", "Mul"), ("eager_norm_gate_step", "gate_mul")))
+        cast_out = b.vector(
+            "linear_output_norm_cast_out", (gated,), elems, EAGER_NORM_CAST_OPS,
+            family="cast", dtype=act_dtype, shape=shape,
+            read_bytes_override=fp32_full, write_bytes_override=act_full,
+            metadata=(("input_format", "fp32"), ("output_format", act_dtype),
+                      ("eager_norm_gate_step", "cast_out")))
+        chain = (x_f32, sq, mean, eps, rsq, normed, weighted, g_f32, sig, gated, cast_out)
+        native_kind = ("layer_norm_gated_fwd_kernel" if plan.attention == "kda"
+                       else "_layer_norm_fwd_1pass_kernel_npu")
+        declare_group(
+            b.ops, key=b.prefix + ".gated_rmsnorm", role="gated_rmsnorm",
+            family="norm_gate", members=chain, entries=(x_f32, g_f32),
+            anchor=cast_out, block="attention",
+            view={"tokens": tokens, "heads": heads, "width": dv,
+                  "dtype": act_dtype, "attention_kind": plan.attention},
+            implementation={"native_kind": native_kind,
+                            "native_kinds": (native_kind, "FusedRMSNormGated")},
+            source=source_reference(
+                "vllm_ascend/ops/kimi_kda.py" if plan.attention == "kda"
+                else "vllm_ascend/ops/gdn.py", "FusedRMSNormGated"),
+            fusion_status="unfused_decomposed",
+            fusion_reason="torch_npu_eager_rmsnorm_gated_11_kernels",
+            native_fusion_eligible=False,
+        )
+        return cast_out
+    output = b.vector(
+        "linear_output_norm_gate", outputs + [output_gate], elems, OUTPUT_NORM_GATE_OPS_PER_ELEMENT,
+        shape=shape,
+        read_bytes_override=(2 * elems + dv) * act_bytes,
+        write_bytes_override=elems * act_bytes,
+        metadata=(("norm_kind", "rmsnorm"), ("norm_has_weight", True),
+                  ("norm_has_bias", False), ("norm_group_width", dv),
+                  ("gate_present", True), ("recurrent_attention_kind", plan.attention),
+                  ("fused_from", ("rmsnorm", "gate"))) + (
+                      (("gate_input_layout", projection_group["views"]["output_gate"]),)
+                      if projection_group else ()))
+    native_kind = ("layer_norm_gated_fwd_kernel" if plan.attention == "kda"
+                   else "_layer_norm_fwd_1pass_kernel_npu")
+    declare_group(
+        b.ops, key=b.prefix + ".gated_rmsnorm", role="gated_rmsnorm",
+        family="norm_gate", members=(output,), entries=(output,),
+        anchor=output, block="attention",
+        view={"tokens": tokens, "heads": heads, "width": dv,
+              "dtype": act_dtype, "attention_kind": plan.attention},
+        implementation={"native_kind": native_kind,
+                        "native_kinds": (native_kind, "FusedRMSNormGated")},
+        source=source_reference(
+            "vllm_ascend/ops/kimi_kda.py" if plan.attention == "kda"
+            else "vllm_ascend/ops/gdn.py", "FusedRMSNormGated"),
+        fusion_status="fused_existing",
+        fusion_reason="triton_fused_rmsnorm_gated_kernel",
+        native_fusion_eligible=False,
+    )
+    return output
+
+
 def _declare_recurrent_group(b, tensors, *, views, heads, key_heads, dk, dv, chunk,
                              tokens, output_gate, output_gate_view, prefill_source, decode_source,
-                             decode_core, kda_caps, gated, normalized):
+                             decode_core, kda_caps, gated, normalized,
+                             prefill_scan_ids=(), prepare_ids=()):
     prefix, plan, model = b.prefix, b.plan, b.model
     if plan.attention == "gdn":
-        if views and all(view.phase == "prefill" for view in views):
-            core = [op for op in b.ops if op.family in {
-                "recurrent_local", "triangular_solve", "recurrent_scan", "recurrent_output"}]
-            core_ids = {op.op_id for op in core}
+        core = [op for op in b.ops if op.family in {
+            "recurrent_local", "triangular_solve", "recurrent_scan",
+            "recurrent_output", "recurrent_vector"}]
+        has_prefill = any(view.phase == "prefill" for view in views)
+        has_decode = any(view.phase == "decode" for view in views)
+        prefill_ids = set(prefill_scan_ids) | set(prepare_ids)
+        if has_prefill and has_decode:
+            prefill_core = [op for op in core
+                            if op.op_id in prefill_ids or op.family in {
+                                "recurrent_local", "triangular_solve", "recurrent_output"}]
+            prefill_set = {op.op_id for op in prefill_core}
+            decode_core_ops = [op for op in core if op.op_id not in prefill_set]
+        elif has_prefill:
+            prefill_core, decode_core_ops = core, []
+        else:
+            prefill_core, decode_core_ops = [], core
+        if prefill_core:
+            pf_ids = {op.op_id for op in prefill_core}
+            pf_views = tuple(view for view in views if view.phase == "prefill") or tuple(views)
             declare_group(
                 b.ops, key=prefix + ".gdn_chunk", role="gdn_chunk", family="gdn",
-                members=tuple(op.op_id for op in core),
-                entries=tuple(op.op_id for op in core if not core_ids.intersection(op.deps)),
-                anchor=core[-1].op_id,
-                view={"tokens": sum(view.q_len for view in views), "heads": heads,
+                members=tuple(op.op_id for op in prefill_core),
+                entries=tuple(op.op_id for op in prefill_core
+                              if any(dep not in pf_ids for dep in op.deps) or not op.deps),
+                anchor=prefill_core[-1].op_id,
+                view={"tokens": sum(view.q_len for view in pf_views), "heads": heads,
                       "key_heads": key_heads, "key_width": dk, "value_width": dv,
                       "dtype": model.activation_dtype, "state_dtype": plan.recurrent_state_dtype,
-                      "sequence_tokens": tuple(view.q_len for view in views), "chunk": chunk},
+                      "sequence_tokens": tuple(view.q_len for view in pf_views), "chunk": chunk},
                 implementation={
                     "native_kind": "ChunkGatedDeltaRuleFwd",
                     "selection": "compatible_recurrent_algorithm; native_kernel_not_selected",
@@ -754,6 +906,32 @@ def _declare_recurrent_group(b, tensors, *, views, heads, key_heads, dk, dv, chu
                         "wrapper_state_cast_and_sequence_metadata_conversion_not_selected",
                     ],
                 },
+                fusion_status="unfused_decomposed",
+                fusion_reason="analytical_gdn_chunk_decomposition",
+            )
+        if decode_core_ops:
+            dec_ids = {op.op_id for op in decode_core_ops}
+            dec_views = tuple(view for view in views if view.phase == "decode") or tuple(views)
+            declare_group(
+                b.ops, key=prefix + ".gdn_recurrent", role="gdn_recurrent", family="gdn",
+                members=tuple(op.op_id for op in decode_core_ops),
+                entries=tuple(op.op_id for op in decode_core_ops
+                              if any(dep not in dec_ids for dep in op.deps) or not op.deps),
+                anchor=decode_core_ops[-1].op_id,
+                view={"tokens": sum(view.q_len for view in dec_views), "heads": heads,
+                      "key_heads": key_heads, "key_width": dk, "value_width": dv,
+                      "dtype": model.activation_dtype, "state_dtype": plan.recurrent_state_dtype,
+                      "sequence_tokens": tuple(view.q_len for view in dec_views), "chunk": chunk},
+                implementation={
+                    "native_kind": "RecurrentGatedDeltaRule",
+                    "selection": "compatible_recurrent_algorithm; native_kernel_not_selected",
+                    "conditions": {"qk_l2norm": "external", "delta_gates": "external",
+                                   "state_dtype": plan.recurrent_state_dtype}},
+                source=source_reference("vllm_ascend/ops/gdn.py",
+                                        "AscendGatedDeltaNetAttention._recurrent_gated_delta_rule"),
+                fusion_status="unfused_decomposed",
+                fusion_reason="analytical_gdn_decode_recurrence",
+                native_fusion_eligible=False,
             )
         output_gate = tensors.reshape(output_gate_view, (tokens * heads, dv),
                                       name="output_gate_reshape")
@@ -820,6 +998,12 @@ def _declare_recurrent_group(b, tensors, *, views, heads, key_heads, dk, dv, chu
                         "native_backing_tensor_extent_does_not_identify_active_view",
                         "state_indices_and_gate_flags_not_observed"]),
                 },
+                fusion_status=("fused_existing" if decode_core is not None
+                               else "fused_framework_enable" if phase_source
+                               else "unfused_decomposed"),
+                fusion_reason=("source_selected_kda_recurrent_kernel" if decode_core is not None
+                               else "source_selected_kda_chunk_kernel" if phase_source
+                               else "analytical_kda_decomposition"),
             )
     return output_gate
 
@@ -999,23 +1183,17 @@ def linear(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         b, tensors, views=views, heads=heads, key_heads=key_heads, dk=dk, dv=dv,
         chunk=chunk, tokens=tokens, output_gate=output_gate, output_gate_view=output_gate_view,
         prefill_source=prefill_source, decode_source=decode_source, decode_core=decode_core,
-        kda_caps=kda_caps, gated=gated, normalized=normalized)
+        kda_caps=kda_caps, gated=gated, normalized=normalized,
+        prefill_scan_ids=prefill_scan_ids, prepare_ids=prepare_ids)
     if use_recover_ssm and any(view.phase == "decode" and view.q_len > 1 for view in views):
         emit_commit_op(b, name="recover_ssm_commit", deps=tuple(outputs), views=views,
                        heads=heads, dk=dk, dv=dv, state_dtype=plan.recurrent_state_dtype,
                        kg_dtype=model.activation_dtype, runtime=runtime,
                        attention_kind=plan.attention)
-    output = b.vector(
-        "linear_output_norm_gate", outputs + [output_gate], tokens * value_width, OUTPUT_NORM_GATE_OPS_PER_ELEMENT,
-        shape=(tokens * heads, dv),
-        read_bytes_override=(2 * tokens * value_width + dv) * dtype_bytes(model.activation_dtype),
-        write_bytes_override=tokens * value_width * dtype_bytes(model.activation_dtype),
-        metadata=(("norm_kind", "rmsnorm"), ("norm_has_weight", True),
-                  ("norm_has_bias", False), ("norm_group_width", dv),
-                  ("gate_present", True), ("recurrent_attention_kind", plan.attention),
-                  ("fused_from", ("rmsnorm", "gate"))) + (
-                      (("gate_input_layout", projection_group["views"]["output_gate"]),)
-                      if projection_group else ()))
+    output = _lower_output_norm_gate(
+        b, outputs=outputs, output_gate=output_gate, tokens=tokens, heads=heads,
+        dv=dv, value_width=value_width, plan=plan, model=model,
+        projection_group=projection_group, runtime=runtime)
     last = b.matrix("linear_output", (output,), tokens, hidden, value_width,
                     category="kda.o" if plan.attention == "kda" else "gdn.o")
     act_bytes = dtype_bytes(model.activation_dtype)

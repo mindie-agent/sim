@@ -20,6 +20,7 @@ from mindie_sim.schema.tensors import TensorLayout, TensorValue
 from ...graph import GraphPolicy
 from ...lowering import Builder
 from ...mechanism import PlannedRecipe
+from ...structure_groups import declare_group, source_reference
 from mindie_sim.prediction.operators.recurrent.recover_ssm_work import (
     GDN_ARCH35_RECOVER_SSM_RECIPE,
     emit_commit_op, recover_ssm_enabled, rewrite_gdn_analytical_scan,
@@ -217,6 +218,40 @@ def _lower_recurrence(b, tensors, *, decode_core, values, gate_values, views,
         emit_commit_op(b, name="recover_ssm_commit", deps=(scan.op_id,), views=active,
                        heads=heads, dk=dk, dv=dv, state_dtype=plan.recurrent_state_dtype,
                        kg_dtype=model.activation_dtype, runtime=runtime, attention_kind="gdn")
+    is_kernel = recurrent_implementation == "arch35_fp32"
+    if is_kernel:
+        rec_members = (scan.op_id,)
+        rec_entries = (scan.op_id,)
+    else:
+        rec_ops = [op for op in b.ops if op.op_id.endswith((
+            ".decode_q_l2norm", ".decode_k_l2norm", ".decode_recurrent_scan"))]
+        rec_ids = {op.op_id for op in rec_ops}
+        rec_members = tuple(op.op_id for op in rec_ops) or (scan.op_id,)
+        rec_entries = tuple(
+            op.op_id for op in rec_ops
+            if any(dep not in rec_ids for dep in op.deps) or not op.deps
+        ) or (scan.op_id,)
+    declare_group(
+        b.ops, key=b.prefix + ".gdn_recurrent", role="gdn_recurrent", family="gdn",
+        members=rec_members, entries=rec_entries, anchor=scan.op_id, block="attention",
+        view={"tokens": sum(view.q_len for view in active), "heads": heads,
+              "key_heads": keys, "key_width": dk, "value_width": dv,
+              "dtype": model.activation_dtype, "state_dtype": plan.recurrent_state_dtype,
+              "sequence_tokens": lengths, "speculative": speculative},
+        implementation={
+            "native_kind": "RecurrentGatedDeltaRule",
+            "selection": (gdn_recurrent.IMPLEMENTATION if is_kernel
+                          else "compatible_recurrent_algorithm; native_kernel_not_selected"),
+            "conditions": {"recurrence_selection": recurrent_implementation,
+                           "speculative": speculative, "state_dtype": plan.recurrent_state_dtype},
+        },
+        source=gdn_recurrent.SOURCE if is_kernel else source_reference(
+            "vllm_ascend/ops/gdn.py", "AscendGatedDeltaNetAttention._recurrent_gated_delta_rule"),
+        fusion_status="fused_existing" if is_kernel else "unfused_decomposed",
+        fusion_reason=("arch35_gdn_recurrent_kernel" if is_kernel
+                       else "analytical_gdn_decode_recurrence"),
+        native_fusion_eligible=False,
+    )
     return core
 
 
@@ -248,6 +283,22 @@ def _resolve_beta_store(runtime, gating_beta_store, gating_programs):
         raise ModelingError("gdn_decode_gating_programs_requires_positive_integer")
     beta_store = {key: value for key, value in gating_beta_store.items() if key != "bytes_per_element"}
     return beta_store
+
+
+def _declare_gated_rmsnorm(b, *, normalized, tokens, heads, dv, dtype):
+    declare_group(
+        b.ops, key=b.prefix + ".gated_rmsnorm", role="gated_rmsnorm",
+        family="norm_gate", members=(normalized,), entries=(normalized,),
+        anchor=normalized, block="attention",
+        view={"tokens": tokens, "heads": heads, "width": dv,
+              "dtype": dtype, "attention_kind": "gdn"},
+        implementation={"native_kind": "_layer_norm_fwd_1pass_kernel_npu",
+                        "native_kinds": ("_layer_norm_fwd_1pass_kernel_npu", "FusedRMSNormGated")},
+        source=source_reference("vllm_ascend/ops/gdn.py", "FusedRMSNormGated"),
+        fusion_status="fused_existing",
+        fusion_reason="triton_fused_rmsnorm_gated_kernel",
+        native_fusion_eligible=False,
+    )
 
 
 def lower(*, prefix, plan, views, stage, deps, model, parallel, mode,
@@ -391,6 +442,8 @@ def lower(*, prefix, plan, views, stage, deps, model, parallel, mode,
         metadata=(("norm_kind", "rmsnorm"), ("norm_has_weight", True), ("norm_has_bias", False),
                   ("norm_group_width", dv), ("gate_present", True), ("gate_layout", gate.layout.to_dict()),
                   ("recurrent_attention_kind", "gdn"), ("fused_from", ("rmsnorm", "gate"))))
+    _declare_gated_rmsnorm(
+        b, normalized=normalized, tokens=tokens, heads=heads, dv=dv, dtype=model.activation_dtype)
     last = b.matrix("linear_output", (normalized,), tokens, model.hidden_size, value_width, category="gdn.o")
     if tp > 1:
         last = b.communicate("linear_reduce", (last,), 2 * (tp - 1) / tp * tokens * model.hidden_size * 2, "allreduce")

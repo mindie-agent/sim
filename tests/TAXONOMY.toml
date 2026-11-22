@@ -340,6 +340,10 @@ owns = ["mindie_sim/catalog/cache.py", "mindie_sim/catalog/cache_format.py", "mi
 path = "spine/test_typed_graph_transforms.py"
 tier = "tier0"
 owns = ["mindie_sim/catalog/ops.py", "mindie_sim/catalog/quant.py", "mindie_sim/prediction/blocks.py", "mindie_sim/prediction/graph.py"]
+[[module]]
+path = "spine/test_cartesian_structure_matrix.py"
+tier = "tier1"
+owns = ["mindie_sim/structure_implementations.py", "mindie_sim/structure_subgraphs.py", "mindie_sim/prediction/operators/mla/mla_structure.py", "scripts/_arch_governance_ag012.py"]
 # ---------------------------------------------------------------- serving
 [[module]]
 path = "serving/test_service_core.py"
