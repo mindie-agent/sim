@@ -21,17 +21,23 @@ from mindie_sim.schema.common import ModelingError, dtype_bytes
 from .matrix import DEFAULT_COMPUTE_TILE_MN, HierarchicalMatmul
 from .matrix_epilogue import MatrixEpilogue
 from .matrix_mapping_owners import (
+    MS_PER_SECOND,
     _declared_rate,
     critical_output_owner_rate_fraction,
     freeze_owner_tiles,
     gemm_fractal_operand_bytes,
     grouped_owner_rectangles,
     grouped_owner_tiles,
+    is_arch35_context,
     mte_owner_unit_count,
     owner_records,
     owner_tiles,
     physical_owner_rate,
     physical_owner_units,
+    primitive_cold_hbm_bps,
+    primitive_nd2nz_mte2_rate_bps_per_aic,
+    primitive_p01_scaling_bps,
+    streamk_fixup_latency_ms,
 )
 from mindie_sim.prediction.mechanism import Work as _Work
 from mindie_sim.prediction.ownership import read_role
@@ -46,6 +52,19 @@ MAX_SPLIT_K = 32
 A5_L2_MTE2_RATE = 1e13
 A5_BF16_PEAK_FLOOR = 4e14
 _BF16_SUBTILE_REFERENCE = _Work(matrix={"bf16": A5_BF16_PEAK_FLOOR / 1000})
+#: Upstream DAV_3510 Stream-K thresholds (arch35/matmul_v3_basic_streamk_tiling.cpp:257-262).
+STREAM_K_MIN_K_BYTES = 8192
+STREAM_K_PER_AIC_K_BYTES = 256
+STREAM_K_K_ALIGN = 256
+#: Upstream DAV_2201 Split-K thresholds (matmul_v3_base_tiling.cpp:61, 87, 2571).
+DAV2201_SPLITK_K_PER_AIC = 384
+DAV2201_SPLITK_LARGE_K = 27392
+DAV2201_SPLITK_FP32_MIN_K = 6144
+DAV2201_SPLITK_FP32_MAX_MN = 64
+SPLIT_K_HALF_CORE_DIVISOR = 2
+#: Minimum N/K for DAV_3510 BF16 macro-tile Stream-K vs underfilled subtiles.
+ARCH35_MACRO_MIN_N = 256
+ARCH35_MACRO_MIN_K = 2048
 
 DEFAULT_CANDIDATES = ((128, 128, 64), (128, 128, 128), (128, 256, 64), (128, 256, 128),
                       (256, 128, 64), (256, 128, 128), (256, 256, 64), (256, 256, 128))
@@ -56,6 +75,10 @@ NARROW_CANDIDATES = ((16, 16, 64), (32, 16, 64), (64, 16, 64),
 # feasible block is not evidence that the deployed kernel dispatches it.
 UNDERFILLED_CANDIDATES = tuple((m, n, k) for m in (16, 32, 64)
                               for n in (16, 32, 64) for k in (64, 128))
+#: Upstream DAV_2201 CalBaseSize small-M candidates (matmul_v3_base_tiling.cpp:47, 103).
+DAV2201_SMALL_M_CANDIDATES = tuple(
+    (m, n, k) for m in (16, 32, 64) for n in (128, 256) for k in (64, 128)
+)
 
 
 @dataclass(frozen=True)
@@ -272,10 +295,168 @@ def matrix_geometry(context, recipe, *, owners=None, group_rows=None):
     )
 
 
-def mapping_bound(context, recipe, *, geometry=None):
+def _primitive_mte1_owner_demands(context, left_owners, right_owners, *,
+                                  inputs, weight, total_m, n, k, groups, width):
+    """Directional L1->L0A / L1->L0B service demands when calibrated modes exist."""
+    modes = getattr(context, "service_modes", None) or {}
+    l0a_rate = float(modes["mte1_l0a"][1]) / MS_PER_SECOND if "mte1_l0a" in modes else 0.0
+    l0b_rate = float(modes["mte1_l0b"][1]) / MS_PER_SECOND if "mte1_l0b" in modes else 0.0
+    if l0a_rate <= 0.0 or l0b_rate <= 0.0:
+        return None
+    units = context.resource_units.get("mte1", context.core_count)
+    per_a = l0a_rate / float(max(1, units))
+    per_b = l0b_rate / float(max(1, units))
+    a_unit = max(inputs / total_m, k * width)
+    b_unit = max(weight / (n * groups), k * width)
+    return [a[3] * a_unit / per_a + b[3] * b_unit / per_b
+            for a, b in zip(left_owners, right_owners)]
+
+
+def _calibrated_hbm_rate_ms(context, geometry, recipe, *, width, hbm_declared):
+    """Effective HBM read rate in bytes/ms from calibrated P01/P05 surfaces."""
+    if getattr(context, "primitive_table", None) is None:
+        return hbm_declared
+    _, n, _ = geometry.local_shape
+    active = max(1, min(int(context.core_count), int(geometry.tiles)))
+    row_bytes = int(min(recipe.tile_n, n) * width)
+    stride_bytes = int(n * width)
+    is_grouped = geometry.groups > 1
+    coalesced = is_grouped and active >= max(1, int(geometry.nn))
+    cold_bps = primitive_cold_hbm_bps(
+        context, active_cores=active, row_bytes=row_bytes,
+        stride_bytes=stride_bytes, total_tiles=geometry.tiles,
+        is_grouped=is_grouped, is_full_row_coalesced=coalesced,
+    )
+    if cold_bps is None or cold_bps <= 0.0:
+        return hbm_declared
+    return min(hbm_declared, cold_bps / MS_PER_SECOND)
+
+
+def _candidate_split_k(context, *, m, n, k, tk, output_tiles, groups, compute_format):
+    """Architecture-grounded Split-K / Stream-K factor for one tile candidate."""
+    if output_tiles >= context.core_count or k <= tk:
+        return 1
+    pt = getattr(context, "primitive_table", None)
+    if pt is None:
+        return min(k // tk, max(1, context.core_count // max(1, output_tiles)), MAX_SPLIT_K)
+    if groups > 1:
+        return 1
+    cores = max(1, int(context.core_count))
+    half_cores = max(1, cores // SPLIT_K_HALF_CORE_DIVISOR)
+    if is_arch35_context(context):
+        elem_b = max(1, int(dtype_bytes(compute_format)))
+        min_k = max(STREAM_K_MIN_K_BYTES, cores * STREAM_K_PER_AIC_K_BYTES) / float(elem_b)
+        k_aligned = math.ceil(k / STREAM_K_K_ALIGN) * STREAM_K_K_ALIGN
+        if k_aligned < min_k or output_tiles > half_cores:
+            return 1
+        return min(k // tk, max(1, cores // max(1, output_tiles)), MAX_SPLIT_K)
+    fp32_small = (
+        compute_format == "fp32"
+        and m <= DAV2201_SPLITK_FP32_MAX_MN and n <= DAV2201_SPLITK_FP32_MAX_MN
+        and k >= DAV2201_SPLITK_FP32_MIN_K
+    )
+    wide_k = (output_tiles <= half_cores and k >= cores * DAV2201_SPLITK_K_PER_AIC)
+    if not (wide_k or k >= DAV2201_SPLITK_LARGE_K or fp32_small):
+        return 1
+    return min(k // tk, max(1, cores // max(1, output_tiles)), MAX_SPLIT_K)
+
+
+def _arch35_streamk_perf(context, recipe, geometry, *, split_k: int, output_tiles: int) -> float:
+    """Upstream DAV_3510 Stream-K perf model (arch35/matmul_v3_basic_streamk_tiling.cpp:70-129)."""
+    names = context.resource_names
+    cores = max(1, int(context.core_count))
+    waves = max(1, math.ceil(int(output_tiles) / cores))
+    used = max(1, min(cores, int(output_tiles) * int(split_k)))
+    frac = float(used) / float(cores)
+    hbm_full = _declared_rate(context, names["hbm"])
+    meta = dict(context.op.metadata)
+    width = dtype_bytes(meta.get("compute_format", context.op.dtype or "bf16"))
+    total_m, n, _ = geometry.local_shape
+    strided_bps = primitive_cold_hbm_bps(
+        context, active_cores=cores,
+        row_bytes=int(min(recipe.tile_n, n) * width),
+        stride_bytes=int(n * width),
+        total_tiles=max(1, int(output_tiles)), is_grouped=False,
+    )
+    b_hbm_full = min(hbm_full, strided_bps / MS_PER_SECOND) if strided_bps else hbm_full
+    l2_agg = primitive_p01_scaling_bps(context, cores, warm=True)
+    l2_full = (l2_agg / MS_PER_SECOND) if (l2_agg and l2_agg > 0.0) else hbm_full
+    epilogue = MatrixEpilogue.from_op(context.op)
+    inputs, weight = epilogue.operands(context.op)
+    a_bytes = inputs + epilogue.row_scale_bytes
+    b_bytes = weight + epilogue.column_scale_bytes
+    l2_extra = max(
+        0.0,
+        (inputs * max(1, geometry.nn) + weight * max(1, geometry.nm)) - (inputs + weight),
+    )
+    mte2_ms = (
+        a_bytes / (hbm_full * frac)
+        + b_bytes / (b_hbm_full * frac)
+        + l2_extra / (l2_full * frac)
+    )
+    if waves > 1:
+        # Multi-wave tile grid under-utilizes the tail wave.
+        wave_eff = float(output_tiles) / float(waves * cores)
+        mte2_ms /= max(wave_eff, 1.0 / float(cores))
+    cube_key = names.get("cube")
+    cube_total = float(context.work.get(cube_key, 0.0)) if cube_key else 0.0
+    cube_units = max(1, int(context.resource_units.get("cube", cores)))
+    if waves > 1:
+        cube_ms = (cube_total * float(cube_units) * float(waves) / float(max(1, int(output_tiles)))) if cube_total > 0.0 else 0.0
+    else:
+        cube_ms = (cube_total * float(cube_units) / float(used)) if cube_total > 0.0 else 0.0
+    if split_k <= 1:
+        return max(mte2_ms, cube_ms)
+    partial_bytes = float(2 * FP32_BYTES * split_k * total_m * n)
+    vec_r = _declared_rate(context, names["vector"]) if "vector" in names else 0.0
+    merge_ops = float((split_k - 1) * total_m * n)
+    neg_ms = (
+        streamk_fixup_latency_ms(context, k_splits=split_k, used_cores=used)
+        + partial_bytes / (hbm_full * frac)
+        + (merge_ops / vec_r if vec_r > 0.0 else 0.0)
+    )
+    return max(mte2_ms, cube_ms) + neg_ms
+
+
+def _split_k_bound(context, recipe, geometry, *, bound, split_k, output_tiles):
+    """Evaluate calibrated Split-K / Stream-K bound (host tiling ignores L2 warmth)."""
+    if is_arch35_context(context):
+        base_perf = _arch35_streamk_perf(
+            context, recipe, geometry, split_k=1, output_tiles=output_tiles)
+        sk_perf = _arch35_streamk_perf(
+            context, recipe, geometry, split_k=split_k, output_tiles=output_tiles)
+        return sk_perf if sk_perf < base_perf else bound + 1.0
+    names = context.resource_names
+    hbm_r = _declared_rate(context, names["hbm"])
+    vec_r = _declared_rate(context, names["vector"]) if "vector" in names else 0.0
+    total_m, n, _ = geometry.local_shape
+    partial_bytes = float(2 * FP32_BYTES * split_k * total_m * n)
+    merge_ops = float((split_k - 1) * total_m * n)
+    meta = dict(context.op.metadata)
+    epilogue = MatrixEpilogue.from_op(context.op)
+    inputs, weight = epilogue.operands(context.op)
+    width = dtype_bytes(meta.get("compute_format", context.op.dtype or "bf16"))
+    hbm_reads = inputs + weight + epilogue.row_scale_bytes + epilogue.column_scale_bytes
+    used_cores = max(1, min(int(context.core_count), int(output_tiles) * int(split_k)))
+    cold_bps = primitive_cold_hbm_bps(
+        context, active_cores=used_cores,
+        row_bytes=int(min(recipe.tile_n, n) * width),
+        stride_bytes=int(n * width),
+        total_tiles=used_cores, is_grouped=False,
+    )
+    eff_hbm_r = min(hbm_r, cold_bps / MS_PER_SECOND) if cold_bps else hbm_r
+    hbm_ms = hbm_reads / eff_hbm_r + context.op.mte3_bytes / hbm_r
+    fixup_ms = streamk_fixup_latency_ms(
+        context, k_splits=split_k, used_cores=used_cores)
+    return (max(hbm_ms, bound / split_k) + partial_bytes / hbm_r
+            + (merge_ops / vec_r if vec_r > 0.0 else 0.0) + fixup_ms)
+
+
+def mapping_bound(context, recipe, *, geometry=None, allow_unequal_groups=False,
+                  ignore_l2_hits=False):
     """Resource-only lower bound with private copies and actual owner tails."""
     geometry = geometry or matrix_geometry(context, recipe)
-    if len(set(geometry.group_rows)) > 1:
+    if not allow_unequal_groups and len(set(geometry.group_rows)) > 1:
         raise ModelingError("matrix_mapping_bound_requires_equal_group_rows")
     total_m, n, k = geometry.local_shape
     if not total_m:
@@ -286,16 +467,25 @@ def mapping_bound(context, recipe, *, geometry=None):
     epilogue = MatrixEpilogue.from_op(context.op)
     inputs, weight = epilogue.operands(context.op)
     owners = geometry.owners
-    private = [inputs * a / total_m + weight * b / (n * groups)
-               for _, a, b, _ in owners]
+    private_parts = [(inputs * a / total_m, weight * b / (n * groups))
+                     for _, a, b, _ in owners]
+    private = [a_b + b_b for a_b, b_b in private_parts]
     scales = [epilogue.row_scale_bytes * a / total_m
               + epilogue.column_scale_bytes * b / (n * groups)
               for _, a, b, _ in owners]
     width = dtype_bytes(meta.get("compute_format", context.op.dtype or "bf16"))
-    left = owner_tiles(m, math.ceil(n / recipe.compute_n), recipe.tile_m,
-                       recipe.tile_n // recipe.compute_n, context.core_count, groups)
-    right = owner_tiles(math.ceil(m / recipe.compute_m), n,
-                        recipe.tile_m // recipe.compute_m, recipe.tile_n, context.core_count, groups)
+    if len(set(geometry.group_rows)) == 1:
+        left = owner_tiles(m, math.ceil(n / recipe.compute_n), recipe.tile_m,
+                           recipe.tile_n // recipe.compute_n, context.core_count, groups)
+        right = owner_tiles(math.ceil(m / recipe.compute_m), n,
+                            recipe.tile_m // recipe.compute_m, recipe.tile_n, context.core_count, groups)
+    else:
+        left = grouped_owner_tiles(
+            geometry.group_rows, math.ceil(n / recipe.compute_n), recipe.tile_m,
+            recipe.tile_n // recipe.compute_n, context.core_count)
+        right = grouped_owner_tiles(
+            tuple(math.ceil(r / recipe.compute_m) for r in geometry.group_rows),
+            n, recipe.tile_m // recipe.compute_m, recipe.tile_n, context.core_count)
     inner = [a[3] * max(inputs / total_m, k * width) + b[3] * max(weight / (n * groups), k * width)
              for a, b in zip(left, right)]
     if recipe.reuse_inputs and recipe.reuse_weights:
@@ -305,12 +495,36 @@ def mapping_bound(context, recipe, *, geometry=None):
                       (1 if recipe.reuse_inputs else math.ceil(n / recipe.tile_n)))
                      + ((weight + epilogue.column_scale_bytes) *
                         (1 if recipe.reuse_weights else math.ceil(m / recipe.tile_m))))
-    admitted_l2_hit = max(0.0, float(meta.get("admitted_l2_read_hit_bytes", 0.0) or 0.0))
-    hbm = max(0.0, hbm_reads - min(admitted_l2_hit, hbm_reads)) + context.op.mte3_bytes
-    bound = hbm / _declared_rate(context, names["hbm"])
+    admitted_l2_hit = (
+        0.0 if ignore_l2_hits
+        else max(0.0, float(meta.get("admitted_l2_read_hit_bytes", 0.0) or 0.0))
+    )
+    hbm_miss_reads = max(0.0, hbm_reads - min(admitted_l2_hit, hbm_reads))
+    hbm_declared = _declared_rate(context, names["hbm"])
+    pt = getattr(context, "primitive_table", None)
+    active_cores = max(1, min(int(context.core_count), int(geometry.tiles)))
+    if pt is not None and hbm_reads > 0.0:
+        miss_frac = hbm_miss_reads / hbm_reads
+        a_hbm = (inputs + epilogue.row_scale_bytes) * (1 if recipe.reuse_inputs else math.ceil(n / recipe.tile_n)) * miss_frac
+        b_hbm = (weight + epilogue.column_scale_bytes) * (1 if recipe.reuse_weights else math.ceil(m / recipe.tile_m)) * miss_frac
+        a_cold = primitive_p01_scaling_bps(context, active_cores, warm=False)
+        a_rate = min(hbm_declared, a_cold / MS_PER_SECOND) if a_cold else hbm_declared
+        b_rate = _calibrated_hbm_rate_ms(
+            context, geometry, recipe, width=width, hbm_declared=hbm_declared)
+        bound = a_hbm / a_rate + b_hbm / b_rate + context.op.mte3_bytes / hbm_declared
+    else:
+        bound = hbm_miss_reads / hbm_declared + context.op.mte3_bytes / hbm_declared
+    weight_layout = str(meta.get("weight_layout", "ND"))
+    dir_mte1 = (
+        _primitive_mte1_owner_demands(
+            context, left, right, inputs=inputs, weight=weight,
+            total_m=total_m, n=n, k=k, groups=groups, width=width)
+        if pt is not None else None
+    )
     demands = {}
+    read_op_role = read_role(names)
     for role, values in (
-        (read_role(names), private),
+        (read_op_role, private),
         (read_role(names, aiv=0), scales),
         ("mte1", inner),
         ("mte3", [context.op.mte3_bytes * area / (total_m * n) for _, _, _, area in owners]),
@@ -320,18 +534,29 @@ def mapping_bound(context, recipe, *, geometry=None):
     ):
         if role not in names:
             continue
-        # Ownership can include several pipes or share one. Use the same
-        # physical unit groups as program execution, including uneven groups.
         units = context.resource_units.get(role, context.core_count)
         resource = names[role]
+        declared_r = _declared_rate(context, resource)
         for core, value in enumerate(values):
             selected = context.owned(core, context.core_count, (role,))[resource]
+            eff_ms = None
+            if pt is not None and role == read_op_role and value > 0.0:
+                a_b, b_b = private_parts[core]
+                eff_bps = primitive_nd2nz_mte2_rate_bps_per_aic(
+                    context, active_cores, a_b, b_b, weight_layout=weight_layout,
+                    row_bytes=int(min(recipe.tile_n, n) * width),
+                    stride_bytes=int(n * width),
+                )
+                if eff_bps is not None and eff_bps > 0.0:
+                    eff_ms = value / min(declared_r / float(max(1, units)),
+                                         eff_bps / MS_PER_SECOND)
+            elif dir_mte1 is not None and role == "mte1" and core < len(dir_mte1):
+                eff_ms = dir_mte1[core]
             for unit in selected:
                 key = resource, unit
-                # Both read phases may share one pipe. Sum its service before
-                # taking a bound, preserving contention across logical roles.
-                demands[key] = (demands.get(key, 0) + value / len(selected)
-                               * units / _declared_rate(context, resource))
+                inc = (eff_ms / len(selected) if eff_ms is not None
+                       else value / len(selected) * units / declared_r)
+                demands[key] = demands.get(key, 0.0) + inc
     bound = max(bound, max(demands.values(), default=0))
     return bound
 
@@ -373,12 +598,17 @@ def _matmul_recipe_key(recipe):
 
 def _op_matrix_key(op):
     meta = dict(op.metadata)
+    rows = meta.get("matrix_group_rows") or meta.get("aclnn_group_list")
+    rows_key = tuple(int(v) for v in rows) if rows else ()
     return (
         op.local_shape, op.semantic_shape, op.padded_shape,
         op.dtype, op.hbm_bytes, op.mte2_bytes, op.mte3_bytes, op.vector_ops,
         meta.get("matrix_groups", 1), meta.get("compute_format"), meta.get("output_format"),
         meta.get("packed_weight_bytes", 0), meta.get("row_scale_bytes", 0),
         meta.get("column_scale_bytes", 0), meta.get("epilogue_ops_per_element", 0),
+        float(meta.get("admitted_l2_read_hit_bytes", 0.0) or 0.0),
+        bool(meta.get("l2_weight_cache_disable", False)),
+        rows_key,
         MatrixEpilogue.from_op(op),
     )
 
@@ -408,13 +638,16 @@ class MappedMatmul:
     narrow_candidates: tuple | None = None
     underfilled_candidates: tuple | None = None
 
-    def select(self, context, *, include_record: bool = True):
+    def select(self, context, *, include_record: bool = True, group_rows=None):
         """Select the declared tile mapping and its explanatory record.
 
         ``include_record=False`` skips the defensive record copy on the hot
         steady path (a caller that has no mapping observer).  Selection itself
         is identical: the same cached recipe object is returned either way.
         """
+        pt = getattr(context, "primitive_table", None)
+        pt_key = (getattr(pt, "sku", None), getattr(pt, "arch_preset", None)) if pt is not None else None
+        rows_key = tuple(int(v) for v in group_rows) if group_rows is not None else None
         cache_key = (
             _matmul_recipe_key(self), _op_matrix_key(context.op), context.core_count,
             tuple(sorted(context.resource_names.items())),
@@ -423,6 +656,7 @@ class MappedMatmul:
             tuple(sorted(context.resource_units.items())),
             tuple(sorted(context.pool_capacities.items())),
             getattr(context.physical_mechanisms, "signature", None),
+            pt_key, rows_key,
         )
         if cache_key in _SELECT_CACHE:
             recipe, record = _SELECT_CACHE[cache_key]
@@ -432,12 +666,23 @@ class MappedMatmul:
         selected_geometry = None
         meta = dict(context.op.metadata)
         groups = int(meta.get("matrix_groups", 1))
-        if groups < 1 or context.op.local_shape[(-3)] % groups:
-            raise ModelingError("matrix_groups_require_equal_integer_rows")
+        if rows_key is None:
+            if groups < 1 or context.op.local_shape[(-3)] % groups:
+                raise ModelingError("matrix_groups_require_equal_integer_rows")
+            m = context.op.local_shape[(-3)] // groups
+        else:
+            groups = len(rows_key)
+            if groups < 1:
+                raise ModelingError("matrix_groups_require_positive_integer")
+            m = max(rows_key, default=0)
         compute_format = meta.get("compute_format", context.op.dtype or "bf16")
-        m = context.op.local_shape[(-3)] // groups
         n = context.op.local_shape[(-2)]
-        default_grid = math.ceil(m / REFILL_M) * math.ceil(n / REFILL_M) * groups
+        k = context.op.local_shape[(-1)]
+        default_grid = (
+            sum(math.ceil(r / REFILL_M) for r in rows_key) * math.ceil(n / REFILL_M)
+            if rows_key is not None
+            else math.ceil(m / REFILL_M) * math.ceil(n / REFILL_M) * groups
+        )
         # FP32 always screens the declared subtiles so narrow projections
         # can fill more owners, even when the usual supply budget is unmet.
         fp32_subtiles = self.candidates is None and compute_format == "fp32"
@@ -449,26 +694,42 @@ class MappedMatmul:
         narrow = (NARROW_CANDIDATES if automatic_subtiles else ()
                   ) if self.narrow_candidates is None else self.narrow_candidates
         narrow = narrow if n <= MIN_NARROW_N else ()
-        underfilled = (UNDERFILLED_CANDIDATES if automatic_subtiles else ()
-                       ) if self.underfilled_candidates is None else self.underfilled_candidates
+        arch35_macro_streamk = (
+            pt is not None and is_arch35_context(context)
+            and compute_format != "fp32" and groups == 1
+            and n >= ARCH35_MACRO_MIN_N and k >= ARCH35_MACRO_MIN_K
+        )
+        underfilled = (
+            () if (arch35_macro_streamk and self.underfilled_candidates is None)
+            else ((UNDERFILLED_CANDIDATES if automatic_subtiles else ())
+                  if self.underfilled_candidates is None else self.underfilled_candidates)
+        )
         underfilled = underfilled if default_grid < context.core_count else ()
         candidates = [(tile, False) for tile in
                       (DEFAULT_CANDIDATES if self.candidates is None else self.candidates)]
+        if (pt is not None and not is_arch35_context(context) and groups > 1
+                and self.candidates is None and n >= ARCH35_MACRO_MIN_N):
+            # Upstream DAV_2201 SPLIT_M GroupedMatmul fixes baseN = BEST_BASEN (256)
+            # (ops-transformer/gmm/grouped_matmul/op_host/op_tiling/grouped_matmul_tiling.cpp:1693-1738).
+            candidates = [(tile, flag) for tile, flag in candidates if tile[1] == ARCH35_MACRO_MIN_N]
+        if (pt is not None and not is_arch35_context(context) and groups == 1
+                and self.candidates is None and default_grid < context.core_count):
+            candidates.extend((tile, True) for tile in DAV2201_SMALL_M_CANDIDATES)
         candidates.extend((tile, True) for tile in narrow)
         candidates.extend((tile, True) for tile in underfilled if tile not in narrow)
         for (tm, tn, tk), is_narrow in candidates:
             del is_narrow
             cm = min(self.compute_m, tm)
             cn = min(self.compute_n, tn)
-            k = context.op.local_shape[(-1)]
-            output_tiles = (math.ceil(m / tm) * math.ceil(n / tn) * groups)
-            split_k = 1
-            if output_tiles < context.core_count and k > tk:
-                split_k = min(
-                    k // tk,
-                    max(1, context.core_count // max(1, output_tiles)),
-                    MAX_SPLIT_K,
-                )
+            output_tiles = (
+                sum(math.ceil(r / tm) for r in rows_key) * math.ceil(n / tn)
+                if rows_key is not None
+                else math.ceil(m / tm) * math.ceil(n / tn) * groups
+            )
+            split_k = _candidate_split_k(
+                context, m=m, n=n, k=k, tk=tk, output_tiles=output_tiles,
+                groups=groups, compute_format=compute_format,
+            )
             recipe = HierarchicalMatmul(
                 tm, tn, tk, cm, cn,
                 self.slots, self.compute_slots, self.reuse_inputs,
@@ -478,12 +739,48 @@ class MappedMatmul:
                 raise ModelingError("matrix_tile_dimensions_and_slots_must_be_positive")
             if tm % cm or tn % cn:
                 raise ModelingError("matrix_refill_tiles_must_be_multiples_of_compute_tiles")
-            geometry = matrix_geometry(context, recipe)
+            geometry = matrix_geometry(context, recipe, group_rows=rows_key)
             buffers = footprint(context, recipe, geometry=geometry)
             exceeded = {pool: size for pool, size in buffers.items()
                         if pool in context.pool_capacities and size > context.pool_capacities[pool]}
-            bound = None if exceeded else mapping_bound(context, recipe, geometry=geometry)
-            waves = math.ceil(math.ceil(m / tm) * math.ceil(n / tn) * groups / context.core_count)
+            # Host tiling runs from static (M, N, K) and never observes transient L2 warmth.
+            if exceeded:
+                bound = None
+            elif arch35_macro_streamk and split_k > 1:
+                base_perf = _arch35_streamk_perf(
+                    context, recipe, geometry, split_k=1, output_tiles=output_tiles)
+                sk_perf = _arch35_streamk_perf(
+                    context, recipe, geometry, split_k=split_k, output_tiles=output_tiles)
+                if sk_perf < base_perf:
+                    bound = sk_perf
+                else:
+                    split_k = 1
+                    recipe = HierarchicalMatmul(
+                        tm, tn, tk, cm, cn,
+                        self.slots, self.compute_slots, self.reuse_inputs,
+                        self.reuse_weights, split_k)
+                    bound = base_perf
+            elif arch35_macro_streamk:
+                bound = _arch35_streamk_perf(
+                    context, recipe, geometry, split_k=1, output_tiles=output_tiles)
+            else:
+                bound = mapping_bound(
+                    context, recipe, geometry=geometry,
+                    allow_unequal_groups=rows_key is not None,
+                    ignore_l2_hits=(pt is not None))
+                if pt is not None and split_k > 1:
+                    split_bound = _split_k_bound(
+                        context, recipe, geometry, bound=bound,
+                        split_k=split_k, output_tiles=output_tiles)
+                    if split_bound >= bound:
+                        split_k = 1
+                        recipe = HierarchicalMatmul(
+                            tm, tn, tk, cm, cn,
+                            self.slots, self.compute_slots, self.reuse_inputs,
+                            self.reuse_weights, split_k)
+                    else:
+                        bound = split_bound
+            waves = math.ceil(output_tiles / context.core_count)
             records.append({"tile": [tm, tn, tk], "split_k": split_k,
                             "footprint_bytes_per_owner": buffers,
                             "exceeded_pools": exceeded, "resource_bound_ms": bound,

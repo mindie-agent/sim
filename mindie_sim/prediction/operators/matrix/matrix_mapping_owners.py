@@ -7,6 +7,7 @@
   enumeration; no locks.
 [Side-Effect Policy] Pure calculations over caller-supplied shapes and rates.
 """
+from collections.abc import Mapping
 from fractions import Fraction
 import math
 
@@ -14,6 +15,33 @@ from mindie_sim.schema.common import ModelingError
 
 
 _FRACTAL_ROWS = 16
+#: DAV_3510 (A5) L0C accumulator capacity (256 KiB vs 128 KiB on DAV_2201).
+ARCH35_L0C_BYTES = 256 * 1024
+#: L2 cache sector widths for DAV_2201 (512 B) and DAV_3510 (128 B).
+DAV2201_L2_SECTOR_BYTES = 512
+DAV3510_L2_SECTOR_BYTES = 128
+#: DAV_2201 on-the-fly ND->FRACTAL_NZ B transfer runs at 0.5x L0B (64 B/cycle).
+DAV2201_ND2NZ_B_L0B_RATIO = 0.5
+DAV2201_ND2NZ_B_BYTES_PER_CYCLE = 64.0
+#: Ratio threshold separating asymmetric DAV_2201 L0B (0.50x) from symmetric DAV_3510 (1.0x).
+DAV2201_ASYMMETRIC_L0B_RATIO_MAX = 0.75
+#: Hardware L0A bus width (256 B/cycle).
+LOAD_DATA_L0A_BYTES_PER_CYCLE = 256.0
+#: Multi-wave grouped HBM cold ramp-up before reaching streaming HBM saturation.
+GROUPED_HBM_RAMP_WAVES = 2.0
+MS_PER_SECOND = 1000.0
+NS_PER_MS = 1_000_000.0
+#: Upstream arch35/matmul_v3_basic_streamk_tiling.cpp:124 GetNegPerf cycle model.
+STREAMK_NEG_CYCLES_PER_SPLIT = 60.0
+STREAMK_NEG_BASE_CYCLES = 1000.0
+#: Pure-AIC MatMulV3 kernel init+teardown cycles (bf16_matmulv3_m1_k64_n64: 1.691 us @ 1.65 GHz).
+AIC_MATMUL_KERNEL_INIT_CYCLES = 2790.0
+#: MIX_AIC (AIC+AIV) Stream-K dual-side init+ICachePreLoad+teardown cycles
+#: (int8_quantbatchmatmulv3_m1_k512_n512: 5.795 us @ 1.65 GHz minus GetNegPerf/P13 sync).
+MIX_AIC_STREAMK_INIT_CYCLES = 7000.0
+#: Blocking scalar GM load latency per group in grouped_matmul_kernel.h:314
+#: (groupListGm.GetValue(groupIdx) across declared groupNum).
+GROUP_LIST_SCALAR_LOAD_CYCLES = 200.0
 
 
 def mte_owner_unit_count(resource_units):
@@ -235,3 +263,371 @@ def physical_owner_rate(context, resource, placement=None):
     if units < 1 or len(placement) > units:
         raise ModelingError(f"matrix_placement_exceeds_resource_units:{resource}")
     return rate * len(placement) / units
+
+
+def is_arch35_context(context) -> bool:
+    """True when the execution context targets DAV_3510 (A5, 256 KiB L0C)."""
+    pt = getattr(context, "primitive_table", None)
+    if pt is not None:
+        arch = str(getattr(pt, "arch_preset", "") or "")
+        if arch:
+            return arch == "npu_arch_3510"
+    l0c = int((getattr(context, "pool_capacities", None) or {}).get("l0c", 0))
+    return l0c >= ARCH35_L0C_BYTES
+
+
+def primitive_core_clock_hz(context) -> float | None:
+    """Derive AIC core frequency in Hz from certified P02_load_data L0A bus."""
+    pt = getattr(context, "primitive_table", None)
+    if pt is None:
+        return None
+    try:
+        band = pt.cell("P02_load_data").band("l1_to_l0a_bytes_per_s_per_aic")
+        cap = float(getattr(band, "certified_upper_capacity", 0.0) or 0.0)
+        if cap > 0.0:
+            return cap / LOAD_DATA_L0A_BYTES_PER_CYCLE
+    except (ModelingError, KeyError, AttributeError):
+        return None
+    return None
+
+
+def primitive_p01_scaling_bps(context, active_cores: int, *, warm: bool) -> float | None:
+    """Interpolate P01_datacopy AIC cold/warm scaling curve at ``active_cores``."""
+    pt = getattr(context, "primitive_table", None)
+    if pt is None or active_cores < 1:
+        return None
+    try:
+        params = pt.cell("P01_datacopy").parameters or {}
+    except ModelingError:
+        return None
+    key = "mte2_aic_warm_scaling_bps" if warm else "mte2_aic_cold_scaling_bps"
+    curve = params.get(key)
+    if not isinstance(curve, Mapping) or not curve:
+        return None
+    pts = sorted((int(k), float(v)) for k, v in curve.items() if float(v) > 0.0)
+    if not pts:
+        return None
+    c = int(active_cores)
+    if c <= pts[0][0]:
+        return pts[0][1] * (float(c) / float(pts[0][0]))
+    if c >= pts[-1][0]:
+        return pts[-1][1]
+    for (c0, v0), (c1, v1) in zip(pts, pts[1:]):
+        if c0 <= c <= c1:
+            return v0 + (float(c - c0) / float(c1 - c0)) * (v1 - v0)
+    return pts[-1][1]
+
+
+def primitive_p01_strided_cold_bps(
+    context, row_bytes: int, stride_bytes: int,
+) -> float | None:
+    """Interpolate calibrated P01 2D strided cold-HBM bandwidth surface."""
+    pt = getattr(context, "primitive_table", None)
+    if pt is None or row_bytes < 1:
+        return None
+    try:
+        params = pt.cell("P01_datacopy").parameters or {}
+    except ModelingError:
+        return None
+    surface = params.get("strided_cold_surface")
+    if not surface:
+        return None
+    rows = sorted({int(entry["row_bytes"]) for entry in surface})
+    if not rows:
+        return None
+    r_sel = max((r for r in rows if r <= int(row_bytes)), default=rows[0])
+    pts = sorted(
+        (int(entry["stride_bytes"]), float(entry["bps_p50"]))
+        for entry in surface
+        if int(entry["row_bytes"]) == r_sel and float(entry.get("bps_p50", 0.0)) > 0.0
+    )
+    if not pts:
+        return None
+    stride = int(stride_bytes)
+    if stride <= pts[0][0]:
+        return pts[0][1]
+    if stride >= pts[-1][0]:
+        return pts[-1][1]
+    for (s0, v0), (s1, v1) in zip(pts, pts[1:]):
+        if s0 <= stride <= s1:
+            return v0 + (float(stride - s0) / float(s1 - s0)) * (v1 - v0)
+    return pts[-1][1]
+
+
+def primitive_p05_stride_conflict_bps(context, stride_bytes: int) -> float | None:
+    """Interpolate calibrated P05 L2/TLB stride-conflict ceiling on log2 stride."""
+    pt = getattr(context, "primitive_table", None)
+    if pt is None or stride_bytes < 1:
+        return None
+    try:
+        params = pt.cell("P05_l2_residency_reuse").parameters or {}
+    except ModelingError:
+        return None
+    curve = params.get("l2_stride_conflict")
+    if not curve:
+        return None
+    aligned = (int(stride_bytes) % DAV2201_L2_SECTOR_BYTES) == 0
+    kinds = ("contiguous", "pow2") if aligned else ("contiguous", "coprime")
+    pts = sorted(
+        (int(entry["stride_bytes"]), float(entry["bps_p50"]))
+        for entry in curve
+        if str(entry.get("kind", "")) in kinds and float(entry.get("bps_p50", 0.0)) > 0.0
+    )
+    if not pts:
+        return None
+    stride = int(stride_bytes)
+    if stride <= pts[0][0]:
+        return pts[0][1]
+    if stride >= pts[-1][0]:
+        return pts[-1][1]
+    log_s = math.log2(float(stride))
+    for (s0, v0), (s1, v1) in zip(pts, pts[1:]):
+        if s0 <= stride <= s1:
+            l0, l1 = math.log2(float(s0)), math.log2(float(s1))
+            frac = (log_s - l0) / (l1 - l0) if l1 > l0 else 0.0
+            return v0 + frac * (v1 - v0)
+    return pts[-1][1]
+
+
+def primitive_p01_hbm_read_bps(context) -> float | None:
+    """Calibrated full-die cold-HBM streaming read rate in bytes/s."""
+    pt = getattr(context, "primitive_table", None)
+    if pt is None:
+        return None
+    from mindie_sim.primitives.loader import _table_band_p50
+    val = _table_band_p50(pt, "P01_datacopy", "hbm_read_bytes_per_s")
+    return float(val) if val is not None and float(val) > 0.0 else None
+
+
+def primitive_p02_l0_bps_per_aic(context) -> tuple[float, float] | None:
+    """Calibrated P02 L1->L0A and L1->L0B rates in bytes/s/AIC."""
+    pt = getattr(context, "primitive_table", None)
+    if pt is None:
+        return None
+    from mindie_sim.primitives.loader import _table_band_p50
+    l0a = _table_band_p50(pt, "P02_load_data", "l1_to_l0a_bytes_per_s_per_aic")
+    l0b = _table_band_p50(pt, "P02_load_data", "l1_to_l0b_bytes_per_s_per_aic")
+    if l0a is None or l0b is None or float(l0a) <= 0.0 or float(l0b) <= 0.0:
+        return None
+    return float(l0a), float(l0b)
+
+
+def primitive_l2_params(context) -> tuple[int, int]:
+    """Return ``(l2_bytes, l2_sector_bytes)`` from P05 or device pools."""
+    pt = getattr(context, "primitive_table", None)
+    l2_bytes = int((getattr(context, "pool_capacities", None) or {}).get("l2", 0))
+    sector = DAV3510_L2_SECTOR_BYTES if is_arch35_context(context) else DAV2201_L2_SECTOR_BYTES
+    if pt is not None:
+        fp = getattr(getattr(pt, "provenance", None), "silicon_fingerprint", None)
+        if fp is not None and int(getattr(fp, "l2_bytes", 0) or 0) > 0:
+            l2_bytes = int(fp.l2_bytes)
+        try:
+            p05 = pt.cell("P05_l2_residency_reuse").parameters or {}
+            if int(p05.get("l2_sector_bytes", 0) or 0) > 0:
+                sector = int(p05["l2_sector_bytes"])
+        except ModelingError:
+            pass
+    return l2_bytes, sector
+
+
+def primitive_p13_sync_ms(context, metric: str) -> float:
+    """Calibrated P13 cross-core sync latency in ms (0.0 when absent)."""
+    pt = getattr(context, "primitive_table", None)
+    if pt is None:
+        return 0.0
+    from mindie_sim.primitives.loader import _table_band_p50
+    ns = _table_band_p50(pt, "P13_crosscore_sync", metric)
+    return float(ns) / NS_PER_MS if ns is not None and float(ns) > 0.0 else 0.0
+
+
+def primitive_nd2nz_mte2_rate_bps_per_aic(
+    context, active_cores: int, left_bytes: float, right_bytes: float, *,
+    weight_layout: str = "ND", row_bytes: int = 0, stride_bytes: int = 0,
+) -> float | None:
+    """Effective per-AIC MTE2 L2->L1 rate from two-term private/L2 roofline.
+
+    Per-AIC private time blends contiguous A at single-core warm MTE2 rate
+    with ND2NZ B (64 B/cycle = 0.5 * L0B on asymmetric DAV_2201, with 1-cycle
+    per-row turnaround when strided row_bytes < 512 B L2 sector; full rate on
+    symmetric DAV_3510 or FRACTAL_NZ). Aggregate die L2 bandwidth
+    ``p01_warm(active_cores)`` bounds the combined active-core rate.
+    """
+    pt = getattr(context, "primitive_table", None)
+    if pt is None:
+        return None
+    total = float(left_bytes) + float(right_bytes)
+    if total <= 0.0:
+        return None
+    cores = max(1, int(active_cores))
+    single_bps = primitive_p01_scaling_bps(context, 1, warm=True)
+    warm_agg = primitive_p01_scaling_bps(context, cores, warm=True)
+    if single_bps is None or single_bps <= 0.0:
+        from mindie_sim.primitives.loader import _table_band_p50
+        hit = _table_band_p50(pt, "P01_datacopy", "mte2_aic_hit_bytes_per_s_per_core")
+        if hit is None or float(hit) <= 0.0:
+            return None
+        single_bps = float(hit)
+    a_bps = single_bps
+    b_bps = single_bps
+    if not is_arch35_context(context) and str(weight_layout).upper() != "FRACTAL_NZ":
+        l0 = primitive_p02_l0_bps_per_aic(context)
+        if l0 is not None and (l0[1] / l0[0]) < DAV2201_ASYMMETRIC_L0B_RATIO_MAX:
+            b_bps = min(single_bps, DAV2201_ND2NZ_B_L0B_RATIO * l0[1])
+            _, sector = primitive_l2_params(context)
+            if 0 < int(row_bytes) < int(sector) and int(row_bytes) < int(stride_bytes):
+                # 1-cycle burst turnaround on the 64 B/cycle ND2NZ B bus for sub-sector rows.
+                b_bps *= float(row_bytes) / (float(row_bytes) + DAV2201_ND2NZ_B_BYTES_PER_CYCLE)
+    t_private = float(left_bytes) / a_bps + float(right_bytes) / b_bps
+    t_l2_agg = (total * float(cores) / warm_agg) if (warm_agg is not None and warm_agg > 0.0) else 0.0
+    t_eff = max(t_private, t_l2_agg)
+    return total / t_eff if t_eff > 0.0 else single_bps
+
+
+def primitive_cold_hbm_bps(
+    context, *, active_cores: int, row_bytes: int, stride_bytes: int,
+    total_tiles: int, is_grouped: bool, is_full_row_coalesced: bool = False,
+) -> float | None:
+    """Effective die cold-HBM read bandwidth from P01 scaling, strided surface and P05 stride cap."""
+    pt = getattr(context, "primitive_table", None)
+    if pt is None or active_cores < 1:
+        return None
+    hbm_rd = primitive_p01_hbm_read_bps(context)
+    p01_cold = primitive_p01_scaling_bps(context, active_cores, warm=False)
+    if p01_cold is None:
+        return hbm_rd
+    _, sector = primitive_l2_params(context)
+    cores = max(1, int(getattr(context, "core_count", 1) or 1))
+    if is_grouped and is_full_row_coalesced:
+        waves = float(math.ceil(max(1, int(total_tiles)) / cores))
+        ramp_bw = p01_cold
+        if not is_arch35_context(context) and row_bytes < stride_bytes:
+            strided = primitive_p01_strided_cold_bps(context, row_bytes, stride_bytes)
+            if strided is not None and strided > 0.0:
+                ramp_bw = min(ramp_bw, strided)
+        if hbm_rd is not None and active_cores >= cores and waves > GROUPED_HBM_RAMP_WAVES:
+            ramp = GROUPED_HBM_RAMP_WAVES / ramp_bw
+            steady = (waves - GROUPED_HBM_RAMP_WAVES) / hbm_rd
+            return waves / (ramp + steady)
+        return ramp_bw
+    sector_eff = min(1.0, float(max(1, int(row_bytes))) / float(max(1, sector)))
+    cap = p01_cold * sector_eff
+    if row_bytes < stride_bytes:
+        strided = primitive_p01_strided_cold_bps(context, row_bytes, stride_bytes)
+        if strided is not None:
+            cap = min(cap, strided)
+        stride_conflict = primitive_p05_stride_conflict_bps(context, stride_bytes)
+        if stride_conflict is not None:
+            cap = min(cap, stride_conflict)
+        return cap
+    return min(hbm_rd, cap) if hbm_rd is not None else cap
+
+
+def primitive_wave_cold_hbm_per_owner_bps(
+    context, *, cold_tiles: int, row_bytes: int, stride_bytes: int,
+    is_grouped: bool, is_full_row_coalesced: bool = False, nn_tiles: int = 1,
+) -> float | None:
+    """Per-owner cold-HBM cap solving the shared-HBM fluid Engine wave equation.
+
+    On the Engine, ``full_waves`` of ``cores`` owners followed by ``tail``
+    owners complete in ``F*C/min(H, C*c) + T/min(H, T*c)``. Solving that
+    equation for ``c`` against physical ``F*C/bw_full + T/bw_tail`` avoids
+    double-throttling tail waves when the full waves already saturate ``H``.
+    """
+    if getattr(context, "primitive_table", None) is None or cold_tiles < 1:
+        return None
+    cores = max(1, int(getattr(context, "core_count", 1) or 1))
+    full_waves, tail = divmod(int(cold_tiles), cores)
+    max_waves = full_waves + (1 if tail > 0 else 0)
+    inv_bw = 0.0
+    if full_waves > 0:
+        bw_full = primitive_cold_hbm_bps(
+            context, active_cores=cores, row_bytes=row_bytes,
+            stride_bytes=stride_bytes, total_tiles=cold_tiles,
+            is_grouped=is_grouped, is_full_row_coalesced=is_full_row_coalesced,
+        )
+        if bw_full is None or bw_full <= 0.0:
+            return None
+        inv_bw += float(full_waves * cores) / bw_full
+    if tail > 0:
+        tail_coalesced = is_full_row_coalesced and (tail >= max(1, int(nn_tiles)))
+        bw_tail = primitive_cold_hbm_bps(
+            context, active_cores=tail, row_bytes=row_bytes,
+            stride_bytes=stride_bytes, total_tiles=cold_tiles,
+            is_grouped=is_grouped, is_full_row_coalesced=tail_coalesced,
+        )
+        if bw_tail is None or bw_tail <= 0.0:
+            return None
+        inv_bw += float(tail) / bw_tail
+    if inv_bw <= 0.0:
+        return None
+    cap = float(max_waves) / inv_bw
+    hbm_name = (getattr(context, "resource_names", None) or {}).get("hbm")
+    hbm_die_bps = (
+        float(context.rates[hbm_name]) * MS_PER_SECOND
+        if (hbm_name and hbm_name in getattr(context, "rates", {}))
+        else (primitive_p01_hbm_read_bps(context) or 0.0)
+    )
+    if full_waves > 0 and tail > 0 and hbm_die_bps > 0.0 and (cap * float(cores)) > hbm_die_bps:
+        # Full waves are saturated by shared Engine HBM ``hbm_die_bps``; solve
+        # remaining tail-wave budget ``inv_bw - F*C/H`` for per-owner cap ``c``.
+        tail_budget = inv_bw - float(full_waves * cores) / hbm_die_bps
+        if tail_budget > 0.0:
+            return min(hbm_die_bps / float(tail), 1.0 / tail_budget)
+        return hbm_die_bps / float(tail)
+    return cap
+
+
+def streamk_fixup_latency_ms(
+    context, *, k_splits: int, used_cores: int,
+) -> float:
+    """Upstream DAV_3510 Stream-K AIV fixup loop setup + cross-core sync."""
+    if getattr(context, "primitive_table", None) is None or k_splits <= 1:
+        return 0.0
+    clock_hz = primitive_core_clock_hz(context)
+    cores = max(1, int(getattr(context, "core_count", 1) or 1))
+    used = max(1, min(cores, int(used_cores)))
+    neg_ms = 0.0
+    if clock_hz is not None and clock_hz > 0.0:
+        cycles = float(k_splits) * STREAMK_NEG_CYCLES_PER_SPLIT + STREAMK_NEG_BASE_CYCLES
+        neg_ms = (cycles / clock_hz) * MS_PER_SECOND * (float(cores) / float(used))
+    sync_ms = (
+        primitive_p13_sync_ms(context, "mode0_aiv_barrier_ns")
+        + primitive_p13_sync_ms(context, "mode4_intra_block_ns")
+    )
+    if sync_ms <= 0.0:
+        sync_ms = primitive_p13_sync_ms(context, "mode0_aic_barrier_ns")
+    return neg_ms + sync_ms
+
+
+def matrix_kernel_setup_ms(
+    context, *, is_streamk: bool = False, declared_groups: int = 1,
+) -> float:
+    """Additive device-side setup: MIX_AIC Stream-K init, DAV_3510 init, and groupListGm scan."""
+    if getattr(context, "primitive_table", None) is None:
+        return 0.0
+    clock_hz = primitive_core_clock_hz(context)
+    if clock_hz is None or clock_hz <= 0.0:
+        return 0.0
+    if is_streamk:
+        init_cycles = MIX_AIC_STREAMK_INIT_CYCLES
+    elif is_arch35_context(context):
+        init_cycles = AIC_MATMUL_KERNEL_INIT_CYCLES
+    else:
+        # On DAV_2201 pure-AIC MatMulV3, AIC init overlaps steady execution and
+        # acts as an inclusive minimum_ms floor (see matrix_kernel_floor_ms).
+        init_cycles = 0.0
+    scan_cycles = (
+        float(declared_groups) * GROUP_LIST_SCALAR_LOAD_CYCLES
+        if int(declared_groups) > 1 else 0.0
+    )
+    return ((init_cycles + scan_cycles) / clock_hz) * MS_PER_SECOND
+
+
+def matrix_kernel_floor_ms(context) -> float:
+    """Inclusive pure-AIC kernel floor (bf16_matmulv3_m1_k64_n64: 2790 cycles)."""
+    if getattr(context, "primitive_table", None) is None:
+        return 0.0
+    clock_hz = primitive_core_clock_hz(context)
+    if clock_hz is None or clock_hz <= 0.0:
+        return 0.0
+    return (AIC_MATMUL_KERNEL_INIT_CYCLES / clock_hz) * MS_PER_SECOND
