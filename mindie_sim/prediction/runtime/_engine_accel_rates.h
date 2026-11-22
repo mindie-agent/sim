@@ -87,7 +87,6 @@ static bool rates_partition(msim_ctx *c, const int32_t *idx, int32_t n,
         if (found >= 0) { gid[i] = found; continue; }
         {
             msim_ubits mask, seen_occ;
-            int32_t w;
             bool overlaps = false;
             msim_ubits_clear(&mask);
             for (k = 0; k < len; k++) {
@@ -625,14 +624,22 @@ static int32_t compute_rates(msim_ctx *c)
             }
         }
     }
+    for (r = 0; r < c->nres; r++) c->res[r].mode = -1;
     if (any_c) {
         int32_t rc;
-        for (r = 0; r < c->nres; r++) c->res[r].mode = 4;
+        for (a = 0; a < c->act_n; a++) {
+            msim_task *t = &c->task[c->act[a]];
+            if (t->state != 1 || !t->coupled_comp) continue;
+            for (k = 0; k < (int32_t)t->nlink; k++) {
+                msim_link *l = &c->link[t->lstart + k];
+                if (l->rem > 0.0) c->res[l->res].mode = 4;
+            }
+        }
         rc = rates_coupled(c);
         if (rc != 0) return rc;
     }
     if (!any_u) return 0;
-    memset(c->res_seen, 0, (size_t)c->nres);
+    if (c->nres > 0) memset(c->res_seen, 0, (size_t)c->nres);
     for (a = 0; a < c->act_n; a++) {
         msim_task *t = &c->task[c->act[a]];
         if (t->state != 1 || t->coupled_comp) continue;
@@ -673,15 +680,15 @@ static int32_t compute_rates(msim_ctx *c)
                 idx[j + 1] = key;
             }
             if (rates_partition(c, idx, n, res)) {
-                if (!any_c) res->mode = 2;
+                if (res->mode != 4) res->mode = 2;
                 continue;
             }
             if (!rates_overlap(c, idx, n, res)) return MSIM_E_ARITH;
-            if (!any_c) res->mode = 3;
+            if (res->mode != 4) res->mode = 3;
             continue;
         }
         rates_fair(c, idx, n, res->rate);
-        if (!any_c) res->mode = 0;
+        if (res->mode != 4) res->mode = 0;
     }
     return 0;
 }

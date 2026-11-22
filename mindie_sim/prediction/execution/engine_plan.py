@@ -752,6 +752,8 @@ def evaluate_plan(nodes: tuple[PlanNode, ...], hardware: HardwareProfile, *,
             _work(totals))
     except TimeoutError:
         raise
+    except TimeoutError:
+        raise
     except Exception as exc:  # Engine contract errors are recorded, never scored as zero
         return EngineEvaluation("failed", math.inf, 0, 0.0, 0.0, 0.0,
                                 reason=f"{type(exc).__name__}:{exc}")

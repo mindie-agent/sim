@@ -106,8 +106,8 @@ class _LazyFrontier:
         )
         include_sub = execution.include_submission
         stage_launch_ms = (
-            {stg: execution.submission.launch_ms(dies)
-             for (rep, stg), dies in execution.stage_dies.items()
+            {stg: execution._stage_launch_ms((rep, stg), captured=False)
+             for (rep, stg) in execution.stage_dies
              if rep == replica}
             if include_sub else {}
         )
@@ -511,10 +511,10 @@ class _LazyFrontier:
             elif op_futures[idx] is not None or succ_idx[idx]:
                 t_comp = engine._tasks.get(complete.sequence)
                 cb = lambda _ev, _i=idx: self._completed(_i)
-                if t_comp is not None and t_comp.callback is None:
+                if engine._accel is None and t_comp is not None and t_comp.callback is None:
                     t_comp.callback = cb
                 else:
-                    engine.on_complete(complete, cb)
+                    engine.on_complete(complete, cb, native_hook=True)
             return
 
         complete = engine.future(name + ":program_complete")

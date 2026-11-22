@@ -429,10 +429,26 @@ class StarsDescriptorQueue:
             self._retired_desc_ns = []
             self._retired_comp_ns = []
             return
-        fold_desc = [iv for iv in self._retired_desc_ns if iv[1] <= horizon_ns]
-        keep_desc = [iv for iv in self._retired_desc_ns if iv[1] > horizon_ns]
-        fold_comp = [iv for iv in self._retired_comp_ns if iv[1] <= horizon_ns]
-        keep_comp = [iv for iv in self._retired_comp_ns if iv[1] > horizon_ns]
+        fold_desc: list[tuple[int, int]] = []
+        keep_desc: list[tuple[int, int]] = []
+        for s_ns, e_ns in self._retired_desc_ns:
+            if e_ns <= horizon_ns:
+                fold_desc.append((s_ns, e_ns))
+            elif s_ns >= horizon_ns:
+                keep_desc.append((s_ns, e_ns))
+            else:
+                fold_desc.append((s_ns, horizon_ns))
+                keep_desc.append((horizon_ns, e_ns))
+        fold_comp: list[tuple[int, int]] = []
+        keep_comp: list[tuple[int, int]] = []
+        for s_ns, e_ns in self._retired_comp_ns:
+            if e_ns <= horizon_ns:
+                fold_comp.append((s_ns, e_ns))
+            elif s_ns >= horizon_ns:
+                keep_comp.append((s_ns, e_ns))
+            else:
+                fold_comp.append((s_ns, horizon_ns))
+                keep_comp.append((horizon_ns, e_ns))
         if not fold_desc and not fold_comp:
             return
         self._folded_desc_ns += sum(e - s for s, e in fold_desc)

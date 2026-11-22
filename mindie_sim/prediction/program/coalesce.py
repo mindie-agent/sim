@@ -291,6 +291,7 @@ def coalesce_execution_program(program, *, unroll_limit: int = PIPELINE_UNROLL_L
                     not s0.acquire and not s0.free and s0.program is None
                     and s0.latency == 0.0 and not s0.previous
                     and not s0.keep_empty and s0.fragment is None
+                    and not s0.latency_from_first_service
                 ):
                     return KernelProgram((replace(s0, after=(), latency=eff_min),))
             elif len(real_stages) == 2 and len(body.stages) == 2:

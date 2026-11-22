@@ -305,7 +305,7 @@ def _check_quant(op: OpNode, values, outs, bad: list[str]) -> ContractCheck:
                 _fail(bad, "quant_scale_shape_mismatch")
         else:
             _fail(bad, "quant_scale_shape_mismatch")
-    if out.dtype not in {"int8", "fp8", "fp8_e4m3", "int4"}:
+    if out.dtype not in {"int8", "fp8", "fp8_e4m3", "fp8_e5m2", "int4", "fp4"}:
         _fail(bad, "quant_payload_dtype_invalid")
     rounding_known = rounding is not None and saturation is not None
     policy = NUMERICAL_EXACT if op.numerical_policy == NUMERICAL_EXACT \
@@ -387,8 +387,9 @@ def handoff_split(graph: TypedGraph, chosen: tuple[str, ...],
         tiles = (int(math.ceil(max(1, m_total) / m))
                  * int(math.ceil(max(1, k_total) / k))
                  * int(math.ceil(max(1, n_total) / n)))
-        elem = dtype_bytes(left.dtype)
-        operand += tiles * (m * k * elem + k * n * elem)
+        elem_a = dtype_bytes(left.dtype)
+        elem_b = dtype_bytes(right.dtype)
+        operand += tiles * (m * k * elem_a + k * n * elem_b)
         for value_id in op.outputs:
             if any(consumer in chosen and graph.ops[consumer].resource == "vector"
                    for consumer in graph.consumers(value_id)):
@@ -540,9 +541,8 @@ def _cube_operands(graph: TypedGraph, op: OpNode, tile_rows: int,
     m = min(rows, _CUBE_TILE_M)
     k = max(1, min(int(left.shape[-1]), _CUBE_TILE_K))
     n = max(1, min(int(right.shape[-1]), _CUBE_TILE_N))
-    elem = dtype_bytes(right.dtype)
-    a = m * k * elem
-    b = k * n * elem
+    a = m * k * dtype_bytes(left.dtype)
+    b = k * n * dtype_bytes(right.dtype)
     return {"l1": a + b, "l0a": a, "l0b": b, "l0c": m * n * _CUBE_ACCUMULATOR_BYTES}
 
 

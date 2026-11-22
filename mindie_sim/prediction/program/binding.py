@@ -161,24 +161,6 @@ class RecipeContext:
     padded_tokens: int = 0
     layout: str = ""
 
-    @property
-    def effective_aic_cores(self) -> int:
-        """Effective AIC core limit for this operator's stream."""
-        if self.stream_owners is not None:
-            return int(self.stream_owners.aic_limit)
-        if self.datapath is not None:
-            return int(self.datapath.aic_count)
-        return int(self.core_count)
-
-    @property
-    def effective_aiv_cores(self) -> int:
-        """Effective AIV core limit for this operator's stream."""
-        if self.stream_owners is not None:
-            return int(self.stream_owners.aiv_limit)
-        if self.datapath is not None:
-            return int(self.datapath.aiv_count)
-        return int(self.resource_units.get("vector", self.core_count))
-
     def wave_count(self, tiles: int, *, kind: str = "aic") -> int:
         """Return ``ceil(tiles / active_cores)`` under this stream's core budget."""
         if tiles <= 0:

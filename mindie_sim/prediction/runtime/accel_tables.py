@@ -404,7 +404,8 @@ def task_flags(task, engine=None) -> int:
         flags |= F_LATENCY
     if task.acquire or task.free or task.allocation_demands:
         flags |= F_EXT_START | F_CALLBACK
-    if (task.callback is not None or "occurrence" in task.metadata
+    if (task.callback is not None
+            or (task.metadata is not None and "occurrence" in task.metadata)
             or callback_capable(task, engine)):
         # A finalizer-capable row ends *time* integration at its own
         # completion instant, so any observer registered by that release is

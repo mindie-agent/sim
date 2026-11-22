@@ -486,3 +486,61 @@ def test_pd_disaggregation_rules_and_serving_cli_guards() -> None:
     assert "--no-enable-prefix-caching" in a2_rules.cli_flags
     assert a2_rules.enable_ep_weight_filter is False
     assert a2_rules.additional_config["enable_weight_nz_layout"] is True
+
+
+def test_draft_kv_clamps_to_draft_spec_and_guards_mla_prolog() -> None:
+    """Draft attention clamps KV context to DraftSpec cap and guards MLAPO eligibility."""
+    from dataclasses import replace
+    from types import SimpleNamespace
+    from mindie_sim import compose_case, parse_case
+    from mindie_sim.prediction.frontend.speculation import _draft_mla_prolog_eligible, _effective_draft_context_cap
+
+    raw = compose_case("kimi-k3.1", hardware="Ascend910_9362", layers=2, tp=1, dp=1)
+    case = parse_case(raw)
+    assert _effective_draft_context_cap(SimpleNamespace(max_position_embeddings=2048), case.runtime) == 2048
+    assert _effective_draft_context_cap(SimpleNamespace(max_position_embeddings=0), case.runtime) == 0
+    rt_meta = replace(case.runtime, metadata=(("draft_max_model_len", 3072),))
+    assert _effective_draft_context_cap(SimpleNamespace(max_position_embeddings=0), rt_meta) == 3072
+
+    bad_plan = replace(case.model.layer_plans[0], attention="mla", qk_rope_head_dim=0)
+    bad_mla = replace(case.model, layer_plans=(bad_plan,))
+    assert _draft_mla_prolog_eligible(bad_mla, case.runtime) is False
+
+
+def test_compiled_kernel_program_root_delay_respects_future_ready() -> None:
+    """Compiled KernelProgram root delay must start from max(engine.now, ready.time)."""
+    from mindie_sim.prediction.engine import Engine, Resource
+    from mindie_sim.prediction.program import KernelProgram, Stage
+
+    eng = Engine([Resource("r", 10.0)], backend="python")
+    ready = eng.submit("prep", {"r": 30.0})
+    prog = KernelProgram((Stage("delayed", latency=2.0), Stage("work", {"r": 10.0}, after=("delayed",))))
+    done = prog.start(eng, "p", ready)
+    eng.advance(until=(done,))
+    assert ready.time == pytest.approx(3.0)
+    assert done.time == pytest.approx(6.0)
+
+
+def test_calibrated_dispatch_floor_preserves_explicit_device_override() -> None:
+    """Calibrated P15 dispatch envelope must never lower an explicit device.kernel_invocations override."""
+    from dataclasses import replace
+    from mindie_sim import compose_case, parse_case
+    from mindie_sim.prediction.evaluation import EvaluationContext
+    from mindie_sim.prediction.graph_analysis import graph_costs
+    from mindie_sim.prediction.program import RecipeBook
+    from mindie_sim.primitives.loader import load_primitives
+    from mindie_sim.schema.invocation import InvocationTiming
+    from mindie_sim.schema.operators import OpSpec
+
+    sku = "Ascend910_9362"
+    cs = parse_case(compose_case("qwen3.8-27b", hardware=sku, tp=1, ep=1, num_devices=1, layers=1, quant="none"))
+    custom_die = replace(cs.machine.dies[0], kernel_invocations=(("vector", InvocationTiming(minimum_ms=0.01)),))
+    cs_custom = replace(cs, machine=replace(cs.machine, dies=(custom_die,)))
+    tbl = load_primitives(sku, require_calibrated=True)
+    ev = EvaluationContext.create(cs_custom, RecipeBook(), primitive_table=tbl)
+    op = OpSpec(
+        "tiny_vec", "vector", "decode", 0, 0, (), (1, 128), (1, 128), (1, 128), (1, 128),
+        dtype="bf16", vector_ops=128.0, mte2_bytes=256.0, mte3_bytes=256.0, hbm_bytes=512.0,
+    )
+    rep = graph_costs(cs_custom, {0: [op]}, evaluation=ev, include_submission=False, isolated=True)
+    assert rep["duration_ms"] == pytest.approx(0.01, rel=1e-4)

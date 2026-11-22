@@ -289,6 +289,7 @@ class RecipeBook:
         from mindie_sim.prediction.operators.attention.batch_prefix_attention import BatchPrefixAttention
         from mindie_sim.prediction.operators.sparse_indexer.batch_prefix_indexer import BatchPrefixIndexer
         from mindie_sim.prediction.operators.grouped_moe.bf16_grouped import recipe as bf16_grouped
+        from .. import collectives as _collectives
         from ..collectives import PairwiseCollective, RingCollective
         from mindie_sim.prediction.operators.collectives.direct_peer import DirectPeerCollective
         from mindie_sim.prediction.operators.paged_mla.indexed_attention import recipe as indexed_attention
@@ -306,7 +307,7 @@ class RecipeBook:
         from mindie_sim.prediction.operators.attention.attention_decode import staged_gqa_decode
         from mindie_sim.prediction.operators.attention.attention_prefill import staged_gqa_prefill
 
-        return {
+        factories = {
             "tiled_matmul": TiledMatmul, "hierarchical_matmul": HierarchicalMatmul,
             "mapped_matmul": MappedMatmul, "phase_matmul": PhaseMatmul,
             "steady_matmul": SteadyMatmul,
@@ -324,6 +325,10 @@ class RecipeBook:
             "pairwise_collective": PairwiseCollective,
             "direct_peer_collective": DirectPeerCollective,
         }
+        oneshot_cls = getattr(_collectives, "OneShotCollective", None)
+        if oneshot_cls is not None:
+            factories["oneshot_collective"] = oneshot_cls
+        return factories
 
     @classmethod
     def from_mapping(cls, raw, *, family_registry: Any = None):

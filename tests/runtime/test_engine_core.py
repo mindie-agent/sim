@@ -541,3 +541,45 @@ def test_distinct_unit_address_phases_do_not_create_per_tile_global_barriers():
     # independent workers take 111; a barrier at each tile would give 114.
     assert done.time == pytest.approx(111)
     assert engine.serviced["issue"] == 81 and engine.serviced["hbm"] == 162
+
+
+def test_host_launch_with_pending_predecessor_preserves_causality_in_python_mode():
+    """Python-mode _submit_host_launch must wait for pending predecessors before starting."""
+    eng = Engine([Resource("host", 1000.0), Resource("cube", 1000.0)], backend="python", trace_limit=64)
+    first = eng.submit("first", {"cube": 5000.0})
+    prep = eng.prepare_stage("launch_after", {"host": 2000.0})
+    launched, started = eng._submit_host_launch(prep, "launch_after", "launch_start", after=(first,))
+    eng.advance(until=(launched,))
+    assert first.time == pytest.approx(5.0)
+    assert started.time == pytest.approx(5.0)
+    assert launched.time == pytest.approx(7.0)
+    rec = next(row for row in eng.trace if row["task"] == "launch_after")
+    assert rec["start_ms"] >= first.time - 1e-12
+
+
+def test_exposed_observer_stage_descriptor_counts_control_once():
+    """StageDescriptor control_ms must contribute 1x control time (not 2x via control_clocks)."""
+    from mindie_sim.prediction.efficiency.exposed_program import StageDescriptor
+    from mindie_sim.prediction.runtime.exposed_observer import _clock_for_declaration
+
+    clocks, control_ms, opaque_ms = _clock_for_declaration(
+        StageDescriptor(role="control", control_ms=2.0, vector_ms=0.0)
+    )
+    assert clocks.all_ms == pytest.approx(2.0) and clocks.cube_ms == pytest.approx(0.0)
+    assert control_ms == pytest.approx(2.0) and opaque_ms == pytest.approx(0.0)
+
+
+def test_periodic_clock_exact_matches_reference_addition_loop():
+    """O(1)/O(log N) exact periodic clock matches reference addition loop bit-for-bit."""
+    from mindie_sim.prediction.engine_periodic.frontier import _advance_periodic_clock
+    from mindie_sim.prediction.runtime.engine import _advance_periodic_clock_exact
+
+    for now, steps, cycles in (
+        (0.0, (0.1,), 5000),
+        (1.0, (1.0 / 3.0,), 4097),
+        (1.5, (math.ulp(1.5) * 0.5,), 2048),
+        (4.0, (0.125, 0.25), 1024),
+    ):
+        assert _advance_periodic_clock_exact(now, steps, cycles) == _advance_periodic_clock(now, steps, cycles)
+    huge = (1 << 31) + 98
+    assert _advance_periodic_clock_exact(4.0, (1.0,), huge) == float(4 + huge)

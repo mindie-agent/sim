@@ -76,10 +76,31 @@ _EXECUTION_CLASS_HARDWARE_ROLES: dict[str, tuple[str, ...]] = {
     "cube_aic": ("cube",),
 }
 _ORDINARY_HARDWARE_CLASSES = frozenset({"cube", "vector"})
+_CATALOG_VECTOR_BASELINE_BASES = frozenset({
+    "arch2201_baseline_extrapolation",
+    "arch2201_baseline_declaration",
+    "stream_saturated_event_median",
+})
 _NON_KERNEL_FAMILIES = frozenset({
     "barrier", "token_commit", "collective", "allreduce", "allgather",
     "reduce_scatter", "alltoall", "alltoallv", "transport",
 })
+
+
+def _is_catalog_vector_baseline(timing: InvocationTiming) -> bool:
+    """Return True only when every selected device vector declaration came from a catalog baseline."""
+    prov = timing.provenance if isinstance(timing.provenance, _AbcMapping) else {}
+    declarations = prov.get("declarations")
+    if not isinstance(declarations, (list, tuple)) or not declarations:
+        return False
+    for entry in declarations:
+        if not isinstance(entry, _AbcMapping):
+            return False
+        entry_prov = entry.get("provenance")
+        basis = entry_prov.get("basis") if isinstance(entry_prov, _AbcMapping) else None
+        if basis not in _CATALOG_VECTOR_BASELINE_BASES:
+            return False
+    return True
 
 
 def _resolve_mapped_hardware_invocation(dies, roles: tuple[str, ...]):
@@ -182,7 +203,18 @@ def _apply_calibrated_dispatch_floor(context, dies, selected, envelope):
             target_startup_ms = floor_ms
     else:
         return selected
-    target_min_ms = floor_ms if kind in ("vector", "vector_sync") else max(timing.minimum_ms, floor_ms)
+    if kind in ("vector", "vector_sync"):
+        has_declared_blocks = (
+            (isinstance(prog_exec, _AbcMapping)
+             and bool(prog_exec.get("launched_blocks") or prog_exec.get("active_aivs")))
+            or bool(meta.get("launched_blocks") or meta.get("active_aivs"))
+        )
+        if has_declared_blocks and _is_catalog_vector_baseline(timing):
+            target_min_ms = floor_ms
+        else:
+            target_min_ms = max(timing.minimum_ms, floor_ms)
+    else:
+        target_min_ms = max(timing.minimum_ms, floor_ms)
     if target_min_ms == timing.minimum_ms and target_startup_ms <= timing.startup_ms:
         return selected
     evidence = f"p15_p13:{envelope.sku}:{envelope.envelope_sha256[:DIGEST_PREFIX_CHARS]}:{kind}"
@@ -292,11 +324,18 @@ def build_stage_profiles(case: CaseSpec, namespace: str = "", *,
                     for role, val in overlay.rates
                 }
                 overlay_peaks = dict(overlay.compute_peaks)
+                hbm_cap_s = orig_rates_s.get("hbm", 0.0)
                 dp_updates: dict[str, Any] = {}
                 if overlay.hbm_read_bytes_per_s is not None:
-                    dp_updates["hbm_read_bytes_per_s"] = overlay.hbm_read_bytes_per_s
+                    hbm_r = overlay.hbm_read_bytes_per_s
+                    dp_updates["hbm_read_bytes_per_s"] = (
+                        min(hbm_r, hbm_cap_s) if hbm_cap_s > 0.0 else hbm_r
+                    )
                 if overlay.hbm_write_bytes_per_s is not None:
-                    dp_updates["hbm_write_bytes_per_s"] = overlay.hbm_write_bytes_per_s
+                    hbm_w = overlay.hbm_write_bytes_per_s
+                    dp_updates["hbm_write_bytes_per_s"] = (
+                        min(hbm_w, hbm_cap_s) if hbm_cap_s > 0.0 else hbm_w
+                    )
                 if overlay.hbm_rw_alpha is not None:
                     dp_updates["hbm_rw_alpha"] = overlay.hbm_rw_alpha
                 merged_caps = {**dict(datapath.compute_peaks), **overlay_peaks}
@@ -345,14 +384,27 @@ def build_stage_profiles(case: CaseSpec, namespace: str = "", *,
                 elif role in overlay_rates and orig_rates_s.get(role, 0.0) > 0.0:
                     m_rate = m_rate * (overlay_rates[role] / orig_rates_s[role])
                 service_modes[mode] = (role, m_rate)
+            hbm_cap_s = orig_rates_s.get("hbm", 0.0)
             if "mte2_aiv_dram" not in service_modes and overlay and overlay.hbm_read_bytes_per_s is not None:
-                service_modes["mte2_aiv_dram"] = ("mte2_aiv", overlay.hbm_read_bytes_per_s)
+                hbm_r = overlay.hbm_read_bytes_per_s
+                service_modes["mte2_aiv_dram"] = (
+                    "mte2_aiv", min(hbm_r, hbm_cap_s) if hbm_cap_s > 0.0 else hbm_r,
+                )
             if overlay and overlay.hbm_write_bytes_per_s is not None:
-                service_modes["hbm_write_dram"] = ("hbm", overlay.hbm_write_bytes_per_s)
+                hbm_w = overlay.hbm_write_bytes_per_s
+                service_modes["hbm_write_dram"] = (
+                    "hbm", min(hbm_w, hbm_cap_s) if hbm_cap_s > 0.0 else hbm_w,
+                )
             if overlay and overlay.hbm_rw11_bytes_per_s is not None:
-                service_modes["hbm_rw11_dram"] = ("hbm", overlay.hbm_rw11_bytes_per_s)
+                hbm_rw11 = overlay.hbm_rw11_bytes_per_s
+                service_modes["hbm_rw11_dram"] = (
+                    "hbm", min(hbm_rw11, hbm_cap_s) if hbm_cap_s > 0.0 else hbm_rw11,
+                )
             if overlay and overlay.hbm_rw21_bytes_per_s is not None:
-                service_modes["hbm_rw21_dram"] = ("hbm", overlay.hbm_rw21_bytes_per_s)
+                hbm_rw21 = overlay.hbm_rw21_bytes_per_s
+                service_modes["hbm_rw21_dram"] = (
+                    "hbm", min(hbm_rw21, hbm_cap_s) if hbm_cap_s > 0.0 else hbm_rw21,
+                )
             l2_pipe = "mte2_aiv" if "mte2_aiv" in names else ("mte2" if "mte2" in names else None)
             if l2_pipe is not None and overlay and overlay.l2_die_bytes_per_s is not None:
                 service_modes["l2_die_bw"] = (l2_pipe, overlay.l2_die_bytes_per_s)

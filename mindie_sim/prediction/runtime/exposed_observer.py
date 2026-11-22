@@ -28,7 +28,7 @@ from typing import Any, Mapping, Sequence
 
 from mindie_sim.schema.common import ModelingError
 from ..efficiency.exposed_breakdown import (
-    ExposedClocks, advance_clocks, control_clocks, cube_clocks,
+    ExposedClocks, advance_clocks, cube_clocks,
     finish_breakdown, join_clocks, memory_clocks, roofline_clocks,
     unavailable_breakdown, vector_clocks, communication_clocks,
 )
@@ -113,7 +113,7 @@ def _clock_for_declaration(declaration: Any) -> tuple[ExposedClocks, float, floa
     elif role == ROLE_COMMUNICATION:
         clocks = communication_clocks(declaration.communication_ms)
     else:
-        clocks = control_clocks(declaration.control_ms)
+        clocks = vector_clocks(declaration.vector_ms)
     clocks, control, opaque = bind_interval(
         interval=IntervalClocks(clocks), control_ms=control,
         opaque_control_ms=opaque)

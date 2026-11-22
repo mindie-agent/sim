@@ -60,8 +60,6 @@ def expand_call(op, kernels):
     return (*expanded, join)
 
 
-from dataclasses import replace
-
 from mindie_sim.catalog.ops import gemm_op, vector_op
 from mindie_sim.catalog.types import norm_role
 from mindie_sim.schema.common import dtype_bytes
@@ -133,13 +131,14 @@ class Residual:
 
     def after(self, context, output, saved):
         c = context
+        act_bytes = dtype_bytes(c["model"].activation_dtype)
         op = vector_op(
             op_id=c["prefix"] + ".residual", deps=(output, saved), stage=c["stage"],
             layer=c["plan"].index, requests=c["requests"], elements=c["tokens"] * c["model"].hidden_size,
             ops_per_element=1, dtype=c["model"].activation_dtype,
             family="elementwise", phase=c["mode"], recipe="residual_add",
-            read_bytes_override=c["tokens"] * c["model"].hidden_size * 4,
-            write_bytes_override=c["tokens"] * c["model"].hidden_size * 2,
+            read_bytes_override=c["tokens"] * c["model"].hidden_size * 2 * act_bytes,
+            write_bytes_override=c["tokens"] * c["model"].hidden_size * act_bytes,
         )
         return [op], op.op_id
 
@@ -151,12 +150,13 @@ class HyperConnection:
         h, hc, tokens = model.hidden_size, plan.hc_mult, c["tokens"]
         mixed = (2 + hc) * hc
         common = dict(stage=c["stage"], layer=plan.index, requests=c["requests"], phase=c["mode"])
+        act_bytes = dtype_bytes(model.activation_dtype)
         values = vector_op(
             op_id=c["prefix"] + ".hc_values_fp32", deps=(ready,),
             elements=tokens * hc * h, ops_per_element=1, dtype="fp32",
             family="cast", recipe="hc_values_fp32", shape=(tokens, hc * h),
-            read_bytes_override=tokens * hc * h * dtype_bytes(model.activation_dtype),
-            write_bytes_override=tokens * hc * h * 4, **common,
+            read_bytes_override=tokens * hc * h * act_bytes,
+            write_bytes_override=tokens * hc * h * _FP32_BYTES, **common,
         )
         project = gemm_op(
             op_id=c["prefix"] + ".hc_project", deps=(values.op_id,), m=tokens, n=mixed, k=hc * h,
@@ -168,27 +168,27 @@ class HyperConnection:
             elements=tokens * hc * h, ops_per_element=2, dtype="fp32",
             vector_ops_override=tokens * (2 * hc * h + _HC_INVERSE_RMS_FINALIZE_OPS),
             family="mhc", recipe="hc_inverse_rms", shape=(tokens,),
-            read_bytes_override=tokens * hc * h * 4,
-            write_bytes_override=tokens * 4, **common,
+            read_bytes_override=tokens * hc * h * _FP32_BYTES,
+            write_bytes_override=tokens * _FP32_BYTES, **common,
         )
         affine = vector_op(
             op_id=c["prefix"] + ".hc_affine", deps=(project.op_id, inverse_rms.op_id),
             elements=tokens * mixed, ops_per_element=_HC_AFFINE_OPS_PER_ELEMENT, dtype="fp32", family="mhc",
             recipe="hc_normalize_scale_bias_gate", shape=(tokens, mixed),
-            read_bytes_override=(tokens * (mixed + 1) + mixed + _HC_AFFINE_SCALAR_PARAMETERS) * 4,
-            write_bytes_override=tokens * mixed * 4, **common,
+            read_bytes_override=(tokens * (mixed + 1) + mixed + _HC_AFFINE_SCALAR_PARAMETERS) * _FP32_BYTES,
+            write_bytes_override=tokens * mixed * _FP32_BYTES, **common,
         )
         sinkhorn = vector_op(
             op_id=c["prefix"] + ".hc_sinkhorn", deps=(affine.op_id,), elements=tokens * mixed,
             ops_per_element=4 * plan.hc_sinkhorn_iters, dtype="fp32", family="mhc",
             recipe="hc_sinkhorn", returns=("post", "comb"),
-            read_bytes_override=tokens * mixed * 4, **common,
+            read_bytes_override=tokens * mixed * _FP32_BYTES, **common,
         )
         mix = vector_op(
             op_id=c["prefix"] + ".hc_mix", deps=(ready, sinkhorn.op_id), elements=tokens * h,
             ops_per_element=2 * hc, dtype=model.activation_dtype, family="mhc",
-            recipe="hc_pre_mix", read_bytes_override=tokens * hc * (h * 2 + _FP32_BYTES),
-            write_bytes_override=tokens * h * 2, **common,
+            recipe="hc_pre_mix", read_bytes_override=tokens * hc * (h * act_bytes + _FP32_BYTES),
+            write_bytes_override=tokens * h * act_bytes, **common,
         )
         ops = [values, project, inverse_rms, affine, sinkhorn, mix]
         declare_group(
@@ -209,13 +209,14 @@ class HyperConnection:
     def after(self, context, output, saved):
         c = context
         h, hc, tokens = c["model"].hidden_size, c["plan"].hc_mult, c["tokens"]
+        act_bytes = dtype_bytes(c["model"].activation_dtype)
         op = vector_op(
             op_id=c["prefix"] + ".hc_post", deps=(output, *saved), stage=c["stage"],
             layer=c["plan"].index, requests=c["requests"], elements=tokens * hc * h,
             ops_per_element=2 * hc + 1, dtype=c["model"].activation_dtype,
             family="mhc", phase=c["mode"], recipe="hc_post_mix",
-            read_bytes_override=tokens * (h * 2 + hc * h * 2 + hc * 4 + hc * hc * 4),
-            write_bytes_override=tokens * hc * h * 2,
+            read_bytes_override=tokens * (h * act_bytes + hc * h * act_bytes + hc * _FP32_BYTES + hc * hc * _FP32_BYTES),
+            write_bytes_override=tokens * hc * h * act_bytes,
         )
         ops = [op]
         declare_group(
@@ -369,12 +370,20 @@ class AttentionResidual(Residual):
         common = dict(stage=c["stage"], layer=c["plan"].index,
                       requests=c["requests"], phase=c["mode"])
         elements = tokens * len(sources) * model.hidden_size
+        act_bytes = dtype_bytes(model.activation_dtype)
+        concat = vector_op(
+            op_id=c["prefix"] + ".residual_concat", deps=sources,
+            elements=elements, ops_per_element=1, dtype=model.activation_dtype,
+            family="tensor_copy", recipe="attention_residual_concat",
+            shape=(tokens, len(sources), model.hidden_size),
+            read_bytes_override=elements * act_bytes,
+            write_bytes_override=elements * act_bytes, **common)
         values = vector_op(
-            op_id=c["prefix"] + ".residual_values_fp32", deps=sources,
+            op_id=c["prefix"] + ".residual_values_fp32", deps=(concat.op_id,),
             elements=elements, ops_per_element=1, dtype="fp32", family="cast",
             recipe="residual_values_fp32", shape=(tokens, len(sources), model.hidden_size),
-            read_bytes_override=elements * dtype_bytes(model.activation_dtype),
-            write_bytes_override=elements * 4, **common)
+            read_bytes_override=elements * act_bytes,
+            write_bytes_override=elements * _FP32_BYTES, **common)
         normalized = norm(
             name=c["prefix"] + ".residual_norm", deps=(values.op_id,), stage=c["stage"],
             layer=c["plan"].index, requests=c["requests"], tokens=tokens * len(sources),
@@ -395,20 +404,20 @@ class AttentionResidual(Residual):
             elements=tokens * model.hidden_size * len(sources), ops_per_element=2,
             dtype="fp32", family="elementwise", phase=c["mode"],
             recipe="attention_residual_mix",
-            read_bytes_override=tokens * len(sources) * (model.hidden_size + 1) * 4,
-            write_bytes_override=tokens * model.hidden_size * 4)
+            read_bytes_override=tokens * len(sources) * (model.hidden_size + 1) * _FP32_BYTES,
+            write_bytes_override=tokens * model.hidden_size * _FP32_BYTES)
         cast = vector_op(
             op_id=c["prefix"] + ".residual_output_cast", deps=(mix.op_id,),
             elements=tokens * model.hidden_size, ops_per_element=1,
             dtype=model.activation_dtype, family="cast", recipe="attention_residual_output_cast",
-            read_bytes_override=tokens * model.hidden_size * 4,
-            write_bytes_override=tokens * model.hidden_size * dtype_bytes(model.activation_dtype),
+            read_bytes_override=tokens * model.hidden_size * _FP32_BYTES,
+            write_bytes_override=tokens * model.hidden_size * act_bytes,
             **common)
-        ops = [values, normalized, scores, probabilities, mix, cast]
+        ops = [concat, values, normalized, scores, probabilities, mix, cast]
         declare_group(
             ops, key=c["prefix"] + ".attention_residual_group",
             role="attn_res_prefix_point", family="attn_res_prefix",
-            members=tuple(op.op_id for op in ops), entries=(values.op_id,),
+            members=tuple(op.op_id for op in ops), entries=(concat.op_id,),
             anchor=cast.op_id, block=c.get("structure_block"), scope_role="residual",
             view={"tokens": tokens, "hidden": model.hidden_size, "sources": len(sources),
                   "dtype": model.activation_dtype, "compute_dtype": "fp32"},
@@ -511,12 +520,14 @@ def describe_included_components(case, *, scope: str = "body") -> dict[str, obje
     draft_layers = 0
     draft_kind: str | None = None
     if is_model_scope and proposals > 0 and aux is not None:
-        if getattr(aux, "dspark", None) is not None:
-            draft_layers = int(getattr(aux.dspark, "layers", 0) or 0)
-            draft_kind = "dspark"
-        elif getattr(aux, "mtp", None) is not None:
-            draft_layers = int(getattr(aux.mtp, "layers", 0) or 0)
-            draft_kind = "mtp"
+        draft_mode = str(meta.get("draft_mode") or "").strip().lower()
+        candidates = (draft_mode, "dspark", "mtp", "eagle3") if draft_mode else ("dspark", "mtp", "eagle3")
+        for candidate in dict.fromkeys(candidates):
+            spec = getattr(aux, candidate, None)
+            if spec is not None:
+                draft_layers = int(getattr(spec, "layers", 0) or 0)
+                draft_kind = candidate
+                break
     return {
         "scope": str(scope),
         "target_layers": int(parsed.model.layers),

@@ -685,6 +685,15 @@ class NativeBackend:
                     engine._latency_active.add(seq)
                 if len(tasks) > engine.peak_tasks:
                     engine.peak_tasks = len(tasks)
+                obs1 = task.start_observer
+                if obs1 is not None:
+                    task.start_observer = None
+                    obs1.started = obs1.time = moment
+                    engine._promises.pop(obs1.sequence, None)
+                    engine._wake(obs1)
+                    for callback in obs1._callbacks or ():
+                        callback(obs1)
+                    obs1._callbacks = None
                 for observer in engine._start_waiters.pop(seq, ()):
                     observer.started = observer.time = moment
                     engine._promises.pop(observer.sequence, None)

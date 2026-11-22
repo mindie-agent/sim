@@ -12,6 +12,7 @@ from dataclasses import replace
 import math
 
 from mindie_sim.catalog.draft import optional_draft_spec, draft_quant
+from mindie_sim.catalog import draft_spec as _draft_spec_mod
 from mindie_sim.catalog.ops import gemm_op, vector_op, comm_op
 from mindie_sim.schema.common import ModelingError, dtype_bytes
 from mindie_sim.schema.model import LayerPlan
@@ -67,19 +68,100 @@ from mindie_sim.catalog.draft_geometry import (  # noqa: F401
 )
 
 
-def _independent_draft_runtime(runtime, selections=()):
+def _draft_enforce_eager(runtime) -> bool:
+    meta = dict(getattr(runtime, "metadata", ()) or ())
+    if bool(meta.get("draft_enforce_eager", False)):
+        return True
+    spec_cfg = meta.get("speculative_config")
+    return isinstance(spec_cfg, dict) and bool(spec_cfg.get("enforce_eager", False))
+
+
+def _target_prolog_has_custom_cache_layout(binding) -> bool:
+    if not isinstance(binding, dict):
+        return False
+    opts = binding.get("options")
+    return isinstance(opts, dict) and bool(opts.get("cache_layout"))
+
+
+def _effective_draft_context_cap(draft, runtime) -> int:
+    """Resolve explicit draft context cap from DraftSpec or runtime metadata."""
+    helper = getattr(_draft_spec_mod, "effective_draft_context_cap", None)
+    if callable(helper):
+        return int(helper(draft, runtime))
+    caps: list[int] = []
+    spec_cap = int(getattr(draft, "max_position_embeddings", 0) or 0)
+    if spec_cap > 0:
+        caps.append(spec_cap)
+    meta = dict(getattr(runtime, "metadata", ()) or ())
+    spec_cfg = meta.get("speculative_config")
+    for raw in (
+        meta.get("draft_max_model_len"),
+        spec_cfg.get("max_model_len") if isinstance(spec_cfg, dict) else None,
+    ):
+        val = int(raw or 0)
+        if val > 0:
+            caps.append(val)
+    return min(caps) if caps else 0
+
+
+def _draft_mla_prolog_eligible(draft_model, runtime) -> bool:
+    """True iff every draft MLA layer satisfies vllm_ascend_mla_prolog_v3 validation."""
+    if draft_model is None:
+        return True
+    from mindie_sim.prediction.operators.mla_prolog import family_mla_prolog
+    mla_plans = [p for p in getattr(draft_model, "layer_plans", ()) if p.attention == "mla"]
+    if not mla_plans:
+        return False
+    for plan in mla_plans:
+        try:
+            family_mla_prolog.validate(
+                plan=plan,
+                parallel=runtime.parallel,
+                model=draft_model,
+                quant=draft_model.quant,
+                lowering_passes=runtime.lowering_passes,
+            )
+        except ModelingError:
+            return False
+    return True
+
+
+def _independent_draft_runtime(runtime, selections=(), *, draft_model=None):
     """Use the independent draft's declared writer for its body prolog."""
     kernels = dict(getattr(runtime, "kernels", {}) or ())
     lowerings = dict(kernels.get("lowerings", {}) or ())
-    if "mla_prolog" not in lowerings:
+    eager_draft = _draft_enforce_eager(runtime)
+    if eager_draft:
+        lowerings.pop(PROLOG_ROLE, None)
+        lowerings.pop("native_fusion", None)
+        return replace(
+            runtime,
+            graph_capture_mode="none",
+            kernels={**kernels, "lowerings": lowerings},
+        )
+    if PROLOG_ROLE not in lowerings:
         return runtime
     draft_binding = any(
         choice["selector"] == PROLOG_ROLE
         and choice["implementation"] != "analytical"
         for choice in selections)
-    if not draft_binding:
+    prolog_decl = lowerings.get(PROLOG_ROLE)
+    # When target's MLA prolog binding has no incompatible packed cache layout
+    # override, an independent MLA drafter may run its own BF16 MLAPO kernel
+    # iff its MLA layers satisfy MLAPO V3 structural validation.
+    compatible_plain_prolog = (
+        not draft_binding
+        and not _target_prolog_has_custom_cache_layout(prolog_decl)
+        and (isinstance(prolog_decl, str) or (
+            isinstance(prolog_decl, dict) and "cases" not in prolog_decl
+        ))
+        and _draft_mla_prolog_eligible(draft_model, runtime)
+    )
+    if not draft_binding and not compatible_plain_prolog:
         lowerings.pop(PROLOG_ROLE)
         return replace(runtime, kernels={**kernels, "lowerings": lowerings})
+    if compatible_plain_prolog:
+        lowerings[PROLOG_ROLE] = "vllm_ascend_mla_prolog_v3"
     fusion = lowerings.get("native_fusion")
     if isinstance(fusion, dict):
         # The target's fusion inventory can name grouped/hyper groups that a
@@ -240,15 +322,30 @@ def _append_draft_decode_head(ops, frontend, model, draft, step_model, draft_mod
     return previous
 
 
+def _proposal_view(view, *, prefill: bool, serial: bool, step: int, draft_cap: int):
+    q_len = view.q_len if prefill else (1 if serial else view.draft_proposal_tokens)
+    raw_ctx = view.context + (step if serial else 0)
+    eff_ctx = min(raw_ctx, max(0, draft_cap - q_len)) if draft_cap > 0 else raw_ctx
+    return replace(
+        view, q_len=q_len, samples=not prefill,
+        phase="prefill" if prefill else "decode",
+        context=eff_ctx, draft_verify=False, draft_proposal_tokens=0,
+    )
+
+
 def _draft_step_runtime(runtime, draft, proposal_views, global_proposals, rows, *,
-                        replay_scope, external_context):
+                        replay_scope, external_context, draft_model=None):
+    eff_scope = "none" if _draft_enforce_eager(runtime) else replay_scope
     selected_runtime, selections = resolve(
-        runtime, proposal_views, padded_tokens=rows, replay_scope=replay_scope,
+        runtime, proposal_views, padded_tokens=rows, replay_scope=eff_scope,
         global_views=global_proposals, model_scope="draft")
     from mindie_sim.prediction.frontend import mark_analytical_runtime
     selected_runtime = mark_analytical_runtime(selected_runtime, selections)
     if external_context and draft.attention_kind == "mla":
-        selected_runtime = _independent_draft_runtime(selected_runtime, selections)
+        selected_runtime = _independent_draft_runtime(
+            selected_runtime, selections, draft_model=draft_model)
+    elif _draft_enforce_eager(runtime):
+        selected_runtime = replace(selected_runtime, graph_capture_mode="none")
     if external_context and not draft.dcp_sharded and selected_runtime.parallel.cp > 1:
         selected_runtime = replace(
             selected_runtime,
@@ -353,26 +450,26 @@ def draft_program(frontend, model, runtime, views, ready, *, global_views=None, 
     # Feature projection shards its output; the draft body consumes a complete
     # hidden vector, so TP must gather before entering the first layer.
     tp = runtime.parallel.tp
+    draft_cap = _effective_draft_context_cap(draft, runtime)
+    eager_draft = _draft_enforce_eager(runtime)
     last_active = None
     for step in range(steps):
         selected = tuple(view for view in active if not serial or view.draft_proposal_tokens > step)
-
-        def proposal(view):
-            return replace(
-                view, q_len=view.q_len if prefill else 1 if serial else view.draft_proposal_tokens,
-                samples=not prefill, phase="prefill" if prefill else "decode",
-                context=view.context + (step if serial else 0),
-                draft_verify=False, draft_proposal_tokens=0,
-            )
-        proposal_views = tuple(proposal(view) for view in selected)
-        global_proposals = tuple(proposal(view) for view in all_active
-                                 if not serial or view.draft_proposal_tokens > step)
+        proposal_views = tuple(
+            _proposal_view(view, prefill=prefill, serial=serial, step=step, draft_cap=draft_cap)
+            for view in selected
+        )
+        global_proposals = tuple(
+            _proposal_view(view, prefill=prefill, serial=serial, step=step, draft_cap=draft_cap)
+            for view in all_active if not serial or view.draft_proposal_tokens > step
+        )
         rows = sum(view.q_len for view in proposal_views)
         feature_rows = (sum(view.q_len if prefill else view.draft_proposal_tokens + 1
                             for view in selected) if external_context else rows)
         selected_runtime, selections = _draft_step_runtime(
             runtime, draft, proposal_views, global_proposals, rows,
-            replay_scope=replay_scope, external_context=external_context)
+            replay_scope=replay_scope, external_context=external_context,
+            draft_model=draft_model)
         cyclic = bool(serial and draft.execution_mode == "cyclic_nextn"
                       and len(plans) > 1)
         step_model = (_cyclic_draft_model(draft_model, plans, step)
@@ -410,7 +507,7 @@ def draft_program(frontend, model, runtime, views, ready, *, global_views=None, 
                 views=proposal_views,
                 contexts=[view.context for view in proposal_views],
                 block=int(getattr(runtime, "kv_block_size", 1) or 1),
-                use_prolog_v3=context_prolog_v3)
+                use_prolog_v3=context_prolog_v3 and not eager_draft)
         body, previous = frontend.body(
             step_model, selected_runtime, proposal_views, prefix=prefix,
             ready=body_ready,
