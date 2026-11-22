@@ -583,3 +583,196 @@ def test_dsl_catalog_requires_real_pool_and_owner_capability(real_graph, matrix_
     assert not select_dsl_candidates((op,), path, 4, 0)
     tiny_ub = replace(path, buffers=tuple((pool, 1 if pool == "ub" else size) for pool, size in path.buffers))
     assert not select_dsl_candidates((op,), tiny_ub, 4, 8)
+
+
+def test_verify_plan_blocks_nonlinear_norm_across_sum_collective_and_cross_cube_swap():
+    from mindie_sim.prediction.spine import PredictionSpine
+    from mindie_sim.rewrite import RewritePlan
+    from mindie_sim.schema.common import ModelingError
+    from mindie_sim.schema.operators import OpSpec
+
+    def _op(op_id, family, shape, **kw):
+        return OpSpec(op_id=op_id, family=family, phase="decode", stage=0, layer=0, requests=(),
+                      semantic_shape=shape, local_shape=shape, padded_shape=shape, launch_shape=shape, **kw)
+
+    case = compose_case("qwen3-32b", REPRESENTATIVE_SKUS["a5"], tp=2, dp=1, layers=1)
+    ar = _op("s0.l0.allreduce", "allreduce", (16, 4096), dtype="bf16", link_bytes=131072.0,
+             metadata=(("group_axis", "tp"),))
+    norm = _op("s0.l0.rmsnorm", "rmsnorm", (16, 4096), deps=("s0.l0.allreduce",), dtype="bf16",
+               vector_ops=262144.0, mte2_bytes=131072.0, mte3_bytes=131072.0, hbm_bytes=262144.0)
+    mm1 = _op("s0.l0.mm1", "gemm", (16, 4096, 4096), deps=("s0.l0.rmsnorm",), dtype="bf16",
+              flops=float(2 * 16 * 4096 * 4096), matrix_flops=(("bf16", float(2 * 16 * 4096 * 4096)),),
+              mte2_bytes=33554432.0, mte3_bytes=131072.0, hbm_bytes=33685504.0)
+    mm2 = _op("s0.l0.mm2", "gemm", (16, 4096, 4096), deps=("s0.l0.mm1",), dtype="bf16",
+              flops=float(2 * 16 * 4096 * 4096), matrix_flops=(("bf16", float(2 * 16 * 4096 * 4096)),),
+              mte2_bytes=33554432.0, mte3_bytes=131072.0, hbm_bytes=33685504.0)
+
+    class _GuardSpine(PredictionSpine):
+        def lower(self, parsed, request, **kwargs):
+            prepared = super().lower(parsed, request, **kwargs)
+            ranks = tuple(replace(rank, ops=(ar, norm, mm1, mm2)) for rank in prepared.graph.executable)
+            return replace(prepared, graph=replace(prepared.graph, executable=ranks, streams=()))
+
+    scenario = resolve_scenario(case, StepRequest("decode", tokens=16, context=64), spine=_GuardSpine())
+    bad_comm_refs = (OpRef("atom", "s0.l0.allreduce"), OpRef("atom", "s0.l0.rmsnorm"))
+    bad_comm_plan = RewritePlan(
+        base_graph_sha256=scenario.base_graph_sha256,
+        framing_sha256=scenario.framing_sha256,
+        edits=(Edit("bad_ar_norm", operation=FuseRegion(
+            members=bad_comm_refs, preserve_ports=(),
+            kernel_boundaries=(KernelBoundary("IllegalArNorm", bad_comm_refs),),
+            fusion_tier="K2_epilogue",
+        )),),
+    )
+    receipt_comm = verify_plan(scenario, apply_plan(bad_comm_plan, scenario), scope="archetype")
+    assert not receipt_comm.passed
+    assert any(
+        g.reason == "NON_COMMUTATIVE_REWRITE" and "collective_sum_fusion" in g.detail
+        for g in receipt_comm.gates if not g.passed
+    )
+
+    # Swapping causal order across Cube boundaries fails both in apply_plan and verify_plan.
+    swap_refs = (OpRef("atom", "s0.l0.mm1"), OpRef("atom", "s0.l0.mm2"))
+    swap_plan = RewritePlan(
+        base_graph_sha256=scenario.base_graph_sha256,
+        framing_sha256=scenario.framing_sha256,
+        edits=(Edit("swap_cube", operation=FuseRegion(
+            members=swap_refs, preserve_ports=(),
+            kernel_boundaries=(
+                KernelBoundary("SecondFirst", (OpRef("atom", "s0.l0.mm2"),)),
+                KernelBoundary("FirstSecond", (OpRef("atom", "s0.l0.mm1"),)),
+            ),
+            fusion_tier="K2_epilogue",
+        )),),
+    )
+    with pytest.raises(ModelingError, match="rewrite_kernel_boundary_dependency_order"):
+        apply_plan(swap_plan, scenario)
+
+    base_applied = apply_plan(
+        RewritePlan(base_graph_sha256=scenario.base_graph_sha256, framing_sha256=scenario.framing_sha256),
+        scenario,
+    )
+    reordered_ranks = tuple(
+        replace(
+            rank,
+            ops=(
+                ar,
+                norm,
+                replace(mm2, deps=("s0.l0.rmsnorm",)),
+                replace(mm1, deps=("s0.l0.mm2",)),
+            ),
+        )
+        for rank in base_applied.executable
+    )
+    receipt_swap = verify_plan(scenario, replace(base_applied, executable=reordered_ranks), scope="archetype")
+    assert not receipt_swap.passed
+    assert any(
+        g.reason == "NON_COMMUTATIVE_REWRITE" and "non_commuting_reorder" in g.detail
+        for g in receipt_swap.gates if not g.passed
+    )
+
+
+def test_algebraic_rewrite_laws_enforce_port_quant_contracts_and_activation_predicates(real_graph):
+    from mindie_sim.rewrite import discover_algebraic_rewrites_for_ops
+    from mindie_sim.schema.operators import OpSpec
+
+    scenario, _ = real_graph
+    path = scenario.datapath
+
+    def _op(op_id, family, shape, **kw):
+        return OpSpec(op_id=op_id, family=family, phase="decode", stage=0, layer=0, requests=(),
+                      semantic_shape=shape, local_shape=shape, padded_shape=shape, launch_shape=shape, **kw)
+
+    # Law 2: matching PortRef + (a_dtype, group_size) fuses; mismatched quant/group_size rejects.
+    src = _op("s0.l0.norm", "rmsnorm", (16, 4096), dtype="bf16", vector_ops=65536.0, hbm_bytes=262144.0)
+    q_proj = _op(
+        "s0.l0.q_proj", "gemm", (16, 2048, 4096), deps=("s0.l0.norm",), dtype="bf16",
+        flops=float(2 * 16 * 2048 * 4096), hbm_bytes=16777216.0,
+        metadata=(
+            ("typed_inputs", ({"producer": "s0.l0.norm", "port": "out", "version": 0},)),
+            ("activation_format", "fp8_e4m3"), ("activation_group_size", 32),
+        ),
+    )
+    k_proj = replace(q_proj, op_id="s0.l0.k_proj", local_shape=(16, 1024, 4096),
+                     flops=float(2 * 16 * 1024 * 4096), hbm_bytes=8388608.0)
+    v_mismatch = replace(
+        q_proj, op_id="s0.l0.v_proj", local_shape=(16, 1024, 4096),
+        flops=float(2 * 16 * 1024 * 4096), hbm_bytes=8388608.0,
+        metadata=(
+            ("typed_inputs", ({"producer": "s0.l0.norm", "port": "out", "version": 0},)),
+            ("activation_format", "bf16"), ("activation_group_size", 128),
+        ),
+    )
+    law2 = discover_algebraic_rewrites_for_ops((src, q_proj, k_proj, v_mismatch), datapath=path)
+    block_cands = [c for c in law2.candidates if c.law == "law2_block_matmul"]
+    assert len(block_cands) == 1
+    assert block_cands[0].member_ids == ("s0.l0.q_proj", "s0.l0.k_proj")
+    assert any(reason == "quant_or_sharding_contract_mismatch" for _, reason in law2.rejected_pairs)
+
+    # Law 4 / ABI variant extension: MoE dispatch -> grouped_gemm -> situ -> quant -> grouped_gemm -> combine.
+    disp = _op("s0.l0.dispatch", "dispatch", (16, 2048), dtype="bf16", link_bytes=65536.0)
+    gmm1 = _op("s0.l0.gmm1", "grouped_gemm", (16, 4096, 2048), deps=("s0.l0.dispatch",), dtype="bf16",
+               flops=float(2 * 16 * 4096 * 2048), hbm_bytes=16777216.0)
+    situ = _op("s0.l0.act", "activation", (16, 2048), deps=("s0.l0.gmm1",), dtype="bf16",
+               vector_ops=float(16 * 2048 * 6), hbm_bytes=262144.0,
+               metadata=(("activation", "situ"), ("beta", 1.5)))
+    quant = _op("s0.l0.act_quant", "quantize", (16, 2048), deps=("s0.l0.act",), dtype="fp8",
+                vector_ops=float(16 * 2048 * 3), hbm_bytes=196608.0)
+    gmm2 = _op("s0.l0.gmm2", "grouped_gemm", (16, 2048, 2048), deps=("s0.l0.act_quant",), dtype="bf16",
+               flops=float(2 * 16 * 2048 * 2048), hbm_bytes=8388608.0)
+    comb = _op("s0.l0.combine", "combine", (16, 2048), deps=("s0.l0.gmm2",), dtype="bf16", link_bytes=65536.0)
+    moe_res = discover_algebraic_rewrites_for_ops((disp, gmm1, situ, quant, gmm2, comb), datapath=path)
+    assert any(t.kind == "ABI_UNSUPPORTED_VARIANT" and t.candidate_abi == "dispatch_ffn_combine_situ_ext"
+               for t in moe_res.semantic_audit_triggers)
+    assert any(c.abi_id == "dispatch_ffn_combine_situ_ext" and not c.shipping_supported for c in moe_res.candidates)
+
+
+def test_solve_target_graph_enforces_mode_separation_and_whitebox_l0_pricing():
+    from mindie_sim.optimization import TargetOpNode, solve_target_graph
+    from mindie_sim.prediction.results import OpOccurrence
+    from mindie_sim.prediction.structure import parse_case
+    from mindie_sim.schema.operators import OpSpec
+
+    case = parse_case(compose_case("qwen3-32b", REPRESENTATIVE_SKUS["a5"], tp=1, dp=1, layers=1))
+    shape = (16, 4096)
+    tensor_bytes = float(16 * 4096 * 2)
+    op1 = OpSpec(op_id="s0.l0.act", family="activation", phase="decode", stage=0, layer=0, requests=(),
+                 semantic_shape=shape, local_shape=shape, padded_shape=shape, launch_shape=shape,
+                 dtype="bf16", vector_ops=float(16 * 4096 * 6),
+                 mte2_bytes=tensor_bytes, mte3_bytes=tensor_bytes, hbm_bytes=2.0 * tensor_bytes,
+                 metadata=(("activation", "situ"), ("beta", 1.5)))
+    op2 = OpSpec(op_id="s0.l0.quant", family="quantize", phase="decode", stage=0, layer=0, requests=(),
+                 deps=("s0.l0.act",), semantic_shape=shape, local_shape=shape, padded_shape=shape, launch_shape=shape,
+                 dtype="fp8", vector_ops=float(16 * 4096 * 3),
+                 mte2_bytes=tensor_bytes, mte3_bytes=tensor_bytes * 0.5, hbm_bytes=1.5 * tensor_bytes)
+    occ1 = OpOccurrence(replica=0, stage=0, rank=0, op_id="s0.l0.act")
+    occ2 = OpOccurrence(replica=0, stage=0, rank=0, op_id="s0.l0.quant")
+    n1 = TargetOpNode(
+        0, occ1, "s0.l0.act", "arch0", 1, "activation", "situ", "main", 0, "AIV", shape, "bf16", (),
+        0.0, 40.0, 40.0, 40.0, False, "", 0.0, op1.vector_ops, tensor_bytes, tensor_bytes, 2.0 * tensor_bytes,
+        tensor_bytes, tensor_bytes, 0.0, 0.0, "memory_bound", "HBM", 1.0, 39.0, 40.0, 0.025,
+        ("act",), ("act",), "SiTU", "situ", "CANN", "", False, "", "act", spec=op1,
+    )
+    n2 = TargetOpNode(
+        1, occ2, "s0.l0.quant", "arch0", 1, "quantize", "dynamic_quant", "main", 0, "AIV", shape, "fp8", (occ1,),
+        40.0, 80.0, 40.0, 40.0, False, "", 0.0, op2.vector_ops, tensor_bytes, tensor_bytes * 0.5, 1.5 * tensor_bytes,
+        tensor_bytes, tensor_bytes * 0.5, 0.0, 0.0, "memory_bound", "HBM", 1.0, 39.0, 40.0, 0.025,
+        ("quant",), ("quant",), "Quant", "quant", "CANN", "", False, "", "quant", spec=op2,
+    )
+    die = case.machine.dies[0]
+    peaks = {0: {"hbm_peak_bytes_per_s": dict(die.rates)["hbm"]}}
+    dems = ((0, 500, 500, 500, 0), (0, 500, 500, 250, 0))
+
+    sim_res = solve_target_graph((n1, n2), dems, case, peaks, allow_unbound_formula=False)
+    assert sim_res.has_unbound_formula_ops is False
+    assert sim_res.binding_state == "bound_implementation"
+    assert len(sim_res.nodes) == 2
+
+    mod_res = solve_target_graph((n1, n2), dems, case, peaks, allow_unbound_formula=True)
+    assert mod_res.has_unbound_formula_ops is True
+    assert mod_res.binding_state == "unbound_formula_projection"
+    assert len(mod_res.nodes) == 1
+    fused = mod_res.nodes[0]
+    assert fused.dur_us < 80.0 and fused.dur_us >= fused.l_star_lean_us
+    assert mod_res.synthesis_specs[0].sram_verified is True
+    assert any("beta=1.5" in eq for eq in mod_res.synthesis_specs[0].symbolic_equations)

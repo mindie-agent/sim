@@ -586,3 +586,95 @@ def test_asymmetric_hbm_arbiter_and_catlass_base_byte_obligation():
     (cat_off,), _ = next(_catlass_proposals((g_off,), dp_off, dp_off.aic_count, dp_off.aiv_count))
     full_off = finalize_plan(d_off.handle, replace(d_off.unmerge_plan, edits=(Edit("c", operation=cat_off),)))
     assert full_off.verification.passed and full_off.verification.l_star_ns <= full_off.wall_ns
+
+
+def test_resident_fusion_elides_untiled_multi_mib_intermediate_when_fp32_tile_fits_ub():
+    from mindie_sim.prediction.spine import PredictionSpine
+    from mindie_sim.schema.operators import OpSpec
+
+    case = compose_case("qwen3-32b", REPRESENTATIVE_SKUS["a3"], tp=1, dp=1, layers=1)
+    # 201 * 7168 * 2 B = 2.75 MiB untiled tensor (>> 192 KiB UB), while 1-row FP32 tile fits UB.
+    rows, hidden = 201, 7168
+    shape = (rows, hidden)
+    tensor_bytes = float(rows * hidden * 2)
+    norm_op = OpSpec(
+        op_id="s0.l0.rmsnorm", family="rmsnorm", phase="decode", stage=0, layer=0,
+        requests=(), semantic_shape=shape, local_shape=shape, padded_shape=shape, launch_shape=shape,
+        dtype="bf16", vector_ops=float(rows * hidden * 4),
+        mte2_bytes=tensor_bytes, mte3_bytes=tensor_bytes, hbm_bytes=2.0 * tensor_bytes,
+    )
+    quant_op = OpSpec(
+        op_id="s0.l0.quant", family="quantize", phase="decode", stage=0, layer=0,
+        requests=(), semantic_shape=shape, local_shape=shape, padded_shape=shape, launch_shape=shape,
+        deps=("s0.l0.rmsnorm",), dtype="fp8",
+        vector_ops=float(rows * hidden * 3),
+        mte2_bytes=tensor_bytes, mte3_bytes=tensor_bytes * 0.5, hbm_bytes=1.5 * tensor_bytes,
+    )
+
+    class _ChainSpine(PredictionSpine):
+        def lower(self, parsed, request, **kwargs):
+            prepared = super().lower(parsed, request, **kwargs)
+            rank, = prepared.graph.executable
+            return replace(prepared, graph=replace(prepared.graph, executable=(replace(rank, ops=(norm_op, quant_op)),), streams=()))
+
+    scenario = resolve_scenario(case, StepRequest("decode", tokens=rows, context=64), spine=_ChainSpine())
+    assert tensor_bytes > dict(scenario.datapath.buffers)["ub"]
+    applied = apply_plan(_plan(scenario, Edit("fuse_nq", operation=_fuse("s0.l0.rmsnorm", "s0.l0.quant"))), scenario)
+    fused, = applied.executable[0].ops
+    meta = dict(fused.metadata)
+    assert meta["fusion_route"] == "resident"
+    assert meta["gm_round_trip_eliminated_bytes"] == pytest.approx(2.0 * tensor_bytes)
+    assert fused.hbm_bytes == pytest.approx(1.5 * tensor_bytes)
+    assert fused.mte2_bytes == pytest.approx(tensor_bytes)
+    assert fused.mte3_bytes == pytest.approx(0.5 * tensor_bytes)
+
+
+def test_resident_fusion_spills_when_fp32_upcast_row_exceeds_ub_after_simt_carveout():
+    from mindie_sim.prediction.spine import PredictionSpine
+    from mindie_sim.schema.operators import OpSpec
+
+    case = compose_case("qwen3-32b", REPRESENTATIVE_SKUS["a3"], tp=1, dp=1, layers=1)
+    # Row width 32768 * 4 B (FP32 upcast) * 2 buffers > 192 KiB - 16 KiB SIMT carveout -> must spill.
+    rows, hidden = 4, 32768
+    shape = (rows, hidden)
+    tensor_bytes = float(rows * hidden * 2)
+    norm_op = OpSpec(
+        op_id="s0.l0.big_norm", family="rmsnorm", phase="decode", stage=0, layer=0,
+        requests=(), semantic_shape=shape, local_shape=shape, padded_shape=shape, launch_shape=shape,
+        dtype="bf16", vector_ops=float(rows * hidden * 4),
+        mte2_bytes=tensor_bytes, mte3_bytes=tensor_bytes, hbm_bytes=2.0 * tensor_bytes,
+    )
+    quant_op = OpSpec(
+        op_id="s0.l0.big_quant", family="quantize", phase="decode", stage=0, layer=0,
+        requests=(), semantic_shape=shape, local_shape=shape, padded_shape=shape, launch_shape=shape,
+        deps=("s0.l0.big_norm",), dtype="fp8",
+        vector_ops=float(rows * hidden * 3),
+        mte2_bytes=tensor_bytes, mte3_bytes=tensor_bytes * 0.5, hbm_bytes=1.5 * tensor_bytes,
+    )
+
+    class _BigRowSpine(PredictionSpine):
+        def lower(self, parsed, request, **kwargs):
+            prepared = super().lower(parsed, request, **kwargs)
+            rank, = prepared.graph.executable
+            return replace(prepared, graph=replace(prepared.graph, executable=(replace(rank, ops=(norm_op, quant_op)),), streams=()))
+
+    scenario = resolve_scenario(case, StepRequest("decode", tokens=rows, context=64), spine=_BigRowSpine())
+    applied = apply_plan(_plan(scenario, Edit("fuse_big", operation=_fuse("s0.l0.big_norm", "s0.l0.big_quant"))), scenario)
+    fused, = applied.executable[0].ops
+    meta = dict(fused.metadata)
+    assert meta["fusion_route"] == "gm_spill"
+    assert meta["gm_round_trip_eliminated_bytes"] == 0.0
+    assert fused.hbm_bytes == pytest.approx(3.5 * tensor_bytes)
+
+
+def test_collective_transform_accepts_oneshot_mode_and_rejects_unknown_mode(routed):
+    dispatch = next(op for op in routed.atomic_ops[0].ops if op.family == "alltoall")
+    route = routed.case.machine.links[0].name
+    edit = Edit("oneshot_route", operation=CollectiveTransform(_atom(dispatch.op_id), "oneshot", route))
+    plan = _plan(routed, edit)
+    assert decode_rewrite_plan(encode_rewrite_plan(plan)) == plan
+    applied = apply_plan(plan, routed)
+    record, = applied.collective_rewrites
+    assert (record.target_op, record.mode, record.topology_route) == (dispatch.op_id, "oneshot", route)
+    with pytest.raises(ModelingError, match="rewrite_collective_mode_invalid:invented"):
+        CollectiveTransform(_atom(dispatch.op_id), "invented", route)  # type: ignore[arg-type]

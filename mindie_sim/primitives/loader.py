@@ -93,6 +93,8 @@ def _read_json(path: Path, kind: str) -> dict[str, Any]:
     try:
         with path.open("rb") as stream:
             encoded = stream.read(_MAX_DOCUMENT_BYTES + 1)
+    except TimeoutError:
+        raise
     except OSError as exc:
         raise ModelingError(f"primitive_{kind}_read_failed") from exc
     if len(encoded) > _MAX_DOCUMENT_BYTES:

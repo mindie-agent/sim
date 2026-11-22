@@ -31,6 +31,7 @@ from mindie_sim.prediction.streams import MAIN_STREAM, bind_stream_owners, propo
 from mindie_sim.prediction.execution.weight_prefetch import residency_peak
 from mindie_sim.schema.common import ModelingError
 
+from .algebra import AlgebraicTrait, classify_op_traits
 from .apply import (
     AppliedPlan, ResolvedScenario, SIMT_UB_CARVEOUT_BYTES, _check_stream, _convex, _die, _path, _solve_tiles, _successors, _topological,
 )
@@ -42,7 +43,9 @@ NS_PER_MS = 1_000_000
 SERVICE_CONSERVATION_REL_TOL = 1e-12
 SERVICE_CONSERVATION_ABS_TOL = 1e-6
 _CAPACITY_POOLS = frozenset({"ub", "l1", "l0a", "l0b", "l0c", "l2", "hbm"})
-_NON_MATRIX_IMPLEMENTATIONS = frozenset({"TiledPointwise", "RingCollective", "PairwiseCollective"})
+_NON_MATRIX_IMPLEMENTATIONS = frozenset({
+    "TiledPointwise", "RingCollective", "PairwiseCollective", "OneShotCollective",
+})
 _MATRIX_SERVICE_PREFIXES = ("matrix@", "cube@", "simt@")
 _TRANSFER_SERVICE = {"mte2": ("mte2@", "mte2_aic@", "mte2_aiv@"), "hbm": ("memory@",)}
 _TEMPLATE_SERVICE = {**_TRANSFER_SERVICE, "cube": _MATRIX_SERVICE_PREFIXES,
@@ -124,6 +127,136 @@ def compute_overlap_pct(intervals_x, intervals_y) -> float | None:
     return 100 * fsum(intersections) / denominator
 
 
+def _ancestor_masks(ops) -> tuple[dict[str, int], dict[str, int]]:
+    """Compute transitive ancestor bitmasks in O(V + E) topological order."""
+    by_id = {op.op_id: op for op in ops}
+    ordered = _topological(by_id)
+    bit = {op.op_id: 1 << idx for idx, op in enumerate(ordered)}
+    anc: dict[str, int] = {}
+    for op in ordered:
+        mask = 0
+        for dep in op.deps:
+            if dep in bit:
+                mask |= bit[dep] | anc.get(dep, 0)
+        anc[op.op_id] = mask
+    return bit, anc
+
+
+def _boundary_order_by_region(applied) -> dict[str, dict[str, int]]:
+    """Map each ``FuseRegion`` id to atom -> kernel_boundary index."""
+    handles = dict(applied.handles)
+    absorbed = dict(applied.absorbed_atoms)
+    order: dict[str, dict[str, int]] = {}
+    for edit in applied.plan.edits:
+        op = edit.operation
+        if not isinstance(op, FuseRegion):
+            continue
+        rid = f"rewrite:{edit.edit_id}"
+        pos: dict[str, int] = {}
+        for b_idx, boundary in enumerate(op.kernel_boundaries):
+            for ref in boundary.members:
+                if ref.kind == "atom":
+                    pos.setdefault(ref.id, b_idx)
+                    continue
+                for resolved_id in handles.get(ref.id, ()):
+                    for atom_id in absorbed.get(resolved_id, (resolved_id,)):
+                        pos.setdefault(atom_id, b_idx)
+        if pos:
+            order[rid] = pos
+    return order
+
+
+def _is_non_commuting_pair(tr_a, tr_b) -> bool:
+    red_or_nl_a = tr_a.trait in {AlgebraicTrait.ROW_REDUCTION, AlgebraicTrait.ATTENTION_CORE} or tr_a.is_nonlinear
+    red_or_nl_b = tr_b.trait in {AlgebraicTrait.ROW_REDUCTION, AlgebraicTrait.ATTENTION_CORE} or tr_b.is_nonlinear
+    if red_or_nl_a and red_or_nl_b:
+        return True
+    strict_red_a = tr_a.trait in {AlgebraicTrait.ROW_REDUCTION, AlgebraicTrait.ATTENTION_CORE} or tr_a.is_precision_sensitive
+    strict_red_b = tr_b.trait in {AlgebraicTrait.ROW_REDUCTION, AlgebraicTrait.ATTENTION_CORE} or tr_b.is_precision_sensitive
+    cube_a = tr_a.trait == AlgebraicTrait.BILINEAR_MATMUL
+    cube_b = tr_b.trait == AlgebraicTrait.BILINEAR_MATMUL
+    return (strict_red_a and cube_b) or (cube_a and strict_red_b) or (cube_a and cube_b)
+
+
+def _check_algebraic_commutativity(originals, current_ops, regions, applied) -> None:
+    """Reject illegal nonlinear-norm / collective-sum and cross-reduction rewrites."""
+    if not originals:
+        return
+    if not regions and len(originals) == len(current_ops) and all(
+        a.op_id == b.op_id and a.deps == b.deps for a, b in zip(originals, current_ops)
+    ):
+        return
+    by_id = {op.op_id: op for op in current_ops}
+    replacements = {
+        atom: region for region, atoms in regions.items()
+        if region in by_id for atom in atoms
+    }
+    traits = {op.op_id: classify_op_traits(op) for op in originals}
+    orig_bit, orig_anc = _ancestor_masks(originals)
+    curr_bit, curr_anc = _ancestor_masks(current_ops)
+    boundary_pos = _boundary_order_by_region(applied)
+
+    sum_collectives = [
+        op.op_id for op in originals
+        if traits[op.op_id].trait == AlgebraicTrait.ASSOCIATIVE_COLLECTIVE
+        and traits[op.op_id].collective_op == "SUM"
+    ]
+    nonlinear_or_red = [
+        op.op_id for op in originals
+        if traits[op.op_id].trait in {AlgebraicTrait.ROW_REDUCTION, AlgebraicTrait.ATTENTION_CORE}
+        or traits[op.op_id].is_nonlinear
+    ]
+
+    # Guard 1: Never fuse or push NONLINEAR_NORM / ROW_REDUCTION across ASSOCIATIVE_COLLECTIVE(SUM).
+    for c_id in sum_collectives:
+        rc = replacements.get(c_id, c_id)
+        for n_id in nonlinear_or_red:
+            if c_id == n_id:
+                continue
+            rn = replacements.get(n_id, n_id)
+            c_before_n = bool(orig_anc.get(n_id, 0) & orig_bit[c_id])
+            n_before_c = bool(orig_anc.get(c_id, 0) & orig_bit[n_id])
+            if c_before_n:
+                if rc == rn:
+                    raise ModelingError(f"NON_COMMUTATIVE_REWRITE:collective_sum_fusion:{c_id}:{n_id}")
+                if rc in curr_bit and rn in curr_bit and (curr_anc.get(rc, 0) & curr_bit[rn]):
+                    raise ModelingError(f"NON_COMMUTATIVE_REWRITE:collective_sum_reorder:{n_id}_before_{c_id}")
+            elif n_before_c:
+                if rc == rn and rc in boundary_pos:
+                    pos = boundary_pos[rc]
+                    if c_id in pos and n_id in pos and pos[c_id] < pos[n_id]:
+                        raise ModelingError(f"NON_COMMUTATIVE_REWRITE:collective_sum_reorder:{c_id}_before_{n_id}")
+                if rc in curr_bit and rn in curr_bit and (curr_anc.get(rn, 0) & curr_bit[rc]):
+                    raise ModelingError(f"NON_COMMUTATIVE_REWRITE:collective_sum_reorder:{c_id}_before_{n_id}")
+
+    # Guard 2: Never reverse causal order across non-commuting reductions or Cube boundaries.
+    guarded = [
+        op.op_id for op in originals
+        if traits[op.op_id].trait in {
+            AlgebraicTrait.ROW_REDUCTION,
+            AlgebraicTrait.ATTENTION_CORE,
+            AlgebraicTrait.BILINEAR_MATMUL,
+        }
+        or traits[op.op_id].is_nonlinear
+        or traits[op.op_id].is_precision_sensitive
+    ]
+    for a_id in guarded:
+        ra = replacements.get(a_id, a_id)
+        tr_a = traits[a_id]
+        for b_id in guarded:
+            if a_id == b_id or not (orig_anc.get(b_id, 0) & orig_bit[a_id]):
+                continue
+            if not _is_non_commuting_pair(tr_a, traits[b_id]):
+                continue
+            rb = replacements.get(b_id, b_id)
+            if ra != rb and ra in curr_bit and rb in curr_bit and (curr_anc.get(ra, 0) & curr_bit[rb]):
+                raise ModelingError(f"NON_COMMUTATIVE_REWRITE:non_commuting_reorder:{b_id}_before_{a_id}")
+            if ra == rb and ra in boundary_pos:
+                pos = boundary_pos[ra]
+                if a_id in pos and b_id in pos and pos[b_id] < pos[a_id]:
+                    raise ModelingError(f"NON_COMMUTATIVE_REWRITE:non_commuting_boundary_swap:{b_id}_before_{a_id}")
+
+
 def _structure(scenario, applied):
     sorter = TopologicalSorter()
     for source, target, credits in applied.credit_edges:
@@ -154,6 +287,7 @@ def _structure(scenario, applied):
                 raise ModelingError(f"NON_CONVEX_REGION:{region}")
             claimed.update(atoms)
             seen.add(region)
+        _check_algebraic_commutativity(originals, rank.ops, regions, applied)
         original_users = _successors(originals) if applied.in_place_aliases else {}
         replacements = {atom: region for region, atoms in regions.items()
                         if region in by_id for atom in atoms}

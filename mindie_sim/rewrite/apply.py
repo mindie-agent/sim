@@ -37,7 +37,7 @@ from mindie_sim.stack_registry import DEFAULT_STACK_NAME, LoweringRequest, RankO
 
 from ._oracle_prefetch import die_placements_for_case, primitive_table_digest_token
 from .schema import (
-    CollectiveTransform, Edit, FuseRegion, FusionTier, HoistOrDeduplicate, OpRef,
+    CollectiveTransform, FuseRegion, FusionTier, HoistOrDeduplicate, OpRef,
     PipelineTiles, PortRef, QuantizeContract, RewritePlan, SelectTemplate, StreamSchedule,
     TemplateTier, VariantRef, WeightPrefetch, _digest_default, _flat, _json_digest, _ordered_edits, _references,
     plan_sha256,
@@ -45,6 +45,16 @@ from .schema import (
 
 DEFAULT_STACK_ID = "cann93_va_main"
 SIMT_UB_CARVEOUT_BYTES = 16384
+_FP32_UPCAST_BYTES = 4
+_POINTWISE_TILE_ELEMS = 128
+_BLOCK_QUANT_TILE_ELEMS = 256
+_L1_TILE_K_ELEMS = 64
+_L0C_TILE_ELEMS = 128
+_GEMM_SHAPE_RANK = 3
+_ROW_REDUCTION_FAMILIES = frozenset({
+    "rmsnorm", "layernorm", "add_rmsnorm", "add_rmsnorm_quant", "rmsnorm_quant",
+    "softmax", "quantize", "attention_residual", "mhc", "l2norm",
+})
 _DBO_FAMILIES = frozenset({
     "grouped_moe", "grouped_gemm", "moe_gemm", "routed_moe",
     "mc2", "mc2_protocol", "moe", "alltoall", "dispatch", "combine",
@@ -286,41 +296,179 @@ def _ports(op):
                     version = port.get("version", port.get("state_version"))
                     result.add((name, 0 if version is None else int(version)))
     return result
+def _safe_elem_bytes(dtype_str: str) -> int:
+    try:
+        return max(1, int(round(float(dtype_bytes(str(dtype_str or "bf16").lower())))))
+    except ModelingError:
+        return 2
+
+
+def _tile_fits_resident_pool(
+    source: OpSpec, target: OpSpec, pool: str, path: DatapathCapabilitySpec,
+) -> bool:
+    """Verify per-tile SRAM fit via TileSolver (Ascend FP32 4B/elem UB upcast)."""
+    shape = tuple(source.local_shape or target.local_shape or ())
+    inner = max(1, int(shape[-1])) if shape else _POINTWISE_TILE_ELEMS
+    sfam, tfam = str(source.family or "").lower(), str(target.family or "").lower()
+    srec, trec = str(source.recipe or "").lower(), str(target.recipe or "").lower()
+    is_row = (
+        sfam in _ROW_REDUCTION_FAMILIES or tfam in _ROW_REDUCTION_FAMILIES
+        or any(tok in srec or tok in trec for tok in ("norm", "softmax", "quant"))
+    )
+    smeta = dict(source.metadata)
+    tmeta = dict(target.metadata)
+    group_sz = int(tmeta.get("quant_group_size") or tmeta.get("group_size") or 0)
+    is_block_quant = tfam == "quantize" and group_sz > 0 and group_sz < inner and sfam not in _ROW_REDUCTION_FAMILIES
+    if is_block_quant:
+        tile_elems = min(inner, max(group_sz, _BLOCK_QUANT_TILE_ELEMS))
+    elif is_row:
+        tile_elems = inner
+    else:
+        tile_elems = min(inner, _POINTWISE_TILE_ELEMS)
+
+    src_dtype = str(smeta.get("output_format") or smeta.get("activation_format") or source.dtype or "bf16")
+    dst_dtype = str(tmeta.get("output_format") or target.dtype or "bf16")
+    carveout = max(SIMT_UB_CARVEOUT_BYTES, int(path.simt_ub_carveout_bytes))
+    candidates: list[tile_solver.TileCandidate] = []
+    if pool == "ub":
+        in_b = tile_elems * _safe_elem_bytes(src_dtype)
+        out_b = tile_elems * _safe_elem_bytes(dst_dtype)
+        fp32_b = tile_elems * _FP32_UPCAST_BYTES
+        for depth in (2, 1):
+            buffers = (
+                tile_solver.LiveBufferSpec("tile_in", "ub", in_b, 0, 1, owner_kind="aiv", slots=depth),
+                tile_solver.LiveBufferSpec("tile_fp32_a", "ub", fp32_b, 0, 2, owner_kind="aiv", slots=1),
+                tile_solver.LiveBufferSpec("tile_fp32_b", "ub", fp32_b, 1, 2, owner_kind="aiv", slots=1),
+                tile_solver.LiveBufferSpec("tile_out", "ub", out_b, 1, 2, owner_kind="aiv", slots=depth),
+            )
+            candidates.append(tile_solver.TileCandidate(
+                "resident_1pass", tile_solver.TileShape(1, tile_elems, 1),
+                depth, (1, 1), 1, 1, buffers, uses_simt=True, owner_axis="aiv",
+            ))
+    elif pool == "l1":
+        tw = min(inner, _POINTWISE_TILE_ELEMS)
+        buf_b = tw * _L1_TILE_K_ELEMS * _safe_elem_bytes(src_dtype)
+        buffers = (
+            tile_solver.LiveBufferSpec("tile_a", "l1", buf_b, 0, 1, owner_kind="aic", slots=2),
+            tile_solver.LiveBufferSpec("tile_b", "l1", buf_b, 0, 1, owner_kind="aic", slots=2),
+        )
+        candidates.append(tile_solver.TileCandidate(
+            "resident_1pass", tile_solver.TileShape(tw, tw, _L1_TILE_K_ELEMS),
+            2, (1, 1), 1, 1, buffers, owner_axis="aic",
+        ))
+    else:
+        buf_b = _L0C_TILE_ELEMS * _L0C_TILE_ELEMS * _FP32_UPCAST_BYTES
+        buffers = (
+            tile_solver.LiveBufferSpec("tile_acc", "l0c", buf_b, 0, 1, owner_kind="aic", slots=1),
+        )
+        candidates.append(tile_solver.TileCandidate(
+            "resident_1pass", tile_solver.TileShape(_L0C_TILE_ELEMS, _L0C_TILE_ELEMS, _L1_TILE_K_ELEMS),
+            1, (1, 1), 1, 1, buffers, owner_axis="aic",
+        ))
+    hw = SimpleNamespace(datapath=path, buffers=dict(path.buffers), buffer_units={"l2": 1}, stream_owners=None)
+    for cand in candidates:
+        spec = TilePipelineSpec(str(source.family or "fused"), (cand,), simt_ub_carveout_bytes=carveout)
+        try:
+            tile_solver.solve(spec, source, hw)
+            return True
+        except (tile_solver.TileInfeasibleError, ModelingError):
+            continue
+    return False
+
+
+def _sibling_activation_dedup_bytes(members, kernel_for) -> float:
+    """Compute duplicate input activation HBM read bytes eliminated by Law-2 sibling GEMM fusion."""
+    member_ids = {op.op_id for op in members}
+    groups: dict[tuple, list[OpSpec]] = {}
+    for op in members:
+        if not (op.flops > 0 and not op.link_bytes and len(op.local_shape) == _GEMM_SHAPE_RANK):
+            continue
+        if any(dep in member_ids for dep in op.deps) or not op.deps:
+            continue
+        meta = dict(op.metadata)
+        a_dt = str(meta.get("activation_format") or meta.get("dtype_a") or op.dtype or "bf16").lower()
+        key = (kernel_for[op.op_id], tuple(op.deps), int(op.local_shape[0]), int(op.local_shape[2]), a_dt)
+        groups.setdefault(key, []).append(op)
+    saved = 0.0
+    for (_, _, m_dim, k_dim, a_dt), siblings in groups.items():
+        if len(siblings) < 2 or m_dim <= 0 or k_dim <= 0:
+            continue
+        try:
+            elem_b = float(dtype_bytes(a_dt))
+        except ModelingError:
+            elem_b = 2.0
+        act_bytes = float(m_dim * k_dim) * elem_b
+        for sib in siblings[1:]:
+            avail = max(0.0, min(float(sib.mte2_bytes), float(sib.hbm_bytes)) - float(sib.mte3_bytes))
+            saved += min(act_bytes, avail)
+    return saved
+
+
 def _resident_savings(members, kernel_for, preserved, external_reads, path):
-    """Charge GM unless both operand ledgers and a resident handoff establish savings."""
+    """Elide on-chip intermediate HBM round-trips verified by datapath + TileSolver."""
     saved_read = saved_write = 0.0
     for source in members:
         if source.op_id in preserved or source.op_id in external_reads:
             continue
         sm = dict(source.metadata)
-        writes = sm.get("write_bytes")
-        if type(writes) not in {int, float} or not 0 < writes <= min(source.hbm_bytes, source.mte3_bytes):
+        raw_writes = sm.get("write_bytes")
+        explicit_w = type(raw_writes) in {int, float}
+        writes = float(raw_writes) if explicit_w else min(float(source.hbm_bytes), float(source.mte3_bytes))
+        if not 0.0 < writes <= min(float(source.hbm_bytes), float(source.mte3_bytes)):
             continue
-        consumers = [op for op in members if source.op_id in op.deps]
+        consumers = [
+            op for op in members
+            if source.op_id in op.deps or any(
+                isinstance(port, Mapping) and port.get("producer") == source.op_id
+                for port in dict(op.metadata).get("typed_inputs", ())
+            )
+        ]
         if len(consumers) != 1:
             continue
         target = consumers[0]
         if kernel_for[source.op_id] != kernel_for[target.op_id]:
             continue
         tm = dict(target.metadata)
-        capacity = dict(path.buffers)
+        s_owner, t_owner = sm.get("owner_id"), tm.get("owner_id")
+        owners_conflict = s_owner is not None and t_owner is not None and s_owner != t_owner
         if source.flops and not target.flops:
-            route = path.has_l0c_to_ub and writes <= capacity.get("ub", 0)
+            route = bool(path.has_l0c_to_ub) and _tile_fits_resident_pool(source, target, "ub", path)
         elif not source.flops and target.flops:
-            route = path.has_ub_to_l1 and writes <= capacity.get("l1", 0)
+            route = bool(path.has_ub_to_l1) and _tile_fits_resident_pool(source, target, "l1", path)
+        elif not source.flops and not target.flops:
+            route = (not owners_conflict) and _tile_fits_resident_pool(source, target, "ub", path)
         else:
-            pool = "l0c" if source.flops else "ub"
-            route = (sm.get("owner_id") is not None
-                     and sm.get("owner_id") == tm.get("owner_id")
-                     and writes <= capacity.get(pool, 0))
-        reads = tm.get("resident_input_bytes")
-        if reads is None:
+            route = (s_owner is not None and s_owner == t_owner
+                     and _tile_fits_resident_pool(source, target, "l0c", path))
+        raw_reads = tm.get("resident_input_bytes")
+        if raw_reads is None:
             matching = [p.get("read_bytes") for p in tm.get("typed_inputs", ())
                         if isinstance(p, Mapping) and p.get("producer") == source.op_id]
-            reads = matching[0] if len(matching) == 1 else None
-        if route and reads == writes and writes <= min(target.hbm_bytes, target.mte2_bytes):
-            saved_read += writes
-            saved_write += writes
+            raw_reads = matching[0] if len(matching) == 1 else None
+        explicit_r = type(raw_reads) in {int, float}
+        if explicit_w and explicit_r:
+            reads = float(raw_reads)
+            if reads != writes:
+                continue
+            handoff = writes
+        elif explicit_r:
+            handoff = min(writes, float(raw_reads))
+        else:
+            handoff = min(writes, float(target.hbm_bytes), float(target.mte2_bytes))
+        if route and 0.0 < handoff <= min(float(target.hbm_bytes), float(target.mte2_bytes)):
+            saved_read += handoff
+            saved_write += handoff
+    saved_read += _sibling_activation_dedup_bytes(members, kernel_for)
+    max_m2 = sum(float(op.mte2_bytes) for op in members)
+    max_m3 = sum(float(op.mte3_bytes) for op in members)
+    max_hbm = sum(float(op.hbm_bytes) for op in members)
+    saved_read = min(saved_read, max_m2)
+    saved_write = min(saved_write, max_m3)
+    if saved_read + saved_write > max_hbm:
+        excess = saved_read + saved_write - max_hbm
+        trim_r = min(saved_read, excess)
+        saved_read -= trim_r
+        saved_write = max(0.0, saved_write - (excess - trim_r))
     return saved_read, saved_write
 
 class _RankDraft:
@@ -508,8 +656,32 @@ class _RankDraft:
         typed_outputs = tuple({**source_ports.get(key, {}), "producer": fused_id,
                                "port": outputs[key], "output": outputs[key], "name": outputs[key], "version": key[-1]}
                               for key in sorted(typed_keys))
+        fused_shape = tail.local_shape
+        if (
+            len(ordered) >= 2
+            and all(op.flops > 0 and not op.link_bytes and len(op.local_shape) == _GEMM_SHAPE_RANK for op in ordered)
+            and all(not (set(op.deps) & keys) for op in ordered)
+            and len({(int(op.local_shape[0]), int(op.local_shape[2])) for op in ordered}) == 1
+        ):
+            fused_shape = (
+                int(ordered[0].local_shape[0]),
+                sum(int(op.local_shape[1]) for op in ordered),
+                int(ordered[0].local_shape[2]),
+            )
+        extra_meta: list[tuple[str, Any]] = [
+            ("fusion_tier", spec.fusion_tier),
+            ("kernel_abi", abi),
+            ("gm_round_trip_eliminated_bytes", read + write),
+            ("fusion_route", "resident" if read or write else "gm_spill"),
+        ]
+        for op in ordered:
+            axis = dict(op.metadata).get("group_axis")
+            if isinstance(axis, str) and axis:
+                extra_meta.append(("group_axis", axis))
+                break
         fused = replace(
             tail, op_id=fused_id, family="rewrite_fused", recipe=abi, source_boundary="",
+            local_shape=fused_shape,
             returns=tuple(dict.fromkeys((*tail.returns, *(ref.name for ref in spec.preserve_ports),
                                         *outputs.values()))),
             flops=sum(op.flops for op in ordered), matrix_flops=tuple(sorted(matrix.items())),
@@ -518,9 +690,7 @@ class _RankDraft:
             hbm_bytes=sum(op.hbm_bytes for op in ordered) - read - write,
             mte2_bytes=sum(op.mte2_bytes for op in ordered) - read,
             mte3_bytes=sum(op.mte3_bytes for op in ordered) - write,
-            metadata=(("fusion_tier", spec.fusion_tier), ("kernel_abi", abi),
-                      ("gm_round_trip_eliminated_bytes", read + write),
-                      ("fusion_route", "resident" if read or write else "gm_spill")),
+            metadata=tuple(extra_meta),
         )
         fused = apply_incoming_controls(fused, ordered, keys, boundary, self.ops)
         explicit = {port for op in ordered for port in input_port_entries(op.metadata)}

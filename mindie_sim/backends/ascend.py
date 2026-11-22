@@ -36,9 +36,14 @@ from .ascend_channels import (
 )
 from .instruction_presets import expand_instruction_presets
 
-# Named topology preset constants (preserving public preset contract):
+# Named topology preset constants (preserving public preset contract).
+# Utilization factors below are explicit nominal preset deratings applied ONLY
+# to uncalibrated nominal peaks when no effective/calibrated channel bandwidth
+# is supplied in ``profiles/ascend.json`` or L0 ``P18_hccl_collective_band``
+# (see ``_ASSUMPTIONS["transfer_bandwidth_precedence"]``).
 A2_STD_RANKS_PER_NODE = 8
 A2_ROCE_PEAK_GBPS = 25.0
+#: Nominal 200GbE RoCE wire-framing derating when uncalibrated (profiles/ascend.json).
 A2_ROCE_UTIL = 0.80
 A2_INTER_LATENCY_US = 10.0
 
@@ -49,9 +54,12 @@ A3_SUPERPOD_PACKAGES = 384
 A3_SUPERPOD_RANKS = A3_SUPERPOD_PACKAGES * A3_DIES_PER_PACKAGE
 A3_INTRA_PEAK_GBPS = 196.0
 A3_INTRA_BI_PEAK_GBPS = 2 * A3_INTRA_PEAK_GBPS
+#: Nominal A3 intra-node HCCS protocol framing derating when uncalibrated.
 A3_INTRA_UTIL = 0.80
+#: Nominal A3 multi-tier SuperPod UB/HCCS fabric derating when uncalibrated.
 A3_SUPERPOD_UTIL = 0.70
 A3_ROCE_PEAK_GBPS = 25.0
+#: Nominal A3 inter-node RoCE wire-framing derating when uncalibrated.
 A3_ROCE_UTIL = 0.80
 A3_INTRA_LATENCY_US = 1.5
 A3_INTER_NODE_LATENCY_US = 5.0
@@ -61,16 +69,20 @@ A3_INTER_POD_LATENCY_US = 10.0
 A5_POD_RANKS_PER_NODE = 64
 A5_POD_SUPERPOD_RANKS = 8192
 A5_POD_INTRA_BW_GBPS = 800.0
+#: Nominal A5 Pod intra-domain UB-Direct framing derating when uncalibrated.
 A5_POD_INTRA_UTIL = 0.85
 A5_POD_INTER_POD_BW_GBPS = 100.0
+#: Nominal A5 inter-pod fabric derating when uncalibrated.
 A5_POD_INTER_UTIL = 0.80
 A5_POD_INTER_LATENCY_US = 4.5
 
 A5_SERVER_RANKS_PER_NODE = 8
 A5_SERVER_SUBGROUP_BW_GBPS = 560.0
 A5_SERVER_NODE_BW_GBPS = 640.0
+#: Nominal A5 Server intra-node UB-Direct framing derating when uncalibrated.
 A5_SERVER_INTRA_UTIL = 0.85
 A5_SERVER_INTER_BW_GBPS = 200.0
+#: Nominal A5 Server inter-node RoCE/UB derating when uncalibrated.
 A5_SERVER_INTER_UTIL = 0.80
 
 A5_PCIE_RANKS_PER_NODE = 16

@@ -12,13 +12,16 @@ from .nvidia import materialize as nvidia, normalize_nvidia_machine
 from .nvidia import profiles as nvidia_profiles
 
 ADAPTERS = {"ascend": normalize_ascend_machine, "nvidia": normalize_nvidia_machine}
+_PRESET_CACHE_MAXSIZE = 64
 
 
-@lru_cache(maxsize=64)
+@lru_cache(maxsize=_PRESET_CACHE_MAXSIZE)
 def _registered_preset(sku: str, arch_family: str) -> str | None:
     for loader in (ascend_profiles, nvidia_profiles):
         try:
             profile = loader().get(sku)
+        except TimeoutError:
+            raise
         except (OSError, ValueError, KeyError):
             continue
         if not isinstance(profile, dict) or profile.get("architecture") != arch_family:

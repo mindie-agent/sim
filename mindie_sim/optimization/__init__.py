@@ -24,6 +24,15 @@ from .dual_bound import (
 from .framework_solver import (
     CandidateSearchStats, CoreLatticePoint, FrameworkSolveResult, generate_gcd_core_lattice, solve_framework,
 )
+from .kernel_synthesis import (
+    STATUS_AT_FLOOR, STATUS_EXTEND_ABI, STATUS_NEW_OP, STATUS_TUNE_PREFIX,
+    BindingState, FormulaKernelEvaluation, FormulaKernelSpec, FormulaTensorSpec,
+    FusedPipelineRecipe, KernelSynthesisSpec, MacroWallTrigger, SkuTargetFloors,
+    SolvedTargetGraph, TargetGraphResult, TargetOpNode,
+    attribute_node_overlap, evaluate_formula_kernel, evaluate_macro_wall_trigger,
+    extract_sku_floors, load_rewrite_plan, reschedule_node_timelines,
+    simulate_formula_kernel, solve_target_graph, synthesize_kernel_spec,
+)
 from .ladder import (
     FIVE_LEVEL_REPORT_SCHEMA, FiveLevelLadderMetrics, FiveLevelReport, FiveLevelWaterfall,
     LooMarginalImpact, OrderedTelescopeStep, RegionWallAttribution, partition_step_wall_ns,
@@ -47,6 +56,13 @@ __all__ = (
     "check_optimality_certificate", "eval_checked_path", "inward_floor_ns",
     "solve_checked_critical_path", "solve_farkas_dual", "verify_epoch_trace",
     "CandidateSearchStats", "CoreLatticePoint", "FrameworkSolveResult", "generate_gcd_core_lattice", "solve_framework",
+    "STATUS_AT_FLOOR", "STATUS_EXTEND_ABI", "STATUS_NEW_OP", "STATUS_TUNE_PREFIX",
+    "BindingState", "FormulaKernelEvaluation", "FormulaKernelSpec", "FormulaTensorSpec",
+    "FusedPipelineRecipe", "KernelSynthesisSpec", "MacroWallTrigger", "SkuTargetFloors",
+    "SolvedTargetGraph", "TargetGraphResult", "TargetOpNode",
+    "attribute_node_overlap", "evaluate_formula_kernel", "evaluate_macro_wall_trigger",
+    "extract_sku_floors", "load_rewrite_plan", "reschedule_node_timelines",
+    "simulate_formula_kernel", "solve_target_graph", "synthesize_kernel_spec",
     "FIVE_LEVEL_REPORT_SCHEMA", "FiveLevelLadderMetrics", "FiveLevelReport", "FiveLevelWaterfall",
     "LooMarginalImpact", "OrderedTelescopeStep", "RegionWallAttribution", "partition_step_wall_ns",
     "solve_five_level_ladder", "BITS_PER_BYTE", "MAX_EXPLICIT_STRIDED_ROWS", "SECTOR_BYTES",

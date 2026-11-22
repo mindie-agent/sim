@@ -21,6 +21,37 @@ from typing import Any, Literal
 
 from mindie_sim.catalog.ops import comm_op
 from mindie_sim.prediction.collectives.ring_pairwise import PairwiseCollective, RingCollective
+try:
+    from mindie_sim.prediction.collectives import OneShotCollective
+except ImportError:
+    @dataclass(frozen=True)
+    class OneShotCollective:  # type: ignore[no-redef]
+        """L0 link-alpha + wire-rate one-shot collective fallback recipe."""
+
+        path_model: str = "direct"
+
+        def lower(self, context):
+            link_work = {
+                name: float(val) for name, val in dict(context.work).items()
+                if float(val) > 0.0 and ("link" in str(name).split(":") or str(name).startswith("link"))
+            }
+            local_work = {
+                name: float(val) for name, val in dict(context.work).items()
+                if float(val) > 0.0 and name not in link_work
+                and not str(name).startswith(("host", "scheduler@"))
+            }
+            stages: list[Stage] = []
+            if context.setup_ms > 0.0:
+                stages.append(Stage("oneshot_alpha", latency=context.setup_ms))
+            prev = ("oneshot_alpha",) if stages else ()
+            if link_work:
+                stages.append(Stage("oneshot_transfer", link_work, after=prev, coupled=False))
+                prev = ("oneshot_transfer",)
+            if local_work:
+                stages.append(Stage("oneshot_reduce", local_work, after=prev))
+            if not stages:
+                return KernelProgram((), minimum_ms=context.minimum_ms)
+            return KernelProgram(tuple(stages), minimum_ms=context.minimum_ms)
 from mindie_sim.prediction.evaluation import ACTIVE_DEADLINE_MONO, EvaluationContext
 from mindie_sim.prediction.execution.split_barrier import DEFAULT_SPLIT_DTYPE_BYTES
 from mindie_sim.prediction.execution.runner import EAGER_MOE_DISPATCH_RECIPES
@@ -112,6 +143,7 @@ class ScenarioHandle:
     _certificate: dict = field(default_factory=dict, repr=False, compare=False)
     _hardware_cache: list = field(default_factory=list, repr=False, compare=False)
     _cache_lock: Lock = field(default_factory=Lock, repr=False, compare=False)
+    allow_unbound_formula: bool = False
 
     @property
     def _prefetch_hardware(self):
@@ -165,6 +197,9 @@ class CandidateEvaluation:
     coverage_ratio: float
     verification: VerificationReceipt | None
     reason: str = ""
+    has_unbound_formula_ops: bool = False
+    unbound_formula_ops: tuple[str, ...] = ()
+    binding_states: tuple[tuple[str, str], ...] = ()
 
     @property
     def accepted(self):
@@ -186,6 +221,9 @@ class FullPlanEvaluation:
     applied: AppliedPlan
     elapsed_ms: float
     region_summaries: tuple = ()
+    has_unbound_formula_ops: bool = False
+    unbound_formula_ops: tuple[str, ...] = ()
+    binding_states: tuple[tuple[str, str], ...] = ()
 class OracleCache:
     """Bounded LRU of complete scenario handles, including a graph-size limit."""
 
@@ -329,8 +367,16 @@ def _dossier(handle):
 def _coverage(handle):
     seed = handle._unmerge
     return len(seed.reference) / len(seed.layers) if seed.layers else 1.0
-def prepare_scenario(request: ScenarioRequest, *, budget: EvalBudget = EvalBudget(),
-                     cache=None, spine=None, primitives=None, primitive_table=None) -> ScenarioDossier:
+def prepare_scenario(
+    request: ScenarioRequest,
+    *,
+    budget: EvalBudget = EvalBudget(),
+    cache=None,
+    spine=None,
+    primitives=None,
+    primitive_table=None,
+    allow_unbound_formula: bool = False,
+) -> ScenarioDossier:
     deadline = _deadline(budget, request.replay)
     _check_budget(budget, deadline)
     case = Case.from_mapping(request.case)
@@ -340,7 +386,8 @@ def prepare_scenario(request: ScenarioRequest, *, budget: EvalBudget = EvalBudge
     replay_frame = asdict(replace(request.replay, deadline_mono=None))
     if cache is not None and spine is None:
         request_key = _json_digest((case.to_dict(), asdict(request.step), request.stack_id,
-                                    replay_frame, primitives, primitive_table_digest_token(prim_table)),
+                                    replay_frame, primitives, primitive_table_digest_token(prim_table),
+                                    bool(allow_unbound_formula)),
                                    default=_digest_default)
         if (hit := cache.get(request_key)) is not None:
             return _dossier(hit)
@@ -393,7 +440,8 @@ def prepare_scenario(request: ScenarioRequest, *, budget: EvalBudget = EvalBudge
     handle = ScenarioHandle(digest, scenario, u.archetypes, context, book, u.evaluation, m.evaluation,
                             u.total_ns, round(u.evaluation.span_ms * NS_PER_MS),
                             round(m.evaluation.span_ms * NS_PER_MS), u, m,
-                            replace(request.replay, deadline_mono=None))
+                            replace(request.replay, deadline_mono=None),
+                            allow_unbound_formula=bool(allow_unbound_formula))
     if cache is not None and spine is None:
         cache.put(handle, request_key=request_key)
     return _dossier(handle)
@@ -501,12 +549,71 @@ def _device_counts(ops, targets, book, case, include_submission):
         updated.append(op)
     return tuple(updated), book
 
-def _bind_replay(scenario, applied, book, handle):
+def _bind_collective_op(op, replica, binding, topology, registered):
+    recipes = {"ring": RingCollective, "pairwise": PairwiseCollective, "oneshot": OneShotCollective}
+    meta = dict(op.metadata)
+    groups = topology.groups(meta.get("group_axis", "tp"), replica,
+                             meta.get("source_stage", op.stage), metadata=meta)
+    pairs = ((a, b) for group in groups for a, b in (
+        zip(group, group[1:] + group[:1]) if binding.mode == "ring"
+        else ((a, b) for a in group for b in group)) if a != b)
+    if (binding.mode not in recipes or binding.topology_route not in topology.links
+            or any(not any(name == binding.topology_route for name, _, _ in topology.route(a, b))
+                   for a, b in pairs)):
+        raise ModelingError(f"rewrite_collective_route_recipe_unbound:{op.op_id}")
+    identifier = f"rewrite_collective:{op.op_id}:{binding.mode}:{binding.topology_route}"
+    registered[identifier] = recipes[binding.mode]()
+    return replace(op, recipe=identifier)
+
+
+def _bind_formula_fused_recipe(scenario, atomic_entry, op, applied):
+    """Build a white-box L0-pipe ``FusedPipelineRecipe`` from absorbed atomic ops."""
+    from mindie_sim.optimization.kernel_synthesis import (
+        FormulaKernelSpec,
+        FusedPipelineRecipe,
+        _solve_formula_sram,
+    )
+
+    by_id = {atom.op_id: atom for atom in atomic_entry.ops}
+    absorbed_ids = dict(applied.absorbed_atoms).get(op.op_id, ())
+    absorbed_ops = tuple(by_id[oid] for oid in absorbed_ids if oid in by_id) or (op,)
+    formula = FormulaKernelSpec.from_ops(absorbed_ops, name=op.recipe or op.op_id)
+    datapath = scenario.datapath
+    depth = 1
+    if datapath is not None:
+        _, _, _, _, _, _, _, _, _, solved_depth, _ = _solve_formula_sram(formula, datapath)
+        depth = max(1, int(solved_depth))
+    return FusedPipelineRecipe(
+        slots=depth,
+        row_reduction=formula.row_reduction,
+        abi_signature_id=formula.resolved_abi_signature(),
+        binding_state="unbound_formula_projection",
+    )
+
+
+def _resolve_fused_binding(scenario, atomic_entry, op, applied, book, catalog, handle, registered, *, allow_unbound_formula):
+    """Enforce 3-tier resolution: UserProfile > Extension/RecipeBook > FormulaKernelSpec."""
+    boundaries = next(
+        edit.operation.kernel_boundaries for edit in applied.plan.edits
+        if op.op_id == f"rewrite:{edit.edit_id}"
+    )
+    has_measured_store = isinstance(handle.evaluation_context.cost.primitives, PrimitiveStore)
+    if len(boundaries) == 1 and (catalog or op.recipe in book.recipes):
+        state = "bound_measured" if (has_measured_store and op.recipe in book.recipes) else "bound_implementation"
+        return op, state, False
+    if len(boundaries) != 1 or not allow_unbound_formula:
+        raise ModelingError(f"rewrite_fusion_recipe_unbound:{op.op_id}:{op.recipe}")
+    identifier = f"rewrite_formula:{atomic_entry.replica}:{op.op_id}:{op.recipe}"
+    registered[identifier] = _bind_formula_fused_recipe(scenario, atomic_entry, op, applied)
+    return replace(op, recipe=identifier), "unbound_formula_projection", True
+
+
+def _bind_replay(scenario, applied, book, handle, *, allow_unbound_formula: bool = False):
     """Bind the selected executable recipes and collect catalog audit summaries."""
     from mindie_sim.optimization.dsl_solver import catalog_recipe_id, replay_catalog_binding
     templates = {binding.target_op: binding for binding in applied.template_bindings}
     atomic = {entry.replica: entry for entry in scenario.atomic_ops}
-    summaries = []
+    summaries, unbound_ops, binding_states = [], [], []
     tiles = {binding.target_op: binding for binding in applied.tile_bindings}
     streams = {stream.rank: stream for stream in applied.streams}
     registered, graphs = {}, {}
@@ -530,25 +637,16 @@ def _bind_replay(scenario, applied, book, handle):
                 if template.template_id not in book.recipes:
                     raise ModelingError(f"rewrite_template_recipe_unbound:{op.op_id}:{template.template_id}")
                 op = replace(op, recipe=template.template_id)
-            if (binding := collective.get(op.op_id)) is not None:
-                recipes = {"ring": RingCollective, "pairwise": PairwiseCollective}
-                meta = dict(op.metadata)
-                groups = topology.groups(meta.get("group_axis", "tp"), entry.replica,
-                                         meta.get("source_stage", op.stage), metadata=meta)
-                pairs = ((a, b) for group in groups for a, b in (
-                    zip(group, group[1:] + group[:1]) if binding.mode == "ring"
-                    else ((a, b) for a in group for b in group)) if a != b)
-                if (binding.mode not in recipes or binding.topology_route not in topology.links
-                        or any(not any(name == binding.topology_route for name, _, _ in topology.route(a, b))
-                               for a, b in pairs)):
-                    raise ModelingError(f"rewrite_collective_route_recipe_unbound:{op.op_id}")
-                identifier = f"rewrite_collective:{op.op_id}:{binding.mode}:{binding.topology_route}"
-                registered[identifier] = recipes[binding.mode]()
-                op = replace(op, recipe=identifier)
-            if op.family == "rewrite_fused" and (len(next(
-                    edit.operation.kernel_boundaries for edit in applied.plan.edits
-                    if op.op_id == f"rewrite:{edit.edit_id}")) != 1 or op.recipe not in book.recipes and not catalog):
-                raise ModelingError(f"rewrite_fusion_recipe_unbound:{op.op_id}:{op.recipe}")
+            if (col_binding := collective.get(op.op_id)) is not None:
+                op = _bind_collective_op(op, entry.replica, col_binding, topology, registered)
+            if op.family == "rewrite_fused":
+                op, state, is_unbound = _resolve_fused_binding(
+                    scenario, atomic[entry.replica], op, applied, book, catalog, handle, registered,
+                    allow_unbound_formula=allow_unbound_formula,
+                )
+                binding_states.append((op.op_id, state))
+                if is_unbound:
+                    unbound_ops.append(op.op_id)
             binding = tiles.get(op.op_id)
             tile = binding.tile_spec if binding else None
             if binding is None:
@@ -581,7 +679,10 @@ def _bind_replay(scenario, applied, book, handle):
             graphs[replica], book = bind_prefetch_ops(scenario.atomic_step.case, replica, ops, book,
                                                       applied.prefetch_leases, handle._prefetch_hardware)
     bound_streams = bind_prefetch_streams(graphs, applied.streams, applied.prefetch_leases)
-    return graphs, book, tuple(summaries), bound_streams
+    return (
+        graphs, book, tuple(summaries), bound_streams,
+        tuple(dict.fromkeys(unbound_ops)), tuple(dict.fromkeys(binding_states)),
+    )
 def _cut_plans(graphs, streams):
     plans = []
     for plan in streams:
@@ -633,15 +734,17 @@ def _replay_cut(handle, seed, graph, book, streams, need_eval, trace, deadline):
         _memo_put(handle._layer_cache, key, (span, evaluation))
     return span, evaluation
 
-def _estimate(handle, seed, scenario, applied, budget, deadline):
+def _estimate(handle, seed, scenario, applied, budget, deadline, *, allow_unbound_formula: bool = False):
     baseline = seed.evaluation
     baseline_ns = round(baseline.span_ms * NS_PER_MS)
     # Quantization declarations are compatibility assertions against the
     # prepared representation. Their annotations leave the physical bound intact.
     if (all(receipt.status == "noop" for receipt in applied.edit_receipts)
             or all(isinstance(edit.operation, QuantizeContract) for edit in applied.plan.edits)):
-        return baseline_ns, seed.total_ns, baseline, baseline, None, ()
-    graphs, book, summaries, bound_streams = _bind_replay(scenario, applied, seed.book, handle)
+        return baseline_ns, seed.total_ns, baseline, baseline, None, (), (), ()
+    graphs, book, summaries, bound_streams, unbound_ops, binding_states = _bind_replay(
+        scenario, applied, seed.book, handle, allow_unbound_formula=allow_unbound_formula,
+    )
     layers = {replica: _layers(ops) for replica, ops in graphs.items()}
     domain = {op.layer for rank in scenario.atomic_ops for op in rank.ops}
     changed_streams = {plan.rank for plan in bound_streams if plan not in scenario.stream_plans}
@@ -655,7 +758,7 @@ def _estimate(handle, seed, scenario, applied, budget, deadline):
         # Screen the extra DMA service with the copies serialized and no overlap credit.
         copied = fsum(op.hbm_bytes for ops in graphs.values() for op in ops if op.family == "prefetch")
         extra_ns = round(copied / handle._prefetch_hardware.hbm_bytes_per_ms * NS_PER_MS)
-        return baseline_ns + extra_ns, seed.total_ns + extra_ns, baseline, baseline, None, summaries
+        return baseline_ns + extra_ns, seed.total_ns + extra_ns, baseline, baseline, None, summaries, unbound_ops, binding_states
     archetype_ns = seed.total_ns
     rows, comparisons = [], []
     overlap = any(len(plan.lanes) > 1 for plan in bound_streams) or any(
@@ -678,24 +781,32 @@ def _estimate(handle, seed, scenario, applied, budget, deadline):
             rows.append(row)
     return (max(0, baseline_ns + archetype_ns - seed.total_ns), archetype_ns,
             _combine_replays(rows) or baseline, _combine_replays(comparisons) or baseline,
-            (graphs, book, seed.book, handle.evaluation_context, deadline), summaries)
+            (graphs, book, seed.book, handle.evaluation_context, deadline), summaries,
+            unbound_ops, binding_states)
 
 def evaluate_rewrites(
-    scenario: ScenarioHandle, candidates: Sequence[RewritePlan], *, budget: EvalBudget = EvalBudget(),
+    scenario: ScenarioHandle,
+    candidates: Sequence[RewritePlan],
+    *,
+    budget: EvalBudget = EvalBudget(),
+    allow_unbound_formula: bool | None = None,
 ) -> BatchEvaluation:
     started = monotonic()
     deadline = _deadline(budget, scenario._replay)
     coverage = _coverage(scenario)
+    use_formula = scenario.allow_unbound_formula if allow_unbound_formula is None else bool(allow_unbound_formula)
     results = []
     for plan in islice(candidates, budget.max_candidates):
         digest = ""
+        cache_key = None
         try:
             digest = plan_sha256(plan)
+            cache_key = (digest, use_formula)
             _check_budget(budget, deadline)
             with scenario._cache_lock:
-                hit = scenario._candidates.get(digest)
+                hit = scenario._candidates.get(cache_key)
                 if hit is not None:
-                    scenario._candidates.move_to_end(digest)
+                    scenario._candidates.move_to_end(cache_key)
             if hit is not None:
                 _check_budget(budget, deadline)
                 results.append(hit)
@@ -703,36 +814,54 @@ def evaluate_rewrites(
             seed = _baseline(scenario, plan)
             resolved, work = _screen_scenario(seed, plan)
             applied = apply_plan(plan, resolved)
-            wall, archetype_wall, evidence, comparison, service_replay, summaries = _estimate(
-                scenario, seed, resolved, applied, budget, deadline)
+            wall, archetype_wall, evidence, comparison, service_replay, summaries, unbound_ops, b_states = _estimate(
+                scenario, seed, resolved, applied, budget, deadline, allow_unbound_formula=use_formula,
+            )
             verification = verify_plan(resolved, applied, step_eval=evidence, wall_ns=wall,
                 scope="archetype", baseline_eval=comparison, baseline_work=work, service_replay=service_replay,
                 region_summaries=summaries)
             _check_budget(budget, deadline)
             failure = next((gate.reason for gate in verification.gates if not gate.passed), "")
             coverage = len(seed.reference) / len(seed.layers) if seed.layers else 1.0
-            result = CandidateEvaluation(digest, "gate_failed" if failure else "ok", "archetype",
-                                         wall, archetype_wall, coverage, verification, failure)
+            result = CandidateEvaluation(
+                digest, "gate_failed" if failure else "ok", "archetype",
+                wall, archetype_wall, coverage, verification, failure,
+                has_unbound_formula_ops=bool(unbound_ops),
+                unbound_formula_ops=unbound_ops,
+                binding_states=b_states,
+            )
         except TimeoutError as error:
             result = CandidateEvaluation(digest, "cancelled", "archetype", None, None, coverage, None, str(error))
         except (ValueError, TypeError) as error:
             result = CandidateEvaluation(digest, "invalid", "archetype", None, None, coverage, None, str(error))
-        if digest and result.status != "cancelled":
+        if cache_key is not None and result.status != "cancelled":
             with scenario._cache_lock:
-                _memo_put(scenario._candidates, digest, result)
+                _memo_put(scenario._candidates, cache_key, result)
         results.append(result)
     return BatchEvaluation(scenario.scenario_digest, "archetype", tuple(results), (monotonic() - started) * 1000)
+
 def finalize_plan(
-    scenario: ScenarioHandle, plan: RewritePlan, *, budget: EvalBudget = EvalBudget(),
-    dual_certificate=None, dual_program=None, event_dag=None, primitive_table=None, rate_mode="engine_ceiling",
+    scenario: ScenarioHandle,
+    plan: RewritePlan,
+    *,
+    budget: EvalBudget = EvalBudget(),
+    dual_certificate=None,
+    dual_program=None,
+    event_dag=None,
+    primitive_table=None,
+    rate_mode="engine_ceiling",
+    allow_unbound_formula: bool | None = None,
 ) -> FullPlanEvaluation:
     started = monotonic()
     deadline = _deadline(budget, scenario._replay)
     _check_budget(budget, deadline)
+    use_formula = scenario.allow_unbound_formula if allow_unbound_formula is None else bool(allow_unbound_formula)
     seed = _baseline(scenario, plan)
     resolved, baseline = seed.scenario, seed.evaluation
     applied = apply_plan(plan, resolved)
-    graphs, book, summaries, bound_streams = _bind_replay(resolved, applied, seed.book, scenario)
+    graphs, book, summaries, bound_streams, unbound_ops, b_states = _bind_replay(
+        resolved, applied, seed.book, scenario, allow_unbound_formula=use_formula,
+    )
     overlap = any(len(stream.lanes) > 1 for stream in bound_streams) or any(
         tile.cohort_split == "dbo_2cohort" for tile in applied.tile_bindings)
     report = _report(resolved.atomic_step.case, graphs, scenario.evaluation_context, book, scenario._replay,
@@ -761,8 +890,13 @@ def finalize_plan(
                                baseline_m_ns=scenario.full_m_ns, baseline_eval=baseline,
                                baseline_work=seed.work, region_summaries=summaries, primitive_table=primitive_table, rate_mode=rate_mode,
                                service_replay=(graphs, book, seed.book, scenario.evaluation_context, deadline))
-    return FullPlanEvaluation(scenario.scenario_digest, applied.plan_sha256, "full", step, wall,
-                              verification, applied, (monotonic() - started) * 1000, summaries)
+    return FullPlanEvaluation(
+        scenario.scenario_digest, applied.plan_sha256, "full", step, wall,
+        verification, applied, (monotonic() - started) * 1000, summaries,
+        has_unbound_formula_ops=bool(unbound_ops),
+        unbound_formula_ops=unbound_ops,
+        binding_states=b_states,
+    )
 
 __all__ = [
     "ScenarioRequest", "EvalBudget", "StepArchetype", "ScenarioHandle", "ScenarioDossier",
