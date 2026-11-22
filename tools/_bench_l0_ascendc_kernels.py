@@ -42,6 +42,22 @@ extern "C" __global__ __cube__ void p12_flag_m_fix(GM_ADDR out, int iters) {
 extern "C" __global__ __cube__ void p06_pipe_m_barrier(GM_ADDR out, int iters) {
     for (int i = 0; i < iters; ++i) { AscendC::PipeBarrier<PIPE_M>(); }
 }
+#if defined(_MINDIE_ARCH35)
+extern "C" __global__ __cube__ void p14_mutex_pipe_m(GM_ADDR out, int iters) {
+    for (int i = 0; i < iters; ++i) {
+        AscendC::Mutex::Lock<PIPE_M>(0);
+        AscendC::Mutex::Unlock<PIPE_M>(0);
+    }
+}
+extern "C" __global__ __cube__ void p14_mutex_xpipe(GM_ADDR out, int iters) {
+    for (int i = 0; i < iters; ++i) {
+        AscendC::Mutex::Lock<PIPE_MTE1>(0);
+        AscendC::Mutex::Unlock<PIPE_MTE1>(0);
+        AscendC::Mutex::Lock<PIPE_M>(0);
+        AscendC::Mutex::Unlock<PIPE_M>(0);
+    }
+}
+#endif
 extern "C" __global__ __vector__ void p07_ub_alu_fp32(GM_ADDR in_gm, GM_ADDR out_gm, int iters) {
     constexpr int N = 8192;
     AscendC::TPipe pipe; AscendC::TBuf<AscendC::TPosition::VECCALC> b0, b1, b2;
@@ -116,6 +132,10 @@ int run_p07_alu(void* i, void* o, int it, void* st, int bd) { p07_ub_alu_fp32<<<
 int run_p08_exp(void* i, void* o, int it, void* st, int bd) { p08_ub_exp_fp32<<<bd, nullptr, st>>>((uint8_t*)i, (uint8_t*)o, it); return 0; }
 int run_p09_red(void* i, void* o, int it, void* st, int bd) { p09_ub_reduce_fp32<<<bd, nullptr, st>>>((uint8_t*)i, (uint8_t*)o, it); return 0; }
 int run_p09_cast(void* i, void* o, int it, void* st, int bd) { p09_ub_cast_f32_bf16<<<bd, nullptr, st>>>((uint8_t*)i, (uint8_t*)o, it); return 0; }
+#if defined(_MINDIE_ARCH35)
+int run_p14_mutex(void* o, int it, void* st, int bd) { p14_mutex_pipe_m<<<bd, nullptr, st>>>((uint8_t*)o, it); return 0; }
+int run_p14_mutex_xpipe(void* o, int it, void* st, int bd) { p14_mutex_xpipe<<<bd, nullptr, st>>>((uint8_t*)o, it); return 0; }
+#endif
 }
 '''
 
@@ -283,9 +303,51 @@ extern "C" __global__ __cube__ void p06_mmad_fp32(GM_ADDR i, int it) { p06_mmad_
 extern "C" __global__ __cube__ void p06_mmad_hf32(GM_ADDR i, int it) { p06_mmad_impl<float, float, float, 64, 128, 64, true>(i, it); }
 extern "C" __global__ __cube__ void p06_mmad_int8(GM_ADDR i, int it) { p06_mmad_impl<int8_t, int8_t, int32_t, 64, 128, 256, false>(i, it); }
 #if defined(_MINDIE_ARCH35)
+template <typename TA, typename TB, int M, int N, int K, bool IS_FP4>
+__aicore__ inline void p06_mmad_mx_impl(GM_ADDR in_gm, GM_ADDR mx_gm, int iters) {
+    constexpr int A_BYTES = IS_FP4 ? (M * K / 2) : (M * K);
+    constexpr int B_BYTES = IS_FP4 ? (K * N / 2) : (K * N);
+    constexpr int C_BYTES = M * N * sizeof(float);
+    constexpr int MX_BUF_BYTES = 16384;
+    AscendC::TPipe pipe;
+    AscendC::TBuf<AscendC::TPosition::A1> l1aBuf, l1aMxBuf;
+    AscendC::TBuf<AscendC::TPosition::B1> l1bBuf, l1bMxBuf;
+    AscendC::TBuf<AscendC::TPosition::A2> l0aBuf;
+    AscendC::TBuf<AscendC::TPosition::B2> l0bBuf;
+    AscendC::TBuf<AscendC::TPosition::CO1> l0cBuf;
+    pipe.InitBuffer(l1aBuf, A_BYTES); pipe.InitBuffer(l1aMxBuf, MX_BUF_BYTES);
+    pipe.InitBuffer(l1bBuf, B_BYTES); pipe.InitBuffer(l1bMxBuf, MX_BUF_BYTES);
+    pipe.InitBuffer(l0aBuf, A_BYTES); pipe.InitBuffer(l0bBuf, B_BYTES);
+    pipe.InitBuffer(l0cBuf, C_BYTES);
+    auto l1aU8 = l1aBuf.Get<uint8_t>(); auto l1bU8 = l1bBuf.Get<uint8_t>();
+    auto l1aMxU8 = l1aMxBuf.Get<uint8_t>(); auto l1bMxU8 = l1bMxBuf.Get<uint8_t>();
+    AscendC::GlobalTensor<uint8_t> gIn, gMx;
+    gIn.SetGlobalBuffer((__gm__ uint8_t*)in_gm, 65536);
+    gMx.SetGlobalBuffer((__gm__ uint8_t*)mx_gm, MX_BUF_BYTES);
+    AscendC::DataCopy(l1aU8, gIn, A_BYTES); AscendC::DataCopy(l1bU8, gIn, B_BYTES);
+    AscendC::DataCopy(l1aMxU8, gMx, MX_BUF_BYTES); AscendC::DataCopy(l1bMxU8, gMx, MX_BUF_BYTES);
+    AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(0); AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(0);
+    auto l1a = l1aU8.ReinterpretCast<TA>(); auto l1b = l1bU8.ReinterpretCast<TB>();
+    auto l1aMx = l1aMxU8.ReinterpretCast<fp8_e8m0_t>(); auto l1bMx = l1bMxU8.ReinterpretCast<fp8_e8m0_t>();
+    auto l0a = l0aBuf.Get<TA>(); auto l0b = l0bBuf.Get<TB>(); auto l0c = l0cBuf.Get<float>();
+    AscendC::LoadData2DParamsV2 pa, pb;
+    pa.mStartPosition = 0; pa.kStartPosition = 0; pa.mStep = 4; pa.kStep = 8; pa.srcStride = 8; pa.dstStride = 8; pa.ifTranspose = false;
+    pb.mStartPosition = 0; pb.kStartPosition = 0; pb.mStep = 8; pb.kStep = 8; pb.srcStride = 8; pb.dstStride = 8; pb.ifTranspose = false;
+    AscendC::LoadData2DMxParams pma, pmb;
+    pma.xStartPosition = 0; pma.yStartPosition = 0; pma.xStep = 4; pma.yStep = 4; pma.srcStride = 4; pma.dstStride = 4;
+    pmb.xStartPosition = 0; pmb.yStartPosition = 0; pmb.xStep = 4; pmb.yStep = 8; pmb.srcStride = 8; pmb.dstStride = 8;
+    AscendC::LoadData(l0a, l1a, l1aMx, pa, pma); AscendC::LoadData(l0b, l1b, l1bMx, pb, pmb);
+    AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(0); AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(0);
+    AscendC::MmadParams mp;
+    mp.m = M; mp.n = N; mp.k = K; mp.isBias = false; mp.cmatrixInitVal = true; mp.cmatrixSource = false;
+    for (int i = 0; i < iters; ++i) { AscendC::MmadMx(l0c, l0a, l0b, mp); }
+    AscendC::PipeBarrier<PIPE_M>();
+}
 extern "C" __global__ __cube__ void p06_mmad_fp8e4(GM_ADDR i, int it) { p06_mmad_impl<fp8_e4m3fn_t, fp8_e4m3fn_t, float, 64, 128, 256, false>(i, it); }
 extern "C" __global__ __cube__ void p06_mmad_fp8e5(GM_ADDR i, int it) { p06_mmad_impl<fp8_e5m2_t, fp8_e5m2_t, float, 64, 128, 256, false>(i, it); }
 extern "C" __global__ __cube__ void p06_mmad_hif8(GM_ADDR i, int it) { p06_mmad_impl<hifloat8_t, hifloat8_t, float, 64, 128, 256, false>(i, it); }
+extern "C" __global__ __cube__ void p06_mmad_mxfp8(GM_ADDR i, GM_ADDR mx, int it) { p06_mmad_mx_impl<fp8_e4m3fn_t, fp8_e4m3fn_t, 64, 128, 256, false>(i, mx, it); }
+extern "C" __global__ __cube__ void p06_mmad_mxfp4(GM_ADDR i, GM_ADDR mx, int it) { p06_mmad_mx_impl<fp4x2_e2m1_t, fp4x2_e2m1_t, 64, 128, 512, true>(i, mx, it); }
 #endif
 extern "C" {
 int run_p06_bf16(void* i, int it, void* st, int bd) { p06_mmad_bf16<<<bd, nullptr, st>>>((uint8_t*)i, it); return 0; }
@@ -297,6 +359,8 @@ int run_p06_int8(void* i, int it, void* st, int bd) { p06_mmad_int8<<<bd, nullpt
 int run_p06_fp8e4(void* i, int it, void* st, int bd) { p06_mmad_fp8e4<<<bd, nullptr, st>>>((uint8_t*)i, it); return 0; }
 int run_p06_fp8e5(void* i, int it, void* st, int bd) { p06_mmad_fp8e5<<<bd, nullptr, st>>>((uint8_t*)i, it); return 0; }
 int run_p06_hif8(void* i, int it, void* st, int bd) { p06_mmad_hif8<<<bd, nullptr, st>>>((uint8_t*)i, it); return 0; }
+int run_p06_mxfp8(void* i, void* mx, int it, void* st, int bd) { p06_mmad_mxfp8<<<bd, nullptr, st>>>((uint8_t*)i, (uint8_t*)mx, it); return 0; }
+int run_p06_mxfp4(void* i, void* mx, int it, void* st, int bd) { p06_mmad_mxfp4<<<bd, nullptr, st>>>((uint8_t*)i, (uint8_t*)mx, it); return 0; }
 #endif
 }
 '''

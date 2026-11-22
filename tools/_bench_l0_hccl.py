@@ -15,6 +15,7 @@
 """
 from __future__ import annotations
 
+import gc
 import math
 import os
 import socket
@@ -68,7 +69,14 @@ def _hccl_two_rank_worker(
     for _ in range(WARMUP_GEMM_ITERS):
         _ = torch.matmul(wa, wb)
     torch.npu.synchronize()
-    blk_reps = HCCL_BLOCKER_GEMMS
+    s0, e0 = torch.npu.Event(enable_timing=True), torch.npu.Event(enable_timing=True)
+    s0.record()
+    for _ in range(HCCL_BIG_INNER):
+        _ = torch.matmul(wa, wb)
+    e0.record()
+    torch.npu.synchronize()
+    gemm_ms = max(MIN_SINGLE_GEMM_MS, float(s0.elapsed_time(e0)) / float(HCCL_BIG_INNER))
+    blk_reps = max(HCCL_BLOCKER_GEMMS, math.ceil(BLOCKER_TARGET_MS / gemm_ms))
 
     big_elems = (HCCL_BIG_MIB * MIB) // BF16_BYTES
     big_bytes = float(HCCL_BIG_MIB * MIB)
@@ -105,23 +113,30 @@ def _hccl_two_rank_worker(
 
     def _measure_trials(fn: Any, *, inner: int, blocker: bool, reset_fn: Any = None) -> list[float]:
         ms_list: list[float] = []
-        for _ in range(repeats):
-            if reset_fn is not None:
-                reset_fn()
-            torch.npu.synchronize()
-            dist.barrier()
-            if blocker:
-                for _ in range(blk_reps):
-                    _ = torch.matmul(wa, wb)
+        gc.collect()
+        was_gc = gc.isenabled()
+        gc.disable()
+        try:
+            for _ in range(repeats):
+                if reset_fn is not None:
+                    reset_fn()
+                torch.npu.synchronize()
+                dist.barrier()
+                if blocker:
+                    for _ in range(blk_reps):
+                        _ = torch.matmul(wa, wb)
                 fn()
-            s, e = torch.npu.Event(enable_timing=True), torch.npu.Event(enable_timing=True)
-            s.record()
-            for _ in range(inner):
-                fn()
-            e.record()
-            torch.npu.synchronize()
-            val = float(s.elapsed_time(e)) / float(inner)
-            ms_list.append(val)
+                s, e = torch.npu.Event(enable_timing=True), torch.npu.Event(enable_timing=True)
+                s.record()
+                for _ in range(inner):
+                    fn()
+                e.record()
+                torch.npu.synchronize()
+                val = float(s.elapsed_time(e)) / float(inner)
+                ms_list.append(val)
+        finally:
+            if was_gc:
+                gc.enable()
         return ms_list
 
     ar_big_ms = _measure_trials(lambda: dist.all_reduce(big_buf), inner=HCCL_BIG_INNER, blocker=False, reset_fn=lambda: big_buf.fill_(float(rank + 1)))

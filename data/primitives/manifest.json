@@ -124,14 +124,14 @@
     "Ascend950DT_9582": {
       "arch_preset": "npu_arch_3510",
       "calibrated": true,
-      "calibrated_primitive_count": 14,
-      "cann_version": "9.2.0",
-      "capture_uri": "capture://a5-9582-ep/camp-202611-l0/b15af2ccbe4a3c187179a44af933b079994a58ca75848975742a5eeb8d151e7c",
+      "calibrated_primitive_count": 18,
+      "cann_version": "9.3.0",
+      "capture_uri": "capture://a5-9582-ep/live-a5-9582-cann930-20261123/59948ea79cb4dda2337067447cbcdb9dfe4da3ffe4c7c736925930db23a81ace",
       "compatible_skus": [
         "Ascend950DT_9582"
       ],
       "coverage_summary": {
-        "calibrated_metrics": 41,
+        "calibrated_metrics": 48,
         "calibrated_modes": [
           "bf16",
           "fp16",
@@ -140,25 +140,24 @@
           "int8",
           "fp8_e4m3",
           "fp8_e5m2",
-          "hifloat8"
-        ],
-        "conflict_metrics": 3,
-        "conflict_modes": [],
-        "supported_metrics": 74,
-        "unmeasured_modes": [
+          "hifloat8",
           "mxfp8",
           "mxfp4"
         ],
+        "conflict_metrics": 3,
+        "conflict_modes": [],
+        "supported_metrics": 75,
+        "unmeasured_modes": [],
         "unsupported_modes": [
           "int4"
         ]
       },
-      "envelope_sha256": "5c849b5ed8d487beed4abda7c9d6eeff8a4dc0592765eb549603624fe8173d17",
+      "envelope_sha256": "d288dd2f012a4879d6d131d78c0e9bd7ac9ba0d2968458e38ce023c121afb0d0",
       "file": "arch35_a5_950dt.json",
-      "ini_sha256": "b8e7d61780056889e795639504530ecacb2b759ad1602e929b863d837fdf0099",
+      "ini_sha256": "26a9caca4d1854e5eb95dbc5725249ddf0d7fcd85676f2f377149d38cb3ed251",
       "sku": "Ascend950DT_9582",
       "total_primitives": 20,
-      "unmeasured_primitive_count": 6,
+      "unmeasured_primitive_count": 2,
       "unsupported_primitive_count": 0
     },
     "Ascend950PR_9579": {

@@ -257,10 +257,12 @@ def test_sku_stage2_canonical_sealer_timeout_idle_and_cann_provenance(tmp_path):
         TimeoutBudget((("l0", 300), ("fabric", 200)), cleanup_grace_s=60, outer_timeout_s=500)
 
     a5_cap = REPO_ROOT / "data/primitives/captures/arch35_a5_950dt.capture.json"
-    a5_cap_sku = json.loads(a5_cap.read_text(encoding="utf-8"))["payload"]["device_name"]
+    a5_payload = json.loads(a5_cap.read_text(encoding="utf-8"))["payload"]
+    a5_cap_sku = a5_payload["device_name"]
+    a5_cap_cann = str(a5_payload["runtime_cann_version"])
     with pytest.raises(ModelingError, match="cann_version_provenance_conflict"):
-        calibrate_l0_and_fabric(sku=a5_cap_sku, raw_l0_json=a5_cap, cann_version="9.3.0")
-    cal_a5 = calibrate_l0_and_fabric(sku=a5_cap_sku, raw_l0_json=a5_cap, cann_version="9.2.0", campaign_id="lease-audituser-0abc")
+        calibrate_l0_and_fabric(sku=a5_cap_sku, raw_l0_json=a5_cap, cann_version="9.9.9")
+    cal_a5 = calibrate_l0_and_fabric(sku=a5_cap_sku, raw_l0_json=a5_cap, cann_version=a5_cap_cann, campaign_id="lease-audituser-0abc")
     assert cal_a5["ok"] is True and "audituser" not in json.dumps(cal_a5) and cal_a5["train_manifest"]["campaign_id"].startswith("camp-")
 
     over_l0 = tmp_path / "over_l0.json"

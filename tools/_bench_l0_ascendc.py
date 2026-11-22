@@ -102,6 +102,9 @@ MMAD_N2 = 6500
 MMAD_BF16_FLOPS_PER_ITER = 2.0 * 64.0 * 128.0 * 128.0
 MMAD_FP32_FLOPS_PER_ITER = 2.0 * 64.0 * 128.0 * 64.0
 MMAD_INT8_FLOPS_PER_ITER = 2.0 * 64.0 * 128.0 * 256.0
+MMAD_MXFP4_FLOPS_PER_ITER = 2.0 * 64.0 * 128.0 * 512.0
+MX_SCALE_BUF_BYTES = 16384
+E8M0_UNITY_BYTE = 127
 FIXPIPE_M = 64
 FIXPIPE_N = 128
 FIXPIPE_PIPE_M = 128
@@ -311,9 +314,12 @@ def _run_dma_hw_subtask(
 
     aiv_warm_bytes = float(((warm_slot // aiv // DMA_CHUNK_BYTES) * DMA_CHUNK_BYTES) * aiv * AIC_WARM_REPS)
     ts_aiv_warm = time_ms(lambda _i: lib.run_dma_align(l2_p, out_p, ctypes.c_longlong(warm_slot), ctypes.c_int(0), ctypes.c_int(DMA_CHUNK_BYTES), ctypes.c_int(AIC_WARM_REPS), st_p, ctypes.c_int(aiv)), reps=repeats)
-    res["samples"]["P01.mte2_aiv_hit_bytes_per_s_per_core"] = [(aiv_warm_bytes / (t * MS_PER_S)) / float(aiv) for t in ts_aiv_warm]
+    aiv_warm_die_bps = [aiv_warm_bytes / (t * MS_PER_S) for t in ts_aiv_warm]
+    res["samples"]["P01.mte2_aiv_hit_bytes_per_s_per_core"] = [bw / float(aiv) for bw in aiv_warm_die_bps]
 
-    l2_conf: list[dict[str, Any]] = []
+    l2_conf: list[dict[str, Any]] = [
+        {"stride_bytes": L2_CONFLICT_ROW_BYTES, "kind": "contiguous", "bps_p50": round(statistics.median(aiv_warm_die_bps), ROUND_BPS_DIGITS)},
+    ]
     for sb, kind in L2_STRIDE_GRID:
         max_rows = min((L2_CONFLICT_WS_MIB * MIB) // sb, L2_CONFLICT_MAX_ROWS)
         rpb = max(1, min(L2_CONFLICT_MAX_RPB, max_rows // max(1, aiv)))
@@ -321,7 +327,8 @@ def _run_dma_hw_subtask(
         reps = max(1, min(L2_CONFLICT_MAX_REPS, (L2_CONFLICT_WS_MIB * MIB) // max(1, tot_rows * L2_CONFLICT_ROW_BYTES)))
         tot_b = float(tot_rows * L2_CONFLICT_ROW_BYTES * reps)
         ts = time_ms(lambda _i, nr=tot_rows, s=sb, b=rpb, rp=reps: lib.run_dma_2d(l2_p, ctypes.c_int(nr), ctypes.c_int(L2_CONFLICT_ROW_BYTES), ctypes.c_int(s), ctypes.c_int(b), ctypes.c_int(rp), st_p, ctypes.c_int(aiv)), reps=L2_CONFLICT_REPEATS)
-        l2_conf.append({"stride_bytes": sb, "kind": kind, "bps_p50": round(statistics.median([tot_b / (t * MS_PER_S) for t in ts]), ROUND_BPS_DIGITS)})
+        entry_kind = "row128_2d" if kind == "contiguous" else kind
+        l2_conf.append({"stride_bytes": sb, "kind": entry_kind, "bps_p50": round(statistics.median([tot_b / (t * MS_PER_S) for t in ts]), ROUND_BPS_DIGITS)})
     res["metadata"]["l2_stride_conflict"] = l2_conf
     del l2_buf
     torch.npu.empty_cache()
@@ -372,7 +379,7 @@ def _fit_two_point_pipe(
 
 def _run_cube_subtask(
     sub: str, *, arch: str, cann_root: str, tmp: Path,
-    in_p: Any, out_p: Any, st_p: Any, aic: int, repeats: int,
+    in_p: Any, mx_p: Any, out_p: Any, st_p: Any, aic: int, repeats: int,
     time_diff: Any, time_ms: Any, lock_dvfs: Any, res: dict[str, Any],
 ) -> None:
     if sub == "p02_p03":
@@ -447,17 +454,32 @@ def _run_cube_subtask(
             if len(ts) >= MIN_VALID_DELTAS:
                 tot = flops_iter * float(MMAD_N2)
                 res["samples"][f"P06.cube_only.{mode_name}"] = [tot / (t * MS_PER_S) for t in ts]
+        if arch == ARCH35_BISHENG:
+            for mode_name, sym, flops_iter in (
+                ("mxfp8", "run_p06_mxfp8", MMAD_INT8_FLOPS_PER_ITER),
+                ("mxfp4", "run_p06_mxfp4", MMAD_MXFP4_FLOPS_PER_ITER),
+            ):
+                if not hasattr(lib, sym):
+                    continue
+                fn_sym = getattr(lib, sym)
+                ts = time_ms(
+                    lambda _i, f=fn_sym: f(in_p, mx_p, ctypes.c_int(MMAD_N2), st_p, ctypes.c_int(aic)),
+                    reps=repeats,
+                )
+                if len(ts) >= MIN_VALID_DELTAS:
+                    tot = flops_iter * float(MMAD_N2)
+                    res["samples"][f"P06.cube_only.{mode_name}"] = [tot / (t * MS_PER_S) for t in ts]
 
 
 def _run_kernel_subtask(
     sub: str, *, torch: Any, out_buf: Any, arch: str, cann_root: str, tmp: Path,
-    in_p: Any, out_p: Any, st_p: Any, aic: int, aiv: int, repeats: int,
+    in_p: Any, mx_p: Any, out_p: Any, st_p: Any, aic: int, aiv: int, repeats: int,
     time_diff: Any, time_ms: Any, lock_dvfs: Any, res: dict[str, Any],
 ) -> None:
     if sub in ("p02_p03", "p06_mmad"):
         _run_cube_subtask(
             sub, arch=arch, cann_root=cann_root, tmp=tmp,
-            in_p=in_p, out_p=out_p, st_p=st_p, aic=aic, repeats=repeats,
+            in_p=in_p, mx_p=mx_p, out_p=out_p, st_p=st_p, aic=aic, repeats=repeats,
             time_diff=time_diff, time_ms=time_ms, lock_dvfs=lock_dvfs, res=res,
         )
         return
@@ -467,14 +489,19 @@ def _run_kernel_subtask(
             res["errors"]["compile"] = err
             return
         lock_dvfs()
-        for key, fn in (
+        flag_probes: list[tuple[str, Any]] = [
             ("P12.flag_mte2_v_ns", lambda n: lib.run_p12_mte2_v(out_p, ctypes.c_int(n), st_p, ctypes.c_int(aiv))),
             ("P12.flag_v_mte3_ns", lambda n: lib.run_p12_v_mte3(out_p, ctypes.c_int(n), st_p, ctypes.c_int(aiv))),
             ("P12.pipe_v_barrier_ns", lambda n: lib.run_p12_pipe_v(out_p, ctypes.c_int(n), st_p, ctypes.c_int(aiv))),
             ("P12.flag_mte1_m_ns", lambda n: lib.run_p12_mte1_m(out_p, ctypes.c_int(n), st_p, ctypes.c_int(aic))),
             ("P12.flag_m_fix_ns", lambda n: lib.run_p12_m_fix(out_p, ctypes.c_int(n), st_p, ctypes.c_int(aic))),
             ("P06.pipe_m_barrier_ns", lambda n: lib.run_p06_pipe_m(out_p, ctypes.c_int(n), st_p, ctypes.c_int(aic))),
-        ):
+        ]
+        if arch == ARCH35_BISHENG and hasattr(lib, "run_p14_mutex"):
+            flag_probes.append(("P14.mutex_overhead_ns", lambda n: lib.run_p14_mutex(out_p, ctypes.c_int(n), st_p, ctypes.c_int(aic))))
+        if arch == ARCH35_BISHENG and hasattr(lib, "run_p14_mutex_xpipe"):
+            flag_probes.append(("P14.mutex_xpipe_handoff_ns", lambda n: lib.run_p14_mutex_xpipe(out_p, ctypes.c_int(n), st_p, ctypes.c_int(aic))))
+        for key, fn in flag_probes:
             ds = time_diff(fn, FLAG_N1, FLAG_N2)
             vals = [d * (NS_PER_MS / FLAG_DELTA) for d in ds]
             if len(vals) >= MIN_VALID_DELTAS and statistics.median(vals) >= MIN_VALID_BARRIER_NS:
@@ -623,8 +650,10 @@ def _run_subtask(
         return out
 
     in_buf = torch.randn((aiv * IN_BUF_STRIDE,), dtype=torch.float32, device=dev) * IN_SCALE
+    mx_buf = torch.full((MX_SCALE_BUF_BYTES,), E8M0_UNITY_BYTE, dtype=torch.uint8, device=dev)
     out_buf = torch.zeros((max(aiv, aic) * OUT_BUF_STRIDE,), dtype=torch.float32, device=dev)
     in_p = ctypes.c_void_p(in_buf.data_ptr())
+    mx_p = ctypes.c_void_p(mx_buf.data_ptr())
     out_p = ctypes.c_void_p(out_buf.data_ptr())
     st_p = ctypes.c_void_p(torch.npu.current_stream().npu_stream)
     res: dict[str, Any] = {"subtask": sub, "samples": {}, "metadata": {}, "errors": {}}
@@ -645,7 +674,7 @@ def _run_subtask(
         else:
             _run_kernel_subtask(
                 sub, torch=torch, out_buf=out_buf, arch=arch, cann_root=cann_root, tmp=tmp,
-                in_p=in_p, out_p=out_p, st_p=st_p, aic=aic, aiv=aiv, repeats=repeats,
+                in_p=in_p, mx_p=mx_p, out_p=out_p, st_p=st_p, aic=aic, aiv=aiv, repeats=repeats,
                 time_diff=_time_diff, time_ms=_time_ms, lock_dvfs=_lock_dvfs, res=res,
             )
     return res
@@ -658,7 +687,7 @@ def run_ascendc_suite(
     """Run native AscendC subtasks in isolated child processes and merge results."""
     arch = ARCH35_BISHENG if arch_preset == ARCH35_PRESET else ARCH22_BISHENG
     subtask_map = [
-        ("vec_p12", {"P06", "P07", "P08", "P09", "P12"}),
+        ("vec_p12", {"P06", "P07", "P08", "P09", "P12", "P14"}),
         ("p13_aiv", {"P13"}), ("p13_aic", {"P13"}), ("p13_mode2", {"P13"}),
         ("p02_p03", {"P02", "P03"}), ("p06_mmad", {"P06"}),
         ("p10_sort", {"P10"}), ("p17_launch", {"P15"}), ("dma_hw", {"P01", "P05"}),
