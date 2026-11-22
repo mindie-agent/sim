@@ -22,9 +22,8 @@ import statistics
 from types import MappingProxyType
 from typing import Any, Literal, Protocol, overload, runtime_checkable
 
-from mindie_sim.observations._capture_verify import (
-    L3_BOUNDARY_KINDS, CaptureVerificationReceipt, verify_capture_file_consistency as _verify_capture,
-)
+from mindie_sim.observations._capture_verify import L1_COMPOSITE_BOUNDARY_KINDS, L3_BOUNDARY_KINDS, CaptureVerificationReceipt
+from mindie_sim.observations._capture_verify import verify_capture_file_consistency as _verify_capture
 from mindie_sim.observations.multilevel_drilldown import DRILLDOWN_LEVELS, score_vertical_drilldown
 from mindie_sim.observations.multilevel_stream import (
     CAPTURE_URI_SCHEME, MS_TO_NS, SHA256_HEX_LENGTH, SOURCE_REF_KEYS, STREAM_CHUNK_BYTES,
@@ -54,8 +53,7 @@ _CALLER_PREDICTION_KEYS = frozenset({"predicted_ns", "predicted_ms", "predicted_
 MANIFEST_HEADER_KEYS = frozenset(
     {"manifest_id", "schema_version", "lineage_edges", "source_uri", "source_sha256", "strict_three_level_blind"}
 )
-L1_BOUNDARY_KINDS = frozenset({"device_kernel", "native_composite", "hccl_api", "aclnn_call",
-                               "single_operator", "collective_call", "npu_event_call"})
+L1_BOUNDARY_KINDS = L1_COMPOSITE_BOUNDARY_KINDS | {"device_kernel"}
 L2_BOUNDARY_KINDS = frozenset({"fx_region", "dispatch_gmm_combine", "periodic_block",
                                "paired_rung_delta", "subgraph_block", "npu_event_burst"})
 FORBIDDEN_L2_BOUNDARY_KINDS = L3_BOUNDARY_KINDS | {"layer_step_quotient", "step_divided_by_layers", "l3_clone"}
@@ -729,9 +727,8 @@ def _step_census(step: Residual, candidates: Iterable[Residual]) -> tuple[str, l
     receipt = step.capture_verification
     if receipt is None or not (census := receipt.window_kernels):
         return "step_physical_census_unavailable", []
-    inner, verified = [], []
-    coverage = {level: set() for level in DRILLDOWN_LEVELS}
-    outside_step = False
+    inner, verified, coverage = [], [], {level: set() for level in DRILLDOWN_LEVELS}
+    outside_step = bundled_l1 = False
     for row in candidates:
         proof = row.capture_verification
         kernels = proof.selected_kernels if proof else frozenset()
@@ -739,12 +736,15 @@ def _step_census(step: Residual, candidates: Iterable[Residual]) -> tuple[str, l
         if row.case_id not in expected and not in_window:
             continue
         inner.append(row.case_id)
+        bundled_l1 |= row.level == "L1" and len(kernels) != len({rank for rank, _ in kernels})
         if not (in_window and row.status == "debug_only" and row.engine_receipt and row.measured_ns > 0):
             outside_step |= bool(kernels) and not in_window
             continue
         verified.append(row)
         coverage[f"{row.level}_in_L3"].update(kernels)
     parts = [(f"{row.level}_in_L3", row.case_id, row.predicted_ns, row.measured_ns) for row in verified]
+    if bundled_l1:
+        return "l1_drilldown_requires_individual_occurrences", parts
     if set(inner) != expected or len(inner) != len(expected):
         return "component_census_mismatch", parts
     if outside_step:

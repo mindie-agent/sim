@@ -4,7 +4,7 @@
   frontiers and apply CycleDetector-approved skips without altering Event order.
 [Invariants] Any external/opaque work, memory-epoch change or indexed catalog
   invalidates skipping and preserves exact step-by-step execution.
-[Timeouts & Locks] Bounded structural inspection (`<= 512` live tasks); no I/O.
+[Timeouts & Locks] Bounded structural inspection (`<= 4096` live tasks); no I/O.
 [Side-Effect Policy] Advances clock, counters and live window cursors on valid skip.
 """
 from __future__ import annotations
@@ -16,6 +16,7 @@ from .engine_types import ExecutionError, _structural_value
 
 _PERIODIC_EPOCH_MISS_MULTIPLIER = 2
 _PERIODIC_COLD_ISSUE_MULTIPLIER = 2
+_MAX_PERIODIC_LIVE_TASKS = 4096
 
 
 def _admission_l2_digest(view) -> str:
@@ -247,7 +248,7 @@ class _EnginePeriodicMixin:
         # this observation bounded to an active cohort that can actually be
         # compared; an oversized ordinary graph keeps the detailed Engine path
         # instead of paying O(live tasks) validation on every step.
-        if len(self._tasks) > 512:
+        if len(self._tasks) > _MAX_PERIODIC_LIVE_TASKS:
             return None
         if (len(self._periodic_runs) > 64
                 or sum(len(tuple(run.get("slots", ())))
@@ -271,11 +272,9 @@ class _EnginePeriodicMixin:
         if (self._periodic_last is not None
                 and self._external_completions
                 > self._periodic_last["external_completions"]):
-            # The detector only accepts an interval with no external/opaque
-            # completion (``crossed_external_or_opaque``).  Since the baseline
-            # was recorded, real external work has completed, so this interval
-            # can never become evidence.  Skipping the observation is a sound
-            # O(1) rejection, not a lost proof.
+            # Discard the crossed interval so the next observation can start
+            # fresh once external completions settle.
+            self._periodic_last = None
             return None
         previous = self._periodic_last
         stop_at = self._periodic_stop(stop_at)

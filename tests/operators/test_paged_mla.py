@@ -17,13 +17,15 @@ import pytest
 
 from _support.axes import REPRESENTATIVE_SKUS, SKUS
 from _support.hardware import sku_case
+from _support.operator_cases import paged_mla_attention, paged_mla_case
 from mindie_sim import target_graphs
 from mindie_sim.prediction.engine import Engine, Resource
 from mindie_sim.prediction.mechanism import Geometry
 from mindie_sim.prediction.operators import paged_mla as governed
 from mindie_sim.prediction.operators.contracts import OperatorPlanningContext
-from mindie_sim.prediction.operators.paged_mla import DSL_MQS_ABI, FIA_ABI, FLASH_ABI, MQS_ABI
-from mindie_sim.prediction.program import RecipeContext
+from mindie_sim.prediction.operators.matrix.refill_steady import PeriodicPipelineSpec, compact_periodic_peer_group
+from mindie_sim.prediction.operators.paged_mla import DSL_MQS_ABI, FIA_ABI, FLASH_ABI, MQS_ABI, paged_mla
+from mindie_sim.prediction.program import PipelineProgram, PipelineTemplateProgram, RecipeContext, Stage
 from mindie_sim.prediction.results import FusedPipelineDescriptor, OpOccurrence
 from mindie_sim.prediction.streams import StreamOwners
 from mindie_sim.public.errors import UnmodeledCapabilityError
@@ -41,12 +43,12 @@ CAPTURES = Path(__file__).resolve().parents[2] / "examples/cases/high-concurrenc
 def _read(path):
     return json.loads(path.read_text())
 
-def _engine(operator, plan, geometry, *, overrides=None):
+def _engine(operator, plan, geometry, *, overrides=None, compute_peaks=None):
     units = geometry.resource_units
     rates = dict.fromkeys(units, 1e8) | {"cube": 1} | (overrides or {})
     pools = geometry.buffers
     ctx = RecipeContext(plan.work.apply(operator), {}, {r: r for r in units}, rates,
-                        geometry.compute_units, resource_units=units, compute_peaks={"bf16": 1e12},
+                        geometry.compute_units, resource_units=units, compute_peaks=compute_peaks or {"bf16": 1e12},
                         pool_names={p: p for p in pools}, pool_capacities=pools,
                         pool_units=geometry.buffer_units)
     engine = Engine([Resource(r, rates[r], units=n) for r, n in units.items()],
@@ -63,7 +65,7 @@ def _execute(operator, plan, geometry, **options):
     assert {r: n for r, n in engine.serviced.items() if n} == pytest.approx(ctx.bind(plan.work))
     assert not any(engine.allocated.values())
     assert engine.summary()["live_tasks"] == engine.summary()["live_programs"] == 0
-    return program.stages[1].program, engine.trace
+    return program.stages[1].program, engine
 
 def _governed_geom(sku):
     return Geometry.from_devices(sku_case(sku).machine.dies)
@@ -112,7 +114,7 @@ def test_governed_dense_work_survives_serialization(hardware, s2):
     for item in (item for phase in descriptor.phases for item in phase.work):
         totals[item.resource] += item.amount
     assert dict(totals) == plan.work.resources | {"cube": 2 * keys * physical * (DQK + LATENT)}
-    program, trace = _execute(operator, restored, geometry)
+    program, engine = _execute(operator, restored, geometry)
     key_tile = 112 if direct else s2
     tiles = ceil(keys / key_tile)
     stages = _tiles(program.tile(0)[0].program)
@@ -127,7 +129,7 @@ def test_governed_dense_work_survives_serialization(hardware, s2):
         for name, delay in (("qk", 0), ("softmax", 1), ("pv", 1), ("output_update", 2)):
             assert [(s.metadata["clock"], s.metadata["task_record_idx"], s.metadata["workspace_buf_idx"])
                     for s in _phase(stages, name)] == [(i + delay, i % 3, i % 2) for i in range(tiles)]
-        assert all(u == (0,) for e in trace for role, u in e["placement"].items() if role in {"vector", "mte2_aiv", "mte3"})
+        assert all(u == (0,) for e in engine.trace for role, u in e["placement"].items() if role in {"vector", "mte2_aiv", "mte3"})
 
 @pytest.mark.parametrize("abi", [FLASH_ABI, MQS_ABI])
 def test_workspace_strategy_rejects_direct_only_abis(abi):
@@ -215,7 +217,6 @@ def test_mixed_quant_payload_and_branch_local_validation(mode, row_bytes, encodi
     with pytest.raises(ModelingError, match="invalid_scale_encoding"):
         governed.make_op(replace(contract, scale_encoding=("fp32", "fp16_g16")))
 
-
 @pytest.mark.parametrize("layout", ["BSND", "TND"])
 def test_contiguous_inline_scale_kv_reads_records_without_page_tables(layout):
     geometry = _governed_geom(DIRECT_SKU)
@@ -225,7 +226,6 @@ def test_contiguous_inline_scale_kv_reads_records_without_page_tables(layout):
     load, = _phase(_tiles(program.tile(0)[0].program), "kv_load")
     assert (load.metadata["ori_logical_bytes"], load.metadata["cmp_logical_bytes"]) == (608, 608)
     assert load.work == {"mte2_aiv": 2 * 608, "hbm": 2 * 608}
-
 
 @pytest.mark.parametrize("layout,mode,row_bytes,repeated_hbm,contiguous_hbm", [
     ("PA_BBND", 1, 608, 1280, 1280),
@@ -239,15 +239,14 @@ def test_sparse_gather_charges_repeats_and_coalesces_contiguous_rows(
     geom = _governed_geom(DIRECT_SKU)
     op = governed.make_op(sequences=((1, 2),), logical_heads=1, physical_heads=1, abi=MQS_ABI,
                           kv_layout=layout, page_size=2, n_ori=2, quant_mode=mode, ori_indices=((0, second_index),))
-    program, trace = _execute(op, governed.build(op, geom), geom)
+    program, engine = _execute(op, governed.build(op, geom), geom)
     load, = _phase(_tiles(program.tile(0)[0].program), "kv_load")
     expected_hbm = contiguous_hbm if second_index else repeated_hbm
     # Contiguous scales can share a GM sector while each scale still takes a padded UB row.
     assert load.work == {"hbm": expected_hbm, "mte2_aiv": repeated_hbm}
     assert load.metadata["ori_logical_bytes"] == 2 * row_bytes
     assert load.metadata["dram_sector_bytes"] == expected_hbm
-    assert sum(row["demand"]["hbm"] for row in trace if ":kv_load:" in row["task"]) == expected_hbm
-
+    assert sum(row["demand"]["hbm"] for row in engine.trace if ":kv_load:" in row["task"]) == expected_hbm
 
 @pytest.mark.parametrize("abi,mode,attributes,error", [
     (MQS_ABI, 1, {"scale_encoding": "bf16_g32"}, "invalid_scale_encoding"),
@@ -267,7 +266,6 @@ def test_sparse_cache_packing_rejects_cross_abi_or_cross_mode_attributes(abi, mo
         governed.make_op(sequences=((1, 2),), logical_heads=64, physical_heads=64,
                          abi=abi, quant_mode=mode, n_ori=1, n_cmp=1, **attributes)
 
-
 def test_block_scale_plane_uses_physical_page_boundary():
     geometry = _governed_geom(DIRECT_SKU)
     op = governed.make_op(sequences=((1, 2),), logical_heads=4, physical_heads=4, abi=MQS_ABI,
@@ -279,14 +277,13 @@ def test_block_scale_plane_uses_physical_page_boundary():
     assert load.work["hbm"] == (2 * 576 + 32) + 2 * 32 + 32
     assert load.work["mte2_aiv"] == 2 * (576 + 32) + 32
 
-
 @pytest.mark.parametrize("splits,intervals", [(1, ((0, 1, 2),)), (2, ((0, 1), (2,)))])
 def test_workspace_pv_accumulates_within_each_owner_interval(splits, intervals):
     geometry = _one_owner(_governed_geom(GM_SKU))
     operator = governed.make_op(sequences=((1, 1025),), logical_heads=4, physical_heads=4,
                                 s2_base_size=512, splits=splits)
     plan = governed.build(operator, geometry)
-    program, trace = _execute(operator, plan, geometry)
+    program, engine = _execute(operator, plan, geometry)
     query = program.tile(0)[0].program
     pv_bytes = 4 * LATENT * 4
     for slot, tiles in enumerate(intervals):
@@ -307,8 +304,7 @@ def test_workspace_pv_accumulates_within_each_owner_interval(splits, intervals):
         reads = [s for s in _phase(stages, "output_read") if s.work]
         assert len(reads) == 1 and reads[0].metadata["kv_tile"] == tiles[-1]
         assert reads[0].metadata["mm2_offset_bytes"] == writes[-1].metadata["mm2_offset_bytes"]
-    assert sum(e["demand"].get("fixpipe", 0) for e in trace) == plan.work.resources["fixpipe"]
-
+    assert sum(e["demand"].get("fixpipe", 0) for e in engine.trace) == plan.work.resources["fixpipe"]
 
 def test_workspace_accumulator_rotation_skips_empty_intervals():
     geometry = _one_owner(_governed_geom(GM_SKU))
@@ -322,13 +318,12 @@ def test_workspace_accumulator_rotation_skips_empty_intervals():
         assert {s.metadata["mm2_slot"] for s in writes} == {interval % 2}
         assert len({s.metadata["mm2_offset_bytes"] for s in writes}) == 1
 
-
 @pytest.mark.parametrize("heads,keys", [(8, 17), (3, 241), (1, 241)])
 def test_direct_fixpipe_rounds_rows_and_publishes_each_panel(heads, keys):
     geometry = _one_owner(_governed_geom(DIRECT_SKU))
     operator = governed.make_op(sequences=((1, keys),), logical_heads=heads, physical_heads=heads, abi=FLASH_ABI)
     plan = governed.build(operator, geometry)
-    program, trace = _execute(operator, plan, geometry)
+    program, engine = _execute(operator, plan, geometry)
     stages = _tiles(program.tile(0)[0].program)
     score_stages = _phase(stages, "score_store")
     padded_rows = 2 * ceil(heads / 2)
@@ -337,7 +332,7 @@ def test_direct_fixpipe_rounds_rows_and_publishes_each_panel(heads, keys):
         assert expected == [768]
     assert [s.work["fixpipe"] for s in score_stages] == expected
     fixpipe_bytes = sum(expected)
-    by_task = {event["task"]: event for event in trace}
+    by_task = {event["task"]: event for event in engine.trace}
     for panel in range(2):
         publications = _phase(stages, f"partial{panel}")
         releases = _phase(stages, f"release{panel}")
@@ -364,7 +359,6 @@ def test_direct_fixpipe_rounds_rows_and_publishes_each_panel(heads, keys):
     assert plan.work.resources["fixpipe"] == fixpipe_bytes
     assert plan.work.matrix == {"bf16": 2 * heads * keys * (DQK + LATENT)}
 
-
 @pytest.mark.parametrize("keys,return_lse", [(17, True), (0, True), (0, False)])
 def test_dsl_mixed_quant_binds_fp32_sinks_and_seeds_even_empty_selection(keys, return_lse):
     geometry = _governed_geom(DIRECT_SKU)
@@ -375,7 +369,7 @@ def test_dsl_mixed_quant_binds_fp32_sinks_and_seeds_even_empty_selection(keys, r
     operator = governed.make_op(contract)
     assert dict(operator.metadata)["paged_mla_contract"]["sinks"] == ("fp32", (heads,))
     plan = governed.build(operator, geometry)
-    program, trace = _execute(operator, plan, geometry)
+    program, engine = _execute(operator, plan, geometry)
     load, attention = program.stages
     assert load.metadata["sinks_logical_bytes"] == 256
     assert load.work == {"mte2_aiv": 256, "hbm": 256}
@@ -393,9 +387,8 @@ def test_dsl_mixed_quant_binds_fp32_sinks_and_seeds_even_empty_selection(keys, r
         assert governed.mqsmla_payload_bytes(oris, keys - oris) == oris * 544 + (keys - oris) * 320
     else:
         assert not plan.work.matrix
-        assert not any("qk:" in e["task"] or "pv:" in e["task"] for e in trace)
+        assert not any("qk:" in e["task"] or "pv:" in e["task"] for e in engine.trace)
         assert plan.work.resources["hbm"] == 256 + heads * (2 * LATENT + 4 * return_lse)
-
 
 @pytest.mark.parametrize("encoding", ["e8m0_g32", ("e8m0_g32", "bf16_g16"), ("bf16_g64", "bf16_g64"),
                                       ("bf16_g32", "fp16_g16"), ("bf16_g16", "bf16_g32")])
@@ -404,13 +397,11 @@ def test_dsl_mixed_quant_rejects_incompatible_bank_scales(encoding):
         governed.make_op(sequences=((1, 2),), logical_heads=64, physical_heads=64, abi=DSL_MQS_ABI,
                          n_ori=1, n_cmp=1, scale_encoding=encoding)
 
-
 @pytest.mark.parametrize("sinks", [("bf16", (64,)), ("fp32", (1, 64)), ("fp32", (32,))])
 def test_dsl_mixed_quant_rejects_incompatible_sink_tensors(sinks):
     with pytest.raises(ModelingError, match="invalid_sinks"):
         governed.make_op(sequences=((1, 0),), logical_heads=64, physical_heads=64,
                          abi=DSL_MQS_ABI, sinks=sinks)
-
 
 def test_dsl_mixed_quant_cost_partition_reduces_only_the_split_row():
     geometry = _governed_geom(DIRECT_SKU)
@@ -436,7 +427,6 @@ def test_dsl_mixed_quant_cost_partition_reduces_only_the_split_row():
     assert finish["merge"].after == ("merge_read",) and finish["merge"].work["vector"] > 0
     assert next(s for s in empty.stages if s.name == "sink_init").work["vector"] == 64 * (LATENT + 2)
 
-
 def test_dsl_mixed_quant_repeated_rows_keep_native_selective_boundaries():
     geometry = _governed_geom(DIRECT_SKU)
     heads, rows = 64, 72
@@ -452,7 +442,6 @@ def test_dsl_mixed_quant_repeated_rows_keep_native_selective_boundaries():
         assert query.stages[-1].metadata["nonempty_splits"] == len(expected)
         for split, tiles in enumerate(expected):
             assert [s.metadata["kv_tile"] for s in _phase(_tiles(query, split), "kv_load")] == list(tiles)
-
 
 @pytest.mark.parametrize("nested", [False, True])
 def test_short_sparse_queries_use_their_own_banks_without_split_state(nested):
@@ -470,7 +459,7 @@ def test_short_sparse_queries_use_their_own_banks_without_split_state(nested):
     assert plan.metadata["workspace_bytes_per_core"] == 2 * slot_bytes
     assert plan.metadata["workspace_bytes"] == len(geometry.datapath.aic_aiv_pairs) * 2 * slot_bytes
     assert operator.flops == plan.work.matrix["bf16"] == 2 * 4 * heads * (LATENT + LATENT)
-    program, trace = _execute(operator, plan, geometry)
+    program, engine = _execute(operator, plan, geometry)
     attention = program.stages[-1].program
     first, last = (group.program for group in attention.tile(0))
     first_tiles = _tiles(first)
@@ -482,12 +471,11 @@ def test_short_sparse_queries_use_their_own_banks_without_split_state(nested):
         assert [stage.name for stage in group.stages] == ["splits", "normalize", "store"]
         assert group.stages[-1].metadata["nonempty_splits"] == 1
         assert all(not s.work for s in _phase(_tiles(group), "split_write"))
-    assert not any(event["demand"] for event in trace
+    assert not any(event["demand"] for event in engine.trace
                    if "split_write" in event["task"] or "merge_read" in event["task"])
     assert plan.work == governed.build(governed.make_op(inputs | {"splits": 1}), geometry).work
     with pytest.raises(ModelingError, match="cmp_block_table_coverage:0:1"):
         governed.make_op(inputs | {"cmp_block_table": [[4]]})
-
 
 @pytest.mark.parametrize("layout", ["PA_BLK_BSND", "PA_BLK_NZ", "NZ_LATENT"])
 def test_latent_alias_avoids_value_refill_with_exact_tail_bytes(layout):
@@ -508,7 +496,6 @@ def test_latent_alias_avoids_value_refill_with_exact_tail_bytes(layout):
         assert governed.latent_record_bytes(replace(contract, latent_alias=alias)) == RECORD + (
             0 if alias else LATENT * 2)
 
-
 def test_sparse_page_aliases_preserve_each_request_gather():
     geometry = _governed_geom(DIRECT_SKU)
     operator = governed.make_op(sequences=((1, 3), (1, 2)), logical_heads=4, physical_heads=4,
@@ -522,7 +509,6 @@ def test_sparse_page_aliases_preserve_each_request_gather():
         assert gather.metadata["cmp_logical_bytes"] == 608
         assert gather.metadata["ori_pages_logical_bytes"] == 4 * n_ori
         assert gather.work["hbm"] > 0
-
 
 @pytest.mark.parametrize("rows,captured", [(12, False), (48, False), (12, True)])
 def test_capture_rows_and_caller_allocations_remain_distinct(rows, captured):
@@ -567,32 +553,48 @@ def test_router_payload_width_is_independent_of_projection_compute(dtype, width)
     assert {meta[k] for k in ("weight_format", "activation_format", "compute_format")} == {router.dtype} == {"bf16"}
     assert meta["output_format"] == dtype and router.mte3_bytes == scores.mte2_bytes == 4 * 16 * width
 
-
-def test_pipelined_peer_group_calibration_matches_literal_in_o1():
-    from mindie_sim.prediction.operators.matrix import refill_steady
-    from mindie_sim.prediction.program import KernelProgram, PipelineProgram, Stage
-
-    peers, count = 4, 64
-    ctx = RecipeContext(None, {}, {"hbm": "hbm", "cube": "cube"}, {"hbm": 1.0, "cube": float(peers)}, peers,
-                        resource_units={"cube": peers})
-    def tile(peer):
-        return lambda _idx: (Stage("load", {"hbm": 0.25}),
-                             Stage("compute", {"cube": 0.5}, after=("load",), placement={"cube": (peer,)}))
+@pytest.mark.parametrize("demands,arrival,expected", [
+    (((0.24, 0.30), (0.60, 3.25)), None, (22.780, 209.2)),
+    (((0.25, 0.50), (0.25, 1.00)), 16, (37.75, 64.500)),
+])
+def test_asymmetric_refill_peers_stay_literal(demands, arrival, expected):
+    ctx = RecipeContext(None, {}, {"hbm": "hbm", "cube": "cube"}, {"hbm": 1, "cube": 2}, 2,
+                        resource_units={"cube": 2})
+    def tile(peer, hbm, cube):
+        return lambda _: (Stage("load", {"hbm": hbm}),
+                          Stage("compute", {"cube": cube}, after=("load",), placement={"cube": (peer,)}))
     def run(programs):
-        eng = Engine([Resource("hbm", 1.0), Resource("cube", float(peers), units=peers)], backend="python")
-        ready = eng.submit("ready")
-        ends = tuple(prog.start(eng, f"p{i}", ready) for i, prog in enumerate(programs))
-        eng.advance(until=ends, first=False)
-        return tuple(e.time for e in ends), dict(eng.serviced)
+        engine = Engine((Resource("hbm", 1), Resource("cube", 2, units=2)), backend="python")
+        if arrival is not None:
+            engine.submit("external", {"hbm": 96}, release=arrival)
+        ready = engine.submit("ready")
+        ends = tuple(pipe.start(engine, f"peer{peer}", ready) for peer, pipe in enumerate(programs))
+        engine.advance(until=ends, first=False)
+        return tuple(end.time for end in ends)
+    specs = tuple(PeriodicPipelineSpec(64, 2, tile(peer, *demand)) for peer, demand in enumerate(demands))
+    selected = compact_periodic_peer_group(ctx, specs)
+    assert all(isinstance(pipe, PipelineProgram) for pipe in selected)
+    times = run(selected)
+    assert times == run(spec.literal() for spec in specs)
+    assert times == pytest.approx(expected, rel=1e-12)
 
-    pipelined = tuple(refill_steady.PeriodicPipelineSpec(count, 2, tile(i)) for i in range(peers))
-    calibrated = refill_steady.compact_periodic_peer_group(ctx, pipelined)
-    assert all(isinstance(p, KernelProgram) for p in calibrated)
-    cal_t, cal_s = run(calibrated)
-    lit_t, lit_s = run(s.literal() for s in pipelined)
-    assert cal_t == pytest.approx(lit_t, rel=1e-6) and cal_s == pytest.approx(lit_s, rel=1e-12)
-    serial = tuple(refill_steady.PeriodicPipelineSpec(count, 1, tile(i)) for i in range(peers))
-    assert all(isinstance(p, PipelineProgram) for p in refill_steady.compact_periodic_peer_group(ctx, serial))
-    shared_owner = tuple(refill_steady.PeriodicPipelineSpec(count, 2, tile(0)) for _ in range(peers))
-    assert all(isinstance(p, PipelineProgram) for p in refill_steady.compact_periodic_peer_group(ctx, shared_owner))
-
+def test_long_paged_pipeline_skips_with_literal_timing(monkeypatch):
+    raw = paged_mla_case(splits=32)
+    context = 409600
+    raw["runtime"]["max_model_len"] = context + PAGE
+    op, _ = paged_mla_attention(raw, context=context)
+    geometry = _governed_geom(DIRECT_SKU)
+    plan = paged_mla.build(op, geometry)
+    rates = {role: value / 1000 for role, value in geometry.rates.items()}
+    options = {"overrides": rates, "compute_peaks": geometry.compute_peaks}
+    program, fast = _execute(op, plan, geometry, **options)
+    for producer in program.stages[1].program.programs:
+        pipe = producer.tile(0)[0].program.stages[1].program
+        assert isinstance(pipe, PipelineTemplateProgram)
+        for phase in pipe.template.phases:
+            assert not any(stage.program for group in (phase.stages, *phase.residue_stages) for stage in group)
+    monkeypatch.setattr(paged_mla, "_template_pipeline", lambda _, pipe: pipe)
+    monkeypatch.setattr(paged_mla, "_flat_cycle_stage", lambda stage: (stage,))
+    _, literal = _execute(op, plan, geometry, **options)
+    assert fast.now - READY == pytest.approx(literal.now - READY, rel=1e-12)
+    assert fast.advance_steps < 500 < literal.advance_steps

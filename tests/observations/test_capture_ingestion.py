@@ -16,14 +16,7 @@ from statistics import mean, median
 import tracemalloc
 
 import pytest
-from _support.captures import (
-    REPO_ROOT,
-    activation_protocol,
-    fixture_json,
-    fixture_path,
-    grouped_protocol,
-    served_protocol,
-)
+from _support.captures import REPO_ROOT, activation_protocol, fixture_json, fixture_path, grouped_protocol, served_protocol
 from _support.memory_cases import case, linear_work
 
 from mindie_sim import Case, predict
@@ -63,7 +56,6 @@ def test_capture_inventory_counts_source_bound_samples_and_acquisitions():
     for sample in samples:
         assert sample["sample_id"].startswith(sample["run_id"] + ":")
         assert sample["identity"]["implementation"]["producer_sha256"] == protocol["producer"]["sha256"]
-
 @pytest.mark.parametrize("source_role", ["producer", "supporting_sources", "captures"])
 def test_capture_identity_rejects_changed_bytes(source_role, tmp_path):
     protocol = activation_protocol()
@@ -74,7 +66,6 @@ def test_capture_identity_rejects_changed_bytes(source_role, tmp_path):
     protocol[source_role] = altered if source_role == "producer" else [altered]
     with pytest.raises(ValueError, match="capture_source_hash_mismatch"):
         list(iter_conditions(protocol))
-
 def test_activation_uses_original_events_and_restores_distinct_burst_boundary():
     manifest = activation_protocol()
     conditions = list(iter_conditions(manifest))
@@ -82,8 +73,7 @@ def test_activation_uses_original_events_and_restores_distinct_burst_boundary():
     first = next(iter(raw["cells"].values()))
     call, burst, hidden_replicate = conditions[0], conditions[1], conditions[2]
     assert [s["duration_ms"] for s in call["samples"]] == first["samples_ms"]
-    assert [s["duration_ms"] for s in burst["samples"]] == pytest.approx(
-        [value * first["burst_ops"] for value in first["burst_samples_ms"]])
+    assert [s["duration_ms"] for s in burst["samples"]] == pytest.approx([v * first["burst_ops"] for v in first["burst_samples_ms"]])
     assert call["identity"]["boundary"] == "npu_event_call"
     assert burst["identity"]["boundary"] == "npu_event_burst"
     assert burst["identity"]["execution"]["invocations"] == first["burst_ops"]
@@ -94,7 +84,6 @@ def test_activation_uses_original_events_and_restores_distinct_burst_boundary():
     samples = [sample for condition in conditions for sample in condition["samples"]]
     assert len(samples) == 270 and len({sample["run_id"] for sample in samples}) == 2
     assert all(sample["split"] == "unassigned" for sample in samples)
-
 def test_grouped_keeps_actual_histogram_and_whole_graph_replay_events():
     manifest = grouped_protocol()
     conditions = list(iter_conditions(manifest))
@@ -110,13 +99,11 @@ def test_grouped_keeps_actual_histogram_and_whole_graph_replay_events():
     assert graph8["identity"]["execution"]["activation_quant"] == "outside_timed_region"
     assert len({s["run_id"] for c in conditions for s in c["samples"]}) == 1
     assert len([s for c in conditions for s in c["samples"]]) == 240
-
 def test_grouped_preserves_producer_canary_failure_without_shape(tmp_path):
     manifest = grouped_protocol()
     raw = fixture_json(*ADAPTER_FIXTURES, "grouped_probe.json")
     # run_row's early canary-rejected return precedes shape/projection construction.
-    failed = {"label": raw["rows"][0]["label"], "status": "failed",
-              "error": "canary_rejected", "canary": {"ok": False}}
+    failed = {"label": raw["rows"][0]["label"], "status": "failed", "error": "canary_rejected", "canary": {"ok": False}}
     raw["rows"].insert(1, failed)
     path = tmp_path / "grouped-with-rejected-canary.json"
     path.write_text(json.dumps(raw))
@@ -128,7 +115,6 @@ def test_grouped_preserves_producer_canary_failure_without_shape(tmp_path):
     assert conditions[3]["metadata"]["error"] == "canary_rejected"
     assert conditions[3]["identity"] == {} and conditions[3]["samples"] == []
     assert len([sample for condition in conditions for sample in condition["samples"]]) == 240
-
 def test_served_grouped_is_kernel_sum_and_never_includes_contaminated_intervals(profiler_api):
     manifest = served_protocol()
     conditions = list(iter_conditions(manifest))
@@ -152,10 +138,8 @@ def test_served_grouped_is_kernel_sum_and_never_includes_contaminated_intervals(
     assert "group_list_tensor_values" in observed["metadata"]["unresolved_semantics"]
     inventory = capture_inventory(manifest)
     assert inventory["timing_conditions"] == 2 and inventory["event_or_kernel_sum_samples"] == 1
-
 def test_zero_duration_markers_preserve_intervals_without_entering_kernel_sum(tmp_path, profiler_api):
     from mindie_sim.observations.kernels import kernel_rows
-
     manifest = served_protocol()
     expected = list(iter_conditions(manifest))
     with (fixture_path(*ADAPTER_FIXTURES, "served_grouped.csv")).open(newline="") as stream:
@@ -183,7 +167,6 @@ def test_zero_duration_markers_preserve_intervals_without_entering_kernel_sum(tm
     retained = [row for row in kernel_rows(path, include_zero_duration=True)
                 if row.name == manifest["marker"]]
     assert len(retained) == 3 and all(row.duration_ns == 0 for row in retained)
-
 def test_descriptive_residual_does_not_promote_unassigned_samples_to_validation():
     samples = list(iter_observations(grouped_protocol()))
     identity = samples[0]["identity"]
@@ -191,10 +174,8 @@ def test_descriptive_residual_does_not_promote_unassigned_samples_to_validation(
     wrong = deepcopy(prediction)
     wrong.update(point_id="wrong_boundary")
     wrong["identity"]["boundary"] = "profiled_device_kernel"
-    report = comparison_report({
-        "predictions": [prediction, wrong], "observations": iter(samples),
-        "tolerances": {"relative": 10},
-    })
+    report = comparison_report({"predictions": [prediction, wrong], "observations": iter(samples),
+                                "tolerances": {"relative": 10}})
     matching = [sample["duration_ms"] for sample in samples if sample["identity"] == identity]
     point = report["descriptive"]["points"][0]
     assert point["observed_ms"] == median(matching)
@@ -204,7 +185,6 @@ def test_descriptive_residual_does_not_promote_unassigned_samples_to_validation(
     assert report["descriptive"]["points"][1]["reason"] == "no_exact_observation_identity"
     assert report["validation"]["coverage"]["paired_heldout_points"] == 0
     assert report["validation"]["tolerance_outcomes"]["within"] == 0
-
 @pytest.mark.parametrize("reinterpreted_first", [False, True])
 def test_duplicate_source_cannot_drop_newly_identified_missing_semantics(reinterpreted_first, profiler_api):
     current = next(iter_observations(served_protocol()))
@@ -218,7 +198,6 @@ def test_duplicate_source_cannot_drop_newly_identified_missing_semantics(reinter
                              "duration_ms": current["duration_ms"]}],
             "observations": samples, "tolerances": {"relative": 0.1},
         })
-
 def test_served_stream_rejects_unordered_time_instead_of_assigning_the_wrong_interval(tmp_path, profiler_api):
     manifest = served_protocol()
     with (fixture_path(*ADAPTER_FIXTURES, "served_grouped.csv")).open(newline="") as stream:
@@ -233,22 +212,16 @@ def test_served_stream_rejects_unordered_time_instead_of_assigning_the_wrong_int
     manifest["captures"] = [{"path": str(path), "sha256": digest_file(path), "label": "unordered"}]
     with pytest.raises(ValueError, match="capture_csv_start_times_not_monotone"):
         list(iter_observations(manifest))
-
 def test_missing_served_route_values_cannot_be_validated_by_relabelling_split(profiler_api):
     sample = next(iter_observations(served_protocol()))
     sample["split"] = "heldout"
-    report = comparison_report({
-        "predictions": [{"point_id": "same_partial_descriptor", "identity": sample["identity"],
-                         "duration_ms": sample["duration_ms"]}],
-        "observations": [sample], "tolerances": {"relative": 0.1},
-    })
+    prediction = {"point_id": "same_partial_descriptor", "identity": sample["identity"], "duration_ms": sample["duration_ms"]}
+    report = comparison_report({"predictions": [prediction], "observations": [sample], "tolerances": {"relative": 0.1}})
     assert report["descriptive"]["points"][0]["reason"] == "unresolved_observation_semantics"
     assert report["validation"]["coverage"]["excluded_observations"] == {"unresolved_semantics": 1}
     assert report["validation"]["tolerance_outcomes"]["within"] == 0
-
 def activation_case():
     return json.loads((REPO_ROOT / "examples/calls/activation-nominal.json").read_text())
-
 def test_real_activation_calls_keep_event_span_and_reuse_physical_predictions():
     protocol = activation_protocol()
     original = list(iter_conditions(protocol))
@@ -270,10 +243,8 @@ def test_real_activation_calls_keep_event_span_and_reuse_physical_predictions():
     burst = next(row for row in result["conditions"] if row["boundary"] == "npu_event_burst")
     source = next(row for row in original if row["condition_id"] == burst["condition_id"])
     # The adapter already restored whole-event time; do not multiply it again.
-    assert burst["statistics"]["sample_median_ms"] == median(
-        sample["duration_ms"] for sample in source["samples"])
+    assert burst["statistics"]["sample_median_ms"] == median(sample["duration_ms"] for sample in source["samples"])
     assert all(p["execution"]["live_tasks"] == 0 for p in result["predictions"])
-
 def test_event_durations_and_canaries_never_change_predictions(tmp_path):
     protocol = activation_protocol()
     reference = compare_calls(activation_case(), protocol)
@@ -295,7 +266,6 @@ def test_event_durations_and_canaries_never_change_predictions(tmp_path):
     for before, after in zip(reference["conditions"], altered["conditions"]):
         assert after["statistics"]["sample_median_ms"] == pytest.approx(
             before["statistics"]["sample_median_ms"] * 17)
-
 def test_actual_grouped_representation_is_not_substituted_with_bf16_nd():
     result = compare_calls(activation_case(), grouped_protocol())
     assert result["status"] == "completed"
@@ -306,10 +276,8 @@ def test_actual_grouped_representation_is_not_substituted_with_bf16_nd():
         assert row["alignment"]["api"]["weight"] == "int8 [E,K,N] FRACTAL_NZ"
         assert row["alignment"]["identified_historical_compiled_kernel"] is None
         assert row["alignment"]["matrix"]["core_recipe"] == "mapped_matmul"
-    assert {row["identity"]["execution"]["invocations"]
-            for row in result["conditions"]} == {1, 8}
+    assert {row["identity"]["execution"]["invocations"] for row in result["conditions"]} == {1, 8}
     assert result["validation"]["strict_pairs"] == 0
-
 def test_budget_retains_observations_and_cli_returns_partial_report(tmp_path):
     protocol = tmp_path / "protocol.json"
     protocol.write_text(json.dumps(activation_protocol()))
@@ -323,11 +291,9 @@ def test_budget_retains_observations_and_cli_returns_partial_report(tmp_path):
     assert result["summary"]["condition_statuses"]["prediction_failed"] > 0
     assert any(comparison.get("reason") == "prediction_budget_exceeded"
                for row in result["conditions"] for comparison in row["comparisons"])
-
 def test_real_profiler_csv_remains_readable_with_companion_api(profiler_api):
     rows = list(profiler_rows(fixture_path("observations", "profiler.csv")))
     assert rows and all(row["duration_ms"] > 0 and row["kernel"] for row in rows)
-
 def test_profiler_catalogue_exposes_samples_and_variant_extrema():
     with ProfilerCatalogue(fixture_path("observations", "catalogue.sqlite")) as catalogue:
         variants = list(catalogue.variants(limit=5))
@@ -335,7 +301,6 @@ def test_profiler_catalogue_exposes_samples_and_variant_extrema():
     assert samples and all(row["duration_ms"] > 0 and row["source"] for row in samples)
     assert variants[0]["min_ms"] <= min(row["duration_ms"] for row in samples)
     assert variants[0]["max_ms"] >= max(row["duration_ms"] for row in samples)
-
 def test_shared_profiler_row_preserves_consumer_projection(profiler_api):
     from dataclasses import replace
     from mindie_profiler.tensor_contracts import observed_contract
@@ -358,7 +323,6 @@ def test_shared_profiler_row_preserves_consumer_projection(profiler_api):
     assert observed_contract(row) == ("rmsnorm", (16384, 5120), "bf16", True)
     assert observed_contract(replace(row, output_shapes=None)) is None
     assert observed_contract(replace(row, output_shapes=((16384, 2560), (16384, 1)))) is None
-
 def test_missing_or_unrecognized_matrix_dtype_does_not_authorize_a_contract(profiler_api):
     from dataclasses import replace
     from mindie_profiler.normalized import row_from_event
@@ -367,13 +331,11 @@ def test_missing_or_unrecognized_matrix_dtype_does_not_authorize_a_contract(prof
 
     row = next(row for row in kernel_rows(fixture_path("observations", "operator-kernels.csv"))
                if row.kind == "MatMulV3")
-    assert observed_contract(row) == (
-        "matrix", (16384, 16384, 5120), "bf16", "bf16", "bf16", (), "")
+    assert observed_contract(row) == ("matrix", (16384, 16384, 5120), "bf16", "bf16", "bf16", (), "")
     for descriptors in ("", "N/A;DT_BF16", "DT_UNRECOGNIZED;DT_BF16"):
         incomplete = row_from_event(replace(row.event, input_dtypes=descriptors))
         assert incomplete.input_shapes == row.input_shapes
         assert observed_contract(incomplete) is None
-
 def test_bound_raw_samples_can_be_calibrated_without_reinterpreting_predictions():
     value = Case.from_mapping(case())
     plan = IterationPlan((RequestView("r", 4, 0, True, "prefill"),))
@@ -391,7 +353,6 @@ def test_bound_raw_samples_can_be_calibrated_without_reinterpreting_predictions(
         assert store.lookup(key) is None
         assert predict(value, lower=linear_work, primitives=store)["metrics"] == predict(
             value, lower=linear_work)["metrics"]
-
 def test_train_primitive_changes_duration_without_fabricating_resource_work():
     value = Case.from_mapping(case())
     plan = IterationPlan((RequestView("r", 4, 0, True, "prefill"),))
@@ -405,7 +366,6 @@ def test_train_primitive_changes_duration_without_fabricating_resource_work():
     assert after["requests"][0]["ttft_ms"] == 10
     assert after["execution"]["work"] == before["execution"]["work"]
     assert after["execution"]["serviced"]["matrix@r0:s0"] == before["execution"]["serviced"]["matrix@r0:s0"]
-
 def test_service_boundary_mismatch_precludes_calibration_and_acceptance():
     observed = service_observation(fixture_path("observations", "service.json"))
     result = compare(predict(case()), observed, boundary="client_stream")
@@ -413,7 +373,6 @@ def test_service_boundary_mismatch_precludes_calibration_and_acceptance():
     assert result["rows"] and all(row["observed"] > 0 for row in result["rows"])
     with pytest.raises(ValueError, match="boundary_conflicts"):
         compare(predict(case()), observed, boundary="device_token_commit")
-
 def test_actual_speculative_capture_uses_tokens_instead_of_sse_chunks_for_tpot():
     raw = fixture_json("observations", "service.json")
     observed = service_observation(fixture_path("observations", "service.json"))
@@ -422,11 +381,8 @@ def test_actual_speculative_capture_uses_tokens_instead_of_sse_chunks_for_tpot()
     assert observed["tpot_ms"]["mean"] == pytest.approx(expected)
     assert observed["tpot_ms"]["mean"] < raw["tpot_ms"]["mean"] / 3
     assert observed["reported_metrics"]["tpot_ms"] == raw["tpot_ms"]
-    assert observed["e2e_ms"]["mean"] == pytest.approx(
-        mean(row["ttft_ms"] + row["decode_ms"] for row in requests))
-    assert observed["output_tps"] == pytest.approx(
-        sum(row["completion_tokens"] for row in requests) / raw["wall_s"])
-
+    assert observed["e2e_ms"]["mean"] == pytest.approx(mean(row["ttft_ms"] + row["decode_ms"] for row in requests))
+    assert observed["output_tps"] == pytest.approx(sum(row["completion_tokens"] for row in requests) / raw["wall_s"])
 def test_capture_without_usage_does_not_substitute_chunks_or_requested_token_counts(tmp_path):
     raw = fixture_json("observations", "service.json")
     for row in raw["per_request"]:
@@ -438,7 +394,6 @@ def test_capture_without_usage_does_not_substitute_chunks_or_requested_token_cou
     assert observed["output_tps"] is None
     assert observed["reported_metrics"]["tpot_ms"] == raw["tpot_ms"]
     assert observed["ttft_ms"] == raw["ttft_ms"]
-
 def test_historical_source_index_preserves_hashes_and_source_roles(tmp_path):
     with ObservationIndex(tmp_path / "observations.sqlite") as index:
         index.scan(fixture_path("observations"))
@@ -446,7 +401,6 @@ def test_historical_source_index_preserves_hashes_and_source_roles(tmp_path):
         rows = index.find_sources("profiler.csv")
         assert rows[0]["kind"] == "profiler" and len(rows[0]["sha256"]) == 64
         assert index.inventory()["profiler_catalogue"]["files"] == 1
-
 def test_rate_fit_predicts_independent_measurements():
     root = REPO_ROOT / "data" / "measurements" / "gpu"
     raw = json.loads(next(root.glob("*.stdout")).read_text())
@@ -458,7 +412,6 @@ def test_rate_fit_predicts_independent_measurements():
     assert fitted["bytes_per_ms"] == fit_resource_rate(changed)["bytes_per_ms"]
     assert len(fitted["heldout"]) == 5
     assert max(abs(row["relative_error"]) for row in fitted["heldout"]) < .08
-
 def test_real_matmul_rows_do_not_gain_negative_gaps_from_epoch_float_rounding():
     report = analyze_window(fixture_path("a5_microbench_20261030", "cube_matmul_m1_k4096_n4096.csv"), 4)
     stream = report["streams"][0]
@@ -470,7 +423,6 @@ def test_real_matmul_rows_do_not_gain_negative_gaps_from_epoch_float_rounding():
     assert stream["duration_sum_us"] == 50.254
     assert stream["first_start_to_last_end_us"] == 134.746
     assert stream["duration_sum_over_window_span"] == pytest.approx(50.254 / 134.746)
-
 def test_real_vector_rows_retain_first_transition_and_device_work_separately():
     report = analyze_window(fixture_path("a5_microbench_20261030", "vector_add_t1.csv"), 4)
     stream = report["streams"][0]
@@ -483,26 +435,23 @@ def test_real_vector_rows_retain_first_transition_and_device_work_separately():
     assert stream["duration_sum_us"] == pytest.approx(2.134 + 1.523 + 1.477 + 1.326)
     assert report["kernel_descriptors"]["Block Num"] == ["8"]
     assert report["kernel_descriptors"]["Accelerator Core"] == ["AI_VECTOR_CORE"]
-
-def _verify_capture(path, *, level="L1", events=("gemm",), ranks=(1,), measured=60_023, operator="elapsed_span", endpoints=None):
+def _verify_capture(path, *, level="L1", events=("gemm",), ranks=(1,), measured=60_023,
+                    operator="elapsed_span", endpoints=None, kind=None):
     start, end = endpoints or (events[0], events[-1])
-    kind = {"L1": "device_kernel", "L2": "periodic_block", "L3": "model_step"}[level]
+    kind = kind or {"L1": "device_kernel", "L2": "periodic_block", "L3": "model_step"}[level]
     boundary = gate.CaptureBoundary(gate.digest_file_streaming(path), "acq", "session", (), events, ranks,
                                     "device", start, end, kind, "ns", clock_operator=operator)
     cohort = gate.CohortKey(level, "timing", "device", "decode", "eager", "shape", "tp1")
     item = gate.GateCase("capture", level, "heldout", boundary, "inputs", "stack", "impl", cohort, measured)
-    gate.validate_lineage(gate.Manifest("native", "1", (item,)), gate.FrozenFitManifest("empty", "1", ()),
-                          capture_files={item.case_id: path}, require_capture_files=True)
-
+    index = gate.validate_lineage(gate.Manifest("native", "1", (item,)), gate.FrozenFitManifest("empty", "1", ()),
+                                  capture_files={item.case_id: path}, require_capture_files=True)
+    return index.capture_receipts[item.case_id]
 @pytest.mark.parametrize("level", ("L1", "L2", "L3"))
 def test_native_csv_binds_rank_events_and_duration(tmp_path, level):
     path = tmp_path / "kernel_details.csv"
-    path.write_text(
-        "Device_id,Task ID,Name,Start Time(us),Duration(us)\n"
-        "1,44,gemm,1793296125087346.271,60.023\n"
-        "2,44,gemm,1793296125087346.271,548.894\n",
-        encoding="utf-8",
-    )
+    path.write_text("Device_id,Task ID,Name,Start Time(us),Duration(us)\n"
+                    "1,44,gemm,1793296125087346.271,60.023\n"
+                    "2,44,gemm,1793296125087346.271,548.894\n", encoding="utf-8")
     for ranks, duration in (((1,), 60_023), ((2,), 548_894), ((1, 2), 548_894)):
         _verify_capture(path, level=level, ranks=ranks, measured=duration)
     for change, cause in (({"ranks": (999,)}, "capture_rank_mismatch"),
@@ -513,7 +462,6 @@ def test_native_csv_binds_rank_events_and_duration(tmp_path, level):
     path.write_text("Name,Start Time(us),Duration(us)\ngemm,20,60.023\n", encoding="utf-8")
     with pytest.raises(ModelingError, match="rank_column_absent"):
         _verify_capture(path, level=level)
-
 def test_profiler_rows_preserve_clock_and_single_kernel_boundaries(tmp_path):
     path = tmp_path / "summary.csv"
     path.write_text("Rank ID,Name,Start Time(us),Duration(us)\n1,a,0,140\n1,b,140,60\n1,c,210,100\n")
@@ -541,6 +489,58 @@ def test_profiler_rows_preserve_clock_and_single_kernel_boundaries(tmp_path):
     path.write_text("Device_id,Name\n1,gemm\n")
     with pytest.raises(ModelingError, match="csv_schema_unsupported"):
         _verify_capture(path)
+
+@pytest.mark.parametrize("ownership", ("none", "connection", "call", "host", "peers", "other_thread", "ambiguous_host"))
+def test_composite_capture_requires_shared_host_call(tmp_path, ownership):
+    path = tmp_path / "matmul.json"
+    connections = (10, 10 if ownership == "connection" else 11)
+    rows = [{"ph": "X", "device_id": 1, "ts": start, "dur": 5, "name": "MatMulV3",
+             "args": {"Task Id": task, "Connection Id": conn}} for task, start, conn in zip((112, 113), (20, 30), connections)]
+    rows.append({"ph": "X", "device_id": 1, "ts": 26, "dur": 3, "name": "unrelated"})
+    if ownership == "call":
+        rows[0]["Host Call Id"] = rows[1]["args"]["callId"] = 18
+    if ownership in ("host", "peers", "other_thread", "ambiguous_host"):
+        host = {"ph": "X", "pid": 100, "tid": 7, "ts": 0, "dur": 20, "name": "aclnnMatmul"}
+        rows.extend((host, dict(host)) if ownership == "ambiguous_host" else (host,))
+        for conn, start in zip(connections, (2, 12)):
+            if ownership == "peers":
+                rows.append({**host, "ts": start - 1, "dur": 4})
+            rows.append({**host, "name": "rtKernelLaunch", "ts": start, "dur": 1, "args": {"Connection Id": conn},
+                         "tid": conn if ownership == "other_thread" else host["tid"]})
+    path.write_text(json.dumps({"traceEvents": rows}))
+    claim = {"events": ("task:112", "task:113"), "kind": "aclnn_call", "operator": "busy_union", "measured": 10_000}
+    if ownership in ("connection", "call", "host"):
+        assert _verify_capture(path, **claim).selected_kernels == {(1, 1), (1, 2)}
+    else:
+        with pytest.raises(ModelingError, match="capture_l1_call_ownership_unverified:capture:rank=1"):
+            _verify_capture(path, **claim)
+
+@pytest.mark.parametrize("level", ("L2", "L3"))
+@pytest.mark.parametrize("suffix", ("csv", "json"))
+def test_busy_union_includes_prior_launch_and_clips_both_ends(tmp_path, level, suffix):
+    path = tmp_path / f"window.{suffix}"
+    runs = (("prior", 0, 80), ("open", 50, 10), ("crosses_end", 90, 60), ("close", 100, 10))
+    if suffix == "csv":
+        path.write_text("Rank,Name,Start Time(us),Duration(us)\n" + "".join(f"1,{e},{s},{d}\n" for e, s, d in runs))
+    else:
+        path.write_text(json.dumps([{"rank": 1, "name": e, "start_us": s, "duration_us": d} for e, s, d in runs]))
+    claim = {"level": level, "events": ("open", "close"), "operator": "busy_union"}
+    receipt = _verify_capture(path, measured=50_000, **claim)
+    assert receipt.window_kernels == ({(1, 2), (1, 3), (1, 4)} if level == "L3" else None)
+    with pytest.raises(ModelingError, match="capture_duration_mismatch:.*actual=50000"):
+        _verify_capture(path, measured=30_000, **claim)
+
+@pytest.mark.parametrize(("stream", "start", "passes"), ((25, 15, True), (59, 15, False), (None, 15, False),
+                                                       (59, 5, False), (59, 0.001, True)))
+def test_single_kernel_accepts_independent_stream_overlap(tmp_path, stream, start, passes):
+    path = tmp_path / "streams.csv"
+    path.write_text("Rank,Name,Start Time(us),Duration(us),Stream ID\n1,target,10,20,59\n"
+                    f"1,concurrent,{start},10,{stream or ''}\n")
+    if passes:
+        assert _verify_capture(path, events=("target",), measured=20_000).selected_kernels == {(1, 1)}
+    else:
+        with pytest.raises(ModelingError, match="capture_device_kernel_multiple_occurrences:capture:rank=1"):
+            _verify_capture(path, events=("target",), measured=20_000)
 
 def test_json_capture_filters_unrelated_events_while_streaming(tmp_path, monkeypatch):
     monkeypatch.setattr(gate, "ijson", None)  # Exercise the stdlib fallback directly.

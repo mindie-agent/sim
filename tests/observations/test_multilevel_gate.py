@@ -329,21 +329,20 @@ def test_physical_tolerance_boundaries_and_release() -> None:
 @pytest.mark.parametrize("capture_format", ("csv", "csv.gz", "trace", "json", "jsonl"))
 def test_vertical_drilldown_requires_physical_kernel_census(tmp_path, capture_format):
     suffix = "json" if capture_format == "trace" else capture_format
-    path = tmp_path / f"step.{suffix}"
-    events = ("a", "b", "c", "d")
+    path, events = tmp_path / f"step.{suffix}", ("a", "b", "c", "d")
     runs = tuple(zip(events, (0, 100, 240, 300), (100, 140, 60, 100)))
     if capture_format.startswith("csv"):
-        data = "Rank ID,Name,Start Time(us),Duration(us)\n" + "".join(f"0,{e},{s},{d}\n" for e, s, d in runs)
+        data = "Rank,Name,Start Time(us),Duration(us),Connection Id\n" + "".join(f"0,{e},{s},{d},42\n" for e, s, d in runs)
         path.write_bytes(gzip.compress(data.encode()) if suffix == "csv.gz" else data.encode())
     elif capture_format == "trace":
-        path.write_text(json.dumps({"traceEvents": [
-            {"ph": "X", "device_id": 0, "name": e, "ts": s, "dur": d} for e, s, d in runs]}))
+        rows = [{"ph": "X", "device_id": 0, "name": e, "ts": s, "dur": d, "args": {"Connection Id": 42}} for e, s, d in runs]
+        path.write_text(json.dumps({"traceEvents": rows}))
     else:
-        kernels = [{"rank": 0, "event_id": e, "start_us": s, "duration_us": d} for e, s, d in runs]
+        kernels = [{"rank": 0, "event_id": e, "start_us": s, "duration_us": d, "connection_id": 42} for e, s, d in runs]
         path.write_text(json.dumps({"events": kernels}) if suffix == "json" else "\n".join(map(json.dumps, kernels)))
     digest = hashlib.sha256(path.read_bytes()).hexdigest()
-    def measured(name, level, selected, duration):
-        case = _case(name, level=level, raw_sha=digest, events=selected, measured_ns=duration * 1000,
+    def measured(name, level, selected, duration, *, kind=None):
+        case = _case(name, level=level, kind=kind, raw_sha=digest, events=selected, measured_ns=duration * 1000,
                      debug_cross_level=level != "L3")
         return replace(case, boundary=replace(case.boundary, start_event=selected[0], end_event=selected[-1]))
     operators = tuple(measured(e, "L1", (e,), d) for e, _, d in runs)
@@ -355,15 +354,17 @@ def test_vertical_drilldown_requires_physical_kernel_census(tmp_path, capture_fo
         verdict = gate_decision(summarize_cohorts(rows), required_levels=("L3",))
         return verdict, verdict["vertical_drilldowns"]["step"]
     good = _LiveEngineRunner(scale=1)
-    full_block = measured("block", "L2", events, 400)
-    short_block = measured("block", "L2", endpoints, 400)
+    full_block, short_block = (measured("block", "L2", selected, 400) for selected in (events, endpoints))
     assert score((*operators, full_block), good)[0]["status"] == "pass"
+    bundle = measured("bundle", "L1", events[:2], 240, kind="aclnn_call")
+    verdict, report = score((bundle, *operators[2:], full_block), good)
+    assert verdict["status"] == "insufficient_evidence" and report["failure_reason"] == "l1_drilldown_requires_individual_occurrences"
     bad = _LiveEngineRunner({case.case_id: _live_interval(case, 100_000) for case in operators}, scale=1)
     verdict, report = score((*operators, full_block), bad)
     assert verdict["status"] == "fail" and report["step_passed"] and report["levels"]["L1_in_L3"]["cancellation_ratio"] == 1
     assert [part["name"] for part in report["failed_components"]] == ["b", "c"]
-    edge_operators = (operators[0], operators[-1])
-    for inner in ((*edge_operators, short_block), (*edge_operators, full_block), (*operators, short_block)):
+    edge = (operators[0], operators[-1])
+    for inner in ((*edge, short_block), (*edge, full_block), (*operators, short_block)):
         verdict, report = score(inner, good)
         assert verdict["status"] == "insufficient_evidence"
         assert report["failure_reason"] == "component_physical_kernels_incomplete"
@@ -504,7 +505,6 @@ def test_tail_diagnoser_moved_tail_unassessed_stages_and_conflicts(tmp_path: Pat
     assert pers_rep["status"] == "blocking_escalation" and persistent in pers_rep["clusters"][0]["escalation_reasons"]
     st = {s["stage_number"]: s for s in pers_rep["clusters"][0]["stages"]}
     assert all(st[n]["status"] == "issue_found" for n in (1, 2, 3, 4)) and st[5]["status"] == "action_required"
-
     res_f, lin_f, rcpt_f, ref_f, out_f = tmp_path / "r.json", tmp_path / "l.json", tmp_path / "e.json", tmp_path / "ref.json", tmp_path / "out.json"
     for path, payload in ((res_f, {"residuals": rows}), (lin_f, [lin_b]), (rcpt_f, [rcpt_b]), (ref_f, ref_persist)):
         path.write_text(json.dumps(payload), encoding="utf-8")

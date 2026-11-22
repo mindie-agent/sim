@@ -8,13 +8,16 @@
 [Timeouts & Locks] O(batch + active owners + finite tile windows), no locks.
 [Side-Effect Policy] Immutable plans and virtual tasks only; no device or I/O.
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache
 import math
 
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.prediction.mechanism import OperatorPlan, Work
-from mindie_sim.prediction.program import KernelProgram, ParallelProgram, PipelineProgram, Stage
+from mindie_sim.prediction.program import (
+    KernelProgram, ParallelProgram, PipelinePhase, PipelineProgram, PipelineTemplate,
+    PipelineTemplateProgram, Stage,
+)
 from mindie_sim.prediction.operators.matrix.refill_steady import (
     PeriodicPipelineSpec, compact_periodic_peer_group, compact_periodic_pipeline,
 )
@@ -46,6 +49,9 @@ _PAGE_INDEX_BYTES = 4
 _SPLIT_STATS_BYTES = 2 * _FP32_BYTES
 _SOFTMAX_OPS_PER_SCORE = 8
 _COMPACT_BOUNDARY_CYCLES = 2
+_STEADY_CYCLE_PERIOD = 2
+_TEMPLATE_BOUNDARY_TOTAL = 2 * _COMPACT_BOUNDARY_CYCLES
+_MIN_TEMPLATE_CYCLES = _TEMPLATE_BOUNDARY_TOTAL + _STEADY_CYCLE_PERIOD
 _SOFTMAX_FIRST_OPS_PER_HEAD = 26
 _SOFTMAX_NEXT_OPS_PER_HEAD = 32
 _LATER_UPDATE_OPS_PER_ELEM = 3
@@ -280,22 +286,34 @@ def _plan(spec, cores):
 
 
 def _producer_group(ctx, by_owner, spec, stage):
-    tiles = compact_periodic_peer_group(ctx, (
+    compiled = iter(compact_periodic_peer_group(ctx, (
         _job_pipeline_spec(owner, job, spec, stage)
         for owner, jobs in enumerate(by_owner) for job in jobs
-    ), compactor=compact_periodic_pipeline)
-    if tiles and isinstance(tiles[0], KernelProgram):
-        compiled = iter(tiles)
-        return tuple(_producer_program(owner, jobs, spec, stage, tuple(next(compiled) for _ in jobs))
-                     for owner, jobs in enumerate(by_owner))
-    return tuple(_producer_program(owner, jobs, spec, stage) for owner, jobs in enumerate(by_owner))
+    ), compactor=compact_periodic_pipeline))
+    return tuple(_producer_program(owner, jobs, spec, stage, tuple(next(compiled) for _ in jobs))
+                 for owner, jobs in enumerate(by_owner))
 
 
-def _producer_program(owner, jobs, spec, stage, tiles=None):
+def _template_pipeline(owner, pipe):
+    if isinstance(pipe, KernelProgram) or pipe.count <= _MIN_TEMPLATE_CYCLES:
+        return pipe
+    steady_start = _COMPACT_BOUNDARY_CYCLES
+    tail_start = pipe.count - _COMPACT_BOUNDARY_CYCLES
+    steady = tuple(pipe.tile(index) for index in range(steady_start, steady_start + _STEADY_CYCLE_PERIOD))
+    return PipelineTemplateProgram(PipelineTemplate(owner, pipe.slots, (
+        PipelinePhase('head0', pipe.tile(0), 1),
+        PipelinePhase('head1', pipe.tile(1), 1),
+        PipelinePhase('steady', steady[0], pipe.count - _TEMPLATE_BOUNDARY_TOTAL, residue_stages=steady),
+        PipelinePhase('tail0', pipe.tile(tail_start), 1),
+        PipelinePhase('tail1', pipe.tile(tail_start + 1), 1),
+    )))
+
+
+def _producer_program(owner, jobs, spec, stage, tiles):
     def job_program(index):
         job = jobs[index]
         begin, end = _ends(spec, job)
-        pipe = _job_pipeline_spec(owner, job, spec, stage).literal() if tiles is None else tiles[index]
+        pipe = _template_pipeline(owner, tiles[index])
         return (Stage('job', program=KernelProgram((
             stage('query', begin, owner),
             Stage('tiles', after=('query',), program=pipe),
@@ -303,6 +321,20 @@ def _producer_program(owner, jobs, spec, stage, tiles=None):
         ))),)
 
     return PipelineProgram(len(jobs), 1, job_program)
+
+
+def _flat_cycle_stage(stage):
+    if stage.program is None:
+        yield stage
+        return
+    # The nested stage serialized both subblocks behind the prior join.
+    previous = (*stage.previous, stage.name)
+    names = []
+    for subblock, program in enumerate(stage.program.programs):
+        name = f'{stage.name}_sb{subblock}'
+        yield replace(program.stages[0], name=name, after=stage.after, previous=previous)
+        names.append(name)
+    yield Stage(stage.name, after=tuple(names))
 
 
 def _job_pipeline_spec(owner, job, spec, stage):
@@ -343,7 +375,7 @@ def _job_pipeline_spec(owner, job, spec, stage):
                 stage('update', work['update'], owner, after=('partial','softmax')),
                 Stage(f'partial_release{1-parity}', after=('update',)),
             ))
-        return tuple(result)
+        return tuple(flat for stage in result for flat in _flat_cycle_stage(stage))
 
     def cycle(index):
         # Only prologue, two ring parities and tail/flush differ.
@@ -353,7 +385,7 @@ def _job_pipeline_spec(owner, job, spec, stage):
         keys = min(KEY_TILE, end-(start+index)*KEY_TILE) if index < count else None
         old_keys = min(KEY_TILE, end-(start+index-1)*KEY_TILE) if index else None
         return cycle_template(keys, old_keys, index == 0, index == 1,
-                              index == count, index % 2)
+                              index == count, index % _STEADY_CYCLE_PERIOD)
     return PeriodicPipelineSpec(
         count + 1, _PIPELINE_SLOTS, cycle, head=_COMPACT_BOUNDARY_CYCLES, tail=_COMPACT_BOUNDARY_CYCLES,
     )
