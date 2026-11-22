@@ -358,10 +358,18 @@ def build_triton_chunk_kda(
     diag_blocks = max(1, bt // TRITON_DIAG_BLOCK)
     offdiag_tile = TRITON_DIAG_BLOCK * TRITON_DIAG_BLOCK
     inv_block_flops = 2 * offdiag_tile * TRITON_DIAG_BLOCK
-    pre_fp32_flops = head_chunks * (
-        2 * bt * bt * c.dk
-        + 2 * 2 * TRITON_OFFDIAG_BLOCKS * offdiag_tile * c.dk
-        + TRITON_INV_MERGE_DOTS * inv_block_flops
+    total_offdiag_blocks = 0
+    for length in c.lengths:
+        rem = length
+        while rem > 0:
+            rows = min(bt, rem)
+            n_sub = ceil_div(rows, TRITON_DIAG_BLOCK)
+            total_offdiag_blocks += (n_sub * (n_sub - 1)) // 2
+            rem -= rows
+    # vllm_ascend/ops/triton/kda/kda.py:538,542,671: off-diag sub_inter (2*tl.dot per pair) + solve_tril merge.
+    pre_fp32_flops = (
+        c.hv * total_offdiag_blocks * 2 * 2 * offdiag_tile * c.dk
+        + head_chunks * TRITON_INV_MERGE_DOTS * inv_block_flops
     )
     pre_bf16_flops = head_chunks * 2 * bt * bt * (c.dk + c.dv)
     diag_exp2_ops = head_chunks * DIAG_EXP2_PER_HEAD_CHUNK

@@ -40,6 +40,7 @@ from ..sparse_indexer.common import (
     PAIR_BYTES,
     SCORE_SLOTS,
     SparseIndexerContract,
+    request_contracts,
     sort_ops,
 )
 from .l0_sync import p12_flag_ms, p13_paired_ms, p13_syncall_ms
@@ -114,7 +115,19 @@ def _q_groups_for_batch(contract: SparseIndexerContract, s1_base: int) -> tuple[
     return tuple(out)
 
 
-def _q_groups_with_kv(op: OpSpec, contract: SparseIndexerContract, s1_base: int) -> tuple[tuple[int, int], ...]:
+def _q_groups_with_kv(
+    op: OpSpec, contract: SparseIndexerContract, s1_base: int, ctx: OperatorPlanningContext | None = None,
+) -> tuple[tuple[int, int], ...]:
+    if ctx is not None and ctx.requests:
+        out_req: list[tuple[int, int]] = []
+        for rc in request_contracts(contract, ctx):
+            rem = rc.query_tokens
+            while rem > 0:
+                take = min(s1_base, rem)
+                out_req.append((take, max(1, int(rc.scanned_rows))))
+                rem -= take
+        if out_req:
+            return tuple(out_req)
     raw_kv = dict(op.metadata).get("kv_lens")
     if isinstance(raw_kv, (list, tuple)) and len(raw_kv) == contract.batch_size:
         per_req_q = ceil_div(contract.query_tokens, contract.batch_size)
@@ -283,7 +296,7 @@ def build_arch35_v1_lightning(
     owners: tuple[tuple[int, tuple[int, ...]], ...], sources: tuple[SourceRef, ...],
 ) -> OperatorPlan:
     """Build native Arch35 aclnnLightningIndexer v1 (isLDOpen=false, 8192-trunk TopK)."""
-    q_groups = _q_groups_with_kv(op, contract, ARCH35_V1_S1_BASE)
+    q_groups = _q_groups_with_kv(op, contract, ARCH35_V1_S1_BASE, ctx)
     active = min(len(owners), max(1, len(q_groups)))
     score_ws = active * max((qr * kv for qr, kv in q_groups), default=1) * FP32_BYTES
     l2_cap = _l2_capacity(ctx)
@@ -320,6 +333,7 @@ class _Arch22V1Program:
     owners: tuple[tuple[int, tuple[int, ...]], ...]
     core_full_counts: tuple[int, ...]
     core_tail_rows: tuple[tuple[int, ...], ...]
+    core_q_loads: tuple[int, ...]
     q_rows_per_block: int
     s2_owners_per_group: int
     n_q_groups: int
@@ -397,12 +411,13 @@ class _Arch22V1Program:
         q_w = Work(resources={self.aic_read: q_b, "hbm": q_b})
         store_w = self._split_store_work()
         branches = []
-        for idx, (n_full, tails) in enumerate(zip(self.core_full_counts, self.core_tail_rows)):
+        for idx, (n_full, tails, q_loads) in enumerate(zip(self.core_full_counts, self.core_tail_rows, self.core_q_loads)):
             n_blks = n_full + len(tails)
             if n_blks <= 0:
                 continue
             aic, raw_aivs = self.owners[idx]
             aivs = raw_aivs[: min(len(raw_aivs), max(1, self.q_rows_per_block))]
+            core_q_w = q_w.scaled(max(1, q_loads))
 
             def _tile_for_rows(valid: int, aic=aic, aivs=aivs, n_blks=n_blks):
                 ws = self._tile_works(valid, n_blks)
@@ -436,7 +451,7 @@ class _Arch22V1Program:
 
             credit_ms = ARCH22_ENTRY_EXIT_CREDITS * p13_paired_ms(ctx)
             st = [
-                Stage("query_load", ctx.bind(q_w), placement=_place_aic(ctx, aic, self.aic_count, q_w)),
+                Stage("query_load", ctx.bind(core_q_w), placement=_place_aic(ctx, aic, self.aic_count, core_q_w)),
             ]
             prev_local = "query_load"
             if credit_ms > 0.0:
@@ -489,24 +504,27 @@ class _Arch22V1Program:
 
 
 def _assign_block_runs(
-    runs: list[tuple[int, int]], active: int,
-) -> tuple[tuple[int, ...], tuple[tuple[int, ...], ...]]:
-    """Distribute ``(count, valid_rows)`` tile runs evenly across ``active`` cores without row inflation."""
-    total_blocks = sum(cnt for cnt, _ in runs)
+    runs: list[tuple[int, int, int]], active: int,
+) -> tuple[tuple[int, ...], tuple[tuple[int, ...], ...], tuple[int, ...]]:
+    """Distribute ``(group_id, count, valid_rows)`` runs evenly across ``active`` cores with exact query-load counts."""
+    total_blocks = sum(cnt for _, cnt, _ in runs)
     if active <= 0 or total_blocks <= 0:
-        return (), ()
+        return (), (), ()
     base, rem_cores = divmod(total_blocks, active)
     full_counts: list[int] = []
     tail_lists: list[tuple[int, ...]] = []
+    q_loads: list[int] = []
     run_idx = 0
-    run_rem = runs[0][0] if runs else 0
+    run_rem = runs[0][1] if runs else 0
     for core_i in range(active):
         quota = base + (1 if core_i < rem_cores else 0)
         c_full = 0
         c_tails: list[int] = []
+        seen_groups: set[int] = set()
         while quota > 0 and run_idx < len(runs):
-            rows = runs[run_idx][1]
+            gid, _, rows = runs[run_idx]
             take = min(quota, run_rem)
+            seen_groups.add(gid)
             if rows == DEFAULT_S2_TILE:
                 c_full += take
             else:
@@ -515,10 +533,11 @@ def _assign_block_runs(
             run_rem -= take
             if run_rem == 0:
                 run_idx += 1
-                run_rem = runs[run_idx][0] if run_idx < len(runs) else 0
+                run_rem = runs[run_idx][1] if run_idx < len(runs) else 0
         full_counts.append(c_full)
         tail_lists.append(tuple(c_tails))
-    return tuple(full_counts), tuple(tail_lists)
+        q_loads.append(max(1, len(seen_groups)) if (c_full or c_tails) else 0)
+    return tuple(full_counts), tuple(tail_lists), tuple(q_loads)
 
 
 def build_arch22_v1_lightning(
@@ -526,37 +545,25 @@ def build_arch22_v1_lightning(
     owners: tuple[tuple[int, tuple[int, ...]], ...], sources: tuple[SourceRef, ...],
 ) -> OperatorPlan:
     """Build native Arch22 aclnnLightningIndexer v1 (SplitCore + s1BaseSize K-reuse + L2 score slots)."""
-    q_kv_groups = _q_groups_with_kv(op, contract, ARCH22_V1_S1_BASE)
+    q_kv_groups = _q_groups_with_kv(op, contract, ARCH22_V1_S1_BASE, ctx)
     n_q_groups = max(1, len(q_kv_groups))
     q_rows_per_block = max((qr for qr, _ in q_kv_groups), default=1)
-    raw_kv = dict(op.metadata).get("kv_lens")
-    runs: list[tuple[int, int]] = []
-    if isinstance(raw_kv, (list, tuple)) and len(raw_kv) == contract.batch_size:
-        # lightning_indexer_kernel_arch22.h:264: flatten exact per-request full and tail tiles.
-        seq_tiles = []
-        for _, kv in q_kv_groups:
-            n_full, rem = divmod(max(1, int(kv)), DEFAULT_S2_TILE)
-            if n_full > 0:
-                runs.append((n_full, DEFAULT_S2_TILE))
-            if rem > 0:
-                runs.append((1, rem))
-            seq_tiles.append(n_full + int(rem > 0))
-        total_blocks = sum(seq_tiles)
-        active = min(len(owners), total_blocks) if total_blocks > 0 else 0
-        max_tiles = max(seq_tiles, default=1)
-        s2_owners_per_group = min(active, max_tiles) if max_tiles > 1 else 1
-    else:
-        n_full, rem = divmod(contract.scanned_rows, DEFAULT_S2_TILE)
-        tiles_per_group = n_full + int(rem > 0)
-        for _ in range(n_q_groups):
-            if n_full > 0:
-                runs.append((n_full, DEFAULT_S2_TILE))
-            if rem > 0:
-                runs.append((1, rem))
-        total_blocks = n_q_groups * tiles_per_group
-        active = min(len(owners), total_blocks) if total_blocks > 0 else 0
-        s2_owners_per_group = min(tiles_per_group, max(1, active // n_q_groups)) if tiles_per_group > 1 else 1
-    core_full_counts, core_tail_rows = _assign_block_runs(runs, active)
+    runs: list[tuple[int, int, int]] = []
+    seq_tiles: list[int] = []
+    for gid, (_, kv) in enumerate(q_kv_groups):
+        n_full, rem = divmod(max(1, int(kv)), DEFAULT_S2_TILE)
+        if n_full > 0:
+            runs.append((gid, n_full, DEFAULT_S2_TILE))
+        if rem > 0:
+            runs.append((gid, 1, rem))
+        seq_tiles.append(n_full + int(rem > 0))
+    total_blocks = sum(seq_tiles)
+    active = min(len(owners), total_blocks) if total_blocks > 0 else 0
+    max_tiles = max(seq_tiles, default=1)
+    s2_owners_per_group = min(max_tiles, max(1, active // n_q_groups)) if max_tiles > 1 else 1
+    if len(set(seq_tiles)) > 1 and max_tiles > 1:
+        s2_owners_per_group = min(active, max_tiles)
+    core_full_counts, core_tail_rows, core_q_loads = _assign_block_runs(runs, active)
     slot_ws = active * SCORE_SLOTS * DEFAULT_S2_TILE * q_rows_per_block * contract.index_heads * FP32_BYTES
     l2_cap = _l2_capacity(ctx)
     score_l2 = l2_cap > 0 and slot_ws <= l2_cap
@@ -564,7 +571,7 @@ def build_arch22_v1_lightning(
     aic_r = read_role(ctx.geometry.resource_units)
     aiv_r = read_role(ctx.geometry.resource_units, aiv=0)
     prog = _Arch22V1Program(
-        contract, owners, core_full_counts, core_tail_rows, q_rows_per_block,
+        contract, owners, core_full_counts, core_tail_rows, core_q_loads, q_rows_per_block,
         s2_owners_per_group, n_q_groups, aic_r, aiv_r,
         ctx.datapath.aic_count, ctx.datapath.aiv_count, score_l2, has_l2,
     )
@@ -572,11 +579,11 @@ def build_arch22_v1_lightning(
     q_b = q_rows_per_block * contract.index_heads * contract.cache_row_bytes
     q_w = Work(resources={aic_r: q_b, "hbm": q_b})
     store_w = prog._split_store_work()
-    for n_full, tails in zip(core_full_counts, core_tail_rows):
+    for n_full, tails, q_loads in zip(core_full_counts, core_tail_rows, core_q_loads):
         n_blks = n_full + len(tails)
         if n_blks <= 0:
             continue
-        _acc(totals, "query_load", q_w)
+        _acc(totals, "query_load", q_w, max(1, q_loads))
         if n_full > 0:
             for k, w in prog._tile_works(DEFAULT_S2_TILE, n_blks).items():
                 _acc(totals, k, w, n_full)

@@ -1,10 +1,10 @@
 {
   "arch_preset": "npu_arch_2201",
   "cann_version": "9.2.1",
-  "envelope_sha256": "3fdd2aea820bf65d753b92dcade1a1a5caf195a514529b1e1703f055f80a616f",
+  "envelope_sha256": "ef9fa06d0747009fc78a0d6bf007beb046edf1a31f2c3e3ba744c42b032694a9",
   "primitives": {
     "P01_datacopy": {
-      "evidence_id": "capture://ascend910_9382/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
+      "evidence_id": "capture://a3-9382-ep/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
       "metrics": {
         "hbm_read_bytes_per_s": {
           "bound_kind": "rate_upper",
@@ -88,7 +88,7 @@
         "bisheng_version": "2026-10-23T10:55:39+08:00 clang version 15.0.5 (clang-5c68a1cb1231 flang-5c68a1cb1231)",
         "burst_turn_penalty": [
           {
-            "evidence_id": "capture://ascend910_9382/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
+            "evidence_id": "capture://a3-9382-ep/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
             "max_row_bytes": 64,
             "max_stride_bytes": 1024,
             "min_row_bytes": 32,
@@ -96,7 +96,7 @@
             "penalty_bytes": 480.0
           },
           {
-            "evidence_id": "capture://ascend910_9382/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
+            "evidence_id": "capture://a3-9382-ep/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
             "max_row_bytes": 64,
             "max_stride_bytes": 4096,
             "min_row_bytes": 32,
@@ -104,7 +104,7 @@
             "penalty_bytes": 480.0
           },
           {
-            "evidence_id": "capture://ascend910_9382/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
+            "evidence_id": "capture://a3-9382-ep/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
             "max_row_bytes": 64,
             "max_stride_bytes": null,
             "min_row_bytes": 32,
@@ -112,7 +112,7 @@
             "penalty_bytes": 480.0
           },
           {
-            "evidence_id": "capture://ascend910_9382/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
+            "evidence_id": "capture://a3-9382-ep/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
             "max_row_bytes": 128,
             "max_stride_bytes": 1024,
             "min_row_bytes": 64,
@@ -120,7 +120,7 @@
             "penalty_bytes": 448.0
           },
           {
-            "evidence_id": "capture://ascend910_9382/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
+            "evidence_id": "capture://a3-9382-ep/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
             "max_row_bytes": 128,
             "max_stride_bytes": 4096,
             "min_row_bytes": 64,
@@ -128,7 +128,7 @@
             "penalty_bytes": 448.0
           },
           {
-            "evidence_id": "capture://ascend910_9382/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
+            "evidence_id": "capture://a3-9382-ep/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
             "max_row_bytes": 128,
             "max_stride_bytes": null,
             "min_row_bytes": 64,
@@ -136,7 +136,7 @@
             "penalty_bytes": 448.0
           },
           {
-            "evidence_id": "capture://ascend910_9382/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
+            "evidence_id": "capture://a3-9382-ep/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
             "max_row_bytes": 256,
             "max_stride_bytes": 1024,
             "min_row_bytes": 128,
@@ -144,7 +144,7 @@
             "penalty_bytes": 383.96
           },
           {
-            "evidence_id": "capture://ascend910_9382/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
+            "evidence_id": "capture://a3-9382-ep/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
             "max_row_bytes": 256,
             "max_stride_bytes": 4096,
             "min_row_bytes": 128,
@@ -152,7 +152,7 @@
             "penalty_bytes": 384.0
           },
           {
-            "evidence_id": "capture://ascend910_9382/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
+            "evidence_id": "capture://a3-9382-ep/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
             "max_row_bytes": 256,
             "max_stride_bytes": null,
             "min_row_bytes": 128,
@@ -160,7 +160,7 @@
             "penalty_bytes": 384.0
           },
           {
-            "evidence_id": "capture://ascend910_9382/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
+            "evidence_id": "capture://a3-9382-ep/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
             "max_row_bytes": 512,
             "max_stride_bytes": 1024,
             "min_row_bytes": 256,
@@ -168,7 +168,7 @@
             "penalty_bytes": 256.0
           },
           {
-            "evidence_id": "capture://ascend910_9382/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
+            "evidence_id": "capture://a3-9382-ep/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
             "max_row_bytes": 512,
             "max_stride_bytes": 4096,
             "min_row_bytes": 256,
@@ -176,7 +176,7 @@
             "penalty_bytes": 256.0
           },
           {
-            "evidence_id": "capture://ascend910_9382/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
+            "evidence_id": "capture://a3-9382-ep/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
             "max_row_bytes": 512,
             "max_stride_bytes": null,
             "min_row_bytes": 256,
@@ -484,7 +484,7 @@
       }
     },
     "P02_load_data": {
-      "evidence_id": "capture://ascend910_9382/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
+      "evidence_id": "capture://a3-9382-ep/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
       "metrics": {
         "l1_to_l0a_bytes_per_s_per_aic": {
           "bound_kind": "rate_upper",
@@ -591,7 +591,7 @@
       }
     },
     "P03_fixpipe": {
-      "evidence_id": "capture://ascend910_9382/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
+      "evidence_id": "capture://a3-9382-ep/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
       "metrics": {
         "fixpipe_in_bytes_per_s_per_aic": {
           "bound_kind": "rate_upper",
@@ -663,7 +663,7 @@
       }
     },
     "P04_mte3_store": {
-      "evidence_id": "capture://ascend910_9382/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
+      "evidence_id": "capture://a3-9382-ep/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
       "metrics": {
         "atomic_contention_ns": {
           "bound_kind": "latency_lower",
@@ -739,7 +739,7 @@
       }
     },
     "P05_l2_residency_reuse": {
-      "evidence_id": "capture://ascend910_9382/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
+      "evidence_id": "capture://a3-9382-ep/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
       "metrics": {
         "l2_die_bytes_per_s": {
           "bound_kind": "rate_upper",
@@ -881,7 +881,7 @@
       }
     },
     "P06_mmad": {
-      "evidence_id": "capture://ascend910_9382/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
+      "evidence_id": "capture://a3-9382-ep/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
       "metrics": {
         "pipe_m_barrier_ns": {
           "bound_kind": "latency_lower",
@@ -911,7 +911,7 @@
             "trimmed_cv_pct": 0.0166,
             "trimmed_mean": 14671444296013.613
           },
-          "evidence_id": "capture://ascend910_9382/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
+          "evidence_id": "capture://a3-9382-ep/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
           "k_0": 16,
           "m_iss": 16,
           "status": "calibrated",
@@ -933,7 +933,7 @@
             "trimmed_cv_pct": 0.0136,
             "trimmed_mean": 14671775765898.246
           },
-          "evidence_id": "capture://ascend910_9382/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
+          "evidence_id": "capture://a3-9382-ep/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
           "k_0": 16,
           "m_iss": 16,
           "status": "calibrated",
@@ -955,7 +955,7 @@
             "trimmed_cv_pct": 0.0098,
             "trimmed_mean": 3678630258526.1626
           },
-          "evidence_id": "capture://ascend910_9382/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
+          "evidence_id": "capture://a3-9382-ep/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
           "k_0": 8,
           "m_iss": 16,
           "status": "calibrated",
@@ -977,7 +977,7 @@
             "trimmed_cv_pct": 0.0113,
             "trimmed_mean": 7342304804874.611
           },
-          "evidence_id": "capture://ascend910_9382/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
+          "evidence_id": "capture://a3-9382-ep/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
           "k_0": 8,
           "m_iss": 16,
           "status": "calibrated",
@@ -1012,7 +1012,7 @@
             "trimmed_cv_pct": 0.0185,
             "trimmed_mean": 29371308274611.664
           },
-          "evidence_id": "capture://ascend910_9382/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
+          "evidence_id": "capture://a3-9382-ep/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
           "k_0": 32,
           "m_iss": 16,
           "status": "calibrated",
@@ -1205,7 +1205,7 @@
       }
     },
     "P07_vec_alu": {
-      "evidence_id": "capture://ascend910_9382/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
+      "evidence_id": "capture://a3-9382-ep/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
       "metrics": {
         "raw_latency_cycles": {
           "bound_kind": "latency_lower",
@@ -1213,7 +1213,7 @@
         },
         "vec_alu_ops_per_s_per_aiv": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 115200000000.0,
+          "certified_upper_capacity": 57600000000.0,
           "cv_pct": 0.134,
           "n_samples": 24,
           "p05": 36894462906.85753,
@@ -1235,14 +1235,16 @@
           },
           "vec_alu_ops_per_s_per_aiv": {
             "cv_pct": 0.134,
-            "nominal_bound": 115200000000.0,
+            "nominal_bound": 57600000000.0,
             "status": "calibrated"
           }
         },
+        "probe_ops_per_element": 2.0,
         "ub_bank_groups": 16,
         "ub_bank_size_bytes": 4096,
         "ub_banks_per_group": 3,
-        "vector_width_bytes": 256
+        "vector_width_bytes": 256,
+        "work_unit": "elementary_alu_ops_per_s"
       },
       "status": "calibrated",
       "units": {
@@ -1250,7 +1252,7 @@
       }
     },
     "P08_vec_sfu": {
-      "evidence_id": "capture://ascend910_9382/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
+      "evidence_id": "capture://a3-9382-ep/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
       "metrics": {
         "raw_latency_cycles": {
           "bound_kind": "latency_lower",
@@ -1295,7 +1297,7 @@
       }
     },
     "P09_vec_reduce_cast": {
-      "evidence_id": "capture://ascend910_9382/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
+      "evidence_id": "capture://a3-9382-ep/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
       "metrics": {
         "cast_bytes_per_s_per_aiv": {
           "bound_kind": "rate_upper",
@@ -1349,7 +1351,7 @@
       }
     },
     "P10_sort_topk": {
-      "evidence_id": "capture://ascend910_9382/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
+      "evidence_id": "capture://a3-9382-ep/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
       "metrics": {
         "sort_elems_per_s": {
           "bound_kind": "rate_upper",
@@ -1360,28 +1362,28 @@
           "certified_upper_capacity": 57600000000.0,
           "cv_pct": 0.1645,
           "n_samples": 24,
-          "p05": 789532508.632391,
-          "p50": 791038988.126272,
-          "p95": 792937908.014885,
-          "p99": 793032475.216311,
+          "p05": 3158130034.529565,
+          "p50": 3164155952.505089,
+          "p95": 3171751632.059541,
+          "p99": 3172129900.865244,
           "trimmed_cv_pct": 0.1296,
-          "trimmed_mean": 791095272.149379
+          "trimmed_mean": 3164381088.597518
         }
       },
       "modes": {
         "sort32_mrgsort4": {
-          "evidence_id": "capture://ascend910_9382/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
+          "evidence_id": "capture://a3-9382-ep/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
           "sort_elems_per_s_per_aiv": {
             "bound_kind": "rate_upper",
             "certified_upper_capacity": 57600000000.0,
             "cv_pct": 0.1645,
             "n_samples": 24,
-            "p05": 789532508.632391,
-            "p50": 791038988.126272,
-            "p95": 792937908.014885,
-            "p99": 793032475.216311,
+            "p05": 3158130034.529565,
+            "p50": 3164155952.505089,
+            "p95": 3171751632.059541,
+            "p99": 3172129900.865244,
             "trimmed_cv_pct": 0.1296,
-            "trimmed_mean": 791095272.149379
+            "trimmed_mean": 3164381088.597518
           },
           "status": "calibrated"
         }
@@ -1400,6 +1402,8 @@
             "status": "calibrated"
           }
         },
+        "probe_sort_length": 1024,
+        "probe_sort_passes": 4,
         "sort_algorithm": "sort32_mrgsort4",
         "sort_die_elems_per_s_p50": 37969871430.06,
         "supported_sortall_lengths": [
@@ -1409,11 +1413,12 @@
           512,
           1024,
           2048
-        ]
+        ],
+        "work_unit": "elem_passes_per_s"
       },
       "status": "calibrated",
       "units": {
-        "rate": "elems_per_s_per_aiv"
+        "rate": "elem_passes_per_s_per_aiv"
       }
     },
     "P11_simt": {
@@ -1472,7 +1477,7 @@
       }
     },
     "P12_intracore_flag": {
-      "evidence_id": "capture://ascend910_9382/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
+      "evidence_id": "capture://a3-9382-ep/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
       "metrics": {
         "flag_m_fix_ns": {
           "bound_kind": "latency_lower",
@@ -1581,7 +1586,7 @@
       }
     },
     "P13_crosscore_sync": {
-      "evidence_id": "capture://ascend910_9382/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
+      "evidence_id": "capture://a3-9382-ep/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
       "metrics": {
         "mode0_aic_barrier_ns": {
           "bound_kind": "latency_lower",
@@ -1757,6 +1762,8 @@
       "modes": {},
       "parameters": {
         "first_issue_includes_min_kernel": true,
+        "issue_interval_includes_min_kernel": true,
+        "issue_interval_owner": "aiv",
         "lanes": 1,
         "metric_diagnostics": {
           "aic_first_issue_ns": {
@@ -1802,7 +1809,7 @@
       }
     },
     "P16_multistream_core_control": {
-      "evidence_id": "capture://ascend910_9382/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
+      "evidence_id": "capture://a3-9382-ep/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
       "metrics": {
         "set_limit_ns": {
           "bound_kind": "latency_lower",
@@ -1902,7 +1909,7 @@
       }
     },
     "P18_hccl_collective_band": {
-      "evidence_id": "capture://ascend910_9382/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
+      "evidence_id": "capture://a3-9382-ep/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
       "metrics": {
         "link_bytes_per_s": {
           "bound_kind": "rate_upper",
@@ -2062,7 +2069,7 @@
       }
     },
     "P20_host_dma_sync": {
-      "evidence_id": "capture://ascend910_9382/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
+      "evidence_id": "capture://a3-9382-ep/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
       "metrics": {
         "eager_d2h_sync_ns": {
           "bound_kind": "latency_lower",
@@ -2142,15 +2149,7 @@
         },
         "pinned_dma_startup_ns": {
           "bound_kind": "latency_lower",
-          "certified_upper_capacity": 0.0,
-          "cv_pct": 3.5458,
-          "n_samples": 24,
-          "p05": 33294.35108,
-          "p50": 33836.57446,
-          "p95": 37191.60636,
-          "p99": 37423.797539,
-          "trimmed_cv_pct": 2.2303,
-          "trimmed_mean": 34032.295504
+          "certified_upper_capacity": 0.0
         },
         "pinned_h2d_startup_ns": {
           "bound_kind": "latency_lower",
@@ -2199,11 +2198,8 @@
             "status": "calibrated"
           },
           "pageable_dma_startup_ns": {
-            "cv_pct": 5.6215,
             "nominal_bound": 0.0,
-            "observed_p50": 46838.263825,
-            "observed_p99": 56976.470118,
-            "status": "high_cv_unsealed"
+            "status": "unmeasured"
           },
           "pageable_h2d_startup_ns": {
             "cv_pct": 5.6215,
@@ -2218,9 +2214,8 @@
             "status": "calibrated"
           },
           "pinned_dma_startup_ns": {
-            "cv_pct": 3.5458,
             "nominal_bound": 0.0,
-            "status": "calibrated"
+            "status": "unmeasured"
           },
           "pinned_h2d_startup_ns": {
             "cv_pct": 3.5458,
@@ -2239,14 +2234,14 @@
   "provenance": {
     "calibrated": true,
     "campaign_id": "camp-202611-l0",
-    "capture_uri": "capture://ascend910_9382/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
+    "capture_uri": "capture://a3-9382-ep/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
     "clock_calibration": {
       "core_clock_scale_ratio": 1.0,
       "nominal_cube_freq_mhz": 1800.0,
       "observed_aicore_freq_mhz": 1800
     },
     "collected_utc": "2026-11-21T19:26:45Z",
-    "endpoint_alias": "ascend910_9382",
+    "endpoint_alias": "a3-9382-ep",
     "silicon_fingerprint": {
       "aic_count": 24,
       "aiv_count": 48,

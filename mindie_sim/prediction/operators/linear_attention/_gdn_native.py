@@ -91,7 +91,8 @@ def arch35_gdn_vf_vector_ops(rows: int, dk: int, dv: int) -> tuple[int, int, int
     row_scale = rows / float(GDN_CHUNK64_TOKENS)
     dim_scale = (dk * dv) / float(GDN_REF_HEAD_DIM * GDN_REF_HEAD_DIM)
     scale_2a2b = row_scale * (dk + dv) / GDN_REF_DIM_SUM
-    scale_3a3b = row_scale
+    # BuildLowerAndMaskedQktExactSliceVF + InverseAIVPanel8DirectBrcVFImpl execute fixed 64x64 VF panels.
+    scale_3a3b = 1.0
     gate_ops = int(round(ARCH35_GDN_AIVS_PER_HEAD * ARCH35_VF_GATE_ISSUES_PER_AIV * ARCH35_VF_LANES * scale_2a2b))
     inv_ops = int(round(ARCH35_GDN_AIVS_PER_HEAD * ARCH35_VF_INV_ISSUES_PER_AIV * ARCH35_VF_LANES * scale_3a3b))
     cast_ops = int(round(ARCH35_GDN_AIVS_PER_HEAD * ARCH35_VF_CAST_ISSUES_PER_AIV * ARCH35_VF_LANES * scale_2a2b))
@@ -144,8 +145,9 @@ def build_native_recurrent_gdn(
     waves = ceil_div(total_heads, active_aivs)
 
     slot_bytes = c.dk * c.dv * state_elem
-    state_read = total_heads * slot_bytes * c.use_initial_state
-    state_write = total_tokens * c.hv * slot_bytes * c.output_final_state
+    # recurrent_gated_delta_rule_arch35.h:438,465: CopyInState/CopyOutState execute unconditionally on in-place state.
+    state_read = total_heads * slot_bytes
+    state_write = total_tokens * c.hv * slot_bytes
     qkv_read = total_tokens * (2 * c.hk * c.dk * elem + c.hv * (c.dv * elem + gate_elem + beta_elem))
     out_write = total_tokens * c.hv * c.dv * elem
     mte2_total = state_read + qkv_read

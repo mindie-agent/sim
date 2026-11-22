@@ -133,7 +133,10 @@ def _merge_ascendc_into_raw(
         if s.get("P06.pipe_m_barrier_ns"):
             p06_dst["pipe_m_barrier_ns"] = s["P06.pipe_m_barrier_ns"]
     if s.get("P07.ub_alu_ops_per_s_per_aiv"):
-        raw.setdefault("P07_vec_alu", {})["vec_alu_ops_per_s_per_aiv"] = s["P07.ub_alu_ops_per_s_per_aiv"]
+        p07_dst = raw.setdefault("P07_vec_alu", {})
+        p07_dst["vec_alu_ops_per_s_per_aiv"] = s["P07.ub_alu_ops_per_s_per_aiv"]
+        if "p07_work_unit" in meta:
+            p07_dst["work_unit"] = meta["p07_work_unit"]
     if s.get("P08.ub_sfu_ops_per_s_per_aiv"):
         raw.setdefault("P08_vec_sfu", {})["vec_sfu_ops_per_s_per_aiv"] = s["P08.ub_sfu_ops_per_s_per_aiv"]
     if s.get("P09.ub_reduce_ops_per_s_per_aiv"):
@@ -144,6 +147,8 @@ def _merge_ascendc_into_raw(
         p10_dst = raw.setdefault("P10_sort_topk", {})
         p10_dst["sort_elems_per_s_per_aiv"] = s["P10.sort_elems_per_s_per_aiv"]
         p10_dst["measured_algorithm"] = "sort32_mrgsort4"
+        if "p10_work_unit" in meta:
+            p10_dst["work_unit"] = meta["p10_work_unit"]
         if "sort_die_elems_per_s_p50" in meta:
             p10_dst["sort_die_elems_per_s_p50"] = meta["sort_die_elems_per_s_p50"]
     if s.get("P11.simt_warp_instructions_per_s_per_aiv"):
@@ -174,60 +179,30 @@ def _merge_ascendc_into_raw(
         raw.setdefault("P15_rts_stars", {})["host_submit_burst_ns"] = s["P15.host_submit_burst_ns"]
     if ac.get("errors"):
         raw["ascendc_subtask_errors"] = ac["errors"]
-VEC_DIM = 2048
-TRITON_VEC_BLOCK = 2048
-TRITON_VEC_BLOCK_FALLBACK = 1024
-TRITON_VEC_ACCUMS = 4
-TRITON_VEC_ITERS = 512
-TRITON_VEC_OPS_PER_ITER = 4
-TRITON_VEC_WARMUP = 4
-TRITON_VEC_INNER = 4
-TRITON_VEC_INIT_SCALE = 0.001
-TRITON_VEC_MUL_VAL = 0.9999
-SORT_ROWS = 256
-SORT_COLS = 2048
-SORT_TOPK = 128
+VEC_DIM, TRITON_VEC_BLOCK, TRITON_VEC_BLOCK_FALLBACK = 2048, 2048, 1024
+TRITON_VEC_ACCUMS, TRITON_VEC_ITERS, TRITON_VEC_OPS_PER_ITER = 4, 512, 4
+TRITON_VEC_WARMUP, TRITON_VEC_INNER = 4, 4
+TRITON_VEC_INIT_SCALE, TRITON_VEC_MUL_VAL = 0.001, 0.9999
+SORT_ROWS, SORT_COLS, SORT_TOPK = 256, 2048, 128
 SMALL_M_GRID = (1, 16, 32, 64, 128, 256)
-INT8_MIN_VAL = -8
-INT8_MAX_VAL = 8
-TINY_GEMM_DIM = 16
-HOST_SUBMIT_BURST = 128
-P15_SMALL_BURST = 16
-P15_LARGE_BURST = 64
-P15_MARGINAL_DENOM = 48.0
-P15_FIRST_INNER = 1
-P16_INNER_STEPS = 32
-P16_HALF_NS_SCALE = 0.5e6
-DMA_SLAB_MIB = 64
-DMA_SMALL_ELEMS = 1024
+INT8_MIN_VAL, INT8_MAX_VAL, TINY_GEMM_DIM = -8, 8, 16
+HOST_SUBMIT_BURST, P15_SMALL_BURST, P15_LARGE_BURST = 128, 16, 64
+P15_MARGINAL_DENOM, P15_FIRST_INNER = 48.0, 1
+P16_INNER_STEPS, P16_HALF_NS_SCALE = 32, 0.5e6
+DMA_SLAB_MIB, DMA_SMALL_ELEMS = 64, 1024
 DMA_SMALL_BYTES = DMA_SMALL_ELEMS * FP32_BYTES
 BISHENG_VER_TIMEOUT_S = 10
 CANN_VER_RE = re.compile(r"(\d+\.\d+(?:\.\d+)?(?:\.[A-Za-z0-9]+)?)")
 PRIMITIVE_TAG_RE = re.compile(r"^P(?:0[1-9]|1[0-9]|20)$")
-NS_PER_MS = 1e6
-NS_PER_S = 1e9
-MS_PER_S = 1e-3
-MIN_LATENCY_MS = 1e-6
-MIN_DIVISOR = 1e-9
-MIN_KNEE_FRAC = 0.05
-KNEE_HALF_RATIO = 0.5
-HALF = 0.5
-TWO = 2.0
-THREE = 3.0
-THREE_INT = 3
-FOUR = 4
-SIX = 6
-EIGHT = 8
-SIXTEEN = 16
+NS_PER_MS, NS_PER_S, MS_PER_S = 1e6, 1e9, 1e-3
+MIN_LATENCY_MS, MIN_DIVISOR = 1e-6, 1e-9
+MIN_KNEE_FRAC, KNEE_HALF_RATIO, HALF = 0.05, 0.5, 0.5
+TWO, THREE, THREE_INT, FOUR, SIX, EIGHT, SIXTEEN = 2.0, 3.0, 3, 4, 6, 8, 16
 
 
 def _detect_runtime_toolchain(soc_name: str) -> dict[str, Any]:
     """Locate active CANN root INI SHA-256 plus runtime CANN and bisheng versions."""
-    env_roots = [
-        os.environ.get("ASCEND_HOME_PATH", ""),
-        os.environ.get("ASCEND_TOOLKIT_HOME", ""),
-        os.environ.get("ASCEND_OPP_PATH", ""),
-    ]
+    env_roots = [os.environ.get(k, "") for k in ("ASCEND_HOME_PATH", "ASCEND_TOOLKIT_HOME", "ASCEND_OPP_PATH")]
     patterns = [f"{r.rstrip('/')}/**/platform_config/{soc_name}.ini" for r in env_roots if r and Path(r).is_dir()]
     patterns.extend([
         f"/usr/local/Ascend/cann*/opp/**/platform_config/{soc_name}.ini",
@@ -238,32 +213,28 @@ def _detect_runtime_toolchain(soc_name: str) -> dict[str, Any]:
     active_root = next((r for r in env_roots[:2] if r and Path(r).is_dir()), "")
     for pat in patterns:
         matches = sorted(glob.glob(pat, recursive=True))
-        if matches:
-            ini_path = matches[-1]
-            try:
-                raw_bytes = Path(ini_path).read_bytes()
-            except OSError:
-                continue
-            ini_info = {
-                "ini_filename": os.path.basename(ini_path),
-                "ini_sha256": hashlib.sha256(raw_bytes).hexdigest(),
-                "ini_bytes": len(raw_bytes),
-            }
-            if not active_root:
-                parts = Path(ini_path).parts
-                for idx, part in enumerate(parts):
-                    if part.startswith("cann") or part == "ascend-toolkit":
-                        active_root = str(Path(*parts[: idx + 1]))
-                        break
-            break
+        if not matches:
+            continue
+        ini_path = matches[-1]
+        try:
+            raw_bytes = Path(ini_path).read_bytes()
+        except OSError:
+            continue
+        ini_info = {"ini_filename": os.path.basename(ini_path), "ini_sha256": hashlib.sha256(raw_bytes).hexdigest(), "ini_bytes": len(raw_bytes)}
+        if not active_root:
+            parts = Path(ini_path).parts
+            for idx, part in enumerate(parts):
+                if part.startswith("cann") or part == "ascend-toolkit":
+                    active_root = str(Path(*parts[: idx + 1]))
+                    break
+        break
     rt_cann = ""
     if active_root:
         for cfg in (Path(active_root) / "version.cfg", Path(active_root) / "ascend_toolkit_install.info"):
             if cfg.is_file():
                 m = CANN_VER_RE.search(cfg.read_text(encoding="utf-8", errors="ignore"))
                 if m:
-                    rt_cann = m.group(1)
-                    break
+                    rt_cann = m.group(1); break
         if not rt_cann:
             m = CANN_VER_RE.search(Path(active_root).name)
             rt_cann = m.group(1) if m else ""
@@ -275,12 +246,7 @@ def _detect_runtime_toolchain(soc_name: str) -> dict[str, Any]:
             bs_ver = first[0].strip()[:ERR_PREVIEW_CHARS] if first else ""
         except Exception:
             bs_ver = ""
-    return {
-        **ini_info,
-        "runtime_cann_version": rt_cann,
-        "bisheng_version": bs_ver,
-        "collected_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-    }
+    return {**ini_info, "runtime_cann_version": rt_cann, "bisheng_version": bs_ver, "collected_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
 
 
 def _parse_selected_primitives(spec: str) -> set[str] | None:
@@ -360,6 +326,24 @@ def _probe_vec_alu_triton(dev: Any, aiv_count: int, time_fn: Any) -> list[float]
     return None
 
 
+def certify_cold_ring(
+    touched_bytes: int, reuse_distance_bytes: int, l2_bytes: int, *, evicted_bytes: int = 0,
+) -> bool:
+    """Certify cold DRAM access from touched/evicted footprint and reuse distance."""
+    min_cold = THREE_INT * max(1, int(l2_bytes))
+    return bool(int(reuse_distance_bytes) >= min_cold and (int(touched_bytes) >= min_cold or int(evicted_bytes) >= min_cold))
+
+
+def collect_event_ms(events: list[tuple[Any, Any]], *, inner: int) -> list[float]:
+    """Read elapsed ms for every timed event pair without dropping zero/invalid trials."""
+    denom = float(max(1, inner))
+    return [float(se.elapsed_time(ee)) / denom for se, ee in events]
+
+
+def _safe_rate(num: float, t_ms: float) -> float:
+    return (num / (t_ms * MS_PER_S)) if t_ms > 0.0 else 0.0
+
+
 def _probe_hbm_l2_domain(
     torch: Any, dev: Any, *, l2_bytes: int, aiv_count: int, repeats: int, time_ms: Any,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], int, list[float], list[float]]:
@@ -375,44 +359,54 @@ def _probe_hbm_l2_domain(
     rw11_ms = time_ms(lambda i: ring_c[i % n_slots].copy_(ring_a[i % n_slots]), inner=1, blocker=True)
     rw21_ms = time_ms(lambda i: torch.add(ring_a[i % n_slots], ring_b[i % n_slots], out=ring_c[i % n_slots]), inner=1, blocker=True)
     rd_ms = time_ms(lambda i: torch.amax(ring_a[i % n_slots]), inner=1, blocker=True)
-    hbm_w = [slab / (t * MS_PER_S) for t in w_ms]
-    hbm_rw11 = [(TWO * slab) / (t * MS_PER_S) for t in rw11_ms]
-    hbm_rw21 = [(THREE * slab) / (t * MS_PER_S) for t in rw21_ms]
-    hbm_r = [max(slab / (tr * MS_PER_S), (TWO / THREE) * rw) for tr, rw in zip(rd_ms, hbm_rw21)]
+    hbm_w = [_safe_rate(slab, t) for t in w_ms]
+    hbm_rw11 = [_safe_rate(TWO * slab, t) for t in rw11_ms]
+    hbm_rw21 = [_safe_rate(THREE * slab, t) for t in rw21_ms]
+    hbm_r = [max(_safe_rate(slab, tr), (TWO / THREE) * rw) if (tr > 0.0 and rw > 0.0) else 0.0 for tr, rw in zip(rd_ms, hbm_rw21)]
     t_r1 = slab / max(1.0, statistics.median(hbm_r)) / MS_PER_S
     t_w1 = slab / max(1.0, statistics.median(hbm_w)) / MS_PER_S
     alphas = [(t11 - max(t_r1, t_w1)) / max(MIN_DIVISOR, min(t_r1, t_w1)) for t11 in rw11_ms]
     s_dst = torch.empty((STRIDED_ROWS, STRIDED_SLICE), dtype=torch.bfloat16, device=dev)
     s_rings = [a[: STRIDED_ROWS * STRIDED_COLS].view(STRIDED_ROWS, STRIDED_COLS) for a in ring_a]
     strided_bps = [
-        (TWO * STRIDED_ROWS * STRIDED_SLICE_BYTES) / (t * MS_PER_S)
+        _safe_rate(TWO * STRIDED_ROWS * STRIDED_SLICE_BYTES, t)
         for t in time_ms(lambda i: s_dst.copy_(s_rings[i % n_slots][:, :STRIDED_SLICE]), inner=BF16_BYTES, blocker=True)
     ]
     payload_ramp: dict[str, dict[str, Any]] = {}
     ring_total_bytes = n_slots * slab
+    evict_slots = min(n_slots, max(1, math.ceil((THREE_INT * l2_bytes) / slab)))
+    cursor = 0
     for kb in PAYLOAD_RAMP_KIB:
-        n_b = kb * KIB
-        el = n_b // BF16_BYTES
+        n_b, el = kb * KIB, (kb * KIB) // BF16_BYTES
         chunks_per_slot = max(1, slab // n_b)
         tot_pos = n_slots * chunks_per_slot
         inn = PAYLOAD_RAMP_SMALL_INNER if kb <= PAYLOAD_RAMP_SMALL_KIB else 1
-        def _slice_a(i: int, _e: int = el, _cps: int = chunks_per_slot, _tp: int = tot_pos) -> Any:
-            p = i % _tp
-            off = (p % _cps) * _e
-            return ring_a[p // _cps][off : off + _e]
-        def _slice_c(i: int, _e: int = el, _cps: int = chunks_per_slot, _tp: int = tot_pos) -> Any:
-            p = i % _tp
-            off = (p % _cps) * _e
-            return ring_c[p // _cps][off : off + _e]
+        base_pos = cursor
+        touched_bytes = (repeats + BLOCKER_SETTLE_ITERS) * inn * n_b
+        evicted_bytes = 0
+        if touched_bytes < THREE_INT * l2_bytes:
+            for e_i in range(evict_slots):
+                ring_c[e_i].copy_(ring_b[e_i])
+            torch.npu.synchronize()
+            evicted_bytes = evict_slots * slab
+        def _slice_a(i: int, _e: int = el, _cps: int = chunks_per_slot, _tp: int = tot_pos, _bp: int = base_pos) -> Any:
+            p = (_bp + i) % _tp
+            return ring_a[p % n_slots][((p // n_slots) % _cps) * _e : ((p // n_slots) % _cps + 1) * _e]
+        def _slice_c(i: int, _e: int = el, _cps: int = chunks_per_slot, _tp: int = tot_pos, _bp: int = base_pos) -> Any:
+            p = (_bp + i) % _tp
+            return ring_c[p % n_slots][((p // n_slots) % _cps) * _e : ((p // n_slots) % _cps + 1) * _e]
+        cursor += (repeats + BLOCKER_SETTLE_ITERS + DEFAULT_WARMUP) * inn
         t_rd = statistics.median(time_ms(lambda i, sa=_slice_a: torch.amax(sa(i)), inner=inn, blocker=True))
         t_wr = statistics.median(time_ms(lambda i, sc=_slice_c: sc(i).fill_(1.0), inner=inn, blocker=True))
         t_rw = statistics.median(time_ms(lambda i, sa=_slice_a, sc=_slice_c: sc(i).copy_(sa(i)), inner=inn, blocker=True))
+        reuse_dist = min(ring_total_bytes, tot_pos * n_b)
         payload_ramp[f"{kb}KB"] = {
-            "read_bps": round(n_b / (t_rd * MS_PER_S), SMALL_M_ROUND_DIGITS),
-            "write_bps": round(n_b / (t_wr * MS_PER_S), SMALL_M_ROUND_DIGITS),
-            "rw11_bps": round((TWO * n_b) / (t_rw * MS_PER_S), SMALL_M_ROUND_DIGITS),
-            "cold_ring_bytes": ring_total_bytes,
-            "cold_verified": bool(ring_total_bytes >= THREE_INT * l2_bytes),
+            "read_bps": round(_safe_rate(n_b, t_rd), SMALL_M_ROUND_DIGITS),
+            "write_bps": round(_safe_rate(n_b, t_wr), SMALL_M_ROUND_DIGITS),
+            "rw11_bps": round(_safe_rate(TWO * n_b, t_rw), SMALL_M_ROUND_DIGITS),
+            "cold_ring_bytes": ring_total_bytes, "touched_bytes": touched_bytes,
+            "reuse_distance_bytes": reuse_dist, "evicted_bytes": evicted_bytes,
+            "cold_verified": certify_cold_ring(touched_bytes, reuse_dist, l2_bytes, evicted_bytes=evicted_bytes),
         }
     del ring_a, ring_b, ring_c, s_rings, s_dst
     torch.npu.empty_cache()
@@ -624,21 +618,18 @@ def _probe_runtime_and_host_dma(
                 if sync:
                     torch.npu.synchronize()
                 acc += float(time.perf_counter_ns() - t0)
-            if acc > 0.0:
-                res.append(acc / float(EIGHT))
+            res.append(acc / float(EIGHT))
         return res
     def _fit_dma_pair(t_big_ns: list[float], t_sml_ns: list[float]) -> tuple[list[float], list[float]]:
         bps_list, lat_list = [], []
         for tb_ns, ts_ns in zip(t_big_ns, t_sml_ns):
             dt_s = (tb_ns - ts_ns) / NS_PER_S
-            if dt_s <= 0.0:
-                bps_list.append(-1.0)
-                lat_list.append(-1.0)
+            if tb_ns <= 0.0 or ts_ns <= 0.0 or dt_s <= 0.0:
+                bps_list.append(-1.0); lat_list.append(-1.0)
                 continue
             rate = float(dma_bytes - DMA_SMALL_BYTES) / dt_s
-            lat = ts_ns - (float(DMA_SMALL_BYTES) / rate) * NS_PER_S
             bps_list.append(rate)
-            lat_list.append(lat)
+            lat_list.append(ts_ns - (float(DMA_SMALL_BYTES) / rate) * NS_PER_S)
         return bps_list, lat_list
     h2d_pin_big = _single_dma_ns(lambda: d_buf.copy_(h_pin, non_blocking=True))
     h2d_pin_sml = _single_dma_ns(lambda: sp_dev.copy_(sp_pin, non_blocking=True))
@@ -656,7 +647,6 @@ def _probe_runtime_and_host_dma(
         "host_h2d_bytes_per_s": h2d_bps, "host_d2h_bytes_per_s": d2h_bps,
         "pinned_h2d_startup_ns": h2d_pin_lat, "pinned_d2h_startup_ns": d2h_pin_lat,
         "pageable_h2d_startup_ns": h2d_pg_lat, "pageable_d2h_startup_ns": d2h_pg_lat,
-        "pinned_dma_startup_ns": h2d_pin_lat, "pageable_dma_startup_ns": h2d_pg_lat,
         "eager_d2h_sync_ns": _single_dma_ns(lambda: float(ta.item()), sync=False),
     }
     del h_pin, h_page, d_buf, sp_pin, sp_page, sp_dev, ta, tb, to, aa, ab
@@ -720,7 +710,7 @@ def run_local_npu_microbenchmarks(
                     fn((idx + BLOCKER_SETTLE_ITERS) * inner + k)
                 ee.record()
             torch.npu.synchronize()
-            out.extend(float(se.elapsed_time(ee)) / float(inner) for se, ee in evs if float(se.elapsed_time(ee)) > 0.0)
+            out.extend(collect_event_ms(evs, inner=inner))
         return out
 
     raw: dict[str, Any] = {

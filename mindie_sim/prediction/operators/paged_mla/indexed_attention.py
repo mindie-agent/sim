@@ -194,7 +194,7 @@ def _align(value, size):
 
 
 def _phases(keys, heads, latent, rope, *, first, last, scratch_policy,
-            operand_modes=False):
+            operand_modes=False, flash_decode=False):
     """Physical tile work; padding is confined to matrix operands/results."""
     padded_h, padded_k = _align(heads, FRACTAL_ALIGNMENT), _align(keys, FRACTAL_ALIGNMENT)
     width = latent + rope
@@ -239,8 +239,9 @@ def _phases(keys, heads, latent, rope, *, first, last, scratch_policy,
 
     qk_inner = operands(padded_h * ((keys + (CUBE_PANEL_COLUMNS - 1)) // CUBE_PANEL_COLUMNS) * width * 2,
                         padded_k * width * 2)
-    pv_reads = keys * latent * 2 + probability
-    pv_inner = operands(padded_h * (latent // CUBE_PANEL_COLUMNS) * padded_k * 2,
+    pv_prob_mult = 2 if flash_decode else 1
+    pv_reads = keys * latent * 2 + pv_prob_mult * probability
+    pv_inner = operands(pv_prob_mult * padded_h * (latent // CUBE_PANEL_COLUMNS) * padded_k * 2,
                         latent * padded_k * 2)
     return (
         ("gather", Work(resources={
@@ -254,9 +255,10 @@ def _phases(keys, heads, latent, rope, *, first, last, scratch_policy,
         ("softmax", Work(resources={
             **scratch(read=heads * padded_k * FP32_ELEMENT_BYTES + 1024, vector=True),
             "vector": SOFTMAX_OPS_PER_SCORE * heads * padded_k + SOFTMAX_STATE_OPS_PER_HEAD * heads})),
-        ("probability", Work(resources=scratch(write=probability))),
+        ("probability", Work(resources=scratch(write=pv_prob_mult * probability))),
         ("pv_load", Work(resources={**scratch(read=pv_reads), **pv_inner})),
-        ("pv", Work(matrix={"bf16": 2 * padded_h * padded_k * latent})),
+        # sparse_flash_attention_service_cube_mla.h:1339: FLASH_DECODE issues high + residual PV Mmad.
+        ("pv", Work(matrix={"bf16": pv_prob_mult * 2 * padded_h * padded_k * latent})),
         ("nupdate", Work(resources={
             **(scratch(write=partial_output) if first else atomic(partial_output)),
             "vector": padded_h * (latent if first else OUTPUT_INIT_COLUMNS)})),
@@ -266,6 +268,9 @@ def _phases(keys, heads, latent, rope, *, first, last, scratch_policy,
             "vector": heads * latent * OUTPUT_FINALIZE_OPS_PER_VALUE if last else 0})),
         ("output", Work(resources={"hbm": output, "mte3": output})),
     )
+
+
+_FD_PHASES = partial(_phases, flash_decode=True)
 
 
 def build(op, geometry, *, scratch_policy, key_tile=INDEXED_KEY_TILE, slots=INDEXED_PIPELINE_SLOTS, compact=True,
@@ -339,10 +344,11 @@ def build_pipeline(shape, geometry, *, scratch_policy, key_tile=INDEXED_KEY_TILE
                         pk = base_k + (1 if p_idx < rem_k else 0)
                         if pk > 0:
                             part_seqs.append((1, pk - 1))
+            fd_factory = _FD_PHASES if phase_factory is _phases else phase_factory
             sub_plan = _plan(
                 tuple(part_seqs), topk, heads, latent, rope, geometry.compute_units,
                 scratch_policy, key_tile, slots, compact, operand_modes,
-                phase_factory, source_items, tuple(paired_vector_stages), vector_buffer_bytes,
+                fd_factory, source_items, tuple(paired_vector_stages), vector_buffer_bytes,
                 phase_unit_weights, 1, False,
             )
             state_bytes = heads * (latent + SPLIT_KV_STATE_SCALARS) * FP32_ELEMENT_BYTES

@@ -51,11 +51,32 @@ def p13_paired_ms(rc: Any) -> float:
 
 
 def p15_first_issue_ms(rc: Any, *, aiv: bool = True) -> float:
-    """Return calibrated P15 first-issue/submit latency in ms (0.0 if absent)."""
+    """Return calibrated dispatch-only P15 first-issue latency in ms (0.0 if absent or kernel-inclusive)."""
+    table = getattr(rc, "primitive_table", None)
+    if table is None or not hasattr(table, "cell"):
+        return 0.0
+    try:
+        params = table.cell("P15_rts_stars").parameters or {}
+    except ModelingError:
+        return 0.0
+    if params.get("first_issue_includes_min_kernel", False):
+        return 0.0
     primary = "aiv_first_issue_ns" if aiv else "aic_first_issue_ns"
-    return _p50_ms(rc, "P15_rts_stars", primary) or _p50_ms(rc, "P15_rts_stars", "host_submit_ns")
+    return _p50_ms(rc, "P15_rts_stars", primary)
 
 
-def p15_issue_interval_ms(rc: Any) -> float:
-    """Return calibrated P15 back-to-back stream issue interval in ms (0.0 if absent)."""
+def p15_issue_interval_ms(rc: Any, *, owner_kind: str = "aiv") -> float:
+    """Return calibrated dispatch-only P15 stream issue interval in ms (0.0 if absent or kernel-inclusive)."""
+    table = getattr(rc, "primitive_table", None)
+    if table is None or not hasattr(table, "cell"):
+        return 0.0
+    try:
+        params = table.cell("P15_rts_stars").parameters or {}
+    except ModelingError:
+        return 0.0
+    if params.get("issue_interval_includes_min_kernel", False):
+        return 0.0
+    measured_owner = str(params.get("issue_interval_owner") or "all").strip().lower()
+    if measured_owner not in {"all", owner_kind}:
+        return 0.0
     return _p50_ms(rc, "P15_rts_stars", "issue_interval_ns")

@@ -144,3 +144,74 @@ def test_directional_pcie_caps_unwrap_and_partial_p06_evidence_and_alpha_conflic
         assert tbl.cann_version and tbl.cann_version != "unmeasured"
         bt = tbl.cell("P01_datacopy").parameters.get("burst_turn_penalty") or ()
         assert all(int(r.get("min_row_bytes", 0)) > 0 for r in bt)
+
+
+def test_l0_metrology_cold_ring_zero_trial_p07_p10_p15_p18_p20_regressions():
+    """Lock fixes #7-#12: cold-ring touched footprint, zero-duration trials, P07/P10 units, P15/P18/P20 guards."""
+    from types import SimpleNamespace
+    from mindie_sim import compose_case, parse_case
+    from mindie_sim.prediction.collectives.topology import Topology
+    from mindie_sim.prediction.execution.step_helpers import _calibrated_stars_spec
+    from tools._bench_l0_probes import _safe_rate, certify_cold_ring, collect_event_ms
+
+    # #7: 16 KiB probe touching 3.25 MiB prefix on 192 MiB L2 is NOT cold unless evicted.
+    l2_192m = 192 * 1024 * 1024
+    assert certify_cold_ring(3_407_872, 16_384, l2_192m, evicted_bytes=0) is False
+    assert certify_cold_ring(3_407_872, 640 * 1024 * 1024, l2_192m, evicted_bytes=640 * 1024 * 1024) is True
+
+    # #8: Zero-duration trial is preserved (not dropped) and rejected by summarize_metric.
+    class _FakeEvt:
+        def __init__(self, ms: float):
+            self._ms = ms
+        def elapsed_time(self, _other) -> float:
+            return self._ms
+    evs = [(_FakeEvt(1.0), None)] * 8 + [(_FakeEvt(0.0), None)]
+    ms_list = collect_event_ms(evs, inner=1)
+    assert len(ms_list) == 9 and ms_list[-1] == 0.0
+    rates = [_safe_rate(1e6, dt) for dt in ms_list]
+    band, diag = summarize_metric(rates, certified_bound=2e9)
+    assert diag["status"] == "insufficient_or_invalid_samples" and diag["invalid_samples"] == 1 and "p50" not in band
+
+    # #9: P07 (179.13 ns for 8192-elem MulAddDst ops_per_element=2; 89.56 ns for 1-op) and P10 (1.5082 us for N=1024).
+    dp9582 = _dp("Ascend950DT_9582")
+    tbl9582 = load_primitives("Ascend950DT_9582", datapath=dp9582, require_calibrated=True)
+    assert tbl9582.cell("P07_vec_alu").parameters.get("work_unit") == "elementary_alu_ops_per_s"
+    assert tbl9582.cell("P10_sort_topk").parameters.get("work_unit") == "elem_passes_per_s"
+    r_p07_fma = lower_primitive(
+        "P07_vec_alu", {"elements": 8192, "ops_per_element": 2, "clock_hz": 1.65e9}, tbl9582, datapath=dp9582,
+        allow_uncalibrated_declaration=True,
+    )
+    assert 170.0 <= r_p07_fma.analytical_ms * 1e6 <= 190.0
+    r_p07_1op = lower_primitive(
+        "P07_vec_alu", {"elements": 8192, "ops_per_element": 1, "clock_hz": 1.65e9}, tbl9582, datapath=dp9582,
+        allow_uncalibrated_declaration=True,
+    )
+    assert 85.0 <= r_p07_1op.analytical_ms * 1e6 <= 95.0
+    r_p10 = lower_primitive("P10_sort_topk", {"n": 1024}, tbl9582, datapath=dp9582, allow_uncalibrated_declaration=True)
+    assert 1.4 <= r_p10.analytical_ms * 1e3 <= 1.65
+
+    # #10: P15 AIV min-kernel (1.810 us) never binds as STARS dispatch for AIC GEMMs.
+    dp9382 = _dp("Ascend910_9382")
+    tbl9382 = load_primitives("Ascend910_9382", datapath=dp9382, require_calibrated=True)
+    assert tbl9382.cell("P15_rts_stars").parameters.get("issue_interval_includes_min_kernel") is True
+    assert _calibrated_stars_spec(dp9382.stars_spec, tbl9382, submission_mode="eager", owner_kind="aic") is None
+
+    # #11: P18 2-rank intra-package AR eager startup never leaks to cross-package AG, 4-rank RS, or blocked stack.
+    cs4 = parse_case(compose_case("qwen3.8-27b", hardware="Ascend910_9382", tp=4, ep=1, num_devices=4, layers=1, quant="none"))
+    topo = Topology(cs4.machine, cs4.runtime.parallel, primitive_table=tbl9382)
+    assert topo.p18_matched_startup_us("allreduce", (0, 1), stack="eager") > 100.0
+    assert topo.p18_matched_startup_us("allgather", (0, 2), stack="eager") == 0.0
+    assert topo.p18_matched_startup_us("reduce_scatter", (0, 1, 2, 3), stack="eager") == 0.0
+    assert topo.p18_matched_startup_us("allreduce", (0, 1), stack="") == 0.0
+
+    # #12: P20 selects sealed directional D2H startup (~65.59 us on 9362), not H2D alias.
+    dp9362 = _dp("Ascend910_9362")
+    tbl9362 = load_primitives("Ascend910_9362", datapath=dp9362, require_calibrated=True)
+    r_p20 = lower_primitive(
+        "P20_host_dma_sync",
+        {"payload_bytes": 4 * 1024 * 1024, "direction": "d2h", "memory_kind": "pinned", "node": 0, "root_complex_id": "rc0", "die": 0},
+        tbl9362, datapath=dp9362, allow_uncalibrated_declaration=True,
+    )
+    startup_us = sum(st.latency * 1000.0 for st in r_p20.stages)
+    assert startup_us == pytest.approx(tbl9362.cell("P20_host_dma_sync").band("pinned_d2h_startup_ns").p50 * 1e-3, rel=1e-4)
+    assert startup_us > 50.0

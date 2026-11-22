@@ -63,9 +63,7 @@ DAV_3510_HBM_BURST_BYTES = 256
 
 
 def _fixpipe_bytes(rows: int, columns: int) -> int:
-    m = ceil(rows / FIXPIPE_ROW_ALIGNMENT) * FIXPIPE_ROW_ALIGNMENT
-    n = ceil(columns / FIXPIPE_COLUMN_ALIGNMENT) * FIXPIPE_COLUMN_ALIGNMENT
-    return m * n * FP32_BYTES
+    return ceil(rows / FIXPIPE_ROW_ALIGNMENT) * FIXPIPE_ROW_ALIGNMENT * ceil(columns / FIXPIPE_COLUMN_ALIGNMENT) * FIXPIPE_COLUMN_ALIGNMENT * FP32_BYTES
 
 
 def _l2_capacity_bytes(ctx: OperatorPlanningContext) -> int:
@@ -83,6 +81,8 @@ class _FiaRect:
     end: int
     rect_in_head: int = 0
     rects_per_head: int = 1
+    prev_touched_start: int = 0
+    prev_touched_end: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -221,8 +221,10 @@ class _FiaLoop:
         row = tile * self.m_tile
         m = min(self.m_tile, queries * group - row)
         visible = min(kv, kv if c.selected_tokens is None else c.selected_tokens, c.window_size or kv)
+        prev_start, prev_end = 0, 0
         if c.causal and c.sequences:
-            if (self.ctx.layout or c.kv_layout) in TOKEN_MAJOR_LAYOUTS:
+            token_major = (self.ctx.layout or c.kv_layout) in TOKEN_MAJOR_LAYOUTS
+            if token_major:
                 first, last = row // group, (row + m - 1) // group
             elif row // queries == (row + m - 1) // queries:
                 first, last = row % queries, (row + m - 1) % queries
@@ -230,12 +232,23 @@ class _FiaLoop:
                 first, last = 0, queries - 1
             start = max(0, kv - queries + first + 1 - visible)
             end = max(0, kv - queries + last + 1)
+            if tile > 0:
+                prev_start = max(0, kv - queries + 1 - visible)
+                if token_major:
+                    prev_end = max(0, kv - queries + ((row - 1) // group) + 1)
+                elif (row - 1) // queries == row // queries:
+                    prev_end = max(0, kv - queries + ((row - 1) % queries) + 1)
+                else:
+                    prev_end = kv
         else:
             start, end = kv - visible, kv
+            if tile > 0:
+                prev_start, prev_end = start, end
         return _FiaRect(
             sequence, m, head, kv, row, start // self.s2_tile,
             ceil(end / self.s2_tile) if visible else start // self.s2_tile,
             rect_in_head=tile, rects_per_head=rects_per_head,
+            prev_touched_start=prev_start, prev_touched_end=prev_end,
         )
 
     def _kv(self, rect, start, n, dim, width, offset, tensor):
@@ -243,6 +256,7 @@ class _FiaLoop:
         page = c.block_size if c.kv_layout in PAGED_LAYOUTS else rect.kv
         base_token = self.kv_offsets[rect.sequence] if self.kv_offsets and not c.block_table else 0
         stride = self.kv_strides[rect.sequence] if self.kv_strides else rect.kv
+        orig_start, orig_n = start, n
         runs = []
         while n:
             block, begin = divmod(start, page)
@@ -271,10 +285,13 @@ class _FiaLoop:
             copy = max(copy, plan.dram_sector_and_service(owner_rules)[1])
         hbm = plan.dram_sector_and_service(hbm_rules)[1]
         memory = (plan, hbm_rules, tensor) if c.kv_tensor_id and (c.block_table or self.ctx.requests) else None
-        if memory is None and rect.rect_in_head > 0 and self.kv_reuse_hit_frac > 0.0:
-            hit_bytes = int(round(copy * self.kv_reuse_hit_frac))
-            miss_hbm = max(0, int(round(hbm * (1.0 - self.kv_reuse_hit_frac))))
-            return read_work(self.ctx, copy, hbm=miss_hbm, l2=hit_bytes), None
+        if memory is None and rect.rect_in_head > 0 and self.kv_reuse_hit_frac > 0.0 and orig_n > 0:
+            reused_toks = max(0, min(orig_start + orig_n, rect.prev_touched_end) - max(orig_start, rect.prev_touched_start))
+            eff_hit_frac = (reused_toks / float(orig_n)) * self.kv_reuse_hit_frac
+            if eff_hit_frac > 0.0:
+                hit_bytes = int(round(copy * eff_hit_frac))
+                miss_hbm = max(0, int(round(hbm * (1.0 - eff_hit_frac))))
+                return read_work(self.ctx, copy, hbm=miss_hbm, l2=hit_bytes), None
         return read_work(self.ctx, copy, hbm=hbm), memory
 
     def s2_phases(self, rect, tile):
@@ -472,7 +489,7 @@ class _FiaLoop:
             # rather than dividing a 32-core ceiling across 8 straggler cores.
             cold_kv_caps = p01_cold_mte2_aic_cap(context, 1, include_hbm=True)
         else:
-            if self.fd_segments and not self.ctx.requests:
+            if self.fd_segments:
                 active_owners = max(1, min(owners, len(self.fd_segments)))
             elif self.row_ends[-1] > 0:
                 splits_0 = max(1, len(tuple(self.ranges(self.rectangle(0)))))
@@ -518,7 +535,7 @@ class _FiaLoop:
                             for phase in partial)
             return KernelProgram((load, loop, *commits))
 
-        if self.fd_segments and not self.ctx.requests:
+        if self.fd_segments:
             return self._lower_fd_segments(context, places, allocs, owners, lower_phase, build_branch)
 
         def row(index, core, name="s1"):
@@ -607,28 +624,20 @@ class _FiaLoop:
 
 
 def _resolve_native_tiling(
-    contract: AttentionContract,
-    ctx: OperatorPlanningContext,
-    sequences: tuple[tuple[int, int], ...],
-    *,
-    gm_workspace: bool,
+    contract: AttentionContract, ctx: OperatorPlanningContext,
+    sequences: tuple[tuple[int, int], ...], *, gm_workspace: bool,
 ) -> CorePartition | None:
     if contract.panel_mode != "shipping" or contract.splits > 1 or contract.fia_template is not None:
         return None
-    if contract.kv_tensor_id and (contract.block_table or ctx.requests):
-        return None
-    aic_count = ctx.effective_aic_cores
-    paged = contract.kv_layout in PAGED_LAYOUTS
+    aic_count, paged = ctx.effective_aic_cores, contract.kv_layout in PAGED_LAYOUTS
     if gm_workspace:
         return resolve_arch22_fia_gqa_tiling(
-            sequences=sequences, num_heads=contract.num_heads,
-            num_kv_heads=contract.num_kv_heads, block_size=contract.block_size,
-            paged=paged, aic_count=aic_count, layout=contract.kv_layout,
+            sequences=sequences, num_heads=contract.num_heads, num_kv_heads=contract.num_kv_heads,
+            block_size=contract.block_size, paged=paged, aic_count=aic_count, layout=contract.kv_layout,
         )
     return resolve_arch35_fia_gqa_tiling(
-        sequences=sequences, num_heads=contract.num_heads,
-        num_kv_heads=contract.num_kv_heads, head_dim=contract.head_dim,
-        v_head_dim=contract.v_head_dim, block_size=contract.block_size,
+        sequences=sequences, num_heads=contract.num_heads, num_kv_heads=contract.num_kv_heads,
+        head_dim=contract.head_dim, v_head_dim=contract.v_head_dim, block_size=contract.block_size,
         paged=paged, aic_count=aic_count, l2_bytes=_l2_capacity_bytes(ctx),
         causal=contract.causal, is_decode=(contract.phase == "decode"),
     )
@@ -640,8 +649,7 @@ def _compute_kv_l2_reuse(
     ws_bytes: int, ws_l2_resident: bool, gm_workspace: bool,
 ) -> float:
     group = contract.num_heads // contract.num_kv_heads
-    max_s1 = max((q for q, _ in sequences), default=1)
-    max_s2 = max((kv for _, kv in sequences), default=0)
+    max_s1, max_s2 = max((q for q, _ in sequences), default=1), max((kv for _, kv in sequences), default=0)
     rects_per_head = ceil(max_s1 * group / m_tile)
     if rects_per_head <= 1 or l2_cap <= 0 or max_s2 <= 0:
         return 0.0
@@ -651,13 +659,10 @@ def _compute_kv_l2_reuse(
     wave_rects_per_head = min(rects_per_head, max(1, num_owners // concurrent_heads))
     pipe_slots = ARCH22_WORKSPACE_SLOTS if gm_workspace else ARCH35_PIPELINE_SLOTS
     lockstep_window = concurrent_heads * pipe_slots * s2_tile * (contract.head_dim + contract.v_head_dim) * BF16_BYTES
-    # Streaming LRU residency: lockstep peer rectangles hit iff the in-flight S2 window
-    # fits in L2; cross-wave reuses hit iff the entire streamed KV stream fits without LRU eviction.
     in_wave_hit = 1.0 if lockstep_window <= l2_usable else 0.0
     cross_wave_hit = 1.0 if (concurrent_heads * kv_head_bytes) <= l2_usable else 0.0
     total_reuse_rects = max(1, rects_per_head - 1)
-    waves = ceil(rects_per_head / wave_rects_per_head)
-    cross_wave_firsts = max(0, waves - 1)
+    cross_wave_firsts = max(0, ceil(rects_per_head / wave_rects_per_head) - 1)
     in_wave_reuses = max(0, total_reuse_rects - cross_wave_firsts)
     return (in_wave_reuses * in_wave_hit + cross_wave_firsts * cross_wave_hit) / float(total_reuse_rects)
 
@@ -726,7 +731,7 @@ def dense_fia(
         contract, sequences, m_tile, s2_tile, len(owners), l2_cap, ws_bytes, ws_l2_resident, gm_workspace,
     )
     use_balanced_fd = (
-        native is not None and native.fd_enabled and contract.splits == 1 and not ctx.requests
+        native is not None and native.fd_enabled and contract.splits == 1
         and (len(owners) > n_rects or n_rects % len(owners) != 0)
     )
     loop_seed = _FiaLoop(
@@ -771,10 +776,14 @@ def dense_fia(
             for phase in loop.partial(rect, len(ranges) > 1):
                 collect(partials, phase)
         full_end = min(rect.end, rect.kv // s2_tile)
-        periodic_end = full_end if contract.block_table else min(full_end, rect.first + period)
+        non_periodic = bool(contract.block_table) or (
+            rect.rect_in_head > 0 and kv_reuse_hit_frac > 0.0
+            and (rect.prev_touched_start > rect.first * s2_tile or rect.prev_touched_end < full_end * s2_tile)
+        )
+        periodic_end = full_end if non_periodic else min(full_end, rect.first + period)
         for tile in range(rect.first, periodic_end):
             for phase in loop.s2_phases(rect, tile):
-                collect(s2, phase, 1 if contract.block_table else ceil((full_end - tile) / period))
+                collect(s2, phase, 1 if non_periodic else ceil((full_end - tile) / period))
         if rect.first <= full_end < rect.end:
             for phase in loop.s2_phases(rect, full_end):
                 collect(s2, phase)

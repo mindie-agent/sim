@@ -25,6 +25,15 @@ from ...mechanism import Geometry, OperatorPlan, Work
 from ...ownership import read_role
 from ...program import KernelProgram, ParallelProgram, RecipeContext, Stage
 from ...results import FusedPipelineSpec, OpOccurrence, PipelinePhase, WorkItem
+from ...runtime.l2_residency import AdmissionMemoryView, bind_memory_access
+from ...runtime.memory_physics import (
+    AddressRun,
+    AddressRunPlan,
+    HbmBusSpec,
+    MemoryAccessPattern,
+    ReuseKey,
+    VisibilityContract,
+)
 from ..attention.common import ARCH35, BF16_BYTES, FP32_BYTES
 from ..contracts import OperatorPlanningContext
 
@@ -141,14 +150,43 @@ def build_ring_update(op: OpSpec, geometry: Geometry | OperatorPlanningContext) 
     vec_per_th = contract.head_dim * ATTN_ELEM_OPS + STATS_WIDTH * STATS_LANE_OPS
     total_th = contract.tokens * contract.num_heads
     has_l2_rate = "l2" in ctx.geometry.rates
+    die = int(ctx.geometry.rank or 0)
     l2_cap = _l2_capacity_bytes(ctx)
     total_read = total_th * read_per_th
     total_write = total_th * write_per_th
-    absorbed_write = min(total_write, max(0, l2_cap - total_read)) if l2_cap > 0 else 0
-    spilled_write = total_write - absorbed_write
-    l2_absorbed = absorbed_write > 0
-    hbm_per_th = int(round((total_read + spilled_write) / max(1, total_th)))
-    l2_per_th = int(round(absorbed_write / max(1, total_th))) if has_l2_rate else 0
+    view = ctx.admission_memory_view
+    if view is None:
+        view = AdmissionMemoryView({die: l2_cap}, arch_id=str(ctx.compute_arch.arch_id))
+    hbm_bus = HbmBusSpec(die, 1, 1, 0)
+    read_hbm, write_hbm, l2_bytes = total_read, total_write, 0
+    if total_read > 0:
+        r_pat = MemoryAccessPattern(
+            "ring_update_in", 0, die, 0, "read", aiv_read, total_read,
+            AddressRunPlan((AddressRun(0, 1, total_read, total_read),)),
+            reuse_key=ReuseKey(die, "ring_update_in", 0, reuse_stream="ring_update"),
+        )
+        r_led = bind_memory_access(
+            r_pat, view, hbm_bus=hbm_bus, copy_hit_bytes_per_ms=1, copy_miss_bytes_per_ms=1,
+            l2_bytes_per_ms=1, pipe_row_id=aiv_read, l2_row_id="l2", commit=False,
+        ).ledger
+        read_hbm = r_led.dram_sector_bytes
+        l2_bytes += r_led.l2_hit_bytes
+    if total_write > 0:
+        w_pat = MemoryAccessPattern(
+            "ring_update_out", 0, die, 0, "write", "mte3", total_write,
+            AddressRunPlan((AddressRun(0, 1, total_write, total_write),)),
+            reuse_key=ReuseKey(die, "ring_update_out", 0, reuse_stream="ring_update"),
+            visibility=VisibilityContract(live_out=True, private_workspace=False),
+        )
+        w_led = bind_memory_access(
+            w_pat, view, hbm_bus=hbm_bus, copy_hit_bytes_per_ms=1, copy_miss_bytes_per_ms=1,
+            l2_bytes_per_ms=1, pipe_row_id="mte3", l2_row_id="l2", commit=False,
+        ).ledger
+        write_hbm = w_led.dram_sector_bytes
+        l2_bytes += w_led.l2_hit_bytes
+    l2_absorbed = l2_bytes > 0
+    hbm_per_th = int(round((read_hbm + write_hbm) / max(1, total_th)))
+    l2_per_th = int(round(l2_bytes / max(1, total_th))) if has_l2_rate else 0
     if is_arch35:
         total_units = total_th
         mult = 1

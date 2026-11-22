@@ -6,12 +6,12 @@
       "calibrated": true,
       "calibrated_primitive_count": 15,
       "cann_version": "9.2.1",
-      "capture_uri": "capture://ascend910b4/camp-202611-l0/ac44045b6fbccea57a98480a34ac7832078f8b72ca530032c58a33414320a75c",
+      "capture_uri": "capture://a2-910b4-ep/camp-202611-l0/ac44045b6fbccea57a98480a34ac7832078f8b72ca530032c58a33414320a75c",
       "compatible_skus": [
         "Ascend910B4"
       ],
       "coverage_summary": {
-        "calibrated_metrics": 46,
+        "calibrated_metrics": 44,
         "calibrated_modes": [
           "bf16",
           "fp16",
@@ -33,7 +33,7 @@
           "mxfp4"
         ]
       },
-      "envelope_sha256": "13a6ddf74035aa78741ba2df3239a5e64fb28a9e7c5668cf0a2e51b9ca68eefd",
+      "envelope_sha256": "03b1ec9f3db8b982853d67820e3c704fde77841ffb16eda66069e1debfb55be2",
       "file": "arch22_a2_910b4.json",
       "ini_sha256": "314c14eefb53807216db8ed5486367e7ad615079d613423aa66ce2a0d22c74e1",
       "sku": "Ascend910B4",
@@ -46,7 +46,7 @@
       "calibrated": true,
       "calibrated_primitive_count": 14,
       "cann_version": "9.3.0",
-      "capture_uri": "capture://ascend910_9362/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
+      "capture_uri": "capture://a3-9362-ep/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
       "compatible_skus": [
         "Ascend910_9362"
       ],
@@ -73,7 +73,7 @@
           "mxfp4"
         ]
       },
-      "envelope_sha256": "eda1aebc12275f0f030d105182d0de4004c76918ca01bd3c1c528a59d3bfab71",
+      "envelope_sha256": "bebb0d9e4294702112e631629b053bf0b594fe11bb338e11076d13a54c9612b2",
       "file": "arch22_a3_9362.json",
       "ini_sha256": "c070a85dd8063e034e772b178caf798b3f8fae4c4024f2afdf983eb4117a9fa3",
       "sku": "Ascend910_9362",
@@ -86,12 +86,12 @@
       "calibrated": true,
       "calibrated_primitive_count": 15,
       "cann_version": "9.2.1",
-      "capture_uri": "capture://ascend910_9382/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
+      "capture_uri": "capture://a3-9382-ep/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
       "compatible_skus": [
         "Ascend910_9382"
       ],
       "coverage_summary": {
-        "calibrated_metrics": 46,
+        "calibrated_metrics": 45,
         "calibrated_modes": [
           "bf16",
           "fp16",
@@ -113,7 +113,7 @@
           "mxfp4"
         ]
       },
-      "envelope_sha256": "3fdd2aea820bf65d753b92dcade1a1a5caf195a514529b1e1703f055f80a616f",
+      "envelope_sha256": "ef9fa06d0747009fc78a0d6bf007beb046edf1a31f2c3e3ba744c42b032694a9",
       "file": "arch22_a3_9382.json",
       "ini_sha256": "d2d84c0ded236393ef40284673cb62bc234e503ed4f0967f31a637f965aadd29",
       "sku": "Ascend910_9382",
@@ -126,7 +126,7 @@
       "calibrated": true,
       "calibrated_primitive_count": 14,
       "cann_version": "9.2.0",
-      "capture_uri": "capture://ascend950dt_9582/camp-202611-l0/b15af2ccbe4a3c187179a44af933b079994a58ca75848975742a5eeb8d151e7c",
+      "capture_uri": "capture://a5-9582-ep/camp-202611-l0/b15af2ccbe4a3c187179a44af933b079994a58ca75848975742a5eeb8d151e7c",
       "compatible_skus": [
         "Ascend950DT_9582"
       ],
@@ -153,7 +153,7 @@
           "int4"
         ]
       },
-      "envelope_sha256": "d5207f99367708d049a865bbb11ce3feb5ded80fbce91319bfdba2e71f57cf6a",
+      "envelope_sha256": "5c849b5ed8d487beed4abda7c9d6eeff8a4dc0592765eb549603624fe8173d17",
       "file": "arch35_a5_950dt.json",
       "ini_sha256": "b8e7d61780056889e795639504530ecacb2b759ad1602e929b863d837fdf0099",
       "sku": "Ascend950DT_9582",
@@ -166,7 +166,7 @@
       "calibrated": false,
       "calibrated_primitive_count": 0,
       "cann_version": "unmeasured",
-      "capture_uri": "capture://ascend950pr_9579/camp-202611-l0/7e9b2da7383afdd9e1678c01f9812162a9b74a3dddf6fe770488727344677e0a",
+      "capture_uri": "capture://a5-9579-unmeasured/camp-202611-l0/7e9b2da7383afdd9e1678c01f9812162a9b74a3dddf6fe770488727344677e0a",
       "compatible_skus": [
         "Ascend950PR_9579"
       ],
@@ -192,7 +192,7 @@
           "int4"
         ]
       },
-      "envelope_sha256": "7c2d64346d0ec991f935c7ba69c9cb9f8be869084e294cde9c82d7bfc00b8651",
+      "envelope_sha256": "f0b0295e98fd5bb956c4fe7f54ecd32762e7e6dec2e88c53d1890bf267737319",
       "file": "arch35_a5_950pr.json",
       "ini_sha256": "",
       "sku": "Ascend950PR_9579",

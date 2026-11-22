@@ -1,10 +1,10 @@
 {
   "arch_preset": "npu_arch_2201",
   "cann_version": "9.3.0",
-  "envelope_sha256": "eda1aebc12275f0f030d105182d0de4004c76918ca01bd3c1c528a59d3bfab71",
+  "envelope_sha256": "bebb0d9e4294702112e631629b053bf0b594fe11bb338e11076d13a54c9612b2",
   "primitives": {
     "P01_datacopy": {
-      "evidence_id": "capture://ascend910_9362/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
+      "evidence_id": "capture://a3-9362-ep/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
       "metrics": {
         "hbm_read_bytes_per_s": {
           "bound_kind": "rate_upper",
@@ -88,7 +88,7 @@
         "bisheng_version": "2026-11-10T23:30:14+08:00 clang version 15.0.5 (clang-5c68a1cb1231 flang-5c68a1cb1231)",
         "burst_turn_penalty": [
           {
-            "evidence_id": "capture://ascend910_9362/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
+            "evidence_id": "capture://a3-9362-ep/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
             "max_row_bytes": 64,
             "max_stride_bytes": 1024,
             "min_row_bytes": 32,
@@ -96,7 +96,7 @@
             "penalty_bytes": 479.4
           },
           {
-            "evidence_id": "capture://ascend910_9362/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
+            "evidence_id": "capture://a3-9362-ep/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
             "max_row_bytes": 64,
             "max_stride_bytes": 4096,
             "min_row_bytes": 32,
@@ -104,7 +104,7 @@
             "penalty_bytes": 480.0
           },
           {
-            "evidence_id": "capture://ascend910_9362/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
+            "evidence_id": "capture://a3-9362-ep/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
             "max_row_bytes": 64,
             "max_stride_bytes": null,
             "min_row_bytes": 32,
@@ -112,7 +112,7 @@
             "penalty_bytes": 480.0
           },
           {
-            "evidence_id": "capture://ascend910_9362/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
+            "evidence_id": "capture://a3-9362-ep/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
             "max_row_bytes": 128,
             "max_stride_bytes": 1024,
             "min_row_bytes": 64,
@@ -120,7 +120,7 @@
             "penalty_bytes": 446.3
           },
           {
-            "evidence_id": "capture://ascend910_9362/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
+            "evidence_id": "capture://a3-9362-ep/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
             "max_row_bytes": 128,
             "max_stride_bytes": 4096,
             "min_row_bytes": 64,
@@ -128,7 +128,7 @@
             "penalty_bytes": 448.0
           },
           {
-            "evidence_id": "capture://ascend910_9362/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
+            "evidence_id": "capture://a3-9362-ep/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
             "max_row_bytes": 128,
             "max_stride_bytes": null,
             "min_row_bytes": 64,
@@ -136,7 +136,7 @@
             "penalty_bytes": 448.0
           },
           {
-            "evidence_id": "capture://ascend910_9362/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
+            "evidence_id": "capture://a3-9362-ep/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
             "max_row_bytes": 256,
             "max_stride_bytes": 1024,
             "min_row_bytes": 128,
@@ -144,7 +144,7 @@
             "penalty_bytes": 382.82
           },
           {
-            "evidence_id": "capture://ascend910_9362/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
+            "evidence_id": "capture://a3-9362-ep/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
             "max_row_bytes": 256,
             "max_stride_bytes": 4096,
             "min_row_bytes": 128,
@@ -152,7 +152,7 @@
             "penalty_bytes": 384.0
           },
           {
-            "evidence_id": "capture://ascend910_9362/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
+            "evidence_id": "capture://a3-9362-ep/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
             "max_row_bytes": 256,
             "max_stride_bytes": null,
             "min_row_bytes": 128,
@@ -160,7 +160,7 @@
             "penalty_bytes": 384.0
           },
           {
-            "evidence_id": "capture://ascend910_9362/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
+            "evidence_id": "capture://a3-9362-ep/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
             "max_row_bytes": 512,
             "max_stride_bytes": 1024,
             "min_row_bytes": 256,
@@ -168,7 +168,7 @@
             "penalty_bytes": 256.0
           },
           {
-            "evidence_id": "capture://ascend910_9362/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
+            "evidence_id": "capture://a3-9362-ep/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
             "max_row_bytes": 512,
             "max_stride_bytes": 4096,
             "min_row_bytes": 256,
@@ -176,7 +176,7 @@
             "penalty_bytes": 256.0
           },
           {
-            "evidence_id": "capture://ascend910_9362/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
+            "evidence_id": "capture://a3-9362-ep/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
             "max_row_bytes": 512,
             "max_stride_bytes": null,
             "min_row_bytes": 256,
@@ -484,7 +484,7 @@
       }
     },
     "P02_load_data": {
-      "evidence_id": "capture://ascend910_9362/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
+      "evidence_id": "capture://a3-9362-ep/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
       "metrics": {
         "l1_to_l0a_bytes_per_s_per_aic": {
           "bound_kind": "rate_upper",
@@ -591,7 +591,7 @@
       }
     },
     "P03_fixpipe": {
-      "evidence_id": "capture://ascend910_9362/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
+      "evidence_id": "capture://a3-9362-ep/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
       "metrics": {
         "fixpipe_in_bytes_per_s_per_aic": {
           "bound_kind": "rate_upper",
@@ -663,7 +663,7 @@
       }
     },
     "P04_mte3_store": {
-      "evidence_id": "capture://ascend910_9362/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
+      "evidence_id": "capture://a3-9362-ep/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
       "metrics": {
         "atomic_contention_ns": {
           "bound_kind": "latency_lower",
@@ -739,7 +739,7 @@
       }
     },
     "P05_l2_residency_reuse": {
-      "evidence_id": "capture://ascend910_9362/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
+      "evidence_id": "capture://a3-9362-ep/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
       "metrics": {
         "l2_die_bytes_per_s": {
           "bound_kind": "rate_upper",
@@ -886,7 +886,7 @@
       }
     },
     "P06_mmad": {
-      "evidence_id": "capture://ascend910_9362/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
+      "evidence_id": "capture://a3-9362-ep/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
       "metrics": {
         "pipe_m_barrier_ns": {
           "bound_kind": "latency_lower",
@@ -916,7 +916,7 @@
             "trimmed_cv_pct": 0.0311,
             "trimmed_mean": 13433731368470.3
           },
-          "evidence_id": "capture://ascend910_9362/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
+          "evidence_id": "capture://a3-9362-ep/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
           "k_0": 16,
           "m_iss": 16,
           "status": "calibrated",
@@ -938,7 +938,7 @@
             "trimmed_cv_pct": 0.02,
             "trimmed_mean": 13436590864148.693
           },
-          "evidence_id": "capture://ascend910_9362/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
+          "evidence_id": "capture://a3-9362-ep/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
           "k_0": 16,
           "m_iss": 16,
           "status": "calibrated",
@@ -960,7 +960,7 @@
             "trimmed_cv_pct": 0.0287,
             "trimmed_mean": 3372032585676.565
           },
-          "evidence_id": "capture://ascend910_9362/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
+          "evidence_id": "capture://a3-9362-ep/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
           "k_0": 8,
           "m_iss": 16,
           "status": "calibrated",
@@ -982,7 +982,7 @@
             "trimmed_cv_pct": 0.0539,
             "trimmed_mean": 6730078663219.177
           },
-          "evidence_id": "capture://ascend910_9362/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
+          "evidence_id": "capture://a3-9362-ep/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
           "k_0": 8,
           "m_iss": 16,
           "status": "calibrated",
@@ -1017,7 +1017,7 @@
             "trimmed_cv_pct": 0.0555,
             "trimmed_mean": 26919837249604.1
           },
-          "evidence_id": "capture://ascend910_9362/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
+          "evidence_id": "capture://a3-9362-ep/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
           "k_0": 32,
           "m_iss": 16,
           "status": "calibrated",
@@ -1210,7 +1210,7 @@
       }
     },
     "P07_vec_alu": {
-      "evidence_id": "capture://ascend910_9362/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
+      "evidence_id": "capture://a3-9362-ep/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
       "metrics": {
         "raw_latency_cycles": {
           "bound_kind": "latency_lower",
@@ -1218,7 +1218,7 @@
         },
         "vec_alu_ops_per_s_per_aiv": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 105600000000.00002,
+          "certified_upper_capacity": 52800000000.00001,
           "cv_pct": 0.2031,
           "n_samples": 24,
           "p05": 33819970817.139698,
@@ -1240,14 +1240,16 @@
           },
           "vec_alu_ops_per_s_per_aiv": {
             "cv_pct": 0.2031,
-            "nominal_bound": 105600000000.00002,
+            "nominal_bound": 52800000000.00001,
             "status": "calibrated"
           }
         },
+        "probe_ops_per_element": 2.0,
         "ub_bank_groups": 16,
         "ub_bank_size_bytes": 4096,
         "ub_banks_per_group": 3,
-        "vector_width_bytes": 256
+        "vector_width_bytes": 256,
+        "work_unit": "elementary_alu_ops_per_s"
       },
       "status": "calibrated",
       "units": {
@@ -1255,7 +1257,7 @@
       }
     },
     "P08_vec_sfu": {
-      "evidence_id": "capture://ascend910_9362/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
+      "evidence_id": "capture://a3-9362-ep/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
       "metrics": {
         "raw_latency_cycles": {
           "bound_kind": "latency_lower",
@@ -1300,7 +1302,7 @@
       }
     },
     "P09_vec_reduce_cast": {
-      "evidence_id": "capture://ascend910_9362/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
+      "evidence_id": "capture://a3-9362-ep/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
       "metrics": {
         "cast_bytes_per_s_per_aiv": {
           "bound_kind": "rate_upper",
@@ -1354,7 +1356,7 @@
       }
     },
     "P10_sort_topk": {
-      "evidence_id": "capture://ascend910_9362/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
+      "evidence_id": "capture://a3-9362-ep/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
       "metrics": {
         "sort_elems_per_s": {
           "bound_kind": "rate_upper",
@@ -1365,28 +1367,28 @@
           "certified_upper_capacity": 52800000000.00001,
           "cv_pct": 0.3276,
           "n_samples": 24,
-          "p05": 724919842.375093,
-          "p50": 726447255.119499,
-          "p95": 730979554.361993,
-          "p99": 731976924.884463,
+          "p05": 2899679369.50037,
+          "p50": 2905789020.477998,
+          "p95": 2923918217.447971,
+          "p99": 2927907699.537853,
           "trimmed_cv_pct": 0.2845,
-          "trimmed_mean": 727650411.52059
+          "trimmed_mean": 2910601646.082361
         }
       },
       "modes": {
         "sort32_mrgsort4": {
-          "evidence_id": "capture://ascend910_9362/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
+          "evidence_id": "capture://a3-9362-ep/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
           "sort_elems_per_s_per_aiv": {
             "bound_kind": "rate_upper",
             "certified_upper_capacity": 52800000000.00001,
             "cv_pct": 0.3276,
             "n_samples": 24,
-            "p05": 724919842.375093,
-            "p50": 726447255.119499,
-            "p95": 730979554.361993,
-            "p99": 731976924.884463,
+            "p05": 2899679369.50037,
+            "p50": 2905789020.477998,
+            "p95": 2923918217.447971,
+            "p99": 2927907699.537853,
             "trimmed_cv_pct": 0.2845,
-            "trimmed_mean": 727650411.52059
+            "trimmed_mean": 2910601646.082361
           },
           "status": "calibrated"
         }
@@ -1405,6 +1407,8 @@
             "status": "calibrated"
           }
         },
+        "probe_sort_length": 1024,
+        "probe_sort_passes": 4,
         "sort_algorithm": "sort32_mrgsort4",
         "sort_die_elems_per_s_p50": 29057890204.78,
         "supported_sortall_lengths": [
@@ -1414,11 +1418,12 @@
           512,
           1024,
           2048
-        ]
+        ],
+        "work_unit": "elem_passes_per_s"
       },
       "status": "calibrated",
       "units": {
-        "rate": "elems_per_s_per_aiv"
+        "rate": "elem_passes_per_s_per_aiv"
       }
     },
     "P11_simt": {
@@ -1477,7 +1482,7 @@
       }
     },
     "P12_intracore_flag": {
-      "evidence_id": "capture://ascend910_9362/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
+      "evidence_id": "capture://a3-9362-ep/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
       "metrics": {
         "flag_m_fix_ns": {
           "bound_kind": "latency_lower",
@@ -1586,7 +1591,7 @@
       }
     },
     "P13_crosscore_sync": {
-      "evidence_id": "capture://ascend910_9362/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
+      "evidence_id": "capture://a3-9362-ep/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
       "metrics": {
         "mode0_aic_barrier_ns": {
           "bound_kind": "latency_lower",
@@ -1754,6 +1759,8 @@
       "modes": {},
       "parameters": {
         "first_issue_includes_min_kernel": true,
+        "issue_interval_includes_min_kernel": true,
+        "issue_interval_owner": "aiv",
         "lanes": 1,
         "metric_diagnostics": {
           "aic_first_issue_ns": {
@@ -1801,7 +1808,7 @@
       }
     },
     "P16_multistream_core_control": {
-      "evidence_id": "capture://ascend910_9362/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
+      "evidence_id": "capture://a3-9362-ep/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
       "metrics": {
         "set_limit_ns": {
           "bound_kind": "latency_lower",
@@ -2038,7 +2045,7 @@
       }
     },
     "P20_host_dma_sync": {
-      "evidence_id": "capture://ascend910_9362/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
+      "evidence_id": "capture://a3-9362-ep/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
       "metrics": {
         "eager_d2h_sync_ns": {
           "bound_kind": "latency_lower",
@@ -2147,11 +2154,8 @@
             "status": "high_cv_unsealed"
           },
           "pageable_dma_startup_ns": {
-            "cv_pct": 70.9619,
             "nominal_bound": 0.0,
-            "observed_p50": 115955.972082,
-            "observed_p99": 335651.015824,
-            "status": "high_cv_unsealed"
+            "status": "unmeasured"
           },
           "pageable_h2d_startup_ns": {
             "cv_pct": 70.9619,
@@ -2166,11 +2170,8 @@
             "status": "calibrated"
           },
           "pinned_dma_startup_ns": {
-            "cv_pct": 8.2052,
             "nominal_bound": 0.0,
-            "observed_p50": 63959.548846,
-            "observed_p99": 76561.945055,
-            "status": "high_cv_unsealed"
+            "status": "unmeasured"
           },
           "pinned_h2d_startup_ns": {
             "cv_pct": 8.2052,
@@ -2191,14 +2192,14 @@
   "provenance": {
     "calibrated": true,
     "campaign_id": "camp-202611-l0",
-    "capture_uri": "capture://ascend910_9362/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
+    "capture_uri": "capture://a3-9362-ep/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
     "clock_calibration": {
       "core_clock_scale_ratio": 1.1,
       "nominal_cube_freq_mhz": 1500.0,
       "observed_aicore_freq_mhz": 1650
     },
     "collected_utc": "2026-11-21T19:27:29Z",
-    "endpoint_alias": "ascend910_9362",
+    "endpoint_alias": "a3-9362-ep",
     "silicon_fingerprint": {
       "aic_count": 20,
       "aiv_count": 40,

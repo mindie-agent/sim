@@ -451,10 +451,12 @@ class _PackedAttention:
 
 
 def _validate_c8_abi(contract: AttentionContract) -> None:
+    if contract.quant_mode == QUANT_MODE_TQ4:
+        raise unmodeled("attention_arch35_tq4_unsupported", "TQ4 packed latent cache is supported on Arch22 only, not Arch35")
     if (contract.quant_mode not in C8_MODES or contract.num_kv_heads != 1
             or contract.v_head_dim != C8_LATENT_DIM
             or contract.head_dim not in {C8_LATENT_DIM, C8_LATENT_DIM + C8_ROPE_DIM}):
-        raise unmodeled("attention_c8_abi_shape", "Bind the packed latent C8 or TQ4 cache geometry")
+        raise unmodeled("attention_c8_abi_shape", "Bind the packed latent C8 cache geometry")
 
 
 def _packed_kv(op, contract, ctx, sources):
@@ -782,11 +784,11 @@ class _Strategy:
         ctx.datapath.route("ub", "l1")
         if contract.abi == FIA_ABI:
             return dense_fia(op, contract, ctx, sources, gm_workspace=False)
-        if contract.abi in {SFA_V1_ABI, C8_V1_ABI} or (
-            contract.abi == C8_ABI and contract.splits == 1 and not contract.selection_lists and contract.num_heads > SFA_SPLIT_G_HEADS
-        ):
-            if contract.abi in {C8_ABI, C8_V1_ABI}:
-                _validate_c8_abi(contract)
+        if contract.abi in {C8_ABI, C8_V1_ABI}:
+            _validate_c8_abi(contract)
+        if contract.abi == SFA_V1_ABI and contract.splits == 1:
             return build_arch35_split_g_sfa(op, contract, ctx, sources)
-        return _packed_kv(op, contract, ctx, sources) if contract.abi == C8_ABI else _sparse(op, contract, ctx, sources)
+        if contract.abi in {C8_V1_ABI, C8_ABI} and contract.splits == 1 and not contract.selection_lists and contract.num_heads > SFA_SPLIT_G_HEADS:
+            return build_arch35_split_g_sfa(op, contract, ctx, sources)
+        return _packed_kv(op, contract, ctx, sources) if contract.abi in {C8_ABI, C8_V1_ABI} else _sparse(op, contract, ctx, sources)
 STRATEGY = _Strategy()

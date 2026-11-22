@@ -227,7 +227,7 @@ def load_sku_hardware_spec(sku: str) -> dict[str, Any]:
         "atomic_rmw_bytes_per_s": float(sm["hbm_atomic_rmw"][1]) if "hbm_atomic_rmw" in sm else float(dp.hbm_write_bytes_per_s or rates.get("hbm", 0.0)),
         "fixpipe_bytes_per_s": float(rates.get("fixpipe", 0.0)),
         "vector_ops_per_s": float(rates.get("vector", 0.0)),
-        "vec_alu_ops_per_s": float(rates.get("reg_alu_lanes", rates.get("vector", 0.0) * TWO)),
+        "vec_alu_ops_per_s": float(rates.get("vector", 0.0)),
         "vec_sfu_ops_per_s": vec_sfu_bps,
         "vec_reduce_ops_per_s": float(rates.get("reg_reduce_lanes", rates.get("vector", 0.0))),
         "cast_bytes_per_s": cast_bps,

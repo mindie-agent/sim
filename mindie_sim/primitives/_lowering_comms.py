@@ -140,7 +140,17 @@ def _dma(b):
     rate = b.speed(f"host_{direction}_bytes_per_s")
     shared = b.speed(f"host_rc_{direction}_bytes_per_s", default=rate * MS_PER_SECOND)
     pinned = b.get("pinned", b.get("memory_kind", "pinned") == "pinned")
-    setup = b.delay("dma_startup", "pinned_dma_startup_ns" if pinned else "pageable_dma_startup_ns")
+    mem_kind = "pinned" if pinned else "pageable"
+    dir_metric = f"{mem_kind}_{direction}_startup_ns"
+    generic_metric = f"{mem_kind}_dma_startup_ns"
+    dir_band = b.cell.metrics.get(dir_metric)
+    gen_band = b.cell.metrics.get(generic_metric)
+    startup_metric = (
+        dir_metric
+        if (dir_band is not None and (dir_band.p50 is not None or gen_band is None or gen_band.p50 is None))
+        else generic_metric
+    )
+    setup = b.delay("dma_startup", startup_metric)
     amount = b.integer("payload_bytes", b.get("bytes", 0))
     done = b.work("dma", ((f"{namespace}host_solo:{direction}:d{die}", amount, rate),
                           (root.resource_name(namespace), amount, shared)), (setup,))

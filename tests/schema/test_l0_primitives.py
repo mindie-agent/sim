@@ -565,8 +565,8 @@ def test_dma_pinned_startup_and_coupled_per_die_and_root_complex_service():
     cell = table.cell(pid)
     table = replace(table, primitives={**table.primitives, pid: replace(cell, metrics={
         **cell.metrics, "host_rc_d2h_bytes_per_s": UncertaintyBand(rate * 1000),
-        "pinned_dma_startup_ns": UncertaintyBand(15000.0, bound_kind="latency_lower"),
-        "pageable_dma_startup_ns": UncertaintyBand(35000.0, bound_kind="latency_lower")})})
+        "pinned_d2h_startup_ns": UncertaintyBand(15000.0, bound_kind="latency_lower"),
+        "pageable_d2h_startup_ns": UncertaintyBand(35000.0, bound_kind="latency_lower")})})
     results, startup = [], []
     for die, kind in enumerate(("pinned", "pageable")):
         r = _lower(pid, dict(payload_bytes=amount, node=2, root_complex_id="shared", namespace="host:", die=die, memory_kind=kind), table, datapath=dp)
@@ -574,7 +574,7 @@ def test_dma_pinned_startup_and_coupled_per_die_and_root_complex_service():
         dma = _trace(_run(r), "dma")
         assert dma["coupled"] and dma["serviced"] == pytest.approx({root: amount, f"host:host_solo:d2h:d{die}": amount})
         startup.append(dma["start_ms"])
-        assert startup[-1] == pytest.approx(table.sim_rate_p50(pid, f"{kind}_dma_startup_ns", allow_uncalibrated_declaration=True) * 1e-6)
+        assert startup[-1] == pytest.approx(table.sim_rate_p50(pid, f"{kind}_d2h_startup_ns", allow_uncalibrated_declaration=True) * 1e-6)
     assert startup[0] < startup[1]
     engine = _engine(*results)
     engine.advance(until=[submit_lowered_primitive(engine, r, name_prefix=f"copy:{i}") for i, r in enumerate(results)], first=False)

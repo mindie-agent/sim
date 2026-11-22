@@ -80,8 +80,8 @@ VEC_N1 = 200
 VEC_N2 = 600
 EXP_N1 = 100
 EXP_N2 = 300
-UB_ALU_LANE_OPS_PER_ITER = 2.0 * 8192.0  # MulAddDst: 1 mul + 1 add = 2 FP32 ALU ops per element
 UB_ALU_FMA_FLOPS_FACTOR = 2.0
+UB_ALU_LANE_OPS_PER_ITER = UB_ALU_FMA_FLOPS_FACTOR * 8192.0  # MulAddDst: 2 elementary ALU ops (mul + add) per elem
 UB_EXP_ELEMS = 4096
 UB_EXP_WORK_PER_ITER = 2.0 * float(UB_EXP_ELEMS)
 UB_RED_WORK_PER_ITER = 128.0 * 64.0
@@ -118,6 +118,7 @@ FIXPIPE_PIPE_ITERS = 2000
 SORT_N1 = 50
 SORT_N2 = 150
 SORT_ELEMS_PER_ITER = 1024.0
+SORT_PASSES_PER_ITER = 4.0  # 1 Sort32 + 3 MrgSort4 passes for N=1024
 SIMT_N1 = 500
 SIMT_N2 = 1500
 SIMT_LAUNCH_N1 = 50
@@ -490,7 +491,9 @@ def _run_kernel_subtask(
                 continue
             if len(ds) >= MIN_VALID_DELTAS:
                 tot = work * float(n2 - n1)
-                res["samples"][key] = [tot / (d * MS_PER_S) for d in ds]
+                res["samples"][key] = [(tot / (d * MS_PER_S)) if d > 0.0 else 0.0 for d in ds]
+                if key == "P07.ub_alu_ops_per_s_per_aiv":
+                    res["metadata"]["p07_work_unit"] = "elementary_alu_ops_per_s"
     elif sub in ("p13_aiv", "p13_aic", "p13_mode2", "p13_mode4"):
         lib, err = _compile_so(P13_SYNC_CPP, arch, cann_root, tmp, sub)
         if err or lib is None:
@@ -518,8 +521,10 @@ def _run_kernel_subtask(
         lock_dvfs()
         ds = time_diff(lambda n: lib.run_p10_sort(in_p, out_p, ctypes.c_int(n), st_p, ctypes.c_int(aiv)), SORT_N1, SORT_N2)
         if len(ds) >= MIN_VALID_DELTAS:
-            per_aiv = [(SORT_ELEMS_PER_ITER * float(SORT_N2 - SORT_N1)) / (d * MS_PER_S) for d in ds]
+            work_pass = SORT_PASSES_PER_ITER * SORT_ELEMS_PER_ITER * float(SORT_N2 - SORT_N1)
+            per_aiv = [(work_pass / (d * MS_PER_S)) if d > 0.0 else 0.0 for d in ds]
             res["samples"]["P10.sort_elems_per_s_per_aiv"] = per_aiv
+            res["metadata"]["p10_work_unit"] = "elem_passes_per_s"
             res["metadata"]["sort_die_elems_per_s_p50"] = round(statistics.median(per_aiv) * float(aiv), ROUND_BPS_DIGITS)
     elif sub == "p11_simt" and arch == ARCH35_BISHENG:
         lib, err = _compile_so(ARCH35_SIMT_CPP, arch, cann_root, tmp, sub)

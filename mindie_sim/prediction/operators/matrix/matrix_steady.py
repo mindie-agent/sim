@@ -76,15 +76,13 @@ def _make_tile_builder(context, recipe, geometry, dram_rate, output, directional
     epilogue = MatrixEpilogue.from_op(op)
     inputs, weights = epilogue.operands(op)
     full_hbm_reads = (
-        (inputs if recipe.reuse_inputs else inputs * nn)
-        + (weights if recipe.reuse_weights else weights * nm)
+        (inputs * (1 if recipe.reuse_inputs else nn))
+        + (weights * (1 if recipe.reuse_weights else nm))
     )
-    decl_hbm = float(getattr(op, "hbm_bytes", 0.0) or 0.0)
-    decl_reads = max(0.0, decl_hbm - float(getattr(op, "mte3_bytes", 0.0) or 0.0))
+    admitted_l2_hit = max(0.0, float(meta.get("admitted_l2_read_hit_bytes", 0.0) or 0.0))
     hbm_read_scale = (
-        min(1.0, decl_reads / full_hbm_reads)
-        if (decl_hbm > 0.0 and full_hbm_reads > 0.0 and decl_reads < full_hbm_reads)
-        else 1.0
+        max(0.0, 1.0 - min(admitted_l2_hit, full_hbm_reads) / full_hbm_reads)
+        if (admitted_l2_hit > 0.0 and full_hbm_reads > 0.0) else 1.0
     )
     single_m_hbm_cap = _resolve_single_m_hbm_cap(context, geometry, dram_rate, hbm_read_scale)
     operand_read = read_role(names)

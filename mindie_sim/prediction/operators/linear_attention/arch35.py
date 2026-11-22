@@ -28,6 +28,7 @@ from ..contracts import OperatorPlanningContext
 from ._gdn_native import (
     ARCH35_GDN_AIC_MTE2_QK_PANELS,
     ARCH35_GDN_AIV_MTE2_QKV_PANELS,
+    ARCH35_GDN_COMPACT_THRESHOLD,
     RECURRENT_GDN_ABI,
     arch35_gdn_chunk_sync_ms,
     arch35_gdn_extra_sync_stage,
@@ -35,6 +36,8 @@ from ._gdn_native import (
     build_native_recurrent_gdn,
     compact_lane_pipeline,
 )
+from ..kda.triton_kda import TRITON_KDA_CHUNK_ABIS, TRITON_KDA_RECURRENT_ABIS
+TRITON_KDA_ARCH22_ABIS = TRITON_KDA_CHUNK_ABIS | TRITON_KDA_RECURRENT_ABIS
 from .common import (
     CHUNK32_KERNELS, CHUNK32_LEAVES, DIAG_BLOCK_WIDTH, FLASH_KDA_TEMPLATE_BY_ABI, FLA_GDN_ABIS,
     FP32_BYTES, GDN_CHUNK64_TOKENS, KDA_MAX_AIC_CORES, KDA_WORKSPACE_SLOTS,
@@ -327,7 +330,27 @@ def _build_persistent(c: LinearAttentionContract, ctx: OperatorPlanningContext,
                 stages.extend((replace(read, after=("state_end",)), last))
                 return tuple(stages)
 
-            pipe = compact_lane_pipeline(rc, ends[-1], CHUNK_RING_DEPTH, tile)
+            # Compact only inside single sequences so inter-sequence state_begin/state_end are never dropped.
+            if len(spans) == 1 and spans[0][2] == 1:
+                pipe = compact_lane_pipeline(rc, ends[-1], CHUNK_RING_DEPTH, tile)
+            else:
+                seq_stages: list[Stage] = []
+                cursor = 0
+                for _, length, repeat in spans:
+                    s_chunks = ceil_div(length, c.bt)
+                    for r_i in range(repeat):
+                        base = cursor
+                        if s_chunks > ARCH35_GDN_COMPACT_THRESHOLD:
+                            sub = compact_lane_pipeline(
+                                rc, s_chunks, CHUNK_RING_DEPTH,
+                                lambda idx, b=base: tile(b + idx),
+                            )
+                        else:
+                            sub = PipelineProgram(s_chunks, CHUNK_RING_DEPTH, lambda idx, b=base: tile(b + idx))
+                        after = (seq_stages[-1].name,) if seq_stages else ()
+                        seq_stages.append(Stage(f"seq_{len(seq_stages)}", after=after, program=sub))
+                        cursor += s_chunks
+                pipe = seq_stages[0].program if len(seq_stages) == 1 else KernelProgram(tuple(seq_stages))
             allocations = []
             for pool, size, kind, ids in (
                 ("ub", report.owner_ub_bytes, ctx.datapath.aiv_count, aivs),
@@ -707,7 +730,7 @@ class Arch35LinearAttentionStrategy:
         c = validate_contract(op, ctx)
         if isinstance(c, CausalConvContract):
             return c.mode == "incremental" or (ctx.requested_abi or dict(op.metadata).get("abi") or op.recipe) == "causal_conv1d_update"
-        return (c.abi not in FLA_GDN_ABIS | {"aclnnChunkGatedDeltaRuleArch22"}
+        return (c.abi not in FLA_GDN_ABIS | TRITON_KDA_ARCH22_ABIS | {"aclnnChunkGatedDeltaRuleArch22"}
                 and c.operation != "recover_ssm_verify")
 
     def build(self, op: OpSpec, ctx: OperatorPlanningContext, /) -> OperatorPlan:

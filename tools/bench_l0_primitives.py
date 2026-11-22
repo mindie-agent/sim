@@ -106,6 +106,8 @@ DAV35_UB_BANK_SIZE_BYTES = 16384
 MX_SCALE_GROUP = 32
 ARCH35_HIST_TRUNK = 16384
 SORTALL_LENGTHS = (64, 128, 256, 512, 1024, 2048)
+SORT_PROBE_LENGTH = 1024
+SORT_PROBE_PASSES = 4
 TLA_MAX_THREADS = 2048
 CATLASS_MAX_THREADS = 1024
 SIMT_WARP_SIZE = 32
@@ -320,18 +322,11 @@ def _build_memory_primitives(
     }
 
 
-def _build_compute_primitives(
-    ctx: dict[str, Any], raw: dict[str, Any],
-) -> dict[str, Any]:
-    spec, aic, aiv, is_arch35 = ctx["spec"], ctx["aic"], ctx["aiv"], ctx["is_arch35"]
-    _m, _u, _cell, top_capture = ctx["m"], ctx["u"], ctx["cell"], ctx["top_capture"]
-    conflict_meta, unm_hw = ctx["conflict_meta"], ctx["unm_hw"]
-    p06r, p09r, p10r, p11r = (raw.get(k, {}) for k in ("P06_mmad", "P09_vec_reduce_cast", "P10_sort_topk", "P11_simt"))
-    ub_meta = {
-        "ub_bank_groups": DAV35_UB_BANK_GROUPS if is_arch35 else DAV22_UB_BANK_GROUPS,
-        "ub_banks_per_group": DAV35_UB_BANKS_PER_GROUP if is_arch35 else DAV22_UB_BANKS_PER_GROUP,
-        "ub_bank_size_bytes": DAV35_UB_BANK_SIZE_BYTES if is_arch35 else DAV22_UB_BANK_SIZE_BYTES,
-    }
+def _build_p06_mmad_modes(
+    ctx: dict[str, Any], p06r: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], bool]:
+    spec, aic, is_arch35 = ctx["spec"], ctx["aic"], ctx["is_arch35"]
+    _m, top_capture = ctx["m"], ctx["top_capture"]
     p06_modes: dict[str, Any] = {}
     cal_modes, unm_modes, conf_modes = [], [], []
     unsupported_modes = ["int4"] if is_arch35 else list(ARCH35_EXTRA_MODES)
@@ -394,9 +389,30 @@ def _build_compute_primitives(
         "conflict_modes": conf_modes, "calibrated_count": len(cal_modes), "supported_count": len(p06_modes),
         "mode_diagnostics": p06_mode_diags,
     }
+    return p06_modes, p06_cov, gemm_e2e_summary, core_p06_ok
+
+
+def _build_compute_primitives(
+    ctx: dict[str, Any], raw: dict[str, Any],
+) -> dict[str, Any]:
+    spec, aiv, is_arch35 = ctx["spec"], ctx["aiv"], ctx["is_arch35"]
+    _m, _u, _cell, top_capture = ctx["m"], ctx["u"], ctx["cell"], ctx["top_capture"]
+    conflict_meta, unm_hw = ctx["conflict_meta"], ctx["unm_hw"]
+    p06r, p09r, p10r, p11r = (raw.get(k, {}) for k in ("P06_mmad", "P09_vec_reduce_cast", "P10_sort_topk", "P11_simt"))
+    ub_meta = {
+        "ub_bank_groups": DAV35_UB_BANK_GROUPS if is_arch35 else DAV22_UB_BANK_GROUPS,
+        "ub_banks_per_group": DAV35_UB_BANKS_PER_GROUP if is_arch35 else DAV22_UB_BANKS_PER_GROUP,
+        "ub_bank_size_bytes": DAV35_UB_BANK_SIZE_BYTES if is_arch35 else DAV22_UB_BANK_SIZE_BYTES,
+    }
+    p06_modes, p06_cov, gemm_e2e_summary, core_p06_ok = _build_p06_mmad_modes(ctx, p06r)
     sort_per_aiv_cap = spec["vector_ops_per_s"] / aiv
-    sort_band, sort_diag = _m(p10r.get("sort_elems_per_s_per_aiv"), sort_per_aiv_cap, per_core=True)
+    p10_raw = p10r.get("sort_elems_per_s_per_aiv")
+    p10_passes = SORT_PROBE_PASSES if (p10r.get("measured_algorithm") == "sort32_mrgsort4" and p10r.get("work_unit") != "elem_passes_per_s") else 1
+    p10_samples = [float(v) * float(p10_passes) for v in p10_raw] if isinstance(p10_raw, list) else p10_raw
+    sort_band, sort_diag = _m(p10_samples, sort_per_aiv_cap, per_core=True)
     sort_st = _cell_status({"r": sort_band})
+    p07r = raw.get("P07_vec_alu", {})
+    p07_samples = p07r.get("vec_alu_ops_per_s_per_aiv")
     p10_modes: dict[str, Any] = {
         "sort32_mrgsort4": {
             "status": sort_st,
@@ -424,8 +440,9 @@ def _build_compute_primitives(
         ),
         "P07_vec_alu": _cell(
             {"rate": "ops_per_s_per_aiv"},
-            {"vector_width_bytes": VEC_WIDTH_BYTES, "fp32_lanes": FP32_LANES, "bf16_lanes": BF16_LANES, **ub_meta, **conflict_meta},
-            {"vec_alu_ops_per_s_per_aiv": _m(raw.get("P07_vec_alu", {}).get("vec_alu_ops_per_s_per_aiv"), spec["vec_alu_ops_per_s"] / aiv, per_core=True)},
+            {"vector_width_bytes": VEC_WIDTH_BYTES, "fp32_lanes": FP32_LANES, "bf16_lanes": BF16_LANES,
+             "work_unit": "elementary_alu_ops_per_s", "probe_ops_per_element": TWO, **ub_meta, **conflict_meta},
+            {"vec_alu_ops_per_s_per_aiv": _m(p07_samples, spec["vec_alu_ops_per_s"] / aiv, per_core=True)},
             {"raw_latency_cycles": _u(0.0, "latency_lower")}, unmeasured_reason=unm_hw,
         ),
         "P08_vec_sfu": _cell(
@@ -442,9 +459,10 @@ def _build_compute_primitives(
             unmeasured_reason=unm_hw,
         ),
         "P10_sort_topk": _cell(
-            {"rate": "elems_per_s_per_aiv"},
+            {"rate": "elem_passes_per_s_per_aiv"},
             {"sort_algorithm": "sort32_mrgsort4", "masked_hist256_supported": is_arch35,
              "supported_sortall_lengths": list(SORTALL_LENGTHS),
+             "work_unit": "elem_passes_per_s", "probe_sort_length": SORT_PROBE_LENGTH, "probe_sort_passes": SORT_PROBE_PASSES,
              "histogram_trunk_elems": ARCH35_HIST_TRUNK if is_arch35 else 0,
              "sort_die_elems_per_s_p50": p10r.get("sort_die_elems_per_s_p50"), **conflict_meta},
             {"sort_elems_per_s_per_aiv": (sort_band, sort_diag)},
@@ -523,7 +541,10 @@ def _build_sync_and_link_primitives(
             status_override="unmeasured" if is_arch35 else "unsupported", unmeasured_reason=unm_hw if is_arch35 else "",
         ),
         "P15_rts_stars": _cell(
-            {"latency": "ns"}, {"queue_scope": "die", "queue_depth": STARS_QUEUE_DEPTH, "lanes": 1, "first_issue_includes_min_kernel": True, **conflict_meta},
+            {"latency": "ns"},
+            {"queue_scope": "die", "queue_depth": STARS_QUEUE_DEPTH, "lanes": 1,
+             "first_issue_includes_min_kernel": True, "issue_interval_includes_min_kernel": True,
+             "issue_interval_owner": "aiv", **conflict_meta},
             {"issue_interval_ns": _m(p15r.get("issue_interval_ns"), 0.0, "latency_lower"),
              "aiv_first_issue_ns": _m(p15r.get("aiv_first_issue_ns"), 0.0, "latency_lower"),
              "aic_first_issue_ns": _m(p15r.get("aic_first_issue_ns"), 0.0, "latency_lower")},
@@ -582,8 +603,8 @@ def _build_sync_and_link_primitives(
              "pinned_d2h_startup_ns": _m(p20r.get("pinned_d2h_startup_ns"), 0.0, "latency_lower"),
              "pageable_h2d_startup_ns": _m(p20r.get("pageable_h2d_startup_ns"), 0.0, "latency_lower"),
              "pageable_d2h_startup_ns": _m(p20r.get("pageable_d2h_startup_ns"), 0.0, "latency_lower"),
-             "pinned_dma_startup_ns": _m(p20r.get("pinned_dma_startup_ns"), 0.0, "latency_lower"),
-             "pageable_dma_startup_ns": _m(p20r.get("pageable_dma_startup_ns"), 0.0, "latency_lower"),
+             "pinned_dma_startup_ns": _u(0.0, "latency_lower"),
+             "pageable_dma_startup_ns": _u(0.0, "latency_lower"),
              "eager_d2h_sync_ns": _m(p20r.get("eager_d2h_sync_ns"), 0.0, "latency_lower")},
             unmeasured_reason=unm_hw,
         ),

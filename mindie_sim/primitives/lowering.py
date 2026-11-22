@@ -505,12 +505,13 @@ def _vector(b):
     dtype, owner = b.get("dtype", "bf16"), b.owner("aiv")
     lanes = b.integer("lanes", int(b.integer("vector_width_bytes", VECTOR_WIDTH_BYTES, 1) / dtype_bytes(dtype)), 1)
     elems, rows = b.integer("elements", b.get("n", 0)), b.integer("rows", 1)
+    ops_per_elem = b.integer("ops_per_element", 1, 1)
     width = b.integer("reduction_dim", b.get("d", elems))
     raw = b.value("raw_latency_cycles", 0)
     if pipe == "vec_reduce" and width:
         depth = min(width, lanes, MX_SCALE_GROUP if b.get("mx_dynamic_quant") else lanes)
         raw += b.value("tree_base_cycles", 0) + b.value("tree_step_cycles", 0) * (depth - 1).bit_length()
-    repeats = rows * _ceil(width if pipe == "vec_reduce" else elems, lanes)
+    repeats = rows * _ceil(width if pipe == "vec_reduce" else elems * ops_per_elem, lanes)
     groups = b.get("groups")
     if groups is None:
         graph = [(pipe, pipe, repeats, raw)]

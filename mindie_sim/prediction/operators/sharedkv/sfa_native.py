@@ -21,7 +21,8 @@ from mindie_sim.schema.operators import OpSpec
 
 from ...mechanism import OperatorPlan, Work
 from ...program import KernelProgram, ParallelProgram, PipelineProgram, Stage
-from ...runtime.memory_physics import AddressRun, AddressRunPlan
+from ...runtime.l2_residency import AdmissionMemoryView, bind_memory_access
+from ...runtime.memory_physics import AddressRun, AddressRunPlan, HbmBusSpec, MemoryAccessPattern, ReuseKey
 from ..attention.common import (
     BF16_BYTES,
     C8_MODES,
@@ -37,7 +38,10 @@ from ..attention.common import (
     _stage,
     make_plan,
     owner_pairs,
+    packed_gather_run_plans,
+    packed_selection_runs,
     read_work,
+    unmodeled,
     workspace_write_work,
 )
 from ..contracts import OperatorPlanningContext
@@ -78,10 +82,17 @@ class _Arch35SfaProgram:
     ring_l2_resident: bool
     has_l2_rate: bool
     phases: tuple[AttentionPhase, ...] = ()
+    tile_gathers: tuple[tuple[tuple[int, int, int], ...], ...] = ()
 
-    def _tile_phases(self, rows: int, heads_per_aic: int, aics_per_group: int) -> tuple[AttentionPhase, ...]:
+    def _tile_phases(
+        self, rows: int, heads_per_aic: int, aics_per_group: int,
+        *, gather_override: tuple[int, int, int] | None = None,
+    ) -> tuple[AttentionPhase, ...]:
         c, ctx = self.contract, self.ctx
-        if self.is_quant:
+        gather_l2 = 0
+        if gather_override is not None:
+            gather_copy, gather_hbm, gather_l2 = gather_override
+        elif self.is_quant:
             stride = ceil(self.row_bytes / SECTOR_BYTES) * SECTOR_BYTES
             run = AddressRunPlan((AddressRun(0, rows, self.row_bytes, stride),))
             gather_copy = run.aligned_copy_bytes()
@@ -105,7 +116,11 @@ class _Arch35SfaProgram:
             pages = ceil(rows / max(1, c.block_size))
             out.append(AttentionPhase("block_table", read_work(ctx, pages * INDEX_BYTES, aiv=True), ()))
             gather_deps += ("block_table",)
-        out.append(AttentionPhase("packed_kv_gather", read_work(ctx, gather_copy, aiv=True, hbm=gather_hbm), gather_deps))
+        out.append(AttentionPhase(
+            "packed_kv_gather",
+            read_work(ctx, gather_copy, aiv=True, hbm=gather_hbm, l2=gather_l2 if self.has_l2_rate else 0),
+            gather_deps,
+        ))
         prev = "packed_kv_gather"
         if self.is_quant:
             out.append(AttentionPhase(
@@ -114,31 +129,37 @@ class _Arch35SfaProgram:
                 (prev,),
             ))
             prev = "kv_dequant"
-        out.append(AttentionPhase(
-            "kv_publish",
-            workspace_write_work(ctx, "mte3", kv_bf16_bytes, l2_resident=self.ring_l2_resident),
-            (prev,),
-        ))
         pairs = heads_per_aic * rows * aics_per_group
         total_heads = heads_per_aic * aics_per_group
         prob_bytes = pairs * BF16_BYTES
-        kv_read_bytes = kv_bf16_bytes * aics_per_group
-        out.append(AttentionPhase(
-            "kv_ring_read",
-            read_work(
-                ctx, kv_read_bytes,
-                hbm=0 if self.ring_l2_resident else kv_read_bytes,
-                l2=(kv_read_bytes if (self.ring_l2_resident and self.has_l2_rate) else 0),
-            ),
-            ("kv_publish",),
-        ))
+        if aics_per_group > 1:
+            out.append(AttentionPhase(
+                "kv_publish",
+                workspace_write_work(ctx, "mte3", kv_bf16_bytes, l2_resident=self.ring_l2_resident),
+                (prev,),
+            ))
+            kv_read_bytes = kv_bf16_bytes * aics_per_group
+            out.append(AttentionPhase(
+                "kv_ring_read",
+                read_work(
+                    ctx, kv_read_bytes,
+                    hbm=0 if self.ring_l2_resident else kv_read_bytes,
+                    l2=(kv_read_bytes if (self.ring_l2_resident and self.has_l2_rate) else 0),
+                ),
+                ("kv_publish",),
+            ))
+            qk_dep = "kv_ring_read"
+        else:
+            # Non-split-G (1 AIC + local 2 AIVs): push KV directly UB->L1 without GM workspace.
+            out.append(AttentionPhase("kv_to_l1", Work(resources={"mte3": kv_bf16_bytes}), (prev,)))
+            qk_dep = "kv_to_l1"
         out.append(AttentionPhase(
             "qk",
             Work(
                 {self.dtype: FLOPS_PER_FMA * pairs * c.head_dim},
                 {"mte1": (total_heads + rows * aics_per_group) * c.head_dim * BF16_BYTES},
             ),
-            ("kv_ring_read",),
+            (qk_dep,),
         ))
         out.append(AttentionPhase("score_fixpipe", Work(resources={"fixpipe": pairs * FP32_BYTES}), ("qk",)))
         sm_ops = SOFTMAX_OPS + (SFA_SSMAX_EXTRA_OPS if c.ssmax else 0)
@@ -203,12 +224,15 @@ class _Arch35SfaProgram:
                              for i, p in enumerate(fin_phases))
                 return KernelProgram((q_st, *f_st))
 
-            def tile_fn(t_idx: int, total_rows=rows, pl=place):
+            q_gathers = self.tile_gathers[q_idx] if q_idx < len(self.tile_gathers) else ()
+
+            def tile_fn(t_idx: int, total_rows=rows, pl=place, qg=q_gathers):
                 t_rows = min(SFA_TILE_ROWS, total_rows - t_idx * SFA_TILE_ROWS)
+                ov = qg[t_idx] if t_idx < len(qg) else None
                 stages = []
-                for ph in self._tile_phases(t_rows, heads_per_aic, aics_per_group):
+                for ph in self._tile_phases(t_rows, heads_per_aic, aics_per_group, gather_override=ov):
                     st = _stage(context, ph, pl)
-                    if ph.name == "kv_ring_read":
+                    if ph.name in {"kv_ring_read", "kv_to_l1"}:
                         st = replace(st, previous=("pv",))
                     stages.append(st)
                 return tuple(stages)
@@ -229,16 +253,43 @@ class _Arch35SfaProgram:
         ))
 
 
+def _admit_selection_tile(
+    selection: tuple[int, ...], row_bytes: int, contract: AttentionContract,
+    ctx: OperatorPlanningContext, view: AdmissionMemoryView,
+) -> tuple[int, int, int]:
+    die = int(ctx.geometry.rank or 0)
+    runs = packed_selection_runs(selection, row_bytes)
+    key = ReuseKey(die, contract.kv_tensor_id, contract.kv_version, reuse_stream="sfa_selection")
+    bus = HbmBusSpec(die, 1, 1, 0)
+    gather_copy = gather_hbm = gather_l2 = 0
+    for plan in packed_gather_run_plans(runs):
+        pat = MemoryAccessPattern(
+            key.backing_allocation, key.tensor_version, die, 0, "read", "mte2_aiv",
+            plan.runs[0].rows * row_bytes, plan, reuse_key=key,
+        )
+        led = bind_memory_access(
+            pat, view, hbm_bus=bus, copy_hit_bytes_per_ms=1, copy_miss_bytes_per_ms=1,
+            l2_bytes_per_ms=1, pipe_row_id="mte2_aiv", l2_row_id="l2", commit=True,
+        ).ledger
+        gather_copy += led.aligned_transfer_bytes
+        gather_hbm += led.dram_sector_bytes
+        gather_l2 += led.l2_hit_bytes
+    return gather_copy, gather_hbm, gather_l2
+
+
 def build_arch35_split_g_sfa(
     op: OpSpec, contract: AttentionContract, ctx: OperatorPlanningContext, sources: tuple[SourceRef, ...],
 ) -> OperatorPlan:
     """Build split-G 2-AIC/4-AIV 3-slot pipelined SFA plan (BF16 or C8) on npu_arch_3510."""
+    if contract.quant_mode == QUANT_MODE_TQ4:
+        raise unmodeled("attention_arch35_tq4_unsupported", "TQ4 packed latent cache is supported on Arch22 only, not Arch35")
     is_quant = contract.quant_mode in C8_MODES
     row_bytes = _packed_row_bytes(contract)
     counts = tuple(contract.row_counts())
-    aics_per_query = SPLIT_G_AICS_PER_QUERY if contract.num_heads > SFA_SPLIT_G_HEADS else 1
+    desired_aics = SPLIT_G_AICS_PER_QUERY if contract.num_heads > SFA_SPLIT_G_HEADS else 1
+    raw_owners = owner_pairs(ctx, max(desired_aics, len(counts) * desired_aics))
+    aics_per_query = max(1, min(desired_aics, len(raw_owners)))
     heads_per_aic = ceil(contract.num_heads / aics_per_query)
-    raw_owners = owner_pairs(ctx, max(aics_per_query, len(counts) * aics_per_query))
     n_groups = max(1, len(raw_owners) // aics_per_query)
     groups = tuple(
         raw_owners[g * aics_per_query : (g + 1) * aics_per_query]
@@ -246,7 +297,7 @@ def build_arch35_split_g_sfa(
     )
     ring_bytes = n_groups * SFA_RING_SLOTS * SFA_TILE_ROWS * contract.head_dim * BF16_BYTES
     l2_cap = _l2_capacity_bytes(ctx)
-    ring_l2_resident = l2_cap > 0 and ring_bytes <= l2_cap
+    ring_l2_resident = aics_per_query > 1 and l2_cap > 0 and ring_bytes <= l2_cap
     has_l2 = "l2" in ctx.geometry.rates
     prog = _Arch35SfaProgram(
         contract, ctx, op.dtype or "bf16", row_bytes, is_quant, counts, groups, ring_l2_resident, has_l2,
@@ -260,15 +311,32 @@ def build_arch35_split_g_sfa(
 
     q_load = prog._query_head_load()
     fin = prog._query_finish()
-    for rows in counts:
+    die = int(ctx.geometry.rank or 0)
+    sel_l2 = (
+        ctx.admission_memory_view if ctx.admission_memory_view is not None
+        else (AdmissionMemoryView({die: l2_cap}, arch_id=str(ctx.compute_arch.arch_id)) if l2_cap > 0 else None)
+    ) if (contract.selection_lists and contract.kv_tensor_id) else None
+    tile_gathers: list[tuple[tuple[int, int, int], ...]] = []
+    for q_idx, rows in enumerate(counts):
         _acc(q_load)
-        full, rem = divmod(rows, SFA_TILE_ROWS)
-        if full:
-            for ph in prog._tile_phases(SFA_TILE_ROWS, heads_per_aic, aics_per_query):
-                _acc(ph, full)
-        if rem:
-            for ph in prog._tile_phases(rem, heads_per_aic, aics_per_query):
-                _acc(ph, 1)
+        if sel_l2 is not None and contract.selection_lists:
+            sr = contract.selection_lists[q_idx]
+            q_tiles: list[tuple[int, int, int]] = []
+            for start in range(0, rows, SFA_TILE_ROWS):
+                t_rows = min(SFA_TILE_ROWS, rows - start)
+                ov = _admit_selection_tile(sr[start : start + t_rows], row_bytes, contract, ctx, sel_l2)
+                q_tiles.append(ov)
+                for ph in prog._tile_phases(t_rows, heads_per_aic, aics_per_query, gather_override=ov):
+                    _acc(ph, 1)
+            tile_gathers.append(tuple(q_tiles))
+        else:
+            full, rem = divmod(rows, SFA_TILE_ROWS)
+            if full:
+                for ph in prog._tile_phases(SFA_TILE_ROWS, heads_per_aic, aics_per_query):
+                    _acc(ph, full)
+            if rem:
+                for ph in prog._tile_phases(rem, heads_per_aic, aics_per_query):
+                    _acc(ph, 1)
         for ph in fin:
             _acc(ph)
 
@@ -289,4 +357,7 @@ def build_arch35_split_g_sfa(
         "split_g_aics_per_query": aics_per_query,
         "ring_l2_resident": ring_l2_resident,
     }
-    return make_plan(op, contract, ctx, phases, sources, metadata=metadata, program=replace(prog, phases=phases))
+    return make_plan(
+        op, contract, ctx, phases, sources, metadata=metadata,
+        program=replace(prog, phases=phases, tile_gathers=tuple(tile_gathers)),
+    )

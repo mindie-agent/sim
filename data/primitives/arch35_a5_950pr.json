@@ -1,7 +1,7 @@
 {
   "arch_preset": "npu_arch_3510",
   "cann_version": "unmeasured",
-  "envelope_sha256": "7c2d64346d0ec991f935c7ba69c9cb9f8be869084e294cde9c82d7bfc00b8651",
+  "envelope_sha256": "f0b0295e98fd5bb956c4fe7f54ecd32762e7e6dec2e88c53d1890bf267737319",
   "primitives": {
     "P01_datacopy": {
       "evidence_id": "",
@@ -542,7 +542,7 @@
         },
         "vec_alu_ops_per_s_per_aiv": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 211200000000.0
+          "certified_upper_capacity": 105600000000.0
         }
       },
       "modes": {},
@@ -555,15 +555,17 @@
             "status": "unmeasured"
           },
           "vec_alu_ops_per_s_per_aiv": {
-            "nominal_bound": 211200000000.0,
+            "nominal_bound": 105600000000.0,
             "status": "unmeasured"
           }
         },
+        "probe_ops_per_element": 2.0,
         "ub_bank_groups": 8,
         "ub_bank_size_bytes": 16384,
         "ub_banks_per_group": 2,
         "unmeasured_reason": "no_reachable_physical_hardware",
-        "vector_width_bytes": 256
+        "vector_width_bytes": 256,
+        "work_unit": "elementary_alu_ops_per_s"
       },
       "status": "unmeasured",
       "units": {
@@ -686,6 +688,8 @@
             "status": "unmeasured"
           }
         },
+        "probe_sort_length": 1024,
+        "probe_sort_passes": 4,
         "sort_algorithm": "sort32_mrgsort4",
         "sort_die_elems_per_s_p50": null,
         "supported_sortall_lengths": [
@@ -696,11 +700,12 @@
           1024,
           2048
         ],
-        "unmeasured_reason": "no_reachable_physical_hardware"
+        "unmeasured_reason": "no_reachable_physical_hardware",
+        "work_unit": "elem_passes_per_s"
       },
       "status": "unmeasured",
       "units": {
-        "rate": "elems_per_s_per_aiv"
+        "rate": "elem_passes_per_s_per_aiv"
       }
     },
     "P11_simt": {
@@ -944,6 +949,8 @@
       "modes": {},
       "parameters": {
         "first_issue_includes_min_kernel": true,
+        "issue_interval_includes_min_kernel": true,
+        "issue_interval_owner": "aiv",
         "lanes": 1,
         "metric_diagnostics": {
           "aic_first_issue_ns": {
@@ -1261,14 +1268,14 @@
   "provenance": {
     "calibrated": false,
     "campaign_id": "camp-202611-l0",
-    "capture_uri": "capture://ascend950pr_9579/camp-202611-l0/7e9b2da7383afdd9e1678c01f9812162a9b74a3dddf6fe770488727344677e0a",
+    "capture_uri": "capture://a5-9579-unmeasured/camp-202611-l0/7e9b2da7383afdd9e1678c01f9812162a9b74a3dddf6fe770488727344677e0a",
     "clock_calibration": {
       "core_clock_scale_ratio": 1.0,
       "nominal_cube_freq_mhz": 1650.0,
       "observed_aicore_freq_mhz": null
     },
-    "collected_utc": "2026-11-22T00:14:44Z",
-    "endpoint_alias": "ascend950pr_9579",
+    "collected_utc": "2026-11-22T02:11:33Z",
+    "endpoint_alias": "a5-9579-unmeasured",
     "silicon_fingerprint": {
       "aic_count": 28,
       "aiv_count": 56,

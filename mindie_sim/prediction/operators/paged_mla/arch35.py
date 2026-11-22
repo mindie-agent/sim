@@ -374,7 +374,7 @@ class _DirectStrategy:
             ("probability", kvp_depth, "probability", "pv_operands"),
         )
         clocks = FLASH_CLOCKS if panel_width else DSL_MQS_CLOCKS if c.sinks else CLOCKS
-        if (c.abi == FIA_ABI and c.splits == 1 and not ctx.requests
+        if (c.abi == FIA_ABI and c.splits == 1
                 and c.physical_heads >= FIA_M_TILE and max_extent > key_tile):
             tiling = resolve_fia_mla_tiling(
                 sequences=c.sequences, physical_heads=c.physical_heads,

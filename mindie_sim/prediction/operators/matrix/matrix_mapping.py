@@ -299,17 +299,14 @@ def mapping_bound(context, recipe, *, geometry=None):
     inner = [a[3] * max(inputs / total_m, k * width) + b[3] * max(weight / (n * groups), k * width)
              for a, b in zip(left, right)]
     if recipe.reuse_inputs and recipe.reuse_weights:
-        hbm = (inputs + weight + epilogue.row_scale_bytes
-               + epilogue.column_scale_bytes + context.op.mte3_bytes)
+        hbm_reads = inputs + weight + epilogue.row_scale_bytes + epilogue.column_scale_bytes
     else:
-        hbm = (((inputs + epilogue.row_scale_bytes) *
-                (1 if recipe.reuse_inputs else math.ceil(n / recipe.tile_n)))
-               + ((weight + epilogue.column_scale_bytes) *
-                  (1 if recipe.reuse_weights else math.ceil(m / recipe.tile_m)))
-               + context.op.mte3_bytes)
-    declared_hbm = float(getattr(context.op, "hbm_bytes", 0.0) or 0.0)
-    if declared_hbm > 0.0:
-        hbm = min(hbm, declared_hbm)
+        hbm_reads = (((inputs + epilogue.row_scale_bytes) *
+                      (1 if recipe.reuse_inputs else math.ceil(n / recipe.tile_n)))
+                     + ((weight + epilogue.column_scale_bytes) *
+                        (1 if recipe.reuse_weights else math.ceil(m / recipe.tile_m))))
+    admitted_l2_hit = max(0.0, float(meta.get("admitted_l2_read_hit_bytes", 0.0) or 0.0))
+    hbm = max(0.0, hbm_reads - min(admitted_l2_hit, hbm_reads)) + context.op.mte3_bytes
     bound = hbm / _declared_rate(context, names["hbm"])
     demands = {}
     for role, values in (

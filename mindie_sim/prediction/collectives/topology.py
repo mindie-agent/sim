@@ -155,13 +155,19 @@ class Topology(_TopologyPlansMixin):
         self.p18_eager_startup_us = 0.0
         self._p18_link_bytes_per_ms = 0.0
         self._p18_measured_scope = ""
+        self._p18_measured_collective = ""
+        self._p18_measured_world_size = 0
         if primitive_table is not None and hasattr(primitive_table, "cell"):
             try:
                 p18 = primitive_table.cell(P18_PRIMITIVE_ID)
             except ModelingError:
                 p18 = None
             if p18 is not None:
-                self._p18_measured_scope = str((p18.parameters or {}).get("measured_scope") or "")
+                p18_params = p18.parameters or {}
+                self._p18_measured_scope = str(p18_params.get("measured_scope") or "")
+                raw_coll = str(p18_params.get("measured_collective") or "all_reduce").strip().lower()
+                self._p18_measured_collective = raw_coll.replace("_", "") if raw_coll in {"all_reduce", "all_gather"} else raw_coll
+                self._p18_measured_world_size = int(p18_params.get("measured_world_size") or 0)
                 lb = p18.metrics.get("link_bytes_per_s")
                 if lb is not None and lb.p50 is not None and float(lb.p50) > 0.0:
                     self._p18_link_bytes_per_ms = float(lb.p50) / MS_PER_S
@@ -261,6 +267,25 @@ class Topology(_TopologyPlansMixin):
         if key in self._rank_package:
             return (node, self._rank_package[key])
         return (node, key // self._dies_per_package)
+
+    def p18_matched_startup_us(self, collective: str, group: tuple[int, ...], *, stack: str) -> float:
+        """Return P18 startup only when collective, world size, route scope, and stack all match."""
+        if not group or len(group) < 2:
+            return 0.0
+        if self._p18_measured_collective and collective != self._p18_measured_collective:
+            return 0.0
+        if self._p18_measured_world_size > 0 and len(group) != self._p18_measured_world_size:
+            return 0.0
+        p18_scope = self._p18_measured_scope or ("package" if self._dies_per_package >= 2 else "node")
+        same_pkg = len({self._package_key(r) for r in group}) == 1
+        same_node = len({self._node_of(r) for r in group}) == 1
+        if p18_scope == "package" and not same_pkg:
+            return 0.0
+        if p18_scope == "node" and (not same_node or (self._dies_per_package >= 2 and same_pkg)):
+            return 0.0
+        if stack == "eager":
+            return float(self.p18_eager_startup_us)
+        return float(self.p18_startup_us)
 
     def link_protocol_bands(self, link_name: str):
         """Return piecewise ``CollectiveBandSpec``s declared on link or channel."""
