@@ -45,7 +45,7 @@ _ACLNN_DECLARATION_KEYS = (
 )
 _ACLNN_PROTOCOL_KEYS = frozenset({
     "include_submission", "input_ready_ms", "invocations", "max_operators",
-    "mode", "recipes", "submission", "trace_limit",
+    "mode", "recipes", "replica", "submission", "trace_limit",
 })
 
 

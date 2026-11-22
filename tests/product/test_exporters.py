@@ -1125,4 +1125,142 @@ def test_export_binding_conservation_pp_reconciliation_and_brief_precision(tmp_p
     assert not any(issue.issue_id == "draft_tp_policy_mismatch" for issue in audit_rep.issues)
 
 
+def test_export_streams_spec_batch_quant_preset_cache_t4_pd_cluster_and_overlap_lstar(tmp_path, monkeypatch):
+    from dataclasses import replace
+    from mindie_sim.cli import _main as cli_main
+    from mindie_sim.compose import compose_case
+    from mindie_sim.export import (
+        SHEET_BREAKDOWN,
+        SHEET_MEMORY,
+        SHEET_SUMMARY,
+        build_agent_brief,
+        build_export_bundle,
+        compute_memory_quant_ledger,
+        export_comparison_xlsx,
+    )
+    from mindie_sim.export import bundle as bundle_mod
+    from mindie_sim.export.models import OperatorExportRow
+    from mindie_sim.prediction.results import StepRequest
+    from mindie_sim.prediction.structure import parse_case
+    from mindie_sim.schema.workload import RequestView
+
+    # 1. Ordinary prefill (spec_tokens=0) never infers proposals from prompt length;
+    #    1-token decode with configured MTP resolves avg_accepted == 1.0 and spec_method == "None".
+    raw_plain = compose_case("qwen3-32b", "a3", tp=2, layers=2, prompt_tokens=256, output_tokens=32)
+    bun_pre = build_export_bundle(
+        raw_plain, request=StepRequest(phase="prefill", tokens=256, context=0, sequences=1, scope="body"),
+        apply_target_envelope=False,
+    )
+    assert bun_pre.spec_method == "None" and bun_pre.spec_proposals == 0
+    raw_mtp = compose_case(
+        "deepseek-v3.2", "a5", tp=8, ep=8, quant="mxfp4", prompt_tokens=256, output_tokens=32,
+        mtp_proposal_tokens=3, mtp_acceptance_length=2.5,
+    )
+    bun_dec1 = build_export_bundle(
+        raw_mtp, request=StepRequest(phase="decode", tokens=1, context=256, sequences=1, scope="body"),
+        apply_target_envelope=False,
+    )
+    assert bun_dec1.spec_method == "None" and bun_dec1.spec_proposals == 0
+    assert bun_dec1.avg_accepted_tokens == pytest.approx(1.0, abs=1e-12)
+
+    # 2. Explicit StepRequest.requests active count governs bundle concurrency & KV ledger.
+    views = tuple(
+        RequestView(request_id=f"r{i}", q_len=1, context=128, samples=True, phase="decode", padding=(i >= 4))
+        for i in range(6)
+    )
+    req_views = StepRequest(phase="decode", tokens=1, context=128, sequences=1, scope="body", requests=views)
+    bun_views = build_export_bundle(raw_mtp, request=req_views, apply_target_envelope=False)
+    assert bun_views.sequences == 4 and bun_views.cluster_concurrency == 4
+    assert bun_views.memory_ledger.concurrency == 4
+
+    # 3. Target synthesis sees original recurrent_scan0 DAG identities before post-pricing display collapse.
+    seen_target_ids: list[str] = []
+    orig_solve = bundle_mod.solve_target_graph
+
+    def _spy_solve(nodes, *a, **kw):
+        seen_target_ids.extend(n.op_id for n in nodes)
+        return orig_solve(nodes, *a, **kw)
+
+    raw_gdn = compose_case("kimi-k3.1", "a5", tp=1, ep=1, layers=2, prompt_tokens=128, output_tokens=16)
+    with monkeypatch.context() as mp:
+        mp.setattr(bundle_mod, "solve_target_graph", _spy_solve)
+        bun_gdn = build_export_bundle(
+            raw_gdn, request=StepRequest(phase="decode", tokens=1, context=128, sequences=1, scope="body"),
+            apply_target_envelope=True,
+        )
+    assert any(oid.endswith("recurrent_scan0") for oid in seen_target_ids)
+    assert not any(o.op_id.endswith(("recurrent_scan0", "recurrent_scan1")) for o in bun_gdn.operators)
+
+    # 4. Stream plans forward into spine.rewrite.apply on the direct bundle path.
+    from mindie_sim.prediction.rewrite import RewritePipeline
+    seen_streams: list[tuple[object, ...]] = []
+    orig_apply = RewritePipeline.apply
+
+    def _spy_apply(self, base, *, streams=()):
+        seen_streams.append(tuple(streams))
+        return orig_apply(self, base, streams=streams)
+
+    raw_base = compose_case("qwen3-32b", "a3", tp=2, layers=1, prompt_tokens=64, output_tokens=8)
+    with monkeypatch.context() as mp:
+        mp.setattr(RewritePipeline, "apply", _spy_apply)
+        build_export_bundle(
+            raw_base, request=StepRequest(phase="decode", tokens=1, context=64, sequences=1, scope="body"),
+            apply_target_envelope=False, streams=(),
+        )
+    assert len(seen_streams) >= 1
+
+    # 5. Catalog quant preset strings (w8a8_dynamic / auto_va) work on CLI one-shot export and SDK xlsx entry.
+    out_xlsx = tmp_path / "auto_va.xlsx"
+    export_comparison_xlsx(
+        None, out_xlsx, model="qwen3-32b", hardware="a3", tp=2,
+        prompt_tokens=128, output_tokens=16, concurrency=1, weight_quant="auto_va",
+    )
+    assert out_xlsx.is_file()
+    cli_xlsx = tmp_path / "cli_w8a8.xlsx"
+    rc = cli_main([
+        "export", "--model", "qwen3-32b", "--hardware", "a3", "--tp", "2", "--concurrency", "1",
+        "--prompt-tokens", "128", "--output-tokens", "16", "--weight-quant", "w8a8_dynamic",
+        "--xlsx", str(cli_xlsx),
+    ])
+    assert rc == 0 and cli_xlsx.is_file()
+
+    # 6. DCP cohort cache bytes scale with cache-dtype override (C8 < BF16, never dropped to 0).
+    raw_dcp = compose_case(
+        "deepseek-v3.2", "a3", dp=2, tp=2, dcp=4, ep=4, layers=4, prompt_tokens=512, output_tokens=32,
+    )
+    parsed_dcp = parse_case(raw_dcp)
+    led_bf16 = compute_memory_quant_ledger(parsed_dcp, phase="decode", seq_len=512, concurrency=2, cache_dtype="BF16")
+    led_c8 = compute_memory_quant_ledger(parsed_dcp, phase="decode", seq_len=512, concurrency=2, cache_dtype="C8")
+    cohort_bf16 = [r for r in led_bf16.cache_rows if r.component == "dcp_dp_cohort_kv"]
+    cohort_c8 = [r for r in led_c8.cache_rows if r.component == "dcp_dp_cohort_kv"]
+    assert cohort_bf16 and cohort_c8
+    assert 0.0 < cohort_c8[0].per_request_bytes < cohort_bf16[0].per_request_bytes
+
+    # 7. Sheet 3 T4 live cache-dtype formula, Sheet 1 PD cluster_tps + brief parity, Sheet 2 overlapped L* == '=0'.
+    hidden_op = replace(bun_dec1.operators[0], exposed_dur_us=0.0, l_star_lean_us=50.0, is_overlapped=True)
+    visible_op = replace(bun_dec1.operators[1], exposed_dur_us=200.0, dur_us=200.0, l_star_lean_us=120.0, is_overlapped=False)
+    pd_pool = {
+        "pd_ratio": "1P:2D", "pd_transfer_mode": "layerwise_overlap_d2d",
+        "prefill_instances": 1, "decode_instances": 2,
+        "prefill_used_dies": 2, "decode_used_dies": 4, "used_dies": 6,
+        "handoff_tpot_ms": 0.5, "prefill_kv_rps": 10.0, "e2e_total_tps": 320.0,
+    }
+    bun_pd = replace(
+        bun_dec1, operators=(hidden_op, visible_op), step_span_us=200.0,
+        throughput_per_die_tokens_per_s=100.0, pd_pool_summary=pd_pool, output_tokens=32,
+    )
+    assert build_agent_brief(bun_pd)["kpis_before_vs_after"]["after"]["cluster_tps"] == pytest.approx(320.0, rel=1e-9)
+    pd_xlsx = tmp_path / "pd_sheet_checks.xlsx"
+    export_comparison_xlsx(bun_pd, pd_xlsx)
+    _, roots, shared = _read_xlsx_sheets(pd_xlsx)
+    s1_cells = _sheet_cells(roots[SHEET_SUMMARY], shared)
+    assert float(s1_cells["B18"][0]) == pytest.approx(320.0, rel=1e-9)
+    assert s1_cells["B18"][1] is not None and "MIN(" in s1_cells["B18"][1]
+    s2_cells = _sheet_cells(roots[SHEET_BREAKDOWN], shared)
+    assert any(ref.startswith("M") and f in {"0", "=0"} and float(v or 0.0) == 0.0 for ref, (v, f) in s2_cells.items())
+    s3_cells = _sheet_cells(roots[SHEET_MEMORY], shared)
+    assert any(ref.startswith("D") and f and 'IF($T$4="BF16"' in f for ref, (_, f) in s3_cells.items())
+
+
+
 

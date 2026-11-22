@@ -227,10 +227,12 @@ def _run_oneshot_export(args: argparse.Namespace) -> dict[str, Any]:
         sequences=auto_req.sequences,
         scope="model",
     )
+    # Both Cases were just composed with ``eff_quant``; the ledger reads their resolved QuantSpec,
+    # so a catalog preset name (``w8a8_dynamic``) is never re-passed as a storage-format override.
     before_bundle = build_export_bundle(
         raw_before, request=step_req, replay=replay,
         observations_path=args.observations,
-        weight_quant=eff_quant, cache_dtype=eff_cache,
+        cache_dtype=eff_cache,
         engram_host_offload=args.engram_offload,
     )
     after_bundle = None
@@ -240,7 +242,7 @@ def _run_oneshot_export(args: argparse.Namespace) -> dict[str, Any]:
         )
         after_bundle = build_export_bundle(
             raw_after, request=step_req, replay=replay,
-            weight_quant=eff_quant, cache_dtype=eff_cache,
+            cache_dtype=eff_cache,
             engram_host_offload=args.engram_offload,
         )
     result: dict[str, Any] = {

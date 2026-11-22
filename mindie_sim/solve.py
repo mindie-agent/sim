@@ -422,7 +422,7 @@ def _summarize_iso_sla_state(
         "decode_tps_per_die": decode_tps_per_die,
         "e2e_tps_per_die": e2e_tps_per_die,
         "e2e_total_tps": e2e_total_tps,
-        "cluster_tps_per_purchased_die": tps / float(max(1, int(num_devices))),
+        "cluster_tps_per_purchased_die": e2e_total_tps / float(max(1, int(num_devices))),
         "n_tok_per_die": float(best.get("n_tok_per_die", 0.0) or 0.0),
         "us_per_tok_die": float(best.get("us_per_tok_die", 0.0) or 0.0),
         "operating_regime": str(best.get("operating_regime") or ""),
@@ -441,8 +441,9 @@ def _bundle_inputs_for_solution(
     prompt_tokens: int,
     output_tokens: int,
     scope: str,
+    phase: str | None = None,
 ) -> tuple[dict[str, Any], StepRequest, dict[str, Any]]:
-    is_prefill_only = int(output_tokens) <= 1
+    is_prefill_only = phase == "prefill" if phase is not None else int(output_tokens) <= 1
     best = solved.get("best_configuration") or {}
     rec_case = (
         solved.get("prefill_case") or solved.get("recommended_case")

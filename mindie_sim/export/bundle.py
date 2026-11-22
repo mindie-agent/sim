@@ -47,6 +47,7 @@ from mindie_sim.optimization.kernel_synthesis import (
 )
 from mindie_sim.prediction.body_defaults import consume_target_declaration
 from mindie_sim.prediction.efficiency import extract_hardware_peaks
+from mindie_sim.prediction.efficiency.capacity_window import _resolve_speculative_tokens
 from mindie_sim.prediction.evaluation import EvaluationContext
 from mindie_sim.prediction.graph_analysis import graph_costs
 from mindie_sim.prediction.mechanism import Geometry
@@ -732,31 +733,37 @@ def _collapse_micro_split_ops(
     rows: list[OperatorExportRow],
     demands: list[tuple[int, int, int, int, int]],
 ) -> tuple[list[OperatorExportRow], list[tuple[int, int, int, int, int]]]:
+    """Group micro-split recurrent scan rows for display after pricing & DAG attribution."""
     out_rows: list[OperatorExportRow] = []
     out_demands: list[tuple[int, int, int, int, int]] = []
     group_pos: dict[tuple[str, str], int] = {}
+    renamed: dict[str, str] = {}
     for row, dem in zip(rows, demands):
         match = _RECURRENT_MICRO_PATTERN.match(row.op_id)
         if match is None:
             out_rows.append(row)
             out_demands.append(dem)
             continue
-        key = (row.archetype_id, f"{match.group(1)}.{match.group(2)}")
+        collapsed_id = f"{match.group(1)}.{match.group(2)}"
+        key = (row.archetype_id, collapsed_id)
+        renamed[row.op_id] = collapsed_id
         prev_idx = group_pos.get(key)
         if prev_idx is None:
             group_pos[key] = len(out_rows)
-            out_rows.append(replace(row, op_id=f"{match.group(1)}.{match.group(2)}"))
+            out_rows.append(replace(row, op_id=collapsed_id))
             out_demands.append(dem)
             continue
         base = out_rows[prev_idx]
         b_dem = out_demands[prev_idx]
         merged_dem = tuple(b_dem[i] + dem[i] for i in range(CERT_RESOURCE_COUNT))
         new_dur = base.dur_us + row.dur_us
+        new_exposed = base.exposed_dur_us + row.exposed_dur_us
         new_l_star = float(max(merged_dem)) / NS_PER_US
         out_rows[prev_idx] = replace(
             base,
             start_us=min(base.start_us, row.start_us), end_us=max(base.end_us, row.end_us),
-            dur_us=new_dur, exposed_dur_us=base.exposed_dur_us + row.exposed_dur_us,
+            dur_us=new_dur, exposed_dur_us=new_exposed,
+            is_overlapped=(new_exposed <= 1e-9 and new_dur > 0.0),
             flops=base.flops + row.flops, vector_ops=base.vector_ops + row.vector_ops,
             hbm_read_bytes=base.hbm_read_bytes + row.hbm_read_bytes,
             hbm_write_bytes=base.hbm_write_bytes + row.hbm_write_bytes,
@@ -767,6 +774,19 @@ def _collapse_micro_split_ops(
             gap_ratio=(new_dur / new_l_star) if new_l_star > 0.0 else None,
         )
         out_demands[prev_idx] = merged_dem  # type: ignore[assignment]
+    if renamed:
+        out_rows = [
+            replace(
+                r,
+                predecessors=tuple(dict.fromkeys(
+                    replace(p, op_id=renamed.get(p.op_id, p.op_id))
+                    for p in r.predecessors
+                    if renamed.get(p.op_id, p.op_id) != r.op_id
+                )),
+            )
+            if any(p.op_id in renamed for p in r.predecessors) else r
+            for r in out_rows
+        ]
     return out_rows, out_demands
 
 
@@ -869,7 +889,7 @@ def _evaluate_representative_step(
     dict[str, dict[str, float]], Any,
 ]:
     base = spine.stacks.resolve_base(rep_case, LoweringRequest(step=step_req))
-    rewritten = spine.rewrite.apply(base)
+    rewritten = spine.rewrite.apply(base, streams=tuple(streams))
     eff_case = (
         consume_target_declaration(base.case, rewritten.target_graphs)
         if rewritten.target_graphs is not None else base.case
@@ -884,7 +904,7 @@ def _evaluate_representative_step(
         if any("analysis_input" in op.deps for ops in graphs.values() for op in ops)
         else None
     )
-    eff_streams = tuple(streams) if streams else (rewritten.streams or ())
+    eff_streams = tuple(rewritten.streams or ()) or tuple(streams)
     report = graph_costs(
         eff_case, graphs, recipes=book, external_inputs=ext_inputs,
         include_submission=replay.include_submission, isolated=replay.isolated,
@@ -1340,21 +1360,24 @@ def _extract_scenario_meta(
     spec_tokens = int(meta.get("draft_proposal_tokens", 0) or 0)
     draft_mode = str(meta.get("draft_mode") or "").strip().lower()
     aux = getattr(parsed.model, "auxiliary", None)
-    if spec_tokens > 0 or step_req.tokens > 1:
+    # Only a decode query width implies draft proposals; a prefill prompt width never does.
+    inferred = max(0, int(step_req.tokens) - 1) if step_req.phase == "decode" else 0
+    proposals = spec_tokens if spec_tokens > 0 else inferred
+    if step_req.phase == "decode":
+        q_width, avg_accepted = _resolve_speculative_tokens(
+            parsed, output_budget=output_toks, tokens_per_seq=int(step_req.tokens),
+            emitted_tokens_per_seq=None,
+        )
+        proposals = min(proposals, q_width - 1)
+    else:
+        avg_accepted = float(max(1, int(step_req.tokens)))
+    if proposals > 0:
         if draft_mode == "dspark" or (aux is not None and getattr(aux, "dspark", None) is not None):
             spec_method = "DSpark"
         else:
             spec_method = "MTP"
-        proposals = spec_tokens if spec_tokens > 0 else max(0, int(step_req.tokens) - 1)
     else:
         spec_method = "None"
-        proposals = 0
-
-    if step_req.phase == "decode":
-        raw_accept = float(getattr(parsed.runtime, "mtp_acceptance_length", 1.0) or 1.0)
-        avg_accepted = max(1.0, raw_accept) if proposals > 0 else 1.0
-    else:
-        avg_accepted = float(max(1, int(step_req.tokens)))
 
     exec_pol = meta.get("execution_policy") if isinstance(meta.get("execution_policy"), Mapping) else {}
     sp_enabled = bool(exec_pol.get("sp", False)) or any(
@@ -1462,7 +1485,7 @@ def _resolve_bundle_step_eval(
     dict[str, Sequence[Any]], dict[str, dict[str, Any]], dict[str, dict[str, Any]],
     str, tuple[FusedPipelineDescriptor, ...], Any,
 ]:
-    eff_streams = tuple(streams) if streams else tuple(getattr(step_eval, "streams", ()) or ())
+    eff_streams = tuple(streams) if streams else tuple(getattr(step_eval, "streams", None) or ())
     eff_pt_arg = primitive_table if primitive_table is not None else getattr(step_eval, "primitive_table", None)
     prepared = spine.lower(eval_case, LoweringRequest(step=step_req), streams=eff_streams)
     eff_case = prepared.case
@@ -1528,7 +1551,13 @@ def build_export_bundle(
             scope="model" if spec_tokens > 0 else "body",
         )
     )
-    seq_count, cluster_conc = _normalize_bundle_sequences(step_req.sequences, int(parsed.runtime.parallel.dp))
+    dp_width = int(parsed.runtime.parallel.dp)
+    if step_req.requests:
+        # Explicit RequestViews own the per-replica batch, matching the graph builder's precedence.
+        active = max(1, sum(1 for view in step_req.requests if not view.padding))
+        seq_count, cluster_conc = active, active * max(1, dp_width)
+    else:
+        seq_count, cluster_conc = _normalize_bundle_sequences(step_req.sequences, dp_width)
     if rewrite_plan is not None and apply_target_envelope is False:
         raise ModelingError("rewrite_plan_conflicts_with_apply_target_envelope_false")
     ext_plan = load_rewrite_plan(rewrite_plan) if rewrite_plan is not None else None
@@ -1577,7 +1606,6 @@ def build_export_bundle(
         struct_by_op=struct_by_op, subgraph_by_op=subgraph_by_op,
         prepared_work_by_op=prepared_work_by_op,
     )
-    prelim_rows, demands_ns = _collapse_micro_split_ops(prelim_rows, demands_ns)
     should_synthesize = (
         True if rewrite_plan is not None
         else (
@@ -1608,6 +1636,8 @@ def build_export_bundle(
             prelim_rows, eff_case, phase=step_req.phase, primitive_table=rebound_primitive_table,
         )
 
+    # Display grouping belongs strictly after target synthesis and DAG dependency attribution.
+    prelim_rows, demands_ns = _collapse_micro_split_ops(prelim_rows, demands_ns)
     prelim_rows, demands_ns = _reorder_rows_by_archetype(prelim_rows, demands_ns, archetypes)
     final_rows, rank_order, reconcile_summary = _finalize_ranked_rows(prelim_rows, observations_path)
 
