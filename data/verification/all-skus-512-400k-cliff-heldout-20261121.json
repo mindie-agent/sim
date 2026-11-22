@@ -19,11 +19,11 @@
     "zero_empirical_fitting": true,
     "zero_filtering": true
   },
-  "bundle_sha256": "d5877b8a2117f7c7bfe0ab027fe240f0ae40d7165fa68d634c9490de2057a053",
+  "bundle_sha256": "f4cd543ea8e7786b655d86f6f4a7f32d126204b0ff7bcf92f5ee9e8dd09cae97",
   "campaign": "all-skus-512-400k-cliff-heldout-20261121",
   "capture_quality_summary": {
     "clean_l1_cliff_pass": 1200,
-    "clean_pass": 1058,
+    "clean_pass": 1056,
     "clean_scored": 1532,
     "flagged_rows": 125,
     "flags": {
@@ -116,12 +116,12 @@
   },
   "overall_counts": {
     "blocked": 111,
-    "fail": 591,
+    "fail": 593,
     "inv_obs": 0,
     "inv_sim": 0,
     "l1_cliff_fail": 449,
     "l1_cliff_pass": 1208,
-    "pass": 1066,
+    "pass": 1064,
     "total": 1768,
     "worker_diagnostics": 12
   },
@@ -713,7 +713,7 @@
           "lstar_us": 41.95,
           "meas_p99_us": 76.968,
           "meas_us": 60.07,
-          "pred_us": 55.64906245746385,
+          "pred_us": 55.64906245746384,
           "split": "gate2",
           "status": "pass"
         },
@@ -731,7 +731,7 @@
           "lstar_us": 3.969,
           "meas_p99_us": 20.2602,
           "meas_us": 20.0425,
-          "pred_us": 20.382302579373302,
+          "pred_us": 20.382302579373306,
           "split": "gate2",
           "status": "pass"
         },
@@ -749,7 +749,7 @@
           "lstar_us": 41.96,
           "meas_p99_us": 75.456,
           "meas_us": 60.21,
-          "pred_us": 55.67491300607767,
+          "pred_us": 55.67491300607766,
           "split": "gate2",
           "status": "pass"
         },
@@ -767,7 +767,7 @@
           "lstar_us": 3.97,
           "meas_p99_us": 20.0362,
           "meas_us": 19.8825,
-          "pred_us": 20.42115385805665,
+          "pred_us": 20.421153858056652,
           "split": "gate2",
           "status": "pass"
         },
@@ -785,7 +785,7 @@
           "lstar_us": 41.981,
           "meas_p99_us": 75.677,
           "meas_us": 60.29,
-          "pred_us": 55.72661410330526,
+          "pred_us": 55.72661410330527,
           "split": "gate2",
           "status": "pass"
         },
@@ -803,7 +803,7 @@
           "lstar_us": 3.972,
           "meas_p99_us": 20.1268,
           "meas_us": 19.945,
-          "pred_us": 20.498856415423354,
+          "pred_us": 20.498856415423358,
           "split": "gate2",
           "status": "pass"
         },
@@ -839,7 +839,7 @@
           "lstar_us": 3.976,
           "meas_p99_us": 20.1818,
           "meas_us": 20.015,
-          "pred_us": 20.65426153015676,
+          "pred_us": 20.654261530156763,
           "split": "gate2",
           "status": "pass"
         },
@@ -875,7 +875,7 @@
           "lstar_us": 3.984,
           "meas_p99_us": 20.51,
           "meas_us": 20.3175,
-          "pred_us": 20.965071759623584,
+          "pred_us": 20.965071759623587,
           "split": "gate2",
           "status": "pass"
         },
@@ -983,7 +983,7 @@
           "lstar_us": 7.94,
           "meas_p99_us": 21.859,
           "meas_us": 21.43,
-          "pred_us": 22.946658526198522,
+          "pred_us": 22.94665852619852,
           "split": "gate2",
           "status": "pass"
         },
@@ -1055,7 +1055,7 @@
           "lstar_us": 15.884,
           "meas_p99_us": 26.027,
           "meas_us": 25.58,
-          "pred_us": 25.66731464830191,
+          "pred_us": 25.667314648301918,
           "split": "gate2",
           "status": "pass"
         },
@@ -1073,7 +1073,7 @@
           "lstar_us": 43.906,
           "meas_p99_us": 91.387,
           "meas_us": 68.73,
-          "pred_us": 79.75883010005477,
+          "pred_us": 79.75883010005478,
           "split": "gate2",
           "status": "fail"
         },
@@ -1091,7 +1091,7 @@
           "lstar_us": 23.828,
           "meas_p99_us": 42.967,
           "meas_us": 42.42,
-          "pred_us": 46.10666781824399,
+          "pred_us": 46.106667818244,
           "split": "gate2",
           "status": "pass"
         },
@@ -1163,7 +1163,7 @@
           "lstar_us": 63.547,
           "meas_p99_us": 90.56,
           "meas_us": 90.23,
-          "pred_us": 95.80845331921606,
+          "pred_us": 95.80845331921607,
           "split": "gate2",
           "status": "pass"
         },
@@ -1181,7 +1181,7 @@
           "lstar_us": 9.189,
           "meas_p99_us": 32.846,
           "meas_us": 31.8,
-          "pred_us": 28.52578857373559,
+          "pred_us": 28.525788573735593,
           "split": "gate2",
           "status": "fail"
         },
@@ -1199,7 +1199,7 @@
           "lstar_us": 0.867,
           "meas_p99_us": 22.5062,
           "meas_us": 22.2525,
-          "pred_us": 22.112198271842676,
+          "pred_us": 22.11219827184268,
           "split": "gate2",
           "status": "pass"
         },
@@ -1217,7 +1217,7 @@
           "lstar_us": 9.207,
           "meas_p99_us": 32.156,
           "meas_us": 31.07,
-          "pred_us": 28.58408175328287,
+          "pred_us": 28.584081753282877,
           "split": "gate2",
           "status": "pass"
         },
@@ -1235,7 +1235,7 @@
           "lstar_us": 0.869,
           "meas_p99_us": 22.1448,
           "meas_us": 21.7225,
-          "pred_us": 22.161636776228598,
+          "pred_us": 22.1616367762286,
           "split": "gate2",
           "status": "pass"
         },
@@ -1253,7 +1253,7 @@
           "lstar_us": 9.243,
           "meas_p99_us": 32.107,
           "meas_us": 31.41,
-          "pred_us": 28.700668112377436,
+          "pred_us": 28.70066811237744,
           "split": "gate2",
           "status": "pass"
         },
@@ -1289,7 +1289,7 @@
           "lstar_us": 9.315,
           "meas_p99_us": 32.304,
           "meas_us": 31.44,
-          "pred_us": 28.933840830566552,
+          "pred_us": 28.933840830566556,
           "split": "gate2",
           "status": "pass"
         },
@@ -1325,7 +1325,7 @@
           "lstar_us": 9.458,
           "meas_p99_us": 44.591,
           "meas_us": 42.83,
-          "pred_us": 29.400186266944804,
+          "pred_us": 29.400186266944807,
           "split": "gate2",
           "status": "fail"
         },
@@ -1361,7 +1361,7 @@
           "lstar_us": 9.745,
           "meas_p99_us": 45.387,
           "meas_us": 44.39,
-          "pred_us": 29.41269461327106,
+          "pred_us": 29.412694613271068,
           "split": "gate2",
           "status": "fail"
         },
@@ -1397,7 +1397,7 @@
           "lstar_us": 10.032,
           "meas_p99_us": 32.845,
           "meas_us": 32.05,
-          "pred_us": 29.435920320922662,
+          "pred_us": 29.43592032092267,
           "split": "gate2",
           "status": "pass"
         },
@@ -1433,7 +1433,7 @@
           "lstar_us": 10.318,
           "meas_p99_us": 29.979,
           "meas_us": 28.97,
-          "pred_us": 29.463779816907767,
+          "pred_us": 29.46377981690777,
           "split": "gate2",
           "status": "pass"
         },
@@ -1469,7 +1469,7 @@
           "lstar_us": 10.892,
           "meas_p99_us": 33.31,
           "meas_us": 31.33,
-          "pred_us": 30.44467171887949,
+          "pred_us": 30.444671718879487,
           "split": "gate2",
           "status": "pass"
         },
@@ -1487,7 +1487,7 @@
           "lstar_us": 2.603,
           "meas_p99_us": 24.831,
           "meas_us": 24.23,
-          "pred_us": 23.73852785915974,
+          "pred_us": 23.738527859159742,
           "split": "gate2",
           "status": "pass"
         },
@@ -1505,7 +1505,7 @@
           "lstar_us": 11.465,
           "meas_p99_us": 34.485,
           "meas_us": 32.19,
-          "pred_us": 30.500390710849707,
+          "pred_us": 30.500390710849704,
           "split": "gate2",
           "status": "pass"
         },
@@ -1523,7 +1523,7 @@
           "lstar_us": 3.472,
           "meas_p99_us": 26.375,
           "meas_us": 25.48,
-          "pred_us": 23.78310305273591,
+          "pred_us": 23.783103052735914,
           "split": "gate2",
           "status": "pass"
         },
@@ -1541,7 +1541,7 @@
           "lstar_us": 12.612,
           "meas_p99_us": 35.707,
           "meas_us": 33.64,
-          "pred_us": 32.46501053072209,
+          "pred_us": 32.4650105307221,
           "split": "gate2",
           "status": "pass"
         },
@@ -1739,7 +1739,7 @@
           "lstar_us": 3.474,
           "meas_p99_us": 19.8208,
           "meas_us": 19.6625,
-          "pred_us": 20.18983818785668,
+          "pred_us": 20.189838187856672,
           "split": "gate2",
           "status": "pass"
         },
@@ -1847,7 +1847,7 @@
           "lstar_us": 3.487,
           "meas_p99_us": 20.3135,
           "meas_us": 20.1825,
-          "pred_us": 21.328356108195262,
+          "pred_us": 21.328356108195266,
           "split": "gate2",
           "status": "pass"
         },
@@ -2027,7 +2027,7 @@
           "lstar_us": 20.849,
           "meas_p99_us": 34.205,
           "meas_us": 33.68,
-          "pred_us": 35.16458748111457,
+          "pred_us": 35.16458748111458,
           "split": "gate2",
           "status": "pass"
         },
@@ -2063,7 +2063,7 @@
           "lstar_us": 27.8,
           "meas_p99_us": 37.667,
           "meas_us": 37.11,
-          "pred_us": 37.077852307346184,
+          "pred_us": 37.07785230734619,
           "split": "gate2",
           "status": "pass"
         },
@@ -2117,7 +2117,7 @@
           "lstar_us": 2.628,
           "meas_p99_us": 30.22,
           "meas_us": 29.28,
-          "pred_us": 15.64219249066641,
+          "pred_us": 15.642192490666407,
           "split": "gate2",
           "status": "fail"
         },
@@ -2135,7 +2135,7 @@
           "lstar_us": 0.246,
           "meas_p99_us": 13.704,
           "meas_us": 13.6025,
-          "pred_us": 12.720026842943115,
+          "pred_us": 12.720026842943117,
           "split": "gate2",
           "status": "pass"
         },
@@ -2243,7 +2243,7 @@
           "lstar_us": 0.252,
           "meas_p99_us": 13.9228,
           "meas_us": 13.5975,
-          "pred_us": 12.926995738489294,
+          "pred_us": 12.926995738489296,
           "split": "gate2",
           "status": "pass"
         },
@@ -2261,7 +2261,7 @@
           "lstar_us": 2.782,
           "meas_p99_us": 32.276,
           "meas_us": 31.0,
-          "pred_us": 16.58972957832038,
+          "pred_us": 16.589729578320384,
           "split": "gate2",
           "status": "fail"
         },
@@ -2333,7 +2333,7 @@
           "lstar_us": 3.109,
           "meas_p99_us": 35.446,
           "meas_us": 34.19,
-          "pred_us": 16.59988828690361,
+          "pred_us": 16.599888286903614,
           "split": "gate2",
           "status": "fail"
         },
@@ -2369,7 +2369,7 @@
           "lstar_us": 3.273,
           "meas_p99_us": 18.094,
           "meas_us": 17.65,
-          "pred_us": 16.611032085297655,
+          "pred_us": 16.61103208529765,
           "split": "gate2",
           "status": "pass"
         },
@@ -2441,7 +2441,7 @@
           "lstar_us": 3.929,
           "meas_p99_us": 17.319,
           "meas_us": 16.84,
-          "pred_us": 16.670133715861958,
+          "pred_us": 16.670133715861954,
           "split": "gate2",
           "status": "pass"
         },
@@ -2477,7 +2477,7 @@
           "lstar_us": 4.584,
           "meas_p99_us": 32.369,
           "meas_us": 31.28,
-          "pred_us": 17.734431295547463,
+          "pred_us": 17.73443129554746,
           "split": "gate2",
           "status": "fail"
         },
@@ -2495,7 +2495,7 @@
           "lstar_us": 1.486,
           "meas_p99_us": 27.339,
           "meas_us": 26.29,
-          "pred_us": 13.730339331715564,
+          "pred_us": 13.730339331715566,
           "split": "gate2",
           "status": "fail"
         },
@@ -2513,7 +2513,7 @@
           "lstar_us": 5.239,
           "meas_p99_us": 21.437,
           "meas_us": 20.78,
-          "pred_us": 17.80129408591172,
+          "pred_us": 17.801294085911724,
           "split": "gate2",
           "status": "fail"
         },
@@ -2531,7 +2531,7 @@
           "lstar_us": 1.982,
           "meas_p99_us": 15.96,
           "meas_us": 15.67,
-          "pred_us": 13.774914525291736,
+          "pred_us": 13.774914525291738,
           "split": "gate2",
           "status": "pass"
         },
@@ -2567,7 +2567,7 @@
           "lstar_us": 3.968,
           "meas_p99_us": 16.614,
           "meas_us": 15.91,
-          "pred_us": 14.898277655976393,
+          "pred_us": 14.898277655976397,
           "split": "gate2",
           "status": "pass"
         },
@@ -3269,7 +3269,7 @@
           "lstar_us": 127.097,
           "meas_p99_us": 224.624,
           "meas_us": 217.4,
-          "pred_us": 183.2683487529532,
+          "pred_us": 183.26834875295322,
           "split": "gate4",
           "status": "fail"
         },
@@ -3287,7 +3287,7 @@
           "lstar_us": 127.097,
           "meas_p99_us": 188.14,
           "meas_us": 185.54,
-          "pred_us": 164.09563012178558,
+          "pred_us": 164.09563012178563,
           "split": "gate4",
           "status": "fail"
         },
@@ -7495,7 +7495,7 @@
         "total": 408,
         "worker_diagnostics": 3
       },
-      "elapsed_s": 85.44,
+      "elapsed_s": 51.65,
       "endpoint_alias": "a2-910b4-ep",
       "family_summary": {
         "anchor": {
@@ -8767,7 +8767,7 @@
           "lstar_us": 20.978,
           "meas_p99_us": 56.907,
           "meas_us": 39.63,
-          "pred_us": 34.91878182169818,
+          "pred_us": 34.918781821698175,
           "split": "gate2",
           "status": "fail"
         },
@@ -8785,7 +8785,7 @@
           "lstar_us": 3.97,
           "meas_p99_us": 20.3522,
           "meas_us": 20.04,
-          "pred_us": 20.431120601597737,
+          "pred_us": 20.43112060159774,
           "split": "gate2",
           "status": "pass"
         },
@@ -8821,7 +8821,7 @@
           "lstar_us": 3.972,
           "meas_p99_us": 20.4503,
           "meas_us": 20.1825,
-          "pred_us": 20.498835049187683,
+          "pred_us": 20.498835049187687,
           "split": "gate2",
           "status": "pass"
         },
@@ -8857,7 +8857,7 @@
           "lstar_us": 3.976,
           "meas_p99_us": 20.7243,
           "meas_us": 20.2,
-          "pred_us": 20.63426394436757,
+          "pred_us": 20.634263944367568,
           "split": "gate2",
           "status": "pass"
         },
@@ -8893,7 +8893,7 @@
           "lstar_us": 3.984,
           "meas_p99_us": 20.9478,
           "meas_us": 20.55,
-          "pred_us": 20.90512173472733,
+          "pred_us": 20.905121734727334,
           "split": "gate2",
           "status": "pass"
         },
@@ -8965,7 +8965,7 @@
           "lstar_us": 5.954,
           "meas_p99_us": 24.094,
           "meas_us": 23.67,
-          "pred_us": 22.0665990483611,
+          "pred_us": 22.066599048361102,
           "split": "gate2",
           "status": "pass"
         },
@@ -9037,7 +9037,7 @@
           "lstar_us": 11.912,
           "meas_p99_us": 25.053,
           "meas_us": 23.94,
-          "pred_us": 23.829620142062442,
+          "pred_us": 23.829620142062446,
           "split": "gate2",
           "status": "pass"
         },
@@ -9055,7 +9055,7 @@
           "lstar_us": 21.623,
           "meas_p99_us": 59.929,
           "meas_us": 42.29,
-          "pred_us": 37.21195732837974,
+          "pred_us": 37.21195732837975,
           "split": "gate2",
           "status": "fail"
         },
@@ -9163,7 +9163,7 @@
           "lstar_us": 63.547,
           "meas_p99_us": 118.736,
           "meas_us": 108.55,
-          "pred_us": 114.70884456324444,
+          "pred_us": 114.70884456324445,
           "split": "gate2",
           "status": "pass"
         },
@@ -9199,7 +9199,7 @@
           "lstar_us": 4.593,
           "meas_p99_us": 32.279,
           "meas_us": 31.53,
-          "pred_us": 34.70341175617665,
+          "pred_us": 34.703411756176656,
           "split": "gate2",
           "status": "fail"
         },
@@ -9217,7 +9217,7 @@
           "lstar_us": 0.867,
           "meas_p99_us": 21.1283,
           "meas_us": 20.6675,
-          "pred_us": 22.134393911833087,
+          "pred_us": 22.13439391183309,
           "split": "gate2",
           "status": "pass"
         },
@@ -9235,7 +9235,7 @@
           "lstar_us": 4.602,
           "meas_p99_us": 32.028,
           "meas_us": 31.0,
-          "pred_us": 34.773440632589164,
+          "pred_us": 34.77344063258917,
           "split": "gate2",
           "status": "fail"
         },
@@ -9271,7 +9271,7 @@
           "lstar_us": 4.62,
           "meas_p99_us": 32.379,
           "meas_us": 31.77,
-          "pred_us": 34.9134983854142,
+          "pred_us": 34.91349838541421,
           "split": "gate2",
           "status": "pass"
         },
@@ -9307,7 +9307,7 @@
           "lstar_us": 4.656,
           "meas_p99_us": 32.634,
           "meas_us": 31.97,
-          "pred_us": 35.19361389106428,
+          "pred_us": 35.19361389106429,
           "split": "gate2",
           "status": "fail"
         },
@@ -9325,7 +9325,7 @@
           "lstar_us": 0.879,
           "meas_p99_us": 20.9375,
           "meas_us": 20.485,
-          "pred_us": 22.483128791428385,
+          "pred_us": 22.48312879142839,
           "split": "gate2",
           "status": "pass"
         },
@@ -9343,7 +9343,7 @@
           "lstar_us": 4.727,
           "meas_p99_us": 44.363,
           "meas_us": 43.19,
-          "pred_us": 35.753844902364435,
+          "pred_us": 35.75384490236444,
           "split": "gate2",
           "status": "fail"
         },
@@ -9415,7 +9415,7 @@
           "lstar_us": 5.014,
           "meas_p99_us": 33.631,
           "meas_us": 32.45,
-          "pred_us": 35.767573716454464,
+          "pred_us": 35.76757371645447,
           "split": "gate2",
           "status": "fail"
         },
@@ -9451,7 +9451,7 @@
           "lstar_us": 5.157,
           "meas_p99_us": 30.724,
           "meas_us": 29.89,
-          "pred_us": 35.779087383574904,
+          "pred_us": 35.77908738357491,
           "split": "gate2",
           "status": "fail"
         },
@@ -9487,7 +9487,7 @@
           "lstar_us": 5.444,
           "meas_p99_us": 32.065,
           "meas_us": 31.57,
-          "pred_us": 36.94152444458627,
+          "pred_us": 36.94152444458628,
           "split": "gate2",
           "status": "fail"
         },
@@ -9559,7 +9559,7 @@
           "lstar_us": 6.304,
           "meas_p99_us": 36.435,
           "meas_us": 35.61,
-          "pred_us": 39.29288265085018,
+          "pred_us": 39.29288265085019,
           "split": "gate2",
           "status": "fail"
         },
@@ -9577,7 +9577,7 @@
           "lstar_us": 5.21,
           "meas_p99_us": 23.694,
           "meas_us": 22.79,
-          "pred_us": 25.39008188637917,
+          "pred_us": 25.390081886379175,
           "split": "gate2",
           "status": "fail"
         },
@@ -9595,7 +9595,7 @@
           "lstar_us": 6.947,
           "meas_p99_us": 34.813,
           "meas_us": 34.16,
-          "pred_us": 39.33893731933195,
+          "pred_us": 39.338937319331954,
           "split": "gate2",
           "status": "fail"
         },
@@ -9613,7 +9613,7 @@
           "lstar_us": 6.947,
           "meas_p99_us": 24.544,
           "meas_us": 23.46,
-          "pred_us": 25.436136554860934,
+          "pred_us": 25.436136554860937,
           "split": "gate2",
           "status": "pass"
         },
@@ -9649,7 +9649,7 @@
           "lstar_us": 13.898,
           "meas_p99_us": 36.225,
           "meas_us": 34.99,
-          "pred_us": 28.826721542499737,
+          "pred_us": 28.826721542499744,
           "split": "gate2",
           "status": "fail"
         },
@@ -9703,7 +9703,7 @@
           "lstar_us": 18.352,
           "meas_p99_us": 47.295,
           "meas_us": 39.23,
-          "pred_us": 36.91534496573939,
+          "pred_us": 36.9153449657394,
           "split": "gate2",
           "status": "pass"
         },
@@ -9793,7 +9793,7 @@
           "lstar_us": 3.476,
           "meas_p99_us": 20.2163,
           "meas_us": 19.88,
-          "pred_us": 20.33177694168995,
+          "pred_us": 20.331776941689952,
           "split": "gate2",
           "status": "pass"
         },
@@ -9811,7 +9811,7 @@
           "lstar_us": 18.388,
           "meas_p99_us": 44.558,
           "meas_us": 36.64,
-          "pred_us": 37.201552829265886,
+          "pred_us": 37.20155282926589,
           "split": "gate2",
           "status": "pass"
         },
@@ -9829,7 +9829,7 @@
           "lstar_us": 3.48,
           "meas_p99_us": 20.3053,
           "meas_us": 20.01,
-          "pred_us": 20.61067392042949,
+          "pred_us": 20.610673920429495,
           "split": "gate2",
           "status": "pass"
         },
@@ -9865,7 +9865,7 @@
           "lstar_us": 3.487,
           "meas_p99_us": 20.7278,
           "meas_us": 20.1975,
-          "pred_us": 21.208045828926227,
+          "pred_us": 21.208045828926235,
           "split": "gate2",
           "status": "pass"
         },
@@ -10045,7 +10045,7 @@
           "lstar_us": 20.849,
           "meas_p99_us": 35.213,
           "meas_us": 33.93,
-          "pred_us": 34.97174769622287,
+          "pred_us": 34.97174769622286,
           "split": "gate2",
           "status": "pass"
         },
@@ -10153,7 +10153,7 @@
           "lstar_us": 0.246,
           "meas_p99_us": 13.138,
           "meas_us": 12.675,
-          "pred_us": 12.732627687750137,
+          "pred_us": 12.732627687750139,
           "split": "gate2",
           "status": "pass"
         },
@@ -10189,7 +10189,7 @@
           "lstar_us": 0.247,
           "meas_p99_us": 13.157,
           "meas_us": 12.715,
-          "pred_us": 12.762280754496777,
+          "pred_us": 12.762280754496778,
           "split": "gate2",
           "status": "pass"
         },
@@ -10243,7 +10243,7 @@
           "lstar_us": 1.348,
           "meas_p99_us": 27.442,
           "meas_us": 26.42,
-          "pred_us": 17.11945003756072,
+          "pred_us": 17.119450037560718,
           "split": "gate2",
           "status": "fail"
         },
@@ -10261,7 +10261,7 @@
           "lstar_us": 0.252,
           "meas_p99_us": 13.3198,
           "meas_us": 13.1225,
-          "pred_us": 12.94019915497663,
+          "pred_us": 12.940199154976632,
           "split": "gate2",
           "status": "pass"
         },
@@ -10297,7 +10297,7 @@
           "lstar_us": 0.26,
           "meas_p99_us": 13.752,
           "meas_us": 13.245,
-          "pred_us": 13.177423688949768,
+          "pred_us": 13.177423688949766,
           "split": "gate2",
           "status": "pass"
         },
@@ -10315,7 +10315,7 @@
           "lstar_us": 1.471,
           "meas_p99_us": 29.614,
           "meas_us": 28.92,
-          "pred_us": 17.653785300095844,
+          "pred_us": 17.65378530009584,
           "split": "gate2",
           "status": "fail"
         },
@@ -10333,7 +10333,7 @@
           "lstar_us": 0.276,
           "meas_p99_us": 15.0463,
           "meas_us": 14.4975,
-          "pred_us": 13.177423688949768,
+          "pred_us": 13.177423688949766,
           "split": "gate2",
           "status": "pass"
         },
@@ -10369,7 +10369,7 @@
           "lstar_us": 0.369,
           "meas_p99_us": 16.211,
           "meas_us": 14.98,
-          "pred_us": 13.177423688949768,
+          "pred_us": 13.177423688949766,
           "split": "gate2",
           "status": "pass"
         },
@@ -10405,7 +10405,7 @@
           "lstar_us": 0.493,
           "meas_p99_us": 14.641,
           "meas_us": 13.9,
-          "pred_us": 13.177423688949768,
+          "pred_us": 13.177423688949766,
           "split": "gate2",
           "status": "pass"
         },
@@ -10441,7 +10441,7 @@
           "lstar_us": 0.741,
           "meas_p99_us": 13.973,
           "meas_us": 12.7,
-          "pred_us": 13.177424896423858,
+          "pred_us": 13.177424896423856,
           "split": "gate2",
           "status": "pass"
         },
@@ -10477,7 +10477,7 @@
           "lstar_us": 0.989,
           "meas_p99_us": 14.997,
           "meas_us": 14.42,
-          "pred_us": 13.1889385635443,
+          "pred_us": 13.188938563544298,
           "split": "gate2",
           "status": "pass"
         },
@@ -10567,7 +10567,7 @@
           "lstar_us": 3.968,
           "meas_p99_us": 22.423,
           "meas_us": 21.55,
-          "pred_us": 21.10667991270922,
+          "pred_us": 21.106679912709225,
           "split": "gate2",
           "status": "pass"
         },
@@ -10585,7 +10585,7 @@
           "lstar_us": 3.968,
           "meas_p99_us": 16.212,
           "meas_us": 14.73,
-          "pred_us": 14.763899619458737,
+          "pred_us": 14.763899619458739,
           "split": "gate2",
           "status": "pass"
         },
@@ -11071,7 +11071,7 @@
           "lstar_us": 42.103,
           "meas_p99_us": 64.88,
           "meas_us": 62.92,
-          "pred_us": 65.07260978468057,
+          "pred_us": 65.07260978468058,
           "split": "gate4",
           "status": "pass"
         },
@@ -11089,7 +11089,7 @@
           "lstar_us": 7.971,
           "meas_p99_us": 62.471,
           "meas_us": 61.21,
-          "pred_us": 64.8245436813822,
+          "pred_us": 64.82454368138218,
           "split": "gate4",
           "status": "pass"
         },
@@ -11125,7 +11125,7 @@
           "lstar_us": 8.064,
           "meas_p99_us": 65.01,
           "meas_us": 63.12,
-          "pred_us": 65.42853279554836,
+          "pred_us": 65.42853279554835,
           "split": "gate4",
           "status": "pass"
         },
@@ -11143,7 +11143,7 @@
           "lstar_us": 42.595,
           "meas_p99_us": 69.282,
           "meas_us": 67.97,
-          "pred_us": 67.2190668850824,
+          "pred_us": 67.21906688508241,
           "split": "gate4",
           "status": "pass"
         },
@@ -11161,7 +11161,7 @@
           "lstar_us": 8.064,
           "meas_p99_us": 64.651,
           "meas_us": 63.38,
-          "pred_us": 66.22215823581192,
+          "pred_us": 66.2221582358119,
           "split": "gate4",
           "status": "pass"
         },
@@ -11215,7 +11215,7 @@
           "lstar_us": 44.561,
           "meas_p99_us": 87.28,
           "meas_us": 84.83,
-          "pred_us": 79.09617038084383,
+          "pred_us": 79.09617038084382,
           "split": "gate4",
           "status": "pass"
         },
@@ -11233,7 +11233,7 @@
           "lstar_us": 31.772,
           "meas_p99_us": 72.557,
           "meas_us": 71.23,
-          "pred_us": 59.70628143551585,
+          "pred_us": 59.70628143551584,
           "split": "gate4",
           "status": "fail"
         },
@@ -11251,7 +11251,7 @@
           "lstar_us": 127.097,
           "meas_p99_us": 179.553,
           "meas_us": 176.47,
-          "pred_us": 175.40938564297497,
+          "pred_us": 175.40938564297505,
           "split": "gate4",
           "status": "pass"
         },
@@ -11287,7 +11287,7 @@
           "lstar_us": 127.097,
           "meas_p99_us": 190.119,
           "meas_us": 187.75,
-          "pred_us": 183.84605105552052,
+          "pred_us": 183.8460510555205,
           "split": "gate4",
           "status": "pass"
         },
@@ -11305,7 +11305,7 @@
           "lstar_us": 127.097,
           "meas_p99_us": 151.582,
           "meas_us": 150.64,
-          "pred_us": 164.37006301487472,
+          "pred_us": 164.3700630148747,
           "split": "gate4",
           "status": "pass"
         },
@@ -17268,7 +17268,7 @@
         "total": 499,
         "worker_diagnostics": 4
       },
-      "elapsed_s": 82.77,
+      "elapsed_s": 50.46,
       "endpoint_alias": "a3-9362-ep",
       "family_summary": {
         "anchor": {
@@ -18598,7 +18598,7 @@
           "lstar_us": 3.031,
           "meas_p99_us": 19.1732,
           "meas_us": 18.955,
-          "pred_us": 18.70587169469105,
+          "pred_us": 18.705871694691055,
           "split": "gate2",
           "status": "pass"
         },
@@ -18634,7 +18634,7 @@
           "lstar_us": 3.032,
           "meas_p99_us": 19.0825,
           "meas_us": 18.81,
-          "pred_us": 18.738921869942338,
+          "pred_us": 18.73892186994234,
           "split": "gate2",
           "status": "pass"
         },
@@ -18670,7 +18670,7 @@
           "lstar_us": 3.034,
           "meas_p99_us": 19.0912,
           "meas_us": 18.8925,
-          "pred_us": 18.80502222044491,
+          "pred_us": 18.805022220444915,
           "split": "gate2",
           "status": "pass"
         },
@@ -18688,7 +18688,7 @@
           "lstar_us": 21.009,
           "meas_p99_us": 37.934,
           "meas_us": 29.92,
-          "pred_us": 30.639055001991053,
+          "pred_us": 30.639055001991057,
           "split": "gate2",
           "status": "pass"
         },
@@ -18706,7 +18706,7 @@
           "lstar_us": 3.037,
           "meas_p99_us": 19.3225,
           "meas_us": 19.06,
-          "pred_us": 18.937222921450047,
+          "pred_us": 18.93722292145005,
           "split": "gate2",
           "status": "pass"
         },
@@ -18760,7 +18760,7 @@
           "lstar_us": 21.132,
           "meas_p99_us": 37.905,
           "meas_us": 31.26,
-          "pred_us": 31.01729183494389,
+          "pred_us": 31.017291834943897,
           "split": "gate2",
           "status": "pass"
         },
@@ -18796,7 +18796,7 @@
           "lstar_us": 21.214,
           "meas_p99_us": 38.848,
           "meas_us": 32.13,
-          "pred_us": 31.281362031251717,
+          "pred_us": 31.281362031251724,
           "split": "gate2",
           "status": "pass"
         },
@@ -18850,7 +18850,7 @@
           "lstar_us": 6.065,
           "meas_p99_us": 21.073,
           "meas_us": 20.74,
-          "pred_us": 20.895243504575415,
+          "pred_us": 20.89524350457542,
           "split": "gate2",
           "status": "pass"
         },
@@ -18868,7 +18868,7 @@
           "lstar_us": 21.46,
           "meas_p99_us": 38.961,
           "meas_us": 33.41,
-          "pred_us": 32.09243860272623,
+          "pred_us": 32.092438602726226,
           "split": "gate2",
           "status": "pass"
         },
@@ -18886,7 +18886,7 @@
           "lstar_us": 9.099,
           "meas_p99_us": 22.476,
           "meas_us": 22.17,
-          "pred_us": 22.04318894120321,
+          "pred_us": 22.043188941203212,
           "split": "gate2",
           "status": "pass"
         },
@@ -18904,7 +18904,7 @@
           "lstar_us": 21.623,
           "meas_p99_us": 40.236,
           "meas_us": 34.45,
-          "pred_us": 32.67427506359962,
+          "pred_us": 32.674275063599616,
           "split": "gate2",
           "status": "pass"
         },
@@ -18940,7 +18940,7 @@
           "lstar_us": 21.951,
           "meas_p99_us": 58.651,
           "meas_us": 58.04,
-          "pred_us": 52.10414620767064,
+          "pred_us": 52.104146207670645,
           "split": "gate2",
           "status": "fail"
         },
@@ -18976,7 +18976,7 @@
           "lstar_us": 24.269,
           "meas_p99_us": 62.806,
           "meas_us": 61.62,
-          "pred_us": 54.4286494611627,
+          "pred_us": 54.428649461162706,
           "split": "gate2",
           "status": "fail"
         },
@@ -19030,7 +19030,7 @@
           "lstar_us": 48.542,
           "meas_p99_us": 65.091,
           "meas_us": 64.7,
-          "pred_us": 66.44428348173771,
+          "pred_us": 66.4442834817377,
           "split": "gate2",
           "status": "pass"
         },
@@ -19048,7 +19048,7 @@
           "lstar_us": 4.593,
           "meas_p99_us": 30.928,
           "meas_us": 29.99,
-          "pred_us": 27.55177638146867,
+          "pred_us": 27.551776381468677,
           "split": "gate2",
           "status": "pass"
         },
@@ -19066,7 +19066,7 @@
           "lstar_us": 0.662,
           "meas_p99_us": 20.6772,
           "meas_us": 20.0225,
-          "pred_us": 20.2998968637997,
+          "pred_us": 20.299896863799702,
           "split": "gate2",
           "status": "pass"
         },
@@ -19084,7 +19084,7 @@
           "lstar_us": 4.602,
           "meas_p99_us": 30.331,
           "meas_us": 29.58,
-          "pred_us": 27.60809971607817,
+          "pred_us": 27.608099716078172,
           "split": "gate2",
           "status": "pass"
         },
@@ -19102,7 +19102,7 @@
           "lstar_us": 0.663,
           "meas_p99_us": 20.258,
           "meas_us": 19.5575,
-          "pred_us": 20.348634416133965,
+          "pred_us": 20.34863441613397,
           "split": "gate2",
           "status": "pass"
         },
@@ -19138,7 +19138,7 @@
           "lstar_us": 0.665,
           "meas_p99_us": 20.0555,
           "meas_us": 19.58,
-          "pred_us": 20.446109520802494,
+          "pred_us": 20.446109520802498,
           "split": "gate2",
           "status": "pass"
         },
@@ -19156,7 +19156,7 @@
           "lstar_us": 4.656,
           "meas_p99_us": 31.296,
           "meas_us": 30.61,
-          "pred_us": 27.9460397237352,
+          "pred_us": 27.946039723735204,
           "split": "gate2",
           "status": "pass"
         },
@@ -19192,7 +19192,7 @@
           "lstar_us": 4.727,
           "meas_p99_us": 44.305,
           "meas_us": 43.55,
-          "pred_us": 28.39662640061124,
+          "pred_us": 28.396626400611243,
           "split": "gate2",
           "status": "fail"
         },
@@ -19228,7 +19228,7 @@
           "lstar_us": 4.871,
           "meas_p99_us": 46.843,
           "meas_us": 46.03,
-          "pred_us": 28.401175767927544,
+          "pred_us": 28.401175767927548,
           "split": "gate2",
           "status": "fail"
         },
@@ -19264,7 +19264,7 @@
           "lstar_us": 5.014,
           "meas_p99_us": 31.0,
           "meas_us": 30.38,
-          "pred_us": 28.412746812777772,
+          "pred_us": 28.412746812777776,
           "split": "gate2",
           "status": "pass"
         },
@@ -19300,7 +19300,7 @@
           "lstar_us": 5.157,
           "meas_p99_us": 28.796,
           "meas_us": 28.24,
-          "pred_us": 28.424317857627994,
+          "pred_us": 28.424317857627997,
           "split": "gate2",
           "status": "pass"
         },
@@ -19390,7 +19390,7 @@
           "lstar_us": 2.651,
           "meas_p99_us": 38.579,
           "meas_us": 37.47,
-          "pred_us": 21.861840707106364,
+          "pred_us": 21.861840707106367,
           "split": "gate2",
           "status": "fail"
         },
@@ -19408,7 +19408,7 @@
           "lstar_us": 6.304,
           "meas_p99_us": 33.719,
           "meas_us": 33.05,
-          "pred_us": 29.440447552280798,
+          "pred_us": 29.4404475522808,
           "split": "gate2",
           "status": "fail"
         },
@@ -19426,7 +19426,7 @@
           "lstar_us": 3.979,
           "meas_p99_us": 24.016,
           "meas_us": 23.17,
-          "pred_us": 21.90812488650725,
+          "pred_us": 21.908124886507252,
           "split": "gate2",
           "status": "pass"
         },
@@ -19462,7 +19462,7 @@
           "lstar_us": 5.306,
           "meas_p99_us": 23.485,
           "meas_us": 21.79,
-          "pred_us": 23.508259025765064,
+          "pred_us": 23.508259025765067,
           "split": "gate2",
           "status": "pass"
         },
@@ -19498,7 +19498,7 @@
           "lstar_us": 10.616,
           "meas_p99_us": 32.747,
           "meas_us": 32.32,
-          "pred_us": 26.801095663082453,
+          "pred_us": 26.801095663082457,
           "split": "gate2",
           "status": "fail"
         },
@@ -19516,7 +19516,7 @@
           "lstar_us": 18.349,
           "meas_p99_us": 40.957,
           "meas_us": 33.72,
-          "pred_us": 36.90605134130321,
+          "pred_us": 36.90605134130322,
           "split": "gate2",
           "status": "pass"
         },
@@ -19660,7 +19660,7 @@
           "lstar_us": 18.388,
           "meas_p99_us": 37.134,
           "meas_us": 30.79,
-          "pred_us": 37.25581421546193,
+          "pred_us": 37.255814215461946,
           "split": "gate2",
           "status": "fail"
         },
@@ -19822,7 +19822,7 @@
           "lstar_us": 7.961,
           "meas_p99_us": 22.257,
           "meas_us": 21.92,
-          "pred_us": 22.184100591878842,
+          "pred_us": 22.184100591878845,
           "split": "gate2",
           "status": "pass"
         },
@@ -19876,7 +19876,7 @@
           "lstar_us": 18.838,
           "meas_p99_us": 51.192,
           "meas_us": 46.8,
-          "pred_us": 48.36273353539028,
+          "pred_us": 48.362733535390284,
           "split": "gate2",
           "status": "pass"
         },
@@ -19894,7 +19894,7 @@
           "lstar_us": 15.925,
           "meas_p99_us": 32.66,
           "meas_us": 31.95,
-          "pred_us": 32.566216027056214,
+          "pred_us": 32.56621602705621,
           "split": "gate2",
           "status": "pass"
         },
@@ -19912,7 +19912,7 @@
           "lstar_us": 21.235,
           "meas_p99_us": 52.829,
           "meas_us": 48.33,
-          "pred_us": 50.05849083276858,
+          "pred_us": 50.05849083276857,
           "split": "gate2",
           "status": "pass"
         },
@@ -19948,7 +19948,7 @@
           "lstar_us": 42.474,
           "meas_p99_us": 77.368,
           "meas_us": 75.77,
-          "pred_us": 71.77733281249496,
+          "pred_us": 71.77733281249495,
           "split": "gate2",
           "status": "pass"
         },
@@ -19966,7 +19966,7 @@
           "lstar_us": 42.474,
           "meas_p99_us": 54.945,
           "meas_us": 54.47,
-          "pred_us": 55.59595125792514,
+          "pred_us": 55.59595125792513,
           "split": "gate2",
           "status": "pass"
         },
@@ -20020,7 +20020,7 @@
           "lstar_us": 1.317,
           "meas_p99_us": 25.245,
           "meas_us": 24.74,
-          "pred_us": 15.444685455646292,
+          "pred_us": 15.444685455646294,
           "split": "gate2",
           "status": "fail"
         },
@@ -20074,7 +20074,7 @@
           "lstar_us": 0.189,
           "meas_p99_us": 12.6805,
           "meas_us": 12.2625,
-          "pred_us": 11.764848824417836,
+          "pred_us": 11.764848824417838,
           "split": "gate2",
           "status": "pass"
         },
@@ -20110,7 +20110,7 @@
           "lstar_us": 0.192,
           "meas_p99_us": 12.904,
           "meas_us": 12.565,
-          "pred_us": 11.88133840860971,
+          "pred_us": 11.881338408609713,
           "split": "gate2",
           "status": "pass"
         },
@@ -20128,7 +20128,7 @@
           "lstar_us": 1.389,
           "meas_p99_us": 26.723,
           "meas_us": 25.7,
-          "pred_us": 16.31435422415335,
+          "pred_us": 16.314354224153348,
           "split": "gate2",
           "status": "fail"
         },
@@ -20146,7 +20146,7 @@
           "lstar_us": 0.198,
           "meas_p99_us": 13.4388,
           "meas_us": 12.91,
-          "pred_us": 12.114317576993468,
+          "pred_us": 12.114317576993471,
           "split": "gate2",
           "status": "pass"
         },
@@ -20164,7 +20164,7 @@
           "lstar_us": 1.471,
           "meas_p99_us": 28.43,
           "meas_us": 27.68,
-          "pred_us": 16.31435422415335,
+          "pred_us": 16.314354224153348,
           "split": "gate2",
           "status": "fail"
         },
@@ -20182,7 +20182,7 @@
           "lstar_us": 0.21,
           "meas_p99_us": 14.4342,
           "meas_us": 14.135,
-          "pred_us": 12.114317576993468,
+          "pred_us": 12.114317576993471,
           "split": "gate2",
           "status": "fail"
         },
@@ -20218,7 +20218,7 @@
           "lstar_us": 0.281,
           "meas_p99_us": 14.474,
           "meas_us": 14.09,
-          "pred_us": 12.114317576993468,
+          "pred_us": 12.114317576993471,
           "split": "gate2",
           "status": "pass"
         },
@@ -20236,7 +20236,7 @@
           "lstar_us": 1.635,
           "meas_p99_us": 18.124,
           "meas_us": 17.41,
-          "pred_us": 16.32386548092216,
+          "pred_us": 16.323865480922155,
           "split": "gate2",
           "status": "pass"
         },
@@ -20254,7 +20254,7 @@
           "lstar_us": 0.376,
           "meas_p99_us": 12.797,
           "meas_us": 12.21,
-          "pred_us": 12.114317576993468,
+          "pred_us": 12.114317576993471,
           "split": "gate2",
           "status": "pass"
         },
@@ -20290,7 +20290,7 @@
           "lstar_us": 0.565,
           "meas_p99_us": 14.291,
           "meas_us": 13.54,
-          "pred_us": 12.114317576993468,
+          "pred_us": 12.114317576993471,
           "split": "gate2",
           "status": "pass"
         },
@@ -20326,7 +20326,7 @@
           "lstar_us": 0.755,
           "meas_p99_us": 13.202,
           "meas_us": 12.59,
-          "pred_us": 12.121988975956768,
+          "pred_us": 12.12198897595677,
           "split": "gate2",
           "status": "pass"
         },
@@ -20344,7 +20344,7 @@
           "lstar_us": 2.29,
           "meas_p99_us": 18.718,
           "meas_us": 17.76,
-          "pred_us": 16.375287623164915,
+          "pred_us": 16.37528762316492,
           "split": "gate2",
           "status": "pass"
         },
@@ -20362,7 +20362,7 @@
           "lstar_us": 1.134,
           "meas_p99_us": 13.822,
           "meas_us": 13.48,
-          "pred_us": 12.14513106565721,
+          "pred_us": 12.145131065657214,
           "split": "gate2",
           "status": "pass"
         },
@@ -20398,7 +20398,7 @@
           "lstar_us": 1.514,
           "meas_p99_us": 26.198,
           "meas_us": 24.72,
-          "pred_us": 12.631355634705344,
+          "pred_us": 12.631355634705345,
           "split": "gate2",
           "status": "fail"
         },
@@ -20416,7 +20416,7 @@
           "lstar_us": 3.929,
           "meas_p99_us": 20.116,
           "meas_us": 19.56,
-          "pred_us": 19.537591781934474,
+          "pred_us": 19.53759178193447,
           "split": "gate2",
           "status": "pass"
         },
@@ -20902,7 +20902,7 @@
           "lstar_us": 6.088,
           "meas_p99_us": 55.71,
           "meas_us": 54.01,
-          "pred_us": 53.20618774940825,
+          "pred_us": 53.20618774940824,
           "split": "gate4",
           "status": "pass"
         },
@@ -20920,7 +20920,7 @@
           "lstar_us": 42.103,
           "meas_p99_us": 63.912,
           "meas_us": 56.68,
-          "pred_us": 54.133906348115865,
+          "pred_us": 54.13390634811586,
           "split": "gate4",
           "status": "pass"
         },
@@ -20938,7 +20938,7 @@
           "lstar_us": 6.088,
           "meas_p99_us": 55.037,
           "meas_us": 53.92,
-          "pred_us": 53.92769534073354,
+          "pred_us": 53.92769534073355,
           "split": "gate4",
           "status": "pass"
         },
@@ -20956,7 +20956,7 @@
           "lstar_us": 42.595,
           "meas_p99_us": 61.889,
           "meas_us": 55.43,
-          "pred_us": 54.606115785550095,
+          "pred_us": 54.60611578555009,
           "split": "gate4",
           "status": "pass"
         },
@@ -20974,7 +20974,7 @@
           "lstar_us": 6.159,
           "meas_p99_us": 55.76,
           "meas_us": 54.84,
-          "pred_us": 53.79186199187116,
+          "pred_us": 53.791861991871144,
           "split": "gate4",
           "status": "pass"
         },
@@ -20992,7 +20992,7 @@
           "lstar_us": 42.595,
           "meas_p99_us": 62.648,
           "meas_us": 58.26,
-          "pred_us": 57.41669418899262,
+          "pred_us": 57.41669418899263,
           "split": "gate4",
           "status": "pass"
         },
@@ -21010,7 +21010,7 @@
           "lstar_us": 6.159,
           "meas_p99_us": 56.358,
           "meas_us": 55.26,
-          "pred_us": 56.56323784930236,
+          "pred_us": 56.563237849302354,
           "split": "gate4",
           "status": "pass"
         },
@@ -21028,7 +21028,7 @@
           "lstar_us": 44.561,
           "meas_p99_us": 66.69,
           "meas_us": 65.24,
-          "pred_us": 59.29753095698194,
+          "pred_us": 59.29753095698192,
           "split": "gate4",
           "status": "pass"
         },
@@ -21046,7 +21046,7 @@
           "lstar_us": 24.269,
           "meas_p99_us": 59.499,
           "meas_us": 57.7,
-          "pred_us": 56.047502840284565,
+          "pred_us": 56.04750284028455,
           "split": "gate4",
           "status": "pass"
         },
@@ -21118,7 +21118,7 @@
           "lstar_us": 97.087,
           "meas_p99_us": 113.697,
           "meas_us": 112.45,
-          "pred_us": 121.58591285416159,
+          "pred_us": 121.5859128541616,
           "split": "gate4",
           "status": "pass"
         },
@@ -21154,7 +21154,7 @@
           "lstar_us": 97.087,
           "meas_p99_us": 120.08,
           "meas_us": 119.51,
-          "pred_us": 131.4604538022542,
+          "pred_us": 131.46045380225416,
           "split": "gate4",
           "status": "pass"
         },
@@ -25362,7 +25362,7 @@
         "total": 408,
         "worker_diagnostics": 4
       },
-      "elapsed_s": 81.23,
+      "elapsed_s": 49.86,
       "endpoint_alias": "a3-9382-ep",
       "family_summary": {
         "anchor": {
@@ -26625,7 +26625,7 @@
       "cann_version": "9.2.0",
       "capture_quality_summary": {
         "clean_l1_cliff_pass": 308,
-        "clean_pass": 270,
+        "clean_pass": 268,
         "clean_scored": 366,
         "flagged_rows": 24,
         "flags": {
@@ -27039,7 +27039,7 @@
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 6.0483,
+          "ape_pct": 4.3801,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M1_N4096_K4096_cold",
@@ -27051,13 +27051,13 @@
           "lstar_us": 8.387,
           "meas_p99_us": 20.8787,
           "meas_us": 18.4485,
-          "pred_us": 19.56431144629316,
+          "pred_us": 19.25657055486892,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 2.6805,
+          "ape_pct": 5.248,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M1_N4096_K4096_warm",
@@ -27069,13 +27069,13 @@
           "lstar_us": 2.48,
           "meas_p99_us": 12.7117,
           "meas_us": 11.986,
-          "pred_us": 11.664711731764827,
+          "pred_us": 11.356970840340585,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 9.3692,
+          "ape_pct": 7.651,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M2_N4096_K4096_cold",
@@ -27087,13 +27087,13 @@
           "lstar_us": 8.389,
           "meas_p99_us": 20.0161,
           "meas_us": 17.9115,
-          "pred_us": 19.58965804915685,
+          "pred_us": 19.281917157732607,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 0.4494,
+          "ape_pct": 3.0652,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M2_N4096_K4096_warm",
@@ -27105,13 +27105,13 @@
           "lstar_us": 2.48,
           "meas_p99_us": 12.2914,
           "meas_us": 11.7645,
-          "pred_us": 11.711634508712523,
+          "pred_us": 11.40389361728828,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 8.5612,
+          "ape_pct": 6.8602,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M4_N4096_K4096_cold",
@@ -27123,13 +27123,13 @@
           "lstar_us": 8.393,
           "meas_p99_us": 19.5046,
           "meas_us": 18.0915,
-          "pred_us": 19.64035125488423,
+          "pred_us": 19.332610363459988,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 0.7668,
+          "ape_pct": 3.3535,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M4_N4096_K4096_warm",
@@ -27141,13 +27141,13 @@
           "lstar_us": 2.481,
           "meas_p99_us": 12.1949,
           "meas_us": 11.8967,
-          "pred_us": 11.80548006260791,
+          "pred_us": 11.497739171183666,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 10.4217,
+          "ape_pct": 8.7004,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M8_N4096_K4096_cold",
@@ -27159,13 +27159,13 @@
           "lstar_us": 8.401,
           "meas_p99_us": 19.1474,
           "meas_us": 17.8785,
-          "pred_us": 19.741737666338977,
+          "pred_us": 19.433996774914736,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 6.4546,
+          "ape_pct": 3.723,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M8_N4096_K4096_warm",
@@ -27177,13 +27177,13 @@
           "lstar_us": 2.484,
           "meas_p99_us": 11.6673,
           "meas_us": 11.266,
-          "pred_us": 11.99317117039869,
+          "pred_us": 11.685430278974447,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 7.6365,
+          "ape_pct": 5.9757,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M16_N4096_K4096_cold",
@@ -27195,13 +27195,13 @@
           "lstar_us": 8.418,
           "meas_p99_us": 21.0343,
           "meas_us": 18.5295,
-          "pred_us": 19.94451048924848,
+          "pred_us": 19.63676959782424,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 1.5674,
+          "ape_pct": 4.0165,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M16_N4096_K4096_warm",
@@ -27213,13 +27213,13 @@
           "lstar_us": 2.489,
           "meas_p99_us": 12.9384,
           "meas_us": 12.5655,
-          "pred_us": 12.368553385980242,
+          "pred_us": 12.060812494556,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 8.3187,
+          "ape_pct": 6.6869,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M32_N4096_K4096_cold",
@@ -27231,13 +27231,13 @@
           "lstar_us": 8.451,
           "meas_p99_us": 20.3198,
           "meas_us": 18.859,
-          "pred_us": 20.427816134559013,
+          "pred_us": 20.12007524313477,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 0.7787,
+          "ape_pct": 1.5713,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M32_N4096_K4096_warm",
@@ -27249,13 +27249,13 @@
           "lstar_us": 2.498,
           "meas_p99_us": 13.3703,
           "meas_us": 13.0951,
-          "pred_us": 13.197077816634872,
+          "pred_us": 12.88933692521063,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 6.3963,
+          "ape_pct": 4.8305,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M48_N4096_K4096_cold",
@@ -27267,13 +27267,13 @@
           "lstar_us": 8.483,
           "meas_p99_us": 21.3255,
           "meas_us": 19.654,
-          "pred_us": 20.911121779869532,
+          "pred_us": 20.603380888445287,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 3.346,
+          "ape_pct": 1.0784,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M48_N4096_K4096_warm",
@@ -27285,13 +27285,13 @@
           "lstar_us": 3.72,
           "meas_p99_us": 15.6132,
           "meas_us": 13.5715,
-          "pred_us": 14.0256022472895,
+          "pred_us": 13.717861355865256,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 6.4082,
+          "ape_pct": 4.8776,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M64_N4096_K4096_cold",
@@ -27303,13 +27303,13 @@
           "lstar_us": 8.516,
           "meas_p99_us": 21.3466,
           "meas_us": 20.106,
-          "pred_us": 21.39442742518007,
+          "pred_us": 21.086686533755827,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 7.7557,
+          "ape_pct": 5.5233,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M64_N4096_K4096_warm",
@@ -27321,13 +27321,13 @@
           "lstar_us": 4.961,
           "meas_p99_us": 15.2087,
           "meas_us": 13.785,
-          "pred_us": 14.854126677944135,
+          "pred_us": 14.546385786519894,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 5.278,
+          "ape_pct": 3.8291,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M96_N4096_K4096_cold",
@@ -27339,13 +27339,13 @@
           "lstar_us": 8.582,
           "meas_p99_us": 24.4033,
           "meas_us": 21.24,
-          "pred_us": 22.361038715801122,
+          "pred_us": 22.053297824376884,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 1.8454,
+          "ape_pct": 0.0528,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M96_N4096_K4096_warm",
@@ -27357,13 +27357,13 @@
           "lstar_us": 7.444,
           "meas_p99_us": 17.7968,
           "meas_us": 16.212,
-          "pred_us": 16.511175539253394,
+          "pred_us": 16.203434647829155,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 2.6135,
+          "ape_pct": 1.2599,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M128_N4096_K4096_cold",
@@ -27375,13 +27375,13 @@
           "lstar_us": 9.926,
           "meas_p99_us": 24.4186,
           "meas_us": 22.7335,
-          "pred_us": 23.327650006422193,
+          "pred_us": 23.01990911499795,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 2.3129,
+          "ape_pct": 0.6083,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M128_N4096_K4096_warm",
@@ -27393,13 +27393,13 @@
           "lstar_us": 9.926,
           "meas_p99_us": 19.6992,
           "meas_us": 18.054,
-          "pred_us": 18.471563251729577,
+          "pred_us": 18.16382236030534,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 2.2412,
+          "ape_pct": 3.4322,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M192_N4096_K4096_cold",
@@ -27411,13 +27411,13 @@
           "lstar_us": 14.891,
           "meas_p99_us": 26.9431,
           "meas_us": 25.84,
-          "pred_us": 25.260872587664302,
+          "pred_us": 24.95313169624006,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 3.7886,
+          "ape_pct": 2.5082,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M192_N4096_K4096_warm",
@@ -27429,13 +27429,13 @@
           "lstar_us": 14.891,
           "meas_p99_us": 25.1957,
           "meas_us": 24.036,
-          "pred_us": 24.946617429203403,
+          "pred_us": 24.63887653777916,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 4.9899,
+          "ape_pct": 3.9666,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M256_N4096_K4096_cold",
@@ -27447,13 +27447,13 @@
           "lstar_us": 19.856,
           "meas_p99_us": 31.2393,
           "meas_us": 30.071,
-          "pred_us": 31.5715263143716,
+          "pred_us": 31.26378542294736,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 7.4043,
+          "ape_pct": 6.3524,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M256_N4096_K4096_warm",
@@ -27465,13 +27465,13 @@
           "lstar_us": 19.856,
           "meas_p99_us": 31.4627,
           "meas_us": 29.2555,
-          "pred_us": 31.421671606677428,
+          "pred_us": 31.113930715253183,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 2.4832,
+          "ape_pct": 2.4262,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M512_N4096_K4096_cold",
@@ -27483,13 +27483,13 @@
           "lstar_us": 39.715,
           "meas_p99_us": 44.9008,
           "meas_us": 44.7765,
-          "pred_us": 43.66460990362028,
+          "pred_us": 43.69014956271119,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 1.2392,
+          "ape_pct": 1.1815,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M512_N4096_K4096_warm",
@@ -27501,13 +27501,13 @@
           "lstar_us": 39.715,
           "meas_p99_us": 44.6056,
           "meas_us": 44.2125,
-          "pred_us": 43.66460990362028,
+          "pred_us": 43.69014956271119,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 2.2102,
+          "ape_pct": 1.5024,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M1_N512_K7168_cold",
@@ -27519,13 +27519,13 @@
           "lstar_us": 1.835,
           "meas_p99_us": 9.0856,
           "meas_us": 8.289,
-          "pred_us": 8.472204557995282,
+          "pred_us": 8.164463666571042,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 2.7006,
+          "ape_pct": 6.9016,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M1_N512_K7168_warm",
@@ -27537,13 +27537,13 @@
           "lstar_us": 0.541,
           "meas_p99_us": 7.8768,
           "meas_us": 7.3254,
-          "pred_us": 7.127568979181641,
+          "pred_us": 6.819828087757401,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 6.7317,
+          "ape_pct": 2.8666,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M2_N512_K7168_cold",
@@ -27555,13 +27555,13 @@
           "lstar_us": 1.839,
           "meas_p99_us": 8.9845,
           "meas_us": 7.962,
-          "pred_us": 8.497975684237169,
+          "pred_us": 8.190234792812927,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 1.2506,
+          "ape_pct": 3.1052,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M2_N512_K7168_warm",
@@ -27573,13 +27573,13 @@
           "lstar_us": 0.542,
           "meas_p99_us": 7.7396,
           "meas_us": 7.0651,
-          "pred_us": 7.153456476511597,
+          "pred_us": 6.845715585087356,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 8.0167,
+          "ape_pct": 4.1286,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M4_N512_K7168_cold",
@@ -27591,13 +27591,13 @@
           "lstar_us": 1.846,
           "meas_p99_us": 9.2198,
           "meas_us": 7.915,
-          "pred_us": 8.54951793672094,
+          "pred_us": 8.241777045296699,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 1.7401,
+          "ape_pct": 2.6053,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M4_N512_K7168_warm",
@@ -27609,13 +27609,13 @@
           "lstar_us": 0.544,
           "meas_p99_us": 7.8376,
           "meas_us": 7.082,
-          "pred_us": 7.205231471171509,
+          "pred_us": 6.8974905797472665,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 13.6407,
+          "ape_pct": 9.5989,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M8_N512_K7168_cold",
@@ -27627,13 +27627,13 @@
           "lstar_us": 1.86,
           "meas_p99_us": 9.0642,
           "meas_us": 7.614,
-          "pred_us": 8.652602441688481,
+          "pred_us": 8.344861550264241,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 10.6637,
+          "ape_pct": 6.0041,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M8_N512_K7168_warm",
@@ -27645,13 +27645,13 @@
           "lstar_us": 0.548,
           "meas_p99_us": 6.8658,
           "meas_us": 6.6045,
-          "pred_us": 7.308781460491332,
+          "pred_us": 7.001040569067089,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 5.9535,
+          "ape_pct": 2.2728,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M16_N512_K7168_cold",
@@ -27663,13 +27663,13 @@
           "lstar_us": 1.889,
           "meas_p99_us": 8.9568,
           "meas_us": 8.361,
-          "pred_us": 8.858771451623568,
+          "pred_us": 8.551030560199328,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 0.6803,
+          "ape_pct": 3.4421,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M16_N512_K7168_warm",
@@ -27681,13 +27681,13 @@
           "lstar_us": 0.557,
           "meas_p99_us": 8.0183,
           "meas_us": 7.4651,
-          "pred_us": 7.515881439130977,
+          "pred_us": 7.208140547706735,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 9.5309,
+          "ape_pct": 5.9216,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M32_N512_K7168_cold",
@@ -27699,13 +27699,13 @@
           "lstar_us": 1.946,
           "meas_p99_us": 9.4863,
           "meas_us": 8.5265,
-          "pred_us": 9.33914947104882,
+          "pred_us": 9.031408579624578,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 7.4164,
+          "ape_pct": 3.2834,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M32_N512_K7168_warm",
@@ -27717,13 +27717,13 @@
           "lstar_us": 0.573,
           "meas_p99_us": 7.9235,
           "meas_us": 7.4459,
-          "pred_us": 7.99812139596535,
+          "pred_us": 7.690380504541109,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 8.9969,
+          "ape_pct": 5.5809,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M48_N512_K7168_cold",
@@ -27735,13 +27735,13 @@
           "lstar_us": 2.004,
           "meas_p99_us": 10.1726,
           "meas_us": 9.009,
-          "pred_us": 9.819527490474073,
+          "pred_us": 9.511786599049831,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 6.5038,
+          "ape_pct": 2.6389,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M48_N512_K7168_warm",
@@ -27753,13 +27753,13 @@
           "lstar_us": 0.811,
           "meas_p99_us": 8.7039,
           "meas_us": 7.9625,
-          "pred_us": 8.480361352799724,
+          "pred_us": 8.172620461375482,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 17.3511,
+          "ape_pct": 13.8449,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M64_N512_K7168_cold",
@@ -27771,13 +27771,13 @@
           "lstar_us": 2.061,
           "meas_p99_us": 9.3034,
           "meas_us": 8.777,
-          "pred_us": 10.299905509899324,
+          "pred_us": 9.992164618475082,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 24.2476,
+          "ape_pct": 19.9814,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M64_N512_K7168_warm",
@@ -27789,13 +27789,13 @@
           "lstar_us": 1.083,
           "meas_p99_us": 9.0704,
           "meas_us": 7.2135,
-          "pred_us": 8.962601309634096,
+          "pred_us": 8.654860418209854,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 8.5103,
+          "ape_pct": 5.5449,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M96_N512_K7168_cold",
@@ -27807,13 +27807,13 @@
           "lstar_us": 2.176,
           "meas_p99_us": 11.6733,
           "meas_us": 10.3775,
-          "pred_us": 11.260661548749832,
+          "pred_us": 10.95292065732559,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 3.1224,
+          "ape_pct": 0.0744,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M96_N512_K7168_warm",
@@ -27825,13 +27825,13 @@
           "lstar_us": 1.626,
           "meas_p99_us": 10.7788,
           "meas_us": 9.6265,
-          "pred_us": 9.927081223302844,
+          "pred_us": 9.619340331878604,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 11.5042,
+          "ape_pct": 8.6965,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M128_N512_K7168_cold",
@@ -27843,13 +27843,13 @@
           "lstar_us": 2.29,
           "meas_p99_us": 11.9893,
           "meas_us": 10.9605,
-          "pred_us": 12.221417587600335,
+          "pred_us": 11.913676696176092,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 7.0957,
+          "ape_pct": 4.0844,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M128_N512_K7168_warm",
@@ -27861,13 +27861,13 @@
           "lstar_us": 2.169,
           "meas_p99_us": 11.3601,
           "meas_us": 10.2195,
-          "pred_us": 10.944645435925777,
+          "pred_us": 10.636904544501535,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 1.5111,
+          "ape_pct": 0.8858,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M192_N512_K7168_cold",
@@ -27879,13 +27879,13 @@
           "lstar_us": 3.255,
           "meas_p99_us": 13.931,
           "meas_us": 12.839,
-          "pred_us": 13.033012655485221,
+          "pred_us": 12.725271764060981,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 1.8461,
+          "ape_pct": 4.3549,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M192_N512_K7168_warm",
@@ -27897,13 +27897,13 @@
           "lstar_us": 3.255,
           "meas_p99_us": 13.0925,
           "meas_us": 12.2665,
-          "pred_us": 12.040046155194704,
+          "pred_us": 11.732305263770462,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 11.0883,
+          "ape_pct": 13.2041,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M256_N512_K7168_cold",
@@ -27915,13 +27915,13 @@
           "lstar_us": 4.341,
           "meas_p99_us": 15.3756,
           "meas_us": 14.5455,
-          "pred_us": 12.932645163655472,
+          "pred_us": 12.624904272231232,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 3.1226,
+          "ape_pct": 5.4279,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M256_N512_K7168_warm",
@@ -27933,13 +27933,13 @@
           "lstar_us": 4.341,
           "meas_p99_us": 14.801,
           "meas_us": 13.3495,
-          "pred_us": 12.932645163655472,
+          "pred_us": 12.624904272231232,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 9.3187,
+          "ape_pct": 10.9416,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M512_N512_K7168_cold",
@@ -27951,13 +27951,13 @@
           "lstar_us": 8.685,
           "meas_p99_us": 20.5012,
           "meas_us": 18.9615,
-          "pred_us": 17.1945439040149,
+          "pred_us": 16.886803012590658,
           "split": "gate2",
-          "status": "pass"
+          "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 9.4142,
+          "ape_pct": 11.0355,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M512_N512_K7168_warm",
@@ -27969,13 +27969,13 @@
           "lstar_us": 8.685,
           "meas_p99_us": 20.2878,
           "meas_us": 18.9815,
-          "pred_us": 17.1945439040149,
+          "pred_us": 16.886803012590658,
           "split": "gate2",
-          "status": "pass"
+          "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 6.5097,
+          "ape_pct": 6.3443,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M1_N7168_K2048_cold",
@@ -27987,13 +27987,13 @@
           "lstar_us": 7.338,
           "meas_p99_us": 15.8769,
           "meas_us": 15.446,
-          "pred_us": 14.440519307484799,
+          "pred_us": 14.466058966575709,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 4.5366,
+          "ape_pct": 4.2441,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M1_N7168_K2048_warm",
@@ -28005,13 +28005,13 @@
           "lstar_us": 2.169,
           "meas_p99_us": 8.7942,
           "meas_us": 8.7314,
-          "pred_us": 8.335293729085498,
+          "pred_us": 8.360833388176406,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 3.922,
+          "ape_pct": 3.7521,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M2_N7168_K2048_cold",
@@ -28023,13 +28023,13 @@
           "lstar_us": 7.339,
           "meas_p99_us": 15.9576,
           "meas_us": 15.0375,
-          "pred_us": 14.447733318653144,
+          "pred_us": 14.473272977744054,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 4.6857,
+          "ape_pct": 4.3947,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M2_N7168_K2048_warm",
@@ -28041,13 +28041,13 @@
           "lstar_us": 2.169,
           "meas_p99_us": 8.8194,
           "meas_us": 8.7771,
-          "pred_us": 8.365834523251145,
+          "pred_us": 8.391374182342053,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 5.8759,
+          "ape_pct": 5.7097,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M4_N7168_K2048_cold",
@@ -28059,13 +28059,13 @@
           "lstar_us": 7.341,
           "meas_p99_us": 15.809,
           "meas_us": 15.365,
-          "pred_us": 14.462161340989834,
+          "pred_us": 14.487701000080744,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 5.2346,
+          "ape_pct": 4.9474,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M4_N7168_K2048_warm",
@@ -28077,13 +28077,13 @@
           "lstar_us": 2.17,
           "meas_p99_us": 8.9436,
           "meas_us": 8.8924,
-          "pred_us": 8.426916111582438,
+          "pred_us": 8.452455770673348,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 4.2138,
+          "ape_pct": 4.045,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M8_N7168_K2048_cold",
@@ -28095,13 +28095,13 @@
           "lstar_us": 7.345,
           "meas_p99_us": 15.8502,
           "meas_us": 15.1285,
-          "pred_us": 14.491017385663204,
+          "pred_us": 14.516557044754114,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 3.9537,
+          "ape_pct": 3.6668,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M8_N7168_K2048_warm",
@@ -28113,13 +28113,13 @@
           "lstar_us": 2.171,
           "meas_p99_us": 9.069,
           "meas_us": 8.901,
-          "pred_us": 8.549079288245025,
+          "pred_us": 8.574618947335935,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 4.2973,
+          "ape_pct": 4.1293,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M16_N7168_K2048_cold",
@@ -28131,13 +28131,13 @@
           "lstar_us": 7.353,
           "meas_p99_us": 16.1474,
           "meas_us": 15.202,
-          "pred_us": 14.548729475009958,
+          "pred_us": 14.574269134100868,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 3.7278,
+          "ape_pct": 3.4482,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M16_N7168_K2048_warm",
@@ -28149,13 +28149,13 @@
           "lstar_us": 2.173,
           "meas_p99_us": 9.2456,
           "meas_us": 9.1339,
-          "pred_us": 8.7934056415702,
+          "pred_us": 8.81894530066111,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 6.3441,
+          "ape_pct": 6.1815,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M32_N7168_K2048_cold",
@@ -28167,13 +28167,13 @@
           "lstar_us": 7.369,
           "meas_p99_us": 16.4161,
           "meas_us": 15.699,
-          "pred_us": 14.703033653449223,
+          "pred_us": 14.728573312540133,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 9.8416,
+          "ape_pct": 9.5945,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M32_N7168_K2048_warm",
@@ -28185,13 +28185,13 @@
           "lstar_us": 2.178,
           "meas_p99_us": 10.465,
           "meas_us": 10.3384,
-          "pred_us": 9.32093834796631,
+          "pred_us": 9.346478007057218,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 8.6606,
+          "ape_pct": 8.5037,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M48_N7168_K2048_cold",
@@ -28203,13 +28203,13 @@
           "lstar_us": 7.386,
           "meas_p99_us": 17.5901,
           "meas_us": 16.277,
-          "pred_us": 14.867311164459101,
+          "pred_us": 14.892850823550011,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 7.1054,
+          "ape_pct": 6.8647,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M48_N7168_K2048_warm",
@@ -28221,13 +28221,13 @@
           "lstar_us": 3.255,
           "meas_p99_us": 10.9664,
           "meas_us": 10.6125,
-          "pred_us": 9.858444386933039,
+          "pred_us": 9.883984046023947,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 9.0311,
+          "ape_pct": 8.8768,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M64_N7168_K2048_cold",
@@ -28239,13 +28239,13 @@
           "lstar_us": 7.402,
           "meas_p99_us": 17.12,
           "meas_us": 16.545,
-          "pred_us": 15.050798372947154,
+          "pred_us": 15.076338032038064,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 5.0275,
+          "ape_pct": 4.7946,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M64_N7168_K2048_warm",
@@ -28257,13 +28257,13 @@
           "lstar_us": 4.341,
           "meas_p99_us": 11.1919,
           "meas_us": 10.9665,
-          "pred_us": 10.415160123377937,
+          "pred_us": 10.440699782468847,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 13.0707,
+          "ape_pct": 12.9267,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M96_N7168_K2048_cold",
@@ -28275,13 +28275,13 @@
           "lstar_us": 7.435,
           "meas_p99_us": 18.5615,
           "meas_us": 17.736,
-          "pred_us": 15.417772789923266,
+          "pred_us": 15.443312449014176,
           "split": "gate2",
           "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 8.7892,
+          "ape_pct": 8.5871,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M96_N7168_K2048_warm",
@@ -28293,13 +28293,13 @@
           "lstar_us": 6.513,
           "meas_p99_us": 13.3423,
           "meas_us": 12.6395,
-          "pred_us": 11.528591596267741,
+          "pred_us": 11.554131255358651,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 14.5801,
+          "ape_pct": 14.4419,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M128_N7168_K2048_cold",
@@ -28311,13 +28311,13 @@
           "lstar_us": 8.685,
           "meas_p99_us": 19.3111,
           "meas_us": 18.479,
-          "pred_us": 15.784747206899372,
+          "pred_us": 15.81028686599028,
           "split": "gate2",
           "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 6.2474,
+          "ape_pct": 6.0624,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M128_N7168_K2048_warm",
@@ -28329,13 +28329,13 @@
           "lstar_us": 8.685,
           "meas_p99_us": 14.3899,
           "meas_us": 13.808,
-          "pred_us": 12.945361920324332,
+          "pred_us": 12.970901579415242,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 20.8999,
+          "ape_pct": 20.79,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M192_N7168_K2048_cold",
@@ -28347,13 +28347,13 @@
           "lstar_us": 13.029,
           "meas_p99_us": 23.9014,
           "meas_us": 23.2585,
-          "pred_us": 18.397506568791062,
+          "pred_us": 18.423046227881972,
           "split": "gate2",
           "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 3.259,
+          "ape_pct": 3.4031,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M192_N7168_K2048_warm",
@@ -28365,13 +28365,13 @@
           "lstar_us": 13.029,
           "meas_p99_us": 18.3726,
           "meas_us": 17.717,
-          "pred_us": 18.29439344217141,
+          "pred_us": 18.31993310126232,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 5.7171,
+          "ape_pct": 5.6153,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M256_N7168_K2048_cold",
@@ -28383,13 +28383,13 @@
           "lstar_us": 17.373,
           "meas_p99_us": 25.9649,
           "meas_us": 25.0875,
-          "pred_us": 23.653230958648912,
+          "pred_us": 23.67877061773982,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 6.3271,
+          "ape_pct": 6.442,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M256_N7168_K2048_warm",
@@ -28401,13 +28401,13 @@
           "lstar_us": 17.373,
           "meas_p99_us": 22.539,
           "meas_us": 22.2365,
-          "pred_us": 23.643424964018468,
+          "pred_us": 23.66896462310938,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 5.2593,
+          "ape_pct": 5.3208,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M512_N7168_K2048_cold",
@@ -28419,13 +28419,13 @@
           "lstar_us": 34.75,
           "meas_p99_us": 42.3441,
           "meas_us": 41.4915,
-          "pred_us": 43.67364444328189,
+          "pred_us": 43.6991841023728,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 7.749,
+          "ape_pct": 7.8121,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M512_N7168_K2048_warm",
@@ -28437,13 +28437,13 @@
           "lstar_us": 34.75,
           "meas_p99_us": 40.7892,
           "meas_us": 40.519,
-          "pred_us": 43.65883117892788,
+          "pred_us": 43.68437083801879,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 4.5893,
+          "ape_pct": 0.4089,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M1_N256_K4096_cold",
@@ -28455,13 +28455,13 @@
           "lstar_us": 0.523,
           "meas_p99_us": 6.9578,
           "meas_us": 6.157,
-          "pred_us": 6.4395641783793245,
+          "pred_us": 6.131823286955082,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 6.3153,
+          "ape_pct": 11.055,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M1_N256_K4096_warm",
@@ -28473,13 +28473,13 @@
           "lstar_us": 0.152,
           "meas_p99_us": 6.9632,
           "meas_us": 6.4928,
-          "pred_us": 6.082761388531967,
+          "pred_us": 5.775020497107724,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 4.8761,
+          "ape_pct": 9.4128,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M2_N256_K4096_cold",
@@ -28491,13 +28491,13 @@
           "lstar_us": 0.525,
           "meas_p99_us": 8.1772,
           "meas_us": 6.7835,
-          "pred_us": 6.452726860589706,
+          "pred_us": 6.144985969165464,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 7.7397,
+          "ape_pct": 12.3972,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M2_N256_K4096_warm",
@@ -28509,13 +28509,13 @@
           "lstar_us": 0.153,
           "meas_p99_us": 6.9532,
           "meas_us": 6.6075,
-          "pred_us": 6.096096971445548,
+          "pred_us": 5.788356080021305,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 5.3946,
+          "ape_pct": 9.8881,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M4_N256_K4096_cold",
@@ -28527,13 +28527,13 @@
           "lstar_us": 0.529,
           "meas_p99_us": 7.8299,
           "meas_us": 6.8485,
-          "pred_us": 6.479052225010469,
+          "pred_us": 6.171311333586226,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 1.4207,
+          "ape_pct": 3.6769,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M4_N256_K4096_warm",
@@ -28545,13 +28545,13 @@
           "lstar_us": 0.154,
           "meas_p99_us": 6.412,
           "meas_us": 6.037,
-          "pred_us": 6.122768137272709,
+          "pred_us": 5.815027245848467,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 10.9576,
+          "ape_pct": 15.1529,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M8_N256_K4096_cold",
@@ -28563,13 +28563,13 @@
           "lstar_us": 0.537,
           "meas_p99_us": 9.3207,
           "meas_us": 7.3355,
-          "pred_us": 6.531702953851996,
+          "pred_us": 6.223962062427756,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 11.7862,
+          "ape_pct": 16.1817,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M8_N256_K4096_warm",
@@ -28581,13 +28581,13 @@
           "lstar_us": 0.157,
           "meas_p99_us": 7.4936,
           "meas_us": 7.0013,
-          "pred_us": 6.176110468927033,
+          "pred_us": 5.868369577502792,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 12.4579,
+          "ape_pct": 16.517,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M16_N256_K4096_cold",
@@ -28599,13 +28599,13 @@
           "lstar_us": 0.554,
           "meas_p99_us": 8.3834,
           "meas_us": 7.5815,
-          "pred_us": 6.637004411535049,
+          "pred_us": 6.329263520110808,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 6.2367,
+          "ape_pct": 10.8294,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M16_N256_K4096_warm",
@@ -28617,13 +28617,13 @@
           "lstar_us": 0.161,
           "meas_p99_us": 7.3166,
           "meas_us": 6.7007,
-          "pred_us": 6.28279513223568,
+          "pred_us": 5.97505424081144,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 15.1126,
+          "ape_pct": 18.9061,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M32_N256_K4096_cold",
@@ -28635,13 +28635,13 @@
           "lstar_us": 0.586,
           "meas_p99_us": 9.6605,
           "meas_us": 8.1125,
-          "pred_us": 6.8864873266469155,
+          "pred_us": 6.578746435222673,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 9.9906,
+          "ape_pct": 14.2292,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M32_N256_K4096_warm",
@@ -28653,13 +28653,13 @@
           "lstar_us": 0.171,
           "meas_p99_us": 7.5447,
           "meas_us": 7.2604,
-          "pred_us": 6.535044458598737,
+          "pred_us": 6.227303567174496,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 8.6245,
+          "ape_pct": 12.5651,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M48_N256_K4096_cold",
@@ -28671,13 +28671,13 @@
           "lstar_us": 0.619,
           "meas_p99_us": 9.0234,
           "meas_us": 7.8095,
-          "pred_us": 7.135970241758781,
+          "pred_us": 6.82822935033454,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 5.5238,
+          "ape_pct": 0.7393,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M48_N256_K4096_warm",
@@ -28689,13 +28689,13 @@
           "lstar_us": 0.229,
           "meas_p99_us": 8.0318,
           "meas_us": 6.432,
-          "pred_us": 6.787293784961793,
+          "pred_us": 6.479552893537552,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 12.593,
+          "ape_pct": 16.2351,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M64_N256_K4096_cold",
@@ -28707,13 +28707,13 @@
           "lstar_us": 0.652,
           "meas_p99_us": 10.5821,
           "meas_us": 8.4495,
-          "pred_us": 7.385453156870651,
+          "pred_us": 7.077712265446408,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 11.4801,
+          "ape_pct": 15.3499,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M64_N256_K4096_warm",
@@ -28725,13 +28725,13 @@
           "lstar_us": 0.307,
           "meas_p99_us": 9.6819,
           "meas_us": 7.9525,
-          "pred_us": 7.039543111324851,
+          "pred_us": 6.731802219900608,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 12.4391,
+          "ape_pct": 15.8568,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M96_N256_K4096_cold",
@@ -28743,13 +28743,13 @@
           "lstar_us": 0.717,
           "meas_p99_us": 10.2536,
           "meas_us": 9.0045,
-          "pred_us": 7.884418987094382,
+          "pred_us": 7.576678095670142,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 10.8533,
+          "ape_pct": 14.4898,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M96_N256_K4096_warm",
@@ -28761,13 +28761,13 @@
           "lstar_us": 0.462,
           "meas_p99_us": 9.7027,
           "meas_us": 8.4625,
-          "pred_us": 7.544041764050964,
+          "pred_us": 7.236300872626723,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 13.3545,
+          "ape_pct": 16.5351,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M128_N256_K4096_cold",
@@ -28779,13 +28779,13 @@
           "lstar_us": 0.783,
           "meas_p99_us": 11.5078,
           "meas_us": 9.6755,
-          "pred_us": 8.383384817318118,
+          "pred_us": 8.075643925893878,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 3.0938,
+          "ape_pct": 6.7991,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M128_N256_K4096_warm",
@@ -28797,13 +28797,13 @@
           "lstar_us": 0.617,
           "meas_p99_us": 10.0392,
           "meas_us": 8.3055,
-          "pred_us": 8.048540416777078,
+          "pred_us": 7.740799525352838,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 21.064,
+          "ape_pct": 23.9444,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M192_N256_K4096_cold",
@@ -28815,13 +28815,13 @@
           "lstar_us": 0.927,
           "meas_p99_us": 11.5072,
           "meas_us": 10.684,
-          "pred_us": 8.433525448152068,
+          "pred_us": 8.125784556727826,
           "split": "gate2",
           "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 22.552,
+          "ape_pct": 25.4847,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M192_N256_K4096_warm",
@@ -28833,13 +28833,13 @@
           "lstar_us": 0.927,
           "meas_p99_us": 11.5173,
           "meas_us": 10.4935,
-          "pred_us": 8.127006691348972,
+          "pred_us": 7.81926579992473,
           "split": "gate2",
           "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 30.8046,
+          "ape_pct": 33.2884,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M256_N256_K4096_cold",
@@ -28851,13 +28851,13 @@
           "lstar_us": 1.238,
           "meas_p99_us": 12.8352,
           "meas_us": 12.39,
-          "pred_us": 8.57330619557936,
+          "pred_us": 8.26556530415512,
           "split": "gate2",
           "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 29.8391,
+          "ape_pct": 32.3576,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M256_N256_K4096_warm",
@@ -28869,13 +28869,13 @@
           "lstar_us": 1.238,
           "meas_p99_us": 13.9379,
           "meas_us": 12.2195,
-          "pred_us": 8.57330619557936,
+          "pred_us": 8.26556530415512,
           "split": "gate2",
           "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 30.2752,
+          "ape_pct": 32.4083,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M512_N256_K4096_cold",
@@ -28887,13 +28887,13 @@
           "lstar_us": 2.479,
           "meas_p99_us": 15.8016,
           "meas_us": 14.427,
-          "pred_us": 10.059201389547558,
+          "pred_us": 9.751460498123317,
           "split": "gate2",
           "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 19.8693,
+          "ape_pct": 22.3208,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M512_N256_K4096_warm",
@@ -28905,7 +28905,7 @@
           "lstar_us": 2.479,
           "meas_p99_us": 13.3386,
           "meas_us": 12.5535,
-          "pred_us": 10.059201389547558,
+          "pred_us": 9.751460498123317,
           "split": "gate2",
           "status": "fail"
         },
@@ -29343,7 +29343,7 @@
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 6.8912,
+          "ape_pct": 6.7917,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g4_gmm_E8_T64_uniform_cold",
@@ -29355,13 +29355,13 @@
           "lstar_us": 16.839,
           "meas_p99_us": 31.1746,
           "meas_us": 25.6655,
-          "pred_us": 23.896840563651608,
+          "pred_us": 23.922380222742518,
           "split": "gate4",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 6.1447,
+          "ape_pct": 5.9982,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g4_gmm_E8_T64_uniform_warm",
@@ -29373,13 +29373,13 @@
           "lstar_us": 4.981,
           "meas_p99_us": 18.3706,
           "meas_us": 17.4315,
-          "pred_us": 16.36038340060488,
+          "pred_us": 16.385923059695795,
           "split": "gate4",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 5.9203,
+          "ape_pct": 5.8201,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g4_gmm_E8_T64_skew_hot1_cold",
@@ -29391,13 +29391,13 @@
           "lstar_us": 16.839,
           "meas_p99_us": 30.7213,
           "meas_us": 25.471,
-          "pred_us": 23.96302997076118,
+          "pred_us": 23.988569629852087,
           "split": "gate4",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 8.1688,
+          "ape_pct": 8.028,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g4_gmm_E8_T64_skew_hot1_warm",
@@ -29409,13 +29409,13 @@
           "lstar_us": 4.981,
           "meas_p99_us": 19.1688,
           "meas_us": 18.137,
-          "pred_us": 16.655424044213007,
+          "pred_us": 16.68096370330392,
           "split": "gate4",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 10.9128,
+          "ape_pct": 10.8195,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g4_gmm_E8_T256_uniform_cold",
@@ -29427,13 +29427,13 @@
           "lstar_us": 17.036,
           "meas_p99_us": 32.3112,
           "meas_us": 27.3725,
-          "pred_us": 24.38539795392173,
+          "pred_us": 24.410937613012642,
           "split": "gate4",
           "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 6.66,
+          "ape_pct": 6.5336,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g4_gmm_E8_T256_uniform_warm",
@@ -29445,13 +29445,13 @@
           "lstar_us": 5.039,
           "meas_p99_us": 20.8922,
           "meas_us": 20.209,
-          "pred_us": 18.863081446428886,
+          "pred_us": 18.888621105519796,
           "split": "gate4",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 10.5561,
+          "ape_pct": 10.4652,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g4_gmm_E8_T256_skew_hot1_cold",
@@ -29463,13 +29463,13 @@
           "lstar_us": 17.036,
           "meas_p99_us": 32.9745,
           "meas_us": 28.092,
-          "pred_us": 25.126570233312698,
+          "pred_us": 25.152109892403608,
           "split": "gate4",
           "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 5.1719,
+          "ape_pct": 5.0518,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g4_gmm_E8_T256_skew_hot1_warm",
@@ -29481,13 +29481,13 @@
           "lstar_us": 5.039,
           "meas_p99_us": 21.755,
           "meas_us": 21.266,
-          "pred_us": 20.166153206103647,
+          "pred_us": 20.191692865194558,
           "split": "gate4",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 14.8569,
+          "ape_pct": 14.7818,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g4_gmm_E8_T1024_uniform_cold",
@@ -29499,13 +29499,13 @@
           "lstar_us": 19.856,
           "meas_p99_us": 36.6111,
           "meas_us": 34.0035,
-          "pred_us": 28.95163362921641,
+          "pred_us": 28.977173288307316,
           "split": "gate4",
           "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 11.6595,
+          "ape_pct": 11.758,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g4_gmm_E8_T1024_uniform_warm",
@@ -29517,13 +29517,13 @@
           "lstar_us": 19.856,
           "meas_p99_us": 26.483,
           "meas_us": 25.9285,
-          "pred_us": 28.95163362921641,
+          "pred_us": 28.977173288307316,
           "split": "gate4",
           "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 5.0892,
+          "ape_pct": 5.0327,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g4_gmm_E8_T1024_skew_zipf_cold",
@@ -29535,13 +29535,13 @@
           "lstar_us": 19.856,
           "meas_p99_us": 46.1301,
           "meas_us": 45.1715,
-          "pred_us": 42.872623546923656,
+          "pred_us": 42.89816320601457,
           "split": "gate4",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 24.878,
+          "ape_pct": 24.8164,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g4_gmm_E8_T1024_skew_zipf_warm",
@@ -29553,13 +29553,13 @@
           "lstar_us": 19.856,
           "meas_p99_us": 42.1536,
           "meas_us": 41.4685,
-          "pred_us": 31.151968091912057,
+          "pred_us": 31.177507751002963,
           "split": "gate4",
           "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 2.5001,
+          "ape_pct": 2.4708,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g4_gmm_E8_T4096_uniform_cold",
@@ -29571,13 +29571,13 @@
           "lstar_us": 79.434,
           "meas_p99_us": 87.2159,
           "meas_us": 86.9775,
-          "pred_us": 84.80296323240763,
+          "pred_us": 84.82850289149854,
           "split": "gate4",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 2.6912,
+          "ape_pct": 2.6617,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g4_gmm_E8_T4096_uniform_warm",
@@ -29589,13 +29589,13 @@
           "lstar_us": 79.434,
           "meas_p99_us": 87.2549,
           "meas_us": 86.6235,
-          "pred_us": 84.292275097825,
+          "pred_us": 84.31781475691591,
           "split": "gate4",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 10.9257,
+          "ape_pct": 10.9002,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g4_gmm_E8_T4096_skew_zipf_cold",
@@ -29607,13 +29607,13 @@
           "lstar_us": 79.434,
           "meas_p99_us": 100.7083,
           "meas_us": 100.0075,
-          "pred_us": 89.08095400539737,
+          "pred_us": 89.10649366448828,
           "split": "gate4",
           "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 10.7942,
+          "ape_pct": 10.7686,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g4_gmm_E8_T4096_skew_zipf_warm",
@@ -29625,13 +29625,13 @@
           "lstar_us": 79.434,
           "meas_p99_us": 100.9101,
           "meas_us": 99.858,
-          "pred_us": 89.07914258367995,
+          "pred_us": 89.10468224277086,
           "split": "gate4",
           "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 6.6498,
+          "ape_pct": 6.6665,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g4_gmm_E64_T64_uniform_cold",
@@ -29643,13 +29643,13 @@
           "lstar_us": 134.28,
           "meas_p99_us": 156.7679,
           "meas_us": 153.3775,
-          "pred_us": 163.57684012101777,
+          "pred_us": 163.6023797801087,
           "split": "gate4",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 6.058,
+          "ape_pct": 6.0746,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g4_gmm_E64_T64_uniform_warm",
@@ -29661,13 +29661,13 @@
           "lstar_us": 39.735,
           "meas_p99_us": 158.8799,
           "meas_us": 154.1625,
-          "pred_us": 163.5016555574702,
+          "pred_us": 163.52719521656113,
           "split": "gate4",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 2.8596,
+          "ape_pct": 3.0252,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g4_gmm_E64_T64_skew_hot1_cold",
@@ -29679,13 +29679,13 @@
           "lstar_us": 4.256,
           "meas_p99_us": 16.2562,
           "meas_us": 15.418,
-          "pred_us": 15.858887542594877,
+          "pred_us": 15.884427201685785,
           "split": "gate4",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 2.4409,
+          "ape_pct": 2.6068,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g4_gmm_E64_T64_skew_hot1_warm",
@@ -29697,13 +29697,13 @@
           "lstar_us": 1.257,
           "meas_p99_us": 15.8611,
           "meas_us": 15.3885,
-          "pred_us": 15.764110797454856,
+          "pred_us": 15.789650456545768,
           "split": "gate4",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 5.5854,
+          "ape_pct": 5.6018,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g4_gmm_E64_T256_uniform_cold",
@@ -29715,13 +29715,13 @@
           "lstar_us": 134.476,
           "meas_p99_us": 157.9593,
           "meas_us": 155.351,
-          "pred_us": 164.02794750230325,
+          "pred_us": 164.05348716139417,
           "split": "gate4",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 5.0715,
+          "ape_pct": 5.0879,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g4_gmm_E64_T256_uniform_warm",
@@ -29733,13 +29733,13 @@
           "lstar_us": 39.793,
           "meas_p99_us": 158.6142,
           "meas_us": 155.8245,
-          "pred_us": 163.72720924811296,
+          "pred_us": 163.75274890720388,
           "split": "gate4",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 6.7393,
+          "ape_pct": 6.7556,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g4_gmm_E64_T256_skew_hot1_cold",
@@ -29751,13 +29751,13 @@
           "lstar_us": 134.476,
           "meas_p99_us": 162.7599,
           "meas_us": 156.6025,
-          "pred_us": 167.1563575970061,
+          "pred_us": 167.181897256097,
           "split": "gate4",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 6.6653,
+          "ape_pct": 6.6816,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g4_gmm_E64_T256_skew_hot1_warm",
@@ -29769,13 +29769,13 @@
           "lstar_us": 39.793,
           "meas_p99_us": 162.0865,
           "meas_us": 156.4235,
-          "pred_us": 166.84956197324004,
+          "pred_us": 166.87510163233097,
           "split": "gate4",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 4.6826,
+          "ape_pct": 4.6987,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g4_gmm_E64_T1024_uniform_cold",
@@ -29787,13 +29787,13 @@
           "lstar_us": 135.263,
           "meas_p99_us": 161.8031,
           "meas_us": 158.4145,
-          "pred_us": 165.8323770274451,
+          "pred_us": 165.85791668653602,
           "split": "gate4",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 3.5584,
+          "ape_pct": 3.5745,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g4_gmm_E64_T1024_uniform_warm",
@@ -29805,13 +29805,13 @@
           "lstar_us": 40.026,
           "meas_p99_us": 164.4583,
           "meas_us": 158.9725,
-          "pred_us": 164.62942401068386,
+          "pred_us": 164.6549636697748,
           "split": "gate4",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 0.6495,
+          "ape_pct": 0.6345,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g4_gmm_E64_T1024_skew_zipf_cold",
@@ -29823,13 +29823,13 @@
           "lstar_us": 135.263,
           "meas_p99_us": 174.7906,
           "meas_us": 170.8735,
-          "pred_us": 169.76369914581701,
+          "pred_us": 169.78923880490794,
           "split": "gate4",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 1.0544,
+          "ape_pct": 1.0394,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g4_gmm_E64_T1024_skew_zipf_warm",
@@ -29841,13 +29841,13 @@
           "lstar_us": 40.026,
           "meas_p99_us": 176.5505,
           "meas_us": 170.395,
-          "pred_us": 168.598418487769,
+          "pred_us": 168.62395814685993,
           "split": "gate4",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 8.5584,
+          "ape_pct": 8.5449,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g4_gmm_E64_T4096_uniform_cold",
@@ -29859,13 +29859,13 @@
           "lstar_us": 138.409,
           "meas_p99_us": 191.7858,
           "meas_us": 189.2465,
-          "pred_us": 173.05009512801252,
+          "pred_us": 173.07563478710338,
           "split": "gate4",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 11.3229,
+          "ape_pct": 11.3094,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g4_gmm_E64_T4096_uniform_warm",
@@ -29877,13 +29877,13 @@
           "lstar_us": 79.434,
           "meas_p99_us": 192.1691,
           "meas_us": 189.72,
-          "pred_us": 168.23828306096755,
+          "pred_us": 168.26382272005847,
           "split": "gate4",
           "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 0.282,
+          "ape_pct": 0.2698,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g4_gmm_E64_T4096_skew_zipf_cold",
@@ -29895,13 +29895,13 @@
           "lstar_us": 138.409,
           "meas_p99_us": 213.7031,
           "meas_us": 209.5145,
-          "pred_us": 208.9236518628544,
+          "pred_us": 208.9491915219453,
           "split": "gate4",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 2.3128,
+          "ape_pct": 2.3006,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g4_gmm_E64_T4096_skew_zipf_warm",
@@ -29913,7 +29913,7 @@
           "lstar_us": 79.434,
           "meas_p99_us": 212.4256,
           "meas_us": 209.468,
-          "pred_us": 204.62335933533927,
+          "pred_us": 204.64889899443017,
           "split": "gate4",
           "status": "pass"
         },
@@ -33802,16 +33802,16 @@
       ],
       "counts": {
         "blocked": 63,
-        "fail": 120,
+        "fail": 122,
         "inv_obs": 0,
         "inv_sim": 0,
         "l1_cliff_fail": 82,
         "l1_cliff_pass": 308,
-        "pass": 270,
+        "pass": 268,
         "total": 453,
         "worker_diagnostics": 1
       },
-      "elapsed_s": 150.26,
+      "elapsed_s": 87.47,
       "endpoint_alias": "a5-9582-ep",
       "family_summary": {
         "anchor": {
@@ -33996,31 +33996,31 @@
         "gate2": {
           "g2_gemm_cold": {
             "count": 52,
-            "fail": 6,
+            "fail": 7,
             "inv_obs": 0,
             "inv_sim": 0,
             "l1_cliff_fail": 3,
             "l1_cliff_pass": 49,
             "l1_two_tier_gate_pass": false,
-            "max_ape_pct": 30.8,
-            "mean_ape_pct": 9.35,
-            "med_ape_pct": 8.41,
-            "p90_ape_pct": 15.11,
-            "pass": 46
+            "max_ape_pct": 33.29,
+            "mean_ape_pct": 9.19,
+            "med_ape_pct": 6.52,
+            "p90_ape_pct": 16.54,
+            "pass": 45
           },
           "g2_gemm_warm": {
             "count": 52,
-            "fail": 3,
+            "fail": 4,
             "inv_obs": 0,
             "inv_sim": 0,
             "l1_cliff_fail": 1,
             "l1_cliff_pass": 51,
             "l1_two_tier_gate_pass": false,
-            "max_ape_pct": 29.84,
-            "mean_ape_pct": 6.6,
-            "med_ape_pct": 5.38,
-            "p90_ape_pct": 11.48,
-            "pass": 49
+            "max_ape_pct": 32.36,
+            "mean_ape_pct": 7.14,
+            "med_ape_pct": 4.87,
+            "p90_ape_pct": 15.35,
+            "pass": 48
           }
         },
         "gate3": {
@@ -34076,10 +34076,10 @@
             "l1_cliff_fail": 0,
             "l1_cliff_pass": 16,
             "l1_two_tier_gate_pass": true,
-            "max_ape_pct": 14.86,
-            "mean_ape_pct": 6.48,
-            "med_ape_pct": 6.29,
-            "p90_ape_pct": 10.93,
+            "max_ape_pct": 14.78,
+            "mean_ape_pct": 6.45,
+            "med_ape_pct": 6.24,
+            "p90_ape_pct": 10.9,
             "pass": 12
           },
           "g4_moe_gmm_warm": {
@@ -34090,10 +34090,10 @@
             "l1_cliff_fail": 1,
             "l1_cliff_pass": 15,
             "l1_two_tier_gate_pass": false,
-            "max_ape_pct": 24.88,
-            "mean_ape_pct": 7.17,
-            "med_ape_pct": 6.1,
-            "p90_ape_pct": 11.66,
+            "max_ape_pct": 24.82,
+            "mean_ape_pct": 7.14,
+            "med_ape_pct": 6.04,
+            "p90_ape_pct": 11.76,
             "pass": 12
           }
         },
