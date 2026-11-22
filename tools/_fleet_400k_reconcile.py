@@ -32,6 +32,7 @@ L1_MEDIAN_APE_MAX_PCT = 8.0
 L1_P90_APE_MAX_PCT = 12.0
 L1_CLIFF_REL_TOL = 0.15
 L1_CLIFF_ABS_FLOOR_NS = 3000.0
+P90_QUANTILE = 0.9
 NS_PER_US = 1000.0
 LSTAR_INV_EPS = 1e-6
 DCP_MAX_VERIFIED_KV = 32768
@@ -47,6 +48,15 @@ ONE_TOL = 1.0 + LSTAR_INV_EPS
 P99_ORDER_EPS = 1e-9
 ABORT_SUFFIXES: tuple[str, ...] = ("_ABORT", "_TIMEOUT")
 ABORT_ERR_PREFIXES: tuple[str, ...] = ("worker_abort_", "timeout_")
+
+
+def nearest_rank_p90(values: Sequence[float]) -> float:
+    """Return canonical nearest-rank P90 (index ceil(0.9 * n) - 1) without pre-rounding."""
+    if not values:
+        return MIN_POSITIVE
+    ordered = sorted(float(v) for v in values)
+    idx = max(0, min(len(ordered) - 1, math.ceil(P90_QUANTILE * len(ordered)) - 1))
+    return float(ordered[idx])
 
 
 def canonical_capture_sha256(doc: Mapping[str, Any]) -> str:

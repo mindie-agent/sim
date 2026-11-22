@@ -26,12 +26,10 @@ _MAX_DOCUMENT_BYTES = 8 * 1024 * 1024
 MS_PER_SECOND = 1000.0
 NS_PER_MS = 1_000_000.0
 P12_FLAG_CYCLES = 4.0
-AIV_SCALAR_INIT_CYCLES = 2560.0
 AIV_MIN_TILE_BYTES = 2048
-AIV_FULL_DIE_BARRIER_ROUNDS = 3.0
-MIX_AIC_AIV_BARRIER_ROUNDS = 2.0
+MIX_AIC_AIV_BARRIER_ROUNDS = 6.0
 MIX_AIC_AIC_BARRIER_ROUNDS = 2.0
-MIX_AIC_PAIRED_SYNC_ROUNDS = 4.0
+MIX_AIC_PAIRED_SYNC_ROUNDS = 5.0
 DEFAULT_CORE_CLOCK_HZ = 1_650_000_000.0
 RateRole = Literal["sim", "dual"]
 
@@ -466,7 +464,7 @@ class CalibratedDispatchEnvelope:
     aiv_full_die_floor_ms: float
 
     def aiv_floor_ms(self, active_aiv: int) -> float:
-        """Inclusive AIV kernel completion floor scaled by active block fanout."""
+        """Inclusive AIV kernel completion floor from P15 dispatch scaled by active block fanout."""
         clamped = max(1, min(self.aiv_count, int(active_aiv)))
         if self.aiv_count <= 1:
             return self.aiv_min_block_floor_ms
@@ -474,6 +472,10 @@ class CalibratedDispatchEnvelope:
         return self.aiv_min_block_floor_ms + fanout_fraction * (
             self.aiv_full_die_floor_ms - self.aiv_min_block_floor_ms
         )
+
+    def aiv_sync_floor_ms(self, active_aiv: int) -> float:
+        """Inclusive AIV floor for kernels executing an explicit cross-core SyncAll barrier."""
+        return self.aiv_floor_ms(active_aiv) + self.aiv_barrier_ms
 
     def mix_aic_floor_ms(self, cube_floor_ms: float) -> float:
         """Inclusive coupled MIX_AIC kernel completion floor (AIC + AIV + FFTS+ sync)."""
@@ -493,6 +495,7 @@ def resolve_dispatch_envelope(
     if not isinstance(table, PrimitiveTable) or not table.provenance.calibrated:
         return None
     issue_ns = _table_band_p50(table, "P15_rts_stars", "issue_interval_ns")
+    aiv_first_ns = _table_band_p50(table, "P15_rts_stars", "aiv_first_issue_ns")
     aiv_bar_ns = _table_band_p50(table, "P13_crosscore_sync", "mode0_aiv_barrier_ns")
     paired_ns = _table_band_p50(table, "P13_crosscore_sync", "mode2_paired_ns")
     if issue_ns is None or aiv_bar_ns is None or paired_ns is None:
@@ -506,14 +509,16 @@ def resolve_dispatch_envelope(
         clock_period_ms = MS_PER_SECOND / DEFAULT_CORE_CLOCK_HZ
     p13_params = table.cell("P13_crosscore_sync").parameters or {}
     issue_ms = issue_ns / NS_PER_MS
+    first_issue_ms = (
+        (aiv_first_ns / NS_PER_MS) if (aiv_first_ns is not None and aiv_first_ns > 0.0) else issue_ms
+    )
     aiv_bar_ms = aiv_bar_ns / NS_PER_MS
     aic_bar_ms = (aic_bar_ns if aic_bar_ns is not None else aiv_bar_ns) / NS_PER_MS
     paired_ms = paired_ns / NS_PER_MS
     event_ms = event_ns / NS_PER_MS
-    aiv_min_ms = issue_ms + aiv_bar_ms + AIV_SCALAR_INIT_CYCLES * clock_period_ms
-    aiv_full_ms = (
-        aiv_min_ms + issue_ms + AIV_FULL_DIE_BARRIER_ROUNDS * aiv_bar_ms + paired_ms
-    )
+    # Ordinary independent-block AIV kernels pay only P15 RTS/STARS dispatch (no SyncAll / paired sync).
+    aiv_min_ms = issue_ms
+    aiv_full_ms = max(first_issue_ms, issue_ms) + issue_ms
     return CalibratedDispatchEnvelope(
         sku=table.sku,
         envelope_sha256=table.canonical_envelope_sha256(),

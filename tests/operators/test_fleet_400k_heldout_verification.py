@@ -423,3 +423,54 @@ def test_active_core_calibration_and_scoped_p18_topology() -> None:
     raw_b4["primitives"]["P01_datacopy"]["parameters"]["mte2_aic_cold_scaling_bps"] = {"4": 9e12}
     raw_b4["envelope_sha256"] = compute_envelope_sha256(raw_b4)
     assert _p01_active_core_bps(SimpleNamespace(primitive_table=parse_primitive_table(raw_b4)), 4) is None
+
+
+def test_nearest_rank_p90_unrounded_two_tier_and_kda_sfu_conservation() -> None:
+    """Lock nearest-rank P90, unrounded threshold comparison, and KDA gate exp() BK SFU count."""
+    import importlib.util
+    from tools._fleet_400k_reconcile import nearest_rank_p90
+
+    assert nearest_rank_p90([1.0, 2.0, 3.0, 4.0, 14.56]) == pytest.approx(14.56)
+    assert nearest_rank_p90([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 29.69]) == pytest.approx(29.69)
+
+    spec = importlib.util.spec_from_file_location("fleet_400k_producer_check", PRODUCER_PATH)
+    assert spec is not None and spec.loader is not None
+    prod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(prod)
+    # 8.004% rounds to 8.00% at 2 decimals, yet MUST fail the <= 8.0% median gate unrounded.
+    borderline = [{
+        "split": "heldout", "family": "border", "case_id": f"c{i}", "status": "pass",
+        "l1_cliff_status": "pass", "meas_us": 1000.0, "pred_us": 1080.04, "ape_pct": 8.004,
+        "inv_sim": False, "inv_obs": False,
+    } for i in range(5)]
+    summary = prod._summarize_families(borderline)["heldout"]["border"]
+    assert summary["med_ape_pct"] == 8.0 and summary["l1_two_tier_gate_pass"] is False
+
+    c9362 = parse_case(compose_case("qwen3.8-27b", hardware="Ascend910_9362", tp=1, ep=1, num_devices=1, layers=1, quant="none"))
+    op_rec = OpSpec(
+        "kda_rec_sfu", "kda_recurrent", "decode", 0, 0, (), (2, 8, 128), (2, 8, 128), (2, 8, 128), (2, 8, 128),
+        recipe="kda_recurrent", dtype="bf16",
+        metadata=(("native_kind", "vllm_ascend.ops.triton.kda.kda.fused_recurrent_kda"),
+                  ("abi", "vllm_ascend.ops.triton.kda.kda.fused_recurrent_kda"),
+                  ("operation", "kda_recurrent"), ("lengths", (1, 1)), ("hq", 8), ("hk", 8), ("hv", 8),
+                  ("dk", 128), ("dv", 128), ("dtype", "bf16"), ("state_dtype", "fp32"),
+                  ("use_qk_l2norm_in_kernel", False)),
+    )
+    pl_rec = linear_attention.build(op_rec, Geometry.from_devices(c9362.machine.dies))
+    rc_rec = SimpleNamespace(
+        bind=lambda w: dict(w.resources), resource_names={"vector": "vector", "hbm": "hbm", "mte2_aiv": "mte2_aiv", "mte3": "mte3", "l2": "l2"},
+        rates={"vector": 1e12}, resource_units={}, primitive_table=None, service_rate=lambda *_a, **_k: None,
+        physical_role=lambda r: r, read_pipe=lambda aiv=False: "mte2_aiv" if aiv else "mte2_aic",
+    )
+    prog = pl_rec.program(rc_rec)
+    def _sum_sfu(p) -> float:
+        if hasattr(p, "tile") and hasattr(p, "count"):
+            return sum(_sum_sfu(p.tile(i)) for i in range(p.count))
+        tot = 0.0
+        for st in (p.stages if hasattr(p, "stages") else p):
+            if st.program is not None:
+                tot += _sum_sfu(st.program)
+            elif "rec_decay_sfu" in st.name:
+                tot += float(st.work.get("vector", 0.0))
+        return tot
+    assert _sum_sfu(prog) == pytest.approx(2 * 8 * 16 * 128)

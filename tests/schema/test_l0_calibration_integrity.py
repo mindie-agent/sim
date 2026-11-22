@@ -505,3 +505,40 @@ def test_calibrated_hbm_rw_ratios_l2_bandwidth_and_cann_vector_submodes():
         spill_kids = {k.op_id.split(".")[-1]: k for k in expand_dcp_lse_eager_kernels(fit_op, l2_bytes=1024)}
         assert spill_kids["mul"].hbm_bytes == spill_kids["mul"].mte2_bytes + spill_kids["mul"].mte3_bytes
         assert spill_kids["osum"].hbm_bytes == spill_kids["osum"].mte2_bytes + spill_kids["osum"].mte3_bytes
+
+
+def test_ordinary_aiv_floor_is_p15_only_and_sync_barrier_is_explicit():
+    """Ordinary 39-block AIV Add stays <= 3.04 us (pure P15); SyncAll barrier applies only when declared."""
+    from mindie_sim import compose_case, parse_case
+    from mindie_sim.prediction.evaluation import EvaluationContext
+    from mindie_sim.prediction.graph_analysis import graph_costs
+    from mindie_sim.prediction.program import RecipeBook
+    from mindie_sim.primitives.loader import resolve_dispatch_envelope
+    from mindie_sim.schema.operators import OpSpec
+
+    sku = CALIBRATED_FLEET_SKUS[1]  # Ascend910_9362
+    dp = _dp(sku)
+    tbl = load_primitives(sku, datapath=dp, require_calibrated=True)
+    env = resolve_dispatch_envelope(tbl, dp)
+    assert env is not None
+    assert env.aiv_floor_ms(39) < 0.00304
+    assert env.aiv_sync_floor_ms(39) == pytest.approx(env.aiv_floor_ms(39) + env.aiv_barrier_ms)
+
+    cs = parse_case(compose_case("qwen3.8-27b", hardware=sku, tp=1, ep=1, num_devices=1, layers=1, quant="none"))
+    ev = EvaluationContext.create(cs, RecipeBook(), primitive_table=tbl)
+    n = 129280
+    rd, wr = float(2 * n * 2), float(n * 2)
+    add_plain = OpSpec(
+        "add_plain", "vector", "decode", 0, 0, (), (1, n), (1, n), (1, n), (1, n),
+        dtype="bf16", vector_ops=float(n), mte2_bytes=rd, mte3_bytes=wr, hbm_bytes=rd + wr,
+        metadata=(("program_execution", {"execution_class": "aiv_only", "launched_blocks": 39}),),
+    )
+    add_sync = OpSpec(
+        "add_sync", "vector", "decode", 0, 0, (), (1, n), (1, n), (1, n), (1, n),
+        dtype="bf16", vector_ops=float(n), mte2_bytes=rd, mte3_bytes=wr, hbm_bytes=rd + wr,
+        metadata=(("program_execution", {"execution_class": "aiv_only", "launched_blocks": 39, "cross_core_sync": True}),),
+    )
+    d_plain = graph_costs(cs, {0: [add_plain]}, evaluation=ev, include_submission=False, isolated=True)["duration_ms"]
+    d_sync = graph_costs(cs, {0: [add_sync]}, evaluation=ev, include_submission=False, isolated=True)["duration_ms"]
+    assert d_plain == pytest.approx(env.aiv_floor_ms(39), rel=1e-4) and d_plain < 0.00304
+    assert d_sync == pytest.approx(env.aiv_sync_floor_ms(39), rel=1e-4) and d_sync > d_plain

@@ -600,8 +600,7 @@ class _TopologyPlansMixin:
                 op, participants
             )
         except ModelingError as exc:
-            if (not getattr(self, "_has_primitive_table", False)
-                    or not str(exc).startswith("joint_collective_group_membership")
+            if (not str(exc).startswith("joint_collective_group_membership")
                     or len(participants) != 1 or transport is None
                     or "peer_traffic" in raw_meta):
                 raise
@@ -636,7 +635,7 @@ class _TopologyPlansMixin:
                     rounds = max(phases[norm_family] * (len(ranks) - 1), 0)
                     if metadata.get("steps", rounds) != rounds:
                         return None
-            elif not (getattr(self, "_has_primitive_table", False) and norm_family == "alltoall"):
+            elif norm_family != "alltoall":
                 return None
         peer = None
         if "peer_traffic" in metadata:

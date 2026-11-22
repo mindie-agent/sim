@@ -649,8 +649,8 @@ def build_triton_recurrent_kda(
     l2norm_sfu = (total_tokens * c.hv * nv * L2NORM_VECTORS * bk) if use_l2norm else 0
     short_vec_alu = total_tokens * c.hv * nv * REC_SHORT_VEC_OPS * max(bv, REC_SIMD_WIDTH)
     decay_alu = prologue_alu + l2norm_alu + short_vec_alu + total_tokens * c.hv * nv * (REC_DECAY_OPS_PER_STATE * prog_state + bk)
-    # Line 128: tl.exp(b_gk[None, :]) evaluates exp on full [BV, BK] broadcast tensor.
-    sfu_ops = total_tokens * c.hv * nv * prog_state + l2norm_sfu
+    # fused_recurrent_kda.py:127-128: tl.exp(b_gk[None, :]) evaluates exp on [1, BK] before broadcasting across BV.
+    sfu_ops = total_tokens * c.hv * nv * bk + l2norm_sfu
     dot1_red = l2norm_red + total_tokens * c.hv * nv * prog_state
     update_alu = total_tokens * c.hv * nv * (REC_UPDATE_OPS_PER_STATE + REC_EPILOGUE_OPS_PER_STATE) * prog_state
     dot2_red = total_tokens * c.hv * nv * prog_state

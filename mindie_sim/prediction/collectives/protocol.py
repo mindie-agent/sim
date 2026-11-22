@@ -264,7 +264,10 @@ def _hcomm_algorithm(fabric, collective, ranks, size, expansion, *, is_multi_pac
             logical_size = size * float(ranks) if collective == "allgather" else size
             if logical_size >= MID_BAND_UPPER_EXCLUSIVE:
                 return "double_ring"
-            return "one_shot_mesh" if collective == "allreduce" else "mesh"
+            if collective == "allreduce":
+                return "one_shot_mesh"
+            if collective == "reduce_scatter":
+                return "mesh"
         if expansion is None and collective == "alltoall":
             return "direct_mesh"
         if collective == "allreduce" and expansion in (None, "aiv", "aicpu"):
@@ -321,10 +324,7 @@ def select_band(
                else str(expansion_mode).strip().lower() or None)
     scope = _infer_group_scope(group, topology)
     candidates = _candidate_bands(group, topology, scope)
-    is_multi_pkg = bool(
-        getattr(topology, "_has_primitive_table", False)
-        and _package_partition(group, topology)
-    )
+    is_multi_pkg = bool(_package_partition(group, topology))
 
     matches: list[tuple[tuple[int, int, int, int], CollectiveBandSpec]] = []
     physical_limit = None
@@ -772,7 +772,7 @@ def _resolve_collective_startup_and_hbm(
         and topology.has_calibrated_p18_allreduce_rate()
     )
     local_hbm_bytes = 0.0
-    if api_bytes > 0.0 and count >= TWO_RANKS and uses_calibrated_startup:
+    if api_bytes > 0.0 and count >= TWO_RANKS:
         if collective in {"reduce_scatter", "allreduce"} and has_p18_ar:
             # Ring/mesh ReduceScatter executes (W-1) binary adds on N/W shards = 3*(W-1)/W * N HBM.
             # Subtract the 1.5 HBM/wire already embedded in 2-rank P18 AllReduce on the bottleneck fabric.

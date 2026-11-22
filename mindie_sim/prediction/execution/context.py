@@ -162,8 +162,16 @@ def _apply_calibrated_dispatch_floor(context, dies, selected, envelope):
         floor_ms = envelope.mix_aic_floor_ms(cube_floor_ms)
         kind = "mixed_aic_aiv"
     elif mapped_roles == ("vector",) or (explicit_class in (None, "vector") and has_vec and not has_cube):
-        floor_ms = envelope.aiv_floor_ms(_active_aiv_blocks(op, meta, envelope))
-        kind = "vector"
+        active_blocks = _active_aiv_blocks(op, meta, envelope)
+        needs_sync = bool(
+            meta.get("cross_core_sync")
+            or (isinstance(prog_exec, _AbcMapping) and prog_exec.get("cross_core_sync"))
+        )
+        floor_ms = (
+            envelope.aiv_sync_floor_ms(active_blocks)
+            if needs_sync else envelope.aiv_floor_ms(active_blocks)
+        )
+        kind = "vector_sync" if needs_sync else "vector"
         if (
             target_startup_ms <= 0.0
             and str(meta.get("vector_submode") or "") in {"broadcast_elementwise", "outer_axis_reduction"}
@@ -174,8 +182,8 @@ def _apply_calibrated_dispatch_floor(context, dies, selected, envelope):
             target_startup_ms = floor_ms
     else:
         return selected
-    target_min_ms = max(timing.minimum_ms, floor_ms)
-    if target_min_ms <= timing.minimum_ms and target_startup_ms <= timing.startup_ms:
+    target_min_ms = floor_ms if kind in ("vector", "vector_sync") else max(timing.minimum_ms, floor_ms)
+    if target_min_ms == timing.minimum_ms and target_startup_ms <= timing.startup_ms:
         return selected
     evidence = f"p15_p13:{envelope.sku}:{envelope.envelope_sha256[:DIGEST_PREFIX_CHARS]}:{kind}"
     upgraded = InvocationTiming(

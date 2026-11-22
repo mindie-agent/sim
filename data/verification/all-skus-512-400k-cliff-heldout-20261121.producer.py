@@ -63,10 +63,10 @@ from mindie_sim.schema.datapath import datapath_for_die
 from mindie_sim.schema.operators import OpSpec
 from tools._fleet_400k_reconcile import (
     ABS_FLOOR_NS, DIGEST_PREFIX_LEN, L1_CLIFF_ABS_FLOOR_NS, L1_CLIFF_REL_TOL,
-    L1_MEDIAN_APE_MAX_PCT, L1_P90_APE_MAX_PCT, NS_PER_US, REL_TOL,
+    L1_MEDIAN_APE_MAX_PCT, L1_P90_APE_MAX_PCT, NS_PER_US, PCT_SCALE, REL_TOL,
     apply_sku_observed_clock, dcp_reference_verified, extract_observed_clock_mhz,
-    is_worker_diagnostic_record, load_verified_capture, reconcile_sku_accounting,
-    score_verdict, seq_geometry_key,
+    is_worker_diagnostic_record, load_verified_capture, nearest_rank_p90,
+    reconcile_sku_accounting, score_verdict, seq_geometry_key,
 )
 
 REACHABLE_SKUS: tuple[str, ...] = ("Ascend910B4", "Ascend910_9362", "Ascend910_9382", "Ascend950DT_9582")
@@ -91,7 +91,6 @@ MLA_DQK = MLA_NOPE + MLA_ROPE
 IDX_H, IDX_D, DEFAULT_TOPK, DEFAULT_PAGE_SIZE, L2_GRANULE_BYTES = 64, 128, 2048, 128, 128
 GDN_DEFAULT_H, GDN_REC_DEFAULT_H, KDA_CHUNK_DEFAULT_H, KDA_REC_DEFAULT_H = 4, 16, 2, 8
 GDN_BT, GDN_DIM, MAX_ERR_CHARS, ROUND_SUMMARY_DIGITS = 64, 128, 160, 2
-P90_QUANTILE = 0.9
 STARVED_CV_PCT = 25.0
 STARVED_SMALL_MAX_BYTES = 64 * 1024
 STARVED_BLOCKED_FLOOR_US = 50.0
@@ -761,17 +760,29 @@ def _eval_single_seq_record(
     return None, 0.0
 
 
+def _raw_row_ape_pct(row: Mapping[str, Any]) -> float:
+    meas = row.get("meas_us")
+    pred = row.get("pred_us")
+    if (
+        isinstance(meas, (int, float)) and not isinstance(meas, bool) and meas > 0.0
+        and isinstance(pred, (int, float)) and not isinstance(pred, bool) and pred > 0.0
+    ):
+        return (abs(float(pred) - float(meas)) / float(meas)) * PCT_SCALE
+    return float(row["ape_pct"])
+
+
 def _summarize_families(rows: list[dict[str, Any]]) -> dict[str, dict[str, dict[str, Any]]]:
     grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
     for r in rows:
         grouped.setdefault((r["split"], r["family"]), []).append(r)
     out: dict[str, dict[str, dict[str, Any]]] = {}
     for (split, fam), items in sorted(grouped.items()):
-        apes = sorted(float(x["ape_pct"]) for x in items)
+        apes = sorted(_raw_row_ape_pct(x) for x in items)
         l400 = [x for x in items if "400000" in x["case_id"] or "409600" in x["case_id"]]
-        p90_idx = min(len(apes) - 1, int(P90_QUANTILE * (len(apes) - 1)))
-        med_ape = round(statistics.median(apes), ROUND_SUMMARY_DIGITS)
-        p90_ape = round(apes[p90_idx], ROUND_SUMMARY_DIGITS)
+        med_raw = float(statistics.median(apes))
+        p90_raw = nearest_rank_p90(apes)
+        med_ape = round(med_raw, ROUND_SUMMARY_DIGITS)
+        p90_ape = round(p90_raw, ROUND_SUMMARY_DIGITS)
         c_pass = sum(1 for x in items if x.get("l1_cliff_status") == "pass")
         c_fail = len(items) - c_pass
         inv_sim = sum(1 for x in items if x["inv_sim"])
@@ -783,8 +794,8 @@ def _summarize_families(rows: list[dict[str, Any]]) -> dict[str, dict[str, dict[
             "mean_ape_pct": round(statistics.mean(apes), ROUND_SUMMARY_DIGITS),
             "max_ape_pct": round(apes[-1], ROUND_SUMMARY_DIGITS),
             "l1_two_tier_gate_pass": (
-                med_ape <= L1_MEDIAN_APE_MAX_PCT
-                and p90_ape <= L1_P90_APE_MAX_PCT
+                med_raw <= L1_MEDIAN_APE_MAX_PCT
+                and p90_raw <= L1_P90_APE_MAX_PCT
                 and c_fail == 0 and inv_sim == 0
             ),
             "inv_sim": inv_sim, "inv_obs": sum(1 for x in items if x["inv_obs"]),

@@ -527,3 +527,24 @@ def test_transport_receive_pool_conflict_is_explicit():
     first.start(engine, "a", ready)
     with pytest.raises(ModelingError, match="transport_receive_capacity_conflict"):
         second.start(engine, "b", ready)
+
+
+def test_collective_algorithm_and_hccs_k8_alltoall_staging_independent_of_calibration():
+    """Physical topology picks double_ring and hccs_k8 AllToAll HBM staging without primitive_table."""
+    from mindie_sim import compose_case, parse_case
+    from mindie_sim.prediction.collectives.protocol import HCCL_DEFAULT_BUFFSIZE_BYTES, lower_collective
+    from mindie_sim.primitives.loader import load_primitives
+
+    cs_a3 = parse_case(compose_case("qwen3.8-27b", hardware="Ascend910_9362", tp=4, ep=1, num_devices=4, layers=1, quant="none"))
+    topo_uncal = Topology(cs_a3.machine, cs_a3.runtime.parallel, primitive_table=None)
+    topo_cal = Topology(cs_a3.machine, cs_a3.runtime.parallel, primitive_table=load_primitives("Ascend910_9362"))
+    low_uncal = lower_collective("allreduce", (0, 1, 2, 3), topo_uncal, 4 * 1024 * 1024)
+    low_cal = lower_collective("allreduce", (0, 1, 2, 3), topo_cal, 4 * 1024 * 1024)
+    assert low_uncal.band.algorithm == "double_ring" == low_cal.band.algorithm
+
+    cs_a2 = parse_case(compose_case("qwen3.8-27b", hardware="Ascend910B4", tp=4, ep=1, num_devices=4, layers=1, quant="none"))
+    topo_a2 = Topology(cs_a2.machine, cs_a2.runtime.parallel, primitive_table=None)
+    low_a2a = lower_collective("alltoall", (0, 1, 2, 3), topo_a2, 4 * 1024 * 1024)
+    assert low_a2a.local_hbm_bytes_per_rank == pytest.approx(4.0 * 4 * 1024 * 1024)
+    low_direct = lower_collective("alltoall", (0, 1, 2, 3), topo_a2, HCCL_DEFAULT_BUFFSIZE_BYTES + 1024 * 1024)
+    assert low_direct.local_hbm_bytes_per_rank == 0.0
