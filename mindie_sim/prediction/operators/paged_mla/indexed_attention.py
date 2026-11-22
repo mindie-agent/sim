@@ -16,8 +16,13 @@ from functools import lru_cache, partial
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.catalog.index_pool import selected_tokens
 from mindie_sim.prediction.mechanism import OperatorPlan, PlannedRecipe, Work
+from mindie_sim.prediction.operators.sharedkv.l0_sync import p13_syncall_ms
 from mindie_sim.prediction.operators.sparse_indexer.sparse_attention import selected_query_owners
 from mindie_sim.prediction.program import KernelProgram, ParallelProgram, Stage
+
+SPLIT_KV_STATE_SCALARS = 2
+SPLIT_KV_MERGE_OPS_PER_ELEM = 3
+PRELOAD_SLOTS_VALID = frozenset({2, 3})
 
 
 CUBE_PANEL_COLUMNS = 128
@@ -189,7 +194,7 @@ def _align(value, size):
 
 
 def _phases(keys, heads, latent, rope, *, first, last, scratch_policy,
-            operand_modes=False):
+            operand_modes=False, flash_decode=False):
     """Physical tile work; padding is confined to matrix operands/results."""
     padded_h, padded_k = _align(heads, FRACTAL_ALIGNMENT), _align(keys, FRACTAL_ALIGNMENT)
     width = latent + rope
@@ -234,8 +239,9 @@ def _phases(keys, heads, latent, rope, *, first, last, scratch_policy,
 
     qk_inner = operands(padded_h * ((keys + (CUBE_PANEL_COLUMNS - 1)) // CUBE_PANEL_COLUMNS) * width * 2,
                         padded_k * width * 2)
-    pv_reads = keys * latent * 2 + probability
-    pv_inner = operands(padded_h * (latent // CUBE_PANEL_COLUMNS) * padded_k * 2,
+    pv_prob_mult = 2 if flash_decode else 1
+    pv_reads = keys * latent * 2 + pv_prob_mult * probability
+    pv_inner = operands(pv_prob_mult * padded_h * (latent // CUBE_PANEL_COLUMNS) * padded_k * 2,
                         latent * padded_k * 2)
     return (
         ("gather", Work(resources={
@@ -249,9 +255,10 @@ def _phases(keys, heads, latent, rope, *, first, last, scratch_policy,
         ("softmax", Work(resources={
             **scratch(read=heads * padded_k * FP32_ELEMENT_BYTES + 1024, vector=True),
             "vector": SOFTMAX_OPS_PER_SCORE * heads * padded_k + SOFTMAX_STATE_OPS_PER_HEAD * heads})),
-        ("probability", Work(resources=scratch(write=probability))),
+        ("probability", Work(resources=scratch(write=pv_prob_mult * probability))),
         ("pv_load", Work(resources={**scratch(read=pv_reads), **pv_inner})),
-        ("pv", Work(matrix={"bf16": 2 * padded_h * padded_k * latent})),
+        # sparse_flash_attention_service_cube_mla.h:1339: FLASH_DECODE issues high + residual PV Mmad.
+        ("pv", Work(matrix={"bf16": pv_prob_mult * 2 * padded_h * padded_k * latent})),
         ("nupdate", Work(resources={
             **(scratch(write=partial_output) if first else atomic(partial_output)),
             "vector": padded_h * (latent if first else OUTPUT_INIT_COLUMNS)})),
@@ -263,6 +270,9 @@ def _phases(keys, heads, latent, rope, *, first, last, scratch_policy,
     )
 
 
+_FD_PHASES = partial(_phases, flash_decode=True)
+
+
 def build(op, geometry, *, scratch_policy, key_tile=INDEXED_KEY_TILE, slots=INDEXED_PIPELINE_SLOTS, compact=True,
           operand_modes=False, rope0_analytic=False):
     meta = dict(op.metadata)
@@ -270,7 +280,7 @@ def build(op, geometry, *, scratch_policy, key_tile=INDEXED_KEY_TILE, slots=INDE
     if not shape:
         raise ModelingError("indexed_attention_requires_frontend_geometry")
     if (scratch_policy not in {"resident", "offchip"} or key_tile != INDEXED_KEY_TILE
-            or slots != INDEXED_PIPELINE_SLOTS):
+            or slots not in PRELOAD_SLOTS_VALID):
         raise ModelingError("indexed_attention_requires_declared_source_tile_and_scratch_policy")
     if (shape["window"] or shape["compression_ratio"] != 1
             or shape["cp"] != 1 or shape["query_dtype"] != "bf16"
@@ -311,6 +321,68 @@ def build_pipeline(shape, geometry, *, scratch_policy, key_tile=INDEXED_KEY_TILE
         raise ModelingError("indexed_attention_requires_integer_sequence_geometry")
     query, topk = sum(row[0] for row in sequences), shape["topk"]
     heads, latent, rope = shape["heads"], shape["latent"], shape["rope"]
+    if shape.get("split_kv") and query > 0 and geometry.compute_units > query:
+        # sparse_flash_attention_tiling.cpp:409 (CANN >= 9.3.0): N=512, T=ceil(K/N),
+        # p=min(C//queryCount, T), parts=ceil(T/ceil(T/p)); part 0 merges partials.
+        max_k = max(
+            (selected_tokens(ctx_len + 1, topk, shape.get("index_pool_size", 1), shape.get("index_pool_tail", False))
+             for q_cnt, ctx_len in sequences if q_cnt > 0),
+            default=0,
+        )
+        n_tiles = (max_k + key_tile - 1) // key_tile if max_k > 0 else 0
+        p_cap = min(geometry.compute_units // query, n_tiles) if n_tiles > 1 else 1
+        parts = (n_tiles + ((n_tiles + p_cap - 1) // p_cap) - 1) // ((n_tiles + p_cap - 1) // p_cap) if p_cap > 1 else 1
+        if parts > 1:
+            pool_size = shape.get("index_pool_size", 1)
+            pool_tail = shape.get("index_pool_tail", False)
+            part_seqs = []
+            for q_cnt, ctx_len in sequences:
+                for pos in range(q_cnt):
+                    k_row = selected_tokens(ctx_len + pos + 1, topk, pool_size, pool_tail)
+                    base_k, rem_k = divmod(k_row, parts)
+                    for p_idx in range(parts):
+                        pk = base_k + (1 if p_idx < rem_k else 0)
+                        if pk > 0:
+                            part_seqs.append((1, pk - 1))
+            fd_factory = _FD_PHASES if phase_factory is _phases else phase_factory
+            sub_plan = _plan(
+                tuple(part_seqs), topk, heads, latent, rope, geometry.compute_units,
+                scratch_policy, key_tile, slots, compact, operand_modes,
+                fd_factory, source_items, tuple(paired_vector_stages), vector_buffer_bytes,
+                phase_unit_weights, 1, False,
+            )
+            state_bytes = heads * (latent + SPLIT_KV_STATE_SCALARS) * FP32_ELEMENT_BYTES
+            per_q_merge = Work(resources={
+                "mte2_aiv": parts * state_bytes,
+                "mte3": state_bytes,
+                "hbm": (parts + 1) * state_bytes,
+                "vector": (parts - 1) * heads * (SPLIT_KV_MERGE_OPS_PER_ELEM * latent + SPLIT_KV_STATE_SCALARS),
+            })
+            merge_work = per_q_merge.scaled(query)
+            base_lower = sub_plan.program
+
+            def _split_kv_lower(ctx):
+                body_prog = base_lower(ctx)
+                q_work = ctx.bind(per_q_merge)
+                merge_branches = tuple(
+                    KernelProgram((Stage(
+                        f"merge_q{q_idx}", q_work,
+                        placement=ctx.owned((q_idx * parts) % geometry.compute_units, geometry.compute_units,
+                                            {"mte2_aiv", "mte3", "vector"}),
+                        coupled=True,
+                    ),))
+                    for q_idx in range(query)
+                )
+                barrier_ms = p13_syncall_ms(ctx)
+                stages = [Stage("split_kv_parts", program=body_prog)]
+                prev = "split_kv_parts"
+                if barrier_ms > 0.0:
+                    stages.append(Stage("split_kv_barrier", after=(prev,), latency=barrier_ms, keep_empty=True))
+                    prev = "split_kv_barrier"
+                stages.append(Stage("split_kv_merge", after=(prev,), program=ParallelProgram(merge_branches)))
+                return KernelProgram(tuple(stages))
+
+            return replace(sub_plan, work=sub_plan.work + merge_work, program=_split_kv_lower)
     owners = selected_query_owners(query, geometry.compute_units)
     # The source reserves four KV rings and three score/probability/output
     # rings per owner. Cache residency is an explicit conditional placement.

@@ -414,6 +414,26 @@ def splitk_program(context, split_count: int, *, recipe=None, geometry=None,
         partial_bytes=partial_write, vector_merge=vector_merge,
         final_write=hbm_write, cube_total=cube_total,
         declared_hbm=hbm_total, issued_vector=vector_total + vector_merge)
+    sync_ms = 0.0
+    pt = getattr(context, "primitive_table", None)
+    if pt is not None:
+        from mindie_sim.primitives.loader import _table_band_p50
+        sync_ns = (
+            _table_band_p50(pt, "P13_crosscore_sync", "mode0_aiv_barrier_ns")
+            or _table_band_p50(pt, "P13_crosscore_sync", "mode0_aic_barrier_ns")
+        )
+        if sync_ns is not None and sync_ns > 0.0:
+            sync_ms = float(sync_ns) / 1_000_000.0
+    if sync_ms > 0.0:
+        return KernelProgram((
+            Stage("setup", latency=context.setup_ms),
+            Stage("splits", after=("setup",),
+                  program=ParallelProgram(tuple(split_program(index)
+                                                for index in range(len(tasks))))),
+            Stage("split_sync", after=("splits",), latency=sync_ms, keep_empty=True),
+            Stage("merge", after=("split_sync",),
+                  program=ParallelProgram(merges)),
+        ), minimum_ms=context.minimum_ms)
     return KernelProgram((
         Stage("setup", latency=context.setup_ms),
         Stage("splits", after=("setup",),

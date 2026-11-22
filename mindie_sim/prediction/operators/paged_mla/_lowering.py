@@ -25,11 +25,14 @@ from ...runtime.memory_physics import AddressRun, AddressRunPlan, ByteLedger, Hb
 from ...runtime.ring_buffer import RingBuffer, lower_generation
 from ..attention.common import AttentionMemoryRead, planning_sequence_spans, sequence_layout_metadata
 from ..contracts import OperatorPlanningContext
+from ..matrix.refill_steady import compact_periodic_pipeline
+from ..sharedkv.split_core import p01_cold_mte2_aic_cap
 from .common import (
     ACLNN_MQS_DATA_BYTES, ACLNN_MQS_INLINE_ROW_BYTES, ACLNN_MQS_SCALE_BYTES, ACLNN_MQS_SEPARATE_SCALE_MODE,
-    DSL_MQS_ABI, FAMILY, FP32_BYTES, INDEX_BYTES, MQS_ABI, MQS_COMPRESSED_ROW_BYTES,
-    MQS_ORIGINAL_ROW_BYTES, MQS_PAGED_LAYOUT, NZ_BLOCK_BYTES, PagedMlaContract, _query_row, align_bytes,
-    capability_gap, ceil_div, latent_record_bytes,
+    ARCH22_MLA_L0A_RELOAD_PANELS, DSL_MQS_ABI, FAMILY, FIA_ABI, FP32_BYTES, INDEX_BYTES,
+    MQS_ABI, MQS_COMPRESSED_ROW_BYTES, MQS_ORIGINAL_ROW_BYTES,
+    MQS_PAGED_LAYOUT, NZ_BLOCK_BYTES, PagedMlaContract, _query_row, align_bytes, capability_gap,
+    ceil_div, latent_record_bytes, mla_step_crosscore_ms,
 )
 
 FIA_ISSUE_ORDER = {
@@ -44,6 +47,11 @@ WEIGHTED_MERGE_OPS_PER_VALUE = 3
 FP8_DEQUANT_OPS_PER_VALUE = 6
 FP4_DEQUANT_OPS_PER_VALUE = 4
 SOFTMAX_STATE_SCALARS = 2
+SINGLE_AIV_HEAD_LIMIT = 16
+NATIVE_FD_REDUCE_HEAD_TILE = 64
+FD_REDUCE_HEAD_GRAIN = 8
+MLA_COMPACT_THRESHOLD = 32
+MLA_COMPACT_MIN_KEY_TILE = 128
 RowCuts = dict[tuple[int, int], tuple[int, ...]]
 
 
@@ -62,6 +70,9 @@ class PipelineLayout:
     matrix_output: tuple[str, int] = ("fixpipe", NZ_BLOCK_BYTES)
     probability_output: tuple[str, int] = ("mte3", NZ_BLOCK_BYTES)
     pv_panel_width: int = 0
+    ws_l2_resident: bool = False
+    latent_l2_hit: bool = False
+    kv_reuse_hit: float = 0.0
     @property
     def phases(self) -> tuple[str, ...]:
         return tuple(chain.from_iterable(self.clocks))
@@ -77,18 +88,26 @@ class _Demand:
         if amount:
             self.resources[resource] = self.resources.get(resource, 0) + amount
     def transfer(self, tensor: str, pipe: str, nbytes: int, plan: AddressRunPlan, *,
-                 aligned_copy_bytes: int | None = None) -> None:
+                 aligned_copy_bytes: int | None = None, l2_hit_fraction: float = 0.0) -> None:
         if not nbytes:
             return
         direction = "read" if pipe.startswith("mte2") else "write"
         access = MemoryAccessPattern(tensor, 0, 0, 0, direction, pipe, nbytes, plan)
         aligned = access.runs.aligned_copy_bytes() if aligned_copy_bytes is None else aligned_copy_bytes
         sectors, dram = access.runs.dram_sector_and_service()
-        ledger = ByteLedger(access.logical_bytes, aligned, dram, 0, aligned, sectors)
+        hit = max(0.0, min(1.0, float(l2_hit_fraction)))
+        l2_bytes = int(round(aligned * hit))
+        miss_copy = max(0, aligned - l2_bytes)
+        miss_dram = int(round(dram * (1.0 - hit)))
+        miss_sectors = int(round(sectors * (1.0 - hit)))
+        ledger = ByteLedger(access.logical_bytes, aligned, miss_dram, l2_bytes, miss_copy, miss_sectors)
         if self.kv_reads is not None and tensor in {"key", "value"}:
             self.kv_reads.append((access, ledger))
         self.add(pipe, ledger.aligned_transfer_bytes)
-        self.add("hbm", ledger.dram_bus_transaction_bytes)
+        if ledger.l2_hit_bytes:
+            self.add("l2", ledger.l2_hit_bytes)
+        if ledger.dram_bus_transaction_bytes:
+            self.add("hbm", ledger.dram_bus_transaction_bytes)
         for key, value in (
             ("logical_bytes", ledger.logical_tensor_bytes),
             ("aligned_transfer_bytes", ledger.aligned_transfer_bytes),
@@ -100,11 +119,16 @@ class _Demand:
         ):
             self.metadata[key] = self.metadata.get(key, 0) + value
 
-    def linear(self, tensor: str, pipe: str, nbytes: int, offset: int = 0) -> None:
-        self.transfer(tensor, pipe, nbytes, AddressRunPlan((AddressRun(offset, 1, nbytes, nbytes),)))
+    def linear(self, tensor: str, pipe: str, nbytes: int, offset: int = 0, *, l2_hit_fraction: float = 0.0) -> None:
+        self.transfer(tensor, pipe, nbytes, AddressRunPlan((AddressRun(offset, 1, nbytes, nbytes),)),
+                      l2_hit_fraction=l2_hit_fraction)
 
-    def atomic_add(self, tensor: str, pipe: str, nbytes: int, offset: int) -> None:
-        self.linear(tensor, pipe, nbytes, offset)
+    def atomic_add(self, tensor: str, pipe: str, nbytes: int, offset: int, *, l2_hit_fraction: float = 0.0) -> None:
+        self.linear(tensor, pipe, nbytes, offset, l2_hit_fraction=l2_hit_fraction)
+        if l2_hit_fraction >= 1.0:
+            self.add("l2", nbytes)
+            self.metadata["atomic_read_bytes"] = nbytes
+            return
         read_bytes = self.metadata["dram_bus_transaction_bytes"]
         self.add("hbm", read_bytes)
         self.metadata["dram_bus_transaction_bytes"] += read_bytes
@@ -171,7 +195,8 @@ def _read_sparse_bank(demand, c, branch, spans, table, dsl_width):
         demand.metadata[logical_key] = demand.metadata.get(logical_key, 0) + rows * row_width
 
 def _read_kv(demand: _Demand, c: PagedMlaContract, seq: int, query: int, start: int, keys: int,
-             dqk_bytes: int, dv_bytes: int, *, value: bool = False, base_token: int = 0) -> None:
+             dqk_bytes: int, dv_bytes: int, *, value: bool = False, base_token: int = 0,
+             l2_hit_fraction: float = 0.0) -> None:
     if not c.mixed_quant:
         table = c.block_table[seq] if c.block_table else ()
         tensor, width = ("value", dv_bytes) if value else ("key", dqk_bytes)
@@ -179,10 +204,11 @@ def _read_kv(demand: _Demand, c: PagedMlaContract, seq: int, query: int, start: 
         for page, offset, rows in _spans(start, keys, c.page_size):
             plan = _kv_runs(c, ((page, offset, rows),), width, stride, table, c.kv_layout,
                             base_token=0 if table else base_token)
-            demand.transfer(tensor, "mte2_aic", rows * width, plan)
+            demand.transfer(tensor, "mte2_aic", rows * width, plan, l2_hit_fraction=l2_hit_fraction)
         first_page = start // c.page_size
         pages = ceil_div(start + keys, c.page_size) - first_page
-        demand.linear(f"{tensor}_pages", "mte2_aic", INDEX_BYTES * pages, INDEX_BYTES * first_page)
+        demand.linear(f"{tensor}_pages", "mte2_aic", INDEX_BYTES * pages, INDEX_BYTES * first_page,
+                      l2_hit_fraction=l2_hit_fraction)
         return
     ori, cmp = c.bank_counts(seq, query)
     for branch, lo, hi, tables, lists, width in (
@@ -247,14 +273,17 @@ class _PagedMlaProgramBuilder:
             _, _, q_base, kv_base, _ = self.sequence_spans[seq]
             q_base = (q_base + query) * c.physical_heads + head_start
         atomic = layout.gm_workspace and not first
+        ws_hit = 1.0 if layout.ws_l2_resident else 0.0
         if step == "sink_load":
             d.linear("sinks", "mte2_aiv", c.physical_heads * FP32_BYTES)
         elif step == "sink_init" and ((first and start == 0) or not partials):
             d.add("vector", heads * (c.dv + SOFTMAX_STATE_SCALARS))
-        elif step == "q_load" and (layout.gm_workspace or first):
-            d.linear("query", "mte2_aic", heads * qk_width, q_base * qk_width)
+        elif step == "q_load" and (first or layout.gm_workspace):
+            d.linear("query", "mte2_aic", heads * qk_width, q_base * qk_width,
+                     l2_hit_fraction=0.0 if first else ws_hit)
         elif step == "kv_load":
-            _read_kv(d, c, seq, query, start, keys, qk_width, v_width, base_token=kv_base)
+            _read_kv(d, c, seq, query, start, keys, qk_width, v_width, base_token=kv_base,
+                     l2_hit_fraction=layout.kv_reuse_hit)
         elif step == "dequant" and c.mixed_quant:
             ori, _ = c.bank_counts(seq, query)
             fp8_keys = keys if c.abi == MQS_ABI else max(0, min(keys, ori - start))
@@ -264,7 +293,8 @@ class _PagedMlaProgramBuilder:
             pipe, alignment = layout.probability_output
             d.add(pipe, align_bytes(keys * qk_width, alignment))
         elif step == "qk_operands":
-            d.add("mte1", (heads + keys) * qk_width)
+            q_mult = ARCH22_MLA_L0A_RELOAD_PANELS if layout.gm_workspace else 1
+            d.add("mte1", (heads * q_mult + keys) * qk_width)
         elif step == "qk":
             d.flops = 2 * heads * keys * c.dqk
         elif step in {"score_store", "probability", "partial"}:
@@ -275,24 +305,27 @@ class _PagedMlaProgramBuilder:
             }[step]
             if layout.gm_workspace:
                 if step == "partial" and atomic:
-                    d.atomic_add(tensor, pipe, amount, mm2_offset)
+                    d.atomic_add(tensor, pipe, amount, mm2_offset, l2_hit_fraction=ws_hit)
                 else:
-                    d.linear(tensor, pipe, amount, mm2_offset if step == "partial" else 0)
+                    d.linear(tensor, pipe, amount, mm2_offset if step == "partial" else 0, l2_hit_fraction=ws_hit)
             else:
                 if step == "score_store" and layout.pv_panel_width:
                     amount = fixpipe_rectangle_bytes(heads, keys)
                 d.add(pipe, align_bytes(amount, alignment))
         elif step == "score_read" and layout.gm_workspace:
-            d.linear("mm1", "mte2_aiv", scores)
+            d.linear("mm1", "mte2_aiv", scores, l2_hit_fraction=ws_hit)
         elif step == "softmax":
             d.add("vector", heads * (SOFTMAX_OPS_PER_KEY * keys - 2))
         elif step == "pv_load":
             if layout.gm_workspace:
-                d.linear("vec1", "mte2_aic", probs)
+                d.linear("vec1", "mte2_aic", probs, l2_hit_fraction=ws_hit)
             if not layout.resident_latent:
-                _read_kv(d, c, seq, query, start, keys, qk_width, v_width, value=True, base_token=kv_base)
+                v_hit = 1.0 if layout.latent_l2_hit else layout.kv_reuse_hit
+                _read_kv(d, c, seq, query, start, keys, qk_width, v_width, value=True, base_token=kv_base,
+                         l2_hit_fraction=v_hit)
         elif step == "pv_operands":
-            d.add("mte1", probs + keys * v_width)
+            p_mult = ARCH22_MLA_L0A_RELOAD_PANELS if layout.gm_workspace else 1
+            d.add("mte1", probs * p_mult + keys * v_width)
         elif step in {"pv", "pv0", "pv1"}:
             columns = layout.pv_panel_width if step != "pv" else c.dv
             d.flops = 2 * heads * keys * columns
@@ -306,9 +339,9 @@ class _PagedMlaProgramBuilder:
             d.add("vector", _merge_ops(c, heads, 1) - heads * c.dv)
         elif step == "atomic_write" and atomic:
             # Vec1 applies the exponent correction using INT32 atomic add on the MM2 bytes.
-            d.atomic_add("mm2", "mte3", pv, mm2_offset)
+            d.atomic_add("mm2", "mte3", pv, mm2_offset, l2_hit_fraction=ws_hit)
         elif step == "output_read" and last:
-            d.linear("mm2", "mte2_aiv", pv, mm2_offset)
+            d.linear("mm2", "mte2_aiv", pv, mm2_offset, l2_hit_fraction=ws_hit)
         elif step == "output_update" and not layout.gm_workspace and not first:
             d.add("vector", _merge_ops(c, heads, 1))
         elif step == "split_write" and last and partials > 1:
@@ -434,7 +467,7 @@ class _PagedMlaProgramBuilder:
                         totals[step] = totals.get(step, Work()) + work.scaled(repeat)
         return totals
 
-    def _stage(self, context, demand, pair, name, *, after=(), previous=(), metadata=None):
+    def _stage(self, context, demand, pair, name, *, after=(), previous=(), metadata=None, latency=0.0, cold_caps=None):
         aic, aivs = pair
         work = demand.work(self.dtype)
         stages = []
@@ -455,15 +488,23 @@ class _PagedMlaProgramBuilder:
                 resources[access.pipe] -= ledger.aligned_transfer_bytes
                 resources["hbm"] -= ledger.dram_bus_transaction_bytes
             work = Work(work.matrix, {role: value for role, value in resources.items() if value})
+        if "l2" in work.resources and "l2" not in context.resource_names:
+            work = Work(work.matrix, {role: val for role, val in work.resources.items() if role != "l2"})
         roles = (*work.resources, *(("cube",) if work.matrix else ()))
         placement = {}
         for role in roles:
-            if role != "hbm":
+            if role not in ("hbm", "l2"):
                 placement.update(context.placement(role, aivs if role in AIV_ROLES else (aic,)))
+        caps = cold_caps if (cold_caps and work.resources.get("hbm", 0) > 0 and name.startswith("kv_load")) else {}
         stage = Stage(name, context.bind(work), after=after, previous=previous, placement=placement,
-                      coupled="hbm" in work.resources, metadata={**demand.metadata, **(metadata or {})})
+                      coupled=("hbm" in work.resources or "l2" in work.resources), caps=caps,
+                      metadata={**demand.metadata, **(metadata or {})})
         if not stages:
-            return stage
+            if latency > 0.0 and (work.resources or work.matrix):
+                return Stage(name, after=after, previous=previous, metadata=stage.metadata,
+                             program=KernelProgram((replace(stage, after=(), previous=()),
+                                                    Stage("sync", after=(name,), latency=latency, keep_empty=True))))
+            return replace(stage, latency=latency) if latency > 0.0 else stage
         if work.resources or work.matrix:
             stages.append(KernelProgram((replace(stage, after=(), previous=()),)))
         return Stage(name, after=after, previous=previous, program=ParallelProgram(tuple(stages)),
@@ -502,23 +543,46 @@ class _PagedMlaProgramBuilder:
         def name(step, index):
             return f"{step}:{index % period}"
 
-        def cycle(clock):
-            stages = []
+        split_cold_caps = p01_cold_mte2_aic_cap(ctx, len(self.owners), include_hbm=True)
+
+        def _build_cycle(clock: int, *, compact_names: bool) -> tuple[Stage, ...]:
+            stages: list[Stage] = []
             for position, step in enumerate(phases):
                 index = clock - delays[step]
                 if not 0 <= index < count:
                     continue
                 deps, prev = [], []
-                def depend(other, tile):
+
+                def depend(other: str, tile: int) -> None:
                     if 0 <= tile < count:
-                        target = deps if tile + delays[other] == clock else prev
-                        target.append(name(other, tile))
+                        delta = clock - (tile + delays[other])
+                        if compact_names:
+                            if delta == 0:
+                                deps.append(other)
+                            elif delta == 1:
+                                prev.append(other)
+                        else:
+                            (deps if delta == 0 else prev).append(name(other, tile))
+
                 if step in {"release0", "release1"}:
                     depend(f"partial{step[-1]}", index)
-                    if step == "release0":
-                        depend("release1", index - 1)
-                    else:
-                        depend("release0", index)
+                    depend("release1" if step == "release0" else "release0",
+                           index - 1 if step == "release0" else index)
+                elif layout.gm_workspace and layout.head_tile > SINGLE_AIV_HEAD_LIMIT:
+                    if step == "qk":
+                        depend("kv_load", index)
+                    elif step == "score_store":
+                        depend("qk_operands", index)
+                        depend("qk", index)
+                    elif step == "pv":
+                        depend("pv_load", index)
+                    elif step == "atomic_rescale":
+                        depend("probability", index)
+                    elif step == "partial":
+                        depend("pv_operands", index)
+                        depend("pv", index)
+                    elif position:
+                        depend(phases[position - 1], index)
                 elif position:
                     depend(phases[position - 1], index)
                 if step in {"softmax", "output_update", "qk", "pv"}:
@@ -530,31 +594,56 @@ class _PagedMlaProgramBuilder:
                     depend("partial", index - 1)
                 if step == "pv0":
                     depend("partial1", index - 1)
-                metadata = {"kv_tile": offset + index, "clock": clock}
-                if layout.gm_workspace:
-                    metadata.update(task_record_idx=index % len(layout.clocks), workspace_buf_idx=index % FIA_WORKSPACE_DEPTH)
+                metadata = {} if compact_names else {"kv_tile": offset + index, "clock": clock}
+                if not compact_names and layout.gm_workspace:
+                    metadata.update(task_record_idx=index % len(layout.clocks),
+                                    workspace_buf_idx=index % FIA_WORKSPACE_DEPTH)
                     if step in {"partial", "atomic_rescale", "atomic_write", "output_read"}:
-                        metadata.update(bn2_idx_in_cur_core=interval, mm2_slot=mm2_slot, mm2_offset_bytes=mm2_offset)
-                if layout.pv_panel_width and step in {"pv0", "pv1", "partial0", "partial1", "release0", "release1"}:
+                        metadata.update(bn2_idx_in_cur_core=interval, mm2_slot=mm2_slot,
+                                        mm2_offset_bytes=mm2_offset)
+                if not compact_names and layout.pv_panel_width and step in {
+                    "pv0", "pv1", "partial0", "partial1", "release0", "release1",
+                }:
                     panel = int(step[-1])
                     metadata.update(mm2_slot=panel, mm2_generation=index, aiv_owners=aiv_owners,
                                     column_start=panel * layout.pv_panel_width, columns=layout.pv_panel_width)
                 for region, consumer, depth in credits.get(step, ()):
                     depend(consumer, index - depth)
-                    metadata[f"{region}_slot"] = index % depth
-                    metadata[f"{region}_generation"] = index // depth
+                    if not compact_names:
+                        metadata[f"{region}_slot"] = index % depth
+                        metadata[f"{region}_generation"] = index // depth
                 demand = self._tile_demand(step, seq, query, heads, live, index, offset, count, partials,
                                            mm2_offset, head_start)
                 edges = dict(after=tuple(dict.fromkeys(deps)), previous=tuple(dict.fromkeys(prev)))
+                st_name = step if compact_names else name(step, index)
                 if step in {"release0", "release1"}:
-                    stages.append(Stage(name(step, index), program=self._panel_release(ctx, demand, aivs, heads),
+                    stages.append(Stage(st_name, program=self._panel_release(ctx, demand, aivs, heads),
                                         metadata=metadata, **edges))
                 else:
-                    stages.append(self._stage(ctx, demand, pair, name(step, index), metadata=metadata, **edges))
+                    sync_lat = mla_step_crosscore_ms(ctx, step, gm_workspace=layout.gm_workspace, abi=self.contract.abi)
+                    stages.append(self._stage(ctx, demand, pair, st_name, metadata=metadata, latency=sync_lat, cold_caps=split_cold_caps, **edges))
             by_name = {stage.name: stage for stage in stages}
             order = TopologicalSorter({stage.name: stage.after for stage in stages})
             return tuple(by_name[key] for key in order.static_order())
-        return PipelineProgram(count + len(layout.clocks) - 1, len(layout.clocks), cycle)
+
+        slots = len(layout.clocks)
+        can_compact = (
+            count > MLA_COMPACT_THRESHOLD
+            and layout.gm_workspace
+            and layout.key_tile >= MLA_COMPACT_MIN_KEY_TILE
+            and not self.contract.mixed_quant
+            and not self.contract.block_table
+            and self.planning is None
+            and self.contract.kv_layout == "PA_BLK_BSND"
+            and (layout.key_tile % self.contract.page_size == 0 or self.contract.page_size % layout.key_tile == 0)
+        )
+        if can_compact:
+            return compact_periodic_pipeline(
+                ctx, count + slots - 1, slots,
+                lambda clk: _build_cycle(clk, compact_names=True),
+                head=slots + 1, tail=slots + 1, threshold=MLA_COMPACT_THRESHOLD,
+            )
+        return PipelineProgram(count + slots - 1, slots, lambda clk: _build_cycle(clk, compact_names=False))
 
     def __call__(self, context: RecipeContext) -> Program:
         c, layout = self.contract, self.layout
@@ -601,12 +690,36 @@ class _PagedMlaProgramBuilder:
                     yield Stage(f"split{local}", program=program, metadata={"split": split})
 
             stages = [Stage("splits", program=PipelineProgram(ceil_div(partials, lanes), 1, wave))]
-            for step in self._finish_steps(partials):
-                stages.append(self._stage(
-                    context, self._demand(step, live, seq=seq, query=query, heads=heads, partials=partials,
-                                          head_start=head_start), self.owners[owner_start],
-                    step, after=(stages[-1].name,), metadata={"nonempty_splits": partials},
+            if (c.abi == FIA_ABI and partials > 1 and lanes > 1
+                    and layout.head_tile >= NATIVE_FD_REDUCE_HEAD_TILE and live > FD_REDUCE_HEAD_GRAIN):
+                n_chunks = min(lanes, ceil_div(live, FD_REDUCE_HEAD_GRAIN))
+                base_h, extra_h = divmod(live, n_chunks)
+                finish_steps = self._finish_steps(partials)
+                def _reduce_chunk(idx: int) -> KernelProgram:
+                    ch_live = base_h + (1 if idx < extra_h else 0)
+                    ch_pair = self.owners[owner_start + idx]
+                    ch_stages: list[Stage] = []
+                    for step in finish_steps:
+                        dep = (ch_stages[-1].name,) if ch_stages else ()
+                        ch_stages.append(self._stage(
+                            context, self._demand(step, ch_live, seq=seq, query=query, heads=ch_live,
+                                                  partials=partials, head_start=head_start),
+                            ch_pair, step, after=dep, metadata={"nonempty_splits": partials},
+                        ))
+                    return KernelProgram(tuple(ch_stages))
+                stages.append(Stage(
+                    "fd_reduce", after=(stages[-1].name,),
+                    program=PipelineProgram(1, 1, lambda _i: tuple(
+                        Stage(f"reduce{k}", program=_reduce_chunk(k)) for k in range(n_chunks)
+                    )),
                 ))
+            else:
+                for step in self._finish_steps(partials):
+                    stages.append(self._stage(
+                        context, self._demand(step, live, seq=seq, query=query, heads=heads, partials=partials,
+                                              head_start=head_start), self.owners[owner_start],
+                        step, after=(stages[-1].name,), metadata={"nonempty_splits": partials},
+                    ))
             return KernelProgram(tuple(stages))
         def launch(index):
             start = index * groups_per_wave
@@ -640,7 +753,7 @@ def make_plan(op: OpSpec, ctx: OperatorPlanningContext, c: PagedMlaContract,
         raise capability_gap("paged_mla_unsupported_dtype", c.abi, ctx.compute_arch.arch_id)
     if pairs is None:
         pairs = owner_pairs(ctx, c.abi)
-    if layout.gm_workspace:
+    if layout.gm_workspace and layout.head_tile <= SINGLE_AIV_HEAD_LIMIT:
         pairs = tuple((aic, aivs[:1]) for aic, aivs in pairs)
     spans = planning_sequence_spans(ctx, c.kv_layout)
     raw = dict(op.metadata)
@@ -649,30 +762,26 @@ def make_plan(op: OpSpec, ctx: OperatorPlanningContext, c: PagedMlaContract,
     planning = ctx if spans and ctx.admission_memory_view is not None and c.block_table and tensor_id else None
     builder = _PagedMlaProgramBuilder(c, layout, dtype, pairs, row_cuts or {}, spans, planning, tensor_id, version)
     phase_totals = builder.totals()
+    if "l2" not in ctx.geometry.rates:
+        phase_totals = {k: Work(w.matrix, {r: v for r, v in w.resources.items() if r != "l2"}) for k, w in phase_totals.items()}
     total = sum(phase_totals.values(), Work())
     phases = []
     for step in ("sink_load", *layout.phases, "merge_read", "merge", "normalize", "store"):
         if (work := phase_totals.get(step)) is None:
             continue
-        items = tuple(WorkItem("cube", "flop", amount, precision)
-                      for precision, amount in work.matrix.items())
-        items += tuple(WorkItem(role, "op" if role == "vector" else "bytes", amount)
-                       for role, amount in work.resources.items())
-        predecessors = {
-            "release0": ("partial0",),
-            "release1": ("partial1", "release0"),
-        }.get(step, (phases[-1].phase_id,) if phases else ())
-        phases.append(PipelinePhase(step, predecessors, items))
+        items = (tuple(WorkItem("cube", "flop", a, p) for p, a in work.matrix.items())
+                 + tuple(WorkItem(r, "op" if r == "vector" else "bytes", a) for r, a in work.resources.items()))
+        preds = {"release0": ("partial0",), "release1": ("partial1", "release0")}.get(
+            step, (phases[-1].phase_id,) if phases else ())
+        phases.append(PipelinePhase(step, preds, items))
     return OperatorPlan(
         total, builder, metadata={
-            "implementation": c.abi, "arch_id": ctx.compute_arch.arch_id,
-            "governed_family": FAMILY, "s2_base_size": c.s2_base_size, "key_tile": layout.key_tile,
-            "dqk": c.dqk, "dv": c.dv, "useful_matrix_flops": c.useful_matrix_flops,
+            "implementation": c.abi, "arch_id": ctx.compute_arch.arch_id, "governed_family": FAMILY,
+            "s2_base_size": c.s2_base_size, "key_tile": layout.key_tile, "dqk": c.dqk, "dv": c.dv,
+            "useful_matrix_flops": c.useful_matrix_flops, "issued_matrix_flops": c.issued_matrix_flops,
             "latent_record_bytes": 0 if c.mixed_quant else latent_record_bytes(c, dtype=dtype),
-            "issued_matrix_flops": c.issued_matrix_flops,
             "scale_encoding": c.scale_encoding if c.mixed_quant else "", **metadata,
-            **sequence_layout_metadata(ctx, c.kv_layout),
-            **({"sinks": c.sinks} if c.sinks else {}),
+            **sequence_layout_metadata(ctx, c.kv_layout), **({"sinks": c.sinks} if c.sinks else {}),
         },
         pipeline_spec=FusedPipelineSpec(FAMILY, c.abi, tuple(phases), sources),
     )

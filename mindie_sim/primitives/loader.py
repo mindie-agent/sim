@@ -212,7 +212,7 @@ def load_primitives(
 _SIM_RATE_METRICS: tuple[tuple[str, str, str, str | None], ...] = (
     ("mte2_aic", "P01_datacopy", "mte2_aic_hit_bytes_per_s_per_core", "aic_count"),
     ("mte2_aiv", "P01_datacopy", "mte2_aiv_hit_bytes_per_s_per_core", "aiv_count"),
-    ("fixpipe", "P03_fixpipe", "fixpipe_out_bytes_per_s_per_aic", "aic_count"),
+    ("fixpipe", "P03_fixpipe", "fixpipe_in_bytes_per_s_per_aic", "aic_count"),
     ("mte3", "P04_mte3_store", "mte3_store_bytes_per_s_per_aiv", "aiv_count"),
     ("l2", "P05_l2_residency_reuse", "l2_die_bytes_per_s", None),
     ("vector", "P07_vec_alu", "vec_alu_ops_per_s_per_aiv", "aiv_count"),
@@ -240,6 +240,7 @@ class CalibratedRateOverlay:
     compute_peaks: tuple[tuple[str, float], ...] = ()
     hbm_read_bytes_per_s: float | None = None
     hbm_write_bytes_per_s: float | None = None
+    hbm_rw21_bytes_per_s: float | None = None
     hbm_rw_alpha: float | None = None
     coverage_gaps: tuple[str, ...] = ()
 
@@ -248,7 +249,8 @@ class CalibratedRateOverlay:
         return (
             self.sku, self.cann_version, self.envelope_sha256,
             self.rates, self.compute_peaks,
-            self.hbm_read_bytes_per_s, self.hbm_write_bytes_per_s, self.hbm_rw_alpha,
+            self.hbm_read_bytes_per_s, self.hbm_write_bytes_per_s,
+            self.hbm_rw21_bytes_per_s, self.hbm_rw_alpha,
         )
 
 
@@ -357,10 +359,13 @@ def resolve_sim_rate_overlay(
     gaps: list[str] = []
     hbm_r = _table_band_p50(table, "P01_datacopy", "hbm_read_bytes_per_s")
     hbm_w = _table_band_p50(table, "P01_datacopy", "hbm_write_bytes_per_s")
+    hbm_rw21 = _table_band_p50(table, "P01_datacopy", "hbm_rw21_bytes_per_s")
     if hbm_r is not None and datapath.hbm_read_bytes_per_s > 0.0:
         hbm_r = min(hbm_r, datapath.hbm_read_bytes_per_s)
     if hbm_w is not None and datapath.hbm_write_bytes_per_s > 0.0:
         hbm_w = min(hbm_w, datapath.hbm_write_bytes_per_s)
+    if hbm_rw21 is not None and datapath.hbm_read_bytes_per_s > 0.0:
+        hbm_rw21 = min(hbm_rw21, datapath.hbm_read_bytes_per_s)
     hbm_alpha_val = None
     try:
         alpha_band = table.cell("P01_datacopy").band("hbm_rw_alpha")
@@ -400,6 +405,7 @@ def resolve_sim_rate_overlay(
         compute_peaks=tuple(sorted(peaks_map.items())),
         hbm_read_bytes_per_s=hbm_r,
         hbm_write_bytes_per_s=hbm_w,
+        hbm_rw21_bytes_per_s=hbm_rw21,
         hbm_rw_alpha=hbm_alpha_val,
         coverage_gaps=tuple(sorted(dict.fromkeys(gaps))),
     )

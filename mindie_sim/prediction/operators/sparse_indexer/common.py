@@ -119,11 +119,11 @@ class SparseIndexerContract:
     return_choice: int | None = None
     compress_ratio: int = 1
     residual_tokens: int = 0
+    native_split_core: bool = False
 
     def __post_init__(self) -> None:
         if self.abi in MSA_ABIS and self.return_choice is not None:
             object.__setattr__(self, "fused_topk", self.return_choice != 0)
-
     @property
     def matrix_flops(self) -> int:
         return 2 * self.query_tokens * self.scanned_rows * self.index_heads * self.index_dim

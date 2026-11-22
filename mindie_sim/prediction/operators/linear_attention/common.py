@@ -55,11 +55,13 @@ FLASH_KDA_TEMPLATE_BY_ABI = {"flash_kda_persistent": "persistent", "flash_kda_st
 ABI_OPERATIONS = {
     **dict.fromkeys(CHUNK32_ABIS, "gdn_chunk32"),
     **dict.fromkeys(FLA_GDN_ABIS | {CANN_GDN_ABI, "aclnnChunkGatedDeltaRuleArch22"}, "gdn_prefill"),
-    "aclnnChunkGatedDeltaRuleArch35": "gdn_prefill",
-    "gdn_prefill_arch35": "gdn_prefill",
+    "aclnnChunkGatedDeltaRuleArch35": "gdn_prefill", "gdn_prefill_arch35": "gdn_prefill",
+    "aclnnRecurrentGatedDeltaRule": "gdn_recurrent",
     **dict.fromkeys(FLASH_KDA_TEMPLATE_BY_ABI, "kda_prefill"),
     "flash_kda": "kda_prefill", "flash_kda_arch35": "kda_prefill",
-    "fused_recurrent_kda": "kda_recurrent",
+    "vllm_ascend.ops.triton.kda.kda.chunk_kda": "kda_prefill", "triton_chunk_kda": "kda_prefill",
+    "fused_recurrent_kda": "kda_recurrent", "triton_recurrent_kda": "kda_recurrent",
+    "vllm_ascend.ops.triton.kda.kda.fused_recurrent_kda": "kda_recurrent",
     "causal_conv1d_update": "causal_conv1d", "commit_recurrent_kda": "recover_ssm_commit",
 }
 OPERATIONS = frozenset({
@@ -68,14 +70,11 @@ OPERATIONS = frozenset({
 })
 RECOVER_SSM_FAMILIES = ("kda", "gdn", "deltanet", "gla", "lightning", "retnet", "mamba")
 RECTANGULAR_LAYOUTS = frozenset({"BSND", "BNSD", "BSH"})
-
 def ceil_div(value: int, width: int) -> int:
     return (value + width - 1) // width
-
 def _positive(*values: int) -> None:
     if any(type(value) is not int or value < 1 for value in values):
         raise ModelingError("linear_attention_requires_positive_integer_geometry")
-
 def _lengths(lengths: Sequence[int]) -> tuple[int, ...]:
     if not isinstance(lengths, (list, tuple)) or not lengths:
         raise ModelingError("linear_attention_requires_sequence_lengths")

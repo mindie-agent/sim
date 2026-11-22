@@ -25,10 +25,10 @@ from ._cp_tiling import (
     with_collectives,
 )
 from .common import (
-    ARCH22, ARCH35, C8_ABI, C8_LATENT_DIM, FIA_ABI, FIA_TILE,
+    ARCH22, ARCH35, C8_ABI, C8_LATENT_DIM, C8_V1_ABI, FIA_ABI, FIA_TILE,
     GBSA_ABI, MINDIE_ABIS, MINDIE_V3_ABI, NOPE_ABI, QUANT_MODE_BF16, QUANT_MODE_FP8_C8, QUANT_MODE_INT8_C8,
     QUANT_MODE_MINDIE_FP8, QUANT_MODE_MXFP4_CX, QUANT_MODE_MXFP4_OCP, QUANT_MODE_MXFP8, QUANT_MODE_TQ4,
-    SUPPORTED_QUANT_MODES, AttentionContract, ContextParallelPlan,
+    SFA_V1_ABI, SUPPORTED_QUANT_MODES, AttentionContract, ContextParallelPlan,
     FiaPanelPlan, bsh_kv_access_plan, c8_gather_accounting, describe, lower_cp_collectives,
     shipping_fia_panel_plan, solve_wide_head_tiling, unmodeled, with_sequence_context,
 )
@@ -40,6 +40,7 @@ SPARSE_FLASH_MLA_NOPE_RECIPE = "sparse_flash_mla_nope_arch35"
 LEGACY_RECIPES = frozenset({GBSA_RECIPE, KV_QUANT_SFA_C8_RECIPE, SPARSE_FLASH_MLA_NOPE_RECIPE})
 RECIPE_BY_ABI = {
     FIA_ABI: FIA_RECIPE, GBSA_ABI: GBSA_RECIPE, C8_ABI: KV_QUANT_SFA_C8_RECIPE,
+    C8_V1_ABI: C8_V1_ABI, SFA_V1_ABI: SFA_V1_ABI,
     NOPE_ABI: SPARSE_FLASH_MLA_NOPE_RECIPE, **{abi: abi for abi in MINDIE_ABIS},
 }
 ABI_BY_RECIPE = {recipe: abi for abi, recipe in RECIPE_BY_ABI.items()}
@@ -134,6 +135,8 @@ def _planning_context(op: OpSpec, geometry: Geometry) -> OperatorPlanningContext
 
 def build(op: OpSpec, ctx: OperatorPlanningContext | Geometry, /) -> OperatorPlan:
     """Build the source-bound attention kernel at either planning entrypoint."""
+    if op.recipe == RING_UPDATE_RECIPE:
+        return build_ring_update(op, ctx)
     if isinstance(ctx, Geometry):
         ctx = _planning_context(op, ctx)
     ctx = with_sequence_context(op, ctx)
@@ -160,6 +163,9 @@ def build(op: OpSpec, ctx: OperatorPlanningContext | Geometry, /) -> OperatorPla
 
 def resolve_operator_plan(op: OpSpec, ctx: OperatorPlanningContext, /) -> ResolvedOperator:
     """Return the kernel program and occurrence-bound pipeline projection."""
+    if op.recipe == RING_UPDATE_RECIPE:
+        plan = build_ring_update(op, ctx)
+        return ResolvedOperator(ctx.occurrence, op, plan, RING_UPDATE_RECIPE, RING_UPDATE_SOURCES, None)
     plan = build(op, ctx)
     descriptor = describe(op, ctx, plan)
     return ResolvedOperator(ctx.occurrence, op, plan, descriptor.implementation, descriptor.sources, descriptor)
@@ -167,8 +173,8 @@ def resolve_operator_plan(op: OpSpec, ctx: OperatorPlanningContext, /) -> Resolv
 
 def register_family() -> OperatorFamilySpec:
     """Declare the governed family's exact owned recipe IDs."""
-    return OperatorFamilySpec("attention", frozenset({"attention", "mla"}), frozenset(ABI_BY_RECIPE),
-                              resolve_operator_plan)
+    return OperatorFamilySpec("attention", frozenset({"attention", "mla"}),
+                              frozenset((*ABI_BY_RECIPE, RING_UPDATE_RECIPE)), resolve_operator_plan)
 
 
 def _kernels(op: OpSpec) -> tuple[OpSpec, ...]:
@@ -185,7 +191,11 @@ def _kernels(op: OpSpec) -> tuple[OpSpec, ...]:
 def recipes() -> dict[str, PlannedRecipe | PairwiseCollective]:
     """Expose exact recipe bindings through the existing source-recipe entrypoint."""
     planner = PlannedRecipe(build, _kernels)
-    return {OUTPUT_LSE_EXCHANGE_RECIPE: PairwiseCollective(), **{recipe: planner for recipe in ABI_BY_RECIPE}}
+    return {
+        OUTPUT_LSE_EXCHANGE_RECIPE: PairwiseCollective(),
+        RING_UPDATE_RECIPE: PlannedRecipe(build_ring_update),
+        **{recipe: planner for recipe in ABI_BY_RECIPE},
+    }
 
 
 def make_attention_op(
@@ -260,8 +270,14 @@ def make_kv_quant_sfa_c8_op(
     return make_attention_op(contract, op_id=op_id, deps=deps, stage=stage, layer=layer, requests=requests)
 
 
+from ..vector.ring_update import (
+    RING_UPDATE_ABI, RING_UPDATE_RECIPE, RING_UPDATE_SOURCES, RingUpdateContract,
+    build_ring_update, make_ring_update_op,
+)
+
 __all__ = [
     "build", "resolve_operator_plan", "register_family", "AttentionContract", "ContextParallelPlan",
     "c8_gather_accounting", "bsh_kv_access_plan", "solve_wide_head_tiling", "shipping_fia_panel_plan",
     "lower_cp_collectives", "make_gbsa_op", "make_kv_quant_sfa_c8_op", "make_attention_op",
+    "RING_UPDATE_ABI", "RING_UPDATE_RECIPE", "RingUpdateContract", "build_ring_update", "make_ring_update_op",
 ]

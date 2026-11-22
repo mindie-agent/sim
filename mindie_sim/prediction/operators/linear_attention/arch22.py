@@ -20,6 +20,13 @@ from ...mechanism import OperatorPlan, Work
 from ...program import KernelProgram, PipelineProgram, RecipeContext, Stage
 from ...runtime.ring_buffer import RingBuffer, lower_generation
 from ..contracts import OperatorPlanningContext
+from ..kda.triton_kda import (
+    TRITON_KDA_CHUNK_ABIS, TRITON_KDA_RECURRENT_ABIS, build_triton_chunk_kda, build_triton_recurrent_kda,
+)
+from ..matrix.refill_steady import compact_periodic_pipeline
+from ..sharedkv.l0_sync import p12_flag_ms, p13_paired_ms, p13_syncall_ms
+from ..sharedkv.split_core import p01_cold_hbm_group_cap
+from ._gdn_native import RECURRENT_GDN_ABI, build_native_recurrent_gdn
 from .common import (
     FLA_GDN_ABIS, FP32_BYTES, CausalConvContract, LinearAttentionContract, Phase, analyze_state_residency,
     bind_phase, ceil_div, compute_wy_chunk_work, element_bytes, make_plan, missing,
@@ -54,6 +61,26 @@ WY_PREPARE_KEY_PANELS = 5
 WY_PREPARE_SCORE_PANELS = 4
 WY_RECURRENCE_KEY_PANELS = 3
 STATE_UPDATE_OPS_PER_ELEMENT = 3
+# Arch22 chunk_gated_delta_rule_stage{1,2,3}_arch22.h op counts (zero fitted timings)
+ARCH22_STAGE1_INV_FMAS_PER_HEAD = 31_744
+ARCH22_STAGE1_INV_BCAST_MULT = 3
+ARCH22_STAGE1_GBK_OPS_PER_ELEM = 4
+ARCH22_STAGE1_INV_FLAG_ROUNDS = 31 * 4  # 31 dependent scalar/vector sync rounds per head-chunk
+ARCH22_STAGE1_SCRATCH_READ_KEY_PANELS = 6  # stage1_arch22.h:298-799 (queryCon,keyCon,gBK,vBeta,kkWs,attnWs)
+ARCH22_STAGE1_SCRATCH_READ_VAL_PANELS = 2
+ARCH22_STAGE1_SCRATCH_READ_SCORE_PANELS = 4
+ARCH22_STAGE1_SCRATCH_WRITE_KEY_PANELS = 4
+ARCH22_STAGE1_SCRATCH_WRITE_VAL_PANELS = 1
+ARCH22_STAGE1_EXP_SCORE_MULT = 3  # 3*C^2 + 3*C + 1 exp ops across stages 1-3 (stage1_arch22.h:433,619)
+ARCH22_STAGE1_EXP_SFU_WEIGHT = 4  # P07/P08 SFU ratio fallback
+ARCH22_STAGE1_CROSSCORE_BATCH = 4
+ARCH22_STAGE1_CROSSCORE_SYNCS = 6  # 6 CrossCore notifications per 4-head-chunk batch
+ARCH22_STAGE3_CROSSCORE_SYNCS = 2  # 2 CrossCore notifications per head-chunk (stage3_arch22.h:114)
+ARCH22_STAGE3_MASK_OPS_PER_SCORE = 12
+ARCH22_STAGE2_PAIRED_SYNCS_PER_CHUNK = 3  # 3 CrossCore flags per chunk (stage2_arch22.h)
+ARCH22_STAGE2_AIV_CAST_MUL_OPS = 3  # AIV0 bf16->fp32->mul->bf16 (stage2_arch22.h:157)
+ARCH22_COMPACT_GROUP_THRESHOLD = 20
+ARCH22_COMPACT_WINDOW = 2
 ARCH35_ABIS = frozenset({
     "aclnnChunkGatedDeltaRuleArch35", "gdn_prefill_arch35", "flash_kda_persistent",
     "flash_kda_arch35", "causal_conv1d_update", "commit_recurrent_kda",
@@ -74,15 +101,16 @@ def _rolling_chunk_phases(c: LinearAttentionContract, ctx: OperatorPlanningConte
         Phase("read_rolling_state",
               transfer(ctx, read=state_bytes * load_state + heads * FP32_BYTES)),
         Phase("R_O_inter",
-              transfer(ctx, read=2 * key + value + 2 * state_bytes * load_state, aiv=False)
+              transfer(ctx, read=2 * key + 2 * value + 2 * state_bytes * load_state, aiv=False)
               + Work({c.dtype: heads * (w.r_flops + w.o_inter_flops)}, {
                   "mte1": 2 * key + value + 2 * state_bytes, "fixpipe": 2 * value, "hbm": 2 * value,
               }), ("read_rolling_state",)),
         Phase("write_decayed_state",
               transfer(ctx, write=state_bytes)
-              + Work(resources={"vector": heads * (w.cast_ops + w.state_update_ops)}), ("R_O_inter",)),
+              + Work(resources={"vector": heads * (w.cast_ops + w.state_update_ops + ARCH22_STAGE2_AIV_CAST_MUL_OPS * c.dk * c.dv)}),
+              ("R_O_inter",)),
         Phase("write_rolling_state",
-              transfer(ctx, read=key, aiv=False) + Work({c.dtype: heads * w.delta_flops}, {
+              transfer(ctx, read=key + state_bytes, aiv=False) + Work({c.dtype: heads * w.delta_flops}, {
                   "mte1": key + value, "fixpipe": state_bytes, "hbm": state_bytes,
               }), ("write_decayed_state",)),
     )
@@ -107,6 +135,13 @@ def _work_for_group(c: LinearAttentionContract, ctx: OperatorPlanningContext, ro
         "qkt": scores * elem,
     }
     prepare_vec = sum(n * (w.gate_ops + w.mask_ops + w.diag_inv_ops) for _, n, w in work)
+    if rolling:
+        head_chunks = sum(count for _, count, _ in work)
+        exp_ops = head_chunks * (ARCH22_STAGE1_EXP_SCORE_MULT * c.bt * c.bt + ARCH22_STAGE1_EXP_SCORE_MULT * c.bt + 1)
+        prepare_vec += head_chunks * (
+            ARCH22_STAGE1_INV_BCAST_MULT * ARCH22_STAGE1_INV_FMAS_PER_HEAD
+            + ARCH22_STAGE1_GBK_OPS_PER_ELEM * c.bt * (2 * c.dk + c.dv)
+        ) + exp_ops * ARCH22_STAGE1_EXP_SFU_WEIGHT
     prepare_cube = sum(n * (w.kkt_flops + w.qkt_flops + w.offdiag_inv_flops
                             + w.kcd_flops + w.u_flops) for _, n, w in work)
     state_cube = sum(n * (w.r_flops + w.delta_flops + w.o_inter_flops) for _, n, w in work)
@@ -128,7 +163,19 @@ def _work_for_group(c: LinearAttentionContract, ctx: OperatorPlanningContext, ro
     cube_workspace = workspace["kCumDecay"] + v_bytes + workspace["qkt"] + matrix_save
     vector_workspace = workspace["gCum"] + workspace["qPrime"] + workspace["kg"]
     recurrence_inputs = workspace["kCumDecay"] + v_bytes + workspace["qPrime"] + workspace["kg"]
-    prepare = transfer(ctx, read=inputs, write=vector_workspace) + Work(
+    s1_scratch_read = (
+        (ARCH22_STAGE1_SCRATCH_READ_KEY_PANELS * tokens * c.dk
+         + ARCH22_STAGE1_SCRATCH_READ_VAL_PANELS * tokens * c.dv
+         + ARCH22_STAGE1_SCRATCH_READ_SCORE_PANELS * scores) * elem
+        if rolling else 0
+    )
+    s1_scratch_write = (
+        (ARCH22_STAGE1_SCRATCH_WRITE_KEY_PANELS * tokens * c.dk
+         + ARCH22_STAGE1_SCRATCH_WRITE_VAL_PANELS * tokens * c.dv) * elem
+        + scores * elem // 2
+        if rolling else 0
+    )
+    prepare = transfer(ctx, read=inputs + s1_scratch_read, write=vector_workspace + s1_scratch_write) + Work(
         {c.dtype: prepare_cube}, {
             "hbm": cube_workspace,
             "mte1": (tokens * (WY_PREPARE_KEY_PANELS * c.dk + c.dv) + WY_PREPARE_SCORE_PANELS * scores) * elem,
@@ -161,11 +208,13 @@ def _work_for_group(c: LinearAttentionContract, ctx: OperatorPlanningContext, ro
             })
         )
     # Stage 3 combines the GM residual and scores with the existing O_inter.
+    output_vec = ARCH22_STAGE3_MASK_OPS_PER_SCORE * scores if rolling else 0
     output = (
         transfer(ctx, read=workspace["qkt"] + workspace["gCum"], write=workspace["qkt"])
         + transfer(ctx, read=workspace["qkt"] + 2 * v_bytes, aiv=False)
         + Work({c.dtype: output_cube}, {"hbm": v_bytes, "fixpipe": v_bytes,
-                                       "mte1": workspace["qkt"] + v_bytes})
+                                       "mte1": workspace["qkt"] + v_bytes,
+                                       **({"vector": output_vec} if output_vec else {})})
     )
     phases = (
         Phase("RunStage1", prepare, ("SyncAll.entry",)),
@@ -176,6 +225,90 @@ def _work_for_group(c: LinearAttentionContract, ctx: OperatorPlanningContext, ro
         Phase("SyncAll.output", Work(), ("RunStage3",)),
     )
     return phases, workspace
+
+
+def _lower_rolling_group(
+    c: LinearAttentionContract, ctx: OperatorPlanningContext, rc: RecipeContext,
+    pairs: tuple[tuple[int, tuple[int, ...]], ...], used: tuple[tuple[int, tuple[int, ...]], ...],
+    cores: tuple[int, ...], phases: tuple[Phase, ...], bound: tuple[Stage, ...],
+    key: tuple[int, bool, bool], chunks: int, sequence: int,
+    position: int, index: int, spans: list[tuple[int, tuple[int, bool, bool], int]],
+    ends: tuple[int, ...], groups: int,
+) -> tuple[Stage, ...]:
+    """Lower Arch22 rolling GDN stages 1-3 with P01 cold-core caps and P12/P13 syncs."""
+    rows, load_state, _ = key
+    # Stage 2 binds headsPerCore = ceil(Nv / AIC) -> min(AIC, Nv) AICs + AIV0 subblocks
+    # (chunk_gated_delta_rule_stage2_arch22.h:91-115).
+    stage2_used = pairs[:min(len(pairs), c.hv)]
+    stage2_cores = tuple(aic for aic, _ in stage2_used)
+    stage2_aiv0 = tuple(peers[0] for _, peers in stage2_used)
+    stage3_aiv0 = tuple(peers[0] for _, peers in used)
+    stage2_caps = p01_cold_hbm_group_cap(rc, len(stage2_cores))
+    full_caps = p01_cold_hbm_group_cap(rc, len(cores))
+    chunk_sync_ms = ARCH22_STAGE2_PAIRED_SYNCS_PER_CHUNK * p13_paired_ms(rc)
+    sync_all_ms = p13_syncall_ms(rc)
+    slot_bytes = c.dk * c.dv * element_bytes("bf16")
+    slot = {"state_slot": "rolling_final_state", "sequence": sequence,
+            "base_byte": sequence * c.hv * slot_bytes, "head_stride_bytes": slot_bytes}
+    first_group = (position == 0 or spans[position - 1][2] != sequence) and (
+        index == 0 or index == ends[position - 1]
+    )
+
+    def _with_caps(st: Stage, cap_map: dict[str, float]) -> Stage:
+        if not cap_map:
+            return st
+        applied = {k: v for k, v in cap_map.items() if k in st.work}
+        return replace(st, caps={**st.caps, **applied}) if applied else st
+
+    def chunk_tile(chunk: int) -> tuple[Stage, ...]:
+        valid = min(c.bt, rows - chunk * c.bt)
+        loaded = load_state or chunk > 0
+        stages = tuple(replace(_with_caps(bind_phase(p, rc, ctx, stage2_cores, stage2_aiv0), stage2_caps),
+                               metadata={"phase": p.name, **slot})
+                       for p in _rolling_chunk_phases(c, ctx, valid, loaded))
+        if chunk_sync_ms > 0.0:
+            read = replace(stages[0], previous=("stage2_crosscore_sync",),
+                           metadata={**stages[0].metadata,
+                                     "initial_state_read": first_group and chunk == 0 and loaded})
+            sync = Stage("stage2_crosscore_sync", after=("write_rolling_state",),
+                         latency=chunk_sync_ms, keep_empty=True)
+            return (read, *stages[1:], sync)
+        read = replace(stages[0], previous=("write_rolling_state",),
+                       metadata={**stages[0].metadata,
+                                 "initial_state_read": first_group and chunk == 0 and loaded})
+        return (read, *stages[1:])
+
+    stage2_prog = (
+        compact_periodic_pipeline(
+            rc, chunks, 1, chunk_tile,
+            head=ARCH22_COMPACT_WINDOW, tail=ARCH22_COMPACT_WINDOW,
+            threshold=ARCH22_COMPACT_WINDOW * 2,
+        )
+        if groups > ARCH22_COMPACT_GROUP_THRESHOLD else PipelineProgram(chunks, 1, chunk_tile)
+    )
+    stage1_jobs_per_core = ceil_div(chunks * c.hv, max(1, len(used)))
+    stage1_cc_ms = ceil_div(stage1_jobs_per_core, ARCH22_STAGE1_CROSSCORE_BATCH) * ARCH22_STAGE1_CROSSCORE_SYNCS * p13_paired_ms(rc)
+    stage1_sync_ms = stage1_jobs_per_core * ARCH22_STAGE1_INV_FLAG_ROUNDS * p12_flag_ms(rc) + stage1_cc_ms
+    s1_capped = _with_caps(bound[0], full_caps)
+    stage1_bound = (
+        Stage(s1_capped.name, after=s1_capped.after, program=KernelProgram((
+            replace(s1_capped, after=()),
+            Stage("stage1_sync", after=(s1_capped.name,), latency=stage1_sync_ms, keep_empty=True),
+        ))) if stage1_sync_ms > 0.0 else s1_capped
+    )
+    stage2 = replace(bound[2], work={}, placement={}, program=stage2_prog)
+    stage3_cc_ms = stage1_jobs_per_core * ARCH22_STAGE3_CROSSCORE_SYNCS * p13_paired_ms(rc)
+    s3_raw = _with_caps(bind_phase(phases[4], rc, ctx, cores, stage3_aiv0), full_caps)
+    stage3 = (
+        Stage(s3_raw.name, after=s3_raw.after, program=KernelProgram((
+            replace(s3_raw, after=()),
+            Stage("stage3_sync", after=(s3_raw.name,), latency=stage3_cc_ms, keep_empty=True),
+        ))) if stage3_cc_ms > 0.0 else s3_raw
+    )
+    return (
+        stage1_bound, replace(bound[1], latency=sync_all_ms), stage2,
+        replace(bound[3], latency=sync_all_ms), stage3, replace(bound[5], latency=sync_all_ms),
+    )
 
 
 def _build_staged(c: LinearAttentionContract, ctx: OperatorPlanningContext) -> OperatorPlan:
@@ -239,37 +372,19 @@ def _build_staged(c: LinearAttentionContract, ctx: OperatorPlanningContext) -> O
             credit, write, publish, read, last = ring.to_stages()
             bound = tuple(bind_phase(p, rc, ctx, cores, vectors) for p in phases)
             if rolling:
-                rows, load_state, _ = key
-                # The sequence/head bank is contiguous. Each chunk reuses its base.
-                slot_bytes = c.dk * c.dv * element_bytes("bf16")
-                slot = {"state_slot": "rolling_final_state", "sequence": sequence,
-                        "base_byte": sequence * c.hv * slot_bytes, "head_stride_bytes": slot_bytes}
-
-                first_group = (position == 0 or spans[position - 1][2] != sequence) and (
-                    index == 0 or index == ends[position - 1]
+                bound = _lower_rolling_group(
+                    c, ctx, rc, pairs, used, cores, phases, bound,
+                    key, chunks, sequence, position, index, spans, ends, groups,
                 )
-
-                def chunk_tile(chunk: int) -> tuple[Stage, ...]:
-                    valid = min(c.bt, rows - chunk * c.bt)
-                    loaded = load_state or chunk > 0
-                    stages = tuple(replace(bind_phase(p, rc, ctx, cores, vectors),
-                                           metadata={"phase": p.name, **slot})
-                                   for p in _rolling_chunk_phases(c, ctx, valid, loaded))
-                    read = replace(stages[0], previous=("write_rolling_state",),
-                                   metadata={**stages[0].metadata,
-                                             "initial_state_read": first_group and chunk == 0 and loaded})
-                    return (read, *stages[1:])
-
-                stage2 = replace(bound[2], work={}, placement={}, program=PipelineProgram(chunks, 1, chunk_tile))
-                bound = (*bound[:2], stage2, *bound[3:])
             return (
                 replace(bound[0], after=()), *bound[1:4], credit, write, publish,
                 replace(bound[4], after=(events.publish,)), replace(read, after=("RunStage3",)),
                 last, replace(bound[5], after=(events.last_use,)),
             )
 
+        entry_latency = p13_syncall_ms(rc) if rolling else 0.0
         return KernelProgram((
-            Stage("SyncAll.entry", keep_empty=True),
+            Stage("SyncAll.entry", latency=entry_latency, keep_empty=True),
             Stage("chunk_groups", after=("SyncAll.entry",), program=PipelineProgram(groups, 1, tile)),
         ))
 
@@ -385,6 +500,12 @@ class Arch22LinearAttentionStrategy:
         if not c.lengths:
             return make_plan(ctx, c.abi or c.operation, (),
                              metadata={"total_chunks": 0, "state_contraction_ops": 0})
+        if c.abi in TRITON_KDA_CHUNK_ABIS:
+            return build_triton_chunk_kda(c, ctx)
+        if c.abi in TRITON_KDA_RECURRENT_ABIS:
+            return build_triton_recurrent_kda(c, ctx)
+        if c.abi == RECURRENT_GDN_ABI:
+            return build_native_recurrent_gdn(c, ctx)
         if c.operation.endswith("_prefill"):
             return _build_staged(c, ctx)
         return _build_recurrent(c, ctx)

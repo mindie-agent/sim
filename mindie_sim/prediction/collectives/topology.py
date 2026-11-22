@@ -26,7 +26,7 @@ from __future__ import annotations
 
 from collections import deque
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import math
 
 from mindie_sim.schema.common import ModelingError
@@ -69,6 +69,8 @@ from .transport import (
 
 MAX_ROUTE_CACHE_ENTRIES = 8192
 UNDECLARED_SCOPE_PRIORITY = 3
+NS_PER_US_TOPO = 1000.0
+P18_PRIMITIVE_ID = "P18_hccl_collective_band"
 _SCOPE_PRIORITY = {
     "package": 0,
     "node": 1,
@@ -142,13 +144,39 @@ class TopologyCommunicationWork(CommunicationWork):
 
 class Topology(_TopologyPlansMixin):
     def __init__(self, machine, parallel, namespace="", *,
-                 collective_startup_mode="legacy"):
+                 collective_startup_mode="legacy", primitive_table=None):
         self.machine, self.parallel = machine, parallel
         self.namespace = namespace
         self.collective_startup_mode = collective_startup_mode
         self.collective_protocols = dict(
             getattr(machine, "collective_protocols", ()) or ())
         self.links = {link.name: link for link in machine.links}
+        self.p18_startup_us = 0.0
+        self.p18_eager_startup_us = 0.0
+        self._p18_link_bytes_per_ms = 0.0
+        self._p18_measured_scope = ""
+        self._p18_measured_collective = ""
+        self._p18_measured_world_size = 0
+        if primitive_table is not None and hasattr(primitive_table, "cell"):
+            try:
+                p18 = primitive_table.cell(P18_PRIMITIVE_ID)
+            except ModelingError:
+                p18 = None
+            if p18 is not None:
+                p18_params = p18.parameters or {}
+                self._p18_measured_scope = str(p18_params.get("measured_scope") or "")
+                raw_coll = str(p18_params.get("measured_collective") or "all_reduce").strip().lower()
+                self._p18_measured_collective = raw_coll.replace("_", "") if raw_coll in {"all_reduce", "all_gather"} else raw_coll
+                self._p18_measured_world_size = int(p18_params.get("measured_world_size") or 0)
+                lb = p18.metrics.get("link_bytes_per_s")
+                if lb is not None and lb.p50 is not None and float(lb.p50) > 0.0:
+                    self._p18_link_bytes_per_ms = float(lb.p50) / MS_PER_S
+                sb = p18.metrics.get("startup_blocked_ns")
+                if sb is not None and sb.p50 is not None and float(sb.p50) > 0.0:
+                    self.p18_startup_us = float(sb.p50) / NS_PER_US_TOPO
+                se = p18.metrics.get("startup_ns")
+                if se is not None and se.p50 is not None and float(se.p50) > 0.0:
+                    self.p18_eager_startup_us = float(se.p50) / NS_PER_US_TOPO
         self.routes = {}
         width = max(1, int(getattr(machine, "ranks_per_node", 1) or 1))
         self._ranks_per_node = width
@@ -194,6 +222,11 @@ class Topology(_TopologyPlansMixin):
             name: _link_scope(link, self._channel_decls.get(link.channel))
             for name, link in self.links.items()
         }
+        if self._p18_link_bytes_per_ms > 0.0:
+            p18_scope = self._p18_measured_scope or ("package" if self._dies_per_package >= 2 else "node")
+            for name, link in list(self.links.items()):
+                if self._link_scope.get(name) == p18_scope and link.capacity_bytes_per_ms > self._p18_link_bytes_per_ms:
+                    self.links[name] = replace(link, capacity_bytes_per_ms=self._p18_link_bytes_per_ms)
         self._ordered_links = tuple(sorted(
             self.links.values(),
             key=lambda item: (
@@ -234,6 +267,25 @@ class Topology(_TopologyPlansMixin):
         if key in self._rank_package:
             return (node, self._rank_package[key])
         return (node, key // self._dies_per_package)
+
+    def p18_matched_startup_us(self, collective: str, group: tuple[int, ...], *, stack: str) -> float:
+        """Return P18 startup only when collective, world size, route scope, and stack all match."""
+        if not group or len(group) < 2:
+            return 0.0
+        if self._p18_measured_collective and collective != self._p18_measured_collective:
+            return 0.0
+        if self._p18_measured_world_size > 0 and len(group) != self._p18_measured_world_size:
+            return 0.0
+        p18_scope = self._p18_measured_scope or ("package" if self._dies_per_package >= 2 else "node")
+        same_pkg = len({self._package_key(r) for r in group}) == 1
+        same_node = len({self._node_of(r) for r in group}) == 1
+        if p18_scope == "package" and not same_pkg:
+            return 0.0
+        if p18_scope == "node" and (not same_node or (self._dies_per_package >= 2 and same_pkg)):
+            return 0.0
+        if stack == "eager":
+            return float(self.p18_eager_startup_us)
+        return float(self.p18_startup_us)
 
     def link_protocol_bands(self, link_name: str):
         """Return piecewise ``CollectiveBandSpec``s declared on link or channel."""

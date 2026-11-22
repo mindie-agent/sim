@@ -46,6 +46,12 @@ owns = ["mindie_sim/study.py", "mindie_sim/catalog/expert_slots.py", "mindie_sim
 path = "schema/test_l0_primitives.py"
 tier = "tier0"
 owns = ["mindie_sim/primitives", "data/primitives", "tools/bench_l0_primitives.py"]
+
+[[module]]
+path = "schema/test_l0_calibration_integrity.py"
+tier = "tier0"
+owns = ["data/primitives", "tools/_bench_l0_bounds.py"]
+
 # ---------------------------------------------------------------- runtime
 [[module]]
 path = "runtime/test_engine_core.py"
@@ -430,6 +436,16 @@ path = "operators/test_sparse_indexer_topk.py"
 tier = "tier0"
 owns = ["mindie_sim/prediction/operators/sparse_indexer"]
 # ---------------------------------------------------------------- product
+[[module]]
+path = "operators/test_fleet_400k_heldout_verification.py"
+tier = "tier0"
+owns = [
+  "data/verification/all-skus-512-400k-cliff-heldout-20261121.json",
+  "data/verification/all-skus-512-400k-cliff-heldout-20261121.producer.py",
+  "mindie_sim/prediction/operators/sharedkv/split_core.py",
+  "mindie_sim/prediction/operators/sharedkv/l0_sync.py",
+]
+
 [[module]]
 path = "product/test_rewrite_oracle.py"
 tier = "tier0"

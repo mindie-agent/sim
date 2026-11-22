@@ -1,47 +1,482 @@
 {
   "arch_preset": "npu_arch_2201",
   "cann_version": "9.3.0",
-  "envelope_sha256": "f3e9e2180ddd2e6afaa9396b89e493d0892389406ed595603e9e197f43ccc880",
+  "envelope_sha256": "bebb0d9e4294702112e631629b053bf0b594fe11bb338e11076d13a54c9612b2",
   "primitives": {
     "P01_datacopy": {
-      "evidence_id": "",
+      "evidence_id": "capture://a3-9362-ep/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
       "metrics": {
         "hbm_read_bytes_per_s": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 1200000000000.0
+          "certified_upper_capacity": 1600000000000.0,
+          "cv_pct": 0.5235,
+          "n_samples": 24,
+          "p05": 1474717260307.4294,
+          "p50": 1483833998191.214,
+          "p95": 1495870913387.7844,
+          "p99": 1498964988123.462,
+          "trimmed_cv_pct": 0.3926,
+          "trimmed_mean": 1485256890199.3188
+        },
+        "hbm_rw11_bytes_per_s": {
+          "bound_kind": "rate_upper",
+          "certified_upper_capacity": 1600000000000.0,
+          "cv_pct": 0.3847,
+          "n_samples": 24,
+          "p05": 1228079433858.1113,
+          "p50": 1237828371099.6614,
+          "p95": 1243079105524.3447,
+          "p99": 1243660745290.1594,
+          "trimmed_cv_pct": 0.2423,
+          "trimmed_mean": 1238000810746.2314
+        },
+        "hbm_rw21_bytes_per_s": {
+          "bound_kind": "rate_upper",
+          "certified_upper_capacity": 1600000000000.0,
+          "cv_pct": 0.8964,
+          "n_samples": 24,
+          "p05": 1063815310450.782,
+          "p50": 1082954180392.5892,
+          "p95": 1096529511463.0554,
+          "p99": 1098448562780.1353,
+          "trimmed_cv_pct": 0.6071,
+          "trimmed_mean": 1082517586891.1248
         },
         "hbm_rw_alpha": {
           "bound_kind": "latency_lower",
-          "certified_upper_capacity": 0.0,
-          "cv_pct": 0.2827,
-          "n_samples": 32,
-          "p05": 0.993049,
-          "p50": 1.0,
-          "p95": 1.0,
-          "p99": 1.0,
-          "trimmed_cv_pct": 0.0078,
-          "trimmed_mean": 0.999985
+          "certified_upper_capacity": 0.0
         },
         "hbm_write_bytes_per_s": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 1200000000000.0
+          "certified_upper_capacity": 1600000000000.0,
+          "cv_pct": 0.3838,
+          "n_samples": 24,
+          "p05": 1416620892273.1746,
+          "p50": 1423004489239.7993,
+          "p95": 1432848064119.9487,
+          "p99": 1434210840498.0916,
+          "trimmed_cv_pct": 0.3145,
+          "trimmed_mean": 1424315942845.0046
         },
         "mte2_aic_hit_bytes_per_s_per_core": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 52800000000.0
+          "certified_upper_capacity": 422400000000.00006,
+          "cv_pct": 0.2305,
+          "n_samples": 12,
+          "p05": 226666311831.26877,
+          "p50": 227437103574.33307,
+          "p95": 228286784294.0627,
+          "p99": 228304276898.8466,
+          "trimmed_cv_pct": 0.1718,
+          "trimmed_mean": 227433755460.90292
         },
         "mte2_aiv_hit_bytes_per_s_per_core": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 52800000000.0
+          "certified_upper_capacity": 211200000000.00003,
+          "cv_pct": 0.2648,
+          "n_samples": 24,
+          "p05": 111758003329.67888,
+          "p50": 112161558654.39175,
+          "p95": 112546794324.2264,
+          "p99": 112621272235.58801,
+          "trimmed_cv_pct": 0.1957,
+          "trimmed_mean": 112172528087.34375
         }
       },
       "modes": {},
       "parameters": {
-        "burst_turn_penalty": [],
-        "l2_cache_ctl_supported": false,
-        "sector_bytes": 32
+        "bisheng_version": "2026-11-10T23:30:14+08:00 clang version 15.0.5 (clang-5c68a1cb1231 flang-5c68a1cb1231)",
+        "burst_turn_penalty": [
+          {
+            "evidence_id": "capture://a3-9362-ep/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
+            "max_row_bytes": 64,
+            "max_stride_bytes": 1024,
+            "min_row_bytes": 32,
+            "min_stride_bytes": 512,
+            "penalty_bytes": 479.4
+          },
+          {
+            "evidence_id": "capture://a3-9362-ep/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
+            "max_row_bytes": 64,
+            "max_stride_bytes": 4096,
+            "min_row_bytes": 32,
+            "min_stride_bytes": 1024,
+            "penalty_bytes": 480.0
+          },
+          {
+            "evidence_id": "capture://a3-9362-ep/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
+            "max_row_bytes": 64,
+            "max_stride_bytes": null,
+            "min_row_bytes": 32,
+            "min_stride_bytes": 4096,
+            "penalty_bytes": 480.0
+          },
+          {
+            "evidence_id": "capture://a3-9362-ep/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
+            "max_row_bytes": 128,
+            "max_stride_bytes": 1024,
+            "min_row_bytes": 64,
+            "min_stride_bytes": 512,
+            "penalty_bytes": 446.3
+          },
+          {
+            "evidence_id": "capture://a3-9362-ep/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
+            "max_row_bytes": 128,
+            "max_stride_bytes": 4096,
+            "min_row_bytes": 64,
+            "min_stride_bytes": 1024,
+            "penalty_bytes": 448.0
+          },
+          {
+            "evidence_id": "capture://a3-9362-ep/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
+            "max_row_bytes": 128,
+            "max_stride_bytes": null,
+            "min_row_bytes": 64,
+            "min_stride_bytes": 4096,
+            "penalty_bytes": 448.0
+          },
+          {
+            "evidence_id": "capture://a3-9362-ep/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
+            "max_row_bytes": 256,
+            "max_stride_bytes": 1024,
+            "min_row_bytes": 128,
+            "min_stride_bytes": 512,
+            "penalty_bytes": 382.82
+          },
+          {
+            "evidence_id": "capture://a3-9362-ep/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
+            "max_row_bytes": 256,
+            "max_stride_bytes": 4096,
+            "min_row_bytes": 128,
+            "min_stride_bytes": 1024,
+            "penalty_bytes": 384.0
+          },
+          {
+            "evidence_id": "capture://a3-9362-ep/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
+            "max_row_bytes": 256,
+            "max_stride_bytes": null,
+            "min_row_bytes": 128,
+            "min_stride_bytes": 4096,
+            "penalty_bytes": 384.0
+          },
+          {
+            "evidence_id": "capture://a3-9362-ep/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
+            "max_row_bytes": 512,
+            "max_stride_bytes": 1024,
+            "min_row_bytes": 256,
+            "min_stride_bytes": 512,
+            "penalty_bytes": 256.0
+          },
+          {
+            "evidence_id": "capture://a3-9362-ep/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
+            "max_row_bytes": 512,
+            "max_stride_bytes": 4096,
+            "min_row_bytes": 256,
+            "min_stride_bytes": 1024,
+            "penalty_bytes": 256.0
+          },
+          {
+            "evidence_id": "capture://a3-9362-ep/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
+            "max_row_bytes": 512,
+            "max_stride_bytes": null,
+            "min_row_bytes": 256,
+            "min_stride_bytes": 4096,
+            "penalty_bytes": 256.0
+          }
+        ],
+        "core_clock_scale_ratio": 1.1,
+        "gather_v2_cold_surface": {
+          "1024B": {
+            "random_scatter_rw_bps": 1126040569902.76,
+            "row_bytes": 1024,
+            "scatter_penalty_ratio": 0.9254,
+            "sequential_rw_bps": 1042088304631.58
+          },
+          "128B": {
+            "random_scatter_rw_bps": 318422821424.27,
+            "row_bytes": 128,
+            "scatter_penalty_ratio": 1.0062,
+            "sequential_rw_bps": 320383383306.88
+          },
+          "2048B": {
+            "random_scatter_rw_bps": 1439519092337.98,
+            "row_bytes": 2048,
+            "scatter_penalty_ratio": 0.8542,
+            "sequential_rw_bps": 1229698880428.39
+          },
+          "256B": {
+            "random_scatter_rw_bps": 506596108757.67,
+            "row_bytes": 256,
+            "scatter_penalty_ratio": 1.0029,
+            "sequential_rw_bps": 508068884081.09
+          },
+          "4096B": {
+            "random_scatter_rw_bps": 1639199607610.61,
+            "row_bytes": 4096,
+            "scatter_penalty_ratio": 0.8987,
+            "sequential_rw_bps": 1473122782177.98
+          },
+          "512B": {
+            "random_scatter_rw_bps": 734743631143.3,
+            "row_bytes": 512,
+            "scatter_penalty_ratio": 1.0015,
+            "sequential_rw_bps": 735862815196.59
+          },
+          "576B": {
+            "random_scatter_rw_bps": 660489089805.6,
+            "row_bytes": 576,
+            "scatter_penalty_ratio": 1.0474,
+            "sequential_rw_bps": 691796077821.34
+          }
+        },
+        "gm_alignment_cold_bps": {
+          "off_0B": 1484493307760.21,
+          "off_128B": 1471911383444.18,
+          "off_256B": 1482517596010.85,
+          "off_32B": 1455479444656.92,
+          "off_64B": 1446913961406.27
+        },
+        "hbm_burst_granule_bytes": 512,
+        "hbm_read_datacopy_blocked_bps_p50": 1483833998191.21,
+        "hbm_scatter_row_open_bytes": 0,
+        "ini_filename": "Ascend910_9362.ini",
+        "ini_sha256": "c070a85dd8063e034e772b178caf798b3f8fae4c4024f2afdf983eb4117a9fa3",
+        "l2_cache_ctl_mechanism": "l2_cache_alter_dual_va",
+        "l2_cache_ctl_supported": true,
+        "metric_diagnostics": {
+          "hbm_read_bytes_per_s": {
+            "cv_pct": 0.5235,
+            "nominal_bound": 1600000000000.0,
+            "status": "calibrated"
+          },
+          "hbm_rw11_bytes_per_s": {
+            "cv_pct": 0.3847,
+            "nominal_bound": 1600000000000.0,
+            "status": "calibrated"
+          },
+          "hbm_rw21_bytes_per_s": {
+            "cv_pct": 0.8964,
+            "nominal_bound": 1600000000000.0,
+            "status": "calibrated"
+          },
+          "hbm_rw_alpha": {
+            "admissible_max": 1.0,
+            "cv_pct": 0.6833,
+            "nominal_bound": 0.0,
+            "observed_p05": 1.344605,
+            "observed_p50": 1.354732,
+            "observed_p99": 1.379552,
+            "status": "p99_exceeds_nominal_conflict"
+          },
+          "hbm_write_bytes_per_s": {
+            "cv_pct": 0.3838,
+            "nominal_bound": 1600000000000.0,
+            "status": "calibrated"
+          },
+          "mte2_aic_hit_bytes_per_s_per_core": {
+            "cv_pct": 0.2305,
+            "nominal_bound": 422400000000.00006,
+            "status": "calibrated"
+          },
+          "mte2_aiv_hit_bytes_per_s_per_core": {
+            "cv_pct": 0.2648,
+            "nominal_bound": 211200000000.00003,
+            "status": "calibrated"
+          }
+        },
+        "mte2_aic_cold_scaling_bps": {
+          "1": 138480213619.51,
+          "12": 1321871392884.94,
+          "16": 1443511858371.57,
+          "2": 255891605543.86,
+          "20": 1455409898622.92,
+          "4": 426260205432.64,
+          "8": 994648540596.7
+        },
+        "mte2_aic_warm_scaling_bps": {
+          "1": 304668180503.01,
+          "12": 3397714820258.09,
+          "16": 4008597230628.77,
+          "2": 611512276023.44,
+          "20": 4548742071486.66,
+          "4": 1221745937404.11,
+          "8": 2364388457103.66
+        },
+        "nominal_cube_freq_mhz": 1500.0,
+        "observed_aicore_freq_mhz": 1650,
+        "observed_cur_freq_mhz": 800,
+        "payload_ramp_bytes_per_s": {
+          "1024KB": {
+            "cold_ring_bytes": 805306368,
+            "cold_verified": true,
+            "read_bps": 116589409669.39,
+            "rw11_bps": 427444979350.08,
+            "write_bps": 248036890912.2
+          },
+          "131072KB": {
+            "cold_ring_bytes": 805306368,
+            "cold_verified": true,
+            "read_bps": 1198586619220.3,
+            "rw11_bps": 1234356231376.17,
+            "write_bps": 1414008960672.01
+          },
+          "16384KB": {
+            "cold_ring_bytes": 805306368,
+            "cold_verified": true,
+            "read_bps": 655359992713.93,
+            "rw11_bps": 1029277098215.97,
+            "write_bps": 1051203980031.53
+          },
+          "16KB": {
+            "cold_ring_bytes": 805306368,
+            "cold_verified": true,
+            "read_bps": 3638867343.03,
+            "rw11_bps": 39479517858.33,
+            "write_bps": 13512576921.03
+          },
+          "256KB": {
+            "cold_ring_bytes": 805306368,
+            "cold_verified": true,
+            "read_bps": 30972558977.37,
+            "rw11_bps": 422812899021.3,
+            "write_bps": 68444909630.1
+          },
+          "4096KB": {
+            "cold_ring_bytes": 805306368,
+            "cold_verified": true,
+            "read_bps": 346636696093.16,
+            "rw11_bps": 822412519343.52,
+            "write_bps": 609637209229.7
+          },
+          "64KB": {
+            "cold_ring_bytes": 805306368,
+            "cold_verified": true,
+            "read_bps": 10754625624.59,
+            "rw11_bps": 146653982033.05,
+            "write_bps": 30967985960.81
+          },
+          "65536KB": {
+            "cold_ring_bytes": 805306368,
+            "cold_verified": true,
+            "read_bps": 1109604224526.1,
+            "rw11_bps": 1166603467403.87,
+            "write_bps": 1336829998968.27
+          }
+        },
+        "runtime_cann_version": "9.3.0",
+        "sector_bytes": 32,
+        "strided_cold_surface": [
+          {
+            "bps_p50": 92848268489.09,
+            "cold_evicted": true,
+            "row_bytes": 32,
+            "stride_bytes": 512
+          },
+          {
+            "bps_p50": 58272223591.75,
+            "cold_evicted": true,
+            "row_bytes": 32,
+            "stride_bytes": 1024
+          },
+          {
+            "bps_p50": 60683792191.52,
+            "cold_evicted": true,
+            "row_bytes": 32,
+            "stride_bytes": 4096
+          },
+          {
+            "bps_p50": 186097311391.59,
+            "cold_evicted": true,
+            "row_bytes": 64,
+            "stride_bytes": 512
+          },
+          {
+            "bps_p50": 116663999579.93,
+            "cold_evicted": true,
+            "row_bytes": 64,
+            "stride_bytes": 1024
+          },
+          {
+            "bps_p50": 124593355894.1,
+            "cold_evicted": true,
+            "row_bytes": 64,
+            "stride_bytes": 4096
+          },
+          {
+            "bps_p50": 371814404097.13,
+            "cold_evicted": true,
+            "row_bytes": 128,
+            "stride_bytes": 512
+          },
+          {
+            "bps_p50": 232810951669.56,
+            "cold_evicted": true,
+            "row_bytes": 128,
+            "stride_bytes": 1024
+          },
+          {
+            "bps_p50": 240212523333.07,
+            "cold_evicted": true,
+            "row_bytes": 128,
+            "stride_bytes": 4096
+          },
+          {
+            "bps_p50": 660512099530.55,
+            "cold_evicted": true,
+            "row_bytes": 256,
+            "stride_bytes": 512
+          },
+          {
+            "bps_p50": 461864320747.2,
+            "cold_evicted": true,
+            "row_bytes": 256,
+            "stride_bytes": 1024
+          },
+          {
+            "bps_p50": 486654207220.57,
+            "cold_evicted": true,
+            "row_bytes": 256,
+            "stride_bytes": 4096
+          },
+          {
+            "bps_p50": 936228643849.24,
+            "cold_evicted": true,
+            "row_bytes": 512,
+            "stride_bytes": 1024
+          },
+          {
+            "bps_p50": 983655155582.79,
+            "cold_evicted": true,
+            "row_bytes": 512,
+            "stride_bytes": 2048
+          },
+          {
+            "bps_p50": 971503775134.02,
+            "cold_evicted": true,
+            "row_bytes": 512,
+            "stride_bytes": 4096
+          },
+          {
+            "bps_p50": 1026245829841.1,
+            "cold_evicted": true,
+            "row_bytes": 1024,
+            "stride_bytes": 2048
+          },
+          {
+            "bps_p50": 1058502848293.7,
+            "cold_evicted": true,
+            "row_bytes": 1024,
+            "stride_bytes": 4096
+          },
+          {
+            "bps_p50": 1001680903145.09,
+            "cold_evicted": true,
+            "row_bytes": 2048,
+            "stride_bytes": 4096
+          }
+        ]
       },
-      "status": "unmeasured",
+      "status": "calibrated",
       "units": {
         "alpha": "dimensionless",
         "penalty": "bytes",
@@ -49,63 +484,186 @@
       }
     },
     "P02_load_data": {
-      "evidence_id": "",
+      "evidence_id": "capture://a3-9362-ep/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
       "metrics": {
         "l1_to_l0a_bytes_per_s_per_aic": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 422400000000.0
+          "certified_upper_capacity": 422400000000.00006,
+          "cv_pct": 0.042,
+          "n_samples": 24,
+          "p05": 415573868664.92773,
+          "p50": 415824371894.0798,
+          "p95": 416093666759.2686,
+          "p99": 416101590450.99524,
+          "trimmed_cv_pct": 0.0338,
+          "trimmed_mean": 415811222919.6769
+        },
+        "l1_to_l0a_transpose_bytes_per_s_per_aic": {
+          "bound_kind": "rate_upper",
+          "certified_upper_capacity": 422400000000.00006,
+          "cv_pct": 0.0411,
+          "n_samples": 24,
+          "p05": 415581774276.9009,
+          "p50": 415863945951.4967,
+          "p95": 416101590450.99524,
+          "p99": 416101590450.99524,
+          "trimmed_cv_pct": 0.0315,
+          "trimmed_mean": 415850794688.4784
         },
         "l1_to_l0b_bytes_per_s_per_aic": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 211200000000.0
+          "certified_upper_capacity": 211200000000.00003,
+          "cv_pct": 0.0193,
+          "n_samples": 24,
+          "p05": 209514073075.52542,
+          "p50": 209567663865.78967,
+          "p95": 209633686722.63672,
+          "p99": 209650188302.28455,
+          "trimmed_cv_pct": 0.0155,
+          "trimmed_mean": 209569344316.6731
+        },
+        "l1_to_l0b_transpose_bytes_per_s_per_aic": {
+          "bound_kind": "rate_upper",
+          "certified_upper_capacity": 211200000000.00003,
+          "cv_pct": 0.0243,
+          "n_samples": 24,
+          "p05": 209494979522.51456,
+          "p50": 209581076048.8034,
+          "p95": 209634690919.08157,
+          "p99": 209639861512.58875,
+          "trimmed_cv_pct": 0.0186,
+          "trimmed_mean": 209574707080.24112
         },
         "setup_ns": {
           "bound_kind": "latency_lower",
-          "certified_upper_capacity": 0.0
+          "certified_upper_capacity": 0.0,
+          "cv_pct": 0.4469,
+          "n_samples": 24,
+          "p05": 16.191333,
+          "p50": 16.338334,
+          "p95": 16.423832,
+          "p99": 16.436033,
+          "trimmed_cv_pct": 0.3315,
+          "trimmed_mean": 16.326833
         }
       },
       "modes": {},
       "parameters": {
         "fractal_bytes": 512,
+        "measured_l0a_transpose_ratio": 0.999905,
+        "measured_l0b_transpose_ratio": 0.999936,
+        "metric_diagnostics": {
+          "l1_to_l0a_bytes_per_s_per_aic": {
+            "cv_pct": 0.042,
+            "nominal_bound": 422400000000.00006,
+            "status": "calibrated"
+          },
+          "l1_to_l0a_transpose_bytes_per_s_per_aic": {
+            "cv_pct": 0.0411,
+            "nominal_bound": 422400000000.00006,
+            "status": "calibrated"
+          },
+          "l1_to_l0b_bytes_per_s_per_aic": {
+            "cv_pct": 0.0193,
+            "nominal_bound": 211200000000.00003,
+            "status": "calibrated"
+          },
+          "l1_to_l0b_transpose_bytes_per_s_per_aic": {
+            "cv_pct": 0.0243,
+            "nominal_bound": 211200000000.00003,
+            "status": "calibrated"
+          },
+          "setup_ns": {
+            "cv_pct": 0.4469,
+            "nominal_bound": 0.0,
+            "status": "calibrated"
+          }
+        },
+        "mx_scale_bytes_per_cyc": 0,
         "mx_scale_supported": false,
-        "transpose_factor": 1.0
+        "transpose_factor": 1.0,
+        "transpose_l0b_factor": 1.0
       },
-      "status": "unmeasured",
+      "status": "calibrated",
       "units": {
         "latency": "ns",
         "rate": "bytes_per_s_per_aic"
       }
     },
     "P03_fixpipe": {
-      "evidence_id": "",
+      "evidence_id": "capture://a3-9362-ep/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
       "metrics": {
         "fixpipe_in_bytes_per_s_per_aic": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 211200000000.0
+          "certified_upper_capacity": 422400000000.00006,
+          "cv_pct": 0.0288,
+          "n_samples": 24,
+          "p05": 194898549977.98108,
+          "p50": 194966379121.81296,
+          "p95": 195017727185.49734,
+          "p99": 195023070949.63312,
+          "trimmed_cv_pct": 0.0151,
+          "trimmed_mean": 194966966744.48788
         },
         "fixpipe_out_bytes_per_s_per_aic": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 211200000000.0
+          "certified_upper_capacity": 211200000000.00003,
+          "cv_pct": 0.0288,
+          "n_samples": 24,
+          "p05": 97449274988.99054,
+          "p50": 97483189560.90648,
+          "p95": 97508863592.74867,
+          "p99": 97511535474.81656,
+          "trimmed_cv_pct": 0.0151,
+          "trimmed_mean": 97483483372.24394
         },
         "setup_ns": {
           "bound_kind": "latency_lower",
-          "certified_upper_capacity": 0.0
+          "certified_upper_capacity": 0.0,
+          "cv_pct": 0.1251,
+          "n_samples": 24,
+          "p05": 163.92934,
+          "p50": 164.113328,
+          "p95": 164.502322,
+          "p99": 164.754338,
+          "trimmed_cv_pct": 0.0693,
+          "trimmed_mean": 164.138328
         }
       },
       "modes": {},
       "parameters": {
+        "dual_target_ub_supported": false,
         "has_l0c_to_l1": true,
         "has_l0c_to_ub": false,
+        "metric_diagnostics": {
+          "fixpipe_in_bytes_per_s_per_aic": {
+            "cv_pct": 0.0288,
+            "nominal_bound": 422400000000.00006,
+            "status": "calibrated"
+          },
+          "fixpipe_out_bytes_per_s_per_aic": {
+            "cv_pct": 0.0288,
+            "nominal_bound": 211200000000.00003,
+            "status": "calibrated"
+          },
+          "setup_ns": {
+            "cv_pct": 0.1251,
+            "nominal_bound": 0.0,
+            "status": "calibrated"
+          }
+        },
+        "nz2dn_stride_gt1_div": 1,
+        "split_m_supported": false,
         "ub_split_n_align_elems": 32
       },
-      "status": "unmeasured",
+      "status": "calibrated",
       "units": {
         "latency": "ns",
         "rate": "bytes_per_s_per_aic"
       }
     },
     "P04_mte3_store": {
-      "evidence_id": "",
+      "evidence_id": "capture://a3-9362-ep/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
       "metrics": {
         "atomic_contention_ns": {
           "bound_kind": "latency_lower",
@@ -113,19 +671,19 @@
         },
         "atomic_rmw_bytes_per_s": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 1200000000000.0,
-          "cv_pct": 1.6882,
-          "n_samples": 32,
-          "p05": 3123481592.662884,
-          "p50": 3236408133.691533,
-          "p95": 3304274734.877486,
-          "p99": 3322293776.145686,
-          "trimmed_cv_pct": 1.1648,
-          "trimmed_mean": 3234552014.724561
+          "certified_upper_capacity": 1600000000000.0
         },
         "mte3_store_bytes_per_s_per_aiv": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 105600000000.0
+          "certified_upper_capacity": 105600000000.00002,
+          "cv_pct": 1.3785,
+          "n_samples": 24,
+          "p05": 58195217947.163124,
+          "p50": 59293926497.83462,
+          "p95": 60529875816.14648,
+          "p99": 60560028383.8856,
+          "trimmed_cv_pct": 1.1513,
+          "trimmed_mean": 59462672650.30708
         },
         "setup_ns": {
           "bound_kind": "latency_lower",
@@ -134,45 +692,193 @@
       },
       "modes": {},
       "parameters": {
-        "has_ub_to_l1": false
+        "has_ub_to_l1": false,
+        "indexed_update_diagnostic": {
+          "band": {
+            "bound_kind": "rate_upper",
+            "certified_upper_capacity": 8448000000000.001,
+            "cv_pct": 1.5894,
+            "n_samples": 24,
+            "p05": 3141339289.274523,
+            "p50": 3234811493.844049,
+            "p95": 3304156780.475018,
+            "p99": 3310571274.497984,
+            "trimmed_cv_pct": 1.2488,
+            "trimmed_mean": 3227983338.597169
+          },
+          "diagnostic": {
+            "cv_pct": 1.5894,
+            "nominal_bound": 8448000000000.001,
+            "status": "calibrated"
+          }
+        },
+        "metric_diagnostics": {
+          "atomic_contention_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          },
+          "atomic_rmw_bytes_per_s": {
+            "nominal_bound": 1600000000000.0,
+            "status": "unmeasured"
+          },
+          "mte3_store_bytes_per_s_per_aiv": {
+            "cv_pct": 1.3785,
+            "nominal_bound": 105600000000.00002,
+            "status": "calibrated"
+          },
+          "setup_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          }
+        }
       },
-      "status": "unmeasured",
+      "status": "calibrated",
       "units": {
         "latency": "ns",
         "rate": "bytes_per_s"
       }
     },
     "P05_l2_residency_reuse": {
-      "evidence_id": "",
+      "evidence_id": "capture://a3-9362-ep/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
       "metrics": {
         "l2_die_bytes_per_s": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 4224000000000.0
+          "certified_upper_capacity": 8448000000000.001,
+          "cv_pct": 0.4621,
+          "n_samples": 24,
+          "p05": 1389208865518.4907,
+          "p50": 1395774975752.1929,
+          "p95": 1406914252574.4473,
+          "p99": 1407394061185.307,
+          "trimmed_cv_pct": 0.3513,
+          "trimmed_mean": 1398545010151.839
         },
         "l2_effective_fraction": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 1.0
+          "certified_upper_capacity": 1.0,
+          "cv_pct": 2.3689,
+          "n_samples": 24,
+          "p05": 0.814004,
+          "p50": 0.827379,
+          "p95": 0.868574,
+          "p99": 0.873275,
+          "trimmed_cv_pct": 1.9398,
+          "trimmed_mean": 0.834441
         }
       },
       "modes": {},
       "parameters": {
         "buffer_units_l2": 1,
-        "cache_disable_supported": false,
-        "granule_bytes": 128,
+        "cache_disable_mechanism": "l2_cache_alter_dual_va",
+        "cache_disable_supported": true,
+        "cache_persistent_supported": false,
+        "granule_bytes": 512,
         "l2_bytes": 176160768,
+        "l2_line_bytes": 512,
+        "l2_sector_bytes": 512,
+        "l2_stride_conflict": [
+          {
+            "bps_p50": 2502079699473.26,
+            "kind": "contiguous",
+            "stride_bytes": 128
+          },
+          {
+            "bps_p50": 1238403934401.4,
+            "kind": "pow2",
+            "stride_bytes": 512
+          },
+          {
+            "bps_p50": 699575041848.14,
+            "kind": "coprime",
+            "stride_bytes": 544
+          },
+          {
+            "bps_p50": 1217238938972.32,
+            "kind": "pow2",
+            "stride_bytes": 1024
+          },
+          {
+            "bps_p50": 712038389385.16,
+            "kind": "coprime",
+            "stride_bytes": 1056
+          },
+          {
+            "bps_p50": 1223426223698.44,
+            "kind": "pow2",
+            "stride_bytes": 4096
+          },
+          {
+            "bps_p50": 708687056318.99,
+            "kind": "coprime",
+            "stride_bytes": 4128
+          },
+          {
+            "bps_p50": 751255099532.29,
+            "kind": "pow2",
+            "stride_bytes": 16384
+          },
+          {
+            "bps_p50": 703061922816.76,
+            "kind": "coprime",
+            "stride_bytes": 16416
+          },
+          {
+            "bps_p50": 331302841994.3,
+            "kind": "pow2",
+            "stride_bytes": 32768
+          },
+          {
+            "bps_p50": 520898771851.81,
+            "kind": "coprime",
+            "stride_bytes": 32800
+          },
+          {
+            "bps_p50": 157903698965.92,
+            "kind": "pow2",
+            "stride_bytes": 65536
+          },
+          {
+            "bps_p50": 248342771538.36,
+            "kind": "coprime",
+            "stride_bytes": 65568
+          },
+          {
+            "bps_p50": 116762110876.2,
+            "kind": "pow2",
+            "stride_bytes": 131072
+          }
+        ],
+        "metric_diagnostics": {
+          "l2_die_bytes_per_s": {
+            "cv_pct": 0.4621,
+            "nominal_bound": 8448000000000.001,
+            "status": "calibrated"
+          },
+          "l2_effective_fraction": {
+            "cv_pct": 2.3689,
+            "nominal_bound": 1.0,
+            "status": "calibrated"
+          }
+        },
         "ws_sweep_bytes_per_s": {
-          "128MiB": 1443511858371.57,
-          "160MiB": 1230903616972.83,
-          "192MiB": 1228350143471.31,
-          "256MiB": 1242526683960.39,
-          "320MiB": 1179583463584.64,
-          "32MiB": 628622533024.51,
-          "64MiB": 3687807383283.92,
-          "8MiB": 134826365761.55,
-          "96MiB": 2407846320389.64
+          "112MiB": 1371968675040.8,
+          "128MiB": 1363308609964.85,
+          "144MiB": 1322777392483.33,
+          "160MiB": 1260118436447.13,
+          "16MiB": 923347100172.08,
+          "192MiB": 1282253281857.32,
+          "208MiB": 1252894188619.61,
+          "224MiB": 1243809689336.89,
+          "256MiB": 1249757692129.97,
+          "320MiB": 1272833380367.54,
+          "32MiB": 1180351905420.97,
+          "4MiB": 389081999096.02,
+          "64MiB": 1379421716290.82,
+          "8MiB": 638281016324.45,
+          "96MiB": 1395774975752.19
         }
       },
-      "status": "unmeasured",
+      "status": "calibrated",
       "units": {
         "capacity": "bytes",
         "fraction": "dimensionless",
@@ -180,27 +886,38 @@
       }
     },
     "P06_mmad": {
-      "evidence_id": "capture://lab-a3-9362/camp-202611-l0-a3-9362/e45ac4e414371e0b6f9bef258be3d0b652067b1eccbcdf4a770610b9378581d9",
+      "evidence_id": "capture://a3-9362-ep/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
       "metrics": {
         "pipe_m_barrier_ns": {
           "bound_kind": "latency_lower",
-          "certified_upper_capacity": 0.0
+          "certified_upper_capacity": 0.0,
+          "cv_pct": 0.503,
+          "n_samples": 24,
+          "p05": 1.796344,
+          "p50": 1.811875,
+          "p95": 1.821594,
+          "p99": 1.822356,
+          "trimmed_cv_pct": 0.445,
+          "trimmed_mean": 1.809125
         }
       },
       "modes": {
         "bf16": {
+          "cube_k": 16,
           "cube_only_rate": {
             "bound_kind": "rate_upper",
-            "certified_upper_capacity": 13516800000000.0,
-            "cv_pct": 0.2507,
-            "n_samples": 32,
-            "p05": 12309022099234.543,
-            "p50": 12333221456508.363,
-            "p95": 12357120969935.18,
-            "p99": 12365685753898.453,
-            "trimmed_cv_pct": 0.0738,
-            "trimmed_mean": 12333415205233.201
+            "certified_upper_capacity": 13516800000000.002,
+            "cv_pct": 0.0484,
+            "n_samples": 24,
+            "p05": 13419407242472.475,
+            "p50": 13435332434895.934,
+            "p95": 13437981001807.412,
+            "p99": 13440838122089.037,
+            "trimmed_cv_pct": 0.0311,
+            "trimmed_mean": 13433731368470.3
           },
+          "evidence_id": "capture://a3-9362-ep/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
+          "k_0": 16,
           "m_iss": 16,
           "status": "calibrated",
           "tile_k": 16,
@@ -208,18 +925,21 @@
           "tile_n": 16
         },
         "fp16": {
+          "cube_k": 16,
           "cube_only_rate": {
             "bound_kind": "rate_upper",
-            "certified_upper_capacity": 13516800000000.0,
-            "cv_pct": 0.2184,
-            "n_samples": 32,
-            "p05": 12312715328726.043,
-            "p50": 12331451201980.262,
-            "p95": 12349789878963.857,
-            "p99": 12352386647696.2,
-            "trimmed_cv_pct": 0.0745,
-            "trimmed_mean": 12330989536107.123
+            "certified_upper_capacity": 13516800000000.002,
+            "cv_pct": 0.0322,
+            "n_samples": 24,
+            "p05": 13425460428033.092,
+            "p50": 13437451993381.23,
+            "p95": 13439795659901.006,
+            "p99": 13440243926198.13,
+            "trimmed_cv_pct": 0.02,
+            "trimmed_mean": 13436590864148.693
           },
+          "evidence_id": "capture://a3-9362-ep/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
+          "k_0": 16,
           "m_iss": 16,
           "status": "calibrated",
           "tile_k": 16,
@@ -227,37 +947,78 @@
           "tile_n": 16
         },
         "fp32": {
+          "cube_k": 4,
           "cube_only_rate": {
             "bound_kind": "rate_upper",
-            "certified_upper_capacity": 3379200000000.0,
-            "cv_pct": 0.113,
-            "n_samples": 32,
-            "p05": 3312957910164.0317,
-            "p50": 3314041895179.6396,
-            "p95": 3315063546509.3027,
-            "p99": 3315489002456.818,
-            "trimmed_cv_pct": 0.0106,
-            "trimmed_mean": 3314042605180.7993
+            "certified_upper_capacity": 3379200000000.0005,
+            "cv_pct": 0.0355,
+            "n_samples": 24,
+            "p05": 3369945160806.577,
+            "p50": 3371827103551.2905,
+            "p95": 3373424146897.3647,
+            "p99": 3373557908002.809,
+            "trimmed_cv_pct": 0.0287,
+            "trimmed_mean": 3372032585676.565
           },
+          "evidence_id": "capture://a3-9362-ep/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
+          "k_0": 8,
           "m_iss": 16,
           "status": "calibrated",
           "tile_k": 8,
           "tile_m": 16,
           "tile_n": 16
         },
-        "int8": {
+        "hf32": {
+          "cube_k": 8,
           "cube_only_rate": {
             "bound_kind": "rate_upper",
-            "certified_upper_capacity": 27033600000000.0,
-            "cv_pct": 0.6221,
-            "n_samples": 32,
-            "p05": 19359938278857.652,
-            "p50": 19441388997462.695,
-            "p95": 19542817438061.043,
-            "p99": 19558837158115.17,
-            "trimmed_cv_pct": 0.206,
-            "trimmed_mean": 19447477844477.17
+            "certified_upper_capacity": 6758400000000.001,
+            "cv_pct": 0.0571,
+            "n_samples": 24,
+            "p05": 6726018932077.503,
+            "p50": 6729805414895.785,
+            "p95": 6734917933000.347,
+            "p99": 6735365539249.328,
+            "trimmed_cv_pct": 0.0539,
+            "trimmed_mean": 6730078663219.177
           },
+          "evidence_id": "capture://a3-9362-ep/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
+          "k_0": 8,
+          "m_iss": 16,
+          "status": "calibrated",
+          "tile_k": 8,
+          "tile_m": 16,
+          "tile_n": 16
+        },
+        "int4": {
+          "cube_k": 64,
+          "cube_only_rate": {
+            "bound_kind": "rate_upper",
+            "certified_upper_capacity": 54067200000000.01
+          },
+          "k_0": 64,
+          "m_iss": 16,
+          "status": "unmeasured",
+          "tile_k": 64,
+          "tile_m": 16,
+          "tile_n": 16
+        },
+        "int8": {
+          "cube_k": 32,
+          "cube_only_rate": {
+            "bound_kind": "rate_upper",
+            "certified_upper_capacity": 27033600000000.004,
+            "cv_pct": 0.0585,
+            "n_samples": 24,
+            "p05": 26903092085250.473,
+            "p50": 26919487326281.203,
+            "p95": 26937491417967.496,
+            "p99": 26938800334129.953,
+            "trimmed_cv_pct": 0.0555,
+            "trimmed_mean": 26919837249604.1
+          },
+          "evidence_id": "capture://a3-9362-ep/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
+          "k_0": 32,
           "m_iss": 16,
           "status": "calibrated",
           "tile_k": 32,
@@ -266,14 +1027,180 @@
         }
       },
       "parameters": {
+        "fp32_allow_hf32_recorded": true,
+        "gemm_e2e_flops_per_s_per_aic": {
+          "bf16": {
+            "band": {
+              "bound_kind": "rate_upper",
+              "certified_upper_capacity": 13516800000000.002,
+              "cv_pct": 0.0694,
+              "n_samples": 24,
+              "p05": 12417787800124.453,
+              "p50": 12431333283128.299,
+              "p95": 12443534587843.82,
+              "p99": 12448525774181.318,
+              "trimmed_cv_pct": 0.0479,
+              "trimmed_mean": 12430560016979.266
+            },
+            "diagnostic": {
+              "cv_pct": 0.0694,
+              "nominal_bound": 13516800000000.002,
+              "status": "calibrated"
+            }
+          },
+          "fp16": {
+            "band": {
+              "bound_kind": "rate_upper",
+              "certified_upper_capacity": 13516800000000.002,
+              "cv_pct": 0.0649,
+              "n_samples": 24,
+              "p05": 12391873858802.582,
+              "p50": 12406477037381.732,
+              "p95": 12416351641731.248,
+              "p99": 12419044838185.223,
+              "trimmed_cv_pct": 0.0512,
+              "trimmed_mean": 12404979651392.656
+            },
+            "diagnostic": {
+              "cv_pct": 0.0649,
+              "nominal_bound": 13516800000000.002,
+              "status": "calibrated"
+            }
+          },
+          "fp32": {
+            "band": {
+              "bound_kind": "rate_upper",
+              "certified_upper_capacity": 3379200000000.0005,
+              "cv_pct": 0.018,
+              "n_samples": 24,
+              "p05": 3312472487798.8525,
+              "p50": 3313610419310.5684,
+              "p95": 3314330409361.255,
+              "p99": 3314472903139.1465,
+              "trimmed_cv_pct": 0.0132,
+              "trimmed_mean": 3313620110212.639
+            },
+            "diagnostic": {
+              "cv_pct": 0.018,
+              "nominal_bound": 3379200000000.0005,
+              "status": "calibrated"
+            }
+          },
+          "hf32": {
+            "band": {
+              "bound_kind": "rate_upper",
+              "certified_upper_capacity": 6758400000000.001,
+              "cv_pct": 0.0772,
+              "n_samples": 24,
+              "p05": 6156666215339.796,
+              "p50": 6164840476117.891,
+              "p95": 6171234837394.364,
+              "p99": 6171740133021.915,
+              "trimmed_cv_pct": 0.0625,
+              "trimmed_mean": 6163767279051.076
+            },
+            "diagnostic": {
+              "cv_pct": 0.0772,
+              "nominal_bound": 6758400000000.001,
+              "status": "calibrated"
+            }
+          },
+          "int8": {
+            "band": {
+              "bound_kind": "rate_upper",
+              "certified_upper_capacity": 27033600000000.004,
+              "cv_pct": 0.34,
+              "n_samples": 24,
+              "p05": 19926849919841.152,
+              "p50": 20089742784045.84,
+              "p95": 20145708028869.125,
+              "p99": 20155852285213.73,
+              "trimmed_cv_pct": 0.2248,
+              "trimmed_mean": 20085156526121.8
+            },
+            "diagnostic": {
+              "cv_pct": 0.34,
+              "nominal_bound": 27033600000000.004,
+              "status": "calibrated"
+            }
+          }
+        },
+        "metric_diagnostics": {
+          "pipe_m_barrier_ns": {
+            "cv_pct": 0.503,
+            "nominal_bound": 0.0,
+            "status": "calibrated"
+          }
+        },
+        "mode_coverage": {
+          "calibrated_count": 5,
+          "calibrated_modes": [
+            "bf16",
+            "fp16",
+            "fp32",
+            "hf32",
+            "int8"
+          ],
+          "conflict_modes": [],
+          "mode_diagnostics": {
+            "bf16": {
+              "cv_pct": 0.0484,
+              "nominal_bound": 13516800000000.002,
+              "status": "calibrated"
+            },
+            "fp16": {
+              "cv_pct": 0.0322,
+              "nominal_bound": 13516800000000.002,
+              "status": "calibrated"
+            },
+            "fp32": {
+              "cv_pct": 0.0355,
+              "nominal_bound": 3379200000000.0005,
+              "status": "calibrated"
+            },
+            "hf32": {
+              "cv_pct": 0.0571,
+              "nominal_bound": 6758400000000.001,
+              "status": "calibrated"
+            },
+            "int4": {
+              "nominal_bound": 54067200000000.01,
+              "status": "unmeasured"
+            },
+            "int8": {
+              "cv_pct": 0.0585,
+              "nominal_bound": 27033600000000.004,
+              "status": "calibrated"
+            }
+          },
+          "supported_count": 6,
+          "unmeasured_modes": [
+            "int4"
+          ],
+          "unsupported_modes": [
+            "fp8_e4m3",
+            "fp8_e5m2",
+            "hifloat8",
+            "mxfp8",
+            "mxfp4"
+          ]
+        },
         "pipe_m_barrier_fractal_threshold": 10,
         "small_m_bf16_ns": {
-          "1": 120810.0,
-          "128": 25550.0,
-          "16": 46585.0,
-          "256": 47287.5,
-          "32": 20990.0,
-          "64": 21177.5
+          "1": 39820.0,
+          "128": 41180.0,
+          "16": 38160.0,
+          "256": 64130.0,
+          "32": 39420.0,
+          "64": 39700.0
+        },
+        "small_m_bf16_warm_ns": {
+          "1": 20222.5,
+          "128": 25682.5,
+          "16": 20427.5,
+          "256": 47327.5,
+          "32": 21182.5,
+          "64": 21372.5
         }
       },
       "status": "calibrated",
@@ -283,7 +1210,7 @@
       }
     },
     "P07_vec_alu": {
-      "evidence_id": "capture://lab-a3-9362/camp-202611-l0-a3-9362/e45ac4e414371e0b6f9bef258be3d0b652067b1eccbcdf4a770610b9378581d9",
+      "evidence_id": "capture://a3-9362-ep/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
       "metrics": {
         "raw_latency_cycles": {
           "bound_kind": "latency_lower",
@@ -291,22 +1218,38 @@
         },
         "vec_alu_ops_per_s_per_aiv": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 105600000000.0,
-          "cv_pct": 2.4926,
-          "n_samples": 32,
-          "p05": 11434772621.461079,
-          "p50": 11611333423.751537,
-          "p95": 11741104760.906723,
-          "p99": 11758590925.816124,
-          "trimmed_cv_pct": 0.6908,
-          "trimmed_mean": 11620094935.362125
+          "certified_upper_capacity": 52800000000.00001,
+          "cv_pct": 0.2031,
+          "n_samples": 24,
+          "p05": 33819970817.139698,
+          "p50": 33926594652.275757,
+          "p95": 34019402531.67042,
+          "p99": 34019933412.609802,
+          "trimmed_cv_pct": 0.1532,
+          "trimmed_mean": 33917187137.066803
         }
       },
       "modes": {},
       "parameters": {
         "bf16_lanes": 128,
         "fp32_lanes": 64,
-        "vector_width_bytes": 256
+        "metric_diagnostics": {
+          "raw_latency_cycles": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          },
+          "vec_alu_ops_per_s_per_aiv": {
+            "cv_pct": 0.2031,
+            "nominal_bound": 52800000000.00001,
+            "status": "calibrated"
+          }
+        },
+        "probe_ops_per_element": 2.0,
+        "ub_bank_groups": 16,
+        "ub_bank_size_bytes": 4096,
+        "ub_banks_per_group": 3,
+        "vector_width_bytes": 256,
+        "work_unit": "elementary_alu_ops_per_s"
       },
       "status": "calibrated",
       "units": {
@@ -314,7 +1257,7 @@
       }
     },
     "P08_vec_sfu": {
-      "evidence_id": "",
+      "evidence_id": "capture://a3-9362-ep/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
       "metrics": {
         "raw_latency_cycles": {
           "bound_kind": "latency_lower",
@@ -322,71 +1265,152 @@
         },
         "vec_sfu_ops_per_s_per_aiv": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 52800000000.0
+          "certified_upper_capacity": 52800000000.00001,
+          "cv_pct": 2.5896,
+          "n_samples": 24,
+          "p05": 41296573661.61893,
+          "p50": 42912626506.32384,
+          "p95": 44373427736.63488,
+          "p99": 44432652919.29065,
+          "trimmed_cv_pct": 2.3028,
+          "trimmed_mean": 42916215451.04283
         }
       },
       "modes": {},
       "parameters": {
         "bf16_lanes": 128,
         "fp32_lanes": 64,
+        "metric_diagnostics": {
+          "raw_latency_cycles": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          },
+          "vec_sfu_ops_per_s_per_aiv": {
+            "cv_pct": 2.5896,
+            "nominal_bound": 52800000000.00001,
+            "status": "calibrated"
+          }
+        },
+        "ub_bank_groups": 16,
+        "ub_bank_size_bytes": 4096,
+        "ub_banks_per_group": 3,
         "vector_width_bytes": 256
       },
-      "status": "unmeasured",
+      "status": "calibrated",
       "units": {
         "rate": "ops_per_s_per_aiv"
       }
     },
     "P09_vec_reduce_cast": {
-      "evidence_id": "",
+      "evidence_id": "capture://a3-9362-ep/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
       "metrics": {
         "cast_bytes_per_s_per_aiv": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 52800000000.0
+          "certified_upper_capacity": 633600000000.0001,
+          "cv_pct": 0.6181,
+          "n_samples": 24,
+          "p05": 387328583783.5466,
+          "p50": 389284696812.3109,
+          "p95": 393507205210.30316,
+          "p99": 393591500189.83875,
+          "trimmed_cv_pct": 0.5711,
+          "trimmed_mean": 390320281658.4088
         },
         "vec_reduce_ops_per_s_per_aiv": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 52800000000.0,
-          "cv_pct": 0.6504,
-          "n_samples": 32,
-          "p05": 6066392639.133844,
-          "p50": 6096814942.122423,
-          "p95": 6147301492.445376,
-          "p99": 6148545491.277268,
-          "trimmed_cv_pct": 0.3286,
-          "trimmed_mean": 6102405497.375031
+          "certified_upper_capacity": 52800000000.00001,
+          "cv_pct": 0.292,
+          "n_samples": 24,
+          "p05": 14490330598.863003,
+          "p50": 14544199807.50341,
+          "p95": 14594495438.499035,
+          "p99": 14595691570.533817,
+          "trimmed_cv_pct": 0.2737,
+          "trimmed_mean": 14543427592.08173
         }
       },
       "modes": {},
       "parameters": {
+        "metric_diagnostics": {
+          "cast_bytes_per_s_per_aiv": {
+            "cv_pct": 0.6181,
+            "nominal_bound": 633600000000.0001,
+            "status": "calibrated"
+          },
+          "vec_reduce_ops_per_s_per_aiv": {
+            "cv_pct": 0.292,
+            "nominal_bound": 52800000000.00001,
+            "status": "calibrated"
+          }
+        },
         "mx_dynamic_quant_supported": false,
-        "mx_scale_group": 32
+        "mx_scale_group": 32,
+        "ub_bank_groups": 16,
+        "ub_bank_size_bytes": 4096,
+        "ub_banks_per_group": 3
       },
-      "status": "unmeasured",
+      "status": "calibrated",
       "units": {
         "cast_rate": "bytes_per_s_per_aiv",
         "rate": "ops_per_s_per_aiv"
       }
     },
     "P10_sort_topk": {
-      "evidence_id": "capture://lab-a3-9362/camp-202611-l0-a3-9362/e45ac4e414371e0b6f9bef258be3d0b652067b1eccbcdf4a770610b9378581d9",
+      "evidence_id": "capture://a3-9362-ep/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
       "metrics": {
         "sort_elems_per_s": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 2112000000000.0,
-          "cv_pct": 0.8887,
-          "n_samples": 32,
-          "p05": 15723025823.659996,
-          "p50": 15946713951.670391,
-          "p95": 16166262799.257797,
-          "p99": 16206271110.543907,
-          "trimmed_cv_pct": 0.6257,
-          "trimmed_mean": 15954778138.889133
+          "certified_upper_capacity": 52800000000.00001
+        },
+        "sort_elems_per_s_per_aiv": {
+          "bound_kind": "rate_upper",
+          "certified_upper_capacity": 52800000000.00001,
+          "cv_pct": 0.3276,
+          "n_samples": 24,
+          "p05": 2899679369.50037,
+          "p50": 2905789020.477998,
+          "p95": 2923918217.447971,
+          "p99": 2927907699.537853,
+          "trimmed_cv_pct": 0.2845,
+          "trimmed_mean": 2910601646.082361
         }
       },
-      "modes": {},
+      "modes": {
+        "sort32_mrgsort4": {
+          "evidence_id": "capture://a3-9362-ep/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
+          "sort_elems_per_s_per_aiv": {
+            "bound_kind": "rate_upper",
+            "certified_upper_capacity": 52800000000.00001,
+            "cv_pct": 0.3276,
+            "n_samples": 24,
+            "p05": 2899679369.50037,
+            "p50": 2905789020.477998,
+            "p95": 2923918217.447971,
+            "p99": 2927907699.537853,
+            "trimmed_cv_pct": 0.2845,
+            "trimmed_mean": 2910601646.082361
+          },
+          "status": "calibrated"
+        }
+      },
       "parameters": {
         "histogram_trunk_elems": 0,
+        "masked_hist256_supported": false,
+        "metric_diagnostics": {
+          "sort_elems_per_s": {
+            "nominal_bound": 52800000000.00001,
+            "status": "unmeasured"
+          },
+          "sort_elems_per_s_per_aiv": {
+            "cv_pct": 0.3276,
+            "nominal_bound": 52800000000.00001,
+            "status": "calibrated"
+          }
+        },
+        "probe_sort_length": 1024,
+        "probe_sort_passes": 4,
         "sort_algorithm": "sort32_mrgsort4",
+        "sort_die_elems_per_s_p50": 29057890204.78,
         "supported_sortall_lengths": [
           64,
           128,
@@ -394,11 +1418,12 @@
           512,
           1024,
           2048
-        ]
+        ],
+        "work_unit": "elem_passes_per_s"
       },
       "status": "calibrated",
       "units": {
-        "rate": "elems_per_s"
+        "rate": "elem_passes_per_s_per_aiv"
       }
     },
     "P11_simt": {
@@ -412,6 +1437,10 @@
           "bound_kind": "rate_upper",
           "certified_upper_capacity": 0.0
         },
+        "simt_warp_instructions_per_s_per_aiv": {
+          "bound_kind": "rate_upper",
+          "certified_upper_capacity": 0.0
+        },
         "syncthreads_ns": {
           "bound_kind": "latency_lower",
           "certified_upper_capacity": 0.0
@@ -420,23 +1449,100 @@
       "modes": {},
       "parameters": {
         "catlass_max_threads": 0,
+        "metric_diagnostics": {
+          "simt_launch_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          },
+          "simt_ops_per_s_per_aiv": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          },
+          "simt_warp_instructions_per_s_per_aiv": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          },
+          "syncthreads_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          }
+        },
+        "simt_scalar_flops_per_s_per_aiv_p50": null,
         "simt_ub_carveout_bytes": 0,
+        "simt_ub_carveout_min_bytes": 0,
         "supported": false,
         "tla_max_threads": 0,
+        "warp_schedulers": 0,
         "warp_size": 32
       },
       "status": "unsupported",
       "units": {
         "latency": "ns",
-        "rate": "ops_per_s_per_aiv"
+        "rate": "warp_instructions_per_s_per_aiv"
       }
     },
     "P12_intracore_flag": {
-      "evidence_id": "",
+      "evidence_id": "capture://a3-9362-ep/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
       "metrics": {
+        "flag_m_fix_ns": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0,
+          "cv_pct": 0.5189,
+          "n_samples": 24,
+          "p05": 2.402062,
+          "p50": 2.42,
+          "p95": 2.43925,
+          "p99": 2.440481,
+          "trimmed_cv_pct": 0.4263,
+          "trimmed_mean": 2.41775
+        },
+        "flag_mte2_v_ns": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0,
+          "cv_pct": 0.7252,
+          "n_samples": 24,
+          "p05": 2.398313,
+          "p50": 2.418438,
+          "p95": 2.453437,
+          "p99": 2.458225,
+          "trimmed_cv_pct": 0.5411,
+          "trimmed_mean": 2.418844
+        },
         "flag_ns": {
           "bound_kind": "latency_lower",
-          "certified_upper_capacity": 0.0
+          "certified_upper_capacity": 0.0,
+          "cv_pct": 0.4658,
+          "n_samples": 24,
+          "p05": 2.404031,
+          "p50": 2.415312,
+          "p95": 2.437,
+          "p99": 2.440531,
+          "trimmed_cv_pct": 0.3651,
+          "trimmed_mean": 2.416094
+        },
+        "flag_v_mte3_ns": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0,
+          "cv_pct": 0.7529,
+          "n_samples": 24,
+          "p05": 2.399219,
+          "p50": 2.415313,
+          "p95": 2.448031,
+          "p99": 2.45775,
+          "trimmed_cv_pct": 0.6135,
+          "trimmed_mean": 2.419531
+        },
+        "pipe_v_barrier_ns": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0,
+          "cv_pct": 0.9709,
+          "n_samples": 24,
+          "p05": 1.793313,
+          "p50": 1.810312,
+          "p95": 1.848937,
+          "p99": 1.8564,
+          "trimmed_cv_pct": 0.6727,
+          "trimmed_mean": 1.811781
         },
         "unitflag_ns": {
           "bound_kind": "latency_lower",
@@ -446,23 +1552,70 @@
       "modes": {},
       "parameters": {
         "event_ids": 8,
+        "metric_diagnostics": {
+          "flag_m_fix_ns": {
+            "cv_pct": 0.5189,
+            "nominal_bound": 0.0,
+            "status": "calibrated"
+          },
+          "flag_mte2_v_ns": {
+            "cv_pct": 0.7252,
+            "nominal_bound": 0.0,
+            "status": "calibrated"
+          },
+          "flag_ns": {
+            "cv_pct": 0.4658,
+            "nominal_bound": 0.0,
+            "status": "calibrated"
+          },
+          "flag_v_mte3_ns": {
+            "cv_pct": 0.7529,
+            "nominal_bound": 0.0,
+            "status": "calibrated"
+          },
+          "pipe_v_barrier_ns": {
+            "cv_pct": 0.9709,
+            "nominal_bound": 0.0,
+            "status": "calibrated"
+          },
+          "unitflag_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          }
+        },
         "unit_flag_requires_single_l0c_stage": true
       },
-      "status": "unmeasured",
+      "status": "calibrated",
       "units": {
         "latency": "ns"
       }
     },
     "P13_crosscore_sync": {
-      "evidence_id": "",
+      "evidence_id": "capture://a3-9362-ep/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
       "metrics": {
         "mode0_aic_barrier_ns": {
           "bound_kind": "latency_lower",
-          "certified_upper_capacity": 0.0
+          "certified_upper_capacity": 0.0,
+          "cv_pct": 0.1483,
+          "n_samples": 24,
+          "p05": 570.483014,
+          "p50": 570.999995,
+          "p95": 572.88699,
+          "p99": 573.458992,
+          "trimmed_cv_pct": 0.1041,
+          "trimmed_mean": 571.229997
         },
         "mode0_aiv_barrier_ns": {
           "bound_kind": "latency_lower",
-          "certified_upper_capacity": 0.0
+          "certified_upper_capacity": 0.0,
+          "cv_pct": 0.138,
+          "n_samples": 24,
+          "p05": 1035.987994,
+          "p50": 1037.400007,
+          "p95": 1040.306997,
+          "p99": 1040.370848,
+          "trimmed_cv_pct": 0.1106,
+          "trimmed_mean": 1037.705997
         },
         "mode1_subblock_ns": {
           "bound_kind": "latency_lower",
@@ -470,7 +1623,15 @@
         },
         "mode2_paired_ns": {
           "bound_kind": "latency_lower",
-          "certified_upper_capacity": 0.0
+          "certified_upper_capacity": 0.0,
+          "cv_pct": 0.6245,
+          "n_samples": 24,
+          "p05": 568.495505,
+          "p50": 573.455006,
+          "p95": 578.984524,
+          "p99": 580.184126,
+          "trimmed_cv_pct": 0.5072,
+          "trimmed_mean": 573.637994
         }
       },
       "modes": {},
@@ -478,10 +1639,33 @@
         "aic_inter_block_barrier_id": 9,
         "aiv_inter_block_barrier_id": 8,
         "ffts_max_flag_id": 7,
+        "hw_flag_ids": 16,
         "intra_subblock_barrier_id": 10,
+        "metric_diagnostics": {
+          "mode0_aic_barrier_ns": {
+            "cv_pct": 0.1483,
+            "nominal_bound": 0.0,
+            "status": "calibrated"
+          },
+          "mode0_aiv_barrier_ns": {
+            "cv_pct": 0.138,
+            "nominal_bound": 0.0,
+            "status": "calibrated"
+          },
+          "mode1_subblock_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          },
+          "mode2_paired_ns": {
+            "cv_pct": 0.6245,
+            "nominal_bound": 0.0,
+            "status": "calibrated"
+          }
+        },
+        "mode4_supported": false,
         "reverse_depth": 15
       },
-      "status": "unmeasured",
+      "status": "calibrated",
       "units": {
         "latency": "ns"
       }
@@ -496,10 +1680,18 @@
       },
       "modes": {},
       "parameters": {
-        "max_mutex_ids": 28,
+        "hw_mutex_ids": 0,
+        "max_mutex_ids": 0,
+        "metric_diagnostics": {
+          "mutex_overhead_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          }
+        },
+        "supported": false,
         "unit_flag_requires_single_l0c_stage": true
       },
-      "status": "unmeasured",
+      "status": "unsupported",
       "units": {
         "latency": "ns"
       }
@@ -513,22 +1705,102 @@
         },
         "aiv_first_issue_ns": {
           "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0,
+          "cv_pct": 3.0555,
+          "n_samples": 12,
+          "p05": 1658.5,
+          "p50": 1729.99996,
+          "p95": 1803.500007,
+          "p99": 1816.700005,
+          "trimmed_cv_pct": 1.964,
+          "trimmed_mean": 1734.999998
+        },
+        "host_submit_burst_ns": {
+          "bound_kind": "latency_lower",
           "certified_upper_capacity": 0.0
         },
         "host_submit_ns": {
           "bound_kind": "latency_lower",
-          "certified_upper_capacity": 0.0
+          "certified_upper_capacity": 0.0,
+          "cv_pct": 4.8546,
+          "n_samples": 24,
+          "p05": 8269.90625,
+          "p50": 8752.851562,
+          "p95": 9018.304688,
+          "p99": 9137.770313,
+          "trimmed_cv_pct": 2.5774,
+          "trimmed_mean": 8653.863281
         },
         "issue_interval_ns": {
           "bound_kind": "latency_lower",
-          "certified_upper_capacity": 0.0
+          "certified_upper_capacity": 0.0,
+          "cv_pct": 1.2671,
+          "n_samples": 24,
+          "p05": 923.145817,
+          "p50": 944.583366,
+          "p95": 961.604188,
+          "p99": 965.837514,
+          "trimmed_cv_pct": 0.8448,
+          "trimmed_mean": 944.770843
+        },
+        "npugraph_issue_ns": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0,
+          "cv_pct": 1.6779,
+          "n_samples": 24,
+          "p05": 4467.859375,
+          "p50": 4583.74992,
+          "p95": 4683.484486,
+          "p99": 4708.918869,
+          "trimmed_cv_pct": 1.4105,
+          "trimmed_mean": 4574.312526
         }
       },
       "modes": {},
       "parameters": {
+        "first_issue_includes_min_kernel": true,
+        "issue_interval_includes_min_kernel": true,
+        "issue_interval_owner": "aiv",
         "lanes": 1,
+        "metric_diagnostics": {
+          "aic_first_issue_ns": {
+            "cv_pct": 16.1019,
+            "nominal_bound": 0.0,
+            "observed_p50": 2114.999981,
+            "observed_p99": 3212.399952,
+            "status": "high_cv_unsealed"
+          },
+          "aiv_first_issue_ns": {
+            "cv_pct": 3.0555,
+            "nominal_bound": 0.0,
+            "status": "calibrated"
+          },
+          "host_submit_burst_ns": {
+            "cv_pct": 7.1159,
+            "nominal_bound": 0.0,
+            "observed_p50": 16061.640054,
+            "observed_p99": 18843.873695,
+            "status": "high_cv_unsealed"
+          },
+          "host_submit_ns": {
+            "cv_pct": 4.8546,
+            "nominal_bound": 0.0,
+            "status": "calibrated"
+          },
+          "issue_interval_ns": {
+            "cv_pct": 1.2671,
+            "nominal_bound": 0.0,
+            "status": "calibrated"
+          },
+          "npugraph_issue_ns": {
+            "cv_pct": 1.6779,
+            "nominal_bound": 0.0,
+            "status": "calibrated"
+          }
+        },
         "queue_depth": 64,
-        "queue_scope": "die"
+        "queue_scope": "die",
+        "unmeasured_reason": "requires_ascendc_microkernel"
       },
       "status": "unmeasured",
       "units": {
@@ -536,7 +1808,7 @@
       }
     },
     "P16_multistream_core_control": {
-      "evidence_id": "",
+      "evidence_id": "capture://a3-9362-ep/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
       "metrics": {
         "set_limit_ns": {
           "bound_kind": "latency_lower",
@@ -544,17 +1816,36 @@
         },
         "stream_event_ns": {
           "bound_kind": "latency_lower",
-          "certified_upper_capacity": 0.0
+          "certified_upper_capacity": 0.0,
+          "cv_pct": 4.1258,
+          "n_samples": 24,
+          "p05": 1007.218746,
+          "p50": 1071.250008,
+          "p95": 1121.609419,
+          "p99": 1124.665657,
+          "trimmed_cv_pct": 3.6947,
+          "trimmed_mean": 1061.281248
         }
       },
       "modes": {},
       "parameters": {
+        "metric_diagnostics": {
+          "set_limit_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          },
+          "stream_event_ns": {
+            "cv_pct": 4.1258,
+            "nominal_bound": 0.0,
+            "status": "calibrated"
+          }
+        },
         "modes": [
           "disjoint",
           "shared_cap"
         ]
       },
-      "status": "unmeasured",
+      "status": "calibrated",
       "units": {
         "latency": "ns"
       }
@@ -581,7 +1872,29 @@
       },
       "modes": {},
       "parameters": {
-        "aclgraph_cacheable": true
+        "aclgraph_cacheable": true,
+        "metric_diagnostics": {
+          "aicpu_base_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          },
+          "eager_d2h_sync_ns": {
+            "cv_pct": 5.1338,
+            "nominal_bound": 0.0,
+            "observed_p50": 33971.25,
+            "observed_p99": 39212.65,
+            "status": "high_cv_unsealed"
+          },
+          "gm_pub_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          },
+          "host_select_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          }
+        },
+        "unmeasured_reason": "requires_aicpu_metadata_select_probe"
       },
       "status": "unmeasured",
       "units": {
@@ -593,7 +1906,19 @@
       "metrics": {
         "link_bytes_per_s": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 196000000000.0
+          "certified_upper_capacity": 196000000000.0,
+          "cv_pct": 3.821,
+          "n_samples": 24,
+          "p05": 97605716046.76201,
+          "p50": 107086087725.7341,
+          "p95": 108296496011.49387,
+          "p99": 108535637424.08989,
+          "trimmed_cv_pct": 1.8428,
+          "trimmed_mean": 106529416525.51859
+        },
+        "startup_blocked_ns": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0
         },
         "startup_ns": {
           "bound_kind": "latency_lower",
@@ -602,8 +1927,38 @@
       },
       "modes": {},
       "parameters": {
+        "bandwidth_definition": "two_rank_allreduce_busbw_equals_algbw",
+        "curves_by_topology": {},
+        "group_max": 2,
+        "group_min": 2,
+        "mc2_contention": {},
+        "measured_collective": "all_reduce",
+        "measured_scope": "package",
+        "measured_world_size": 2,
+        "metric_diagnostics": {
+          "link_bytes_per_s": {
+            "cv_pct": 3.821,
+            "nominal_bound": 196000000000.0,
+            "status": "calibrated"
+          },
+          "startup_blocked_ns": {
+            "cv_pct": 96.1848,
+            "nominal_bound": 0.0,
+            "observed_p50": 38055.937737,
+            "observed_p99": 211924.564242,
+            "status": "high_cv_unsealed"
+          },
+          "startup_ns": {
+            "cv_pct": 60.4564,
+            "nominal_bound": 0.0,
+            "observed_p50": 104956.250638,
+            "observed_p99": 432703.608871,
+            "status": "high_cv_unsealed"
+          }
+        },
         "payload_bytes_per_frame": 1024,
         "short_final_frame_policy": "exact_plus_header",
+        "unmeasured_reason": "requires_multirank_peer_die",
         "wire_bytes_per_frame": 1024
       },
       "status": "unmeasured",
@@ -626,9 +1981,62 @@
       },
       "modes": {},
       "parameters": {
-        "token_payload_bytes_per_frame": 480,
-        "token_wire_bytes_per_frame": 512,
-        "transport": "a3_sio_hccs"
+        "curves_by_topology": {},
+        "hccl_duplex_diagnostics": {
+          "hccl_duplex_4k_blocked_ns": {
+            "band": {
+              "bound_kind": "latency_lower",
+              "certified_upper_capacity": 0.0
+            },
+            "diagnostic": {
+              "cv_pct": 132.114,
+              "nominal_bound": 0.0,
+              "observed_p50": 52768.437192,
+              "observed_p99": 623605.946898,
+              "status": "high_cv_unsealed"
+            }
+          },
+          "hccl_duplex_4k_ns": {
+            "band": {
+              "bound_kind": "latency_lower",
+              "certified_upper_capacity": 0.0
+            },
+            "diagnostic": {
+              "cv_pct": 71.8722,
+              "nominal_bound": 0.0,
+              "observed_p50": 112752.184272,
+              "observed_p99": 570076.735616,
+              "status": "high_cv_unsealed"
+            }
+          },
+          "hccl_duplex_bytes_per_s": {
+            "band": {
+              "bound_kind": "rate_upper",
+              "certified_upper_capacity": 196000000000.0
+            },
+            "diagnostic": {
+              "cv_pct": 17.2691,
+              "nominal_bound": 196000000000.0,
+              "observed_p50": 121073665995.3388,
+              "observed_p99": 123642581727.7758,
+              "status": "high_cv_unsealed"
+            }
+          }
+        },
+        "metric_diagnostics": {
+          "peer_bytes_per_s": {
+            "nominal_bound": 196000000000.0,
+            "status": "unmeasured"
+          },
+          "status_sync_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          }
+        },
+        "token_payload_bytes_per_frame": 1024,
+        "token_wire_bytes_per_frame": 1024,
+        "transport": "a3_sio_hccs",
+        "unmeasured_reason": "requires_direct_window_kernel"
       },
       "status": "unmeasured",
       "units": {
@@ -637,7 +2045,7 @@
       }
     },
     "P20_host_dma_sync": {
-      "evidence_id": "capture://lab-a3-9362/camp-202611-l0-a3-9362/e45ac4e414371e0b6f9bef258be3d0b652067b1eccbcdf4a770610b9378581d9",
+      "evidence_id": "capture://a3-9362-ep/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
       "metrics": {
         "eager_d2h_sync_ns": {
           "bound_kind": "latency_lower",
@@ -645,27 +2053,27 @@
         },
         "host_d2h_bytes_per_s": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 42700000000.0,
-          "cv_pct": 4.0127,
-          "n_samples": 32,
-          "p05": 32954175084.943027,
-          "p50": 37211310113.15362,
-          "p95": 38634460831.15808,
-          "p99": 38710143818.622955,
-          "trimmed_cv_pct": 1.6928,
-          "trimmed_mean": 37170175695.82442
+          "certified_upper_capacity": 48000000000.0,
+          "cv_pct": 1.5282,
+          "n_samples": 24,
+          "p05": 37298131128.0361,
+          "p50": 37823832217.23663,
+          "p95": 38989089796.32134,
+          "p99": 39115083276.680916,
+          "trimmed_cv_pct": 1.2049,
+          "trimmed_mean": 37913218851.78163
         },
         "host_h2d_bytes_per_s": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 58400000000.0,
-          "cv_pct": 4.8087,
-          "n_samples": 32,
-          "p05": 45904127448.250305,
-          "p50": 51098347971.43324,
-          "p95": 54203587688.91011,
-          "p99": 54634769817.44151,
-          "trimmed_cv_pct": 2.6899,
-          "trimmed_mean": 51091877541.44958
+          "certified_upper_capacity": 64000000000.0,
+          "cv_pct": 2.5996,
+          "n_samples": 24,
+          "p05": 50987534317.50142,
+          "p50": 53585062204.299545,
+          "p95": 54725889563.6155,
+          "p99": 55451517399.73498,
+          "trimmed_cv_pct": 2.1743,
+          "trimmed_mean": 53276782675.47797
         },
         "host_rc_d2h_bytes_per_s": {
           "bound_kind": "rate_upper",
@@ -675,18 +2083,104 @@
           "bound_kind": "rate_upper",
           "certified_upper_capacity": 238800000000.0
         },
+        "pageable_d2h_startup_ns": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0
+        },
         "pageable_dma_startup_ns": {
           "bound_kind": "latency_lower",
           "certified_upper_capacity": 0.0
         },
+        "pageable_h2d_startup_ns": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0
+        },
+        "pinned_d2h_startup_ns": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0,
+          "cv_pct": 3.7782,
+          "n_samples": 24,
+          "p05": 63403.870971,
+          "p50": 65593.47769,
+          "p95": 70558.683635,
+          "p99": 71665.144283,
+          "trimmed_cv_pct": 2.7644,
+          "trimmed_mean": 65817.174083
+        },
         "pinned_dma_startup_ns": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0
+        },
+        "pinned_h2d_startup_ns": {
           "bound_kind": "latency_lower",
           "certified_upper_capacity": 0.0
         }
       },
       "modes": {},
       "parameters": {
-        "contention_scope": "root_complex"
+        "contention_scope": "root_complex",
+        "dma_curve_by_size": {},
+        "metric_diagnostics": {
+          "eager_d2h_sync_ns": {
+            "cv_pct": 5.1338,
+            "nominal_bound": 0.0,
+            "observed_p50": 33971.25,
+            "observed_p99": 39212.65,
+            "status": "high_cv_unsealed"
+          },
+          "host_d2h_bytes_per_s": {
+            "cv_pct": 1.5282,
+            "nominal_bound": 48000000000.0,
+            "status": "calibrated"
+          },
+          "host_h2d_bytes_per_s": {
+            "cv_pct": 2.5996,
+            "nominal_bound": 64000000000.0,
+            "status": "calibrated"
+          },
+          "host_rc_d2h_bytes_per_s": {
+            "nominal_bound": 160000000000.0,
+            "status": "unmeasured"
+          },
+          "host_rc_h2d_bytes_per_s": {
+            "nominal_bound": 238800000000.0,
+            "status": "unmeasured"
+          },
+          "pageable_d2h_startup_ns": {
+            "cv_pct": 23.6802,
+            "nominal_bound": 0.0,
+            "observed_p50": 64428.064572,
+            "observed_p99": 116223.877132,
+            "status": "high_cv_unsealed"
+          },
+          "pageable_dma_startup_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          },
+          "pageable_h2d_startup_ns": {
+            "cv_pct": 70.9619,
+            "nominal_bound": 0.0,
+            "observed_p50": 115955.972082,
+            "observed_p99": 335651.015824,
+            "status": "high_cv_unsealed"
+          },
+          "pinned_d2h_startup_ns": {
+            "cv_pct": 3.7782,
+            "nominal_bound": 0.0,
+            "status": "calibrated"
+          },
+          "pinned_dma_startup_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          },
+          "pinned_h2d_startup_ns": {
+            "cv_pct": 8.2052,
+            "nominal_bound": 0.0,
+            "observed_p50": 63959.548846,
+            "observed_p99": 76561.945055,
+            "status": "high_cv_unsealed"
+          }
+        }
       },
       "status": "calibrated",
       "units": {
@@ -697,10 +2191,15 @@
   },
   "provenance": {
     "calibrated": true,
-    "campaign_id": "camp-202611-l0-a3-9362",
-    "capture_uri": "capture://lab-a3-9362/camp-202611-l0-a3-9362/e45ac4e414371e0b6f9bef258be3d0b652067b1eccbcdf4a770610b9378581d9",
-    "collected_utc": "2026-11-21T01:05:25Z",
-    "endpoint_alias": "lab-a3-9362",
+    "campaign_id": "camp-202611-l0",
+    "capture_uri": "capture://a3-9362-ep/camp-202611-l0/2f0903daf6ee5848d902710cc9ce7078468b80340565eda37dc4b463ff624382",
+    "clock_calibration": {
+      "core_clock_scale_ratio": 1.1,
+      "nominal_cube_freq_mhz": 1500.0,
+      "observed_aicore_freq_mhz": 1650
+    },
+    "collected_utc": "2026-11-21T19:27:29Z",
+    "endpoint_alias": "a3-9362-ep",
     "silicon_fingerprint": {
       "aic_count": 20,
       "aiv_count": 40,

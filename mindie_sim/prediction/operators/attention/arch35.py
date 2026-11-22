@@ -30,16 +30,16 @@ from ...runtime.memory_physics import (
     _intersect_byte_intervals, _measure_byte_intervals, _merge_byte_intervals, _subtract_byte_intervals,
 )
 from ..contracts import OperatorPlanningContext
+from ..sharedkv.sfa_native import SFA_SPLIT_G_HEADS, build_arch35_split_g_sfa
 from ._fia import dense_fia
 from .common import (
-    ARCH35, BF16_BYTES, C8_ABI, C8_LATENT_DIM, C8_MODES, C8_ROPE_DIM, C8_ROW_BYTES,
+    ARCH35, BF16_BYTES, C8_ABI, C8_LATENT_DIM, C8_MODES, C8_ROPE_DIM, C8_ROW_BYTES, C8_V1_ABI,
     FIA_ABI, FIA_TILE, FP32_BYTES, GBSA_ABI, INDEX_BYTES, MINDIE_ABIS, MINDIE_V1_ABI, MINDIE_V3_ABI,
     NOPE_ABI, PAGED_LAYOUTS, QUANT_MODE_BF16, QUANT_MODE_FP8_C8, QUANT_MODE_INT8_C8,
     QUANT_MODE_MINDIE_FP8, QUANT_MODE_MXFP4_CX, QUANT_MODE_MXFP4_OCP, QUANT_MODE_MXFP8,
-    QUANT_MODE_TQ4, SCALE_ADDRESS_BYTES, SECTOR_BYTES, SOFTMAX_OPS, SUPPORTED_ABIS, TQ4_ROW_BYTES,
+    QUANT_MODE_TQ4, SCALE_ADDRESS_BYTES, SECTOR_BYTES, SFA_V1_ABI, SOFTMAX_OPS, SUPPORTED_ABIS, TQ4_ROW_BYTES,
     AttentionContract, AttentionPhase, _placement, _stage, attention_owner_waves, bsh_kv_access_plan, contract_for_requests,
-    make_plan, output_phases,
-    owner_pairs, packed_gather_run_plans, packed_selection_runs, read_work, sparse_kv_extents, unmodeled,
+    make_plan, output_phases, owner_pairs, packed_gather_run_plans, packed_selection_runs, read_work, sparse_kv_extents, unmodeled,
 )
 
 UPSTREAM_ABI = "aclnnGenericBlockSparseAttention"
@@ -132,29 +132,18 @@ SOURCES: tuple[SourceRef, ...] = (
         "vllm-project/vllm-ascend", VLLM_MLA_REVISION, "vllm_ascend/attention/context_parallel/common_cp.py",
         "670f1ffa9c08cd316b5564c9ca03d7a6f4bb1aa6d7e5b81bde5287630903350c",
     ),
-    SourceRef(
-        "vllm-project/vllm-ascend", VLLM_STACK_REVISION, "vllm_ascend/attention/context_parallel/attention_cp.py",
-        "d784faa60393e7d543f7c52b2d4f63a8af69810292af231c6ef769ce8de4d02e",
-    ),
-    SourceRef(
-        "vllm-project/vllm-ascend", VLLM_STACK_REVISION, "vllm_ascend/attention/context_parallel/common_cp.py",
-        "e20eaa698b825c24a9ab37f83870391d944aef7d57fa7e6d680db0c306cc5f65",
-    ),
-    SourceRef(
-        "vllm-project/vllm-ascend", VLLM_REVISION, "vllm_ascend/ops/triton/dcp/dcp_a2a.py",
-        "40f1339048c1e61a6de11c5633d70755ccb47ffc15889524d4c6234a89cdd69e",
-    ),
-    SourceRef(
-        "vllm-project/vllm-ascend", VLLM_STACK_REVISION, "vllm_ascend/ops/triton/dcp/dcp_a2a.py",
-        "40f1339048c1e61a6de11c5633d70755ccb47ffc15889524d4c6234a89cdd69e",
-    ),
+    SourceRef("vllm-project/vllm-ascend", VLLM_STACK_REVISION, "vllm_ascend/attention/context_parallel/attention_cp.py", "d784faa60393e7d543f7c52b2d4f63a8af69810292af231c6ef769ce8de4d02e"),
+    SourceRef("vllm-project/vllm-ascend", VLLM_STACK_REVISION, "vllm_ascend/attention/context_parallel/common_cp.py", "e20eaa698b825c24a9ab37f83870391d944aef7d57fa7e6d680db0c306cc5f65"),
+    SourceRef("vllm-project/vllm-ascend", VLLM_REVISION, "vllm_ascend/ops/triton/dcp/dcp_a2a.py", "40f1339048c1e61a6de11c5633d70755ccb47ffc15889524d4c6234a89cdd69e"),
+    SourceRef("vllm-project/vllm-ascend", VLLM_STACK_REVISION, "vllm_ascend/ops/triton/dcp/dcp_a2a.py", "40f1339048c1e61a6de11c5633d70755ccb47ffc15889524d4c6234a89cdd69e"),
 )
 (FIA_SOURCE, GBSA_SOURCE, C8_TILING_SOURCE, C8_VECTOR_SOURCE, NOPE_SOURCE, MINDIE_SOURCE,
  FIA_KERNEL_SOURCE, MXFP4_KERNEL_SOURCE, MXFP4_TILING_SOURCE, MXFP4_CALLER_SOURCE,
  MINDIE_FP8_KERNEL_SOURCE, *CP_SOURCES) = SOURCES
 SOURCES_BY_ABI = {
-    FIA_ABI: (FIA_SOURCE, FIA_KERNEL_SOURCE), GBSA_ABI: (GBSA_SOURCE,), C8_ABI: (C8_TILING_SOURCE, C8_VECTOR_SOURCE),
-    NOPE_ABI: (NOPE_SOURCE,), **{abi: (MINDIE_SOURCE,) for abi in MINDIE_ABIS},
+    FIA_ABI: (FIA_SOURCE, FIA_KERNEL_SOURCE), GBSA_ABI: (GBSA_SOURCE,),
+    C8_ABI: (C8_TILING_SOURCE, C8_VECTOR_SOURCE), C8_V1_ABI: (C8_TILING_SOURCE, C8_VECTOR_SOURCE),
+    SFA_V1_ABI: (NOPE_SOURCE,), NOPE_ABI: (NOPE_SOURCE,), **{abi: (MINDIE_SOURCE,) for abi in MINDIE_ABIS},
 }
 MXFP4_SCALE_GROUP = 32
 MXFP4_BLOCK_ALIGNMENT = 2 * MXFP4_SCALE_GROUP
@@ -489,11 +478,17 @@ class _PackedAttention:
         ))
 
 
-def _packed_kv(op, contract, ctx, sources):
+def _validate_c8_abi(contract: AttentionContract) -> None:
+    if contract.quant_mode == QUANT_MODE_TQ4:
+        raise unmodeled("attention_arch35_tq4_unsupported", "TQ4 packed latent cache is supported on Arch22 only, not Arch35")
     if (contract.quant_mode not in C8_MODES or contract.num_kv_heads != 1
             or contract.v_head_dim != C8_LATENT_DIM
             or contract.head_dim not in {C8_LATENT_DIM, C8_LATENT_DIM + C8_ROPE_DIM}):
-        raise unmodeled("attention_c8_abi_shape", "Bind the packed latent C8 or TQ4 cache geometry")
+        raise unmodeled("attention_c8_abi_shape", "Bind the packed latent C8 cache geometry")
+
+
+def _packed_kv(op, contract, ctx, sources):
+    _validate_c8_abi(contract)
     size = TQ4_ROW_BYTES if contract.quant_mode == QUANT_MODE_TQ4 else C8_ROW_BYTES
     counts = tuple(contract.row_counts())
     capacity = _l2_capacity(ctx)
@@ -817,9 +812,11 @@ class _Strategy:
         ctx.datapath.route("ub", "l1")
         if contract.abi == FIA_ABI:
             return dense_fia(op, contract, ctx, sources, gm_workspace=False)
-        if contract.abi == C8_ABI:
-            return _packed_kv(op, contract, ctx, sources)
-        return _sparse(op, contract, ctx, sources)
-
-
+        if contract.abi in {C8_ABI, C8_V1_ABI}:
+            _validate_c8_abi(contract)
+        if contract.abi == SFA_V1_ABI and contract.splits == 1:
+            return build_arch35_split_g_sfa(op, contract, ctx, sources)
+        if contract.abi in {C8_V1_ABI, C8_ABI} and contract.splits == 1 and not contract.selection_lists and contract.num_heads > SFA_SPLIT_G_HEADS:
+            return build_arch35_split_g_sfa(op, contract, ctx, sources)
+        return _packed_kv(op, contract, ctx, sources) if contract.abi in {C8_ABI, C8_V1_ABI} else _sparse(op, contract, ctx, sources)
 STRATEGY = _Strategy()

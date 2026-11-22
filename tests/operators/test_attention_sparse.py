@@ -95,6 +95,10 @@ def test_contiguous_rows_share_sectors_and_verify_retains_repeated_accesses(mode
     assert warm.dram_sector_bytes == 3 * sectors * 32 and warm.l2_hit_bytes == issued - warm.dram_sector_bytes
     op = governed.make_kv_quant_sfa_c8_op(op_id="verify", query_tokens=1 + k_spec, num_heads=8,
         rope_dim=64, quant_mode=mode, selection_lists=selections)
+    if mode == 3:
+        with pytest.raises(UnmodeledCapabilityError, match="attention_arch35_tq4_unsupported"):
+            governed.build(op, geometry())
+        return
     plan = governed.build(op, geometry())
     phase = stages(plan)
     assert plan.metadata["kv_logical_bytes"] == 12 * row and plan.metadata["kv_gather_rows"] == 12

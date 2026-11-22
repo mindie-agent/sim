@@ -1,14 +1,46 @@
 {
   "arch_preset": "npu_arch_2201",
   "cann_version": "9.2.1",
-  "envelope_sha256": "8bf24ef9011e3e254620f16271e66f8f449d16b91d72c71c158939aff41f4684",
+  "envelope_sha256": "ef9fa06d0747009fc78a0d6bf007beb046edf1a31f2c3e3ba744c42b032694a9",
   "primitives": {
     "P01_datacopy": {
-      "evidence_id": "",
+      "evidence_id": "capture://a3-9382-ep/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
       "metrics": {
         "hbm_read_bytes_per_s": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 1600000000000.0
+          "certified_upper_capacity": 1600000000000.0,
+          "cv_pct": 0.687,
+          "n_samples": 24,
+          "p05": 1471328191646.411,
+          "p50": 1494449356232.2214,
+          "p95": 1503897359742.4534,
+          "p99": 1504462328210.0657,
+          "trimmed_cv_pct": 0.4113,
+          "trimmed_mean": 1493305008078.6055
+        },
+        "hbm_rw11_bytes_per_s": {
+          "bound_kind": "rate_upper",
+          "certified_upper_capacity": 1600000000000.0,
+          "cv_pct": 0.7699,
+          "n_samples": 24,
+          "p05": 1237252378746.4785,
+          "p50": 1246856156438.623,
+          "p95": 1265783014961.6921,
+          "p99": 1266535926492.21,
+          "trimmed_cv_pct": 0.6109,
+          "trimmed_mean": 1247954302490.8413
+        },
+        "hbm_rw21_bytes_per_s": {
+          "bound_kind": "rate_upper",
+          "certified_upper_capacity": 1600000000000.0,
+          "cv_pct": 1.2264,
+          "n_samples": 24,
+          "p05": 1098182987108.9911,
+          "p50": 1122880316234.027,
+          "p95": 1134275909672.8003,
+          "p99": 1134756068848.273,
+          "trimmed_cv_pct": 1.0999,
+          "trimmed_mean": 1119384676802.776
         },
         "hbm_rw_alpha": {
           "bound_kind": "latency_lower",
@@ -16,29 +48,435 @@
         },
         "hbm_write_bytes_per_s": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 1600000000000.0
+          "certified_upper_capacity": 1600000000000.0,
+          "cv_pct": 0.6978,
+          "n_samples": 24,
+          "p05": 1401957176823.4456,
+          "p50": 1415948188955.914,
+          "p95": 1433016580008.7388,
+          "p99": 1434281227878.8696,
+          "trimmed_cv_pct": 0.5263,
+          "trimmed_mean": 1417016933521.214
         },
         "mte2_aic_hit_bytes_per_s_per_core": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 52800000000.0
+          "certified_upper_capacity": 460800000000.0,
+          "cv_pct": 0.0673,
+          "n_samples": 12,
+          "p05": 217915032578.3705,
+          "p50": 218063936242.7062,
+          "p95": 218366674911.89844,
+          "p99": 218366674911.89844,
+          "trimmed_cv_pct": 0.0529,
+          "trimmed_mean": 218076945433.48553
         },
         "mte2_aiv_hit_bytes_per_s_per_core": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 52800000000.0
+          "certified_upper_capacity": 230400000000.0,
+          "cv_pct": 0.1875,
+          "n_samples": 24,
+          "p05": 108011540861.0262,
+          "p50": 108281358113.77438,
+          "p95": 108592142276.18292,
+          "p99": 108634780302.51791,
+          "trimmed_cv_pct": 0.1266,
+          "trimmed_mean": 108280453649.01573
         }
       },
       "modes": {},
       "parameters": {
-        "burst_turn_penalty": [],
-        "l2_cache_ctl_supported": false,
+        "bisheng_version": "2026-10-23T10:55:39+08:00 clang version 15.0.5 (clang-5c68a1cb1231 flang-5c68a1cb1231)",
+        "burst_turn_penalty": [
+          {
+            "evidence_id": "capture://a3-9382-ep/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
+            "max_row_bytes": 64,
+            "max_stride_bytes": 1024,
+            "min_row_bytes": 32,
+            "min_stride_bytes": 512,
+            "penalty_bytes": 480.0
+          },
+          {
+            "evidence_id": "capture://a3-9382-ep/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
+            "max_row_bytes": 64,
+            "max_stride_bytes": 4096,
+            "min_row_bytes": 32,
+            "min_stride_bytes": 1024,
+            "penalty_bytes": 480.0
+          },
+          {
+            "evidence_id": "capture://a3-9382-ep/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
+            "max_row_bytes": 64,
+            "max_stride_bytes": null,
+            "min_row_bytes": 32,
+            "min_stride_bytes": 4096,
+            "penalty_bytes": 480.0
+          },
+          {
+            "evidence_id": "capture://a3-9382-ep/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
+            "max_row_bytes": 128,
+            "max_stride_bytes": 1024,
+            "min_row_bytes": 64,
+            "min_stride_bytes": 512,
+            "penalty_bytes": 448.0
+          },
+          {
+            "evidence_id": "capture://a3-9382-ep/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
+            "max_row_bytes": 128,
+            "max_stride_bytes": 4096,
+            "min_row_bytes": 64,
+            "min_stride_bytes": 1024,
+            "penalty_bytes": 448.0
+          },
+          {
+            "evidence_id": "capture://a3-9382-ep/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
+            "max_row_bytes": 128,
+            "max_stride_bytes": null,
+            "min_row_bytes": 64,
+            "min_stride_bytes": 4096,
+            "penalty_bytes": 448.0
+          },
+          {
+            "evidence_id": "capture://a3-9382-ep/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
+            "max_row_bytes": 256,
+            "max_stride_bytes": 1024,
+            "min_row_bytes": 128,
+            "min_stride_bytes": 512,
+            "penalty_bytes": 383.96
+          },
+          {
+            "evidence_id": "capture://a3-9382-ep/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
+            "max_row_bytes": 256,
+            "max_stride_bytes": 4096,
+            "min_row_bytes": 128,
+            "min_stride_bytes": 1024,
+            "penalty_bytes": 384.0
+          },
+          {
+            "evidence_id": "capture://a3-9382-ep/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
+            "max_row_bytes": 256,
+            "max_stride_bytes": null,
+            "min_row_bytes": 128,
+            "min_stride_bytes": 4096,
+            "penalty_bytes": 384.0
+          },
+          {
+            "evidence_id": "capture://a3-9382-ep/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
+            "max_row_bytes": 512,
+            "max_stride_bytes": 1024,
+            "min_row_bytes": 256,
+            "min_stride_bytes": 512,
+            "penalty_bytes": 256.0
+          },
+          {
+            "evidence_id": "capture://a3-9382-ep/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
+            "max_row_bytes": 512,
+            "max_stride_bytes": 4096,
+            "min_row_bytes": 256,
+            "min_stride_bytes": 1024,
+            "penalty_bytes": 256.0
+          },
+          {
+            "evidence_id": "capture://a3-9382-ep/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
+            "max_row_bytes": 512,
+            "max_stride_bytes": null,
+            "min_row_bytes": 256,
+            "min_stride_bytes": 4096,
+            "penalty_bytes": 256.0
+          }
+        ],
+        "core_clock_scale_ratio": 1.0,
+        "gather_v2_cold_surface": {
+          "1024B": {
+            "random_scatter_rw_bps": 1204774797056.6,
+            "row_bytes": 1024,
+            "scatter_penalty_ratio": 0.9286,
+            "sequential_rw_bps": 1118748033615.56
+          },
+          "128B": {
+            "random_scatter_rw_bps": 425228962008.11,
+            "row_bytes": 128,
+            "scatter_penalty_ratio": 1.0059,
+            "sequential_rw_bps": 427752127320.69
+          },
+          "2048B": {
+            "random_scatter_rw_bps": 1525060953707.36,
+            "row_bytes": 2048,
+            "scatter_penalty_ratio": 0.8992,
+            "sequential_rw_bps": 1371403947141.51
+          },
+          "256B": {
+            "random_scatter_rw_bps": 791607889627.94,
+            "row_bytes": 256,
+            "scatter_penalty_ratio": 1.0043,
+            "sequential_rw_bps": 795024366526.52
+          },
+          "4096B": {
+            "random_scatter_rw_bps": 1634016068726.43,
+            "row_bytes": 4096,
+            "scatter_penalty_ratio": 0.8864,
+            "sequential_rw_bps": 1448348420145.31
+          },
+          "512B": {
+            "random_scatter_rw_bps": 1400852395348.01,
+            "row_bytes": 512,
+            "scatter_penalty_ratio": 0.9525,
+            "sequential_rw_bps": 1334250410640.86
+          },
+          "576B": {
+            "random_scatter_rw_bps": 780938865391.69,
+            "row_bytes": 576,
+            "scatter_penalty_ratio": 1.0533,
+            "sequential_rw_bps": 822576252131.08
+          }
+        },
+        "gm_alignment_cold_bps": {
+          "off_0B": 1489952509762.18,
+          "off_128B": 1490783506928.08,
+          "off_256B": 1492447504889.02,
+          "off_32B": 1491614874777.74,
+          "off_64B": 1492780670860.4
+        },
+        "hbm_burst_granule_bytes": 512,
+        "hbm_read_datacopy_blocked_bps_p50": 1494449356232.22,
+        "hbm_scatter_row_open_bytes": 0,
+        "ini_filename": "Ascend910_9382.ini",
+        "ini_sha256": "d2d84c0ded236393ef40284673cb62bc234e503ed4f0967f31a637f965aadd29",
+        "l2_cache_ctl_mechanism": "l2_cache_alter_dual_va",
+        "l2_cache_ctl_supported": true,
+        "metric_diagnostics": {
+          "hbm_read_bytes_per_s": {
+            "cv_pct": 0.687,
+            "nominal_bound": 1600000000000.0,
+            "status": "calibrated"
+          },
+          "hbm_rw11_bytes_per_s": {
+            "cv_pct": 0.7699,
+            "nominal_bound": 1600000000000.0,
+            "status": "calibrated"
+          },
+          "hbm_rw21_bytes_per_s": {
+            "cv_pct": 1.2264,
+            "nominal_bound": 1600000000000.0,
+            "status": "calibrated"
+          },
+          "hbm_rw_alpha": {
+            "admissible_max": 1.0,
+            "cv_pct": 1.3729,
+            "nominal_bound": 0.0,
+            "observed_p05": 1.305867,
+            "observed_p50": 1.341709,
+            "observed_p99": 1.366579,
+            "status": "p99_exceeds_nominal_conflict"
+          },
+          "hbm_write_bytes_per_s": {
+            "cv_pct": 0.6978,
+            "nominal_bound": 1600000000000.0,
+            "status": "calibrated"
+          },
+          "mte2_aic_hit_bytes_per_s_per_core": {
+            "cv_pct": 0.0673,
+            "nominal_bound": 460800000000.0,
+            "status": "calibrated"
+          },
+          "mte2_aiv_hit_bytes_per_s_per_core": {
+            "cv_pct": 0.1875,
+            "nominal_bound": 230400000000.0,
+            "status": "calibrated"
+          }
+        },
+        "mte2_aic_cold_scaling_bps": {
+          "1": 139950168976.24,
+          "12": 1346358955937.29,
+          "16": 1454152130351.96,
+          "2": 276989093441.6,
+          "24": 1455723884688.08,
+          "4": 537386923297.89,
+          "8": 1014495530893.13
+        },
+        "mte2_aic_warm_scaling_bps": {
+          "1": 313227175472.05,
+          "12": 3420895196895.01,
+          "16": 4497162709776.91,
+          "2": 606084029319.44,
+          "24": 5233534469824.95,
+          "4": 1204282003896.2,
+          "8": 2344107397641.7
+        },
+        "nominal_cube_freq_mhz": 1800.0,
+        "observed_aicore_freq_mhz": 1800,
+        "observed_cur_freq_mhz": 800,
+        "payload_ramp_bytes_per_s": {
+          "1024KB": {
+            "cold_ring_bytes": 805306368,
+            "cold_verified": true,
+            "read_bps": 106090904321.87,
+            "rw11_bps": 399172390606.87,
+            "write_bps": 222627600454.83
+          },
+          "131072KB": {
+            "cold_ring_bytes": 805306368,
+            "cold_verified": true,
+            "read_bps": 1330732980932.69,
+            "rw11_bps": 1250922495662.39,
+            "write_bps": 1418492205393.35
+          },
+          "16384KB": {
+            "cold_ring_bytes": 805306368,
+            "cold_verified": true,
+            "read_bps": 810493517701.7,
+            "rw11_bps": 1122221789856.94,
+            "write_bps": 1290555096523.67
+          },
+          "16KB": {
+            "cold_ring_bytes": 805306368,
+            "cold_verified": true,
+            "read_bps": 3755644865.27,
+            "rw11_bps": 45511112260.82,
+            "write_bps": 14928474144.11
+          },
+          "256KB": {
+            "cold_ring_bytes": 805306368,
+            "cold_verified": true,
+            "read_bps": 28712376349.66,
+            "rw11_bps": 433295861778.89,
+            "write_bps": 60963722160.84
+          },
+          "4096KB": {
+            "cold_ring_bytes": 805306368,
+            "cold_verified": true,
+            "read_bps": 356355473505.75,
+            "rw11_bps": 846479110086.13,
+            "write_bps": 565270086828.01
+          },
+          "64KB": {
+            "cold_ring_bytes": 805306368,
+            "cold_verified": true,
+            "read_bps": 11178848513.2,
+            "rw11_bps": 160824538555.93,
+            "write_bps": 33119897121.59
+          },
+          "65536KB": {
+            "cold_ring_bytes": 805306368,
+            "cold_verified": true,
+            "read_bps": 1191140653247.71,
+            "rw11_bps": 1192410515967.73,
+            "write_bps": 1347026567405.0
+          }
+        },
+        "runtime_cann_version": "9.2.1",
         "sector_bytes": 32,
-        "silicon_profile_conflict": {
-          "observed_aic_count": 24,
-          "observed_aicore_freq_mhz": 1800,
-          "profile_aic_count": 20
-        }
+        "strided_cold_surface": [
+          {
+            "bps_p50": 93179147353.12,
+            "cold_evicted": true,
+            "row_bytes": 32,
+            "stride_bytes": 512
+          },
+          {
+            "bps_p50": 89693504496.54,
+            "cold_evicted": true,
+            "row_bytes": 32,
+            "stride_bytes": 1024
+          },
+          {
+            "bps_p50": 73705030407.47,
+            "cold_evicted": true,
+            "row_bytes": 32,
+            "stride_bytes": 4096
+          },
+          {
+            "bps_p50": 186505612113.62,
+            "cold_evicted": true,
+            "row_bytes": 64,
+            "stride_bytes": 512
+          },
+          {
+            "bps_p50": 180332956576.75,
+            "cold_evicted": true,
+            "row_bytes": 64,
+            "stride_bytes": 1024
+          },
+          {
+            "bps_p50": 147825564005.01,
+            "cold_evicted": true,
+            "row_bytes": 64,
+            "stride_bytes": 4096
+          },
+          {
+            "bps_p50": 373644458051.09,
+            "cold_evicted": true,
+            "row_bytes": 128,
+            "stride_bytes": 512
+          },
+          {
+            "bps_p50": 360831403170.95,
+            "cold_evicted": true,
+            "row_bytes": 128,
+            "stride_bytes": 1024
+          },
+          {
+            "bps_p50": 295651128010.01,
+            "cold_evicted": true,
+            "row_bytes": 128,
+            "stride_bytes": 4096
+          },
+          {
+            "bps_p50": 665594848269.86,
+            "cold_evicted": true,
+            "row_bytes": 256,
+            "stride_bytes": 512
+          },
+          {
+            "bps_p50": 648202797644.76,
+            "cold_evicted": true,
+            "row_bytes": 256,
+            "stride_bytes": 1024
+          },
+          {
+            "bps_p50": 549952468440.92,
+            "cold_evicted": true,
+            "row_bytes": 256,
+            "stride_bytes": 4096
+          },
+          {
+            "bps_p50": 1437655920337.57,
+            "cold_evicted": true,
+            "row_bytes": 512,
+            "stride_bytes": 1024
+          },
+          {
+            "bps_p50": 1370694079951.0,
+            "cold_evicted": true,
+            "row_bytes": 512,
+            "stride_bytes": 2048
+          },
+          {
+            "bps_p50": 1230722960812.77,
+            "cold_evicted": true,
+            "row_bytes": 512,
+            "stride_bytes": 4096
+          },
+          {
+            "bps_p50": 1442049546999.82,
+            "cold_evicted": true,
+            "row_bytes": 1024,
+            "stride_bytes": 2048
+          },
+          {
+            "bps_p50": 1367707823428.64,
+            "cold_evicted": true,
+            "row_bytes": 1024,
+            "stride_bytes": 4096
+          },
+          {
+            "bps_p50": 1454752070280.45,
+            "cold_evicted": true,
+            "row_bytes": 2048,
+            "stride_bytes": 4096
+          }
+        ]
       },
-      "status": "unmeasured",
+      "status": "calibrated",
       "units": {
         "alpha": "dimensionless",
         "penalty": "bytes",
@@ -46,63 +484,186 @@
       }
     },
     "P02_load_data": {
-      "evidence_id": "",
+      "evidence_id": "capture://a3-9382-ep/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
       "metrics": {
         "l1_to_l0a_bytes_per_s_per_aic": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 422400000000.0
+          "certified_upper_capacity": 460800000000.0,
+          "cv_pct": 0.0341,
+          "n_samples": 24,
+          "p05": 453066029720.1167,
+          "p50": 453363787797.3141,
+          "p95": 453531618029.03394,
+          "p99": 453536325070.94037,
+          "trimmed_cv_pct": 0.0262,
+          "trimmed_mean": 453334009474.9147
+        },
+        "l1_to_l0a_transpose_bytes_per_s_per_aic": {
+          "bound_kind": "rate_upper",
+          "certified_upper_capacity": 460800000000.0,
+          "cv_pct": 0.0282,
+          "n_samples": 24,
+          "p05": 453106747103.7087,
+          "p50": 453348108508.4129,
+          "p95": 453500238400.9753,
+          "p99": 453529107606.68384,
+          "trimmed_cv_pct": 0.0213,
+          "trimmed_mean": 453338707308.4704
         },
         "l1_to_l0b_bytes_per_s_per_aic": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 211200000000.0
+          "certified_upper_capacity": 230400000000.0,
+          "cv_pct": 0.0158,
+          "n_samples": 24,
+          "p05": 228480591049.62057,
+          "p50": 228539543371.80496,
+          "p95": 228571422466.51422,
+          "p99": 228571422466.51422,
+          "trimmed_cv_pct": 0.0082,
+          "trimmed_mean": 228538750326.00616
+        },
+        "l1_to_l0b_transpose_bytes_per_s_per_aic": {
+          "bound_kind": "rate_upper",
+          "certified_upper_capacity": 230400000000.0,
+          "cv_pct": 0.0245,
+          "n_samples": 24,
+          "p05": 228388616727.31213,
+          "p50": 228535565117.149,
+          "p95": 228570228657.14276,
+          "p99": 228577569409.85788,
+          "trimmed_cv_pct": 0.0161,
+          "trimmed_mean": 228520428181.2226
         },
         "setup_ns": {
           "bound_kind": "latency_lower",
-          "certified_upper_capacity": 0.0
+          "certified_upper_capacity": 0.0,
+          "cv_pct": 0.3676,
+          "n_samples": 24,
+          "p05": 14.894833,
+          "p50": 14.968333,
+          "p95": 15.023333,
+          "p99": 15.115732,
+          "trimmed_cv_pct": 0.2247,
+          "trimmed_mean": 14.968333
         }
       },
       "modes": {},
       "parameters": {
         "fractal_bytes": 512,
+        "measured_l0a_transpose_ratio": 1.000035,
+        "measured_l0b_transpose_ratio": 1.000017,
+        "metric_diagnostics": {
+          "l1_to_l0a_bytes_per_s_per_aic": {
+            "cv_pct": 0.0341,
+            "nominal_bound": 460800000000.0,
+            "status": "calibrated"
+          },
+          "l1_to_l0a_transpose_bytes_per_s_per_aic": {
+            "cv_pct": 0.0282,
+            "nominal_bound": 460800000000.0,
+            "status": "calibrated"
+          },
+          "l1_to_l0b_bytes_per_s_per_aic": {
+            "cv_pct": 0.0158,
+            "nominal_bound": 230400000000.0,
+            "status": "calibrated"
+          },
+          "l1_to_l0b_transpose_bytes_per_s_per_aic": {
+            "cv_pct": 0.0245,
+            "nominal_bound": 230400000000.0,
+            "status": "calibrated"
+          },
+          "setup_ns": {
+            "cv_pct": 0.3676,
+            "nominal_bound": 0.0,
+            "status": "calibrated"
+          }
+        },
+        "mx_scale_bytes_per_cyc": 0,
         "mx_scale_supported": false,
-        "transpose_factor": 1.0
+        "transpose_factor": 1.0,
+        "transpose_l0b_factor": 1.0
       },
-      "status": "unmeasured",
+      "status": "calibrated",
       "units": {
         "latency": "ns",
         "rate": "bytes_per_s_per_aic"
       }
     },
     "P03_fixpipe": {
-      "evidence_id": "",
+      "evidence_id": "capture://a3-9382-ep/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
       "metrics": {
         "fixpipe_in_bytes_per_s_per_aic": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 211200000000.0
+          "certified_upper_capacity": 460800000000.0,
+          "cv_pct": 0.049,
+          "n_samples": 24,
+          "p05": 205089364747.61792,
+          "p50": 205136555329.29626,
+          "p95": 205413350321.89932,
+          "p99": 205436079136.72568,
+          "trimmed_cv_pct": 0.032,
+          "trimmed_mean": 205159370919.10736
         },
         "fixpipe_out_bytes_per_s_per_aic": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 211200000000.0
+          "certified_upper_capacity": 230400000000.0,
+          "cv_pct": 0.049,
+          "n_samples": 24,
+          "p05": 102544682373.80896,
+          "p50": 102568277664.64813,
+          "p95": 102706675160.94966,
+          "p99": 102718039568.36284,
+          "trimmed_cv_pct": 0.032,
+          "trimmed_mean": 102579685459.55368
         },
         "setup_ns": {
           "bound_kind": "latency_lower",
-          "certified_upper_capacity": 0.0
+          "certified_upper_capacity": 0.0,
+          "cv_pct": 0.2128,
+          "n_samples": 24,
+          "p05": 165.489336,
+          "p50": 166.153337,
+          "p95": 166.630336,
+          "p99": 166.863527,
+          "trimmed_cv_pct": 0.1282,
+          "trimmed_mean": 166.123334
         }
       },
       "modes": {},
       "parameters": {
+        "dual_target_ub_supported": false,
         "has_l0c_to_l1": true,
         "has_l0c_to_ub": false,
+        "metric_diagnostics": {
+          "fixpipe_in_bytes_per_s_per_aic": {
+            "cv_pct": 0.049,
+            "nominal_bound": 460800000000.0,
+            "status": "calibrated"
+          },
+          "fixpipe_out_bytes_per_s_per_aic": {
+            "cv_pct": 0.049,
+            "nominal_bound": 230400000000.0,
+            "status": "calibrated"
+          },
+          "setup_ns": {
+            "cv_pct": 0.2128,
+            "nominal_bound": 0.0,
+            "status": "calibrated"
+          }
+        },
+        "nz2dn_stride_gt1_div": 1,
+        "split_m_supported": false,
         "ub_split_n_align_elems": 32
       },
-      "status": "unmeasured",
+      "status": "calibrated",
       "units": {
         "latency": "ns",
         "rate": "bytes_per_s_per_aic"
       }
     },
     "P04_mte3_store": {
-      "evidence_id": "",
+      "evidence_id": "capture://a3-9382-ep/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
       "metrics": {
         "atomic_contention_ns": {
           "bound_kind": "latency_lower",
@@ -114,7 +675,15 @@
         },
         "mte3_store_bytes_per_s_per_aiv": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 105600000000.0
+          "certified_upper_capacity": 115200000000.0,
+          "cv_pct": 2.0151,
+          "n_samples": 24,
+          "p05": 51581933026.325264,
+          "p50": 53039433493.00981,
+          "p95": 54341629879.945114,
+          "p99": 54568730192.730644,
+          "trimmed_cv_pct": 1.769,
+          "trimmed_mean": 53027873114.3098
         },
         "setup_ns": {
           "bound_kind": "latency_lower",
@@ -124,24 +693,65 @@
       "modes": {},
       "parameters": {
         "has_ub_to_l1": false,
-        "silicon_profile_conflict": {
-          "observed_aic_count": 24,
-          "observed_aicore_freq_mhz": 1800,
-          "profile_aic_count": 20
+        "indexed_update_diagnostic": {
+          "band": {
+            "bound_kind": "rate_upper",
+            "certified_upper_capacity": 11059200000000.0,
+            "cv_pct": 1.3862,
+            "n_samples": 24,
+            "p05": 3599928205.45914,
+            "p50": 3669222702.289537,
+            "p95": 3741543109.98718,
+            "p99": 3755786077.61338,
+            "trimmed_cv_pct": 1.124,
+            "trimmed_mean": 3662602923.294284
+          },
+          "diagnostic": {
+            "cv_pct": 1.3862,
+            "nominal_bound": 11059200000000.0,
+            "status": "calibrated"
+          }
+        },
+        "metric_diagnostics": {
+          "atomic_contention_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          },
+          "atomic_rmw_bytes_per_s": {
+            "nominal_bound": 1600000000000.0,
+            "status": "unmeasured"
+          },
+          "mte3_store_bytes_per_s_per_aiv": {
+            "cv_pct": 2.0151,
+            "nominal_bound": 115200000000.0,
+            "status": "calibrated"
+          },
+          "setup_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          }
         }
       },
-      "status": "unmeasured",
+      "status": "calibrated",
       "units": {
         "latency": "ns",
         "rate": "bytes_per_s"
       }
     },
     "P05_l2_residency_reuse": {
-      "evidence_id": "",
+      "evidence_id": "capture://a3-9382-ep/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
       "metrics": {
         "l2_die_bytes_per_s": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 4224000000000.0
+          "certified_upper_capacity": 11059200000000.0,
+          "cv_pct": 0.4329,
+          "n_samples": 24,
+          "p05": 1926024978205.7327,
+          "p50": 1942035331715.72,
+          "p95": 1946696668811.1067,
+          "p99": 1946764412684.7368,
+          "trimmed_cv_pct": 0.368,
+          "trimmed_mean": 1938668603626.9563
         },
         "l2_effective_fraction": {
           "bound_kind": "rate_upper",
@@ -151,27 +761,119 @@
       "modes": {},
       "parameters": {
         "buffer_units_l2": 1,
-        "cache_disable_supported": false,
-        "granule_bytes": 128,
+        "cache_disable_mechanism": "l2_cache_alter_dual_va",
+        "cache_disable_supported": true,
+        "cache_persistent_supported": false,
+        "granule_bytes": 512,
         "l2_bytes": 201326592,
-        "silicon_profile_conflict": {
-          "observed_aic_count": 24,
-          "observed_aicore_freq_mhz": 1800,
-          "profile_aic_count": 20
+        "l2_line_bytes": 512,
+        "l2_sector_bytes": 512,
+        "l2_stride_conflict": [
+          {
+            "bps_p50": 2739006210715.25,
+            "kind": "contiguous",
+            "stride_bytes": 128
+          },
+          {
+            "bps_p50": 1441110183945.8,
+            "kind": "pow2",
+            "stride_bytes": 512
+          },
+          {
+            "bps_p50": 820421063684.53,
+            "kind": "coprime",
+            "stride_bytes": 544
+          },
+          {
+            "bps_p50": 1436110589359.44,
+            "kind": "pow2",
+            "stride_bytes": 1024
+          },
+          {
+            "bps_p50": 845193009341.03,
+            "kind": "coprime",
+            "stride_bytes": 1056
+          },
+          {
+            "bps_p50": 1413847755804.4,
+            "kind": "pow2",
+            "stride_bytes": 4096
+          },
+          {
+            "bps_p50": 837479148464.1,
+            "kind": "coprime",
+            "stride_bytes": 4128
+          },
+          {
+            "bps_p50": 807953766875.55,
+            "kind": "pow2",
+            "stride_bytes": 16384
+          },
+          {
+            "bps_p50": 816610694194.73,
+            "kind": "coprime",
+            "stride_bytes": 16416
+          },
+          {
+            "bps_p50": 453934309236.44,
+            "kind": "pow2",
+            "stride_bytes": 32768
+          },
+          {
+            "bps_p50": 528743545394.04,
+            "kind": "coprime",
+            "stride_bytes": 32800
+          },
+          {
+            "bps_p50": 177756485062.43,
+            "kind": "pow2",
+            "stride_bytes": 65536
+          },
+          {
+            "bps_p50": 252014080852.18,
+            "kind": "coprime",
+            "stride_bytes": 65568
+          },
+          {
+            "bps_p50": 98303998535.16,
+            "kind": "pow2",
+            "stride_bytes": 131072
+          }
+        ],
+        "metric_diagnostics": {
+          "l2_die_bytes_per_s": {
+            "cv_pct": 0.4329,
+            "nominal_bound": 11059200000000.0,
+            "status": "calibrated"
+          },
+          "l2_effective_fraction": {
+            "cv_pct": 2.0444,
+            "nominal_bound": 1.0,
+            "observed_p05": 1.005559,
+            "observed_p50": 1.040641,
+            "observed_p99": 1.074737,
+            "status": "p99_exceeds_nominal_conflict"
+          }
         },
         "ws_sweep_bytes_per_s": {
-          "128MiB": 4945386933095.78,
-          "160MiB": 5321033156932.54,
-          "192MiB": 4659265505977.0,
-          "256MiB": 1246334192511.55,
-          "320MiB": 1257096956407.82,
-          "32MiB": 3111237073942.56,
-          "64MiB": 4041486798560.98,
-          "8MiB": 1461564111969.33,
-          "96MiB": 4636725810766.86
+          "112MiB": 1854421458695.83,
+          "128MiB": 1890923255813.77,
+          "144MiB": 1907224286677.15,
+          "160MiB": 1942035331715.72,
+          "16MiB": 984433996993.46,
+          "192MiB": 1708911966951.12,
+          "208MiB": 1620786286005.77,
+          "224MiB": 1373734388239.94,
+          "256MiB": 1376380308129.24,
+          "320MiB": 1408607197239.25,
+          "32MiB": 1358891660629.48,
+          "4MiB": 370357973870.54,
+          "64MiB": 1666369449343.71,
+          "8MiB": 633820024479.74,
+          "96MiB": 1808214505273.06
         }
       },
-      "status": "unmeasured",
+      "status": "calibrated",
       "units": {
         "capacity": "bytes",
         "fraction": "dimensionless",
@@ -179,83 +881,331 @@
       }
     },
     "P06_mmad": {
-      "evidence_id": "",
+      "evidence_id": "capture://a3-9382-ep/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
       "metrics": {
         "pipe_m_barrier_ns": {
           "bound_kind": "latency_lower",
-          "certified_upper_capacity": 0.0
+          "certified_upper_capacity": 0.0,
+          "cv_pct": 0.2759,
+          "n_samples": 24,
+          "p05": 1.6575,
+          "p50": 1.664062,
+          "p95": 1.67125,
+          "p99": 1.672694,
+          "trimmed_cv_pct": 0.2213,
+          "trimmed_mean": 1.664437
         }
       },
       "modes": {
         "bf16": {
+          "cube_k": 16,
           "cube_only_rate": {
             "bound_kind": "rate_upper",
-            "certified_upper_capacity": 13516800000000.0
+            "certified_upper_capacity": 14745600000000.0,
+            "cv_pct": 0.0209,
+            "n_samples": 24,
+            "p05": 14668286769354.027,
+            "p50": 14670765016318.598,
+            "p95": 14676404075101.818,
+            "p99": 14676938186501.994,
+            "trimmed_cv_pct": 0.0166,
+            "trimmed_mean": 14671444296013.613
           },
+          "evidence_id": "capture://a3-9382-ep/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
+          "k_0": 16,
           "m_iss": 16,
-          "status": "unmeasured",
+          "status": "calibrated",
           "tile_k": 16,
           "tile_m": 16,
           "tile_n": 16
         },
         "fp16": {
+          "cube_k": 16,
           "cube_only_rate": {
             "bound_kind": "rate_upper",
-            "certified_upper_capacity": 13516800000000.0
+            "certified_upper_capacity": 14745600000000.0,
+            "cv_pct": 0.0188,
+            "n_samples": 24,
+            "p05": 14669233412693.045,
+            "p50": 14670923120108.707,
+            "p95": 14676040301832.121,
+            "p99": 14676135090259.688,
+            "trimmed_cv_pct": 0.0136,
+            "trimmed_mean": 14671775765898.246
           },
+          "evidence_id": "capture://a3-9382-ep/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
+          "k_0": 16,
           "m_iss": 16,
-          "status": "unmeasured",
+          "status": "calibrated",
           "tile_k": 16,
           "tile_m": 16,
           "tile_n": 16
         },
         "fp32": {
+          "cube_k": 4,
           "cube_only_rate": {
             "bound_kind": "rate_upper",
-            "certified_upper_capacity": 3379200000000.0
+            "certified_upper_capacity": 3686400000000.0,
+            "cv_pct": 0.0114,
+            "n_samples": 24,
+            "p05": 3678181656811.924,
+            "p50": 3678538880751.49,
+            "p95": 3679168369587.2197,
+            "p99": 3679388372895.224,
+            "trimmed_cv_pct": 0.0098,
+            "trimmed_mean": 3678630258526.1626
           },
+          "evidence_id": "capture://a3-9382-ep/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
+          "k_0": 8,
           "m_iss": 16,
-          "status": "unmeasured",
+          "status": "calibrated",
           "tile_k": 8,
           "tile_m": 16,
           "tile_n": 16
         },
-        "int8": {
+        "hf32": {
+          "cube_k": 8,
           "cube_only_rate": {
             "bound_kind": "rate_upper",
-            "certified_upper_capacity": 27033600000000.0
+            "certified_upper_capacity": 7372800000000.0,
+            "cv_pct": 0.0161,
+            "n_samples": 24,
+            "p05": 7340936646533.188,
+            "p50": 7342099029897.526,
+            "p95": 7344797225828.517,
+            "p99": 7345112245298.3125,
+            "trimmed_cv_pct": 0.0113,
+            "trimmed_mean": 7342304804874.611
           },
+          "evidence_id": "capture://a3-9382-ep/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
+          "k_0": 8,
+          "m_iss": 16,
+          "status": "calibrated",
+          "tile_k": 8,
+          "tile_m": 16,
+          "tile_n": 16
+        },
+        "int4": {
+          "cube_k": 64,
+          "cube_only_rate": {
+            "bound_kind": "rate_upper",
+            "certified_upper_capacity": 58982400000000.0
+          },
+          "k_0": 64,
           "m_iss": 16,
           "status": "unmeasured",
+          "tile_k": 64,
+          "tile_m": 16,
+          "tile_n": 16
+        },
+        "int8": {
+          "cube_k": 32,
+          "cube_only_rate": {
+            "bound_kind": "rate_upper",
+            "certified_upper_capacity": 29491200000000.0,
+            "cv_pct": 0.0232,
+            "n_samples": 24,
+            "p05": 29360773470216.465,
+            "p50": 29370611010845.69,
+            "p95": 29381911513403.06,
+            "p99": 29382493509385.715,
+            "trimmed_cv_pct": 0.0185,
+            "trimmed_mean": 29371308274611.664
+          },
+          "evidence_id": "capture://a3-9382-ep/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
+          "k_0": 32,
+          "m_iss": 16,
+          "status": "calibrated",
           "tile_k": 32,
           "tile_m": 16,
           "tile_n": 16
         }
       },
       "parameters": {
-        "pipe_m_barrier_fractal_threshold": 10,
-        "silicon_profile_conflict": {
-          "observed_aic_count": 24,
-          "observed_aicore_freq_mhz": 1800,
-          "profile_aic_count": 20
+        "fp32_allow_hf32_recorded": true,
+        "gemm_e2e_flops_per_s_per_aic": {
+          "bf16": {
+            "band": {
+              "bound_kind": "rate_upper",
+              "certified_upper_capacity": 14745600000000.0,
+              "cv_pct": 0.1361,
+              "n_samples": 24,
+              "p05": 13447426004499.318,
+              "p50": 13483528615204.594,
+              "p95": 13503981629220.625,
+              "p99": 13513133946927.545,
+              "trimmed_cv_pct": 0.0909,
+              "trimmed_mean": 13482126409048.21
+            },
+            "diagnostic": {
+              "cv_pct": 0.1361,
+              "nominal_bound": 14745600000000.0,
+              "status": "calibrated"
+            }
+          },
+          "fp16": {
+            "band": {
+              "bound_kind": "rate_upper",
+              "certified_upper_capacity": 14745600000000.0,
+              "cv_pct": 0.1029,
+              "n_samples": 24,
+              "p05": 13462259470745.281,
+              "p50": 13476864929853.56,
+              "p95": 13498872104830.873,
+              "p99": 13504452828285.852,
+              "trimmed_cv_pct": 0.0826,
+              "trimmed_mean": 13479125670837.97
+            },
+            "diagnostic": {
+              "cv_pct": 0.1029,
+              "nominal_bound": 14745600000000.0,
+              "status": "calibrated"
+            }
+          },
+          "fp32": {
+            "band": {
+              "bound_kind": "rate_upper",
+              "certified_upper_capacity": 3686400000000.0,
+              "cv_pct": 0.0258,
+              "n_samples": 24,
+              "p05": 3554131694164.5083,
+              "p50": 3555837668599.1455,
+              "p95": 3557107639341.061,
+              "p99": 3557208004103.2773,
+              "trimmed_cv_pct": 0.0182,
+              "trimmed_mean": 3555859761322.0107
+            },
+            "diagnostic": {
+              "cv_pct": 0.0258,
+              "nominal_bound": 3686400000000.0,
+              "status": "calibrated"
+            }
+          },
+          "hf32": {
+            "band": {
+              "bound_kind": "rate_upper",
+              "certified_upper_capacity": 7372800000000.0,
+              "cv_pct": 0.1229,
+              "n_samples": 24,
+              "p05": 6590142890896.976,
+              "p50": 6597263915540.592,
+              "p95": 6612366079857.03,
+              "p99": 6613305169206.876,
+              "trimmed_cv_pct": 0.0984,
+              "trimmed_mean": 6599775303977.924
+            },
+            "diagnostic": {
+              "cv_pct": 0.1229,
+              "nominal_bound": 7372800000000.0,
+              "status": "calibrated"
+            }
+          },
+          "int8": {
+            "band": {
+              "bound_kind": "rate_upper",
+              "certified_upper_capacity": 29491200000000.0,
+              "cv_pct": 0.152,
+              "n_samples": 24,
+              "p05": 21296596881163.21,
+              "p50": 21345297774873.25,
+              "p95": 21387948126459.492,
+              "p99": 21391606490612.617,
+              "trimmed_cv_pct": 0.1242,
+              "trimmed_mean": 21342504484114.508
+            },
+            "diagnostic": {
+              "cv_pct": 0.152,
+              "nominal_bound": 29491200000000.0,
+              "status": "calibrated"
+            }
+          }
         },
+        "metric_diagnostics": {
+          "pipe_m_barrier_ns": {
+            "cv_pct": 0.2759,
+            "nominal_bound": 0.0,
+            "status": "calibrated"
+          }
+        },
+        "mode_coverage": {
+          "calibrated_count": 5,
+          "calibrated_modes": [
+            "bf16",
+            "fp16",
+            "fp32",
+            "hf32",
+            "int8"
+          ],
+          "conflict_modes": [],
+          "mode_diagnostics": {
+            "bf16": {
+              "cv_pct": 0.0209,
+              "nominal_bound": 14745600000000.0,
+              "status": "calibrated"
+            },
+            "fp16": {
+              "cv_pct": 0.0188,
+              "nominal_bound": 14745600000000.0,
+              "status": "calibrated"
+            },
+            "fp32": {
+              "cv_pct": 0.0114,
+              "nominal_bound": 3686400000000.0,
+              "status": "calibrated"
+            },
+            "hf32": {
+              "cv_pct": 0.0161,
+              "nominal_bound": 7372800000000.0,
+              "status": "calibrated"
+            },
+            "int4": {
+              "nominal_bound": 58982400000000.0,
+              "status": "unmeasured"
+            },
+            "int8": {
+              "cv_pct": 0.0232,
+              "nominal_bound": 29491200000000.0,
+              "status": "calibrated"
+            }
+          },
+          "supported_count": 6,
+          "unmeasured_modes": [
+            "int4"
+          ],
+          "unsupported_modes": [
+            "fp8_e4m3",
+            "fp8_e5m2",
+            "hifloat8",
+            "mxfp8",
+            "mxfp4"
+          ]
+        },
+        "pipe_m_barrier_fractal_threshold": 10,
         "small_m_bf16_ns": {
-          "1": 19110.0,
-          "128": 24165.0,
-          "16": 19347.5,
-          "256": 44500.0,
-          "32": 20107.5,
-          "64": 20342.5
+          "1": 34380.0,
+          "128": 37920.0,
+          "16": 36040.0,
+          "256": 62440.0,
+          "32": 37280.0,
+          "64": 36280.0
+        },
+        "small_m_bf16_warm_ns": {
+          "1": 19127.5,
+          "128": 24130.0,
+          "16": 19382.5,
+          "256": 44412.5,
+          "32": 20110.0,
+          "64": 20297.5
         }
       },
-      "status": "unmeasured",
+      "status": "calibrated",
       "units": {
         "latency": "ns",
         "rate": "flops_per_s_per_aic"
       }
     },
     "P07_vec_alu": {
-      "evidence_id": "",
+      "evidence_id": "capture://a3-9382-ep/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
       "metrics": {
         "raw_latency_cycles": {
           "bound_kind": "latency_lower",
@@ -263,27 +1213,46 @@
         },
         "vec_alu_ops_per_s_per_aiv": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 105600000000.0
+          "certified_upper_capacity": 57600000000.0,
+          "cv_pct": 0.134,
+          "n_samples": 24,
+          "p05": 36894462906.85753,
+          "p50": 36971678880.46762,
+          "p95": 37024107542.770775,
+          "p99": 37038881240.81519,
+          "trimmed_cv_pct": 0.0915,
+          "trimmed_mean": 36969623043.54633
         }
       },
       "modes": {},
       "parameters": {
         "bf16_lanes": 128,
         "fp32_lanes": 64,
-        "silicon_profile_conflict": {
-          "observed_aic_count": 24,
-          "observed_aicore_freq_mhz": 1800,
-          "profile_aic_count": 20
+        "metric_diagnostics": {
+          "raw_latency_cycles": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          },
+          "vec_alu_ops_per_s_per_aiv": {
+            "cv_pct": 0.134,
+            "nominal_bound": 57600000000.0,
+            "status": "calibrated"
+          }
         },
-        "vector_width_bytes": 256
+        "probe_ops_per_element": 2.0,
+        "ub_bank_groups": 16,
+        "ub_bank_size_bytes": 4096,
+        "ub_banks_per_group": 3,
+        "vector_width_bytes": 256,
+        "work_unit": "elementary_alu_ops_per_s"
       },
-      "status": "unmeasured",
+      "status": "calibrated",
       "units": {
         "rate": "ops_per_s_per_aiv"
       }
     },
     "P08_vec_sfu": {
-      "evidence_id": "",
+      "evidence_id": "capture://a3-9382-ep/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
       "metrics": {
         "raw_latency_cycles": {
           "bound_kind": "latency_lower",
@@ -291,70 +1260,152 @@
         },
         "vec_sfu_ops_per_s_per_aiv": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 52800000000.0
+          "certified_upper_capacity": 57600000000.0,
+          "cv_pct": 0.6446,
+          "n_samples": 24,
+          "p05": 46338775918.27662,
+          "p50": 46838192010.63699,
+          "p95": 47207984751.47995,
+          "p99": 47237107902.22843,
+          "trimmed_cv_pct": 0.5048,
+          "trimmed_mean": 46787164433.22635
         }
       },
       "modes": {},
       "parameters": {
         "bf16_lanes": 128,
         "fp32_lanes": 64,
-        "silicon_profile_conflict": {
-          "observed_aic_count": 24,
-          "observed_aicore_freq_mhz": 1800,
-          "profile_aic_count": 20
+        "metric_diagnostics": {
+          "raw_latency_cycles": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          },
+          "vec_sfu_ops_per_s_per_aiv": {
+            "cv_pct": 0.6446,
+            "nominal_bound": 57600000000.0,
+            "status": "calibrated"
+          }
         },
+        "ub_bank_groups": 16,
+        "ub_bank_size_bytes": 4096,
+        "ub_banks_per_group": 3,
         "vector_width_bytes": 256
       },
-      "status": "unmeasured",
+      "status": "calibrated",
       "units": {
         "rate": "ops_per_s_per_aiv"
       }
     },
     "P09_vec_reduce_cast": {
-      "evidence_id": "",
+      "evidence_id": "capture://a3-9382-ep/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
       "metrics": {
         "cast_bytes_per_s_per_aiv": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 52800000000.0
+          "certified_upper_capacity": 691200000000.0,
+          "cv_pct": 0.1851,
+          "n_samples": 24,
+          "p05": 422567533164.8071,
+          "p50": 423952557809.046,
+          "p95": 425070809377.80286,
+          "p99": 425169165175.3296,
+          "trimmed_cv_pct": 0.1324,
+          "trimmed_mean": 423848161352.4798
         },
         "vec_reduce_ops_per_s_per_aiv": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 52800000000.0
+          "certified_upper_capacity": 57600000000.0,
+          "cv_pct": 0.1222,
+          "n_samples": 24,
+          "p05": 15795537337.886082,
+          "p50": 15831480927.241276,
+          "p95": 15852927077.322863,
+          "p99": 15852928043.030891,
+          "trimmed_cv_pct": 0.095,
+          "trimmed_mean": 15829735752.623257
         }
       },
       "modes": {},
       "parameters": {
+        "metric_diagnostics": {
+          "cast_bytes_per_s_per_aiv": {
+            "cv_pct": 0.1851,
+            "nominal_bound": 691200000000.0,
+            "status": "calibrated"
+          },
+          "vec_reduce_ops_per_s_per_aiv": {
+            "cv_pct": 0.1222,
+            "nominal_bound": 57600000000.0,
+            "status": "calibrated"
+          }
+        },
         "mx_dynamic_quant_supported": false,
         "mx_scale_group": 32,
-        "silicon_profile_conflict": {
-          "observed_aic_count": 24,
-          "observed_aicore_freq_mhz": 1800,
-          "profile_aic_count": 20
-        }
+        "ub_bank_groups": 16,
+        "ub_bank_size_bytes": 4096,
+        "ub_banks_per_group": 3
       },
-      "status": "unmeasured",
+      "status": "calibrated",
       "units": {
         "cast_rate": "bytes_per_s_per_aiv",
         "rate": "ops_per_s_per_aiv"
       }
     },
     "P10_sort_topk": {
-      "evidence_id": "",
+      "evidence_id": "capture://a3-9382-ep/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
       "metrics": {
         "sort_elems_per_s": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 2112000000000.0
+          "certified_upper_capacity": 57600000000.0
+        },
+        "sort_elems_per_s_per_aiv": {
+          "bound_kind": "rate_upper",
+          "certified_upper_capacity": 57600000000.0,
+          "cv_pct": 0.1645,
+          "n_samples": 24,
+          "p05": 3158130034.529565,
+          "p50": 3164155952.505089,
+          "p95": 3171751632.059541,
+          "p99": 3172129900.865244,
+          "trimmed_cv_pct": 0.1296,
+          "trimmed_mean": 3164381088.597518
         }
       },
-      "modes": {},
+      "modes": {
+        "sort32_mrgsort4": {
+          "evidence_id": "capture://a3-9382-ep/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
+          "sort_elems_per_s_per_aiv": {
+            "bound_kind": "rate_upper",
+            "certified_upper_capacity": 57600000000.0,
+            "cv_pct": 0.1645,
+            "n_samples": 24,
+            "p05": 3158130034.529565,
+            "p50": 3164155952.505089,
+            "p95": 3171751632.059541,
+            "p99": 3172129900.865244,
+            "trimmed_cv_pct": 0.1296,
+            "trimmed_mean": 3164381088.597518
+          },
+          "status": "calibrated"
+        }
+      },
       "parameters": {
         "histogram_trunk_elems": 0,
-        "silicon_profile_conflict": {
-          "observed_aic_count": 24,
-          "observed_aicore_freq_mhz": 1800,
-          "profile_aic_count": 20
+        "masked_hist256_supported": false,
+        "metric_diagnostics": {
+          "sort_elems_per_s": {
+            "nominal_bound": 57600000000.0,
+            "status": "unmeasured"
+          },
+          "sort_elems_per_s_per_aiv": {
+            "cv_pct": 0.1645,
+            "nominal_bound": 57600000000.0,
+            "status": "calibrated"
+          }
         },
+        "probe_sort_length": 1024,
+        "probe_sort_passes": 4,
         "sort_algorithm": "sort32_mrgsort4",
+        "sort_die_elems_per_s_p50": 37969871430.06,
         "supported_sortall_lengths": [
           64,
           128,
@@ -362,11 +1413,12 @@
           512,
           1024,
           2048
-        ]
+        ],
+        "work_unit": "elem_passes_per_s"
       },
-      "status": "unmeasured",
+      "status": "calibrated",
       "units": {
-        "rate": "elems_per_s"
+        "rate": "elem_passes_per_s_per_aiv"
       }
     },
     "P11_simt": {
@@ -380,6 +1432,10 @@
           "bound_kind": "rate_upper",
           "certified_upper_capacity": 0.0
         },
+        "simt_warp_instructions_per_s_per_aiv": {
+          "bound_kind": "rate_upper",
+          "certified_upper_capacity": 0.0
+        },
         "syncthreads_ns": {
           "bound_kind": "latency_lower",
           "certified_upper_capacity": 0.0
@@ -388,23 +1444,100 @@
       "modes": {},
       "parameters": {
         "catlass_max_threads": 0,
+        "metric_diagnostics": {
+          "simt_launch_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          },
+          "simt_ops_per_s_per_aiv": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          },
+          "simt_warp_instructions_per_s_per_aiv": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          },
+          "syncthreads_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          }
+        },
+        "simt_scalar_flops_per_s_per_aiv_p50": null,
         "simt_ub_carveout_bytes": 0,
+        "simt_ub_carveout_min_bytes": 0,
         "supported": false,
         "tla_max_threads": 0,
+        "warp_schedulers": 0,
         "warp_size": 32
       },
       "status": "unsupported",
       "units": {
         "latency": "ns",
-        "rate": "ops_per_s_per_aiv"
+        "rate": "warp_instructions_per_s_per_aiv"
       }
     },
     "P12_intracore_flag": {
-      "evidence_id": "",
+      "evidence_id": "capture://a3-9382-ep/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
       "metrics": {
+        "flag_m_fix_ns": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0,
+          "cv_pct": 0.282,
+          "n_samples": 24,
+          "p05": 2.209031,
+          "p50": 2.2175,
+          "p95": 2.224906,
+          "p99": 2.230775,
+          "trimmed_cv_pct": 0.1893,
+          "trimmed_mean": 2.217781
+        },
+        "flag_mte2_v_ns": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0,
+          "cv_pct": 0.4132,
+          "n_samples": 24,
+          "p05": 2.204844,
+          "p50": 2.220937,
+          "p95": 2.230531,
+          "p99": 2.234956,
+          "trimmed_cv_pct": 0.3325,
+          "trimmed_mean": 2.219156
+        },
         "flag_ns": {
           "bound_kind": "latency_lower",
-          "certified_upper_capacity": 0.0
+          "certified_upper_capacity": 0.0,
+          "cv_pct": 0.3443,
+          "n_samples": 24,
+          "p05": 2.210281,
+          "p50": 2.217187,
+          "p95": 2.231219,
+          "p99": 2.235244,
+          "trimmed_cv_pct": 0.202,
+          "trimmed_mean": 2.217906
+        },
+        "flag_v_mte3_ns": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0,
+          "cv_pct": 0.3095,
+          "n_samples": 24,
+          "p05": 2.20725,
+          "p50": 2.217813,
+          "p95": 2.229,
+          "p99": 2.229856,
+          "trimmed_cv_pct": 0.2348,
+          "trimmed_mean": 2.21875
+        },
+        "pipe_v_barrier_ns": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0,
+          "cv_pct": 0.4986,
+          "n_samples": 24,
+          "p05": 1.649656,
+          "p50": 1.66625,
+          "p95": 1.673656,
+          "p99": 1.674713,
+          "trimmed_cv_pct": 0.399,
+          "trimmed_mean": 1.664281
         },
         "unitflag_ns": {
           "bound_kind": "latency_lower",
@@ -414,23 +1547,70 @@
       "modes": {},
       "parameters": {
         "event_ids": 8,
+        "metric_diagnostics": {
+          "flag_m_fix_ns": {
+            "cv_pct": 0.282,
+            "nominal_bound": 0.0,
+            "status": "calibrated"
+          },
+          "flag_mte2_v_ns": {
+            "cv_pct": 0.4132,
+            "nominal_bound": 0.0,
+            "status": "calibrated"
+          },
+          "flag_ns": {
+            "cv_pct": 0.3443,
+            "nominal_bound": 0.0,
+            "status": "calibrated"
+          },
+          "flag_v_mte3_ns": {
+            "cv_pct": 0.3095,
+            "nominal_bound": 0.0,
+            "status": "calibrated"
+          },
+          "pipe_v_barrier_ns": {
+            "cv_pct": 0.4986,
+            "nominal_bound": 0.0,
+            "status": "calibrated"
+          },
+          "unitflag_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          }
+        },
         "unit_flag_requires_single_l0c_stage": true
       },
-      "status": "unmeasured",
+      "status": "calibrated",
       "units": {
         "latency": "ns"
       }
     },
     "P13_crosscore_sync": {
-      "evidence_id": "",
+      "evidence_id": "capture://a3-9382-ep/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
       "metrics": {
         "mode0_aic_barrier_ns": {
           "bound_kind": "latency_lower",
-          "certified_upper_capacity": 0.0
+          "certified_upper_capacity": 0.0,
+          "cv_pct": 0.0876,
+          "n_samples": 24,
+          "p05": 626.718991,
+          "p50": 627.639994,
+          "p95": 628.528006,
+          "p99": 628.570805,
+          "trimmed_cv_pct": 0.0648,
+          "trimmed_mean": 627.574
         },
         "mode0_aiv_barrier_ns": {
           "bound_kind": "latency_lower",
-          "certified_upper_capacity": 0.0
+          "certified_upper_capacity": 0.0,
+          "cv_pct": 0.1753,
+          "n_samples": 24,
+          "p05": 1270.245966,
+          "p50": 1271.259993,
+          "p95": 1277.184993,
+          "p99": 1278.257834,
+          "trimmed_cv_pct": 0.1029,
+          "trimmed_mean": 1271.662006
         },
         "mode1_subblock_ns": {
           "bound_kind": "latency_lower",
@@ -438,7 +1618,15 @@
         },
         "mode2_paired_ns": {
           "bound_kind": "latency_lower",
-          "certified_upper_capacity": 0.0
+          "certified_upper_capacity": 0.0,
+          "cv_pct": 0.7263,
+          "n_samples": 24,
+          "p05": 687.600952,
+          "p50": 694.065005,
+          "p95": 704.613981,
+          "p99": 705.686761,
+          "trimmed_cv_pct": 0.4859,
+          "trimmed_mean": 694.065993
         }
       },
       "modes": {},
@@ -446,10 +1634,33 @@
         "aic_inter_block_barrier_id": 9,
         "aiv_inter_block_barrier_id": 8,
         "ffts_max_flag_id": 7,
+        "hw_flag_ids": 16,
         "intra_subblock_barrier_id": 10,
+        "metric_diagnostics": {
+          "mode0_aic_barrier_ns": {
+            "cv_pct": 0.0876,
+            "nominal_bound": 0.0,
+            "status": "calibrated"
+          },
+          "mode0_aiv_barrier_ns": {
+            "cv_pct": 0.1753,
+            "nominal_bound": 0.0,
+            "status": "calibrated"
+          },
+          "mode1_subblock_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          },
+          "mode2_paired_ns": {
+            "cv_pct": 0.7263,
+            "nominal_bound": 0.0,
+            "status": "calibrated"
+          }
+        },
+        "mode4_supported": false,
         "reverse_depth": 15
       },
-      "status": "unmeasured",
+      "status": "calibrated",
       "units": {
         "latency": "ns"
       }
@@ -464,10 +1675,18 @@
       },
       "modes": {},
       "parameters": {
-        "max_mutex_ids": 28,
+        "hw_mutex_ids": 0,
+        "max_mutex_ids": 0,
+        "metric_diagnostics": {
+          "mutex_overhead_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          }
+        },
+        "supported": false,
         "unit_flag_requires_single_l0c_stage": true
       },
-      "status": "unmeasured",
+      "status": "unsupported",
       "units": {
         "latency": "ns"
       }
@@ -481,27 +1700,108 @@
         },
         "aiv_first_issue_ns": {
           "bound_kind": "latency_lower",
-          "certified_upper_capacity": 0.0
+          "certified_upper_capacity": 0.0,
+          "cv_pct": 1.686,
+          "n_samples": 12,
+          "p05": 1781.000019,
+          "p50": 1810.000016,
+          "p95": 1857.999989,
+          "p99": 1875.599995,
+          "trimmed_cv_pct": 1.1643,
+          "trimmed_mean": 1812.999998
+        },
+        "host_submit_burst_ns": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0,
+          "cv_pct": 1.7551,
+          "n_samples": 24,
+          "p05": 13989.163472,
+          "p50": 14168.202142,
+          "p95": 14697.631559,
+          "p99": 14842.975743,
+          "trimmed_cv_pct": 1.3415,
+          "trimmed_mean": 14249.655942
         },
         "host_submit_ns": {
           "bound_kind": "latency_lower",
-          "certified_upper_capacity": 0.0
+          "certified_upper_capacity": 0.0,
+          "cv_pct": 1.818,
+          "n_samples": 24,
+          "p05": 7319.734375,
+          "p50": 7498.90625,
+          "p95": 7711.019531,
+          "p99": 7831.03125,
+          "trimmed_cv_pct": 1.2414,
+          "trimmed_mean": 7488.582031
         },
         "issue_interval_ns": {
           "bound_kind": "latency_lower",
-          "certified_upper_capacity": 0.0
+          "certified_upper_capacity": 0.0,
+          "cv_pct": 1.3686,
+          "n_samples": 24,
+          "p05": 922.645846,
+          "p50": 935.416669,
+          "p95": 957.062495,
+          "p99": 969.3708,
+          "trimmed_cv_pct": 1.0221,
+          "trimmed_mean": 938.874999
+        },
+        "npugraph_issue_ns": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0,
+          "cv_pct": 0.7487,
+          "n_samples": 24,
+          "p05": 1142.18751,
+          "p50": 1152.812503,
+          "p95": 1166.999975,
+          "p99": 1167.668743,
+          "trimmed_cv_pct": 0.6485,
+          "trimmed_mean": 1152.984367
         }
       },
       "modes": {},
       "parameters": {
+        "first_issue_includes_min_kernel": true,
+        "issue_interval_includes_min_kernel": true,
+        "issue_interval_owner": "aiv",
         "lanes": 1,
+        "metric_diagnostics": {
+          "aic_first_issue_ns": {
+            "cv_pct": 19.087,
+            "nominal_bound": 0.0,
+            "observed_p50": 2090.000024,
+            "observed_p99": 3215.59996,
+            "status": "high_cv_unsealed"
+          },
+          "aiv_first_issue_ns": {
+            "cv_pct": 1.686,
+            "nominal_bound": 0.0,
+            "status": "calibrated"
+          },
+          "host_submit_burst_ns": {
+            "cv_pct": 1.7551,
+            "nominal_bound": 0.0,
+            "status": "calibrated"
+          },
+          "host_submit_ns": {
+            "cv_pct": 1.818,
+            "nominal_bound": 0.0,
+            "status": "calibrated"
+          },
+          "issue_interval_ns": {
+            "cv_pct": 1.3686,
+            "nominal_bound": 0.0,
+            "status": "calibrated"
+          },
+          "npugraph_issue_ns": {
+            "cv_pct": 0.7487,
+            "nominal_bound": 0.0,
+            "status": "calibrated"
+          }
+        },
         "queue_depth": 64,
         "queue_scope": "die",
-        "silicon_profile_conflict": {
-          "observed_aic_count": 24,
-          "observed_aicore_freq_mhz": 1800,
-          "profile_aic_count": 20
-        }
+        "unmeasured_reason": "requires_ascendc_microkernel"
       },
       "status": "unmeasured",
       "units": {
@@ -509,7 +1809,7 @@
       }
     },
     "P16_multistream_core_control": {
-      "evidence_id": "",
+      "evidence_id": "capture://a3-9382-ep/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
       "metrics": {
         "set_limit_ns": {
           "bound_kind": "latency_lower",
@@ -517,22 +1817,36 @@
         },
         "stream_event_ns": {
           "bound_kind": "latency_lower",
-          "certified_upper_capacity": 0.0
+          "certified_upper_capacity": 0.0,
+          "cv_pct": 4.0007,
+          "n_samples": 24,
+          "p05": 947.968746,
+          "p50": 957.968761,
+          "p95": 1059.109403,
+          "p99": 1072.246847,
+          "trimmed_cv_pct": 2.8942,
+          "trimmed_mean": 968.250007
         }
       },
       "modes": {},
       "parameters": {
+        "metric_diagnostics": {
+          "set_limit_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          },
+          "stream_event_ns": {
+            "cv_pct": 4.0007,
+            "nominal_bound": 0.0,
+            "status": "calibrated"
+          }
+        },
         "modes": [
           "disjoint",
           "shared_cap"
-        ],
-        "silicon_profile_conflict": {
-          "observed_aic_count": 24,
-          "observed_aicore_freq_mhz": 1800,
-          "profile_aic_count": 20
-        }
+        ]
       },
-      "status": "unmeasured",
+      "status": "calibrated",
       "units": {
         "latency": "ns"
       }
@@ -546,7 +1860,15 @@
         },
         "eager_d2h_sync_ns": {
           "bound_kind": "latency_lower",
-          "certified_upper_capacity": 0.0
+          "certified_upper_capacity": 0.0,
+          "cv_pct": 3.8386,
+          "n_samples": 24,
+          "p05": 19612.0625,
+          "p50": 20973.75,
+          "p95": 21746.125,
+          "p99": 23057.75,
+          "trimmed_cv_pct": 1.9573,
+          "trimmed_mean": 20993.125
         },
         "gm_pub_ns": {
           "bound_kind": "latency_lower",
@@ -559,7 +1881,27 @@
       },
       "modes": {},
       "parameters": {
-        "aclgraph_cacheable": true
+        "aclgraph_cacheable": true,
+        "metric_diagnostics": {
+          "aicpu_base_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          },
+          "eager_d2h_sync_ns": {
+            "cv_pct": 3.8386,
+            "nominal_bound": 0.0,
+            "status": "calibrated"
+          },
+          "gm_pub_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          },
+          "host_select_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          }
+        },
+        "unmeasured_reason": "requires_aicpu_metadata_select_probe"
       },
       "status": "unmeasured",
       "units": {
@@ -567,24 +1909,71 @@
       }
     },
     "P18_hccl_collective_band": {
-      "evidence_id": "",
+      "evidence_id": "capture://a3-9382-ep/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
       "metrics": {
         "link_bytes_per_s": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 196000000000.0
+          "certified_upper_capacity": 196000000000.0,
+          "cv_pct": 0.8556,
+          "n_samples": 24,
+          "p05": 106205688101.5061,
+          "p50": 107863888629.31706,
+          "p95": 108833813899.84824,
+          "p99": 108928638543.52724,
+          "trimmed_cv_pct": 0.6148,
+          "trimmed_mean": 107815460097.96927
+        },
+        "startup_blocked_ns": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0
         },
         "startup_ns": {
           "bound_kind": "latency_lower",
-          "certified_upper_capacity": 0.0
+          "certified_upper_capacity": 0.0,
+          "cv_pct": 2.0902,
+          "n_samples": 24,
+          "p05": 117182.500288,
+          "p50": 119900.312275,
+          "p95": 125056.751817,
+          "p99": 125982.395858,
+          "trimmed_cv_pct": 1.4144,
+          "trimmed_mean": 119881.499186
         }
       },
       "modes": {},
       "parameters": {
+        "bandwidth_definition": "two_rank_allreduce_busbw_equals_algbw",
+        "curves_by_topology": {},
+        "group_max": 2,
+        "group_min": 2,
+        "mc2_contention": {},
+        "measured_collective": "all_reduce",
+        "measured_scope": "package",
+        "measured_world_size": 2,
+        "metric_diagnostics": {
+          "link_bytes_per_s": {
+            "cv_pct": 0.8556,
+            "nominal_bound": 196000000000.0,
+            "status": "calibrated"
+          },
+          "startup_blocked_ns": {
+            "cv_pct": 11.7911,
+            "nominal_bound": 0.0,
+            "observed_p50": 36304.062232,
+            "observed_p99": 43805.395328,
+            "status": "high_cv_unsealed"
+          },
+          "startup_ns": {
+            "cv_pct": 2.0902,
+            "nominal_bound": 0.0,
+            "status": "calibrated"
+          }
+        },
         "payload_bytes_per_frame": 1024,
         "short_final_frame_policy": "exact_plus_header",
         "wire_bytes_per_frame": 1024
       },
-      "status": "unmeasured",
+      "status": "calibrated",
       "units": {
         "latency": "ns",
         "rate": "bytes_per_s"
@@ -604,9 +1993,74 @@
       },
       "modes": {},
       "parameters": {
-        "token_payload_bytes_per_frame": 480,
-        "token_wire_bytes_per_frame": 512,
-        "transport": "a3_sio_hccs"
+        "curves_by_topology": {},
+        "hccl_duplex_diagnostics": {
+          "hccl_duplex_4k_blocked_ns": {
+            "band": {
+              "bound_kind": "latency_lower",
+              "certified_upper_capacity": 0.0
+            },
+            "diagnostic": {
+              "cv_pct": 8.8351,
+              "nominal_bound": 0.0,
+              "observed_p50": 53589.999676,
+              "observed_p99": 57419.625483,
+              "status": "high_cv_unsealed"
+            }
+          },
+          "hccl_duplex_4k_ns": {
+            "band": {
+              "bound_kind": "latency_lower",
+              "certified_upper_capacity": 0.0,
+              "cv_pct": 1.8424,
+              "n_samples": 24,
+              "p05": 122889.970616,
+              "p50": 127107.188106,
+              "p95": 130426.623672,
+              "p99": 130949.932039,
+              "trimmed_cv_pct": 1.4177,
+              "trimmed_mean": 127099.185064
+            },
+            "diagnostic": {
+              "cv_pct": 1.8424,
+              "nominal_bound": 0.0,
+              "status": "calibrated"
+            }
+          },
+          "hccl_duplex_bytes_per_s": {
+            "band": {
+              "bound_kind": "rate_upper",
+              "certified_upper_capacity": 196000000000.0,
+              "cv_pct": 0.9981,
+              "n_samples": 24,
+              "p05": 120960022723.29707,
+              "p50": 122042471071.79135,
+              "p95": 124445460366.85997,
+              "p99": 124479310898.60982,
+              "trimmed_cv_pct": 0.8738,
+              "trimmed_mean": 122531024931.46436
+            },
+            "diagnostic": {
+              "cv_pct": 0.9981,
+              "nominal_bound": 196000000000.0,
+              "status": "calibrated"
+            }
+          }
+        },
+        "metric_diagnostics": {
+          "peer_bytes_per_s": {
+            "nominal_bound": 196000000000.0,
+            "status": "unmeasured"
+          },
+          "status_sync_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          }
+        },
+        "token_payload_bytes_per_frame": 1024,
+        "token_wire_bytes_per_frame": 1024,
+        "transport": "a3_sio_hccs",
+        "unmeasured_reason": "requires_direct_window_kernel"
       },
       "status": "unmeasured",
       "units": {
@@ -615,19 +2069,43 @@
       }
     },
     "P20_host_dma_sync": {
-      "evidence_id": "",
+      "evidence_id": "capture://a3-9382-ep/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
       "metrics": {
         "eager_d2h_sync_ns": {
           "bound_kind": "latency_lower",
-          "certified_upper_capacity": 0.0
+          "certified_upper_capacity": 0.0,
+          "cv_pct": 3.8386,
+          "n_samples": 24,
+          "p05": 19612.0625,
+          "p50": 20973.75,
+          "p95": 21746.125,
+          "p99": 23057.75,
+          "trimmed_cv_pct": 1.9573,
+          "trimmed_mean": 20993.125
         },
         "host_d2h_bytes_per_s": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 41500000000.0
+          "certified_upper_capacity": 48000000000.0,
+          "cv_pct": 0.3482,
+          "n_samples": 24,
+          "p05": 41572829564.822914,
+          "p50": 41884069324.80582,
+          "p95": 41991011918.52767,
+          "p99": 42039392926.675186,
+          "trimmed_cv_pct": 0.2752,
+          "trimmed_mean": 41856937607.71831
         },
         "host_h2d_bytes_per_s": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 59500000000.0
+          "certified_upper_capacity": 64000000000.0,
+          "cv_pct": 0.858,
+          "n_samples": 24,
+          "p05": 57063841168.14126,
+          "p50": 58272734003.13435,
+          "p95": 58526949631.17597,
+          "p99": 58569844744.23884,
+          "trimmed_cv_pct": 0.6533,
+          "trimmed_mean": 58094493117.31746
         },
         "host_rc_d2h_bytes_per_s": {
           "bound_kind": "rate_upper",
@@ -637,25 +2115,116 @@
           "bound_kind": "rate_upper",
           "certified_upper_capacity": 238800000000.0
         },
+        "pageable_d2h_startup_ns": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0,
+          "cv_pct": 2.1435,
+          "n_samples": 24,
+          "p05": 48360.140313,
+          "p50": 49374.852782,
+          "p95": 50743.542632,
+          "p99": 52725.884398,
+          "trimmed_cv_pct": 0.9258,
+          "trimmed_mean": 49339.030645
+        },
         "pageable_dma_startup_ns": {
           "bound_kind": "latency_lower",
           "certified_upper_capacity": 0.0
         },
+        "pageable_h2d_startup_ns": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0
+        },
+        "pinned_d2h_startup_ns": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0,
+          "cv_pct": 3.3912,
+          "n_samples": 24,
+          "p05": 34003.027628,
+          "p50": 35657.648782,
+          "p95": 37758.002312,
+          "p99": 37955.350566,
+          "trimmed_cv_pct": 2.4889,
+          "trimmed_mean": 35699.069603
+        },
         "pinned_dma_startup_ns": {
           "bound_kind": "latency_lower",
           "certified_upper_capacity": 0.0
+        },
+        "pinned_h2d_startup_ns": {
+          "bound_kind": "latency_lower",
+          "certified_upper_capacity": 0.0,
+          "cv_pct": 3.5458,
+          "n_samples": 24,
+          "p05": 33294.35108,
+          "p50": 33836.57446,
+          "p95": 37191.60636,
+          "p99": 37423.797539,
+          "trimmed_cv_pct": 2.2303,
+          "trimmed_mean": 34032.295504
         }
       },
       "modes": {},
       "parameters": {
         "contention_scope": "root_complex",
-        "silicon_profile_conflict": {
-          "observed_aic_count": 24,
-          "observed_aicore_freq_mhz": 1800,
-          "profile_aic_count": 20
+        "dma_curve_by_size": {},
+        "metric_diagnostics": {
+          "eager_d2h_sync_ns": {
+            "cv_pct": 3.8386,
+            "nominal_bound": 0.0,
+            "status": "calibrated"
+          },
+          "host_d2h_bytes_per_s": {
+            "cv_pct": 0.3482,
+            "nominal_bound": 48000000000.0,
+            "status": "calibrated"
+          },
+          "host_h2d_bytes_per_s": {
+            "cv_pct": 0.858,
+            "nominal_bound": 64000000000.0,
+            "status": "calibrated"
+          },
+          "host_rc_d2h_bytes_per_s": {
+            "nominal_bound": 160000000000.0,
+            "status": "unmeasured"
+          },
+          "host_rc_h2d_bytes_per_s": {
+            "nominal_bound": 238800000000.0,
+            "status": "unmeasured"
+          },
+          "pageable_d2h_startup_ns": {
+            "cv_pct": 2.1435,
+            "nominal_bound": 0.0,
+            "status": "calibrated"
+          },
+          "pageable_dma_startup_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          },
+          "pageable_h2d_startup_ns": {
+            "cv_pct": 5.6215,
+            "nominal_bound": 0.0,
+            "observed_p50": 46838.263825,
+            "observed_p99": 56976.470118,
+            "status": "high_cv_unsealed"
+          },
+          "pinned_d2h_startup_ns": {
+            "cv_pct": 3.3912,
+            "nominal_bound": 0.0,
+            "status": "calibrated"
+          },
+          "pinned_dma_startup_ns": {
+            "nominal_bound": 0.0,
+            "status": "unmeasured"
+          },
+          "pinned_h2d_startup_ns": {
+            "cv_pct": 3.5458,
+            "nominal_bound": 0.0,
+            "status": "calibrated"
+          }
         }
       },
-      "status": "unmeasured",
+      "status": "calibrated",
       "units": {
         "latency": "ns",
         "rate": "bytes_per_s"
@@ -663,11 +2232,16 @@
     }
   },
   "provenance": {
-    "calibrated": false,
-    "campaign_id": "camp-202611-l0-a3-9382",
-    "capture_uri": "capture://lab-a3-9382/camp-202611-l0-a3-9382/abbc7ec1573986f0062b647c3151303178b15310dfe96a0968931d73ad5238d6",
-    "collected_utc": "2026-11-21T01:05:25Z",
-    "endpoint_alias": "lab-a3-9382",
+    "calibrated": true,
+    "campaign_id": "camp-202611-l0",
+    "capture_uri": "capture://a3-9382-ep/camp-202611-l0/b0bdcd4dcae6eeeb05aa86a1a2195f88b2472bdb785551b5b36fc0f669f859c7",
+    "clock_calibration": {
+      "core_clock_scale_ratio": 1.0,
+      "nominal_cube_freq_mhz": 1800.0,
+      "observed_aicore_freq_mhz": 1800
+    },
+    "collected_utc": "2026-11-21T19:26:45Z",
+    "endpoint_alias": "a3-9382-ep",
     "silicon_fingerprint": {
       "aic_count": 24,
       "aiv_count": 48,

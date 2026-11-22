@@ -199,31 +199,30 @@ def build_stage_profiles(case: CaseSpec, namespace: str = "", *,
             service_modes = {}
             for mode, (role, _) in dies[0].service_modes:
                 m_rate = min(dict(die.service_modes)[mode][1] for die in dies)
-                if role in overlay_rates and orig_rates_s.get(role, 0.0) > 0.0:
+                if mode in {"mte2_aic_dram", "mte2_aiv_dram"} and overlay and overlay.hbm_read_bytes_per_s is not None:
+                    m_rate = min(m_rate, overlay.hbm_read_bytes_per_s)
+                elif role in overlay_rates and orig_rates_s.get(role, 0.0) > 0.0:
                     m_rate = m_rate * (overlay_rates[role] / orig_rates_s[role])
                 service_modes[mode] = (role, m_rate)
+            if "mte2_aiv_dram" not in service_modes and overlay and overlay.hbm_read_bytes_per_s is not None:
+                service_modes["mte2_aiv_dram"] = ("mte2_aiv", overlay.hbm_read_bytes_per_s)
+            if overlay and overlay.hbm_rw21_bytes_per_s is not None:
+                service_modes["hbm_rw21_dram"] = ("hbm", overlay.hbm_rw21_bytes_per_s)
             store_queues = {
                 name: dict(queue) for name, queue in dies[0].store_queues
                 if all(dict(die.store_queues).get(name) == queue for die in dies)
             }
             profiles.append(StageProfile(
-                replica=int(replica), stage=int(stage), dies=dies,
-                geometry=geometry, rates=rates, names=names,
-                resources=tuple(stage_resources), stage_pools=stage_pools,
-                pools=pools, pool_units=pool_units,
+                replica=int(replica), stage=int(stage), dies=dies, geometry=geometry,
+                rates=rates, names=names, resources=tuple(stage_resources),
+                stage_pools=stage_pools, pools=pools, pool_units=pool_units,
                 units={role: dies[0].units(role) for role in names},
-                pool_units_by_name={pool: dies[0].pool_units(pool)
-                                    for pool in dict(dies[0].buffers)},
+                pool_units_by_name={pool: dies[0].pool_units(pool) for pool in dict(dies[0].buffers)},
                 compute_peaks=compute_peaks,
-                pool_capacities={pool: min(dict(die.buffers)[pool] for die in dies)
-                                 for pool in dict(dies[0].buffers)},
-                service_modes=service_modes, work_units=work_units,
-                store_queues=store_queues,
-                physical_mechanisms=dies[0].physical_mechanisms,
-                compute_arch=compute_arch,
-                datapath=datapath,
-                host_rc_resources=host_rc,
-                primitive_table=primitive_table,
+                pool_capacities={pool: min(dict(die.buffers)[pool] for die in dies) for pool in dict(dies[0].buffers)},
+                service_modes=service_modes, work_units=work_units, store_queues=store_queues,
+                physical_mechanisms=dies[0].physical_mechanisms, compute_arch=compute_arch,
+                datapath=datapath, host_rc_resources=host_rc, primitive_table=primitive_table,
                 primitive_identity=() if overlay is None else overlay.identity,
                 primitive_coverage_gaps=() if overlay is None else overlay.coverage_gaps,
             ))

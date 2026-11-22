@@ -311,6 +311,7 @@ def build_band_collective_plan(
     expansion_mode: str | None = None,
 ) -> BandCollectivePlan:
     """Lower all groups in a cohort through ``lower_collective`` into one plan."""
+    stack = str(metadata.get("collective_stack", stack) or stack)
     groups: list[BandCollectiveGroup] = []
     for idx, ranks in enumerate(unique_groups):
         if family == "alltoallv" or peer is not None:

@@ -19,8 +19,9 @@ from mindie_sim.schema.operators import OpSpec
 
 from ...mechanism import OperatorPlan
 from ..contracts import OperatorPlanningContext
+from ..sharedkv.sparse_indexer_v1 import build_arch35_v1_lightning
 from .common import (
-    BF16_BYTES, DSL_QSLI_ABI, FP32_BYTES, INT32_BYTES, MSA_ABIS, PAIR_BYTES,
+    BF16_BYTES, DSL_QSLI_ABI, FP32_BYTES, INT32_BYTES, LIGHTNING_ABI, MSA_ABIS, PAIR_BYTES,
     QSA_ABI, QSA_OVERLAY_SOURCE, QUANT_ABIS, REGION_ABI, SCORE_SLOTS, VLLM_QLI_ABIS, Lowering, PhaseWork,
     SparseIndexerContract, align, build_plan, ceil_div, indexer_contract, request_contracts,
     owner_pairs, pair_merge, sort_ops, unsupported, vector,
@@ -305,6 +306,8 @@ class _Arch35Strategy:
 
     def build(self, op: OpSpec, ctx: OperatorPlanningContext, /) -> OperatorPlan:
         contract = _contract(op, ctx)
+        if contract.native_split_core and contract.abi == LIGHTNING_ABI and contract.cache_dtype == "bf16":
+            return build_arch35_v1_lightning(op, ctx, contract, owner_pairs(ctx, 2), (LIGHTNING_V2_TILER,))
         lowering, sources = _make_lowering(contract)
         needed = lowering.aivs_per_aic
         representation = "fp32"

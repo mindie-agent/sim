@@ -402,6 +402,36 @@ def contract_for(op: OpSpec, ctx: OperatorPlanningContext) -> PagedMlaContract:
             padded_fields[name] = tuple(fill if span[-1] else next(values) for span in spans)
     return validate_contract(replace(c, sequences=sequences, **padded_fields), capacity_extents=True)
 
+ARCH22_MLA_L0A_RELOAD_PANELS = 4
+ARCH22_MLA_CROSSCORE_SYNCS_SCORE = 2
+ARCH22_MLA_CROSSCORE_SYNCS_PROB = 2
+ARCH22_MLA_CROSSCORE_SYNCS_PARTIAL = 1
+ARCH35_MLA_CROSSCORE_SYNCS_STEP = 1
+NS_PER_MS_MLA = 1_000_000.0
+
+
+def mla_step_crosscore_ms(ctx, step: str, *, gm_workspace: bool, abi: str) -> float:
+    """Calibrated P13 CrossCore handoff latency per MLA pipeline step (0.0 when nominal)."""
+    pt = getattr(ctx, "primitive_table", None)
+    if pt is None:
+        return 0.0
+    if gm_workspace:
+        mult = {
+            "score_store": ARCH22_MLA_CROSSCORE_SYNCS_SCORE,
+            "probability": ARCH22_MLA_CROSSCORE_SYNCS_PROB,
+            "partial": ARCH22_MLA_CROSSCORE_SYNCS_PARTIAL,
+        }.get(step, 0)
+    elif abi == FIA_ABI:
+        mult = ARCH35_MLA_CROSSCORE_SYNCS_STEP if step in {"score_store", "probability", "partial"} else 0
+    else:
+        return 0.0
+    if not mult:
+        return 0.0
+    from mindie_sim.primitives.loader import _table_band_p50
+    ns = _table_band_p50(pt, "P13_crosscore_sync", "mode2_paired_ns")
+    return (float(mult) * float(ns) / NS_PER_MS_MLA) if (ns is not None and ns > 0.0) else 0.0
+
+
 def make_op(
     contract: PagedMlaContract | Mapping | None = None, *,
     op_id: str = FAMILY, dtype: str = "bf16", phase: str = "decode",
