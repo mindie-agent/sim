@@ -2273,6 +2273,59 @@ def _validate_supported_plan_opcodes(plan: RewritePlan) -> None:
             )
 
 
+def _verify_external_plan_digests(
+    ext_plan: RewritePlan,
+    case: Case,
+    base_scenario: Any,
+    *,
+    step_request: StepRequest | None = None,
+    stack_id: str | None = None,
+    primitive_table: Any = None,
+) -> bool:
+    """Verify caller-supplied plan digests against target scenario or resolved public scenario.
+
+    Returns ``True`` when the plan matched a public ``resolve_scenario`` digest (so
+    downstream archetype application may rebind digests onto the archetype scenario),
+    and ``False`` when the plan is unsealed or directly matched ``base_scenario``.
+    """
+    has_base = bool(ext_plan.base_graph_sha256)
+    has_frame = bool(ext_plan.framing_sha256)
+    if not has_base and not has_frame:
+        return False
+    base_match = (not has_base) or (ext_plan.base_graph_sha256 == base_scenario.base_graph_sha256)
+    frame_match = (not has_frame) or (ext_plan.framing_sha256 == base_scenario.framing_sha256)
+    if base_match and frame_match:
+        return False
+    if step_request is not None:
+        from mindie_sim.rewrite.apply import DEFAULT_STACK_ID, resolve_scenario
+
+        eff_stack = stack_id or DEFAULT_STACK_ID
+        alt_scope = "body" if step_request.scope == "model" else "model"
+        candidates = (step_request, replace(step_request, scope=alt_scope))
+        last_base_ok = False
+        for cand_step in candidates:
+            resolved = resolve_scenario(
+                case, cand_step, stack_id=eff_stack, primitive_table=primitive_table,
+            )
+            valid_bases = {resolved.base_graph_sha256}
+            if resolved.mainline_step is not None:
+                valid_bases.add(_json_digest(
+                    ("mainline", resolved.mainline_step.graph.executable, resolved.mainline_step.case.runtime.to_dict()),
+                    default=_digest_default,
+                ))
+            pub_base_ok = (not has_base) or (ext_plan.base_graph_sha256 in valid_bases)
+            pub_frame_ok = (not has_frame) or (ext_plan.framing_sha256 == resolved.framing_sha256)
+            if pub_base_ok and pub_frame_ok:
+                return True
+            last_base_ok = last_base_ok or pub_base_ok
+        if not last_base_ok:
+            raise ModelingError("rewrite_digest_mismatch:base_graph_sha256")
+        raise ModelingError("rewrite_digest_mismatch:framing_sha256")
+    if not base_match:
+        raise ModelingError("rewrite_digest_mismatch:base_graph_sha256")
+    raise ModelingError("rewrite_digest_mismatch:framing_sha256")
+
+
 def _apply_and_verify_plan(
     case: Case,
     arch_ops: Sequence[OpSpec],
@@ -2282,6 +2335,7 @@ def _apply_and_verify_plan(
     phase: str = "decode",
     primitive_table: Any = None,
     bind_empty_digests: bool = False,
+    rebind_digests: bool = False,
 ) -> tuple[Any, Any, Any]:
     """Run canonical ``apply_plan`` + ``verify_plan`` and return ``(scenario, applied, receipt)``."""
     from mindie_sim.rewrite.apply import apply_plan
@@ -2291,14 +2345,20 @@ def _apply_and_verify_plan(
     scenario = _build_target_scenario(
         case, arch_ops, datapath, phase=phase, primitive_table=primitive_table,
     )
-    eff_plan = (
-        replace(
+    if rebind_digests:
+        eff_plan = replace(
+            plan,
+            base_graph_sha256=scenario.base_graph_sha256,
+            framing_sha256=scenario.framing_sha256,
+        )
+    elif bind_empty_digests:
+        eff_plan = replace(
             plan,
             base_graph_sha256=plan.base_graph_sha256 or scenario.base_graph_sha256,
             framing_sha256=plan.framing_sha256 or scenario.framing_sha256,
         )
-        if bind_empty_digests else plan
-    )
+    else:
+        eff_plan = plan
     applied = apply_plan(eff_plan, scenario)
     receipt = verify_plan(scenario, applied, scope="archetype")
     return scenario, applied, receipt
@@ -3030,6 +3090,7 @@ def _materialize_external_plan(
     phase: str,
     primitive_table: Any,
     allow_unbound_formula: bool,
+    rebind_digests: bool = False,
 ) -> tuple[
     list[TargetOpNode],
     list[tuple[int, int, int, int, int]],
@@ -3043,7 +3104,7 @@ def _materialize_external_plan(
     base_ops = [_node_to_op_spec(n, all_known, phase=phase) for n in nodes]
     scenario, applied, receipt = _apply_and_verify_plan(
         case, base_ops, ext_plan, datapath, phase=phase, primitive_table=primitive_table,
-        bind_empty_digests=True,
+        bind_empty_digests=True, rebind_digests=rebind_digests,
     )
     if not receipt.passed:
         failed = next((g for g in receipt.gates if not g.passed), receipt.gates[0])
@@ -3451,15 +3512,17 @@ def _reconcile_oneshot_link_ledger(
         if rank is None:
             die = peaks.get("die")
             rank = int(getattr(die, "rank", 0) or 0)
-        tx = float(entry[0].accounting(source_ranks=(rank,)).useful_by_rank.get(rank, 0.0))
+        acc = entry[0].accounting(source_ranks=(rank,))
+        tx_useful = float(acc.useful_by_rank.get(rank, 0.0))
+        tx_wire = float(acc.physical_wire_bytes) if float(acc.physical_wire_bytes) > 0.0 else tx_useful
         link_rate = float(peaks.get("link_peak_bytes_per_s") or 0.0)
-        link_ns = int(tx * NS_PER_SECOND / link_rate) if link_rate > 0.0 else int(out_dems[i][4])
+        link_ns = int(tx_wire * NS_PER_SECOND / link_rate) if link_rate > 0.0 else int(out_dems[i][4])
         out_dems[i] = (*out_dems[i][:4], link_ns)
         l_star = float(max(out_dems[i])) / NS_PER_US
         dur = float(node.dur_us)
         eff = min(1.0, l_star / dur) if dur > 0.0 and l_star > 0.0 else None
         out_nodes[i] = replace(
-            node, link_bytes=tx, l_star_lean_us=l_star,
+            node, link_bytes=tx_wire, l_star_lean_us=l_star,
             gap_us=max(0.0, dur - l_star),
             gap_ratio=(dur / l_star) if l_star > 0.0 else None,
             roofline_efficiency=eff,
@@ -3479,6 +3542,9 @@ def solve_target_graph(
     n_tok_per_die: float = 1.0,
     primitive_table: Any = None,
     allow_unbound_formula: bool = True,
+    step_request: StepRequest | None = None,
+    stack_id: str | None = None,
+    scenario_case: Case | None = None,
 ) -> SolvedTargetGraph:
     """Solve target-state graph via Tier-P2 algebra + canonical ``apply_plan``/``verify_plan``."""
     floors = extract_sku_floors(case, primitive_table=primitive_table)
@@ -3502,22 +3568,25 @@ def solve_target_graph(
     global_remap: dict[OpOccurrence, OpOccurrence] = {}
     collective_plans: dict[OpOccurrence, tuple[Any, float]] = {}
 
+    rebind_ext = (
+        _verify_external_plan_digests(
+            ext_plan, scenario_case or case, base_scenario,
+            step_request=step_request, stack_id=stack_id, primitive_table=primitive_table,
+        )
+        if ext_plan is not None else False
+    )
+
     if ext_plan is not None and ext_plan.edits:
         work_nodes, work_dems, ext_specs, locked_ids, ext_remap, ext_col_plans = _materialize_external_plan(
             nodes, demands, ext_plan, case, datapath, floors, p0, pricing_ctx,
             phase=phase, primitive_table=primitive_table,
-            allow_unbound_formula=allow_unbound_formula,
+            allow_unbound_formula=allow_unbound_formula, rebind_digests=rebind_ext,
         )
         all_specs.extend(ext_specs)
         executed_ext_edits.extend(ext_plan.edits)
         global_remap.update(ext_remap)
         collective_plans.update(ext_col_plans)
     else:
-        if ext_plan is not None:
-            if ext_plan.base_graph_sha256 and ext_plan.base_graph_sha256 != base_scenario.base_graph_sha256:
-                raise ModelingError("rewrite_digest_mismatch:base_graph_sha256")
-            if ext_plan.framing_sha256 and ext_plan.framing_sha256 != base_scenario.framing_sha256:
-                raise ModelingError("rewrite_digest_mismatch:framing_sha256")
         work_nodes = list(nodes)
         work_dems = list(demands)
 

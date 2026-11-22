@@ -127,6 +127,7 @@ def optimize_ladder(
     primitive_table: Any = None,
     stack_id: str = "cann93_va_main",
     max_trials: int = DEFAULT_OPTIMIZE_TRIALS,
+    allow_unbound_formula: bool = False,
 ) -> Any:
     """Solve the certified 5-level primal-dual performance ladder for one step."""
     return default_spine().optimize_ladder(
@@ -137,6 +138,7 @@ def optimize_ladder(
         primitive_table=primitive_table,
         stack_id=stack_id,
         max_trials=max_trials,
+        allow_unbound_formula=allow_unbound_formula,
     )
 
 

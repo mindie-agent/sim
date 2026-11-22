@@ -421,16 +421,77 @@ def _resolve_pd_sla_and_pool_args(
     return prompt, output, ttft, tpot, mode, dram_r, ssd_r, hit_r
 
 
+def _prefill_cache_key(
+    cache_id: int,
+    compute_tokens: int,
+    hit_tokens: int,
+    apply_target_envelope: bool,
+    rewrite_plan: Any,
+    allow_unbound_formula: bool,
+) -> tuple[Any, ...]:
+    """Build a mode- and rewrite-scoped cache key for prefill stage measurements."""
+    return (
+        cache_id, compute_tokens, hit_tokens,
+        bool(apply_target_envelope), id(rewrite_plan), bool(allow_unbound_formula),
+    )
+
+
+def _eval_prefill_with_plan(
+    parsed: CaseSpec,
+    *,
+    compute_tokens: int,
+    hit_tokens: int,
+    min_layers: int,
+    rep_info: tuple[CaseSpec, dict[int, int], float] | None = None,
+    reclaim_on_exit: bool = True,
+    apply_target_envelope: bool = False,
+    rewrite_plan: Any = None,
+    allow_unbound_formula: bool = True,
+    allow_plan_fallback: bool = False,
+) -> tuple[float, bool]:
+    """Price prefill with optional ``rewrite_plan``, falling back only on decode-scoped plan mismatch."""
+    try:
+        ms = _prefill_step_ms(
+            parsed, compute_tokens=compute_tokens, hit_tokens=hit_tokens,
+            min_layers=min_layers, rep_info=rep_info, reclaim_on_exit=reclaim_on_exit,
+            apply_target_envelope=apply_target_envelope,
+            rewrite_plan=rewrite_plan,
+            allow_unbound_formula=allow_unbound_formula,
+        )
+        return ms, (rewrite_plan is not None)
+    except (ModelingError, ValueError) as exc:
+        if allow_plan_fallback and rewrite_plan is not None and _is_plan_phase_mismatch(exc):
+            ms = _prefill_step_ms(
+                parsed, compute_tokens=compute_tokens, hit_tokens=hit_tokens,
+                min_layers=min_layers, rep_info=rep_info, reclaim_on_exit=reclaim_on_exit,
+                apply_target_envelope=apply_target_envelope,
+                rewrite_plan=None,
+                allow_unbound_formula=allow_unbound_formula,
+            )
+            return ms, False
+        raise
+
+
 def _measure_prefill_stage(
     p_parsed: CaseSpec,
     *,
     prompt: int,
     compute_tokens: int,
     hit_tokens: int,
-    cache: dict[tuple[int, int, int], tuple[Memory, bool, int, float]] | None,
+    cache: dict[tuple[Any, ...], tuple[Memory, bool, int, float]] | None,
     cache_id: int | None,
+    apply_target_envelope: bool = False,
+    rewrite_plan: Any = None,
+    allow_unbound_formula: bool = True,
+    allow_plan_fallback: bool = False,
 ) -> tuple[Memory, bool, int, float]:
-    key = (cache_id, compute_tokens, hit_tokens) if (cache is not None and cache_id is not None) else None
+    key = (
+        _prefill_cache_key(
+            cache_id, compute_tokens, hit_tokens,
+            apply_target_envelope, rewrite_plan, allow_unbound_formula,
+        )
+        if (cache is not None and cache_id is not None) else None
+    )
     if key is not None and key in cache:
         return cache[key]
     p_mem = Memory(p_parsed, workspace_tokens=_prefill_workspace_tokens(p_parsed, compute_tokens))
@@ -450,9 +511,13 @@ def _measure_prefill_stage(
         if prefill_hbm_ok else 0
     )
     if compute_tokens > 0 and prefill_hbm_ok:
-        p_step = _prefill_step_ms(
+        p_step, _ = _eval_prefill_with_plan(
             p_parsed, compute_tokens=compute_tokens,
             hit_tokens=hit_tokens, min_layers=ARCHETYPE_FOLD_MIN_LAYERS,
+            apply_target_envelope=apply_target_envelope,
+            rewrite_plan=rewrite_plan,
+            allow_unbound_formula=allow_unbound_formula,
+            allow_plan_fallback=allow_plan_fallback,
         )
     elif compute_tokens > 0:
         p_step = math.inf
@@ -623,6 +688,10 @@ def _evaluate_pd_stages(
     p_mem, prefill_hbm_ok, p_slots, p_step = _measure_prefill_stage(
         p_parsed, prompt=prompt, compute_tokens=compute_tokens, hit_tokens=hit_tokens,
         cache=_prefill_step_cache, cache_id=_prefill_cache_id,
+        apply_target_envelope=apply_target_envelope,
+        rewrite_plan=rewrite_plan,
+        allow_unbound_formula=allow_unbound_formula,
+        allow_plan_fallback=(output > 1),
     )
     decode_q_tokens, _ = _resolve_speculative_tokens(
         d_parsed, output_budget=output, tokens_per_seq=None, emitted_tokens_per_seq=None,
@@ -1263,10 +1332,14 @@ def _evaluate_colocated_candidate(
     rep_info = build_archetype_representative_case(parsed, min_layers=ARCHETYPE_FOLD_MIN_LAYERS)
     # Exact finalist always prices the prompt: an omitted TTFT bound removes the
     # SLA check, not the prefill service time that TTFT and end-to-end TPS consume.
-    p_step = _prefill_step_ms(
+    p_step, prefill_plan_matched = _eval_prefill_with_plan(
         parsed, compute_tokens=prompt_tokens, hit_tokens=0,
         min_layers=ARCHETYPE_FOLD_MIN_LAYERS,
         rep_info=rep_info,
+        apply_target_envelope=apply_target_envelope,
+        rewrite_plan=rewrite_plan,
+        allow_unbound_formula=allow_unbound_formula,
+        allow_plan_fallback=(output_tokens > 1),
     )
     ttft_ok = bool(p_step <= ttft_sla_ms)
     decode_tokens = max(0, output_tokens - 1)
@@ -1295,16 +1368,30 @@ def _evaluate_colocated_candidate(
     _, emit_est = _resolve_speculative_tokens(
         parsed, output_budget=output_tokens, tokens_per_seq=None, emitted_tokens_per_seq=None,
     )
-    d_sla = _solve_sla_archetype_aware(
-        parsed, sla_ms=tpot_sla_ms * max(1.0, float(emit_est)),
-        context=prompt_tokens, output_budget=output_tokens,
-        max_sequences_per_dp=max_sequences_per_dp,
-        workspace_tokens=prefill_ws,
-        rep_info=rep_info, probe_cache=probe_cache,
-        apply_target_envelope=apply_target_envelope,
-        rewrite_plan=rewrite_plan,
-        allow_unbound_formula=allow_unbound_formula,
-    )
+    try:
+        d_sla = _solve_sla_archetype_aware(
+            parsed, sla_ms=tpot_sla_ms * max(1.0, float(emit_est)),
+            context=prompt_tokens, output_budget=output_tokens,
+            max_sequences_per_dp=max_sequences_per_dp,
+            workspace_tokens=prefill_ws,
+            rep_info=rep_info, probe_cache=probe_cache,
+            apply_target_envelope=apply_target_envelope,
+            rewrite_plan=rewrite_plan,
+            allow_unbound_formula=allow_unbound_formula,
+        )
+    except (ModelingError, ValueError) as exc:
+        if not (prefill_plan_matched and _is_plan_phase_mismatch(exc)):
+            raise
+        d_sla = _solve_sla_archetype_aware(
+            parsed, sla_ms=tpot_sla_ms * max(1.0, float(emit_est)),
+            context=prompt_tokens, output_budget=output_tokens,
+            max_sequences_per_dp=max_sequences_per_dp,
+            workspace_tokens=prefill_ws,
+            rep_info=rep_info, probe_cache=probe_cache,
+            apply_target_envelope=apply_target_envelope,
+            rewrite_plan=None,
+            allow_unbound_formula=allow_unbound_formula,
+        )
     scen = d_sla["scenarios"][0]
     emitted = float(d_sla["emitted_tokens_per_seq"])
     b_feasible = int(scen["b_feasible"])
@@ -1731,10 +1818,22 @@ _REWRITE_PLAN_ERROR_TOKENS = (
 )
 
 
+_PLAN_PHASE_MISMATCH_TOKENS = (
+    "rewrite_digest_mismatch:",
+    "rewrite_unresolved_op",
+)
+
+
 def _is_rewrite_plan_error(exc: Exception) -> bool:
     """Return True when ``exc`` signals an explicit rewrite-plan or strict-binding failure."""
     msg = str(exc)
     return any(tok in msg for tok in _REWRITE_PLAN_ERROR_TOKENS)
+
+
+def _is_plan_phase_mismatch(exc: Exception) -> bool:
+    """Return True when ``exc`` indicates a rewrite plan does not belong to the tested phase/graph."""
+    msg = str(exc)
+    return any(tok in msg for tok in _PLAN_PHASE_MISMATCH_TOKENS)
 
 
 def _is_draft_op(spec: Any, row: Mapping[str, Any] | None = None) -> bool:
@@ -1765,6 +1864,8 @@ def _solve_target_step_ms(
     ext_plan: Any,
     primitive_table: Any,
     allow_unbound_formula: bool,
+    step_request: Any = None,
+    scenario_case: CaseSpec | None = None,
 ) -> float:
     """Evaluate rewritten target graph via ``solve_target_graph`` and return exposed step ms."""
     kept = _prepare_target_records(eff_case, timeline_rows, spec_by_id)
@@ -1838,6 +1939,8 @@ def _solve_target_step_ms(
         n_tok_per_die=max(float(n_tok_per_die), PARETO_EPS),
         primitive_table=primitive_table,
         allow_unbound_formula=allow_unbound_formula,
+        step_request=step_request,
+        scenario_case=scenario_case,
     )
     return sum(n.exposed_dur_us * max(1, int(n.repeat_count)) for n in solved.nodes) / US_PER_MS
 
@@ -1941,10 +2044,14 @@ def _archetype_weighted_step_ms(
         len(rep_case.model.layer_plans) < len(parsed.model.layer_plans)
         or draft_scale > 1.0
     )
-    use_target = bool((apply_target_envelope or rewrite_plan is not None) and phase == "decode")
+    use_target = bool(apply_target_envelope or rewrite_plan is not None)
     ext_plan = load_rewrite_plan(rewrite_plan) if (use_target and rewrite_plan is not None) else None
-    has_explicit_edits = ext_plan is not None and bool(getattr(ext_plan, "edits", ()))
-    if use_target and has_explicit_edits and reduced:
+    has_explicit_or_sealed_plan = ext_plan is not None and (
+        bool(getattr(ext_plan, "edits", ()))
+        or bool(getattr(ext_plan, "base_graph_sha256", ""))
+        or bool(getattr(ext_plan, "framing_sha256", ""))
+    )
+    if use_target and has_explicit_or_sealed_plan and reduced:
         rep_case = parsed
         layer_weights = {int(lp.index): 1 for lp in parsed.model.layer_plans}
         draft_scale = 1.0
@@ -1999,11 +2106,15 @@ def _archetype_weighted_step_ms(
         return baseline_ms
     if ext_plan is None and skip_target_if_baseline_le_ms is not None and baseline_ms <= skip_target_if_baseline_le_ms:
         return baseline_ms
+    from mindie_sim.prediction.results import StepRequest
+
     solved_ms = _solve_target_step_ms(
         eff_case, timeline_rows, spec_by_id,
         phase=phase, layer_weights=layer_weights, draft_scale=draft_scale,
         n_tok_per_die=n_tok_per_die, ext_plan=ext_plan,
         primitive_table=rebound_pt, allow_unbound_formula=allow_unbound_formula,
+        step_request=StepRequest(phase=phase, tokens=tokens, context=context, sequences=sequences, scope=scope),
+        scenario_case=parsed,
     )
     if ext_plan is not None:
         return solved_ms if solved_ms > 0.0 else baseline_ms
@@ -2106,6 +2217,9 @@ def _prefill_step_ms(
     evaluation_context: EvaluationContext | None = None,
     eval_ctx_box: list[EvaluationContext | None] | None = None,
     reclaim_on_exit: bool = True,
+    apply_target_envelope: bool = False,
+    rewrite_plan: Any = None,
+    allow_unbound_formula: bool = True,
 ) -> float:
     """Compute prefill latency via direct step or chunked-prefill midpoint quadrature."""
     if compute_tokens <= 0:
@@ -2116,6 +2230,9 @@ def _prefill_step_ms(
             context=hit_tokens, sequences=1, min_layers=min_layers,
             rep_info=rep_info, evaluation_context=evaluation_context,
             eval_ctx_box=eval_ctx_box, reclaim_on_exit=reclaim_on_exit,
+            apply_target_envelope=apply_target_envelope,
+            rewrite_plan=rewrite_plan,
+            allow_unbound_formula=allow_unbound_formula,
         )
     batched_cap = int(parsed.runtime.max_num_batched_tokens or PREFILL_CHUNK_PROBE_TOKENS)
     chunk_tok = max(1, min(int(compute_tokens), batched_cap, PREFILL_CHUNK_PROBE_TOKENS))
@@ -2125,6 +2242,9 @@ def _prefill_step_ms(
         context=mid_ctx, sequences=1, min_layers=min_layers,
         rep_info=rep_info, evaluation_context=evaluation_context,
         eval_ctx_box=eval_ctx_box, reclaim_on_exit=reclaim_on_exit,
+        apply_target_envelope=apply_target_envelope,
+        rewrite_plan=rewrite_plan,
+        allow_unbound_formula=allow_unbound_formula,
     )
     return chunk_ms * (float(compute_tokens) / float(chunk_tok))
 
@@ -2316,29 +2436,48 @@ def _screen_colocated_job(args: tuple[Any, ...]) -> tuple[int, bool, float, dict
         if limit < 1:
             return idx, False, -1.0, {}
         rep_info = build_archetype_representative_case(parsed, min_layers=ARCHETYPE_SCREEN_MIN_LAYERS)
+        prefill_plan_matched = False
         if math.isinf(ttft_sla_ms) and output_tokens > 1:
             p_ms = 0.0
         else:
-            p_ms = _prefill_step_ms(
+            p_ms, prefill_plan_matched = _eval_prefill_with_plan(
                 parsed, compute_tokens=prompt_tokens, hit_tokens=0,
                 min_layers=ARCHETYPE_SCREEN_MIN_LAYERS,
                 rep_info=rep_info, reclaim_on_exit=False,
+                apply_target_envelope=apply_target_envelope,
+                rewrite_plan=rewrite_plan,
+                allow_unbound_formula=allow_unbound_formula,
+                allow_plan_fallback=(output_tokens > 1),
             )
             if p_ms > ttft_sla_ms * SCREEN_TTFT_MARGIN:
                 return idx, False, -p_ms, {}
         probe_b = min(limit, SCREEN_DECODE_BATCH_PROBE)
         per_dp_dies = max(1, int(par.tp) * int(par.pcp) * int(par.pp))
         screen_target = bool(apply_target_envelope or rewrite_plan is not None)
-        d_ms = _archetype_weighted_step_ms(
-            parsed, phase="decode", tokens=max(1, int(q_tok)),
-            context=prompt_tokens, sequences=probe_b,
-            rep_info=rep_info,
-            apply_target_envelope=screen_target,
-            rewrite_plan=rewrite_plan if screen_target else None,
-            allow_unbound_formula=allow_unbound_formula,
-            n_tok_per_die=(float(probe_b) * float(emit_est)) / float(per_dp_dies),
-            reclaim_on_exit=False,
-        )
+        try:
+            d_ms = _archetype_weighted_step_ms(
+                parsed, phase="decode", tokens=max(1, int(q_tok)),
+                context=prompt_tokens, sequences=probe_b,
+                rep_info=rep_info,
+                apply_target_envelope=screen_target,
+                rewrite_plan=rewrite_plan if screen_target else None,
+                allow_unbound_formula=allow_unbound_formula,
+                n_tok_per_die=(float(probe_b) * float(emit_est)) / float(per_dp_dies),
+                reclaim_on_exit=False,
+            )
+        except (ModelingError, ValueError) as exc:
+            if not (prefill_plan_matched and _is_plan_phase_mismatch(exc)):
+                raise
+            d_ms = _archetype_weighted_step_ms(
+                parsed, phase="decode", tokens=max(1, int(q_tok)),
+                context=prompt_tokens, sequences=probe_b,
+                rep_info=rep_info,
+                apply_target_envelope=apply_target_envelope,
+                rewrite_plan=None,
+                allow_unbound_formula=allow_unbound_formula,
+                n_tok_per_die=(float(probe_b) * float(emit_est)) / float(per_dp_dies),
+                reclaim_on_exit=False,
+            )
         est_tpot = d_ms / max(float(emit_est), PARETO_EPS)
         eff_b = (
             float(probe_b)
@@ -2377,7 +2516,10 @@ def _eval_colocated_job(args: tuple[Any, ...]) -> tuple[int, dict[str, Any] | No
 def _screen_prefill_job(
     args: tuple[Any, ...],
 ) -> tuple[int, bool, float, tuple[Memory, bool, int, float] | None]:
-    p_idx, raw_p, prompt, compute_tokens, hit_tokens, ttft_sla_ms = args
+    (
+        p_idx, raw_p, prompt, compute_tokens, hit_tokens, ttft_sla_ms,
+        apply_target_envelope, rewrite_plan, allow_unbound_formula, allow_plan_fallback,
+    ) = args
     try:
         parsed = parse_case(raw_p)
         if not validate_vllm_ascend_dcp_codomain(parsed.model, parsed.runtime.parallel)[0]:
@@ -2397,10 +2539,14 @@ def _screen_prefill_job(
                for row in p_mem.capacity for cap, kv in zip(row, p_kv) if kv > 0]
         )
         p_ms = (
-            _prefill_step_ms(
+            _eval_prefill_with_plan(
                 parsed, compute_tokens=compute_tokens, hit_tokens=hit_tokens,
                 min_layers=ARCHETYPE_SCREEN_MIN_LAYERS, reclaim_on_exit=False,
-            )
+                apply_target_envelope=apply_target_envelope,
+                rewrite_plan=rewrite_plan,
+                allow_unbound_formula=allow_unbound_formula,
+                allow_plan_fallback=allow_plan_fallback,
+            )[0]
             if compute_tokens > 0 else 0.0
         )
         cached = (p_mem, True, p_slots, p_ms)
@@ -2409,7 +2555,9 @@ def _screen_prefill_job(
             return p_idx, False, -p_ms, cached
         rps_per_die = (float(par.dp) * MS_PER_S) / max(p_ms * float(par.world_size), PARETO_EPS)
         return p_idx, True, rps_per_die, cached
-    except (ModelingError, ValueError):
+    except (ModelingError, ValueError) as exc:
+        if rewrite_plan is not None and _is_rewrite_plan_error(exc):
+            raise
         return p_idx, False, -1.0, None
 
 
@@ -2457,15 +2605,24 @@ def _screen_decode_job(args: tuple[Any, ...]) -> tuple[int, bool, float, dict[in
 
 
 def _eval_prefill_exact_job(args: tuple[Any, ...]) -> tuple[int, tuple[Memory, bool, int, float] | None]:
-    p_idx, raw_p, prompt, compute_tokens, hit_tokens = args
+    (
+        p_idx, raw_p, prompt, compute_tokens, hit_tokens,
+        apply_target_envelope, rewrite_plan, allow_unbound_formula, allow_plan_fallback,
+    ) = args
     try:
         parsed = parse_case(raw_p)
         res = _measure_prefill_stage(
             parsed, prompt=prompt, compute_tokens=compute_tokens, hit_tokens=hit_tokens,
             cache=None, cache_id=None,
+            apply_target_envelope=apply_target_envelope,
+            rewrite_plan=rewrite_plan,
+            allow_unbound_formula=allow_unbound_formula,
+            allow_plan_fallback=allow_plan_fallback,
         )
         return p_idx, res
-    except (ModelingError, ValueError):
+    except (ModelingError, ValueError) as exc:
+        if rewrite_plan is not None and _is_rewrite_plan_error(exc):
+            raise
         return p_idx, None
 
 
@@ -2613,14 +2770,21 @@ def _select_and_warm_pd_finalists(
     base_compute_tok = max(0, prompt - hit_tokens_pool) if is_pool_only else prompt
     base_hit_tok = hit_tokens_pool if is_pool_only else 0
 
-    prefill_cache: dict[tuple[int, int, int], tuple[Memory, bool, int, float]] = {}
+    prefill_cache: dict[tuple[Any, ...], tuple[Memory, bool, int, float]] = {}
+    allow_p_fallback = output > 1
     if layers >= ARCHETYPE_SCREEN_MIN_LAYERS and len(p_cases) > PD_PREFILL_STAGE2_FINALISTS:
         p_screen = []
         for s_i, (p_idx, _, raw_p) in enumerate(p_cases):
-            res_p = _screen_prefill_job((p_idx, raw_p, prompt, base_compute_tok, base_hit_tok, ttft))
+            res_p = _screen_prefill_job((
+                p_idx, raw_p, prompt, base_compute_tok, base_hit_tok, ttft,
+                apply_target_envelope, rewrite_plan, allow_unbound_formula, allow_p_fallback,
+            ))
             p_screen.append(res_p)
             if res_p[3] is not None:
-                prefill_cache[(p_idx, base_compute_tok, base_hit_tok)] = res_p[3]
+                prefill_cache[_prefill_cache_key(
+                    p_idx, base_compute_tok, base_hit_tok,
+                    apply_target_envelope, rewrite_plan, allow_unbound_formula,
+                )] = res_p[3]
             if num_devices >= GC_RECLAIM_MIN_WORLD_SIZE and (s_i + 1) % SCREEN_RECLAIM_STRIDE == 0:
                 _reclaim_sweep_memory()
         if num_devices >= GC_RECLAIM_MIN_WORLD_SIZE:
@@ -2661,11 +2825,17 @@ def _select_and_warm_pd_finalists(
         p_tok_pairs.add((max(0, prompt - hit_tokens_pool), hit_tokens_pool))
     for p_idx, _, raw_p in p_cases:
         for c_tok, h_tok in sorted(p_tok_pairs):
-            if (p_idx, c_tok, h_tok) in prefill_cache:
+            p_key = _prefill_cache_key(
+                p_idx, c_tok, h_tok, apply_target_envelope, rewrite_plan, allow_unbound_formula,
+            )
+            if p_key in prefill_cache:
                 continue
-            _, res = _eval_prefill_exact_job((p_idx, raw_p, prompt, c_tok, h_tok))
+            _, res = _eval_prefill_exact_job((
+                p_idx, raw_p, prompt, c_tok, h_tok,
+                apply_target_envelope, rewrite_plan, allow_unbound_formula, allow_p_fallback,
+            ))
             if res is not None:
-                prefill_cache[(p_idx, c_tok, h_tok)] = res
+                prefill_cache[p_key] = res
 
     for idx, _, raw_d in all_d_cases:
         p_cache = d_probe_caches.setdefault(idx, {})

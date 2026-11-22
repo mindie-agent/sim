@@ -512,6 +512,7 @@ class PredictionSpine:
         primitive_table: Any = None,
         stack_id: str = "cann93_va_main",
         max_trials: int = DEFAULT_OPTIMIZE_TRIALS,
+        allow_unbound_formula: bool = False,
     ) -> Any:
         """Run the certified 5-level primal-dual optimization ladder on ``runtime.Engine``."""
         from mindie_sim.optimization.ladder import solve_five_level_ladder
@@ -525,6 +526,7 @@ class PredictionSpine:
             primitive_table=primitive_table,
             stack_id=stack_id,
             max_trials=max_trials,
+            allow_unbound_formula=allow_unbound_formula,
         )
 
     def evaluate_three_tiers(

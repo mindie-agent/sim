@@ -1450,6 +1450,8 @@ def _apply_target_envelope_to_rows(
         phase=step_req.phase, rewrite_plan=ext_plan, n_tok_per_die=n_tok_die,
         primitive_table=rebound_primitive_table,
         allow_unbound_formula=allow_unbound_formula,
+        step_request=step_req,
+        scenario_case=parsed,
     )
     new_rows = [
         _apply_node_to_row(

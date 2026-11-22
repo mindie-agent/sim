@@ -1392,9 +1392,10 @@ def test_oneshot_selection_reconciles_link_ledger_with_executed_sends():
 
     link_rate = 50.0e9
 
-    def _check(node, dem, useful_tx):
-        assert node.link_bytes == pytest.approx(useful_tx)
-        assert dem[4] == int(useful_tx * 1.0e9 / link_rate)
+    def _check(node, dem, expected_tx, useful_tx):
+        assert node.link_bytes == pytest.approx(expected_tx)
+        assert node.link_bytes >= useful_tx
+        assert dem[4] == int(expected_tx * 1.0e9 / link_rate)
         assert node.l_star_lean_us == pytest.approx(max(dem) / 1000.0)
         assert node.gap_us == pytest.approx(max(0.0, node.dur_us - node.l_star_lean_us))
 
@@ -1410,12 +1411,14 @@ def test_oneshot_selection_reconciles_link_ledger_with_executed_sends():
     n_ar = _mk_target_node(0, ar, task_type="HCCL", dur_us=200.0, l_star_us=0.5, bound="link_bound")
     res = solve_target_graph((n_ar,), ((0, 0, 0, 0, 500),), case8, peaks8, allow_unbound_formula=False)
     assert "One-Shot" in res.nodes[0].ascend_kernel
-    _check(res.nodes[0], res.demands_ns[0], 7.0 * msg)
+    _check(res.nodes[0], res.demands_ns[0], res.nodes[0].link_bytes, 7.0 * msg)
 
-    # Explicit CollectiveTransform: TP4 ring ledger 1.5*M -> one-shot sends M to 3 peers.
-    case4 = parse_case(compose_case("qwen3-32b", REPRESENTATIVE_SKUS["a5"], tp=4, dp=1, layers=1))
+    # Explicit CollectiveTransform: TP4 on framed one-credit link (1,024 B -> 3 x 400 B = 1,200 B wire/peer).
+    raw4 = compose_case("qwen3-32b", REPRESENTATIVE_SKUS["a5"], tp=4, dp=1, layers=1)
+    raw4["machine"]["links"][0].update(transaction_bytes=352, alignment_bytes=64, protocol_overhead_bytes=48)
+    case4 = parse_case(raw4)
     peaks4 = {0: {"hbm_peak_bytes_per_s": dict(case4.machine.dies[0].rates)["hbm"], "link_peak_bytes_per_s": link_rate}}
-    msg4 = float(64 * 1024)
+    msg4 = float(1024)
     ar4 = replace(ar, op_id="s0.l0.ar4", link_bytes=msg4 * (2.0 * 3.0 / 4.0))
     n_ar4 = _mk_target_node(0, ar4, task_type="HCCL", dur_us=200.0, l_star_us=0.5, bound="link_bound")
     plan = RewritePlan(edits=(
@@ -1424,7 +1427,33 @@ def test_oneshot_selection_reconciles_link_ledger_with_executed_sends():
     res4 = solve_target_graph(
         (n_ar4,), ((0, 0, 0, 0, 500),), case4, peaks4, rewrite_plan=plan, allow_unbound_formula=False,
     )
-    _check(res4.nodes[0], res4.demands_ns[0], 3.0 * msg4)
+    assert res4.nodes[0].link_bytes == pytest.approx(3.0 * 1200.0)
+    assert res4.nodes[0].link_bytes > 3.0 * msg4
+    _check(res4.nodes[0], res4.demands_ns[0], 3.0 * 1200.0, 3.0 * msg4)
+
+
+def test_solve_target_graph_accepts_public_prepare_scenario_sealed_plan_and_rejects_tampered():
+    from mindie_sim.api import optimize_ladder
+    from mindie_sim.export import build_export_bundle
+    from mindie_sim.prediction.results import StepRequest
+    from mindie_sim.prediction.structure import parse_case
+    from mindie_sim.rewrite import ScenarioRequest, prepare_scenario
+    from mindie_sim.schema.common import ModelingError
+    from mindie_sim.solve import solve_deployment
+
+    raw = compose_case("qwen3-32b", REPRESENTATIVE_SKUS["a5"], dp=1, tp=2, ep=1, pp=1, layers=2, prompt_tokens=1024, output_tokens=64, concurrency=1)
+    case, req = parse_case(raw), StepRequest(phase="decode", tokens=1, context=1024, sequences=1)
+    dossier = prepare_scenario(ScenarioRequest(case=case, step=req))
+    assert build_export_bundle(raw, request=req, apply_target_envelope=True, rewrite_plan=dossier.unmerge_plan, allow_unbound_formula=False).step_span_us > 0.0
+    assert build_export_bundle(raw, request=req, apply_target_envelope=True, rewrite_plan=dossier.mainline_plan, allow_unbound_formula=False).step_span_us > 0.0
+    with pytest.raises(ModelingError, match="rewrite_digest_mismatch:framing_sha256"):
+        build_export_bundle(raw, request=req, apply_target_envelope=True, rewrite_plan=replace(dossier.unmerge_plan, framing_sha256="a" * 64), allow_unbound_formula=False)
+    assert optimize_ladder(case, req, max_trials=1, allow_unbound_formula=True) is not None
+    from mindie_sim.sweep.pd import solve_optimal_deployment
+    sol0 = solve_optimal_deployment("qwen3-32b", REPRESENTATIVE_SKUS["a5"], num_devices=1, prompt_tokens=128, output_tokens=1, ttft_sla_ms=5000.0, tpot_sla_ms=100.0, layers=1, feature_track="unmerged_pr", apply_target_envelope=False)
+    dos_p = prepare_scenario(ScenarioRequest(case=parse_case(sol0["recommended_case"]), step=StepRequest(phase="prefill", tokens=128, context=0, sequences=1)))
+    sol_p = solve_deployment("qwen3-32b", REPRESENTATIVE_SKUS["a5"], num_devices=1, prompt_tokens=128, output_tokens=1, ttft_slo_ms=5000.0, tpot_slo_ms=100.0, layers=1, mode="simulation", compare_track="unmerged_pr", rewrite_plan=dos_p.unmerge_plan)
+    assert sol_p["feasible"] is True and sol_p["recommended_deployment"]["best_configuration"]["ttft_ms"] > 0.0
 
 
 def test_formula_sram_sizes_norm_row_by_reduction_width_not_downstream_vocab():

@@ -1725,7 +1725,7 @@ def _populate_memory_sheet(ws: Worksheet, bundle: ExportBundle) -> None:
     )
 
     cache_end = _populate_cache_block(ws, w_tot_vit + 2, mem)
-    _populate_stage_budget_block(ws, cache_end + 2, mem, cache_tot_row=cache_end)
+    _populate_stage_budget_block(ws, cache_end + 2, mem, cache_tot_row=cache_end, weight_start_row=w_start)
 
 
 def _populate_cache_block(ws: Worksheet, start_row: int, mem: MemoryCalculatorLedger) -> int:
@@ -1783,8 +1783,77 @@ def _populate_cache_block(ws: Worksheet, start_row: int, mem: MemoryCalculatorLe
     return c_tot
 
 
+def _stage_weight_formulas(
+    mem: MemoryCalculatorLedger, stage_idx: int, weight_start_row: int,
+) -> tuple[str | None, str | None]:
+    """Build live Excel formulas for one PP stage's HBM weight payload & scale+aux (GiB)."""
+    if weight_start_row <= 0 or not mem.weight_rows:
+        return None, None
+    lookup_ref = f"$U${MEMORY_LOOKUP_FIRST_ROW}:$X${MEMORY_LOOKUP_LAST_ROW}"
+    payload_terms: list[str] = []
+    scale_terms: list[str] = []
+    run_start: int | None = None
+    run_end: int | None = None
+
+    def _flush_run() -> None:
+        nonlocal run_start, run_end
+        if run_start is None or run_end is None:
+            return
+        if run_start == run_end:
+            payload_terms.append(f"K{run_start}")
+            scale_terms.append(f"(L{run_start}+M{run_start})")
+        else:
+            payload_terms.append(f"SUM(K{run_start}:K{run_end})")
+            scale_terms.append(f"(SUM(L{run_start}:L{run_end})+SUM(M{run_start}:M{run_end}))")
+        run_start = run_end = None
+
+    for idx, wrow in enumerate(mem.weight_rows):
+        if wrow.is_engram_or_ple:
+            _flush_run()
+            continue
+        st_rep = int(wrow.stage_repeats[stage_idx]) if stage_idx < len(wrow.stage_repeats) else 0
+        if st_rep <= 0:
+            _flush_run()
+            continue
+        wr = weight_start_row + idx
+        if not wrow.is_vision and wrow.peak_stage_repeats == st_rep:
+            if run_start is None:
+                run_start = run_end = wr
+            elif run_end == wr - 1:
+                run_end = wr
+            else:
+                _flush_run()
+                run_start = run_end = wr
+            continue
+        _flush_run()
+        if wrow.peak_stage_repeats > 0:
+            ratio = float(st_rep) / float(wrow.peak_stage_repeats)
+            p_term = f"K{wr}" if st_rep == wrow.peak_stage_repeats else f"K{wr}*{ratio!r}"
+            s_term = (
+                f"(L{wr}+M{wr})" if st_rep == wrow.peak_stage_repeats
+                else f"(L{wr}+M{wr})*{ratio!r}"
+            )
+        else:
+            p_term = f"F{wr}*ROUNDUP(G{wr}*VLOOKUP(J{wr},{lookup_ref},2,FALSE),0)*{st_rep}"
+            s_term = (
+                f"(IF(VLOOKUP(J{wr},{lookup_ref},3,FALSE)>0,"
+                f"F{wr}*ROUNDUP(G{wr}/VLOOKUP(J{wr},{lookup_ref},3,FALSE),0)*{st_rep},0)"
+                f"+F{wr}*VLOOKUP(J{wr},{lookup_ref},4,FALSE)*{st_rep})"
+            )
+        if wrow.is_vision:
+            p_term = f'IF({MEM_CTL_VIT_REF}="ON",{p_term},0)'
+            s_term = f'IF({MEM_CTL_VIT_REF}="ON",{s_term},0)'
+        payload_terms.append(p_term)
+        scale_terms.append(s_term)
+    _flush_run()
+    payload_f = f"=({'+'.join(payload_terms) or '0'})/{GIB_BYTES}"
+    scale_f = f"=({'+'.join(scale_terms) or '0'})/{GIB_BYTES}"
+    return payload_f, scale_f
+
+
 def _populate_stage_budget_block(
-    ws: Worksheet, start_row: int, mem: MemoryCalculatorLedger, *, cache_tot_row: int = 0,
+    ws: Worksheet, start_row: int, mem: MemoryCalculatorLedger, *,
+    cache_tot_row: int = 0, weight_start_row: int = 0,
 ) -> int:
     ws.set_cell(start_row, 1, "3. Per-PP-Stage HBM vs Host Offload Budget (DP/TP/EP/PP/DCP/PCP/Local-TP)", style=STYLE_SECTION)
     ws.merge_range(start_row, 1, start_row, MEMORY_TABLE_END_COL)
@@ -1826,10 +1895,11 @@ def _populate_stage_budget_block(
             cache_f = f"=({'+'.join(terms) or '0'})*{MEM_CTL_CONC_REF}/{MIB_PER_GIB}"
         else:
             cache_f = f"={st_per_req / float(GIB_BYTES)!r}*{MEM_CTL_CONC_REF}"
+        w_payload_f, w_scale_f = _stage_weight_formulas(mem, st.stage, weight_start_row)
         _write_row(ws, r, (
             (f"Stage {st.stage}", None, STYLE_MERGED), (st.owned_layers, None, STYLE_INT),
-            (st.weight_payload_bytes / float(GIB_BYTES), None, STYLE_FLOAT3),
-            (st.weight_scale_aux_bytes / float(GIB_BYTES), None, STYLE_FLOAT3),
+            (st.weight_payload_bytes / float(GIB_BYTES), w_payload_f, STYLE_FLOAT3),
+            (st.weight_scale_aux_bytes / float(GIB_BYTES), w_scale_f, STYLE_FLOAT3),
             (st.engram_ple_hbm_bytes / float(GIB_BYTES), f'=IF({MEM_CTL_OFFLOAD_REF}="ON",0,N{r})', STYLE_FLOAT3),
             (st.engram_ple_host_bytes / float(GIB_BYTES), f'=IF({MEM_CTL_OFFLOAD_REF}="ON",N{r},0)', STYLE_FLOAT3),
             (st.cache_bytes / float(GIB_BYTES), cache_f, STYLE_FLOAT3),
