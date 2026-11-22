@@ -74,6 +74,10 @@ from mindie_sim.schema.operators import OpSpec
 ROOT = Path(__file__).resolve().parents[2]
 PERCENT_SCALE = 100.0
 TAIL_QUANTILE_P90 = 0.9
+L1_MEDIAN_APE_LIMIT_PCT = 8.0
+L1_P90_APE_LIMIT_PCT = 12.0
+L1_CLIFF_RTOL = 0.15
+L1_CLIFF_ATOL_NS = 3_000
 DISPLAY_ROUND_DIGITS = 4
 SAMPLE_RECORD_LIMIT = 40
 SPLITS = ("train", "heldout", "unassigned")
@@ -260,24 +264,59 @@ def _timing_fields(predicted: float, measured: float, *, unit: str = "us") -> di
         raise ModelingError("predicted_duration_invalid")
     ape = abs(predicted - measured) / measured
     scale = TIME_UNIT_SCALE_NS[unit]
+    pred_ns = round(predicted * scale)
+    meas_ns = round(measured * scale)
+    cliff_limit_ns = max(L1_CLIFF_RTOL * float(meas_ns), float(L1_CLIFF_ATOL_NS))
     return {
         "status": "ok", "ape": ape, "ape_pct": round(ape * PERCENT_SCALE, 2),
-        "pointwise_pass": not exceeds_physical_tolerance(round(predicted * scale), round(measured * scale)),
+        "pointwise_pass": not exceeds_physical_tolerance(pred_ns, meas_ns),
+        "l1_cliff_pass": abs(pred_ns - meas_ns) <= cliff_limit_ns,
     }
 
 
-def _stats(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
-    """Summarize every row and determine status from individual timing checks."""
-    apes = sorted(row["ape"] for row in rows if row["status"] == "ok")
-    passed = sum(row["pointwise_pass"] for row in rows if row["status"] == "ok")
-    failed, blocked = len(apes) - passed, len(rows) - len(apes)
+def _stats(rows: Sequence[Mapping[str, Any]], *, level: str = "L2") -> dict[str, Any]:
+    """Summarize rows using Two-Tier law for L1 and strict 10%/2us for L2/L3."""
+    ok_rows = [row for row in rows if row["status"] == "ok"]
+    apes = sorted(row["ape"] for row in ok_rows)
+    blocked = len(rows) - len(ok_rows)
     p90_idx = math.ceil(TAIL_QUANTILE_P90 * len(apes)) - 1
+    strict_passed = sum(bool(row["pointwise_pass"]) for row in ok_rows)
+    medape_pct = round(statistics.median(apes) * PERCENT_SCALE, DISPLAY_ROUND_DIGITS) if apes else None
+    p90_ape_pct = round(apes[p90_idx] * PERCENT_SCALE, DISPLAY_ROUND_DIGITS) if apes else None
+    max_ape_pct = round(apes[-1] * PERCENT_SCALE, DISPLAY_ROUND_DIGITS) if apes else None
+    mape_pct = round(statistics.fmean(apes) * PERCENT_SCALE, DISPLAY_ROUND_DIGITS) if apes else None
+    if level == "L1":
+        cliff_passed = sum(bool(row.get("l1_cliff_pass", row["pointwise_pass"])) for row in ok_rows)
+        cliff_failed = len(apes) - cliff_passed
+        median_ok = medape_pct is not None and medape_pct <= L1_MEDIAN_APE_LIMIT_PCT
+        p90_ok = p90_ape_pct is not None and p90_ape_pct <= L1_P90_APE_LIMIT_PCT
+        cliff_ok = cliff_failed == 0
+        status = (
+            "fail" if (apes and not (median_ok and p90_ok and cliff_ok))
+            else ("insufficient_evidence" if blocked or not apes else "pass")
+        )
+        return {
+            "status": status, "gate_tier": "L1_two_tier",
+            "total": len(rows), "count": len(apes), "passed": cliff_passed, "failed": cliff_failed,
+            "strict_10pct_passed": strict_passed, "explicitly_blocked": blocked,
+            "mape_pct": mape_pct, "medape_pct": medape_pct, "p90_ape_pct": p90_ape_pct,
+            "max_ape_pct": max_ape_pct,
+            "cliff_pass_rate": round(cliff_passed / len(apes), DISPLAY_ROUND_DIGITS) if apes else None,
+            "two_tier_thresholds": {
+                "median_ape_limit_pct": L1_MEDIAN_APE_LIMIT_PCT,
+                "p90_ape_limit_pct": L1_P90_APE_LIMIT_PCT,
+                "cliff_rtol_pct": round(L1_CLIFF_RTOL * PERCENT_SCALE, 2),
+                "cliff_atol_us": round(L1_CLIFF_ATOL_NS / TIME_UNIT_SCALE_NS["us"], 2),
+            },
+            "two_tier_checks": {"median_pass": median_ok, "p90_pass": p90_ok, "cliff_pass": cliff_ok},
+        }
+    failed = len(apes) - strict_passed
     return {
         "status": "fail" if failed else ("insufficient_evidence" if blocked or not apes else "pass"),
-        "total": len(rows), "count": len(apes), "passed": passed, "failed": failed, "explicitly_blocked": blocked,
-        "mape_pct": round(statistics.fmean(apes) * PERCENT_SCALE, DISPLAY_ROUND_DIGITS) if apes else None,
-        "medape_pct": round(statistics.median(apes) * PERCENT_SCALE, DISPLAY_ROUND_DIGITS) if apes else None,
-        "p90_ape_pct": round(apes[p90_idx] * PERCENT_SCALE, DISPLAY_ROUND_DIGITS) if apes else None,
+        "gate_tier": "strict_10pct_2us",
+        "total": len(rows), "count": len(apes), "passed": strict_passed, "failed": failed,
+        "explicitly_blocked": blocked, "mape_pct": mape_pct,
+        "medape_pct": medape_pct, "p90_ape_pct": p90_ape_pct, "max_ape_pct": max_ape_pct,
     }
 
 
@@ -541,7 +580,8 @@ def evaluate_level1(captures_dir: Path, resolver: _LineageSplitResolver) -> dict
             by_family.setdefault(row["family"], []).append(row)
         report_rows = [_display_row(row) for row in rows]
         out[split] = {
-            "summary": _stats(rows), "families": {f: _stats(v) for f, v in sorted(by_family.items())},
+            "summary": _stats(rows, level="L1"),
+            "families": {f: _stats(v, level="L1") for f, v in sorted(by_family.items())},
             "ids": [row["id"] for row in rows], "records": report_rows,
             "sample_records": report_rows[:SAMPLE_RECORD_LIMIT],
         }
@@ -815,7 +855,7 @@ def build_report(
         "level2_subgraphs_and_blocks": {
             sp: {
                 "summary": {
-                    **_stats(l2[sp]),
+                    **_stats(l2[sp], level="L2"),
                     "missing_evidence": sum(1 for x in l2[sp] if x.get("status") == "missing_evidence"),
                 },
                 "records": [{k: v for k, v in x.items() if k != "ape"} for x in l2[sp]],
@@ -823,7 +863,7 @@ def build_report(
             for sp in SPLITS
         },
         "level3_model_steps": {
-            sp: {"summary": _stats(l3[sp]), "records": [{k: v for k, v in x.items() if k != "ape"} for x in l3[sp]]}
+            sp: {"summary": _stats(l3[sp], level="L3"), "records": [{k: v for k, v in x.items() if k != "ape"} for x in l3[sp]]}
             for sp in SPLITS
         },
         "wall_seconds": round(time.perf_counter() - t0, 2),

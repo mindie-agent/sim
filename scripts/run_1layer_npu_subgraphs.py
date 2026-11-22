@@ -380,47 +380,70 @@ def _detect_cann_version() -> str:
     return "unknown"
 
 
+def _parse_npu_smi_chip_freqs(stdout: str) -> tuple[dict[int, float], float | None]:
+    """Parse per-chip ``Aicore curFreq(MHZ)`` readings from ``npu-smi info -t common``."""
+    chip_freqs: dict[int, float] = {}
+    fallback_cur: float | None = None
+    cur_chip: int | None = None
+    for line in stdout.splitlines():
+        low = line.lower()
+        if "chip id" in low:
+            m_c = re.search(r":\s*([0-9]+)", line)
+            cur_chip = int(m_c.group(1)) if m_c else None
+            continue
+        if "aicore" in low and "curfreq" in low and "mhz" in low:
+            m = re.search(r":\s*([0-9]+(?:\.[0-9]+)?)", line)
+            if m and float(m.group(1)) > 0.0:
+                val = round(float(m.group(1)), 2)
+                if cur_chip is not None:
+                    chip_freqs[cur_chip] = val
+                elif fallback_cur is None:
+                    fallback_cur = val
+    return chip_freqs, fallback_cur
+
+
+def _query_npu_smi_common(dev_id: str) -> tuple[dict[int, float], float | None]:
+    if not dev_id.isdigit():
+        return {}, None
+    try:
+        res = subprocess.run(
+            ["npu-smi", "info", "-t", "common", "-i", dev_id],
+            capture_output=True, text=True, timeout=FREQ_PROBE_TIMEOUT_SEC, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {}, None
+    return _parse_npu_smi_chip_freqs(res.stdout)
+
+
 def _detect_aicore_freq_mhz(rank: int = 0) -> float:
-    """Query actual operating ``Aicore curFreq(MHZ)`` via ``npu-smi`` (never substituting rated max)."""
+    """Query actual operating ``Aicore curFreq(MHZ)`` via ``npu-smi`` (dual-die A3 aware)."""
     vis_env = os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "").strip()
     vis_list = [x.strip() for x in vis_env.split(",") if x.strip()] if vis_env else []
     raw_id = vis_list[rank] if rank < len(vis_list) else str(rank)
-    candidates: list[tuple[str, int | None]] = [(raw_id, None)]
-    if raw_id.isdigit() and int(raw_id) > 0:
-        candidates.append((str(int(raw_id) // 2), int(raw_id) % 2))
-    for dev_id, target_chip in candidates:
-        if not dev_id.isdigit():
-            continue
-        try:
-            res = subprocess.run(
-                ["npu-smi", "info", "-t", "common", "-i", dev_id],
-                capture_output=True, text=True, timeout=FREQ_PROBE_TIMEOUT_SEC, check=False,
-            )
-        except (OSError, subprocess.SubprocessError):
-            continue
-        chip_freqs: dict[int, float] = {}
-        fallback_cur: float | None = None
-        cur_chip: int | None = None
-        for line in res.stdout.splitlines():
-            low = line.lower()
-            if "chip id" in low:
-                m_c = re.search(r":\s*([0-9]+)", line)
-                cur_chip = int(m_c.group(1)) if m_c else None
-                continue
-            if "aicore" in low and "curfreq" in low and "mhz" in low:
-                m = re.search(r":\s*([0-9]+(?:\.[0-9]+)?)", line)
-                if m and float(m.group(1)) > 0.0:
-                    val = round(float(m.group(1)), 2)
-                    if cur_chip is not None:
-                        chip_freqs[cur_chip] = val
-                    elif fallback_cur is None:
-                        fallback_cur = val
-        if target_chip is not None and target_chip in chip_freqs:
-            return chip_freqs[target_chip]
-        if chip_freqs:
-            return chip_freqs[sorted(chip_freqs)[0]]
-        if fallback_cur is not None:
-            return fallback_cur
+    if not raw_id.isdigit():
+        return 0.0
+    logical_id = int(raw_id)
+    chip_freqs, fallback_cur = _query_npu_smi_common(raw_id)
+    if len(chip_freqs) > 1:
+        # Dual-die package (e.g. Ascend 910C/A3): logical die d maps to (pkg=d//2, chip=d%2).
+        pkg_id, chip_id = logical_id // len(chip_freqs), logical_id % len(chip_freqs)
+        if str(pkg_id) != raw_id:
+            chip_freqs, fallback_cur = _query_npu_smi_common(str(pkg_id))
+        if chip_id in chip_freqs:
+            return chip_freqs[chip_id]
+    if chip_freqs:
+        return chip_freqs[sorted(chip_freqs)[0]]
+    if fallback_cur is not None:
+        return fallback_cur
+    if logical_id > 0:
+        chip_freqs2, fallback_cur2 = _query_npu_smi_common(str(logical_id // 2))
+        chip_id = logical_id % 2
+        if chip_id in chip_freqs2:
+            return chip_freqs2[chip_id]
+        if chip_freqs2:
+            return chip_freqs2[sorted(chip_freqs2)[0]]
+        if fallback_cur2 is not None:
+            return fallback_cur2
     return 0.0
 
 
@@ -1882,12 +1905,13 @@ def _run_moe_owner_routed_ep(
     global_idx = (idx_top[:, :local_top_k] % total_e).to(torch_mod.int64).reshape(-1)
     tok_ids = torch_mod.arange(tokens, dtype=torch_mod.int64, device=device).repeat_interleave(local_top_k)
 
-    # Sort by global_idx = owner_rank * local_e + local_e_id and scatter into static per-owner slots (zero .tolist() sync)
+    # Sort by global_idx = owner_rank * local_e + local_e_id and scatter into static per-owner slots (zero D2H sync)
     send_order = torch_mod.argsort(global_idx, stable=True)
     sorted_g = global_idx[send_order]
     sorted_x = h[tok_ids[send_order]].contiguous()
     sorted_owner = torch_mod.div(sorted_g, local_e, rounding_mode="floor")
-    owner_counts = torch_mod.bincount(sorted_owner, minlength=world_ep).to(torch_mod.int64)
+    owner_counts = torch_mod.zeros((world_ep,), dtype=torch_mod.int64, device=device)
+    owner_counts.scatter_add_(0, sorted_owner, torch_mod.ones((n_assign,), dtype=torch_mod.int64, device=device))
     owner_offsets = torch_mod.cumsum(owner_counts, dim=0) - owner_counts
     pos_in_owner = torch_mod.arange(n_assign, dtype=torch_mod.int64, device=device) - owner_offsets[sorted_owner]
     valid_send = pos_in_owner < per_rank_cap
@@ -1927,7 +1951,8 @@ def _run_moe_owner_routed_ep(
     recv_valid = recv_meta > 0
     recv_e = torch_mod.where(recv_valid, recv_meta - 1, recv_meta * 0 + (local_e - 1)).clamp(min=0, max=local_e - 1)
     recv_order = torch_mod.argsort(recv_e, stable=True)
-    recv_gl = torch_mod.bincount(recv_e, minlength=local_e).to(torch_mod.int64)
+    recv_gl = torch_mod.zeros((local_e,), dtype=torch_mod.int64, device=device)
+    recv_gl.scatter_add_(0, recv_e, torch_mod.ones((padded_total,), dtype=torch_mod.int64, device=device))
     g2_sorted = _exec_moe_local_gmm(
         torch_mod, torch_npu_mod,
         recv_x[recv_order].contiguous(), recv_gl, weights, quant_mode,

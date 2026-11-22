@@ -148,6 +148,10 @@ class _CpuTensor:
     def __rpow__(self, base: Any) -> _CpuTensor: return _CpuTensor(np.power(base, self.arr))
     def expand(self, *shape: int) -> _CpuTensor: return _CpuTensor(np.broadcast_to(self.arr, shape).copy())
     def clamp(self, min: int | None = None, max: int | None = None) -> _CpuTensor: return _CpuTensor(np.clip(self.arr, min, max))
+    def scatter_add_(self, dim: int, idx: _CpuTensor, src: _CpuTensor) -> _CpuTensor:
+        del dim
+        np.add.at(self.arr, idx.arr.astype(np.int64), src.arr)
+        return self
 
 
 def _make_cpu_torch_mocks(all_to_all_cb: Any = None, router_experts: list[int] | None = None, w_val: float = 1.0, qk_norm_scale: float = 1.0) -> tuple[Any, Any, dict[str, Any]]:
@@ -533,9 +537,18 @@ def test_live_runner_cpu_builders_kv_slot_prefill_owner_ep_and_preflight(monkeyp
     t1.join()
     assert not errs and np.allclose(outs[0].arr, 132.0) and np.allclose(outs[1].arr, 132.0) and r0_tr["gmm_calls"] and r1_tr["gmm_calls"]
 
-    # 5. curFreq ignores rated 1650; StreamBlocker keeps 99us post-blocker copy tail; overlap error != absent_custom_op
+    # 5. curFreq ignores rated 1650 & maps dual-die A3 logical ID 5 -> (pkg=2, chip=1); StreamBlocker keeps 99us tail
     monkeypatch.setattr(live_runner.subprocess, "run", lambda *a, **kw: SimpleNamespace(stdout="Aicore Freq(MHZ) : 1650\nAicore curFreq(MHZ) : 800\n"))
     assert live_runner._detect_aicore_freq_mhz(0) == 800.0
+    monkeypatch.setenv("ASCEND_RT_VISIBLE_DEVICES", "5")
+    def _dual_die_smi(cmd: list[str], **_kw: Any) -> Any:
+        pkg = cmd[-1]
+        if pkg == "5":
+            return SimpleNamespace(stdout="Chip ID : 0\nAicore curFreq(MHZ) : 800\nChip ID : 1\nAicore curFreq(MHZ) : 800\n")
+        return SimpleNamespace(stdout="Chip ID : 0\nAicore curFreq(MHZ) : 800\nChip ID : 1\nAicore curFreq(MHZ) : 1650\n")
+    monkeypatch.setattr(live_runner.subprocess, "run", _dual_die_smi)
+    assert live_runner._detect_aicore_freq_mhz(0) == 1650.0
+    monkeypatch.delenv("ASCEND_RT_VISIBLE_DEVICES", raising=False)
     blk = {"type": "MatMulV3", "input_shapes": live_runner.STREAM_BLOCKER_EXACT_PREFIX, "start_us": 100.0, "duration_us": 100.0}
     tail_cp = {"type": "MemcpyAsync", "start_us": 199.0, "duration_us": 100.0}
     kept, stripped, matched = live_runner._strip_stream_blocker_rows([blk, blk, tail_cp, blk, blk])
@@ -544,7 +557,7 @@ def test_live_runner_cpu_builders_kv_slot_prefill_owner_ep_and_preflight(monkeyp
 
 
 def test_sanitization_and_tutorial_exec_mxfp4_and_mso_false(tmp_path: Path) -> None:
-    """Sanitizer strips IPv6 zone IDs & bare 64-hex digests; tutorial parser handles quoted TP/PP & $VAR skip."""
+    """Sanitizer strips IPv6/64-hex; tutorial parser skips eagle3 & reads MkDocs tabs; Two-Tier L1 & MC2 helpers work."""
     dirty = "ValueError:fd12:3456::789a:beef%en0 abcd:efab::cdef:abcd " + "c" * 64 + " user@corp.org " + "/" + "root/my dir/secret"
     for clean in (live_runner._sanitize_text(dirty), harness._sanitize_diagnostic(dirty)):
         for tok in ("fd12:3456", "beef%en0", "abcd:efab", "c" * 32, "user@corp.org", "secret"):
@@ -562,3 +575,10 @@ def test_sanitization_and_tutorial_exec_mxfp4_and_mso_false(tmp_path: Path) -> N
     assert disc["total_commands"] == 2 and len(disc["discovered"]) == 1 and len(disc["explicitly_skipped"]) == 1
     assert disc["discovered"][0]["tp"] == 4 and disc["discovered"][0]["pp"] == 4 and disc["discovered"][0]["mso"] is False
     assert isinstance(disc["discovered"][0]["quant"], dict) and disc["discovered"][0]["quant"]["weight_format"] == "mxfp4"
+    assert harness._parse_mtp_spec_tokens('{"method": "eagle3", "num_speculative_tokens": 3}') == 0
+    assert harness._parse_mtp_spec_tokens('{"method": "deepseek_mtp", "num_speculative_tokens": 2}') == 2
+    assert harness._mc2_protocol_link_bytes({"mc2_phase": {"route_matrix_bytes": [[10, 40], [30, 5]]}}) == 40.0
+    assert harness._l1_cliff_limit_us(10.0) == 3.0 and harness._l1_cliff_limit_us(100.0) == 15.0
+    l1_ok = harness._summarize_l1_two_tier({"a": {"signed_err_pct": 5.0, "pass_l1_cliff_tol": True}, "b": {"signed_err_pct": -11.0, "pass_l1_cliff_tol": True}})
+    l1_bad = harness._summarize_l1_two_tier({"a": {"signed_err_pct": 5.0, "pass_l1_cliff_tol": True}, "b": {"signed_err_pct": 18.0, "pass_l1_cliff_tol": False}})
+    assert l1_ok["l1_two_tier_pass"] is True and l1_bad["l1_two_tier_pass"] is False
