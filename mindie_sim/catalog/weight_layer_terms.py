@@ -69,9 +69,9 @@ def _norm_terms(plan: LayerPlan, model: ModelSpec) -> list[WeightTerm]:
     if plan.residual_block_size:
         terms.extend([
             _t("attn_res_norm", h, 1, "norm"),
-            _t("attn_res_proj", 1, h, "norm"),
+            _t("attn_res_proj", 1, h, "attn_res_proj"),
             _t("mlp_res_norm", h, 1, "norm"),
-            _t("mlp_res_proj", 1, h, "norm"),
+            _t("mlp_res_proj", 1, h, "attn_res_proj"),
         ])
     return terms
 

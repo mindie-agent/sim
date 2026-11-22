@@ -279,7 +279,7 @@ def body_head_terms(model: ModelSpec) -> list[WeightTerm]:
         if not model.tie_word_embeddings:
             terms.append(replace(_t("lm_head", model.vocab_size, h, "lm_head", "out_tp"), placement_role="logits"))
     if any(plan.residual_block_size for plan in model.layer_plans):
-        terms.extend([_t("output_attn_res_norm", h, 1, "norm"), _t("output_attn_res_proj", 1, h, "norm")])
+        terms.extend([_t("output_attn_res_norm", h, 1, "norm"), _t("output_attn_res_proj", 1, h, "attn_res_proj")])
     if lowrank_hc:
         from mindie_sim.catalog.qwen4_exp import lowrank_hc_head_terms
         terms.extend(lowrank_hc_head_terms(model))

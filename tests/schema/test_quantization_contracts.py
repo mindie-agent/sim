@@ -16,11 +16,13 @@ from pathlib import Path
 
 import pytest
 
+from _support.axes import REPRESENTATIVE_SKUS
 from _support.builders import hardware, quant
 from _support.memory_cases import SPARSE_OFFLOAD_SKU, case as memory_case
 from mindie_sim import Case, compose_case, graph_costs, operator_costs, target_graphs
 from mindie_sim.catalog.ops import compute_dtype_for, gemm_op
-from mindie_sim.catalog.quant import quant_preset
+from mindie_sim.catalog.quant import quant_preset, resolve_auto_va_quant
+from mindie_sim.model_catalog import load_model
 from mindie_sim.catalog.types import EngramSpec, EngramTableSpec, QuantSpec
 from mindie_sim.catalog.weight_terms import WeightTerm, term_bytes, term_payload_bytes
 from mindie_sim.catalog.weights import layer_weight_terms, stage_weight_bytes, stage_weight_decomposition
@@ -593,3 +595,48 @@ def test_named_dtype_preset_controls_each_cache_and_weight_format():
     assert quant.weight_format == quant.kv_dtype == quant.index_dtype == "fp16"
     graph = target_graphs(case, phase="decode", tokens=1, context=8, scope="model")
     assert graph[0]
+
+
+def test_routed_mxfp4_preset_quantizes_latent_moe_and_attn_res_projections():
+    q = quant_preset("mxfp4_routed_only")
+    assert q.format_for("routed_expert") == "mxfp4"
+    assert q.format_for("latent_moe") == "mxfp4"
+    assert q.format_for("attn_res_proj") == "mxfp4"
+    overrides = {key: dict(val) for key, val in q.category_overrides}
+    assert overrides["latent_moe"]["activation_format"] == "fp8_e4m3"
+    assert overrides["attn_res_proj"]["activation_format"] == "fp8_e4m3"
+    for excluded in ("attn", "mla", "kda", "shared_expert", "dense_mlp", "router", "norm", "lm_head", "embedding", "vision"):
+        assert q.format_for(excluded) == "bf16"
+
+    case = parse_case(compose_case(
+        "kimi-k3.1", hardware=REPRESENTATIVE_SKUS["a5"], topology_preset="a5_pod",
+        dp=4, tp=8, ep=32, dcp=8, prompt_tokens=1024, output_tokens=16, concurrency=2,
+    ))
+    terms = layer_weight_terms(case.model.layer_plans[1], case.model)
+    by_name = {t.name: t for t in terms}
+    assert by_name["attn_res_proj"].category == "attn_res_proj"
+    assert by_name["mlp_res_proj"].category == "attn_res_proj"
+    assert by_name["latent_down"].category == "latent_moe"
+    assert by_name["latent_up"].category == "latent_moe"
+    assert term_bytes(by_name["latent_down"], case.model.quant, case.runtime.parallel) < 2 * 3584 * 7168
+
+
+def test_production_mxfp8_mxfp4_preset_and_hardware_aware_quant_selection():
+    q = quant_preset("mxfp8_mxfp4")
+    assert q.format_for("attn") == "fp8_e4m3"
+    assert q.format_for("shared_expert") == "fp8_e4m3"
+    assert q.format_for("routed_expert") == "mxfp4"
+    assert q.format_for("latent_moe") == "mxfp4"
+    assert q.format_for("norm") == "bf16" and q.format_for("router") == "bf16"
+
+    moe_spec = load_model("kimi-k3.1")
+    dense_spec = load_model("qwen3-32b")
+    for legacy_key in ("a2", "a3"):
+        wq_m, kv_m, _ = resolve_auto_va_quant(moe_spec, REPRESENTATIVE_SKUS[legacy_key], context_tokens=65536)
+        wq_d, kv_d, _ = resolve_auto_va_quant(dense_spec, REPRESENTATIVE_SKUS[legacy_key], context_tokens=65536)
+        assert wq_m == "w4a8" and kv_m == "int8"
+        assert wq_d == "w8a8" and kv_d == "int8"
+    wq_a5_m, kv_a5_m, _ = resolve_auto_va_quant(moe_spec, REPRESENTATIVE_SKUS["a5"], context_tokens=65536)
+    wq_a5_d, kv_a5_d, _ = resolve_auto_va_quant(dense_spec, REPRESENTATIVE_SKUS["a5"], context_tokens=65536)
+    assert wq_a5_m == "mxfp8_mxfp4" and kv_a5_m == "fp8_e4m3"
+    assert wq_a5_d == "mxfp8" and kv_a5_d == "fp8_e4m3"

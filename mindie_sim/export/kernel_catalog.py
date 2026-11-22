@@ -43,7 +43,8 @@ from .models import (
     KERNEL_STATUS_NEW_OP,
     KERNEL_STATUS_NEW_OR_EXTEND,
     MACRO_MOD_COLLECTIVES,
-    MACRO_MOD_DENSE_NORM,
+    MACRO_MOD_DENSE_FFN,
+    MACRO_MOD_DRAFT_LAYERS,
     MACRO_MOD_DSA_LI,
     MACRO_MOD_ENGRAM,
     MACRO_MOD_GATED_O_PROJ,
@@ -53,7 +54,8 @@ from .models import (
     MACRO_MOD_MOE_ROUTED,
     MACRO_MOD_MOE_ROUTER,
     MACRO_MOD_MOE_SHARED,
-    MACRO_MOD_SPEC_HEAD,
+    MACRO_MOD_RESIDUAL_NORM,
+    MACRO_MOD_VERIFY_HEAD,
     MACRO_MOD_VISION,
     MATRIX_2D_RANK,
     STRUCTURE_BACKEND_MAP,
@@ -170,9 +172,9 @@ def classify_submodule(
 
 
 def classify_macro_module(op: OperatorExportRow) -> str:
-    """Assign an operator to its single executive architectural macro-module."""
+    """Assign an operator to its single executive L2 architectural macro-module."""
     if op.model_scope == "draft":
-        return MACRO_MOD_SPEC_HEAD
+        return MACRO_MOD_DRAFT_LAYERS
     sub = op.submodule
     if sub == SUB_ENGRAM_PLE:
         return MACRO_MOD_ENGRAM
@@ -198,7 +200,7 @@ def classify_macro_module(op: OperatorExportRow) -> str:
     if op.task_type == "HCCL" or fam in COLLECTIVE_FAMILIES:
         return MACRO_MOD_COLLECTIVES
     if sub == SUB_EMBED_TAIL:
-        return MACRO_MOD_SPEC_HEAD
+        return MACRO_MOD_VERIFY_HEAD
     if sub in {SUB_KDA, SUB_GDN}:
         return MACRO_MOD_KDA_GDN
     if sub == SUB_MLA_PROLOG:
@@ -211,7 +213,9 @@ def classify_macro_module(op: OperatorExportRow) -> str:
         return MACRO_MOD_GATED_O_PROJ
     if sub == SUB_MOE_ROUTED:
         return MACRO_MOD_MOE_ROUTED
-    return MACRO_MOD_DENSE_NORM
+    if sub == SUB_DENSE_FFN:
+        return MACRO_MOD_DENSE_FFN
+    return MACRO_MOD_RESIDUAL_NORM
 
 
 def _is_embed_or_tail_op(oid: str, suffix: str, fam: str, rec: str) -> bool:
@@ -558,6 +562,43 @@ def _extract_native_candidate(struct_node: Mapping[str, Any] | None) -> str:
     return ""
 
 
+def _disambiguate_scoped_role(suffix: str, role: str) -> str:
+    """Prefix repeated per-layer roles with their exact topological scope."""
+    if role.startswith("["):
+        return role
+    if "attn_res" in suffix:
+        if suffix.startswith("attention."):
+            return f"[Pre-Attn] {role}"
+        if suffix.startswith("ffn."):
+            return f"[Pre-MoE/FFN] {role}"
+        if suffix.startswith("final."):
+            return f"[Final] {role}"
+    if ".hc_" in f".{suffix}":
+        if suffix.startswith("attention."):
+            return f"[Post-Attn] {role}" if "hc_post" in suffix else f"[Pre-Attn] {role}"
+        if suffix.startswith("ffn."):
+            return f"[Post-MoE/FFN] {role}" if "hc_post" in suffix else f"[Pre-MoE/FFN] {role}"
+        if suffix.startswith("final."):
+            return f"[Final] {role}"
+    if suffix in {"norm1", "input_layernorm"}:
+        return f"[Pre-Attn] {role}"
+    if suffix in {"norm2", "post_attention_layernorm"}:
+        return f"[Pre-MoE/FFN] {role}"
+    if suffix == "attention.sp_gather":
+        return f"[Attn SP] {role}"
+    if suffix == "ffn.sp_gather":
+        return f"[MoE/FFN SP] {role}"
+    if suffix == "shared.sp_gather":
+        return f"[Shared SP] {role}"
+    if suffix == "sp_output_gather":
+        return f"[Final SP] {role}"
+    if suffix in {"attention.sp_scatter", "output_reduce.reduce_scatter", "tp_attn.reduce_scatter"}:
+        return f"[Attn SP] {role}"
+    if suffix in {"ffn.sp_scatter", "tp.reduce_scatter"}:
+        return f"[MoE/FFN SP] {role}"
+    return role
+
+
 def resolve_ascend_kernel_identity(
     op_id: str,
     spec: OpSpec | None,
@@ -580,7 +621,20 @@ def resolve_ascend_kernel_identity(
     is_ideal = track == "expected_ideal"
     is_raw_eager = track == "raw_eager"
     is_quant_mm = str(meta.get("activation_format") or "").lower() in {"int8", "fp8", "fp8_e4m3", "fp8_e5m2"}
-    is_mxfp4_w = str(meta.get("weight_format") or "").lower() in {"mxfp4", "mx_fp4", "fp4", "fp4_e2m1"}
+    w_fmt_l = str(meta.get("weight_format") or "").lower()
+    is_mxfp4_w = w_fmt_l in {"mxfp4", "mx_fp4", "fp4", "fp4_e2m1"}
+    is_int4_w = w_fmt_l in {"int4", "w4a8"}
+    sku_low = str(case.machine.sku or case.machine.name or "").lower()
+    is_a2_or_a3 = (
+        any(tok in sku_low for tok in ("910b", "910c", "910_93", "a2", "a3", "9362", "9381", "9382", "9391", "9392"))
+        and not any(tok in sku_low for tok in ("950", "a5", "3510"))
+    )
+    kv_raw = str(
+        (getattr(case.model.quant, "kv_dtype", "") if getattr(case.model, "quant", None) is not None else "")
+        or getattr(case.model, "kv_dtype", "")
+        or ""
+    ).lower()
+    is_c8_kv = kv_raw in {"int8", "c8"}
     struct_nat = _extract_native_candidate(struct_node)
     reg_spec = None
     if not isinstance(struct_node, Mapping) or not struct_nat:
@@ -595,14 +649,19 @@ def resolve_ascend_kernel_identity(
         suffix=suffix, fam=fam, rec=rec, meta=meta, nat_kind=nat_kind,
         is_ideal=is_ideal, is_raw_eager=is_raw_eager,
         is_quant_mm=is_quant_mm, is_mxfp4_w=is_mxfp4_w,
+        is_int4_w=is_int4_w, is_a2_or_a3=is_a2_or_a3, is_c8_kv=is_c8_kv,
         layer_plan=layer_plan,
     )
     if isinstance(struct_node, Mapping):
         preserve_qualified = bool(struct_nat) and kernel.startswith(f"{struct_nat} (")
+        preserve_a23_quant = is_a2_or_a3 and (is_quant_mm or is_int4_w or is_c8_kv) and any(
+            tok in kernel for tok in ("aclnnQuantMatmulV4", "aclnnGroupedMatmulV4", "aclnnAddRmsNormDynamicQuant", "aclnnSwiGluQuant", "C8 INT8 KV", "INT4")
+        )
         if (
             struct_nat
             and not needs_new
             and not preserve_qualified
+            and not preserve_a23_quant
             and not (is_raw_eager and (fam == "rmsnorm" or suffix == "linear_output_norm_gate"))
         ):
             kernel = "aclnnLayerNorm_LayerNormV3" if (fam == "layernorm" and struct_nat in {"aclnnLayerNorm", "LayerNormV3"}) else struct_nat
@@ -635,7 +694,7 @@ def resolve_ascend_kernel_identity(
     if kernel in BANNED_IMPLEMENTATION_NAMES or not kernel:
         kernel = "aclnnCustomOp"
     return AscendKernelDescriptor(
-        logical_role=role,
+        logical_role=_disambiguate_scoped_role(suffix, role),
         ascend_kernel=kernel,
         kernel_backend=backend,
         kernel_status=status,
@@ -658,9 +717,15 @@ def _classify_kernel_tuple(
     is_raw_eager: bool = False,
     is_quant_mm: bool,
     is_mxfp4_w: bool,
+    is_int4_w: bool = False,
+    is_a2_or_a3: bool = False,
+    is_c8_kv: bool = False,
     layer_plan: Any | None,
 ) -> tuple[str, str, str, str, str, bool, str, str]:
-    mm_kernel = "QuantBatchMatmulV3" if is_quant_mm else "MatMulV2"
+    mm_kernel = (
+        "aclnnQuantMatmulV4 (INT8)" if (is_a2_or_a3 and is_quant_mm)
+        else ("QuantBatchMatmulV3" if is_quant_mm else "MatMulV2")
+    )
     mm_src = "vllm-ascend/vllm_ascend/ops/linear.py"
 
     if suffix.endswith(".pad") or suffix == "pad":
@@ -700,14 +765,16 @@ def _classify_kernel_tuple(
             BACKEND_HCCL_MC2,
             KERNEL_STATUS_FRAMEWORK,
             "vllm-ascend/vllm_ascend/compilation/passes/mm_reduce_scatter_fusion_pass.py",
-            False, "", fam,
+            False, "", suffix or fam,
         )
     if fam == "mhc" or ".hc_" in f".{suffix}":
         return _classify_mhc_tuple(suffix, fam, rec, mm_kernel, layer_plan, is_ideal=is_ideal)
     if any(tok in suffix or tok in fam or tok in rec for tok in ("engram", "ple_")):
         return _classify_engram_ple_tuple(suffix, fam, rec, mm_kernel)
     if fam in {"rmsnorm", "add_rmsnorm", "add_rmsnorm_quant", "rmsnorm_quant", "layernorm", "quantize"}:
-        return _classify_norm_quant_tuple(suffix, fam, rec, meta, nat_kind, is_raw_eager=is_raw_eager)
+        return _classify_norm_quant_tuple(
+            suffix, fam, rec, meta, nat_kind, is_raw_eager=is_raw_eager, is_a2_or_a3=is_a2_or_a3,
+        )
     if "mla_prolog" in suffix or "mla_prolog" in rec:
         return (
             "Fused MLA Prolog (Q/KV-A + RMSNorm + Q-B + W_UK Absorb + KV Cache)",
@@ -725,7 +792,7 @@ def _classify_kernel_tuple(
             False, "", suffix,
         )
     if fam == "attention":
-        return _classify_attention_tuple(suffix, rec, nat_kind, layer_plan)
+        return _classify_attention_tuple(suffix, rec, nat_kind, layer_plan, is_a2_or_a3=is_a2_or_a3, is_c8_kv=is_c8_kv)
     if fam == "attention_merge" or suffix == "dcp_lse_merge":
         return (
             "DCP Attention LSE Merge", "aclnnAttentionUpdate", BACKEND_CANN,
@@ -740,7 +807,10 @@ def _classify_kernel_tuple(
             is_raw_eager=is_raw_eager, layer_plan=layer_plan,
         )
     if _is_moe_router_dispatch_op(suffix, fam, rec) or _is_moe_routed_op(suffix, fam, rec) or _is_shared_expert_op(suffix, rec):
-        return _classify_moe_tuple(suffix, fam, rec, meta, nat_kind, is_ideal, is_quant_mm, is_mxfp4_w, mm_kernel)
+        return _classify_moe_tuple(
+            suffix, fam, rec, meta, nat_kind, is_ideal, is_quant_mm, is_mxfp4_w, mm_kernel,
+            is_int4_w=is_int4_w, is_a2_or_a3=is_a2_or_a3,
+        )
     if fam in COLLECTIVE_FAMILIES:
         return _classify_collective_tuple(suffix, fam, rec)
     return _classify_proj_and_misc_tuple(suffix, fam, nat_kind, mm_kernel, mm_src)
@@ -857,10 +927,10 @@ def _classify_proj_and_misc_tuple(
 
 def _classify_norm_quant_tuple(
     suffix: str, fam: str, rec: str, meta: Mapping[str, Any], nat_kind: str,
-    *, is_raw_eager: bool = False,
+    *, is_raw_eager: bool = False, is_a2_or_a3: bool = False,
 ) -> tuple[str, str, str, str, str, bool, str, str]:
     out_fmt = str(meta.get("output_format") or "").lower()
-    is_mx = out_fmt in {"fp8_e4m3", "mxfp8"} and str(meta.get("activation_scale_format") or "") == "fp8_e8m0"
+    is_mx = (not is_a2_or_a3) and out_fmt in {"fp8_e4m3", "mxfp8"} and str(meta.get("activation_scale_format") or "") == "fp8_e8m0"
     if fam == "layernorm":
         return (
             "Indexer K LayerNorm (1-kernel FP32-UB)" if "index" in suffix else "LayerNorm (1-kernel FP32-UB)",
@@ -868,13 +938,13 @@ def _classify_norm_quant_tuple(
             "vllm-ascend/vllm_ascend/ops/layernorm.py", False, "", suffix,
         )
     if fam == "add_rmsnorm_quant":
-        kern = "AddRmsNormDynamicMxQuant" if is_mx else "AddRmsNormDynamicQuant"
+        kern = "AddRmsNormDynamicMxQuant" if is_mx else ("aclnnAddRmsNormDynamicQuant" if is_a2_or_a3 else "AddRmsNormDynamicQuant")
         return (
             "Fused Residual Add + RMSNorm + Dynamic Quant", kern, BACKEND_CANN,
             KERNEL_STATUS_EXISTING, "vllm-ascend/vllm_ascend/ops/layernorm.py", False, "", suffix,
         )
     if fam == "rmsnorm_quant":
-        kern = "RmsNormDynamicMxQuant" if is_mx else "RmsNormDynamicQuant"
+        kern = "RmsNormDynamicMxQuant" if is_mx else ("aclnnRmsNormDynamicQuant" if is_a2_or_a3 else "RmsNormDynamicQuant")
         return (
             "Fused RMSNorm + Dynamic Quant", kern, BACKEND_CANN,
             KERNEL_STATUS_EXISTING, "vllm-ascend/vllm_ascend/ops/layernorm.py", False, "", suffix,
@@ -885,7 +955,7 @@ def _classify_norm_quant_tuple(
             KERNEL_STATUS_EXISTING, "vllm-ascend/vllm_ascend/ops/layernorm.py", False, "", suffix,
         )
     if fam == "quantize":
-        kern = "DynamicMxQuant" if is_mx else "DynamicQuant"
+        kern = "DynamicMxQuant" if is_mx else ("aclnnDynamicQuant" if is_a2_or_a3 else "DynamicQuant")
         return (
             f"Dynamic Activation Quantize ({suffix})", kern, BACKEND_CANN,
             KERNEL_STATUS_EXISTING, "vllm-ascend/vllm_ascend/quantization/w8a8_dynamic.py",
@@ -914,6 +984,7 @@ def _classify_norm_quant_tuple(
 
 def _classify_attention_tuple(
     suffix: str, rec: str, nat_kind: str, layer_plan: Any | None,
+    *, is_a2_or_a3: bool = False, is_c8_kv: bool = False,
 ) -> tuple[str, str, str, str, str, bool, str, str]:
     topk = int(getattr(layer_plan, "index_topk", 0) or 0) if layer_plan is not None else 0
     if "mixed_quant_sparse" in rec or suffix == "mqsmla":
@@ -929,6 +1000,12 @@ def _classify_attention_tuple(
             "aclnnSparseFlashAttention", BACKEND_CANN, KERNEL_STATUS_EXISTING,
             "vllm-ascend/vllm_ascend/attention/sfa_v1.py",
             False, "", "latent_attention_batch",
+        )
+    if is_a2_or_a3 and is_c8_kv:
+        return (
+            "Fused Infer Attention Score v3 (C8 INT8 KV)",
+            "aclnnFusedInferAttentionScoreV3 (C8 INT8 KV)", BACKEND_CANN, KERNEL_STATUS_EXISTING,
+            "vllm-ascend/vllm_ascend/attention/mla_v1.py", False, "", suffix,
         )
     return (
         "Fused Infer Attention Score v2 (FIA v2)",
@@ -1137,15 +1214,17 @@ def _classify_linear_attn_tuple(
 def _classify_moe_tuple(
     suffix: str, fam: str, rec: str, meta: Mapping[str, Any], nat_kind: str,
     is_ideal: bool, is_quant_mm: bool, is_mxfp4_w: bool, mm_kernel: str,
+    *, is_int4_w: bool = False, is_a2_or_a3: bool = False,
 ) -> tuple[str, str, str, str, str, bool, str, str]:
     moe_src = "vllm-ascend/vllm_ascend/ops/fused_moe/fused_moe.py"
     if suffix == "router" or fam == "router":
         role = "Shared Expert Gate Linear" if "shared" in suffix else "MoE Router Gate Linear (W_router)"
         return (role, mm_kernel, BACKEND_CANN, KERNEL_STATUS_EXISTING, moe_src, False, "", suffix)
-    if suffix == "moe_gating_topk":
+    if suffix == "moe_gating_topk" or fam == "moe_init_routing":
+        kern = "aclnnMoeInitRoutingQuantV2" if (is_a2_or_a3 and is_quant_mm and fam == "moe_init_routing") else "MoeGatingTopK"
         return (
-            "MoE Sigmoid + Correction Bias TopK Gating", "MoeGatingTopK", BACKEND_CANN,
-            KERNEL_STATUS_EXISTING, moe_src, False, "", "moe_gating_topk",
+            "MoE Sigmoid + Correction Bias TopK Gating", kern, BACKEND_CANN,
+            KERNEL_STATUS_EXISTING, moe_src, False, "", suffix or "moe_gating_topk",
         )
     if suffix in {"latent_down", "latent_up"}:
         role = "MoE Routed Latent Down Projection (H->Hm)" if suffix == "latent_down" else "MoE Routed Latent Up Projection (Hm->H)"
@@ -1153,6 +1232,15 @@ def _classify_moe_tuple(
     if suffix == "latent_norm":
         return ("MoE Routed Latent RMSNorm", "RmsNorm", BACKEND_CANN, KERNEL_STATUS_EXISTING, moe_src, False, "", "latent_norm")
     if "megamoe" in rec or "dispatch_ffn_combine" in rec:
+        if is_a2_or_a3:
+            return (
+                "Fused MegaMoE (A3 INT4 Dispatch + GMM1 + Act + GMM2 + Combine)",
+                "dispatch_ffn_combine (A3 MegaMoE INT4)", BACKEND_CANN,
+                f"{KERNEL_STATUS_EXTEND_TILING} A3 W4A8 INT4 FRACTAL_NZ MegaMoE Compact Tiling",
+                "vllm-ascend/vllm_ascend/ops/fused_moe/moe_comm_method.py", True,
+                "Fused A3 MegaMoE dispatch_ffn_combine with packed INT4 FRACTAL_NZ weights & HCCS dual-Die overlap",
+                "megamoe_arch35",
+            )
         return (
             "Fused MegaMoE (Dispatch + GMM1 + Act + GMM2 + Combine)",
             "dispatch_ffn_combine (MegaMoE)", BACKEND_CANN,
@@ -1169,6 +1257,14 @@ def _classify_moe_tuple(
         return ("MoE EP Token Distribute Combine (MC2)", kern, BACKEND_HCCL_MC2, KERNEL_STATUS_EXISTING, moe_src, False, "", "unpack")
     if suffix in {"expert_up", "expert_down"} or fam == "grouped_gemm":
         is_up = suffix == "expert_up" or "gate_up" in rec
+        if is_a2_or_a3:
+            q_tag = "W4A8 INT4" if is_int4_w else ("W8A8 INT8" if is_quant_mm else "BF16")
+            role = f"Routed Expert {'Gate+Up GMM1' if is_up else 'Down GMM2'} ({q_tag})"
+            kern = (
+                "aclnnGroupedMatmulV4 (INT4 FRACTAL_NZ)" if is_int4_w
+                else ("aclnnGroupedMatmulV4 (INT8)" if is_quant_mm else "GroupedMatmul")
+            )
+            return (role, kern, BACKEND_CANN, KERNEL_STATUS_EXISTING, moe_src, False, "", suffix)
         q_tag = "MXFP4" if is_mxfp4_w else ("W8A8" if is_quant_mm else "BF16")
         role = f"Routed Expert {'Gate+Up GMM1' if is_up else 'Down GMM2'} ({q_tag})"
         if is_ideal and is_mxfp4_w:
@@ -1185,12 +1281,13 @@ def _classify_moe_tuple(
             return (
                 "Routed Expert K3 SiTU+Mul Activation" if suffix == "expert_act" else "Shared Expert K3 SiTU+Mul Activation",
                 "K3 SituAndMul", BACKEND_TRITON,
-                f"{KERNEL_STATUS_NEW_OP} K3 SituAndMul(beta=4, linear_beta=25) + MXQuant",
+                f"{KERNEL_STATUS_NEW_OP} K3 SituAndMul(beta=4, linear_beta=25) + Quant",
                 "vllm-ascend/vllm_ascend/models/kimi_k3/modeling_kimi_k3.py", True,
-                "Fused K3 SituAndMul(beta=4, linear_beta=25) + optional DynamicMxQuant epilogue",
+                "Fused K3 SituAndMul(beta=4, linear_beta=25) + optional dynamic quant epilogue",
                 suffix,
             )
-        return ("Routed Expert SwiGLU Activation", "SwiGlu", BACKEND_CANN, KERNEL_STATUS_EXISTING, moe_src, False, "", suffix)
+        act_kern = "aclnnSwiGluQuant" if (is_a2_or_a3 and is_quant_mm) else "SwiGlu"
+        return ("Routed Expert SwiGLU Activation", act_kern, BACKEND_CANN, KERNEL_STATUS_EXISTING, moe_src, False, "", suffix)
     if suffix == "join":
         return (
             "MoE Routed + Shared Residual Add", "aclnnAdd", BACKEND_CANN,
