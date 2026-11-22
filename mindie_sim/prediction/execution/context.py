@@ -722,6 +722,9 @@ class _ContextMixin:
                 except ModelingError as exc:
                     if not str(exc).startswith("joint_collective_group_membership"):
                         raise
+            if (band_plan is not None
+                    and not set(band_plan.accounting().wire_by_resource).issubset(self.engine.resources)):
+                band_plan = None
             if band_plan is not None:
                 plan_binding = _CollectivePlanBinding(algorithm, plan=band_plan)
             else:
