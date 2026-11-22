@@ -294,13 +294,19 @@ _SUPER_COMPACT_MIN_TILES = 68
 
 def _super_step_stages(pipe, super_idx: int):
     i0, i1 = 2 * super_idx, 2 * super_idx + 1
+    prev_names = set()
+    if super_idx > 0:
+        prev_names.update('e_' + s.name for s in pipe.tile(i0 - 2))
+        prev_names.update('o_' + s.name for s in pipe.tile(i0 - 1))
     out = []
     e_names = []
     for st in pipe.tile(i0):
         prev = []
         if super_idx > 0:
             for p in st.previous:
-                prev.append(('e_' if p in _DEPTH2_RELEASES else 'o_') + p)
+                cand = ('e_' if p in _DEPTH2_RELEASES else 'o_') + p
+                if cand in prev_names:
+                    prev.append(cand)
         name = 'e_' + st.name
         e_names.append(name)
         out.append(replace(
@@ -308,6 +314,7 @@ def _super_step_stages(pipe, super_idx: int):
             after=tuple('e_' + a for a in st.after),
             previous=tuple(prev),
         ))
+    e_set = set(e_names)
     out.append(Stage('e_done', after=tuple(e_names)))
     if i1 < pipe.count:
         for st in pipe.tile(i1):
@@ -315,10 +322,13 @@ def _super_step_stages(pipe, super_idx: int):
             prev = ['e_done'] if (super_idx > 0 and not st.after) else []
             for p in st.previous:
                 if p in _DEPTH2_RELEASES:
-                    if super_idx > 0:
-                        prev.append('o_' + p)
+                    cand = 'o_' + p
+                    if cand in prev_names:
+                        prev.append(cand)
                 else:
-                    after.append('e_' + p)
+                    cand = 'e_' + p
+                    if cand in e_set:
+                        after.append(cand)
             out.append(replace(
                 st, name='o_' + st.name,
                 after=tuple(dict.fromkeys(after)),
