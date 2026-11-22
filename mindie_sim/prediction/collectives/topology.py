@@ -387,11 +387,16 @@ class Topology(_TopologyPlansMixin):
         if raw_us <= 0.0:
             return 0.0
         extra_peers = max(0, len(group) - 2)
-        extra_peer_us = float(extra_peers) * (
-            self._p15_issue_interval_us + STARS_SYNC_EVENTS_PER_STEP * self._p16_stream_event_us
-        )
+        if stack == "eager":
+            extra_peer_us = float(extra_peers) * self._p15_host_submit_us
+        else:
+            extra_peer_us = float(extra_peers) * (
+                self._p15_issue_interval_us + STARS_SYNC_EVENTS_PER_STEP * self._p16_stream_event_us
+            )
         if not self._p19_uncoalesced_duplex:
-            return float(raw_us + extra_peer_us)
+            # Coalesced batch_isend_irecv enqueues 2 P2P descriptors vs 1 collective op.
+            single_op_us = max(0.0, raw_us - self._p15_host_submit_us) if stack == "eager" else raw_us
+            return float(single_op_us + extra_peer_us)
         per_op_us = raw_us / DUPLEX_SERIAL_OPS
         barrier_us = (
             STARS_SYNC_EVENTS_PER_STEP * self._p16_stream_event_us
@@ -403,7 +408,7 @@ class Topology(_TopologyPlansMixin):
 
     def collective_device_step_us(
         self, collective: str, group: tuple[int, ...], *,
-        alpha_us: float, stack: str, phase_count: int = 1,
+        alpha_us: float, stack: str, phase_count: int = 1, total_rounds: int = 1,
     ) -> float:
         """Derive collective startup from sealed P15/P16/P17/P20 STARS/AIV steps."""
         if not self._has_primitive_table or not group or len(group) < 2:
@@ -414,22 +419,33 @@ class Topology(_TopologyPlansMixin):
         vec = self._vector_invocation_us
         if ev <= 0.0 and first <= 0.0 and vec <= 0.0:
             return 0.0
-        eff_phases = max(int(phase_count), ALLREDUCE_DEVICE_PHASES if collective == "allreduce" else 1)
+        min_ar_rounds = ALLREDUCE_DEVICE_PHASES if (collective == "allreduce" and len(group) == 2) else 1
+        eff_rounds = max(int(total_rounds), int(phase_count), min_ar_rounds)
         entry_us = (
             STARS_SYNC_EVENTS_PER_STEP * ev
             + first
             + issue
-            + STARS_SYNC_EVENTS_PER_STEP * float(alpha_us)
+            + float(alpha_us)
         )
-        phase_us = vec + STARS_SYNC_EVENTS_PER_STEP * ev + float(alpha_us)
-        total_us = entry_us + eff_phases * phase_us
+        round_comm_us = STARS_SYNC_EVENTS_PER_STEP * ev + float(alpha_us)
+        kernel_us = vec * float(ALLREDUCE_DEVICE_PHASES if collective == "allreduce" else 1)
+        total_us = entry_us + float(eff_rounds) * round_comm_us + kernel_us
         if stack == "eager":
             host_sync_us = self._p17_eager_sync_us or self._p20_pinned_d2h_startup_us
-            total_us += self._p15_host_submit_us + host_sync_us
+            eff_phases = max(1, int(phase_count))
+            rendezvous_depth = max(1, math.ceil(math.log2(len(group))))
+            total_us += (
+                float(len(group) - 1) * self._p15_host_submit_us
+                + float(eff_phases + rendezvous_depth) * host_sync_us
+            )
         return float(total_us)
 
+    def has_calibrated_p18_allreduce_rate(self) -> bool:
+        """True when sealed P18 link capacity was calibrated on 2-phase AllReduce."""
+        return bool(self._p18_link_bytes_per_ms > 0.0 and self._p18_measured_collective == "allreduce")
+
     def single_peer_flow_cap_bytes_per_ms(self, link_name: str) -> float | None:
-        """Per-peer SDMA rate cap on A3 switched HCCS_SW links without mutating link capacity."""
+        """Per-die SDMA rate cap on A3 switched HCCS_SW links without mutating link capacity."""
         if self._p18_link_bytes_per_ms <= 0.0 or self._dies_per_package < 2:
             return None
         if self._link_scope.get(link_name) != "node":

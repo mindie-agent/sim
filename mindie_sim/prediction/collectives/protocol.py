@@ -38,6 +38,10 @@ A5_AICPU_ONE_SHOT_BYTES = 8 * MIB
 A5_AICPU_ALLREDUCE_CHUNK_BYTES = 16 * MIB
 A5_AICPU_RS_CHUNK_BYTES = 32 * MIB
 HIERARCHICAL_2D_SLICE_BYTES = 16 * MIB
+HCCL_DEFAULT_BUFFSIZE_BYTES = 200 * MIB
+SCRATCH_STAGING_HBM_PASSES = 4  # Pack (R+W) + unpack (R+W) through HCCL scratch buffer.
+LOCAL_REDUCE_HBM_PASSES = 3  # Two operand reads + one reduced result write per binary add.
+P18_ALLREDUCE_EMBEDDED_HBM_PER_WIRE = 1.5  # 2-rank AllReduce embeds 3*(N/2) HBM per 1*N wire.
 UB_DIE_INJECTION_CEILING_BYTES_PER_MS = 280_000_000.0
 UB_INJECTION_CEILING_MIN_RANKS = 5
 DOUBLE_BUFFER_CREDIT_FRAMES = 2
@@ -53,7 +57,7 @@ SUPPORTED_COLLECTIVES = frozenset({
     "allreduce", "reduce_scatter", "allgather", "alltoall", "alltoallv",
 })
 SUPPORTED_BAND_ALGORITHMS = frozenset({
-    "ring", "nhr", "halving_doubling", "recursive_halving_doubling", "tree", "hierarchical_2d",
+    "ring", "double_ring", "nhr", "halving_doubling", "recursive_halving_doubling", "tree", "hierarchical_2d",
 }) | _MESH_ALGORITHMS
 
 
@@ -143,6 +147,7 @@ class LoweredCollective:
     collective_startup_us: float
     uses_calibrated_startup: bool = False
     die_injection_ceiling_bytes_per_ms: float | None = None
+    local_hbm_bytes_per_rank: float = 0.0
 
     @property
     def port_keys(self) -> frozenset[PortKey]:
@@ -256,7 +261,10 @@ def _hcomm_algorithm(fabric, collective, ranks, size, expansion, *, is_multi_pac
         if expansion == "nhr":
             return "nhr"
         if expansion is None and is_multi_package and collective in {"allreduce", "allgather", "reduce_scatter"}:
-            return "hierarchical_2d"
+            logical_size = size * float(ranks) if collective == "allgather" else size
+            if logical_size >= MID_BAND_UPPER_EXCLUSIVE:
+                return "double_ring"
+            return "one_shot_mesh" if collective == "allreduce" else "mesh"
         if expansion is None and collective == "alltoall":
             return "direct_mesh"
         if collective == "allreduce" and expansion in (None, "aiv", "aicpu"):
@@ -668,6 +676,23 @@ def _lower_ring_or_alg(
                     transfers.append(_build_transfer(pname, r_idx, src, dst, chunk, band, topology))
             phases.append(LoweredPhase(pname, rounds, tuple(transfers), phase_startup))
         return tuple(phases)
+    if alg == "double_ring":
+        pkgs = _package_partition(group, topology)
+        ring_order = tuple(rank for pkg in pkgs for rank in pkg) if pkgs else group
+        rounds = count - 1
+        half_shard = shard / float(TWO_RANKS)
+        phases = []
+        for pname in phase_names:
+            transfers = []
+            for r_idx in range(rounds):
+                for idx, src in enumerate(ring_order):
+                    cw_dst = ring_order[(idx + 1) % count]
+                    ccw_dst = ring_order[(idx - 1) % count]
+                    per_rank_payload[src] += TWO_RANKS * half_shard
+                    transfers.append(_build_transfer(pname, r_idx, src, cw_dst, half_shard, band, topology))
+                    transfers.append(_build_transfer(pname, r_idx, src, ccw_dst, half_shard, band, topology))
+            phases.append(LoweredPhase(pname, rounds, tuple(transfers), phase_startup))
+        return tuple(phases)
     # Default: ring
     rounds = count - 1
     phases = []
@@ -680,6 +705,91 @@ def _lower_ring_or_alg(
                 transfers.append(_build_transfer(pname, r_idx, src, dst, shard, band, topology))
         phases.append(LoweredPhase(pname, rounds, tuple(transfers), phase_startup))
     return tuple(phases)
+
+
+def _resolve_collective_startup_and_hbm(
+    collective: str,
+    group: tuple[int, ...],
+    topology,
+    band: BandSelection,
+    phases: tuple[LoweredPhase, ...],
+    api_bytes: float,
+    stack: str,
+    base_startup_us: float,
+) -> tuple[float, bool, tuple[LoweredPhase, ...], float | None, float]:
+    """Resolve calibrated collective startup, UB ceiling, and unabsorbed local HBM bytes."""
+    count = len(group)
+    matched_p18 = (
+        float(topology.p18_matched_startup_us(collective, group, stack=stack))
+        if hasattr(topology, "p18_matched_startup_us") else 0.0
+    )
+    matched_p19 = (
+        float(topology.p19_matched_duplex_startup_us(collective, group, stack=stack))
+        if hasattr(topology, "p19_matched_duplex_startup_us") else 0.0
+    )
+    total_rounds = max(1, sum(phase.rounds for phase in phases))
+    dev_step = (
+        float(topology.collective_device_step_us(
+            collective, group, alpha_us=float(band.startup_us), stack=stack,
+            phase_count=max(1, len(phases)), total_rounds=total_rounds,
+        ))
+        if hasattr(topology, "collective_device_step_us") else 0.0
+    )
+    collective_startup = base_startup_us
+    uses_calibrated_startup = False
+    if matched_p18 > 0.0:
+        collective_startup = max(collective_startup, matched_p18)
+        uses_calibrated_startup = True
+    elif matched_p19 > 0.0:
+        collective_startup = max(collective_startup, matched_p19)
+        uses_calibrated_startup = True
+    elif dev_step > 0.0:
+        collective_startup = max(collective_startup, dev_step)
+        uses_calibrated_startup = True
+    if uses_calibrated_startup and phases:
+        phases = tuple(replace(phase, startup_us=0.0) for phase in phases)
+
+    fabric = band.protocol.rsplit("_", 1)[0]
+    uses_per_pair_mesh = bool(
+        phases
+        and all(
+            topology.links[hop.link_name].semantics == "per_pair"
+            for phase in phases
+            for transfer in phase.transfers
+            for hop in transfer.hops
+        )
+    )
+    die_inj_ceil = (
+        UB_DIE_INJECTION_CEILING_BYTES_PER_MS
+        if fabric == "ub_mesh" and count >= UB_INJECTION_CEILING_MIN_RANKS and uses_per_pair_mesh
+        else None
+    )
+    has_p18_ar = bool(
+        hasattr(topology, "has_calibrated_p18_allreduce_rate")
+        and topology.has_calibrated_p18_allreduce_rate()
+    )
+    local_hbm_bytes = 0.0
+    if api_bytes > 0.0 and count >= TWO_RANKS and uses_calibrated_startup:
+        if collective in {"reduce_scatter", "allreduce"} and has_p18_ar:
+            # Ring/mesh ReduceScatter executes (W-1) binary adds on N/W shards = 3*(W-1)/W * N HBM.
+            # Subtract the 1.5 HBM/wire already embedded in 2-rank P18 AllReduce on the bottleneck fabric.
+            total_reduce_hbm = float(LOCAL_REDUCE_HBM_PASSES) * float(count - 1) / float(count) * api_bytes
+            bottleneck_wire = float(count - 1) / float(count) * api_bytes
+            if collective == "allreduce":
+                bottleneck_wire *= float(TWO_RANKS)
+            if band.algorithm == "double_ring":
+                bottleneck_wire /= float(TWO_RANKS)
+            local_hbm_bytes = max(
+                0.0,
+                total_reduce_hbm - P18_ALLREDUCE_EMBEDDED_HBM_PER_WIRE * bottleneck_wire,
+            )
+        elif (
+            collective == "alltoall"
+            and fabric == "hccs_k8"
+            and api_bytes <= float(HCCL_DEFAULT_BUFFSIZE_BYTES)
+        ):
+            local_hbm_bytes = float(SCRATCH_STAGING_HBM_PASSES) * api_bytes
+    return collective_startup, uses_calibrated_startup, phases, die_inj_ceil, local_hbm_bytes
 
 
 def lower_collective(
@@ -745,7 +855,7 @@ def lower_collective(
         )
         if collective == "allreduce" and (
             band.algorithm in _MESH_ALGORITHMS
-            or band.algorithm in {"ring", "nhr", "hierarchical_2d"}
+            or band.algorithm in {"ring", "double_ring", "nhr", "hierarchical_2d"}
         ):
             one_shot = band.algorithm in {"one_shot_mesh", "small_count_mesh"}
             expected = (count - 1) * api_bytes * (1 if one_shot else 2 / count)
@@ -767,48 +877,14 @@ def lower_collective(
         rounds = 1 if concurrent else (count - 1)
         phases = (LoweredPhase("alltoall", rounds, tuple(transfers), phase_startup),)
 
-    matched_p18 = (
-        float(topology.p18_matched_startup_us(collective, group, stack=stack))
-        if hasattr(topology, "p18_matched_startup_us") else 0.0
-    )
-    matched_p19 = (
-        float(topology.p19_matched_duplex_startup_us(collective, group, stack=stack))
-        if hasattr(topology, "p19_matched_duplex_startup_us") else 0.0
-    )
-    dev_step = (
-        float(topology.collective_device_step_us(
-            collective, group, alpha_us=float(band.startup_us), stack=stack,
-            phase_count=max(1, len(phases)),
-        ))
-        if hasattr(topology, "collective_device_step_us") else 0.0
-    )
-    uses_calibrated_startup = False
-    if matched_p18 > 0.0:
-        collective_startup = max(collective_startup, matched_p18)
-        uses_calibrated_startup = True
-    elif matched_p19 > 0.0:
-        collective_startup = max(collective_startup, matched_p19)
-        uses_calibrated_startup = True
-    elif dev_step > 0.0:
-        collective_startup = max(collective_startup, dev_step)
-        uses_calibrated_startup = True
-    if uses_calibrated_startup and phases:
-        phases = tuple(replace(phase, startup_us=0.0) for phase in phases)
-
-    fabric = band.protocol.rsplit("_", 1)[0]
-    uses_per_pair_mesh = bool(
-        phases
-        and all(
-            topology.links[hop.link_name].semantics == "per_pair"
-            for phase in phases
-            for transfer in phase.transfers
-            for hop in transfer.hops
-        )
-    )
-    die_inj_ceil = (
-        UB_DIE_INJECTION_CEILING_BYTES_PER_MS
-        if fabric == "ub_mesh" and count >= UB_INJECTION_CEILING_MIN_RANKS and uses_per_pair_mesh
-        else None
+    (
+        collective_startup,
+        uses_calibrated_startup,
+        phases,
+        die_inj_ceil,
+        local_hbm_bytes,
+    ) = _resolve_collective_startup_and_hbm(
+        collective, group, topology, band, phases, api_bytes, stack, collective_startup
     )
     total_payload = sum(per_rank_payload.values())
     total_wire = sum(t.wire_bytes for phase in phases for t in phase.transfers)
@@ -822,6 +898,7 @@ def lower_collective(
         collective_startup_us=collective_startup,
         uses_calibrated_startup=uses_calibrated_startup,
         die_injection_ceiling_bytes_per_ms=die_inj_ceil,
+        local_hbm_bytes_per_rank=local_hbm_bytes,
     )
 
 
@@ -838,7 +915,8 @@ def _submit_transfer_chunks(
     uses_calibrated_startup: bool,
     ub_tx_res: Mapping[int, str],
     ub_rx_res: Mapping[int, str],
-    flow_cap_res: Mapping[tuple[int, int], str],
+    flow_tx_res: Mapping[int, str],
+    flow_rx_res: Mapping[int, str],
     owner: str,
 ) -> list:
     pipelined_credit = bool(
@@ -850,7 +928,6 @@ def _submit_transfer_chunks(
         chunks = chunk_sizes(transfer.wire_bytes, slice_cap, DEFAULT_MAX_PHYSICAL_CHUNKS)
     else:
         chunks = (transfer.wire_bytes,)
-    pair_flow_res = flow_cap_res.get((transfer.source, transfer.destination))
     done = []
     for c_idx, chunk_wire in enumerate(chunks):
         alloc = (
@@ -867,8 +944,13 @@ def _submit_transfer_chunks(
                 demand[tx_inj] = chunk_wire
             if rx_inj is not None:
                 demand[rx_inj] = chunk_wire
-            if pair_flow_res is not None and transfer.flow_cap_bytes_per_ms is not None:
-                demand[pair_flow_res] = chunk_wire
+            if transfer.flow_cap_bytes_per_ms is not None:
+                sdma_tx = flow_tx_res.get(hop.source)
+                sdma_rx = flow_rx_res.get(hop.destination)
+                if sdma_tx is not None:
+                    demand[sdma_tx] = chunk_wire
+                if sdma_rx is not None:
+                    demand[sdma_rx] = chunk_wire
             svc = engine.submit(
                 f"{prefix}:c{c_idx}:h{h_idx}:svc",
                 demand,
@@ -894,6 +976,53 @@ def _submit_transfer_chunks(
             )
         done.append(hop_cursor)
     return done
+
+
+def _prepare_collective_resources(
+    engine, name: str, lowered: LoweredCollective, credit_cap: float
+) -> tuple[dict[tuple[int, int], str], dict[int, str], dict[int, str], dict[int, str], dict[int, str]]:
+    credit_pools: dict[tuple[int, int], str] = {}
+    new_pools: dict[str, float] = {}
+    flow_tx_res: dict[int, str] = {}
+    flow_rx_res: dict[int, str] = {}
+    new_resources: list[Resource] = []
+    for phase in lowered.phases:
+        for transfer in phase.transfers:
+            pair = (transfer.source, transfer.destination)
+            if credit_cap > 0.0 and pair not in credit_pools:
+                pool_name = f"{name}:credit:r{pair[0]}to{pair[1]}"
+                credit_pools[pair] = pool_name
+                if pool_name not in engine.pools:
+                    new_pools[pool_name] = credit_cap
+            if transfer.flow_cap_bytes_per_ms is not None:
+                cap = float(transfer.flow_cap_bytes_per_ms)
+                for hop in transfer.hops:
+                    if hop.source not in flow_tx_res:
+                        tx_name = f"{name}:sdma_flow:tx:r{hop.source}"
+                        flow_tx_res[hop.source] = tx_name
+                        if tx_name not in engine.resources:
+                            new_resources.append(Resource(tx_name, cap, "bytes"))
+                    if hop.destination not in flow_rx_res:
+                        rx_name = f"{name}:sdma_flow:rx:r{hop.destination}"
+                        flow_rx_res[hop.destination] = rx_name
+                        if rx_name not in engine.resources:
+                            new_resources.append(Resource(rx_name, cap, "bytes"))
+    ub_tx_res: dict[int, str] = {}
+    ub_rx_res: dict[int, str] = {}
+    if lowered.die_injection_ceiling_bytes_per_ms is not None:
+        ceil = float(lowered.die_injection_ceiling_bytes_per_ms)
+        for rank in lowered.group:
+            tx_name = f"{name}:ub_inj:tx:r{rank}"
+            rx_name = f"{name}:ub_inj:rx:r{rank}"
+            ub_tx_res[rank] = tx_name
+            ub_rx_res[rank] = rx_name
+            if tx_name not in engine.resources:
+                new_resources.append(Resource(tx_name, ceil, "bytes"))
+            if rx_name not in engine.resources:
+                new_resources.append(Resource(rx_name, ceil, "bytes"))
+    if new_resources or new_pools:
+        engine.extend(tuple(new_resources), pools=new_pools or None)
+    return credit_pools, ub_tx_res, ub_rx_res, flow_tx_res, flow_rx_res
 
 
 def submit_lowered_collective(
@@ -923,40 +1052,9 @@ def submit_lowered_collective(
         else (lowered.band.startup_us / MS_PER_S if lowered.band.startup_scope == "hop" else 0.0)
     )
     credit_cap = float(lowered.band.credit_bytes or 0)
-    credit_pools: dict[tuple[int, int], str] = {}
-    new_pools: dict[str, float] = {}
-    flow_cap_res: dict[tuple[int, int], str] = {}
-    new_resources: list[Resource] = []
-    for phase in lowered.phases:
-        for transfer in phase.transfers:
-            pair = (transfer.source, transfer.destination)
-            if credit_cap > 0.0 and pair not in credit_pools:
-                pool_name = f"{name}:credit:r{pair[0]}to{pair[1]}"
-                credit_pools[pair] = pool_name
-                if pool_name not in engine.pools:
-                    new_pools[pool_name] = credit_cap
-            if transfer.flow_cap_bytes_per_ms is not None and pair not in flow_cap_res:
-                flow_name = f"{name}:sdma_flow:r{pair[0]}to{pair[1]}"
-                flow_cap_res[pair] = flow_name
-                if flow_name not in engine.resources:
-                    new_resources.append(Resource(
-                        flow_name, float(transfer.flow_cap_bytes_per_ms), "bytes",
-                    ))
-    ub_tx_res: dict[int, str] = {}
-    ub_rx_res: dict[int, str] = {}
-    if lowered.die_injection_ceiling_bytes_per_ms is not None:
-        ceil = float(lowered.die_injection_ceiling_bytes_per_ms)
-        for rank in lowered.group:
-            tx_name = f"{name}:ub_inj:tx:r{rank}"
-            rx_name = f"{name}:ub_inj:rx:r{rank}"
-            ub_tx_res[rank] = tx_name
-            ub_rx_res[rank] = rx_name
-            if tx_name not in engine.resources:
-                new_resources.append(Resource(tx_name, ceil, "bytes"))
-            if rx_name not in engine.resources:
-                new_resources.append(Resource(rx_name, ceil, "bytes"))
-    if new_resources or new_pools:
-        engine.extend(tuple(new_resources), pools=new_pools or None)
+    credit_pools, ub_tx_res, ub_rx_res, flow_tx_res, flow_rx_res = _prepare_collective_resources(
+        engine, name, lowered, credit_cap
+    )
 
     if all(phase.pipelined_slices for phase in lowered.phases):
         slice_ids = sorted({t.slice_index for phase in lowered.phases for t in phase.transfers})
@@ -988,7 +1086,7 @@ def submit_lowered_collective(
                         hop_startup_ms=hop_startup_ms,
                         uses_calibrated_startup=lowered.uses_calibrated_startup,
                         ub_tx_res=ub_tx_res, ub_rx_res=ub_rx_res,
-                        flow_cap_res=flow_cap_res, owner=owner,
+                        flow_tx_res=flow_tx_res, flow_rx_res=flow_rx_res, owner=owner,
                     ))
                 slice_cursor[s_idx] = engine.submit(
                     f"{name}:p{p_idx}:s{s_idx}:done",
@@ -1024,7 +1122,7 @@ def submit_lowered_collective(
                     hop_startup_ms=hop_startup_ms,
                     uses_calibrated_startup=lowered.uses_calibrated_startup,
                     ub_tx_res=ub_tx_res, ub_rx_res=ub_rx_res,
-                    flow_cap_res=flow_cap_res, owner=owner,
+                    flow_tx_res=flow_tx_res, flow_rx_res=flow_rx_res, owner=owner,
                 ))
             round_gate = engine.submit(
                 f"{name}:p{p_idx}:r{round_index}:done",

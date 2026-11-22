@@ -585,13 +585,13 @@ def test_collective_hierarchy_and_directional_dma_lowering():
     from mindie_sim.primitives.loader import load_primitives
     from mindie_sim.primitives.lowering import lower_primitive
     cs = parse_case(compose_case("qwen3.8-27b", hardware=REPRESENTATIVE_SKUS["a3"], tp=4, ep=1, num_devices=4, layers=1, quant="none"))
-    topo = Topology(cs.machine, cs.runtime.parallel)
+    topo = Topology(cs.machine, cs.runtime.parallel, primitive_table=load_primitives(ROOT / "data/primitives/arch22_a3_9362.json"))
     low_ar = lower_collective("allreduce", (0, 1, 2, 3), topo, 64 * 1024 * 1024)
-    assert low_ar.band.algorithm == "hierarchical_2d" and all(p.pipelined_slices for p in low_ar.phases) and low_ar.total_payload_bytes == pytest.approx(4 * 1.5 * 64 * 1024 * 1024)
+    assert low_ar.band.algorithm == "double_ring" and low_ar.total_payload_bytes == pytest.approx(4 * 1.5 * 64 * 1024 * 1024) and low_ar.local_hbm_bytes_per_rank > 0.0
     eng = Engine(topo.resources())
     done = submit_lowered_collective(eng, "h2d_ar", low_ar, {r: eng.submit(f"r{r}") for r in (0, 1, 2, 3)})
     eng.advance()
-    assert done[0].time > 0.0 and eng.summary()["live_tasks"] == 0 and lower_collective("alltoall", (0, 1, 2, 3), topo, 4 * 1024 * 1024).band.algorithm == "direct_mesh"
+    assert done[0].time > 0.0 and eng.summary()["live_tasks"] == 0 and lower_collective("alltoall", (0, 1, 2, 3), topo, 64 * 1024 * 1024).band.algorithm == "direct_mesh" and "h2d_ar:sdma_flow:tx:r0" in eng.resources
     pt = load_primitives(ROOT / "data/primitives/arch22_a2_910b4.json")
     r_h2d = lower_primitive("P20_host_dma_sync", {"direction": "h2d", "payload_bytes": 4096}, pt, allow_uncalibrated_declaration=True)
     r_d2h = lower_primitive("P20_host_dma_sync", {"direction": "d2h", "payload_bytes": 4096}, pt, allow_uncalibrated_declaration=True)
