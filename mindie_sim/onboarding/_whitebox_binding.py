@@ -31,7 +31,7 @@ _INDEXER_SHAPE_MIN_RANK = 3
 _GEMM_SHAPE_MIN_RANK = 3
 _BLOCK_TABLE_PAIR_LEN = 2
 _MIN_DCP_PARTIALS = 2
-_GEMM_FAMILIES = frozenset({"gemm", "gate_up_projection", "down_projection"})
+_GEMM_FAMILIES = frozenset({"gemm", "grouped_gemm", "gate_up_projection", "down_projection"})
 _MLA_RECIPES = frozenset({
     "ascend_paged_mla_decode_arch22",
     "ascend_paged_mla_decode_arch35",
@@ -103,15 +103,15 @@ def _extract_lowered_attention_contract(
     return primary, cache_dim, q_layout, kv_len, page_count
 
 
-def _extract_block_table_pages(mapping: Mapping[str, Any]) -> int | None:
+def _extract_block_table_dims(mapping: Mapping[str, Any]) -> tuple[int | None, int | None]:
     bt = mapping.get("block_table")
     if (
         isinstance(bt, Sequence)
         and not isinstance(bt, (str, bytes))
         and len(bt) >= _BLOCK_TABLE_PAIR_LEN
     ):
-        return _opt_pos_int(bt[1])
-    return None
+        return _opt_pos_int(bt[0]), _opt_pos_int(bt[1])
+    return None, None
 
 
 def _verify_attention_op_binding(
@@ -123,6 +123,8 @@ def _verify_attention_op_binding(
     *,
     local_kv_heads: int,
     case_id: str,
+    step_tokens: int = 0,
+    step_sequences: int = 0,
 ) -> None:
     meas_rec = str(binding.get("recipe") or plan_key.get("recipe") or "").strip()
     if meas_rec in _GQA_RECIPES and target_op.recipe in _MLA_RECIPES:
@@ -156,9 +158,28 @@ def _verify_attention_op_binding(
         or binding.get("query_layout") or binding.get("input_layout") or ""
     ).strip().upper()
     meas_kv_len = _opt_pos_int(actual.get("seq_len"), actual.get("kv_len"), binding.get("kv_len"))
+    meas_seqs = _opt_pos_int(actual.get("sequences"), binding.get("sequences"))
+    meas_q = _opt_pos_int(actual.get("q_len"), actual.get("query_tokens"), binding.get("q_len"), binding.get("query_tokens"))
     actual_explicit_pages = _opt_pos_int(actual.get("page_count"))
-    actual_bt_pages = _extract_block_table_pages(actual)
+    actual_bt_seqs, actual_bt_pages = _extract_block_table_dims(actual)
     binding_pages = _opt_pos_int(binding.get("page_count"))
+    if actual_bt_seqs is not None and meas_seqs is not None and actual_bt_seqs != meas_seqs:
+        raise ModelingError(
+            f"whitebox_measured_binding_mismatch:{case_id}:sequences_block_table_conflict"
+            f":sequences={meas_seqs}:block_table_sequences={actual_bt_seqs}"
+        )
+    if step_sequences > 0 and meas_seqs is not None and meas_seqs != step_sequences:
+        raise ModelingError(
+            f"whitebox_measured_binding_mismatch:{case_id}:sequences:measured={meas_seqs}:lowered={step_sequences}"
+        )
+    if step_sequences > 0 and actual_bt_seqs is not None and actual_bt_seqs != step_sequences:
+        raise ModelingError(
+            f"whitebox_measured_binding_mismatch:{case_id}:block_table_sequences:measured={actual_bt_seqs}:lowered={step_sequences}"
+        )
+    if step_tokens > 0 and meas_q is not None and meas_q != step_tokens:
+        raise ModelingError(
+            f"whitebox_measured_binding_mismatch:{case_id}:q_len:measured={meas_q}:lowered={step_tokens}"
+        )
     if (
         actual_explicit_pages is not None
         and actual_bt_pages is not None
@@ -271,7 +292,7 @@ def _verify_gemm_node_binding(
     has_actual: bool = False,
 ) -> None:
     meta = dict(getattr(op, "metadata", ()) or ())
-    lowered_mg = max(1, int(meta.get("matrix_groups") or 1))
+    lowered_mg = max(1, int(meta.get("matrix_weight_bank_groups") or meta.get("matrix_groups") or 1))
     use_case_mg = is_per_node_actual or lowered_mg > 1 or is_sole_gemm
     act_mg = _opt_pos_int(n_actual.get("matrix_groups"), n_actual.get("e")) if use_case_mg else None
     nb_mg = _opt_pos_int(nb.get("matrix_groups"), nb.get("e"))
@@ -306,6 +327,7 @@ def _verify_gemm_node_binding(
                 f"whitebox_measured_binding_mismatch:{case_id}:weight_{dim_key}:{op_id}:measured={meas_d}:lowered={loc[dim_idx]}"
             )
     lowered_dt = str(getattr(op, "dtype", "") or "bf16").strip().lower()
+    lowered_wdt = str(meta.get("weight_dtype") or lowered_dt).strip().lower()
     lowered_q = str(meta.get("quant_mode") or meta.get("quantization") or "none").strip().lower()
     act_dt = str(n_actual.get("dtype") or n_actual.get("input_dtype") or "").strip().lower() if use_actual_dims else ""
     act_wdt = str(n_actual.get("weight_dtype") or "").strip().lower() if use_actual_dims else ""
@@ -318,8 +340,8 @@ def _verify_gemm_node_binding(
     eff_dt = act_dt or nb_dt
     if eff_dt and lowered_dt and eff_dt != lowered_dt:
         raise ModelingError(f"whitebox_measured_binding_mismatch:{case_id}:dtype:{op_id}:measured={eff_dt}:lowered={lowered_dt}")
-    if act_wdt and lowered_dt and act_wdt != lowered_dt:
-        raise ModelingError(f"whitebox_measured_binding_mismatch:{case_id}:weight_dtype:{op_id}:measured={act_wdt}:lowered={lowered_dt}")
+    if act_wdt and lowered_wdt and act_wdt != lowered_wdt:
+        raise ModelingError(f"whitebox_measured_binding_mismatch:{case_id}:weight_dtype:{op_id}:measured={act_wdt}:lowered={lowered_wdt}")
     if act_q and act_q not in {"", "none", "dense", lowered_q, lowered_dt}:
         raise ModelingError(f"whitebox_measured_binding_mismatch:{case_id}:quant_mode:{op_id}:measured={act_q}:lowered={lowered_q}")
     if use_actual_dims and (n_actual.get("has_scales") is True or str(n_actual.get("scale_dtype") or "").strip()) and lowered_q in {"", "none", "dense"}:
@@ -380,6 +402,8 @@ def _verify_node_bindings(
     local_kv_heads: int,
     expected_level: str,
     case_id: str,
+    step_tokens: int = 0,
+    step_sequences: int = 0,
 ) -> None:
     ops_by_id = {str(op.op_id): op for op in chosen_ops}
     has_payload_timed = "timed_nodes" in payload and payload.get("timed_nodes") is not None
@@ -407,12 +431,26 @@ def _verify_node_bindings(
             ) from exc
 
     raw_node_bindings = binding.get("node_bindings")
-    if isinstance(raw_node_bindings, Sequence) and not isinstance(raw_node_bindings, (str, bytes)) and raw_node_bindings:
-        node_bindings: Sequence[Mapping[str, Any]] = [nb for nb in raw_node_bindings if isinstance(nb, Mapping)]
-    elif expected_level in {"L2", "L3"} and actual:
-        node_bindings = [{"op_id": oid} for oid in ops_by_id]
-    else:
-        node_bindings = ()
+    nb_by_id: dict[str, Mapping[str, Any]] = {}
+    has_explicit_nb = (
+        isinstance(raw_node_bindings, Sequence)
+        and not isinstance(raw_node_bindings, (str, bytes))
+        and bool(raw_node_bindings)
+    )
+    if has_explicit_nb:
+        for nb in raw_node_bindings:
+            if not isinstance(nb, Mapping):
+                continue
+            oid = str(nb.get("op_id") or "").strip()
+            if not oid:
+                continue
+            if oid in nb_by_id:
+                raise ModelingError(
+                    f"whitebox_measured_binding_mismatch:{case_id}:node_bindings_duplicate_op_id:{oid}"
+                )
+            if oid not in ops_by_id:
+                raise ModelingError(f"whitebox_measured_binding_mismatch:{case_id}:node_op_id_missing:{oid}")
+            nb_by_id[oid] = nb
 
     raw_ns = actual.get("node_shapes")
     node_shapes: dict[str, Mapping[str, Any]] = {}
@@ -425,33 +463,32 @@ def _verify_node_bindings(
                     f"whitebox_measured_binding_mismatch:{case_id}:node_shapes_entry_invalid:{k}"
                 )
             node_shapes[_norm_timed_op_id(k, case_id, error_prefix="whitebox_node_shapes")] = v
-    all_gemm_ids = [
-        str(nb.get("op_id") or "").strip()
-        for nb in node_bindings
-        if str(nb.get("op_id") or "").strip() in ops_by_id
-        and ops_by_id[str(nb.get("op_id") or "").strip()].family in _GEMM_FAMILIES
-    ]
+
+    verify_ops = chosen_ops if (nb_by_id or (expected_level in {"L2", "L3"} and (actual or has_payload_timed))) else ()
+    all_gemm_ids = [str(op.op_id) for op in chosen_ops if op.family in _GEMM_FAMILIES]
     grouped_gemm_ids = [
         oid for oid in all_gemm_ids
-        if int(dict(getattr(ops_by_id[oid], "metadata", ()) or ()).get("matrix_groups") or 1) > 1
+        if int(
+            dict(getattr(ops_by_id[oid], "metadata", ()) or ()).get("matrix_weight_bank_groups")
+            or dict(getattr(ops_by_id[oid], "metadata", ()) or ()).get("matrix_groups")
+            or 1
+        ) > 1
     ]
     last_grouped_id = grouped_gemm_ids[-1] if grouped_gemm_ids else ""
     sole_gemm_id = all_gemm_ids[0] if len(all_gemm_ids) == 1 else ""
     multi_gemm = len(all_gemm_ids) > 1
     has_actual = bool(actual)
-    for nb in node_bindings:
-        op_id = str(nb.get("op_id") or "").strip()
-        if not op_id:
-            continue
-        op = ops_by_id.get(op_id)
-        if op is None:
-            raise ModelingError(f"whitebox_measured_binding_mismatch:{case_id}:node_op_id_missing:{op_id}")
+    for op in verify_ops:
+        op_id = str(op.op_id)
+        nb = nb_by_id.get(op_id, {})
         per_node = node_shapes.get(op_id)
         is_per_node = per_node is not None
         n_actual = per_node if is_per_node else actual
         if op.family == "attention":
             _verify_attention_op_binding(
-                op, sim_case, nb, n_actual, {}, local_kv_heads=local_kv_heads, case_id=case_id
+                op, sim_case, nb, n_actual, {},
+                local_kv_heads=local_kv_heads, case_id=case_id,
+                step_tokens=step_tokens, step_sequences=step_sequences,
             )
         elif op.family in _GEMM_FAMILIES:
             if has_actual and multi_gemm and not is_per_node:
@@ -479,6 +516,12 @@ def _verify_node_bindings(
                     f"whitebox_measured_binding_mismatch:{case_id}:width:{op_id}:measured={meas_w}:lowered={lowered_w}"
                 )
 
+    if expected_level in {"L2", "L3"} and has_explicit_nb:
+        missing_nb = sorted(set(ops_by_id) - set(nb_by_id))
+        if missing_nb:
+            raise ModelingError(
+                f"whitebox_measured_binding_mismatch:{case_id}:node_bindings_incomplete:missing={missing_nb}"
+            )
     has_planned_context = bool(binding.get("timed_op_ids") or actual or binding.get("node_bindings"))
     if expected_level in {"L2", "L3"} and has_planned_context and not has_payload_timed:
         raise ModelingError(
@@ -494,6 +537,8 @@ def _verify_measured_binding(
     local_kv_heads: int,
     expected_level: str,
     case_id: str,
+    step_tokens: int = 0,
+    step_sequences: int = 0,
 ) -> None:
     """Verify the lowered replay target matches the measured operator's recipe, layout, and geometry."""
     binding = payload.get("measured_binding") if isinstance(payload.get("measured_binding"), Mapping) else {}
@@ -511,6 +556,7 @@ def _verify_measured_binding(
     _verify_node_bindings(
         chosen_ops, sim_case, binding, actual, payload,
         local_kv_heads=local_kv_heads, expected_level=expected_level, case_id=case_id,
+        step_tokens=step_tokens, step_sequences=step_sequences,
     )
 
     wanted_id = str(binding.get("target_op_id") or "").strip()
@@ -548,6 +594,7 @@ def _verify_measured_binding(
         _verify_attention_op_binding(
             target_op, sim_case, binding, t_actual, plan_key,
             local_kv_heads=local_kv_heads, case_id=case_id,
+            step_tokens=step_tokens, step_sequences=step_sequences,
         )
     elif target_op.family == "rmsnorm":
         loc = getattr(target_op, "local_shape", None)
@@ -562,7 +609,8 @@ def _verify_measured_binding(
     elif target_op.family in _GEMM_FAMILIES:
         _verify_gemm_node_binding(
             target_op, binding, t_actual, case_id=case_id, op_id=str(target_op.op_id),
-            is_per_node_actual=True, is_last_grouped_gemm=True, is_sole_gemm=True,
+            is_per_node_actual=bool(t_actual), is_last_grouped_gemm=True, is_sole_gemm=True,
+            has_actual=bool(t_actual),
         )
     elif target_op.family == "attention_merge":
         _verify_attention_merge_node_binding(

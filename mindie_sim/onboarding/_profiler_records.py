@@ -51,7 +51,9 @@ _ALLOWED_CAPTURE_SHAPE_KEYS = frozenset({
     "kv_lora_rank", "rope", "qk_rope_head_dim", "width", "byte_width",
     "m", "n", "k", "e", "matrix_groups", "topk", "top_k", "sparse_count",
     "enforce_exact_topk", "query_layout", "input_layout", "cache_layout",
-    "output_layout", "query_dtype", "cache_dtype", "dtype", "partial_count",
+    "output_layout", "query_dtype", "cache_dtype", "dtype", "input_dtype",
+    "weight_dtype", "output_dtype", "quant_mode", "quantization", "scale_dtype",
+    "has_scales", "partial_count",
     "nbytes", "link_bytes", "elements", "group_size", "parallel_topology",
     "batch_x_kv_heads",
 })
@@ -334,6 +336,11 @@ def _join_multirank_obs_entries(
         clocks = {m["clock_op"] for m in members}
         if len(clocks) > 1:
             raise ModelingError(f"profiler_writer_clock_operator_conflict:{cid}:{sorted(clocks)}")
+        member_acqs = {str(m.get("acq_id") or "").strip() for m in members if str(m.get("acq_id") or "").strip()}
+        if len(member_acqs) > 1:
+            raise ModelingError(f"profiler_mixed_acquisition_ids:{cid}:{sorted(member_acqs)}")
+        if member_acqs and any(not str(m.get("acq_id") or "").strip() for m in members):
+            raise ModelingError(f"profiler_sample_acquisition_id_missing:{cid}")
         merged_group: list[Mapping[str, Any]] = []
         merged_receipts: list[Mapping[str, Any]] = []
         merged_comps: list[Mapping[str, Any]] = []

@@ -38,7 +38,7 @@ _BUSY_UNION_TIMING_MODES = frozenset({
 })
 _ELAPSED_SPAN_TIMING_MODES = frozenset({"eager", "aclgraph", "elapsed_span", "event_elapsed_span"})
 _BUSY_UNION_BOUNDARIES = frozenset({"busy_union", "event_busy_union"})
-_GEMM_BINDING_FAMILIES = frozenset({"gemm", "gate_up_projection", "down_projection"})
+_GEMM_BINDING_FAMILIES = frozenset({"gemm", "grouped_gemm", "gate_up_projection", "down_projection"})
 _COLLECTIVE_BINDING_FAMILIES = frozenset({"allreduce", "dcp_allgather"})
 
 
@@ -125,21 +125,23 @@ def extract_shape_dims(
     *,
     plan_pt: Mapping[str, Any] | None = None,
     expected_shape: Mapping[str, Any] | None = None,
+    measured_binding: Mapping[str, Any] | None = None,
+    cid: str = "",
 ) -> dict[str, Any]:
     """Extract canonical integer onboarding coordinates strictly from executed shape + plan key."""
     dims: dict[str, Any] = {}
     axis = str((plan_pt or {}).get("axis") or plan_key.get("axis") or "").strip()
     eff_shape: dict[str, Any] = dict(shape)
-    raw_ns = shape.get("node_shapes")
-    if isinstance(raw_ns, Mapping):
-        for nval in raw_ns.values():
-            if isinstance(nval, Mapping) and (
-                nval.get("seq_len") is not None
-                or nval.get("kv_len") is not None
-                or nval.get("top_k") is not None
+    primary = _primary_geometry_source(shape, measured_binding, cid=cid or "case")
+    if primary is not shape:
+        eff_shape.update(primary)
+    elif isinstance(shape.get("node_shapes"), Mapping):
+        for nval in shape["node_shapes"].values():
+            if isinstance(nval, Mapping) and any(
+                nval.get(mk) is not None
+                for mk in ("heads", "kv_heads", "block_table", "top_k", "sparse_count", "paged")
             ):
-                for k, v in nval.items():
-                    eff_shape.setdefault(k, v)
+                eff_shape.update(nval)
                 break
     merged = {**dict(plan_key), **eff_shape}
 
@@ -165,8 +167,17 @@ def extract_shape_dims(
         if pk_ctx is not None:
             dims["context_len"] = pk_ctx
 
-    tok_val = _int_from(eff_shape, "tokens", "m", "num_tokens")
-    if tok_val is None:
+    tok_explicit = _int_from(eff_shape, "tokens", "num_tokens")
+    m_val = _int_from(eff_shape, "m")
+    exp_m = _int_from(expected_shape or {}, "m")
+    exp_tok = _int_from(expected_shape or {}, "tokens")
+    if tok_explicit is not None:
+        tok_val: int | None = tok_explicit
+    elif m_val is not None and exp_m is not None and exp_tok is not None and m_val == exp_m:
+        tok_val = exp_tok
+    elif m_val is not None:
+        tok_val = m_val
+    else:
         tok_val = _int_from(plan_key, "tokens", "m", "num_tokens")
     if tok_val is not None:
         dims["tokens"] = tok_val
@@ -381,6 +392,49 @@ def _verify_node_bindings_actual_geometry(
                 )
 
 
+def _verify_l1_gemm_actual_geometry(
+    n_act: Mapping[str, Any],
+    mb: Mapping[str, Any],
+    *,
+    cid: str,
+) -> None:
+    oid = str(mb.get("target_op_id") or mb.get("builder") or "op0").strip()
+    for dim in ("m", "n", "k"):
+        exp_d, got_d = _int_from(mb, dim), _int_from(n_act, dim)
+        if exp_d is not None and got_d is None:
+            raise ModelingError(f"profiler_actual_geometry_missing:{cid}:{dim}:{oid}")
+        if exp_d is not None and got_d != exp_d:
+            raise ModelingError(
+                f"profiler_actual_geometry_mismatch:{cid}:{dim}:{oid}:expected={exp_d}:actual={got_d}"
+            )
+    exp_mg = _int_from(mb, "matrix_groups") or 1
+    got_mg = _unique_alias_int(n_act, ("matrix_groups", "e"), cid=cid, field=f"matrix_groups:{oid}")
+    if exp_mg > 1 and got_mg is None:
+        raise ModelingError(f"profiler_actual_geometry_missing:{cid}:matrix_groups:{oid}")
+    if got_mg is not None and got_mg != exp_mg:
+        raise ModelingError(
+            f"profiler_actual_geometry_mismatch:{cid}:matrix_groups:{oid}:expected={exp_mg}:actual={got_mg}"
+        )
+    exp_dt = str(mb.get("dtype") or "").strip().lower()
+    exp_wdt = str(mb.get("weight_dtype") or exp_dt).strip().lower()
+    exp_q = str(mb.get("quant_mode") or "none").strip().lower()
+    got_dt = str(n_act.get("dtype") or n_act.get("input_dtype") or "").strip().lower()
+    got_wdt = str(n_act.get("weight_dtype") or "").strip().lower()
+    got_q = str(n_act.get("quant_mode") or n_act.get("quantization") or "").strip().lower()
+    if exp_dt and not got_dt:
+        raise ModelingError(f"profiler_actual_geometry_missing:{cid}:dtype:{oid}")
+    if exp_dt and got_dt != exp_dt:
+        raise ModelingError(f"profiler_actual_geometry_mismatch:{cid}:dtype:{oid}:expected={exp_dt}:actual={got_dt}")
+    if exp_wdt and got_wdt and got_wdt != exp_wdt:
+        raise ModelingError(
+            f"profiler_actual_geometry_mismatch:{cid}:weight_dtype:{oid}:expected={exp_wdt}:actual={got_wdt}"
+        )
+    if got_q and got_q not in {"", "none", "dense", exp_q, exp_dt}:
+        raise ModelingError(f"profiler_actual_geometry_mismatch:{cid}:quant_mode:{oid}:expected={exp_q}:actual={got_q}")
+    if (n_act.get("has_scales") is True or str(n_act.get("scale_dtype") or "").strip()) and exp_q in {"", "none", "dense"}:
+        raise ModelingError(f"profiler_actual_geometry_mismatch:{cid}:unexpected_quant_scales:{oid}")
+
+
 def _primary_geometry_source(
     actual_shape: Mapping[str, Any],
     measured_binding: Mapping[str, Any] | None,
@@ -462,10 +516,22 @@ def verify_actual_geometry_matches_plan(
     exp_pages = _int_from(expected_shape, "page_count")
     explicit_pages = _int_from(geo_src, "page_count")
     bt = geo_src.get("block_table")
+    bt_seqs: int | None = None
     bt_pages: int | None = None
     if isinstance(bt, Sequence) and not isinstance(bt, (str, bytes)) and len(bt) >= _BLOCK_TABLE_PAIR_LEN:
+        if not isinstance(bt[0], bool) and isinstance(bt[0], int):
+            bt_seqs = int(bt[0])
         if not isinstance(bt[1], bool) and isinstance(bt[1], int):
             bt_pages = int(bt[1])
+    if bt_seqs is not None and exp_seqs is not None and bt_seqs != exp_seqs:
+        raise ModelingError(
+            f"profiler_actual_geometry_mismatch:{cid}:block_table_sequences:expected={exp_seqs}:actual={bt_seqs}"
+        )
+    if bt_seqs is not None and got_seqs is not None and bt_seqs != got_seqs:
+        raise ModelingError(
+            f"profiler_actual_geometry_mismatch:{cid}:sequences_block_table_conflict"
+            f":sequences={got_seqs}:block_table_sequences={bt_seqs}"
+        )
     if explicit_pages is not None and bt_pages is not None and explicit_pages != bt_pages:
         raise ModelingError(
             f"profiler_actual_geometry_mismatch:{cid}:page_count_block_table_conflict"
@@ -499,6 +565,12 @@ def verify_actual_geometry_matches_plan(
         got_f = _int_from(geo_src, field)
         if exp_f is not None and got_f is not None and got_f != exp_f:
             raise ModelingError(f"profiler_actual_geometry_mismatch:{cid}:{field}:expected={exp_f}:actual={got_f}")
+    if (
+        isinstance(measured_binding, Mapping)
+        and not measured_binding.get("node_bindings")
+        and str(measured_binding.get("family") or "").strip() in _GEMM_BINDING_FAMILIES
+    ):
+        _verify_l1_gemm_actual_geometry(geo_src, measured_binding, cid=cid)
     _verify_node_bindings_actual_geometry(actual_shape, measured_binding, cid=cid)
 
 

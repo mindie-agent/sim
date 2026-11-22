@@ -56,6 +56,9 @@ _MLA_LATENT_DIM = 512
 _MLA_ROPE_DIM = 64
 _MLA_HEAD_DIM = 128
 _MLA_BLOCK_SIZE = 128
+_MOE_TOPK_EXPERTS = 6
+_MOE_EXPERT_BANK = 64
+_MOE_GATE_UP_WIDTH = 2816
 _DEFAULT_HEAD_DIM = 128
 _DEFAULT_HIDDEN_WIDTH = 4096
 _DEFAULT_CONTEXT_FALLBACK = 2048
@@ -111,6 +114,51 @@ def assign_plan_point_level(plan_doc: Mapping[str, Any], pt: Mapping[str, Any]) 
     if tag in _L2_REGIME_TAGS or (tag == "off_grid_heldout" and _L2_CONTEXT_MIN <= val < _L3_CONTEXT_MIN):
         return "L2"
     return "L1"
+
+
+def _resolve_bound_family_shape(
+    plan_family: str,
+    *,
+    axis: str,
+    val: int,
+    batch: int,
+    q_tok: int,
+    topo: str,
+    topo_opts: Mapping[str, Any],
+    local_mla_heads: int,
+    topk_val: int | None,
+) -> tuple[str, str, str, str, str, str, dict[str, Any], dict[str, Any]]:
+    pfam, prec, pbld, impl = _FAMILY_BINDINGS[plan_family]
+    sim_fam = pfam
+    model_name = _INDEXER_SIM_MODEL if sim_fam in {"indexer", "layernorm", "rotary"} else _DEFAULT_SIM_MODEL
+    width = _MLA_HIDDEN_WIDTH if model_name == _DEFAULT_SIM_MODEL else _DEFAULT_HIDDEN_WIDTH
+    seqs = val if axis == "batch_x_kv_heads" else batch
+    tok_val = val if axis == "tokens" else max(1, seqs * q_tok)
+    tp = max(1, int(topo_opts.get("tp", 1)))
+    ep = max(1, int(topo_opts.get("ep", 1)))
+    eff_opts = dict(topo_opts)
+    if pbld == "matmul":
+        shape: dict[str, Any] = {
+            "tokens": tok_val, "m": tok_val, "n": width, "k": max(1, width // tp),
+            "dtype": "bf16", "parallel_topology": topo,
+        }
+        eff_opts["graph_capture_mode"] = "none"
+    elif pbld == "grouped_matmul":
+        local_experts = max(1, _MOE_EXPERT_BANK // ep)
+        shape = {
+            "tokens": tok_val, "m": tok_val * _MOE_TOPK_EXPERTS,
+            "n": max(1, _MOE_GATE_UP_WIDTH // tp), "k": width,
+            "e": local_experts, "matrix_groups": local_experts,
+            "dtype": "bf16", "parallel_topology": topo,
+        }
+        eff_opts["graph_capture_mode"] = "none"
+    elif pbld == "rotary_embedding":
+        shape = {"tokens": tok_val, "heads": local_mla_heads, "head_dim": _DEFAULT_HEAD_DIM, "parallel_topology": topo}
+    elif pbld == "indexer_topk":
+        shape = {"tokens": tok_val, "width": width, "top_k": topk_val or _MLA_BLOCK_SIZE, "parallel_topology": topo}
+    else:
+        shape = {"tokens": tok_val, "width": width, "parallel_topology": topo}
+    return pfam, prec, pbld, impl, sim_fam, model_name, shape, eff_opts
 
 
 def resolve_point_binding_and_shape(
@@ -224,22 +272,10 @@ def resolve_point_binding_and_shape(
         if axis == "batch_x_kv_heads":
             shape["batch_x_kv_heads"] = val
     elif plan_family in _FAMILY_BINDINGS:
-        pfam, prec, pbld, impl = _FAMILY_BINDINGS[plan_family]
-        sim_fam = pfam
-        model_name = _INDEXER_SIM_MODEL if sim_fam in {"indexer", "layernorm", "rotary"} else _DEFAULT_SIM_MODEL
-        width = _MLA_HIDDEN_WIDTH if model_name == _DEFAULT_SIM_MODEL else _DEFAULT_HIDDEN_WIDTH
-        seqs = val if axis == "batch_x_kv_heads" else batch
-        tok_val = val if axis == "tokens" else max(1, seqs * q_tok)
-        if pbld == "matmul":
-            shape = {"m": tok_val, "n": width, "k": width, "parallel_topology": topo}
-        elif pbld == "grouped_matmul":
-            shape = {"m": tok_val, "n": width, "k": width, "e": local_mla_heads, "matrix_groups": local_mla_heads, "parallel_topology": topo}
-        elif pbld == "rotary_embedding":
-            shape = {"tokens": tok_val, "heads": local_mla_heads, "head_dim": _DEFAULT_HEAD_DIM, "parallel_topology": topo}
-        elif pbld == "indexer_topk":
-            shape = {"tokens": tok_val, "width": width, "top_k": topk_val or _MLA_BLOCK_SIZE, "parallel_topology": topo}
-        else:
-            shape = {"tokens": tok_val, "width": width, "parallel_topology": topo}
+        pfam, prec, pbld, impl, sim_fam, model_name, shape, topo_opts = _resolve_bound_family_shape(
+            plan_family, axis=axis, val=val, batch=batch, q_tok=q_tok,
+            topo=topo, topo_opts=topo_opts, local_mla_heads=local_mla_heads, topk_val=topk_val,
+        )
     else:
         pfam, prec, pbld = plan_family, plan_family, ""
         impl, sim_fam, model_name = str(plan_doc.get("target_id") or plan_family), plan_family, _DEFAULT_SIM_MODEL
@@ -383,6 +419,10 @@ def resolve_point_measured_binding(
             target_op_id = "s0.l0.norm1"
         elif sim_fam == "indexer":
             target_op_id = "s0.l2.index_quant_lightning"
+        elif pbld == "grouped_matmul":
+            target_op_id = "s0.l1.expert_up"
+        elif pbld == "matmul":
+            target_op_id = "s0.l0.output"
         else:
             target_op_id = ""
         _nodes, _edges, node_bindings, timed_op_ids = _build_case_nodes_edges_and_bindings(
@@ -398,9 +438,15 @@ def resolve_point_measured_binding(
         "paged", "heads", "kv_heads", "head_dim", "latent", "rope", "width",
         "kv_len", "page_count", "query_layout", "input_layout",
         "query_dtype", "cache_dtype", "sparse_count", "topk",
+        "dtype", "m", "n", "k", "matrix_groups",
     ):
         if key in shape:
             binding[key] = shape[key]
+    if pbld in {"matmul", "grouped_matmul"} or sim_fam in {"gemm", "grouped_gemm", "gate_up_projection", "down_projection"}:
+        binding.setdefault("dtype", str(shape.get("dtype") or "bf16"))
+        binding.setdefault("weight_dtype", str(shape.get("weight_dtype") or binding["dtype"]))
+        binding.setdefault("quant_mode", str(shape.get("quant_mode") or "none"))
+        binding.setdefault("matrix_groups", int(shape.get("matrix_groups") or shape.get("e") or 1))
     if node_bindings:
         binding["node_bindings"] = node_bindings
     if timed_op_ids:

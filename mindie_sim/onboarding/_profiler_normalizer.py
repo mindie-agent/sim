@@ -289,6 +289,8 @@ def _seal_normalized_entry(
         plan_key,
         plan_pt=plan_pt,
         expected_shape=binding_info["expected_shape"] if binding_info else None,
+        measured_binding=binding_info["measured_binding"] if binding_info else None,
+        cid=cid,
     )
     ev_ids = sorted({str(r.get("sample_id") or f"{cid}-s{i}") for i, r in enumerate(group)})
     ident = first.get("identity") if isinstance(first.get("identity"), Mapping) else {}
@@ -439,13 +441,29 @@ def normalize_profiler_records(
         for _arm, _tmode, clock_op, group in selected:
             first = group[0]
             ranks = _extract_ranks_from_bucket(group, summary)
-            acq_id = str(first.get("acquisition_id") or comp.get("acquisition_id") or "").strip()
+            sample_acqs = [str(r.get("acquisition_id") or "").strip() for r in group]
+            nonempty_sample_acqs = {a for a in sample_acqs if a}
+            if len(nonempty_sample_acqs) > 1:
+                raise ModelingError(f"profiler_mixed_acquisition_ids:{cid}:{sorted(nonempty_sample_acqs)}")
+            if nonempty_sample_acqs and any(not a for a in sample_acqs):
+                raise ModelingError(f"profiler_sample_acquisition_id_missing:{cid}")
+            comp_acqs = {str(c.get("acquisition_id") or "").strip() for c in comp_list if str(c.get("acquisition_id") or "").strip()}
+            all_bucket_acqs = nonempty_sample_acqs | comp_acqs
+            if len(all_bucket_acqs) > 1:
+                raise ModelingError(f"profiler_mixed_acquisition_ids:{cid}:{sorted(all_bucket_acqs)}")
+            acq_id = next(iter(all_bucket_acqs)) if all_bucket_acqs else ""
             obs_plan_id = str(first.get("plan_id") or comp.get("plan_id") or "").strip()
             acq_key = acq_id or obs_plan_id
             matched_rcpts, receipt_ranks = _lookup_entry_receipts(
                 receipts_by_key, cid=cid, base_rid=base_rid, ranks=ranks,
                 split=split, acq_id=acq_id, plan_id=obs_plan_id,
             )
+            rcpt_acqs = {str(r.get("acquisition_id") or "").strip() for r in matched_rcpts if str(r.get("acquisition_id") or "").strip()}
+            if len(all_bucket_acqs | rcpt_acqs) > 1:
+                raise ModelingError(f"profiler_mixed_acquisition_ids:{cid}:{sorted(all_bucket_acqs | rcpt_acqs)}")
+            if not acq_id and rcpt_acqs:
+                acq_id = next(iter(rcpt_acqs))
+                acq_key = acq_id or obs_plan_id
             pre_entries.append({
                 "cid": cid, "base_rid": base_rid, "pub_run_id": sanitize_public_run_id(base_rid),
                 "split": split, "clock_op": clock_op, "group": list(group),

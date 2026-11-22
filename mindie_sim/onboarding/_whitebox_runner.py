@@ -505,6 +505,8 @@ class WhiteboxSpineRunner:
                 local_kv_heads=local_kv,
                 expected_level=expected_level,
                 case_id=case.case_id,
+                step_tokens=tokens,
+                step_sequences=sequences,
             )
             graphs[entry.replica] = chosen
         external_inputs = {"analysis_input": 0.0} if any(

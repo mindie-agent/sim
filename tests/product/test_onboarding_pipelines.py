@@ -51,26 +51,20 @@ from mindie_sim.schema.operators import OpSpec
 from _support.axes import REPRESENTATIVE_SKUS
 
 pytestmark = pytest.mark.tier1
-REPO_ROOT = Path(__file__).resolve().parents[2]
-SAMPLE_REPEATS = 12
-A2_SKU = REPRESENTATIVE_SKUS["a2"]
-A5_SKU = REPRESENTATIVE_SKUS["a5"]
+REPO_ROOT, SAMPLE_REPEATS, A2_SKU, A5_SKU = Path(__file__).resolve().parents[2], 12, REPRESENTATIVE_SKUS["a2"], REPRESENTATIVE_SKUS["a5"]
 A2_ORACLE = {"arch_id": "npu_arch_2201", "aic": 20, "aiv": 40, "l2": 100_663_296, "ub": 196_608, "dies": 1, "hbm_bw": 1.2e12, "mte2_aiv": 2.4e10}
 
 
 @pytest.fixture(autouse=True)
 def _isolate_host_env(monkeypatch, tmp_path):
-    iso = tmp_path / "isolated_home"
-    iso.mkdir(parents=True, exist_ok=True)
+    iso = tmp_path / "isolated_home"; iso.mkdir(parents=True, exist_ok=True)
     for var in ("HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "MINDIE_CONFIG_HOME", "MINDIE_DATA_HOME", "MINDIE_DIAGNOSTICS_ROOT", "REMOTE_DEV_AUTH_DIR", "UV_CACHE_DIR", "TMPDIR"):
         monkeypatch.setenv(var, str(iso))
 
 
 def _git_repo_with_blob(tmp_path: Path, name: str, rel_path: str, content: bytes) -> tuple[Path, str, str]:
-    repo = tmp_path / "refs" / name
-    target = repo / rel_path
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_bytes(content)
+    repo, target = tmp_path / "refs" / name, tmp_path / "refs" / name / rel_path
+    target.parent.mkdir(parents=True, exist_ok=True); target.write_bytes(content)
     env = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@e.invalid", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@e.invalid"}
     for cmd in (["init", "-q"], ["add", rel_path], ["commit", "-q", "-m", "init"]):
         subprocess.run(["git", "-C", str(repo), *cmd], check=True, env=env, capture_output=True)
@@ -176,14 +170,12 @@ def _a2_probe_payload(sku: str = A2_SKU, *, endpoint: str = "prod-cluster-01.cor
 
 
 def test_probe_soc_conflicts_capture_gate_and_unspoofable_status(tmp_path):
-    synthetic_ip = ".".join(("198", "51", "100", "22"))
-    ok_probe = tmp_path / "probe_ok.json"
+    synthetic_ip, ok_probe = ".".join(("198", "51", "100", "22")), tmp_path / "probe_ok.json"
     ok_probe.write_text(json.dumps(_a2_probe_payload(endpoint=f"prod-cluster-{synthetic_ip}.corp")), encoding="utf-8")
     res_ok = probe_soc(probe_json=ok_probe)
     assert res_ok["ok"] is True and res_ok["probe"]["endpoint_alias"].startswith("ep-") and "prod-cluster" not in json.dumps(res_ok) and synthetic_ip not in json.dumps(res_ok)
     for bad_name, payload in (("soc_conflict", {**_a2_probe_payload(), "soc_name": A2_SKU, "aclrt_soc_name": "OtherSilicon"}), ("smi_hbm", {**_a2_probe_payload(), "npu_smi_common": f"Chip ID : 0\nAicore Count : {A2_ORACLE['aic']}\nHBM Capacity(MB) : 1\n"}), ("bad_fab", {**_a2_probe_payload(), "fabric_channels": {"d2d_intra_node": 1.0}})):
-        p = tmp_path / f"{bad_name}.json"
-        p.write_text(json.dumps(payload), encoding="utf-8")
+        p = tmp_path / f"{bad_name}.json"; p.write_text(json.dumps(payload), encoding="utf-8")
         assert probe_soc(probe_json=p)["error"] == "silicon_profile_conflict", bad_name
     new_sku, full_probe = "AscendFuture_9999", tmp_path / "probe_new.json"
     full_probe.write_text(json.dumps({"aclrt_soc_name": new_sku, "arch_preset": A2_ORACLE["arch_id"], "architecture": "A2", "aic_count": 28, "aiv_count": 56, "hbm_bytes": 64 * 1024**3, "l2_bytes": 200 * 1024**2, "ub_bytes": 196_608, "dies_per_package": 1, "ranks_per_node": 8}), encoding="utf-8")
@@ -198,13 +190,11 @@ def test_probe_soc_conflicts_capture_gate_and_unspoofable_status(tmp_path):
     run_new = run_sku_onboarding(probe_json=full_probe, raw_l0_json=raw_l0, allow_scaffold=True, base_template_sku=A2_SKU, profiler_runner=lambda _p: obs, abi_rejection_results=abis, capture_root=cap_dir, runner=_independent_engine_runner(preds, prog_sha_by_id=pshas), lean_bounds_json=leans, repo_root=_synthetic_repo(tmp_path, family="new_sku"), out_dir=tmp_path / "new_sku_out")
     assert run_new["ok"] is True and run_new["status"] == "offline_reverify"
     off768_row = next(r for r in obs if r["point_id"] == "offgrid_ctx_768")
-    orig_cap_path = cap_dir / f"{off768_row['raw_sha256']}.json"
-    saved_cap_bytes, decoy_dir = orig_cap_path.read_bytes(), cap_dir / "0000_decoys"
+    orig_cap_path = cap_dir / f"{off768_row['raw_sha256']}.json"; saved_cap_bytes, decoy_dir = orig_cap_path.read_bytes(), cap_dir / "0000_decoys"
     decoy_dir.mkdir(parents=True, exist_ok=True)
     for j in range(4100):
         (decoy_dir / f"d_{j:04d}.json").write_bytes(b"{}")
-    nested_f = cap_dir / "audit-node.internal.example/lease-audituser/trial-001.json"
-    nested_f.parent.mkdir(parents=True, exist_ok=True); nested_f.write_bytes(saved_cap_bytes); orig_cap_path.unlink()
+    nested_f = cap_dir / "audit-node.internal.example/lease-audituser/trial-001.json"; nested_f.parent.mkdir(parents=True, exist_ok=True); nested_f.write_bytes(saved_cap_bytes); orig_cap_path.unlink()
     off768_row["capture_uri"] = "capture://audit-node.internal.example/lease-audituser/trial-001.json"
     prim_new, prof_new = run_new["stages"]["calibrate-l0-and-fabric"]["primitives_payload"], run_new["stages"]["probe-soc"]["scaffold_profile"][new_sku]
     val_nested = validate_512_400k(sku=new_sku, primitives_json=prim_new, profiler_runner=lambda _p: obs, abi_rejection_results=abis, profile_override=prof_new, capture_root=cap_dir, runner=_independent_engine_runner(preds, prog_sha_by_id=pshas))
@@ -224,18 +214,15 @@ def test_probe_soc_conflicts_capture_gate_and_unspoofable_status(tmp_path):
 
 
 def test_sealer_cann_manifest_conflicts_and_campaign_privacy(tmp_path):
-    assert load_canonical_l0_sealer(tmp_path / "no_tools").__name__ == "mindie_sim.primitives.sealer"
+    assert load_canonical_l0_sealer(tmp_path / "no_tools").__name__ == "mindie_sim.primitives.sealer" and mindie_sim_main(["onboard-sku", "calibrate-l0-and-fabric", "--sku", A2_SKU]) == 2
     with pytest.raises(ModelingError, match="timeout_budget_outer_too_small"):
         TimeoutBudget((("l0", 300), ("fabric", 200)), cleanup_grace_s=60, outer_timeout_s=500)
-    assert mindie_sim_main(["onboard-sku", "calibrate-l0-and-fabric", "--sku", A2_SKU]) == 2
-    a5_cap = REPO_ROOT / "data/primitives/captures/arch35_a5_950dt.capture.json"
-    a5_cap_sku = json.loads(a5_cap.read_text(encoding="utf-8"))["payload"]["device_name"]
+    a5_cap = REPO_ROOT / "data/primitives/captures/arch35_a5_950dt.capture.json"; a5_cap_sku = json.loads(a5_cap.read_text(encoding="utf-8"))["payload"]["device_name"]
     with pytest.raises(ModelingError, match="cann_version_provenance_conflict"):
         calibrate_l0_and_fabric(sku=a5_cap_sku, raw_l0_json=a5_cap, cann_version="9.3.0")
     cal_a5 = calibrate_l0_and_fabric(sku=a5_cap_sku, raw_l0_json=a5_cap, cann_version="9.2.0", campaign_id="lease-audituser-0abc123abc")
     assert cal_a5["ok"] is True and "audituser" not in json.dumps(cal_a5) and cal_a5["train_manifest"]["campaign_id"].startswith("camp-")
-    over_l0 = tmp_path / "over_l0.json"
-    over_l0.write_text(json.dumps(_raw_l0_samples(A2_SKU, scale=2.5)), encoding="utf-8")
+    over_l0 = tmp_path / "over_l0.json"; over_l0.write_text(json.dumps(_raw_l0_samples(A2_SKU, scale=2.5)), encoding="utf-8")
     cal_over = calibrate_l0_and_fabric(sku=A2_SKU, raw_l0_json=over_l0)
     assert any(c["reason"].startswith("p99_exceeds_nominal") for c in cal_over["metric_conflicts"]) and any(r["reason"] == "missing_samples" for r in cal_over["coverage_matrix"])
 
@@ -265,9 +252,7 @@ def test_capture_duration_override_clock_plan_ranks_and_capture_p99(tmp_path):
     plan, cap_dir = synthesize_sku_512_400k_plan(sku=A2_SKU, core_count=A2_ORACLE["aic"], l2_bytes=A2_ORACLE["l2"]).to_dict(), tmp_path / "caps"
     obs, preds, leans, abis, pshas = _plan_fixture_bundle(plan, capture_dir=cap_dir)
     cap75 = {"case_id": "clk-75", "sku": A2_SKU, "split": "heldout", "acquisition_root": "acq-held-l1", "start_event": "start", "end_event": "end", "clock_domain": "device_ns", "device_ranks": [0], "clock_operator": "busy_union", "event_ids": ["s0", "e0"], "busy_union_ns": 7500, "samples_ns": [7500] * 12}
-    cap75_b = json.dumps(cap75, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    cap75_sha = hashlib.sha256(cap75_b).hexdigest()
-    (cap_dir / f"{cap75_sha}.json").write_bytes(cap75_b)
+    cap75_b = json.dumps(cap75, sort_keys=True, separators=(",", ":")).encode("utf-8"); cap75_sha = hashlib.sha256(cap75_b).hexdigest(); (cap_dir / f"{cap75_sha}.json").write_bytes(cap75_b)
     tampered = {**obs[-1], "case_id": "clk-75", "point_id": "clk-75", "raw_sha256": cap75_sha, "capture_uri": f"capture://heldout/{cap75_sha}.json", "event_ids": ["s0", "e0"], "device_ranks": [0], "clock_operator": "busy_union", "measured_ns": 110, "busy_union_ns": 110}
     with pytest.raises(ModelingError, match="capture_measured_duration_mismatch"):
         score_sealed_gate_cases([tampered], sku=A2_SKU, capture_root=cap_dir, require_capture_files=True, runner=_independent_engine_runner({"clk-75": 110}, clock_op="busy_union"))
@@ -277,9 +262,7 @@ def test_capture_duration_override_clock_plan_ranks_and_capture_p99(tmp_path):
     mr_row = next(r for r in obs if r["parallel_topology"] == "tp2_pcp2_dcp2")
     with pytest.raises(ModelingError, match="observation_participating_ranks_mismatch"):
         score_sealed_gate_cases([{**mr_row, "device_ranks": [0]}], sku=A2_SKU, expected_points=plan["heldout_points"], runner=_independent_engine_runner(preds))
-    nop99_dir, raw_l0 = tmp_path / "caps_nop99", tmp_path / "l0.json"
-    obs_np, preds_np, leans_np, abis_np, pshas_np = _plan_fixture_bundle(plan, capture_dir=nop99_dir, omit_capture_p99=True)
-    raw_l0.write_text(json.dumps(_raw_l0_samples(A2_SKU)), encoding="utf-8")
+    nop99_dir, raw_l0 = tmp_path / "caps_nop99", tmp_path / "l0.json"; obs_np, preds_np, leans_np, abis_np, pshas_np = _plan_fixture_bundle(plan, capture_dir=nop99_dir, omit_capture_p99=True); raw_l0.write_text(json.dumps(_raw_l0_samples(A2_SKU)), encoding="utf-8")
     cal = calibrate_l0_and_fabric(sku=A2_SKU, raw_l0_json=raw_l0)
     val_np = validate_512_400k(sku=A2_SKU, primitives_json=cal["primitives_payload"], profiler_runner=lambda _p: obs_np, abi_rejection_results=abis_np, capture_root=nop99_dir, runner=_independent_engine_runner(preds_np, prog_sha_by_id=pshas_np))
     gate_np = verify_sku_gates(sku=A2_SKU, validation_report_json=val_np, primitives_json=cal["primitives_payload"], lean_bounds_json=leans_np, capture_root=nop99_dir, repo_root=_synthetic_repo(tmp_path, family="nop99"))
@@ -401,6 +384,7 @@ def test_host_queue_unified_grant_cleanup_and_profiler_roundtrip(tmp_path):
         ("profiler_actual_geometry_mismatch|profiler_rank_actual_shape_mismatch", [r for rk in range(4) for r in ({"schema": "mindie-bench-observation/1", "record_type": "observation", "case_id": "cross_tp2_pcp2_dcp4_ctx_400000", "run_id": f"mr{rk}.base.eager.t0", "acquisition_id": "acq-mr", "trial": 0, "repeat_index": 0, "rank": rk, "split": "heldout", "boundary": "model_step", "timing_mode": "eager", "duration_ms": 0.1, "sample_id": f"s-{rk}", "sku": A2_SKU, "validated": True, "qualified": True}, {"schema": "mindie-bench-subgraph-run/1", "record_type": "receipt", "case_id": "cross_tp2_pcp2_dcp4_ctx_400000", "run_id": f"mr{rk}", "rank": rk, "status": "ok", "actual_shape": l3_full if rk < 3 else {**l3_full, "partial_count": 2}, "timed_nodes": l3_tn})]),
         ("multirank_incomplete_rank_samples", [{"schema": "mindie-bench-observation/1", "record_type": "observation", "case_id": "cross_tp2_pcp2_dcp4_ctx_400000", "run_id": f"mr{rk}.base.eager.t0", "acquisition_id": "acq-mr", "trial": 0, "repeat_index": rep, "rank": rk, "split": "heldout", "boundary": "model_step", "timing_mode": "eager", "duration_ms": 0.03 + 0.01 * (rk == 3), "sample_id": f"s-{rk}-{rep}", "sku": A2_SKU, "validated": True, "qualified": True} for rk in range(4) for rep in (range(4) if rk < 3 else range(1))]),
         ("profiler_abi_rejection_unexpectedly_accepted", [{"schema": "mindie-bench-observation/1", "record_type": "observation", "case_id": "abi_reject_topk_attr_2049", "run_id": "r1.base.eager.t0", "trial": 0, "split": "abi_rejection", "boundary": "device_kernel", "timing_mode": "eager", "duration_ms": 0.05, "sample_id": "s0", "sku": A2_SKU, "validated": True, "qualified": True, "actual_shape": {"top_k": 2048, "seq_len": 2049}}]),
+        ("profiler_mixed_acquisition_ids", [{"schema": "mindie-bench-observation/1", "record_type": "observation", "case_id": "anchor_ctx_512", "run_id": "r1.base.eager.t0", "acquisition_id": "acq-held-1", "trial": 0, "rank": 0, "split": "train", "boundary": "device_kernel", "timing_mode": "eager", "duration_ms": 0.05, "sample_id": "s0", "sku": A2_SKU, "validated": True, "qualified": True}, {"schema": "mindie-bench-observation/1", "record_type": "observation", "case_id": "anchor_ctx_512", "run_id": "r1.base.eager.t0", "acquisition_id": "acq-train-1", "trial": 0, "rank": 0, "split": "train", "boundary": "device_kernel", "timing_mode": "eager", "duration_ms": 0.05, "sample_id": "s1", "sku": A2_SKU, "validated": True, "qualified": True}, {"schema": "mindie-bench-subgraph-run/1", "record_type": "receipt", "case_id": "anchor_ctx_512", "run_id": "r1", "acquisition_id": "acq-held-1", "rank": 0, "status": "ok", "actual_shape": b4_by_id["anchor_ctx_512"]["shape"], "timed_nodes": ["anchor_ctx_512:op0"]}]),
     ):
         with pytest.raises(ModelingError, match=pat):
             normalize_profiler_records(recs, plan_doc=b4_plan, sku=A2_SKU)
@@ -420,8 +404,11 @@ def test_capture_invariants_and_profiler_dispatch_roundtrip(tmp_path):
     l2_cap, leak_rep = tmp_path / "l2_caps", tmp_path / "leak_rep.json"
     b16_ns = {n["node_id"]: n["shape"] for n in b4_by_id["cross_b16_ctx_4097"]["nodes"]}
     l2_norm, _ = normalize_profiler_records([{"schema": "mindie-bench-observation/1", "record_type": "observation", "case_id": "cross_b16_ctx_4097", "run_id": "r2.base.stream_saturated.t0", "trial": 0, "rank": 0, "split": "heldout", "boundary": "fx_region", "timing_mode": "stream_saturated", "duration_ms": 0.25, "sample_id": "s0", "sku": A2_SKU, "validated": True, "qualified": True}, {"schema": "mindie-bench-subgraph-run/1", "record_type": "receipt", "case_id": "cross_b16_ctx_4097", "run_id": "r2", "rank": 0, "status": "ok", "actual_shape": b4_by_id["cross_b16_ctx_4097"]["shape"], "node_shapes": b16_ns, "timed_nodes": b16_tn}], plan_doc=b4_plan, sku=A2_SKU, capture_out_dir=l2_cap)
+    l3_c200 = b4_by_id["offgrid_ctx_200000"]
+    l3_ns_kv1 = {"offgrid_ctx_200000:s0.l0.kv_store": {"tokens": 1, "width": 576, "seq_len": 1, "dtype": "bf16"}, **{n["node_id"]: ({**n["shape"], "dtype": "bf16", "weight_dtype": "bf16"} if n["family"] in {"gemm", "grouped_gemm", "gate_up_projection", "down_projection"} else n["shape"]) for n in l3_c200["nodes"] if n["op_id"] != "s0.l0.kv_store"}}
+    l3_kv1_norm, _ = normalize_profiler_records([{"schema": "mindie-bench-observation/1", "record_type": "observation", "case_id": "offgrid_ctx_200000", "run_id": "r200.base.eager.t0", "trial": 0, "rank": 0, "split": "heldout", "boundary": "model_step", "timing_mode": "eager", "duration_ms": 1.5, "sample_id": "s0", "sku": A2_SKU, "validated": True, "qualified": True}, {"schema": "mindie-bench-subgraph-run/1", "record_type": "receipt", "case_id": "offgrid_ctx_200000", "run_id": "r200", "rank": 0, "status": "ok", "actual_shape": {"tokens": 1, "width": 2048, "dtype": "bf16"}, "node_shapes": l3_ns_kv1, "timed_nodes": [n["node_id"] for n in l3_c200["nodes"]]}], plan_doc=b4_plan, sku=A2_SKU, capture_out_dir=l2_cap)
     rms127_norm, _ = normalize_profiler_records([{"schema": "mindie-bench-observation/1", "record_type": "observation", "case_id": "tile_128_minus1_127", "run_id": "r3.base.eager.t0", "trial": 0, "rank": 0, "split": "heldout", "boundary": "device_kernel", "timing_mode": "eager", "duration_ms": 0.02, "sample_id": "s0", "sku": A2_SKU, "validated": True, "qualified": True}, {"schema": "mindie-bench-subgraph-run/1", "record_type": "receipt", "case_id": "tile_128_minus1_127", "run_id": "r3", "rank": 0, "status": "ok", "actual_shape": {"tokens": 127, "width": 2048}, "timed_nodes": ["tile_128_minus1_127:op0"]}], plan_doc=b4_plan, sku=A2_SKU, capture_out_dir=l2_cap)
-    assert l2_norm[0]["clock_operator"] == "elapsed_span" and rms127_norm[0]["tokens"] == 127
+    assert l2_norm[0]["clock_operator"] == "elapsed_span" and rms127_norm[0]["tokens"] == 127 and l3_kv1_norm[0]["context_len"] == 200000
     stripped_l2 = {k: v for k, v in l2_norm[0].items() if k not in {"timed_nodes", "actual_shape", "measured_binding", "plan_key"}}
     for bad_cap_row, pat in (({**stripped_l2, "target_op_ids": ["s0.l0.norm1"]}, "capture_target_op_ids_mismatch|l2_op_set_mismatch"), ({**rms127_norm[0], "acquisition_root": "acq-forged"}, "capture_acquisition_root_mismatch"), ({**rms127_norm[0], "target_family": "attention", "target_op_id": "s0.l0.paged_mla_decode", "measured_binding": {}}, "capture_target_family_mismatch|l1_plan_target_mismatch"), ({**rms127_norm[0], "debug_cross_level": True}, "observation_debug_cross_level_forbidden"), ({**rms127_norm[0], "busy_union_ns": 999_999, "elapsed_span_ns": 20_000}, "observation_busy_union_exceeds_elapsed_span")):
         with pytest.raises(ModelingError, match=pat):
@@ -517,9 +504,21 @@ def test_whitebox_sku_check_2d_kv_heads_dcp_compose_and_real_dag(tmp_path):
         with pytest.raises(ModelingError, match="whitebox_measured_binding_mismatch"):
             score_sealed_gate_cases([{**attn_l1, **bad_bind}], sku=A2_SKU, runner=WhiteboxSpineRunner(clock_operator="busy_union"))
     l2_b16 = {**base_l1, "case_id": "l2-mg", "point_id": "l2-mg", "level": "L2", "context_len": 4097, "batch_size": 16, "target_family": None, "target_op_ids": ["s0.l0.paged_mla_decode", "s0.l0.v_expand"]}
-    for pat, patch in (("matrix_groups", {"measured_binding": {"node_bindings": [{"op_id": "s0.l0.v_expand", "matrix_groups": 1}]}}), ("l2_op_set_mismatch", {"timed_nodes": ["l2-mg:s0.l0.paged_mla_decode"]}), ("order_violation", {"timed_nodes": ["l2-mg:s0.l0.v_expand", "l2-mg:s0.l0.paged_mla_decode"]}), ("l2_timed_nodes_missing", {"actual_shape": {"m": 256, "n": 128, "k": 512, "e": 16, "matrix_groups": 16, "dtype": "bf16"}}), ("gemm_n_conflict|weight_n", {"actual_shape": {"m": 256, "n": 64, "k": 512, "e": 16, "matrix_groups": 16, "dtype": "bf16"}, "measured_binding": {"node_bindings": [{"op_id": "s0.l0.v_expand", "m": 256, "n": 128, "k": 512, "matrix_groups": 16, "dtype": "bf16"}]}}), ("dtype", {"actual_shape": {"m": 256, "n": 128, "k": 512, "e": 16, "matrix_groups": 16, "dtype": "int8"}, "timed_nodes": ["l2-mg:s0.l0.paged_mla_decode", "l2-mg:s0.l0.v_expand"]})):
+    l2_tn_pair, l2_attn_ok, l2_v_ok = ["l2-mg:s0.l0.paged_mla_decode", "l2-mg:s0.l0.v_expand"], {"sequences": 16, "q_len": 1, "seq_len": 4098, "page_count": 33, "block_table": [16, 33], "heads": 16, "kv_heads": 1, "latent": 512, "rope": 64, "query_layout": "BNSD"}, {"m": 256, "n": 128, "k": 512, "e": 16, "matrix_groups": 16, "dtype": "bf16", "weight_dtype": "bf16"}
+    for pat, patch in (("matrix_groups", {"measured_binding": {"node_bindings": [{"op_id": "s0.l0.v_expand", "matrix_groups": 1}]}}), ("l2_op_set_mismatch", {"timed_nodes": ["l2-mg:s0.l0.paged_mla_decode"]}), ("order_violation", {"timed_nodes": ["l2-mg:s0.l0.v_expand", "l2-mg:s0.l0.paged_mla_decode"]}), ("l2_timed_nodes_missing", {"actual_shape": l2_v_ok}), ("gemm_n_conflict|weight_n", {"actual_shape": {**l2_v_ok, "n": 64}, "measured_binding": {"node_bindings": [{"op_id": "s0.l0.v_expand", "m": 256, "n": 128, "k": 512, "matrix_groups": 16, "dtype": "bf16"}]}}), ("dtype", {"actual_shape": {**l2_v_ok, "dtype": "int8"}, "timed_nodes": l2_tn_pair}), ("dtype", {"measured_binding": {"node_bindings": [{"op_id": "s0.l0.paged_mla_decode", "family": "attention"}]}, "actual_shape": {"node_shapes": {"s0.l0.paged_mla_decode": l2_attn_ok, "s0.l0.v_expand": {**l2_v_ok, "dtype": "int8"}}}, "timed_nodes": l2_tn_pair}), ("node_bindings_incomplete", {"measured_binding": {"node_bindings": [{"op_id": "s0.l0.paged_mla_decode", "family": "attention"}]}, "actual_shape": {"node_shapes": {"s0.l0.paged_mla_decode": l2_attn_ok, "s0.l0.v_expand": l2_v_ok}}, "timed_nodes": l2_tn_pair}), ("sequences|q_len|block_table_sequences", {"actual_shape": {"node_shapes": {"s0.l0.paged_mla_decode": {**l2_attn_ok, "sequences": 1, "q_len": 16, "block_table": [1, 33]}, "s0.l0.v_expand": l2_v_ok}}, "timed_nodes": l2_tn_pair})):
         with pytest.raises(ModelingError, match=pat):
             score_sealed_gate_cases([{**l2_b16, **patch}], sku=A2_SKU, runner=WhiteboxSpineRunner(clock_operator="busy_union"))
+    for g_fam in ("gemm", "grouped_gemm"):
+        g_plan = synthesize_operator_cliff_plan(OperatorCliffParameters(f"{g_fam}:v1", g_fam, 128, 20, A2_ORACLE["l2"]), sku=A2_SKU).to_dict()
+        g_pt = next(p for p in g_plan["heldout_points"] if p["point_id"] == "tile_128_minus1_127")
+        g_sh = {k: v for k, v in resolve_point_measured_binding(g_plan, g_pt, sku=A2_SKU)["expected_shape"].items() if k in {"m", "n", "k", "e", "matrix_groups", "dtype"}}
+        g_sh["weight_dtype"] = "bf16"
+        g_rows, _ = normalize_profiler_records([{"schema": "mindie-bench-observation/1", "record_type": "observation", "case_id": g_pt["point_id"], "run_id": f"g-{g_fam}.base.eager.t0", "acquisition_id": f"acq-{g_fam}", "trial": 0, "rank": 0, "split": "heldout", "boundary": "device_kernel", "timing_mode": "eager", "duration_ms": 0.05, "sample_id": "s0", "sku": A2_SKU, "validated": True, "qualified": True}, {"schema": "mindie-bench-subgraph-run/1", "record_type": "receipt", "case_id": g_pt["point_id"], "run_id": f"g-{g_fam}", "acquisition_id": f"acq-{g_fam}", "rank": 0, "status": "ok", "actual_shape": g_sh, "timed_nodes": [f"{g_pt['point_id']}:op0"]}], plan_doc=g_plan, sku=A2_SKU)
+        g_sc = score_sealed_gate_cases(g_rows, sku=A2_SKU, expected_family=g_fam, runner=WhiteboxSpineRunner(clock_operator="elapsed_span"))
+        assert g_sc["residuals"][0]["predicted_ns"] > 0 and g_rows[0]["actual_shape"]["weight_dtype"] == "bf16"
+        for k_bad, v_bad in (("weight_dtype", "int8"), ("quant_mode", "w8a8")):
+            with pytest.raises(ModelingError, match=k_bad):
+                score_sealed_gate_cases([{**g_rows[0], "actual_shape": {**g_sh, k_bad: v_bad}}], sku=A2_SKU, expected_family=g_fam, runner=WhiteboxSpineRunner(clock_operator="elapsed_span"))
     l3_base = {"compose_model": "deepseek-v2-lite", "compose_hardware": A2_SKU, "model_overrides": {"layers": 1}}
     l3_c400 = next(c for c in build_profiler_subgraph_plan(synthesize_sku_512_400k_plan(sku=A2_SKU, core_count=20, l2_bytes=A2_ORACLE["l2"]).to_dict(), sku=A2_SKU)["cases"] if c["case_id"] == "cross_tp2_pcp2_dcp4_ctx_400000")
     l3_ns = {n["op_id"]: n["shape"] for n in l3_c400["nodes"] if n["family"] in {"gemm", "grouped_gemm", "gate_up_projection", "down_projection"}}
