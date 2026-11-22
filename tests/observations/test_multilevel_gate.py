@@ -15,7 +15,6 @@ import json
 import math
 from pathlib import Path
 import sys
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -524,7 +523,7 @@ def test_producer_end_to_end_report_assembly_boundary_and_precision(tmp_path: Pa
     outlier = prod._timing_fields(5.929, 9.017)
     for pred, obs, unit in ((4.5, 3, "us"), (4.09, 3, "us"), (90, 100, "us"), (0.09, 0.1, "ms")):
         assert prod._stats([prod._timing_fields(pred, obs, unit=unit)])["status"] == "pass"
-    assert prod._stats([prod._timing_fields(100, 100)] * 8 + [outlier])["failed"] == 1 and outlier["ape_pct"] == 34.25
+    assert prod._stats([prod._timing_fields(100, 100)] * 8 + [outlier])["failed"] == 1 and outlier["ape_pct"] == 34.25 and prod._stats([prod._timing_fields(108.004, 100.0)], level="L1")["status"] == "fail"
     sku = "Ascend950DT_9582"
     captures = {
         "acquisition_split_manifest.json": {"acquisitions": [
@@ -594,7 +593,7 @@ def test_producer_end_to_end_report_assembly_boundary_and_precision(tmp_path: Pa
     for key in ("level1_operators", "level2_subgraphs_and_blocks", "level3_model_steps"):
         report[key]["heldout"]["summary"]["status"] = "pass"
     monkeypatch.setattr(prod, "build_report", lambda *args, **kwargs: report)
-    assert prod.main(argv) == 1
+    assert prod.main(argv) == 1 and all(r.update(vertical_drilldown={"passed": True}) or True for r in timed_steps) and prod.main(argv) == 1
     with pytest.raises(ModelingError, match="producer_manifest_split_conflict"):
         prod._LineageSplitResolver({"acquisitions": [{"acquisition_uid": f"acq-{tag}", "raw_sha256": digest, "split": split}
             for tag, digest, split in (("x", _sha("a"), "train"), ("y", _sha("a").upper(), "heldout"))]})

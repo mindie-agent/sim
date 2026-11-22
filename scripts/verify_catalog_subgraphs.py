@@ -68,9 +68,12 @@ from mindie_sim.prediction.program import RecipeBook  # noqa: E402
 from mindie_sim.prediction.results import ReplayOptions, StepRequest  # noqa: E402
 from mindie_sim.prediction.spine import PredictionSpine, PreparedStep, default_spine  # noqa: E402
 from mindie_sim.prediction.structure import parse_case  # noqa: E402
+from mindie_sim.primitives import load_primitives  # noqa: E402
+from mindie_sim.schema.common import ModelingError  # noqa: E402
 from mindie_sim.schema.parallel import ParallelSpec  # noqa: E402
 from mindie_sim.schema.workload import IterationPlan, RequestView  # noqa: E402
 from mindie_sim.stack_registry import LoweringRequest  # noqa: E402
+from tools._fleet_400k_reconcile import nearest_rank_p90  # noqa: E402
 
 PHYSICAL_TOL_PCT = 10.0
 PHYSICAL_ATOL_NS = 2000.0
@@ -116,6 +119,7 @@ CROSSOVER_HIGH_SEQS = 64
 CROSSOVER_HIGH_CTX = 32768
 DEFAULT_GATE_A_SKU = "Ascend910_9362"
 DEFAULT_A5_SKU = "Ascend950DT_9582"
+DEFAULT_A5_PR_SKU = "Ascend950PR_9579"
 DEFAULT_A2_SKU = "Ascend910B4"
 DEFAULT_KV_BLOCK_SIZE = 128
 LOCAL_TP_WIDTH_FOUR = 4
@@ -347,6 +351,41 @@ def _op_work_flops(
     return 0.0
 
 
+def _op_attn_logical_and_cube_flops(
+    op: Any,
+    resolved_map: Mapping[tuple[int, str], Any],
+    replica: int,
+    book: RecipeBook,
+    geometry: Geometry,
+    prepare_errors: list[str],
+    base_flops: float,
+) -> tuple[float, float]:
+    """Separate logical attention FLOPs from Cube FRACTAL_NZ head-padded work."""
+    res = resolved_map.get((replica, op.op_id))
+    target_op = res.op if res is not None else op
+    cube_flops = base_flops
+    if target_op.flops and not target_op.matrix_flops:
+        try:
+            _, plan = book.prepare(target_op, geometry)
+            m_work = getattr(getattr(plan, "work", None), "matrix", None)
+            if m_work:
+                cube_flops = float(sum(float(v) for v in m_work.values()))
+        except Exception as exc:  # noqa: BLE001
+            prepare_errors.append(f"{op.op_id}:prepare_error:{type(exc).__name__}:{exc}")
+        return float(target_op.flops), max(cube_flops, float(target_op.flops))
+    if cube_flops <= 0.0:
+        return 0.0, 0.0
+    meta = dict(op.metadata) if op.metadata else {}
+    pgeo = meta.get("paged_mla_geometry")
+    if isinstance(pgeo, Mapping):
+        l_heads = int(pgeo.get("logical_heads") or 0)
+        if l_heads > 0:
+            padded_heads = ((l_heads + FRACTAL_NZ_TILE - 1) // FRACTAL_NZ_TILE) * FRACTAL_NZ_TILE
+            if padded_heads > l_heads:
+                return cube_flops * (float(l_heads) / float(padded_heads)), cube_flops
+    return cube_flops, cube_flops
+
+
 def _op_dep_sig(op: Any) -> tuple[str, ...]:
     """Return normalized dependency op-id suffixes (stripping replica/step prefix)."""
     out: list[str] = []
@@ -423,7 +462,7 @@ def _step_conservation_metrics(step: PreparedStep, spine: PredictionSpine) -> di
 
     if not step.graph.executable:
         return {
-            "attn_flops": 0.0, "compress_flops": 0.0, "attn_proj_flops": 0.0,
+            "attn_flops": 0.0, "attn_cube_flops": 0.0, "compress_flops": 0.0, "attn_proj_flops": 0.0,
             "sharded_attn_proj_flops": 0.0, "ffn_flops": 0.0, "proj_flops": 0.0, "moe_flops": 0.0,
             "layer_flops": {}, "layer_attn_flops": {}, "layer_ffn_flops": {}, "layer_ffn_ops": {},
             "collectives": {}, "fallbacks": ["empty_executable_graph"], "prepare_errors": [],
@@ -431,7 +470,7 @@ def _step_conservation_metrics(step: PreparedStep, spine: PredictionSpine) -> di
             "stream_count": 0,
         }
 
-    attn_flops = compress_flops = attn_proj_flops = sharded_attn_proj_flops = ffn_flops = moe_flops = 0.0
+    attn_flops = attn_cube_flops = compress_flops = attn_proj_flops = sharded_attn_proj_flops = ffn_flops = moe_flops = r0_raw_total = 0.0
     collectives: dict[str, dict[str, float]] = {}
     fallbacks: list[str] = []
     prepare_errors: list[str] = []
@@ -460,18 +499,26 @@ def _step_conservation_metrics(step: PreparedStep, spine: PredictionSpine) -> di
         if any(m in impl_name.lower() for m in FORBIDDEN_IMPL_MARKERS):
             fallbacks.append(f"{op.op_id}:{impl_name}")
         flops = _op_work_flops(op, resolved_map, entry.replica, book, geometry, prepare_errors)
-        if layer_id >= 0:
-            layer_flops[layer_id] = layer_flops.get(layer_id, 0.0) + flops
+        r0_raw_total += flops
         oid_low = op.op_id.lower()
         meta = dict(op.metadata) if op.metadata else {}
         blk = str(meta.get("structure_block", "")).lower()
         is_compressor = "compress" in oid_low or "compressor" in impl_name.lower()
+        if fam in ATTN_FAMILIES and not is_compressor:
+            logical_flops, cube_flops = _op_attn_logical_and_cube_flops(
+                op, resolved_map, entry.replica, book, geometry, prepare_errors, flops,
+            )
+        else:
+            logical_flops, cube_flops = flops, flops
+        if layer_id >= 0:
+            layer_flops[layer_id] = layer_flops.get(layer_id, 0.0) + logical_flops
         if fam in ATTN_FAMILIES and is_compressor:
             compress_flops += flops
         elif fam in ATTN_FAMILIES:
-            attn_flops += flops
+            attn_flops += logical_flops
+            attn_cube_flops += cube_flops
             if layer_id >= 0:
-                layer_attn_flops[layer_id] = layer_attn_flops.get(layer_id, 0.0) + flops
+                layer_attn_flops[layer_id] = layer_attn_flops.get(layer_id, 0.0) + logical_flops
         elif ".hc_" in oid_low:
             attn_proj_flops += flops
         elif (
@@ -524,7 +571,7 @@ def _step_conservation_metrics(step: PreparedStep, spine: PredictionSpine) -> di
                 bucket["count"] += 1.0
                 bucket["link_bytes"] += fused_lb
 
-    r0_total = attn_flops + compress_flops + attn_proj_flops + ffn_flops
+    r0_total = r0_raw_total
     for rep_entry in step.graph.executable[1:]:
         rep_fb_before = len(fallbacks)
         rep_total, rep_sig, rep_self_dep = _sum_replica_flops(
@@ -541,7 +588,7 @@ def _step_conservation_metrics(step: PreparedStep, spine: PredictionSpine) -> di
 
     streams = {str(getattr(op, "stream", "main")) for op in entry.ops}
     return {
-        "attn_flops": attn_flops, "compress_flops": compress_flops,
+        "attn_flops": attn_flops, "attn_cube_flops": attn_cube_flops, "compress_flops": compress_flops,
         "attn_proj_flops": attn_proj_flops, "sharded_attn_proj_flops": sharded_attn_proj_flops,
         "ffn_flops": ffn_flops,
         "proj_flops": attn_proj_flops + (ffn_flops - moe_flops), "moe_flops": moe_flops,
@@ -835,11 +882,15 @@ def _sum_pcp_physical_rank_attn_flops(parsed_case: Any, pcp: int, tokens: int) -
 
 
 def _select_canonical_tp_width(spec: Any, *, is_mla: bool) -> int:
-    """Choose canonical non-KV-replicated / Cube-tile-aligned TP width for TP+EP conservation checks."""
+    """Choose canonical non-KV-replicated TP width for TP+EP conservation checks."""
     if is_mla:
-        # Align local MLA heads to >= FRACTAL_NZ_TILE (16) so Cube FRACTAL_NZ tiling does not 2x-pad small head shards
+        # Prefer Cube-tile-aligned (>= 16) local MLA heads first, then smaller divisible TP widths
+        # (e.g. deepseek-v2-lite with 16 heads -> TP=2) so TP/EP checks never degenerate to TP=1.
         for cand in (WORLD_QUAD, 2):
             if spec.num_heads % cand == 0 and (spec.num_heads // cand) >= FRACTAL_NZ_TILE:
+                return cand
+        for cand in (2, WORLD_QUAD):
+            if spec.num_heads % cand == 0:
                 return cand
         return 1
     gqa_kv = [int(p.num_kv_heads) for p in spec.layer_plans if p.attention == "gqa" and int(p.num_kv_heads) > 0]
@@ -848,6 +899,25 @@ def _select_canonical_tp_width(spec: Any, *, is_mla: bool) -> int:
         if spec.num_heads % cand == 0 and (min_kv == 1 or min_kv % cand == 0):
             return cand
     return 1
+
+
+def _check_attn_cube_padding(
+    spec: Any, *, is_mla: bool, tp_w: int, m_tp: Mapping[str, Any], ref_dec: Mapping[str, Any], findings: list[str],
+) -> float:
+    """Verify FRACTAL_NZ padded Cube work separately from logical attention FLOP conservation."""
+    cube_tp, cube_ref = float(m_tp.get("attn_cube_flops", 0.0)), float(ref_dec.get("attn_cube_flops", 0.0))
+    if cube_ref <= 0.0:
+        return 1.0
+    cube_ratio = (cube_tp * float(tp_w)) / cube_ref
+    if cube_tp + KV_LAYER_ABS_TOL < float(m_tp.get("attn_flops", 0.0)):
+        findings.append(f"tp_ep_cube_below_logical:{cube_tp:.3e}<{float(m_tp.get('attn_flops', 0.0)):.3e}")
+    if is_mla and tp_w > 1 and spec.num_heads % tp_w == 0:
+        local_h = spec.num_heads // tp_w
+        padded_h = ((local_h + FRACTAL_NZ_TILE - 1) // FRACTAL_NZ_TILE) * FRACTAL_NZ_TILE
+        exp_ratio = float(padded_h) / float(local_h)
+        if abs(cube_ratio - exp_ratio) > FLOP_CONSERVATION_REL_TOL:
+            findings.append(f"tp_ep_fractal_nz_cube_drift:{cube_ratio:.4f}!=exp:{exp_ratio:.4f}")
+    return cube_ratio
 
 
 def _audit_model_cp_regimes(
@@ -1183,6 +1253,7 @@ def _audit_model_gate_a(model_key: str, spine: PredictionSpine, sku: str) -> dic
         ev_tp = spine.run_step(s_tp, ReplayOptions(include_submission=False))
         kv_tp = _kv_and_indexer_memory_audit(spec, c_tp.runtime.parallel)
         attn_ratio = _check_ratio_non_tautological("tp_ep_attn", m_tp["attn_flops"] * tp_w, ref_dec["attn_flops"], exp_dec_attn, findings)
+        attn_cube_ratio = _check_attn_cube_padding(spec, is_mla=is_mla, tp_w=tp_w, m_tp=m_tp, ref_dec=ref_dec, findings=findings)
         ffn_ratio_tp = _check_ratio_non_tautological("tp_ep_ffn", m_tp["ffn_flops"] * tp_w, ref_dec["ffn_flops"], exp_dec_ffn, findings)
         proj_ratio_tp = _check_ratio_non_tautological(
             "tp_ep_proj", m_tp["sharded_attn_proj_flops"] * tp_w,
@@ -1209,6 +1280,7 @@ def _audit_model_gate_a(model_key: str, spine: PredictionSpine, sku: str) -> dic
             findings.append(f"tp_ep_issues:fb={m_tp['fallbacks']},pe={m_tp['prepare_errors']},rep={m_tp['replica_issues']}")
         regimes["tp_ep"] = {
             "tp": tp_w, "ep": tp_ep, "attn_flop_ratio": round(attn_ratio, 4),
+            "attn_cube_padded_ratio": round(attn_cube_ratio, 4),
             "ffn_flop_ratio": round(ffn_ratio_tp, 4), "proj_flop_ratio": round(proj_ratio_tp, 4),
             "span_ms": round(ev_tp.span_ms, 4), "kv_audit": kv_tp, "collectives": m_tp["collectives"],
         }
@@ -1603,7 +1675,7 @@ def _has_unresolved_parallel_var(cmd: str) -> bool:
 def _parse_mtp_spec_tokens(cmd: str) -> int:
     """Extract native MTP ``num_speculative_tokens`` (ignoring external ``eagle3``/``ngram`` draft configs)."""
     m_meth = re.search(r"method[\"']?\s*[:=]\s*[\"']?([a-z0-9_-]+)", cmd.lower())
-    if m_meth and m_meth.group(1) not in ("mtp", "deepseek_mtp"):
+    if m_meth and m_meth.group(1) != "mtp" and not m_meth.group(1).endswith("_mtp"):
         return 0
     m = re.search(r"num_speculative_tokens[\"']?\s*[:=]\s*(\d+)", cmd)
     return int(m.group(1)) if m else 0
@@ -1628,7 +1700,9 @@ def audit_va_tutorial_discovery(tutorials_dir: Path) -> dict[str, Any]:
             stripped = lines[idx].lstrip()
             low = stripped.lower()
             if "tab-item" in low or stripped.startswith("#") or stripped.startswith("==="):
-                if "950dt" in low or "950pr" in low or "a5" in low:
+                if "950pr" in low:
+                    current_hw = DEFAULT_A5_PR_SKU
+                elif "950dt" in low or "a5" in low:
                     current_hw = DEFAULT_A5_SKU
                 elif "a2" in low or "910b" in low:
                     current_hw = DEFAULT_A2_SKU
@@ -1677,16 +1751,17 @@ def audit_va_tutorial_discovery(tutorials_dir: Path) -> dict[str, Any]:
                 has_fp8_kv = bool(re.search(r"--kv-cache-dtype(?:=|\s+)['\"]?fp8", cmd_low))
                 has_int8_kv = bool(re.search(r"--kv-cache-dtype(?:=|\s+)['\"]?int8", cmd_low))
                 cmd_hw = current_hw
+                a5_skus = (DEFAULT_A5_SKU, DEFAULT_A5_PR_SKU)
                 if "mxfp4" in cmd_low or "w4a4" in cmd_low:
-                    cmd_hw = DEFAULT_A5_SKU
+                    cmd_hw = cmd_hw if cmd_hw in a5_skus else DEFAULT_A5_SKU
                     quant = MXFP4_FP8KV_QUANT_SPEC if (has_fp8_kv or "c8" in cmd_low) else "mxfp4"
                 elif "mxfp8" in cmd_low:
-                    cmd_hw = DEFAULT_A5_SKU
+                    cmd_hw = cmd_hw if cmd_hw in a5_skus else DEFAULT_A5_SKU
                     quant = "mxfp8"
                 elif "w4a8" in cmd_low:
                     quant = "w4a8"
                 elif has_fp8_kv:
-                    cmd_hw = DEFAULT_A5_SKU
+                    cmd_hw = cmd_hw if cmd_hw in a5_skus else DEFAULT_A5_SKU
                     quant = W8A8_FP8KV_QUANT_SPEC
                 elif has_int8_kv or "w8a8c8" in cmd_low:
                     quant = C8_QUANT_SPEC
@@ -3278,6 +3353,24 @@ def _build_capture_geom_meta(
     }
 
 
+_PRIMITIVE_TABLE_CACHE: dict[str, Any] = {}
+
+
+def _load_calibrated_primitive_table(hardware_soc: str) -> Any:
+    """Load calibrated L0 ``PrimitiveTable`` for ``hardware_soc`` if registered (cached)."""
+    key = str(hardware_soc or "").strip()
+    if not key:
+        return None
+    if key in _PRIMITIVE_TABLE_CACHE:
+        return _PRIMITIVE_TABLE_CACHE[key]
+    try:
+        table = load_primitives(key)
+    except (ModelingError, FileNotFoundError, KeyError, ValueError):
+        table = None
+    _PRIMITIVE_TABLE_CACHE[key] = table
+    return table
+
+
 def _lower_capture_sim_step(
     capture_case: Mapping[str, Any],
     hardware_soc: str,
@@ -3345,7 +3438,8 @@ def _lower_capture_sim_step(
         sim_ctx = max(0, context - q_len) if phase == "decode" else context
         req = LoweringRequest(step=StepRequest(phase=phase, tokens=q_len, context=sim_ctx, sequences=seqs, scope="body"))
     step = spine.lower(parsed, req)
-    ev = spine.run_step(step, ReplayOptions(include_submission=False))
+    pt = _load_calibrated_primitive_table(hardware_soc)
+    ev = spine.run_step(step, ReplayOptions(include_submission=False), primitive_table=pt)
     local_tokens = max(1, (seqs * q_len) // pcp) if phase == "prefill" else (seqs * q_len)
     geom_meta = _build_capture_geom_meta(
         spec, target_plan, local_tokens=local_tokens, tp=tp, o_proj_tp=o_proj_tp,
@@ -3371,7 +3465,7 @@ def _classify_sim_fine_bucket(op: Any, block: str) -> str:
                 return "attn_quant"
             return "attn_norm"
         if cat == "matmul":
-            if any(t in oid for t in (".output", "o_proj", "v_expand", "linear_output")) or fam == "output_projection":
+            if any(t in oid for t in (".output", "o_proj", "v_expand", "linear_output", "grouped_output")) or fam == "output_projection":
                 return "attn_o_proj"
             if any(t in oid for t in ("kv_a", "kv_b", "kv_proj", "kv_compress", "k_proj", "v_proj")):
                 return "attn_kv_proj"
@@ -3381,11 +3475,13 @@ def _classify_sim_fine_bucket(op: Any, block: str) -> str:
                 return "attn_q_a_proj"
             if "q_b" in oid:
                 return "attn_q_b_proj"
+            if any(t in oid for t in (".hc_", "engram_")):
+                return "attn_other"
             return "attn_q_proj"
         return "attn_other"
     if cat == "collective":
         return "ffn_collective"
-    if "shared." in oid and cat == "matmul":
+    if any(t in oid for t in ("shared.", "latent_down", "latent_up")) and cat == "matmul":
         return "ffn_shared"
     if "router" in oid or fam == "router":
         return "ffn_router"
@@ -3400,6 +3496,8 @@ def _classify_sim_fine_bucket(op: Any, block: str) -> str:
             return "ffn_quant"
         return "ffn_norm"
     if cat == "matmul":
+        if any(t in oid for t in (".hc_", "engram_")):
+            return "ffn_other"
         if "down" in oid or fam == "down_projection":
             return "ffn_down"
         return "ffn_gate_up"
@@ -3587,11 +3685,7 @@ def _l1_cliff_limit_us(obs_us: float) -> float:
 
 
 def _quantile_p90(values: Sequence[float]) -> float:
-    if not values:
-        return 0.0
-    ordered = sorted(values)
-    idx = max(0, min(len(ordered) - 1, math.ceil(0.9 * len(ordered)) - 1))
-    return float(ordered[idx])
+    return nearest_rank_p90(values) if values else 0.0
 
 
 def _summarize_l1_two_tier(l1_in_l2: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
@@ -3604,15 +3698,15 @@ def _summarize_l1_two_tier(l1_in_l2: Mapping[str, Mapping[str, Any]]) -> dict[st
         }
     cliff_pass = sum(1 for sc in l1_in_l2.values() if sc.get("pass_l1_cliff_tol"))
     apes = [abs(float(sc.get("signed_err_pct") if sc.get("signed_err_pct") is not None else PERCENT_SCALE)) for sc in l1_in_l2.values()]
-    med_ape = round(float(statistics.median(apes)), 2)
-    p90_ape = round(_quantile_p90(apes), 2)
+    raw_med = float(statistics.median(apes))
+    raw_p90 = _quantile_p90(apes)
     return {
         "l1_cliff_pass_count": cliff_pass,
         "l1_cliff_pass_rate": round(cliff_pass / total, 4),
-        "l1_median_ape_pct": med_ape,
-        "l1_p90_ape_pct": p90_ape,
+        "l1_median_ape_pct": round(raw_med, 2),
+        "l1_p90_ape_pct": round(raw_p90, 2),
         "l1_two_tier_pass": bool(
-            cliff_pass == total and med_ape <= L1_MEDIAN_APE_LIMIT_PCT and p90_ape <= L1_P90_APE_LIMIT_PCT
+            cliff_pass == total and raw_med <= L1_MEDIAN_APE_LIMIT_PCT and raw_p90 <= L1_P90_APE_LIMIT_PCT
         ),
     }
 
@@ -4311,15 +4405,15 @@ def _aggregate_gate_b_two_tier_stats(ok_eval: Sequence[Mapping[str, Any]]) -> di
     for bkt in sorted(by_bucket):
         pairs = by_bucket[bkt]
         b_apes = [p[0] for p in pairs]
-        b_med = round(float(statistics.median(b_apes)), 2)
-        b_p90 = round(_quantile_p90(b_apes), 2)
+        raw_b_med = float(statistics.median(b_apes))
+        raw_b_p90 = _quantile_p90(b_apes)
         b_cliff = sum(1 for _, ok in pairs if ok)
         bucket_summary[bkt] = {
             "count": len(pairs),
-            "median_ape_pct": b_med,
-            "p90_ape_pct": b_p90,
+            "median_ape_pct": round(raw_b_med, 2),
+            "p90_ape_pct": round(raw_b_p90, 2),
             "cliff_pass_rate": round(b_cliff / len(pairs), 4),
-            "two_tier_pass": bool(b_cliff == len(pairs) and b_med <= L1_MEDIAN_APE_LIMIT_PCT and b_p90 <= L1_P90_APE_LIMIT_PCT),
+            "two_tier_pass": bool(b_cliff == len(pairs) and raw_b_med <= L1_MEDIAN_APE_LIMIT_PCT and raw_b_p90 <= L1_P90_APE_LIMIT_PCT),
         }
     return {
         "l2_median_ape_pct": round(float(statistics.median(l2_apes)), 2) if l2_apes else None,
@@ -4328,6 +4422,9 @@ def _aggregate_gate_b_two_tier_stats(ok_eval: Sequence[Mapping[str, Any]]) -> di
         "l1_in_l2_p90_ape_pct": round(_quantile_p90(all_l1_apes), 2) if all_l1_apes else None,
         "l1_in_l2_cliff_pass_rate": round(all_l1_cliff / len(all_l1_apes), 4) if all_l1_apes else 0.0,
         "l1_in_l2_two_tier_pass_cases": sum(1 for r in ok_eval if r.get("l1_two_tier_pass")),
+        "l1_in_l2_all_buckets_two_tier_pass": bool(
+            bucket_summary and all(bool(b.get("two_tier_pass")) for b in bucket_summary.values())
+        ),
         "l1_in_l2_by_bucket": bucket_summary,
     }
 
@@ -4448,7 +4545,12 @@ def run_gate_b(
     models_verified_pass = sorted({str(r["model"]) for r in passed_cases if str(r.get("model", "")) in ALL_CATALOG_MODEL_SET})
     total_cases = len(evaluated_rows)
     zero_drop_ok = total_cases == len(passed_cases) + len(failed_cases) + len(blocked_cases)
-    gate_pass = bool(passed_cases and not failed_cases and not blocked_cases and not shard_integrity_errors and zero_drop_ok)
+    two_tier_stats = _aggregate_gate_b_two_tier_stats(ok_eval)
+    gate_pass = bool(
+        passed_cases and not failed_cases and not blocked_cases
+        and not shard_integrity_errors and zero_drop_ok
+        and two_tier_stats["l1_in_l2_all_buckets_two_tier_pass"]
+    )
 
     return {
         "gate": "B", "status": "pass" if gate_pass else "fail",
@@ -4465,7 +4567,7 @@ def run_gate_b(
         "rank_parity_pass": sum(1 for r in ok_eval if r.get("rank_parity_ok")),
         "l2_physical_tol_pass": sum(1 for r in ok_eval if r.get("pass_l2_layer")),
         "l2_device_kernel_tol_pass": sum(1 for r in ok_eval if r.get("pass_l2_device_kernel")),
-        **_aggregate_gate_b_two_tier_stats(ok_eval),
+        **two_tier_stats,
         "coverage_tiers": dict(tier_counts), "wall_seconds": round(time.perf_counter() - t0, 3),
         "rows": evaluated_rows,
     }

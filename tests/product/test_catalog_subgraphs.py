@@ -567,18 +567,25 @@ def test_sanitization_and_tutorial_exec_mxfp4_and_mso_false(tmp_path: Path) -> N
         "::::{tab-item} 950DT\n```bash\n"
         "exec vllm serve /models/GLM-5.3-w4a4c8-mxfp4 --tensor-parallel-size \"4\" --pipeline-parallel-size \"4\" "
         "--enable-expert-parallel --quantization ascend --kv-cache-dtype fp8 --additional-config '{\"multistream_overlap_shared_expert\": false}'\n"
-        "vllm serve /models/GLM-5.3 --tensor-parallel-size \"$TP\"\n"
-        "```\n::::\n"
+        "vllm serve /models/GLM-5.3 --tensor-parallel-size \"$TP\"\n```\n::::\n"
+        "=== \"950PR Products\"\n```bash\nvllm serve /models/Qwen3.8-27B --quantization ascend "
+        "--speculative-config '{\"method\": \"qwen3_5_mtp\", \"num_speculative_tokens\": 3}'\n```\n"
     )
     (tmp_path / "GLM5.3.md").write_text(md, encoding="utf-8")
     disc = harness.audit_va_tutorial_discovery(tmp_path)
-    assert disc["total_commands"] == 2 and len(disc["discovered"]) == 1 and len(disc["explicitly_skipped"]) == 1
-    assert disc["discovered"][0]["tp"] == 4 and disc["discovered"][0]["pp"] == 4 and disc["discovered"][0]["mso"] is False
-    assert isinstance(disc["discovered"][0]["quant"], dict) and disc["discovered"][0]["quant"]["weight_format"] == "mxfp4"
+    assert disc["total_commands"] == 3 and len(disc["discovered"]) == 2 and len(disc["explicitly_skipped"]) == 1
+    d0, d1 = disc["discovered"]
+    assert d0["hw"] == harness.DEFAULT_A5_SKU and d0["tp"] == 4 and d0["pp"] == 4 and d0["mso"] is False
+    assert isinstance(d0["quant"], dict) and d0["quant"]["weight_format"] == "mxfp4"
+    assert d1["hw"] == harness.DEFAULT_A5_PR_SKU and d1["mtp"] == 3
     assert harness._parse_mtp_spec_tokens('{"method": "eagle3", "num_speculative_tokens": 3}') == 0
-    assert harness._parse_mtp_spec_tokens('{"method": "deepseek_mtp", "num_speculative_tokens": 2}') == 2
+    assert harness._parse_mtp_spec_tokens('{"method": "qwen3_5_mtp", "num_speculative_tokens": 3}') == 3
     assert harness._mc2_protocol_link_bytes({"mc2_phase": {"route_matrix_bytes": [[10, 40], [30, 5]]}}) == 40.0
     assert harness._l1_cliff_limit_us(10.0) == 3.0 and harness._l1_cliff_limit_us(100.0) == 15.0
-    l1_ok = harness._summarize_l1_two_tier({"a": {"signed_err_pct": 5.0, "pass_l1_cliff_tol": True}, "b": {"signed_err_pct": -11.0, "pass_l1_cliff_tol": True}})
-    l1_bad = harness._summarize_l1_two_tier({"a": {"signed_err_pct": 5.0, "pass_l1_cliff_tol": True}, "b": {"signed_err_pct": 18.0, "pass_l1_cliff_tol": False}})
-    assert l1_ok["l1_two_tier_pass"] is True and l1_bad["l1_two_tier_pass"] is False
+    assert harness._summarize_l1_two_tier({"a": {"signed_err_pct": 8.004, "pass_l1_cliff_tol": True}})["l1_two_tier_pass"] is False
+    canc = [{"l1_two_tier_pass": True, "l1_in_l2_scores": {
+        f"b{i}": {"signed_err_pct": e, "pass_l1_cliff_tol": True} for i, e in enumerate((10.0, -10.0, 0.0, 0.0, 0.0))
+    }}]
+    assert harness._aggregate_gate_b_two_tier_stats(canc)["l1_in_l2_all_buckets_two_tier_pass"] is False
+    assert harness._select_canonical_tp_width(SimpleNamespace(num_heads=16, num_kv_heads=16, layer_plans=()), is_mla=True) == 2
+    assert harness._load_calibrated_primitive_table(harness.DEFAULT_A5_SKU) is not None

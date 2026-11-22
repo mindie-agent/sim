@@ -57,7 +57,9 @@ from mindie_sim.observations.multilevel_stream import (
 from mindie_sim.prediction.api import RecipeBook
 from mindie_sim.prediction.call_builders import build_aclnn_call
 from mindie_sim.prediction.efficiency import capacity_feedback
+from mindie_sim.prediction.evaluation import EvaluationContext
 from mindie_sim.prediction.mechanism import PlannedRecipe
+from mindie_sim.primitives import load_primitives
 from mindie_sim.prediction.operators import (
     attention as bsa,
     hyper_connections as hc,
@@ -72,8 +74,11 @@ from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.operators import OpSpec
 
 ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+from tools._fleet_400k_reconcile import nearest_rank_p90  # noqa: E402
+
 PERCENT_SCALE = 100.0
-TAIL_QUANTILE_P90 = 0.9
 L1_MEDIAN_APE_LIMIT_PCT = 8.0
 L1_P90_APE_LIMIT_PCT = 12.0
 L1_CLIFF_RTOL = 0.15
@@ -279,17 +284,18 @@ def _stats(rows: Sequence[Mapping[str, Any]], *, level: str = "L2") -> dict[str,
     ok_rows = [row for row in rows if row["status"] == "ok"]
     apes = sorted(row["ape"] for row in ok_rows)
     blocked = len(rows) - len(ok_rows)
-    p90_idx = math.ceil(TAIL_QUANTILE_P90 * len(apes)) - 1
     strict_passed = sum(bool(row["pointwise_pass"]) for row in ok_rows)
-    medape_pct = round(statistics.median(apes) * PERCENT_SCALE, DISPLAY_ROUND_DIGITS) if apes else None
-    p90_ape_pct = round(apes[p90_idx] * PERCENT_SCALE, DISPLAY_ROUND_DIGITS) if apes else None
+    raw_medape_pct = (statistics.median(apes) * PERCENT_SCALE) if apes else None
+    raw_p90_ape_pct = (nearest_rank_p90(apes) * PERCENT_SCALE) if apes else None
+    medape_pct = round(raw_medape_pct, DISPLAY_ROUND_DIGITS) if raw_medape_pct is not None else None
+    p90_ape_pct = round(raw_p90_ape_pct, DISPLAY_ROUND_DIGITS) if raw_p90_ape_pct is not None else None
     max_ape_pct = round(apes[-1] * PERCENT_SCALE, DISPLAY_ROUND_DIGITS) if apes else None
     mape_pct = round(statistics.fmean(apes) * PERCENT_SCALE, DISPLAY_ROUND_DIGITS) if apes else None
     if level == "L1":
         cliff_passed = sum(bool(row.get("l1_cliff_pass", row["pointwise_pass"])) for row in ok_rows)
         cliff_failed = len(apes) - cliff_passed
-        median_ok = medape_pct is not None and medape_pct <= L1_MEDIAN_APE_LIMIT_PCT
-        p90_ok = p90_ape_pct is not None and p90_ape_pct <= L1_P90_APE_LIMIT_PCT
+        median_ok = raw_medape_pct is not None and raw_medape_pct <= L1_MEDIAN_APE_LIMIT_PCT
+        p90_ok = raw_p90_ape_pct is not None and raw_p90_ape_pct <= L1_P90_APE_LIMIT_PCT
         cliff_ok = cliff_failed == 0
         status = (
             "fail" if (apes and not (median_ok and p90_ok and cliff_ok))
@@ -347,6 +353,21 @@ def _operator_row(resolver, r, doc, *, sku, name, family, fallback, uri, measure
     return split or "unassigned", {**row, "status": "blocked", "reason": reason, "predicted_us": None}
 
 
+_PRIMITIVE_CACHE: dict[str, Any] = {}
+
+
+def _calibrated_evaluation(cs, recipes: RecipeBook | None = None) -> EvaluationContext:
+    sku = str(getattr(getattr(cs, "machine", None), "sku", "") or "").strip()
+    if sku and sku not in _PRIMITIVE_CACHE:
+        try:
+            _PRIMITIVE_CACHE[sku] = load_primitives(sku)
+        except (ModelingError, FileNotFoundError, KeyError, ValueError):
+            _PRIMITIVE_CACHE[sku] = None
+    pt = _PRIMITIVE_CACHE.get(sku)
+    book = recipes if recipes is not None else RecipeBook.from_mapping(cs.runtime.kernels)
+    return EvaluationContext.create(cs, book, primitive_table=pt)
+
+
 def _eval_collective(cs_comm, coll: str, world_size: int, payload_bytes: int) -> float:
     w = max(2, int(world_size))
     if coll == "AllReduce":
@@ -363,13 +384,13 @@ def _eval_collective(cs_comm, coll: str, world_size: int, payload_bytes: int) ->
             link_bytes=(w - 1) / w * payload_bytes, shape=(1, max(1, payload_bytes // 2)),
             metadata=(("group_axis", "tp"), ("collective", "all_to_all")),
         )
-    rep = graph_costs(cs_comm, {0: [op]}, include_submission=False, isolated=False, fast_span_only=True)
+    rep = graph_costs(cs_comm, {0: [op]}, include_submission=False, isolated=False, fast_span_only=True, evaluation=_calibrated_evaluation(cs_comm))
     return float(rep["duration_ms"]) * 1000.0
 
 
 def _eval_planned(cs, op: OpSpec, builder_fn) -> float:
     rb = RecipeBook(recipes={op.recipe: PlannedRecipe(builder_fn)})
-    rep = graph_costs(cs, {0: [op]}, recipes=rb, include_submission=False, isolated=False, fast_span_only=True)
+    rep = graph_costs(cs, {0: [op]}, recipes=rb, include_submission=False, isolated=False, fast_span_only=True, evaluation=_calibrated_evaluation(cs, rb))
     return float(rep["duration_ms"]) * 1000.0
 
 
@@ -417,7 +438,7 @@ def _eval_fia(cs, B: int, S: int, Hq: int, Hkv: int, D: int, seq_kv: int, *, win
     cores = int(cs.machine.dies[0].compute_units)
     key_tile = 32 if D >= 512 else (64 if D >= 256 else 128)
     rb = RecipeBook(recipes={RECIPE_ID: StagedGQADecode(key_tile=key_tile, target_cores=cores, kv_mapping="fai_host_arch35")})
-    return float(graph_costs(cs, {0: [op]}, recipes=rb, include_submission=False, isolated=False, fast_span_only=True)["duration_ms"]) * 1000.0
+    return float(graph_costs(cs, {0: [op]}, recipes=rb, include_submission=False, isolated=False, fast_span_only=True, evaluation=_calibrated_evaluation(cs, rb))["duration_ms"]) * 1000.0
 
 
 def _eval_gdn_chunk32(cs, T: int, Hk: int, Hv: int, K: int, V: int) -> float:
@@ -426,7 +447,7 @@ def _eval_gdn_chunk32(cs, T: int, Hk: int, Hv: int, K: int, V: int) -> float:
     s_op = replace(STATE.make_op(params), deps=(p_op.op_id,))
     o_op = replace(OUTPUT.make_op(params), deps=(p_op.op_id, s_op.op_id))
     rb = RecipeBook(recipes={p_op.recipe: PlannedRecipe(PREPARE.build), s_op.recipe: PlannedRecipe(STATE.build), o_op.recipe: PlannedRecipe(OUTPUT.build)})
-    return float(graph_costs(cs, {0: [p_op, s_op, o_op]}, recipes=rb, include_submission=False, isolated=False, fast_span_only=True)["duration_ms"]) * 1000.0
+    return float(graph_costs(cs, {0: [p_op, s_op, o_op]}, recipes=rb, include_submission=False, isolated=False, fast_span_only=True, evaluation=_calibrated_evaluation(cs, rb))["duration_ms"]) * 1000.0
 
 
 def _single_operator(cs_bf, cs_mx, gmm_rb, dom, name, sh) -> tuple[str, float]:
@@ -434,16 +455,16 @@ def _single_operator(cs_bf, cs_mx, gmm_rb, dom, name, sh) -> tuple[str, float]:
         raise ModelingError("single_operator_sku_unsupported")
     if dom == "domain2_bf16_gemm":
         cd = build_aclnn_call({"api": "aclnnMatmul", "dtype": "bf16", "m": sh[0], "n": sh[1], "k": sh[2]})
-        return "gemm_qmm", float(graph_costs(cs_bf, {0: cd.ops}, recipes=cd.recipes, include_submission=False, isolated=False, fast_span_only=True)["duration_ms"]) * 1000.0
+        return "gemm_qmm", float(graph_costs(cs_bf, {0: cd.ops}, recipes=cd.recipes, include_submission=False, isolated=False, fast_span_only=True, evaluation=_calibrated_evaluation(cs_bf, cd.recipes))["duration_ms"]) * 1000.0
     if dom == "domain2_mxfp8_qmm":
         op = gemm_op(op_id=name, deps=(), stage=0, layer=0, requests=("r0",), m=sh[0], n=sh[1], k=sh[2], quant=cs_mx.model.quant, category="linear_param", phase="prefill")
-        return "gemm_qmm", float(graph_costs(cs_mx, {0: [op]}, include_submission=False, isolated=False, fast_span_only=True)["duration_ms"]) * 1000.0
+        return "gemm_qmm", float(graph_costs(cs_mx, {0: [op]}, include_submission=False, isolated=False, fast_span_only=True, evaluation=_calibrated_evaluation(cs_mx))["duration_ms"]) * 1000.0
     if dom == "domain3_moe_gmm" and ("uniform" in name or "zero_tail" in name):
         act_e = sh["E_local"] // 2 if "zero_tail" in name else sh["E_local"]
         q_spec = replace(cs_mx.model.quant.for_category("expert"), weight_format="mxfp4") if "MXFP4" in name else cs_mx.model.quant
         meta = (("compute_format", "fp8_e4m3"), ("matrix_mapping_domain", "aggregate_experts"), ("routing_basis", "probability_moments"), ("expected_active_experts", float(act_e)), ("expected_rows", float(sh["M_total"])), ("matrix_groups", act_e))
         op = gemm_op(op_id=name, deps=(), stage=0, layer=0, requests=("r0",), m=sh["M_total"], n=sh["N"], k=sh["K"], quant=q_spec, category="expert", phase="prefill", recipe="aclnn_grouped_matmul", family="grouped_gemm", activation_dtype="fp8_e4m3", weight_count=act_e, metadata=meta)
-        return "moe_gmm", float(graph_costs(cs_mx, {0: [op]}, recipes=gmm_rb, include_submission=False, isolated=False, fast_span_only=True)["duration_ms"]) * 1000.0
+        return "moe_gmm", float(graph_costs(cs_mx, {0: [op]}, recipes=gmm_rb, include_submission=False, isolated=False, fast_span_only=True, evaluation=_calibrated_evaluation(cs_mx, gmm_rb))["duration_ms"]) * 1000.0
     if dom == "domain4_fia" and "fia_v1" in name:
         return "fia_decode", _eval_fia(cs_bf, sh["B"], sh["S"], sh["Hq"], sh["Hkv"], sh["D"], sh["seq_kv"], window=sh.get("swa", 0))
     if dom == "probe1_c8_sfa":
@@ -499,7 +520,7 @@ def _hotspot_operator(cs, record, name, shape) -> tuple[str, float]:
         raise ModelingError("hotspot_operator_variant_unsupported")
     call = build_aclnn_call({"api": "aclnnMatmul", "dtype": "bf16", "m": shape["M"], "n": shape.get("N", 4096), "k": shape.get("K", 4096)})
     report = graph_costs(cs, {0: call.ops}, recipes=call.recipes, include_submission=False,
-                         isolated=False, fast_span_only=True)
+                         isolated=False, fast_span_only=True, evaluation=_calibrated_evaluation(cs, call.recipes))
     return "gemm_qmm", float(report["duration_ms"]) * 1000.0
 
 
@@ -579,9 +600,15 @@ def evaluate_level1(captures_dir: Path, resolver: _LineageSplitResolver) -> dict
         for row in rows:
             by_family.setdefault(row["family"], []).append(row)
         report_rows = [_display_row(row) for row in rows]
+        families = {f: _stats(v, level="L1") for f, v in sorted(by_family.items())}
+        summary = _stats(rows, level="L1")
+        all_families_pass = bool(families and all(fs.get("status") == "pass" for fs in families.values()))
+        summary["all_families_pass"] = all_families_pass
+        if summary.get("status") == "pass" and not all_families_pass:
+            summary["status"] = "fail"
         out[split] = {
-            "summary": _stats(rows, level="L1"),
-            "families": {f: _stats(v, level="L1") for f, v in sorted(by_family.items())},
+            "summary": summary,
+            "families": families,
             "ids": [row["id"] for row in rows], "records": report_rows,
             "sample_records": report_rows[:SAMPLE_RECORD_LIMIT],
         }
@@ -643,7 +670,7 @@ def _eval_l2_boundary(
             filtered[rep_id] = [replace(op, deps=tuple(d for d in op.deps if d in kept_ids)) for op in kept]
         l2_graphs = filtered
 
-    l2_rep = graph_costs(cs_l2, l2_graphs, external_inputs={"analysis_input": 0}, include_submission=False, isolated=False, fast_span_only=True)
+    l2_rep = graph_costs(cs_l2, l2_graphs, external_inputs={"analysis_input": 0}, include_submission=False, isolated=False, fast_span_only=True, evaluation=_calibrated_evaluation(cs_l2))
     l2_pred_us = float(l2_rep["duration_ms"]) * 1000.0
     return {
         **_timing_fields(l2_pred_us, measured),
@@ -731,7 +758,7 @@ def _eval_model_run(task: tuple[dict[str, Any], str, str, str, str, str]) -> dic
         if step_reason:
             continue
         try:
-            rep = graph_costs(cs, target_graphs(cs, phase=ph, tokens=tok, context=ctx, sequences=seqs, scope="model"), external_inputs={"analysis_input": 0}, include_submission=True, isolated=False, fast_span_only=True)
+            rep = graph_costs(cs, target_graphs(cs, phase=ph, tokens=tok, context=ctx, sequences=seqs, scope="model"), external_inputs={"analysis_input": 0}, include_submission=True, isolated=False, fast_span_only=True, evaluation=_calibrated_evaluation(cs))
             pred_ms = float(rep["duration_ms"])
             phase_result.update(_timing_fields(pred_ms, meas, unit="ms"))
         except ModelingError as exc:
@@ -888,9 +915,15 @@ def main(argv: list[str] | None = None) -> int:
         "fx_matches": report["disjoint_split_verification"]["exact_fx_subgraph_matches"], "wall_seconds": report["wall_seconds"],
     }, indent=2))
     levels = (report["level1_operators"], report["level2_subgraphs_and_blocks"], report["level3_model_steps"])
+    l1_heldout_families = report["level1_operators"]["heldout"].get("families") or {}
+    l1_families_failed = (
+        not l1_heldout_families
+        or any(fam_stats.get("status") != "pass" for fam_stats in l1_heldout_families.values())
+    )
     return int(
         any(level["heldout"]["summary"]["status"] != "pass" or level["unassigned"]["summary"]["total"]
             for level in levels)
+        or l1_families_failed
         or any(row.get("vertical_drilldown", {}).get("passed") is not True
                for row in report["level3_model_steps"]["heldout"]["records"])
     )

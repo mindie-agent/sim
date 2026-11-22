@@ -68,6 +68,7 @@ ARCH35_MACRO_MIN_K = 2048
 
 DEFAULT_CANDIDATES = ((128, 128, 64), (128, 128, 128), (128, 256, 64), (128, 256, 128),
                       (256, 128, 64), (256, 128, 128), (256, 256, 64), (256, 256, 128))
+LEGACY_128_CANDIDATES = ((128, 128, 128), (128, 128, 64))
 NARROW_CANDIDATES = ((16, 16, 64), (32, 16, 64), (64, 16, 64),
                      (16, 32, 64), (32, 32, 64), (64, 32, 64))
 # FP32 projections may expose smaller independent M/N blocks. Ordinary low
@@ -705,15 +706,22 @@ class MappedMatmul:
                   if self.underfilled_candidates is None else self.underfilled_candidates)
         )
         underfilled = underfilled if default_grid < context.core_count else ()
+        use_default_tiling = (
+            self.candidates is None
+            or (
+                pt is not None
+                and tuple(tuple(t) for t in self.candidates) == LEGACY_128_CANDIDATES
+            )
+        )
         candidates = [(tile, False) for tile in
-                      (DEFAULT_CANDIDATES if self.candidates is None else self.candidates)]
+                      (DEFAULT_CANDIDATES if use_default_tiling else self.candidates)]
         if (pt is not None and not is_arch35_context(context) and groups > 1
-                and self.candidates is None and n >= ARCH35_MACRO_MIN_N):
+                and use_default_tiling and n >= ARCH35_MACRO_MIN_N):
             # Upstream DAV_2201 SPLIT_M GroupedMatmul fixes baseN = BEST_BASEN (256)
             # (ops-transformer/gmm/grouped_matmul/op_host/op_tiling/grouped_matmul_tiling.cpp:1693-1738).
             candidates = [(tile, flag) for tile, flag in candidates if tile[1] == ARCH35_MACRO_MIN_N]
         if (pt is not None and not is_arch35_context(context) and groups == 1
-                and self.candidates is None and default_grid < context.core_count):
+                and use_default_tiling and default_grid < context.core_count):
             candidates.extend((tile, True) for tile in DAV2201_SMALL_M_CANDIDATES)
         candidates.extend((tile, True) for tile in narrow)
         candidates.extend((tile, True) for tile in underfilled if tile not in narrow)

@@ -356,7 +356,7 @@ def test_mx_panel_template_alias_topology_and_cache_invalidation():
     from math import ceil, lcm
     from pathlib import Path
     from mindie_sim.prediction.operators.mx_quant_matrix import mxfp4_grouped
-    from mindie_sim.prediction.engine import Allocation, Engine, Resource
+    from mindie_sim.prediction.engine import Engine, Resource
     from mindie_sim.prediction.mechanism import PlannedRecipe
     from mindie_sim.prediction.operators.mx_quant_matrix.mxfp4_geometry import panel_sizes
     from mindie_sim.prediction.operators.mx_quant_matrix.mxfp4_panels import compiled_panels, panel_parts
@@ -570,18 +570,25 @@ def test_grouped_matmul_aclnn_group_list_cache_disable_and_wave_hbm():
 
 def test_uncalibrated_matrix_helpers_return_neutral_defaults():
     from mindie_sim.prediction.call_builders import build_aclnn_call
+    from mindie_sim.prediction.operators.matrix.matrix_mapping import LEGACY_128_CANDIDATES, MappedMatmul
     from mindie_sim.prediction.operators.matrix.matrix_mapping_owners import (
-        matrix_kernel_floor_ms, matrix_kernel_setup_ms,
-        primitive_wave_cold_hbm_per_owner_bps, streamk_fixup_latency_ms,
+        matrix_kernel_floor_ms, matrix_kernel_setup_ms, primitive_cold_hbm_bps,
+        primitive_p05_stride_conflict_bps, primitive_wave_cold_hbm_per_owner_bps, streamk_fixup_latency_ms,
     )
 
     cd = build_aclnn_call({"api": "aclnnMatmul", "dtype": "bf16", "m": 16, "n": 256, "k": 1024})
     _, _, ctx_of = _calibrated_case_and_eval(GEN2_SKU, cd.recipes)
-    ctx = replace(ctx_of(cd.ops[0]), primitive_table=None)
+    cal_ctx = ctx_of(cd.ops[0])
+    assert 0.0 < matrix_kernel_floor_ms(cal_ctx) < matrix_kernel_setup_ms(cal_ctx, is_streamk=True)
+    assert primitive_p05_stride_conflict_bps(cal_ctx, 3 * 16384) == primitive_p05_stride_conflict_bps(cal_ctx, 16384)
+    big_ctx = replace(cal_ctx, op=replace(cd.ops[0], hbm_bytes=512e6))
+    kw = dict(active_cores=cal_ctx.core_count, row_bytes=512, stride_bytes=65536, total_tiles=cal_ctx.core_count, is_grouped=False)
+    assert primitive_cold_hbm_bps(big_ctx, **kw) > primitive_cold_hbm_bps(cal_ctx, **kw)
+    cd_lg = build_aclnn_call({"api": "aclnnMatmul", "dtype": "bf16", "m": 4, "n": 4096, "k": 4096})
+    cal_lg = ctx_of(cd_lg.ops[0])
+    assert MappedMatmul(candidates=LEGACY_128_CANDIDATES).select(cal_lg)[0].tile_n == 256
+    assert MappedMatmul(candidates=LEGACY_128_CANDIDATES).select(replace(cal_lg, primitive_table=None))[0].tile_n == 128
+    ctx = replace(cal_ctx, primitive_table=None)
     assert matrix_kernel_setup_ms(ctx, is_streamk=True, declared_groups=16) == 0.0
-    assert matrix_kernel_floor_ms(ctx) == 0.0
-    assert streamk_fixup_latency_ms(ctx, k_splits=4, used_cores=8) == 0.0
-    assert primitive_wave_cold_hbm_per_owner_bps(
-        ctx, cold_tiles=8, row_bytes=256, stride_bytes=512,
-        is_grouped=False, is_full_row_coalesced=False,
-    ) is None
+    assert matrix_kernel_floor_ms(ctx) == 0.0 and streamk_fixup_latency_ms(ctx, k_splits=4, used_cores=8) == 0.0
+    assert primitive_wave_cold_hbm_per_owner_bps(ctx, cold_tiles=8, row_bytes=256, stride_bytes=512, is_grouped=False, is_full_row_coalesced=False) is None

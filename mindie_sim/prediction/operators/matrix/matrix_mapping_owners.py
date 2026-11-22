@@ -20,6 +20,8 @@ ARCH35_L0C_BYTES = 256 * 1024
 #: L2 cache sector widths for DAV_2201 (512 B) and DAV_3510 (128 B).
 DAV2201_L2_SECTOR_BYTES = 512
 DAV3510_L2_SECTOR_BYTES = 128
+#: P05 L2 bank-stride conflict knee (16 KiB) above which non-pow2 strides alias by gcd(stride, 2^k).
+L2_BANK_STRIDE_KNEE_BYTES = 16 * 1024
 #: DAV_2201 on-the-fly ND->FRACTAL_NZ B transfer runs at 0.5x L0B (64 B/cycle).
 DAV2201_ND2NZ_B_L0B_RATIO = 0.5
 DAV2201_ND2NZ_B_BYTES_PER_CYCLE = 64.0
@@ -34,11 +36,11 @@ NS_PER_MS = 1_000_000.0
 #: Upstream arch35/matmul_v3_basic_streamk_tiling.cpp:124 GetNegPerf cycle model.
 STREAMK_NEG_CYCLES_PER_SPLIT = 60.0
 STREAMK_NEG_BASE_CYCLES = 1000.0
-#: Pure-AIC MatMulV3 kernel init+teardown cycles (bf16_matmulv3_m1_k64_n64: 1.691 us @ 1.65 GHz).
-AIC_MATMUL_KERNEL_INIT_CYCLES = 2790.0
-#: MIX_AIC (AIC+AIV) Stream-K dual-side init+ICachePreLoad+teardown cycles
-#: (int8_quantbatchmatmulv3_m1_k512_n512: 5.795 us @ 1.65 GHz minus GetNegPerf/P13 sync).
-MIX_AIC_STREAMK_INIT_CYCLES = 7000.0
+#: Dual-side AIC + AIV RTS/STARS sub-block launches and FFTS+ sync rounds for MIX_AIC Stream-K kernels.
+MIX_AIC_SUBBLOCK_DISPATCHES = 2.0
+STREAMK_AIV_BARRIER_ROUNDS = 2.0
+STREAMK_AIC_BARRIER_ROUNDS = 2.0
+STREAMK_PAIRED_SYNC_ROUNDS = 4.0
 #: Blocking scalar GM load latency per group in grouped_matmul_kernel.h:314
 #: (groupListGm.GetValue(groupIdx) across declared groupNum).
 GROUP_LIST_SCALAR_LOAD_CYCLES = 200.0
@@ -375,7 +377,12 @@ def primitive_p05_stride_conflict_bps(context, stride_bytes: int) -> float | Non
     curve = params.get("l2_stride_conflict")
     if not curve:
         return None
-    aligned = (int(stride_bytes) % DAV2201_L2_SECTOR_BYTES) == 0
+    stride = int(stride_bytes)
+    aligned = (stride % DAV2201_L2_SECTOR_BYTES) == 0
+    if aligned and stride > L2_BANK_STRIDE_KNEE_BYTES and (stride & (stride - 1)) != 0:
+        # Multiplying a cache-set stride by an odd factor is a bijection modulo 2^k L2 sets;
+        # only its power-of-2 factor gcd(stride, 2^k) = stride & -stride aliases L2 sets.
+        stride = stride & -stride
     kinds = ("contiguous", "pow2") if aligned else ("contiguous", "coprime")
     pts = sorted(
         (int(entry["stride_bytes"]), float(entry["bps_p50"]))
@@ -384,7 +391,6 @@ def primitive_p05_stride_conflict_bps(context, stride_bytes: int) -> float | Non
     )
     if not pts:
         return None
-    stride = int(stride_bytes)
     if stride <= pts[0][0]:
         return pts[0][1]
     if stride >= pts[-1][0]:
@@ -437,14 +443,19 @@ def primitive_l2_params(context) -> tuple[int, int]:
     return l2_bytes, sector
 
 
-def primitive_p13_sync_ms(context, metric: str) -> float:
-    """Calibrated P13 cross-core sync latency in ms (0.0 when absent)."""
+def _primitive_band_ms(context, primitive_id: str, metric: str) -> float:
+    """Calibrated primitive latency band in ms (0.0 when absent or unmeasured)."""
     pt = getattr(context, "primitive_table", None)
     if pt is None:
         return 0.0
     from mindie_sim.primitives.loader import _table_band_p50
-    ns = _table_band_p50(pt, "P13_crosscore_sync", metric)
+    ns = _table_band_p50(pt, primitive_id, metric)
     return float(ns) / NS_PER_MS if ns is not None and float(ns) > 0.0 else 0.0
+
+
+def primitive_p13_sync_ms(context, metric: str) -> float:
+    """Calibrated P13 cross-core sync latency in ms (0.0 when absent)."""
+    return _primitive_band_ms(context, "P13_crosscore_sync", metric)
 
 
 def primitive_nd2nz_mte2_rate_bps_per_aic(
@@ -502,7 +513,7 @@ def primitive_cold_hbm_bps(
     p01_cold = primitive_p01_scaling_bps(context, active_cores, warm=False)
     if p01_cold is None:
         return hbm_rd
-    _, sector = primitive_l2_params(context)
+    l2_bytes, sector = primitive_l2_params(context)
     cores = max(1, int(getattr(context, "core_count", 1) or 1))
     if is_grouped and is_full_row_coalesced:
         waves = float(math.ceil(max(1, int(total_tiles)) / cores))
@@ -516,17 +527,25 @@ def primitive_cold_hbm_bps(
             steady = (waves - GROUPED_HBM_RAMP_WAVES) / hbm_rd
             return waves / (ramp + steady)
         return ramp_bw
+    op = getattr(context, "op", None)
+    op_hbm_bytes = float(getattr(op, "hbm_bytes", 0.0) or 0.0) if op is not None else 0.0
+    # Upstream CANN CACHE_MODE_DISABLE (grouped_no_quant_matmul_tiling.cpp:193 / P05.cache_disable_supported):
+    # weights exceeding L2 capacity bypass L2 allocation, eliminating P05 L2 stride conflict; on DAV_3510
+    # va_bits_62_60 bypass also avoids the DAV_2201 strided L2-sector ceiling.
+    cache_disable = bool(l2_bytes > 0 and op_hbm_bytes >= float(l2_bytes))
     sector_eff = min(1.0, float(max(1, int(row_bytes))) / float(max(1, sector)))
     cap = p01_cold * sector_eff
     if hbm_rd is not None:
         cap = min(cap, hbm_rd)
     if row_bytes < stride_bytes:
-        strided = primitive_p01_strided_cold_bps(context, row_bytes, stride_bytes)
-        if strided is not None:
-            cap = min(cap, strided)
-        stride_conflict = primitive_p05_stride_conflict_bps(context, stride_bytes)
-        if stride_conflict is not None:
-            cap = min(cap, stride_conflict)
+        if not (cache_disable and is_arch35_context(context)):
+            strided = primitive_p01_strided_cold_bps(context, row_bytes, stride_bytes)
+            if strided is not None:
+                cap = min(cap, strided)
+        if not cache_disable:
+            stride_conflict = primitive_p05_stride_conflict_bps(context, stride_bytes)
+            if stride_conflict is not None:
+                cap = min(cap, stride_conflict)
         return cap
     return min(hbm_rd, cap) if hbm_rd is not None else cap
 
@@ -608,35 +627,63 @@ def streamk_fixup_latency_ms(
     return neg_ms + sync_ms
 
 
+def _pure_aic_launch_ms(context) -> float:
+    """Pure-AIC RTS/STARS dispatch + Cube pipe fill/drain + stream completion from L0 primitives."""
+    issue_ms = _primitive_band_ms(context, "P15_rts_stars", "issue_interval_ns")
+    pipe_ms = (
+        _primitive_band_ms(context, "P02_load_data", "setup_ns")
+        + _primitive_band_ms(context, "P03_fixpipe", "setup_ns")
+    )
+    event_ms = _primitive_band_ms(context, "P16_multistream_core_control", "stream_event_ns")
+    return issue_ms + pipe_ms + event_ms
+
+
+def _mix_aic_launch_ms(context) -> float:
+    """MIX_AIC Stream-K dual-side launch + FFTS+ cross-core sync from L0 P02/P03/P13/P15/P16."""
+    issue_ms = _primitive_band_ms(context, "P15_rts_stars", "issue_interval_ns")
+    pipe_ms = (
+        _primitive_band_ms(context, "P02_load_data", "setup_ns")
+        + _primitive_band_ms(context, "P03_fixpipe", "setup_ns")
+    )
+    event_ms = _primitive_band_ms(context, "P16_multistream_core_control", "stream_event_ns")
+    aiv_bar = primitive_p13_sync_ms(context, "mode0_aiv_barrier_ns")
+    aic_bar = primitive_p13_sync_ms(context, "mode0_aic_barrier_ns") or aiv_bar
+    paired = primitive_p13_sync_ms(context, "mode2_paired_ns")
+    return (
+        MIX_AIC_SUBBLOCK_DISPATCHES * issue_ms
+        + pipe_ms
+        + event_ms
+        + STREAMK_AIV_BARRIER_ROUNDS * aiv_bar
+        + STREAMK_AIC_BARRIER_ROUNDS * aic_bar
+        + STREAMK_PAIRED_SYNC_ROUNDS * paired
+    )
+
+
 def matrix_kernel_setup_ms(
     context, *, is_streamk: bool = False, declared_groups: int = 1,
 ) -> float:
-    """Additive device-side setup: MIX_AIC Stream-K init, DAV_3510 init, and groupListGm scan."""
+    """Additive device-side setup from calibrated L0 primitives + groupListGm scalar scan."""
     if getattr(context, "primitive_table", None) is None:
         return 0.0
-    clock_hz = primitive_core_clock_hz(context)
-    if clock_hz is None or clock_hz <= 0.0:
-        return 0.0
     if is_streamk:
-        init_cycles = MIX_AIC_STREAMK_INIT_CYCLES
+        base_ms = _mix_aic_launch_ms(context)
     elif is_arch35_context(context):
-        init_cycles = AIC_MATMUL_KERNEL_INIT_CYCLES
+        base_ms = _pure_aic_launch_ms(context)
     else:
-        # On DAV_2201 pure-AIC MatMulV3, AIC init overlaps steady execution and
+        # On DAV_2201 pure-AIC MatMulV3, AIC launch overlaps steady execution and
         # acts as an inclusive minimum_ms floor (see matrix_kernel_floor_ms).
-        init_cycles = 0.0
-    scan_cycles = (
-        float(declared_groups) * GROUP_LIST_SCALAR_LOAD_CYCLES
-        if int(declared_groups) > 1 else 0.0
+        base_ms = 0.0
+    clock_hz = primitive_core_clock_hz(context)
+    scan_ms = (
+        (float(declared_groups) * GROUP_LIST_SCALAR_LOAD_CYCLES / clock_hz) * MS_PER_SECOND
+        if (int(declared_groups) > 1 and clock_hz is not None and clock_hz > 0.0)
+        else 0.0
     )
-    return ((init_cycles + scan_cycles) / clock_hz) * MS_PER_SECOND
+    return base_ms + scan_ms
 
 
 def matrix_kernel_floor_ms(context) -> float:
-    """Inclusive pure-AIC kernel floor (bf16_matmulv3_m1_k64_n64: 2790 cycles)."""
+    """Inclusive pure-AIC kernel floor from calibrated L0 P15/P02/P03/P16 primitives."""
     if getattr(context, "primitive_table", None) is None:
         return 0.0
-    clock_hz = primitive_core_clock_hz(context)
-    if clock_hz is None or clock_hz <= 0.0:
-        return 0.0
-    return (AIC_MATMUL_KERNEL_INIT_CYCLES / clock_hz) * MS_PER_SECOND
+    return _pure_aic_launch_ms(context)
