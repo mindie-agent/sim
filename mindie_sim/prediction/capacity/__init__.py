@@ -49,7 +49,6 @@ from .cache import _MemoryCacheMixin
 from .contracts import (
     MemoryPolicy,
     _HoldSnapshot,
-    _LedgerBoundary,
     _PhysicalRef,
     _normalise_owner_spans,
 )
@@ -269,6 +268,16 @@ class Memory(
             max(0.0, total - payload)
             for total, payload in zip(self.weights, self.weights_payload)
         ]
+        if case.runtime.engram_cpu_offload and case.model.engram is not None:
+            from mindie_sim.catalog.weights import engram_table_terms
+            quant = case.model.quant or QuantSpec("bf16")
+            table_bytes = float(sum(
+                term_bytes(term, quant, p, case.machine.ranks_per_node)
+                for term in engram_table_terms(case.model)
+            ))
+            self.engram_host_dram_bytes = [table_bytes] * p.pp
+        else:
+            self.engram_host_dram_bytes = [0.0] * p.pp
 
     def _init_workspace_capacity(self, case, p, workspace_tokens):
         async_enabled = bool(case.runtime.async_scheduling)

@@ -7,9 +7,19 @@
 [Side-Effect Policy] Pure transformation."""
 from __future__ import annotations
 
+from dataclasses import replace
+from types import SimpleNamespace
 from typing import Any, Iterable, Mapping, Sequence
 
-from mindie_sim.schema.common import ModelingError
+from mindie_sim.catalog.ops import comm_op
+from mindie_sim.catalog.projection_placement import (
+    ROLE_ATTENTION_INPUT, ROLE_DENSE_MLP_DOWN, ROLE_DENSE_MLP_UP,
+    ROLE_DRAFT_LOGITS, ROLE_LINEAR_INPUT, ROLE_LOGITS,
+    ROLE_SHARED_EXPERT_DOWN, ROLE_SHARED_EXPERT_UP,
+    _padded_local, role_from_category, role_width,
+)
+from mindie_sim.schema.common import ModelingError, align_up, dtype_bytes
+from mindie_sim.schema.operators import OpSpec
 from mindie_sim.schema.runtime_features import LOCAL_TP_AXIS_NAMES
 
 
@@ -39,7 +49,7 @@ def _stage_rank_buckets(
     topology = Topology(machine, parallel)
     buckets: dict[tuple[int, int, int, int], list[int]] = {}
     ext_dp = max(1, int(getattr(parallel, "external_dp", 1) or 1))
-    internal_replicas = max(1, int(parallel.dp) * int(parallel.active_pcp_lanes))
+    internal_replicas = max(1, int(parallel.dp))
     devices = _device_map(machine)
     tp = max(1, int(parallel.tp))
     lane_stride = max(1, int(stride))
@@ -121,7 +131,7 @@ def local_tp_cohorts(
     topology = Topology(machine, parallel)
     edges: list[tuple[int, int]] = []
     ext_dp = max(1, int(getattr(parallel, "external_dp", 1) or 1))
-    replicas = max(1, ext_dp * int(parallel.dp) * int(parallel.active_pcp_lanes))
+    replicas = max(1, ext_dp * int(parallel.dp))
     cp_spans = bool(getattr(parallel, "cp_spans_dp", False))
     tp = max(1, int(parallel.tp))
     for stage in range(max(1, int(parallel.pp))):
@@ -193,7 +203,7 @@ def validate_local_projection_tp(case: Any) -> None:
     ext_dp = max(1, int(getattr(parallel, "external_dp", 1) or 1))
     expected = {
         rank
-        for replica in range(max(1, ext_dp * int(parallel.dp) * int(parallel.active_pcp_lanes)))
+        for replica in range(max(1, ext_dp * int(parallel.dp)))
         for stage in range(max(1, int(parallel.pp)))
         for rank in topology.ranks(replica, stage)
     }
@@ -241,8 +251,12 @@ def local_tp_spans_dp(parallel: Any) -> bool:
 
 def rank_zero_graph_reuse(parallel: Any, replicas: int, has_device_group: bool) -> bool:
     """Legacy rank-zero graph reuse remains valid only without cross-DP groups."""
+    ep_tp_w = max(1, int(parallel.tp) // max(1, int(getattr(parallel, "etp", 1) or 1)))
+    ep_spans_pcp = int(parallel.pcp) > 1 and int(parallel.ep) > int(parallel.dp) * ep_tp_w
+    ep_intra_w = ep_tp_w * int(parallel.pcp) if ep_spans_pcp else ep_tp_w
+    ep_spans_dp = bool(parallel.ep_spans_dp) or (int(parallel.ep) > ep_intra_w)
     return (int(replicas) > 1 and not has_device_group
-            and not parallel.ep_spans_dp
+            and not ep_spans_dp
             and not bool(getattr(parallel, "cp_spans_dp", False))
             and not local_tp_spans_dp(parallel))
 
@@ -303,14 +317,15 @@ def collective_requires_cohort(op: Any, topology: Any) -> bool:
     metadata = dict(getattr(op, "metadata", ()) or ())
     parallel = topology.parallel
     stage = int(metadata.get("source_stage", getattr(op, "stage", 0)))
-    replicas = max(1, int(parallel.dp) * int(parallel.active_pcp_lanes))
+    ext_dp = max(1, int(getattr(parallel, "external_dp", 1) or 1))
+    replicas = max(1, ext_dp * int(parallel.dp))
     owner: dict[int, int] = {}
     for replica in range(replicas):
         for rank in topology.ranks(replica, stage):
             owner[int(rank)] = replica
     axis = str(metadata.get("group_axis", "tp"))
     if axis not in {
-        "cp", "dcp_tp", "dcp_pcp", "dcp_dp", "dcp_a2a",
+        "cp", "dcp", "dcp_tp", "dcp_pcp", "dcp_dp", "dcp_a2a",
         "etp", "pcp", "ep", "tp", "dp", LOCAL_TP_AXIS,
     }:
         return False
@@ -320,11 +335,6 @@ def collective_requires_cohort(op: Any, topology: Any) -> bool:
         groups: Sequence[Sequence[int]] = (tuple(declared),)
     elif axis == "etp":
         groups = expert_tp_groups(topology, replica=rep, stage=stage)
-    elif axis == "dp":
-        dp_count = max(1, int(parallel.dp))
-        rows = [tuple(int(rk) for rk in topology.ranks(r, stage)) for r in range(dp_count)]
-        width = min((len(row) for row in rows), default=0)
-        groups = tuple(tuple(rows[r][off] for r in range(dp_count)) for off in range(width))
     else:
         groups = tuple(topology.groups(axis, rep, stage, metadata=metadata))
     for group in groups:
@@ -334,20 +344,6 @@ def collective_requires_cohort(op: Any, topology: Any) -> bool:
             return True
     return False
 
-
-from dataclasses import replace
-from types import SimpleNamespace
-from typing import Any, Mapping, Sequence
-
-from mindie_sim.catalog.ops import comm_op
-from mindie_sim.catalog.projection_placement import (
-    ROLE_ATTENTION_INPUT, ROLE_DENSE_MLP_DOWN, ROLE_DENSE_MLP_UP,
-    ROLE_DRAFT_LOGITS, ROLE_LINEAR_INPUT, ROLE_LOGITS,
-    ROLE_SHARED_EXPERT_DOWN, ROLE_SHARED_EXPERT_UP,
-    _padded_local, role_from_category, role_width,
-)
-from mindie_sim.schema.common import ModelingError, align_up, dtype_bytes
-from mindie_sim.schema.operators import OpSpec
 
 ALIGN_ELEMENT = 16
 FALLBACK_ACTIVATION = "bf16"
@@ -549,6 +545,8 @@ def _transport_metadata(op: OpSpec, *, role: str, group: Sequence[int], width: i
     kept = {k: src[k] for k in _TRANSPORT_KEEP_META if k in src}
     kept.update({
         "collective": family, "group_axis": SDK_PLACEMENT,
+        "comm_axis": "tp",
+        "comm_group_size": int(len(group) or width),
         "group_ranks": tuple(int(rank) for rank in group),
         "local_tp_width": int(width), "projection_role": role,
         "placement_scope": str(src.get("placement_scope") or src.get("layer_scope") or scope or "target"),

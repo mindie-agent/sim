@@ -449,3 +449,139 @@ class PairwiseCollective:
         plan.validate_path_model(self.path_model)
         return KernelProgram((Stage("pairwise", program=plan),),
                              minimum_ms=context.minimum_ms)
+
+
+@dataclass(frozen=True)
+class OneShotGroup:
+    """Single-round concurrent direct collective conserving physical wire bytes.
+
+    All remote peers transmit concurrently in one round over their routed links.
+    ``startup_ms`` carries the hardware-derived AIV/CCU kernel launch floor
+    (from SKU ``kernel_invocations["vector"]`` / L0 ``P15``+``P16``) charged
+    once at the joint synchronization boundary; each routed hop still pays its
+    own physical propagation latency ``hop.latency_ms`` and link bandwidth.
+    """
+
+    ranks: tuple[int, ...]
+    messages: tuple[RoutedMessage, ...]
+    startup_ms: float = 0.0
+
+    def start(self, engine, name, ready, *, owner=""):
+        events = self.start_participants(
+            engine, name, {rank: ready for rank in self.ranks}, owner=owner)
+        return _joint_complete(engine, name, events.values(), ready, owner)
+
+    def start_participants(self, engine, name, ready_by_rank, *, owner=""):
+        initial = _ready_by_rank(self.ranks, ready_by_rank)
+        if not self.ranks:
+            return {}
+        if not self.messages or not any(
+                message.flow.useful_bytes for message in self.messages):
+            return initial
+        rank_set = set(self.ranks)
+        if len(rank_set) != len(self.ranks):
+            raise ModelingError("oneshot_collective_duplicate_rank")
+        for message in self.messages:
+            src, dst = message.flow.source, message.flow.destination
+            if src == dst or src not in rank_set or dst not in rank_set:
+                raise ModelingError(
+                    f"oneshot_collective_message_endpoint_invalid:{src}>{dst}")
+        joint_ready = engine.submit(
+            f"{name}:sync", after=tuple(initial[rank] for rank in self.ranks),
+            latency=float(self.startup_ms or 0.0), owner=owner,
+        )
+        arrivals = []
+        for index, message in enumerate(self.messages):
+            if not message.flow.useful_bytes:
+                continue
+            prefix = (
+                f"{name}:m{index}:r{message.flow.source}"
+                f">{message.flow.destination}:oneshot"
+            )
+            previous = joint_ready
+            for hop_index, hop in enumerate(message.hops):
+                service = engine.submit(
+                    f"{prefix}:hop{hop_index}:service", hop.demand,
+                    after=(previous,), owner=owner, coupled=True,
+                )
+                previous = engine.submit(
+                    f"{prefix}:hop{hop_index}:arrival", after=(service,),
+                    latency=hop.latency_ms, owner=owner,
+                )
+            arrivals.append(previous)
+        done = engine.submit(
+            f"{name}:barrier", after=tuple(arrivals) if arrivals else (joint_ready,),
+            owner=owner,
+        )
+        return {rank: done for rank in self.ranks}
+
+
+@dataclass(frozen=True)
+class OneShotPlan:
+    """Single-round concurrent plan over one or more disjoint collective groups."""
+
+    family: str
+    groups: tuple[OneShotGroup, ...]
+
+    @property
+    def ranks(self):
+        return tuple(sorted({rank for group in self.groups for rank in group.ranks}))
+
+    def start(self, engine, name, ready, *, owner=""):
+        events = self.start_participants(
+            engine, name, {rank: ready for rank in self.ranks}, owner=owner)
+        return _joint_complete(engine, name, events.values(), ready, owner)
+
+    def start_participants(self, engine, name, ready_by_rank, *, owner=""):
+        _ready_by_rank(self.ranks, ready_by_rank)
+        events = {}
+        for index, group in enumerate(self.groups):
+            part = group.start_participants(
+                engine, f"{name}:group{index}",
+                {rank: ready_by_rank[rank] for rank in group.ranks}, owner=owner)
+            overlap = set(events) & set(part)
+            if overlap:
+                raise ModelingError(
+                    "oneshot_collective_rank_accounted_twice:"
+                    + ",".join(map(str, sorted(overlap))))
+            events.update(part)
+        if set(events) != set(self.ranks):
+            raise ModelingError("oneshot_collective_group_completion_missing")
+        return events
+
+    def validate_path_model(self, path_model):
+        if path_model not in {"direct", "store_forward"}:
+            raise ModelingError(
+                f"oneshot_collective_path_model_unsupported:{path_model}")
+        if path_model == "direct" and any(
+                len(message.hops) != 1
+                for group in self.groups for message in group.messages):
+            raise ModelingError(
+                "oneshot_collective_multihop_requires_store_forward_declaration")
+
+
+@dataclass(frozen=True)
+class OneShotCollective:
+    """Single-round concurrent collective using SKU-declared link ports and hop latency."""
+
+    path_model: str = "store_forward"
+    algorithm: ClassVar[str] = "oneshot"
+
+    def lower(self, context):
+        from ..program import KernelProgram, Stage
+
+        if any(amount for role, amount in context.native_work.items() if role != "link"):
+            raise ModelingError("oneshot_collective_requires_transport_only_work")
+        if self.path_model not in {"direct", "store_forward"}:
+            raise ModelingError(
+                f"oneshot_collective_path_model_unsupported:{self.path_model}")
+        if context.collective_plan is None:
+            if not context.native_work.get("link"):
+                return KernelProgram((), minimum_ms=context.minimum_ms)
+            raise ModelingError("oneshot_collective_requires_bound_topology")
+        if not context.native_work.get("link"):
+            return KernelProgram((), minimum_ms=context.minimum_ms)
+        plan = context.collective_plan()
+        plan.validate_path_model(self.path_model)
+        return KernelProgram((Stage("oneshot", program=plan),),
+                             minimum_ms=context.minimum_ms)

@@ -59,6 +59,9 @@ from .protocol import (
     submit_lowered_collective,
 )
 from .ring_pairwise import (
+    OneShotCollective,
+    OneShotGroup,
+    OneShotPlan,
     PairwiseCollective,
     PairwiseGroup,
     PairwisePlan,
@@ -105,6 +108,9 @@ __all__ = [
     "LoweredPhase",
     "LoweredTransfer",
     "MID_BAND_UPPER_EXCLUSIVE",
+    "OneShotCollective",
+    "OneShotGroup",
+    "OneShotPlan",
     "PairKey",
     "PairwiseCollective",
     "PairwiseGroup",

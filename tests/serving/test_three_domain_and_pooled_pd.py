@@ -529,3 +529,117 @@ def test_kimi_k31_five_live_correctness_regressions():
     c_unmerged = compose_case("kimi-k3.1", "950dt-96g-pod", feature_track="unmerged_pr", **common)
     step_unmerged = sdk_api.evaluate_step(c_unmerged, StepRequest(phase="decode", tokens=6, context=131584, sequences=8, scope="model"))
     assert step_unmerged.span_ms > 0.0
+
+
+def test_memory_hbm_pools_draft_cap_engram_offload_and_pd_runtime_sharding():
+    """Verify HBM cache pool conservation, draft_max_model_len cap, Engram CPU offload, and PD runtime sharding."""
+    from mindie_sim.prediction.capacity import Memory
+    from mindie_sim.prediction.efficiency.sla import _vram_max_sequences_per_dp
+
+    # 1) 128K Kimi-K3.1 950DT 96G (DP4 TP8 EP32 DCP8, K=5, FP8 KV/Indexer):
+    #    target MLA KV + DSA Indexer K + KDA [K+1] SSM slots + Draft KV all accounted & conserved.
+    base_k31 = dict(
+        dp=4, tp=8, dcp=8, ep=32, role="pd_decode",
+        prompt_tokens=131072, output_tokens=1024,
+        mtp_proposal_tokens=5, mtp_acceptance_length=3.5,
+        kv_cache_dtype="fp8", indexer_kv_dtype="fp8",
+        max_num_seqs=128, max_num_batched_tokens=1024,
+    )
+    c_k5 = parse_case(compose_case("kimi-k3.1", "950dt-96g-pod", feature_track="merged", **base_k31))
+    mem_k5 = Memory(c_k5)
+    seq_len = 131072 + 1024
+    bd_k5 = mem_k5.cache_pool_breakdown(seq_len, padded=True)
+    assert bd_k5["query_tokens"] == 6
+    assert bd_k5["target_kv_bytes"] > 0.0
+    assert bd_k5["indexer_k_bytes"] > 0.0
+    assert bd_k5["recurrent_state_bytes"] > 0.0
+    assert bd_k5["draft_kv_bytes"] > 0.0
+    pool_sum = (
+        bd_k5["target_kv_bytes"] + bd_k5["indexer_k_bytes"]
+        + bd_k5["recurrent_state_bytes"] + bd_k5["draft_kv_bytes"]
+        + bd_k5["draft_state_bytes"] + bd_k5["page_reserve_bytes"]
+        + bd_k5["page_metadata_bytes"]
+    )
+    assert pool_sum == pytest.approx(bd_k5["total_bytes"])
+    assert bd_k5["total_bytes"] == pytest.approx(sum(mem_k5.cache_bytes(seq_len, padded=True)))
+    # Realistic 128K capacity on 950DT-96G (~24-36 seqs/DP, never 75).
+    max_seqs = _vram_max_sequences_per_dp(c_k5, context=131072, tokens_per_seq=6, output_budget=1024)
+    assert 20 <= max_seqs <= 36
+
+    # K+1 speculative SSM state scales up with K=7 and drops sharply under recover_ssm=True.
+    c_k7 = parse_case(compose_case(
+        "kimi-k3.1", "950dt-96g-pod", feature_track="merged", **{**base_k31, "mtp_proposal_tokens": 7},
+    ))
+    bd_k7 = Memory(c_k7).cache_pool_breakdown(seq_len, padded=True)
+    assert bd_k7["query_tokens"] == 8
+    assert bd_k7["recurrent_state_bytes"] > bd_k5["recurrent_state_bytes"]
+
+    c_rec = parse_case(compose_case(
+        "kimi-k3.1", "950dt-96g-pod", feature_track="unmerged_pr", **base_k31,
+    ))
+    bd_rec = Memory(c_rec).cache_pool_breakdown(seq_len, padded=True)
+    assert bd_rec["recurrent_state_bytes"] < bd_k5["recurrent_state_bytes"]
+
+    # 2) Non-paired_sfa draft KV cap (draft_max_model_len=4096) shrinks cache_bytes & conserves rank views.
+    raw_uncapped = compose_case(
+        "deepseek-v3.2", "950dt-96g-pod", layers=4,
+        dp=1, tp=4, dcp=4, ep=4, role="pd_decode",
+        prompt_tokens=65536, output_tokens=1024,
+        mtp_proposal_tokens=3, mtp_acceptance_length=2.5,
+    )
+    raw_capped = compose_case(
+        "deepseek-v3.2", "950dt-96g-pod", layers=4,
+        dp=1, tp=4, dcp=4, ep=4, role="pd_decode",
+        prompt_tokens=65536, output_tokens=1024,
+        mtp_proposal_tokens=3, mtp_acceptance_length=2.5,
+    )
+    raw_capped["runtime"]["metadata"]["draft_max_model_len"] = 4096
+    mem_uncapped = Memory(parse_case(raw_uncapped))
+    mem_capped = Memory(parse_case(raw_capped))
+    bd_uncapped = mem_uncapped.cache_pool_breakdown(65536, padded=True)
+    bd_capped = mem_capped.cache_pool_breakdown(65536, padded=True)
+    assert bd_capped["draft_context_cap"] == 4096
+    assert bd_capped["draft_kv_bytes"] < bd_uncapped["draft_kv_bytes"]
+    assert sum(mem_capped.cache_bytes(65536, padded=True)) < sum(mem_uncapped.cache_bytes(65536, padded=True))
+    rank_views = mem_capped.rank_cache_allocation(65536)
+    assert len(rank_views) == 4
+    expected_capped = sum(mem_capped.cache_bytes(65536, padded=True))
+    assert all(sum(view["allocated"]["total_bytes_per_stage_rank"]) == pytest.approx(expected_capped) for view in rank_views)
+
+    # 3) Engram CPU offload excludes Engram tables from HBM weights and records engram_host_dram_bytes.
+    raw_eng_off = compose_case(
+        "deepseek-v4.1-flash", "950dt-96g-pod", layers=4, dp=1, tp=4, ep=4,
+        prompt_tokens=4096, output_tokens=64, engram_cpu_offload=False,
+    )
+    raw_eng_on = compose_case(
+        "deepseek-v4.1-flash", "950dt-96g-pod", layers=4, dp=1, tp=4, ep=4,
+        prompt_tokens=4096, output_tokens=64, engram_cpu_offload=True,
+    )
+    mem_eng_off = Memory(parse_case(raw_eng_off))
+    mem_eng_on = Memory(parse_case(raw_eng_on))
+    assert sum(mem_eng_on.weights) < sum(mem_eng_off.weights)
+    assert sum(mem_eng_on.engram_host_dram_bytes) > 0.0
+    assert sum(mem_eng_off.engram_host_dram_bytes) == 0.0
+    assert mem_eng_on.cache_pool_breakdown(4096)["engram_host_dram_bytes"] > 0.0
+
+    # 4) PD handoff honors runtime dcp_indexer_sharded and excludes target speculative SSM slots from draft_kv_bytes.
+    p_pd = compose_case(
+        "kimi-k3.1", "950dt-96g-pod", layers=4, dp=1, pp=1, pcp=4, tp=1, ep=4,
+        role="pd_prefill", prompt_tokens=4096, output_tokens=64, mtp_proposal_tokens=5,
+    )
+    d_pd_rep = compose_case(
+        "kimi-k3.1", "950dt-96g-pod", layers=4, dp=1, pp=1, tp=4, dcp=4, ep=4,
+        role="pd_decode", prompt_tokens=4096, output_tokens=64, mtp_proposal_tokens=5,
+    )
+    d_pd_shd = compose_case(
+        "kimi-k3.1", "950dt-96g-pod", layers=4, dp=1, pp=1, tp=4, dcp=4, ep=4,
+        role="pd_decode", prompt_tokens=4096, output_tokens=64, mtp_proposal_tokens=5,
+    )
+    d_pd_rep["runtime"]["metadata"]["dcp_indexer_sharded"] = False
+    d_pd_shd["runtime"]["metadata"]["dcp_indexer_sharded"] = True
+    plan_rep = compute_pd_handoff_plan(p_pd, d_pd_rep, tokens=4096)
+    plan_shd = compute_pd_handoff_plan(p_pd, d_pd_shd, tokens=4096)
+    assert plan_shd["total_transfer_bytes"] < plan_rep["total_transfer_bytes"]
+    d_mem_shd = Memory(parse_case(d_pd_shd))
+    bd_unpad_q1 = d_mem_shd.cache_pool_breakdown(4096, padded=False, query_tokens=1)
+    assert plan_shd["draft_kv_bytes"] == pytest.approx(bd_unpad_q1["draft_kv_bytes"] * 4.0)
