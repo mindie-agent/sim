@@ -604,6 +604,111 @@ def build_triton_chunk_kda(
     )
 
 
+def _lower_recurrent_kda(
+    ctx: OperatorPlanningContext,
+    rc: RecipeContext,
+    *,
+    aivs: tuple[int, ...],
+    active_aivs: int,
+    waves: int,
+    total_progs: int,
+    max_q: int,
+    total_hbm_read: float,
+    total_hbm_write: float,
+    total_mte2_aiv: float,
+    total_l2_hits: float,
+    has_l2_rate: bool,
+    decay_alu: float,
+    sfu_ops: float,
+    dot1_red: float,
+    update_alu: float,
+    dot2_red: float,
+    ht_mte3_total: float,
+) -> KernelProgram:
+    reduce_ratio = _reduce_rate_ratio(rc)
+    sfu_ratio = _sfu_rate_ratio(rc)
+    flag_ms = max_q * REC_FLAGS_PER_TOKEN * p12_flag_ms(rc)
+
+    def _block_stages(k_progs: int, grp_aivs: tuple[int, ...], pfx: str = "") -> tuple[Stage, ...]:
+        share = k_progs / float(total_progs)
+        w_load = Work(resources={
+            "hbm": total_hbm_read * share,
+            "mte2_aiv": total_mte2_aiv * share,
+            **({"l2": total_l2_hits * share} if (total_l2_hits and has_l2_rate) else {}),
+        })
+        s0 = bind_phase(Phase(f"{pfx}rec_load", w_load), rc, ctx, (), grp_aivs)
+        s1 = bind_phase(
+            Phase(f"{pfx}rec_decay_alu", Work(resources={"vector": decay_alu * share}), (s0.name,)),
+            rc, ctx, (), grp_aivs,
+        )
+        s2 = _cap_vec_stage(
+            bind_phase(Phase(f"{pfx}rec_decay_sfu", Work(resources={"vector": sfu_ops * share}), (s1.name,)),
+                       rc, ctx, (), grp_aivs),
+            rc, sfu_ratio,
+        )
+        s3 = _cap_vec_stage(
+            bind_phase(Phase(f"{pfx}rec_dot1_reduce", Work(resources={"vector": dot1_red * share}), (s2.name,)),
+                       rc, ctx, (), grp_aivs),
+            rc, reduce_ratio,
+        )
+        s4 = bind_phase(
+            Phase(f"{pfx}rec_update_alu", Work(resources={"vector": update_alu * share}), (s3.name,)),
+            rc, ctx, (), grp_aivs,
+        )
+        s5 = _cap_vec_stage(
+            bind_phase(Phase(f"{pfx}rec_dot2_reduce", Work(resources={"vector": dot2_red * share}), (s4.name,)),
+                       rc, ctx, (), grp_aivs),
+            rc, reduce_ratio,
+        )
+        w_store = Work(resources={"hbm": total_hbm_write * share, "mte3": ht_mte3_total * share})
+        s6 = bind_phase(Phase(f"{pfx}rec_store", w_store, (s5.name,)), rc, ctx, (), grp_aivs)
+        if flag_ms > 0.0:
+            return (s0, s1, s2, s3, s4, s5, s6, _fixed_stage(f"{pfx}rec_sync", flag_ms, after=(s6.name,)))
+        return (s0, s1, s2, s3, s4, s5, s6)
+
+    def _group_prog(grp_aivs: tuple[int, ...], grp_progs: int, pfx: str) -> KernelProgram:
+        g_n = len(grp_aivs)
+        g_full, g_rem = divmod(grp_progs, g_n)
+        stages_g: list[Stage] = []
+        prev_g: tuple[str, ...] = ()
+        if g_full > 0:
+            body = (
+                KernelProgram(_block_stages(g_n, grp_aivs, pfx))
+                if g_full == 1
+                else compact_periodic_pipeline(
+                    rc, g_full, 1, lambda _i, g_n=g_n, ga=grp_aivs, p=pfx: _block_stages(g_n, ga, p),
+                    head=COMPACT_WINDOW, tail=COMPACT_WINDOW, threshold=COMPACT_THRESHOLD,
+                )
+            )
+            stages_g.append(Stage(f"{pfx}full", program=body))
+            prev_g = (f"{pfx}full",)
+        if g_rem > 0:
+            stages_g.append(Stage(
+                f"{pfx}tail", after=prev_g, program=KernelProgram(_block_stages(g_rem, grp_aivs[:g_rem], f"{pfx}t_")),
+            ))
+        return KernelProgram(tuple(stages_g))
+
+    if active_aivs < REC_ASYNC_GROUPS or waves <= 1:
+        return _group_prog(aivs[:active_aivs], total_progs, "g0_")
+    # Two independent AIV halves keep T=1 load->vec->store serial per AIV while staggering HBM.
+    mid = active_aivs // REC_ASYNC_GROUPS
+    a_aivs, b_aivs = aivs[:mid], aivs[mid:active_aivs]
+    a_progs = (total_progs * len(a_aivs)) // active_aivs
+    b_progs = total_progs - a_progs
+    a_head = _block_stages(len(a_aivs), a_aivs, "ga0_")
+    a_rem_progs = a_progs - len(a_aivs)
+    if a_rem_progs <= 0:
+        return KernelProgram((
+            Stage("triton_rec_half_a", program=KernelProgram(a_head)),
+            Stage("triton_rec_half_b", program=_group_prog(b_aivs, b_progs, "gb_")),
+        ))
+    return KernelProgram((
+        *a_head,
+        Stage("triton_rec_half_a_rest", after=(a_head[-1].name,), program=_group_prog(a_aivs, a_rem_progs, "ga_")),
+        Stage("triton_rec_half_b", after=(a_head[0].name,), program=_group_prog(b_aivs, b_progs, "gb_")),
+    ))
+
+
 def build_triton_recurrent_kda(
     c: LinearAttentionContract, ctx: OperatorPlanningContext,
 ) -> OperatorPlan:
@@ -676,88 +781,14 @@ def build_triton_recurrent_kda(
     )
 
     def lower(rc: RecipeContext) -> KernelProgram:
-        reduce_ratio = _reduce_rate_ratio(rc)
-        sfu_ratio = _sfu_rate_ratio(rc)
-        flag_ms = max_q * REC_FLAGS_PER_TOKEN * p12_flag_ms(rc)
-
-        def _block_stages(k_progs: int, grp_aivs: tuple[int, ...], pfx: str = "") -> tuple[Stage, ...]:
-            share = k_progs / float(total_progs)
-            w_load = Work(resources={
-                "hbm": total_hbm_read * share,
-                "mte2_aiv": total_mte2_aiv * share,
-                **({"l2": total_l2_hits * share} if (total_l2_hits and has_l2_rate) else {}),
-            })
-            s0 = bind_phase(Phase(f"{pfx}rec_load", w_load), rc, ctx, (), grp_aivs)
-            s1 = bind_phase(
-                Phase(f"{pfx}rec_decay_alu", Work(resources={"vector": decay_alu * share}), (s0.name,)),
-                rc, ctx, (), grp_aivs,
-            )
-            s2 = _cap_vec_stage(
-                bind_phase(Phase(f"{pfx}rec_decay_sfu", Work(resources={"vector": sfu_ops * share}), (s1.name,)),
-                           rc, ctx, (), grp_aivs),
-                rc, sfu_ratio,
-            )
-            s3 = _cap_vec_stage(
-                bind_phase(Phase(f"{pfx}rec_dot1_reduce", Work(resources={"vector": dot1_red * share}), (s2.name,)),
-                           rc, ctx, (), grp_aivs),
-                rc, reduce_ratio,
-            )
-            s4 = bind_phase(
-                Phase(f"{pfx}rec_update_alu", Work(resources={"vector": update_alu * share}), (s3.name,)),
-                rc, ctx, (), grp_aivs,
-            )
-            s5 = _cap_vec_stage(
-                bind_phase(Phase(f"{pfx}rec_dot2_reduce", Work(resources={"vector": dot2_red * share}), (s4.name,)),
-                           rc, ctx, (), grp_aivs),
-                rc, reduce_ratio,
-            )
-            w_store = Work(resources={"hbm": total_hbm_write * share, "mte3": ht_mte3_total * share})
-            s6 = bind_phase(Phase(f"{pfx}rec_store", w_store, (s5.name,)), rc, ctx, (), grp_aivs)
-            if flag_ms > 0.0:
-                return (s0, s1, s2, s3, s4, s5, s6, _fixed_stage(f"{pfx}rec_sync", flag_ms, after=(s6.name,)))
-            return (s0, s1, s2, s3, s4, s5, s6)
-
-        def _group_prog(grp_aivs: tuple[int, ...], grp_progs: int, pfx: str) -> KernelProgram:
-            g_n = len(grp_aivs)
-            g_full, g_rem = divmod(grp_progs, g_n)
-            stages_g: list[Stage] = []
-            prev_g: tuple[str, ...] = ()
-            if g_full > 0:
-                body = (
-                    KernelProgram(_block_stages(g_n, grp_aivs, pfx))
-                    if g_full == 1
-                    else compact_periodic_pipeline(
-                        rc, g_full, 1, lambda _i, g_n=g_n, ga=grp_aivs, p=pfx: _block_stages(g_n, ga, p),
-                        head=COMPACT_WINDOW, tail=COMPACT_WINDOW, threshold=COMPACT_THRESHOLD,
-                    )
-                )
-                stages_g.append(Stage(f"{pfx}full", program=body))
-                prev_g = (f"{pfx}full",)
-            if g_rem > 0:
-                stages_g.append(Stage(
-                    f"{pfx}tail", after=prev_g, program=KernelProgram(_block_stages(g_rem, grp_aivs[:g_rem], f"{pfx}t_")),
-                ))
-            return KernelProgram(tuple(stages_g))
-
-        if active_aivs < REC_ASYNC_GROUPS or waves <= 1:
-            return _group_prog(aivs[:active_aivs], total_progs, "g0_")
-        # Two independent AIV halves keep T=1 load->vec->store serial per AIV while staggering HBM.
-        mid = active_aivs // REC_ASYNC_GROUPS
-        a_aivs, b_aivs = aivs[:mid], aivs[mid:active_aivs]
-        a_progs = (total_progs * len(a_aivs)) // active_aivs
-        b_progs = total_progs - a_progs
-        a_head = _block_stages(len(a_aivs), a_aivs, "ga0_")
-        a_rem_progs = a_progs - len(a_aivs)
-        if a_rem_progs <= 0:
-            return KernelProgram((
-                Stage("triton_rec_half_a", program=KernelProgram(a_head)),
-                Stage("triton_rec_half_b", program=_group_prog(b_aivs, b_progs, "gb_")),
-            ))
-        return KernelProgram((
-            *a_head,
-            Stage("triton_rec_half_a_rest", after=(a_head[-1].name,), program=_group_prog(a_aivs, a_rem_progs, "ga_")),
-            Stage("triton_rec_half_b", after=(a_head[0].name,), program=_group_prog(b_aivs, b_progs, "gb_")),
-        ))
+        return _lower_recurrent_kda(
+            ctx, rc,
+            aivs=aivs, active_aivs=active_aivs, waves=waves, total_progs=total_progs,
+            max_q=max_q, total_hbm_read=total_hbm_read, total_hbm_write=total_hbm_write,
+            total_mte2_aiv=total_mte2_aiv, total_l2_hits=total_l2_hits, has_l2_rate=has_l2_rate,
+            decay_alu=decay_alu, sfu_ops=sfu_ops, dot1_red=dot1_red,
+            update_alu=update_alu, dot2_red=dot2_red, ht_mte3_total=ht_mte3_total,
+        )
 
     return make_plan(
         ctx, TRITON_RECURRENT_KDA_ABI, phases, sources=TRITON_RECURRENT_SOURCES,

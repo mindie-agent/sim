@@ -84,6 +84,58 @@ DEFAULT_CP_INTERLEAVE = 128
 INT32_BYTES = 4
 
 
+def _lower_gqa_dcp_query(
+    ops, *, query_producer, views, parallel, prefix, stage, plan, requests, mode,
+    model, heads, width, padded_tokens, layer_dcp, cacheless, pcp_factor, tp_gather,
+    dp_width, cohort_dec_views, peer_dec_rows, local_dp_pos, idle_dcp_owner,
+):
+    has_decode_dcp = layer_dcp > 1 and (
+        any(v.phase != "prefill" for v in views) or (dp_width > 1 and bool(cohort_dec_views))
+    )
+    has_chunked_pf_dcp = (
+        layer_dcp > 1 and not cacheless
+        and any(v.phase == "prefill" and v.context > 0 for v in views)
+    )
+    dcp_query_producer = query_producer
+    dcp_heads = heads
+    chunked_pf_only = has_chunked_pf_dcp and not has_decode_dcp
+    if has_chunked_pf_dcp and parallel.pcp > 1:
+        # Upstream ``attention_cp.py:695`` slices out decode rows before the PCP
+        # history-query AllGather so only prefill tokens are gathered/restored.
+        pf_only_views = tuple(v for v in views if v.phase == "prefill")
+        pcp_q_local, pf_global_q = pcp_uniform_peer_rows(
+            pf_only_views, parallel.pcp, local_rows=0)
+        q_row_bytes = float(heads * width) * dtype_bytes(model.activation_dtype)
+        pcp_q_ag = comm_op(
+            op_id=f"{prefix}.pcp_query_allgather", deps=(query_producer,),
+            stage=stage, layer=plan.index, requests=requests, family="allgather",
+            phase=mode, recipe="pcp_query_allgather",
+            link_bytes=float(pcp_q_local) * q_row_bytes * float(parallel.pcp - 1),
+            shape=(pcp_q_local * parallel.pcp, heads, width),
+            metadata=(("group_axis", "pcp"), ("stream", CP_CHUNKED_PREFILL_STREAM)),
+        )
+        ops.append(replace(pcp_q_ag, dtype=model.activation_dtype, stream=CP_CHUNKED_PREFILL_STREAM))
+        dcp_query_producer = emit_pcp_restore_unpermute(
+            ops, prefix=prefix, name="pcp_query_restore", stage=stage, layer=plan.index,
+            requests=requests, mode=mode, dep=pcp_q_ag.op_id,
+            global_rows=pf_global_q, row_bytes=q_row_bytes,
+            dtype=model.activation_dtype, stream=CP_CHUNKED_PREFILL_STREAM,
+        )
+    if (has_decode_dcp or has_chunked_pf_dcp) and (tp_gather > 1 or dp_width > 1):
+        dcp_query_producer, dcp_heads, _ = emit_dcp_query_gather(
+            ops, prefix=prefix, stage=stage, layer=plan.index,
+            requests=requests, mode=mode, deps=(dcp_query_producer,),
+            rows=(0 if idle_dcp_owner else max(1, padded_tokens)),
+            local_heads=heads, head_width=width,
+            act_dtype=model.activation_dtype, tp_gather=tp_gather,
+            dp_width=dp_width, pack_inputs=False,
+            stream=CP_CHUNKED_PREFILL_STREAM if chunked_pf_only else "",
+            peer_rows=(peer_dec_rows if (dp_width > 1 and has_decode_dcp) else None),
+            local_dp_pos=local_dp_pos, pcp_factor=pcp_factor,
+        )
+    return dcp_query_producer, dcp_heads
+
+
 def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         padded_tokens, policy=AttentionPolicy(), cp_interleave_size=DEFAULT_CP_INTERLEAVE,
         runtime=None, cache_ids=None, stage_of=None, topk_ids=None,
@@ -178,50 +230,14 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         query_producer = rope.op_id
     eff_window = min_positive(plan.window, eff_topk)
     dense_win = int(plan.window or 0)
-    has_decode_dcp = layer_dcp > 1 and (
-        any(v.phase != "prefill" for v in views) or (dp_width > 1 and bool(cohort_dec_views))
-    )
-    has_chunked_pf_dcp = (
-        layer_dcp > 1 and not cacheless
-        and any(v.phase == "prefill" and v.context > 0 for v in views)
-    )
-    dcp_query_producer = query_producer
-    dcp_heads = heads
-    chunked_pf_only = has_chunked_pf_dcp and not has_decode_dcp
-    if has_chunked_pf_dcp and parallel.pcp > 1:
-        # Upstream ``attention_cp.py:695`` slices out decode rows before the PCP
-        # history-query AllGather so only prefill tokens are gathered/restored.
-        pf_only_views = tuple(v for v in views if v.phase == "prefill")
-        pcp_q_local, pf_global_q = pcp_uniform_peer_rows(
-            pf_only_views, parallel.pcp, local_rows=0)
-        q_row_bytes = float(heads * width) * dtype_bytes(model.activation_dtype)
-        pcp_q_ag = comm_op(
-            op_id=f"{prefix}.pcp_query_allgather", deps=(query_producer,),
-            stage=stage, layer=plan.index, requests=requests, family="allgather",
-            phase=mode, recipe="pcp_query_allgather",
-            link_bytes=float(pcp_q_local) * q_row_bytes * float(parallel.pcp - 1),
-            shape=(pcp_q_local * parallel.pcp, heads, width),
-            metadata=(("group_axis", "pcp"), ("stream", CP_CHUNKED_PREFILL_STREAM)),
-        )
-        ops.append(replace(pcp_q_ag, dtype=model.activation_dtype, stream=CP_CHUNKED_PREFILL_STREAM))
-        dcp_query_producer = emit_pcp_restore_unpermute(
-            ops, prefix=prefix, name="pcp_query_restore", stage=stage, layer=plan.index,
-            requests=requests, mode=mode, dep=pcp_q_ag.op_id,
-            global_rows=pf_global_q, row_bytes=q_row_bytes,
-            dtype=model.activation_dtype, stream=CP_CHUNKED_PREFILL_STREAM,
-        )
-    if (has_decode_dcp or has_chunked_pf_dcp) and (tp_gather > 1 or dp_width > 1):
-        dcp_query_producer, dcp_heads, _ = emit_dcp_query_gather(
-            ops, prefix=prefix, stage=stage, layer=plan.index,
-            requests=requests, mode=mode, deps=(dcp_query_producer,),
-            rows=(0 if idle_dcp_owner else max(1, padded_tokens)),
-            local_heads=heads, head_width=width,
-            act_dtype=model.activation_dtype, tp_gather=tp_gather,
-            dp_width=dp_width, pack_inputs=False,
-            stream=CP_CHUNKED_PREFILL_STREAM if chunked_pf_only else "",
-            peer_rows=(peer_dec_rows if (dp_width > 1 and has_decode_dcp) else None),
-            local_dp_pos=local_dp_pos, pcp_factor=pcp_factor,
-        )
+    dcp_query_producer, dcp_heads = _lower_gqa_dcp_query(
+        ops, query_producer=query_producer, views=views, parallel=parallel,
+        prefix=prefix, stage=stage, plan=plan, requests=requests, mode=mode,
+        model=model, heads=heads, width=width, padded_tokens=padded_tokens,
+        layer_dcp=layer_dcp, cacheless=cacheless, pcp_factor=pcp_factor,
+        tp_gather=tp_gather, dp_width=dp_width, cohort_dec_views=cohort_dec_views,
+        peer_dec_rows=peer_dec_rows, local_dp_pos=local_dp_pos,
+        idle_dcp_owner=idle_dcp_owner)
     local_attn_deps = ((*store_ids, topk_id, query_producer) if topk_id
                        else (*store_ids, query_producer))
     dcp_attn_deps = ((*store_ids, topk_id, dcp_query_producer) if topk_id
@@ -699,14 +715,7 @@ def _gqa_history_pairs(
     return rank_pairs, per_view
 
 
-def _append_gqa_attention(
-    ops, views, parallel, prefix, eff_topk, eff_window, plan, policy, dense_win,
-    cp_interleave_size, block_size, kv_heads, local_heads, dcp_heads, width, kv_row_bytes,
-    mode, hierarchy, model, stage, streams, quant, runtime, cacheless, selected,
-    user_pinned_attn, request_op, *, pcp_factor, tp_gather, dp_width, local_attn_deps,
-    cohort_decode_views=None, peer_decode_rows=None, local_dp_pos=0,
-    physical_rank=None, explicit_dp_cohort=False, explicit_physical_rank=False,
-):
+def _group_gqa_phase_views(views, plan, parallel, *, dp_width, cacheless, cohort_decode_views):
     layer_dcp = layer_dcp_degree(plan, parallel)
     phase_groups: list[tuple[int, bool, list[tuple[int, object]]]] = []
     group_map: dict[tuple[int, bool], list[tuple[int, object]]] = {}
@@ -727,6 +736,53 @@ def _append_gqa_attention(
         group_map[gkey].append((index, view))
     if has_dp_decode:
         phase_groups.append((layer_dcp, False, list(enumerate(cohort_decode_views))))
+    return phase_groups
+
+
+def _lower_gqa_dcp_combine(
+    ops, *, grp_prefix, stage, plan, grp_reqs, mode, grp_attn, grp_views, grp_valid,
+    grp_hist_valid, local_heads, width, v_width, kv_row_bytes, model, pcp_factor,
+    tp_gather, dp_width, local_attn_deps, split_curr, chunked_pf, chunked_pf_pcp,
+    dense_win, peer_decode_rows, local_dp_pos, cp_interleave_size,
+):
+    current_dep = None
+    if split_curr and (not chunked_pf or grp_valid > 0):
+        current_deps = (local_attn_deps if chunked_pf
+                        else tuple(dict.fromkeys((*grp_attn, *local_attn_deps))))
+        current_dep = emit_mtp_current_attention(
+            ops, prefix=grp_prefix, stage=stage, layer=plan.index,
+            requests=grp_reqs, mode=mode, deps=current_deps,
+            views=grp_views, local_heads=local_heads, qk_dim=width,
+            v_dim=v_width, kv_row_bytes=kv_row_bytes,
+            act_dtype=model.activation_dtype,
+            stream=("" if chunked_pf else CP_DECODE_COMM_STREAM),
+            allow_q1=chunked_pf, window=dense_win)
+    return emit_dcp_output_exchange_combine(
+        ops, prefix=grp_prefix, stage=stage, layer=plan.index,
+        requests=grp_reqs, mode=mode, deps=tuple(grp_attn),
+        rows=max(1, grp_hist_valid), local_heads=local_heads, v_dim=v_width,
+        act_dtype=model.activation_dtype, pcp_factor=pcp_factor,
+        tp_gather=tp_gather, dp_width=dp_width,
+        local_current_dep=current_dep,
+        peer_rows=(peer_decode_rows if (dp_width > 1 and not chunked_pf) else None),
+        local_dp_pos=local_dp_pos,
+        stream=(CP_CHUNKED_PREFILL_STREAM if chunked_pf else ""),
+        merge_rows=(grp_valid if chunked_pf_pcp else None),
+        meta_extra=(("cp_interleave", int(cp_interleave_size)),
+                    ("gqa_chunked_prefill_dcp", bool(chunked_pf))))
+
+
+def _append_gqa_attention(
+    ops, views, parallel, prefix, eff_topk, eff_window, plan, policy, dense_win,
+    cp_interleave_size, block_size, kv_heads, local_heads, dcp_heads, width, kv_row_bytes,
+    mode, hierarchy, model, stage, streams, quant, runtime, cacheless, selected,
+    user_pinned_attn, request_op, *, pcp_factor, tp_gather, dp_width, local_attn_deps,
+    cohort_decode_views=None, peer_decode_rows=None, local_dp_pos=0,
+    physical_rank=None, explicit_dp_cohort=False, explicit_physical_rank=False,
+):
+    phase_groups = _group_gqa_phase_views(
+        views, plan, parallel, dp_width=dp_width, cacheless=cacheless,
+        cohort_decode_views=cohort_decode_views)
     attention: list[str] = []
     multi_group = len(phase_groups) > 1
     v_width = int(getattr(plan, "v_head_dim", 0) or width)
@@ -838,32 +894,16 @@ def _append_gqa_attention(
             ops.extend(batches)
             grp_attn = [item.op_id for item in batches]
         if eff_cp > 1 and grp_attn:
-            current_dep = None
-            if split_curr and (not chunked_pf or grp_valid > 0):
-                current_deps = (local_attn_deps if chunked_pf
-                                else tuple(dict.fromkeys((*grp_attn, *local_attn_deps))))
-                current_dep = emit_mtp_current_attention(
-                    ops, prefix=grp_prefix, stage=stage, layer=plan.index,
-                    requests=grp_reqs, mode=mode, deps=current_deps,
-                    views=grp_views, local_heads=local_heads, qk_dim=width,
-                    v_dim=v_width, kv_row_bytes=kv_row_bytes,
-                    act_dtype=model.activation_dtype,
-                    stream=("" if chunked_pf else CP_DECODE_COMM_STREAM),
-                    allow_q1=chunked_pf, window=dense_win)
-            merged_last = emit_dcp_output_exchange_combine(
-                ops, prefix=grp_prefix, stage=stage, layer=plan.index,
-                requests=grp_reqs, mode=mode, deps=tuple(grp_attn),
-                rows=max(1, grp_hist_valid), local_heads=local_heads, v_dim=v_width,
-                act_dtype=model.activation_dtype, pcp_factor=pcp_factor,
-                tp_gather=tp_gather, dp_width=dp_width,
-                local_current_dep=current_dep,
-                peer_rows=(peer_decode_rows if (dp_width > 1 and not chunked_pf) else None),
-                local_dp_pos=local_dp_pos,
-                stream=(CP_CHUNKED_PREFILL_STREAM if chunked_pf else ""),
-                merge_rows=(grp_valid if chunked_pf_pcp else None),
-                meta_extra=(("cp_interleave", int(cp_interleave_size)),
-                            ("gqa_chunked_prefill_dcp", bool(chunked_pf))))
-            grp_attn = [merged_last]
+            grp_attn = [_lower_gqa_dcp_combine(
+                ops, grp_prefix=grp_prefix, stage=stage, plan=plan, grp_reqs=grp_reqs,
+                mode=mode, grp_attn=grp_attn, grp_views=grp_views, grp_valid=grp_valid,
+                grp_hist_valid=grp_hist_valid, local_heads=local_heads, width=width,
+                v_width=v_width, kv_row_bytes=kv_row_bytes, model=model,
+                pcp_factor=pcp_factor, tp_gather=tp_gather, dp_width=dp_width,
+                local_attn_deps=local_attn_deps, split_curr=split_curr,
+                chunked_pf=chunked_pf, chunked_pf_pcp=chunked_pf_pcp,
+                dense_win=dense_win, peer_decode_rows=peer_decode_rows,
+                local_dp_pos=local_dp_pos, cp_interleave_size=cp_interleave_size)]
         attention.extend(grp_attn)
     return attention
 

@@ -17,8 +17,6 @@ from mindie_sim.prediction.physical_recipe_base import (IO_HBM_CATEGORY, Phase, 
 
 MS_PER_SECOND = 1000
 HALF_SHARE = 0.5
-STREAM_LOAD_SHARE = 0.30
-STREAM_STORE_SHARE = 0.70
 PIPELINE_SLOTS = 2
 # AscendC double-buffered VECIN(2)+VECOUT(2) allows MTE2, VEC and MTE3 to run
 # concurrently across 3 in-flight tiles in 3-phase vector pipelines.

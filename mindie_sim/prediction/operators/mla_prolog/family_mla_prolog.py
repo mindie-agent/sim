@@ -78,6 +78,7 @@ def validate(*, plan, parallel, model, quant, lowering_passes,
         if compute_dtype_for(quant, "mla")[1] != quant.format_for("mla"):
             raise ModelingError("mla_prolog_packed_requires_declared_projection_operands")
     if (plan.mla_variant != "latent_mla" or plan.cache_kind != "dense"
+            or plan.qk_rope_head_dim <= 0
             or parallel.cp < 1 or parallel.pcp < 1
             or model.activation_dtype != "bf16"
             or (quant.kv_dtype not in BF16_CACHE_DTYPES and not packed)

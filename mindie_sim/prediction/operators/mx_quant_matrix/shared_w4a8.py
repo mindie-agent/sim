@@ -143,6 +143,8 @@ def matches_source_interface(op):
         return False
     if not _source_declaration_valid(meta, m, n, k):
         return False
+    if k % MX_SCALE_GROUP_PAIR or n % OUTPUT_N_ALIGNMENT:
+        return False
     return True
 
 
