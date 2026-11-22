@@ -25,7 +25,7 @@ import math
 from typing import ClassVar
 
 from mindie_sim.schema.common import ModelingError
-from ..communication import MessageFlow, RoutedMessage
+from ..communication import CommunicationWork, MessageFlow, RoutedMessage
 
 
 def plan_options(recipe, op):
@@ -558,6 +558,61 @@ class OneShotPlan:
                 for group in self.groups for message in group.messages):
             raise ModelingError(
                 "oneshot_collective_multihop_requires_store_forward_declaration")
+
+    def accounting(self, *, source_ranks=None) -> CommunicationWork:
+        """Derive wire/useful/framing accounting directly from executed messages."""
+        sources = (
+            None if source_ranks is None
+            else frozenset(int(rank) for rank in source_ranks)
+        )
+        useful_by_rank: dict[int, float] = {}
+        useful: dict[str, float] = {}
+        wire: dict[str, float] = {}
+        transactions: dict[str, int | None] = {}
+        transaction_frames: dict[str, tuple[int, int]] = {}
+        count = 0
+        routed_useful = 0.0
+        physical_wire = 0.0
+        max_path_latency = 0.0
+        setup_ms = 0.0
+        for group in self.groups:
+            group_path_latency = 0.0
+            group_active = False
+            for message in group.messages:
+                if not message.flow.useful_bytes:
+                    continue
+                if sources is not None and message.flow.source not in sources:
+                    continue
+                group_active = True
+                src = message.flow.source
+                useful_by_rank[src] = (
+                    useful_by_rank.get(src, 0.0) + message.flow.useful_bytes
+                )
+                count += message.flow.messages
+                path_latency = 0.0
+                for hop in message.hops:
+                    routed_useful += hop.useful_bytes
+                    physical_wire += hop.wire_bytes
+                    for resource in hop.demand:
+                        useful[resource] = useful.get(resource, 0.0) + hop.useful_bytes
+                        wire[resource] = wire.get(resource, 0.0) + hop.wire_bytes
+                        transactions[resource] = (
+                            None if hop.transactions is None
+                            else transactions.get(resource, 0) + hop.transactions
+                        )
+                        if hop.transaction_frame is not None:
+                            transaction_frames[resource] = hop.transaction_frame
+                    path_latency += hop.latency_ms
+                group_path_latency = max(group_path_latency, path_latency)
+                max_path_latency = max(max_path_latency, path_latency)
+            if group_active:
+                setup_ms = max(
+                    setup_ms, float(group.startup_ms or 0.0) + group_path_latency
+                )
+        return CommunicationWork(
+            useful_by_rank, useful, wire, transactions, transaction_frames,
+            count, setup_ms, routed_useful, physical_wire, max_path_latency,
+        )
 
 
 @dataclass(frozen=True)

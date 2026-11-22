@@ -248,6 +248,14 @@ def fused_op_spec(candidate, *, phase: str | None = None,
         ("proven_eliminated_hbm", saved),
         # The full surviving interface, including secondary declared ports.
         ("retained_outputs", retained_records),
+        *(
+            (("uses_simt", True),)
+            if any(
+                analysis.ops[m].param("uses_simt") or analysis.ops[m].param("tile_uses_simt")
+                for m in member_ops
+            )
+            else ()
+        ),
         ("retained_ports", tuple(record.metadata_record()
                                  for record in port_records)),
         ("retained_port_map", tuple(sorted(value_port.items()))),

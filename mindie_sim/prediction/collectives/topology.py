@@ -257,6 +257,7 @@ class Topology(_TopologyPlansMixin):
         self._resource_rates = None
         self._transport_bindings = {}
         self._mesh_plans = {}
+        self._oneshot_plans = {}
 
     def _node_of(self, rank: int) -> int:
         key = int(rank)
@@ -574,6 +575,34 @@ class Topology(_TopologyPlansMixin):
             return None
         return self._mesh_plans.get(
             (str(getattr(op, "op_id", "")), int(replica)))
+
+    @staticmethod
+    def _oneshot_key(op, replica) -> tuple[object, int]:
+        op_id = str(getattr(op, "op_id", ""))
+        return (op_id if op_id else id(op), int(replica))
+
+    def bind_oneshot_plan(self, op, replica, plan, *, volume=None) -> None:
+        """Publish the executed one-shot plan for an invocation."""
+        if len(self._oneshot_plans) >= MAX_ROUTE_CACHE_ENTRIES:
+            self._oneshot_plans.clear()
+        bound_vol = None if volume is None else float(volume)
+        self._oneshot_plans[self._oneshot_key(op, replica)] = (plan, bound_vol)
+
+    def clear_oneshot_plan(self, op, replica) -> None:
+        if self._oneshot_plans:
+            self._oneshot_plans.pop(self._oneshot_key(op, replica), None)
+
+    def bound_oneshot_plan(self, op, replica, *, volume=None):
+        if not self._oneshot_plans:
+            return None
+        entry = self._oneshot_plans.get(self._oneshot_key(op, replica))
+        if entry is None:
+            return None
+        plan, bound_vol = entry
+        if (volume is not None and bound_vol is not None
+                and not math.isclose(bound_vol, float(volume), rel_tol=1e-12, abs_tol=1e-9)):
+            return None
+        return plan
 
     def mesh_phase_startup_ms(self, links) -> float:
         """Declared per-phase protocol startup; unknown stays zero."""

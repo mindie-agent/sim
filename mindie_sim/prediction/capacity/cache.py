@@ -56,12 +56,9 @@ class _MemoryCacheMixin:
     def _effective_cache_query_tokens(self, query_tokens: int | None = None) -> int:
         if query_tokens is not None:
             return max(1, int(query_tokens))
-        declared = int(dict(self.case.runtime.metadata).get(
-            "draft_proposal_tokens", 0) or 0)
-        if self.draft_kind == "dspark" and not self.paired_sfa and declared <= 0:
-            # A bare DSpark spec widens the draft pool/page geometry; the
-            # dense target state keeps its single-row reservation.
-            return 1
+        dspark = getattr(self.case.runtime, "dspark", None)
+        if dspark is not None and not self.paired_sfa:
+            return 1 + int(dspark.step_spec().draft_len)
         return self.query_tokens
 
     def dp_cohort_cache_bytes(
@@ -179,7 +176,7 @@ class _MemoryCacheMixin:
             dcp=int(getattr(p, "cp", 1) or 1),
             draft_page=block * int(row_bytes),
         )
-        if rank is not None and self.rank_token_owners is not None:
+        if draft_sharded and rank is not None and self.rank_token_owners is not None:
             base_tokens = (
                 math.ceil(eff_tokens / block) * block if padded else eff_tokens
             )

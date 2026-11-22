@@ -508,7 +508,9 @@ def analyze_region(graph: TypedGraph, members: Iterable[str], *, tile_rows: int,
                    usable_ub_bytes: int | None = None,
                    reduction_merge: ReductionMerge | None = None,
                    owner: int = 0,
-                   allow_relaxed_numerics: bool = False) -> RegionAnalysis:
+                   allow_relaxed_numerics: bool = False,
+                   uses_simt: bool = False,
+                   simt_ub_carveout_bytes: int = 0) -> RegionAnalysis:
     chosen = tuple(dict.fromkeys(members))
     causal = region_causal_order(graph, chosen)
     raw_width = channel_width
@@ -542,7 +544,9 @@ def analyze_region(graph: TypedGraph, members: Iterable[str], *, tile_rows: int,
                              buffer_factor=buffer_factor, allow_cube=allow_cube,
                              usable_bytes=usable_ub_bytes, owner=owner,
                              reduction_merge=priced_merge,
-                             cube_resources=cube_resources)
+                             cube_resources=cube_resources,
+                             uses_simt=uses_simt,
+                             simt_ub_carveout_bytes=simt_ub_carveout_bytes)
     split = handoff_split(graph, causal, cube_resources,
                           max(1, min(tile_rows, graph.rows)))
     return RegionAnalysis(causal, legality, tuple(external), interior, retained,

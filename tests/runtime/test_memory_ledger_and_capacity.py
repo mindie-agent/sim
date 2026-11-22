@@ -598,3 +598,116 @@ def test_non_hbm_tiers_never_charge_hbm_capacity(tier, amount, host_bytes):
     assert memory.budget_version == version and not memory.grant_bindings
     assert not memory.grant_batch(0, [dict(name="hbm", bytes=PAGE)])
     assert memory.occupied_bytes(0, 0) == 0
+
+
+def test_dspark_hbm_admission_reserves_verified_recurrent_state_slots():
+    from mindie_sim.catalog.types import AuxiliarySpec, DraftSpec
+    from mindie_sim.compose import compose_case
+    from mindie_sim.prediction.scheduler.progress import DraftPolicy
+    from mindie_sim.schema.dspark import DsparkSpec
+    from mindie_sim.schema.model import LayerPlan
+    from _support.axes import REPRESENTATIVE_SKUS
+
+    raw = compose_case(
+        "qwen3-32b", hardware=REPRESENTATIVE_SKUS["a5"], tp=1, dp=1, layers=1,
+        prompt_tokens=64, output_tokens=16,
+    )
+    parsed = parse_case(raw)
+    gdn_layer = LayerPlan(
+        index=0, attention="gdn", ffn="dense", num_heads=8, num_kv_heads=8,
+        head_dim=128, linear_heads=8, linear_head_dim=128,
+        linear_key_heads=8, linear_key_head_dim=128, linear_value_heads=8,
+        intermediate_size=2048, recurrent_state_elements=8 * 128 * 128,
+        recurrent_state_dtype="fp32", conv_state_elements=1024 * 4,
+        conv_width=1024, conv_kernel=4, conv_state_dtype="bf16",
+    )
+    draft = DraftSpec(
+        kind="dspark", layers=1, hidden_size=1024, intermediate_size=2048,
+        num_heads=8, num_kv_heads=2, head_dim=128, q_width=1024, kv_width=256,
+        attention_kind="gqa", block_size=3, markov_rank=16, vocab_size=1024,
+    )
+    model = replace(parsed.model, layers=1, layer_plans=(gdn_layer,),
+                    auxiliary=AuxiliarySpec(dspark=draft), metadata=())
+    rt_base = replace(parsed.runtime, dspark=None, metadata=(), recover_ssm=False)
+    rt_dspark = replace(parsed.runtime, dspark=DsparkSpec(3, (0.8, 0.6, 0.4)),
+                        metadata=(), recover_ssm=False)
+    case_base = replace(parsed, model=model, runtime=rt_base)
+    case_dspark = replace(parsed, model=model, runtime=rt_dspark)
+
+    policy = DraftPolicy.for_request(case_dspark, case_dspark.workload.requests[0])
+    assert policy.proposal == 3
+    mem_base, mem_dspark = Memory(case_base), Memory(case_dspark)
+    bd_base = mem_base.cache_pool_breakdown(128, padded=True)
+    bd_dspark = mem_dspark.cache_pool_breakdown(128, padded=True)
+    assert mem_dspark._effective_cache_query_tokens() == 1 + policy.proposal == 4
+    assert bd_dspark["query_tokens"] == 4
+    # Recurrent state must reserve 4 FP32 checkpoint slots instead of 1 (plus 3 conv rollback slices).
+    single_state = 8 * 128 * 128 * 4
+    assert bd_dspark["by_component"]["recurrent_state"] == pytest.approx(4 * single_state)
+    assert bd_base["by_component"]["recurrent_state"] == pytest.approx(single_state)
+
+    # Confidence threshold declining all proposals drops verify width back to 1.
+    rt_declined = replace(
+        parsed.runtime,
+        dspark=DsparkSpec(3, (0.8, 0.6, 0.4), confidence=(0.1, 0.9, 0.9), confidence_threshold=0.5),
+        metadata=(), recover_ssm=False,
+    )
+    mem_declined = Memory(replace(parsed, model=model, runtime=rt_declined))
+    assert mem_declined._effective_cache_query_tokens() == 1
+    assert mem_declined.cache_pool_breakdown(128, padded=True)["by_component"]["recurrent_state"] == pytest.approx(single_state)
+
+
+def test_replicated_draft_kv_ignores_target_rank_token_owners():
+    from mindie_sim.catalog.types import AuxiliarySpec, DraftSpec
+    from mindie_sim.compose import compose_case
+    from mindie_sim.prediction.capacity import MemoryPolicy
+    from mindie_sim.schema.dspark import DsparkSpec
+    from _support.axes import REPRESENTATIVE_SKUS
+
+    raw = compose_case(
+        "deepseek-v3.2", hardware=REPRESENTATIVE_SKUS["a5"], tp=2, dp=1, ep=2, dcp=2,
+        layers=4, prompt_tokens=8192, output_tokens=16, max_model_len=16384,
+    )
+    parsed = parse_case(raw)
+    replicated_draft = DraftSpec(
+        kind="dspark", layers=2, hidden_size=1024, intermediate_size=2048,
+        num_heads=8, num_kv_heads=2, head_dim=64, q_width=512, kv_width=128,
+        attention_kind="gqa", block_size=3, markov_rank=16, vocab_size=1024,
+        dcp_sharded=False, max_position_embeddings=4096,
+    )
+    model_rep = replace(parsed.model, auxiliary=AuxiliarySpec(dspark=replicated_draft))
+    rt = replace(parsed.runtime, dspark=DsparkSpec(3, (0.8, 0.6, 0.4)),
+                 metadata=(("draft_mode", "dspark"), ("draft_max_model_len", 4096)))
+    owners = ((0, 2048), (2048, 4096))
+    mem_rep = Memory(replace(parsed, model=model_rep, runtime=rt),
+                     policy=MemoryPolicy(rank_token_owners=owners))
+    # TP=2, draft num_kv_heads=2 -> 1 local KV head -> 2 * 1 * 64 * 2B = 256 B/row * 2 layers = 512 B/tok.
+    expected_draft_bytes = 4096 * 2 * 1 * 64 * 2 * 2
+    for rank in (0, 1):
+        draft_b, is_sharded = mem_rep._non_inherited_draft_cache_bytes(
+            model_rep, 8192, padded=True, rank=rank,
+        )
+        assert is_sharded is False
+        assert draft_b == pytest.approx(expected_draft_bytes)
+    rank_views = mem_rep.rank_cache_allocation(8192)
+    assert len(rank_views) == 2
+    for view in rank_views:
+        assert view["components"][0]["allocated"]["draft_kv"]["total"] == pytest.approx(expected_draft_bytes)
+
+    # Sharded MLA draft (dcp_sharded=True) continues to respect target rank_token_owners.
+    sharded_draft = DraftSpec(
+        kind="dspark", layers=2, hidden_size=1024, intermediate_size=2048,
+        num_heads=8, num_kv_heads=8, head_dim=64, q_width=512, kv_width=576,
+        attention_kind="mla", q_lora_rank=128, kv_lora_rank=512,
+        qk_nope_head_dim=64, qk_rope_head_dim=64, v_head_dim=64,
+        kv_cache_elements=576, block_size=3, markov_rank=16, vocab_size=1024,
+        dcp_sharded=True, max_position_embeddings=4096,
+    )
+    model_shd = replace(parsed.model, auxiliary=AuxiliarySpec(dspark=sharded_draft))
+    mem_shd = Memory(replace(parsed, model=model_shd, runtime=rt),
+                     policy=MemoryPolicy(rank_token_owners=owners))
+    draft_b0, is_sharded0 = mem_shd._non_inherited_draft_cache_bytes(model_shd, 8192, padded=True, rank=0)
+    draft_b1, is_sharded1 = mem_shd._non_inherited_draft_cache_bytes(model_shd, 8192, padded=True, rank=1)
+    assert is_sharded0 is True and is_sharded1 is True
+    assert draft_b0 == pytest.approx(draft_b1)
+    assert draft_b0 == pytest.approx(2048 * 576 * 2 * 2)

@@ -482,7 +482,7 @@ def _resolve_scenario_and_slo(
     else:
         eff_prompt, eff_output = 1, 1
 
-    required_len = eff_prompt + eff_output + max(0, mtp_tokens)
+    required_len = eff_prompt + eff_output
     if model_limit > 0 and required_len > model_limit:
         raise ModelingError(
             f"workload_exceeds_model_max_position_embeddings:{required_len}>{model_limit}"
@@ -1148,7 +1148,7 @@ def _resolve_mtp_policy(
     )
     if not has_draft:
         return DEFAULT_MTP_TOKENS, DEFAULT_MTP_ACCEPT, "no_structural_draft"
-    needed = int(prompt_tokens) + out_toks + prof_mtp
+    needed = int(prompt_tokens) + out_toks
     if (model_limit > 0 and needed > model_limit) or (max_model_len is not None and needed > int(max_model_len)):
         return DEFAULT_MTP_TOKENS, DEFAULT_MTP_ACCEPT, "max_len_bounded"
     from mindie_sim.prediction.frontend.speculation import compute_speculative_accept_step
@@ -1385,6 +1385,16 @@ def _assemble_composed_case(
         raw_dml = runtime_options["draft_max_model_len"]
         if isinstance(raw_dml, bool) or not isinstance(raw_dml, int) or raw_dml < 1:
             raise ModelingError(f"invalid_draft_max_model_len:{raw_dml!r}")
+        draft_aux = getattr(model_spec, "auxiliary", None)
+        draft_spec = (
+            getattr(draft_aux, "mtp", None) or getattr(draft_aux, "dspark", None)
+            if draft_aux is not None else None
+        )
+        draft_limit = int(getattr(draft_spec, "max_position_embeddings", 0) or 0)
+        if draft_limit > 0 and raw_dml > draft_limit:
+            raise ModelingError(
+                f"draft_max_model_len_exceeds_draft_max_position_embeddings:{raw_dml}>{draft_limit}"
+            )
         runtime_meta["draft_max_model_len"] = int(raw_dml)
     if runtime_options.get("draft_enforce_eager") is not None:
         runtime_meta["draft_enforce_eager"] = bool(runtime_options["draft_enforce_eager"])

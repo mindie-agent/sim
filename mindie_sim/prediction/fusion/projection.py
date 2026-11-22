@@ -32,6 +32,9 @@ _STATE_SCALAR_BYTES = 4
 
 _FAMILY_KIND = {
     "rmsnorm": "rms_norm", "layernorm": "rms_norm", "norm": "rms_norm",
+    "add_rmsnorm": "add_rms_norm",
+    "rmsnorm_quant": "rms_norm_quant",
+    "add_rmsnorm_quant": "add_rms_norm_quant",
     "add": "add", "residual_add": "add", "elementwise": "elementwise",
     "quantize": "dynamic_quant", "quant": "dynamic_quant",
     "dequantize": "cast", "cast": "cast", "tensor_copy": "cast",
@@ -43,6 +46,10 @@ _FAMILY_KIND = {
     "rotary": "rope", "topk": "topk", "attention": "attention",
     "indexer": "attention", "native_fusion": "matmul",
 }
+_NORM_KINDS = frozenset({"rms_norm", "add_rms_norm", "rms_norm_quant",
+                         "add_rms_norm_quant"})
+_QUANT_KINDS = frozenset({"dynamic_quant", "quant", "rms_norm_quant",
+                          "add_rms_norm_quant"})
 _CUBE_FAMILIES = frozenset({"gemm", "gate_up_projection", "down_projection",
                             "shared_expert", "grouped_gemm", "attention",
                             "indexer", "native_fusion"})
@@ -294,20 +301,37 @@ def _opnode(op: OpSpec, dep_ids: tuple[str, ...], inputs: tuple[str, ...],
         "declared_width" if meta.get("reduction_width") else None)
     params: list[tuple[str, Any]] = [
         ("epsilon", meta.get("epsilon", meta.get("norm_eps"))
-         if kind in {"rms_norm"} else None),
+         if kind in _NORM_KINDS else None),
         ("axis", meta.get("quant_axis", meta.get("axis"))
-         if kind in {"dynamic_quant", "quant"} else None),
-        ("group_size", meta.get("quant_group_size", meta.get("group_size"))
-         if kind in {"dynamic_quant", "quant"} else None),
+         if kind in _QUANT_KINDS else None),
+        ("group_size", meta.get("quant_group_size",
+                                meta.get("group_size", meta.get("activation_group_size")))
+         if kind in _QUANT_KINDS else None),
         ("rounding", meta.get("rounding")
-         if kind in {"dynamic_quant", "quant", "cast", "kv_cast"} else None),
+         if kind in (_QUANT_KINDS | {"cast", "kv_cast"}) else None),
         ("saturation", meta.get("saturation")
-         if kind in {"dynamic_quant", "quant"} else None),
+         if kind in _QUANT_KINDS else None),
         ("rotate_style", meta.get("rotate_style") if kind == "rope" else None),
         ("target_dtype", op.dtype if kind in {"cast", "kv_cast"} else None),
-        ("reduction_order", reduction_order if kind in {"rms_norm", "softmax"} else None),
+        ("reduction_order", reduction_order
+         if kind in (_NORM_KINDS | {"softmax"}) else None),
         ("state_key", _state_target(op, meta) if state_effect else None),
     ]
+    native_norm_kind = meta.get("native_norm_kind")
+    if native_norm_kind:
+        params.append(("native_norm_kind", str(native_norm_kind)))
+    fp32_tiles = meta.get("native_norm_fp32_working_tiles")
+    if isinstance(fp32_tiles, int) and not isinstance(fp32_tiles, bool) and fp32_tiles >= 1:
+        params.append(("fp32_working_tiles", fp32_tiles))
+    uses_simt = bool(
+        meta.get("uses_simt")
+        or meta.get("tile_uses_simt")
+        or meta.get("template_param_uses_simt")
+    )
+    if uses_simt:
+        params.append(("uses_simt", True))
+        if meta.get("tile_uses_simt"):
+            params.append(("tile_uses_simt", True))
     if matrix:
         params.append(("matrix_flops", dict(sorted(matrix.items()))))
     group = meta.get("group_sizes") or meta.get("expert_rows")
@@ -443,7 +467,7 @@ def _project_weights(op, meta, kind, in_shape, out_shape, dtype,
             storage_bytes=weight_bytes, sharded=True, layout=layout
             if layout in {"contiguous", "nd", "nz"} else "contiguous")
         input_ids.append(weight_id)
-    if kind == "rms_norm":
+    if kind in _NORM_KINDS and meta.get("norm_has_weight") is not False:
         gamma_id = f"{op.op_id}:gamma"
         hidden = int(in_shape[-1]) if in_shape else 1
         values[gamma_id] = TensorValue(
