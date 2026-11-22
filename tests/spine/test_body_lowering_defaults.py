@@ -541,3 +541,57 @@ def test_default_keeps_tier4_router_owner_grid_and_grouped_mapping_domain():
             inherited = operator_costs(raw, graph[i:i + 1])["operators"][0]; previous = operator_costs(explicit, graph[i:i + 1])["operators"][0]
             assert inherited["serviced"] == previous["serviced"] and inherited["duration_ms"] == previous["duration_ms"]
             assert next(row["selected"] for row in inherited["basis"]["matrix_mappings"] if "selected" in row)["tile_n"] == 256
+
+
+def test_homogeneous_layer_dedup_isolates_irregular_quant_exclusions(monkeypatch):
+    """Per-layer quant exclusions must split archetypes so homogeneous dedup has 0.0 drift."""
+    from mindie_sim.prediction.frontend.repeat import _FrontendRepeat, _layer_quant_signature
+
+    raw = compose_case("qwen3-32b", hardware="a3", layers=3, tp=1, dp=1, quant="w8a8_dynamic")
+    raw["model"]["quant"]["exclusions"] = list(raw["model"]["quant"]["exclusions"]) + ["model.layers.1.self_attn"]
+    case = parse_case(raw)
+    assert _layer_quant_signature(case.model, 1) != _layer_quant_signature(case.model, 0)
+    assert _layer_quant_signature(case.model, 0) == _layer_quant_signature(case.model, 2)
+    ded = target_graphs(case, scope="body", phase="decode", tokens=1, context=256)[0]
+    monkeypatch.setattr(_FrontendRepeat, "_try_lower_homogeneous", lambda *a, **k: None)
+    ref = target_graphs(case, scope="body", phase="decode", tokens=1, context=256)[0]
+    assert [(o.layer, o.family, o.dtype, o.flops, o.hbm_bytes) for o in ded] == [
+        (o.layer, o.family, o.dtype, o.flops, o.hbm_bytes) for o in ref
+    ]
+
+
+def test_stars_retired_interval_split_and_raw_eager_host_submit(monkeypatch):
+    """StarsDescriptorQueue splits straddling intervals cleanly; raw_eager charges P15 host submit."""
+    from mindie_sim.prediction.evaluation import EvaluationContext
+    from mindie_sim.prediction.execution import Execution
+    from mindie_sim.prediction.execution import runner as exec_runner
+    from mindie_sim.prediction.execution.submission import StarsDescriptorQueue, StarsSpec
+    from mindie_sim.primitives.loader import load_primitives
+
+    q = StarsDescriptorQueue(StarsSpec("die", 64, 1, 1.0, 2.0, "descriptor_ready", "test"))
+    q._retired_comp_ns = [(0, 5000)]
+    q._retired_desc_ns = [(1000, 2000), (2000, 4000)]
+    q._fold_retired_up_to(2500)
+    assert q._retired_desc_ns == [(2500, 4000)] and q._retired_comp_ns == [(2500, 5000)]
+    q._fold_retired_up_to(None)
+    assert q._folded_uncovered_ns == 0 and q._folded_desc_ns == 3000
+
+    raw = compose_case("qwen3-32b", hardware="Ascend910_9362", layers=1, tp=1, dp=1)
+    raw["runtime"]["graph_capture_mode"] = "full"
+    case_full = parse_case(raw)
+    ev_full = EvaluationContext.create(case_full, RecipeBook())
+    ex_full = Execution(case_full, ev_full.cost, recipes=RecipeBook(), bindings=ev_full.bindings, evaluation=ev_full)
+    seen_modes = []
+    orig_build = exec_runner.build_stars_queues
+    monkeypatch.setattr(exec_runner, "build_stars_queues", lambda *a, **k: (seen_modes.append(k.get("submission_mode")), orig_build(*a, **k))[1])
+    exec_runner.attach_stars_queues(ex_full)
+    assert seen_modes == ["aclgraph"]
+
+    raw_eager = compose_case("qwen3-32b", hardware="Ascend910_9362", layers=1, tp=1, dp=1)
+    raw_eager["runtime"].update({"graph_mode": "none", "graph_capture_mode": "none", "compilation_config": {"cudagraph_mode": "NONE"}, "metadata": {"feature_track": "raw_eager"}})
+    case_eager = parse_case(raw_eager)
+    ev_eager = EvaluationContext.create(case_eager, RecipeBook(), primitive_table=load_primitives("Ascend910_9362", require_calibrated=True))
+    op = target_graphs(case_eager, scope="body", phase="decode", tokens=1, context=128)[0][0]
+    with_sub = graph_costs(case_eager, {0: [op]}, evaluation=ev_eager, include_submission=True, isolated=True, external_inputs={"analysis_input": 0})
+    no_sub = graph_costs(case_eager, {0: [op]}, evaluation=ev_eager, include_submission=False, isolated=True, external_inputs={"analysis_input": 0})
+    assert with_sub["execution"]["serviced"].get("host@r0:s0", 0.0) > 0.0 and with_sub["duration_ms"] > no_sub["duration_ms"]

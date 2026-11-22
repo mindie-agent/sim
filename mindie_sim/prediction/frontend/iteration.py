@@ -255,6 +255,8 @@ class _FrontendIteration:
                 from mindie_sim.prediction.topology import Topology
                 auto_rank = Topology(machine, runtime.parallel).ranks(
                     replica, 0)[0]
+            except TimeoutError:
+                raise
             except Exception:
                 auto_rank = None
             features = (self.features if self.features is not None else

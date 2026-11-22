@@ -641,11 +641,12 @@ drain_compl_snapshot:
                 for (k = 0; k < (int32_t)t->nlink; k++) {
                     int32_t li = (int32_t)t->lstart + k;
                     msim_link *l = &c->link[li];
-                    int32_t mode;
                     if (l->rem <= 0.0 || l->rate > 0.0) continue;
-                    mode = c->res[l->res].mode;
-                    if (mode == 1) continue;
-                    if (mode == 4 && l->mode != 1) continue;
+                    if (t->coupled_comp) {
+                        if (l->mode != 1) continue;
+                    } else if (c->res[l->res].policy == 1) {
+                        continue;
+                    }
                     if (bad_li < 0 || li < bad_li) {
                         bad_li = li;
                         bad_res = l->res + 1;
@@ -676,7 +677,7 @@ drain_compl_snapshot:
                     boundary = MSIM_B_OUTPUT; goto done;
                 }
             }
-            memset(c->res_seen, 0, (size_t)c->nres);
+            if (c->nres > 0) memset(c->res_seen, 0, (size_t)c->nres);
             for (a = 0; a < c->act_n; a++) {
                 msim_task *t = &c->task[c->act[a]];
                 if (t->state != 1) continue;

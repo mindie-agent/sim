@@ -34,11 +34,14 @@ STREAM_QUOTA_PREFIX = "stream_quota@"
 
 AIC_ROLES: frozenset[str] = frozenset({"cube", "mte1", "mte2_aic", "fixpipe"})
 AIV_ROLES: frozenset[str] = frozenset({
-    "vector", "mte2_aiv", "mte3", "reg_data_writes", "reg_ub_accesses",
-    "reg_ub_stores", "reg_alu_lanes", "reg_special_lanes", "reg_reduce_lanes",
-    "reg_shuffle_lanes", "scalar_store_issue",
+    "vector", "mte2_aiv", "mte3", "vec_issue", "vec_alu", "vec_sfu", "vec_reduce",
+    "reg_data_writes", "reg_ub_accesses", "reg_ub_stores", "reg_alu_lanes",
+    "reg_special_lanes", "reg_reduce_lanes", "reg_shuffle_lanes",
+    "scalar_store_issue",
 })
-AIC_BUFFER_POOLS: frozenset[str] = frozenset({"l1", "l0a", "l0b", "l0c"})
+AIC_BUFFER_POOLS: frozenset[str] = frozenset({
+    "l1", "l0a", "l0b", "l0c", "bt", "fb", "bias_table", "fixpipe_buffer",
+})
 AIV_BUFFER_POOLS: frozenset[str] = frozenset({"ub"})
 
 

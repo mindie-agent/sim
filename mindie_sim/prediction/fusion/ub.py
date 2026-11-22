@@ -22,10 +22,17 @@ from mindie_sim.prediction.fusion.contract import (
 )
 from mindie_sim.prediction.fusion.graph import (
     FeasibilityError, PARAM_ROLES, REDUCTION_KINDS, TypedGraph, _align,
-    _is_public, external_readers,
+    _is_public, dtype_bytes, external_readers,
 )
 
 _MIN_REDUCTION_SCRATCH_BYTES = 32
+FP32_BYTES_PER_ELEM = 4
+DEFAULT_SIMT_UB_CARVEOUT_BYTES = 16 * 1024
+_FP32_UPCAST_SOURCE_DTYPES = frozenset({"bf16", "fp16"})
+AIV_FP32_UPCAST_KINDS = frozenset({
+    "add", "rms_norm", "layer_norm", "l2_norm", "reduce", "softmax",
+    "silu", "swiglu", "situ", "gelu", "sigmoid", "quant", "dynamic_quant",
+})
 
 
 @dataclass(frozen=True)
@@ -59,16 +66,26 @@ def tile_liveness(graph: TypedGraph, members: Iterable[str], *, tile_rows: int,
             first[value_id] = index
             last.setdefault(value_id, index)
     points = []
+    chosen_set = frozenset(chosen)
     for index, op_id in enumerate(chosen):
         live = tuple(value_id for value_id in first
                      if first[value_id] <= index <= last[value_id]
                      and graph.values[value_id].role not in PARAM_ROLES
                      and not (graph.values[value_id].role == "scale"
                               and graph.values[value_id].producer not in chosen))
-        live_bytes = sum(_align(
-            _tile_size(graph.values[v], tile_rows, total_rows, channel_width,
-                       start_row, worst),
-            graph.values[v].alignment_bytes) for v in live)
+        live_bytes = 0
+        for v in live:
+            val = graph.values[v]
+            raw_sz = _tile_size(val, tile_rows, total_rows, channel_width,
+                                start_row, worst)
+            if (val.producer in chosen_set
+                    and val.role not in {"weight", "parameter", "scale"}
+                    and val.dtype in _FP32_UPCAST_SOURCE_DTYPES
+                    and graph.ops[val.producer].kind in AIV_FP32_UPCAST_KINDS):
+                src_b = max(1, dtype_bytes(val.dtype))
+                if src_b < FP32_BYTES_PER_ELEM:
+                    raw_sz = (raw_sz * FP32_BYTES_PER_ELEM + src_b - 1) // src_b
+            live_bytes += _align(raw_sz, val.alignment_bytes)
         points.append(LivenessPoint(index, op_id, live, live_bytes))
     return TileLiveness(tuple(points), max((p.live_bytes for p in points), default=0))
 
@@ -203,7 +220,7 @@ def _ub_allocations(graph: TypedGraph, chosen: tuple[str, ...], rows: int,
                 (graph.values[v].shape[-1] for v in boundary
                  if graph.values[v].role not in {"weight", "parameter", "state"}),
                 default=channel_width))
-        allocations.append(Allocation("fp32_working", _align(rows * width * 4),
+        allocations.append(Allocation("fp32_working", _align(rows * width * FP32_BYTES_PER_ELEM),
                                       1, "working_tile", units=units))
     for op_id in chosen:
         for value_id in graph.ops[op_id].inputs:
@@ -250,14 +267,15 @@ def ub_worksheet(graph: TypedGraph, members: Iterable[str], *, tile_rows: int,
                  allow_cube: bool = False, usable_bytes: int | None = None,
                  owner: int = 0,
                  reduction_merge: ReductionMerge | None = None,
-                 cube_resources: CubeResources | None = None) -> UbWorksheet:
+                 cube_resources: CubeResources | None = None,
+                 uses_simt: bool = False,
+                 simt_ub_carveout_bytes: int = 0) -> UbWorksheet:
     chosen = tuple(dict.fromkeys(members))
     total_rows = int(rows or graph.rows)
     tile_rows = max(1, min(int(tile_rows), total_rows))
     channel_width = max(1, int(channel_width))
     external = external_readers(graph, chosen)
-    working = any(graph.ops[o].kind in {"add", "rms_norm", "reduce", "softmax"}
-                  for o in chosen)
+    working = any(graph.ops[o].kind in AIV_FP32_UPCAST_KINDS for o in chosen)
     physical = int(capacity_per_owner)
     if physical <= 0:
         raise FeasibilityError("ub_capacity_invalid")
@@ -265,6 +283,10 @@ def ub_worksheet(graph: TypedGraph, members: Iterable[str], *, tile_rows: int,
               else min(physical, int(usable_bytes)))
     if usable <= 0:
         raise FeasibilityError("ub_usable_capacity_invalid")
+    simt_active = bool(uses_simt) or any(bool(graph.ops[o].param("uses_simt")) for o in chosen)
+    if simt_active:
+        carveout = max(int(simt_ub_carveout_bytes), DEFAULT_SIMT_UB_CARVEOUT_BYTES)
+        usable = max(0, usable - carveout)
     # Every physical tile owns a reservation: the aligned remainder tile can
     # be larger than an interior tile (e.g. 33 B -> 64 B per allocation), so
     # admission is the maximum over all starts, never tile 0 alone.  The
@@ -355,9 +377,10 @@ def single_op_ub(graph: TypedGraph, op_id: str, *, tile_rows: int,
         cases.append((tail_rows, True))
     best: tuple[Allocation, ...] = ()
     best_total = -1
+    working = op.kind in AIV_FP32_UPCAST_KINDS
     for rows_here, _is_tail in cases:
         allocations, _ = _ub_allocations(
-            graph, (op_id,), rows_here, graph.rows, max(1, width), False, {},
+            graph, (op_id,), rows_here, graph.rows, max(1, width), working, {},
             allow_cube, None, owner, worst=True)
         total = sum(allocation.total_bytes for allocation in allocations)
         if total > best_total:

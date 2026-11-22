@@ -7,6 +7,8 @@
 """
 from __future__ import annotations
 
+import re
+
 from mindie_sim.prediction import frontend as _frontend
 from mindie_sim.prediction.frontend.body import _build_representative_body, _representative_attention
 from mindie_sim.prediction.frontend.iteration import _append_service_tail, _finalize_repeated_selections
@@ -16,6 +18,30 @@ _META_LIST_EDITS = 3
 _META_LAYER_INDEX = 4
 _META_DICT_VALUE_EDITS = 5
 _META_DICT_KEY_AND_VALUE_EDITS = 6
+_LAYER_QUANT_INDEX_RE = re.compile(r"(?:^|[.:/_-])layers?[.:/_-]?(\d+)(?:$|[.:/_-])", re.IGNORECASE)
+
+
+def _layer_quant_signature(model, layer_index: int) -> tuple:
+    """Capture any per-layer quant exclusions/overrides targeting ``layer_index``."""
+    quant = getattr(model, "quant", None)
+    if quant is None:
+        return ()
+    matched: list[str] = []
+    for entry in getattr(quant, "exclusions", ()) or ():
+        text = str(entry)
+        for m in _LAYER_QUANT_INDEX_RE.finditer(text):
+            if int(m.group(1)) == layer_index:
+                matched.append(f"excl:{text}")
+                break
+    overrides = getattr(quant, "category_overrides", ()) or ()
+    items = overrides.items() if isinstance(overrides, dict) else overrides
+    for key, val in items:
+        text = str(key)
+        for m in _LAYER_QUANT_INDEX_RE.finditer(text):
+            if int(m.group(1)) == layer_index:
+                matched.append(f"ovr:{text}={val!r}")
+                break
+    return tuple(sorted(matched))
 
 
 class _FrontendRepeat:
@@ -51,6 +77,7 @@ class _FrontendRepeat:
         else:
             for lyr in layers:
                 if (lyr.engram or lyr.hyper_connections or lyr.residual_block_size
+                        or getattr(lyr, "hc_lowrank", 0) > 0
                         or lyr.kv_owner_layer_id not in (-1, lyr.index)
                         or lyr.index_k_owner_layer_id not in (-1, lyr.index)
                         or lyr.topk_owner_layer_id not in (-1, lyr.index)
@@ -102,7 +129,7 @@ class _FrontendRepeat:
                     index_source_layer_id=(-1 if lyr.index_source_layer_id == -1 else 0),
                     native_layer_id=(-1 if lyr.native_layer_id == -1 else 0),
                 )
-                akey = (norm_lyr, norm_real)
+                akey = (norm_lyr, norm_real, _layer_quant_signature(model, lyr.index))
                 arch_for_layer_list.append(akey)
                 if akey not in unique_archs:
                     unique_archs[akey] = idx
@@ -490,17 +517,17 @@ class _FrontendRepeat:
         dispatch_fast_step: bool = False, machine=None,
     ):
         layers = model.layer_plans
+        p = runtime.parallel
         if (len(layers) <= 2 or local_tokens <= 0 or scope != "none"
                 or before or has_after_draft or pcp_prefill
-                or runtime.parallel.pp != 1):
+                or p.pp != 1 or p.cp_spans_dp or p.rank_table is not None):
             return None
         fusions_cfg = runtime.kernels.get("fusions") or ()
-        if "residual_norm" in fusions_cfg:
+        if "residual_norm" in fusions_cfg or runtime.kernels.get("force_eplb_source"):
             return None
         rmeta = dict(runtime.metadata)
         if "sparse_mla_metadata_groups" in rmeta:
             return None
-        p = runtime.parallel
         archetypes = self._resolve_homogeneous_archetypes(
             layers, model=model, runtime=runtime, mode=mode, local_views=local_views,
             local_tokens=local_tokens, body_global_tokens=body_global_tokens,

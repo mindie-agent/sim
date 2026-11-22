@@ -47,6 +47,33 @@ def _stars_controller_id(spec, replica: int, stage: int, die) -> str:
 
 
 NS_PER_US = 1000.0
+NS_PER_MS = 1_000_000.0
+_ACLGRAPH_SCOPES = frozenset({"full", "aclgraph", "cudagraph", "graph", "piecewise"})
+
+
+def _is_raw_eager_runtime(runtime) -> bool:
+    """True when runtime metadata explicitly enables raw_eager execution."""
+    if runtime is None:
+        return False
+    raw_meta = getattr(runtime, "metadata", None) or {}
+    meta = dict(raw_meta) if not isinstance(raw_meta, _AbcMapping) else raw_meta
+    if bool(meta.get("raw_eager", False)):
+        return True
+    policy = meta.get("execution_policy")
+    if isinstance(policy, _AbcMapping) and bool(policy.get("raw_eager", False)):
+        return True
+    return str(meta.get("feature_track") or "").strip().lower() == "raw_eager"
+
+
+def _calibrated_host_submit_ms(primitive_table) -> float:
+    """Return calibrated P15_rts_stars host_submit_ns in ms, or 0.0 when unmeasured."""
+    if primitive_table is None or not hasattr(primitive_table, "cell"):
+        return 0.0
+    from mindie_sim.primitives.loader import _table_band_p50
+    host_ns = _table_band_p50(primitive_table, "P15_rts_stars", "host_submit_ns")
+    if host_ns is None or host_ns <= 0.0:
+        return 0.0
+    return float(host_ns) / NS_PER_MS
 
 
 def _stars_is_noop_placeholder(spec) -> bool:
@@ -157,8 +184,14 @@ def build_stars_queues(
 
 def attach_stars_queues(execution) -> None:
     """Build and register STARS queues/pools on ``execution.engine``."""
-    scope = str(getattr(getattr(execution, "case", None), "runtime", None) and getattr(execution.case.runtime, "replay_scope", "none") or "none").strip().lower()
-    sub_mode = "aclgraph" if scope in {"aclgraph", "cudagraph", "graph", "piecewise"} else "eager"
+    rt = getattr(getattr(execution, "case", None), "runtime", None)
+    raw_scope = (
+        getattr(rt, "replay_scope", None)
+        or getattr(rt, "graph_capture_mode", None)
+        or "none"
+    )
+    scope = str(raw_scope).strip().lower()
+    sub_mode = "aclgraph" if scope in _ACLGRAPH_SCOPES else "eager"
     execution.stars_queues = build_stars_queues(
         execution.stage_profiles,
         execution.namespace,
@@ -533,6 +566,31 @@ def finalize_step(
     return step
 
 
+def _stage_submission_entry(execution, stage_key: tuple[int, int], dies) -> dict[str, Any]:
+    replica, stage = stage_key
+    base_launch = execution.submission.launch_ms(dies)
+    eff_launch = execution._stage_launch_ms(stage_key, captured=False)
+    if execution.submission.kernel_launch_ms is not None:
+        kernel_param = f"{execution.submission_source}.kernel_launch_ms"
+    elif base_launch <= 0.0 < eff_launch:
+        kernel_param = "primitive_table.P15_rts_stars.host_submit_ns"
+    else:
+        kernel_param = "machine.device.launch_us"
+    replay_param = (
+        f"{execution.submission_source}.graph_replay_ms"
+        if execution.submission.graph_replay_ms is not None
+        else "kernel_launch_parameter"
+    )
+    return {
+        "replica": replica,
+        "stage": stage,
+        "kernel_launch_ms": eff_launch,
+        "graph_replay_ms": execution._stage_launch_ms(stage_key, captured=True),
+        "kernel_parameter": kernel_param,
+        "replay_parameter": replay_param,
+    }
+
+
 def build_submission_summary(execution) -> dict[str, Any]:
     """Assemble the host submission summary block."""
     return {
@@ -542,15 +600,7 @@ def build_submission_summary(execution) -> dict[str, Any]:
             execution.engine.serviced.get(names["host"], 0)
             for names in execution.stage_names.values()),
         "stages": [
-            {"replica": replica, "stage": stage,
-             "kernel_launch_ms": execution.submission.launch_ms(dies),
-             "graph_replay_ms": execution.submission.launch_ms(dies, captured=True),
-             "kernel_parameter": (f"{execution.submission_source}.kernel_launch_ms"
-                                  if execution.submission.kernel_launch_ms is not None
-                                  else "machine.device.launch_us"),
-             "replay_parameter": (f"{execution.submission_source}.graph_replay_ms"
-                                  if execution.submission.graph_replay_ms is not None
-                                  else "kernel_launch_parameter")}
+            _stage_submission_entry(execution, (replica, stage), dies)
             for (replica, stage), dies in execution.stage_dies.items()
         ],
         "boundary": "host enqueue service; may overlap ready device work",
@@ -847,6 +897,7 @@ class Execution(_ContextMixin, _CohortMixin, _LazySubmitMixin):
                 or getattr(cost, "primitives", None) is not None)
         self.legacy_diagnostics = bool(legacy_diagnostics)
         self.include_submission = include_submission
+        self._raw_eager_mode = _is_raw_eager_runtime(case.runtime)
         self.on_operator = on_operator
         self.lazy_frontier = bool(lazy_frontier)
         self.host_lookahead = max(1, int(host_lookahead))
@@ -1465,6 +1516,19 @@ class Execution(_ContextMixin, _CohortMixin, _LazySubmitMixin):
             self._active_padded_tokens = int(work.padded_tokens)
         return work
 
+    def _stage_launch_ms(self, stage_key: tuple[int, int], *, captured: bool = False) -> float:
+        dies = self.stage_dies[stage_key]
+        duration = self.submission.launch_ms(dies, captured=captured)
+        if (duration <= 0.0 and not captured and self._raw_eager_mode
+                and self.submission.kernel_launch_ms is None):
+            profile = self.stage_profiles.get(stage_key)
+            p15_ms = _calibrated_host_submit_ms(
+                getattr(profile, "primitive_table", None) if profile is not None else None
+            )
+            if p15_ms > 0.0:
+                return p15_ms
+        return duration
+
     def _submit_eager_host_launch(
         self, engine, stage_key, name, names, owner, prepared, deps,
         captured, capture_key, scope, graph_launch, host_submits,
@@ -1472,8 +1536,7 @@ class Execution(_ContextMixin, _CohortMixin, _LazySubmitMixin):
         if captured and capture_key in graph_launch:
             host_launch, _start = graph_launch[capture_key]
         else:
-            dies = self.stage_dies[stage_key]
-            duration = self.submission.launch_ms(dies, captured=captured)
+            duration = self._stage_launch_ms(stage_key, captured=captured)
             host_deps = (prepared,) + ((self.hosts[stage_key],) if stage_key in self.hosts else ())
             if captured and scope == "piecewise" and self.submission.piecewise_sync_ms > 0.0:
                 if deps:

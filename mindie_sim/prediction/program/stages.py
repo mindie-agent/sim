@@ -526,6 +526,8 @@ def _run_compiled_ops(engine, name: str, ready, owner: str, plan_ops):
     sub_prep = engine._submit_prepared
     now = engine.now
     ready_is_tuple = ready.__class__ is tuple
+    ready_t = None if ready_is_tuple else ready.time
+    delay_base = now if (ready_t is None or ready_t <= now) else ready_t
     ev = [None] if ready_is_tuple else [ready]
     ev_append = ev.append
     for task_suf, static, acq_specs, free_specs, pred_m, pred_a in plan_ops:
@@ -534,7 +536,7 @@ def _run_compiled_ops(engine, name: str, ready, owner: str, plan_ops):
             after = ready if (ready_is_tuple and pred_a == 0) else ev[pred_a]
         elif pred_m == 0:
             after = ()
-            rel = now + pred_a
+            rel = delay_base + pred_a
         elif ready_is_tuple and 0 in pred_a:
             after = tuple([*ready, *[ev[i] for i in pred_a if i != 0]])
         else:
@@ -602,9 +604,10 @@ class KernelProgram:
                     and not engine.occurrence_metrics
                 ):
                     if delay_fast is not None:
+                        base_t = engine.now if ready.time <= engine.now else ready.time
                         return engine._submit_prepared(
                             delay_fast[1], name + delay_fast[0],
-                            release=engine.now + delay_fast[2], owner=owner,
+                            release=base_t + delay_fast[2], owner=owner,
                         )
                     if not plan_ops:
                         return ready

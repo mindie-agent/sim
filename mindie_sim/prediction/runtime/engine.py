@@ -18,6 +18,68 @@ _PERIODIC_COLD_ISSUE_MULTIPLIER = 2
 _MAX_PERIODIC_LIVE_TASKS = 4096
 _MAX_PERIODIC_RUNS = 64
 _MAX_PERIODIC_LIVE_SLOTS = 128
+_BINARY64_EXACT_INT_LIMIT = 1 << 53
+_BINARY64_DYADIC_DEN_LIMIT = 1 << 500
+
+
+def _advance_periodic_clock_single_step(now: float, dt: float, cycles: int) -> float:
+    """Exact binary64 repeated addition ``now + dt`` (with nextafter on underflow) in O(log cycles)."""
+    if dt <= 0.0 or cycles <= 0:
+        return now
+    rem = int(cycles)
+    while rem > 0:
+        if now == 0.0:
+            now = dt
+            rem -= 1
+            continue
+        _, exp = math.frexp(now)
+        next_binade = math.ldexp(1.0, exp)
+        one = now + dt
+        if one == now:
+            one = math.nextafter(now, math.inf)
+        if one >= next_binade or rem == 1:
+            now = one
+            rem -= 1
+            continue
+        two = one + dt
+        if two == one:
+            two = math.nextafter(one, math.inf)
+        d1 = one - now
+        d2 = two - one
+        if d1 <= 0.0 or d1 != d2 or two >= next_binade:
+            now = one
+            rem -= 1
+            continue
+        jump = min(rem, int((next_binade - now) // d1))
+        while jump > 1 and now + jump * d1 >= next_binade:
+            jump -= 1
+        if jump <= 1:
+            now = one
+            rem -= 1
+        else:
+            now = now + jump * d1
+            rem -= jump
+    return now
+
+
+def _advance_periodic_clock_exact(now: float, steps: tuple[float, ...], cycles: int) -> float:
+    """Bit-exact periodic clock advance avoiding O(cycles) loops for large skip counts."""
+    if cycles <= 0 or not steps:
+        return now
+    if all(dt >= 0.0 and math.isfinite(dt) for dt in steps) and now >= 0.0 and math.isfinite(now):
+        now_num, now_den = now.as_integer_ratio()
+        ratios = [dt.as_integer_ratio() for dt in steps]
+        max_den = max(now_den, *(den for _, den in ratios))
+        if max_den <= _BINARY64_DYADIC_DEN_LIMIT:
+            i_now = now_num * (max_den // now_den)
+            i_sum = sum(num * (max_den // den) for num, den in ratios)
+            i_end = i_now + i_sum * cycles
+            if i_end <= _BINARY64_EXACT_INT_LIMIT:
+                return i_end / max_den
+        if len(steps) == 1:
+            return _advance_periodic_clock_single_step(now, steps[0], cycles)
+    from ..engine_periodic.frontier import _advance_periodic_clock
+    return _advance_periodic_clock(now, steps, cycles)
 
 
 def _admission_l2_digest(view) -> str:
@@ -368,9 +430,8 @@ class _EnginePeriodicMixin:
         if dt < 0 or not math.isfinite(dt):
             raise ExecutionError("periodic_skip_period_invalid")
         start_before = self.now
-        from ..engine_periodic.frontier import _advance_periodic_clock
         if skip.delta.clock_steps:
-            self.now = _advance_periodic_clock(self.now, skip.delta.clock_steps, skip.cycles)
+            self.now = _advance_periodic_clock_exact(self.now, skip.delta.clock_steps, skip.cycles)
             dt = self.now - start_before
         else:
             self.now += dt

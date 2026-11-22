@@ -395,3 +395,58 @@ def test_dp_cohort_dedup_declines_asymmetric_replicas(monkeypatch: pytest.Monkey
     monkeypatch.setenv("MINDIE_SIM_DP_DEDUP", "1")
     got = graph_costs(case, skewed_ops, external_inputs={"analysis_input": 0}, isolated=False, compact=True)
     _assert_graph_parity(ref, got)
+
+
+@pytest.mark.parametrize("backend", ["python", "c"])
+def test_uncoupled_fair_resource_underflows_alongside_coupled_task(backend: str) -> None:
+    """Uncoupled fair link must raise service_rate_underflow even while a coupled task runs."""
+    from mindie_sim.prediction.runtime.engine_types import ExecutionError
+
+    eng = Engine([
+        Resource("cube", 10.0),
+        Resource("hbm", 10.0),
+        Resource("link", 1e-322, policy="fair"),
+    ], backend=backend)
+    try:
+        eng.submit("coupled", {"cube": 100.0, "hbm": 100.0}, coupled=True)
+        for idx in range(100):
+            eng.submit(f"u{idx}", {"link": 1.0}, coupled=False)
+        with pytest.raises(ExecutionError, match="service_rate_underflow"):
+            eng.advance(max_steps=16)
+    finally:
+        _close(eng)
+
+
+@pytest.mark.parametrize("backend", ["python", "c"])
+def test_start_observer_resolves_across_python_and_native_backends(backend: str) -> None:
+    """Native epoch commits must resolve task.start_observer identically to Python mode."""
+    eng = Engine([Resource("r", 10.0)], backend=backend)
+    try:
+        prep = eng.prepare_stage("work", {"r": 20.0})
+        done, started = eng._submit_host_launch(prep, "work", "obs_started", after=())
+        eng.advance(until=(done,))
+        assert started.done and started.time == pytest.approx(0.0)
+        assert done.done and done.time == pytest.approx(2.0)
+    finally:
+        _close(eng)
+
+
+def test_ring_buffer_producer_extra_after_roundtrips_through_native_abi() -> None:
+    """Native ABI ring validator must accept DEP_KIND_EXTRA edges from producer_extra_after."""
+    from mindie_sim.prediction.runtime.accel_terms import PreparedTermsRunner
+    from mindie_sim.prediction.runtime.ring_buffer import DEP_KIND_EXTRA, RingBuffer, lower_generation
+
+    ring = RingBuffer(occurrence=1, die=0, owner=0, pool="ub", allocation="r", slot_bytes=1024, depth=2)
+    g0 = lower_generation(
+        ring, 0, producer="prod", consumers=("cons",),
+        producer_work={"mte2": 1.0}, consumer_works={"cons": {"vec": 1.0}},
+    )
+    lower_generation(
+        ring, 1, producer="prod", consumers=("cons",),
+        producer_work={"mte2": 1.0}, consumer_works={"cons": {"vec": 1.0}},
+        producer_extra_after=(g0.publish,),
+    )
+    _, deps = ring.to_c_records()
+    assert any(d.kind == DEP_KIND_EXTRA for d in deps)
+    with PreparedTermsRunner() as runner:
+        assert runner.roundtrip_ring(ring) == ring.to_c_records()

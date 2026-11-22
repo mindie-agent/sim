@@ -556,3 +556,43 @@ def test_catalog_compressed_cache_reports_physical_and_access_scales():
         allocated["payload_bytes_per_stage_rank"], allocated["scale_bytes_per_stage_rank"],
         allocated["metadata_bytes_per_stage_rank"],
     )] == allocated["total_bytes_per_stage_rank"]
+
+
+def test_tile_solver_and_fusion_budget_fp32_ub_upcast_and_simt_carveout():
+    """AIV FP32 (4B/elem) UB upcast and 16 KiB SIMT UB carveout enforce hardware ceilings."""
+    from types import SimpleNamespace
+    from mindie_sim.prediction.fusion.contract import CubeResources, OpNode, TensorValue, TypedGraph, _cube_operands
+    from mindie_sim.prediction.fusion.ub import AIV_FP32_UPCAST_KINDS, ub_worksheet
+    from mindie_sim.prediction.runtime.tile_solver import (
+        DEFAULT_SIMT_UB_CARVEOUT_BYTES, LiveBufferSpec, TileCandidate,
+        TileInfeasibleError, TilePipelineSpec, TileShape, solve, ub_working_bytes,
+    )
+
+    assert DEFAULT_SIMT_UB_CARVEOUT_BYTES == 16 * 1024 and ub_working_bytes(4096, 2, upcast_fp32=True) == 4096 * 4
+    cand = TileCandidate(
+        "resident_1pass", TileShape(16, 64, 64), 1, (1, 1), 1, 1,
+        (LiveBufferSpec("norm_buf", "ub", 46 * 1024, 0, 1, upcast_fp32=True, elements_per_owner=46 * 1024),),
+        uses_simt=True,
+    )
+    with pytest.raises(TileInfeasibleError):
+        solve(TilePipelineSpec("norm_upcast", (cand,)), None, SimpleNamespace(buffers=(("ub", 192 * 1024),), compute_units=1))
+    sol = solve(TilePipelineSpec("norm_upcast", (cand,)), None, SimpleNamespace(buffers=(("ub", 200 * 1024),), compute_units=1))
+    assert next(p for p in sol.pool_peaks if p.pool == "ub").peak_bytes == 46 * 1024 * 4
+    assert {"rms_norm", "layer_norm", "l2_norm", "softmax", "silu", "swiglu", "situ", "dynamic_quant"} <= AIV_FP32_UPCAST_KINDS
+    vals = {
+        "x": TensorValue("x", "bf16", (16, 128)),
+        "m": TensorValue("m", "bf16", (16, 128), producer="n"),
+        "y": TensorValue("y", "bf16", (16, 128), producer="s", public=True),
+    }
+    ops = {
+        "n": OpNode("n", "rms_norm", "vector", ("x",), ("m",)),
+        "s": OpNode("s", "swiglu", "vector", ("m",), ("y",), deps=("n",)),
+    }
+    fg = TypedGraph(16, vals, ops, public_outputs=("y",), external_inputs=("x",))
+    ws = ub_worksheet(fg, ("n", "s"), tile_rows=16, channel_width=128, capacity_per_owner=192 * 1024, uses_simt=True)
+    assert ws.usable_bytes == 192 * 1024 - 16 * 1024 and any(a.name == "fp32_working" and a.bytes_per_instance == 16 * 128 * 4 for a in ws.allocations)
+    mm_vals = {"a": TensorValue("a", "bf16", (16, 64)), "b": TensorValue("b", "fp8_e4m3", (64, 32), role="weight"), "c": TensorValue("c", "bf16", (16, 32), producer="mm", public=True)}
+    mm_op = OpNode("mm", "matmul", "cube", ("a", "b"), ("c",))
+    cube = CubeResources(l1=524288, l0a=65536, l0b=65536, l0c=131072)
+    opnd = _cube_operands(TypedGraph(16, mm_vals, {"mm": mm_op}, public_outputs=("c",)), mm_op, 16, cube)
+    assert opnd["l0a"] == 16 * 64 * 2 and opnd["l0b"] == 64 * 32 * 1

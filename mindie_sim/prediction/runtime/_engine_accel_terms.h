@@ -121,12 +121,15 @@ typedef struct {
 static uint64_t msim_ms_to_ns_even(double t_ms)
 {
     double scaled = t_ms * 1000000.0;
-    double fl, rounded;
+    double fl, frac, rounded;
     if (!isfinite(scaled) || scaled <= 0.0) return 0u;
+    if (scaled >= 18446744073709551616.0) return UINT64_MAX;
     fl = floor(scaled);
-    rounded = floor(scaled + 0.5);
-    if ((scaled - fl) == 0.5 && fmod(rounded, 2.0) != 0.0)
-        rounded -= 1.0;
+    frac = scaled - fl;
+    if (frac > 0.5) rounded = fl + 1.0;
+    else if (frac < 0.5) rounded = fl;
+    else rounded = (fmod(fl, 2.0) != 0.0) ? (fl + 1.0) : fl;
+    if (rounded >= 18446744073709551616.0) return UINT64_MAX;
     return (uint64_t)rounded;
 }
 
@@ -210,7 +213,7 @@ MSIM_EXPORT int32_t msim_validate_ring(
     for (i = 0; i < ndeps; i++) {
         if (deps[i].src_node >= nnodes || deps[i].dst_node >= nnodes)
             return MSIM_E_RANGE;
-        if (deps[i].src_node == deps[i].dst_node || deps[i].kind > 4u)
+        if (deps[i].src_node == deps[i].dst_node || deps[i].kind > 5u)
             return MSIM_E_VALUE;
     }
     return 0;

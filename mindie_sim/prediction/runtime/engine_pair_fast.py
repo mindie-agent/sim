@@ -14,6 +14,10 @@ import math
 
 from .engine_types import ExecutionError, _Task
 
+_PAIR_MODE_COUPLED_RATES = 3
+_PAIR_MODE_DUAL_SINGLE = 4
+_PAIR_MODE_COUPLED_SCALED = 5
+
 
 class _EnginePairFastMixin:
     def _step_pair_fast(
@@ -36,7 +40,7 @@ class _EnginePairFastMixin:
             if wdt_s < dt:
                 dt = wdt_s
         mode = cp_fast[0]
-        if mode == 3:
+        if mode == _PAIR_MODE_COUPLED_RATES:
             _, kc, tc, c_rates, ku, tu, name_u, rate_u = cp_fast
             rem_c = tc.remaining
             rem_u = tu.remaining
@@ -102,7 +106,7 @@ class _EnginePairFastMixin:
                 if not rem_u and tu.latency <= 0.0:
                     completable_seen.add(ku)
                     heapq.heappush(completable, ku)
-        elif mode == 4:
+        elif mode == _PAIR_MODE_DUAL_SINGLE:
             _, k0, t0, n0, rate0, k1, t1, n1, rate1 = cp_fast
             rem0 = t0.remaining
             rem1 = t1.remaining
@@ -164,14 +168,12 @@ class _EnginePairFastMixin:
                 if t1.latency <= 0.0:
                     completable_seen.add(k1)
                     heapq.heappush(completable, k1)
-        elif mode == 5:
+        elif mode == _PAIR_MODE_COUPLED_SCALED:
             _, kc, tc, c_items, fc, ku, tu, name_u, rate_u = cp_fast
             rem_c = tc.remaining
             rem_u = tu.remaining
             if fc:
                 for rname, amt in c_items:
-                    if (amt * fc) == 0.0:
-                        raise ExecutionError(f"service_rate_underflow:{rname}")
                     if (amt * fc) == 0.0:
                         raise ExecutionError(f"service_rate_underflow:{rname}")
                     wdt = rem_c[rname] / (amt * fc)
@@ -338,6 +340,8 @@ class _EnginePairFastMixin:
                                  if rname in rem_c and amt > 0.0))
             if fc:
                 for rname, amt in c_iter:
+                    if (amt * fc) == 0.0:
+                        raise ExecutionError(f"service_rate_underflow:{rname}")
                     wdt = rem_c[rname] / (amt * fc)
                     if wdt < dt:
                         dt = wdt

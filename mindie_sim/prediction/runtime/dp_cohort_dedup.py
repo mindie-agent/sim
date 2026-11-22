@@ -156,11 +156,18 @@ def _ops_symmetric(
     if (op0.op_id != op_r.op_id or op0.family != op_r.family
             or op0.stage != op_r.stage or op0.layer != op_r.layer
             or op0.deps != op_r.deps or op0.flops != op_r.flops
+            or op0.matrix_flops != op_r.matrix_flops
             or op0.vector_ops != op_r.vector_ops
             or op0.hbm_bytes != op_r.hbm_bytes
             or op0.mte2_bytes != op_r.mte2_bytes
             or op0.mte3_bytes != op_r.mte3_bytes
             or op0.link_bytes != op_r.link_bytes
+            or op0.link_scope != op_r.link_scope
+            or op0.local_shape != op_r.local_shape
+            or op0.padded_shape != op_r.padded_shape
+            or op0.launch_shape != op_r.launch_shape
+            or op0.layout != op_r.layout
+            or op0.returns != op_r.returns
             or op0.dtype != op_r.dtype or op0.recipe != op_r.recipe
             or op0.stream != op_r.stream or op0.phase != op_r.phase
             or op0.source_boundary != op_r.source_boundary):
@@ -331,6 +338,7 @@ def is_symmetric_dp_cohort(
             or getattr(getattr(execution, "regimes", None), "rules", None)
             or getattr(execution, "stream_owners", None)
             or getattr(execution, "stream_quota_by_res", None)
+            or getattr(execution, "stars_queues", None)
             or execution.offload_policy is not None
             or execution._joint_collective_trace is not None
             or engine.memory is not None or engine._memory_grants
@@ -504,6 +512,7 @@ def _mirror_replica_resources(
         rep: tuple(rk for s in range(pp) for rk in topology.ranks(rep, s))
         for rep in (r0, *peers)
     }
+    port_by_class: dict[tuple[str, str, int, float], tuple[float, float]] = {}
     tx_by_class: dict[tuple[str, int, float], tuple[float, float]] = {}
     pair_by_class: dict[tuple[str, float], tuple[float, float]] = {}
     intra_pair_by_pos: dict[tuple[str, int, int, float], tuple[float, float]] = {}
@@ -519,10 +528,13 @@ def _mirror_replica_resources(
             pfx = m_port.group("pfx")
             direction = m_port.group("dir")
             rk_id = int(m_port.group("rk"))
-            if direction == "tx" and rk_id in r0_pos:
+            if rk_id in r0_pos:
                 pos = r0_pos[rk_id]
                 lclass = pfx.rsplit(":", 1)[0] if ":" in pfx else pfx
-                tx_by_class[(lclass, pos, rate_val)] = (amt, busy.get(res_name, 0.0))
+                pair_val = (amt, busy.get(res_name, 0.0))
+                port_by_class[(lclass, direction, pos, rate_val)] = pair_val
+                if direction == "tx":
+                    tx_by_class[(lclass, pos, rate_val)] = pair_val
             continue
         m_pair = _PAIR_RE.match(res_name)
         if m_pair:
@@ -542,7 +554,7 @@ def _mirror_replica_resources(
         for rep, rk_list in all_ranks_by_rep.items()
         for pos, rk in enumerate(rk_list)
     }
-    if tx_by_class or pair_by_class or intra_pair_by_pos:
+    if port_by_class or tx_by_class or pair_by_class or intra_pair_by_pos:
         for res_name in list(serviced):
             if "link:" not in res_name:
                 continue
@@ -551,12 +563,15 @@ def _mirror_replica_resources(
             m_port = _PORT_RE.match(res_name)
             if m_port:
                 pfx = m_port.group("pfx")
+                direction = m_port.group("dir")
                 rk_id = int(m_port.group("rk"))
                 info = rank_to_rep_pos.get(rk_id)
                 if info is not None:
                     _, pos = info
                     lclass = pfx.rsplit(":", 1)[0] if ":" in pfx else pfx
-                    val = tx_by_class.get((lclass, pos, rate_val))
+                    val = port_by_class.get((lclass, direction, pos, rate_val))
+                    if val is None and direction == "rx":
+                        val = tx_by_class.get((lclass, pos, rate_val))
                     if val is not None:
                         serviced[res_name], busy[res_name] = val
                 continue

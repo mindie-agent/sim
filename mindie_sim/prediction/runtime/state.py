@@ -331,7 +331,7 @@ class RuntimeState:
                 value, maxlen=getattr(value, "maxlen", None))
         self._trace_dq = self._trace_view._dq
         ml = self._trace_view.maxlen
-        self._trace_maxlen = 0 if ml is None else int(ml)
+        self._trace_maxlen = -1 if ml is None else int(ml)
 
     @property
     def allocation_trace(self):

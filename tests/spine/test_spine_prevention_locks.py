@@ -289,7 +289,7 @@ def test_live_dispatch_rejects_flat_program_callbacks(monkeypatch, traced_plan_p
         return prepared, replace(plan, program=callback)
 
     monkeypatch.setattr(RecipeBook, "prepare", route_to_flat)
-    with pytest.raises(AssertionError, match=r"OperatorPlan\.program.*prediction\.call_builders_operators"):
+    with pytest.raises(AssertionError, match=r"OperatorPlan\.program.*prediction\.call_builders"):
         execute_one(case, views, op)
 
 

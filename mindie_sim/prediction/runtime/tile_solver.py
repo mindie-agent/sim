@@ -37,11 +37,26 @@ ALGORITHM_LADDER_RANK: Mapping[str, int] = {
 DEFAULT_POOL_GRANULE_BYTES = 32
 DEFAULT_INST_BLOCK_DIM = 16
 DEFAULT_L2_GRANULE_BYTES = 128
+DEFAULT_SIMT_UB_CARVEOUT_BYTES = 16 * 1024
+AIV_UPCAST_BYTES_PER_ELEM = 4
 CHECKED_POOLS = ("ub", "l1", "l0a", "l0b", "l0c", "l2", "bt", "fb", "ssbuffer")
 _POOL_ALIASES = {"bias_table": "bt", "fixpipe_buffer": "fb"}
 _FIXPIPE_BUFFER_ALIGNMENT_BYTES = 64
 AIC_POOLS = frozenset({"l1", "l0a", "l0b", "l0c", "bt", "fb", *_POOL_ALIASES})
 AIV_POOLS = frozenset({"ub"})
+
+
+def ub_working_bytes(
+    elements: int,
+    element_bytes: int = 2,
+    *,
+    upcast_fp32: bool = False,
+) -> int:
+    """Compute UB working-set bytes, charging ``4B/elem`` (FP32) on AIV upcast."""
+    if elements < 0 or element_bytes < 1:
+        raise ModelingError("ub_working_bytes_invalid_dimensions")
+    eff_bytes = max(int(element_bytes), AIV_UPCAST_BYTES_PER_ELEM) if upcast_fp32 else int(element_bytes)
+    return int(elements) * eff_bytes
 
 
 def _ceil_div(numerator: int, denominator: int) -> int:
@@ -106,11 +121,13 @@ class LiveBufferSpec:
     alignment_bytes: int = DEFAULT_POOL_GRANULE_BYTES
     scale_bytes: int = 0
     slots: int = 1
+    upcast_fp32: bool = False
+    elements_per_owner: int = 0
 
     def __post_init__(self) -> None:
         if not self.name or not self.pool:
             raise ModelingError("live_buffer_identity_required")
-        if self.bytes_per_owner < 0 or self.scale_bytes < 0 or self.slots < 1:
+        if self.bytes_per_owner < 0 or self.scale_bytes < 0 or self.slots < 1 or self.elements_per_owner < 0:
             raise ModelingError(f"live_buffer_size_invalid:{self.name}")
         if self.live_end < self.live_start:
             raise ModelingError(f"live_buffer_interval_reversed:{self.name}")
@@ -274,7 +291,10 @@ def _pool_peak_bytes(
             )):
                 continue
             eff_granule = max(granule, buf.alignment_bytes)
-            per_slot = _align_up(buf.bytes_per_owner + buf.scale_bytes, eff_granule)
+            payload_bytes = buf.bytes_per_owner
+            if pool == "ub" and buf.upcast_fp32 and buf.elements_per_owner > 0:
+                payload_bytes = max(payload_bytes, buf.elements_per_owner * AIV_UPCAST_BYTES_PER_ELEM)
+            per_slot = _align_up(payload_bytes + buf.scale_bytes, eff_granule)
             total_b = per_slot * buf.slots
             if pool == "l2":
                 kind_scale = int(scales.get(buf.owner_kind, 1))
@@ -311,7 +331,13 @@ def _available_pool_capacity(
         g = max(1, l2_granule)
         return g * (avail // (g * max(1, spec.active_l2_streams)))
     if pool == "ub" and uses_simt:
-        return max(0, raw_cap - spec.simt_ub_carveout_bytes)
+        dp = getattr(hw, "datapath", None)
+        hw_carveout = max(
+            int(getattr(hw, "simt_ub_carveout_bytes", 0) or 0),
+            int(getattr(dp, "simt_ub_carveout_bytes", 0) or 0) if dp is not None else 0,
+        )
+        carveout = max(int(spec.simt_ub_carveout_bytes), hw_carveout, DEFAULT_SIMT_UB_CARVEOUT_BYTES)
+        return max(0, raw_cap - carveout)
     return max(0, raw_cap)
 
 
@@ -501,11 +527,13 @@ def solve(spec: TilePipelineSpec, op: Any, hw: Any) -> TileSolution:
 
 
 __all__ = [
+    "AIV_UPCAST_BYTES_PER_ELEM",
     "ALGORITHM_LADDER_RANK",
     "AlgorithmKind",
     "CHECKED_POOLS",
     "DEFAULT_INST_BLOCK_DIM",
     "DEFAULT_POOL_GRANULE_BYTES",
+    "DEFAULT_SIMT_UB_CARVEOUT_BYTES",
     "LiveBufferSpec",
     "OwnerPoolPeak",
     "SubtileWaveSpec",
@@ -516,4 +544,5 @@ __all__ = [
     "TileShape",
     "TileSolution",
     "solve",
+    "ub_working_bytes",
 ]

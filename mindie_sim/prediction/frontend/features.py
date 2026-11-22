@@ -640,8 +640,10 @@ class FeatureConfig:
         return cls(**base)
 
     def with_parallel(self, parallel: ParallelSpec) -> "FeatureConfig":
+        eff_etp = min(self.etp, parallel.tp) if parallel.tp > 0 else self.etp
         return replace(self, tp=parallel.tp, ep=parallel.ep, pp=parallel.pp,
                        dp=parallel.dp, cp=parallel.cp, pcp=parallel.pcp,
+                       etp=eff_etp,
                        cp_plan=str(getattr(parallel, "cp_plan", self.cp_plan)))
 
 __all__ = ["FeatureConfig"]

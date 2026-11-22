@@ -207,8 +207,10 @@ def homogeneous_layer_runs(ops: Sequence[Any],
     templates = layer_templates(ops, plans)
     if not templates:
         return ()
-    layers = sorted({int(getattr(op, "layer", -1)) for op in ops
-                     if int(getattr(op, "layer", -1)) >= 0})
+    layers = list(dict.fromkeys(
+        int(getattr(op, "layer", -1)) for op in ops
+        if int(getattr(op, "layer", -1)) >= 0
+    ))
     plans = tuple(plans or ())
     plan_for = {int(getattr(plan, "index", index)): plan
                 for index, plan in enumerate(plans)}

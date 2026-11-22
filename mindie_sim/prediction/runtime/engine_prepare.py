@@ -524,7 +524,9 @@ class _EnginePrepareMixin:
             frozenset(k for k, _ in demands_tuple), static.solo_rates,
             static.coupled_res_info, static.uncoupled_res_info,
             p_masks_1, static.cohort_widened, static.cohort_members,
-            static.latency_from_first_service)
+            static.latency_from_first_service,
+            hbm_bus_epoch=static.hbm_bus_epoch,
+            hbm_accounting=static.hbm_accounting)
 
     def _prepare_static_stage(self, lookup_stage) -> _PreparedTask:
         id_cache = self._stage_id_prepared

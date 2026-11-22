@@ -95,6 +95,9 @@ def reclaim_arena(backend, engine) -> None:
                          if (backend.has_fair_res and backend.pending) else None)
 
 
+RECLAIM_STORAGE_THRESHOLD = 65536
+
+
 def flush_pending(backend, engine) -> None:
     """Mirror every queued row into the kernel at the current instant."""
     if backend.external:
@@ -107,8 +110,10 @@ def flush_pending(backend, engine) -> None:
         backend.arena.call("msim_ctx_drop", backend.drops)
         backend.drops.clear()
     if (not engine._native_slots and backend.pending
-            and (backend.epoch_storage > 65536 or backend.epoch_links > MAX_L
-                 or backend.epoch_tasks > MAX_T)):
+            and (backend.epoch_storage > RECLAIM_STORAGE_THRESHOLD
+                 or backend.epoch_links > MAX_L
+                 or backend.epoch_tasks > MAX_T
+                 or backend.epoch_edges > MAX_OWN)):
         reclaim_arena(backend, engine)
     if not backend.pending:
         if backend.deliver:
@@ -484,6 +489,7 @@ def sync_back(backend, engine) -> None:
         requeue_pending(engine, task, pending, releases)
     engine._native_seqs.clear()
     engine._native_slots.clear()
+    engine._native_active = 0
     backend.pending.clear()
     backend.deliver.clear()
     backend.drops.clear()

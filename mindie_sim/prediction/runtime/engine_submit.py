@@ -392,9 +392,10 @@ class _EngineSubmitMixin:
         elif pending is not None:
             for predecessor in pending:
                 predecessor._waiters.append(seq_launch)
-        if self._accel is not None and (pending_one is not None or pending is not None):
-            self._accel.note_external_predecessors(
-                self, (pending_one,) if pending_one is not None else pending)
+        if pending_one is not None or pending is not None:
+            if self._accel is not None:
+                self._accel.note_external_predecessors(
+                    self, (pending_one,) if pending_one is not None else pending)
         elif release <= now:
             if seq_launch not in self._ready_seen:
                 self._ready_seen.add(seq_launch)

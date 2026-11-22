@@ -38,6 +38,8 @@ _FAMILY_KIND = {
     "gemm": "matmul", "gate_up_projection": "matmul",
     "down_projection": "matmul", "shared_expert": "matmul",
     "grouped_gemm": "grouped_matmul", "swiglu": "swiglu",
+    "silu": "silu", "situ": "situ", "gelu": "gelu", "sigmoid": "sigmoid",
+    "softmax": "softmax", "l2_norm": "l2_norm", "l2norm": "l2_norm",
     "rotary": "rope", "topk": "topk", "attention": "attention",
     "indexer": "attention", "native_fusion": "matmul",
 }
@@ -568,7 +570,10 @@ def project_graph(case, ops: tuple[OpSpec, ...], *,
     for op in ops:
         meta = _metadata(op)
         kind = _family_kind(op.family)
-        resource = "cube" if (op.flops or op.family in _CUBE_FAMILIES) else (
+        vec_only_native = op.family == "native_fusion" and not op.flops and bool(op.vector_ops)
+        if vec_only_native:
+            kind = "elementwise"
+        resource = "cube" if (op.flops or (op.family in _CUBE_FAMILIES and not vec_only_native)) else (
             "mix" if op.link_bytes else "vector")
         if op.family in {"allreduce", "allgather", "reduce_scatter"}:
             resource = "mix"
