@@ -31,12 +31,96 @@ from mindie_sim.catalog.ops import comm_op, compute_dtype_for, gemm_op, vector_o
 from mindie_sim.catalog.types import EngramSpec, QuantSpec
 from mindie_sim.schema.model import ModelSpec
 from mindie_sim.schema.operators import OpSpec
-from mindie_sim.schema.common import ModelingError, dtype_bytes
+from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.parallel import ParallelSpec
 
 
 def _requests(views: Sequence[Any]) -> tuple[str, ...]:
     return tuple(view.request_id for view in views)
+
+
+def _lower_engram_table(
+    *, prefix: str, table: Any, engram: EngramSpec, plan: Any, stage: int,
+    deps: str, parallel: ParallelSpec, mode: str, padded_tokens: int,
+    requests: tuple[str, ...], runtime: Any,
+) -> tuple[list[OpSpec], str]:
+    """Lower one Engram table's query, ID exchange, gather/staging, and TP broadcast."""
+    lookups = max(1, padded_tokens * engram.lookups_per_token_per_table)
+    query = vector_op(
+        op_id=f"{prefix}.engram_query_t{table.table_id}", deps=(deps,),
+        stage=stage, layer=plan.index, requests=requests,
+        elements=lookups, ops_per_element=2.0, dtype="fp32",
+        family="engram_query", phase=mode, recipe="catalog_engram_query",
+        semantic_family="engram_ngram_query_construction",
+        shape=(padded_tokens, engram.lookups_per_token_per_table),
+        metadata=(("table_id", table.table_id), ("max_ngram", engram.max_ngram),
+                  ("heads", engram.heads), ("no_dedup", engram.no_dedup),
+                  ("lookups", lookups), ("lookup_id_bytes", engram.id_bytes)),
+    )
+    id_exchange = comm_op(
+        op_id=f"{prefix}.engram_ids_t{table.table_id}", deps=(query.op_id,),
+        stage=stage, layer=plan.index, requests=requests,
+        family="engram_ids", phase=mode, recipe="catalog_engram_node_exchange",
+        link_bytes=float(lookups * engram.id_bytes * (parallel.tp - 1) / max(1, parallel.tp)),
+        shape=(lookups,),
+        metadata=(("table_id", table.table_id),
+                  ("diagonal_is_local", True),
+                  ("owner_scope", "node_local"),
+                  ("request_count_conserved", lookups)),
+    )
+    table_ops: list[OpSpec] = [query, id_exchange]
+    host_bytes = lookups * engram.host_response_bytes if runtime.engram_cpu_offload else 0
+    gather_deps = (id_exchange.op_id,)
+    if host_bytes > 0:
+        host = vector_op(
+            op_id=f"{prefix}.engram_host_t{table.table_id}",
+            deps=(id_exchange.op_id,), stage=stage, layer=plan.index,
+            requests=requests, family="engram_rh2d", phase=mode,
+            recipe="engram_cpu_decode_pinned_staging_h2d",
+            elements=0, ops_per_element=0, dtype="bf16", shape=(host_bytes,),
+            read_bytes_override=0, write_bytes_override=host_bytes,
+            metadata=(("resource_work", {"host_memory": lookups * engram.row_bytes,
+                                         "host_vector": lookups * engram.width * 2,
+                                         "h2d": host_bytes}),),
+        )
+        table_ops.append(host)
+        gather_deps = (host.op_id,)
+    device_dtype = {
+        "device_bf16": "bf16", "device_int8_fp32": "int8",
+        "host_fp8_e8m0": "fp8_e4m3",
+    }.get(engram.storage_mode, "bf16")
+    gather = vector_op(
+        op_id=f"{prefix}.engram_gather_t{table.table_id}", deps=gather_deps,
+        stage=stage, layer=plan.index, requests=requests,
+        elements=max(1, lookups * engram.width), ops_per_element=2.0,
+        dtype=device_dtype, family="engram_gather", phase=mode,
+        recipe="catalog_engram_device_gather",
+        semantic_family="engram_device_table_gather_dequant",
+        read_write=1.0,
+        hbm_bytes_override=float(lookups) * engram.row_bytes,
+        shape=(lookups, engram.width),
+        metadata=(("table_id", table.table_id),
+                  ("storage_mode", engram.storage_mode),
+                  ("storage_row_bytes", engram.row_bytes),
+                  ("response_bytes_per_lookup", engram.host_response_bytes),
+                  ("storage_and_response_distinct", True),
+                  ("device_table_row_bytes", engram.row_bytes)),
+    )
+    if runtime.engram_cpu_offload:
+        gather = replace(gather, hbm_bytes=0, mte2_bytes=0, mte3_bytes=0, vector_ops=0)
+    broadcast = comm_op(
+        op_id=f"{prefix}.engram_broadcast_t{table.table_id}",
+        deps=(gather.op_id,), stage=stage, layer=plan.index,
+        requests=requests, family="engram_broadcast", phase=mode,
+        recipe="catalog_engram_tp_broadcast",
+        link_bytes=float(lookups * engram.host_response_bytes
+                         * (parallel.tp - 1) / max(1, parallel.tp)),
+        shape=(lookups, engram.width),
+        metadata=(("table_id", table.table_id), ("scope", "tp_group"),
+                  ("response_count_conserved", lookups)),
+    )
+    table_ops.extend([gather, broadcast])
+    return table_ops, broadcast.op_id
 
 
 def lower_engram(
@@ -57,88 +141,17 @@ def lower_engram(
     requests = _requests(views)
     h = model.hidden_size
     hc_mult = plan.hc_mult or 1
-    table_lookup_lists: list[str] = []
     response_lists: list[str] = []
     for table in engram.tables:
         if table.layer_id != plan.index:
             continue
-        lookups = max(1, padded_tokens * engram.lookups_per_token_per_table)
-        query = vector_op(
-            op_id=f"{prefix}.engram_query_t{table.table_id}", deps=(deps,),
-            stage=stage, layer=plan.index, requests=requests,
-            elements=lookups, ops_per_element=2.0, dtype="fp32",
-            family="engram_query", phase=mode, recipe="catalog_engram_query",
-            semantic_family="engram_ngram_query_construction",
-            shape=(padded_tokens, engram.lookups_per_token_per_table),
-            metadata=(("table_id", table.table_id), ("max_ngram", engram.max_ngram),
-                      ("heads", engram.heads), ("no_dedup", engram.no_dedup),
-                      ("lookups", lookups), ("lookup_id_bytes", engram.id_bytes)),
+        table_ops, broadcast_id = _lower_engram_table(
+            prefix=prefix, table=table, engram=engram, plan=plan, stage=stage,
+            deps=deps, parallel=parallel, mode=mode, padded_tokens=padded_tokens,
+            requests=requests, runtime=runtime,
         )
-        id_exchange = comm_op(
-            op_id=f"{prefix}.engram_ids_t{table.table_id}", deps=(query.op_id,),
-            stage=stage, layer=plan.index, requests=requests,
-            family="engram_ids", phase=mode, recipe="catalog_engram_node_exchange",
-            link_bytes=float(lookups * engram.id_bytes * (parallel.tp - 1) / max(1, parallel.tp)),
-            shape=(lookups,),
-            metadata=(("table_id", table.table_id),
-                      ("diagonal_is_local", True),
-                      ("owner_scope", "node_local"),
-                      ("request_count_conserved", lookups)),
-        )
-        ops.extend([query, id_exchange])
-        table_lookup_lists.append(id_exchange.op_id)
-        host_bytes = lookups * engram.host_response_bytes if runtime.engram_cpu_offload else 0
-        gather_deps = (id_exchange.op_id,)
-        if host_bytes > 0:
-            host = vector_op(
-                op_id=f"{prefix}.engram_host_t{table.table_id}",
-                deps=(id_exchange.op_id,), stage=stage, layer=plan.index,
-                requests=requests, family="engram_rh2d", phase=mode,
-                recipe="engram_cpu_decode_pinned_staging_h2d",
-                elements=0, ops_per_element=0, dtype="bf16", shape=(host_bytes,),
-                read_bytes_override=0, write_bytes_override=host_bytes,
-                metadata=(("resource_work", {"host_memory": lookups * engram.row_bytes,
-                                             "host_vector": lookups * engram.width * 2,
-                                             "h2d": host_bytes}),),
-            )
-            ops.append(host)
-            gather_deps = (host.op_id,)
-        device_dtype = {
-            "device_bf16": "bf16", "device_int8_fp32": "int8",
-            "host_fp8_e8m0": "fp8_e4m3",
-        }.get(engram.storage_mode, "bf16")
-        gather = vector_op(
-            op_id=f"{prefix}.engram_gather_t{table.table_id}", deps=gather_deps,
-            stage=stage, layer=plan.index, requests=requests,
-            elements=max(1, lookups * engram.width), ops_per_element=2.0,
-            dtype=device_dtype, family="engram_gather", phase=mode,
-            recipe="catalog_engram_device_gather",
-            semantic_family="engram_device_table_gather_dequant",
-            read_write=1.0,
-            hbm_bytes_override=float(lookups) * engram.row_bytes,
-            shape=(lookups, engram.width),
-            metadata=(("table_id", table.table_id),
-                      ("storage_mode", engram.storage_mode),
-                      ("storage_row_bytes", engram.row_bytes),
-                      ("response_bytes_per_lookup", engram.host_response_bytes),
-                      ("storage_and_response_distinct", True),
-                      ("device_table_row_bytes", engram.row_bytes)),
-        )
-        if runtime.engram_cpu_offload:
-            gather = replace(gather, hbm_bytes=0, mte2_bytes=0, mte3_bytes=0, vector_ops=0)
-        broadcast = comm_op(
-            op_id=f"{prefix}.engram_broadcast_t{table.table_id}",
-            deps=(gather.op_id,), stage=stage, layer=plan.index,
-            requests=requests, family="engram_broadcast", phase=mode,
-            recipe="catalog_engram_tp_broadcast",
-            link_bytes=float(lookups * engram.host_response_bytes
-                             * (parallel.tp - 1) / max(1, parallel.tp)),
-            shape=(lookups, engram.width),
-            metadata=(("table_id", table.table_id), ("scope", "tp_group"),
-                      ("response_count_conserved", lookups)),
-        )
-        ops.extend([gather, broadcast])
-        response_lists.append(broadcast.op_id)
+        ops.extend(table_ops)
+        response_lists.append(broadcast_id)
     if not response_lists:
         raise ModelingError(f"catalog_engram_table_not_at_layer:{plan.index}")
     join = comm_op(

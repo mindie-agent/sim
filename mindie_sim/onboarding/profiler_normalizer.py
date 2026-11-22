@@ -267,6 +267,30 @@ def _lowered_op_to_profiler_node(pid: str, op_rec: Mapping[str, Any], *, attn_sh
     return {"node_id": nid, "op_id": oid, "kind": "operator", "op": "vector_add", "builder": "vector_add", "family": "elementwise", "recipe": "residual_add", "implementation": "aclnnAdd", "dtype": "bf16", "shape": {"tokens": total_tokens, "width": width}}, {"op_id": oid, "family": fam, "recipe": rec, "builder": "vector_add"}
 
 
+def _resolve_family_shape(
+    pbld: str, *, tok_val: int, width: int, tp: int, ep: int,
+    local_heads: int, topo: str, topo_opts: dict[str, int],
+) -> tuple[dict[str, Any], dict[str, int]]:
+    """Build the shape dict and adjusted topo options for a registered family binding."""
+    if pbld == "matmul":
+        return (
+            {"tokens": tok_val, "m": tok_val, "n": width, "k": max(1, width // tp), "dtype": "bf16", "parallel_topology": topo},
+            {**topo_opts, "graph_capture_mode": "none"},
+        )
+    if pbld == "grouped_matmul":
+        loc_e = max(1, _MOE_EXPERT_BANK // ep)
+        return (
+            {"tokens": tok_val, "m": tok_val * _MOE_TOPK_EXPERTS, "n": max(1, _MOE_GATE_UP_WIDTH // tp), "k": width, "e": loc_e, "matrix_groups": loc_e, "dtype": "bf16", "parallel_topology": topo},
+            {**topo_opts, "graph_capture_mode": "none"},
+        )
+    if pbld == "rotary_embedding":
+        return (
+            {"tokens": tok_val, "heads": local_heads, "head_dim": _DEFAULT_HEAD_DIM, "parallel_topology": topo},
+            topo_opts,
+        )
+    return {"tokens": tok_val, "width": width, "parallel_topology": topo}, topo_opts
+
+
 def resolve_point_binding_and_shape(
     plan_doc: Mapping[str, Any], pt: Mapping[str, Any], *, sku: str, profile_override: Mapping[str, Any] | None = None,
 ) -> tuple[str, str, str, str, str, dict[str, Any], dict[str, Any]]:
@@ -319,17 +343,10 @@ def resolve_point_binding_and_shape(
         model_name = _INDEXER_SIM_MODEL if sim_fam in {"indexer", "layernorm", "rotary"} else _DEFAULT_SIM_MODEL
         width = _MLA_HIDDEN_WIDTH if model_name == _DEFAULT_SIM_MODEL else _DEFAULT_HIDDEN_WIDTH
         tok_val = val if axis == "tokens" else max(1, (val if axis == "batch_x_kv_heads" else batch) * q_tok)
-        if pbld == "matmul":
-            shape = {"tokens": tok_val, "m": tok_val, "n": width, "k": max(1, width // tp), "dtype": "bf16", "parallel_topology": topo}
-            topo_opts = {**topo_opts, "graph_capture_mode": "none"}
-        elif pbld == "grouped_matmul":
-            loc_e = max(1, _MOE_EXPERT_BANK // ep)
-            shape = {"tokens": tok_val, "m": tok_val * _MOE_TOPK_EXPERTS, "n": max(1, _MOE_GATE_UP_WIDTH // tp), "k": width, "e": loc_e, "matrix_groups": loc_e, "dtype": "bf16", "parallel_topology": topo}
-            topo_opts = {**topo_opts, "graph_capture_mode": "none"}
-        elif pbld == "rotary_embedding":
-            shape = {"tokens": tok_val, "heads": local_heads, "head_dim": _DEFAULT_HEAD_DIM, "parallel_topology": topo}
-        else:
-            shape = {"tokens": tok_val, "width": width, "parallel_topology": topo}
+        shape, topo_opts = _resolve_family_shape(
+            pbld, tok_val=tok_val, width=width, tp=tp, ep=ep,
+            local_heads=local_heads, topo=topo, topo_opts=topo_opts,
+        )
     else:
         pfam, prec, pbld, impl, sim_fam, model_name = plan_family, plan_family, "", str(plan_doc.get("target_id") or plan_family), plan_family, _DEFAULT_SIM_MODEL
         shape = {"tokens": val if axis == "tokens" else max(1, batch * q_tok), "width": _MLA_HIDDEN_WIDTH, "parallel_topology": topo}

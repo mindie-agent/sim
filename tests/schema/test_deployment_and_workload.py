@@ -455,8 +455,16 @@ def test_mla_projection_dependencies_and_weight_placement_follow_declared_format
                 "bf16_index": {"indexer.weights": BF16}}.get(mode)
     case = projection_case(override)
     if mode == "source":
+        plans = tuple(
+            replace(
+                p, qk_rope_head_dim=64, qk_nope_head_dim=192,
+                index_kpool=1, index_kpool_compress=False,
+            ) if p.attention == "mla" and p.qk_rope_head_dim == 0 else p
+            for p in case.model.layer_plans
+        )
         kernels = case.runtime.kernels | {"lowerings": {"mla_prolog": "vllm_ascend_mla_prolog_v3"}}
-        case = replace(case, runtime=replace(case.runtime, kernels=kernels))
+        case = replace(case, model=replace(case.model, layer_plans=plans),
+                       runtime=replace(case.runtime, kernels=kernels))
     ops = layer_graph(case, 3)
     if mode in {"mixed", "source"}:
         assert "qkv_a" not in ops and ops["kv_a"].dtype == "bf16"

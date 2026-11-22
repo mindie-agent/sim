@@ -7,10 +7,13 @@
 [Side-Effect Policy] Pure read-only analysis."""
 from __future__ import annotations
 
-from hashlib import sha256
+from collections import OrderedDict
+from contextlib import ExitStack
 from functools import lru_cache
+from hashlib import sha256
 import json
 import re
+from tempfile import SpooledTemporaryFile
 
 
 _WORK = ("flops", "hbm_bytes", "mte2_bytes", "mte3_bytes", "vector_ops", "link_bytes")
@@ -180,11 +183,6 @@ def subgraph_physical(by_id, group):
     }
 
 
-from contextlib import ExitStack
-from hashlib import sha256
-import json
-from tempfile import SpooledTemporaryFile
-
 ARRAYS = ('nodes', 'source_calls', 'subgraphs', 'resource_operators')
 
 
@@ -322,12 +320,6 @@ def _scan_structure(case, consume, *, draft_prepare: bool = False, **geometry):
         digest.update(b'}')
     return {'graph_id': 'sha256:' + digest.hexdigest(), 'execution': execution,
             'record_counts': counts}
-
-
-from hashlib import sha256
-import json
-from collections import OrderedDict
-
 
 
 SCHEMA_VERSION = 'mindie-model-structure-index/1'

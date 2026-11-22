@@ -598,3 +598,40 @@ def test_two_receivers_read_one_named_source_extent():
     assert {(tuple(t["source_byte_range"]), tuple(t["source_token_span"])) for t in rows} == {((0, 5760), (5, 10))}
     assert len({(t["destination_rank"], t["destination_storage"]) for t in rows}) == 2 == len(rows)
     assert sum(t["payload_bytes"] for t in rows) == 11520
+
+
+def test_paired_sfa_caps_draft_kv_pages_at_draft_max_model_len() -> None:
+    from mindie_sim.catalog.cache_pages import CachePages
+    from mindie_sim.catalog.paired_sfa import page_groups
+
+    uncapped = parse_case(compose_case(
+        "kimi-k3.1", hardware=SPARSE_OFFLOAD_SKU, tp=8, ep=8, dcp=8, layers=4,
+        mtp_proposal_tokens=5, max_model_len=131072,
+        prompt_tokens=1024, output_tokens=16,
+    ))
+    capped = parse_case(compose_case(
+        "kimi-k3.1", hardware=SPARSE_OFFLOAD_SKU, tp=8, ep=8, dcp=8, layers=4,
+        mtp_proposal_tokens=5, max_model_len=131072, draft_max_model_len=4096,
+        prompt_tokens=1024, output_tokens=16,
+    ))
+    layer_stage = [0] * len(uncapped.model.layer_plans)
+    groups_uncapped = page_groups(uncapped, layer_stage, query_tokens=6)
+    groups_capped = page_groups(capped, layer_stage, query_tokens=6)
+
+    assert len(groups_uncapped) == 1
+    assert len(groups_capped) == 2
+    main_g, aux_g = groups_capped
+    assert aux_g["auxiliary"] is True
+    assert aux_g["resident_tokens"] == 4096
+    assert aux_g["recycling_pages"] == 0
+    assert main_g["bytes_per_group_page"] < groups_uncapped[0]["bytes_per_group_page"]
+
+    comp_names = {p.index: ("mla_kv", "index_k", "state") for p in capped.model.layer_plans}
+    pages_uncapped = CachePages(groups_uncapped, comp_names, layer_stage)
+    pages_capped = CachePages(groups_capped, comp_names, layer_stage)
+    assert pages_capped.group_components(pages_capped.groups[1]) == {}
+    bytes_uncapped = pages_uncapped.stage_bytes(131072, 131072, 1)[0]
+    bytes_capped = pages_capped.stage_bytes(131072, 131072, 1)[0]
+    assert bytes_capped < bytes_uncapped
+    # At 4096 tokens, capped draft group holds the exact same draft pages as 131072 tokens.
+    assert pages_capped.groups[1].pages(4096, 131072) == pages_capped.groups[1].pages(131072, 131072)

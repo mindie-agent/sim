@@ -208,11 +208,12 @@ def _scale_values(operator, values, quantization):
                 value["attrs"].update(attrs)
             inputs_by_name[value["name"]] = value
             inputs_by_output[value["output"]] = value
-    quantization["scales"] = {
-        role: {key: detail.get(key) for key in
-               ("format", "storage_format", "shape", "group_size", "bytes",
-                "storage_bytes", "in_mte2", "producer") if detail.get(key) is not None}
-        for role, detail in details.items()}
+    if quantization is not None:
+        quantization["scales"] = {
+            role: {key: detail.get(key) for key in
+                   ("format", "storage_format", "shape", "group_size", "bytes",
+                    "storage_bytes", "in_mte2", "producer") if detail.get(key) is not None}
+            for role, detail in details.items()}
 
 
 def _merge_values(values, extra):
@@ -384,7 +385,6 @@ def _merge_produced_outputs(operator, contract, values, produced):
 
 
 def _bind_value_ports(operator, contract, values, context, gaps, op_id):
-    deps = operator.get("deps") or ()
     for value in values["outputs"]:
         if not value["producer"]:
             value["producer"] = op_id
@@ -417,6 +417,61 @@ def _bind_value_ports(operator, contract, values, context, gaps, op_id):
                              "detail": {"matrix_kind": contract[0],
                                         "weight_shape": value.get("shape"),
                                         "effect": "declared weight retained; producer not named"}})
+
+
+def _project_non_boundary_values(operator, contract, context, meta, gaps):
+    """Project values for operators that do not declare an audit boundary."""
+    attention = (_attention_values(operator)
+                 if operator.get("family") == "attention"
+                 and meta.get("gqa_decode") and contract is None else None)
+    if attention is not None:
+        gaps.extend(attention["gaps"])
+        return attention, attention, attention["semantic_attrs"], ["output"]
+    view = (_view_values(operator, context)
+            if meta.get("source_layout") or meta.get("target_layout") else None)
+    if view is not None:
+        gaps.extend(view["gaps"])
+        return view, None, [], []
+    family = operator.get("family")
+    if family == "swiglu" and contract is not None:
+        values = _swiglu_values(operator, contract, context)
+        gaps.extend(values["gaps"])
+        return values, None, [], []
+    if family == "recurrent_vector" and contract is not None:
+        values = _recurrent_values(operator, contract, context)
+        gaps.extend(values["gaps"])
+        return values, None, [], []
+    if family == "tensor_copy":
+        copied = _tensor_copy_values(operator, contract, context)
+        if copied is not None:
+            gaps.extend(copied["gaps"])
+            return copied, None, [], []
+        inputs, outputs = _declared_metadata_values(operator)
+        basis = "operator_metadata" if inputs or outputs else "unavailable"
+        return {"inputs": inputs, "outputs": outputs, "declared": [], "basis": basis}, None, [], []
+    projected = (_matrix_values(contract) or _common_values(contract)
+                 if contract is not None else None)
+    if projected is not None:
+        inputs, outputs, declared, _extra = projected
+        return {"inputs": inputs, "outputs": outputs, "declared": declared, "basis": "contract"}, None, [], []
+    if contract is not None:
+        scanned = _scan_tensors(contract, "contract")
+        declared = [
+            _value(
+                f"declared{index}", "declared", dtype=spec[1],
+                shape=spec[0], storage_shape=spec[0],
+                layout_kind=spec[2], attrs={"source": path},
+                contract="native_tensor_contract")
+            for index, (path, spec) in enumerate(scanned)
+        ]
+        if declared:
+            gaps.append({"code": "tensor_roles_not_distinguished",
+                         "detail": {"contract_kind": contract[0],
+                                    "value_count": len(declared)}})
+        return {"inputs": [], "outputs": [], "declared": declared, "basis": "contract_scan"}, None, [], []
+    inputs, outputs = _declared_metadata_values(operator)
+    basis = "operator_metadata" if inputs or outputs else "unavailable"
+    return {"inputs": inputs, "outputs": outputs, "declared": [], "basis": basis}, None, [], []
 
 
 def typed_values(operator, contract, *, context=None):
@@ -461,63 +516,9 @@ def typed_values(operator, contract, *, context=None):
                 if projected[0] or projected[1]:
                     values["basis"] = "typed_records+contract"
     else:
-        attention = (_attention_values(operator)
-                     if operator.get("family") == "attention"
-                     and meta.get("gqa_decode") and contract is None else None)
-        view = _view_values(operator, context) if meta.get("source_layout") or meta.get(
-            "target_layout") else None
-        if attention is not None:
-            attention_data = attention
-            values = attention
-            gaps.extend(attention["gaps"])
-            semantic_attrs = attention["semantic_attrs"]
-            external_outputs = ["output"]
-        elif view is not None:
-            values = view
-            gaps.extend(view["gaps"])
-        elif operator.get("family") == "swiglu" and contract is not None:
-            values = _swiglu_values(operator, contract, context)
-            gaps.extend(values["gaps"])
-        elif operator.get("family") == "recurrent_vector" and contract is not None:
-            values = _recurrent_values(operator, contract, context)
-            gaps.extend(values["gaps"])
-        elif operator.get("family") == "tensor_copy":
-            copied = _tensor_copy_values(operator, contract, context)
-            if copied is not None:
-                values = copied
-                gaps.extend(copied["gaps"])
-            else:
-                inputs, outputs = _declared_metadata_values(operator)
-                values = {"inputs": inputs, "outputs": outputs, "declared": [],
-                          "basis": "operator_metadata" if inputs or outputs
-                                   else "unavailable"}
-        else:
-            projected = (_matrix_values(contract) or _common_values(contract)
-                         if contract is not None else None)
-            if projected is not None:
-                inputs, outputs, declared, _extra = projected
-                values = {"inputs": inputs, "outputs": outputs,
-                          "declared": declared, "basis": "contract"}
-            elif contract is not None:
-                scanned = _scan_tensors(contract, "contract")
-                declared = []
-                for index, (path, spec) in enumerate(scanned):
-                    declared.append(_value(
-                        f"declared{index}", "declared", dtype=spec[1],
-                        shape=spec[0], storage_shape=spec[0],
-                        layout_kind=spec[2], attrs={"source": path},
-                        contract="native_tensor_contract"))
-                values = {"inputs": [], "outputs": [], "declared": declared,
-                          "basis": "contract_scan"}
-                if declared:
-                    gaps.append({"code": "tensor_roles_not_distinguished",
-                                 "detail": {"contract_kind": contract[0],
-                                            "value_count": len(declared)}})
-            else:
-                inputs, outputs = _declared_metadata_values(operator)
-                values = {"inputs": inputs, "outputs": outputs, "declared": [],
-                          "basis": "operator_metadata" if inputs or outputs
-                                   else "unavailable"}
+        values, attention_data, semantic_attrs, external_outputs = (
+            _project_non_boundary_values(operator, contract, context, meta, gaps)
+        )
 
     if contract is not None:
         _postprocess_compact_layout(values, operator, contract)

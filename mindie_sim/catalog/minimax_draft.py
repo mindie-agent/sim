@@ -28,6 +28,7 @@ from __future__ import annotations
 from typing import Any, Mapping
 
 from mindie_sim.catalog.config import _int, _require
+from mindie_sim.catalog.draft_spec import parse_draft_max_position_embeddings
 from mindie_sim.catalog.hf_config import declared_partial_rotary, rotary_dimensions
 from mindie_sim.catalog.types import AuxiliarySpec, DraftSpec, merge_source
 from mindie_sim.schema.common import ModelingError
@@ -157,6 +158,7 @@ def build_minimax_auxiliary(
         pp_capability=MINIMAX_DSPARK_PP_CAPABILITY,
         vocab_size=vocab,
         layer_plans=draft_plans,
+        max_position_embeddings=parse_draft_max_position_embeddings(c),
         source=merge_source(
             MINIMAX_DSPARK_SOURCE,
             {

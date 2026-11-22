@@ -8,16 +8,16 @@
 [Side-Effect Policy] Pure planning and read-only simulation."""
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from typing import Any
 
 from mindie_sim.prediction.operators.linear_attention.gdn_domain import (
     GDN_CHUNK32_TOKENS,
     model_supports_gdn_chunk32,
 )
+from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.model import ModelSpec
-
-if TYPE_CHECKING:
-    from mindie_sim.feature_mechanisms import MechanismContext, OptimizationMechanism
 
 MX_SCALE_GROUP_SIZE = 32
 MSA_MIN_BLOCK_SIZE = 64
@@ -109,7 +109,38 @@ def _apply_mhc_fusion_overlap(rt: dict[str, Any], ctx: MechanismContext) -> None
     _append_passes(rt, pass_name)
 
 
+SHIPPING_MEGAMOE_SUPPORTED_ACTIVATIONS: frozenset[str] = frozenset({
+    "swiglu", "silu", "gelu",
+})
+
+
+def _model_supports_shipping_megamoe_activation(ctx: MechanismContext) -> bool:
+    if bool((ctx.options or {}).get("allow_extended_activation_abi", False)):
+        return True
+    moe_plans = [p for p in ctx.model.layer_plans if p.ffn == "moe"]
+    if not moe_plans:
+        return False
+    return all(
+        str(getattr(p, "ffn_activation", "silu") or "silu").strip().lower()
+        in SHIPPING_MEGAMOE_SUPPORTED_ACTIVATIONS
+        for p in moe_plans
+    )
+
+
+def _fused_mc2_disabled(ctx: MechanismContext) -> bool:
+    return (ctx.options or {}).get("enable_fused_mc2") == 0
+
+
+def _fused_mc2_explicitly_disabled(rt: Mapping[str, Any], ctx: MechanismContext) -> bool:
+    additional = (dict(rt.get("metadata") or {}).get("additional_config") or {})
+    if isinstance(additional, Mapping) and additional.get("enable_fused_mc2") == 0:
+        return True
+    return _fused_mc2_disabled(ctx)
+
+
 def _apply_tp_mc2_overlap(rt: dict[str, Any], ctx: MechanismContext) -> None:
+    if _fused_mc2_explicitly_disabled(rt, ctx):
+        return
     _update_meta(rt, tp_mc2_overlap=True)
     if ctx.arch == "a5" and int(ctx.parallel.get("tp", 1) or 1) > 1:
         _append_passes(rt, "tp_mc2_overlap")
@@ -134,8 +165,17 @@ def _is_mxfp_moe(ctx: MechanismContext) -> bool:
     if expert_fmt in MXFP_EXPERT_WEIGHT_FORMATS or weight_fmt in MXFP_EXPERT_WEIGHT_FORMATS:
         return True
     overrides = getattr(q, "category_overrides", ()) or ()
-    if any(str(fmt).lower() in MXFP_EXPERT_WEIGHT_FORMATS for _, fmt in overrides):
-        return True
+    for _, fields in overrides:
+        if isinstance(fields, str):
+            fmt = fields.lower()
+        elif isinstance(fields, Mapping):
+            fmt = str(fields.get("weight_format") or "").lower()
+        elif isinstance(fields, (tuple, list)):
+            fmt = str(dict(fields).get("weight_format") or "").lower()
+        else:
+            fmt = ""
+        if fmt in MXFP_EXPERT_WEIGHT_FORMATS:
+            return True
     return (
         q.activation_format == "fp8_e4m3"
         and q.activation_group_size == MX_SCALE_GROUP_SIZE
@@ -194,6 +234,10 @@ def _ep_within_ub_domain(ctx: MechanismContext) -> bool:
 
 def _apply_cann_megamoe(rt: dict[str, Any], ctx: MechanismContext) -> None:
     if "moe_comm_mode" in ctx.caller_explicit or "enable_fused_mc2" in ctx.caller_explicit:
+        return
+    if _fused_mc2_explicitly_disabled(rt, ctx):
+        return
+    if not _model_supports_shipping_megamoe_activation(ctx):
         return
     if not _ep_within_ub_domain(ctx):
         return
@@ -386,44 +430,9 @@ def _parallel_cp_mechanisms() -> tuple[OptimizationMechanism, ...]:
     )
 
 
-def source_mechanisms() -> tuple[OptimizationMechanism, ...]:
-    """Build the audited mechanism specs in registration order."""
-    from mindie_sim.feature_mechanisms import OptimizationMechanism
-
+def _source_attention_and_moe_mechanisms() -> tuple[OptimizationMechanism, ...]:
+    """Attention, indexer, recurrent, and MoE mechanisms in registration order."""
     return (
-        OptimizationMechanism(
-            id="torch_compile_support", category="compilation", phases=("prefill", "decode"),
-            summary="Enable torch.compile / npugraph_ex FX fusion passes on models with do_not_compile=True",
-            eligible=lambda ctx: dict(ctx.model.catalog_facts).get("supports_torch_compile") is False,
-            apply=_apply_torch_compile_support,
-        ),
-        OptimizationMechanism(
-            id="fp32_residual_norm_fusion", category="norm_fusion", phases=("prefill", "decode"),
-            summary="Fuse FP32 residual accumulate + (1+w) RMSNorm + BF16 cast into one AIV kernel",
-            eligible=lambda ctx: bool((dict(ctx.model.catalog_facts).get("normalization") or {}).get("fp32_residual")),
-            apply=_apply_fp32_residual_norm,
-        ),
-        OptimizationMechanism(
-            id="gdn_chunk32_prefill", category="recurrent", phases=("prefill",),
-            summary="Arch35 fla-npu Chunk32 GDN prefill composite for Hv/Hk in {1,2,3,4}",
-            eligible=lambda ctx: (
-                ctx.arch == "a5"
-                and model_supports_gdn_chunk32(ctx.model, int(ctx.parallel.get("tp", 1)))
-            ),
-            apply=_apply_gdn_chunk32,
-        ),
-        OptimizationMechanism(
-            id="cann_megamoe_fusion", category="moe_comm", phases=("prefill", "decode"),
-            summary="CANN 9.3 MegaMoE composite Dispatch+GMM1+ActMxQuant+GMM2+[SharedExpert]+Combine",
-            eligible=lambda ctx: (
-                ctx.arch == "a5"
-                and _ep_within_ub_domain(ctx)
-                and int(ctx.parallel.get("redundant_experts_per_rank", 0) or 0) == 0
-                and any(p.ffn == "moe" for p in ctx.model.layer_plans)
-                and _is_mxfp_moe(ctx)
-            ),
-            apply=_apply_cann_megamoe,
-        ),
         OptimizationMechanism(
             id="kv_quant_sfa_scale_precompute", category="attention_fusion",
             phases=("prefill", "decode"),
@@ -469,7 +478,7 @@ def source_mechanisms() -> tuple[OptimizationMechanism, ...]:
         OptimizationMechanism(
             id="tp_mc2_overlap", category="parallelism", phases=("prefill", "decode"),
             summary="AllGatherMatmulV2 + MatmulReduceScatterV2 overlapping TP collectives with Cube GEMMs",
-            eligible=lambda ctx: int(ctx.parallel.get("tp", 1)) > 1,
+            eligible=lambda ctx: int(ctx.parallel.get("tp", 1)) > 1 and not _fused_mc2_disabled(ctx),
             apply=_apply_tp_mc2_overlap,
         ),
         OptimizationMechanism(
@@ -533,16 +542,51 @@ def source_mechanisms() -> tuple[OptimizationMechanism, ...]:
             ),
             apply=lambda rt, _ctx: _update_meta(rt, keypool_int8_supported=True),
         ),
-        *_parallel_cp_mechanisms(),
     )
 
 
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass
-from typing import Any
+def source_mechanisms() -> tuple[OptimizationMechanism, ...]:
+    """Build the audited mechanism specs in registration order."""
+    return (
+        OptimizationMechanism(
+            id="torch_compile_support", category="compilation", phases=("prefill", "decode"),
+            summary="Enable torch.compile / npugraph_ex FX fusion passes on models with do_not_compile=True",
+            eligible=lambda ctx: dict(ctx.model.catalog_facts).get("supports_torch_compile") is False,
+            apply=_apply_torch_compile_support,
+        ),
+        OptimizationMechanism(
+            id="fp32_residual_norm_fusion", category="norm_fusion", phases=("prefill", "decode"),
+            summary="Fuse FP32 residual accumulate + (1+w) RMSNorm + BF16 cast into one AIV kernel",
+            eligible=lambda ctx: bool((dict(ctx.model.catalog_facts).get("normalization") or {}).get("fp32_residual")),
+            apply=_apply_fp32_residual_norm,
+        ),
+        OptimizationMechanism(
+            id="gdn_chunk32_prefill", category="recurrent", phases=("prefill",),
+            summary="Arch35 fla-npu Chunk32 GDN prefill composite for Hv/Hk in {1,2,3,4}",
+            eligible=lambda ctx: (
+                ctx.arch == "a5"
+                and model_supports_gdn_chunk32(ctx.model, int(ctx.parallel.get("tp", 1)))
+            ),
+            apply=_apply_gdn_chunk32,
+        ),
+        OptimizationMechanism(
+            id="cann_megamoe_fusion", category="moe_comm", phases=("prefill", "decode"),
+            summary="CANN 9.3 MegaMoE composite Dispatch+GMM1+ActMxQuant+GMM2+[SharedExpert]+Combine",
+            eligible=lambda ctx: (
+                ctx.arch == "a5"
+                and not _fused_mc2_disabled(ctx)
+                and _ep_within_ub_domain(ctx)
+                and int(ctx.parallel.get("redundant_experts_per_rank", 0) or 0) == 0
+                and any(p.ffn == "moe" for p in ctx.model.layer_plans)
+                and _is_mxfp_moe(ctx)
+                and _model_supports_shipping_megamoe_activation(ctx)
+            ),
+            apply=_apply_cann_megamoe,
+        ),
+        *_source_attention_and_moe_mechanisms(),
+        *_parallel_cp_mechanisms(),
+    )
 
-from mindie_sim.schema.common import ModelingError
-from mindie_sim.schema.model import ModelSpec
 
 MX_SCALE_PACK_FACTOR = 2
 GDN_DEFAULT_CHUNK_SIZE = 64
@@ -701,7 +745,7 @@ def _apply_mla_prolog(rt: dict[str, Any], ctx: MechanismContext) -> None:
     passes = tuple(rt.get("lowering_passes") or ())
     options: dict[str, Any] = {}
     quant = ctx.model.quant
-    if ctx.arch == "a5" and quant is not None and quant.kv_dtype == "int8":
+    if ctx.arch in {"a3", "a5"} and quant is not None and quant.kv_dtype == "int8":
         from mindie_sim.prediction.operators.mla_prolog.mla_prolog_packed import LAYOUT
         options["cache_layout"] = LAYOUT
     try:
@@ -799,6 +843,8 @@ def _apply_recover_ssm(rt: dict[str, Any], ctx: MechanismContext) -> None:
 
 def _apply_dynamic_mc2(rt: dict[str, Any], ctx: MechanismContext) -> None:
     if "moe_comm_mode" in ctx.caller_explicit:
+        return
+    if _fused_mc2_explicitly_disabled(rt, ctx):
         return
     if int(ctx.parallel.get("ep", 1)) > 1:
         meta = dict(rt.get("metadata") or {})
@@ -961,7 +1007,10 @@ for _item in (
     OptimizationMechanism(
         id="dynamic_mc2_dispatch", category="moe_comm", phases=("decode",),
         summary="Dynamic token-capacity selection between fused MC2 and AllToAll/AllGather",
-        eligible=lambda ctx: any(p.ffn == "moe" for p in ctx.model.layer_plans),
+        eligible=lambda ctx: (
+            any(p.ffn == "moe" for p in ctx.model.layer_plans)
+            and not _fused_mc2_disabled(ctx)
+        ),
         apply=_apply_dynamic_mc2,
     ),
 ):
@@ -1065,57 +1114,17 @@ def _compare_pr_ablations(
     return pr_ablations, loo_ablations
 
 
-def compare_feature_tracks(
-    model: str | Mapping[str, Any],
-    hardware: str | Mapping[str, Any] = "a3",
+_UNQUANTIZED_PRESET_NAMES = frozenset({"bf16", "bfloat16", "fp16", "float16", "fp32"})
+
+
+def _build_waterfall_payload(
     *,
-    runtime_stack: str | Mapping[str, Any] = "vllm-ascend",
-    phase: str = "decode",
-    tokens: int = 1,
-    context: int = DEFAULT_WATERFALL_CONTEXT,
-    sequences: int = DEFAULT_WATERFALL_SEQUENCES,
-    scope: str = "body",
-    ablate_prs: bool = True,
-    **compose_kwargs: Any,
+    cases: Mapping[str, Mapping[str, Any]],
+    analyses: Mapping[str, Mapping[str, Any]],
+    geometry: Mapping[str, Any],
+    pr_ablations: list[dict[str, Any]],
+    loo_ablations: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    """Return the complete 4-rung software-to-silicon performance waterfall."""
-    from mindie_sim.compose import compose_case
-    from mindie_sim.prediction.efficiency import analyze_network_efficiency
-
-    cleaned_kwargs = dict(compose_kwargs)
-    cleaned_kwargs.pop("feature_track", None)
-    cleaned_kwargs.pop("optimizations", None)
-    cleaned_kwargs.pop("exclude_optimizations", None)
-    cleaned_kwargs.pop("raw_eager", None)
-    cleaned_kwargs.pop("_stack_phase", None)
-
-    cases: dict[str, dict[str, Any]] = {}
-    analyses: dict[str, dict[str, Any]] = {}
-    for track in ("merged", "unmerged_pr", "expected_ideal"):
-        case = compose_case(
-            model, hardware=hardware, runtime_stack=runtime_stack,
-            feature_track=track, _stack_phase=phase, **cleaned_kwargs,
-        )
-        cases[track] = case
-        analyses[track] = analyze_network_efficiency(
-            case, phase=phase, tokens=tokens, context=context,
-            sequences=sequences, scope=scope,
-        )
-
-    eager_kwargs = dict(cleaned_kwargs)
-    if "quant" not in eager_kwargs:
-        va_prof = (cases["merged"]["runtime"]["metadata"] or {}).get("va_profile") or {}
-        if va_prof.get("quant") is not None:
-            eager_kwargs["quant"] = va_prof["quant"]
-    cases["raw_eager"] = compose_case(
-        model, hardware=hardware, runtime_stack=runtime_stack,
-        feature_track="raw_eager", _stack_phase=phase, **eager_kwargs,
-    )
-    analyses["raw_eager"] = analyze_network_efficiency(
-        cases["raw_eager"], phase=phase, tokens=tokens, context=context,
-        sequences=sequences, scope=scope,
-    )
-
     eager_ms = float(analyses["raw_eager"]["graph_duration_ms"])
     merged_ms = float(analyses["merged"]["graph_duration_ms"])
     pr_ms = float(analyses["unmerged_pr"]["graph_duration_ms"])
@@ -1125,37 +1134,24 @@ def compare_feature_tracks(
         float(ideal_eff.get("critical_path_roofline_ms") or 0.0),
         float(ideal_eff.get("physical_resource_cut_ms") or 0.0),
     ) or float(ideal_eff.get("total_roofline_ideal_ms") or 0.0)
-
     eager_report = cases["raw_eager"]["runtime"]["metadata"]["feature_track_report"]
     merged_report = cases["merged"]["runtime"]["metadata"]["feature_track_report"]
     pr_report = cases["unmerged_pr"]["runtime"]["metadata"]["feature_track_report"]
     ideal_report = cases["expected_ideal"]["runtime"]["metadata"]["feature_track_report"]
-
-    pr_ablations, loo_ablations = [], []
-    if ablate_prs:
-        pr_ablations, loo_ablations = _compare_pr_ablations(
-            model, hardware, runtime_stack, pr_report, merged_ms, pr_ms,
-            phase=phase, tokens=tokens, context=context, sequences=sequences,
-            scope=scope, compose_kwargs=cleaned_kwargs,
-        )
-
+    eager_monotonic = eager_ms + MONOTONIC_TOLERANCE_MS >= merged_ms
     monotonic = (
-        merged_ms + MONOTONIC_TOLERANCE_MS >= pr_ms
+        eager_monotonic
+        and merged_ms + MONOTONIC_TOLERANCE_MS >= pr_ms
         and pr_ms + MONOTONIC_TOLERANCE_MS >= ideal_ms
         and ideal_ms + MONOTONIC_TOLERANCE_MS >= roof_1p0_ms
     )
-    eager_monotonic = eager_ms + MONOTONIC_TOLERANCE_MS >= merged_ms
-
     return {
         "schema": WATERFALL_SCHEMA,
         "model": cases["merged"]["model"]["name"],
         "hardware_sku": cases["merged"]["machine"]["sku"],
         "runtime_stack": merged_report["stack"],
         "repository": merged_report["repository"],
-        "geometry": {
-            "phase": phase, "tokens": tokens,
-            "context": context, "sequences": sequences, "scope": scope,
-        },
+        "geometry": dict(geometry),
         "monotonic_verified": bool(monotonic),
         "eager_vs_merged_monotonic": bool(eager_monotonic),
         "waterfall": {
@@ -1214,3 +1210,80 @@ def compare_feature_tracks(
             "basis": "physical_1p0x_critical_path_roofline",
         },
     }
+
+
+def compare_feature_tracks(
+    model: str | Mapping[str, Any],
+    hardware: str | Mapping[str, Any] = "a3",
+    *,
+    runtime_stack: str | Mapping[str, Any] = "vllm-ascend",
+    phase: str = "decode",
+    tokens: int = 1,
+    context: int = DEFAULT_WATERFALL_CONTEXT,
+    sequences: int = DEFAULT_WATERFALL_SEQUENCES,
+    scope: str = "body",
+    ablate_prs: bool = True,
+    **compose_kwargs: Any,
+) -> dict[str, Any]:
+    """Return the complete 4-rung software-to-silicon performance waterfall."""
+    from mindie_sim.compose import compose_case
+    from mindie_sim.prediction.efficiency import analyze_network_efficiency
+
+    cleaned_kwargs = dict(compose_kwargs)
+    for key in ("feature_track", "optimizations", "exclude_optimizations", "raw_eager", "_stack_phase"):
+        cleaned_kwargs.pop(key, None)
+
+    cases: dict[str, dict[str, Any]] = {}
+    analyses: dict[str, dict[str, Any]] = {}
+    for track in ("merged", "unmerged_pr", "expected_ideal"):
+        case = compose_case(
+            model, hardware=hardware, runtime_stack=runtime_stack,
+            feature_track=track, _stack_phase=phase, **cleaned_kwargs,
+        )
+        cases[track] = case
+        analyses[track] = analyze_network_efficiency(
+            case, phase=phase, tokens=tokens, context=context,
+            sequences=sequences, scope=scope,
+        )
+
+    eager_kwargs = dict(cleaned_kwargs)
+    va_prof = (cases["merged"]["runtime"]["metadata"] or {}).get("va_profile") or {}
+    va_flags = dict(va_prof.get("tutorial_flags") or {})
+    explicit_quant = eager_kwargs.get("quant")
+    unquantized_override = (
+        isinstance(explicit_quant, str)
+        and explicit_quant.strip().lower() in _UNQUANTIZED_PRESET_NAMES
+    )
+    if "quant" not in eager_kwargs and va_prof.get("quant") is not None:
+        eager_kwargs["quant"] = va_prof["quant"]
+    if not unquantized_override:
+        if "kv_cache_dtype" not in eager_kwargs and va_flags.get("kv_cache_dtype"):
+            eager_kwargs["kv_cache_dtype"] = str(va_flags["kv_cache_dtype"])
+        if "indexer_kv_dtype" not in eager_kwargs and va_flags.get("indexer_kv_dtype"):
+            eager_kwargs["indexer_kv_dtype"] = str(va_flags["indexer_kv_dtype"])
+    cases["raw_eager"] = compose_case(
+        model, hardware=hardware, runtime_stack=runtime_stack,
+        feature_track="raw_eager", _stack_phase=phase, **eager_kwargs,
+    )
+    analyses["raw_eager"] = analyze_network_efficiency(
+        cases["raw_eager"], phase=phase, tokens=tokens, context=context,
+        sequences=sequences, scope=scope,
+    )
+
+    pr_ablations, loo_ablations = [], []
+    if ablate_prs:
+        pr_report = cases["unmerged_pr"]["runtime"]["metadata"]["feature_track_report"]
+        pr_ablations, loo_ablations = _compare_pr_ablations(
+            model, hardware, runtime_stack, pr_report,
+            float(analyses["merged"]["graph_duration_ms"]),
+            float(analyses["unmerged_pr"]["graph_duration_ms"]),
+            phase=phase, tokens=tokens, context=context, sequences=sequences,
+            scope=scope, compose_kwargs=cleaned_kwargs,
+        )
+
+    return _build_waterfall_payload(
+        cases=cases, analyses=analyses,
+        geometry={"phase": phase, "tokens": tokens, "context": context,
+                  "sequences": sequences, "scope": scope},
+        pr_ablations=pr_ablations, loo_ablations=loo_ablations,
+    )

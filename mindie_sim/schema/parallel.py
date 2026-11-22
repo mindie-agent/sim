@@ -8,22 +8,24 @@
 from __future__ import annotations
 from dataclasses import dataclass
 import math
-from typing import Sequence
+from typing import TYPE_CHECKING, Any, Mapping, Sequence
 from mindie_sim.schema.common import ModelingError, _int, _mapping, _unknown
 from mindie_sim.schema.runtime_features import (
-    LOCAL_PARALLEL_DEFAULTS, LOCAL_TP_AXIS_NAMES, ONE, PARALLEL_FEATURE_NAMES,
-    ZERO, normalize_parallel_features,
+    LOCAL_PARALLEL_DEFAULTS, LOCAL_TP_AXIS_NAMES, PARALLEL_FEATURE_NAMES,
+    normalize_parallel_features,
 )
-from typing import Any, Mapping
+
+if TYPE_CHECKING:
+    from mindie_sim.schema.model import ModelSpec
 
 def factor_dcp_axes(cp: int, *, pcp: int, tp: int, dp: int) -> tuple[int, int, int]:
     """Canonical 3-axis DCP factorization ``(pcp_factor, tp_gather, dp_width)``."""
-    cp = max(ONE, int(cp))
-    if cp <= ONE:
-        return (ONE, ONE, ONE)
-    pcp = max(ONE, int(pcp))
-    tp = max(ONE, int(tp))
-    pcp_factor = math.gcd(cp, pcp) if pcp > ONE else ONE
+    cp = max(1, int(cp))
+    if cp <= 1:
+        return (1, 1, 1)
+    pcp = max(1, int(pcp))
+    tp = max(1, int(tp))
+    pcp_factor = math.gcd(cp, pcp) if pcp > 1 else 1
     rem = cp // pcp_factor
     tp_gather = math.gcd(rem, tp)
     dp_width = rem // tp_gather
@@ -231,15 +233,15 @@ class ParallelSpec:
     #: Node-local dense-subgraph TP widths.  They partition ranks inside one
     #: node/stage/PCP lane without adding a world axis; global ``tp`` remains
     #: the attention tensor-parallel degree.
-    q_proj_tp: int = ONE
-    o_proj_tp: int = ONE
-    dcp_linear_tp: int = ONE
-    mlp_tp: int = ONE
-    shared_expert_tp: int = ONE
-    linear_proj_tp: int = ONE
-    lm_head_tp: int = ONE
+    q_proj_tp: int = 1
+    o_proj_tp: int = 1
+    dcp_linear_tp: int = 1
+    mlp_tp: int = 1
+    shared_expert_tp: int = 1
+    linear_proj_tp: int = 1
+    lm_head_tp: int = 1
     #: Extra resident physical routed-expert slots per EP owner rank.
-    redundant_experts_per_rank: int = ZERO
+    redundant_experts_per_rank: int = 0
     #: External data-parallel replica multiplier outside one serving engine's
     #: internal DP/PP/PCP/TP rank mesh (``world_size = external_dp*dp*pp*pcp*tp``).
     external_dp: int = 1
@@ -294,16 +296,16 @@ class ParallelSpec:
                 raise ModelingError(f"{name}_invalid:{value}")
         for name in (*LOCAL_TP_AXIS_NAMES, "redundant_experts_per_rank"):
             value = getattr(self, name)
-            if isinstance(value, bool) or not isinstance(value, int) or value < ZERO:
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ModelingError(f"{name}_invalid:{value}")
-        if any(getattr(self, name) < ONE for name in LOCAL_TP_AXIS_NAMES):
+        if any(getattr(self, name) < 1 for name in LOCAL_TP_AXIS_NAMES):
             raise ModelingError("local_projection_tp_must_be_positive")
-        if self.dcp_linear_tp > ONE:
-            if self.q_proj_tp > ONE and self.q_proj_tp != self.dcp_linear_tp:
+        if self.dcp_linear_tp > 1:
+            if self.q_proj_tp > 1 and self.q_proj_tp != self.dcp_linear_tp:
                 raise ModelingError(
                     f"local_tp_conflict:dcp_linear_tp={self.dcp_linear_tp},q_proj_tp={self.q_proj_tp}"
                 )
-            if self.o_proj_tp > ONE and self.o_proj_tp != self.dcp_linear_tp:
+            if self.o_proj_tp > 1 and self.o_proj_tp != self.dcp_linear_tp:
                 raise ModelingError(
                     f"local_tp_conflict:dcp_linear_tp={self.dcp_linear_tp},o_proj_tp={self.o_proj_tp}"
                 )
@@ -472,7 +474,7 @@ class ParallelSpec:
     @property
     def ep_domain(self) -> int:
         if self.rank_table is None:
-            if self.pcp > 1 and self.ep > self.lane_plane:
+            if self.pcp > 1 and self.ep * self.etp > self.lane_plane:
                 return self.dp * self.pcp * self.tp
             return self.lane_plane
         total = len({rank for group in self.rank_table for rank in group})
@@ -499,11 +501,11 @@ class ParallelSpec:
 
     @property
     def effective_q_proj_tp(self) -> int:
-        return self.dcp_linear_tp if self.dcp_linear_tp > ONE else self.q_proj_tp
+        return self.dcp_linear_tp if self.dcp_linear_tp > 1 else self.q_proj_tp
 
     @property
     def effective_o_proj_tp(self) -> int:
-        return self.dcp_linear_tp if self.dcp_linear_tp > ONE else self.o_proj_tp
+        return self.dcp_linear_tp if self.dcp_linear_tp > 1 else self.o_proj_tp
 
     @property
     def local_tp_widths(self) -> tuple[int, ...]:
@@ -511,7 +513,7 @@ class ParallelSpec:
 
     @property
     def has_local_tp(self) -> bool:
-        return any(width > ONE for width in self.local_tp_widths)
+        return any(width > 1 for width in self.local_tp_widths)
 
     @property
     def dcp_pcp_factor(self) -> int:
@@ -535,18 +537,21 @@ class ParallelSpec:
     @property
     def ep_spans_pcp(self) -> bool:
         if self.pcp > 1:
-            return self.ep > self.dp * self.tp
+            ep_tp_width = max(1, self.tp // self.etp)
+            return self.ep > self.dp * ep_tp_width
         return False
 
     @property
     def ep_spans_dp(self) -> bool:
-        return (self.ep > self.tp * self.pcp) if self.ep_spans_pcp else (self.ep > self.tp)
+        ep_tp_width = max(1, self.tp // self.etp)
+        return (self.ep > ep_tp_width * self.pcp) if self.ep_spans_pcp else (self.ep > ep_tp_width)
 
     @property
     def ep_dp_width(self) -> int:
         if not self.ep_spans_dp:
             return 1
-        return self.ep // (self.tp * self.pcp) if self.ep_spans_pcp else self.ep // self.tp
+        ep_tp_width = max(1, self.tp // self.etp)
+        return self.ep // (ep_tp_width * self.pcp) if self.ep_spans_pcp else self.ep // ep_tp_width
 
     @property
     def etp(self) -> int:
@@ -637,11 +642,14 @@ class ParallelSpec:
                 raise ModelingError(f"pp_partition_empty_stage:{list(counts)}")
         if model.num_heads % self.tp != 0:
             raise ModelingError(f"heads_not_divisible_by_tp:{model.num_heads}%{self.tp}")
+        ep_tp_width = max(1, self.tp // self.etp)
         if not self.ep_spans_pcp:
-            if self.ep > 1 and self.ep <= self.tp and self.tp % self.ep != 0:
-                raise ModelingError(f"ep_not_divisor_of_tp:{self.ep}%{self.tp}")
+            if self.ep > 1 and self.ep <= ep_tp_width and ep_tp_width % self.ep != 0:
+                raise ModelingError(f"ep_not_divisor_of_tp:{self.ep}%{ep_tp_width}")
+            if self.rank_table is None and self.ep > ep_tp_width and self.ep % ep_tp_width != 0:
+                raise ModelingError(f"ep_not_multiple_of_tp:{self.ep}%{ep_tp_width}")
         else:
-            local_domain = self.tp * self.pcp
+            local_domain = ep_tp_width * self.pcp
             if self.ep <= local_domain and local_domain % self.ep != 0:
                 raise ModelingError(f"ep_not_divisor_of_tp_pcp:{local_domain}%{self.ep}")
             if self.ep > local_domain and self.ep % local_domain != 0:
@@ -666,7 +674,7 @@ class ParallelSpec:
             "redundant_experts_per_rank")}
         for key in ("q_proj_tp", "dcp_linear_tp", "mlp_tp", "shared_expert_tp"):
             val = getattr(self, key)
-            if val != ONE:
+            if val != 1:
                 out[key] = val
         if self.external_dp != 1:
             out["external_dp"] = self.external_dp

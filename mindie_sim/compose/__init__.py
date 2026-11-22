@@ -319,7 +319,11 @@ def _apply_cp_and_tutorial_flags(
     dcp_q_replicate: bool,
 ) -> None:
     """Attach tutorial execution flags and non-blocking KV-replication metadata."""
-    from mindie_sim.catalog.context_parallel import kv_cache_replication_info
+    from mindie_sim.catalog.context_parallel import (
+        kv_cache_replication_info,
+        legal_vllm_ascend_dcp_values,
+        validate_vllm_ascend_dcp_codomain,
+    )
     from mindie_sim.schema.parallel import ParallelSpec
 
     additional = dict(runtime_meta.get("additional_config") or {})
@@ -342,6 +346,16 @@ def _apply_cp_and_tutorial_flags(
     runtime_meta["kv_cache_replicated_tp"] = bool(kv_rep["kv_cache_replicated_tp"])
     runtime_meta["kv_cache_replication_factor"] = int(kv_rep["kv_cache_replication_factor"])
     runtime_meta["canonical_kv_sharding"] = str(kv_rep["canonical_kv_sharding"])
+    dcp_ok, dcp_reason = validate_vllm_ascend_dcp_codomain(model_spec, p_spec)
+    runtime_meta["vllm_ascend_dcp_codomain_ok"] = bool(dcp_ok)
+    if dcp_reason:
+        runtime_meta["vllm_ascend_dcp_codomain_reason"] = str(dcp_reason)
+    runtime_meta["vllm_ascend_dcp_legal_values"] = list(
+        legal_vllm_ascend_dcp_values(model_spec, tp=p_spec.tp, pcp=p_spec.pcp)
+    )
+    runtime_meta["dcp_reuses_tp_ranks"] = bool(
+        p_spec.cp > 1 and p_spec.pcp == 1 and not p_spec.cp_spans_dp
+    )
 
 
 def _resolve_parallel_axes(
@@ -569,9 +583,10 @@ def _resolve_domain2_policy(
     """Resolve Domain-2 model-intrinsic offload & production stack features (opt-out only)."""
     prof = va_profile or {}
     prof_flags = dict(prof.get("tutorial_flags") or {})
-    # Never let merged-branch disable workarounds (e.g. enable_fused_mc2=0)
-    # suppress unmerged_pr or expected_ideal optimization tracks.
-    allow_merged_workarounds = canonical_track == "merged"
+    # Preserve explicit stack disable workarounds (e.g. enable_fused_mc2=0) on
+    # both merged and unmerged_pr ('Before') tracks; only expected_ideal lifts
+    # them when evaluating theoretical ceiling unless caller explicitly pins 0.
+    allow_merged_workarounds = canonical_track in {"merged", "unmerged_pr"}
     explicit_sp_flag = (sp is not None) or (enable_flashcomm1 is not None)
     eff_sp = bool(enable_flashcomm1) if (sp is None and enable_flashcomm1 is not None and not raw_eager) else sp
 
@@ -836,6 +851,9 @@ def _apply_stack_and_lowerings(
             ctx_opts: dict[str, Any] = {
                 "ranks_per_node": int(machine.get("ranks_per_node", 0) or 0),
             }
+            additional_cfg = runtime_meta.get("additional_config") or {}
+            if isinstance(additional_cfg, Mapping) and additional_cfg.get("enable_fused_mc2") is not None:
+                ctx_opts["enable_fused_mc2"] = additional_cfg["enable_fused_mc2"]
             if _stack_phase:
                 ctx_opts["phase"] = _stack_phase
             mechanism_ctx = MechanismContext(
@@ -984,7 +1002,10 @@ def _build_runtime_dict(
     enable_super_kernel: bool | None,
     enable_dbo: bool,
     pp_layer_partition: Sequence[int] | None,
+    draft_max_model_len: int | None = None,
+    draft_enforce_eager: bool | None = None,
 ) -> dict[str, Any]:
+    del draft_max_model_len, draft_enforce_eager
     tp, dp, ep, pp, pcp, dcp = (
         axes["tp"], axes["dp"], axes["ep"], axes["pp"], axes["pcp"], axes["dcp"],
     )
@@ -1157,17 +1178,24 @@ def _prepare_composed_model(
     model_spec = _resolve_model_spec(model)
     model_limit = _resolve_max_position_embeddings(model, model_spec)
     explicit_quant = quant is not None
+    spec_meta = dict(getattr(model_spec, "metadata", ()) or ())
+    checkpoint_quant_declared = bool(spec_meta.get("checkpoint_quant_declared"))
     va_profile: dict[str, Any] | None = None
     if production:
-        model_id = str(model) if isinstance(model, str) else str(model_spec.name)
+        model_id = (
+            str(model_spec.name)
+            if spec_meta.get("checkpoint_repo_id") or not isinstance(model, str)
+            else str(model)
+        )
         va_profile = va_recommended_config(model_id, sku, role=role)
         va_profile["quantization_action"] = (
             "explicit_quant_preserved" if explicit_quant else
+            "checkpoint_quant_preserved" if (checkpoint_quant_declared and model_spec.quant is not None) else
             "documented_alternative_applied" if va_profile["quant"] is not None else
             "no_profile_override"
         )
         va_profile.setdefault("graph_capture_mode", None)
-        if not explicit_quant:
+        if not explicit_quant and not (checkpoint_quant_declared and model_spec.quant is not None):
             quant = va_profile["quant"]
     model_spec = _apply_quant_override(model_spec, quant, machine)
     resolved_kv_dtype, resolved_idx_dtype = kv_cache_dtype, indexer_kv_dtype
@@ -1178,7 +1206,8 @@ def _prepare_composed_model(
         and quant.strip().lower() in {"bf16", "bfloat16", "fp16", "float16", "fp32"}
     )
     if (production and va_profile is not None
-            and va_profile.get("quant") is not None and not unquantized_override):
+            and va_profile.get("quant") is not None and not unquantized_override
+            and not (checkpoint_quant_declared and not explicit_quant)):
         prof_flags = dict(va_profile.get("tutorial_flags") or {})
         if resolved_kv_dtype is None and not explicit_kv_in_quant and prof_flags.get("kv_cache_dtype"):
             resolved_kv_dtype = str(prof_flags["kv_cache_dtype"])
@@ -1352,6 +1381,13 @@ def _assemble_composed_case(
             "mtp" if getattr(model_spec.auxiliary, "mtp", None) is not None else "dspark"
         )
         runtime_meta["draft_proposal_tokens"] = mtp_tokens
+    if runtime_options.get("draft_max_model_len") is not None:
+        raw_dml = runtime_options["draft_max_model_len"]
+        if isinstance(raw_dml, bool) or not isinstance(raw_dml, int) or raw_dml < 1:
+            raise ModelingError(f"invalid_draft_max_model_len:{raw_dml!r}")
+        runtime_meta["draft_max_model_len"] = int(raw_dml)
+    if runtime_options.get("draft_enforce_eager") is not None:
+        runtime_meta["draft_enforce_eager"] = bool(runtime_options["draft_enforce_eager"])
     if policy_out["enable_shared_expert_dp"]:
         runtime_meta["enable_shared_expert_dp"] = True
 
@@ -1393,7 +1429,7 @@ def _assemble_composed_case(
             ("multistream_overlap_shared_expert", policy_options["multistream_overlap_shared_expert"] is not None),
             ("moe_comm_mode", moe_comm_mode is not None),
             ("enable_fused_mc2", policy_options["enable_fused_mc2"] is not None or (
-                canonical_track == "merged" and policy_out["enable_fused_mc2"] == 0
+                canonical_track in {"merged", "unmerged_pr"} and policy_out["enable_fused_mc2"] == 0
             )),
             ("enable_flashcomm1", policy_options["enable_flashcomm1"] is not None),
             ("recover_ssm", runtime_options["recover_ssm"] is True),
@@ -1418,6 +1454,60 @@ def _assemble_composed_case(
     }
     parse_case(case_dict)
     return case_dict
+
+
+_COMPOSE_OPTION_GROUPS: dict[str, tuple[str, ...]] = {
+    "auto": (
+        "quant", "layers", "ranks_per_node", "topology_preset", "va_recommended",
+        "raw_eager", "feature_track", "runtime_stack", "optimizations",
+        "exclude_optimizations", "engram_cpu_offload", "multistream_overlap_shared_expert",
+        "enable_shared_expert_dp", "sp", "graph_capture_mode", "mtp_proposal_tokens",
+        "mtp_acceptance_length", "kv_cache_dtype", "indexer_kv_dtype",
+    ),
+    "machine_options": (
+        "num_devices", "ranks_per_node", "topology_preset",
+        "inter_node_bw_gbps", "intra_node_bw_gbps", "intra_package_bw_gbps",
+        "inter_node_bw_util", "intra_node_bw_util", "intra_package_bw_util",
+        "inter_node_latency_us", "intra_node_latency_us", "intra_package_latency_us",
+        "superpod_size", "superpod_bw_gbps", "inter_pod_bw_gbps",
+        "intra_bw_4p_gbps", "intra_bw_8p_gbps",
+    ),
+    "model_options": (
+        "quant", "kv_cache_dtype", "indexer_kv_dtype", "layers",
+        "n_routed_experts", "num_experts_per_tok", "promote_dense_to_moe",
+    ),
+    "mtp_options": ("mtp_proposal_tokens", "mtp_acceptance_length"),
+    "scenario_options": (
+        "prompt_tokens", "output_tokens", "concurrency", "prefix_tokens",
+        "arrival_gap_ms", "ttft_slo_ms", "tpot_slo_ms", "require_scenario",
+        "max_model_len", "max_num_seqs", "max_num_batched_tokens", "prefix_cache_key",
+    ),
+    "policy_options": (
+        "sp", "enable_torch_compile", "multistream_overlap_shared_expert",
+        "engram_cpu_offload", "enable_shared_expert_dp", "enable_flashcomm1",
+        "enable_fused_mc2", "enable_prefill_mc2",
+    ),
+    "runtime_options": (
+        "q_proj_tp", "o_proj_tp", "linear_proj_tp", "dcp_linear_tp",
+        "mlp_tp", "shared_expert_tp", "lm_head_tp", "redundant_experts_per_rank",
+        "collective_startup_mode", "matrix_compute_policy", "recover_ssm",
+        "prefix_cache_mode", "prefix_read_mode", "homogeneous_graph_reuse",
+        "enable_chunked_prefill", "async_scheduling", "enable_npugraph_ex",
+        "enable_static_kernel", "enable_super_kernel", "enable_dbo",
+        "pp_layer_partition", "draft_max_model_len", "draft_enforce_eager",
+    ),
+    "cp_options": (
+        "enable_pcp_o_proj_weight_sharding", "enable_sfa_dcp_sharded_indexer",
+        "dcp_q_replicate",
+    ),
+    "stack_options": (
+        "runtime_stack", "optimizations", "exclude_optimizations", "_stack_phase",
+    ),
+}
+
+
+def _select_group(scope: Mapping[str, Any], group: str) -> dict[str, Any]:
+    return {key: scope[key] for key in _COMPOSE_OPTION_GROUPS[group]}
 
 
 def compose_case(
@@ -1452,6 +1542,8 @@ def compose_case(
     graph_capture_mode: str | None = None,
     mtp_proposal_tokens: int | None = None,
     mtp_acceptance_length: float | None = None,
+    draft_max_model_len: int | None = None,
+    draft_enforce_eager: bool | None = None,
     ttft_slo_ms: float | None = None,
     tpot_slo_ms: float | None = None,
     inter_node_bw_gbps: float | None = None,
@@ -1524,6 +1616,7 @@ def compose_case(
     _stack_phase: str | None = None,
 ) -> dict[str, Any]:
     """Synthesize and validate a complete simulation Case dictionary."""
+    args = locals()
     norm_role = str(role).strip().lower() if role is not None else None
     if norm_role is not None and norm_role not in _VALID_DEPLOYMENT_ROLES:
         raise ModelingError(f"invalid_deployment_role:{role}")
@@ -1537,78 +1630,20 @@ def compose_case(
         return _compose_auto_deployment(
             model, hardware, axes, num_devices=num_devices, prompt_tokens=prompt_tokens,
             output_tokens=output_tokens, ttft_slo_ms=ttft_slo_ms, tpot_slo_ms=tpot_slo_ms,
-            deployment=deployment, **{
-                "quant": quant, "layers": layers, "ranks_per_node": ranks_per_node,
-                "topology_preset": topology_preset, "va_recommended": va_recommended,
-                "raw_eager": raw_eager, "feature_track": feature_track,
-                "runtime_stack": runtime_stack, "optimizations": optimizations,
-                "exclude_optimizations": exclude_optimizations, "engram_cpu_offload": engram_cpu_offload,
-                "multistream_overlap_shared_expert": multistream_overlap_shared_expert,
-                "enable_shared_expert_dp": enable_shared_expert_dp, "sp": sp,
-                "graph_capture_mode": graph_capture_mode, "mtp_proposal_tokens": mtp_proposal_tokens,
-                "mtp_acceptance_length": mtp_acceptance_length,
-                "kv_cache_dtype": kv_cache_dtype, "indexer_kv_dtype": indexer_kv_dtype,
-            },
+            deployment=deployment, **_select_group(args, "auto"),
         )
-
+    grouped = {
+        key: _select_group(args, key)
+        for key in (
+            "machine_options", "model_options", "mtp_options", "scenario_options",
+            "policy_options", "runtime_options", "cp_options", "stack_options",
+        )
+    }
     case_dict = _compose_explicit_case(
         model, hardware, axes, norm_role, graph_capture_mode=graph_capture_mode,
         raw_eager=raw_eager, feature_track=feature_track, va_recommended=va_recommended,
         block_size=block_size, allow_synthetic_gqa_draft=allow_synthetic_gqa_draft,
-        moe_comm_mode=moe_comm_mode,
-        machine_options={
-            "num_devices": num_devices, "ranks_per_node": ranks_per_node, "topology_preset": topology_preset,
-            "inter_node_bw_gbps": inter_node_bw_gbps, "intra_node_bw_gbps": intra_node_bw_gbps,
-            "intra_package_bw_gbps": intra_package_bw_gbps, "inter_node_bw_util": inter_node_bw_util,
-            "intra_node_bw_util": intra_node_bw_util, "intra_package_bw_util": intra_package_bw_util,
-            "inter_node_latency_us": inter_node_latency_us, "intra_node_latency_us": intra_node_latency_us,
-            "intra_package_latency_us": intra_package_latency_us, "superpod_size": superpod_size,
-            "superpod_bw_gbps": superpod_bw_gbps, "inter_pod_bw_gbps": inter_pod_bw_gbps,
-            "intra_bw_4p_gbps": intra_bw_4p_gbps, "intra_bw_8p_gbps": intra_bw_8p_gbps,
-        },
-        model_options={
-            "quant": quant, "kv_cache_dtype": kv_cache_dtype, "indexer_kv_dtype": indexer_kv_dtype,
-            "layers": layers, "n_routed_experts": n_routed_experts, "num_experts_per_tok": num_experts_per_tok,
-            "promote_dense_to_moe": promote_dense_to_moe,
-        },
-        mtp_options={
-            "mtp_proposal_tokens": mtp_proposal_tokens, "mtp_acceptance_length": mtp_acceptance_length,
-        },
-        scenario_options={
-            "prompt_tokens": prompt_tokens, "output_tokens": output_tokens, "concurrency": concurrency,
-            "prefix_tokens": prefix_tokens, "arrival_gap_ms": arrival_gap_ms,
-            "ttft_slo_ms": ttft_slo_ms, "tpot_slo_ms": tpot_slo_ms, "require_scenario": require_scenario,
-            "max_model_len": max_model_len, "max_num_seqs": max_num_seqs,
-            "max_num_batched_tokens": max_num_batched_tokens, "prefix_cache_key": prefix_cache_key,
-        },
-        policy_options={
-            "sp": sp, "enable_torch_compile": enable_torch_compile,
-            "multistream_overlap_shared_expert": multistream_overlap_shared_expert,
-            "engram_cpu_offload": engram_cpu_offload, "enable_shared_expert_dp": enable_shared_expert_dp,
-            "enable_flashcomm1": enable_flashcomm1, "enable_fused_mc2": enable_fused_mc2,
-            "enable_prefill_mc2": enable_prefill_mc2,
-        },
-        runtime_options={
-            "q_proj_tp": q_proj_tp, "o_proj_tp": o_proj_tp, "linear_proj_tp": linear_proj_tp,
-            "dcp_linear_tp": dcp_linear_tp, "mlp_tp": mlp_tp, "shared_expert_tp": shared_expert_tp,
-            "lm_head_tp": lm_head_tp, "redundant_experts_per_rank": redundant_experts_per_rank,
-            "collective_startup_mode": collective_startup_mode, "matrix_compute_policy": matrix_compute_policy,
-            "recover_ssm": recover_ssm, "prefix_cache_mode": prefix_cache_mode, "prefix_read_mode": prefix_read_mode,
-            "homogeneous_graph_reuse": homogeneous_graph_reuse,
-            "enable_chunked_prefill": enable_chunked_prefill, "async_scheduling": async_scheduling,
-            "enable_npugraph_ex": enable_npugraph_ex, "enable_static_kernel": enable_static_kernel,
-            "enable_super_kernel": enable_super_kernel, "enable_dbo": enable_dbo,
-            "pp_layer_partition": pp_layer_partition,
-        },
-        cp_options={
-            "enable_pcp_o_proj_weight_sharding": enable_pcp_o_proj_weight_sharding,
-            "enable_sfa_dcp_sharded_indexer": enable_sfa_dcp_sharded_indexer,
-            "dcp_q_replicate": dcp_q_replicate,
-        },
-        stack_options={
-            "runtime_stack": runtime_stack, "optimizations": optimizations,
-            "exclude_optimizations": exclude_optimizations, "_stack_phase": _stack_phase,
-        },
+        moe_comm_mode=moe_comm_mode, **grouped,
     )
     return _apply_hardware_derivation(
         case_dict,

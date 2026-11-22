@@ -23,20 +23,21 @@
 """
 from __future__ import annotations
 
-from typing import Any, Mapping, Sequence
+from typing import Any
 
 from mindie_sim.catalog.types import QuantSpec
 from mindie_sim.schema.operators import OpSpec
 from mindie_sim.schema.common import ModelingError, align_up, dtype_bytes
 
-ZERO = 0
-ONE = 1
 #: Fused groupwise INT4 kernels unpack two nibbles per stored byte, widen the
 #: integer to the compute dtype, then multiply by one declared group scale.
 W4A16_DEQUANT_OPS_PER_WEIGHT = 3
 #: Packed integer weights whose activation stays floating point dequantize
 #: in-kernel; the op's compute identity is that activation format.
 W4A16_WEIGHT_FORMATS = frozenset({"int4", "w4a8"})
+INT8_EPILOGUE_FP32_OPS = 3
+INT8_EPILOGUE_CAST_OPS = 4
+CUBE_TILE_ALIGN = 16
 
 
 def _safe_bytes(dtype: str) -> float:
@@ -111,11 +112,75 @@ def packed_weight_format(quant: QuantSpec, category: str) -> str:
     return quant.format_for(category)
 
 
+def _gemm_packed_and_epilogue_meta(
+    *, quant: QuantSpec, category: str, fmt: str, act: str, out_dtype: str,
+    compute: str, m: int, n: int, k: int, group: int, scale_bytes: float,
+    weight_bytes: float, weight_cols: int | None, unit_shape: tuple[int, int],
+    unit_total: float, bytes_per_weight: float, weight_elements: float,
+    metadata: tuple[tuple[str, Any], ...],
+) -> tuple[tuple[tuple[str, Any], ...], float]:
+    """Build packed-weight, fused-dequant, and INT8 epilogue metadata + vector_ops."""
+    packed = fmt not in {"bf16", "bfloat16", "fp16", "float16", "fp32", "float32"}
+    groupwise_dequant = (fmt in W4A16_WEIGHT_FORMATS and compute != "int8"
+                         and m > 0 and weight_elements > 0)
+    extra: tuple[tuple[str, Any], ...] = ()
+    if packed:
+        existing_meta = dict(metadata)
+        scale_meta: tuple[tuple[str, Any], ...] = ()
+        if "weight_payload_bytes" not in existing_meta:
+            unit_payload = float(quant.matrix_payload_bytes(*unit_shape, category))
+            payload_bytes = weight_bytes * (unit_payload / unit_total) if unit_total > 0 else 0.0
+            scale_meta += (("weight_payload_bytes", payload_bytes),)
+        if "weight_scale_format" not in existing_meta:
+            scale_meta += (("weight_scale_format", quant.execution_weight_scale_format()),)
+        if "weight_scale_bytes" not in existing_meta:
+            scale_meta += (("weight_scale_bytes", quant.execution_weight_scale_bytes()),
+                           ("weight_scale_storage_format", quant.scale_format),
+                           ("weight_scale_storage_bytes", float(quant.scale_bytes)))
+        extra = extra + scale_meta + (
+            ("dequant", "fused" if fmt in {"mxfp4", "fp4", "fp4_e2m1", "int4", "w4a8"} else "none"),
+            ("dequant_traffic", 0.0),
+            ("weight_bytes", weight_bytes),
+            ("implementation_assumption", "declared_matrix_operand_formats"),
+        )
+    if groupwise_dequant:
+        extra = extra + (
+            ("dequant", "groupwise_fused"),
+            ("dequant_group_size", max(1, int(quant.expert_block))),
+            ("dequant_ops_per_weight", float(W4A16_DEQUANT_OPS_PER_WEIGHT)),
+            ("dequant_weight_elements", float(weight_elements)),
+            ("dequant_bytes_per_element", float(bytes_per_weight)),
+            ("dequant_compute_format", compute),
+            ("dequant_residency", "on_chip_l1_l0_no_hbm_writeback"),
+        )
+    vector_ops = (float(W4A16_DEQUANT_OPS_PER_WEIGHT * weight_elements)
+                  if groupwise_dequant else 0.0)
+    if (fmt in {"int8", "w8a8"} and act == "int8" and group >= k
+            and out_dtype in {"bf16", "bfloat16", "fp16", "float16", "fp32", "float32"}):
+        runtime_meta = quant.execution_int8_weight_metadata()
+        runtime_scale_bytes = quant.execution_weight_scale_bytes()
+        metadata_columns = 1 if runtime_meta == "scale_only" else 2
+        column_width = metadata_columns * runtime_scale_bytes
+        column_metadata = weight_bytes * column_width / (int(weight_cols or k) + column_width)
+        operations = (INT8_EPILOGUE_FP32_OPS if out_dtype in {"fp32", "float32"}
+                      else INT8_EPILOGUE_CAST_OPS)
+        vector_ops = float(operations * m * n)
+        extra += (("matrix_epilogue", {
+            "kind": "row_column_scale", "row_scale_bytes": float(scale_bytes),
+            "column_scale_bytes": column_metadata, "operations_per_output": operations,
+        }), ("matrix_output_contract", "int32_cast_row_scale_column_scale_output_cast"),
+            ("int8_weight_metadata", runtime_meta),
+            ("column_metadata_policy", "declared_scale_only_storage_traffic"
+             if runtime_meta == "scale_only"
+             else "retains_declared_scale_and_offset_storage_traffic"))
+    return extra, vector_ops
+
+
 def gemm_op(
     *, op_id: str, deps: tuple[str, ...], stage: int, layer: int,
     requests: tuple[str, ...], m: int, n: int, k: int, quant: QuantSpec,
     category: str, phase: str, recipe: str = "", family: str = "gemm",
-    semantic_family: str = "", weight_count: int = ONE,
+    semantic_family: str = "", weight_count: int = 1,
     weight_rows: int | None = None, weight_cols: int | None = None,
     weight_bytes_override: float | None = None,
     semantic_shape: tuple[int, ...] | None = None,
@@ -126,7 +191,7 @@ def gemm_op(
 ) -> OpSpec:
     quant = quant.for_category(category)
     m, n, k = int(m), int(n), int(k)
-    if m < ZERO or min(n, k) < ONE:
+    if m < 0 or min(n, k) < 1:
         raise ModelingError(f"matrix_geometry_invalid:{op_id}:{m},{n},{k}")
     declared_compute = dict(metadata).get("compute_format")
     compute, act = compute_dtype_for(quant, category)
@@ -146,7 +211,7 @@ def gemm_op(
         if weight_bytes_override is not None
         else packed_weight_bytes(
             quant, int(weight_rows or n), int(weight_cols or k), category,
-            count=max(ONE, int(weight_count)),
+            count=max(1, int(weight_count)),
         )
     )
     if not m:
@@ -159,16 +224,11 @@ def gemm_op(
     fmt = packed_weight_format(quant, category)
     unit_shape = (int(weight_rows or n), int(weight_cols or k))
     unit_total = float(quant.matrix_bytes(*unit_shape, category))
-    bytes_per_weight = (unit_total / float(unit_shape[ZERO] * unit_shape[ONE])
-                        if unit_total > ZERO else 0.0)
-    # The dequantized operand is the packed byte stream this occurrence really
-    # reads, including a caller-declared active expert bank count.
+    bytes_per_weight = (unit_total / float(unit_shape[0] * unit_shape[1])
+                        if unit_total > 0 else 0.0)
     weight_elements = (weight_bytes / bytes_per_weight
-                       if bytes_per_weight > ZERO else 0.0)
-    groupwise_dequant = (fmt in W4A16_WEIGHT_FORMATS and compute != "int8"
-                         and m > ZERO and weight_elements > ZERO)
+                       if bytes_per_weight > 0 else 0.0)
     recipe = recipe or semantic_family or family
-    packed = fmt not in {"bf16", "bfloat16", "fp16", "float16", "fp32", "float32"}
     meta = tuple(metadata) + (
         ("semantic_family", semantic_family or family),
         ("weight_format", fmt),
@@ -181,7 +241,7 @@ def gemm_op(
         ("quant_category", category),
         ("catalog_category", category),
         ("packed_weight_bytes", weight_bytes),
-        ("matrix_groups", max(ONE, int(weight_count))),
+        ("matrix_groups", max(1, int(weight_count))),
         ("weight_representation", _layout_name(fmt, quant)),
         ("dequant_before_compute", fmt in {"mxfp4", "fp4", "fp4_e2m1"}),
         *((("activation_group_size", group),
@@ -189,78 +249,32 @@ def gemm_op(
            ("activation_scale_shape", scale_shape),
            ("activation_scale_bytes", float(scale_bytes)),
            ("activation_scale_in_mte2", True))
-          if scale_bytes > ZERO else ()),
+          if scale_bytes > 0 else ()),
     )
-    if packed:
-        existing_meta = dict(metadata)
-        scale_meta = ()
-        if "weight_payload_bytes" not in existing_meta:
-            unit_payload = float(quant.matrix_payload_bytes(*unit_shape, category))
-            payload_bytes = weight_bytes * (unit_payload / unit_total) if unit_total > 0 else 0.0
-            scale_meta += (("weight_payload_bytes", payload_bytes),)
-        if "weight_scale_format" not in existing_meta:
-            scale_meta += (("weight_scale_format", quant.execution_weight_scale_format()),)
-        if "weight_scale_bytes" not in existing_meta:
-            scale_meta += (("weight_scale_bytes", quant.execution_weight_scale_bytes()),
-                           ("weight_scale_storage_format", quant.scale_format),
-                           ("weight_scale_storage_bytes", float(quant.scale_bytes)))
-        meta = meta + scale_meta + (
-            ("dequant", "fused" if fmt in {"mxfp4", "fp4", "fp4_e2m1", "int4", "w4a8"} else "none"),
-            ("dequant_traffic", 0.0),
-            ("weight_bytes", weight_bytes),
-            ("implementation_assumption", "declared_matrix_operand_formats"),
-        )
-    if groupwise_dequant:
-        # The packed operand is unpacked, widened and rescaled on the vector
-        # pipe inside the consumer; the staged tile stays on chip and never
-        # becomes an HBM write-back.
-        meta = meta + (
-            ("dequant", "groupwise_fused"),
-            ("dequant_group_size", max(ONE, int(quant.expert_block))),
-            ("dequant_ops_per_weight", float(W4A16_DEQUANT_OPS_PER_WEIGHT)),
-            ("dequant_weight_elements", float(weight_elements)),
-            ("dequant_bytes_per_element", float(bytes_per_weight)),
-            ("dequant_compute_format", compute),
-            ("dequant_residency", "on_chip_l1_l0_no_hbm_writeback"),
-        )
-    vector_ops = (float(W4A16_DEQUANT_OPS_PER_WEIGHT * weight_elements)
-                  if groupwise_dequant else 0.0)
-    if (fmt in {"int8", "w8a8"} and act == "int8" and group >= k
-            and out_dtype in {"bf16", "bfloat16", "fp16", "float16", "fp32", "float32"}):
-        # Per-row dynamic quantization rescales the completed INT32 reduction.
-        # Retain only the declared column inputs; an absent offset must not
-        # double the scale traffic or become a synthetic matrix operand.
-        runtime_meta = quant.execution_int8_weight_metadata()
-        runtime_scale_bytes = quant.execution_weight_scale_bytes()
-        metadata_columns = 1 if runtime_meta == "scale_only" else 2
-        column_width = metadata_columns * runtime_scale_bytes
-        column_metadata = weight_bytes * column_width / (int(weight_cols or k) + column_width)
-        operations = 3 if out_dtype in {"fp32", "float32"} else 4
-        vector_ops = float(operations * m * n)
-        meta += (("matrix_epilogue", {
-            "kind": "row_column_scale", "row_scale_bytes": float(scale_bytes),
-            "column_scale_bytes": column_metadata, "operations_per_output": operations,
-        }), ("matrix_output_contract", "int32_cast_row_scale_column_scale_output_cast"),
-            ("int8_weight_metadata", runtime_meta),
-            ("column_metadata_policy", "declared_scale_only_storage_traffic"
-             if runtime_meta == "scale_only"
-             else "retains_declared_scale_and_offset_storage_traffic"))
+    extra_meta, vector_ops = _gemm_packed_and_epilogue_meta(
+        quant=quant, category=category, fmt=fmt, act=act, out_dtype=out_dtype,
+        compute=compute, m=m, n=n, k=k, group=group, scale_bytes=scale_bytes,
+        weight_bytes=weight_bytes, weight_cols=weight_cols,
+        unit_shape=unit_shape, unit_total=unit_total,
+        bytes_per_weight=bytes_per_weight, weight_elements=weight_elements,
+        metadata=metadata,
+    )
+    meta = meta + extra_meta
     return OpSpec(
         op_id=op_id, family=family, phase=phase, stage=stage, layer=layer,
         requests=requests,
         semantic_shape=semantic_shape or (m, n, k),
         local_shape=(m, n, k),
-        padded_shape=(align_up(m, 16), align_up(n, 16), align_up(k, 16)),
+        padded_shape=(align_up(m, CUBE_TILE_ALIGN), align_up(n, CUBE_TILE_ALIGN),
+                      align_up(k, CUBE_TILE_ALIGN)),
         launch_shape=(m, n, k),
         flops=flops, vector_ops=vector_ops, hbm_bytes=hbm,
         mte2_bytes=input_bytes + weight_bytes + scale_bytes,
         mte3_bytes=output_bytes, deps=deps, recipe=recipe,
         notes=tuple(notes) + ("gemm_formula=2*M*N*K",
                               "weight_bytes_use_declared_packing"),
-        # The cube op's physical identity is its *compute* dtype: a W8A8 op is
-        # an int8 kernel even though it consumes/produces bf16 activations.
-        # Byte widths stay on ``act``/``out_dtype`` above.
-        metadata=meta + (("program_kind", "matmul"),), dtype=compute, layout=_layout_name(fmt, quant),
+        metadata=meta + (("program_kind", "matmul"),), dtype=compute,
+        layout=_layout_name(fmt, quant),
     )
 
 
@@ -368,6 +382,59 @@ def vector_op(
     )
 
 
+_COMM_AXIS_NORMALIZE = {
+    "cp": "dcp",
+    "dcp": "dcp",
+    "dcp_tp": "dcp",
+    "dcp_dp": "dcp",
+    "dcp_a2a": "dcp",
+    "pcp": "pcp",
+    "tp": "tp",
+    "tp_sp": "tp_sp",
+    "ep": "ep",
+    "dp": "dp",
+    "pp": "pp",
+    "etp": "etp",
+    "local_tp": "local_tp",
+}
+
+
+def _normalize_comm_metadata(
+    family: str, metadata: tuple[tuple[str, Any], ...],
+) -> tuple[tuple[str, Any], ...]:
+    meta_map = dict(metadata)
+    extra: list[tuple[str, Any]] = []
+    if "comm_axis" not in meta_map:
+        raw_axis = str(meta_map.get("group_axis") or "").strip().lower()
+        if raw_axis == "tp" and "sequence_parallel" in meta_map:
+            axis = "tp_sp"
+        else:
+            axis = _COMM_AXIS_NORMALIZE.get(raw_axis, raw_axis)
+        if axis:
+            extra.append(("comm_axis", axis))
+    if "comm_group_size" not in meta_map:
+        size = 0
+        for key in ("moe_ep_size", "dcp_degree", "dcp_tp_gather", "dcp_dp_width", "local_tp_width"):
+            val = meta_map.get(key)
+            if isinstance(val, int) and not isinstance(val, bool) and val > 1:
+                size = int(val)
+                break
+        if not size:
+            ranks = meta_map.get("group_ranks")
+            if isinstance(ranks, (tuple, list)) and len(ranks) > 1:
+                size = len(ranks)
+        if not size:
+            steps = meta_map.get("steps")
+            if isinstance(steps, int) and not isinstance(steps, bool) and steps > 0:
+                if family == "allreduce" and steps >= 2 and steps % 2 == 0:
+                    size = (steps // 2) + 1
+                else:
+                    size = steps + 1
+        if size > 1:
+            extra.append(("comm_group_size", int(size)))
+    return tuple(metadata) + tuple(extra) if extra else tuple(metadata)
+
+
 def comm_op(
     *, op_id: str, deps: tuple[str, ...], stage: int, layer: int,
     requests: tuple[str, ...], family: str, phase: str, recipe: str,
@@ -379,7 +446,7 @@ def comm_op(
         requests=requests, semantic_shape=shape, local_shape=shape,
         padded_shape=shape, launch_shape=shape, link_bytes=float(max(0.0, link_bytes)),
         hbm_bytes=float(max(0.0, hbm_bytes)), deps=deps, recipe=recipe,
-        notes=tuple(notes), metadata=metadata,
+        notes=tuple(notes), metadata=_normalize_comm_metadata(family, metadata),
     )
 
 

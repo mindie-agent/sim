@@ -28,6 +28,7 @@ from dataclasses import replace
 from typing import Any, Mapping
 
 from mindie_sim.catalog.config import _int, _require
+from mindie_sim.catalog.draft_spec import parse_draft_max_position_embeddings
 from mindie_sim.catalog.types import AuxiliarySpec, DraftSpec, merge_source
 from mindie_sim.schema.model import LayerPlan
 from mindie_sim.schema.common import ModelingError
@@ -265,6 +266,7 @@ def _aux_deepseek(c: Mapping[str, Any], *, v41: bool, d: Mapping[str, Any]) -> A
         vocab_size=_int(c, "vocab_size"),
         mhc_mult=_int(c, "hc_mult"), mhc_sinkhorn_iters=_int(c, "hc_sinkhorn_iters"),
         input_projection_category="dspark_input",
+        max_position_embeddings=parse_draft_max_position_embeddings(c),
         source=merge_source(
             dspark_source,
             {

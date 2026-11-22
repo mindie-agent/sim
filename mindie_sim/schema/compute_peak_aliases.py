@@ -29,12 +29,6 @@ from typing import Any
 from mindie_sim.schema.common import ModelingError
 
 
-ZERO: float = 0.0
-PAIR = 2
-FIRST = 0
-SECOND = 1
-
-
 def _items(value: Any, reason: str) -> tuple[tuple[str, Any], ...]:
     if value is None:
         return ()
@@ -43,9 +37,9 @@ def _items(value: Any, reason: str) -> tuple[tuple[str, Any], ...]:
     if isinstance(value, (tuple, list)):
         result: list[tuple[str, Any]] = []
         for item in value:
-            if not isinstance(item, (tuple, list)) or len(item) != PAIR:
+            if not isinstance(item, (tuple, list)) or len(item) != 2:
                 raise ModelingError(reason)
-            result.append((item[FIRST], item[SECOND]))
+            result.append((item[0], item[1]))
         return tuple(result)
     raise ModelingError(reason)
 
@@ -123,10 +117,10 @@ def validate_compute_peak_aliases(
                 f"compute_peak_alias_unknown_target:{name}->{target}")
         value = values[name]
         target_value = values[target]
-        if (not math.isfinite(value) or value <= ZERO
-                or not math.isfinite(target_value) or target_value <= ZERO):
+        if (not math.isfinite(value) or value <= 0.0
+                or not math.isfinite(target_value) or target_value <= 0.0):
             raise ModelingError(f"compute_peak_alias_invalid_value:{name}")
-        if not math.isclose(value, target_value, rel_tol=ZERO, abs_tol=ZERO):
+        if not math.isclose(value, target_value, rel_tol=0.0, abs_tol=0.0):
             raise ModelingError(
                 f"compute_peak_alias_value_mismatch:{name}:{value}!={target_value}")
         if native_modes:

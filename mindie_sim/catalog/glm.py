@@ -31,6 +31,7 @@ from __future__ import annotations
 from typing import Any, Mapping
 
 from mindie_sim.catalog.config import _int, _require
+from mindie_sim.catalog.draft_spec import parse_draft_max_position_embeddings
 from mindie_sim.catalog.types import AuxiliarySpec, DraftSpec, merge_source
 from mindie_sim.schema.model import LayerPlan
 from mindie_sim.schema.common import ModelingError
@@ -341,6 +342,7 @@ def _aux_glm(c: Mapping[str, Any]) -> AuxiliarySpec:
         vocab_size=int(c["vocab_size"]),
         mhc_mult=_int(c, "hc_mult") if hyper else 0,
         mhc_sinkhorn_iters=_int(c, "hc_sinkhorn_iters") if hyper else 0,
+        max_position_embeddings=parse_draft_max_position_embeddings(c),
         source=merge_source(
             GLM_MTP_SOURCE,
             {

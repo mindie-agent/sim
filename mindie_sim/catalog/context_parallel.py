@@ -899,3 +899,94 @@ def dcp_q_replicate_enabled(
     if pcp_factor != 1 or dp_width != 1 or sparse:
         return False
     return bool(runtime_cp_flag(runtime, "dcp_q_replicate", "enable_dcp_q_replicate"))
+
+
+def _has_non_negative_id(obj: Any, attr: str) -> bool:
+    raw = getattr(obj, attr, None)
+    return raw is not None and not isinstance(raw, bool) and int(raw) >= 0
+
+
+def _model_dcp_attention_class(model: ModelSpec) -> str:
+    """Classify a model's KV-reading attention family for vLLM-Ascend DCP co-domain rules."""
+    if is_v41_replicated_cache_model(model):
+        return "replicated_cache"
+    plans = tuple(getattr(model, "layer_plans", ()) or ()) or (model,)
+    has_sfa_dsa = any(
+        str(getattr(lp, "attention", "") or "").lower() == "dsa"
+        or (
+            str(getattr(lp, "attention", "") or "").lower() == "mla"
+            and (
+                bool(getattr(lp, "indexer", False))
+                or bool(getattr(lp, "owns_topk", False))
+                or _has_non_negative_id(lp, "topk_owner_layer_id")
+                or _has_non_negative_id(lp, "index_k_owner_layer_id")
+            )
+        )
+        for lp in plans
+    )
+    if has_sfa_dsa:
+        return "sfa_dsa"
+    has_mla = any(
+        str(getattr(lp, "attention", "") or "").lower() == "mla"
+        or str(getattr(lp, "cache_kind", "") or "").lower() == "window_compressed"
+        for lp in plans
+    )
+    if has_mla:
+        return "mla"
+    has_gqa = any(
+        str(getattr(lp, "attention", "") or "").lower() in {"gqa", "mha", "mqa"}
+        for lp in plans
+    )
+    return "gqa" if has_gqa else "non_kv"
+
+
+def legal_vllm_ascend_dcp_values(
+    model: ModelSpec, *, tp: int, pcp: int = 1,
+) -> tuple[int, ...]:
+    """Exact ``vllm-ascend`` legal DCP degrees reusing TP (and optional PCP) ranks.
+
+    Standalone Decode DCP (``pcp == 1``) reuses the TP rank group with zero
+    extra ranks (``world_size = dp * tp * pp``):
+    - SFA / DSA sparse MLA: ``dcp in {1, tp}`` (must equal ``tp`` when > 1).
+    - Standard MLA: ``dcp`` divides ``tp`` (``1 <= dcp <= tp``).
+    - GQA / replicated cache / non-KV: ``dcp == 1`` (GQA DCP deprecated in v0.32.0).
+    Combined PCP + DCP (``pcp > 1``, ``world_size = dp * tp * pcp * pp``):
+    - MLA / SFA: ``dcp in {1, pcp, pcp * tp}``.
+    - GQA / replicated cache / non-KV: ``dcp == 1``.
+    """
+    tp_n = max(1, int(tp))
+    pcp_n = max(1, int(pcp))
+    kind = _model_dcp_attention_class(model)
+    if kind in {"gqa", "replicated_cache", "non_kv"}:
+        return (1,)
+    if pcp_n > 1:
+        return tuple(dict.fromkeys((1, pcp_n, pcp_n * tp_n)))
+    if kind == "sfa_dsa":
+        return (1, tp_n) if tp_n > 1 else (1,)
+    return tuple(d for d in range(1, tp_n + 1) if tp_n % d == 0)
+
+
+def validate_vllm_ascend_dcp_codomain(
+    model: ModelSpec, parallel: ParallelSpec,
+) -> tuple[bool, str | None]:
+    """Check whether ``parallel`` obeys upstream ``vllm-ascend`` DCP <-> TP co-domain rules."""
+    dcp = max(1, int(getattr(parallel, "cp", 1) or 1))
+    tp = max(1, int(getattr(parallel, "tp", 1) or 1))
+    pcp = max(1, int(getattr(parallel, "pcp", 1) or 1))
+    if dcp <= 1:
+        return True, None
+    kind = _model_dcp_attention_class(model)
+    if kind == "replicated_cache":
+        return False, "vllm_ascend_replicated_cache_requires_dcp_1"
+    if kind == "non_kv":
+        return False, "vllm_ascend_non_kv_model_requires_dcp_1"
+    if kind == "gqa":
+        return False, "vllm_ascend_gqa_dcp_deprecated"
+    legal = legal_vllm_ascend_dcp_values(model, tp=tp, pcp=pcp)
+    if dcp in legal:
+        return True, None
+    if pcp > 1:
+        return False, f"vllm_ascend_pcp_dcp_must_be_pcp_or_pcp_times_tp:dcp={dcp},pcp={pcp},tp={tp}"
+    if kind == "sfa_dsa":
+        return False, f"vllm_ascend_sfa_dcp_must_equal_tp:dcp={dcp},tp={tp}"
+    return False, f"vllm_ascend_mla_dcp_must_divide_tp:dcp={dcp},tp={tp}"
