@@ -468,6 +468,53 @@ def _normalize_quant_preset(quant: QuantSpec | None, fallback: str = "BF16") -> 
     return "BF16"
 
 
+_WEIGHT_QUANT_ALIASES: dict[str, str] = {
+    "bf16": "BF16",
+    "bfloat16": "BF16",
+    "fp16": "BF16",
+    "float16": "BF16",
+    "fp32": "FP32",
+    "float32": "FP32",
+    "fp8": "FP8",
+    "fp8_e4m3": "FP8",
+    "fp8_e5m2": "FP8",
+    "w8a8": "W8A8",
+    "int8": "INT8",
+    "w4a8": "W4A8",
+    "int4": "INT4",
+    "mxfp8": "MXFP8",
+    "w8a8_mxfp8": "MXFP8",
+    "w8a8-mxfp8": "MXFP8",
+    "mxfp4": "MXFP4",
+    "w4a8_mxfp": "MXFP4",
+    "w4a8-mxfp": "MXFP4",
+    "w4a8_mxfp4": "MXFP4",
+    "w4a8-mxfp4": "MXFP4",
+}
+
+_CACHE_DTYPE_ALIASES: dict[str, str] = {
+    "bf16": "BF16",
+    "bfloat16": "BF16",
+    "fp16": "BF16",
+    "float16": "BF16",
+    "c8": "C8",
+    "int8": "C8",
+    "fp8": "FP8",
+    "fp8_e4m3": "FP8",
+    "fp8_e5m2": "FP8",
+}
+
+
+def _canonicalize_weight_quant_override(raw: str) -> str:
+    token = str(raw).strip().lower()
+    return _WEIGHT_QUANT_ALIASES.get(token, str(raw).strip().upper())
+
+
+def _canonicalize_cache_dtype_override(raw: str) -> str:
+    token = str(raw).strip().lower()
+    return _CACHE_DTYPE_ALIASES.get(token, str(raw).strip().upper())
+
+
 def _normalize_cache_dtype(model: Any) -> str:
     quant = getattr(model, "quant", None)
     raw = str(
@@ -1124,10 +1171,16 @@ def compute_memory_quant_ledger(
     stage_layers = _stage_layer_counts(case)
     resolved_seq = max(1, int(seq_len if seq_len is not None else case.runtime.max_model_len))
     resolved_conc = max(1, int(concurrency if concurrency is not None else max(1, len(case.workload.requests))))
-    resolved_wq = str(weight_quant or _normalize_quant_preset(case.model.quant)).strip().upper()
+    resolved_wq = (
+        _canonicalize_weight_quant_override(weight_quant)
+        if weight_quant is not None else _normalize_quant_preset(case.model.quant)
+    )
     if resolved_wq not in WEIGHT_QUANT_FORMATS:
         raise ModelingError(f"unsupported_weight_quant:{resolved_wq}")
-    resolved_cd = str(cache_dtype or _normalize_cache_dtype(case.model)).strip().upper()
+    resolved_cd = (
+        _canonicalize_cache_dtype_override(cache_dtype)
+        if cache_dtype is not None else _normalize_cache_dtype(case.model)
+    )
     if resolved_cd not in SUPPORTED_CACHE_DTYPES:
         raise ModelingError(f"unsupported_cache_dtype:{resolved_cd}")
     resolved_offload = (

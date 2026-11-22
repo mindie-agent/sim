@@ -469,7 +469,7 @@ def test_cli_export_commands_receipt_isolation_and_error_guards(tmp_path, monkey
     rc_xlsx = cli_mod._main([
         "export-xlsx", str(case_path), "--output", str(xlsx_out),
         "--phase", "decode", "--tokens", "1", "--context", "256",
-        "--weight-quant", "W8A8", "--cache-dtype", "C8", "--engram-offload",
+        "--weight-quant", "w4a8_mxfp", "--cache-dtype", "fp8_e4m3", "--engram-offload",
         "--receipt", str(xlsx_receipt),
     ])
     assert rc_xlsx == 0

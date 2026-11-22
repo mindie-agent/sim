@@ -23,8 +23,6 @@ import sys
 from typing import Any
 
 from .export import (
-    SUPPORTED_CACHE_DTYPES,
-    SUPPORTED_WEIGHT_QUANTS,
     export_comparison_xlsx,
     export_msprof_trace,
 )
@@ -103,12 +101,12 @@ def add_export_commands(subparsers) -> None:
         help="optional candidate ('After') case JSON for Before/After Summary delta table",
     )
     xlsx_cmd.add_argument(
-        "--weight-quant", choices=SUPPORTED_WEIGHT_QUANTS, default=None,
-        help="optional weight quantization preset override for Sheet 3 calculator",
+        "--weight-quant", default=None,
+        help="optional weight quantization preset override (e.g. BF16, W8A8, W4A8, MXFP8, MXFP4, w4a8_mxfp)",
     )
     xlsx_cmd.add_argument(
-        "--cache-dtype", choices=SUPPORTED_CACHE_DTYPES, default=None,
-        help="optional KV/Indexer/KeyPool cache dtype override for Sheet 3 calculator",
+        "--cache-dtype", default=None,
+        help="optional KV/Indexer/KeyPool cache dtype override (e.g. BF16, C8, FP8, fp8_e4m3, int8)",
     )
     xlsx_cmd.add_argument("--engram-offload", dest="engram_offload", action="store_true", default=None)
     xlsx_cmd.add_argument("--no-engram-offload", dest="engram_offload", action="store_false")
