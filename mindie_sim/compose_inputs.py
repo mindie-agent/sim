@@ -148,6 +148,7 @@ _EXTRA_QUANT_SPECS: dict[str, QuantSpec] = {
         weight_block=(1, MX_EXPERT_BLOCK_GROUP),
         expert_block=MX_EXPERT_BLOCK_GROUP,
         scale_format="fp8_e8m0", scale_bytes=1.0, kv_dtype="bf16",
+        index_dtype="bf16", index_scale_dtype="none",
     ),
 }
 

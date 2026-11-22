@@ -17,7 +17,6 @@ from typing import Any
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.parallel import ParallelSpec
 from mindie_sim.schema.model import ModelSpec
-from mindie_sim.schema.subgraphs import KV_READING_ATTENTION_KINDS
 
 #: DCP strategy (kept as the historical string because plan consumers already
 #: report it).  It shards KV and merges (out, LSE); DSA indexers are replicated.
@@ -345,16 +344,16 @@ class PcpSplit:
 
 
 def _pcp_chunk_bounds(q_len: int, pcp: int) -> tuple[int, ...]:
-    """Equal-as-possible contiguous bounds for ``2*pcp`` DualChunkSwap chunks.
+    """Contiguous bounds for ``2*pcp`` DualChunkSwap chunks matching upstream ``PCPManager``.
 
-    The upstream chunker pads every chunk to ``ceil(q/2pcp)``; the simulator
-    prices real tokens only, so it redistributes the remainder at the tail.
-    Sums stay exact (no invented tokens) and the chunk sizes differ by <= 1.
+    Upstream sizes each mirrored chunk to ``ceil(q_len / (2*pcp))`` and clips
+    trailing chunks to ``q_len``.  Real token sums stay exact (no invented tokens).
     """
     q_len = max(0, int(q_len))
     pcp = max(1, int(pcp))
     chunks = 2 * pcp
-    return tuple((index * q_len) // chunks for index in range(chunks + 1))
+    chunk_size = (q_len + chunks - 1) // chunks if q_len > 0 else 0
+    return tuple(min(index * chunk_size, q_len) for index in range(chunks + 1))
 
 
 def pcp_rank_chunk_ranges(q_len: int, pcp: int, rank: int) -> tuple[tuple[int, int], ...]:
@@ -466,6 +465,25 @@ def split_index_rows(rows: int, cp: int) -> CpSplit:
     return split_rows(rows, cp, unit="rows")
 
 
+def dcp_indexer_sharded(model: Any, runtime: Any = None) -> bool:
+    """True when sparse LightningIndexer cache is sharded across DCP ranks.
+
+    By default ``vllm-ascend`` replicates the LightningIndexer cache across DCP
+    ranks and remaps global Top-K indices via Triton ``sparse_index_remap``.
+    Sharding is opt-in via model execution policy or runtime
+    ``enable_sfa_dcp_sharded_indexer`` / ``dcp_indexer_sharded``.
+    """
+    if runtime is not None:
+        meta = dict(getattr(runtime, "metadata", ()) or ())
+        extra = dict(meta.get("additional_config") or ()) if isinstance(meta.get("additional_config"), dict) else {}
+        for source in (meta, extra):
+            for key in ("enable_sfa_dcp_sharded_indexer", "dcp_indexer_sharded"):
+                if key in source and source[key] is not None:
+                    return bool(source[key])
+    from .paired_sfa import execution
+    return bool(execution(model).get("dcp_indexer_sharded"))
+
+
 def cp_interleave(runtime: Any) -> int:
     """Declared KV block interleave; defaults to the KV block size."""
     raw = dict(getattr(runtime, "metadata", ()) or ()).get(
@@ -499,23 +517,144 @@ def cp_plan_kind(parallel: ParallelSpec) -> str:
     return CP_PLAN_DCP if cp_requested(parallel) else CP_PLAN_NONE
 
 
+def dcp_axis_factors(parallel: ParallelSpec) -> tuple[int, int, int]:
+    """Factorize ``parallel.cp`` into ``(pcp_factor, tp_gather, dcp_dp_width)``."""
+    from mindie_sim.schema.parallel import factor_dcp_axes
+
+    return factor_dcp_axes(
+        int(getattr(parallel, "cp", 1) or 1),
+        pcp=int(getattr(parallel, "pcp", 1) or 1),
+        tp=int(getattr(parallel, "tp", 1) or 1),
+        dp=int(getattr(parallel, "dp", 1) or 1),
+    )
+
+
+def is_v41_replicated_cache_model(model: ModelSpec) -> bool:
+    """True for latent-MQA C2 window-compressed backends requiring replicated KV caches.
+
+    Matches upstream ``DeepseekV41CacheLayer.supports_dcp = False`` and
+    ``AscendDSAV41PCPMetadataBuilder`` requiring ``DCP=1`` at backend
+    construction regardless of how many leading layers are sliced.
+    """
+    plans = tuple(getattr(model, "layer_plans", ()) or ()) or (model,)
+    if any(
+        str(getattr(plan, "mla_variant", "") or "") == "latent_mqa"
+        and str(getattr(plan, "cache_kind", "") or "") == "window_compressed"
+        and (int(getattr(plan, "compress_ratio", 0) or 0) == 2
+             or str(getattr(plan, "compressor_kind", "") or "") == "gated_ring")
+        for plan in plans
+    ):
+        return True
+    facts = dict(getattr(model, "catalog_facts", ()) or ())
+    ratios = tuple(int(r) for r in (facts.get("compress_ratios") or ()) if r is not None)
+    attn_types = dict(facts.get("attention_types") or ())
+    has_latent_mqa = any(str(getattr(plan, "mla_variant", "") or "") == "latent_mqa" for plan in plans)
+    return bool(has_latent_mqa and (2 in ratios or int(attn_types.get("csa2", 0) or 0) > 0))
+
+
+def layer_dcp_factors(plan: Any, parallel: ParallelSpec) -> tuple[int, int, int]:
+    """Effective ``(pcp_factor, layer_tp_gather, dp_width)`` KV-sharding factors for one layer.
+
+    MLA/DSA/CSA/CSA2/SWA/HCA layers hold 1 compressed latent KV head regardless
+    of any HuggingFace ``num_kv_heads`` metadata field.  GQA layers shard across
+    ``tp_gather`` only up to their intra-TP KV replication factor
+    ``max(1, tp // num_kv_heads)``; hybrid layers already head-sharded on TP
+    (such as sliding layers with ``num_kv_heads >= tp``) keep
+    ``layer_tp_gather = 1`` rather than double-dividing KV cache or FLOPs.
+    """
+    cp = int(getattr(parallel, "cp", 1) or 1)
+    if cp <= 1:
+        return (1, 1, 1)
+    attn = str(getattr(plan, "attention", "") or "").strip().lower()
+    if attn not in _CP_CONTEXT_FAMILIES:
+        return (1, 1, 1)
+    pcp_factor, tp_gather, dp_width = dcp_axis_factors(parallel)
+    if attn != "gqa":
+        return (pcp_factor, tp_gather, dp_width)
+    tp = max(1, int(getattr(parallel, "tp", 1) or 1))
+    kv_heads = max(1, int(getattr(plan, "num_kv_heads", 1) or 1))
+    kv_rep = (tp // kv_heads) if (tp >= kv_heads and tp % kv_heads == 0) else 1
+    if tp_gather <= 1:
+        layer_tp_gather = 1
+    elif kv_rep > 1 and tp_gather <= kv_rep and kv_rep % tp_gather == 0:
+        layer_tp_gather = tp_gather
+    elif kv_rep == 1:
+        layer_tp_gather = 1
+    else:
+        raise ModelingError(
+            f"cp_exceeds_gqa_decode_domain:cp={cp},tp={tp},kv_heads={kv_heads}"
+        )
+    return (pcp_factor, layer_tp_gather, dp_width)
+
+
+def layer_dcp_degree(plan: Any, parallel: ParallelSpec) -> int:
+    """Effective KV-cache and decode attention DCP shard count for one layer."""
+    pcp_factor, layer_tp_gather, dp_width = layer_dcp_factors(plan, parallel)
+    return int(pcp_factor * layer_tp_gather * dp_width)
+
+
+def kv_cache_replication_info(
+    model: ModelSpec, parallel: ParallelSpec,
+) -> dict[str, Any]:
+    """Diagnostic KV-cache replication metadata (informational only, never a ban)."""
+    tp = max(1, int(getattr(parallel, "tp", 1) or 1))
+    cp = max(1, int(getattr(parallel, "cp", 1) or 1))
+    pcp = max(1, int(getattr(parallel, "pcp", 1) or 1))
+    plans = tuple(getattr(model, "layer_plans", ()) or ()) or (model,)
+    max_rep = 1
+    for plan in plans:
+        attn = str(getattr(plan, "attention", "") or "").strip().lower()
+        if attn not in _CP_CONTEXT_FAMILIES:
+            continue
+        if attn == "gqa":
+            kv_heads = max(1, int(getattr(plan, "num_kv_heads", 1) or 1))
+            raw_tp_rep = (tp // kv_heads) if (tp >= kv_heads and tp % kv_heads == 0) else 1
+        else:
+            raw_tp_rep = tp
+        _, layer_tp_gather, _ = layer_dcp_factors(plan, parallel)
+        residual = max(1, raw_tp_rep // max(1, layer_tp_gather))
+        if residual > max_rep:
+            max_rep = residual
+    if tp == 1 and cp == 1 and pcp == 1:
+        sharding = "pure_dp_ep"
+    elif pcp > 1 and cp > 1:
+        sharding = "pcp_dcp"
+    elif pcp > 1:
+        sharding = "pcp"
+    elif cp > 1:
+        sharding = "dcp"
+    elif max_rep > 1:
+        sharding = "tp_kv_replicated"
+    else:
+        sharding = "tp_kv_sharded"
+    return {
+        "kv_cache_replicated_tp": bool(tp > 1 and max_rep > 1),
+        "kv_cache_replication_factor": int(max_rep),
+        "canonical_kv_sharding": sharding,
+    }
+
+
 def validate_cp_geometry(parallel: ParallelSpec) -> None:
-    """Structural CP guards across TP (when PCP=1) or TPxPCP (when PCP>1)."""
+    """Algebraic-only CP guards across PCP, TP, and DP axes."""
     cp = int(getattr(parallel, "cp", 1) or 1)
     if cp <= 1:
         return
-    tp = int(parallel.tp)
-    pcp = int(getattr(parallel, "pcp", 1) or 1)
-    if pcp <= 1:
-        if tp <= 1:
-            raise ModelingError("cp_requires_tp_group")
-        if cp > tp:
-            raise ModelingError(f"cp_exceeds_tp:{cp}>{tp}")
-        if tp % cp != 0:
-            raise ModelingError(f"tp_not_divisible_by_cp:{tp}%{cp}")
-        return
-    if cp not in {pcp, tp * pcp}:
-        raise ModelingError(f"dcp_pcp_domain_invalid:dcp={cp},pcp={pcp},tp={tp}")
+    dp = max(1, int(getattr(parallel, "dp", 1) or 1))
+    tp = max(1, int(getattr(parallel, "tp", 1) or 1))
+    pcp = max(1, int(getattr(parallel, "pcp", 1) or 1))
+    max_domain = dp * tp * pcp
+    if cp > max_domain:
+        raise ModelingError(
+            f"cp_exceeds_parallel_domain:cp={cp}>dp*tp*pcp={max_domain}"
+        )
+    pcp_factor, tp_gather, dp_width = dcp_axis_factors(parallel)
+    rem = cp // pcp_factor
+    if (pcp % pcp_factor != 0 or cp % pcp_factor != 0
+            or tp % tp_gather != 0 or rem % tp_gather != 0
+            or dp % dp_width != 0 or pcp_factor * tp_gather * dp_width != cp):
+        raise ModelingError(
+            f"dcp_factorization_invalid:dcp={cp},pcp={pcp},tp={tp},dp={dp}"
+        )
 
 
 def validate_pcp_geometry(parallel: ParallelSpec) -> None:
@@ -553,15 +692,23 @@ def verify_cp_model(model: ModelSpec, parallel: ParallelSpec) -> None:
     cp = int(getattr(parallel, "cp", 1) or 1)
     if cp <= 1:
         return
-    pcp = int(getattr(parallel, "pcp", 1) or 1)
+    if is_v41_replicated_cache_model(model):
+        raise ModelingError("v41_replicated_cache_requires_dcp_1")
     kinds = _attention_families(model)
     if not kinds & _CP_CONTEXT_FAMILIES:
         raise ModelingError(f"cp_requires_context_attention:{'+'.join(sorted(kinds))}")
-    for plan in getattr(model, "layer_plans", ()) or ():
-        if plan.attention == "gqa":
-            _verify_gqa_kv_domain(int(plan.num_kv_heads), int(parallel.tp), cp, pcp=pcp)
-    if not getattr(model, "layer_plans", ()) and model.attention == "gqa":
-        _verify_gqa_kv_domain(int(model.num_kv_heads), int(parallel.tp), cp, pcp=pcp)
+    plans = tuple(getattr(model, "layer_plans", ()) or ()) or (model,)
+    kv_degrees = [
+        layer_dcp_degree(plan, parallel)
+        for plan in plans
+        if str(getattr(plan, "attention", "") or "").strip().lower()
+        in _CP_CONTEXT_FAMILIES
+    ]
+    max_layer_dcp = max(kv_degrees, default=1)
+    if max_layer_dcp < cp:
+        raise ModelingError(
+            f"cp_exceeds_gqa_decode_domain:cp={cp},max_layer_dcp={max_layer_dcp}"
+        )
 
 
 def _attention_kinds(model: ModelSpec) -> set[str]:
@@ -600,22 +747,6 @@ def _attention_families(model: ModelSpec) -> set[str]:
     if plans:
         return {_cp_attention_family(plan) for plan in plans}
     return {_cp_attention_family(model)}
-
-
-def _verify_gqa_kv_domain(
-    num_kv_heads: int, tp: int, cp: int, *, pcp: int = 1,
-) -> None:
-    if pcp > 1 and cp > 1 and cp != pcp:
-        raise ModelingError(f"gqa_pcp_dcp_requires_equal_degrees:pcp={pcp},dcp={cp}")
-    kv_heads = max(1, num_kv_heads)
-    if pcp <= 1:
-        domain = tp // kv_heads
-    elif tp >= kv_heads:
-        domain = (tp // kv_heads) * pcp
-    else:
-        domain = pcp if kv_heads % max(1, tp) == 0 else 0
-    if domain < cp or cp <= 0 or domain % cp != 0:
-        raise ModelingError(f"cp_exceeds_gqa_decode_domain:cp={cp},tp//kv_heads={domain}")
 
 
 def verify_pcp_model(model: ModelSpec, parallel: ParallelSpec) -> None:

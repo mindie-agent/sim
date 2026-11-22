@@ -114,7 +114,6 @@ def compute_sweep_candidate_id(
     """Deterministic 32-hex identity before any static or graph evaluation."""
     model = parsed.model
     runtime = parsed.runtime
-    engram = getattr(model, "engram", None)
     model_runtime = {
         "model": model.to_dict(),
         "runtime": runtime.to_dict(),
@@ -155,7 +154,36 @@ def _parallel_short(spec: ParallelSpec) -> dict[str, int]:
               for key in ("dp", "tp", "ep", "pp", "pcp")}
     if spec.dcp > 1:
         result["dcp"] = int(spec.dcp)
+    for axis in (
+        "q_proj_tp", "o_proj_tp", "linear_proj_tp", "dcp_linear_tp",
+        "mlp_tp", "shared_expert_tp", "lm_head_tp",
+    ):
+        val = int(getattr(spec, axis, 1))
+        if val > 1:
+            result[axis] = val
     return result
+
+
+def kv_replication_fields(model: ModelSpec, cand_p: ParallelSpec) -> dict[str, Any]:
+    """Transparent non-blocking KV-cache replication metadata for sweep rows."""
+    from mindie_sim.catalog.context_parallel import kv_cache_replication_info
+    from mindie_sim.public.errors import UnmodeledCapabilityError
+
+    try:
+        info = kv_cache_replication_info(model, cand_p)
+    except UnmodeledCapabilityError:
+        raise
+    except (ModelingError, ValueError):
+        return {
+            "kv_cache_replicated_tp": False,
+            "kv_cache_replication_factor": 1,
+            "canonical_kv_sharding": "invalid",
+        }
+    return {
+        "kv_cache_replicated_tp": bool(info["kv_cache_replicated_tp"]),
+        "kv_cache_replication_factor": int(info["kv_cache_replication_factor"]),
+        "canonical_kv_sharding": str(info["canonical_kv_sharding"]),
+    }
 
 
 def compute_pareto_frontier(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -288,8 +316,7 @@ def validate_candidate_statically(
     _local_head_validation(model, cand_p, mla_replicate)
     cand_p.validate(model, layer_partition=part or None)
     cand_machine.validate_placement(cand_p)
-    if max(int(cand_p.o_proj_tp), int(cand_p.linear_proj_tp),
-           int(cand_p.lm_head_tp)) > 1:
+    if cand_p.has_local_tp:
         cand_case = replace(parsed, machine=cand_machine,
                             runtime=replace(parsed.runtime, parallel=cand_p,
                                             pp_layer_partition=tuple(part or ())))
@@ -652,8 +679,10 @@ def candidate_devices(raw: Mapping[str, Any], num_devices: int | None) -> int:
 def enumerate_case_candidates(
     parsed: CaseSpec, *, num_devices: int | None, allow_dp: bool,
     allow_ep: bool, allow_pp: bool, allow_pcp: bool,
+    allow_dcp: bool = False,
     candidate_tps: Sequence[int] | None, ep_candidates: Sequence[int] | None,
     pp_candidates: Sequence[int] | None, pcp_candidates: Sequence[int] | None,
+    dcp_candidates: Sequence[int] | None = None,
     explicit: Sequence[Mapping[str, Any]] | None,
 ) -> list[dict[str, Any]]:
     if explicit is not None:
@@ -662,9 +691,51 @@ def enumerate_case_candidates(
                else len(parsed.machine.dies))
     return enumerate_parallel_candidates(
         parsed, num_devices=devices, allow_dp=allow_dp, allow_ep=allow_ep,
-        allow_pp=allow_pp, allow_pcp=allow_pcp,
+        allow_pp=allow_pp, allow_pcp=allow_pcp, allow_dcp=allow_dcp,
         candidate_tps=candidate_tps, ep_candidates=ep_candidates,
-        pp_candidates=pp_candidates, pcp_candidates=pcp_candidates)
+        pp_candidates=pp_candidates, pcp_candidates=pcp_candidates,
+        dcp_candidates=dcp_candidates)
+
+
+def evaluate_candidate_worker(task: Mapping[str, Any]) -> dict[str, Any]:
+    """Pickle-safe worker evaluating one candidate from plain dict payloads."""
+    started = time.monotonic()
+    parsed = parse_case(task["case_dict"])
+    cand_p = ParallelSpec.from_mapping(task["parallel_spec"])
+    cand_devices = int(task["num_devices"])
+    part = tuple(task["part"] or ())
+    common = dict(task["common"])
+    probe = dict(task["probe"])
+    machine = materialize_machine_for_devices(parsed, parsed, cand_devices)
+    cand_case = build_candidate_case(parsed, machine, cand_p, part)
+    from mindie_sim.public.errors import UnmodeledCapabilityError
+
+    try:
+        static = validate_candidate_statically(
+            parsed, cand_p, cand_devices=cand_devices, cand_machine=machine,
+            part=part, phase=probe["phase"], context=probe["context"],
+            q_tokens=probe["q_tokens"], emit_tokens=probe["emit_tokens"],
+            output_budget=probe["output_budget"],
+            max_sequences_per_dp=probe["max_sequences_per_dp"])
+    except UnmodeledCapabilityError:
+        raise
+    except (ModelingError, ValueError) as exc:
+        return static_row(
+            common, reason=str(exc), kind="topology",
+            elapsed_ms=(time.monotonic() - started) * MS_PER_S)
+    if not static["ok"]:
+        return static_row(
+            common, reason=str(static["reason"]), kind=str(static["kind"]),
+            elapsed_ms=(time.monotonic() - started) * MS_PER_S)
+    ctx = EvaluationContext.create(cand_case)
+    row = full_row(
+        parsed, cand_case, cand_p, common=common, ctx=ctx,
+        phase=probe["phase"], scope=probe["scope"], context=probe["context"],
+        q_tokens=probe["q_tokens"], emit_tokens=probe["emit_tokens"],
+        sla_ms=probe["sla_ms"], output_budget=probe["output_budget"],
+        max_sequences_per_dp=probe["max_sequences_per_dp"],
+        b_vram_max=int(static["b_vram_max_joint"]), static=static)
+    return row
 
 
 __all__ = [
@@ -673,7 +744,8 @@ __all__ = [
     "DEFAULT_SLA_MS", "FULL_STAGE", "LOCKED_PROGRAM_ERROR", "SCREEN_BATCH",
     "SweepEvaluationCache", "b1_screen", "build_candidate_case",
     "candidate_devices", "compute_pareto_frontier",
-    "compute_sweep_candidate_id", "enumerate_case_candidates", "full_row",
+    "compute_sweep_candidate_id", "enumerate_case_candidates",
+    "evaluate_candidate_worker", "full_row", "kv_replication_fields",
     "parallel_report", "project_replica_row", "select_finalists",
     "set_deadline", "static_row", "timeout_row",
     "validate_candidate_statically",

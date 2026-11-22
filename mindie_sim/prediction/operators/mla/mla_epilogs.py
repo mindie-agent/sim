@@ -14,7 +14,12 @@ import math
 
 from mindie_sim.catalog.cache import completed_rows, index_row_bytes, index_selection_cost
 from mindie_sim.catalog.cache_format import cache_format
+from mindie_sim.catalog.context_parallel import dcp_indexer_sharded, layer_dcp_degree
 from mindie_sim.catalog.ops import compute_dtype_for
+from mindie_sim.prediction.operators.context_parallel.graph import (
+    CP_DECODE_COMM_STREAM,
+    emit_pcp_hidden_gather_restore,
+)
 from mindie_sim.schema.common import ModelingError, dtype_bytes
 
 from .generic_latent_attention import (
@@ -284,7 +289,7 @@ def index_head_weights(builder, *, plan, model, quant, deps, pool_weights, token
     weights = pool_weights or builder.matrix(
         "index_weights", (weights_input,), tokens, plan.index_heads, model.hidden_size,
         category="indexer.weights")
-    mode1 = native and plan.index_kpool == 1 and quant.index_dtype == "fp8_e4m3"
+    mode1 = native and plan.index_kpool == 1 and quant.index_dtype in {"fp8", "fp8_e4m3"}
     if native and not mode1:
         # ``aclnnQuantLightningIndexerV2`` / ``aclnnPoolKeyIndexer`` consume the
         # checkpoint head-weight projection directly.  Any external cast would
@@ -336,14 +341,16 @@ def lower_index_path(builder, *, plan, model, quant, parallel, views, deps, runt
                      compressed_latent, cache_ids, index_cache_ids, candidate_ids,
                      topk_ids, q_norm, stage, stage_of, index_rope, pool_binding,
                      pcp_prefill, dsa_prefill, hierarchy=None, reuse_selection=False,
-                     shared_topk=None, fused_compressor=False):
+                     shared_topk=None, fused_compressor=False,
+                     cache_hidden_dep=None, cache_views=None,
+                     cache_padded_tokens=None, skip_pcp_index_gather=False):
     """Produce the index cache and (optionally) its TopK selection."""
     b = builder
     q = padded_tokens
     native_indexer = native_indexer_active(runtime)
     ratio = max(1, plan.compress_ratio)
-    sharded_index = bool(dict(model.metadata).get("attention_execution", {}).get(
-        "dcp_indexer_sharded")) and cp > 1
+    eff_dcp = max(int(cp), layer_dcp_degree(plan, parallel)) if dcp_indexer_sharded(model, runtime) else int(cp)
+    sharded_index = dcp_indexer_sharded(model, runtime) and eff_dcp > 1
     idx_block = max(1, own_block // ratio)
     topk = candidate = None
 
@@ -358,26 +365,27 @@ def lower_index_path(builder, *, plan, model, quant, parallel, views, deps, runt
                                   source_stage=producer_stage, destination_stage=stage)
         return ready
 
+    prod_views = cache_views if cache_views is not None else views
+    prod_deps = cache_hidden_dep if cache_hidden_dep is not None else deps
+    prod_q = cache_padded_tokens if cache_padded_tokens is not None else q
+    prod_valid = sum(v.q_len for v in prod_views)
     index_store, pool_weights = _produce_index_cache(
-        b, plan, pool_binding, views, deps, model, quant, q, long_store, compressed_latent,
-        ratio, valid, fused_compressor, runtime, native_indexer, index_rope, parallel,
-        idx_block, sharded_index)
-    if pcp_prefill and plan.indexer and plan.owns_index_k and index_store is not None:
+        b, plan, pool_binding, prod_views, prod_deps, model, quant, prod_q, long_store,
+        compressed_latent, ratio, prod_valid, fused_compressor, runtime, native_indexer,
+        index_rope, parallel, idx_block, sharded_index,
+        pcp_prefill=(pcp_prefill and not skip_pcp_index_gather))
+    if (pcp_prefill and not skip_pcp_index_gather and plan.index_kpool <= 1
+            and plan.indexer and plan.owns_index_k and index_store is not None):
         # One stored index vector is index_dim wide, not index_heads copies of it.
-        if plan.index_kpool > 1:
-            rows = sum((view.context + (view.global_q_len or view.q_len)) // plan.index_kpool
-                       - view.context // plan.index_kpool
-                       for view in views if view.phase == "prefill")
-        else:
-            rows = sum(completed_rows(
-                view.context + (view.global_q_len or view.q_len), ratio)
-                - completed_rows(view.context, ratio)
-                for view in views if view.phase == "prefill")
+        rows = sum(completed_rows(
+            view.context + (view.global_q_len or view.q_len), ratio)
+            - completed_rows(view.context, ratio)
+            for view in views if view.phase == "prefill")
         index_store = b.communicate(
             "pcp_index_gather", (index_store,),
             rows * index_row_bytes(model, plan.index_dim)
             * (parallel.pcp - 1) / parallel.pcp,
-            "allgather", "pcp")
+            "allgather", "pcp", dtype=quant.index_dtype)
     if reuse_selection:
         if shared_topk is None or plan.index not in shared_topk:
             raise ModelingError("mtp_shared_topk_selection_missing")
@@ -424,7 +432,7 @@ def lower_index_path(builder, *, plan, model, quant, parallel, views, deps, runt
                     candidate_ids, plan.candidate_source_layer_id, "candidate",
                     valid * plan.candidate_topk_blocks * INT32_BYTES))
         shard = (parallel.tp if dsa_prefill
-                 else cp if sharded_index else 1)
+                 else eff_dcp if sharded_index else 1)
         score_rows = (
             sharded_index_visible_rows(views, parallel, idx_block, ratio)
             if sharded_index else None
@@ -441,10 +449,10 @@ def lower_index_path(builder, *, plan, model, quant, parallel, views, deps, runt
                 family="elementwise")
             gathered = b.communicate(
                 "candidate_gather", (topk,),
-                valid * plan.index_topk * CANDIDATE_BYTES * (cp - 1),
-                "allgather", "cp")
+                valid * plan.index_topk * CANDIDATE_BYTES * (eff_dcp - 1),
+                "allgather", "cp", dtype="fp32")
             topk = b.vector("candidate_merge", (gathered,),
-                            valid * plan.index_topk * cp,
+                            valid * plan.index_topk * eff_dcp,
                             math.log2(max(MIN_LOG_TOPK, plan.index_topk)),
                             dtype="fp32", family="topk")
         if plan.owns_candidate_blocks:
@@ -460,11 +468,32 @@ def lower_index_path(builder, *, plan, model, quant, parallel, views, deps, runt
 def _produce_index_cache(
     b, plan, pool_binding, views, deps, model, quant, q, long_store, compressed_latent, ratio,
     valid, fused_compressor, runtime, native_indexer, index_rope, parallel, idx_block,
-    sharded_index,
+    sharded_index, *, pcp_prefill=False,
 ):
     index_store = pool_weights = None
     if plan.owns_index_k and plan.index_kpool > 1:
         from mindie_sim.prediction.operators.sparse_indexer import index_pool
+        kpool_source, kpool_views, kpool_q = deps, views, q
+        if pcp_prefill and int(parallel.pcp) > 1:
+            kpool_views = tuple(
+                replace(v, q_len=int(v.global_q_len or v.q_len),
+                        query_ranges=((0, int(v.global_q_len or v.q_len)),))
+                if v.phase == "prefill" else v
+                for v in views
+            )
+            kpool_q = max(q * int(parallel.pcp), sum(v.q_len for v in kpool_views))
+            kpool_source = emit_pcp_hidden_gather_restore(
+                b.ops, prefix=b.prefix,
+                gather_name="pcp_keypool_hidden_gather",
+                restore_name="pcp_keypool_hidden_restore",
+                stage=b.common["stage"], layer=plan.index,
+                requests=b.common["requests"], mode=b.common["phase"],
+                dep=deps, local_rows=q, global_rows=kpool_q,
+                hidden=model.hidden_size, pcp=int(parallel.pcp),
+                act_dtype=model.activation_dtype, runtime=runtime,
+                source="vllm_ascend.attention.indexer_kpool",
+                stream=CP_DECODE_COMM_STREAM,
+            )
         native_pool = bool(
             pool_binding
             and pool_binding.name == "vllm_ascend_cann_keypool_caller")
@@ -472,12 +501,12 @@ def _produce_index_cache(
             from mindie_sim.prediction.operators.sparse_indexer.index_pool_native import supported as native_pool_supported
             # Both native cache production and analytical fallback retain the full K/V batch.
             native_pool = native_pool_supported(
-                views=views, plan=plan, model=model, quant=quant)
+                views=kpool_views, plan=plan, model=model, quant=quant)
         pool_module = pool_binding.module if native_pool else index_pool
         producer_options = (pool_binding.options if native_pool else {})
         index_store, pool_weights = pool_module.producer(
-            b, source=deps, views=views, plan=plan, model=model, quant=quant,
-            padded_tokens=q, **producer_options)
+            b, source=kpool_source, views=kpool_views, plan=plan, model=model, quant=quant,
+            padded_tokens=kpool_q, **producer_options)
     elif plan.owns_index_k:
         index_source = long_store if plan.index_input == "compressed" else deps
         if (plan.index_input == "compressed"

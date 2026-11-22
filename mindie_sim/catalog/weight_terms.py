@@ -81,13 +81,16 @@ def _legacy_sharded_shape(
 ) -> tuple[int, int, int]:
     rows, cols, count = int(term.rows), int(term.cols), int(term.count)
     tp, ep = max(1, parallel.tp), max(1, parallel.ep)
+    pcp = max(1, int(getattr(parallel, "pcp", 1) or 1))
     etp = max(1, parallel.etp)
+    # KDA under PCP shards heads (and head-indexed weights) across tp * pcp.
+    kda_tp = (tp * pcp) if (pcp > 1 and term.name.startswith("kda_")) else tp
     if term.shard == "replicated":
         return rows, cols, count
     if term.shard == "out_tp":
-        return _ceil_div(rows, tp), cols, count
+        return _ceil_div(rows, kda_tp), cols, count
     if term.shard == "in_tp":
-        return rows, _ceil_div(cols, tp), count
+        return rows, _ceil_div(cols, kda_tp), count
     if term.shard == "kv_out":
         if term.units <= 0 or term.unit_width <= 0:
             raise ModelingError(f"catalog_kv_shard_granularity_missing:{term.name}")

@@ -403,6 +403,8 @@ def lower_implementations(ops, runtime, source_dtype, *, passes=None, resource_f
             if generated:
                 for identifier, value in generated.items():
                     capture_state.setdefault(identifier, value)
+    from mindie_sim.prediction.operators.context_parallel.graph import rewrite_quantized_allreduce
+    ops = rewrite_quantized_allreduce(ops, runtime, source_dtype)
     ops = lower_operators(ops, bindings, activation_quantized=activation_quantized, final=True)
     ops = lower_shared_experts(ops, bindings)
     grouped_int8 = select(bindings, "grouped_int8_caller")

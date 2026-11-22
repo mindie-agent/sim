@@ -628,10 +628,9 @@ def attention_defaults(case, phase, *, tokens=1):
                      any(k in recipes for k in ("flash_attention", "flash_attention_decode")))) or
                     (family == "indexed_mla" and ("indexed_attention" in lowerings or
                      "indexed_attention" in programs)))
-        from mindie_sim.catalog.paired_sfa import execution
         reason = ("explicit_implementation_preserved" if explicit else
-                  "gathered_head_attention_contract" if family == "indexed_mla"
-                  and execution(case.model).get("dcp_query_gather") else
+                  "paired_sfa_allocator_contract" if family == "indexed_mla"
+                  and dict(case.model.metadata).get("cache_allocator") == "paired_sfa" else
                   "partitioned_attention_domain" if phase != "decode" and parallel.pcp != 1 else
                   "decode_profile_only" if phase != "decode" else
                   "independent_copy_pipes_not_declared" if not pipes else

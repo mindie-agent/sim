@@ -21,6 +21,10 @@ from mindie_sim.prediction.structure_groups import declare_group, source_referen
 from mindie_sim.prediction.implementations import select
 from mindie_sim.prediction.projections import kda_projections, require_packed_slice
 from .recover_ssm_work import emit_commit_op, record_head_bytes, recover_ssm_enabled
+from mindie_sim.prediction.operators.context_parallel.graph import (
+    emit_pcp_hidden_gather_restore,
+    emit_pcp_restore_unpermute,
+)
 from mindie_sim.prediction.operators.kda.kda_source import serial_context_parallel, serving_source
 
 DEFAULT_RECURRENT_CHUNK_TOKENS = 64
@@ -114,6 +118,22 @@ def _lower_kda_projections(b, tensors, *, projection_source, conv_source, deps, 
 def _lower_convolution(b, tensors, *, conv_source, projection_group, conv_input, sources,
                        views, tokens, heads, key_width, value_width, conv_width, parallel, runtime):
     prefix, plan = b.prefix, b.plan
+    conv_deps = tuple(dict.fromkeys(sources))
+    # GDN under PCP exchanges the pre-conv [n_pf, conv_width, kernel-1] boundary
+    # tail via one pcp AllGather BEFORE short convolution; KDA under PCP operates
+    # on gathered global sequences with tp*pcp head sharding.
+    if (plan.attention == "gdn" and parallel.pcp > 1
+            and any(view.phase == "prefill" for view in views)):
+        n_pf = sum(1 for view in views if view.phase == "prefill")
+        tail_bytes = (
+            n_pf * max(0, plan.conv_kernel - 1) * conv_width
+            * dtype_bytes(b.model.activation_dtype)
+            * (parallel.pcp - 1)
+        )
+        tail_op = b.communicate(
+            "pcp_conv_tail_gather", conv_deps, tail_bytes, "allgather", "pcp",
+            dtype=b.model.activation_dtype, source="vllm_ascend.ops.gdn")
+        conv_deps = (*conv_deps, tail_op)
     if conv_source:
         conv = conv_source.module.lower(
             b, tensors, plan=plan, views=views, tokens=tokens, sources=sources,
@@ -122,7 +142,7 @@ def _lower_convolution(b, tensors, *, conv_source, projection_group, conv_input,
         active_views = tuple(view for view in views if not view.padding)
         active_tokens = sum(view.q_len for view in active_views)
         history_bytes = (plan.conv_kernel - 1) * len(active_views) * conv_width * 2
-        conv = b.vector("short_convolution", tuple(dict.fromkeys(sources)),
+        conv = b.vector("short_convolution", conv_deps,
                         tokens * conv_width, 2 * plan.conv_kernel,
                         read_bytes_override=(active_tokens * conv_width * 2
                                              + history_bytes),
@@ -187,15 +207,6 @@ def _lower_convolution(b, tensors, *, conv_source, projection_group, conv_input,
     if state_copy:
         conv = state_copy.module.wrap(b, conv=conv, views=views, width=conv_width,
                                       **state_copy.options)
-    # DualChunkSwap owns 2*pcp chunks. Conv history crosses each boundary, so
-    # each prefill request pays (2*pcp-1)/pcp of one state all-gather.
-    if parallel.pcp > 1 and any(view.phase == "prefill" for view in views):
-        conv = b.communicate(
-            "pcp_conv_state_step", (conv,),
-            sum(1 for view in views if view.phase == "prefill")
-            * max(0, plan.conv_kernel - 1) * conv_width * 2
-            * (2 * parallel.pcp - 1) / parallel.pcp,
-            "allgather", "pcp")
     return conv
 
 
@@ -234,6 +245,62 @@ def _lower_chunk_prepare(b, *, index, q, chunk, chunks, span, heads, dk, dv,
     return pairs, last
 
 
+def _emit_gdn_pcp_prefix_scan(b, *, index, view, dep, heads, dk, dv, pcp, chunk):
+    """Exact ``ops/triton/fla/chunk.py`` GDN PCP: fwd_hupdate + 2 FP32 AGs + prefix scan."""
+    q_local = max(1, int(view.q_len))
+    scan_chunk = max(1, int(chunk))
+    chunks = max(1, math.ceil(q_local / scan_chunk))
+    scan_heads = max(1, int(heads))
+    phi_bytes = float(scan_heads * dk * dk * FP32_BYTES)
+    state_bytes = float(scan_heads * dk * dv * FP32_BYTES)
+    hupdate = b.work(
+        f"pcp_gdn_hupdate{index}", (dep,), (1, scan_heads, dk, dk),
+        flops=float(2 * q_local * scan_heads * dk * dk),
+        vector=float(chunks * scan_heads * dk * dk),
+        read=phi_bytes + float(q_local * scan_heads * dk * 2),
+        write=phi_bytes, family="recurrent_scan", dtype="fp32",
+        metadata=(
+            ("pcp", int(pcp)), ("chunks", chunks), ("chunk", scan_chunk),
+            ("tokens", q_local), ("heads", scan_heads),
+            ("source", "ops/triton/fla/chunk.py:fwd_hupdate"),
+        ),
+    )
+    ag_state = b.communicate(
+        f"pcp_gdn_state_gather{index}", (dep,),
+        state_bytes * (pcp - 1), "allgather", "pcp", dtype="fp32",
+    )
+    ag_phi = b.communicate(
+        f"pcp_gdn_hupdate_gather{index}", (hupdate,),
+        phi_bytes * (pcp - 1), "allgather", "pcp", dtype="fp32",
+    )
+    steps = max(1, int(pcp) - 1)
+    prefix = b.work(
+        f"pcp_gdn_prefix_scan{index}", (ag_state, ag_phi), (steps, scan_heads, dk, dv),
+        flops=float(2 * steps * scan_heads * dk * dk * dv),
+        vector=float(steps * scan_heads * dk * dv),
+        read=(state_bytes + phi_bytes) * pcp, write=state_bytes,
+        family="recurrent_scan", dtype="fp32",
+        metadata=(
+            ("pcp", int(pcp)), ("chunks", steps), ("chunk", 1),
+            ("tokens", steps), ("heads", scan_heads),
+            ("source", "ops/triton/fla/chunk.py:prefix_scan"),
+        ),
+    )
+    rerun = b.work(
+        f"pcp_gdn_fwd_h_rerun{index}", (prefix,), (q_local, scan_heads, dk, dv),
+        flops=float(PREFILL_SCAN_FLOPS_PER_STATE_ELEMENT * q_local * scan_heads * dk * dv),
+        vector=float(chunks * 2 * scan_heads * dk * dv),
+        read=chunks * state_bytes, write=chunks * state_bytes,
+        family="recurrent_scan", dtype="fp32",
+        metadata=(
+            ("pcp", int(pcp)), ("chunks", chunks), ("chunk", scan_chunk),
+            ("tokens", q_local), ("heads", scan_heads),
+            ("pcp_rank_gt_zero_rerun", True),
+        ),
+    )
+    return rerun
+
+
 def _lower_segmented_gdn_scan(b, *, view, index, views, last, normalized, chunk,
                               heads, dk, dv, state_bytes, value_width, parallel):
     prefix, plan = b.prefix, b.plan
@@ -259,10 +326,6 @@ def _lower_segmented_gdn_scan(b, *, view, index, views, last, normalized, chunk,
         segment_view = replace(view, q_len=length, context=version,
                                global_q_len=length, query_ranges=((0, length),))
         direction = "conv" if range_index == len(view.query_ranges) - 1 else "h"
-        # A local tail segment that reaches the global end is not
-        # necessarily the global owner: a PCP rank may miss the
-        # middle ranges owned by its peers.  Publish only when the
-        # whole rank owns every global query token.
         owner = not pcp_state_selection.pcp_remote_publish(
             view.query_ranges, view.q_len, total_global, pcp=parallel.pcp, padding=view.padding)
         contract, effects = gdn_recurrent.state_contract(
@@ -282,25 +345,13 @@ def _lower_segmented_gdn_scan(b, *, view, index, views, last, normalized, chunk,
         if range_index < len(view.query_ranges) - 1:
             gap = int(view.query_ranges[range_index + 1][0]) - int(end)
             if gap:
-                previous = b.communicate(
-                    f"pcp_recurrent_state_step{index}_{segment_index}", (previous,),
-                    state_bytes * (2 * parallel.pcp - 1) / parallel.pcp,
-                    "state_transfer", "pcp", state_scope="recurrent_local_bank",
-                    remote_producer="external_rank", source_implementation="pcp1_only",
-                    status="pending_external_rank", from_version=version, to_version=version + gap)
                 version += gap
         segment_index += 1
     if previous is not None and parallel.pcp > 1:
-        pub_name = "pcp_remote_state_publish" if len(views) == 1 else f"pcp_remote_state_publish{index}"
-        previous = b.work(
-            pub_name, (previous,), (0,), recipe="pcp_remote_state_publish", family="state_publish",
-            metadata=(("status", "local_owner" if owner else "pending_external_rank"),
-                      ("producer_scope", "local_writeback" if owner else "external_rank"),
-                      ("completion_owner", "T04/final_writeback"),
-                      ("source_implementation", "pcp1_only"),
-                      ("global_expected_version", view.context + (view.global_q_len or view.q_len))))
-    last = previous
-    return last
+        previous = _emit_gdn_pcp_prefix_scan(
+            b, index=index, view=view, dep=previous, heads=heads, dk=dk, dv=dv,
+            pcp=parallel.pcp, chunk=chunk)
+    return previous
 
 
 def _lower_recurrent_scan(b, *, view, index, q, chunks, span, chunk, heads, dk, dv,
@@ -324,7 +375,6 @@ def _lower_recurrent_scan(b, *, view, index, q, chunks, span, chunk, heads, dk, 
     pcp_segment = plan.attention == "gdn" and view.phase == "prefill" and parallel.pcp > 1
     ranges = tuple(view.query_ranges)
     first_start = int(ranges[0][0]) if ranges else 0
-    range_end = int(ranges[-1][1]) if ranges else q
     global_q = view.global_q_len or view.q_len
     remote_initial = remote_port = None
     if pcp_segment and first_start > 0:
@@ -373,24 +423,9 @@ def _lower_recurrent_scan(b, *, view, index, q, chunks, span, chunk, heads, dk, 
             "gdn_state_contract": contract, "gdn_state_effects": effects,
             "state_value_outputs": state_outputs}.items()))
         if pcp_segment:
-            state_bytes = heads * dk * dv * dtype_bytes(plan.recurrent_state_dtype or "fp32")
-            step = None
-            if first_start == 0 and range_end < global_q:
-                step = b.communicate(
-                    f"pcp_recurrent_state_step{index}", (last,),
-                    state_bytes * (2 * parallel.pcp - 1) / parallel.pcp,
-                    "state_transfer", "pcp", request=view.request_id,
-                    from_version=view.context + range_end, to_version=view.context + global_q,
-                    remote_producer="external_rank", completion_owner="T09/COMM-LEAVES",
-                    source_implementation="pcp1_only", status="pending_external_rank")
-            owner = "local_writeback" if range_end >= global_q else "external_rank"
-            b.work(
-                f"pcp_remote_state_publish{index}", (step or last,), (0,), family="state_publish",
-                metadata=(("status", "local_owner" if range_end >= global_q else "pending_external_rank"),
-                          ("producer_scope", owner), ("completion_owner", "T04/final_writeback"),
-                          ("source_implementation", "pcp1_only"), ("request", view.request_id),
-                          ("global_expected_version", view.context + global_q),
-                          ("publish_pending", "remote_producer")))
+            last = _emit_gdn_pcp_prefix_scan(
+                b, index=index, view=view, dep=last, heads=heads, dk=dk, dv=dv,
+                pcp=parallel.pcp, chunk=chunk)
     return last, state_bytes
 
 
@@ -482,8 +517,8 @@ def _lower_recurrent_views(b, *, views, chunk, heads, key_heads, dk, dv, key_wid
                     is_kda_prefill=is_kda_prefill, use_recover_ssm=use_recover_ssm, rec_bytes=rec_bytes)
             if view.phase == "prefill":
                 prefill_scan_ids.append(last)
-                if parallel.pcp > 1 and not pcp_ranges and plan.attention != "gdn":
-                    # Contiguous KDA ranges keep the single post-scan handoff.
+                if parallel.pcp > 1 and not pcp_ranges and plan.attention not in {"gdn", "kda"}:
+                    # Non-head-sharded recurrent families keep the single post-scan handoff.
                     state_bytes = heads * dk * dv * dtype_bytes(plan.recurrent_state_dtype or "fp32")
                     last = b.communicate(
                         f"pcp_recurrent_state_step{index}", (last,),
@@ -789,8 +824,65 @@ def _declare_recurrent_group(b, tensors, *, views, heads, key_heads, dk, dv, chu
     return output_gate
 
 
+def _kda_pcp_enabled(plan, parallel, runtime):
+    if plan.attention != "kda" or int(parallel.pcp) <= 1:
+        return False
+    axis = str(dict(getattr(runtime, "metadata", ()) or ()).get(
+        "kda_parallel_axis", "")).strip().lower()
+    return axis != "tp"
+
+
+def _apply_kda_pcp_entry(b, *, deps, views, tokens, hidden, parallel, model, runtime):
+    """Gather hidden states for head-sharded KDA PCP.
+
+    GLM5Next (``kda_batch_chunk_norm=True``) gathers/restores hidden states only
+    when prefill tokens are present; Kimi KDA (``ops/kimi_kda.py``) gathers,
+    restores/zero-masks padding, and scatters unconditionally across both prefill
+    and decode when ``pcp > 1``.
+    """
+    from mindie_sim.prediction.operators.context_parallel.graph import pcp_uniform_peer_rows
+    pcp = int(parallel.pcp)
+    has_prefill = any(v.phase == "prefill" for v in views)
+    uses_pcp_row_parallel = bool(b.plan.kda_batch_chunk_norm)
+    if uses_pcp_row_parallel and not has_prefill:
+        return deps, views, tokens, tokens, False
+    global_views = tuple(
+        replace(v, q_len=int(v.global_q_len or v.q_len),
+                query_ranges=((0, int(v.global_q_len or v.q_len)),))
+        if v.phase == "prefill" else v
+        for v in views
+    )
+    if has_prefill:
+        common_peer_rows, global_tokens = pcp_uniform_peer_rows(views, pcp, local_rows=0)
+        common_peer_rows = max(1, common_peer_rows)
+        global_tokens = max(1, global_tokens)
+    else:
+        common_peer_rows = max(1, int(tokens))
+        global_tokens = common_peer_rows * pcp
+    # Kimi KDA (``ops/kda_pcp.py:54,108-109``) retains all ``pcp * common_peer_rows``
+    # rows (with padding zero-masked) through projection and AllReduce, slicing back
+    # only at ``kda_pcp_scatter``; GLM row-parallel KDA compacts to ``global_tokens``.
+    restored_rows = global_tokens if uses_pcp_row_parallel else (common_peer_rows * pcp)
+    kimi_mask_meta = (() if uses_pcp_row_parallel
+                      else (("pcp_zero_mask_padding", True),
+                            ("pcp_restore_mask", True)))
+    restored = emit_pcp_hidden_gather_restore(
+        b.ops, prefix=b.prefix,
+        gather_name="kda_pcp_gather", restore_name="kda_pcp_restore",
+        stage=b.common["stage"], layer=b.plan.index,
+        requests=b.common["requests"], mode=b.common["phase"],
+        dep=deps, local_rows=common_peer_rows, global_rows=restored_rows,
+        hidden=hidden, pcp=pcp, act_dtype=model.activation_dtype,
+        runtime=runtime, source="vllm_ascend.ops.kda_pcp",
+        restore=True, per_peer_rows=common_peer_rows,
+        restore_meta=kimi_mask_meta,
+    )
+    return restored, global_views, restored_rows, common_peer_rows, True
+
+
 def linear(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
-           padded_tokens, policy=None, runtime=None, **_):
+           padded_tokens, policy=None, runtime=None, physical_rank=None,
+           explicit_physical_rank=False, **_):
     from mindie_sim.catalog.paired_sfa import execution
     if execution(model).get("recurrent_context_sharded") is False:
         # Preserve the PCP plan for head-local KDA state.
@@ -811,12 +903,23 @@ def linear(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         return selected.module.lower(
             prefix=prefix, plan=plan, views=views, stage=stage, deps=deps, model=model,
             parallel=parallel, mode=mode, padded_tokens=padded_tokens, policy=policy,
-            runtime=runtime, **selected.options)
+            runtime=runtime,
+            physical_rank=physical_rank if explicit_physical_rank else None,
+            **selected.options)
     b = Builder(prefix, plan, stage, views, model, mode)
     tensors = TensorLowering(b, runtime.tensor_layouts if runtime else None)
-    tp, tokens, hidden = parallel.tp, padded_tokens, model.hidden_size
-    key_heads = math.ceil((plan.linear_key_heads or plan.linear_heads) / tp)
-    heads = math.ceil((plan.linear_value_heads or plan.linear_heads) / tp)
+    tp, local_tokens, hidden = parallel.tp, padded_tokens, model.hidden_size
+    kda_pcp = _kda_pcp_enabled(plan, parallel, runtime)
+    head_shards = tp * int(parallel.pcp) if kda_pcp else tp
+    kda_gathered = False
+    tokens = local_tokens
+    kda_common_peer = local_tokens
+    if kda_pcp:
+        deps, views, tokens, kda_common_peer, kda_gathered = _apply_kda_pcp_entry(
+            b, deps=deps, views=views, tokens=local_tokens, hidden=hidden,
+            parallel=parallel, model=model, runtime=runtime)
+    key_heads = math.ceil((plan.linear_key_heads or plan.linear_heads) / head_shards)
+    heads = math.ceil((plan.linear_value_heads or plan.linear_heads) / head_shards)
     dk, dv = plan.linear_key_head_dim or plan.linear_head_dim, plan.linear_head_dim
     key_width, value_width = key_heads * dk, heads * dv
     use_recover_ssm = recover_ssm_enabled(runtime)
@@ -861,8 +964,6 @@ def linear(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
                           metadata=(("batch_chunk_norm", plan.kda_batch_chunk_norm
                                      and any(v.phase == "prefill" for v in views)),))
     if plan.attention == "gdn":
-        # g and beta are scalars per value head, not per value channel. The
-        # independent z projection gates the output after the recurrent core.
         gated = b.vector(
             "delta_gates", tuple(dict.fromkeys(gate_inputs)), tokens * heads, GDN_GATE_OPS_PER_HEAD, family="gdn_gating",
             shape=(tokens, heads), read_bytes_override=(tokens + 2) * heads * FP32_BYTES,
@@ -917,7 +1018,40 @@ def linear(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
                       if projection_group else ()))
     last = b.matrix("linear_output", (output,), tokens, hidden, value_width,
                     category="kda.o" if plan.attention == "kda" else "gdn.o")
+    act_bytes = dtype_bytes(model.activation_dtype)
+    pure_prefill_rs = (
+        kda_pcp and kda_gathered and bool(plan.kda_batch_chunk_norm)
+        and bool(views) and all(v.phase == "prefill" for v in views)
+    )
+    if kda_pcp:
+        pcp = int(parallel.pcp)
+        if pure_prefill_rs:
+            last = b.communicate(
+                "kda_pcp_reduce_scatter", (last,),
+                float(kda_common_peer * hidden) * act_bytes * float(pcp - 1),
+                "reduce_scatter", "pcp", dtype=model.activation_dtype,
+                shape=(kda_common_peer, hidden),
+                source="vllm_ascend.models.glm5next.kda")
+        else:
+            last = b.communicate(
+                "kda_pcp_allreduce", (last,),
+                2 * (pcp - 1) / pcp * tokens * hidden * act_bytes,
+                "allreduce", "pcp", dtype=model.activation_dtype,
+                shape=(tokens, hidden),
+                source="vllm_ascend.ops.kda_parallel")
+    if kda_gathered and not pure_prefill_rs:
+        scatter_meta = (() if bool(plan.kda_batch_chunk_norm)
+                        else (("pcp_zero_mask_padding", True),
+                              ("pcp_local_mask", True)))
+        last = emit_pcp_restore_unpermute(
+            b.ops, prefix=b.prefix, name="kda_pcp_scatter",
+            stage=b.common["stage"], layer=plan.index,
+            requests=b.common["requests"], mode=b.common["phase"],
+            dep=last, global_rows=local_tokens,
+            row_bytes=float(hidden) * act_bytes, dtype=model.activation_dtype,
+            meta_extra=scatter_meta)
     if tp > 1:
-        last = b.communicate("linear_reduce", (last,), 2 * (tp - 1) / tp * tokens * hidden * 2,
-                             "allreduce")
+        tp_tokens = local_tokens if kda_gathered else tokens
+        last = b.communicate("linear_reduce", (last,), 2 * (tp - 1) / tp * tp_tokens * hidden * act_bytes,
+                             "allreduce", dtype=model.activation_dtype)
     return AttentionResult(ops=b.ops, last=last)

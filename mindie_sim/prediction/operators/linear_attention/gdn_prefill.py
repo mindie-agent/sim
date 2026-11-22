@@ -94,8 +94,12 @@ def _prefill_state_segments(b, *, views, pcp, state_dtype, state_bytes, chunk,
         version = view.context
         remote_initial = None
         if pcp > 1 and first_start > 0:
+            rem_name = (
+                "pcp_remote_initial_state" if view_index == 0
+                else f"pcp_remote_initial_state_{view_index}"
+            )
             remote_initial = b.work(
-                "pcp_remote_initial_state", (gather,), (0,),
+                rem_name, (gather,), (0,),
                 family="state_transfer",
                 metadata=(("status", "pending_external_rank"),
                           ("producer_scope", "external_rank"),
@@ -118,8 +122,6 @@ def _prefill_state_segments(b, *, views, pcp, state_dtype, state_bytes, chunk,
                 from_version = version
                 version += gap
                 to_version = version
-                if pcp > 1:
-                    exchange_bytes = state_bytes * (2 * pcp - 1) / pcp
             if pcp == 1 and gap:
                 # A single-rank caller may still pack non-contiguous requested
                 # ranges; the state advances over the gap without a collective.
@@ -176,7 +178,7 @@ def _prefill_state_segments(b, *, views, pcp, state_dtype, state_bytes, chunk,
 
 
 def core(*, builder, tensors, conv, gated, views, heads, key_heads, dk, dv,
-          chunk, gate_values=None, qkv_values=None, pcp=1,
+          chunk, gate_values=None, qkv_values=None, pcp=1, pcp_rank=None,
           state_slot_indices=None, state_capacity=None, state_slot_source="", **_):
     b = builder
     tokens = sum(view.q_len for view in views)
@@ -270,27 +272,106 @@ def core(*, builder, tensors, conv, gated, views, heads, key_heads, dk, dv,
         state_capacity=state_capacity, slot_source=slot_source,
         remote_publish=remote_flags)
     if pcp > 1:
-        owner_slots = tuple(slot for slot in scatter_contract["active_slots"]
-                            if not remote_flags[slot])
-        remote_slots = tuple(slot for slot in scatter_contract["active_slots"]
-                             if remote_flags[slot])
-        all_owner = bool(owner_slots) and not remote_slots
-        remote_publish = b.work(
-            "pcp_remote_state_publish", tuple(composite.states), (0,),
-            family="state_publish", vector=0, read=0, write=0,
-            metadata=(("status", ("local_owner" if all_owner
-                                  else "pending_external_rank")),
-                      ("producer_scope", ("local_writeback" if all_owner else
-                                          "per_slot" if owner_slots else
-                                          "external_rank")),
-                      ("owner_slots", owner_slots),
-                      ("remote_slots", remote_slots),
-                      ("completion_owner", "T04/final_writeback"),
-                      ("source_implementation", "pcp1_only"),
-                      ("global_versions", scatter_contract["global_versions"]),
-                      ("local_commit_versions",
-                       scatter_contract["local_commit_versions"])))
-        scatter_deps = (remote_publish,)
+        # Move every chunk_fwd_o / output-concat op that depends on composite.states
+        # (or composite.output) AFTER the PCP state/phi AllGathers, (p-1)-step
+        # prefix scan, and rank>0 fwd_h rerun so chunk_fwd_o consumes corrected state.
+        state_set = set(composite.states)
+        deferred_ops = []
+        deferred_ids: set[str] = set()
+        kept_ops = []
+        for op in b.ops:
+            if op.op_id in state_set:
+                kept_ops.append(op)
+            elif (op.op_id == composite.output
+                    or any(d in state_set or d in deferred_ids for d in op.deps)):
+                deferred_ops.append(op)
+                deferred_ids.add(op.op_id)
+            else:
+                kept_ops.append(op)
+        b.ops[:] = kept_ops
+        n_pf = max(1, len(active))
+        scan_seq_lens = tuple(int(v.q_len) for v in active if int(v.q_len) > 0)
+        scan_tok = sum(scan_seq_lens) if scan_seq_lens else max(1, int(tokens))
+        scan_chunk = max(1, int(chunk))
+        scan_chunks = max(
+            1, sum((q_i + scan_chunk - 1) // scan_chunk for q_i in scan_seq_lens),
+        )
+        scan_seq_meta = (("sequence_tokens", scan_seq_lens),) if scan_seq_lens else ()
+        scan_heads = max(1, int(heads))
+        prefix_steps = max(1, int(pcp) - 1) * n_pf
+        phi_bytes = float(n_pf * scan_heads * dk * dk * FP32_BYTES)
+        st_bytes = float(n_pf * scan_heads * dk * dv * FP32_BYTES)
+        hupdate = b.work(
+            "pcp_gdn_hupdate", tuple(composite.states), (n_pf, scan_heads, dk, dk),
+            flops=float(2 * scan_tok * scan_heads * dk * dk),
+            vector=float(scan_chunks * scan_heads * dk * dk),
+            read=phi_bytes + float(scan_tok * scan_heads * dk * 2), write=phi_bytes,
+            family="recurrent_scan", dtype="fp32",
+            metadata=(
+                ("pcp", int(pcp)), ("chunks", scan_chunks), ("chunk", scan_chunk),
+                ("tokens", scan_tok), ("heads", scan_heads),
+                ("source", "ops/triton/fla/chunk.py:fwd_hupdate"),
+            ) + scan_seq_meta,
+        )
+        ag_state = b.communicate(
+            "pcp_gdn_state_gather", tuple(composite.states),
+            st_bytes * (pcp - 1), "allgather", "pcp", dtype="fp32",
+        )
+        ag_phi = b.communicate(
+            "pcp_gdn_hupdate_gather", (hupdate,),
+            phi_bytes * (pcp - 1), "allgather", "pcp", dtype="fp32",
+        )
+        prefix_scan = b.work(
+            "pcp_gdn_prefix_scan", (ag_state, ag_phi), (pcp - 1, n_pf, scan_heads, dk, dv),
+            flops=float(2 * prefix_steps * scan_heads * dk * dk * dv),
+            vector=float(prefix_steps * scan_heads * dk * dv),
+            read=(st_bytes + phi_bytes) * pcp, write=st_bytes,
+            family="recurrent_scan", dtype="fp32",
+            metadata=(
+                ("pcp", int(pcp)), ("chunks", prefix_steps), ("chunk", 1),
+                ("tokens", prefix_steps), ("heads", scan_heads),
+                ("source", "ops/triton/fla/chunk.py:prefix_scan"),
+            ),
+        )
+        needs_rerun = pcp_rank is None or int(pcp_rank) > 0
+        if needs_rerun:
+            final_state_op = b.work(
+                "pcp_gdn_fwd_h_rerun", (prefix_scan,), (scan_tok, scan_heads, dk, dv),
+                flops=float(2 * 2 * scan_tok * scan_heads * dk * dv),
+                vector=float(scan_chunks * 2 * scan_heads * dk * dv),
+                read=st_bytes, write=st_bytes, family="recurrent_scan", dtype="fp32",
+                metadata=(
+                    ("pcp", int(pcp)), ("chunks", scan_chunks), ("chunk", scan_chunk),
+                    ("tokens", scan_tok), ("heads", scan_heads),
+                    ("pcp_rank_gt_zero_rerun", True),
+                ) + scan_seq_meta,
+            )
+            for def_op in deferred_ops:
+                if any(d in state_set for d in def_op.deps):
+                    new_deps = tuple(dict.fromkeys(
+                        [*(d for d in def_op.deps if d not in state_set), final_state_op]
+                    ))
+                    meta_d = dict(def_op.metadata)
+                    sv_in = meta_d.get("state_value_inputs")
+                    if sv_in:
+                        meta_d["state_value_inputs"] = tuple(
+                            ({**p, "producer": final_state_op, "ready": final_state_op,
+                              "owner": final_state_op}
+                             if isinstance(p, dict) and p.get("producer") in state_set else p)
+                            for p in sv_in
+                        )
+                    if meta_d.get("state_ready") in state_set:
+                        meta_d["state_ready"] = final_state_op
+                    b.ops.append(replace(def_op, deps=new_deps,
+                                         metadata=tuple(meta_d.items())))
+                else:
+                    b.ops.append(def_op)
+        else:
+            b.ops.extend(deferred_ops)
+        # Upstream ``ops/triton/fla/chunk.py:198,210,240``: prefix_scan yields the
+        # global final state for persistent cache scatter on ALL PCP ranks; the
+        # rank>0 rerun discards its final-state return and feeds local gdn_output*.
+        scatter_deps = (prefix_scan,)
     else:
         scatter_deps = tuple(composite.states)
     scatter = b.work("scatter_recurrent_state", scatter_deps,
@@ -300,7 +381,7 @@ def core(*, builder, tensors, conv, gated, views, heads, key_heads, dk, dv,
            family="state_scatter", dtype=state_dtype,
            metadata=(("state_layout", "V,K"), ("padding_slots", padding_slots),
                      ("active_state_rows", len(active)), ("effect_role", "scatter_publish"),
-                     ("state_value_input", tuple(composite.states)),
+                     ("state_value_input", scatter_deps),
                      ("state_value_output", "persistent_cache"),
                      ("state_publish_versions", scatter_contract["publish_versions"]),
                      ("state_publish_point", scatter_contract["publish_point"]),
@@ -313,7 +394,7 @@ def core(*, builder, tensors, conv, gated, views, heads, key_heads, dk, dv,
             TensorLayout.contiguous((len(views), heads, dv, dk)),
             state_version=(scatter_contract.get("local_commit_versions") or (None,))[0]),
             ready=str(state), role="state_input", owner=str(state))
-        for state in composite.states)
+        for state in scatter_deps)
     scatter_contract, scatter_outputs = gdn_recurrent.bind_state_ports(
         scatter_contract, scatter, heads=heads, head_shards=1)
     b.ops[-1] = replace(b.ops[-1], metadata=tuple(sorted({
@@ -484,8 +565,66 @@ def _lower_prefill_convolution(b, tensors, *, parallel, ordered, prefill, decode
     return conv
 
 
+def _lower_idle_pcp_peer(
+    b, tensors, *, projection, zero, prefill, model, plan, parallel,
+    tokens, tp, heads, dk, dv, width, value_width,
+):
+    """Idle PCP peer owns 0 local tokens of a live prefill: join PCP collectives."""
+    pcp = int(parallel.pcp)
+    n_pf = max(1, len(prefill))
+    phi_bytes = float(n_pf * heads * dk * dk * FP32_BYTES)
+    st_bytes = float(n_pf * heads * dk * dv * FP32_BYTES)
+    ag_state = b.communicate(
+        "pcp_gdn_state_gather", (zero,),
+        st_bytes * (pcp - 1), "allgather", "pcp", dtype="fp32",
+    )
+    ag_phi = b.communicate(
+        "pcp_gdn_hupdate_gather", (zero,),
+        phi_bytes * (pcp - 1), "allgather", "pcp", dtype="fp32",
+    )
+    prefix_steps = max(1, pcp - 1) * n_pf
+    prefix_scan = b.work(
+        "pcp_gdn_prefix_scan", (ag_state, ag_phi), (pcp - 1, n_pf, heads, dk, dv),
+        flops=float(2 * prefix_steps * heads * dk * dk * dv),
+        vector=float(prefix_steps * heads * dk * dv),
+        read=(st_bytes + phi_bytes) * pcp, write=st_bytes,
+        family="recurrent_scan", dtype="fp32",
+        metadata=(
+            ("pcp", pcp), ("chunks", prefix_steps), ("chunk", 1),
+            ("tokens", prefix_steps), ("heads", heads),
+            ("source", "ops/triton/fla/chunk.py:prefix_scan"),
+        ),
+    )
+    b.work(
+        "scatter_recurrent_state", (prefix_scan,), (len(prefill), heads, dv, dk),
+        read=st_bytes, write=st_bytes, family="state_scatter",
+        dtype=plan.recurrent_state_dtype,
+        metadata=(("state_layout", "V,K"), ("effect_role", "scatter_publish"),
+                  ("state_value_input", (prefix_scan,)),
+                  ("state_value_output", "persistent_cache")),
+    )
+    gate = tensors.reshape(projection.narrow(1, width, value_width), (tokens * heads, dv),
+                           name="output_gate_reshape")
+    gate = tensors.require(gate, "linear_output_norm_gate", "gate", name="output_gate_contiguous")
+    normalized = b.vector(
+        "linear_output_norm_gate", (zero, gate.producer, prefix_scan),
+        tokens * value_width, OUTPUT_NORM_GATE_OPS_PER_ELEMENT,
+        shape=(tokens * heads, dv), read_bytes_override=(2 * tokens * value_width + dv) * 2,
+        write_bytes_override=tokens * value_width * 2,
+        metadata=(("norm_kind", "rmsnorm"), ("norm_has_weight", True),
+                  ("norm_has_bias", False), ("norm_group_width", dv),
+                  ("gate_present", True), ("recurrent_attention_kind", plan.attention),
+                  ("fused_from", ("rmsnorm", "gate"))))
+    last = b.matrix("linear_output", (normalized,), tokens, model.hidden_size, value_width,
+                    category="gdn.o")
+    if tp > 1:
+        last = b.communicate("linear_reduce", (last,), 2 * (tp - 1) / tp * tokens * model.hidden_size * 2,
+                             "allreduce")
+    return AttentionResult(ops=b.ops, last=last)
+
+
 def lower(*, prefix, plan, views, stage, deps, model, parallel, mode,
-          padded_tokens, policy, runtime):
+          padded_tokens, policy, runtime, physical_rank=None):
     if plan.recurrent_state_dtype != "fp32":
         raise ValueError("gdn_prefill_arch35_state_precision_branch_not_implemented:"
                          + plan.recurrent_state_dtype)
@@ -520,6 +659,12 @@ def lower(*, prefix, plan, views, stage, deps, model, parallel, mode,
     zero = b.work("core_output_zero", (deps,), (tokens, heads, dv),
                   vector=tokens * value_width, write=tokens * value_width * 2,
                   family="tensor_fill", dtype=model.activation_dtype)
+    if actual == 0 and int(parallel.pcp) > 1:
+        return _lower_idle_pcp_peer(
+            b, tensors, projection=projection, zero=zero, prefill=prefill,
+            model=model, plan=plan, parallel=parallel, tokens=tokens, tp=tp,
+            heads=heads, dk=dk, dv=dv, width=width, value_width=value_width,
+        )
     conv_input = tensors.contiguous(projection.narrow(0, 0, actual).narrow(1, 0, width),
                                     "convolution_input_contiguous",
                                     reason="causal_conv1d_fn.contiguous")
@@ -594,13 +739,17 @@ def lower(*, prefix, plan, views, stage, deps, model, parallel, mode,
     prefill_slots = (None if cache_indices is None else
                      tuple(cache_indices[len(decode) + index]
                            for index in range(len(prefill))))
+    pcp_rank = (
+        (int(physical_rank) % max(1, int(parallel.tp) * int(parallel.pcp))) // max(1, int(parallel.tp))
+        if physical_rank is not None and int(parallel.pcp) > 1 else None
+    )
     output = core(builder=b, tensors=tensors, conv=conv, gated=gated, views=prefill,
                   heads=heads, key_heads=keys, dk=dk, dv=dv, chunk=chunk,
                   state_slot_indices=prefill_slots, state_capacity=state_rows,
                   state_slot_source=index_source,
                   qkv_values=tuple(v.narrow(1, decode_tokens, prefill_tokens) for v in qkv),
                   gate_values=tuple(v.narrow(1, decode_tokens, prefill_tokens) for v in gate_values),
-                  pcp=parallel.pcp)
+                  pcp=parallel.pcp, pcp_rank=pcp_rank)
     outputs.append(tensors.result(output, (prefill_tokens, heads, dv)))
     if decode:
         flat = [tensors.reshape(value, (value.layout.elements,), name="mixed_output_view")

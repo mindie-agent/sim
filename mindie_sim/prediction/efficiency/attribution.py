@@ -96,7 +96,9 @@ def _fast_operator_and_graph_reports(case: CaseSpec, *, phase: str, tokens: int,
         ctx = evaluation_context or EvaluationContext.create(eff_case)
     r0_ops = graphs[0]
     parallel = eff_case.runtime.parallel
-    needs_cohort = bool(parallel.ep_spans_dp or local_tp_spans_dp(parallel))
+    needs_cohort = bool(
+        parallel.ep_spans_dp or local_tp_spans_dp(parallel) or parallel.cp_spans_dp
+    )
     has_kg = any("device_kernel_group" in dict(op.metadata) for op in r0_ops)
     if needs_cohort and not rank_zero_graph_reuse(parallel, len(graphs), has_kg):
         selection = graphs if isinstance(graphs, Mapping) else {0: graphs}

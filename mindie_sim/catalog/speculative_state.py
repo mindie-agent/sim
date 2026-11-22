@@ -81,11 +81,14 @@ KDA_PARALLEL_AXIS = "tp_x_pcp"
 
 def _kda_shards(layer: Any, parallel: Any, runtime: Any) -> int:
     """The KDA TP x PCP history shard count, or one every other family uses."""
-    if str(getattr(layer, "attention", "")) != "kda" or runtime is None:
+    if str(getattr(layer, "attention", "")) != "kda":
         return 1
-    metadata = dict(getattr(runtime, "metadata", ()) or ())
-    axis = str(metadata.get("kda_parallel_axis", ""))
-    return max(1, int(parallel.pcp)) if axis == KDA_PARALLEL_AXIS else 1
+    pcp = max(1, int(getattr(parallel, "pcp", 1) or 1))
+    if pcp <= 1:
+        return 1
+    metadata = dict(getattr(runtime, "metadata", ()) or ()) if runtime is not None else {}
+    axis = str(metadata.get("kda_parallel_axis", "")).strip().lower()
+    return 1 if axis == "tp" else pcp
 
 
 def _local_heads(layer: Any, parallel: Any, shards: int = 1) -> int:

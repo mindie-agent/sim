@@ -61,16 +61,17 @@ def cohorts(parallel, machine=None):
             from .rank_ledger import replica_cohorts
             return replica_cohorts(machine, parallel, list(local_tp_replica_cohorts(machine, parallel)))
     width = ONE if parallel.rank_table is not None else parallel.ep_dp_width
-    if int(parallel.tp) == ONE:
-        for candidate in (
-            int(parallel.o_proj_tp),
-            int(parallel.linear_proj_tp),
-            int(parallel.lm_head_tp),
-        ):
-            if candidate > ONE:
-                combined = math.lcm(width, candidate)
-                if int(parallel.dp) % combined == ZERO:
-                    width = combined
+    if bool(getattr(parallel, "cp_spans_dp", False)):
+        combined = math.lcm(width, int(parallel.dcp_dp_width))
+        if int(parallel.dp) % combined == ZERO:
+            width = combined
+    tp = max(ONE, int(parallel.tp))
+    for candidate in parallel.local_tp_widths:
+        if candidate > tp and candidate % tp == ZERO:
+            factor = candidate // tp
+            combined = math.lcm(width, factor)
+            if int(parallel.dp) % combined == ZERO:
+                width = combined
     from .rank_ledger import replica_cohorts
     groups = [tuple(range(first, first + width)) for first in range(ZERO, parallel.dp, width)]
     return replica_cohorts(machine, parallel, groups)

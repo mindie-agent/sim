@@ -337,6 +337,14 @@ def resolve_stack_track(
                 active[mid] = {**prev, "options": {**prev["options"], **opts}}
 
     for mid in include_ids:
+        mech = MECHANISM_CATALOG[mid]
+        opt_ctx = MechanismContext(
+            model=ctx.model, sku=ctx.sku, arch=ctx.arch, parallel=ctx.parallel,
+            caller_explicit=ctx.caller_explicit,
+            options={**dict(ctx.options or {}), "explicit_opt_in": True},
+        )
+        if not mech.eligible(opt_ctx):
+            continue
         group = pr_by_id.get(mid) or merged_by_id.get(mid)
         if group:
             collapsed = _collapse_binding_group(mid, group[0].state, group)
@@ -379,13 +387,16 @@ def apply_resolved_mechanisms(
         entry = active.get(mid)
         if entry is None:
             continue
+        opts = {**dict(base_ctx.options or {}), **dict(entry.get("options") or {})}
+        if entry.get("notes") == "caller_enabled":
+            opts["explicit_opt_in"] = True
         ctx = MechanismContext(
             model=base_ctx.model,
             sku=base_ctx.sku,
             arch=base_ctx.arch,
             parallel=base_ctx.parallel,
             caller_explicit=base_ctx.caller_explicit,
-            options={**dict(base_ctx.options or {}), **dict(entry.get("options") or {})},
+            options=opts,
         )
         if mech.eligible(ctx):
             mech.apply(runtime_dict, ctx)
@@ -395,7 +406,6 @@ def apply_resolved_mechanisms(
 
 def _vllm_ascend_profile() -> RuntimeStackProfile:
     profile = load_runtime_stack_manifest(VLLM_ASCEND_MANIFEST_PATH)
-    documented_models = tuple(sorted(VA_RECOMMENDED_PROFILES))
     model_defaults = {
         key: {
             "quant": dict(value.get("quant") or {}),
@@ -407,18 +417,11 @@ def _vllm_ascend_profile() -> RuntimeStackProfile:
         }
         for key, value in VA_RECOMMENDED_PROFILES.items()
     }
-    scoped_defaults = {"aclgraph_decode_capture", "sequence_parallel"}
-    bindings = tuple(
-        replace(binding, models=documented_models)
-        if not binding.models and binding.state == "merged" and binding.mechanism_id in scoped_defaults
-        else binding
-        for binding in profile.bindings
-    )
     return replace(
         profile,
         description="vLLM-Ascend main baseline and audited open performance PRs",
         model_defaults=model_defaults,
-        bindings=bindings,
+        bindings=profile.bindings,
     )
 
 

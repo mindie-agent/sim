@@ -62,16 +62,67 @@ TARGET_ALIAS_CATEGORIES = frozenset({
 })
 
 
-def _resident_parallel(term: WeightTerm, parallel: ParallelSpec,
-                       shared_expert_dp: bool) -> ParallelSpec:
+def _resident_parallel(
+    term: WeightTerm, parallel: ParallelSpec, shared_expert_dp: bool,
+    *, pcp_o_proj_weight_sharding: bool = False,
+    dcp_q_replicate: bool = False,
+) -> ParallelSpec:
     """Placement used for one resident term.
 
     Shared-expert DP executes those matrices with ``tp=1``. Each rank keeps
-    the full shared-expert copy instead of a TP shard.
+    the full shared-expert copy instead of a TP shard.  When
+    ``enable_pcp_o_proj_weight_sharding`` is enabled with ``pcp > 1``, attention
+    output weights (``o_proj`` / ``wo_a`` / ``wo_b``) are sharded across PCP.
+    When ``dcp_q_replicate`` is active, dense MLA Q projection weights
+    (``mla.q_b`` / ``mla.q_proj``) replicate across ``dcp_tp_gather``.
     """
+    placed = parallel
     if shared_expert_dp and term.category == "shared_expert":
-        return replace(parallel, tp=1)
-    return parallel
+        placed = replace(placed, tp=1)
+    if (dcp_q_replicate and term.category in {"mla.q_b", "mla.q_proj"}
+            and int(placed.dcp_tp_gather) > 1
+            and int(placed.dcp_pcp_factor) == 1
+            and int(placed.dcp_dp_width) == 1):
+        eff_tp = max(1, int(placed.tp) // int(placed.dcp_tp_gather))
+        placed = replace(placed, tp=eff_tp, q_proj_tp=1, dcp_linear_tp=1)
+    if (pcp_o_proj_weight_sharding and int(placed.pcp) > 1
+            and term.placement_role == "attention_output"):
+        base_width = max(int(placed.tp), int(placed.effective_o_proj_tp))
+        placed = replace(placed, dcp_linear_tp=1,
+                         o_proj_tp=base_width * int(placed.pcp))
+    return placed
+
+
+def _expand_resident_terms(
+    term: WeightTerm, parallel: ParallelSpec, shared_expert_dp: bool,
+    *, pcp_o_proj_weight_sharding: bool = False,
+    dcp_q_replicate: bool = False,
+    model: ModelSpec | None = None,
+) -> tuple[tuple[WeightTerm, ParallelSpec], ...]:
+    """Return placed ``(term, parallel)`` pairs, splitting ``W_UK_T`` when replicated under DCP."""
+    placed = _resident_parallel(
+        term, parallel, shared_expert_dp,
+        pcp_o_proj_weight_sharding=pcp_o_proj_weight_sharding,
+        dcp_q_replicate=dcp_q_replicate,
+    )
+    if (dcp_q_replicate and term.name == "kv_b" and term.category == "mla_absorb"
+            and int(parallel.dcp_tp_gather) > 1
+            and int(parallel.dcp_pcp_factor) == 1
+            and int(parallel.dcp_dp_width) == 1):
+        uk_rows = term.rows // 2
+        if model is not None:
+            mla_plan = next((lp for lp in model.layer_plans if lp.attention == "mla"), None)
+            if mla_plan is not None and (mla_plan.qk_nope_head_dim + mla_plan.v_head_dim) > 0:
+                uk_rows = int(mla_plan.num_heads) * int(mla_plan.qk_nope_head_dim)
+        uv_rows = max(0, term.rows - uk_rows)
+        if uk_rows > 0 and uv_rows > 0:
+            eff_tp = max(1, int(placed.tp) // int(parallel.dcp_tp_gather))
+            placed_uk = replace(placed, tp=eff_tp, q_proj_tp=1, dcp_linear_tp=1)
+            return (
+                (replace(term, name="w_uk_t", rows=uk_rows), placed_uk),
+                (replace(term, name="w_uv", rows=uv_rows), placed),
+            )
+    return ((term, placed),)
 
 
 def _special_layer_keys(model: ModelSpec) -> set[str]:
@@ -118,6 +169,8 @@ def stage_weight_decomposition(
     include_engram_tables: bool | None = None,
     layer_partition: Sequence[int] | None = None,
     enable_shared_expert_dp: bool = False,
+    enable_pcp_o_proj_weight_sharding: bool = False,
+    dcp_q_replicate: bool = False,
 ) -> list[dict[str, float]]:
     """Per-PP-stage weight bytes split into payload and quant metadata."""
     quant = model.quant or QuantSpec("bf16")
@@ -133,9 +186,15 @@ def stage_weight_decomposition(
             ck = _cache_key(term)
             pair = pair_memo.get(ck) if ck is not None else None
             if pair is None:
-                placed = _resident_parallel(term, parallel, enable_shared_expert_dp)
-                pair = (term_bytes(term, quant, placed, node_ranks),
-                        term_payload_bytes(term, quant, placed, node_ranks))
+                expanded = _expand_resident_terms(
+                    term, parallel, enable_shared_expert_dp,
+                    pcp_o_proj_weight_sharding=enable_pcp_o_proj_weight_sharding,
+                    dcp_q_replicate=dcp_q_replicate, model=model,
+                )
+                pair = (
+                    sum(term_bytes(t_sub, quant, p_sub, node_ranks) for t_sub, p_sub in expanded),
+                    sum(term_payload_bytes(t_sub, quant, p_sub, node_ranks) for t_sub, p_sub in expanded),
+                )
                 if ck is not None:
                     pair_memo[ck] = pair
             total += pair[0]
@@ -378,6 +437,8 @@ def stage_weight_bytes(
     include_engram_tables: bool | None = None,
     source: bool = False, layer_partition: Sequence[int] | None = None,
     draft_kind: str | None = None, enable_shared_expert_dp: bool = False,
+    enable_pcp_o_proj_weight_sharding: bool = False,
+    dcp_q_replicate: bool = False,
     slot_plans: Mapping[int, Any] | None = None, ep_rank: int | None = None,
 ) -> list[float]:
     quant = model.quant or QuantSpec("bf16")
@@ -393,8 +454,13 @@ def stage_weight_bytes(
             ck = _cache_key(term)
             val = byte_memo.get(ck) if ck is not None else None
             if val is None:
-                val = term_bytes(term, quant, _resident_parallel(term, parallel, enable_shared_expert_dp),
-                                 node_ranks, source=source)
+                expanded = _expand_resident_terms(
+                    term, parallel, enable_shared_expert_dp,
+                    pcp_o_proj_weight_sharding=enable_pcp_o_proj_weight_sharding,
+                    dcp_q_replicate=dcp_q_replicate, model=model,
+                )
+                val = sum(term_bytes(t_sub, quant, p_sub, node_ranks, source=source)
+                          for t_sub, p_sub in expanded)
                 if ck is not None:
                     byte_memo[ck] = val
             stage_total += val
@@ -406,12 +472,16 @@ def sharded_weight_bytes(
     model: ModelSpec, parallel: ParallelSpec, node_ranks: int = 1, *,
     include_draft: bool = False, include_engram: bool = True,
     include_engram_tables: bool = True, enable_shared_expert_dp: bool = False,
+    enable_pcp_o_proj_weight_sharding: bool = False,
+    dcp_q_replicate: bool = False,
 ) -> float:
     return float(max(stage_weight_bytes(
         model, parallel, node_ranks, include_draft=include_draft,
         include_engram=include_engram,
         include_engram_tables=include_engram_tables,
         enable_shared_expert_dp=enable_shared_expert_dp,
+        enable_pcp_o_proj_weight_sharding=enable_pcp_o_proj_weight_sharding,
+        dcp_q_replicate=dcp_q_replicate,
     )))
 
 

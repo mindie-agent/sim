@@ -28,6 +28,7 @@ FUSED_MC2_ROUTED_MODE = 2
 FUSED_MC2_SHARED_MODE = 3
 QSA_MROPE_DECODE_MAX_ROWS = 64
 TEXT_GATED_RESIDUAL_MIN_ROWS = 513
+QUANTIZED_ALLREDUCE_MAX_WORLD = 8
 
 MXFP_EXPERT_WEIGHT_FORMATS = frozenset({"mxfp4", "mxfp8", "fp4_e2m1"})
 
@@ -167,7 +168,7 @@ def _ep_within_ub_domain(ctx: MechanismContext) -> bool:
 
 
 def _apply_cann_megamoe(rt: dict[str, Any], ctx: MechanismContext) -> None:
-    if "moe_comm_mode" in ctx.caller_explicit:
+    if "moe_comm_mode" in ctx.caller_explicit or "enable_fused_mc2" in ctx.caller_explicit:
         return
     if not _ep_within_ub_domain(ctx):
         return
@@ -232,6 +233,132 @@ def _apply_in_kernel_gdn_decode_gate(rt: dict[str, Any], _ctx: MechanismContext)
 def _apply_kimi_dspark_c8(rt: dict[str, Any], ctx: MechanismContext) -> None:
     _apply_shared_expert_overlap(rt, ctx)
     _update_meta(rt, kimi_dspark_c8_mla=True)
+
+
+def _has_any_local_tp(parallel: Any) -> bool:
+    return any(
+        int(parallel.get(axis, 1) or 1) > 1
+        for axis in (
+            "q_proj_tp", "o_proj_tp", "linear_proj_tp", "dcp_linear_tp",
+            "mlp_tp", "shared_expert_tp", "lm_head_tp",
+        )
+    )
+
+
+def _parallel_cp_mechanisms() -> tuple[OptimizationMechanism, ...]:
+    """Generalized Parallelism, Context-Parallel (DCP/PCP), and Local-TP mechanisms."""
+    from mindie_sim.feature_mechanisms import OptimizationMechanism
+
+    return (
+        OptimizationMechanism(
+            id="universal_dcp_query_gather", category="context_parallel",
+            phases=("decode",),
+            summary="Universal Q AllGather across DCP/TP/DP cohort conserving 100% attention FLOPs",
+            eligible=lambda ctx: (
+                int(ctx.parallel.get("cp", ctx.parallel.get("dcp", 1)) or 1) > 1
+                and any(p.attention in {"mla", "gqa"} for p in ctx.model.layer_plans)
+            ),
+            apply=lambda rt, _ctx: _update_meta(rt, universal_dcp_query_gather=True),
+        ),
+        OptimizationMechanism(
+            id="sfa_dcp_sharded_indexer", category="context_parallel",
+            phases=("decode",),
+            summary="Optional DCP-sharded LightningIndexer KV cache reducing indexer HBM by 1/dcp",
+            eligible=lambda ctx: (
+                int(ctx.parallel.get("cp", ctx.parallel.get("dcp", 1)) or 1) > 1
+                and any(p.attention == "mla" and p.indexer for p in ctx.model.layer_plans)
+            ),
+            apply=lambda rt, _ctx: _update_meta(rt, enable_sfa_dcp_sharded_indexer=True),
+        ),
+        OptimizationMechanism(
+            id="local_projection_tp", category="parallelism",
+            phases=("prefill", "decode"),
+            summary="Composable per-sublayer Local-TP across Q/O/linear/MLP/shared-expert/lm_head",
+            eligible=lambda ctx: _has_any_local_tp(ctx.parallel),
+            apply=lambda rt, _ctx: _update_meta(rt, local_projection_tp_active=True),
+        ),
+        OptimizationMechanism(
+            id="pcp_o_proj_weight_sharding", category="context_parallel",
+            phases=("prefill", "decode"),
+            summary="Shard o_proj weights across PCP ranks with async weight AllGather on cp_weight_stream",
+            eligible=lambda ctx: (
+                int(ctx.parallel.get("pcp", 1) or 1) > 1
+                and any(p.attention in {"mla", "gqa"} for p in ctx.model.layer_plans)
+            ),
+            apply=lambda rt, ctx: _update_meta(
+                rt,
+                pcp_o_proj_weight_sharding_supported=True,
+                **({"enable_pcp_o_proj_weight_sharding": True}
+                   if ctx.options.get("enable_pcp_o_proj_weight_sharding") else {}),
+            ),
+        ),
+        OptimizationMechanism(
+            id="pcp_decode_request_sharding", category="context_parallel",
+            phases=("decode",),
+            summary="Shard independent decode requests across PCP lanes when DCP=1",
+            eligible=lambda ctx: (
+                int(ctx.parallel.get("pcp", 1) or 1) > 1
+                and int(ctx.parallel.get("cp", ctx.parallel.get("dcp", 1)) or 1) == 1
+            ),
+            apply=lambda rt, _ctx: _update_meta(rt, pcp_decode_request_sharding=True),
+        ),
+        OptimizationMechanism(
+            id="kda_pcp_head_sharding", category="context_parallel",
+            phases=("prefill", "decode"),
+            summary="Shard KDA recurrent heads across TP*PCP with prefill sequence-to-head AllGather/Scatter",
+            eligible=lambda ctx: (
+                int(ctx.parallel.get("pcp", 1) or 1) > 1
+                and any(p.attention == "kda" for p in ctx.model.layer_plans)
+            ),
+            apply=lambda rt, _ctx: _update_meta(rt, kda_pcp_head_sharding=True),
+        ),
+        OptimizationMechanism(
+            id="pcp_w8a8_quantized_allgather", category="context_parallel",
+            phases=("prefill", "decode"),
+            summary="INT8/FP8 quantized PCP activation AllGather halving inter-rank wire volume",
+            eligible=lambda ctx: (
+                int(ctx.parallel.get("pcp", 1) or 1) > 1
+                and _has_quant_activations(ctx.model)
+            ),
+            apply=lambda rt, _ctx: _update_meta(rt, pcp_w8a8_quantized_allgather=True),
+        ),
+        OptimizationMechanism(
+            id="quantized_allreduce", category="parallelism",
+            phases=("prefill", "decode"),
+            summary="Opt-in INT8 quantized TP AllReduce on A2 (BF16, 2<=TP<=8, >=16M elems)",
+            eligible=lambda ctx: (
+                ctx.arch == "a2"
+                and 1 < int(ctx.parallel.get("tp", 1) or 1) <= QUANTIZED_ALLREDUCE_MAX_WORLD
+                and str(ctx.model.activation_dtype).strip().lower() in {"bf16", "bfloat16"}
+                and not (
+                    isinstance(ctx.options.get("quantized_all_reduce_config"), dict)
+                    and "enable" in ctx.options["quantized_all_reduce_config"]
+                    and str(ctx.options["quantized_all_reduce_config"]["enable"]).strip().lower()
+                    in {"false", "0", "no", "off", ""}
+                )
+                and bool(
+                    ctx.options.get("explicit_opt_in")
+                    or ctx.options.get("quantized_allreduce")
+                    or (isinstance(ctx.options.get("quantized_all_reduce_config"), dict)
+                        and bool(ctx.options["quantized_all_reduce_config"].get("enable", False)))
+                )
+            ),
+            apply=lambda rt, _ctx: _update_meta(rt, quantized_allreduce=True),
+        ),
+        OptimizationMechanism(
+            id="dsv41_pcp_c2_ring_gather", category="context_parallel",
+            phases=("prefill",),
+            summary="V4.1 PCP C2 ring-tail compressor boundary gather and restore unpermute",
+            eligible=lambda ctx: (
+                int(ctx.parallel.get("pcp", 1) or 1) > 1
+                and any(
+                    p.cache_kind == "window_compressed" and p.compressor_kind == "gated_ring"
+                    for p in ctx.model.layer_plans
+                )
+            ),
+            apply=lambda rt, _ctx: _update_meta(rt, dsv41_pcp_c2_ring_gather=True),
+        ),
+    )
 
 
 def source_mechanisms() -> tuple[OptimizationMechanism, ...]:
@@ -381,4 +508,5 @@ def source_mechanisms() -> tuple[OptimizationMechanism, ...]:
             ),
             apply=lambda rt, _ctx: _update_meta(rt, keypool_int8_supported=True),
         ),
+        *_parallel_cp_mechanisms(),
     )

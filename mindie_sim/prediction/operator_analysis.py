@@ -169,7 +169,8 @@ def target_operators(case, *, phase, tokens, context=0, sequences=1, scope="body
     from .local_tp_groups import local_tp_spans_dp
     if (len(group) > 1
             and (case.runtime.kernels.get("sequence_parallel")
-                 or local_tp_spans_dp(case.runtime.parallel))):
+                 or local_tp_spans_dp(case.runtime.parallel)
+                 or case.runtime.parallel.cp_spans_dp)):
         # A single rank cannot resolve cross-DP SP without the complete
         # cohort's query totals. Delegate only the cohort graph binding.
         graphs = target_graphs(
@@ -189,10 +190,12 @@ def target_operators(case, *, phase, tokens, context=0, sequences=1, scope="body
                                 selection=selection, scope=scope)
                 if scope == "body" else result)
     replica = selected
-    physical = physical_rank if physical_rank is not None else _physical_rank_for(case, replica)
+    explicit_rank = physical_rank is not None
+    physical = physical_rank if explicit_rank else _physical_rank_for(case, replica)
     result = tuple(op for op in _target_ops(
         case, views, scope, resource_fusion=resource_fusion,
         routing_views=routing_views, physical_rank=physical,
+        explicit_physical_rank=explicit_rank,
         query_position=query_position, replica=replica, layer_limit=layer_limit)
                    if op.family != "barrier")
     return (TargetOperators(result, kernels=case.runtime.kernels,
@@ -235,7 +238,8 @@ def _target_ops(case, views, scope, *, global_views=None, resource_fusion=True,
                 cohort_tokens=None, phase=None, replica=0, active_rows=None,
                 source_rows_by_replica=None, routing_global_tokens=None,
                 routing_views=None, cohort_views_by_replica=None,
-                physical_rank=None, query_position=None,
+                physical_rank=None, explicit_physical_rank: bool = False,
+                query_position=None,
                 model_programs=None, layer_limit=None):
     from mindie_sim.schema.workload import IterationPlan
     from mindie_sim.prediction.operators.attention.attention import AttentionPolicy
@@ -261,6 +265,7 @@ def _target_ops(case, views, scope, *, global_views=None, resource_fusion=True,
             routing_views=routing_views,
             cohort_views_by_replica=cohort_views_by_replica,
             physical_rank=physical_rank,
+            explicit_physical_rank=explicit_physical_rank,
             query_position=query_position)
         if model_programs is not None:
             model_programs[replica] = program
@@ -305,6 +310,7 @@ def _target_ops(case, views, scope, *, global_views=None, resource_fusion=True,
                           routing_views=routing_views,
                           cohort_views_by_replica=cohort_views_by_replica,
                           physical_rank=physical_rank,
+                          explicit_physical_rank=explicit_physical_rank,
                           query_position=query_position,
                           machine=case.machine, layer_limit=layer_limit)
     # Source lowerings consume the same active/storage distinction as the
@@ -558,6 +564,7 @@ def _can_reuse_replica_graph(
         for item in (case.runtime.routing.get("realizations") or ()))
     return (
         case.runtime.parallel.rank_table is None
+        and not case.runtime.parallel.cp_spans_dp
         and len(set(counts.values())) <= UNIFORM_COUNT_CARDINALITY
         and (scope != "model" or (
             case.machine.homogeneous
@@ -565,6 +572,7 @@ def _can_reuse_replica_graph(
             and not case.runtime.routing
             and not case.runtime.kernels.get("force_eplb_source")
             and not local_tp_spans_dp(case.runtime.parallel)
+            and not case.runtime.parallel.cp_spans_dp
             and routing_views is None
             and query_position is None
             and all(
@@ -646,8 +654,11 @@ def target_graphs(case, *, phase, tokens, context=0, sequences=1, scope="model",
     padded_cohort, source_rows_by_replica, routing_global_tokens = _cohort_routing_geometry(
         case, participants, logical_views, global_views, active_rows_by_replica,
         allgather_padded_cohort)
-    uniform_replicas = _can_reuse_replica_graph(
-        case, scope, counts, participants, views, routing_views, query_position)
+    uniform_replicas = (
+        physical_rank is None
+        and _can_reuse_replica_graph(
+            case, scope, counts, participants, views, routing_views, query_position)
+    )
     model_programs = {}
     program_bindings = {}
     program_owners = {}
@@ -700,6 +711,7 @@ def target_graphs(case, *, phase, tokens, context=0, sequences=1, scope="model",
                             physical_rank=(physical_rank if r == (participants[0] if selected_replica is None else selected_replica) and
                                            physical_rank is not None else
                                            _physical_rank_for(case, r, cohort_topology)),
+                            explicit_physical_rank=(physical_rank is not None and r == (participants[0] if selected_replica is None else selected_replica)),
                            query_position=query_position,
                            model_programs=model_programs,
                            layer_limit=layer_limit)

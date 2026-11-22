@@ -175,8 +175,26 @@ class Memory(
         self.kvc_hbm_ratio = max(
             0.0, 1.0 - self.offload["kvc_ddr_ratio"] - self.offload["kvc_ssd_ratio"]
         )
-        shared_expert_dp = bool(dict(case.runtime.metadata).get(
-            "enable_shared_expert_dp", False))
+        meta = dict(case.runtime.metadata)
+        extra = dict(meta.get("additional_config") or ()) if isinstance(meta.get("additional_config"), dict) else {}
+        shared_expert_dp = bool(meta.get("enable_shared_expert_dp", False))
+        pcp_o_proj_shard = bool(
+            meta.get("enable_pcp_o_proj_weight_sharding",
+                     extra.get("enable_pcp_o_proj_weight_sharding", False)))
+        from mindie_sim.prediction.operators.context_parallel.graph import dcp_q_replicate_enabled
+        has_sparse_mla = any(
+            lp.indexer or lp.owns_topk or lp.topk_owner_layer_id >= 0 or lp.index_k_owner_layer_id >= 0
+            for lp in case.model.layer_plans
+        )
+        dcp_q_rep = (
+            int(p.cp) > 1
+            and dcp_q_replicate_enabled(
+                case.runtime,
+                pcp_factor=int(p.dcp_pcp_factor),
+                dp_width=int(p.dcp_dp_width),
+                sparse=has_sparse_mla,
+            )
+        )
         self.slot_plans = None
         if (int(getattr(p, "redundant_experts_per_rank", 0) or 0) > 0
                 or any(plan.ffn == "moe" and int(plan.num_experts) > 0
@@ -197,6 +215,8 @@ class Memory(
             include_engram_tables=not case.runtime.engram_cpu_offload,
             layer_partition=self.layers, draft_kind=self.draft_kind or None,
             enable_shared_expert_dp=shared_expert_dp,
+            enable_pcp_o_proj_weight_sharding=pcp_o_proj_shard,
+            dcp_q_replicate=dcp_q_rep,
             slot_plans=self.slot_plans,
         )
         weight_totals, weight_payloads = _weight_ledger_by_stage(
@@ -204,6 +224,8 @@ class Memory(
             include_draft=draft,
             include_engram_tables=not case.runtime.engram_cpu_offload,
             enable_shared_expert_dp=shared_expert_dp,
+            enable_pcp_o_proj_weight_sharding=pcp_o_proj_shard,
+            dcp_q_replicate=dcp_q_rep,
             slot_plans=self.slot_plans,
         )
         if any(abs(total - gross) > max(1.0, abs(gross) * 1e-9)

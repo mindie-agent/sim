@@ -178,8 +178,9 @@ def _state_page_bytes(model: Any, parallel: Any, block_size: int,
     tp = max(1, int(getattr(parallel, "tp", 1) or 1))
     pcp = max(1, int(getattr(parallel, "pcp", 1) or 1))
     axis = str(dict(getattr(runtime, "metadata", ()) or ()).get(
-        "kda_parallel_axis", ""))
-    kda_pcp = pcp if axis == "tp_x_pcp" else 1
+        "kda_parallel_axis", "")).strip().lower()
+    # KDA under PCP shards heads (and state) across tp * pcp by default.
+    kda_pcp = 1 if axis == "tp" else pcp
     total_bytes = 0
     for plan in plans:
         shards = tp * (kda_pcp if plan.attention == "kda" else 1)

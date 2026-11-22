@@ -23,7 +23,7 @@ from mindie_sim.catalog.weight_terms import WeightTerm, term_bytes
 from mindie_sim.prediction.operators.attention.attention import AttentionPolicy, gqa
 from mindie_sim.prediction.engine import Engine, Resource
 from mindie_sim.prediction.operators.mla.generic_latent_attention import owned_store_rows, sparse_over_parts
-from mindie_sim.prediction.operators.mla.latent_dcp import PACK_LSE_OPS
+from mindie_sim.prediction.operators.context_parallel.graph import PACK_LSE_OPS
 from mindie_sim.prediction.local_projection_tp import _local_dimension, _packed_local_width
 from mindie_sim.prediction.mechanism import Geometry
 from mindie_sim.prediction.operators import attention as governed

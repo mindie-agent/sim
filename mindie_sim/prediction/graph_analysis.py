@@ -259,6 +259,10 @@ def _prepare_graphs(case, ops, book, replay_scope, external):
             dict(op.metadata).get("group_axis") == "local_tp" for op in items
         ) and set(group_for[r]) - graphs.keys():
             raise ValueError("graph_local_tp_collective_requires_complete_cohort")
+        if case.runtime.parallel.cp_spans_dp and any(
+            dict(op.metadata).get("group_axis") in {"cp", "dcp_dp", "dcp_a2a"} for op in items
+        ) and set(group_for[r]) - graphs.keys():
+            raise ValueError("graph_cp_collective_requires_complete_cohort")
     return graphs, scopes, replay_scope, groups, group_for
 
 
@@ -340,14 +344,30 @@ def _run_graph(
     return execution, engine, records, steps, stream_plans
 
 
+def _dcp_replica_subgroup(topology, axis, replica, stage, meta, fallback):
+    """Map one op's physical DCP collective group to its participating DP replicas."""
+    groups = topology.groups(axis, replica, stage, metadata=meta)
+    ranks = {int(rk) for group in groups for rk in group}
+    if not ranks:
+        return fallback
+    matched = tuple(
+        r for r in fallback
+        if any(int(rk) in ranks for rk in topology.ranks(r, stage))
+    )
+    return matched or fallback
+
+
 def _bind_collective_readiness(case, records, group_for, execution):
     from .local_tp_groups import local_tp_spans_dp
+    from .topology import Topology
 
     # Aggregate recipes retain their rendezvous. Causal transport plans retain
     # rank entry and round dependencies instead of one all-cohort ready gate.
     joins = {}
     has_ltp = local_tp_spans_dp(case.runtime.parallel)
-    if case.runtime.parallel.ep_spans_dp or has_ltp:
+    has_cp_dp = bool(case.runtime.parallel.cp_spans_dp)
+    topology = Topology(case.machine, case.runtime.parallel) if has_cp_dp else None
+    if case.runtime.parallel.ep_spans_dp or has_ltp or has_cp_dp:
         for record in records:
             op, r = record["op"], record["replica"]
             meta = dict(op.metadata)
@@ -356,6 +376,10 @@ def _bind_collective_readiness(case, records, group_for, execution):
                 joins.setdefault((group_for[r], op.op_id), []).append(record)
             elif has_ltp and axis == "local_tp":
                 grp = tuple(meta.get("group_ranks") or group_for[r])
+                joins.setdefault((grp, op.op_id), []).append(record)
+            elif has_cp_dp and axis in {"cp", "dcp_dp", "dcp_a2a"}:
+                grp = _dcp_replica_subgroup(
+                    topology, axis, r, op.stage, meta, group_for[r])
                 joins.setdefault((grp, op.op_id), []).append(record)
     for participants in joins.values():
         if all(item["collective_algorithm"] for item in participants):

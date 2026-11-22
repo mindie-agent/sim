@@ -45,7 +45,9 @@ def requires_collective_cohort(case, op, recipe):
     return bool(
         getattr(recipe, "algorithm", None)
         and ((case.runtime.parallel.ep_spans_dp and axis == "ep")
-             or (local_tp_spans_dp(case.runtime.parallel) and axis == "local_tp")))
+             or (local_tp_spans_dp(case.runtime.parallel) and axis == "local_tp")
+             or (case.runtime.parallel.cp_spans_dp
+                 and axis in {"cp", "dcp_dp", "dcp_a2a"})))
 
 
 def _service_regime_row(context, duration):

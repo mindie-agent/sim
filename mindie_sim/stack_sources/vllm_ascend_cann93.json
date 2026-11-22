@@ -113,16 +113,8 @@
       "state": "merged",
       "ref": "vllm-project/vllm-ascend@405617bae227fe5b097ff163efaa60bb7f22c698",
       "archs": ["a5"],
-      "models": [
-        "deepseek-v4.1-flash", "deepseek-v4-flash-0731", "deepseek-v4-pro-0813", "deepseek-v4-10t",
-        "deepseek-v3", "deepseek-r1", "deepseek-v3.2", "deepseek-v3.2-prune-3l",
-        "glm-5.1", "glm-5.2", "glm-5.3", "glm-5.3-flash",
-        "qwen3.8-flash-next", "qwen3.5-35b-a3b", "qwen3.6-35b-a3b", "qwen3.5-397b-a17b",
-        "qwen3-next-80b-a3b", "qwen3.8-2.4t-a95b", "qwen3-30b-a3b", "qwen3-235b-a22b",
-        "qwen3.5-moe", "minimax-m3", "minimax-m3.1-flash", "step-5-preview", "gemma-4-26b-a4b"
-      ],
       "options": {"enable_fused_mc2": 3},
-      "notes": "CANN_MEGAMOE + CANN_MEGAMOE_MXFP + CANN_MEGAMOE_SHARED_EXPERT_FUSION (enable_fused_mc2=3) merged on A5",
+      "notes": "CANN_MEGAMOE + CANN_MEGAMOE_MXFP + CANN_MEGAMOE_SHARED_EXPERT_FUSION (enable_fused_mc2=3) merged structurally on A5 MXFP MoE models",
       "provenance": {
         "repository": "vllm-project/vllm-ascend",
         "revision": "405617bae227fe5b097ff163efaa60bb7f22c698",
@@ -206,12 +198,7 @@
       "mechanism_id": "unit_offset_rmsnorm_fusion",
       "state": "unmerged_pr",
       "ref": "vllm-project/vllm-ascend#21449",
-      "models": [
-        "qwen3.5-27b", "qwen3.6-27b", "qwen3.8-27b", "qwen3.5-35b-a3b", "qwen3.6-35b-a3b",
-        "qwen3.5-397b-a17b", "qwen3-next-80b-a3b", "qwen3.8-2.4t-a95b", "qwen3.5-moe",
-        "minimax-m3", "minimax-m3.1-flash"
-      ],
-      "notes": "Pre-fold (1+w) GemmaRMSNorm gamma at load time across Qwen3.5/3.6/3.8 and MiniMax-M3 (Gemma-4 uses standard RMSNorm)",
+      "notes": "Pre-fold (1+w) GemmaRMSNorm gamma at load time structurally across all unit-offset RMSNorm models",
       "provenance": {
         "repository": "vllm-project/vllm-ascend",
         "revision": "bbf28393cc",
@@ -278,11 +265,7 @@
       "state": "unmerged_pr",
       "ref": "vllm-project/vllm-ascend#22467",
       "archs": ["a5"],
-      "models": [
-        "glm-5.1", "glm-5.2", "glm-5.3", "glm-5.3-flash",
-        "deepseek-v3.2", "deepseek-v3.2-prune-3l"
-      ],
-      "notes": "Precompute A5 C8 FP8 scale addresses for npu_kv_quant_sparse_flash_attention (-40% SFA overhead)",
+      "notes": "Precompute A5 C8 FP8 scale addresses structurally for all indexed MLA/SFA models (-40% SFA overhead)",
       "provenance": {
         "repository": "vllm-project/vllm-ascend",
         "revision": "1b33178393",
@@ -349,11 +332,7 @@
       "state": "unmerged_pr",
       "ref": "vllm-project/vllm-ascend#22385",
       "archs": ["a5"],
-      "models": [
-        "qwen3.5-27b", "qwen3.6-27b", "qwen3.8-27b", "qwen3-30b-a3b",
-        "qwen3-235b-a22b", "qwen3.5-moe", "qwen3.5-35b-a3b", "qwen3.6-35b-a3b", "qwen3.5-397b-a17b"
-      ],
-      "notes": "Dense MLP & MoE TP MC2 AllGatherMatmulV2 + MatmulReduceScatterV2 (#22385, #21832)",
+      "notes": "Dense MLP & MoE TP MC2 AllGatherMatmulV2 + MatmulReduceScatterV2 structurally on any TP>1 model (#22385, #21832)",
       "provenance": {
         "repository": "vllm-project/vllm-ascend",
         "revision": "2ed6a1dc5b",
@@ -429,8 +408,7 @@
       "mechanism_id": "kda_in_kernel_l2norm",
       "state": "unmerged_pr",
       "ref": "vllm-project/vllm-ascend#22048",
-      "models": ["kimi-k3", "kimi-k3.1"],
-      "notes": "Enable use_qk_l2norm_in_kernel=True for Kimi KDA prefill (ops/kimi_kda.py still hardcodes False on 405617bae)",
+      "notes": "Enable use_qk_l2norm_in_kernel=True structurally across all KDA prefill models",
       "provenance": {
         "repository": "vllm-project/vllm-ascend",
         "revision": "405617bae227fe5b097ff163efaa60bb7f22c698",
@@ -442,12 +420,7 @@
       "mechanism_id": "fused_recover_ssm",
       "state": "unmerged_pr",
       "ref": "vllm-project/vllm-ascend#22045",
-      "models": [
-        "qwen3.5-27b", "qwen3.6-27b", "qwen3.8-27b", "qwen3.5-35b-a3b", "qwen3.6-35b-a3b",
-        "qwen3.5-397b-a17b", "qwen3-next-80b-a3b", "qwen3.8-2.4t-a95b", "qwen3.5-moe",
-        "qwen3.8-flash-next", "glm-5.3-flash"
-      ],
-      "notes": "End-to-end --use-replayssm GDN Part 2 (#22045) and colocated PCP KDA RecoverSSM (#22146)",
+      "notes": "End-to-end --use-replayssm GDN Part 2 (#22045) and colocated PCP KDA RecoverSSM (#22146) structurally across all GDN/KDA models",
       "provenance": {
         "repository": "vllm-project/vllm-ascend",
         "revision": "fb1826af03",
@@ -474,8 +447,7 @@
       "state": "unmerged_pr",
       "ref": "vllm-project/vllm-ascend#22191",
       "archs": ["a5"],
-      "models": ["glm-5.3-flash"],
-      "notes": "Dynamic INT8 quant_mode=2 pool_key_indexer (#22191), long-context sparse_flash_mla plan fix (#22383), small-batch padded verify (#22370)",
+      "notes": "Dynamic INT8 quant_mode=2 pool_key_indexer structurally on all keypool MLA models (#22191, #22383, #22370)",
       "provenance": {
         "repository": "vllm-project/vllm-ascend",
         "revision": "46b9d6c1d8",
@@ -519,6 +491,115 @@
         "revision": "fbeab2eb9a",
         "relative_path": "vllm_ascend/ops/fused_moe/moe_mlp.py",
         "source_sha256": "7882f9d0847e0303c78f2b216cfc50da9d3d062d6bd6f0cd22c94d1c7e78af0e"
+      }
+    },
+    {
+      "mechanism_id": "universal_dcp_query_gather",
+      "state": "merged",
+      "ref": "vllm-project/vllm-ascend@0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
+      "notes": "Universal DCP Q AllGather + AllToAll [+ PCP AllGather] + fused LSE combine conserving 100% attention FLOPs across all KV-reading families",
+      "provenance": {
+        "repository": "vllm-project/vllm-ascend",
+        "revision": "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
+        "relative_path": "vllm_ascend/attention/context_parallel/mla_cp.py",
+        "source_sha256": "10c820fc90a228efa8088c8e5e37ddef8621e8625c2fdfdca9c892e59d71f55c"
+      }
+    },
+    {
+      "mechanism_id": "local_projection_tp",
+      "state": "merged",
+      "ref": "vllm-project/vllm-ascend@0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
+      "notes": "Composable per-sublayer Local-TP across Q/O/linear/MLP/shared-expert/lm_head projections",
+      "provenance": {
+        "repository": "vllm-project/vllm-ascend",
+        "revision": "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
+        "relative_path": "vllm_ascend/distributed/parallel_state.py",
+        "source_sha256": "308d7e59d02673a8c2fd44c8539f70396e69c08085d8104d4ce569bd1265dbce"
+      }
+    },
+    {
+      "mechanism_id": "pcp_decode_request_sharding",
+      "state": "merged",
+      "ref": "vllm-project/vllm-ascend@0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
+      "notes": "Shard independent decode requests across PCP lanes when DCP=1",
+      "provenance": {
+        "repository": "vllm-project/vllm-ascend",
+        "revision": "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
+        "relative_path": "vllm_ascend/attention/context_parallel/common_cp.py",
+        "source_sha256": "e20eaa698b825c24a9ab37f83870391d944aef7d57fa7e6d680db0c306cc5f65"
+      }
+    },
+    {
+      "mechanism_id": "kda_pcp_head_sharding",
+      "state": "merged",
+      "ref": "vllm-project/vllm-ascend@0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
+      "notes": "KDA TPxPCP head sharding (#21510 / #21941) with sequence-to-head AllGather/Restore/Scatter",
+      "provenance": {
+        "repository": "vllm-project/vllm-ascend",
+        "revision": "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
+        "relative_path": "vllm_ascend/ops/kda_pcp.py",
+        "source_sha256": "16e66eb6fecb95de2d1bf252046fb2090659078ffd58fe55dfcf6272cfdff47b"
+      }
+    },
+    {
+      "mechanism_id": "dsv41_pcp_c2_ring_gather",
+      "state": "merged",
+      "ref": "vllm-project/vllm-ascend@0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
+      "notes": "V4.1 PCP C2 ring-tail compressor boundary gather and restore unpermute",
+      "provenance": {
+        "repository": "vllm-project/vllm-ascend",
+        "revision": "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
+        "relative_path": "vllm_ascend/attention/context_parallel/dsa_v41_cp.py",
+        "source_sha256": "c1fc6cfbdf9d151ff0587709a3a448ec434025dc78c23bf3956b8954f8cfdb14"
+      }
+    },
+    {
+      "mechanism_id": "sfa_dcp_sharded_indexer",
+      "state": "unmerged_pr",
+      "ref": "vllm-project/vllm-ascend#22215",
+      "notes": "Optional DCP-sharded LightningIndexer KV cache reducing indexer HBM by 1/dcp",
+      "provenance": {
+        "repository": "vllm-project/vllm-ascend",
+        "revision": "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
+        "relative_path": "vllm_ascend/attention/context_parallel/sharded_indexer.py",
+        "source_sha256": "0a7e01b3006d277090e3589253596a6bc2c46e437cae3503d463d29564dfc54d"
+      }
+    },
+    {
+      "mechanism_id": "pcp_o_proj_weight_sharding",
+      "state": "merged",
+      "ref": "vllm-project/vllm-ascend@0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
+      "notes": "Shard o_proj weights across PCP ranks with overlapped weight AllGather on cp_weight_stream",
+      "provenance": {
+        "repository": "vllm-project/vllm-ascend",
+        "revision": "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
+        "relative_path": "vllm_ascend/attention/context_parallel/dsa_cp.py",
+        "source_sha256": "0b1bbc0201c63441f1a163ce8d4a59edd4079202b2f5b3ce09d31ec9015185c5"
+      }
+    },
+    {
+      "mechanism_id": "pcp_w8a8_quantized_allgather",
+      "state": "unmerged_pr",
+      "ref": "vllm-project/vllm-ascend#22230",
+      "notes": "Quantized INT8/FP8 PCP activation AllGather halving inter-rank wire volume",
+      "provenance": {
+        "repository": "vllm-project/vllm-ascend",
+        "revision": "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
+        "relative_path": "vllm_ascend/attention/context_parallel/common_cp.py",
+        "source_sha256": "e20eaa698b825c24a9ab37f83870391d944aef7d57fa7e6d680db0c306cc5f65"
+      }
+    },
+    {
+      "mechanism_id": "quantized_allreduce",
+      "state": "merged",
+      "ref": "vllm-project/vllm-ascend@0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
+      "archs": ["a2"],
+      "notes": "Opt-in INT8 quantized TP AllReduce on A2 (BF16, 2<=TP<=8, >=16,777,216 elements)",
+      "provenance": {
+        "repository": "vllm-project/vllm-ascend",
+        "revision": "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
+        "relative_path": "vllm_ascend/distributed/device_communicators/quantized_all_reduce.py",
+        "source_sha256": "d59bd4cd53418ae508ee6983401f9195bb3c4f5bc1f4d560e138da472922b8a8"
       }
     }
   ]

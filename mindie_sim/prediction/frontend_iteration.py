@@ -163,21 +163,24 @@ class _FrontendIteration:
         degree = runtime.parallel.pcp
         if degree == 1 or not any(v.phase == "prefill" for v in views):
             return views, padded, False
-        rep_win = 0
         plans = getattr(model, "layer_plans", ()) if model is not None else ()
         attn_plans = [
             lp for lp in plans
             if lp.attention in {"gqa", "mla"} and lp.cache_kind != "recurrent_unmodeled"
         ]
-        if attn_plans and all(
-            int(lp.window) > 0 and not lp.compress_ratio and not lp.index_topk
-            for lp in attn_plans
-        ):
-            rep_win = max(int(lp.window) for lp in attn_plans)
         costs = [0.0] * degree
         for view in views:
-            if view.phase == "prefill":
-                split = _frontend.split_pcp_pairs(view.q_len, view.context, degree, window=rep_win)
+            if view.phase != "prefill":
+                continue
+            if attn_plans:
+                for lp in attn_plans:
+                    win = (int(lp.window)
+                           if int(lp.window) > 0 and not lp.compress_ratio and not lp.index_topk
+                           else 0)
+                    split = _frontend.split_pcp_pairs(view.q_len, view.context, degree, window=win)
+                    costs = [old + current for old, current in zip(costs, split.per_rank)]
+            else:
+                split = _frontend.split_pcp_pairs(view.q_len, view.context, degree, window=0)
                 costs = [old + current for old, current in zip(costs, split.per_rank)]
         rank = max(range(degree), key=costs.__getitem__) if lane is None else lane
         ranges = [_frontend.pcp_rank_chunk_ranges(view.q_len, degree, rank) for view in views]
@@ -237,7 +240,8 @@ class _FrontendIteration:
                  resource_fusion=None, replica=0, source_rows_by_replica=None,
                  routing_global_tokens=None, routing_views=None,
                  cohort_views_by_replica=None,
-                 physical_rank=None, query_position=None, assembly="service",
+                 physical_rank=None, explicit_physical_rank: bool = False,
+                 query_position=None, assembly="service",
                  dispatch_binding=None, dispatch_fast_step: bool = False):
         # ``dispatch_binding`` is the T14 PP/EP microbatch envelope (original
         # slot/version/replica). The ordinary producer keeps using the views in
@@ -397,6 +401,7 @@ class _FrontendIteration:
                                    routing_views=eff_routing_views,
                                    cohort_views_by_replica=cohort_views_by_replica,
                                    physical_rank=physical_rank,
+                                   explicit_physical_rank=(explicit_physical_rank or requested_rank is not None),
                                    query_position=eff_query_pos,
                                    include_recover_commits=(assembly == "service" or any(
                                        view.draft_proposal_tokens for view in plan.requests)),

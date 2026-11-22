@@ -19,7 +19,7 @@ from _support.builders import dense_case, dense_layer
 from _support.captures import REPO_ROOT
 from _support.hardware import sku_case
 from mindie_sim import compose_case, graph_costs
-from mindie_sim.catalog.attention_common import dcp_partial_merge_ops
+from mindie_sim.prediction.operators.context_parallel.graph import emit_dcp_output_exchange_combine
 from mindie_sim.prediction.operators.attention.attention import gqa
 from mindie_sim.prediction.engine import Engine, Resource
 from mindie_sim.prediction.frontend import Frontend
@@ -129,15 +129,17 @@ def test_qkv_fusion_partitions_projection_and_materializes_gather_inputs(gate, p
 
 
 def test_partial_update_follows_collective_and_owns_only_local_merge():
-    ops, last = dcp_partial_merge_ops(
-        prefix="attention", view=RequestView("r", 3, 17, True, "decode"), cp=2, local_heads=4,
-        v_dim=8, stage=0, layer=0, mode="decode", deps=("partial_attention",),
-        total_pairs=60, local_pairs=32, total_rows=20, local_rows=12, interleave=4)
-    gather, update = ops
-    view = dict(update.metadata)["native_tensor_view"]
-    assert last == update.op_id and update.deps == (gather.op_id,)
-    assert gather.link_bytes > 0 and update.link_bytes == 0 and update.vector_ops > 0
-    assert view["partial_output_shapes"] == ((12, 8),) * 2 and view["partial_lse_shapes"] == ((12,),) * 2
+    ops = []
+    last = emit_dcp_output_exchange_combine(
+        ops, prefix="attention", stage=0, layer=0, requests=("r",), mode="decode",
+        deps=("partial_attention",), rows=3, local_heads=4, v_dim=8,
+        act_dtype="bf16", pcp_factor=1, tp_gather=2, dp_width=1)
+    pack, exchange, update = ops
+    meta = dict(update.metadata)
+    assert last == update.op_id and update.deps == (exchange.op_id,)
+    assert pack.deps == ("partial_attention",) and exchange.deps == (pack.op_id,)
+    assert exchange.link_bytes > 0 and update.link_bytes == 0 and update.vector_ops > 0
+    assert meta["partial_count"] == 2 and meta["lse_wire_bytes"] == 4
 
 
 @pytest.mark.requires_profiler

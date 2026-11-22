@@ -251,9 +251,11 @@ def test_parallel_world_size_five_axes_expert_tp_and_rank_table_contracts() -> N
         assert active_dcp_degree(par, "prefill") == 1
         assert active_dcp_degree(par, "decode") == kw.get("dcp", 1)
 
-    with pytest.raises(ModelingError, match="dcp_pcp_domain_invalid"):
-        ParallelSpec(tp=4, pcp=2, dcp=4, ep=1).validate(mla_moe)
-    with pytest.raises(ModelingError, match="gqa_pcp_dcp_requires_equal_degrees"):
+    # Intermediate PCP+TP DCP (pcp=2, tp=4, dcp=4 -> pcp_factor=2, tp_gather=2) is algebraically valid on MLA.
+    ParallelSpec(tp=4, pcp=2, dcp=4, ep=1).validate(mla_moe)
+    with pytest.raises(ModelingError, match="dcp_factorization_invalid"):
+        ParallelSpec(tp=4, pcp=2, dcp=3, ep=1).validate(mla_moe)
+    with pytest.raises(ModelingError, match="cp_exceeds_gqa_decode_domain"):
         ParallelSpec(tp=2, pcp=2, dcp=4, ep=1).validate(dense_gqa)
 
     # Expert-TP groups under TP=2, PCP=2, EP=4 emit four singletons with zero empty tuples.

@@ -36,7 +36,7 @@ from mindie_sim.catalog.quant import quant_preset
 from mindie_sim.catalog.types import AuxiliarySpec, DraftSpec, QuantSpec
 from mindie_sim.catalog.weight_terms import term_bytes
 from mindie_sim.catalog.weights import cache_row_bytes_by_layer, layer_weight_terms
-from mindie_sim.prediction.operators.sparse_indexer import family_quant_indexer, index_pool; from mindie_sim.prediction.operators.mla import latent_dcp
+from mindie_sim.prediction.operators.sparse_indexer import family_quant_indexer, index_pool; from mindie_sim.prediction.operators.context_parallel import graph as cp_graph
 from mindie_sim.prediction.operators.paged_mla import indexed_quant_attention as c8
 from mindie_sim.prediction.operators.attention.attention import _CacheProducer
 from mindie_sim.prediction.operators.attention.attention_decode import StagedGQADecode
@@ -355,7 +355,7 @@ def catalog_case(model, **overrides):
     return parse_case(compose_case(model, **(settings | overrides)))
 
 @pytest.mark.parametrize("model,query,total,draft", [
-    ("deepseek-v4.1-flash", 1, 2207744, 208896), ("glm-5.3-flash", 4, 30610432, None),
+    ("deepseek-v4.1-flash", 1, 2207744, 208896), ("glm-5.3-flash", 4, 21844992, None),
     ("step-5-preview", 1, None, None),
 ])
 def test_draft_cache_allocation_and_batch_ledger_conserve_bytes(model, query, total, draft):
@@ -471,8 +471,8 @@ def test_latent_attention_requires_the_exact_packed_cache_geometry(fmt, bytes_pe
     plan = SimpleNamespace(kv_lora_rank=512, qk_rope_head_dim=64, cache_row_elements=576,
                            index_topk=2048, indexer=True)
     views = (RequestView("r", 1, 256, False, "decode"),)
-    result = latent_dcp.packed_sfa_geometry({"attention_tensor_view": {"cache_dtype": "int8"}},
-                                            8, plan, views, 8, cache_dtype="int8", cache_fmt=fmt)
+    result = cp_graph.packed_sfa_geometry({"attention_tensor_view": {"cache_dtype": "int8"}},
+                                          8, plan, views, 8, cache_dtype="int8", cache_fmt=fmt)
     assert (fmt.row_bytes(576), None if result is None else (result["latent"], result["rope"])) == (bytes_per_row, (512, 64) if eligible else None)
 
 def test_quantized_indexer_prices_payload_scale_and_cold_fill_separately():
@@ -499,7 +499,7 @@ def test_context_parallel_statistics_are_in_the_immediate_consumer_read():
                     dims, dims, dims, dims, hbm_bytes=payload, mte3_bytes=payload,
                     metadata=(("program_kind", "attention"), ("native_kernel", "mla_attention")))
     builder.add(source)
-    latent_dcp.attention_batch(builder, [source.op_id], views, plan=builder.plan, heads=96, local_heads=12, cp=8, rows=1)
+    cp_graph.paired_sfa_attention_batch(builder, [source.op_id], views, plan=builder.plan, heads=96, local_heads=12, cp=8, rows=1)
     by_name = {op.op_id.rsplit(".", 1)[-1]: op for op in builder.ops}
     assert by_name["latent_attention_batch"].mte3_bytes == by_name["dcp_output_pack"].mte2_bytes == payload + 96 * 2 * 4
 

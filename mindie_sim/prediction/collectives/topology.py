@@ -534,28 +534,86 @@ class Topology(_TopologyPlansMixin):
         """Rank axes are independent; EP absorbs PCP copies only when it spans them."""
         p = self.parallel
         sources = self.ranks(replica, stage)
+        declared = dict(metadata or {})
         if axis == "local_tp":
             from ..local_tp_groups import local_tp_groups
 
-            declared = dict(metadata or {})
             width = int(declared.get("local_tp_width", 0) or 0)
+            stride = int(declared.get("local_tp_stride", 1) or 1)
             if width <= 0:
                 raise ModelingError("local_tp_group_requires_declared_width")
-            all_groups = local_tp_groups(self.machine, p, stage=stage, width=width)
+            all_groups = local_tp_groups(
+                self.machine, p, stage=stage, width=width, stride=stride)
             selected = tuple(group for group in all_groups
                              if any(rank in sources for rank in group))
             return selected or all_groups
         if axis == "cp":
-            if p.pcp > 1:
-                transposed = tuple(
-                    sources[copy * p.tp + lane]
-                    for lane in range(p.tp)
-                    for copy in range(p.pcp)
-                )
+            pcp_w = int(declared.get("dcp_pcp_factor") or p.dcp_pcp_factor)
+            tp_w = int(declared.get("dcp_tp_gather") or p.dcp_tp_gather)
+            dp_w = int(declared.get("dcp_dp_width") or p.dcp_dp_width)
+            if dp_w > 1:
+                first = (replica // dp_w) * dp_w
                 return tuple(
-                    transposed[i:i + p.cp] for i in range(0, len(transposed), p.cp)
+                    tuple(
+                        rank
+                        for r in range(first, first + dp_w)
+                        for copy in range(copy0, copy0 + pcp_w)
+                        for rank in self.ranks(r, stage)[copy * p.tp + i:copy * p.tp + i + tp_w]
+                    )
+                    for copy0 in range(0, p.pcp, pcp_w)
+                    for i in range(0, p.tp, tp_w)
                 )
-            return tuple(sources[i:i + p.cp] for i in range(0, len(sources), p.cp))
+            if p.pcp > 1:
+                return tuple(
+                    tuple(
+                        sources[copy * p.tp + lane]
+                        for lane in range(i, i + tp_w)
+                        for copy in range(copy0, copy0 + pcp_w)
+                    )
+                    for i in range(0, p.tp, tp_w)
+                    for copy0 in range(0, p.pcp, pcp_w)
+                )
+            return tuple(sources[i:i + tp_w] for i in range(0, len(sources), tp_w))
+        if axis == "dcp_tp":
+            width = int(declared.get("dcp_tp_gather") or p.dcp_tp_gather)
+            return tuple(
+                sources[copy * p.tp + i:copy * p.tp + i + width]
+                for copy in range(p.pcp)
+                for i in range(0, p.tp, width)
+            )
+        if axis == "dcp_pcp":
+            width = int(declared.get("dcp_pcp_factor") or p.dcp_pcp_factor)
+            return tuple(
+                sources[lane::p.tp][i:i + width]
+                for lane in range(p.tp)
+                for i in range(0, p.pcp, width)
+            )
+        if axis == "dcp_dp":
+            count = int(declared.get("dcp_dp_width") or p.dcp_dp_width)
+            first = (replica // count) * count
+            return tuple(
+                tuple(self.ranks(r, stage)[idx] for r in range(first, first + count))
+                for idx in range(len(sources))
+            )
+        if axis == "dcp_a2a":
+            tp_w = int(declared.get("dcp_tp_gather") or p.dcp_tp_gather)
+            dp_w = int(declared.get("dcp_dp_width") or p.dcp_dp_width)
+            if dp_w <= 1:
+                return tuple(
+                    sources[copy * p.tp + i:copy * p.tp + i + tp_w]
+                    for copy in range(p.pcp)
+                    for i in range(0, p.tp, tp_w)
+                )
+            first = (replica // dp_w) * dp_w
+            return tuple(
+                tuple(
+                    rank
+                    for r in range(first, first + dp_w)
+                    for rank in self.ranks(r, stage)[copy * p.tp + i:copy * p.tp + i + tp_w]
+                )
+                for copy in range(p.pcp)
+                for i in range(0, p.tp, tp_w)
+            )
         if axis == "dp":
             return tuple(
                 tuple(self.ranks(r, stage)[idx] for r in range(p.dp))

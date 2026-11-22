@@ -608,3 +608,19 @@ tier = "tier0"
 owns = [
   "mindie_sim/rewrite/oracle.py",
 ]
+
+[[module]]
+path = "operators/test_context_parallel_graph.py"
+tier = "tier0"
+owns = [
+  "mindie_sim/prediction/operators/context_parallel",
+]
+
+[[module]]
+path = "product/test_parallel_generalization_and_sweeps.py"
+tier = "tier0"
+owns = [
+  "mindie_sim/catalog/context_parallel.py",
+  "mindie_sim/sweep_resize.py",
+  "mindie_sim/runtime_profiles.py",
+]

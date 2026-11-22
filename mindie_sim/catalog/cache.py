@@ -63,7 +63,9 @@ from mindie_sim.catalog.cache_pools import (
     separate_pool_page_pitches,
     target_mla_page_bytes,
 )
-from mindie_sim.catalog.context_parallel import cp_plan_kind
+from mindie_sim.catalog.context_parallel import (
+    cp_plan_kind, dcp_indexer_sharded, layer_dcp_degree,
+)
 from mindie_sim.schema.common import ModelingError, dtype_bytes
 from mindie_sim.schema.model import WorkloadSpec
 from mindie_sim.schema.parallel import ParallelSpec
@@ -320,7 +322,8 @@ def layer_cache_components(model: Any, plan: Any, parallel: ParallelSpec,
                            phase: str = "decode") -> dict[str, float]:
     seq = max(0, int(sequence_tokens))
     int8_fa3 = gbsa_cache_layout(runtime) == "int8_fa3"
-    tp, cp = parallel.tp, parallel.cp
+    tp = parallel.tp
+    cp = layer_dcp_degree(plan, parallel)
     result: dict[str, float] = {}
 
     def local_rows(rows: int, block: int = interleave, *, start: int = 0, ratio: int = 1) -> float:
@@ -330,9 +333,22 @@ def layer_cache_components(model: Any, plan: Any, parallel: ParallelSpec,
             owned = owned_token_rows(rows, spans, rank, start=start)
             if owned is not None:
                 return owned
-            if capacity_padded:
-                return owned_block_rows(rows, block, cp, rank)
-            return rows / cp
+            if cp <= 1:
+                return float(block_round(rows, block) if capacity_padded else rows)
+            if rows <= 0:
+                return 0.0
+            from mindie_sim.catalog.context_parallel import layer_dcp_factors, owned_positions
+            pcp_f, tp_g, dp_w = layer_dcp_factors(plan, parallel)
+            tp_dim = max(1, int(parallel.tp))
+            pcp_dim = max(1, int(parallel.pcp))
+            dp_dim = max(1, int(parallel.dp))
+            r_int = int(rank)
+            tp_i = r_int % tp_dim
+            pcp_i = (r_int // tp_dim) % pcp_dim
+            dp_i = (r_int // (tp_dim * pcp_dim)) % dp_dim
+            cp_rank = ((dp_i % dp_w) * (pcp_f * tp_g) + (pcp_i % pcp_f) * tp_g + (tp_i % tp_g)) % cp
+            exact = owned_positions(start, start + rows - 1, cp, block, cp_rank)
+            return float(block_round(exact, block) if capacity_padded else exact)
         return (_context_shard_blocks(rows, block, cp) if capacity_padded
                 else rows / cp)
 
@@ -343,12 +359,14 @@ def layer_cache_components(model: Any, plan: Any, parallel: ParallelSpec,
                 sequence_tokens=seq, query_tokens=query_tokens, phase=phase,
                 capacity_padded=capacity_padded)
         else:
+            pcp = max(1, int(getattr(parallel, "pcp", 1) or 1))
+            shards = tp * (pcp if plan.attention == "kda" else 1)
             result["recurrent_state"] = float(exact_element_bytes(
-                _ceil_div(int(plan.recurrent_state_elements), tp),
+                _ceil_div(int(plan.recurrent_state_elements), shards),
                 str(plan.recurrent_state_dtype),
             ))
             result["conv_state"] = float(exact_element_bytes(
-                _ceil_div(int(plan.conv_state_elements), tp),
+                _ceil_div(int(plan.conv_state_elements), shards),
                 str(plan.conv_state_dtype),
             ))
         if plan.engram and seq > 0:
@@ -397,8 +415,7 @@ def layer_cache_components(model: Any, plan: Any, parallel: ParallelSpec,
     if plan.owns_index_k:
         index_ratio = max(1, plan.compress_ratio, plan.index_kpool)
         rows = completed_rows(seq, index_ratio)
-        from .paired_sfa import execution
-        if execution(model).get("dcp_indexer_sharded") and cp > 1:
+        if dcp_indexer_sharded(model, runtime) and cp > 1:
             rows = local_rows(rows, max(1, interleave // index_ratio), ratio=index_ratio)
         elif parallel.cp_plan == "dsa_cp":
             if rank is not None:
