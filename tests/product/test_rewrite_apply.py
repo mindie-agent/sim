@@ -678,3 +678,112 @@ def test_collective_transform_accepts_oneshot_mode_and_rejects_unknown_mode(rout
     assert (record.target_op, record.mode, record.topology_route) == (dispatch.op_id, "oneshot", route)
     with pytest.raises(ModelingError, match="rewrite_collective_mode_invalid:invented"):
         CollectiveTransform(_atom(dispatch.op_id), "invented", route)  # type: ignore[arg-type]
+
+
+def test_sibling_gemm_activation_dedup_exact_bytes_and_port_contract():
+    from mindie_sim.prediction.spine import PredictionSpine
+    from mindie_sim.rewrite import discover_algebraic_rewrites_for_ops
+    from mindie_sim.schema.operators import OpSpec
+
+    case = compose_case("qwen3-32b", REPRESENTATIVE_SKUS["a3"], tp=1, dp=1, layers=1)
+    m_dim, n_dim, k_dim = 1, 4096, 4096
+    act_bytes = float(m_dim * k_dim * 2)  # 8,192 B
+    wt_bytes = float(n_dim * k_dim * 2)   # 33,554,432 B
+    out_bytes = float(m_dim * n_dim * 2)  # 8,192 B
+    mte2 = act_bytes + wt_bytes           # 33,562,624 B
+    hbm = mte2 + out_bytes                # 33,570,816 B
+    flops = float(2 * m_dim * n_dim * k_dim)
+
+    norm_op = OpSpec(
+        op_id="s0.l0.norm", family="rmsnorm", phase="decode", stage=0, layer=0, requests=(),
+        semantic_shape=(m_dim, k_dim), local_shape=(m_dim, k_dim),
+        padded_shape=(m_dim, k_dim), launch_shape=(m_dim, k_dim),
+        dtype="bf16", vector_ops=float(m_dim * k_dim * 4),
+        mte2_bytes=act_bytes, mte3_bytes=act_bytes, hbm_bytes=2.0 * act_bytes,
+    )
+    shared_meta = (
+        ("typed_inputs", ({"producer": "s0.l0.norm", "port": "out", "version": 0},)),
+        ("activation_format", "bf16"),
+        ("weight_format", "bf16"),
+        ("output_format", "bf16"),
+        ("compute_format", "bf16"),
+        ("packed_weight_bytes", int(wt_bytes)),
+    )
+    g1 = OpSpec(
+        op_id="s0.l0.proj_a", family="gemm", phase="decode", stage=0, layer=0, requests=(),
+        deps=("s0.l0.norm",), semantic_shape=(m_dim, n_dim, k_dim), local_shape=(m_dim, n_dim, k_dim),
+        padded_shape=(m_dim, n_dim, k_dim), launch_shape=(m_dim, n_dim, k_dim),
+        dtype="bf16", flops=flops, mte2_bytes=mte2, mte3_bytes=out_bytes, hbm_bytes=hbm,
+        metadata=shared_meta,
+    )
+    g2 = replace(g1, op_id="s0.l0.proj_b")
+
+    class _SiblingSpine(PredictionSpine):
+        def __init__(self, ops):
+            super().__init__()
+            self._ops = ops
+
+        def lower(self, parsed, request, **kwargs):
+            prepared = super().lower(parsed, request, **kwargs)
+            rank, = prepared.graph.executable
+            return replace(prepared, graph=replace(prepared.graph, executable=(replace(rank, ops=self._ops),), streams=()))
+
+    scenario = resolve_scenario(case, StepRequest("decode", tokens=1, context=64), spine=_SiblingSpine((norm_op, g1, g2)))
+    alg = discover_algebraic_rewrites_for_ops((norm_op, g1, g2), datapath=scenario.datapath)
+    law2 = [c for c in alg.candidates if c.law == "law2_block_matmul"]
+    assert len(law2) == 1
+    assert law2[0].avoidable_hbm_bytes == int(act_bytes)
+
+    applied = apply_plan(_plan(scenario, Edit("fuse_sib", operation=_fuse("s0.l0.proj_a", "s0.l0.proj_b"))), scenario)
+    fused = next(op for op in applied.executable[0].ops if op.op_id == "rewrite:fuse_sib")
+    meta = dict(fused.metadata)
+    assert meta["gm_round_trip_eliminated_bytes"] == pytest.approx(act_bytes)
+    assert fused.mte2_bytes == pytest.approx(2.0 * mte2 - act_bytes)
+    assert fused.mte3_bytes == pytest.approx(2.0 * out_bytes)
+    assert fused.hbm_bytes == pytest.approx(2.0 * hbm - act_bytes)
+    assert fused.local_shape == (m_dim, 2 * n_dim, k_dim)
+    assert meta["weight_format"] == "bf16"
+    assert meta["activation_format"] == "bf16"
+    assert meta["packed_weight_bytes"] == int(2 * wt_bytes)
+
+    # Disjoint output ports on a multi-output split producer MUST credit 0 B activation dedup.
+    split_op = OpSpec(
+        op_id="s0.l0.split", family="split", phase="decode", stage=0, layer=0, requests=(),
+        semantic_shape=(m_dim, 2 * k_dim), local_shape=(m_dim, 2 * k_dim),
+        padded_shape=(m_dim, 2 * k_dim), launch_shape=(m_dim, 2 * k_dim),
+        dtype="bf16", returns=("q", "k"),
+    )
+    g_q = replace(g1, op_id="s0.l0.proj_q", deps=("s0.l0.split",),
+                  metadata=(("typed_inputs", ({"producer": "s0.l0.split", "port": "q", "version": 0},)),))
+    g_k = replace(g1, op_id="s0.l0.proj_k", deps=("s0.l0.split",),
+                  metadata=(("typed_inputs", ({"producer": "s0.l0.split", "port": "k", "version": 0},)),))
+    scen_split = resolve_scenario(case, StepRequest("decode", tokens=1, context=64), spine=_SiblingSpine((split_op, g_q, g_k)))
+    alg_split = discover_algebraic_rewrites_for_ops((split_op, g_q, g_k), datapath=scen_split.datapath)
+    assert not [c for c in alg_split.candidates if c.law == "law2_block_matmul"]
+    applied_split = apply_plan(_plan(scen_split, Edit("fuse_split", operation=_fuse("s0.l0.proj_q", "s0.l0.proj_k"))), scen_split)
+    fused_split = next(op for op in applied_split.executable[0].ops if op.op_id == "rewrite:fuse_split")
+    assert dict(fused_split.metadata)["gm_round_trip_eliminated_bytes"] == 0.0
+    assert fused_split.mte2_bytes == pytest.approx(2.0 * mte2)
+    assert fused_split.hbm_bytes == pytest.approx(2.0 * hbm)
+
+    # Ambiguous multi-output producer without explicit typed port MUST also credit 0 B.
+    g_amb1 = replace(g1, op_id="s0.l0.amb1", deps=("s0.l0.split",), metadata=())
+    g_amb2 = replace(g1, op_id="s0.l0.amb2", deps=("s0.l0.split",), metadata=())
+    scen_amb = resolve_scenario(case, StepRequest("decode", tokens=1, context=64), spine=_SiblingSpine((split_op, g_amb1, g_amb2)))
+    applied_amb = apply_plan(_plan(scen_amb, Edit("fuse_amb", operation=_fuse("s0.l0.amb1", "s0.l0.amb2"))), scen_amb)
+    fused_amb = next(op for op in applied_amb.executable[0].ops if op.op_id == "rewrite:fuse_amb")
+    assert dict(fused_amb.metadata)["gm_round_trip_eliminated_bytes"] == 0.0
+
+    # Mismatched activation group size MUST credit 0 B.
+    g_gs1 = replace(g1, op_id="s0.l0.gs1", metadata=(
+        ("typed_inputs", ({"producer": "s0.l0.norm", "port": "out", "version": 0},)),
+        ("activation_format", "fp8_e4m3"), ("activation_group_size", 32),
+    ))
+    g_gs2 = replace(g1, op_id="s0.l0.gs2", metadata=(
+        ("typed_inputs", ({"producer": "s0.l0.norm", "port": "out", "version": 0},)),
+        ("activation_format", "fp8_e4m3"), ("activation_group_size", 128),
+    ))
+    scen_gs = resolve_scenario(case, StepRequest("decode", tokens=1, context=64), spine=_SiblingSpine((norm_op, g_gs1, g_gs2)))
+    applied_gs = apply_plan(_plan(scen_gs, Edit("fuse_gs", operation=_fuse("s0.l0.gs1", "s0.l0.gs2"))), scen_gs)
+    fused_gs = next(op for op in applied_gs.executable[0].ops if op.op_id == "rewrite:fuse_gs")
+    assert dict(fused_gs.metadata)["gm_round_trip_eliminated_bytes"] == 0.0

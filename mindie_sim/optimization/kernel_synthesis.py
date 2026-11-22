@@ -32,10 +32,19 @@ import hashlib
 import json
 from math import prod
 from pathlib import Path
+import re
 from types import SimpleNamespace
 from typing import Any, Literal
 
+from mindie_sim.prediction.collectives import (
+    OneShotCollective,
+    Topology,
+)
 from mindie_sim.prediction.engine import Engine, Resource
+from mindie_sim.prediction.evaluation import EvaluationContext
+from mindie_sim.prediction.execution.operator_replay import operator_costs
+from mindie_sim.prediction.fusion.pool import register_recipe
+from mindie_sim.prediction.fusion.ports import input_port_entries
 from mindie_sim.prediction.physical_recipe_base import (
     IO_HBM_CATEGORY,
     Phase,
@@ -44,7 +53,9 @@ from mindie_sim.prediction.physical_recipe_base import (
     phased_program,
     tiled_phased_program,
 )
+from mindie_sim.prediction.program import RecipeBook
 from mindie_sim.prediction.program.binding import RecipeContext
+from mindie_sim.prediction.program.primitives import PrimitiveStore
 from mindie_sim.prediction.program.stages import KernelProgram, Stage
 from mindie_sim.prediction.results import OpOccurrence, StepRequest
 from mindie_sim.prediction.runtime import tile_solver
@@ -57,6 +68,7 @@ from mindie_sim.prediction.runtime.tile_solver import (
 from mindie_sim.primitives.loader import resolve_dispatch_envelope, resolve_sim_rate_overlay
 from mindie_sim.rewrite.algebra import (
     FP32_ACCUM_BYTES,
+    MATMUL_SHAPE_RANK,
     MIN_FUSE_MEMBERS,
     UB_DOUBLE_BUFFER_SLOTS,
     AlgebraicCandidate,
@@ -67,12 +79,16 @@ from mindie_sim.rewrite.algebra import (
     discover_algebraic_rewrites_for_ops,
 )
 from mindie_sim.rewrite.schema import (
+    CollectiveTransform,
     Edit,
     FuseRegion,
+    HoistOrDeduplicate,
     KernelBoundary,
     OpRef,
     PortRef,
+    QuantizeContract,
     RewritePlan,
+    SelectTemplate,
     decode_rewrite_plan,
     empty_plan,
     plan_sha256,
@@ -158,6 +174,26 @@ _COLLECTIVE_FAMILIES = frozenset({
     "alltoallv", "mc2", "mc2_transport", "mc2_protocol", "dispatch", "combine",
     "collective", "hccl", "p2p", "tp_allreduce", "engram_ids", "engram_broadcast",
 })
+_COLLECTIVE_FAMILY_ALIASES = {
+    "all_reduce": "allreduce",
+    "tp_allreduce": "allreduce",
+    "all_gather": "allgather",
+    "reducescatter": "reduce_scatter",
+}
+_SUPPORTED_TARGET_OPCODES = (
+    FuseRegion,
+    SelectTemplate,
+    CollectiveTransform,
+    QuantizeContract,
+    HoistOrDeduplicate,
+)
+_NON_MATRIX_PROGRAMS = frozenset({
+    "TiledPointwise",
+    "RingCollective",
+    "PairwiseCollective",
+    "OneShotCollective",
+})
+_EQUATION_IDENT_RE = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\b")
 _INTRA_LINK_SCOPES = frozenset({"", "intra_package", "intra_node", "superpod"})
 _BOUND_LABELS = {
     "memory_bound": "HBM Weight/KV BW Bound",
@@ -205,6 +241,17 @@ class FormulaTensorSpec:
 
 
 @dataclass(frozen=True, slots=True)
+class PipeStageSpec:
+    """One causal compute/communication pipe stage derived from the true operand DAG."""
+
+    name: str
+    pipe_kind: Literal["cube", "vector", "link"]
+    share: float = 1.0
+    after: tuple[str, ...] = ()
+    row_reduction: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class FormulaKernelSpec:
     """Layer-1 declarative mathematical formula specification for unbound kernels."""
 
@@ -226,6 +273,7 @@ class FormulaKernelSpec:
     hbm_bytes_override: float | None = None
     mte2_bytes_override: float | None = None
     mte3_bytes_override: float | None = None
+    pipe_stages: tuple[PipeStageSpec, ...] = ()
 
     def resolved_abi_signature(self) -> str:
         if self.abi_signature_id:
@@ -257,6 +305,7 @@ class FormulaKernelSpec:
         equations: Sequence[str] = (),
         saved_read_bytes: float = 0.0,
         saved_write_bytes: float = 0.0,
+        preserve_port_ids: Sequence[str] = (),
     ) -> FormulaKernelSpec:
         """Construct a ``FormulaKernelSpec`` directly from absorbed atomic ``OpSpec``s."""
         ordered = tuple(ops)
@@ -281,16 +330,16 @@ class FormulaKernelSpec:
         row_red = any(tr.trait in {AlgebraicTrait.ROW_REDUCTION, AlgebraicTrait.ATTENTION_CORE} for tr in traits)
         acts = [tr.activation_kind for tr in traits if tr.activation_kind]
         act_params = tuple(dict(p for tr in traits for p in tr.activation_params).items())
-        comp_eqs = tuple(equations) if equations else tuple(
-            _equation_for_op_spec(op, tr, idx) for idx, (op, tr) in enumerate(zip(ordered, traits))
+        dag_eqs, in_specs, out_specs, _elided = _compose_dag_equations_and_ports(
+            ordered, traits, preserve_port_ids=preserve_port_ids,
         )
-        in_spec = FormulaTensorSpec("x", tuple(ordered[0].local_shape), traits[0].input_dtype, "input")
-        out_spec = FormulaTensorSpec("y", tuple(ordered[-1].local_shape), traits[-1].output_dtype, "output")
+        comp_eqs = tuple(equations) if equations else dag_eqs
+        pipe_stages = _derive_pipe_stages_from_ops(ordered, traits)
         return cls(
             name=kernel_name,
             equations=comp_eqs,
-            inputs=(in_spec,) if in_spec.shape else (),
-            outputs=(out_spec,) if out_spec.shape else (),
+            inputs=in_specs,
+            outputs=out_specs,
             matrix_flops=tuple(sorted(matrix.items())),
             vector_ops_fp32=vec_ops,
             link_bytes=link_b,
@@ -302,6 +351,7 @@ class FormulaKernelSpec:
             hbm_bytes_override=hbm,
             mte2_bytes_override=mte2,
             mte3_bytes_override=mte3,
+            pipe_stages=pipe_stages,
         )
 
 
@@ -371,6 +421,7 @@ class FusedPipelineRecipe:
     abi_signature_id: str = ""
     binding_state: BindingState = "unbound_formula_projection"
     traffic_rewrite_capable: bool = True
+    pipe_stages: tuple[PipeStageSpec, ...] = ()
 
     def bind_context(self, context: RecipeContext) -> RecipeContext:
         """Bind calibrated L0 HBM R:W asymmetry rates when supplied by ``PrimitiveTable``."""
@@ -401,6 +452,94 @@ class FusedPipelineRecipe:
         updated_modes["hbm"] = ("hbm", min(dram_rate, hbm_peak))
         return replace(context, service_modes=updated_modes)
 
+    def _lower_dag_pipe_stages(
+        self, categories: set[str], has_load: bool,
+    ) -> tuple[list[Phase], tuple[str, ...]]:
+        """Emit compute/communication ``Phase`` DAG preserving true operand-DAG order."""
+        active_kinds: set[str] = set()
+        if categories & {"cube", "mte1"}:
+            active_kinds.add("cube")
+        if "vector" in categories:
+            active_kinds.add("vector")
+        if "link" in categories:
+            active_kinds.add("link")
+        if not active_kinds:
+            return [], ("mte2_load",) if has_load else ()
+
+        raw_stages: list[PipeStageSpec] = list(self.pipe_stages)
+        if not raw_stages:
+            prev_name: tuple[str, ...] = ()
+            if "cube" in active_kinds:
+                raw_stages.append(PipeStageSpec("cube_mma", "cube", 1.0, prev_name))
+                prev_name = ("cube_mma",)
+            if "vector" in active_kinds:
+                raw_stages.append(PipeStageSpec("aiv_fp32", "vector", 1.0, prev_name, self.row_reduction))
+                prev_name = ("aiv_fp32",)
+            if "link" in active_kinds:
+                raw_stages.append(PipeStageSpec("link_pipe", "link", 1.0, prev_name))
+
+        # Project declared pipe DAG onto active resource categories while keeping transitive edges.
+        active_names = {st.name for st in raw_stages if st.pipe_kind in active_kinds}
+        eff_preds: dict[str, tuple[str, ...]] = {}
+        for st in raw_stages:
+            preds: list[str] = []
+            for p_name in st.after:
+                if p_name in active_names:
+                    preds.append(p_name)
+                elif p_name in eff_preds:
+                    preds.extend(eff_preds[p_name])
+            eff_preds[st.name] = tuple(dict.fromkeys(preds))
+
+        active_stages = [st for st in raw_stages if st.name in active_names]
+        covered_kinds = {st.pipe_kind for st in active_stages}
+        tail_names = tuple(
+            st.name for st in active_stages
+            if not any(st.name in eff_preds[other.name] for other in active_stages)
+        )
+        for kind, default_name in (("cube", "cube_mma"), ("vector", "aiv_fp32"), ("link", "link_pipe")):
+            if kind in active_kinds and kind not in covered_kinds:
+                st_extra = PipeStageSpec(
+                    default_name, kind, 1.0, tail_names,
+                    row_reduction=(self.row_reduction if kind == "vector" else False),
+                )
+                active_stages.append(st_extra)
+                eff_preds[st_extra.name] = tail_names
+                tail_names = (st_extra.name,)
+
+        share_totals: dict[str, float] = defaultdict(float)
+        for st in active_stages:
+            share_totals[st.pipe_kind] += max(0.0, float(st.share))
+
+        phases: list[Phase] = []
+        term_name: dict[str, str] = {}
+        used_as_pred: set[str] = set()
+        for st in active_stages:
+            total = share_totals[st.pipe_kind]
+            norm_share = (max(0.0, float(st.share)) / total) if total > 0.0 else (1.0 / len(active_stages))
+            preds = tuple(dict.fromkeys(term_name[p] for p in eff_preds.get(st.name, ()) if p in term_name))
+            used_as_pred.update(p for p in eff_preds.get(st.name, ()) if p in term_name)
+            if not preds and has_load:
+                preds = ("mte2_load",)
+            if st.pipe_kind == "cube":
+                cube_w = {role: norm_share for role in ("cube", "mte1") if role in categories}
+                phases.append(Phase(st.name, cube_w, after=preds))
+                term_name[st.name] = st.name
+            elif st.pipe_kind == "vector":
+                if st.row_reduction:
+                    r_name = "aiv_reduce" if st.name == "aiv_fp32" else f"{st.name}_reduce"
+                    e_name = "aiv_epilogue" if st.name == "aiv_fp32" else f"{st.name}_epilogue"
+                    phases.append(Phase(r_name, {"vector": norm_share * HALF_SPLIT_RATIO}, after=preds))
+                    phases.append(Phase(e_name, {"vector": norm_share * HALF_SPLIT_RATIO}, after=(r_name,)))
+                    term_name[st.name] = e_name
+                else:
+                    phases.append(Phase(st.name, {"vector": norm_share}, after=preds))
+                    term_name[st.name] = st.name
+            elif st.pipe_kind == "link":
+                phases.append(Phase(st.name, {"link": norm_share}, after=preds))
+                term_name[st.name] = st.name
+        sinks = tuple(dict.fromkeys(term_name[st.name] for st in active_stages if st.name not in used_as_pred))
+        return phases, sinks or (("mte2_load",) if has_load else ())
+
     def lower(self, context: RecipeContext) -> KernelProgram:
         """Lower declared physical work into a finite multi-pipe tile pipeline."""
         categories = set(_resource_categories(context).values())
@@ -422,18 +561,8 @@ class FusedPipelineRecipe:
             if "mte2" in categories:
                 load_w["mte2"] = 1.0
             phases.append(Phase("mte2_load", load_w))
-        if categories & {"cube", "mte1"}:
-            cube_w = {role: 1.0 for role in ("cube", "mte1") if role in categories}
-            phases.append(Phase("cube_mma", cube_w, after=(phases[-1].name,) if phases else ()))
-        if "vector" in categories:
-            prev = (phases[-1].name,) if phases else ()
-            if self.row_reduction:
-                phases.append(Phase("aiv_reduce", {"vector": HALF_SPLIT_RATIO}, after=prev))
-                phases.append(Phase("aiv_epilogue", {"vector": HALF_SPLIT_RATIO}, after=("aiv_reduce",)))
-            else:
-                phases.append(Phase("aiv_fp32", {"vector": 1.0}, after=prev))
-        if "link" in categories:
-            phases.append(Phase("link_pipe", {"link": 1.0}, after=(phases[-1].name,) if phases else ()))
+        pipe_phases, store_preds = self._lower_dag_pipe_stages(categories, has_load)
+        phases.extend(pipe_phases)
         if has_store:
             store_w: dict[str, float] = {}
             if "hbm" in categories:
@@ -445,7 +574,7 @@ class FusedPipelineRecipe:
             if "fixpipe" in categories:
                 store_w["fixpipe"] = 1.0
             if store_w:
-                phases.append(Phase("mte3_store", store_w, after=(phases[-1].name,) if phases else ()))
+                phases.append(Phase("mte3_store", store_w, after=store_preds))
         if not phases:
             return phased_program(context, ())
         cap = self.tile_count if self.tile_count > 0 else self.tile_cap
@@ -1025,11 +1154,25 @@ def evaluate_formula_kernel(
         hbm_bytes=hbm, mte2_bytes=mte2, mte3_bytes=mte3, link_bytes=float(spec.link_bytes),
     )
     abi_id = spec.resolved_abi_signature()
+    resolved_stages = spec.pipe_stages
+    if not resolved_stages and spec.atomic_ops:
+        resolved_stages = _derive_pipe_stages_from_ops(
+            spec.atomic_ops, tuple(classify_op_traits(op) for op in spec.atomic_ops),
+        )
+    elif not resolved_stages and spec.equations:
+        resolved_stages = _derive_pipe_stages_from_equations(
+            spec.equations,
+            has_cube=has_cube,
+            has_vector=(vec_ops > 0.0),
+            has_link=(spec.link_bytes > 0.0),
+            row_reduction=spec.row_reduction,
+        )
     recipe = FusedPipelineRecipe(
         slots=depth,
         row_reduction=spec.row_reduction,
         abi_signature_id=abi_id,
         binding_state="unbound_formula_projection",
+        pipe_stages=resolved_stages,
     )
     ctx = RecipeContext(
         op=op_stub, work=work_map, resource_names=res_names, rates=res_rates,
@@ -1159,7 +1302,7 @@ def _exposed_length_outside(
             exposed += min(hi, c_lo) - cur
         cur = max(cur, c_hi)
         if cur >= hi:
-            return 0.0
+            return exposed
     return exposed + max(0.0, hi - cur)
 
 
@@ -1204,50 +1347,48 @@ def _overlap_priority_key(node: TargetOpNode) -> tuple[Any, ...]:
 def attribute_node_overlap(
     nodes: Sequence[TargetOpNode],
 ) -> tuple[list[TargetOpNode], dict[str, float]]:
-    """Attribute cross-stream/branch overlap with 100% exact archetype-span conservation."""
-    by_arch: dict[str, list[tuple[int, TargetOpNode]]] = defaultdict(list)
-    for idx, node in enumerate(nodes):
-        by_arch[node.archetype_id].append((idx, node))
-
+    """Attribute cross-stream/cross-archetype overlap globally across the step timeline."""
     updated: list[TargetOpNode] = list(nodes)
     span_by_arch: dict[str, float] = {}
-    for aid, indexed in by_arch.items():
-        all_ivs = [(n.start_us, n.end_us) for _, n in indexed if n.dur_us > 0.0]
-        span_by_arch[aid] = sum(hi - lo for lo, hi in _merge_intervals(all_ivs))
-        ordered = sorted(indexed, key=lambda item: _overlap_priority_key(item[1]))
-        claimed: list[tuple[float, float]] = []
-        claimed_labeled: list[tuple[float, float, str]] = []
-        for idx, node in ordered:
-            if node.dur_us <= 0.0:
-                updated[idx] = replace(node, is_overlapped=False, exposed_dur_us=0.0, masked_by="")
-                continue
-            iv = (node.start_us, node.end_us)
-            exp_us = _exposed_length_outside(iv, claimed)
-            masked_us = max(0.0, node.dur_us - exp_us)
-            fully_hidden = exp_us <= OVERLAP_EXPOSED_EPS_US
-            eff_exp = 0.0 if fully_hidden else exp_us
-            masker = _find_dominant_masker(iv, claimed_labeled) if masked_us > OVERLAP_EXPOSED_EPS_US else ""
-            eff_gap = 0.0 if fully_hidden else max(0.0, eff_exp - node.l_star_lean_us)
-            eff_ratio = None if fully_hidden else (
-                (eff_exp / node.l_star_lean_us) if node.l_star_lean_us > 0.0 else None
-            )
-            b_disp = f"Overlapped by {masker} (0 exposed)" if fully_hidden else node.bound_display
-            updated[idx] = replace(
-                node,
-                is_overlapped=fully_hidden,
-                exposed_dur_us=eff_exp,
-                masked_by=masker,
-                gap_us=eff_gap,
-                gap_ratio=eff_ratio,
-                bound_display=b_disp,
-            )
+    for node in nodes:
+        span_by_arch.setdefault(node.archetype_id, 0.0)
+
+    ordered = sorted(enumerate(nodes), key=lambda item: _overlap_priority_key(item[1]))
+    claimed: list[tuple[float, float]] = []
+    claimed_labeled: list[tuple[float, float, str]] = []
+    for idx, node in ordered:
+        if node.dur_us <= 0.0:
+            updated[idx] = replace(node, is_overlapped=False, exposed_dur_us=0.0, masked_by="")
+            continue
+        iv = (node.start_us, node.end_us)
+        exp_us = _exposed_length_outside(iv, claimed)
+        masked_us = max(0.0, node.dur_us - exp_us)
+        fully_hidden = exp_us <= OVERLAP_EXPOSED_EPS_US
+        eff_exp = 0.0 if fully_hidden else exp_us
+        masker = _find_dominant_masker(iv, claimed_labeled) if masked_us > OVERLAP_EXPOSED_EPS_US else ""
+        eff_gap = 0.0 if fully_hidden else max(0.0, eff_exp - node.l_star_lean_us)
+        eff_ratio = None if fully_hidden else (
+            (eff_exp / node.l_star_lean_us) if node.l_star_lean_us > 0.0 else None
+        )
+        b_disp = f"Overlapped by {masker} (0 exposed)" if fully_hidden else node.bound_display
+        updated[idx] = replace(
+            node,
+            is_overlapped=fully_hidden,
+            exposed_dur_us=eff_exp,
+            masked_by=masker,
+            gap_us=eff_gap,
+            gap_ratio=eff_ratio,
+            bound_display=b_disp,
+        )
+        span_by_arch[node.archetype_id] = span_by_arch.get(node.archetype_id, 0.0) + eff_exp
+        if not fully_hidden:
             claimed = _merge_intervals([*claimed, iv])
             claimed_labeled.append((iv[0], iv[1], _short_primary_label(node)))
     return updated, span_by_arch
 
 
 def reschedule_node_timelines(nodes: Sequence[TargetOpNode]) -> list[TargetOpNode]:
-    """Recompute exact causal ``(start_us, end_us)`` preserving parallel branches."""
+    """Recompute exact causal ``(start_us, end_us)`` preserving parallel and cross-layer overlap."""
     by_arch: dict[str, list[tuple[int, TargetOpNode]]] = defaultdict(list)
     arch_order: list[str] = []
     for idx, node in enumerate(nodes):
@@ -1257,32 +1398,71 @@ def reschedule_node_timelines(nodes: Sequence[TargetOpNode]) -> list[TargetOpNod
 
     updated = list(nodes)
     cursor_us = 0.0
-    for aid in arch_order:
+    prev_arch_orig_end = 0.0
+    global_end_by_occ: dict[Any, float] = {}
+    global_stream_history: dict[tuple[str, int], list[tuple[float, float, float]]] = defaultdict(list)
+    for arch_idx, aid in enumerate(arch_order):
         ordered = sorted(by_arch[aid], key=lambda item: (item[1].start_us, item[1].ordinal))
         end_by_occ: dict[Any, float] = {}
         stream_history: dict[tuple[str, int], list[tuple[float, float, float]]] = defaultdict(list)
         arch_origin = cursor_us
         arch_max_end = arch_origin
+        arch_orig_max = prev_arch_orig_end
         for idx, node in ordered:
-            pred_ready = max((end_by_occ.get(p, arch_origin) for p in node.predecessors), default=arch_origin)
+            overlaps_prev = (
+                arch_idx > 0
+                and node.dur_us > 0.0
+                and node.start_us < prev_arch_orig_end - ORIG_OVERLAP_EPS_US
+            )
+            base_origin = 0.0 if overlaps_prev else arch_origin
+            occ_lookup = global_end_by_occ if overlaps_prev else end_by_occ
+            pred_ready = max((occ_lookup.get(p, base_origin) for p in node.predecessors), default=base_origin)
             s_key = (node.stream, node.stream_index)
-            stream_ready = arch_origin
-            for orig_s, orig_e, new_e in stream_history[s_key]:
+            hist = global_stream_history[s_key] if overlaps_prev else stream_history[s_key]
+            stream_ready = base_origin
+            for orig_s, orig_e, new_e in hist:
                 if node.start_us >= orig_e - ORIG_OVERLAP_EPS_US and orig_e > orig_s:
                     stream_ready = max(stream_ready, new_e)
             new_s = max(pred_ready, stream_ready)
             new_e = new_s + node.dur_us
             end_by_occ[node.occurrence] = new_e
+            global_end_by_occ[node.occurrence] = new_e
             arch_max_end = max(arch_max_end, new_e)
-            stream_history[s_key].append((node.start_us, node.end_us, new_e))
+            arch_orig_max = max(arch_orig_max, node.end_us)
+            entry = (node.start_us, node.end_us, new_e)
+            stream_history[s_key].append(entry)
+            global_stream_history[s_key].append(entry)
             updated[idx] = replace(node, start_us=new_s, end_us=new_e)
         cursor_us = arch_max_end
+        prev_arch_orig_end = arch_orig_max
     return updated
 
 
-def _equation_for_shape(shape: Sequence[int], trait: OpTraitInfo, step_idx: int) -> str:
-    prev = "x" if step_idx == 0 else f"t{step_idx}"
-    out = f"t{step_idx + 1}"
+def _op_input_shape(op: OpSpec, trait: OpTraitInfo) -> tuple[int, ...]:
+    sh = tuple(op.local_shape)
+    if trait.trait == AlgebraicTrait.BILINEAR_MATMUL and len(sh) == MATMUL_SHAPE_RANK:
+        return (int(sh[0]), int(sh[2]))
+    return sh
+
+
+def _op_output_shape(op: OpSpec, trait: OpTraitInfo) -> tuple[int, ...]:
+    sh = tuple(op.local_shape)
+    if trait.trait == AlgebraicTrait.BILINEAR_MATMUL and len(sh) == MATMUL_SHAPE_RANK:
+        return (int(sh[0]), int(sh[1]))
+    return sh
+
+
+def _format_dag_equation(
+    op_id: str,
+    shape: Sequence[int],
+    trait: OpTraitInfo,
+    input_syms: Sequence[str],
+    out_sym: str,
+) -> str:
+    prev = input_syms[0] if input_syms else "x"
+    rhs_second = input_syms[1] if len(input_syms) > 1 else ""
+    all_args = ", ".join(input_syms) if input_syms else "x"
+    out = out_sym
     k = trait.symbolic_op_kind
     gs = trait.group_size or MXFP_BLOCK_GROUP
     shape_tag = "x".join(str(d) for d in shape) if shape else "?"
@@ -1290,22 +1470,24 @@ def _equation_for_shape(shape: Sequence[int], trait: OpTraitInfo, step_idx: int)
         "; " + ", ".join(f"{pk}={pv:g}" for pk, pv in trait.activation_params)
         if trait.activation_params else ""
     )
+    w_tag = _strip_op_prefix(op_id)
+    w_sym = f"W_{w_tag}" if w_tag else "W"
     eq_map = {
         "view_copy": f"{out} = strided_view({prev}) [zero-copy metadata elision]",
-        "grouped_matmul": f"{out} = GroupedMatMul({prev}, W_e^T) [{shape_tag}, L0C FP32]",
-        "matmul": f"{out} = {prev} @ W^T [{shape_tag}, L0C FP32]",
+        "grouped_matmul": f"{out} = GroupedMatMul({prev}, {w_sym}_e^T) [{shape_tag}, L0C FP32]",
+        "matmul": f"{out} = {prev} @ {w_sym}^T [{shape_tag}, L0C FP32]",
         "allgather": f"{out} = AllGather({prev}, axis={trait.collective_axis or 'tp'})",
         "reduce_scatter": f"{out} = ReduceScatter({prev}, SUM, axis={trait.collective_axis or 'tp'})",
-        "all_gather_matmul": f"{out} = AllGather({prev}) @ W_col^T [MC2 pipelined]",
-        "matmul_reduce_scatter": f"{out} = ReduceScatter({prev} @ W_row^T, SUM) [MC2 pipelined]",
-        "add": f"{out} = {prev} + r [UB FP32]",
-        "mul": f"{out} = {prev} * g [UB FP32]",
+        "all_gather_matmul": f"{out} = AllGather({prev}) @ {w_sym}_col^T [MC2 pipelined]",
+        "matmul_reduce_scatter": f"{out} = ReduceScatter({prev} @ {w_sym}_row^T, SUM) [MC2 pipelined]",
+        "add": f"{out} = {prev} + {rhs_second or 'r'} [UB FP32]",
+        "mul": f"{out} = {prev} * {rhs_second or 'g'} [UB FP32]",
         "rmsnorm": f"{out} = ({prev} / sqrt(mean({prev}^2) + eps)) * gamma [UB FP32]",
         "layernorm": f"{out} = (({prev} - mu) / sqrt(var + eps)) * gamma + beta [UB FP32]",
-        "add_rmsnorm": f"{out} = RMSNorm({prev} + r; gamma) [UB FP32]",
-        "add_rmsnorm_quant": f"{out}, s = DynamicQuant(RMSNorm({prev} + r; gamma)) [UB FP32]",
+        "add_rmsnorm": f"{out} = RMSNorm({prev} + {rhs_second or 'r'}; gamma) [UB FP32]",
+        "add_rmsnorm_quant": f"{out}, s = DynamicQuant(RMSNorm({prev} + {rhs_second or 'r'}; gamma)) [UB FP32]",
         "rmsnorm_quant": f"{out}, s = DynamicQuant(RMSNorm({prev}; gamma)) [UB FP32]",
-        "norm_gate": f"{out} = RMSNorm({prev}; gamma) * SiLU(z) [UB FP32]",
+        "norm_gate": f"{out} = RMSNorm({prev}; gamma) * SiLU({rhs_second or 'z'}) [UB FP32]",
         "l2norm": f"{out} = {prev} / (||{prev}||_2 + eps) [UB FP32]",
         "swiglu": f"{out} = SiLU({prev}_gate) * {prev}_up [UB FP32]",
         "situ": f"{out} = SiTU({prev}_gate, {prev}_up{param_txt}) [UB FP32, custom ABI]",
@@ -1321,22 +1503,281 @@ def _equation_for_shape(shape: Sequence[int], trait: OpTraitInfo, step_idx: int)
         "conv1d": f"{out}, S_next = CausalConv1d({prev}, S_conv, W_conv) [rolling UB]",
         "recurrent_scan": f"{out}, H_next = RecurrentStateUpdate({prev}, H_prev) [FP32 state]",
         "recover_ssm": "H_commit = AliasSlotSelect(H_slots, accept_idx) [2D slot alias]",
-        "rotary": f"{out} = RoPE({prev}, cos, sin) [UB FP32]",
+        "rotary": f"{out} = RoPE({all_args}, cos, sin) [UB FP32]",
         "kv_scatter": f"KV_cache[slot] = QuantScatter({prev}) [in-place cache write]",
         "attn_res": f"{out} = Sum_i softmax_i(Norm(h_i) . q_l) * h_i [UB FP32]",
         "mhc_mix": f"{out} = SinkhornMix({prev}, H_pre, H_post) [UB FP32]",
         "attention_update": f"{out}, lse = OnlineSoftmaxMerge({prev}, lse_prev) [FP32]",
         "cast": f"{out} = cast_{trait.output_dtype}({prev})",
     }
-    return eq_map.get(k, f"{out} = {k}({prev}{param_txt}) [{shape_tag}]")
+    return eq_map.get(k, f"{out} = {k}({all_args}{param_txt}) [{shape_tag}]")
 
 
-def _equation_for_atom(node: TargetOpNode, trait: OpTraitInfo, step_idx: int) -> str:
-    return _equation_for_shape(node.shape, trait, step_idx)
+def _extract_op_operand_ports(op: OpSpec) -> list[tuple[str, str, int]]:
+    """Extract ordered ``(producer_id, port_name, version)`` activation operands for ``op``."""
+    ports: list[tuple[str, str, int]] = []
+    meta = dict(op.metadata) if op.metadata else {}
+    for key in ("typed_inputs", "input_ports"):
+        raw = meta.get(key, ())
+        if isinstance(raw, Sequence) and not isinstance(raw, (str, bytes)):
+            for entry in raw:
+                if not isinstance(entry, Mapping):
+                    continue
+                if str(entry.get("role") or "").strip().lower() == "weight":
+                    continue
+                prod_id = entry.get("producer")
+                if isinstance(prod_id, str) and prod_id and prod_id != op.op_id:
+                    pname = str(entry.get("port") or entry.get("output") or entry.get("name") or "output")
+                    ver = int(entry.get("version", entry.get("state_version", 0)) or 0)
+                    ports.append((prod_id, "output" if pname == "out" else pname, ver))
+    if not ports:
+        for dep, port in input_port_entries(op.metadata):
+            if dep and dep != op.op_id:
+                pname = port.removeprefix(dep + ":")
+                if pname != "weight":
+                    ports.append((dep, "output" if pname == "out" else pname, 0))
+    seen_producers = {p[0] for p in ports}
+    for dep in op.deps:
+        if dep and dep != op.op_id and dep not in seen_producers:
+            ports.append((dep, "output", 0))
+            seen_producers.add(dep)
+    return ports
 
 
-def _equation_for_op_spec(op: OpSpec, trait: OpTraitInfo, step_idx: int) -> str:
-    return _equation_for_shape(op.local_shape, trait, step_idx)
+def _compose_dag_equations_and_ports(
+    ops: Sequence[OpSpec],
+    traits: Sequence[OpTraitInfo],
+    *,
+    preserve_port_ids: Sequence[str] = (),
+) -> tuple[tuple[str, ...], tuple[FormulaTensorSpec, ...], tuple[FormulaTensorSpec, ...], tuple[str, ...]]:
+    """Build composed symbolic equations, input/output tensor specs, and elided intermediates from true DAG."""
+    ordered = tuple(ops)
+    if not ordered:
+        return (), (), (), ()
+    member_ids = {op.op_id for op in ordered}
+    preserve_set = set(preserve_port_ids)
+    internal_preds: dict[str, tuple[str, ...]] = {}
+    external_keys: dict[str, tuple[tuple[str, str, int], ...]] = {}
+    internal_users: dict[str, list[str]] = {op.op_id: [] for op in ordered}
+    unique_ext: list[tuple[tuple[str, str, int], OpSpec, OpTraitInfo]] = []
+    seen_ext: set[tuple[str, str, int]] = set()
+
+    for op, tr in zip(ordered, traits):
+        ports = _extract_op_operand_ports(op)
+        int_p = tuple(dict.fromkeys(p[0] for p in ports if p[0] in member_ids))
+        ext_p = tuple(dict.fromkeys(p for p in ports if p[0] not in member_ids))
+        if not int_p and not ext_p:
+            ext_p = ((f"__ext__:{op.op_id}", "output", 0),)
+        internal_preds[op.op_id] = int_p
+        external_keys[op.op_id] = ext_p
+        for pid in int_p:
+            internal_users[pid].append(op.op_id)
+        for ek in ext_p:
+            if ek not in seen_ext:
+                seen_ext.add(ek)
+                unique_ext.append((ek, op, tr))
+
+    ext_sym: dict[tuple[str, str, int], str] = {}
+    in_specs: list[FormulaTensorSpec] = []
+    for idx, (ek, op, tr) in enumerate(unique_ext):
+        sym = "x" if len(unique_ext) == 1 else f"x{idx}"
+        ext_sym[ek] = sym
+        sh = _op_input_shape(op, tr)
+        if sh:
+            in_specs.append(FormulaTensorSpec(sym, sh, tr.input_dtype, "input"))
+
+    live_out_ids = [
+        op.op_id for op in ordered
+        if (not internal_users[op.op_id]) or (op.op_id in preserve_set)
+    ]
+    if not live_out_ids:
+        live_out_ids = [ordered[-1].op_id]
+    live_out_set = set(live_out_ids)
+
+    sym_by_id: dict[str, str] = {}
+    out_specs: list[FormulaTensorSpec] = []
+    temp_idx = 1
+    out_idx = 0
+    for op, tr in zip(ordered, traits):
+        if op.op_id in live_out_set:
+            sym = "y" if len(live_out_ids) == 1 else f"y{out_idx}"
+            out_idx += 1
+            sym_by_id[op.op_id] = sym
+            sh = _op_output_shape(op, tr)
+            if sh:
+                out_specs.append(FormulaTensorSpec(sym, sh, tr.output_dtype, "output"))
+        else:
+            sym_by_id[op.op_id] = f"t{temp_idx}"
+            temp_idx += 1
+
+    equations: list[str] = []
+    for op, tr in zip(ordered, traits):
+        in_syms = tuple(dict.fromkeys([
+            *(sym_by_id[pid] for pid in internal_preds[op.op_id]),
+            *(ext_sym[ek] for ek in external_keys[op.op_id]),
+        ]))
+        equations.append(_format_dag_equation(op.op_id, op.local_shape, tr, in_syms, sym_by_id[op.op_id]))
+    elided_ids = tuple(
+        op.op_id for op in ordered
+        if op.op_id not in live_out_set and internal_users[op.op_id]
+    )
+    return tuple(equations), tuple(in_specs), tuple(out_specs), elided_ids
+
+
+def _condense_pipe_nodes(
+    elem_nodes: Sequence[tuple[str, Literal["cube", "vector", "link"], float, bool, tuple[str, ...]]],
+) -> tuple[PipeStageSpec, ...]:
+    """Condense elementary pipe DAG into acyclic level-grouped ``PipeStageSpec``s."""
+    if not elem_nodes:
+        return ()
+    pipe_by_id: dict[str, Literal["cube", "vector", "link"]] = {}
+    level_by_id: dict[str, int] = {}
+    for eid, pkind, _work, _is_red, preds in elem_nodes:
+        pipe_by_id[eid] = pkind
+        if not preds:
+            level_by_id[eid] = 0
+        else:
+            level_by_id[eid] = max(
+                level_by_id[p] if pipe_by_id[p] == pkind else level_by_id[p] + 1
+                for p in preds if p in level_by_id
+            ) if any(p in level_by_id for p in preds) else 0
+
+    group_key_by_id = {eid: (level_by_id[eid], pipe_by_id[eid]) for eid in pipe_by_id}
+    group_order: list[tuple[int, Literal["cube", "vector", "link"]]] = []
+    group_work: dict[tuple[int, Literal["cube", "vector", "link"]], float] = defaultdict(float)
+    group_red: dict[tuple[int, Literal["cube", "vector", "link"]], bool] = defaultdict(bool)
+    group_preds: dict[tuple[int, Literal["cube", "vector", "link"]], list[tuple[int, Literal["cube", "vector", "link"]]]] = defaultdict(list)
+
+    for eid, pkind, work, is_red, preds in elem_nodes:
+        gk = group_key_by_id[eid]
+        if gk not in group_order:
+            group_order.append(gk)
+        group_work[gk] += max(0.0, float(work))
+        if is_red:
+            group_red[gk] = True
+        for p in preds:
+            if p in group_key_by_id and group_key_by_id[p] != gk:
+                if group_key_by_id[p] not in group_preds[gk]:
+                    group_preds[gk].append(group_key_by_id[p])
+
+    group_order.sort(key=lambda item: (item[0], {"link": 0, "vector": 1, "cube": 2}[item[1]]))
+    counts_by_kind: dict[str, int] = defaultdict(int)
+    for _lvl, pkind in group_order:
+        counts_by_kind[pkind] += 1
+
+    base_names = {"cube": "cube_mma", "vector": "aiv_fp32", "link": "link_pipe"}
+    seen_kind: dict[str, int] = defaultdict(int)
+    stage_name: dict[tuple[int, Literal["cube", "vector", "link"]], str] = {}
+    totals_by_kind: dict[str, float] = defaultdict(float)
+    for gk in group_order:
+        pkind = gk[1]
+        idx = seen_kind[pkind]
+        seen_kind[pkind] += 1
+        stage_name[gk] = base_names[pkind] if counts_by_kind[pkind] == 1 else f"{base_names[pkind]}_{idx}"
+        totals_by_kind[pkind] += group_work[gk]
+
+    stages: list[PipeStageSpec] = []
+    for gk in group_order:
+        pkind = gk[1]
+        tot = totals_by_kind[pkind]
+        share = (group_work[gk] / tot) if tot > 0.0 else (1.0 / float(counts_by_kind[pkind]))
+        after = tuple(stage_name[pgk] for pgk in group_preds[gk] if pgk in stage_name)
+        stages.append(PipeStageSpec(
+            name=stage_name[gk],
+            pipe_kind=pkind,
+            share=share,
+            after=after,
+            row_reduction=bool(group_red[gk]) if pkind == "vector" else False,
+        ))
+    return tuple(stages)
+
+
+def _derive_pipe_stages_from_ops(
+    ops: Sequence[OpSpec], traits: Sequence[OpTraitInfo],
+) -> tuple[PipeStageSpec, ...]:
+    """Derive causal ``PipeStageSpec`` DAG strictly from true operand dependencies."""
+    ordered = tuple(ops)
+    if not ordered:
+        return ()
+    member_ids = {op.op_id for op in ordered}
+    elem_nodes: list[tuple[str, Literal["cube", "vector", "link"], float, bool, tuple[str, ...]]] = []
+    exit_eid: dict[str, tuple[str, ...]] = {}
+
+    for op, tr in zip(ordered, traits):
+        ports = _extract_op_operand_ports(op)
+        int_preds = tuple(dict.fromkeys(p[0] for p in ports if p[0] in member_ids))
+        pred_eids = tuple(dict.fromkeys(eid for pid in int_preds for eid in exit_eid.get(pid, ())))
+        fam = str(op.family or "").strip().lower()
+        cube_w = sum(float(fl) for _, fl in op.matrix_flops) if op.matrix_flops else float(op.flops or 0.0)
+        vec_w = float(op.vector_ops or 0.0)
+        link_w = float(op.link_bytes or 0.0)
+        is_red = tr.trait in {AlgebraicTrait.ROW_REDUCTION, AlgebraicTrait.ATTENTION_CORE}
+
+        if fam == "all_gather_matmul":
+            l_id, c_id = f"{op.op_id}:link", f"{op.op_id}:cube"
+            elem_nodes.append((l_id, "link", max(link_w, 1.0), False, pred_eids))
+            elem_nodes.append((c_id, "cube", max(cube_w, 1.0), False, (l_id,)))
+            exit_eid[op.op_id] = (c_id,)
+            continue
+        if fam == "matmul_reduce_scatter":
+            c_id, l_id = f"{op.op_id}:cube", f"{op.op_id}:link"
+            elem_nodes.append((c_id, "cube", max(cube_w, 1.0), False, pred_eids))
+            elem_nodes.append((l_id, "link", max(link_w, 1.0), False, (c_id,)))
+            exit_eid[op.op_id] = (l_id,)
+            continue
+
+        local_ids: list[str] = []
+        if cube_w > 0.0 or tr.trait == AlgebraicTrait.BILINEAR_MATMUL:
+            cid = f"{op.op_id}:cube"
+            elem_nodes.append((cid, "cube", max(cube_w, 1.0), False, pred_eids))
+            local_ids.append(cid)
+        if vec_w > 0.0 or (not local_ids and tr.trait in {AlgebraicTrait.POINTWISE, AlgebraicTrait.ROW_REDUCTION}):
+            vid = f"{op.op_id}:vec"
+            v_preds = tuple(local_ids) if local_ids else pred_eids
+            elem_nodes.append((vid, "vector", max(vec_w, 1.0), is_red, v_preds))
+            local_ids = [vid]
+        if link_w > 0.0 or (not local_ids and tr.trait == AlgebraicTrait.ASSOCIATIVE_COLLECTIVE):
+            lid = f"{op.op_id}:link"
+            l_preds = tuple(local_ids) if local_ids else pred_eids
+            elem_nodes.append((lid, "link", max(link_w, 1.0), False, l_preds))
+            local_ids = [lid]
+        exit_eid[op.op_id] = tuple(local_ids) if local_ids else pred_eids
+
+    return _condense_pipe_nodes(elem_nodes)
+
+
+def _derive_pipe_stages_from_equations(
+    equations: Sequence[str],
+    *,
+    has_cube: bool,
+    has_vector: bool,
+    has_link: bool,
+    row_reduction: bool,
+) -> tuple[PipeStageSpec, ...]:
+    """Infer causal ``PipeStageSpec`` DAG from declarative ``FormulaKernelSpec.equations``."""
+    elem_nodes: list[tuple[str, Literal["cube", "vector", "link"], float, bool, tuple[str, ...]]] = []
+    producer_by_sym: dict[str, str] = {}
+    for idx, eq in enumerate(equations):
+        lhs, sep, rhs = str(eq).partition("=")
+        rhs_txt = rhs if sep else lhs
+        rhs_low = rhs_txt.lower()
+        if any(tok in rhs_low for tok in ("allgather", "reducescatter", "allreduce", "alltoall")):
+            pkind: Literal["cube", "vector", "link"] = "link"
+        elif "@" in rhs_txt or "matmul" in rhs_low:
+            pkind = "cube"
+        else:
+            pkind = "vector"
+        if (pkind == "cube" and not has_cube) or (pkind == "vector" and not has_vector) or (pkind == "link" and not has_link):
+            continue
+        rhs_idents = _EQUATION_IDENT_RE.findall(rhs_txt)
+        preds = tuple(dict.fromkeys(producer_by_sym[tok] for tok in rhs_idents if tok in producer_by_sym))
+        eid = f"eq:{idx}"
+        is_red = pkind == "vector" and (row_reduction or any(t in rhs_low for t in ("norm", "softmax", "quant")))
+        elem_nodes.append((eid, pkind, 1.0, is_red, preds))
+        if sep:
+            for sym in _EQUATION_IDENT_RE.findall(lhs):
+                producer_by_sym[sym] = eid
+    return _condense_pipe_nodes(elem_nodes)
 
 
 def _verify_sram_residency(
@@ -1355,8 +1796,12 @@ def _verify_sram_residency(
     l0_budget = int(bufs.get("l0c", 0) or 0)
 
     has_cube = any(t.trait == AlgebraicTrait.BILINEAR_MATMUL for t in traits)
-    max_row_ub = max((t.row_working_bytes for t in traits if t.row_working_bytes > 0), default=0)
-    if max_row_ub == 0:
+    has_aiv = any(t.trait != AlgebraicTrait.BILINEAR_MATMUL for t in traits)
+    max_row_ub = (
+        max((t.row_working_bytes for t in traits if t.trait != AlgebraicTrait.BILINEAR_MATMUL and t.row_working_bytes > 0), default=0)
+        if has_aiv else 0
+    )
+    if has_aiv and max_row_ub == 0:
         row_elems = max((int(m.shape[-1]) for m in members if m.shape), default=0)
         max_row_ub = row_elems * FP32_ACCUM_BYTES * UB_DOUBLE_BUFFER_SLOTS
     l1_tile = l0_tile = 0
@@ -1365,7 +1810,7 @@ def _verify_sram_residency(
         w_b = max((_safe_elem_bytes(t.weight_dtype or t.input_dtype) for t in traits if t.trait == AlgebraicTrait.BILINEAR_MATMUL), default=1.0)
         l1_tile = int(CUBE_TILE_MN_ELEMS * CUBE_TILE_K_ELEMS * (a_b + w_b) * UB_DOUBLE_BUFFER_SLOTS)
         l0_tile = int(CUBE_TILE_MN_ELEMS * CUBE_TILE_MN_ELEMS * L0C_ACCUM_BYTES)
-    if max_row_ub <= 0 or ub_budget <= 0:
+    if (has_aiv and (max_row_ub <= 0 or ub_budget <= 0)) or (not has_aiv and not has_cube):
         return "ub_infeasible", "(M=1, N=1, K=1)", max_row_ub, ub_budget, l1_tile, l1_budget, l0_tile, l0_budget, False
 
     hw = SimpleNamespace(
@@ -1376,7 +1821,9 @@ def _verify_sram_residency(
     )
     cands: list[TileCandidate] = []
     for slots in (UB_DOUBLE_BUFFER_SLOTS, 1):
-        live_bufs = [LiveBufferSpec("ub_fp32_work", "ub", max_row_ub, 0, 1, owner_kind="aiv", slots=slots)]
+        live_bufs: list[LiveBufferSpec] = []
+        if has_aiv and max_row_ub > 0:
+            live_bufs.append(LiveBufferSpec("ub_fp32_work", "ub", max_row_ub, 0, 1, owner_kind="aiv", slots=slots))
         if has_cube and l1_budget > 0 and l1_tile > 0:
             live_bufs.append(LiveBufferSpec("l1_cube_tile", "l1", min(l1_tile, l1_budget), 0, 1, owner_kind="aic", slots=1))
         if has_cube and l0_budget > 0 and l0_tile > 0:
@@ -1384,16 +1831,17 @@ def _verify_sram_residency(
         algo: Literal["resident_1pass", "online_reduce"] = (
             "resident_1pass" if slots == UB_DOUBLE_BUFFER_SLOTS else "online_reduce"
         )
+        tile_n = max(1, max_row_ub // FP32_ACCUM_BYTES) if has_aiv else CUBE_TILE_MN_ELEMS
         cands.append(TileCandidate(
             algorithm=algo,
-            tile_shape=TileShape(1, max(1, max_row_ub // FP32_ACCUM_BYTES), CUBE_TILE_K_ELEMS if has_cube else 1),
+            tile_shape=TileShape(1 if has_aiv else CUBE_TILE_MN_ELEMS, tile_n, CUBE_TILE_K_ELEMS if has_cube else 1),
             depth=slots,
             owner_partition=(datapath.aic_count, datapath.aiv_count),
             work_items=1,
             tiles_per_owner=1,
             buffers=tuple(live_bufs),
-            uses_simt=True,
-            owner_axis="aiv",
+            uses_simt=has_aiv,
+            owner_axis="aiv" if has_aiv else "aic",
         ))
     try:
         solved = tile_solver.solve(
@@ -1436,15 +1884,20 @@ def synthesize_kernel_spec(
     eta_target: float = 1.0,
     abi_signature_id: str = "",
     binding_state: BindingState = "unbound_formula_projection",
+    preserve_port_ids: Sequence[str] = (),
 ) -> KernelSynthesisSpec:
-    """Compose symbolic math equations and TileSolver FP32 SRAM residency for a fused kernel."""
-    equations = tuple(
-        _equation_for_atom(node, tr, idx)
-        for idx, (node, tr) in enumerate(zip(members, member_traits))
+    """Compose symbolic math equations and TileSolver FP32 SRAM residency from true operand DAG."""
+    member_ops = tuple(_node_to_op_spec(m, None) for m in members)
+    equations, in_specs, out_specs, elided_ids = _compose_dag_equations_and_ports(
+        member_ops, member_traits, preserve_port_ids=preserve_port_ids,
     )
-    in_t = (f"{_strip_op_prefix(members[0].op_id)}.in[{members[0].dtype}, {list(members[0].shape)}]",)
-    out_t = (f"{_strip_op_prefix(members[-1].op_id)}.out[{members[-1].dtype}, {list(members[-1].shape)}]",)
-    elided_names = tuple(_strip_op_prefix(m.op_id) for m in members[:-1])
+    in_t = tuple(f"{t.name}[{t.dtype}, {list(t.shape)}]" for t in in_specs) or (
+        f"{_strip_op_prefix(members[0].op_id)}.in[{members[0].dtype}, {list(members[0].shape)}]",
+    )
+    out_t = tuple(f"{t.name}[{t.dtype}, {list(t.shape)}]" for t in out_specs) or (
+        f"{_strip_op_prefix(members[-1].op_id)}.out[{members[-1].dtype}, {list(members[-1].shape)}]",
+    )
+    elided_names = tuple(_strip_op_prefix(oid) for oid in elided_ids)
     algo, t_shape, ub_pk, ub_cap, l1_pk, l1_cap, l0_pk, l0_cap, ok = _verify_sram_residency(
         members, member_traits, datapath,
     )
@@ -1501,16 +1954,25 @@ def load_rewrite_plan(
     raise ModelingError(f"unsupported_rewrite_plan_type:{type(rewrite_plan).__name__}")
 
 
-def _node_to_op_spec(node: TargetOpNode, known_ids: set[str]) -> OpSpec:
-    deps = tuple(dict.fromkeys(p.op_id for p in node.predecessors if p.op_id in known_ids and p.op_id != node.op_id))
+def _node_to_op_spec(
+    node: TargetOpNode,
+    known_ids: set[str] | None = None,
+    *,
+    phase: str = "decode",
+) -> OpSpec:
+    deps = tuple(dict.fromkeys(
+        p.op_id for p in node.predecessors
+        if p.op_id != node.op_id and (known_ids is None or p.op_id in known_ids)
+    ))
     if node.spec is not None:
         return replace(node.spec, op_id=node.op_id, deps=deps)
+    matrix_flops = ((node.dtype, float(node.flops)),) if node.flops > 0.0 else ()
     return OpSpec(
         op_id=node.op_id,
         family=node.family,
         stage=node.occurrence.stage,
         layer=0,
-        phase="decode",
+        phase=phase,
         requests=(),
         semantic_shape=node.shape,
         local_shape=node.shape,
@@ -1521,6 +1983,7 @@ def _node_to_op_spec(node: TargetOpNode, known_ids: set[str]) -> OpSpec:
         stream=node.stream,
         dtype=node.dtype,
         flops=node.flops,
+        matrix_flops=matrix_flops,
         vector_ops=node.vector_ops,
         hbm_bytes=node.hbm_total_bytes,
         mte2_bytes=node.mte2_bytes,
@@ -1529,21 +1992,41 @@ def _node_to_op_spec(node: TargetOpNode, known_ids: set[str]) -> OpSpec:
     )
 
 
-def _verify_arch_plan(
+class _TargetPricingContext:
+    """Lazily constructed canonical ``RecipeBook`` + ``EvaluationContext`` + ``Topology``."""
+
+    __slots__ = ("_case", "_primitive_table", "_book", "_eval_ctx")
+
+    def __init__(self, case: Case, primitive_table: Any = None) -> None:
+        self._case = case
+        self._primitive_table = primitive_table
+        self._book: RecipeBook | None = None
+        self._eval_ctx: EvaluationContext | None = None
+
+    def ensure(self) -> tuple[RecipeBook, EvaluationContext, Topology, bool]:
+        if self._book is None or self._eval_ctx is None:
+            self._book = RecipeBook.from_mapping(self._case.runtime.kernels)
+            self._eval_ctx = EvaluationContext.create(
+                self._case, self._book, primitive_table=self._primitive_table,
+            )
+        has_measured = isinstance(self._eval_ctx.cost.primitives, PrimitiveStore)
+        return self._book, self._eval_ctx, self._eval_ctx.bindings.topology, has_measured
+
+
+def _build_target_scenario(
     case: Case,
     arch_ops: Sequence[OpSpec],
     plan: RewritePlan,
     datapath: DatapathCapabilitySpec,
-) -> bool:
-    """Mechanically verify a ``RewritePlan`` against all structural/capacity/conservation gates."""
-    if not plan.edits or not arch_ops:
-        return True
-    from mindie_sim.rewrite.apply import ResolvedScenario, apply_plan
-    from mindie_sim.rewrite.verify import verify_plan
+    *,
+    phase: str = "decode",
+    primitive_table: Any = None,
+) -> Any:
+    from mindie_sim.rewrite.apply import ResolvedScenario
 
-    scenario = ResolvedScenario(
+    return ResolvedScenario(
         case=case,
-        step=StepRequest(phase="decode", tokens=1, context=1),
+        step=StepRequest(phase=phase, tokens=1, context=1),
         stack_id="kernel_synthesis",
         base_graph_sha256=plan.base_graph_sha256,
         framing_sha256=plan.framing_sha256,
@@ -1552,13 +2035,243 @@ def _verify_arch_plan(
         mainline_step=None,
         atomic_ops=(RankOps(0, tuple(arch_ops)),),
         datapath=datapath,
+        primitive_table=primitive_table,
+    )
+
+
+def _validate_supported_plan_opcodes(plan: RewritePlan) -> None:
+    """Explicitly reject opcodes unsupported by ``solve_target_graph``."""
+    for edit in plan.edits:
+        if not isinstance(edit.operation, _SUPPORTED_TARGET_OPCODES):
+            raise ModelingError(
+                f"REWRITE_PLAN_UNSUPPORTED_OPCODE:{edit.edit_id}:{type(edit.operation).__name__}"
+            )
+
+
+def _apply_and_verify_plan(
+    case: Case,
+    arch_ops: Sequence[OpSpec],
+    plan: RewritePlan,
+    datapath: DatapathCapabilitySpec,
+    *,
+    phase: str = "decode",
+    primitive_table: Any = None,
+) -> tuple[Any, Any, Any]:
+    """Run canonical ``apply_plan`` + ``verify_plan`` and return ``(scenario, applied, receipt)``."""
+    from mindie_sim.rewrite.apply import apply_plan
+    from mindie_sim.rewrite.verify import verify_plan
+
+    _validate_supported_plan_opcodes(plan)
+    scenario = _build_target_scenario(
+        case, arch_ops, plan, datapath, phase=phase, primitive_table=primitive_table,
     )
     applied = apply_plan(plan, scenario)
     receipt = verify_plan(scenario, applied, scope="archetype")
-    if not receipt.passed:
-        failed = next((g for g in receipt.gates if not g.passed), receipt.gates[0])
-        raise ModelingError(f"REWRITE_PLAN_REJECTED:{failed.name}:{failed.reason}:{failed.detail}")
-    return True
+    return scenario, applied, receipt
+
+
+def _price_collective_on_topology(
+    op_spec: OpSpec,
+    pricing_ctx: _TargetPricingContext,
+    case: Case,
+    *,
+    mode: str = "oneshot",
+    topology_route: str | None = None,
+    minimum_us: float = 0.0,
+) -> float | None:
+    """Price ``OneShotCollective`` / ``RingCollective`` / ``PairwiseCollective`` on true ``Topology``."""
+    _, _, topology, _ = pricing_ctx.ensure()
+    fam_raw = str(op_spec.family or "").strip().lower()
+    norm_fam = _COLLECTIVE_FAMILY_ALIASES.get(fam_raw, fam_raw)
+    meta = dict(op_spec.metadata) if op_spec.metadata else {}
+    meta.pop("steps", None)
+    if not meta.get("group_axis"):
+        scope_l = str(op_spec.link_scope or "").strip().lower()
+        meta["group_axis"] = scope_l if scope_l in {"tp", "dp", "ep", "cp", "pp", "sp"} else "tp"
+    op_norm = replace(op_spec, family=norm_fam, metadata=tuple(meta.items()))
+
+    if topology_route is not None:
+        valid_modes = {"ring", "pairwise", "oneshot"}
+        groups = topology.groups(
+            meta.get("group_axis", "tp"), 0,
+            int(meta.get("source_stage", op_norm.stage)), metadata=meta,
+        )
+        pairs = (
+            (a, b) for group in groups for a, b in (
+                zip(group, group[1:] + group[:1]) if mode == "ring"
+                else ((a, b) for a in group for b in group)
+            ) if a != b
+        )
+        if (
+            mode not in valid_modes
+            or topology_route not in topology.links
+            or any(not any(name == topology_route for name, _, _ in topology.route(a, b)) for a, b in pairs)
+        ):
+            raise ModelingError(f"rewrite_collective_route_recipe_unbound:{op_spec.op_id}")
+
+    if op_norm.link_bytes <= 0.0:
+        return float(minimum_us) if topology_route is not None else None
+
+    plan_fn = {
+        "oneshot": topology.oneshot_plan,
+        "ring": topology.ring_plan,
+        "pairwise": topology.pairwise_plan,
+    }.get(mode)
+    if plan_fn is None:
+        if topology_route is not None:
+            raise ModelingError(f"rewrite_collective_route_recipe_unbound:{op_spec.op_id}")
+        return None
+
+    try:
+        plan = plan_fn(op_norm, 0)
+    except ModelingError as exc:
+        msg = str(exc)
+        if "complete_local_group" in msg or "joint_collective_group_membership" in msg:
+            dp_count = max(1, int(case.runtime.parallel.dp))
+            participants = {r: float(op_norm.link_bytes) for r in range(dp_count)}
+            try:
+                plan = topology.joint_plan(op_norm, participants, algorithm=mode)
+            except ModelingError:
+                if topology_route is not None:
+                    raise
+                return None
+        elif topology_route is not None:
+            raise
+        else:
+            return None
+
+    if not getattr(plan, "groups", ()) or not any(getattr(g, "messages", ()) for g in plan.groups):
+        return float(minimum_us) if topology_route is not None else None
+    if mode == "oneshot":
+        plan.validate_path_model(OneShotCollective().path_model)
+
+    engine = Engine(topology.resources_for_ranks(plan.ranks), backend="python")
+    ready = engine.submit("ready")
+    done = plan.start(engine, op_norm.op_id, ready)
+    engine.advance(until=(done,))
+    return max(float(done.time) * US_PER_MS, float(minimum_us))
+
+
+def _price_bound_op_on_engine(
+    op_spec: OpSpec,
+    pricing_ctx: _TargetPricingContext,
+    case: Case,
+    *,
+    scenario: Any = None,
+    atomic_entry: Any = None,
+    template_binding: Any = None,
+    applied: Any = None,
+    allow_law2_gemm: bool = False,
+) -> tuple[float, BindingState, str] | None:
+    """Price strictly bound implementations (``RecipeBook``/Catalog/Extension) via ``Engine``."""
+    from mindie_sim.optimization.dsl_solver import catalog_recipe_id, replay_catalog_binding
+
+    book, eval_ctx, _, has_measured = pricing_ctx.ensure()
+    bound_book = book
+    target_op: OpSpec | None = None
+
+    if template_binding is not None:
+        cat = (
+            replay_catalog_binding(scenario, atomic_entry, op_spec, template_binding, applied, None)
+            if (scenario is not None and atomic_entry is not None and applied is not None)
+            else None
+        )
+        if cat is not None:
+            rec_id = catalog_recipe_id(0, op_spec, template_binding, cat[1])
+            bound_book = register_recipe(book, rec_id, cat[0])
+            target_op = replace(op_spec, recipe=rec_id)
+        elif template_binding.template_id in book.recipes:
+            target_op = replace(op_spec, recipe=template_binding.template_id)
+        else:
+            raise ModelingError(
+                f"rewrite_template_recipe_unbound:{op_spec.op_id}:{template_binding.template_id}"
+            )
+    elif op_spec.family == "rewrite_fused":
+        cat = (
+            replay_catalog_binding(scenario, atomic_entry, op_spec, None, applied, None)
+            if (scenario is not None and atomic_entry is not None and applied is not None)
+            else None
+        )
+        if cat is not None:
+            rec_id = catalog_recipe_id(0, op_spec, None, cat[1])
+            bound_book = register_recipe(book, rec_id, cat[0])
+            target_op = replace(op_spec, recipe=rec_id)
+        elif op_spec.recipe in book.recipes:
+            target_op = op_spec
+        elif allow_law2_gemm and len(op_spec.local_shape) == MATMUL_SHAPE_RANK and op_spec.flops > 0.0:
+            gemm_candidate = replace(op_spec, family="gemm", recipe="gemm")
+            selected = book.select(gemm_candidate)
+            if not isinstance(selected, FusedPipelineRecipe):
+                target_op = gemm_candidate
+    elif op_spec.recipe in book.recipes:
+        target_op = op_spec
+
+    if target_op is None:
+        return None
+    report = operator_costs(case, (target_op,), recipes=bound_book, evaluation=eval_ctx)
+    rows = report.get("operators", ())
+    if not rows:
+        return None
+    row = rows[0]
+    program_name = str(row.get("program") or "")
+    if (op_spec.flops > 0.0 or op_spec.matrix_flops) and program_name in _NON_MATRIX_PROGRAMS:
+        raise ModelingError(f"WORK_CONSERVATION_MISMATCH:recipe_drops_matrix:{op_spec.op_id}:{program_name}")
+    if op_spec.link_bytes > 0.0 and program_name == "TiledPointwise":
+        raise ModelingError(f"WORK_CONSERVATION_MISMATCH:recipe_drops_link:{op_spec.op_id}:{program_name}")
+    state: BindingState = "bound_measured" if has_measured else "bound_implementation"
+    return float(row["duration_ms"]) * US_PER_MS, state, program_name
+
+
+def _directional_fused_traffic(
+    group_nodes: Sequence[TargetOpNode],
+    fused_op: OpSpec,
+) -> tuple[float, float, float, float, float, float]:
+    """Return exact directional ``(hbm_r, hbm_w, mte2, mte3, useful_hbm, elided_hbm)``."""
+    raw_hbm = sum(float(n.hbm_total_bytes) for n in group_nodes)
+    raw_mte2 = sum(float(n.mte2_bytes) for n in group_nodes)
+    raw_mte3 = sum(float(n.mte3_bytes) for n in group_nodes)
+    raw_hbm_r = sum(float(n.hbm_read_bytes) for n in group_nodes)
+    raw_hbm_w = sum(float(n.hbm_write_bytes) for n in group_nodes)
+
+    saved_read = max(0.0, raw_mte2 - float(fused_op.mte2_bytes)) if raw_mte2 > 0.0 else (
+        max(0.0, raw_hbm - float(fused_op.hbm_bytes))
+    )
+    saved_write = max(0.0, raw_mte3 - float(fused_op.mte3_bytes)) if raw_mte3 > 0.0 else 0.0
+    mte2 = max(0.0, float(fused_op.mte2_bytes)) if raw_mte2 > 0.0 else max(0.0, raw_hbm_r - saved_read)
+    mte3 = max(0.0, float(fused_op.mte3_bytes)) if raw_mte3 > 0.0 else max(0.0, raw_hbm_w - saved_write)
+    hbm_r = max(0.0, raw_hbm_r - saved_read) if raw_hbm_r > 0.0 else mte2
+    hbm_w = max(0.0, raw_hbm_w - saved_write) if raw_hbm_w > 0.0 else mte3
+    useful_hbm = max(0.0, float(fused_op.hbm_bytes)) if raw_hbm > 0.0 else (hbm_r + hbm_w)
+    elided_hbm = max(0.0, raw_hbm - useful_hbm)
+    return hbm_r, hbm_w, mte2, mte3, useful_hbm, elided_hbm
+
+
+def _compute_fused_demand_and_bound(
+    group_demands: Sequence[tuple[int, int, int, int, int]],
+    hbm_r: float,
+    hbm_w: float,
+    useful_hbm: float,
+    peaks: Mapping[str, Any],
+) -> tuple[tuple[int, int, int, int, int], str]:
+    hbm_peak = float(peaks.get("hbm_peak_bytes_per_s") or 1.0)
+    hbm_r_rate = max(float(peaks.get("hbm_read_bytes_per_s") or hbm_peak), 1.0)
+    hbm_w_rate = max(float(peaks.get("hbm_write_bytes_per_s") or hbm_peak), 1.0)
+    alpha = float(peaks.get("hbm_rw_alpha", 1.0) if "hbm_rw_alpha" in peaks else 1.0)
+    hbm_r_ns = int((hbm_r + alpha * hbm_w) / hbm_r_rate * NS_PER_SECOND) if useful_hbm > 0.0 else 0
+    hbm_w_ns = int((hbm_w + alpha * hbm_r) / hbm_w_rate * NS_PER_SECOND) if useful_hbm > 0.0 else 0
+    cube_ns = sum(d[0] for d in group_demands)
+    vec_ns = sum(d[1] for d in group_demands)
+    link_ns = sum(d[4] for d in group_demands)
+    demand = (cube_ns, vec_ns, hbm_r_ns, hbm_w_ns, link_ns)
+    hbm_ns = max(hbm_r_ns, hbm_w_ns)
+    dom_bound = (
+        "link_bound" if link_ns > max(cube_ns, vec_ns, hbm_ns) and link_ns > 0 else (
+            "memory_bound" if hbm_ns >= max(cube_ns, vec_ns) and hbm_ns > 0 else (
+                "cube_bound" if cube_ns >= vec_ns and cube_ns > 0 else "vector_bound"
+            )
+        )
+    )
+    return demand, dom_bound
 
 
 def _resolve_candidate_metadata(
@@ -1638,90 +2351,31 @@ def _resolve_candidate_metadata(
     )
 
 
-def _collapse_candidate_group(
-    group_nodes: Sequence[TargetOpNode],
-    group_demands: Sequence[tuple[int, int, int, int, int]],
-    cand: AlgebraicCandidate,
-    member_traits: Sequence[OpTraitInfo],
-    floors: SkuTargetFloors,
-    peaks: Mapping[str, Any],
-    case: Case,
-    datapath: DatapathCapabilitySpec,
+def _build_fused_target_node(
     *,
-    primitive_table: Any = None,
-    allow_unbound_formula: bool = True,
-) -> tuple[TargetOpNode, tuple[int, int, int, int, int], KernelSynthesisSpec] | None:
-    """Collapse a verified candidate into one fused ``TargetOpNode`` via ``Engine`` + ``TileSolver``."""
-    suffix, role, kern, backend, status, needs_new, b_state = _resolve_candidate_metadata(
-        cand, group_nodes, member_traits, floors,
-    )
-    if b_state == "unbound_formula_projection" and not allow_unbound_formula:
-        return None
+    group_nodes: Sequence[TargetOpNode],
+    fused_op: OpSpec,
+    demand: tuple[int, int, int, int, int],
+    dom_bound: str,
+    new_op_id: str,
+    new_family: str,
+    suffix: str,
+    role: str,
+    kern: str,
+    backend: str,
+    status: str,
+    needs_new: bool,
+    b_state: BindingState,
+    dur_us: float,
+    l_star_us: float,
+    hbm_r: float,
+    hbm_w: float,
+    mte2: float,
+    mte3: float,
+    useful_hbm: float,
+    spec: KernelSynthesisSpec,
+) -> TargetOpNode:
     anchor = group_nodes[0]
-    raw_hbm = sum(n.hbm_total_bytes for n in group_nodes)
-    avoid = min(raw_hbm, float(cand.avoidable_hbm_bytes))
-    useful_hbm = max(0.0, raw_hbm - avoid)
-    if useful_hbm <= 0.0 and raw_hbm > 0.0:
-        useful_hbm = max(n.hbm_total_bytes for n in group_nodes)
-    hbm_r = useful_hbm * HALF_SPLIT_RATIO
-    hbm_w = useful_hbm * HALF_SPLIT_RATIO
-
-    group_ops = tuple(_node_to_op_spec(n, {m.op_id for m in group_nodes}) for n in group_nodes)
-    equations = tuple(_equation_for_atom(n, tr, idx) for idx, (n, tr) in enumerate(zip(group_nodes, member_traits)))
-    formula_spec = replace(
-        FormulaKernelSpec.from_ops(group_ops, name=kern, equations=equations),
-        hbm_bytes_override=useful_hbm,
-        mte2_bytes_override=hbm_r,
-        mte3_bytes_override=hbm_w,
-    )
-    eval_res = evaluate_formula_kernel(formula_spec, case, primitive_table=primitive_table)
-    if not eval_res.sram_verified:
-        return None
-
-    hbm_peak = float(peaks.get("hbm_peak_bytes_per_s") or 1.0)
-    hbm_r_rate = max(float(peaks.get("hbm_read_bytes_per_s") or hbm_peak), 1.0)
-    hbm_w_rate = max(float(peaks.get("hbm_write_bytes_per_s") or hbm_peak), 1.0)
-    alpha = float(peaks.get("hbm_rw_alpha", 1.0) if "hbm_rw_alpha" in peaks else 1.0)
-    hbm_r_ns = int((hbm_r + alpha * hbm_w) / hbm_r_rate * NS_PER_SECOND) if useful_hbm > 0.0 else 0
-    hbm_w_ns = int((hbm_w + alpha * hbm_r) / hbm_w_rate * NS_PER_SECOND) if useful_hbm > 0.0 else 0
-    cube_ns = sum(d[0] for d in group_demands)
-    vec_ns = sum(d[1] for d in group_demands)
-    link_ns = sum(d[4] for d in group_demands)
-    demand = (cube_ns, vec_ns, hbm_r_ns, hbm_w_ns, link_ns)
-    l_star_us = max(float(max(demand)) / NS_PER_US, eval_res.l_star_us)
-
-    before_sum_us = sum(n.dur_us for n in group_nodes)
-    t_target = max(eval_res.projected_us, l_star_us)
-    if cand.law == "law3_mc2":
-        t_target = max(t_target, floors.mc2_sync_us + float(link_ns) / NS_PER_US)
-    dur_us = min(before_sum_us, t_target)
-    if dur_us >= before_sum_us - SAVING_POSITIVE_EPS_US:
-        return None
-
-    achieved_eta = min(1.0, l_star_us / dur_us) if dur_us > 0.0 and l_star_us > 0.0 else 1.0
-    spec = synthesize_kernel_spec(
-        spec_id=cand.candidate_id,
-        kernel_name=kern,
-        abi_tier=cand.fusion_tier,
-        suggested_backend=backend,
-        status_tag=status,
-        opt_pillar="pillar3_comm" if cand.law == "law3_mc2" else "pillar1_fusion",
-        members=group_nodes,
-        member_traits=member_traits,
-        datapath=datapath,
-        elided_hbm_bytes=int(round(max(0.0, raw_hbm - useful_hbm))),
-        l_star_us=l_star_us,
-        before_us=before_sum_us,
-        target_us=dur_us,
-        eta_target=achieved_eta,
-        abi_signature_id=eval_res.abi_signature_id,
-        binding_state=b_state,
-    )
-    if not spec.sram_verified:
-        return None
-
-    prefix = anchor.op_id[: len(anchor.op_id) - len(_strip_op_prefix(anchor.op_id))]
-    new_op_id = f"{prefix}{suffix}"
     absorbed = tuple(dict.fromkeys(
         s for n in group_nodes for s in (n.absorbed_source_ops or (_strip_op_prefix(n.op_id),))
     ))
@@ -1729,39 +2383,27 @@ def _collapse_candidate_group(
     group_occs = {n.occurrence for n in group_nodes}
     ext_preds = tuple(dict.fromkeys(p for n in group_nodes for p in n.predecessors if p not in group_occs))
     new_occ = replace(anchor.occurrence, op_id=new_op_id)
-    hbm_ns = max(hbm_r_ns, hbm_w_ns)
-    dom_bound = (
-        "link_bound" if link_ns > max(cube_ns, vec_ns, hbm_ns) and link_ns > 0 else (
-            "memory_bound" if hbm_ns >= max(cube_ns, vec_ns) and hbm_ns > 0 else (
-                "cube_bound" if cube_ns >= vec_ns and cube_ns > 0 else "vector_bound"
-            )
-        )
-    )
-    new_family = (
-        "all_gather_matmul" if cand.abi_id == "aclnnAllGatherMatmulV2" else (
-            "matmul_reduce_scatter" if cand.abi_id == "aclnnMatmulReduceScatterV2" else anchor.family
-        )
-    )
-    fused_node = replace(
+    return replace(
         anchor,
         occurrence=new_occ,
         op_id=new_op_id,
         family=new_family,
         recipe=suffix,
+        shape=tuple(fused_op.local_shape) if fused_op.local_shape else anchor.shape,
         predecessors=ext_preds,
         start_us=min(n.start_us for n in group_nodes),
         end_us=min(n.start_us for n in group_nodes) + dur_us,
         dur_us=dur_us,
         exposed_dur_us=dur_us,
-        flops=sum(n.flops for n in group_nodes),
-        vector_ops=sum(n.vector_ops for n in group_nodes),
+        flops=float(fused_op.flops),
+        vector_ops=float(fused_op.vector_ops),
         hbm_read_bytes=hbm_r,
         hbm_write_bytes=hbm_w,
         hbm_total_bytes=useful_hbm,
-        mte2_bytes=hbm_r,
-        mte3_bytes=hbm_w,
+        mte2_bytes=mte2,
+        mte3_bytes=mte3,
         fixpipe_bytes=0.0,
-        link_bytes=sum(n.link_bytes for n in group_nodes),
+        link_bytes=float(fused_op.link_bytes),
         dominant_bound=dom_bound,
         bound_display=_BOUND_LABELS.get(dom_bound, dom_bound),
         l_star_lean_us=l_star_us,
@@ -1779,10 +2421,176 @@ def _collapse_candidate_group(
         canonical_op_key=suffix,
         opt_pillar=spec.opt_pillar,
         opt_attainment_pct=spec.target_attainment_pct,
+        spec=fused_op,
         synthesis_spec=spec,
         binding_state=b_state,
     )
-    return fused_node, demand, spec
+
+
+def _external_read_member_ids(
+    member_ids: Sequence[str],
+    graph_ops: Sequence[OpSpec],
+) -> tuple[str, ...]:
+    """Return member IDs consumed by any external op in ``graph_ops`` across deps/ports/named inputs."""
+    keys = set(member_ids)
+    read_set: set[str] = set()
+    for op in graph_ops:
+        if op.op_id in keys:
+            continue
+        for dep in op.deps:
+            if dep in keys:
+                read_set.add(dep)
+        for dep, _ in input_port_entries(op.metadata):
+            if dep in keys:
+                read_set.add(dep)
+        for mkey, mval in op.metadata:
+            if (
+                mkey in {"typed_inputs", "input_ports"}
+                and isinstance(mval, Sequence)
+                and not isinstance(mval, (str, bytes))
+            ):
+                for entry in mval:
+                    if isinstance(entry, Mapping) and entry.get("producer") in keys:
+                        read_set.add(str(entry["producer"]))
+            elif mkey.endswith("_producer") and isinstance(mval, str) and mval in keys:
+                read_set.add(mval)
+    return tuple(mid for mid in member_ids if mid in read_set)
+
+
+def _collapse_candidate_group(
+    group_nodes: Sequence[TargetOpNode],
+    group_demands: Sequence[tuple[int, int, int, int, int]],
+    cand: AlgebraicCandidate,
+    member_traits: Sequence[OpTraitInfo],
+    arch_ops: Sequence[OpSpec],
+    floors: SkuTargetFloors,
+    peaks: Mapping[str, Any],
+    case: Case,
+    datapath: DatapathCapabilitySpec,
+    pricing_ctx: _TargetPricingContext,
+    *,
+    edit_id: str,
+    verify_ops: Sequence[OpSpec] | None = None,
+    phase: str = "decode",
+    primitive_table: Any = None,
+    allow_unbound_formula: bool = True,
+) -> tuple[TargetOpNode, tuple[int, int, int, int, int], KernelSynthesisSpec, Edit] | None:
+    """Collapse a verified candidate via canonical ``apply_plan`` + bound/formula pricing."""
+    suffix, role, kern, backend, status, needs_new, meta_state = _resolve_candidate_metadata(
+        cand, group_nodes, member_traits, floors,
+    )
+    plan_ops = verify_ops if verify_ops is not None else arch_ops
+    eff_preserve_ids = tuple(dict.fromkeys((
+        *cand.preserve_port_ids,
+        *_external_read_member_ids(cand.member_ids, plan_ops),
+    )))
+    refs = tuple(OpRef("atom", mid) for mid in cand.member_ids)
+    edit = Edit(
+        edit_id=edit_id,
+        operation=FuseRegion(
+            members=refs,
+            preserve_ports=tuple(PortRef(OpRef("atom", mid), "output", 0) for mid in eff_preserve_ids),
+            kernel_boundaries=(KernelBoundary(cand.abi_id, refs),),
+            fusion_tier=cand.fusion_tier,
+        ),
+    )
+    trial_plan = RewritePlan(edits=(edit,))
+    try:
+        scenario, applied, receipt = _apply_and_verify_plan(
+            case, plan_ops, trial_plan, datapath, phase=phase, primitive_table=primitive_table,
+        )
+    except ModelingError:
+        return None
+    if not receipt.passed:
+        return None
+
+    fused_op_id = f"rewrite:{edit_id}"
+    fused_op = next((op for op in applied.executable[0].ops if op.op_id == fused_op_id), None)
+    if fused_op is None:
+        return None
+
+    hbm_r, hbm_w, mte2, mte3, useful_hbm, elided_hbm = _directional_fused_traffic(group_nodes, fused_op)
+    demand, dom_bound = _compute_fused_demand_and_bound(group_demands, hbm_r, hbm_w, useful_hbm, peaks)
+    l_star_us = float(max(demand)) / NS_PER_US
+
+    try:
+        bound_res = _price_bound_op_on_engine(
+            fused_op, pricing_ctx, case,
+            scenario=scenario, atomic_entry=scenario.atomic_ops[0], applied=applied,
+            allow_law2_gemm=(cand.law == "law2_block_matmul"),
+        )
+    except ModelingError:
+        bound_res = None
+    if bound_res is not None:
+        projected_us, b_state, _prog = bound_res
+        abi_sig = cand.abi_id
+    else:
+        if not allow_unbound_formula:
+            return None
+        group_ops = tuple(_node_to_op_spec(n, None, phase=phase) for n in group_nodes)
+        formula_spec = replace(
+            FormulaKernelSpec.from_ops(
+                group_ops, name=kern, preserve_port_ids=eff_preserve_ids,
+            ),
+            hbm_bytes_override=useful_hbm,
+            mte2_bytes_override=mte2,
+            mte3_bytes_override=mte3,
+        )
+        eval_res = evaluate_formula_kernel(formula_spec, case, primitive_table=primitive_table)
+        if not eval_res.sram_verified:
+            return None
+        projected_us = eval_res.projected_us
+        l_star_us = max(l_star_us, eval_res.l_star_us)
+        abi_sig = eval_res.abi_signature_id
+        b_state = "unbound_formula_projection"
+
+    before_sum_us = sum(n.dur_us for n in group_nodes)
+    t_target = max(projected_us, l_star_us)
+    if cand.law == "law3_mc2":
+        t_target = max(t_target, floors.mc2_sync_us + float(demand[4]) / NS_PER_US)
+    dur_us = min(before_sum_us, t_target)
+    if dur_us >= before_sum_us - SAVING_POSITIVE_EPS_US:
+        return None
+
+    achieved_eta = min(1.0, l_star_us / dur_us) if dur_us > 0.0 and l_star_us > 0.0 else 1.0
+    spec = synthesize_kernel_spec(
+        spec_id=cand.candidate_id,
+        kernel_name=kern,
+        abi_tier=cand.fusion_tier,
+        suggested_backend=backend,
+        status_tag=status,
+        opt_pillar="pillar3_comm" if cand.law == "law3_mc2" else "pillar1_fusion",
+        members=group_nodes,
+        member_traits=member_traits,
+        datapath=datapath,
+        elided_hbm_bytes=int(round(elided_hbm)),
+        l_star_us=l_star_us,
+        before_us=before_sum_us,
+        target_us=dur_us,
+        eta_target=achieved_eta,
+        abi_signature_id=abi_sig,
+        binding_state=b_state,
+        preserve_port_ids=eff_preserve_ids,
+    )
+    if not spec.sram_verified:
+        return None
+
+    anchor = group_nodes[0]
+    prefix = anchor.op_id[: len(anchor.op_id) - len(_strip_op_prefix(anchor.op_id))]
+    new_op_id = f"{prefix}{suffix}"
+    new_family = (
+        "all_gather_matmul" if cand.abi_id == "aclnnAllGatherMatmulV2" else (
+            "matmul_reduce_scatter" if cand.abi_id == "aclnnMatmulReduceScatterV2" else anchor.family
+        )
+    )
+    fused_node = _build_fused_target_node(
+        group_nodes=group_nodes, fused_op=fused_op, demand=demand, dom_bound=dom_bound,
+        new_op_id=new_op_id, new_family=new_family, suffix=suffix, role=role, kern=kern,
+        backend=backend, status=status, needs_new=(needs_new or meta_state == "unbound_formula_projection"),
+        b_state=b_state, dur_us=dur_us, l_star_us=l_star_us,
+        hbm_r=hbm_r, hbm_w=hbm_w, mte2=mte2, mte3=mte3, useful_hbm=useful_hbm, spec=spec,
+    )
+    return fused_node, demand, spec, edit
 
 
 def _rewire_node_preds(
@@ -1790,63 +2598,246 @@ def _rewire_node_preds(
 ) -> list[TargetOpNode]:
     if not occ_remap:
         return list(nodes)
+    valid_occs = {n.occurrence for n in nodes}
     return [
         replace(
             n,
             predecessors=tuple(dict.fromkeys(
-                occ_remap.get(p, p) for p in n.predecessors if occ_remap.get(p, p) != n.occurrence
+                mapped for p in n.predecessors
+                if (mapped := occ_remap.get(p, p)) != n.occurrence and mapped in valid_occs
             )),
         )
         for n in nodes
     ]
 
 
-def _extract_external_candidates(
-    ext_plan: RewritePlan | None,
-    arch_ops: Sequence[OpSpec],
-    traits_map: Mapping[str, OpTraitInfo],
+def _materialize_external_fused_op(
+    op: OpSpec,
+    member_ids: tuple[str, ...],
+    node_by_id: Mapping[str, TargetOpNode],
+    dem_by_id: Mapping[str, tuple[int, int, int, int, int]],
+    template_binding: Any,
+    scenario: Any,
+    applied: Any,
+    peaks: Mapping[str, Any],
     case: Case,
     datapath: DatapathCapabilitySpec,
-) -> list[AlgebraicCandidate]:
-    """Verify external Agent ``FuseRegion`` edits through ``verify_plan`` and lift to candidates."""
-    if ext_plan is None or not ext_plan.edits:
-        return []
-    op_ids = {op.op_id for op in arch_ops}
-    matching_edits: list[Edit] = []
-    for edit in ext_plan.edits:
-        op = edit.operation
-        if isinstance(op, FuseRegion):
-            m_ids = tuple(ref.id for ref in op.members)
-            if m_ids and all(mid in op_ids for mid in m_ids):
-                matching_edits.append(edit)
-    if not matching_edits:
-        return []
-    sub_plan = RewritePlan(
-        base_graph_sha256=ext_plan.base_graph_sha256,
-        framing_sha256=ext_plan.framing_sha256,
-        edits=tuple(matching_edits),
+    pricing_ctx: _TargetPricingContext,
+    *,
+    phase: str,
+    primitive_table: Any,
+    allow_unbound_formula: bool,
+) -> tuple[TargetOpNode, tuple[int, int, int, int, int], KernelSynthesisSpec]:
+    """Price and materialize an explicit caller ``FuseRegion`` applied by ``apply_plan``."""
+    group_nodes = [node_by_id[mid] for mid in member_ids if mid in node_by_id]
+    group_dems = [dem_by_id[mid] for mid in member_ids if mid in dem_by_id]
+    group_ops = tuple(_node_to_op_spec(n, None, phase=phase) for n in group_nodes)
+    member_traits = tuple(classify_op_traits(item) for item in group_ops)
+
+    edit = next((e for e in applied.plan.edits if op.op_id == f"rewrite:{e.edit_id}"), None)
+    freg = edit.operation if (edit is not None and isinstance(edit.operation, FuseRegion)) else None
+    preserve_ids = tuple(p.op.id for p in freg.preserve_ports) if freg is not None else ()
+    tier = freg.fusion_tier if freg is not None else "K2_epilogue"
+    abi = op.recipe or (freg.kernel_boundaries[-1].abi_id if (freg and freg.kernel_boundaries) else op.op_id)
+
+    hbm_r, hbm_w, mte2, mte3, useful_hbm, elided_hbm = _directional_fused_traffic(group_nodes, op)
+    demand, dom_bound = _compute_fused_demand_and_bound(group_dems, hbm_r, hbm_w, useful_hbm, peaks)
+    l_star_us = float(max(demand)) / NS_PER_US
+
+    bound_res = _price_bound_op_on_engine(
+        op, pricing_ctx, case,
+        scenario=scenario, atomic_entry=scenario.atomic_ops[0],
+        template_binding=template_binding, applied=applied,
+        allow_law2_gemm=False,
     )
-    _verify_arch_plan(case, arch_ops, sub_plan, datapath)
-    out: list[AlgebraicCandidate] = []
-    op_by_id = {op.op_id: op for op in arch_ops}
-    for edit in matching_edits:
-        freg = edit.operation
-        assert isinstance(freg, FuseRegion)
-        m_ids = tuple(ref.id for ref in freg.members)
-        abi = freg.kernel_boundaries[0].abi_id if freg.kernel_boundaries else f"AgentFused_{edit.edit_id}"
-        avoid = sum(int(op_by_id[mid].hbm_bytes or 0) for mid in m_ids[:-1]) // 2
-        out.append(AlgebraicCandidate(
-            candidate_id=f"agent_{edit.edit_id}",
-            law="law1_ub_chain",
-            abi_id=abi,
-            fusion_tier=freg.fusion_tier,
-            member_ids=m_ids,
-            preserve_port_ids=tuple(p.op.id for p in freg.preserve_ports),
-            shipping_supported=(freg.fusion_tier == "K1_shipping"),
-            avoidable_hbm_bytes=avoid,
-            traits=tuple(traits_map[mid].trait.value for mid in m_ids if mid in traits_map),
+    if bound_res is not None:
+        dur_us, b_state, _prog = bound_res
+        abi_sig = template_binding.template_id if template_binding is not None else abi
+        needs_new = False
+        status = f"[配置/算子融合: {abi_sig} -> 绑定实现]"
+    else:
+        if not allow_unbound_formula:
+            raise ModelingError(f"rewrite_fusion_recipe_unbound:{op.op_id}:{abi}")
+        formula_spec = replace(
+            FormulaKernelSpec.from_ops(group_ops, name=abi, preserve_port_ids=preserve_ids),
+            hbm_bytes_override=useful_hbm,
+            mte2_bytes_override=mte2,
+            mte3_bytes_override=mte3,
+        )
+        eval_res = evaluate_formula_kernel(formula_spec, case, primitive_table=primitive_table)
+        if not eval_res.sram_verified:
+            raise ModelingError(
+                f"MULTI_POOL_CAPACITY:{op.op_id}:{eval_res.tile_algorithm}"
+                f":ub={eval_res.ub_peak_bytes}>{eval_res.ub_budget_bytes}"
+            )
+        dur_us = max(eval_res.projected_us, l_star_us)
+        l_star_us = max(l_star_us, eval_res.l_star_us)
+        abi_sig = eval_res.abi_signature_id
+        b_state = "unbound_formula_projection"
+        needs_new = True
+        status = f"{STATUS_NEW_OP} {abi} (UB FP32 驻留融合)"
+
+    before_sum_us = sum(n.dur_us for n in group_nodes)
+    achieved_eta = min(1.0, l_star_us / dur_us) if dur_us > 0.0 and l_star_us > 0.0 else 1.0
+    spec = synthesize_kernel_spec(
+        spec_id=f"plan_{edit.edit_id}" if edit is not None else op.op_id,
+        kernel_name=abi,
+        abi_tier=tier,
+        suggested_backend=BACKEND_TRITON_LABEL if needs_new else BACKEND_CANN_LABEL,
+        status_tag=status,
+        opt_pillar="pillar1_fusion",
+        members=group_nodes,
+        member_traits=member_traits,
+        datapath=datapath,
+        elided_hbm_bytes=int(round(elided_hbm)),
+        l_star_us=l_star_us,
+        before_us=before_sum_us,
+        target_us=dur_us,
+        eta_target=achieved_eta,
+        abi_signature_id=abi_sig,
+        binding_state=b_state,
+        preserve_port_ids=preserve_ids,
+    )
+    if not spec.sram_verified and b_state == "unbound_formula_projection":
+        raise ModelingError(
+            f"MULTI_POOL_CAPACITY:{op.op_id}:{spec.tile_algorithm}"
+            f":ub={spec.ub_peak_bytes}>{spec.ub_budget_bytes}"
+        )
+    fused_node = _build_fused_target_node(
+        group_nodes=group_nodes, fused_op=op, demand=demand, dom_bound=dom_bound,
+        new_op_id=op.op_id, new_family="rewrite_fused", suffix=abi,
+        role=f"RewritePlan Fused ({' + '.join(_strip_op_prefix(m.op_id) for m in group_nodes)})",
+        kern=abi, backend=BACKEND_TRITON_LABEL if needs_new else BACKEND_CANN_LABEL,
+        status=status, needs_new=needs_new, b_state=b_state,
+        dur_us=dur_us, l_star_us=l_star_us,
+        hbm_r=hbm_r, hbm_w=hbm_w, mte2=mte2, mte3=mte3, useful_hbm=useful_hbm, spec=spec,
+    )
+    return fused_node, demand, spec
+
+
+def _materialize_external_plan(
+    nodes: Sequence[TargetOpNode],
+    demands: Sequence[tuple[int, int, int, int, int]],
+    ext_plan: RewritePlan,
+    case: Case,
+    datapath: DatapathCapabilitySpec,
+    floors: SkuTargetFloors,
+    peaks: Mapping[str, Any],
+    pricing_ctx: _TargetPricingContext,
+    *,
+    phase: str,
+    primitive_table: Any,
+    allow_unbound_formula: bool,
+) -> tuple[
+    list[TargetOpNode],
+    list[tuple[int, int, int, int, int]],
+    list[KernelSynthesisSpec],
+    set[str],
+    dict[OpOccurrence, OpOccurrence],
+]:
+    """Execute and price ALL supported caller ``RewritePlan`` edits via canonical ``apply_plan``."""
+    all_known = {n.op_id for n in nodes}
+    base_ops = [_node_to_op_spec(n, all_known, phase=phase) for n in nodes]
+    scenario, applied, receipt = _apply_and_verify_plan(
+        case, base_ops, ext_plan, datapath, phase=phase, primitive_table=primitive_table,
+    )
+    if not receipt.passed:
+        failed = next((g for g in receipt.gates if not g.passed), receipt.gates[0])
+        raise ModelingError(f"REWRITE_PLAN_REJECTED:{failed.name}:{failed.reason}:{failed.detail}")
+
+    node_by_id = {n.op_id: n for n in nodes}
+    dem_by_id = {n.op_id: d for n, d in zip(nodes, demands)}
+    absorbed_map = dict(applied.absorbed_atoms)
+    template_map = {b.target_op: b for b in applied.template_bindings}
+    collective_map = {c.target_op: c for c in applied.collective_rewrites}
+
+    out_nodes: list[TargetOpNode] = []
+    out_dems: list[tuple[int, int, int, int, int]] = []
+    out_specs: list[KernelSynthesisSpec] = []
+    touched_ids: set[str] = set()
+    remap: dict[OpOccurrence, OpOccurrence] = {}
+
+    for op in applied.executable[0].ops:
+        if op.op_id in absorbed_map:
+            m_ids = absorbed_map[op.op_id]
+            fused_node, fused_dem, kspec = _materialize_external_fused_op(
+                op, m_ids, node_by_id, dem_by_id, template_map.get(op.op_id),
+                scenario, applied, peaks, case, datapath, pricing_ctx,
+                phase=phase, primitive_table=primitive_table,
+                allow_unbound_formula=allow_unbound_formula,
+            )
+            out_nodes.append(fused_node)
+            out_dems.append(fused_dem)
+            out_specs.append(kspec)
+            touched_ids.add(fused_node.op_id)
+            for mid in m_ids:
+                if mid in node_by_id:
+                    remap[node_by_id[mid].occurrence] = fused_node.occurrence
+            continue
+
+        base_node = node_by_id[op.op_id]
+        base_dem = dem_by_id[op.op_id]
+        updated_node = replace(base_node, spec=op)
+        if op.op_id in template_map:
+            tb = template_map[op.op_id]
+            bound_res = _price_bound_op_on_engine(
+                op, pricing_ctx, case,
+                scenario=scenario, atomic_entry=scenario.atomic_ops[0],
+                template_binding=tb, applied=applied,
+            )
+            if bound_res is None:
+                raise ModelingError(f"rewrite_template_recipe_unbound:{op.op_id}:{tb.template_id}")
+            dur_us, b_state, _prog = bound_res
+            eff = min(1.0, base_node.l_star_lean_us / dur_us) if dur_us > 0.0 and base_node.l_star_lean_us > 0.0 else None
+            updated_node = replace(
+                updated_node,
+                dur_us=dur_us, exposed_dur_us=dur_us,
+                recipe=tb.template_id, ascend_kernel=tb.template_id,
+                kernel_status=f"[模板切换: {tb.template_id}]", needs_new_kernel=False,
+                gap_us=max(0.0, dur_us - base_node.l_star_lean_us),
+                gap_ratio=(dur_us / base_node.l_star_lean_us) if base_node.l_star_lean_us > 0.0 else None,
+                roofline_efficiency=eff, opt_pillar="pillar2_roofline",
+                opt_attainment_pct=round(eff * PERCENT_SCALE, 1) if eff is not None else None,
+                binding_state=b_state,
+            )
+            touched_ids.add(op.op_id)
+        if op.op_id in collective_map:
+            col_rec = collective_map[op.op_id]
+            col_us = _price_collective_on_topology(
+                op, pricing_ctx, case,
+                mode=col_rec.mode, topology_route=col_rec.topology_route,
+                minimum_us=floors.launch_vec_us,
+            )
+            if col_us is None:
+                raise ModelingError(f"rewrite_collective_route_recipe_unbound:{op.op_id}")
+            base_k = updated_node.ascend_kernel.split(" (", 1)[0]
+            eff = min(1.0, base_node.l_star_lean_us / col_us) if col_us > 0.0 and base_node.l_star_lean_us > 0.0 else None
+            updated_node = replace(
+                updated_node,
+                dur_us=col_us, exposed_dur_us=col_us,
+                recipe=f"collective_{col_rec.mode}",
+                ascend_kernel=f"{base_k} ({col_rec.mode}:{col_rec.topology_route})",
+                kernel_status=f"[通信方案切换: {col_rec.mode} @ {col_rec.topology_route}]",
+                needs_new_kernel=False,
+                gap_us=max(0.0, col_us - base_node.l_star_lean_us),
+                gap_ratio=(col_us / base_node.l_star_lean_us) if base_node.l_star_lean_us > 0.0 else None,
+                roofline_efficiency=eff, opt_pillar="pillar3_comm",
+                opt_attainment_pct=round(eff * PERCENT_SCALE, 1) if eff is not None else None,
+                binding_state="bound_implementation",
+            )
+            touched_ids.add(op.op_id)
+        out_nodes.append(updated_node)
+        out_dems.append(base_dem)
+
+    # Rewire predecessors from applied.executable OpSpec deps so HoistOrDeduplicate / FuseRegion updates hold.
+    occ_by_id = {n.op_id: n.occurrence for n in out_nodes}
+    rewired_nodes: list[TargetOpNode] = []
+    for node, op in zip(out_nodes, applied.executable[0].ops):
+        new_preds = tuple(dict.fromkeys(
+            occ_by_id[d] for d in op.deps if d in occ_by_id and d != node.op_id
         ))
-    return out
+        rewired_nodes.append(replace(node, predecessors=new_preds))
+    return rewired_nodes, out_dems, out_specs, touched_ids, remap
 
 
 def _apply_pillar23_envelopes(
@@ -1854,16 +2845,19 @@ def _apply_pillar23_envelopes(
     demands: Sequence[tuple[int, int, int, int, int]],
     floors: SkuTargetFloors,
     case: Case,
+    pricing_ctx: _TargetPricingContext,
     *,
     phase: str,
+    locked_ids: set[str] | None = None,
     primitive_table: Any = None,
     allow_unbound_formula: bool = True,
 ) -> list[TargetOpNode]:
-    """Price remaining single operators via white-box L0-pipe ``Engine`` + link alpha."""
+    """Price remaining single operators via bound ``OneShotCollective`` or Modeling Mode formulas."""
     is_decode = str(phase or "decode").lower() == "decode"
+    locked = locked_ids or set()
     out: list[TargetOpNode] = []
     for node, dem in zip(nodes, demands):
-        if node.opt_pillar in {"pillar1_fusion", "pillar3_comm"} or node.dur_us <= 0.0:
+        if node.op_id in locked or node.opt_pillar in {"pillar1_fusion", "pillar3_comm"} or node.dur_us <= 0.0:
             out.append(node)
             continue
         fam = node.family.lower()
@@ -1879,10 +2873,16 @@ def _apply_pillar23_envelopes(
         is_pure_comm = (node.task_type == "HCCL" or fam in _COLLECTIVE_FAMILIES) and not is_mc2 and not is_megamoe
 
         if is_pure_comm:
-            # Pure L0 one-shot collective: SKU launch + link alpha + wire transfer time.
-            t_after = min(node.dur_us, floors.oneshot_floor_us + l_link) if floors.is_intra_pod else node.dur_us
+            op_stub = _node_to_op_spec(node, set(), phase=phase)
+            oneshot_us = (
+                _price_collective_on_topology(
+                    op_stub, pricing_ctx, case, mode="oneshot", minimum_us=floors.launch_vec_us,
+                )
+                if floors.is_intra_pod else None
+            )
+            t_after = min(node.dur_us, oneshot_us) if oneshot_us is not None else node.dur_us
             gain = node.dur_us - t_after
-            if floors.is_intra_pod and gain >= TARGET_OPT_MIN_GAIN_US and gain >= node.dur_us * TARGET_OPT_MIN_RATIO:
+            if oneshot_us is not None and gain >= TARGET_OPT_MIN_GAIN_US and gain >= node.dur_us * TARGET_OPT_MIN_RATIO:
                 tag = "CCU/AIV UB-Direct One-Shot" if floors.is_a5_ub else "AIV Intra-Pod One-Shot"
                 is_small_sp = fam in {"allgather", "reduce_scatter"} and node.link_bytes <= UB_ONESHOT_SMALL_MSG_BYTES
                 status = (
@@ -1899,23 +2899,31 @@ def _apply_pillar23_envelopes(
                     roofline_efficiency=eff,
                     opt_pillar="pillar3_comm",
                     opt_attainment_pct=round(eff * PERCENT_SCALE, 1) if eff is not None else None,
+                    binding_state="bound_implementation",
                 ))
             else:
                 out.append(replace(node, kernel_status=STATUS_AT_FLOOR, needs_new_kernel=False))
             continue
 
-        op_stub = _node_to_op_spec(node, set())
+        # Strict Simulation Mode (allow_unbound_formula=False) NEVER runs unbound formula projections.
+        if not allow_unbound_formula:
+            out.append(replace(node, kernel_status=STATUS_AT_FLOOR, needs_new_kernel=False))
+            continue
+
+        op_stub = _node_to_op_spec(node, set(), phase=phase)
         formula_spec = FormulaKernelSpec.from_ops((op_stub,), name=node.ascend_kernel or node.op_id)
         try:
             eval_res = evaluate_formula_kernel(formula_spec, case, primitive_table=primitive_table)
         except ModelingError:
             out.append(replace(node, kernel_status=STATUS_AT_FLOOR, needs_new_kernel=False))
             continue
+        if not eval_res.sram_verified:
+            out.append(replace(node, kernel_status=STATUS_AT_FLOOR, needs_new_kernel=False))
+            continue
 
         t_target = max(eval_res.projected_us, node.l_star_lean_us)
         mc2_kernel = node.ascend_kernel
-        needs_new = fam == "attn_res_prefix" and allow_unbound_formula
-        b_state: BindingState = "unbound_formula_projection" if needs_new else node.binding_state
+        needs_new = fam == "attn_res_prefix"
         if is_mc2:
             t_target = max(t_target, floors.oneshot_floor_us + l_link) + floors.mc2_sync_us
             pillar = "pillar3_comm"
@@ -1947,7 +2955,7 @@ def _apply_pillar23_envelopes(
                 roofline_efficiency=eff,
                 opt_pillar=pillar,
                 opt_attainment_pct=round(eff * PERCENT_SCALE, 1) if eff is not None else None,
-                binding_state=b_state,
+                binding_state="unbound_formula_projection",
             ))
         else:
             out.append(replace(node, kernel_status=STATUS_AT_FLOOR, needs_new_kernel=False))
@@ -1958,12 +2966,16 @@ def _solve_one_archetype(
     aid: str,
     a_nodes: Sequence[TargetOpNode],
     a_dems: Sequence[tuple[int, int, int, int, int]],
-    ext_plan: RewritePlan | None,
+    locked_ids: set[str],
+    used_edit_ids: set[str],
     floors: SkuTargetFloors,
     p0: Mapping[str, Any],
     case: Case,
     datapath: DatapathCapabilitySpec,
+    pricing_ctx: _TargetPricingContext,
     *,
+    verify_ops: Sequence[OpSpec] | None = None,
+    phase: str,
     safe_n_tok: float,
     primitive_table: Any,
     allow_unbound_formula: bool,
@@ -1976,14 +2988,11 @@ def _solve_one_archetype(
     dict[OpOccurrence, OpOccurrence],
 ]:
     known_ids = {n.op_id for n in a_nodes}
-    arch_ops = [_node_to_op_spec(n, known_ids) for n in a_nodes]
+    arch_ops = [_node_to_op_spec(n, known_ids, phase=phase) for n in a_nodes]
     traits_map = {op.op_id: classify_op_traits(op) for op in arch_ops}
     alg = discover_algebraic_rewrites_for_ops(
         arch_ops, datapath=datapath, allow_mc2=True, include_abi_extensions=allow_unbound_formula,
     )
-    ext_cands = _extract_external_candidates(ext_plan, arch_ops, traits_map, case, datapath)
-    ext_claimed = {mid for c in ext_cands for mid in c.member_ids}
-    merged_cands = [*ext_cands, *(c for c in alg.candidates if not (set(c.member_ids) & ext_claimed))]
     idx_by_id = {n.op_id: i for i, n in enumerate(a_nodes)}
     consumed_idxs: set[int] = set()
     replacements: dict[int, tuple[TargetOpNode, tuple[int, int, int, int, int]]] = {}
@@ -1992,7 +3001,9 @@ def _solve_one_archetype(
     edits: list[Edit] = []
     remap: dict[OpOccurrence, OpOccurrence] = {}
 
-    for cand in merged_cands:
+    for cand in alg.candidates:
+        if set(cand.member_ids) & locked_ids:
+            continue
         idxs = [idx_by_id[mid] for mid in cand.member_ids if mid in idx_by_id]
         if len(idxs) < MIN_FUSE_MEMBERS or any(i in consumed_idxs for i in idxs):
             continue
@@ -2000,27 +3011,26 @@ def _solve_one_archetype(
         grp_nodes = [a_nodes[i] for i in idxs]
         grp_dems = [a_dems[i] for i in idxs]
         grp_traits = [traits_map[n.op_id] for n in grp_nodes]
+        base_eid = f"{aid}_{cand.candidate_id}"
+        eid = base_eid
+        serial = 1
+        while eid in used_edit_ids:
+            eid = f"{base_eid}_{serial}"
+            serial += 1
         collapsed = _collapse_candidate_group(
-            grp_nodes, grp_dems, cand, grp_traits, floors, p0, case, datapath,
-            primitive_table=primitive_table, allow_unbound_formula=allow_unbound_formula,
+            grp_nodes, grp_dems, cand, grp_traits, arch_ops, floors, p0, case, datapath, pricing_ctx,
+            edit_id=eid, verify_ops=verify_ops, phase=phase, primitive_table=primitive_table,
+            allow_unbound_formula=allow_unbound_formula,
         )
         if collapsed is None:
             continue
-        fused_node, fused_dem, kspec = collapsed
+        fused_node, fused_dem, kspec, edit = collapsed
+        used_edit_ids.add(eid)
         consumed_idxs.update(idxs)
         replacements[idxs[0]] = (fused_node, fused_dem)
         unlocked_ops.update(cand.member_ids)
         specs.append(kspec)
-        refs = tuple(OpRef("atom", mid) for mid in cand.member_ids)
-        edits.append(Edit(
-            edit_id=f"{aid}_{cand.candidate_id}",
-            operation=FuseRegion(
-                members=refs,
-                preserve_ports=tuple(PortRef(OpRef("atom", mid), "output", 0) for mid in cand.preserve_port_ids),
-                kernel_boundaries=(KernelBoundary(cand.abi_id, refs),),
-                fusion_tier=cand.fusion_tier,
-            ),
-        ))
+        edits.append(edit)
         for i in idxs:
             remap[a_nodes[i].occurrence] = fused_node.occurrence
 
@@ -2049,6 +3059,45 @@ def _solve_one_archetype(
     return out_nodes, out_dems, specs, triggers, edits, remap
 
 
+def _verify_final_target_plan(
+    nodes: Sequence[TargetOpNode],
+    final_plan: RewritePlan,
+    case: Case,
+    datapath: DatapathCapabilitySpec,
+    *,
+    phase: str,
+    primitive_table: Any,
+) -> bool:
+    """Verify the complete combined plan against the base target graph via canonical ``verify_plan``."""
+    if not nodes:
+        return True
+    unique_ids = {n.op_id for n in nodes}
+    if len(unique_ids) == len(nodes):
+        base_ops = [_node_to_op_spec(n, unique_ids, phase=phase) for n in nodes]
+        _, _, receipt = _apply_and_verify_plan(
+            case, base_ops, final_plan, datapath, phase=phase, primitive_table=primitive_table,
+        )
+        return bool(receipt.passed)
+    by_arch: dict[str, list[TargetOpNode]] = defaultdict(list)
+    for n in nodes:
+        by_arch[n.archetype_id].append(n)
+    all_passed = True
+    for aid, arch_nodes in by_arch.items():
+        ids = {n.op_id for n in arch_nodes}
+        arch_ops = [_node_to_op_spec(n, ids, phase=phase) for n in arch_nodes]
+        arch_edits = tuple(e for e in final_plan.edits if e.edit_id.startswith(f"{aid}_"))
+        sub_plan = RewritePlan(
+            base_graph_sha256=final_plan.base_graph_sha256,
+            framing_sha256=final_plan.framing_sha256,
+            edits=arch_edits,
+        )
+        _, _, receipt = _apply_and_verify_plan(
+            case, arch_ops, sub_plan, datapath, phase=phase, primitive_table=primitive_table,
+        )
+        all_passed = all_passed and bool(receipt.passed)
+    return all_passed
+
+
 def solve_target_graph(
     nodes: Sequence[TargetOpNode],
     demands: Sequence[tuple[int, int, int, int, int]],
@@ -2061,17 +3110,37 @@ def solve_target_graph(
     primitive_table: Any = None,
     allow_unbound_formula: bool = True,
 ) -> SolvedTargetGraph:
-    """Solve target-state graph via Tier-P2 algebra + white-box L0-pipe ``Engine`` pricing."""
+    """Solve target-state graph via Tier-P2 algebra + canonical ``apply_plan``/``verify_plan``."""
     floors = extract_sku_floors(case, primitive_table=primitive_table)
     die = case.machine.dies[0]
     ub_edges = ub_peer_edges_for_rank(die.rank, case.machine.links, case.machine.transfer_channels)
     datapath = datapath_for_die(die, ub_peer_edges=ub_edges)
     p0 = peaks_by_stage.get(0) or next(iter(peaks_by_stage.values()), {})
     ext_plan = load_rewrite_plan(rewrite_plan)
+    pricing_ctx = _TargetPricingContext(case, primitive_table=primitive_table)
+    safe_n_tok = max(float(n_tok_per_die), SAVING_POSITIVE_EPS_US)
+
+    all_specs: list[KernelSynthesisSpec] = []
+    executed_ext_edits: list[Edit] = []
+    locked_ids: set[str] = set()
+    global_remap: dict[OpOccurrence, OpOccurrence] = {}
+
+    if ext_plan is not None and ext_plan.edits:
+        work_nodes, work_dems, ext_specs, locked_ids, ext_remap = _materialize_external_plan(
+            nodes, demands, ext_plan, case, datapath, floors, p0, pricing_ctx,
+            phase=phase, primitive_table=primitive_table,
+            allow_unbound_formula=allow_unbound_formula,
+        )
+        all_specs.extend(ext_specs)
+        executed_ext_edits.extend(ext_plan.edits)
+        global_remap.update(ext_remap)
+    else:
+        work_nodes = list(nodes)
+        work_dems = list(demands)
 
     by_arch: dict[str, tuple[list[TargetOpNode], list[tuple[int, int, int, int, int]]]] = {}
     arch_order: list[str] = []
-    for node, dem in zip(nodes, demands):
+    for node, dem in zip(work_nodes, work_dems):
         if node.archetype_id not in by_arch:
             by_arch[node.archetype_id] = ([], [])
             arch_order.append(node.archetype_id)
@@ -2080,34 +3149,45 @@ def solve_target_graph(
 
     all_nodes: list[TargetOpNode] = []
     all_dems: list[tuple[int, int, int, int, int]] = []
-    all_specs: list[KernelSynthesisSpec] = []
     all_triggers: list[SemanticAuditTrigger] = []
-    applied_edits: list[Edit] = []
-    global_remap: dict[OpOccurrence, OpOccurrence] = {}
-    safe_n_tok = max(float(n_tok_per_die), SAVING_POSITIVE_EPS_US)
-
-    if ext_plan is not None and ext_plan.edits:
-        all_known = {n.op_id for n in nodes}
-        _verify_arch_plan(case, [_node_to_op_spec(n, all_known) for n in nodes], ext_plan, datapath)
+    auto_edits: list[Edit] = []
+    used_edit_ids = {e.edit_id for e in executed_ext_edits}
+    work_unique_ids = {n.op_id for n in work_nodes}
+    verify_work_ops = (
+        [_node_to_op_spec(n, work_unique_ids, phase=phase) for n in work_nodes]
+        if len(work_unique_ids) == len(work_nodes) else None
+    )
 
     for aid in arch_order:
         a_nodes, a_dems = by_arch[aid]
         o_nodes, o_dems, o_specs, o_trigs, o_edits, o_remap = _solve_one_archetype(
-            aid, a_nodes, a_dems, ext_plan, floors, p0, case, datapath,
-            safe_n_tok=safe_n_tok, primitive_table=primitive_table,
+            aid, a_nodes, a_dems, locked_ids, used_edit_ids, floors, p0, case, datapath, pricing_ctx,
+            verify_ops=verify_work_ops, phase=phase, safe_n_tok=safe_n_tok, primitive_table=primitive_table,
             allow_unbound_formula=allow_unbound_formula,
         )
         all_nodes.extend(o_nodes)
         all_dems.extend(o_dems)
         all_specs.extend(o_specs)
         all_triggers.extend(o_trigs)
-        applied_edits.extend(o_edits)
+        auto_edits.extend(o_edits)
         global_remap.update(o_remap)
+
+    base_sha = ext_plan.base_graph_sha256 if ext_plan is not None else ""
+    frame_sha = ext_plan.framing_sha256 if ext_plan is not None else ""
+    combined_edits = (*executed_ext_edits, *auto_edits)
+    final_plan = (
+        RewritePlan(base_graph_sha256=base_sha, framing_sha256=frame_sha, edits=combined_edits)
+        if combined_edits else empty_plan(base_sha, frame_sha)
+    )
+    verification_passed = _verify_final_target_plan(
+        nodes, final_plan, case, datapath, phase=phase, primitive_table=primitive_table,
+    )
 
     rewired = _rewire_node_preds(all_nodes, global_remap)
     enveloped = _apply_pillar23_envelopes(
-        rewired, all_dems, floors, case,
-        phase=phase, primitive_table=primitive_table, allow_unbound_formula=allow_unbound_formula,
+        rewired, all_dems, floors, case, pricing_ctx,
+        phase=phase, locked_ids=locked_ids, primitive_table=primitive_table,
+        allow_unbound_formula=allow_unbound_formula,
     )
     scheduled = reschedule_node_timelines(enveloped)
     attributed, arch_spans = attribute_node_overlap(scheduled)
@@ -2116,14 +3196,6 @@ def solve_target_graph(
     has_unbound = bool(unbound_ops)
     graph_state: BindingState = "unbound_formula_projection" if has_unbound else "bound_implementation"
 
-    final_plan = (
-        RewritePlan(
-            base_graph_sha256=ext_plan.base_graph_sha256 if ext_plan is not None else "",
-            framing_sha256=ext_plan.framing_sha256 if ext_plan is not None else "",
-            edits=tuple(applied_edits),
-        )
-        if applied_edits else (ext_plan or empty_plan("", ""))
-    )
     return SolvedTargetGraph(
         nodes=indexed,
         demands_ns=tuple(all_dems),
@@ -2132,7 +3204,7 @@ def solve_target_graph(
         semantic_audit_triggers=tuple(all_triggers),
         applied_plan=final_plan,
         rewrite_plan_sha256=plan_sha256(final_plan),
-        verification_passed=True,
+        verification_passed=verification_passed,
         floors=floors,
         has_unbound_formula_ops=has_unbound,
         binding_state=graph_state,
@@ -2142,6 +3214,7 @@ def solve_target_graph(
 
 __all__ = [
     "BindingState",
+    "PipeStageSpec",
     "FormulaTensorSpec",
     "FormulaKernelSpec",
     "FormulaKernelEvaluation",
