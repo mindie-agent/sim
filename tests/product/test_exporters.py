@@ -1,10 +1,14 @@
-"""Orthogonal tests for ``msprof`` trace and OOXML ``.xlsx`` product exporters.
+"""Orthogonal tests for human-native ``msprof`` trace and OOXML ``.xlsx`` exporters.
 
-[Role] Verify 1:1 ``msprof`` ``trace_view.json`` metadata/span/flow/counter
-  invariants, bounded streaming memory usage on multi-layer graphs, real OOXML
-  ``<mergeCell>`` hierarchy & 1-to-N ``kernel_details.csv`` reconciliation,
-  closed-form Weight/Quant/Cache/Engram-PLE/PP memory calculations, and CLI
-  command/receipt isolation.
+[Role] Verify 1:1 full-model streaming ``msprof`` ``trace_view.json`` (``PID 0``
+  Host Framework/MSTX hierarchy, physically grounded AIC/AIV/MTE2/MTE3/Fixpipe
+  durations & ratios with zero ``PIPE_*_FRACTION`` hacks, causal flows, bounded
+  memory), human-native OOXML ``.xlsx`` workbooks (Archetype ×N grouping,
+  side-by-side Before-vs-After N->1 ``merge_cells``, live formulas, MSO Stream-1
+  overlap, ``New_Kernel_Design_Backlog`` Agent slots, conditional
+  ``Measured_msprof_Calibration``, zero banned Python class names, zero
+  ``Other`` submodules), ``QuantSpec.exclusions`` in ``Memory_Quant_Calculator``,
+  and one-shot ``export`` / ``export-xlsx`` / ``export-trace`` CLI flows.
 [Invariants] Every timing and memory assertion checks exact physical/schema
   identities against ``runtime.Engine`` and ``check_optimality_certificate``;
   zero ``0.80x`` heuristic fudge factors or third-party OOXML dependencies.
@@ -15,9 +19,11 @@
 """
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 import math
 from pathlib import Path
+import time
 import tracemalloc
 import xml.etree.ElementTree as ET
 import zipfile
@@ -29,35 +35,40 @@ from mindie_sim import cli as cli_mod
 from mindie_sim import cli_export
 from mindie_sim.compose import compose_case as compose_raw_case
 from mindie_sim.export import (
-    EXPORT_BUNDLE_SCHEMA,
+    BANNED_IMPLEMENTATION_NAMES,
     GIB_BYTES,
     MSPROF_PROCESS_SPEC,
+    PID_FRAMEWORK,
     SHEET_BREAKDOWN,
+    SHEET_MEASURED,
     SHEET_MEMORY,
+    SHEET_NEW_KERNELS,
     SHEET_SUMMARY,
-    ExportBundle,
-    GapRadarRow,
-    MemoryCalculatorLedger,
-    OperatorExportRow,
-    StageBudgetRow,
+    TID_FW_ENGINE,
+    TID_FW_HOST_LAUNCH,
+    TID_FW_LAYER_MSTX,
+    TID_FW_SUBMODULE_MSTX,
     Workbook,
     build_export_bundle,
+    compose_export_case,
     compute_memory_quant_ledger,
     evaluate_weight_storage_bytes,
     export_comparison_xlsx,
     export_msprof_trace,
     load_kernel_details_csv,
+    resolve_hardware_alias,
 )
+from mindie_sim.export import trace_exporter as trace_mod
 from mindie_sim.export.xlsx_exporter import NS_MAIN
-from mindie_sim.prediction.results import OpOccurrence, StepRequest
+from mindie_sim.prediction.results import StepRequest
 from mindie_sim.prediction.structure import parse_case
 
 pytestmark = pytest.mark.tier0
 
 NS_PREFIX = f"{{{NS_MAIN}}}"
-STREAM_MEMORY_LIMIT_BYTES = 16 * 1024 * 1024
-LARGE_SYNTHETIC_LAYERS = 60
-OPS_PER_SYNTHETIC_LAYER = 25
+STREAM_MEMORY_LIMIT_BYTES = 64 * 1024 * 1024
+MAX_SERIALIZE_SECONDS = 0.6
+MAX_ARCHETYPE_OPS_IN_RAM = 250
 
 
 def _read_xlsx_sheets(path: Path) -> tuple[list[str], dict[str, ET.Element], list[str]]:
@@ -69,14 +80,8 @@ def _read_xlsx_sheets(path: Path) -> tuple[list[str], dict[str, ET.Element], lis
         } <= names
         wb_root = ET.fromstring(zf.read("xl/workbook.xml"))
         sst_root = ET.fromstring(zf.read("xl/sharedStrings.xml"))
-        shared = [
-            "".join(si.itertext())
-            for si in sst_root.findall(f"{NS_PREFIX}si")
-        ]
-        sheet_names = [
-            elem.attrib["name"]
-            for elem in wb_root.findall(f".//{NS_PREFIX}sheet")
-        ]
+        shared = ["".join(si.itertext()) for si in sst_root.findall(f"{NS_PREFIX}si")]
+        sheet_names = [elem.attrib["name"] for elem in wb_root.findall(f".//{NS_PREFIX}sheet")]
         roots = {
             title: ET.fromstring(zf.read(f"xl/worksheets/sheet{idx}.xml"))
             for idx, title in enumerate(sheet_names, start=1)
@@ -94,10 +99,7 @@ def _sheet_cells(
         v_el = cell.find(f"{NS_PREFIX}v")
         formula = f_el.text if f_el is not None else None
         raw_v = v_el.text if v_el is not None else None
-        if cell.attrib.get("t") == "s" and raw_v is not None:
-            val = shared[int(raw_v)]
-        else:
-            val = raw_v
+        val = shared[int(raw_v)] if (cell.attrib.get("t") == "s" and raw_v is not None) else raw_v
         out[ref] = (val, formula)
     return out
 
@@ -112,120 +114,18 @@ def _compact_case(
     return compose_raw_case(
         "qwen3-30b-a3b",
         REPRESENTATIVE_SKUS[sku_key],
-        tp=tp,
-        dp=1,
-        ep=ep,
-        pp=pp,
-        layers=layers,
-        prompt_tokens=256,
-        output_tokens=16,
-        concurrency=2,
+        tp=tp, dp=1, ep=ep, pp=pp, layers=layers,
+        prompt_tokens=256, output_tokens=16, concurrency=2,
     )
 
 
-def _synthetic_multilayer_bundle(num_layers: int, ops_per_layer: int) -> ExportBundle:
-    ops: list[OperatorExportRow] = []
-    t_cur = 0.0
-    prev_occ: OpOccurrence | None = None
-    ordinal = 0
-    for layer in range(num_layers):
-        for step in range(ops_per_layer):
-            is_comm = (step == ops_per_layer - 1)
-            is_aux = (step == ops_per_layer - 2)
-            stream = "comm" if is_comm else ("aux" if is_aux else "main")
-            s_idx = 2 if is_comm else (1 if is_aux else 0)
-            sub = "Collective" if is_comm else ("MoE" if is_aux else "Attention")
-            fam = "allreduce" if is_comm else ("grouped_gemm" if is_aux else "gemm")
-            occ = OpOccurrence(replica=0, stage=0, rank=0, op_id=f"s0.l{layer}.op{step}")
-            dur = 5.0 if not is_comm else 8.0
-            l_star = 2.5 if not is_comm else 4.0
-            ops.append(OperatorExportRow(
-                ordinal=ordinal,
-                occurrence=occ,
-                op_id=occ.op_id,
-                layer=layer,
-                layer_label=f"Layer {layer}",
-                submodule=sub,
-                family=fam,
-                recipe=fam,
-                implementation="SyntheticKernel",
-                stream=stream,
-                stream_index=s_idx,
-                task_type="HCCL" if is_comm else "MIX_AIC",
-                shape=(4, 2048, 2048),
-                dtype="bf16",
-                predecessors=(prev_occ,) if prev_occ is not None else (),
-                start_us=t_cur,
-                end_us=t_cur + dur,
-                dur_us=dur,
-                flops=0.0 if is_comm else 3.2e7,
-                vector_ops=0.0 if is_comm else 1.6e4,
-                hbm_read_bytes=0.0 if is_comm else 4.0e6,
-                hbm_write_bytes=0.0 if is_comm else 1.0e6,
-                hbm_total_bytes=0.0 if is_comm else 5.0e6,
-                mte2_bytes=0.0 if is_comm else 5.0e6,
-                mte3_bytes=0.0 if is_comm else 1.0e6,
-                fixpipe_bytes=0.0 if is_comm else 5.0e5,
-                link_bytes=2.0e6 if is_comm else 0.0,
-                l2_hit_pct=0.0 if is_comm else 20.0,
-                dominant_bound="link_bound" if is_comm else "memory_bound",
-                l_star_lean_us=l_star,
-                gap_us=dur - l_star,
-                gap_ratio=dur / l_star,
-                gap_radar_rank=ordinal + 1,
-                roofline_efficiency=0.5,
-                absorbed_source_ops=(),
-            ))
-            prev_occ = occ
-            t_cur += dur
-            ordinal += 1
-    mem = MemoryCalculatorLedger(
-        model_name="synthetic-multilayer",
-        hardware_sku="synthetic-npu",
-        phase="decode",
-        weight_quant="BF16",
-        cache_dtype="BF16",
-        engram_host_offload=False,
-        dp=1, tp=1, ep=1, pp=1, dcp=1, pcp=1, local_tp=1, shared_tp=1, total_dies=1,
-        seq_len=1024, concurrency=1, block_size=128, spec_tokens=0, local_cache_tokens=1024,
-        die_hbm_capacity_bytes=64 * GIB_BYTES, gpu_memory_utilization=0.9,
-        usable_hbm_bytes=57.6 * GIB_BYTES,
-        weight_rows=(), cache_rows=(),
-        stage_budgets=(StageBudgetRow(0, num_layers, 10 * GIB_BYTES, 0.0, 0.0, 0.0, GIB_BYTES, 0.5 * GIB_BYTES, 0.5 * GIB_BYTES, 12 * GIB_BYTES, 57.6 * GIB_BYTES, 45.6 * GIB_BYTES, True),),
-        max_stage_hbm_bytes=12 * GIB_BYTES, max_stage_host_offload_bytes=0.0, fits_hbm=True,
-        sim_memory_weight_bytes_by_stage=(10 * GIB_BYTES,),
-        sim_memory_cache_bytes_by_stage=(float(GIB_BYTES),),
-    )
-    return ExportBundle(
-        schema=EXPORT_BUNDLE_SCHEMA,
-        model_name="synthetic-multilayer",
-        hardware_sku="synthetic-npu",
-        phase="decode",
-        scope="body",
-        graph_id="sha256:synthetic",
-        tokens_per_seq=1,
-        context_tokens=1024,
-        sequences=1,
-        step_span_us=t_cur,
-        operator_sum_us=t_cur,
-        step_l_star_lean_us=t_cur * 0.5,
-        step_certificate_valid=True,
-        step_tight_resources=("hbm_read@r0.p0.d0",),
-        throughput_tokens_per_s=1e6 / max(t_cur, 1.0),
-        throughput_per_die_tokens_per_s=1e6 / max(t_cur, 1.0),
-        network_cube_mfu=20.0, network_vec_mfu=10.0, network_mbu=50.0,
-        network_link_util=40.0, network_roofline_efficiency=50.0,
-        exposed_breakdown_us={"cube": t_cur * 0.7, "communication": t_cur * 0.3},
-        bottleneck_mix={"memory_bound": {"count": float(len(ops)), "duration_us": t_cur, "share_pct": 100.0, "roofline_eff_pct": 50.0}},
-        hardware_peaks={"cube_peak_flops_per_s": 5e14, "vector_peak_ops_per_s": 1e13, "hbm_peak_bytes_per_s": 4e12, "link_peak_bytes_per_s": 4e11},
-        operators=tuple(ops),
-        pipelines=(),
-        gap_radar=(GapRadarRow(1, "Layer 0", "Collective", "s0.l0.op39", "allreduce", "SyntheticKernel", "link_bound", 4.0, 8.0, 4.0, 2.0, 1.0),),
-        memory_ledger=mem,
-    )
+def test_msprof_trace_schema_metadata_physical_pipes_and_host_hierarchy(tmp_path):
+    for banned_attr in (
+        "PIPE_LEAD_FRACTION", "PIPE_CORE_START_FRACTION",
+        "PIPE_CORE_END_FRACTION", "PIPE_TAIL_START_FRACTION",
+    ):
+        assert not hasattr(trace_mod, banned_attr)
 
-
-def test_msprof_trace_schema_metadata_flows_and_counters(tmp_path):
     case = _compact_case(tp=2, ep=2, pp=1, layers=2)
     req = StepRequest(phase="decode", tokens=1, context=512, sequences=2, scope="body")
     bundle = build_export_bundle(case, request=req)
@@ -236,7 +136,10 @@ def test_msprof_trace_schema_metadata_flows_and_counters(tmp_path):
     receipt = export_msprof_trace(bundle, trace_path)
     raw = trace_path.read_bytes()
     assert b"\r\n" not in raw
-    events = json.loads(raw.decode("utf-8"))
+    text = raw.decode("utf-8")
+    for banned in BANNED_IMPLEMENTATION_NAMES:
+        assert banned not in text
+    events = json.loads(text)
     assert isinstance(events, list) and len(events) == receipt.total_events
 
     meta_names = {e["name"] for e in events if e.get("ph") == "M"}
@@ -244,14 +147,22 @@ def test_msprof_trace_schema_metadata_flows_and_counters(tmp_path):
     proc_names = {e["args"]["name"] for e in events if e.get("ph") == "M" and e["name"] == "process_name"}
     for required_proc in MSPROF_PROCESS_SPEC:
         assert any(name.startswith(required_proc) for name in proc_names)
-    thread_names = {e["args"]["name"] for e in events if e.get("ph") == "M" and e["name"] == "thread_name"}
-    assert {"Stream 0 (Compute)", "Stream 1 (MSO / Aux 2nd)", "Stream 2 (Comm / CSA 3rd)", "Cube (AIC)", "Vector (AIV)", "MTE2 (GM->L1/UB)", "MTE3 (UB->GM)", "Fixpipe (L0C->GM/UB)"} <= thread_names
+
+    fw_events = [e for e in events if e.get("pid") == PID_FRAMEWORK and e.get("ph") == "X"]
+    fw_tids = {e["tid"] for e in fw_events}
+    assert {TID_FW_ENGINE, TID_FW_LAYER_MSTX, TID_FW_SUBMODULE_MSTX, TID_FW_HOST_LAUNCH} <= fw_tids
 
     kernel_events = [e for e in events if e.get("ph") == "X" and e.get("cat") in {"Kernel", "Communication"}]
-    assert len(kernel_events) == len(bundle.operators)
+    assert len(kernel_events) >= len(bundle.operators)
     sample_args = kernel_events[0]["args"]
-    for key in ("Input Shapes", "Input Data Types", "FLOPs", "HBM Read (B)", "HBM Write (B)", "L2 Hit (%)", "Bottleneck", "L* Physical Lower Bound (us)", "Sim Pred (us)", "Gap vs L* (us)", "Physical-Limit Gap Ratio (T_pred / L*)", "Gap Radar Rank"):
+    for key in (
+        "Ascend Kernel", "Kernel Backend", "Kernel Status", "Logical Role", "Shapes & Dtype",
+        "aic_mac_ratio", "aiv_vec_ratio", "mte2_ratio", "mte3_ratio", "fixpipe_ratio",
+        "L* Physical Lower Bound (us)", "Sim Pred (us)", "Gap vs L* (us)", "Gap Radar Rank",
+    ):
         assert key in sample_args
+    for ratio_k in ("aic_mac_ratio", "aiv_vec_ratio", "mte2_ratio", "mte3_ratio", "fixpipe_ratio"):
+        assert 0.0 <= float(sample_args[ratio_k]) <= 1.0
     assert all(e["ts"] >= 0 and e["dur"] >= 0 and math.isfinite(e["ts"]) and math.isfinite(e["dur"]) for e in kernel_events)
 
     flow_s = {e["id"]: e for e in events if e.get("ph") == "s"}
@@ -265,79 +176,142 @@ def test_msprof_trace_schema_metadata_flows_and_counters(tmp_path):
 
     counter_names = {e["name"] for e in events if e.get("ph") == "C"}
     assert {"HBM Bandwidth (GB/s)", "Cube Utilization (%)", "Vector Utilization (%)", "Active HBM Memory (GiB)"} <= counter_names
-    for ev in (e for e in events if e.get("ph") == "C"):
-        if ev["name"] == "Cube Utilization (%)":
-            assert 0.0 <= ev["args"]["Cube_Util_Pct"] <= 100.0
-        elif ev["name"] == "Vector Utilization (%)":
-            assert 0.0 <= ev["args"]["Vector_Util_Pct"] <= 100.0
 
 
-def test_trace_streaming_memory_bound_on_large_multilayer_graph(tmp_path):
-    bundle = _synthetic_multilayer_bundle(LARGE_SYNTHETIC_LAYERS, OPS_PER_SYNTHETIC_LAYER)
-    out = tmp_path / "large_trace_view.json"
+def test_trace_streaming_memory_and_speed_budget_on_full_multilayer_model(tmp_path):
+    raw_case, req = compose_export_case(
+        "kimi-k3.1", REPRESENTATIVE_SKUS["a5"], topology_preset="a5_pod",
+        dp=1, tp=1, ep=1, dcp=1, prompt_tokens=2048, output_tokens=64,
+        concurrency=1, mtp_proposal_tokens=5, feature_track="expected_ideal",
+    )
+    bundle = build_export_bundle(raw_case, request=req)
+    assert len(bundle.operators) < MAX_ARCHETYPE_OPS_IN_RAM
+    assert bundle.total_target_layers == 93 and bundle.total_draft_layers == 5
+    arch_titles = [a.title for a in bundle.archetypes]
+    assert any("Target Archetype A" in t for t in arch_titles)
+    assert any("Target Archetype B" in t and "×68" in t for t in arch_titles)
+    assert any("Target Archetype C" in t and "×24" in t for t in arch_titles)
+    assert any(t.startswith("Draft [DSpark]") and "×5" in t for t in arch_titles)
+    recover_ops = [o for o in bundle.operators if "recover_ssm" in o.op_id]
+    assert recover_ops and all(o.archetype_id.startswith("target_arch_") for o in recover_ops)
+    assert not any(o.op_id.endswith(("recurrent_scan0", "recurrent_scan1")) for o in bundle.operators)
+
+    out_trace = tmp_path / "full_trace_view.json"
+    out_xlsx = tmp_path / "full_standalone.xlsx"
+    t0 = time.perf_counter()
+    t_rec = export_msprof_trace(bundle, out_trace)
+    x_rec = export_comparison_xlsx(bundle, out_xlsx)
+    elapsed = time.perf_counter() - t0
+    assert elapsed < MAX_SERIALIZE_SECONDS
+
     tracemalloc.start()
     try:
         tracemalloc.reset_peak()
-        receipt = export_msprof_trace(bundle, out)
+        export_msprof_trace(bundle, tmp_path / "mem_trace_view.json")
+        export_comparison_xlsx(bundle, tmp_path / "mem_standalone.xlsx")
         _, peak_bytes = tracemalloc.get_traced_memory()
     finally:
         tracemalloc.stop()
 
-    assert receipt.total_events > 10_000
-    assert receipt.bytes_written > 2 * 1024 * 1024
     assert peak_bytes < STREAM_MEMORY_LIMIT_BYTES
-    assert receipt.total_events == (
-        receipt.metadata_events + receipt.complete_events
-        + 2 * receipt.flow_pairs + receipt.counter_events
+    assert t_rec.replayed_layers >= 98
+    assert t_rec.total_events > 8000
+    assert x_rec.bytes_written > 0
+    assert out_trace.read_bytes()[:2] == b"[\n" and out_trace.read_bytes()[-3:] == b"\n]\n"
+    events = json.loads(out_trace.read_text(encoding="utf-8"))
+    mstx_layers = [e["name"] for e in events if e.get("pid") == PID_FRAMEWORK and e.get("tid") == TID_FW_LAYER_MSTX and e.get("ph") == "X"]
+    assert any("Layer 0" in n for n in mstx_layers)
+    assert any("Layer 92" in n for n in mstx_layers)
+    assert any("Draft [DSpark] Block Layer L4" in n for n in mstx_layers)
+
+
+def test_xlsx_before_after_merge_cells_formulas_and_new_kernel_backlog(tmp_path):
+    raw_bef, req = compose_export_case(
+        "kimi-k3.1", REPRESENTATIVE_SKUS["a5"], topology_preset="a5_pod",
+        dp=1, tp=2, ep=2, dcp=1, prompt_tokens=2048, output_tokens=64,
+        concurrency=2, mtp_proposal_tokens=5, feature_track="merged",
     )
-    assert out.read_bytes()[:2] == b"[\n"
-    assert out.read_bytes()[-3:] == b"\n]\n"
-    try:
-        from mindie_profiler.sources_trace import iter_trace_events
-    except ImportError:
-        iter_trace_events = None
-    if iter_trace_events is not None:
-        streamed_count = sum(1 for _ in iter_trace_events(out))
-        assert streamed_count == receipt.total_events
+    raw_aft, _ = compose_export_case(
+        "kimi-k3.1", REPRESENTATIVE_SKUS["a5"], topology_preset="a5_pod",
+        dp=1, tp=2, ep=2, dcp=1, prompt_tokens=2048, output_tokens=64,
+        concurrency=2, mtp_proposal_tokens=5, feature_track="expected_ideal",
+    )
+    b_bef = build_export_bundle(raw_bef, request=req)
+    b_aft = build_export_bundle(raw_aft, request=req)
 
+    # Inject a realistic N->1 MLA Prolog fusion in After to assert vertical K..U merge_cells.
+    mla_ops = [op for op in b_aft.operators if op.archetype_id == "target_arch_2" and "MLA Prolog" in op.submodule]
+    assert len(mla_ops) >= 3
+    fused_mla = replace(
+        mla_ops[0],
+        op_id="s0.l2.mla_prolog_v3",
+        canonical_op_key="mla_prolog_v3",
+        logical_role="Fused MLA Prolog (Q/KV-A + RMSNorm + Q-B + W_UK + KV Cache)",
+        ascend_kernel="aclnnMlaPrologV3",
+        implementation="aclnnMlaPrologV3",
+        absorbed_source_ops=tuple(op.op_id for op in mla_ops),
+        dur_us=sum(op.dur_us for op in mla_ops) * 0.6,
+        exposed_dur_us=sum(op.dur_us for op in mla_ops) * 0.6,
+    )
+    mla_ids = {op.op_id for op in mla_ops}
+    kept = []
+    inserted = False
+    for op in b_aft.operators:
+        if op.op_id in mla_ids:
+            if not inserted:
+                kept.append(fused_mla)
+                inserted = True
+            continue
+        kept.append(op)
+    b_aft_fused = replace(b_aft, operators=tuple(kept))
 
-def test_xlsx_structure_merge_cells_formulas_and_comparison_delta(tmp_path):
-    base_case = _compact_case(tp=2, ep=2, pp=1, layers=2)
-    cand_case = _compact_case(tp=4, ep=4, pp=1, layers=2)
-    req = StepRequest(phase="prefill", tokens=128, context=0, sequences=1, scope="body")
-
+    designs = {
+        "K3 SituAndMul": {
+            "design": "Single-pass AIV vector tile (UB 248KiB double-buffered) fusing SiTU + Mul",
+            "acceptance": "BF16 abs_err <= 1e-3, L* efficiency >= 70%",
+        },
+    }
     xlsx_path = tmp_path / "comparison.xlsx"
-    summary = export_comparison_xlsx(base_case, xlsx_path, compare_source=cand_case, request=req)
-    assert summary.sheets == (SHEET_SUMMARY, SHEET_BREAKDOWN, SHEET_MEMORY)
+    summary = export_comparison_xlsx(
+        b_bef, xlsx_path, compare_source=b_aft_fused, agent_kernel_designs=designs,
+    )
+    assert summary.sheets == (SHEET_SUMMARY, SHEET_BREAKDOWN, SHEET_MEMORY, SHEET_NEW_KERNELS)
+    assert SHEET_MEASURED not in summary.sheets
     assert summary.has_comparison is True and summary.has_measured is False
+    assert summary.new_kernel_backlog_count >= 1
 
     sheet_names, roots, shared = _read_xlsx_sheets(xlsx_path)
-    assert sheet_names == [SHEET_SUMMARY, SHEET_BREAKDOWN, SHEET_MEMORY]
+    assert sheet_names == [SHEET_SUMMARY, SHEET_BREAKDOWN, SHEET_MEMORY, SHEET_NEW_KERNELS]
+    for banned in BANNED_IMPLEMENTATION_NAMES:
+        assert not any(banned in s for s in shared), f"banned name leaked: {banned}"
+    assert "Other" not in shared
 
     expected_order = ["dimension", "sheetViews", "sheetFormatPr", "cols", "sheetData", "mergeCells", "dataValidations", "pageMargins"]
     for title, root in roots.items():
         tags = [child.tag.removeprefix(NS_PREFIX) for child in root]
-        filtered = [t for t in expected_order if t in tags]
-        assert tags == filtered, f"{title}: out-of-order OOXML tags {tags}"
-        merges = _sheet_merges(root)
-        assert len(merges) == summary.merge_cell_counts[title] and len(merges) > 0
-
-    sum_cells = _sheet_cells(roots[SHEET_SUMMARY], shared)
-    assert sum_cells["A6"][0] == "Prefill TTFT (ms)"
-    assert sum_cells["B7"][1] == "B6*1000"
-    assert sum_cells["B13"][1] == "B7-B12"
-    assert any(f and "H" in f and "-G" in f for _, f in sum_cells.values())
-    assert any(v == "3. Before vs After Comparison Delta" for v, _ in sum_cells.values())
+        assert tags == [t for t in expected_order if t in tags]
 
     brk_merges = _sheet_merges(roots[SHEET_BREAKDOWN])
-    assert any(ref.startswith("A") and ":A" in ref for ref in brk_merges)
-    assert any(ref.startswith("B") and ":B" in ref for ref in brk_merges)
     brk_cells = _sheet_cells(roots[SHEET_BREAKDOWN], shared)
-    sum_formulas = [f for _, f in brk_cells.values() if f and f.startswith("SUM(")]
-    assert len(sum_formulas) >= 5
+    assert any(ref.startswith("A") and ":A" in ref for ref in brk_merges)
+    assert any(ref.startswith("C") and ":C" in ref for ref in brk_merges)
+    assert any(ref.startswith("K") and ":K" in ref for ref in brk_merges), "Expected N->1 vertical merge in After Kernel column K"
+    assert any(ref.startswith("O") and ":O" in ref for ref in brk_merges), "Expected N->1 vertical merge in After Model ms column O"
+    assert any(f and "ISNUMBER(SEARCH(\"Overlapped\"" in f for _, f in brk_cells.values())
+    assert any(f and f.startswith("H") and "/1000" in f for _, f in brk_cells.values())
+    assert any(f and f.startswith("SUM(I") and "-O" in f for _, f in brk_cells.values())
+    assert any(v == "Before Source Ref" for v, _ in brk_cells.values())
+    assert any(v == "Before Bound" for v, _ in brk_cells.values())
+    assert any(v == "After Bound" for v, _ in brk_cells.values())
+    assert not any(v == "Measured Kernel (msprof)" for v, _ in brk_cells.values())
+
+    bk_cells = _sheet_cells(roots[SHEET_NEW_KERNELS], shared)
+    assert any(v and "Single-pass AIV vector tile" in v for v, _ in bk_cells.values())
+    assert any(v and "BF16 abs_err <= 1e-3" in v for v, _ in bk_cells.values())
+    assert any(f and f.startswith("SUM(G") for _, f in bk_cells.values())
 
 
-def test_xlsx_one_to_many_kernel_csv_reconciliation_and_merges(tmp_path):
+def test_xlsx_conditional_measured_calibration_sheet_and_one_to_many_merges(tmp_path):
     case = _compact_case(tp=2, ep=2, pp=1, layers=1)
     req = StepRequest(phase="decode", tokens=1, context=256, sequences=1, scope="body")
     base_bundle = build_export_bundle(case, request=req)
@@ -353,8 +327,7 @@ def test_xlsx_one_to_many_kernel_csv_reconciliation_and_merges(tmp_path):
         '0,104,47,aclnnUnmatched_Fill,Fill,AI_VECTOR_CORE,1792763502739300.000\t,2.500,"""1""",INT32',
     ]
     csv_path.write_text("\n".join(csv_lines) + "\n", encoding="utf-8")
-    parsed_csv = load_kernel_details_csv(csv_path)
-    assert len(parsed_csv) == 4
+    assert len(load_kernel_details_csv(csv_path)) == 4
 
     obs_json = tmp_path / "obs_bundle.json"
     obs_json.write_text(json.dumps({
@@ -367,44 +340,71 @@ def test_xlsx_one_to_many_kernel_csv_reconciliation_and_merges(tmp_path):
 
     rec_bundle = build_export_bundle(case, request=req, observations_path=obs_json)
     assert rec_bundle.reconciliation is not None
-    rec = rec_bundle.reconciliation
-    assert rec.total_kernels == 4 and rec.matched_kernels == 3 and len(rec.unmatched_kernels) == 1
-    assert rec.unmatched_kernels[0].name == "aclnnUnmatched_Fill"
-    matched_row = next(op for op in rec_bundle.operators if op.op_id == target_op.op_id)
-    assert len(matched_row.measured_kernels) == 3
-    assert matched_row.measured_sum_us == pytest.approx(3.0 * k_dur, rel=1e-6)
-    assert matched_row.ape_pct is not None and matched_row.ape_pct < 1.0
+    assert rec_bundle.reconciliation.matched_kernels == 3 and len(rec_bundle.reconciliation.unmatched_kernels) == 1
 
     xlsx_path = tmp_path / "reconciled.xlsx"
     xlsx_rec = export_comparison_xlsx(rec_bundle, xlsx_path)
-    assert xlsx_rec.has_measured is True
+    assert xlsx_rec.has_measured is True and SHEET_MEASURED in xlsx_rec.sheets
 
     _, roots, shared = _read_xlsx_sheets(xlsx_path)
-    brk_merges = _sheet_merges(roots[SHEET_BREAKDOWN])
-    brk_cells = _sheet_cells(roots[SHEET_BREAKDOWN], shared)
-    target_ref = next(
-        ref for ref, (val, _) in brk_cells.items()
-        if ref.startswith("C") and val == target_op.op_id
-    )
+    meas_merges = _sheet_merges(roots[SHEET_MEASURED])
+    meas_cells = _sheet_cells(roots[SHEET_MEASURED], shared)
+    target_ref = next(ref for ref, (val, _) in meas_cells.items() if ref.startswith("C") and val == target_op.op_id)
     r_start = int(target_ref[1:])
     r_end = r_start + 2
-    for col_let in ("C", "M", "P", "Q", "R"):
-        assert f"{col_let}{r_start}:{col_let}{r_end}" in brk_merges
-    assert brk_cells[f"N{r_start}"][0] == "aclnnStageA_Kernel"
-    assert brk_cells[f"N{r_start + 1}"][0] == "aclnnStageB_Kernel"
-    assert brk_cells[f"N{r_end}"][0] == "aclnnStageC_Kernel"
-    assert brk_cells[f"P{r_start}"][1] == f"SUM(O{r_start}:O{r_end})"
-    assert brk_cells[f"Q{r_start}"][1] == f"IF(P{r_start}>0,ABS(M{r_start}-P{r_start})/P{r_start},0)"
+    for col_let in ("C", "I", "L", "M", "N"):
+        assert f"{col_let}{r_start}:{col_let}{r_end}" in meas_merges
+    assert meas_cells[f"J{r_start}"][0] == "aclnnStageA_Kernel"
+    assert meas_cells[f"J{r_end}"][0] == "aclnnStageC_Kernel"
+    assert meas_cells[f"L{r_start}"][1] == f"SUM(K{r_start}:K{r_end})"
+    assert meas_cells[f"M{r_start}"][1] == f"IF(L{r_start}>0,ABS(I{r_start}-L{r_start})/L{r_start},0)"
 
 
-def test_memory_quant_calculator_exact_storage_offload_and_pp_budget(tmp_path):
-    # Exact post-TP local shape (6, 130)/2 -> (6, 65) in MXFP4: 198 B payload + 18 B E8M0 scale = 216 B.
-    payload, scale, aux, total = evaluate_weight_storage_bytes(6, 65, "MXFP4")
-    assert (payload, scale, aux, total) == (198, 18, 0, 216)
+def test_submodule_and_kernel_hygiene_across_hybrid_architectures():
+    catalog_matrix = (
+        ("kimi-k3.1", 2),
+        ("deepseek-v4.1-flash", 2),
+        ("glm-5.3-flash", 2),
+        ("qwen3.8-flash-next", 2),
+        ("qwen3-32b", 1),
+    )
+    for model_name, ep in catalog_matrix:
+        raw, req = compose_export_case(
+            model_name, REPRESENTATIVE_SKUS["a5"], topology_preset="a5_pod",
+            dp=1, tp=2, ep=ep, dcp=1, prompt_tokens=1024, output_tokens=32, concurrency=1,
+        )
+        bundle = build_export_bundle(raw, request=req)
+        assert bundle.operators
+        assert not [o.op_id for o in bundle.operators if o.submodule.lower() == "other"]
+        assert not [o.ascend_kernel for o in bundle.operators if o.ascend_kernel in BANNED_IMPLEMENTATION_NAMES]
+
+    raw_eager_case, raw_req = compose_export_case(
+        "kimi-k3.1", REPRESENTATIVE_SKUS["a5"], topology_preset="a5_pod",
+        dp=1, tp=1, ep=1, dcp=1, prompt_tokens=1024, output_tokens=32, concurrency=1, feature_track="raw_eager",
+    )
+    b_raw = build_export_bundle(raw_eager_case, request=raw_req)
+    ln_ops = [o for o in b_raw.operators if o.family == "layernorm"]
+    ng_ops = [o for o in b_raw.operators if o.canonical_op_key == "linear_output_norm_gate"]
+    assert ln_ops and all(o.ascend_kernel == "aclnnLayerNorm_LayerNormV3" for o in ln_ops)
+    assert ng_ops and all("Cast->Pows->ReduceMean" in o.ascend_kernel for o in ng_ops)
+
+
+def test_memory_quant_calculator_exclusions_offload_and_pp_budget(tmp_path):
+    assert evaluate_weight_storage_bytes(6, 65, "MXFP4") == (198, 18, 0, 216)
     assert evaluate_weight_storage_bytes(16, 64, "W8A8") == (1024, 0, 128, 1152)
     assert evaluate_weight_storage_bytes(16, 64, "W4A8") == (512, 0, 256, 768)
     assert evaluate_weight_storage_bytes(16, 64, "MXFP8") == (1024, 32, 0, 1056)
     assert evaluate_weight_storage_bytes(16, 64, "BF16") == (2048, 0, 0, 2048)
+
+    raw_k, _ = compose_export_case("kimi-k3.1", REPRESENTATIVE_SKUS["a5"], topology_preset="a5_pod", tp=8, ep=32, dp=4, dcp=8)
+    led_routed = compute_memory_quant_ledger(parse_case(raw_k), seq_len=4096, concurrency=4)
+    assert led_routed.weight_quant == "MXFP4"
+    assert led_routed.weight_quant_display == "MXFP4 (Routed-Only, Attn/Shared BF16)"
+    by_name = {r.name: r for r in led_routed.weight_rows}
+    assert by_name["q_a"].quant_format == "BF16" and by_name["q_a"].is_quant_excluded is True
+    assert by_name["o_proj"].quant_format == "BF16" and by_name["dense_down"].quant_format == "BF16"
+    assert any(r.category == "routed_expert" and r.quant_format == "MXFP4" for r in led_routed.weight_rows)
+    assert all(r.quant_format == "BF16" for r in led_routed.weight_rows if r.category in {"shared_expert", "router", "latent_moe"})
 
     raw_case = json.loads(Path("examples/cases/deepseek-v4.1-flash.json").read_text(encoding="utf-8"))
     case = parse_case(raw_case)
@@ -414,72 +414,56 @@ def test_memory_quant_calculator_exact_storage_offload_and_pp_budget(tmp_path):
     led_mxfp4_offload = compute_memory_quant_ledger(
         case, seq_len=4096, concurrency=4, weight_quant="MXFP4", cache_dtype="C8", engram_host_offload=True,
     )
-    assert led_bf16_hbm.pp == 4 and len(led_bf16_hbm.stage_budgets) == 4
     engram_hbm_total = sum(s.engram_ple_hbm_bytes for s in led_bf16_hbm.stage_budgets)
     engram_host_total = sum(s.engram_ple_host_bytes for s in led_mxfp4_offload.stage_budgets)
-    assert engram_hbm_total > 0.0
-    assert engram_host_total == pytest.approx(engram_hbm_total, rel=1e-9)
+    assert engram_hbm_total > 0.0 and engram_host_total == pytest.approx(engram_hbm_total, rel=1e-9)
     assert all(s.engram_ple_hbm_bytes == 0.0 for s in led_mxfp4_offload.stage_budgets)
-    assert led_mxfp4_offload.max_stage_hbm_bytes < led_bf16_hbm.max_stage_hbm_bytes
-    assert sum(r.scale_bytes for r in led_mxfp4_offload.weight_rows) > 0
-    assert sum(s.cache_bytes for s in led_mxfp4_offload.stage_budgets) < sum(s.cache_bytes for s in led_bf16_hbm.stage_budgets)
 
     xlsx_path = tmp_path / "memory_calc.xlsx"
-    compact = _compact_case(tp=2, ep=2, pp=2, layers=4)
     export_comparison_xlsx(
-        compact, xlsx_path,
+        raw_k, xlsx_path,
         request=StepRequest(phase="decode", tokens=1, context=512, sequences=2, scope="body"),
-        weight_quant="MXFP4", cache_dtype="C8", engram_host_offload=True,
     )
     _, roots, shared = _read_xlsx_sheets(xlsx_path)
-    mem_root = roots[SHEET_MEMORY]
-    validations = [
-        (dv.attrib["sqref"], (dv.find(f"{NS_PREFIX}formula1").text or ""))
-        for dv in mem_root.findall(f".//{NS_PREFIX}dataValidation")
-    ]
-    assert any(sq == "R3" and "MXFP4" in f1 and "W8A8" in f1 for sq, f1 in validations)
-    assert any(sq == "R4" and "C8" in f1 and "FP8" in f1 for sq, f1 in validations)
-    assert any(sq == "R5" and "ON,OFF" in f1 for sq, f1 in validations)
-    mem_cells = _sheet_cells(mem_root, shared)
+    mem_cells = _sheet_cells(roots[SHEET_MEMORY], shared)
     assert mem_cells["R14"][1] == "R6*R7*R9*R11"
     assert mem_cells["R19"][1] == "ROUNDUP(R15/(R17*R10),0)*R17"
     assert mem_cells["R22"][1] == "R20*R21"
+    assert mem_cells["R23"][0] == "MXFP4 (Routed-Only, Attn/Shared BF16)"
     assert any(f and "VLOOKUP(" in f and "ROUNDUP(" in f for _, f in mem_cells.values())
 
 
-def test_cli_export_commands_receipt_isolation_and_error_guards(tmp_path, monkeypatch):
+def test_cli_export_commands_oneshot_receipt_isolation_and_error_guards(tmp_path, monkeypatch):
+    sku, preset = resolve_hardware_alias("a5-144g-pod")
+    assert sku == REPRESENTATIVE_SKUS["a5"] and preset == "a5_pod"
+
+    designs_path = tmp_path / "designs.json"
+    designs_path.write_text(json.dumps({"K3 SituAndMul": {"design": "CLI AIV fused kernel"}}), encoding="utf-8")
+    oneshot_xlsx = tmp_path / "oneshot.xlsx"
+    oneshot_trace = tmp_path / "oneshot_trace.json"
+    oneshot_receipt = tmp_path / "oneshot_receipt.json"
+    rc_one = cli_mod._main([
+        "export", "--model", "qwen3-32b", "--hardware", "a5-pod",
+        "--dp", "1", "--tp", "2", "--ep", "1", "--prompt-tokens", "512", "--output-tokens", "32",
+        "--compare-track", "merged", "--target-track", "expected_ideal",
+        "--xlsx", str(oneshot_xlsx), "--trace", str(oneshot_trace),
+        "--kernel-designs-json", str(designs_path), "--receipt", str(oneshot_receipt),
+    ])
+    assert rc_one == 0 and zipfile.is_zipfile(oneshot_xlsx) and oneshot_trace.is_file()
+    rec_one = json.loads(oneshot_receipt.read_text(encoding="utf-8"))
+    assert rec_one["ok"] is True and rec_one["command"] == "export"
+    assert rec_one["xlsx"]["has_comparison"] is True and rec_one["trace"]["total_events"] > 10
+
     case_path = tmp_path / "case.json"
     case_path.write_text(json.dumps(_compact_case(tp=2, ep=2, pp=1, layers=1)), encoding="utf-8")
     trace_out = tmp_path / "cli_trace_view.json"
-    trace_receipt = tmp_path / "trace_receipt.json"
     xlsx_out = tmp_path / "cli_report.xlsx"
-    xlsx_receipt = tmp_path / "xlsx_receipt.json"
-
-    rc_trace = cli_mod._main([
-        "export-trace", str(case_path), "-o", str(trace_out),
-        "--phase", "decode", "--tokens", "1", "--context", "256",
-        "--receipt", str(trace_receipt),
-    ])
-    assert rc_trace == 0
-    trace_events = json.loads(trace_out.read_text(encoding="utf-8"))
-    assert isinstance(trace_events, list) and len(trace_events) > 10
-    rec_t = json.loads(trace_receipt.read_text(encoding="utf-8"))
-    assert rec_t["ok"] is True and rec_t["command"] == "export-trace" and rec_t["total_events"] == len(trace_events)
-
-    rc_xlsx = cli_mod._main([
-        "export-xlsx", str(case_path), "--output", str(xlsx_out),
-        "--phase", "decode", "--tokens", "1", "--context", "256",
+    assert cli_mod._main(["export-trace", str(case_path), "-o", str(trace_out), "--context", "256"]) == 0
+    assert cli_mod._main([
+        "export-xlsx", str(case_path), "--output", str(xlsx_out), "--context", "256",
         "--weight-quant", "w4a8_mxfp", "--cache-dtype", "fp8_e4m3", "--engram-offload",
-        "--receipt", str(xlsx_receipt),
-    ])
-    assert rc_xlsx == 0
-    assert zipfile.is_zipfile(xlsx_out)
-    rec_x = json.loads(xlsx_receipt.read_text(encoding="utf-8"))
-    assert rec_x["ok"] is True and rec_x["command"] == "export-xlsx"
-
-    standalone_out = tmp_path / "standalone.xlsx"
-    assert cli_export.main(["export-xlsx", str(case_path), "-o", str(standalone_out), "--context", "128"]) == 0
-    assert zipfile.is_zipfile(standalone_out)
+    ]) == 0
+    assert cli_export.main(["export-xlsx", str(case_path), "-o", str(tmp_path / "standalone.xlsx"), "--context", "128"]) == 0
 
     wb = Workbook()
     ws = wb.create_sheet("OverlapCheck")

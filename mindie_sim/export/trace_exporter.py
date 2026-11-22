@@ -1,19 +1,31 @@
 """Streaming 1:1 Ascend ``msprof`` ``trace_view.json`` exporter for MindStudio Insight.
 
 [Role] Stream Chrome Trace JSON array events matching the native Ascend
-  ``msprof`` / ``torch_npu.profiler`` schema (``ph="M"`` metadata, ``ph="X"``
-  operator/pipe/overlap spans with Lean-4 ``L*`` Gap Radar metadata, ``ph="s"``
-  / ``ph="f"`` ``SetFlag``/``WaitFlag`` flows, and ``ph="C"`` utilization &
-  memory counter series) directly to disk in bounded memory.
+  ``msprof`` / ``torch_npu.profiler`` schema directly to disk in O(Archetypes)
+  bounded memory:
+  - ``PID 0: Python / vLLM-Ascend Framework (Host)`` with 4 top-level tracks:
+    ``vLLM Engine & ModelRunner``, ``Model Layer Scope (MSTX)`` (full multi-layer
+    Target + Draft schedule), ``Submodule Scope (MSTX)``, and ``CANN Runtime /
+    Host Launch`` (``aclGraphLaunch`` / ``aclrtLaunchKernel`` + ``HostToDevice``
+    flow arrows);
+  - ``Ascend Hardware`` (``Stream 0/1/2`` named with real Ascend/CANN/Triton/
+    cannbot-dsl kernels + physically grounded ``Cube (AIC)``, ``Vector (AIV)``,
+    ``MTE2``, ``MTE3``, ``Fixpipe`` pipe durations and ``aic_mac_ratio`` /
+    ``aiv_vec_ratio`` / ``mte2_ratio`` / ``mte3_ratio`` / ``fixpipe_ratio``);
+  - ``HCCL`` (Planes 0/1/2 named with ``hcom_*`` / MC2 kernels);
+  - ``Overlap Analysis`` (``Computing``, ``Communication``,
+    ``Communication(Not Overlapped)``, ``Free``);
+  - ``Ascend Metrics`` (sampled ``HBM Bandwidth``, ``Cube Utilization``,
+    ``Vector Utilization``, ``Active HBM Memory`` counter series).
 [Invariants] Root document is a valid JSON array ``[...]`` with Unix LF endings
-  and ``allow_nan=False`` (readable natively by MindStudio Insight ``msinsight``,
-  Perfetto UI, and ``mindie_profiler.sources_trace.iter_trace_events``). Events
-  are streamed incrementally without ever materializing a full event list in RAM
-  (peak overhead ``<< 512 MiB``). Every ``ph="s"`` flow event has an exact
-  matching ``ph="f"`` (``bp="e"``) event with identical ``id`` and causal
-  ``dst_ts >= src_ts``. Zero ``0.80x`` heuristic scaling or host-path leaks.
-[Timeouts & Locks] Pure bounded single-pass streaming over operators; atomic
-  write via same-directory temp file + ``os.replace``; no locks or device access.
+  and ``allow_nan=False``. Zero arbitrary ``0.75/0.15/0.85`` pipe-fraction
+  heuristics and zero banned internal Python recipe class names. Full multi-layer
+  models (e.g. 93 Target + 5 Draft layers) stream lazily from compact archetype
+  templates without materializing all events in RAM (peak delta ``<< 64 MiB``).
+  Every ``ph="s"`` flow event has an exact matching ``ph="f"`` (``bp="e"``) event
+  with identical ``id`` and causal ``dst_ts >= src_ts``.
+[Timeouts & Locks] Pure single-pass streaming generator; atomic write via
+  same-directory temp file + ``os.replace``; no locks or device access.
 [Side-Effect Policy] Writes only the caller-requested output file path and cleans
   up its private temp file on error.
 """
@@ -30,25 +42,43 @@ from typing import Any
 
 from mindie_sim.prediction.results import CaseInput, ReplayOptions, StepEvaluation, StepRequest
 from .analysis import (
+    DEFAULT_SCENARIO_OUTPUT_TOKENS,
+    DEFAULT_SCENARIO_PROMPT_TOKENS,
     ExportBundle,
     GIB_BYTES,
+    MIN_POSITIVE_SECONDS,
     OperatorExportRow,
+    US_PER_SECOND,
     build_export_bundle,
+    compose_export_case,
 )
 
 #: Schema tag for trace export receipts.
-TRACE_EXPORT_RECEIPT_SCHEMA = "mindie-sim.msprof-trace-receipt/1"
+TRACE_EXPORT_RECEIPT_SCHEMA = "mindie-sim.msprof-trace-receipt/2"
 #: Stream buffer size (64 KiB) for bounded low-RSS JSON emission.
 STREAM_BUFFER_BYTES = 64 * 1024
 #: Timestamp decimal precision in microseconds (3 decimal places = 1 ns).
 TIMESTAMP_US_DECIMALS = 3
 #: Metric rounding decimals for compact readable ``msinsight`` args.
 METRIC_DECIMALS = 3
-#: Ratio rounding decimals for Gap Radar ratios.
+#: Ratio rounding decimals for physical pipe & Gap Radar ratios.
 RATIO_DECIMALS = 4
 #: Maximum counter sample points emitted per series to keep large traces bounded.
 MAX_COUNTER_SAMPLES = 512
-#: Per-die PID block stride guaranteeing disjoint Ascend Hardware / HCCL / Metrics PIDs.
+#: Bytes per decimal GB for GB/s bandwidth counter reporting.
+BYTES_PER_GB = 1_000_000_000.0
+#: Percentage scale factor (100.0%) and midpoint ratio for per-layer counter sampling.
+PCT_SCALE = 100.0
+MIDPOINT_FRACTION = 0.5
+
+#: Top-level Host Framework process ID (always sorted above Ascend Hardware).
+PID_FRAMEWORK = 0
+TID_FW_ENGINE = 0
+TID_FW_LAYER_MSTX = 1
+TID_FW_SUBMODULE_MSTX = 2
+TID_FW_HOST_LAUNCH = 3
+
+#: Per-die PID block stride guaranteeing disjoint Hardware / HCCL / Overlap / Metrics PIDs.
 DIE_PID_STRIDE = 100
 PID_OFFSET_HARDWARE = 1
 PID_OFFSET_HCCL = 2
@@ -59,7 +89,7 @@ PID_OFFSET_METRICS = 4
 TID_STREAM_COMPUTE = 0
 TID_STREAM_MSO_AUX = 1
 TID_STREAM_COMM_CSA = 2
-#: Pipe sub-lane thread IDs inside the ``Ascend Hardware`` process.
+#: Physical pipe sub-lane thread IDs inside the ``Ascend Hardware`` process.
 TID_PIPE_CUBE = 10
 TID_PIPE_VECTOR = 11
 TID_PIPE_MTE2 = 12
@@ -80,17 +110,20 @@ TID_OVERLAP_FREE = 3
 #: Counter thread ID inside the ``Ascend Metrics`` process.
 TID_METRICS_COUNTER = 0
 
-#: Phase split shares used only when a single-op event has multiple active sub-pipes
-#: without explicit ``FusedPipelineDescriptor.phases`` timestamps.
-PIPE_LEAD_FRACTION = 0.25
-PIPE_CORE_START_FRACTION = 0.15
-PIPE_CORE_END_FRACTION = 0.85
-PIPE_TAIL_START_FRACTION = 0.75
+#: Minimum visible sub-pipe span (1 ns = 0.001 us) and host launch submission duration (us).
 PIPE_MIN_SUBSPAN_US = 0.001
+HOST_GRAPH_LAUNCH_US = 12.0
+HOST_KERNEL_LAUNCH_US = 1.5
 FLOW_CAUSAL_EPSILON_US = 1e-6
 
 #: Canonical ``msprof`` process and thread specification exported for introspection.
 MSPROF_PROCESS_SPEC: dict[str, tuple[tuple[int, str], ...]] = {
+    "Python / vLLM-Ascend Framework (Host)": (
+        (TID_FW_ENGINE, "vLLM Engine & ModelRunner"),
+        (TID_FW_LAYER_MSTX, "Model Layer Scope (MSTX)"),
+        (TID_FW_SUBMODULE_MSTX, "Submodule Scope (MSTX)"),
+        (TID_FW_HOST_LAUNCH, "CANN Runtime / Host Launch"),
+    ),
     "Ascend Hardware": (
         (TID_STREAM_COMPUTE, "Stream 0 (Compute)"),
         (TID_STREAM_MSO_AUX, "Stream 1 (MSO / Aux 2nd)"),
@@ -136,6 +169,7 @@ class TraceExportSummary:
     step_span_us: float
     step_l_star_lean_us: float
     bytes_written: int
+    replayed_layers: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -153,7 +187,19 @@ class TraceExportSummary:
             "step_span_us": round(self.step_span_us, TIMESTAMP_US_DECIMALS),
             "step_l_star_lean_us": round(self.step_l_star_lean_us, TIMESTAMP_US_DECIMALS),
             "bytes_written": self.bytes_written,
+            "replayed_layers": self.replayed_layers,
         }
+
+
+@dataclass(frozen=True, slots=True)
+class _ArchetypeTemplate:
+    archetype_id: str
+    ops: tuple[OperatorExportRow, ...]
+    min_start_us: float
+    span_us: float
+    sub_spans: tuple[tuple[str, float, float], ...]
+    comp_intervals: tuple[tuple[float, float], ...]
+    comm_intervals: tuple[tuple[float, float], ...]
 
 
 def _round_us(value: float) -> float:
@@ -162,10 +208,6 @@ def _round_us(value: float) -> float:
 
 def _round_metric(value: float) -> float:
     return round(float(value), METRIC_DECIMALS)
-
-
-def _format_shape(shape: Sequence[int]) -> str:
-    return "x".join(str(int(dim)) for dim in shape) if shape else "scalar"
 
 
 def _die_coordinates(bundle: ExportBundle) -> tuple[tuple[int, int, int], ...]:
@@ -181,7 +223,7 @@ def _pid_base(die_index: int) -> int:
 
 
 def _hccl_tid(op: OperatorExportRow) -> int:
-    lower = f"{op.op_id} {op.family} {op.recipe}".lower()
+    lower = f"{op.op_id} {op.family} {op.recipe} {op.ascend_kernel}".lower()
     if any(tok in lower for tok in ("alltoall", "dispatch", "combine", "expert", "moe", "mc2")):
         return TID_HCCL_EP_MOE
     if any(tok in lower for tok in ("allreduce", "allgather", "reducescatter", "tp", "sp", "cp")):
@@ -189,10 +231,8 @@ def _hccl_tid(op: OperatorExportRow) -> int:
     return TID_HCCL_COLLECTIVE
 
 
-def _op_pid_tid(
-    op: OperatorExportRow, base_pid: int,
-) -> tuple[int, int]:
-    if op.submodule == "Collective" or op.task_type == "HCCL":
+def _op_pid_tid(op: OperatorExportRow, base_pid: int) -> tuple[int, int]:
+    if op.task_type == "HCCL":
         return base_pid + PID_OFFSET_HCCL, _hccl_tid(op)
     if op.stream_index == 1:
         return base_pid + PID_OFFSET_HARDWARE, TID_STREAM_MSO_AUX
@@ -204,6 +244,14 @@ def _op_pid_tid(
 def _iter_metadata_events(
     coords: Sequence[tuple[int, int, int]],
 ) -> Iterator[dict[str, Any]]:
+    fw_name = "Python / vLLM-Ascend Framework (Host)"
+    yield {"ph": "M", "name": "process_name", "pid": PID_FRAMEWORK, "tid": 0, "args": {"name": fw_name}}
+    yield {"ph": "M", "name": "process_labels", "pid": PID_FRAMEWORK, "tid": 0, "args": {"labels": "CPU"}}
+    yield {"ph": "M", "name": "process_sort_index", "pid": PID_FRAMEWORK, "tid": 0, "args": {"sort_index": PID_FRAMEWORK}}
+    for tid, thread_label in MSPROF_PROCESS_SPEC[fw_name]:
+        yield {"ph": "M", "name": "thread_name", "pid": PID_FRAMEWORK, "tid": tid, "args": {"name": thread_label}}
+        yield {"ph": "M", "name": "thread_sort_index", "pid": PID_FRAMEWORK, "tid": tid, "args": {"sort_index": tid}}
+
     multi = len(coords) > 1
     process_offsets = (
         ("Ascend Hardware", PID_OFFSET_HARDWARE, "NPU"),
@@ -216,48 +264,113 @@ def _iter_metadata_events(
         suffix = f" (R{replica}/PP{stage}/Die{rank})" if multi else ""
         for proc_key, offset, label in process_offsets:
             pid = base + offset
-            yield {
-                "ph": "M",
-                "name": "process_name",
-                "pid": pid,
-                "tid": 0,
-                "args": {"name": f"{proc_key}{suffix}"},
-            }
-            yield {
-                "ph": "M",
-                "name": "process_labels",
-                "pid": pid,
-                "tid": 0,
-                "args": {"labels": label},
-            }
-            yield {
-                "ph": "M",
-                "name": "process_sort_index",
-                "pid": pid,
-                "tid": 0,
-                "args": {"sort_index": pid},
-            }
+            yield {"ph": "M", "name": "process_name", "pid": pid, "tid": 0, "args": {"name": f"{proc_key}{suffix}"}}
+            yield {"ph": "M", "name": "process_labels", "pid": pid, "tid": 0, "args": {"labels": label}}
+            yield {"ph": "M", "name": "process_sort_index", "pid": pid, "tid": 0, "args": {"sort_index": pid}}
             for tid, thread_label in MSPROF_PROCESS_SPEC[proc_key]:
-                yield {
-                    "ph": "M",
-                    "name": "thread_name",
-                    "pid": pid,
-                    "tid": tid,
-                    "args": {"name": thread_label},
-                }
-                yield {
-                    "ph": "M",
-                    "name": "thread_sort_index",
-                    "pid": pid,
-                    "tid": tid,
-                    "args": {"sort_index": tid},
-                }
+                yield {"ph": "M", "name": "thread_name", "pid": pid, "tid": tid, "args": {"name": thread_label}}
+                yield {"ph": "M", "name": "thread_sort_index", "pid": pid, "tid": tid, "args": {"sort_index": tid}}
+
+
+def _compute_physical_pipe_times(
+    op: OperatorExportRow, peaks: Mapping[str, float],
+) -> dict[str, float]:
+    """Compute true physical pipe busy durations (us) & ``msprof`` ratios from HW peaks."""
+    cube_rate = op.cube_peak_flops_per_s or float(peaks.get("cube_peak_flops_per_s") or 0.0)
+    vec_rate = float(peaks.get("vector_peak_ops_per_s") or 0.0)
+    hbm_rate = float(peaks.get("hbm_peak_bytes_per_s") or 0.0)
+    mte2_rate = float(peaks.get("mte2_peak_bytes_per_s") or hbm_rate)
+    mte3_rate = float(peaks.get("mte3_peak_bytes_per_s") or hbm_rate)
+    fp_rate = float(peaks.get("fixpipe_peak_bytes_per_s") or hbm_rate)
+
+    fp_bytes = (
+        op.fixpipe_bytes if op.fixpipe_bytes > 0.0
+        else (op.hbm_write_bytes if (op.flops > 0.0 and op.mte3_bytes <= 0.0) else 0.0)
+    )
+    t_cube = (op.flops / cube_rate) * US_PER_SECOND if (op.flops > 0.0 and cube_rate > 0.0) else 0.0
+    t_vec = (op.vector_ops / vec_rate) * US_PER_SECOND if (op.vector_ops > 0.0 and vec_rate > 0.0) else 0.0
+    t_mte2 = (op.mte2_bytes / mte2_rate) * US_PER_SECOND if (op.mte2_bytes > 0.0 and mte2_rate > 0.0) else 0.0
+    t_mte3 = (op.mte3_bytes / mte3_rate) * US_PER_SECOND if (op.mte3_bytes > 0.0 and mte3_rate > 0.0) else 0.0
+    t_fp = (fp_bytes / fp_rate) * US_PER_SECOND if (fp_bytes > 0.0 and fp_rate > 0.0) else 0.0
+
+    dur = max(op.dur_us, PIPE_MIN_SUBSPAN_US)
+    return {
+        "cube_us": min(op.dur_us, t_cube) if t_cube > 0.0 else 0.0,
+        "vec_us": min(op.dur_us, t_vec) if t_vec > 0.0 else 0.0,
+        "mte2_us": min(op.dur_us, t_mte2) if t_mte2 > 0.0 else 0.0,
+        "mte3_us": min(op.dur_us, t_mte3) if t_mte3 > 0.0 else 0.0,
+        "fp_us": min(op.dur_us, t_fp) if t_fp > 0.0 else 0.0,
+        "fp_bytes": fp_bytes,
+        "aic_mac_ratio": round(min(1.0, t_cube / dur), RATIO_DECIMALS) if op.dur_us > 0.0 else 0.0,
+        "aiv_vec_ratio": round(min(1.0, t_vec / dur), RATIO_DECIMALS) if op.dur_us > 0.0 else 0.0,
+        "mte2_ratio": round(min(1.0, t_mte2 / dur), RATIO_DECIMALS) if op.dur_us > 0.0 else 0.0,
+        "mte3_ratio": round(min(1.0, t_mte3 / dur), RATIO_DECIMALS) if op.dur_us > 0.0 else 0.0,
+        "fixpipe_ratio": round(min(1.0, t_fp / dur), RATIO_DECIMALS) if op.dur_us > 0.0 else 0.0,
+    }
+
+
+def _physical_pipe_spans(
+    op: OperatorExportRow,
+    ts0: float,
+    pipe_info: Mapping[str, float],
+    kernel_name: str,
+) -> list[tuple[int, str, float, float, dict[str, Any]]]:
+    """Derive strictly physical sub-pipe spans inside ``[ts0, ts0 + op.dur_us]``."""
+    if op.dur_us <= 0.0:
+        return []
+    dur = op.dur_us
+    d_mte2 = max(PIPE_MIN_SUBSPAN_US, pipe_info["mte2_us"]) if op.mte2_bytes > 0.0 else 0.0
+    d_cube = max(PIPE_MIN_SUBSPAN_US, pipe_info["cube_us"]) if op.flops > 0.0 else 0.0
+    d_vec = max(PIPE_MIN_SUBSPAN_US, pipe_info["vec_us"]) if op.vector_ops > 0.0 else 0.0
+    d_fp = max(PIPE_MIN_SUBSPAN_US, pipe_info["fp_us"]) if pipe_info["fp_bytes"] > 0.0 else 0.0
+    d_mte3 = max(PIPE_MIN_SUBSPAN_US, pipe_info["mte3_us"]) if op.mte3_bytes > 0.0 else 0.0
+
+    d_mte2 = min(dur, d_mte2)
+    d_cube = min(dur, d_cube)
+    d_vec = min(dur, d_vec)
+    d_fp = min(dur, d_fp)
+    d_mte3 = min(dur, d_mte3)
+    store_tail = max(d_fp, d_mte3)
+
+    spans: list[tuple[int, str, float, float, dict[str, Any]]] = []
+    if d_mte2 > 0.0:
+        spans.append((
+            TID_PIPE_MTE2, f"{kernel_name}:MTE2", ts0, d_mte2,
+            {"Pipe": "MTE2", "Bytes": round(op.mte2_bytes, 1), "mte2_ratio": pipe_info["mte2_ratio"], "Kernel": kernel_name},
+        ))
+    if d_cube > 0.0:
+        c_start = ts0 + max(0.0, min(dur - d_cube, (dur - store_tail) - d_cube))
+        spans.append((
+            TID_PIPE_CUBE, f"{kernel_name}:Cube", c_start, d_cube,
+            {"Pipe": "Cube(AIC)", "FLOPs": round(op.flops, 1), "aic_mac_ratio": pipe_info["aic_mac_ratio"], "Dtype": op.dtype, "Kernel": kernel_name},
+        ))
+    if d_vec > 0.0:
+        v_start = ts0 + max(0.0, min(dur - d_vec, (dur - d_mte3) - d_vec))
+        spans.append((
+            TID_PIPE_VECTOR, f"{kernel_name}:Vector", v_start, d_vec,
+            {"Pipe": "Vector(AIV)", "Vector Ops": round(op.vector_ops, 1), "aiv_vec_ratio": pipe_info["aiv_vec_ratio"], "Kernel": kernel_name},
+        ))
+    if d_fp > 0.0:
+        f_start = ts0 + max(0.0, dur - d_fp)
+        spans.append((
+            TID_PIPE_FIXPIPE, f"{kernel_name}:Fixpipe", f_start, d_fp,
+            {"Pipe": "Fixpipe", "Bytes": round(pipe_info["fp_bytes"], 1), "fixpipe_ratio": pipe_info["fixpipe_ratio"], "Kernel": kernel_name},
+        ))
+    if d_mte3 > 0.0:
+        s_start = ts0 + max(0.0, dur - d_mte3)
+        spans.append((
+            TID_PIPE_MTE3, f"{kernel_name}:MTE3", s_start, d_mte3,
+            {"Pipe": "MTE3", "Bytes": round(op.mte3_bytes, 1), "mte3_ratio": pipe_info["mte3_ratio"], "Kernel": kernel_name},
+        ))
+    return spans
 
 
 def _operator_args(
     bundle: ExportBundle,
     op: OperatorExportRow,
     task_id: int,
+    layer_label: str,
+    pipe_info: Mapping[str, float],
     pipeline_info: tuple[int, tuple[str, ...]] | None = None,
 ) -> dict[str, Any]:
     args: dict[str, Any] = {
@@ -267,12 +380,15 @@ def _operator_args(
         "Task Type": op.task_type,
         "Stream Id": op.stream_index,
         "Task Id": task_id,
-        "Layer": op.layer_label,
+        "Layer": layer_label,
+        "Archetype": op.archetype_title or op.layer_label,
         "Submodule": op.submodule,
-        "Op Family": op.family,
-        "Implementation": op.implementation,
-        "Input Shapes": _format_shape(op.shape),
-        "Input Data Types": op.dtype,
+        "Logical Role": op.logical_role,
+        "Ascend Kernel": op.ascend_kernel or op.implementation,
+        "Kernel Backend": op.kernel_backend,
+        "Kernel Status": op.kernel_status,
+        "Source Ref": op.source_ref,
+        "Shapes & Dtype": op.tensor_contract,
         "FLOPs": round(op.flops, 1),
         "Vector Ops": round(op.vector_ops, 1),
         "HBM Read (B)": round(op.hbm_read_bytes, 1),
@@ -280,7 +396,12 @@ def _operator_args(
         "HBM Total (B)": round(op.hbm_total_bytes, 1),
         "Link Bytes (B)": round(op.link_bytes, 1),
         "L2 Hit (%)": _round_metric(op.l2_hit_pct),
-        "Bottleneck": op.dominant_bound,
+        "Bottleneck": op.bound_display or op.dominant_bound,
+        "aic_mac_ratio": pipe_info["aic_mac_ratio"],
+        "aiv_vec_ratio": pipe_info["aiv_vec_ratio"],
+        "mte2_ratio": pipe_info["mte2_ratio"],
+        "mte3_ratio": pipe_info["mte3_ratio"],
+        "fixpipe_ratio": pipe_info["fixpipe_ratio"],
         "L* Physical Lower Bound (us)": _round_us(op.l_star_lean_us),
         "Sim Pred (us)": _round_us(op.dur_us),
         "Gap vs L* (us)": round(op.gap_us, TIMESTAMP_US_DECIMALS),
@@ -299,51 +420,6 @@ def _operator_args(
     if op.ape_pct is not None:
         args["APE (%)"] = _round_metric(op.ape_pct)
     return args
-
-
-def _active_pipe_spans(
-    op: OperatorExportRow,
-) -> list[tuple[int, str, float, float, dict[str, Any]]]:
-    """Derive bounded sub-pipe spans inside ``[op.start_us, op.end_us]``."""
-    if op.dur_us <= 0.0:
-        return []
-    ts0 = op.start_us
-    dur = op.dur_us
-    spans: list[tuple[int, str, float, float, dict[str, Any]]] = []
-    if op.mte2_bytes > 0.0:
-        load_dur = max(PIPE_MIN_SUBSPAN_US, dur * (1.0 - PIPE_LEAD_FRACTION))
-        spans.append((
-            TID_PIPE_MTE2, f"{op.op_id}:MTE2", ts0, min(dur, load_dur),
-            {"Pipe": "MTE2", "Bytes": round(op.mte2_bytes, 1), "Op Id": op.op_id},
-        ))
-    if op.flops > 0.0:
-        c_start = ts0 + (dur * PIPE_CORE_START_FRACTION if op.mte2_bytes > 0.0 else 0.0)
-        c_end = ts0 + dur * (PIPE_CORE_END_FRACTION if (op.fixpipe_bytes > 0.0 or op.mte3_bytes > 0.0) else 1.0)
-        spans.append((
-            TID_PIPE_CUBE, f"{op.op_id}:Cube", c_start, max(PIPE_MIN_SUBSPAN_US, c_end - c_start),
-            {"Pipe": "Cube(AIC)", "FLOPs": round(op.flops, 1), "Dtype": op.dtype, "Op Id": op.op_id},
-        ))
-    if op.vector_ops > 0.0:
-        v_start = ts0 + (dur * PIPE_CORE_START_FRACTION if op.mte2_bytes > 0.0 else 0.0)
-        v_end = ts0 + dur * (PIPE_CORE_END_FRACTION if op.mte3_bytes > 0.0 else 1.0)
-        spans.append((
-            TID_PIPE_VECTOR, f"{op.op_id}:Vector", v_start, max(PIPE_MIN_SUBSPAN_US, v_end - v_start),
-            {"Pipe": "Vector(AIV)", "Vector Ops": round(op.vector_ops, 1), "Op Id": op.op_id},
-        ))
-    if op.fixpipe_bytes > 0.0 or (op.flops > 0.0 and op.hbm_write_bytes > 0.0 and op.mte3_bytes <= 0.0):
-        fp_bytes = op.fixpipe_bytes if op.fixpipe_bytes > 0.0 else op.hbm_write_bytes
-        f_start = ts0 + dur * PIPE_TAIL_START_FRACTION
-        spans.append((
-            TID_PIPE_FIXPIPE, f"{op.op_id}:Fixpipe", f_start, max(PIPE_MIN_SUBSPAN_US, (ts0 + dur) - f_start),
-            {"Pipe": "Fixpipe", "Bytes": round(fp_bytes, 1), "Op Id": op.op_id},
-        ))
-    if op.mte3_bytes > 0.0:
-        s_start = ts0 + dur * PIPE_TAIL_START_FRACTION
-        spans.append((
-            TID_PIPE_MTE3, f"{op.op_id}:MTE3", s_start, max(PIPE_MIN_SUBSPAN_US, (ts0 + dur) - s_start),
-            {"Pipe": "MTE3", "Bytes": round(op.mte3_bytes, 1), "Op Id": op.op_id},
-        ))
-    return spans
 
 
 def _merge_intervals(intervals: Sequence[tuple[float, float]]) -> list[tuple[float, float]]:
@@ -388,29 +464,159 @@ def _subtract_intervals(
     return result
 
 
-def _iter_overlap_events(
-    bundle: ExportBundle,
-    die_map: Mapping[tuple[int, int, int], int],
-) -> Iterator[dict[str, Any]]:
-    comp_by_die: dict[int, list[tuple[float, float]]] = defaultdict(list)
-    comm_by_die: dict[int, list[tuple[float, float]]] = defaultdict(list)
+def _build_archetype_templates(bundle: ExportBundle) -> dict[str, _ArchetypeTemplate]:
+    grouped: dict[str, list[OperatorExportRow]] = defaultdict(list)
     for op in bundle.operators:
-        if op.dur_us <= 0.0:
-            continue
-        coord = (op.occurrence.replica, op.occurrence.stage, int(op.occurrence.rank or 0))
-        d_idx = die_map.get(coord, 0)
-        if op.submodule == "Collective" or op.task_type == "HCCL":
-            comm_by_die[d_idx].append((op.start_us, op.end_us))
-        else:
-            comp_by_die[d_idx].append((op.start_us, op.end_us))
+        grouped[op.archetype_id or op.layer_label].append(op)
+    span_by_arch = {a.archetype_id: a.single_span_us for a in bundle.archetypes}
+    templates: dict[str, _ArchetypeTemplate] = {}
+    for aid, ops in grouped.items():
+        min_s = min((op.start_us for op in ops), default=0.0)
+        max_e = max((op.end_us for op in ops), default=min_s)
+        span = span_by_arch.get(aid, max(0.0, max_e - min_s))
+        if span <= 0.0:
+            span = max(0.0, max_e - min_s)
+        sub_spans: list[tuple[str, float, float]] = []
+        comp_iv: list[tuple[float, float]] = []
+        comm_iv: list[tuple[float, float]] = []
+        for op in ops:
+            r_s = max(0.0, op.start_us - min_s)
+            r_e = max(r_s, op.end_us - min_s)
+            if r_e > r_s:
+                if op.task_type == "HCCL":
+                    comm_iv.append((r_s, r_e))
+                else:
+                    comp_iv.append((r_s, r_e))
+            if sub_spans and sub_spans[-1][0] == op.submodule:
+                prev_sub, p_lo, p_hi = sub_spans[-1]
+                sub_spans[-1] = (prev_sub, min(p_lo, r_s), max(p_hi, r_e))
+            else:
+                sub_spans.append((op.submodule, r_s, r_e))
+        templates[aid] = _ArchetypeTemplate(
+            archetype_id=aid,
+            ops=tuple(ops),
+            min_start_us=min_s,
+            span_us=span,
+            sub_spans=tuple(sub_spans),
+            comp_intervals=tuple(_merge_intervals(comp_iv)),
+            comm_intervals=tuple(_merge_intervals(comm_iv)),
+        )
+    return templates
 
-    for d_idx in sorted(set(die_map.values())):
+
+def _emit_host_launch_with_flow(
+    *,
+    name: str,
+    dev_ts: float,
+    dev_pid: int,
+    dev_tid: int,
+    launch_dur_us: float,
+    flow_id: int,
+    extra_args: Mapping[str, Any],
+) -> tuple[list[dict[str, Any]], int]:
+    host_ts = max(0.0, dev_ts - launch_dur_us)
+    host_dur = max(PIPE_MIN_SUBSPAN_US, min(launch_dur_us, dev_ts - host_ts) if dev_ts > host_ts else PIPE_MIN_SUBSPAN_US)
+    flow_src_ts = _round_us(host_ts + host_dur)
+    flow_dst_ts = max(flow_src_ts, _round_us(dev_ts))
+    f_args = {"launch": name, "sync_kind": "HostToDevice", **extra_args}
+    events = [
+        {
+            "name": name, "cat": "Runtime", "ph": "X",
+            "ts": _round_us(host_ts), "dur": _round_us(host_dur),
+            "pid": PID_FRAMEWORK, "tid": TID_FW_HOST_LAUNCH,
+            "args": dict(f_args),
+        },
+        {
+            "name": f"HostToDevice->{name}", "cat": "HostToDevice", "ph": "s",
+            "id": flow_id, "ts": flow_src_ts,
+            "pid": PID_FRAMEWORK, "tid": TID_FW_HOST_LAUNCH,
+            "args": f_args,
+        },
+        {
+            "name": f"HostToDevice<-{name}", "cat": "HostToDevice", "ph": "f",
+            "bp": "e", "id": flow_id, "ts": flow_dst_ts,
+            "pid": dev_pid, "tid": dev_tid,
+            "args": f_args,
+        },
+    ]
+    return events, flow_id + 1
+
+
+def _emit_op_and_pipes(
+    bundle: ExportBundle,
+    op: OperatorExportRow,
+    *,
+    ts_start: float,
+    task_id: int,
+    layer_label: str,
+    base_pid: int,
+    flow_id: int,
+    include_pipe_lanes: bool,
+    pipeline_info: tuple[int, tuple[str, ...]] | None,
+    op_placement: Mapping[Any, tuple[int, int, float, str]],
+) -> tuple[list[dict[str, Any]], tuple[int, int, float, str], int]:
+    pid, tid = _op_pid_tid(op, base_pid)
+    cat = "Communication" if op.task_type == "HCCL" else "Kernel"
+    k_name = op.ascend_kernel or op.implementation
+    event_name = f"{k_name} [{op.canonical_op_key}]" if op.canonical_op_key else k_name
+    pipe_info = _compute_physical_pipe_times(op, bundle.hardware_peaks)
+    ts_end = ts_start + op.dur_us
+    events: list[dict[str, Any]] = [{
+        "name": event_name,
+        "cat": cat,
+        "ph": "X",
+        "ts": _round_us(ts_start),
+        "dur": _round_us(op.dur_us),
+        "pid": pid,
+        "tid": tid,
+        "args": _operator_args(bundle, op, task_id, layer_label, pipe_info, pipeline_info),
+    }]
+    placement = (pid, tid, ts_end, k_name)
+
+    for pred in op.predecessors:
+        src = op_placement.get(pred)
+        if src is None:
+            continue
+        src_pid, src_tid, src_end_us, src_name = src
+        if src_pid == pid and src_tid == tid:
+            continue
+        dst_ts = max(src_end_us, ts_start)
+        sync_kind = "EventRecord/Wait" if src_pid != pid else "StreamSync"
+        f_args = {"src_kernel": src_name, "dst_kernel": k_name, "sync_kind": sync_kind}
+        events.append({
+            "name": f"SetFlag->{sync_kind}", "cat": "SetFlag_WaitFlag", "ph": "s",
+            "id": flow_id, "ts": _round_us(src_end_us), "pid": src_pid, "tid": src_tid, "args": f_args,
+        })
+        events.append({
+            "name": f"WaitFlag<-{sync_kind}", "cat": "SetFlag_WaitFlag", "ph": "f", "bp": "e",
+            "id": flow_id, "ts": _round_us(dst_ts), "pid": pid, "tid": tid, "args": f_args,
+        })
+        flow_id += 1
+
+    if include_pipe_lanes and op.task_type != "HCCL":
+        hw_pid = base_pid + PID_OFFSET_HARDWARE
+        for p_tid, p_name, p_ts, p_dur, p_args in _physical_pipe_spans(op, ts_start, pipe_info, k_name):
+            events.append({
+                "name": p_name, "cat": "Pipe", "ph": "X",
+                "ts": _round_us(p_ts), "dur": _round_us(p_dur),
+                "pid": hw_pid, "tid": p_tid, "args": p_args,
+            })
+    return events, placement, flow_id
+
+
+def _iter_overlap_from_intervals(
+    comp_by_die: Mapping[int, Sequence[tuple[float, float]]],
+    comm_by_die: Mapping[int, Sequence[tuple[float, float]]],
+    die_indices: Sequence[int],
+    total_span_us: float,
+) -> Iterator[dict[str, Any]]:
+    for d_idx in die_indices:
         pid = _pid_base(d_idx) + PID_OFFSET_OVERLAP
         comp = _merge_intervals(comp_by_die.get(d_idx, ()))
         comm = _merge_intervals(comm_by_die.get(d_idx, ()))
         comm_only = _subtract_intervals(comm, comp)
         busy = _merge_intervals([*comp, *comm])
-        step_end = max(bundle.step_span_us, max((hi for _, hi in busy), default=0.0))
+        step_end = max(total_span_us, max((hi for _, hi in busy), default=0.0))
         free = _subtract_intervals([(0.0, step_end)], busy) if step_end > 0.0 else []
         for tid, label, intervals in (
             (TID_OVERLAP_COMPUTING, "Computing", comp),
@@ -422,108 +628,279 @@ def _iter_overlap_events(
                 if hi <= lo:
                     continue
                 yield {
-                    "name": label,
-                    "cat": "Overlap",
-                    "ph": "X",
-                    "ts": _round_us(lo),
-                    "dur": _round_us(hi - lo),
-                    "pid": pid,
-                    "tid": tid,
+                    "name": label, "cat": "Overlap", "ph": "X",
+                    "ts": _round_us(lo), "dur": _round_us(hi - lo),
+                    "pid": pid, "tid": tid,
                     "args": {"Overlap Lane": label, "Duration (us)": _round_us(hi - lo)},
                 }
 
 
-def _iter_counter_events(
+def _iter_counter_events_from_samples(
     bundle: ExportBundle,
-    die_map: Mapping[tuple[int, int, int], int],
+    samples_by_die: Mapping[int, Sequence[tuple[float, float, float, float, float]]],
 ) -> Iterator[dict[str, Any]]:
     peaks = bundle.hardware_peaks
-    hbm_peak_gbps = float(peaks.get("hbm_peak_bytes_per_s", 0.0) or 0.0) / 1_000_000_000.0
-    cube_peak = float(peaks.get("cube_peak_flops_per_s", 0.0) or 0.0)
-    vec_peak = float(peaks.get("vector_peak_ops_per_s", 0.0) or 0.0)
+    hbm_peak_gbps = float(peaks.get("hbm_peak_bytes_per_s", 0.0) or 0.0) / BYTES_PER_GB
     mem_ledger = bundle.memory_ledger
     resident_gib = (
-        (mem_ledger.max_stage_hbm_bytes - sum(
-            b.workspace_peak_bytes for b in mem_ledger.stage_budgets[:1]
-        )) / float(GIB_BYTES)
+        (mem_ledger.max_stage_hbm_bytes - sum(b.workspace_peak_bytes for b in mem_ledger.stage_budgets[:1]))
+        / float(GIB_BYTES)
         if mem_ledger.stage_budgets else 0.0
     )
     resident_gib = max(0.0, resident_gib)
 
-    ops_by_die: dict[int, list[OperatorExportRow]] = defaultdict(list)
-    for op in bundle.operators:
-        if op.dur_us <= 0.0:
-            continue
-        coord = (op.occurrence.replica, op.occurrence.stage, int(op.occurrence.rank or 0))
-        ops_by_die[die_map.get(coord, 0)].append(op)
-
-    for d_idx in sorted(set(die_map.values())):
+    for d_idx, samples in sorted(samples_by_die.items()):
         pid = _pid_base(d_idx) + PID_OFFSET_METRICS
-        die_ops = ops_by_die.get(d_idx, ())
-        if not die_ops:
+        if not samples:
             continue
-        deltas: dict[float, list[float]] = defaultdict(lambda: [0.0, 0.0, 0.0, 0.0])
-        for op in die_ops:
-            dur_s = max(op.dur_us / 1_000_000.0, 1e-12)
-            bw_gbps = (op.hbm_total_bytes / dur_s) / 1_000_000_000.0
-            cube_pct = (100.0 * (op.flops / dur_s) / cube_peak) if cube_peak > 0.0 else 0.0
-            vec_pct = (100.0 * (op.vector_ops / dur_s) / vec_peak) if vec_peak > 0.0 else 0.0
-            ws_gib = (op.hbm_write_bytes + op.mte3_bytes) / float(GIB_BYTES)
-            t0, t1 = _round_us(op.start_us), _round_us(op.end_us)
-            for idx, val in enumerate((bw_gbps, cube_pct, vec_pct, ws_gib)):
-                deltas[t0][idx] += val
-                deltas[t1][idx] -= val
-
-        timestamps = sorted(deltas)
-        stride = max(1, (len(timestamps) + MAX_COUNTER_SAMPLES - 1) // MAX_COUNTER_SAMPLES)
-        bw_acc = cube_acc = vec_acc = ws_acc = 0.0
-        for step_idx, ts_us in enumerate(timestamps):
-            d_bw, d_cube, d_vec, d_ws = deltas[ts_us]
-            bw_acc += d_bw
-            cube_acc += d_cube
-            vec_acc += d_vec
-            ws_acc += d_ws
-            if step_idx % stride != 0 and step_idx != len(timestamps) - 1:
+        stride = max(1, (len(samples) + MAX_COUNTER_SAMPLES - 1) // MAX_COUNTER_SAMPLES)
+        for idx, (ts_us, bw_gbps, cube_pct, vec_pct, ws_gib) in enumerate(samples):
+            if idx % stride != 0 and idx != len(samples) - 1:
                 continue
-            bw_val = max(0.0, min(bw_acc, hbm_peak_gbps if hbm_peak_gbps > 0.0 else bw_acc))
-            cube_val = max(0.0, min(100.0, cube_acc))
-            vec_val = max(0.0, min(100.0, vec_acc))
-            active_gib = max(resident_gib, resident_gib + max(0.0, ws_acc))
+            bw_val = max(0.0, min(bw_gbps, hbm_peak_gbps if hbm_peak_gbps > 0.0 else bw_gbps))
             yield {
-                "name": "HBM Bandwidth (GB/s)",
-                "ph": "C",
-                "ts": ts_us,
-                "pid": pid,
-                "tid": TID_METRICS_COUNTER,
-                "args": {"HBM_BW_GBps": _round_metric(bw_val)},
+                "name": "HBM Bandwidth (GB/s)", "ph": "C", "ts": _round_us(ts_us),
+                "pid": pid, "tid": TID_METRICS_COUNTER, "args": {"HBM_BW_GBps": _round_metric(bw_val)},
             }
             yield {
-                "name": "Cube Utilization (%)",
-                "ph": "C",
-                "ts": ts_us,
-                "pid": pid,
-                "tid": TID_METRICS_COUNTER,
-                "args": {"Cube_Util_Pct": _round_metric(cube_val)},
+                "name": "Cube Utilization (%)", "ph": "C", "ts": _round_us(ts_us),
+                "pid": pid, "tid": TID_METRICS_COUNTER, "args": {"Cube_Util_Pct": _round_metric(min(PCT_SCALE, max(0.0, cube_pct)))},
             }
             yield {
-                "name": "Vector Utilization (%)",
-                "ph": "C",
-                "ts": ts_us,
-                "pid": pid,
-                "tid": TID_METRICS_COUNTER,
-                "args": {"Vector_Util_Pct": _round_metric(vec_val)},
+                "name": "Vector Utilization (%)", "ph": "C", "ts": _round_us(ts_us),
+                "pid": pid, "tid": TID_METRICS_COUNTER, "args": {"Vector_Util_Pct": _round_metric(min(PCT_SCALE, max(0.0, vec_pct)))},
             }
             yield {
-                "name": "Active HBM Memory (GiB)",
-                "ph": "C",
-                "ts": ts_us,
-                "pid": pid,
-                "tid": TID_METRICS_COUNTER,
+                "name": "Active HBM Memory (GiB)", "ph": "C", "ts": _round_us(ts_us),
+                "pid": pid, "tid": TID_METRICS_COUNTER,
                 "args": {
                     "Resident_GiB": _round_metric(resident_gib),
-                    "Active_Total_GiB": _round_metric(active_gib),
+                    "Active_Total_GiB": _round_metric(max(resident_gib, resident_gib + max(0.0, ws_gib))),
                 },
             }
+
+
+def _layer_metric_sample(
+    ops: Sequence[OperatorExportRow], ts_mid: float, span_us: float, peaks: Mapping[str, float],
+) -> tuple[float, float, float, float, float]:
+    dur_s = max(span_us / US_PER_SECOND, MIN_POSITIVE_SECONDS)
+    cube_peak = float(peaks.get("cube_peak_flops_per_s", 0.0) or 0.0)
+    vec_peak = float(peaks.get("vector_peak_ops_per_s", 0.0) or 0.0)
+    hbm_tot = sum(op.hbm_total_bytes for op in ops)
+    flops = sum(op.flops for op in ops)
+    vec_ops = sum(op.vector_ops for op in ops)
+    ws_gib = max((op.hbm_write_bytes + op.mte3_bytes for op in ops), default=0.0) / float(GIB_BYTES)
+    bw_gbps = (hbm_tot / dur_s) / BYTES_PER_GB
+    cube_pct = (PCT_SCALE * (flops / dur_s) / cube_peak) if cube_peak > 0.0 else 0.0
+    vec_pct = (PCT_SCALE * (vec_ops / dur_s) / vec_peak) if vec_peak > 0.0 else 0.0
+    return ts_mid, bw_gbps, cube_pct, vec_pct, ws_gib
+
+
+def _iter_scheduled_full_model_trace(
+    bundle: ExportBundle,
+    die_map: Mapping[tuple[int, int, int], int],
+    pipeline_by_occ: Mapping[Any, tuple[int, tuple[str, ...]]],
+    *,
+    include_pipe_lanes: bool,
+    include_counters: bool,
+    include_overlap: bool,
+) -> Iterator[dict[str, Any]]:
+    """Stream full multi-layer Target + Draft schedule from compact archetype templates."""
+    templates = _build_archetype_templates(bundle)
+    total_span_us = sum(
+        templates[e.archetype_id].span_us for e in bundle.full_trace_schedule if e.archetype_id in templates
+    )
+    yield {
+        "name": f"ModelRunner.execute_model [{bundle.model_name} | {bundle.phase.upper()} | graph={bundle.graph_capture_mode}]",
+        "cat": "Framework", "ph": "X", "ts": 0.0, "dur": _round_us(total_span_us),
+        "pid": PID_FRAMEWORK, "tid": TID_FW_ENGINE,
+        "args": {
+            "Model": bundle.model_name, "Hardware": bundle.hardware_sku,
+            "Target Layers": bundle.total_target_layers, "Draft Layers": bundle.total_draft_layers,
+            "Graph Capture": bundle.graph_capture_mode, "Feature Track": bundle.feature_track,
+        },
+    }
+
+    is_graph_mode = bundle.graph_capture_mode.lower() not in {"eager", "none", "off"}
+    comp_by_die: dict[int, list[tuple[float, float]]] = defaultdict(list)
+    comm_by_die: dict[int, list[tuple[float, float]]] = defaultdict(list)
+    samples_by_die: dict[int, list[tuple[float, float, float, float, float]]] = defaultdict(list)
+
+    ts_cursor = 0.0
+    task_id = 1
+    flow_id = 1
+    launched_scopes: set[str] = set()
+    scope_bounds: dict[str, list[float]] = {}
+
+    for entry in bundle.full_trace_schedule:
+        tpl = templates.get(entry.archetype_id)
+        if tpl is None or not tpl.ops:
+            continue
+        l_start = ts_cursor
+        l_end = ts_cursor + tpl.span_us
+        if entry.scope not in scope_bounds:
+            scope_bounds[entry.scope] = [l_start, l_end]
+        else:
+            scope_bounds[entry.scope][1] = l_end
+
+        yield {
+            "name": entry.label, "cat": "MSTX_Layer", "ph": "X",
+            "ts": _round_us(l_start), "dur": _round_us(tpl.span_us),
+            "pid": PID_FRAMEWORK, "tid": TID_FW_LAYER_MSTX,
+            "args": {"Scope": entry.scope, "Archetype": entry.archetype_id, "Layer": entry.full_layer_index},
+        }
+        for sub_name, r_lo, r_hi in tpl.sub_spans:
+            if r_hi <= r_lo:
+                continue
+            yield {
+                "name": f"{sub_name} ({entry.label})", "cat": "MSTX_Submodule", "ph": "X",
+                "ts": _round_us(l_start + r_lo), "dur": _round_us(r_hi - r_lo),
+                "pid": PID_FRAMEWORK, "tid": TID_FW_SUBMODULE_MSTX,
+                "args": {"Submodule": sub_name, "Layer": entry.label},
+            }
+
+        op_placement: dict[Any, tuple[int, int, float, str]] = {}
+        first_op_for_scope = entry.scope not in launched_scopes
+        for op in tpl.ops:
+            coord = (op.occurrence.replica, op.occurrence.stage, int(op.occurrence.rank or 0))
+            d_idx = die_map.get(coord, 0)
+            base = _pid_base(d_idx)
+            op_ts = l_start + max(0.0, op.start_us - tpl.min_start_us)
+            if first_op_for_scope or not is_graph_mode:
+                dev_pid, dev_tid = _op_pid_tid(op, base)
+                launch_name = (
+                    f"aclGraphLaunch ({entry.scope.upper()})" if is_graph_mode
+                    else f"aclrtLaunchKernel ({op.ascend_kernel})"
+                )
+                l_events, flow_id = _emit_host_launch_with_flow(
+                    name=launch_name, dev_ts=op_ts, dev_pid=dev_pid, dev_tid=dev_tid,
+                    launch_dur_us=HOST_GRAPH_LAUNCH_US if is_graph_mode else HOST_KERNEL_LAUNCH_US,
+                    flow_id=flow_id, extra_args={"scope": entry.scope, "layer": entry.label},
+                )
+                yield from l_events
+                launched_scopes.add(entry.scope)
+                first_op_for_scope = False
+
+            events, placement, flow_id = _emit_op_and_pipes(
+                bundle, op,
+                ts_start=op_ts, task_id=task_id, layer_label=entry.label,
+                base_pid=base, flow_id=flow_id, include_pipe_lanes=include_pipe_lanes,
+                pipeline_info=pipeline_by_occ.get(op.occurrence),
+                op_placement=op_placement,
+            )
+            yield from events
+            op_placement[op.occurrence] = placement
+            task_id += 1
+
+        # Accumulate compact per-layer overlap intervals & counter samples (O(1) per layer).
+        d0 = die_map.get((tpl.ops[0].occurrence.replica, tpl.ops[0].occurrence.stage, int(tpl.ops[0].occurrence.rank or 0)), 0)
+        for r_lo, r_hi in tpl.comp_intervals:
+            comp_by_die[d0].append((l_start + r_lo, l_start + r_hi))
+        for r_lo, r_hi in tpl.comm_intervals:
+            comm_by_die[d0].append((l_start + r_lo, l_start + r_hi))
+        if include_counters and tpl.span_us > 0.0:
+            samples_by_die[d0].append(_layer_metric_sample(tpl.ops, l_start + tpl.span_us * MIDPOINT_FRACTION, tpl.span_us, bundle.hardware_peaks))
+        ts_cursor = l_end
+
+    for sc_key, (s_lo, s_hi) in scope_bounds.items():
+        if s_hi > s_lo:
+            sc_title = (
+                f"Target Forward Pass ({bundle.total_target_layers} Layers)" if sc_key == "target"
+                else f"Speculative Draft Forward Pass ({bundle.total_draft_layers} Layers)"
+            )
+            yield {
+                "name": sc_title, "cat": "Framework", "ph": "X",
+                "ts": _round_us(s_lo), "dur": _round_us(s_hi - s_lo),
+                "pid": PID_FRAMEWORK, "tid": TID_FW_ENGINE,
+                "args": {"Scope": sc_key},
+            }
+
+    if include_overlap:
+        yield from _iter_overlap_from_intervals(comp_by_die, comm_by_die, sorted(set(die_map.values())), ts_cursor)
+    if include_counters:
+        yield from _iter_counter_events_from_samples(bundle, samples_by_die)
+
+
+def _iter_direct_trace(
+    bundle: ExportBundle,
+    die_map: Mapping[tuple[int, int, int], int],
+    pipeline_by_occ: Mapping[Any, tuple[int, tuple[str, ...]]],
+    *,
+    include_pipe_lanes: bool,
+    include_counters: bool,
+    include_overlap: bool,
+) -> Iterator[dict[str, Any]]:
+    """Fallback single-pass streamer when caller passed an explicit ``step_eval``."""
+    yield {
+        "name": f"ModelRunner.execute_model [{bundle.model_name} | {bundle.phase.upper()}]",
+        "cat": "Framework", "ph": "X", "ts": 0.0, "dur": _round_us(bundle.step_span_us),
+        "pid": PID_FRAMEWORK, "tid": TID_FW_ENGINE,
+        "args": {"Model": bundle.model_name, "Hardware": bundle.hardware_sku},
+    }
+    comp_by_die: dict[int, list[tuple[float, float]]] = defaultdict(list)
+    comm_by_die: dict[int, list[tuple[float, float]]] = defaultdict(list)
+    samples_by_die: dict[int, list[tuple[float, float, float, float, float]]] = defaultdict(list)
+    op_placement: dict[Any, tuple[int, int, float, str]] = {}
+    layer_spans: list[tuple[str, float, float]] = []
+    sub_spans: list[tuple[str, str, float, float]] = []
+    flow_id = 1
+    launched = False
+
+    for task_id, op in enumerate(bundle.operators, start=1):
+        coord = (op.occurrence.replica, op.occurrence.stage, int(op.occurrence.rank or 0))
+        d_idx = die_map.get(coord, 0)
+        base = _pid_base(d_idx)
+        if not launched:
+            dev_pid, dev_tid = _op_pid_tid(op, base)
+            l_events, flow_id = _emit_host_launch_with_flow(
+                name=f"aclGraphLaunch ({bundle.phase.upper()})", dev_ts=op.start_us,
+                dev_pid=dev_pid, dev_tid=dev_tid, launch_dur_us=HOST_GRAPH_LAUNCH_US,
+                flow_id=flow_id, extra_args={"phase": bundle.phase},
+            )
+            yield from l_events
+            launched = True
+        lbl = op.archetype_title or op.layer_label
+        events, placement, flow_id = _emit_op_and_pipes(
+            bundle, op, ts_start=op.start_us, task_id=task_id, layer_label=lbl,
+            base_pid=base, flow_id=flow_id, include_pipe_lanes=include_pipe_lanes,
+            pipeline_info=pipeline_by_occ.get(op.occurrence), op_placement=op_placement,
+        )
+        yield from events
+        op_placement[op.occurrence] = placement
+        if op.dur_us > 0.0:
+            if op.task_type == "HCCL":
+                comm_by_die[d_idx].append((op.start_us, op.end_us))
+            else:
+                comp_by_die[d_idx].append((op.start_us, op.end_us))
+            if include_counters:
+                samples_by_die[d_idx].append(_layer_metric_sample((op,), op.start_us, op.dur_us, bundle.hardware_peaks))
+        if layer_spans and layer_spans[-1][0] == lbl:
+            layer_spans[-1] = (lbl, min(layer_spans[-1][1], op.start_us), max(layer_spans[-1][2], op.end_us))
+        else:
+            layer_spans.append((lbl, op.start_us, op.end_us))
+        if sub_spans and sub_spans[-1][0] == lbl and sub_spans[-1][1] == op.submodule:
+            sub_spans[-1] = (lbl, op.submodule, min(sub_spans[-1][2], op.start_us), max(sub_spans[-1][3], op.end_us))
+        else:
+            sub_spans.append((lbl, op.submodule, op.start_us, op.end_us))
+
+    for lbl, lo, hi in layer_spans:
+        if hi > lo:
+            yield {
+                "name": lbl, "cat": "MSTX_Layer", "ph": "X",
+                "ts": _round_us(lo), "dur": _round_us(hi - lo),
+                "pid": PID_FRAMEWORK, "tid": TID_FW_LAYER_MSTX, "args": {"Layer": lbl},
+            }
+    for lbl, sub, lo, hi in sub_spans:
+        if hi > lo:
+            yield {
+                "name": f"{sub} ({lbl})", "cat": "MSTX_Submodule", "ph": "X",
+                "ts": _round_us(lo), "dur": _round_us(hi - lo),
+                "pid": PID_FRAMEWORK, "tid": TID_FW_SUBMODULE_MSTX, "args": {"Submodule": sub, "Layer": lbl},
+            }
+    if include_overlap:
+        yield from _iter_overlap_from_intervals(comp_by_die, comm_by_die, sorted(set(die_map.values())), bundle.step_span_us)
+    if include_counters:
+        yield from _iter_counter_events_from_samples(bundle, samples_by_die)
 
 
 def iter_msprof_trace_events(
@@ -533,7 +910,7 @@ def iter_msprof_trace_events(
     include_counters: bool = True,
     include_overlap: bool = True,
 ) -> Iterator[dict[str, Any]]:
-    """Yield 1:1 Ascend ``msprof`` Chrome Trace events lazily with O(active) memory."""
+    """Yield 1:1 Ascend ``msprof`` Chrome Trace events lazily with O(Archetypes) memory."""
     coords = _die_coordinates(bundle)
     die_map = {coord: idx for idx, coord in enumerate(coords)}
     yield from _iter_metadata_events(coords)
@@ -542,113 +919,60 @@ def iter_msprof_trace_events(
         pipe.owner: (len(pipe.phases), pipe.member_op_ids)
         for pipe in bundle.pipelines
     }
-    op_placement: dict[Any, tuple[int, int, float, str]] = {}
-    flow_id = 1
-    for task_id, op in enumerate(bundle.operators, start=1):
-        coord = (op.occurrence.replica, op.occurrence.stage, int(op.occurrence.rank or 0))
-        base = _pid_base(die_map.get(coord, 0))
-        pid, tid = _op_pid_tid(op, base)
-        cat = "Communication" if (op.submodule == "Collective" or op.task_type == "HCCL") else "Kernel"
-        yield {
-            "name": f"{op.op_id} [{op.family}]",
-            "cat": cat,
-            "ph": "X",
-            "ts": _round_us(op.start_us),
-            "dur": _round_us(op.dur_us),
-            "pid": pid,
-            "tid": tid,
-            "args": _operator_args(bundle, op, task_id, pipeline_by_occ.get(op.occurrence)),
-        }
-        op_placement[op.occurrence] = (pid, tid, op.end_us, op.op_id)
+    if bundle.full_trace_schedule:
+        yield from _iter_scheduled_full_model_trace(
+            bundle, die_map, pipeline_by_occ,
+            include_pipe_lanes=include_pipe_lanes,
+            include_counters=include_counters,
+            include_overlap=include_overlap,
+        )
+    else:
+        yield from _iter_direct_trace(
+            bundle, die_map, pipeline_by_occ,
+            include_pipe_lanes=include_pipe_lanes,
+            include_counters=include_counters,
+            include_overlap=include_overlap,
+        )
 
-        for pred in op.predecessors:
-            src = op_placement.get(pred)
-            if src is None:
-                continue
-            src_pid, src_tid, src_end_us, src_op_id = src
-            if src_pid == pid and src_tid == tid:
-                continue
-            dst_ts = max(src_end_us, op.start_us)
-            sync_kind = "EventRecord/Wait" if src_pid != pid else "StreamSync"
-            flow_args = {"src_op": src_op_id, "dst_op": op.op_id, "sync_kind": sync_kind}
-            yield {
-                "name": f"SetFlag->{sync_kind}",
-                "cat": "SetFlag_WaitFlag",
-                "ph": "s",
-                "id": flow_id,
-                "ts": _round_us(src_end_us),
-                "pid": src_pid,
-                "tid": src_tid,
-                "args": flow_args,
-            }
-            yield {
-                "name": f"WaitFlag<-{sync_kind}",
-                "cat": "SetFlag_WaitFlag",
-                "ph": "f",
-                "bp": "e",
-                "id": flow_id,
-                "ts": _round_us(dst_ts),
-                "pid": pid,
-                "tid": tid,
-                "args": flow_args,
-            }
-            flow_id += 1
 
-        if include_pipe_lanes:
-            hw_pid = base + PID_OFFSET_HARDWARE
-            pipe_spans = _active_pipe_spans(op)
-            for p_tid, p_name, p_ts, p_dur, p_args in pipe_spans:
-                yield {
-                    "name": p_name,
-                    "cat": "Pipe",
-                    "ph": "X",
-                    "ts": _round_us(p_ts),
-                    "dur": _round_us(p_dur),
-                    "pid": hw_pid,
-                    "tid": p_tid,
-                    "args": p_args,
-                }
-            for prev_span, next_span in zip(pipe_spans, pipe_spans[1:]):
-                src_t = _round_us(prev_span[2])
-                dst_t = max(src_t, _round_us(next_span[2]))
-                p_args = {
-                    "src_pipe": prev_span[4]["Pipe"],
-                    "dst_pipe": next_span[4]["Pipe"],
-                    "op_id": op.op_id,
-                    "sync_kind": "SetFlag/WaitFlag",
-                }
-                yield {
-                    "name": "SetFlag->WaitFlag",
-                    "cat": "SetFlag_WaitFlag",
-                    "ph": "s",
-                    "id": flow_id,
-                    "ts": src_t,
-                    "pid": hw_pid,
-                    "tid": prev_span[0],
-                    "args": p_args,
-                }
-                yield {
-                    "name": "SetFlag->WaitFlag",
-                    "cat": "SetFlag_WaitFlag",
-                    "ph": "f",
-                    "bp": "e",
-                    "id": flow_id,
-                    "ts": dst_t,
-                    "pid": hw_pid,
-                    "tid": next_span[0],
-                    "args": p_args,
-                }
-                flow_id += 1
-
-    if include_overlap:
-        yield from _iter_overlap_events(bundle, die_map)
-    if include_counters:
-        yield from _iter_counter_events(bundle, die_map)
+def _stream_trace_events_to_fd(
+    fd: int,
+    bundle: ExportBundle,
+    *,
+    include_pipe_lanes: bool,
+    include_counters: bool,
+    include_overlap: bool,
+) -> tuple[int, dict[str, int]]:
+    total = 0
+    ph_counts: dict[str, int] = {"M": 0, "X": 0, "s": 0, "C": 0}
+    with os.fdopen(
+        fd, "w", encoding="utf-8", newline="\n", buffering=STREAM_BUFFER_BYTES,
+    ) as handle:
+        handle.write("[\n")
+        first = True
+        for event in iter_msprof_trace_events(
+            bundle,
+            include_pipe_lanes=include_pipe_lanes,
+            include_counters=include_counters,
+            include_overlap=include_overlap,
+        ):
+            if not first:
+                handle.write(",\n")
+            first = False
+            handle.write(
+                json.dumps(event, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+            )
+            total += 1
+            ph = str(event.get("ph") or "")
+            if ph in ph_counts:
+                ph_counts[ph] += 1
+        handle.write("\n]\n")
+    return total, ph_counts
 
 
 def export_msprof_trace(
-    source: ExportBundle | CaseInput,
-    output_path: str | Path,
+    source: ExportBundle | CaseInput | None = None,
+    output_path: str | Path = "",
     *,
     request: StepRequest | None = None,
     step_eval: StepEvaluation | None = None,
@@ -657,8 +981,37 @@ def export_msprof_trace(
     include_pipe_lanes: bool = True,
     include_counters: bool = True,
     include_overlap: bool = True,
+    model: str | None = None,
+    hardware: str | None = None,
+    topology_preset: str | None = None,
+    dp: int = 1,
+    tp: int = 1,
+    dcp: int = 1,
+    ep: int = 1,
+    pp: int = 1,
+    pcp: int = 1,
+    prompt_tokens: int = DEFAULT_SCENARIO_PROMPT_TOKENS,
+    output_tokens: int = DEFAULT_SCENARIO_OUTPUT_TOKENS,
+    concurrency: int = 1,
+    mtp_proposal_tokens: int = 0,
+    mtp_acceptance_length: float = 1.0,
+    feature_track: str = "merged",
 ) -> TraceExportSummary:
     """Stream a 1:1 ``msprof`` ``trace_view.json`` to ``output_path`` atomically."""
+    if not str(output_path):
+        raise ValueError("export_msprof_trace_requires_output_path")
+    if source is None:
+        if not model or not hardware:
+            raise ValueError("export_msprof_trace_requires_source_or_model_and_hardware")
+        raw_case, auto_req = compose_export_case(
+            model, hardware, topology_preset=topology_preset,
+            dp=dp, tp=tp, dcp=dcp, ep=ep, pp=pp, pcp=pcp,
+            prompt_tokens=prompt_tokens, output_tokens=output_tokens,
+            concurrency=concurrency, mtp_proposal_tokens=mtp_proposal_tokens,
+            mtp_acceptance_length=mtp_acceptance_length, feature_track=feature_track,
+        )
+        source = raw_case
+        request = request or auto_req
     bundle = (
         source if isinstance(source, ExportBundle)
         else build_export_bundle(
@@ -675,36 +1028,13 @@ def export_msprof_trace(
         prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent),
     )
     tmp_path = Path(tmp_name)
-    total = meta_cnt = complete_cnt = flow_s = counter_cnt = 0
     try:
-        with os.fdopen(
-            fd, "w", encoding="utf-8", newline="\n", buffering=STREAM_BUFFER_BYTES,
-        ) as handle:
-            handle.write("[\n")
-            first = True
-            for event in iter_msprof_trace_events(
-                bundle,
-                include_pipe_lanes=include_pipe_lanes,
-                include_counters=include_counters,
-                include_overlap=include_overlap,
-            ):
-                if not first:
-                    handle.write(",\n")
-                first = False
-                handle.write(
-                    json.dumps(event, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
-                )
-                total += 1
-                ph = event.get("ph")
-                if ph == "M":
-                    meta_cnt += 1
-                elif ph == "X":
-                    complete_cnt += 1
-                elif ph == "s":
-                    flow_s += 1
-                elif ph == "C":
-                    counter_cnt += 1
-            handle.write("\n]\n")
+        total, ph_counts = _stream_trace_events_to_fd(
+            fd, bundle,
+            include_pipe_lanes=include_pipe_lanes,
+            include_counters=include_counters,
+            include_overlap=include_overlap,
+        )
         bytes_written = int(tmp_path.stat().st_size)
         os.replace(tmp_path, target)
     except TimeoutError:
@@ -721,13 +1051,14 @@ def export_msprof_trace(
         phase=bundle.phase,
         graph_id=bundle.graph_id,
         total_events=total,
-        metadata_events=meta_cnt,
-        complete_events=complete_cnt,
-        flow_pairs=flow_s,
-        counter_events=counter_cnt,
+        metadata_events=ph_counts["M"],
+        complete_events=ph_counts["X"],
+        flow_pairs=ph_counts["s"],
+        counter_events=ph_counts["C"],
         step_span_us=bundle.step_span_us,
         step_l_star_lean_us=bundle.step_l_star_lean_us,
         bytes_written=bytes_written,
+        replayed_layers=len(bundle.full_trace_schedule) or len(bundle.archetypes),
     )
 
 
@@ -742,6 +1073,11 @@ def _cleanup_temp(path: Path) -> None:
 
 __all__ = [
     "MSPROF_PROCESS_SPEC",
+    "PID_FRAMEWORK",
+    "TID_FW_ENGINE",
+    "TID_FW_HOST_LAUNCH",
+    "TID_FW_LAYER_MSTX",
+    "TID_FW_SUBMODULE_MSTX",
     "TRACE_EXPORT_RECEIPT_SCHEMA",
     "TraceExportSummary",
     "export_msprof_trace",

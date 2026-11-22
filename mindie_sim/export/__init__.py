@@ -1,17 +1,22 @@
-"""Pragmatic productization exporters for ``mindie_sim`` (``msprof`` Trace & OOXML XLSX).
+"""Human-native productization exporters for ``mindie_sim`` (``msprof`` Trace & OOXML XLSX).
 
 [Role] Expose the single cohesive export domain package providing:
-  (1) ``build_export_bundle`` (shared ``runtime.Engine`` evaluation, Lean-4
-      certified ``L*`` physical lower bound & Gap Radar, 1-to-N ``kernel_details.csv``
-      reconciliation, and closed-form Memory/Quant/PP ledger),
-  (2) ``export_msprof_trace`` / ``iter_msprof_trace_events`` (1:1 streaming
-      Ascend ``msprof`` ``trace_view.json`` for MindStudio Insight ``msinsight``),
+  (1) ``build_export_bundle`` / ``compose_export_case`` / ``align_before_after_operators``
+      / ``build_new_kernel_backlog`` (O(Unique Archetypes) ``runtime.Engine`` evaluation,
+      domain-accurate submodule classification, real Ascend/CANN/cannbot-dsl/Triton/HCCL
+      kernel identities, Lean-4 certified ``L*`` & Gap Radar, 1-to-N ``kernel_details.csv``
+      reconciliation, and closed-form Memory/Quant/PP ledger honoring ``QuantSpec.exclusions``),
+  (2) ``export_msprof_trace`` / ``iter_msprof_trace_events`` (1:1 streaming full-model
+      Ascend ``msprof`` ``trace_view.json`` with ``PID 0`` Framework/MSTX host hierarchy
+      and physically grounded AIC/AIV/MTE2/MTE3/Fixpipe spans),
   (3) ``export_comparison_xlsx`` (zero-dependency OOXML ``.xlsx`` workbook with
-      real ``merge_cells``, 1-to-N kernel reconciliation, and Memory/Quant/PP
-      calculator).
+      side-by-side Before-vs-After N->1 ``merge_cells``, ``Memory_Quant_Calculator``,
+      ``New_Kernel_Design_Backlog`` with Agent-fillable slots, and conditional
+      ``Measured_msprof_Calibration``).
 [Invariants] Strictly a top-layer consumer in the unidirectional import DAG;
   lower layers (``schema``, ``catalog``, ``prediction``, ``optimization``) never
-  import ``mindie_sim.export``. Zero ``0.80x`` heuristic fudge factors and zero
+  import ``mindie_sim.export``. Zero ``0.80x`` heuristic fudge factors, zero
+  ``PIPE_*_FRACTION`` hacks, zero banned Python recipe class names, and zero
   third-party OOXML dependencies.
 [Timeouts & Locks] Delegates bounded execution and streaming writes to submodules;
   no locks or device contexts.
@@ -20,16 +25,37 @@
 from __future__ import annotations
 
 from .analysis import (
+    AlignedComparisonRow,
+    AscendKernelDescriptor,
+    BACKEND_CANN,
+    BACKEND_CANNBOT_DSL,
+    BACKEND_HCCL_MC2,
+    BACKEND_TORCH_NPU,
+    BACKEND_TRITON,
+    BANNED_IMPLEMENTATION_NAMES,
     CacheLedgerRow,
+    DEFAULT_EXPORT_CONTEXT_TOKENS,
     DEFAULT_GAP_RADAR_TOP_K,
+    DEFAULT_SCENARIO_OUTPUT_TOKENS,
+    DEFAULT_SCENARIO_PROMPT_TOKENS,
+    DEFAULT_TPOT_SLO_MS,
+    DEFAULT_TTFT_SLO_MS,
     EXPORT_BUNDLE_SCHEMA,
     ExportBundle,
     GIB_BYTES,
     GapRadarRow,
+    HARDWARE_PRESET_ALIASES,
+    KERNEL_STATUS_EXISTING,
+    KERNEL_STATUS_EXTEND_TILING,
+    KERNEL_STATUS_FRAMEWORK,
+    KERNEL_STATUS_NEW_OP,
+    KERNEL_STATUS_NEW_OR_EXTEND,
     KernelObservationRow,
+    LayerArchetypeSpec,
     MIB_BYTES,
     MXFP_GROUP_SIZE,
     MemoryCalculatorLedger,
+    NewKernelBacklogItem,
     OperatorExportRow,
     RECONCILE_ABS_FLOOR_US,
     RECONCILE_APE_THRESHOLD_PCT,
@@ -38,20 +64,30 @@ from .analysis import (
     SUPPORTED_CACHE_DTYPES,
     SUPPORTED_WEIGHT_QUANTS,
     StageBudgetRow,
+    TraceScheduleEntry,
     US_PER_MS,
     WEIGHT_QUANT_FORMATS,
     WeightLedgerRow,
+    align_before_after_operators,
     build_export_bundle,
+    build_new_kernel_backlog,
     classify_submodule,
+    compose_export_case,
     compute_memory_quant_ledger,
     evaluate_weight_storage_bytes,
     extract_layer_index,
     load_kernel_details_csv,
     load_observation_bundle,
     reconcile_operators_with_kernels,
+    resolve_hardware_alias,
 )
 from .trace_exporter import (
     MSPROF_PROCESS_SPEC,
+    PID_FRAMEWORK,
+    TID_FW_ENGINE,
+    TID_FW_HOST_LAUNCH,
+    TID_FW_LAYER_MSTX,
+    TID_FW_SUBMODULE_MSTX,
     TRACE_EXPORT_RECEIPT_SCHEMA,
     TraceExportSummary,
     export_msprof_trace,
@@ -59,7 +95,9 @@ from .trace_exporter import (
 )
 from .xlsx_exporter import (
     SHEET_BREAKDOWN,
+    SHEET_MEASURED,
     SHEET_MEMORY,
+    SHEET_NEW_KERNELS,
     SHEET_SUMMARY,
     Workbook,
     Worksheet,
@@ -71,30 +109,59 @@ from .xlsx_exporter import (
 )
 
 __all__ = [
+    "AlignedComparisonRow",
+    "AscendKernelDescriptor",
+    "BACKEND_CANN",
+    "BACKEND_CANNBOT_DSL",
+    "BACKEND_HCCL_MC2",
+    "BACKEND_TORCH_NPU",
+    "BACKEND_TRITON",
+    "BANNED_IMPLEMENTATION_NAMES",
     "CacheLedgerRow",
+    "DEFAULT_EXPORT_CONTEXT_TOKENS",
     "DEFAULT_GAP_RADAR_TOP_K",
+    "DEFAULT_SCENARIO_OUTPUT_TOKENS",
+    "DEFAULT_SCENARIO_PROMPT_TOKENS",
+    "DEFAULT_TPOT_SLO_MS",
+    "DEFAULT_TTFT_SLO_MS",
     "EXPORT_BUNDLE_SCHEMA",
     "ExportBundle",
     "GIB_BYTES",
     "GapRadarRow",
+    "HARDWARE_PRESET_ALIASES",
+    "KERNEL_STATUS_EXISTING",
+    "KERNEL_STATUS_EXTEND_TILING",
+    "KERNEL_STATUS_FRAMEWORK",
+    "KERNEL_STATUS_NEW_OP",
+    "KERNEL_STATUS_NEW_OR_EXTEND",
     "KernelObservationRow",
+    "LayerArchetypeSpec",
     "MIB_BYTES",
     "MSPROF_PROCESS_SPEC",
     "MXFP_GROUP_SIZE",
     "MemoryCalculatorLedger",
+    "NewKernelBacklogItem",
     "OperatorExportRow",
+    "PID_FRAMEWORK",
     "RECONCILE_ABS_FLOOR_US",
     "RECONCILE_APE_THRESHOLD_PCT",
     "ReconciledKernelGroup",
     "ReconciliationSummary",
     "SHEET_BREAKDOWN",
+    "SHEET_MEASURED",
     "SHEET_MEMORY",
+    "SHEET_NEW_KERNELS",
     "SHEET_SUMMARY",
     "SUPPORTED_CACHE_DTYPES",
     "SUPPORTED_WEIGHT_QUANTS",
     "StageBudgetRow",
+    "TID_FW_ENGINE",
+    "TID_FW_HOST_LAUNCH",
+    "TID_FW_LAYER_MSTX",
+    "TID_FW_SUBMODULE_MSTX",
     "TRACE_EXPORT_RECEIPT_SCHEMA",
     "TraceExportSummary",
+    "TraceScheduleEntry",
     "US_PER_MS",
     "WEIGHT_QUANT_FORMATS",
     "WeightLedgerRow",
@@ -102,10 +169,13 @@ __all__ = [
     "Worksheet",
     "XLSX_EXPORT_RECEIPT_SCHEMA",
     "XlsxExportSummary",
+    "align_before_after_operators",
     "build_export_bundle",
+    "build_new_kernel_backlog",
     "cell_ref",
     "classify_submodule",
     "column_letter",
+    "compose_export_case",
     "compute_memory_quant_ledger",
     "evaluate_weight_storage_bytes",
     "export_comparison_xlsx",
@@ -115,4 +185,5 @@ __all__ = [
     "load_kernel_details_csv",
     "load_observation_bundle",
     "reconcile_operators_with_kernels",
+    "resolve_hardware_alias",
 ]
