@@ -27,6 +27,7 @@ from .gdn_prefill_phases import (
 )
 from mindie_sim.prediction.lowering import Builder
 from mindie_sim.prediction.mechanism import PlannedRecipe
+from mindie_sim.prediction.structure_groups import declare_group, source_reference
 from mindie_sim.prediction.operators.causal_conv import native_causal_conv_prefill
 from mindie_sim.prediction.operators.kda import kda_state_selection as pcp_state_selection
 from mindie_sim.prediction.operators.linear_attention import gdn_recurrent
@@ -210,6 +211,7 @@ def core(*, builder, tensors, conv, gated, views, heads, key_heads, dk, dv,
         direction="gather", target_kind="recurrent",
         global_lengths=global_lengths, slot_indices=slot_indices,
         state_capacity=state_capacity, slot_source=slot_source)
+    chunk_start_index = len(b.ops)
     gather = b.work(
         "gather_recurrent_state", (conv,), (len(views), heads, dv, dk),
         read=prior_elements * state_byte + gather_metadata,
@@ -404,6 +406,35 @@ def core(*, builder, tensors, conv, gated, views, heads, key_heads, dk, dv,
         "state_value_outputs": scatter_outputs,
         "gdn_state_contract": scatter_contract,
     }.items())))
+    region_ops = b.ops[chunk_start_index:]
+    if region_ops:
+        region_ids = {op.op_id for op in region_ops}
+        entries = tuple(
+            op.op_id for op in region_ops
+            if any(dep not in region_ids for dep in op.deps) or not op.deps
+        ) or (region_ops[0].op_id,)
+        anchor_id = composite.output if composite.output in region_ids else region_ops[-1].op_id
+        declare_group(
+            b.ops, key=b.prefix + ".gdn_chunk", role="gdn_chunk", family="gdn",
+            members=tuple(op.op_id for op in region_ops), entries=entries,
+            anchor=anchor_id, block="attention",
+            view={"tokens": tokens, "heads": heads, "key_heads": key_heads,
+                  "key_width": dk, "value_width": dv, "dtype": dtype,
+                  "state_dtype": state_dtype, "sequence_tokens": lengths,
+                  "chunk": chunk, "pcp": int(pcp)},
+            implementation={
+                "native_kind": "ChunkGatedDeltaRuleFwd",
+                "native_kinds": ("ChunkGatedDeltaRuleFwdPrepare", "ChunkFwdH", "ChunkFwdO"),
+                "selection": "arch35_gdn_prefill_composite",
+                "conditions": {"pcp": int(pcp), "chunk": chunk,
+                               "state_dtype": state_dtype},
+            },
+            source=source_reference("vllm_ascend/ops/gdn.py",
+                                    "AscendGatedDeltaNetAttention._chunk_gated_delta_rule_fused"),
+            fusion_status="fused_existing",
+            fusion_reason="arch35_native_gdn_prefill_composite",
+            native_fusion_eligible=False,
+        )
     return composite.output
 
 
@@ -574,6 +605,7 @@ def _lower_idle_pcp_peer(
     n_pf = max(1, len(prefill))
     phi_bytes = float(n_pf * heads * dk * dk * FP32_BYTES)
     st_bytes = float(n_pf * heads * dk * dv * FP32_BYTES)
+    idle_start = len(b.ops)
     ag_state = b.communicate(
         "pcp_gdn_state_gather", (zero,),
         st_bytes * (pcp - 1), "allgather", "pcp", dtype="fp32",
@@ -595,13 +627,33 @@ def _lower_idle_pcp_peer(
             ("source", "ops/triton/fla/chunk.py:prefix_scan"),
         ),
     )
-    b.work(
+    scatter = b.work(
         "scatter_recurrent_state", (prefix_scan,), (len(prefill), heads, dv, dk),
         read=st_bytes, write=st_bytes, family="state_scatter",
         dtype=plan.recurrent_state_dtype,
         metadata=(("state_layout", "V,K"), ("effect_role", "scatter_publish"),
                   ("state_value_input", (prefix_scan,)),
                   ("state_value_output", "persistent_cache")),
+    )
+    idle_ops = b.ops[idle_start:]
+    idle_ids = {op.op_id for op in idle_ops}
+    declare_group(
+        b.ops, key=b.prefix + ".gdn_chunk", role="gdn_chunk", family="gdn",
+        members=tuple(op.op_id for op in idle_ops),
+        entries=tuple(op.op_id for op in idle_ops
+                      if any(dep not in idle_ids for dep in op.deps) or not op.deps),
+        anchor=scatter, block="attention",
+        view={"tokens": 0, "heads": heads, "key_heads": heads,
+              "key_width": dk, "value_width": dv,
+              "dtype": model.activation_dtype, "state_dtype": plan.recurrent_state_dtype,
+              "sequence_tokens": (), "pcp": pcp},
+        implementation={"native_kind": "ChunkGatedDeltaRuleFwd",
+                        "conditions": {"pcp": pcp, "idle_pcp_peer": True}},
+        source=source_reference("vllm_ascend/ops/gdn.py",
+                                "AscendGatedDeltaNetAttention._chunk_gated_delta_rule_fused"),
+        fusion_status="fused_existing",
+        fusion_reason="arch35_gdn_idle_pcp_peer_sync",
+        native_fusion_eligible=False,
     )
     gate = tensors.reshape(projection.narrow(1, width, value_width), (tokens * heads, dv),
                            name="output_gate_reshape")
@@ -699,6 +751,7 @@ def lower(*, prefix, plan, views, stage, deps, model, parallel, mode,
             if not view.padding:
                 decode_offsets.append(cursor)
             cursor += view.q_len
+        decode_start_index = len(b.ops)
         outputs.append(decode_core(
             b, tensors, tuple(v.narrow(1, 0, decode_tokens) for v in qkv),
             tuple(v.narrow(1, 0, decode_tokens) for v in gate_values),
@@ -736,6 +789,27 @@ def lower(*, prefix, plan, views, stage, deps, model, parallel, mode,
                 None if count <= 0 else (context + 1,)
                 for context, count in zip(decode_contract["contexts"],
                                           decode_contract["checkpoints"]))}.items()))
+        dec_ops = b.ops[decode_start_index:]
+        dec_ids = {op.op_id for op in dec_ops}
+        declare_group(
+            b.ops, key=prefix + ".gdn_recurrent", role="gdn_recurrent", family="gdn",
+            members=tuple(op.op_id for op in dec_ops),
+            entries=tuple(op.op_id for op in dec_ops
+                          if any(dep not in dec_ids for dep in op.deps) or not op.deps),
+            anchor=scan.op_id, block="attention",
+            view={"tokens": decode_tokens, "heads": heads, "key_heads": keys,
+                  "key_width": dk, "value_width": dv, "dtype": model.activation_dtype,
+                  "state_dtype": plan.recurrent_state_dtype,
+                  "sequence_tokens": tuple(view.q_len for view in decode)},
+            implementation={"native_kind": "RecurrentGatedDeltaRule",
+                            "conditions": {"mixed_batch_decode": True,
+                                           "state_dtype": plan.recurrent_state_dtype}},
+            source=source_reference("vllm_ascend/ops/gdn.py",
+                                    "AscendGatedDeltaNetAttention._recurrent_gated_delta_rule"),
+            fusion_status="unfused_decomposed",
+            fusion_reason="mixed_batch_analytical_gdn_decode",
+            native_fusion_eligible=False,
+        )
     prefill_slots = (None if cache_indices is None else
                      tuple(cache_indices[len(decode) + index]
                            for index in range(len(prefill))))
@@ -772,6 +846,19 @@ def lower(*, prefix, plan, views, stage, deps, model, parallel, mode,
                   ("norm_has_bias", False), ("norm_group_width", dv),
                   ("gate_present", True), ("recurrent_attention_kind", plan.attention),
                   ("fused_from", ("rmsnorm", "gate"))))
+    declare_group(
+        b.ops, key=prefix + ".gated_rmsnorm", role="gated_rmsnorm",
+        family="norm_gate", members=(normalized,), entries=(normalized,),
+        anchor=normalized, block="attention",
+        view={"tokens": tokens, "heads": heads, "width": dv,
+              "dtype": model.activation_dtype, "attention_kind": plan.attention},
+        implementation={"native_kind": "_layer_norm_fwd_1pass_kernel_npu",
+                        "native_kinds": ("_layer_norm_fwd_1pass_kernel_npu", "FusedRMSNormGated")},
+        source=source_reference("vllm_ascend/ops/gdn.py", "FusedRMSNormGated"),
+        fusion_status="fused_existing",
+        fusion_reason="triton_fused_rmsnorm_gated_kernel",
+        native_fusion_eligible=False,
+    )
     last = b.matrix("linear_output", (normalized,), tokens, model.hidden_size, value_width,
                     category="gdn.o")
     if tp > 1:

@@ -45,6 +45,7 @@ SEMANTIC_FAMILIES: tuple[str, ...] = (
 )
 ROLE_FAMILIES: dict[str, str] = {
     "attention_residual": "mhc_residual",
+    "attn_res_prefix_point": "mhc_residual",
     "residual": "mhc_residual",
     "hc_pre": "mhc_residual",
     "hc_post": "mhc_residual",
@@ -58,8 +59,11 @@ ROLE_FAMILIES: dict[str, str] = {
     "router_selection": "moe_ffn",
     "grouped_gate_up_situ_quant": "moe_ffn",
     "grouped_gate_up_activation_quant": "moe_ffn",
+    "grouped_gate_up_act": "moe_ffn",
     "situ_quant": "norm_quant",
+    "gated_rmsnorm": "norm_quant",
     "gdn_chunk": "recurrent_gdn_kda",
+    "gdn_recurrent": "recurrent_gdn_kda",
     "kda_recurrent": "recurrent_gdn_kda",
     "kda_chunk": "recurrent_gdn_kda",
 }
@@ -72,6 +76,7 @@ DECLARATION_FAMILIES: dict[str, str] = {
     "pooled_indexer": "indexer",
     "moe": "moe_ffn",
     "situ": "norm_quant",
+    "norm_gate": "norm_quant",
     "mhc": "mhc_residual",
     "gdn": "recurrent_gdn_kda",
     "kda": "recurrent_gdn_kda",

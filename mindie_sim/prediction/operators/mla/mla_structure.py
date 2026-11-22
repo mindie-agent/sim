@@ -11,9 +11,9 @@ from mindie_sim.prediction.structure_groups import declare_group
 
 def declare_indexer(ops, *, prefix, plan, parallel, model, quant, views,
                     padded_tokens, scores, topk):
-    if parallel.cp != 1 or plan.candidate_filter:
-        return
+    """Unconditionally declare the DSA indexer subgraph over rank-local KV."""
     selection = next(op for op in ops if op.op_id == topk)
+    sel_meta = dict(selection.metadata)
     quantized = quant.index_dtype not in {"bf16", "fp16"}
     role = "quant_lightning_indexer" if quantized else "lightning_indexer"
     partition = tuple({"query": view.q_len, "context": view.context,
@@ -22,6 +22,25 @@ def declare_indexer(ops, *, prefix, plan, parallel, model, quant, views,
     fused = scores == topk
     members = (topk,) if fused else (scores, topk)
     entries = (topk,) if fused else (scores,)
+    is_kernel = selection.source_boundary == "kernel"
+    sel_impl = sel_meta.get("native_implementation")
+    sel_native_kind = (
+        sel_meta.get("native_kind")
+        or (sel_impl.get("native_kind") if isinstance(sel_impl, dict) else None)
+    )
+    default_kind = ("VllmAscendQuantLightningIndexerV2" if quantized
+                    else "LightningIndexer")
+    fusion_status = "fused_existing" if fused else "unfused_decomposed"
+    if is_kernel:
+        fusion_reason = "selected_native_indexer_kernel"
+    elif fused:
+        fusion_reason = "fused_quantized_indexer_operator"
+    elif int(parallel.cp) != 1 or bool(plan.candidate_filter):
+        fusion_reason = "dcp_or_candidate_filter_decomposed_indexer"
+    else:
+        fusion_reason = "separate_score_and_topk_operators"
+    native_fusion_eligible = bool(
+        int(parallel.cp) == 1 and not plan.candidate_filter and not is_kernel)
     declare_group(
         ops, key=prefix + "." + role, role=role,
         family="dsa", members=members, entries=entries, anchor=topk,
@@ -32,20 +51,21 @@ def declare_indexer(ops, *, prefix, plan, parallel, model, quant, views,
             "topk": plan.index_topk, "query_dtype": quant.index_dtype,
             "weight_dtype": "fp16" if quant.index_dtype == "int8" else model.activation_dtype,
             "cache_dtype": quant.index_dtype,
-            "selection_output_dtype": dict(selection.metadata)["selection_output_dtype"],
+            "selection_output_dtype": sel_meta.get("selection_output_dtype", "int32"),
             "scale_dtype": quant.index_scale_dtype,
         },
         implementation={
-            "native_kind": (dict(selection.metadata).get("native_kind")
-                            if fused else
-                            "VllmAscendQuantLightningIndexerV2" if quantized
-                            else "LightningIndexer"),
+            "native_kind": sel_native_kind or default_kind,
             "conditions": {
-                "cp": 1, "pcp": parallel.pcp, "candidate_filter": False,
+                "cp": int(parallel.cp), "pcp": int(parallel.pcp),
+                "candidate_filter": bool(plan.candidate_filter),
                 "source_selection": "semantic_score_and_topk_projection",
                 "timing_boundary": ("single_fused_quantized_indexer" if fused
                                     else "separate_declared_operators"),
             },
         },
         source={"kind": "semantic_builder", "module": "mindie_sim.prediction.operators.mla.mla"},
+        fusion_status=fusion_status,
+        fusion_reason=fusion_reason,
+        native_fusion_eligible=native_fusion_eligible,
     )

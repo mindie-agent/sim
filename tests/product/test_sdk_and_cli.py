@@ -408,13 +408,13 @@ def test_pipeline_and_context_partition_scale_speculative_verify_rows():
     proposal = verify["runtime"]["metadata"]["draft_proposal_tokens"]
     assert proposal == 2
     single, expanded = target_operators(base, **DECODE), target_operators(verify, **(DECODE | {"tokens": 1 + proposal}))
-    for suffix in (".expert_up", ".expert_down"):
+    routed_b, routed_a = ([op for op in ops if op.recipe == "megamoe_arch35"] for ops in (single, expanded))
+    suffixes = (".shared.gate_up", ".shared.down") if routed_b else (".expert_up", ".expert_down")
+    for suffix in suffixes:
         before, after = ([op for op in ops if op.op_id.endswith(suffix)] for ops in (single, expanded))
         assert len(before) == len(after) == 3
-        for one, three in zip(before, after, strict=True):
-            assert three.local_shape[0] == 3 * one.local_shape[0]
-            assert three.flops == pytest.approx(3 * one.flops, rel=1e-12)
-            assert three.hbm_bytes > one.hbm_bytes
+        assert all(b.local_shape[0] == 3 * a.local_shape[0] and b.flops == pytest.approx(3 * a.flops, rel=1e-12) and b.hbm_bytes > a.hbm_bytes for a, b in zip(before, after, strict=True))
+    assert not routed_b or (len(routed_b) == len(routed_a) == 3 and all(b.flops == pytest.approx(3 * a.flops, rel=1e-12) and dict(b.metadata)["megamoe_geometry"]["routed_rows"] == pytest.approx(3 * dict(a.metadata)["megamoe_geometry"]["routed_rows"], rel=1e-12) for a, b in zip(routed_b, routed_a, strict=True)))
     rows = [next(op.local_shape[0] for op in ops if op.family == "attention") for ops in (single, expanded)]
     assert rows[1] == 3 * rows[0]
 

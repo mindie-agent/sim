@@ -350,7 +350,7 @@ class AttentionResidual(Residual):
         ops = [values, normalized, scores, probabilities, mix, cast]
         declare_group(
             ops, key=c["prefix"] + ".attention_residual_group",
-            role="attention_residual", family="attention_residual",
+            role="attn_res_prefix_point", family="attn_res_prefix",
             members=tuple(op.op_id for op in ops), entries=(values.op_id,),
             anchor=cast.op_id, block=c.get("structure_block"), scope_role="residual",
             view={"tokens": tokens, "hidden": model.hidden_size, "sources": len(sources),
@@ -360,6 +360,9 @@ class AttentionResidual(Residual):
             source=source_reference("vllm_ascend/models/kimi_k3.py", "_apply_attention_residual"),
             coverage={"kind": "complete_subgraph",
                       "limitations": ["native_residual_slot_order_requires_descriptor_evidence"]},
+            fusion_status="unfused_decomposed",
+            fusion_reason="decomposed_attention_residual_fp32_chain",
+            native_fusion_eligible=False,
         )
         return ops, cast.op_id, ready
 

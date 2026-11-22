@@ -75,11 +75,18 @@ def _apply_role_traffic_profile(role, profile, view, phases, ledger, recipe, rem
         norm, store = recipe("kv_norm"), recipe("kv_store")
         rotary = next((op for op in phases if op.recipe == "rotary"), None)
         latent, rope = view["latent_rank"], view["rope_width"]
-        latent_bytes = store.mte2_bytes * latent / (latent + rope)
-        rope_bytes = store.mte2_bytes - latent_bytes
-        remove(norm, store, latent_bytes)
+        denom = max(1, latent + rope)
+        raw_latent = store.mte2_bytes * latent / denom
+        latent_bytes = min(raw_latent, norm.mte3_bytes, store.mte2_bytes)
+        if latent_bytes > 0:
+            remove(norm, store, latent_bytes)
         if rotary is not None:
-            remove(rotary, store, rope_bytes)
+            rope_bytes = min(
+                max(0.0, store.mte2_bytes - latent_bytes),
+                rotary.mte3_bytes,
+            )
+            if rope_bytes > 0:
+                remove(rotary, store, rope_bytes)
         ledger["source"] = _MLA_SOURCE
         ledger["limitations"].extend([
             "source_arch35_selection_does_not_identify_capture_implementation",

@@ -20,6 +20,52 @@ MLA_PROLOG_V4_CONTRACT = "aclnnMlaPrologV4WeightNz"
 MLA_PROLOG_V4_KINDS = frozenset({
     MLA_PROLOG_V4_CONTRACT, "MlaPrologV4WeightNz", "MlaPrologV4",
 })
+VALID_FUSION_STATUSES = frozenset({
+    "fused_existing",
+    "fused_framework_enable",
+    "fused_new_kernel_required",
+    "unfused_decomposed",
+})
+
+
+def resolve_subgraph_fusion_status(declaration, ordered_nodes, *, resource_bound=False):
+    """Return canonical ``(fusion_status, fusion_reason)`` for an exported subgraph."""
+    role = declaration.get("role")
+    impl = declaration.get("implementation") or {}
+    native_kind = impl.get("native_kind")
+    declared_status = declaration.get("fusion_status")
+    declared_reason = declaration.get("fusion_reason")
+    if resource_bound:
+        if role == "grouped_gate_up_situ_quant":
+            return "fused_new_kernel_required", "selected_situ_mx_target_fusion_boundary"
+        if declared_status in {"fused_existing", "fused_framework_enable", "fused_new_kernel_required"}:
+            return declared_status, declared_reason or "selected_native_fusion_resource_boundary"
+        return "fused_existing", "selected_native_fusion_resource_boundary"
+    if declared_status in VALID_FUSION_STATUSES:
+        return declared_status, declared_reason or "declared_subgraph_fusion_status"
+    if len(ordered_nodes) == 1:
+        only = ordered_nodes[0]
+        if (only.get("boundary") == "kernel"
+                or (only.get("operator") or {}).get("metadata", {}).get("native_kind")
+                or impl.get("fused") is True):
+            if role == "grouped_gate_up_situ_quant" or native_kind in QWEN4_HC_KINDS:
+                return "fused_new_kernel_required", "single_kernel_target_fusion"
+            return "fused_existing", "single_native_kernel_subgraph"
+    if role == "mla_prolog" and impl.get("selection") == "vllm_ascend_mla_prolog_v3":
+        return (
+            "fused_framework_enable",
+            "mla_prolog_v4_selected_lowering"
+            if native_kind in MLA_PROLOG_V4_KINDS else "mla_prolog_v3_selected_lowering",
+        )
+    if role == "grouped_gate_up_situ_quant":
+        return "fused_new_kernel_required", "situ_mx_grouped_gate_up_target_fusion"
+    if role == "grouped_gate_up_activation_quant":
+        return "fused_framework_enable", "grouped_matmul_swiglu_quant_eligible"
+    if role in {"hc_pre", "hc_post"} and native_kind in QWEN4_HC_KINDS:
+        return "fused_new_kernel_required", "lowrank_hc_target_fusion"
+    if impl.get("fused") is True:
+        return "fused_existing", "declared_fused_subgraph"
+    return "unfused_decomposed", f"decomposed_{len(ordered_nodes)}_member_operators"
 
 
 def metadata(op):
@@ -133,6 +179,9 @@ def subgraph_contract(declaration):
             ((rows, 1, view["topk"]), view["selection_output_dtype"], "ND"),
         )
     if role == "mla_prolog":
+        if (declaration.get("native_fusion_eligible") is False
+                or view.get("absorbed_weight_dtype") is None):
+            return None
         rows, hidden, heads, qr, latent, nope, rope = (
             view[key] for key in
             ("tokens", "hidden", "heads", "query_rank", "latent_rank", "nope_width", "rope_width"))
@@ -354,11 +403,16 @@ def export_subgraphs(nodes, declarations, memberships, entry_dependencies):
                     pending.append(dependency)
         ordered = [by_id[node_id] for node_id in sorted(members, key=position.__getitem__)]
         first = ordered[0]
+        phases = {node["phase"] for node in ordered}
+        valid_phases = (
+            len(phases) <= 1
+            or phases <= {"decode", "draft"}
+            or phases <= {"prefill", "draft", "draft_prefill"}
+            or phases <= {"mixed", "prefill"}
+            or phases <= {"mixed", "decode"}
+        )
         if any((node["replica"], node["stage"]) != (first["replica"], first["stage"])
-               or (node["phase"] != first["phase"]
-                   and not {node["phase"], first["phase"]} <= {"decode", "draft"}
-                   and not {node["phase"], first["phase"]} <= {"prefill", "draft", "draft_prefill"})
-               for node in ordered):
+               for node in ordered) or not valid_phases:
             raise ValueError(f"structure_subgraph_crosses_placement:{local_id}")
         owners = set()
         owner_struct_keys = set()
@@ -383,6 +437,8 @@ def export_subgraphs(nodes, declarations, memberships, entry_dependencies):
                    if users[node["node_id"]] - members or not users[node["node_id"]] & members]
         source_calls = sorted({node["lineage"]["source_call_id"] for node in ordered
                                if node["lineage"]["source_call_id"]})
+        fusion_status, fusion_reason = resolve_subgraph_fusion_status(
+            declaration, ordered, resource_bound=False)
         result.append({
             "subgraph_id": f"rank:{replica}/subgraph:{local_id}",
             "node_ids": [node["node_id"] for node in ordered],
@@ -393,6 +449,8 @@ def export_subgraphs(nodes, declarations, memberships, entry_dependencies):
             "phase": first["phase"], "block": next(iter(blocks)) if len(blocks) == 1 else None,
             "scope_role": first["role"],
             "structure": common_structure, "boundary": "semantic_subgraph",
+            "fusion_status": fusion_status,
+            "fusion_reason": fusion_reason,
             "external_inputs": inputs, "external_outputs": outputs,
             "contract": subgraph_contract(declaration),
             "contract_scope": subgraph_comparison_scope(declaration["role"], ordered),
