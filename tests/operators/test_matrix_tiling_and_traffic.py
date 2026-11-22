@@ -444,7 +444,9 @@ def test_owner_grid_subtiles_and_explicit_domain(m, n, dtype):
     else:
         control, coarse, _ = _price(options={"underfilled_candidates": ()})
         assert span <= control and len(owner_tiles(m, n, tile["tile_m"], tile["tile_n"], 32)) * tile["k_splits"] >= 16
-        assert work["memory@r0:s0"] == pytest.approx(6_963_200 + 2 * tile["k_splits"] * 4 * m * n) and coarse["memory@r0:s0"] > work["memory@r0:s0"]
+        partial = tile["k_splits"] * 4 * m * n
+        assert work["memory@r0:s0"] == pytest.approx(6_963_200) and coarse["memory@r0:s0"] == pytest.approx(6_963_200)
+        assert work["l2@r0:s0"] == pytest.approx(2 * partial) and work["fixpipe@r0:s0"] == pytest.approx(partial)
         assert work["mte2_aic@r0:s0"] == pytest.approx(coarse["mte2_aic@r0:s0"])
 def test_full_grid_and_compute_sweep_preserve_logical_work():
     assert _price(1024, 4096, 128)[:2] == _price(1024, 4096, 128, options={"underfilled_candidates": ()})[:2]
@@ -462,7 +464,7 @@ def test_small_matrix_service_domain_and_memory_supply(hardware):
     native = hardware == GENERATION_PROFILE
     raw["model"]["layers"], raw["machine"]["sku"] = 2, OWNER_GRID_PROFILE if native else hardware
     regimes = json.loads((REPO_ROOT / "examples/service-regimes/a5-small-m-bf16-matmul-20261030.json").read_text())
-    for batch, rate, span in ((32, 2e12, 0.054272), (32, 4e12, 0.027136), (32, 8e12, 0.020136971625838044),
+    for batch, rate, span in ((32, 2e12, 0.054272), (32, 4e12, 0.027136), (32, 8e12, "physical"),
                               (32, 1e9, None), (40, 4e12, None)):
         ops = target_graphs(raw, scope="body", phase="decode", tokens=1, context=4104, sequences=batch)[0]
         op = replace(next(op for op in ops if op.op_id == "s0.l1.latent_down"), op_id="independent_matrix", deps=(), layer=-1)
@@ -473,7 +475,11 @@ def test_small_matrix_service_domain_and_memory_supply(hardware):
         raw["runtime"]["kernels"].pop("service_regimes")
         actual, work = result["duration_ms"], result["execution"]["work"]
         assert (work["hbm_bytes"], work["flops"], result["complete_ms"]) == (op.hbm_bytes, op.flops, pytest.approx(7 + actual))
-        if native and batch == 32:
+        if native and batch == 32 and span == "physical":
+            ev_plain = EvaluationContext.create(parse_case(raw), primitive_table=False)
+            assert actual == pytest.approx(graph_costs(raw, (op,), input_ready_ms=7, evaluation=ev_plain)["duration_ms"])
+            assert 0.027136 / 2 < actual < 0.027136
+        elif native and batch == 32:
             assert actual == pytest.approx(span) if span else actual > 0.027136
         else:
             ev_plain = EvaluationContext.create(parse_case(raw), primitive_table=False)
@@ -603,3 +609,52 @@ def test_representative_rank_keeps_rate_and_owner_count_together():
         verify_operator(raw, _mixed_op(), build)
     raw["machine"]["devices"][0] = device(4, 4e6)
     assert verify_operator(raw, _mixed_op(), build)["result"]["duration_ms"] == 2
+
+
+def test_contiguous_narrow_matrix_panel_avoids_strided_subsector_penalty():
+    from types import SimpleNamespace
+    from mindie_sim.prediction.operators.matrix.matrix_mapping_owners import primitive_cold_hbm_bps
+
+    p01_metrics = {"hbm_read_bytes_per_s": SimpleNamespace(p50=3.6e12, certified_upper_capacity=4.0e12)}
+    p01 = SimpleNamespace(
+        supported=True, modes={}, mode_status=lambda _m=None: "calibrated",
+        band=lambda m, mode=None: p01_metrics.get(m),
+        metrics=p01_metrics,
+        parameters={"mte2_aic_cold_scaling_bps": {"1": 150e9, "8": 1.2e12, "32": 3.6e12}},
+    )
+    p05 = SimpleNamespace(
+        supported=True, modes={}, mode_status=lambda _m=None: "calibrated",
+        band=lambda _m, mode=None: None,
+        metrics={}, parameters={"l2_sector_bytes": 128},
+    )
+    pt = SimpleNamespace(cell=lambda cid: {"P01_datacopy": p01, "P05_l2_residency_reuse": p05}.get(cid))
+    ctx = SimpleNamespace(
+        primitive_table=pt, core_count=32, op=SimpleNamespace(local_shape=(4, 16, 7168)),
+        compute_arch=SimpleNamespace(arch_id="ascend_950"),
+    )
+
+    # Dense contiguous BF16 N=16 (row_bytes == stride_bytes == 32B) across K=7168 rows coalesces
+    # across 128B sectors and must NOT take a 32/128 = 0.25x strided sub-sector penalty.
+    dense_bps = primitive_cold_hbm_bps(
+        ctx, active_cores=8, row_bytes=32, stride_bytes=32,
+        total_tiles=8, is_grouped=False, panel_rows=7168,
+    )
+    wide_bps = primitive_cold_hbm_bps(
+        ctx, active_cores=8, row_bytes=256, stride_bytes=256,
+        total_tiles=8, is_grouped=False, panel_rows=7168,
+    )
+    assert dense_bps == pytest.approx(wide_bps)
+
+    # Short contiguous panel (2 rows * 32B = 64B inside one 128B sector) matches exact sector union 64/128.
+    short_bps = primitive_cold_hbm_bps(
+        ctx, active_cores=8, row_bytes=32, stride_bytes=32,
+        total_tiles=8, is_grouped=False, panel_rows=2,
+    )
+    assert short_bps == pytest.approx(0.5 * wide_bps)
+
+    # Truly strided narrow slice (row_bytes=32 < stride_bytes=256) retains the 32/128 sub-sector penalty.
+    strided_bps = primitive_cold_hbm_bps(
+        ctx, active_cores=8, row_bytes=32, stride_bytes=256,
+        total_tiles=8, is_grouped=False, panel_rows=7168,
+    )
+    assert strided_bps == pytest.approx(0.25 * wide_bps)

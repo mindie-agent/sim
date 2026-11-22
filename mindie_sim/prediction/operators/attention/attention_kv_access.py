@@ -565,3 +565,74 @@ def paged_fia_plan(*, requests, query_lengths, kv_lengths, page_size,
                    "multiquery_broadcast": False},
     }
     return plan
+
+
+@dataclass(frozen=True)
+class FixpipeHandoffPolicy:
+    """Architecture-specific L0C egress policy for staged GQA scores and PV partials."""
+
+    enabled: bool = False
+    via_gm: bool = False
+    mem_tier: str | None = None
+
+    def handoff_resources(self, nbytes: int) -> dict[str, int]:
+        if not self.enabled or nbytes <= 0:
+            return {}
+        res = {"fixpipe": nbytes}
+        if self.via_gm and self.mem_tier:
+            res[self.mem_tier] = nbytes
+        return res
+
+    def read_resources(self, nbytes: int, vread: str) -> dict[str, int]:
+        if not (self.enabled and self.via_gm) or nbytes <= 0:
+            return {}
+        res = {vread: nbytes}
+        if self.mem_tier:
+            res[self.mem_tier] = nbytes
+        return res
+
+
+def gqa_fixpipe_policy(source, workspace_bytes: int = 0) -> FixpipeHandoffPolicy:
+    """Resolve L0C->UB (Arch35) vs L0C->L2/HBM + AIV read (Arch22) from Geometry or RecipeContext."""
+    if source is None:
+        return FixpipeHandoffPolicy()
+    names = getattr(source, "resource_names", None)
+    if names is not None:
+        has_fixpipe = "fixpipe" in names
+        has_l2 = "l2" in names
+    else:
+        units = getattr(source, "resource_units", ())
+        rates = getattr(source, "rates", ())
+        has_fixpipe = "fixpipe" in units
+        has_l2 = "l2" in rates or "l2" in units
+    if not has_fixpipe:
+        return FixpipeHandoffPolicy()
+    datapath = getattr(source, "datapath", None)
+    if bool(getattr(datapath, "has_l0c_to_ub", False)):
+        return FixpipeHandoffPolicy(enabled=True, via_gm=False, mem_tier=None)
+    mech = getattr(source, "physical_mechanisms", None)
+    hierarchy = getattr(mech, "memory_hierarchy", None)
+    buffers = getattr(source, "buffers", None)
+    if buffers is None:
+        buffers = getattr(source, "pool_capacities", {})
+    l2_cap = int(getattr(hierarchy, "effective_l2_bytes", buffers.get("l2", 0)) or 0)
+    if l2_cap > 0 and workspace_bytes <= l2_cap:
+        return FixpipeHandoffPolicy(enabled=True, via_gm=True, mem_tier="l2" if has_l2 else None)
+    return FixpipeHandoffPolicy(enabled=True, via_gm=True, mem_tier="hbm")
+
+
+def remap_stream_pool_units(units: tuple[int, ...], pool: tuple[int, ...]) -> tuple[int, ...]:
+    """Map logical unit indices into a non-empty stream core pool without duplicates."""
+    return tuple(dict.fromkeys(pool[u % len(pool)] for u in units)) if pool and units else units
+
+
+def stream_pool_for_role(owners, role: str, *, buffer_pool: bool = False) -> tuple[int, ...]:
+    """Return the AIC or AIV core pool from ``owners`` for one role or SRAM buffer pool."""
+    from mindie_sim.prediction.streams import AIC_BUFFER_POOLS, AIC_ROLES, AIV_BUFFER_POOLS, AIV_ROLES
+    aic_set = AIC_BUFFER_POOLS if buffer_pool else AIC_ROLES
+    aiv_set = AIV_BUFFER_POOLS if buffer_pool else AIV_ROLES
+    if role in aic_set:
+        return owners.aic if owners.isolation == "disjoint" else owners.pool_aic
+    if role in aiv_set:
+        return owners.aiv if owners.isolation == "disjoint" else owners.pool_aiv
+    return ()

@@ -55,7 +55,6 @@ TYPED_DTYPES = ("int8", "int8", "bf16", "fp32")
 CAPTURED_TOTAL, CAPTURED_COLUMN, CAPTURED_OUTPUT = 44_650_512, 10_240, 40_960
 TYPED_MISMATCH = "typed_scale_representation_mismatch"
 PRODUCER_CONFLICT = "producer_scale_conflict"
-DRAM_SERVICE_FACTOR = 1 / 0.8316
 FAST = 1e12
 AIV_COUNT = 64
 OUTPUT = PartitionedMatrixOutput("fixpipe", 2, 2, 8)
@@ -253,7 +252,7 @@ def test_quantize_producer_dependency_and_exact_matrix_storage(typed):
     rows = {row["op_id"]: row for row in joint["timeline"]}
     assert rows[matrix.op_id]["predecessors"] == [f"r0:{producer.op_id}"]
     assert rows[matrix.op_id]["ready_ms"] == pytest.approx(rows[producer.op_id]["complete_ms"])
-    assert joint["execution"]["serviced"]["memory@r0:s0"] == pytest.approx(CAPTURED_TOTAL + producer.hbm_bytes * DRAM_SERVICE_FACTOR, rel=1e-12)
+    assert joint["execution"]["serviced"]["memory@r0:s0"] == pytest.approx(CAPTURED_TOTAL + producer.hbm_bytes, rel=1e-12)
 @pytest.mark.parametrize("entry", [MatrixEpilogue.from_op, reconcile_native_scale_storage, reconcile_scale_storage])
 def test_bound_producer_scale_conflicts_are_visible(entry):
     _, matrix, producer = _typed_case(enabled=True)

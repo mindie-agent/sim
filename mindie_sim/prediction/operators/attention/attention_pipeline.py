@@ -33,6 +33,9 @@ from mindie_sim.prediction.program import (
     PipelineTemplateProgram, RecipeContext, Stage,
 )
 
+from .attention_kv_access import (
+    FixpipeHandoffPolicy, gqa_fixpipe_policy, remap_stream_pool_units, stream_pool_for_role,
+)
 from .common import AttentionContract
 
 if TYPE_CHECKING:
@@ -136,7 +139,17 @@ def _rows_per_token(output: _Output, group: int, token: int) -> int:
 
 def _placement(context: RecipeContext, core: int, *roles: str) -> dict:
     present = tuple(role for role in roles if role in context.resource_names)
-    return context.owned(core, context.core_count, present) if present else {}
+    if not present:
+        return {}
+    placed = context.owned(core, context.core_count, present)
+    owners = context.stream_owners
+    if owners is None or not placed:
+        return placed
+    role_by_res = {phys: role for role, phys in context.resource_names.items()}
+    return {
+        res: remap_stream_pool_units(units, stream_pool_for_role(owners, role_by_res.get(res, "")))
+        for res, units in placed.items()
+    }
 
 
 def _read_role(context: RecipeContext, *, vector=False) -> str:
@@ -153,17 +166,53 @@ def _operand_role(context: RecipeContext) -> str | None:
 
 def _allocation(context: RecipeContext, core: int, pool: str, name: str,
                 size: float) -> Allocation | None:
-    if pool not in context.pool_names:
-        return None
-    if size <= 0:
+    if pool not in context.pool_names or size <= 0:
         return None
     capacity = context.pool_capacities.get(pool)
     if capacity is not None and size > capacity:
         raise ModelingError(
             f"attention_decode_buffer_exceeds_pool:{pool}:{name}:{size}>{capacity}")
-    units = unit_group(core, context.core_count,
-                       context.pool_units.get(pool, 1))
+    units = unit_group(core, context.core_count, context.pool_units.get(pool, 1))
+    if context.stream_owners is not None and units:
+        units = remap_stream_pool_units(
+            units, stream_pool_for_role(context.stream_owners, pool, buffer_pool=True),
+        )
     return Allocation(name, context.pool_names[pool], float(size), units)
+
+
+def decode_handoff_workspace_bytes(spec: _Spec, core_count: int) -> int:
+    """Simultaneous die-wide FP32 score + PV workspace bytes for staged GQA decode."""
+    if not spec.outputs:
+        return 0
+    max_rows = max(output.rows for output in spec.outputs)
+    max_tile = min(spec.key_tile, max(1, max(output.horizon for output in spec.outputs)))
+    active = min(max(1, int(core_count)), sum(len(o.contributions) for o in spec.outputs))
+    return active * spec.slots * max_rows * (max_tile + spec.head_dim) * _FP32_BYTES
+
+
+def append_gqa_handoff_stages(
+    stages: list[Stage], prefix: str, producer: str, nbytes: int,
+    release: tuple[Allocation, ...], policy: FixpipeHandoffPolicy,
+    context: RecipeContext, core: int, vread: str,
+) -> tuple[str, tuple[Allocation, ...]]:
+    """Emit arch-specific Fixpipe (+ Arch22 AIV read) egress; return (ready_stage, consumer_free)."""
+    if not policy.enabled:
+        return producer, release
+    handoff_name = f"{prefix}_handoff"
+    handoff_res = policy.handoff_resources(nbytes)
+    stages.append(Stage(
+        handoff_name, context.bind(Work(resources=handoff_res)) if handoff_res else {},
+        after=(producer,), free=release, placement=_placement(context, core, "fixpipe"),
+    ))
+    if not policy.via_gm:
+        return handoff_name, ()
+    read_name = f"{prefix}_read"
+    read_res = policy.read_resources(nbytes, vread)
+    stages.append(Stage(
+        read_name, context.bind(Work(resources=read_res)) if read_res else {},
+        after=(handoff_name,), placement=_placement(context, core, vread),
+    ))
+    return read_name, ()
 
 
 def _allocations(items) -> tuple[Allocation, ...]:
@@ -388,8 +437,10 @@ def _producer_program(context: RecipeContext, recipe: StagedGQADecode,
         stages.append(Stage(
             "page_access", context.bind(Work(resources=page_work)),
             acquire=_allocations((page_scale_ub,)), after=("q_load",),
-            placement={**_placement(context, core, *copy_in),
-                       **_placement(context, core, *vector_copy_in)}))
+            placement={
+                **(_placement(context, core, *copy_in) if page_meta else {}),
+                **(_placement(context, core, *vector_copy_in) if page_scale else {}),
+            }))
     key_ready = "page_access" if (page_meta or page_scale) else "q_load"
 
     max_tile = min(recipe.key_tile, max(1, output.horizon))
@@ -412,11 +463,15 @@ def _producer_program(context: RecipeContext, recipe: StagedGQADecode,
         valid, pairs, active_rows, slot = key_of(index)
         return template(valid, pairs, active_rows, slot)
 
+    handoff = gqa_fixpipe_policy(
+        context, decode_handoff_workspace_bytes(spec, context.core_count),
+    )
+
     @lru_cache(maxsize=TEMPLATE_CACHE_SLOTS_FACTOR * recipe.slots + tail_count)
     def template(valid: int, pairs: int, active_rows: int, slot: int):
         return _decode_tile_stages(
             valid, pairs, active_rows, slot, context, core, spec, cache, rows, dim, max_tile,
-            read, write, operand, vector_copy_in)
+            read, write, operand, vector_copy_in, handoff)
 
     contributions = len(output.contributions)
     use_compact = len(set(spec.requests)) <= 1 and contributions == 1
@@ -591,7 +646,7 @@ def _append_decode_key_load(
 
 def _decode_tile_stages(
     valid, pairs, active_rows, slot, context, core, spec, cache, rows, dim, max_tile, read,
-    write, operand, vector_copy_in,
+    write, operand, vector_copy_in, handoff: FixpipeHandoffPolicy = FixpipeHandoffPolicy(),
 ):
     copy_in = (read,)
     copy_out = (write,) if write else ()
@@ -643,9 +698,13 @@ def _decode_tile_stages(
         acquire=score_buffer, free=k_free, placement={
             **_placement(context, core, *cube),
             **_placement(context, core, *vector)}))
+    score_ready, softmax_free = append_gqa_handoff_stages(
+        stages_local, "score", "qk", pairs * _FP32_BYTES,
+        score_buffer, handoff, context, core, vector_copy_in[0],
+    )
     stages_local.append(Stage(
-        "softmax", context.bind(softmax), after=("qk",),
-        acquire=prob_buffer, free=score_buffer,
+        "softmax", context.bind(softmax), after=(score_ready,),
+        acquire=prob_buffer, free=softmax_free,
         placement=_placement(context, core, *vector)))
 
     # V mirrors K; PV consumes the materialized V operand and probability.
@@ -708,16 +767,21 @@ def _decode_tile_stages(
                        **_placement(context, core, *operand_role)}))
         v_ready = "v_load"
         v_free = _allocations((v_l1, v_l0b))
+    pv_free = v_free + _allocations((p_l0a,)) + (() if handoff.enabled else pv_acc_buffer)
     stages_local.extend((
         Stage("probability_operand", context.bind(Work(resources=(
                   {operand: pairs * spec.query_bytes} if operand else {}))),
               after=("softmax",), acquire=_allocations((p_l0a,)),
               placement=_placement(context, core, *operand_role)),
         Stage("pv", context.bind(pv), after=(v_ready, "probability_operand"),
-              free=v_free + _allocations((p_l0a,)) + pv_acc_buffer,
-              placement=_placement(context, core, *cube)),
-        Stage("online_update", context.bind(online), after=("pv",),
-              free=prob_buffer, previous=("online_update",),
-              placement=_placement(context, core, *vector)),
+              free=pv_free, placement=_placement(context, core, *cube)),
     ))
+    pv_ready, _ = append_gqa_handoff_stages(
+        stages_local, "pv", "pv", active_rows * dim * _FP32_BYTES,
+        pv_acc_buffer, handoff, context, core, vector_copy_in[0],
+    )
+    stages_local.append(Stage(
+        "online_update", context.bind(online), after=(pv_ready,),
+        free=prob_buffer, previous=("online_update",),
+        placement=_placement(context, core, *vector)))
     return tuple(stages_local)

@@ -295,8 +295,7 @@ def test_ordinary_and_quantized_classes_pay_inclusive_minima_once():
     large = replace(mixed, hbm_bytes=4e8)
     result = graph_costs(raw, (large,), input_ready_ms=7, trace_limit=100, evaluation=nominal)
     assert result["duration_ms"] == pytest.approx(.1 * DRAM_SERVICE_SCALE)
-    assert result["execution"]["serviced"]["memory@r0:s0"] == pytest.approx(
-        4e8 * DRAM_SERVICE_SCALE)
+    assert result["execution"]["serviced"]["memory@r0:s0"] == pytest.approx(4e8)
     assert not any(event["task"].endswith(":startup") for event in result["events"])
     dma = operator_costs(raw, (op("dma", memory=400),), evaluation=nominal)["operators"][0]
     assert dma["duration_ms"] == pytest.approx(1e-7 * DRAM_SERVICE_SCALE)

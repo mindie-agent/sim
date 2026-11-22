@@ -649,6 +649,9 @@ def apply_stream_owners_to_program(
     if isinstance(program, NativeProgram):
         inner = apply_stream_owners_to_program(program.program, owners, datapath, **kwargs)
         return program if inner is program.program else replace(program, program=inner)
+    binder = getattr(program, "bind_stream_owners", None)
+    if callable(binder):
+        return binder(owners, datapath, **kwargs)
     for attr in ("body", "program"):
         child = getattr(program, attr, None)
         if child is not None:

@@ -152,6 +152,31 @@ def router_matrix_operand_bytes(op, geometry, *, recipe=None) -> float:
             + weight_bytes * -(-m // recipe.tile_m))
 
 
+def _geometry_partials_l2_resident(geometry, partial_bytes: float) -> bool:
+    """True when the die declares an L2 resource large enough for FP32 partials."""
+    units = getattr(geometry, "resource_units", None) or {}
+    if "l2" not in units or partial_bytes <= 0.0:
+        return False
+    l2_bytes = int((getattr(geometry, "buffers", None) or {}).get("l2", 0) or 0)
+    if l2_bytes <= 0:
+        hierarchy = getattr(getattr(geometry, "physical_mechanisms", None), "memory_hierarchy", None)
+        l2_bytes = int(getattr(hierarchy, "effective_l2_bytes", 0) or 0)
+    return l2_bytes > 0 and partial_bytes <= float(l2_bytes)
+
+
+def _partials_l2_resident(context, partial_bytes: float) -> bool:
+    """True when FP32 Split-K partials fit die L2 and the Engine exposes an L2 pipe."""
+    names = getattr(context, "resource_names", None) or {}
+    if "l2" not in names or partial_bytes <= 0.0:
+        return False
+    from .matrix_mapping_owners import primitive_l2_params
+    l2_bytes, _ = primitive_l2_params(context)
+    if l2_bytes <= 0:
+        hierarchy = getattr(getattr(context, "physical_mechanisms", None), "memory_hierarchy", None)
+        l2_bytes = int(getattr(hierarchy, "effective_l2_bytes", 0) or 0)
+    return l2_bytes > 0 and partial_bytes <= float(l2_bytes)
+
+
 def build_router_splitk(op, geometry):
     """A5 narrow-N BF16 router: generic tile grid plus Split-K workspace.
 
@@ -175,8 +200,11 @@ def build_router_splitk(op, geometry):
     matrix_mte2 = router_matrix_operand_bytes(op, geometry, recipe=recipe)
     resources = dict(base.resources)
     resources["mte2"] = matrix_mte2
-    base = Work(matrix=base.matrix, resources=resources) + Work(
-        matrix={"bf16": float(op.flops)})
+    matrix = dict(base.matrix)
+    if not any(float(val) > 0.0 for val in matrix.values()) and float(op.flops) > 0.0:
+        compute_fmt = str(dict(op.metadata).get("compute_format") or "bf16")
+        matrix = {compute_fmt: float(op.flops)}
+    base = Work(matrix=matrix, resources=resources)
     m, n, k = (int(value) for value in op.local_shape[-LOCAL_SHAPE_DIMS:])
     tiles = router_output_tiles(m, n)
     cores = int(getattr(geometry, "compute_units", A5_AIC_UNITS))
@@ -184,7 +212,23 @@ def build_router_splitk(op, geometry):
                  max(1, -(-k // ROUTER_K_GRANULE)))
     partial = float(FP32_BYTES) * float(splits) * float(m) * float(n)
     merge = float(splits - 1) * float(m) * float(n)
-    extra = Work(resources={"hbm": 2 * partial, "vector": merge})
+    ws_l2 = _geometry_partials_l2_resident(geometry, partial)
+    units = getattr(geometry, "resource_units", None) or {}
+    extra_res: dict[str, float] = {"vector": merge}
+    if partial > 0.0:
+        if "fixpipe" in units:
+            extra_res["fixpipe"] = partial
+        vread_role = (
+            "mte2_aiv" if "mte2_aiv" in units
+            else ("mte2" if "mte2" in units else None)
+        )
+        if vread_role is not None:
+            extra_res[vread_role] = partial
+        if ws_l2:
+            extra_res["l2"] = 2.0 * partial
+        else:
+            extra_res["hbm"] = 2.0 * partial
+    extra = Work(resources=extra_res)
     plan_work = base + extra
 
     def program(context):
@@ -201,7 +245,8 @@ def build_router_splitk(op, geometry):
         matrix = SteadyMatmul().lower(
             replace(context, op=matrix_op, work=matrix_demand),
             mapping=recipe)
-        workspace = splitk_program(replace(context, work={}), splits)
+        workspace = splitk_program(
+            replace(context, work={}), splits, ws_l2_resident=ws_l2)
         return KernelProgram((
             Stage("router_prologue_drain",
                   latency=ROUTER_PROLOGUE_DRAIN_CYCLES / clock_ms),
@@ -219,6 +264,7 @@ def build_router_splitk(op, geometry):
         "matrix_operand_bytes": matrix_mte2,
         "partial_write_bytes": partial,
         "merge_vector_ops": merge,
+        "workspace_residency": "l2" if ws_l2 else "hbm",
     })
 
 
@@ -277,7 +323,7 @@ def _k_slices(k: float, count: int) -> tuple[int, ...]:
 
 def _per_owner_cap(
     context, owners: int, *, row_bytes: int = 0, stride_bytes: int = 0,
-    m_tiles: int | None = None,
+    m_tiles: int | None = None, panel_rows: int | None = None,
 ) -> dict[str, float]:
     """Service-mode bytes/second as a bytes/ms cap for one active owner."""
     hbm = context.resource_names.get("hbm")
@@ -288,7 +334,7 @@ def _per_owner_cap(
         cold_bps = primitive_cold_hbm_bps(
             context, active_cores=active, row_bytes=row_bytes,
             stride_bytes=stride_bytes, total_tiles=owners, is_grouped=False,
-            m_tiles=m_tiles,
+            m_tiles=m_tiles, panel_rows=panel_rows,
         )
         if cold_bps is not None and cold_bps > 0.0:
             return {hbm: cold_bps / (MS_PER_SECOND * float(active))}
@@ -298,25 +344,41 @@ def _per_owner_cap(
     return {hbm: rate / (MS_PER_SECOND * float(int(owners)))}
 
 
-def _merge_owner_cap(context, merge_tasks: int, *, total_partial_bytes: float = 0.0) -> dict[str, float]:
-    """Per-tile HBM/L2 cap for AIV Stream-K fixup across active merge tasks."""
+def _merge_owner_cap(
+    context, merge_tasks: int, *, total_partial_bytes: float = 0.0,
+    l2_resident: bool = False,
+) -> tuple[dict[str, float], dict[str, float]]:
+    """Per-tile caps ``(partial_read_caps, final_store_caps)`` for AIV Stream-K fixup."""
     hbm = context.resource_names.get("hbm")
-    if hbm is None or merge_tasks < 1:
-        return {}
+    l2 = context.resource_names.get("l2")
+    if merge_tasks < 1:
+        return {}, {}
     pt = getattr(context, "primitive_table", None)
+    read_caps: dict[str, float] = {}
+    store_caps: dict[str, float] = {}
     if pt is not None:
-        from .matrix_mapping_owners import primitive_l2_params, primitive_p01_scaling_bps
-        l2_bytes, _ = primitive_l2_params(context)
+        from mindie_sim.primitives.loader import _table_band_p50
+        from .matrix_mapping_owners import primitive_p01_scaling_bps
         cores = max(1, int(context.core_count))
-        if l2_bytes > 0 and total_partial_bytes > 0.0 and total_partial_bytes <= float(l2_bytes):
-            # FP32 partials just written by AICs reside in L2 for AIV fixup.
+        if l2_resident and l2 is not None:
             l2_bps = primitive_p01_scaling_bps(context, cores, warm=True)
             if l2_bps is not None and l2_bps > 0.0:
-                return {hbm: l2_bps / (MS_PER_SECOND * float(int(merge_tasks)))}
-        hbm_rd = primitive_p01_hbm_read_bps(context)
-        if hbm_rd is not None and hbm_rd > 0.0:
-            return {hbm: hbm_rd / (MS_PER_SECOND * float(int(merge_tasks)))}
-    return _per_owner_cap(context, merge_tasks)
+                read_caps[l2] = l2_bps / (MS_PER_SECOND * float(int(merge_tasks)))
+        elif hbm is not None:
+            hbm_rd = primitive_p01_hbm_read_bps(context)
+            if hbm_rd is not None and hbm_rd > 0.0:
+                read_caps[hbm] = hbm_rd / (MS_PER_SECOND * float(int(merge_tasks)))
+        if hbm is not None:
+            hbm_wr = _table_band_p50(pt, "P01_datacopy", "hbm_write_bytes_per_s")
+            if hbm_wr is not None and float(hbm_wr) > 0.0:
+                store_caps[hbm] = float(hbm_wr) / (MS_PER_SECOND * float(int(merge_tasks)))
+            else:
+                hbm_rd = primitive_p01_hbm_read_bps(context)
+                if hbm_rd is not None and hbm_rd > 0.0:
+                    store_caps[hbm] = hbm_rd / (MS_PER_SECOND * float(int(merge_tasks)))
+        return read_caps, store_caps
+    fallback = _per_owner_cap(context, merge_tasks)
+    return ({} if l2_resident else fallback), fallback
 
 
 def _split_stage_caps(context, base_caps, load_work, *, used_cores: int,
@@ -347,34 +409,45 @@ def _split_stage_caps(context, base_caps, load_work, *, used_cores: int,
     return caps
 
 
-def _partial_write_caps(context, base_caps, *, total_partial_bytes: float = 0.0, active_tasks: int = 1) -> dict[str, float]:
-    """Per-AIC Fixpipe write cap for contiguous FP32 workspace partials."""
+def _partial_write_caps(
+    context, base_caps, *, total_partial_bytes: float = 0.0, active_tasks: int = 1,
+    l2_resident: bool = False,
+) -> dict[str, float]:
+    """Per-AIC Fixpipe and L2/HBM write caps for contiguous FP32 workspace partials."""
     pt = getattr(context, "primitive_table", None)
-    hbm = context.resource_names.get("hbm")
-    if pt is None or hbm is None:
-        return dict(base_caps)
+    names = context.resource_names
+    fixpipe = names.get("fixpipe")
+    hbm = names.get("hbm")
+    l2 = names.get("l2")
+    if pt is None:
+        return {} if l2_resident else dict(base_caps)
     from mindie_sim.primitives.loader import _table_band_p50
-    from .matrix_mapping_owners import primitive_l2_params
+    from .matrix_mapping_owners import primitive_p01_scaling_bps
     fix_out = _table_band_p50(pt, "P03_fixpipe", "fixpipe_out_bytes_per_s_per_aic")
     hbm_wr = _table_band_p50(pt, "P01_datacopy", "hbm_write_bytes_per_s")
-    l2_bytes, _ = primitive_l2_params(context)
-    caps = {}
-    per_aic_cap = None
+    caps: dict[str, float] = {}
     if fix_out is not None and float(fix_out) > 0.0:
-        per_aic_cap = float(fix_out) * BF16_TO_FP32_FIXPIPE_RATIO / MS_PER_SECOND
-    if (hbm_wr is not None and float(hbm_wr) > 0.0
-            and (l2_bytes <= 0 or total_partial_bytes > float(l2_bytes))):
+        per_aic_fix = float(fix_out) * BF16_TO_FP32_FIXPIPE_RATIO / MS_PER_SECOND
+        if fixpipe is not None:
+            caps[fixpipe] = per_aic_fix
+        elif not l2_resident and hbm is not None:
+            caps[hbm] = per_aic_fix
+    if l2_resident and l2 is not None:
+        cores = max(1, int(context.core_count))
+        l2_bps = primitive_p01_scaling_bps(context, cores, warm=True)
+        if l2_bps is not None and l2_bps > 0.0:
+            caps[l2] = float(l2_bps) / (MS_PER_SECOND * float(max(1, int(active_tasks))))
+    elif not l2_resident and hbm is not None and hbm_wr is not None and float(hbm_wr) > 0.0:
         wr_per = float(hbm_wr) / (MS_PER_SECOND * float(max(1, int(active_tasks))))
-        per_aic_cap = min(per_aic_cap, wr_per) if per_aic_cap is not None else wr_per
-    if per_aic_cap is not None:
-        caps[hbm] = per_aic_cap
+        caps[hbm] = min(caps[hbm], wr_per) if hbm in caps else wr_per
+    if caps or l2_resident:
         return caps
     return dict(base_caps)
 
 
-def _build_split_slice_stages(load_work, cube_key, cube_val, *, hbm, area,
+def _build_split_slice_stages(load_work, cube_key, cube_val, *, fixpipe, mem_tier, area,
                               k_slice, tile_k, load_caps, write_caps,
-                              load_place, mma_place, pipelined: bool):
+                              load_place, mma_place, fixpipe_place, pipelined: bool):
     """Build K-panel stages for one Split-K task conserving exact work."""
     n_panels = max(1, math.ceil(k_slice / float(max(1, tile_k)))) if tile_k else 1
     stages = []
@@ -401,10 +474,16 @@ def _build_split_slice_stages(load_work, cube_key, cube_val, *, hbm, area,
             stages.append(Stage("mma", {cube_key: cube_val}, after=(predecessor,),
                                 caps=load_caps, placement=mma_place))
             predecessor = "mma"
-    if hbm is not None and area > 0:
+    if area > 0 and (fixpipe is not None or mem_tier is not None):
         write = float(FP32_BYTES) * area
-        stages.append(Stage("partial_write", {hbm: write},
-                            after=(predecessor,), caps=write_caps))
+        pw_work: dict[str, float] = {}
+        if fixpipe is not None:
+            pw_work[fixpipe] = write
+        if mem_tier is not None:
+            pw_work[mem_tier] = write
+        stages.append(Stage("partial_write", pw_work,
+                            after=(predecessor,), caps=write_caps,
+                            placement=fixpipe_place))
     return KernelProgram(tuple(stages))
 
 
@@ -414,14 +493,27 @@ def _placement(context, index: int, cores: int, roles) -> dict:
 
 def _tile_merge_program(context, names, area: float, vector_share,
                         mte3_share, hbm_write_share, partial_read, merges: int,
-                        caps, index: int, cores: int, *,
+                        read_caps, store_caps, index: int, cores: int, *,
+                        mem_tier: str | None = None,
+                        vread_role: str | None = None,
+                        vread_name: str | None = None,
                         merge_tasks: int = 1, used_cores: int | None = None) -> KernelProgram:
     active_cores = cores if used_cores is None else used_cores
     hbm, vector, mte3 = names.get("hbm"), names.get("vector"), names.get("mte3")
+    sharded_aiv = getattr(context, "primitive_table", None) is not None and active_cores > merge_tasks
     stages = []
     predecessor = ()
-    if hbm is not None and partial_read > 0:
-        stages.append(Stage("partial_read", {hbm: partial_read}, caps=caps))
+    if partial_read > 0 and (vread_name is not None or mem_tier is not None):
+        pr_work: dict[str, float] = {}
+        if vread_name is not None:
+            pr_work[vread_name] = partial_read
+        if mem_tier is not None:
+            pr_work[mem_tier] = partial_read
+        if sharded_aiv or vread_role is None:
+            read_place = {}
+        else:
+            read_place = _placement(context, index, cores, (vread_role,))
+        stages.append(Stage("partial_read", pr_work, caps=read_caps, placement=read_place))
         predecessor = ("partial_read",)
     merged = {}
     if vector is not None:
@@ -431,7 +523,7 @@ def _tile_merge_program(context, names, area: float, vector_share,
     if merged:
         # On calibrated Stream-K (arch35/mat_mul_stream_k_kernel.h:213-259), AIV
         # fixup shards output reduction across all paired AIVs of the active grid.
-        if getattr(context, "primitive_table", None) is not None and active_cores > merge_tasks:
+        if sharded_aiv:
             vec_place = {}
         else:
             vec_place = _placement(context, index, cores, ("vector",))
@@ -443,24 +535,30 @@ def _tile_merge_program(context, names, area: float, vector_share,
     if hbm is not None and hbm_write_share > 0:
         store[hbm] = hbm_write_share
     if store:
-        if getattr(context, "primitive_table", None) is not None and active_cores > merge_tasks:
+        if sharded_aiv:
             st_place = {}
         else:
             st_place = _placement(context, index, cores, ("mte3",))
-        stages.append(Stage("final_store", store, after=predecessor, caps=caps,
+        stages.append(Stage("final_store", store, after=predecessor, caps=store_caps,
                             placement=st_place))
     return KernelProgram(tuple(stages))
 
 
 def _record_traffic(record, *, split_count, slices, tasks, partial_bytes,
                     vector_merge, final_write, cube_total, declared_hbm,
-                    issued_vector):
+                    issued_vector, l2_resident: bool = False,
+                    fixpipe_present: bool = False):
     if record is None:
         return
+    partial_hbm = 0.0 if l2_resident else float(partial_bytes) * 2.0
+    partial_l2 = float(partial_bytes) * 2.0 if l2_resident else 0.0
     record.update({
         "execution_abstraction": "finite_split_k",
         "split_k": int(split_count),
-        "partial_policy": "explicit_gm_fp32_partials_then_vector_merge",
+        "partial_policy": (
+            "explicit_l2_fp32_partials_then_vector_merge"
+            if l2_resident else "explicit_gm_fp32_partials_then_vector_merge"
+        ),
         "split_k_tasks": len(tasks),
         "split_k_k_slices": list(slices),
         "split_k_traffic": {
@@ -471,7 +569,10 @@ def _record_traffic(record, *, split_count, slices, tasks, partial_bytes,
             "merge_latency_ms": 0,
             "declared_cube_work": float(cube_total),
             "issued_cube_work": float(cube_total),
-            "issued_hbm_work": float(declared_hbm + partial_bytes + partial_bytes),
+            "issued_hbm_work": float(declared_hbm + partial_hbm),
+            "issued_l2_work": partial_l2,
+            "issued_fixpipe_work": float(partial_bytes) if fixpipe_present else 0.0,
+            "workspace_residency": "l2" if l2_resident else "hbm",
             "issued_vector_work": float(issued_vector),
             "tasks": len(tasks),
             "output_tiles": int(len(tasks) // max(1, len(slices))),
@@ -481,11 +582,17 @@ def _record_traffic(record, *, split_count, slices, tasks, partial_bytes,
 
 
 def splitk_program(context, split_count: int, *, recipe=None, geometry=None,
-                   record=None) -> KernelProgram:
+                   record=None, ws_l2_resident: bool | None = None) -> KernelProgram:
     """Lower one underfilled output grid onto output-tile x K-slice tasks."""
     count = max(1, int(split_count))
     names = context.resource_names
     hbm, vector, mte3 = names.get("hbm"), names.get("vector"), names.get("mte3")
+    l2_res, fixpipe = names.get("l2"), names.get("fixpipe")
+    vread_role = (
+        "mte2_aiv" if "mte2_aiv" in names
+        else ("mte2" if "mte2" in names else None)
+    )
+    vread_name = names.get(vread_role) if vread_role is not None else None
     cube = names.get("cube")
     if cube is None:
         cube = next((key for key in context.work if key.startswith("matrix@")),
@@ -524,8 +631,15 @@ def splitk_program(context, split_count: int, *, recipe=None, geometry=None,
             if share > 0:
                 loads[index][hbm] = loads[index].get(hbm, 0) + share
     cubes = _allocate(cube_total, weights)
+    has_partial_sink = hbm is not None or l2_res is not None or fixpipe is not None
     partial_write = (float(FP32_BYTES) * float(splits) * total_m * n
-                     if hbm is not None else 0)
+                     if has_partial_sink else 0.0)
+    l2_resident = (
+        _partials_l2_resident(context, partial_write)
+        if ws_l2_resident is None
+        else (bool(ws_l2_resident) and l2_res is not None)
+    )
+    mem_tier = l2_res if l2_resident else hbm
     vector_merge = (float(splits - 1) * total_m * n
                     if vector is not None else 0)
     pt = getattr(context, "primitive_table", None)
@@ -539,13 +653,17 @@ def splitk_program(context, split_count: int, *, recipe=None, geometry=None,
     split_caps = _per_owner_cap(
         context, len(tasks),
         row_bytes=int(tile_n_dim) * elem_bytes, stride_bytes=int(n) * elem_bytes,
-        m_tiles=m_tiles)
+        m_tiles=m_tiles, panel_rows=max(1, int(k)))
     write_caps = _partial_write_caps(
-        context, split_caps, total_partial_bytes=partial_write, active_tasks=len(tasks))
-    merge_caps = _merge_owner_cap(context, len(areas), total_partial_bytes=partial_write)
+        context, split_caps, total_partial_bytes=partial_write,
+        active_tasks=len(tasks), l2_resident=l2_resident)
+    merge_read_caps, merge_store_caps = _merge_owner_cap(
+        context, len(areas), total_partial_bytes=partial_write,
+        l2_resident=l2_resident)
     load_roles = tuple(role for role in ("mte1", "mte2_aic", "mte2")
                        if role in names)
     mma_roles = ("cube",) if "cube" in names else ()
+    fixpipe_roles = ("fixpipe",) if "fixpipe" in names else ()
 
     def split_program(index: int) -> KernelProgram:
         _tile_index, area, k_slice = tasks[index]
@@ -556,11 +674,12 @@ def splitk_program(context, split_count: int, *, recipe=None, geometry=None,
             tile_m=eff_tm, tile_n=eff_tn, k_slice=k_slice,
             elem_bytes=elem_bytes, cube_key=cube, core_index=index, cores=cores)
         return _build_split_slice_stages(
-            loads[index], cube, cubes[index], hbm=hbm, area=area,
-            k_slice=k_slice, tile_k=tile_k_dim, load_caps=load_caps,
+            loads[index], cube, cubes[index], fixpipe=fixpipe, mem_tier=mem_tier,
+            area=area, k_slice=k_slice, tile_k=tile_k_dim, load_caps=load_caps,
             write_caps=write_caps,
             load_place=_placement(context, index, cores, load_roles),
             mma_place=_placement(context, index, cores, mma_roles),
+            fixpipe_place=_placement(context, index, cores, fixpipe_roles),
             pipelined=(pt is not None))
 
     tile_areas = [areas[tile] for tile in sorted({task[0] for task in tasks})]
@@ -574,7 +693,9 @@ def splitk_program(context, split_count: int, *, recipe=None, geometry=None,
         partial_read = float(FP32_BYTES) * float(splits) * area
         return _tile_merge_program(
             context, names, area, vector_shares[index], mte3_shares[index],
-            hbm_shares[index], partial_read, splits, merge_caps, index, cores,
+            hbm_shares[index], partial_read, splits, merge_read_caps,
+            merge_store_caps, index, cores, mem_tier=mem_tier,
+            vread_role=vread_role, vread_name=vread_name,
             merge_tasks=len(tile_areas), used_cores=used_cores)
 
     merges = tuple(merge_program(index) for index in range(len(tile_areas)))
@@ -582,7 +703,8 @@ def splitk_program(context, split_count: int, *, recipe=None, geometry=None,
         record, split_count=count, slices=slices, tasks=tasks,
         partial_bytes=partial_write, vector_merge=vector_merge,
         final_write=hbm_write, cube_total=cube_total,
-        declared_hbm=hbm_total, issued_vector=vector_total + vector_merge)
+        declared_hbm=hbm_total, issued_vector=vector_total + vector_merge,
+        l2_resident=l2_resident, fixpipe_present=(fixpipe is not None))
     total_setup_ms = float(context.setup_ms or 0.0) + matrix_kernel_setup_ms(
         context, is_streamk=(splits > 1))
     sync_ms = streamk_fixup_latency_ms(context, k_splits=splits, used_cores=used_cores)

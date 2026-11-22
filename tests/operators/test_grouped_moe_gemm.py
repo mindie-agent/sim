@@ -529,7 +529,10 @@ def test_router_split_k_preserves_matrix_and_workspace_service(m, n, k):
     assert 1 < plan.metadata["split_k"] <= k
     assert plan.metadata["partial_write_bytes"] == partial
     assert plan.work.matrix["bf16"] == 2 * m * n * k
-    assert plan.work.resources["hbm"] == pytest.approx(op.hbm_bytes + 2 * partial)
+    assert plan.work.resources["hbm"] == pytest.approx(op.hbm_bytes)
+    assert plan.work.resources["l2"] == pytest.approx(2 * partial)
+    assert plan.work.resources["fixpipe"] == pytest.approx(partial)
+    assert plan.work.resources["mte2_aiv"] == pytest.approx(partial)
 
 
 @pytest.mark.parametrize("tokens,groups,group_topk", [(1, 0, 0), (65, 1, 1), (960, 8, 4)])
@@ -597,3 +600,109 @@ def test_two_bank_bf16_service_preserves_analytical_work(batch, query):
     assert response["execution"]["work"] == control["execution"]["work"]
     assert response["execution"]["work"]["hbm_bytes"] >= dict(op.metadata)["packed_weight_bytes"]
     assert any(row["queries"].get(query) == 1 for row in response["parameters"]["service_regimes"])
+
+
+def test_router_splitk_preserves_single_gemm_flops_on_typed_and_reprepared_ops():
+    from mindie_sim.prediction.operators.matrix.matrix_splitk import build_router_splitk
+
+    m, n, k = 16, 256, 4096
+    layer = SimpleNamespace(
+        router_dtype="", router_output_dtype="fp32",
+        num_experts=n, router_input_size=k, index=0,
+    )
+    model = SimpleNamespace(quant=QuantSpec("mx", weight_format="mxfp8"), activation_dtype="bf16")
+    _, op, _, _ = router_gemm(
+        prefix="route", plan=layer, deps=(), stage=0, requests=(),
+        tokens=m, model=model, hidden=k, mode="decode",
+    )
+    expected_flops = float(2 * m * n * k)
+    geom = hardware(REPRESENTATIVE_SKUS["a5"])
+
+    typed_op = replace(op, flops=expected_flops, matrix_flops=(("bf16", expected_flops),))
+    plan_typed = build_router_splitk(typed_op, geom)
+    assert plan_typed.work.matrix == {"bf16": pytest.approx(expected_flops)}
+    assert sum(plan_typed.work.matrix.values()) == pytest.approx(expected_flops)
+
+    reprepared_op = plan_typed.work.apply(op)
+    plan_reprepared = build_router_splitk(reprepared_op, geom)
+    assert plan_reprepared.work.matrix == {"bf16": pytest.approx(expected_flops)}
+    assert sum(plan_reprepared.work.matrix.values()) == pytest.approx(expected_flops)
+
+
+def test_splitk_workspace_charges_fixpipe_and_routes_warm_vs_spill_reads():
+    from mindie_sim.prediction.operators.matrix.matrix_splitk import build_router_splitk
+
+    def _exec_plan(op_spec, geom, plan):
+        roles = set(geom.rates) | set(plan.work.resources) | {"cube"}
+        rates = {r: float(geom.rates.get(r, 1e12)) / 1000.0 for r in roles}
+        rates["cube"] = 1.0
+        units = {r: int(geom.resource_units.get(r, 1)) for r in roles}
+        ctx = RecipeContext(
+            op_spec,
+            {},
+            {r: r for r in roles},
+            rates,
+            geom.compute_units,
+            resource_units=units,
+            compute_peaks=dict(geom.compute_peaks),
+            pool_names={p: p for p in geom.buffers},
+            pool_capacities=dict(geom.buffers),
+            pool_units=dict(geom.buffer_units),
+            physical_mechanisms=geom.physical_mechanisms,
+            datapath=geom.datapath,
+        )
+        ctx = replace(ctx, work=ctx.bind(plan.work))
+        eng = Engine(
+            [Resource(r, rates[r], units=units[r]) for r in roles],
+            pools=dict(geom.buffers), pool_units=dict(geom.buffer_units),
+        )
+        done = plan.program(ctx).start(eng, "splitk", eng.submit("in"))
+        eng.advance(until=(done,))
+        return eng
+
+    m, n, k = 32, 256, 4096
+    layer = SimpleNamespace(
+        router_dtype="", router_output_dtype="fp32",
+        num_experts=n, router_input_size=k, index=0,
+    )
+    model = SimpleNamespace(quant=QuantSpec("mx", weight_format="mxfp8"), activation_dtype="bf16")
+    _, op, _, _ = router_gemm(
+        prefix="route", plan=layer, deps=(), stage=0, requests=(),
+        tokens=m, model=model, hidden=k, mode="decode",
+    )
+    geom_l2 = hardware(REPRESENTATIVE_SKUS["a5"])
+    plan_l2 = build_router_splitk(op, geom_l2)
+    partial_l2 = float(plan_l2.metadata["partial_write_bytes"])
+    assert plan_l2.metadata["workspace_residency"] == "l2"
+    assert plan_l2.work.resources["hbm"] == pytest.approx(op.hbm_bytes)
+    assert plan_l2.work.resources["l2"] == pytest.approx(2.0 * partial_l2)
+    assert plan_l2.work.resources["fixpipe"] == pytest.approx(partial_l2)
+    assert plan_l2.work.resources["mte2_aiv"] == pytest.approx(partial_l2)
+
+    eng_l2 = _exec_plan(op, geom_l2, plan_l2)
+    assert eng_l2.serviced["hbm"] == pytest.approx(op.hbm_bytes)
+    assert eng_l2.serviced["l2"] == pytest.approx(2.0 * partial_l2)
+    assert eng_l2.serviced["fixpipe"] == pytest.approx(partial_l2)
+    assert eng_l2.serviced["mte2_aiv"] == pytest.approx(partial_l2)
+
+    # Force workspace spill by shrinking effective L2 below partial_write_bytes.
+    mech = geom_l2.physical_mechanisms
+    tiny_hierarchy = replace(mech.memory_hierarchy, l2_capacity_bytes=1024)
+    geom_spill = replace(
+        geom_l2,
+        buffers={**dict(geom_l2.buffers), "l2": 1024},
+        physical_mechanisms=replace(mech, memory_hierarchy=tiny_hierarchy),
+    )
+    plan_spill = build_router_splitk(op, geom_spill)
+    partial_spill = float(plan_spill.metadata["partial_write_bytes"])
+    assert plan_spill.metadata["workspace_residency"] == "hbm"
+    assert plan_spill.work.resources["hbm"] == pytest.approx(op.hbm_bytes + 2.0 * partial_spill)
+    assert plan_spill.work.resources.get("l2", 0.0) == 0.0
+    assert plan_spill.work.resources["fixpipe"] == pytest.approx(partial_spill)
+    assert plan_spill.work.resources["mte2_aiv"] == pytest.approx(partial_spill)
+
+    eng_spill = _exec_plan(op, geom_spill, plan_spill)
+    assert eng_spill.serviced["hbm"] == pytest.approx(op.hbm_bytes + 2.0 * partial_spill)
+    assert eng_spill.serviced.get("l2", 0.0) == 0.0
+    assert eng_spill.serviced["fixpipe"] == pytest.approx(partial_spill)
+    assert eng_spill.serviced["mte2_aiv"] == pytest.approx(partial_spill)

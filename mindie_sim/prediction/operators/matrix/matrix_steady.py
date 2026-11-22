@@ -51,7 +51,7 @@ def _resolve_calibrated_hbm_cap(
         if geometry.nm == 1 and dram_rate is not None:
             return {names["hbm"]: dram_rate / (MS_PER_SECOND * max(1, int(context.core_count)))}
         return {}
-    _, n, _ = geometry.local_shape
+    _, n, k = geometry.local_shape
     active_groups = max(1, sum(1 for r in geometry.group_rows if r > 0))
     cold_tiles = (
         max(1, int(geometry.nn) * active_groups)
@@ -66,7 +66,7 @@ def _resolve_calibrated_hbm_cap(
         context, cold_tiles=cold_tiles, row_bytes=row_bytes,
         stride_bytes=stride_bytes, is_grouped=is_grouped,
         is_full_row_coalesced=coalesced, nn_tiles=int(geometry.nn),
-        m_tiles=int(geometry.nm),
+        m_tiles=int(geometry.nm), panel_rows=max(1, int(k)),
     )
     if per_owner_bps is None or per_owner_bps <= 0.0:
         if geometry.nm == 1 and dram_rate is not None:

@@ -789,3 +789,166 @@ def test_mqsmla_quant_plan_avoids_per_tile_window_overcount_and_rejects_non_fp8_
     assert plan_a5.work.resources["mte2_aic"] == expected_mte2_tiles + streamed
     with pytest.raises(ModelingError, match=r"^mqsmla_fp8_fp4_unsupported_on_"):
         mqsmla.build(native, geometry(governed.ARCH22))
+
+
+def test_staged_gqa_decode_emits_arch_specific_fixpipe_handoffs():
+    from _support.operator_cases import gqa_decode_op
+    from mindie_sim.prediction.operators.attention.attention_decode import StagedGQADecode
+
+    def _run(geom, op_spec, recipe):
+        plan = recipe.build(op_spec, geom)
+        units = dict(geom.resource_units)
+        rates = {r: float(geom.rates.get(r, 1e12)) / 1000.0 for r in units}
+        rates["cube"] = 1.0
+        ctx = RecipeContext(
+            op_spec, {}, {r: r for r in units}, rates, geom.compute_units,
+            resource_units=units, compute_peaks=dict(geom.compute_peaks),
+            pool_names={p: p for p in geom.buffers}, pool_capacities=dict(geom.buffers),
+            pool_units=dict(geom.buffer_units),
+            physical_mechanisms=geom.physical_mechanisms, datapath=geom.datapath,
+        )
+        eng = Engine(
+            [Resource(r, rates[r], units=units[r]) for r in units],
+            pools=dict(geom.buffers), pool_units=dict(geom.buffer_units), trace_limit=4096,
+        )
+        done = plan.program(ctx).start(eng, "gqa_dec", eng.submit("in"))
+        eng.advance(until=(done,))
+        assert {r: v for r, v in eng.serviced.items() if v} == pytest.approx(ctx.bind(plan.work))
+        assert all(v == 0 for v in eng.allocated.values())
+        return plan, eng
+
+    op = gqa_decode_op([(1, 255)], heads=16, kv_heads=2, dim=128)
+    recipe = StagedGQADecode(key_tile=128, query_tile=16)
+    # 2 KV heads, each 8 query rows * (256 pairs + 2 tiles * 128 dim) * 4B FP32.
+    expected_fixpipe = 2 * (8 * 256 + 2 * 8 * 128) * 4
+
+    # Arch35 (950DT): direct L0C->UB Fixpipe only, zero GM/L2/HBM handoff or AIV read.
+    geom_a5 = Geometry.from_devices(sku_case(REPRESENTATIVE_SKUS["a5"]).machine.dies)
+    plan_a5, eng_a5 = _run(geom_a5, op, recipe)
+    tasks_a5 = {row["task"].rsplit(":", 1)[-1] for row in eng_a5.trace}
+    assert {"score_handoff", "pv_handoff"} <= tasks_a5
+    assert "score_read" not in tasks_a5 and "pv_read" not in tasks_a5
+    assert plan_a5.work.resources["fixpipe"] == pytest.approx(expected_fixpipe)
+    assert plan_a5.work.resources.get("l2", 0.0) == 0.0
+
+    # Arch22 L2-resident (no die l2 rate -> zero extra HBM; explicit l2 rate -> exact 2x L2 traffic).
+    geom_a3 = Geometry.from_devices(sku_case(REPRESENTATIVE_SKUS["a3"]).machine.dies)
+    plan_a3, eng_a3 = _run(geom_a3, op, recipe)
+    tasks_a3 = {row["task"].rsplit(":", 1)[-1] for row in eng_a3.trace}
+    assert {"score_handoff", "score_read", "pv_handoff", "pv_read"} <= tasks_a3
+    assert plan_a3.work.resources["fixpipe"] == pytest.approx(expected_fixpipe)
+    assert plan_a3.work.resources["mte2_aiv"] == pytest.approx(expected_fixpipe)
+    assert plan_a3.work.resources["hbm"] == pytest.approx(plan_a5.work.resources["hbm"])
+
+    geom_a3_l2 = replace(
+        geom_a3,
+        rates={**dict(geom_a3.rates), "l2": 2e12},
+        resource_units={**dict(geom_a3.resource_units), "l2": 1},
+    )
+    plan_a3_l2, _ = _run(geom_a3_l2, op, recipe)
+    assert plan_a3_l2.work.resources["l2"] == pytest.approx(2.0 * expected_fixpipe)
+    assert plan_a3_l2.work.resources["hbm"] == pytest.approx(plan_a5.work.resources["hbm"])
+
+    # Arch22 L2-spill: Fixpipe -> HBM + MTE2_AIV read from HBM.
+    mech = geom_a3.physical_mechanisms
+    geom_spill = replace(
+        geom_a3,
+        buffers={**dict(geom_a3.buffers), "l2": 1024},
+        physical_mechanisms=replace(mech, memory_hierarchy=replace(mech.memory_hierarchy, l2_capacity_bytes=1024)),
+    )
+    plan_spill, _ = _run(geom_spill, op, recipe)
+    assert plan_spill.work.resources["hbm"] == pytest.approx(plan_a5.work.resources["hbm"] + 2.0 * expected_fixpipe)
+    assert plan_spill.work.resources.get("l2", 0.0) == 0.0
+
+
+def test_staged_gqa_decode_respects_disjoint_and_shared_stream_core_partitions():
+    from _support.operator_cases import gqa_decode_op
+    from mindie_sim.prediction.operators.attention.attention_decode import StagedGQADecode
+    from mindie_sim.prediction.streams import (
+        AIC_ROLES, AIV_ROLES, StreamCoreBudget, StreamLane, StreamPlan,
+        apply_stream_owners_to_program, bind_stream_owners, stream_quota_resources,
+    )
+
+    geom = Geometry.from_devices(sku_case(REPRESENTATIVE_SKUS["a5"]).machine.dies)
+    plan_streams = StreamPlan(
+        rank=0,
+        lanes=(
+            StreamLane("main", StreamCoreBudget(aic=8, aiv=16, isolation="disjoint")),
+            StreamLane("aux", StreamCoreBudget(aic=8, aiv=16, isolation="disjoint")),
+            StreamLane("zero_aic", StreamCoreBudget(aic=0, aiv=8, isolation="disjoint")),
+            StreamLane("shared", StreamCoreBudget(aic=4, aiv=8, isolation="shared_cap")),
+        ),
+    )
+    bound_owners = bind_stream_owners(plan_streams, geom.datapath)
+    aux_owners = bound_owners["aux"]
+    assert aux_owners.aic == tuple(range(8, 16))
+    assert aux_owners.aiv == tuple(range(16, 32))
+
+    op = gqa_decode_op([(1, 255)] * 4, heads=16, kv_heads=4, dim=128)
+    recipe = StagedGQADecode(key_tile=128, query_tile=16, kv_splits=2)
+    op_plan = recipe.build(op, geom)
+    units = dict(geom.resource_units)
+    rates = {r: float(geom.rates.get(r, 1e12)) / 1000.0 for r in units}
+    rates["cube"] = 1.0
+    names = {r: r for r in units}
+    ctx = RecipeContext(
+        op, {}, names, rates, geom.compute_units,
+        resource_units=units, compute_peaks=dict(geom.compute_peaks),
+        pool_names={p: p for p in geom.buffers}, pool_capacities=dict(geom.buffers),
+        pool_units=dict(geom.buffer_units),
+        physical_mechanisms=geom.physical_mechanisms, datapath=geom.datapath,
+    )
+    bound_prog = apply_stream_owners_to_program(
+        op_plan.lower(ctx), aux_owners, geom.datapath,
+        resource_names=names, resource_units=units, rates=rates, stream_id="aux",
+        pool_names=ctx.pool_names, pool_units=ctx.pool_units,
+    )
+    eng = Engine(
+        [Resource(r, rates[r], units=units[r]) for r in units],
+        pools=dict(geom.buffers), pool_units=dict(geom.buffer_units), trace_limit=8192,
+    )
+    done = bound_prog.start(eng, "aux_gqa", eng.submit("in"))
+    eng.advance(until=(done,))
+
+    used_aic: set[int] = set()
+    used_aiv: set[int] = set()
+    for row in eng.trace:
+        for role, placed in row.get("placement", {}).items():
+            if role in AIC_ROLES:
+                used_aic.update(placed)
+            elif role in AIV_ROLES:
+                used_aiv.update(placed)
+    assert used_aic and used_aic <= set(aux_owners.aic)
+    assert used_aiv and used_aiv <= set(aux_owners.aiv)
+    assert all(v == 0 for v in eng.allocated.values())
+
+    # Zero-AIC budget must fail honestly on decode.
+    zero_prog = apply_stream_owners_to_program(
+        op_plan.lower(ctx), bound_owners["zero_aic"], geom.datapath,
+        resource_names=names, resource_units=units, rates=rates, stream_id="zero_aic",
+        pool_names=ctx.pool_names, pool_units=ctx.pool_units,
+    )
+    eng_zero = Engine([Resource(r, rates[r], units=units[r]) for r in units],
+                      pools=dict(geom.buffers), pool_units=dict(geom.buffer_units))
+    with pytest.raises(ModelingError, match="stream_zero_aic_budget"):
+        zero_prog.start(eng_zero, "zero_gqa", eng_zero.submit("in"))
+
+    # Shared-cap mode attaches stream_quota resources and completes cleanly.
+    shared_owners = bound_owners["shared"]
+    quota_res, quota_map = stream_quota_resources(
+        {"shared": shared_owners}, geom.datapath, resource_names=names, rates=rates,
+    )
+    qmap = {phys: qname for (sid, phys), qname in quota_map.items() if sid == "shared"}
+    shared_prog = apply_stream_owners_to_program(
+        op_plan.lower(ctx), shared_owners, geom.datapath,
+        resource_names=names, resource_units=units, rates=rates, stream_id="shared",
+        quota_resources=qmap, pool_names=ctx.pool_names, pool_units=ctx.pool_units,
+    )
+    eng_sh = Engine(
+        [Resource(r, rates[r], units=units[r]) for r in units] + list(quota_res),
+        pools=dict(geom.buffers), pool_units=dict(geom.buffer_units),
+    )
+    done_sh = shared_prog.start(eng_sh, "sh_gqa", eng_sh.submit("in"))
+    eng_sh.advance(until=(done_sh,))
+    assert any(k.startswith("stream_quota@") and v > 0.0 for k, v in eng_sh.serviced.items())
+    assert all(v == 0 for v in eng_sh.allocated.values())

@@ -144,6 +144,12 @@ def make_op(
     output_dtype: str = "bf16",
     dispatch_link_bytes: float = 0.0,
     combine_link_bytes: float = 0.0,
+    group_axis: str = "ep",
+    collective: str = "alltoall",
+    dispatch_peer_traffic: Any = None,
+    combine_peer_traffic: Any = None,
+    source_stage: int | None = None,
+    peer_volume_basis: str | None = None,
     shared_inter: int = 0,
     shared_w13_bytes: float = 0.0,
     shared_w2_bytes: float = 0.0,
@@ -190,6 +196,36 @@ def make_op(
         + (r_rows * inter + (tok * sh_inter if sh_inter > 0 else 0.0)) * _activation_ops(act)
         + float(tok * width * (k_sel * COMBINE_REDUCE_OPS_PER_ELEM + (1 if sh_inter > 0 else 0)))
     )
+    ep_axis = str(group_axis or "ep")
+    ep_collective = str(collective or "alltoall")
+    has_ep_comm = mc2_mode >= FUSED_MC2_ROUTED_MODE and int(ep) > 1
+    megamoe_geo: dict[str, Any] = {
+        "tokens": tok,
+        "hidden": width,
+        "moe_intermediate": inter,
+        "top_k": k_sel,
+        "routed_rows": r_rows,
+        "w13_bytes": float(w13_bytes),
+        "w2_bytes": float(w2_bytes),
+        "enable_fused_mc2": mc2_mode,
+        "ep": max(1, int(ep)),
+        "activation": act,
+        "abi_variant_extension": bool(is_abi_ext),
+        "compute_dtype": compute_dtype,
+        "output_dtype": output_dtype,
+        "dispatch_link_bytes": float(dispatch_link_bytes),
+        "combine_link_bytes": float(combine_link_bytes),
+        "shared_intermediate": sh_inter,
+        "shared_w13_bytes": float(shared_w13_bytes) if mc2_mode == FUSED_MC2_SHARED_MODE else 0.0,
+        "shared_w2_bytes": float(shared_w2_bytes) if mc2_mode == FUSED_MC2_SHARED_MODE else 0.0,
+    }
+    if has_ep_comm:
+        megamoe_geo["group_axis"] = ep_axis
+        megamoe_geo["collective"] = ep_collective
+        if dispatch_peer_traffic is not None:
+            megamoe_geo["dispatch_peer_traffic"] = dispatch_peer_traffic
+        if combine_peer_traffic is not None:
+            megamoe_geo["combine_peer_traffic"] = combine_peer_traffic
     spec_meta = {
         "native_kind": NATIVE_KIND,
         "input_format": output_dtype,
@@ -199,26 +235,20 @@ def make_op(
         "ub_working_bytes_per_elem": FP32_BYTES,
         "abi_variant_extension": bool(is_abi_ext),
         **({"activation_params": dict(activation_params)} if activation_params else {}),
-        "megamoe_geometry": {
-            "tokens": tok,
-            "hidden": width,
-            "moe_intermediate": inter,
-            "top_k": k_sel,
-            "routed_rows": r_rows,
-            "w13_bytes": float(w13_bytes),
-            "w2_bytes": float(w2_bytes),
-            "enable_fused_mc2": mc2_mode,
-            "ep": max(1, int(ep)),
-            "activation": act,
-            "abi_variant_extension": bool(is_abi_ext),
-            "compute_dtype": compute_dtype,
-            "output_dtype": output_dtype,
-            "dispatch_link_bytes": float(dispatch_link_bytes),
-            "combine_link_bytes": float(combine_link_bytes),
-            "shared_intermediate": sh_inter,
-            "shared_w13_bytes": float(shared_w13_bytes) if mc2_mode == FUSED_MC2_SHARED_MODE else 0.0,
-            "shared_w2_bytes": float(shared_w2_bytes) if mc2_mode == FUSED_MC2_SHARED_MODE else 0.0,
-        },
+        **(
+            {
+                "group_axis": ep_axis,
+                "comm_axis": ep_axis,
+                "comm_group_size": max(1, int(ep)),
+                "collective": ep_collective,
+                **({"source_stage": int(source_stage)} if source_stage is not None else {}),
+                **({"peer_volume_basis": str(peer_volume_basis)} if peer_volume_basis is not None else {}),
+                **({"dispatch_peer_traffic": dispatch_peer_traffic} if dispatch_peer_traffic is not None else {}),
+                **({"combine_peer_traffic": combine_peer_traffic} if combine_peer_traffic is not None else {}),
+            }
+            if has_ep_comm else {}
+        ),
+        "megamoe_geometry": megamoe_geo,
         "native_source": CANN_MEGAMOE_SOURCE,
         "caller_source": (
             PR22333_SITUGLU_SOURCE if act in {"situglu", "situ"} else VLLM_MEGAMOE_SOURCE
@@ -260,6 +290,45 @@ def _gmm_stage(
     )
 
 
+def _resolve_phase_links(
+    context, disp_link: float, comb_link: float,
+) -> tuple[dict[str, float], dict[str, float]]:
+    """Resolve routed Topology (or die-local) dispatch/combine wire demands."""
+    phase_links = getattr(context, "phase_link_work", None)
+    if isinstance(phase_links, Mapping) and (
+        phase_links.get("dispatch") or phase_links.get("combine")
+    ):
+        disp = {str(k): float(v) for k, v in dict(phase_links.get("dispatch") or {}).items() if float(v) > 0.0}
+        comb = {str(k): float(v) for k, v in dict(phase_links.get("combine") or {}).items() if float(v) > 0.0}
+        return disp, comb
+    total_link = disp_link + comb_link
+    topo_links = {
+        str(k): float(v)
+        for k, v in dict(getattr(context, "work", {}) or {}).items()
+        if float(v) > 0.0 and "link" in str(k).split(":")
+    }
+    if topo_links:
+        disp_frac = (disp_link / total_link) if total_link > 0.0 else 0.5
+        disp = {k: v * disp_frac for k, v in topo_links.items() if v * disp_frac > 0.0}
+        comb = {k: v - disp.get(k, 0.0) for k, v in topo_links.items() if v - disp.get(k, 0.0) > 0.0}
+        return disp, comb
+    if total_link > 0.0 and "link" in context.resource_names:
+        disp = context.bind(Work(resources={"link": disp_link})) if disp_link > 0.0 else {}
+        comb = context.bind(Work(resources={"link": comb_link})) if comb_link > 0.0 else {}
+        return disp, comb
+    return {}, {}
+
+
+def _core_portion(total: float, core: int, cores: int) -> float:
+    """Exact per-core slice closing floating-point rounding on the final core."""
+    if cores <= 1:
+        return total
+    unit = total / float(cores)
+    if core + 1 == cores:
+        return max(0.0, total - unit * float(cores - 1))
+    return unit
+
+
 def _build_megamoe_program(
     context, *, cores: int, aiv_units: int, buf_sizes: dict[str, int],
     in_aiv_bytes: float, out_aiv_bytes: float, pack_vec_ops: float,
@@ -273,6 +342,7 @@ def _build_megamoe_program(
     c_aic_pipe = read_role(context.resource_names, aiv=None)
     c_aiv_pipe = read_role(context.resource_names, aiv=0)
     share = 1.0 / float(cores)
+    disp_wire, comb_wire = _resolve_phase_links(context, disp_link, comb_link)
 
     def per_core(core: int):
         aiv_idx = min(aiv_units - 1, 2 * core if aiv_units >= 2 * cores else core)
@@ -290,10 +360,12 @@ def _build_megamoe_program(
             c_aiv_pipe: in_aiv_bytes * share,
             "vector": pack_vec_ops * share,
         }
-        if disp_link > 0.0 and "link" in context.resource_names:
-            disp_res["link"] = disp_link * share
-        s_disp = Stage("dispatch_mx", context.bind(Work(resources=disp_res)),
-                       acquire=allocs, placement=aiv_owned)
+        disp_work = context.bind(Work(resources=disp_res))
+        for res_name, wire_val in disp_wire.items():
+            portion = _core_portion(wire_val, core, cores)
+            if portion > 0.0:
+                disp_work[res_name] = disp_work.get(res_name, 0.0) + portion
+        s_disp = Stage("dispatch_mx", disp_work, acquire=allocs, placement=aiv_owned)
         s_gmm1 = _gmm_stage(
             context, "gmm1_gate_up", "dispatch_mx", aic_owned, share, comp_dt, gmm1_flops,
             c_aic_pipe, gmm1_gm_read, gmm1_read_total, l0_gmm1, fix_gmm1, gmm1_l2_hit,
@@ -312,11 +384,14 @@ def _build_megamoe_program(
             "hbm": out_aiv_bytes * share,
             "mte3": out_aiv_bytes * share,
         }
-        if comb_link > 0.0 and "link" in context.resource_names:
-            comb_res["link"] = comb_link * share
+        comb_work = context.bind(Work(resources=comb_res))
+        for res_name, wire_val in comb_wire.items():
+            portion = _core_portion(wire_val, core, cores)
+            if portion > 0.0:
+                comb_work[res_name] = comb_work.get(res_name, 0.0) + portion
         s_comb = Stage(
             "combine_store",
-            context.bind(Work(resources=comb_res)),
+            comb_work,
             after=("gmm2_down",), free=allocs, placement=aiv_owned,
         )
         return KernelProgram((s_disp, s_gmm1, s_act, s_gmm2, s_comb))
@@ -353,12 +428,14 @@ def build(op: OpSpec, geometry: Geometry) -> OperatorPlan:
     sh_inter = int(spec.get("shared_intermediate", 0)) if mc2_mode == FUSED_MC2_SHARED_MODE else 0
     sh_w13 = float(spec.get("shared_w13_bytes", 0.0)) if sh_inter > 0 else 0.0
     sh_w2 = float(spec.get("shared_w2_bytes", 0.0)) if sh_inter > 0 else 0.0
-    disp_link = float(spec.get("dispatch_link_bytes", 0.0)) if (mc2_mode >= 2 and ep > 1) else 0.0
-    comb_link = float(spec.get("combine_link_bytes", 0.0)) if (mc2_mode >= 2 and ep > 1) else 0.0
-    has_link = bool((geometry.rates or {}).get("link", 0.0) or (geometry.resource_units or {}).get("link", 0))
-    if not has_link:
-        disp_link = 0.0
-        comb_link = 0.0
+    disp_link = (
+        float(spec.get("dispatch_link_bytes", 0.0))
+        if (mc2_mode >= FUSED_MC2_ROUTED_MODE and ep > 1) else 0.0
+    )
+    comb_link = (
+        float(spec.get("combine_link_bytes", 0.0))
+        if (mc2_mode >= FUSED_MC2_ROUTED_MODE and ep > 1) else 0.0
+    )
 
     # Input hidden + topk metadata read once on AIV; final output written once on AIV.
     in_aiv_bytes = float(tok * (width * out_elem + k_sel * (FP32_BYTES + INT32_BYTES)))
@@ -447,6 +524,8 @@ def build(op: OpSpec, geometry: Geometry) -> OperatorPlan:
         "ub_working_bytes_per_elem": FP32_BYTES,
         "abi_variant_extension": bool(act not in SUPPORTED_ACTIVATIONS),
         "shared_expert_fused": bool(sh_inter > 0),
+        "dispatch_link_bytes": disp_link,
+        "combine_link_bytes": comb_link,
         "l2_onchip_activation_bytes": l2_hit,
         "source_program": CANN_MEGAMOE_SOURCE,
     })
