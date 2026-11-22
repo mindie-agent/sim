@@ -22,7 +22,7 @@ def _issue(row, reason, detail, *, missing=False):
     }
 
 
-def _project(row):
+def _project_router(row):
     native = native_tensor_contract(row)
     if native is None:
         return None, native_tensor_diagnostic(row)
@@ -70,11 +70,11 @@ def _project(row):
 
 
 def observed_router_contract(row):
-    return _project(row)[0] if row.kind in ROUTER_TYPES else None
+    return _project_router(row)[0] if row.kind in ROUTER_TYPES else None
 
 
 def router_contract_diagnostic(row):
-    contract, issue = _project(row)
+    contract, issue = _project_router(row)
     return issue or {
         "category": "tensor_contract_available", "reason": "observed_tensor_contract_available",
         "operator_type": row.kind,
@@ -302,7 +302,7 @@ def _grouped(row, inputs, outputs):
             xs[0], xs[1] if xs[0] else ""), None
 
 
-def _project(row):
+def _project_matrix(row):
     slots = _slots(row)
     if slots is None:
         return None, native_tensor_diagnostic(row)
@@ -314,11 +314,11 @@ def _project(row):
 
 
 def observed_matrix_contract(row):
-    return _project(row)[0]
+    return _project_matrix(row)[0]
 
 
 def matrix_contract_diagnostic(row):
-    contract, issue = _project(row)
+    contract, issue = _project_matrix(row)
     return issue or {
         "category": "tensor_contract_available", "reason": "observed_tensor_contract_available",
         "operator_type": row.kind,

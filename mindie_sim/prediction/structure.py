@@ -21,7 +21,6 @@ from mindie_sim.schema.case import Case, Software
 from mindie_sim.schema.hardware import Hardware
 from mindie_sim.schema import runtime_features
 
-ONE = 1
 
 
 def normalize_model(model: ModelSpec) -> ModelSpec:

@@ -18,9 +18,14 @@
     services, quantization, runtime policy or recipe selection) produces a new
     evaluation context; the structural signature is explicit and hashable.
 
+  * With no caller table, the shipped calibrated ``PrimitiveTable`` of the
+    declared SKU is bound to the declared dies: hardware what-ifs rescale its
+    rate bands by declared/registered supply ratios instead of dropping it.
+
 [Timeouts & Locks]
-  Pure construction from already-parsed declarations.  No I/O, no locks and no
-  device context initialization.
+  Pure construction from already-parsed declarations.  The only read is the
+  shipped read-only primitive table, loaded once per SKU (``lru_cache``).  No
+  locks and no device context initialization.
 
 [Side-Effect Policy]
   Reads the parsed Case; never mutates it, the catalog, the filesystem or any
@@ -31,6 +36,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from contextvars import ContextVar
+from functools import lru_cache
 import time
 import hashlib
 import json
@@ -297,6 +303,282 @@ class ExecutionBindings:
             primitive_coverage_gaps=self.primitive_coverage_gaps)
 
 
+PRIMITIVE_TABLE_CACHE_MAXSIZE = 32
+
+
+@lru_cache(maxsize=PRIMITIVE_TABLE_CACHE_MAXSIZE)
+def _bundled_calibrated_primitive_table(sku: str) -> Any:
+    """Load and cache the shipped calibrated L0 primitive table for ``sku``."""
+    if not sku:
+        return None
+    from mindie_sim.primitives.loader import load_primitives
+
+    try:
+        return load_primitives(sku, require_calibrated=True)
+    except ModelingError:
+        return None
+
+
+#: Relative tolerance under which a declared die rate equals the registered
+#: SKU rate the bundled primitive table was measured against.
+PRIMITIVE_RESCALE_TOLERANCE = 1e-9
+PRIMITIVE_RESCALED_WARNING = "primitive_table_rescaled_to_declared_die"
+#: ``(primitive, metric) -> die role`` for whole-die bus rates, and per-owner
+#: rates whose table value is already normalized by the owning core count.
+_DIE_BUS_METRICS = {
+    ("P01_datacopy", "hbm_read_bytes_per_s"): "hbm_read",
+    ("P01_datacopy", "hbm_write_bytes_per_s"): "hbm_write",
+    ("P01_datacopy", "hbm_rw11_bytes_per_s"): "hbm",
+    ("P01_datacopy", "hbm_rw21_bytes_per_s"): "hbm",
+    ("P05_l2_residency_reuse", "l2_die_bytes_per_s"): "l2",
+}
+_PER_OWNER_METRICS = {
+    ("P01_datacopy", "mte2_aic_hit_bytes_per_s_per_core"): "mte2_aic",
+    ("P01_datacopy", "mte2_aiv_hit_bytes_per_s_per_core"): "mte2_aiv",
+    ("P03_fixpipe", "fixpipe_in_bytes_per_s_per_aic"): "fixpipe",
+    ("P04_mte3_store", "mte3_store_bytes_per_s_per_aiv"): "mte3",
+    ("P07_vec_alu", "vec_alu_ops_per_s_per_aiv"): "vector",
+    ("P11_simt", "simt_ops_per_s_per_aiv"): "simt",
+}
+_CUBE_PRIMITIVE = "P06_mmad"
+
+
+def _hbm_direction_rate(explicit: Any, rates: Mapping[str, Any]) -> float:
+    return float(explicit if explicit is not None else rates.get("hbm", 0.0) or 0.0)
+
+
+def _per_owner(rate: float, units: int) -> float:
+    return rate / units if units > 0 else 0.0
+
+
+def _ratio(declared: float, registered: float) -> float:
+    return declared / registered if declared > 0.0 and registered > 0.0 else 1.0
+
+
+def _die_rescale_factors(die: Any, registered: Mapping[str, Any]) -> dict[str, float]:
+    """Declared-die / registered-SKU supply ratios, one per table-bound role.
+
+    Whole-die buses compare total rates; per-owner pipes compare the rate per
+    owning core, because the overlay multiplies per-core table values by the
+    declared core count itself.  Cube modes compare the per-AIC peak.
+    """
+    reg_rates = dict(registered.get("rates") or {})
+    die_rates = dict(die.rates)
+    reg_units = dict(registered.get("resource_units") or {})
+    reg_cu = int(registered.get("compute_units", 1) or 1)
+    reg_hbm = float(reg_rates.get("hbm", 0.0) or 0.0)
+    die_hbm = float(die_rates.get("hbm", 0.0) or 0.0)
+    hbm_factor = _ratio(die_hbm, reg_hbm)
+    reg_hbm_read = _hbm_direction_rate(registered.get("hbm_read_bytes_per_s"), reg_rates)
+    reg_hbm_write = _hbm_direction_rate(registered.get("hbm_write_bytes_per_s"), reg_rates)
+    die_hbm_read = _hbm_direction_rate(die.hbm_read_bytes_per_s, die_rates)
+    die_hbm_write = _hbm_direction_rate(die.hbm_write_bytes_per_s, die_rates)
+    # Callers perturbing ``hbm_bw_bytes_per_s`` or ``rates["hbm"]`` leave
+    # explicit SKU read/write fields untouched; follow ``hbm`` when they were
+    # not independently perturbed, and never let read/write exceed ``die_hbm``.
+    hbm_read_factor = (
+        hbm_factor
+        if abs(_ratio(die_hbm_read, reg_hbm_read) - 1.0) <= PRIMITIVE_RESCALE_TOLERANCE
+        else _ratio(die_hbm_read, reg_hbm_read)
+    )
+    hbm_write_factor = (
+        hbm_factor
+        if abs(_ratio(die_hbm_write, reg_hbm_write) - 1.0) <= PRIMITIVE_RESCALE_TOLERANCE
+        else _ratio(die_hbm_write, reg_hbm_write)
+    )
+    factors = {
+        "hbm": hbm_factor,
+        "hbm_read": hbm_read_factor,
+        "hbm_write": hbm_write_factor,
+        "l2": _ratio(float(die_rates.get("l2", 0.0) or 0.0), float(reg_rates.get("l2", 0.0) or 0.0)),
+    }
+    for role in set(_PER_OWNER_METRICS.values()):
+        factors[role] = _ratio(
+            _per_owner(float(die_rates.get(role, 0.0) or 0.0), int(die.units(role))),
+            _per_owner(float(reg_rates.get(role, 0.0) or 0.0), int(reg_units.get(role, reg_cu))))
+    die_peaks = dict(die.compute_peaks)
+    for dtype, reg_peak in dict(registered.get("compute_peaks") or {}).items():
+        factors[f"cube:{dtype}"] = _ratio(
+            _per_owner(float(die_peaks.get(dtype, 0.0) or 0.0), int(die.compute_units)),
+            _per_owner(float(reg_peak), reg_cu))
+    return factors
+
+
+def _scaled_band(band: Any, factor: float) -> Any:
+    from dataclasses import replace as _replace
+
+    if factor == 1.0 or getattr(band, "bound_kind", "") != "rate_upper":
+        return band
+    scaled = {name: (getattr(band, name) * factor if getattr(band, name) is not None else None)
+              for name in ("certified_upper_capacity", "p05", "p50", "p95", "p99", "trimmed_mean")}
+    return _replace(band, **scaled)
+
+
+def _scaled_metrics(values: Mapping[str, Any], factor_for: Any) -> dict[str, Any]:
+    """Rebuild one metric mapping, rescaling only bands with a declared role factor."""
+    from mindie_sim.primitives.schema import UncertaintyBand
+
+    out: dict[str, Any] = {}
+    for name, value in values.items():
+        if isinstance(value, UncertaintyBand):
+            out[name] = _scaled_band(value, factor_for(name))
+        elif isinstance(value, Mapping):
+            out[name] = _scaled_metrics(value, factor_for)
+        else:
+            out[name] = value
+    return out
+
+
+def _scale_bps_mapping(values: Any, factor: float) -> Any:
+    if factor == 1.0 or not isinstance(values, Mapping):
+        return values
+    return {
+        k: (float(v) * factor if isinstance(v, (int, float)) and not isinstance(v, bool) else v)
+        for k, v in values.items()
+    }
+
+
+def _scale_bps_records(records: Any, factor: float, field: str = "bps_p50") -> Any:
+    if factor == 1.0 or not isinstance(records, (list, tuple)):
+        return records
+    return tuple(
+        {**item, field: float(item[field]) * factor}
+        if isinstance(item, Mapping) and isinstance(item.get(field), (int, float))
+        else item
+        for item in records
+    )
+
+
+def _scale_nested_bps(mapping: Any, field_factors: Mapping[str, float]) -> Any:
+    if not isinstance(mapping, Mapping) or all(f == 1.0 for f in field_factors.values()):
+        return mapping
+    out: dict[str, Any] = {}
+    for key, entry in mapping.items():
+        if not isinstance(entry, Mapping):
+            out[key] = entry
+            continue
+        updated = dict(entry)
+        for metric_name, factor in field_factors.items():
+            if factor != 1.0 and isinstance(updated.get(metric_name), (int, float)):
+                updated[metric_name] = float(updated[metric_name]) * factor
+        out[key] = updated
+    return out
+
+
+def _rescaled_parameters(
+    pid: str, params: Mapping[str, Any], factors: Mapping[str, float],
+    buffers: Mapping[str, int],
+) -> dict[str, Any]:
+    """Scale embedded bandwidth lookup surfaces inside P01/P05 cell parameters."""
+    out = dict(params)
+    hbm = float(factors.get("hbm", 1.0))
+    hbm_r = float(factors.get("hbm_read", hbm))
+    hbm_w = float(factors.get("hbm_write", hbm))
+    l2 = float(factors.get("l2", 1.0))
+    mte2_aic = float(factors.get("mte2_aic", 1.0))
+    if pid == "P01_datacopy":
+        if isinstance(out.get("hbm_read_datacopy_blocked_bps_p50"), (int, float)) and hbm_r != 1.0:
+            out["hbm_read_datacopy_blocked_bps_p50"] = float(out["hbm_read_datacopy_blocked_bps_p50"]) * hbm_r
+        out["gm_alignment_cold_bps"] = _scale_bps_mapping(out.get("gm_alignment_cold_bps"), hbm_r)
+        out["mte2_aic_cold_scaling_bps"] = _scale_bps_mapping(out.get("mte2_aic_cold_scaling_bps"), hbm_r)
+        out["mte2_aic_warm_scaling_bps"] = _scale_bps_mapping(out.get("mte2_aic_warm_scaling_bps"), mte2_aic)
+        out["strided_cold_surface"] = _scale_bps_records(out.get("strided_cold_surface"), hbm_r)
+        out["gather_v2_cold_surface"] = _scale_nested_bps(
+            out.get("gather_v2_cold_surface"),
+            {"random_scatter_rw_bps": hbm, "sequential_rw_bps": hbm})
+        out["payload_ramp_bytes_per_s"] = _scale_nested_bps(
+            out.get("payload_ramp_bytes_per_s"),
+            {"read_bps": hbm_r, "write_bps": hbm_w, "rw11_bps": hbm})
+    elif pid == "P05_l2_residency_reuse":
+        if "l2" in buffers:
+            out["l2_bytes"] = int(buffers["l2"])
+        out["l2_stride_conflict"] = _scale_bps_records(out.get("l2_stride_conflict"), l2)
+    return out
+
+
+def _rescaled_cell(
+    cell: Any, factors: Mapping[str, float], buffers: Mapping[str, int],
+) -> Any:
+    from dataclasses import replace as _replace
+
+    pid = cell.primitive_id
+
+    def metric_factor(metric: str) -> float:
+        role = _DIE_BUS_METRICS.get((pid, metric)) or _PER_OWNER_METRICS.get((pid, metric))
+        return float(factors.get(role, 1.0)) if role else 1.0
+
+    modes = {}
+    for mode, entry in cell.modes.items():
+        if pid == _CUBE_PRIMITIVE:
+            cube = float(factors.get(f"cube:{mode}", 1.0))
+            modes[mode] = _scaled_metrics(entry, lambda metric, cube=cube: cube if metric == "cube_only_rate" else 1.0)
+        else:
+            modes[mode] = _scaled_metrics(entry, metric_factor)
+    return _replace(
+        cell,
+        metrics=_scaled_metrics(cell.metrics, metric_factor),
+        modes=modes,
+        parameters=_rescaled_parameters(pid, cell.parameters, factors, buffers),
+    )
+
+
+def _rebind_primitive_table(table: Any, die: Any, registered: Mapping[str, Any]) -> Any:
+    """Bind a measured SKU table to a declared (possibly perturbed) die.
+
+    A hardware what-if (e.g. 4.0 -> 1.4 TB/s HBM, fewer cores, another clock)
+    keeps every measured per-mechanism efficiency: bus rates scale by the
+    declared/registered supply ratio, per-core rates by the per-core ratio, and
+    the silicon fingerprint adopts the declared core counts and buffers.  Launch
+    and latency bands are unchanged.  A different architecture is unbound.
+    """
+    from dataclasses import replace as _replace
+
+    from mindie_sim.primitives.loader import _check_datapath
+
+    datapath = datapath_for_die(die)
+    factors = _die_rescale_factors(die, registered)
+    silicon = table.provenance.silicon_fingerprint
+    buffers = dict(datapath.buffers)
+    fingerprint = _replace(
+        silicon, aic_count=int(datapath.aic_count), aiv_count=int(datapath.aiv_count),
+        **{f"{pool}_bytes": int(buffers[pool]) for pool in ("l1", "l0a", "l0b", "l0c", "ub", "l2")
+           if pool in buffers})
+    unchanged = fingerprint == silicon and all(
+        abs(value - 1.0) <= PRIMITIVE_RESCALE_TOLERANCE for value in factors.values())
+    candidate = table
+    if not unchanged:
+        candidate = _replace(
+            table,
+            provenance=_replace(table.provenance, silicon_fingerprint=fingerprint),
+            primitives={key: _rescaled_cell(cell, factors, buffers) for key, cell in table.primitives.items()},
+            warnings=tuple(dict.fromkeys((*table.warnings, PRIMITIVE_RESCALED_WARNING))))
+    try:
+        _check_datapath(candidate, datapath)
+    except ModelingError:
+        return None
+    return candidate
+
+
+def _resolve_default_primitive_table(case: CaseSpec) -> Any:
+    """Auto-bind the calibrated bundled SKU primitive table to the declared dies."""
+    if not case.machine.dies or not case.machine.homogeneous:
+        return None
+    sku = str(case.machine.sku or "")
+    table = _bundled_calibrated_primitive_table(sku)
+    if table is None:
+        return None
+    from mindie_sim.backends.ascend import profiles as ascend_profiles
+
+    # Ratios are taken against the silicon the table was measured on, which can
+    # be a manifest-compatible sibling of the declared SKU.
+    registry = ascend_profiles()
+    entry = registry.get(str(table.sku)) or registry.get(sku)
+    registered = entry.get("device") if isinstance(entry, Mapping) else None
+    if not isinstance(registered, Mapping):
+        return None
+    return _rebind_primitive_table(table, case.machine.dies[0], registered)
+
+
 @dataclass
 class EvaluationContext:
     """One evaluation's frozen hardware, bindings, cost model and caches."""
@@ -321,7 +603,13 @@ class EvaluationContext:
         from .efficiency.cost import CostModel
         from .program import RecipeBook
         book = recipes or RecipeBook.from_mapping(case.runtime.kernels)
-        bindings = ExecutionBindings.create(case, book, primitive_table=primitive_table)
+        if primitive_table is False:
+            eff_table = None
+        elif primitive_table is not None:
+            eff_table = primitive_table
+        else:
+            eff_table = _resolve_default_primitive_table(case)
+        bindings = ExecutionBindings.create(case, book, primitive_table=eff_table)
         cost = CostModel(case, primitives, hardware=bindings.hardware)
         return cls(case=case, bindings=bindings, cost=cost,
                    recipe_origin="case" if recipes is None else "caller")

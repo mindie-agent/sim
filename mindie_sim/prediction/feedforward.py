@@ -14,7 +14,11 @@ import math
 
 from mindie_sim.catalog.ops import gemm_op, vector_op, comm_op, barrier_op
 from mindie_sim.schema.common import ModelingError, dtype_bytes
-from mindie_sim.prediction.operators.vector.gated_activation import gated_activation, declare_situ_quant
+from mindie_sim.prediction.operators.vector.gated_activation import (
+    declare_situ_quant,
+    gated_activation,
+    situ_eager_chain,
+)
 from mindie_sim.prediction.operators.moe_transport.deepep import (deepep_exchange_factor, resolve_exchange_options,
                      scale_exchange_operator, split_deepep_combine_overlap,
                      split_deepep_dispatch_overlap, split_deepep_down_overlap,
@@ -31,9 +35,6 @@ from .sharding.ffn_rules import (
 from mindie_sim.prediction.operators.moe_transport import deepep, moe_transport
 from mindie_sim.prediction.operators.moe_routing import moe_token_partition
 
-ZERO = 0
-ONE = 1
-TWO = 2
 INVERSE_INDEX_DTYPE = "int32"
 _PACK_ROUTING_INDEX_BYTES = 4
 
@@ -51,6 +52,32 @@ def _latent_norm(prefix, source, stage, plan, requests, tokens, latent, model, m
                   ("latent_norm_position", plan.expert_latent_norm_position)))
 
 
+def _is_raw_eager(runtime) -> bool:
+    if runtime is None:
+        return False
+    meta = dict(getattr(runtime, "metadata", ()) or ())
+    policy = meta.get("execution_policy")
+    return bool(
+        meta.get("raw_eager", False)
+        or (isinstance(policy, dict) and policy.get("raw_eager", False))
+    )
+
+
+def _activation_params_meta(plan) -> tuple[tuple[str, object], ...]:
+    """Export canonical ``activation_params`` mapping for rewrite/algebra consumers."""
+    act = str(getattr(plan, "ffn_activation", "") or "")
+    params: dict[str, float] = {}
+    if act == "situ":
+        params["beta"] = float(plan.activation_situ_beta)
+        if plan.activation_situ_linear_beta is not None:
+            params["linear_beta"] = float(plan.activation_situ_linear_beta)
+    elif act == "swigluoai" or (act == "silu" and float(getattr(plan, "swiglu_limit", 0) or 0) > 0):
+        params["limit"] = float(plan.swiglu_limit)
+        params["alpha"] = float(plan.swiglu_alpha)
+        params["beta"] = float(plan.swiglu_beta)
+    return (("activation_params", params),) if params else ()
+
+
 def dense(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mode,
           category="dense_mlp", runtime=None, reduce_output=True, **_):
     # A declared selector is configuration even when this FFN is dense. Validate
@@ -64,14 +91,28 @@ def dense(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mode,
         family="gate_up_projection", recipe="dense_gate_up",
         metadata=(("ffn_role", "gate_up"), ("ffn_category", category)),
     )
-    activation = gated_activation(
-        plan=plan, rows=tokens, width=width,
-        op_id=prefix + (".situ" if plan.ffn_activation == "situ" else ".swiglu"),
-        deps=(gate.op_id,), stage=stage,
-        requests=requests, dtype=model.activation_dtype, phase=mode, recipe="swiglu",
+    act_id = prefix + (".situ" if plan.ffn_activation == "situ" else ".swiglu")
+    act_extra_meta = (
+        ("ffn_role", "activation"),
+        ("ffn_category", category),
+        *_activation_params_meta(plan),
     )
-    activation = replace(activation, metadata=activation.metadata + (
-        ("ffn_role", "activation"), ("ffn_category", category)))
+    if plan.ffn_activation == "situ" and _is_raw_eager(runtime):
+        act_ops = list(situ_eager_chain(
+            plan=plan, rows=tokens, width=width, op_id=act_id,
+            deps=(gate.op_id,), stage=stage, requests=requests,
+            dtype=model.activation_dtype, phase=mode,
+        ))
+        act_ops[-1] = replace(act_ops[-1], metadata=act_ops[-1].metadata + act_extra_meta)
+        activation = act_ops[-1]
+    else:
+        activation = gated_activation(
+            plan=plan, rows=tokens, width=width, op_id=act_id,
+            deps=(gate.op_id,), stage=stage,
+            requests=requests, dtype=model.activation_dtype, phase=mode, recipe="swiglu",
+        )
+        activation = replace(activation, metadata=activation.metadata + act_extra_meta)
+        act_ops = [activation]
     down = gemm_op(
         op_id=prefix + ".down", deps=(activation.op_id,), stage=stage, layer=plan.index,
         requests=requests, m=tokens, n=model.hidden_size, k=width,
@@ -79,7 +120,7 @@ def dense(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mode,
         family="down_projection", recipe="dense_down",
         metadata=(("ffn_role", "down"), ("ffn_category", category)),
     )
-    ops, last = [gate, activation, down], down.op_id
+    ops, last = [gate, *act_ops, down], down.op_id
     declare_situ_quant(ops, key=prefix + ".situ_quant", activation=activation,
                        consumer=down, runtime=runtime, rows=tokens, width=width)
     if parallel.tp > 1 and reduce_output:
@@ -99,7 +140,7 @@ def _route_expert_rows(
     plan, model, parallel, runtime, routing, routing_realization, *,
     caller, token_partition, sequence_plan, group_tokens, ep_owner, price_owner,
 ):
-    local_experts = max(ONE, (int(plan.num_experts) + int(parallel.ep) - ONE)
+    local_experts = max(1, (int(plan.num_experts) + int(parallel.ep) - 1)
                         // int(parallel.ep))
     partitions = (sequence_plan.source_partitions if sequence_plan else
                   getattr(routing_realization, "source_partitions",
@@ -137,12 +178,12 @@ def _route_expert_rows(
     # The local EP owner this graph represents. Base and redundant physical
     # slots are a property of that owner, not of the logical expert ledger.
     local_ep_rank = int(
-        getattr(routing_realization, "representative_rank", ZERO) or ZERO)
+        getattr(routing_realization, "representative_rank", 0) or 0)
     if routing_realization is None and ep_owner is not None:
         # Probability routing has no explicit representative rank.  The
         # physical EP owner still decides which redundant slot bank this graph
         # represents; pricing every replica as owner zero is not a copy.
-        local_ep_rank = int(ep_owner) % max(ONE, int(parallel.ep))
+        local_ep_rank = int(ep_owner) % max(1, int(parallel.ep))
     destination_rows = (
         tuple(int(value) for value in routing_realization.rank_assignment_rows)
         if routing_realization is not None
@@ -155,14 +196,14 @@ def _route_expert_rows(
         if destination_rows is not None else ())
     receive_rows = (
         max((destination_rows[rank] for rank in represented_ranks
-             if 0 <= rank < len(destination_rows)), default=ZERO)
+             if 0 <= rank < len(destination_rows)), default=0)
         if destination_rows is not None else int(math.ceil(local_rows)))
     runtime_routing = dict(getattr(runtime, "routing", {}) or {})
     has_slots = (
-        int(getattr(parallel, "redundant_experts_per_rank", ZERO) or ZERO) > ZERO
+        int(getattr(parallel, "redundant_experts_per_rank", 0) or 0) > 0
         or "expert_slot_map" in runtime_routing
-        or (int(plan.num_experts) > ZERO and int(parallel.ep) > ZERO
-            and int(plan.num_experts) % int(parallel.ep) != ZERO))
+        or (int(plan.num_experts) > 0 and int(parallel.ep) > 0
+            and int(plan.num_experts) % int(parallel.ep) != 0))
     balanced = (routing_realization is not None
                 and routing_realization.basis in {"forced_balanced_integer_counts",
                                                   "source_force_eplb_masked_integer_counts"})
@@ -364,6 +405,8 @@ def _dispatch_routed_inputs(
     ep_scale = tokens * plan.top_k * (parallel.ep - 1) / parallel.ep / exchange_partitions
     dispatch_exchange_bytes, combine_exchange_bytes = ep_scale * dispatch_row_bytes, ep_scale * combine_row_bytes
     collective_meta = (("group_axis", "ep"),
+                       ("comm_axis", "ep"),
+                       ("comm_group_size", int(parallel.ep)),
                        ("source_assignment_partitions", source_partitions),
                        ("traffic_model", "uniform_peer_payload"), ("routing_basis", routing_basis))
     if local_rows and exchange_options["overlap"] > 0.0:
@@ -474,15 +517,31 @@ def _run_routed_experts(
         source_contract=dispatch_source,
         row_cut=gate_row_cut, activation_id=prefix + ".expert_act")
     gate_segments = tuple(op for op in gate_ops if op.family == "grouped_gemm")
-    activation = gated_activation(
-        plan=plan, rows=activation_rows, width=expert_width,
-        op_id=prefix + ".expert_act",
-        deps=tuple(op.op_id for op in gate_segments) or (gate_last,),
-        stage=stage, requests=requests, dtype=model.activation_dtype,
-        phase=mode, recipe="grouped_swiglu",
-    )
+    act_deps = tuple(op.op_id for op in gate_segments) or (gate_last,)
+    if plan.ffn_activation == "situ" and _is_raw_eager(runtime):
+        act_ops = list(situ_eager_chain(
+            plan=plan, rows=activation_rows, width=expert_width,
+            op_id=prefix + ".expert_act", deps=act_deps, stage=stage,
+            requests=requests, dtype=model.activation_dtype, phase=mode,
+        ))
+        activation = act_ops[-1]
+    else:
+        activation = gated_activation(
+            plan=plan, rows=activation_rows, width=expert_width,
+            op_id=prefix + ".expert_act", deps=act_deps,
+            stage=stage, requests=requests, dtype=model.activation_dtype,
+            phase=mode, recipe="grouped_swiglu",
+        )
+        act_ops = [activation]
+    act_params_meta = _activation_params_meta(plan)
+    if act_params_meta:
+        act_ops[-1] = replace(act_ops[-1], metadata=act_ops[-1].metadata + act_params_meta)
     if gate_segments:
-        activation = replace(activation, metadata=activation.metadata + (
+        # The first op of a multi-kernel activation chain (e.g. situ_eager_chain's
+        # cast_in) consumes the gate_up segments; for a single fused op act_ops[0]
+        # and act_ops[-1] are the same op.
+        gate_consumer = act_ops[0]
+        gate_consumer = replace(gate_consumer, metadata=gate_consumer.metadata + (
             ("memory_accesses", tuple({
                 "producer": op.op_id,
                 "output": dict(op.metadata).get("primary_output") or "output",
@@ -499,13 +558,15 @@ def _run_routed_experts(
              dict(op.metadata).get("deepep_physical_row_stop"),
              int(op.local_shape[0]), int(op.local_shape[1]))
             for op in gate_segments)
-        activation = replace(activation, metadata=activation.metadata + (
+        gate_consumer = replace(gate_consumer, metadata=gate_consumer.metadata + (
             ("activation_input_segments", segment_meta),
             ("activation_input_bytes", sum(
                 int(op.local_shape[0]) * int(op.local_shape[1])
                 * dtype_bytes(dict(op.metadata).get("output_format") or "bf16")
                 for op in gate_segments)),
         ))
+        act_ops[0] = gate_consumer
+    activation = act_ops[-1]
     if token_partition is not None and token_partition.activation_owners:
         activation = replace(activation, metadata=activation.metadata + (
             ("activation_owners", token_partition.activation_owners),
@@ -513,7 +574,8 @@ def _run_routed_experts(
             ("activation_capacity_basis", "declared_unmasked_tensor_capacity")))
     if caller is not None:
         activation = caller.tag_activation(activation, local_rows)
-    ops.extend((*gate_ops, activation, down))
+    act_ops[-1] = activation
+    ops.extend((*gate_ops, *act_ops, down))
     declare_gate_up_fusion_group(
         ops=ops, runtime=runtime, prefix=prefix, activation=activation,
         gate_ops=gate_ops, gate=gate, down=ops[-1],
@@ -529,7 +591,9 @@ def _run_routed_experts(
             requests=requests, family="allreduce", phase=mode, recipe="expert_tensor_reduce",
             link_bytes=2 * (parallel.etp - 1) / parallel.etp * local_rows * latent
                        * dtype_bytes(model.activation_dtype),
-            shape=(math.ceil(local_rows), latent), metadata=(("group_axis", "etp"),))
+            shape=(math.ceil(local_rows), latent),
+            metadata=(("group_axis", "etp"), ("comm_axis", "etp"),
+                      ("comm_group_size", int(parallel.etp))))
         ops.append(reduce)
         last = reduce.op_id
         down_mid_id = reduce.op_id
@@ -808,8 +872,8 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
         deps=deps, tokens=tokens, hidden=hidden, sequence_plan=sequence_plan,
         overlap_shared=overlap_shared, reduce_after_join=reduce_after_join, caller=caller,
     )
-    if (has_slots and runtime is not None and int(plan.num_experts) > ZERO
-            and routed_tokens > ZERO):
+    if (has_slots and runtime is not None and int(plan.num_experts) > 0
+            and routed_tokens > 0):
         # Redundant physical copies change residency and active weight reads,
         # never logical assignments or aggregate FLOPs. Bind the exact
         # per-owner slot bytes after routing and before native graph lowering.

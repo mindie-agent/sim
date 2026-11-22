@@ -10,6 +10,8 @@ from copy import deepcopy
 from dataclasses import replace
 from collections.abc import Mapping
 
+from mindie_sim.schema.common import ModelingError
+
 from .graph_analysis import (
     FIRST_PARTICIPANT, UNIFORM_COUNT_CARDINALITY,
     analysis_view, rebind_analysis_requests,
@@ -396,7 +398,7 @@ def _build_topology(case):
     from .topology import Topology
     try:
         return Topology(case.machine, case.runtime.parallel)
-    except Exception:
+    except (ModelingError, ValueError, KeyError, IndexError):
         return None
 
 
@@ -406,7 +408,7 @@ def _physical_rank_for(case, replica, topology=None):
         return None
     try:
         return active.ranks(replica, FIRST_PARTICIPANT)[FIRST_PARTICIPANT]
-    except Exception:
+    except (ModelingError, ValueError, KeyError, IndexError):
         return None
 
 
@@ -598,6 +600,28 @@ def _can_reuse_replica_graph(
     )
 
 
+def _finalize_target_graph_set(case, graphs, views, *, scope, selection,
+                               uniform_replicas, participants, model_programs,
+                               program_bindings, program_owners,
+                               padded_tokens, layout):
+    if scope == "body":
+        graph_set = TargetGraphSet(graphs, kernels=case.runtime.kernels,
+                                   selection=selection, scope=scope)
+    else:
+        if uniform_replicas and participants:
+            base_program = model_programs[participants[0]]
+            program_seeds = {replica: base_program for replica in participants}
+        else:
+            program_seeds = dict(model_programs)
+        graph_set = ModelGraphSet(graphs, programs=program_seeds,
+                                  bindings=program_bindings, owners=program_owners,
+                                  kernels=case.runtime.kernels, selection=selection)
+    graph_set.request_views = dict(views)
+    graph_set.padded_tokens = int(padded_tokens or 0)
+    graph_set.sequence_layout = str(layout or "")
+    return graph_set
+
+
 def target_graphs(case, *, phase, tokens, context=0, sequences=1, scope="model",
                   media_tokens_per_sequence=None, resource_fusion=True,
                   draft_prepare=False, apply_body_defaults=True,
@@ -612,8 +636,6 @@ def target_graphs(case, *, phase, tokens, context=0, sequences=1, scope="model",
     physical padding view launches the actual graph bucket and EP kernel
     participation without inventing a logical request.
     """
-    from .execution.dispatch import cohorts
-
     case = parse_model(case) if pure_model else parse_case(case)
     _check_geometry(phase, tokens, 1, context, scope)
     case, selection = effective_body_declaration(
@@ -730,25 +752,12 @@ def target_graphs(case, *, phase, tokens, context=0, sequences=1, scope="model",
         prepared = prepare_cohort_graphs(case, graphs, reuse=reuse_mode)
         graphs = {replica: tuple(prepared.graphs[replica])
                   for replica in graphs}
-    if scope == "body":
-        graph_set = TargetGraphSet(graphs, kernels=case.runtime.kernels,
-                                   selection=selection, scope=scope)
-        graph_set.request_views = dict(views)
-        graph_set.padded_tokens = int(padded_tokens or 0)
-        graph_set.sequence_layout = str(layout or "")
-        return graph_set
-    if uniform_replicas and participants:
-        base_program = model_programs[participants[0]]
-        program_seeds = {replica: base_program for replica in participants}
-    else:
-        program_seeds = dict(model_programs)
-    graph_set = ModelGraphSet(graphs, programs=program_seeds,
-                              bindings=program_bindings, owners=program_owners,
-                              kernels=case.runtime.kernels, selection=selection)
-    graph_set.request_views = dict(views)
-    graph_set.padded_tokens = int(padded_tokens or 0)
-    graph_set.sequence_layout = str(layout or "")
-    return graph_set
+    return _finalize_target_graph_set(
+        case, graphs, views, scope=scope, selection=selection,
+        uniform_replicas=uniform_replicas, participants=participants,
+        model_programs=model_programs, program_bindings=program_bindings,
+        program_owners=program_owners, padded_tokens=padded_tokens, layout=layout,
+    )
 
 
 def model_graphs(value, *, phase, tokens, context=0, sequences=1, scope="model",

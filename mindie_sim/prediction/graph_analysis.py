@@ -533,7 +533,7 @@ from .program import RecipeBook
 from .structure import parse_case
 from .efficiency.exposed_breakdown import (
     CLOCK_GAP_ABS_FLOOR_MS, CLOCK_GAP_LIMIT_FRACTION, ExposedClocks,
-    communication_clocks, control_clocks, cube_clocks, finish_breakdown,
+    advance_clocks, communication_clocks, control_clocks, cube_clocks, finish_breakdown,
     memory_clocks, unavailable_breakdown, vector_clocks)
 from .efficiency.resource_attribution import realized_clock_dag
 
@@ -551,24 +551,64 @@ NON_COMMUNICATION_ROLES = frozenset({
     ROLE_CUBE, ROLE_VECTOR, ROLE_MEMORY, ROLE_CONTROL})
 
 
-def _dominant_role(op) -> str:
-    """Dominant/active physical service role of one executed occurrence."""
-    if float(getattr(op, "link_bytes", 0) or 0) > 0:
-        return ROLE_COMMUNICATION
-    if float(getattr(op, "flops", 0) or 0) > 0:
-        return ROLE_CUBE
-    if float(getattr(op, "vector_ops", 0) or 0) > 0:
-        return ROLE_VECTOR
+def _dominant_role(op, *, stage_rates: Mapping[str, Any] | None = None) -> str:
+    """Dominant physical service role of one executed occurrence by roofline argmax."""
+    link = float(getattr(op, "link_bytes", 0) or 0)
+    flops = float(getattr(op, "flops", 0) or 0)
+    vec = float(getattr(op, "vector_ops", 0) or 0)
     metadata = dict(getattr(op, "metadata", ()) or ())
-    memory = sum(float(getattr(op, field, 0) or 0) for field in (
-        "hbm_bytes", "mte2_bytes", "mte3_bytes"))
-    memory += float(metadata.get("mte1_bytes", 0) or 0)
-    memory += float(metadata.get("fixpipe_bytes", 0) or 0)
-    return ROLE_MEMORY if memory > 0 else ROLE_CONTROL
+    hbm = float(getattr(op, "hbm_bytes", 0) or 0)
+    if hbm <= 0.0:
+        hbm = sum(float(getattr(op, field, 0) or 0) for field in ("mte2_bytes", "mte3_bytes"))
+        hbm += float(metadata.get("mte1_bytes", 0) or 0)
+        hbm += float(metadata.get("fixpipe_bytes", 0) or 0)
+    if stage_rates:
+        peaks = stage_rates.get("compute_peaks") or {}
+        dtype = str(getattr(op, "dtype", "") or "bf16").strip().lower()
+        cube_rate = float(peaks.get(dtype) or peaks.get("bf16") or peaks.get("fp16") or 0.0)
+        vec_rate = float(stage_rates.get("vector") or 0.0)
+        hbm_rate = float(stage_rates.get("hbm") or 0.0)
+        link_rate = float(stage_rates.get("link") or 0.0)
+        times = (
+            (ROLE_COMMUNICATION, (link / link_rate) if (link > 0.0 and link_rate > 0.0) else (float("inf") if link > 0.0 else 0.0)),
+            (ROLE_CUBE, (flops / cube_rate) if (flops > 0.0 and cube_rate > 0.0) else 0.0),
+            (ROLE_VECTOR, (vec / vec_rate) if (vec > 0.0 and vec_rate > 0.0) else 0.0),
+            (ROLE_MEMORY, (hbm / hbm_rate) if (hbm > 0.0 and hbm_rate > 0.0) else 0.0),
+        )
+        best_role, best_time = max(times, key=lambda pair: pair[1])
+        if best_time > 0.0:
+            return best_role
+    if link > 0:
+        return ROLE_COMMUNICATION
+    if flops > 0:
+        return ROLE_CUBE
+    if vec > 0:
+        return ROLE_VECTOR
+    return ROLE_MEMORY if hbm > 0 else ROLE_CONTROL
+
+
+def _stage_role_rates(execution) -> dict[tuple[int, int], dict[str, Any]]:
+    """Extract per-(replica, stage) physical peak rates for dominant-role classification."""
+    out: dict[tuple[int, int], dict[str, Any]] = {}
+    link_rates = [
+        float(res.rate) * 1000.0
+        for name, res in execution.engine.resources.items()
+        if str(name).startswith("link") and float(res.rate) > 0.0
+    ]
+    link_rate = max(link_rates, default=0.0)
+    for (replica, stage), profile in getattr(execution, "stage_profiles", {}).items():
+        hbm_rate = float(profile.rates.get("hbm", (0.0,))[0]) * 1000.0
+        vec_rate = float(profile.rates.get("vector", (0.0,))[0]) * 1000.0
+        peaks = {str(k).lower(): float(v) for k, v in dict(profile.compute_peaks).items()}
+        out[(int(replica), int(stage))] = {
+            "hbm": hbm_rate, "vector": vec_rate,
+            "link": link_rate, "compute_peaks": peaks,
+        }
+    return out
 
 
 def _exposed_breakdown(records, duration_ms, input_ready_ms, replica,
-                       service_clocks_by_id=None):
+                       service_clocks_by_id=None, stage_rates_by_key=None):
     """Reduce executed occurrence service clocks onto the device-step boundary.
 
     Intervals are the actual ``[ready, complete]`` spans of one replica's
@@ -581,13 +621,13 @@ def _exposed_breakdown(records, duration_ms, input_ready_ms, replica,
     """
     intervals = []
     for record in records:
-        if record["replica"] != replica or record["op"].family == "barrier":
+        if record["replica"] != replica:
             continue
         ready = record.get("collective_ready_ms", record["ready"].time)
         start = max(0.0, float(ready) - float(input_ready_ms))
         end = max(start, float(record["complete"].time) - float(input_ready_ms))
         intervals.append((start, end, record))
-    if not intervals:
+    if not any(record["op"].family != "barrier" for _start, _end, record in intervals):
         return unavailable_breakdown(
             "exposed_operator_intervals_missing", boundary="device_step")
     first_start = min(start for start, _end, _record in intervals)
@@ -597,17 +637,14 @@ def _exposed_breakdown(records, duration_ms, input_ready_ms, replica,
         return unavailable_breakdown(
             "unreconciled_execution_boundary", boundary="device_step")
 
-    def service_clocks(op, elapsed):
-        role = _dominant_role(op)
-        if role == ROLE_COMMUNICATION:
-            return communication_clocks(elapsed)
-        if role == ROLE_CUBE:
-            return cube_clocks(elapsed)
-        if role == ROLE_VECTOR:
-            return vector_clocks(elapsed)
-        if role == ROLE_MEMORY:
-            return memory_clocks(elapsed)
-        return control_clocks(elapsed)
+    def service_role(op):
+        if op.family == "barrier":
+            return ROLE_CONTROL
+        stage_rates = (
+            (stage_rates_by_key or {}).get((int(replica), int(getattr(op, "stage", 0) or 0)))
+            if stage_rates_by_key else None
+        )
+        return _dominant_role(op, stage_rates=stage_rates)
 
     def record_id(record, ordinal):
         return str(record.get("id") or f"record{ordinal}")
@@ -617,35 +654,25 @@ def _exposed_breakdown(records, duration_ms, input_ready_ms, replica,
     if len(set(identifiers)) != len(identifiers):
         return unavailable_breakdown(
             "exposed_occurrence_identity_duplicate", boundary="device_step")
-    local = {}
-    dependencies = {}
     has_dependency_identity = all(
         "predecessors" in record for _start, _end, record in intervals)
-    for ordinal, (start, end, record) in enumerate(intervals):
-        elapsed = max(0.0, end - start)
-        supplied = (service_clocks_by_id or {}).get(identifiers[ordinal])
-        local[identifiers[ordinal]] = (
-            supplied if isinstance(supplied, ExposedClocks)
-            else service_clocks(record["op"], elapsed))
-        if has_dependency_identity:
-            dependencies[identifiers[ordinal]] = tuple(record["predecessors"])
-    if not has_dependency_identity:
-        # No declared edges: keep the observed intervals serial in execution
-        # order.  Parallel overlap is not invented.
-        def interval_order(pair):
-            interval, _identifier = pair
-            start, end, _record = interval
-            return start, end
-
-        ordered = [
-            identifier for _interval, identifier in sorted(
-                zip(intervals, identifiers), key=interval_order)]
-        dependencies = {}
-        previous = None
-        for node_id in ordered:
-            dependencies[node_id] = (
-                () if previous is None else (previous,))
-            previous = node_id
+    dependencies = (
+        {identifiers[ordinal]: tuple(record["predecessors"])
+         for ordinal, (_start, _end, record) in enumerate(intervals)}
+        if has_dependency_identity else _serial_dependencies(intervals, identifiers))
+    local, waits = {}, {ROLE_COMMUNICATION: 0.0, ROLE_CONTROL: 0.0}
+    for (_start, _end, record), node, (wait, elapsed) in zip(
+            intervals, identifiers, _causal_wait_ms(intervals, identifiers, dependencies)):
+        role = service_role(record["op"])
+        supplied = (service_clocks_by_id or {}).get(node)
+        service = (supplied if isinstance(supplied, ExposedClocks)
+                   else _ROLE_CLOCKS[role](elapsed))
+        # Causal wait between the latest in-DAG predecessor and this occurrence's
+        # readiness is real exposed time: peer skew for a collective, dispatch /
+        # launch / stream gating otherwise.  It is attributed, never stuffed.
+        wait_role = ROLE_COMMUNICATION if role == ROLE_COMMUNICATION else ROLE_CONTROL
+        waits[wait_role] += wait
+        local[node] = advance_clocks((_ROLE_CLOCKS[wait_role](wait),), service)
     _clocks, terminal = realized_clock_dag(
         local, dependencies, allow_external_predecessors=True)
     expected = float(duration_ms)
@@ -660,18 +687,57 @@ def _exposed_breakdown(records, duration_ms, input_ready_ms, replica,
             "unreconciled_service_clock_boundary", boundary="device_step")
     result = finish_breakdown(
         terminal, duration_ms=expected, boundary="device_step",
-        control_ms=first_start)
+        control_ms=waits[ROLE_CONTROL])
     basis = result["exposed_breakdown_basis"]
     basis["replica"] = int(replica)
-    basis["operator_intervals"] = len(intervals)
+    basis["operator_intervals"] = sum(
+        record["op"].family != "barrier" for _start, _end, record in intervals)
     basis["host_launch_ms"] = float(first_start)
-    basis["method"] = "four_clock_service_attribution_v2"
+    basis["causal_wait_ms"] = {
+        "communication_rendezvous": float(waits[ROLE_COMMUNICATION]),
+        "control_dispatch": float(waits[ROLE_CONTROL]),
+    }
+    basis["method"] = "four_clock_service_attribution_v3"
     basis["service_basis"] = (
-        "executed_interval_assigned_to_declared_dominant_physical_class")
+        "executed_interval_assigned_to_declared_dominant_physical_class_"
+        "plus_attributed_causal_wait")
     basis["declared_edges"] = bool(has_dependency_identity)
     basis["realized_edges"] = sum(
         len(predecessors) for predecessors in dependencies.values())
     return result
+
+
+_ROLE_CLOCKS = {
+    ROLE_COMMUNICATION: communication_clocks, ROLE_CUBE: cube_clocks,
+    ROLE_VECTOR: vector_clocks, ROLE_MEMORY: memory_clocks,
+    ROLE_CONTROL: control_clocks,
+}
+
+
+def _serial_dependencies(intervals, identifiers):
+    """No declared edges: keep observed intervals serial in execution order."""
+    ordered = [identifier for _interval, identifier in sorted(
+        zip(intervals, identifiers), key=lambda pair: (pair[0][0], pair[0][1]))]
+    return {node: (() if index == 0 else (ordered[index - 1],))
+            for index, node in enumerate(ordered)}
+
+
+def _causal_wait_ms(intervals, identifiers, dependencies):
+    """Per-occurrence ``(causal wait, executed service)`` split of its span.
+
+    The wait runs from the latest in-DAG predecessor completion (roots: the
+    replica's input boundary, i.e. host launch) to readiness; service runs from
+    the later of readiness and that floor to completion.  With this split the
+    realized ``all`` clock of every node equals its completion, so the terminal
+    telescopes exactly to the executed device-step boundary.
+    """
+    complete = {node: end for (_start, end, _record), node in zip(intervals, identifiers)}
+    split = []
+    for (start, end, _record), node in zip(intervals, identifiers):
+        floor = max((complete[pred] for pred in dependencies.get(node, ()) if pred in complete),
+                    default=0.0)
+        split.append((max(0.0, start - floor), max(0.0, end - max(start, floor))))
+    return split
 
 
 def _name(replica, identifier):
@@ -956,6 +1022,105 @@ def _price_isolated_graph(case, graphs, joins, scopes, book, primitives, ctx, st
     return costs, durations, isolated_sum, cohort_cache
 
 
+def _accumulate_compact_record(profile, record, ready_ms, complete_ms, elapsed,
+                               metadata, boundary, native_payload,
+                               isolated, durations, stream_plans, physical_id):
+    op, r = record["op"], record["replica"]
+    profile["operator_events"] += 1
+    family = profile["by_family"].setdefault(
+        op.family, {"operator_events": 0, "elapsed_ms": 0.0, "replicas": {}})
+    family["operator_events"] += 1
+    family["elapsed_ms"] += elapsed
+    rank_totals = profile["by_rank"].setdefault(
+        r, {"operator_events": 0, "elapsed_ms": 0.0,
+            "ready_ms": ready_ms, "complete_ms": complete_ms})
+    rank_totals["operator_events"] += 1
+    rank_totals["elapsed_ms"] += elapsed
+    rank_totals["ready_ms"] = min(rank_totals["ready_ms"], ready_ms)
+    rank_totals["complete_ms"] = max(rank_totals["complete_ms"], complete_ms)
+    layer_totals = profile["by_layer"].setdefault(
+        op.layer, {"operator_events": 0, "elapsed_ms": 0.0})
+    layer_totals["operator_events"] += 1
+    layer_totals["elapsed_ms"] += elapsed
+    # One canonical operator entry, with each replica's actual declared
+    # identity and source boundaries retained below it. No synthetic
+    # histogram and no first-rank label leaking onto another rank.
+    identity = f"s{op.stage}:{op.op_id}"
+    stats = profile["by_operator"].get(identity)
+    if stats is None:
+        stats = {
+            "op_id": op.op_id, "stage": op.stage,
+            "operator_events": 0, "ready_ms": ready_ms,
+            "complete_ms": complete_ms, "elapsed_ms": 0.0,
+            "replicas": {},
+        }
+        profile["by_operator"][identity] = stats
+    stats["operator_events"] += 1
+    stats["ready_ms"] = min(stats["ready_ms"], ready_ms)
+    stats["complete_ms"] = max(stats["complete_ms"], complete_ms)
+    stats["elapsed_sum_ms"] = stats.get("elapsed_sum_ms", 0.0) + elapsed
+    stats["elapsed_ms"] = max(stats.get("elapsed_ms", 0.0), elapsed)
+    rank = stats["replicas"].get(r)
+    if rank is None:
+        rank = {
+            "operator_events": 0, "ready_ms": ready_ms,
+            "complete_ms": complete_ms, "elapsed_ms": 0.0,
+            "family": op.family, "layer": op.layer,
+            "stream": op.stream or "main",
+            "phase": op.phase, "recipe": op.recipe,
+            "program": record["program"],
+            "source_boundary": op.source_boundary,
+        }
+        stats["replicas"][r] = rank
+    if native_payload is not None:
+        rank["native_call"] = native_payload
+    rank["operator_events"] += 1
+    rank["ready_ms"] = min(rank["ready_ms"], ready_ms)
+    rank["complete_ms"] = max(rank["complete_ms"], complete_ms)
+    rank["elapsed_ms"] += elapsed
+    for key in ("fusion_role", "fusion_group_key", "native_kind"):
+        if key in metadata:
+            rank[key] = metadata[key]
+    rank.update(matrix_wrapper_projection(metadata))
+    if boundary:
+        rank["native_implementation"] = boundary.get("native")
+        rank["physical_source_program"] = (
+            metadata.get("fusion_program_profile")
+            or metadata.get("fusion_source_profile")
+            or boundary.get("program_profile") or boundary.get("traffic_profile"))
+    if record.get("joint_collective"):
+        rank["collective_algorithm"] = record["collective_algorithm"]
+    if record.get("native_local_ready"):
+        rank["native_local_ready_ms"] = record["ready"].time
+    if "collective_ready_ms" in record:
+        wait = ready_ms - record["ready"].time
+        rank["local_ready_ms"] = record["ready"].time
+        rank["rendezvous_wait_ms"] = max(rank.get("rendezvous_wait_ms", 0.0), wait)
+        rank["rendezvous_events"] = rank.get("rendezvous_events", 0) + 1
+    if isolated:
+        if record.get("joint_collective"):
+            iso = record["joint_isolated_ms"]
+            record["isolated_ms"] = iso
+            record["precedence_ms"] = 0
+            rank.update(cohort_id=record["cohort_id"],
+                        isolation_boundary="complete_collective_cohort")
+        else:
+            op_stream = (op.stream or "main") if stream_plans else ""
+            iso = (0 if op.family == "barrier"
+                   else durations[r, op.stage, physical_id(op), op_stream])
+            record["isolated_ms"] = iso
+        rank["isolated_ms"] = rank.get("isolated_ms", 0.0) + iso
+        stats["isolated_ms"] = stats.get("isolated_ms", 0.0) + iso
+        family["isolated_ms"] = family.get("isolated_ms", 0.0) + iso
+    family_rank = family["replicas"].setdefault(
+        r, {"operator_events": 0, "elapsed_ms": 0.0,
+            "ready_ms": ready_ms, "complete_ms": complete_ms})
+    family_rank["operator_events"] += 1
+    family_rank["elapsed_ms"] += elapsed
+    family_rank["ready_ms"] = min(family_rank["ready_ms"], ready_ms)
+    family_rank["complete_ms"] = max(family_rank["complete_ms"], complete_ms)
+
+
 def _graph_operator_rows(records, duration, compact, isolated, durations, stream_plans):
     from .operator_analysis import physical_id
     profile = None
@@ -979,101 +1144,10 @@ def _graph_operator_rows(records, duration, compact, isolated, durations, stream
         native_call = bind_native_call(op)
         native_payload = native_call.to_dict() if native_call is not None else None
         if compact:
-            profile["operator_events"] += 1
-            family = profile["by_family"].setdefault(
-                op.family, {"operator_events": 0, "elapsed_ms": 0.0,
-                            "replicas": {}})
-            family["operator_events"] += 1
-            family["elapsed_ms"] += elapsed
-            rank_totals = profile["by_rank"].setdefault(
-                r, {"operator_events": 0, "elapsed_ms": 0.0,
-                    "ready_ms": ready_ms, "complete_ms": complete_ms})
-            rank_totals["operator_events"] += 1
-            rank_totals["elapsed_ms"] += elapsed
-            rank_totals["ready_ms"] = min(rank_totals["ready_ms"], ready_ms)
-            rank_totals["complete_ms"] = max(rank_totals["complete_ms"], complete_ms)
-            layer_totals = profile["by_layer"].setdefault(
-                op.layer, {"operator_events": 0, "elapsed_ms": 0.0})
-            layer_totals["operator_events"] += 1
-            layer_totals["elapsed_ms"] += elapsed
-            # One canonical operator entry, with each replica's actual declared
-            # identity and source boundaries retained below it. No synthetic
-            # histogram and no first-rank label leaking onto another rank.
-            identity = f"s{op.stage}:{op.op_id}"
-            stats = profile["by_operator"].get(identity)
-            if stats is None:
-                stats = {
-                    "op_id": op.op_id, "stage": op.stage,
-                    "operator_events": 0, "ready_ms": ready_ms,
-                    "complete_ms": complete_ms, "elapsed_ms": 0.0,
-                    "replicas": {},
-                }
-                profile["by_operator"][identity] = stats
-            stats["operator_events"] += 1
-            stats["ready_ms"] = min(stats["ready_ms"], ready_ms)
-            stats["complete_ms"] = max(stats["complete_ms"], complete_ms)
-            stats["elapsed_sum_ms"] = stats.get("elapsed_sum_ms", 0.0) + elapsed
-            stats["elapsed_ms"] = max(stats.get("elapsed_ms", 0.0), elapsed)
-            rank = stats["replicas"].get(r)
-            if rank is None:
-                rank = {
-                    "operator_events": 0, "ready_ms": ready_ms,
-                    "complete_ms": complete_ms, "elapsed_ms": 0.0,
-                    "family": op.family, "layer": op.layer,
-                    "stream": op.stream or "main",
-                    "phase": op.phase, "recipe": op.recipe,
-                    "program": record["program"],
-                    "source_boundary": op.source_boundary,
-                }
-                stats["replicas"][r] = rank
-            if native_payload is not None:
-                rank["native_call"] = native_payload
-            rank["operator_events"] += 1
-            rank["ready_ms"] = min(rank["ready_ms"], ready_ms)
-            rank["complete_ms"] = max(rank["complete_ms"], complete_ms)
-            rank["elapsed_ms"] += elapsed
-            for key in ("fusion_role", "fusion_group_key", "native_kind"):
-                if key in metadata:
-                    rank[key] = metadata[key]
-            rank.update(matrix_wrapper_projection(metadata))
-            if boundary:
-                rank["native_implementation"] = boundary.get("native")
-                rank["physical_source_program"] = (
-                    metadata.get("fusion_program_profile")
-                    or metadata.get("fusion_source_profile")
-                    or boundary.get("program_profile") or boundary.get("traffic_profile"))
-            if record.get("joint_collective"):
-                rank["collective_algorithm"] = record["collective_algorithm"]
-            if record.get("native_local_ready"):
-                rank["native_local_ready_ms"] = record["ready"].time
-            if "collective_ready_ms" in record:
-                wait = ready_ms - record["ready"].time
-                rank["local_ready_ms"] = record["ready"].time
-                rank["rendezvous_wait_ms"] = max(
-                    rank.get("rendezvous_wait_ms", 0.0), wait)
-                rank["rendezvous_events"] = rank.get("rendezvous_events", 0) + 1
-            if isolated:
-                if record.get("joint_collective"):
-                    iso = record["joint_isolated_ms"]
-                    record["isolated_ms"] = iso
-                    record["precedence_ms"] = 0
-                    rank.update(cohort_id=record["cohort_id"],
-                                isolation_boundary="complete_collective_cohort")
-                else:
-                    op_stream = (op.stream or "main") if stream_plans else ""
-                    iso = (0 if op.family == "barrier"
-                           else durations[r, op.stage, physical_id(op), op_stream])
-                    record["isolated_ms"] = iso
-                rank["isolated_ms"] = rank.get("isolated_ms", 0.0) + iso
-                stats["isolated_ms"] = stats.get("isolated_ms", 0.0) + iso
-                family["isolated_ms"] = family.get("isolated_ms", 0.0) + iso
-            family_rank = family["replicas"].setdefault(
-                r, {"operator_events": 0, "elapsed_ms": 0.0,
-                    "ready_ms": ready_ms, "complete_ms": complete_ms})
-            family_rank["operator_events"] += 1
-            family_rank["elapsed_ms"] += elapsed
-            family_rank["ready_ms"] = min(family_rank["ready_ms"], ready_ms)
-            family_rank["complete_ms"] = max(family_rank["complete_ms"], complete_ms)
+            _accumulate_compact_record(
+                profile, record, ready_ms, complete_ms, elapsed,
+                metadata, boundary, native_payload,
+                isolated, durations, stream_plans, physical_id)
             continue
         row = {
             "id": record["id"], "replica": r, "op_id": op.op_id, "family": op.family,
@@ -1221,6 +1295,80 @@ def _record_native_bridge(case, records, execution_summary, profile):
         }
 
 
+def _assemble_graph_result(
+    case, graphs, records, steps, execution, engine, rows, profile,
+    resources, head, *, compact, isolated, costs, isolated_sum,
+    isolated_profile, cohort_cache, external_times, input_ready_ms,
+    duration, audit_allocations,
+):
+    execution_summary = execution.summary()
+    parameter_summary = execution.cost.summary()
+    if compact:
+        result = {
+            **head, "resources": resources,
+            "execution": execution_summary, "parameters": parameter_summary,
+        }
+        profile["steps_by_replica"] = {
+            replica: {
+                "start_ms": step.start_ms,
+                "device_end_ms": step.device_complete.time,
+                "end_ms": step.completion.time,
+            }
+            for replica, step in steps.items()
+        }
+        _record_native_bridge(case, records, execution_summary, profile)
+        result.update(
+            result_mode="compact", profile=profile,
+            event_profile=bounded_event_profile(engine),
+            timeline_omitted=True, events_omitted=True,
+        )
+    else:
+        # Keep the historical detailed key order byte-for-byte.
+        result = {
+            **head, "timeline": rows, "resources": resources,
+            "execution": execution_summary, "parameters": parameter_summary,
+            "events": list(engine.trace),
+        }
+        evicted_spans = getattr(engine, "_evicted_service_spans", None)
+        if evicted_spans:
+            result["evicted_service_spans"] = {
+                key: tuple(spans) for key, spans in evicted_spans.items()
+            }
+    if graphs:
+        result.update(_exposed_breakdown(
+            records, duration, input_ready_ms, min(graphs),
+            stage_rates_by_key=_stage_role_rates(execution)))
+    else:
+        result.update(unavailable_breakdown(
+            "exposed_operator_intervals_missing", boundary="device_step"))
+    if isolated:
+        path = _precedence_bound(records if compact else rows,
+                                 external_times, input_ready_ms)
+        capacity_bound = max((row["capacity_bound_ms"] for row in resources), default=0)
+        result["isolated"] = {
+            "boundary": "sum_of_isolated_device_programs",
+            "operator_sum_ms": isolated_sum,
+            **({"by_family": isolated_profile["by_family"],
+                "by_operator": isolated_profile["by_operator"],
+                "operators_omitted": True}
+               if compact else {"operators": costs}),
+            **({"collective_cohorts": [
+                {key: value for key, value in report.items() if key != "operators"}
+                for report in cohort_cache.values()
+            ], "sum_interpretation": "sum_of_replica_representative_completion_spans"}
+               if cohort_cache else {}),
+        }
+        result["bounds"] = {
+            "precedence": path, "resource_capacity_ms": capacity_bound,
+            "combined_ms": max(path["duration_ms"], capacity_bound),
+            "interpretation": "lower_bounds_for_this_declared_graph_not_optimization_savings",
+        }
+    if audit_allocations:
+        # Bounded real grant/release evidence for shared-pool admission.
+        result["allocation_trace"] = tuple(getattr(engine, "allocation_trace", ()))
+    return result
+
+
 def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=None,
                 input_ready_ms=0, include_submission=False, replay_scope=None,
                 isolated=True, trace_limit=0, compact=False,
@@ -1328,68 +1476,11 @@ def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=Non
         "operator_occurrences": sum(
             record["op"].family != "barrier" for record in records) + skipped_occurrences,
     }
-    execution_summary = execution.summary()
-    parameter_summary = execution.cost.summary()
-    if compact:
-        result = {
-            **head, "resources": resources,
-            "execution": execution_summary, "parameters": parameter_summary,
-        }
-        profile["steps_by_replica"] = {
-            replica: {
-                "start_ms": step.start_ms,
-                "device_end_ms": step.device_complete.time,
-                "end_ms": step.completion.time,
-            }
-            for replica, step in steps.items()
-        }
-        _record_native_bridge(case, records, execution_summary, profile)
-        result.update(
-            result_mode="compact", profile=profile,
-            event_profile=bounded_event_profile(engine),
-            timeline_omitted=True, events_omitted=True,
-        )
-    else:
-        # Keep the historical detailed key order byte-for-byte.
-        result = {
-            **head, "timeline": rows, "resources": resources,
-            "execution": execution_summary, "parameters": parameter_summary,
-            "events": list(engine.trace),
-        }
-        evicted_spans = getattr(engine, "_evicted_service_spans", None)
-        if evicted_spans:
-            result["evicted_service_spans"] = {
-                key: tuple(spans) for key, spans in evicted_spans.items()
-            }
-    if graphs:
-        result.update(_exposed_breakdown(
-            records, duration, input_ready_ms, min(graphs)))
-    else:
-        result.update(unavailable_breakdown(
-            "exposed_operator_intervals_missing", boundary="device_step"))
-    if isolated:
-        path = _precedence_bound(records if compact else rows,
-                                 external_times, input_ready_ms)
-        capacity_bound = max((row["capacity_bound_ms"] for row in resources), default=0)
-        result["isolated"] = {
-            "boundary": "sum_of_isolated_device_programs",
-            "operator_sum_ms": isolated_sum,
-            **({"by_family": isolated_profile["by_family"],
-                "by_operator": isolated_profile["by_operator"],
-                "operators_omitted": True}
-               if compact else {"operators": costs}),
-            **({"collective_cohorts": [
-                {key: value for key, value in report.items() if key != "operators"}
-                for report in cohort_cache.values()
-            ], "sum_interpretation": "sum_of_replica_representative_completion_spans"}
-               if cohort_cache else {}),
-        }
-        result["bounds"] = {
-            "precedence": path, "resource_capacity_ms": capacity_bound,
-            "combined_ms": max(path["duration_ms"], capacity_bound),
-            "interpretation": "lower_bounds_for_this_declared_graph_not_optimization_savings",
-        }
-    if audit_allocations:
-        # Bounded real grant/release evidence for shared-pool admission.
-        result["allocation_trace"] = tuple(getattr(engine, "allocation_trace", ()))
-    return result
+    return _assemble_graph_result(
+        case, graphs, records, steps, execution, engine, rows, profile,
+        resources, head, compact=compact, isolated=isolated, costs=costs,
+        isolated_sum=isolated_sum, isolated_profile=isolated_profile,
+        cohort_cache=cohort_cache, external_times=external_times,
+        input_ready_ms=input_ready_ms, duration=duration,
+        audit_allocations=audit_allocations,
+    )

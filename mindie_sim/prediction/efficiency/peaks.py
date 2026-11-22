@@ -60,6 +60,24 @@ def _validate_geometry(phase: str, tokens: int, context: int, sequences: int, sc
             raise ValueError(f"efficiency_invalid_{name}:{val}")
 
 
+def resolve_efficiency_scope(case: CaseSpec | Mapping[str, Any], scope: str | None) -> str:
+    """Resolve the accounted program scope; ``None`` follows the declared stack.
+
+    An explicit ``"body"``/``"model"`` is honoured.  An omitted scope selects the
+    full ``"model"`` assembly (embedding, LM head and Draft/MTP/DSpark proposal
+    programs) whenever the case declares speculative decoding, so callers that
+    forget the argument never silently drop the draft stage from a step.
+    """
+    if scope is not None:
+        return scope
+    from .capacity_window import _resolve_speculative_tokens
+
+    parsed = parse_case(case)
+    query_tokens, _ = _resolve_speculative_tokens(
+        parsed, output_budget=1, tokens_per_seq=None, emitted_tokens_per_seq=None)
+    return "model" if query_tokens > 1 else "body"
+
+
 def _resolve_link_bw_bytes_per_ms(case: CaseSpec, scope: str) -> float:
     """Effective machine-wide link bandwidth in bytes/ms (slowest configured link)."""
     links = parse_case(case).machine.links

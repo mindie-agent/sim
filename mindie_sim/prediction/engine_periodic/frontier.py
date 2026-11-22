@@ -486,10 +486,77 @@ class CycleSkip:
         )
 
 
+_MIN_NORMAL_BINADE_HI = math.ldexp(1.0, sys.float_info.min_exp)
+_CLOCK_PROBE_CYCLES = 3
+
+
+def _advance_clock_one_cycle(now: float, steps: tuple[float, ...]) -> float:
+    for dt in steps:
+        after = now + dt
+        now = math.nextafter(now, math.inf) if dt > 0.0 and after == now else after
+    return now
+
+
+def _binade_upper_bound(value: float) -> float:
+    """Upper boundary where ``math.ulp`` stays constant on ``[value, hi)``."""
+    exp = math.frexp(value)[1]
+    if exp >= sys.float_info.max_exp:
+        return sys.float_info.max
+    return max(math.ldexp(1.0, exp), _MIN_NORMAL_BINADE_HI)
+
+
 def _advance_periodic_clock(now: float, steps: tuple[float, ...], cycles: int) -> float:
-    """Repeat the engine's rounded additions without replaying resource tasks."""
-    for _ in range(cycles):
-        for dt in steps:
-            after = now + dt
-            now = math.nextafter(now, math.inf) if dt > 0.0 and after == now else after
+    """Repeat the engine's rounded additions bit-exactly in O(log cycles) time."""
+    remaining = int(cycles)
+    if remaining <= 0 or not steps or not math.isfinite(now):
+        return now
+    if now < 0.0 or any(not math.isfinite(dt) or dt < 0.0 for dt in steps):
+        for _ in range(remaining):
+            now = _advance_clock_one_cycle(now, steps)
+        return now
+    while remaining > 0 and math.isfinite(now):
+        if now == 0.0:
+            nxt = _advance_clock_one_cycle(now, steps)
+            if nxt == now:
+                return now
+            now = nxt
+            remaining -= 1
+            continue
+        hi = _binade_upper_bound(now)
+        x1 = _advance_clock_one_cycle(now, steps)
+        if x1 == now:
+            return now
+        if remaining == 1 or not math.isfinite(x1) or x1 >= hi:
+            now = x1
+            remaining -= 1
+            continue
+        x2 = _advance_clock_one_cycle(x1, steps)
+        if remaining == 2 or not math.isfinite(x2) or x2 >= hi:
+            now = x2
+            remaining -= 2
+            continue
+        x3 = _advance_clock_one_cycle(x2, steps)
+        if not math.isfinite(x3) or x3 >= hi:
+            now = x3
+            remaining -= _CLOCK_PROBE_CYCLES
+            continue
+        d1, d2, d3 = x1 - now, x2 - x1, x3 - x2
+        if d2 == d3 and d2 > 0.0:
+            step_cycles, stride, base = 1, d2, x3
+        elif d1 == d3 and (d1 + d2) > 0.0:
+            step_cycles, stride, base = 2, d1 + d2, x3
+        else:
+            now = x3
+            remaining -= _CLOCK_PROBE_CYCLES
+            continue
+        remaining -= _CLOCK_PROBE_CYCLES
+        room = hi - base
+        jumps = min(remaining // step_cycles, int(room // stride))
+        while jumps > 0 and base + jumps * stride >= hi:
+            jumps -= 1
+        if jumps > 0:
+            now = base + jumps * stride
+            remaining -= jumps * step_cycles
+        else:
+            now = base
     return now

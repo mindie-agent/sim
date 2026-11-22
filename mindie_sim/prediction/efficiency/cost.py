@@ -13,9 +13,12 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import math
-from typing import Any, Mapping
+from typing import TYPE_CHECKING, Any, Mapping
+
+if TYPE_CHECKING:
+    from ..evaluation import FrozenHardwareView
 
 from mindie_sim.schema.operators import OpSpec
 from mindie_sim.schema.case import Case as CaseSpec

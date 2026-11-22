@@ -289,7 +289,7 @@ def test_live_dispatch_rejects_flat_program_callbacks(monkeypatch, traced_plan_p
         return prepared, replace(plan, program=callback)
 
     monkeypatch.setattr(RecipeBook, "prepare", route_to_flat)
-    with pytest.raises(AssertionError, match=r"OperatorPlan\.program.*prediction\.call_builders_operators"):
+    with pytest.raises(AssertionError, match=r"OperatorPlan\.program.*prediction\.call_builders"):
         execute_one(case, views, op)
 
 
@@ -489,3 +489,96 @@ def test_packed_schedule_checks_declared_isa_without_datapath(sku_alias, support
     else:
         with pytest.raises(ModelingError, match=f"arch35_unsupported_on_{geometry.compute_arch.preset}"):
             indexed_quant_attention.build(op, geometry, scratch_policy="offchip", schedule=schedule)
+
+
+def test_dominant_role_classifies_memory_bound_gemm_and_stage_clock_reconciles():
+    from mindie_sim.prediction.efficiency.analysis import analyze_network_efficiency
+    from mindie_sim.prediction.efficiency.exposed_breakdown import ExposedClocks, finish_breakdown
+    from mindie_sim.prediction.graph_analysis import ROLE_CUBE, ROLE_MEMORY, _dominant_role
+
+    rates = {"compute_peaks": {"bf16": 400e12}, "vector": 6e12, "hbm": 4e12, "link": 400e9}
+    decode_gemm = OpSpec("d", "gemm", "decode", 0, 0, ("r0",), (1, 4096), (1, 4096),
+                         (1, 4096), (1, 4096), dtype="bf16", flops=2 * 4096 * 4096,
+                         hbm_bytes=2 * 4096 * 4096)
+    prefill_gemm = replace(decode_gemm, op_id="p", flops=2 * 2048 * 4096 * 4096)
+    assert _dominant_role(decode_gemm, stage_rates=rates) == ROLE_MEMORY
+    assert _dominant_role(prefill_gemm, stage_rates=rates) == ROLE_CUBE
+    zero_bd = finish_breakdown(ExposedClocks(0.0, 0.0, 0.0, 0.0), duration_ms=1e-4, boundary="device_step")
+    assert zero_bd["exposed_breakdown_basis"]["available"] is True
+
+    case = compose_case("qwen3-32b", hardware=REPRESENTATIVE_SKUS["a5"], layers=2, tp=2)
+    eff = analyze_network_efficiency(case, phase="decode", tokens=1, context=1024, sequences=1, scope="body")
+    sc = eff["attribution"]["stage_clock_attribution"]
+    assert sc["available"] is True
+    assert abs(sc["modeled_span_ms"] - sc["reported_span_ms"]) <= 1e-3 * max(1e-6, sc["reported_span_ms"])
+    assert sc["buckets"]["hbm"]["exposed_ms"] > sc["buckets"]["cube"]["exposed_ms"]
+
+
+def test_efficiency_scope_defaults_to_model_when_speculative_active():
+    from mindie_sim.prediction.efficiency.analysis import analyze_network_efficiency
+
+    base = compose_case("kimi-k3", hardware=REPRESENTATIVE_SKUS["a5"], tp=2, dp=1, ep=2, layers=2,
+                        prompt_tokens=256, output_tokens=16, concurrency=1, mtp_proposal_tokens=0)
+    spec = compose_case("kimi-k3", hardware=REPRESENTATIVE_SKUS["a5"], tp=2, dp=1, ep=2, layers=2,
+                        prompt_tokens=256, output_tokens=16, concurrency=1,
+                        mtp_proposal_tokens=3, mtp_acceptance_length=3.0)
+    assert analyze_network_efficiency(base, phase="decode", tokens=1, context=256, sequences=1)["geometry"]["scope"] == "body"
+    assert analyze_network_efficiency(spec, phase="decode", tokens=4, context=256, sequences=1)["geometry"]["scope"] == "model"
+    assert analyze_network_efficiency(spec, phase="decode", tokens=4, context=256, sequences=1, scope="body")["geometry"]["scope"] == "body"
+
+
+@pytest.mark.parametrize("track", ("merged", "unmerged_pr"))
+def test_primitive_table_perturbation_scales_monotonically_without_dropping(track):
+    from mindie_sim.prediction.efficiency.analysis import analyze_network_efficiency
+    from mindie_sim.prediction.evaluation import EvaluationContext, PRIMITIVE_RESCALED_WARNING
+    from mindie_sim.primitives.loader import load_manifest
+
+    sku = next(
+        name for name, entry in load_manifest()["tables"].items()
+        if entry.get("calibrated") and entry.get("arch_preset") == "npu_arch_3510"
+    )
+    durations = []
+    for hbm_tb in (4.0, 1.6, 1.4):
+        raw = compose_case("qwen3-32b", hardware=sku, layers=2, tp=2, feature_track=track,
+                           hbm_peak_bytes_per_s=hbm_tb * 1e12)
+        parsed = Case.from_mapping(raw)
+        ctx = EvaluationContext.create(parsed)
+        table = ctx.bindings.primitive_table
+        assert table is not None
+        if hbm_tb < 4.0:
+            assert PRIMITIVE_RESCALED_WARNING in table.warnings
+        eff = analyze_network_efficiency(parsed, phase="decode", tokens=1, context=1024, sequences=1, scope="body")
+        durations.append(eff["graph_duration_ms"])
+    assert durations[0] < durations[1] < durations[2]
+    shrunk = Case.from_mapping(compose_case("qwen3-32b", hardware=sku, layers=1, tp=1, aic_count=28, aiv_count=56))
+    shrunk_table = EvaluationContext.create(shrunk).bindings.primitive_table
+    assert shrunk_table is not None and shrunk_table.provenance.silicon_fingerprint.aic_count == 28
+    assert EvaluationContext.create(shrunk, primitive_table=False).bindings.primitive_table is None
+
+
+def test_advance_periodic_clock_matches_literal_loop_and_skips_billions_in_ologn():
+    import math
+    import time
+    from mindie_sim.prediction.engine_periodic.frontier import _advance_periodic_clock
+
+    def literal(now, steps, cycles):
+        for _ in range(cycles):
+            for dt in steps:
+                after = now + dt
+                now = math.nextafter(now, math.inf) if dt > 0.0 and after == now else after
+        return now
+
+    cases = [
+        (0.0, (1e-6, 3e-7), 500),
+        (1.0, (0.5 * math.ulp(1.0),), 1000),
+        (1.0, (1.5 * math.ulp(1.0), 0.5 * math.ulp(1.0)), 1000),
+        (math.nextafter(2.0, 0.0) - 5 * math.ulp(1.0), (0.3 * math.ulp(1.0), 1.5 * math.ulp(1.0)), 200),
+        (1e-320, (1e-322, 1e-321), 500),
+        (7.0, (0.0, 1e-18, 0.002425), 500),
+    ]
+    for now, steps, cycles in cases:
+        assert _advance_periodic_clock(now, steps, cycles) == literal(now, steps, cycles)
+
+    t0 = time.perf_counter()
+    huge = _advance_periodic_clock(7.0, (1e-6, 2.5e-6), 1 << 31)
+    assert time.perf_counter() - t0 < 0.25 and math.isfinite(huge) and huge > 7.0

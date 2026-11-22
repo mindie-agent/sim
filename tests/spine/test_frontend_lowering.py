@@ -500,3 +500,36 @@ def test_real_dspark_graph_exports_decode_and_draft_subgraphs():
     report = export_op_structure(ops, model={}, execution={"phase": "decode", "scope": "model"}, kernels=parsed.runtime.kernels)
     assert report["nodes"] and report["subgraphs"]
     with pytest.raises(ValueError, match="structure_phase_mismatch"): export_op_structure(ops, model={}, execution={"phase": "prefill", "scope": "model"})
+
+
+def test_situ_eager_chain_activation_params_and_router_contract_unshadowed():
+    from types import SimpleNamespace
+    from mindie_sim.observations.communication.calibration import evaluate_a5_mc2_chains
+    from mindie_sim.observed_contracts.matrix import observed_router_contract
+    from mindie_sim.schema.common import ModelingError
+
+    eager_case = parse_case(compose_case("kimi-k3", "a5", tp=2, dp=1, ep=2, layers=2, raw_eager=True))
+    ops = target_graphs(eager_case, phase="decode", tokens=1, context=128, sequences=1, scope="body")[0]
+    situ_casts = [op for op in ops if op.recipe == "situ_cast_fp32"]
+    assert situ_casts, "raw_eager SiTU FFN must lower via situ_eager_chain"
+    routed_cast = next(op for op in situ_casts if "expert_act.cast_in" in op.op_id)
+    assert "memory_accesses" in dict(routed_cast.metadata)
+    situ_outs = [op for op in ops if op.recipe == "situ_cast_out"]
+    assert situ_outs and all("activation_params" in dict(op.metadata) for op in situ_outs)
+    assert dict(situ_outs[0].metadata)["activation_params"]["beta"] == pytest.approx(4.0)
+
+    router_row = SimpleNamespace(
+        kind="MoeGatingTopK",
+        input_shapes=((8, 64), ()), input_dtypes=("bf16", None), input_formats=("ND", None),
+        output_shapes=((8, 4), (8, 4), (8, 64)), output_dtypes=("bf16", "int32", "fp32"),
+        output_formats=("ND", "ND", "ND"),
+    )
+    contract = observed_router_contract(router_row)
+    assert contract is not None and contract[0] == "router_selection_active" and contract[1] == "MoeGatingTopK"
+
+    with pytest.raises(ModelingError, match="a5_mc2_chain_nonpositive_sum"):
+        evaluate_a5_mc2_chains({
+            "schema": "a5-campaign-ingestion/1",
+            "mc2_chains": [{"condition": "bad", "dtype": "bf16", "chain_p50_ms": 1.0,
+                            "sum_leg_p50_ms": 0.0, "legs_ms": {}}],
+        })

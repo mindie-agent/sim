@@ -31,7 +31,10 @@ def unit_group(index, owners, units):
     raise ValueError(f"resource_ownership_geometry_incompatible:{owners}:{units}")
 
 
-@lru_cache(maxsize=None)
+_OWNERSHIP_CACHE_MAXSIZE = 1024
+
+
+@lru_cache(maxsize=_OWNERSHIP_CACHE_MAXSIZE)
 def _full_units(count):
     return tuple(range(count))
 
@@ -39,7 +42,7 @@ def _full_units(count):
 _ZERO_MASK = 0; _ONE_BIT = 1
 
 
-@lru_cache(maxsize=None)
+@lru_cache(maxsize=_OWNERSHIP_CACHE_MAXSIZE)
 def _unit_mask(units):
     mask = _ZERO_MASK
     for unit in units:

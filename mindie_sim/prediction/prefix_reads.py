@@ -31,8 +31,6 @@ from typing import Any
 from mindie_sim.schema.common import ModelingError
 
 
-ZERO = 0
-ONE = 1
 FIRST = 0
 ZERO_FLOAT = 0.0
 ONE_FLOAT = 1.0
@@ -63,16 +61,16 @@ class CacheAccess:
 
     request_id: str
     context_tokens: int
-    q_len: int = ONE
-    prefix_tokens: int = ZERO
+    q_len: int = 1
+    prefix_tokens: int = 0
     prefix_key: str = ""
     row_bytes: float = ONE_FLOAT
     scale_bytes: float = ZERO_FLOAT
-    layer: int = ZERO
+    layer: int = 0
     component: str = "index_k"
     selected_tokens: tuple[tuple[int, int], ...] = ()
-    logical_rows: int = ZERO
-    unique_rows: int = ZERO
+    logical_rows: int = 0
+    unique_rows: int = 0
     window_tokens: int | None = None
     shared_intervals: tuple[tuple[int, int], ...] = ()
 
@@ -108,22 +106,22 @@ class PrefixReadPlan:
 
 
 def _access_tokens(access: CacheAccess) -> int:
-    context = max(ZERO, int(access.context_tokens))
-    q = max(ONE, int(access.q_len))
-    if q <= ONE:
-        return context + ONE
+    context = max(0, int(access.context_tokens))
+    q = max(1, int(access.q_len))
+    if q <= 1:
+        return context + 1
     return context + q
 
 
 def _logical_rows(access: CacheAccess) -> float:
-    if int(access.logical_rows) > ZERO:
+    if int(access.logical_rows) > 0:
         return float(int(access.logical_rows))
-    context = max(ZERO, int(access.context_tokens))
-    q = max(ONE, int(access.q_len))
-    total = ZERO
+    context = max(0, int(access.context_tokens))
+    q = max(1, int(access.q_len))
+    total = 0
     for index in range(q):
-        total += min(context + index + ONE, context + q)
-    return float(max(ONE, total))
+        total += min(context + index + 1, context + q)
+    return float(max(1, total))
 
 
 def _merged_intervals(intervals) -> tuple[tuple[int, int], ...]:
@@ -149,16 +147,16 @@ def owned_window_intervals(
 ) -> tuple[tuple[int, int], ...]:
     """Rank-owned sub-intervals under interleaved DCP token ownership."""
     merged = _merged_intervals(intervals)
-    if cp <= ONE or not merged:
+    if cp <= 1 or not merged:
         return merged
-    step = max(ONE, int(interleave))
+    step = max(1, int(interleave))
     owned: list[tuple[int, int]] = []
     for lo, hi in merged:
         first_block = lo // step
         block = first_block + ((int(rank) - (first_block % cp)) % cp)
         while block * step < hi:
             seg_lo = max(lo, block * step)
-            seg_hi = min(hi, (block + ONE) * step)
+            seg_hi = min(hi, (block + 1) * step)
             if seg_hi > seg_lo:
                 owned.append((seg_lo, seg_hi))
             block += cp
@@ -166,23 +164,23 @@ def owned_window_intervals(
 
 
 def _materialized_prefix(access: CacheAccess, cache_state: Mapping[str, Any] | None) -> int:
-    declared = max(ZERO, int(access.prefix_tokens))
+    declared = max(0, int(access.prefix_tokens))
     if not cache_state:
         return declared
     entry = cache_state.get(access.prefix_key, cache_state.get("*"))
     if entry is None:
-        return ZERO
+        return 0
     if isinstance(entry, Mapping):
         limit = entry.get("materialized_tokens", entry.get("valid_tokens"))
         if limit is None:
             return declared
-        return max(ZERO, min(declared, int(limit)))
+        return max(0, min(declared, int(limit)))
     if isinstance(entry, (int, float)) and not isinstance(entry, bool):
-        return max(ZERO, min(declared, int(entry)))
+        return max(0, min(declared, int(entry)))
     if isinstance(entry, Sequence) and not isinstance(entry, (str, bytes)):
         spans = tuple(entry)
         if spans and all(isinstance(item, Sequence) and len(item) == PAIR for item in spans):
-            return max((int(end) for _start, end in spans), default=ZERO)
+            return max((int(end) for _start, end in spans), default=0)
     return declared
 
 
@@ -223,85 +221,85 @@ def plan_prefix_reads(
     accesses = tuple(accesses)
     logical = math.fsum(
         float(_logical_rows(access)) * float(access.row_bytes)
-        + float(access.scale_bytes) * max(ONE, int(access.q_len))
+        + float(access.scale_bytes) * max(1, int(access.q_len))
         for access in accesses)
     query_reads = math.fsum(
-        float(max(ONE, int(access.q_len))) * float(access.row_bytes)
+        float(max(1, int(access.q_len))) * float(access.row_bytes)
         for access in accesses)
     scale_total = math.fsum(
-        float(access.scale_bytes) * max(ONE, int(access.q_len))
+        float(access.scale_bytes) * max(1, int(access.q_len))
         for access in accesses)
     if not accesses or mode == MODE_PER_SEQUENCE:
         return PrefixReadPlan(
-            logical, logical, logical, query_reads, scale_total, ZERO, ZERO,
+            logical, logical, logical, query_reads, scale_total, 0, 0,
             REUSE_PER_SEQUENCE, False, NO_REUSE_REASONS["mode_not_shared"])
-    shared_candidates = [access for access in accesses if int(access.prefix_tokens) > ZERO]
-    if len(accesses) <= ONE:
+    shared_candidates = [access for access in accesses if int(access.prefix_tokens) > 0]
+    if len(accesses) <= 1:
         return PrefixReadPlan(
-            logical, logical, logical, query_reads, scale_total, ZERO, ZERO,
+            logical, logical, logical, query_reads, scale_total, 0, 0,
             REUSE_PER_SEQUENCE, False, NO_REUSE_REASONS["single_access"])
     if mode == MODE_BATCH_SHARED and kernel_reuse not in SUPPORTED_BATCH_SHARED_REUSE:
         raise ModelingError("shared_prefix_kernel_reuse_unsupported")
     if mode == MODE_AUTO and kernel_reuse not in SUPPORTED_AUTO_REUSE:
         return PrefixReadPlan(
-            logical, logical, logical, query_reads, scale_total, ZERO, ZERO,
+            logical, logical, logical, query_reads, scale_total, 0, 0,
             REUSE_PER_SEQUENCE, False, NO_REUSE_REASONS["unsupported_kernel"])
     if not shared_candidates:
         return PrefixReadPlan(
-            logical, logical, logical, query_reads, scale_total, ZERO, ZERO,
+            logical, logical, logical, query_reads, scale_total, 0, 0,
             REUSE_PER_SEQUENCE, False, NO_REUSE_REASONS["empty_prefix"])
-    unique = ZERO
-    core = ZERO
+    unique = 0
+    core = 0
     logical_rows = math.fsum(_logical_rows(access) for access in accesses)
-    unique_rows = ZERO
+    unique_rows = 0
     logical_shared_bytes = ZERO_FLOAT
     groups: dict[tuple[int, str, str, float], list[tuple[int, int]]] = {}
     for access in accesses:
-        context = max(ZERO, int(access.context_tokens))
-        q_len = max(ONE, int(access.q_len))
+        context = max(0, int(access.context_tokens))
+        q_len = max(1, int(access.q_len))
         rows = _logical_rows(access)
         prefix_limit = _materialized_prefix(access, cache_state)
         end = context + q_len
         if access.window_tokens is not None:
-            win = max(ZERO, int(access.window_tokens))
-            windowed = win > ZERO
-            start = max(ZERO, end - win) if windowed else ZERO
+            win = max(0, int(access.window_tokens))
+            windowed = win > 0
+            start = max(0, end - win) if windowed else 0
         else:
             windowed = rows < end and int(prefix_limit) < int(rows)
-            start = max(ZERO, end - int(rows)) if windowed else ZERO
+            start = max(0, end - int(rows)) if windowed else 0
         span = (int(access.unique_rows)
-                if int(access.unique_rows) > ZERO
-                else (int(rows) if not windowed and int(access.logical_rows) > ZERO
-                      else max(ZERO, end - start)))
+                if int(access.unique_rows) > 0
+                else (int(rows) if not windowed and int(access.logical_rows) > 0
+                      else max(0, end - start)))
         if access.shared_intervals:
             shared = min(_merged_interval_rows(access.shared_intervals), span)
-            private = max(ZERO, span - shared)
+            private = max(0, span - shared)
             intervals = access.shared_intervals
         elif access.selected_tokens:
             visible_sel = _intersect_intervals(access.selected_tokens, start, end)
-            shared_iv = _intersect_intervals(visible_sel, ZERO, max(ZERO, int(prefix_limit)))
+            shared_iv = _intersect_intervals(visible_sel, 0, max(0, int(prefix_limit)))
             priv_iv = _intersect_intervals(visible_sel, max(start, int(prefix_limit)), end)
             shared = _merged_interval_rows(shared_iv)
             private = _merged_interval_rows(priv_iv)
             intervals = shared_iv
         elif windowed:
             shared_lo = start
-            shared_hi = min(end, max(ZERO, int(prefix_limit)))
-            raw_shared = max(ZERO, shared_hi - shared_lo)
+            shared_hi = min(end, max(0, int(prefix_limit)))
+            raw_shared = max(0, shared_hi - shared_lo)
             shared = min(raw_shared, span)
-            private = max(ZERO, span - shared)
-            intervals = ((shared_lo, shared_lo + shared),) if shared > ZERO else ()
+            private = max(0, span - shared)
+            intervals = ((shared_lo, shared_lo + shared),) if shared > 0 else ()
         else:
-            limit = int(access.logical_rows) if int(access.logical_rows) > ZERO else context
-            prefix = min(max(ZERO, int(prefix_limit)), limit)
+            limit = int(access.logical_rows) if int(access.logical_rows) > 0 else context
+            prefix = min(max(0, int(prefix_limit)), limit)
             shared = min(prefix, span)
-            private = max(ZERO, span - shared)
-            intervals = ((ZERO, shared),) if shared > ZERO else ()
+            private = max(0, span - shared)
+            intervals = ((0, shared),) if shared > 0 else ()
         unique += float(private) * float(access.row_bytes)
         unique_rows += float(private)
         logical_shared_bytes += float(shared) * float(access.row_bytes)
         core += rows * float(access.row_bytes)
-        if shared > ZERO and intervals:
+        if shared > 0 and intervals:
             key = (int(access.layer), str(access.component),
                    str(access.prefix_key), float(access.row_bytes))
             groups.setdefault(key, []).extend(intervals)
@@ -318,7 +316,7 @@ def plan_prefix_reads(
         spill_ratio = max(ZERO_FLOAT, ONE_FLOAT - retained / unique_shared_bytes)
         refill_shared = max(ZERO_FLOAT, logical_shared_bytes - unique_shared_bytes) * spill_ratio
         unique += refill_shared
-    if logical_rows > ZERO:
+    if logical_rows > 0:
         unique_scale = scale_total * unique_rows / logical_rows
     else:
         unique_scale = scale_total
@@ -326,7 +324,7 @@ def plan_prefix_reads(
     core += scale_total
     applied = bool((logical - unique) > SAVINGS_EPS)
     return PrefixReadPlan(
-        logical, unique, core, query_reads, scale_total, ZERO, ZERO,
+        logical, unique, core, query_reads, scale_total, 0, 0,
         kernel_reuse if applied else REUSE_PER_SEQUENCE, applied,
         "" if applied else NO_REUSE_REASONS["no_savings"])
 
@@ -351,8 +349,8 @@ def apply_prefix_read_plan(op: Any, plan: PrefixReadPlan, *,
         "prefix_read_l2_core_bytes": float(plan.l2_to_core_bytes),
         "prefix_read_reason": plan.reason,
     })
-    hbm = float(getattr(op, "hbm_bytes", ZERO))
-    mte2 = float(getattr(op, "mte2_bytes", ZERO))
+    hbm = float(getattr(op, "hbm_bytes", 0))
+    mte2 = float(getattr(op, "mte2_bytes", 0))
     if plan.read_reuse_applied:
         # A caller that does not name its key component keeps the historical
         # delta form; the component-aware callers pass the exact precharged
@@ -372,9 +370,9 @@ def apply_prefix_read_plan(op: Any, plan: PrefixReadPlan, *,
             raise ModelingError(
                 "prefix_read_component_underflow:"
                 f"{hbm_precharged:.3f}>"
-                f"{float(getattr(op, 'hbm_bytes', ZERO)):.3f}:"
+                f"{float(getattr(op, 'hbm_bytes', 0)):.3f}:"
                 f"{mte2_precharged:.3f}>"
-                f"{float(getattr(op, 'mte2_bytes', ZERO)):.3f}")
+                f"{float(getattr(op, 'mte2_bytes', 0)):.3f}")
         hbm, mte2 = max(ZERO_FLOAT, hbm), max(ZERO_FLOAT, mte2)
     return replace(
         op,

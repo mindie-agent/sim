@@ -35,10 +35,12 @@ FULL_PERCENT: float = 100.0
 ATTRIBUTION_PERCENT_TOLERANCE: float = 1e-9
 CLOCK_ULP_MULTIPLIER: int = 32
 CLOCK_ABS_TOLERANCE_MS: float = 1e-12
-#: A reconciled clock gap larger than this share of the reported duration is a
-#: real accounting defect, not summed float service.  Below it the gap is
-#: disclosed in the basis instead of aborting a public report.
-CLOCK_GAP_LIMIT_FRACTION: float = 0.25
+#: Executed spans are split into attributed causal wait plus service, so the
+#: realized clock telescopes to the reported boundary.  Any gap above this
+#: share (the same 1e-3 used for stage-DAG boundary reconciliation) is a real
+#: accounting defect and makes the breakdown unavailable; it is never stuffed
+#: into a bucket.  Only float summation residue below it is disclosed.
+CLOCK_GAP_LIMIT_FRACTION: float = 1e-3
 CLOCK_GAP_ABS_FLOOR_MS: float = 0.001
 VECTOR_BUCKET = "vector"
 MEMORY_BUCKET = "memory"
@@ -146,7 +148,7 @@ def _residual_bucket(values: Mapping[str, float]) -> str:
     for name in BUCKETS:
         if values[name] > 0.0:
             return name
-    return BUCKETS[0.0]
+    return BUCKETS[0]
 
 
 def finish_breakdown(
