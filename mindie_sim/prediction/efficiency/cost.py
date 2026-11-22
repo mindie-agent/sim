@@ -493,6 +493,9 @@ class CostModel:
             calibration.append("observable_kernel_regimes")
         declared_regimes = [row["id"] for row in self.case.runtime.kernels.get("service_regimes", ())]
         declared_sku = str(self.case.machine.sku or "")
+        pt_sku = getattr(pt, "sku", None)
+        pt_cann = getattr(pt, "cann_version", None)
+        pt_sha = getattr(pt, "envelope_sha256", None)
         calibration_basis = {
             "mode": (
                 "calibrated_primitive_table_rescaled" if (pt is not None and rescaled)
@@ -503,9 +506,9 @@ class CostModel:
             "calibrated": pt_calibrated,
             "rescaled": rescaled,
             "declared_sku": declared_sku,
-            "primitive_table_sku": str(pt.sku) if pt is not None else None,
-            "cann_version": str(pt.cann_version) if pt is not None else None,
-            "envelope_sha256": str(pt.envelope_sha256) if pt is not None else None,
+            "primitive_table_sku": str(pt_sku) if pt_sku is not None else None,
+            "cann_version": str(pt_cann) if pt_cann is not None else None,
+            "envelope_sha256": str(pt_sha) if pt_sha is not None else None,
             "warnings": (
                 list(pt_warnings) if pt is not None
                 else (["uncalibrated_datasheet_declaration"] if declared_sku else [])
