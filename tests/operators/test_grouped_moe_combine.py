@@ -11,8 +11,8 @@ from dataclasses import asdict, replace
 import numpy as np
 import pytest
 
-from _support.axes import SKUS
-from _support.hardware import machine
+from _support.axes import DT_SKUS, DUAL_DIE_SKU, GEN2_SKU, SKUS
+from _support.hardware import machine, sku_case
 from mindie_sim.schema.operators import OpSpec
 
 from mindie_sim import graph_costs, operator_costs, target_graphs, target_operators
@@ -461,3 +461,127 @@ def test_mx_swiglu_subblock_owner_timing_and_single_batch_invocation():
     assert observed[0] == observed[1] == 2 and all(observed[idx] == 1 for idx in range(2, 64))
     owner0 = sorted((e for e in vec if tuple(e["placement"]["vector@r0:s0"]) == (0,)), key=lambda e: e["start_ms"])
     assert owner0[-1]["start_ms"] >= owner0[0]["end_ms"]
+
+
+def _calibrated_case_and_eval(sku: str, recipes):
+    from mindie_sim.prediction.evaluation import EvaluationContext
+    from mindie_sim.prediction.execution import Execution
+    from mindie_sim.primitives import load_primitives
+
+    cs = sku_case(sku)
+    pt = load_primitives(sku)
+    ev = EvaluationContext.create(cs, recipes, primitive_table=pt)
+    ex = Execution(cs, ev.cost, recipes=recipes, bindings=ev.bindings)
+    return cs, ev, lambda op: ex._context(op, 0, "none")
+
+
+def test_calibrated_matrix_host_tiling_warmth_invariance_and_l2_speedup():
+    from mindie_sim.prediction.call_builders import build_aclnn_call
+    from mindie_sim.prediction.operators.matrix.matrix_steady import SteadyMatmul
+
+    for sku in (GEN2_SKU, DUAL_DIE_SKU, DT_SKUS[0]):
+        cd = build_aclnn_call({"api": "aclnnMatmul", "dtype": "bf16", "m": 16, "n": 4096, "k": 4096})
+        cs, ev, ctx_of = _calibrated_case_and_eval(sku, cd.recipes)
+        op_cold = cd.ops[0]
+        read_bytes = float(16 * 4096 * 2 + 4096 * 4096 * 2)
+        op_warm = replace(
+            op_cold, op_id=f"{op_cold.op_id}_warm", hbm_bytes=float(16 * 4096 * 2),
+            metadata=tuple({**dict(op_cold.metadata), "admitted_l2_read_hit_bytes": read_bytes}.items()),
+        )
+        rec_cold, _ = SteadyMatmul().select(ctx_of(op_cold))
+        rec_warm, _ = SteadyMatmul().select(ctx_of(op_warm))
+        assert rec_cold == rec_warm
+        t_cold = graph_costs(cs, {0: [op_cold]}, recipes=cd.recipes, evaluation=ev, isolated=True)["duration_ms"]
+        t_warm = graph_costs(cs, {0: [op_warm]}, recipes=cd.recipes, evaluation=ev, isolated=True)["duration_ms"]
+        assert 0.0 < t_warm < t_cold
+
+
+def test_asymmetric_nd2nz_mte2_and_streamk_partial_l2_residency():
+    from mindie_sim.prediction.call_builders import build_aclnn_call
+    from mindie_sim.prediction.operators.matrix.matrix_mapping_owners import (
+        primitive_nd2nz_mte2_rate_bps_per_aic, streamk_fixup_latency_ms,
+    )
+    from mindie_sim.prediction.operators.matrix.matrix_steady import SteadyMatmul
+
+    cd = build_aclnn_call({"api": "aclnnMatmul", "dtype": "bf16", "m": 16, "n": 256, "k": 4096})
+    op = cd.ops[0]
+    cs_old, ev_old, ctx_old_of = _calibrated_case_and_eval(GEN2_SKU, cd.recipes)
+    cs_new, ev_new, ctx_new_of = _calibrated_case_and_eval(DT_SKUS[0], cd.recipes)
+    ctx_old, ctx_new = ctx_old_of(op), ctx_new_of(op)
+    nd_sub = primitive_nd2nz_mte2_rate_bps_per_aic(ctx_old, 2, 16 * 4096 * 2, 128 * 4096 * 2, weight_layout="ND", row_bytes=256, stride_bytes=512)
+    nd_full = primitive_nd2nz_mte2_rate_bps_per_aic(ctx_old, 2, 16 * 4096 * 2, 256 * 4096 * 2, weight_layout="ND", row_bytes=512, stride_bytes=512)
+    nz_rate = primitive_nd2nz_mte2_rate_bps_per_aic(ctx_old, 2, 16 * 4096 * 2, 256 * 4096 * 2, weight_layout="FRACTAL_NZ", row_bytes=512, stride_bytes=512)
+    sym_nd = primitive_nd2nz_mte2_rate_bps_per_aic(ctx_new, 2, 16 * 4096 * 2, 128 * 4096 * 2, weight_layout="ND", row_bytes=256, stride_bytes=512)
+    sym_nz = primitive_nd2nz_mte2_rate_bps_per_aic(ctx_new, 2, 16 * 4096 * 2, 128 * 4096 * 2, weight_layout="FRACTAL_NZ", row_bytes=256, stride_bytes=512)
+    assert 0.0 < nd_sub < nd_full < nz_rate
+    assert sym_nd == pytest.approx(sym_nz)
+    rec_old, _ = SteadyMatmul().select(ctx_old)
+    rec_new, _ = SteadyMatmul().select(ctx_new)
+    assert rec_old.k_splits == 1 and rec_new.k_splits > 1
+    assert streamk_fixup_latency_ms(ctx_new, k_splits=rec_new.k_splits, used_cores=ctx_new.core_count) > 0.0
+    rep_old = graph_costs(cs_old, {0: [op]}, recipes=cd.recipes, evaluation=ev_old, isolated=True)
+    rep_new = graph_costs(cs_new, {0: [op]}, recipes=cd.recipes, evaluation=ev_new, isolated=True)
+    assert rep_old["execution"]["work"]["flops"] == op.flops and rep_new["execution"]["work"]["flops"] == op.flops
+    assert 0.0 < rep_new["duration_ms"] < rep_old["duration_ms"]
+
+
+def test_grouped_matmul_aclnn_group_list_cache_disable_and_wave_hbm():
+    from mindie_sim.prediction.call_builders import build_aclnn_call
+    from mindie_sim.prediction.operators.grouped_moe.expected_grouped import _apply_grouped_weight_cache_policy
+    from mindie_sim.prediction.operators.matrix.matrix_mapping_owners import (
+        matrix_kernel_setup_ms, primitive_cold_hbm_bps, primitive_wave_cold_hbm_per_owner_bps,
+    )
+
+    skew = [64, 0, 32, 0, 16, 0, 8, 0]
+    cd = build_aclnn_call({"api": "aclnnGroupedMatmulV4", "dtype": "bf16", "group_list": skew, "n": 1024, "k": 1024})
+    op_cold = cd.ops[0]
+    w_bytes = float(len(skew) * 1024 * 1024 * 2)
+    op_warm = replace(
+        op_cold, op_id=f"{op_cold.op_id}_warm", hbm_bytes=float(sum(skew) * 1024 * 2 * 2),
+        metadata=tuple({**dict(op_cold.metadata), "admitted_l2_read_hit_bytes": w_bytes}.items()),
+    )
+    for sku in (GEN2_SKU, DT_SKUS[0]):
+        cs, ev, ctx_of = _calibrated_case_and_eval(sku, cd.recipes)
+        ctx = ctx_of(op_cold)
+        assert matrix_kernel_setup_ms(ctx, declared_groups=64) > matrix_kernel_setup_ms(ctx, declared_groups=8)
+        meta_small = {"admitted_l2_read_hit_bytes": w_bytes}
+        _apply_grouped_weight_cache_policy(
+            ctx, meta_small, active_rows=(64, 32, 16, 8), declared_groups=8, rows=120, n=1024, k=1024, dtype="bf16",
+        )
+        if sku == GEN2_SKU:
+            assert meta_small.get("l2_weight_cache_disable") is True and meta_small["admitted_l2_read_hit_bytes"] == pytest.approx(120 * 1024 * 2)
+        else:
+            assert "l2_weight_cache_disable" not in meta_small and meta_small["admitted_l2_read_hit_bytes"] == w_bytes
+            meta_over = {"admitted_l2_read_hit_bytes": w_bytes}
+            _apply_grouped_weight_cache_policy(ctx, meta_over, active_rows=(64,), declared_groups=128, rows=64, n=1024, k=1024, dtype="bf16")
+            assert meta_over.get("l2_weight_cache_disable") is True
+        t_cold = graph_costs(cs, {0: [op_cold]}, recipes=cd.recipes, evaluation=ev, isolated=True)["duration_ms"]
+        t_warm = graph_costs(cs, {0: [op_warm]}, recipes=cd.recipes, evaluation=ev, isolated=True)["duration_ms"]
+        assert 0.0 < t_warm <= t_cold
+        cores = int(ctx.core_count)
+        cold_tiles = cores + max(1, cores // 3)
+        per_owner = primitive_wave_cold_hbm_per_owner_bps(ctx, cold_tiles=cold_tiles, row_bytes=256, stride_bytes=2048, is_grouped=True, is_full_row_coalesced=True, nn_tiles=8)
+        full_agg = primitive_cold_hbm_bps(ctx, active_cores=cores, row_bytes=256, stride_bytes=2048, total_tiles=cold_tiles, is_grouped=True, is_full_row_coalesced=True)
+        tail = cold_tiles % cores
+        tail_agg = primitive_cold_hbm_bps(ctx, active_cores=tail, row_bytes=256, stride_bytes=2048, total_tiles=cold_tiles, is_grouped=True, is_full_row_coalesced=(tail >= 8))
+        hbm_pool = float(ctx.rates[ctx.resource_names["hbm"]]) * 1000.0
+        assert (cores / min(hbm_pool, cores * per_owner) + tail / min(hbm_pool, tail * per_owner)) == pytest.approx(cores / full_agg + tail / tail_agg, rel=1e-9)
+
+
+def test_uncalibrated_matrix_helpers_return_neutral_defaults():
+    from mindie_sim.prediction.call_builders import build_aclnn_call
+    from mindie_sim.prediction.operators.matrix.matrix_mapping_owners import (
+        matrix_kernel_floor_ms, matrix_kernel_setup_ms,
+        primitive_wave_cold_hbm_per_owner_bps, streamk_fixup_latency_ms,
+    )
+
+    cd = build_aclnn_call({"api": "aclnnMatmul", "dtype": "bf16", "m": 16, "n": 256, "k": 1024})
+    _, _, ctx_of = _calibrated_case_and_eval(GEN2_SKU, cd.recipes)
+    ctx = replace(ctx_of(cd.ops[0]), primitive_table=None)
+    assert matrix_kernel_setup_ms(ctx, is_streamk=True, declared_groups=16) == 0.0
+    assert matrix_kernel_floor_ms(ctx) == 0.0
+    assert streamk_fixup_latency_ms(ctx, k_splits=4, used_cores=8) == 0.0
+    assert primitive_wave_cold_hbm_per_owner_bps(
+        ctx, cold_tiles=8, row_bytes=256, stride_bytes=512,
+        is_grouped=False, is_full_row_coalesced=False,
+    ) is None

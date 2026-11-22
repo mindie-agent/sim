@@ -10,8 +10,46 @@
 from dataclasses import dataclass, replace
 import math
 
+from mindie_sim.schema.common import dtype_bytes
+from mindie_sim.prediction.operators.matrix.matrix_mapping_owners import (
+    is_arch35_context,
+    primitive_l2_params,
+)
+
 ROW_TILE = 128
 FRACTAL = 16
+
+
+def _apply_grouped_weight_cache_policy(
+    context, meta, *, active_rows, declared_groups, rows, n, k, dtype,
+):
+    """Apply upstream CANN GroupedMatmul operand-scoped L2 weight cache policy.
+
+    - DAV_2201 (grouped_matmul_kernel.h:566): sets CACHE_MODE_DISABLE on
+      weightGmLocal for every expert with blockDimM == 1 (rows_e <= baseM=128).
+    - DAV_3510 (arch35/grouped_no_quant_matmul_tiling.cpp:193): sets
+      weightNoL2Cache_ = (m*k + groupNum*k*n + m*n) * elem_bytes >= l2_bytes
+      using declared total groupNum = len(group_list).
+    """
+    if getattr(context, "primitive_table", None) is None:
+        return
+    admitted = max(0.0, float(meta.get("admitted_l2_read_hit_bytes", 0.0) or 0.0))
+    if admitted <= 0.0:
+        return
+    elem_b = dtype_bytes(meta.get("compute_format", dtype or "bf16"))
+    x_bytes = float(rows * k * elem_b)
+    l2_bytes, _ = primitive_l2_params(context)
+    if is_arch35_context(context):
+        total_size = (rows * k + declared_groups * k * n + rows * n) * elem_b
+        if l2_bytes > 0 and total_size >= l2_bytes:
+            meta["admitted_l2_read_hit_bytes"] = min(admitted, x_bytes)
+            meta["l2_weight_cache_disable"] = True
+        return
+    cacheable_experts = sum(1 for r in active_rows if r > ROW_TILE)
+    cacheable_weight_bytes = float(cacheable_experts * k * n * elem_b)
+    meta["admitted_l2_read_hit_bytes"] = min(admitted, x_bytes + cacheable_weight_bytes)
+    if cacheable_experts == 0:
+        meta["l2_weight_cache_disable"] = True
 
 
 def inclusion_probability(probabilities, *, tokens):
@@ -59,14 +97,32 @@ class ExpectedGroupedMatmul:
     def lower(self, context):
         op = context.op
         meta = dict(op.metadata)
-        histogram = meta.get("expert_rows") or meta.get("rows_by_expert")
-        if histogram:
-            group_rows = tuple(max(0, int(value)) for value in histogram)
+        _, n, k = op.local_shape[(-3):]
+        explicit_hist = meta.get("expert_rows") or meta.get("rows_by_expert")
+        aclnn_hist = meta.get("aclnn_group_list")
+        if explicit_hist:
+            group_rows = tuple(max(0, int(value)) for value in explicit_hist)
             active = sum(1 for value in group_rows if value > 0)
             rows = sum(group_rows)
             banks = len(group_rows)
-            per_bank = (max(group_rows) if group_rows else 0)
+            per_bank = max(group_rows, default=0)
             slots = max(1, rows)
+        elif aclnn_hist:
+            full_rows = tuple(max(0, int(value)) for value in aclnn_hist)
+            active_rows = tuple(value for value in full_rows if value > 0)
+            declared_groups = len(full_rows)
+            active = len(active_rows)
+            rows = sum(active_rows)
+            group_rows = active_rows if active > 0 else (0,)
+            banks = max(1, active)
+            per_bank = max(group_rows, default=0)
+            slots = max(1, rows)
+            meta["declared_group_count"] = declared_groups
+            _apply_grouped_weight_cache_policy(
+                context, meta, active_rows=active_rows,
+                declared_groups=declared_groups, rows=rows, n=n, k=k,
+                dtype=op.dtype,
+            )
         else:
             active = meta["expected_active_experts"]
             rows = meta["expected_rows"]
@@ -77,7 +133,6 @@ class ExpectedGroupedMatmul:
             banks = math.ceil(active)
             per_bank = math.ceil(rows / active)
             slots = banks * per_bank
-        _, n, k = op.local_shape[(-3):]
         meta.update(matrix_groups=banks, matrix_mapping_domain="expected_expert_banks")
         if "matrix_epilogue" in meta:
             epilogue = dict(meta["matrix_epilogue"])
@@ -91,7 +146,7 @@ class ExpectedGroupedMatmul:
             context.record_mapping({
                 "execution_abstraction": "expected_expert_bank_grid",
                 "expected_rows": rows, "expected_active_experts": active,
-                "conditional_mean_rows": rows / active,
+                "conditional_mean_rows": (rows / active) if active else 0.0,
                 "bank_slots": banks, "rows_per_bank_slot": per_bank,
                 "semantic_rows": op.local_shape[(-3)], "scheduling_rows": slots,
                 "work_policy": "preserve_semantic_arithmetic_and_payload_moments",
