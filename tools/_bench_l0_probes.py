@@ -173,6 +173,11 @@ def _merge_ascendc_into_raw(
             "mode2_paired_ns": s.get("P13.mode2_paired_ns") or [],
             "mode4_intra_block_ns": s.get("P13.mode4_intra_block_ns") or [],
         }
+    if s.get("P14.mutex_overhead_ns"):
+        raw["P14_mutex_block_mmad"] = {
+            "mutex_overhead_ns": s["P14.mutex_overhead_ns"],
+            "mutex_xpipe_handoff_ns": s.get("P14.mutex_xpipe_handoff_ns") or [],
+        }
     if s.get("P15.graph_issue_interval_ns"):
         raw.setdefault("P15_rts_stars", {})["npugraph_issue_ns"] = s["P15.graph_issue_interval_ns"]
     if s.get("P15.host_submit_burst_ns"):
@@ -187,10 +192,12 @@ SORT_ROWS, SORT_COLS, SORT_TOPK = 256, 2048, 128
 SMALL_M_GRID = (1, 16, 32, 64, 128, 256)
 INT8_MIN_VAL, INT8_MAX_VAL, TINY_GEMM_DIM = -8, 8, 16
 HOST_SUBMIT_BURST, P15_SMALL_BURST, P15_LARGE_BURST = 128, 16, 64
-P15_MARGINAL_DENOM, P15_FIRST_INNER = 48.0, 1
+P15_MARGINAL_DENOM, P15_FIRST_INNER, P15_FIRST_GROUP = 48.0, 1, 8
 P16_INNER_STEPS, P16_HALF_NS_SCALE = 32, 0.5e6
-DMA_SLAB_MIB, DMA_SMALL_ELEMS = 64, 1024
+DMA_SLAB_MIB, DMA_SMALL_ELEMS, DMA_SMALL_INNER = 128, 1024, 64
 DMA_SMALL_BYTES = DMA_SMALL_ELEMS * FP32_BYTES
+MX_BLOCK_SIZE = 32
+MX_GROUP_SIZES = (1, 1, MX_BLOCK_SIZE)
 BISHENG_VER_TIMEOUT_S = 10
 CANN_VER_RE = re.compile(r"(\d+\.\d+(?:\.\d+)?(?:\.[A-Za-z0-9]+)?)")
 PRIMITIVE_TAG_RE = re.compile(r"^P(?:0[1-9]|1[0-9]|20)$")
@@ -511,6 +518,38 @@ def _probe_compute_domain(
                 del fa, fb, fsc
             except Exception:
                 pass
+        if arch_preset == "npu_arch_3510" and hasattr(torch_npu, "npu_dynamic_mx_quant"):
+            mx_x = torch.randn((WARMUP_GEMM_DIM, MMAD_K_DIM), dtype=torch.bfloat16, device=dev)
+            mx_w = torch.randn((WARMUP_GEMM_DIM, MMAD_K_DIM), dtype=torch.bfloat16, device=dev)
+            mx_specs = [("mxfp8", getattr(torch_npu, "float8_e4m3fn", None), False)]
+            if hasattr(torch_npu, "float4_e2m1fn_x2"):
+                mx_specs.append(("mxfp4", torch_npu.float4_e2m1fn_x2, True))
+            e8m0_dt = getattr(torch_npu, "float8_e8m0fnu", None)
+            for mx_name, dst_dt, pass_x_dt in mx_specs:
+                if dst_dt is None or e8m0_dt is None:
+                    continue
+                try:
+                    qx, sx = torch_npu.npu_dynamic_mx_quant(mx_x, axis=-1, round_mode="rint", dst_type=dst_dt, block_size=MX_BLOCK_SIZE)
+                    qw, sw = torch_npu.npu_dynamic_mx_quant(mx_w, axis=-1, round_mode="rint", dst_type=dst_dt, block_size=MX_BLOCK_SIZE)
+                    qw_t, sw_t = qw.transpose(0, 1), sw.transpose(0, 1)
+                    kw: dict[str, Any] = {
+                        "pertoken_scale": sx, "output_dtype": torch.bfloat16,
+                        "scale_dtype": e8m0_dt, "pertoken_scale_dtype": e8m0_dt,
+                        "group_sizes": list(MX_GROUP_SIZES),
+                    }
+                    if pass_x_dt:
+                        kw["x1_dtype"] = dst_dt
+                        kw["x2_dtype"] = dst_dt
+                    _ = torch_npu.npu_quant_matmul(qx, qw_t, sw_t, **kw)
+                    torch.npu.synchronize()
+                    mm_modes[mx_name] = [(mm_flops / (t * MS_PER_S)) / max(1, aic_count) for t in time_ms(
+                        lambda _i, _qx=qx, _qwt=qw_t, _swt=sw_t, _kw=kw: torch_npu.npu_quant_matmul(_qx, _qwt, _swt, **_kw),
+                        inner=BF16_BYTES, blocker=True,
+                    )]
+                    del qx, sx, qw, sw, qw_t, sw_t
+                except Exception:
+                    pass
+            del mx_x, mx_w
     sm_cold_ns: dict[str, float] = {}
     sm_warm_ns: dict[str, float] = {}
     w_bytes = WARMUP_GEMM_DIM * WARMUP_GEMM_DIM * BF16_BYTES
@@ -568,10 +607,12 @@ def _probe_runtime_and_host_dma(
         host_ns.append((time.perf_counter_ns() - t0) / float(HOST_SUBMIT_BURST))
     torch.npu.synchronize()
     def _first_issue_ns(fn: Any) -> list[float]:
-        raw_ms = time_ms(lambda _i: fn(), inner=P15_FIRST_INNER, blocker=True, chunk_size=1, target_ms=P15_BLOCKER_TARGET_MS)
         out_ns: list[float] = []
-        for pos in range(0, len(raw_ms), BF16_BYTES):
-            grp = raw_ms[pos : pos + BF16_BYTES]
+        for _ in range(repeats):
+            grp = time_ms(
+                lambda _i: fn(), inner=P15_FIRST_INNER, blocker=True,
+                chunk_size=1, target_ms=P15_BLOCKER_TARGET_MS, n_repeats=P15_FIRST_GROUP,
+            )
             if grp:
                 out_ns.append((sum(grp) / float(len(grp))) * NS_PER_MS)
         return out_ns
@@ -604,7 +645,7 @@ def _probe_runtime_and_host_dma(
         d_buf.copy_(h_pin, non_blocking=False)
         h_pin.copy_(d_buf, non_blocking=False)
     torch.npu.synchronize()
-    def _single_dma_ns(fn: Any, sync: bool = True) -> list[float]:
+    def _single_dma_ns(fn: Any, sync: bool = True, inner: int = EIGHT) -> list[float]:
         for _ in range(warmup):
             fn()
             if sync:
@@ -612,13 +653,13 @@ def _probe_runtime_and_host_dma(
         res: list[float] = []
         for _ in range(repeats):
             acc = 0.0
-            for _ in range(EIGHT):
+            for _ in range(inner):
                 t0 = time.perf_counter_ns()
                 fn()
                 if sync:
                     torch.npu.synchronize()
                 acc += float(time.perf_counter_ns() - t0)
-            res.append(acc / float(EIGHT))
+            res.append(acc / float(inner))
         return res
     def _fit_dma_pair(t_big_ns: list[float], t_sml_ns: list[float]) -> tuple[list[float], list[float]]:
         bps_list, lat_list = [], []
@@ -631,14 +672,14 @@ def _probe_runtime_and_host_dma(
             bps_list.append(rate)
             lat_list.append(ts_ns - (float(DMA_SMALL_BYTES) / rate) * NS_PER_S)
         return bps_list, lat_list
-    h2d_pin_big = _single_dma_ns(lambda: d_buf.copy_(h_pin, non_blocking=True))
-    h2d_pin_sml = _single_dma_ns(lambda: sp_dev.copy_(sp_pin, non_blocking=True))
-    d2h_pin_big = _single_dma_ns(lambda: h_pin.copy_(d_buf, non_blocking=True))
-    d2h_pin_sml = _single_dma_ns(lambda: sp_pin.copy_(sp_dev, non_blocking=True))
-    h2d_pg_big = _single_dma_ns(lambda: d_buf.copy_(h_page, non_blocking=False))
-    h2d_pg_sml = _single_dma_ns(lambda: sp_dev.copy_(sp_page, non_blocking=False))
-    d2h_pg_big = _single_dma_ns(lambda: h_page.copy_(d_buf, non_blocking=False))
-    d2h_pg_sml = _single_dma_ns(lambda: sp_page.copy_(sp_dev, non_blocking=False))
+    h2d_pin_big = _single_dma_ns(lambda: d_buf.copy_(h_pin, non_blocking=True), inner=EIGHT)
+    h2d_pin_sml = _single_dma_ns(lambda: sp_dev.copy_(sp_pin, non_blocking=True), inner=DMA_SMALL_INNER)
+    d2h_pin_big = _single_dma_ns(lambda: h_pin.copy_(d_buf, non_blocking=True), inner=EIGHT)
+    d2h_pin_sml = _single_dma_ns(lambda: sp_pin.copy_(sp_dev, non_blocking=True), inner=DMA_SMALL_INNER)
+    h2d_pg_big = _single_dma_ns(lambda: d_buf.copy_(h_page, non_blocking=False), inner=EIGHT)
+    h2d_pg_sml = _single_dma_ns(lambda: sp_dev.copy_(sp_page, non_blocking=False), inner=DMA_SMALL_INNER)
+    d2h_pg_big = _single_dma_ns(lambda: h_page.copy_(d_buf, non_blocking=False), inner=EIGHT)
+    d2h_pg_sml = _single_dma_ns(lambda: sp_page.copy_(sp_dev, non_blocking=False), inner=DMA_SMALL_INNER)
     h2d_bps, h2d_pin_lat = _fit_dma_pair(h2d_pin_big, h2d_pin_sml)
     d2h_bps, d2h_pin_lat = _fit_dma_pair(d2h_pin_big, d2h_pin_sml)
     _, h2d_pg_lat = _fit_dma_pair(h2d_pg_big, h2d_pg_sml)
@@ -647,7 +688,7 @@ def _probe_runtime_and_host_dma(
         "host_h2d_bytes_per_s": h2d_bps, "host_d2h_bytes_per_s": d2h_bps,
         "pinned_h2d_startup_ns": h2d_pin_lat, "pinned_d2h_startup_ns": d2h_pin_lat,
         "pageable_h2d_startup_ns": h2d_pg_lat, "pageable_d2h_startup_ns": d2h_pg_lat,
-        "eager_d2h_sync_ns": _single_dma_ns(lambda: float(ta.item()), sync=False),
+        "eager_d2h_sync_ns": _single_dma_ns(lambda: float(ta.item()), sync=False, inner=DMA_SMALL_INNER),
     }
     del h_pin, h_page, d_buf, sp_pin, sp_page, sp_dev, ta, tb, to, aa, ab
     torch.npu.empty_cache()
@@ -680,22 +721,27 @@ def run_local_npu_microbenchmarks(
     torch.npu.synchronize()
 
     s0, e0 = torch.npu.Event(enable_timing=True), torch.npu.Event(enable_timing=True)
-    s0.record(); _ = torch.matmul(wa, wb); e0.record()
+    s0.record()
+    for _ in range(EIGHT):
+        _ = torch.matmul(wa, wb)
+    e0.record()
     torch.npu.synchronize()
-    single_gemm_ms = max(MIN_SINGLE_GEMM_MS, float(s0.elapsed_time(e0)))
+    single_gemm_ms = max(MIN_SINGLE_GEMM_MS, float(s0.elapsed_time(e0)) / float(EIGHT))
     blocker_reps = max(1, math.ceil(BLOCKER_TARGET_MS / single_gemm_ms))
 
     def _time_ms(
         fn: Any, *, inner: int = 1, blocker: bool = True,
         chunk_size: int = BLOCKER_CHUNK_REPEATS, target_ms: float = BLOCKER_TARGET_MS,
+        n_repeats: int | None = None,
     ) -> list[float]:
         for i in range(warmup):
             fn(i)
         torch.npu.synchronize()
         out: list[float] = []
+        total_reps = repeats if n_repeats is None else int(n_repeats)
         step = max(1, chunk_size) if blocker else 1
-        for start in range(0, repeats, step):
-            k_rep = min(step, repeats - start)
+        for start in range(0, total_reps, step):
+            k_rep = min(step, total_reps - start)
             evs = [(torch.npu.Event(enable_timing=True), torch.npu.Event(enable_timing=True)) for _ in range(k_rep)]
             if blocker:
                 reps = max(blocker_reps, math.ceil((target_ms + (k_rep + BLOCKER_SETTLE_ITERS) * inner * DISPATCH_MARGIN_MS) / single_gemm_ms))

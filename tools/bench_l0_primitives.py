@@ -497,7 +497,12 @@ def _build_sync_and_link_primitives(
     spec, sku, is_arch35 = ctx["spec"], ctx["sku"], ctx["is_arch35"]
     _m, _u, _cell = ctx["m"], ctx["u"], ctx["cell"]
     conflict_meta, unm_hw, has_raw = ctx["conflict_meta"], ctx["unm_hw"], ctx["has_raw"]
-    p12r, p13r, p15r, p17r = (raw.get(k, {}) for k in ("P12_intracore_flag", "P13_crosscore_sync", "P15_rts_stars", "P17_aicpu_metadata_launch"))
+    p12r, p13r, p14r, p15r, p17r = (
+        raw.get(k, {}) for k in (
+            "P12_intracore_flag", "P13_crosscore_sync", "P14_mutex_block_mmad",
+            "P15_rts_stars", "P17_aicpu_metadata_launch",
+        )
+    )
     p18r, p19r, p20r = (raw.get(k, {}) for k in ("P18_hccl_collective_band", "P19_direct_peer_window", "P20_host_dma_sync"))
     p13_extra: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {
         "mode1_subblock_ns": _u(0.0, "latency_lower"),
@@ -538,9 +543,13 @@ def _build_sync_and_link_primitives(
         "P14_mutex_block_mmad": _cell(
             {"latency": "ns"},
             {"supported": is_arch35, "hw_mutex_ids": HW_MUTEX_IDS if is_arch35 else 0,
-             "max_mutex_ids": MAX_MUTEX_IDS if is_arch35 else 0, "unit_flag_requires_single_l0c_stage": True},
-            {}, {"mutex_overhead_ns": _u(0.0, "latency_lower")},
-            status_override="unmeasured" if is_arch35 else "unsupported", unmeasured_reason=unm_hw if is_arch35 else "",
+             "max_mutex_ids": MAX_MUTEX_IDS if is_arch35 else 0, "unit_flag_requires_single_l0c_stage": True, **conflict_meta},
+            {"mutex_overhead_ns": _m(p14r.get("mutex_overhead_ns"), 0.0, "latency_lower")} if is_arch35 else {},
+            ({"mutex_xpipe_handoff_ns": _m(p14r.get("mutex_xpipe_handoff_ns"), 0.0, "latency_lower")}
+             if (is_arch35 and p14r.get("mutex_xpipe_handoff_ns")) else (
+                 {} if is_arch35 else {"mutex_overhead_ns": _u(0.0, "latency_lower")}
+             )),
+            status_override=None if is_arch35 else "unsupported", unmeasured_reason=unm_hw if is_arch35 else "",
         ),
         "P15_rts_stars": _cell(
             {"latency": "ns"},
