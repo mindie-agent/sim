@@ -15,6 +15,7 @@ from .engine_types import ExecutionError, _structural_value
 
 _PERIODIC_EPOCH_MISS_MULTIPLIER = 2
 _PERIODIC_COLD_ISSUE_MULTIPLIER = 2
+_DEFAULT_PERIODIC_LAG = 24
 _MAX_PERIODIC_LIVE_TASKS = 4096
 _MAX_PERIODIC_RUNS = 64
 _MAX_PERIODIC_LIVE_SLOTS = 128
@@ -270,7 +271,7 @@ class _EnginePeriodicMixin:
         active_runs = max(
             1, sum(1 for run in self._periodic_runs.values() if run.get("slots"))
         )
-        step_limit = detector.max_lag * active_runs
+        step_limit = max(detector.max_lag, _DEFAULT_PERIODIC_LAG * active_runs)
         issue_limit = (
             step_limit
             if any_retired
@@ -317,17 +318,19 @@ class _EnginePeriodicMixin:
         # instead of paying O(live tasks) validation on every step.
         if len(self._tasks) > _MAX_PERIODIC_LIVE_TASKS:
             return None
-        if (len(self._periodic_runs) > _MAX_PERIODIC_RUNS
-                or sum(len(tuple(run.get("slots", ())))
-                       for run in self._periodic_runs.values()) > _MAX_PERIODIC_LIVE_SLOTS):
+        active_slots = sum(
+            len(tuple(run.get("slots", ()))) for run in self._periodic_runs.values()
+        )
+        if len(self._periodic_runs) > _MAX_PERIODIC_RUNS or active_slots > _MAX_PERIODIC_LIVE_SLOTS:
             return None
+        required_lag = max(_DEFAULT_PERIODIC_LAG, _PERIODIC_COLD_ISSUE_MULTIPLIER * active_slots)
         detector = self._periodic_detector
-        if detector is None:
+        if detector is None or (required_lag > detector.max_lag and detector.skips_returned == 0):
             try:
                 from ..engine_periodic import CycleDetector
             except ImportError:
                 return None
-            detector = CycleDetector()
+            detector = CycleDetector(max_lag=required_lag)
             self._periodic_detector = detector
         if not self._progressable_periodic_run(detector.evidence_periods):
             # No run can reach the next comparable period, so no skip is
@@ -350,10 +353,11 @@ class _EnginePeriodicMixin:
         active_runs = max(
             1, sum(1 for run in self._periodic_runs.values() if run.get("slots"))
         )
+        step_limit = max(detector.max_lag, _DEFAULT_PERIODIC_LAG * active_runs)
         if previous is not None:
             clock_steps = previous["clock_steps"]
             clock = self._periodic_clock_step
-            if (clock_steps is not None and len(clock_steps) < detector.max_lag * active_runs
+            if (clock_steps is not None and len(clock_steps) < step_limit
                     and clock is not None and clock[0] == self.advance_steps == previous["advance_steps"] + 1
                     and not self._crossed_external_or_opaque(previous, stop_at)):
                 clock_steps.append(clock[1])

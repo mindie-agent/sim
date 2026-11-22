@@ -25,9 +25,7 @@ from ...runtime.memory_physics import AddressRun, AddressRunPlan, ByteLedger, Hb
 from ...runtime.ring_buffer import RingBuffer, lower_generation
 from ..attention.common import AttentionMemoryRead, planning_sequence_spans, sequence_layout_metadata
 from ..contracts import OperatorPlanningContext
-from ..matrix.refill_steady import (
-    PeriodicPipelineSpec, compact_periodic_peer_group, compact_periodic_pipeline,
-)
+from ..matrix.refill_steady import compact_periodic_pipeline
 from ..sharedkv.l0_sync import (
     p01_gather_v2_cold_bps, p01_hbm_scatter_row_open_bytes, p01_paged_copy_setup_ms,
     p01_strided_cold_bps, p02_l0b_load_factor, p03_fixpipe_setup_ms, p13_syncall_ms,
@@ -653,7 +651,7 @@ class _PagedMlaProgramBuilder:
         return caps or None
 
     def _split_program(self, ctx, seq, query, heads, live, pair, offset, count, partials, interval, head_start,
-                       *, active_owners: int | None = None, return_peer_spec: bool = False):
+                       *, active_owners: int | None = None):
         layout = self.layout
         aivs = pair[1]
         aiv_owners = ",".join(map(str, aivs)) if layout.pv_panel_width else ""
@@ -788,22 +786,18 @@ class _PagedMlaProgramBuilder:
             return tuple(by_name[key] for key in order.static_order())
 
         slots = len(layout.clocks)
-        can_compact_geom = (
+        can_compact = (
             count > MLA_COMPACT_THRESHOLD
+            and eff_owners == 1
+            and layout.gm_workspace
             and layout.key_tile >= MLA_COMPACT_MIN_KEY_TILE
             and not self.contract.mixed_quant
             and not self.contract.block_table
             and self.planning is None
-            and self.contract.kv_layout in {"PA_BLK_BSND", "BNSD"}
+            and self.contract.kv_layout == "PA_BLK_BSND"
             and (layout.key_tile % self.contract.page_size == 0 or self.contract.page_size % layout.key_tile == 0)
         )
-        if return_peer_spec and can_compact_geom:
-            return PeriodicPipelineSpec(
-                count + slots - 1, slots,
-                lambda clk: _build_cycle(clk, compact_names=True),
-                head=slots + 1, tail=slots + 1, threshold=MLA_COMPACT_THRESHOLD,
-            )
-        if can_compact_geom and eff_owners == 1 and layout.gm_workspace:
+        if can_compact:
             return compact_periodic_pipeline(
                 ctx, count + slots - 1, slots,
                 lambda clk: _build_cycle(clk, compact_names=True),
@@ -837,7 +831,7 @@ class _PagedMlaProgramBuilder:
                 prior += groups * max(0, ceil_div(partials - local, lanes))
             return prior
 
-        def group(group_index, owner_start, *, prebuilt_splits=None):
+        def group(group_index, owner_start):
             seq = bisect_right(prefix, group_index) - 1
             query, head_group = divmod(group_index - prefix[seq], head_groups)
             head_start = head_group * layout.head_tile
@@ -851,14 +845,11 @@ class _PagedMlaProgramBuilder:
             def wave(index):
                 for local in range(min(lanes, partials - index * lanes)):
                     split = index * lanes + local
-                    if prebuilt_splits is not None and index == 0:
-                        program = prebuilt_splits[local]
-                    else:
-                        offset, count = self._split_extent(seq, query, tiles, split)
-                        program = self._split_program(
-                            context, seq, query, heads, live, self.owners[owner_start + local], offset, count, partials,
-                            owner_interval(group_index, local) + index, head_start, active_owners=wave_owners,
-                        )
+                    offset, count = self._split_extent(seq, query, tiles, split)
+                    program = self._split_program(
+                        context, seq, query, heads, live, self.owners[owner_start + local], offset, count, partials,
+                        owner_interval(group_index, local) + index, head_start, active_owners=wave_owners,
+                    )
                     yield Stage(f"split{local}", program=program, metadata={"split": split})
 
             stages = [Stage("splits", program=PipelineProgram(ceil_div(partials, lanes), 1, wave))]
@@ -897,53 +888,8 @@ class _PagedMlaProgramBuilder:
             return KernelProgram(tuple(stages))
         def launch(index):
             start = index * groups_per_wave
-            n_groups = min(groups_per_wave, prefix[-1] - start)
-            active_groups = min(groups_per_wave, prefix[-1])
-            peer_specs = []
-            slice_bounds = []
-            can_peer_compact = True
-            for local in range(n_groups):
-                g_idx = start + local
-                seq = bisect_right(prefix, g_idx) - 1
-                query, head_group = divmod(g_idx - prefix[seq], head_groups)
-                tiles, partials = self._counts(seq, query)
-                if partials <= 0 or partials > lanes:
-                    can_peer_compact = False
-                    break
-                head_start = head_group * layout.head_tile
-                heads = min(layout.head_tile, c.physical_heads - head_start)
-                live = min(heads, max(0, c.logical_heads - head_start))
-                wave_owners = min(len(self.owners), active_groups * min(lanes, max(1, partials)))
-                lo = len(peer_specs)
-                for s_idx in range(partials):
-                    offset, count = self._split_extent(seq, query, tiles, s_idx)
-                    cand = self._split_program(
-                        context, seq, query, heads, live, self.owners[local * lanes + s_idx],
-                        offset, count, partials, owner_interval(g_idx, s_idx), head_start,
-                        active_owners=wave_owners, return_peer_spec=True,
-                    )
-                    if not isinstance(cand, PeriodicPipelineSpec):
-                        can_peer_compact = False
-                        break
-                    peer_specs.append(cand)
-                if not can_peer_compact:
-                    break
-                slice_bounds.append((lo, len(peer_specs)))
-            compacted = (
-                compact_periodic_peer_group(context, peer_specs, compactor=compact_periodic_pipeline)
-                if can_peer_compact and peer_specs
-                else None
-            )
-            return tuple(
-                Stage(
-                    f"query{local}",
-                    program=group(
-                        start + local, local * lanes,
-                        prebuilt_splits=(compacted[slice_bounds[local][0]:slice_bounds[local][1]] if compacted is not None else None),
-                    ),
-                )
-                for local in range(n_groups)
-            )
+            return tuple(Stage(f"query{local}", program=group(start + local, local * lanes))
+                         for local in range(min(groups_per_wave, prefix[-1] - start)))
 
         pipeline = PipelineProgram(ceil_div(prefix[-1], groups_per_wave), 1, launch)
         if not c.sinks:
