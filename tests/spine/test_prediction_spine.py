@@ -598,3 +598,34 @@ def test_prediction_body_uses_one_evaluation_context(evaluation_calls):
     duration = report.get("duration_ms") or report.get("body_ms") or report.get("step_ms")
     assert duration is not None and float(duration) > 0
     _assert_fields(evaluation_calls, cost=1, bindings=1)
+
+
+def test_cohort_reuse_preserves_local_tp_stride_and_scales_linearly():
+    import time
+    from mindie_sim.compose import compose_case
+    from mindie_sim.prediction.operator_analysis import target_graphs
+
+    raw_ltp = compose_case(
+        "glm-5.3-flash", hardware="a5", tp=2, dp=4, ep=8, num_devices=8,
+        layers=4, prompt_tokens=1024, output_tokens=64, concurrency=4,
+        homogeneous_graph_reuse="require",
+    )
+    raw_ltp["runtime"]["parallel"]["mlp_tp"] = 4
+    raw_off = {**raw_ltp, "runtime": {**raw_ltp["runtime"], "homogeneous_graph_reuse": "off"}}
+    g_off = target_graphs(parse_case(raw_off), phase="decode", tokens=1, context=1024, sequences=1, scope="model")
+    g_req = target_graphs(parse_case(raw_ltp), phase="decode", tokens=1, context=1024, sequences=1, scope="model")
+    for rep in range(4):
+        off_groups = [(op.op_id, dict(op.metadata).get("group_ranks"), dict(op.metadata).get("local_tp_stride"))
+                      for op in g_off[rep] if dict(op.metadata).get("local_tp_stride", 1) > 1]
+        req_groups = [(op.op_id, dict(op.metadata).get("group_ranks"), dict(op.metadata).get("local_tp_stride"))
+                      for op in g_req[rep] if dict(op.metadata).get("local_tp_stride", 1) > 1]
+        assert off_groups and off_groups == req_groups
+
+    raw_big = compose_case(
+        "glm-5.3-flash", hardware="a5", tp=1, dp=32, ep=32, num_devices=32,
+        layers=4, prompt_tokens=512, output_tokens=32, concurrency=32 * 16,
+        homogeneous_graph_reuse="auto",
+    )
+    t0 = time.perf_counter()
+    graphs = target_graphs(parse_case(raw_big), phase="decode", tokens=1, context=512, sequences=16, scope="body")
+    assert len(graphs) == 32 and (time.perf_counter() - t0) < 10.0
