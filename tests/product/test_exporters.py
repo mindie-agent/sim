@@ -36,11 +36,14 @@ from mindie_sim.compose import compose_case as compose_raw_case
 from mindie_sim.export import (
     BANNED_IMPLEMENTATION_NAMES,
     MSPROF_PROCESS_SPEC,
+    PENDING_KIND_TO_IMPLEMENT,
+    PENDING_KIND_TO_OPTIMIZE,
     PID_FRAMEWORK,
     SHEET_BREAKDOWN,
     SHEET_MEASURED,
     SHEET_MEMORY,
     SHEET_NEW_KERNELS,
+    SHEET_PENDING_KERNELS,
     SHEET_SUMMARY,
     TID_FW_ENGINE,
     TID_FW_HOST_LAUNCH,
@@ -226,13 +229,15 @@ def test_trace_streaming_memory_and_speed_budget_on_full_multilayer_model(tmp_pa
 def test_xlsx_before_after_merge_cells_formulas_and_new_kernel_backlog(tmp_path):
     raw_bef, req = compose_export_case(
         "kimi-k3.1", REPRESENTATIVE_SKUS["a5"], topology_preset="a5_pod",
-        dp=1, tp=2, ep=2, dcp=1, prompt_tokens=2048, output_tokens=64,
-        concurrency=2, mtp_proposal_tokens=5, feature_track="merged",
+        dp=2, tp=2, ep=4, dcp=2, prompt_tokens=2048, output_tokens=64,
+        concurrency=4, tpot_slo_ms=30.0, mtp_proposal_tokens=5,
+        mtp_acceptance_length=3.5, feature_track="merged",
     )
     raw_aft, _ = compose_export_case(
         "kimi-k3.1", REPRESENTATIVE_SKUS["a5"], topology_preset="a5_pod",
-        dp=1, tp=2, ep=2, dcp=1, prompt_tokens=2048, output_tokens=64,
-        concurrency=2, mtp_proposal_tokens=5, feature_track="expected_ideal",
+        dp=2, tp=2, ep=4, dcp=2, prompt_tokens=2048, output_tokens=64,
+        concurrency=4, tpot_slo_ms=30.0, mtp_proposal_tokens=5,
+        mtp_acceptance_length=3.5, feature_track="expected_ideal",
     )
     b_bef = build_export_bundle(raw_bef, request=req)
     b_aft = build_export_bundle(raw_aft, request=req)
@@ -247,33 +252,60 @@ def test_xlsx_before_after_merge_cells_formulas_and_new_kernel_backlog(tmp_path)
             "design": "Single-pass AIV vector tile (UB 248KiB double-buffered) fusing SiTU + Mul",
             "acceptance": "BF16 abs_err <= 1e-3, L* efficiency >= 70%",
         },
+        "dcp_query_allgather": {
+            "design": "Overlap DCP Q AllGather with DSA Indexer scores on Stream 2",
+            "acceptance": "Exposed DCP AllGather overlap >= 85%",
+        },
     }
     xlsx_path = tmp_path / "comparison.xlsx"
     summary = export_comparison_xlsx(
         b_bef, xlsx_path, compare_source=b_aft, agent_kernel_designs=designs,
     )
-    assert summary.sheets == (SHEET_SUMMARY, SHEET_BREAKDOWN, SHEET_MEMORY, SHEET_NEW_KERNELS)
+    assert SHEET_PENDING_KERNELS == "Pending_Kernel_Details" and SHEET_NEW_KERNELS == SHEET_PENDING_KERNELS
+    assert summary.sheets == (SHEET_SUMMARY, SHEET_BREAKDOWN, SHEET_MEMORY, SHEET_PENDING_KERNELS)
     assert SHEET_MEASURED not in summary.sheets
     assert summary.has_comparison is True and summary.has_measured is False
-    assert summary.new_kernel_backlog_count >= 1
+    assert summary.new_kernel_backlog_count >= 1 and summary.to_optimize_kernel_count >= 1
 
     sheet_names, roots, shared = _read_xlsx_sheets(xlsx_path)
-    assert sheet_names == [SHEET_SUMMARY, SHEET_BREAKDOWN, SHEET_MEMORY, SHEET_NEW_KERNELS]
+    assert sheet_names == [SHEET_SUMMARY, SHEET_BREAKDOWN, SHEET_MEMORY, SHEET_PENDING_KERNELS]
     for banned in BANNED_IMPLEMENTATION_NAMES:
         assert not any(banned in s for s in shared), f"banned name leaked: {banned}"
     assert "Other" not in shared
 
     expected_order = ["dimension", "sheetViews", "sheetFormatPr", "cols", "sheetData", "mergeCells", "dataValidations", "pageMargins"]
-    for title, root in roots.items():
+    for _, root in roots.items():
         tags = [child.tag.removeprefix(NS_PREFIX) for child in root]
         assert tags == [t for t in expected_order if t in tags]
 
+    # Sheet 1 — Verify all 3 Executive Blocks (Parallelism/Concurrency, TPS/Effective TPOT, Macro-Module Share %).
+    s1 = _sheet_cells(roots[SHEET_SUMMARY], shared)
+    assert s1["C4"][0] == "Target 93L + Draft 5L" and int(s1["G4"][0]) == 4
+    assert "DP=2, TP=2, EP=4" in (s1["H5"][0] or "") and "DCP=2" in (s1["H5"][0] or "") and "SP=" in (s1["H5"][0] or "")
+    assert int(s1["G6"][0]) == 4 and s1["G7"][1] == "G6*2" and int(s1["G7"][0]) == 8
+    assert float(s1["B8"][0]) == pytest.approx(30.0) and float(s1["B9"][0]) == pytest.approx(3.5)
+    assert s1["B10"][1] == "B8*B9" and float(s1["B10"][0]) == pytest.approx(105.0)
+    assert float(s1["G8"][0]) > 0.0 and int(s1["G9"][0]) >= 0
+    assert s1["B15"][1] == "IF($B$9>0,B14/$B$9,B14)" and s1["C15"][1] == "IF($B$9>0,C14/$B$9,C14)"
+    assert float(s1["C15"][0]) == pytest.approx(float(s1["C14"][0]) / 3.5, rel=1e-6)
+    assert s1["B16"][1] == 'IF(B15<=$B$8,"PASS","FAIL")' and s1["C16"][0] in {"PASS", "FAIL"}
+    assert s1["B17"][1] == "IF($G$4>0,B18/$G$4,0)" and s1["C17"][1] == "IF($G$4>0,C18/$G$4,0)"
+    assert s1["B18"][1] == "IF(B14>0,$G$7*$B$9*1000/B14,0)" and s1["C18"][1] == "IF(C14>0,$G$7*$B$9*1000/C14,0)"
+    assert float(s1["C18"][0]) == pytest.approx(8 * 3.5 * 1000.0 / float(s1["C14"][0]), rel=1e-6)
+    assert float(s1["C17"][0]) == pytest.approx(float(s1["C18"][0]) / 4.0, rel=1e-6)
+    assert any(v == "KDA / GDN Linear Attention" for v, _ in s1.values())
+    assert any(v == "MoE Routed Experts (GMM1 / Act / GMM2)" for v, _ in s1.values())
+    assert any(v and "MSO Stream 1 Overlapped" in v for v, _ in s1.values())
+    assert any(f and f.startswith("SUM(D28:D") for _, f in s1.values())
+    assert any(f and f.startswith("SUM(F28:F") for _, f in s1.values())
+
+    # Sheet 2 — Side-by-side N->1 merge_cells, MSO formulas, Source Refs & Bounds.
     brk_merges = _sheet_merges(roots[SHEET_BREAKDOWN])
     brk_cells = _sheet_cells(roots[SHEET_BREAKDOWN], shared)
     assert any(ref.startswith("A") and ":A" in ref for ref in brk_merges)
     assert any(ref.startswith("C") and ":C" in ref for ref in brk_merges)
-    assert any(ref.startswith("K") and ":K" in ref for ref in brk_merges), "Expected N->1 vertical merge in After Kernel column K"
-    assert any(ref.startswith("O") and ":O" in ref for ref in brk_merges), "Expected N->1 vertical merge in After Model ms column O"
+    assert any(ref.startswith("K") and ":K" in ref for ref in brk_merges)
+    assert any(ref.startswith("O") and ":O" in ref for ref in brk_merges)
     assert any(f and "ISNUMBER(SEARCH(\"Overlapped\"" in f for _, f in brk_cells.values())
     assert any(f and f.startswith("H") and "/1000" in f for _, f in brk_cells.values())
     assert any(f and f.startswith("SUM(I") and "-O" in f for _, f in brk_cells.values())
@@ -282,10 +314,16 @@ def test_xlsx_before_after_merge_cells_formulas_and_new_kernel_backlog(tmp_path)
     assert any(v == "After Bound" for v, _ in brk_cells.values())
     assert not any(v == "Measured Kernel (msprof)" for v, _ in brk_cells.values())
 
-    bk_cells = _sheet_cells(roots[SHEET_NEW_KERNELS], shared)
-    assert any(v and "Single-pass AIV vector tile" in v for v, _ in bk_cells.values())
-    assert any(v and "BF16 abs_err <= 1e-3" in v for v, _ in bk_cells.values())
-    assert any(f and f.startswith("SUM(G") for _, f in bk_cells.values())
+    # Sheet 4 — Pending_Kernel_Details: Index + Structured Per-Kernel Cards for BOTH To-Implement & To-Optimize.
+    s4 = _sheet_cells(roots[SHEET_PENDING_KERNELS], shared)
+    assert any(v == PENDING_KIND_TO_IMPLEMENT for v, _ in s4.values())
+    assert any(v == PENDING_KIND_TO_OPTIMIZE for v, _ in s4.values())
+    assert any(v and v.startswith("Card #1 |") for v, _ in s4.values())
+    assert any(v and "Single-pass AIV vector tile" in v for v, _ in s4.values())
+    assert any(v and "BF16 abs_err <= 1e-3" in v for v, _ in s4.values())
+    assert any(v and "Overlap DCP Q AllGather" in v for v, _ in s4.values())
+    assert any(f and f.startswith("SUM(G") for _, f in s4.values())
+    assert any(f == "G4" for _, f in s4.values())
 
 
 def test_xlsx_conditional_measured_calibration_sheet_and_one_to_many_merges(tmp_path):
@@ -337,7 +375,7 @@ def test_xlsx_conditional_measured_calibration_sheet_and_one_to_many_merges(tmp_
     assert meas_cells[f"M{r_start}"][1] == f"IF(L{r_start}>0,ABS(I{r_start}-L{r_start})/L{r_start},0)"
 
 
-def test_submodule_and_kernel_hygiene_across_hybrid_architectures():
+def test_submodule_and_kernel_hygiene_across_hybrid_architectures(tmp_path):
     catalog_matrix = (
         ("kimi-k3.1", 2),
         ("deepseek-v4.1-flash", 2),
@@ -364,6 +402,23 @@ def test_submodule_and_kernel_hygiene_across_hybrid_architectures():
     ng_ops = [o for o in b_raw.operators if o.canonical_op_key == "linear_output_norm_gate"]
     assert ln_ops and all(o.ascend_kernel == "aclnnLayerNorm_LayerNormV3" for o in ln_ops)
     assert ng_ops and all("Cast->Pows->ReduceMean" in o.ascend_kernel for o in ng_ops)
+
+    # Verify PLE / Engram Host Offload visibility across Sheet 1/2/3 & H2D trace on hybrid GDN+PLE model.
+    raw_ple, ple_req = compose_export_case(
+        "qwen3.8-flash-next", REPRESENTATIVE_SKUS["a5"], topology_preset="a5_pod",
+        dp=1, tp=2, ep=2, dcp=1, prompt_tokens=1024, output_tokens=32,
+        concurrency=2, engram_cpu_offload=True, feature_track="expected_ideal",
+    )
+    b_ple = build_export_bundle(raw_ple, request=ple_req)
+    assert b_ple.memory_ledger.engram_host_offload is True and b_ple.memory_ledger.max_stage_host_offload_bytes > 0.0
+    assert any(o.submodule == "Engram / PLE Memory" and "Host->Device UVA H2D" in o.ascend_kernel for o in b_ple.operators)
+    ple_xlsx = tmp_path / "ple_host_offload.xlsx"
+    ple_trace = tmp_path / "ple_trace.json"
+    export_comparison_xlsx(b_ple, ple_xlsx)
+    export_msprof_trace(b_ple, ple_trace)
+    _, ple_roots, ple_shared = _read_xlsx_sheets(ple_xlsx)
+    assert any("Engram / PLE Memory" in s for s in ple_shared) and any("Host Offload=" in s for s in ple_shared)
+    assert "aclrtMemcpyAsync (PLE/Engram H2D" in ple_trace.read_text(encoding="utf-8")
 
 
 def test_memory_quant_calculator_exclusions_offload_and_pp_budget(tmp_path):

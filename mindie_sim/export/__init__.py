@@ -1,85 +1,119 @@
 """Human-native productization exporters for ``mindie_sim`` (``msprof`` Trace & OOXML XLSX).
 
-[Role] Expose the single cohesive export domain package providing:
-  (1) ``build_export_bundle`` / ``compose_export_case`` / ``align_before_after_operators``
-      / ``build_new_kernel_backlog`` (O(Unique Archetypes) ``runtime.Engine`` evaluation,
-      domain-accurate submodule classification, real Ascend/CANN/cannbot-dsl/Triton/HCCL
-      kernel identities, Lean-4 certified ``L*`` & Gap Radar, 1-to-N ``kernel_details.csv``
-      reconciliation, and closed-form Memory/Quant/PP ledger honoring ``QuantSpec.exclusions``),
-  (2) ``export_msprof_trace`` / ``iter_msprof_trace_events`` (1:1 streaming full-model
-      Ascend ``msprof`` ``trace_view.json`` with ``PID 0`` Framework/MSTX host hierarchy
-      and physically grounded AIC/AIV/MTE2/MTE3/Fixpipe spans),
-  (3) ``export_comparison_xlsx`` (zero-dependency OOXML ``.xlsx`` workbook with
-      side-by-side Before-vs-After N->1 ``merge_cells``, ``Memory_Quant_Calculator``,
-      ``New_Kernel_Design_Backlog`` with Agent-fillable slots, and conditional
-      ``Measured_msprof_Calibration``).
+[Role] Expose the cohesive export domain package organized into focused modules:
+  - ``models``: immutable data records, backend/readiness/submodule/macro-module
+    taxonomies, and hardware/quant storage constants;
+  - ``kernel_catalog``: domain-standard Ascend submodule, macro-module, and
+    multi-ecosystem kernel/readiness/tensor-contract classification;
+  - ``memory_ledger``: closed-form per-die Weight/Quant/Cache/Engram-PLE/PP HBM
+    calculator honoring ``QuantSpec.exclusions`` and per-DP Max HBM Concurrency;
+  - ``reconcile``: streaming ``msprof`` ``kernel_details.csv`` ingress and 1-to-N
+    sample-conserving reconciliation;
+  - ``bundle``: O(Unique Archetypes) ``runtime.Engine`` evaluation, Lean-4 ``L*``
+    certification, Before-vs-After alignment, macro-module aggregation, and dual
+    ``待新开发`` + ``重点待优化`` pending-kernel detail construction;
+  - ``ooxml`` & ``xlsx_exporter``: zero-dependency OOXML ``.xlsx`` workbook with
+    3-block Executive ``Summary``, ``Layer_Operator_Breakdown``,
+    ``Memory_Quant_Calculator``, ``Pending_Kernel_Details`` (index + structured
+    detail cards with Agent design slots), and conditional
+    ``Measured_msprof_Calibration``;
+  - ``trace_exporter``: streaming 1:1 full-model ``msprof`` ``trace_view.json``.
 [Invariants] Strictly a top-layer consumer in the unidirectional import DAG;
-  lower layers (``schema``, ``catalog``, ``prediction``, ``optimization``) never
-  import ``mindie_sim.export``. Zero ``0.80x`` heuristic fudge factors, zero
-  ``PIPE_*_FRACTION`` hacks, zero banned Python recipe class names, and zero
-  third-party OOXML dependencies.
+  lower layers never import ``mindie_sim.export``. Zero heuristic fudge factors,
+  zero banned Python recipe class names, and zero third-party OOXML deps.
 [Timeouts & Locks] Delegates bounded execution and streaming writes to submodules;
   no locks or device contexts.
 [Side-Effect Policy] Package import has zero filesystem or runtime side effects.
 """
 from __future__ import annotations
 
-from .analysis import (
-    AlignedComparisonRow,
-    AscendKernelDescriptor,
+from .bundle import (
+    build_export_bundle,
+    compose_export_case,
+    resolve_hardware_alias,
+)
+from .comparison import (
+    align_before_after_operators,
+    build_macro_module_breakdown,
+    build_new_kernel_backlog,
+    build_pending_kernel_details,
+)
+from .kernel_catalog import (
+    classify_macro_module,
+    classify_submodule,
+    extract_layer_index,
+)
+from .memory_ledger import (
+    compute_memory_quant_ledger,
+    evaluate_weight_storage_bytes,
+)
+from .models import (
     BACKEND_CANN,
     BACKEND_CANNBOT_DSL,
     BACKEND_HCCL_MC2,
     BACKEND_TORCH_NPU,
     BACKEND_TRITON,
     BANNED_IMPLEMENTATION_NAMES,
-    CacheLedgerRow,
     DEFAULT_EXPORT_CONTEXT_TOKENS,
     DEFAULT_GAP_RADAR_TOP_K,
     DEFAULT_SCENARIO_OUTPUT_TOKENS,
     DEFAULT_SCENARIO_PROMPT_TOKENS,
+    DEFAULT_TOP_OPTIMIZE_KERNELS,
     DEFAULT_TPOT_SLO_MS,
     DEFAULT_TTFT_SLO_MS,
     EXPORT_BUNDLE_SCHEMA,
-    ExportBundle,
     GIB_BYTES,
-    GapRadarRow,
     HARDWARE_PRESET_ALIASES,
     KERNEL_STATUS_EXISTING,
     KERNEL_STATUS_EXTEND_TILING,
     KERNEL_STATUS_FRAMEWORK,
     KERNEL_STATUS_NEW_OP,
     KERNEL_STATUS_NEW_OR_EXTEND,
-    KernelObservationRow,
-    LayerArchetypeSpec,
+    MACRO_MOD_COLLECTIVES,
+    MACRO_MOD_DENSE_NORM,
+    MACRO_MOD_DSA_LI,
+    MACRO_MOD_ENGRAM,
+    MACRO_MOD_GATED_O_PROJ,
+    MACRO_MOD_KDA_GDN,
+    MACRO_MOD_LATENT_ATTN,
+    MACRO_MOD_MLA_PROLOG,
+    MACRO_MOD_MOE_ROUTED,
+    MACRO_MOD_MOE_ROUTER,
+    MACRO_MOD_MOE_SHARED,
+    MACRO_MOD_SPEC_HEAD,
+    MACRO_MOD_VISION,
     MIB_BYTES,
     MXFP_GROUP_SIZE,
+    PENDING_KIND_TO_IMPLEMENT,
+    PENDING_KIND_TO_OPTIMIZE,
+    RECONCILE_ABS_FLOOR_US,
+    RECONCILE_APE_THRESHOLD_PCT,
+    SUPPORTED_CACHE_DTYPES,
+    SUPPORTED_WEIGHT_QUANTS,
+    US_PER_MS,
+    WEIGHT_QUANT_FORMATS,
+    AlignedComparisonRow,
+    AscendKernelDescriptor,
+    CacheLedgerRow,
+    ExportBundle,
+    GapRadarRow,
+    KernelObservationRow,
+    LayerArchetypeSpec,
+    MacroModuleRow,
     MemoryCalculatorLedger,
     NewKernelBacklogItem,
     OperatorExportRow,
-    RECONCILE_ABS_FLOOR_US,
-    RECONCILE_APE_THRESHOLD_PCT,
+    PendingKernelItem,
     ReconciledKernelGroup,
     ReconciliationSummary,
-    SUPPORTED_CACHE_DTYPES,
-    SUPPORTED_WEIGHT_QUANTS,
     StageBudgetRow,
     TraceScheduleEntry,
-    US_PER_MS,
-    WEIGHT_QUANT_FORMATS,
     WeightLedgerRow,
-    align_before_after_operators,
-    build_export_bundle,
-    build_new_kernel_backlog,
-    classify_submodule,
-    compose_export_case,
-    compute_memory_quant_ledger,
-    evaluate_weight_storage_bytes,
-    extract_layer_index,
+)
+from .reconcile import (
     load_kernel_details_csv,
     load_observation_bundle,
     reconcile_operators_with_kernels,
-    resolve_hardware_alias,
 )
 from .trace_exporter import (
     MSPROF_PROCESS_SPEC,
@@ -98,10 +132,11 @@ from .xlsx_exporter import (
     SHEET_MEASURED,
     SHEET_MEMORY,
     SHEET_NEW_KERNELS,
+    SHEET_PENDING_KERNELS,
     SHEET_SUMMARY,
+    XLSX_EXPORT_RECEIPT_SCHEMA,
     Workbook,
     Worksheet,
-    XLSX_EXPORT_RECEIPT_SCHEMA,
     XlsxExportSummary,
     cell_ref,
     column_letter,
@@ -122,6 +157,7 @@ __all__ = [
     "DEFAULT_GAP_RADAR_TOP_K",
     "DEFAULT_SCENARIO_OUTPUT_TOKENS",
     "DEFAULT_SCENARIO_PROMPT_TOKENS",
+    "DEFAULT_TOP_OPTIMIZE_KERNELS",
     "DEFAULT_TPOT_SLO_MS",
     "DEFAULT_TTFT_SLO_MS",
     "EXPORT_BUNDLE_SCHEMA",
@@ -136,13 +172,30 @@ __all__ = [
     "KERNEL_STATUS_NEW_OR_EXTEND",
     "KernelObservationRow",
     "LayerArchetypeSpec",
+    "MACRO_MOD_COLLECTIVES",
+    "MACRO_MOD_DENSE_NORM",
+    "MACRO_MOD_DSA_LI",
+    "MACRO_MOD_ENGRAM",
+    "MACRO_MOD_GATED_O_PROJ",
+    "MACRO_MOD_KDA_GDN",
+    "MACRO_MOD_LATENT_ATTN",
+    "MACRO_MOD_MLA_PROLOG",
+    "MACRO_MOD_MOE_ROUTED",
+    "MACRO_MOD_MOE_ROUTER",
+    "MACRO_MOD_MOE_SHARED",
+    "MACRO_MOD_SPEC_HEAD",
+    "MACRO_MOD_VISION",
     "MIB_BYTES",
     "MSPROF_PROCESS_SPEC",
     "MXFP_GROUP_SIZE",
+    "MacroModuleRow",
     "MemoryCalculatorLedger",
     "NewKernelBacklogItem",
     "OperatorExportRow",
+    "PENDING_KIND_TO_IMPLEMENT",
+    "PENDING_KIND_TO_OPTIMIZE",
     "PID_FRAMEWORK",
+    "PendingKernelItem",
     "RECONCILE_ABS_FLOOR_US",
     "RECONCILE_APE_THRESHOLD_PCT",
     "ReconciledKernelGroup",
@@ -151,6 +204,7 @@ __all__ = [
     "SHEET_MEASURED",
     "SHEET_MEMORY",
     "SHEET_NEW_KERNELS",
+    "SHEET_PENDING_KERNELS",
     "SHEET_SUMMARY",
     "SUPPORTED_CACHE_DTYPES",
     "SUPPORTED_WEIGHT_QUANTS",
@@ -171,8 +225,11 @@ __all__ = [
     "XlsxExportSummary",
     "align_before_after_operators",
     "build_export_bundle",
+    "build_macro_module_breakdown",
     "build_new_kernel_backlog",
+    "build_pending_kernel_details",
     "cell_ref",
+    "classify_macro_module",
     "classify_submodule",
     "column_letter",
     "compose_export_case",

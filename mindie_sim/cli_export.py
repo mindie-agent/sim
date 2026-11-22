@@ -134,6 +134,12 @@ def _add_oneshot_export_command(subparsers) -> None:
     cmd.add_argument("--cache-dtype", default=None)
     cmd.add_argument("--engram-offload", dest="engram_offload", action="store_true", default=None)
     cmd.add_argument("--no-engram-offload", dest="engram_offload", action="store_false")
+    cmd.add_argument(
+        "--deployment-mode",
+        choices=("auto", "pd_unpooled", "pd_pooled", "colocated"),
+        default="auto",
+        help="deployment mode label for Summary Block 1 (default: auto)",
+    )
     cmd.add_argument("--kernel-designs-json", default=None, help="optional JSON mapping kernel keys to Agent design/acceptance drafts")
     cmd.add_argument("--observations", "--kernel-csv", dest="observations", default=None)
     cmd.add_argument("--include-submission", action="store_true")
@@ -182,6 +188,7 @@ def _run_oneshot_export(args: argparse.Namespace) -> dict[str, Any]:
         tpot_slo_ms=float(args.tpot_ms), ttft_slo_ms=float(args.ttft_ms),
         mtp_proposal_tokens=int(args.spec_tokens),
         mtp_acceptance_length=float(args.accept_len),
+        deployment_mode=getattr(args, "deployment_mode", None),
     )
     raw_before, auto_req = compose_export_case(
         args.model, args.hardware, feature_track=str(args.compare_track or "merged"), **common_kw,
