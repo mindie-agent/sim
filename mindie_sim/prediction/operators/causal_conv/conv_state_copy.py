@@ -53,6 +53,13 @@ def wrap(b, *, conv, views, width, state_slots=None, cache_index_dtype="int32",
     pos = next(i for i, op in enumerate(b.ops) if op.op_id == conv)
     kernel = b.ops[pos]
     before = len(b.ops)
+    copy_columns = math.ceil(state_slots * width / COPY_TILE_ELEMENTS)
+    copy_programs = requests * copy_columns
+    copy_meta_reads = copy_programs * (
+        int(dtype_bytes(cache_index_dtype)) + 2 * int(dtype_bytes(query_start_dtype))
+    )
+    copy_payload = requests * state_slots * width * dtype_bytes(dtype)
+    copy_idx_write = requests * COPY_TARGET_INDEX_BYTES
     common = (("implementation", IMPLEMENTATION), ("source", SOURCE),
               ("native_kind", "_copy_conv_state_kernel"), ("invocation_class", "vector"),
               ("state_slots", state_slots), ("state_dtype", dtype),
@@ -61,10 +68,12 @@ def wrap(b, *, conv, views, width, state_slots=None, cache_index_dtype="int32",
               ("cache_indices", "declared_distinct_valid_slot_per_active_request"),
               ("cache_index_dtype", cache_index_dtype), ("query_start_dtype", query_start_dtype),
               ("active_requests", (True,) * requests),
-              ("logical_grid", (requests, math.ceil(state_slots * width / COPY_TILE_ELEMENTS))))
+              ("logical_grid", (requests, copy_columns)))
     if joint_program_service:
         common += (("joint_program_service", joint_program_service),)
     gather = b.work("convolution_state_gather", kernel.deps, (requests, state_slots, width),
+                    read=copy_payload, write=copy_payload + copy_idx_write,
+                    hbm_read=copy_payload + copy_meta_reads,
                     family="conv_state_copy", dtype=dtype,
                     metadata=common + (("direction", "gather"),))
     b.ops[-1] = replace(b.ops[-1], recipe=IMPLEMENTATION, source_boundary="kernel")
@@ -75,6 +84,8 @@ def wrap(b, *, conv, views, width, state_slots=None, cache_index_dtype="int32",
                   metadata=(("caller", SOURCE), ("reason", "torch.zeros_like(x)"),
                             ("invocation_class", "vector")))
     scatter = b.work("convolution_state_scatter", (conv,), (requests, state_slots, width),
+                     read=copy_payload, write=copy_payload,
+                     hbm_read=copy_payload + copy_meta_reads,
                      family="conv_state_copy", dtype=dtype,
                      metadata=common + (("direction", "scatter"),
                                         ("passthrough_result", conv)))

@@ -598,3 +598,105 @@ def test_uncalibrated_matrix_helpers_return_neutral_defaults():
     assert matrix_kernel_setup_ms(ctx, is_streamk=True, declared_groups=16) == 0.0
     assert matrix_kernel_floor_ms(ctx) == 0.0 and streamk_fixup_latency_ms(ctx, k_splits=4, used_cores=8) == 0.0
     assert primitive_wave_cold_hbm_per_owner_bps(ctx, cold_tiles=8, row_bytes=256, stride_bytes=512, is_grouped=False, is_full_row_coalesced=False) is None
+
+
+def test_grouped_moe_abi_fp32_ub_expected_groups_and_a5_sector_eff_monotonicity():
+    from _support.hardware import machine
+    from mindie_sim.compose import compose_case
+    from mindie_sim.hardware_derivation import derive_hardware_sku
+    from mindie_sim.prediction.evaluation import EvaluationContext
+    from mindie_sim.prediction.mechanism import Geometry
+    from mindie_sim.prediction.operators.contracts import OperatorPlanningContext
+    from mindie_sim.prediction.operators.grouped_moe import arch22 as gm_arch22, arch35 as gm_arch35
+    from mindie_sim.prediction.operators.grouped_moe.common import validate_contract
+    from mindie_sim.prediction.operators.grouped_moe.expected_grouped import ExpectedGroupedMatmul
+    from mindie_sim.prediction.operators.matrix.matrix_steady import SteadyMatmul
+    from mindie_sim.prediction.program import RecipeBook
+    from mindie_sim.prediction.results import OpOccurrence
+    from mindie_sim.primitives.loader import load_primitives
+
+    # 1. Typed shipping activation predicates on grouped_moe arch22/arch35 + FP32 UB upcast.
+    a5_geo = Geometry.from_devices(machine(DT_SKUS[0]).dies[:1])
+    a3_geo = Geometry.from_devices(machine(GEN2_SKU).dies[:1])
+    a5_ctx = OperatorPlanningContext(OpOccurrence(0, 0, 0, "gm_abi"), a5_geo, a5_geo.datapath)
+    a3_ctx = OperatorPlanningContext(OpOccurrence(0, 0, 0, "gm_abi"), a3_geo, a3_geo.datapath)
+    situ_meta = (
+        ("mode", "mega_moe"), ("group_rows", (4, 4)), ("n", 128), ("k", 64),
+        ("dtype_a", "bf16"), ("dtype_b", "bf16"), ("output_dtype", "bf16"),
+        ("activation", "situ"), ("handoff_dtype", "bf16"),
+    )
+    situ_op = OpSpec("gm_situ", "grouped_moe", "decode", 0, 0, ("r0",), (8, 128, 64),
+                     (8, 128, 64), (8, 128, 64), (8, 128, 64), dtype="bf16",
+                     recipe="mega_moe", metadata=situ_meta)
+    assert not gm_arch35.STRATEGY.accepts(situ_op, a5_ctx)
+    assert not gm_arch22.STRATEGY.accepts(situ_op, a3_ctx)
+    ext_op = replace(situ_op, metadata=situ_meta + (("abi_variant_extension", True),))
+    assert gm_arch35.STRATEGY.accepts(ext_op, a5_ctx)
+    assert gm_arch22.STRATEGY.accepts(ext_op, a3_ctx)
+    _, slot_bytes = gm_arch35._fit_ub(validate_contract(ext_op, a5_ctx), a5_ctx)
+    # BF16 handoff still budgets FP32 (4 B/elem) * 2 (gate+up) * rows * cols in UB.
+    assert slot_bytes == 4 * 64 * 2 * 4
+
+    # 2. ExpectedGroupedMatmul stamps declared_group_count & L2 cache policy on probability_moments.
+    raw_k3 = compose_case("kimi-k3", DT_SKUS[0], tp=2, dp=1, ep=2, layers=2, prompt_tokens=1024, output_tokens=64)
+    parsed_k3 = parse_case(raw_k3)
+    g_prob = target_graphs(parsed_k3, phase="decode", tokens=4, context=1024, sequences=4, scope="body")[0]
+    exp_up = next(op for op in g_prob if op.op_id.endswith(".expert_up"))
+    assert dict(exp_up.metadata).get("matrix_weight_bank_groups", 0) > 1
+    _, _, ctx_of = _calibrated_case_and_eval(DT_SKUS[0], RecipeBook.from_mapping(parsed_k3.runtime.kernels))
+    captured_ops = []
+
+    class _CaptureMatrix(SteadyMatmul):
+        def lower(self, context, **kwargs):
+            captured_ops.append(context.op)
+            return super().lower(context, **kwargs)
+
+    ExpectedGroupedMatmul(_CaptureMatrix()).lower(ctx_of(exp_up))
+    assert dict(captured_ops[0].metadata)["declared_group_count"] >= dict(exp_up.metadata)["matrix_weight_bank_groups"]
+
+    # 3. Calibrated PrimitiveTable A5 sector efficiency prevents M=1>M=4 inversion and 4->1.6 TB/s cliff.
+    pt_a5 = load_primitives("Ascend950DT_9582")
+    ev_k3 = EvaluationContext.create(parsed_k3, primitive_table=pt_a5)
+    g1 = target_graphs(parsed_k3, phase="decode", tokens=1, context=1024, sequences=1, scope="body")[0]
+    g4 = target_graphs(parsed_k3, phase="decode", tokens=4, context=1024, sequences=1, scope="body")[0]
+    gc1 = graph_costs(parsed_k3, g1, evaluation=ev_k3, external_inputs={"analysis_input": 0})
+    gc4 = graph_costs(parsed_k3, g4, evaluation=ev_k3, external_inputs={"analysis_input": 0})
+    def d_of(gc, oid):
+        return next(float(r.get("duration_ms", r["complete_ms"] - r["ready_ms"])) for r in gc["timeline"] if r["op_id"] == oid)
+    assert d_of(gc4, "s0.l0.linear_qkvbfg_a") >= d_of(gc1, "s0.l0.linear_qkvbfg_a") - 1e-6
+    assert gc4["duration_ms"] >= gc1["duration_ms"] - 1e-6
+
+    def _scale_pt_hbm(pt, scale, sku):
+        prims = {}
+        for pid, cell in pt.primitives.items():
+            if pid != "P01_datacopy":
+                prims[pid] = cell
+                continue
+            metrics = {
+                k: (replace(b, certified_upper_capacity=b.certified_upper_capacity * scale,
+                            p05=None if b.p05 is None else b.p05 * scale,
+                            p50=None if b.p50 is None else b.p50 * scale,
+                            p95=None if b.p95 is None else b.p95 * scale,
+                            p99=None if b.p99 is None else b.p99 * scale,
+                            trimmed_mean=None if b.trimmed_mean is None else b.trimmed_mean * scale)
+                    if "hbm" in k else b)
+                for k, b in cell.metrics.items()
+            }
+            params = dict(cell.parameters or {})
+            if "mte2_aic_cold_scaling_bps" in params:
+                params["mte2_aic_cold_scaling_bps"] = {k: float(v) * scale for k, v in params["mte2_aic_cold_scaling_bps"].items()}
+            if "strided_cold_surface" in params:
+                params["strided_cold_surface"] = [{**e, "bps_p50": float(e["bps_p50"]) * scale} for e in params["strided_cold_surface"]]
+            prims[pid] = replace(cell, metrics=metrics, parameters=params)
+        return replace(pt, sku=sku, primitives=prims)
+
+    gb = target_graphs(parsed_k3, phase="decode", tokens=1, context=1024, sequences=4, scope="body")[0]
+    gate_durs = []
+    for bw in (4.0e12, 1.6e12, 1.4e12):
+        sku_name = f"s-{int(bw // 1e11)}"
+        c_bw = replace(parsed_k3, machine=derive_hardware_sku(parsed_k3.machine, sku=sku_name, hbm_peak_bytes_per_s=bw))
+        ev_bw = EvaluationContext.create(c_bw, primitive_table=_scale_pt_hbm(pt_a5, bw / 4.0e12, sku_name))
+        gc_bw = graph_costs(c_bw, gb, evaluation=ev_bw, external_inputs={"analysis_input": 0})
+        gate_durs.append(d_of(gc_bw, "s0.l0.gate_up"))
+    assert 1.5 <= gate_durs[1] / gate_durs[0] <= 3.5
+    assert 1.0 <= gate_durs[2] / gate_durs[1] <= 1.5

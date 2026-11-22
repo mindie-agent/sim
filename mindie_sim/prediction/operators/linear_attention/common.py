@@ -89,6 +89,22 @@ def request_lengths(requests: tuple[RequestView, ...]) -> tuple[int, ...]:
     return tuple(view.logical_q_len for view in requests)
 
 
+def executed_request_lengths(requests: tuple[RequestView, ...], declared: Sequence[int] = ()) -> tuple[int, ...]:
+    """Per-request rows the lowered op executes for the execution request views.
+
+    Execution views stay logical (``q_len`` plus ``draft_proposal_tokens``)
+    while a target-verify graph is lowered over ``q_len + draft_proposal_tokens``
+    rows. When the op's own lowered active rows equal that exact verify
+    projection the verify rows execute; otherwise the logical rows do.
+    """
+    raw = request_lengths(requests)
+    verify = tuple(q + view.draft_proposal_tokens if q else 0 for q, view in zip(raw, requests))
+    active = tuple(int(q) for q in declared if q)
+    if verify != raw and active and tuple(q for q in verify if q) == active:
+        return verify
+    return raw
+
+
 def request_layout_metadata(ctx: OperatorPlanningContext) -> dict[str, Any]:
     """Project the GM bases in each tensor's row units from the request views."""
     if not ctx.requests:
@@ -242,7 +258,8 @@ def validate_contract(op: OpSpec, ctx: OperatorPlanningContext) -> LinearAttenti
     use_requests = bool(ctx.requests) and (operation.endswith(("_prefill", "_recurrent"))
                                           or operation == "gdn_chunk32")
     if use_requests:
-        lengths = tuple(length for length in request_lengths(ctx.requests) if length)
+        declared = metadata.get("lengths", metadata.get("sequence_lengths", metadata.get("sequence_tokens", ())))
+        lengths = tuple(length for length in executed_request_lengths(ctx.requests, declared) if length)
     else:
         raw_lengths = metadata.get("lengths", metadata.get("sequence_lengths", metadata.get("sequence_tokens", ())))
         if not raw_lengths:
@@ -393,9 +410,17 @@ def analyze_state_residency(
     scratch = qkv_gate_correction_scratch
     if scratch is None:
         gate_width = contract.bk if contract.operation.startswith("kda_") else 1
-        scratch = contract.bt * (
-            (2 * contract.bk + contract.bv) * element_bytes(contract.dtype)
-            + gate_width * element_bytes(contract.gate_dtype) + element_bytes(contract.beta_dtype)
+        # Ascend AIV decode recurrences upcast BF16/FP16 Q/K/V/gate/beta inputs
+        # into FP32 (4B/elem) UB working vectors; chunked prefill Q/K/V stay
+        # in Cube L1 so only recurrent ops budget 4B/elem UB scratch here.
+        is_recurrent = contract.operation.endswith("_recurrent")
+        qkv_elem = max(FP32_BYTES, element_bytes(contract.dtype)) if is_recurrent else element_bytes(contract.dtype)
+        gate_elem = max(FP32_BYTES, element_bytes(contract.gate_dtype)) if is_recurrent else element_bytes(contract.gate_dtype)
+        beta_elem = max(FP32_BYTES, element_bytes(contract.beta_dtype)) if is_recurrent else element_bytes(contract.beta_dtype)
+        scratch_tokens = min(max(contract.lengths, default=1), contract.bt) if is_recurrent else contract.bt
+        scratch = scratch_tokens * (
+            (2 * contract.bk + contract.bv) * qkv_elem
+            + gate_width * gate_elem + beta_elem
             + FP32_BYTES * contract.bv
         )
     chunks = sum(ceil_div(length, contract.bt) for length in contract.lengths)
@@ -783,7 +808,7 @@ def _resolve_recover_ssm_accepted(
             ]
             raw_a = sum(vals) / len(vals)
     if isinstance(raw_a, float) and not isinstance(raw_a, bool) and math.isfinite(raw_a):
-        return max(0, min(q, int(round(raw_a))))
+        return max(0, min(q, math.ceil(raw_a)))
     return raw_a
 
 

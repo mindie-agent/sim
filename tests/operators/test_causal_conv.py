@@ -383,3 +383,50 @@ def test_recover_ssm_keeps_native_kda_and_accounts_replay_separately():
     native = [op for op in ops if op.recipe == "vllm_ascend_recurrent_kda_arch35"]
     assert len(native) == 69
     assert all(dict(op.metadata)["recover_ssm"] for op in native)
+
+
+def test_causal_conv_and_state_copy_stamp_nonzero_compulsory_work():
+    from _support.hardware import machine
+    from mindie_sim.prediction.mechanism import Geometry
+    from mindie_sim.prediction.operators.causal_conv import conv_state_copy, native_causal_conv_prefill, native_causal_conv_spec
+    from mindie_sim.prediction.operators.hyper_connections.common import attnres_spec_terms
+
+    # 1. Native prefill CausalConv1d stamps non-zero compulsory work <= build().work and 0 on all-skipped slots.
+    geo = Geometry.from_devices(machine(REPRESENTATIVE_SKUS["a5"]).dies[:1])
+    op_act = native_causal_conv_spec.make_op({"lengths": (32, 16), "dim": 128, "width": 4, "dtype": "bf16"})
+    plan_act = native_causal_conv_prefill.build(op_act, geo)
+    assert op_act.hbm_bytes > 0 and op_act.mte2_bytes > 0 and op_act.mte3_bytes > 0
+    assert op_act.hbm_bytes <= plan_act.work.resources["hbm"] + 1e-6
+    op_skip = native_causal_conv_spec.make_op({
+        "lengths": (8,), "dim": 128, "width": 4, "dtype": "bf16",
+        "cache_indices": (-1,), "pad_slot_id": -1,
+    })
+    assert op_skip.hbm_bytes == 0.0 and op_skip.mte2_bytes == 0.0 and op_skip.mte3_bytes == 0.0
+
+    # 2. AttnRes prefix spec terms return non-zero work for active tokens and 0 for empty tokens.
+    from mindie_sim.schema.operators import OpSpec
+    def _attnres_op(tok: int) -> OpSpec:
+        shape = (tok, 128)
+        return OpSpec(
+            "attn_res_fwd", "attn_res_prefix", "decode", 0, 0, ("r0",),
+            shape, shape, shape, shape, dtype="bf16", recipe="attn_res_fwd",
+            metadata=(("tokens", tok), ("hidden_size", 128), ("capacity", 4), ("valid_history", 3)),
+        )
+    terms = attnres_spec_terms(_attnres_op(8))
+    assert all(terms[k] > 0 for k in ("hbm_bytes", "mte2_bytes", "mte3_bytes", "vector_ops"))
+    zero_terms = attnres_spec_terms(_attnres_op(0))
+    assert all(zero_terms[k] == 0.0 for k in ("hbm_bytes", "mte2_bytes", "mte3_bytes", "vector_ops"))
+
+    # 3. Conv state copy gather/scatter and causal_conv_update stamp non-zero compulsory work.
+    copy_raw = json.loads((ROOT / "examples/cases/high-concurrency-20261030/glm-flash-ws9/a5_glm53flash_tp8_c16_p4k.json").read_text())
+    copy_raw["runtime"]["kernels"].setdefault("lowerings", {})["conv_state_copy"] = {
+        "implementation": COPY_RECIPE, "options": {"state_slots": 6}}
+    ops = target_graphs(copy_raw, phase="decode", tokens=4, context=4096, sequences=16, scope="body")[0]
+    copies = [op for op in ops if op.family == "conv_state_copy"]
+    assert copies and all(op.hbm_bytes > 0 and op.mte2_bytes > 0 and op.mte3_bytes > 0 for op in copies)
+    raw = compose_case("kimi-k3", REPRESENTATIVE_SKUS["a5"], tp=2, ep=2, layers=2, prompt_tokens=256, output_tokens=16)
+    raw["runtime"]["kernels"].setdefault("lowerings", {})["causal_conv_update"] = "ascend_causal_conv1d_update"
+    u_ops = target_graphs(raw, phase="decode", tokens=1, context=256, sequences=2, scope="body")[0]
+    convs = [op for op in u_ops if op.recipe == "ascend_causal_conv1d_update"]
+    assert convs and all(op.hbm_bytes > 0 and op.mte2_bytes > 0 and op.mte3_bytes > 0 and op.vector_ops > 0 for op in convs)
+    assert conv_state_copy.IMPLEMENTATION == "triton_noncontiguous_conv_state_copy"

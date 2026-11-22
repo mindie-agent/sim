@@ -8,6 +8,7 @@
 """
 from dataclasses import replace
 
+from mindie_sim.prediction.mechanism import Geometry
 from mindie_sim.prediction.operators.kda import kda_recurrent
 
 IMPLEMENTATION = RECIPE = "vllm_ascend_recurrent_kda_arch22"
@@ -29,10 +30,25 @@ def build(op, geometry, *, compact=True):
 
 
 def bind_source(op):
-    """Apply the source identity to a shared recurrent operator."""
-    metadata = {**dict(op.metadata), "implementation": IMPLEMENTATION, "source": SOURCE,
+    """Apply the source identity and minimum-owner membase floor work to a shared recurrent op."""
+    raw_meta = dict(op.metadata)
+    metadata = {**raw_meta, "implementation": IMPLEMENTATION, "source": SOURCE,
                 "source_binding": "explicit_arch22_kernel_selection_not_binary_equivalence"}
-    return replace(op, recipe=RECIPE, metadata=tuple(sorted(metadata.items())))
+    bound = replace(op, recipe=RECIPE, metadata=tuple(sorted(metadata.items())))
+    params = raw_meta.get("kda_recurrent_params")
+    if params is None:
+        return bound
+    floor_geo = Geometry(
+        1, {"vector": 1, "mte2": 1, "mte3": 1},
+        dict(kda_recurrent.frontend_geometry().buffers),
+    )
+    summary = kda_recurrent.summarize_work(params, floor_geo, execution=EXECUTION)
+    bound = summary.apply(bound)
+    physical_read = float(sum(
+        amount for role, amount in summary.resources.items()
+        if role in {"mte2", "mte2_aiv"}
+    ))
+    return replace(bound, mte2_bytes=physical_read)
 
 
 def make_op(params, **kwargs):

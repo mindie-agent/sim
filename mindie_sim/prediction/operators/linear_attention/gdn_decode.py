@@ -23,12 +23,14 @@ from ...mechanism import PlannedRecipe
 from ...structure_groups import declare_group, source_reference
 from mindie_sim.prediction.operators.recurrent.recover_ssm_work import (
     GDN_ARCH35_RECOVER_SSM_RECIPE,
-    emit_commit_op, recover_ssm_enabled, rewrite_gdn_analytical_scan,
+    emit_commit_op, recover_ssm_enabled, rewrite_gdn_analytical_scan, stamp_gdn_kernel_spec,
 )
 from ...tensors import TensorLowering
 from ..contracts import OperatorPlanningContext
 from . import gdn_recurrent
-from ._gdn_decode_programs import CONV, GATING, CONV_SOURCE, conv_plan, gating_plan
+from ._gdn_decode_programs import (
+    CONV, GATING, CONV_SOURCE, conv_plan, conv_spec_terms, gating_plan, gating_spec_terms,
+)
 from .common import request_layout_metadata
 
 SOURCE = {"path": "data/observations/sources/gdn-image-c3d00a196905/gdn.py.txt",
@@ -146,8 +148,11 @@ def _lower_convolution(b, tensors, *, conv_input, deps, views, active, active_ro
         "gdn_state_contract": conv_contract,
         "gdn_state_effects": conv_effects,
     }.items())))
+    external, reads, writes, vector = conv_spec_terms(
+        lengths, padding_slots, plan.conv_kernel, width, False, speculative)
     b.ops[-1] = replace(b.ops[-1], recipe=CONV, source_boundary="kernel",
-                        padded_shape=(core_tokens, width))
+                        padded_shape=(core_tokens, width), hbm_bytes=float(external),
+                        mte2_bytes=float(reads), mte3_bytes=float(writes), vector_ops=float(vector))
     return conv
 
 
@@ -197,13 +202,14 @@ def _lower_recurrence(b, tensors, *, decode_core, values, gate_values, views,
     if recurrent_implementation == "arch35_fp32":
         recipe_name = GDN_ARCH35_RECOVER_SSM_RECIPE if use_recover_ssm else gdn_recurrent.IMPLEMENTATION
         extra_meta = {"recover_ssm": True, "recover_ssm_stage": "verify_compact_record"} if use_recover_ssm else {}
-        b.ops[-1] = replace(scan, recipe=recipe_name, source_boundary="kernel",
-                           metadata=tuple({**dict(scan.metadata), "source": gdn_recurrent.SOURCE,
-                               "implementation_scope": "source_resident_qkv_and_state_pipeline",
-                               "recurrence_selection": recurrent_implementation,
-                               "unmodeled_features": ("scalar_metadata_issue_and_cache_latency",),
-                               **extra_meta,
-                           }.items()))
+        b.ops[-1] = stamp_gdn_kernel_spec(replace(
+            scan, recipe=recipe_name, source_boundary="kernel",
+            metadata=tuple({**dict(scan.metadata), "source": gdn_recurrent.SOURCE,
+                            "implementation_scope": "source_resident_qkv_and_state_pipeline",
+                            "recurrence_selection": recurrent_implementation,
+                            "unmodeled_features": ("scalar_metadata_issue_and_cache_latency",),
+                            **extra_meta,
+                            }.items())), compact_records=use_recover_ssm)
     elif recurrent_implementation == "analytical":
         updated_scan = replace(scan, metadata=tuple({**dict(scan.metadata),
                                "recurrence_selection": recurrent_implementation}.items()))
@@ -301,6 +307,24 @@ def _declare_gated_rmsnorm(b, *, normalized, tokens, heads, dv, dtype):
     )
 
 
+def _resolve_decode_slot_indices(raw_slots, views):
+    if raw_slots is None:
+        return "caller_tensor", None
+    if isinstance(raw_slots, dict):
+        try:
+            indices = tuple(
+                None if raw_slots[view.request_id] is None
+                else int(raw_slots[view.request_id]) for view in views
+            )
+        except (KeyError, TypeError, ValueError):
+            raise ModelingError("gdn_decode_state_indices_missing_request")
+    elif isinstance(raw_slots, (list, tuple)) and len(raw_slots) == len(views):
+        indices = tuple(None if value is None else int(value) for value in raw_slots)
+    else:
+        raise ModelingError("gdn_decode_state_indices_length_mismatch")
+    return "caller_metadata", indices
+
+
 def lower(*, prefix, plan, views, stage, deps, model, parallel, mode,
           padded_tokens, policy, runtime, gating_beta_store=None, gating_programs=None,
           recurrent_implementation="analytical", cache_index_row_stride=1):
@@ -353,22 +377,7 @@ def lower(*, prefix, plan, views, stage, deps, model, parallel, mode,
         "gdn_state_rows", runtime_meta.get("gdn_state_capacity"))
     raw_slots = runtime_meta.get("gdn_decode_state_indices",
                                  runtime_meta.get("gdn_state_indices"))
-    slot_source = "caller_tensor"
-    slot_indices = None
-    if raw_slots is not None:
-        if isinstance(raw_slots, dict):
-            try:
-                slot_indices = tuple(
-                    None if raw_slots[view.request_id] is None
-                    else int(raw_slots[view.request_id]) for view in views)
-            except (KeyError, TypeError, ValueError):
-                raise ModelingError("gdn_decode_state_indices_missing_request")
-        elif isinstance(raw_slots, (list, tuple)) and len(raw_slots) == len(views):
-            slot_indices = tuple(None if value is None else int(value)
-                                 for value in raw_slots)
-        else:
-            raise ModelingError("gdn_decode_state_indices_length_mismatch")
-        slot_source = "caller_metadata"
+    slot_source, slot_indices = _resolve_decode_slot_indices(raw_slots, views)
     contract, recurrent_effects = gdn_recurrent.state_contract(
         views=views, phase="decode", state_dtype=plan.recurrent_state_dtype,
         conv_state_dtype=conv_dtype, conv_kernel=plan.conv_kernel,
@@ -418,7 +427,10 @@ def lower(*, prefix, plan, views, stage, deps, model, parallel, mode,
                              ("g_store_selection", "retained_binary_positive_stride_dma_inference"),
                              ("compiled_identity", "new_capture_binary_unverified"),
                              ("outputs", ("fp32_decay", "bf16_beta"))))
-    b.ops[-1] = replace(b.ops[-1], recipe=GATING, source_boundary="kernel")
+    gate_reads, gate_writes, gate_vector = gating_spec_terms(core_tokens, heads)
+    b.ops[-1] = replace(b.ops[-1], recipe=GATING, source_boundary="kernel",
+                        hbm_bytes=float(gate_reads + gate_writes), mte2_bytes=float(gate_reads),
+                        mte3_bytes=float(gate_writes), vector_ops=float(gate_vector))
     gate_values = (tensors.result(gated, (1, core_tokens, heads), "fp32", output="decay"),
                    tensors.result(gated, (1, core_tokens, heads), "bf16", output="beta"))
     core = _lower_recurrence(

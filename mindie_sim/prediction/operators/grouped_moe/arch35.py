@@ -20,7 +20,7 @@ from ..contracts import ArchStrategy, OperatorPlanningContext
 from .common import (
     ACTIVATION_OPS, FRACTAL_M_DIM, FRACTAL_N_DIM, GEMM_MODES, INT32_HANDOFF_BYTES_PER_ELEM,
     MX_DTYPES, MX_SCALE_GROUP_SIZE, PER_TOKEN_SCALE_BYTES, QUANT_OPS_PER_ELEMENT, ROUTED_MODES,
-    SPARSE_GROUP_LIST_TYPE,
+    SHIPPING_MEGAMOE_ACTIVATIONS, SHIPPING_SWIGLU_QUANT_ACTIVATIONS, SPARSE_GROUP_LIST_TYPE,
     StageDemand, activation_stages, capability_gap, contract_fields,
     blaze_tasks, ceil_div, element_bytes, fractal_issues, fractal_k0, make_plan, matrix_schedule,
     matrix_stages, tensor_bytes, validate_contract,
@@ -152,7 +152,11 @@ def _validate(op, ctx, contract):
         raise capability_gap(op, ctx, "arch35_xllm_int32_gm_abi")
     if mode in ROUTED_MODES | {"gmm_swiglu_quant"} and not ctx.datapath.has_l0c_to_ub:
         raise capability_gap(op, ctx, "l0c_to_ub_fixpipe")
+    fields = contract_fields(op)
+    allow_abi_ext = bool(fields.get("abi_variant_extension", False))
     if mode in ROUTED_MODES:
+        if not allow_abi_ext and contract.activation not in SHIPPING_MEGAMOE_ACTIVATIONS:
+            raise capability_gap(op, ctx, f"arch35_mega_moe_activation:{contract.activation}")
         _specialization(op, ctx, contract)
         if contract.shared_intermediate:
             compute, weight = contract.shared_compute_dtype, contract.shared_weight_dtype
@@ -161,13 +165,17 @@ def _validate(op, ctx, contract):
                 raise ModelingError(f"grouped_moe_unsupported_shared_expert_precision:{compute}:{weight}")
     if mode in ROUTED_MODES | {"gmm_swiglu_quant"}:
         ctx.datapath.route("l0c", "ub")
-    if mode == "gmm_swiglu_quant" and (
-        contract.dtype_a not in MX_DTYPES or contract.dtype_b not in MX_DTYPES
-        or contract.activation_divisor != 2
-    ):
-        raise capability_gap(op, ctx, "arch35_paired_mx_operands")
-    if mode == "dequant_swiglu_quant" and contract.handoff_dtype not in AIV_INPUT_DTYPES:
-        raise capability_gap(op, ctx, f"arch35_dequant_input:{contract.handoff_dtype}")
+    if mode == "gmm_swiglu_quant":
+        if not allow_abi_ext and contract.activation not in SHIPPING_SWIGLU_QUANT_ACTIVATIONS:
+            raise capability_gap(op, ctx, f"arch35_swiglu_quant_activation:{contract.activation}")
+        if (contract.dtype_a not in MX_DTYPES or contract.dtype_b not in MX_DTYPES
+                or contract.activation_divisor != 2):
+            raise capability_gap(op, ctx, "arch35_paired_mx_operands")
+    if mode == "dequant_swiglu_quant":
+        if not allow_abi_ext and contract.activation not in SHIPPING_SWIGLU_QUANT_ACTIVATIONS:
+            raise capability_gap(op, ctx, f"arch35_dequant_swiglu_activation:{contract.activation}")
+        if contract.handoff_dtype not in AIV_INPUT_DTYPES:
+            raise capability_gap(op, ctx, f"arch35_dequant_input:{contract.handoff_dtype}")
 
 
 def _fit_ub(contract, ctx):
@@ -175,7 +183,10 @@ def _fit_ub(contract, ctx):
     capacity = ctx.datapath.usable_bytes("ub")
     if contract.enable_dbo:
         capacity -= 2 * min(capacity // 2, contract.top_k * INT32_HANDOFF_BYTES_PER_ELEM)
-    accum_bytes = element_bytes(contract.activation_divisor, contract.handoff_dtype)
+    # Ascend AIV upcasts BF16/FP16 handoffs to FP32 (4B/elem) inside UB for
+    # gated activations and quantization scale math.
+    working_elem = max(INT32_HANDOFF_BYTES_PER_ELEM, element_bytes(1, contract.handoff_dtype))
+    accum_bytes = contract.activation_divisor * working_elem
     columns = min(contract.intermediate, contract.base_n)
     # Reduce M before N so independently stored MX scales remain group aligned.
     if columns < contract.intermediate and contract.uses_mx_scales:

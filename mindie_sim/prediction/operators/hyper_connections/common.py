@@ -202,6 +202,20 @@ def _text_gate_a2_small(contract: TextGatedResidualContract, aic_cores: int) -> 
     return TextGatedGuardDecision("native_a2_small", split, task, max(1, min(aic_cores, max(c0_loops, c1_slices))))
 
 
+def _text_gate_a5_small_reason(c: int, h: int, r: int, aic_cores: int) -> str | None:
+    if not 2 <= c <= TEXT_GATED_SMALL_MAX_STREAMS:
+        return "a5_small_hc_mult"
+    if not (TEXT_GATED_SMALL_HIDDEN_ALIGNMENT <= h <= TEXT_GATED_SMALL_MAX_HIDDEN
+            and h % TEXT_GATED_SMALL_HIDDEN_ALIGNMENT == 0):
+        return "a5_small_hidden_size"
+    if not (TEXT_GATED_SMALL_RANK_ALIGNMENT <= r <= TEXT_GATED_SMALL_MAX_RANK
+            and r % TEXT_GATED_SMALL_RANK_ALIGNMENT == 0):
+        return "a5_small_rank"
+    if aic_cores == 0:
+        return "a5_small_aic_cores"
+    return None
+
+
 def evaluate_text_gated_guard(
     contract: TextGatedResidualContract, arch_id: ArchId, aic_cores: int,
 ) -> TextGatedGuardDecision:
@@ -219,17 +233,8 @@ def evaluate_text_gated_guard(
     elif arch_id == ARCH22 and m < SMALL_M_THRESH_A2:
         return _text_gate_a2_small(contract, aic_cores)
     elif arch_id == ARCH35 and m < TEXT_GATED_LARGE_MIN_ROWS:
-        if not 2 <= c <= TEXT_GATED_SMALL_MAX_STREAMS:
-            reason = "a5_small_hc_mult"
-        elif not (TEXT_GATED_SMALL_HIDDEN_ALIGNMENT <= h <= TEXT_GATED_SMALL_MAX_HIDDEN
-                  and h % TEXT_GATED_SMALL_HIDDEN_ALIGNMENT == 0):
-            reason = "a5_small_hidden_size"
-        elif not (TEXT_GATED_SMALL_RANK_ALIGNMENT <= r <= TEXT_GATED_SMALL_MAX_RANK
-                  and r % TEXT_GATED_SMALL_RANK_ALIGNMENT == 0):
-            reason = "a5_small_rank"
-        elif aic_cores == 0:
-            reason = "a5_small_aic_cores"
-        else:
+        reason = _text_gate_a5_small_reason(c, h, r, aic_cores)
+        if reason is None:
             return TextGatedGuardDecision("native_a5_small", TEXT_GATED_SMALL_SPLITK_FACTOR, m, aic_cores)
     if reason is not None:
         if contract.strict_native:
@@ -591,6 +596,31 @@ def model_attnres(graph: PhaseGraph, t: AttnResContract, ub: int, physical_cap: 
             graph.end_token()
             previous = (output,)
     return metadata
+
+
+def attnres_spec_terms(op: OpSpec) -> dict[str, float]:
+    """Geometry-free compulsory work of one ``AttnResFwd`` call for its ``OpSpec``.
+
+    Mirrors ``model_attnres`` per token (vector work is owner-independent);
+    bytes count each compulsory tensor once: prefix (+addend), the ``j`` valid
+    history rows, the score/norm weights and the stored rows. UB-capacity
+    re-reads and per-owner weight reloads only add traffic on top.
+    """
+    contract, options = operator_contract(op, "attn_res_fwd")
+    m, h, j = contract.tokens, contract.hidden_size, contract.valid_history
+    row = int(dtype_bytes(contract.dtype)) * h
+    fuse = int(contract.fuse_add)
+    weights = (2 + int(contract.output_norm)) * row
+    if not m:
+        return {"hbm_bytes": 0.0, "mte2_bytes": 0.0, "mte3_bytes": 0.0, "vector_ops": 0.0}
+    reads = m * (1 + fuse + j) * row + weights
+    writes = m * (1 + fuse + int(options["bank_write"])) * row
+    score_per_row = 2 * (h - 1) + (2 + 2) * h + RMS_SCALAR_OPS
+    norm = (2 + 2) * h + 2 * h + h + RMS_SCALAR_OPS if contract.output_norm else 0
+    per_token = ((j + 1) * score_per_row + (2 + 2) * h * fuse
+                 + ATTNRES_SOFTMAX_OPS_PER_ROW * (j + 1) - 1 + 2 * (j + 1) * h + norm)
+    return {"hbm_bytes": float(reads + writes), "mte2_bytes": float(reads),
+            "mte3_bytes": float(writes), "vector_ops": float(m * per_token)}
 
 
 def model_engram(graph: PhaseGraph, t: EngramGateContract, ub: int) -> dict:

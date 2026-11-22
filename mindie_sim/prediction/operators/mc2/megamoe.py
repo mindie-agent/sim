@@ -36,9 +36,16 @@ from ...program import KernelProgram, ParallelProgram, Stage
 RECIPE = "megamoe_arch35"
 NATIVE_KIND = "aclnnMegaMoe"
 
-SUPPORTED_ACTIVATIONS = frozenset({
-    "swiglu", "swigluoai", "situglu", "situ", "silu", "gelu", "gelu_tanh", "geglu",
+#: Stock shipping CANN ``dispatch_ffn_combine`` / ``aclnnMegaMoe`` activations.
+#: Custom gated variants (``situ``, ``situglu``, ``swigluoai``, ``geglu``,
+#: ``gelu_tanh``) require an explicit ABI variant extension rather than silent
+#: admission on shipping ``merged`` / ``unmerged_pr`` baselines.
+SHIPPING_SUPPORTED_ACTIVATIONS = frozenset({"swiglu", "silu", "gelu"})
+EXTENDED_ABI_ACTIVATIONS = frozenset({
+    "swigluoai", "situglu", "situ", "gelu_tanh", "geglu",
 })
+SUPPORTED_ACTIVATIONS = SHIPPING_SUPPORTED_ACTIVATIONS
+ALL_ACTIVATIONS = SHIPPING_SUPPORTED_ACTIVATIONS | EXTENDED_ABI_ACTIVATIONS
 FUSED_MC2_ROUTED_MODE = 2
 FUSED_MC2_SHARED_MODE = 3
 SUPPORTED_FUSED_MC2_MODES = frozenset({0, FUSED_MC2_ROUTED_MODE, FUSED_MC2_SHARED_MODE})
@@ -140,12 +147,16 @@ def make_op(
     shared_inter: int = 0,
     shared_w13_bytes: float = 0.0,
     shared_w2_bytes: float = 0.0,
+    allow_abi_extension: bool = False,
+    activation_params: Mapping[str, Any] | None = None,
     extra_metadata: tuple[tuple[str, Any], ...] = (),
 ) -> OpSpec:
     """Construct a ``megamoe_arch35`` composite ``OpSpec``."""
     act = str(activation or "swiglu").strip().lower()
-    if act not in SUPPORTED_ACTIVATIONS:
+    allowed_acts = ALL_ACTIVATIONS if allow_abi_extension else SUPPORTED_ACTIVATIONS
+    if act not in allowed_acts:
         raise ModelingError(f"megamoe_arch35_unsupported_activation:{act}")
+    is_abi_ext = act not in SUPPORTED_ACTIVATIONS
     mc2_mode = int(enable_fused_mc2)
     if mc2_mode not in SUPPORTED_FUSED_MC2_MODES:
         raise ModelingError(f"megamoe_arch35_unsupported_fused_mc2:{mc2_mode}")
@@ -184,6 +195,10 @@ def make_op(
         "input_format": output_dtype,
         "output_format": output_dtype,
         "compute_format": compute_dtype,
+        "activation_compute_dtype": "fp32",
+        "ub_working_bytes_per_elem": FP32_BYTES,
+        "abi_variant_extension": bool(is_abi_ext),
+        **({"activation_params": dict(activation_params)} if activation_params else {}),
         "megamoe_geometry": {
             "tokens": tok,
             "hidden": width,
@@ -195,6 +210,7 @@ def make_op(
             "enable_fused_mc2": mc2_mode,
             "ep": max(1, int(ep)),
             "activation": act,
+            "abi_variant_extension": bool(is_abi_ext),
             "compute_dtype": compute_dtype,
             "output_dtype": output_dtype,
             "dispatch_link_bytes": float(dispatch_link_bytes),
@@ -325,7 +341,9 @@ def build(op: OpSpec, geometry: Geometry) -> OperatorPlan:
     out_dt = str(spec.get("output_dtype", op.dtype or "bf16"))
     out_elem = float(dtype_bytes(out_dt))
 
-    if act not in SUPPORTED_ACTIVATIONS:
+    allow_ext = bool(spec.get("abi_variant_extension") or meta.get("abi_variant_extension"))
+    allowed_acts = ALL_ACTIVATIONS if allow_ext else SUPPORTED_ACTIVATIONS
+    if act not in allowed_acts:
         raise ModelingError(f"megamoe_arch35_unsupported_activation:{act}")
     if mc2_mode not in SUPPORTED_FUSED_MC2_MODES:
         raise ModelingError(f"megamoe_arch35_unsupported_fused_mc2:{mc2_mode}")
@@ -425,6 +443,9 @@ def build(op: OpSpec, geometry: Geometry) -> OperatorPlan:
         "execution_class": "mixed_aic_aiv_mc2",
         "enable_fused_mc2": mc2_mode,
         "activation": act,
+        "activation_compute_dtype": "fp32",
+        "ub_working_bytes_per_elem": FP32_BYTES,
+        "abi_variant_extension": bool(act not in SUPPORTED_ACTIVATIONS),
         "shared_expert_fused": bool(sh_inter > 0),
         "l2_onchip_activation_bytes": l2_hit,
         "source_program": CANN_MEGAMOE_SOURCE,

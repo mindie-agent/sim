@@ -31,6 +31,7 @@ from .common import (
     ATTNRES_FP32_SCRATCH_ROWS,
     ATTNRES_SOFTMAX_OPS_PER_ROW,
     FP32_BYTES,
+    attnres_spec_terms,
 )
 
 
@@ -500,6 +501,7 @@ def attn_res_point(context, *, prefix_id, addend_id, bank_ids, valid_blocks,
             "serial per-owner load/compute/store phases, shared-rate contention",
         ),
     )
+    op = replace(op, **attnres_spec_terms(op))
     ops = [op]
     declare_group(
         ops, key=op_id + ".group", role=GROUP_ROLE, family="attn_res_prefix",

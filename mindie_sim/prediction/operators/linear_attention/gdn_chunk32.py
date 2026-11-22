@@ -224,11 +224,27 @@ def make_prepare_op(params: Mapping[str, Any]) -> OpSpec:
         },
         "native_source": FLA_GDN_CHUNK_SOURCE, "pr_source": PR22147_SOURCE,
     }
+    bt = GDN_CHUNK32_TOKENS
+    gate_bytes = FP32_BYTES if gate_dtype == "fp32" else BF16_BYTES
+    beta_bytes = FP32_BYTES if beta_dtype == "fp32" else BF16_BYTES
+    aiv_read = float(keys * tokens * (2 * dk * BF16_BYTES + gqa * dv * BF16_BYTES + gqa * (gate_bytes + beta_bytes)))
+    a_write = keys * tokens * gqa * bt * BF16_BYTES if output_a else 0
+    aiv_write = float(keys * tokens * (2 * dk * BF16_BYTES + 2 * FP32_BYTES + gqa * FP32_BYTES) + a_write)
+    aiv_vec = float(keys * (
+        tokens * (2 * dk * L2NORM_OPS_PER_ELEM + gqa * (dk + dv) * SIGMOID_SCALE_OPS_PER_ELEM)
+        + chunks.total * gqa * (bt * GATE_CUMSUM_OPS_PER_ROW + bt * bt * CAUSAL_DECAY_OPS_PER_PAIR + VCS32_TRIANGULAR_OPS)
+    ))
+    aic_read = float(keys * tokens * (dk + gqa * (dk + dv)) * BF16_BYTES)
+    wu_write = float(keys * tokens * gqa * (dk + dv) * BF16_BYTES)
+    flops = float(chunks.total * keys * (2 * bt * bt * dk + gqa * (2 * bt * dk * bt + 2 * bt * dv * bt)))
     return OpSpec(
         op_id=f"gdn-prepare-c32:h{heads}:hk{keys}:c{chunks.total}",
         family="gdn_prepare", phase="prefill", stage=0, layer=0, requests=(),
         semantic_shape=semantic, local_shape=semantic,
         padded_shape=padded, launch_shape=padded,
+        flops=flops, matrix_flops=(("bf16", flops),), vector_ops=aiv_vec,
+        hbm_bytes=aiv_read + aiv_write + aic_read + wu_write,
+        mte2_bytes=aiv_read + aic_read, mte3_bytes=aiv_write,
         dtype="bf16", recipe=PREPARE_RECIPE, source_boundary="kernel",
         metadata=tuple(sorted(meta.items())),
     )
@@ -304,10 +320,24 @@ def make_state_op(params: Mapping[str, Any]) -> OpSpec:
         },
         "native_source": FLA_GDN_CHUNK_SOURCE,
     }
+    bt = GDN_CHUNK32_TOKENS
+    tokens = sum(lengths)
+    seq_chunks = tuple((n + bt - 1) // bt for n in lengths)
+    state_fp32, state_bf16 = float(dk * dv * FP32_BYTES), float(dk * dv * BF16_BYTES)
+    total_snaps = sum((1 if use_init else 0) + (nc - 1) for nc in seq_chunks)
+    total_aic_states = sum((nc if use_init else nc - 1) for nc in seq_chunks)
+    aiv_read = (len(lengths) * heads * state_fp32 if use_init else 0.0) + float(heads * tokens * (dv * BF16_BYTES + FP32_BYTES))
+    aiv_write = (len(lengths) * heads * state_fp32 if out_final else 0.0) + total_snaps * heads * state_bf16 + float(heads * tokens * dv * BF16_BYTES)
+    aiv_vec = float(heads * (chunks.total * dk * dv + tokens * dv) * STATE_DECAY_OPS_PER_ELEM)
+    aic_read = float((keys * tokens * dk + heads * tokens * (dk + dv)) * BF16_BYTES) + total_aic_states * heads * state_bf16
+    flops = float(chunks.total * heads * 2 * (2 * bt * dv * dk))
     return OpSpec(
         op_id=f"gdn-state-c32:h{heads}:c{chunks.total}",
         family="gdn_state", phase="prefill", stage=0, layer=0, requests=(),
         semantic_shape=shape, local_shape=shape, padded_shape=shape, launch_shape=shape,
+        flops=flops, matrix_flops=(("bf16", flops),), vector_ops=aiv_vec,
+        hbm_bytes=aiv_read + aiv_write + aic_read,
+        mte2_bytes=aiv_read + aic_read, mte3_bytes=aiv_write,
         dtype="fp32", recipe=STATE_RECIPE, source_boundary="kernel",
         metadata=tuple(sorted(meta.items())),
     )
@@ -379,9 +409,21 @@ def make_output_op(params: Mapping[str, Any]) -> OpSpec:
         },
         "native_source": FLA_GDN_CHUNK_SOURCE,
     }
+    bt = GDN_CHUNK32_TOKENS
+    chunks = PackedChunks.from_lengths(lengths, bt)
+    tokens = sum(lengths)
+    groups_per_key = (heads // keys + group - 1) // group
+    aic_read = float((keys * groups_per_key * 2 * tokens * dk + heads * (chunks.total * dk * dv + tokens * dv)) * BF16_BYTES)
+    flops = float(heads * (chunks.total * (2 * bt * bt * dk + 2 * bt * dv * dk) + tokens * 2 * dv * bt))
+    aiv_read = float(heads * tokens * FP32_BYTES)
+    aiv_write = float(heads * tokens * dv * BF16_BYTES)
+    aiv_vec = float(heads * (chunks.total * bt * bt * CAUSAL_DECAY_OPS_PER_PAIR + tokens * dv * OUTPUT_FUSE_OPS_PER_ELEM))
     return OpSpec(
         op_id="gdn_output_c32", family="gdn_output", phase="prefill",
         stage=0, layer=0, requests=(), dtype="bf16", layout="BSND",
+        flops=flops, matrix_flops=(("bf16", flops),), vector_ops=aiv_vec,
+        hbm_bytes=aic_read + aiv_read + aiv_write,
+        mte2_bytes=aic_read + aiv_read, mte3_bytes=aiv_write,
         recipe=OUTPUT_RECIPE, source_boundary="kernel",
         semantic_shape=shape, local_shape=shape, padded_shape=shape, launch_shape=shape,
         metadata=tuple(sorted(meta.items())),

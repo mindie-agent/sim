@@ -10,6 +10,7 @@ Upstream-ABI: aclnnMoeDistributeDispatchV2
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 import math
 
@@ -17,8 +18,10 @@ from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.datapath import ArchId, SourceRef
 from mindie_sim.schema.operators import OpSpec
 from . import megamoe as mc2_megamoe
-from mindie_sim.prediction.operators.mc2.mc2_phase import RECIPE, build as build_fullmesh, contract
-from ...mechanism import OperatorPlan, PlannedRecipe, Work
+from mindie_sim.prediction.operators.mc2.mc2_phase import (
+    RECIPE, build as build_fullmesh, contract, declared_floor_work,
+)
+from ...mechanism import OperatorPlan, PlannedRecipe
 from mindie_sim.prediction.operators.mc2.moe_comm_selection import FUSED_MC2
 from ..contracts import ArchStrategy, OperatorPlanningContext
 from mindie_sim.prediction.operators.mc2.mc2_fullmesh import SOURCE, combine_layout, dispatch_layout
@@ -341,7 +344,7 @@ def lower_native_protocol(
             and received_assignments
             and not has_redundant_slots):
         megamoe = _try_lower_megamoe(
-            ops, by_id, selected, prefix, tokens, width, top_k, received_assignments,
+            ops, by_id, selected, runtime, prefix, tokens, width, top_k, received_assignments,
             ep, dtype, pack, dispatch, combine, unpack, pack_quant,
         )
         if megamoe is not None:
@@ -420,8 +423,24 @@ def _dispatch_quant_mode(selected, pack, pack_quant, by_id, prefix, dispatch, wi
     return quant, absorbed
 
 
+def _allow_megamoe_abi_extension(runtime) -> bool:
+    """Return True when the active feature track or runtime explicitly permits ABI extensions."""
+    rmeta = dict(getattr(runtime, "metadata", ()) or ())
+    if bool(rmeta.get("allow_megamoe_abi_extension", False)) or bool(
+        rmeta.get("allow_extended_activation_abi", False)
+    ):
+        return True
+    report = rmeta.get("feature_track_report")
+    track = (
+        (report.get("feature_track") if isinstance(report, Mapping) else None)
+        or rmeta.get("feature_track")
+        or ""
+    )
+    return str(track).strip().lower() == "expected_ideal"
+
+
 def _try_lower_megamoe(
-    ops, by_id, selected, prefix, tokens, width, top_k, received_assignments,
+    ops, by_id, selected, runtime, prefix, tokens, width, top_k, received_assignments,
     ep, dtype, pack, dispatch, combine, unpack, pack_quant,
 ):
     e_up = by_id.get(prefix + ".expert_up")
@@ -447,7 +466,9 @@ def _try_lower_megamoe(
         return None
     act_meta = dict(e_act.metadata)
     act_kind = str(act_meta.get("activation_kind") or e_act.family or "swiglu").lower()
-    if act_kind not in mc2_megamoe.SUPPORTED_ACTIVATIONS:
+    allow_ext = _allow_megamoe_abi_extension(runtime)
+    allowed_acts = mc2_megamoe.ALL_ACTIVATIONS if allow_ext else mc2_megamoe.SUPPORTED_ACTIVATIONS
+    if act_kind not in allowed_acts:
         return None
 
     fused_lvl = int(selected.get("fused_mc2_level") or FUSED_MC2_ROUTED_MODE)
@@ -512,6 +533,8 @@ def _try_lower_megamoe(
         combine_link_bytes=float(combine.link_bytes),
         shared_inter=sh_inter, shared_w13_bytes=sh_w13,
         shared_w2_bytes=sh_w2,
+        allow_abi_extension=allow_ext,
+        activation_params=act_meta.get("activation_params"),
         extra_metadata=(
             ("device_kernel_group", {
                 "id": prefix + ".megamoe",
@@ -789,7 +812,7 @@ def _native_dispatch_combine(
                                               absorbed["native_kind"])
         return tuple(metadata.items())
 
-    dispatch_op = Work().apply(replace(
+    dispatch_op = declared_floor_work(forward_raw).apply(replace(
         dispatch, op_id=dispatch.op_id, deps=pack.deps,
         family="mc2_protocol", recipe=RECIPE, source_boundary="kernel",
         dtype=dtype, returns=dispatch_returns,
@@ -801,7 +824,7 @@ def _native_dispatch_combine(
     final_deps = (dispatch.op_id,) + tuple(
         d for d in unpack.deps if d not in {pack.op_id, combine.op_id})
     combine_deps = tuple(dict.fromkeys(combine.deps + final_deps))
-    combine_op = Work().apply(replace(
+    combine_op = declared_floor_work(backward_raw).apply(replace(
         combine, op_id=unpack.op_id, deps=combine_deps,
         family="mc2_protocol", recipe=RECIPE, source_boundary="kernel",
         dtype=dtype,

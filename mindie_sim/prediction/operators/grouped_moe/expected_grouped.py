@@ -102,11 +102,19 @@ class ExpectedGroupedMatmul:
         aclnn_hist = meta.get("aclnn_group_list")
         if explicit_hist:
             group_rows = tuple(max(0, int(value)) for value in explicit_hist)
-            active = sum(1 for value in group_rows if value > 0)
+            active_rows = tuple(value for value in group_rows if value > 0)
+            active = len(active_rows)
             rows = sum(group_rows)
             banks = len(group_rows)
             per_bank = max(group_rows, default=0)
             slots = max(1, rows)
+            declared_groups = max(banks, int(meta.get("matrix_weight_bank_groups", 0) or 0))
+            meta["declared_group_count"] = declared_groups
+            _apply_grouped_weight_cache_policy(
+                context, meta, active_rows=active_rows,
+                declared_groups=declared_groups, rows=rows, n=n, k=k,
+                dtype=op.dtype,
+            )
         elif aclnn_hist:
             full_rows = tuple(max(0, int(value)) for value in aclnn_hist)
             active_rows = tuple(value for value in full_rows if value > 0)
@@ -133,6 +141,13 @@ class ExpectedGroupedMatmul:
             banks = math.ceil(active)
             per_bank = math.ceil(rows / active)
             slots = banks * per_bank
+            declared_groups = max(banks, int(meta.get("matrix_weight_bank_groups", 0) or 0))
+            meta["declared_group_count"] = declared_groups
+            _apply_grouped_weight_cache_policy(
+                context, meta, active_rows=(per_bank,) * banks,
+                declared_groups=declared_groups, rows=rows, n=n, k=k,
+                dtype=op.dtype,
+            )
         meta.update(matrix_groups=banks, matrix_mapping_domain="expected_expert_banks")
         if "matrix_epilogue" in meta:
             epilogue = dict(meta["matrix_epilogue"])

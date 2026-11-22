@@ -149,9 +149,13 @@ def conv_schedule(lengths, dim, units, *, width, bias, speculative, compact=True
     }
 
 
-def _conv_work(lengths, has_state, width, dim, bias, speculative, read):
-    # Source reloads weights per (sequence, channel tile), and recasts each
-    # window tap before the multiply/add. SiLU is neg/exp/add/div/multiply.
+def conv_spec_terms(lengths, padding_slots, width, dim, bias, speculative):
+    """Geometry-free ``(external_hbm, reads, writes, vector)`` of the update kernel.
+
+    Shared by ``conv_plan`` and the lowering so the declared ``OpSpec`` carries
+    exactly the executed descriptors (never a zero-work placeholder).
+    """
+    has_state = _state_slots(lengths, padding_slots)
     traffic = [_conv_traffic(q, width, bias, speculative, own)
                for q, own in zip(lengths, has_state) if q > 0 and own]
     reads = sum(amount for amount, _ in traffic) * dim * 2
@@ -164,11 +168,33 @@ def _conv_work(lengths, has_state, width, dim, bias, speculative, read):
     # inputs from UB, so neither adds an off-chip descriptor.
     external = sum(2 * (q + width - 1) * dim * 2
                    for q, own in zip(lengths, has_state) if q > 0 and own)
-    token_ops = CONV_TOKEN_TAP_OPS * width + CONV_TOKEN_FIXED_OPS + CONV_TOKEN_BIAS_OPS * int(bias)
-    vector = sum((width + 1 + q * token_ops) * dim
+    vector = sum((width + 1 + q * conv_token_ops(width, bias)) * dim
                  for q, own in zip(lengths, has_state) if q > 0 and own)
+    return external, reads, writes, vector
+
+
+def conv_token_ops(width, bias):
+    # Source recasts each window tap before the multiply/add; SiLU is
+    # neg/exp/add/div/multiply.
+    return CONV_TOKEN_TAP_OPS * width + CONV_TOKEN_FIXED_OPS + CONV_TOKEN_BIAS_OPS * int(bias)
+
+
+def _conv_work(lengths, padding_slots, width, dim, bias, speculative, read):
+    external, reads, writes, vector = conv_spec_terms(lengths, padding_slots, width, dim, bias, speculative)
     work = Work(resources={"hbm": external, read: reads, "mte3": writes, "vector": vector})
-    return work, token_ops
+    return work, conv_token_ops(width, bias)
+
+
+def gating_spec_terms(rows, heads):
+    """Unpadded ``(reads, writes, vector)`` lower bound of the gating kernel.
+
+    Every element is loaded, gated and stored once and the per-head
+    parameters are read at least once; tile padding only adds work.
+    """
+    elements = rows * heads
+    reads = elements * 2 * BF16_BYTES + heads * 2 * FP32_BYTES
+    writes = elements * (FP32_BYTES + BF16_BYTES)
+    return reads, writes, elements * GATING_PER_ELEMENT_OPS
 
 
 def conv_plan(op, geometry, *, compact=True):
@@ -209,7 +235,7 @@ def conv_plan(op, geometry, *, compact=True):
                           compact=compact, has_state=has_state)
     run_counts = schedule["owner_cycles"]
     read = read_role(geometry.resource_units, aiv=0)
-    work, token_ops = _conv_work(lengths, has_state, width, dim, bias, speculative, read)
+    work, token_ops = _conv_work(lengths, padding_slots, width, dim, bias, speculative, read)
 
     def program(context):
         def task(q, n, repeat, owns_state, owner):

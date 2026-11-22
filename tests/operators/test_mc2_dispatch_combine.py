@@ -597,3 +597,50 @@ def test_matmul_all_reduce_multichunk_rdma_and_hbm_coupling():
     mm_plan, mm_ctx = megamoe.build(mm_op, geo_view), lower_plan(call(DISPATCH, 2, width=ROW, assignment_matrix={(0, 1): 1}), geo_view)[1]
     mm_stgs = {s.name: s for s in mm_plan.program(mm_ctx).programs[0].stages}
     assert mm_plan.metadata["l2_onchip_activation_bytes"] == 512.0 and mm_stgs["gmm1_gate_up"].work["hbm"] != mm_stgs["gmm2_down"].work["hbm"] and "l2" not in mm_stgs["gmm2_down"].work
+
+
+def test_megamoe_typed_activation_abi_predicate_and_mc2_protocol_floor_work():
+    from mindie_sim.compose import compose_case
+    from mindie_sim.prediction.operator_analysis import target_graphs
+    from mindie_sim.prediction.operators.mc2 import megamoe
+
+    assert megamoe.SUPPORTED_ACTIVATIONS == frozenset({"swiglu", "silu", "gelu"})
+    base_kw = dict(op_id="mm_abi", tokens=4, hidden=128, moe_inter=256, top_k=2,
+                   routed_rows=8.0, w13_bytes=65536.0, w2_bytes=32768.0, ep=2, compute_dtype="fp8_e4m3")
+    with pytest.raises(ModelingError, match="megamoe_arch35_unsupported_activation:situ"):
+        megamoe.make_op(**base_kw, activation="situ")
+    ext = megamoe.make_op(
+        **base_kw, activation="situ", allow_abi_extension=True,
+        activation_params={"activation": "situ", "beta": 4.0, "linear_beta": 25.0},
+    )
+    emeta = dict(ext.metadata)
+    assert emeta["abi_variant_extension"] is True
+    assert emeta["activation_compute_dtype"] == "fp32" and emeta["ub_working_bytes_per_elem"] == 4
+    assert emeta["activation_params"] == {"activation": "situ", "beta": 4.0, "linear_beta": 25.0}
+
+    for track in ("merged", "unmerged_pr", "expected_ideal"):
+        raw = compose_case(
+            "kimi-k3.1", MESH_SKU, dp=4, tp=8, dcp=8, ep=32, layers=4,
+            prompt_tokens=131072, output_tokens=1024, mtp_proposal_tokens=5,
+            feature_track=track, enable_fused_mc2=2,
+        )
+        raw["runtime"]["metadata"].setdefault("additional_config", {})["enable_mega_moe"] = 1
+        graph = target_graphs(raw, phase="decode", tokens=6, context=131072, sequences=8, scope="body")[0]
+        megas = [op for op in graph if op.recipe == "megamoe_arch35"]
+        if track in ("merged", "unmerged_pr"):
+            assert len(megas) == 0
+            protos = [op for op in graph if op.family == "mc2_protocol"]
+            assert protos and all(op.hbm_bytes > 0 and op.link_bytes > 0 for op in protos)
+        else:
+            assert megas and dict(megas[0].metadata)["abi_variant_extension"] is True
+            assert dict(megas[0].metadata)["activation_params"]["beta"] == 4.0
+
+    raw_ds = compose_case(
+        "deepseek-v3.2", MESH_SKU, dp=1, tp=8, ep=8, layers=4,
+        prompt_tokens=2048, output_tokens=64, feature_track="merged",
+        quant="mxfp8_mxfp4", enable_fused_mc2=2,
+    )
+    raw_ds["runtime"]["metadata"].setdefault("additional_config", {})["enable_mega_moe"] = 1
+    g_ds = target_graphs(raw_ds, phase="decode", tokens=1, context=2048, sequences=16, scope="body")[0]
+    ds_megas = [op for op in g_ds if op.recipe == "megamoe_arch35"]
+    assert ds_megas and dict(ds_megas[0].metadata)["abi_variant_extension"] is False

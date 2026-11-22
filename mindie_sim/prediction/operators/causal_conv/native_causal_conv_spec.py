@@ -640,11 +640,35 @@ def make_op(
     }
     semantic = (cfg.cu_seqlen, cfg.dim)
     padded = (padded_tokens, cfg.dim)
+    active_tokens = 0
+    active_seqs = 0
+    for seq in range(cfg.batch):
+        seq_len = cfg.qsl[seq + 1] - cfg.qsl[seq]
+        if seq_len <= 0:
+            continue
+        if cfg.cache_index_present and cfg.cache_indices is not None:
+            cache_idx = cfg.cache_indices[seq]
+            if cache_idx == cfg.pad_slot_id or (
+                cfg.null_block_id is not None and cache_idx == cfg.null_block_id
+            ):
+                continue
+        active_tokens += seq_len
+        active_seqs += 1
+    elem_bytes = _dtype_width(cfg.dtype)
+    conv_reads = float(
+        active_tokens * cfg.dim * elem_bytes
+        + (cfg.width * cfg.dim * elem_bytes if active_tokens > 0 else 0)
+    )
+    conv_writes = float(
+        active_tokens * cfg.dim * elem_bytes
+        + (active_seqs * cfg.history_count * cfg.dim * elem_bytes if cfg.has_conv_states else 0)
+    )
     return OpSpec(
         op_id=f"native-causal-conv1d-fn:T{cfg.cu_seqlen}:D{cfg.dim}:W{cfg.width}",
         family="causal_conv1d_fn", phase="prefill", stage=0, layer=0,
         requests=(), semantic_shape=semantic, local_shape=semantic,
         padded_shape=padded, launch_shape=padded, dtype=cfg.dtype,
+        hbm_bytes=conv_reads + conv_writes, mte2_bytes=conv_reads, mte3_bytes=conv_writes,
         recipe=IMPLEMENTATION, source_boundary="kernel", layout="TN", metadata=tuple(sorted(metadata.items())),
         notes=("source-selected arch35 runMode=0 varlen FN",),
     )

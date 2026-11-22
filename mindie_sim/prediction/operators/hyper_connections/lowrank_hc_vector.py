@@ -25,6 +25,7 @@ LOWRANK_HC_RECIPES: tuple[str, ...] = (
 REGBASE_UB_MIN_BYTES = 248 * 1024
 LOWRANK_HC_STRIDED_HBM_EFF = 0.14
 LOWRANK_HC_SETUP_MS = 0.053
+FP32_WORKING_BYTES = 4
 
 
 def _is_regbase_capable(geometry: Geometry) -> bool:
@@ -81,6 +82,8 @@ def _build_fused_ub_resident_hc(op: OpSpec, geometry: Geometry, base: Work) -> O
         "execution_class": "vector_aiv",
         "hc_variant": str(op.recipe),
         "fused_ub_resident": True,
+        "ub_compute_dtype": "fp32",
+        "ub_working_bytes_per_elem": FP32_WORKING_BYTES,
     })
 
 
@@ -141,6 +144,8 @@ def build_lowrank_hc_vector(op: OpSpec, geometry: Geometry) -> OperatorPlan:
     return OperatorPlan(base, program, {
         "execution_class": "vector_aiv",
         "hc_variant": str(op.recipe),
+        "ub_compute_dtype": "fp32",
+        "ub_working_bytes_per_elem": FP32_WORKING_BYTES,
     })
 
 
