@@ -268,8 +268,8 @@ from _support.axes import COMPOSITE_ACCURACY_CAPTURES as CAPTURES  # noqa: E402
 
 PIPELINE = (("kimi-k3", 2), ("glm-5.3", 4), ("deepseek-v4-pro", 4), ("qwen3.5-397b-a17b", 2))
 
-MC2_PLAIN_REF_MS = 0.7761500723861844
-MC2_SCHEDULED_REF_MS = 1.2135945764501508
+MC2_PLAIN_REF_MS = 0.6295117032070006
+MC2_SCHEDULED_REF_MS = 1.0628817021101824
 
 def _rel(actual: float, measured: float) -> float:
     return abs(actual - measured) / measured

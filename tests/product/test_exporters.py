@@ -635,12 +635,9 @@ def test_agent_brief_digest_and_static_launch_script_audit(tmp_path):
     brief = build_agent_brief(b_bef, b_aft, script_audit=audit_rep.to_dict())
     assert brief["schema"] == AGENT_BRIEF_SCHEMA
     cb = brief["scenario_and_parallelism"].get("calibration_basis")
-    assert isinstance(cb, dict) and isinstance(cb.get("calibrated"), bool)
-    assert cb.get("mode") in {
-        "calibrated_primitive_table",
-        "calibrated_primitive_table_rescaled",
-        "datasheet_declaration",
-    }
+    assert isinstance(cb, dict) and cb.get("calibrated") is True
+    assert cb.get("pt_sku") == "Ascend950DT_9582"
+    assert cb.get("mode") in {"calibrated_primitive_table", "calibrated_primitive_table_rescaled"}
     assert brief["kpis_before_vs_after"]["saved_step_ms"] == pytest.approx(
         brief["kpis_before_vs_after"]["sheet4_cards_total_gain_ms"], abs=0.01,
     )

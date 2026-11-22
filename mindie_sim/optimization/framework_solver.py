@@ -316,9 +316,10 @@ class _TrialSearch:
                     if _wall(result) < _wall(self.best_eval):
                         self.seed(plan, result)
                 else:
-                    self.rejected += 1
                     if result is not None:
                         self.rejection_reasons["finalize_gate_failed"] += 1
+                    else:
+                        self.rejection_reasons["finalize_error"] += 1
 
     def stage(self, stage_id, plans, limit):
         from mindie_sim.rewrite.schema import plan_sha256

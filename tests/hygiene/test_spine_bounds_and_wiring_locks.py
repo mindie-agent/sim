@@ -273,7 +273,12 @@ def test_lock5_k2_k3_autogeneration_and_search_stats_disclosure():
         == report.search_stats.generated_candidates
     )
     assert not report.search_stats.rejected_candidates or bool(report.search_stats.rejection_reasons)
-    assert isinstance(report.primitive_coverage_gaps, tuple) and report.primitive_coverage_gaps
+    assert isinstance(report.primitive_coverage_gaps, tuple)
+    unmeasured_table = load_primitives("Ascend950PR_9579")
+    case_gap = compose_case("deepseek-v4-flash", hardware="Ascend950PR_9579", tp=1, layers=1)
+    gap_report = api.optimize_ladder(case_gap, StepRequest("decode", context=DECODE_CTX),
+                                     primitive_table=unmeasured_table, max_trials=1)
+    assert isinstance(gap_report.primitive_coverage_gaps, tuple) and gap_report.primitive_coverage_gaps
 
     spine = PredictionSpine()
     case_qwen = compose_case("qwen3-32b", hardware=SKU_A5, tp=4, layers=1, quant="bf16")

@@ -128,7 +128,8 @@
       "cann_version": "9.3.0",
       "capture_uri": "capture://a5-9582-ep/live-a5-9582-cann930-20261123/59948ea79cb4dda2337067447cbcdb9dfe4da3ffe4c7c736925930db23a81ace",
       "compatible_skus": [
-        "Ascend950DT_9582"
+        "Ascend950DT_9582",
+        "Ascend950DT_9581"
       ],
       "coverage_summary": {
         "calibrated_metrics": 48,

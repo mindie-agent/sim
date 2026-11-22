@@ -161,7 +161,11 @@ def test_sealed_envelopes_match_manifest_and_preserve_calibrated_rate_bounds():
     for sku, entry in entries.items():
         path = PRIMITIVES_DIR / entry["file"]
         cap = PRIMITIVES_DIR / "captures" / f"{path.stem}.capture.json"
-        assert entry["compatible_skus"] == [sku] and cap.is_file() and not PRIVATE_SOURCE.search(cap.read_text(encoding="utf-8"))
+        assert sku in entry["compatible_skus"] and cap.is_file() and not PRIVATE_SOURCE.search(cap.read_text(encoding="utf-8"))
+        if sku == "Ascend950DT_9582":
+            assert entry["compatible_skus"] == ["Ascend950DT_9582", "Ascend950DT_9581"]
+        else:
+            assert entry["compatible_skus"] == [sku]
         assert entry["capture_uri"].endswith("/" + hashlib.sha256(cap.read_bytes()).hexdigest())
         encoded = path.read_text(encoding="utf-8")
         assert not PRIVATE_SOURCE.search(encoded), sku
@@ -176,8 +180,10 @@ def test_sealed_envelopes_match_manifest_and_preserve_calibrated_rate_bounds():
             for band in _bands({"metrics": cell.metrics, "modes": cell.modes}):
                 if band.bound_kind == "rate_upper" and band.p50 is not None:
                     assert 0 < band.p50 <= band.p99 <= band.certified_upper_capacity and band.cv_pct <= 5.0
+    compat = load_primitives(REPRESENTATIVE_SKUS["a5"], datapath=_datapath(REPRESENTATIVE_SKUS["a5"]))
+    assert compat.sku == "Ascend950DT_9582" and compat.provenance.calibrated is True
     with pytest.raises(ModelingError, match="^primitive_table_sku_unknown_or_ambiguous:"):
-        load_primitives(REPRESENTATIVE_SKUS["a5"], datapath=_datapath(REPRESENTATIVE_SKUS["a5"]))
+        load_primitives("Ascend910_9392", datapath=_datapath("Ascend910_9392"))
 
 @pytest.mark.parametrize("field", ("sku", "cann_version", "calibrated", "metric"))
 def test_full_envelope_digest_detects_mutation_and_manifest_rejects_resealing(tmp_path, field, register_device):

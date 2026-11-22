@@ -64,10 +64,8 @@ MAX_SOURCE_REF_SUMMARY_LEN = 160
 MXFP_GROUP_SIZE = 32
 KV_QUANT_GROUP_SIZE = 128
 #: Element width and per-channel auxiliary storage constants in bytes.
-BF16_BYTES = 2
-FP32_BYTES = 4
-C8_INDEX_SCALE_BYTES = 2
-FP8_INDEX_SCALE_BYTES = 4
+BF16_BYTES, FP32_BYTES = 2, 4
+C8_INDEX_SCALE_BYTES, FP8_INDEX_SCALE_BYTES = 2, 4
 INT8_CHANNEL_AUX_BYTES = 8
 INT4_CHANNEL_AUX_BYTES = 16
 #: Resource tuple slot count for single-op / whole-step Lean L* certificates.

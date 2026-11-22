@@ -164,6 +164,7 @@ class Topology(_TopologyPlansMixin):
         self.p18_startup_us = 0.0
         self.p18_eager_startup_us = 0.0
         self._p18_link_bytes_per_ms = 0.0
+        self._p18_cap_bytes_per_ms = 0.0
         self._p18_measured_scope = ""
         self._p18_measured_collective = ""
         self._p18_measured_world_size = 0
@@ -229,7 +230,14 @@ class Topology(_TopologyPlansMixin):
         if self._p18_link_bytes_per_ms > 0.0:
             p18_scope = self._p18_measured_scope or ("package" if self._dies_per_package >= 2 else "node")
             for name, link in list(self.links.items()):
-                if self._link_scope.get(name) == p18_scope and link.capacity_bytes_per_ms > self._p18_link_bytes_per_ms:
+                if (
+                    self._link_scope.get(name) == p18_scope
+                    and link.capacity_bytes_per_ms > self._p18_link_bytes_per_ms
+                    and (
+                        self._p18_cap_bytes_per_ms <= 0.0
+                        or link.capacity_bytes_per_ms <= self._p18_cap_bytes_per_ms
+                    )
+                ):
                     self.links[name] = replace(link, capacity_bytes_per_ms=self._p18_link_bytes_per_ms)
         self._ordered_links = tuple(sorted(
             self.links.values(),
@@ -324,6 +332,10 @@ class Topology(_TopologyPlansMixin):
             lb = self._sealed_metric_p50(p18, "link_bytes_per_s")
             if lb > 0.0:
                 self._p18_link_bytes_per_ms = lb / MS_PER_S
+                band = (p18.metrics or {}).get("link_bytes_per_s")
+                cap = float(getattr(band, "certified_upper_capacity", 0.0) or 0.0)
+                if cap > 0.0:
+                    self._p18_cap_bytes_per_ms = cap / MS_PER_S
             sb = self._sealed_metric_p50(p18, "startup_blocked_ns")
             if sb > 0.0:
                 self.p18_startup_us = sb / NS_PER_US_TOPO
