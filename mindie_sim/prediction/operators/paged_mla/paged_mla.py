@@ -19,6 +19,9 @@ from mindie_sim.prediction.program import (
     PipelineTemplateProgram, Stage,
 )
 from .paged_mla_dispatch import Dispatch
+from mindie_sim.prediction.operators.matrix.refill_steady import (
+    PeriodicPipelineSpec, compact_periodic_peer_group, compact_periodic_pipeline,
+)
 from mindie_sim.prediction.operators.paged_mla import paged_mla_host_v2
 
 IMPLEMENTATION = 'ascend_paged_mla_decode_arch35'
@@ -258,7 +261,7 @@ def _plan(spec, cores):
         allocations = tuple(ctx.allocate(f'{pool}_{owner}', pool, size,
                             tuple(range(2*owner,2*owner+2)) if pool == 'ub' else (owner,))
                             for owner in range(active) for pool, size in BUFFERS.items())
-        producers = _producer_group(by_owner, spec, stage)
+        producers = _producer_group(ctx, by_owner, spec, stage)
         return KernelProgram((Stage('reserve', acquire=allocations),
             Stage('producers', after=('reserve',), program=ParallelProgram(producers)),
             Stage('merge', after=('producers',), program=ParallelProgram(tuple(merged))),
@@ -282,7 +285,77 @@ def _plan(spec, cores):
     })
 
 
-def _producer_group(by_owner, spec, stage):
+_DEPTH2_RELEASES = frozenset({
+    'score_release0', 'score_release1', 'partial_release0', 'partial_release1',
+})
+_SUPER_SLOTS = 2
+_SUPER_COMPACT_MIN_TILES = 68
+
+
+def _super_step_stages(pipe, super_idx: int):
+    i0, i1 = 2 * super_idx, 2 * super_idx + 1
+    out = []
+    e_names = []
+    for st in pipe.tile(i0):
+        prev = []
+        if super_idx > 0:
+            for p in st.previous:
+                prev.append(('e_' if p in _DEPTH2_RELEASES else 'o_') + p)
+        name = 'e_' + st.name
+        e_names.append(name)
+        out.append(replace(
+            st, name=name,
+            after=tuple('e_' + a for a in st.after),
+            previous=tuple(prev),
+        ))
+    out.append(Stage('e_done', after=tuple(e_names)))
+    if i1 < pipe.count:
+        for st in pipe.tile(i1):
+            after = ['o_' + a for a in st.after]
+            prev = ['e_done'] if (super_idx > 0 and not st.after) else []
+            for p in st.previous:
+                if p in _DEPTH2_RELEASES:
+                    if super_idx > 0:
+                        prev.append('o_' + p)
+                else:
+                    after.append('e_' + p)
+            out.append(replace(
+                st, name='o_' + st.name,
+                after=tuple(dict.fromkeys(after)),
+                previous=tuple(dict.fromkeys(prev)),
+            ))
+    return tuple(out)
+
+
+def _producer_group(ctx, by_owner, spec, stage):
+    if by_owner and all(len(jobs) == 1 and jobs[0][2] >= _SUPER_COMPACT_MIN_TILES for jobs in by_owner):
+        raw_pipes = [
+            _job_pipeline(owner, jobs[0], spec, stage)
+            for owner, jobs in enumerate(by_owner)
+        ]
+        peer_specs = [
+            PeriodicPipelineSpec(
+                (p.count + 1) // 2, _SUPER_SLOTS,
+                lambda s, p=p: _super_step_stages(p, s),
+                head=1, tail=2,
+            )
+            for p in raw_pipes
+        ]
+        compacted = compact_periodic_peer_group(ctx, peer_specs, compactor=compact_periodic_pipeline)
+        if all(isinstance(prog, KernelProgram) for prog in compacted):
+            def single_job(owner, job, comp_prog):
+                begin, end = _ends(spec, job)
+                return PipelineProgram(1, 1, lambda _: (Stage('job', program=KernelProgram((
+                    stage('query', begin, owner),
+                    Stage('tiles', after=('query',), program=comp_prog),
+                    stage('output', end, owner, after=('tiles',)),
+                ))),))
+
+            return tuple(
+                single_job(owner, jobs[0], comp_prog)
+                for owner, (jobs, comp_prog) in enumerate(zip(by_owner, compacted))
+            )
+
     def producer(owner, jobs):
         def job_program(index):
             job = jobs[index]

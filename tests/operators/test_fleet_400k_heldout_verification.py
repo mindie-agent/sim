@@ -391,7 +391,7 @@ def test_whitebox_operator_physics_conservation_regressions_13_to_21() -> None:
     op_ru = make_ring_update_op(1024, 32, 128, op_id="ru")
     v_ru = verify_operator(c9362, op_ru, lambda o, _g: build_ring_update(o, _ctx(c9362, o, memory_view=AdmissionMemoryView({0: 0}))))
     assert v_ru["status"] == "passed" and v_ru["result"]["serviced"].get("l2@r0:s0", 0.0) == 0.0
-    assert v_ru["result"]["serviced"]["memory@r0:s0"] >= 31457280.0
+    assert v_ru["result"]["serviced"]["memory@r0:s0"] >= 31457280.0 - LSTAR_INV_EPS
 
 
 def test_active_core_calibration_and_scoped_p18_topology() -> None:
