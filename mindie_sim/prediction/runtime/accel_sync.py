@@ -74,6 +74,8 @@ def reclaim_arena(backend, engine) -> None:
     backend.deliver.clear()
     backend.drops.clear()
     backend.external.clear()
+    backend.callback_marks.clear()
+    backend.touched_res_ids.clear()
     backend.usage = {
         event.sequence: task_usage(engine, task, pending)
         for event, task, pending in backend.pending}
@@ -98,6 +100,9 @@ def flush_pending(backend, engine) -> None:
     if backend.external:
         backend.arena.call("msim_ctx_mark_external", backend.external)
         backend.external.clear()
+    if backend.callback_marks:
+        backend.arena.call("msim_ctx_mark_callback", backend.callback_marks)
+        backend.callback_marks.clear()
     if backend.drops:
         backend.arena.call("msim_ctx_drop", backend.drops)
         backend.drops.clear()
@@ -109,15 +114,18 @@ def flush_pending(backend, engine) -> None:
         if backend.deliver:
             deliver_slots(backend)
         return
-    index = {name: i for i, name in enumerate(backend.res_names)}
+    index = backend.res_index
+    touched = backend.touched_res_ids
     slots = engine._native_slots
     rows = []
     for event, task, pending in backend.pending:
         wset = set(task.cohort_widened) if (task.cohort_size > 1 and task.cohort_widened) else ()
         links = []
         for name, remaining in task.remaining.items():
+            rid = index[name]
+            touched.add(rid)
             units = task.placement.get(name, ()) if task.placement else ()
-            links.append((index[name], remaining,
+            links.append((rid, remaining,
                           task.caps.get(name, math.inf), units, name in wset))
         flags = task_flags(task, engine)
         task.waiting = sum(
@@ -163,6 +171,9 @@ def drain_output(backend, engine) -> int:
     backend.draining = True
     try:
         while backend.enabled or backend.pending_handback:
+            if backend.callback_marks:
+                backend.arena.call("msim_ctx_mark_callback", backend.callback_marks)
+                backend.callback_marks.clear()
             try:
                 now, boundary, steps, ncomp, nstart = backend.arena.run(
                     engine.now, engine.now, engine._frontier_next_release(), 0)
@@ -251,10 +262,11 @@ def can_rearm(backend, engine) -> bool:
         return False
     if engine._inline_blocked:
         return False
-    if engine._sequence < REARM_MIN_TASKS:
+    min_tasks = getattr(backend, "min_tasks", REARM_MIN_TASKS)
+    if engine._sequence < min_tasks:
         return False
     return (engine._sequence >= backend.rearm_after
-            and len(engine._tasks) >= REARM_MIN_TASKS)
+            and len(engine._tasks) >= min_tasks)
 
 
 def solver_capacity_exceeded(tasks: int, links: int, units: int,
@@ -345,6 +357,12 @@ def adopt_frontier(backend, engine, skip: int) -> bool:
         for successor in task.event._waiters:
             if successor in predecessors:
                 predecessors[successor].append(task.event)
+    for promise in engine._promises.values():
+        if promise.done:
+            continue
+        for successor in promise._waiters:
+            if successor in predecessors:
+                predecessors[successor].append(promise)
     for task in items:
         if task.waiting != len(predecessors[task.event.sequence]):
             return False
@@ -470,6 +488,8 @@ def sync_back(backend, engine) -> None:
     backend.deliver.clear()
     backend.drops.clear()
     backend.external.clear()
+    backend.callback_marks.clear()
+    backend.touched_res_ids.clear()
     backend.engine_slots = engine._native_slots
     backend.live = 0
     backend.deps.clear()

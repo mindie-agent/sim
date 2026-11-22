@@ -48,6 +48,7 @@ SOURCE_NAMES = (
     "_engine_accel.c",
     "_engine_accel_abi.h",
     "_engine_accel_core.h",
+    "_engine_accel_coupled.h",
     "_engine_accel_rates.h",
     "_engine_accel_submit.h",
     "_engine_accel_terms.h",
@@ -66,6 +67,8 @@ _BASE_FLAGS = (
     "-std=c11", "-O3", "-fPIC", "-fno-fast-math", "-ffp-contract=off",
     "-fno-strict-aliasing",
 )
+_MSVC_FLAGS = ("/nologo", "/std:c11", "/O2", "/fp:precise", "/LD")
+_MSVC_STEM = "cl"
 _STATUS_MEMO: dict[tuple, dict] = {}
 _IDENTITY_MEMO: dict[tuple, str] = {}
 _MEMO_LOCK = threading.Lock()
@@ -107,8 +110,14 @@ def source_bytes() -> bytes:
     return source_snapshot()[0]
 
 
-def compiler_flags() -> list[str]:
+def _is_msvc(compiler: str | None) -> bool:
+    return bool(compiler) and Path(compiler).stem.lower() == _MSVC_STEM
+
+
+def compiler_flags(compiler: str | None = None) -> list[str]:
     """Exact deterministic flags; never ``-march=native`` or fast-math."""
+    if _is_msvc(compiler):
+        return list(_MSVC_FLAGS)
     flags = [f for f in _BASE_FLAGS if not (os.name == "nt" and f == "-fPIC")]
     if sys.platform == "darwin":
         flags.extend(("-dynamiclib", "-lm"))
@@ -142,7 +151,7 @@ def discover_compiler() -> tuple[str | None, str | None]:
         if found is None:
             return None, "compiler_unavailable:configured_override_missing"
         return found, None
-    candidates = ("gcc", "clang", "cc") if os.name == "nt" else ("cc", "clang", "gcc")
+    candidates = ("gcc", "clang", "cc", _MSVC_STEM) if os.name == "nt" else ("cc", "clang", "gcc")
     for candidate in candidates:
         found = shutil.which(candidate)
         if found is not None:
@@ -215,8 +224,9 @@ def _compiler_identity(compiler: str, *, persist: bool = False) -> str:
             pass
     version = "unknown"
     try:
+        probe_argv = [resolved] if _is_msvc(resolved) else [resolved, "--version"]
         completed = subprocess.run(
-            [resolved, "--version"], capture_output=True, text=True,
+            probe_argv, capture_output=True, text=True,
             timeout=PROBE_TIMEOUT_SECONDS, check=False, **_SUBPROCESS_KWARGS)
         lines = (completed.stdout or completed.stderr or "").splitlines()
         if lines:
@@ -408,7 +418,14 @@ def _publish(compiler: str, flags: list[str], destination_dir: Path,
             raise
         except OSError as error:
             return False, f"cache_directory_unwritable:{error}", None
-        command = [compiler, *flags, "-o", str(temporary), str(snapshot)]
+        if _is_msvc(compiler):
+            obj_path = snapshot_dir / "accel.obj"
+            command = [
+                compiler, *flags, str(snapshot),
+                f"/Fe:{temporary}", f"/Fo:{obj_path}",
+            ]
+        else:
+            command = [compiler, *flags, "-o", str(temporary), str(snapshot)]
         try:
             completed = subprocess.run(
                 command, capture_output=True, text=True,
@@ -502,7 +519,7 @@ def _memo_key(digest: bytes, compiler: str | None,
     """
     return (
         digest, str(cache_root()), compiler, identity,
-        tuple(compiler_flags()),
+        tuple(compiler_flags(compiler)),
     )
 
 
@@ -547,7 +564,7 @@ def build_accel(*, check_only: bool = False, force: bool = False) -> dict:
         with _MEMO_LOCK:
             _STATUS_MEMO[key] = status
         return dict(status)
-    flags = compiler_flags()
+    flags = compiler_flags(compiler)
     digest = cache_digest(data, compiler, flags, identity)
     digest_hex = digest.hex() if isinstance(digest, bytes) else digest
     existing = _read_manifest(digest_hex)

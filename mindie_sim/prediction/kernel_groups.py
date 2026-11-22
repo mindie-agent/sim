@@ -185,11 +185,13 @@ class KernelGroups:
                     if allocations else group.ready)
         engine.submit(stem + ":startup", after=(admitted,), latency=startup_ms,
                       owner=self.owner,
-                      on_complete=lambda _, event=group.startup: engine.resolve(event))
+                      on_complete=lambda _, event=group.startup: engine.resolve(event),
+                      native_hook=True)
         dependencies = list(group.finishes)
         if minimum_ms:
             dependencies.append(engine.submit(stem + ":minimum", after=(admitted,),
                                                latency=minimum_ms, owner=self.owner))
         engine.submit(stem + ":retire", after=tuple(dependencies), free=allocations, owner=self.owner,
-                      on_complete=lambda _, event=group.completion: engine.resolve(event))
+                      on_complete=lambda _, event=group.completion: engine.resolve(event),
+                      native_hook=True)
         return group.completion

@@ -70,6 +70,10 @@ path = "runtime/test_engine_accel_handback.py"
 tier = "tier0"
 owns = ["mindie_sim/prediction/runtime/accel_bridge.py", "mindie_sim/prediction/runtime/accel_sync.py"]
 [[module]]
+path = "runtime/test_engine_accel_fast_coupled.py"
+tier = "tier0"
+owns = ["mindie_sim/prediction/runtime/arbiter_fast_coupled.py", "mindie_sim/prediction/runtime/_engine_accel_coupled.h", "mindie_sim/prediction/runtime/dp_cohort_dedup.py"]
+[[module]]
 path = "runtime/test_coupled_and_periodic.py"
 tier = "tier0"
 owns = ["mindie_sim/prediction/coupled.py", "mindie_sim/prediction/primitives.py"]
@@ -129,6 +133,10 @@ owns = ["mindie_sim/observations/resource_services.py", "mindie_sim/prediction/c
 path = "runtime/test_remote_exec.py"
 tier = "tier0"
 owns = ["mindie_sim/remote_exec.py", "mindie_sim/_remote_worker.py"]
+[[module]]
+path = "runtime/test_remote_exec_batch.py"
+tier = "tier1"
+owns = ["mindie_sim/remote_exec.py", "mindie_sim/_remote_worker.py", "mindie_sim/prediction/runtime/accel_build.py", "mindie_sim/prediction/runtime/accel_loader.py"]
 [[module]]
 path = "runtime/test_formal_lean_locks.py"
 tier = "tier0"

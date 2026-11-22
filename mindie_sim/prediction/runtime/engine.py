@@ -158,6 +158,7 @@ class Engine(
         self._wave_recorder = None
         self._admission_memory_view = None
         self._allocation_versions: dict[str, int] = {}
+        self._resource_version: int = 0
         self._hbm_bus_aliases: dict[str, Any] = {}
         self._hbm_bus_epoch: int = 0
         self._hbm_acct_live: int = 0
@@ -229,7 +230,7 @@ class Engine(
         return self._releases[0][0] if self._releases else math.inf
 
     def _native_deliver(self, sequence: int) -> None:
-        if self._accel is not None:
+        if self._accel is not None and sequence in self._native_slots:
             self._accel.deliver.append(sequence)
 
     def _complete_native(self, task: _Task, moment: float) -> None:
@@ -306,8 +307,10 @@ class Engine(
             self._alloc_state_version += 1
         self._seen_floor_peaks.clear()
         self._clear_prepared_caches()
-        if added_resource and _discover_hbm:
-            self._discover_hbm_bus_aliases()
+        if added_resource:
+            self._resource_version += 1
+            if _discover_hbm:
+                self._discover_hbm_bus_aliases()
         if (added_resource and self._accel is not None
                 and self._accel.enabled
                 and not self._tasks and not self._native_slots):
@@ -366,10 +369,18 @@ class Engine(
         ledger = memory if memory is not None else self.memory
         if ledger is not None:
             self._memory_ledgers[id(ledger)] = ledger
-        pools_frozen = (
-            pools if pools.__class__ is frozenset
-            else frozenset(str(pool) for pool in pools)
-        )
+        if pools.__class__ is frozenset:
+            pools_frozen = pools
+        else:
+            pool_key = tuple(sorted({str(pool) for pool in pools}))
+            if not pool_key:
+                pools_frozen = _EMPTY_FROZENSET
+            else:
+                pools_frozen = self._engine_pool_sets.get(pool_key)
+                if pools_frozen is None:
+                    pools_frozen = frozenset(pool_key)
+                    self._engine_pool_sets[pool_key] = pools_frozen
+                    self._engine_pool_set_ids.add(id(pools_frozen))
         norm_bindings = dict(bindings) if bindings else {}
         rep_i = int(replica)
         stg_i = int(stage)
@@ -405,7 +416,8 @@ class Engine(
             self.resources, self._tasks, self._active,
             coupled_solver=coupled_rates,
             coupled_active=self._coupled_active,
-            placed_active=self._placed_active)
+            placed_active=self._placed_active,
+            allow_native=self._accel is not None)
 
     def advance(
         self, *, until: Sequence[Event] = (), horizon: float = math.inf,

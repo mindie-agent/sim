@@ -211,6 +211,11 @@ typedef struct msim_ctx {
     int32_t cheap_n, cheap_cap;
     int32_t *act;
     int32_t act_n, act_cap;
+    int32_t *new_ready;
+    int32_t new_ready_n, new_ready_cap;
+    int32_t *act_res;
+    uint8_t *res_seen;
+    int32_t res_seen_cap;
     /* Mirrored successor edges (head per predecessor slot). */
     int32_t *sidx;
     int32_t *snext;
@@ -433,6 +438,7 @@ static void msim_ctx_release(msim_ctx *c)
     free(c->res); free(c->busy); free(c->serv);
     free(c->task); free(c->free); free(c->link); free(c->units);
     free(c->heap); free(c->rheap); free(c->cheap); free(c->act);
+    free(c->new_ready); free(c->act_res); free(c->res_seen);
     free(c->sidx); free(c->snext); free(c->sseq);
     free(c->idx); free(c->gid); free(c->rep); free(c->pend); free(c->surv);
     free(c->fifo_first); free(c->uhead); free(c->unext); free(c->uflow);

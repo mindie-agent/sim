@@ -555,7 +555,7 @@ class Execution(_ContextMixin, _CohortMixin, _LazySubmitMixin):
                 source_send=source_send,
                 send_placeholders=send_placeholders,
                 resource_names=native_resources, transport=transport)
-            engine.on_complete(finish, finished)
+            engine.on_complete(finish, finished, native_hook=True)
 
         def begin_with_binding(event):
             with engine.memory_scope(

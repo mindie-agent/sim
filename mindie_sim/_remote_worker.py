@@ -10,25 +10,31 @@
 """
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from contextlib import contextmanager, nullcontext, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+import importlib
 import inspect
 import json
 import math
 import multiprocessing as mp
 import os
 from pathlib import Path
+import pickle
+import re
 import shutil
 import sys
 import tempfile
 import threading
 import time
+from typing import Any
 
 from mindie_sim.remote_exec import (
-    ENTRYPOINTS, FILE_LIMIT, MANIFEST, PRIVATE_DIR, PROTOCOL_VERSION, READY, REQUEST_LIMIT,
-    RESULT_LIMIT, UUID_TOKEN, WORKER_MEMORY_MIB, _active_leases,
+    AUTO_REMOTE_BATCH_THRESHOLD, ENTRYPOINTS, JOB_TIMEOUT, MANIFEST,
+    PRIVATE_DIR, PROTOCOL_VERSION, READY, REQUEST_LIMIT, RESULT_LIMIT,
+    UUID_TOKEN, WORKER_MEMORY_MIB, RemoteDispatcher, RemoteExecPolicy,
+    RemoteExecReceipt, RemoteExecUnavailableError, _active_leases,
     _boot, _bounded_read, _exchange, _pin,
     _canonical, _create_lease, _digest_lock, _lock, _manifest, _native_root,
     _private_dir, _remaining, _safe_path, size_remote_workers, verify_staged_manifest,
@@ -39,6 +45,15 @@ MIN_SHM_BYTES = 256 * 1024 * 1024
 MIN_PYTHON = (3, 11)
 DEFAULT_PRIMITIVE_MANIFEST = "data/primitives/manifest.json"
 ENV_LOCK = threading.RLock()
+_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\Z")
+_REMOTE_MODE_ALIASES = {
+    "off": "local",
+    "local": "local",
+    "auto": "auto",
+    "prefer_remote": "prefer_remote",
+    "require": "remote",
+    "remote": "remote",
+}
 
 @dataclass(frozen=True, slots=True)
 class RemoteBatchRequest:
@@ -153,8 +168,8 @@ def _probe_remote(endpoint, policy):
               + inspect.getsource(_linux_capacity) + _PROBE)
     return pinned, json.loads(_exchange(pinned, _boot(source), b"", _remaining(deadline)))
 def _local_ready():
-    from mindie_sim.prediction.runtime.accel_loader import cached_library_ready
-    return cached_library_ready()
+    from mindie_sim.prediction.runtime.accel_loader import toolchain_or_cache_ready
+    return toolchain_or_cache_ready()
 
 @contextmanager
 def _worker_environment(stage):
@@ -289,6 +304,39 @@ def _lowering(raw):
         for row in fields.get("declared_ops", ())
     )
     return LoweringRequest(**fields)
+def _resolve_batch_callable(module_name: str, qualname: str) -> Callable[[Any], Any]:
+    """Resolve a module-level callable strictly inside ``mindie_sim.*``."""
+    if not isinstance(module_name, str) or not isinstance(qualname, str):
+        raise ValueError("invalid_batch_callable")
+    if not module_name.startswith("mindie_sim.") or ".." in module_name:
+        raise ValueError("unauthorized_batch_module")
+    if not all(_IDENT_RE.fullmatch(part) for part in module_name.split(".")):
+        raise ValueError("invalid_batch_module_name")
+    if not _IDENT_RE.fullmatch(qualname) or qualname.startswith("__"):
+        raise ValueError("invalid_batch_function_name")
+    mod = importlib.import_module(module_name)
+    target = getattr(mod, qualname, None)
+    if not callable(target):
+        raise ValueError("batch_target_not_callable")
+    return target
+
+
+def _decode_primitive_table(table):
+    if table.get("kind") == "primitive_table":
+        from mindie_sim.primitives.schema import parse_primitive_table
+
+        parsed = parse_primitive_table(table["envelope"])
+        # The loader attaches warnings outside the digested envelope.
+        object.__setattr__(parsed, "warnings", tuple(table.get("warnings", ())))
+        return parsed
+    from mindie_sim.optimization.contracts import PrimitiveCapacityEntry, PrimitiveCapacityTable
+
+    return PrimitiveCapacityTable(
+        sku=table["sku"],
+        entries=tuple(PrimitiveCapacityEntry(**entry) for entry in table["entries"]),
+    )
+
+
 def _candidate(entrypoint, base, candidate, deadline):
     from mindie_sim.prediction.evaluation import ACTIVE_DEADLINE_MONO, check_active_deadline
     from mindie_sim.prediction.results import ReplayOptions, SlaRequest, SweepRequest, json_payload
@@ -296,6 +344,11 @@ def _candidate(entrypoint, base, candidate, deadline):
     from mindie_sim.schema.case import Case
 
     _remaining(deadline)
+    if entrypoint == "batch_call":
+        fn = _resolve_batch_callable(candidate["module"], candidate["qualname"])
+        result = fn(candidate["payload"])
+        return {"candidate_id": candidate["candidate_id"], "objective_key": candidate["objective_key"],
+                "result": json_payload(result)}
     token = ACTIVE_DEADLINE_MONO.set(deadline)
     try:
         case = Case.from_mapping(candidate.get("case", base))
@@ -318,19 +371,7 @@ def _candidate(entrypoint, base, candidate, deadline):
         else:
             options = dict(candidate.get("options", {}))
             if (table := options.get("primitive_table")) is not None:
-                if table.get("kind") == "primitive_table":
-                    from mindie_sim.primitives.schema import parse_primitive_table
-
-                    parsed = parse_primitive_table(table["envelope"])
-                    # The loader attaches warnings outside the digested envelope.
-                    object.__setattr__(parsed, "warnings", tuple(table.get("warnings", ())))
-                    options["primitive_table"] = parsed
-                else:
-                    from mindie_sim.optimization.contracts import PrimitiveCapacityEntry, PrimitiveCapacityTable
-
-                    options["primitive_table"] = PrimitiveCapacityTable(
-                        sku=table["sku"], entries=tuple(PrimitiveCapacityEntry(**entry) for entry in table["entries"]),
-                    )
+                options["primitive_table"] = _decode_primitive_table(table)
             result = spine.optimize_ladder(case, _step_request(raw), replay=replay, **options)
         check_active_deadline()
         return {"candidate_id": candidate["candidate_id"], "objective_key": candidate["objective_key"],
@@ -408,6 +449,218 @@ def execute_worker_request(request_payload: Mapping | bytes, *, max_result_bytes
             outputs.close()
     envelope["results"].sort(key=lambda row: (row["objective_key"], row["candidate_id"]))
     return envelope
+
+def _local_pool_initializer() -> None:
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"
+
+
+def _run_local_callable_batch(
+    fn: Callable[[Any], Any],
+    items: Sequence[Any],
+    *,
+    max_workers: int | None,
+    deadline_s: float,
+) -> tuple[list[Any], int]:
+    """Execute ``fn`` over ``items`` locally via bounded ProcessPoolExecutor."""
+    n_items = len(items)
+    if n_items == 0:
+        return [], 1
+    cpus = os.cpu_count() or 1
+    workers = min(n_items, cpus if max_workers is None else max(1, int(max_workers)))
+    if os.name == "nt":
+        workers = min(workers, WINDOWS_POOL_LIMIT)
+    deadline = time.monotonic() + deadline_s
+    can_pool = workers > 1 and _callable_is_picklable(fn)
+    if not can_pool:
+        outputs = []
+        for item in items:
+            _remaining(deadline)
+            outputs.append(fn(item))
+        return outputs, 1
+
+    methods = mp.get_all_start_methods()
+    method = "forkserver" if "forkserver" in methods and sys.platform == "linux" else "spawn"
+    ctx = mp.get_context(method)
+    pool = ProcessPoolExecutor(
+        max_workers=workers, mp_context=ctx, initializer=_local_pool_initializer,
+    )
+    ordered: list[Any] = [None] * n_items
+    try:
+        future_to_idx = {
+            pool.submit(fn, item): idx for idx, item in enumerate(items)
+        }
+        pending = set(future_to_idx)
+        while pending:
+            done, pending = wait(
+                pending, timeout=_remaining(deadline), return_when=FIRST_COMPLETED,
+            )
+            if not done:
+                raise TimeoutError("local_batch_deadline_expired")
+            for fut in done:
+                ordered[future_to_idx[fut]] = fut.result()
+        return ordered, workers
+    except BaseException:
+        for process in (pool._processes or {}).values():
+            with suppress(ProcessLookupError):
+                process.kill()
+        raise
+    finally:
+        pool.shutdown(cancel_futures=True)
+
+
+def _callable_is_picklable(fn: Callable[[Any], Any]) -> bool:
+    try:
+        pickle.dumps(fn)
+        return True
+    except (pickle.PicklingError, AttributeError, TypeError):
+        return False
+
+
+def _remote_callable_spec(fn: Callable[[Any], Any]) -> tuple[str, str] | None:
+    module_name = getattr(fn, "__module__", "")
+    qualname = getattr(fn, "__qualname__", "")
+    if (isinstance(module_name, str) and module_name.startswith("mindie_sim.")
+            and isinstance(qualname, str) and _IDENT_RE.fullmatch(qualname)
+            and not qualname.startswith("__")):
+        return module_name, qualname
+    return None
+
+
+def _normalize_remote_mode(remote: str) -> str:
+    key = str(remote).strip().lower()
+    if key not in _REMOTE_MODE_ALIASES:
+        raise ValueError(f"invalid_remote_mode:{remote}")
+    return _REMOTE_MODE_ALIASES[key]
+
+
+def execute_batch_with_auto_remote(
+    tasks_or_fn: Any,
+    tasks: Sequence[Any] | None = None,
+    *,
+    remote: str = "auto",
+    entrypoint: str | None = None,
+    base_case: Any = None,
+    preferred_alias: str | None = None,
+    authorized_aliases: Sequence[str] = (),
+    max_workers: int | None = None,
+    deadline_s: float = JOB_TIMEOUT,
+    min_remote_batch: int = AUTO_REMOTE_BATCH_THRESHOLD,
+    policy: RemoteExecPolicy | None = None,
+    dispatcher: RemoteDispatcher | None = None,
+    local_executor: Callable[[Sequence[Any]], list[Any]] | None = None,
+    cwd: Path | None = None,
+) -> tuple[list[Any], RemoteExecReceipt]:
+    """Execute a batch over SSH remote CPU workers when eligible, else locally."""
+    if not math.isfinite(deadline_s) or deadline_s <= 0:
+        raise ValueError("invalid execution deadline")
+    target = _normalize_remote_mode(remote)
+
+    if entrypoint is not None:
+        candidates = list(tasks_or_fn if tasks is None else tasks)
+        if not candidates:
+            return [], RemoteExecReceipt(resolved_target="local", effective_workers=1)
+        eff_policy = (
+            replace(policy, target=target)
+            if policy is not None else RemoteExecPolicy(
+                target=target, preferred_alias=preferred_alias,
+                authorized_aliases=tuple(authorized_aliases),
+                max_remote_workers=max_workers, job_timeout_s=deadline_s,
+            )
+        )
+        disp = dispatcher or RemoteDispatcher(eff_policy, cwd=cwd)
+        if target == "auto" and len(candidates) < min_remote_batch and disp._local_ready():
+            local_disp = RemoteDispatcher(
+                replace(disp.policy, target="local"), local_c11_ready_fn=disp._local_ready,
+            )
+            env, _ = local_disp.dispatch_batch(
+                entrypoint, base_case or {}, candidates, deadline_s=deadline_s,
+            )
+            return list(env["results"]), RemoteExecReceipt(
+                resolved_target="local", effective_workers=env.get("effective_workers", 1),
+                accel_mode="c11", fallback_reason="warm_local_c11",
+            )
+        env, receipt = disp.dispatch_batch(
+            entrypoint, base_case or {}, candidates, deadline_s=deadline_s,
+        )
+        return list(env["results"]), receipt
+
+    if not callable(tasks_or_fn):
+        raise TypeError("execute_batch_with_auto_remote requires callable or entrypoint")
+    fn: Callable[[Any], Any] = tasks_or_fn
+    items = list(() if tasks is None else tasks)
+    if not items:
+        return [], RemoteExecReceipt(resolved_target="local", effective_workers=1)
+
+    eff_policy = (
+        replace(policy, target=target)
+        if policy is not None else RemoteExecPolicy(
+            target=target, preferred_alias=preferred_alias,
+            authorized_aliases=tuple(authorized_aliases),
+            max_remote_workers=max_workers, job_timeout_s=deadline_s,
+        )
+    )
+    disp = dispatcher or RemoteDispatcher(eff_policy, cwd=cwd)
+    local_c11 = False
+    try:
+        local_c11 = bool(disp._local_ready())
+    except TimeoutError:
+        raise
+    except (OSError, RuntimeError):
+        local_c11 = False
+
+    fallback_reason: str | None = None
+    try_remote = (
+        target in {"remote", "prefer_remote"}
+        or (target == "auto" and (not local_c11 or len(items) >= min_remote_batch))
+    )
+    if target == "auto" and not try_remote:
+        fallback_reason = "warm_local_c11"
+
+    if try_remote:
+        spec = _remote_callable_spec(fn)
+        if spec is None:
+            if target == "remote":
+                raise RemoteExecUnavailableError("endpoint_configuration")
+            fallback_reason = "endpoint_configuration"
+        else:
+            mod_name, qual_name = spec
+            receipt_probe, endpoint = disp._resolve(len(items))
+            if endpoint is not None:
+                cands = [
+                    {"candidate_id": str(i), "objective_key": i,
+                     "module": mod_name, "qualname": qual_name, "payload": item}
+                    for i, item in enumerate(items)
+                ]
+                env, receipt = disp.dispatch_batch(
+                    "batch_call", {}, cands, deadline_s=deadline_s,
+                )
+                if receipt.resolved_target == "remote":
+                    ordered = [row["result"] for row in env["results"]]
+                    return ordered, receipt
+                fallback_reason = receipt.fallback_reason
+            else:
+                if target == "remote":
+                    raise RemoteExecUnavailableError(
+                        receipt_probe.fallback_reason or "no_authorized_endpoint"
+                    )
+                fallback_reason = receipt_probe.fallback_reason
+
+    if local_executor is not None:
+        return list(local_executor(items)), RemoteExecReceipt(
+            resolved_target="local", effective_workers=1,
+            accel_mode="c11" if local_c11 else "python",
+            fallback_reason=fallback_reason,
+        )
+    results, workers = _run_local_callable_batch(
+        fn, items, max_workers=max_workers, deadline_s=deadline_s,
+    )
+    return results, RemoteExecReceipt(
+        resolved_target="local", effective_workers=workers,
+        accel_mode="c11" if local_c11 else "python",
+        fallback_reason=fallback_reason,
+    )
+
 
 def main(*, ready=False, expected_root=None, max_result_bytes=RESULT_LIMIT):
     request_id = None

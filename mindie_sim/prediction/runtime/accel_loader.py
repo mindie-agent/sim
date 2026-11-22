@@ -120,6 +120,17 @@ def cached_library_ready() -> bool:
     return bool(status.get("library_ready"))
 
 
+def toolchain_or_cache_ready() -> bool:
+    """True when a validated library is cached or a local C compiler exists."""
+    try:
+        status = accel_build.build_accel(check_only=True)
+    except TimeoutError:
+        raise
+    except (OSError, RuntimeError):
+        return False
+    return bool(status.get("library_ready") or status.get("toolchain_ready"))
+
+
 def load_accel_cdll(status: dict | None = None) -> tuple[dict, ctypes.CDLL]:
     """Build (unless supplied) and map under one cache lock.
 

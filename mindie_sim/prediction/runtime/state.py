@@ -193,6 +193,9 @@ class RuntimeState:
         self.memory_pools: set[str] = set()
         #: Frozen view of ``memory_pools``; rebuilt only when the set changes.
         self._memory_pools_frozen: frozenset[str] = _EMPTY_FROZENSET
+        #: Interned Engine-owned pool sets created by ``memory_scope``.
+        self._engine_pool_sets: dict[tuple[str, ...], frozenset[str]] = {}
+        self._engine_pool_set_ids: set[int] = set()
         # Actual granted allocation name -> binding/replica/ledger. The grant
         # stays live until the allocation's real free boundary, not when the
         # acquiring task happens to complete.

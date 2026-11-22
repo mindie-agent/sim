@@ -406,9 +406,10 @@ def _partition_hbm_accounting_for_split(
 def _refresh_prepared_for_hbm_bus(engine, prepared, name: str):
     """Re-prepare cached shipping tasks whenever HBM directional bindings changed."""
     aliases = engine._hbm_bus_aliases
+    if not aliases or prepared.hbm_bus_epoch == engine._hbm_bus_epoch:
+        return prepared
     acct_map = {entry[0]: (entry[1], entry[4]) for entry in prepared.hbm_accounting}
-    if (not aliases or prepared.hbm_bus_epoch == engine._hbm_bus_epoch
-            or (not prepared.demand and not acct_map)):
+    if not prepared.demand and not acct_map:
         return prepared
     if not any(base in prepared.demand or base in acct_map for base in aliases):
         return prepared

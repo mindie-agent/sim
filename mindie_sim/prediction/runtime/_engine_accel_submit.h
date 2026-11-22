@@ -127,7 +127,7 @@ MSIM_EXPORT int32_t msim_ctx_submit(void *ctx, const uint64_t *rows, size_t nrow
                         int32_t *st, size_t nst)
 {
     msim_ctx *c = (msim_ctx *)ctx;
-    size_t i, sum_nlink = 0, need_l, base;
+    size_t i, sum_nlink = 0, need_l, base, ready_cnt = 0;
     if (st != NULL && nst >= 2) { st[0] = 0; st[1] = 0; }
     if (!ctx_ok(c)) return reject(st, nst, MSIM_E_STATE);
     if (nrows == 0) {
@@ -199,6 +199,13 @@ MSIM_EXPORT int32_t msim_ctx_submit(void *ctx, const uint64_t *rows, size_t nrow
         c->sseq = next_sseq;
         c->s_cap = target;
     }
+    for (i = 0; i < nrows; i++) {
+        if ((int64_t)(rows + i * row_stride)[4] == 0) ready_cnt++;
+    }
+    if (ready_cnt > 0 && !msim_grow((void **)&c->new_ready, &c->new_ready_cap,
+                                    c->new_ready_n + (int32_t)ready_cnt,
+                                    sizeof(int32_t)))
+        return reject(st, nst, MSIM_E_RANGE);
     if (nplace > 0 && !msim_grow((void **)&c->units, &c->units_cap,
                                  (int32_t)(c->nu + nplace), sizeof(uint32_t)))
         return reject(st, nst, MSIM_E_RANGE);
@@ -236,6 +243,7 @@ MSIM_EXPORT int32_t msim_ctx_submit(void *ctx, const uint64_t *rows, size_t nrow
         t->first_succ = -1;
         c->idx[i] = slot;
         out_slots[i] = slot;
+        if (t->waiting == 0) c->new_ready[c->new_ready_n++] = slot;
         c->live_n++;
     }
     for (i = 0; i < nrows; i++) {

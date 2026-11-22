@@ -44,6 +44,9 @@ from .accel_tables import (
 #: ``auto`` keeps smaller Engines on pure Python: zero build and marshalling.
 AUTO_MIN_TASKS = 64
 AUTO_GRAPH_MIN_TASKS = 16
+#: Stop re-arming ``auto`` when repeated handbacks average too few C steps/call.
+_THRASH_HANDBACK_LIMIT = 4
+_THRASH_MIN_STEPS_PER_CALL = 8
 #: Frontier-shaped reasons: recoverable in ``auto`` once the boundary drains.
 #: Explicit ``c`` and capability failures stay disabled for the Engine's life.
 _TRANSIENT_AUTO_REASONS = frozenset({
@@ -63,7 +66,7 @@ class NativeBackend:
         "reason", "abi", "native_calls", "native_steps",
         "native_boundaries", "fallbacks", "mode", "enabled",
         "res_names", "pending", "deliver", "drops",
-        "external", "max_tasks", "live", "seeded",
+        "external", "callback_marks", "max_tasks", "live", "seeded",
         "disabled_reason", "error", "made_progress", "engine_slots",
         "dormant", "recoverable", "handing_back", "rearm_after",
         "rearm_failures", "rearm_rejections", "_finalizer", "deps",
@@ -72,7 +75,8 @@ class NativeBackend:
         "epoch_tasks", "epoch_edges", "_engine_finalizer", "__weakref__",
         "applying", "callback_dirty", "coupled_seqs", "pending_handback",
         "draining", "aborted_publication", "needs_settle", "fair_prio",
-        "has_fair_res", "min_tasks",
+        "has_fair_res", "min_tasks", "res_index", "touched_res_ids", "res_version",
+        "handbacks",
     )
     def __init__(self, status: dict | None, mode: str = "auto", *,
                  eager_attach: bool = False) -> None:
@@ -90,10 +94,14 @@ class NativeBackend:
         self.min_tasks = AUTO_GRAPH_MIN_TASKS if mode == "auto" and eager_attach else AUTO_MIN_TASKS
         self.enabled = False
         self.res_names: tuple[str, ...] = ()
+        self.res_index: dict[str, int] = {}
+        self.touched_res_ids: set[int] = set()
+        self.res_version: int = -1
         self.pending: list = []
         self.deliver: list[int] = []
         self.drops: list[int] = []
         self.external: list[int] = []
+        self.callback_marks: list[int] = []
         self.max_tasks = 0
         self.live = 0
         self.seeded = False
@@ -107,6 +115,7 @@ class NativeBackend:
         self.rearm_after = 0
         self.rearm_failures = 0
         self.rearm_rejections = 0
+        self.handbacks = 0
         self._finalizer = None
         self._engine_finalizer = None
         self.deps: dict[int, tuple] = {}
@@ -130,6 +139,7 @@ class NativeBackend:
         if self.mode == "auto" and engine._sequence < self.min_tasks:
             self.disabled_reason = "auto_tiny_workload"
             return False
+        reuse_config = False
         if self.arena is None:
             try:
                 # Keep the cache lock across the hit/build and the in-process
@@ -167,22 +177,31 @@ class NativeBackend:
         else:
             self.arena.reset()
             self.seeded = False
-        rates, units, policy = resource_table(engine)
-        if len(rates) < 1 or len(rates) > MAX_R:
-            self.disabled_reason = "resource_count"
-            self.dormant = True
-            return False
-        for rate, unit in zip(rates, units):
-            if not math.isfinite(rate) or rate <= 0.0 or not 1 <= unit <= MAX_U:
-                self.disabled_reason = "resource_shape"
+            reuse_config = (
+                bool(self.res_names)
+                and self.res_version == engine._resource_version
+                and len(engine.resources) == len(self.res_names)
+            )
+        if not reuse_config:
+            rates, units, policy = resource_table(engine)
+            if len(rates) < 1 or len(rates) > MAX_R:
+                self.disabled_reason = "resource_count"
                 self.dormant = True
                 return False
-        try:
-            self.arena.configure(rates, units, policy)
-        except (KernelFault, MemoryError) as error:
-            return self._attach_failed(error)
-        self.res_names = tuple(engine.resources)
-        self.has_fair_res = any(p == 0 for p in policy)
+            for rate, unit in zip(rates, units):
+                if not math.isfinite(rate) or rate <= 0.0 or not 1 <= unit <= MAX_U:
+                    self.disabled_reason = "resource_shape"
+                    self.dormant = True
+                    return False
+            try:
+                self.arena.configure(rates, units, policy)
+            except (KernelFault, MemoryError) as error:
+                return self._attach_failed(error)
+            self.res_names = tuple(engine.resources)
+            self.res_index = {name: i for i, name in enumerate(self.res_names)}
+            self.res_version = engine._resource_version
+            self.has_fair_res = any(p == 0 for p in policy)
+        self.touched_res_ids.clear()
         self.fair_prio = None
         self.enabled = True
         self.dormant = False
@@ -225,6 +244,11 @@ class NativeBackend:
         self.disabled_reason = reason
         self.needs_settle = False
         if was_enabled:
+            self.handbacks += 1
+            if (self.recoverable
+                    and self.handbacks >= _THRASH_HANDBACK_LIMIT
+                    and self.native_steps < self.native_calls * _THRASH_MIN_STEPS_PER_CALL):
+                self.recoverable = False
             # A real hand-back is a legitimate transition: the next pure burst
             # may adopt immediately, so the failure backoff restarts here.
             self.rearm_failures = 0
@@ -370,36 +394,59 @@ class NativeBackend:
         """Allow one zero-work Python grant at a native publication boundary."""
         return (self.applying and self.enabled
                 and len(engine._native_seqs) == len(engine._tasks) - 1)
-    def on_callback_registered(self, engine, event) -> None:
-        """a live mirrored row acquired a Python completion observer.
+    def on_callback_registered(self, engine, event, *, native_hook: bool = False) -> None:
+        """A live mirrored row acquired a Python completion observer.
 
         An undeclared hook was not marked when the task was mirrored. The
         kernel can no longer run through that row's completion: it cannot
         invoke the callback at the exact instant and it would publish the epoch
         clock past it.  Hand the whole frontier back before the next native
         step, deferring the transfer when this registration happens inside
-        ``_apply`` (the current completion batch must finish first).
+        ``_apply`` (the current completion batch must finish first).  A
+        declared ``native_hook=True`` observer instead marks ``MSIM_F_CALLBACK``
+        directly on the mirrored slot so the kernel halts at that exact
+        completion instant without abandoning native execution.
         """
         if not self.enabled or event.done:
             return
         if event.sequence not in engine._native_seqs:
+            return
+        if native_hook:
+            slot = engine._native_slots.get(event.sequence)
+            if slot is not None:
+                self.callback_marks.append(slot)
             return
         if self.applying:
             self.callback_dirty = True
             return
         self.disable(engine, self._mixed_reason())
         self.made_progress = True
-    def _sync_counters(self, engine) -> None:
+    def _sync_counters(self, engine, *, full: bool = False) -> None:
         if self.arena is None:
             return
         if engine._hbm_acct_live:
             from .accel_terms import sync_native_hbm_accounting
             sync_native_hbm_accounting(self, engine)
-        busy, serv = self.arena.counters()
+        busy, serv = self.arena.counters_raw()
         acct = engine._hbm_accounting_serviced
-        for i, name in enumerate(self.res_names):
-            engine.busy_ms[name] = busy[i]
-            engine.serviced[name] = serv[i] + acct.get(name, 0.0)
+        names = self.res_names
+        eng_busy = engine.busy_ms
+        eng_serv = engine.serviced
+        indices = (
+            range(len(names))
+            if (full or not self.touched_res_ids)
+            else self.touched_res_ids
+        )
+        if acct:
+            for i in indices:
+                name = names[i]
+                eng_busy[name] = busy[i]
+                eng_serv[name] = serv[i] + acct.get(name, 0.0)
+        else:
+            for i in indices:
+                name = names[i]
+                eng_busy[name] = busy[i]
+                eng_serv[name] = serv[i]
         if engine._delivery_live:
             from .accel_terms import sync_native_deliveries
             sync_native_deliveries(self, engine)
@@ -407,12 +454,12 @@ class NativeBackend:
         """publish the kernel-accepted prefix of a failing epoch."""
         prefix = getattr(error, "prefix", None)
         if prefix is None or not getattr(error, "has_prefix", False):
-            self._sync_counters(engine)
+            self._sync_counters(engine, full=True)
             return
         now, _boundary, steps, ncomp, nstart = prefix
         self.native_calls += 1
         self.native_steps += steps
-        self._sync_counters(engine)
+        self._sync_counters(engine, full=True)
         engine.now = now
         engine.advance_steps += steps
         self._apply(engine, nstart, ncomp)
@@ -458,8 +505,12 @@ class NativeBackend:
         self.made_progress = True
         self.needs_settle = False
     def _refresh_resources(self, engine) -> bool:
+        if (self.res_version == engine._resource_version
+                and len(engine.resources) == len(self.res_names)):
+            return True
         names = tuple(engine.resources)
         if names == self.res_names:
+            self.res_version = engine._resource_version
             return True
         if engine._native_slots or not 1 <= len(names) <= MAX_R:
             return False
@@ -475,6 +526,9 @@ class NativeBackend:
         # event was queued. Unflushed rows have no native resource indices yet.
         self.arena.configure(rates, units, policy)
         self.res_names = names
+        self.res_index = {name: i for i, name in enumerate(names)}
+        self.res_version = engine._resource_version
+        self.touched_res_ids.clear()
         self.has_fair_res = has_fair
         self.fair_prio = next(iter(priorities), None)
         self.seeded = False
@@ -746,7 +800,7 @@ def make_backend(requested: str | None = None, *, eager_attach: bool = False):
             "requested": mode, "build": status, "epoch_enabled": EPOCH_ENABLED,
             **_IDLE_COUNTERS,
         }
-    eager = bool(eager_attach and accel_loader.cached_library_ready())
+    eager = bool(eager_attach and accel_loader.toolchain_or_cache_ready())
     backend = NativeBackend(None, "auto", eager_attach=eager)
     reason = "auto_ready" if eager else "auto_deferred"
     return backend, {
