@@ -94,6 +94,8 @@ def _source_digest(path: str | Path | None) -> str:
         if not candidate.is_file() or candidate.stat().st_size > _MAX_SOURCE_BYTES:
             return ""
         return digest_bytes(candidate.read_bytes())
+    except TimeoutError:
+        raise
     except OSError:
         return ""
 
@@ -276,6 +278,8 @@ def _workspace_module_file(module: Any, root: Path) -> bool:
         return False
     try:
         return Path(filename).resolve().is_relative_to(root)
+    except TimeoutError:
+        raise
     except (OSError, ValueError):
         return False
 
@@ -284,6 +288,8 @@ def _sibling_names(root: Path) -> tuple[str, ...]:
     names = []
     try:
         children = tuple(root.iterdir())
+    except TimeoutError:
+        raise
     except OSError:
         return ()
     for child in children:
@@ -723,6 +729,7 @@ def load_extensions(
     paths: Any = (),
     packages: Any = (),
     entry_points: Any = (),
+    extensions: Any = (),
     profiles: Any = (),
     discover_installed: bool = False,
 ) -> ExtensionContext:
@@ -731,7 +738,9 @@ def load_extensions(
     ``paths`` accepts workspace directories (or an explicit ``mindie_ext.py``).
     ``packages`` accepts installed distribution names with entry points in
     ``mindie_sim.extensions``.  ``entry_points`` accepts explicit entry-point
-    objects or ``module:factory`` strings.  ``profiles`` accepts a local user
+    objects or ``module:factory`` strings.  ``extensions`` accepts explicit
+    in-memory ``Extension`` declarations (such as Layer-2 bindings returned by
+    ``bind_kernel_implementation``).  ``profiles`` accepts a local user
     calibration profile path or mapping.  All sources are loaded once; callers
     hold the returned immutable context for the whole request.
     """
@@ -745,6 +754,9 @@ def load_extensions(
     explicit = _sources(entry_points)
     if explicit:
         loaded.extend(_installed(item) for item in explicit)
+    if extensions:
+        raw_exts = (extensions,) if isinstance(extensions, (Extension, Mapping)) else tuple(extensions)
+        loaded.extend(_declaration(item, "inline") for item in raw_exts)
     if discover_installed:
         discovered = sorted(metadata.entry_points(group=ENTRY_POINT_GROUP),
                             key=lambda item: (item.name, item.value))

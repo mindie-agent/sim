@@ -246,8 +246,10 @@ def _is_attn_res_or_norm_op(suffix: str, fam: str, rec: str) -> bool:
         "attention.residual", "ffn.residual", "residual",
     }:
         return True
+    if rec.endswith("_rmsnorm") and "grouped" in rec:
+        return True
     return rec in {
-        "rmsnorm", "add_rmsnorm", "residual_add", "grouped_gemma_rmsnorm",
+        "rmsnorm", "add_rmsnorm", "residual_add",
         "hc_silu", "hc_values_fp32", "hc_projection", "hc_lowrank_down_inject",
         "hc_lowrank_up",
     }
@@ -412,6 +414,208 @@ def _format_dtype_upper(raw: str) -> str:
     return _DTYPE_UPPER_MAP.get(tok, tok.upper() or "BF16")
 
 
+def resolve_comm_domain_tag(
+    op_id: str,
+    family: str,
+    recipe: str,
+    meta: Mapping[str, Any],
+    case: Case,
+) -> str:
+    """Resolve the exact active collective communication domain tag (never indiscriminate TP+EP)."""
+    suffix = strip_op_prefix(op_id).lower()
+    fam = str(family or "").strip().lower()
+    rec = str(recipe or "").strip().lower()
+    axis = str(meta.get("comm_axis") or meta.get("group_axis") or "").strip().lower()
+    explicit_group = int(meta.get("comm_group_size") or 0)
+    p = case.runtime.parallel
+    tp = explicit_group if (explicit_group > 0 and axis == "tp") else max(1, int(p.tp))
+    ep = explicit_group if (explicit_group > 0 and axis == "ep") else max(1, int(p.ep))
+    dcp = explicit_group if (explicit_group > 0 and axis in {"dcp", "cp"}) else max(1, int(p.cp))
+    pcp = explicit_group if (explicit_group > 0 and axis == "pcp") else max(1, int(p.pcp))
+    pp = explicit_group if (explicit_group > 0 and axis == "pp") else max(1, int(p.pp))
+
+    is_comm = (
+        fam in COLLECTIVE_FAMILIES
+        or fam in {"all_gather_matmul", "matmul_reduce_scatter"}
+        or "megamoe" in rec
+        or "dispatch_ffn_combine" in rec
+        or suffix.startswith(("dcp_", "pcp_", "sp_"))
+        or "sp_gather" in suffix
+        or "sp_scatter" in suffix
+        or "reduce_scatter" in suffix
+        or "allgather" in rec
+        or "allreduce" in rec
+        or "alltoall" in rec
+    )
+    if not is_comm:
+        return ""
+    if (
+        axis == "ep"
+        or fam in _MOE_EP_COMM_FAMILIES
+        or suffix in {"dispatch", "unpack", "combine"}
+        or "dispatch" in rec
+        or "combine" in rec
+        or "megamoe" in rec
+    ):
+        return f"EP={ep}"
+    if (
+        axis in {"dcp", "cp"}
+        or suffix.startswith("dcp_")
+        or "dcp_" in rec
+        or "candidate_gather" in suffix
+    ):
+        return f"DCP={dcp}"
+    if axis == "pcp" or suffix.startswith("pcp_"):
+        return f"PCP={pcp}"
+    if axis == "pp" or fam == "p2p":
+        return f"PP={pp}"
+    if (
+        "sp_gather" in suffix
+        or "sp_scatter" in suffix
+        or "sp_output" in suffix
+        or "reduce_scatter" in suffix
+        or fam in {"reduce_scatter", "reducescatter", "all_gather_matmul", "matmul_reduce_scatter"}
+    ):
+        return f"TP={tp} (SP)"
+    return f"TP={tp}"
+
+
+_PURE_GLUE_FAMILIES = frozenset({
+    "allreduce", "all_reduce", "tp_allreduce", "allgather", "all_gather",
+    "reduce_scatter", "reducescatter", "alltoall", "alltoallv",
+    "collective", "hccl", "p2p", "quantize",
+    "tensor_copy", "copy", "view", "reshape", "slice", "permute",
+    "transpose", "cat", "concat", "contiguous", "tensor_fill", "pad", "split",
+})
+_GLUE_ROLE_MARKERS = (
+    "contiguous", "materialize", "_zero", "_copy", "_flat", "concatenate",
+    "sp_gather", "sp_scatter", "sp_shard", "sp_output_gather",
+    "reduce_scatter", "output_reduce", "linear_reduce",
+    "dcp_query_", "dcp_output_", "candidate_pack", "candidate_gather",
+    "logits_gather", "features_gather",
+)
+_SCOPE_ATOM_PREFIXES = ("attention.", "ffn.", "shared.", "final.")
+
+
+def _atom_scope_prefix(suffix: str) -> str:
+    for pfx in _SCOPE_ATOM_PREFIXES:
+        if suffix.startswith(pfx):
+            return pfx
+    return ""
+
+
+def _is_pure_glue_op(suf: str, fam: str, rec: str, meta: Mapping[str, Any] | None = None) -> bool:
+    if meta:
+        if meta.get("is_glue") or meta.get("view_only"):
+            return True
+        if (meta.get("comm_axis") or meta.get("group_axis")) and fam not in {
+            "all_gather_matmul", "matmul_reduce_scatter", "dispatch", "combine", "mc2",
+        } and suf not in {"dispatch", "unpack", "combine"}:
+            return True
+    if suf in {"pad", "tp", "tp_attn", "shared.tp"} or suf.endswith((".quantize", ".pad")):
+        return True
+    if fam in _PURE_GLUE_FAMILIES and suf not in {
+        "dispatch", "unpack", "combine", "expert_up", "expert_down", "expert_act",
+    }:
+        return True
+    if any(tok in suf for tok in _GLUE_ROLE_MARKERS):
+        return True
+    return any(tok in rec for tok in ("contiguous", "materialize", "tensor_copy", "view_copy"))
+
+
+def _canonicalize_single_atom(
+    raw_suffix: str, fam: str, rec: str, meta: Mapping[str, Any] | None = None,
+) -> tuple[str, ...]:
+    suf = strip_op_prefix(raw_suffix).lower()
+    if not suf:
+        return ()
+    if _is_pure_glue_op(suf, fam, rec, meta):
+        return ()
+    scope = _atom_scope_prefix(suf)
+    if "mla_prolog" in suf or "mla_prolog" in rec:
+        return ("q_a", "kv_a", "q_norm", "q_b", "kv_norm", "rotary", "kv_store", "q_absorb")
+    if "megamoe" in rec or "dispatch_ffn_combine" in rec or "dispatch_ffn_combine" in suf:
+        return ("moe_dispatch", "expert_up", "expert_act", "expert_down", "moe_combine")
+    if suf in {"dispatch"} or (fam == "dispatch"):
+        return ("moe_dispatch",)
+    if suf in {"unpack", "combine"} or (fam == "combine"):
+        return ("moe_combine",)
+    if suf in {"qkv_a"}:
+        return ("q_a", "kv_a")
+    if suf in {"q_rotary", "kv_rotary", "rotary", "rope"}:
+        return ("rotary",)
+    if suf in {"kv_scatter", "kv_store", "cache"}:
+        return ("kv_store",)
+    if fam == "mhc" or ".hc_" in f".{suf}":
+        if "hc_post" in suf or "hc_combine" in rec:
+            return (f"{scope}mhc_combine",)
+        return (f"{scope}mhc_mix",)
+    if "attn_res" in suf or fam == "attn_res_prefix":
+        return (f"{scope}attn_res",)
+    if suf in {"norm1", "input_layernorm"}:
+        return ("pre_attn_norm",)
+    if suf in {"norm2", "post_attention_layernorm"}:
+        return ("pre_moe_norm",)
+    if suf in {"quant_lightning_indexer", "index_scores"} or fam == "indexer":
+        return ("index_scores",)
+    if suf in {"latent_attention_batch", "mqsmla", "attention"} or fam == "attention":
+        return ("core_attention",)
+    if suf == "dcp_lse_merge" or fam == "attention_merge":
+        return ("dcp_lse_merge",)
+    if suf in {"output", "o_proj"}:
+        return ("attn_output",)
+    if suf in {"linear_output"}:
+        return ("linear_output",)
+    if suf in {"linear_output_norm_gate", "fused_linear_output_epilogue"}:
+        return ("linear_output_norm_gate",)
+    if suf.startswith("recurrent_scan") or suf == "decode_recurrent_scan" or fam in {"recurrent_scan", "recurrent_vector"}:
+        return ("recurrent_state_scan",)
+    if "recover_ssm" in suf:
+        return ("recover_ssm",)
+    if suf == "short_convolution" or fam in {"short_convolution", "causal_conv1d_fn"}:
+        return ("short_convolution",)
+    return (suf,)
+
+
+def extract_semantic_atoms(
+    op_id: str,
+    family: str,
+    recipe: str = "",
+    absorbed_source_ops: Sequence[str] = (),
+    metadata: Mapping[str, Any] | None = None,
+) -> tuple[str, ...]:
+    """Extract canonical unlowered semantic atoms (honoring ``OpSpec``/``AppliedPlan`` traits)."""
+    fam = str(family or "").strip().lower()
+    rec = str(recipe or "").strip().lower()
+    meta = dict(metadata) if isinstance(metadata, Mapping) else {}
+    atoms: list[str] = []
+    for key in ("semantic_atoms", "absorbed_atoms"):
+        explicit = meta.get(key)
+        if isinstance(explicit, (list, tuple)):
+            for item in explicit:
+                tok = str(item or "").strip().lower()
+                if tok and tok not in atoms:
+                    atoms.append(tok)
+    if atoms:
+        return tuple(atoms)
+    if absorbed_source_ops:
+        for src in absorbed_source_ops:
+            for a in _canonicalize_single_atom(str(src), "", ""):
+                if a not in atoms:
+                    atoms.append(a)
+    if fam in {"all_gather_matmul", "matmul_reduce_scatter"}:
+        # MC2 keeps the core matmul's semantic atom while absorbing pure SP glue.
+        for a in _canonicalize_single_atom(op_id, "gemm", rec, meta):
+            if a not in atoms:
+                atoms.append(a)
+        return tuple(atoms)
+    if not atoms:
+        for a in _canonicalize_single_atom(op_id, fam, rec, meta):
+            if a not in atoms:
+                atoms.append(a)
+    return tuple(atoms)
+
+
 def _format_tensor_contract(
     op_id: str,
     family: str,
@@ -429,7 +633,7 @@ def _format_tensor_contract(
     w_dt = _format_dtype_upper(str(meta.get("weight_format") or dtype or "bf16"))
     out_dt = _format_dtype_upper(str(meta.get("output_format") or dtype or "bf16"))
     dims = tuple(int(d) for d in shape)
-    tp = max(1, int(case.runtime.parallel.tp))
+    domain_tag = resolve_comm_domain_tag(op_id, fam, recipe, meta, case)
 
     if fam == "grouped_gemm" and len(dims) == GEMM_SHAPE_RANK:
         m_dim, n_dim, k_dim = dims
@@ -444,13 +648,15 @@ def _format_tensor_contract(
         fam in {
             "gemm", "projection", "gate_up_projection", "down_projection",
             "qkv_projection", "output_projection", "router", "logits", "index_projection",
+            "all_gather_matmul", "matmul_reduce_scatter",
         }
         or meta.get("program_kind") == "matmul"
     ):
         m_dim, n_dim, k_dim = dims
         if suffix in {"q_absorb", "v_expand"}:
             return f"x:[{m_dim},{k_dim}] {act_dt} × W_bmm:[{k_dim},{n_dim}] {w_dt} -> y:[{m_dim},{n_dim}] {out_dt}"
-        return f"x:[{m_dim},{k_dim}] {act_dt} × W:[{n_dim},{k_dim}] {w_dt} -> y:[{m_dim},{n_dim}] {out_dt}"
+        comm_sfx = f" ({domain_tag})" if domain_tag else ""
+        return f"x:[{m_dim},{k_dim}] {act_dt} × W:[{n_dim},{k_dim}] {w_dt} -> y:[{m_dim},{n_dim}] {out_dt}{comm_sfx}"
 
     if fam == "attention":
         if len(dims) == ATTN_5D_RANK:
@@ -465,15 +671,16 @@ def _format_tensor_contract(
             kv_txt = f"SparseKV(topk={topk})" if topk > 0 else "PagedKV"
             return f"Q:[{q_tok},{nh},{dv}] {act_dt} × {kv_txt} -> O:[{q_tok},{nh},{dv}] {out_dt}"
 
-    if fam in {"allgather", "reduce_scatter", "reducescatter", "allreduce", "alltoall", "mc2_protocol"}:
+    if fam in COLLECTIVE_FAMILIES or domain_tag:
+        tag = domain_tag or f"TP={max(1, int(case.runtime.parallel.tp))}"
         if len(dims) >= MATRIX_2D_RANK:
             sh_txt = ",".join(str(d) for d in dims)
-            return f"comm:[{sh_txt}] {act_dt} (TP={tp}, EP={case.runtime.parallel.ep})"
+            return f"comm:[{sh_txt}] {act_dt} ({tag})"
         if len(dims) == 1:
             rows = int(meta.get("graph_active_query_rows") or 0)
             if rows > 0 and dims[0] % rows == 0:
-                return f"comm:[{rows},{dims[0] // rows}] {act_dt} (TP={tp})"
-            return f"comm:[{dims[0]}] {act_dt} (TP={tp})"
+                return f"comm:[{rows},{dims[0] // rows}] {act_dt} ({tag})"
+            return f"comm:[{dims[0]}] {act_dt} ({tag})"
 
     if len(dims) == 1 and dims[0] > 0:
         rows = int(meta.get("graph_active_query_rows") or 0)
@@ -535,6 +742,41 @@ def _native_kernel_from_structure(
         if kinds:
             return str(kinds[0])
     return ""
+
+
+def _normalize_display_kernel(kernel: str) -> str:
+    """Normalize display kernel names without model-specific alias tables."""
+    if kernel.endswith("GatedResidualMix") and not kernel.startswith("FusedMHC"):
+        return "FusedMHCGatedResidualMix"
+    if kernel.endswith("HcCombine") and not kernel.startswith("FusedMHC"):
+        return "FusedMHCCombine"
+    return kernel
+
+
+def _format_situ_params(meta: Mapping[str, Any], layer_plan: Any | None) -> str:
+    """Format SiTU activation parameters dynamically from op metadata or layer plan."""
+    raw_params = meta.get("activation_params")
+    params_map: dict[str, Any] = {}
+    if isinstance(raw_params, Mapping):
+        params_map = dict(raw_params)
+    elif isinstance(raw_params, (tuple, list)):
+        for entry in raw_params:
+            if isinstance(entry, (tuple, list)) and len(entry) == 2:
+                params_map[str(entry[0])] = entry[1]
+    beta = params_map.get("beta", meta.get("activation_situ_beta"))
+    lin_beta = params_map.get("linear_beta", meta.get("activation_situ_linear_beta"))
+    if beta is None and layer_plan is not None:
+        beta = getattr(layer_plan, "activation_situ_beta", None)
+    if lin_beta is None and layer_plan is not None:
+        lin_beta = getattr(layer_plan, "activation_situ_linear_beta", None)
+    parts: list[str] = []
+    if beta is not None:
+        b_val = float(beta)
+        parts.append(f"beta={int(b_val) if b_val.is_integer() else b_val:g}")
+    if lin_beta is not None:
+        lb_val = float(lin_beta)
+        parts.append(f"linear_beta={int(lb_val) if lb_val.is_integer() else lb_val:g}")
+    return f"({', '.join(parts)})" if parts else ""
 
 
 def _extract_native_candidate(struct_node: Mapping[str, Any] | None) -> str:
@@ -691,6 +933,7 @@ def resolve_ascend_kernel_identity(
             new_spec = new_spec or reason
         elif f_status == "fused_framework_enable" and status == KERNEL_STATUS_EXISTING:
             status = KERNEL_STATUS_FRAMEWORK
+    kernel = _normalize_display_kernel(kernel)
     if kernel in BANNED_IMPLEMENTATION_NAMES or not kernel:
         kernel = "aclnnCustomOp"
     return AscendKernelDescriptor(
@@ -752,7 +995,7 @@ def _classify_kernel_tuple(
             "vllm_ascend_attn_res_prefix",
             BACKEND_TRITON,
             f"{KERNEL_STATUS_NEW_OR_EXTEND} AttnRes Cross-Layer Fused Prefix",
-            "vllm-ascend/vllm_ascend/models/kimi_k3/attn_res.py",
+            "vllm-ascend/vllm_ascend/ops/attn_res.py",
             True,
             "Fused block residual norm+projection+softmax+weighted sum across block history",
             suffix,
@@ -809,15 +1052,18 @@ def _classify_kernel_tuple(
     if _is_moe_router_dispatch_op(suffix, fam, rec) or _is_moe_routed_op(suffix, fam, rec) or _is_shared_expert_op(suffix, rec):
         return _classify_moe_tuple(
             suffix, fam, rec, meta, nat_kind, is_ideal, is_quant_mm, is_mxfp4_w, mm_kernel,
-            is_int4_w=is_int4_w, is_a2_or_a3=is_a2_or_a3,
+            is_int4_w=is_int4_w, is_a2_or_a3=is_a2_or_a3, layer_plan=layer_plan,
         )
     if fam in COLLECTIVE_FAMILIES:
         return _classify_collective_tuple(suffix, fam, rec)
-    return _classify_proj_and_misc_tuple(suffix, fam, nat_kind, mm_kernel, mm_src)
+    return _classify_proj_and_misc_tuple(
+        suffix, fam, nat_kind, mm_kernel, mm_src, meta=meta, layer_plan=layer_plan,
+    )
 
 
 def _classify_proj_and_misc_tuple(
     suffix: str, fam: str, nat_kind: str, mm_kernel: str, mm_src: str,
+    *, meta: Mapping[str, Any] = (), layer_plan: Any | None = None,
 ) -> tuple[str, str, str, str, str, bool, str, str]:
     if fam in {"cache_store", "kv_compress_epilog", "kv_cache_write"} or suffix in {"kv_store", "kv_scatter", "cache"}:
         return (
@@ -833,14 +1079,15 @@ def _classify_proj_and_misc_tuple(
         )
     if fam in {"swiglu", "situ"}:
         if fam == "situ":
+            p_str = _format_situ_params(meta if isinstance(meta, Mapping) else {}, layer_plan)
             return (
-                "K3 SiTU Gated Activation (beta=4, linear_beta=25)",
-                "K3 SituAndMul",
+                f"SiTU Gated Activation {p_str}".strip(),
+                "SituAndMul",
                 BACKEND_TRITON,
-                f"{KERNEL_STATUS_NEW_OP} K3 SituAndMul(beta=4, linear_beta=25)",
-                "vllm-ascend/vllm_ascend/models/kimi_k3/modeling_kimi_k3.py",
+                f"{KERNEL_STATUS_NEW_OP} SituAndMul{p_str}",
+                "vllm-ascend/vllm_ascend/ops/activation.py",
                 True,
-                "Fused K3 SituAndMul activation (non-standard SiLU variant not in shipping CANN SwiGlu)",
+                f"Fused SituAndMul{p_str} activation (non-standard gated variant not in shipping CANN SwiGlu)",
                 suffix,
             )
         return (
@@ -1072,31 +1319,28 @@ def _classify_mhc_tuple(
         (hc_lowrank > 0 and hc_sinkhorn == 0)
         or rec in {"hc_gate_mix", "hc_combine", "hc_combine_rmsnorm", "hc_silu", "hc_lowrank_down_inject", "hc_lowrank_up"}
     )
-    src = (
-        "vllm-ascend/vllm_ascend/models/qwen4_exp/hyper_connection.py"
-        if is_lowrank else "vllm-ascend/vllm_ascend/ops/mhc.py"
-    )
+    src = "vllm-ascend/vllm_ascend/ops/mhc.py"
     if rec == "hc_silu" or suffix.endswith("hc_silu"):
         return (f"mHC Low-Rank SiLU ({suffix})", "Silu", BACKEND_CANN, KERNEL_STATUS_EXISTING, src, False, "", suffix)
-    if fam == "rmsnorm" or rec == "grouped_gemma_rmsnorm" or suffix.endswith("hc_norm"):
+    if fam == "rmsnorm" or (rec.endswith("_rmsnorm") and "grouped" in rec) or suffix.endswith("hc_norm"):
         return (f"mHC Grouped RMSNorm ({suffix})", "RmsNorm", BACKEND_CANN, KERNEL_STATUS_EXISTING, src, False, "", suffix)
     if fam == "gemm" or rec in {"hc_lowrank_down_inject", "hc_lowrank_up", "hc_projection", "hc_coefficients_fused"}:
         return (f"mHC Hyper-Connection Projection ({suffix})", mm_kernel, BACKEND_CANN, KERNEL_STATUS_EXISTING, src, False, "", suffix)
     if rec in {"hc_combine", "hc_combine_rmsnorm"} or suffix.endswith("hc_post"):
-        kern = "Qwen4ExpHcCombine" if is_lowrank else "mhc_post_combine"
+        kern = "FusedMHCCombine" if is_lowrank else "mhc_post_combine"
         return (
             f"mHC Post Combine ({suffix})", kern, BACKEND_CANN if is_lowrank else BACKEND_TRITON,
             KERNEL_STATUS_NEW_OP if (is_lowrank and is_ideal) else KERNEL_STATUS_FRAMEWORK,
             src, bool(is_lowrank and is_ideal),
-            "UB-resident fused Qwen4ExpHcCombine eliminating strided HBM round-trips" if (is_lowrank and is_ideal) else "",
+            "UB-resident fused FusedMHCCombine eliminating strided HBM round-trips" if (is_lowrank and is_ideal) else "",
             suffix,
         )
     if is_lowrank:
         return (
-            f"mHC Low-Rank Gated Residual Mix ({suffix})", "Qwen4ExpGatedResidualMix", BACKEND_CANN,
+            f"mHC Low-Rank Gated Residual Mix ({suffix})", "FusedMHCGatedResidualMix", BACKEND_CANN,
             KERNEL_STATUS_NEW_OP if is_ideal else KERNEL_STATUS_FRAMEWORK,
             src, bool(is_ideal),
-            "UB-resident fused Qwen4ExpGatedResidualMix (Norm+Down+SiLU+Up+Mix)" if is_ideal else "",
+            "UB-resident fused FusedMHCGatedResidualMix (Norm+Down+SiLU+Up+Mix)" if is_ideal else "",
             suffix,
         )
     kern = "mhc_sinkhorn_mix_kernel" if ("sinkhorn" in suffix or "mix" in suffix) else "HcPre"
@@ -1198,7 +1442,7 @@ def _classify_linear_attn_tuple(
         }
         proj_src = (
             "vllm-ascend/vllm_ascend/ops/gdn.py"
-            if is_gdn_proj else "vllm-ascend/vllm_ascend/models/kimi_k3/kda.py"
+            if is_gdn_proj else "vllm-ascend/vllm_ascend/ops/linear_attention/kda.py"
         )
         return (
             lin_roles.get(suffix, f"Linear Attention Projection ({suffix})"),
@@ -1214,7 +1458,7 @@ def _classify_linear_attn_tuple(
 def _classify_moe_tuple(
     suffix: str, fam: str, rec: str, meta: Mapping[str, Any], nat_kind: str,
     is_ideal: bool, is_quant_mm: bool, is_mxfp4_w: bool, mm_kernel: str,
-    *, is_int4_w: bool = False, is_a2_or_a3: bool = False,
+    *, is_int4_w: bool = False, is_a2_or_a3: bool = False, layer_plan: Any | None = None,
 ) -> tuple[str, str, str, str, str, bool, str, str]:
     moe_src = "vllm-ascend/vllm_ascend/ops/fused_moe/fused_moe.py"
     if suffix == "router" or fam == "router":
@@ -1246,7 +1490,7 @@ def _classify_moe_tuple(
             "dispatch_ffn_combine (MegaMoE)", BACKEND_CANN,
             f"{KERNEL_STATUS_EXTEND_TILING} MXFP4 MegaMoE Compact Tiling & AIV/Cube Ping-Pong",
             "vllm-ascend/vllm_ascend/ops/fused_moe/moe_comm_method.py", True,
-            "Fused MegaMoE dispatch_ffn_combine supporting packed MXFP4 uint8 + K3 SiTU + compact tiling",
+            "Fused MegaMoE dispatch_ffn_combine supporting packed MXFP4 uint8 + gated activation + compact tiling",
             "megamoe_arch35",
         )
     if suffix == "dispatch" or "dispatch" in rec:
@@ -1278,12 +1522,13 @@ def _classify_moe_tuple(
         return (role, "GroupedMatmul", BACKEND_CANN, KERNEL_STATUS_EXISTING, moe_src, False, "", suffix)
     if suffix == "expert_act" or suffix == "shared.situ":
         if fam == "situ" or "situ" in rec:
+            p_str = _format_situ_params(meta, layer_plan)
             return (
-                "Routed Expert K3 SiTU+Mul Activation" if suffix == "expert_act" else "Shared Expert K3 SiTU+Mul Activation",
-                "K3 SituAndMul", BACKEND_TRITON,
-                f"{KERNEL_STATUS_NEW_OP} K3 SituAndMul(beta=4, linear_beta=25) + Quant",
-                "vllm-ascend/vllm_ascend/models/kimi_k3/modeling_kimi_k3.py", True,
-                "Fused K3 SituAndMul(beta=4, linear_beta=25) + optional dynamic quant epilogue",
+                f"Routed Expert SiTU+Mul Activation {p_str}".strip() if suffix == "expert_act" else f"Shared Expert SiTU+Mul Activation {p_str}".strip(),
+                "SituAndMul", BACKEND_TRITON,
+                f"{KERNEL_STATUS_NEW_OP} SituAndMul{p_str} + Quant",
+                "vllm-ascend/vllm_ascend/ops/activation.py", True,
+                f"Fused SituAndMul{p_str} + optional dynamic quant epilogue",
                 suffix,
             )
         act_kern = "aclnnSwiGluQuant" if (is_a2_or_a3 and is_quant_mm) else "SwiGlu"

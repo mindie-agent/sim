@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Architecture governance gate (AG001..AG012) for ``mindie_sim``.
+"""Architecture governance gate (AG001..AG013) for ``mindie_sim``.
 
 [Role] Enforce governed ``mindie_sim/prediction/operators/<family>/`` package
   boundaries, forbid flat ISA/CANN filename sprawl under ``mindie_sim/**/*.py``,
@@ -37,7 +37,8 @@ if __package__:
         MAX_OPERATOR_PACKAGE_FILES, MAX_TOPLEVEL_MODULES, OPERATORS_PARTS, Violation,
         _check_ag006_flat_prediction, _check_ag007, _check_ag008_module, _check_ag008_repo_bounds,
         _check_ag009_silent_physical_defaults, _check_ag010_layer_dag,
-        _check_ag011_operator_reachability, _check_ag013_anti_hardcoding,
+        _check_ag011_operator_reachability,
+        _check_ag013_anti_hardcoding as _base_ag013_anti_hardcoding,
         _is_governed_family_path, scan_runtime,
         verify_ag007_discrimination, verify_ag011_engine_reachability,
     )
@@ -49,7 +50,8 @@ else:
         MAX_OPERATOR_PACKAGE_FILES, MAX_TOPLEVEL_MODULES, OPERATORS_PARTS, Violation,
         _check_ag006_flat_prediction, _check_ag007, _check_ag008_module, _check_ag008_repo_bounds,
         _check_ag009_silent_physical_defaults, _check_ag010_layer_dag,
-        _check_ag011_operator_reachability, _check_ag013_anti_hardcoding,
+        _check_ag011_operator_reachability,
+        _check_ag013_anti_hardcoding as _base_ag013_anti_hardcoding,
         _is_governed_family_path, scan_runtime,
         verify_ag007_discrimination, verify_ag011_engine_reachability,
     )
@@ -673,6 +675,119 @@ def _check_ag005(
                         actual_sha = hashlib.sha256(blob.stdout).hexdigest()
                         if actual_sha != sha:
                             add_v(elt.lineno, f"sha_mismatch:{rpath}", f"SHA-256 mismatch for {rpath}: expected {sha}, got {actual_sha}")
+    return violations
+
+
+_AG013_HARDENED_ROOTS = frozenset({
+    "rewrite", "optimization", "export", "solve", "sweep",
+})
+_AG013_ALLOWED_TIER_TOKENS = frozenset({"K3", "K3_dsl_pipeline"})
+_AG013_CAMEL_BOUNDARY_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
+_AG013_MODEL_TOKEN_RE = re.compile(
+    r"(?:^|[^a-z0-9])("
+    r"kimi(?:[-_]?k\d*(?:\.\d+)?)?"
+    r"|k3(?:\.\d+)?"
+    r"|qwen(?:\d\w*)?"
+    r"|deepseek\w*"
+    r"|glm(?:[-_]?\d\w*)?"
+    r"|minimax\w*"
+    r"|llama(?:[-_]?\d\w*)?"
+    r"|gemma(?:[-_]?\d\w*)?"
+    r")(?:[^a-z0-9]|$)",
+    re.IGNORECASE,
+)
+_AG013_SUFFIX_TABLE_RE = re.compile(
+    r"^_(?:KNOWN_FUSION_SOURCES|PURE_GLUE_EXACT_SUFFIXES|(?:GDN|KDA)_[A-Z0-9_]*SUFFIXES)$"
+)
+_AG013_TARGET_ETA_RE = re.compile(r"(?:^|_)target_eta(?:$|_)", re.IGNORECASE)
+
+
+def _ag013_docstring_node_ids(tree: ast.Module) -> set[int]:
+    ids: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            if (
+                node.body
+                and isinstance(node.body[0], ast.Expr)
+                and isinstance(node.body[0].value, ast.Constant)
+                and isinstance(node.body[0].value.value, str)
+            ):
+                ids.add(id(node.body[0].value))
+    return ids
+
+
+def _ag013_match_model_token(text: str) -> str | None:
+    stripped = text.strip()
+    if stripped in _AG013_ALLOWED_TIER_TOKENS:
+        return None
+    normalized = _AG013_CAMEL_BOUNDARY_RE.sub("_", stripped)
+    match = _AG013_MODEL_TOKEN_RE.search(normalized)
+    if match is None:
+        return None
+    token = match.group(1)
+    if token == "K3" and stripped in _AG013_ALLOWED_TIER_TOKENS:
+        return None
+    return token
+
+
+def _check_ag013_anti_hardcoding(rel: PurePosixPath, tree: ast.Module) -> list[Violation]:
+    """Hardened AG013: ban model literals/identifiers, static op-suffix tables & TARGET_ETA multipliers."""
+    if len(rel.parts) < 2 or rel.parts[0] != SIM_PACKAGE_ROOT:
+        return []
+    top = rel.parts[1][:-3] if rel.parts[1].endswith(".py") else rel.parts[1]
+    if top not in _AG013_HARDENED_ROOTS:
+        return list(_base_ag013_anti_hardcoding(rel, tree))
+
+    pos = rel.as_posix()
+    docs = _ag013_docstring_node_ids(tree)
+    violations: list[Violation] = []
+    seen: set[tuple[int, str, str]] = set()
+
+    def _emit(line: int, kind: str, token: str, detail: str) -> None:
+        key = (line, kind, token.lower())
+        if key not in seen:
+            seen.add(key)
+            violations.append(Violation(
+                "AG013", rel, line, f"AG013:{kind}:{pos}:{key[2]}", detail,
+            ))
+
+    for node in ast.walk(tree):
+        lineno = int(getattr(node, "lineno", 1))
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            if id(node) in docs:
+                continue
+            model_tok = _ag013_match_model_token(node.value)
+            if model_tok is not None:
+                _emit(
+                    lineno, "model_literal", model_tok,
+                    f"hardcoded model-specific string {node.value!r} ({model_tok}) forbidden in {top}",
+                )
+            elif _AG013_TARGET_ETA_RE.search(node.value):
+                _emit(
+                    lineno, "target_eta", "target_eta",
+                    f"heuristic TARGET_ETA multiplier string {node.value!r} forbidden in {top}",
+                )
+        for field in ("id", "name", "attr", "arg"):
+            val = getattr(node, field, None)
+            if not isinstance(val, str) or not val:
+                continue
+            if _AG013_SUFFIX_TABLE_RE.match(val):
+                _emit(
+                    lineno, "suffix_table", val,
+                    f"static op-suffix table {val!r} forbidden in {top}; use typed OpSpec traits/metadata",
+                )
+            elif _AG013_TARGET_ETA_RE.search(val):
+                _emit(
+                    lineno, "target_eta", val,
+                    f"heuristic TARGET_ETA multiplier identifier {val!r} forbidden in {top}",
+                )
+            else:
+                model_tok = _ag013_match_model_token(val)
+                if model_tok is not None:
+                    _emit(
+                        lineno, "model_identifier", val,
+                        f"hardcoded model-specific identifier {val!r} ({model_tok}) forbidden in {top}",
+                    )
     return violations
 
 

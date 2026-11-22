@@ -513,3 +513,88 @@ def _extension_op():
             ("program_kind", "matmul"), ("physical_program", "SteadyMatmul"), ("activation_format", "bf16"),
             ("output_format", "bf16"), ("matrix_groups", 1), ("aclnn_api", ACLNN_ENTRY),
             ("aclnn_symbol", ACLNN_ENTRY), ("profiler_rule", PROFILER_RULE),),)
+
+
+def test_two_layer_operator_sdk_simulation_honesty_lock_and_layer2_binding():
+    from mindie_sim.public import (
+        CapabilityGap,
+        ExecutionEnvironment,
+        ExtensionError,
+        FormulaKernelSpec,
+        FormulaTensorSpec,
+        bind_kernel_implementation,
+        load_extensions,
+        simulate_aclnn_call,
+        simulate_formula_kernel,
+        simulate_graph,
+        simulate_model,
+        simulate_native_call,
+        simulate_operator,
+        simulate_service,
+    )
+    from mindie_sim.schema.hardware import Hardware
+    from mindie_sim.schema.operators import OpSpec
+
+    env = ExecutionEnvironment.from_hardware(Hardware.from_mapping({"backend": "ascend", "sku": "Ascend950DT_9582"}))
+    spec = FormulaKernelSpec(
+        name="FusedNormGateCustom",
+        equations=("y = rmsnorm(x) * sigmoid(g)",),
+        inputs=(
+            FormulaTensorSpec("x", (16, 4096), dtype="bf16"),
+            FormulaTensorSpec("g", (16, 4096), dtype="bf16"),
+        ),
+        outputs=(FormulaTensorSpec("y", (16, 4096), dtype="bf16", role="output"),),
+        vector_ops_fp32=float(16 * 4096 * 8),
+        row_reduction=True,
+    )
+
+    # Layer 1 (Modeling Mode): evaluates hardware SRAM & pipes, stamped unbound.
+    eval_a = simulate_formula_kernel(spec, env)
+    eval_b = simulate_formula_kernel(env, spec)
+    assert eval_a.projected_us == pytest.approx(eval_b.projected_us)
+    assert eval_a.projected_us >= eval_a.l_star_us > 0.0
+    assert eval_a.sram_verified is True and eval_a.ub_peak_bytes <= eval_a.ub_budget_bytes
+    assert eval_a.binding_state == "unbound_formula_projection" and eval_a.has_unbound_formula_ops is True
+
+    # Simulation Mode Honesty Lock: rejects unbound FormulaKernelSpec and unbound OpSpec.
+    unbound_op = OpSpec(
+        "custom.fused_norm_gate", "vector", "decode", 0, 0, (), (65536,), (65536,), (65536,), (65536,),
+        dtype="bf16", hbm_bytes=262144, vector_ops=524288,
+        metadata=(("binding_state", "unbound_formula_projection"), ("unbound_formula_op", True)),
+    )
+    for call_fn, arg in (
+        (simulate_operator, spec),
+        (simulate_operator, unbound_op),
+        (simulate_native_call, spec),
+        (simulate_graph, (unbound_op,)),
+    ):
+        with pytest.raises(CapabilityGap) as exc_info:
+            call_fn(env, arg)
+        assert exc_info.value.code == "unbound_operator_implementation"
+        assert exc_info.value.kind == "unmodeled_capability"
+
+    # Simulation Mode also forbids passing allow_unbound_formula=True.
+    for fn, args in (
+        (simulate_operator, (env, ())),
+        (simulate_native_call, (env, ())),
+        (simulate_aclnn_call, (env,)),
+        (simulate_graph, (env, ())),
+        (simulate_model, (_tiny_case(),)),
+        (simulate_service, (_tiny_case(),)),
+    ):
+        with pytest.raises(ExtensionError, match="simulation_mode_forbids_unbound_formula_ops"):
+            fn(*args, allow_unbound_formula=True)
+
+    # Layer 2: empty binding fails fast; real binding promotes op into passing Simulation Mode.
+    with pytest.raises(ExtensionError, match="bind_kernel_implementation_requires_real_binding"):
+        bind_kernel_implementation(spec)
+
+    bound_op = OpSpec(
+        "custom.fused_norm_gate", "vector", "decode", 0, 0, (), (65536,), (65536,), (65536,), (65536,),
+        dtype="bf16", hbm_bytes=262144, vector_ops=524288,
+    )
+    ext = bind_kernel_implementation(spec, implementation={"ops": (bound_op,)}, capability="operator")
+    ctx = load_extensions(extensions=[ext])
+    sim_res = simulate_operator(env, (unbound_op,), extensions=ctx)
+    assert sim_res["schema"] == "mindie-sim.operators/1" and sim_res["operator_sum_ms"] > 0.0
+

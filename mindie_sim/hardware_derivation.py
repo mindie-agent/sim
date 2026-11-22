@@ -7,18 +7,15 @@
 [Side-Effect Policy] Pure computation."""
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 import math
 from typing import Any
 
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.hardware import Hardware
 
 
-ZERO: float = 0.0
-ONE: float = 1.0
-FIRST = 0
-LAST = -1
-INT_ONE = 1
 AXIS_AIC_COUNT = "aic_count"
 AXIS_HBM_PEAK = "hbm_peak_bytes_per_s"
 AXES = frozenset({AXIS_AIC_COUNT, AXIS_HBM_PEAK})
@@ -48,9 +45,9 @@ class EfficiencyCurve:
             raise ModelingError("efficiency_curve_requires_knots")
         previous: float | None = None
         for x, y in knots:
-            if not math.isfinite(x) or x < ZERO:
+            if not math.isfinite(x) or x < 0.0:
                 raise ModelingError(f"efficiency_curve_knot_x_invalid:{x}")
-            if not math.isfinite(y) or y <= ZERO or y > ONE:
+            if not math.isfinite(y) or y <= 0.0 or y > 1.0:
                 raise ModelingError(f"efficiency_curve_knot_y_invalid:{y}")
             if previous is not None and x <= previous:
                 raise ModelingError("efficiency_curve_knots_not_increasing")
@@ -62,26 +59,26 @@ class EfficiencyCurve:
     def resolve(self, x: float) -> float:
         """Linear interpolation with explicitly declared clamp extrapolation."""
         value = float(x)
-        if not math.isfinite(value) or value < ZERO:
+        if not math.isfinite(value) or value < 0.0:
             raise ModelingError(f"efficiency_curve_x_invalid:{x}")
         knots = self.knots
-        if value <= knots[FIRST][FIRST]:
+        if value <= knots[0][0]:
             if self.extrapolation == EXTRAPOLATION_CLAMP:
-                return knots[FIRST][INT_ONE]
+                return knots[0][1]
             raise ModelingError(f"efficiency_curve_below_range:{value}")
-        if value >= knots[LAST][FIRST]:
+        if value >= knots[-1][0]:
             if self.extrapolation == EXTRAPOLATION_CLAMP:
-                return knots[LAST][INT_ONE]
+                return knots[-1][1]
             raise ModelingError(f"efficiency_curve_above_range:{value}")
-        for index in range(INT_ONE, len(knots)):
-            left_x, left_y = knots[index - INT_ONE]
+        for index in range(1, len(knots)):
+            left_x, left_y = knots[index - 1]
             right_x, right_y = knots[index]
             if value <= right_x:
                 span = right_x - left_x
-                if span <= ZERO:
+                if span <= 0.0:
                     return right_y
                 return left_y + (right_y - left_y) * (value - left_x) / span
-        return knots[LAST][INT_ONE]
+        return knots[-1][1]
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -101,7 +98,7 @@ def coerce_curve(value: Any, *, axis_hint: str = "") -> EfficiencyCurve | None:
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         # A scalar efficiency is a constant curve, not a fitted trend.
         return EfficiencyCurve(axis_hint or AXIS_AIC_COUNT,
-                               ((ZERO, float(value)),))
+                               ((0.0, float(value)),))
     if isinstance(value, dict):
         axis = value.get("axis", axis_hint)
         knots = value.get("knots", ())
@@ -121,14 +118,14 @@ def apply_mte2_ceiling(
     if ceiling is None:
         return result
     cap = float(ceiling)
-    if not math.isfinite(cap) or cap <= ZERO:
+    if not math.isfinite(cap) or cap <= 0.0:
         raise ModelingError(f"mte2_ceiling_invalid:{ceiling}")
     keys = [name for name in ("mte2_aic", "mte2_aiv") if name in result]
     if not keys:
         if "mte2" in result:
             result["mte2"] = min(result["mte2"], cap)
         return result
-    total = sum(max(ZERO, float(result[name])) for name in keys)
+    total = sum(max(0.0, float(result[name])) for name in keys)
     if total > cap:
         factor = cap / total
         for name in keys:
@@ -136,14 +133,6 @@ def apply_mte2_ceiling(
     if "mte2" in result:
         result["mte2"] = min(float(result["mte2"]), cap)
     return result
-
-
-from collections.abc import Mapping
-import math
-from typing import Any
-
-from mindie_sim.schema.common import ModelingError
-from mindie_sim.schema.hardware import Hardware
 
 
 DEFAULT_DEVICE_COUNT = 1
@@ -199,7 +188,7 @@ def _finite_positive(value: Any, reason: str) -> float:
         result = float(value)
     except (TypeError, ValueError) as exc:
         raise ModelingError(reason) from exc
-    if not math.isfinite(result) or result <= ZERO:
+    if not math.isfinite(result) or result <= 0.0:
         raise ModelingError(reason)
     return result
 
@@ -211,7 +200,7 @@ def _positive_count(value: Any, reason: str) -> int:
         result = int(value)
     except (TypeError, ValueError) as exc:
         raise ModelingError(reason) from exc
-    if result < ONE or float(value) != float(result):
+    if result < 1 or float(value) != float(result):
         raise ModelingError(reason)
     return result
 
@@ -219,9 +208,9 @@ def _positive_count(value: Any, reason: str) -> int:
 def _exact_scaled(value: int, factor: float, reason: str) -> int:
     scaled = float(value) * float(factor)
     nearest = int(round(scaled))
-    if abs(scaled - nearest) > TOLERANCE * max(ONE, abs(scaled)):
+    if abs(scaled - nearest) > TOLERANCE * max(1.0, abs(scaled)):
         raise ModelingError(reason)
-    if nearest < ONE:
+    if nearest < 1:
         raise ModelingError(reason)
     return nearest
 
@@ -230,7 +219,7 @@ def _resolve_efficiency(
     value: Any, *, axis_hint: str, aic_count: int, hbm_peak: float,
 ) -> tuple[float, dict[str, str]]:
     if value is None:
-        return ONE, {}
+        return 1.0, {}
     curve = coerce_curve(value, axis_hint=axis_hint)
     assert curve is not None
     if curve.axis == AXIS_AIC_COUNT:
@@ -255,9 +244,9 @@ def _scale_owner_units(units: dict[str, Any], s_c: float, s_v: float) -> dict[st
     result = dict(units)
     for name, value in list(result.items()):
         if name in AIC_OWNER_UNITS:
-            result[name] = max(ONE, int(round(int(value) * s_c)))
+            result[name] = max(1, int(round(int(value) * s_c)))
         elif name in AIV_OWNER_UNITS:
-            result[name] = max(ONE, int(round(int(value) * s_v)))
+            result[name] = max(1, int(round(int(value) * s_v)))
     return result
 
 
@@ -284,7 +273,7 @@ def _strip_derived_instruction_rates(
         count = int(units.get(service.owner_axis, data.get("compute_units", DEFAULT_DEVICE_COUNT)) or DEFAULT_DEVICE_COUNT)
         canonical = float(service.per_owner_rate) * count
         current = float(rates[name])
-        if service.clock_hz is not None or abs(current - canonical) <= TOLERANCE * max(ONE, abs(canonical)):
+        if service.clock_hz is not None or abs(current - canonical) <= TOLERANCE * max(1.0, abs(canonical)):
             rates.pop(name)
             assumptions[f"derivation.recomputed_service.{name}"] = "from_owner_supply"
         else:
@@ -297,12 +286,115 @@ def _strip_derived_instruction_rates(
             continue
         count = int(units.get(service.owner_axis, data.get("compute_units", DEFAULT_DEVICE_COUNT)) or DEFAULT_DEVICE_COUNT)
         canonical = float(service.per_owner_rate) * count
-        if service.clock_hz is not None or abs(float(mode["rate"]) - canonical) <= TOLERANCE * max(ONE, abs(canonical)):
+        if service.clock_hz is not None or abs(float(mode["rate"]) - canonical) <= TOLERANCE * max(1.0, abs(canonical)):
             mode.pop("rate")
             assumptions[f"derivation.recomputed_mode.{name}"] = "from_owner_supply"
         else:
             assumptions[f"derivation.explicit_mode_override.{name}"] = "preserved"
     data["service_modes"] = modes
+
+
+def _derive_single_device(
+    device: dict[str, Any],
+    base_die: Any,
+    *,
+    arch_family: str,
+    sku: str,
+    core_override: bool,
+    new_aic: int,
+    new_aiv: int,
+    s_c: float,
+    s_v: float,
+    memory_bytes: int | None,
+    raw_peak: float | None,
+    hbm_efficiency: Any,
+    hbm_eta: float,
+    mte2_efficiency: Any,
+    mte2_eta: float,
+    ceiling: float | None,
+    assumptions: dict[str, str],
+) -> None:
+    """Apply scaled core, buffer, peak, HBM/MTE2 rate and cacheline derivation to one die."""
+    dev_aic = int(device.get("compute_units", 1) or 1)
+    dev_aiv = int((device.get("resource_units") or {}).get("vector", dev_aic))
+    device["compute_units"] = new_aic if core_override else dev_aic
+    units = _scale_owner_units(dict(device.get("resource_units", {})), s_c, s_v)
+    units["vector"] = new_aiv if core_override else dev_aiv
+    buffers = dict(device.get("buffer_units", {}))
+    for name, value in list(buffers.items()):
+        if name in AIC_BUFFER_UNITS:
+            buffers[name] = max(1, int(round(int(value) * s_c)))
+        elif name in AIV_BUFFER_UNITS:
+            buffers[name] = max(1, int(round(int(value) * s_v)))
+    device["buffer_units"] = buffers
+
+    aliases = dict(device.get("compute_peak_aliases", {}))
+    alias_keys = set(aliases)
+    peaks = {
+        name: (float(value) * s_c if name not in alias_keys else float(value))
+        for name, value in device.get("compute_peaks", {}).items()
+    }
+    for name, target in list(aliases.items()):
+        if target in peaks:
+            peaks[name] = peaks[target]
+    if arch_family == A5_FAMILY and MXFP4_ALIAS not in peaks and MXFP4_ALIAS not in aliases:
+        target = FP8_E4M3 if FP8_E4M3 in peaks else (FP8_GENERIC if FP8_GENERIC in peaks else None)
+        if target is not None:
+            aliases[MXFP4_ALIAS] = target
+            peaks[MXFP4_ALIAS] = peaks[target]
+            assumptions["derivation.mxfp4_supply_alias"] = target
+    device["compute_peak_aliases"] = aliases
+    device["compute_peaks"] = peaks
+
+    rates = _scale_rates(dict(device.get("rates", {})), s_c, s_v)
+    if memory_bytes is not None:
+        device["memory_bytes"] = _positive_count(memory_bytes, "hardware_derivation_memory_invalid")
+    if raw_peak is not None:
+        rates["hbm"] = raw_peak * hbm_eta
+        assumptions["derivation.hbm_peak_bytes_per_s"] = repr(raw_peak)
+        assumptions["derivation.hbm_rate_bytes_per_s"] = repr(rates["hbm"])
+    elif hbm_efficiency is not None and "hbm" in rates:
+        rates["hbm"] = float(rates["hbm"]) * hbm_eta
+        assumptions["derivation.hbm_rate_bytes_per_s"] = repr(rates["hbm"])
+    if mte2_efficiency is not None:
+        for name in ("mte2_aic", "mte2_aiv"):
+            if name in rates:
+                rates[name] = float(rates[name]) * mte2_eta
+    if ceiling is not None:
+        rates = apply_mte2_ceiling(rates, ceiling)
+        assumptions["derivation.mte2_ceiling_bytes_per_s"] = repr(ceiling)
+    if "mte2_aic" in rates and "mte2_aiv" in rates:
+        rates["mte2"] = min(float(rates["mte2_aic"]), float(rates["mte2_aiv"]))
+
+    hbm_scale = float(rates["hbm"]) / float(dict(base_die.rates)["hbm"])
+    for name, mode in device.get("service_modes", {}).items():
+        resource = mode.get("resource")
+        if mode.get("rate") is None:
+            continue
+        if resource == "hbm" or name in DRAM_BOUND_MODES:
+            mode["rate"] = float(mode["rate"]) * hbm_scale
+        elif resource in AIC_RATE_KEYS:
+            mode["rate"] = float(mode["rate"]) * s_c
+        elif resource in AIV_RATE_KEYS:
+            mode["rate"] = float(mode["rate"]) * s_v
+
+    services = (device.get("compute_arch") or {}).get("instruction_services") or {}
+    cacheline = services.get(HBM_CACHELINE_SERVICE)
+    if isinstance(cacheline, dict) and cacheline.get("clock_hz") is None:
+        if HBM_CACHELINE_SERVICE not in base_die.instruction_unit_overrides:
+            units.pop(HBM_CACHELINE_SERVICE, None)
+        owners = max(1, int(units.get(HBM_CACHELINE_SERVICE, units.get("vector", new_aiv))))
+        cacheline["per_owner_rate"] = float(rates["hbm"]) / (HBM_CACHELINE_BYTES * owners)
+        if HBM_CACHELINE_SERVICE not in base_die.linked_rate_overrides:
+            rates.pop(HBM_CACHELINE_SERVICE, None)
+            assumptions[f"derivation.recomputed_service.{HBM_CACHELINE_SERVICE}"] = "from_owner_supply"
+        cacheline_mode = (device.get("service_modes") or {}).get(HBM_CACHELINE_SERVICE)
+        if isinstance(cacheline_mode, dict) and HBM_CACHELINE_SERVICE not in base_die.instruction_mode_overrides:
+            cacheline_mode.pop("rate", None)
+    device["resource_units"] = units
+    device["rates"] = rates
+    _strip_derived_instruction_rates(device, base_die.compute_arch, assumptions)
+    device["sku"] = sku
 
 
 def derive_hardware_sku(
@@ -322,23 +414,21 @@ def derive_hardware_sku(
     if not base_hardware.dies:
         raise ModelingError("hardware_derivation_requires_devices")
     if (aic_count is not None or aiv_count is not None) and not base_hardware.homogeneous:
-        raise ModelingError(
-            "hardware_derivation_requires_per_device_core_mapping")
+        raise ModelingError("hardware_derivation_requires_per_device_core_mapping")
     data = base_hardware.to_dict()
     devices = list(data.get("devices", ()))
     core_override = aic_count is not None or aiv_count is not None
-    base_aic = int(devices[FIRST].get("compute_units", ONE) or ONE)
-    base_aiv = int((devices[FIRST].get("resource_units") or {}).get("vector", base_aic))
+    base_aic = int(devices[0].get("compute_units", 1) or 1)
+    base_aiv = int((devices[0].get("resource_units") or {}).get("vector", base_aic))
     new_aic = base_aic if aic_count is None else _positive_count(
         aic_count, "hardware_derivation_aic_count_invalid")
-    s_c = float(new_aic) / float(base_aic) if core_override else float(ONE)
+    s_c = float(new_aic) / float(base_aic) if core_override else 1.0
     if aiv_count is None:
-        new_aiv = (_exact_scaled(base_aiv, s_c,
-                                 "hardware_derivation_aiv_count_not_integral")
+        new_aiv = (_exact_scaled(base_aiv, s_c, "hardware_derivation_aiv_count_not_integral")
                    if core_override else base_aiv)
     else:
         new_aiv = _positive_count(aiv_count, "hardware_derivation_aiv_count_invalid")
-    s_v = float(new_aiv) / float(base_aiv) if core_override else float(ONE)
+    s_v = float(new_aiv) / float(base_aiv) if core_override else 1.0
     assumptions: dict[str, str] = dict(data.get("assumptions", {}))
     assumptions.update({
         "derivation.base": base_hardware.sku or base_hardware.name,
@@ -355,114 +445,27 @@ def derive_hardware_sku(
         mte2_ceiling_bytes_per_s, "hardware_derivation_mte2_ceiling_invalid")
     hbm_eta, hbm_provenance = _resolve_efficiency(
         hbm_efficiency, axis_hint=AXIS_HBM_PEAK, aic_count=new_aic,
-        hbm_peak=(raw_peak if raw_peak is not None
-                  else float(devices[FIRST].get("rates", {}).get("hbm", ONE))))
+        hbm_peak=(raw_peak if raw_peak is not None else float(devices[0].get("rates", {}).get("hbm", 1.0))))
     assumptions.update(hbm_provenance)
     if hbm_efficiency is not None:
         assumptions["derivation.hbm_efficiency"] = repr(hbm_eta)
     mte2_eta, mte2_provenance = _resolve_efficiency(
         mte2_efficiency, axis_hint=AXIS_AIC_COUNT, aic_count=new_aic,
-        hbm_peak=(raw_peak if raw_peak is not None else ONE))
-    assumptions.update({key.replace("efficiency", "mte2_efficiency", ONE): value
-                        for key, value in mte2_provenance.items()})
+        hbm_peak=(raw_peak if raw_peak is not None else 1.0))
+    assumptions.update({
+        key.replace("efficiency", "mte2_efficiency", 1): value
+        for key, value in mte2_provenance.items()
+    })
     for device_index, device in enumerate(devices):
-        device_arch = base_hardware.dies[device_index].compute_arch
-        dev_aic = int(device.get("compute_units", ONE) or ONE)
-        dev_aiv = int((device.get("resource_units") or {}).get("vector", dev_aic))
-        device["compute_units"] = new_aic if core_override else dev_aic
-        units = _scale_owner_units(
-            dict(device.get("resource_units", {})), s_c, s_v)
-        units["vector"] = new_aiv if core_override else dev_aiv
-        device["resource_units"] = units
-        buffers = dict(device.get("buffer_units", {}))
-        for name, value in list(buffers.items()):
-            if name in AIC_BUFFER_UNITS:
-                buffers[name] = max(ONE, int(round(int(value) * s_c)))
-            elif name in AIV_BUFFER_UNITS:
-                buffers[name] = max(ONE, int(round(int(value) * s_v)))
-        device["buffer_units"] = buffers
-        aliases = dict(device.get("compute_peak_aliases", {}))
-        alias_keys = set(aliases)
-        peaks = {name: (float(value) * s_c if name not in alias_keys else float(value))
-                 for name, value in device.get("compute_peaks", {}).items()}
-        for name, target in list(aliases.items()):
-            if target in peaks:
-                peaks[name] = peaks[target]
-        if (base_hardware.arch_family == A5_FAMILY
-                and MXFP4_ALIAS not in peaks and MXFP4_ALIAS not in aliases):
-            target = FP8_E4M3 if FP8_E4M3 in peaks else (
-                FP8_GENERIC if FP8_GENERIC in peaks else None)
-            if target is not None:
-                aliases[MXFP4_ALIAS] = target
-                peaks[MXFP4_ALIAS] = peaks[target]
-                assumptions["derivation.mxfp4_supply_alias"] = target
-        device["compute_peak_aliases"] = aliases
-        device["compute_peaks"] = peaks
-        rates = _scale_rates(dict(device.get("rates", {})), s_c, s_v)
-        if memory_bytes is not None:
-            capacity = _positive_count(memory_bytes, "hardware_derivation_memory_invalid")
-            device["memory_bytes"] = capacity
-        if raw_peak is not None:
-            rates["hbm"] = raw_peak * hbm_eta
-            assumptions["derivation.hbm_peak_bytes_per_s"] = repr(raw_peak)
-            assumptions["derivation.hbm_rate_bytes_per_s"] = repr(rates["hbm"])
-        elif hbm_efficiency is not None and "hbm" in rates:
-            rates["hbm"] = float(rates["hbm"]) * hbm_eta
-            assumptions["derivation.hbm_rate_bytes_per_s"] = repr(rates["hbm"])
-        if mte2_efficiency is not None:
-            for name in ("mte2_aic", "mte2_aiv"):
-                if name in rates:
-                    rates[name] = float(rates[name]) * mte2_eta
-        if ceiling is not None:
-            rates = apply_mte2_ceiling(rates, ceiling)
-            assumptions["derivation.mte2_ceiling_bytes_per_s"] = repr(ceiling)
-        if "mte2_aic" in rates and "mte2_aiv" in rates:
-            rates["mte2"] = min(float(rates["mte2_aic"]), float(rates["mte2_aiv"]))
-        original_hbm = dict(base_hardware.dies[device_index].rates)["hbm"]
-        hbm_scale = float(rates["hbm"]) / float(original_hbm)
-        # A service mode's duration is work / mode_rate.  Scaling only the
-        # underlying HBM resource would leave an explicit mode rate unchanged,
-        # so carry the die's effective bandwidth ratio exactly once.  On-core
-        # aggregate modes follow their physical owner count instead.
-        for name, mode in device.get("service_modes", {}).items():
-            resource = mode.get("resource")
-            if mode.get("rate") is None:
-                continue
-            if resource == "hbm" or name in DRAM_BOUND_MODES:
-                mode["rate"] = float(mode["rate"]) * hbm_scale
-            elif resource in AIC_RATE_KEYS:
-                mode["rate"] = float(mode["rate"]) * s_c
-            elif resource in AIV_RATE_KEYS:
-                mode["rate"] = float(mode["rate"]) * s_v
-        # A scalar HBM line is one 128-byte transaction over the die's whole
-        # AIV population.  Recompute the per-owner share from the effective
-        # bandwidth and the derived owner count, and drop round-tripped rate/
-        # unit entries unless the base explicitly overrode them.
-        base_die = base_hardware.dies[device_index]
-        services = (device.get("compute_arch") or {}).get("instruction_services") or {}
-        cacheline = services.get(HBM_CACHELINE_SERVICE)
-        if isinstance(cacheline, dict) and cacheline.get("clock_hz") is None:
-            if HBM_CACHELINE_SERVICE not in base_die.instruction_unit_overrides:
-                units.pop(HBM_CACHELINE_SERVICE, None)
-            owners = max(
-                ONE,
-                int(units.get(HBM_CACHELINE_SERVICE, units.get("vector", new_aiv))),
-            )
-            cacheline["per_owner_rate"] = (
-                float(rates["hbm"]) / (HBM_CACHELINE_BYTES * owners))
-            if HBM_CACHELINE_SERVICE not in base_die.linked_rate_overrides:
-                rates.pop(HBM_CACHELINE_SERVICE, None)
-                assumptions[f"derivation.recomputed_service.{HBM_CACHELINE_SERVICE}"] = (
-                    "from_owner_supply"
-                )
-            cacheline_mode = (device.get("service_modes") or {}).get(HBM_CACHELINE_SERVICE)
-            if (isinstance(cacheline_mode, dict)
-                    and HBM_CACHELINE_SERVICE not in base_die.instruction_mode_overrides):
-                cacheline_mode.pop("rate", None)
-        device["resource_units"] = units
-        device["rates"] = rates
-        _strip_derived_instruction_rates(device, device_arch, assumptions)
-        device["sku"] = sku
+        _derive_single_device(
+            device, base_hardware.dies[device_index],
+            arch_family=base_hardware.arch_family, sku=sku,
+            core_override=core_override, new_aic=new_aic, new_aiv=new_aiv,
+            s_c=s_c, s_v=s_v, memory_bytes=memory_bytes,
+            raw_peak=raw_peak, hbm_efficiency=hbm_efficiency, hbm_eta=hbm_eta,
+            mte2_efficiency=mte2_efficiency, mte2_eta=mte2_eta,
+            ceiling=ceiling, assumptions=assumptions,
+        )
     data["name"] = sku
     data["sku"] = sku
     data["hardware_key"] = sku

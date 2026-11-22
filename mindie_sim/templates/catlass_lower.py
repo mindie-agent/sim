@@ -32,7 +32,7 @@ from .contracts import SemanticWorkItem, ceil_div, eligible_matrix_engines, evg_
 from .fuse_region import Lowering, ring_credit, solve_template_tile
 
 _NOMINAL_BUFFER_ALIGNMENT = 32
-_PURE_LOWER_CACHE_SIZE = 512
+_PURE_LOWER_CACHE_SIZE = 128
 A8W4_PROLOGUE_SUBBLOCK_ALIGNMENT = 32
 A8W4_PROLOGUE_UB_SLOT_BYTES = 2 * 32 * 1024
 GATHER_SCATTER_FULL_LOAD_UB_BYTES = 216 * 1024

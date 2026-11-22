@@ -442,7 +442,7 @@ from mindie_sim.schema.common import ModelingError
 #: measured value enters it. One probe of the same declaration re-executes every
 #: operator through the Engine; only repeated frontend construction is skipped.
 _GRAPH_CACHE: dict = {}
-_GRAPH_CACHE_LIMIT = 4
+_GRAPH_CACHE_LIMIT = 2
 
 
 def _freeze_key(value):
@@ -478,8 +478,8 @@ def _declared_graphs(case, *, phase, tokens, context, sequences, scope,
         parsed, phase=phase, tokens=tokens, context=context,
         sequences=sequences, scope=scope,
         apply_body_defaults=apply_body_defaults, padded_idle=padded_idle)
-    if len(_GRAPH_CACHE) >= _GRAPH_CACHE_LIMIT:
-        _GRAPH_CACHE.clear()
+    while len(_GRAPH_CACHE) >= _GRAPH_CACHE_LIMIT:
+        _GRAPH_CACHE.pop(next(iter(_GRAPH_CACHE)))
     _GRAPH_CACHE[key] = (parsed, graphs)
     return parsed, graphs
 

@@ -197,6 +197,24 @@ def solve_deployment(
     return _solve_deployment(model_arg, hw_arg, **kwargs)
 
 
+def model_target_ceiling(
+    model: ModelInput,
+    hardware: HardwareInput = "a5",
+    /,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """First-class Modeling Mode entrypoint solving Before vs After Iso-SLA ceiling."""
+    from mindie_sim.public.formula_sdk import model_target_ceiling as _model_target_ceiling
+
+    model_arg: Any = str(model) if isinstance(model, Path) else (
+        deepcopy(dict(model)) if isinstance(model, Mapping) else model
+    )
+    hw_arg: Any = (
+        deepcopy(dict(hardware)) if isinstance(hardware, Mapping) else hardware
+    )
+    return _model_target_ceiling(model_arg, hw_arg, **kwargs)
+
+
 def sweep_topology(
     case: CaseInput,
     request: SweepRequest,
@@ -266,6 +284,7 @@ __all__ = [
     "evaluate_step",
     "evaluate_three_tiers",
     "export_structure",
+    "model_target_ceiling",
     "optimize_ladder",
     "solve_deployment",
     "solve_optimal_deployment",

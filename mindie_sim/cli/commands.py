@@ -559,6 +559,8 @@ def _dispatch_catalog(args: argparse.Namespace) -> object:
 
 def _dispatch_solve(args: argparse.Namespace) -> object:
     from mindie_sim.solve import solve_deployment
+    plan_path = getattr(args, "rewrite_plan", None)
+    rewrite_plan = read_json(plan_path, bounded=True) if plan_path else None
     return solve_deployment(
         args.model,
         args.hardware,
@@ -590,6 +592,8 @@ def _dispatch_solve(args: argparse.Namespace) -> object:
         trace_path=getattr(args, "trace", None),
         compare_track=str(getattr(args, "compare_track", None) or "unmerged_pr"),
         target_track=str(getattr(args, "target_track", None) or "expected_ideal"),
+        mode=str(getattr(args, "mode", None) or "modeling"),
+        rewrite_plan=rewrite_plan,
     )
 
 

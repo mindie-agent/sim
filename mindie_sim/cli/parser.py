@@ -291,6 +291,10 @@ def _add_catalog_and_solve_parsers(sub) -> None:
                        choices=("raw_eager", "merged", "unmerged_pr", "expected_ideal"))
     solve.add_argument("--target-track", default="expected_ideal",
                        choices=("raw_eager", "merged", "unmerged_pr", "expected_ideal"))
+    solve.add_argument("--mode", choices=("modeling", "simulation"), default="modeling",
+                       help="modeling (Before sim vs After SLA target ceiling) or simulation (Layer-2 bound ops only)")
+    solve.add_argument("--rewrite-plan", default=None,
+                       help="optional Pass-2 Agent semantic rewrite plan JSON")
     solve.add_argument("--output", "-o")
 
     catalog = sub.add_parser("catalog", help="list models, hardware SKUs, topology presets, and quant modes")

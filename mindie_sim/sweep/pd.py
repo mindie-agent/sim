@@ -15,22 +15,94 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from concurrent.futures import ProcessPoolExecutor
 from copy import deepcopy
-from dataclasses import replace
+from dataclasses import fields as dataclass_fields, replace
+import ctypes
+import gc
 import math
-import multiprocessing
-import os
+import re
+import sys
 from typing import Any
 
+try:
+    from mindie_sim.catalog.context_parallel import (
+        legal_vllm_ascend_dcp_values,
+        validate_vllm_ascend_dcp_codomain,
+    )
+except ImportError:  # Standalone pre-merge compatibility before catalog DCP helpers land.
+    from mindie_sim.catalog.context_parallel import is_v41_replicated_cache_model
+
+    def _model_dcp_attention_class(model: Any) -> str:
+        if is_v41_replicated_cache_model(model):
+            return "replicated_cache"
+        plans = tuple(getattr(model, "layer_plans", ()) or ()) or (model,)
+        if any(
+            str(getattr(lp, "attention", "") or "").lower() == "dsa"
+            or (str(getattr(lp, "attention", "") or "").lower() == "mla"
+                and bool(getattr(lp, "indexer", False)))
+            for lp in plans
+        ):
+            return "sfa_dsa"
+        if any(
+            str(getattr(lp, "attention", "") or "").lower() == "mla"
+            or str(getattr(lp, "cache_kind", "") or "").lower() == "window_compressed"
+            for lp in plans
+        ):
+            return "mla"
+        return "gqa"
+
+    def legal_vllm_ascend_dcp_values(
+        model: Any, *, tp: int, pcp: int = 1,
+    ) -> tuple[int, ...]:
+        tp_n, pcp_n = max(1, int(tp)), max(1, int(pcp))
+        kind = _model_dcp_attention_class(model)
+        if kind in {"gqa", "replicated_cache"}:
+            return (1,)
+        if pcp_n > 1:
+            return tuple(dict.fromkeys((1, pcp_n, pcp_n * tp_n)))
+        if kind == "sfa_dsa":
+            return (1, tp_n) if tp_n > 1 else (1,)
+        divisors = [1]
+        width = 2
+        while width <= tp_n:
+            if tp_n % width == 0:
+                divisors.append(width)
+            width *= 2
+        if tp_n not in divisors:
+            divisors.append(tp_n)
+        return tuple(sorted(set(divisors)))
+
+    def validate_vllm_ascend_dcp_codomain(
+        model: Any, parallel: Any,
+    ) -> tuple[bool, str | None]:
+        dcp = max(1, int(getattr(parallel, "cp", 1) or 1))
+        tp = max(1, int(getattr(parallel, "tp", 1) or 1))
+        pcp = max(1, int(getattr(parallel, "pcp", 1) or 1))
+        if dcp <= 1:
+            return True, None
+        kind = _model_dcp_attention_class(model)
+        if kind == "replicated_cache":
+            return False, "vllm_ascend_replicated_cache_requires_dcp_1"
+        if kind == "gqa":
+            return False, "vllm_ascend_gqa_dcp_deprecated"
+        legal = legal_vllm_ascend_dcp_values(model, tp=tp, pcp=pcp)
+        if dcp in legal:
+            return True, None
+        if pcp > 1:
+            return False, f"vllm_ascend_pcp_dcp_must_be_pcp_or_pcp_times_tp:dcp={dcp},pcp={pcp},tp={tp}"
+        if kind == "sfa_dsa":
+            return False, f"vllm_ascend_sfa_dcp_must_equal_tp:dcp={dcp},tp={tp}"
+        return False, f"vllm_ascend_mla_dcp_must_divide_tp:dcp={dcp},tp={tp}"
+from mindie_sim.prediction.body_defaults import TargetGraphSet
 from mindie_sim.prediction.capacity import Memory
 from mindie_sim.prediction.disaggregated.handoff import compute_pd_handoff_plan
 from mindie_sim.prediction.efficiency import (
-    DEFAULT_SLA_SCENARIOS,
     _lower_and_run_graph,
     _resolve_speculative_tokens,
-    solve_sla_sizing,
 )
+from mindie_sim.prediction.evaluation import EvaluationContext
+from mindie_sim.prediction.graph_analysis import graph_costs
+from mindie_sim.prediction.sharding.local_tp import rank_zero_graph_reuse
 from mindie_sim.prediction.offload.policy import (
     _DEFAULT_SSD_BANDWIDTH_UTILIZATION,
     _DEFAULT_SSD_LATENCY_US,
@@ -61,15 +133,86 @@ AUTO_PD_TRANSFER_MODES = (
 MAX_COLOCATED_CANDIDATES = 10
 MAX_PD_STAGE_CANDIDATES = 6
 ARCHETYPE_SCREEN_MIN_LAYERS = 12
+ARCHETYPE_FOLD_MIN_LAYERS = 2
 COLOCATED_STAGE2_FINALISTS = 3
 PD_PREFILL_STAGE2_FINALISTS = 3
 PD_DECODE_STAGE2_FINALISTS = 4
-MAX_SOLVE_POOL_WORKERS = 8
 SCREEN_DECODE_BATCH_PROBE = 8
+SLA_SLACK_BOUND_TOLERANCE_MS = 0.5
+_LAYER_POSITION_FIELDS = frozenset({
+    "index", "native_layer_id", "kv_owner_layer_id",
+    "index_k_owner_layer_id", "topk_owner_layer_id",
+    "candidate_source_layer_id", "index_source_layer_id",
+})
+_LAYER_EXCLUSION_INDEX_RE = re.compile(r"((?:layers|layer|blocks|h)[._])(\d+)([._]|$)")
 _POW2_WIDTHS = (1, 2, 4, 8, 16)
 _PREFILL_PCP_WIDTHS = (1, 2, 4)
 PREFILL_PCP_MIN_PROMPT_TOKENS = 1024
 DECODE_DCP_MIN_PROMPT_TOKENS = 2048
+DEFAULT_CHUNKED_PREFILL_TOKENS = 8192
+DEFAULT_CHUNKED_BATCH_SEQ_FLOOR = 64
+PREFILL_DIRECT_MAX_TOKENS = 1024
+PREFILL_CHUNK_PROBE_TOKENS = 512
+GC_RECLAIM_MIN_WORLD_SIZE = 8
+
+
+_RECLAIM_LRU_PREFIXES = (
+    "mindie_sim.prediction.operators.",
+    "mindie_sim.prediction.ownership",
+    "mindie_sim.prediction.sharding.",
+    "mindie_sim.prediction.runtime.memory_physics",
+    "mindie_sim.prediction.engine_periodic.",
+)
+
+
+def _reclaim_sweep_memory() -> None:
+    """Release transient structural memos, cyclic GC garbage, and Linux glibc heap pages."""
+    from mindie_sim.prediction.execution.runner import Execution
+    from mindie_sim.prediction.execution.streams import clear_stream_caches
+    from mindie_sim.prediction.frontend.body_spec import _GRAPH_CACHE
+    from mindie_sim.prediction.frontend.features import _NORMAL_SUMMARY_CACHE
+    from mindie_sim.prediction.operators.matrix.matrix_mapping import _SELECT_CACHE
+    from mindie_sim.prediction.program.invocation import _HW_INV_CACHE
+    from mindie_sim.prediction.program.physical_key import _METADATA_MEMO, _SIGNATURE_MEMO
+    from mindie_sim.prediction.projections import _REPLICATED_MEMO
+    from mindie_sim.prediction.runtime.engine_types import _UNITS_MASK_CACHE
+    from mindie_sim.prediction.structure import _PARSE_MEMO
+    from mindie_sim.templates.catlass_lower import _PURE_LOWER_CACHE
+
+    clear_stream_caches()
+    for cache in (
+        Execution._isolated_scripts, _SELECT_CACHE, _PARSE_MEMO, _UNITS_MASK_CACHE,
+        _NORMAL_SUMMARY_CACHE, _GRAPH_CACHE, _METADATA_MEMO, _SIGNATURE_MEMO,
+        _PURE_LOWER_CACHE, _HW_INV_CACHE, _REPLICATED_MEMO,
+    ):
+        cache.clear()
+    for mod_name, mod in list(sys.modules.items()):
+        if mod is None or mod_name.endswith(".registry"):
+            continue
+        if not mod_name.startswith(_RECLAIM_LRU_PREFIXES):
+            continue
+        for obj in vars(mod).values():
+            clear_fn = getattr(obj, "cache_clear", None)
+            if callable(clear_fn):
+                clear_fn()
+    gc.collect()
+    if sys.platform.startswith("linux"):
+        try:
+            libc = ctypes.CDLL("libc.so.6")
+            libc.malloc_trim(0)
+        except TimeoutError:
+            raise
+        except (OSError, AttributeError):
+            pass
+
+
+def _prefill_workspace_tokens(parsed: CaseSpec, compute_tokens: int) -> int:
+    """Bound prefill activation workspace to chunk size when chunked prefill is active."""
+    if compute_tokens <= 0:
+        return 1
+    if parsed.runtime.enable_chunked_prefill and int(parsed.runtime.max_num_batched_tokens) > 0:
+        return max(1, min(int(compute_tokens), int(parsed.runtime.max_num_batched_tokens)))
+    return max(1, int(compute_tokens))
 
 
 def _pool_kv_hbm_ms(parsed_pool: CaseSpec, memory: Memory, tokens: int) -> float:
@@ -332,7 +475,7 @@ def _measure_prefill_stage(
     key = (cache_id, compute_tokens, hit_tokens) if (cache is not None and cache_id is not None) else None
     if key is not None and key in cache:
         return cache[key]
-    p_mem = Memory(p_parsed, workspace_tokens=max(1, compute_tokens))
+    p_mem = Memory(p_parsed, workspace_tokens=_prefill_workspace_tokens(p_parsed, compute_tokens))
     p_kv = p_mem.cache_bytes(prompt + 1, padded=True)
     prefill_hbm_ok = bool(
         prompt <= p_parsed.runtime.max_model_len
@@ -349,19 +492,10 @@ def _measure_prefill_stage(
         if prefill_hbm_ok else 0
     )
     if compute_tokens > 0 and prefill_hbm_ok:
-        if len(p_parsed.model.layer_plans) >= ARCHETYPE_SCREEN_MIN_LAYERS:
-            p_step = _archetype_weighted_step_ms(
-                p_parsed, phase="prefill", tokens=compute_tokens,
-                context=hit_tokens, sequences=1,
-            )
-        else:
-            _, _, p_graph = _lower_and_run_graph(
-                p_parsed, phase="prefill", tokens=compute_tokens,
-                context=hit_tokens, sequences=1, scope="model", run_graph=True,
-                fast_span_only=True,
-            )
-            assert p_graph is not None
-            p_step = float(p_graph["duration_ms"])
+        p_step = _prefill_step_ms(
+            p_parsed, compute_tokens=compute_tokens,
+            hit_tokens=hit_tokens, min_layers=ARCHETYPE_FOLD_MIN_LAYERS,
+        )
     elif compute_tokens > 0:
         p_step = math.inf
     else:
@@ -430,6 +564,18 @@ def _measure_decode_stage(
         (max(1, b_feasible) * d_dp * emitted * MS_PER_S)
         / (max(decode_step, PARETO_EPS) * float(decode_tokens))
     )
+    d_par = d_parsed.runtime.parallel
+    per_dp_dies = max(1, int(d_par.tp) * int(d_par.pcp) * int(d_par.pp))
+    n_tok_per_die = (float(max(1, b_feasible)) * emitted) / float(per_dp_dies) if b_feasible >= 1 else 0.0
+    us_per_tok_die = (decode_step * US_PER_MS) / n_tok_per_die if n_tok_per_die > 0.0 else 0.0
+    unused_sla_slack_ms = max(0.0, float(tpot_sla_ms) - float(effective_tpot)) if tpot_ok else 0.0
+    operating_regime = (
+        "HBM_CAPACITY_BOUND"
+        if (tpot_ok and b_vram >= 1 and b_feasible >= b_vram
+            and unused_sla_slack_ms > SLA_SLACK_BOUND_TOLERANCE_MS)
+        else "SLA_LATENCY_BOUND"
+    )
+    free_hbm_gib = float(d_scen.get("free_hbm_headroom_gib", 0.0) or 0.0)
     return {
         "decode_budget": decode_budget, "length_ok": length_ok,
         "b_vram": b_vram, "b_sla": b_sla, "b_feasible": b_feasible,
@@ -437,6 +583,12 @@ def _measure_decode_stage(
         "effective_tpot": effective_tpot, "first_itl": first_itl,
         "tpot_ok": tpot_ok, "rps_d": rps_d, "raw_rps_d": raw_rps_d,
         "decode_tps": rps_d * float(output),
+        "avg_accepted_tokens": emitted,
+        "n_tok_per_die": n_tok_per_die,
+        "us_per_tok_die": us_per_tok_die,
+        "unused_sla_slack_ms": unused_sla_slack_ms,
+        "operating_regime": operating_regime,
+        "free_hbm_headroom_gib": free_hbm_gib,
     }
 
 
@@ -471,7 +623,6 @@ def _evaluate_pd_stages(
         p_parsed, prompt=prompt, compute_tokens=compute_tokens, hit_tokens=hit_tokens,
         cache=_prefill_step_cache, cache_id=_prefill_cache_id,
     )
-    prefill_ok = bool(p_step <= ttft_sla_ms)
     decode_q_tokens, _ = _resolve_speculative_tokens(
         d_parsed, output_budget=output, tokens_per_seq=None, emitted_tokens_per_seq=None,
     )
@@ -481,6 +632,7 @@ def _evaluate_pd_stages(
         p_parsed, d_parsed, total_dies=total, kv_transfer_bw_gbps=kv_transfer_bw_gbps,
     )
     if decode_tokens <= 0:
+        prefill_ok = bool(p_step <= ttft_sla_ms)
         rps_p = (
             (p_dp * MS_PER_S) / max(p_step, PARETO_EPS)
             if (prefill_ok and prefill_hbm_ok and p_step > 0.0)
@@ -491,7 +643,8 @@ def _evaluate_pd_stages(
             else "prefill_ttft_sla_exceeded" if not prefill_ok else None
         )
         return {
-            "p_step": p_step, "prefill_hbm_ok": prefill_hbm_ok, "prefill_ok": prefill_ok,
+            "p_step": p_step, "effective_ttft_ms": p_step,
+            "prefill_hbm_ok": prefill_hbm_ok, "prefill_ok": prefill_ok,
             "compute_tokens": compute_tokens, "hit_tokens": hit_tokens,
             "kv_bytes": 0.0, "unique_kv_bytes": 0.0, "kv_ms": 0.0,
             "exposed_kv_ms": 0.0, "tail_layer_kv_ms": 0.0,
@@ -501,6 +654,9 @@ def _evaluate_pd_stages(
             "b1_step": 0.0, "decode_step": 0.0, "effective_tpot": 0.0, "first_itl": 0.0,
             "decode_budget": tpot_sla_ms, "tpot_ok": True, "infeasible": infeasible,
             "link_info": link_info, "pool_metrics": None, "handoff_plan": None,
+            "avg_accepted_tokens": 1.0, "n_tok_per_die": 0.0, "us_per_tok_die": 0.0,
+            "unused_sla_slack_ms": 0.0, "operating_regime": "SLA_LATENCY_BOUND",
+            "free_hbm_headroom_gib": 0.0,
         }
 
     handoff = compute_pd_handoff_plan(
@@ -547,6 +703,9 @@ def _evaluate_pd_stages(
         )
         p_kv_rps_per_inst = MS_PER_S / max(kv_ms, 1e-9)
 
+    prefill_compute_ok = bool(p_step <= ttft_sla_ms)
+    effective_ttft_ms = p_step + (exposed_kv_ms if mode == "direct_blocking_d2d" else 0.0)
+    prefill_ok = bool(effective_ttft_ms <= ttft_sla_ms)
     rps_p = (p_dp * per_rep) if (prefill_ok and prefill_hbm_ok) else 0.0
     dec = _measure_decode_stage(
         d_parsed, prompt=prompt, output=output, eff_decode=eff_decode,
@@ -556,14 +715,16 @@ def _evaluate_pd_stages(
     )
     infeasible = (
         "prefill_hbm_oom" if not prefill_hbm_ok
-        else "prefill_ttft_sla_exceeded" if not prefill_ok
+        else "prefill_ttft_sla_exceeded" if not prefill_compute_ok
         else "decode_max_model_len_exceeded" if not dec["length_ok"]
         else "decode_hbm_oom" if dec["b_vram"] < 1
         else "effective_tpot_sla_exceeded" if not dec["tpot_ok"]
+        else "prefill_ttft_sla_exceeded" if not prefill_ok
         else None
     )
     return {
-        "p_step": p_step, "prefill_hbm_ok": prefill_hbm_ok, "prefill_ok": prefill_ok,
+        "p_step": p_step, "effective_ttft_ms": float(effective_ttft_ms),
+        "prefill_hbm_ok": prefill_hbm_ok, "prefill_ok": prefill_ok,
         "compute_tokens": compute_tokens, "hit_tokens": hit_tokens,
         "kv_bytes": kv_bytes, "unique_kv_bytes": float(handoff["unique_kv_bytes"]),
         "kv_ms": kv_ms, "exposed_kv_ms": exposed_kv_ms, "tail_layer_kv_ms": tail_layer_kv_ms,
@@ -600,24 +761,14 @@ def _mark_pd_pareto(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def sweep_pd_disaggregation_ratios(
-    prefill_case: CaseSpec | Mapping[str, Any],
-    decode_case: CaseSpec | Mapping[str, Any],
-    *,
-    total_dies: int,
-    prompt_tokens: int | None = None,
-    output_tokens: int | None = None,
-    decode_context: int | None = None,
-    ttft_sla_ms: float | None = None,
-    tpot_sla_ms: float | None = None,
-    kv_transfer_bw_gbps: float | None = None,
-    pd_transfer_mode: str = "direct_blocking_d2d",
-    pool_dram_ratio: float | None = None,
-    pool_ssd_ratio: float = 0.0,
-    pool_prefix_hit_ratio: float = 0.0,
-    ddr_bw_gbps: float | None = None,
-    ssd_bw_gbps: float | None = None,
-    max_sequences_per_dp: int | None = None,
-    allow_unconstrained_ttft: bool = False,
+    prefill_case: CaseSpec | Mapping[str, Any], decode_case: CaseSpec | Mapping[str, Any], *,
+    total_dies: int, prompt_tokens: int | None = None, output_tokens: int | None = None,
+    decode_context: int | None = None, ttft_sla_ms: float | None = None,
+    tpot_sla_ms: float | None = None, kv_transfer_bw_gbps: float | None = None,
+    pd_transfer_mode: str = "direct_blocking_d2d", pool_dram_ratio: float | None = None,
+    pool_ssd_ratio: float = 0.0, pool_prefix_hit_ratio: float = 0.0,
+    ddr_bw_gbps: float | None = None, ssd_bw_gbps: float | None = None,
+    max_sequences_per_dp: int | None = None, allow_unconstrained_ttft: bool = False,
     _prefill_step_cache: dict[tuple[int, int, int], tuple[Memory, bool, int, float]] | None = None,
     _prefill_cache_id: int | None = None,
     _decode_sla_cache: dict[tuple[int, float], dict[str, Any]] | None = None,
@@ -719,7 +870,9 @@ def sweep_pd_disaggregation_ratios(
         "first_decode_itl_ms": float(st["first_itl"]),
         "prefill_instance": {
             "dies_per_instance": p_dies, "parallel": p_par.to_dict(),
-            "step_ms": float(st["p_step"]), "hbm_ok": bool(st["prefill_hbm_ok"]),
+            "step_ms": float(st["p_step"]),
+            "effective_ttft_ms": float(st.get("effective_ttft_ms", st["p_step"])),
+            "hbm_ok": bool(st["prefill_hbm_ok"]),
             "ttft_sla_ok": bool(st["prefill_ok"]), "rps_per_instance": float(st["rps_p"]),
             "effective_prefill_tokens": int(st["compute_tokens"]),
             "prefix_hit_tokens": int(st["hit_tokens"]),
@@ -735,6 +888,12 @@ def sweep_pd_disaggregation_ratios(
             "tpot_sla_ok": bool(st["tpot_ok"]),
             "tps_per_instance": float(st["decode_tps"]),
             "rps_per_instance": float(st["rps_d"]),
+            "avg_accepted_tokens": float(st["avg_accepted_tokens"]),
+            "n_tok_per_die": float(st["n_tok_per_die"]),
+            "us_per_tok_die": float(st["us_per_tok_die"]),
+            "unused_sla_slack_ms": float(st["unused_sla_slack_ms"]),
+            "operating_regime": str(st["operating_regime"]),
+            "free_hbm_headroom_gib": float(st["free_hbm_headroom_gib"]),
         },
         "candidates": rows, "ratios": rows, "pareto_frontier": front,
         "best_configuration": best,
@@ -779,6 +938,24 @@ def _seed_from_profile_topo(
     return None
 
 
+def _dcp_choices_for_candidate(
+    model_spec: Any,
+    *,
+    tp: int,
+    pcp: int,
+    prompt_tokens: int,
+    pinned: Mapping[str, int],
+) -> tuple[int, ...]:
+    if "dcp" in pinned:
+        return (int(pinned["dcp"]),)
+    if model_spec is None:
+        return (1, tp) if (tp > 1 and pcp == 1 and prompt_tokens >= DECODE_DCP_MIN_PROMPT_TOKENS) else (1,)
+    legal = legal_vllm_ascend_dcp_values(model_spec, tp=tp, pcp=pcp)
+    if prompt_tokens < DECODE_DCP_MIN_PROMPT_TOKENS and pcp == 1:
+        return (1,)
+    return legal
+
+
 def _build_colocated_candidates(
     *,
     num_devices: int,
@@ -786,6 +963,8 @@ def _build_colocated_candidates(
     layers: int,
     rec_topo: Mapping[str, Any] | None,
     pinned: Mapping[str, int],
+    model_spec: Any = None,
+    prompt_tokens: int = 0,
 ) -> list[dict[str, int]]:
     out: list[dict[str, int]] = []
     seen: set[tuple[int, ...]] = set()
@@ -802,6 +981,9 @@ def _build_colocated_candidates(
             return
         if not _matches_pinned(cand, pinned):
             return
+        if model_spec is not None and "dcp" not in pinned and dcp > 1:
+            if dcp not in legal_vllm_ascend_dcp_values(model_spec, tp=tp, pcp=pcp):
+                return
         key = (dp, tp, ep, pp, pcp, dcp, cand.get("o_proj_tp", 1), cand.get("lm_head_tp", 1))
         if key not in seen:
             seen.add(key)
@@ -812,8 +994,10 @@ def _build_colocated_candidates(
         add(seeded)
     pp_vals = (pinned["pp"],) if "pp" in pinned else (1, 2)
     pcp_vals = (pinned["pcp"],) if "pcp" in pinned else (1,)
-    dcp_vals = (pinned["dcp"],) if "dcp" in pinned else (1,)
-    tp_vals = (pinned["tp"],) if "tp" in pinned else tuple(w for w in _POW2_WIDTHS if w <= num_devices)
+    tp_vals = (
+        (pinned["tp"],) if "tp" in pinned
+        else tuple(reversed(tuple(w for w in _POW2_WIDTHS if w <= num_devices)))
+    )
     for pp in pp_vals:
         for pcp in pcp_vals:
             for tp in tp_vals:
@@ -824,10 +1008,18 @@ def _build_colocated_candidates(
                     (pinned["dp"],) if "dp" in pinned
                     else tuple(dict.fromkeys([num_devices // unit, 1]))
                 )
+                raw_dcp = _dcp_choices_for_candidate(
+                    model_spec, tp=tp, pcp=pcp, prompt_tokens=prompt_tokens, pinned=pinned,
+                )
+                dcp_choices = (
+                    tuple(reversed(raw_dcp))
+                    if prompt_tokens >= DECODE_DCP_MIN_PROMPT_TOKENS
+                    else raw_dcp
+                )
                 for dp in dp_choices:
                     if dp * unit > num_devices or dp < 1:
                         continue
-                    for dcp in dcp_vals:
+                    for dcp in dcp_choices:
                         ep_val = pinned["ep"] if "ep" in pinned else (dp * tp * pcp if is_moe else 1)
                         add({"dp": dp, "tp": tp, "ep": ep_val, "pp": pp, "pcp": pcp, "dcp": dcp})
     return out[:MAX_COLOCATED_CANDIDATES]
@@ -842,6 +1034,7 @@ def _build_pd_stage_candidates(
     prompt_tokens: int,
     rec_topo: Mapping[str, Any] | None,
     pinned: Mapping[str, int],
+    model_spec: Any = None,
 ) -> list[dict[str, int]]:
     out: list[dict[str, int]] = []
     seen: set[tuple[int, ...]] = set()
@@ -858,6 +1051,9 @@ def _build_pd_stage_candidates(
             return
         if not _matches_pinned(cand, pinned):
             return
+        if model_spec is not None and "dcp" not in pinned and dcp > 1:
+            if dcp not in legal_vllm_ascend_dcp_values(model_spec, tp=tp, pcp=pcp):
+                return
         key = (dp, tp, ep, pp, pcp, dcp, cand.get("o_proj_tp", 1), cand.get("lm_head_tp", 1))
         if key not in seen:
             seen.add(key)
@@ -866,13 +1062,14 @@ def _build_pd_stage_candidates(
     seeded = _seed_from_profile_topo(rec_topo, role, max_dies=max_dies, pinned=pinned)
     if seeded:
         add(seeded)
-    widths = tuple(w for w in _POW2_WIDTHS if w <= max_dies)
+    widths = tuple(reversed(tuple(w for w in _POW2_WIDTHS if w <= max_dies)))
     if role == "pd_prefill":
         for tp in ((pinned["tp"],) if "tp" in pinned else widths):
             for pp in ((pinned["pp"],) if "pp" in pinned else (1, 2)):
                 pcp_vals = (
                     (pinned["pcp"],) if "pcp" in pinned
-                    else (_PREFILL_PCP_WIDTHS if prompt_tokens >= PREFILL_PCP_MIN_PROMPT_TOKENS else (1,))
+                    else (tuple(reversed(_PREFILL_PCP_WIDTHS))
+                          if prompt_tokens >= PREFILL_PCP_MIN_PROMPT_TOKENS else (1,))
                 )
                 for pcp in pcp_vals:
                     dp = int(pinned.get("dp", 1))
@@ -889,13 +1086,39 @@ def _build_pd_stage_candidates(
                 if dp * tp * pp * pcp > max_dies:
                     continue
                 ep = int(pinned.get("ep", dp * tp * pcp if is_moe else 1))
+                raw_dcp = _dcp_choices_for_candidate(
+                    model_spec, tp=tp, pcp=pcp, prompt_tokens=prompt_tokens, pinned=pinned,
+                )
                 dcp_choices = (
-                    (pinned["dcp"],) if "dcp" in pinned
-                    else ((1, tp) if tp > 1 and prompt_tokens >= DECODE_DCP_MIN_PROMPT_TOKENS else (1,))
+                    tuple(reversed(raw_dcp))
+                    if prompt_tokens >= DECODE_DCP_MIN_PROMPT_TOKENS
+                    else raw_dcp
                 )
                 for dcp in dcp_choices:
                     add({"dp": dp, "tp": tp, "ep": ep, "pp": pp, "pcp": pcp, "dcp": dcp})
-    return out[:MAX_PD_STAGE_CANDIDATES]
+    if len(out) > MAX_PD_STAGE_CANDIDATES:
+        head = out[:1] if seeded else []
+        tail = sorted(
+            out[len(head):],
+            key=lambda c: (
+                c["dp"] * c["tp"] * c["pp"] * c["pcp"],
+                int(c["dcp"] > 1) if role == "pd_decode" else int(c["pcp"] > 1),
+                c["tp"],
+                c["dp"],
+            ),
+            reverse=True,
+        )
+        return (head + tail)[:MAX_PD_STAGE_CANDIDATES]
+    return out
+
+
+def _colocated_workspace_tokens(parsed: CaseSpec, prompt_tokens: int, decode_tokens: int = 1) -> int:
+    prefill_ws = (
+        min(int(prompt_tokens), int(parsed.runtime.max_num_batched_tokens))
+        if parsed.runtime.enable_chunked_prefill and int(parsed.runtime.max_num_batched_tokens) > 0
+        else int(prompt_tokens)
+    )
+    return max(1, prefill_ws, int(decode_tokens))
 
 
 def _evaluate_colocated_candidate(
@@ -907,11 +1130,13 @@ def _evaluate_colocated_candidate(
     tpot_sla_ms: float,
     mtp_tokens: int,
     max_sequences_per_dp: int | None = None,
+    probe_cache: Mapping[int, float] | None = None,
 ) -> dict[str, Any]:
     parsed = parse_case(raw_case)
     par = parsed.runtime.parallel
     used_dies = par.world_size
-    p_mem = Memory(parsed, workspace_tokens=prompt_tokens)
+    prefill_ws = _colocated_workspace_tokens(parsed, prompt_tokens)
+    p_mem = Memory(parsed, workspace_tokens=prefill_ws)
     p_kv = p_mem.cache_bytes(prompt_tokens + 1, padded=True)
     prefill_hbm_ok = bool(
         prompt_tokens <= parsed.runtime.max_model_len
@@ -922,21 +1147,20 @@ def _evaluate_colocated_candidate(
     if not prefill_hbm_ok:
         return {
             "deployment_mode": "colocated", "used_dies": used_dies, "parallel": par.to_dict(),
-            "mtp_proposal_tokens": mtp_tokens, "ttft_ms": math.inf, "effective_tpot_ms": math.inf,
-            "b_feasible": 0, "sustainable_rps": 0.0, "sustainable_tps": 0.0,
-            "sustainable_tps_per_die": 0.0, "feasible": False, "infeasible_reason": "prefill_hbm_oom",
+            "mtp_proposal_tokens": mtp_tokens, "ttft_ms": 0.0, "effective_tpot_ms": 0.0,
+            "b_feasible": 0, "b_vram_max": 0, "sustainable_rps": 0.0, "sustainable_tps": 0.0,
+            "sustainable_tps_per_die": 0.0, "avg_accepted_tokens": 1.0,
+            "n_tok_per_die": 0.0, "us_per_tok_die": 0.0,
+            "unused_sla_slack_ms": 0.0, "operating_regime": "HBM_CAPACITY_BOUND",
+            "free_hbm_headroom_gib": 0.0,
+            "feasible": False, "infeasible_reason": "prefill_hbm_oom",
         }
-    if len(parsed.model.layer_plans) >= ARCHETYPE_SCREEN_MIN_LAYERS:
-        p_step = _archetype_weighted_step_ms(
-            parsed, phase="prefill", tokens=prompt_tokens, context=0, sequences=1,
-        )
-    else:
-        _, _, p_graph = _lower_and_run_graph(
-            parsed, phase="prefill", tokens=prompt_tokens, context=0,
-            sequences=1, scope="model", run_graph=True, fast_span_only=True,
-        )
-        assert p_graph is not None
-        p_step = float(p_graph["duration_ms"])
+    rep_info = build_archetype_representative_case(parsed, min_layers=ARCHETYPE_FOLD_MIN_LAYERS)
+    p_step = _prefill_step_ms(
+        parsed, compute_tokens=prompt_tokens, hit_tokens=0,
+        min_layers=ARCHETYPE_FOLD_MIN_LAYERS,
+        rep_info=rep_info,
+    )
     ttft_ok = bool(p_step <= ttft_sla_ms)
     decode_tokens = max(0, output_tokens - 1)
     if decode_tokens == 0:
@@ -945,9 +1169,13 @@ def _evaluate_colocated_candidate(
         return {
             "deployment_mode": "colocated", "used_dies": used_dies, "parallel": par.to_dict(),
             "mtp_proposal_tokens": mtp_tokens, "ttft_ms": p_step, "effective_tpot_ms": 0.0,
-            "b_feasible": 1 if feasible else 0, "sustainable_rps": rps,
+            "b_feasible": 1 if feasible else 0, "b_vram_max": 1 if feasible else 0,
+            "sustainable_rps": rps,
             "sustainable_tps": rps * float(output_tokens),
             "sustainable_tps_per_die": (rps * float(output_tokens)) / float(used_dies),
+            "avg_accepted_tokens": 1.0, "n_tok_per_die": 0.0, "us_per_tok_die": 0.0,
+            "unused_sla_slack_ms": 0.0, "operating_regime": "SLA_LATENCY_BOUND",
+            "free_hbm_headroom_gib": 0.0,
             "feasible": feasible, "infeasible_reason": None if feasible else "prefill_sla_or_oom",
         }
     _, emit_est = _resolve_speculative_tokens(
@@ -957,10 +1185,13 @@ def _evaluate_colocated_candidate(
         parsed, sla_ms=tpot_sla_ms * max(1.0, float(emit_est)),
         context=prompt_tokens, output_budget=output_tokens,
         max_sequences_per_dp=max_sequences_per_dp,
+        workspace_tokens=prefill_ws,
+        rep_info=rep_info, probe_cache=probe_cache,
     )
     scen = d_sla["scenarios"][0]
     emitted = float(d_sla["emitted_tokens_per_seq"])
     b_feasible = int(scen["b_feasible"])
+    b_vram = int(scen.get("b_vram_max", b_feasible) or 0)
     decode_step = float(scen["step_ms_feasible"] if b_feasible >= 1 and scen.get("step_ms_feasible") is not None else scen["step_ms_at_b1"])
     tpot_ms = decode_step / max(emitted, PARETO_EPS)
     length_ok = bool(prompt_tokens + output_tokens <= parsed.runtime.max_model_len)
@@ -968,6 +1199,17 @@ def _evaluate_colocated_candidate(
     req_compute_ms = p_step + (float(decode_tokens) * decode_step) / max(float(max(1, b_feasible)) * emitted, PARETO_EPS)
     rps = (float(par.dp) * MS_PER_S) / max(req_compute_ms, PARETO_EPS) if feasible else 0.0
     tps = rps * float(output_tokens)
+    per_dp_dies = max(1, int(par.tp) * int(par.pcp) * int(par.pp))
+    n_tok_per_die = (float(b_feasible) * emitted) / float(per_dp_dies) if b_feasible >= 1 else 0.0
+    us_per_tok_die = (decode_step * US_PER_MS) / n_tok_per_die if n_tok_per_die > 0.0 else 0.0
+    unused_slack_ms = max(0.0, float(tpot_sla_ms) - float(tpot_ms)) if feasible else 0.0
+    operating_regime = (
+        "HBM_CAPACITY_BOUND"
+        if (feasible and b_vram >= 1 and b_feasible >= b_vram
+            and unused_slack_ms > SLA_SLACK_BOUND_TOLERANCE_MS)
+        else "SLA_LATENCY_BOUND"
+    )
+    dcp_ok, dcp_reason = validate_vllm_ascend_dcp_codomain(parsed.model, par)
     reason = (
         None if feasible else
         "prefill_hbm_oom" if not prefill_hbm_ok else
@@ -977,59 +1219,127 @@ def _evaluate_colocated_candidate(
     )
     return {
         "deployment_mode": "colocated", "used_dies": used_dies, "parallel": par.to_dict(),
-        "mtp_proposal_tokens": mtp_tokens, "ttft_ms": p_step, "effective_tpot_ms": tpot_ms,
-        "b_feasible": b_feasible, "sustainable_rps": rps, "sustainable_tps": tps,
+        "mtp_proposal_tokens": mtp_tokens, "ttft_ms": p_step,
+        "decode_step_ms": decode_step, "effective_tpot_ms": tpot_ms,
+        "b_feasible": b_feasible, "b_vram_max": b_vram,
+        "sustainable_rps": rps, "sustainable_tps": tps,
         "sustainable_tps_per_die": tps / float(used_dies),
+        "avg_accepted_tokens": emitted,
+        "n_tok_per_die": n_tok_per_die,
+        "us_per_tok_die": us_per_tok_die,
+        "unused_sla_slack_ms": unused_slack_ms,
+        "operating_regime": operating_regime,
+        "free_hbm_headroom_gib": float(scen.get("free_hbm_headroom_gib", 0.0) or 0.0),
+        "dcp_codomain_valid": bool(dcp_ok),
+        "dcp_codomain_reason": dcp_reason,
         "feasible": feasible, "infeasible_reason": reason,
     }
 
 
+def _layer_quant_exclusion_signature(quant: Any, layer_idx: int) -> tuple[Any, ...]:
+    """Normalized per-layer quant exclusions & category overrides matching ``layer_idx``."""
+    if quant is None:
+        return ()
+    target = str(int(layer_idx))
+    matched_excl: list[str] = []
+    for item in (getattr(quant, "exclusions", ()) or ()):
+        text = str(item)
+        m = _LAYER_EXCLUSION_INDEX_RE.search(text)
+        if m is not None and m.group(2) == target:
+            matched_excl.append(_LAYER_EXCLUSION_INDEX_RE.sub(r"\1*\3", text))
+    matched_ov: list[tuple[str, Any]] = []
+    raw_ov = getattr(quant, "category_overrides", ()) or ()
+    ov_items = raw_ov.items() if isinstance(raw_ov, Mapping) else raw_ov
+    for cat, fields in ov_items:
+        cat_s = str(cat)
+        m = _LAYER_EXCLUSION_INDEX_RE.search(cat_s)
+        if m is not None and m.group(2) == target:
+            norm_cat = _LAYER_EXCLUSION_INDEX_RE.sub(r"\1*\3", cat_s)
+            norm_f = tuple(sorted(fields.items())) if isinstance(fields, Mapping) else tuple(fields)
+            matched_ov.append((norm_cat, norm_f))
+    if not matched_excl and not matched_ov:
+        return ()
+    return (tuple(sorted(matched_excl)), tuple(sorted(matched_ov)))
+
+
+def _remap_layer_quant_exclusions(
+    quant: Any, old_to_new: Mapping[int, int],
+) -> Any:
+    """Remap per-layer quant exclusions & category overrides onto deduplicated indices."""
+    if quant is None:
+        return quant
+    exclusions = getattr(quant, "exclusions", ()) or ()
+    updated_excl: list[str] = []
+    excl_changed = False
+    for item in exclusions:
+        text = str(item)
+        m = _LAYER_EXCLUSION_INDEX_RE.search(text)
+        if m is None:
+            updated_excl.append(text)
+            continue
+        excl_changed = True
+        orig = int(m.group(2))
+        if orig in old_to_new:
+            mapped = _LAYER_EXCLUSION_INDEX_RE.sub(
+                rf"\g<1>{int(old_to_new[orig])}\g<3>", text,
+            )
+            updated_excl.append(mapped)
+    raw_ov = getattr(quant, "category_overrides", ()) or ()
+    ov_items = list(raw_ov.items()) if isinstance(raw_ov, Mapping) else list(raw_ov)
+    updated_ov: list[tuple[str, Any]] = []
+    ov_changed = False
+    for cat, fields in ov_items:
+        cat_s = str(cat)
+        m = _LAYER_EXCLUSION_INDEX_RE.search(cat_s)
+        if m is None:
+            updated_ov.append((cat_s, fields))
+            continue
+        ov_changed = True
+        orig = int(m.group(2))
+        if orig in old_to_new:
+            mapped_cat = _LAYER_EXCLUSION_INDEX_RE.sub(
+                rf"\g<1>{int(old_to_new[orig])}\g<3>", cat_s,
+            )
+            updated_ov.append((mapped_cat, fields))
+    if not excl_changed and not ov_changed:
+        return quant
+    kwargs: dict[str, Any] = {}
+    if excl_changed:
+        kwargs["exclusions"] = tuple(dict.fromkeys(updated_excl))
+    if ov_changed:
+        kwargs["category_overrides"] = tuple(sorted(updated_ov))
+    return replace(quant, **kwargs)
+
+
 def _layer_archetype_key(
-    lp: Any, stage: int, *, cand_producers: frozenset[int] = frozenset(),
+    lp: Any,
+    stage: int,
+    *,
+    cand_producers: frozenset[int] = frozenset(),
+    quant: Any = None,
 ) -> tuple[Any, ...]:
-    """Structural equivalence signature matching KeyPool, Engram/PLE, and PP stage."""
+    """Automatic structural equivalence hash over every LayerPlan + quant contract field."""
     idx = int(getattr(lp, "index", 0))
     kv_own = int(getattr(lp, "kv_owner_layer_id", -1))
     idx_own = int(getattr(lp, "index_k_owner_layer_id", -1))
     topk_own = int(getattr(lp, "topk_owner_layer_id", -1))
     cand_src = int(getattr(lp, "candidate_source_layer_id", -1))
     idx_src = int(getattr(lp, "index_source_layer_id", -1))
+    field_sig = tuple(
+        (f.name, getattr(lp, f.name))
+        for f in dataclass_fields(lp)
+        if f.name not in _LAYER_POSITION_FIELDS
+    )
     return (
         int(stage),
-        str(getattr(lp, "attention", "")),
-        str(getattr(lp, "ffn", "")),
-        str(getattr(lp, "architecture", "")),
-        bool(getattr(lp, "indexer", False)),
-        str(getattr(lp, "indexer_type", "")),
-        str(getattr(lp, "mla_variant", "")),
-        bool(getattr(lp, "mla_output_gate", False)),
-        bool(getattr(lp, "mla_use_nope", False)),
-        int(getattr(lp, "num_heads", 0)),
-        int(getattr(lp, "num_kv_heads", 0)),
-        int(getattr(lp, "head_dim", 0)),
-        int(getattr(lp, "intermediate_size", 0)),
-        int(getattr(lp, "num_experts", 0)),
-        int(getattr(lp, "top_k", 0)),
-        int(getattr(lp, "moe_intermediate_size", 0)),
-        int(getattr(lp, "num_shared_experts", 0)),
-        int(getattr(lp, "shared_intermediate_size", 0)),
-        int(getattr(lp, "linear_heads", 0)),
-        int(getattr(lp, "linear_head_dim", 0)),
-        int(getattr(lp, "expert_latent_size", 0)),
-        bool(getattr(lp, "engram", False)),
-        bool(getattr(lp, "hyper_connections", False)),
-        int(getattr(lp, "window", 0)),
-        str(getattr(lp, "cache_kind", "")),
-        str(getattr(lp, "compressor_kind", "")),
-        str(getattr(lp, "ffn_activation", "")),
+        field_sig,
         (kv_own >= 0, kv_own == idx),
         (idx_own >= 0, idx_own == idx),
         (topk_own >= 0, topk_own == idx),
-        bool(getattr(lp, "candidate_filter", False)),
-        int(getattr(lp, "candidate_topk_blocks", 0)),
         idx in cand_producers,
         cand_src >= 0,
         (idx_src >= 0, idx_src == idx),
+        _layer_quant_exclusion_signature(quant, idx),
     )
 
 
@@ -1045,10 +1355,12 @@ def _stage_counts_for_case(parsed: CaseSpec) -> tuple[int, ...]:
 
 def build_archetype_representative_case(
     parsed: CaseSpec,
+    *,
+    min_layers: int = ARCHETYPE_SCREEN_MIN_LAYERS,
 ) -> tuple[CaseSpec, dict[int, int], float]:
-    """Deduplicate identical layers while preserving KeyPool, Engram, and Draft links."""
+    """Deduplicate structurally identical layers while conserving quant, KeyPool, Engram, and Draft."""
     plans = tuple(parsed.model.layer_plans)
-    if len(plans) < ARCHETYPE_SCREEN_MIN_LAYERS:
+    if len(plans) < max(2, int(min_layers)):
         return parsed, {int(lp.index): 1 for lp in plans}, 1.0
     stage_counts = _stage_counts_for_case(parsed)
     layer_stage = [s for s, cnt in enumerate(stage_counts) for _ in range(cnt)]
@@ -1059,21 +1371,26 @@ def build_archetype_representative_case(
     groups: dict[tuple[Any, ...], list[Any]] = {}
     for lp in plans:
         st = layer_stage[lp.index] if lp.index < len(layer_stage) else 0
-        groups.setdefault(_layer_archetype_key(lp, st, cand_producers=cand_producers), []).append(lp)
+        key = _layer_archetype_key(
+            lp, st, cand_producers=cand_producers, quant=parsed.model.quant,
+        )
+        groups.setdefault(key, []).append(lp)
     if len(groups) >= len(plans) or parsed.runtime.parallel.pp > len(groups):
         return parsed, {int(lp.index): 1 for lp in plans}, 1.0
 
     old_to_new: dict[int, int] = {}
     layer_weights: dict[int, int] = {}
     rep_orig: dict[int, Any] = {}
+    rep_stages: list[int] = []
     rep_list: list[Any] = []
     last_kv = last_idx = last_topk = last_cand = -1
-    for new_idx, members in enumerate(groups.values()):
+    for new_idx, (grp_key, members) in enumerate(groups.items()):
         lp = members[0]
         old_idx = int(lp.index)
         old_to_new[old_idx] = new_idx
         layer_weights[new_idx] = len(members)
         rep_orig[new_idx] = lp
+        rep_stages.append(int(grp_key[0]))
         kv_own = int(getattr(lp, "kv_owner_layer_id", -1))
         idx_own = int(getattr(lp, "index_k_owner_layer_id", -1))
         topk_own = int(getattr(lp, "topk_owner_layer_id", -1))
@@ -1115,8 +1432,20 @@ def build_archetype_representative_case(
         )
         if remapped:
             rep_engram = replace(rep_engram, tables=remapped)
-    rep_model = replace(parsed.model, layers=len(rep_plans), layer_plans=rep_plans, auxiliary=rep_aux, engram=rep_engram)
-    rep_case = replace(parsed, model=rep_model, runtime=replace(parsed.runtime, pp_layer_partition=()))
+    rep_quant = _remap_layer_quant_exclusions(parsed.model.quant, old_to_new)
+    rep_model = replace(
+        parsed.model, layers=len(rep_plans), layer_plans=rep_plans,
+        auxiliary=rep_aux, engram=rep_engram, quant=rep_quant,
+    )
+    pp = max(1, int(parsed.runtime.parallel.pp))
+    rep_pp_part: tuple[int, ...] = ()
+    if pp > 1:
+        counts = tuple(sum(1 for st in rep_stages if st == s) for s in range(pp))
+        if all(c >= 1 for c in counts) and sum(counts) == len(rep_plans):
+            rep_pp_part = counts
+        else:
+            return parsed, {int(lp.index): 1 for lp in plans}, 1.0
+    rep_case = replace(parsed, model=rep_model, runtime=replace(parsed.runtime, pp_layer_partition=rep_pp_part))
     return rep_case, layer_weights, draft_scale
 
 
@@ -1127,60 +1456,150 @@ def _archetype_weighted_step_ms(
     tokens: int,
     context: int,
     sequences: int,
+    scope: str = "model",
+    min_layers: int = ARCHETYPE_FOLD_MIN_LAYERS,
+    rep_info: tuple[CaseSpec, dict[int, int], float] | None = None,
+    evaluation_context: EvaluationContext | None = None,
 ) -> float:
-    """Exact O(Unique Archetypes) step time conserving per-layer and draft repeat counts."""
-    rep_case, layer_weights, draft_scale = build_archetype_representative_case(parsed)
+    """Exact O(Unique Archetypes x 1 Representative Rank) step latency."""
+    if rep_info is not None:
+        rep_case, layer_weights, draft_scale = rep_info
+    else:
+        rep_case, layer_weights, draft_scale = build_archetype_representative_case(
+            parsed, min_layers=min_layers,
+        )
     reduced = (
         len(rep_case.model.layer_plans) < len(parsed.model.layer_plans)
         or draft_scale > 1.0
     )
-    _, _, graph = _lower_and_run_graph(
+    graphs, eff_case, _ = _lower_and_run_graph(
         rep_case, phase=phase, tokens=tokens, context=context,
-        sequences=sequences, scope="model", run_graph=True,
-        fast_span_only=(not reduced),
+        sequences=sequences, scope=scope, run_graph=False,
     )
-    assert graph is not None
-    rep_total = float(graph["duration_ms"])
+    eval_ctx = evaluation_context or EvaluationContext.create(eff_case)
+    ext_in = {"analysis_input": 0} if scope == "body" else None
+    has_kg = any("device_kernel_group" in dict(op.metadata) for op in graphs[0])
+    sg = (
+        TargetGraphSet({0: graphs[0]}, kernels=graphs.effective_kernels, selection=graphs.default_selection)
+        if isinstance(graphs, TargetGraphSet) else {0: graphs[0]}
+    ) if rank_zero_graph_reuse(eff_case.runtime.parallel, len(graphs), has_kg) else graphs
+    try:
+        graph = graph_costs(
+            eff_case, sg, external_inputs=ext_in, isolated=False,
+            evaluation=eval_ctx, fast_span_only=(not reduced),
+            timeline_replicas=(0,) if reduced else None,
+        )
+        rep_total = float(graph["duration_ms"])
+        timeline_rows = tuple(graph.get("timeline", ()) or ()) if reduced else ()
+    finally:
+        del graphs, sg
+        if evaluation_context is None:
+            del eval_ctx
+            if len(parsed.machine.dies) >= GC_RECLAIM_MIN_WORLD_SIZE or int(parsed.runtime.parallel.dp) > 1:
+                _reclaim_sweep_memory()
     if not reduced:
         return rep_total
 
-    layer_bounds: dict[int, list[float]] = {}
-    draft_bounds: list[float] | None = None
-    for occ in graph.get("timeline", ()) or ():
+    # Track per-(stage, layer) completion & non-root ready times so a t=0 prefetch
+    # op inside layer i cannot pull layer i's span back across earlier layers.
+    stage_layer_end: dict[int, dict[int, float]] = {}
+    stage_layer_dep_start: dict[int, dict[int, float]] = {}
+    stage_layer_any_start: dict[int, dict[int, float]] = {}
+    draft_dep_start: float | None = None
+    draft_any_start: float | None = None
+    draft_end: float | None = None
+    for occ in timeline_rows:
         if not isinstance(occ, Mapping) or int(occ.get("replica", 0) or 0) != 0:
             continue
         st = float(occ.get("ready_ms", 0.0) or 0.0)
         en = float(occ.get("complete_ms", 0.0) or 0.0)
         if en < st:
             continue
+        has_pred = bool(occ.get("predecessors"))
         op_id = str(occ.get("op_id") or "")
         is_draft = op_id.startswith("draft") or ".draft." in op_id
         if is_draft:
-            if draft_bounds is None:
-                draft_bounds = [st, en]
-            else:
-                draft_bounds[0] = min(draft_bounds[0], st)
-                draft_bounds[1] = max(draft_bounds[1], en)
+            draft_any_start = st if draft_any_start is None else min(draft_any_start, st)
+            if has_pred:
+                draft_dep_start = st if draft_dep_start is None else min(draft_dep_start, st)
+            draft_end = en if draft_end is None else max(draft_end, en)
             continue
         lyr = occ.get("layer")
         if lyr is None or int(lyr) < 0:
             continue
+        stage_id = int(occ.get("stage", 0) or 0)
         idx = int(lyr)
-        if idx not in layer_bounds:
-            layer_bounds[idx] = [st, en]
-        else:
-            layer_bounds[idx][0] = min(layer_bounds[idx][0], st)
-            layer_bounds[idx][1] = max(layer_bounds[idx][1], en)
+        ends = stage_layer_end.setdefault(stage_id, {})
+        ends[idx] = en if idx not in ends else max(ends[idx], en)
+        starts_any = stage_layer_any_start.setdefault(stage_id, {})
+        starts_any[idx] = st if idx not in starts_any else min(starts_any[idx], st)
+        if has_pred:
+            starts_dep = stage_layer_dep_start.setdefault(stage_id, {})
+            starts_dep[idx] = st if idx not in starts_dep else min(starts_dep[idx], st)
 
-    extra_target = sum(
-        float(layer_weights.get(idx, 1) - 1) * max(0.0, bounds[1] - bounds[0])
-        for idx, bounds in layer_bounds.items()
-    )
+    extra_target = 0.0
+    max_target_end = 0.0
+    for stage_id, ends in stage_layer_end.items():
+        prev_end: float | None = None
+        for idx in sorted(ends):
+            end_ms = ends[idx]
+            max_target_end = max(max_target_end, end_ms)
+            if prev_end is not None:
+                layer_span = max(0.0, end_ms - prev_end)
+            else:
+                first_start = stage_layer_dep_start.get(stage_id, {}).get(
+                    idx, stage_layer_any_start.get(stage_id, {}).get(idx, 0.0),
+                )
+                layer_span = max(0.0, end_ms - first_start)
+            prev_end = max(prev_end, end_ms) if prev_end is not None else end_ms
+            extra_target += float(layer_weights.get(idx, 1) - 1) * layer_span
+
+    draft_start = draft_dep_start if draft_dep_start is not None else draft_any_start
+    if draft_start is not None and draft_end is not None and draft_start < max_target_end <= draft_end:
+        draft_start = max_target_end
     extra_draft = (
-        (draft_scale - 1.0) * max(0.0, draft_bounds[1] - draft_bounds[0])
-        if (draft_scale > 1.0 and draft_bounds is not None) else 0.0
+        (draft_scale - 1.0) * max(0.0, draft_end - draft_start)
+        if (draft_scale > 1.0 and draft_start is not None and draft_end is not None) else 0.0
     )
     return rep_total + extra_target + extra_draft
+
+
+def _free_hbm_gib_for_batch(memory: Memory, kv_by_stage: Sequence[float], batch: int) -> float:
+    remaining = min(
+        (float(cap) - float(batch) * float(kv)
+         for row in memory.capacity for cap, kv in zip(row, kv_by_stage)),
+        default=0.0,
+    )
+    return max(0.0, remaining) / float(1024 ** 3)
+
+
+def _prefill_step_ms(
+    parsed: CaseSpec,
+    *,
+    compute_tokens: int,
+    hit_tokens: int = 0,
+    min_layers: int = ARCHETYPE_FOLD_MIN_LAYERS,
+    rep_info: tuple[CaseSpec, dict[int, int], float] | None = None,
+    evaluation_context: EvaluationContext | None = None,
+) -> float:
+    """Compute prefill latency via direct step or chunked-prefill midpoint quadrature."""
+    if compute_tokens <= 0:
+        return 0.0
+    if not parsed.runtime.enable_chunked_prefill or compute_tokens <= PREFILL_DIRECT_MAX_TOKENS:
+        return _archetype_weighted_step_ms(
+            parsed, phase="prefill", tokens=compute_tokens,
+            context=hit_tokens, sequences=1, min_layers=min_layers,
+            rep_info=rep_info, evaluation_context=evaluation_context,
+        )
+    batched_cap = int(parsed.runtime.max_num_batched_tokens or PREFILL_CHUNK_PROBE_TOKENS)
+    chunk_tok = max(1, min(int(compute_tokens), batched_cap, PREFILL_CHUNK_PROBE_TOKENS))
+    mid_ctx = int(hit_tokens) + max(0, (int(compute_tokens) - chunk_tok) // 2)
+    chunk_ms = _archetype_weighted_step_ms(
+        parsed, phase="prefill", tokens=chunk_tok,
+        context=mid_ctx, sequences=1, min_layers=min_layers,
+        rep_info=rep_info, evaluation_context=evaluation_context,
+    )
+    return chunk_ms * (float(compute_tokens) / float(chunk_tok))
 
 
 def _solve_sla_archetype_aware(
@@ -1190,22 +1609,18 @@ def _solve_sla_archetype_aware(
     context: int,
     output_budget: int,
     max_sequences_per_dp: int | None,
+    workspace_tokens: int | None = None,
+    rep_info: tuple[CaseSpec, dict[int, int], float] | None = None,
+    evaluation_context: EvaluationContext | None = None,
+    probe_cache: Mapping[int, float] | None = None,
 ) -> dict[str, Any]:
-    """Exact SLA concurrency solver using O(Archetypes) engine steps for deep models."""
-    if len(parsed.model.layer_plans) < ARCHETYPE_SCREEN_MIN_LAYERS:
-        sla_kw: dict[str, Any] = dict(
-            sla_ms=sla_ms, context=context, phase="decode",
-            output_budget=output_budget, scenarios=[DEFAULT_SLA_SCENARIOS[0]],
-        )
-        if max_sequences_per_dp is not None:
-            sla_kw["max_sequences_per_dp"] = int(max_sequences_per_dp)
-        return solve_sla_sizing(parsed, **sla_kw)
-
+    """Exact SLA concurrency solver using O(Archetypes x 1 Rank) steps."""
     q_tok, emit_est = _resolve_speculative_tokens(
         parsed, output_budget=output_budget, tokens_per_seq=None, emitted_tokens_per_seq=None,
     )
-    d_mem = Memory(parsed, workspace_tokens=max(1, int(q_tok)))
-    d_kv = d_mem.cache_bytes(context + output_budget, padded=True)
+    base_ws = int(workspace_tokens) if workspace_tokens is not None else max(1, int(q_tok))
+    d_mem = Memory(parsed, workspace_tokens=base_ws)
+    d_kv = d_mem.dp_cohort_cache_bytes(context + output_budget, padded=True)
     cap_bound = int(parsed.runtime.max_num_seqs)
     if max_sequences_per_dp is not None:
         cap_bound = min(cap_bound, int(max_sequences_per_dp))
@@ -1216,20 +1631,61 @@ def _solve_sla_archetype_aware(
         ])
         if all(cap >= 0.0 for row in d_mem.capacity for cap in row) else 0
     )
+    if b_vram > 1 and int(b_vram * q_tok) > base_ws:
+        # Refine workspace to max(base_ws, b_vram * decode_q) so both colocated
+        # and pd_decode activation buffers are never underestimated at high batch.
+        refined_mem = Memory(parsed, workspace_tokens=max(base_ws, int(b_vram * q_tok)))
+        refined_b = (
+            min([cap_bound] + [
+                int(math.floor(max(0.0, float(cap)) / float(kv)))
+                for row in refined_mem.capacity for cap, kv in zip(row, d_kv) if kv > 0
+            ])
+            if all(cap >= 0.0 for row in refined_mem.capacity for cap in row) else 0
+        )
+        d_mem, b_vram = refined_mem, min(b_vram, refined_b)
+
+    rep_info = rep_info or build_archetype_representative_case(parsed, min_layers=ARCHETYPE_FOLD_MIN_LAYERS)
+    memo: dict[int, float] = {int(k): float(v) for k, v in (probe_cache or {}).items() if int(k) >= 1}
 
     def eval_b(seq_count: int) -> float:
-        return _archetype_weighted_step_ms(
-            parsed, phase="decode", tokens=max(1, int(q_tok)),
-            context=context, sequences=max(1, int(seq_count)),
-        )
+        key = max(1, int(seq_count))
+        if key not in memo:
+            memo[key] = _archetype_weighted_step_ms(
+                parsed, phase="decode", tokens=max(1, int(q_tok)),
+                context=context, sequences=key,
+                rep_info=rep_info, evaluation_context=evaluation_context,
+            )
+        return memo[key]
 
-    t1 = eval_b(1)
-    if b_vram < 1 or t1 > sla_ms + PARETO_EPS:
+    if b_vram < 1:
+        t1 = eval_b(1)
         return {
             "emitted_tokens_per_seq": float(emit_est),
             "scenarios": [{
                 "b_vram_max": b_vram, "b_sla": 0 if t1 > sla_ms + PARETO_EPS else 1,
                 "b_feasible": 0, "step_ms_at_b1": t1, "step_ms_feasible": None,
+                "free_hbm_headroom_gib": _free_hbm_gib_for_batch(d_mem, d_kv, 0),
+            }],
+        }
+    if b_vram > 1:
+        t_hi = eval_b(b_vram)
+        if t_hi <= sla_ms + PARETO_EPS:
+            return {
+                "emitted_tokens_per_seq": float(emit_est),
+                "scenarios": [{
+                    "b_vram_max": b_vram, "b_sla": b_vram, "b_feasible": b_vram,
+                    "step_ms_at_b1": memo.get(1, t_hi), "step_ms_feasible": t_hi,
+                    "free_hbm_headroom_gib": _free_hbm_gib_for_batch(d_mem, d_kv, b_vram),
+                }],
+            }
+    t1 = eval_b(1)
+    if t1 > sla_ms + PARETO_EPS:
+        return {
+            "emitted_tokens_per_seq": float(emit_est),
+            "scenarios": [{
+                "b_vram_max": b_vram, "b_sla": 0, "b_feasible": 0,
+                "step_ms_at_b1": t1, "step_ms_feasible": None,
+                "free_hbm_headroom_gib": _free_hbm_gib_for_batch(d_mem, d_kv, 0),
             }],
         }
     if b_vram == 1:
@@ -1238,15 +1694,7 @@ def _solve_sla_archetype_aware(
             "scenarios": [{
                 "b_vram_max": 1, "b_sla": 1, "b_feasible": 1,
                 "step_ms_at_b1": t1, "step_ms_feasible": t1,
-            }],
-        }
-    t_hi = eval_b(b_vram)
-    if t_hi <= sla_ms + PARETO_EPS:
-        return {
-            "emitted_tokens_per_seq": float(emit_est),
-            "scenarios": [{
-                "b_vram_max": b_vram, "b_sla": b_vram, "b_feasible": b_vram,
-                "step_ms_at_b1": t1, "step_ms_feasible": t_hi,
+                "free_hbm_headroom_gib": _free_hbm_gib_for_batch(d_mem, d_kv, 1),
             }],
         }
     lo, hi = 1, b_vram
@@ -1263,48 +1711,18 @@ def _solve_sla_archetype_aware(
         "scenarios": [{
             "b_vram_max": b_vram, "b_sla": best_b, "b_feasible": best_b,
             "step_ms_at_b1": t1, "step_ms_feasible": best_t,
+            "free_hbm_headroom_gib": _free_hbm_gib_for_batch(d_mem, d_kv, best_b),
         }],
     }
 
 
-def _build_solve_pool(pool_workers: int) -> ProcessPoolExecutor | None:
-    """Create a safe ProcessPoolExecutor (POSIX fork when single-threaded, else verified spawn)."""
-    import sys
-    import threading
-    from pathlib import Path
-
-    try:
-        if multiprocessing.current_process().daemon or pool_workers < 2:
-            return None
-        methods = multiprocessing.get_all_start_methods()
-        if os.name == "posix" and "fork" in methods and threading.active_count() == 1:
-            return ProcessPoolExecutor(
-                max_workers=pool_workers,
-                mp_context=multiprocessing.get_context("fork"),
-            )
-        main_mod = sys.modules.get("__main__")
-        main_file = getattr(main_mod, "__file__", None)
-        if not main_file or str(main_file).startswith("<") or not Path(str(main_file)).is_file():
-            return None
-        return ProcessPoolExecutor(max_workers=pool_workers)
-    except Exception:
-        return None
-
-
-def _map_jobs(pool: ProcessPoolExecutor | None, fn: Any, jobs: Sequence[Any]) -> list[Any]:
-    if not jobs:
-        return []
-    if pool is None or len(jobs) < 2:
-        return [fn(j) for j in jobs]
-    return list(pool.map(fn, jobs))
-
-
-def _screen_colocated_job(args: tuple[Any, ...]) -> tuple[int, bool, float]:
+def _screen_colocated_job(args: tuple[Any, ...]) -> tuple[int, bool, float, dict[int, float]]:
     idx, raw_case, prompt_tokens, output_tokens, ttft_sla_ms, tpot_sla_ms = args
     try:
         parsed = parse_case(raw_case)
         par = parsed.runtime.parallel
-        p_mem = Memory(parsed, workspace_tokens=prompt_tokens)
+        prefill_ws = _colocated_workspace_tokens(parsed, prompt_tokens)
+        p_mem = Memory(parsed, workspace_tokens=prefill_ws)
         p_kv = p_mem.cache_bytes(prompt_tokens + 1, padded=True)
         prefill_ok = bool(
             prompt_tokens <= parsed.runtime.max_model_len
@@ -1312,11 +1730,11 @@ def _screen_colocated_job(args: tuple[Any, ...]) -> tuple[int, bool, float]:
             and all(cap >= 0.0 and cap >= kv for row in p_mem.capacity for cap, kv in zip(row, p_kv))
         )
         if not prefill_ok:
-            return idx, False, -1.0
+            return idx, False, -1.0, {}
         q_tok, emit_est = _resolve_speculative_tokens(
             parsed, output_budget=output_tokens, tokens_per_seq=None, emitted_tokens_per_seq=None,
         )
-        d_mem = Memory(parsed, workspace_tokens=max(1, int(q_tok)))
+        d_mem = Memory(parsed, workspace_tokens=prefill_ws)
         d_kv = d_mem.cache_bytes(prompt_tokens + output_tokens, padded=True)
         b_vram = min(
             [int(parsed.runtime.max_num_seqs)]
@@ -1324,30 +1742,40 @@ def _screen_colocated_job(args: tuple[Any, ...]) -> tuple[int, bool, float]:
                for row in d_mem.capacity for cap, kv in zip(row, d_kv) if kv > 0]
         ) if all(cap >= 0.0 for row in d_mem.capacity for cap in row) else 0
         if b_vram < 1:
-            return idx, False, -1.0
-        p_ms = _archetype_weighted_step_ms(parsed, phase="prefill", tokens=prompt_tokens, context=0, sequences=1)
-        if p_ms > ttft_sla_ms * 1.15:
-            return idx, False, -p_ms
+            return idx, False, -1.0, {}
+        rep_info = build_archetype_representative_case(parsed, min_layers=ARCHETYPE_SCREEN_MIN_LAYERS)
+        if math.isinf(ttft_sla_ms) and output_tokens > 1:
+            p_ms = 0.0
+        else:
+            p_ms = _prefill_step_ms(
+                parsed, compute_tokens=prompt_tokens, hit_tokens=0,
+                min_layers=ARCHETYPE_SCREEN_MIN_LAYERS,
+                rep_info=rep_info,
+            )
+            if p_ms > ttft_sla_ms * 1.15:
+                return idx, False, -p_ms, {}
         probe_b = min(b_vram, SCREEN_DECODE_BATCH_PROBE)
         d_ms = _archetype_weighted_step_ms(
-            parsed, phase="decode", tokens=max(1, int(q_tok)), context=prompt_tokens, sequences=probe_b,
+            parsed, phase="decode", tokens=max(1, int(q_tok)),
+            context=prompt_tokens, sequences=probe_b,
+            rep_info=rep_info,
         )
         est_tpot = d_ms / max(float(emit_est), PARETO_EPS)
         eff_b = float(probe_b) if est_tpot <= tpot_sla_ms * 1.25 else max(1.0, float(probe_b) * (tpot_sla_ms / max(est_tpot, PARETO_EPS)))
         req_ms = p_ms + (float(max(1, output_tokens - 1)) * d_ms) / max(eff_b * float(emit_est), PARETO_EPS)
         score = (float(par.dp) * MS_PER_S * float(output_tokens)) / max(req_ms, PARETO_EPS)
-        return idx, True, score
+        return idx, True, score, {int(probe_b): float(d_ms)}
     except (ModelingError, ValueError):
-        return idx, False, -1.0
+        return idx, False, -1.0, {}
 
 
 def _eval_colocated_job(args: tuple[Any, ...]) -> tuple[int, dict[str, Any] | None]:
-    idx, raw_case, prompt, output, ttft, tpot, mtp_n, max_seq = args
+    idx, raw_case, prompt, output, ttft, tpot, mtp_n, max_seq, probe_cache = args
     try:
         row = _evaluate_colocated_candidate(
             raw_case, prompt_tokens=prompt, output_tokens=output,
             ttft_sla_ms=ttft, tpot_sla_ms=tpot, mtp_tokens=mtp_n,
-            max_sequences_per_dp=max_seq,
+            max_sequences_per_dp=max_seq, probe_cache=probe_cache,
         )
         return idx, row
     except (ModelingError, ValueError):
@@ -1358,7 +1786,7 @@ def _screen_prefill_job(args: tuple[Any, ...]) -> tuple[int, bool, float]:
     p_idx, raw_p, prompt, compute_tokens, hit_tokens, ttft_sla_ms = args
     try:
         parsed = parse_case(raw_p)
-        p_mem = Memory(parsed, workspace_tokens=max(1, compute_tokens))
+        p_mem = Memory(parsed, workspace_tokens=_prefill_workspace_tokens(parsed, compute_tokens))
         p_kv = p_mem.cache_bytes(prompt + 1, padded=True)
         hbm_ok = bool(
             prompt <= parsed.runtime.max_model_len
@@ -1368,7 +1796,10 @@ def _screen_prefill_job(args: tuple[Any, ...]) -> tuple[int, bool, float]:
         if not hbm_ok:
             return p_idx, False, -1.0
         p_ms = (
-            _archetype_weighted_step_ms(parsed, phase="prefill", tokens=compute_tokens, context=hit_tokens, sequences=1)
+            _prefill_step_ms(
+                parsed, compute_tokens=compute_tokens, hit_tokens=hit_tokens,
+                min_layers=ARCHETYPE_SCREEN_MIN_LAYERS,
+            )
             if compute_tokens > 0 else 0.0
         )
         par = parsed.runtime.parallel
@@ -1447,6 +1878,7 @@ def _search_colocated_deployments(
     num_devices: int,
     is_moe: bool,
     layers: int,
+    model_spec: Any,
     rec_topo: Mapping[str, Any] | None,
     pinned: Mapping[str, int],
     mtp_grid: tuple[int, ...],
@@ -1455,11 +1887,11 @@ def _search_colocated_deployments(
     ttft: float,
     tpot: float,
     max_sequences_per_dp: int | None,
-    pool: ProcessPoolExecutor | None = None,
 ) -> tuple[list[dict[str, Any]], list[tuple[dict[str, Any], dict[str, Any]]]]:
     coloc_topos = _build_colocated_candidates(
         num_devices=num_devices, is_moe=is_moe, layers=layers,
         rec_topo=rec_topo, pinned=pinned,
+        model_spec=model_spec, prompt_tokens=prompt,
     )
     composed: list[tuple[int, int, dict[str, Any]]] = []
     for mtp_n in mtp_grid:
@@ -1471,27 +1903,30 @@ def _search_colocated_deployments(
         return [], []
 
     selected = composed
+    probe_caches: dict[int, dict[int, float]] = {}
     if layers >= ARCHETYPE_SCREEN_MIN_LAYERS and len(composed) > COLOCATED_STAGE2_FINALISTS:
-        screen_jobs = [(idx, raw_c, prompt, output, ttft, tpot) for idx, _, raw_c in composed]
-        screened = _map_jobs(pool, _screen_colocated_job, screen_jobs)
+        screened = [
+            _screen_colocated_job((idx, raw_c, prompt, output, ttft, tpot))
+            for idx, _, raw_c in composed
+        ]
+        probe_caches = {idx: pc for idx, _, _, pc in screened if pc}
         feasible_idx = sorted(
-            ((score, idx) for idx, ok, score in screened if ok), reverse=True,
+            ((score, idx) for idx, ok, score, _ in screened if ok), reverse=True,
         )
         if feasible_idx:
             keep = {idx for _, idx in feasible_idx[:COLOCATED_STAGE2_FINALISTS]}
             selected = [item for item in composed if item[0] in keep]
         else:
-            keep = {idx for _, idx in sorted(((sc, idx) for idx, _, sc in screened), reverse=True)[:1]}
+            keep = {idx for _, idx in sorted(((sc, idx) for idx, _, sc, _ in screened), reverse=True)[:1]}
             selected = [item for item in composed if item[0] in keep]
 
-    eval_jobs = [
-        (idx, raw_c, prompt, output, ttft, tpot, mtp_n, max_sequences_per_dp)
-        for idx, mtp_n, raw_c in selected
-    ]
     by_idx = {idx: raw_c for idx, _, raw_c in selected}
     rows: list[dict[str, Any]] = []
     feasible_entries: list[tuple[dict[str, Any], dict[str, Any]]] = []
-    for idx, row in _map_jobs(pool, _eval_colocated_job, eval_jobs):
+    for idx, mtp_n, raw_c in selected:
+        _, row = _eval_colocated_job(
+            (idx, raw_c, prompt, output, ttft, tpot, mtp_n, max_sequences_per_dp, probe_caches.get(idx))
+        )
         if row is None:
             continue
         rows.append(row)
@@ -1513,24 +1948,23 @@ def _select_and_warm_pd_finalists(
     tpot: float,
     pool_prefix_hit_ratio: float,
     max_sequences_per_dp: int | None,
-    pool: ProcessPoolExecutor | None,
 ) -> tuple[
     list[tuple[int, int, dict[str, Any]]],
     list[tuple[int, list[tuple[int, int, dict[str, Any]]]]],
     dict[tuple[int, int, int], tuple[Memory, bool, int, float]],
     dict[tuple[int, float], dict[str, Any]],
 ]:
-    """Run Stage-1 archetype screening and parallel Stage-2 cache warm-up for PD stages."""
+    """Run single-process Stage-1 archetype screening and Stage-2 cache warm-up for PD stages."""
     hit_tokens_pool = int(math.floor(prompt * float(pool_prefix_hit_ratio))) if "pooled_dram_ssd" in pd_modes else 0
     is_pool_only = len(pd_modes) == 1 and pd_modes[0] == "pooled_dram_ssd"
     base_compute_tok = max(0, prompt - hit_tokens_pool) if is_pool_only else prompt
     base_hit_tok = hit_tokens_pool if is_pool_only else 0
 
     if layers >= ARCHETYPE_SCREEN_MIN_LAYERS and len(p_cases) > PD_PREFILL_STAGE2_FINALISTS:
-        p_screen = _map_jobs(
-            pool, _screen_prefill_job,
-            [(p_idx, raw_p, prompt, base_compute_tok, base_hit_tok, ttft) for p_idx, _, raw_p in p_cases],
-        )
+        p_screen = [
+            _screen_prefill_job((p_idx, raw_p, prompt, base_compute_tok, base_hit_tok, ttft))
+            for p_idx, _, raw_p in p_cases
+        ]
         p_ok = sorted(((sc, idx) for idx, ok, sc in p_screen if ok), reverse=True)
         keep_p = (
             {idx for _, idx in p_ok[:PD_PREFILL_STAGE2_FINALISTS]} if p_ok
@@ -1539,10 +1973,10 @@ def _select_and_warm_pd_finalists(
         p_cases = [item for item in p_cases if item[0] in keep_p]
 
     if layers >= ARCHETYPE_SCREEN_MIN_LAYERS and len(all_d_cases) > PD_DECODE_STAGE2_FINALISTS:
-        d_screen = _map_jobs(
-            pool, _screen_decode_job,
-            [(idx, raw_d, prompt, output, tpot) for idx, _, raw_d in all_d_cases],
-        )
+        d_screen = [
+            _screen_decode_job((idx, raw_d, prompt, output, tpot))
+            for idx, _, raw_d in all_d_cases
+        ]
         d_ok = sorted(((sc, idx) for idx, ok, sc in d_screen if ok), reverse=True)
         keep_d = (
             {idx for _, idx in d_ok[:PD_DECODE_STAGE2_FINALISTS]} if d_ok
@@ -1556,22 +1990,16 @@ def _select_and_warm_pd_finalists(
     p_tok_pairs = {(prompt, 0)} if any(m != "pooled_dram_ssd" for m in pd_modes) else set()
     if "pooled_dram_ssd" in pd_modes:
         p_tok_pairs.add((max(0, prompt - hit_tokens_pool), hit_tokens_pool))
-    p_exact_jobs = [
-        (p_idx, raw_p, prompt, c_tok, h_tok)
-        for p_idx, _, raw_p in p_cases
-        for c_tok, h_tok in sorted(p_tok_pairs)
-    ]
-    for (p_idx, _, _, c_tok, h_tok), (_, res) in zip(
-        p_exact_jobs, _map_jobs(pool, _eval_prefill_exact_job, p_exact_jobs),
-    ):
-        if res is not None:
-            prefill_cache[(p_idx, c_tok, h_tok)] = res
+    for p_idx, _, raw_p in p_cases:
+        for c_tok, h_tok in sorted(p_tok_pairs):
+            _, res = _eval_prefill_exact_job((p_idx, raw_p, prompt, c_tok, h_tok))
+            if res is not None:
+                prefill_cache[(p_idx, c_tok, h_tok)] = res
 
-    d_exact_jobs = [
-        (idx, raw_d, prompt, output, tpot, max_sequences_per_dp)
-        for idx, _, raw_d in all_d_cases
-    ]
-    for idx, sla_key, d_sla in _map_jobs(pool, _eval_decode_exact_job, d_exact_jobs):
+    for idx, _, raw_d in all_d_cases:
+        _, sla_key, d_sla = _eval_decode_exact_job(
+            (idx, raw_d, prompt, output, tpot, max_sequences_per_dp)
+        )
         if d_sla is not None:
             decode_cache[(idx, sla_key)] = d_sla
     return p_cases, d_by_mtp, prefill_cache, decode_cache
@@ -1583,6 +2011,7 @@ def _search_pd_deployments(
     num_devices: int,
     is_moe: bool,
     layers: int,
+    model_spec: Any,
     rec_topo: Mapping[str, Any] | None,
     p_pin: Mapping[str, int],
     d_pin: Mapping[str, int],
@@ -1599,15 +2028,16 @@ def _search_pd_deployments(
     ddr_bw_gbps: float | None,
     ssd_bw_gbps: float | None,
     max_sequences_per_dp: int | None,
-    pool: ProcessPoolExecutor | None = None,
 ) -> tuple[list[dict[str, Any]], list[tuple[dict[str, Any], dict[str, Any], dict[str, Any]]]]:
     p_topos = _build_pd_stage_candidates(
         role="pd_prefill", max_dies=num_devices - 1, is_moe=is_moe,
         layers=layers, prompt_tokens=prompt, rec_topo=rec_topo, pinned=p_pin,
+        model_spec=model_spec,
     )
     d_topos = _build_pd_stage_candidates(
         role="pd_decode", max_dies=num_devices - 1, is_moe=is_moe,
         layers=layers, prompt_tokens=prompt, rec_topo=rec_topo, pinned=d_pin,
+        model_spec=model_spec,
     )
     pd_modes = (
         (str(pd_transfer_mode).strip().lower(),)
@@ -1639,7 +2069,7 @@ def _search_pd_deployments(
         p_cases, d_by_mtp, all_d_cases, layers=layers, pd_modes=pd_modes,
         prompt=prompt, output=output, ttft=ttft, tpot=tpot,
         pool_prefix_hit_ratio=pool_prefix_hit_ratio,
-        max_sequences_per_dp=max_sequences_per_dp, pool=pool,
+        max_sequences_per_dp=max_sequences_per_dp,
     )
 
     rows: list[dict[str, Any]] = []
@@ -1670,17 +2100,26 @@ def _search_pd_deployments(
                     except (ModelingError, ValueError):
                         continue
                     best_ratio = rep.get("best_configuration")
+                    d_inst = rep["decode_instance"]
                     row = {
                         "deployment_mode": "pd_disaggregated",
                         "pd_transfer_mode": pd_mode,
                         "mtp_proposal_tokens": mtp_n,
                         "prefill_parallel": rep["prefill_instance"]["parallel"],
-                        "decode_parallel": rep["decode_instance"]["parallel"],
+                        "decode_parallel": d_inst["parallel"],
                         "pd_ratio": best_ratio["pd_ratio"] if best_ratio else None,
                         "used_dies": int(best_ratio["used_dies"]) if best_ratio else (p_world + d_world),
-                        "b_feasible": int(rep["decode_instance"]["b_feasible"]),
-                        "ttft_ms": float(rep["prefill_instance"]["step_ms"]),
+                        "b_feasible": int(d_inst["b_feasible"]),
+                        "b_vram_max": int(d_inst["b_vram_max"]),
+                        "ttft_ms": float(rep["prefill_instance"].get("effective_ttft_ms", rep["prefill_instance"]["step_ms"])),
+                        "decode_step_ms": float(d_inst["step_ms_feasible"]),
                         "effective_tpot_ms": float(rep["effective_tpot_ms"]),
+                        "avg_accepted_tokens": float(d_inst["avg_accepted_tokens"]),
+                        "n_tok_per_die": float(d_inst["n_tok_per_die"]),
+                        "us_per_tok_die": float(d_inst["us_per_tok_die"]),
+                        "unused_sla_slack_ms": float(d_inst["unused_sla_slack_ms"]),
+                        "operating_regime": str(d_inst["operating_regime"]),
+                        "free_hbm_headroom_gib": float(d_inst["free_hbm_headroom_gib"]),
                         "kv_transfer_ms_per_request": float(rep["kv_transfer_ms_per_request"]),
                         "sustainable_rps": float(best_ratio["sustainable_rps"]) if best_ratio else 0.0,
                         "sustainable_tps": float(best_ratio["sustainable_tps"]) if best_ratio else 0.0,
@@ -1771,7 +2210,18 @@ def _finalize_optimal_deployment(
     elif best_coloc_entry:
         winner_row, recommended_case = best_coloc_entry[0], deepcopy(best_coloc_entry[1])
     elif all_candidates:
-        recommended_case = compose_for({"dp": 1, "tp": 1, "ep": 1, "pp": 1, "pcp": 1, "dcp": 1}, 0)
+        first_cand = all_candidates[0]
+        raw_topo = first_cand.get("parallel") or first_cand.get("decode_parallel") or {}
+        fb_topo = {
+            ("dcp" if k == "cp" else k): int(raw_topo[k])
+            for k in ("dp", "tp", "ep", "pp", "pcp", "cp", "dcp")
+            if k in raw_topo and raw_topo[k] is not None
+        }
+        fb_mtp = int(first_cand.get("mtp_proposal_tokens", 0) or 0)
+        fb_role = "pd_decode" if first_cand.get("deployment_mode") == "pd_disaggregated" else "colocated"
+        recommended_case = (
+            compose_for(fb_topo, fb_mtp, role=fb_role) if fb_topo else None
+        ) or compose_for({"dp": 1, "tp": 1, "ep": 1, "pp": 1, "pcp": 1, "dcp": 1}, 0)
 
     return {
         "schema": "mindie-sim.optimal-deployment/1",
@@ -1874,12 +2324,21 @@ def solve_optimal_deployment(
 
     def compose_for(topo: Mapping[str, int], mtp_n: int, role: str = "colocated") -> dict[str, Any] | None:
         accept = (
-            float(mtp_acceptance_length) if mtp_acceptance_length is not None
-            else (compute_speculative_accept_step(DEFAULT_SPECULATIVE_ACCEPT_RATE, mtp_n) if mtp_n > 0 else 1.0)
+            1.0 if int(mtp_n) <= 0
+            else (
+                float(mtp_acceptance_length) if mtp_acceptance_length is not None
+                else compute_speculative_accept_step(DEFAULT_SPECULATIVE_ACCEPT_RATE, mtp_n)
+            )
         )
+        extra_kw: dict[str, Any] = {}
+        if role in {"colocated", "pd_prefill"}:
+            seq_floor = int(max_sequences_per_dp or DEFAULT_CHUNKED_BATCH_SEQ_FLOOR)
+            chunk_cap = max(DEFAULT_CHUNKED_PREFILL_TOKENS, seq_floor * (1 + max(0, int(mtp_n))))
+            if prompt > chunk_cap:
+                extra_kw["max_num_batched_tokens"] = chunk_cap
         try:
             return compose_case(
-                **common_kw, role=role, **{k: int(v) for k, v in topo.items()},
+                **common_kw, **extra_kw, role=role, **{k: int(v) for k, v in topo.items()},
                 mtp_proposal_tokens=mtp_n, mtp_acceptance_length=accept,
             )
         except (ModelingError, ValueError):
@@ -1892,35 +2351,26 @@ def solve_optimal_deployment(
     coloc_entries: list[tuple[dict[str, Any], dict[str, Any]]] = []
     pd_entries: list[tuple[dict[str, Any], dict[str, Any], dict[str, Any]]] = []
 
-    pool_workers = min(max(1, os.cpu_count() or 1), MAX_SOLVE_POOL_WORKERS)
-    pool: ProcessPoolExecutor | None = (
-        _build_solve_pool(pool_workers)
-        if (pool_workers >= 2 and eff_layers >= ARCHETYPE_SCREEN_MIN_LAYERS)
-        else None
-    )
-    try:
-        if dep_norm in {"auto", "colocated"}:
-            c_rows, coloc_entries = _search_colocated_deployments(
-                compose_for, num_devices=n_dev, is_moe=is_moe, layers=eff_layers,
-                rec_topo=rec_topo, pinned=coloc_pin, mtp_grid=mtp_grid,
-                prompt=prompt, output=output, ttft=ttft, tpot=tpot,
-                max_sequences_per_dp=max_sequences_per_dp, pool=pool,
-            )
-            all_candidates.extend(c_rows)
-        if dep_norm in {"auto", "pd_disaggregated"} and n_dev >= 2:
-            p_rows, pd_entries = _search_pd_deployments(
-                compose_for, num_devices=n_dev, is_moe=is_moe, layers=eff_layers,
-                rec_topo=rec_topo, p_pin=p_pin, d_pin=d_pin, mtp_grid=mtp_grid,
-                prompt=prompt, output=output, ttft=ttft, tpot=tpot,
-                pd_transfer_mode=pd_transfer_mode, kv_transfer_bw_gbps=kv_transfer_bw_gbps,
-                pool_dram_ratio=pool_dram_ratio, pool_ssd_ratio=pool_ssd_ratio,
-                pool_prefix_hit_ratio=pool_prefix_hit_ratio, ddr_bw_gbps=ddr_bw_gbps,
-                ssd_bw_gbps=ssd_bw_gbps, max_sequences_per_dp=max_sequences_per_dp, pool=pool,
-            )
-            all_candidates.extend(p_rows)
-    finally:
-        if pool is not None:
-            pool.shutdown(wait=True)
+    if dep_norm in {"auto", "colocated"}:
+        c_rows, coloc_entries = _search_colocated_deployments(
+            compose_for, num_devices=n_dev, is_moe=is_moe, layers=eff_layers,
+            model_spec=model_spec, rec_topo=rec_topo, pinned=coloc_pin,
+            mtp_grid=mtp_grid, prompt=prompt, output=output, ttft=ttft,
+            tpot=tpot, max_sequences_per_dp=max_sequences_per_dp,
+        )
+        all_candidates.extend(c_rows)
+    if dep_norm in {"auto", "pd_disaggregated"} and n_dev >= 2:
+        p_rows, pd_entries = _search_pd_deployments(
+            compose_for, num_devices=n_dev, is_moe=is_moe, layers=eff_layers,
+            model_spec=model_spec, rec_topo=rec_topo, p_pin=p_pin, d_pin=d_pin,
+            mtp_grid=mtp_grid, prompt=prompt, output=output, ttft=ttft,
+            tpot=tpot, pd_transfer_mode=pd_transfer_mode,
+            kv_transfer_bw_gbps=kv_transfer_bw_gbps,
+            pool_dram_ratio=pool_dram_ratio, pool_ssd_ratio=pool_ssd_ratio,
+            pool_prefix_hit_ratio=pool_prefix_hit_ratio, ddr_bw_gbps=ddr_bw_gbps,
+            ssd_bw_gbps=ssd_bw_gbps, max_sequences_per_dp=max_sequences_per_dp,
+        )
+        all_candidates.extend(p_rows)
 
     return _finalize_optimal_deployment(
         model_id=model_id, sku=sku, n_dev=n_dev, prompt=prompt, output=output,
