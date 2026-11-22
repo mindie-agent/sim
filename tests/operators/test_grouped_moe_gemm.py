@@ -706,3 +706,32 @@ def test_splitk_workspace_charges_fixpipe_and_routes_warm_vs_spill_reads():
     assert eng_spill.serviced.get("l2", 0.0) == 0.0
     assert eng_spill.serviced["fixpipe"] == pytest.approx(partial_spill)
     assert eng_spill.serviced["mte2_aiv"] == pytest.approx(partial_spill)
+
+    # Full-grid router (32 tiles on 32 AICs) must NOT allocate Split-K workspace or partials.
+    full_layer = SimpleNamespace(
+        router_dtype="", router_output_dtype="fp32",
+        num_experts=256, router_input_size=6144, index=0,
+    )
+    _, full_op, _, _ = router_gemm(
+        prefix="route", plan=full_layer, deps=(), stage=0, requests=(),
+        tokens=4096, model=model, hidden=6144, mode="prefill",
+    )
+    full_plan = build_router_splitk(full_op, geom_l2)
+    assert full_plan.metadata.get("execution_abstraction") != "finite_split_k_workspace"
+    assert full_plan.work.resources.get("l2", 0.0) == 0.0
+
+    # Real split executes Cube work inside split_k K-slices before vector merge (never empty-work).
+    ctx_l2 = RecipeContext(
+        op, {}, {r: r for r in set(geom_l2.rates) | set(plan_l2.work.resources) | {"cube"}},
+        {**{r: float(geom_l2.rates.get(r, 1e12)) / 1000.0 for r in set(geom_l2.rates) | set(plan_l2.work.resources)}, "cube": 1.0},
+        geom_l2.compute_units,
+        resource_units={r: int(geom_l2.resource_units.get(r, 1)) for r in set(geom_l2.rates) | set(plan_l2.work.resources) | {"cube"}},
+        compute_peaks=dict(geom_l2.compute_peaks),
+        pool_names={p: p for p in geom_l2.buffers}, pool_capacities=dict(geom_l2.buffers),
+        pool_units=dict(geom_l2.buffer_units),
+        physical_mechanisms=geom_l2.physical_mechanisms, datapath=geom_l2.datapath,
+    )
+    ctx_l2 = replace(ctx_l2, work=ctx_l2.bind(plan_l2.work))
+    prog_l2 = plan_l2.program(ctx_l2)
+    assert [s.name for s in prog_l2.stages] == ["router_prologue_drain", "split_k"]
+    assert eng_l2.serviced["cube"] == pytest.approx(ctx_l2.bind(plan_l2.work)["cube"])

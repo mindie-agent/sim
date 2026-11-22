@@ -533,7 +533,7 @@ def paired_case(**overrides):
         {"prefix_cache_mode": "shared", "metadata": ()} | overrides)))
 
 @pytest.mark.parametrize("mode,query,extra,recycling", [
-    ({"dspark": DsparkSpec(4, (1.,) * 4)}, 1, 32768, 5),
+    ({"dspark": DsparkSpec(4, (1.,) * 4)}, 1, 32768, 6),
     ({"metadata": (("draft_proposal_tokens", 3), ("draft_mode", "dspark"))}, 4, 32768, 5),
     ({"metadata": (("draft_proposal_tokens", 0),)}, 1, 0, 2),
 ])

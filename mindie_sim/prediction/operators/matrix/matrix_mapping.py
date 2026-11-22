@@ -32,6 +32,7 @@ from .matrix_mapping_owners import (
     mte_owner_unit_count,
     owner_records,
     owner_tiles,
+    panel_sector_efficiency,
     physical_owner_rate,
     physical_owner_units,
     primitive_cold_hbm_bps,
@@ -384,11 +385,13 @@ def _arch35_streamk_perf(context, recipe, geometry, *, split_k: int, output_tile
     if strided_bps:
         b_hbm_full = min(hbm_full, strided_bps / MS_PER_SECOND)
     elif row_bytes < stride_bytes:
-        # Sub-sector strided weight rows still pull complete L2 cache sectors
-        # from HBM (e.g. 128 B on DAV_3510), so host tiling must price the
-        # same sector efficiency ceiling as calibrated execution.
+        # Strided weight rows pull complete L2 cache sectors from HBM (e.g.
+        # 128 B on DAV_3510); rows closer than one sector share it, so host
+        # tiling prices the same panel sector union as calibrated execution.
         _, sector = primitive_l2_params(context)
-        sector_eff = min(1.0, float(max(1, row_bytes)) / float(max(1, sector)))
+        sector_eff = panel_sector_efficiency(
+            row_bytes=row_bytes, stride_bytes=stride_bytes,
+            rows=max(1, int(k)), sector_bytes=sector)
         b_hbm_full = hbm_full * sector_eff
     else:
         b_hbm_full = hbm_full

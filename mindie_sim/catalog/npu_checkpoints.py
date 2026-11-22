@@ -266,7 +266,7 @@ _INT8_RT = {
 _TAG_SPEC_TABLE: dict[str, dict[str, Any]] = {
     "W8A8_MXFP8": {"weight_format": "fp8_e4m3", "activation_format": "fp8_e4m3", "ledger_format": "MXFP8", **_MX_BASE},
     "W4A8_MXFP": {"weight_format": "mxfp4", "activation_format": "fp8_e4m3", "ledger_format": "MXFP4", **_MX_BASE},
-    "W4A4_MXFP4": {"weight_format": "mxfp4", "activation_format": "fp8_e4m3", "ledger_format": "MXFP4", **_MX_BASE},
+    "W4A4_MXFP4": {"weight_format": "mxfp4", "activation_format": "fp4_e2m1", "ledger_format": "MXFP4", **_MX_BASE},
     "W8A8_DYNAMIC": {"weight_format": "int8", "activation_format": "int8", "ledger_format": "W8A8", **_INT_BASE, **_INT8_RT},
     "W8A8": {"weight_format": "int8", "activation_format": "int8", "ledger_format": "W8A8", **_INT_BASE, **_INT8_RT},
     "W4A8_DYNAMIC": {"weight_format": "int4", "activation_format": "int8", "ledger_format": "W4A8", **_INT_BASE},
@@ -1085,7 +1085,7 @@ def parse_quant_model_description(
 _PRESET_RECIPES: dict[str, dict[str, Any]] = {
     "w4a8_mxfp": {"name": "W8A8_MXFP8+W4A8_MXFP", "wf": "fp8_e4m3", "af": "fp8_e4m3", "ef": "mxfp4", "wb": (1, MXFP_GROUP_SIZE), "eb": MXFP_GROUP_SIZE, "sf": "fp8_e8m0", "sb": MXFP_SCALE_BYTES, "ags": MXFP_GROUP_SIZE, "asf": "fp8_e8m0", "asp": MXFP_SCALE_PACK, "excl": _STANDARD_UNQUANTIZED_EXCLUSIONS + ("mtp",)},
     "w8a8_mxfp8": {"name": "W8A8_MXFP8", "wf": "fp8_e4m3", "af": "fp8_e4m3", "ef": "fp8_e4m3", "wb": (1, MXFP_GROUP_SIZE), "eb": MXFP_GROUP_SIZE, "sf": "fp8_e8m0", "sb": MXFP_SCALE_BYTES, "ags": MXFP_GROUP_SIZE, "asf": "fp8_e8m0", "asp": MXFP_SCALE_PACK, "excl": _STANDARD_UNQUANTIZED_EXCLUSIONS + ("gdn", "mtp")},
-    "w4a4_mxfp4": {"name": "W4A4_MXFP4", "wf": "mxfp4", "af": "fp8_e4m3", "ef": "mxfp4", "wb": (1, MXFP_GROUP_SIZE), "eb": MXFP_GROUP_SIZE, "sf": "fp8_e8m0", "sb": MXFP_SCALE_BYTES, "ags": MXFP_GROUP_SIZE, "asf": "fp8_e8m0", "asp": MXFP_SCALE_PACK, "excl": _STANDARD_UNQUANTIZED_EXCLUSIONS + ("mtp",)},
+    "w4a4_mxfp4": {"name": "W4A4_MXFP4", "wf": "mxfp4", "af": "fp4_e2m1", "ef": "mxfp4", "wb": (1, MXFP_GROUP_SIZE), "eb": MXFP_GROUP_SIZE, "sf": "fp8_e8m0", "sb": MXFP_SCALE_BYTES, "ags": MXFP_GROUP_SIZE, "asf": "fp8_e8m0", "asp": MXFP_SCALE_PACK, "excl": _STANDARD_UNQUANTIZED_EXCLUSIONS + ("mtp",)},
     "fp8_dynamic+mxfp4_experts": {"name": "fp8_dynamic+mxfp4_experts", "wf": "fp8_e4m3", "af": "fp8_e4m3", "ef": "mxfp4", "wb": (MXFP_GROUP_SIZE, MXFP_GROUP_SIZE), "eb": MXFP_GROUP_SIZE, "sf": "fp8_e8m0", "sb": MXFP_SCALE_BYTES, "ags": MXFP_GROUP_SIZE, "asf": "fp8_e8m0", "asp": MXFP_SCALE_PACK, "excl": _STANDARD_UNQUANTIZED_EXCLUSIONS},
     "w4a8_dynamic": {"name": "W4A8_DYNAMIC", "wf": "int8", "af": "int8", "ef": "int4", "wb": (1, 1), "eb": 1, "sf": "fp32", "sb": FP32_SCALE_BYTES, "ags": 0, "asf": "fp32", "asp": 1, "excl": _STANDARD_UNQUANTIZED_EXCLUSIONS + ("mtp",), **_INT8_RT},
     "w8a8_dynamic": {"name": "W8A8_DYNAMIC", "wf": "int8", "af": "int8", "ef": "int8", "wb": (1, 1), "eb": 1, "sf": "fp32", "sb": FP32_SCALE_BYTES, "ags": 0, "asf": "fp32", "asp": 1, "excl": _STANDARD_UNQUANTIZED_EXCLUSIONS + ("mtp",), **_INT8_RT},
@@ -1179,7 +1179,8 @@ def _classify_from_quant_spec(
     if wf in {"bf16", "bfloat16", "fp16", "float16", "fp32", "float32"}:
         return WeightTensorQuant("FLOAT", wf, wf, "FP32" if "32" in wf else "BF16", "none", 0, False, f"quant_spec:{role_name}", role_name)
     if wf in {"mxfp4", "fp4", "fp4_e2m1"}:
-        return WeightTensorQuant("W4A8_MXFP", "mxfp4", af, "MXFP4", "fp8_e8m0", mx_group or MXFP_GROUP_SIZE, True, f"quant_spec:{role_name}", role_name)
+        tag = "W4A4_MXFP4" if af in {"fp4", "fp4_e2m1"} else "W4A8_MXFP"
+        return WeightTensorQuant(tag, "mxfp4", af, "MXFP4", "fp8_e8m0", mx_group or MXFP_GROUP_SIZE, True, f"quant_spec:{role_name}", role_name)
     if wf in {"fp8", "fp8_e4m3", "fp8_e5m2"}:
         is_mx = sf in {"fp8_e8m0", "ue8m0"} and mx_group == MXFP_GROUP_SIZE
         return WeightTensorQuant("W8A8_MXFP8" if is_mx else "FP8_DYNAMIC", "fp8_e4m3", af, "MXFP8" if is_mx else "FP8", sf, mx_group or (MXFP_GROUP_SIZE if is_mx else FP8_BLOCK_SIZE), True, f"quant_spec:{role_name}", role_name)

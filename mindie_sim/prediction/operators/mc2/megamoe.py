@@ -6,7 +6,8 @@
   ``situglu`` (``PR #22333``) gated activations, fusing EP fullmesh MX32
   Dispatch, ``GMM1``, in-UB activation + group-32 E8M0 quantization, ``GMM2``,
   optional ``enable_fused_mc2=3`` Shared Expert, and BF16 Combine into one
-  kernel boundary without intermediate HBM round-trips.
+  kernel boundary; only the quantized GMM2 input workspace is stored (MTE3)
+  and reloaded (AIC MTE2), split across L2/HBM by residency.
 
 [Invariants]
   * ``OperatorPlan.work`` equals the exact sum of issued per-owner ``Stage``
@@ -24,7 +25,6 @@
 """
 from __future__ import annotations
 
-import math
 from typing import Any, Mapping
 
 from mindie_sim.schema.common import ModelingError, dtype_bytes
@@ -32,6 +32,7 @@ from mindie_sim.schema.operators import OpSpec
 from ...mechanism import Geometry, OperatorPlan, PlannedRecipe, Work
 from ...ownership import read_role, unit_group
 from ...program import KernelProgram, ParallelProgram, Stage
+from ..grouped_moe.lowering import element_bytes, mx_scale_bytes
 
 RECIPE = "megamoe_arch35"
 NATIVE_KIND = "aclnnMegaMoe"
@@ -113,6 +114,31 @@ def _effective_l2(geometry: Geometry) -> float:
     return L2_EFFECTIVE_SHARE * float((geometry.buffers or {}).get("l2", 0))
 
 
+_UNQUANTIZED_DTYPES = frozenset({"bf16", "bfloat16", "fp16", "float16", "fp32", "float32"})
+
+
+def _mx_row_bytes(elements: int, payload_dtype: str) -> float:
+    """Packed operand row: payload elements plus E8M0 MX scales when quantized."""
+    if elements <= 0:
+        return 0.0
+    dt = str(payload_dtype or "fp8_e4m3").lower()
+    payload = element_bytes(elements, dt)
+    scales = 0 if dt in _UNQUANTIZED_DTYPES else mx_scale_bytes(elements)
+    return float(payload + scales)
+
+
+def _merge_matrix_flops(
+    routed_dt: str, routed_flops: float, shared_dt: str, shared_flops: float,
+) -> dict[str, float]:
+    """Combine routed and optional shared Cube FLOPs under their own operand dtypes."""
+    matrix: dict[str, float] = {}
+    if routed_flops > 0.0:
+        matrix[routed_dt] = routed_flops
+    if shared_flops > 0.0:
+        matrix[shared_dt] = matrix.get(shared_dt, 0.0) + shared_flops
+    return matrix
+
+
 def _check_buffers(geometry: Geometry) -> dict[str, int]:
     available = dict(geometry.buffers or {})
     for pool, required in MEGAMOE_BUFFERS.items():
@@ -153,6 +179,7 @@ def make_op(
     shared_inter: int = 0,
     shared_w13_bytes: float = 0.0,
     shared_w2_bytes: float = 0.0,
+    shared_compute_dtype: str | None = None,
     allow_abi_extension: bool = False,
     activation_params: Mapping[str, Any] | None = None,
     extra_metadata: tuple[tuple[str, Any], ...] = (),
@@ -174,11 +201,13 @@ def make_op(
     shape = (tok, width)
     routed_flops = 2.0 * r_rows * width * (2 * inter) + 2.0 * r_rows * inter * width
     sh_inter = int(shared_inter) if mc2_mode == FUSED_MC2_SHARED_MODE else 0
+    sh_comp_dt = str(shared_compute_dtype or compute_dtype) if sh_inter > 0 else compute_dtype
     shared_flops = (
         2.0 * tok * width * (2 * sh_inter) + 2.0 * tok * sh_inter * width
         if sh_inter > 0 else 0.0
     )
     total_flops = routed_flops + shared_flops
+    matrix_flops_map = _merge_matrix_flops(compute_dtype, routed_flops, sh_comp_dt, shared_flops)
     out_elem = float(dtype_bytes(output_dtype))
     in_aiv_bytes = float(tok * (width * out_elem + k_sel * (FP32_BYTES + INT32_BYTES)))
     out_aiv_bytes = float(tok * width * out_elem)
@@ -218,6 +247,7 @@ def make_op(
         "shared_intermediate": sh_inter,
         "shared_w13_bytes": float(shared_w13_bytes) if mc2_mode == FUSED_MC2_SHARED_MODE else 0.0,
         "shared_w2_bytes": float(shared_w2_bytes) if mc2_mode == FUSED_MC2_SHARED_MODE else 0.0,
+        **({"shared_compute_dtype": sh_comp_dt} if sh_inter > 0 and sh_comp_dt != compute_dtype else {}),
     }
     if has_ep_comm:
         megamoe_geo["group_axis"] = ep_axis
@@ -260,7 +290,7 @@ def make_op(
         phase=phase, stage=stage, layer=layer, requests=requests,
         semantic_shape=shape, local_shape=shape, padded_shape=shape, launch_shape=shape,
         dtype=output_dtype, flops=total_flops,
-        matrix_flops=((compute_dtype, total_flops),) if total_flops > 0 else (),
+        matrix_flops=tuple(matrix_flops_map.items()),
         vector_ops=vec_ops, hbm_bytes=hbm_b, mte2_bytes=mte2_b, mte3_bytes=mte3_b,
         link_bytes=link_b,
         source_boundary="kernel",
@@ -269,7 +299,7 @@ def make_op(
 
 
 def _gmm_stage(
-    context, name, after, placement, share, compute_dtype, flops,
+    context, name, after, placement, share, matrix_flops,
     aic_pipe, gm_read_bytes, total_read_bytes, operand_bytes, fixpipe_bytes, l2_hit,
 ):
     resources = {
@@ -283,7 +313,7 @@ def _gmm_stage(
     return Stage(
         name,
         context.bind(Work(
-            matrix={compute_dtype: flops * share} if flops > 0.0 else {},
+            matrix={dt: flops * share for dt, flops in matrix_flops.items() if flops > 0.0},
             resources=resources,
         )),
         after=(after,), placement=placement,
@@ -333,15 +363,16 @@ def _build_megamoe_program(
     context, *, cores: int, aiv_units: int, buf_sizes: dict[str, int],
     in_aiv_bytes: float, out_aiv_bytes: float, pack_vec_ops: float,
     act_vec_ops: float, comb_vec_ops: float, disp_link: float, comb_link: float,
-    comp_dt: str, gmm1_flops: float, gmm2_flops: float,
+    gmm1_matrix: Mapping[str, float], gmm2_matrix: Mapping[str, float],
     gmm1_gm_read: float, gmm2_gm_read: float,
     gmm1_read_total: float, gmm2_read_total: float,
     l0_gmm1: float, l0_gmm2: float, fix_gmm1: float,
-    fix_gmm2: float, gmm1_l2_hit: float,
+    fix_gmm2: float, gmm1_l2_hit: float, act2_hot: float = 0.0, act2_cold: float = 0.0,
 ):
     c_aic_pipe = read_role(context.resource_names, aiv=None)
     c_aiv_pipe = read_role(context.resource_names, aiv=0)
     share = 1.0 / float(cores)
+    act2 = act2_hot + act2_cold
     disp_wire, comb_wire = _resolve_phase_links(context, disp_link, comb_link)
 
     def per_core(core: int):
@@ -367,17 +398,20 @@ def _build_megamoe_program(
                 disp_work[res_name] = disp_work.get(res_name, 0.0) + portion
         s_disp = Stage("dispatch_mx", disp_work, acquire=allocs, placement=aiv_owned)
         s_gmm1 = _gmm_stage(
-            context, "gmm1_gate_up", "dispatch_mx", aic_owned, share, comp_dt, gmm1_flops,
+            context, "gmm1_gate_up", "dispatch_mx", aic_owned, share, gmm1_matrix,
             c_aic_pipe, gmm1_gm_read, gmm1_read_total, l0_gmm1, fix_gmm1, gmm1_l2_hit,
         )
+        act_res = {"vector": act_vec_ops * share, "mte3": act2 * share}
+        for tier, amount in (("hbm", act2_cold), ("l2", act2_hot)):
+            if amount > 0.0:
+                act_res[tier] = amount * share
         s_act = Stage(
-            "act_mx_quant",
-            context.bind(Work(resources={"vector": act_vec_ops * share})),
+            "act_mx_quant", context.bind(Work(resources=act_res)),
             after=("gmm1_gate_up",), placement=aiv_owned,
         )
         s_gmm2 = _gmm_stage(
-            context, "gmm2_down", "act_mx_quant", aic_owned, share, comp_dt, gmm2_flops,
-            c_aic_pipe, gmm2_gm_read, gmm2_read_total, l0_gmm2, fix_gmm2, 0.0,
+            context, "gmm2_down", "act_mx_quant", aic_owned, share, gmm2_matrix,
+            c_aic_pipe, gmm2_gm_read + act2_cold, gmm2_read_total + act2, l0_gmm2, fix_gmm2, act2_hot,
         )
         comb_res: dict[str, float] = {
             "vector": comb_vec_ops * share,
@@ -426,6 +460,7 @@ def build(op: OpSpec, geometry: Geometry) -> OperatorPlan:
     w13 = float(spec.get("w13_bytes", 2.0 * inter * width))
     w2 = float(spec.get("w2_bytes", width * inter))
     sh_inter = int(spec.get("shared_intermediate", 0)) if mc2_mode == FUSED_MC2_SHARED_MODE else 0
+    sh_comp_dt = str(spec.get("shared_compute_dtype") or comp_dt) if sh_inter > 0 else comp_dt
     sh_w13 = float(spec.get("shared_w13_bytes", 0.0)) if sh_inter > 0 else 0.0
     sh_w2 = float(spec.get("shared_w2_bytes", 0.0)) if sh_inter > 0 else 0.0
     disp_link = (
@@ -441,10 +476,11 @@ def build(op: OpSpec, geometry: Geometry) -> OperatorPlan:
     in_aiv_bytes = float(tok * (width * out_elem + k_sel * (FP32_BYTES + INT32_BYTES)))
     out_aiv_bytes = float(tok * width * out_elem)
 
-    # Routed + optional shared weight/operand reads on AIC (no intermediate GM dump!).
-    mx_row_bytes = float(width + math.ceil(width / MX_GROUP_SIZE))
-    inter_mx_bytes = float(inter + math.ceil(inter / MX_GROUP_SIZE))
-    aic_act_read = r_rows * mx_row_bytes + (tok * mx_row_bytes if sh_inter > 0 else 0.0)
+    # Routed + optional shared weight/operand reads on AIC; MX rows follow each projection's dtype.
+    mx_row_bytes = _mx_row_bytes(width, comp_dt)
+    inter_mx_bytes = _mx_row_bytes(inter, comp_dt)
+    sh_row_bytes = _mx_row_bytes(width, sh_comp_dt) if sh_inter > 0 else 0.0
+    aic_act_read = r_rows * mx_row_bytes + (tok * sh_row_bytes if sh_inter > 0 else 0.0)
     aic_weight_read = w13 + w2 + sh_w13 + sh_w2
     aic_read_total = aic_act_read + aic_weight_read
 
@@ -458,16 +494,21 @@ def build(op: OpSpec, geometry: Geometry) -> OperatorPlan:
     gmm2_gm_read = gmm2_read_total
     aic_gm_read = gmm1_gm_read + gmm2_gm_read
 
-    gmm1_flops = 2.0 * r_rows * width * (2 * inter) + (
-        2.0 * tok * width * (2 * sh_inter) if sh_inter > 0 else 0.0
-    )
-    gmm2_flops = 2.0 * r_rows * inter * width + (
-        2.0 * tok * sh_inter * width if sh_inter > 0 else 0.0
-    )
+    r_gmm1_flops = 2.0 * r_rows * width * (2 * inter)
+    s_gmm1_flops = 2.0 * tok * width * (2 * sh_inter) if sh_inter > 0 else 0.0
+    r_gmm2_flops = 2.0 * r_rows * inter * width
+    s_gmm2_flops = 2.0 * tok * sh_inter * width if sh_inter > 0 else 0.0
+    gmm1_matrix = _merge_matrix_flops(comp_dt, r_gmm1_flops, sh_comp_dt, s_gmm1_flops)
+    gmm2_matrix = _merge_matrix_flops(comp_dt, r_gmm2_flops, sh_comp_dt, s_gmm2_flops)
     l0_gmm1 = aic_act_read + w13 + sh_w13
     l0_gmm2 = r_rows * inter_mx_bytes + w2 + sh_w2 + (
-        tok * float(sh_inter + math.ceil(sh_inter / MX_GROUP_SIZE)) if sh_inter > 0 else 0.0
+        tok * _mx_row_bytes(sh_inter, sh_comp_dt) if sh_inter > 0 else 0.0
     )
+    # GMM1 epilogue writes the quantized activation (data + E8M0 scales) to the GMM2 input
+    # workspace (MTE3); GMM2 reads it back on the AIC GM path.  L2 residency only splits tiers.
+    act2 = max(0.0, l0_gmm2 - w2 - sh_w2)
+    act2_hot = min(act2, l2_cap) if l2_cap > 0.0 else 0.0
+    act2_cold = act2 - act2_hot
     fix_gmm1 = 2.0 * r_rows * inter * BF16_BYTES + (
         2.0 * tok * sh_inter * BF16_BYTES if sh_inter > 0 else 0.0
     )
@@ -484,23 +525,24 @@ def build(op: OpSpec, geometry: Geometry) -> OperatorPlan:
     aiv_pipe = read_role(geometry.resource_units or {}, aiv=0)
 
     plan_res: dict[str, float] = {
-        "hbm": in_aiv_bytes + aic_gm_read + out_aiv_bytes,
+        "hbm": in_aiv_bytes + aic_gm_read + out_aiv_bytes + 2.0 * act2_cold,
         "mte1": l0_gmm1 + l0_gmm2,
         "fixpipe": fix_gmm1 + fix_gmm2,
         "vector": pack_vec_ops + act_vec_ops + comb_vec_ops,
-        "mte3": out_aiv_bytes,
+        "mte3": out_aiv_bytes + act2,
     }
     if aic_pipe == aiv_pipe:
-        plan_res[aic_pipe] = in_aiv_bytes + aic_read_total
+        plan_res[aic_pipe] = in_aiv_bytes + aic_read_total + act2
     else:
         plan_res[aiv_pipe] = in_aiv_bytes
-        plan_res[aic_pipe] = aic_read_total
-    if l2_hit > 0.0:
-        plan_res["l2"] = l2_hit
+        plan_res[aic_pipe] = aic_read_total + act2
+    if l2_hit + act2_hot > 0.0:
+        plan_res["l2"] = l2_hit + 2.0 * act2_hot
     if disp_link + comb_link > 0.0:
         plan_res["link"] = disp_link + comb_link
-    total_flops = gmm1_flops + gmm2_flops
-    matrix_map = {comp_dt: total_flops} if total_flops > 0.0 else {}
+    matrix_map = _merge_matrix_flops(
+        comp_dt, r_gmm1_flops + r_gmm2_flops, sh_comp_dt, s_gmm1_flops + s_gmm2_flops,
+    )
     total_work = Work(matrix=matrix_map, resources={k: v for k, v in plan_res.items() if v > 0.0})
 
     def program(context):
@@ -508,12 +550,13 @@ def build(op: OpSpec, geometry: Geometry) -> OperatorPlan:
             context, cores=cores, aiv_units=aiv_units, buf_sizes=buf_sizes,
             in_aiv_bytes=in_aiv_bytes, out_aiv_bytes=out_aiv_bytes,
             pack_vec_ops=pack_vec_ops, act_vec_ops=act_vec_ops, comb_vec_ops=comb_vec_ops,
-            disp_link=disp_link, comb_link=comb_link, comp_dt=comp_dt,
-            gmm1_flops=gmm1_flops, gmm2_flops=gmm2_flops,
+            disp_link=disp_link, comb_link=comb_link,
+            gmm1_matrix=gmm1_matrix, gmm2_matrix=gmm2_matrix,
             gmm1_gm_read=gmm1_gm_read, gmm2_gm_read=gmm2_gm_read,
             gmm1_read_total=gmm1_read_total, gmm2_read_total=gmm2_read_total,
             l0_gmm1=l0_gmm1, l0_gmm2=l0_gmm2,
             fix_gmm1=fix_gmm1, fix_gmm2=fix_gmm2, gmm1_l2_hit=l2_hit,
+            act2_hot=act2_hot, act2_cold=act2_cold,
         )
 
     return OperatorPlan(total_work, program, {
@@ -527,6 +570,7 @@ def build(op: OpSpec, geometry: Geometry) -> OperatorPlan:
         "dispatch_link_bytes": disp_link,
         "combine_link_bytes": comb_link,
         "l2_onchip_activation_bytes": l2_hit,
+        "gmm2_activation_workspace_bytes": act2,
         "source_program": CANN_MEGAMOE_SOURCE,
     })
 

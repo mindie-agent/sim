@@ -9,10 +9,11 @@
   adds are explicit issued work; declared operand/epilogue/final-store work is
   conserved across the same task grid. A declared service mode is bytes/second,
   so its per-owner Stage cap is ``rate/1000`` divided by the active owner count.
-  A cap only tightens an existing bound.  The A5 narrow-N router adds an
-  explicit FP32 workspace (one partial per K slice) plus its vector merge on
-  top of the unchanged steady matrix pipeline; non-Split-K routers keep that
-  pipeline alone.
+  A cap only tightens an existing bound.  The A5 narrow-N router splits K
+  only when its 128x256 output grid leaves AICs idle and K has two nonempty
+  slices; its matrix demand then runs on the same Split-K task grid (operand
+  load, Cube, FP32 partial write, vector merge, final store).  A router that
+  fills the AIC grid keeps the steady matrix pipeline with no workspace.
 [Timeouts & Locks] O(output_tiles * K_slices) bounded tasks; no I/O or locks.
 [Side-Effect Policy] Submits only to the caller's virtual Engine.
 """
@@ -83,11 +84,19 @@ def _a5_aic_grid(geometry) -> bool:
 
 
 def _router_split(op, geometry) -> bool:
+    """True only when the router grid leaves AICs idle for nonempty K slices."""
     meta = dict(op.metadata)
-    return (bool(meta.get("split_k_required"))
+    if not (bool(meta.get("split_k_required"))
             and meta.get("weight_format") == "bf16"
             and meta.get("output_format") == "fp32"
-            and _a5_aic_grid(geometry))
+            and _a5_aic_grid(geometry)):
+        return False
+    if len(op.local_shape) < LOCAL_SHAPE_DIMS:
+        return False
+    m, n, k = (int(value) for value in op.local_shape[-LOCAL_SHAPE_DIMS:])
+    tiles = router_output_tiles(m, n)
+    cores = int(getattr(geometry, "compute_units", 0) or 0)
+    return 0 < tiles < cores and k > ROUTER_K_GRANULE
 
 
 def router_output_tiles(m: int, n: int) -> int:
@@ -105,7 +114,7 @@ def router_split_count(tiles: int, aics: int = A5_AIC_UNITS) -> int:
 
 
 def _router_recipe(op, geometry):
-    """Select the exact router mapping the executor will lower."""
+    """Select the steady router mapping (the non-Split-K executed recipe)."""
     from .matrix_steady import SteadyMatmul
     units = dict(getattr(geometry, "resource_units", {}) or ())
     names = {role: f"{role}@router:0" for role in units}
@@ -177,14 +186,24 @@ def _partials_l2_resident(context, partial_bytes: float) -> bool:
     return l2_bytes > 0 and partial_bytes <= float(l2_bytes)
 
 
-def build_router_splitk(op, geometry):
-    """A5 narrow-N BF16 router: generic tile grid plus Split-K workspace.
+def _router_split_recipe(op, geometry):
+    """Steady router mapping re-tiled onto the declared 128x256 router grid."""
+    recipe = _router_recipe(op, geometry)
+    return replace(
+        recipe, tile_m=ROUTER_TILE_M, tile_n=ROUTER_TILE_N,
+        compute_m=math.gcd(ROUTER_TILE_M, int(recipe.compute_m)),
+        compute_n=math.gcd(ROUTER_TILE_N, int(recipe.compute_n)))
 
-    The matrix wave keeps the declared operand/epilogue pipeline; every free
-    AIC receives a disjoint K slice and one FP32 partial.  The workspace write,
-    its vector merge and the last-tile drain are explicit stages whose bytes
-    and merge ops are added to the plan work.  A non-Split-K router keeps the
-    existing steady matrix recipe unchanged.
+
+def build_router_splitk(op, geometry):
+    """A5 narrow-N BF16 router: 128x256 output tiles x disjoint K slices.
+
+    Only an underfilled router grid splits K.  Operand traffic is priced on
+    the same 128x256 tile grid that executes; the matrix demand is distributed
+    over output-tile x K-slice tasks, each spilling one FP32 partial, followed
+    by the vector merge and one final store.  Partial bytes and merge ops are
+    added to the plan work.  A router that fills the AIC grid keeps the steady
+    matrix recipe with no workspace.
     """
     from .matrix_steady import SteadyMatmul
     from mindie_sim.prediction.mechanism import OperatorPlan, Work
@@ -196,7 +215,7 @@ def build_router_splitk(op, geometry):
     declared_mte2 = float(op.mte2_bytes)
     declared_mte3 = float(op.mte3_bytes)
     declared_vector = float(op.vector_ops)
-    recipe = _router_recipe(op, geometry)
+    recipe = _router_split_recipe(op, geometry)
     matrix_mte2 = router_matrix_operand_bytes(op, geometry, recipe=recipe)
     resources = dict(base.resources)
     resources["mte2"] = matrix_mte2
@@ -242,18 +261,13 @@ def build_router_splitk(op, geometry):
             context.op, mte2_bytes=declared_mte2,
             hbm_bytes=declared_mte2 + declared_mte3,
             vector_ops=declared_vector)
-        matrix = SteadyMatmul().lower(
-            replace(context, op=matrix_op, work=matrix_demand),
-            mapping=recipe)
-        workspace = splitk_program(
-            replace(context, work={}), splits, ws_l2_resident=ws_l2)
+        body = splitk_program(
+            replace(context, op=matrix_op, work=matrix_demand), splits,
+            recipe=recipe, ws_l2_resident=ws_l2)
         return KernelProgram((
             Stage("router_prologue_drain",
                   latency=ROUTER_PROLOGUE_DRAIN_CYCLES / clock_ms),
-            Stage("narrow_matrix", after=("router_prologue_drain",),
-                  program=matrix),
-            Stage("splitk_workspace", after=("narrow_matrix",),
-                  program=workspace),
+            Stage("split_k", after=("router_prologue_drain",), program=body),
         ))
 
     return OperatorPlan(plan_work, program, {

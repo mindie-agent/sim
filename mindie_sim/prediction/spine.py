@@ -283,6 +283,7 @@ class PredictionSpine:
                 replicas=list(replicas) if replicas is not None else None,
                 draft_prepare=req.step.draft_prepare,
                 physical_graphs=phys_map,
+                media_tokens_per_sequence=req.step.media_tokens_per_sequence,
             )
             report = export_op_structure(
                 graphs_in, native_evidence=native_evidence, **options
@@ -306,6 +307,8 @@ class PredictionSpine:
         )
         if draft_prepare:
             exec_meta["draft_prepare"] = True
+        if req.step is not None and req.step.media_tokens_per_sequence is not None:
+            exec_meta["media_tokens_per_sequence"] = req.step.media_tokens_per_sequence
         if rewritten.streams:
             exec_meta["streams"] = {
                 str(plan.rank): list(plan.lane_ids()) for plan in rewritten.streams
@@ -492,6 +495,10 @@ class PredictionSpine:
                 or ""
             ),
             native_steps=int(accel.get("native_steps", 0) or 0),
+            primitive_table=(
+                False if primitive_table is False else evaluation.bindings.primitive_table
+            ),
+            streams=step.graph.streams,
         )
 
     def optimize_ladder(

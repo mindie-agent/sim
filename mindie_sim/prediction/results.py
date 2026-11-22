@@ -15,7 +15,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, fields, is_dataclass
+from dataclasses import dataclass, field, fields, is_dataclass
 from fractions import Fraction
 import math
 from pathlib import Path
@@ -24,7 +24,7 @@ from typing import Literal, TypeAlias
 from mindie_sim.schema.case import Case
 from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.schema.workload import RequestView
-from .streams import MAIN_STREAM, StreamId, validate_stream_id
+from .streams import MAIN_STREAM, StreamId, StreamPlan, validate_stream_id
 
 Phase = Literal["prefill", "decode"]
 Scope = Literal["body", "model"]
@@ -88,6 +88,7 @@ def freeze_json(value: object, /) -> JsonValue:
         return FrozenJsonMapping({
             f.name: freeze_json(getattr(value, f.name))
             for f in fields(value)
+            if f.metadata.get("wire", True)
         })
     if isinstance(value, Mapping):
         return FrozenJsonMapping({
@@ -119,6 +120,7 @@ def json_payload(value: object, /) -> object:
         return {
             f.name: json_payload(getattr(value, f.name))
             for f in fields(value)
+            if f.metadata.get("wire", True)
         }
     if isinstance(value, Mapping):
         return {str(key): json_payload(item) for key, item in value.items()}
@@ -274,6 +276,47 @@ class StepEvaluation:
     wave_breakdown: WaveBreakdown | None = None
     accel_backend: str = ""
     native_steps: int = 0
+    primitive_table: object | None = field(
+        default=None, repr=False, compare=False, metadata={"wire": False},
+    )
+    streams: tuple[StreamPlan, ...] = field(
+        default=(), repr=False, compare=False, metadata={"wire": False},
+    )
+
+    def __reduce__(self):
+        # ``PrimitiveTable`` wraps ``MappingProxyType`` (unpicklable), so serialize
+        # its plain envelope dict alongside any rescaled warnings.
+        pt = self.primitive_table
+        if hasattr(pt, "to_envelope_dict"):
+            pt_state: object = (
+                "primitive_table",
+                pt.to_envelope_dict(),
+                tuple(getattr(pt, "warnings", ())),
+            )
+        else:
+            pt_state = pt
+        wire_args = (
+            self.graph_id, self.request, self.tier, self.span_ms,
+            self.operators, self.pipelines, self.wave_breakdown,
+            self.accel_backend, self.native_steps,
+        )
+        return (_unpickle_step_evaluation, (wire_args, self.streams, pt_state))
+
+
+def _unpickle_step_evaluation(
+    wire_args: tuple[object, ...],
+    streams: tuple[StreamPlan, ...],
+    pt_state: object,
+) -> StepEvaluation:
+    if isinstance(pt_state, tuple) and pt_state and pt_state[0] == "primitive_table":
+        from mindie_sim.primitives.schema import parse_primitive_table
+        _, env_dict, warnings = pt_state
+        pt: object | None = parse_primitive_table(env_dict, verify_envelope=False)
+        if warnings:
+            object.__setattr__(pt, "warnings", tuple(warnings))
+    else:
+        pt = pt_state
+    return StepEvaluation(*wire_args, primitive_table=pt, streams=streams)
 
 
 @dataclass(frozen=True, slots=True)

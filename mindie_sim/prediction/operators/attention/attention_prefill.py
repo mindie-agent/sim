@@ -16,13 +16,17 @@ from functools import lru_cache
 import math
 from typing import Mapping
 
-from mindie_sim.prediction.engine import Allocation
 from mindie_sim.prediction.mechanism import (
     Geometry, OperatorPlan, PlannedRecipe, Work,
 )
-from mindie_sim.prediction.ownership import read_role, unit_group
+from mindie_sim.prediction.ownership import read_role
 from .attention_kv_access import FixpipeHandoffPolicy, KVCacheAccess, gqa_fixpipe_policy, kv_access
-from .attention_pipeline import append_gqa_handoff_stages
+# Stream-aware owner placement and SRAM allocation shared with staged decode;
+# ``attention_prefill_issue`` and ``attention_prefill_nofd`` import them from here.
+from .attention_pipeline import (
+    _allocation, _allocations, _operand_role, _placement, _read_role, _write_role,
+    append_gqa_handoff_stages,
+)
 from .attention_prefill_geometry import (
     IMPLEMENTATION, NATIVE_S2_PRELOAD, _DTYPE_ALIASES, _FP32_BYTES,
     _PREFILL_PHASES, _SOURCE_LARGE_HEAD_THRESHOLD, _SOURCE_QUERY_TILE_DEFAULT,
@@ -225,6 +229,8 @@ class StagedGQAPrefill:
             operand = "mte1" if "mte1" in geometry.resource_units else None
             mte1 = operand is not None
             cores = max(1, int(geometry.compute_units))
+            if geometry.stream_owners is not None:
+                cores = max(1, min(cores, int(geometry.stream_owners.aic_limit)))
             handoff = gqa_fixpipe_policy(
                 geometry, prefill_handoff_workspace_bytes(spec, cores),
             )
@@ -339,38 +345,9 @@ def build(op: OpSpec, geometry: Geometry | None = None) -> OperatorPlan:
 # ---------------------------------------------------------------------------
 
 
-def _placement(context: RecipeContext, core: int, *roles: str) -> dict:
-    present = tuple(role for role in roles if role in context.resource_names)
-    return context.owned(core, context.core_count, present) if present else {}
-
-
-def _read_role(context: RecipeContext, *, vector: bool = False) -> str:
-    return read_role(context.resource_names, aiv=0 if vector else None)
-
-
-def _write_role(context: RecipeContext) -> str | None:
-    return "mte3" if "mte3" in context.resource_names else None
-
-
-def _operand_role(context: RecipeContext) -> str | None:
-    return "mte1" if "mte1" in context.resource_names else None
-
-
-def _allocation(context: RecipeContext, core: int, pool: str, name: str,
-                size: float) -> Allocation | None:
-    if pool not in context.pool_names or size <= 0:
-        return None
-    capacity = context.pool_capacities.get(pool)
-    if capacity is not None and size > capacity:
-        raise ModelingError(
-            f"attention_prefill_buffer_exceeds_pool:{pool}:{name}:{size}>{capacity}")
-    units = unit_group(core, context.core_count,
-                       context.pool_units.get(pool, 1))
-    return Allocation(name, context.pool_names[pool], float(size), units)
-
-
-def _allocations(items) -> tuple[Allocation, ...]:
-    return tuple(item for item in items if item is not None)
+def admitted_cores(context: RecipeContext) -> int:
+    """AIC owners this op may dispatch: the stream's ``aic_limit`` when bound, else the die."""
+    return max(1, min(int(context.core_count), int(context.effective_aic_cores)))
 
 
 def _task_program(context: RecipeContext, recipe: StagedGQAPrefill,
@@ -444,7 +421,7 @@ def _task_program(context: RecipeContext, recipe: StagedGQAPrefill,
     # Only the final partial panel differs. Reuse bound stage descriptions;
     # PipelineProgram still creates independent events and lifetimes per panel.
     handoff = gqa_fixpipe_policy(
-        context, prefill_handoff_workspace_bytes(spec, context.core_count),
+        context, prefill_handoff_workspace_bytes(spec, admitted_cores(context)),
     )
 
     @lru_cache(maxsize=preload + 1)

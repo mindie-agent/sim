@@ -13,6 +13,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 import math
 
+from mindie_sim.backends.ascend import A5_POD_RANKS_PER_NODE
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.hardware_links import CollectiveBandSpec
 from ..engine import Allocation, Resource
@@ -48,7 +49,8 @@ DOUBLE_BUFFER_CREDIT_FRAMES = 2
 _HCOMM_EXPANSIONS = {
     "aiv": "aiv", "ccu_ms": "ccu_ms", "ai_cpu": "aicpu", "aicpu": "aicpu", "aicpu_ts": "aicpu", "nhr": "nhr",
 }
-_PHYSICAL_BAND_LIMITS = {"hccs_k8": K8_RANKS, "ub_mesh": K8_RANKS, "hccs_sw": A3_NODE_RANKS, "sio": TWO_RANKS}
+# UB mesh spans the A5 Pod node scope (ascend.json group_max=64); a5_server ranks_per_node=8 still bounds it.
+_PHYSICAL_BAND_LIMITS = {"hccs_k8": K8_RANKS, "ub_mesh": A5_POD_RANKS_PER_NODE, "hccs_sw": A3_NODE_RANKS, "sio": TWO_RANKS}
 _MESH_ALGORITHMS = frozenset({
     "direct", "direct_mesh", "pairwise", "mesh", "small_count_mesh", "one_shot_mesh",
     "two_shot_mesh", "chunked_two_shot_mesh", "chunked_mesh",

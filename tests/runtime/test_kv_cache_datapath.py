@@ -42,6 +42,7 @@ from mindie_sim.prediction.prefix_reads import (
     CacheAccess, apply_prefix_read_plan, plan_prefix_reads,
 )
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.dspark import DsparkSpec
 from mindie_sim.schema.model import RequestSpec, WorkloadSpec
 from mindie_sim.schema.operators import OpSpec
 from mindie_sim.schema.parallel import ParallelSpec
@@ -506,6 +507,24 @@ def test_shared_prefix_window_charges_pool_pages_and_releases_owners():
     footprint = batch_cache_bytes(linear, sequences=2, context=128, tokens_per_seq=1,
                                   prefix_tokens=64, phase="decode", padded=True)
     assert long["active_kv_bytes"] == pytest.approx(sum(footprint.total_bytes))
+def test_capacity_window_parses_mapping_before_override_and_forwards_verify_width():
+    mapping = dense_case(layers=1).to_dict()
+    for flag in (False, True):
+        window = capacity_window(mapping, phase="decode", context=32, async_scheduling=flag)
+        assert window["schema"] == "mindie-sim.capacity-window/1" and window["active_kv_bytes"] > 0
+    base = dense_case(layers=1)
+    kda = replace(base, model=linear_model("kda", layers=1),
+                  runtime=replace(base.runtime, dspark=DsparkSpec(3, (1.0,) * 3), metadata=()))
+    memory = Memory(kda)
+    assert memory.query_tokens == 4
+    short = capacity_window(kda, phase="decode", context=32, tokens_per_seq=3, output_budget=0,
+                            async_scheduling=False, memory=memory)
+    active = short["window"]["active_tokens_per_sequence"]
+    scheduled = sum(memory.dp_cohort_cache_bytes(active, padded=True, query_tokens=3))
+    assert short["active_kv_bytes"] == pytest.approx(scheduled)
+    assert scheduled < sum(memory.dp_cohort_cache_bytes(active, padded=True))
+
+
 def oracle_bytes(spans):
     """Independent finite byte-set expansion of the compact span encoding."""; result = set()
     for item in normalize_spans(spans):

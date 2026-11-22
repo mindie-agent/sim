@@ -215,13 +215,12 @@ def resolve_speculative_query_tokens(
                 f"speculative_state_tokens_per_seq_invalid:{tokens_per_seq}")
         return width
     dspark = getattr(runtime, "dspark", None)
-    draft_len = int(getattr(dspark, "draft_len", ZERO) or ZERO)
-    if draft_len > ZERO:
-        return draft_len
+    if dspark is not None:
+        # DSpark verifies the confidence-truncated proposal prefix plus the bonus token.
+        return ONE + int(dspark.step_spec().draft_len)
     metadata = dict(getattr(runtime, "metadata", ()) or ())
     proposals = int(metadata.get("draft_proposal_tokens", ZERO) or ZERO)
     if int(getattr(runtime, "mtp_acceptance_length", ONE) or ONE) <= ONE and proposals <= ZERO:
         return ONE
-    if str(metadata.get("draft_mode", "mtp")) == "dspark":
-        return max(ONE, proposals)
+    # MTP and metadata-only DSpark both declare a proposal count: verify width is ``[K+1]``.
     return max(ONE, proposals + ONE)

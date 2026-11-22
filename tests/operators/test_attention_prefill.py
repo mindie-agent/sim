@@ -614,3 +614,140 @@ def test_staged_gqa_prefill_emits_arch_specific_fixpipe_handoffs():
     tasks_cur = {row["task"].rsplit(":", 1)[-1] for row in eng_cur.trace}
     assert {"score_handoff", "pv_handoff"} <= tasks_cur
     assert plan_cur.work.resources["fixpipe"] > 0.0
+
+
+def _partition_halves(geom, *, aux_aic=None):
+    from mindie_sim.prediction.streams import StreamCoreBudget, StreamLane, StreamPlan, bind_stream_owners
+    path = geom.datapath
+    plan = StreamPlan(rank=0, lanes=(
+        StreamLane("main", StreamCoreBudget(
+            aic=path.aic_count // 2, aiv=path.aiv_count // 2, isolation="disjoint")),
+        StreamLane("aux", StreamCoreBudget(aic=aux_aic, isolation="disjoint")),
+    ))
+    return bind_stream_owners(plan, path)
+
+
+def _run_partitioned_prefill(geom, op, recipe, owners=None):
+    plan = recipe.build(op, replace(geom, stream_owners=owners))
+    units = dict(geom.resource_units)
+    rates = {r: float(geom.rates.get(r, 1e12)) / 1000.0 for r in units}
+    rates["cube"] = 1.0
+    ctx = RecipeContext(
+        op, {}, {r: r for r in units}, rates, geom.compute_units,
+        resource_units=units, compute_peaks=dict(geom.compute_peaks),
+        pool_names={p: p for p in geom.buffers}, pool_capacities=dict(geom.buffers),
+        pool_units=dict(geom.buffer_units),
+        physical_mechanisms=geom.physical_mechanisms, datapath=geom.datapath,
+        stream_owners=owners,
+    )
+    eng = Engine(
+        [Resource(r, rates[r], units=units[r]) for r in units],
+        pools=dict(geom.buffers), pool_units=dict(geom.buffer_units), trace_limit=1 << 17,
+    )
+    done = plan.program(ctx).start(eng, "gqa_pre", eng.submit("in"))
+    eng.advance(until=(done,))
+    assert eng.trace_dropped == 0
+    assert {r: v for r, v in eng.serviced.items() if v} == pytest.approx(ctx.bind(plan.work))
+    assert all(v == 0 for v in eng.allocated.values())
+    return plan, eng
+
+
+def _placed_and_buffers(eng, *, task_marker=""):
+    from mindie_sim.prediction.streams import AIC_BUFFER_POOLS, AIC_ROLES, AIV_BUFFER_POOLS, AIV_ROLES
+    aic, aiv, buf_aic, buf_aiv = set(), set(), set(), set()
+    for row in eng.trace:
+        if task_marker not in row["task"]:
+            continue
+        for role, units in (row.get("placement") or {}).items():
+            if role in AIC_ROLES:
+                aic.update(units)
+            elif role in AIV_ROLES:
+                aiv.update(units)
+    for (pool, unit), peak in eng.peak_unit_allocated.items():
+        if peak <= 0:
+            continue
+        if pool in AIC_BUFFER_POOLS:
+            buf_aic.add(unit)
+        elif pool in AIV_BUFFER_POOLS:
+            buf_aiv.add(unit)
+    return aic, aiv, buf_aic, buf_aiv
+
+
+@pytest.mark.parametrize("hardware", SKUS)
+def test_partitioned_prefill_places_cube_and_sram_only_on_assigned_cores(hardware):
+    from mindie_sim.prediction.operators.attention.attention_prefill import StagedGQAPrefill
+    geom = Geometry.from_devices(sku_case(hardware).machine.dies)
+    aux = _partition_halves(geom)["aux"]
+    assert min(aux.aic) >= geom.datapath.aic_count // 2
+    tile = INDEX_QUERY_TILE
+    op = OpSpec(
+        "prefill_gqa", "attention", "prefill", 0, 0, (),
+        (4 * tile, 16, INDEX_DIM), (4 * tile, 4, INDEX_DIM),
+        (4 * tile, 4, INDEX_DIM), (4 * tile, 16, INDEX_DIM),
+        dtype="bf16", recipe="flash_attention",
+        metadata=(("gqa_prefill", {
+            "requests": ((4 * tile, 0),), "query_heads": 16, "kv_heads": 4,
+            "head_dim": INDEX_DIM, "query_dtype": "bf16", "kv_dtype": "bf16", "causal": True,
+        }),),
+    )
+    recipe = StagedGQAPrefill(query_tile=tile, key_tile=tile)
+    _, free_eng = _run_partitioned_prefill(geom, op, recipe)
+    free_aic, _, _, _ = _placed_and_buffers(free_eng)
+    assert free_aic - set(aux.aic)
+    _, eng = _run_partitioned_prefill(geom, op, recipe, aux)
+    used_aic, used_aiv, buf_aic, buf_aiv = _placed_and_buffers(eng)
+    assert used_aic == set(aux.aic) and used_aiv and used_aiv <= set(aux.aiv)
+    assert buf_aic and buf_aic <= set(aux.aic) and buf_aiv and buf_aiv <= set(aux.aiv)
+    assert eng.now > free_eng.now
+
+
+def test_partitioned_native_prefill_keeps_split_reduction_and_zero_core_guard():
+    from mindie_sim.prediction.operators.attention.attention_prefill import StagedGQAPrefill
+    tile = INDEX_QUERY_TILE
+    geom_a5 = Geometry.from_devices(sku_case(REPRESENTATIVE_SKUS["a5"]).machine.dies)
+    aux_a5 = _partition_halves(geom_a5)["aux"]
+    op_fd = OpSpec(
+        "prefill_fd", "attention", "prefill", 0, 0, (),
+        (tile, 2, INDEX_DIM), (tile, 1, INDEX_DIM), (tile, 1, INDEX_DIM), (tile, 2, INDEX_DIM),
+        dtype="bf16", recipe="flash_attention",
+        metadata=(
+            ("gqa_prefill", {
+                "requests": ((tile, 127 * tile),), "query_heads": 2, "kv_heads": 1,
+                "head_dim": INDEX_DIM, "query_dtype": "bf16", "kv_dtype": "bf16", "causal": True,
+            }),
+            ("native_operator", "FusedInferAttentionScore"),
+        ),
+    )
+    plan, eng = _run_partitioned_prefill(geom_a5, op_fd, StagedGQAPrefill(), aux_a5)
+    host = plan.metadata["prefill_plan"]
+    assert host["cores"] == aux_a5.aic_limit and host["fd_splits"] > 0 and len(host["loads"]) <= aux_a5.aic_limit
+    used_aic, used_aiv, buf_aic, buf_aiv = _placed_and_buffers(eng)
+    fd_aic, fd_aiv, _, _ = _placed_and_buffers(eng, task_marker=":fd")
+    assert used_aic and used_aic <= set(aux_a5.aic) and used_aiv <= set(aux_a5.aiv)
+    assert not fd_aic and fd_aiv and fd_aiv <= set(aux_a5.aiv)
+    assert buf_aic <= set(aux_a5.aic) and buf_aiv <= set(aux_a5.aiv)
+
+    # IssueCursor reconstruct path under an Arch22 stream partition conserves handoff tier & owners.
+    geom_a3 = Geometry.from_devices(sku_case(REPRESENTATIVE_SKUS["a3"]).machine.dies)
+    aux_a3 = _partition_halves(geom_a3)["aux"]
+    op_cur = OpSpec(
+        "prefill_cur", "attention", "prefill", 0, 0, (),
+        (tile, 4, INDEX_DIM), (tile, 2, INDEX_DIM), (tile, 2, INDEX_DIM), (tile, 4, INDEX_DIM),
+        dtype="bf16", recipe="flash_attention",
+        metadata=(
+            ("gqa_prefill", {
+                "requests": ((tile, tile),), "query_heads": 4, "kv_heads": 2,
+                "head_dim": INDEX_DIM, "query_dtype": "bf16", "kv_dtype": "bf16", "causal": True,
+            }),
+            ("native_operator", "FusedInferAttentionScore"),
+            ("reconstruct", True),
+        ),
+    )
+    _, cur_eng = _run_partitioned_prefill(geom_a3, op_cur, StagedGQAPrefill(query_tile=tile, key_tile=tile), aux_a3)
+    c_aic, c_aiv, cb_aic, cb_aiv = _placed_and_buffers(cur_eng)
+    assert c_aic and c_aic <= set(aux_a3.aic) and c_aiv <= set(aux_a3.aiv)
+    assert cb_aic <= set(aux_a3.aic) and cb_aiv <= set(aux_a3.aiv)
+
+    idle = _partition_halves(geom_a3, aux_aic=0)["aux"]
+    with pytest.raises(ModelingError, match="stream_zero_aic_budget:.*:gqa_prefill"):
+        _run_partitioned_prefill(geom_a3, op_cur, StagedGQAPrefill(query_tile=tile, key_tile=tile), idle)

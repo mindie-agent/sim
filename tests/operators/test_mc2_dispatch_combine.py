@@ -596,7 +596,9 @@ def test_matmul_all_reduce_multichunk_rdma_and_hbm_coupling():
     geo_view = replace(geo_m, buffers={"ub": 262144, "l1": 524288, "l0a": 65536, "l0b": 65536, "l0c": 131072, "l2": 1048576}, rates={**geo_m.rates, "l2": RATE}, admission_memory_view=AdmissionMemoryView({0: 512}))
     mm_plan, mm_ctx = megamoe.build(mm_op, geo_view), lower_plan(call(DISPATCH, 2, width=ROW, assignment_matrix={(0, 1): 1}), geo_view)[1]
     mm_stgs = {s.name: s for s in mm_plan.program(mm_ctx).programs[0].stages}
-    assert mm_plan.metadata["l2_onchip_activation_bytes"] == 512.0 and mm_stgs["gmm1_gate_up"].work["hbm"] != mm_stgs["gmm2_down"].work["hbm"] and "l2" not in mm_stgs["gmm2_down"].work
+    assert mm_plan.metadata["l2_onchip_activation_bytes"] == 512.0
+    assert mm_stgs["gmm1_gate_up"].work["hbm"] != mm_stgs["gmm2_down"].work["hbm"]
+    assert mm_stgs["act_mx_quant"].work["mte3"] > 0.0 and mm_stgs["gmm2_down"].work["l2"] > 0.0
 
 
 def test_megamoe_typed_activation_abi_predicate_and_mc2_protocol_floor_work():
@@ -717,3 +719,68 @@ def test_megamoe_ep_fusion_preserves_topology_dispatch_and_combine_wire_service(
     )
     plan_ep1 = megamoe.build(ep1, geo)
     assert plan_ep1.work.resources.get("link", 0.0) == 0.0
+
+
+def test_w4a4_mxfp4_preserves_fp4_payload_and_megamoe_charges_gmm2_activation_workspace():
+    from mindie_sim.catalog.npu_checkpoints import (
+        _quant_spec_from_preset, parse_quant_model_description,
+    )
+    from mindie_sim.catalog.ops import activation_scales
+    from mindie_sim.compose import compose_case
+    from mindie_sim.prediction.operator_analysis import target_graphs
+    from mindie_sim.prediction.operators.mc2 import megamoe
+    from mindie_sim.prediction.runtime.l2_residency import AdmissionMemoryView
+
+    # W4A4_MXFP4 checkpoint parser and preset preserve fp4_e2m1 end-to-end.
+    preset_q = _quant_spec_from_preset("w4a4_mxfp4")
+    assert preset_q.activation_format == "fp4_e2m1"
+    parsed_q = parse_quant_model_description({"model.layers.0.mlp.experts.0.up_proj.weight": "W4A4_MXFP4"})
+    assert parsed_q.for_category("routed_expert").activation_format == "fp4_e2m1"
+    grp, sfmt, _shape, sbytes = activation_scales(preset_q, "fp4_e2m1", 1, 6144)
+    assert grp == 32 and sfmt == "fp8_e8m0" and sbytes == pytest.approx(192.0)
+
+    # GLM-5.2 W4A4 checkpoint preserves fp4_e2m1 through dispatch and MegaMoE lowering.
+    raw_w4a4 = compose_case(
+        "Eco-Tech/GLM-5.2-w4a4c8-mxfp4", MESH_SKU, dp=1, tp=8, ep=8, layers=4,
+        prompt_tokens=2048, output_tokens=64, feature_track="merged", enable_fused_mc2=2,
+    )
+    assert raw_w4a4["model"]["quant"]["activation_format"] == "fp4_e2m1"
+    raw_w4a4["runtime"]["metadata"].setdefault("additional_config", {})["enable_mega_moe"] = 1
+    g_w4a4 = target_graphs(raw_w4a4, phase="decode", tokens=1, context=2048, sequences=16, scope="body")[0]
+    megas = [op for op in g_w4a4 if op.recipe == "megamoe_arch35"]
+    assert megas and dict(megas[0].metadata)["compute_format"] == "fp4_e2m1"
+
+    # MegaMoE charges act2 = l0_gmm2 - w2 - sh_w2 on MTE3 (act_mx_quant) and AIC MTE2 (gmm2_down)
+    # with L2/HBM split and exact Engine work conservation.
+    geo = geometry(MESH_SKU, 2)
+    mm_fp8 = megamoe.make_op(
+        op_id="mm_p5", tokens=16, hidden=2048, moe_inter=2048, top_k=8,
+        routed_rows=128.0, w13_bytes=2097152.0, w2_bytes=1048576.0, ep=2, compute_dtype="fp8_e4m3",
+    )
+    act2_expected = 128.0 * (2048 + 64)  # 264 KiB
+    geo_l2 = replace(
+        geo,
+        buffers={"ub": 262144, "l1": 524288, "l0a": 65536, "l0b": 65536, "l0c": 131072, "l2": 4 * 1048576},
+        rates={**geo.rates, "l2": RATE},
+        admission_memory_view=AdmissionMemoryView({0: 131072}),
+    )
+    plan = megamoe.build(mm_fp8, geo_l2)
+    assert plan.metadata["gmm2_activation_workspace_bytes"] == pytest.approx(act2_expected)
+    _, ctx = lower_plan(call(DISPATCH, 2, width=ROW, assignment_matrix={(0, 1): 1}), geo_l2)
+    ctx = replace(ctx, compute_peaks={**dict(ctx.compute_peaks), **dict(geo_l2.compute_peaks)})
+    prog = plan.program(ctx)
+    _, eng = execute(plan.lower(ctx), ctx.rates, ctx.resource_units)
+    assert +Counter(eng.serviced) == pytest.approx(+Counter(ctx.bind(plan.work)))
+    act_mte3 = sum(s.work.get("mte3", 0.0) for p in prog.programs for s in p.stages if s.name == "act_mx_quant")
+    gmm2_mte2 = sum(s.work.get("mte2_aic", 0.0) for p in prog.programs for s in p.stages if s.name == "gmm2_down")
+    assert act_mte3 == pytest.approx(act2_expected)
+    assert gmm2_mte2 == pytest.approx(1048576.0 + act2_expected)
+
+    # FP4 MegaMoE uses half the FP8 activation payload bytes plus identical E8M0 scales.
+    mm_fp4 = megamoe.make_op(
+        op_id="mm_fp4", tokens=16, hidden=6144, moe_inter=2048, top_k=8,
+        routed_rows=128.0, w13_bytes=2097152.0, w2_bytes=1048576.0, ep=2, compute_dtype="fp4_e2m1",
+    )
+    plan_fp4 = megamoe.build(mm_fp4, geo_l2)
+    assert plan_fp4.metadata["gmm2_activation_workspace_bytes"] == pytest.approx(128.0 * (1024 + 64))
+    assert "fp4_e2m1" in plan_fp4.work.matrix

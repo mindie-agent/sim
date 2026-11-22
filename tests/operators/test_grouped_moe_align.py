@@ -344,9 +344,9 @@ def test_absorbed_init_routing_writes_the_inverse_index_once():
 
 
 @pytest.mark.parametrize(("shape", "expected"), [
-    ((528, 288, 4096), 15728640),
+    ((528, 288, 4096), 20447232),
     ((240, 384, 7168), 17891328),
-    ((512, 896, 7168), 55050240),
+    ((512, 896, 7168), 80740352),
 ])
 def test_router_operand_traffic_uses_the_executed_tile(shape, expected):
     raw = router_splitk._case(router_splitk.V41, router_splitk.DT)

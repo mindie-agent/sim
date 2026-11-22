@@ -105,7 +105,8 @@ def page_groups(case, layer_stage, query_tokens):
     fallback = max(0, query_tokens - 1)
     draft_len = getattr(runtime.dspark, "draft_len", None)
     if draft_len is not None and "draft_proposal_tokens" not in metadata:
-        fallback = max(0, int(draft_len) - 1)
+        # Fixed reservation keeps the declared proposal count (not the truncated verify width).
+        fallback = max(0, int(draft_len))
     proposals = int(metadata.get("num_speculative_state_blocks",
                                 metadata.get("draft_proposal_tokens", fallback)))
     extra = int(metadata.get("num_prefill_checkpoint_blocks", 0))

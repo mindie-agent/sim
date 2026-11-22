@@ -27,7 +27,8 @@ from ..contracts import ArchStrategy, OperatorPlanningContext
 from mindie_sim.prediction.operators.mc2.mc2_fullmesh import SOURCE, combine_layout, dispatch_layout
 from mindie_sim.prediction.operators.mc2.mc2_mx_quant import mx32_work
 from .common import (
-    COLLECTIVES, COMBINE, FLOAT_ROWS, MMAR, MMRS, Mc2Contract, PeerRoute, Transport, build_transport_stages, capability_gap,
+    COLLECTIVES, COMBINE, FLOAT_ROWS, FP4_ROWS, MMAR, MMRS, Mc2Contract, PeerRoute, Transport,
+    build_transport_stages, capability_gap,
     contract_fields, make_plan, native_protocol_peer_transport, topology_hops,
     validate_contract, validate_native_dispatch_quant,
 )
@@ -439,6 +440,16 @@ def _allow_megamoe_abi_extension(runtime) -> bool:
     return str(track).strip().lower() == "expected_ideal"
 
 
+def _megamoe_payload_dtype(up_meta: Mapping) -> str:
+    """Resolve fused GMM operand format: preserve FP4/FP8/float declaration."""
+    act = str(up_meta.get("activation_format") or up_meta.get("compute_format") or "").lower()
+    if act in FP4_ROWS or act in {"mxfp4", "mx_fp4", "mxfp4_e2m1"}:
+        return "fp4_e2m1"
+    if act in FLOAT_ROWS or act == "fp32":
+        return act
+    return "fp8_e4m3"
+
+
 def _try_lower_megamoe(
     ops, by_id, selected, runtime, prefix, tokens, width, top_k, received_assignments,
     ep, dtype, pack, dispatch, combine, unpack, pack_quant,
@@ -535,7 +546,7 @@ def _try_lower_megamoe(
         w13_bytes=w13_b, w2_bytes=w2_b,
         enable_fused_mc2=fused_lvl if fuse_shared else FUSED_MC2_ROUTED_MODE,
         ep=int(ep), activation=act_kind,
-        compute_dtype="fp8_e4m3", output_dtype=dtype,
+        compute_dtype=_megamoe_payload_dtype(up_meta), output_dtype=dtype,
         dispatch_link_bytes=float(dispatch.link_bytes),
         combine_link_bytes=float(combine.link_bytes),
         group_axis=group_axis,
@@ -546,6 +557,9 @@ def _try_lower_megamoe(
         peer_volume_basis=str(peer_volume_basis) if peer_volume_basis is not None else None,
         shared_inter=sh_inter, shared_w13_bytes=sh_w13,
         shared_w2_bytes=sh_w2,
+        shared_compute_dtype=(
+            _megamoe_payload_dtype(dict(sh_up.metadata)) if fuse_shared else None
+        ),
         allow_abi_extension=allow_ext,
         activation_params=act_meta.get("activation_params"),
         extra_metadata=(
