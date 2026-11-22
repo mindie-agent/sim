@@ -36,7 +36,6 @@ from mindie_sim.schema.workload import IterationPlan, RequestView
 from tools.analyze_a5_microbench_boundaries import analyze_window, nanoseconds
 
 pytestmark = pytest.mark.tier0
-
 ADAPTER_FIXTURES = ("observations", "capture_adapters")
 
 def test_capture_inventory_counts_source_bound_samples_and_acquisitions():
@@ -439,13 +438,11 @@ def _verify_capture(path, *, level="L1", events=("gemm",), ranks=(1,), measured=
                     operator="elapsed_span", endpoints=None, kind=None):
     start, end = endpoints or (events[0], events[-1])
     kind = kind or {"L1": "device_kernel", "L2": "periodic_block", "L3": "model_step"}[level]
-    boundary = gate.CaptureBoundary(gate.digest_file_streaming(path), "acq", "session", (), events, ranks,
-                                    "device", start, end, kind, "ns", clock_operator=operator)
+    boundary = gate.CaptureBoundary(gate.digest_file_streaming(path), "acq", "session", (), events, ranks, "device", start, end, kind, "ns", clock_operator=operator)
     cohort = gate.CohortKey(level, "timing", "device", "decode", "eager", "shape", "tp1")
     item = gate.GateCase("capture", level, "heldout", boundary, "inputs", "stack", "impl", cohort, measured)
-    index = gate.validate_lineage(gate.Manifest("native", "1", (item,)), gate.FrozenFitManifest("empty", "1", ()),
-                                  capture_files={item.case_id: path}, require_capture_files=True)
-    return index.capture_receipts[item.case_id]
+    return gate.validate_lineage(gate.Manifest("native", "1", (item,)), gate.FrozenFitManifest("empty", "1", ()),
+                                 capture_files={item.case_id: path}, require_capture_files=True).capture_receipts[item.case_id]
 @pytest.mark.parametrize("level", ("L1", "L2", "L3"))
 def test_native_csv_binds_rank_events_and_duration(tmp_path, level):
     path = tmp_path / "kernel_details.csv"
@@ -489,32 +486,36 @@ def test_profiler_rows_preserve_clock_and_single_kernel_boundaries(tmp_path):
     path.write_text("Device_id,Name\n1,gemm\n")
     with pytest.raises(ModelingError, match="csv_schema_unsupported"):
         _verify_capture(path)
-
-@pytest.mark.parametrize("ownership", ("none", "connection", "call", "host", "peers", "other_thread", "ambiguous_host"))
+@pytest.mark.parametrize("ownership", ("none", "connection", "call", "host", "flow", "mixed", "peers", "other_thread", "ambiguous_host", "no_api"))
 def test_composite_capture_requires_shared_host_call(tmp_path, ownership):
-    path = tmp_path / "matmul.json"
-    connections = (10, 10 if ownership == "connection" else 11)
-    rows = [{"ph": "X", "device_id": 1, "ts": start, "dur": 5, "name": "MatMulV3",
-             "args": {"Task Id": task, "Connection Id": conn}} for task, start, conn in zip((112, 113), (20, 30), connections)]
-    rows.append({"ph": "X", "device_id": 1, "ts": 26, "dur": 3, "name": "unrelated"})
-    if ownership == "call":
-        rows[0]["Host Call Id"] = rows[1]["args"]["callId"] = 18
-    if ownership in ("host", "peers", "other_thread", "ambiguous_host"):
-        host = {"ph": "X", "pid": 100, "tid": 7, "ts": 0, "dur": 20, "name": "aclnnMatmul"}
-        rows.extend((host, dict(host)) if ownership == "ambiguous_host" else (host,))
-        for conn, start in zip(connections, (2, 12)):
+    path, tasks = tmp_path / "convolution.json", (112, 113, 114)
+    conns = (10, 10, 10) if ownership in ("connection", "no_api") else (10, 11, 12)
+    call = {"Host Call Id": 18} if ownership == "call" else {}
+    rows = [{"ph": "X", "device_id": 1, "ts": start, "dur": 5, "name": "device_kernel",
+             "args": {"Task Id": task, "Connection Id": conn, **call}} for task, start, conn in zip(tasks, (20, 30, 40), conns)]
+    rows.extend(({**rows[0], "device_id": 2}, {**rows[0], "dur": 0, "args": {**rows[0]["args"], "Task Id": 115}}))
+    if ownership not in ("none", "connection", "call"):
+        host = dict(ph="X", pid=100, tid=7, ts=0, dur=20, name="AscendCL@aclnnConvolution")
+        rows.extend([{**host, "connection_id": 9}] * (2 if ownership == "ambiguous_host" else int(ownership != "no_api")))
+        for conn, start, helper in zip(dict.fromkeys(conns), (2, 8, 14), ("AscendCL@aclrtLaunchKernel", "Node@launch", "Node@launch")):
             if ownership == "peers":
                 rows.append({**host, "ts": start - 1, "dur": 4})
-            rows.append({**host, "name": "rtKernelLaunch", "ts": start, "dur": 1, "args": {"Connection Id": conn},
-                         "tid": conn if ownership == "other_thread" else host["tid"]})
+            rows.append({**host, "name": helper, "ts": start, "dur": 2})
+            if ownership != "flow":
+                rows.append(dict(host, name=helper, ts=start, dur=1, connection_id=conn, tid=conn if ownership == "other_thread" else 7))
+            if ownership in ("flow", "mixed"):
+                link = {"args": {"Connection Id": conn}} if conn == conns[-1] else {"id": conn}
+                rows.append({"ph": "s", "pid": 100, "tid": 8 if ownership == "mixed" else 7, "ts": start, **link})
     path.write_text(json.dumps({"traceEvents": rows}))
-    claim = {"events": ("task:112", "task:113"), "kind": "aclnn_call", "operator": "busy_union", "measured": 10_000}
-    if ownership in ("connection", "call", "host"):
-        assert _verify_capture(path, **claim).selected_kernels == {(1, 1), (1, 2)}
-    else:
+    claim = {"kind": "aclnn_call", "operator": "busy_union"}
+    events = tuple(f"task:{task}" for task in tasks)
+    rejected = (events,)
+    if ownership in ("connection", "call", "host", "flow", "mixed", "no_api"):
+        assert _verify_capture(path, events=events, measured=15_000, **claim).selected_kernels == {(1, 1), (1, 2), (1, 3)}
+        rejected = (events[1:], events[-1:])
+    for selected in rejected:
         with pytest.raises(ModelingError, match="capture_l1_call_ownership_unverified:capture:rank=1"):
-            _verify_capture(path, **claim)
-
+            _verify_capture(path, events=selected, measured=5_000 * len(selected), **claim)
 @pytest.mark.parametrize("level", ("L2", "L3"))
 @pytest.mark.parametrize("suffix", ("csv", "json"))
 def test_busy_union_includes_prior_launch_and_clips_both_ends(tmp_path, level, suffix):
@@ -526,10 +527,11 @@ def test_busy_union_includes_prior_launch_and_clips_both_ends(tmp_path, level, s
         path.write_text(json.dumps([{"rank": 1, "name": e, "start_us": s, "duration_us": d} for e, s, d in runs]))
     claim = {"level": level, "events": ("open", "close"), "operator": "busy_union"}
     receipt = _verify_capture(path, measured=50_000, **claim)
-    assert receipt.window_kernels == ({(1, 2), (1, 3), (1, 4)} if level == "L3" else None)
+    assert receipt.window_kernels == ({(1, 1), (1, 2), (1, 3), (1, 4)} if level == "L3" else None)
+    elapsed = _verify_capture(path, level=level, events=claim["events"], measured=60_000)
+    assert elapsed.window_kernels == ({(1, 2), (1, 3), (1, 4)} if level == "L3" else None)
     with pytest.raises(ModelingError, match="capture_duration_mismatch:.*actual=50000"):
         _verify_capture(path, measured=30_000, **claim)
-
 @pytest.mark.parametrize(("stream", "start", "passes"), ((25, 15, True), (59, 15, False), (None, 15, False),
                                                        (59, 5, False), (59, 0.001, True)))
 def test_single_kernel_accepts_independent_stream_overlap(tmp_path, stream, start, passes):
@@ -541,15 +543,13 @@ def test_single_kernel_accepts_independent_stream_overlap(tmp_path, stream, star
     else:
         with pytest.raises(ModelingError, match="capture_device_kernel_multiple_occurrences:capture:rank=1"):
             _verify_capture(path, events=("target",), measured=20_000)
-
 def test_json_capture_filters_unrelated_events_while_streaming(tmp_path, monkeypatch):
     monkeypatch.setattr(gate, "ijson", None)  # Exercise the stdlib fallback directly.
     path = tmp_path / "trace.json"
     with path.open("w", encoding="utf-8") as capture:
         capture.write('{"traceEvents":[')
         for _ in range(40_000):
-            capture.write(json.dumps({"name": "gemm", "ph": "X", "device_id": 999,
-                                      "ts": 1, "dur": 100, "detail": "x" * 100}) + ",\n")
+            capture.write(json.dumps(dict(name="gemm", ph="X", device_id=999, ts=1, dur=100, detail="x" * 100)) + ",\n")
         capture.write('{"name":"gemm","ph":"X","device_id":1,"ts":1,"dur":60.023}]}')
     tracemalloc.start()
     try:

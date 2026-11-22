@@ -725,7 +725,7 @@ def _step_census(step: Residual, candidates: Iterable[Residual]) -> tuple[str, l
     if not expected or len(expected) != len(step.expected_components):
         return "missing_or_invalid_component_census", []
     receipt = step.capture_verification
-    if receipt is None or not (census := receipt.window_kernels):
+    if receipt is None or not (census := receipt.window_kernels):  # Includes clipped busy-union contributors.
         return "step_physical_census_unavailable", []
     inner, verified, coverage = [], [], {level: set() for level in DRILLDOWN_LEVELS}
     outside_step = bundled_l1 = False

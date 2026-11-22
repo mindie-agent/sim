@@ -140,7 +140,7 @@ def test_lineage_case_normalization_event_scoping_and_fit_closure(tmp_path: Path
     cap_doc = {"device_ranks": [0], "clock_domain": "device_monotonic", "start_event": "k_start", "end_event": "k_end", "event_ids": ["ev-ok"]}
     cap_path = tmp_path / "cap_ok.json"
     cap_path.write_text(json.dumps(cap_doc), encoding="utf-8")
-    good_case = _case("cap_ok", kind="native_composite", tag="4", raw_sha=hashlib.sha256(cap_path.read_bytes()).hexdigest(),
+    good_case = _case("cap_ok", level="L2", tag="4", raw_sha=hashlib.sha256(cap_path.read_bytes()).hexdigest(),
                       events=("ev-ok",), uri="capture://cap_ok.json")
     disk_manifest = Manifest("m_disk", "1", (good_case,))
     validate_lineage(disk_manifest, EMPTY_FITS, capture_root=tmp_path, require_capture_files=True)
@@ -156,15 +156,16 @@ def test_lineage_case_normalization_event_scoping_and_fit_closure(tmp_path: Path
         ("bad_clock_boundary.json", {**cap_doc, "boundary": {"clock_operator": "elapsed_span"}}, "capture_clock_operator_mismatch"),
         ("bad_clock_event.jsonl", json.dumps({"event_id": "hdr", "start_event": "k_start", "end_event": "k_end", "clock_operator": "busy_union", "device_ranks": [0], "clock_domain": "device_monotonic"}) + "\n" + json.dumps({"event_id": "ev-ok", "clock_operator": "elapsed_span"}) + "\n", "capture_clock_operator_mismatch"),
         ("bad_ev.json", {**cap_doc, "event_ids": ["other_ev"]}, "capture_event_mismatch"),
+        ("metadata_only_call.json", cap_doc, "capture_l1_call_ownership_unverified"),
         ("bad_se.json", {**cap_doc, "start_event": "wrong_start"}, "capture_event_mismatch"),
         ("unrel.json", {"summary": "unrelated_without_events"}, "capture_event_mismatch"),
     ):
         fp = tmp_path / fname
         fp.write_text(bad_payload if isinstance(bad_payload, str) else json.dumps(bad_payload), encoding="utf-8")
-        c_bad = _case(fname, tag="5", raw_sha=hashlib.sha256(fp.read_bytes()).hexdigest(), events=("ev-ok",), uri=f"capture://{fname}")
-        c_bad = replace(c_bad, boundary=replace(c_bad.boundary, clock_operator="busy_union"))
+        c_bad = _case(fname, kind="aclnn_call" if fname == "metadata_only_call.json" else None, events=("ev-ok",))
+        boundary = replace(c_bad.boundary, raw_sha256=hashlib.sha256(fp.read_bytes()).hexdigest(), clock_operator="busy_union")
         with pytest.raises(ModelingError, match=err):
-            validate_lineage(Manifest(f"m_{fname}", "1", (c_bad,)), EMPTY_FITS, capture_root=tmp_path, require_capture_files=True)
+            validate_lineage(Manifest(f"m_{fname}", "1", (replace(c_bad, boundary=boundary),)), EMPTY_FITS, capture_files={fname: fp})
 def test_cross_level_root_overlap_rejected_unless_debug_only() -> None:
     c_l1 = _case("l1_case", level="L1", split="heldout", tag="a", acq="shared_root")
     c_l2 = _case("l2_case", level="L2", split="heldout", tag="b", parents=("shared_root",))
@@ -327,44 +328,43 @@ def test_physical_tolerance_boundaries_and_release() -> None:
     verdict = gate_decision(failed, required_levels=("L1",), **atol)
     assert verdict["status"] == "fail" and verdict["pointwise_threshold_exceeded"] == [summary.cohort.as_id()]
 @pytest.mark.parametrize("capture_format", ("csv", "csv.gz", "trace", "json", "jsonl"))
-def test_vertical_drilldown_requires_physical_kernel_census(tmp_path, capture_format):
-    suffix = "json" if capture_format == "trace" else capture_format
-    path, events = tmp_path / f"step.{suffix}", ("a", "b", "c", "d")
-    runs = tuple(zip(events, (0, 100, 240, 300), (100, 140, 60, 100)))
+def test_vertical_drilldown_requires_inflight_busy_union_contributors(tmp_path, capture_format):
+    path, events = tmp_path / ("step.json" if capture_format == "trace" else f"step.{capture_format}"), ("a", "b", "c", "d")
+    runs = tuple(zip(events, (0, 60, 240, 300), (209, 80, 60, 100), (10, 11, 12, 12)))
     if capture_format.startswith("csv"):
-        data = "Rank,Name,Start Time(us),Duration(us),Connection Id\n" + "".join(f"0,{e},{s},{d},42\n" for e, s, d in runs)
-        path.write_bytes(gzip.compress(data.encode()) if suffix == "csv.gz" else data.encode())
+        data = "Rank,Name,Start Time(us),Duration(us),Connection Id,Stream Id\n" + "".join(f"0,{e},{s},{d},{c},{c}\n" for e, s, d, c in runs)
+        path.write_bytes(gzip.compress(data.encode()) if capture_format == "csv.gz" else data.encode())
     elif capture_format == "trace":
-        rows = [{"ph": "X", "device_id": 0, "name": e, "ts": s, "dur": d, "args": {"Connection Id": 42}} for e, s, d in runs]
+        rows = [dict(ph="X", device_id=0, name=e, ts=s, dur=d, tid=c, connection_id=c) for e, s, d, c in runs]
         path.write_text(json.dumps({"traceEvents": rows}))
     else:
-        kernels = [{"rank": 0, "event_id": e, "start_us": s, "duration_us": d, "connection_id": 42} for e, s, d in runs]
-        path.write_text(json.dumps({"events": kernels}) if suffix == "json" else "\n".join(map(json.dumps, kernels)))
+        kernels = [dict(rank=0, event_id=e, start_us=s, duration_us=d, connection_id=c, stream_id=c) for e, s, d, c in runs]
+        path.write_text(json.dumps({"events": kernels}) if capture_format == "json" else "\n".join(map(json.dumps, kernels)))
     digest = hashlib.sha256(path.read_bytes()).hexdigest()
-    def measured(name, level, selected, duration, *, kind=None):
+    def measured(name, level, selected, duration, *, kind=None, clock="elapsed_span"):
         case = _case(name, level=level, kind=kind, raw_sha=digest, events=selected, measured_ns=duration * 1000,
                      debug_cross_level=level != "L3")
-        return replace(case, boundary=replace(case.boundary, start_event=selected[0], end_event=selected[-1]))
-    operators = tuple(measured(e, "L1", (e,), d) for e, _, d in runs)
-    endpoints = (events[0], events[-1])
+        return replace(case, boundary=replace(case.boundary, start_event=selected[0], end_event=selected[-1], clock_operator=clock))
+    operators = tuple(measured(e, "L1", (e,), d) for e, _, d, _ in runs)
     def score(inner, runner, *, raw=True):
-        step = replace(measured("step", "L3", endpoints, 400),
+        step = replace(measured("step", "L3", ("b", "d"), 309, clock="busy_union"),
                        payload=(("component_case_ids", tuple(case.case_id for case in inner)),))
         rows = evaluate(Manifest("step", "1", (step, *inner)), EMPTY_FITS, runner, capture_files={digest: path} if raw else None)
         verdict = gate_decision(summarize_cohorts(rows), required_levels=("L3",))
         return verdict, verdict["vertical_drilldowns"]["step"]
     good = _LiveEngineRunner(scale=1)
-    full_block, short_block = (measured("block", "L2", selected, 400) for selected in (events, endpoints))
+    full_block, short_block = measured("block", "L2", events, 400), measured("block", "L2", events[1:], 340)
     assert score((*operators, full_block), good)[0]["status"] == "pass"
-    bundle = measured("bundle", "L1", events[:2], 240, kind="aclnn_call")
-    verdict, report = score((bundle, *operators[2:], full_block), good)
+    bundle = measured("bundle", "L1", events[2:], 160, kind="aclnn_call")
+    verdict, report = score((*operators[:2], bundle, full_block), good)
     assert verdict["status"] == "insufficient_evidence" and report["failure_reason"] == "l1_drilldown_requires_individual_occurrences"
-    bad = _LiveEngineRunner({case.case_id: _live_interval(case, 100_000) for case in operators}, scale=1)
-    verdict, report = score((*operators, full_block), bad)
-    assert verdict["status"] == "fail" and report["step_passed"] and report["levels"]["L1_in_L3"]["cancellation_ratio"] == 1
-    assert [part["name"] for part in report["failed_components"]] == ["b", "c"]
-    edge = (operators[0], operators[-1])
-    for inner in ((*edge, short_block), (*edge, full_block), (*operators, short_block)):
+    bad = {"a": _live_interval(operators[0], 10_000)}
+    verdict, report = score((*operators, full_block), _LiveEngineRunner(bad, scale=1))
+    assert verdict["status"] == "fail" and report["step_passed"] and report["failure_reason"] == "component_pointwise_failure"
+    assert [part["name"] for part in report["failed_components"]] == ["a"]
+    bad["c"] = _live_interval(operators[2], 259_000)
+    assert score((*operators, full_block), _LiveEngineRunner(bad, scale=1))[1]["levels"]["L1_in_L3"]["cancellation_ratio"] == 1
+    for inner in ((*operators[1:], short_block), (*operators[1:], full_block), (*operators, short_block)):
         verdict, report = score(inner, good)
         assert verdict["status"] == "insufficient_evidence"
         assert report["failure_reason"] == "component_physical_kernels_incomplete"

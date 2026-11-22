@@ -47,7 +47,7 @@ _CALL_ID_KEYS = ("Call Id", "Call ID", "call_id", "callId", "Host Call Id", "hos
 _STREAM_ID_KEYS = ("Stream Id", "Stream ID", "Physic Stream Id", "stream_id", "streamId", "stream")
 _JSON_ROW_KEYS = frozenset((*_EVENT_ID_KEYS, *_TRACE_RANK_KEYS, *_TASK_ID_KEYS, *_CONNECTION_ID_KEYS,
                             *_STREAM_ID_KEYS, *_CALL_ID_KEYS, "ph", "pid", "tid", "args"))
-_HOST_API_PREFIXES = ("aclnn", "hccl", "acl", "aten::", "npu_", "ops.")
+_HOST_API_PREFIXES = ("aclnn", "aclop", "hccl", "Hccl", "aten::", "npu_", "ops.")
 _SELECTOR_PREFIXES = ("row:", "task:", "conn:", "stream:", "dev:")
 _JSON_START_KEYS = ("start_time", "start_ts", "start", "timestamp", "ts")
 _JSON_END_KEYS = ("end_time", "end_ts", "end")
@@ -66,6 +66,8 @@ L3_BOUNDARY_KINDS = frozenset({"model_step", "service_step", "e2e_step", "device
 
 _KernelOccurrence = tuple[int, int]  # (device rank, one-based source row)
 _RankWindows = Mapping[int, tuple[Decimal, Decimal]]
+_HostThread = tuple[int | str, int | str]
+_HostLaunch = tuple[_HostThread, Decimal, Decimal]
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,6 +107,7 @@ def resolve_capture_file(
                 return resolved
     if capture_root is None:
         return None
+    candidates = []
     if capture_uri and capture_uri.startswith(CAPTURE_URI_SCHEME):
         rel = capture_uri[len(CAPTURE_URI_SCHEME):].lstrip("/")
         rel_path = PurePosixPath(rel)
@@ -115,14 +118,9 @@ def resolve_capture_file(
             *([capture_root / f"{rel}.json"] if not rel_path.suffix else []),
             capture_root / rel_path.name,
         ]
-        for cand in candidates:
-            if cand.is_file():
-                return cand
     if rel_ref := dict(source_ref).get("relative_path"):
-        cand = capture_root / PurePosixPath(rel_ref)
-        if cand.is_file():
-            return cand
-    return None
+        candidates.append(capture_root / PurePosixPath(rel_ref))
+    return next((candidate for candidate in candidates if candidate.is_file()), None)
 
 
 def _collect_event_names(raw_events: Any) -> set[str]:
@@ -295,21 +293,9 @@ def _capture_metadata(
     return meta
 
 
-def _read_capture_rows(
-    path: Path, *, ijson_mod: Any, iter_json_events_fn: Callable[..., Any],
-    read_value_fn: Callable[..., Any], skip_value_fn: Callable[..., Any],
-) -> Iterator[tuple[bool, Mapping[str, Any]]]:
-    with path.open("rb") as handle:
-        events = iter_json_events_fn(handle, ijson_mod=ijson_mod)
-        yield from _iter_capture_rows(events, next(events), read_value=read_value_fn, skip_value=skip_value_fn)
-
-
 def _extract_capture_meta(
-    path: Path, *, ijson_mod: Any = None,
-    stream_jsonl_fn: Callable[[Path], Any],
-    iter_json_events_fn: Callable[..., Any],
-    read_value_fn: Callable[..., Any],
-    skip_value_fn: Callable[..., Any],
+    path: Path, *, ijson_mod: Any = None, stream_jsonl_fn: Callable[[Path], Any],
+    iter_json_events_fn: Callable[..., Any], read_value_fn: Callable[..., Any], skip_value_fn: Callable[..., Any],
     target_events: frozenset[str] | None = None,
     expected_clock_operator: str | None = None,
 ) -> dict[str, Any]:
@@ -317,8 +303,9 @@ def _extract_capture_meta(
         if path.suffix.lower() in _JSONL_SUFFIXES:
             yield from _iter_jsonl_capture_rows(stream_jsonl_fn(path))
         else:
-            yield from _read_capture_rows(path, ijson_mod=ijson_mod, iter_json_events_fn=iter_json_events_fn,
-                                          read_value_fn=read_value_fn, skip_value_fn=skip_value_fn)
+            with path.open("rb") as handle:
+                events = iter_json_events_fn(handle, ijson_mod=ijson_mod)
+                yield from _iter_capture_rows(events, next(events), read_value=read_value_fn, skip_value=skip_value_fn)
 
     meta = _capture_metadata(rows(), target_events, expected_clock_operator)
     if "_trace_processes" in meta or meta.get("_timed_json_rows"):
@@ -352,8 +339,8 @@ def _csv_time_field(fields: Mapping[str, str], kinds: tuple[str, ...]) -> tuple[
 
 
 def _csv_capture_rows(
-    path: Path, case_id: str, ranks: tuple[int, ...], target_events: frozenset[str], seen_ranks: set[int],
-    windows: _RankWindows | None,
+    path: Path, case_id: str, ranks: tuple[int, ...], seen_ranks: set[int],
+    windows: _RankWindows | None, target_events: frozenset[str] | None,
 ) -> Iterator[_CaptureRow]:
     open_csv = gzip.open if path.suffix.lower() == ".gz" else Path.open
     with open_csv(path, "rt", encoding="utf-8-sig", newline="") as handle:
@@ -383,7 +370,7 @@ def _csv_capture_rows(
                 continue
             seen_ranks.add(rank)
             names = frozenset()
-            if windows is None:
+            if target_events is not None:
                 names = target_events.intersection((f"row={record}", *(row[col].strip() for col in event_cols)))
                 if not names:
                     continue
@@ -478,8 +465,8 @@ def _capture_time_ns(row: Mapping[str, Any], field: tuple[str, int] | None) -> D
 
 
 def _json_capture_rows(
-    case_id: str, boundary: Any, meta: Mapping[str, Any], target_events: frozenset[str], trace_format: bool,
-    seen_ranks: set[int], windows: _RankWindows | None,
+    case_id: str, boundary: Any, meta: Mapping[str, Any], trace_format: bool, seen_ranks: set[int],
+    windows: _RankWindows | None, target_events: frozenset[str] | None,
 ) -> Iterator[_CaptureRow]:
     processes = meta.get("_trace_processes", {})
     header_ranks = meta.get("_header_ranks", ())
@@ -501,13 +488,15 @@ def _json_capture_rows(
         seen_ranks.add(rank)
         if trace_format and process_rank is not None and rank != process_rank:
             raise ModelingError(f"capture_rank_mismatch:{case_id}:trace_process_conflict")
-        names = _json_event_names(row, record, rank, target_events) if windows is None else frozenset()
-        if windows is None and not names:
-            continue
-        for key in ("clock_operator", "clock_domain"):
-            expected = getattr(boundary, key)
-            if names and row.get(key, expected) != expected:
-                raise ModelingError(f"capture_{key}_mismatch:{case_id}:expected={expected}")
+        names = frozenset()
+        if target_events is not None:
+            names = _json_event_names(row, record, rank, target_events)
+            if not names:
+                continue
+            for key in ("clock_operator", "clock_domain"):
+                expected = getattr(boundary, key)
+                if row.get(key, expected) != expected:
+                    raise ModelingError(f"capture_{key}_mismatch:{case_id}:expected={expected}")
         start = _capture_time_ns(row, start_field)
         window = windows[rank] if windows is not None else None
         if window and start >= window[1]:
@@ -553,14 +542,9 @@ def _selected_rows(
     return selected
 
 
-def _verify_kernel_count(case_id: str, rank: int, count: int) -> None:
-    if count != 1:
-        raise ModelingError(f"capture_device_kernel_requires_one_occurrence:{case_id}:rank={rank}:count={count}")
-
-
-def _host_trace_rows(meta: Mapping[str, Any]) -> Iterator[tuple[tuple[int | str, int | str], Mapping[str, Any]]]:
+def _host_trace_rows(meta: Mapping[str, Any]) -> Iterator[tuple[_HostThread, Mapping[str, Any]]]:
     for trace, row in meta["_capture_rows"]():
-        if not trace or row.get("ph") != "X":
+        if not trace or row.get("ph") not in ("X", "s"):
             continue
         pid, tid = row.get("pid"), row.get("tid")
         if (type(pid) in (int, str) and type(tid) in (int, str)
@@ -570,55 +554,101 @@ def _host_trace_rows(meta: Mapping[str, Any]) -> Iterator[tuple[tuple[int | str,
 
 def _host_trace_interval(row: Mapping[str, Any]) -> tuple[Decimal, Decimal]:
     start = _capture_time_ns(row, ("ts", _NS_PER_US))
-    return start, start + _capture_time_ns(row, ("dur", _NS_PER_US))
+    return start, start + _capture_time_ns(row, ("dur", _NS_PER_US)) if row["ph"] == "X" else start
 
 
-def _has_shared_l1_call(rows: list[_CaptureRow], trace_meta: Mapping[str, Any] | None) -> bool:
-    calls, connections = {row.call_id for row in rows}, {row.connection_id for row in rows}
-    if (None not in calls and len(calls) == 1) or (None not in connections and len(connections) == 1):
-        return True
-    if trace_meta is None or None in connections:
-        return False
-    thread = None
-    launches: dict[str, tuple[Decimal, Decimal]] = {}
-    for track, row in _host_trace_rows(trace_meta):
-        conn = _unique_event_id((row, _trace_args(row)), _CONNECTION_ID_KEYS)
-        if conn is None or conn not in connections:
-            continue
-        start, end = _host_trace_interval(row)
-        if (thread is not None and track != thread) or end < start:
-            return False
-        if launches.setdefault(conn, (start, end)) != (start, end):
-            return False
-        thread = track
-    if launches.keys() != connections:
-        return False
-    left = min(start for start, _ in launches.values())
-    right = max(end for _, end in launches.values())
-    shortest_call = None
-    unique_call = False
-    for track, row in _host_trace_rows(trace_meta):
-        if track != thread or not str(row.get("name", "")).startswith(_HOST_API_PREFIXES):
-            continue
-        if _unique_event_id((row, _trace_args(row)), _CONNECTION_ID_KEYS) in connections:
+def _is_host_api_name(raw_name: Any) -> bool:
+    stem = str(raw_name or "").strip().rsplit("@", 1)[-1]
+    return stem.startswith(_HOST_API_PREFIXES)
+
+
+def _host_launch_id(row: Mapping[str, Any]) -> str | None:
+    sources = row, _trace_args(row)
+    conn = _unique_event_id(sources, _CONNECTION_ID_KEYS)
+    return _unique_event_id(sources, ("id",)) if conn is None and row["ph"] == "s" else conn
+
+
+def _trace_call_connections(meta: Mapping[str, Any], connections: set[str]) -> set[str] | None:
+    candidates: dict[tuple[str, str], _HostLaunch | None] = {}
+    has_launches = False
+    for track, row in _host_trace_rows(meta):
+        if (conn := _host_launch_id(row)) is not None:
+            has_launches = True
+            if conn in connections:
+                key, launch = (row["ph"], conn), (track, *_host_trace_interval(row))
+                if candidates.setdefault(key, launch) != launch:
+                    candidates[key] = None
+    single_connection = connections if len(connections) == 1 else None
+    if not has_launches:
+        return single_connection
+    launches = [launch for conn in connections
+                if (launch := candidates.get(("X", conn), candidates.get(("s", conn)))) is not None]
+    if len(launches) != len(connections) or len(threads := {track for track, _, _ in launches}) != 1:
+        return None
+    if any(end < start for _, start, end in launches):
+        return None
+    thread = threads.pop()
+    left, right = min(start for _, start, _ in launches), max(end for _, _, end in launches)
+    owner = shortest = None
+    for track, row in _host_trace_rows(meta):
+        if track != thread or row["ph"] != "X" or not _is_host_api_name(row.get("name")) or _host_launch_id(row) in connections:
             continue
         start, end = _host_trace_interval(row)
         if start <= left and right <= end:
-            # Nested wrappers can enclose the same launches. Require one closest API span.
             duration = end - start
-            if shortest_call is None or duration < shortest_call:
-                shortest_call, unique_call = duration, True
-            elif duration == shortest_call:
-                unique_call = False
-        elif start < end and any(start <= begin and finish <= end for begin, finish in launches.values()):
-            # Any inner API span enclosing only a proper subset proves distinct host calls.
-            return False
-    return unique_call
+            if shortest is None or duration < shortest:
+                owner, shortest = (start, end), duration
+            elif duration == shortest:
+                owner = None
+        elif start < end and any(start <= begin <= finish <= end for _, begin, finish in launches):
+            return None  # A proper subset belongs to another API span.
+    if owner is None:
+        return single_connection if shortest is None else None
+    spans, flows = set(), set()
+    left, right = owner
+    for track, row in _host_trace_rows(meta):
+        if track == thread and (conn := _host_launch_id(row)) is not None:
+            start, end = _host_trace_interval(row)
+            if left <= start <= end <= right:
+                (spans if row["ph"] == "X" else flows).add(conn)
+    flows -= spans
+    if flows:  # A launch span takes precedence even when its flow starts inside the owner.
+        for _, row in _host_trace_rows(meta):
+            if row["ph"] == "X":
+                flows.discard(_host_launch_id(row))
+    return spans | flows
+
+
+def _verify_l1_ownership(
+    case_id: str, selected: Mapping[int, list[_CaptureRow]], occurrences: frozenset[_KernelOccurrence],
+    all_rows: Iterable[_CaptureRow], trace_meta: Mapping[str, Any] | None,
+) -> None:
+    owners = {}
+    for rank, rows in selected.items():
+        calls = {row.call_id or "" for row in rows}
+        if len(calls) == 1 and all(calls):
+            owners[rank] = "call_id", calls
+            continue
+        connections = {row.connection_id or "" for row in rows}
+        if all(connections):
+            owned = (_trace_call_connections(trace_meta, connections) if trace_meta is not None
+                     else connections if len(connections) == 1 else None)
+            if owned is not None and connections <= owned:
+                owners[rank] = "connection_id", owned
+                continue
+        if trace_meta is not None or len(rows) != 1:
+            raise ModelingError(f"capture_l1_call_ownership_unverified:{case_id}:rank={rank}")
+    if owners:
+        for row in all_rows:
+            if row.rank in owners and row.occurrence not in occurrences and row.end > (row.start or 0):
+                field, ids = owners[row.rank]
+                if getattr(row, field) in ids:
+                    raise ModelingError(f"capture_l1_call_ownership_unverified:{case_id}:rank={row.rank}")
 
 
 def _verify_timed_capture(
     case_id: str, boundary: Any, format_name: str, target_events: frozenset[str],
-    rows: Callable[[_RankWindows | None], Iterator[_CaptureRow]], seen_ranks: set[int],
+    rows: Callable[[_RankWindows | None, frozenset[str] | None], Iterator[_CaptureRow]], seen_ranks: set[int],
     trace_meta: Mapping[str, Any] | None = None,
 ) -> tuple[int, CaptureVerificationReceipt]:
     if not boundary.device_ranks:
@@ -627,17 +657,16 @@ def _verify_timed_capture(
     kind = getattr(boundary, "boundary_kind", "")
     single_kernel, step = kind == "device_kernel", kind in L3_BOUNDARY_KINDS
     composite = kind in L1_COMPOSITE_BOUNDARY_KINDS
-    selected = _selected_rows(case_id, format_name, boundary, target_events, rows(None), seen_ranks)
+    selected = _selected_rows(case_id, format_name, boundary, target_events, rows(None, target_events), seen_ranks)
+    occurrences = frozenset(row.occurrence for local_rows in selected.values() for row in local_rows)
     if single_kernel:
         for rank, local_rows in selected.items():
-            _verify_kernel_count(case_id, rank, len(local_rows))
+            if (count := len(local_rows)) != 1:
+                raise ModelingError(f"capture_device_kernel_requires_one_occurrence:{case_id}:rank={rank}:count={count}")
         if start_name != end_name:
             raise ModelingError(f"capture_device_kernel_endpoint_mismatch:{case_id}")
     if composite:
-        for rank, local_rows in selected.items():
-            if len(local_rows) > 1 and not _has_shared_l1_call(local_rows, trace_meta):
-                raise ModelingError(f"capture_l1_call_ownership_unverified:{case_id}:rank={rank}")
-    occurrences = frozenset(row.occurrence for local_rows in selected.values() for row in local_rows)
+        _verify_l1_ownership(case_id, selected, occurrences, rows(None, None), trace_meta)
     if any(row.start is None for local_rows in selected.values() for row in local_rows):
         if not single_kernel and (len(occurrences) != 1 or len(target_events) != 1):
             raise ModelingError(f"capture_csv_timestamps_absent:{case_id}")
@@ -656,7 +685,7 @@ def _verify_timed_capture(
     census: set[_KernelOccurrence] = set()
     spans: dict[int, list[tuple[Decimal, Decimal]]] = {rank: [] for rank in windows}
     if single_kernel or step or scan_busy:
-        for row in rows(windows):
+        for row in rows(windows, None):
             if row.end == row.start:
                 continue
             left, right = windows[row.rank]
@@ -667,7 +696,7 @@ def _verify_timed_capture(
                 overlap = min(row.end, right) - max(row.start, left)
                 if not independent and (launched_inside or overlap > _CAPTURE_ROUNDING_NS):
                     raise ModelingError(f"capture_device_kernel_multiple_occurrences:{case_id}:rank={row.rank}")
-            if step and launched_inside:
+            if step and (launched_inside or operator == "busy_union" and row.end - left > _CAPTURE_ROUNDING_NS):
                 census.add(row.occurrence)
             if scan_busy:
                 spans[row.rank].append((row.start, row.end))
@@ -678,11 +707,6 @@ def _verify_timed_capture(
     return duration, CaptureVerificationReceipt(occurrences, frozenset(census) if step else None)
 
 
-def _verify_duration(case_id: str, observed_ns: int, measured_ns: int | None) -> None:
-    if measured_ns is None or abs(observed_ns - measured_ns) > _CAPTURE_ROUNDING_NS:
-        raise ModelingError(f"capture_duration_mismatch:{case_id}:declared={measured_ns}:actual={observed_ns}")
-
-
 def verify_capture_file_consistency(
     case_id: str, boundary: Any, path: Path, *, ijson_mod: Any = None,
     digest_fn: Callable[[Path], str],
@@ -690,12 +714,9 @@ def verify_capture_file_consistency(
     extract_meta_fn: Callable[..., dict[str, Any]],
     measured_ns: int | None = None,
 ) -> CaptureVerificationReceipt | None:
-    """Verify the linked raw capture before scoring the declared observation.
+    """Bind one-based source rows and field-qualified events to a raw capture.
 
-    For multiple ranks, the longest verified local window represents the capture
-    duration. CSV ``row=N`` and trace ``row:N`` are one-based source records.
-    Trace ``task:``, ``conn:``, ``stream:<id>:task:``, and
-    ``dev:<rank>:stream:<id>:task:`` selectors are tied to their source fields.
+    For multiple ranks, the longest verified local window represents the capture duration.
     """
     try:
         actual_sha = digest_fn(path)
@@ -711,31 +732,32 @@ def verify_capture_file_consistency(
     read_errors = (OSError, EOFError, StopIteration, ValueError, InvalidOperation, csv.Error, AttributeError, KeyError)
     if json_error := getattr(ijson_mod, "JSONError", None):
         read_errors += (json_error,)
-    receipt = None
+    receipt, rows, meta = None, None, {}
+    format_name = "csv"
     seen_ranks: set[int] = set()
     try:
         if path.name.lower().endswith((".csv", ".csv.gz")):
-            rows = partial(_csv_capture_rows, path, case_id, boundary.device_ranks, target_events, seen_ranks)
-            duration, receipt = _verify_timed_capture(case_id, boundary, "csv", target_events, rows, seen_ranks)
-            _verify_duration(case_id, duration, measured_ns)
-            return receipt
-        if path.suffix.lower() not in _JSON_SUFFIXES:
-            with path.open("rb") as handle:
-                if not handle.read(stream_chunk_bytes).lstrip().startswith((b"{", b"[")):
-                    raise ModelingError(f"capture_format_unsupported:{case_id}")
-        meta = extract_meta_fn(
-            path, ijson_mod=ijson_mod,
-            target_events=target_events,
-            expected_clock_operator=boundary.clock_operator,
-        )
-        if "_capture_rows" in meta:
+            rows = partial(_csv_capture_rows, path, case_id, boundary.device_ranks, seen_ranks)
+        else:
+            if path.suffix.lower() not in _JSON_SUFFIXES:
+                with path.open("rb") as handle:
+                    if not handle.read(stream_chunk_bytes).lstrip().startswith((b"{", b"[")):
+                        raise ModelingError(f"capture_format_unsupported:{case_id}")
+            meta = extract_meta_fn(path, ijson_mod=ijson_mod, target_events=target_events,
+                                   expected_clock_operator=boundary.clock_operator)
             trace_format = "_trace_processes" in meta
-            rows = partial(_json_capture_rows, case_id, boundary, meta, target_events, trace_format, seen_ranks)
+            format_name = "trace" if trace_format else "json"
+            if "_capture_rows" in meta:
+                rows = partial(_json_capture_rows, case_id, boundary, meta, trace_format, seen_ranks)
+        if rows is not None:
             duration, receipt = _verify_timed_capture(
-                case_id, boundary, "trace" if trace_format else "json", target_events, rows, seen_ranks,
-                trace_meta=meta if trace_format else None,
+                case_id, boundary, format_name, target_events, rows, seen_ranks,
+                trace_meta=meta if format_name == "trace" else None,
             )
-            _verify_duration(case_id, duration, measured_ns)
+            if measured_ns is None or abs(duration - measured_ns) > _CAPTURE_ROUNDING_NS:
+                raise ModelingError(f"capture_duration_mismatch:{case_id}:declared={measured_ns}:actual={duration}")
+            if format_name == "csv":
+                return receipt
             meta["event_ids"] = sorted(target_events)
     except TimeoutError:
         raise
@@ -748,7 +770,8 @@ def verify_capture_file_consistency(
     cap_ranks = _capture_ranks(meta)
     if cap_ranks is not None and cap_ranks != set(boundary.device_ranks):
         raise ModelingError(f"capture_rank_mismatch:{case_id}:expected={sorted(boundary.device_ranks)}:actual={sorted(cap_ranks)}")
-    cap_events, matched_start, matched_end = set(), False, False
+    cap_events, matched = set(meta["event_ids"]), set()
+    endpoints = {"start_event": start_name, "end_event": end_name}
     for container in (meta, meta.get("boundary"), meta.get("metadata")):
         if not isinstance(container, Mapping):
             continue
@@ -756,30 +779,21 @@ def verify_capture_file_consistency(
             raise ModelingError(f"capture_clock_operator_mismatch:{case_id}:expected={boundary.clock_operator}")
         if (cap_clock := container.get("clock_domain")) is not None and str(cap_clock).strip() != str(boundary.clock_domain).strip():
             raise ModelingError(f"capture_clock_domain_mismatch:{case_id}:expected={boundary.clock_domain}:actual={cap_clock}")
-        if (cap_start := container.get("start_event")) is not None:
-            if str(cap_start).strip() != start_name:
-                raise ModelingError(f"capture_event_mismatch:{case_id}:start_event")
-            matched_start = True
-        if (cap_end := container.get("end_event")) is not None:
-            if str(cap_end).strip() != end_name:
-                raise ModelingError(f"capture_event_mismatch:{case_id}:end_event")
-            matched_end = True
-        for key in ("event_ids", "events"):
-            raw_ev = container.get(key)
-            cap_events |= _collect_event_names(raw_ev)
-            if isinstance(raw_ev, Sequence) and not isinstance(raw_ev, (str, bytes)):
-                for item in raw_ev:
-                    if isinstance(item, Mapping) and "clock_operator" in item and (_collect_event_names((item,)) & target_events):
-                        if item["clock_operator"] != boundary.clock_operator:
-                            raise ModelingError(f"capture_clock_operator_mismatch:{case_id}:expected={boundary.clock_operator}")
-    if not matched_start and start_name not in cap_events:
-        raise ModelingError(f"capture_event_mismatch:{case_id}:start_event_absent:{start_name}")
-    if not matched_end and end_name not in cap_events:
-        raise ModelingError(f"capture_event_mismatch:{case_id}:end_event_absent:{end_name}")
-    if boundary.event_ids:
-        known = cap_events | ({start_name} if matched_start else set()) | ({end_name} if matched_end else set())
-        if missing := [ev for ev in boundary.event_ids if ev.strip() not in known]:
-            raise ModelingError(f"capture_event_mismatch:{case_id}:missing={','.join(missing)}")
-    if receipt is None and getattr(boundary, "boundary_kind", "") == "device_kernel":
-        raise ModelingError(f"capture_device_kernel_occurrence_unavailable:{case_id}")
+        for key, expected in endpoints.items():
+            if (declared := container.get(key)) is not None:
+                if str(declared).strip() != expected:
+                    raise ModelingError(f"capture_event_mismatch:{case_id}:{key}")
+                matched.add(key)
+    for key, expected in endpoints.items():
+        if key not in matched and expected not in cap_events:
+            raise ModelingError(f"capture_event_mismatch:{case_id}:{key}_absent:{expected}")
+    known = cap_events | {endpoints[key] for key in matched}
+    if missing := [ev for ev in boundary.event_ids if ev.strip() not in known]:
+        raise ModelingError(f"capture_event_mismatch:{case_id}:missing={','.join(missing)}")
+    if receipt is None:
+        kind = getattr(boundary, "boundary_kind", "")
+        if kind == "device_kernel":
+            raise ModelingError(f"capture_device_kernel_occurrence_unavailable:{case_id}")
+        if kind in L1_COMPOSITE_BOUNDARY_KINDS:
+            raise ModelingError(f"capture_l1_call_ownership_unverified:{case_id}:no_device_rows")
     return receipt

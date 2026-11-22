@@ -40,29 +40,27 @@ READY = 7
 CAPTURES = Path(__file__).resolve().parents[2] / "examples/cases/high-concurrency-20261030"
 
 
-def _read(path):
-    return json.loads(path.read_text())
-
-def _engine(operator, plan, geometry, *, overrides=None, compute_peaks=None):
-    units = geometry.resource_units
-    rates = dict.fromkeys(units, 1e8) | {"cube": 1} | (overrides or {})
-    pools = geometry.buffers
-    ctx = RecipeContext(plan.work.apply(operator), {}, {r: r for r in units}, rates,
-                        geometry.compute_units, resource_units=units, compute_peaks=compute_peaks or {"bf16": 1e12},
-                        pool_names={p: p for p in pools}, pool_capacities=pools,
-                        pool_units=geometry.buffer_units)
+def _execute(operator, plan, geometry, *, hardware_rates=False, copy_bytes=0, ready_ms=READY):
+    units, pools = geometry.resource_units, geometry.buffers
+    rates = dict.fromkeys(units, 1e8) | {"cube": 1}
+    if hardware_rates:
+        rates.update((role, rate / 1000) for role, rate in geometry.rates.items())
+    peaks = geometry.compute_peaks if hardware_rates else {"bf16": 1e12}
+    ctx = RecipeContext(plan.work.apply(operator), {}, {r: r for r in units}, rates, geometry.compute_units,
+                        resource_units=units, compute_peaks=peaks, pool_names={p: p for p in pools},
+                        pool_capacities=pools, pool_units=geometry.buffer_units)
     engine = Engine([Resource(r, rates[r], units=n) for r, n in units.items()],
                     pools=pools, pool_units=geometry.buffer_units, trace_limit=16000)
-    return engine, ctx
-
-def _execute(operator, plan, geometry, **options):
-    engine, ctx = _engine(operator, plan, geometry, **options)
     program = plan.lower(ctx)
-    done = program.start(engine, "mla", engine.submit("input", release=READY))
-    engine.advance(horizon=READY)
+    done = program.start(engine, "mla", engine.submit("input", release=ready_ms))
+    expected = ctx.bind(plan.work)
+    if copy_bytes:
+        engine.submit("hbm_copy", {"hbm": copy_bytes}, release=ready_ms + 0.020)
+        expected["hbm"] += copy_bytes
+    engine.advance(horizon=ready_ms)
     assert not any(engine.serviced.values())
     engine.advance(until=(done,))
-    assert {r: n for r, n in engine.serviced.items() if n} == pytest.approx(ctx.bind(plan.work))
+    assert {r: n for r, n in engine.serviced.items() if n} == pytest.approx(expected)
     assert not any(engine.allocated.values())
     assert engine.summary()["live_tasks"] == engine.summary()["live_programs"] == 0
     return program.stages[1].program, engine
@@ -78,11 +76,9 @@ def _tiles(query_group, split=0):
                 return [task for clock in range(stage.program.count) for task in stage.program.tile(clock)]
     raise AssertionError(f"split {split} was not dispatched")
 
-
 def _phase(stages, name):
     return sorted((stage for stage in stages if stage.name.partition(":")[0] == name),
                   key=lambda stage: stage.metadata["kv_tile"])
-
 
 def _one_owner(geometry):
     aic, aivs = geometry.datapath.aic_aiv_pairs[0]
@@ -513,7 +509,7 @@ def test_sparse_page_aliases_preserve_each_request_gather():
 @pytest.mark.parametrize("rows,captured", [(12, False), (48, False), (12, True)])
 def test_capture_rows_and_caller_allocations_remain_distinct(rows, captured):
     suffix = "88_c8" if rows == 48 else "30_c2"
-    raw = _read(CAPTURES / "glm78-capture-rows" / f"a3_glm53_w4a8_tp16_tpot{suffix}.json")
+    raw = json.loads((CAPTURES / "glm78-capture-rows" / f"a3_glm53_w4a8_tp16_tpot{suffix}.json").read_text())
     if captured:
         raw["runtime"]["graph_capture_keys"] = [16]
     active = 16 if captured else rows
@@ -542,7 +538,7 @@ def test_capture_rows_and_caller_allocations_remain_distinct(rows, captured):
 
 @pytest.mark.parametrize("dtype,width", [("bf16", 2), ("fp32", 4)])
 def test_router_payload_width_is_independent_of_projection_compute(dtype, width):
-    raw = _read(CAPTURES / "kimi-variants/a5_kimi_tp8_e16_bf16_c32_p4k.json")
+    raw = json.loads((CAPTURES / "kimi-variants/a5_kimi_tp8_e16_bf16_c32_p4k.json").read_text())
     raw["model"]["layers"] = 4
     raw["runtime"]["kernels"].pop("lowerings", None)
     raw["model"]["layer_overrides"]["3"]["router_output_dtype"] = dtype
@@ -578,15 +574,14 @@ def test_asymmetric_refill_peers_stay_literal(demands, arrival, expected):
     assert times == run(spec.literal() for spec in specs)
     assert times == pytest.approx(expected, rel=1e-12)
 
-def test_long_paged_pipeline_skips_with_literal_timing(monkeypatch):
-    raw = paged_mla_case(splits=32)
-    context = 409600
+@pytest.mark.parametrize("context,splits,copy_bytes", [(409_600, 32, 0), (16_384, 2, 13_700_000)])
+def test_paged_pipeline_matches_literal_timing(monkeypatch, context, splits, copy_bytes):
+    raw = paged_mla_case(splits=splits)
     raw["runtime"]["max_model_len"] = context + PAGE
     op, _ = paged_mla_attention(raw, context=context)
     geometry = _governed_geom(DIRECT_SKU)
     plan = paged_mla.build(op, geometry)
-    rates = {role: value / 1000 for role, value in geometry.rates.items()}
-    options = {"overrides": rates, "compute_peaks": geometry.compute_peaks}
+    options = {"hardware_rates": True, "copy_bytes": copy_bytes, "ready_ms": 0}
     program, fast = _execute(op, plan, geometry, **options)
     for producer in program.stages[1].program.programs:
         pipe = producer.tile(0)[0].program.stages[1].program
@@ -596,5 +591,10 @@ def test_long_paged_pipeline_skips_with_literal_timing(monkeypatch):
     monkeypatch.setattr(paged_mla, "_template_pipeline", lambda _, pipe: pipe)
     monkeypatch.setattr(paged_mla, "_flat_cycle_stage", lambda stage: (stage,))
     _, literal = _execute(op, plan, geometry, **options)
-    assert fast.now - READY == pytest.approx(literal.now - READY, rel=1e-12)
-    assert fast.advance_steps < 500 < literal.advance_steps
+    assert fast.now == pytest.approx(literal.now, rel=1e-12)
+    if copy_bytes:
+        fast_copy, literal_copy = (next(row["end_ms"] for row in engine.trace if row["task"] == "hbm_copy")
+                                   for engine in (fast, literal))
+        assert fast_copy == pytest.approx(literal_copy, rel=1e-12)
+    else:
+        assert fast.advance_steps < 500 < literal.advance_steps
