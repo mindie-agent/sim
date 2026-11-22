@@ -80,19 +80,47 @@ def physical_global_ranks(runtime, replicas):
     return out
 
 
+def describe_included_components(case, *, scope: str = "body") -> dict[str, object]:
+    """Return explicit component provenance so callers see body vs model/draft coverage."""
+    parsed = parse_case(case)
+    is_model_scope = str(scope) == "model"
+    aux = getattr(parsed.model, "auxiliary", None)
+    meta = dict(getattr(parsed.runtime, "metadata", ()) or ())
+    proposals = int(meta.get("draft_proposal_tokens") or getattr(parsed.runtime, "mtp_proposal_tokens", 0) or 0)
+    draft_layers = 0
+    draft_kind: str | None = None
+    if is_model_scope and proposals > 0 and aux is not None:
+        if getattr(aux, "dspark", None) is not None:
+            draft_layers = int(getattr(aux.dspark, "layers", 0) or 0)
+            draft_kind = "dspark"
+        elif getattr(aux, "mtp", None) is not None:
+            draft_layers = int(getattr(aux.mtp, "layers", 0) or 0)
+            draft_kind = "mtp"
+    return {
+        "scope": str(scope),
+        "target_layers": int(parsed.model.layers),
+        "draft_layers": draft_layers,
+        "draft_kind": draft_kind,
+        "embedding_lm_head": is_model_scope,
+    }
+
+
 def body_forward(case, *, phase="decode", tokens=1, context=0, sequences=1,
-                 recipes=None, primitives=None, event_limit=0, compact=False,
+                 scope="body", recipes=None, primitives=None, event_limit=0, compact=False,
                  padded_idle=False):
+    if scope not in {"body", "model"}:
+        raise ModelingError(f"invalid_forward_scope:{scope}")
     case, graphs = _declared_graphs(
         case, phase=phase, tokens=tokens, context=context, sequences=sequences,
-        scope="body", apply_body_defaults=recipes is None,
+        scope=scope, apply_body_defaults=recipes is None,
         padded_idle=padded_idle)
     if case.model.is_standalone_draft:
         raise ModelingError("draft_requires_target_model:attach_auxiliary_to_target;catalog_inspection_available")
     default_selection = (dict(graphs.default_selection) if recipes is None else
                          {"profile": "explicit_recipe_book_preserved"})
+    ext_in = {"analysis_input": 0} if scope == "body" else None
     result = graph_costs(case, graphs, recipes=recipes, primitives=primitives,
-                         external_inputs={"analysis_input": 0},
+                         external_inputs=ext_in,
                          include_submission=False, isolated=False,
                          trace_limit=event_limit, compact=compact)
     counts = cohort_sequence_counts(sequences, tuple(graphs))
@@ -102,10 +130,14 @@ def body_forward(case, *, phase="decode", tokens=1, context=0, sequences=1,
                               padded_idle=padded_idle)
     padded = capacity["padded_query_tokens_by_replica"]
     graph_rows = capacity["graph_query_tokens_by_replica"]
+    included = describe_included_components(case, scope=scope)
     return {
         **result, "schema": "mindie-sim.body-forward/1", "status": "modeled",
-        "scope": "body", "body_forward_ms": result["duration_ms"],
-        "metric_boundary": "target_body_device_graph",
+        "scope": scope, "body_forward_ms": result["duration_ms"],
+        "metric_boundary": (
+            "target_body_device_graph" if scope == "body" else "full_model_step_device_graph"
+        ),
+        "included_components": included,
         "geometry": {"phase": phase, "tokens_per_sequence": tokens,
                      "context_tokens": context, "sequences_per_replica": sequences,
                      "participating_replicas": list(graphs),
@@ -125,10 +157,14 @@ def body_forward(case, *, phase="decode", tokens=1, context=0, sequences=1,
         "capacity": capacity,
         "boundary_details": {
             "start": "input hidden states and KV cache ready",
-            "end": "target transformer body output ready on all cohort participants",
-            "excluded": ["embedding", "final_norm", "lm_head", "draft_generation",
-                         "sampling", "host_submission", "scheduler", "pd_handoff",
-                         "inter_step_wait"],
+            "end": ("target transformer body output ready on all cohort participants"
+                    if scope == "body"
+                    else "full model step (embedding, target body, draft if attached, lm_head) ready"),
+            "excluded": (["embedding", "final_norm", "lm_head", "draft_generation",
+                          "sampling", "host_submission", "scheduler", "pd_handoff",
+                          "inter_step_wait"] if scope == "body"
+                         else ["sampling", "host_submission", "scheduler", "pd_handoff",
+                               "inter_step_wait"]),
             "speculation": "tokens includes every target verification row; acceptance does not scale work",
             "prefix_cache": "context KV is ready; query rows still execute",
             "deployment": "first independent DP cohort; no request admission or capacity guarantee",
@@ -138,6 +174,7 @@ def body_forward(case, *, phase="decode", tokens=1, context=0, sequences=1,
 
 def pd_body_forward(raw, **options):
     common = {k: v for k, v in raw.items() if k not in {"pools", "connector"}}
+    resolved_scope = str(options.get("scope", "body"))
     pools = {name: body_forward(
         {**common, **raw["pools"][name], "model": raw["model"], "workload": raw["workload"]},
         **options) for name in ("prefill", "decode")}
@@ -145,9 +182,13 @@ def pd_body_forward(raw, **options):
     models = [parse_case({**common, **raw["pools"][name], "model": raw["model"],
                           "workload": raw["workload"]}).model for name in pools]
     return {
-        "schema": "mindie-sim.body-forward/1", "status": "modeled", "scope": "body",
+        "schema": "mindie-sim.body-forward/1", "status": "modeled", "scope": resolved_scope,
         "deployment": "disaggregated", **combine_coverage(models),
-        "metric_boundary": "independent_target_body_device_graph_per_pool",
+        "metric_boundary": (
+            "independent_target_body_device_graph_per_pool" if resolved_scope == "body"
+            else "independent_full_model_step_device_graph_per_pool"
+        ),
+        "included_components": {name: value["included_components"] for name, value in pools.items()},
         "body_forward_ms": {name: value["body_forward_ms"] for name, value in pools.items()},
         "pools": pools,
     }

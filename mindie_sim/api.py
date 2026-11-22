@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from mindie_sim.compose import compose_case as _compose_case_dict
+from mindie_sim.prediction.offload.policy import missing_scenario_error
 from mindie_sim.prediction.primitives import PrimitiveStore
 from mindie_sim.prediction.results import (
     CaseInput,
@@ -147,14 +148,53 @@ def evaluate_service(
     primitives: PrimitiveStore | None = None,
 ) -> ServiceEvaluation:
     """Evaluate a complete serving workload through ``PredictionSpine``."""
+    parsed = _to_case(case)
+    if dict(parsed.runtime.metadata).get("scenario_declared") is False:
+        raise missing_scenario_error(("prompt_tokens", "output_tokens"))
     return default_spine().run_service(
-        _to_case(case), replay, primitives=primitives
+        parsed, replay, primitives=primitives
     )
 
 
 def solve_sla(case: CaseInput, request: SlaRequest, /) -> SlaEvaluation:
     """Solve SLA-constrained concurrency sizing."""
     return default_spine().solve_sla(_to_case(case), request)
+
+
+def solve_optimal_deployment(
+    model: ModelInput,
+    hardware: HardwareInput = "a3",
+    /,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """Jointly optimize PD Disaggregated vs Colocated + MTP under Domain 1/2/3."""
+    from mindie_sim.sweep_pd import solve_optimal_deployment as _solve_optimal
+
+    model_arg: Any = str(model) if isinstance(model, Path) else (
+        deepcopy(dict(model)) if isinstance(model, Mapping) else model
+    )
+    hw_arg: Any = (
+        deepcopy(dict(hardware)) if isinstance(hardware, Mapping) else hardware
+    )
+    return _solve_optimal(model_arg, hw_arg, **kwargs)
+
+
+def solve_deployment(
+    model: ModelInput,
+    hardware: HardwareInput = "a3",
+    /,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """One-shot agent entrypoint: capacity ledger, PD/colocated optimum, 4-track waterfall, roofline."""
+    from mindie_sim.solve import solve_deployment as _solve_deployment
+
+    model_arg: Any = str(model) if isinstance(model, Path) else (
+        deepcopy(dict(model)) if isinstance(model, Mapping) else model
+    )
+    hw_arg: Any = (
+        deepcopy(dict(hardware)) if isinstance(hardware, Mapping) else hardware
+    )
+    return _solve_deployment(model_arg, hw_arg, **kwargs)
 
 
 def sweep_topology(
@@ -165,9 +205,47 @@ def sweep_topology(
     decode_case: CaseInput | None = None,
 ) -> TopologySweepResult:
     """Sweep parallel topologies or P/D disaggregation ratios."""
+    parsed = _to_case(case)
+    if str(getattr(request, "mode", "")).strip().lower() == "auto":
+        from mindie_sim.prediction.results import TopologyPoint
+        from mindie_sim.sweep_pd import solve_optimal_deployment as _solve_optimal
+
+        total_dies = (
+            int(request.device_counts[0])
+            if request.device_counts else len(parsed.machine.dies)
+        )
+        prompt = int(request.sla.step.context or request.sla.step.tokens)
+        output = int(request.sla.output_budget)
+        ttft = parsed.slo.ttft_ms
+        tpot = float(request.sla.latency_ms)
+        solved = _solve_optimal(
+            parsed.model.to_dict(),
+            parsed.machine.to_dict(),
+            num_devices=total_dies,
+            prompt_tokens=prompt,
+            output_tokens=output,
+            ttft_sla_ms=ttft,
+            tpot_sla_ms=tpot,
+        )
+        frontier: list[TopologyPoint] = []
+        for row in solved.get("pareto_frontier", ()):
+            par = row.get("prefill_parallel") or row.get("parallel") or {}
+            d_par = row.get("decode_parallel") or {}
+            frontier.append(TopologyPoint(
+                device_count=int(row.get("used_dies", total_dies)),
+                parallel=tuple((str(k), int(v)) for k, v in sorted(par.items()) if isinstance(v, int)),
+                decode_parallel=tuple((str(k), int(v)) for k, v in sorted(d_par.items()) if isinstance(v, int)),
+                span_ms=float(row.get("effective_tpot_ms", 0.0) or 0.0),
+                throughput_tokens_s=float(row.get("sustainable_tps", 0.0) or 0.0),
+                fits_memory=bool(row.get("feasible", False)),
+            ))
+        return TopologySweepResult(
+            evaluated_count=len(solved.get("candidates", ())),
+            frontier=tuple(frontier),
+        )
     parsed_decode = _to_case(decode_case) if decode_case is not None else None
     return default_spine().sweep_topology(
-        _to_case(case), request, decode_case=parsed_decode
+        parsed, request, decode_case=parsed_decode
     )
 
 
@@ -189,6 +267,8 @@ __all__ = [
     "evaluate_three_tiers",
     "export_structure",
     "optimize_ladder",
+    "solve_deployment",
+    "solve_optimal_deployment",
     "solve_sla",
     "sweep_topology",
 ]

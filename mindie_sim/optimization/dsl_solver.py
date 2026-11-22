@@ -584,9 +584,13 @@ def solve_dsl(
                 handles = tuple((op_id, OpRef("result_of", edit_id))
                                 for edit_id, output in applied.handles
                                 for op_id in output if len(output) == 1 and op_id not in atomic_ids)
-            stream_cands = tuple(_stream_candidates(scenario, placed_ops, handles))
-            search.note_eligible(1 if stream_cands else 0)
-            yield from (_stream_plan(base, stage, operation) for operation in stream_cands)
+            stream_iter = _stream_candidates(scenario, placed_ops, handles)
+            first = next(stream_iter, None)
+            search.note_eligible(1 if first is not None else 0)
+            if first is not None:
+                yield _stream_plan(base, stage, first)
+                for operation in stream_iter:
+                    yield _stream_plan(base, stage, operation)
         elif paths:
             path = paths[0]
             aic, aiv = min(p.aic_count for p in paths), min(p.aiv_count for p in paths)

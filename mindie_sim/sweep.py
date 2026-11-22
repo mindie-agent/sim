@@ -37,6 +37,7 @@ from mindie_sim.prediction.evaluation import (
     ACTIVE_DEADLINE_MONO, EvaluationContext, check_active_deadline,
 )
 from mindie_sim.prediction.local_tp_groups import local_tp_spans_dp
+from mindie_sim.prediction.offload.policy import missing_scenario_error
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.public.errors import UnmodeledCapabilityError
 from mindie_sim.schema.case import Case as CaseSpec
@@ -44,8 +45,8 @@ from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.hardware import Hardware
 from mindie_sim.schema.parallel import ParallelSpec
 from mindie_sim.sweep_engine import (
-    B1_STAGE, BASELINE_SCENARIO, CANDIDATE_ID_KEY, DEFAULT_CONTEXT,
-    DEFAULT_MAX_SEQUENCES, DEFAULT_OUTPUT_BUDGET, DEFAULT_SLA_MS,
+    B1_STAGE, BASELINE_SCENARIO, CANDIDATE_ID_KEY,
+    DEFAULT_MAX_SEQUENCES,
     FULL_STAGE, LOCKED_PROGRAM_ERROR, LOCKED_STAGE, STATIC_STAGE,
     TIMEOUT_STAGE,
     SweepEvaluationCache, _parallel_short, b1_screen, build_candidate_case,
@@ -68,7 +69,10 @@ from mindie_sim.sweep_stage import (
     pareto_screen as _b1_pareto, retain_finalist,
     screen_row_meta as _screen_row_meta,
 )
-from mindie_sim.sweep_pd import sweep_pd_disaggregation_ratios
+from mindie_sim.sweep_pd import (
+    solve_optimal_deployment,
+    sweep_pd_disaggregation_ratios,
+)
 from mindie_sim.sweep_resize import (
     check_pos_float, check_pos_int, enumerate_parallel_candidates,
     materialize_machine_for_devices, resolve_ranks_per_node,
@@ -76,10 +80,6 @@ from mindie_sim.sweep_resize import (
 
 _materialize_machine_for_devices = materialize_machine_for_devices
 
-DEFAULT_PROMPT_TOKENS = 4096
-DEFAULT_OUTPUT_TOKENS = 1024
-DEFAULT_TTFT_SLA_MS = 3000.0
-DEFAULT_KV_TRANSFER_BW_GBPS = 100.0
 MS_PER_S = 1000.0
 
 
@@ -158,17 +158,50 @@ def _run_finalist_stage(items, *, finalist_top_k, cache, output_jsonl,
             stream.close()
 
 
+def _resolve_sweep_scenario_inputs(
+    parsed: CaseSpec,
+    *,
+    sla_ms: float | None,
+    context: int | None,
+    output_budget: int | None,
+    phase: str,
+) -> tuple[float, int, int]:
+    """Enforce Domain-1 fail-fast on sweep SLA/context/output_budget inputs."""
+    resolved_sla = sla_ms
+    if resolved_sla is None:
+        resolved_sla = (
+            parsed.slo.ttft_ms if phase == "prefill" else parsed.slo.tpot_ms
+        )
+    resolved_output = output_budget
+    if resolved_output is None:
+        meta = dict(parsed.runtime.metadata)
+        declared = meta.get("scenario_declared", True) is not False
+        reqs = tuple(parsed.workload.requests or ())
+        if declared and reqs and reqs[0].request_id != "__structure_probe__":
+            resolved_output = int(reqs[0].output_tokens)
+    missing = [
+        name for name, val in (
+            ("sla_ms", resolved_sla),
+            ("context", context),
+            ("output_budget", resolved_output),
+        ) if val is None
+    ]
+    if missing:
+        raise missing_scenario_error(missing)
+    return float(resolved_sla), int(context), int(resolved_output)
+
+
 def sweep_topologies_iter(
     case: CaseSpec | Mapping[str, Any], *,
     candidates: Sequence[Mapping[str, Any]] | None = None,
     num_devices: int | None = None,
     num_devices_grid: Sequence[int] | None = None,
-    sla_ms: float = DEFAULT_SLA_MS,
-    context: int = DEFAULT_CONTEXT,
+    sla_ms: float | None = None,
+    context: int | None = None,
     phase: str = "decode",
-    scope: str = "body",
+    scope: str = "model",
     tokens_per_seq: int | None = None,
-    output_budget: int = DEFAULT_OUTPUT_BUDGET,
+    output_budget: int | None = None,
     max_sequences_per_dp: int = DEFAULT_MAX_SEQUENCES,
     allow_dp: bool = True,
     allow_ep: bool = True,
@@ -199,6 +232,13 @@ def sweep_topologies_iter(
 ) -> Iterator[dict[str, Any]]:
     """Stream deterministic candidate rows, optionally checkpointing each row."""
     output_jsonl = _checkpoint_path(output_jsonl, checkpoint_jsonl)
+    if lock_program and not lock_parallel:
+        raise ModelingError(LOCKED_PROGRAM_ERROR)
+    parsed_pre = parse_case(case)
+    sla_ms, context, output_budget = _resolve_sweep_scenario_inputs(
+        parsed_pre, sla_ms=sla_ms, context=context,
+        output_budget=output_budget, phase=phase,
+    )
     _validate_sweep_arguments(
         sla_ms=sla_ms, context=context, output_budget=output_budget,
         max_sequences_per_dp=max_sequences_per_dp, phase=phase, scope=scope,
@@ -208,8 +248,6 @@ def sweep_topologies_iter(
     if finalist_top_k is not None and (
             type(finalist_top_k) is not int or finalist_top_k < 1):
         raise ValueError("finalist_top_k_must_be_positive")
-    if lock_program and not lock_parallel:
-        raise ModelingError(LOCKED_PROGRAM_ERROR)
     from mindie_sim.prediction.unmodeled_gate import assert_timing_supported
     assert_timing_supported(case, entry="sweep_topologies")
     owns_finalists = (two_stage and finalist_top_k is not None
@@ -866,8 +904,8 @@ def reconstruct_sweep_summary(rows: Iterable[Mapping[str, Any]]) -> dict[str, An
                  for row in final_rows)
     report = _sweep_report(
         final_rows, num_devices=int(meta.get("num_devices", 0) or 0),
-        sla_ms=float(meta.get("sla_ms", DEFAULT_SLA_MS)),
-        context=int(meta.get("context", DEFAULT_CONTEXT)),
+        sla_ms=float(meta.get("sla_ms", 0.0) or 0.0),
+        context=int(meta.get("context", 0) or 0),
         phase=str(meta.get("phase", "decode")),
         scope=str(meta.get("scope", "body")),
         allow_dp=bool(meta.get("allow_dp", True)),

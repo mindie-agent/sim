@@ -58,7 +58,7 @@ def solve_sla_sizing(
     context: int = DEFAULT_SLA_CONTEXT, tokens_per_seq: int | None = None,
     emitted_tokens_per_seq: float | None = None,
     max_sequences_per_dp: int = DEFAULT_MAX_SEQUENCES, phase: str = "decode",
-    scope: str = "body", output_budget: int = DEFAULT_OUTPUT_BUDGET,
+    scope: str = "model", output_budget: int = DEFAULT_OUTPUT_BUDGET,
     scenarios: Sequence[Mapping[str, Any]] | None = None, b1_analysis: Mapping[str, Any] | None = None,
     evaluation_context: Any | None = None,
     deadline_monotonic: float | None = None,
@@ -298,7 +298,7 @@ def solve_sla_sizing(
 
         window_provider["fn"] = candidate_windows
         b1_ms = (0.0 if unchunkable else
-                 float(get_bundle(s_key, 1, fast=False)[2]["duration_ms"]))
+                 float(get_bundle(s_key, 1, fast=fast_spans)[2]["duration_ms"]))
         current_one, lifecycle_one = candidate_windows(1)
         b1_capacity = bool(b_joint >= 1 and current_one["fits"]
                            and lifecycle_one["fits"] and not unchunkable)
@@ -374,12 +374,7 @@ def solve_sla_sizing(
 
         bounded_probes = []
         secant_estimate = None
-        # Roofline secant warm-up (Finding 15).  The estimate only *chooses one
-        # additional probe* whose result warms the per-call graph cache; it never
-        # replaces the existing bucket/non-monotonic, headroom, capacity or
-        # lifecycle checks, and ``b_sla_is_proven_max`` stays False.  An
-        # infeasible b == 1, ``eff_max < 2`` or a flat/negative initial slope
-        # skips it.
+        secant_ok: bool | None = None
         if (0 < base_b_hint <= eff_max and eff_max >= 2 and b1_ms <= sla_ms):
             b2_ms = float(eval_at(s_key, 2, full=False)["step_ms"])
             marginal = b2_ms - b1_ms
@@ -387,8 +382,10 @@ def solve_sla_sizing(
                 estimate = 1 + int((sla_ms - b1_ms) / marginal)
                 estimate = max(2, min(int(estimate), int(eff_max)))
                 if estimate not in evaluated_b:
-                    try_step_ok(s_key, estimate, seen=evaluated_b,
-                                capacity_max=b_joint)
+                    secant_ok = try_step_ok(
+                        s_key, estimate, seen=evaluated_b,
+                        checks=candidate_checks, capacity_max=b_joint,
+                    )
                     secant_estimate = estimate
         if b1_ms > sla_ms:
             probe_ceiling = min(eff_max, NON_MONOTONIC_PROBE_CAP)
@@ -404,23 +401,25 @@ def solve_sla_sizing(
             b_sla, eval_sla = eff_max, eval_at(s_key, eff_max, full=True)
         else:
             eff_max = min(b_max, domain_cap)
-            start_b = max(2, min(eff_max, base_b_hint)) if (base_b_hint > 1 and all(x >= 1.0 for x in s_key[:-1])) else 2
-            low, high, probe = 1, eff_max, max(1, min(eff_max, start_b))
-            if probe > 2 and not try_step_ok(s_key, probe, seen=evaluated_b, checks=candidate_checks, capacity_max=b_joint):
-                high, probe = min(high, domain_cap, probe - 1), 2
-            while probe <= high:
-                if try_step_ok(s_key, probe, seen=evaluated_b, checks=candidate_checks, capacity_max=b_joint):
-                    low = probe
-                    if probe == high:
-                        break
-                    probe = min(high, probe * 2)
+            low, high = 1, eff_max
+            if secant_estimate is not None and secant_ok is not None:
+                if secant_ok:
+                    low = max(low, secant_estimate)
                 else:
-                    high = min(high, domain_cap, probe - 1)
-                    break
+                    high = min(high, domain_cap, secant_estimate - 1)
+            elif base_b_hint > 1 and all(x >= 1.0 for x in s_key[:-1]):
+                hint_probe = min(eff_max, base_b_hint)
+                if try_step_ok(s_key, hint_probe, seen=evaluated_b, checks=candidate_checks, capacity_max=b_joint):
+                    low = max(low, hint_probe)
+                else:
+                    high = min(high, domain_cap, hint_probe - 1)
             best_b, lo_i, hi_i = low, low + 1, min(high, domain_cap)
             while lo_i <= hi_i:
                 mid = (lo_i + hi_i) // 2
-                best_b, lo_i, hi_i = (mid, mid + 1, hi_i) if try_step_ok(s_key, mid, seen=evaluated_b, checks=candidate_checks, capacity_max=b_joint) else (best_b, lo_i, min(hi_i, domain_cap, mid - 1))
+                if try_step_ok(s_key, mid, seen=evaluated_b, checks=candidate_checks, capacity_max=b_joint):
+                    best_b, lo_i = mid, mid + 1
+                else:
+                    hi_i = min(hi_i, domain_cap, mid - 1)
             while best_b > 1 and not try_step_ok(s_key, best_b, seen=evaluated_b, checks=candidate_checks, capacity_max=b_joint):
                 best_b -= 1
             b_sla = best_b if try_step_ok(s_key, best_b, seen=evaluated_b, checks=candidate_checks, capacity_max=b_joint) else 0
@@ -626,7 +625,8 @@ def solve_sla_sizing(
         "hbm_bound_at_baseline": bool(base_r["b_vram_max"] < base_r["b_sla"]),
         "disabling_async_unlocks_concurrency": bool(base_r["b_vram_max_sync"] > base_r["b_vram_max_async"] and base_r["b_vram_max_async"] < base_r["b_sla"]),
     }
-    return {"schema": "mindie-sim.hardware-sla/1", "sla_ms": sla_ms, "context": context, "phase": phase, "scope": scope, "timing_boundary": "target_body_only" if scope == "body" else "full_model_step", "tokens_per_seq": q_tokens, "emitted_tokens_per_seq": emit_tokens, "prefill_tokens_per_seq": q_tokens if prefill else None, "decode_emitted_tokens_per_seq": decode_emit_tokens, "dp": dp, "max_sequences_per_dp": b_max,
+    from ..body import describe_included_components
+    return {"schema": "mindie-sim.hardware-sla/1", "sla_ms": sla_ms, "context": context, "phase": phase, "scope": scope, "timing_boundary": "target_body_only" if scope == "body" else "full_model_step", "included_components": describe_included_components(parsed, scope=scope), "tokens_per_seq": q_tokens, "emitted_tokens_per_seq": emit_tokens, "prefill_tokens_per_seq": q_tokens if prefill else None, "decode_emitted_tokens_per_seq": decode_emit_tokens, "dp": dp, "max_sequences_per_dp": b_max,
             "solver": {"monotonicity_assumed": True, "b_sla_is_proven_max": False,
                        "bounded_non_monotonic_dispatch_probe": True,
                        "status_interpretation": "feasible_candidate_found_or_explicit_sla_capacity_domain_infeasibility"},

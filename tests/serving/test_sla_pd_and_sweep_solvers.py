@@ -44,7 +44,7 @@ from mindie_sim.sweep_resize import materialize_machine_for_devices
 pytestmark = pytest.mark.tier0
 
 TOL, EXACT = 1e-9, 1e-12
-SWEEP = {"context": 8, "output_budget": 2, "max_sequences_per_dp": 1}
+SWEEP = {"sla_ms": 30.0, "context": 8, "output_budget": 2, "max_sequences_per_dp": 1}
 _IO = {"host_prepare_ms": 0.5, "host_result_ms": 0.5, "h2d": {"bytes_per_s": 8000, "bytes_per_token": 8, "latency_us": 250}, "d2h": {"bytes_per_s": 4000, "bytes_per_token": 4, "latency_us": 250}, "client_delivery_ms": 2}
 _MOE_MODEL = {"name": "tier0-mla-moe", "layers": 4, "hidden_size": 4096, "num_heads": 32, "num_kv_heads": 1, "head_dim": 128, "intermediate_size": 2048, "vocab_size": 64000, "attention": "mla", "ffn": "moe", "activation_dtype": "bf16", "weight_dtype": "int8", "kv_dtype": "bf16", "compute_dtype": "bf16", "quantization": "w8a8", "num_experts": 16, "top_k": 2, "moe_intermediate_size": 1024, "num_shared_experts": 1, "mla": {"q_lora_rank": 1024, "kv_lora_rank": 512, "qk_nope_head_dim": 128, "qk_rope_head_dim": 64, "v_head_dim": 128}}
 _DENSE_MODEL = {"name": "tier0-dense-gqa", "layers": 2, "hidden_size": 4096, "num_heads": 32, "num_kv_heads": 8, "head_dim": 128, "intermediate_size": 11008, "vocab_size": 64000, "attention": "gqa", "ffn": "dense", "activation_dtype": "bf16", "weight_dtype": "bf16", "kv_dtype": "bf16", "compute_dtype": "bf16"}
@@ -145,7 +145,7 @@ def test_hardware_scaling_roundtrip_and_independent_graph_costs():
         assert same(net["graph_duration_ms"], _decode_costs(scaled_case, 4)["duration_ms"], EXACT)
 def test_sla_solver_exact_threshold_and_speculative_tokens():
     raw = _moe_case(layers=4); raw["machine"]["device"]["rates"]["hbm"] = 4e11; parsed = parse_case(raw)
-    report = solve_sla_sizing(parsed, sla_ms=1.25, context=4096, tokens_per_seq=1, max_sequences_per_dp=8, scenarios=[{"id": "2x_hbm", "label": "2x HBM", "hbm_bw_scale": 2.0}, {"id": "baseline", "label": "1x Baseline", "hbm_bw_scale": 1.0}, {"id": "2x_compute", "label": "2x Compute", "cube_flops_scale": 2.0, "vector_ops_scale": 2.0}])
+    report = solve_sla_sizing(parsed, sla_ms=1.25, context=4096, tokens_per_seq=1, max_sequences_per_dp=8, scope="body", scenarios=[{"id": "2x_hbm", "label": "2x HBM", "hbm_bw_scale": 2.0}, {"id": "baseline", "label": "1x Baseline", "hbm_bw_scale": 1.0}, {"id": "2x_compute", "label": "2x Compute", "cube_flops_scale": 2.0, "vector_ops_scale": 2.0}])
     rows = {row["scenario_id"]: row for row in report["scenarios"]}; base, faster = rows["baseline"], rows["2x_hbm"]
     assert same(base["tps_gain_vs_baseline"], 1.0) and same(base["tps_feasible_gain_vs_baseline"], 1.0)
     assert 1 < base["b_sla"] < 8 and base["step_ms_at_sla"] <= 1.25 and base["step_ms_feasible"] <= 1.25
@@ -156,9 +156,9 @@ def test_sla_solver_exact_threshold_and_speculative_tokens():
     assert _decode_costs(parsed, base["b_sla"] + 1)["duration_ms"] > 1.25
     speculative = _moe_case(layers=2)
     speculative["runtime"]["metadata"] = {"speculative": {"draft_len": 3, "acceptance": [0.7, 0.7, 0.7], "acceptance_mode": "conditional"}}
-    resolved = solve_sla_sizing(speculative, sla_ms=30.0, context=4096, max_sequences_per_dp=2, scenarios=[{"id": "baseline"}])
+    resolved = solve_sla_sizing(speculative, sla_ms=30.0, context=4096, max_sequences_per_dp=2, scope="body", scenarios=[{"id": "baseline"}])
     assert resolved["tokens_per_seq"] == 4 and same(resolved["emitted_tokens_per_seq"], 1.0 + 0.7 + 0.49 + 0.343)
-    single = solve_sla_sizing(speculative, sla_ms=30.0, context=4096, tokens_per_seq=1, max_sequences_per_dp=2, scenarios=[{"id": "baseline"}])
+    single = solve_sla_sizing(speculative, sla_ms=30.0, context=4096, tokens_per_seq=1, max_sequences_per_dp=2, scope="body", scenarios=[{"id": "baseline"}])
     assert single["tokens_per_seq"] == 1 and same(single["emitted_tokens_per_seq"], 1.0)
     assert 0 < _vram_max_sequences_per_dp(parsed, context=32768, tokens_per_seq=64, output_budget=1024) <= _vram_max_sequences_per_dp(parsed, context=32768, tokens_per_seq=1, output_budget=1024)
     for bad_call in (lambda: solve_sla_sizing(parsed, sla_ms=0.0), lambda: scale_case_hardware(parsed, hbm_bw_scale=-1.0), lambda: analyze_network_efficiency(parsed, tokens=0)):
@@ -355,7 +355,8 @@ def test_all_microbatch_statistics_are_independent_of_bounded_trace():
 
 # --------------------------------------------------------------------------- topology / PD ratio sweeps
 def _sweep_case(model="deepseek-v3.2", hardware="a2", tp=2, dp=2, ep=2, layers=4, **extra):
-    return compose_case(model, hardware=hardware, tp=tp, dp=dp, ep=ep, layers=layers, **extra)
+    defaults = dict(prompt_tokens=512, output_tokens=1024, mtp_proposal_tokens=0)
+    return compose_case(model, hardware=hardware, tp=tp, dp=dp, ep=ep, layers=layers, **(defaults | extra))
 @pytest.mark.parametrize("sku", DT_SKUS)
 def test_dt_resize_preserves_declared_link_semantics(sku):
     raw = _sweep_case("qwen3.8-flash-next", sku, tp=4, dp=1, ep=4, layers=4, num_devices=4); parsed = parse_case(raw)
@@ -425,8 +426,8 @@ def test_topology_sweep_pareto_frontier_and_node_topology():
     assert (scaled["candidates"][0]["ranks_per_node"], wide["candidates"][0]["ranks_per_node"]) == (8, 4)
     slow = _dense_case(layers=1, dp=1, tp=2); slow["machine"].update(intra_node_bw_gbps=10.0, inter_node_bw_gbps=8.0)
     overrides = [{"dp": 1, "tp": 4, "ep": 1, "pp": 1, "pcp": 1}]
-    from_dict = sweep_topologies(slow, candidates=overrides, num_devices=4, max_sequences_per_dp=4)
-    from_case = sweep_topologies(parse_case(slow), candidates=overrides, num_devices=4, max_sequences_per_dp=4)
+    from_dict = sweep_topologies(slow, candidates=overrides, num_devices=4, sla_ms=30.0, context=4096, output_budget=64, max_sequences_per_dp=4)
+    from_case = sweep_topologies(parse_case(slow), candidates=overrides, num_devices=4, sla_ms=30.0, context=4096, output_budget=64, max_sequences_per_dp=4)
     assert same(from_dict["candidates"][0]["step_ms_at_b1"], from_case["candidates"][0]["step_ms_at_b1"], EXACT)
     assert same(from_dict["candidates"][0]["tps_feasible"], from_case["candidates"][0]["tps_feasible"], EXACT)
     by_tp = {row["parallel"]["tp"]: row for row in feasible}
@@ -468,17 +469,17 @@ def test_pd_ratio_sweep_conserves_kv_handoff_and_reports_each_bottleneck():
     exceeded = sweep_pd_disaggregation_ratios(prefill, decode, total_dies=16, prompt_tokens=128, output_tokens=256, ttft_sla_ms=2000.0, tpot_sla_ms=25.0, kv_transfer_bw_gbps=0.0000625)
     assert all(not row["feasible"] and row["infeasible_reason"] == "effective_tpot_sla_exceeded" for row in exceeded["candidates"])
     oom = deepcopy(prefill); oom["runtime"]["memory"] = {"workspace_bytes": 64 * 1024**3}
-    oom_report = sweep_pd_disaggregation_ratios(oom, decode, total_dies=16, prompt_tokens=128, output_tokens=256)
+    oom_report = sweep_pd_disaggregation_ratios(oom, decode, total_dies=16, prompt_tokens=128, output_tokens=256, ttft_sla_ms=3000.0, tpot_sla_ms=30.0)
     assert oom_report["prefill_instance"]["hbm_ok"] is False and all(not row["feasible"] and row["infeasible_reason"] == "prefill_hbm_oom" for row in oom_report["candidates"])
     short = deepcopy(decode); short["workload"]["requests"][0]["prompt_tokens"] = 128; short["runtime"]["max_model_len"] = 1024
-    short_report = sweep_pd_disaggregation_ratios(prefill, short, total_dies=16, prompt_tokens=128, output_tokens=2048)
+    short_report = sweep_pd_disaggregation_ratios(prefill, short, total_dies=16, prompt_tokens=128, output_tokens=2048, ttft_sla_ms=3000.0, tpot_sla_ms=30.0)
     assert all(not row["feasible"] and row["infeasible_reason"] == "decode_max_model_len_exceeded" for row in short_report["candidates"])
     oom_decode = deepcopy(decode); oom_decode["runtime"]["memory"] = {"workspace_bytes": 64 * 1024**3}
-    single = sweep_pd_disaggregation_ratios(prefill, oom_decode, total_dies=16, prompt_tokens=128, output_tokens=1)
+    single = sweep_pd_disaggregation_ratios(prefill, oom_decode, total_dies=16, prompt_tokens=128, output_tokens=1, ttft_sla_ms=3000.0, tpot_sla_ms=30.0)
     assert (single["kv_bytes_per_request"], single["kv_transfer_ms_per_request"], single["decode_step_ms"]) == (0.0, 0.0, 0.0)
     assert all(row["feasible"] and row["bottleneck_stage"] == "prefill" for row in single["candidates"])
     one_slot = deepcopy(prefill); one_slot["runtime"]["max_num_seqs"] = 1
-    retention = sweep_pd_disaggregation_ratios(one_slot, decode, total_dies=16, prompt_tokens=128, output_tokens=256, kv_transfer_bw_gbps=0.003125)
+    retention = sweep_pd_disaggregation_ratios(one_slot, decode, total_dies=16, prompt_tokens=128, output_tokens=256, ttft_sla_ms=3000.0, tpot_sla_ms=30.0, kv_transfer_bw_gbps=0.003125)
     assert same(retention["prefill_instance"]["rps_per_instance"], (2 * 1000.0) / (retention["prefill_instance"]["step_ms"] + retention["kv_transfer_ms_per_request"]))
 def test_compute_pareto_frontier_strict_dominance():
     rows = [{"id": "a", "feasible": True, "tps_per_die": 100.0, "total_feasible_concurrency": 32, "step_ms_at_b1": 10.0}, {"id": "b", "feasible": True, "tps_per_die": 90.0, "total_feasible_concurrency": 32, "step_ms_at_b1": 11.0}, {"id": "c", "feasible": True, "tps_per_die": 80.0, "total_feasible_concurrency": 64, "step_ms_at_b1": 12.0}, {"id": "d", "feasible": False, "tps_per_die": 500.0, "total_feasible_concurrency": 128, "step_ms_at_b1": 1.0}]
@@ -488,7 +489,7 @@ def test_compute_pareto_frontier_strict_dominance():
 def _stream_case(layers=2):
     return compose_case("qwen3-32b", hardware="a3", tp=1, ep=1, pp=1, num_devices=1, layers=layers, prompt_tokens=8, output_tokens=2, concurrency=1, max_num_seqs=1)
 def _run_sweep(raw, path, **kwargs):
-    return list(sweep_topologies_iter(raw, context=8, output_budget=2, max_sequences_per_dp=1, two_stage=False, output_jsonl=path, **kwargs))
+    return list(sweep_topologies_iter(raw, sla_ms=30.0, context=8, output_budget=2, max_sequences_per_dp=1, two_stage=False, output_jsonl=path, **kwargs))
 def test_public_sweep_symbols_and_streamed_identity():
     import mindie_sim
     for name in ("sweep_topologies", "sweep_topology_grid", "sweep_topologies_iter", "sweep_topology_grid_iter", "reconstruct_sweep_summary", "solve_sla_sizing", "solve_hardware_sla_throughput"):

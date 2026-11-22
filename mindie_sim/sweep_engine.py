@@ -56,14 +56,7 @@ B1_STAGE = "b1_screen"
 FULL_STAGE = "full_sla"
 LOCKED_STAGE = "locked_plan"
 TIMEOUT_STAGE = "timeout"
-DEFAULT_SLA_MS = 30.0
-DEFAULT_CONTEXT = 126000
-DEFAULT_OUTPUT_BUDGET = 1024
 DEFAULT_MAX_SEQUENCES = 256
-DEFAULT_PROMPT_TOKENS = 4096
-DEFAULT_OUTPUT_TOKENS = 1024
-DEFAULT_TTFT_SLA_MS = 3000.0
-DEFAULT_KV_TRANSFER_BW_GBPS = 100.0
 LOCKED_PROGRAM_ERROR = "fixed_plan_sweep_not_implemented"
 MS_PER_S = 1000.0
 PARETO_EPS = 1e-12
@@ -740,8 +733,8 @@ def evaluate_candidate_worker(task: Mapping[str, Any]) -> dict[str, Any]:
 
 __all__ = [
     "BASELINE_SCENARIO", "B1_STAGE", "CANDIDATE_ID_HEX_LEN",
-    "DEFAULT_CONTEXT", "DEFAULT_MAX_SEQUENCES", "DEFAULT_OUTPUT_BUDGET",
-    "DEFAULT_SLA_MS", "FULL_STAGE", "LOCKED_PROGRAM_ERROR", "SCREEN_BATCH",
+    "DEFAULT_MAX_SEQUENCES", "FULL_STAGE", "LOCKED_PROGRAM_ERROR",
+    "SCREEN_BATCH",
     "SweepEvaluationCache", "b1_screen", "build_candidate_case",
     "candidate_devices", "compute_pareto_frontier",
     "compute_sweep_candidate_id", "enumerate_case_candidates",

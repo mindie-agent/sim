@@ -27,27 +27,25 @@ DEFAULT_EVENT_LIMIT = 256
 DEFAULT_PROFILER_ROW_LIMIT = 50
 DEFAULT_MAX_PREDICTIONS = 512
 DEFAULT_MAX_CONDITIONS = 4096
-DEFAULT_SLA_MS = 30.0
-DEFAULT_TTFT_SLA_MS = 2000.0
-DEFAULT_TPOT_SLA_MS = 30.0
-DEFAULT_SWEEP_CONTEXT = 32768
-DEFAULT_PROMPT_TOKENS = 4096
-DEFAULT_OUTPUT_BUDGET = 1024
 DEFAULT_SWEEP_MAX_SEQUENCES = 256
 DEFAULT_EFF_CONTEXT = 4096
-DEFAULT_SLA_CONTEXT = 126000
 DEFAULT_OPTIMIZE_MAX_TRIALS = 16
 BIND_PROFILER_MIN_POSITIONALS = 3
 
 _BOOLEAN_FLAGS = frozenset({
     "-h", "--help", "--isolated", "--include-submission", "--draft-prepare",
     "--no-body-defaults", "--skip-isolated", "--skip-graph", "--fit-targets",
-    "--supply-legacy-diagnostics", "--sp", "--va-recommended", "--no-ablate-prs",
-    "--allow-pp", "--allow-pcp", "--allow-dcp", "--two-stage", "--isolate-workers",
+    "--supply-legacy-diagnostics", "--sp", "--no-sp", "--va-recommended",
+    "--no-va-recommended", "--raw-eager", "--structure-only", "--no-ablate-prs",
+    "--ablate-prs", "--allow-pp", "--no-pp", "--allow-pcp", "--no-pcp",
+    "--allow-dcp", "--no-dcp", "--two-stage", "--no-two-stage",
+    "--no-kv-pooling", "--presets", "--isolate-workers",
     "--resume", "--progress", "--no-sla", "--no-advisory", "--no-compile",
     "--force", "--check", "--discover-installed", "--async-scheduling",
     "--no-async-scheduling", "--enable-dbo", "--no-enable-dbo",
+    "--engram-cpu-offload", "--no-engram-cpu-offload",
     "--multistream-overlap-shared-expert", "--no-multistream-overlap-shared-expert",
+    "--enable-shared-expert-dp", "--no-enable-shared-expert-dp",
     *ONBOARDING_BOOLEAN_FLAGS,
 })
 
@@ -272,7 +270,7 @@ def build_parser(*, prog: str = "mindie-sim") -> argparse.ArgumentParser:
             cmd.add_argument("--primitives")
             cmd.add_argument("--trace-limit", type=int, default=DEFAULT_TRACE_LIMIT)
             cmd.add_argument("--event-limit", type=int, default=DEFAULT_EVENT_LIMIT)
-            cmd.add_argument("--scope", choices=("serving", "body"), default="serving")
+            cmd.add_argument("--scope", choices=("serving", "body", "model"), default="serving")
             cmd.add_argument("--phase", choices=("decode", "prefill"))
             cmd.add_argument("--tokens", type=int, help="target verification rows per sequence")
             cmd.add_argument("--context", type=int)
@@ -325,8 +323,11 @@ def build_parser(*, prog: str = "mindie-sim") -> argparse.ArgumentParser:
     )
     cohorts.add_argument("arguments", nargs=argparse.REMAINDER)
 
-    catalog = sub.add_parser("catalog")
+    catalog = sub.add_parser("catalog", help="list models, hardware SKUs, topology presets, and quant modes")
     catalog.add_argument("name", nargs="?")
+    catalog.add_argument("--hardware", action="store_true", help="list hardware SKUs with HBM GiB, peaks, and aliases")
+    catalog.add_argument("--presets", action="store_true", help="list topology presets and link fabrics")
+    catalog.add_argument("--quant", action="store_true", help="list quantization presets and aliases")
     catalog.add_argument("--output", "-o")
 
     observations = sub.add_parser("observations")
@@ -398,24 +399,40 @@ def build_parser(*, prog: str = "mindie-sim") -> argparse.ArgumentParser:
     compose.add_argument("--hardware")
     for flag in ("--tp", "--dp", "--ep", "--pp", "--pcp", "--dcp", "--concurrency"):
         compose.add_argument(flag, type=int)
-    compose.add_argument("--sp", action="store_true")
+    compose.add_argument("--sp", action=argparse.BooleanOptionalAction, default=None)
     for flag in ("--num-devices", "--ranks-per-node", "--layers", "--max-num-seqs",
                  "--max-num-batched-tokens", "--max-model-len"):
         compose.add_argument(flag, type=int)
     compose.add_argument("--quant")
     compose.add_argument("--experts", type=int, dest="experts")
     compose.add_argument("--top-k", type=int, dest="top_k")
-    compose.add_argument("--prompt-tokens", type=int)
-    compose.add_argument("--output-tokens", type=int)
+    compose.add_argument("--prompt-tokens", type=int, default=None)
+    compose.add_argument("--output-tokens", type=int, default=None)
     compose.add_argument("--prefix-tokens", type=int)
     compose.add_argument("--async-scheduling", action=argparse.BooleanOptionalAction, default=None)
-    compose.add_argument("--graph-mode", choices=("none", "full", "piecewise"))
-    compose.add_argument("--mtp-tokens", type=int)
-    compose.add_argument("--mtp-accept", type=float)
-    compose.add_argument("--ttft-slo-ms", type=float)
-    compose.add_argument("--tpot-slo-ms", type=float)
-    compose.add_argument("--va-recommended", action="store_true",
-                         help="apply a documented vllm-ascend simulation subset; preserve quant without a hardware-specific reference")
+    compose.add_argument("--graph-mode", choices=("none", "full", "piecewise"), default=None)
+    compose.add_argument("--mtp-tokens", type=int, default=None)
+    compose.add_argument("--mtp-accept", type=float, default=None)
+    compose.add_argument("--ttft-slo-ms", type=float, default=None)
+    compose.add_argument("--tpot-slo-ms", type=float, default=None)
+    compose.add_argument("--va-recommended", action=argparse.BooleanOptionalAction, default=None,
+                         help="enable/disable documented vllm-ascend production profile (default ON)")
+    compose.add_argument("--raw-eager", action="store_true",
+                         help="disable all optional production fusions and offloading")
+    compose.add_argument("--engram-cpu-offload", action=argparse.BooleanOptionalAction, default=None)
+    compose.add_argument("--multistream-overlap-shared-expert",
+                         action=argparse.BooleanOptionalAction, default=None)
+    compose.add_argument("--enable-shared-expert-dp",
+                         action=argparse.BooleanOptionalAction, default=None)
+    compose.add_argument("--parallel", choices=("auto", "fixed"), default=None)
+    compose.add_argument("--deployment", choices=("auto", "pd", "pd_disaggregated", "colocated"),
+                         default=None)
+    compose.add_argument("--role", choices=("colocated", "pd_prefill", "pd_decode"), default=None)
+    compose.add_argument("--topology-preset", default=None)
+    compose.add_argument("--kv-cache-dtype", default=None)
+    compose.add_argument("--indexer-kv-dtype", default=None)
+    compose.add_argument("--structure-only", action="store_true",
+                         help="allow graph/structure composition without serving prompt/output lengths")
     compose.add_argument("--stack", default="vllm-ascend",
                          help="registered runtime stack name or manifest path")
     compose.add_argument("--stack-manifest", default=None,
@@ -445,38 +462,98 @@ def build_parser(*, prog: str = "mindie-sim") -> argparse.ArgumentParser:
     feature_tracks.add_argument("--sequences", type=int, default=DEFAULT_WATERFALL_SEQUENCES)
     feature_tracks.add_argument("--scope", choices=("body", "model"), default="body")
     for flag in ("--tp", "--dp", "--ep", "--pp", "--pcp", "--dcp",
-                 "--num-devices", "--layers", "--mtp-tokens"):
+                 "--num-devices", "--ranks-per-node", "--layers", "--mtp-tokens",
+                 "--q-proj-tp", "--o-proj-tp", "--linear-proj-tp", "--kda-proj-tp",
+                 "--dcp-linear-tp", "--mlp-tp", "--shared-expert-tp", "--lm-head-tp"):
         feature_tracks.add_argument(flag, type=int, default=None)
+    feature_tracks.add_argument("--mtp-accept", type=float, default=None)
     feature_tracks.add_argument("--quant", default=None)
+    feature_tracks.add_argument("--kv-cache-dtype", default=None)
+    feature_tracks.add_argument("--indexer-kv-dtype", default=None)
+    feature_tracks.add_argument("--topology-preset", default=None)
     feature_tracks.add_argument("--jobs", default="auto",
                                 help="worker budget for independent feature levels")
     feature_tracks.add_argument("--no-ablate-prs", dest="ablate_prs", action="store_false")
     feature_tracks.add_argument("--output", "-o")
 
+    solve = sub.add_parser(
+        "solve",
+        help="one-shot deployment solver: capacity ledger, PD/colocated optimum, 4-track waterfall, roofline",
+    )
+    solve.add_argument("--model", required=True)
+    solve.add_argument("--hardware", default="a3")
+    solve.add_argument("--num-devices", type=int, default=None)
+    solve.add_argument("--prompt-tokens", type=int, default=None)
+    solve.add_argument("--output-tokens", type=int, default=None)
+    solve.add_argument("--tpot-slo-ms", type=float, default=None)
+    solve.add_argument("--ttft-slo-ms", type=float, default=None)
+    solve.add_argument("--mtp-tokens", type=int, default=None)
+    solve.add_argument("--mtp-accept", type=float, default=None)
+    solve.add_argument("--kv-pooling", dest="kv_pooling", default="auto",
+                       help="KV pooling mode: auto|off|pooled_dram_ssd|layerwise_overlap_d2d|direct_blocking_d2d")
+    solve.add_argument("--no-kv-pooling", dest="kv_pooling", action="store_const", const="off")
+    solve.add_argument("--deployment", choices=("auto", "pd", "pd_disaggregated", "colocated"), default="auto")
+    solve.add_argument("--quant", default=None)
+    solve.add_argument("--kv-cache-dtype", default=None)
+    solve.add_argument("--indexer-kv-dtype", default=None)
+    solve.add_argument("--topology-preset", default=None)
+    solve.add_argument("--ranks-per-node", type=int, default=None)
+    solve.add_argument("--layers", type=int, default=None)
+    solve.add_argument("--max-sequences-per-dp", type=int, default=None)
+    solve.add_argument("--pool-dram-ratio", type=float, default=None)
+    solve.add_argument("--pool-ssd-ratio", type=float, default=0.0)
+    solve.add_argument("--pool-prefix-hit-ratio", type=float, default=0.0)
+    solve.add_argument("--ddr-bw-gbps", type=float, default=None)
+    solve.add_argument("--ssd-bw-gbps", type=float, default=None)
+    solve.add_argument("--kv-transfer-bw-gbps", type=float, default=None)
+    solve.add_argument("--raw-eager", action="store_true")
+    solve.add_argument("--ablate-prs", action="store_true")
+    solve.add_argument("--xlsx", default=None, help="optional Before-vs-After comparison .xlsx output path")
+    solve.add_argument("--trace", default=None, help="optional msprof trace_view.json output path")
+    solve.add_argument("--compare-track", default="unmerged_pr",
+                       choices=("raw_eager", "merged", "unmerged_pr", "expected_ideal"))
+    solve.add_argument("--target-track", default="expected_ideal",
+                       choices=("raw_eager", "merged", "unmerged_pr", "expected_ideal"))
+    solve.add_argument("--output", "-o")
+
     sweep = sub.add_parser("sweep", help="multi-topology parallel sharding and P/D disaggregation Pareto solver")
     sweep.add_argument("case")
-    sweep.add_argument("--mode", choices=("topology", "pd"), default="topology")
+    sweep.add_argument("--mode", choices=("topology", "pd", "auto"), default="topology")
     sweep.add_argument("--decode-case")
-    sweep.add_argument("--num-devices", type=int)
-    sweep.add_argument("--sla-ms", type=float, default=DEFAULT_SLA_MS)
-    sweep.add_argument("--ttft-sla-ms", type=float, default=DEFAULT_TTFT_SLA_MS)
-    sweep.add_argument("--tpot-sla-ms", type=float, default=DEFAULT_TPOT_SLA_MS)
-    sweep.add_argument("--context", type=int, default=DEFAULT_SWEEP_CONTEXT)
-    sweep.add_argument("--prompt-tokens", type=int, default=DEFAULT_PROMPT_TOKENS)
-    sweep.add_argument("--output-tokens", type=int, default=DEFAULT_OUTPUT_BUDGET)
-    sweep.add_argument("--output-budget", type=int, default=DEFAULT_OUTPUT_BUDGET)
+    sweep.add_argument("--num-devices", type=int, default=None)
+    sweep.add_argument("--sla-ms", type=float, default=None)
+    sweep.add_argument("--ttft-sla-ms", type=float, default=None)
+    sweep.add_argument("--tpot-sla-ms", type=float, default=None)
+    sweep.add_argument("--context", type=int, default=None)
+    sweep.add_argument("--prompt-tokens", type=int, default=None)
+    sweep.add_argument("--output-tokens", type=int, default=None)
+    sweep.add_argument("--output-budget", type=int, default=None)
+    sweep.add_argument("--deployment", choices=("auto", "pd", "pd_disaggregated", "colocated"), default="auto")
+    sweep.add_argument("--pd-transfer-mode",
+                       choices=("auto", "direct_blocking_d2d", "layerwise_overlap_d2d", "pooled_dram_ssd"),
+                       default=None)
+    sweep.add_argument("--kv-transfer-bw-gbps", type=float, default=None)
+    sweep.add_argument("--pool-dram-ratio", type=float, default=None)
+    sweep.add_argument("--pool-ssd-ratio", type=float, default=0.0)
+    sweep.add_argument("--pool-prefix-hit-ratio", type=float, default=0.0)
+    sweep.add_argument("--ddr-bw-gbps", type=float, default=None)
+    sweep.add_argument("--ssd-bw-gbps", type=float, default=None)
     sweep.add_argument("--phase", choices=("decode", "prefill"), default="decode")
-    sweep.add_argument("--scope", choices=("body", "model"), default="body")
-    sweep.add_argument("--allow-pp", action="store_true")
-    sweep.add_argument("--allow-pcp", action="store_true")
-    sweep.add_argument("--allow-dcp", action="store_true")
+    sweep.add_argument("--scope", choices=("body", "model"), default="model")
+    sweep.add_argument("--allow-pp", dest="allow_pp", action="store_true", default=True)
+    sweep.add_argument("--no-pp", dest="allow_pp", action="store_false")
+    sweep.add_argument("--allow-pcp", dest="allow_pcp", action="store_true", default=True)
+    sweep.add_argument("--no-pcp", dest="allow_pcp", action="store_false")
+    sweep.add_argument("--allow-dcp", dest="allow_dcp", action="store_true", default=True)
+    sweep.add_argument("--no-dcp", dest="allow_dcp", action="store_false")
     sweep.add_argument("--dcp-candidates", default=None, help="comma-separated DCP degrees")
     sweep.add_argument("--num-devices-grid", default=None,
                        help="comma-separated device counts, e.g. 2,4,8")
     sweep.add_argument("--tokens-per-seq", type=int)
     sweep.add_argument("--max-sequences-per-dp", type=int, default=DEFAULT_SWEEP_MAX_SEQUENCES)
     sweep.add_argument("--candidates", default=None, help="JSON list of explicit candidate mappings")
-    sweep.add_argument("--two-stage", action="store_true")
+    sweep.add_argument("--two-stage", dest="two_stage", action="store_true", default=True)
+    sweep.add_argument("--no-two-stage", dest="two_stage", action="store_false")
     sweep.add_argument("--finalist-top-k", type=int, default=None)
     sweep.add_argument("--candidate-timeout-s", type=float, default=None)
     sweep.add_argument("--output-jsonl", default=None)
@@ -506,14 +583,14 @@ def build_parser(*, prog: str = "mindie-sim") -> argparse.ArgumentParser:
 
     sla = sub.add_parser("sla", help="SLA-constrained concurrency and hardware scaling solver")
     sla.add_argument("case")
-    sla.add_argument("--sla-ms", type=float, default=DEFAULT_SLA_MS)
-    sla.add_argument("--context", type=int, default=DEFAULT_SLA_CONTEXT)
+    sla.add_argument("--sla-ms", type=float, default=None)
+    sla.add_argument("--context", type=int, default=None)
     sla.add_argument("--phase", choices=("decode", "prefill"), default="decode")
-    sla.add_argument("--scope", choices=("body", "model"), default="body")
+    sla.add_argument("--scope", choices=("body", "model"), default="model")
     sla.add_argument("--tokens-per-seq", type=int)
     sla.add_argument("--emitted-tokens-per-seq", type=float)
     sla.add_argument("--max-sequences-per-dp", type=int, default=DEFAULT_SWEEP_MAX_SEQUENCES)
-    sla.add_argument("--output-budget", type=int, default=DEFAULT_OUTPUT_BUDGET)
+    sla.add_argument("--output-budget", type=int, default=None)
     for flag in ("--hbm-bw-scale", "--cube-flops-scale", "--vector-ops-scale",
                  "--link-bw-scale", "--hbm-capacity-scale"):
         sla.add_argument(flag, type=float)

@@ -353,6 +353,10 @@ owns = ["mindie_sim/sweep.py", "mindie_sim/sweep_engine.py", "mindie_sim/__main_
 path = "serving/test_sku_and_candidate_studies.py"
 tier = "tier0"
 owns = ["mindie_sim/runtime_advisor.py", "mindie_sim/study.py", "mindie_sim/__main__.py", "mindie_sim/compose.py"]
+[[module]]
+path = "serving/test_three_domain_and_pooled_pd.py"
+tier = "tier0"
+owns = ["mindie_sim/compose.py", "mindie_sim/compose_runtime.py", "mindie_sim/sweep_pd.py", "mindie_sim/prediction/offload/policy.py", "mindie_sim/prediction/disaggregated/handoff.py"]
 # ---------------------------------------------------------------- observations
 [[module]]
 path = "observations/test_multilevel_gate.py"

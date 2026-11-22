@@ -30,6 +30,7 @@ from ..scheduler import Scheduler
 from ..structure import parse_case
 from .handoff import (
     HEAD_COMPONENTS,
+    compute_pd_handoff_plan,
 )
 from .handoff import (
     _component_versions as _component_versions,
@@ -92,6 +93,7 @@ __all__ = [
     "address",
     "cohorts",
     "combine_coverage",
+    "compute_pd_handoff_plan",
     "defaultdict",
     "layer_cache_components",
     "math",

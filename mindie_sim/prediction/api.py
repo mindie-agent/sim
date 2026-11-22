@@ -501,17 +501,20 @@ def predict(
     assert_timing_supported(case, entry="predict")
     if gate_case is not case:
         assert_timing_supported(gate_case, entry="predict")
-    if scope == "body":
+    has_geometry = any(v is not None for v in (phase, tokens, context, sequences))
+    if scope in {"body", "model"} or (scope == "serving" and has_geometry):
         if lower is not None:
             raise ModelingError("body_scope_uses_target_frontend_not_custom_serving_lowerer")
         from .body import body_forward, pd_body_forward
+        resolved_scope = "model" if scope == "model" else "body"
         probe = pd_body_forward if isinstance(case, _AbcMapping) and "pools" in case else body_forward
         return probe(case, phase=phase or "decode", tokens=1 if tokens is None else tokens,
                      context=0 if context is None else context,
                      sequences=1 if sequences is None else sequences,
+                     scope=resolved_scope,
                      primitives=primitives, recipes=recipes, event_limit=event_limit)
-    if scope != "serving" or any(v is not None for v in (phase, tokens, context, sequences)):
-        raise ModelingError("prediction_geometry_requires_body_scope")
+    if scope != "serving":
+        raise ModelingError(f"invalid_prediction_scope:{scope}")
     if isinstance(case, _AbcMapping) and "pools" in case:
         from .disaggregated import predict_pd
         return predict_pd(case, primitives=primitives, recipes=recipes, submission=submission,

@@ -414,6 +414,11 @@ def _vllm_ascend_profile() -> RuntimeStackProfile:
             "kv_block_size": value.get("kv_block_size"),
             "mtp_proposal_tokens": value.get("mtp_proposal_tokens", 0),
             "graph_capture_mode": value.get("graph_capture_mode", "full"),
+            "multistream_overlap_shared_expert": bool(
+                value.get("multistream_overlap_shared_expert", False)
+            ),
+            "engram_cpu_offload": bool(value.get("engram_cpu_offload", False)),
+            "tutorial_flags": dict(value.get("tutorial_flags") or {}),
         }
         for key, value in VA_RECOMMENDED_PROFILES.items()
     }

@@ -310,7 +310,7 @@ def _fifo_frontier(*, deferred):
 def test_fifo_admission_order_is_exact_under_the_eager_optimization(monkeypatch):
     assert _fifo_frontier(deferred=True) == 112.0 and _fifo_frontier(deferred=False) == 102.0
     from mindie_sim.prediction import execution as execution_module
-    case_dict = compose_case(LONG_MODEL, hardware="a5", tp=8, ep=8, num_devices=8, layers=4, output_tokens=8)
+    case_dict = compose_case(LONG_MODEL, hardware="a5", tp=8, ep=8, num_devices=8, layers=4, prompt_tokens=4096, output_tokens=8)
     graphs = target_graphs(case_dict, phase="decode", tokens=1, context=256, sequences=1, scope="body")
     submitted = graph_costs(case_dict, graphs, external_inputs={"analysis_input": 0}, include_submission=True, isolated=False, replay_scope="none")["duration_ms"]
     original = execution_module.Execution._program_uses_fifo
@@ -375,7 +375,7 @@ def test_hardware_mutation_always_re_executes_a_fresh_engine():
     assert int(scaled["accel_status"]["native_steps"]) + int(scaled["accel_status"]["python_steps"]) > 0
     assert _backend_case(case_dict, context=1024)["graph_duration_ms"] == baseline["graph_duration_ms"]
 def test_long_sequence_dynamic_efficiency_is_seconds_scale():
-    case_dict = compose_case(SECOND_MODEL, hardware="a5", tp=1, dp=8, ep=8, num_devices=8, layers=93, moe_comm_mode="dynamic")
+    case_dict = compose_case(SECOND_MODEL, hardware="a5", tp=1, dp=8, ep=8, num_devices=8, layers=93, moe_comm_mode="dynamic", multistream_overlap_shared_expert=False)
     import time
     started = time.perf_counter(); report = _backend_case(case_dict, context=4096); elapsed = time.perf_counter() - started
     assert 0.0 < float(report["graph_duration_ms"]) and elapsed < SECONDS_BUDGET
@@ -509,7 +509,7 @@ def test_locked_sweep_reuses_one_plan_or_rejects_unsupported_comparison():
     case_dict = parse_case(compose_case("qwen3.5-35b-a3b", hardware=DT_SKU, tp=8, dp=1, ep=8, pp=1, layers=1, prompt_tokens=64, output_tokens=2, concurrency=1))
     with pytest.raises(Exception, match="fixed_plan_sweep_not_implemented"):
         sweep_topologies(case_dict, num_devices=8, lock_program=True)
-    report = sweep_topologies(case_dict, num_devices=8, lock_parallel=True, lock_program=True)
+    report = sweep_topologies(case_dict, num_devices=8, lock_parallel=True, lock_program=True, sla_ms=30.0, context=4096)
     rows = report["candidates"]
     assert report["plan_selection"] == "fixed_parallel" and report["program_selection"] == "fixed"
     assert rows and all(row.get("plan_identity") for row in rows) and len({row["plan_identity"] for row in rows}) == 1 and len({row["b_retained"] for row in rows}) == 1

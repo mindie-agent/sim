@@ -27,6 +27,7 @@ from typing import Any
 
 from mindie_sim.compose_inputs import _arch_key, _resolve_hardware
 from mindie_sim.model_catalog import ARCHITECTURE_PRESET_ALIASES, MODEL_ALIASES
+from mindie_sim.prediction.offload.policy import resolve_sku_host_dma_rates
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.runtime_profiles import simulation_config
 from mindie_sim.schema.common import ModelingError
@@ -257,6 +258,51 @@ def finalize_compilation_spine(
     runtime_dict["metadata"] = meta
 
 
+def bind_sku_host_dma_rates(
+    machine: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Bind SKU-calibrated L0/profile PCIe H2D/D2H & host DDR rates onto ``machine``.
+
+    Fails closed when a hardware profile declares neither explicit host DMA rates
+    nor calibrated L0 ``P20_host_dma_sync`` / ``transfer_channels``.
+    """
+    host_rates = resolve_sku_host_dma_rates(machine)
+    missing = [
+        name
+        for name, key in (("h2d", "h2d_bps"), ("host_memory", "host_memory_bps"))
+        if not host_rates.get(key)
+    ]
+    if missing:
+        raise ModelingError(
+            "missing_required_hardware_host_dma_rate:" + ",".join(missing)
+        )
+    updated = dict(machine)
+    dev = dict(updated.get("device") or {})
+    rates = dict(dev.get("rates") or {})
+    rates.setdefault("h2d", float(host_rates["h2d_bps"]))
+    if host_rates.get("d2h_bps"):
+        rates.setdefault("d2h", float(host_rates["d2h_bps"]))
+    rates.setdefault("host_memory", float(host_rates["host_memory_bps"]))
+    if host_rates.get("host_vector_ops_per_s"):
+        rates.setdefault("host_vector", float(host_rates["host_vector_ops_per_s"]))
+    dev["rates"] = rates
+    updated["device"] = dev
+    if isinstance(updated.get("devices"), list) and updated["devices"]:
+        patched_devices = []
+        for entry in updated["devices"]:
+            if isinstance(entry, Mapping):
+                ed = dict(entry)
+                ed_rates = dict(ed.get("rates") or {})
+                for k, v in rates.items():
+                    ed_rates.setdefault(k, v)
+                ed["rates"] = ed_rates
+                patched_devices.append(ed)
+            else:
+                patched_devices.append(entry)
+        updated["devices"] = patched_devices
+    return updated, host_rates
+
+
 def apply_va_recommended(case: Mapping[str, Any]) -> dict[str, Any]:
     """Apply supported vLLM-Ascend execution subset while preserving quantization."""
     out = deepcopy(dict(case))
@@ -283,6 +329,26 @@ def apply_va_recommended(case: Mapping[str, Any]) -> dict[str, Any]:
     meta["va_profile"] = deepcopy(va_profile)
     meta["va_env"] = dict(va_profile["env"])
     meta.setdefault("moe_dispatch_quantization", "routed_expert")
+    if (rt.get("multistream_overlap_shared_expert") is not False
+            and va_profile.get("multistream_overlap_shared_expert")):
+        rt["multistream_overlap_shared_expert"] = True
+        meta["multistream_overlap_shared_expert"] = True
+    wants_engram = bool(
+        va_profile.get("engram_cpu_offload")
+        or getattr(parsed.model, "engram", None) is not None
+    )
+    if rt.get("engram_cpu_offload") is not False and wants_engram:
+        rt["engram_cpu_offload"] = True
+        out["machine"], _ = bind_sku_host_dma_rates(out.get("machine") or {})
+    prof_flags = dict(va_profile.get("tutorial_flags") or {})
+    if prof_flags.get("enable_shared_expert_dp") and "enable_shared_expert_dp" not in meta:
+        meta["enable_shared_expert_dp"] = True
+    additional = dict(meta.get("additional_config") or {})
+    for flag_key in ("enable_flashcomm1", "enable_fused_mc2", "enable_prefill_mc2"):
+        if flag_key in prof_flags and flag_key not in additional:
+            additional[flag_key] = prof_flags[flag_key]
+    if additional:
+        meta["additional_config"] = additional
     notes: list[dict[str, Any]] = []
     kernels = dict(rt.get("kernels", {}))
     tp, ep = int(par.get("tp", 1)), int(par.get("ep", 1))

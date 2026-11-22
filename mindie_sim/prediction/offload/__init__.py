@@ -23,8 +23,10 @@ from mindie_sim.schema.case import Case as CaseSpec
 
 from .policy import (
     OffloadPolicy,
+    missing_scenario_error,
     offload_resources,
     resolve_case_offload_policy,
+    resolve_sku_host_dma_rates,
     _PREFETCH_VERSIONS,
     _nonnegative,
     _offload_memory_for,
@@ -103,6 +105,7 @@ _FFN_TOKENS = (
 
 __all__ = [
     "OffloadPolicy",
+    "missing_scenario_error", "resolve_sku_host_dma_rates",
     "resolve_case_offload_policy", "offload_resources", "schedule_expert_layer_offload",
     "schedule_kv_layer_offload", "schedule_kv_layer_writeback",
     "schedule_draft_kv_writeback", "schedule_kv_iteration_offload",

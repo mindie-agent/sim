@@ -440,7 +440,7 @@ def _memory_execution(extra, allocations=(), *, offload=False, duration=1):
     pools = dict.fromkeys(("hbm", "memory@r0:s0"), 1e9)
     resources = [Resource("host", 1, unit="ms", policy="fifo"), Resource("fair", 1, unit="u")]
     engine = Engine(resources, pools=pools, pool_units=dict.fromkeys(pools, 1), trace_limit=256)
-    return _execution(case() | {"runtime": {"memory": cfg}}, recipes=_stage_book(lower), engine=engine, include_submission=False,
+    return _execution(case() | {"runtime": {"memory": cfg, **({"metadata": {"offload": {"ddr_bw_gbps": 200.0, "ssd_bw_gbps": 14.0}}} if offload else {})}}, recipes=_stage_book(lower), engine=engine, include_submission=False,
                       memory=budget_memory(extra, policy=MemoryPolicy(**cfg)))
 
 @pytest.mark.parametrize("entry", ["operator", "blocked", "conductor", "second_conductor"])

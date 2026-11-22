@@ -264,11 +264,13 @@ def analyze_network_efficiency(
                "roofline_efficiency": tot_roof_id / safe_graph_ms,
                "denominator": "graph_span_ms", "semantics": "nominal_peak_relative_work_over_span"}
     graph_accel = graph_report.get("accel_status") if graph_report is not None else None
+    from ..body import describe_included_components
     return {
         "schema": "mindie-sim.efficiency/1",
         "engine_backend": (graph_report or {}).get("engine_backend"),
         "accel_status": graph_accel,
         "geometry": {"phase": phase, "tokens": tokens, "context": context, "sequences": sequences, "scope": scope},
+        "included_components": describe_included_components(parsed, scope=scope),
         "total_flops": tot_flops, "total_vector_ops": tot_vec_ops, "total_hbm_bytes": tot_hbm_b, "total_link_bytes": tot_link_b,
         "total_cube_ideal_ms": tot_cube_id, "total_vec_ideal_ms": tot_vec_id, "total_hbm_ideal_ms": tot_hbm_id, "total_link_ideal_ms": tot_link_id,
         "total_roofline_ideal_ms": tot_roof_id, "operator_serial_roofline_ideal_ms": serial_roof_id, "operator_sum_ms": operator_sum_ms, "graph_duration_ms": graph_duration_ms,

@@ -44,11 +44,6 @@ from mindie_sim.schema.runtime_features import (
 GIB_BYTES = 2 ** 30
 CLI_ONE = 1
 CLI_ZERO = 0
-CLI_PROMPT_TOKENS = 4096
-CLI_OUTPUT_TOKENS = 128
-CLI_MTP_ACCEPT = 1.0
-CLI_TTFT_MS = 5000.0
-CLI_TPOT_MS = 50.0
 SINGLE_RECORD = 1
 DEFAULT_SKU = "derived-sku"
 FEATURE_KEYS = (
@@ -158,49 +153,74 @@ def load_hardware_derivations(path: str | Path) -> list[dict[str, Any]]:
 
 
 def compose_case_kwargs(namespace: argparse.Namespace) -> dict[str, Any]:
-    """Build the complete compose_case keyword set from CLI arguments."""
+    """Build the complete compose_case keyword set from CLI arguments.
+
+    Preserves ``None`` for omitted parallel, scenario, and Domain-2 flags so
+    ``compose_case`` enforces Domain-1 fail-fast, Domain-2 optimal defaults,
+    and Domain-3 auto-optimal search without CLI-layer constant guessing.
+    """
     value = lambda name, default: (default if getattr(namespace, name, None) is None
                                    else getattr(namespace, name))
     return {
-        "tp": value("tp", CLI_ONE), "dp": value("dp", CLI_ONE),
-        "ep": value("ep", CLI_ONE), "pp": value("pp", CLI_ONE),
-        "pcp": value("pcp", CLI_ONE), "dcp": value("dcp", CLI_ONE),
-        "sp": bool(namespace.sp), "num_devices": namespace.num_devices,
-        "ranks_per_node": namespace.ranks_per_node, "quant": namespace.quant,
-        "layers": namespace.layers, "n_routed_experts": namespace.experts,
-        "num_experts_per_tok": namespace.top_k,
-        "prompt_tokens": value("prompt_tokens", CLI_PROMPT_TOKENS),
-        "output_tokens": value("output_tokens", CLI_OUTPUT_TOKENS),
-        "concurrency": value("concurrency", CLI_ONE),
+        "tp": getattr(namespace, "tp", None),
+        "dp": getattr(namespace, "dp", None),
+        "ep": getattr(namespace, "ep", None),
+        "pp": getattr(namespace, "pp", None),
+        "pcp": getattr(namespace, "pcp", None),
+        "dcp": getattr(namespace, "dcp", None),
+        "sp": getattr(namespace, "sp", None),
+        "num_devices": getattr(namespace, "num_devices", None),
+        "ranks_per_node": getattr(namespace, "ranks_per_node", None),
+        "quant": getattr(namespace, "quant", None),
+        "layers": getattr(namespace, "layers", None),
+        "n_routed_experts": getattr(namespace, "experts", None),
+        "num_experts_per_tok": getattr(namespace, "top_k", None),
+        "prompt_tokens": getattr(namespace, "prompt_tokens", None),
+        "output_tokens": getattr(namespace, "output_tokens", None),
+        "concurrency": getattr(namespace, "concurrency", None),
         "prefix_tokens": value("prefix_tokens", CLI_ZERO),
-        "max_num_seqs": namespace.max_num_seqs,
-        "max_num_batched_tokens": namespace.max_num_batched_tokens,
-        "max_model_len": namespace.max_model_len,
+        "max_num_seqs": getattr(namespace, "max_num_seqs", None),
+        "max_num_batched_tokens": getattr(namespace, "max_num_batched_tokens", None),
+        "max_model_len": getattr(namespace, "max_model_len", None),
         "async_scheduling": value("async_scheduling", False),
-        "graph_capture_mode": namespace.graph_mode or "none",
-        "mtp_proposal_tokens": value("mtp_tokens", CLI_ZERO),
-        "mtp_acceptance_length": value("mtp_accept", CLI_MTP_ACCEPT),
-        "ttft_slo_ms": value("ttft_slo_ms", CLI_TTFT_MS),
-        "tpot_slo_ms": value("tpot_slo_ms", CLI_TPOT_MS),
-        "va_recommended": bool(getattr(namespace, "va_recommended", False)),
+        "graph_capture_mode": getattr(namespace, "graph_mode", None),
+        "mtp_proposal_tokens": getattr(namespace, "mtp_tokens", None),
+        "mtp_acceptance_length": getattr(namespace, "mtp_accept", None),
+        "ttft_slo_ms": getattr(namespace, "ttft_slo_ms", None),
+        "tpot_slo_ms": getattr(namespace, "tpot_slo_ms", None),
+        "va_recommended": getattr(namespace, "va_recommended", None),
+        "raw_eager": bool(getattr(namespace, "raw_eager", False)),
+        "engram_cpu_offload": getattr(namespace, "engram_cpu_offload", None),
+        "multistream_overlap_shared_expert": getattr(
+            namespace, "multistream_overlap_shared_expert", None
+        ),
+        "enable_shared_expert_dp": getattr(namespace, "enable_shared_expert_dp", None),
+        "parallel": getattr(namespace, "parallel", None),
+        "deployment": getattr(namespace, "deployment", None),
+        "role": getattr(namespace, "role", None),
+        "topology_preset": getattr(namespace, "topology_preset", None),
+        "kv_cache_dtype": getattr(namespace, "kv_cache_dtype", None),
+        "indexer_kv_dtype": getattr(namespace, "indexer_kv_dtype", None),
+        "require_scenario": not bool(getattr(namespace, "structure_only", False)),
         "o_proj_tp": value("o_proj_tp", CLI_ONE),
         "linear_proj_tp": _linear_tp(namespace),
         "lm_head_tp": value("lm_head_tp", CLI_ONE),
         "redundant_experts_per_rank": value("redundant_experts_per_rank", CLI_ZERO),
-        "collective_startup_mode": namespace.collective_startup_mode,
-        "matrix_compute_policy": namespace.matrix_compute_policy or "auto",
-        "recover_ssm": bool(namespace.recover_ssm),
-        "prefix_cache_mode": namespace.prefix_cache_mode or "private",
-        "prefix_read_mode": namespace.prefix_read_mode or "auto",
-        "homogeneous_graph_reuse": namespace.homogeneous_graph_reuse or "off",
-        "prefix_cache_key": namespace.prefix_cache_key or "",
+        "collective_startup_mode": getattr(namespace, "collective_startup_mode", None),
+        "matrix_compute_policy": getattr(namespace, "matrix_compute_policy", None) or "auto",
+        "recover_ssm": bool(getattr(namespace, "recover_ssm", False)),
+        "prefix_cache_mode": getattr(namespace, "prefix_cache_mode", None) or "private",
+        "prefix_read_mode": getattr(namespace, "prefix_read_mode", None) or "auto",
+        "homogeneous_graph_reuse": getattr(namespace, "homogeneous_graph_reuse", None) or "off",
+        "prefix_cache_key": getattr(namespace, "prefix_cache_key", None) or "",
         "hardware_derivation": _derivation_file(namespace),
-        "aic_count": namespace.aic_count, "aiv_count": namespace.aiv_count,
+        "aic_count": getattr(namespace, "aic_count", None),
+        "aiv_count": getattr(namespace, "aiv_count", None),
         "memory_bytes": _memory_bytes(namespace),
-        "hbm_peak_bytes_per_s": namespace.hbm_peak_bytes_per_s,
-        "hbm_efficiency": namespace.hbm_efficiency,
-        "mte2_ceiling_bytes_per_s": namespace.mte2_ceiling_bytes_per_s,
-        "mte2_efficiency": namespace.mte2_efficiency,
+        "hbm_peak_bytes_per_s": getattr(namespace, "hbm_peak_bytes_per_s", None),
+        "hbm_efficiency": getattr(namespace, "hbm_efficiency", None),
+        "mte2_ceiling_bytes_per_s": getattr(namespace, "mte2_ceiling_bytes_per_s", None),
+        "mte2_efficiency": getattr(namespace, "mte2_efficiency", None),
         "block_size": getattr(namespace, "block_size", None),
         "runtime_stack": (getattr(namespace, "stack_manifest", None)
                           or getattr(namespace, "stack", None) or "vllm-ascend"),
