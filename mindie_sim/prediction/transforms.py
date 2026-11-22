@@ -38,6 +38,7 @@ from .rewrite_mhc_rules import (
     mhc_boundary_fusion_overlap,
     qkv_norm_rope_fusion,
 )
+from mindie_sim.prediction.operators.mc2.mc2_tp_overlap import tp_mc2_overlap_fusion
 from mindie_sim.prediction.operators.vector.transform_norm_quant import (
     _norm_quant_domain,
     norm_quant,
@@ -326,6 +327,7 @@ LOWERING_PASSES = {
     "kda_in_kernel_l2norm": kda_in_kernel_l2norm,
     "gdn_projection_overlap": gdn_projection_overlap,
     "moe_tail_residual": moe_tail_residual_fusion,
+    "tp_mc2_overlap": tp_mc2_overlap_fusion,
 }
 
 

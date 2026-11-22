@@ -230,10 +230,16 @@ def _bind_transfer(phase: Phase, context: RecipeContext, routed_pair: str | None
     )
     resource = routed_pair or next((names[role] for role in candidates if role and role in names), None)
     if resource is None:
-        routed = set(context.work) - set(names.values())
-        if len(routed) != 1:
+        routed = sorted(set(context.work) - set(names.values()))
+        if len(routed) == 1:
+            resource = routed[0]
+        elif routed:
+            tx_ports = [item for item in routed if ":tx:port" in item]
+            pool = tx_ports or routed
+            src_idx = int(dict(phase.metadata).get("source_rank", 0) or 0)
+            resource = pool[src_idx % len(pool)]
+        else:
             raise ModelingError(f"mc2_peer_resource_binding_required:{phase.service_mode}")
-        resource = routed.pop()
     rate = context.service_rate(phase.service_mode)
     if rate is None:
         rate = context.service_rate("mc2_peer")

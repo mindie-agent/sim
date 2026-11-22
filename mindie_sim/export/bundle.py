@@ -67,6 +67,7 @@ from .memory_ledger import compute_memory_quant_ledger, stage_layer_counts
 from .models import (
     ARCHETYPE_ORDER_FALLBACK,
     BOUND_DISPLAY_LABELS,
+    CANONICAL_EXPORT_SUBMODULES,
     CERT_RESOURCE_COUNT,
     DEFAULT_EXPORT_CONTEXT_TOKENS,
     DEFAULT_GAP_RADAR_TOP_K,
@@ -764,6 +765,7 @@ def _evaluate_representative_step(
         trace_limit=replay.event_limit, compact=False, evaluation=evaluation,
         stream_plans=rewritten.streams or None, request_views=rewritten.request_views,
         padded_tokens=step_req.padded_tokens, sequence_layout=step_req.layout,
+        timeline_replicas=(0,),
     )
     op_spec_by_key = {(entry.replica, op.op_id): op for entry in rewritten.executable for op in entry.ops}
     struct_by_op, subgraph_by_op = _extract_structure_registry_view(eff_case, graphs, step_req)
@@ -982,7 +984,7 @@ def _resolve_op_submodule(
 ) -> str:
     if isinstance(struct_node, Mapping):
         raw_sub = str(struct_node.get("submodule") or "").strip()
-        if raw_sub and raw_sub.lower() not in {"other", "unknown", "none"}:
+        if raw_sub in CANONICAL_EXPORT_SUBMODULES:
             return raw_sub
     return classify_submodule(
         rec["op_id"], rec["family"], rec["recipe"],

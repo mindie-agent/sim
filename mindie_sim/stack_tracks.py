@@ -68,6 +68,7 @@ _MECHANISM_LOWERING_PASSES: dict[str, tuple[str, ...]] = {
     "activation_quant_fusion": ("activation_quant",),
     "gmm_swiglu_quant_fusion": ("gmm_swiglu_quant",),
     "moe_tail_residual_fusion": ("moe_tail_residual",),
+    "tp_mc2_overlap": ("tp_mc2_overlap",),
 }
 
 

@@ -269,7 +269,7 @@ def _prepare_graphs(case, ops, book, replay_scope, external):
 def _run_graph(
     case, ops, graphs, scopes, groups, ctx, book, external, input_ready_ms, *,
     include_submission, trace_limit, fast_span_only, stream_plans, request_views,
-    padded_tokens, sequence_layout,
+    padded_tokens, sequence_layout, timeline_replicas=None,
 ):
     records, streams = [], {}
 
@@ -347,10 +347,13 @@ def _run_graph(
                 steps[r] = execution.add(work, r, input_ready_ms, external_inputs=inputs[r])
     unique_completions = tuple(dict.fromkeys(step.completion for step in steps.values()))
     engine.advance(until=unique_completions, first=False)
+    skipped_occurrences = 0
     if not fast_span_only and getattr(execution, "_dedup_cohorts", None):
         from .runtime.dp_cohort_dedup import expand_dedup_graph_artifacts
-        expand_dedup_graph_artifacts(execution, records, graphs)
-    return execution, engine, records, steps, stream_plans
+        skipped_occurrences = expand_dedup_graph_artifacts(
+            execution, records, graphs, timeline_replicas=timeline_replicas,
+        )
+    return execution, engine, records, steps, stream_plans, skipped_occurrences
 
 
 def _dcp_replica_subgroup(topology, axis, replica, stage, meta, fallback):
@@ -721,7 +724,8 @@ def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=Non
                 isolated=True, trace_limit=ZERO, compact=False,
                 audit_allocations=False, evaluation=None,
                 fast_span_only=False, stream_plans=None,
-                request_views=None, padded_tokens=0, sequence_layout=""):
+                request_views=None, padded_tokens=0, sequence_layout="",
+                timeline_replicas=None):
     """Run a declared DAG or replica->DAG mapping without a request scheduler.
 
     External input keys are operator dependency names and values are absolute
@@ -757,11 +761,16 @@ def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=Non
         case, ops, book, replay_scope, external)
     external_times = {_name(r, key): max(value, input_ready_ms)
                       for r in graphs for key, value in external.items()}
-    execution, engine, records, steps, stream_plans = _run_graph(
+    keep_replicas = (
+        frozenset(int(r) for r in timeline_replicas)
+        if timeline_replicas is not None else None
+    )
+    execution, engine, records, steps, stream_plans, skipped_occurrences = _run_graph(
         case, ops, graphs, scopes, groups, ctx, book, external, input_ready_ms,
         include_submission=include_submission, trace_limit=trace_limit,
         fast_span_only=fast_span_only, stream_plans=stream_plans,
-        request_views=request_views, padded_tokens=padded_tokens, sequence_layout=sequence_layout)
+        request_views=request_views, padded_tokens=padded_tokens, sequence_layout=sequence_layout,
+        timeline_replicas=keep_replicas)
     end = max((step.completion.time for step in steps.values()), default=input_ready_ms)
     duration = end - input_ready_ms
     if fast_span_only:
@@ -786,8 +795,12 @@ def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=Non
     if isolated:
         costs, durations, isolated_sum, cohort_cache = _price_isolated_graph(
             case, graphs, joins, scopes, book, primitives, ctx, stream_plans)
+    row_records = (
+        [record for record in records if record["replica"] in keep_replicas]
+        if (keep_replicas is not None and not compact) else records
+    )
     rows, profile = _graph_operator_rows(
-        records, duration, compact, isolated, durations, stream_plans)
+        row_records, duration, compact, isolated, durations, stream_plans)
     isolated_profile = None
     if compact and isolated:
         isolated_profile = _isolated_operator_profile(costs, isolated_sum)
@@ -811,7 +824,7 @@ def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=Non
         "replicas": list(graphs), "replay_scope": replay_scope,
         "replay_scope_by_replica": scopes,
         "operator_occurrences": sum(
-            record["op"].family != "barrier" for record in records),
+            record["op"].family != "barrier" for record in records) + skipped_occurrences,
     }
     execution_summary = execution.summary()
     parameter_summary = execution.cost.summary()

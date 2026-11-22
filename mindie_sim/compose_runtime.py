@@ -344,9 +344,18 @@ def apply_va_recommended(case: Mapping[str, Any]) -> dict[str, Any]:
     if prof_flags.get("enable_shared_expert_dp") and "enable_shared_expert_dp" not in meta:
         meta["enable_shared_expert_dp"] = True
     additional = dict(meta.get("additional_config") or {})
+    track_name = str(
+        (meta.get("feature_track_report") or {}).get("feature_track")
+        or meta.get("feature_track")
+        or "merged"
+    ).strip().lower()
+    allow_merged_workarounds = track_name == "merged"
     for flag_key in ("enable_flashcomm1", "enable_fused_mc2", "enable_prefill_mc2"):
-        if flag_key in prof_flags and flag_key not in additional:
-            additional[flag_key] = prof_flags[flag_key]
+        if flag_key not in prof_flags or flag_key in additional:
+            continue
+        if flag_key == "enable_fused_mc2" and not allow_merged_workarounds and int(prof_flags[flag_key]) == 0:
+            continue
+        additional[flag_key] = prof_flags[flag_key]
     if additional:
         meta["additional_config"] = additional
     notes: list[dict[str, Any]] = []

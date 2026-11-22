@@ -71,6 +71,10 @@ def projection_quant(quant: QuantSpec, plan) -> QuantSpec:
 #: linear weight block (128 for V4, 32 for V4.1).
 MX_EXPERT_BLOCK = 32
 MX_EXPERT_SCALE_PACK = 2
+_STANDARD_MXFP4_EXCLUSIONS: tuple[str, ...] = (
+    "mtp", "norm", "router", "lm_head", "embedding", "mhc",
+    "compressor", "vision", "projector", "conv_weight_f32", "conv_weight_bf16",
+)
 _MXFP4_ROUTED_ACTIVATION = {
     "activation_format": "fp8_e4m3",
     "activation_group_size": MX_EXPERT_BLOCK,
@@ -305,6 +309,40 @@ def _quant_w4a8_dynamic() -> QuantSpec:
     )
 
 
+def _quant_fp16() -> QuantSpec:
+    return QuantSpec(
+        name="fp16", weight_format="fp16", activation_format="fp16",
+        expert_weight_format="fp16", kv_dtype="fp16", index_dtype="fp16",
+        index_scale_dtype="none", native_format="fp16",
+        exclusions=(), source=merge_source({"quantization": "none"}),
+        notes=("no weight quantization declared; compute and activation are FP16",),
+    )
+
+
+def _quant_mxfp4_all() -> QuantSpec:
+    return QuantSpec(
+        name="MXFP4", weight_format="mxfp4", activation_format="fp8_e4m3",
+        expert_weight_format="mxfp4",
+        weight_block=(ONE, MX_EXPERT_BLOCK),
+        expert_block=MX_EXPERT_BLOCK,
+        scale_format="fp8_e8m0", scale_bytes=1.0,
+        activation_group_size=MX_EXPERT_BLOCK,
+        activation_scale_format="fp8_e8m0",
+        activation_scale_pack=MX_EXPERT_SCALE_PACK,
+        kv_dtype="bf16", index_dtype="bf16", index_scale_dtype="none",
+        exclusions=_STANDARD_MXFP4_EXCLUSIONS,
+        source=merge_source({
+            "quant_method": "mxfp4",
+            "weight_block_size": "1x32",
+            "scale_fmt": "ue8m0",
+        }),
+        notes=(
+            "MXFP4 group32 weights with FP8 E4M3 activations and E8M0 microscales",
+            "MTP, norms, router, embedding, LM head, mHC, vision and conv stay BF16/FP32",
+        ),
+    )
+
+
 #: Explicit quantization presets a case may declare on a catalog model.
 QUANTIZATION_PRESETS: dict[str, Any] = {
     # Short names are explicit representation declarations, not dispatch claims.
@@ -315,7 +353,8 @@ QUANTIZATION_PRESETS: dict[str, Any] = {
     "w8a8-mxfp8": _quant_qwen_mxfp8,
     "mxfp8": _quant_qwen_mxfp8,
     "fp8_mxfp8": _quant_qwen_mxfp8,
-    "mxfp4": lambda: _quant_kimi({}),
+    "mxfp4": _quant_mxfp4_all,
+    "mxfp4_all": _quant_mxfp4_all,
     "mxfp4_routed_only": lambda: _quant_kimi({}),
     "w8a8_dynamic": _quant_w8a8_dynamic,
     "w8a8": _quant_w8a8_dynamic,
@@ -325,6 +364,7 @@ QUANTIZATION_PRESETS: dict[str, Any] = {
     "w4a8": _quant_w4a8_dynamic,
     "w4a8-int8": _quant_w4a8_dynamic,
     "bf16": lambda: _quant_bf16({}, name="bf16"),
+    "fp16": _quant_fp16,
 }
 
 

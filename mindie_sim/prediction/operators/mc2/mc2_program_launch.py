@@ -113,7 +113,7 @@ class _Mc2Program(Mc2ProgramState):
             if promise is not None:
                 final = engine.submit(
                     f"{name}:{phase.name}:{source}->{destination}:retire",
-                    after=(arrival,),
+                    after=(arrival,), native_hook=True,
                     on_complete=lambda _event, item=promise:
                     engine.resolve(item))
             parent_events.append(final)
@@ -452,18 +452,18 @@ class _Mc2Program(Mc2ProgramState):
                                 f"{name}:{phase_name}:owner{owner}:"
                                 "finish", after=(final,),
                                 owner="receive_count_success",
-                                on_complete=finish)
+                                on_complete=finish, native_hook=True)
                         else:
                             attempt[0] += 1
                             start_gate(_read)
                     engine.submit(
                         f"{name}:{phase_name}:owner{owner}:read_done",
                         after=(read_event,), owner="receive_count_try",
-                        on_complete=read_done)
+                        on_complete=read_done, native_hook=True)
                 engine.submit(
                     f"{name}:{phase_name}:owner{owner}:gate{attempt[0]}",
                     after=(previous,), owner="receive_count_try",
-                    on_complete=gate)
+                    on_complete=gate, native_hook=True)
             start_gate(after_event)
         for spec in count_specs:
             owner_try(spec, phase_ready)
@@ -508,7 +508,7 @@ class _Mc2Program(Mc2ProgramState):
                         engine.submit(
                             f"{name}:{phase_name}:success_finish",
                             after=(sff,),
-                            owner="receive_flag_success",
+                            owner="receive_flag_success", native_hook=True,
                             on_complete=lambda _done: engine.resolve(
                                 done_event))
                     else:
@@ -521,11 +521,11 @@ class _Mc2Program(Mc2ProgramState):
                 engine.submit(
                     f"{name}:{phase_name}:failed{attempt}:compare_done",
                     after=(read_compare,), owner="receive_flag_try",
-                    on_complete=after_compare)
+                    on_complete=after_compare, native_hook=True)
             engine.submit(
                 f"{name}:{phase_name}:failed{attempt}:init_done",
                 after=(init,), owner="receive_flag_try",
-                on_complete=after_init)
+                on_complete=after_init, native_hook=True)
         next_try(phase_ready)
         return done
 
@@ -595,6 +595,7 @@ class _Mc2Program(Mc2ProgramState):
             arrival = engine.submit(
                 f"{name}:{phase.name}:peer{peer}:arrival",
                 latency=float(view.latency_for(klass)), after=(send,),
+                native_hook=placeholder is not None,
                 on_complete=(
                     (lambda _event, promise=placeholder:
                      engine.resolve(promise))
@@ -691,7 +692,7 @@ class _Mc2Program(Mc2ProgramState):
                     arrival = engine.submit(
                         f"{name}:{phase.name}:peer{peer}:arrival",
                         latency=float(view.latency_for(klass)),
-                        after=(send,),
+                        after=(send,), native_hook=placeholder is not None,
                         on_complete=(
                             (lambda _event, _placeholder=placeholder:
                              engine.resolve(_placeholder))

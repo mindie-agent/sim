@@ -45,6 +45,7 @@ PASS_PRIORITY_ORDER: tuple[str, ...] = (
     "gdn_projection_overlap",
     "activation_quant",
     "gmm_swiglu_quant",
+    "tp_mc2_overlap",
 )
 
 
@@ -80,14 +81,41 @@ def _has_quant_activations(model: ModelSpec) -> bool:
             and str(model.quant.activation_format) != str(model.activation_dtype))
 
 
+def _has_quant_moe_activations(model: ModelSpec) -> bool:
+    """True when model activations or routed-expert overrides are quantized."""
+    if _has_quant_activations(model):
+        return True
+    q = model.quant
+    if q is None:
+        return False
+    for category, override in (getattr(q, "category_overrides", ()) or ()):
+        if "routed_expert" not in str(category):
+            continue
+        if isinstance(override, dict):
+            act_fmt = str(override.get("activation_format") or "")
+            if act_fmt and act_fmt != str(model.activation_dtype):
+                return True
+    return False
+
+
 def _apply_mhc_fusion_overlap(rt: dict[str, Any], ctx: MechanismContext) -> None:
-    unbounded = bool(ctx.options.get("unbounded_rows", False))
+    existing_raw = list(rt.get("lowering_passes") or ())
+    unbounded = (
+        bool(ctx.options.get("unbounded_rows", False))
+        or "mhc_boundary_ideal" in existing_raw
+    )
     pass_name = "mhc_boundary_ideal" if unbounded else "mhc_boundary_pr"
-    # Upgrade PR-bounded pass to ideal pass cleanly if both are requested
-    existing = [p for p in (rt.get("lowering_passes") or ())
+    # Upgrade PR-bounded pass to ideal pass cleanly and never downgrade ideal -> PR.
+    existing = [p for p in existing_raw
                 if p not in {"mhc_boundary_pr", "mhc_boundary_ideal"}]
     rt["lowering_passes"] = existing
     _append_passes(rt, pass_name)
+
+
+def _apply_tp_mc2_overlap(rt: dict[str, Any], ctx: MechanismContext) -> None:
+    _update_meta(rt, tp_mc2_overlap=True)
+    if ctx.arch == "a5" and int(ctx.parallel.get("tp", 1) or 1) > 1:
+        _append_passes(rt, "tp_mc2_overlap")
 
 
 def _apply_shared_expert_overlap(rt: dict[str, Any], ctx: MechanismContext) -> None:
@@ -445,7 +473,7 @@ def source_mechanisms() -> tuple[OptimizationMechanism, ...]:
             id="tp_mc2_overlap", category="parallelism", phases=("prefill", "decode"),
             summary="AllGatherMatmulV2 + MatmulReduceScatterV2 overlapping TP collectives with Cube GEMMs",
             eligible=lambda ctx: int(ctx.parallel.get("tp", 1)) > 1,
-            apply=lambda rt, _ctx: _update_meta(rt, tp_mc2_overlap=True),
+            apply=_apply_tp_mc2_overlap,
         ),
         OptimizationMechanism(
             id="step5_qkvg_indexer_fusion", category="attention_fusion",

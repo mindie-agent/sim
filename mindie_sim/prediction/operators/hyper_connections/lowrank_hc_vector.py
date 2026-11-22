@@ -33,14 +33,67 @@ def _is_regbase_capable(geometry: Geometry) -> bool:
     return ub_cap >= REGBASE_UB_MIN_BYTES and "reg_alu_lanes" in units
 
 
+def _build_fused_ub_resident_hc(op: OpSpec, geometry: Geometry, base: Work) -> OperatorPlan:
+    """UB-resident fused low-rank HC plan conserving ``work_from_op`` without strided penalty."""
+    rows = max(1, int(op.local_shape[0]) if op.local_shape else 1)
+    read = float(op.mte2_bytes)
+    write = float(op.mte3_bytes)
+    hbm = float(op.hbm_bytes)
+    vector = float(op.vector_ops)
+    aiv_units = max(1, int((geometry.resource_units or {}).get("vector", 1)))
+    active_aiv = min(aiv_units, rows)
+    share = 1.0 / float(active_aiv)
+    matrix_work = dict(base.matrix)
+
+    def program(context):
+        branches = []
+        if matrix_work:
+            aic_units = max(1, int(getattr(context, "effective_aic_cores", 1) or 1))
+            aic_owned = context.owned(0, 1, ("cube",))
+            aic_owned = {k: v[:aic_units] for k, v in aic_owned.items()}
+            branches.append(KernelProgram((Stage(
+                "hc_ub_cube",
+                context.bind(Work(matrix=matrix_work)),
+                placement=aic_owned,
+            ),)))
+        for aiv_idx in range(aiv_units):
+            if aiv_idx >= active_aiv:
+                branches.append(KernelProgram(()))
+                continue
+            owned = context.owned(aiv_idx, aiv_units, ("mte2_aiv", "vector", "mte3"))
+            res: dict[str, float] = {}
+            if hbm:
+                res["hbm"] = hbm * share
+            if read:
+                res["mte2"] = read * share
+            if vector:
+                res["vector"] = vector * share
+            if write:
+                res["mte3"] = write * share
+            branches.append(KernelProgram((Stage(
+                "hc_ub_body",
+                context.bind(Work(resources=res)),
+                placement=owned,
+            ),)))
+        return ParallelProgram(tuple(branches))
+
+    return OperatorPlan(base, program, {
+        "execution_class": "vector_aiv",
+        "hc_variant": str(op.recipe),
+        "fused_ub_resident": True,
+    })
+
+
 def build_lowrank_hc_vector(op: OpSpec, geometry: Geometry) -> OperatorPlan:
     """Build a strided multi-stream HC vector plan conserving ``work_from_op``."""
     from mindie_sim.prediction.physical_recipe_base import build_plan, work_from_op
     from mindie_sim.prediction.operators.vector.vector_pipeline import AIVTiledVectorAndGatherRecipe
 
+    base = work_from_op(op)
+    if bool(dict(op.metadata).get("fused_ub_resident", False)):
+        return _build_fused_ub_resident_hc(op, geometry, base)
     if not _is_regbase_capable(geometry):
         return build_plan(AIVTiledVectorAndGatherRecipe(), op, geometry)
-    base = work_from_op(op)
     rows = max(1, int(op.local_shape[0]) if op.local_shape else 1)
     read = float(op.mte2_bytes)
     write = float(op.mte3_bytes)

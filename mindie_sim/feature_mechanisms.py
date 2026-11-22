@@ -33,6 +33,7 @@ from mindie_sim.feature_mechanism_catalog import (
     _apply_mhc_fusion_overlap,
     _apply_shared_expert_overlap,
     _has_quant_activations,
+    _has_quant_moe_activations,
     _set_layout_strided,
     _set_lowering,
     source_mechanisms as _source_mechanisms,
@@ -432,14 +433,14 @@ for _item in (
     OptimizationMechanism(
         id="activation_quant_fusion", category="ffn_fusion", phases=("prefill", "decode"),
         summary="Fused SwiGLU/SiTU/GeGLU + dynamic activation quantization kernel",
-        eligible=lambda ctx: _has_quant_activations(ctx.model),
+        eligible=lambda ctx: _has_quant_moe_activations(ctx.model),
         apply=lambda rt, _ctx: _append_passes(rt, "activation_quantization", "activation_quant"),
     ),
     OptimizationMechanism(
         id="gmm_swiglu_quant_fusion", category="ffn_fusion", phases=("prefill", "decode"),
         summary="On-chip AIC->UB GroupedMatmul + SwiGLU/SiTU + Quant eliminating gate_up HBM round-trip",
         eligible=lambda ctx: (any(p.ffn == "moe" for p in ctx.model.layer_plans)
-                              and _has_quant_activations(ctx.model)),
+                              and _has_quant_moe_activations(ctx.model)),
         apply=lambda rt, _ctx: _append_passes(rt, "activation_quantization", "gmm_swiglu_quant"),
     ),
     OptimizationMechanism(

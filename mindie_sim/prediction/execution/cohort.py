@@ -767,7 +767,7 @@ class _CohortMixin(_CohortNativeMixin):
             self.engine.submit(
                 f"group:{key}:native_wait:r{item.replica}",
                 after=(item.ready,), owner="expert_group",
-                on_complete=begin)
+                on_complete=begin, native_hook=True)
         return True
 
     def _start_native_cohort(self, key, participants, programs, *, defer=False):
@@ -799,7 +799,7 @@ class _CohortMixin(_CohortNativeMixin):
             parent = result["parents"][name]
             self.engine.submit(
                 name + ":release", after=(parent,),
-                owner=f"replica:{item.replica}",
+                owner=f"replica:{item.replica}", native_hook=True,
                 on_complete=lambda _event, promise=item.completion:
                 self.engine.resolve(promise))
         self.native_group_joins[key] = result["join"]

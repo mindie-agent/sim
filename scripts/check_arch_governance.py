@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Architecture governance gate (AG001..AG011) for ``mindie_sim``.
+"""Architecture governance gate (AG001..AG012) for ``mindie_sim``.
 
 [Role] Enforce governed ``mindie_sim/prediction/operators/<family>/`` package
   boundaries, forbid flat ISA/CANN filename sprawl under ``mindie_sim/**/*.py``,
@@ -30,6 +30,7 @@ import sys
 from types import MappingProxyType
 
 if __package__:
+    from ._arch_governance_ag012 import check_ag012  # noqa: F401
     from ._arch_governance_runtime import (  # noqa: F401
         DOCSTRING_HEADER_MAX_LINE, FAMILY_PKG_DEPTH, GOVERNED_PATH_DEPTH,
         MAX_FLAT_PREDICTION_MODULES, MAX_ONBOARDING_FILES, MAX_ONBOARDING_LOC,
@@ -40,6 +41,7 @@ if __package__:
         verify_ag007_discrimination, verify_ag011_engine_reachability,
     )
 else:
+    from _arch_governance_ag012 import check_ag012  # noqa: F401
     from _arch_governance_runtime import (  # noqa: F401
         DOCSTRING_HEADER_MAX_LINE, FAMILY_PKG_DEPTH, GOVERNED_PATH_DEPTH,
         MAX_FLAT_PREDICTION_MODULES, MAX_ONBOARDING_FILES, MAX_ONBOARDING_LOC,
@@ -765,7 +767,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         else:
             active = filter_allowlisted(current)
         if args.strict:
-            active += scan_runtime(root)
+            active += scan_runtime(root) + tuple(check_ag012(root))
     except RuntimeError as exc:
         print(str(exc), file=sys.stderr)
         return EXIT_USAGE

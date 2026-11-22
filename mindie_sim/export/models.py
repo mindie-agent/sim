@@ -159,6 +159,23 @@ SUB_MOE_SHARED = "MoE Shared Experts (MSO Stream 1)"
 SUB_DENSE_FFN = "Dense FFN"
 SUB_ENGRAM_PLE = "Engram / PLE Memory"
 SUB_VISION = "Vision / Multimodal Encoder"
+CANONICAL_EXPORT_SUBMODULES = frozenset({
+    SUB_EMBED_TAIL,
+    SUB_ATTN_RES,
+    SUB_MLA_PROLOG,
+    SUB_DSA_LI,
+    SUB_LATENT_ATTN,
+    SUB_GATED_MLA_O,
+    SUB_KDA,
+    SUB_GDN,
+    SUB_STD_ATTN,
+    SUB_MOE_ROUTER,
+    SUB_MOE_ROUTED,
+    SUB_MOE_SHARED,
+    SUB_DENSE_FFN,
+    SUB_ENGRAM_PLE,
+    SUB_VISION,
+})
 
 #: Canonical architectural macro-modules for Sheet 1 Block 3.
 MACRO_MOD_KDA_GDN = "KDA / GDN Linear Attention"

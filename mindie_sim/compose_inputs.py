@@ -32,7 +32,7 @@ from mindie_sim.backends.ascend import (
 )
 from mindie_sim.backends.nvidia import profiles as nvidia_profiles
 from mindie_sim.catalog.specs import build_model_spec
-from mindie_sim.catalog.types import AuxiliarySpec, DraftSpec, QuantSpec, merge_source
+from mindie_sim.catalog.types import AuxiliarySpec, DraftSpec, merge_source
 from mindie_sim.model_catalog import (
     ARCHITECTURE_PRESET_ALIASES,
     ARCHITECTURE_PRESET_CATALOG,
@@ -170,49 +170,6 @@ _QUANT_ALIASES: dict[str, str] = {
 _SUGGESTION_LIMIT = 5
 _SUGGESTION_CUTOFF = 0.35
 
-_EXTRA_QUANT_SPECS: dict[str, QuantSpec] = {
-    "fp16": QuantSpec(
-        name="fp16", weight_format="fp16", activation_format="fp16",
-        expert_weight_format="fp16", kv_dtype="fp16", index_dtype="fp16",
-        index_scale_dtype="none", native_format="fp16",
-    ),
-    "mxfp4": QuantSpec(
-        name="MXFP4", weight_format="mxfp4", activation_format="fp8_e4m3",
-        expert_weight_format="mxfp4",
-        weight_block=(1, MX_EXPERT_BLOCK_GROUP),
-        expert_block=MX_EXPERT_BLOCK_GROUP,
-        scale_format="fp8_e8m0", scale_bytes=1.0,
-        activation_group_size=MX_EXPERT_BLOCK_GROUP,
-        activation_scale_format="fp8_e8m0",
-        activation_scale_pack=MX_SCALE_PACK,
-        kv_dtype="bf16", index_dtype="bf16", index_scale_dtype="none",
-    ),
-    "mxfp4_all": QuantSpec(
-        name="MXFP4", weight_format="mxfp4", activation_format="fp8_e4m3",
-        expert_weight_format="mxfp4",
-        weight_block=(1, MX_EXPERT_BLOCK_GROUP),
-        expert_block=MX_EXPERT_BLOCK_GROUP,
-        scale_format="fp8_e8m0", scale_bytes=1.0,
-        activation_group_size=MX_EXPERT_BLOCK_GROUP,
-        activation_scale_format="fp8_e8m0",
-        activation_scale_pack=MX_SCALE_PACK,
-        kv_dtype="bf16", index_dtype="bf16", index_scale_dtype="none",
-    ),
-    "mxfp4_routed_only": QuantSpec(
-        name="mxfp4_routed_only", weight_format="bf16", activation_format="bf16",
-        expert_weight_format="mxfp4",
-        weight_block=(0, 0),
-        expert_block=MX_EXPERT_BLOCK_GROUP,
-        scale_format="fp8_e8m0", scale_bytes=1.0,
-        kv_dtype="bf16", index_dtype="bf16", index_scale_dtype="none",
-        exclusions=(
-            "attn", "mla", "kda", "shared_expert", "dense_mlp",
-            "router", "lm_head", "embedding", "norm", "mhc",
-            "vision", "projector", "conv_weight_f32",
-        ),
-    ),
-}
-
 
 def _arch_key(sku: str) -> str:
     if sku.startswith(("Ascend950", "Ascend910_95")):
@@ -264,7 +221,7 @@ def _format_model_suggestions(raw: str) -> str:
 
 def _format_quant_suggestions(raw: str) -> str:
     from mindie_sim.catalog.quant import QUANTIZATION_PRESETS
-    pool = sorted(set(QUANTIZATION_PRESETS) | set(_EXTRA_QUANT_SPECS) | set(_QUANT_ALIASES))
+    pool = sorted(set(QUANTIZATION_PRESETS) | set(_QUANT_ALIASES))
     matches = difflib.get_close_matches(
         str(raw).strip().lower(), pool, n=_SUGGESTION_LIMIT, cutoff=_SUGGESTION_CUTOFF,
     ) or ["bf16", "fp16", "w8a8", "w4a8", "mxfp8", "mxfp4", "fp8"]
@@ -399,11 +356,6 @@ def _apply_quant_override(
         )
         if qkey in {"mxfp4", "mxfp4_routed_only"} and native_mxfp4_excluded:
             return model_spec
-        if qkey in _EXTRA_QUANT_SPECS:
-            qspec = _EXTRA_QUANT_SPECS[qkey]
-            return apply_model_overrides(
-                model_spec, {"quant": qspec.to_dict(), "kv_dtype": qspec.kv_dtype},
-            )
         try:
             return apply_model_overrides(model_spec, {"quantization": qkey})
         except (ValueError, ModelingError) as exc:

@@ -28,7 +28,8 @@ from mindie_sim.schema.common import ModelingError
 _NON_LINEAR_EXCLUSION_ROLES = frozenset({
     "lm_head", "embedding", "norm", "router", "indexer_weights", "mtp",
 })
-_REGEX_META_CHARS = frozenset("|()[]?+{}")
+_REGEX_META_CHARS = frozenset("[]?+{}")
+_PARAM_LEAF_SEGMENTS = frozenset({"weight", "bias"})
 
 _ROLE_EXCLUSION_RULES: tuple[tuple[str, tuple[str, ...], frozenset[str]], ...] = (
     ("lm_head", ("lm_head", "shared_head.head"), frozenset({"lm_head", "shared_head", "head"})),
@@ -72,6 +73,22 @@ _ROLE_EXCLUSION_RULES: tuple[tuple[str, tuple[str, ...], frozenset[str]], ...] =
     ),
     ("attention", ("self_attn", "attention"), frozenset({"self_attn", "attention"})),
     (
+        "dense_mlp",
+        (
+            "mlp.gate_proj", "mlp.up_proj", "mlp.gate_up_proj", "mlp.down_proj",
+            "dense_mlp",
+        ),
+        frozenset({"mlp", "gate_proj", "up_proj", "gate_up_proj", "down_proj", "dense_mlp"}),
+    ),
+    (
+        "gdn",
+        ("linear_attn",),
+        frozenset({
+            "linear_attn", "in_proj_qkv", "in_proj_qkvz", "in_proj_z",
+            "in_proj_ba", "out_proj", "conv1d",
+        }),
+    ),
+    (
         "shared_expert",
         ("shared_experts", "shared_expert"),
         frozenset({"mlp", "shared_experts", "shared_expert"}),
@@ -84,18 +101,28 @@ _ROLE_EXCLUSION_RULES: tuple[tuple[str, tuple[str, ...], frozenset[str]], ...] =
 )
 
 
-def _classify_exclusion_pattern(pattern: str) -> str | None:
-    raw = str(pattern).strip()
-    if not raw or any(ch in raw for ch in _REGEX_META_CHARS):
+def _expand_simple_alternation(text: str) -> tuple[str, ...] | None:
+    """Expand at most one simple ``(a|b|...)`` regex alternation group cleanly."""
+    if "(" not in text and ")" not in text and "|" not in text:
+        return (text,)
+    open_idx = text.find("(")
+    close_idx = text.find(")", open_idx + 1) if open_idx >= 0 else -1
+    if open_idx < 0 or close_idx < 0:
         return None
-    cleaned = raw[3:] if raw.startswith("re:") else raw
-    lower = cleaned.lower().replace("\\.", ".")
-    if "\\" in lower:
+    prefix, body, suffix = text[:open_idx], text[open_idx + 1:close_idx], text[close_idx + 1:]
+    if any(ch in prefix or ch in suffix for ch in "()|") or "(" in body or ")" in body:
         return None
+    parts = [part.strip() for part in body.split("|") if part.strip()]
+    return tuple(f"{prefix}{part}{suffix}" for part in parts) if parts else None
+
+
+def _classify_plain_exclusion(lower: str) -> str | None:
     segments = [
         seg for seg in lower.strip("^$").replace("*", ".").split(".")
         if seg and seg not in {"model", "layers"} and not seg.isdigit()
     ]
+    if len(segments) > 1 and segments[-1] in _PARAM_LEAF_SEGMENTS:
+        segments = segments[:-1]
     if not segments:
         return None
     joined = ".".join(segments)
@@ -107,6 +134,24 @@ def _classify_exclusion_pattern(pattern: str) -> str | None:
         ):
             matched.append(role)
     return matched[0] if len(matched) == 1 else None
+
+
+def _classify_exclusion_pattern(pattern: str) -> str | None:
+    raw = str(pattern).strip()
+    if not raw or any(ch in raw for ch in _REGEX_META_CHARS):
+        return None
+    is_regex = raw.startswith("re:")
+    cleaned = raw[3:] if is_regex else raw
+    lower = cleaned.lower().replace("\\.", ".")
+    if "\\" in lower:
+        return None
+    if not is_regex and any(ch in lower for ch in "()|"):
+        return None
+    variants = _expand_simple_alternation(lower) if is_regex else (lower,)
+    if not variants:
+        return None
+    roles = {_classify_plain_exclusion(variant) for variant in variants}
+    return next(iter(roles)) if len(roles) == 1 else None
 
 
 def resolve_role_exclusions(

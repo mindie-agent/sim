@@ -42,7 +42,6 @@ from mindie_sim.compose_inputs import (
     DERIVED_ASCEND_SKUS,
     HARDWARE_ALIASES,
     HARDWARE_TOPOLOGY_ALIASES,
-    _EXTRA_QUANT_SPECS,
     _apply_quant_override,
     _apply_structural_overrides,
     _arch_key,

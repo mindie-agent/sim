@@ -328,7 +328,12 @@ def _group(fields: Mapping, ctx: OperatorPlanningContext) -> tuple[Mapping, tupl
     ranks = tuple(group.get("ranks", fields.get("ranks", ())))
     rank = fields.get("rank", ctx.occurrence.rank)
     world = max(1, _integer(world, "world_size")) if world is not None else None
-    ranks = ranks or (tuple(range(world)) if world and world > 1 else (0 if rank is None else rank,))
+    if not ranks:
+        if world and world > 1:
+            base = (int(rank) // world) * world if rank is not None and int(rank) >= 0 else 0
+            ranks = tuple(range(base, base + world))
+        else:
+            ranks = (0 if rank is None else rank,)
     for member in ranks:
         _integer(member, "group_rank")
     if len(set(ranks)) != len(ranks) or (world is not None and len(ranks) != world):
@@ -724,11 +729,14 @@ def _chunked_stages(contract: Mc2Contract, transport: Transport, *,
             names = ag_names
         b_bytes = contract.k * contract.n * dtype_bytes(contract.dtype) if rows else 0
         if gathering:
+            local_rows_chunk = rows // world
+            remote = rows - local_rows_chunk
+            b_local = (b_bytes * local_rows_chunk / rows) if rows else 0
+            b_remote = b_bytes - b_local
             local = f"local_gemm_{suffix}"
-            phases.append(_matrix_fragment(contract, local, (), rows // world, b_bytes=b_bytes, slot=tag))
-            remote = rows - rows // world
+            phases.append(_matrix_fragment(contract, local, (), local_rows_chunk, b_bytes=b_local, slot=tag))
             fragments[events.read_done[0]] = _matrix_fragment(
-                contract, gemm, (events.publish,), remote, b_bytes=b_bytes if remote else 0, slot=tag)
+                contract, gemm, (events.publish,), remote, b_bytes=b_remote if remote else 0, slot=tag)
             fragments[events.write] = Phase(comm, (events.credit, *names),
                                             Work(resources={"hbm": wire_window, "l2": wire_window}), metadata=tag)
         else:

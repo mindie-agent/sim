@@ -148,6 +148,8 @@ def classify_submodule(
         return SUB_GATED_MLA_O
     if _is_linear_attn_op(suffix, fam, rec, attn):
         return SUB_GDN if _is_gdn_op(suffix, fam, rec, attn) else SUB_KDA
+    if "megamoe" in rec or "dispatch_ffn_combine" in rec:
+        return SUB_MOE_ROUTED
     if _is_moe_router_dispatch_op(suffix, fam, rec):
         return SUB_MOE_ROUTER
     if _is_moe_routed_op(suffix, fam, rec):
@@ -182,6 +184,9 @@ def classify_macro_module(op: OperatorExportRow) -> str:
     suffix = strip_op_prefix(op.op_id).lower()
     fam = str(op.family or "").strip().lower()
     rec = str(op.recipe or "").strip().lower()
+    kern_l = str(op.ascend_kernel or "").strip().lower()
+    if "megamoe" in rec or "megamoe" in kern_l or "dispatch_ffn_combine" in kern_l or "dispatch_ffn_combine" in rec:
+        return MACRO_MOD_MOE_ROUTED
     is_moe_ep_comm = sub in {SUB_MOE_ROUTER, SUB_MOE_ROUTED} and (
         suffix in {"dispatch", "unpack", "combine"}
         or "dispatch" in rec
@@ -577,6 +582,12 @@ def resolve_ascend_kernel_identity(
     is_quant_mm = str(meta.get("activation_format") or "").lower() in {"int8", "fp8", "fp8_e4m3", "fp8_e5m2"}
     is_mxfp4_w = str(meta.get("weight_format") or "").lower() in {"mxfp4", "mx_fp4", "fp4", "fp4_e2m1"}
     struct_nat = _extract_native_candidate(struct_node)
+    reg_spec = None
+    if not isinstance(struct_node, Mapping) or not struct_nat:
+        from mindie_sim.structure_implementations import _lookup_registry_spec
+        reg_spec = _lookup_registry_spec(fam, rec)
+    if not struct_nat and reg_spec is not None and reg_spec.native_kinds:
+        struct_nat = str(reg_spec.native_kinds[0])
     nat_kind = struct_nat or _native_kernel_from_structure(op_id, spec, shape, dtype)
     contract_txt = _format_tensor_contract(op_id, fam, rec, shape, dtype, meta, case, layer_plan)
 
@@ -587,7 +598,13 @@ def resolve_ascend_kernel_identity(
         layer_plan=layer_plan,
     )
     if isinstance(struct_node, Mapping):
-        if struct_nat and not needs_new and not (is_raw_eager and (fam == "rmsnorm" or suffix == "linear_output_norm_gate")):
+        preserve_qualified = bool(struct_nat) and kernel.startswith(f"{struct_nat} (")
+        if (
+            struct_nat
+            and not needs_new
+            and not preserve_qualified
+            and not (is_raw_eager and (fam == "rmsnorm" or suffix == "linear_output_norm_gate"))
+        ):
             kernel = "aclnnLayerNorm_LayerNormV3" if (fam == "layernorm" and struct_nat in {"aclnnLayerNorm", "LayerNormV3"}) else struct_nat
         raw_backend = str(struct_node.get("backend_stack") or "").strip().lower()
         if raw_backend in STRUCTURE_BACKEND_MAP:
@@ -601,6 +618,11 @@ def resolve_ascend_kernel_identity(
         struct_src = str(struct_node.get("source_ref") or "").strip()
         if struct_src:
             def_src = struct_src
+    elif reg_spec is not None:
+        if reg_spec.backend_stack in STRUCTURE_BACKEND_MAP and not needs_new:
+            backend = STRUCTURE_BACKEND_MAP[reg_spec.backend_stack]
+        if reg_spec.source_ref and not def_src:
+            def_src = reg_spec.source_ref
     if isinstance(subgraph_info, Mapping):
         f_status = str(subgraph_info.get("fusion_status") or "").strip().lower()
         if f_status == "fused_new_kernel_required" and not needs_new:
@@ -670,15 +692,18 @@ def _classify_kernel_tuple(
             "Fused block residual norm+projection+softmax+weighted sum across block history",
             suffix,
         )
-    if fam == "mhc" or ".hc_" in f".{suffix}":
+    if fam in {"all_gather_matmul", "matmul_reduce_scatter"}:
+        is_ag = fam == "all_gather_matmul"
         return (
-            f"mHC Hyper-Connection ({suffix})",
-            "mhc_sinkhorn_mix_kernel" if "sinkhorn" in suffix or "mix" in suffix else ("MatMulV2" if fam == "gemm" else "Cast / RmsNorm"),
-            BACKEND_TRITON if fam == "mhc" else BACKEND_CANN,
-            KERNEL_STATUS_FRAMEWORK if fam == "mhc" else KERNEL_STATUS_EXISTING,
-            "vllm-ascend/vllm_ascend/ops/mhc.py",
-            False, "", suffix,
+            f"Fused MC2 {'AllGather + MatMul' if is_ag else 'MatMul + ReduceScatter'} ({suffix})",
+            "aclnnAllGatherMatmulV2" if is_ag else "aclnnMatmulReduceScatterV2",
+            BACKEND_HCCL_MC2,
+            KERNEL_STATUS_FRAMEWORK,
+            "vllm-ascend/vllm_ascend/compilation/passes/mm_reduce_scatter_fusion_pass.py",
+            False, "", fam,
         )
+    if fam == "mhc" or ".hc_" in f".{suffix}":
+        return _classify_mhc_tuple(suffix, fam, rec, mm_kernel, layer_plan, is_ideal=is_ideal)
     if any(tok in suffix or tok in fam or tok in rec for tok in ("engram", "ple_")):
         return _classify_engram_ple_tuple(suffix, fam, rec, mm_kernel)
     if fam in {"rmsnorm", "add_rmsnorm", "add_rmsnorm_quant", "rmsnorm_quant", "layernorm", "quantize"}:
@@ -710,7 +735,10 @@ def _classify_kernel_tuple(
     if _is_dsa_indexer_op(suffix, fam, rec):
         return _classify_indexer_tuple(suffix, fam, rec, mm_kernel, layer_plan)
     if _is_linear_attn_op(suffix, fam, rec, "kda" if "kda" in rec else ""):
-        return _classify_linear_attn_tuple(suffix, fam, rec, meta, is_ideal, mm_kernel, is_raw_eager=is_raw_eager)
+        return _classify_linear_attn_tuple(
+            suffix, fam, rec, meta, is_ideal, mm_kernel,
+            is_raw_eager=is_raw_eager, layer_plan=layer_plan,
+        )
     if _is_moe_router_dispatch_op(suffix, fam, rec) or _is_moe_routed_op(suffix, fam, rec) or _is_shared_expert_op(suffix, rec):
         return _classify_moe_tuple(suffix, fam, rec, meta, nat_kind, is_ideal, is_quant_mm, is_mxfp4_w, mm_kernel)
     if fam in COLLECTIVE_FAMILIES:
@@ -958,9 +986,54 @@ def _classify_indexer_tuple(
     return (f"DSA Indexer Aux ({suffix})", "TensorMove / GatherV2", BACKEND_CANN, KERNEL_STATUS_EXISTING, src, False, "", suffix)
 
 
+def _classify_mhc_tuple(
+    suffix: str, fam: str, rec: str, mm_kernel: str, layer_plan: Any | None, *, is_ideal: bool,
+) -> tuple[str, str, str, str, str, bool, str, str]:
+    hc_lowrank = int(getattr(layer_plan, "hc_lowrank", 0) or 0) if layer_plan is not None else 0
+    hc_sinkhorn = int(getattr(layer_plan, "hc_sinkhorn_iters", 0) or 0) if layer_plan is not None else 0
+    is_lowrank = (
+        (hc_lowrank > 0 and hc_sinkhorn == 0)
+        or rec in {"hc_gate_mix", "hc_combine", "hc_combine_rmsnorm", "hc_silu", "hc_lowrank_down_inject", "hc_lowrank_up"}
+    )
+    src = (
+        "vllm-ascend/vllm_ascend/models/qwen4_exp/hyper_connection.py"
+        if is_lowrank else "vllm-ascend/vllm_ascend/ops/mhc.py"
+    )
+    if rec == "hc_silu" or suffix.endswith("hc_silu"):
+        return (f"mHC Low-Rank SiLU ({suffix})", "Silu", BACKEND_CANN, KERNEL_STATUS_EXISTING, src, False, "", suffix)
+    if fam == "rmsnorm" or rec == "grouped_gemma_rmsnorm" or suffix.endswith("hc_norm"):
+        return (f"mHC Grouped RMSNorm ({suffix})", "RmsNorm", BACKEND_CANN, KERNEL_STATUS_EXISTING, src, False, "", suffix)
+    if fam == "gemm" or rec in {"hc_lowrank_down_inject", "hc_lowrank_up", "hc_projection", "hc_coefficients_fused"}:
+        return (f"mHC Hyper-Connection Projection ({suffix})", mm_kernel, BACKEND_CANN, KERNEL_STATUS_EXISTING, src, False, "", suffix)
+    if rec in {"hc_combine", "hc_combine_rmsnorm"} or suffix.endswith("hc_post"):
+        kern = "Qwen4ExpHcCombine" if is_lowrank else "mhc_post_combine"
+        return (
+            f"mHC Post Combine ({suffix})", kern, BACKEND_CANN if is_lowrank else BACKEND_TRITON,
+            KERNEL_STATUS_NEW_OP if (is_lowrank and is_ideal) else KERNEL_STATUS_FRAMEWORK,
+            src, bool(is_lowrank and is_ideal),
+            "UB-resident fused Qwen4ExpHcCombine eliminating strided HBM round-trips" if (is_lowrank and is_ideal) else "",
+            suffix,
+        )
+    if is_lowrank:
+        return (
+            f"mHC Low-Rank Gated Residual Mix ({suffix})", "Qwen4ExpGatedResidualMix", BACKEND_CANN,
+            KERNEL_STATUS_NEW_OP if is_ideal else KERNEL_STATUS_FRAMEWORK,
+            src, bool(is_ideal),
+            "UB-resident fused Qwen4ExpGatedResidualMix (Norm+Down+SiLU+Up+Mix)" if is_ideal else "",
+            suffix,
+        )
+    kern = "mhc_sinkhorn_mix_kernel" if ("sinkhorn" in suffix or "mix" in suffix) else "HcPre"
+    return (
+        f"mHC Hyper-Connection ({suffix})", kern,
+        BACKEND_TRITON if fam == "mhc" else BACKEND_CANN,
+        KERNEL_STATUS_FRAMEWORK if fam == "mhc" else KERNEL_STATUS_EXISTING,
+        src, False, "", suffix,
+    )
+
+
 def _classify_linear_attn_tuple(
     suffix: str, fam: str, rec: str, meta: Mapping[str, Any], is_ideal: bool, mm_kernel: str,
-    *, is_raw_eager: bool = False,
+    *, is_raw_eager: bool = False, layer_plan: Any | None = None,
 ) -> tuple[str, str, str, str, str, bool, str, str]:
     kda_src = "vllm/vllm/third_party/flash_linear_attention/ops/kda.py"
     if suffix.startswith("recurrent_scan") or "recurrent_kda" in rec:
@@ -1033,18 +1106,27 @@ def _classify_linear_attn_tuple(
     if fam in {"reduce_scatter", "allgather", "allreduce"}:
         return _classify_collective_tuple(suffix, fam, rec)
     if fam in {"gemm", "projection"} or suffix.startswith("linear_"):
+        is_gdn_proj = (
+            suffix in {"linear_qkvz", "linear_beta_alpha"}
+            or "gdn" in rec
+            or (layer_plan is not None and str(getattr(layer_plan, "attention", "")).lower() == "gdn")
+        )
         lin_roles = {
             "linear_qkvbfg_a": "KDA Fused Q/K/V/Beta/Decay-A/Gate Projection",
             "linear_decay_b": "KDA Low-Rank Decay-B Projection",
             "linear_gate_b": "KDA Low-Rank Gate-B Projection",
-            "linear_output": "KDA Output Projection (O-Proj)",
+            "linear_output": "GDN Output Projection (O-Proj)" if is_gdn_proj else "KDA Output Projection (O-Proj)",
             "linear_qkvz": "GDN Fused QKVZ Projection",
             "linear_beta_alpha": "GDN Beta/Alpha Gate Projection",
         }
+        proj_src = (
+            "vllm-ascend/vllm_ascend/ops/gdn.py"
+            if is_gdn_proj else "vllm-ascend/vllm_ascend/models/kimi_k3/kda.py"
+        )
         return (
             lin_roles.get(suffix, f"Linear Attention Projection ({suffix})"),
             mm_kernel, BACKEND_CANN, KERNEL_STATUS_EXISTING,
-            "vllm-ascend/vllm_ascend/models/kimi_k3/kda.py", False, "", suffix,
+            proj_src, False, "", suffix,
         )
     return (
         f"Linear Attention Layout / Copy ({suffix})", "TensorMove / Slice", BACKEND_CANN,
@@ -1070,13 +1152,7 @@ def _classify_moe_tuple(
         return (role, mm_kernel, BACKEND_CANN, KERNEL_STATUS_EXISTING, moe_src, False, "", suffix)
     if suffix == "latent_norm":
         return ("MoE Routed Latent RMSNorm", "RmsNorm", BACKEND_CANN, KERNEL_STATUS_EXISTING, moe_src, False, "", "latent_norm")
-    if suffix == "dispatch" or "dispatch" in rec:
-        kern = nat_kind if (nat_kind and "Dispatch" in nat_kind) else "MoeDistributeDispatchV2"
-        return ("MoE EP Token Distribute Dispatch (MC2)", kern, BACKEND_HCCL_MC2, KERNEL_STATUS_EXISTING, moe_src, False, "", "dispatch")
-    if suffix in {"unpack", "combine"} or "combine" in rec:
-        kern = nat_kind if (nat_kind and "Combine" in nat_kind) else "MoeDistributeCombineV2"
-        return ("MoE EP Token Distribute Combine (MC2)", kern, BACKEND_HCCL_MC2, KERNEL_STATUS_EXISTING, moe_src, False, "", "unpack")
-    if "megamoe" in rec:
+    if "megamoe" in rec or "dispatch_ffn_combine" in rec:
         return (
             "Fused MegaMoE (Dispatch + GMM1 + Act + GMM2 + Combine)",
             "dispatch_ffn_combine (MegaMoE)", BACKEND_CANN,
@@ -1085,6 +1161,12 @@ def _classify_moe_tuple(
             "Fused MegaMoE dispatch_ffn_combine supporting packed MXFP4 uint8 + K3 SiTU + compact tiling",
             "megamoe_arch35",
         )
+    if suffix == "dispatch" or "dispatch" in rec:
+        kern = nat_kind if (nat_kind and "Dispatch" in nat_kind) else "MoeDistributeDispatchV2"
+        return ("MoE EP Token Distribute Dispatch (MC2)", kern, BACKEND_HCCL_MC2, KERNEL_STATUS_EXISTING, moe_src, False, "", "dispatch")
+    if suffix in {"unpack", "combine"} or "combine" in rec:
+        kern = nat_kind if (nat_kind and "Combine" in nat_kind) else "MoeDistributeCombineV2"
+        return ("MoE EP Token Distribute Combine (MC2)", kern, BACKEND_HCCL_MC2, KERNEL_STATUS_EXISTING, moe_src, False, "", "unpack")
     if suffix in {"expert_up", "expert_down"} or fam == "grouped_gemm":
         is_up = suffix == "expert_up" or "gate_up" in rec
         q_tag = "MXFP4" if is_mxfp4_w else ("W8A8" if is_quant_mm else "BF16")

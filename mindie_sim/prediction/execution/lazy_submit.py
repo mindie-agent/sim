@@ -476,18 +476,19 @@ class _LazySubmitMixin:
                         engine.resolve(comp)
                         completed(_i)
 
-                    engine.on_complete(finish, done_cb)
+                    engine.on_complete(finish, done_cb, native_hook=True)
 
                 if compact_exec and pending_evs is None:
                     pending_evs = [
                         ev for ev in begin_after if ev.time is None or ev.time > now]
                 if pending_evs is not None and len(pending_evs) == 1:
                     ready_marker = pending_evs[0]
-                    engine.on_complete(ready_marker, async_begin)
+                    engine.on_complete(ready_marker, async_begin, native_hook=True)
                 else:
                     ready_marker = engine.submit(
                         name + ":begin" if observer is None else name + ":ready",
-                        after=begin_after, owner=owner, on_complete=async_begin)
+                        after=begin_after, owner=owner, on_complete=async_begin,
+                        native_hook=True)
                 streams[stream_key] = complete
                 op_events[idx] = complete
                 recipes_used[recipe_name] = recipes_used.get(recipe_name, 0) + 1

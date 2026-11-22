@@ -583,11 +583,13 @@ def expand_dedup_graph_artifacts(
     execution: Any,
     records: list[dict[str, Any]],
     graphs: Mapping[int, tuple[Any, ...]],
-) -> None:
+    *,
+    timeline_replicas: frozenset[int] | None = None,
+) -> int:
     """Reconstruct peer-replica timeline records and conserved resource counters."""
     dedup_meta = getattr(execution, "_dedup_cohorts", None)
     if not dedup_meta:
-        return
+        return 0
     engine = execution.engine
     topology = execution.topology
     pp = max(1, int(execution.case.runtime.parallel.pp))
@@ -595,6 +597,7 @@ def expand_dedup_graph_artifacts(
     for rec in records:
         r0_records_by_rep.setdefault(rec["replica"], []).append(rec)
     new_records: list[dict[str, Any]] = []
+    skipped_occurrences = 0
     for entry in dedup_meta:
         r0 = entry["canonical"]
         peers = entry["peers"]
@@ -605,8 +608,12 @@ def expand_dedup_graph_artifacts(
         base_recs = r0_records_by_rep.get(r0, ())
         if not base_recs:
             continue
+        base_non_barrier = sum(rec["op"].family != "barrier" for rec in base_recs)
         r0_prefix = f"r{r0}:"
         for rep in peers:
+            if timeline_replicas is not None and rep not in timeline_replicas:
+                skipped_occurrences += base_non_barrier
+                continue
             rep_ops = {op.op_id: op for op in graphs.get(rep, ())}
             rep_prefix = f"r{rep}:"
             for rec in base_recs:
@@ -625,3 +632,4 @@ def expand_dedup_graph_artifacts(
                 })
     if new_records:
         records.extend(new_records)
+    return skipped_occurrences

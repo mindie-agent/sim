@@ -547,9 +547,9 @@ def _dispatch_catalog(args: argparse.Namespace) -> object:
         out["presets"] = {name: dict(cfg) for name, cfg in sorted(ASCEND_TOPOLOGY_PRESETS.items())}
     if want_quant:
         from .catalog.quant import QUANTIZATION_PRESETS
-        from .compose_inputs import _EXTRA_QUANT_SPECS, _QUANT_ALIASES
+        from .compose_inputs import _QUANT_ALIASES
         out["quant"] = {
-            "presets": sorted(set(QUANTIZATION_PRESETS) | set(_EXTRA_QUANT_SPECS)),
+            "presets": sorted(QUANTIZATION_PRESETS),
             "aliases": dict(sorted(_QUANT_ALIASES.items())),
             "cache_dtypes": ["bf16", "fp16", "fp8_e4m3", "fp8", "int8", "c8"],
         }

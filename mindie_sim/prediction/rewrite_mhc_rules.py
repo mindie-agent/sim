@@ -34,6 +34,7 @@ from .implementations import (
 )
 
 MHC_DEFAULT_CUTOFF_ROWS = 72
+LOWRANK_HC_DEFAULT_MULT = 4
 NO_PORTS: dict = {}
 COEFFICIENT_FUSION_RECIPE = "hc_coefficients_fused"
 COEFFICIENT_FUSION_DTYPE = "fp32"
@@ -218,7 +219,7 @@ def mhc_boundary_fusion_overlap(ops, source_dtype, *, max_rows=0,
                         removed.add(item.op_id)
                         aliases[item.op_id] = sinkhorn.op_id
 
-        # Branch B: Qwen4Exp LowRankHyperConnection (PR #20824 + boundary norm fusion)
+        # Branch B: Qwen4Exp LowRankHyperConnection (PR #20824 + UB-resident ideal fusion)
         elif op.recipe == "hc_gate_mix" and len(op.deps) == 2:
             norm_id, up_id = op.deps[0], op.deps[1]
             hc_norm = by_id.get(norm_id)
@@ -226,6 +227,13 @@ def mhc_boundary_fusion_overlap(ops, source_dtype, *, max_rows=0,
             hc_silu = by_id.get(hc_up.deps[0]) if hc_up and hc_up.deps else None
             hc_down = by_id.get(hc_silu.deps[0]) if hc_silu and hc_silu.deps else None
             if None in (hc_norm, hc_up, hc_silu, hc_down):
+                continue
+            if (max_rows == 0
+                    and _try_fuse_lowrank_hc_ideal(
+                        op, hc_norm, hc_down, hc_silu, hc_up,
+                        by_id=by_id, users=users,
+                        replacements=replacements, removed=removed, aliases=aliases,
+                    )):
                 continue
             aux_stream = "mhc_aux" if captured else (op.stream or "")
             stream_rewrites[hc_silu.op_id] = aux_stream
@@ -241,30 +249,6 @@ def mhc_boundary_fusion_overlap(ops, source_dtype, *, max_rows=0,
                     ("mhc_lowrank_injection_producer", hc_up.op_id),
                 )),
             )
-            # In expected_ideal (max_rows == 0), fuse preceding hc_combine + grouped_gemma_rmsnorm
-            prev_comb = by_id.get(hc_norm.deps[0]) if len(hc_norm.deps) == 1 else None
-            if (max_rows == 0 and prev_comb is not None and prev_comb.recipe == "hc_combine"
-                    and prev_comb.stage == hc_norm.stage and prev_comb.op_id not in removed):
-                base_comb = replacements.get(prev_comb.op_id, prev_comb)
-                gamma_b = max(0.0, float(hc_norm.mte2_bytes) - float(base_comb.mte3_bytes))
-                f_read = float(base_comb.mte2_bytes) + gamma_b
-                f_write = float(base_comb.mte3_bytes) + float(hc_norm.mte3_bytes)
-                replacements[hc_norm.op_id] = replace(
-                    hc_norm,
-                    deps=base_comb.deps,
-                    family="mhc",
-                    recipe="hc_combine_rmsnorm",
-                    vector_ops=float(base_comb.vector_ops) + float(hc_norm.vector_ops),
-                    mte2_bytes=f_read,
-                    mte3_bytes=f_write,
-                    hbm_bytes=f_read + f_write,
-                    metadata=merge_meta(base_comb, hc_norm, extra=(
-                        ("fused_from", ("hc_combine", "grouped_gemma_rmsnorm")),
-                    )),
-                )
-                replacements.pop(prev_comb.op_id, None)
-                removed.add(prev_comb.op_id)
-                aliases[prev_comb.op_id] = hc_norm.op_id
 
     if not replacements and not stream_rewrites:
         return list(ops)
@@ -281,6 +265,76 @@ def mhc_boundary_fusion_overlap(ops, source_dtype, *, max_rows=0,
         updated, replacements=replacements, aliases=full_aliases,
         removed=removed, ports=NO_PORTS,
     )
+
+
+def _merge_matrix_flops(left, right):
+    totals: dict[str, float] = {}
+    for entries in (left, right):
+        for dtype, amount in (entries or ()):
+            totals[str(dtype)] = totals.get(str(dtype), 0.0) + float(amount)
+    return tuple(totals.items())
+
+
+def _try_fuse_lowrank_hc_ideal(
+    op, hc_norm, hc_down, hc_silu, hc_up, *,
+    by_id, users, replacements, removed, aliases,
+) -> bool:
+    """Collapse 5-op low-rank mHC pre-sublayer chain into UB-resident Qwen4ExpGatedResidualMix."""
+    chain = (hc_norm, hc_down, hc_silu, hc_up, op)
+    if any(item.plan_required or item.op_id in removed for item in chain):
+        return False
+    if not (set(users[hc_norm.op_id]) <= {hc_down.op_id, op.op_id}
+            and users[hc_silu.op_id] == [hc_up.op_id]
+            and users[hc_up.op_id] == [op.op_id]):
+        return False
+    down_weight_read = max(0.0, float(hc_down.mte2_bytes) - float(hc_norm.mte3_bytes))
+    up_weight_read = max(0.0, float(hc_up.mte2_bytes) - float(hc_silu.mte3_bytes))
+    fused_read = float(hc_norm.mte2_bytes) + down_weight_read + up_weight_read
+    rows = int(op.local_shape[0]) if op.local_shape else 0
+    hc_mult = int(dict(hc_down.metadata).get("hc_mult", LOWRANK_HC_DEFAULT_MULT) or LOWRANK_HC_DEFAULT_MULT)
+    gate_slice_bytes = min(
+        float(hc_down.mte3_bytes),
+        float(rows * hc_mult) * dtype_bytes(op.dtype or "bf16"),
+    )
+    fused_write = float(op.mte3_bytes) + gate_slice_bytes
+    fused_flops = float(hc_down.flops) + float(hc_up.flops)
+    fused_matrix = _merge_matrix_flops(hc_down.matrix_flops, hc_up.matrix_flops)
+    fused_vec = float(hc_norm.vector_ops) + float(hc_silu.vector_ops) + float(op.vector_ops)
+    replacements[op.op_id] = replace(
+        op,
+        deps=hc_norm.deps,
+        flops=fused_flops,
+        matrix_flops=fused_matrix,
+        vector_ops=fused_vec,
+        mte2_bytes=fused_read,
+        mte3_bytes=fused_write,
+        hbm_bytes=fused_read + fused_write,
+        metadata=merge_meta(*chain, extra=(
+            ("fused_from", (
+                "grouped_gemma_rmsnorm", "hc_lowrank_down_inject",
+                "hc_silu", "hc_lowrank_up", "hc_gate_mix",
+            )),
+            ("absorbed_source_ops", tuple(item.op_id for item in chain)),
+            ("fused_ub_resident", True),
+            ("mhc_lowrank_fused_pre", True),
+        )),
+    )
+    for item in (hc_norm, hc_down, hc_silu, hc_up):
+        removed.add(item.op_id)
+        aliases[item.op_id] = op.op_id
+    for user_id in users[hc_down.op_id]:
+        post_op = by_id.get(user_id)
+        if (post_op is not None and post_op.recipe == "hc_combine"
+                and not post_op.plan_required and post_op.op_id not in removed):
+            base_post = replacements.get(post_op.op_id, post_op)
+            replacements[post_op.op_id] = replace(
+                base_post,
+                metadata=merge_meta(base_post, extra=(
+                    ("fused_ub_resident", True),
+                    ("mhc_lowrank_fused_post", True),
+                )),
+            )
+    return True
 
 
 def _qkv_declared_view(members, key):

@@ -352,6 +352,8 @@ class RecipeBook:
             **implementation_recipes(raw.get("lowerings", {})),
             **kda_recurrent_recipes(),
             "attn_res_fwd": hyper_connections.GovernedAttnResRecipe(hyper_connections.build),
+            "mc2_all_gather_matmul": PlannedRecipe(mc2.build),
+            "mc2_matmul_reduce_scatter": PlannedRecipe(mc2.build),
             **declared_recipes,
         }
         book = cls(

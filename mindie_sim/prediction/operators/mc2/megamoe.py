@@ -39,8 +39,9 @@ NATIVE_KIND = "aclnnMegaMoe"
 SUPPORTED_ACTIVATIONS = frozenset({
     "swiglu", "swigluoai", "situglu", "situ", "silu", "gelu", "gelu_tanh", "geglu",
 })
+FUSED_MC2_ROUTED_MODE = 2
 FUSED_MC2_SHARED_MODE = 3
-SUPPORTED_FUSED_MC2_MODES = frozenset({0, 2, FUSED_MC2_SHARED_MODE})
+SUPPORTED_FUSED_MC2_MODES = frozenset({0, FUSED_MC2_ROUTED_MODE, FUSED_MC2_SHARED_MODE})
 
 CANN_MEGAMOE_SOURCE = {
     "repository": "cann_ops_transformer",
@@ -161,6 +162,23 @@ def make_op(
         if sh_inter > 0 else 0.0
     )
     total_flops = routed_flops + shared_flops
+    out_elem = float(dtype_bytes(output_dtype))
+    in_aiv_bytes = float(tok * (width * out_elem + k_sel * (FP32_BYTES + INT32_BYTES)))
+    out_aiv_bytes = float(tok * width * out_elem)
+    sh_w13_b = float(shared_w13_bytes) if sh_inter > 0 else 0.0
+    sh_w2_b = float(shared_w2_bytes) if sh_inter > 0 else 0.0
+    mte2_b = in_aiv_bytes + float(w13_bytes) + float(w2_bytes) + sh_w13_b + sh_w2_b
+    mte3_b = out_aiv_bytes
+    hbm_b = mte2_b + mte3_b
+    link_b = (
+        float(dispatch_link_bytes) + float(combine_link_bytes)
+        if (mc2_mode >= FUSED_MC2_ROUTED_MODE and int(ep) > 1) else 0.0
+    )
+    vec_ops = (
+        float(tok * width * MX_QUANT_OPS_PER_ELEM)
+        + (r_rows * inter + (tok * sh_inter if sh_inter > 0 else 0.0)) * _activation_ops(act)
+        + float(tok * width * (k_sel * COMBINE_REDUCE_OPS_PER_ELEM + (1 if sh_inter > 0 else 0)))
+    )
     spec_meta = {
         "native_kind": NATIVE_KIND,
         "input_format": output_dtype,
@@ -197,6 +215,8 @@ def make_op(
         semantic_shape=shape, local_shape=shape, padded_shape=shape, launch_shape=shape,
         dtype=output_dtype, flops=total_flops,
         matrix_flops=((compute_dtype, total_flops),) if total_flops > 0 else (),
+        vector_ops=vec_ops, hbm_bytes=hbm_b, mte2_bytes=mte2_b, mte3_bytes=mte3_b,
+        link_bytes=link_b,
         source_boundary="kernel",
         metadata=tuple(sorted(spec_meta.items())),
     )

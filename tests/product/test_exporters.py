@@ -70,6 +70,7 @@ NS_PREFIX = f"{{{NS_MAIN}}}"
 STREAM_MEMORY_LIMIT_BYTES = 64 * 1024 * 1024
 MAX_SERIALIZE_SECONDS = 0.6
 MAX_ARCHETYPE_OPS_IN_RAM = 250
+MIN_EAGER_NORM_GATE_OPS = 11
 
 
 def _read_xlsx_sheets(path: Path) -> tuple[list[str], dict[str, ET.Element], list[str]]:
@@ -399,9 +400,17 @@ def test_submodule_and_kernel_hygiene_across_hybrid_architectures(tmp_path):
     )
     b_raw = build_export_bundle(raw_eager_case, request=raw_req)
     ln_ops = [o for o in b_raw.operators if o.family == "layernorm"]
-    ng_ops = [o for o in b_raw.operators if o.canonical_op_key == "linear_output_norm_gate"]
+    rms_ops = [o for o in b_raw.operators if o.family == "rmsnorm"]
+    ng_decomposed = [
+        o for o in b_raw.operators
+        if o.canonical_op_key.startswith(("linear_output_norm_", "linear_output_gate_"))
+    ]
     assert ln_ops and all(o.ascend_kernel == "aclnnLayerNorm_LayerNormV3" for o in ln_ops)
-    assert ng_ops and all("Cast->Pows->ReduceMean" in o.ascend_kernel for o in ng_ops)
+    assert rms_ops and all("Cast->Pows->ReduceMean" in o.ascend_kernel for o in rms_ops)
+    assert len(ng_decomposed) >= MIN_EAGER_NORM_GATE_OPS
+    assert {"Cast", "Pows", "ReduceMean", "Adds", "Rsqrt", "Mul", "Sigmoid"} <= {
+        o.ascend_kernel for o in ng_decomposed
+    }
 
     # Verify PLE / Engram Host Offload visibility across Sheet 1/2/3 & H2D trace on hybrid GDN+PLE model.
     raw_ple, ple_req = compose_export_case(
