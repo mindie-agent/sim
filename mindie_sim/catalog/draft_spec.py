@@ -103,6 +103,7 @@ class DraftSpec:
     embedding_count: int = 0
     output_head_owned: bool = False
     output_head_count: int = 0
+    max_position_embeddings: int = 0
     source: tuple[tuple[str, str], ...] = ()
     notes: tuple[str, ...] = ()
 
@@ -196,6 +197,8 @@ class DraftSpec:
             raise ModelingError("catalog_draft_shared_compressed_kv_requires_target_context")
         if not isinstance(self.dcp_sharded, bool):
             raise ModelingError("catalog_draft_dcp_sharded_invalid")
+        if isinstance(self.max_position_embeddings, bool) or int(self.max_position_embeddings) < 0:
+            raise ModelingError("catalog_draft_max_position_embeddings_invalid")
         if self.confidence_enabled:
             expected = self.hidden_size + self.markov_rank
             if self.confidence_input_width not in {0, expected}:
@@ -269,9 +272,77 @@ class DraftSpec:
             "embedding_count": self.embedding_count,
             "output_head_owned": self.output_head_owned,
             "output_head_count": self.output_head_count,
+            "max_position_embeddings": self.max_position_embeddings,
             "source": dict(self.source),
             "notes": list(self.notes),
         }
+
+
+def parse_draft_max_position_embeddings(
+    config: Mapping[str, Any], *, is_standalone_draft: bool = False,
+) -> int:
+    """Extract an explicit draft context-length cap from HF/companion config mappings."""
+    def _pos_int(value: Any) -> int:
+        if isinstance(value, bool) or value is None:
+            return 0
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return 0
+        return parsed if parsed > 0 else 0
+
+    for key in (
+        "dspark_max_model_len",
+        "dspark_max_position_embeddings",
+        "draft_max_model_len",
+        "draft_max_position_embeddings",
+        "mtp_max_model_len",
+        "mtp_max_position_embeddings",
+    ):
+        found = _pos_int(config.get(key))
+        if found > 0:
+            return found
+    for nested_key in (
+        "dspark_config",
+        "dflash_config",
+        "draft_config",
+        "speculative_config",
+        "mtp_config",
+    ):
+        nested = config.get(nested_key)
+        if isinstance(nested, Mapping):
+            for key in ("draft_max_model_len", "max_model_len", "max_position_embeddings"):
+                found = _pos_int(nested.get(key))
+                if found > 0:
+                    return found
+    if is_standalone_draft:
+        for key in ("max_model_len", "max_position_embeddings"):
+            found = _pos_int(config.get(key))
+            if found > 0:
+                return found
+    return 0
+
+
+def effective_draft_context_cap(draft: Any, runtime: Any) -> int:
+    """Return the smallest positive declared context-length cap for a drafter."""
+    candidates: list[int] = []
+    spec_cap = int(getattr(draft, "max_position_embeddings", 0) or 0)
+    if spec_cap > 0:
+        candidates.append(spec_cap)
+    if isinstance(runtime, Mapping):
+        meta = dict(runtime)
+    else:
+        meta = dict(getattr(runtime, "metadata", ()) or ())
+    rt_cap = int(meta.get("draft_max_model_len") or 0)
+    if rt_cap > 0:
+        candidates.append(rt_cap)
+    spec_cfg = meta.get("speculative_config")
+    if isinstance(spec_cfg, Mapping):
+        for key in ("draft_max_model_len", "max_model_len", "max_position_embeddings"):
+            cfg_cap = int(spec_cfg.get(key) or 0)
+            if cfg_cap > 0:
+                candidates.append(cfg_cap)
+    return min(candidates) if candidates else 0
 
 
 __all__ = [
@@ -279,4 +350,6 @@ __all__ = [
     "ALLOWED_EXECUTION_MODES",
     "DEFAULT_DRAFT_PP_STAGES",
     "DraftSpec",
+    "effective_draft_context_cap",
+    "parse_draft_max_position_embeddings",
 ]

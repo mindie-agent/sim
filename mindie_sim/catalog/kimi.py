@@ -206,8 +206,10 @@ def _kimi_plans(config: Mapping[str, Any]) -> list[LayerPlan]:
 
 
 def _aux_kimi(c: Mapping[str, Any], config: Mapping[str, Any]) -> AuxiliarySpec:
+    from mindie_sim.catalog.draft_spec import parse_draft_max_position_embeddings
     h = int(c["hidden_size"])
     mla_block = c.get("dspark_attention_kind") == "mla" or c.get("dspark_block_size") == 5
+    draft_max_len = parse_draft_max_position_embeddings(c) or parse_draft_max_position_embeddings(config)
     if mla_block:
         markov = _int(c, "dspark_markov_rank", 256)
         target_ids = tuple(int(v) for v in (
@@ -234,6 +236,7 @@ def _aux_kimi(c: Mapping[str, Any], config: Mapping[str, Any]) -> AuxiliarySpec:
             noncausal_query_block=True, pp_capability=KIMI_DSPARK_PP_CAPABILITY,
             vocab_size=int(c.get("vocab_size", KIMI_DEFAULT_VOCAB_SIZE)),
             num_experts=0, top_k=0,
+            max_position_embeddings=draft_max_len,
             source=merge_source(
                 KIMI_DSPARK_MLA_SOURCE,
                 {
@@ -271,6 +274,7 @@ def _aux_kimi(c: Mapping[str, Any], config: Mapping[str, Any]) -> AuxiliarySpec:
         noncausal_query_block=True, pp_capability=KIMI_DSPARK_PP_CAPABILITY,
         vocab_size=int(c.get("vocab_size", KIMI_DEFAULT_VOCAB_SIZE)),
         num_experts=0, top_k=0,
+        max_position_embeddings=draft_max_len,
         source=merge_source(
             KIMI_DSPARK_GQA_SOURCE,
             {

@@ -223,6 +223,32 @@ def _has_not_implemented_stub(fn_node: ast.AST) -> bool:
     return False
 
 
+def _walk_file_ast_nodes(
+    f: Path, tree: ast.Module, shared: Mapping[str, str],
+    symbols: set[str], refs: list[dict[str, str]], viols: list[str],
+) -> None:
+    """Collect symbol references, SourceRef calls, and unimplemented stubs from one file AST."""
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Name):
+            symbols.add(n.id)
+            continue
+        if isinstance(n, ast.Attribute):
+            symbols.add(n.attr)
+            continue
+        if isinstance(n, ast.ImportFrom):
+            symbols.update(a.name for a in n.names)
+            continue
+        if isinstance(n, ast.Call):
+            fn = n.func.id if isinstance(n.func, ast.Name) else (n.func.attr if isinstance(n.func, ast.Attribute) else "")
+            if fn in {"SourceRef", "TemplateSourceRef"}:
+                pos = [_eval_str(a, shared) for a in n.args]
+                kw = {str(k.arg): _eval_str(k.value, shared) for k in n.keywords if k.arg}
+                refs.append({"file": f.name, "repository": kw.get("repository") or (pos[0] if len(pos) > 0 else "") or "", "revision": kw.get("revision") or (pos[1] if len(pos) > 1 else "") or "", "relative_path": kw.get("relative_path") or (pos[2] if len(pos) > 2 else "") or "", "source_sha256": kw.get("source_sha256") or (pos[3] if len(pos) >= _SOURCE_REF_POS_ARGS else "") or ""})
+            continue
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and _has_not_implemented_stub(n):
+            viols.append(f"operator_target_unimplemented_stub:{f.name}:{n.name}")
+
+
 def _scan_ast_files(files: Sequence[Path], *, is_pkg: bool) -> tuple[dict[str, str], list[dict[str, str]], set[str], str, set[str], list[str]]:
     abis, refs, symbols, decl_builder, decl_tids, shared, viols = {}, [], set(), "", set(), {}, []
     trees = [(f, ast.parse(f.read_text(encoding="utf-8"), filename=str(f))) for f in files]
@@ -236,21 +262,7 @@ def _scan_ast_files(files: Sequence[Path], *, is_pkg: bool) -> tuple[dict[str, s
                 shared[st.target.id] = val
     for f, tree in trees:
         top = {t.id for st in tree.body if isinstance(st, ast.Assign) for t in st.targets if isinstance(t, ast.Name)} | {st.target.id for st in tree.body if isinstance(st, ast.AnnAssign) and isinstance(st.target, ast.Name)} | {st.name for st in tree.body if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))}
-        for n in ast.walk(tree):
-            if isinstance(n, ast.Name):
-                symbols.add(n.id)
-            elif isinstance(n, ast.Attribute):
-                symbols.add(n.attr)
-            elif isinstance(n, ast.ImportFrom):
-                symbols.update(a.name for a in n.names)
-            elif isinstance(n, ast.Call):
-                fn = n.func.id if isinstance(n.func, ast.Name) else (n.func.attr if isinstance(n.func, ast.Attribute) else "")
-                if fn in {"SourceRef", "TemplateSourceRef"}:
-                    pos = [_eval_str(a, shared) for a in n.args]
-                    kw = {str(k.arg): _eval_str(k.value, shared) for k in n.keywords if k.arg}
-                    refs.append({"file": f.name, "repository": kw.get("repository") or (pos[0] if len(pos) > 0 else "") or "", "revision": kw.get("revision") or (pos[1] if len(pos) > 1 else "") or "", "relative_path": kw.get("relative_path") or (pos[2] if len(pos) > 2 else "") or "", "source_sha256": kw.get("source_sha256") or (pos[3] if len(pos) >= _SOURCE_REF_POS_ARGS else "") or ""})
-            elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and _has_not_implemented_stub(n):
-                viols.append(f"operator_target_unimplemented_stub:{f.name}:{n.name}")
+        _walk_file_ast_nodes(f, tree, shared, symbols, refs, viols)
         for st in tree.body:
             tname = [t.id for t in st.targets if isinstance(t, ast.Name)] if isinstance(st, ast.Assign) else ([st.target.id] if isinstance(st, ast.AnnAssign) and isinstance(st.target, ast.Name) else [])
             vnode = st.value if isinstance(st, (ast.Assign, ast.AnnAssign)) else None
@@ -372,6 +384,8 @@ def _verify_sim_owner(is_pkg: bool, target_path: Path, family: str, template_id:
         ctx = _build_default_planning_context(op)
         try:
             resolved = matched.resolve(op, ctx)
+        except TimeoutError:
+            raise
         except Exception as exc:
             return False, {"owner": "builtin_family_registry", "checked": True, "matched": True, "lowered": False}, [f"sim_owner_resolve_failed:{family}:{exc}"]
         ok_l, l_star, reason = _verify_resolved_operator_dual_bound(resolved, ctx)
@@ -402,6 +416,8 @@ def _verify_sim_owner(is_pkg: bool, target_path: Path, family: str, template_id:
             low = cat.lower(tier, specs[0], problem, dp)  # type: ignore[arg-type]
             ok_l, l_star, reason = _certify_stages_dual_bound(_collect_stages(getattr(low, "program", low)), geom)
             return ok_l, {"owner": "builtin_template_catalog", "checked": True, "matched": True, "tier": tier, "template_id": req_id, "lowered": ok_l, "lean_lower_bound_ns": l_star, "lean_status": reason}, ([] if ok_l else [f"template_lower_verification_failed:{req_id}:{reason}"])
+        except TimeoutError:
+            raise
         except Exception:
             continue
     return False, {"owner": "builtin_template_catalog", "checked": True, "matched": True, "lowered": False}, [f"template_enumeration_empty:{req_id}"]

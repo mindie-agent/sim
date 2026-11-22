@@ -151,7 +151,7 @@ def _resolve_va_lowerings(
         from mindie_sim.prediction.operators.mla_prolog.family_mla_prolog import validate as validate_mla_prolog
         prolog_options: dict[str, Any] = {}
         quant = model_spec.quant
-        if is_a5 and quant is not None and quant.kv_dtype == "int8":
+        if _arch_key(sku) in {"a3", "a5"} and quant is not None and quant.kv_dtype == "int8":
             from mindie_sim.prediction.operators.mla_prolog.mla_prolog_packed import LAYOUT
             prolog_options["cache_layout"] = LAYOUT
         try:
@@ -349,7 +349,7 @@ def apply_va_recommended(case: Mapping[str, Any]) -> dict[str, Any]:
         or meta.get("feature_track")
         or "merged"
     ).strip().lower()
-    allow_merged_workarounds = track_name == "merged"
+    allow_merged_workarounds = track_name in {"merged", "unmerged_pr"}
     for flag_key in ("enable_flashcomm1", "enable_fused_mc2", "enable_prefill_mc2"):
         if flag_key not in prof_flags or flag_key in additional:
             continue

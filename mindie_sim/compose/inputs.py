@@ -300,6 +300,71 @@ def _read_config_json(path: Path) -> dict[str, Any]:
     return dict(data)
 
 
+def _attach_checkpoint_quant(
+    spec: ModelSpec,
+    quant_spec: Any,
+    *,
+    repo_id: str = "",
+) -> ModelSpec:
+    if quant_spec is None and not repo_id:
+        return spec
+    meta = dict(spec.metadata)
+    if repo_id:
+        meta["checkpoint_repo_id"] = repo_id
+    if quant_spec is not None:
+        meta["checkpoint_quant_declared"] = True
+        return replace(
+            spec,
+            quant=quant_spec,
+            quantization=str(quant_spec.name),
+            kv_dtype=str(quant_spec.kv_dtype),
+            metadata=tuple(sorted(meta.items())),
+        )
+    return replace(spec, metadata=tuple(sorted(meta.items())))
+
+
+def _read_companion_quant_spec(path: Path, raw_config: Mapping[str, Any]) -> Any:
+    base_dir = path if path.is_dir() else path.parent
+    desc_path = base_dir / "quant_model_description.json"
+    if not desc_path.is_file():
+        return None
+    if desc_path.stat().st_size > MAX_METADATA_MIB * BYTES_PER_KIB * BYTES_PER_KIB:
+        raise ValueError("metadata_input_exceeds_50_MiB")
+    with desc_path.open(encoding="utf-8") as stream:
+        desc_data = json.load(stream)
+    if not isinstance(desc_data, Mapping):
+        return None
+    from mindie_sim.catalog.npu_checkpoints import parse_quant_model_description
+    return parse_quant_model_description(desc_data, base_config=raw_config)
+
+
+def _resolve_checkpoint_model_spec(key: str) -> ModelSpec | None:
+    from mindie_sim.catalog.npu_checkpoints import (
+        lookup_eco_tech_repo,
+        resolve_checkpoint_metadata,
+    )
+    is_repo_or_url = (
+        lookup_eco_tech_repo(key) is not None
+        or "/" in key
+        or key.lower().startswith(("http://", "https://"))
+    )
+    if not is_repo_or_url:
+        return None
+    meta = resolve_checkpoint_metadata(key, allow_network=False)
+    canon = MODEL_ALIASES.get(
+        meta.canonical_model,
+        ARCHITECTURE_PRESET_ALIASES.get(meta.canonical_model, meta.canonical_model),
+    )
+    if canon in CATALOG or canon in ARCHITECTURE_PRESET_CATALOG:
+        base_spec = load_model(canon)
+        return _attach_checkpoint_quant(base_spec, meta.quant_spec, repo_id=meta.repo_id)
+    if isinstance(meta.config, Mapping) and meta.config:
+        name = str(meta.config.get("name") or meta.canonical_model or meta.repo_id)
+        base_spec = build_model_spec(name, meta.config)
+        return _attach_checkpoint_quant(base_spec, meta.quant_spec, repo_id=meta.repo_id)
+    return None
+
+
 def _resolve_model_spec(model: str | Path | Mapping[str, Any]) -> ModelSpec:
     if isinstance(model, Mapping):
         raw = dict(model)
@@ -316,8 +381,11 @@ def _resolve_model_spec(model: str | Path | Mapping[str, Any]) -> ModelSpec:
         )
         name = str(raw.get("name") or fallback_name)
         if "layers" in raw and "hidden_size" in raw and "model_type" not in raw:
-            return ModelSpec.from_mapping(raw)
-        return build_model_spec(name, raw)
+            spec = ModelSpec.from_mapping(raw)
+        else:
+            spec = build_model_spec(name, raw)
+        qspec = _read_companion_quant_spec(resolved_path, raw)
+        return _attach_checkpoint_quant(spec, qspec)
     if not isinstance(model, str) or not model.strip():
         raise ModelingError(f"invalid_model_identifier:{model}")
     key = model.strip()
@@ -330,6 +398,9 @@ def _resolve_model_spec(model: str | Path | Mapping[str, Any]) -> ModelSpec:
     cfg_candidate = CONFIG_DIR / (key if key.endswith(".json") else f"{key}.json")
     if cfg_candidate.is_file():
         return _resolve_model_spec(cfg_candidate)
+    checkpoint_spec = _resolve_checkpoint_model_spec(key)
+    if checkpoint_spec is not None:
+        return checkpoint_spec
     try:
         return load_model(key)
     except (KeyError, ValueError, ModelingError) as exc:

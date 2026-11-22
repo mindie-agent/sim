@@ -136,13 +136,13 @@ VA_RECOMMENDED_PROFILES = {
         tutorial_flags={"enable_flashcomm1": True},
     ),
     "glm-5.1": _p(
-        {"a2": "w8a8", "a3": "w8a8", "a5": "mxfp4"}, MTP_STANDARD_PROPOSAL_TOKENS,
+        {"a2": "w8a8", "a3": "w8a8", "a5": "mxfp8_mxfp4"}, MTP_STANDARD_PROPOSAL_TOKENS,
         "GLM5.md", mlapo=True, mso=True,
         topologies={"a5": _topo(colocated={"dp": 1, "tp": 1, "pcp": 8, "ep": 8})},
         tutorial_flags={"enable_flashcomm1": True},
     ),
     "glm-5.2": _p(
-        {"a2": "w8a8", "a3": "w8a8", "a5": "mxfp4"}, MTP_STANDARD_PROPOSAL_TOKENS,
+        {"a2": "w8a8", "a3": "w8a8", "a5": "mxfp8_mxfp4"}, MTP_STANDARD_PROPOSAL_TOKENS,
         "GLM5.2.md", mlapo=True, mso=True,
         topologies={
             "a5": _topo(
@@ -318,10 +318,11 @@ _MODEL_ALIASES = {
 
 def _supports_structural_draft(canonical: str) -> bool:
     """True when the catalog model declares native/external draft or MLA synthesis."""
+    from mindie_sim.schema.common import ModelingError
     try:
         from mindie_sim.model_catalog import load_model
         spec = load_model(canonical)
-    except Exception:
+    except (ModelingError, KeyError, ValueError):
         return True
     aux = spec.auxiliary
     if aux is not None and aux.standalone_draft:

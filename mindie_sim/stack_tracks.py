@@ -325,10 +325,27 @@ def resolve_stack_track(
             collapsed = _collapse_binding_group(mid, "unmerged_pr", group)
             collapsed["options"] = {**prev_opts, **collapsed["options"]}
             active[mid] = collapsed
+    ideal_eligible_ids: list[str] = eligible_ids
     if canonical_track == "expected_ideal":
-        for mid in eligible_ids:
+        ideal_opts = {**dict(ctx.options or {}), "allow_extended_activation_abi": True}
+        if "enable_fused_mc2" not in ctx.caller_explicit and ideal_opts.get("enable_fused_mc2") == 0:
+            ideal_opts.pop("enable_fused_mc2", None)
+        ideal_ctx = MechanismContext(
+            model=ctx.model, sku=ctx.sku, arch=ctx.arch, parallel=ctx.parallel,
+            caller_explicit=ctx.caller_explicit,
+            options=ideal_opts,
+        )
+        ideal_eligible_ids = [
+            mech.id for mech in MECHANISM_CATALOG.values()
+            if mech.eligible(ideal_ctx) and (not ctx_phase or not mech.phases or ctx_phase in mech.phases)
+        ]
+        for mid in ideal_eligible_ids:
             prev = active.get(mid)
-            opts = {"unbounded_rows": True} if mid == "mhc_boundary_fusion_overlap" else {}
+            opts: dict[str, Any] = {}
+            if mid == "mhc_boundary_fusion_overlap":
+                opts["unbounded_rows"] = True
+            elif mid == "cann_megamoe_fusion":
+                opts["allow_extended_activation_abi"] = True
             if prev is None:
                 active[mid] = {
                     "id": mid, "state": "expected_ideal", "ref": None,
@@ -359,8 +376,9 @@ def resolve_stack_track(
     for mid in exclude_ids:
         active.pop(mid, None)
 
+    gap_pool = ideal_eligible_ids if canonical_track == "expected_ideal" else eligible_ids
     unimplemented_gaps = [
-        mid for mid in eligible_ids
+        mid for mid in gap_pool
         if mid not in merged_by_id and mid not in pr_by_id
     ]
     return {

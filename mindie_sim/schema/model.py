@@ -22,21 +22,21 @@ from __future__ import annotations
 from copy import deepcopy
 import math
 from dataclasses import dataclass, replace
-from typing import Any, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
 from mindie_sim.schema.common import (
-    ModelingError, _DTYPE_BYTES, _int, _mapping, _metadata, _normalize_dtype,
+    ModelingError, _int, _mapping, _metadata, _normalize_dtype,
     _positive_float, _unknown, dtype_bytes,
 )
-
-ZERO = 0
-ZERO_FLOAT = 0.0
 from mindie_sim.catalog.types import (
-    AuxiliarySpec, DraftSpec, EngramSpec, QuantSpec, VisionSpec,
+    AuxiliarySpec, EngramSpec, QuantSpec, VisionSpec,
 )
 from mindie_sim.schema.workload_validation import (
     _request_int, _validate_request, _validate_workload,
 )
+
+if TYPE_CHECKING:
+    from mindie_sim.schema.case import RuntimeSpec
 
 @dataclass(frozen=True)
 class MlaSpec:
@@ -210,7 +210,7 @@ class LayerPlan:
     hyper_connections: bool = False
     hc_mult: int = 0
     hc_sinkhorn_iters: int = 0
-    hc_lowrank: int = ZERO
+    hc_lowrank: int = 0
     residual_block_size: int = 0
     native_layer_id: int = -1
     scope: str = "body"                 # body | mtp | dspark | standalone_draft
@@ -683,13 +683,13 @@ class RequestSpec:
                 raise ModelingError("workload.text_media_prompt_mismatch")
         return cls(
             request_id=request_id,
-            arrival_ms=raw.get("arrival_ms", ZERO_FLOAT), prompt_tokens=prompt,
+            arrival_ms=raw.get("arrival_ms", 0.0), prompt_tokens=prompt,
             output_tokens=raw.get("output_tokens", raw.get("output_len")),
-            prefix_tokens=raw.get("prefix_tokens", raw.get("prefix_len", ZERO)),
-            priority=raw.get("priority", ZERO),
+            prefix_tokens=raw.get("prefix_tokens", raw.get("prefix_len", 0)),
+            priority=raw.get("priority", 0),
             text_prompt_tokens=text_prompt, media_tokens=media_tokens,
             media_encoded=raw.get("media_encoded", False),
-            chain_id=raw.get("chain_id", ZERO), gap_ms=raw.get("gap_ms", ZERO_FLOAT),
+            chain_id=raw.get("chain_id", 0), gap_ms=raw.get("gap_ms", 0.0),
             prefix_cache_key=raw.get("prefix_cache_key", ""),
         )
 

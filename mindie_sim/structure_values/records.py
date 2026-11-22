@@ -175,23 +175,9 @@ def _matrix_values(contract):
     return None
 
 
-def _common_values(contract):
-    """Project the contract shapes that share an unambiguous tensor order."""
+def _common_attention_values(contract):
+    """Project attention and MLA-prolog contract variants."""
     kind = contract[0]
-    if kind == "native_tensor_abi":
-        if len(contract) == 4 and _is_tensor_seq(contract[2]) and _is_tensor_seq(contract[3]):
-            return (_named_tensors("input", "input", contract[2], "contract[2]"),
-                    _named_tensors("output", "output", contract[3], "contract[3]"), [], {})
-        return None
-    if kind == "layernorm_active":
-        # x, weight, bias, output; the native boundary is one row-wise call.
-        if len(contract) == 6 and all(_is_tensor(item) for item in contract[2:]):
-            inputs = [_tensor_record("x", "input", contract[2], "contract[2]"),
-                      _tensor_record("weight", "input", contract[3], "contract[3]"),
-                      _tensor_record("bias", "input", contract[4], "contract[4]")]
-            outputs = [_tensor_record("output", "output", contract[5], "contract[5]")]
-            return inputs, outputs, [], {}
-        return None
     if kind == "attention_active_qkv":
         if (len(contract) == 4 and len(contract[2]) == 3
                 and len(contract[3]) == 1
@@ -239,6 +225,33 @@ def _common_values(contract):
             outputs = _named_tensors("output", "output", contract[5], "contract[5]")
             return inputs, outputs, [], {}
         return None
+    return None
+
+
+def _common_values(contract):
+    """Project the contract shapes that share an unambiguous tensor order."""
+    kind = contract[0]
+    if kind == "native_tensor_abi":
+        if len(contract) == 4 and _is_tensor_seq(contract[2]) and _is_tensor_seq(contract[3]):
+            return (_named_tensors("input", "input", contract[2], "contract[2]"),
+                    _named_tensors("output", "output", contract[3], "contract[3]"), [], {})
+        return None
+    if kind == "layernorm_active":
+        # x, weight, bias, output; the native boundary is one row-wise call.
+        if len(contract) == 6 and all(_is_tensor(item) for item in contract[2:]):
+            inputs = [_tensor_record("x", "input", contract[2], "contract[2]"),
+                      _tensor_record("weight", "input", contract[3], "contract[3]"),
+                      _tensor_record("bias", "input", contract[4], "contract[4]")]
+            outputs = [_tensor_record("output", "output", contract[5], "contract[5]")]
+            return inputs, outputs, [], {}
+        return None
+    if kind in {
+        "attention_active_qkv", "sparse_attention_active",
+        "quant_lightning_indexer_active", "lightning_indexer_active",
+        "attention_paged_active_qkv", "attention_paged_mla_qk_rope",
+        "mla_prolog_active",
+    }:
+        return _common_attention_values(contract)
     if kind == "dynamic_quant_active":
         if len(contract) == 5 and all(_is_tensor(item) for item in contract[2:]):
             return ([_tensor_record("x", "input", contract[2], "contract[2]")],

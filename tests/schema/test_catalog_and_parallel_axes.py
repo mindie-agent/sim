@@ -537,32 +537,117 @@ def test_physical_key_count_is_bounded_by_layer_archetypes_not_layer_count(key):
         assert counts[12] <= counts[6] + counts[2] + 4, (key, counts)
 
 
-from mindie_sim.model_catalog import list_models as _list_catalog_models
+def test_vllm_ascend_dcp_codomain_laws_and_tp_rank_reuse() -> None:
+    from mindie_sim.catalog.context_parallel import (
+        legal_vllm_ascend_dcp_values, validate_vllm_ascend_dcp_codomain,
+    )
 
-_CATALOG_KEYS = tuple(entry["key"] for entry in _list_catalog_models())
+    sfa_model = load_model("deepseek-v3.2")
+    mla_model = load_model("deepseek-v3")
+    gqa_model = load_model("qwen3-32b")
+    shared_indexer_model = replace(
+        mla_model,
+        layer_plans=(replace(mla_model.layer_plans[0], index_k_owner_layer_id=0),),
+    )
+    non_kv_model = replace(
+        gqa_model,
+        attention="gdn",
+        layer_plans=(replace(gqa_model.layer_plans[0], attention="gdn"),),
+    )
+
+    assert legal_vllm_ascend_dcp_values(sfa_model, tp=8, pcp=1) == (1, 8)
+    assert legal_vllm_ascend_dcp_values(shared_indexer_model, tp=8, pcp=1) == (1, 8)
+    assert legal_vllm_ascend_dcp_values(sfa_model, tp=4, pcp=2) == (1, 2, 8)
+    assert legal_vllm_ascend_dcp_values(mla_model, tp=6, pcp=1) == (1, 2, 3, 6)
+    assert legal_vllm_ascend_dcp_values(mla_model, tp=4, pcp=2) == (1, 2, 8)
+    assert legal_vllm_ascend_dcp_values(gqa_model, tp=8, pcp=1) == (1,)
+    assert legal_vllm_ascend_dcp_values(non_kv_model, tp=8, pcp=1) == (1,)
+
+    ok, reason = validate_vllm_ascend_dcp_codomain(
+        sfa_model, ParallelSpec(dp=1, tp=8, pcp=1, dcp=2),
+    )
+    assert not ok and reason is not None and "sfa_dcp_must_equal_tp" in reason
+    ok, reason = validate_vllm_ascend_dcp_codomain(
+        mla_model, ParallelSpec(dp=1, tp=6, pcp=1, dcp=3),
+    )
+    assert ok and reason is None
+    ok, reason = validate_vllm_ascend_dcp_codomain(
+        mla_model, ParallelSpec(dp=1, tp=6, pcp=1, dcp=4),
+    )
+    assert not ok and reason is not None and "mla_dcp_must_divide_tp" in reason
+    ok, reason = validate_vllm_ascend_dcp_codomain(
+        gqa_model, ParallelSpec(dp=1, tp=8, pcp=1, dcp=2),
+    )
+    assert not ok and reason == "vllm_ascend_gqa_dcp_deprecated"
+    ok, reason = validate_vllm_ascend_dcp_codomain(
+        non_kv_model, ParallelSpec(dp=1, tp=8, pcp=1, dcp=2),
+    )
+    assert not ok and reason == "vllm_ascend_non_kv_model_requires_dcp_1"
+
+    p_dcp = ParallelSpec(dp=2, tp=8, pp=1, ep=16, dcp=8, pcp=1)
+    assert p_dcp.world_size == 16
+    assert p_dcp.dcp_tp_gather == 8 and p_dcp.dcp_dp_width == 1
+    p_hybrid = ParallelSpec(dp=1, tp=4, pp=1, ep=8, pcp=2, dcp=8)
+    assert p_hybrid.world_size == 8
+
+    composed = compose_case("deepseek-v3.2", hardware="a5", layers=4, dp=2, tp=8, ep=16, dcp=8)
+    meta = composed["runtime"]["metadata"]
+    assert meta["vllm_ascend_dcp_codomain_ok"] is True
+    assert meta["dcp_reuses_tp_ranks"] is True
+    assert meta["vllm_ascend_dcp_legal_values"] == [1, 8]
 
 
-@pytest.mark.parametrize("key", _CATALOG_KEYS, ids=list(_CATALOG_KEYS))
-def test_physical_key_count_is_bounded_by_layer_archetypes_not_layer_count(key):
-    from mindie_sim import target_graphs
-    from mindie_sim.prediction.program.physical_key import physical_key
+def test_parallel_ep_expert_tp_domain_and_runtime_feature_validation() -> None:
+    from mindie_sim.schema.runtime_features import (
+        normalize_runtime_features, validate_runtime_features,
+    )
 
-    cases = {n: compose_case(key, hardware="a5", layers=n) for n in (2, 6, 12)}
-    counts = {
-        n: len({
-            physical_key(op)
-            for ops in target_graphs(case, scope="body", phase="decode", tokens=1, context=128, sequences=1).values()
-            for op in ops
+    moe_model = ModelSpec.from_mapping({
+        "name": "moe-ep-test", "layers": 2, "hidden_size": 768,
+        "num_heads": 24, "num_kv_heads": 6, "head_dim": 32,
+        "intermediate_size": 1536, "vocab_size": 1024,
+        "attention": "gqa", "ffn": "moe",
+        "num_experts": 24, "top_k": 2, "moe_intermediate_size": 384,
+    })
+
+    p_etp = ParallelSpec(dp=4, tp=6, ep=4, expert_tp=6)
+    p_etp.validate(moe_model)
+    assert p_etp.etp == 6
+    assert p_etp.ep_dp_width == 4
+    assert p_etp.ep_spans_dp is True
+    assert p_etp.ep_domain == 24
+
+    p_pcp_etp = ParallelSpec(dp=2, pcp=2, tp=2, ep=4, expert_tp=2)
+    p_pcp_etp.validate(moe_model)
+    assert p_pcp_etp.ep_spans_pcp is True
+    assert p_pcp_etp.ep_domain == 8
+
+    with pytest.raises(ModelingError, match="ep_not_multiple_of_tp"):
+        ParallelSpec(dp=3, tp=4, ep=6, expert_tp=1).validate(moe_model)
+
+    with pytest.raises(ModelingError, match="runtime_feature_conflict:multistream_overlap_shared_expert"):
+        normalize_runtime_features({
+            "multistream_overlap_shared_expert": True,
+            "enable_shared_expert_overlap": False,
         })
-        for n, case in cases.items()
-    }
-    assert counts[2] > 0 and counts[6] > 0 and counts[12] > 0
-    assert counts[6] <= 3 * counts[2], (key, counts)
-    archetypes = {
-        (p["attention"], p["ffn"], p["indexer"], p["window"], p["compress_ratio"])
-        for p in cases[6]["model"]["layer_plans"]
-    }
-    if len(archetypes) == 1:
-        assert counts[2] == counts[6] == counts[12], (key, counts)
-    else:
-        assert counts[12] <= counts[6] + counts[2] + 4, (key, counts)
+
+    bad_rt = SimpleNamespace(
+        parallel=SimpleNamespace(
+            q_proj_tp=1, o_proj_tp=1, dcp_linear_tp=1, mlp_tp=1,
+            shared_expert_tp=1, linear_proj_tp=0, lm_head_tp=1,
+            redundant_experts_per_rank=0,
+        ),
+        collective_startup_mode="legacy",
+        matrix_compute_policy="auto",
+        prefix_cache_mode="private",
+        prefix_read_mode="auto",
+        homogeneous_graph_reuse="off",
+        recover_ssm=False,
+        enable_torch_compile=False,
+        enable_npugraph_ex=False,
+        enable_static_kernel=False,
+        enable_super_kernel=False,
+        routing={},
+    )
+    with pytest.raises(ModelingError, match="runtime_feature_invalid:linear_proj_tp"):
+        validate_runtime_features(bad_rt)

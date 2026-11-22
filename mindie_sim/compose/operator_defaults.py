@@ -323,11 +323,6 @@ def mqsmla_default(case, kernels):
             "native_kind": MQSMLA_NATIVE, "degraded": False, "installed": True}
 
 
-def _installed_automatically(case, selector):
-    from mindie_sim.compose.operator_defaults import installed_automatically
-    return installed_automatically(case.runtime.metadata, selector)
-
-
 def index_probe_rows(case):
     """Reachable per-call query row counts of one replica, smallest first."""
     rows = [INDEX_PROBE_ROWS, max(INDEX_PROBE_ROWS, int(case.runtime.max_num_seqs))]
@@ -420,9 +415,6 @@ def lightning_indexer_default(case, kernels):
             "binding": LIGHTNING_INDEXER_IMPLEMENTATION,
             "reason": "declared_bf16_index_cache_geometry",
             "native_kind": "LightningIndexer", "degraded": False}
-
-
-SERVING_INVENTORY_KEYS = ("recipes", "programs", "families")
 
 
 def serving_recipe_inventory(case):

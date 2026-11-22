@@ -598,3 +598,125 @@ def test_local_hf_config_path_without_max_position_composes_an_explicit_zero(tmp
     named = compose_case(str(path), hardware={"sku": "a3"}, tp=1, dp=1, prompt_tokens=8,
                          output_tokens=1)
     assert parse_case(named).model.layers == 1
+
+
+def test_hf_quant_exclusions_handle_vision_projector_and_regex_patterns() -> None:
+    from mindie_sim.catalog.hf_config import resolve_quant, resolve_role_exclusions
+
+    roles, unresolved = resolve_role_exclusions((
+        "lm_head",
+        r"language_model.model.layers.\d+.self_attn.q_proj",
+        r"model.layers.\d*.block_sparse_moe.gate",
+        "visual.merger.*",
+        "model.mm_projector",
+    ))
+    assert unresolved == ()
+    assert {"lm_head", "attention", "router", "vision", "projector"} <= set(roles)
+
+    cfg = {
+        "quantization_config": {
+            "quant_method": "fp8",
+            "fmt": "e4m3",
+            "activation_scheme": "dynamic",
+            "weight_block_size": [128, 128],
+            "modules_to_not_convert": [
+                "lm_head",
+                r"model.layers.\d*.block_sparse_moe.gate",
+                "visual.merger.*",
+                "model.mm_projector",
+                "model.layers.0.self_attn",
+            ],
+        },
+    }
+    qspec, gaps = resolve_quant(cfg)
+    assert gaps == []
+    assert {"lm_head", "router", "vision", "projector"} <= set(qspec.exclusions)
+
+
+def test_draft_max_position_embeddings_parsing_and_context_cap() -> None:
+    from mindie_sim.catalog.draft_spec import (
+        effective_draft_context_cap, parse_draft_max_position_embeddings,
+    )
+
+    assert parse_draft_max_position_embeddings(
+        {"max_position_embeddings": 4096}, is_standalone_draft=True,
+    ) == 4096
+    assert parse_draft_max_position_embeddings(
+        {"dspark_max_model_len": 4096},
+    ) == 4096
+    assert parse_draft_max_position_embeddings(
+        {"draft_config": {"max_position_embeddings": 8192}},
+    ) == 8192
+
+    dspark_model = load_model("kimi-k3-dspark")
+    assert dspark_model.auxiliary is not None and dspark_model.auxiliary.dspark is not None
+    assert dspark_model.auxiliary.dspark.max_position_embeddings == 1048576
+    assert effective_draft_context_cap(dspark_model.auxiliary.dspark, {}) == 1048576
+    assert effective_draft_context_cap(
+        dspark_model.auxiliary.dspark, {"draft_max_model_len": 4096},
+    ) == 4096
+
+    from mindie_sim.catalog.specs import build_model_spec
+    short_dspark = build_model_spec("custom-dspark-4k", {
+        "architectures": ["K3DSparkModel"], "model_type": "k3_dspark",
+        "hidden_size": 7168, "intermediate_size": 14336, "num_hidden_layers": 5,
+        "block_size": 5, "num_attention_heads": 64, "num_key_value_heads": 64,
+        "q_lora_rank": 1536, "kv_lora_rank": 512, "qk_nope_head_dim": 128,
+        "qk_rope_head_dim": 64, "v_head_dim": 128, "vocab_size": 163840,
+        "max_position_embeddings": 4096, "target_layer_ids": [2, 23, 47, 71, 89],
+    })
+    assert short_dspark.auxiliary is not None and short_dspark.auxiliary.dspark is not None
+    assert short_dspark.auxiliary.dspark.max_position_embeddings == 4096
+    assert effective_draft_context_cap(short_dspark.auxiliary.dspark, {}) == 4096
+
+    with pytest.raises(ModelingError, match="invalid_draft_max_model_len"):
+        compose_case("kimi-k3", hardware=REPRESENTATIVE_SKUS["a5"], layers=2, draft_max_model_len=0)
+    with pytest.raises(ModelingError, match="invalid_draft_max_model_len"):
+        compose_case("kimi-k3", hardware=REPRESENTATIVE_SKUS["a5"], layers=2, draft_max_model_len=True)
+
+
+def test_compose_accepts_local_hf_dir_companion_quant_and_eco_tech_repo_id(tmp_path: Path) -> None:
+    from mindie_sim.catalog.npu_checkpoints import normalize_model_key
+
+    assert normalize_model_key("DeepSeek-V3.2-Exp-W8A8") == "deepseek-v3.2"
+    assert normalize_model_key("GLM-5.3-W8A8C8-mxfp8") == "glm-5.3"
+
+    ckpt_dir = tmp_path / "local-w8a8-ckpt"
+    ckpt_dir.mkdir()
+    (ckpt_dir / "config.json").write_text(json.dumps({
+        "model_type": "llama",
+        "num_hidden_layers": 2,
+        "hidden_size": 64,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "intermediate_size": 128,
+        "vocab_size": 256,
+        "max_position_embeddings": 8192,
+    }), encoding="utf-8")
+    (ckpt_dir / "quant_model_description.json").write_text(json.dumps({
+        "model_quant_type": "W8A8_DYNAMIC",
+        "model.layers.0.self_attn.q_proj.weight": "W8A8_DYNAMIC",
+        "model.layers.0.mlp.gate_proj.weight": "W8A8_DYNAMIC",
+        "model.layers.0.input_layernorm.weight": "FLOAT",
+        "lm_head.weight": "FLOAT",
+    }), encoding="utf-8")
+
+    local_case = compose_case(
+        ckpt_dir, hardware=REPRESENTATIVE_SKUS["a3"], tp=1, dp=1,
+        prompt_tokens=16, output_tokens=2,
+    )
+    parsed_local = parse_case(local_case)
+    assert parsed_local.model.quant is not None
+    assert parsed_local.model.quant.weight_format == "int8"
+    assert dict(parsed_local.model.metadata).get("checkpoint_quant_declared") is True
+
+    repo_case = compose_case(
+        "Eco-Tech/Qwen3.8-Flash-Next-w4a8-mxfp",
+        hardware=REPRESENTATIVE_SKUS["a5"], layers=2, tp=4, ep=4,
+        prompt_tokens=16, output_tokens=2,
+    )
+    parsed_repo = parse_case(repo_case)
+    assert parsed_repo.model.name == "qwen3.8-flash-next"
+    assert parsed_repo.model.quant is not None
+    assert parsed_repo.model.quant.format_for("routed_expert") == "mxfp4"
+    assert parsed_repo.model.quant.format_for("attn") == "fp8_e4m3"

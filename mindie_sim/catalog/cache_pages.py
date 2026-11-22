@@ -325,6 +325,7 @@ class CachePageGroup:
     allocation: str = "live"
     metadata_bytes_per_page: int = 0
     metadata_scan: str = "touched"
+    auxiliary: bool = False
 
     @classmethod
     def from_mapping(cls, raw: Mapping) -> "CachePageGroup":
@@ -430,10 +431,12 @@ class CachePages:
             for layer in group.layers:
                 if layer not in component_names:
                     raise ModelingError(f"cache_page_group_unknown_layer:{layer}")
+                if group.auxiliary:
+                    continue
                 components = ({component for member_layer, component in group.members
                                if member_layer == layer} if group.members else
-                              set(group.components or component_names[layer]))
-                unknown = components - component_names[layer]
+                              set(group.components or self.component_names[layer]))
+                unknown = components - self.component_names[layer]
                 if unknown:
                     raise ModelingError(f"cache_page_group_unknown_components:{layer}:{sorted(unknown)}")
                 owned = self.covered.setdefault(layer, set())
@@ -445,6 +448,8 @@ class CachePages:
 
     def group_components(self, group: CachePageGroup) -> dict[int, set[str]]:
         """Resolve the components a page group actually owns on each layer."""
+        if group.auxiliary:
+            return {}
         result = {}
         for layer in group.layers:
             if group.members:

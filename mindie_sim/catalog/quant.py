@@ -22,7 +22,7 @@ from dataclasses import replace
 
 from mindie_sim.catalog.types import QuantSpec, merge_source
 
-ONE = 1
+FP32_SCALE_BYTES = 4.0
 
 
 def projection_quant(quant: QuantSpec, plan) -> QuantSpec:
@@ -46,7 +46,7 @@ def projection_quant(quant: QuantSpec, plan) -> QuantSpec:
         defaults[plan.attention] = fields
         if plan.attention == "mla":
             defaults["indexer_fp8"] = fields
-    if plan.index_kpool > ONE and plan.attention != "gqa":
+    if plan.index_kpool > 1 and plan.attention != "gqa":
         # The retained analytic fallback casts hidden once and keeps its own
         # FP32 K/gate copies.  ``indexer.weights`` is deliberately *not* in
         # this set: the checkpoint stores BF16 head weights and both the native
@@ -247,7 +247,7 @@ def _quant_w8a8_dynamic() -> QuantSpec:
         weight_format="int8", activation_format="int8",
         expert_weight_format="int8",
         weight_block=(1, 1), expert_block=1,
-        scale_format="fp32", scale_bytes=4.0,
+        scale_format="fp32", scale_bytes=FP32_SCALE_BYTES,
         # QuantBatchMatmulV3 normal-caller execution ABI: one BF16 weight
         # scale per output channel and one FLOAT dynamic scale per activation
         # row.  The checkpoint storage remains per-channel FP32 (above); this
@@ -264,7 +264,8 @@ def _quant_w8a8_dynamic() -> QuantSpec:
             "attn.o": {"output_format": "bf16"},
         },
         kv_dtype="bf16", index_dtype="bf16", index_scale_dtype="none",
-        exclusions=("mtp", "norm", "lm_head", "embedding", "vision", "projector",
+        exclusions=("mtp", "norm", "router", "lm_head", "embedding", "mhc",
+                    "compressor", "vision", "projector",
                     "conv_weight_f32", "conv_weight_bf16"),
         source=merge_source({
             "quant_method": "w8a8_dynamic",
@@ -301,10 +302,11 @@ def _quant_w4a8_dynamic() -> QuantSpec:
         weight_format="int8", activation_format="int8",
         expert_weight_format="int4",
         weight_block=(1, 1), expert_block=1,
-        scale_format="fp32", scale_bytes=4.0,
+        scale_format="fp32", scale_bytes=FP32_SCALE_BYTES,
         kv_dtype="bf16", index_dtype="bf16", index_scale_dtype="none",
-        exclusions=("mtp", "norm", "lm_head", "embedding", "vision",
-                    "projector", "conv_weight_f32", "conv_weight_bf16"),
+        exclusions=("mtp", "norm", "router", "lm_head", "embedding", "mhc",
+                    "compressor", "vision", "projector",
+                    "conv_weight_f32", "conv_weight_bf16"),
         source=merge_source({
             "quant_method": "w4a8_dynamic",
             "activation_scheme": "dynamic",
@@ -330,18 +332,20 @@ def _quant_fp16() -> QuantSpec:
     )
 
 
-def _quant_mxfp4_all() -> QuantSpec:
+def _quant_mxfp4_all(
+    *, exclusions: tuple[str, ...] = _STANDARD_MXFP4_EXCLUSIONS,
+) -> QuantSpec:
     return QuantSpec(
         name="MXFP4", weight_format="mxfp4", activation_format="fp8_e4m3",
         expert_weight_format="mxfp4",
-        weight_block=(ONE, MX_EXPERT_BLOCK),
+        weight_block=(1, MX_EXPERT_BLOCK),
         expert_block=MX_EXPERT_BLOCK,
         scale_format="fp8_e8m0", scale_bytes=1.0,
         activation_group_size=MX_EXPERT_BLOCK,
         activation_scale_format="fp8_e8m0",
         activation_scale_pack=MX_EXPERT_SCALE_PACK,
         kv_dtype="bf16", index_dtype="bf16", index_scale_dtype="none",
-        exclusions=_STANDARD_MXFP4_EXCLUSIONS,
+        exclusions=exclusions,
         source=merge_source({
             "quant_method": "mxfp4",
             "weight_block_size": "1x32",
@@ -427,7 +431,7 @@ QUANTIZATION_PRESETS: dict[str, Any] = {
     "mxfp8+mxfp4": _quant_mxfp8_mxfp4,
     "quarot_mxfp8_mxfp4": _quant_mxfp8_mxfp4,
     "mxfp4": _quant_mxfp4_all,
-    "mxfp4_all": _quant_mxfp4_all,
+    "mxfp4_all": lambda: _quant_mxfp4_all(exclusions=()),
     "mxfp4_routed_only": lambda: _quant_kimi({}),
     "w8a8_dynamic": _quant_w8a8_dynamic,
     "w8a8": _quant_w8a8_dynamic,

@@ -257,7 +257,11 @@ def probe_soc(
     elif endpoint_alias.strip():
         if container and not _SAFE_CONTAINER_RE.fullmatch(container):
             raise ModelingError(f"soc_probe_container_invalid:{container}")
-        py_cmd = "python3 -c \"import ctypes,json,os,subprocess; soc=os.environ.get('ASCEND_SOC_NAME',''); print(json.dumps({'aclrt_soc_name':soc,'npu_smi_common':subprocess.run(['npu-smi','info','-t','common','-i',str(0)],capture_output=True,text=True).stdout}))\""
+        py_cmd = (
+            "python3 -c \"import ctypes,json,os,subprocess; "
+            "soc=os.environ.get('ASCEND_SOC_NAME',''); "
+            f"print(json.dumps({{'aclrt_soc_name':soc,'npu_smi_common':subprocess.run(['npu-smi','info','-t','common','-i','{int(npu_id)}'],capture_output=True,text=True).stdout}}))\""
+        )
         remote = f"docker exec {shlex.quote(container)} sh -lc {shlex.quote(py_cmd)}" if container else py_cmd
         done = ssh_runner(endpoint_alias, remote, int(timeout_s)) if ssh_runner else _ssh_exec(endpoint_alias, remote, timeout_s=int(timeout_s))
         if int(getattr(done, "returncode", 1)) != 0:
@@ -366,6 +370,8 @@ def _manifest_cann_by_digest(repo_root: str | Path | None, manifest_path: str | 
             continue
         try:
             doc = json.loads(p.read_text(encoding="utf-8"))
+        except TimeoutError:
+            raise
         except (OSError, ValueError):
             continue
         for entry in (doc.get("tables") or {}).values() if isinstance(doc, Mapping) else ():

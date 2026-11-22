@@ -786,7 +786,7 @@ def normalize_model_key(model_id: str) -> str:
         if lower in aliases:
             return aliases[lower]
     stripped = re.sub(
-        r"[-_](?:w\d+a\d+(?:c\d+)?(?:s|sc)?|mxfp\d*|mxfp|fp8|bf16|mtp|quarot|laos|pdmix|nopdmix|xllm|310p?|vllm|mindie|0626|0731|0813|1017|0528|0324|0905|2507|it|instruct|pro)+$",
+        r"(?:[-_](?:w\d+a\d+(?:c\d+)?(?:s|sc)?|mxfp\d*|mxfp|fp8|bf16|mtp|floatmtp|quarot|laos|pdmix|nopdmix|xllm|310p?|vllm|mindie|exp|terminus|speciale|0626|0731|0813|1017|0528|0324|0905|2507|it|instruct|pro))+$",
         "",
         repo_tail.lower(),
     )

@@ -569,6 +569,24 @@ class WhiteboxSpineRunner:
         self.primitive_table = primitive_table
         self.profile_override = deepcopy(dict(profile_override)) if isinstance(profile_override, Mapping) else None
 
+    @staticmethod
+    def _apply_model_overrides(composed: Mapping[str, Any], overrides: Mapping[str, Any]) -> dict[str, Any]:
+        md = dict(composed["model"])
+        if "layers" in overrides:
+            nl = int(overrides["layers"])
+            md["layers"], md["body_layers"], md["layer_plans"] = nl, nl, list(md["layer_plans"])[:nl]
+        if "index_topk" in overrides:
+            tk = int(overrides["index_topk"])
+            md["mla"] = {**dict(md.get("mla") or {}), "index_topk": tk}
+            if isinstance(md.get("layer_plans"), list):
+                md["layer_plans"] = [
+                    {**dict(lp), "index_topk": tk} if isinstance(lp, Mapping) and lp.get("index_topk") is not None else lp
+                    for lp in md["layer_plans"]
+                ]
+        if "index_dtype" in overrides:
+            md["quant"] = {**dict(md.get("quant") or {}), "index_dtype": str(overrides["index_dtype"]).strip()}
+        return {**composed, "model": md}
+
     def _materialize_case(self, case: GateCase, payload: Mapping[str, Any]) -> Any:
         from mindie_sim.api import compose_case
         from mindie_sim.compose import compose_case as compose_case_dict
@@ -588,18 +606,7 @@ class WhiteboxSpineRunner:
                     overrides = raw.get("model_overrides")
                     if isinstance(overrides, Mapping) and overrides:
                         d = compose_case_dict(model=str(raw["compose_model"]), hardware=str(raw.get("compose_hardware", case.cohort.sku)), **opts)
-                        md = dict(d["model"])
-                        if "layers" in overrides:
-                            nl = int(overrides["layers"])
-                            md["layers"], md["body_layers"], md["layer_plans"] = nl, nl, list(md["layer_plans"])[:nl]
-                        if "index_topk" in overrides:
-                            tk = int(overrides["index_topk"])
-                            md["mla"] = {**dict(md.get("mla") or {}), "index_topk": tk}
-                            if isinstance(md.get("layer_plans"), list):
-                                md["layer_plans"] = [{**dict(lp), "index_topk": tk} if isinstance(lp, Mapping) and lp.get("index_topk") is not None else lp for lp in md["layer_plans"]]
-                        if "index_dtype" in overrides:
-                            md["quant"] = {**dict(md.get("quant") or {}), "index_dtype": str(overrides["index_dtype"]).strip()}
-                        sim_case = parse_case({**d, "model": md})
+                        sim_case = parse_case(self._apply_model_overrides(d, overrides))
                     else:
                         sim_case = compose_case(raw["compose_model"], raw.get("compose_hardware", case.cohort.sku), options=opts or None)
                 else:

@@ -24,9 +24,10 @@
 """
 from __future__ import annotations
 
+import json
 import math
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Sequence
+from typing import Any, Sequence
 
 from mindie_sim.catalog.ops import gemm_op, vector_op
 from mindie_sim.catalog.types import QuantSpec, VisionSpec
@@ -34,6 +35,11 @@ from mindie_sim.schema.model import ModelSpec
 from mindie_sim.schema.operators import OpSpec
 from mindie_sim.schema.common import ModelingError, dtype_bytes
 from mindie_sim.schema.parallel import ParallelSpec
+
+VISION_NORM_OPS_PER_ELEMENT = 5.0
+VISION_SOFTMAX_OPS_PER_ELEMENT = 5.0
+VISION_ACT_OPS_PER_ELEMENT = 4.0
+VISION_FP32_SCORE_BYTES = 4.0
 
 
 @dataclass
@@ -70,6 +76,314 @@ def media_geometry(
 
 def _requests(views: Sequence[Any]) -> tuple[str, ...]:
     return tuple(view.request_id for view in views)
+
+
+def _lower_vision_layer_attention(
+    *, prefix: str, layer: int, last: str, vision: VisionSpec, patch_tokens: int,
+    head_dim: int, dtype: str, quant: QuantSpec, mode: str,
+    requests: tuple[str, ...], stage: int,
+) -> tuple[list[OpSpec], str]:
+    """Lower norm1 + QKV + QK/softmax/PV + Wo + residual1 for one vision layer."""
+    norm1 = vector_op(
+        op_id=f"{prefix}.norm1", deps=(last,), stage=stage, layer=layer,
+        requests=requests, elements=max(1, patch_tokens * vision.hidden_size),
+        ops_per_element=VISION_NORM_OPS_PER_ELEMENT, dtype=dtype,
+        family="layernorm" if vision.norm_type == "layernorm" else "rmsnorm",
+        phase=mode, recipe="catalog_vision_norm",
+        shape=(patch_tokens, vision.hidden_size),
+        metadata=(("tokens", patch_tokens),
+                  ("reduction_width", vision.hidden_size),
+                  ("norm_type", vision.norm_type),
+                  ("norm_eps", vision.norm_eps)),
+    )
+    qkv = gemm_op(
+        op_id=f"{prefix}.qkv", deps=(norm1.op_id,), stage=stage, layer=layer,
+        requests=requests, m=patch_tokens, n=vision.qkv_width,
+        k=vision.hidden_size, quant=quant, category="vision", phase=mode,
+        family="qkv_projection", semantic_family="vision_qkv_projection",
+    )
+    ordered: list[OpSpec] = [norm1, qkv]
+    qkv_ready = qkv.op_id
+    if vision.bias:
+        qkv_bias = vector_op(
+            op_id=f"{prefix}.qkv_bias", deps=(qkv.op_id,), stage=stage,
+            layer=layer, requests=requests,
+            elements=max(1, patch_tokens * vision.qkv_width),
+            ops_per_element=1.0, dtype=dtype, family="elementwise",
+            phase=mode, recipe="catalog_vision_bias",
+            semantic_family="vision_qkv_bias",
+        )
+        ordered.append(qkv_bias)
+        qkv_ready = qkv_bias.op_id
+    score_bytes = patch_tokens * patch_tokens * vision.num_heads * VISION_FP32_SCORE_BYTES
+    q_bytes = patch_tokens * vision.query_width * dtype_bytes(dtype)
+    qk = OpSpec(
+        op_id=f"{prefix}.qk", family="attention_qk", phase=mode,
+        stage=stage, layer=layer, requests=requests,
+        semantic_shape=(patch_tokens, patch_tokens, vision.num_heads, head_dim),
+        local_shape=(patch_tokens, patch_tokens, vision.num_heads, head_dim),
+        padded_shape=(patch_tokens, patch_tokens, vision.num_heads, head_dim),
+        launch_shape=(patch_tokens, patch_tokens, vision.num_heads, head_dim),
+        flops=2.0 * vision.num_heads * patch_tokens * patch_tokens * head_dim,
+        hbm_bytes=2.0 * q_bytes + score_bytes,
+        mte2_bytes=2.0 * q_bytes,
+        mte3_bytes=score_bytes,
+        deps=(qkv_ready,), recipe="catalog_vision_qk", dtype=dtype,
+    )
+    soft = vector_op(
+        op_id=f"{prefix}.softmax", deps=(qk.op_id,), stage=stage, layer=layer,
+        requests=requests, elements=max(1, patch_tokens * vision.num_heads * patch_tokens),
+        ops_per_element=VISION_SOFTMAX_OPS_PER_ELEMENT, dtype="fp32",
+        family="attention_softmax", phase=mode, recipe="catalog_vision_softmax",
+    )
+    pv = OpSpec(
+        op_id=f"{prefix}.pv", family="attention_pv", phase=mode,
+        stage=stage, layer=layer, requests=requests,
+        semantic_shape=(patch_tokens, patch_tokens, vision.num_heads, head_dim),
+        local_shape=(patch_tokens, patch_tokens, vision.num_heads, head_dim),
+        padded_shape=(patch_tokens, patch_tokens, vision.num_heads, head_dim),
+        launch_shape=(patch_tokens, patch_tokens, vision.num_heads, head_dim),
+        flops=2.0 * vision.num_heads * patch_tokens * patch_tokens * head_dim,
+        hbm_bytes=2 * q_bytes + score_bytes,
+        mte2_bytes=q_bytes + score_bytes,
+        mte3_bytes=q_bytes,
+        deps=(soft.op_id,), recipe="catalog_vision_pv", dtype=dtype,
+    )
+    wo = gemm_op(
+        op_id=f"{prefix}.wo", deps=(pv.op_id,), stage=stage, layer=layer,
+        requests=requests, m=patch_tokens, n=vision.hidden_size,
+        k=vision.query_width, quant=quant, category="vision", phase=mode,
+        family="o_projection", semantic_family="vision_output_projection",
+    )
+    ordered.extend([qk, soft, pv, wo])
+    wo_ready = wo.op_id
+    if vision.bias:
+        wo_bias = vector_op(
+            op_id=f"{prefix}.wo_bias", deps=(wo.op_id,), stage=stage,
+            layer=layer, requests=requests,
+            elements=max(1, patch_tokens * vision.hidden_size),
+            ops_per_element=1.0, dtype=dtype, family="elementwise",
+            phase=mode, recipe="catalog_vision_bias",
+            semantic_family="vision_wo_bias",
+        )
+        ordered.append(wo_bias)
+        wo_ready = wo_bias.op_id
+    add1 = vector_op(
+        op_id=f"{prefix}.residual1", deps=(wo_ready, last), stage=stage,
+        layer=layer, requests=requests,
+        elements=max(1, patch_tokens * vision.hidden_size),
+        ops_per_element=2.0, dtype=dtype, family="elementwise", phase=mode,
+        recipe="catalog_vision_residual",
+    )
+    ordered.append(add1)
+    return ordered, add1.op_id
+
+
+def _lower_vision_layer(
+    *, layer: int, last: str, vision: VisionSpec, patch_tokens: int,
+    head_dim: int, dtype: str, quant: QuantSpec, mode: str,
+    requests: tuple[str, ...], stage: int,
+) -> tuple[list[OpSpec], str]:
+    """Lower one vision encoder transformer block (attention + MLP)."""
+    prefix = f"vision.l{layer}"
+    ordered, add1_id = _lower_vision_layer_attention(
+        prefix=prefix, layer=layer, last=last, vision=vision,
+        patch_tokens=patch_tokens, head_dim=head_dim, dtype=dtype,
+        quant=quant, mode=mode, requests=requests, stage=stage,
+    )
+    norm2 = vector_op(
+        op_id=f"{prefix}.norm2", deps=(add1_id,), stage=stage, layer=layer,
+        requests=requests, elements=max(1, patch_tokens * vision.hidden_size),
+        ops_per_element=VISION_NORM_OPS_PER_ELEMENT, dtype=dtype,
+        family="layernorm" if vision.norm_type == "layernorm" else "rmsnorm",
+        phase=mode, recipe="catalog_vision_norm",
+        shape=(patch_tokens, vision.hidden_size),
+        metadata=(("tokens", patch_tokens),
+                  ("reduction_width", vision.hidden_size),
+                  ("norm_type", vision.norm_type),
+                  ("norm_eps", vision.norm_eps)),
+    )
+    fc0_width = (2 if vision.gated_mlp else 1) * vision.intermediate_size
+    fc0 = gemm_op(
+        op_id=f"{prefix}.fc0", deps=(norm2.op_id,), stage=stage, layer=layer,
+        requests=requests, m=patch_tokens, n=fc0_width,
+        k=vision.hidden_size, quant=quant, category="vision", phase=mode,
+        family="gate_up_projection", semantic_family="vision_mlp_fc0",
+        metadata=(("gated_mlp", vision.gated_mlp),),
+    )
+    ordered.extend([norm2, fc0])
+    fc0_ready = fc0.op_id
+    if vision.bias:
+        fc0_bias = vector_op(
+            op_id=f"{prefix}.fc0_bias", deps=(fc0.op_id,), stage=stage,
+            layer=layer, requests=requests,
+            elements=max(1, patch_tokens * fc0_width),
+            ops_per_element=1.0, dtype=dtype, family="elementwise",
+            phase=mode, recipe="catalog_vision_bias",
+            semantic_family="vision_fc0_bias",
+        )
+        ordered.append(fc0_bias)
+        fc0_ready = fc0_bias.op_id
+    act_elements = max(1, patch_tokens * vision.intermediate_size)
+    act_bytes = dtype_bytes(dtype)
+    act = vector_op(
+        op_id=f"{prefix}.act", deps=(fc0_ready,), stage=stage, layer=layer,
+        requests=requests, elements=act_elements,
+        ops_per_element=VISION_ACT_OPS_PER_ELEMENT, dtype=dtype,
+        family="swiglu" if vision.gated_mlp else "gelu", phase=mode,
+        recipe="catalog_vision_activation",
+        shape=(patch_tokens, vision.intermediate_size),
+        read_bytes_override=2.0 * act_elements * act_bytes if vision.gated_mlp else None,
+        write_bytes_override=1.0 * act_elements * act_bytes if vision.gated_mlp else None,
+        metadata=(("activation", vision.activation),
+                  ("read_halves", 2 if vision.gated_mlp else 1),
+                  ("write_outputs", 1),
+                  ("packed_gate_input", bool(vision.gated_mlp))),
+    )
+    fc1 = gemm_op(
+        op_id=f"{prefix}.fc1", deps=(act.op_id,), stage=stage, layer=layer,
+        requests=requests, m=patch_tokens, n=vision.hidden_size,
+        k=vision.intermediate_size, quant=quant, category="vision",
+        phase=mode, family="down_projection", semantic_family="vision_mlp_fc1",
+    )
+    ordered.extend([act, fc1])
+    fc1_ready = fc1.op_id
+    if vision.bias:
+        fc1_bias = vector_op(
+            op_id=f"{prefix}.fc1_bias", deps=(fc1.op_id,), stage=stage,
+            layer=layer, requests=requests,
+            elements=max(1, patch_tokens * vision.hidden_size),
+            ops_per_element=1.0, dtype=dtype, family="elementwise",
+            phase=mode, recipe="catalog_vision_bias",
+            semantic_family="vision_fc1_bias",
+        )
+        ordered.append(fc1_bias)
+        fc1_ready = fc1_bias.op_id
+    add2 = vector_op(
+        op_id=f"{prefix}.out", deps=(fc1_ready, add1_id), stage=stage,
+        layer=layer, requests=requests,
+        elements=max(1, patch_tokens * vision.hidden_size),
+        ops_per_element=2.0, dtype=dtype, family="elementwise", phase=mode,
+        recipe="catalog_vision_residual",
+    )
+    ordered.append(add2)
+    return ordered, add2.op_id
+
+
+def _lower_vision_projector(
+    *, merge_id: str, vision: VisionSpec, text_positions: int,
+    dtype: str, quant: QuantSpec, mode: str, requests: tuple[str, ...],
+    stage: int,
+) -> tuple[list[OpSpec], str]:
+    """Lower the multimodal spatial-merge projector into the language width."""
+    if vision.kind == "deepseek_v41":
+        proj1 = gemm_op(
+            op_id="vision.projector1", deps=(merge_id,), stage=stage,
+            layer=vision.layers, requests=requests, m=text_positions,
+            n=vision.out_hidden_size, k=vision.aligner_input_width,
+            quant=quant, category="projector", phase=mode,
+            family="vision_projector", semantic_family="aligner_w1",
+        )
+        proj1_gelu = vector_op(
+            op_id="vision.projector1_gelu", deps=(proj1.op_id,), stage=stage,
+            layer=vision.layers, requests=requests,
+            elements=max(1, text_positions * vision.out_hidden_size),
+            ops_per_element=VISION_ACT_OPS_PER_ELEMENT, dtype=dtype,
+            family="gelu", phase=mode, recipe="catalog_aligner_gelu",
+        )
+        proj2 = gemm_op(
+            op_id="vision.projector2", deps=(proj1_gelu.op_id,), stage=stage,
+            layer=vision.layers, requests=requests, m=text_positions,
+            n=vision.out_hidden_size, k=vision.out_hidden_size,
+            quant=quant, category="projector", phase=mode,
+            family="vision_projector", semantic_family="aligner_w2",
+        )
+        aligner_bias = vector_op(
+            op_id="vision.projector2_bias", deps=(proj2.op_id,), stage=stage,
+            layer=vision.layers, requests=requests,
+            elements=max(1, text_positions * vision.out_hidden_size),
+            ops_per_element=1.0, dtype=dtype, family="elementwise", phase=mode,
+            recipe="catalog_aligner_bias",
+            semantic_family="aligner_w2_bias",
+        )
+        return [proj1, proj1_gelu, proj2, aligner_bias], aligner_bias.op_id
+    if vision.kind == "kimi_k3":
+        proj0 = gemm_op(
+            op_id="vision.projector0", deps=(merge_id,), stage=stage,
+            layer=vision.layers, requests=requests, m=text_positions,
+            n=vision.aligner_hidden_size, k=vision.aligner_input_width,
+            quant=quant, category="projector", phase=mode,
+            family="vision_projector", semantic_family="patchmergerv2_proj0",
+        )
+        proj0_gelu = vector_op(
+            op_id="vision.projector0_gelu", deps=(proj0.op_id,), stage=stage,
+            layer=vision.layers, requests=requests,
+            elements=max(1, text_positions * vision.aligner_hidden_size),
+            ops_per_element=VISION_ACT_OPS_PER_ELEMENT, dtype=dtype,
+            family="gelu", phase=mode, recipe="catalog_kimi_projector_gelu",
+        )
+        proj2 = gemm_op(
+            op_id="vision.projector2", deps=(proj0_gelu.op_id,), stage=stage,
+            layer=vision.layers, requests=requests, m=text_positions,
+            n=vision.out_hidden_size, k=vision.aligner_hidden_size,
+            quant=quant, category="projector", phase=mode,
+            family="vision_projector", semantic_family="patchmergerv2_proj2",
+        )
+        post_norm = vector_op(
+            op_id="vision.projector_post_norm", deps=(proj2.op_id,),
+            stage=stage, layer=vision.layers, requests=requests,
+            elements=max(1, text_positions * vision.out_hidden_size),
+            ops_per_element=VISION_NORM_OPS_PER_ELEMENT, dtype=dtype,
+            family="rmsnorm", phase=mode,
+            recipe="catalog_kimi_projector_post_norm",
+            shape=(text_positions, vision.out_hidden_size),
+            metadata=(("tokens", text_positions),
+                      ("reduction_width", vision.out_hidden_size),
+                      ("norm_type", "rmsnorm"),
+                      ("norm_eps", vision.norm_eps)),
+        )
+        return [proj0, proj0_gelu, proj2, post_norm], post_norm.op_id
+    merger_norm = vector_op(
+        op_id="vision.merger_norm", deps=(merge_id,), stage=stage,
+        layer=vision.layers, requests=requests,
+        elements=max(1, text_positions * vision.aligner_input_width),
+        ops_per_element=VISION_NORM_OPS_PER_ELEMENT, dtype=dtype,
+        family="layernorm", phase=mode, recipe="catalog_qwen_merger_norm",
+        shape=(text_positions, vision.aligner_input_width),
+        metadata=(("tokens", text_positions),
+                  ("reduction_width", vision.aligner_input_width),
+                  ("norm_type", "layernorm"),
+                  ("norm_eps", vision.norm_eps)),
+    )
+    merger_w1 = gemm_op(
+        op_id="vision.merger_w1", deps=(merger_norm.op_id,), stage=stage,
+        layer=vision.layers, requests=requests, m=text_positions,
+        n=vision.aligner_input_width, k=vision.aligner_input_width,
+        quant=quant, category="projector", phase=mode,
+        family="vision_projector", semantic_family="qwen_merger_w1",
+    )
+    merger_gelu = vector_op(
+        op_id="vision.merger_gelu", deps=(merger_w1.op_id,), stage=stage,
+        layer=vision.layers, requests=requests,
+        elements=max(1, text_positions * vision.aligner_input_width),
+        ops_per_element=VISION_ACT_OPS_PER_ELEMENT, dtype=dtype,
+        family="gelu", phase=mode, recipe="catalog_qwen_merger_gelu",
+    )
+    merger = gemm_op(
+        op_id="vision.merger", deps=(merger_gelu.op_id,), stage=stage,
+        layer=vision.layers, requests=requests, m=text_positions,
+        n=vision.out_hidden_size, k=vision.aligner_input_width,
+        quant=quant, category="projector", phase=mode,
+        family="vision_projector", semantic_family="qwen_merger_w2",
+    )
+    merger_bias = vector_op(
+        op_id="vision.merger_bias", deps=(merger.op_id,), stage=stage,
+        layer=vision.layers, requests=requests,
+        elements=max(1, text_positions * vision.out_hidden_size),
+        ops_per_element=1.0, dtype=dtype, family="elementwise", phase=mode,
+        recipe="catalog_qwen_merger_bias",
+    )
+    return [merger_norm, merger_w1, merger_gelu, merger, merger_bias], merger_bias.op_id
 
 
 def lower_media(
@@ -127,190 +441,16 @@ def lower_media(
         last = pos.op_id
     head_dim = vision.head_dim
     for layer in range(vision.layers):
-        prefix = f"vision.l{layer}"
-        norm1 = vector_op(
-            op_id=f"{prefix}.norm1", deps=(last,), stage=stage, layer=layer,
-            requests=requests, elements=max(1, patch_tokens * vision.hidden_size),
-            ops_per_element=5.0, dtype=dtype,
-            family="layernorm" if vision.norm_type == "layernorm" else "rmsnorm",
-            phase=mode, recipe="catalog_vision_norm",
-            shape=(patch_tokens, vision.hidden_size),
-            metadata=(("tokens", patch_tokens),
-                      ("reduction_width", vision.hidden_size),
-                      ("norm_type", vision.norm_type),
-                      ("norm_eps", vision.norm_eps)),
+        layer_ops, last = _lower_vision_layer(
+            layer=layer, last=last, vision=vision, patch_tokens=patch_tokens,
+            head_dim=head_dim, dtype=dtype, quant=quant, mode=mode,
+            requests=requests, stage=stage,
         )
-        qkv = gemm_op(
-            op_id=f"{prefix}.qkv", deps=(norm1.op_id,), stage=stage, layer=layer,
-            requests=requests, m=patch_tokens, n=vision.qkv_width,
-            k=vision.hidden_size, quant=quant, category="vision", phase=mode,
-            family="qkv_projection", semantic_family="vision_qkv_projection",
-        )
-        qkv_ready = qkv.op_id
-        if vision.bias:
-            qkv_bias = vector_op(
-                op_id=f"{prefix}.qkv_bias", deps=(qkv.op_id,), stage=stage,
-                layer=layer, requests=requests,
-                elements=max(1, patch_tokens * vision.qkv_width),
-                ops_per_element=1.0, dtype=dtype, family="elementwise",
-                phase=mode, recipe="catalog_vision_bias",
-                semantic_family="vision_qkv_bias",
-            )
-            qkv_ready = qkv_bias.op_id
-        qk = OpSpec(
-            op_id=f"{prefix}.qk", family="attention_qk", phase=mode,
-            stage=stage, layer=layer, requests=requests,
-            semantic_shape=(patch_tokens, patch_tokens, vision.num_heads, head_dim),
-            local_shape=(patch_tokens, patch_tokens, vision.num_heads, head_dim),
-            padded_shape=(patch_tokens, patch_tokens, vision.num_heads, head_dim),
-            launch_shape=(patch_tokens, patch_tokens, vision.num_heads, head_dim),
-            flops=2.0 * vision.num_heads * patch_tokens * patch_tokens * head_dim,
-            hbm_bytes=2.0 * patch_tokens * vision.query_width * dtype_bytes(dtype)
-            + patch_tokens * patch_tokens * vision.num_heads * 4.0,
-            mte2_bytes=2.0 * patch_tokens * vision.query_width * dtype_bytes(dtype),
-            mte3_bytes=patch_tokens * patch_tokens * vision.num_heads * 4.0,
-            deps=(qkv_ready,), recipe="catalog_vision_qk", dtype=dtype,
-        )
-        soft = vector_op(
-            op_id=f"{prefix}.softmax", deps=(qk.op_id,), stage=stage, layer=layer,
-            requests=requests, elements=max(1, patch_tokens * vision.num_heads * patch_tokens),
-            ops_per_element=5.0, dtype="fp32", family="attention_softmax",
-            phase=mode, recipe="catalog_vision_softmax",
-        )
-        pv = OpSpec(
-            op_id=f"{prefix}.pv", family="attention_pv", phase=mode,
-            stage=stage, layer=layer, requests=requests,
-            semantic_shape=(patch_tokens, patch_tokens, vision.num_heads, head_dim),
-            local_shape=(patch_tokens, patch_tokens, vision.num_heads, head_dim),
-            padded_shape=(patch_tokens, patch_tokens, vision.num_heads, head_dim),
-            launch_shape=(patch_tokens, patch_tokens, vision.num_heads, head_dim),
-            flops=2.0 * vision.num_heads * patch_tokens * patch_tokens * head_dim,
-            hbm_bytes=2 * patch_tokens * vision.query_width * dtype_bytes(dtype)
-            + patch_tokens * patch_tokens * vision.num_heads * 4.0,
-            mte2_bytes=patch_tokens * vision.query_width * dtype_bytes(dtype)
-            + patch_tokens * patch_tokens * vision.num_heads * 4.0,
-            mte3_bytes=patch_tokens * vision.query_width * dtype_bytes(dtype),
-            deps=(soft.op_id,), recipe="catalog_vision_pv", dtype=dtype,
-        )
-        wo = gemm_op(
-            op_id=f"{prefix}.wo", deps=(pv.op_id,), stage=stage, layer=layer,
-            requests=requests, m=patch_tokens, n=vision.hidden_size,
-            k=vision.query_width, quant=quant, category="vision", phase=mode,
-            family="o_projection", semantic_family="vision_output_projection",
-        )
-        wo_ready = wo.op_id
-        if vision.bias:
-            wo_bias = vector_op(
-                op_id=f"{prefix}.wo_bias", deps=(wo.op_id,), stage=stage,
-                layer=layer, requests=requests,
-                elements=max(1, patch_tokens * vision.hidden_size),
-                ops_per_element=1.0, dtype=dtype, family="elementwise",
-                phase=mode, recipe="catalog_vision_bias",
-                semantic_family="vision_wo_bias",
-            )
-            wo_ready = wo_bias.op_id
-        add1 = vector_op(
-            op_id=f"{prefix}.residual1", deps=(wo_ready, last), stage=stage,
-            layer=layer, requests=requests,
-            elements=max(1, patch_tokens * vision.hidden_size),
-            ops_per_element=2.0, dtype=dtype, family="elementwise", phase=mode,
-            recipe="catalog_vision_residual",
-        )
-        norm2 = vector_op(
-            op_id=f"{prefix}.norm2", deps=(add1.op_id,), stage=stage, layer=layer,
-            requests=requests, elements=max(1, patch_tokens * vision.hidden_size),
-            ops_per_element=5.0, dtype=dtype,
-            family="layernorm" if vision.norm_type == "layernorm" else "rmsnorm",
-            phase=mode, recipe="catalog_vision_norm",
-            shape=(patch_tokens, vision.hidden_size),
-            metadata=(("tokens", patch_tokens),
-                      ("reduction_width", vision.hidden_size),
-                      ("norm_type", vision.norm_type),
-                      ("norm_eps", vision.norm_eps)),
-        )
-        fc0 = gemm_op(
-            op_id=f"{prefix}.fc0", deps=(norm2.op_id,), stage=stage, layer=layer,
-            requests=requests, m=patch_tokens,
-            n=(2 if vision.gated_mlp else 1) * vision.intermediate_size,
-            k=vision.hidden_size, quant=quant, category="vision", phase=mode,
-            family="gate_up_projection", semantic_family="vision_mlp_fc0",
-            metadata=(("gated_mlp", vision.gated_mlp),),
-        )
-        fc0_ready = fc0.op_id
-        if vision.bias:
-            fc0_bias = vector_op(
-                op_id=f"{prefix}.fc0_bias", deps=(fc0.op_id,), stage=stage,
-                layer=layer, requests=requests,
-                elements=max(1, patch_tokens * (2 if vision.gated_mlp else 1)
-                             * vision.intermediate_size),
-                ops_per_element=1.0, dtype=dtype, family="elementwise",
-                phase=mode, recipe="catalog_vision_bias",
-                semantic_family="vision_fc0_bias",
-            )
-            fc0_ready = fc0_bias.op_id
-        act_elements = max(1, patch_tokens * vision.intermediate_size)
-        act_bytes = dtype_bytes(dtype)
-        act = vector_op(
-            op_id=f"{prefix}.act", deps=(fc0_ready,), stage=stage, layer=layer,
-            requests=requests, elements=act_elements,
-            ops_per_element=4.0, dtype=dtype,
-            family="swiglu" if vision.gated_mlp else "gelu", phase=mode,
-            recipe="catalog_vision_activation",
-            shape=(patch_tokens, vision.intermediate_size),
-            read_bytes_override=(
-                2.0 * act_elements * act_bytes if vision.gated_mlp else None
-            ),
-            write_bytes_override=(
-                1.0 * act_elements * act_bytes if vision.gated_mlp else None
-            ),
-            metadata=(("activation", vision.activation),
-                      ("read_halves", 2 if vision.gated_mlp else 1),
-                      ("write_outputs", 1),
-                      ("packed_gate_input", bool(vision.gated_mlp))),
-        )
-        fc1 = gemm_op(
-            op_id=f"{prefix}.fc1", deps=(act.op_id,), stage=stage, layer=layer,
-            requests=requests, m=patch_tokens, n=vision.hidden_size,
-            k=vision.intermediate_size, quant=quant, category="vision",
-            phase=mode, family="down_projection", semantic_family="vision_mlp_fc1",
-        )
-        fc1_ready = fc1.op_id
-        if vision.bias:
-            fc1_bias = vector_op(
-                op_id=f"{prefix}.fc1_bias", deps=(fc1.op_id,), stage=stage,
-                layer=layer, requests=requests,
-                elements=max(1, patch_tokens * vision.hidden_size),
-                ops_per_element=1.0, dtype=dtype, family="elementwise",
-                phase=mode, recipe="catalog_vision_bias",
-                semantic_family="vision_fc1_bias",
-            )
-            fc1_ready = fc1_bias.op_id
-        add2 = vector_op(
-            op_id=f"{prefix}.out", deps=(fc1_ready, add1.op_id), stage=stage,
-            layer=layer, requests=requests,
-            elements=max(1, patch_tokens * vision.hidden_size),
-            ops_per_element=2.0, dtype=dtype, family="elementwise", phase=mode,
-            recipe="catalog_vision_residual",
-        )
-        ordered = [norm1, qkv]
-        if vision.bias:
-            ordered.append(qkv_bias)
-        ordered.extend([qk, soft, pv, wo])
-        if vision.bias:
-            ordered.append(wo_bias)
-        ordered.extend([add1, norm2, fc0])
-        if vision.bias:
-            ordered.append(fc0_bias)
-        ordered.extend([act, fc1])
-        if vision.bias:
-            ordered.append(fc1_bias)
-        ordered.append(add2)
-        ops.extend(ordered)
-        last = add2.op_id
+        ops.extend(layer_ops)
     final_norm = vector_op(
         op_id="vision.final_norm", deps=(last,), stage=stage, layer=vision.layers,
         requests=requests, elements=max(1, patch_tokens * vision.hidden_size),
-        ops_per_element=5.0, dtype=dtype,
+        ops_per_element=VISION_NORM_OPS_PER_ELEMENT, dtype=dtype,
         family="layernorm" if vision.norm_type == "layernorm" else "rmsnorm",
         phase=mode, recipe="catalog_vision_final_norm",
         shape=(patch_tokens, vision.hidden_size),
@@ -332,117 +472,11 @@ def lower_media(
                   ("post_merge_tokens", text_positions)),
     )
     ops.append(merge)
-    if vision.kind == "deepseek_v41":
-        proj1 = gemm_op(
-            op_id="vision.projector1", deps=(merge.op_id,), stage=stage,
-            layer=vision.layers, requests=requests, m=text_positions,
-            n=vision.out_hidden_size, k=vision.aligner_input_width,
-            quant=quant, category="projector", phase=mode,
-            family="vision_projector", semantic_family="aligner_w1",
-        )
-        proj1_gelu = vector_op(
-            op_id="vision.projector1_gelu", deps=(proj1.op_id,), stage=stage,
-            layer=vision.layers, requests=requests,
-            elements=max(1, text_positions * vision.out_hidden_size),
-            ops_per_element=4.0, dtype=dtype, family="gelu", phase=mode,
-            recipe="catalog_aligner_gelu",
-        )
-        proj2 = gemm_op(
-            op_id="vision.projector2", deps=(proj1_gelu.op_id,), stage=stage,
-            layer=vision.layers, requests=requests, m=text_positions,
-            n=vision.out_hidden_size, k=vision.out_hidden_size,
-            quant=quant, category="projector", phase=mode,
-            family="vision_projector", semantic_family="aligner_w2",
-        )
-        aligner_bias = vector_op(
-            op_id="vision.projector2_bias", deps=(proj2.op_id,), stage=stage,
-            layer=vision.layers, requests=requests,
-            elements=max(1, text_positions * vision.out_hidden_size),
-            ops_per_element=1.0, dtype=dtype, family="elementwise", phase=mode,
-            recipe="catalog_aligner_bias",
-            semantic_family="aligner_w2_bias",
-        )
-        ops.extend([proj1, proj1_gelu, proj2, aligner_bias])
-        last = aligner_bias.op_id
-    elif vision.kind == "kimi_k3":
-        proj0 = gemm_op(
-            op_id="vision.projector0", deps=(merge.op_id,), stage=stage,
-            layer=vision.layers, requests=requests, m=text_positions,
-            n=vision.aligner_hidden_size, k=vision.aligner_input_width,
-            quant=quant, category="projector", phase=mode,
-            family="vision_projector", semantic_family="patchmergerv2_proj0",
-        )
-        proj0_gelu = vector_op(
-            op_id="vision.projector0_gelu", deps=(proj0.op_id,), stage=stage,
-            layer=vision.layers, requests=requests,
-            elements=max(1, text_positions * vision.aligner_hidden_size),
-            ops_per_element=4.0, dtype=dtype, family="gelu", phase=mode,
-            recipe="catalog_kimi_projector_gelu",
-        )
-        proj2 = gemm_op(
-            op_id="vision.projector2", deps=(proj0_gelu.op_id,), stage=stage,
-            layer=vision.layers, requests=requests, m=text_positions,
-            n=vision.out_hidden_size, k=vision.aligner_hidden_size,
-            quant=quant, category="projector", phase=mode,
-            family="vision_projector", semantic_family="patchmergerv2_proj2",
-        )
-        post_norm = vector_op(
-            op_id="vision.projector_post_norm", deps=(proj2.op_id,),
-            stage=stage, layer=vision.layers, requests=requests,
-            elements=max(1, text_positions * vision.out_hidden_size),
-            ops_per_element=5.0, dtype=dtype, family="rmsnorm", phase=mode,
-            recipe="catalog_kimi_projector_post_norm",
-            shape=(text_positions, vision.out_hidden_size),
-            metadata=(("tokens", text_positions),
-                      ("reduction_width", vision.out_hidden_size),
-                      ("norm_type", "rmsnorm"),
-                      ("norm_eps", vision.norm_eps)),
-        )
-        ops.extend([proj0, proj0_gelu, proj2, post_norm])
-        last = post_norm.op_id
-    else:
-        merger_norm = vector_op(
-            op_id="vision.merger_norm", deps=(merge.op_id,), stage=stage,
-            layer=vision.layers, requests=requests,
-            elements=max(1, text_positions * vision.aligner_input_width),
-            ops_per_element=5.0, dtype=dtype, family="layernorm", phase=mode,
-            recipe="catalog_qwen_merger_norm",
-            shape=(text_positions, vision.aligner_input_width),
-            metadata=(("tokens", text_positions),
-                      ("reduction_width", vision.aligner_input_width),
-                      ("norm_type", "layernorm"),
-                      ("norm_eps", vision.norm_eps)),
-        )
-        merger_w1 = gemm_op(
-            op_id="vision.merger_w1", deps=(merger_norm.op_id,), stage=stage,
-            layer=vision.layers, requests=requests, m=text_positions,
-            n=vision.aligner_input_width, k=vision.aligner_input_width,
-            quant=quant, category="projector", phase=mode,
-            family="vision_projector", semantic_family="qwen_merger_w1",
-        )
-        merger_gelu = vector_op(
-            op_id="vision.merger_gelu", deps=(merger_w1.op_id,), stage=stage,
-            layer=vision.layers, requests=requests,
-            elements=max(1, text_positions * vision.aligner_input_width),
-            ops_per_element=4.0, dtype=dtype, family="gelu", phase=mode,
-            recipe="catalog_qwen_merger_gelu",
-        )
-        merger = gemm_op(
-            op_id="vision.merger", deps=(merger_gelu.op_id,), stage=stage,
-            layer=vision.layers, requests=requests, m=text_positions,
-            n=vision.out_hidden_size, k=vision.aligner_input_width,
-            quant=quant, category="projector", phase=mode,
-            family="vision_projector", semantic_family="qwen_merger_w2",
-        )
-        merger_bias = vector_op(
-            op_id="vision.merger_bias", deps=(merger.op_id,), stage=stage,
-            layer=vision.layers, requests=requests,
-            elements=max(1, text_positions * vision.out_hidden_size),
-            ops_per_element=1.0, dtype=dtype, family="elementwise", phase=mode,
-            recipe="catalog_qwen_merger_bias",
-        )
-        ops.extend([merger_norm, merger_w1, merger_gelu, merger, merger_bias])
-        last = merger_bias.op_id
+    proj_ops, last = _lower_vision_projector(
+        merge_id=merge.op_id, vision=vision, text_positions=text_positions,
+        dtype=dtype, quant=quant, mode=mode, requests=requests, stage=stage,
+    )
+    ops.extend(proj_ops)
     return MediaExpansion(
         text_positions=text_positions, patch_tokens=patch_tokens,
         grid=(grid_h, grid_w, frames), ops=ops, last=last,
@@ -461,8 +495,6 @@ def media_runtime_metadata(workload: Any) -> dict[str, str]:
     lowering which requests still need tower execution and that positions are
     already budgeted.  Encoded requests are excluded from tower execution.
     """
-    import json
-
     mapping: dict[str, int] = {}
     encoded: list[str] = []
     for request in getattr(workload, "requests", ()):

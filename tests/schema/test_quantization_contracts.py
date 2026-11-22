@@ -640,3 +640,70 @@ def test_production_mxfp8_mxfp4_preset_and_hardware_aware_quant_selection():
     wq_a5_d, kv_a5_d, _ = resolve_auto_va_quant(dense_spec, REPRESENTATIVE_SKUS["a5"], context_tokens=65536)
     assert wq_a5_m == "mxfp8_mxfp4" and kv_a5_m == "fp8_e4m3"
     assert wq_a5_d == "mxfp8" and kv_a5_d == "fp8_e4m3"
+
+
+def test_dynamic_quant_exclusions_mxfp4_all_and_a5_recommended_profiles() -> None:
+    from mindie_sim.runtime_profiles import VA_RECOMMENDED_PROFILES
+
+    for preset_name in ("w8a8", "w4a8"):
+        q = quant_preset(preset_name)
+        for excluded in ("router", "mhc", "compressor"):
+            assert excluded in q.exclusions, (preset_name, excluded)
+        assert q.format_for("router") == "bf16"
+        assert q.format_for("compressor") == "bf16"
+        assert q.format_for("mhc") == "fp32"
+
+    assert quant_preset("mxfp4_all").exclusions == ()
+    for model_key in ("glm-5.1", "glm-5.2"):
+        assert VA_RECOMMENDED_PROFILES[model_key]["quant"]["a5"] == "mxfp8_mxfp4"
+
+
+def test_before_baseline_honesty_mc2_megamoe_and_a3_int8_kv_mlapo() -> None:
+    from mindie_sim.feature_mechanisms import MECHANISM_CATALOG, MechanismContext
+    from mindie_sim.stack_tracks import resolve_runtime_stack, resolve_stack_track
+
+    # A3 INT8-KV MLA enables packed-layout mla_prolog_v3.
+    a3_case = compose_case(
+        "deepseek-v3", hardware=REPRESENTATIVE_SKUS["a3"], layers=4,
+        dp=1, tp=8, ep=8, quant="w8a8", kv_cache_dtype="int8",
+        prompt_tokens=32, output_tokens=2,
+    )
+    a3_prolog = a3_case["runtime"]["kernels"]["lowerings"]["mla_prolog"]
+    assert a3_prolog["implementation"] == "vllm_ascend_mla_prolog_v3"
+    assert a3_prolog["options"]["cache_layout"] == "packed_int8_bf16_rope_fp32_scale"
+
+    # enable_fused_mc2=0 suppresses MC2 & MegaMoE on Before, while expected_ideal
+    # unlocks profile workarounds (yet still respects caller-explicit disable).
+    va_profile = resolve_runtime_stack("vllm-ascend")
+    situ_model = replace(load_model("kimi-k3.1"), quant=quant_preset("mxfp8_mxfp4"))
+    ctx_profile_disabled = MechanismContext(
+        model=situ_model, sku=REPRESENTATIVE_SKUS["a5"], arch="a5",
+        parallel={"dp": 2, "tp": 8, "ep": 16, "pcp": 1, "dcp": 8},
+        caller_explicit=frozenset(), options={"enable_fused_mc2": 0},
+    )
+    for mech_id in ("cann_megamoe_fusion", "tp_mc2_overlap", "dynamic_mc2_dispatch"):
+        assert MECHANISM_CATALOG[mech_id].eligible(ctx_profile_disabled) is False
+
+    res_merged = resolve_stack_track(
+        va_profile, track="merged", model_key="kimi-k3.1", ctx=ctx_profile_disabled,
+    )
+    merged_ids = {entry["id"] for entry in res_merged["active_mechanisms"]}
+    assert "cann_megamoe_fusion" not in merged_ids
+    assert "tp_mc2_overlap" not in merged_ids
+
+    res_ideal = resolve_stack_track(
+        va_profile, track="expected_ideal", model_key="kimi-k3.1", ctx=ctx_profile_disabled,
+    )
+    ideal_ids = {entry["id"] for entry in res_ideal["active_mechanisms"]}
+    assert "cann_megamoe_fusion" in ideal_ids
+    assert "tp_mc2_overlap" in ideal_ids
+
+    ctx_caller_disabled = replace(
+        ctx_profile_disabled, caller_explicit=frozenset({"enable_fused_mc2"}),
+    )
+    res_ideal_locked = resolve_stack_track(
+        va_profile, track="expected_ideal", model_key="kimi-k3.1", ctx=ctx_caller_disabled,
+    )
+    locked_ids = {entry["id"] for entry in res_ideal_locked["active_mechanisms"]}
+    assert "cann_megamoe_fusion" not in locked_ids
+    assert "tp_mc2_overlap" not in locked_ids

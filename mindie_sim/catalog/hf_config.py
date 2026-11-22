@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import re
 from typing import Any, Mapping, Sequence
 
 from .config import flatten_config
@@ -27,6 +28,7 @@ from mindie_sim.schema.common import ModelingError
 
 _NON_LINEAR_EXCLUSION_ROLES = frozenset({
     "lm_head", "embedding", "norm", "router", "indexer_weights", "mtp",
+    "vision", "projector",
 })
 _REGEX_META_CHARS = frozenset("[]?+{}")
 _PARAM_LEAF_SEGMENTS = frozenset({"weight", "bias"})
@@ -37,6 +39,25 @@ _ROLE_EXCLUSION_RULES: tuple[tuple[str, tuple[str, ...], frozenset[str]], ...] =
         "embedding",
         ("embed_tokens", "embedding", "wte", "word_embeddings"),
         frozenset({"embed_tokens", "embedding", "wte", "word_embeddings"}),
+    ),
+    (
+        "vision",
+        ("vision_tower", "visual", "vision_model", "vision_encoder", "vision"),
+        frozenset({
+            "vision_tower", "visual", "vision_model", "vision_encoder", "vision",
+            "blocks", "encoder", "patch_embed", "attn", "mlp", "norm", "norm0",
+            "norm1", "norm2", "proj", "qkv", "wqkv", "wo", "fc0", "fc1",
+            "linear_fc1", "linear_fc2", "pos_emb", "pos_embed", "final_layernorm",
+            "merger", "patch_merger", "spatial_merge", "deepstack_merger_list",
+        }),
+    ),
+    (
+        "projector",
+        ("mm_projector", "multi_modal_projector", "visual_projector", "projector"),
+        frozenset({
+            "mm_projector", "multi_modal_projector", "visual_projector",
+            "projector", "proj", "post_norm", "linear_1", "linear_2", "merger",
+        }),
     ),
     (
         "norm",
@@ -54,11 +75,12 @@ _ROLE_EXCLUSION_RULES: tuple[tuple[str, tuple[str, ...], frozenset[str]], ...] =
     (
         "router",
         (
-            "mlp.gate", "mlp.shared_expert_gate", "shared_expert_gate",
-            "mlp.gate.e_score_correction_bias", "router",
+            "mlp.gate", "block_sparse_moe.gate", "mlp.shared_expert_gate",
+            "shared_expert_gate", "mlp.gate.e_score_correction_bias", "router",
         ),
         frozenset({
-            "mlp", "gate", "shared_expert_gate", "e_score_correction_bias", "router",
+            "mlp", "block_sparse_moe", "gate", "shared_expert_gate",
+            "e_score_correction_bias", "router",
         }),
     ),
     (
@@ -71,7 +93,15 @@ _ROLE_EXCLUSION_RULES: tuple[tuple[str, tuple[str, ...], frozenset[str]], ...] =
         ("eh_proj",),
         frozenset({"eh_proj", "mtp"}),
     ),
-    ("attention", ("self_attn", "attention"), frozenset({"self_attn", "attention"})),
+    (
+        "attention",
+        ("self_attn", "attention"),
+        frozenset({
+            "self_attn", "attention", "q_proj", "k_proj", "v_proj", "o_proj",
+            "qkv_proj", "q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj",
+            "wq_a", "wq_b", "wkv_a", "wkv_b", "wo",
+        }),
+    ),
     (
         "dense_mlp",
         (
@@ -119,7 +149,7 @@ def _expand_simple_alternation(text: str) -> tuple[str, ...] | None:
 def _classify_plain_exclusion(lower: str) -> str | None:
     segments = [
         seg for seg in lower.strip("^$").replace("*", ".").split(".")
-        if seg and seg not in {"model", "layers"} and not seg.isdigit()
+        if seg and seg not in {"model", "language_model", "text_model", "layers"} and not seg.isdigit()
     ]
     if len(segments) > 1 and segments[-1] in _PARAM_LEAF_SEGMENTS:
         segments = segments[:-1]
@@ -138,12 +168,20 @@ def _classify_plain_exclusion(lower: str) -> str | None:
 
 def _classify_exclusion_pattern(pattern: str) -> str | None:
     raw = str(pattern).strip()
-    if not raw or any(ch in raw for ch in _REGEX_META_CHARS):
+    if not raw:
         return None
     is_regex = raw.startswith("re:")
     cleaned = raw[3:] if is_regex else raw
-    lower = cleaned.lower().replace("\\.", ".")
-    if "\\" in lower:
+    lower = (
+        cleaned.lower()
+        .replace("\\.", ".")
+        .replace("\\d+", "*")
+        .replace("\\d*", "*")
+        .replace("[0-9]+", "*")
+        .replace("[0-9]*", "*")
+        .replace("\\d", "*")
+    )
+    if any(ch in lower for ch in _REGEX_META_CHARS) or "\\" in lower:
         return None
     if not is_regex and any(ch in lower for ch in "()|"):
         return None
@@ -152,6 +190,19 @@ def _classify_exclusion_pattern(pattern: str) -> str | None:
         return None
     roles = {_classify_plain_exclusion(variant) for variant in variants}
     return next(iter(roles)) if len(roles) == 1 else None
+
+
+_INDEXED_LAYER_ATTN_RE = re.compile(
+    r"(?:^|\.)layers\.(\d+)\.(?:self_attn|linear_attn|attention)(?:\.|$)"
+)
+
+
+def _is_indexed_layer_attention_exclusion(pattern: str) -> bool:
+    """True for concrete per-layer attention exclusions without wildcards."""
+    raw = str(pattern).strip().lower()
+    if not raw or "*" in raw or any(ch in raw for ch in _REGEX_META_CHARS):
+        return False
+    return _INDEXED_LAYER_ATTN_RE.search(raw) is not None
 
 
 def resolve_role_exclusions(
@@ -336,7 +387,10 @@ def _native_quant_gaps(c, quant):
     excluded = tuple(str(v) for v in (raw.get("modules_to_not_convert") or raw.get("ignore") or ()))
     if excluded:
         resolved_roles, unresolved_patterns = resolve_role_exclusions(excluded)
-        if unresolved_patterns or not set(resolved_roles).issubset(_NON_LINEAR_EXCLUSION_ROLES):
+        truly_unresolved = tuple(
+            p for p in unresolved_patterns if not _is_indexed_layer_attention_exclusion(p)
+        )
+        if truly_unresolved or not set(resolved_roles).issubset(_NON_LINEAR_EXCLUSION_ROLES):
             gaps.append("quant_module_exclusions_unresolved")
     return gaps
 
@@ -599,15 +653,23 @@ def resolve_quant(c):
                 gaps.append(f"quant_scale_format_unmodeled:{scale}:{native}_proxy")
                 return base, gaps
             excluded = tuple(str(v) for v in (raw.get("modules_to_not_convert") or raw.get("ignore") or ()))
-            resolved_roles, unresolved_patterns = resolve_role_exclusions(excluded)
-            exclusions_unresolved = bool(excluded) and (
+            per_layer_indexed = tuple(
+                pat for pat in excluded
+                if _is_indexed_layer_attention_exclusion(pat)
+            )
+            global_excluded = tuple(pat for pat in excluded if pat not in per_layer_indexed)
+            resolved_roles, unresolved_patterns = resolve_role_exclusions(global_excluded)
+            exclusions_unresolved = bool(global_excluded) and (
                 bool(unresolved_patterns)
                 or not set(resolved_roles).issubset(_NON_LINEAR_EXCLUSION_ROLES)
             )
             if exclusions_unresolved:
                 gaps.append("quant_module_exclusions_unresolved")
             base_exclusions = ("norm", "router", "embedding", "lm_head")
-            merged_exclusions = tuple(dict.fromkeys((*base_exclusions, *resolved_roles)))
+            merged_exclusions = tuple(dict.fromkeys((
+                *base_exclusions, *resolved_roles,
+                *(f"module:{pat}" for pat in per_layer_indexed),
+            )))
             quant = QuantSpec(
                 name="hf_fp8_block", weight_format="fp8_e4m3",
                 expert_weight_format="fp8_e4m3", activation_format="fp8_e4m3",
