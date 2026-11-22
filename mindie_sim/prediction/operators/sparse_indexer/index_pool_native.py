@@ -399,6 +399,31 @@ def _emit_row_shard_gather(
     return scratch, wire, gathered
 
 
+def _restore_producer_order(b, prepared, query, weights):
+    """Keep KeyPool producer ops (and PCP index gather) before ``prepared``."""
+    group = b.prefix + ".key_pool"
+    producer_ops = [op for op in b.ops if group in dict(op.metadata).get(
+        "structure_subgraph_memberships", ())]
+    producer_ids = {op.op_id for op in producer_ops}
+    pcp_gathers = [
+        op for op in b.ops
+        if op.op_id not in producer_ids and op.recipe == "pcp_index_gather"
+        and any(dep in producer_ids for dep in op.deps)
+    ]
+    moved_ids = producer_ids | {op.op_id for op in pcp_gathers}
+    remaining = [op for op in b.ops if op.op_id not in moved_ids]
+    rewired_producers = [
+        replace(op, deps=tuple(dict.fromkeys((*op.deps, query, weights))))
+        if op.recipe == "cann_keypool_state_gather" else op
+        for op in producer_ops
+    ]
+    insert_at = next(
+        (idx for idx, op in enumerate(remaining) if op.op_id == prepared),
+        len(remaining),
+    )
+    b.ops = remaining[:insert_at] + rewired_producers + pcp_gathers + remaining[insert_at:]
+
+
 def selection(b, *, query, weights, cache, views, plan, quant, padded_tokens,
               score_mode="linear_weighted_query", hierarchy=None, runtime=None,
               shard_sizes=None, **options):
@@ -500,27 +525,7 @@ def selection(b, *, query, weights, cache, views, plan, quant, padded_tokens,
     # and calls KeyPool. Restore that real enqueue/dependency order while
     # keeping producer ops (and any PCP index gather consuming them) strictly
     # before ``cann_keypool_nonempty_inputs`` so the DAG stays topological.
-    group = b.prefix + ".key_pool"
-    producer_ops = [op for op in b.ops if group in dict(op.metadata).get(
-        "structure_subgraph_memberships", ())]
-    producer_ids = {op.op_id for op in producer_ops}
-    pcp_gathers = [
-        op for op in b.ops
-        if op.op_id not in producer_ids and op.recipe == "pcp_index_gather"
-        and any(dep in producer_ids for dep in op.deps)
-    ]
-    moved_ids = producer_ids | {op.op_id for op in pcp_gathers}
-    remaining = [op for op in b.ops if op.op_id not in moved_ids]
-    rewired_producers = [
-        replace(op, deps=tuple(dict.fromkeys((*op.deps, query, weights))))
-        if op.recipe == "cann_keypool_state_gather" else op
-        for op in producer_ops
-    ]
-    insert_at = next(
-        (idx for idx, op in enumerate(remaining) if op.op_id == prepared),
-        len(remaining),
-    )
-    b.ops = remaining[:insert_at] + rewired_producers + pcp_gathers + remaining[insert_at:]
+    _restore_producer_order(b, prepared, query, weights)
     packed = b.work("index_topk", (indices,), (local_tokens, output_width),
         read=selected * pool * INT32_BYTES + (valid_rows + local_tokens) * INT64_BYTES,
         write=local_tokens * output_columns * INT32_BYTES, vector=local_tokens * output_columns,

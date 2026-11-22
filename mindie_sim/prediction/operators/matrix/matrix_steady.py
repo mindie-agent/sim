@@ -107,6 +107,86 @@ def _tightened_caps(caps, extra):
     return combined
 
 
+def _build_steady_panel(
+    context, recipe, *, core, cores, a, b, kd, k, total_m, n, groups, inputs, weights,
+    fraction, width, compulsory_miss, first_m, hbm_read_scale, operand_read,
+    load_stage_caps, directional_mte1, compute, names, pt, transfer,
+):
+    k_fraction = kd / k
+    left = inputs * a / total_m * k_fraction
+    right = weights * b / (n * groups) * k_fraction
+    if compulsory_miss and first_m is not None:
+        weight_reads = right if first_m else 0.0
+    else:
+        weight_reads = weights * fraction * k_fraction if recipe.reuse_weights else right
+    reads = (
+        (inputs * fraction * k_fraction if recipe.reuse_inputs else left)
+        + weight_reads
+    ) * hbm_read_scale
+    load = Stage("load", transfer(operand_read, left + right, hbm=reads),
+                 placement=context.owned(core, cores, (operand_read,)),
+                 caps=load_stage_caps)
+    steps = []
+    cube_key = names.get("cube")
+    for mi in range(0, a, recipe.compute_m):
+        for ni in range(0, b, recipe.compute_n):
+            ai, bi = min(recipe.compute_m, a - mi), min(recipe.compute_n, b - ni)
+            inner_a = max(left * ai / a, ai * kd * width)
+            inner_b = max(right * bi / b, bi * kd * width)
+            operand = Stage("operand", operand_transfer(
+                context, inner_a, inner_b, directional=directional_mte1),
+                            placement=context.owned(core, cores, ("mte1",)))
+            mat_work = {
+                key: value * ai * bi / (total_m * n) * k_fraction
+                for key, value in compute.items()
+            }
+            mat_caps = {}
+            if pt is not None and cube_key in mat_work and ai < _FRACTAL_ROWS:
+                per_core_cube = physical_owner_rate(
+                    context, cube_key, context.owned(core, cores, ("cube",)).get(cube_key))
+                mat_caps[cube_key] = per_core_cube * (float(ai) / float(_FRACTAL_ROWS))
+            matrix = Stage("matrix", mat_work,
+                           placement=context.owned(core, cores, ("cube", "vector")),
+                           caps=mat_caps)
+            steps.append((operand, matrix))
+    return load, tuple(steps)
+
+
+def _append_tile_epilogue(
+    stages, context, recipe, *, core, cores, a, b, total_m, n, groups, fraction,
+    op, output, epilogue, scale_read, names, buffers, transfer,
+):
+    predecessor = "matrix"
+    if output is not None:
+        # Source publication consists of ordinary work stages. Native
+        # cross-core chunk overlap stays outside this serial tile model.
+        publication = output.lower(
+            context, core=core, rows=a, columns=b,
+            buffer_shape=(recipe.tile_m, recipe.tile_n), epilogue=epilogue,
+            reuse_inputs=recipe.reuse_inputs, reuse_weights=recipe.reuse_weights)
+        stages.extend(replace(stage, after=stage.after or ("matrix",))
+                      for stage in publication.stages)
+        predecessor = publication.stages[-1].name
+    elif epilogue.operations_per_output:
+        copy, hbm = epilogue.scales(
+            a, b, total_m, n, groups, reuse_inputs=recipe.reuse_inputs,
+            reuse_weights=recipe.reuse_weights)
+        stages.extend((
+            Stage("scales", transfer(scale_read, copy, hbm=hbm), after=("matrix",),
+                  placement=context.owned(core, cores, (scale_read,))),
+            Stage("epilogue", {names["vector"]: epilogue.operations_per_output * a * b},
+                  after=("scales",), placement=context.owned(core, cores, ("vector",))),
+        ))
+        predecessor = "epilogue"
+    writes = op.mte3_bytes * fraction
+    if output is None:
+        stages.append(Stage("store", transfer("mte3", writes, hbm=writes),
+                            after=(predecessor,),
+                            placement=context.owned(core, cores, ("mte3",))))
+    if buffers:
+        stages[-1] = replace(stages[-1], free=stages[-1].free + buffers)
+
+
 def _make_tile_builder(context, recipe, geometry, dram_rate, output, directional_mte1, duration):
     op, names = context.op, context.resource_names
     total_m, n, k = geometry.local_shape
@@ -184,44 +264,15 @@ def _make_tile_builder(context, recipe, geometry, dram_rate, output, directional
         load_stage_caps = tile_load_caps if pt is not None else {}
 
         def panel(kd):
-            k_fraction = kd / k
-            left = inputs * a / total_m * k_fraction
-            right = weights * b / (n * groups) * k_fraction
-            if compulsory_miss and first_m is not None:
-                weight_reads = right if first_m else 0.0
-            else:
-                weight_reads = weights * fraction * k_fraction if recipe.reuse_weights else right
-            reads = (
-                (inputs * fraction * k_fraction if recipe.reuse_inputs else left)
-                + weight_reads
-            ) * hbm_read_scale
-            load = Stage("load", transfer(operand_read, left + right, hbm=reads),
-                         placement=context.owned(core, cores, (operand_read,)),
-                         caps=load_stage_caps)
-            steps = []
-            cube_key = names.get("cube")
-            for mi in range(0, a, recipe.compute_m):
-                for ni in range(0, b, recipe.compute_n):
-                    ai, bi = min(recipe.compute_m, a - mi), min(recipe.compute_n, b - ni)
-                    inner_a = max(left * ai / a, ai * kd * width)
-                    inner_b = max(right * bi / b, bi * kd * width)
-                    operand = Stage("operand", operand_transfer(
-                        context, inner_a, inner_b, directional=directional_mte1),
-                                    placement=context.owned(core, cores, ("mte1",)))
-                    mat_work = {
-                        key: value * ai * bi / (total_m * n) * k_fraction
-                        for key, value in compute.items()
-                    }
-                    mat_caps = {}
-                    if pt is not None and cube_key in mat_work and ai < _FRACTAL_ROWS:
-                        per_core_cube = physical_owner_rate(
-                            context, cube_key, context.owned(core, cores, ("cube",)).get(cube_key))
-                        mat_caps[cube_key] = per_core_cube * (float(ai) / float(_FRACTAL_ROWS))
-                    matrix = Stage("matrix", mat_work,
-                                   placement=context.owned(core, cores, ("cube", "vector")),
-                                   caps=mat_caps)
-                    steps.append((operand, matrix))
-            return load, tuple(steps)
+            return _build_steady_panel(
+                context, recipe, core=core, cores=cores, a=a, b=b, kd=kd, k=k,
+                total_m=total_m, n=n, groups=groups, inputs=inputs, weights=weights,
+                fraction=fraction, width=width, compulsory_miss=compulsory_miss,
+                first_m=first_m, hbm_read_scale=hbm_read_scale,
+                operand_read=operand_read, load_stage_caps=load_stage_caps,
+                directional_mte1=directional_mte1, compute=compute, names=names,
+                pt=pt, transfer=transfer,
+            )
 
         full = panel(recipe.tile_k) if count else None
         ending = panel(tail) if tail else None
@@ -272,35 +323,12 @@ def _make_tile_builder(context, recipe, geometry, dram_rate, output, directional
             Stage("matrix", final.work, after=("steady",), placement=final.placement,
                   caps=final.caps),
         ]
-        predecessor = "matrix"
-        if output is not None:
-            # Source publication consists of ordinary work stages. Native
-            # cross-core chunk overlap stays outside this serial tile model.
-            publication = output.lower(
-                context, core=core, rows=a, columns=b,
-                buffer_shape=(recipe.tile_m, recipe.tile_n), epilogue=epilogue,
-                reuse_inputs=recipe.reuse_inputs, reuse_weights=recipe.reuse_weights)
-            stages.extend(replace(stage, after=stage.after or ("matrix",))
-                          for stage in publication.stages)
-            predecessor = publication.stages[-1].name
-        elif epilogue.operations_per_output:
-            copy, hbm = epilogue.scales(
-                a, b, total_m, n, groups, reuse_inputs=recipe.reuse_inputs,
-                reuse_weights=recipe.reuse_weights)
-            stages.extend((
-                Stage("scales", transfer(scale_read, copy, hbm=hbm), after=("matrix",),
-                      placement=context.owned(core, cores, (scale_read,))),
-                Stage("epilogue", {names["vector"]: epilogue.operations_per_output * a * b},
-                      after=("scales",), placement=context.owned(core, cores, ("vector",))),
-            ))
-            predecessor = "epilogue"
-        writes = op.mte3_bytes * fraction
-        if output is None:
-            stages.append(Stage("store", transfer("mte3", writes, hbm=writes),
-                                after=(predecessor,),
-                                placement=context.owned(core, cores, ("mte3",))))
-        if buffers:
-            stages[-1] = replace(stages[-1], free=stages[-1].free + buffers)
+        _append_tile_epilogue(
+            stages, context, recipe, core=core, cores=cores, a=a, b=b,
+            total_m=total_m, n=n, groups=groups, fraction=fraction, op=op,
+            output=output, epilogue=epilogue, scale_read=scale_read, names=names,
+            buffers=buffers, transfer=transfer,
+        )
         return (Stage("tile", program=KernelProgram(tuple(stages))),)
 
     return build, single_m_hbm_cap, compulsory_miss

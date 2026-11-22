@@ -160,32 +160,129 @@ def _mla_idle_dcp_owner(
                            index_store_id=None, topk_id=None, candidate_id=None)
 
 
-def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
-        padded_tokens, cache_ids, topk_ids, index_cache_ids, candidate_ids,
-        stage_of, cp_interleave_size=DEFAULT_INTERLEAVE, runtime=None, policy=None,
-        machine=None, hierarchy=None, reuse_index_selection=False, shared_topk=None,
-        dcp_cohort_views_by_member=None, dcp_local_pos=0,
-        physical_rank=None, explicit_physical_rank=False):
-    pcp_factor, tp_gather, raw_dp_width = layer_dcp_factors(plan, parallel)
-    dp_width = raw_dp_width if int(getattr(parallel, "dp", 1) or 1) >= raw_dp_width else 1
-    cohort_dec_views, peer_dec_rows, local_dp_pos = resolve_dcp_cohort_decode(
-        views, dp_width=dp_width,
-        cohort_views_by_member=dcp_cohort_views_by_member,
-        local_dp_pos=dcp_local_pos)
-    if (padded_tokens == 0 and not views and layer_dcp_degree(plan, parallel) > 1
-            and dp_width > 1 and cohort_dec_views):
-        return _mla_idle_dcp_owner(
-            prefix=prefix, plan=plan, stage=stage, deps=deps, model=model,
-            parallel=parallel, quant=quant, mode=mode, runtime=runtime,
-            policy=policy, machine=machine, cp_interleave_size=cp_interleave_size,
-            cohort_dec_views=cohort_dec_views, peer_dec_rows=peer_dec_rows,
-            local_dp_pos=local_dp_pos, pcp_factor=pcp_factor,
-            tp_gather=tp_gather, dp_width=dp_width,
-            physical_rank=physical_rank,
-            explicit_physical_rank=explicit_physical_rank, hierarchy=hierarchy)
-    b = Builder(prefix, plan, stage, views, model, mode)
-    hierarchy = _memory_hierarchy(machine, hierarchy=hierarchy)
-    b.l2_bytes = hierarchy.effective_l2_bytes
+def _apply_mla_dcp_prefill_kv_gather(
+    b, *, prefix, stage, plan, model, views, mode, store, long_store,
+    sfa_replicated_prefill_path, is_sparse, layer_dcp, has_prefill, cp_interleave_size,
+):
+    if sfa_replicated_prefill_path:
+        pf_kv_rows = sum(view.kv_len for view in views)
+        if pf_kv_rows > 0:
+            kv_fmt = cache_format(model, "mla_kv")
+            store = emit_sfa_prefill_kv_gather(
+                b.ops, prefix=prefix, stage=stage, layer=plan.index,
+                requests=b.common["requests"], mode=mode, store_dep=store,
+                prefill_context_rows=pf_kv_rows,
+                kv_row_bytes=kv_fmt.row_bytes(plan.cache_row_elements),
+                layer_dcp=layer_dcp, kv_dtype=kv_fmt.dtype,
+                recipe="sfa_dcp_prefill_kv_gather")
+            if plan.cache_kind == "dense":
+                long_store = store
+    elif not is_sparse and layer_dcp > 1 and has_prefill:
+        vblock = max(1, int(layer_dcp) * int(cp_interleave_size))
+        pf_ctx_padded = sum(
+            math.ceil(int(view.context) / vblock) * int(cp_interleave_size) * int(layer_dcp)
+            for view in views if view.phase == "prefill" and view.context > 0
+        )
+        if pf_ctx_padded > 0:
+            kv_fmt = cache_format(model, "mla_kv")
+            store = emit_sfa_prefill_kv_gather(
+                b.ops, prefix=prefix, stage=stage, layer=plan.index,
+                requests=b.common["requests"], mode=mode, store_dep=store,
+                prefill_context_rows=pf_ctx_padded,
+                kv_row_bytes=kv_fmt.row_bytes(plan.cache_row_elements),
+                layer_dcp=layer_dcp, kv_dtype=kv_fmt.dtype,
+                recipe="dcp_prefill_kv_gather")
+            if plan.cache_kind == "dense":
+                long_store = store
+    return store, long_store
+
+
+def _resolve_mla_index_inputs(
+    *, runtime, plan, is_v41, pcp_prefill, kpool_gathered, v4_hidden_gathered,
+    cache_hidden, cache_views, cache_q, views, parallel, q,
+):
+    pool_binding = (select(runtime.kernels.get("lowerings", {}), "pool_key_indexer")
+                    if runtime and plan.index_kpool > 1 else None)
+    v41_comp_gathered = bool(
+        is_v41 and pcp_prefill and plan.owns_long_kv
+        and plan.cache_kind == "window_compressed" and plan.compress_ratio > 0
+        and plan.index_input == "compressed"
+    )
+    if kpool_gathered is not None:
+        idx_hidden, idx_views, idx_q = kpool_gathered
+    elif v4_hidden_gathered:
+        idx_hidden, idx_views, idx_q = cache_hidden, cache_views, cache_q
+    elif v41_comp_gathered:
+        idx_views = tuple(
+            replace(v, q_len=int(v.global_q_len or v.q_len),
+                    query_ranges=((0, int(v.global_q_len or v.q_len)),))
+            if v.phase == "prefill" else v for v in views
+        )
+        idx_hidden, idx_q = None, max(q * parallel.pcp, sum(v.q_len for v in idx_views))
+    else:
+        idx_hidden, idx_views, idx_q = None, None, None
+    return pool_binding, v41_comp_gathered, idx_hidden, idx_views, idx_q
+
+
+def _apply_mla_sparse_offload_and_selected(
+    b, *, prefix, stage, mode, plan, model, runtime, parallel, quant, views,
+    deps, store, long_store, attn_topk, q, stage_of, heads, dcp_heads, logical_heads,
+    latent_dim, decode_dcp, paired_sfa_mode, pcp_factor, tp_gather, dp_width,
+    cohort_dec_views, peer_dec_rows, local_dp_pos, q_local, rotary_local,
+    q_dcp, rotary_dcp, head_contract, selected, paged,
+):
+    sparse_offload = (select(runtime.kernels.get("lowerings", {}), "sparse_kv_offload")
+                      if runtime else None)
+    offload_budget = dict(model.metadata).get("sparse_kv_offload") if sparse_offload else None
+    offload_info = None
+    if offload_budget and plan.index in offload_budget.get("offload_layers", ()):
+        if (any(view.phase == "prefill" for view in views)
+                and offload_budget["options"].get("layerwise_kv_offload")):
+            sparse_offload.module.lower_prefill_offload(
+                b, plan=plan, views=views, store_id=store, budget=offload_budget)
+        elif any(view.phase == "decode" for view in views):
+            store, attn_topk, offload_info = sparse_offload.module.lower_decode_offload(
+                b, plan=plan, views=views, store_id=store, topk_id=attn_topk, budget=offload_budget)
+            if plan.cache_kind == "dense":
+                long_store = store
+    outputs: list[str] = []
+    metadata_ready = None
+    metadata_source = (select(runtime.kernels.get("lowerings", {}), "sparse_mla_metadata")
+                       if runtime else None)
+    if metadata_source:
+        metadata_ready = metadata_source.module.lower(
+            b, views=views, plan=plan, parallel=parallel, quant=quant,
+            deps=(attn_topk or deps,), padded_tokens=q, stage_of=stage_of,
+            **metadata_source.options)
+    if selected:
+        sel_heads = dcp_heads if decode_dcp else heads
+        sel_views = (cohort_dec_views if (decode_dcp and dp_width > 1 and cohort_dec_views)
+                     else views)
+        sel_out = selected.module.lower_attention(
+            b, views=sel_views, plan=plan, heads=sel_heads, runtime=runtime,
+            query=q_dcp if decode_dcp else q_local,
+            rotary=rotary_dcp if decode_dcp else rotary_local, store=store,
+            **({"head_contract": head_contract,
+                "padded_tokens": sum(v.q_len for v in sel_views) if dp_width > 1 else q}
+               if paged else {}),
+            **selected.options)
+        if decode_dcp and not paired_sfa_mode:
+            sel_out = emit_dcp_output_exchange_combine(
+                b.ops, prefix=prefix, stage=stage, layer=plan.index,
+                requests=b.common["requests"], mode=mode, deps=(sel_out,),
+                rows=max(1, q), local_heads=logical_heads, v_dim=latent_dim,
+                act_dtype=model.activation_dtype, pcp_factor=pcp_factor,
+                tp_gather=tp_gather, dp_width=dp_width,
+                peer_rows=(peer_dec_rows if dp_width > 1 else None),
+                local_dp_pos=local_dp_pos)
+        outputs.append(sel_out)
+    return store, long_store, attn_topk, offload_info, metadata_ready, outputs
+
+
+def _resolve_mla_dcp_flags(
+    *, plan, model, parallel, views, runtime, cp_interleave_size,
+    pcp_factor, dp_width, cohort_dec_views,
+):
     from mindie_sim.catalog.paired_sfa import execution
     layer_dcp = layer_dcp_degree(plan, parallel)
     is_sparse = bool(plan.indexer or plan.owns_topk
@@ -214,6 +311,43 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
                  if paired else int(cp_interleave_size))
     index_rope = (int(execution_flags.get("index_rope_dim", plan.qk_rope_head_dim))
                   if plan.mla_do_rope else 0)
+    return (layer_dcp, is_sparse, sharded_indexer, has_prefill,
+            sfa_replicated_prefill_path, cp, decode_dcp, paired_sfa_mode,
+            q_replicate, own_block, index_rope)
+
+
+def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
+        padded_tokens, cache_ids, topk_ids, index_cache_ids, candidate_ids,
+        stage_of, cp_interleave_size=DEFAULT_INTERLEAVE, runtime=None, policy=None,
+        machine=None, hierarchy=None, reuse_index_selection=False, shared_topk=None,
+        dcp_cohort_views_by_member=None, dcp_local_pos=0,
+        physical_rank=None, explicit_physical_rank=False):
+    pcp_factor, tp_gather, raw_dp_width = layer_dcp_factors(plan, parallel)
+    dp_width = raw_dp_width if int(getattr(parallel, "dp", 1) or 1) >= raw_dp_width else 1
+    cohort_dec_views, peer_dec_rows, local_dp_pos = resolve_dcp_cohort_decode(
+        views, dp_width=dp_width,
+        cohort_views_by_member=dcp_cohort_views_by_member,
+        local_dp_pos=dcp_local_pos)
+    if (padded_tokens == 0 and not views and layer_dcp_degree(plan, parallel) > 1
+            and dp_width > 1 and cohort_dec_views):
+        return _mla_idle_dcp_owner(
+            prefix=prefix, plan=plan, stage=stage, deps=deps, model=model,
+            parallel=parallel, quant=quant, mode=mode, runtime=runtime,
+            policy=policy, machine=machine, cp_interleave_size=cp_interleave_size,
+            cohort_dec_views=cohort_dec_views, peer_dec_rows=peer_dec_rows,
+            local_dp_pos=local_dp_pos, pcp_factor=pcp_factor,
+            tp_gather=tp_gather, dp_width=dp_width,
+            physical_rank=physical_rank,
+            explicit_physical_rank=explicit_physical_rank, hierarchy=hierarchy)
+    b = Builder(prefix, plan, stage, views, model, mode)
+    hierarchy = _memory_hierarchy(machine, hierarchy=hierarchy)
+    b.l2_bytes = hierarchy.effective_l2_bytes
+    (layer_dcp, is_sparse, sharded_indexer, has_prefill,
+     sfa_replicated_prefill_path, cp, decode_dcp, paired_sfa_mode,
+     q_replicate, own_block, index_rope) = _resolve_mla_dcp_flags(
+        plan=plan, model=model, parallel=parallel, views=views, runtime=runtime,
+        cp_interleave_size=cp_interleave_size, pcp_factor=pcp_factor,
+        dp_width=dp_width, cohort_dec_views=cohort_dec_views)
     prolog, partial_rotary, paged, selected, mixed_quant = _select_mla_lowerings(
         runtime, plan, parallel, model, quant, views, padded_tokens, machine)
     q, h, heads = padded_tokens, model.hidden_size, plan.num_heads // parallel.tp
@@ -252,57 +386,17 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         native_fusion, parallel, own_block,
         native_cache_epilogs, pcp_prefill and not v4_hidden_gathered, cache_ids, cp,
         runtime=runtime, is_v41=is_v41)
-    if sfa_replicated_prefill_path:
-        pf_kv_rows = sum(view.kv_len for view in views)
-        if pf_kv_rows > 0:
-            kv_fmt = cache_format(model, "mla_kv")
-            store = emit_sfa_prefill_kv_gather(
-                b.ops, prefix=prefix, stage=stage, layer=plan.index,
-                requests=b.common["requests"], mode=mode, store_dep=store,
-                prefill_context_rows=pf_kv_rows,
-                kv_row_bytes=kv_fmt.row_bytes(plan.cache_row_elements),
-                layer_dcp=layer_dcp, kv_dtype=kv_fmt.dtype,
-                recipe="sfa_dcp_prefill_kv_gather")
-            if plan.cache_kind == "dense":
-                long_store = store
-    elif not is_sparse and layer_dcp > 1 and has_prefill:
-        vblock = max(1, int(layer_dcp) * int(cp_interleave_size))
-        pf_ctx_padded = sum(
-            math.ceil(int(view.context) / vblock) * int(cp_interleave_size) * int(layer_dcp)
-            for view in views if view.phase == "prefill" and view.context > 0
-        )
-        if pf_ctx_padded > 0:
-            kv_fmt = cache_format(model, "mla_kv")
-            store = emit_sfa_prefill_kv_gather(
-                b.ops, prefix=prefix, stage=stage, layer=plan.index,
-                requests=b.common["requests"], mode=mode, store_dep=store,
-                prefill_context_rows=pf_ctx_padded,
-                kv_row_bytes=kv_fmt.row_bytes(plan.cache_row_elements),
-                layer_dcp=layer_dcp, kv_dtype=kv_fmt.dtype,
-                recipe="dcp_prefill_kv_gather")
-            if plan.cache_kind == "dense":
-                long_store = store
-
-    pool_binding = (select(runtime.kernels.get("lowerings", {}), "pool_key_indexer")
-                    if runtime and plan.index_kpool > 1 else None)
-    v41_comp_gathered = bool(
-        is_v41 and pcp_prefill and plan.owns_long_kv
-        and plan.cache_kind == "window_compressed" and plan.compress_ratio > 0
-        and plan.index_input == "compressed"
-    )
-    if kpool_gathered is not None:
-        idx_hidden, idx_views, idx_q = kpool_gathered
-    elif v4_hidden_gathered:
-        idx_hidden, idx_views, idx_q = cache_hidden, cache_views, cache_q
-    elif v41_comp_gathered:
-        idx_views = tuple(
-            replace(v, q_len=int(v.global_q_len or v.q_len),
-                    query_ranges=((0, int(v.global_q_len or v.q_len)),))
-            if v.phase == "prefill" else v for v in views
-        )
-        idx_hidden, idx_q = None, max(q * parallel.pcp, sum(v.q_len for v in idx_views))
-    else:
-        idx_hidden, idx_views, idx_q = None, None, None
+    store, long_store = _apply_mla_dcp_prefill_kv_gather(
+        b, prefix=prefix, stage=stage, plan=plan, model=model, views=views, mode=mode,
+        store=store, long_store=long_store,
+        sfa_replicated_prefill_path=sfa_replicated_prefill_path,
+        is_sparse=is_sparse, layer_dcp=layer_dcp, has_prefill=has_prefill,
+        cp_interleave_size=cp_interleave_size)
+    pool_binding, v41_comp_gathered, idx_hidden, idx_views, idx_q = _resolve_mla_index_inputs(
+        runtime=runtime, plan=plan, is_v41=is_v41, pcp_prefill=pcp_prefill,
+        kpool_gathered=kpool_gathered, v4_hidden_gathered=v4_hidden_gathered,
+        cache_hidden=cache_hidden, cache_views=cache_views, cache_q=cache_q,
+        views=views, parallel=parallel, q=q)
     index_store, topk, candidate, pool_weights = lower_index_path(
         b, plan=plan, model=model, quant=quant, parallel=parallel, views=views,
         deps=deps, runtime=runtime, padded_tokens=q, valid=valid, cp=cp,
@@ -332,53 +426,22 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
             rotary=rotary_local, plan=plan)
         if not decode_dcp:
             q_dcp, rotary_dcp = q_local, rotary_local
-    sparse_offload = (select(runtime.kernels.get("lowerings", {}), "sparse_kv_offload")
-                      if runtime else None)
-    offload_budget = dict(model.metadata).get("sparse_kv_offload") if sparse_offload else None
-    offload_info = None
-    if offload_budget and plan.index in offload_budget.get("offload_layers", ()):
-        if (any(view.phase == "prefill" for view in views)
-                and offload_budget["options"].get("layerwise_kv_offload")):
-            sparse_offload.module.lower_prefill_offload(
-                b, plan=plan, views=views, store_id=store, budget=offload_budget)
-        elif any(view.phase == "decode" for view in views):
-            store, attn_topk, offload_info = sparse_offload.module.lower_decode_offload(
-                b, plan=plan, views=views, store_id=store, topk_id=attn_topk, budget=offload_budget)
-            if plan.cache_kind == "dense":
-                long_store = store
-    outputs = []
-    metadata_ready = None
-    metadata_source = (select(runtime.kernels.get("lowerings", {}), "sparse_mla_metadata")
-                       if runtime else None)
-    if metadata_source:
-        metadata_ready = metadata_source.module.lower(
-            b, views=views, plan=plan, parallel=parallel, quant=quant,
-            deps=(attn_topk or deps,), padded_tokens=q, stage_of=stage_of,
-            **metadata_source.options)
     latent_dim = plan.kv_lora_rank if latent else plan.head_dim
     qk_dim = latent_dim + plan.qk_rope_head_dim if latent else width
-    if selected:
-        sel_heads = dcp_heads if decode_dcp else heads
-        sel_views = (cohort_dec_views if (decode_dcp and dp_width > 1 and cohort_dec_views)
-                     else views)
-        sel_out = selected.module.lower_attention(
-            b, views=sel_views, plan=plan, heads=sel_heads, runtime=runtime,
-            query=q_dcp if decode_dcp else q_local,
-            rotary=rotary_dcp if decode_dcp else rotary_local, store=store,
-            **({"head_contract": head_contract,
-                "padded_tokens": sum(v.q_len for v in sel_views) if dp_width > 1 else q}
-               if paged else {}),
-            **selected.options)
-        if decode_dcp and not paired_sfa_mode:
-            sel_out = emit_dcp_output_exchange_combine(
-                b.ops, prefix=prefix, stage=stage, layer=plan.index,
-                requests=b.common["requests"], mode=mode, deps=(sel_out,),
-                rows=max(1, q), local_heads=logical_heads, v_dim=latent_dim,
-                act_dtype=model.activation_dtype, pcp_factor=pcp_factor,
-                tp_gather=tp_gather, dp_width=dp_width,
-                peer_rows=(peer_dec_rows if dp_width > 1 else None),
-                local_dp_pos=local_dp_pos)
-        outputs.append(sel_out)
+    store, long_store, attn_topk, offload_info, metadata_ready, outputs = (
+        _apply_mla_sparse_offload_and_selected(
+            b, prefix=prefix, stage=stage, mode=mode, plan=plan, model=model,
+            runtime=runtime, parallel=parallel, quant=quant, views=views,
+            deps=deps, store=store, long_store=long_store, attn_topk=attn_topk,
+            q=q, stage_of=stage_of, heads=heads, dcp_heads=dcp_heads,
+            logical_heads=logical_heads, latent_dim=latent_dim,
+            decode_dcp=decode_dcp, paired_sfa_mode=paired_sfa_mode,
+            pcp_factor=pcp_factor, tp_gather=tp_gather, dp_width=dp_width,
+            cohort_dec_views=cohort_dec_views, peer_dec_rows=peer_dec_rows,
+            local_dp_pos=local_dp_pos, q_local=q_local, rotary_local=rotary_local,
+            q_dcp=q_dcp, rotary_dcp=rotary_dcp, head_contract=head_contract,
+            selected=selected, paged=paged)
+    )
     request_op = partial(
         _append_mla_request, b=b, runtime=runtime, parallel=parallel, quant=quant,
         local_heads=heads, dcp_heads=dcp_heads, dp_width=dp_width,
@@ -536,19 +599,9 @@ def _produce_mla_cache(
     return store, produced
 
 
-def _project_mla_inputs(
-    b, q, h, heads, width, kv_width, deps, prolog, do_rope, partial_rotary, views, parallel,
-    own_block, native_cache_epilogs, latent, quant, *, decode_dcp, pcp_factor=1, tp_gather,
-    dp_width, q_replicate, is_sparse, peer_rows=None, local_dp_pos=0, runtime=None,
-    is_v41=False,
+def _prepare_mla_pcp_hidden_gathers(
+    b, *, plan, model, views, parallel, q, h, deps, norm_dtype, runtime, is_v41, pcp_prefill,
 ):
-    plan, model = b.plan, b.model
-    q_replicate_active = bool(q_replicate and tp_gather > 1 and layer_dcp_degree(plan, parallel) > 1)
-    proj_heads = (heads * tp_gather) if q_replicate_active else heads
-    post_q_heads = heads if (q_replicate_active and not decode_dcp) else proj_heads
-    norm_dtype = model.activation_dtype
-    norm_bytes = dtype_bytes(norm_dtype)
-    pcp_prefill = parallel.pcp > 1 and any(view.phase == "prefill" for view in views)
     kpool_gathered = None
     if pcp_prefill and plan.owns_index_k and plan.index_kpool > 1 and int(parallel.pcp) > 1:
         kpool_views = tuple(
@@ -596,6 +649,62 @@ def _project_mla_inputs(
         )
     else:
         cache_views, cache_q, cache_hidden = views, q, deps
+    return kpool_gathered, v4_hidden_gathered, cache_views, cache_q, cache_hidden
+
+
+def _declare_mla_prolog_or_semantic(
+    b, *, prolog, plan, model, parallel, quant, runtime, q,
+    q_a, q_norm, q_b, kv_a, kv, rotary, produced, q_ready, latent,
+):
+    if prolog:
+        prolog.module.declare(
+            b.ops, prefix=b.prefix, plan=plan, model=model, parallel=parallel, quant=quant,
+            tokens=q, members=tuple(dict.fromkeys(
+                (q_a, q_norm, q_b, kv_a, kv, rotary, produced, q_ready))),
+            q_a=q_a, q_b=q_b, kv_a=kv_a, q_absorb=q_ready, **prolog.options)
+        return
+    if not plan.q_lora_rank:
+        return
+    from mindie_sim.prediction.operators.mla_prolog import family_mla_prolog
+    rt_meta = dict(getattr(runtime, "metadata", ()) or ())
+    if rt_meta.get("raw_eager") or (rt_meta.get("execution_policy") or {}).get("raw_eager"):
+        reason = "raw_eager_unfused_mla_prolog"
+    elif plan.mla_variant != "latent_mla":
+        reason = f"mla_variant_{plan.mla_variant}_unfused"
+    elif plan.cache_kind != "dense":
+        reason = f"cache_kind_{plan.cache_kind}_unfused"
+    elif plan.q_lora_rank not in family_mla_prolog.MLA_PROLOG_QUERY_LORA_RANKS:
+        reason = f"query_lora_rank_{plan.q_lora_rank}_outside_v3_v4_domain"
+    else:
+        reason = "mla_prolog_lowering_not_selected"
+    family_mla_prolog.declare_semantic(
+        b.ops, prefix=b.prefix, plan=plan, model=model, parallel=parallel, quant=quant,
+        tokens=q,
+        members=(q_a, q_norm, q_b, kv_a, kv, rotary, produced, q_ready),
+        q_a=q_a, q_b=q_b, kv_a=kv_a,
+        q_absorb=q_ready if latent else None,
+        anchor=q_ready, reason=reason)
+
+
+def _project_mla_inputs(
+    b, q, h, heads, width, kv_width, deps, prolog, do_rope, partial_rotary, views, parallel,
+    own_block, native_cache_epilogs, latent, quant, *, decode_dcp, pcp_factor=1, tp_gather,
+    dp_width, q_replicate, is_sparse, peer_rows=None, local_dp_pos=0, runtime=None,
+    is_v41=False,
+):
+    plan, model = b.plan, b.model
+    q_replicate_active = bool(q_replicate and tp_gather > 1 and layer_dcp_degree(plan, parallel) > 1)
+    proj_heads = (heads * tp_gather) if q_replicate_active else heads
+    post_q_heads = heads if (q_replicate_active and not decode_dcp) else proj_heads
+    norm_dtype = model.activation_dtype
+    norm_bytes = dtype_bytes(norm_dtype)
+    pcp_prefill = parallel.pcp > 1 and any(view.phase == "prefill" for view in views)
+    kpool_gathered, v4_hidden_gathered, cache_views, cache_q, cache_hidden = (
+        _prepare_mla_pcp_hidden_gathers(
+            b, plan=plan, model=model, views=views, parallel=parallel, q=q, h=h,
+            deps=deps, norm_dtype=norm_dtype, runtime=runtime, is_v41=is_v41,
+            pcp_prefill=pcp_prefill)
+    )
     if plan.q_lora_rank:
         if v4_hidden_gathered:
             q_a = b.matrix("q_a", (deps,), q, plan.q_lora_rank, h, category="mla.q_a")
@@ -659,32 +768,10 @@ def _project_mla_inputs(
                            metadata=batched_matrix_metadata(
                                tokens=q, heads=post_q_heads, input_width=plan.qk_nope_head_dim,
                                output_width=plan.kv_lora_rank, role="key_absorption"))
-    if prolog:
-        prolog.module.declare(
-            b.ops, prefix=b.prefix, plan=plan, model=model, parallel=parallel, quant=quant,
-            tokens=q, members=tuple(dict.fromkeys(
-                (q_a, q_norm, q_b, kv_a, kv, rotary, produced, q_ready))),
-            q_a=q_a, q_b=q_b, kv_a=kv_a, q_absorb=q_ready, **prolog.options)
-    elif plan.q_lora_rank:
-        from mindie_sim.prediction.operators.mla_prolog import family_mla_prolog
-        rt_meta = dict(getattr(runtime, "metadata", ()) or ())
-        if rt_meta.get("raw_eager") or (rt_meta.get("execution_policy") or {}).get("raw_eager"):
-            reason = "raw_eager_unfused_mla_prolog"
-        elif plan.mla_variant != "latent_mla":
-            reason = f"mla_variant_{plan.mla_variant}_unfused"
-        elif plan.cache_kind != "dense":
-            reason = f"cache_kind_{plan.cache_kind}_unfused"
-        elif plan.q_lora_rank not in family_mla_prolog.MLA_PROLOG_QUERY_LORA_RANKS:
-            reason = f"query_lora_rank_{plan.q_lora_rank}_outside_v3_v4_domain"
-        else:
-            reason = "mla_prolog_lowering_not_selected"
-        family_mla_prolog.declare_semantic(
-            b.ops, prefix=b.prefix, plan=plan, model=model, parallel=parallel, quant=quant,
-            tokens=q,
-            members=(q_a, q_norm, q_b, kv_a, kv, rotary, produced, q_ready),
-            q_a=q_a, q_b=q_b, kv_a=kv_a,
-            q_absorb=q_ready if latent else None,
-            anchor=q_ready, reason=reason)
+    _declare_mla_prolog_or_semantic(
+        b, prolog=prolog, plan=plan, model=model, parallel=parallel, quant=quant,
+        runtime=runtime, q=q, q_a=q_a, q_norm=q_norm, q_b=q_b, kv_a=kv_a, kv=kv,
+        rotary=rotary, produced=produced, q_ready=q_ready, latent=latent)
     q_local, rotary_local = q_ready, rotary
     q_dcp, rotary_dcp, dcp_heads = q_local, rotary_local, (proj_heads if decode_dcp else heads)
     if decode_dcp and (tp_gather > 1 or dp_width > 1):

@@ -178,6 +178,142 @@ def _prefill_state_segments(b, *, views, pcp, state_dtype, state_bytes, chunk,
     return state_segments
 
 
+def _lower_gdn_pcp_prefix_sync(
+    b, *, composite, active, tokens, chunk, heads, dk, dv, pcp, pcp_rank,
+):
+    """Reorder post-state ops after PCP state/phi AllGathers, prefix scan, and rank>0 rerun."""
+    state_set = set(composite.states)
+    deferred_ops = []
+    deferred_ids: set[str] = set()
+    kept_ops = []
+    for op in b.ops:
+        if op.op_id in state_set:
+            kept_ops.append(op)
+        elif (op.op_id == composite.output
+                or any(d in state_set or d in deferred_ids for d in op.deps)):
+            deferred_ops.append(op)
+            deferred_ids.add(op.op_id)
+        else:
+            kept_ops.append(op)
+    b.ops[:] = kept_ops
+    n_pf = max(1, len(active))
+    scan_seq_lens = tuple(int(v.q_len) for v in active if int(v.q_len) > 0)
+    scan_tok = sum(scan_seq_lens) if scan_seq_lens else max(1, int(tokens))
+    scan_chunk = max(1, int(chunk))
+    scan_chunks = max(
+        1, sum((q_i + scan_chunk - 1) // scan_chunk for q_i in scan_seq_lens),
+    )
+    scan_seq_meta = (("sequence_tokens", scan_seq_lens),) if scan_seq_lens else ()
+    scan_heads = max(1, int(heads))
+    prefix_steps = max(1, int(pcp) - 1) * n_pf
+    phi_bytes = float(n_pf * scan_heads * dk * dk * FP32_BYTES)
+    st_bytes = float(n_pf * scan_heads * dk * dv * FP32_BYTES)
+    hupdate = b.work(
+        "pcp_gdn_hupdate", tuple(composite.states), (n_pf, scan_heads, dk, dk),
+        flops=float(2 * scan_tok * scan_heads * dk * dk),
+        vector=float(scan_chunks * scan_heads * dk * dk),
+        read=phi_bytes + float(scan_tok * scan_heads * dk * 2), write=phi_bytes,
+        family="recurrent_scan", dtype="fp32",
+        metadata=(
+            ("pcp", int(pcp)), ("chunks", scan_chunks), ("chunk", scan_chunk),
+            ("tokens", scan_tok), ("heads", scan_heads),
+            ("source", "ops/triton/fla/chunk.py:fwd_hupdate"),
+        ) + scan_seq_meta,
+    )
+    ag_state = b.communicate(
+        "pcp_gdn_state_gather", tuple(composite.states),
+        st_bytes * (pcp - 1), "allgather", "pcp", dtype="fp32",
+    )
+    ag_phi = b.communicate(
+        "pcp_gdn_hupdate_gather", (hupdate,),
+        phi_bytes * (pcp - 1), "allgather", "pcp", dtype="fp32",
+    )
+    prefix_scan = b.work(
+        "pcp_gdn_prefix_scan", (ag_state, ag_phi), (pcp - 1, n_pf, scan_heads, dk, dv),
+        flops=float(2 * prefix_steps * scan_heads * dk * dk * dv),
+        vector=float(prefix_steps * scan_heads * dk * dv),
+        read=(st_bytes + phi_bytes) * pcp, write=st_bytes,
+        family="recurrent_scan", dtype="fp32",
+        metadata=(
+            ("pcp", int(pcp)), ("chunks", prefix_steps), ("chunk", 1),
+            ("tokens", prefix_steps), ("heads", scan_heads),
+            ("source", "ops/triton/fla/chunk.py:prefix_scan"),
+        ),
+    )
+    needs_rerun = pcp_rank is None or int(pcp_rank) > 0
+    if needs_rerun:
+        final_state_op = b.work(
+            "pcp_gdn_fwd_h_rerun", (prefix_scan,), (scan_tok, scan_heads, dk, dv),
+            flops=float(2 * 2 * scan_tok * scan_heads * dk * dv),
+            vector=float(scan_chunks * 2 * scan_heads * dk * dv),
+            read=st_bytes, write=st_bytes, family="recurrent_scan", dtype="fp32",
+            metadata=(
+                ("pcp", int(pcp)), ("chunks", scan_chunks), ("chunk", scan_chunk),
+                ("tokens", scan_tok), ("heads", scan_heads),
+                ("pcp_rank_gt_zero_rerun", True),
+            ) + scan_seq_meta,
+        )
+        for def_op in deferred_ops:
+            if any(d in state_set for d in def_op.deps):
+                new_deps = tuple(dict.fromkeys(
+                    [*(d for d in def_op.deps if d not in state_set), final_state_op]
+                ))
+                meta_d = dict(def_op.metadata)
+                sv_in = meta_d.get("state_value_inputs")
+                if sv_in:
+                    meta_d["state_value_inputs"] = tuple(
+                        ({**p, "producer": final_state_op, "ready": final_state_op,
+                          "owner": final_state_op}
+                         if isinstance(p, dict) and p.get("producer") in state_set else p)
+                        for p in sv_in
+                    )
+                if meta_d.get("state_ready") in state_set:
+                    meta_d["state_ready"] = final_state_op
+                b.ops.append(replace(def_op, deps=new_deps,
+                                     metadata=tuple(meta_d.items())))
+            else:
+                b.ops.append(def_op)
+    else:
+        b.ops.extend(deferred_ops)
+    return (prefix_scan,)
+
+
+def _declare_gdn_chunk_group(
+    b, *, chunk_start_index, composite, tokens, heads, key_heads, dk, dv,
+    dtype, state_dtype, lengths, chunk, pcp,
+):
+    region_ops = b.ops[chunk_start_index:]
+    if not region_ops:
+        return
+    region_ids = {op.op_id for op in region_ops}
+    entries = tuple(
+        op.op_id for op in region_ops
+        if any(dep not in region_ids for dep in op.deps) or not op.deps
+    ) or (region_ops[0].op_id,)
+    anchor_id = composite.output if composite.output in region_ids else region_ops[-1].op_id
+    declare_group(
+        b.ops, key=b.prefix + ".gdn_chunk", role="gdn_chunk", family="gdn",
+        members=tuple(op.op_id for op in region_ops), entries=entries,
+        anchor=anchor_id, block="attention",
+        view={"tokens": tokens, "heads": heads, "key_heads": key_heads,
+              "key_width": dk, "value_width": dv, "dtype": dtype,
+              "state_dtype": state_dtype, "sequence_tokens": lengths,
+              "chunk": chunk, "pcp": int(pcp)},
+        implementation={
+            "native_kind": "ChunkGatedDeltaRuleFwd",
+            "native_kinds": ("ChunkGatedDeltaRuleFwdPrepare", "ChunkFwdH", "ChunkFwdO"),
+            "selection": "arch35_gdn_prefill_composite",
+            "conditions": {"pcp": int(pcp), "chunk": chunk,
+                           "state_dtype": state_dtype},
+        },
+        source=source_reference("vllm_ascend/ops/gdn.py",
+                                "AscendGatedDeltaNetAttention._chunk_gated_delta_rule_fused"),
+        fusion_status="fused_existing",
+        fusion_reason="arch35_native_gdn_prefill_composite",
+        native_fusion_eligible=False,
+    )
+
+
 def core(*, builder, tensors, conv, gated, views, heads, key_heads, dk, dv,
           chunk, gate_values=None, qkv_values=None, pcp=1, pcp_rank=None,
           state_slot_indices=None, state_capacity=None, state_slot_source="", **_):
@@ -274,106 +410,12 @@ def core(*, builder, tensors, conv, gated, views, heads, key_heads, dk, dv,
         state_capacity=state_capacity, slot_source=slot_source,
         remote_publish=remote_flags)
     if pcp > 1:
-        # Move every chunk_fwd_o / output-concat op that depends on composite.states
-        # (or composite.output) AFTER the PCP state/phi AllGathers, (p-1)-step
-        # prefix scan, and rank>0 fwd_h rerun so chunk_fwd_o consumes corrected state.
-        state_set = set(composite.states)
-        deferred_ops = []
-        deferred_ids: set[str] = set()
-        kept_ops = []
-        for op in b.ops:
-            if op.op_id in state_set:
-                kept_ops.append(op)
-            elif (op.op_id == composite.output
-                    or any(d in state_set or d in deferred_ids for d in op.deps)):
-                deferred_ops.append(op)
-                deferred_ids.add(op.op_id)
-            else:
-                kept_ops.append(op)
-        b.ops[:] = kept_ops
-        n_pf = max(1, len(active))
-        scan_seq_lens = tuple(int(v.q_len) for v in active if int(v.q_len) > 0)
-        scan_tok = sum(scan_seq_lens) if scan_seq_lens else max(1, int(tokens))
-        scan_chunk = max(1, int(chunk))
-        scan_chunks = max(
-            1, sum((q_i + scan_chunk - 1) // scan_chunk for q_i in scan_seq_lens),
-        )
-        scan_seq_meta = (("sequence_tokens", scan_seq_lens),) if scan_seq_lens else ()
-        scan_heads = max(1, int(heads))
-        prefix_steps = max(1, int(pcp) - 1) * n_pf
-        phi_bytes = float(n_pf * scan_heads * dk * dk * FP32_BYTES)
-        st_bytes = float(n_pf * scan_heads * dk * dv * FP32_BYTES)
-        hupdate = b.work(
-            "pcp_gdn_hupdate", tuple(composite.states), (n_pf, scan_heads, dk, dk),
-            flops=float(2 * scan_tok * scan_heads * dk * dk),
-            vector=float(scan_chunks * scan_heads * dk * dk),
-            read=phi_bytes + float(scan_tok * scan_heads * dk * 2), write=phi_bytes,
-            family="recurrent_scan", dtype="fp32",
-            metadata=(
-                ("pcp", int(pcp)), ("chunks", scan_chunks), ("chunk", scan_chunk),
-                ("tokens", scan_tok), ("heads", scan_heads),
-                ("source", "ops/triton/fla/chunk.py:fwd_hupdate"),
-            ) + scan_seq_meta,
-        )
-        ag_state = b.communicate(
-            "pcp_gdn_state_gather", tuple(composite.states),
-            st_bytes * (pcp - 1), "allgather", "pcp", dtype="fp32",
-        )
-        ag_phi = b.communicate(
-            "pcp_gdn_hupdate_gather", (hupdate,),
-            phi_bytes * (pcp - 1), "allgather", "pcp", dtype="fp32",
-        )
-        prefix_scan = b.work(
-            "pcp_gdn_prefix_scan", (ag_state, ag_phi), (pcp - 1, n_pf, scan_heads, dk, dv),
-            flops=float(2 * prefix_steps * scan_heads * dk * dk * dv),
-            vector=float(prefix_steps * scan_heads * dk * dv),
-            read=(st_bytes + phi_bytes) * pcp, write=st_bytes,
-            family="recurrent_scan", dtype="fp32",
-            metadata=(
-                ("pcp", int(pcp)), ("chunks", prefix_steps), ("chunk", 1),
-                ("tokens", prefix_steps), ("heads", scan_heads),
-                ("source", "ops/triton/fla/chunk.py:prefix_scan"),
-            ),
-        )
-        needs_rerun = pcp_rank is None or int(pcp_rank) > 0
-        if needs_rerun:
-            final_state_op = b.work(
-                "pcp_gdn_fwd_h_rerun", (prefix_scan,), (scan_tok, scan_heads, dk, dv),
-                flops=float(2 * 2 * scan_tok * scan_heads * dk * dv),
-                vector=float(scan_chunks * 2 * scan_heads * dk * dv),
-                read=st_bytes, write=st_bytes, family="recurrent_scan", dtype="fp32",
-                metadata=(
-                    ("pcp", int(pcp)), ("chunks", scan_chunks), ("chunk", scan_chunk),
-                    ("tokens", scan_tok), ("heads", scan_heads),
-                    ("pcp_rank_gt_zero_rerun", True),
-                ) + scan_seq_meta,
-            )
-            for def_op in deferred_ops:
-                if any(d in state_set for d in def_op.deps):
-                    new_deps = tuple(dict.fromkeys(
-                        [*(d for d in def_op.deps if d not in state_set), final_state_op]
-                    ))
-                    meta_d = dict(def_op.metadata)
-                    sv_in = meta_d.get("state_value_inputs")
-                    if sv_in:
-                        meta_d["state_value_inputs"] = tuple(
-                            ({**p, "producer": final_state_op, "ready": final_state_op,
-                              "owner": final_state_op}
-                             if isinstance(p, dict) and p.get("producer") in state_set else p)
-                            for p in sv_in
-                        )
-                    if meta_d.get("state_ready") in state_set:
-                        meta_d["state_ready"] = final_state_op
-                    b.ops.append(replace(def_op, deps=new_deps,
-                                         metadata=tuple(meta_d.items())))
-                else:
-                    b.ops.append(def_op)
-        else:
-            b.ops.extend(deferred_ops)
         # Upstream ``ops/triton/fla/chunk.py:198,210,240``: prefix_scan yields the
         # global final state for persistent cache scatter on ALL PCP ranks; the
         # rank>0 rerun discards its final-state return and feeds local gdn_output*.
-        scatter_deps = (prefix_scan,)
+        scatter_deps = _lower_gdn_pcp_prefix_sync(
+            b, composite=composite, active=active, tokens=tokens, chunk=chunk,
+            heads=heads, dk=dk, dv=dv, pcp=pcp, pcp_rank=pcp_rank)
     else:
         scatter_deps = tuple(composite.states)
     scatter = b.work("scatter_recurrent_state", scatter_deps,
@@ -406,35 +448,10 @@ def core(*, builder, tensors, conv, gated, views, heads, key_heads, dk, dv,
         "state_value_outputs": scatter_outputs,
         "gdn_state_contract": scatter_contract,
     }.items())))
-    region_ops = b.ops[chunk_start_index:]
-    if region_ops:
-        region_ids = {op.op_id for op in region_ops}
-        entries = tuple(
-            op.op_id for op in region_ops
-            if any(dep not in region_ids for dep in op.deps) or not op.deps
-        ) or (region_ops[0].op_id,)
-        anchor_id = composite.output if composite.output in region_ids else region_ops[-1].op_id
-        declare_group(
-            b.ops, key=b.prefix + ".gdn_chunk", role="gdn_chunk", family="gdn",
-            members=tuple(op.op_id for op in region_ops), entries=entries,
-            anchor=anchor_id, block="attention",
-            view={"tokens": tokens, "heads": heads, "key_heads": key_heads,
-                  "key_width": dk, "value_width": dv, "dtype": dtype,
-                  "state_dtype": state_dtype, "sequence_tokens": lengths,
-                  "chunk": chunk, "pcp": int(pcp)},
-            implementation={
-                "native_kind": "ChunkGatedDeltaRuleFwd",
-                "native_kinds": ("ChunkGatedDeltaRuleFwdPrepare", "ChunkFwdH", "ChunkFwdO"),
-                "selection": "arch35_gdn_prefill_composite",
-                "conditions": {"pcp": int(pcp), "chunk": chunk,
-                               "state_dtype": state_dtype},
-            },
-            source=source_reference("vllm_ascend/ops/gdn.py",
-                                    "AscendGatedDeltaNetAttention._chunk_gated_delta_rule_fused"),
-            fusion_status="fused_existing",
-            fusion_reason="arch35_native_gdn_prefill_composite",
-            native_fusion_eligible=False,
-        )
+    _declare_gdn_chunk_group(
+        b, chunk_start_index=chunk_start_index, composite=composite, tokens=tokens,
+        heads=heads, key_heads=key_heads, dk=dk, dv=dv, dtype=dtype,
+        state_dtype=state_dtype, lengths=lengths, chunk=chunk, pcp=pcp)
     return composite.output
 
 
@@ -675,6 +692,78 @@ def _lower_idle_pcp_peer(
     return AttentionResult(ops=b.ops, last=last)
 
 
+def _lower_mixed_decode_branch(
+    b, tensors, *, prefix, plan, model, ordered, decode, decode_tokens,
+    qkv, gate_values, heads, keys, dk, dv, chunk, cache_indices, state_rows, index_source,
+):
+    decode_active = tuple(view for view in decode if not view.padding)
+    decode_offsets, cursor = [], 0
+    for view in decode:
+        if not view.padding:
+            decode_offsets.append(cursor)
+        cursor += view.q_len
+    decode_start_index = len(b.ops)
+    decoded = decode_core(
+        b, tensors, tuple(v.narrow(1, 0, decode_tokens) for v in qkv),
+        tuple(v.narrow(1, 0, decode_tokens) for v in gate_values),
+        decode_active, heads, keys, dk, dv,
+        physical_tokens=decode_tokens,
+        physical_sequence_tokens=tuple(view.q_len for view in decode),
+        physical_row_offsets=tuple(decode_offsets))
+    decode_contract, decode_effects = gdn_recurrent.state_contract(
+        views=decode, phase="decode", state_dtype=plan.recurrent_state_dtype,
+        conv_state_dtype=plan.conv_state_dtype, conv_kernel=plan.conv_kernel,
+        target_prefix=prefix, chunk=chunk,
+        initial_state=tuple(view.context > 0 and not view.padding
+                            for view in decode),
+        direction="token", target_kind="recurrent",
+        global_lengths=tuple(view.global_q_len or view.q_len for view in decode),
+        slot_indices=(None if cache_indices is None else
+                      tuple(cache_indices[index] for index, view in enumerate(ordered)
+                            if view.phase == "decode")),
+        state_capacity=state_rows, slot_source=index_source)
+    scan = b.ops[-1]
+    scan_meta = dict(scan.metadata)
+    decode_value_inputs = tuple(
+        view_values[2] for view_values in scan_meta.get("state_value_views", ()))
+    decode_contract, decode_outputs = gdn_recurrent.bind_state_ports(
+        decode_contract, scan.op_id, heads=heads, head_shards=1,
+        value_outputs=None)
+    b.ops[-1] = replace(scan, metadata=tuple({**scan_meta,
+        "state_ready": scan.op_id,
+        "state_value_inputs": decode_value_inputs,
+        "state_value_outputs": decode_outputs,
+        "gdn_state_contract": decode_contract,
+        "gdn_state_effects": decode_effects,
+        "padding_slots": decode_contract["padding_slots"],
+        "state_checkpoint_versions": tuple(
+            None if count <= 0 else (context + 1,)
+            for context, count in zip(decode_contract["contexts"],
+                                      decode_contract["checkpoints"]))}.items()))
+    dec_ops = b.ops[decode_start_index:]
+    dec_ids = {op.op_id for op in dec_ops}
+    declare_group(
+        b.ops, key=prefix + ".gdn_recurrent", role="gdn_recurrent", family="gdn",
+        members=tuple(op.op_id for op in dec_ops),
+        entries=tuple(op.op_id for op in dec_ops
+                      if any(dep not in dec_ids for dep in op.deps) or not op.deps),
+        anchor=scan.op_id, block="attention",
+        view={"tokens": decode_tokens, "heads": heads, "key_heads": keys,
+              "key_width": dk, "value_width": dv, "dtype": model.activation_dtype,
+              "state_dtype": plan.recurrent_state_dtype,
+              "sequence_tokens": tuple(view.q_len for view in decode)},
+        implementation={"native_kind": "RecurrentGatedDeltaRule",
+                        "conditions": {"mixed_batch_decode": True,
+                                       "state_dtype": plan.recurrent_state_dtype}},
+        source=source_reference("vllm_ascend/ops/gdn.py",
+                                "AscendGatedDeltaNetAttention._recurrent_gated_delta_rule"),
+        fusion_status="unfused_decomposed",
+        fusion_reason="mixed_batch_analytical_gdn_decode",
+        native_fusion_eligible=False,
+    )
+    return decoded
+
+
 def lower(*, prefix, plan, views, stage, deps, model, parallel, mode,
           padded_tokens, policy, runtime, physical_rank=None):
     if plan.recurrent_state_dtype != "fp32":
@@ -745,71 +834,11 @@ def lower(*, prefix, plan, views, stage, deps, model, parallel, mode,
                    tensors.result(gated, (1, actual, heads), output="beta"))
     outputs = []
     if decode:
-        decode_active = tuple(view for view in decode if not view.padding)
-        decode_offsets, cursor = [], 0
-        for view in decode:
-            if not view.padding:
-                decode_offsets.append(cursor)
-            cursor += view.q_len
-        decode_start_index = len(b.ops)
-        outputs.append(decode_core(
-            b, tensors, tuple(v.narrow(1, 0, decode_tokens) for v in qkv),
-            tuple(v.narrow(1, 0, decode_tokens) for v in gate_values),
-            decode_active, heads, keys, dk, dv,
-            physical_tokens=decode_tokens,
-            physical_sequence_tokens=tuple(view.q_len for view in decode),
-            physical_row_offsets=tuple(decode_offsets)))
-        decode_contract, decode_effects = gdn_recurrent.state_contract(
-            views=decode, phase="decode", state_dtype=plan.recurrent_state_dtype,
-            conv_state_dtype=plan.conv_state_dtype, conv_kernel=plan.conv_kernel,
-            target_prefix=prefix, chunk=chunk,
-            initial_state=tuple(view.context > 0 and not view.padding
-                                for view in decode),
-            direction="token", target_kind="recurrent",
-            global_lengths=tuple(view.global_q_len or view.q_len for view in decode),
-            slot_indices=(None if cache_indices is None else
-                          tuple(cache_indices[index] for index, view in enumerate(ordered)
-                                if view.phase == "decode")),
-            state_capacity=state_rows, slot_source=index_source)
-        scan = b.ops[-1]
-        scan_meta = dict(scan.metadata)
-        decode_value_inputs = tuple(
-            view_values[2] for view_values in scan_meta.get("state_value_views", ()))
-        decode_contract, decode_outputs = gdn_recurrent.bind_state_ports(
-            decode_contract, scan.op_id, heads=heads, head_shards=1,
-            value_outputs=None)
-        b.ops[-1] = replace(scan, metadata=tuple({**scan_meta,
-            "state_ready": scan.op_id,
-            "state_value_inputs": decode_value_inputs,
-            "state_value_outputs": decode_outputs,
-            "gdn_state_contract": decode_contract,
-            "gdn_state_effects": decode_effects,
-            "padding_slots": decode_contract["padding_slots"],
-            "state_checkpoint_versions": tuple(
-                None if count <= 0 else (context + 1,)
-                for context, count in zip(decode_contract["contexts"],
-                                          decode_contract["checkpoints"]))}.items()))
-        dec_ops = b.ops[decode_start_index:]
-        dec_ids = {op.op_id for op in dec_ops}
-        declare_group(
-            b.ops, key=prefix + ".gdn_recurrent", role="gdn_recurrent", family="gdn",
-            members=tuple(op.op_id for op in dec_ops),
-            entries=tuple(op.op_id for op in dec_ops
-                          if any(dep not in dec_ids for dep in op.deps) or not op.deps),
-            anchor=scan.op_id, block="attention",
-            view={"tokens": decode_tokens, "heads": heads, "key_heads": keys,
-                  "key_width": dk, "value_width": dv, "dtype": model.activation_dtype,
-                  "state_dtype": plan.recurrent_state_dtype,
-                  "sequence_tokens": tuple(view.q_len for view in decode)},
-            implementation={"native_kind": "RecurrentGatedDeltaRule",
-                            "conditions": {"mixed_batch_decode": True,
-                                           "state_dtype": plan.recurrent_state_dtype}},
-            source=source_reference("vllm_ascend/ops/gdn.py",
-                                    "AscendGatedDeltaNetAttention._recurrent_gated_delta_rule"),
-            fusion_status="unfused_decomposed",
-            fusion_reason="mixed_batch_analytical_gdn_decode",
-            native_fusion_eligible=False,
-        )
+        outputs.append(_lower_mixed_decode_branch(
+            b, tensors, prefix=prefix, plan=plan, model=model, ordered=ordered,
+            decode=decode, decode_tokens=decode_tokens, qkv=qkv, gate_values=gate_values,
+            heads=heads, keys=keys, dk=dk, dv=dv, chunk=chunk, cache_indices=cache_indices,
+            state_rows=state_rows, index_source=index_source))
     prefill_slots = (None if cache_indices is None else
                      tuple(cache_indices[len(decode) + index]
                            for index in range(len(prefill))))

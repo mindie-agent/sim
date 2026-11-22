@@ -148,7 +148,8 @@ class ScopedLowRankHcVectorRecipe(PlannedRecipe):
     """Scope strided multi-stream HC vector planning strictly to RegBase devices."""
 
     def prepare(self, op, geometry):
-        if not _is_regbase_capable(geometry):
+        if (not bool(dict(op.metadata).get("fused_ub_resident", False))
+                and not _is_regbase_capable(geometry)):
             from mindie_sim.prediction.physical_recipe_registry import VECTOR
             return op, VECTOR
         return super().prepare(op, geometry)

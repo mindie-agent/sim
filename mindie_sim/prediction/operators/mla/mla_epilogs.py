@@ -545,14 +545,8 @@ def _produce_index_cache(
                 and select(dict(getattr(runtime, "kernels", {}).get("lowerings", {}) or {}),
                            "quant_lightning_indexer") is not None
             )
-            rt_meta = dict(getattr(runtime, "metadata", ()) or ())
-            raw_eager = bool(
-                rt_meta.get("raw_eager")
-                or (rt_meta.get("execution_policy") or {}).get("raw_eager")
-            )
             fp32_wrapper = (
-                not raw_eager
-                and not _is_a5_runtime(runtime)
+                not _is_a5_runtime(runtime)
                 and not explicit_quant_indexer
                 and quant.index_dtype in {"bf16", "fp16"}
             )

@@ -287,6 +287,19 @@ owns = ["mindie_sim/prediction/operators/vector/cuda_norm.py"]
 path = "operators/test_cuda_quant.py"
 tier = "tier0"
 owns = ["mindie_sim/prediction/operators/vector/cuda_quant.py"]
+[[module]]
+path = "operators/test_anti_armchair_ground_truth.py"
+tier = "tier1"
+owns = [
+    "mindie_sim/prediction/operators/mla/mla_epilogs.py",
+    "mindie_sim/prediction/operators/mla_prolog/family_mla_prolog.py",
+    "mindie_sim/prediction/operators/recurrent/recurrent.py",
+    "mindie_sim/prediction/operators/recurrent/linear_attention_pipeline.py",
+    "mindie_sim/prediction/operators/vector/gated_activation.py",
+    "mindie_sim/prediction/operators/vector/vector_pipeline.py",
+    "mindie_sim/prediction/operators/mx_quant_matrix/shared_w4a8.py",
+    "mindie_sim/prediction/operators/hyper_connections/lowrank_hc_vector.py",
+]
 # ---------------------------------------------------------------- spine
 [[module]]
 path = "spine/test_stream_plan.py"

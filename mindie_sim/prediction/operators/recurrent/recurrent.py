@@ -62,6 +62,16 @@ EAGER_NORM_ADD_OPS = 1
 EAGER_NORM_RSQRT_OPS = 1
 EAGER_NORM_MUL_OPS = 1
 EAGER_NORM_SIGMOID_OPS = 4
+EAGER_NORM_SILU_OPS = 5
+EAGER_CONV_COPY_OPS = 1
+EAGER_CONV_SILU_OPS = 5
+EAGER_GATE_CAST_OPS = 1
+EAGER_GATE_ADD_OPS = 1
+EAGER_GATE_SOFTPLUS_OPS = 4
+EAGER_GATE_MUL_OPS = 2
+EAGER_GATE_SIGMOID_OPS = 4
+EAGER_CONV_TORCH_SOURCE = "vllm/model_executor/layers/mamba/ops/cpu/causal_conv1d.py:causal_conv1d_update_torch"
+EAGER_GDN_GATING_SOURCE = "vllm_ascend/_310p/ops/fla/fused_gdn_gating.py:fused_gdn_gating_pytorch"
 
 
 def _sum_valid_powers(tokens: int, chunk: int, power: int) -> int:
@@ -148,13 +158,41 @@ def _lower_convolution(b, tensors, *, conv_source, projection_group, conv_input,
     else:
         active_views = tuple(view for view in views if not view.padding)
         active_tokens = sum(view.q_len for view in active_views)
-        history_bytes = (plan.conv_kernel - 1) * len(active_views) * conv_width * 2
-        conv = b.vector("short_convolution", conv_deps,
-                        tokens * conv_width, 2 * plan.conv_kernel,
-                        read_bytes_override=(active_tokens * conv_width * 2
-                                             + history_bytes),
-                        write_bytes_override=(active_tokens * conv_width * 2
-                                              + history_bytes))
+        act_bytes = dtype_bytes(b.model.activation_dtype)
+        history_rows = max(0, plan.conv_kernel - 1) * len(active_views)
+        history_bytes = history_rows * conv_width * act_bytes
+        eager_gdn_decode = (
+            plan.attention == "gdn" and _is_raw_eager(runtime)
+            and bool(views) and all(view.phase == "decode" for view in views)
+        )
+        if eager_gdn_decode:
+            cat_rows = active_tokens + history_rows
+            cat_bytes = cat_rows * conv_width * act_bytes
+            conv_cat = b.vector(
+                "conv_state_cat", conv_deps, max(1, cat_rows) * conv_width, EAGER_CONV_COPY_OPS,
+                family="tensor_copy", shape=(max(1, cat_rows), conv_width),
+                read_bytes_override=active_tokens * conv_width * act_bytes + history_bytes,
+                write_bytes_override=cat_bytes,
+                metadata=(("native_kind", "ConcatD"), ("native_source", EAGER_CONV_TORCH_SOURCE)))
+            state_upd = b.vector(
+                "conv_state_update", (conv_cat,), max(1, history_rows) * conv_width,
+                EAGER_CONV_COPY_OPS, family="tensor_copy",
+                shape=(max(1, history_rows), conv_width),
+                read_bytes_override=history_bytes, write_bytes_override=history_bytes,
+                metadata=(("native_kind", "InplaceCopy"), ("native_source", EAGER_CONV_TORCH_SOURCE)))
+            conv = b.vector(
+                "short_convolution", (conv_cat, state_upd),
+                tokens * conv_width, QK_INPUT_COUNT * plan.conv_kernel,
+                read_bytes_override=cat_bytes + plan.conv_kernel * conv_width * act_bytes,
+                write_bytes_override=active_tokens * conv_width * act_bytes,
+                metadata=(("native_kind", "Convolution"), ("native_source", EAGER_CONV_TORCH_SOURCE)))
+        else:
+            conv = b.vector("short_convolution", conv_deps,
+                            tokens * conv_width, 2 * plan.conv_kernel,
+                            read_bytes_override=(active_tokens * conv_width * 2
+                                                 + history_bytes),
+                            write_bytes_override=(active_tokens * conv_width * 2
+                                                  + history_bytes))
         if plan.attention == "gdn" and active_views:
             # One physical convolution may carry speculative decode rows and
             # prefill rows.  Each slot keeps its own event: a decode row writes
@@ -204,6 +242,13 @@ def _lower_convolution(b, tensors, *, conv_source, projection_group, conv_input,
                          for direction in directions) else {}),
                 "gdn_state_contract": contract,
                 "gdn_state_effects": effects}.items()))
+        if eager_gdn_decode:
+            out_bytes = tokens * conv_width * act_bytes
+            conv = b.vector(
+                "conv_silu", (conv,), tokens * conv_width, EAGER_CONV_SILU_OPS,
+                family="elementwise", shape=(tokens, conv_width),
+                read_bytes_override=out_bytes, write_bytes_override=out_bytes,
+                metadata=(("native_kind", "Swish"), ("native_source", EAGER_CONV_TORCH_SOURCE)))
     if projection_group:
         # Source returns from its auxiliary stream only after beta is ready.
         b.ops[-1] = replace(b.ops[-1], deps=tuple(dict.fromkeys(
@@ -790,11 +835,17 @@ def _lower_output_norm_gate(b, *, outputs, output_gate, tokens, heads, dv, value
             read_bytes_override=act_full, write_bytes_override=fp32_full,
             metadata=(("input_format", act_dtype), ("output_format", "fp32"),
                       ("eager_norm_gate_step", "cast_gate")))
+        is_gdn = plan.attention == "gdn"
         sig = b.vector(
-            "linear_output_gate_sigmoid", (g_f32,), elems, EAGER_NORM_SIGMOID_OPS,
+            "linear_output_gate_silu" if is_gdn else "linear_output_gate_sigmoid",
+            (g_f32,), elems,
+            EAGER_NORM_SILU_OPS if is_gdn else EAGER_NORM_SIGMOID_OPS,
             family="elementwise", dtype="fp32", shape=shape,
             read_bytes_override=fp32_full, write_bytes_override=fp32_full,
-            metadata=(("native_kind", "Sigmoid"), ("eager_norm_gate_step", "sigmoid")))
+            metadata=(
+                ("native_kind", "Swish" if is_gdn else "Sigmoid"),
+                ("eager_norm_gate_step", "silu" if is_gdn else "sigmoid"),
+            ))
         gated = b.vector(
             "linear_output_gate_mul", (weighted, sig), elems, EAGER_NORM_MUL_OPS,
             family="elementwise", dtype="fp32", shape=shape,
@@ -1064,6 +1115,130 @@ def _apply_kda_pcp_entry(b, *, deps, views, tokens, hidden, parallel, model, run
     return restored, global_views, restored_rows, common_peer_rows, True
 
 
+def _lower_delta_gates(b, *, plan, model, runtime, tokens, heads, key_heads, dk,
+                       gate_inputs, decay, beta):
+    """Emit fused GDN/KDA delta gating or the 7-kernel PyTorch eager GDN chain."""
+    if plan.attention == "gdn":
+        deps = tuple(dict.fromkeys(gate_inputs))
+        if _is_raw_eager(runtime):
+            act_dtype = model.activation_dtype
+            act_bytes = dtype_bytes(act_dtype)
+            elems = tokens * heads
+            act_total = elems * act_bytes
+            fp32_total = elems * FP32_BYTES
+            head_param = heads * FP32_BYTES
+            alpha_dep = (gate_inputs[-1],) if gate_inputs else deps
+            beta_dep = (gate_inputs[0],) if gate_inputs else deps
+            a_f32 = b.vector(
+                "gate_alpha_cast_fp32", alpha_dep, elems, EAGER_GATE_CAST_OPS,
+                family="cast", dtype="fp32", shape=(tokens, heads),
+                read_bytes_override=act_total, write_bytes_override=fp32_total,
+                metadata=(("input_format", act_dtype), ("output_format", "fp32"),
+                          ("native_source", EAGER_GDN_GATING_SOURCE)))
+            a_bias = b.vector(
+                "gate_alpha_add_bias", (a_f32,), elems, EAGER_GATE_ADD_OPS,
+                family="elementwise", dtype="fp32", shape=(tokens, heads),
+                read_bytes_override=fp32_total + head_param, write_bytes_override=fp32_total,
+                metadata=(("native_kind", "Add"), ("native_source", EAGER_GDN_GATING_SOURCE)))
+            a_sp = b.vector(
+                "gate_alpha_softplus", (a_bias,), elems, EAGER_GATE_SOFTPLUS_OPS,
+                family="elementwise", dtype="fp32", shape=(tokens, heads),
+                read_bytes_override=fp32_total, write_bytes_override=fp32_total,
+                metadata=(("native_kind", "Softplus"), ("native_source", EAGER_GDN_GATING_SOURCE)))
+            b_f32 = b.vector(
+                "gate_beta_cast_fp32", beta_dep, elems, EAGER_GATE_CAST_OPS,
+                family="cast", dtype="fp32", shape=(tokens, heads),
+                read_bytes_override=act_total, write_bytes_override=fp32_total,
+                metadata=(("input_format", act_dtype), ("output_format", "fp32"),
+                          ("native_source", EAGER_GDN_GATING_SOURCE)))
+            b_sig = b.vector(
+                "gate_beta_sigmoid", (b_f32,), elems, EAGER_GATE_SIGMOID_OPS,
+                family="elementwise", dtype="fp32", shape=(tokens, heads),
+                read_bytes_override=fp32_total, write_bytes_override=fp32_total,
+                metadata=(("native_kind", "Sigmoid"), ("native_source", EAGER_GDN_GATING_SOURCE)))
+            b_out = b.vector(
+                "gate_beta_cast_out", (b_sig,), elems, EAGER_GATE_CAST_OPS,
+                family="cast", dtype=act_dtype, shape=(tokens, heads),
+                read_bytes_override=fp32_total, write_bytes_override=act_total,
+                metadata=(("input_format", "fp32"), ("output_format", act_dtype),
+                          ("native_source", EAGER_GDN_GATING_SOURCE)))
+            alog_exp = b.vector(
+                "gate_alog_exp", alpha_dep, heads, EAGER_GATE_SOFTPLUS_OPS,
+                family="elementwise", dtype="fp32", shape=(heads,),
+                read_bytes_override=head_param, write_bytes_override=head_param,
+                metadata=(("native_kind", "Exp"), ("native_source", EAGER_GDN_GATING_SOURCE)))
+            alog_neg = b.vector(
+                "gate_alog_neg", (alog_exp,), heads, EAGER_GATE_CAST_OPS,
+                family="elementwise", dtype="fp32", shape=(heads,),
+                read_bytes_override=head_param, write_bytes_override=head_param,
+                metadata=(("native_kind", "Neg"), ("native_source", EAGER_GDN_GATING_SOURCE)))
+            return b.vector(
+                "delta_gates", (a_sp, alog_neg, b_out), elems, EAGER_GATE_MUL_OPS,
+                family="gdn_gating", dtype="fp32", shape=(tokens, heads),
+                read_bytes_override=fp32_total + head_param, write_bytes_override=fp32_total,
+                metadata=(("outputs", ("fp32_decay", "activation_beta")),
+                          ("input_heads", key_heads), ("state_heads", heads),
+                          ("native_kind", "Mul"), ("native_source", EAGER_GDN_GATING_SOURCE)),
+            )
+        return b.vector(
+            "delta_gates", deps, tokens * heads, GDN_GATE_OPS_PER_HEAD, family="gdn_gating",
+            shape=(tokens, heads), read_bytes_override=(tokens + QK_INPUT_COUNT) * heads * FP32_BYTES,
+            write_bytes_override=tokens * heads * (FP32_BYTES + dtype_bytes("bf16")),
+            metadata=(("outputs", ("fp32_decay", "activation_beta")),
+                      ("input_heads", key_heads), ("state_heads", heads)),
+        )
+    return b.vector(
+        "delta_gates", (decay, beta), tokens * (heads * dk + heads), KDA_GATE_OPS_PER_ELEMENT,
+        shape=(tokens, heads, dk),
+        read_bytes_override=tokens * heads * dk * dtype_bytes(model.activation_dtype)
+                            + (tokens * heads + heads + heads * dk) * FP32_BYTES,
+        metadata=(("A_log_dtype", "fp32"), ("dt_bias_dtype", "fp32"),
+                  ("beta_dtype", "fp32"), ("raw_gate_dtype", model.activation_dtype)))
+
+
+def _lower_kda_pcp_exit(b, *, last, plan, model, parallel, views, tokens, local_tokens,
+                        hidden, kda_pcp, kda_gathered, kda_common_peer, tp):
+    act_bytes = dtype_bytes(model.activation_dtype)
+    pure_prefill_rs = (
+        kda_pcp and kda_gathered and bool(plan.kda_batch_chunk_norm)
+        and bool(views) and all(v.phase == "prefill" for v in views)
+    )
+    if kda_pcp:
+        pcp = int(parallel.pcp)
+        if pure_prefill_rs:
+            last = b.communicate(
+                "kda_pcp_reduce_scatter", (last,),
+                float(kda_common_peer * hidden) * act_bytes * float(pcp - 1),
+                "reduce_scatter", "pcp", dtype=model.activation_dtype,
+                shape=(kda_common_peer, hidden),
+                source="vllm_ascend.models.glm5next.kda")
+        else:
+            last = b.communicate(
+                "kda_pcp_allreduce", (last,),
+                QK_INPUT_COUNT * (pcp - 1) / pcp * tokens * hidden * act_bytes,
+                "allreduce", "pcp", dtype=model.activation_dtype,
+                shape=(tokens, hidden),
+                source="vllm_ascend.ops.kda_parallel")
+    if kda_gathered and not pure_prefill_rs:
+        scatter_meta = (() if bool(plan.kda_batch_chunk_norm)
+                        else (("pcp_zero_mask_padding", True),
+                              ("pcp_local_mask", True)))
+        last = emit_pcp_restore_unpermute(
+            b.ops, prefix=b.prefix, name="kda_pcp_scatter",
+            stage=b.common["stage"], layer=plan.index,
+            requests=b.common["requests"], mode=b.common["phase"],
+            dep=last, global_rows=local_tokens,
+            row_bytes=float(hidden) * act_bytes, dtype=model.activation_dtype,
+            meta_extra=scatter_meta)
+    if tp > 1:
+        tp_tokens = local_tokens if kda_gathered else tokens
+        last = b.communicate(
+            "linear_reduce", (last,),
+            QK_INPUT_COUNT * (tp - 1) / tp * tp_tokens * hidden * act_bytes,
+            "allreduce", dtype=model.activation_dtype)
+    return last
+
+
 def linear(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
            padded_tokens, policy=None, runtime=None, physical_rank=None,
            explicit_physical_rank=False, **_):
@@ -1128,6 +1303,7 @@ def linear(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
     if not isinstance(chunk, int) or isinstance(chunk, bool) or chunk <= 0:
         raise ModelingError("recurrent_chunk_must_be_positive")
     conv_input = output_gate_view = output_gate = raw_beta = beta = decay = None
+    gate_inputs: list[str] = []
     if plan.attention == "gdn":
         conv_input, gate_inputs, output_gate_view = _lower_gdn_projections(
             b, tensors, deps=deps, tokens=tokens, hidden=hidden, conv_width=conv_width,
@@ -1147,22 +1323,9 @@ def linear(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
     normalized = b.vector("qk_l2norm", (conv,), norm_rows * QK_INPUT_COUNT * key_width, L2_NORM_OPS,
                           metadata=(("batch_chunk_norm", plan.kda_batch_chunk_norm
                                      and any(v.phase == "prefill" for v in views)),))
-    if plan.attention == "gdn":
-        gated = b.vector(
-            "delta_gates", tuple(dict.fromkeys(gate_inputs)), tokens * heads, GDN_GATE_OPS_PER_HEAD, family="gdn_gating",
-            shape=(tokens, heads), read_bytes_override=(tokens + 2) * heads * FP32_BYTES,
-            write_bytes_override=tokens * heads * (FP32_BYTES + dtype_bytes("bf16")),
-            metadata=(("outputs", ("fp32_decay", "activation_beta")),
-                      ("input_heads", key_heads), ("state_heads", heads)),
-        )
-    else:
-        gated = b.vector(
-            "delta_gates", (decay, beta), tokens * (heads * dk + heads), KDA_GATE_OPS_PER_ELEMENT,
-            shape=(tokens, heads, dk),
-            read_bytes_override=tokens * heads * dk * dtype_bytes(model.activation_dtype)
-                                + (tokens * heads + heads + heads * dk) * FP32_BYTES,
-            metadata=(("A_log_dtype", "fp32"), ("dt_bias_dtype", "fp32"),
-                      ("beta_dtype", "fp32"), ("raw_gate_dtype", model.activation_dtype)))
+    gated = _lower_delta_gates(
+        b, plan=plan, model=model, runtime=runtime, tokens=tokens, heads=heads,
+        key_heads=key_heads, dk=dk, gate_inputs=gate_inputs, decay=decay, beta=beta)
     outputs, prefill_scan_ids, prepare_ids = _lower_recurrent_views(
         b, views=views, chunk=chunk, heads=heads, key_heads=key_heads, dk=dk, dv=dv,
         key_width=key_width, value_width=value_width, conv_width=conv_width, tokens=tokens,
@@ -1196,40 +1359,8 @@ def linear(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         projection_group=projection_group, runtime=runtime)
     last = b.matrix("linear_output", (output,), tokens, hidden, value_width,
                     category="kda.o" if plan.attention == "kda" else "gdn.o")
-    act_bytes = dtype_bytes(model.activation_dtype)
-    pure_prefill_rs = (
-        kda_pcp and kda_gathered and bool(plan.kda_batch_chunk_norm)
-        and bool(views) and all(v.phase == "prefill" for v in views)
-    )
-    if kda_pcp:
-        pcp = int(parallel.pcp)
-        if pure_prefill_rs:
-            last = b.communicate(
-                "kda_pcp_reduce_scatter", (last,),
-                float(kda_common_peer * hidden) * act_bytes * float(pcp - 1),
-                "reduce_scatter", "pcp", dtype=model.activation_dtype,
-                shape=(kda_common_peer, hidden),
-                source="vllm_ascend.models.glm5next.kda")
-        else:
-            last = b.communicate(
-                "kda_pcp_allreduce", (last,),
-                2 * (pcp - 1) / pcp * tokens * hidden * act_bytes,
-                "allreduce", "pcp", dtype=model.activation_dtype,
-                shape=(tokens, hidden),
-                source="vllm_ascend.ops.kda_parallel")
-    if kda_gathered and not pure_prefill_rs:
-        scatter_meta = (() if bool(plan.kda_batch_chunk_norm)
-                        else (("pcp_zero_mask_padding", True),
-                              ("pcp_local_mask", True)))
-        last = emit_pcp_restore_unpermute(
-            b.ops, prefix=b.prefix, name="kda_pcp_scatter",
-            stage=b.common["stage"], layer=plan.index,
-            requests=b.common["requests"], mode=b.common["phase"],
-            dep=last, global_rows=local_tokens,
-            row_bytes=float(hidden) * act_bytes, dtype=model.activation_dtype,
-            meta_extra=scatter_meta)
-    if tp > 1:
-        tp_tokens = local_tokens if kda_gathered else tokens
-        last = b.communicate("linear_reduce", (last,), 2 * (tp - 1) / tp * tp_tokens * hidden * act_bytes,
-                             "allreduce", dtype=model.activation_dtype)
+    last = _lower_kda_pcp_exit(
+        b, last=last, plan=plan, model=model, parallel=parallel, views=views,
+        tokens=tokens, local_tokens=local_tokens, hidden=hidden,
+        kda_pcp=kda_pcp, kda_gathered=kda_gathered, kda_common_peer=kda_common_peer, tp=tp)
     return AttentionResult(ops=b.ops, last=last)

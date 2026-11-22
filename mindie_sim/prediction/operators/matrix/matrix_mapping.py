@@ -627,6 +627,140 @@ def _has_subtile_supply(context) -> bool:
     return 0 <= demand[context.resource_names["cube"]] <= 1
 
 
+def _resolve_select_candidates(mapper, host_ctx, *, m, n, k, groups, compute_format, rows_key):
+    default_grid = (
+        sum(math.ceil(r / REFILL_M) for r in rows_key) * math.ceil(n / REFILL_M)
+        if rows_key is not None
+        else math.ceil(m / REFILL_M) * math.ceil(n / REFILL_M) * groups
+    )
+    # FP32 always screens the declared subtiles so narrow projections
+    # can fill more owners, even when the usual supply budget is unmet.
+    fp32_subtiles = mapper.candidates is None and compute_format == "fp32"
+    automatic_subtiles = fp32_subtiles or (
+        _has_subtile_supply(host_ctx) and (
+            mapper.candidates is None
+            or m < host_ctx.core_count * REFILL_M
+            or default_grid < host_ctx.core_count))
+    narrow = (NARROW_CANDIDATES if automatic_subtiles else ()
+              ) if mapper.narrow_candidates is None else mapper.narrow_candidates
+    narrow = narrow if n <= MIN_NARROW_N else ()
+    arch35_macro_streamk = (
+        is_arch35_context(host_ctx)
+        and compute_format != "fp32" and groups == 1
+        and n >= ARCH35_MACRO_MIN_N and k >= ARCH35_MACRO_MIN_K
+    )
+    underfilled = (
+        () if (arch35_macro_streamk and mapper.underfilled_candidates is None)
+        else ((UNDERFILLED_CANDIDATES if automatic_subtiles else ())
+              if mapper.underfilled_candidates is None else mapper.underfilled_candidates)
+    )
+    underfilled = underfilled if default_grid < host_ctx.core_count else ()
+    use_default_tiling = (
+        mapper.candidates is None
+        or tuple(tuple(t) for t in mapper.candidates) == LEGACY_128_CANDIDATES
+    )
+    candidates = [(tile, False) for tile in
+                  (DEFAULT_CANDIDATES if use_default_tiling else mapper.candidates)]
+    if (not is_arch35_context(host_ctx) and groups > 1
+            and use_default_tiling and n >= ARCH35_MACRO_MIN_N):
+        # Upstream DAV_2201 SPLIT_M GroupedMatmul fixes baseN = BEST_BASEN (256)
+        # (ops-transformer/gmm/grouped_matmul/op_host/op_tiling/grouped_matmul_tiling.cpp:1693-1738).
+        candidates = [(tile, flag) for tile, flag in candidates if tile[1] == ARCH35_MACRO_MIN_N]
+    if (not is_arch35_context(host_ctx) and groups == 1
+            and use_default_tiling and default_grid < host_ctx.core_count):
+        candidates.extend((tile, True) for tile in DAV2201_SMALL_M_CANDIDATES)
+    candidates.extend((tile, True) for tile in narrow)
+    candidates.extend((tile, True) for tile in underfilled if tile not in narrow)
+    return candidates, default_grid, automatic_subtiles, arch35_macro_streamk, underfilled
+
+
+def _evaluate_select_candidate(
+    mapper, host_ctx, *, tile, m, n, k, groups, compute_format, rows_key, arch35_macro_streamk,
+):
+    tm, tn, tk = tile
+    cm = min(mapper.compute_m, tm)
+    cn = min(mapper.compute_n, tn)
+    output_tiles = (
+        sum(math.ceil(r / tm) for r in rows_key) * math.ceil(n / tn)
+        if rows_key is not None
+        else math.ceil(m / tm) * math.ceil(n / tn) * groups
+    )
+    split_k = _candidate_split_k(
+        host_ctx, m=m, n=n, k=k, tk=tk, output_tiles=output_tiles,
+        groups=groups, compute_format=compute_format,
+    )
+    recipe = HierarchicalMatmul(
+        tm, tn, tk, cm, cn,
+        mapper.slots, mapper.compute_slots, mapper.reuse_inputs,
+        mapper.reuse_weights, split_k)
+    if min(tm, tn, tk, mapper.compute_m, mapper.compute_n,
+           mapper.slots, mapper.compute_slots) < 1:
+        raise ModelingError("matrix_tile_dimensions_and_slots_must_be_positive")
+    if tm % cm or tn % cn:
+        raise ModelingError("matrix_refill_tiles_must_be_multiples_of_compute_tiles")
+    geometry = matrix_geometry(host_ctx, recipe, group_rows=rows_key)
+    buffers = footprint(host_ctx, recipe, geometry=geometry)
+    exceeded = {pool: size for pool, size in buffers.items()
+                if pool in host_ctx.pool_capacities and size > host_ctx.pool_capacities[pool]}
+    # Host tiling runs from static (M, N, K) and never observes transient L2 warmth.
+    if exceeded:
+        bound = None
+    elif arch35_macro_streamk and split_k > 1:
+        base_perf = _arch35_streamk_perf(
+            host_ctx, recipe, geometry, split_k=1, output_tiles=output_tiles)
+        sk_perf = _arch35_streamk_perf(
+            host_ctx, recipe, geometry, split_k=split_k, output_tiles=output_tiles)
+        if sk_perf < base_perf:
+            bound = sk_perf
+        else:
+            split_k = 1
+            recipe = HierarchicalMatmul(
+                tm, tn, tk, cm, cn,
+                mapper.slots, mapper.compute_slots, mapper.reuse_inputs,
+                mapper.reuse_weights, split_k)
+            bound = base_perf
+    elif arch35_macro_streamk:
+        bound = _arch35_streamk_perf(
+            host_ctx, recipe, geometry, split_k=1, output_tiles=output_tiles)
+    else:
+        bound = mapping_bound(
+            host_ctx, recipe, geometry=geometry,
+            allow_unequal_groups=rows_key is not None,
+            ignore_l2_hits=True)
+        if split_k > 1:
+            split_bound = _split_k_bound(
+                host_ctx, recipe, geometry, bound=bound,
+                split_k=split_k, output_tiles=output_tiles)
+            if split_bound >= bound:
+                split_k = 1
+                recipe = HierarchicalMatmul(
+                    tm, tn, tk, cm, cn,
+                    mapper.slots, mapper.compute_slots, mapper.reuse_inputs,
+                    mapper.reuse_weights, split_k)
+            else:
+                bound = split_bound
+    waves = math.ceil(output_tiles / host_ctx.core_count)
+    rec = {
+        "tile": [tm, tn, tk], "split_k": split_k,
+        "footprint_bytes_per_owner": buffers,
+        "exceeded_pools": exceeded, "resource_bound_ms": bound,
+        "maximum_owner_output_tiles": waves,
+        "logical_shape": list(geometry.logical_shape),
+        "local_shape": list(geometry.local_shape),
+        "storage_shape": list(geometry.storage_shape),
+        "issued_shape": list(geometry.issued_shape),
+        "useful_flops": geometry.useful_flops,
+        "macro_tile_area": geometry.macro_tile_area,
+        "macro_tile_envelope": geometry.macro_tile_envelope,
+        "output_tiles": geometry.tiles,
+    }
+    score = (
+        (bound, waves, -split_k, -tk, sum(buffers.values()), tm, tn)
+        if bound is not None else None
+    )
+    return recipe, geometry, rec, score
+
+
 @dataclass(frozen=True)
 class MappedMatmul:
     candidates: tuple | None = None
@@ -682,133 +816,20 @@ class MappedMatmul:
         compute_format = meta.get("compute_format", host_ctx.op.dtype or "bf16")
         n = host_ctx.op.local_shape[(-2)]
         k = host_ctx.op.local_shape[(-1)]
-        default_grid = (
-            sum(math.ceil(r / REFILL_M) for r in rows_key) * math.ceil(n / REFILL_M)
-            if rows_key is not None
-            else math.ceil(m / REFILL_M) * math.ceil(n / REFILL_M) * groups
+        candidates, default_grid, automatic_subtiles, arch35_macro_streamk, underfilled = (
+            _resolve_select_candidates(
+                self, host_ctx, m=m, n=n, k=k, groups=groups,
+                compute_format=compute_format, rows_key=rows_key)
         )
-        # FP32 always screens the declared subtiles so narrow projections
-        # can fill more owners, even when the usual supply budget is unmet.
-        fp32_subtiles = self.candidates is None and compute_format == "fp32"
-        automatic_subtiles = fp32_subtiles or (
-            _has_subtile_supply(host_ctx) and (
-                self.candidates is None
-                or m < host_ctx.core_count * REFILL_M
-                or default_grid < host_ctx.core_count))
-        narrow = (NARROW_CANDIDATES if automatic_subtiles else ()
-                  ) if self.narrow_candidates is None else self.narrow_candidates
-        narrow = narrow if n <= MIN_NARROW_N else ()
-        arch35_macro_streamk = (
-            is_arch35_context(host_ctx)
-            and compute_format != "fp32" and groups == 1
-            and n >= ARCH35_MACRO_MIN_N and k >= ARCH35_MACRO_MIN_K
-        )
-        underfilled = (
-            () if (arch35_macro_streamk and self.underfilled_candidates is None)
-            else ((UNDERFILLED_CANDIDATES if automatic_subtiles else ())
-                  if self.underfilled_candidates is None else self.underfilled_candidates)
-        )
-        underfilled = underfilled if default_grid < host_ctx.core_count else ()
-        use_default_tiling = (
-            self.candidates is None
-            or tuple(tuple(t) for t in self.candidates) == LEGACY_128_CANDIDATES
-        )
-        candidates = [(tile, False) for tile in
-                      (DEFAULT_CANDIDATES if use_default_tiling else self.candidates)]
-        if (not is_arch35_context(host_ctx) and groups > 1
-                and use_default_tiling and n >= ARCH35_MACRO_MIN_N):
-            # Upstream DAV_2201 SPLIT_M GroupedMatmul fixes baseN = BEST_BASEN (256)
-            # (ops-transformer/gmm/grouped_matmul/op_host/op_tiling/grouped_matmul_tiling.cpp:1693-1738).
-            candidates = [(tile, flag) for tile, flag in candidates if tile[1] == ARCH35_MACRO_MIN_N]
-        if (not is_arch35_context(host_ctx) and groups == 1
-                and use_default_tiling and default_grid < host_ctx.core_count):
-            candidates.extend((tile, True) for tile in DAV2201_SMALL_M_CANDIDATES)
-        candidates.extend((tile, True) for tile in narrow)
-        candidates.extend((tile, True) for tile in underfilled if tile not in narrow)
-        for (tm, tn, tk), is_narrow in candidates:
-            del is_narrow
-            cm = min(self.compute_m, tm)
-            cn = min(self.compute_n, tn)
-            output_tiles = (
-                sum(math.ceil(r / tm) for r in rows_key) * math.ceil(n / tn)
-                if rows_key is not None
-                else math.ceil(m / tm) * math.ceil(n / tn) * groups
-            )
-            split_k = _candidate_split_k(
-                host_ctx, m=m, n=n, k=k, tk=tk, output_tiles=output_tiles,
-                groups=groups, compute_format=compute_format,
-            )
-            recipe = HierarchicalMatmul(
-                tm, tn, tk, cm, cn,
-                self.slots, self.compute_slots, self.reuse_inputs,
-                self.reuse_weights, split_k)
-            if min(tm, tn, tk, self.compute_m, self.compute_n,
-                   self.slots, self.compute_slots) < 1:
-                raise ModelingError("matrix_tile_dimensions_and_slots_must_be_positive")
-            if tm % cm or tn % cn:
-                raise ModelingError("matrix_refill_tiles_must_be_multiples_of_compute_tiles")
-            geometry = matrix_geometry(host_ctx, recipe, group_rows=rows_key)
-            buffers = footprint(host_ctx, recipe, geometry=geometry)
-            exceeded = {pool: size for pool, size in buffers.items()
-                        if pool in host_ctx.pool_capacities and size > host_ctx.pool_capacities[pool]}
-            # Host tiling runs from static (M, N, K) and never observes transient L2 warmth.
-            if exceeded:
-                bound = None
-            elif arch35_macro_streamk and split_k > 1:
-                base_perf = _arch35_streamk_perf(
-                    host_ctx, recipe, geometry, split_k=1, output_tiles=output_tiles)
-                sk_perf = _arch35_streamk_perf(
-                    host_ctx, recipe, geometry, split_k=split_k, output_tiles=output_tiles)
-                if sk_perf < base_perf:
-                    bound = sk_perf
-                else:
-                    split_k = 1
-                    recipe = HierarchicalMatmul(
-                        tm, tn, tk, cm, cn,
-                        self.slots, self.compute_slots, self.reuse_inputs,
-                        self.reuse_weights, split_k)
-                    bound = base_perf
-            elif arch35_macro_streamk:
-                bound = _arch35_streamk_perf(
-                    host_ctx, recipe, geometry, split_k=1, output_tiles=output_tiles)
-            else:
-                bound = mapping_bound(
-                    host_ctx, recipe, geometry=geometry,
-                    allow_unequal_groups=rows_key is not None,
-                    ignore_l2_hits=True)
-                if split_k > 1:
-                    split_bound = _split_k_bound(
-                        host_ctx, recipe, geometry, bound=bound,
-                        split_k=split_k, output_tiles=output_tiles)
-                    if split_bound >= bound:
-                        split_k = 1
-                        recipe = HierarchicalMatmul(
-                            tm, tn, tk, cm, cn,
-                            self.slots, self.compute_slots, self.reuse_inputs,
-                            self.reuse_weights, split_k)
-                    else:
-                        bound = split_bound
-            waves = math.ceil(output_tiles / host_ctx.core_count)
-            records.append({"tile": [tm, tn, tk], "split_k": split_k,
-                            "footprint_bytes_per_owner": buffers,
-                            "exceeded_pools": exceeded, "resource_bound_ms": bound,
-                            "maximum_owner_output_tiles": waves,
-                            "logical_shape": list(geometry.logical_shape),
-                            "local_shape": list(geometry.local_shape),
-                            "storage_shape": list(geometry.storage_shape),
-                            "issued_shape": list(geometry.issued_shape),
-                            "useful_flops": geometry.useful_flops,
-                            "macro_tile_area": geometry.macro_tile_area,
-                            "macro_tile_envelope": geometry.macro_tile_envelope,
-                            "output_tiles": geometry.tiles})
-            if bound is not None:
-                # Equal resource bounds can hide another serial output-tile
-                # drain/prologue on an owner. Avoid those extra waves before
-                # minimizing residency; smaller buffers alone are not faster.
-                score = (bound, waves, -split_k, -tk, sum(buffers.values()), tm, tn)
-                if selected is None or score < selected[0]:
-                    selected = (score, recipe)
-                    selected_geometry = geometry
+        for tile, _is_narrow in candidates:
+            recipe, geometry, rec, score = _evaluate_select_candidate(
+                self, host_ctx, tile=tile, m=m, n=n, k=k, groups=groups,
+                compute_format=compute_format, rows_key=rows_key,
+                arch35_macro_streamk=arch35_macro_streamk)
+            records.append(rec)
+            if score is not None and (selected is None or score < selected[0]):
+                selected = (score, recipe)
+                selected_geometry = geometry
         if selected is None:
             raise ModelingError(f"matrix_no_feasible_declared_mapping:"
                                 f"shape={context.op.local_shape}:groups={groups}:dtype={context.op.dtype}")
