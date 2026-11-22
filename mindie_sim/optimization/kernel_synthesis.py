@@ -623,7 +623,7 @@ class TargetOpNode:
     new_kernel_spec: str
     canonical_op_key: str
     opt_pillar: str = ""
-    opt_target_eta_pct: float | None = None
+    opt_attainment_pct: float | None = None
     spec: OpSpec | None = None
     synthesis_spec: KernelSynthesisSpec | None = None
     binding_state: BindingState = "bound_implementation"
@@ -1778,7 +1778,7 @@ def _collapse_candidate_group(
         new_kernel_spec=spec.format_formula_block(),
         canonical_op_key=suffix,
         opt_pillar=spec.opt_pillar,
-        opt_target_eta_pct=spec.target_attainment_pct,
+        opt_attainment_pct=spec.target_attainment_pct,
         synthesis_spec=spec,
         binding_state=b_state,
     )
@@ -1898,7 +1898,7 @@ def _apply_pillar23_envelopes(
                     gap_ratio=(t_after / node.l_star_lean_us) if node.l_star_lean_us > 0.0 else None,
                     roofline_efficiency=eff,
                     opt_pillar="pillar3_comm",
-                    opt_target_eta_pct=round(eff * PERCENT_SCALE, 1) if eff is not None else None,
+                    opt_attainment_pct=round(eff * PERCENT_SCALE, 1) if eff is not None else None,
                 ))
             else:
                 out.append(replace(node, kernel_status=STATUS_AT_FLOOR, needs_new_kernel=False))
@@ -1946,7 +1946,7 @@ def _apply_pillar23_envelopes(
                 gap_ratio=(t_after / node.l_star_lean_us) if node.l_star_lean_us > 0.0 else None,
                 roofline_efficiency=eff,
                 opt_pillar=pillar,
-                opt_target_eta_pct=round(eff * PERCENT_SCALE, 1) if eff is not None else None,
+                opt_attainment_pct=round(eff * PERCENT_SCALE, 1) if eff is not None else None,
                 binding_state=b_state,
             ))
         else:
