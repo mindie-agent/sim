@@ -19,7 +19,7 @@ from _support.moe_hc_mc2_fixtures import balanced_case, grouped_case
 from mindie_sim import graph_costs, operator_costs, predict, predict_pd, target_graphs, target_operators
 from mindie_sim.__main__ import parser, run
 from mindie_sim.compose import compose_case
-from mindie_sim.prediction.body import body_forward
+from mindie_sim.prediction.frontend.body_spec import body_forward
 from mindie_sim.prediction.body_defaults import attention_defaults
 from mindie_sim.prediction.engine import Allocation, Engine, Resource
 from mindie_sim.prediction.operators.matrix.matrix import TiledMatmul
@@ -226,7 +226,7 @@ def test_tp_representative_is_local_max_not_global_rank_zero():
     # Multiplying representative work by TP is an upper bound, not an exact shard sum; the global histogram keeps the exact six.
     assert sum(sum(v["local_expert_rows"]) * 4 for v in values) == 8
 def test_unequal_source_rows_preserve_reverse_peer_matrix():
-    from mindie_sim.prediction.peer_traffic import PeerTraffic
+    from mindie_sim.prediction.collectives.peer_traffic import PeerTraffic
     raw = _cohort_case(dp=4, ep=4); raw["runtime"]["graph_mode"] = "eager"
     graphs = target_graphs(raw, phase="decode", tokens=1, context=16, sequences=[1, 0, 3, 2], scope="body")
     forward = next(op for op in graphs[0] if op.recipe == "expert_dispatch"); backward = next(op for op in graphs[0] if op.recipe == "expert_combine")

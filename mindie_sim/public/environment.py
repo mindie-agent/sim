@@ -29,7 +29,7 @@ from dataclasses import dataclass, field, replace
 import math
 from typing import Any
 
-from mindie_sim.prediction.cost import CostModel
+from mindie_sim.prediction.efficiency.cost import CostModel
 from mindie_sim.prediction.engine import Event
 from mindie_sim.prediction.execution import Execution
 from mindie_sim.prediction.program import RecipeBook
@@ -42,7 +42,7 @@ from mindie_sim.schema.parallel import ParallelSpec
 from mindie_sim.schema.workload import IterationPlan
 
 from mindie_sim.observations.resource_services import NormalizedResourceService
-from mindie_sim.prediction.services import service_identity
+from mindie_sim.prediction.service_regime_domains.services import service_identity
 
 from .profiles import UserProfile
 from .services import ProfileServiceRecipe, conditions_context

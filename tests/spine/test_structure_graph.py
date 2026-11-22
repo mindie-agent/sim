@@ -31,7 +31,7 @@ from mindie_sim.catalog.quant import quant_preset
 from mindie_sim.catalog.types import QuantSpec
 from mindie_sim.catalog.weight_terms import term_bytes
 from mindie_sim.catalog.weights import layer_weight_terms, stage_weight_bytes
-from mindie_sim.cohort_comparison import compare_cohorts
+from mindie_sim.cohort_accuracy import compare_cohorts
 from mindie_sim.prediction.capacity import Memory
 from mindie_sim.prediction.frontend import Frontend
 from mindie_sim.prediction.graph import GraphPolicy
@@ -45,8 +45,8 @@ from mindie_sim.schema.parallel import ParallelSpec
 from mindie_sim.schema.workload import IterationPlan, RequestView
 from mindie_sim.structure import export_op_structure, export_structure
 from mindie_sim.structure_implementations import operator_structure
-from mindie_sim.structure_index import export_structure_index
-from mindie_sim.structure_selection import select_structure_targets
+from mindie_sim.structure.physical import export_structure_index
+from mindie_sim.structure.physical import select_structure_targets
 
 pytestmark = pytest.mark.tier0
 ROOT = Path(__file__).resolve().parents[2]

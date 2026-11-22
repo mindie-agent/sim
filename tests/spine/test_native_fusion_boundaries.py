@@ -24,7 +24,7 @@ from mindie_sim.catalog.types import QuantSpec
 from mindie_sim.compose import compose_case
 from mindie_sim.model_catalog import load_model
 from mindie_sim.prediction.operators.attention.attention import AttentionPolicy, _memory_hierarchy, gqa
-from mindie_sim.prediction.blocks import norm
+from mindie_sim.prediction.frontend.body_spec import norm
 from mindie_sim.prediction.operators.hyper_connections.family_hc import pre_phase_work
 from mindie_sim.prediction.operators.mla.generic_latent_attention import owned_completed_rows, semantic_index_selection, unique_index_key_rows, window_tile_rows
 from mindie_sim.prediction.implementation_selection import resolve
@@ -39,7 +39,7 @@ from mindie_sim.prediction.operators.hyper_connections.native_fusion_traffic imp
 from mindie_sim.prediction.operator_analysis import operator_costs, target_graphs, target_operators
 from mindie_sim.prediction.prefix_reads import CacheAccess, plan_prefix_reads
 from mindie_sim.prediction.program import KernelProgram, PipelinePhase, PipelineProgram, PipelineTemplate, RecipeBook, Stage, coalesce_execution_program
-from mindie_sim.prediction.program_catalog import compile_pipeline_template, compile_program, submit_program, submit_program_catalog
+from mindie_sim.prediction.program.catalog import compile_pipeline_template, compile_program, submit_program, submit_program_catalog
 from mindie_sim.prediction.operators.recurrent.recurrent import linear
 from mindie_sim.prediction.runtime import accel_bridge, accel_build
 from mindie_sim.prediction.runtime.contracts import CatalogGeneration
@@ -49,7 +49,7 @@ from mindie_sim.prediction.transforms import activation_quantization, lower_impl
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.parallel import ParallelSpec
 from mindie_sim.schema.workload import RequestView
-from mindie_sim.structure_physical import node_physical
+from mindie_sim.structure.physical import node_physical
 
 pytestmark = pytest.mark.tier0
 ROOT = Path(__file__).resolve().parents[2]

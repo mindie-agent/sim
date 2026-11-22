@@ -24,15 +24,16 @@ from mindie_sim.catalog.draft_geometry import draft_layer_plans
 from mindie_sim.catalog.types import QuantSpec
 from mindie_sim.catalog.weights import stage_weight_bytes
 from mindie_sim.feature_mechanisms import MECHANISM_CATALOG, MechanismContext
-from mindie_sim.prediction import local_projection_tp, operator_analysis as oa
-from mindie_sim.prediction.analysis_inputs import analysis_view
+from mindie_sim.prediction import operator_analysis as oa
+from mindie_sim.prediction.sharding import local_tp as local_projection_tp
+from mindie_sim.prediction.graph_analysis import analysis_view
 from mindie_sim.prediction.operators.attention.attention import AttentionPolicy
 from mindie_sim.prediction.operators.sparse_indexer.batch_prefix_indexer import apply_indexer_prefix_reads
 from mindie_sim.prediction.capacity import Memory, MemoryPolicy
-from mindie_sim.prediction.cost import CostModel
+from mindie_sim.prediction.efficiency.cost import CostModel
 from mindie_sim.prediction.execution import Execution
 from mindie_sim.prediction.frontend import Frontend
-from mindie_sim.prediction.frontend_features import _runtime_metadata
+from mindie_sim.prediction.frontend.features import _runtime_metadata
 from mindie_sim.prediction.operators.linear_attention._gdn_decode_programs import CONV
 from mindie_sim.prediction.operators.mla.generic_latent_attention import index_key_window, unique_index_key_rows
 from mindie_sim.prediction.implementation_selection import graph_selections
@@ -41,8 +42,8 @@ from mindie_sim.prediction.operators.moe_routing.moe_init_mxfp8 import RECIPE
 from mindie_sim.prediction.operator_analysis import operator_costs, target_operators
 from mindie_sim.prediction.operators.attention import attention_online; from mindie_sim.prediction.operators.vector import cuda_norm
 from mindie_sim.prediction.prefix_reads import CacheAccess, plan_prefix_reads
-from mindie_sim.prediction.rewrite_indexer_rules import online_indexer_topk
-from mindie_sim.prediction.speculation import draft_program
+from mindie_sim.prediction.rewrite import online_indexer_topk
+from mindie_sim.prediction.frontend.speculation import draft_program
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.dspark import DsparkSpec

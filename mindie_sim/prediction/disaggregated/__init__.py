@@ -18,14 +18,14 @@ from mindie_sim.schema.common import ModelingError
 
 from mindie_sim.prediction.operators.attention.attention import AttentionPolicy
 from ..capacity import Memory
-from ..cost import CostModel
-from ..dispatch import cohorts, submit_batch
+from ..efficiency.cost import CostModel
+from ..execution.dispatch import cohorts, submit_batch
 from ..engine import Engine
 from ..execution import Execution
 from ..frontend import Frontend
-from ..metrics import serving_boundaries, summarize
+from ..efficiency.metrics import serving_boundaries, summarize
 from ..pd_connector import PDConnector, PDHandoff, PDTransfer
-from ..pd_ranges import address, owned_runs, transfers_for_runs
+from ..disaggregated.ranges import address, owned_runs, transfers_for_runs
 from ..scheduler import Scheduler
 from ..structure import parse_case
 from .handoff import (

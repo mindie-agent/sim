@@ -28,13 +28,13 @@ import pytest
 from mindie_sim import compose_case, graph_costs, predict, target_graphs
 from mindie_sim.observations import calibration as obs_cal, communication as comm
 from mindie_sim.observations.communication import (
-    binding as comm_bind, ingest as comm_ing, recipes as comm_rec, streaming as comm_str)
+    binding as comm_bind, binding as comm_rec, ingest as comm_ing, ingest as comm_str)
 from mindie_sim.observations.resource_services import (
     RESOURCE_SERVICE_PROFILE_SCHEMA, RESOURCE_SERVICE_SCHEMA, normalize_resource_service)
 from mindie_sim.prediction.engine import Allocation, Engine, Resource
 from mindie_sim.prediction.operator_analysis import operator_costs
 from mindie_sim.prediction.program import RecipeBook, RecipeContext
-from mindie_sim.prediction.services import ResourceService, service_identity
+from mindie_sim.prediction.service_regime_domains.services import ResourceService, service_identity
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.operators import OpSpec

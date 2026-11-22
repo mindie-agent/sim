@@ -24,14 +24,14 @@ from mindie_sim.prediction.call_builders import build_aclnn_call
 from mindie_sim.prediction.operators.attention.attention import AttentionPolicy, gqa
 from mindie_sim.prediction.engine import Allocation, Engine, Resource
 from mindie_sim.prediction.operators.mla.generic_latent_attention import owned_store_rows, sparse_over_parts
-from mindie_sim.prediction.operators.context_parallel.graph import PACK_LSE_OPS
-from mindie_sim.prediction.local_projection_tp import _local_dimension, _packed_local_width
+from mindie_sim.prediction.sharding.context_parallel import PACK_LSE_OPS
+from mindie_sim.prediction.sharding.local_tp import _local_dimension, _packed_local_width
 from mindie_sim.prediction.mechanism import Geometry
 from mindie_sim.prediction.operators import attention as governed
 from mindie_sim.prediction.operators.attention.common import MINDIE_V1_ABI, MINDIE_V2_ABI, MINDIE_V3_ABI
 from mindie_sim.prediction.program import AddressRun, AddressRunPlan, AdmissionMemoryView, MemoryAccessPattern, RecipeContext, ReuseKey
 from mindie_sim.prediction.operators.sparse_indexer.sparse_mla_metadata import IMPLEMENTATION as METADATA_RECIPE, NATIVE
-from mindie_sim.prediction.verification import verify_operator
+from mindie_sim.prediction.graph_analysis import verify_operator
 from mindie_sim.public.errors import UnmodeledCapabilityError
 from mindie_sim.schema.compute_arch import NativeComputeMode
 from mindie_sim.schema.parallel import ParallelSpec

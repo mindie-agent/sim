@@ -9,7 +9,7 @@
 
 ## 1. 已注册 SKU 标称几何基线与硬件别名
 
-在 [`mindie_sim/compose.py`](../../mindie_sim/compose.py) 中，常用硬件别名映射为：`a2` / `910b` / `910b4` -> `Ascend910B4`；`800i-a2` -> `Ascend910B4` + `a2_standard`（8P HCCS）；`910b1` / `910b2` / `910b3` 分别对应各自精确 SKU。[`ascend.json`](../../mindie_sim/backends/profiles/ascend.json) 中注册的 6 款 A2 SKU 基线如下（采集前请先通过 `npu-smi info` 核对真机芯片型号）：
+在 [`mindie_sim/compose/inputs.py`](../../mindie_sim/compose/inputs.py) 中，常用硬件别名映射为：`a2` / `910b` / `910b4` -> `Ascend910B4`；`800i-a2` -> `Ascend910B4` + `a2_standard`（8P HCCS）；`910b1` / `910b2` / `910b3` 分别对应各自精确 SKU。[`ascend.json`](../../mindie_sim/backends/profiles/ascend.json) 中注册的 6 款 A2 SKU 基线如下（采集前请先通过 `npu-smi info` 核对真机芯片型号）：
 
 | SKU 键名 | 封装形态 | AIC / AIV | 标称主频 | HBM 容量 / 标称带宽 | 共享 L2 容量（`buffer_units.l2 = 1`） | BF16 / INT8 / INT4 标称峰值 | 冷 HBM 旋转环下限（`>= 3 × L2`） |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |

@@ -383,6 +383,42 @@ def _merge_produced_outputs(operator, contract, values, produced):
                         value["name"] = value["output"] = "rstd"
 
 
+def _bind_value_ports(operator, contract, values, context, gaps, op_id):
+    deps = operator.get("deps") or ()
+    for value in values["outputs"]:
+        if not value["producer"]:
+            value["producer"] = op_id
+        if value["output"] is None:
+            value["output"] = value["name"]
+
+    _apply_input_ports(operator, values, context, gaps)
+    native_norm = (contract is not None and contract[0] == "native_tensor_abi"
+                   and ("RmsNorm" in str(contract[1])
+                        or "LayerNorm" in str(contract[1])))
+    for index, value in enumerate(values["inputs"]):
+        if (value["producer"] or value["role"] not in {"input", "activation"}
+                or value["name"] in {"weight", "bias", "state", "key_cache",
+                                     "value_cache"}
+                or (native_norm and index > 0)):
+            if native_norm and index > 0:
+                value["attrs"]["parameter"] = True
+            continue
+        value["attrs"]["producer_unresolved"] = True
+        gaps.append({"code": "operand_producer_unresolved",
+                     "detail": {"value": value["name"],
+                                "deps": list(operator.get("deps") or ()),
+                                "effect": "no actual input port; not inferred by position"}})
+    if contract is not None and str(contract[0]).startswith(
+            ("matrix", "grouped_matrix")):
+        for value in values["inputs"]:
+            if value["name"] == "weight" and not value["producer"]:
+                value["attrs"]["weight_source_unresolved"] = True
+                gaps.append({"code": "weight_source_unresolved",
+                             "detail": {"matrix_kind": contract[0],
+                                        "weight_shape": value.get("shape"),
+                                        "effect": "declared weight retained; producer not named"}})
+
+
 def typed_values(operator, contract, *, context=None):
     """Project one operator's declared values and representation facts.
 
@@ -491,39 +527,7 @@ def typed_values(operator, contract, *, context=None):
             "recurrent_vector", "tensor_copy"}:
         _merge_produced_outputs(operator, contract, values, produced)
 
-    deps = operator.get("deps") or ()
-    for value in values["outputs"]:
-        if not value["producer"]:
-            value["producer"] = op_id
-        if value["output"] is None:
-            value["output"] = value["name"]
-
-    _apply_input_ports(operator, values, context, gaps)
-    native_norm = (contract is not None and contract[0] == "native_tensor_abi"
-                   and ("RmsNorm" in str(contract[1])
-                        or "LayerNorm" in str(contract[1])))
-    for index, value in enumerate(values["inputs"]):
-        if (value["producer"] or value["role"] not in {"input", "activation"}
-                or value["name"] in {"weight", "bias", "state", "key_cache",
-                                     "value_cache"}
-                or (native_norm and index > 0)):
-            if native_norm and index > 0:
-                value["attrs"]["parameter"] = True
-            continue
-        value["attrs"]["producer_unresolved"] = True
-        gaps.append({"code": "operand_producer_unresolved",
-                     "detail": {"value": value["name"],
-                                "deps": list(operator.get("deps") or ()),
-                                "effect": "no actual input port; not inferred by position"}})
-    if contract is not None and str(contract[0]).startswith(
-            ("matrix", "grouped_matrix")):
-        for value in values["inputs"]:
-            if value["name"] == "weight" and not value["producer"]:
-                value["attrs"]["weight_source_unresolved"] = True
-                gaps.append({"code": "weight_source_unresolved",
-                             "detail": {"matrix_kind": contract[0],
-                                        "weight_shape": value.get("shape"),
-                                        "effect": "declared weight retained; producer not named"}})
+    _bind_value_ports(operator, contract, values, context, gaps, op_id)
     _scale_values(operator, values, quantization)
     semantic_attrs = _semantic_attrs(operator, semantic_attrs)
     if not external_outputs:

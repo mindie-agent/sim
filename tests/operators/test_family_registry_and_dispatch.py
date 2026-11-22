@@ -21,10 +21,10 @@ from _support.axes import REPRESENTATIVE_SKUS, SKUS
 from _support.hardware import hardware_case, isa_of, op as simple_op, sku_case
 from mindie_sim.catalog.ops import gemm_op, vector_op
 from mindie_sim.catalog.quant import quant_preset
-from mindie_sim.observations.historical import call_inventory, call_observations, compare_call
-from mindie_sim.observations.kernels import kernel_rows
-from mindie_sim.prediction.blocks import norm
-from mindie_sim.prediction.cost import CostModel
+from mindie_sim.observations.comparison import call_inventory, call_observations, compare_call
+from mindie_sim.observations.captures import kernel_rows
+from mindie_sim.prediction.frontend.body_spec import norm
+from mindie_sim.prediction.efficiency.cost import CostModel
 from mindie_sim.prediction.engine import Allocation, Engine, Resource
 from mindie_sim.prediction.execution import Execution
 from mindie_sim.prediction.frontend import Frontend
@@ -36,7 +36,7 @@ from mindie_sim.prediction.program import KernelProgram, RecipeBook, RecipeConte
 from mindie_sim.prediction.results import FusedPipelineDescriptor, OpOccurrence
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.prediction.transforms import activation_quantization, lower_implementations, norm_quant, residual_norm
-from mindie_sim.prediction.verification import verify_operator
+from mindie_sim.prediction.graph_analysis import verify_operator
 from mindie_sim.public.errors import UnmodeledCapabilityError
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.datapath import ArchId

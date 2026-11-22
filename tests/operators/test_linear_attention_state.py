@@ -18,7 +18,7 @@ from _support.linear_cases import (
 )
 from mindie_sim.model_catalog import load_model
 from mindie_sim.prediction.operators.attention.attention import AttentionPolicy
-from mindie_sim.prediction.cost import CostModel
+from mindie_sim.prediction.efficiency.cost import CostModel
 from mindie_sim.prediction.engine import Engine
 from mindie_sim.prediction.execution import Execution
 from mindie_sim.prediction.operators.kda.family_kda import IMPLEMENTATION as GATES

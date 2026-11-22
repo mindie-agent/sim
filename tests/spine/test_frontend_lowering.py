@@ -28,19 +28,19 @@ from mindie_sim.catalog.quant import quant_preset
 from mindie_sim.catalog.types import AuxiliarySpec
 from mindie_sim.catalog.weight_terms import term_bytes
 from mindie_sim.catalog.weights import stage_weight_terms
-from mindie_sim.cohort_comparison import compare_cohorts
+from mindie_sim.cohort_accuracy import compare_cohorts
 from mindie_sim.compose import compose_case
 from mindie_sim.model_catalog import CONFIG_DIR, load_model
 from mindie_sim.prediction.operators.attention.attention_pipeline import TiledFlashAndPagedAttentionRecipe
 from mindie_sim.prediction.body_defaults import effective_body_declaration, service_program_defaults
 from mindie_sim.prediction.capacity import Memory
-from mindie_sim.prediction.cost import CostModel
+from mindie_sim.prediction.efficiency.cost import CostModel
 from mindie_sim.prediction.execution import Execution
 from mindie_sim.prediction.frontend import Frontend
-from mindie_sim.prediction.physical_key import physical_key
+from mindie_sim.prediction.program.physical_key import physical_key
 from mindie_sim.prediction.program import RecipeBook, TransferRecipe
 from mindie_sim.prediction.scheduler import DraftPolicy, Progress
-from mindie_sim.prediction.speculation import draft_program
+from mindie_sim.prediction.frontend.speculation import draft_program
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.dspark import DsparkSpec

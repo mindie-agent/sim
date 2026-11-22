@@ -24,7 +24,7 @@ import math
 from pathlib import Path
 from typing import Any
 
-from mindie_sim.observations.accuracy import apply_capture_observed_clock
+from mindie_sim.observations.comparison import apply_capture_observed_clock
 
 REL_TOL = 0.10
 ABS_FLOOR_NS = 2000.0

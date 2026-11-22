@@ -47,7 +47,7 @@ from mindie_sim.catalog.weight_layer_terms import layer_weight_terms
 from mindie_sim.compose import compose_case
 from mindie_sim.model_catalog import CATALOG, MODEL_ALIASES, load_model
 from mindie_sim.prediction.operators.moe_routing.expert_slot_work import physical_slot_work
-from mindie_sim.prediction.local_tp_groups import collective_requires_cohort, expert_tp_groups, local_tp_groups
+from mindie_sim.prediction.sharding.local_tp import collective_requires_cohort, expert_tp_groups, local_tp_groups
 from mindie_sim.prediction.operator_analysis import synchronize_moe_allgather_cohort
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.prediction.topology import Topology
@@ -514,7 +514,7 @@ _CATALOG_KEYS = tuple(entry["key"] for entry in _list_catalog_models())
 @pytest.mark.parametrize("key", _CATALOG_KEYS, ids=list(_CATALOG_KEYS))
 def test_physical_key_count_is_bounded_by_layer_archetypes_not_layer_count(key):
     from mindie_sim import target_graphs
-    from mindie_sim.prediction.physical_key import physical_key
+    from mindie_sim.prediction.program.physical_key import physical_key
 
     cases = {n: compose_case(key, hardware="a5", layers=n) for n in (2, 6, 12)}
     counts = {
@@ -545,7 +545,7 @@ _CATALOG_KEYS = tuple(entry["key"] for entry in _list_catalog_models())
 @pytest.mark.parametrize("key", _CATALOG_KEYS, ids=list(_CATALOG_KEYS))
 def test_physical_key_count_is_bounded_by_layer_archetypes_not_layer_count(key):
     from mindie_sim import target_graphs
-    from mindie_sim.prediction.physical_key import physical_key
+    from mindie_sim.prediction.program.physical_key import physical_key
 
     cases = {n: compose_case(key, hardware="a5", layers=n) for n in (2, 6, 12)}
     counts = {

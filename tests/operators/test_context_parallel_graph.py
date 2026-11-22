@@ -41,7 +41,7 @@ from mindie_sim.prediction.efficiency import _lower_and_run_graph
 from mindie_sim.prediction.graph_analysis import _bind_collective_readiness
 from mindie_sim.prediction.operator_analysis import target_operators
 from mindie_sim.prediction.operators.attention.attention import AttentionPolicy, gqa
-from mindie_sim.prediction.operators.context_parallel.graph import (
+from mindie_sim.prediction.sharding.context_parallel import (
     CP_CHUNKED_PREFILL_STREAM,
     CP_DECODE_COMM_STREAM,
     CP_WEIGHT_STREAM,

@@ -520,7 +520,7 @@ class TransferRecipe:
     response_ms: float = 0.0
 
     def lower(self, context: RecipeContext) -> KernelProgram:
-        from ..transfer import FiniteTransfer
+        from ..collectives.transfer import FiniteTransfer
         paths = []
         for resource, amount in context.work.items():
             frame = context.transaction_frames.get(resource)

@@ -7,6 +7,6 @@
 """
 from .api import predict
 from .graph_analysis import graph_costs
-from .primitives import PrimitiveKey, PrimitiveStore, PrimitiveTiming
+from .program.primitives import PrimitiveKey, PrimitiveStore, PrimitiveTiming
 
 __all__ = ["predict", "graph_costs", "PrimitiveKey", "PrimitiveStore", "PrimitiveTiming"]

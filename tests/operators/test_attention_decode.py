@@ -23,8 +23,8 @@ from mindie_sim import compose_case, graph_costs, operator_costs, target_graphs,
 from mindie_sim.catalog.cache import cache_row_split, packed_region_row_bytes
 from mindie_sim.catalog.cache_format import cache_format
 from mindie_sim.catalog.types import AuxiliarySpec, DraftSpec
-from mindie_sim.observed_contracts.attention_contracts import observed_attention_contract
-from mindie_sim.prediction.operators.paged_mla import family_mqsmla, mqsmla; from mindie_sim.prediction.operators.context_parallel import graph as cp_graph
+from mindie_sim.observed_contracts.attention import observed_attention_contract
+from mindie_sim.prediction.operators.paged_mla import family_mqsmla, mqsmla; from mindie_sim.prediction.sharding import context_parallel as cp_graph
 from mindie_sim.prediction.operators.sharedkv import sharedkv_attention as scfa
 from mindie_sim.prediction.operators.attention.attention import AttentionPolicy
 from mindie_sim.prediction.operators.attention.batch_prefix_attention import BatchPrefixAttention

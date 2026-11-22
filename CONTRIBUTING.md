@@ -38,7 +38,7 @@ flowchart LR
 ```
 
 主干各层代码职责边界如下：
-- **模型目录与用例合成**：[`mindie_sim/model_catalog.py`](mindie_sim/model_catalog.py) 与 `mindie_sim/catalog/*` 解析模型结构并维护六本正交权重/KV/状态账本，经 [`mindie_sim/compose.py`](mindie_sim/compose.py) 确定性合成 `Case`。
+- **模型目录与用例合成**：[`mindie_sim/model_catalog.py`](mindie_sim/model_catalog.py) 与 `mindie_sim/catalog/*` 解析模型结构并维护六本正交权重/KV/状态账本，经 [`mindie_sim/compose/__init__.py`](mindie_sim/compose/__init__.py) 确定性合成 `Case`。
 - **硬件机理声明与拓扑物化**：[`mindie_sim/schema/physical_mechanisms.py`](mindie_sim/schema/physical_mechanisms.py) 定义不可变的 `MemoryHierarchySpec`、`MatrixPolicySpec` 与 `PhysicalMechanismSpec`；[`mindie_sim/backends/ascend.py`](mindie_sim/backends/ascend.py) 与 [`mindie_sim/schema/hardware.py`](mindie_sim/schema/hardware.py) 将 [`mindie_sim/backends/profiles/ascend.json`](mindie_sim/backends/profiles/ascend.json) 物化为冻结的 `Hardware` / `Device` / `Link` 视图。
 - **物理配方降维与单次求值上下文**：[`mindie_sim/prediction/physical_recipe_registry.py`](mindie_sim/prediction/physical_recipe_registry.py) 与 [`mindie_sim/prediction/body_defaults.py`](mindie_sim/prediction/body_defaults.py) 将每个 `OpSpec` 绑定为守恒的 `OperatorPlan` / `Program`，在单次 `EvaluationContext`（单次评估仅构造 `1` 次 `CostModel` 与 `1` 次 `ExecutionBindings`）下提交至 `runtime.Engine` 执行。
 - **实测校准与盲测闭环**：[`mindie_sim/__main__.py`](mindie_sim/__main__.py)、[`mindie_sim/observations/service_fitting.py`](mindie_sim/observations/service_fitting.py)、[`mindie_sim/observations/calibration.py`](mindie_sim/observations/calibration.py) 与 [`mindie_sim/observations/resource_services.py`](mindie_sim/observations/resource_services.py) 负责消费微基准及 `mindie-profiler` 观测数据，严禁将实测耗时反向注入主干执行循环。
@@ -52,7 +52,7 @@ flowchart LR
 | 编号 | 绝对红线 | 代码级拦截机制与精确报错 |
 | :--- | :--- | :--- |
 | **红线 1** | **零旁路计算器与第二套 IR**<br/>严禁新建或恢复独立于 `runtime.Engine` 的公式估算器、私有子图 IR、独立通信耗时计算器或效率侧 `max(...)` 补丁。 | [`scripts/verify_m1.py`](scripts/verify_m1.py) 的 `hygiene` 门禁自动扫描并阻断 `opflow`、`op_formulas`、`prediction.piecewise`、`prediction.subgraphs` 等旁路模块及导入。 |
-| **红线 2** | **零静默回退与严禁 `ResourceEnvelope` `1.0x` 峰值除法兜底**<br/>默认矩阵路径统一采用 `SteadyMatmul`；严禁使用 `ResourceEnvelope`，也严禁把整个算子的 `context.work` 塞入单个未分相的聚合 `Stage` 变相伪装包络；未知算子或未建模结构必须显式报错，绝不静默放行零工作量（仅显式声明的控制同步族 `CONTROL_FAMILIES` 允许空载荷）。 | [`mindie_sim/prediction/program/`](mindie_sim/prediction/program/) 中 `ResourceEnvelope.lower()` 直接抛出 `ModelingError("resource_envelope_banned")`；所有公开计时入口通过 [`unmodeled_gate.py`](mindie_sim/prediction/unmodeled_gate.py) 统一抛出携带 `mindie-unmodeled-structure-hint/1` 的 `UnmodeledCapabilityError`。 |
+| **红线 2** | **零静默回退与严禁 `ResourceEnvelope` `1.0x` 峰值除法兜底**<br/>默认矩阵路径统一采用 `SteadyMatmul`；严禁使用 `ResourceEnvelope`，也严禁把整个算子的 `context.work` 塞入单个未分相的聚合 `Stage` 变相伪装包络；未知算子或未建模结构必须显式报错，绝不静默放行零工作量（仅显式声明的控制同步族 `CONTROL_FAMILIES` 允许空载荷）。 | [`mindie_sim/prediction/program/`](mindie_sim/prediction/program/) 中 `ResourceEnvelope.lower()` 直接抛出 `ModelingError("resource_envelope_banned")`；所有公开计时入口通过 [`unmodeled_gate.py`](mindie_sim/prediction/efficiency/unmodeled_gate.py) 统一抛出携带 `mindie-unmodeled-structure-hint/1` 的 `UnmodeledCapabilityError`。 |
 | **红线 3** | **100% 结构与张量属性泛化（零 `model_id` 绑定、零 LUT 与零残差乘子）**<br/>算子选择（`implementation_selection`）、融合 pass 与 `PhysicalRecipe` **严禁按 `model_id` / 模型名分支绑定**（`model_scopes` 仅允许区分 `target` / `draft` 子图作用域），必须仅依据层结构类型、缓存连续性、量化精度与硬件 `Geometry` 泛化触发，确保同构新模型零代码继承校准结果；严禁按 `(model_name, M, N, K)` 硬编码耗时查表、反向拟合 `step/body/e2e` 窗口或虚构经验折损乘子。 | [`mindie_sim/observations/service_fitting.py`](mindie_sim/observations/service_fitting.py) 硬性拒绝 `step` / `body` / `serving` / `e2e` 窗口及 `target_ms` / `residual_ms` 字段；[`scripts/verify_m2.py`](scripts/verify_m2.py) 审计全量目录模型零包络命中。 |
 | **红线 4** | **严禁容器镜像 SHA 分发与私有开发机/内网路径泄漏**<br/>源码与配置中严禁出现宿主机个人家目录绝对路径（如 macOS/Linux `$HOME/...` 本地绝对路径）、实验室内网 IP 或按容器镜像 Digest（`docker.io/`、`swr.cn-`、`@sha256:`）做分支路由。 | [`scripts/verify_m1.py`](scripts/verify_m1.py) 自动扫描阻断；源码溯源统一使用 `{repository, revision, relative_path, source_sha256}`，抓包引用统一使用 `capture://<capture-id>/<member>`。 |
 | **红线 5** | **`buffer_units.l2 = 1` 共享 L2 容量归属不变量**<br/>只要在 `device.buffers` 中声明了 `"l2"` 容量，`device.buffer_units.l2` **必须且只能等于 `1`**（每颗物理 Die 共享唯一 L2 池，绝不能按 AIC/AIV 核数倍乘）。 | [`mindie_sim/schema/hardware.py`](mindie_sim/schema/hardware.py) 在解析硬件声明时强校验：若 `buffer_units.l2 != 1` 直接抛出 `ModelingError("shared_l2_buffer_requires_one_die_owner")`。 |
@@ -74,7 +74,7 @@ flowchart LR
 
    - **冲突裁决铁律**：动工前必须记录实际核对的 `{repository, revision}`；当历史 Issue 描述、旧文档假设与最新上游源码或真机 `msprof` 抓包冲突时，**一律以最新真实源码 + 实测抓包为唯一真源**，并在 PR Evidence 中写明上游演进差异（例如默认开关下库、新旧内核维度约束差异），严禁盲从过时描述把正确实现改错。
 2. **`mindie-sim <-> mindie-profiler` 跨仓 SSOT 单源契约**：
-   - `mindie_sim.observed_contracts`、`mindie_sim.subgraph_math` 与 `mindie_sim.structure*` 是 `mindie-profiler` 的单一事实源：[`mindie_sim/prediction/fusion_regions.py`](mindie_sim/prediction/fusion_regions.py) 统一维护单归属融合算子谱系（区分 `absorbed_source_ops` 与完整 `FusionBoundary`，求并集保留跨组 `structure_subgraph_memberships` 且杜绝共享复合算子重复计费）；[`mindie_sim/compose_runtime.py`](mindie_sim/compose_runtime.py) 显式标记 `recipe_binding_origins`（区分 `caller`、`stack_profile` 与 `body_default`）；[`mindie_sim/structure.py`](mindie_sim/structure.py) 支持 `--draft-prepare` / `draft_prepare=True` 导出投机预填充草稿缓存构建子图，其 `execution.resource_geometry` 仅保留拓扑结构键以维持跨标定态 `graph_id` 稳定，且 CLI 默认将输入路径脱敏为 `source: {"kind": "case_file", "sha256": ...}`。修改上述模块或算子 `source_boundary` 时，必须挂载同级 `../profiler` 联合运行跨仓测试套件。
+   - `mindie_sim.observed_contracts`、`mindie_sim.subgraph_math` 与 `mindie_sim.structure*` 是 `mindie-profiler` 的单一事实源：[`mindie_sim/prediction/fusion_regions.py`](mindie_sim/prediction/fusion_regions.py) 统一维护单归属融合算子谱系（区分 `absorbed_source_ops` 与完整 `FusionBoundary`，求并集保留跨组 `structure_subgraph_memberships` 且杜绝共享复合算子重复计费）；[`mindie_sim/compose/runtime.py`](mindie_sim/compose/runtime.py) 显式标记 `recipe_binding_origins`（区分 `caller`、`stack_profile` 与 `body_default`）；[`mindie_sim/structure/__init__.py`](mindie_sim/structure/__init__.py) 支持 `--draft-prepare` / `draft_prepare=True` 导出投机预填充草稿缓存构建子图，其 `execution.resource_geometry` 仅保留拓扑结构键以维持跨标定态 `graph_id` 稳定，且 CLI 默认将输入路径脱敏为 `source: {"kind": "case_file", "sha256": ...}`。修改上述模块或算子 `source_boundary` 时，必须挂载同级 `../profiler` 联合运行跨仓测试套件。
 
 ---
 
@@ -188,7 +188,7 @@ def measure_rts_stream_saturated_us(fn, blocker_pair: tuple[torch.Tensor, torch.
 ### 2.3 参数拟合、单算子复现与盲测验证 CLI 工作流
 
 1. **拟合单通道资源速率或原语响应曲线（严格隔离 `train` 与 `heldout`）**
-   构造同时兼容 [`mindie_sim/observations/service_fitting.py`](mindie_sim/observations/service_fitting.py)（`fit-service` 读取 `work`）与 [`mindie_sim/observations/validation.py`](mindie_sim/observations/validation.py)（`fit-rate` 读取 `work_bytes`）契约的样本包 `hbm_read_samples.json`（`train` 至少包含 `2` 个不同工作量端点，`heldout` 样本落在训练工作量区间内以执行内插评估，`boundary` 仅限 `"resource_phase"` 或 `"device_kernel"`，源路径统一使用 `capture://` URI 脱敏）：
+   构造同时兼容 [`mindie_sim/observations/service_fitting.py`](mindie_sim/observations/service_fitting.py)（`fit-service` 读取 `work`）与 [`mindie_sim/observations/captures.py`](mindie_sim/observations/captures.py)（`fit-rate` 读取 `work_bytes`）契约的样本包 `hbm_read_samples.json`（`train` 至少包含 `2` 个不同工作量端点，`heldout` 样本落在训练工作量区间内以执行内插评估，`boundary` 仅限 `"resource_phase"` 或 `"device_kernel"`，源路径统一使用 `capture://` URI 脱敏）：
    ```json
    {
      "resource": "hbm",
@@ -793,7 +793,7 @@ You are contributing incremental Ascend hardware calibration (`A2` / `A3` / `A5`
 
 ## 六、运行时栈接入、四阶特性瀑布与正交编译契约
 
-模拟器严格分离**硬件物理上能达到什么**与**特定推理服务栈当前交付了什么**。每项优化均为框架中立的 Layer-1 `OptimizationMechanism`（[`mindie_sim/feature_mechanisms.py`](mindie_sim/feature_mechanisms.py) 与 [`mindie_sim/feature_mechanism_catalog.py`](mindie_sim/feature_mechanism_catalog.py)），由 Layer-2 `RuntimeStackProfile`（[`mindie_sim/stack_tracks.py`](mindie_sim/stack_tracks.py)）映射到以下**四阶特性状态（4-Rung Feature Tracks）**：
+模拟器严格分离**硬件物理上能达到什么**与**特定推理服务栈当前交付了什么**。每项优化均为框架中立的 Layer-1 `OptimizationMechanism`（[`mindie_sim/feature_mechanisms.py`](mindie_sim/feature_mechanisms.py)），由 Layer-2 `RuntimeStackProfile`（[`mindie_sim/stack_tracks.py`](mindie_sim/stack_tracks.py)）映射到以下**四阶特性状态（4-Rung Feature Tracks）**：
 
 | 轨道（Track） | 物理与工程语义 | CLI 选择参数 |
 | :--- | :--- | :--- |
@@ -802,7 +802,7 @@ You are contributing incremental Ascend hardware calibration (`A2` / `A3` / `A5`
 | `unmerged_pr` | `merged` 叠加已审计的活跃未合入 PR 物理机制（多 PR 同机制自动合并选项与溯源引用，绝不字典覆盖丢失） | `--feature-track unmerged_pr` |
 | `expected_ideal` | 栈中立第一性原理上界：激活当前 `(model, hardware, parallel)` 结构兼容的全部 `OptimizationMechanism` | `--feature-track expected_ideal` |
 
-- **四阶瀑布与双视角 PR 消融（[`mindie_sim/feature_waterfall.py`](mindie_sim/feature_waterfall.py)）**：执行 `mindie-sim feature-tracks --model <name> --hardware a5 --tp 8 --ep 8` 可一次性输出 **`raw_eager` -> `current_merged` -> `current_unmerged_pr` -> `expected_ideal` -> `hardware_roofline`**（调用 `evaluate_target_efficiency(..., mode="exact_target")` 给出 `0.80x` 关键路径目标与 `1.0x` 物理理想下界），自动审计阶梯单调性，并在 `current_unmerged_pr` 下同时给出正向单加 **`single_pr_ablation`**（`merged + {PR}`）与留一剔除 **`leave_one_out_ablation`**（`unmerged_pr - {PR}`）；`compose` 的 `--enable-opt` / `--disable-opt` 支持单机制正交 What-If 对比。
+- **四阶瀑布与双视角 PR 消融（[`mindie_sim/feature_mechanisms.py`](mindie_sim/feature_mechanisms.py)）**：执行 `mindie-sim feature-tracks --model <name> --hardware a5 --tp 8 --ep 8` 可一次性输出 **`raw_eager` -> `current_merged` -> `current_unmerged_pr` -> `expected_ideal` -> `hardware_roofline`**（调用 `evaluate_target_efficiency(..., mode="exact_target")` 给出 `0.80x` 关键路径目标与 `1.0x` 物理理想下界），自动审计阶梯单调性，并在 `current_unmerged_pr` 下同时给出正向单加 **`single_pr_ablation`**（`merged + {PR}`）与留一剔除 **`leave_one_out_ablation`**（`unmerged_pr - {PR}`）；`compose` 的 `--enable-opt` / `--disable-opt` 支持单机制正交 What-If 对比。
 - **CANN `9.3.0` + `vllm-ascend@405617bae` 栈真源清单**：内置 `RUNTIME_STACKS` 仅保留经逐行源码审计的 `vllm-ascend`（由 [`mindie_sim/stack_sources/vllm_ascend_cann93.json`](mindie_sim/stack_sources/vllm_ascend_cann93.json) 与 [`mindie_sim/stack_tracks.py`](mindie_sim/stack_tracks.py) 驱动，精确对齐 `_A5_PROFILE` 中已合入的 `MegaMoE(enable_fused_mc2=3)`、`Chunk64`、`_C_ascend.npu_hc_pre_v3/v2`、`GBSA`、`MlaPrologV4`、缺省的 `GRAPH_QKV_NORM_ROPE_FUSION`，以及 `PR #22147` `Chunk32`、`PR #21794` `text_gated_residual`、`PR #22333` `situglu` MegaMoE、`PR #22467` C8 `KvQuantSFA`、`PR #22235` `msa_index_score_v2` 等 35 个活跃未合入 PR）与框架中立的 `raw_eager`。
 - **`Software` 正交两层编译契约（[`mindie_sim/schema/case.py`](mindie_sim/schema/case.py)）**：`Software` 将外层图捕获 `graph_capture_mode`（`"none"` / `"piecewise"` / `"full"`，对应 `ModelRunner` `NPUGraph` / `FULL_DECODE_ONLY` `ACLGraph`）与内层编译器布尔开关（`enable_torch_compile`、`enable_npugraph_ex`、`enable_static_kernel`、`enable_super_kernel`）正交解耦：模型标记 `do_not_compile=True`（`supports_torch_compile=False`）时**保留 `graph_capture_mode="full"`** 而仅关闭 `enable_torch_compile` / `enable_npugraph_ex`；当 `graph_capture_mode != "full"`（如 `piecewise`）或 `enable_torch_compile=False` 时，自动关闭 `enable_npugraph_ex`、`enable_static_kernel` 与 `enable_super_kernel`。
 

@@ -18,7 +18,7 @@ from mindie_sim import Case, graph_costs, operator_costs
 from mindie_sim.catalog.ops import gemm_op
 from mindie_sim.catalog.types import QuantSpec
 from mindie_sim.prediction import scheduling
-from mindie_sim.prediction.cost import CostModel, primitive_key
+from mindie_sim.prediction.efficiency.cost import CostModel, primitive_key
 from mindie_sim.prediction.engine import Allocation, Engine, Resource
 from mindie_sim.prediction.execution import Execution
 from mindie_sim.prediction.instructions import REGISTER_RESOURCES
@@ -27,16 +27,16 @@ from mindie_sim.prediction.mechanism import OperatorPlan, PlannedRecipe, Work
 from mindie_sim.prediction.operator_analysis import target_operators
 from mindie_sim.prediction.operators.linear_attention import gdn_output, gdn_prepare, gdn_state
 from mindie_sim.prediction.operators.vector.mixed_core import phase_stages
-from mindie_sim.prediction.primitives import PrimitiveStore
+from mindie_sim.prediction.program.primitives import PrimitiveStore
 from mindie_sim.prediction.program import (
     KernelProgram, PipelinePhase, PipelineProgram, PipelineTemplate,
     PipelineTemplateProgram, RecipeBook, RecipeContext, Stage,
     indexed_pipeline_consumer_available,
 )
-from mindie_sim.prediction.services import service_identity
+from mindie_sim.prediction.service_regime_domains.services import service_identity
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.prediction.topology import TransportOptions
-from mindie_sim.prediction.transfer import FiniteTransfer
+from mindie_sim.prediction.collectives.transfer import FiniteTransfer
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.operators import IterationWork
 from mindie_sim.schema.workload import IterationPlan

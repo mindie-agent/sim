@@ -22,8 +22,8 @@ from typing import Any
 from mindie_sim.schema.case import Case as CaseSpec
 from mindie_sim.schema.hardware import Hardware
 
-from ..physical_key import normalize_reference
-from ..roofline_graph import (
+from ..program.physical_key import normalize_reference
+from ..efficiency.roofline_graph import (
     PhysicalWorkGraph, PhysicalWorkNode, RooflineTargets, critical_path_roofline,
     graph_from_occurrences,
 )
@@ -169,7 +169,7 @@ def analyze_network_efficiency(
     _validate_geometry(phase, tokens, context, sequences, scope)
     parsed = parse_case(case)
     # A supplied report is not an escape hatch: its rows must be modeled too.
-    from ..unmodeled_gate import assert_report_supported, assert_timing_supported
+    from ..efficiency.unmodeled_gate import assert_report_supported, assert_timing_supported
     from .attribution import _fast_operator_and_graph_reports, attribute_program
 
     pkg = sys.modules.get(__package__ or "")
@@ -264,7 +264,7 @@ def analyze_network_efficiency(
                "roofline_efficiency": tot_roof_id / safe_graph_ms,
                "denominator": "graph_span_ms", "semantics": "nominal_peak_relative_work_over_span"}
     graph_accel = graph_report.get("accel_status") if graph_report is not None else None
-    from ..body import describe_included_components
+    from ..frontend.body_spec import describe_included_components
     return {
         "schema": "mindie-sim.efficiency/1",
         "engine_backend": (graph_report or {}).get("engine_backend"),

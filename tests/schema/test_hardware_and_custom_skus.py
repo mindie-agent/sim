@@ -28,7 +28,7 @@ from mindie_sim.backends.ascend import profiles
 from mindie_sim.catalog.ops import vector_op
 import mindie_sim.custom_hardware as ch
 from mindie_sim.hardware_derivation import derive_hardware_sku
-from mindie_sim.hardware_efficiency import EfficiencyCurve, apply_mte2_ceiling, coerce_curve
+from mindie_sim.hardware_derivation import EfficiencyCurve, apply_mte2_ceiling, coerce_curve
 from mindie_sim.prediction.communication import MessageFlow
 from mindie_sim.prediction.efficiency import analyze_network_efficiency, extract_hardware_peaks
 from mindie_sim.prediction.engine import Engine

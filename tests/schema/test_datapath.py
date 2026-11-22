@@ -27,7 +27,7 @@ from mindie_sim.catalog.ops import gemm_op
 from mindie_sim.catalog.types import QuantSpec
 from mindie_sim.compose import compose_case
 from mindie_sim.custom_hardware import build_custom_hardware_machine, parse_hardware as custom_parse
-from mindie_sim.prediction.cost import CostModel
+from mindie_sim.prediction.efficiency.cost import CostModel
 from mindie_sim.prediction.engine import Allocation, Engine, Resource
 from mindie_sim.prediction.evaluation import ExecutionBindings
 from mindie_sim.prediction.execution import Execution

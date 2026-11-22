@@ -30,7 +30,7 @@ import pytest
 from mindie_sim import (
     compose_case, graph_costs, operator_costs, predict, predict_pd, target_graphs,
 )
-from mindie_sim.prediction.cohort_traffic import bind_cohort_traffic
+from mindie_sim.prediction.execution.cohort_traffic import bind_cohort_traffic
 from mindie_sim.prediction.collectives import PairwiseCollective
 from mindie_sim.prediction.operators.collectives.direct_peer import DirectPeerGroup
 from mindie_sim.prediction.engine import Allocation, Engine, Resource
@@ -40,7 +40,7 @@ from mindie_sim.prediction.operators.collectives.hccl_contracts import select as
 from mindie_sim.prediction.operators.collectives.hccl_graph import lower as hccl_lower
 from mindie_sim.prediction.operators.moe_routing.moe_token_partition import ALLTOALL_KIND
 from mindie_sim.prediction.pd_connector import PDConnector, PDHandoff, PDTransfer
-from mindie_sim.prediction.peer_traffic import PeerTraffic
+from mindie_sim.prediction.collectives.peer_traffic import PeerTraffic
 from mindie_sim.prediction.program import RecipeBook, RecipeContext
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.common import ModelingError

@@ -11,7 +11,7 @@ from dataclasses import replace
 
 from mindie_sim.schema.common import ModelingError
 
-from ..cache_geometry import (
+from ..cache_path.geometry import (
     CacheAccessGeometry,
     full_line_spans,
     intersect_spans,
@@ -75,66 +75,87 @@ def _prepare_access(
             existing_ranges=(), existing_dirty=(), existing_valid=(),
             existing_dirty_bytes=(), victims=(),
             result=result, bypassed=True, holder=None, claimed=())
+    if bypass:
+        return _reserve_bypass(
+            self, identity, existing, summary, policy, write,
+            line, line_count, transfer_bytes, staging)
+    return _reserve_resident(
+        self, identity, geometry, existing, summary, policy, write,
+        line, line_count, request_ranges, capacity, staging)
+
+
+def _reserve_bypass(
+    self, identity, existing, summary, policy, write,
+    line, line_count, transfer_bytes, staging,
+):
+    from .residency import CacheAccessReservation
+
     bypass_existing = None
     existing_recency = -1
     existing_reserved_lines = 0
-    if bypass:
-        if existing is not None:
-            if existing.dirty_lines:
-                raise ModelingError("cache_bypass_conflicts_with_dirty_identity")
-            if write:
-                # Keep the clean old row as a rollback reservation until
-                # this access is irreversibly published or cancelled.
-                bypass_existing = replace(existing)
-                existing_recency = self._recency.get(identity, 0)
-                existing_reserved_lines = existing.lines
-        if bypass_existing is not None:
-            self._resident.pop(identity)
-            self._drop_recency(identity)
-            self._resident_bytes -= existing_reserved_lines * line
-            self._reserved_bytes += existing_reserved_lines * line
-            existing = None
-        hbm_read_lines = hbm_write_lines = direct_lines = 0
+    if existing is not None:
+        if existing.dirty_lines:
+            raise ModelingError("cache_bypass_conflicts_with_dirty_identity")
         if write:
-            hbm_write_lines = line_count
-            direct_lines = line_count
-        else:
-            hbm_read_lines = line_count
-        hbm_read_lines += summary.rmw_read_lines
-        result = CacheAccessResult(
-            identity=identity, mode="write" if write else "read",
-            logical_bytes=summary.logical_bytes,
-            gm_bytes=transfer_bytes, onchip_bytes=transfer_bytes,
-            staging_bytes=staging,
-            hbm_read_bytes=hbm_read_lines * line,
-            hbm_write_bytes=hbm_write_lines * line,
-            hbm_read_lines=hbm_read_lines,
-            hbm_write_lines=hbm_write_lines,
-            cache_read_bytes=0, fill_bytes=0, evicted_bytes=0,
-            writeback_bytes=0, direct_write_bytes=direct_lines * line,
-            hit_lines=0, miss_lines=line_count,
-            resident_bytes=self._resident_bytes + self._reserved_bytes,
-            bypassed=True, cold_path=policy.cold,
-            ready_ms=float(policy.ready_ms),
-        )
-        holder = self._new_holder()
-        held = (identity,)
-        self._claim(holder, held)
-        return CacheAccessReservation(
-            self, identity, 0, 0, target_ranges=(), dirty_ranges=(),
-            target_valid_bytes=(), target_dirty_bytes=(),
-            existing_ranges=(() if bypass_existing is None
-                             else bypass_existing.ranges),
-            existing_dirty=(() if bypass_existing is None
-                            else bypass_existing.dirty_ranges),
-            existing_valid=(() if bypass_existing is None
-                            else bypass_existing.valid_bytes),
-            existing_dirty_bytes=(() if bypass_existing is None
-                                  else bypass_existing.dirty_bytes_ranges),
-            victims=(),
-            result=result, bypassed=True, holder=holder, claimed=held,
-            existing_recency=existing_recency,
-            existing_reserved_lines=existing_reserved_lines)
+            # Keep the clean old row as a rollback reservation until
+            # this access is irreversibly published or cancelled.
+            bypass_existing = replace(existing)
+            existing_recency = self._recency.get(identity, 0)
+            existing_reserved_lines = existing.lines
+    if bypass_existing is not None:
+        self._resident.pop(identity)
+        self._drop_recency(identity)
+        self._resident_bytes -= existing_reserved_lines * line
+        self._reserved_bytes += existing_reserved_lines * line
+    hbm_read_lines = hbm_write_lines = direct_lines = 0
+    if write:
+        hbm_write_lines = line_count
+        direct_lines = line_count
+    else:
+        hbm_read_lines = line_count
+    hbm_read_lines += summary.rmw_read_lines
+    result = CacheAccessResult(
+        identity=identity, mode="write" if write else "read",
+        logical_bytes=summary.logical_bytes,
+        gm_bytes=transfer_bytes, onchip_bytes=transfer_bytes,
+        staging_bytes=staging,
+        hbm_read_bytes=hbm_read_lines * line,
+        hbm_write_bytes=hbm_write_lines * line,
+        hbm_read_lines=hbm_read_lines,
+        hbm_write_lines=hbm_write_lines,
+        cache_read_bytes=0, fill_bytes=0, evicted_bytes=0,
+        writeback_bytes=0, direct_write_bytes=direct_lines * line,
+        hit_lines=0, miss_lines=line_count,
+        resident_bytes=self._resident_bytes + self._reserved_bytes,
+        bypassed=True, cold_path=policy.cold,
+        ready_ms=float(policy.ready_ms),
+    )
+    holder = self._new_holder()
+    held = (identity,)
+    self._claim(holder, held)
+    return CacheAccessReservation(
+        self, identity, 0, 0, target_ranges=(), dirty_ranges=(),
+        target_valid_bytes=(), target_dirty_bytes=(),
+        existing_ranges=(() if bypass_existing is None
+                         else bypass_existing.ranges),
+        existing_dirty=(() if bypass_existing is None
+                        else bypass_existing.dirty_ranges),
+        existing_valid=(() if bypass_existing is None
+                        else bypass_existing.valid_bytes),
+        existing_dirty_bytes=(() if bypass_existing is None
+                              else bypass_existing.dirty_bytes_ranges),
+        victims=(),
+        result=result, bypassed=True, holder=holder, claimed=held,
+        existing_recency=existing_recency,
+        existing_reserved_lines=existing_reserved_lines)
+
+
+def _reserve_resident(
+    self, identity, geometry, existing, summary, policy, write,
+    line, line_count, request_ranges, capacity, staging,
+):
+    from .residency import CacheAccessReservation
+
     resident_ranges = () if existing is None else existing.ranges
     resident_valid = () if existing is None else existing.valid_bytes
     dirty_lines = () if existing is None else existing.dirty_ranges

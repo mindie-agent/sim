@@ -36,7 +36,7 @@ from mindie_sim.catalog.quant import quant_preset
 from mindie_sim.catalog.types import AuxiliarySpec, DraftSpec, QuantSpec
 from mindie_sim.catalog.weight_terms import term_bytes
 from mindie_sim.catalog.weights import cache_row_bytes_by_layer, layer_weight_terms
-from mindie_sim.prediction.operators.sparse_indexer import family_quant_indexer, index_pool; from mindie_sim.prediction.operators.context_parallel import graph as cp_graph
+from mindie_sim.prediction.operators.sparse_indexer import family_quant_indexer, index_pool; from mindie_sim.prediction.sharding import context_parallel as cp_graph
 from mindie_sim.prediction.operators.paged_mla import indexed_quant_attention as c8
 from mindie_sim.prediction.operators.attention.attention import _CacheProducer
 from mindie_sim.prediction.operators.attention.attention_decode import StagedGQADecode
@@ -44,16 +44,16 @@ from mindie_sim.prediction.operators.attention.batch_prefix_attention import nes
 from mindie_sim.prediction.body_defaults import effective_body_declaration
 from mindie_sim.prediction.cache_representation import store
 from mindie_sim.prediction.capacity import Memory
-from mindie_sim.prediction.capacity_features import batch_cache_bytes
-from mindie_sim.prediction.cost import CostModel
+from mindie_sim.prediction.capacity.features import batch_cache_bytes
+from mindie_sim.prediction.efficiency.cost import CostModel
 from mindie_sim.prediction.execution import Execution
-from mindie_sim.prediction.execution_state import bind_op_accesses
+from mindie_sim.prediction.execution.state import bind_op_accesses
 from mindie_sim.prediction.lowering import Builder
 from mindie_sim.prediction.mechanism import Geometry
 from mindie_sim.prediction.native_binding import bind_native_call
 from mindie_sim.prediction.offload import OffloadPolicy, _accesses_from_ops, project_state_tiers
 from mindie_sim.prediction.operator_analysis import target_operators
-from mindie_sim.prediction.pd_ranges import transfers_for_runs
+from mindie_sim.prediction.disaggregated.ranges import transfers_for_runs
 from mindie_sim.prediction.program import KernelProgram, ParallelProgram, PipelineProgram, RecipeContext
 from mindie_sim.prediction.operators.sharedkv.sharedkv_metadata import query_partitions
 from mindie_sim.prediction.structure import parse_case

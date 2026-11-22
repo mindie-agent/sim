@@ -565,6 +565,79 @@ class WaveRecorder:
             total += min(mid_span, int(round(n_mid * sum(h - l for l, h in ov_f) * NS_PER_MS)))
         return total
 
+    def _window_pipe_rows(self, start_ns, end_ns, all_keys, svc_map,
+                          ho_map, owner_time_map, steady_runs):
+        span_ns = end_ns - start_ns
+        window_iv = ((start_ns, end_ns),) if span_ns > 0 else ()
+
+        pipe_rows: list[PipeIdleRow] = []
+        cube_intervals: list[tuple[int, int]] = []
+        vec_intervals: list[tuple[int, int]] = []
+        limiting: list[ResourceRowRef] = []
+        max_busy = 0
+
+        for sid, pid in all_keys:
+            pname = self._pipe_names.get(pid, f"pipe_{pid}")
+            p_busy, p_ho, p_fa, p_lb, eb, eh = self._periodic_pipe_contrib(
+                sid, pname, start_ns, end_ns, steady_runs,
+            )
+            busy_set = _clamp_intervals((*svc_map.get((sid, pid), ()), *eb), start_ns, end_ns)
+            h0_set = _clamp_intervals((*ho_map.get((sid, pid), ()), *eh), start_ns, end_ns)
+            handoff_set = _subtract_intervals(h0_set, busy_set)
+            covered = _union_intervals((*busy_set, *handoff_set))
+            idle_j = _subtract_intervals(window_iv, covered)
+
+            busy_ns = _measure(busy_set) + p_busy
+            handoff_ns = _measure(handoff_set) + p_ho
+            first_a = busy_set[0][0] if busy_set else p_fa
+            if p_fa is not None and (first_a is None or p_fa < first_a):
+                first_a = p_fa
+            last_b = busy_set[-1][1] if busy_set else p_lb
+            if p_lb is not None and (last_b is None or p_lb > last_b):
+                last_b = p_lb
+            if first_a is not None and last_b is not None:
+                fill_ns = _measure(_clamp_intervals(idle_j, start_ns, first_a))
+                drain_ns = _measure(_clamp_intervals(idle_j, last_b, end_ns))
+                steady_bubble_ns = max(0, span_ns - busy_ns - handoff_ns - fill_ns - drain_ns)
+                inactive = False
+            else:
+                fill_ns = max(0, span_ns - handoff_ns)
+                steady_bubble_ns = 0
+                drain_ns = 0
+                inactive = True
+
+            pipe_rows.append(PipeIdleRow(
+                scope_id=sid,
+                pipe_id=pid,
+                span_ns=span_ns,
+                busy_ns=busy_ns,
+                fill_ns=fill_ns,
+                steady_bubble_ns=steady_bubble_ns,
+                drain_ns=drain_ns,
+                handoff_ns=handoff_ns,
+                inactive_in_window=inactive,
+                pipe_name=pname,
+                owner_time_ns=owner_time_map.get((sid, pid), 0),
+            ))
+            role = _pipe_base_role(pname)
+            if role in CUBE_PIPE_ROLES:
+                cube_intervals.extend(busy_set)
+            elif role in VECTOR_PIPE_ROLES:
+                vec_intervals.extend(busy_set)
+            if busy_ns > max_busy:
+                max_busy = busy_ns
+
+        for row in pipe_rows:
+            if max_busy > 0 and row.busy_ns == max_busy:
+                limiting.append(ResourceRowRef(row.pipe_id, row.pipe_name, row.scope_id))
+
+        cube_union = _union_intervals(cube_intervals)
+        vec_union = _union_intervals(vec_intervals)
+        overlap_ns = _measure(_intersect_intervals(cube_union, vec_union)) + self._periodic_cv_overlap(
+            start_ns, end_ns, steady_runs,
+        )
+        return pipe_rows, limiting, overlap_ns
+
     def finish(
         self,
         spec: Any,
@@ -668,74 +741,8 @@ class WaveRecorder:
         )
         if end_ns < start_ns:
             raise ModelingError(f"wave_recorder_window_reversed:{start_ns}>{end_ns}")
-        span_ns = end_ns - start_ns
-        window_iv = ((start_ns, end_ns),) if span_ns > 0 else ()
-
-        pipe_rows: list[PipeIdleRow] = []
-        cube_intervals: list[tuple[int, int]] = []
-        vec_intervals: list[tuple[int, int]] = []
-        limiting: list[ResourceRowRef] = []
-        max_busy = 0
-
-        for sid, pid in all_keys:
-            pname = self._pipe_names.get(pid, f"pipe_{pid}")
-            p_busy, p_ho, p_fa, p_lb, eb, eh = self._periodic_pipe_contrib(
-                sid, pname, start_ns, end_ns, steady_runs,
-            )
-            busy_set = _clamp_intervals((*svc_map.get((sid, pid), ()), *eb), start_ns, end_ns)
-            h0_set = _clamp_intervals((*ho_map.get((sid, pid), ()), *eh), start_ns, end_ns)
-            handoff_set = _subtract_intervals(h0_set, busy_set)
-            covered = _union_intervals((*busy_set, *handoff_set))
-            idle_j = _subtract_intervals(window_iv, covered)
-
-            busy_ns = _measure(busy_set) + p_busy
-            handoff_ns = _measure(handoff_set) + p_ho
-            first_a = busy_set[0][0] if busy_set else p_fa
-            if p_fa is not None and (first_a is None or p_fa < first_a):
-                first_a = p_fa
-            last_b = busy_set[-1][1] if busy_set else p_lb
-            if p_lb is not None and (last_b is None or p_lb > last_b):
-                last_b = p_lb
-            if first_a is not None and last_b is not None:
-                fill_ns = _measure(_clamp_intervals(idle_j, start_ns, first_a))
-                drain_ns = _measure(_clamp_intervals(idle_j, last_b, end_ns))
-                steady_bubble_ns = max(0, span_ns - busy_ns - handoff_ns - fill_ns - drain_ns)
-                inactive = False
-            else:
-                fill_ns = max(0, span_ns - handoff_ns)
-                steady_bubble_ns = 0
-                drain_ns = 0
-                inactive = True
-
-            pipe_rows.append(PipeIdleRow(
-                scope_id=sid,
-                pipe_id=pid,
-                span_ns=span_ns,
-                busy_ns=busy_ns,
-                fill_ns=fill_ns,
-                steady_bubble_ns=steady_bubble_ns,
-                drain_ns=drain_ns,
-                handoff_ns=handoff_ns,
-                inactive_in_window=inactive,
-                pipe_name=pname,
-                owner_time_ns=owner_time_map.get((sid, pid), 0),
-            ))
-            role = _pipe_base_role(pname)
-            if role in CUBE_PIPE_ROLES:
-                cube_intervals.extend(busy_set)
-            elif role in VECTOR_PIPE_ROLES:
-                vec_intervals.extend(busy_set)
-            if busy_ns > max_busy:
-                max_busy = busy_ns
-
-        for row in pipe_rows:
-            if max_busy > 0 and row.busy_ns == max_busy:
-                limiting.append(ResourceRowRef(row.pipe_id, row.pipe_name, row.scope_id))
-
-        cube_union = _union_intervals(cube_intervals)
-        vec_union = _union_intervals(vec_intervals)
-        overlap_ns = _measure(_intersect_intervals(cube_union, vec_union)) + self._periodic_cv_overlap(
-            start_ns, end_ns, steady_runs,
+        pipe_rows, limiting, overlap_ns = self._window_pipe_rows(
+            start_ns, end_ns, all_keys, svc_map, ho_map, owner_time_map, steady_runs,
         )
 
         timeline = TileWaveTimeline(

@@ -99,125 +99,9 @@ def mhc_boundary_fusion_overlap(ops, source_dtype, *, max_rows=0,
 
         # Branch A: HyperConnection sublayer boundary
         if op.recipe == "hc_pre_mix" and len(op.deps) == 2:
-            ready_id, sinkhorn_id = op.deps[0], op.deps[1]
-            sinkhorn = by_id.get(sinkhorn_id)
-            affine = by_id.get(sinkhorn.deps[0]) if sinkhorn and sinkhorn.deps else None
-            if sinkhorn is None or affine is None or len(affine.deps) < 2:
-                continue
-            proj = by_id.get(affine.deps[0])
-            inv_rms = by_id.get(affine.deps[1])
-            vals = by_id.get(proj.deps[0]) if proj and proj.deps else None
-            if None in (proj, inv_rms, vals) or vals.deps != (ready_id,):
-                continue
-
-            # Decouple coefficient chain onto auxiliary stream when captured:
-            # Attention/MoE input only needs collapsed pre_mix + norm; post/comb
-            # coefficients are consumed at this sublayer's hc_post_mix.
-            coeff_stream = "mhc_aux" if captured else (op.stream or "")
-            for coeff_op in (vals, proj, inv_rms, affine, sinkhorn):
-                stream_rewrites[coeff_op.op_id] = coeff_stream
-
-            mix_users = users[op.op_id]
-            norm_op = by_id.get(mix_users[0]) if len(mix_users) == 1 else None
-            can_fuse_norm = (
-                norm_op is not None
-                and norm_op.family in {"rmsnorm", "rmsnorm_quant"}
-                and norm_op.stage == op.stage
-                and (norm_op.stream or "") == (op.stream or "")
-            )
-            prev_post = by_id.get(ready_id)
-            # The Sinkhorn pre-gates are computed from the residual that the
-            # preceding ``hc_post`` produces.  A single fused node cannot both
-            # produce that residual and wait for coefficients derived from it,
-            # so the post boundary stays separate and the fused norm keeps the
-            # coefficient producer as a real dependency.
-            if can_fuse_norm:
-                # Fuse ``hc_pre_mix + norm``; the residual producer and the
-                # coefficient producer are both required inputs.
-                gamma_bytes = float(dict(norm_op.metadata).get("norm_gamma_runtime_bytes", 0.0) or 0.0)
-                fused_read = float(op.mte2_bytes) + gamma_bytes
-                fused_write = float(norm_op.mte3_bytes)
-                fused_vec = float(op.vector_ops) + float(norm_op.vector_ops)
-                # Only the post/comb Sinkhorn iterations overlap the sublayer;
-                # the pre-gate producer (``affine``) must finish before the
-                # fused norm reads its mixing gates.  When ``max_rows == 0``
-                # collapses the closed chain into ``sinkhorn``, ``aliases``
-                # rewires ``affine`` to that resident region automatically.
-                fused_deps = tuple(dict.fromkeys((ready_id, affine.op_id)))
-                fused = replace(
-                    norm_op,
-                    deps=fused_deps,
-                    vector_ops=fused_vec,
-                    mte2_bytes=fused_read,
-                    mte3_bytes=fused_write,
-                    hbm_bytes=fused_read + fused_write,
-                    metadata=merge_meta(op, norm_op, extra=(
-                        ("fused_from", ("hc_pre_mix", norm_op.family)),
-                        ("mhc_coeff_stream", coeff_stream or "main"),
-                        ("mhc_post_boundary_separate",
-                         prev_post.recipe == "hc_post_mix"
-                         if prev_post is not None else False),
-                    )),
-                )
-                replacements[norm_op.op_id] = fused
-                removed.add(op.op_id)
-                aliases[op.op_id] = norm_op.op_id
-
-            if max_rows == 0:
-                coeff_ops = (vals, proj, inv_rms, affine, sinkhorn)
-                vals_users = set(users[vals.op_id])
-                if (vals_users <= {proj.op_id, inv_rms.op_id}
-                        and {proj.op_id, inv_rms.op_id} <= vals_users
-                        and users[proj.op_id] == [affine.op_id]
-                        and users[inv_rms.op_id] == [affine.op_id]
-                        and users[affine.op_id] == [sinkhorn.op_id]
-                        and not any(item.plan_required or item.op_id in removed
-                                    for item in coeff_ops)):
-                    # One resident coefficient region: the only removable
-                    # traffic is the internal 3V + 2P + 2R + 2A round-trip.
-                    proj_weight_bytes = max(
-                        0.0, float(proj.mte2_bytes) - float(vals.mte3_bytes))
-                    affine_param_bytes = max(
-                        0.0, float(affine.mte2_bytes) - float(proj.mte3_bytes)
-                        - float(inv_rms.mte3_bytes))
-                    coeff_read = (float(vals.mte2_bytes) + proj_weight_bytes
-                                  + affine_param_bytes)
-                    coeff_write = float(sinkhorn.mte3_bytes)
-                    fused_coeff = replace(
-                        sinkhorn,
-                        deps=vals.deps,
-                        stream=coeff_stream,
-                        family=proj.family,
-                        recipe=COEFFICIENT_FUSION_RECIPE,
-                        dtype=COEFFICIENT_FUSION_DTYPE,
-                        returns=sinkhorn.returns,
-                        # The resident region keeps the projection's declared
-                        # matrix geometry; only its internal round-trips vanish.
-                        semantic_shape=proj.semantic_shape,
-                        local_shape=proj.local_shape,
-                        padded_shape=proj.padded_shape,
-                        launch_shape=proj.launch_shape,
-                        layout=proj.layout,
-                        flops=sum(float(item.flops) for item in coeff_ops),
-                        matrix_flops=proj.matrix_flops,
-                        vector_ops=sum(float(item.vector_ops)
-                                       for item in coeff_ops),
-                        mte2_bytes=coeff_read,
-                        mte3_bytes=coeff_write,
-                        hbm_bytes=coeff_read + coeff_write,
-                        metadata=merge_meta(*coeff_ops, extra=(
-                            ("fused_from", (
-                                "hc_values_fp32", "hc_projection",
-                                "hc_inverse_rms", "hc_normalize_scale_bias_gate",
-                                "hc_sinkhorn")),
-                            ("mhc_coefficients_resident_region", True),
-                            ("mhc_coeff_stream", coeff_stream or "main"),
-                        )),
-                    )
-                    replacements[sinkhorn.op_id] = fused_coeff
-                    for item in (vals, proj, inv_rms, affine):
-                        removed.add(item.op_id)
-                        aliases[item.op_id] = sinkhorn.op_id
+            _fuse_pre_mix_boundary(
+                op, by_id, users, captured, max_rows,
+                replacements, removed, aliases, stream_rewrites)
 
         # Branch B: Qwen4Exp LowRankHyperConnection (PR #20824 + UB-resident ideal fusion)
         elif op.recipe == "hc_gate_mix" and len(op.deps) == 2:
@@ -265,6 +149,130 @@ def mhc_boundary_fusion_overlap(ops, source_dtype, *, max_rows=0,
         updated, replacements=replacements, aliases=full_aliases,
         removed=removed, ports=NO_PORTS,
     )
+
+
+def _fuse_pre_mix_boundary(
+    op, by_id, users, captured, max_rows, replacements, removed, aliases, stream_rewrites,
+):
+    ready_id, sinkhorn_id = op.deps[0], op.deps[1]
+    sinkhorn = by_id.get(sinkhorn_id)
+    affine = by_id.get(sinkhorn.deps[0]) if sinkhorn and sinkhorn.deps else None
+    if sinkhorn is None or affine is None or len(affine.deps) < 2:
+        return
+    proj = by_id.get(affine.deps[0])
+    inv_rms = by_id.get(affine.deps[1])
+    vals = by_id.get(proj.deps[0]) if proj and proj.deps else None
+    if None in (proj, inv_rms, vals) or vals.deps != (ready_id,):
+        return
+
+    # Decouple coefficient chain onto auxiliary stream when captured:
+    # Attention/MoE input only needs collapsed pre_mix + norm; post/comb
+    # coefficients are consumed at this sublayer's hc_post_mix.
+    coeff_stream = "mhc_aux" if captured else (op.stream or "")
+    for coeff_op in (vals, proj, inv_rms, affine, sinkhorn):
+        stream_rewrites[coeff_op.op_id] = coeff_stream
+
+    mix_users = users[op.op_id]
+    norm_op = by_id.get(mix_users[0]) if len(mix_users) == 1 else None
+    can_fuse_norm = (
+        norm_op is not None
+        and norm_op.family in {"rmsnorm", "rmsnorm_quant"}
+        and norm_op.stage == op.stage
+        and (norm_op.stream or "") == (op.stream or "")
+    )
+    prev_post = by_id.get(ready_id)
+    # The Sinkhorn pre-gates are computed from the residual that the
+    # preceding ``hc_post`` produces.  A single fused node cannot both
+    # produce that residual and wait for coefficients derived from it,
+    # so the post boundary stays separate and the fused norm keeps the
+    # coefficient producer as a real dependency.
+    if can_fuse_norm:
+        # Fuse ``hc_pre_mix + norm``; the residual producer and the
+        # coefficient producer are both required inputs.
+        gamma_bytes = float(dict(norm_op.metadata).get("norm_gamma_runtime_bytes", 0.0) or 0.0)
+        fused_read = float(op.mte2_bytes) + gamma_bytes
+        fused_write = float(norm_op.mte3_bytes)
+        fused_vec = float(op.vector_ops) + float(norm_op.vector_ops)
+        # Only the post/comb Sinkhorn iterations overlap the sublayer;
+        # the pre-gate producer (``affine``) must finish before the
+        # fused norm reads its mixing gates.  When ``max_rows == 0``
+        # collapses the closed chain into ``sinkhorn``, ``aliases``
+        # rewires ``affine`` to that resident region automatically.
+        fused_deps = tuple(dict.fromkeys((ready_id, affine.op_id)))
+        fused = replace(
+            norm_op,
+            deps=fused_deps,
+            vector_ops=fused_vec,
+            mte2_bytes=fused_read,
+            mte3_bytes=fused_write,
+            hbm_bytes=fused_read + fused_write,
+            metadata=merge_meta(op, norm_op, extra=(
+                ("fused_from", ("hc_pre_mix", norm_op.family)),
+                ("mhc_coeff_stream", coeff_stream or "main"),
+                ("mhc_post_boundary_separate",
+                 prev_post.recipe == "hc_post_mix"
+                 if prev_post is not None else False),
+            )),
+        )
+        replacements[norm_op.op_id] = fused
+        removed.add(op.op_id)
+        aliases[op.op_id] = norm_op.op_id
+
+    if max_rows == 0:
+        coeff_ops = (vals, proj, inv_rms, affine, sinkhorn)
+        vals_users = set(users[vals.op_id])
+        if (vals_users <= {proj.op_id, inv_rms.op_id}
+                and {proj.op_id, inv_rms.op_id} <= vals_users
+                and users[proj.op_id] == [affine.op_id]
+                and users[inv_rms.op_id] == [affine.op_id]
+                and users[affine.op_id] == [sinkhorn.op_id]
+                and not any(item.plan_required or item.op_id in removed
+                            for item in coeff_ops)):
+            # One resident coefficient region: the only removable
+            # traffic is the internal 3V + 2P + 2R + 2A round-trip.
+            proj_weight_bytes = max(
+                0.0, float(proj.mte2_bytes) - float(vals.mte3_bytes))
+            affine_param_bytes = max(
+                0.0, float(affine.mte2_bytes) - float(proj.mte3_bytes)
+                - float(inv_rms.mte3_bytes))
+            coeff_read = (float(vals.mte2_bytes) + proj_weight_bytes
+                          + affine_param_bytes)
+            coeff_write = float(sinkhorn.mte3_bytes)
+            fused_coeff = replace(
+                sinkhorn,
+                deps=vals.deps,
+                stream=coeff_stream,
+                family=proj.family,
+                recipe=COEFFICIENT_FUSION_RECIPE,
+                dtype=COEFFICIENT_FUSION_DTYPE,
+                returns=sinkhorn.returns,
+                # The resident region keeps the projection's declared
+                # matrix geometry; only its internal round-trips vanish.
+                semantic_shape=proj.semantic_shape,
+                local_shape=proj.local_shape,
+                padded_shape=proj.padded_shape,
+                launch_shape=proj.launch_shape,
+                layout=proj.layout,
+                flops=sum(float(item.flops) for item in coeff_ops),
+                matrix_flops=proj.matrix_flops,
+                vector_ops=sum(float(item.vector_ops)
+                               for item in coeff_ops),
+                mte2_bytes=coeff_read,
+                mte3_bytes=coeff_write,
+                hbm_bytes=coeff_read + coeff_write,
+                metadata=merge_meta(*coeff_ops, extra=(
+                    ("fused_from", (
+                        "hc_values_fp32", "hc_projection",
+                        "hc_inverse_rms", "hc_normalize_scale_bias_gate",
+                        "hc_sinkhorn")),
+                    ("mhc_coefficients_resident_region", True),
+                    ("mhc_coeff_stream", coeff_stream or "main"),
+                )),
+            )
+            replacements[sinkhorn.op_id] = fused_coeff
+            for item in (vals, proj, inv_rms, affine):
+                removed.add(item.op_id)
+                aliases[item.op_id] = sinkhorn.op_id
 
 
 def _merge_matrix_flops(left, right):

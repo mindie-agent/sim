@@ -26,13 +26,13 @@ from mindie_sim import compose_case, graph_costs, operator_costs, predict
 from mindie_sim.catalog.quant import quant_preset
 from mindie_sim.prediction.body_defaults import attention_defaults
 from mindie_sim.prediction.operator_analysis import target_graphs
-from mindie_sim.prediction.cost import primitive_key
+from mindie_sim.prediction.efficiency.cost import primitive_key
 from mindie_sim.prediction.mechanism import OperatorPlan, PlannedRecipe, Work
-from mindie_sim.prediction.primitives import PrimitiveStore
+from mindie_sim.prediction.program.primitives import PrimitiveStore
 from mindie_sim.prediction.program import KernelProgram, RecipeBook, Stage
 from mindie_sim.prediction.response_functions import (
     ResponseFunction, nonnegative, positive, scaled_coordinate)
-from mindie_sim.prediction.services import ResourceService
+from mindie_sim.prediction.service_regime_domains.services import ResourceService
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.operators import IterationWork

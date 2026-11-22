@@ -60,7 +60,7 @@ from mindie_sim.catalog.paired_sfa import execution as paired_sfa_execution  # n
 from mindie_sim.compose import compose_case  # noqa: E402
 from mindie_sim.hardware_derivation import derive_hardware_sku  # noqa: E402
 from mindie_sim.model_catalog import load_model  # noqa: E402
-from mindie_sim.observations.multilevel_gate import (  # noqa: E402
+from mindie_sim.observations.multilevel import (  # noqa: E402
     exceeds_physical_tolerance as _canonical_exceeds_physical_tolerance,
 )
 from mindie_sim.prediction.mechanism import Geometry  # noqa: E402

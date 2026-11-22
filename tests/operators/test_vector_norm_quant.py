@@ -24,12 +24,12 @@ from _support.memory_cases import case as declared_case
 from mindie_sim import graph_costs, operator_costs, predict, target_graphs
 from mindie_sim.catalog.ops import vector_op
 from mindie_sim.catalog.quant import quant_preset
-from mindie_sim.observations.call_bindings_activation import bind_activation_condition
+from mindie_sim.observations.calibration import bind_activation_condition
 from mindie_sim.observations.captures import iter_conditions
-from mindie_sim.prediction import calls_activation, instructions
+from mindie_sim.prediction import call_builders as calls_activation, instructions
 from mindie_sim.prediction.operators.vector import dynamic_quant_schedule, family_ascend_norm, mx_dynamic_quant
-from mindie_sim.prediction.call import call_costs
-from mindie_sim.prediction.cost import CostModel
+from mindie_sim.prediction.call_builders import call_costs
+from mindie_sim.prediction.efficiency.cost import CostModel
 from mindie_sim.prediction.engine import Allocation, Engine, Resource
 from mindie_sim.prediction.execution import Execution
 from mindie_sim.prediction.lowering import Builder

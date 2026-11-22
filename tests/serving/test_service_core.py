@@ -36,7 +36,7 @@ from mindie_sim.prediction.efficiency import (
 from mindie_sim.prediction.graph_analysis import graph_costs
 from mindie_sim.prediction.operator_analysis import operator_costs, target_graphs
 from mindie_sim.prediction.structure import parse_case
-from mindie_sim.prediction.unmodeled_gate import assert_report_supported
+from mindie_sim.prediction.efficiency.unmodeled_gate import assert_report_supported
 from mindie_sim.public.errors import UnmodeledCapabilityError
 from mindie_sim.schema.workload import RequestView
 from _support.serving_cases import (

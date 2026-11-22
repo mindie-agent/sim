@@ -21,10 +21,10 @@ from mindie_sim.schema.case import Case as CaseSpec
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.workload import IterationPlan
 from .capacity import Memory, MemoryPolicy
-from .cost import CostModel
+from .efficiency.cost import CostModel
 from .execution import Execution, ScheduledIteration, SubmissionPolicy
-from .metrics import serving_boundaries, summarize
-from .primitives import PrimitiveStore
+from .efficiency.metrics import serving_boundaries, summarize
+from .program.primitives import PrimitiveStore
 from .program import RecipeBook
 from .scheduler import Scheduler
 from .frontend import Frontend
@@ -35,6 +35,7 @@ from mindie_sim.coverage import model_coverage
 ZERO = 0
 DEFAULT_TRACE_LIMIT = 2
 DEFAULT_EVENT_LIMIT = 256
+MAX_COHORT_BINDINGS = 256
 
 
 def _runtime_identity(case: CaseSpec) -> str:
@@ -258,6 +259,65 @@ def _quota_scope(schedulers, quota):
             state.request = request
 
 
+def _submit_ready_cohorts(
+    case, execution, schedulers, memory, lower, engine, groups_to_schedule,
+    *, quota, in_flight, max_model_steps, logical_steps, iterations,
+    bindings, selections, modes, scopes, tails, submit_batch,
+):
+    for cohort in groups_to_schedule:
+        if max_model_steps is not None and logical_steps >= max_model_steps:
+            break
+        if (any(replica in in_flight for replica in cohort)
+                or all(schedulers[r].done for r in cohort)):
+            continue
+        with _quota_scope(schedulers, quota):
+            plans = {
+                r: (schedulers[r].schedule(engine.now)
+                    if not schedulers[r].done else None)
+                for r in cohort
+            }
+        if not any(plans.values()):
+            for r in cohort:
+                if not schedulers[r].done and memory.has_delayed_releases(r):
+                    prep = execution.prepared.pop(r, None)
+                    sched_ms = (execution.submission.scheduler_ms
+                                if execution.include_submission else 0.0)
+                    comp_ms = (execution.submission.completion_ms
+                               if execution.include_submission else 0.0)
+                    sched_ev = engine.submit(
+                        f"{execution.namespace}r{r}:retire_schedule:{iterations}",
+                        {f"{execution.namespace}scheduler@r{r}": sched_ms},
+                        after=(prep,) if prep is not None else (),
+                        release=engine.now, owner=f"replica:{r}",
+                    )
+                    comp_ev = engine.submit(
+                        f"{execution.namespace}r{r}:retire_complete:{iterations}",
+                        after=(sched_ev,), latency=comp_ms,
+                        release=engine.now, owner=f"replica:{r}",
+                    )
+                    in_flight[r] = ScheduledIteration(
+                        r, schedulers[r].iteration, comp_ev, engine.now,
+                        "retire", 0, 0, None, "none", 0, {}, comp_ev,
+                        {}, {}, (),
+                    )
+            continue
+        steps = submit_batch(
+            case, schedulers, plans, execution, lower, engine.now,
+            bindings_out=bindings, selections_out=selections)
+        # One atomic EP/cohort submission counts once against the global
+        # decode budget; PP microbatch work remains inside it.
+        if any(step.mode != "retire" for step in steps.values()):
+            logical_steps += 1
+        for replica, step in steps.items():
+            iterations += 1
+            modes[step.mode] = modes.get(step.mode, 0) + 1
+            scopes[step.replay_scope] = scopes.get(step.replay_scope, 0) + 1
+            in_flight[replica] = step
+            tails.update(getattr(step, "host_results", {}).values())
+            tails.update(getattr(step, "client_deliveries", {}).values())
+    return logical_steps, iterations
+
+
 def run_cohort(case, execution, schedulers, memory, lower, *, trace_limit=DEFAULT_TRACE_LIMIT,
                max_model_steps=None, observer=None, token_quotas=None,
                selected_allocations=None, selected_replica: int = ZERO,
@@ -310,7 +370,7 @@ def run_cohort(case, execution, schedulers, memory, lower, *, trace_limit=DEFAUL
                 "batch_bindings": bindings}
     scheduler_feedback = {}
     stop_reason = "drained"
-    from .dispatch import cohorts, submit_batch
+    from .execution.dispatch import cohorts, submit_batch
     groups_to_schedule = cohorts(parallel, case.machine)
 
     while True:
@@ -324,8 +384,8 @@ def run_cohort(case, execution, schedulers, memory, lower, *, trace_limit=DEFAUL
             assembly["declared_commits"] += len(getattr(step, "declared_commits", {}))
             assembly["fallback_commits"] += len(getattr(step, "fallback_commits", {}))
             assembly["host_submits"] += len(getattr(step, "host_submits", ()))
-            if len(bindings) > 256:
-                del bindings[:len(bindings) - 256]
+            if len(bindings) > MAX_COHORT_BINDINGS:
+                del bindings[:len(bindings) - MAX_COHORT_BINDINGS]
             tails.update(getattr(step, "host_results", {}).values())
             tails.update(getattr(step, "client_deliveries", {}).values())
             if _event_pending(getattr(step, "offload_release", None)):
@@ -366,57 +426,12 @@ def run_cohort(case, execution, schedulers, memory, lower, *, trace_limit=DEFAUL
 
         # 3. Form and submit new work only when no service precondition blocks.
         if selected_attached:
-            for cohort in groups_to_schedule:
-                if max_model_steps is not None and logical_steps >= max_model_steps:
-                    break
-                if (any(replica in in_flight for replica in cohort)
-                        or all(schedulers[r].done for r in cohort)):
-                    continue
-                with _quota_scope(schedulers, quota):
-                    plans = {
-                        r: (schedulers[r].schedule(engine.now)
-                            if not schedulers[r].done else None)
-                        for r in cohort
-                    }
-                if not any(plans.values()):
-                    for r in cohort:
-                        if not schedulers[r].done and memory.has_delayed_releases(r):
-                            prep = execution.prepared.pop(r, None)
-                            sched_ms = (execution.submission.scheduler_ms
-                                        if execution.include_submission else 0.0)
-                            comp_ms = (execution.submission.completion_ms
-                                       if execution.include_submission else 0.0)
-                            sched_ev = engine.submit(
-                                f"{execution.namespace}r{r}:retire_schedule:{iterations}",
-                                {f"{execution.namespace}scheduler@r{r}": sched_ms},
-                                after=(prep,) if prep is not None else (),
-                                release=engine.now, owner=f"replica:{r}",
-                            )
-                            comp_ev = engine.submit(
-                                f"{execution.namespace}r{r}:retire_complete:{iterations}",
-                                after=(sched_ev,), latency=comp_ms,
-                                release=engine.now, owner=f"replica:{r}",
-                            )
-                            in_flight[r] = ScheduledIteration(
-                                r, schedulers[r].iteration, comp_ev, engine.now,
-                                "retire", 0, 0, None, "none", 0, {}, comp_ev,
-                                {}, {}, (),
-                            )
-                    continue
-                steps = submit_batch(
-                    case, schedulers, plans, execution, lower, engine.now,
-                    bindings_out=bindings, selections_out=selections)
-                # One atomic EP/cohort submission counts once against the global
-                # decode budget; PP microbatch work remains inside it.
-                if any(step.mode != "retire" for step in steps.values()):
-                    logical_steps += 1
-                for replica, step in steps.items():
-                    iterations += 1
-                    modes[step.mode] = modes.get(step.mode, 0) + 1
-                    scopes[step.replay_scope] = scopes.get(step.replay_scope, 0) + 1
-                    in_flight[replica] = step
-                    tails.update(getattr(step, "host_results", {}).values())
-                    tails.update(getattr(step, "client_deliveries", {}).values())
+            logical_steps, iterations = _submit_ready_cohorts(
+                case, execution, schedulers, memory, lower, engine,
+                groups_to_schedule, quota=quota, in_flight=in_flight,
+                max_model_steps=max_model_steps, logical_steps=logical_steps,
+                iterations=iterations, bindings=bindings, selections=selections,
+                modes=modes, scopes=scopes, tails=tails, submit_batch=submit_batch)
         # 4. Next arrival is a real clock boundary. Only this service's own
         # pending events can preempt it.
         future = [arrival for replica, scheduler in enumerate(schedulers)
@@ -444,18 +459,7 @@ def run_cohort(case, execution, schedulers, memory, lower, *, trace_limit=DEFAUL
 
     window_end = engine.now
     if selected_attached:
-        # Terminal drain: every delivered host/client/copy tail this service
-        # created, including successors released by a delivery callback. A
-        # completed tail is removed and never wakes the same instant again.
-        while True:
-            pending = tuple(event for event in tails if _event_pending(event))
-            pending += tuple(
-                event for event in dict(
-                    getattr(execution.serving_io, "client_tails", {}) or {}).values()
-                if _event_pending(event))
-            if not pending:
-                break
-            engine.advance(until=tuple(pending))
+        _drain_cohort_tails(execution, engine, tails)
         if max_model_steps is None and not quota:
             memory.flush_delayed_releases()
     return {
@@ -468,6 +472,21 @@ def run_cohort(case, execution, schedulers, memory, lower, *, trace_limit=DEFAUL
         "selected_allocation_attached": bool(selected_attached),
         "operator_selection_summary": combine_summaries(selections),
     }
+
+
+def _drain_cohort_tails(execution, engine, tails):
+    # Terminal drain: every delivered host/client/copy tail this service
+    # created, including successors released by a delivery callback. A
+    # completed tail is removed and never wakes the same instant again.
+    while True:
+        pending = tuple(event for event in tails if _event_pending(event))
+        pending += tuple(
+            event for event in dict(
+                getattr(execution.serving_io, "client_tails", {}) or {}).values()
+            if _event_pending(event))
+        if not pending:
+            break
+        engine.advance(until=tuple(pending))
 
 
 def predict(
@@ -488,7 +507,7 @@ def predict(
     # A declared attention core without a physical model may be inspected
     # structurally, but no latency/throughput entry may fabricate its work.
     # The gate precedes every early body/PD return.
-    from .unmodeled_gate import assert_timing_supported
+    from .efficiency.unmodeled_gate import assert_timing_supported
     gate_case = case
     if isinstance(case, _AbcMapping) and "pools" not in case:
         # Layer overrides are resolved during parse_case.  Gate the resolved
@@ -505,7 +524,7 @@ def predict(
     if scope in {"body", "model"} or (scope == "serving" and has_geometry):
         if lower is not None:
             raise ModelingError("body_scope_uses_target_frontend_not_custom_serving_lowerer")
-        from .body import body_forward, pd_body_forward
+        from .frontend.body_spec import body_forward, pd_body_forward
         resolved_scope = "model" if scope == "model" else "body"
         probe = pd_body_forward if isinstance(case, _AbcMapping) and "pools" in case else body_forward
         return probe(case, phase=phase or "decode", tokens=1 if tokens is None else tokens,
@@ -529,7 +548,7 @@ def predict(
         # select one compact finite-K representation; an explicit caller
         # recipe book still wins.
         from .body_defaults import service_program_defaults
-        from mindie_sim.compose_operator_defaults import serving_recipe_inventory
+        from mindie_sim.compose.operator_defaults import serving_recipe_inventory
         case = serving_recipe_inventory(service_program_defaults(case))
     lower = lower or Frontend(
         attention_policy=AttentionPolicy(**case.runtime.attention_policy),
@@ -589,6 +608,12 @@ def predict(
         selected_allocations=selected_allocations,
         selected_replica=memory_replica, selected_stage=memory_stage,
     )
+    return _serving_result(case, execution, engine, schedulers, memory, cost, run,
+                           quota=quota, event_limit=event_limit)
+
+
+def _serving_result(case, execution, engine, schedulers, memory, cost, run, *,
+                    quota, event_limit):
     iterations = run["iterations"]
     modes = run["modes"]
     scopes = run["scopes"]

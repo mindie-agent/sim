@@ -209,7 +209,7 @@ def effective_body_declaration(case, phase, *, tokens=1, scope=DEFAULT_SCOPE,
     if str(getattr(case.machine, "arch_family", "")) == "A5":
         # The INT8 packed MLA row is resolved before phase-scoped operator
         # selection so prefill, decode and the serving inventory agree.
-        from mindie_sim.compose_operator_defaults import (
+        from mindie_sim.compose.operator_defaults import (
             resolve_packed_indexed_mla_cache,
         )
         case = replace(
@@ -746,7 +746,7 @@ def attention_defaults(case, phase, *, tokens=1):
     attnres = _attnres_default(case, phase, kernels)
     if attnres is not None:
         records.append(attnres)
-    from mindie_sim.compose_operator_defaults import (
+    from mindie_sim.compose.operator_defaults import (
         lightning_indexer_default, mqsmla_default,
     )
     mixed_quant = mqsmla_default(case, kernels)

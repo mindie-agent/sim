@@ -234,88 +234,9 @@ def _accesses_from_ops(work: Any, physical_ops=None) -> tuple[StateAccess, ...]:
             continue
         contract = meta.get("gdn_state_contract")
         if contract:
-            # The original-slot contract is the physical access authority.
-            # Aggregate state_read/write_bytes are validated against a
-            # per-slot formula when the producer declared one; a conv contract
-            # that only declares state_write_bytes explicitly is split across
-            # its real active slots instead of being dropped.
-            state_dtype = str(contract.get("state_dtype")
-                              or meta.get("state_dtype") or "fp32")
-            heads = int(meta.get("heads", contract.get("heads", 0)) or 0)
-            dk = int(meta.get("dk", contract.get("dk", 0)) or 0)
-            dv = int(meta.get("dv", contract.get("dv", 0)) or 0)
-            element = float(meta.get("state_element_bytes", 0.0) or 0.0)
-            if not element:
-                from mindie_sim.schema.common import dtype_bytes
-                element = float(dtype_bytes(state_dtype))
-            state_bytes = float(heads * dk * dv) * element
-            read_versions = tuple(contract.get("read_versions", ()))
-            checkpoints = tuple(contract.get("checkpoints", ()))
-            targets = tuple(contract.get("targets", ()))
-            publish_versions = tuple(contract.get("publish_versions", ()))
-            slot_rows = []
-            for slot, request in enumerate(raw_requests):
-                if str(request) in padding_ids:
-                    continue
-                slot_rows.append({
-                    "slot": slot, "request": request,
-                    "target": (targets[slot] if slot < len(targets)
-                               else (bound_output or "state")),
-                    "read_version": (read_versions[slot]
-                                     if slot < len(read_versions) else None),
-                    "publish_version": (publish_versions[slot]
-                                        if slot < len(publish_versions)
-                                        else None),
-                    "checkpoint": (int(checkpoints[slot])
-                                   if slot < len(checkpoints) else 0),
-                })
-            for row in slot_rows:
-                row["read"] = (state_bytes
-                               if state_bytes > 0.0
-                               and row["read_version"] is not None else 0.0)
-                row["write"] = (state_bytes * row["checkpoint"]
-                                if state_bytes > 0.0 else 0.0)
-            aggregate_read = float(meta.get("state_read_bytes", 0.0) or 0.0)
-            aggregate_write = float(meta.get("state_write_bytes", 0.0) or 0.0)
-            if state_bytes > 0.0:
-                contract_read = sum(row["read"] for row in slot_rows)
-                contract_write = sum(row["write"] for row in slot_rows)
-                for direction, aggregate, total in (
-                        ("read", aggregate_read, contract_read),
-                        ("write", aggregate_write, contract_write)):
-                    if aggregate > 0.0 and abs(aggregate - total) > 1e-9:
-                        raise ValueError(
-                            f"state_access_contract_total_mismatch:{direction}:"
-                            f"{aggregate}:{total}")
-            else:
-                if slot_rows:
-                    if aggregate_read > 0.0:
-                        for row in slot_rows:
-                            row["read"] = aggregate_read / len(slot_rows)
-                    if aggregate_write > 0.0:
-                        for row in slot_rows:
-                            row["write"] = aggregate_write / len(slot_rows)
-            for row in slot_rows:
-                if row["read"] > 0.0:
-                    result.append(StateAccess(
-                        occurrence=occurrence, producer=producer,
-                        request=row["request"], stage=stage, layer=layer,
-                        direction="read", position="state",
-                        output=row["target"],
-                        storage=str(contract.get("state_layout", "state")),
-                        state_version=row["read_version"], span=((0, 1),),
-                        scope=scope, bytes=row["read"], source=producer))
-                if row["write"] > 0.0:
-                    result.append(StateAccess(
-                        occurrence=occurrence, producer=producer,
-                        request=row["request"], stage=stage, layer=layer,
-                        direction="write", position="state",
-                        output=row["target"],
-                        storage=str(contract.get("state_layout", "state")),
-                        state_version=row["publish_version"],
-                        span=((0, 1),), scope=scope, bytes=row["write"],
-                        source=producer, decision=producer))
-            continue
+            _append_gdn_state_accesses(
+                result, meta, contract, raw_requests, padding_ids, bound_output,
+                occurrence, producer, stage, layer, scope)
             continue
         read = float(meta.get("state_read_bytes", 0.0) or 0.0)
         write = float(meta.get("state_write_bytes", 0.0) or 0.0)
@@ -346,6 +267,93 @@ def _accesses_from_ops(work: Any, physical_ops=None) -> tuple[StateAccess, ...]:
                     source=producer,
                 ))
     return tuple(result)
+
+
+def _append_gdn_state_accesses(
+    result, meta, contract, raw_requests, padding_ids, bound_output,
+    occurrence, producer, stage, layer, scope,
+):
+    # The original-slot contract is the physical access authority.
+    # Aggregate state_read/write_bytes are validated against a
+    # per-slot formula when the producer declared one; a conv contract
+    # that only declares state_write_bytes explicitly is split across
+    # its real active slots instead of being dropped.
+    state_dtype = str(contract.get("state_dtype")
+                      or meta.get("state_dtype") or "fp32")
+    heads = int(meta.get("heads", contract.get("heads", 0)) or 0)
+    dk = int(meta.get("dk", contract.get("dk", 0)) or 0)
+    dv = int(meta.get("dv", contract.get("dv", 0)) or 0)
+    element = float(meta.get("state_element_bytes", 0.0) or 0.0)
+    if not element:
+        from mindie_sim.schema.common import dtype_bytes
+        element = float(dtype_bytes(state_dtype))
+    state_bytes = float(heads * dk * dv) * element
+    read_versions = tuple(contract.get("read_versions", ()))
+    checkpoints = tuple(contract.get("checkpoints", ()))
+    targets = tuple(contract.get("targets", ()))
+    publish_versions = tuple(contract.get("publish_versions", ()))
+    slot_rows = []
+    for slot, request in enumerate(raw_requests):
+        if str(request) in padding_ids:
+            continue
+        slot_rows.append({
+            "slot": slot, "request": request,
+            "target": (targets[slot] if slot < len(targets)
+                       else (bound_output or "state")),
+            "read_version": (read_versions[slot]
+                             if slot < len(read_versions) else None),
+            "publish_version": (publish_versions[slot]
+                                if slot < len(publish_versions)
+                                else None),
+            "checkpoint": (int(checkpoints[slot])
+                           if slot < len(checkpoints) else 0),
+        })
+    for row in slot_rows:
+        row["read"] = (state_bytes
+                       if state_bytes > 0.0
+                       and row["read_version"] is not None else 0.0)
+        row["write"] = (state_bytes * row["checkpoint"]
+                        if state_bytes > 0.0 else 0.0)
+    aggregate_read = float(meta.get("state_read_bytes", 0.0) or 0.0)
+    aggregate_write = float(meta.get("state_write_bytes", 0.0) or 0.0)
+    if state_bytes > 0.0:
+        contract_read = sum(row["read"] for row in slot_rows)
+        contract_write = sum(row["write"] for row in slot_rows)
+        for direction, aggregate, total in (
+                ("read", aggregate_read, contract_read),
+                ("write", aggregate_write, contract_write)):
+            if aggregate > 0.0 and abs(aggregate - total) > 1e-9:
+                raise ValueError(
+                    f"state_access_contract_total_mismatch:{direction}:"
+                    f"{aggregate}:{total}")
+    else:
+        if slot_rows:
+            if aggregate_read > 0.0:
+                for row in slot_rows:
+                    row["read"] = aggregate_read / len(slot_rows)
+            if aggregate_write > 0.0:
+                for row in slot_rows:
+                    row["write"] = aggregate_write / len(slot_rows)
+    for row in slot_rows:
+        if row["read"] > 0.0:
+            result.append(StateAccess(
+                occurrence=occurrence, producer=producer,
+                request=row["request"], stage=stage, layer=layer,
+                direction="read", position="state",
+                output=row["target"],
+                storage=str(contract.get("state_layout", "state")),
+                state_version=row["read_version"], span=((0, 1),),
+                scope=scope, bytes=row["read"], source=producer))
+        if row["write"] > 0.0:
+            result.append(StateAccess(
+                occurrence=occurrence, producer=producer,
+                request=row["request"], stage=stage, layer=layer,
+                direction="write", position="state",
+                output=row["target"],
+                storage=str(contract.get("state_layout", "state")),
+                state_version=row["publish_version"],
+                span=((0, 1),), scope=scope, bytes=row["write"],
+                source=producer, decision=producer))
 
 
 def project_state_tiers(

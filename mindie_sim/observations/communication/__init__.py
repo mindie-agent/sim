@@ -60,25 +60,25 @@ __all__ = sorted(_EXPORTS)
 
 def _load_submodule(submodule: str):
     if submodule == "golden":
-        from . import golden as module
+        from . import schema as module
     elif submodule == "ingest":
         from . import ingest as module
     elif submodule == "normalization":
-        from . import normalization as module
+        from . import schema as module
     elif submodule == "normalized":
-        from . import normalized as module
+        from . import schema as module
     elif submodule == "binding":
         from . import binding as module
     elif submodule == "recipes":
-        from . import recipes as module
+        from . import binding as module
     elif submodule == "calibration":
         from . import calibration as module
     elif submodule == "analysis":
-        from . import analysis as module
+        from . import calibration as module
     elif submodule == "local_service":
-        from . import local_service as module
+        from . import calibration as module
     elif submodule == "local_domain":
-        from . import local_domain as module
+        from . import binding as module
     else:  # pragma: no cover - guarded by _EXPORTS
         raise AttributeError(f"unknown communication submodule: {submodule!r}")
     return module

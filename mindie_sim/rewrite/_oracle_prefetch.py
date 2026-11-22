@@ -13,12 +13,12 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from mindie_sim.prediction.fusion_bridge import (
+from mindie_sim.prediction.fusion.bridge import (
     CanonicalPlan, add_prefetch, apply_prefetch_rewrite, settle_prefetch_rewrite,
 )
-from mindie_sim.prediction.fusion_pool import register_recipe
+from mindie_sim.prediction.fusion.pool import register_recipe
 from mindie_sim.prediction.streams import MAIN_STREAM, StreamEvent
-from mindie_sim.prediction.weight_prefetch import PrefetchDecision
+from mindie_sim.prediction.execution.weight_prefetch import PrefetchDecision
 from mindie_sim.schema.common import ModelingError
 
 PREFETCH_PRIORITY = 10

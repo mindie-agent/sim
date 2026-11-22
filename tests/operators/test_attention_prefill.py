@@ -25,7 +25,7 @@ from mindie_sim.backends.ascend import materialize
 from mindie_sim.catalog.ops import gemm_op
 from mindie_sim.catalog.types import QuantSpec
 from mindie_sim.model_catalog import load_model
-from mindie_sim.prediction.operators.context_parallel.graph import emit_dcp_output_exchange_combine
+from mindie_sim.prediction.sharding.context_parallel import emit_dcp_output_exchange_combine
 from mindie_sim.prediction.operators.paged_mla import family_mqsmla, mqsmla
 from mindie_sim.prediction.operators.attention.attention import gqa
 from mindie_sim.prediction.call_builders import build_aclnn_call
@@ -44,7 +44,7 @@ from mindie_sim.prediction.operators.attention.common import (
 from mindie_sim.prediction.physical_recipe_registry import ControlSyncRecipe, resolve_physical_recipe
 from mindie_sim.prediction.program import KernelProgram, ParallelProgram, RecipeBook, RecipeContext
 from mindie_sim.prediction.structure import parse_case
-from mindie_sim.prediction.verification import verify_operator
+from mindie_sim.prediction.graph_analysis import verify_operator
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.hardware import Hardware
 from mindie_sim.schema.operators import OpSpec

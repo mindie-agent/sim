@@ -24,7 +24,7 @@ import pytest
 
 from _support.axes import REPRESENTATIVE_SKUS
 from _support.hardware import sku_case
-from mindie_sim import _remote_worker as worker, api, remote_exec as remote
+from mindie_sim import api, remote_exec as remote, remote_exec as worker
 from mindie_sim.optimization.contracts import PrimitiveCapacityEntry, PrimitiveCapacityTable
 from mindie_sim.prediction.results import ReplayOptions, StepRequest, json_payload
 from mindie_sim.prediction.spine import default_spine
@@ -505,7 +505,7 @@ def test_worker_module_canonical_stdio_and_mock_ssh_round_trip(tmp_path, monkeyp
                    deadline_s=JOB_TIMEOUT_S, entrypoint="run_step", base_case=prediction_case.to_dict(),
                    candidates=[{"request": {"step": {"phase": "decode", "context": 16}}}], max_workers=1)
     request = _wire(payload)
-    command = [sys.executable, "-B", "-m", "mindie_sim._remote_worker"]
+    command = [sys.executable, "-B", "-m", "mindie_sim.remote_exec"]
     process = subprocess.run(command, input=request, capture_output=True, timeout=JOB_TIMEOUT_S, check=False)
     assert process.returncode == 0, process.stderr
     assert b"device import guard active\n" in process.stderr
@@ -524,7 +524,7 @@ def test_worker_module_canonical_stdio_and_mock_ssh_round_trip(tmp_path, monkeyp
     monkeypatch.setattr(remote, "_ssh_plan", lambda *_: (fake_ssh.copy(), None, None))
     endpoint = remote._endpoint(ENDPOINT)
     ssh_command = [sys.executable, "-B", "-u", "-c", (
-        "from mindie_sim._remote_worker import main\n"
+        "from mindie_sim.remote_exec import main\n"
         "raise SystemExit(main(ready=True))\n"
     )]
     assert remote._exchange(endpoint, ssh_command, request, JOB_TIMEOUT_S, handshake=True) == process.stdout

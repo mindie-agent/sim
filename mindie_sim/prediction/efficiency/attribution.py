@@ -22,7 +22,7 @@ from mindie_sim.schema.model import RequestSpec
 from ..body_defaults import TargetGraphSet, consume_target_declaration
 from ..graph_analysis import graph_costs
 from ..operator_analysis import operator_costs, target_graphs
-from ..resource_attribution import attribute_stage_dag
+from ..efficiency.resource_attribution import attribute_stage_dag
 from ..scheduler import DraftPolicy
 from ..structure import parse_case
 from .analysis import analyze_network_efficiency, occurrence_work_graph, scale_case_hardware
@@ -61,7 +61,7 @@ def _lower_and_run_graph(case: CaseSpec, *, phase: str, tokens: int, context: in
         # Local-TP kernel group must not turn it into a full cohort DES run.
         return graphs, eff_case, None
     ext_in = {"analysis_input": 0} if scope == "body" else None
-    from ..local_tp_groups import rank_zero_graph_reuse
+    from ..sharding.local_tp import rank_zero_graph_reuse
     sg = (TargetGraphSet({0: graphs[0]}, kernels=graphs.effective_kernels,
                          selection=graphs.default_selection)
           if isinstance(graphs, TargetGraphSet) else {0: graphs[0]}) \
@@ -84,7 +84,7 @@ def _fast_operator_and_graph_reports(case: CaseSpec, *, phase: str, tokens: int,
     ``isolated_results`` are reused; no execution result crosses a call.
     """
     from ..evaluation import EvaluationContext
-    from ..local_tp_groups import local_tp_spans_dp, rank_zero_graph_reuse
+    from ..sharding.local_tp import local_tp_spans_dp, rank_zero_graph_reuse
     if precomputed_graph is None:
         ctx = evaluation_context or EvaluationContext.create(case)
         graphs, eff_case, graph_rep = _pkg_attr("_lower_and_run_graph", _lower_and_run_graph)(

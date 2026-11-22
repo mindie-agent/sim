@@ -453,51 +453,7 @@ def _route_publication(scope, i, edge):
     return f"{scope}:edge:{i}" + (":write" if edge.route_kind == "gm_spill" else "")
 
 
-def compile_fuse_region(
-    region_id: str, op_ids: Sequence[str], datapath: DatapathCapabilitySpec, *,
-    dependencies: Mapping[str, Sequence[str]], op_stages: Mapping[str, Stage],
-    edge_routes: Sequence[EdgeRouteBinding], edge_bytes: Mapping[str, int],
-    live_buffers: Sequence[LiveBufferSpec] = (), tile_shape: TileShape = TileShape(1, 1, 1),
-    tile_count: int = 1, reduction_class="resident_1pass", backend="dsl_mix",
-    live_in_obligations: Sequence[TensorRangeObligation] = (),
-    live_out_obligations: Sequence[TensorRangeObligation] = (),
-    reads_by_op: Mapping[str, Sequence[TensorRangeObligation]] | None = None,
-    writes_by_op: Mapping[str, Sequence[TensorRangeObligation]] | None = None,
-    semantic_work: Sequence[SemanticWorkItem] = (), collective_ops: Sequence[str] = (),
-    waits: Sequence[tuple[str, str]] = (),
-    numerical_contracts: Mapping[str, tuple[object, object]] | None = None,
-    alias_views: Mapping[str, tuple[str, int, int]] | None = None,
-    edge_owners: Mapping[str, tuple[int, int]] | None = None,
-    route_tiles: Mapping[str, int | tuple[int, ...]] | None = None,
-    resource_units: Mapping[str, int] | None = None,
-    second_pass_stages: Mapping[str, Stage] | None = None,
-    l2_reservation_bytes: int = 0, uses_simt: bool = False,
-    context: RecipeContext | None = None, memory_view: AdmissionMemoryView | None = None,
-    die: int = 0, live_admission: bool = False,
-) -> tuple[FuseRegionSpec, TemplateLoweringResult]:
-    """Compile per-tile stage declarations with explicit tensor and alias facts.
-
-    Op stages describe one tile each. Pass-two declarations name the exact
-    operations repeated after the global first-pass barrier.
-    """
-    edges, buffers = tuple(edge_routes), tuple(live_buffers)
-    if not region_id or type(tile_count) is not int or tile_count < 1 or backend not in {"catlass_evg", "dsl_mix", "dsl_vec", "tla_simt"}:
-        raise ModelingError("fuse_region_geometry_invalid")
-    order, parents = _region_order(
-        op_ids, dependencies, collective_ops, edges, waits,
-        numerical_contracts or {}, alias_views or {},
-    )
-    if set(order) != op_stages.keys() or any(s.previous or s.program is not None for s in op_stages.values()):
-        raise ModelingError("fuse_region_per_tile_stage_required")
-    second = dict(second_pass_stages or {})
-    if bool(second) != (reduction_class == "row_split_2pass") or not second.keys() <= op_stages.keys():
-        raise ModelingError("fuse_region_two_pass_work_required")
-    if any(s.previous or s.program is not None for s in second.values()):
-        raise ModelingError("fuse_region_per_tile_stage_required")
-    for stage in (*op_stages.values(), *second.values()):
-        if stage.after and not set(stage.after) <= set(order):
-            raise ModelingError("fuse_region_stage_dependency_unknown")
-
+def _route_region_edges(datapath, edges, edge_bytes, edge_owners, route_tiles, buffers, tile_count):
     routed = []
     source_buffers = {}
     for idx, edge in enumerate(edges):
@@ -519,41 +475,13 @@ def compile_fuse_region(
                 ),)
     buffers += tuple(LiveBufferSpec(f"producer:{op}:{version}", pool, size, 0, 1, owner_kind=axis)
                      for (op, version, pool, axis), size in source_buffers.items())
-    uses_simt = uses_simt or backend == "tla_simt"
-    solution = solve_template_tile(datapath, region_id, TileCandidate(
-        reduction_class, tile_shape, max((e.ring_depth for e in edges), default=1),
-        (datapath.aic_count, datapath.aiv_count), tile_count, ceil_div(tile_count, max(1, datapath.aic_count)),
-        buffers, uses_simt=uses_simt, owner_axis="aiv" if backend in {"dsl_vec", "tla_simt"} else "aic",
-    ), state=memory_view, die=die, reserved=l2_reservation_bytes)
-    reads = dict(reads_by_op) if reads_by_op is not None else {order[0]: live_in_obligations}
-    writes = dict(writes_by_op) if writes_by_op is not None else {order[-1]: live_out_obligations}
-    if not (reads.keys() | writes.keys()) <= set(order):
-        raise ModelingError("fuse_region_memory_op_outside")
-    produced, external = {}, list(live_in_obligations)
-    for op in order:
-        external.extend(_external_reads(reads.get(op, ()), produced))
-        _record_produced(produced, writes.get(op, ()))
-    read_ranges = _union_obligations(external)
-    write_ranges = _union_obligations((*live_out_obligations, *(entry for rows in writes.values() for entry in rows)))
-    spec = FuseRegionSpec(region_id, order, read_ranges, write_ranges, edges, reduction_class, solution, backend)
-    plan = Lowering(datapath, context=context, memory_view=memory_view, die=die, live_admission=live_admission)
-    if l2_reservation_bytes:
-        plan.state.grant_reservation(die, region_id, l2_reservation_bytes)
-        plan.l2_reservation = (die, l2_reservation_bytes, datapath.usable_bytes("l2"))
-    launch = plan.launch()
-    initial = plan._writebacks("reservation", (launch,))
-    rings = {
-        i: RingBuffer(die=die, owner=owners[-1], pool=edge.route_kind.split("->")[-1],
-                      allocation=f"edge:{i}", depth=edge.ring_depth,
-                      slot_bytes=size if route is not None and context is not None else 0)
-        for i, edge, size, owners, route in routed if edge.iter_kind != "full_barrier"
-    }
-    units = {**dict.fromkeys(_AIC_RESOURCES, datapath.aic_count),
-             **dict.fromkeys(_AIV_RESOURCES, datapath.aiv_count), **(resource_units or {})}
-    if context is not None:
-        units.update({context.resource_names.get(key, key): value for key, value in context.resource_units.items()})
-    plan.reads.extend(read_ranges)
-    plan.writes.extend(write_ranges)
+    return routed, buffers
+
+
+def _lower_region_passes(
+    plan, order, parents, routed, rings, units, op_stages, second, reads, writes,
+    semantic_work, initial, *, region_id, tile_count, context,
+):
     releases, moved = _barrier_storage(routed, op_stages, context)
     passes = (op_stages, second) if second else (op_stages,)
     for pass_idx, declarations in enumerate(passes):
@@ -634,6 +562,95 @@ def compile_fuse_region(
                 completions.append(plan.add(Stage(final_names[op], after=tuple(done))))
         if len(passes) > 1 and pass_idx == 0:
             initial = (plan.add(Stage("first_pass_complete", after=tuple(completions))),)
+
+
+def compile_fuse_region(
+    region_id: str, op_ids: Sequence[str], datapath: DatapathCapabilitySpec, *,
+    dependencies: Mapping[str, Sequence[str]], op_stages: Mapping[str, Stage],
+    edge_routes: Sequence[EdgeRouteBinding], edge_bytes: Mapping[str, int],
+    live_buffers: Sequence[LiveBufferSpec] = (), tile_shape: TileShape = TileShape(1, 1, 1),
+    tile_count: int = 1, reduction_class="resident_1pass", backend="dsl_mix",
+    live_in_obligations: Sequence[TensorRangeObligation] = (),
+    live_out_obligations: Sequence[TensorRangeObligation] = (),
+    reads_by_op: Mapping[str, Sequence[TensorRangeObligation]] | None = None,
+    writes_by_op: Mapping[str, Sequence[TensorRangeObligation]] | None = None,
+    semantic_work: Sequence[SemanticWorkItem] = (), collective_ops: Sequence[str] = (),
+    waits: Sequence[tuple[str, str]] = (),
+    numerical_contracts: Mapping[str, tuple[object, object]] | None = None,
+    alias_views: Mapping[str, tuple[str, int, int]] | None = None,
+    edge_owners: Mapping[str, tuple[int, int]] | None = None,
+    route_tiles: Mapping[str, int | tuple[int, ...]] | None = None,
+    resource_units: Mapping[str, int] | None = None,
+    second_pass_stages: Mapping[str, Stage] | None = None,
+    l2_reservation_bytes: int = 0, uses_simt: bool = False,
+    context: RecipeContext | None = None, memory_view: AdmissionMemoryView | None = None,
+    die: int = 0, live_admission: bool = False,
+) -> tuple[FuseRegionSpec, TemplateLoweringResult]:
+    """Compile per-tile stage declarations with explicit tensor and alias facts.
+
+    Op stages describe one tile each. Pass-two declarations name the exact
+    operations repeated after the global first-pass barrier.
+    """
+    edges, buffers = tuple(edge_routes), tuple(live_buffers)
+    if not region_id or type(tile_count) is not int or tile_count < 1 or backend not in {"catlass_evg", "dsl_mix", "dsl_vec", "tla_simt"}:
+        raise ModelingError("fuse_region_geometry_invalid")
+    order, parents = _region_order(
+        op_ids, dependencies, collective_ops, edges, waits,
+        numerical_contracts or {}, alias_views or {},
+    )
+    if set(order) != op_stages.keys() or any(s.previous or s.program is not None for s in op_stages.values()):
+        raise ModelingError("fuse_region_per_tile_stage_required")
+    second = dict(second_pass_stages or {})
+    if bool(second) != (reduction_class == "row_split_2pass") or not second.keys() <= op_stages.keys():
+        raise ModelingError("fuse_region_two_pass_work_required")
+    if any(s.previous or s.program is not None for s in second.values()):
+        raise ModelingError("fuse_region_per_tile_stage_required")
+    for stage in (*op_stages.values(), *second.values()):
+        if stage.after and not set(stage.after) <= set(order):
+            raise ModelingError("fuse_region_stage_dependency_unknown")
+
+    routed, buffers = _route_region_edges(
+        datapath, edges, edge_bytes, edge_owners, route_tiles, buffers, tile_count,
+    )
+    uses_simt = uses_simt or backend == "tla_simt"
+    solution = solve_template_tile(datapath, region_id, TileCandidate(
+        reduction_class, tile_shape, max((e.ring_depth for e in edges), default=1),
+        (datapath.aic_count, datapath.aiv_count), tile_count, ceil_div(tile_count, max(1, datapath.aic_count)),
+        buffers, uses_simt=uses_simt, owner_axis="aiv" if backend in {"dsl_vec", "tla_simt"} else "aic",
+    ), state=memory_view, die=die, reserved=l2_reservation_bytes)
+    reads = dict(reads_by_op) if reads_by_op is not None else {order[0]: live_in_obligations}
+    writes = dict(writes_by_op) if writes_by_op is not None else {order[-1]: live_out_obligations}
+    if not (reads.keys() | writes.keys()) <= set(order):
+        raise ModelingError("fuse_region_memory_op_outside")
+    produced, external = {}, list(live_in_obligations)
+    for op in order:
+        external.extend(_external_reads(reads.get(op, ()), produced))
+        _record_produced(produced, writes.get(op, ()))
+    read_ranges = _union_obligations(external)
+    write_ranges = _union_obligations((*live_out_obligations, *(entry for rows in writes.values() for entry in rows)))
+    spec = FuseRegionSpec(region_id, order, read_ranges, write_ranges, edges, reduction_class, solution, backend)
+    plan = Lowering(datapath, context=context, memory_view=memory_view, die=die, live_admission=live_admission)
+    if l2_reservation_bytes:
+        plan.state.grant_reservation(die, region_id, l2_reservation_bytes)
+        plan.l2_reservation = (die, l2_reservation_bytes, datapath.usable_bytes("l2"))
+    launch = plan.launch()
+    initial = plan._writebacks("reservation", (launch,))
+    rings = {
+        i: RingBuffer(die=die, owner=owners[-1], pool=edge.route_kind.split("->")[-1],
+                      allocation=f"edge:{i}", depth=edge.ring_depth,
+                      slot_bytes=size if route is not None and context is not None else 0)
+        for i, edge, size, owners, route in routed if edge.iter_kind != "full_barrier"
+    }
+    units = {**dict.fromkeys(_AIC_RESOURCES, datapath.aic_count),
+             **dict.fromkeys(_AIV_RESOURCES, datapath.aiv_count), **(resource_units or {})}
+    if context is not None:
+        units.update({context.resource_names.get(key, key): value for key, value in context.resource_units.items()})
+    plan.reads.extend(read_ranges)
+    plan.writes.extend(write_ranges)
+    _lower_region_passes(
+        plan, order, parents, routed, rings, units, op_stages, second, reads, writes,
+        semantic_work, initial, region_id=region_id, tile_count=tile_count, context=context,
+    )
     for ring in rings.values():
         plan.add_ring(ring, after=(launch,))
     return spec, plan.result("K3", region_id, order, spec, semantic_work, solution)

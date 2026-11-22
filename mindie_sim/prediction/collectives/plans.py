@@ -28,7 +28,7 @@ import math
 
 from mindie_sim.schema.common import ModelingError
 from ..communication import CommunicationWork, MessageFlow
-from ..peer_traffic import PeerTraffic
+from ..collectives.peer_traffic import PeerTraffic
 from .ring_pairwise import PairwiseGroup, PairwisePlan, RingGroup, RingPlan
 from .transport import (
     DEFAULT_MAX_PHYSICAL_CHUNKS,
@@ -304,70 +304,7 @@ class _TopologyPlansMixin:
             startup = self.startup_descriptor(
                 op, len(next(iter(unique_groups))))
         if algorithm == "direct_mesh":
-            from mindie_sim.prediction.operators.collectives.direct_peer import DirectMeshGroup, DirectMeshPhase, DirectMeshPlan
-
-            family = {"all_reduce": "allreduce", "all_gather": "allgather"}.get(family, family)
-            if family not in DIRECT_MESH_FAMILIES:
-                raise ModelingError(
-                    f"direct_mesh_collective_family_unsupported:{family}")
-            names = DIRECT_MESH_PHASES[family]
-            groups = []
-            for ranks in unique_groups:
-                if len(ranks) <= 1:
-                    continue
-                if len(ranks) > DIRECT_MESH_MAX_PEERS:
-                    raise ModelingError(
-                        f"direct_mesh_collective_exceeds_declared_peers:{len(ranks)}")
-                volumes = {rank: volume_by_rank[rank] for rank in ranks}
-                if len(set(volumes.values())) > 1:
-                    raise ModelingError(
-                        "direct_mesh_collective_requires_equal_per_rank_volume")
-                if len({self._rank_node[rank] for rank in ranks}) != 1:
-                    raise ModelingError(
-                        "direct_mesh_collective_requires_single_node_group")
-                rounds = len(names) * (len(ranks) - 1)
-                if metadata.get("steps", rounds) != rounds:
-                    raise ModelingError(
-                        "direct_mesh_collective_round_count_conflicts_with_declaration")
-                links = []
-                for source in ranks:
-                    for destination in ranks:
-                        if source == destination:
-                            continue
-                        path = self.route(source, destination)
-                        if len(path) != 1:
-                            raise ModelingError(
-                                "direct_mesh_collective_requires_one_hop_peer")
-                        link = self.links[path[0][0]]
-                        if link.semantics != "per_pair":
-                            raise ModelingError(
-                                "direct_mesh_collective_requires_per_pair_links")
-                        links.append(link)
-                volume = next(iter(volumes.values()), 0.0)
-                payload = volume / rounds if rounds else 0.0
-                startup_ms = self.mesh_phase_startup_ms(links)
-                phase_startups = [startup_ms] * len(names)
-                from .band_plan import api_bytes_from_link_volume
-                from .protocol import (
-                    MS_PER_S as _MS_PER_S,
-                    _candidate_bands,
-                    _infer_group_scope,
-                    select_band,
-                )
-                if _candidate_bands(ranks, self, _infer_group_scope(ranks, self)):
-                    api_b = api_bytes_from_link_volume(family, len(ranks), volume, metadata)
-                    band = select_band(family, ranks, self, api_b)
-                    band_ms = float(band.startup_us) / _MS_PER_S
-                    if band.startup_scope == "collective":
-                        phase_startups = [band_ms] + [0.0] * max(0, len(names) - 1)
-                    else:
-                        phase_startups = [band_ms] * len(names)
-                groups.append(DirectMeshGroup(
-                    ranks, tuple((rank, volumes[rank]) for rank in ranks),
-                    tuple(DirectMeshPhase(
-                        ranks, payload, self, phase=name, startup_ms=p_ms)
-                        for name, p_ms in zip(names, phase_startups)), self))
-            return DirectMeshPlan(family, tuple(groups))
+            return self._joint_direct_mesh_plan(family, unique_groups, volume_by_rank, metadata)
         if algorithm == "ring":
             if "peer_traffic" in metadata:
                 raise ModelingError(
@@ -445,7 +382,7 @@ class _TopologyPlansMixin:
                     receive_buffer_id=receive_buffer_id,
                     max_physical_chunks=max_physical_chunks))
             elif algorithm == "startup_waves":
-                from ..collective_waves import WaveGroup
+                from ..collectives.waves import WaveGroup
                 wave_rounds = (startup.startup_rounds
                                if startup is not None else rounds)
                 groups.append(WaveGroup(
@@ -455,7 +392,7 @@ class _TopologyPlansMixin:
                 groups.append(PairwiseGroup(
                     ranks, tuple(totals), rounds, self, peer_traffic=peer))
         if algorithm == "startup_waves":
-            from ..collective_waves import WavePlan
+            from ..collectives.waves import WavePlan
             return WavePlan(
                 family, tuple(groups),
                 startup_rounds=(startup.startup_rounds
@@ -465,6 +402,72 @@ class _TopologyPlansMixin:
             startup_rounds=(startup.startup_rounds if startup is not None else None),
             startup_application=("physical_program_owns_arrivals"
                                  if alltoall else "startup_model"))
+
+    def _joint_direct_mesh_plan(self, family, unique_groups, volume_by_rank, metadata):
+        from mindie_sim.prediction.operators.collectives.direct_peer import DirectMeshGroup, DirectMeshPhase, DirectMeshPlan
+
+        family = {"all_reduce": "allreduce", "all_gather": "allgather"}.get(family, family)
+        if family not in DIRECT_MESH_FAMILIES:
+            raise ModelingError(
+                f"direct_mesh_collective_family_unsupported:{family}")
+        names = DIRECT_MESH_PHASES[family]
+        groups = []
+        for ranks in unique_groups:
+            if len(ranks) <= 1:
+                continue
+            if len(ranks) > DIRECT_MESH_MAX_PEERS:
+                raise ModelingError(
+                    f"direct_mesh_collective_exceeds_declared_peers:{len(ranks)}")
+            volumes = {rank: volume_by_rank[rank] for rank in ranks}
+            if len(set(volumes.values())) > 1:
+                raise ModelingError(
+                    "direct_mesh_collective_requires_equal_per_rank_volume")
+            if len({self._rank_node[rank] for rank in ranks}) != 1:
+                raise ModelingError(
+                    "direct_mesh_collective_requires_single_node_group")
+            rounds = len(names) * (len(ranks) - 1)
+            if metadata.get("steps", rounds) != rounds:
+                raise ModelingError(
+                    "direct_mesh_collective_round_count_conflicts_with_declaration")
+            links = []
+            for source in ranks:
+                for destination in ranks:
+                    if source == destination:
+                        continue
+                    path = self.route(source, destination)
+                    if len(path) != 1:
+                        raise ModelingError(
+                            "direct_mesh_collective_requires_one_hop_peer")
+                    link = self.links[path[0][0]]
+                    if link.semantics != "per_pair":
+                        raise ModelingError(
+                            "direct_mesh_collective_requires_per_pair_links")
+                    links.append(link)
+            volume = next(iter(volumes.values()), 0.0)
+            payload = volume / rounds if rounds else 0.0
+            startup_ms = self.mesh_phase_startup_ms(links)
+            phase_startups = [startup_ms] * len(names)
+            from .band_plan import api_bytes_from_link_volume
+            from .protocol import (
+                MS_PER_S as _MS_PER_S,
+                _candidate_bands,
+                _infer_group_scope,
+                select_band,
+            )
+            if _candidate_bands(ranks, self, _infer_group_scope(ranks, self)):
+                api_b = api_bytes_from_link_volume(family, len(ranks), volume, metadata)
+                band = select_band(family, ranks, self, api_b)
+                band_ms = float(band.startup_us) / _MS_PER_S
+                if band.startup_scope == "collective":
+                    phase_startups = [band_ms] + [0.0] * max(0, len(names) - 1)
+                else:
+                    phase_startups = [band_ms] * len(names)
+            groups.append(DirectMeshGroup(
+                ranks, tuple((rank, volumes[rank]) for rank in ranks),
+                tuple(DirectMeshPhase(
+                    ranks, payload, self, phase=name, startup_ms=p_ms)
+                    for name, p_ms in zip(names, phase_startups)), self))
+        return DirectMeshPlan(family, tuple(groups))
 
     def ring_plan(self, op, replica, *, volume=None):
         """Bind a uniform-chunk local ring; no vendor algorithm is inferred."""

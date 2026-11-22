@@ -26,8 +26,8 @@ import pytest
 from mindie_sim.catalog.ops import vector_op
 from mindie_sim.prediction import engine as engine_module
 from mindie_sim.prediction import ownership
-from mindie_sim.prediction.coupled import coupled_rates
-from mindie_sim.prediction.cost import CostModel
+from mindie_sim.prediction.runtime.coupled import coupled_rates
+from mindie_sim.prediction.efficiency.cost import CostModel
 from mindie_sim.prediction.engine import Allocation, Engine, ExecutionError, Resource
 from mindie_sim.prediction.execution import Execution
 from mindie_sim.prediction.ownership import unit_rates

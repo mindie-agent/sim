@@ -21,7 +21,7 @@ from pathlib import Path, PurePosixPath
 import pytest
 
 from _support.linear_cases import gdn_decode_source_case
-from mindie_sim.prediction import implementation_registry
+from mindie_sim.prediction.program import implementation_registry
 from mindie_sim.prediction.mechanism import Geometry, PlannedRecipe
 from mindie_sim.prediction.operators import builtin_family_registry
 from mindie_sim.prediction.operators.linear_attention import gdn_decode, gdn_recurrent

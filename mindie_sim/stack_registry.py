@@ -23,7 +23,7 @@ from functools import lru_cache
 import json
 from typing import Literal
 
-from mindie_sim.compose_runtime import capture_keys, finalize_compilation_spine
+from mindie_sim.compose.runtime import capture_keys, finalize_compilation_spine
 from mindie_sim.feature_mechanisms import MechanismContext
 from mindie_sim.schema.case import Case
 from mindie_sim.schema.common import ModelingError

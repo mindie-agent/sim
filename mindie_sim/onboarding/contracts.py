@@ -33,7 +33,7 @@ import sys
 import tempfile
 from typing import Any, Literal
 
-from mindie_sim.observations.multilevel_stream import SHA256_HEX_LENGTH, sanitize_capture_uri, validate_provenance_text
+from mindie_sim.observations.multilevel import SHA256_HEX_LENGTH, sanitize_capture_uri, validate_provenance_text
 from mindie_sim.optimization.dual_bound import (
     DagEdge, EventDagSpec, FarkasCertificate, OptimalityCertificate, ResourceChoiceProgram, check_optimality_certificate,
 )

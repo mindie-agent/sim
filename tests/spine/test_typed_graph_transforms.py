@@ -14,7 +14,7 @@ import pytest
 
 from mindie_sim.catalog.ops import gemm_op, vector_op
 from mindie_sim.catalog.quant import quant_preset
-from mindie_sim.prediction.blocks import norm
+from mindie_sim.prediction.frontend.body_spec import norm
 from mindie_sim.prediction.graph import GraphPolicy
 from mindie_sim.prediction.implementation_selection import LoweringRegion, lower_regions, resolve
 from mindie_sim.prediction.implementations import (
@@ -30,7 +30,7 @@ from mindie_sim.prediction.transforms import (
     activation_quantization, lower_implementations, norm_quant, residual_norm,
 )
 from mindie_sim.schema.common import ModelingError
-from mindie_sim.structure_physical import node_physical
+from mindie_sim.structure.physical import node_physical
 from _support.operator_cases import hardware_case
 
 pytestmark = pytest.mark.tier0

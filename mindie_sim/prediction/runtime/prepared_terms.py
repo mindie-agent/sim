@@ -18,9 +18,12 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 import math
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from mindie_sim.schema.common import ModelingError
+
+if TYPE_CHECKING:
+    from ..program.stages import Stage
 
 RESIDUAL_SNAP_ULPS = 4.0
 POLICY_FAIR = 0
@@ -69,6 +72,76 @@ class BoundVectorOp:
     stages: tuple[Any, ...] = ()
 
 
+def _append_vector_group_stages(stages, grp, issue_res, pipe_res, deps_after,
+                                issue_w, exec_w, raw_lat_ms, target_eff, pl):
+    from ..program.stages import Stage
+
+    if grp.count > 1 and raw_lat_ms > 0.0 and grp.last_issue_mark:
+        prefix_count = grp.count - 1
+        stages.append(Stage(
+            f"{grp.group_id}:prefix",
+            work={
+                issue_res: float(prefix_count * grp.issue_slots) / target_eff,
+                pipe_res: float(prefix_count * grp.initiation_cycles) / target_eff,
+            },
+            after=deps_after,
+            placement=pl,
+            coupled=True,
+        ))
+        stages.append(Stage(
+            grp.group_id,
+            work={
+                issue_res: float(grp.issue_slots) / target_eff,
+                pipe_res: float(grp.initiation_cycles) / target_eff,
+            },
+            after=(f"{grp.group_id}:prefix",),
+            latency=raw_lat_ms,
+            placement=pl,
+            coupled=True,
+            latency_from_first_service=True,
+        ))
+        stages.append(Stage(
+            f"{grp.group_id}:raw",
+            after=(grp.group_id,),
+            keep_empty=True,
+        ))
+    elif grp.count == 1 and raw_lat_ms > 0.0 and grp.last_issue_mark:
+        stages.append(Stage(
+            grp.group_id,
+            work={
+                issue_res: issue_w / target_eff,
+                pipe_res: exec_w / target_eff,
+            },
+            after=deps_after,
+            latency=raw_lat_ms,
+            placement=pl,
+            coupled=True,
+            latency_from_first_service=True,
+        ))
+        stages.append(Stage(
+            f"{grp.group_id}:raw",
+            after=(grp.group_id,),
+            keep_empty=True,
+        ))
+    else:
+        stages.append(Stage(
+            grp.group_id,
+            work={
+                issue_res: issue_w / target_eff,
+                pipe_res: exec_w / target_eff,
+            } if grp.count > 0 else {},
+            after=deps_after,
+            placement=pl if grp.count > 0 else {},
+            coupled=grp.count > 0,
+        ))
+        if raw_lat_ms > 0.0 and grp.count > 0:
+            stages.append(Stage(
+                f"{grp.group_id}:raw",
+                latency=raw_lat_ms,
+                after=(grp.group_id,),
+            ))
+
+
 def bind_vector_groups(
     groups: Sequence[VectorInstructionGroup],
     *,
@@ -84,8 +157,6 @@ def bind_vector_groups(
     result latency cycles invariant. The legacy ``vector`` total is computed as
     a pure reporting projection and never occupies a competing resource row.
     """
-    from ..program.stages import Stage
-
     if issue_rate_per_ms <= 0.0 or clock_hz <= 0.0 or not (0.0 < target_eff <= 1.0):
         raise ModelingError("bind_vector_rates_invalid")
     eff_issue = issue_rate_per_ms * target_eff
@@ -148,70 +219,10 @@ def bind_vector_groups(
             for d in grp.dependencies
         )
         pl = {issue_res: (owner,), pipe_res: (owner,)}
-        if grp.count > 1 and raw_lat_ms > 0.0 and grp.last_issue_mark:
-            prefix_count = grp.count - 1
-            stages.append(Stage(
-                f"{grp.group_id}:prefix",
-                work={
-                    issue_res: float(prefix_count * grp.issue_slots) / target_eff,
-                    pipe_res: float(prefix_count * grp.initiation_cycles) / target_eff,
-                },
-                after=deps_after,
-                placement=pl,
-                coupled=True,
-            ))
-            stages.append(Stage(
-                grp.group_id,
-                work={
-                    issue_res: float(grp.issue_slots) / target_eff,
-                    pipe_res: float(grp.initiation_cycles) / target_eff,
-                },
-                after=(f"{grp.group_id}:prefix",),
-                latency=raw_lat_ms,
-                placement=pl,
-                coupled=True,
-                latency_from_first_service=True,
-            ))
-            stages.append(Stage(
-                f"{grp.group_id}:raw",
-                after=(grp.group_id,),
-                keep_empty=True,
-            ))
-        elif grp.count == 1 and raw_lat_ms > 0.0 and grp.last_issue_mark:
-            stages.append(Stage(
-                grp.group_id,
-                work={
-                    issue_res: issue_w / target_eff,
-                    pipe_res: exec_w / target_eff,
-                },
-                after=deps_after,
-                latency=raw_lat_ms,
-                placement=pl,
-                coupled=True,
-                latency_from_first_service=True,
-            ))
-            stages.append(Stage(
-                f"{grp.group_id}:raw",
-                after=(grp.group_id,),
-                keep_empty=True,
-            ))
-        else:
-            stages.append(Stage(
-                grp.group_id,
-                work={
-                    issue_res: issue_w / target_eff,
-                    pipe_res: exec_w / target_eff,
-                } if grp.count > 0 else {},
-                after=deps_after,
-                placement=pl if grp.count > 0 else {},
-                coupled=grp.count > 0,
-            ))
-            if raw_lat_ms > 0.0 and grp.count > 0:
-                stages.append(Stage(
-                    f"{grp.group_id}:raw",
-                    latency=raw_lat_ms,
-                    after=(grp.group_id,),
-                ))
+        _append_vector_group_stages(
+            stages, grp, issue_res, pipe_res, deps_after, issue_w, exec_w,
+            raw_lat_ms, target_eff, pl,
+        )
 
     if not any(g.dependencies for g in groups):
         span_ms = max(

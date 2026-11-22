@@ -248,16 +248,16 @@ def _normalize_parsed_case(case: Case) -> Case:
         model = replace(model, metadata=tuple(sorted(metadata.items())))
     case.machine.validate_placement(p)
     if p.has_local_tp:
-        from .local_tp_groups import validate_local_projection_tp
+        from .sharding.local_tp import validate_local_projection_tp
         validate_local_projection_tp(case)
     case.workload.validate_model(model, runtime)
     metadata = dict(runtime.metadata)
     # Carry the unaltered case machine/model identity with the parsed runtime so
     # every ordinary FeatureConfig/compiled feature record receives it.  This is
     # the deployment identity, not a measured supply or model-label branch.
-    from .frontend_features import _identity_metadata
+    from .frontend.features import _identity_metadata
     metadata.update(_identity_metadata(case.machine, model))
-    from .operators.context_parallel.graph import validate_quantized_allreduce_runtime
+    from .sharding.context_parallel import validate_quantized_allreduce_runtime
     validate_quantized_allreduce_runtime(
         metadata, arch=str(case.machine.arch_family or ""), tp=int(p.tp),
     )

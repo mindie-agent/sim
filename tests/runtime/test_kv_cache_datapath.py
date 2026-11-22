@@ -21,7 +21,7 @@ from mindie_sim.catalog.cache_ownership import (
 )
 from mindie_sim.catalog.draft_geometry import native_draft_layer_plans
 from mindie_sim.catalog.types import AuxiliarySpec, DraftSpec
-from mindie_sim.prediction.cache_geometry import (
+from mindie_sim.prediction.cache_path.geometry import (
     Span, full_line_spans, intersect_spans, lines_of_byte_spans,
     normalize_spans, span, subtract_spans, take_first_spans, union_spans,
 )
@@ -29,8 +29,8 @@ from mindie_sim.prediction.cache_path import (
     AccessSummary, CacheAccessGeometry, CacheGeometry, CachePolicy, CacheState,
 )
 from mindie_sim.prediction.capacity import Memory
-from mindie_sim.prediction.capacity_features import batch_cache_bytes
-from mindie_sim.prediction.cost import CostModel
+from mindie_sim.prediction.capacity.features import batch_cache_bytes
+from mindie_sim.prediction.efficiency.cost import CostModel
 from mindie_sim.prediction.efficiency import capacity_window
 from mindie_sim.prediction.engine import Engine
 from mindie_sim.prediction.execution import Execution

@@ -25,7 +25,7 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 from mindie_sim.schema.common import ModelingError
-from ..cohort_traffic import bind_cohort_traffic
+from ..execution.cohort_traffic import bind_cohort_traffic
 from ..collectives import plan_options as collective_options
 from ..engine import Event
 from ..program import RecipeContext
@@ -54,7 +54,7 @@ class _CohortMixin(_CohortNativeMixin):
                   state_accesses=None):
         """Compile an EP/local-TP cohort before releasing any collective events."""
         graphs = bind_cohort_traffic(self.case, {r: work.ops for r, work in works.items()})
-        from ..local_projection_tp import lower_local_projection_tp_cohort
+        from ..sharding.local_tp import lower_local_projection_tp_cohort
         graphs = lower_local_projection_tp_cohort(
             graphs, model=self.case.model, runtime=self.case.runtime,
             machine=self.case.machine)
@@ -194,7 +194,7 @@ class _CohortMixin(_CohortNativeMixin):
                 if matched:
                     return matched
         if axis == "ep":
-            from ..dispatch import cohorts
+            from ..execution.dispatch import cohorts
             for grp in cohorts(self.case.runtime.parallel, self.case.machine):
                 if item0.replica in grp:
                     return tuple(r for r in replicas if r in grp)
@@ -570,7 +570,7 @@ class _CohortMixin(_CohortNativeMixin):
             ready_by_rank.update({rank: ready for rank in
                                   self.topology.ranks(item.replica, source_stage)})
         if self.readiness_report:
-            from ..collective_readiness import bind_pipeline_ready
+            from ..collectives.readiness import bind_pipeline_ready
             try:
                 collective, expected_bytes, expected_dtype = _collective_native_basis(
                     op, len(ready_by_rank))
@@ -652,7 +652,7 @@ class _CohortMixin(_CohortNativeMixin):
                                   else float("-inf")))
         if completion:
             observation["last_completion_ms"] = max(completion)
-        from ..participant_profile import select_call
+        from ..graph_analysis import select_call
         observation["source"] = select_call(
             self.participant_profile, primitive=observation["collective"],
             occurrence=observation["occurrence"],

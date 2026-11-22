@@ -21,16 +21,16 @@ from _support.memory_cases import case, linear_work
 
 from mindie_sim import Case, predict
 from mindie_sim.__main__ import main
-from mindie_sim.observations.accuracy import apply_capture_observed_clock, extract_observed_aicore_freq_mhz
-from mindie_sim.observations import multilevel_gate as gate
+from mindie_sim.observations.comparison import apply_capture_observed_clock, extract_observed_aicore_freq_mhz
+from mindie_sim.observations import multilevel as gate
 from mindie_sim.observations.calibration import import_profiler
-from mindie_sim.observations.call_alignment import compare_calls
+from mindie_sim.observations.calibration import compare_calls
 from mindie_sim.observations.captures import capture_inventory, iter_conditions, iter_observations
 from mindie_sim.observations.comparison import comparison_report
-from mindie_sim.observations.store import ObservationIndex, ProfilerCatalogue, digest_file, profiler_rows
-from mindie_sim.observations.validation import compare, fit_resource_rate, service_observation
-from mindie_sim.prediction.cost import primitive_key
-from mindie_sim.prediction.primitives import PrimitiveStore
+from mindie_sim.observations.captures import ObservationIndex, ProfilerCatalogue, digest_file, profiler_rows
+from mindie_sim.observations.captures import compare, fit_resource_rate, service_observation
+from mindie_sim.prediction.efficiency.cost import primitive_key
+from mindie_sim.prediction.program.primitives import PrimitiveStore
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.workload import IterationPlan, RequestView
 from tools.analyze_a5_microbench_boundaries import analyze_window, nanoseconds
@@ -138,7 +138,7 @@ def test_served_grouped_is_kernel_sum_and_never_includes_contaminated_intervals(
     inventory = capture_inventory(manifest)
     assert inventory["timing_conditions"] == 2 and inventory["event_or_kernel_sum_samples"] == 1
 def test_zero_duration_markers_preserve_intervals_without_entering_kernel_sum(tmp_path, profiler_api):
-    from mindie_sim.observations.kernels import kernel_rows
+    from mindie_sim.observations.captures import kernel_rows
     manifest = served_protocol()
     expected = list(iter_conditions(manifest))
     with (fixture_path(*ADAPTER_FIXTURES, "served_grouped.csv")).open(newline="") as stream:
@@ -303,7 +303,7 @@ def test_profiler_catalogue_exposes_samples_and_variant_extrema():
 def test_shared_profiler_row_preserves_consumer_projection(profiler_api):
     from dataclasses import replace
     from mindie_profiler.tensor_contracts import observed_contract
-    from mindie_sim.observations.kernels import kernel_rows
+    from mindie_sim.observations.captures import kernel_rows
 
     capture = fixture_path("observations", "operator-kernels.csv")
     row = next(kernel_rows(capture))
@@ -326,7 +326,7 @@ def test_missing_or_unrecognized_matrix_dtype_does_not_authorize_a_contract(prof
     from dataclasses import replace
     from mindie_profiler.normalized import row_from_event
     from mindie_profiler.tensor_contracts import observed_contract
-    from mindie_sim.observations.kernels import kernel_rows
+    from mindie_sim.observations.captures import kernel_rows
 
     row = next(row for row in kernel_rows(fixture_path("observations", "operator-kernels.csv"))
                if row.kind == "MatMulV3")

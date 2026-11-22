@@ -41,7 +41,7 @@ from mindie_sim.prediction.operators.recurrent.recover_ssm_commit import bind_de
 from mindie_sim.prediction.operators.recurrent.recover_ssm_work import commit_tokens_for_view
 from mindie_sim.prediction.operators.recurrent.recurrent import _sum_valid_powers
 from mindie_sim.prediction.operators.recurrent.recurrent_template import lower_recurrent_scan, recurrent_scan_classes
-from mindie_sim.prediction.verification import verify_operator
+from mindie_sim.prediction.graph_analysis import verify_operator
 from mindie_sim.schema.case import Software
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.operators import OpSpec

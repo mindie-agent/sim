@@ -13,7 +13,7 @@ from dataclasses import dataclass, replace
 
 from mindie_sim.schema.common import ModelingError
 
-from ..cache_geometry import (
+from ..cache_path.geometry import (
     CacheAccessGeometry,
     drop_last_spans,
     intersect_spans,

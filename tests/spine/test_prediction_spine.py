@@ -23,19 +23,19 @@ from mindie_sim import Case, predict
 from mindie_sim.catalog.expert_slots import expert_slot_plan
 from mindie_sim.compose import compose_case
 from mindie_sim.prediction.capacity import Memory, MemoryPolicy
-from mindie_sim.prediction.cohort_reuse import prepare_cohort_graphs, prove_homogeneous_cohort, rebind_replica_graph
-from mindie_sim.prediction.cost import CostLedger, CostModel
+from mindie_sim.prediction.execution.cohort_reuse import prepare_cohort_graphs, prove_homogeneous_cohort, rebind_replica_graph
+from mindie_sim.prediction.efficiency.cost import CostLedger, CostModel
 from mindie_sim.prediction.efficiency import analyze_network_efficiency, capacity_window
 from mindie_sim.prediction.engine import Engine
 from mindie_sim.prediction.evaluation import BoundedCache, EvaluationContext, ExecutionBindings, FrozenHardwareView
 from mindie_sim.prediction.operators.moe_routing.expert_slot_work import bind_expert_slot_work, physical_slot_work
 from mindie_sim.prediction.frontend import Frontend
 from mindie_sim.prediction.graph_analysis import graph_costs
-from mindie_sim.prediction.graph_cache import SemanticGraphCache, semantic_graph_key
-from mindie_sim.prediction.layer_runs import LayerRunProgram, homogeneous_layer_runs, layer_templates, run_summary
+from mindie_sim.prediction.graph_analysis import SemanticGraphCache, semantic_graph_key
+from mindie_sim.prediction.execution.layer_runs import LayerRunProgram, homogeneous_layer_runs, layer_templates, run_summary
 from mindie_sim.prediction.operator_analysis import target_graphs
-from mindie_sim.prediction.physical_key import physical_id, physical_key, physical_signature
-from mindie_sim.prediction.primitives import PrimitiveStore
+from mindie_sim.prediction.program.physical_key import physical_id, physical_key, physical_signature
+from mindie_sim.prediction.program.primitives import PrimitiveStore
 from mindie_sim.prediction.operators.recurrent.recurrent import serial_context_parallel
 from mindie_sim.prediction.results import StepRequest, StructureRequest
 from mindie_sim.prediction.structure import parse_case

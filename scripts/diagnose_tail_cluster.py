@@ -40,14 +40,14 @@ SIM_ROOT = Path(__file__).resolve().parents[1]
 if str(SIM_ROOT) not in sys.path:
     sys.path.insert(0, str(SIM_ROOT))
 
-from mindie_sim.observations.multilevel_gate import (
+from mindie_sim.observations.multilevel import (
     DEFAULT_THRESHOLD_PCT,
     PERCENT_SCALE,
     TAIL_QUANTILE_P90,
     stream_jsonl,
     validate_provenance_text,
 )
-from mindie_sim.observations.multilevel_stream import iter_json_records_streaming
+from mindie_sim.observations.multilevel import iter_json_records_streaming
 from mindie_sim.schema.common import ModelingError
 
 REGIME_DIMENSIONS = (

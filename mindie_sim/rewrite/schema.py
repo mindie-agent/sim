@@ -17,7 +17,7 @@ from math import isfinite
 from types import UnionType
 from typing import Any, Literal, TypeAlias, get_args, get_origin, get_type_hints
 
-from mindie_sim.prediction.primitives import PrimitiveStore
+from mindie_sim.prediction.program.primitives import PrimitiveStore
 from mindie_sim.prediction.runtime.tile_solver import TilePipelineSpec
 from mindie_sim.prediction.streams import (
     MAIN_STREAM, StreamCoreBudget, StreamEvent, StreamId, StreamLane,

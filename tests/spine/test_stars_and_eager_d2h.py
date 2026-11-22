@@ -20,7 +20,7 @@ from _support.collective_cases import cohort_case
 from mindie_sim import api as sdk_api
 from mindie_sim.backends import ascend
 from mindie_sim.prediction.collectives import RootComplexKey
-from mindie_sim.prediction.cost import CostModel
+from mindie_sim.prediction.efficiency.cost import CostModel
 from mindie_sim.prediction.engine import Allocation, Engine, Resource
 from mindie_sim.prediction.execution import (
     EagerSplitBarrier,
@@ -30,7 +30,7 @@ from mindie_sim.prediction.execution import (
     compute_uncovered_stars_ns,
     is_zero_kernel_view,
 )
-from mindie_sim.prediction.exposed_program import _role_times
+from mindie_sim.prediction.efficiency.exposed_program import _role_times
 from mindie_sim.prediction.graph_analysis import _exposed_breakdown, graph_costs
 from mindie_sim.prediction.operator_analysis import target_graphs, target_operators
 from mindie_sim.public.errors import UnmodeledCapabilityError
@@ -531,7 +531,7 @@ def test_idle_capture_rows_launch_physical_work_and_keep_logical_zero(explicit_i
 
 def test_physical_global_rank_scope_preserves_tp_owner_identity():
     from types import SimpleNamespace
-    from mindie_sim.prediction.body import physical_global_ranks
+    from mindie_sim.prediction.frontend.body_spec import physical_global_ranks
     from mindie_sim.schema.parallel import ParallelSpec
     scope = physical_global_ranks(SimpleNamespace(parallel=ParallelSpec(dp=4, tp=4)), (1, 3))
     assert scope[3] == (12, 13, 14, 15)
@@ -540,7 +540,7 @@ def test_physical_global_rank_scope_preserves_tp_owner_identity():
     assert scope[1][2] == 6
 
 def test_body_geometry_exposes_physical_global_rank_scope_without_relabeling():
-    from mindie_sim.prediction.body import body_forward
+    from mindie_sim.prediction.frontend.body_spec import body_forward
     out = body_forward(_captured_cohort(), phase="decode", tokens=1, context=4,
                        sequences=[1, 0], event_limit=0, compact=True)
     assert out["geometry"]["valid_query_tokens_by_replica"] == {0: 1, 1: 0}
@@ -586,7 +586,7 @@ def test_exposed_breakdown_reconciles_within_limit_and_rejects_large_gap():
     assert unavailable["exposed_breakdown_ms"] is None
     assert unavailable["exposed_breakdown_basis"]["reason"] == ("unreconciled_execution_boundary")
     # A gap larger than a quarter of the reported duration is a real defect.
-    from mindie_sim.prediction.exposed_breakdown import ExposedClocks, finish_breakdown
+    from mindie_sim.prediction.efficiency.exposed_breakdown import ExposedClocks, finish_breakdown
     with pytest.raises(ModelingError, match="exposed_attribution_clock_mismatch"):
         finish_breakdown(ExposedClocks(2.0, 2.0, 2.0, 2.0), duration_ms=10.0, boundary="device_step")
 

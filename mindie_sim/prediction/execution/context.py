@@ -388,7 +388,7 @@ class _ContextMixin:
         recipe = context.program_recipe or recipe
         if context.joint_native_service is not None:
             return KernelProgram((Stage("joint_native_service", context.work),))
-        from ..invocation_binding import lower_invocation
+        from ..program.invocation import lower_invocation
         return lower_invocation(recipe, context)
 
     def transport_options_for(self, op, replica: int = 0, scope: str = "none"):
@@ -440,7 +440,7 @@ class _ContextMixin:
         return apply_stream_owners(self.stream_quota_by_res, context, program)
 
     def prepare(self, op, replica=0):
-        from ..unmodeled_gate import assert_timing_supported
+        from ..efficiency.unmodeled_gate import assert_timing_supported
         assert_timing_supported(None, (op,), entry="execution_prepare")
         stage_key = (replica, op.stage)
         geom = self.stage_geometry[stage_key]
@@ -489,7 +489,7 @@ class _ContextMixin:
                 metadata=meta,
             ), recipe
         res_op, recipe = self.recipes.prepare(op, geom)
-        from ..collective_waves import startup_waves_recipe
+        from ..collectives.waves import startup_waves_recipe
         recipe = startup_waves_recipe(res_op, recipe, startup_mode)
         stage_dies = self.stage_dies.get((replica, res_op.stage))
         if stage_dies:
@@ -574,7 +574,7 @@ class _ContextMixin:
         )
 
     def _context(self, op: Any, replica: int, scope: str, *, recipe=None) -> RecipeContext:
-        from ..collective_waves import startup_waves_recipe
+        from ..collectives.waves import startup_waves_recipe
         from mindie_sim.prediction.operators.collectives.direct_peer import resolve_transport_options
         from mindie_sim.prediction.operators.matrix.matrix_precision import execution_compute_peaks, resolve_matrix_precision
 
@@ -672,7 +672,7 @@ class _ContextMixin:
         return context
 
     def _cached_service_identity(self, op, replica, scope, device):
-        from ..services import service_identity
+        from ..service_regime_domains.services import service_identity
 
         meta = _metadata_dict(op)
         units_key = _DEVICE_UNITS_CACHE.get(id(device))
@@ -922,7 +922,7 @@ class _ContextMixin:
         if max(int(parallel.o_proj_tp), int(parallel.linear_proj_tp),
                int(parallel.lm_head_tp)) <= 1:
             return work
-        from ..local_projection_tp import lower_local_projection_tp
+        from ..sharding.local_tp import lower_local_projection_tp
 
         cohort_views = self._cohort_views
         if cohort_views is None:
@@ -931,7 +931,7 @@ class _ContextMixin:
                               int(parallel.lm_head_tp))
             if (int(parallel.tp) == 1 and local_width > 1
                     and (work.plan.requests or work.mode != "graph")):
-                from ..local_tp_groups import local_tp_replica_cohorts
+                from ..sharding.local_tp import local_tp_replica_cohorts
                 cohorts = local_tp_replica_cohorts(
                     self.case.machine, parallel)
                 peers = next((group for group in cohorts if replica in group),

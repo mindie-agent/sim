@@ -9,8 +9,8 @@
 """
 from collections import defaultdict
 
-from .structure_matrix_contracts import mxfp4_reference_coverage
-from .structure_native_contracts import grouped_situ_contract
+from .structure.native import mxfp4_reference_coverage
+from .structure.native import grouped_situ_contract
 
 # Qwen low-rank hyper-connection kernels own their declared tensor boundary.
 QWEN4_HC_KINDS = frozenset({"Qwen4ExpGatedResidualMix", "Qwen4ExpHcCombine"})

@@ -35,17 +35,17 @@ import pytest
 
 from mindie_sim import graph_costs, predict, target_graphs
 from mindie_sim.catalog.ops import comm_op
-from mindie_sim.prediction.collective_readiness import (
+from mindie_sim.prediction.collectives.readiness import (
     SCHEMA as READINESS_SCHEMA, bind_pipeline_ready, readiness_skew, start_with_pipeline,
 )
-from mindie_sim.prediction.collective_startup import resolve_collective_startup
-from mindie_sim.prediction.collective_waves import WaveGroup, wave_offsets, wave_ranges
+from mindie_sim.prediction.collectives.startup import resolve_collective_startup
+from mindie_sim.prediction.collectives.waves import WaveGroup, wave_offsets, wave_ranges
 from mindie_sim.prediction.collectives import RingCollective, RingGroup
 from mindie_sim.prediction.communication import MessageFlow, RoutedHop, RoutedMessage
 from mindie_sim.prediction.engine import Allocation, Engine, Resource
 from mindie_sim.prediction.execution import _collective_native_basis
 from mindie_sim.prediction.operators.collectives.hccl_signals import SignalGroup
-from mindie_sim.prediction.peer_traffic import PeerTraffic
+from mindie_sim.prediction.collectives.peer_traffic import PeerTraffic
 from mindie_sim.prediction.program import RecipeBook
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.prediction.topology import Topology, TransportOptions

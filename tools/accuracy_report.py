@@ -11,10 +11,10 @@ from dataclasses import replace
 from pathlib import Path
 
 from mindie_sim.__main__ import emit, read_json
-from mindie_sim.observations.accuracy import accuracy_report
-from mindie_sim.observations.store import digest_file
+from mindie_sim.observations.comparison import accuracy_report
+from mindie_sim.observations.captures import digest_file
 from mindie_sim.prediction.graph_analysis import graph_costs
-from mindie_sim.prediction.services import ServiceCurve, service_identity
+from mindie_sim.prediction.service_regime_domains.services import ServiceCurve, service_identity
 from tools.measure.replay_memory_service import copy_at, probe_inputs
 
 

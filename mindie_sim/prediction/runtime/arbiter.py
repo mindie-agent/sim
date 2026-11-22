@@ -162,6 +162,77 @@ def _partition_coupled_components(resources, tasks, active):
     return coupled_keys, uncoupled_keys
 
 
+def _independent_component_rates(resources, tasks, active, placed_active):
+    contenders: dict[str, dict[int, float]] = {}
+    for key in sorted(active):
+        task = tasks[key]
+        caps = task.caps
+        for name in task.remaining:
+            row = contenders.get(name)
+            val = caps.get(name, math.inf) if caps else math.inf
+            if row is None:
+                contenders[name] = {key: val}
+            else:
+                row[key] = val
+    probe_placed = placed_active != 0
+    result = {}
+    for name, caps in contenders.items():
+        resource = resources[name]
+        if resource.policy == "fifo":
+            winner = fifo_winner(caps, tasks)
+            result[name] = {winner: min(resource.rate, caps[winner])}
+            continue
+        n_c = len(caps)
+        if n_c == 1:
+            key, cap = next(iter(caps.items()))
+            t_one = tasks[key]
+            prep = getattr(t_one, "prepared", None)
+            if prep is not None and prep.solo_rates is not None:
+                result[name] = {key: prep.solo_rates[name]}
+                continue
+            if probe_placed:
+                pl = t_one.placement
+                if pl and name in pl:
+                    lim = resource.rate / resource.units * len(pl[name])
+                    result[name] = {key: cap if cap < lim else lim}
+                    continue
+            r_rate = resource.rate
+            result[name] = {key: cap if cap < r_rate else r_rate}
+            continue
+        if not probe_placed or resource.units == 1:
+            result[name] = _max_min_rates(resource.rate, caps)
+            continue
+        if n_c == 2:
+            (k0, c0), (k1, c1) = caps.items()
+            p0, p1 = tasks[k0].placement, tasks[k1].placement
+            u0 = p0.get(name) if p0 else None
+            u1 = p1.get(name) if p1 else None
+            if u0 is None and u1 is None:
+                result[name] = _max_min_rates(resource.rate, caps)
+                continue
+            if u0 is not None and u1 is not None:
+                if u0 == u1:
+                    result[name] = _max_min_rates(
+                        resource.rate / resource.units * len(u0), caps)
+                    continue
+                if set(u0).isdisjoint(u1):
+                    ur = resource.rate / resource.units
+                    l0, l1 = ur * len(u0), ur * len(u1)
+                    result[name] = {k0: c0 if c0 < l0 else l0,
+                                    k1: c1 if c1 < l1 else l1}
+                    continue
+        pinned = {}
+        for key in caps:
+            pl = tasks[key].placement
+            if pl:
+                u = pl.get(name)
+                if u is not None:
+                    pinned[key] = u
+        result[name] = (unit_rates(resource.rate, resource.units, caps, pinned)
+                        if pinned else _max_min_rates(resource.rate, caps))
+    return result
+
+
 def component_rates(resources, tasks, active, *, coupled_solver=None,
                     coupled_active: int | None = None,
                     placed_active: int | None = None,
@@ -279,74 +350,7 @@ def component_rates(resources, tasks, active, *, coupled_solver=None,
                     return {name: {reverse[proxy]: value
                                    for proxy, value in components.items()}
                             for name, components in rates.items()}
-    contenders: dict[str, dict[int, float]] = {}
-    for key in sorted(active):
-        task = tasks[key]
-        caps = task.caps
-        for name in task.remaining:
-            row = contenders.get(name)
-            val = caps.get(name, math.inf) if caps else math.inf
-            if row is None:
-                contenders[name] = {key: val}
-            else:
-                row[key] = val
-    probe_placed = placed_active != 0
-    result = {}
-    for name, caps in contenders.items():
-        resource = resources[name]
-        if resource.policy == "fifo":
-            winner = fifo_winner(caps, tasks)
-            result[name] = {winner: min(resource.rate, caps[winner])}
-            continue
-        n_c = len(caps)
-        if n_c == 1:
-            key, cap = next(iter(caps.items()))
-            t_one = tasks[key]
-            prep = getattr(t_one, "prepared", None)
-            if prep is not None and prep.solo_rates is not None:
-                result[name] = {key: prep.solo_rates[name]}
-                continue
-            if probe_placed:
-                pl = t_one.placement
-                if pl and name in pl:
-                    lim = resource.rate / resource.units * len(pl[name])
-                    result[name] = {key: cap if cap < lim else lim}
-                    continue
-            r_rate = resource.rate
-            result[name] = {key: cap if cap < r_rate else r_rate}
-            continue
-        if not probe_placed or resource.units == 1:
-            result[name] = _max_min_rates(resource.rate, caps)
-            continue
-        if n_c == 2:
-            (k0, c0), (k1, c1) = caps.items()
-            p0, p1 = tasks[k0].placement, tasks[k1].placement
-            u0 = p0.get(name) if p0 else None
-            u1 = p1.get(name) if p1 else None
-            if u0 is None and u1 is None:
-                result[name] = _max_min_rates(resource.rate, caps)
-                continue
-            if u0 is not None and u1 is not None:
-                if u0 == u1:
-                    result[name] = _max_min_rates(
-                        resource.rate / resource.units * len(u0), caps)
-                    continue
-                if set(u0).isdisjoint(u1):
-                    ur = resource.rate / resource.units
-                    l0, l1 = ur * len(u0), ur * len(u1)
-                    result[name] = {k0: c0 if c0 < l0 else l0,
-                                    k1: c1 if c1 < l1 else l1}
-                    continue
-        pinned = {}
-        for key in caps:
-            pl = tasks[key].placement
-            if pl:
-                u = pl.get(name)
-                if u is not None:
-                    pinned[key] = u
-        result[name] = (unit_rates(resource.rate, resource.units, caps, pinned)
-                        if pinned else _max_min_rates(resource.rate, caps))
-    return result
+    return _independent_component_rates(resources, tasks, active, placed_active)
 
 
 def service_step(rates: Mapping[str, Mapping[int, float]], tasks, dt: float):

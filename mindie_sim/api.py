@@ -21,7 +21,7 @@ from typing import Any
 
 from mindie_sim.compose import compose_case as _compose_case_dict
 from mindie_sim.prediction.offload.policy import missing_scenario_error
-from mindie_sim.prediction.primitives import PrimitiveStore
+from mindie_sim.prediction.program.primitives import PrimitiveStore
 from mindie_sim.prediction.results import (
     CaseInput,
     HardwareInput,
@@ -168,7 +168,7 @@ def solve_optimal_deployment(
     **kwargs: Any,
 ) -> dict[str, Any]:
     """Jointly optimize PD Disaggregated vs Colocated + MTP under Domain 1/2/3."""
-    from mindie_sim.sweep_pd import solve_optimal_deployment as _solve_optimal
+    from mindie_sim.sweep.pd import solve_optimal_deployment as _solve_optimal
 
     model_arg: Any = str(model) if isinstance(model, Path) else (
         deepcopy(dict(model)) if isinstance(model, Mapping) else model
@@ -208,7 +208,7 @@ def sweep_topology(
     parsed = _to_case(case)
     if str(getattr(request, "mode", "")).strip().lower() == "auto":
         from mindie_sim.prediction.results import TopologyPoint
-        from mindie_sim.sweep_pd import solve_optimal_deployment as _solve_optimal
+        from mindie_sim.sweep.pd import solve_optimal_deployment as _solve_optimal
 
         total_dies = (
             int(request.device_counts[0])

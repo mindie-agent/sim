@@ -17,17 +17,17 @@ from typing import Any
 import pytest
 
 from mindie_sim import compose_case, graph_costs, predict
-from mindie_sim.prediction import dispatch
+from mindie_sim.prediction.execution import dispatch
 from mindie_sim.prediction.api import run_cohort
 from mindie_sim.prediction.operators.attention.attention import AttentionPolicy
 from mindie_sim.prediction.capacity import Memory, MemoryPolicy
-from mindie_sim.prediction.cost import CostModel
+from mindie_sim.prediction.efficiency.cost import CostModel
 from mindie_sim.prediction.execution import Execution
 from mindie_sim.prediction.frontend import Frontend
 from mindie_sim.prediction.operator_analysis import target_operators
 from mindie_sim.prediction.service_regime_domains import compile_service_regime_domains
-from mindie_sim.prediction.services import service_identity
-from mindie_sim.prediction.speculation import draft_program
+from mindie_sim.prediction.service_regime_domains.services import service_identity
+from mindie_sim.prediction.frontend.speculation import draft_program
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.prediction.scheduler import Scheduler
 from mindie_sim.schema.common import ModelingError

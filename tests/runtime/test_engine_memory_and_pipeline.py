@@ -18,11 +18,11 @@ import pytest
 
 from _support.axes import ALL_SKUS
 from mindie_sim import compose_case
-from mindie_sim.prediction.cost import CostModel
-from mindie_sim.prediction.coupled import coupled_rates
+from mindie_sim.prediction.efficiency.cost import CostModel
+from mindie_sim.prediction.runtime.coupled import coupled_rates
 from mindie_sim.prediction.engine import Engine, OccurrenceKey, Resource
 from mindie_sim.prediction.execution import Execution
-from mindie_sim.prediction.operator_replay import operator_costs
+from mindie_sim.prediction.execution.operator_replay import operator_costs
 from mindie_sim.prediction.operators.matrix import refill_steady
 from mindie_sim.prediction.ownership import unit_rates
 import mindie_sim.prediction.program as prog_pkg

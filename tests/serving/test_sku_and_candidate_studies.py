@@ -29,8 +29,8 @@ from mindie_sim.__main__ import main, parser, run
 from mindie_sim.compose import compose_case
 from mindie_sim.prediction.efficiency import analyze_network_efficiency, scale_case_hardware, solve_sla_sizing
 from mindie_sim.prediction.frontend import Frontend
-from mindie_sim.prediction.layer_runs import homogeneous_layer_runs
-from mindie_sim.prediction.physical_key import physical_key
+from mindie_sim.prediction.execution.layer_runs import homogeneous_layer_runs
+from mindie_sim.prediction.program.physical_key import physical_key
 from mindie_sim.prediction.program import KernelProgram, PipelineProgram, Stage
 from mindie_sim.prediction.runtime.engine import Engine, Resource
 from mindie_sim.prediction.structure import parse_case
@@ -40,7 +40,7 @@ from mindie_sim.schema.parallel import ParallelSpec
 from mindie_sim.schema.workload import IterationPlan, RequestView
 from mindie_sim.sku_comparison import compare_skus
 from mindie_sim.sweep import sweep_topologies
-from mindie_sim.sweep_engine import compute_sweep_candidate_id
+from mindie_sim.sweep.engine import compute_sweep_candidate_id
 from tools.model_convergence import (compare_runs, fingerprint, representative_probes,
                                      retained_gemm_impact, run_probe, select_probes)
 from tools.modeling_priority import cost_ranking, residual_ranking
@@ -567,7 +567,7 @@ def test_shared_page_release_async_consumer_retirement_and_grant_wakeups():
 def test_regime_physical_rate_guards_duplicate_ids_and_member_mismatches():
     from mindie_sim import graph_costs
     from mindie_sim.prediction.service_regime_domains import validate_service_regime_domains
-    from mindie_sim.prediction.service_regimes import RegimePolicy
+    from mindie_sim.prediction.service_regime_domains.regimes import RegimePolicy
     from mindie_sim.schema.common import ModelingError
     from _support.kernel_invocation import copy_op
     from _support.operator_cases import gqa_decode_hardware, hardware_case

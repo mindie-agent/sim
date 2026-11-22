@@ -24,19 +24,19 @@ from dataclasses import replace
 import pytest
 
 from mindie_sim import graph_costs, operator_costs, predict, target_graphs
-from mindie_sim.prediction.call import call_costs
-from mindie_sim.prediction.cost import CostModel, primitive_key
+from mindie_sim.prediction.call_builders import call_costs
+from mindie_sim.prediction.efficiency.cost import CostModel, primitive_key
 from mindie_sim.prediction.engine import Allocation, Engine, Resource
 from mindie_sim.prediction.execution import Execution, SubmissionPolicy
 from mindie_sim.prediction.operators.grouped_moe.grouped_dequant import build as build_grouped_dequant
 from mindie_sim.prediction.instructions import (
     CONTROL_INSTRUCTIONS, InstructionClass, InstructionCount, InstructionInventory,
     PrimitiveInventory)
-from mindie_sim.prediction.invocation import InvocationProgram
+from mindie_sim.prediction.program.invocation import InvocationProgram
 from mindie_sim.prediction.mechanism import OperatorPlan, PlannedRecipe, Work
-from mindie_sim.prediction.primitives import PrimitiveStore
+from mindie_sim.prediction.program.primitives import PrimitiveStore
 from mindie_sim.prediction.program import KernelProgram, RecipeBook, RecipeContext, Stage
-from mindie_sim.prediction.services import ResourceService
+from mindie_sim.prediction.service_regime_domains.services import ResourceService
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.hardware import Hardware
 from mindie_sim.schema.invocation import InvocationTiming

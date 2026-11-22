@@ -17,7 +17,7 @@ import json
 import math
 
 from .prediction.api import predict
-from .prediction.dispatch import cohorts
+from .prediction.execution.dispatch import cohorts
 from .prediction.efficiency import attribute_program
 from .prediction.graph_analysis import graph_costs
 from .prediction.operator_analysis import operator_costs, target_graphs

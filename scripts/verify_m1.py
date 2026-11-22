@@ -593,7 +593,7 @@ def _rss_mib() -> float | None:
 
 
 def _count_constructions() -> dict:
-    from mindie_sim.prediction.cost import CostModel
+    from mindie_sim.prediction.efficiency.cost import CostModel
     from mindie_sim.prediction.evaluation import ExecutionBindings
     counts = {"cost_models": 0, "bindings": 0}
     original_cost = CostModel.__init__

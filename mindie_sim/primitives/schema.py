@@ -498,7 +498,7 @@ class _FramedCollectiveBand(CollectiveBandSpec):
 
 def _submit_stars_plan(engine, stars_spec, stars_plan, after, name):
     """Submit a descriptor sequence through production ``StarsDescriptorQueue``."""
-    from mindie_sim.prediction.execution.step_helpers import StarsDescriptorQueue
+    from mindie_sim.prediction.execution.runner import StarsDescriptorQueue
 
     die, ns, desc_rows = stars_plan
     queue = StarsDescriptorQueue(stars_spec, die_id=die, namespace=ns)

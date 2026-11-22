@@ -33,7 +33,7 @@ from mindie_sim.api import (
     sweep_topology,
 )
 from mindie_sim.prediction.api import predict
-from mindie_sim.prediction.call import call_costs
+from mindie_sim.prediction.call_builders import call_costs
 from mindie_sim.prediction.graph_analysis import graph_costs
 from mindie_sim.prediction.operator_analysis import operator_costs
 

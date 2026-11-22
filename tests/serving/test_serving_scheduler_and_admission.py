@@ -26,13 +26,13 @@ from copy import deepcopy
 import pytest
 from mindie_sim import target_operators
 from mindie_sim.compose import assemble
-from mindie_sim.prediction import dispatch
+from mindie_sim.prediction.execution import dispatch
 from mindie_sim.prediction.api import predict, run_cohort, simulate_service
 from mindie_sim.prediction.capacity import Memory, MemoryPolicy
-from mindie_sim.prediction.decode_probe import decode_windows, probe_capacity
+from mindie_sim.prediction.execution.decode_probe import decode_windows, probe_capacity
 from mindie_sim.prediction.frontend import Frontend
 from mindie_sim.prediction.scheduler import Scheduler
-from mindie_sim.prediction.sequence_parallel import DECLARATION
+from mindie_sim.prediction.sharding.sequence_parallel import DECLARATION
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.operators import AllocationEffect

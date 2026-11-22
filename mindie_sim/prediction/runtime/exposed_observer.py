@@ -27,12 +27,12 @@ from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
 from mindie_sim.schema.common import ModelingError
-from ..exposed_breakdown import (
+from ..efficiency.exposed_breakdown import (
     ExposedClocks, advance_clocks, control_clocks, cube_clocks,
     finish_breakdown, join_clocks, memory_clocks, roofline_clocks,
     unavailable_breakdown, vector_clocks, communication_clocks,
 )
-from ..exposed_program import (
+from ..efficiency.exposed_program import (
     ROLE_COMMUNICATION, ROLE_CONTROL, ROLE_COUPLED, ROLE_CUBE, ROLE_MEMORY,
     ROLE_VECTOR, StageDescriptor, declarations_from_program,
 )

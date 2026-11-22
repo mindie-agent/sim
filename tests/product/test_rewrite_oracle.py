@@ -26,11 +26,11 @@ from mindie_sim.optimization import (
 )
 from mindie_sim.optimization import contracts
 from mindie_sim.optimization.dsl_solver import _catlass_proposals, _dsl_proposals
-from mindie_sim.prediction.cost import CostLedger, CostModel
+from mindie_sim.prediction.efficiency.cost import CostLedger, CostModel
 from mindie_sim.prediction.efficiency.analysis import scale_case_hardware
 from mindie_sim.prediction.evaluation import EvaluationContext, ExecutionBindings
 from mindie_sim.prediction.execution import Execution
-from mindie_sim.prediction.primitives import PrimitiveStore
+from mindie_sim.prediction.program.primitives import PrimitiveStore
 from mindie_sim.prediction.program import Stage
 from mindie_sim.prediction.results import StepRequest
 from mindie_sim.prediction.spine import PredictionSpine

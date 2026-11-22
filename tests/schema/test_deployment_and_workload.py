@@ -28,13 +28,13 @@ from mindie_sim.catalog.ops import gemm_op
 from mindie_sim.catalog.projection_placement import projection_placement, projection_slices
 from mindie_sim.catalog.weight_terms import WeightTerm, term_bytes
 from mindie_sim.catalog.weights import body_head_terms, layer_weight_terms
-from mindie_sim.cli_options import add_runtime_arguments, case_overrides
+from mindie_sim.cli.options import add_runtime_arguments, case_overrides
 from mindie_sim.compose import assemble
 from mindie_sim.model_catalog import load_model
 from mindie_sim.prediction.capacity import Memory
-from mindie_sim.prediction.dispatch import cohorts
+from mindie_sim.prediction.execution.dispatch import cohorts
 from mindie_sim.prediction.operators.moe_routing.expert_slot_work import bind_expert_slot_work, physical_slot_work
-from mindie_sim.prediction.local_projection_tp import lower_local_projection_tp
+from mindie_sim.prediction.sharding.local_tp import lower_local_projection_tp
 from mindie_sim.prediction.lowering import Builder
 from mindie_sim.prediction.projections import kda_projections
 from mindie_sim.prediction.topology import Topology

@@ -18,12 +18,12 @@ from mindie_sim.schema.common import ModelingError as ModelingError, dtype_bytes
 from mindie_sim.schema.operators import FieldDisposition as FieldDisposition
 from mindie_sim.schema.tensors import TensorLayout as TensorLayout, TensorValue as TensorValue
 
-from . import implementation_audit as _audit
-from . import implementation_registry as _registry
-from . import typed_values as _typed
-from . import value_rewrite as _rewrite
-from . import value_uses as _uses
-from .implementation_audit import (
+from .program import implementation_audit as _audit
+from .program import implementation_registry as _registry
+from .values import typed as _typed
+from .values import rewrite as _rewrite
+from .values import uses as _uses
+from .program.implementation_audit import (
     _audit_outputs as _audit_outputs,
     append_audit as append_audit,
     audit_boundary as audit_boundary,
@@ -37,7 +37,7 @@ from .implementation_audit import (
     replaced_occurrences as replaced_occurrences,
     semantic_attrs as semantic_attrs,
 )
-from .implementation_registry import (
+from .program.implementation_registry import (
     IMPLEMENTATIONS as IMPLEMENTATIONS,
     Implementation as Implementation,
     Selection as Selection,
@@ -47,7 +47,7 @@ from .implementation_registry import (
     recipes as recipes,
     select as select,
 )
-from .typed_values import (
+from .values.typed import (
     _contiguous_strides as _contiguous_strides,
     _declared_output_geometry as _declared_output_geometry,
     _json_identity as _json_identity,
@@ -62,7 +62,7 @@ from .typed_values import (
     typed_roles as typed_roles,
     typed_value as typed_value,
 )
-from .value_rewrite import (
+from .values.rewrite import (
     _SINGLE_DEP as _SINGLE_DEP,
     _move_access_slots as _move_access_slots,
     add_input_ports as add_input_ports,
@@ -73,7 +73,7 @@ from .value_rewrite import (
     rewire_value_graph as rewire_value_graph,
     set_input_ports as set_input_ports,
 )
-from .value_uses import (
+from .values.uses import (
     _FIRST_SLOT as _FIRST_SLOT,
     _LAST_ENTRY as _LAST_ENTRY,
     _PRODUCER_FIELDS as _PRODUCER_FIELDS,

@@ -23,14 +23,14 @@ from mindie_sim.catalog.ops import comm_op
 from mindie_sim.prediction.collectives.ring_pairwise import PairwiseCollective, RingCollective
 from mindie_sim.prediction.evaluation import ACTIVE_DEADLINE_MONO, EvaluationContext
 from mindie_sim.prediction.execution.split_barrier import DEFAULT_SPLIT_DTYPE_BYTES
-from mindie_sim.prediction.execution.step_helpers import EAGER_MOE_DISPATCH_RECIPES
+from mindie_sim.prediction.execution.runner import EAGER_MOE_DISPATCH_RECIPES
 from mindie_sim.prediction.operators.grouped_moe.expected_grouped import ExpectedGroupedMatmul
-from mindie_sim.prediction.fusion_bridge import _canonical_hardware
-from mindie_sim.prediction.fusion_pool import register_recipe
+from mindie_sim.prediction.fusion.bridge import _canonical_hardware
+from mindie_sim.prediction.fusion.pool import register_recipe
 from mindie_sim.prediction.graph_analysis import graph_costs
 from mindie_sim.prediction.mechanism import Work
 from mindie_sim.prediction.operators.moe_transport.moe_callers import RoutingPolicy
-from mindie_sim.prediction.primitives import PrimitiveStore
+from mindie_sim.prediction.program.primitives import PrimitiveStore
 from mindie_sim.prediction.program import KernelProgram, RecipeBook, Stage
 from mindie_sim.prediction.results import ReplayOptions, StepEvaluation, StepRequest
 from mindie_sim.prediction.runtime.tile_solver import TilePipelineSpec

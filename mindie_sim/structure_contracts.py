@@ -10,8 +10,8 @@
 """
 import math
 
-from .structure_matrix_contracts import matrix_comparison_scope, matrix_contract
-from .structure_native_contracts import (
+from .structure.native import matrix_comparison_scope, matrix_contract
+from .structure.native import (
     attention_contract, cache_contract, gated_norm_contract, gemma_norm_contract,
     layer_norm_contract, transpose_batchmatmul_contract, add_rmsnorm_bias_contract,
 )

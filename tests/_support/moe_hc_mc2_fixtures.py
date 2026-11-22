@@ -21,7 +21,7 @@ from mindie_sim.catalog.types import QuantSpec
 from mindie_sim.prediction.operators.hyper_connections.native_fusion_hc_regbase import POST_PROFILE, PRE_PROFILE
 from mindie_sim.prediction.mechanism import Geometry
 from mindie_sim.prediction.operators.moe_routing.moe_init_mxfp8 import RECIPE
-from mindie_sim.prediction.rewrite_ffn_rules import router_gemm
+from mindie_sim.prediction.sharding.ffn_rules import router_gemm
 from mindie_sim.prediction.program import KernelProgram, ParallelProgram, PipelineProgram, RecipeContext
 from mindie_sim.prediction.structure import parse_case
 

@@ -46,7 +46,25 @@ flowchart TB
 
 ## Quick Start
 
-Copy and paste the line below to Codex, Claude Code, Kimi Code, DeepSeek Harness (DSH), or Google Antigravity (AGY) so your AI Agent installs and verifies `mindie-sim` automatically:
+### One-Shot Evaluation & Launch-Script Audit (Recommended First Step)
+
+`mindie-sim report` automatically solves HBM-safe parallelism (`DP/TP/EP/DCP/PP` + concurrency) and chip-matched `auto_va` production quantization (**preferring `*-QuaRot` checkpoints / `msmodelslim` QuaRot outlier rotation**), emitting a comparison `.xlsx`, a MindStudio Insight `trace_view.json`, a compact `<8 KB` `*_agent_brief.json`, and a stdout Markdown digest in one command:
+
+```bash
+# 1. Zero-config catalog evaluation (auto-solves parallelism & quant -> .xlsx + trace + agent_brief.json)
+mindie-sim report --model kimi-k3.1 --hardware 950dt --num-devices 32 --context 128k --out-dir ./out
+
+# 2. Zero-exec static audit of a user serve.sh (emits *_optimized_serve.sh + two-step speedup)
+mindie-sim report --from-script ./serve.sh --hardware a3 --out-dir ./out
+
+# 3. True blind-box model (point --model directly at an uncataloged HuggingFace config.json or directory)
+mindie-sim report --model ./new_hf_model/config.json --hardware a3 --tpot-ms 20 --out-dir ./out
+
+# 4. Print <45-line golden commands, hardware/quant aliases & 3-step Agent loop
+mindie-sim quickstart
+```
+
+Or copy and paste the line below to Codex, Claude Code, Kimi Code, DeepSeek Harness (DSH), or Google Antigravity (AGY) so your AI Agent installs and verifies `mindie-sim` automatically:
 
 ```text
 Please install and configure https://github.com/mindie-agent/sim for me
@@ -69,12 +87,14 @@ If you are an AI Agent receiving the prompt above, execute the following steps t
      ```
 3. **Verify CLI & Model Catalog**:
    ```bash
+   mindie-sim quickstart
    mindie-sim catalog
    mindie-sim predict examples/quickstart.json
    ```
-4. **Agent Optimization Workflow**:
-   - Before writing or modifying custom kernels, fusion patterns, or parallel layouts (`TP`/`DP`/`EP`/`PP`/`DCP`/`DSA-CP`/`PCP`), run `mindie-sim operators`, `mindie-sim graph`, `mindie-sim predict`, or `mindie-sim study` to quantify stage latencies and resource bottlenecks.
-   - To evaluate 4D efficiency (`Cube_MFU`, `Vec_MFU`, `MBU`, `Link_Util`, `CV_Overlap`), the five-level Primal-Dual certified ladder, or SLA-constrained maximum throughput, call `analyze_network_efficiency`, `optimize_ladder`, and `solve_sla_sizing` from `mindie_sim`.
+4. **3-Step Agent Optimization Workflow (see `skills/mindie-sim/SKILL.md`)**:
+   - Run `mindie-sim report` first (or `mindie-sim report --from-script <serve.sh>` when auditing a launch script)—never hand-author raw `Case` JSONs for routine evaluations.
+   - Read `<prefix>_agent_brief.json` (`< 8 KB`) for KPIs, bottlenecks, and Sheet 4 `card_id`s—never write XML scrapers for `.xlsx`.
+   - Present the 3-Track action plan (`Config/Env`, `Framework`, `Kernels`, defaulting to `auto_va` production quant with `*-QuaRot` checkpoint priority) and link `.xlsx` + `trace_view.json`; pass `--kernel-csv` when real `msprof` data exists or `--kernel-designs-json` for Pass-2 deep kernel co-design.
 
 </details>
 
@@ -187,6 +207,9 @@ The full reproducible NPU profiling benchmark dataset is published on HuggingFac
 
 | Subcommand | Purpose | Example |
 | --- | --- | --- |
+| `mindie-sim report` | **Turnkey evaluation & script audit**: auto-solves parallelism & `auto_va` quant (supports `--from-script`, blind-box `config.json`, `--kernel-csv`), emitting `.xlsx` + `trace_view.json` + `*_agent_brief.json` | `mindie-sim report --model kimi-k3.1 --hardware 950dt --num-devices 32 --context 128k --out-dir ./out` |
+| `mindie-sim quickstart` | Print `< 45`-line golden commands, hardware/quant aliases (`QuaRot`-first), and the 3-step Agent loop (`--json` supported) | `mindie-sim quickstart` |
+| `mindie-sim solve` / `export` | One-shot PD/colocated deployment solver and fixed-parallel `.xlsx`/`trace_view.json` exporter | `mindie-sim solve --model qwen3.8-flash-next --hardware 950dt-96g-pod --num-devices 16 --prompt-tokens 32768 --output-tokens 1024 --tpot-slo-ms 25` |
 | `mindie-sim predict` | End-to-end serving or body-forward (`--scope serving\|body`) performance prediction | `mindie-sim predict examples/quickstart.json` |
 | `mindie-sim inspect` | Parse a Case and emit normalized model structure, KV memory plan, and lowered operators | `mindie-sim inspect examples/quickstart.json` |
 | `mindie-sim operators` | Evaluate isolated device resource costs for each operator in a Prefill/Decode pass (supports `--draft-prepare`) | `mindie-sim operators examples/quickstart.json --phase decode --tokens 1` |

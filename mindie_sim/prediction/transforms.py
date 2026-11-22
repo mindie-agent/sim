@@ -25,12 +25,12 @@ from .implementations import (
     merge_typed_roles, producer_input_values, produced_values,
     typed_outputs,
 )
-from .rewrite_ffn_rules import (
+from .sharding.ffn_rules import (
     activation_quant_fusion,
     gmm_swiglu_quant_fusion,
     moe_tail_residual_fusion,
 )
-from .rewrite_indexer_rules import online_indexer_topk
+from .rewrite import online_indexer_topk
 from .rewrite_mhc_rules import (
     MHC_DEFAULT_CUTOFF_ROWS,
     gdn_projection_overlap,
@@ -405,7 +405,7 @@ def lower_implementations(ops, runtime, source_dtype, *, passes=None, resource_f
             if generated:
                 for identifier, value in generated.items():
                     capture_state.setdefault(identifier, value)
-    from mindie_sim.prediction.operators.context_parallel.graph import rewrite_quantized_allreduce
+    from mindie_sim.prediction.sharding.context_parallel import rewrite_quantized_allreduce
     ops = rewrite_quantized_allreduce(ops, runtime, source_dtype)
     ops = lower_operators(ops, bindings, activation_quantized=activation_quantized, final=True)
     ops = lower_shared_experts(ops, bindings)

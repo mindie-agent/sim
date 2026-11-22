@@ -22,14 +22,14 @@ from _support.collective_cases import (
 from _support.kernel_invocation import fork, lower_copy, op
 
 from mindie_sim import graph_costs, operator_costs, predict, target_graphs
-from mindie_sim.prediction.body import body_forward
+from mindie_sim.prediction.frontend.body_spec import body_forward
 from mindie_sim.prediction.collectives import PairwiseCollective
-from mindie_sim.prediction.cost import primitive_key
+from mindie_sim.prediction.efficiency.cost import primitive_key
 from mindie_sim.prediction.engine import Allocation, Engine, Resource
 from mindie_sim.prediction.execution import Execution, launch_native_cohort
 from mindie_sim.prediction.operators.mc2.mc2_program import Mc2LaunchView
-from mindie_sim.prediction.participant_profile import normalise, select_call
-from mindie_sim.prediction.primitives import PrimitiveStore
+from mindie_sim.prediction.graph_analysis import normalise, select_call
+from mindie_sim.prediction.program.primitives import PrimitiveStore
 from mindie_sim.prediction.program import KernelProgram, NativeProgram, RecipeContext, Stage
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.common import ModelingError

@@ -19,7 +19,7 @@ from mindie_sim.schema.model import RequestSpec
 from mindie_sim.schema.speculative import SpeculativeSpec
 from mindie_sim.schema.workload import RequestView
 
-from ..serving_io import TokenTimeline
+from ..execution.serving_io import TokenTimeline
 
 _DRAFT_ACCEPTANCE_HASH_BITS = 64
 

@@ -46,7 +46,25 @@ flowchart TB
 
 ## 快速开始
 
-直接复制下面这句话发给你的 Codex、Claude Code、Kimi Code、DeepSeek Harness（DSH）或 Google Antigravity（AGY），由 AI Agent 自动完成 `mindie-sim` 的安装与校验：
+### 一行开箱即用评估与启动脚本调优（推荐首选）
+
+`mindie-sim report` 默认自动求解 HBM 安全的并行策略（`DP/TP/EP/DCP/PP` + 并发）与芯片匹配的 `auto_va` 生产量化（**优先推荐 `*-QuaRot` 权重 / `msmodelslim` QuaRot 离群值旋转**），一次运行即可输出 `.xlsx` 对比表、`trace_view.json`（MindStudio Insight 原生打开）、紧凑 `<8 KB` 的 `*_agent_brief.json` 与终端 Markdown 结论摘要：
+
+```bash
+# 1. 零配置目录模型评估（自动求解并行与量化 -> .xlsx + trace + agent_brief.json）
+mindie-sim report --model kimi-k3.1 --hardware 950dt --num-devices 32 --context 128k --out-dir ./out
+
+# 2. 零执行静态审计用户启动脚本 serve.sh（自动生成 *_optimized_serve.sh 并量化两阶段收益）
+mindie-sim report --from-script ./serve.sh --hardware a3 --out-dir ./out
+
+# 3. 盲盒新模型（直接传入未入库的 HuggingFace config.json 或本地模型目录）
+mindie-sim report --model ./new_hf_model/config.json --hardware a3 --tpot-ms 20 --out-dir ./out
+
+# 4. 查看 45 行速查手册、硬件别名与量化默认策略
+mindie-sim quickstart
+```
+
+或者直接复制下面这句话发给你的 Codex、Claude Code、Kimi Code、DeepSeek Harness（DSH）或 Google Antigravity（AGY），由 AI Agent 自动完成 `mindie-sim` 的安装与校验：
 
 ```text
 帮我安装并配置 https://github.com/mindie-agent/sim
@@ -69,12 +87,14 @@ flowchart TB
      ```
 3. **验证 CLI 与内置模型目录可用**：
    ```bash
+   mindie-sim quickstart
    mindie-sim catalog
    mindie-sim predict examples/quickstart.json
    ```
-4. **Agent 调优工作流规范**：
-   - 在编写或修改算子、融合子图或调整并行配置（`TP`/`DP`/`EP`/`PP`/`DCP`/`DSA-CP`/`PCP`）前，先使用 `mindie-sim operators`、`mindie-sim graph`、`mindie-sim predict` 或 `mindie-sim study` 评估各层耗时与瓶颈。
-   - 需要评估四维效率（`Cube_MFU`、`Vec_MFU`、`MBU`、`Link_Util`、`CV_Overlap`）、五级 Primal-Dual 认证优化阶梯或 Decode SLA 最大吞吐时，直接调用 `mindie_sim` 中的 `analyze_network_efficiency`、`optimize_ladder` 与 `solve_sla_sizing`。
+4. **Agent 三步调优工作流规范（参见 `skills/mindie-sim/SKILL.md`）**：
+   - 优先调用 `mindie-sim report`（或用户提供脚本时使用 `mindie-sim report --from-script <serve.sh>`），切勿手写原始 `Case` JSON。
+   - 直接读取 `<prefix>_agent_brief.json`（`< 8 KB`）获取完整 KPI、瓶颈与 Sheet 4 `card_id`，切勿编写 XML 脚本解析二进制 `.xlsx`。
+   - 按三轨行动清单（`Config/Env`、`Framework`、`Kernels`，默认 `auto_va` 生产量化且优先 `*-QuaRot` 权重）向用户汇报结论并附带 `.xlsx` 与 `trace_view.json`；有实测 profiling 时附带 `--kernel-csv kernel_details.csv`，需要写深度代码设计时用 `--kernel-designs-json` 二次出表。
 
 </details>
 
@@ -187,6 +207,9 @@ flowchart TB
 
 | 子命令 | 典型用途 | 示例 |
 | --- | --- | --- |
+| `mindie-sim report` | **开箱即用一键评估/脚本审计**：自动求解并行与 `auto_va` 量化（支持 `--from-script`、盲盒 `config.json`、`--kernel-csv`），输出 `.xlsx` + `trace_view.json` + `*_agent_brief.json` | `mindie-sim report --model kimi-k3.1 --hardware 950dt --num-devices 32 --context 128k --out-dir ./out` |
+| `mindie-sim quickstart` | 输出 `< 45` 行黄金命令、硬件/量化别名（`QuaRot` 优先）与 Agent 三步闭环（支持 `--json`） | `mindie-sim quickstart` |
+| `mindie-sim solve` / `export` | 一键 PD/混部最优求解器与固定并行 `.xlsx`/`trace_view.json` 导出 | `mindie-sim solve --model qwen3.8-flash-next --hardware 950dt-96g-pod --num-devices 16 --prompt-tokens 32768 --output-tokens 1024 --tpot-slo-ms 25` |
 | `mindie-sim predict` | 运行端到端服务或模型主干（`--scope serving\|body`）性能预测 | `mindie-sim predict examples/quickstart.json` |
 | `mindie-sim inspect` | 解析 Case 并输出模型结构、KV 显存规划与展开后的算子序列 | `mindie-sim inspect examples/quickstart.json` |
 | `mindie-sim operators` | 评估单次 Prefill/Decode 前向中各算子的独立设备资源耗时（支持 `--draft-prepare`） | `mindie-sim operators examples/quickstart.json --phase decode --tokens 1` |

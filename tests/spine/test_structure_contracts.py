@@ -28,13 +28,13 @@ from _support.operator_cases import hardware_case, mla_case
 from mindie_sim.catalog.ops import vector_op
 from mindie_sim.prediction.operator_analysis import operator_costs, target_graphs, target_operators
 from mindie_sim.prediction.program import RecipeBook
-from mindie_sim.prediction.services import service_identity
+from mindie_sim.prediction.service_regime_domains.services import service_identity
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.structure import export_op_structure, export_structure
 from mindie_sim.structure_contracts import comparison_scope, predicted_contract
-from mindie_sim.structure_index import export_structure_index, index_digest
-from mindie_sim.structure_physical import node_physical
-from mindie_sim.structure_selection import select_structure_targets
+from mindie_sim.structure.physical import export_structure_index, index_digest
+from mindie_sim.structure.physical import node_physical
+from mindie_sim.structure.physical import select_structure_targets
 
 pytestmark = pytest.mark.tier0
 ROOT = Path(__file__).resolve().parents[2]

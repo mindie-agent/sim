@@ -46,9 +46,9 @@ from mindie_sim.model_catalog import ARCHITECTURE_PRESET_ALIASES, ARCHITECTURE_P
 from mindie_sim.model_catalog import MODEL_ALIASES, body_parameter_count, body_weight_bytes
 from mindie_sim.model_catalog import build_model_spec, customize_model_spec, load_model, model_value_formats
 from mindie_sim.prediction.feedforward import alltoall, dense
-from mindie_sim.prediction.frontend_features import FeatureConfig
+from mindie_sim.prediction.frontend.features import FeatureConfig
 from mindie_sim.prediction.operators.vector.gated_activation import gated_activation
-from mindie_sim.prediction.routing_realizations import select_realization
+from mindie_sim.prediction.sharding.routing import select_realization
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.prediction.transforms import lower_implementations
 
@@ -584,7 +584,7 @@ def test_draft_indexer_and_prepared_router_are_resident() -> None:
 def test_pp_partition_is_shared_by_capacity_and_catalog_paths() -> None:
     from mindie_sim.catalog.cache import request_cache_breakdown
     from mindie_sim.prediction.capacity import Memory
-    from mindie_sim.prediction.capacity_features import batch_cache_bytes
+    from mindie_sim.prediction.capacity.features import batch_cache_bytes
     case = parse_case(compose_case(
         "deepseek-v3", hardware=A5_SKU, graph_capture_mode="none", prompt_tokens=128,
         output_tokens=2, tp=8, ep=8, layers=5, pp=2, pp_layer_partition=(1, 4), quant="w8a8"))

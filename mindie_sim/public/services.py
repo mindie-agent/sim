@@ -28,7 +28,7 @@ from typing import Any, Mapping
 
 from mindie_sim.observations.calibration import service_conditions_match
 from mindie_sim.observations.resource_services import NormalizedResourceService
-from mindie_sim.prediction.services import (
+from mindie_sim.prediction.service_regime_domains.services import (
     ResourceService, ServiceCurve, ServiceEstimate,
 )
 

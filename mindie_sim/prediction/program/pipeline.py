@@ -231,74 +231,8 @@ class PipelineProgram:
         def scoped(items):
             return scope_allocations(name, items)
 
-        def _zero_work_alias(deps: list[Event], fallback: Event) -> Event | None:
-            if not deps:
-                return fallback
-            if len(deps) == 1:
-                return deps[0]
-            now = engine.now
-            pending = [dep for dep in deps if not dep.done]
-            if len(pending) == 1 and all(dep.time <= now for dep in deps if dep.done):
-                return pending[0]
-            if not pending:
-                latest = max(deps, key=lambda dep: dep.time)
-                if latest.time == now:
-                    return latest
-            return None
-
         if self.count == 1 and not self.setup_ms and not self.minimum_ms:
-            def submit_tile0(trigger: Event) -> tuple[Event, ...]:
-                local: dict[str, Event] = {}
-                previous: dict[str, Event] = {}
-                stages = tuple(self.tile(0))
-                consumed: set[str] = set()
-                for stage in stages:
-                    if stage.after:
-                        consumed.update(stage.after)
-                    deps = [local[key] for key in stage.after]
-                    deps.extend(previous[key] for key in stage.previous if key in previous)
-                    if (
-                        stage.program is None and not stage.acquire
-                        and not stage.free and _declares_no_work(stage)
-                    ):
-                        ev = _zero_work_alias(deps, trigger)
-                        if ev is not None:
-                            local[stage.name] = ev
-                            continue
-                    ev = stage.submit(
-                        engine, f"{name}:tile0:{stage.name}",
-                        tuple(deps) or (trigger,), scoped, owner,
-                    )
-                    local[stage.name] = ev
-                sinks = tuple(dict.fromkeys(
-                    local[stage.name] for stage in stages if stage.name not in consumed
-                ))
-                return sinks or (trigger,)
-
-            if ready.done and ready.time <= engine.now:
-                sinks = submit_tile0(ready)
-                if len(sinks) == 1:
-                    return sinks[0]
-                return engine.submit(f"{name}:tile0:retire", after=sinks, owner=owner)
-
-            complete_one = engine.future(name + ":pipeline_complete")
-
-            def begin_one(trigger: Event) -> None:
-                sinks = submit_tile0(trigger)
-                if len(sinks) == 1:
-                    engine.on_complete(
-                        sinks[0], lambda _e: engine.resolve(complete_one),
-                        native_hook=True,
-                    )
-                else:
-                    engine.submit(
-                        f"{name}:tile0:retire", after=sinks,
-                        on_complete=lambda _e: engine.resolve(complete_one),
-                        owner=owner, native_hook=True,
-                    )
-
-            engine.on_complete(ready, begin_one, native_hook=True)
-            return complete_one
+            return self._start_single_tile(engine, name, ready, scoped, owner)
 
         complete = engine.future(name + ":pipeline_complete")
         setup = (
@@ -343,7 +277,7 @@ class PipelineProgram:
                         stage.program is None and not stage.acquire
                         and not stage.free and _declares_no_work(stage)
                     ):
-                        ev = _zero_work_alias(deps, setup)
+                        ev = _zero_work_alias(engine, deps, setup)
                         if ev is not None:
                             local[stage.name] = stage_tail[stage.name] = ev
                             continue
@@ -395,6 +329,76 @@ class PipelineProgram:
             after=(complete, observation) if observation is not None else (complete,),
             owner=owner,
         )
+
+    def _start_single_tile(self, engine, name, ready, scoped, owner):
+        def submit_tile0(trigger: Event) -> tuple[Event, ...]:
+            local: dict[str, Event] = {}
+            previous: dict[str, Event] = {}
+            stages = tuple(self.tile(0))
+            consumed: set[str] = set()
+            for stage in stages:
+                if stage.after:
+                    consumed.update(stage.after)
+                deps = [local[key] for key in stage.after]
+                deps.extend(previous[key] for key in stage.previous if key in previous)
+                if (
+                    stage.program is None and not stage.acquire
+                    and not stage.free and _declares_no_work(stage)
+                ):
+                    ev = _zero_work_alias(engine, deps, trigger)
+                    if ev is not None:
+                        local[stage.name] = ev
+                        continue
+                ev = stage.submit(
+                    engine, f"{name}:tile0:{stage.name}",
+                    tuple(deps) or (trigger,), scoped, owner,
+                )
+                local[stage.name] = ev
+            sinks = tuple(dict.fromkeys(
+                local[stage.name] for stage in stages if stage.name not in consumed
+            ))
+            return sinks or (trigger,)
+
+        if ready.done and ready.time <= engine.now:
+            sinks = submit_tile0(ready)
+            if len(sinks) == 1:
+                return sinks[0]
+            return engine.submit(f"{name}:tile0:retire", after=sinks, owner=owner)
+
+        complete_one = engine.future(name + ":pipeline_complete")
+
+        def begin_one(trigger: Event) -> None:
+            sinks = submit_tile0(trigger)
+            if len(sinks) == 1:
+                engine.on_complete(
+                    sinks[0], lambda _e: engine.resolve(complete_one),
+                    native_hook=True,
+                )
+            else:
+                engine.submit(
+                    f"{name}:tile0:retire", after=sinks,
+                    on_complete=lambda _e: engine.resolve(complete_one),
+                    owner=owner, native_hook=True,
+                )
+
+        engine.on_complete(ready, begin_one, native_hook=True)
+        return complete_one
+
+
+def _zero_work_alias(engine: Engine, deps: list[Event], fallback: Event) -> Event | None:
+    if not deps:
+        return fallback
+    if len(deps) == 1:
+        return deps[0]
+    now = engine.now
+    pending = [dep for dep in deps if not dep.done]
+    if len(pending) == 1 and all(dep.time <= now for dep in deps if dep.done):
+        return pending[0]
+    if not pending:
+        latest = max(deps, key=lambda dep: dep.time)
+        if latest.time == now:
+            return latest
+    return None
 
 
 @dataclass(frozen=True)
@@ -593,7 +597,7 @@ class PipelineTemplateProgram:
         )
         nested = any(stage.program is not None for stage in stages)
         allocated = any(stage.acquire or stage.free for stage in stages)
-        from ..program_catalog import submit_template
+        from ..program.catalog import submit_template
         if (
             not nested and not allocated
             and self.template.indexed_panels is None

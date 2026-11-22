@@ -18,12 +18,12 @@ from _support.captures import REPO_ROOT, captured_report, fixture_json, norm_cas
 from _support.memory_cases import SPARSE_OFFLOAD_SKU, case as small_case
 
 from mindie_sim.cohort_accuracy import accuracy_fields, accuracy_policy, native_acceptance
-from mindie_sim.cohort_comparison import compare_cohorts
+from mindie_sim.cohort_accuracy import compare_cohorts
 from mindie_sim.compose import compose_case
-from mindie_sim.observations.accuracy import accuracy_report
-from mindie_sim.observations.cohort_scoreboard import render_cohort_campaigns, summarize_cohorts
+from mindie_sim.observations.comparison import accuracy_report
+from mindie_sim.observations.scoreboard import render_cohort_campaigns, summarize_cohorts
 from mindie_sim.observations.scoreboard import main, native_comparison_scoreboard
-from mindie_sim.observations.scoreboard_accuracy import render_native_comparison_markdown
+from mindie_sim.observations.scoreboard import render_native_comparison_markdown
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.structure import export_structure
 from tools.accuracy_report import retained_copy_campaign

@@ -1,15 +1,521 @@
-"""Subgraph and pure-model costs on the ordinary execution engine.
+"""Execution graph lowering, caching, verification and cost analysis.
 
-[Role] Compose operators, streams and cohorts before serving policy is applied.
-[Invariants] Graph spans and sums of isolated costs have distinct boundaries.
-  Cut dependencies require declared inputs. Resource contention conserves work.
-  A precedence bound is not an optimization saving or measured accuracy.
-  Compact results retain the same event boundaries and exact aggregate counts
-  without materializing per-event rows or copying the engine trace.
-[Timeouts & Locks] Finite input graph; O(graph + active program state), no I/O.
-[Side-Effect Policy] No device contexts, measurements or changes to input cases.
-"""
+[Role] Parse analysis inputs, cache/project execution graphs, verify physical
+  work conservation, and evaluate graph costs on the canonical Engine.
+[Invariants] Exact work/byte conservation and deterministic graph caching.
+[Timeouts & Locks] Honors ReplayOptions.deadline_mono; no locks.
+[Side-Effect Policy] Pure simulation."""
 from __future__ import annotations
+
+from dataclasses import fields, is_dataclass, replace
+import math
+import re
+
+from mindie_sim.schema.workload import RequestView
+
+NO_PROPOSALS = 0
+DECODE_BASE_ROWS = 1
+FIRST_PARTICIPANT = 0
+UNIFORM_COUNT_CARDINALITY = 1
+
+
+def analysis_view(case, request_id, tokens, context, scope, phase, *,
+                  index=0, samples=None, **fields):
+    """One analysis view whose target rows match the declared speculative width.
+
+    The frontend performs the single ``q_len + draft_proposal_tokens``
+    expansion, so the stored view keeps one base row and the configured
+    proposal count.  A probe that does not match the declared verification
+    width remains an ordinary non-speculative row count.
+    """
+    proposal = NO_PROPOSALS
+    advanced = NO_PROPOSALS
+    accepted = NO_PROPOSALS
+    if scope == "model" and phase == "decode" and tokens > DECODE_BASE_ROWS:
+        from .efficiency import _resolve_speculative_tokens
+        configured, policy_mean = _resolve_speculative_tokens(
+            case, output_budget=DECODE_BASE_ROWS, tokens_per_seq=None,
+            emitted_tokens_per_seq=None)
+        if configured > DECODE_BASE_ROWS and tokens == configured:
+            proposal = configured - DECODE_BASE_ROWS
+            mean = min(float(tokens),
+                       max(float(DECODE_BASE_ROWS), float(policy_mean)))
+            advanced = (math.floor((index + DECODE_BASE_ROWS) * mean)
+                        - math.floor(index * mean))
+            accepted = advanced - DECODE_BASE_ROWS
+    return RequestView(
+        request_id, tokens - proposal, context,
+        (scope == "model") if samples is None else bool(samples), phase,
+        draft_proposal_tokens=fields.pop("draft_proposal_tokens", proposal),
+        draft_advanced_tokens=fields.pop("draft_advanced_tokens", advanced),
+        draft_accepted_tokens=fields.pop("draft_accepted_tokens", accepted),
+        **fields)
+
+
+def rebind_analysis_requests(value, source_views, target_views):
+    """Rename every complete program record from one replica to another.
+
+    The immutable records carry nested request subsets, draft-row maps, ports
+    and typed metadata, so a string rewrite is bounded by the exact declared
+    request identities of both replicas.
+    """
+    binding = {source.request_id: target.request_id
+               for source, target in zip(source_views, target_views, strict=True)}
+    if not binding:
+        return value
+    pattern = re.compile(
+        r"(?<![\w@])(?:" + "|".join(
+            re.escape(key) for key in sorted(binding, key=len, reverse=True))
+        + r")(?![\w@])")
+    memo = {}
+
+    def visit(item):
+        key = id(item)
+        if key not in memo:
+            memo[key] = transform(item)
+        return memo[key]
+
+    def transform(item):
+        if isinstance(item, str):
+            return pattern.sub(lambda match: binding[match.group()], item)
+        if is_dataclass(item) and not isinstance(item, type):
+            updates = {}
+            for field in fields(item):
+                if field.init:
+                    before = getattr(item, field.name)
+                    after = visit(before)
+                    if after is not before:
+                        updates[field.name] = after
+            return replace(item, **updates) if updates else item
+        if isinstance(item, tuple):
+            result = tuple(visit(part) for part in item)
+            return item if all(a is b for a, b in zip(item, result)) else result
+        if isinstance(item, list):
+            return [visit(part) for part in item]
+        if isinstance(item, dict):
+            return {visit(key): visit(part) for key, part in item.items()}
+        return item
+
+    return visit(value)
+
+
+from collections import OrderedDict
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
+import json
+from typing import Any, Callable
+
+from mindie_sim.schema.common import ModelingError
+
+
+DEFAULT_MAX_BYTES = 64 * 1024 * 1024
+DEFAULT_MAX_ENTRIES = 128
+FREEZE_TAG_LIST = "__list__"
+FREEZE_TAG_MAP = "__map__"
+FREEZE_TAG_SET = "__set__"
+FREEZE_TAG_REPR = "__repr__"
+
+
+def freeze_value(value: Any) -> Any:
+    """Convert nested metadata into a hashable, deeply immutable projection."""
+    if isinstance(value, (str, int, float, bool, bytes, type(None))):
+        return value
+    if isinstance(value, Mapping):
+        return (FREEZE_TAG_MAP, tuple(sorted(
+            ((str(key), freeze_value(item)) for key, item in value.items()),
+            key=lambda pair: pair[0])))
+    if isinstance(value, (list, tuple)):
+        return (FREEZE_TAG_LIST, tuple(freeze_value(item) for item in value))
+    if isinstance(value, (set, frozenset)):
+        return (FREEZE_TAG_SET, tuple(sorted(
+            (freeze_value(item) for item in value), key=repr)))
+    try:
+        hash(value)
+        return value
+    except TypeError:
+        return (FREEZE_TAG_REPR, type(value).__name__, repr(value))
+
+
+@dataclass(frozen=True)
+class GraphKey:
+    """Hashable semantic identity of one frontend graph template."""
+
+    scope: str
+    signature: tuple
+    selection: tuple = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"scope": self.scope, "signature": self.signature,
+                "selection": self.selection}
+
+
+@dataclass
+class SemanticGraphCache:
+    """Bounded caller-owned LRU of immutable semantic graph templates."""
+
+    max_bytes: int = DEFAULT_MAX_BYTES
+    max_entries: int = DEFAULT_MAX_ENTRIES
+    _entries: OrderedDict = field(default_factory=OrderedDict, repr=False)
+    _sizes: dict = field(default_factory=dict, repr=False)
+    _bytes: int = 0
+    hits: int = 0
+    misses: int = 0
+    evictions: int = 0
+    oversized: int = 0
+
+    def __post_init__(self) -> None:
+        if self.max_bytes < 1 or self.max_entries < 1:
+            raise ModelingError("semantic_graph_cache_budget_invalid")
+
+    @property
+    def total_bytes(self) -> int:
+        return int(self._bytes)
+
+    @property
+    def entries(self) -> int:
+        return len(self._entries)
+
+    def _size(self, value: Any) -> int:
+        frozen = freeze_value(value)
+        try:
+            return len(json.dumps(frozen, default=repr).encode("utf-8"))
+        except (TypeError, ValueError):
+            return len(repr(frozen).encode("utf-8"))
+
+    def _evict(self) -> None:
+        while (self._entries
+               and (len(self._entries) > self.max_entries
+                    or self._bytes > self.max_bytes)):
+            key, _template = self._entries.popitem(last=False)
+            self._bytes -= self._sizes.pop(key, 0)
+            self.evictions += 1
+
+    def get_or_build(self, key: GraphKey, builder: Callable[[], Any]) -> Any:
+        cached = self._entries.get(key)
+        if cached is not None:
+            self._entries.move_to_end(key)
+            self.hits += 1
+            return cached
+        self.misses += 1
+        template = builder()
+        size = self._size(template)
+        if size > self.max_bytes // 2:
+            self.oversized += 1
+            return template
+        self._entries[key] = template
+        self._sizes[key] = size
+        self._bytes += size
+        self._evict()
+        return template
+
+    def clear(self) -> None:
+        self._entries.clear()
+        self._sizes.clear()
+        self._bytes = 0
+        self.hits = self.misses = self.evictions = self.oversized = 0
+
+    def stats(self) -> dict[str, int]:
+        return {"entries": self.entries, "bytes": self.total_bytes,
+                "hits": self.hits, "misses": self.misses,
+                "evictions": self.evictions, "oversized": self.oversized}
+
+
+def semantic_graph_key(
+    case: Any, plan: Any, *, scope: str, selection_signature: Any = (),
+) -> GraphKey:
+    """Build the hardware-independent semantic key of one graph template."""
+    runtime = case.runtime
+    parallel = runtime.parallel
+    model = case.model
+    signature = freeze_value({
+        "schema": "mindie-sim.semantic-graph/1",
+        "scope": str(scope),
+        "model": {
+            "name": model.name, "layers": model.layers,
+            "hidden_size": model.hidden_size, "num_heads": model.num_heads,
+            "num_kv_heads": model.num_kv_heads, "head_dim": model.head_dim,
+            "vocab_size": model.vocab_size, "num_experts": model.num_experts,
+            "top_k": model.top_k, "quant": getattr(model.quant, "name", ""),
+            "layer_plans": tuple(
+                (item.index, item.attention, item.ffn, item.scope,
+                 item.cache_kind, item.window, item.compress_ratio,
+                 item.num_experts, item.top_k)
+                for item in model.layer_plans),
+            "auxiliary": freeze_value(getattr(model, "auxiliary", None)),
+        },
+        "parallel": {
+            "dp": parallel.dp, "tp": parallel.tp, "ep": parallel.ep,
+            "pp": parallel.pp, "cp": parallel.cp, "pcp": parallel.pcp,
+            "o_proj_tp": parallel.o_proj_tp,
+            "linear_proj_tp": parallel.linear_proj_tp,
+            "lm_head_tp": parallel.lm_head_tp,
+            "redundant_experts_per_rank": parallel.redundant_experts_per_rank,
+            "cp_plan": parallel.cp_plan,
+            "rank_table": parallel.rank_table,
+        },
+        "features": {
+            "collective_startup_mode": runtime.collective_startup_mode,
+            "matrix_compute_policy": runtime.matrix_compute_policy,
+            "recover_ssm": runtime.recover_ssm,
+            "prefix_cache_mode": runtime.prefix_cache_mode,
+            "prefix_read_mode": runtime.prefix_read_mode,
+            "homogeneous_graph_reuse": runtime.homogeneous_graph_reuse,
+            "routing": freeze_value(runtime.routing),
+            "metadata": freeze_value(runtime.metadata),
+            "attention_policy": freeze_value(runtime.attention_policy),
+            "lowering_passes": runtime.lowering_passes,
+        },
+        "plan": freeze_value(plan),
+        "selection": freeze_value(selection_signature),
+    })
+    return GraphKey(str(scope), signature, freeze_value(selection_signature))
+
+
+from collections.abc import Mapping
+
+
+def bounded_event_profile(engine) -> dict:
+    """Separate completed physical events from optional debug-trace retention."""
+    retained = len(engine.trace)
+    return {
+        "completed_physical_events": engine.completed_count,
+        "completed_tasks": engine.completed_count,
+        "trace_retained": retained,
+        "trace_dropped": engine.trace_dropped,
+        "trace_events": retained + engine.trace_dropped,
+    }
+
+
+def matrix_wrapper_projection(metadata) -> dict:
+    """Publish only the selected wrapper's semantic kind/source role.
+
+    The nested metadata is the explicit source-selection result; absent it the
+    ordinary matrix row keeps no kind. This is attribution, not a second op.
+    """
+    wrapper = metadata.get("matrix_wrapper")
+    if not isinstance(wrapper, Mapping):
+        return {}
+    native = wrapper.get("native_kind")
+    if not isinstance(native, str) or not native:
+        return {}
+    result = {"native_kind": native}
+    role = wrapper.get("source_role")
+    if isinstance(role, str) and role:
+        result["source_role"] = role
+    source = wrapper.get("source")
+    basis = (wrapper.get("source_basis")
+             or (source.get("basis") if isinstance(source, Mapping) else None))
+    if isinstance(basis, str) and basis:
+        result["source_basis"] = basis
+    return result
+
+
+def accel_status(view) -> dict:
+    """Stable compact subset of ``Engine.accel_status()`` for graph output."""
+    return {
+        "accel_backend": view.get("accel_backend"),
+        "native_steps": int(view.get("native_steps") or 0),
+        "python_steps": int(view.get("python_steps") or 0),
+        "fallback_reason": view.get("fallback_reason"),
+        "mode": view.get("mode"),
+        "enabled": bool(view.get("enabled")),
+    }
+
+
+from typing import Any, Mapping
+
+from mindie_sim.schema.common import ModelingError
+
+SCHEMA = "mindie-sim/collective-participant-profile/1"
+_PRIMITIVES = {
+    "allgather": "all_gather", "all_gather": "all_gather",
+    "reducescatter": "reduce_scatter", "reduce_scatter": "reduce_scatter",
+    "alltoall": "all_to_all", "all_to_all": "all_to_all",
+    "alltoallv": "all_to_all", "allreduce": "all_reduce",
+    "all_reduce": "all_reduce",
+}
+
+
+def _primitive(value: Any) -> str | None:
+    token = str(value or "").strip().lower().replace("-", "_")
+    return _PRIMITIVES.get(token)
+
+
+def _dtype(value: Any) -> str | None:
+    token = str(value or "").strip().lower()
+    return {"bfp16": "bf16", "bfloat16": "bf16", "float16": "fp16",
+            "fp16": "fp16", "float32": "fp32", "fp32": "fp32",
+            "fp8": "fp8_e4m3", "fp8_e4m3": "fp8_e4m3",
+            "fp8_e5m2": "fp8_e5m2"}.get(token, token or None)
+
+
+def normalise(value: Any) -> dict[str, Any] | None:
+    """Validate the optional profile without inventing absent fields."""
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise ModelingError("collective_participant_profile_must_be_mapping")
+    doc = value.get("participant_profile", value)
+    if not isinstance(doc, Mapping):
+        raise ModelingError("collective_participant_profile_must_be_mapping")
+    schema = doc.get("schema")
+    if schema not in (None, SCHEMA):
+        raise ModelingError(f"collective_participant_profile_schema_unknown:{schema}")
+    calls = []
+    for raw in doc.get("calls") or ():
+        if not isinstance(raw, Mapping):
+            raise ModelingError("collective_participant_profile_call_must_be_mapping")
+        primitive = _primitive(raw.get("primitive") or raw.get("collective"))
+        if primitive is None:
+            raise ModelingError(
+                f"collective_participant_profile_primitive_unknown:{raw.get('primitive')}")
+        ordinal = raw.get("ordinal")
+        if ordinal is not None:
+            try:
+                ordinal = int(ordinal)
+            except (TypeError, ValueError):
+                raise ModelingError(
+                    f"collective_participant_profile_ordinal_invalid:{ordinal}") from None
+        group_size = raw.get("group_size")
+        if group_size is not None:
+            try:
+                group_size = int(group_size)
+            except (TypeError, ValueError):
+                raise ModelingError(
+                    f"collective_participant_profile_group_invalid:{group_size}") from None
+        ranks = []
+        for item in raw.get("ranks") or raw.get("participants") or ():
+            if not isinstance(item, Mapping):
+                raise ModelingError(
+                    "collective_participant_profile_rank_must_be_mapping")
+            rank_id = item.get("rank_id")
+            if rank_id is None:
+                raise ModelingError("collective_participant_profile_rank_id_missing")
+            try:
+                rank_id = int(rank_id)
+            except (TypeError, ValueError):
+                raise ModelingError(
+                    f"collective_participant_profile_rank_id_invalid:{rank_id}") from None
+            ranks.append({
+                "rank_id": rank_id,
+                "role": str(item.get("role") or ""),
+            })
+        calls.append({
+            "ordinal": ordinal,
+            "primitive": primitive,
+            "native_name": (str(raw["native_name"])
+                            if raw.get("native_name") is not None else None),
+            "group_size": group_size,
+            "dtype": _dtype(raw.get("dtype")),
+            "ranks": tuple(ranks),
+        })
+    return {
+        "schema": SCHEMA,
+        "source": dict(doc.get("source") or {}),
+        "calls": tuple(calls),
+    }
+
+
+def select_call(profile: Mapping[str, Any] | None, *, primitive: Any,
+                occurrence: int = 0, group_size: int | None = None,
+                dtype: Any = None) -> dict[str, Any]:
+    """Select one genuine call by primitive and occurrence, never by time."""
+    if profile is None:
+        return {"resolved": False, "reason": "participant_profile_absent"}
+    family = _primitive(primitive)
+    if family is None:
+        return {"resolved": False, "reason": f"primitive_unknown:{primitive}"}
+    matching = [call for call in profile.get("calls", ())
+                if call["primitive"] == family]
+    if not matching:
+        return {"resolved": False, "reason": f"no_source_call_for_primitive:{family}"}
+    if occurrence < 0 or occurrence >= len(matching):
+        return {"resolved": False,
+                "reason": f"source_call_occurrence_out_of_range:{occurrence}:"
+                          f"available={len(matching)}"}
+    call = matching[occurrence]
+    if (group_size is not None and call.get("group_size") is not None
+            and int(call["group_size"]) != int(group_size)):
+        return {"resolved": False,
+                "reason": f"source_group_size_mismatch:{call['group_size']}!={group_size}"}
+    expected = _dtype(dtype)
+    if (expected is not None and call.get("dtype") is not None
+            and call["dtype"] != expected):
+        return {"resolved": False,
+                "reason": f"source_dtype_mismatch:{call['dtype']}!={expected}"}
+    return {
+        "resolved": True,
+        "basis": "same_primitive_occurrence",
+        "primitive": family,
+        "occurrence": occurrence,
+        "ordinal": call.get("ordinal"),
+        "native_name": call.get("native_name"),
+        "group_size": call.get("group_size"),
+        "dtype": call.get("dtype"),
+        "dtype_basis": ("declared_source" if call.get("dtype") is not None
+                        else "underdetermined_source"),
+        "ranks": [dict(item) for item in call.get("ranks", ())],
+    }
+
+
+import math
+
+from .program import RecipeBook
+from .mechanism import PlannedRecipe
+
+
+def _check_row(row, rel_tol):
+    declared, serviced = row["declared_service"], row["serviced"]
+    mismatches = {
+        name: {"declared": declared.get(name, 0), "executed": serviced.get(name, 0)}
+        for name in declared.keys() | serviced.keys()
+        if not math.isclose(declared.get(name, 0), serviced.get(name, 0),
+                            rel_tol=rel_tol, abs_tol=1e-12)
+    }
+    finite = math.isfinite(row["duration_ms"]) and row["duration_ms"] >= 0
+    released = not any(row["remaining_buffers"].values()) and row["live_tasks"] == 0
+    ready_obeyed = not any(row["service_before_input"].values())
+    return {"finite_completion": finite, "buffers_released": released,
+            "input_dependency_obeyed": ready_obeyed, "work_mismatches": mismatches}
+
+
+def verify_operator(case, op, build, *, kernels=None, rel_tol=1e-9, input_ready_ms=0):
+    """Check the actual public isolated-cost path, not a second recipe executor."""
+    from .operator_analysis import operator_costs
+    recipes = RecipeBook(recipes={op.recipe: PlannedRecipe(build, kernels)})
+    rows = operator_costs(case, (op,), recipes=recipes,
+                          input_ready_ms=input_ready_ms)["operators"]
+    checks = [_check_row(item, rel_tol) for item in rows]
+    if kernels is None:
+        row = rows[0]
+        mismatches = checks[0]["work_mismatches"]
+    else:
+        def total(field):
+            keys = {key for item in rows for key in item[field]}
+            return {key: sum(item[field].get(key, 0) * item["occurrences"] for item in rows)
+                    for key in keys}
+        row = {
+            "operator": op.to_dict(), "kernels": rows,
+            "duration_ms": sum(item["total_ms"] for item in rows),
+            "declared_service": total("declared_service"), "serviced": total("serviced"),
+            "remaining_buffers": total("remaining_buffers"),
+            "service_before_input": total("service_before_input"),
+            "live_tasks": sum(item["live_tasks"] for item in rows),
+        }
+        # Opposite errors in two kernels must not cancel in the display total.
+        mismatches = {item["operator"]["op_id"]: check["work_mismatches"]
+                      for item, check in zip(rows, checks) if check["work_mismatches"]}
+    finite = all(check["finite_completion"] for check in checks)
+    released = all(check["buffers_released"] for check in checks)
+    ready_obeyed = all(check["input_dependency_obeyed"] for check in checks)
+    return {"status": "passed" if finite and released and ready_obeyed and not mismatches else "failed",
+            "scope": "resource_contract_only", "finite_completion": finite,
+            "buffers_released": released,
+            "input_dependency_obeyed": ready_obeyed,
+            "kernel_checks": [{"operator_id": item["operator"]["op_id"], **check}
+                              for item, check in zip(rows, checks)],
+            "work_mismatches": mismatches, "result": row}
+
 
 from collections import deque
 from collections.abc import Mapping
@@ -18,29 +524,22 @@ from mindie_sim.coverage import model_coverage
 
 from mindie_sim.schema.operators import IterationWork
 from mindie_sim.schema.workload import IterationPlan
-from .cost import CostModel
-from .cohort_traffic import bind_cohort_traffic
-from .dispatch import cohorts
+from .efficiency.cost import CostModel
+from .execution.cohort_traffic import bind_cohort_traffic
+from .execution.dispatch import cohorts
 from .execution import Execution
-from .graph_projection import (
-    accel_status, bounded_event_profile, matrix_wrapper_projection,
-)
-from .operator_analysis import cohort_operator_costs, operator_costs, physical_id, _replay_scope
 from .native_binding import bind_native_call
 from .program import RecipeBook
 from .structure import parse_case
-from .exposed_breakdown import (
+from .efficiency.exposed_breakdown import (
     CLOCK_GAP_ABS_FLOOR_MS, CLOCK_GAP_LIMIT_FRACTION, ExposedClocks,
     communication_clocks, control_clocks, cube_clocks, finish_breakdown,
     memory_clocks, unavailable_breakdown, vector_clocks)
-from .resource_attribution import realized_clock_dag
+from .efficiency.resource_attribution import realized_clock_dag
 
 #: A multi-layer graph that amortizes eager callback-free native adoption.
 EAGER_GRAPH_MIN_OPS = 16
 
-ZERO = 0
-ONE = 1
-ZERO_FLOAT = 0.0
 RECONCILE_FRACTION = 1e-3
 RECONCILE_MIN_MS = 1.0
 ROLE_CUBE = "cube"
@@ -54,18 +553,18 @@ NON_COMMUNICATION_ROLES = frozenset({
 
 def _dominant_role(op) -> str:
     """Dominant/active physical service role of one executed occurrence."""
-    if float(getattr(op, "link_bytes", ZERO) or ZERO) > ZERO:
+    if float(getattr(op, "link_bytes", 0) or 0) > 0:
         return ROLE_COMMUNICATION
-    if float(getattr(op, "flops", ZERO) or ZERO) > ZERO:
+    if float(getattr(op, "flops", 0) or 0) > 0:
         return ROLE_CUBE
-    if float(getattr(op, "vector_ops", ZERO) or ZERO) > ZERO:
+    if float(getattr(op, "vector_ops", 0) or 0) > 0:
         return ROLE_VECTOR
     metadata = dict(getattr(op, "metadata", ()) or ())
-    memory = sum(float(getattr(op, field, ZERO) or ZERO) for field in (
+    memory = sum(float(getattr(op, field, 0) or 0) for field in (
         "hbm_bytes", "mte2_bytes", "mte3_bytes"))
-    memory += float(metadata.get("mte1_bytes", ZERO) or ZERO)
-    memory += float(metadata.get("fixpipe_bytes", ZERO) or ZERO)
-    return ROLE_MEMORY if memory > ZERO else ROLE_CONTROL
+    memory += float(metadata.get("mte1_bytes", 0) or 0)
+    memory += float(metadata.get("fixpipe_bytes", 0) or 0)
+    return ROLE_MEMORY if memory > 0 else ROLE_CONTROL
 
 
 def _exposed_breakdown(records, duration_ms, input_ready_ms, replica,
@@ -85,7 +584,7 @@ def _exposed_breakdown(records, duration_ms, input_ready_ms, replica,
         if record["replica"] != replica or record["op"].family == "barrier":
             continue
         ready = record.get("collective_ready_ms", record["ready"].time)
-        start = max(ZERO_FLOAT, float(ready) - float(input_ready_ms))
+        start = max(0.0, float(ready) - float(input_ready_ms))
         end = max(start, float(record["complete"].time) - float(input_ready_ms))
         intervals.append((start, end, record))
     if not intervals:
@@ -123,7 +622,7 @@ def _exposed_breakdown(records, duration_ms, input_ready_ms, replica,
     has_dependency_identity = all(
         "predecessors" in record for _start, _end, record in intervals)
     for ordinal, (start, end, record) in enumerate(intervals):
-        elapsed = max(ZERO_FLOAT, end - start)
+        elapsed = max(0.0, end - start)
         supplied = (service_clocks_by_id or {}).get(identifiers[ordinal])
         local[identifiers[ordinal]] = (
             supplied if isinstance(supplied, ExposedClocks)
@@ -150,8 +649,8 @@ def _exposed_breakdown(records, duration_ms, input_ready_ms, replica,
     _clocks, terminal = realized_clock_dag(
         local, dependencies, allow_external_predecessors=True)
     expected = float(duration_ms)
-    if terminal.all_ms <= ZERO_FLOAT:
-        if expected > ZERO_FLOAT:
+    if terminal.all_ms <= 0.0:
+        if expected > 0.0:
             return unavailable_breakdown(
                 "service_clocks_missing", boundary="device_step")
     gap_limit = max(expected * CLOCK_GAP_LIMIT_FRACTION,
@@ -228,12 +727,13 @@ def _precedence_bound(rows, external, start):
 
 
 def _prepare_graphs(case, ops, book, replay_scope, external):
+    from .operator_analysis import _replay_scope
     graphs = {r: tuple(book.expand(items)) for r, items in
               (ops.items() if isinstance(ops, Mapping) else ((0, ops),))}
     graphs = bind_cohort_traffic(case, graphs)
-    from .local_projection_tp import lower_local_projection_tp_cohort
-    from .local_tp_groups import local_tp_spans_dp
-    if len(graphs) > ONE:
+    from .sharding.local_tp import lower_local_projection_tp_cohort
+    from .sharding.local_tp import local_tp_spans_dp
+    if len(graphs) > 1:
         graphs = lower_local_projection_tp_cohort(
             graphs, model=case.model, runtime=case.runtime, machine=case.machine)
     scopes = {r: _replay_scope(items, replay_scope) for r, items in graphs.items()}
@@ -243,7 +743,7 @@ def _prepare_graphs(case, ops, book, replay_scope, external):
     if any(r not in range(case.runtime.parallel.dp) for r in graphs):
         raise ValueError("graph_replica_outside_declared_placement")
     # Effective lowered operators: no timing may price an unmodeled core.
-    from .unmodeled_gate import assert_timing_supported
+    from .efficiency.unmodeled_gate import assert_timing_supported
     for items in graphs.values():
         assert_timing_supported(case, items, entry="graph_costs")
     for items in graphs.values():
@@ -290,7 +790,7 @@ def _run_graph(
     if stream_plans:
         from .streams import validate_stream_plan_ranks
         stream_plans = validate_stream_plan_ranks(stream_plans, set(graphs))
-    from .cost import CostLedger
+    from .efficiency.cost import CostLedger
     from .implementation_selection import graph_selections
     cost = ctx.cost
     op_count = (sum(len(group) for group in ops.values())
@@ -370,7 +870,7 @@ def _dcp_replica_subgroup(topology, axis, replica, stage, meta, fallback):
 
 
 def _bind_collective_readiness(case, records, group_for, execution):
-    from .local_tp_groups import local_tp_spans_dp
+    from .sharding.local_tp import local_tp_spans_dp
     from .topology import Topology
 
     # Aggregate recipes retain their rendezvous. Causal transport plans retain
@@ -415,6 +915,7 @@ def _bind_collective_readiness(case, records, group_for, execution):
 
 
 def _price_isolated_graph(case, graphs, joins, scopes, book, primitives, ctx, stream_plans):
+    from .operator_analysis import cohort_operator_costs, operator_costs, physical_id
     costs, durations, cohort_cache = [], {}, {}
     for participants in joins.values():
         if not participants[0].get("joint_collective"):
@@ -456,6 +957,7 @@ def _price_isolated_graph(case, graphs, joins, scopes, book, primitives, ctx, st
 
 
 def _graph_operator_rows(records, duration, compact, isolated, durations, stream_plans):
+    from .operator_analysis import physical_id
     profile = None
     if compact:
         profile = {
@@ -720,8 +1222,8 @@ def _record_native_bridge(case, records, execution_summary, profile):
 
 
 def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=None,
-                input_ready_ms=ZERO, include_submission=False, replay_scope=None,
-                isolated=True, trace_limit=ZERO, compact=False,
+                input_ready_ms=0, include_submission=False, replay_scope=None,
+                isolated=True, trace_limit=0, compact=False,
                 audit_allocations=False, evaluation=None,
                 fast_span_only=False, stream_plans=None,
                 request_views=None, padded_tokens=0, sequence_layout="",

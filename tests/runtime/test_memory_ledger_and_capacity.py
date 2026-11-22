@@ -18,7 +18,7 @@ import pytest
 from _support.memory_cases import budget_memory, case, linear_work
 from mindie_sim.prediction.cache_path import CacheGeometry, CacheState
 from mindie_sim.prediction.capacity import Allocation, AllocationPlan, Memory
-from mindie_sim.prediction.cost import CostModel
+from mindie_sim.prediction.efficiency.cost import CostModel
 from mindie_sim.prediction.execution import Execution
 from mindie_sim.prediction.runtime import engine
 from mindie_sim.prediction.runtime.contracts import (

@@ -175,13 +175,18 @@ class Memory(
         self.kvc_hbm_ratio = max(
             0.0, 1.0 - self.offload["kvc_ddr_ratio"] - self.offload["kvc_ssd_ratio"]
         )
+        self._init_weights(case, p, draft, workspace_tokens)
+        self._init_workspace_capacity(case, p, workspace_tokens)
+        self._init_allocation_state(case, p)
+
+    def _init_weights(self, case, p, draft, workspace_tokens):
         meta = dict(case.runtime.metadata)
         extra = dict(meta.get("additional_config") or ()) if isinstance(meta.get("additional_config"), dict) else {}
         shared_expert_dp = bool(meta.get("enable_shared_expert_dp", False))
         pcp_o_proj_shard = bool(
             meta.get("enable_pcp_o_proj_weight_sharding",
                      extra.get("enable_pcp_o_proj_weight_sharding", False)))
-        from mindie_sim.prediction.operators.context_parallel.graph import dcp_q_replicate_enabled
+        from mindie_sim.catalog.context_parallel import dcp_q_replicate_enabled
         has_sparse_mla = any(
             lp.indexer or lp.owns_topk or lp.topk_owner_layer_id >= 0 or lp.index_k_owner_layer_id >= 0
             for lp in case.model.layer_plans
@@ -264,6 +269,8 @@ class Memory(
             max(0.0, total - payload)
             for total, payload in zip(self.weights, self.weights_payload)
         ]
+
+    def _init_workspace_capacity(self, case, p, workspace_tokens):
         async_enabled = bool(case.runtime.async_scheduling)
         self.async_delayed_release_steps = (
             (1 if async_enabled else 0) if self.policy.async_delayed_release_steps is None
@@ -337,6 +344,8 @@ class Memory(
             [min(row) for row in replica_ranks]
             for replica_ranks in self.rank_capacity
         ]
+
+    def _init_allocation_state(self, case, p):
         self.peak = [[0.0] * p.pp for _ in range(p.dp)]
         self.live = [[0.0] * p.pp for _ in range(p.dp)]
         self.live_rank = [

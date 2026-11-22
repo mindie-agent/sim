@@ -42,7 +42,7 @@ from mindie_sim.prediction.collectives import (
 )
 from mindie_sim.prediction.collectives.band_plan import build_band_collective_plan
 from mindie_sim.prediction.communication import MessageFlow
-from mindie_sim.prediction.cost import CostModel
+from mindie_sim.prediction.efficiency.cost import CostModel
 from mindie_sim.prediction.engine import Allocation, Engine, Resource
 from mindie_sim.prediction.execution import Execution
 from mindie_sim.prediction.program import KernelProgram, Stage

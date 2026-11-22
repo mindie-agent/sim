@@ -13,7 +13,7 @@ from mindie_sim.catalog.cache import layer_cache_components
 from mindie_sim.schema.common import ModelingError
 
 from ..pd_connector import PDHandoff, PDTransfer
-from ..pd_ranges import address, owned_runs, transfers_for_runs
+from ..disaggregated.ranges import address, owned_runs, transfers_for_runs
 
 
 def _local_head_spans(count, tp):
@@ -245,208 +245,10 @@ def _pd_handoff_binding(request, tokens, placement, cases, memory, execution,
         destination_ranks.add(destination_rank)
 
     for layer in prefill_case.model.layer_plans:
-        source_stage = prefill_mem.layer_stage[layer.index]
-        destination_stage = decode_mem.layer_stage[layer.index]
-        source = tuple(prefill_exec.topology.ranks(prefill_rep, source_stage))
-        destination = tuple(decode_exec.topology.ranks(decode_rep, destination_stage))
-        if not source or not destination:
-            raise ModelingError("pd_handoff_missing_stage_ranks:" + request)
-        num_heads = int(getattr(layer, "num_kv_heads", 0) or 0)
-        has_head_axis = layer.attention in {"gqa", "projection_only"}
-        source_spans = _local_head_spans(num_heads, prefill_p.tp)
-        target_spans = _local_head_spans(num_heads, decode_p.tp)
-        source_owners = getattr(prefill_mem, "rank_token_owners", None)
-        target_owners = getattr(decode_mem, "rank_token_owners", None)
-
-        def views(case, parallel, ranks, ledger, owners, head_spans):
-            if owners is not None:
-                # A T05 owner partition is the exact physical fact.
-                spans = tuple(
-                    _token_span(ledger, index, tokens)
-                    for index in range(len(ranks)))
-                component_owners = owners
-            else:
-                spans = tuple(
-                    _head_token_span(index, tokens, head_spans if has_head_axis else (), parallel.cp)
-                    for index in range(len(ranks)))
-                # Feed the same exact partition to the cache ledger: an even
-                # ``rows / cp`` split would bill 160/160 B for the [0,2) and
-                # [2,5) shards instead of the exact 128/192 B they own.
-                component_owners = spans
-            result = []
-            for index, rank in enumerate(ranks):
-                components = layer_cache_components(
-                    case.model, layer, parallel, tokens, capacity_padded=False,
-                    interleave=case.runtime.kv_block_size,
-                    rank=index, owner_spans=component_owners)
-                result.append((index, rank, components, spans[index]))
-            return result
-
-        src_views = views(prefill_case, prefill_p, source, prefill_mem,
-                          source_owners, source_spans)
-        dst_views = views(decode_case, decode_p, destination, decode_mem,
-                          target_owners, target_spans)
-        components = {name for _, _, values, _ in src_views for name in values}
-        components |= {name for _, _, values, _ in dst_views for name in values}
-        gqa_components = {name for name in HEAD_COMPONENTS
-                          if has_head_axis and num_heads > 0}
-        split_kv = (num_heads > 0
-                    and _published_for(published, "prefill", request,
-                                       layer.index, "gqa_k") is not None
-                    and _published_for(published, "prefill", request,
-                                       layer.index, "gqa_v") is not None)
-        for component in sorted(components):
-            window = int(getattr(layer, "window", 0) or 0)
-            windowed = component == "window" or (
-                component in {"gqa_kv", "mla_kv"} and window > 0)
-            window_start = max(0, tokens - window) if windowed else 0
-            if component in gqa_components:
-                for dest_index, dest_rank, dest_values, dest_tokens in dst_views:
-                    need = float(dest_values.get(component, 0.0))
-                    dspan = target_spans[dest_index % max(1, len(target_spans))]
-                    d_lo, d_hi = dest_tokens
-                    if windowed:
-                        d_lo, d_hi = max(window_start, d_lo), min(tokens, d_hi)
-                    if (need <= 0.0 or dspan[1] <= dspan[0]
-                            or d_hi <= d_lo):
-                        continue
-                    # A destination row needs a per-head payload only for the
-                    # token rows a source rank actually owns.  The head and
-                    # token axes are independent intersections.
-                    per_head_token = (need / float(dspan[1] - dspan[0])
-                                      / float(d_hi - d_lo))
-                    covered: dict[int, list[tuple[int, int]]] = {}
-                    for src_index, src_rank, src_values, src_tokens in src_views:
-                        sspan = source_spans[src_index % max(1, len(source_spans))]
-                        common = [head for head in range(dspan[0], dspan[1])
-                                  if sspan[0] <= head < sspan[1]]
-                        if not common:
-                            continue
-                        s_lo, s_hi = src_tokens
-                        if windowed:
-                            s_lo, s_hi = (max(window_start, s_lo),
-                                          min(tokens, s_hi))
-                        lo, hi = max(s_lo, d_lo), min(s_hi, d_hi)
-                        if hi <= lo:
-                            continue
-                        src_storage = f"pd:kv:{request}:prefill:r{prefill_rep}:rank{src_rank}"
-                        dst_storage = f"pd:kv:{request}:decode:r{decode_rep}:rank{dest_rank}"
-                        grouped: dict[tuple[int, int], list[int]] = {}
-                        for head in common:
-                            for piece_lo, piece_hi in _uncovered_intervals(
-                                    covered.get(head, ()), lo, hi):
-                                grouped.setdefault(
-                                    (piece_lo, piece_hi), []).append(head)
-                                covered.setdefault(head, []).append(
-                                    (piece_lo, piece_hi))
-                        for (piece_lo, piece_hi), heads in grouped.items():
-                            spans_all_rows = (piece_lo, piece_hi) == (s_lo, s_hi)
-                            spans_all_rows &= (piece_lo, piece_hi) == (d_lo, d_hi)
-                            consecutive = heads[-1] - heads[0] + 1 == len(heads)
-                            groups = ([heads] if spans_all_rows and consecutive
-                                      else ([head] for head in heads))
-                            planes = ("gqa_k", "gqa_v") if split_kv else (component,)
-                            for group in groups:
-                                first = (group[0] - sspan[0]) * (s_hi - s_lo)
-                                offset = first + piece_lo - s_lo
-                                for plane in planes:
-                                    unit = per_head_token / len(planes)
-                                    emit(src_rank, dest_rank, plane,
-                                         unit * (piece_hi - piece_lo) * len(group),
-                                         source_stage=source_stage,
-                                         destination_stage=destination_stage,
-                                         layer=layer.index, source_span=sspan,
-                                         destination_span=dspan,
-                                         source_tokens=(piece_lo, piece_hi),
-                                         destination_tokens=(piece_lo, piece_hi),
-                                         source_storage=src_storage,
-                                         destination_storage=dst_storage,
-                                         source_size=src_values[component] / len(planes),
-                                         source_displacement=unit * offset,
-                                         destination_size=need / len(planes),
-                                         destination_displacement=unit * (
-                                             (group[0] - dspan[0]) * (d_hi - d_lo)
-                                             + piece_lo - d_lo))
-                    missing = [head for head in range(dspan[0], dspan[1])
-                               if sum(piece_hi - piece_lo for piece_lo, piece_hi
-                                      in covered.get(head, ())) < d_hi - d_lo]
-                    if missing:
-                        raise ModelingError(
-                            "pd_handoff_source_head_uncovered:"
-                            f"{request}:{layer.index}:{dest_rank}:{missing}")
-                continue
-            row_component = component in {"mla_kv", "window", "compressed_kv", "index_k"}
-            if row_component:
-                def manifest(case, parallel, entries):
-                    return [(rank, owned_runs(component, layer, case.model, parallel,
-                                              index, span, tokens, window_start),
-                             values.get(component, 0))
-                            for index, rank, values, span in entries]
-
-                sources = manifest(prefill_case, prefill_p, src_views)
-                destinations = manifest(decode_case, decode_p, dst_views)
-                sparse_layer = offload and component == "mla_kv" and layer.index in offload_layers
-                receivers = []
-                if sparse_layer:
-                    receivers.append((destination[0], ((window_start, tokens),),
-                                      "host", f"pd:host:{request}:decode:r{decode_rep}"))
-                for rank, runs, need in destinations:
-                    if need <= 0:
-                        continue
-                    if sparse_layer:
-                        runs = tuple((max(lo, tokens - hot_tokens), hi) for lo, hi in runs
-                                     if hi > max(lo, tokens - hot_tokens))
-                    storage = f"pd:kv:{request}:decode:r{decode_rep}:rank{rank}"
-                    receivers.append((rank, runs, "hbm", storage))
-                ratio = (max(1, layer.compress_ratio, layer.index_kpool)
-                         if component == "index_k" else max(1, layer.compress_ratio)
-                         if component == "compressed_kv" else 1)
-                for dst_rank, runs, tier, storage in receivers:
-                    target_rows = sum(hi - lo for lo, hi in runs)
-                    received = 0
-                    for src_rank, lo, hi, size, offset, unit in transfers_for_runs(sources, runs):
-                        token_span = (lo * ratio, hi * ratio)
-                        emit(src_rank, dst_rank, component, (hi - lo) * unit,
-                             source_stage=source_stage, destination_stage=destination_stage,
-                             layer=layer.index, source_span=(0, num_heads),
-                             destination_span=(0, num_heads), source_tokens=token_span,
-                             destination_tokens=token_span, tier=tier,
-                             source_storage=f"pd:kv:{request}:prefill:r{prefill_rep}:rank{src_rank}",
-                             destination_storage=storage, source_size=size,
-                             source_displacement=offset, destination_size=target_rows * unit,
-                             destination_displacement=received * unit)
-                        received += hi - lo
-                continue
-            for dest_index, dest_rank, dest_values, dest_tokens in dst_views:
-                need = float(dest_values.get(component, 0))
-                dst_storage = f"pd:kv:{request}:decode:r{decode_rep}:rank{dest_rank}"
-                remaining = need
-                for src_index, src_rank, src_values, src_tokens in src_views:
-                    if remaining <= 1e-9:
-                        break
-                    if windowed:
-                        src_tokens = (max(window_start, src_tokens[0]),
-                                      min(tokens, src_tokens[1]))
-                    available = float(src_values.get(component, 0.0))
-                    take = min(available, remaining)
-                    if take <= 0.0:
-                        continue
-                    emit(src_rank, dest_rank, component, take,
-                         source_stage=source_stage,
-                         destination_stage=destination_stage,
-                         layer=layer.index,
-                         source_span=(0, num_heads),
-                         destination_span=(0, num_heads),
-                         source_tokens=src_tokens,
-                         destination_tokens=dest_tokens,
-                         source_storage=f"pd:kv:{request}:prefill:r{prefill_rep}:rank{src_rank}",
-                         destination_storage=dst_storage, source_size=available,
-                         destination_size=need, destination_displacement=need - remaining)
-                    remaining -= take
-                if remaining > max(1e-9, need * 1e-12):
-                    raise ModelingError(
-                        "pd_handoff_component_range_uncovered:"
-                        f"{request}:{layer.index}:{component}:{remaining}")
+        _bind_layer_handoff(
+            layer, request, tokens, published, emit, prefill_exec, decode_exec,
+            prefill_rep, decode_rep, prefill_case, decode_case, prefill_p, decode_p,
+            prefill_mem, decode_mem, offload, offload_layers, hot_tokens)
     if not transfers:
         return PDHandoff.build(
             request, (), memory_work=tuple(sorted(demands.items()))), (), ()
@@ -473,6 +275,244 @@ def _pd_handoff_binding(request, tokens, placement, cases, memory, execution,
             if shared_buffer_capacity is not None else None),
         receive_host_bytes=dict(host_bytes))
     return handoff, tuple(sorted(source_ranks)), tuple(sorted(destination_ranks))
+
+
+def _handoff_rank_views(case, layer, parallel, ranks, ledger, owners,
+                        head_spans, has_head_axis, tokens):
+    if owners is not None:
+        # A T05 owner partition is the exact physical fact.
+        spans = tuple(
+            _token_span(ledger, index, tokens)
+            for index in range(len(ranks)))
+        component_owners = owners
+    else:
+        spans = tuple(
+            _head_token_span(index, tokens, head_spans if has_head_axis else (), parallel.cp)
+            for index in range(len(ranks)))
+        # Feed the same exact partition to the cache ledger: an even
+        # ``rows / cp`` split would bill 160/160 B for the [0,2) and
+        # [2,5) shards instead of the exact 128/192 B they own.
+        component_owners = spans
+    result = []
+    for index, rank in enumerate(ranks):
+        components = layer_cache_components(
+            case.model, layer, parallel, tokens, capacity_padded=False,
+            interleave=case.runtime.kv_block_size,
+            rank=index, owner_spans=component_owners)
+        result.append((index, rank, components, spans[index]))
+    return result
+
+
+def _bind_layer_handoff(
+    layer, request, tokens, published, emit, prefill_exec, decode_exec,
+    prefill_rep, decode_rep, prefill_case, decode_case, prefill_p, decode_p,
+    prefill_mem, decode_mem, offload, offload_layers, hot_tokens,
+):
+    source_stage = prefill_mem.layer_stage[layer.index]
+    destination_stage = decode_mem.layer_stage[layer.index]
+    source = tuple(prefill_exec.topology.ranks(prefill_rep, source_stage))
+    destination = tuple(decode_exec.topology.ranks(decode_rep, destination_stage))
+    if not source or not destination:
+        raise ModelingError("pd_handoff_missing_stage_ranks:" + request)
+    num_heads = int(getattr(layer, "num_kv_heads", 0) or 0)
+    has_head_axis = layer.attention in {"gqa", "projection_only"}
+    source_spans = _local_head_spans(num_heads, prefill_p.tp)
+    target_spans = _local_head_spans(num_heads, decode_p.tp)
+    source_owners = getattr(prefill_mem, "rank_token_owners", None)
+    target_owners = getattr(decode_mem, "rank_token_owners", None)
+
+
+    src_views = _handoff_rank_views(
+        prefill_case, layer, prefill_p, source, prefill_mem,
+        source_owners, source_spans, has_head_axis, tokens)
+    dst_views = _handoff_rank_views(
+        decode_case, layer, decode_p, destination, decode_mem,
+        target_owners, target_spans, has_head_axis, tokens)
+    components = {name for _, _, values, _ in src_views for name in values}
+    components |= {name for _, _, values, _ in dst_views for name in values}
+    gqa_components = {name for name in HEAD_COMPONENTS
+                      if has_head_axis and num_heads > 0}
+    split_kv = (num_heads > 0
+                and _published_for(published, "prefill", request,
+                                   layer.index, "gqa_k") is not None
+                and _published_for(published, "prefill", request,
+                                   layer.index, "gqa_v") is not None)
+    for component in sorted(components):
+        window = int(getattr(layer, "window", 0) or 0)
+        windowed = component == "window" or (
+            component in {"gqa_kv", "mla_kv"} and window > 0)
+        window_start = max(0, tokens - window) if windowed else 0
+        if component in gqa_components:
+            _emit_head_transfers(
+                emit, request, component, layer, source_stage, destination_stage,
+                prefill_rep, decode_rep, src_views, dst_views, source_spans,
+                target_spans, windowed, window_start, tokens, split_kv)
+            continue
+        row_component = component in {"mla_kv", "window", "compressed_kv", "index_k"}
+        if row_component:
+            _emit_row_transfers(
+                emit, request, component, layer, source_stage, destination_stage,
+                prefill_rep, decode_rep, src_views, dst_views, prefill_case,
+                decode_case, prefill_p, decode_p, tokens, window_start, num_heads,
+                offload, offload_layers, hot_tokens, destination)
+            continue
+        for dest_index, dest_rank, dest_values, dest_tokens in dst_views:
+            need = float(dest_values.get(component, 0))
+            dst_storage = f"pd:kv:{request}:decode:r{decode_rep}:rank{dest_rank}"
+            remaining = need
+            for src_index, src_rank, src_values, src_tokens in src_views:
+                if remaining <= 1e-9:
+                    break
+                if windowed:
+                    src_tokens = (max(window_start, src_tokens[0]),
+                                  min(tokens, src_tokens[1]))
+                available = float(src_values.get(component, 0.0))
+                take = min(available, remaining)
+                if take <= 0.0:
+                    continue
+                emit(src_rank, dest_rank, component, take,
+                     source_stage=source_stage,
+                     destination_stage=destination_stage,
+                     layer=layer.index,
+                     source_span=(0, num_heads),
+                     destination_span=(0, num_heads),
+                     source_tokens=src_tokens,
+                     destination_tokens=dest_tokens,
+                     source_storage=f"pd:kv:{request}:prefill:r{prefill_rep}:rank{src_rank}",
+                     destination_storage=dst_storage, source_size=available,
+                     destination_size=need, destination_displacement=need - remaining)
+                remaining -= take
+            if remaining > max(1e-9, need * 1e-12):
+                raise ModelingError(
+                    "pd_handoff_component_range_uncovered:"
+                    f"{request}:{layer.index}:{component}:{remaining}")
+
+
+def _emit_head_transfers(
+    emit, request, component, layer, source_stage, destination_stage,
+    prefill_rep, decode_rep, src_views, dst_views, source_spans, target_spans,
+    windowed, window_start, tokens, split_kv,
+):
+    for dest_index, dest_rank, dest_values, dest_tokens in dst_views:
+        need = float(dest_values.get(component, 0.0))
+        dspan = target_spans[dest_index % max(1, len(target_spans))]
+        d_lo, d_hi = dest_tokens
+        if windowed:
+            d_lo, d_hi = max(window_start, d_lo), min(tokens, d_hi)
+        if (need <= 0.0 or dspan[1] <= dspan[0]
+                or d_hi <= d_lo):
+            continue
+        # A destination row needs a per-head payload only for the
+        # token rows a source rank actually owns.  The head and
+        # token axes are independent intersections.
+        per_head_token = (need / float(dspan[1] - dspan[0])
+                          / float(d_hi - d_lo))
+        covered: dict[int, list[tuple[int, int]]] = {}
+        for src_index, src_rank, src_values, src_tokens in src_views:
+            sspan = source_spans[src_index % max(1, len(source_spans))]
+            common = [head for head in range(dspan[0], dspan[1])
+                      if sspan[0] <= head < sspan[1]]
+            if not common:
+                continue
+            s_lo, s_hi = src_tokens
+            if windowed:
+                s_lo, s_hi = (max(window_start, s_lo),
+                              min(tokens, s_hi))
+            lo, hi = max(s_lo, d_lo), min(s_hi, d_hi)
+            if hi <= lo:
+                continue
+            src_storage = f"pd:kv:{request}:prefill:r{prefill_rep}:rank{src_rank}"
+            dst_storage = f"pd:kv:{request}:decode:r{decode_rep}:rank{dest_rank}"
+            grouped: dict[tuple[int, int], list[int]] = {}
+            for head in common:
+                for piece_lo, piece_hi in _uncovered_intervals(
+                        covered.get(head, ()), lo, hi):
+                    grouped.setdefault(
+                        (piece_lo, piece_hi), []).append(head)
+                    covered.setdefault(head, []).append(
+                        (piece_lo, piece_hi))
+            for (piece_lo, piece_hi), heads in grouped.items():
+                spans_all_rows = (piece_lo, piece_hi) == (s_lo, s_hi)
+                spans_all_rows &= (piece_lo, piece_hi) == (d_lo, d_hi)
+                consecutive = heads[-1] - heads[0] + 1 == len(heads)
+                groups = ([heads] if spans_all_rows and consecutive
+                          else ([head] for head in heads))
+                planes = ("gqa_k", "gqa_v") if split_kv else (component,)
+                for group in groups:
+                    first = (group[0] - sspan[0]) * (s_hi - s_lo)
+                    offset = first + piece_lo - s_lo
+                    for plane in planes:
+                        unit = per_head_token / len(planes)
+                        emit(src_rank, dest_rank, plane,
+                             unit * (piece_hi - piece_lo) * len(group),
+                             source_stage=source_stage,
+                             destination_stage=destination_stage,
+                             layer=layer.index, source_span=sspan,
+                             destination_span=dspan,
+                             source_tokens=(piece_lo, piece_hi),
+                             destination_tokens=(piece_lo, piece_hi),
+                             source_storage=src_storage,
+                             destination_storage=dst_storage,
+                             source_size=src_values[component] / len(planes),
+                             source_displacement=unit * offset,
+                             destination_size=need / len(planes),
+                             destination_displacement=unit * (
+                                 (group[0] - dspan[0]) * (d_hi - d_lo)
+                                 + piece_lo - d_lo))
+        missing = [head for head in range(dspan[0], dspan[1])
+                   if sum(piece_hi - piece_lo for piece_lo, piece_hi
+                          in covered.get(head, ())) < d_hi - d_lo]
+        if missing:
+            raise ModelingError(
+                "pd_handoff_source_head_uncovered:"
+                f"{request}:{layer.index}:{dest_rank}:{missing}")
+
+
+def _emit_row_transfers(
+    emit, request, component, layer, source_stage, destination_stage,
+    prefill_rep, decode_rep, src_views, dst_views, prefill_case, decode_case,
+    prefill_p, decode_p, tokens, window_start, num_heads, offload,
+    offload_layers, hot_tokens, destination,
+):
+    def manifest(case, parallel, entries):
+        return [(rank, owned_runs(component, layer, case.model, parallel,
+                                  index, span, tokens, window_start),
+                 values.get(component, 0))
+                for index, rank, values, span in entries]
+
+    sources = manifest(prefill_case, prefill_p, src_views)
+    destinations = manifest(decode_case, decode_p, dst_views)
+    sparse_layer = offload and component == "mla_kv" and layer.index in offload_layers
+    receivers = []
+    if sparse_layer:
+        receivers.append((destination[0], ((window_start, tokens),),
+                          "host", f"pd:host:{request}:decode:r{decode_rep}"))
+    for rank, runs, need in destinations:
+        if need <= 0:
+            continue
+        if sparse_layer:
+            runs = tuple((max(lo, tokens - hot_tokens), hi) for lo, hi in runs
+                         if hi > max(lo, tokens - hot_tokens))
+        storage = f"pd:kv:{request}:decode:r{decode_rep}:rank{rank}"
+        receivers.append((rank, runs, "hbm", storage))
+    ratio = (max(1, layer.compress_ratio, layer.index_kpool)
+             if component == "index_k" else max(1, layer.compress_ratio)
+             if component == "compressed_kv" else 1)
+    for dst_rank, runs, tier, storage in receivers:
+        target_rows = sum(hi - lo for lo, hi in runs)
+        received = 0
+        for src_rank, lo, hi, size, offset, unit in transfers_for_runs(sources, runs):
+            token_span = (lo * ratio, hi * ratio)
+            emit(src_rank, dst_rank, component, (hi - lo) * unit,
+                 source_stage=source_stage, destination_stage=destination_stage,
+                 layer=layer.index, source_span=(0, num_heads),
+                 destination_span=(0, num_heads), source_tokens=token_span,
+                 destination_tokens=token_span, tier=tier,
+                 source_storage=f"pd:kv:{request}:prefill:r{prefill_rep}:rank{src_rank}",
+                 destination_storage=storage, source_size=size,
+                 source_displacement=offset, destination_size=target_rows * unit,
+                 destination_displacement=received * unit)
+            received += hi - lo
 
 
 def _consumer_release_done(engine, target, on_consumer, rank):

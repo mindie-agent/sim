@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 
 from mindie_sim.schema.common import ModelingError
-from ..exposed_breakdown import ExposedClocks, roofline_clocks
+from ..efficiency.exposed_breakdown import ExposedClocks, roofline_clocks
 
 
 ZERO = 0.0

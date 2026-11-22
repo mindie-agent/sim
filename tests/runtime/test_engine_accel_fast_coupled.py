@@ -20,7 +20,7 @@ from types import SimpleNamespace
 import pytest
 
 from mindie_sim.api import compose_case
-from mindie_sim.prediction.body import target_graphs
+from mindie_sim.prediction.operator_analysis import target_graphs
 from mindie_sim.prediction.graph_analysis import graph_costs
 from mindie_sim.prediction.runtime import accel_build
 from mindie_sim.prediction.runtime.arbiter_fast_coupled import (

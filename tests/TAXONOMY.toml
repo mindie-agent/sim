@@ -17,7 +17,7 @@ owns = ["mindie_sim/backends/ascend.py", "mindie_sim/schema/hardware.py", "mindi
 [[module]]
 path = "schema/test_catalog_and_parallel_axes.py"
 tier = "tier0"
-owns = ["mindie_sim/catalog", "mindie_sim/schema/parallel.py", "mindie_sim/prediction/local_tp_groups.py", "tools/export_subgraph_bench_plan.py", "tools/bench_plan_builders.py", "tools/bench_plan_parallel.py", "tools/bench_packets.py"]
+owns = ["mindie_sim/catalog", "mindie_sim/schema/parallel.py", "mindie_sim/prediction/sharding/local_tp.py", "tools/export_subgraph_bench_plan.py", "tools/bench_plan_builders.py", "tools/bench_plan_parallel.py", "tools/bench_packets.py"]
 [[module]]
 path = "schema/test_model_catalog_conservation.py"
 tier = "tier0"
@@ -76,7 +76,7 @@ owns = ["mindie_sim/prediction/runtime/arbiter_fast_coupled.py", "mindie_sim/pre
 [[module]]
 path = "runtime/test_coupled_and_periodic.py"
 tier = "tier0"
-owns = ["mindie_sim/prediction/coupled.py", "mindie_sim/prediction/primitives.py"]
+owns = ["mindie_sim/prediction/runtime/coupled.py", "mindie_sim/prediction/program/primitives.py"]
 [[module]]
 path = "runtime/test_periodic_cycle_detector.py"
 tier = "tier0"
@@ -92,7 +92,7 @@ owns = ["mindie_sim/prediction/operators/matrix/matrix.py", "mindie_sim/predicti
 [[module]]
 path = "runtime/test_memory_ledger_and_capacity.py"
 tier = "tier0"
-owns = ["mindie_sim/prediction/cache_path", "mindie_sim/prediction/capacity", "mindie_sim/prediction/cost.py", "mindie_sim/prediction/execution"]
+owns = ["mindie_sim/prediction/cache_path", "mindie_sim/prediction/capacity", "mindie_sim/prediction/efficiency/cost.py", "mindie_sim/prediction/execution"]
 [[module]]
 path = "runtime/test_capacity_allocation_geometry.py"
 tier = "tier0"
@@ -112,11 +112,11 @@ owns = ["mindie_sim/catalog/cache_format.py", "mindie_sim/prediction/cache_execu
 [[module]]
 path = "runtime/test_offload_tiers.py"
 tier = "tier0"
-owns = ["mindie_sim/catalog/draft_geometry.py", "mindie_sim/compose.py", "mindie_sim/prediction/capacity", "mindie_sim/prediction/cost.py"]
+owns = ["mindie_sim/catalog/draft_geometry.py", "mindie_sim/compose/__init__.py", "mindie_sim/prediction/capacity", "mindie_sim/prediction/efficiency/cost.py"]
 [[module]]
 path = "runtime/test_invocation_boundary.py"
 tier = "tier0"
-owns = ["mindie_sim/prediction/call.py", "mindie_sim/prediction/cost.py", "mindie_sim/prediction/engine.py", "mindie_sim/prediction/execution"]
+owns = ["mindie_sim/prediction/program/invocation.py", "mindie_sim/prediction/efficiency/cost.py", "mindie_sim/prediction/engine.py", "mindie_sim/prediction/execution"]
 [[module]]
 path = "runtime/test_resource_services_and_exposed_time.py"
 tier = "tier0"
@@ -128,19 +128,19 @@ owns = ["mindie_sim/catalog/ops.py", "mindie_sim/catalog/types.py", "mindie_sim/
 [[module]]
 path = "runtime/test_fragment_executor.py"
 tier = "tier0"
-owns = ["mindie_sim/observations/resource_services.py", "mindie_sim/prediction/capacity", "mindie_sim/prediction/cost.py", "mindie_sim/prediction/engine.py"]
+owns = ["mindie_sim/observations/resource_services.py", "mindie_sim/prediction/capacity", "mindie_sim/prediction/efficiency/cost.py", "mindie_sim/prediction/engine.py"]
 [[module]]
 path = "runtime/test_remote_exec.py"
 tier = "tier0"
-owns = ["mindie_sim/remote_exec.py", "mindie_sim/_remote_worker.py"]
+owns = ["mindie_sim/remote_exec.py"]
 [[module]]
 path = "runtime/test_remote_exec_batch.py"
 tier = "tier1"
-owns = ["mindie_sim/remote_exec.py", "mindie_sim/_remote_worker.py", "mindie_sim/prediction/runtime/accel_build.py", "mindie_sim/prediction/runtime/accel_loader.py"]
+owns = ["mindie_sim/remote_exec.py", "mindie_sim/prediction/runtime/accel_build.py", "mindie_sim/prediction/runtime/accel_loader.py"]
 [[module]]
 path = "runtime/test_formal_lean_locks.py"
 tier = "tier0"
-owns = ["formal/MindIESimSpec", "formal/AxiomCheck.lean", "mindie_sim/prediction/exposed_breakdown.py", "mindie_sim/prediction/weight_prefetch.py", "mindie_sim/prediction/local_projection_tp.py", "mindie_sim/prediction/operators/recurrent/recover_ssm_work.py", "mindie_sim/prediction/collective_startup.py", "mindie_sim/prediction/roofline_graph.py", "mindie_sim/optimization/dual_bound.py", "mindie_sim/optimization/reload_bounds.py"]
+owns = ["formal/MindIESimSpec", "formal/AxiomCheck.lean", "mindie_sim/prediction/efficiency/exposed_breakdown.py", "mindie_sim/prediction/execution/weight_prefetch.py", "mindie_sim/prediction/sharding/local_tp.py", "mindie_sim/prediction/operators/recurrent/recover_ssm_work.py", "mindie_sim/prediction/collectives/startup.py", "mindie_sim/prediction/efficiency/roofline_graph.py", "mindie_sim/optimization/dual_bound.py", "mindie_sim/optimization/reload_bounds.py"]
 # ---------------------------------------------------------------- collectives
 [[module]]
 path = "collectives/test_topology_and_ports.py"
@@ -149,7 +149,7 @@ owns = ["mindie_sim/prediction/collectives", "mindie_sim/schema/hardware_links.p
 [[module]]
 path = "collectives/test_collective_startup_and_bands.py"
 tier = "tier0"
-owns = ["mindie_sim/catalog/ops.py", "mindie_sim/prediction/collective_readiness.py", "mindie_sim/prediction/collective_startup.py", "mindie_sim/prediction/collective_waves.py"]
+owns = ["mindie_sim/catalog/ops.py", "mindie_sim/prediction/collectives/readiness.py", "mindie_sim/prediction/collectives/startup.py", "mindie_sim/prediction/collectives/waves.py"]
 [[module]]
 path = "collectives/test_hccl_algorithms.py"
 tier = "tier0"
@@ -157,7 +157,7 @@ owns = ["mindie_sim/prediction/engine.py", "mindie_sim/prediction/operators/coll
 [[module]]
 path = "collectives/test_collective_volume_conservation.py"
 tier = "tier0"
-owns = ["mindie_sim/prediction/cohort_traffic.py", "mindie_sim/prediction/collectives", "mindie_sim/prediction/operators/collectives/direct_peer.py", "mindie_sim/prediction/engine.py"]
+owns = ["mindie_sim/prediction/execution/cohort_traffic.py", "mindie_sim/prediction/collectives", "mindie_sim/prediction/operators/collectives/direct_peer.py", "mindie_sim/prediction/engine.py"]
 [[module]]
 path = "collectives/test_network_links_and_fabric.py"
 tier = "tier0"
@@ -169,7 +169,7 @@ owns = ["mindie_sim/prediction", "mindie_sim/prediction/operators/collectives/hc
 [[module]]
 path = "collectives/test_joint_cohort_execution.py"
 tier = "tier0"
-owns = ["mindie_sim/prediction/body.py", "mindie_sim/prediction/collectives", "mindie_sim/prediction/cost.py", "mindie_sim/prediction/engine.py"]
+owns = ["mindie_sim/prediction/frontend/body.py", "mindie_sim/prediction/collectives", "mindie_sim/prediction/efficiency/cost.py", "mindie_sim/prediction/engine.py"]
 # ---------------------------------------------------------------- operators
 [[module]]
 path = "operators/test_rotary.py"
@@ -258,7 +258,7 @@ owns = ["mindie_sim/prediction/operators/mc2"]
 [[module]]
 path = "operators/test_matrix_tiling_and_traffic.py"
 tier = "tier0"
-owns = ["mindie_sim/catalog/ops.py", "mindie_sim/catalog/quant.py", "mindie_sim/catalog/types.py", "mindie_sim/prediction/cost.py"]
+owns = ["mindie_sim/catalog/ops.py", "mindie_sim/catalog/quant.py", "mindie_sim/catalog/types.py", "mindie_sim/prediction/efficiency/cost.py"]
 [[module]]
 path = "operators/test_matrix_epilogue_and_output.py"
 tier = "tier0"
@@ -274,7 +274,7 @@ owns = ["mindie_sim/catalog/ops.py", "mindie_sim/catalog/types.py", "mindie_sim/
 [[module]]
 path = "operators/test_vector_norm_quant.py"
 tier = "tier0"
-owns = ["mindie_sim/catalog/ops.py", "mindie_sim/catalog/quant.py", "mindie_sim/observations/call_bindings_activation.py", "mindie_sim/observations/captures.py"]
+owns = ["mindie_sim/catalog/ops.py", "mindie_sim/catalog/quant.py", "mindie_sim/observations/comparison.py", "mindie_sim/observations/captures.py"]
 [[module]]
 path = "operators/test_custom_op_libraries.py"
 tier = "tier0"
@@ -295,11 +295,11 @@ owns = ["mindie_sim/prediction/streams.py"]
 [[module]]
 path = "spine/test_stars_and_eager_d2h.py"
 tier = "tier0"
-owns = ["mindie_sim/prediction/execution", "mindie_sim/prediction/serving_io.py", "mindie_sim/schema/datapath.py"]
+owns = ["mindie_sim/prediction/execution", "mindie_sim/prediction/execution/serving_io.py", "mindie_sim/schema/datapath.py"]
 [[module]]
 path = "spine/test_prediction_spine.py"
 tier = "tier0"
-owns = ["mindie_sim/api.py", "mindie_sim/prediction/body_defaults.py", "mindie_sim/prediction/operator_analysis.py", "mindie_sim/structure.py"]
+owns = ["mindie_sim/api.py", "mindie_sim/prediction/body_defaults.py", "mindie_sim/prediction/operator_analysis.py", "mindie_sim/structure/__init__.py"]
 [[module]]
 path = "spine/test_spine_assembly_and_replay.py"
 tier = "tier0"
@@ -311,11 +311,11 @@ owns = ["mindie_sim/study.py", "mindie_sim/__main__.py", "mindie_sim/catalog/cac
 [[module]]
 path = "spine/test_body_lowering_defaults.py"
 tier = "tier0"
-owns = ["mindie_sim/__main__.py", "mindie_sim/compose.py", "mindie_sim/prediction/body.py", "mindie_sim/prediction/body_defaults.py"]
+owns = ["mindie_sim/__main__.py", "mindie_sim/compose/__init__.py", "mindie_sim/prediction/frontend/body.py", "mindie_sim/prediction/body_defaults.py"]
 [[module]]
 path = "spine/test_implementation_selection.py"
 tier = "tier0"
-owns = ["mindie_sim/study.py", "mindie_sim/catalog/quant.py", "mindie_sim/compose.py", "mindie_sim/feature_mechanisms.py"]
+owns = ["mindie_sim/study.py", "mindie_sim/catalog/quant.py", "mindie_sim/compose/__init__.py", "mindie_sim/feature_mechanisms.py"]
 [[module]]
 path = "spine/test_call_scopes_and_alignment.py"
 tier = "tier0"
@@ -327,11 +327,11 @@ owns = ["mindie_sim/catalog/cache.py", "mindie_sim/catalog/ops.py", "mindie_sim/
 [[module]]
 path = "spine/test_structure_contracts.py"
 tier = "tier0"
-owns = ["mindie_sim/catalog/ops.py", "mindie_sim/prediction/operator_analysis.py", "mindie_sim/prediction/program", "mindie_sim/prediction/services.py"]
+owns = ["mindie_sim/catalog/ops.py", "mindie_sim/prediction/operator_analysis.py", "mindie_sim/prediction/program", "mindie_sim/prediction/service_regime_domains/services.py"]
 [[module]]
 path = "spine/test_sequence_and_context_parallel.py"
 tier = "tier0"
-owns = ["mindie_sim/catalog/ops.py", "mindie_sim/compose.py", "mindie_sim/model_catalog.py", "mindie_sim/prediction/operators/attention/attention_decode.py"]
+owns = ["mindie_sim/catalog/ops.py", "mindie_sim/compose/__init__.py", "mindie_sim/model_catalog.py", "mindie_sim/prediction/operators/attention/attention_decode.py"]
 [[module]]
 path = "spine/test_native_fusion_boundaries.py"
 tier = "tier0"
@@ -339,7 +339,7 @@ owns = ["mindie_sim/catalog/cache.py", "mindie_sim/catalog/cache_format.py", "mi
 [[module]]
 path = "spine/test_typed_graph_transforms.py"
 tier = "tier0"
-owns = ["mindie_sim/catalog/ops.py", "mindie_sim/catalog/quant.py", "mindie_sim/prediction/blocks.py", "mindie_sim/prediction/graph.py"]
+owns = ["mindie_sim/catalog/ops.py", "mindie_sim/catalog/quant.py", "mindie_sim/prediction/frontend/body_spec.py", "mindie_sim/prediction/graph.py"]
 [[module]]
 path = "spine/test_cartesian_structure_matrix.py"
 tier = "tier1"
@@ -352,32 +352,32 @@ owns = ["mindie_sim/catalog/quant.py", "mindie_sim/prediction", "mindie_sim/pred
 [[module]]
 path = "serving/test_serving_scheduler_and_admission.py"
 tier = "tier0"
-owns = ["mindie_sim/compose.py", "mindie_sim/prediction", "mindie_sim/prediction/dispatch.py", "mindie_sim/prediction/api.py"]
+owns = ["mindie_sim/compose/__init__.py", "mindie_sim/prediction", "mindie_sim/prediction/execution/dispatch.py", "mindie_sim/prediction/api.py"]
 [[module]]
 path = "serving/test_service_regimes.py"
 tier = "tier0"
-owns = ["mindie_sim/catalog/quant.py", "mindie_sim/prediction/body_defaults.py", "mindie_sim/prediction/operator_analysis.py", "mindie_sim/prediction/cost.py"]
+owns = ["mindie_sim/catalog/quant.py", "mindie_sim/prediction/body_defaults.py", "mindie_sim/prediction/operator_analysis.py", "mindie_sim/prediction/efficiency/cost.py"]
 [[module]]
 path = "serving/test_sla_pd_and_sweep_solvers.py"
 tier = "tier0"
-owns = ["mindie_sim/sweep.py", "mindie_sim/sweep_engine.py", "mindie_sim/__main__.py", "mindie_sim/compose.py"]
+owns = ["mindie_sim/sweep/__init__.py", "mindie_sim/sweep/engine.py", "mindie_sim/__main__.py", "mindie_sim/compose/__init__.py"]
 [[module]]
 path = "serving/test_sku_and_candidate_studies.py"
 tier = "tier0"
-owns = ["mindie_sim/runtime_advisor.py", "mindie_sim/study.py", "mindie_sim/__main__.py", "mindie_sim/compose.py"]
+owns = ["mindie_sim/runtime_advisor.py", "mindie_sim/study.py", "mindie_sim/__main__.py", "mindie_sim/compose/__init__.py"]
 [[module]]
 path = "serving/test_three_domain_and_pooled_pd.py"
 tier = "tier0"
-owns = ["mindie_sim/compose.py", "mindie_sim/compose_runtime.py", "mindie_sim/sweep_pd.py", "mindie_sim/prediction/offload/policy.py", "mindie_sim/prediction/disaggregated/handoff.py"]
+owns = ["mindie_sim/compose/__init__.py", "mindie_sim/compose/runtime.py", "mindie_sim/sweep/pd.py", "mindie_sim/prediction/offload/policy.py", "mindie_sim/prediction/disaggregated/handoff.py"]
 # ---------------------------------------------------------------- observations
 [[module]]
 path = "observations/test_multilevel_gate.py"
 tier = "tier0"
-owns = ["mindie_sim/observations/multilevel_gate.py", "mindie_sim/observations/multilevel_stream.py", "scripts/diagnose_tail_cluster.py"]
+owns = ["mindie_sim/observations/multilevel.py", "scripts/diagnose_tail_cluster.py"]
 [[module]]
 path = "observations/test_capture_ingestion.py"
 tier = "tier0"
-owns = ["mindie_sim/__main__.py", "mindie_sim/observations/calibration.py", "mindie_sim/observations/call_alignment.py", "mindie_sim/observations/captures.py"]
+owns = ["mindie_sim/__main__.py", "mindie_sim/observations/calibration.py", "mindie_sim/observations/comparison.py", "mindie_sim/observations/captures.py"]
 [[module]]
 path = "observations/test_communication_observations.py"
 tier = "tier0"
@@ -385,24 +385,24 @@ owns = ["mindie_sim/observations/communication"]
 [[module]]
 path = "observations/test_resource_phase_calibration.py"
 tier = "tier0"
-owns = ["mindie_sim/compose.py", "mindie_sim/observations/calibration.py", "mindie_sim/observations/communication", "mindie_sim/observations/resource_services.py"]
+owns = ["mindie_sim/compose/__init__.py", "mindie_sim/observations/calibration.py", "mindie_sim/observations/communication", "mindie_sim/observations/resource_services.py"]
 [[module]]
 path = "observations/test_resource_counterfactuals.py"
 tier = "tier0"
-owns = ["mindie_sim/compose.py", "mindie_sim/prediction", "mindie_sim/prediction/efficiency", "mindie_sim/prediction/capacity"]
+owns = ["mindie_sim/compose/__init__.py", "mindie_sim/prediction", "mindie_sim/prediction/efficiency", "mindie_sim/prediction/capacity"]
 [[module]]
 path = "observations/test_scoreboards_and_cohorts.py"
 tier = "tier0"
-owns = ["mindie_sim/cohort_accuracy.py", "mindie_sim/cohort_comparison.py", "mindie_sim/compose.py", "mindie_sim/observations/accuracy.py"]
+owns = ["mindie_sim/cohort_accuracy.py", "mindie_sim/compose/__init__.py", "mindie_sim/observations/comparison.py"]
 [[module]]
 path = "observations/test_model_scoreboards.py"
 tier = "tier0"
-owns = ["mindie_sim/coverage", "mindie_sim/observations/scoreboard.py", "mindie_sim/observations/scoreboard_accuracy.py"]
+owns = ["mindie_sim/coverage", "mindie_sim/observations/scoreboard.py"]
 # ---------------------------------------------------------------- product
 [[module]]
 path = "product/test_sdk_and_cli.py"
 tier = "tier1"
-owns = ["mindie_sim/api.py", "mindie_sim/cli.py", "mindie_sim/cli_parser.py", "mindie_sim/cli_commands.py"]
+owns = ["mindie_sim/api.py", "mindie_sim/cli/__init__.py", "mindie_sim/cli/parser.py", "mindie_sim/cli/commands.py"]
 [[module]]
 path = "product/test_profiler_ssot.py"
 tier = "tier1"
@@ -415,7 +415,7 @@ owns = ["mindie_sim/optimization/ladder.py", "mindie_sim/optimization/contracts.
 [[module]]
 path = "product/test_accuracy_gates.py"
 tier = "tier0"
-owns = ["mindie_sim/catalog/cache_format.py", "mindie_sim/catalog/weights.py", "mindie_sim/compose.py", "mindie_sim/prediction/efficiency"]
+owns = ["mindie_sim/catalog/cache_format.py", "mindie_sim/catalog/weights.py", "mindie_sim/compose/__init__.py", "mindie_sim/prediction/efficiency"]
 [[module]]
 path = "product/test_rewrite_apply.py"
 tier = "tier0"
@@ -427,7 +427,7 @@ owns = ["mindie_sim/rewrite/verify.py", "mindie_sim/optimization/framework_solve
 [[module]]
 path = "product/test_wheel_and_extension_sdk.py"
 tier = "tier1"
-owns = ["mindie_sim/backends/ascend.py", "mindie_sim/public", "mindie_sim/schema/hardware.py", "mindie_sim/prediction/body.py"]
+owns = ["mindie_sim/backends/ascend.py", "mindie_sim/public", "mindie_sim/schema/hardware.py", "mindie_sim/prediction/frontend/body.py"]
 [[module]]
 path = "product/test_workbench_exports.py"
 tier = "tier0"
@@ -470,7 +470,7 @@ owns = ["mindie_sim/rewrite/oracle.py"]
 [[module]]
 path = "spine/test_spine_prevention_locks.py"
 tier = "tier0"
-owns = ["mindie_sim/prediction/spine.py", "mindie_sim/prediction/implementation_registry.py", "mindie_sim/prediction/physical_recipe_registry.py", "mindie_sim/schema/workload.py"]
+owns = ["mindie_sim/prediction/spine.py", "mindie_sim/prediction/program/implementation_registry.py", "mindie_sim/prediction/physical_recipe_registry.py", "mindie_sim/schema/workload.py"]
 
 [[module]]
 path = "hygiene/test_spine_bounds_and_wiring_locks.py"
@@ -485,19 +485,19 @@ owns = ["scripts/verify_catalog_subgraphs.py", "scripts/run_1layer_npu_subgraphs
 [[module]]
 path = "operators/test_context_parallel_graph.py"
 tier = "tier0"
-owns = ["mindie_sim/prediction/operators/context_parallel"]
+owns = ["mindie_sim/prediction/sharding/context_parallel.py"]
 
 [[module]]
 path = "product/test_parallel_generalization_and_sweeps.py"
 tier = "tier0"
-owns = ["mindie_sim/catalog/context_parallel.py", "mindie_sim/sweep_resize.py", "mindie_sim/runtime_profiles.py"]
+owns = ["mindie_sim/catalog/context_parallel.py", "mindie_sim/sweep/resize.py", "mindie_sim/runtime_profiles.py"]
 
 [[module]]
 path = "product/test_onboarding_pipelines.py"
 tier = "tier1"
 owns = [
   "mindie_sim/onboarding",
-  "mindie_sim/cli_onboarding.py",
+  "mindie_sim/cli/onboarding.py",
   "tools/onboard_sku.py",
   "tools/onboard_operator.py",
 ]
@@ -507,5 +507,5 @@ path = "product/test_exporters.py"
 tier = "tier0"
 owns = [
   "mindie_sim/export",
-  "mindie_sim/cli_export.py",
+  "mindie_sim/cli/export.py",
 ]

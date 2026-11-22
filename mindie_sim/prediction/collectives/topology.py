@@ -499,7 +499,7 @@ class Topology(_TopologyPlansMixin):
 
     def startup_descriptor(self, op, group_size):
         """Resolve this collective's declared startup model once."""
-        from ..collective_startup import resolve_collective_startup
+        from ..collectives.startup import resolve_collective_startup
 
         metadata = dict(op.metadata)
         family = str(metadata.get("collective", op.family)).strip().lower()
@@ -764,7 +764,7 @@ class Topology(_TopologyPlansMixin):
         sources = self.ranks(replica, stage)
         declared = dict(metadata or {})
         if axis == "local_tp":
-            from ..local_tp_groups import local_tp_groups
+            from ..sharding.local_tp import local_tp_groups
 
             width = int(declared.get("local_tp_width", 0) or 0)
             stride = int(declared.get("local_tp_stride", 1) or 1)
@@ -848,7 +848,7 @@ class Topology(_TopologyPlansMixin):
                 for idx in range(len(sources))
             )
         if axis == "etp":
-            from ..local_tp_groups import expert_tp_groups
+            from ..sharding.local_tp import expert_tp_groups
 
             return expert_tp_groups(self, replica=replica, stage=stage)
         if axis == "pcp":

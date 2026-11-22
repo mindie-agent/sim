@@ -112,7 +112,7 @@ def test_attention_head_tiling_rejection_has_explicit_reason():
     assert attention_natives(raw) == {MIXED_QUANT_NATIVE}
 
 def test_explicit_bf16_cache_override_preserves_declared_dtype():
-    from mindie_sim.compose_operator_defaults import (CACHE_OVERRIDE_REASON, apply_compose_v41_a5_defaults,)
+    from mindie_sim.compose.operator_defaults import (CACHE_OVERRIDE_REASON, apply_compose_v41_a5_defaults,)
     model = load_model("deepseek-v4.1-flash")
     model_dict = {"metadata": {"cache_representations": {"window": {"dtype": "bf16"},
         "compressed_kv": {"dtype": "bf16"},}}}
@@ -377,7 +377,7 @@ def _apply_captured_parallel(case, geometry):
         return case
     kernels = case["runtime"].setdefault("kernels", {})
     if "sequence_parallel" not in kernels:
-        from mindie_sim.prediction.sequence_parallel import DECLARATION
+        from mindie_sim.prediction.sharding.sequence_parallel import DECLARATION
         kernels["sequence_parallel"] = dict(DECLARATION, padding="right_to_tp")
         case["runtime"].setdefault("metadata", {})["sp"] = True
     return case

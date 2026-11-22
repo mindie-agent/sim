@@ -325,8 +325,171 @@ def evaluate_migration_binding(decomposition, rule_match, rule_id, plan, service
     kind, scope = plan["replacement_kind"], plan["scope"]
     context_values = plan.get("condition_context") or {}
     slice_conditions = plan.get("slice_conditions") or {}
-    conflicts, unresolved, notes, rate_rows = [], [], [], []
-    identification_pending, service_evidence = [], {}
+    conflicts, unresolved, notes = [], [], []
+    identification_pending = []
+    service_evidence = _migration_service_evidence(
+        plan, services, kind, native, scope, rule_id, rule_match,
+        context_values, slice_conditions, old_provenance_negative,
+        old_training_tokens, conflicts, unresolved, notes, identification_pending)
+    rule_check = _condition_check(rule_match or {}, context_values)
+    slice_check = (_condition_check(slice_conditions, context_values) if slice_conditions
+                   else {"applies": True, "checks": [], "policy": "no_slice_conditions"})
+    for scope_name, check in (("rule", rule_check), ("slice", slice_check)):
+        for item in check["checks"]:
+            if not item["present"]:
+                unresolved.append({"scope": scope_name, **item})
+            elif not item["matched"]:
+                conflicts.append(scope_name + "_condition_mismatch:" + item["path"])
+    if len(native_values) > 1:
+        conflicts.append("actual_native_boundary_conflict:" + ",".join(native_values))
+    terms = [term for term in decomposition.get("terms", ())
+             if term.get("kind") in {"resource_rate", "unidentified_slope",
+                                     "declared_resource_supply"}]
+    legacy_fixed = float(decomposition.get("fixed_us", 0))
+    (evaluations, bound_stages, actual_instances, invocation, undelivered_work,
+     work_rows, missing_terms, unbound_terms, external_rows, rate_rows,
+     uncovered_actual_work, real_zero_work, zero_work_with_service) = _migration_bound_work(
+        plan, services, service_evidence, context, native, terms,
+        coordinate_declarations, conflicts, identification_pending)
+    fixed_rows, fixed_occurrences = _migration_fixed_work(
+        plan, decomposition, services, bound_stages, legacy_fixed, invocation,
+        service_evidence, conflicts, notes, identification_pending)
+    complete = (not conflicts and not unresolved and not identification_pending
+                and not uncovered_actual_work
+                and not zero_work_with_service and not undelivered_work
+                and all(evaluation["bound"] for evaluation in evaluations)
+                and (legacy_fixed <= 0 or bool(fixed_rows)))
+    diagnostic_combination = ("max_by_resource"
+                              if decomposition.get("response_class") == "resource_phase_supply"
+                              else "sum")
+    coverage = {
+        "combination": "actual_program_dependencies",
+        "diagnostic_combination": diagnostic_combination,
+        "program": plan.get("program_view"),
+        "work_terms": work_rows, "external_work": external_rows,
+        "actual_work_instances": list(actual_instances.values()),
+        "uncovered_actual_work": uncovered_actual_work,
+        "undelivered_work": undelivered_work,
+        "real_zero_work": real_zero_work,
+        "zero_work_with_service": zero_work_with_service,
+        "fixed": fixed_rows, "fixed_occurrences": fixed_occurrences,
+        "invocation": (None if invocation is None else {
+            **invocation,
+            "fixed_occurrence_count": len(fixed_occurrences),
+            "service_fixed_covers_startup": any(
+                occurrence["kind"] == "service_fixed"
+                and occurrence["covers_invocation_startup"]
+                for occurrence in fixed_occurrences)}),
+        "complete": complete,
+        "fixed_total_us": sum(occurrence["fixed_us"]
+                              for occurrence in fixed_occurrences),
+        "legacy_fixed_us": legacy_fixed,
+    }
+    stage_missing = any(evaluation["stage_missing"] for evaluation in evaluations)
+    if conflicts:
+        status = "conflict"
+    elif unresolved:
+        status = "awaiting_conditions"
+    elif identification_pending:
+        status = "observation_replay"
+    elif stage_missing:
+        status = "awaiting_program_binding"
+    elif complete and scope == "slice":
+        status = "slice_ready"
+    elif complete:
+        status = "ready"
+    elif (any(evaluation["instance"] is not None for evaluation in evaluations)
+          or external_rows or fixed_rows):
+        status = "partial"
+    else:
+        status = "no_binding"
+    blockers = sorted(set(conflicts))
+    blockers.extend(sorted(set(identification_pending)))
+    blockers.extend(sorted({"condition_context_missing:" + str(item.get("path"))
+                            for item in unresolved}))
+    blockers.extend("legacy_work_term_unbound:" + str(index)
+                    for index in missing_terms)
+    blockers.extend(item["blocker"] for item in uncovered_actual_work)
+    blockers.extend("actual_work_undelivered:" + str(item["stage"]) + ":"
+                    + str(item["resource"]) for item in undelivered_work)
+    if status == "awaiting_program_binding":
+        blockers.append("migration_stage_binding_required")
+    if legacy_fixed > 0 and not fixed_rows:
+        blockers.append("legacy_fixed_component_unbound")
+    if status == "no_binding":
+        blockers.append("migration_binding_plan_requires_actual_work")
+    return {
+        "status": status, "blockers": sorted(set(blockers)),
+        "conflicts": sorted(set(conflicts)),
+        "unresolved_conditions": unresolved,
+        "coverage": coverage, "service_evidence": service_evidence,
+        "conditions": {"rule": rule_check, "slice": slice_check,
+                       "services": {sid: item["conditions"]
+                                    for sid, item in service_evidence.items()}},
+        "diagnostics": {
+            "old_provenance_negative": bool(old_provenance_negative),
+            "old_training_tokens": sorted(old_training_tokens),
+            "actual_native_boundary": native,
+            "native_boundary_sources": native_values,
+            "actual_resources": dict(
+                _attr(context, "resource_names", {}) or {}),
+            "actual_invocation": invocation,
+            "rate_comparison": rate_rows,
+            "fixed_comparison": {
+                "legacy_fixed_us": legacy_fixed,
+                "service_fixed_total_us": sum(
+                    occurrence["fixed_us"] for occurrence in fixed_occurrences),
+                "difference_is_diagnostic": True},
+            "fixed_occurrence_count": len(fixed_occurrences),
+            "unbound_legacy_terms": unbound_terms,
+            "undelivered_work_instances": undelivered_work,
+            "notes": sorted(set(notes + [
+                "old_term_indexes_and_formula_are_diagnostic",
+                "old_rate_and_fixed_differences_are_diagnostic",
+                "actual_work_owner_and_fixed_boundary_are_shared_projection",
+                "validation_or_diagnostic_references_do_not_veto_new_training"])),
+        },
+        "scope": {"kind": scope, "slice_conditions": dict(slice_conditions)},
+        "replacement_scope": ("slice" if scope == "slice" else
+                              ("independent_resource" if kind == "independent_service"
+                               else "joint_phase")),
+    }
+
+
+def _migration_fixed_work(
+    plan, decomposition, services, bound_stages, legacy_fixed, invocation,
+    service_evidence, conflicts, notes, identification_pending,
+):
+    plan_for_fixed = dict(plan, decomposition=decomposition)
+    fixed_rows, fixed_occurrences, fixed_conflicts, fixed_notes = _fixed_rows(
+        plan_for_fixed, services, bound_stages, legacy_fixed,
+        invocation=invocation)
+    conflicts.extend(fixed_conflicts)
+    notes.extend(fixed_notes)
+    for row in fixed_rows:
+        evidence = service_evidence.get(row["service_id"], {})
+        if not evidence.get("identification_ready", True):
+            identification_pending.append(
+                "fixed:" + row["stage"] + ":" + row["service_id"])
+    owned_fixed = {(occurrence["actual_stage"], occurrence["service_id"])
+                   for occurrence in fixed_occurrences
+                   if occurrence["kind"] == "service_fixed"}
+    for item in plan["work"]:
+        record = services.get(item["service_id"])
+        if record and record["fixed_us"] > 0 and item["stage"]:
+            occurrence_stage = _fixed_occurrence_stage(plan, item["stage"])
+            if (occurrence_stage, item["service_id"]) not in owned_fixed:
+                conflicts.append("stage_fixed_component_not_owned:"
+                                 + item["stage"] + ":" + item["service_id"])
+    return fixed_rows, fixed_occurrences
+
+
+def _migration_service_evidence(
+    plan, services, kind, native, scope, rule_id, rule_match, context_values,
+    slice_conditions, old_provenance_negative, old_training_tokens, conflicts,
+    unresolved, notes, identification_pending,
+):
+    service_evidence = {}
     referenced = {item["service_id"] for item in plan["work"]}
     referenced |= {item["service_id"] for item in plan["fixed"]}
     for sid in sorted(referenced):
@@ -395,21 +558,13 @@ def evaluate_migration_binding(decomposition, rule_match, rule_id, plan, service
             "valid": not problems, "identification_ready": not source_problems}
         conflicts.extend(sid + ":" + problem for problem in problems)
         identification_pending.extend(sid + ":" + problem for problem in source_problems)
-    rule_check = _condition_check(rule_match or {}, context_values)
-    slice_check = (_condition_check(slice_conditions, context_values) if slice_conditions
-                   else {"applies": True, "checks": [], "policy": "no_slice_conditions"})
-    for scope_name, check in (("rule", rule_check), ("slice", slice_check)):
-        for item in check["checks"]:
-            if not item["present"]:
-                unresolved.append({"scope": scope_name, **item})
-            elif not item["matched"]:
-                conflicts.append(scope_name + "_condition_mismatch:" + item["path"])
-    if len(native_values) > 1:
-        conflicts.append("actual_native_boundary_conflict:" + ",".join(native_values))
-    terms = [term for term in decomposition.get("terms", ())
-             if term.get("kind") in {"resource_rate", "unidentified_slope",
-                                     "declared_resource_supply"}]
-    legacy_fixed = float(decomposition.get("fixed_us", 0))
+    return service_evidence
+
+
+def _migration_bound_work(
+    plan, services, service_evidence, context, native, terms,
+    coordinate_declarations, conflicts, identification_pending,
+):
     stage_map = {getattr(stage, "name", None): stage
                  for stage in plan.get("stages", ())}
     resolved = _resolve_actual_work(plan)
@@ -542,124 +697,8 @@ def evaluate_migration_binding(decomposition, rule_match, rule_id, plan, service
                                        "unit": instance["unit"]})
         if len(bound_services) > 1:
             conflicts.append("actual_work_bound_to_multiple_services:" + label)
-    plan_for_fixed = dict(plan, decomposition=decomposition)
-    fixed_rows, fixed_occurrences, fixed_conflicts, fixed_notes = _fixed_rows(
-        plan_for_fixed, services, bound_stages, legacy_fixed,
-        invocation=invocation)
-    conflicts.extend(fixed_conflicts)
-    notes.extend(fixed_notes)
-    for row in fixed_rows:
-        evidence = service_evidence.get(row["service_id"], {})
-        if not evidence.get("identification_ready", True):
-            identification_pending.append(
-                "fixed:" + row["stage"] + ":" + row["service_id"])
-    owned_fixed = {(occurrence["actual_stage"], occurrence["service_id"])
-                   for occurrence in fixed_occurrences
-                   if occurrence["kind"] == "service_fixed"}
-    for item in plan["work"]:
-        record = services.get(item["service_id"])
-        if record and record["fixed_us"] > 0 and item["stage"]:
-            occurrence_stage = _fixed_occurrence_stage(plan, item["stage"])
-            if (occurrence_stage, item["service_id"]) not in owned_fixed:
-                conflicts.append("stage_fixed_component_not_owned:"
-                                 + item["stage"] + ":" + item["service_id"])
-    complete = (not conflicts and not unresolved and not identification_pending
-                and not uncovered_actual_work
-                and not zero_work_with_service and not undelivered_work
-                and all(evaluation["bound"] for evaluation in evaluations)
-                and (legacy_fixed <= 0 or bool(fixed_rows)))
-    diagnostic_combination = ("max_by_resource"
-                              if decomposition.get("response_class") == "resource_phase_supply"
-                              else "sum")
-    coverage = {
-        "combination": "actual_program_dependencies",
-        "diagnostic_combination": diagnostic_combination,
-        "program": plan.get("program_view"),
-        "work_terms": work_rows, "external_work": external_rows,
-        "actual_work_instances": list(actual_instances.values()),
-        "uncovered_actual_work": uncovered_actual_work,
-        "undelivered_work": undelivered_work,
-        "real_zero_work": real_zero_work,
-        "zero_work_with_service": zero_work_with_service,
-        "fixed": fixed_rows, "fixed_occurrences": fixed_occurrences,
-        "invocation": (None if invocation is None else {
-            **invocation,
-            "fixed_occurrence_count": len(fixed_occurrences),
-            "service_fixed_covers_startup": any(
-                occurrence["kind"] == "service_fixed"
-                and occurrence["covers_invocation_startup"]
-                for occurrence in fixed_occurrences)}),
-        "complete": complete,
-        "fixed_total_us": sum(occurrence["fixed_us"]
-                              for occurrence in fixed_occurrences),
-        "legacy_fixed_us": legacy_fixed,
-    }
-    stage_missing = any(evaluation["stage_missing"] for evaluation in evaluations)
-    if conflicts:
-        status = "conflict"
-    elif unresolved:
-        status = "awaiting_conditions"
-    elif identification_pending:
-        status = "observation_replay"
-    elif stage_missing:
-        status = "awaiting_program_binding"
-    elif complete and scope == "slice":
-        status = "slice_ready"
-    elif complete:
-        status = "ready"
-    elif (any(evaluation["instance"] is not None for evaluation in evaluations)
-          or external_rows or fixed_rows):
-        status = "partial"
-    else:
-        status = "no_binding"
-    blockers = sorted(set(conflicts))
-    blockers.extend(sorted(set(identification_pending)))
-    blockers.extend(sorted({"condition_context_missing:" + str(item.get("path"))
-                            for item in unresolved}))
-    blockers.extend("legacy_work_term_unbound:" + str(index)
-                    for index in missing_terms)
-    blockers.extend(item["blocker"] for item in uncovered_actual_work)
-    blockers.extend("actual_work_undelivered:" + str(item["stage"]) + ":"
-                    + str(item["resource"]) for item in undelivered_work)
-    if status == "awaiting_program_binding":
-        blockers.append("migration_stage_binding_required")
-    if legacy_fixed > 0 and not fixed_rows:
-        blockers.append("legacy_fixed_component_unbound")
-    if status == "no_binding":
-        blockers.append("migration_binding_plan_requires_actual_work")
-    return {
-        "status": status, "blockers": sorted(set(blockers)),
-        "conflicts": sorted(set(conflicts)),
-        "unresolved_conditions": unresolved,
-        "coverage": coverage, "service_evidence": service_evidence,
-        "conditions": {"rule": rule_check, "slice": slice_check,
-                       "services": {sid: item["conditions"]
-                                    for sid, item in service_evidence.items()}},
-        "diagnostics": {
-            "old_provenance_negative": bool(old_provenance_negative),
-            "old_training_tokens": sorted(old_training_tokens),
-            "actual_native_boundary": native,
-            "native_boundary_sources": native_values,
-            "actual_resources": dict(
-                _attr(context, "resource_names", {}) or {}),
-            "actual_invocation": invocation,
-            "rate_comparison": rate_rows,
-            "fixed_comparison": {
-                "legacy_fixed_us": legacy_fixed,
-                "service_fixed_total_us": sum(
-                    occurrence["fixed_us"] for occurrence in fixed_occurrences),
-                "difference_is_diagnostic": True},
-            "fixed_occurrence_count": len(fixed_occurrences),
-            "unbound_legacy_terms": unbound_terms,
-            "undelivered_work_instances": undelivered_work,
-            "notes": sorted(set(notes + [
-                "old_term_indexes_and_formula_are_diagnostic",
-                "old_rate_and_fixed_differences_are_diagnostic",
-                "actual_work_owner_and_fixed_boundary_are_shared_projection",
-                "validation_or_diagnostic_references_do_not_veto_new_training"])),
-        },
-        "scope": {"kind": scope, "slice_conditions": dict(slice_conditions)},
-        "replacement_scope": ("slice" if scope == "slice" else
-                              ("independent_resource" if kind == "independent_service"
-                               else "joint_phase")),
-    }
+    return (
+        evaluations, bound_stages, actual_instances, invocation, undelivered_work,
+        work_rows, missing_terms, unbound_terms, external_rows, rate_rows,
+        uncovered_actual_work, real_zero_work, zero_work_with_service,
+    )

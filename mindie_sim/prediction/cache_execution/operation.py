@@ -128,19 +128,11 @@ class CacheAccessOperation:
         self.source_event = source
         line = self.state.geometry.line_bytes
 
-        def close_failed(reservation):
-            try:
-                if reservation.published:
-                    if not reservation.finished:
-                        reservation.finish()
-                elif not reservation.finished:
-                    reservation.cancel()
-            except Exception as cleanup:
-                reservation.journal.failure += (
-                    f";cleanup_failed:{type(cleanup).__name__}:{cleanup}")
-                raise
-            finally:
-                self.closed = True
+        work_started = False
+
+        def mark_started():
+            nonlocal work_started
+            work_started = True
 
         def submitted_events():
             return tuple(dict.fromkeys(
@@ -148,16 +140,15 @@ class CacheAccessOperation:
                 + [event for label, event in self.stage_events.items()
                    if label != "ready"]))
 
-        work_started = False
-
         def begin(_):
-            nonlocal work_started
             reservation = None
             try:
                 reservation = self.state.prepare_access(
                     self.request.identity, self.request.geometry,
                     write=self.request.write, policy=self.request.policy)
-                _submit_resolved(reservation)
+                self._submit_resolved(
+                    engine, name, _ready_task, complete, reservation, staging,
+                    write_resource, line, owner, mark_started)
             except Exception as exc:
                 # A failed preparation is never the data-ready completion.
                 # Work not yet issued rolls back immediately; already-issued
@@ -180,7 +171,7 @@ class CacheAccessOperation:
                         engine.submit(
                             name + ":failure_close",
                             after=submitted_events(), free=staging,
-                            on_complete=lambda _event: close_failed(reservation),
+                            on_complete=lambda _event: self._close_failed(reservation),
                             owner=owner)
                     except Exception as cleanup:
                         reservation.journal.failure += (
@@ -189,108 +180,6 @@ class CacheAccessOperation:
                         raise ModelingError(
                             "cache_access_failure_cleanup_unsubmitted") from cleanup
                 raise
-
-        def _submit_resolved(reservation):
-            nonlocal work_started
-            result = reservation.result
-            events = self.stage_events
-            events["ready"] = _ready_task
-            items = cache_work_stages(
-                result, hbm_resource=self.hbm_resource,
-                onchip_resource=self.onchip_resource,
-                write_resource=write_resource,
-                vector_resource=self.vector_resource,
-                source_bytes=self.request.source_bytes,
-                source_residency=self.request.source_residency,
-                convert_ops=self.request.convert_ops)
-            labels = {"ready"}
-            for item in items:
-                if item.label in labels:
-                    raise ModelingError(
-                        f"cache_access_operation_duplicate_stage:{item.label}")
-                labels.add(item.label)
-            for item in items:
-                if item.resource and item.resource not in engine.resources:
-                    raise ModelingError(
-                        "cache_access_operation_resource_missing:"
-                        + item.resource)
-                if (item.resource == self.hbm_resource
-                        and (self.request.outstanding
-                             or self.request.response_ms)
-                        and engine.resources[item.resource].unit != "bytes"):
-                    raise ModelingError(
-                        "cache_access_operation_hbm_resource_not_bytes:"
-                        + self.hbm_resource)
-                missing = tuple(label for label in item.after
-                                if label not in labels)
-                if missing:
-                    raise ModelingError(
-                        "cache_access_operation_stage_predecessor_missing:"
-                        + ",".join(missing))
-
-            def submit_hbm(item, after):
-                amount = item.amount
-                if not amount:
-                    return after[0]
-                label = name + ":" + item.label
-                if self.request.outstanding or self.request.response_ms:
-                    ready_event = (after[0] if len(after) == 1 else
-                                   engine.submit(label + ":join", after=after,
-                                                 owner=owner))
-                    return CacheTransfer(
-                        ((self.hbm_resource, float(amount)),),
-                        transaction_bytes=line,
-                        outstanding=self.request.outstanding or None,
-                        response_ms=self.request.response_ms,
-                    ).start(engine, label, ready_event, owner=owner)
-                return engine.submit(label, {self.hbm_resource: float(amount)},
-                                     after=after, owner=owner)
-
-            def publish_event(_event):
-                reservation.publish()
-
-            for item in items:
-                after = tuple(events[label] for label in item.after)
-                label = name + ":" + item.label
-                if item.terminal:
-                    def finish(_event):
-                        if not reservation.published:
-                            reservation.publish()
-                        reservation.finish()
-                        self.completed_version = self.state.version
-                        self.closed = True
-                        if not reservation.journal.failure:
-                            engine.resolve(complete)
-                    event = engine.submit(
-                        label, after=after, free=staging,
-                        on_complete=finish, owner=owner)
-                elif item.publish:
-                    work = ({item.resource: item.amount}
-                            if item.resource else None)
-                    event = engine.submit(
-                        label, work, after=after,
-                        on_complete=publish_event, owner=owner)
-                elif item.label == "drain":
-                    if (self.request.outstanding
-                            or self.request.response_ms):
-                        drained = submit_hbm(item, after)
-                    else:
-                        drained = engine.submit(
-                            label, {self.hbm_resource: float(item.amount)},
-                            after=after, owner=owner)
-                    event = engine.submit(
-                        label + ":terminal", after=(drained,),
-                        on_complete=lambda _event: reservation.mark_drained(),
-                        owner=owner)
-                elif item.resource == self.hbm_resource:
-                    event = submit_hbm(item, after)
-                else:
-                    event = engine.submit(
-                        label, {item.resource: item.amount}, after=after,
-                        owner=owner)
-                self.stage_events[item.label] = event
-                reservation.note_issue(item.label, item.resource, item.amount)
-                work_started = True
 
         ready_after = (ready,) if source is None else (ready, source)
         _ready_task = engine.submit(
@@ -301,6 +190,125 @@ class CacheAccessOperation:
         self.ready_event = _ready_task
         self.started_event = _ready_task
         return complete
+
+    def _close_failed(self, reservation):
+        try:
+            if reservation.published:
+                if not reservation.finished:
+                    reservation.finish()
+            elif not reservation.finished:
+                reservation.cancel()
+        except Exception as cleanup:
+            reservation.journal.failure += (
+                f";cleanup_failed:{type(cleanup).__name__}:{cleanup}")
+            raise
+        finally:
+            self.closed = True
+
+    def _submit_resolved(
+        self, engine, name, ready_task, complete, reservation, staging,
+        write_resource, line, owner, mark_started,
+    ):
+        result = reservation.result
+        events = self.stage_events
+        events["ready"] = ready_task
+        items = cache_work_stages(
+            result, hbm_resource=self.hbm_resource,
+            onchip_resource=self.onchip_resource,
+            write_resource=write_resource,
+            vector_resource=self.vector_resource,
+            source_bytes=self.request.source_bytes,
+            source_residency=self.request.source_residency,
+            convert_ops=self.request.convert_ops)
+        labels = {"ready"}
+        for item in items:
+            if item.label in labels:
+                raise ModelingError(
+                    f"cache_access_operation_duplicate_stage:{item.label}")
+            labels.add(item.label)
+        for item in items:
+            if item.resource and item.resource not in engine.resources:
+                raise ModelingError(
+                    "cache_access_operation_resource_missing:"
+                    + item.resource)
+            if (item.resource == self.hbm_resource
+                    and (self.request.outstanding
+                         or self.request.response_ms)
+                    and engine.resources[item.resource].unit != "bytes"):
+                raise ModelingError(
+                    "cache_access_operation_hbm_resource_not_bytes:"
+                    + self.hbm_resource)
+            missing = tuple(label for label in item.after
+                            if label not in labels)
+            if missing:
+                raise ModelingError(
+                    "cache_access_operation_stage_predecessor_missing:"
+                    + ",".join(missing))
+
+        def submit_hbm(item, after):
+            amount = item.amount
+            if not amount:
+                return after[0]
+            label = name + ":" + item.label
+            if self.request.outstanding or self.request.response_ms:
+                ready_event = (after[0] if len(after) == 1 else
+                               engine.submit(label + ":join", after=after,
+                                             owner=owner))
+                return CacheTransfer(
+                    ((self.hbm_resource, float(amount)),),
+                    transaction_bytes=line,
+                    outstanding=self.request.outstanding or None,
+                    response_ms=self.request.response_ms,
+                ).start(engine, label, ready_event, owner=owner)
+            return engine.submit(label, {self.hbm_resource: float(amount)},
+                                 after=after, owner=owner)
+
+        def publish_event(_event):
+            reservation.publish()
+
+        for item in items:
+            after = tuple(events[label] for label in item.after)
+            label = name + ":" + item.label
+            if item.terminal:
+                def finish(_event):
+                    if not reservation.published:
+                        reservation.publish()
+                    reservation.finish()
+                    self.completed_version = self.state.version
+                    self.closed = True
+                    if not reservation.journal.failure:
+                        engine.resolve(complete)
+                event = engine.submit(
+                    label, after=after, free=staging,
+                    on_complete=finish, owner=owner)
+            elif item.publish:
+                work = ({item.resource: item.amount}
+                        if item.resource else None)
+                event = engine.submit(
+                    label, work, after=after,
+                    on_complete=publish_event, owner=owner)
+            elif item.label == "drain":
+                if (self.request.outstanding
+                        or self.request.response_ms):
+                    drained = submit_hbm(item, after)
+                else:
+                    drained = engine.submit(
+                        label, {self.hbm_resource: float(item.amount)},
+                        after=after, owner=owner)
+                event = engine.submit(
+                    label + ":terminal", after=(drained,),
+                    on_complete=lambda _event: reservation.mark_drained(),
+                    owner=owner)
+            elif item.resource == self.hbm_resource:
+                event = submit_hbm(item, after)
+            else:
+                event = engine.submit(
+                    label, {item.resource: item.amount}, after=after,
+                    owner=owner)
+            self.stage_events[item.label] = event
+            reservation.note_issue(item.label, item.resource, item.amount)
+            mark_started()
+
 
     def binding(self, occurrence: str | None = None, *, request_id: str = "",
                 stage: int = 0, layer: int = 0, rank: int | None = None,

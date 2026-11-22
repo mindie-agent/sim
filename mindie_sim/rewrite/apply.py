@@ -17,10 +17,10 @@ from math import isfinite
 from types import SimpleNamespace
 from typing import Any, Literal
 
-from mindie_sim.prediction.fusion_control_rewrite import (
+from mindie_sim.prediction.fusion.control_rewrite import (
     apply_incoming_controls, ordering_prerequisites, rewritten_control_metadata,
 )
-from mindie_sim.prediction.fusion_ports import (
+from mindie_sim.prediction.fusion.ports import (
     CONTROL_METADATA_KEYS, control_value_names, declared_control_order, full_operand_ports,
     input_port_entries, replace_input_ports,
 )

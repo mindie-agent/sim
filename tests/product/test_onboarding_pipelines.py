@@ -27,8 +27,8 @@ import pytest
 from _support.axes import REPRESENTATIVE_SKUS
 from mindie_sim.backends import ascend_profiles
 from mindie_sim.cli import main as mindie_sim_main
-from mindie_sim.cli_onboarding import operator_main, sku_main
-from mindie_sim.observations.multilevel_gate import (
+from mindie_sim.cli.onboarding import operator_main, sku_main
+from mindie_sim.observations.multilevel import (
     CaptureBoundary, CohortKey, EngineInterval, GateCase, bind_engine_interval,
 )
 from mindie_sim.onboarding import (

@@ -244,7 +244,7 @@ class RecipeBook:
         return items
 
     def expand(self, ops):
-        from ..boundaries import expand_call
+        from ..frontend.body_spec import expand_call
         from ..mechanism import PlannedRecipe
         is_tup = ops.__class__ is tuple
         if is_tup and self._prev_expand is not None:
@@ -300,7 +300,7 @@ class RecipeBook:
         from mindie_sim.prediction.operators.mx_quant_matrix.mxfp4_grouped import recipe as mxa8w4_nznk
         from mindie_sim.prediction.operators.mx_quant_matrix.mxfp8_grouped import recipe as mxfp8_grouped
         from ..operators.vector import TiledPointwise
-        from ..services import ResourceService
+        from ..service_regime_domains.services import ResourceService
         from mindie_sim.prediction.operators.recurrent.state_program import RecurrentVector
         from mindie_sim.prediction.operators.vector.tensor_copy import recipe as aiv_tensor_copy
         from mindie_sim.prediction.operators.attention.attention_decode import staged_gqa_decode
@@ -330,7 +330,7 @@ class RecipeBook:
         from mindie_sim.prediction.operators.kda.family_kda_recurrent import recipes as kda_recurrent_recipes
         from mindie_sim.prediction.operators.collectives.hccl_graph import recipes as hccl_recipes
         from ..implementations import recipes as implementation_recipes
-        from mindie_sim.prediction.operators.context_parallel.graph import recipes as cp_graph_recipes
+        from mindie_sim.prediction.sharding.context_parallel import recipes as cp_graph_recipes
         from mindie_sim.prediction.operators.mc2.mc2_graph import recipes as native_moe_recipes
         from ..operators import grouped_moe, hyper_connections, linear_attention, mc2
         from ..operators.linear_attention.common import CHUNK32_KERNELS

@@ -29,7 +29,7 @@ import re
 from typing import Any
 
 from mindie_sim.structure_contracts import predicted_contract, typed_values
-from mindie_sim.structure_native_contracts import (
+from mindie_sim.structure.native import (
     MIXED_QUANT_NATIVE_KIND, shared_kv_native_name,
 )
 

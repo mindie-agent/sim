@@ -20,12 +20,12 @@ from _support.hardware import hardware_case, machine
 from mindie_sim import graph_costs, target_graphs
 from mindie_sim.catalog.quant import quant_preset
 from mindie_sim.catalog.types import QuantSpec
-from mindie_sim.prediction.cohort_traffic import bind_cohort_traffic
+from mindie_sim.prediction.execution.cohort_traffic import bind_cohort_traffic
 from mindie_sim.prediction.engine import Allocation, Engine, Resource
 from mindie_sim.prediction.frontend import Frontend
 from mindie_sim.prediction.instructions import cal_token_send_expert_work, get_sff_value_u64_i64_work
 from mindie_sim.prediction.mechanism import Geometry
-from mindie_sim.prediction.peer_traffic import PeerTraffic
+from mindie_sim.prediction.collectives.peer_traffic import PeerTraffic
 from mindie_sim.prediction.operators import mc2
 from mindie_sim.prediction.program import KernelProgram, RecipeContext, Stage
 from mindie_sim.prediction.structure import parse_case
@@ -33,7 +33,7 @@ from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.operators import OpSpec
 from mindie_sim.schema.workload import IterationPlan, RequestView
 from mindie_sim.structure_contracts import predicted_contract
-from mindie_sim.structure_matrix_contracts import matrix_comparison_scope
+from mindie_sim.structure.native import matrix_comparison_scope
 
 pytestmark = pytest.mark.tier0
 DATA, FRAME, FLAG, TRIPLE, FP32 = 480, 512, 32, 12, 4

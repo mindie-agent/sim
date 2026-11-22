@@ -38,7 +38,7 @@ if str(_REPO_ROOT) not in sys.path:
 from mindie_sim.catalog import fleet
 from mindie_sim.compose import compose_case, resolve_hardware_sku, va_recommended_config
 from mindie_sim.model_catalog import load_model
-from mindie_sim.prediction.routing_realizations import select_realization
+from mindie_sim.prediction.sharding.routing import select_realization
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.prediction.topology import Topology
 from mindie_sim.structure import export_structure

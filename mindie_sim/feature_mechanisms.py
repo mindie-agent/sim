@@ -1,43 +1,546 @@
-"""Layer 1 stack-agnostic optimization mechanism catalog and case mutators.
+"""Optimization mechanism registry, catalog applicators and 4-track feature waterfall.
 
-[Role]
-  Define universal, framework-neutral physical optimization mechanisms
-  (graph capture, sequence parallelism, operator fusions, strided zero-copy
-  views, multi-stream compute/comm overlap, compact state recovery) and apply
-  selected mechanisms deterministically to a Case's runtime configuration.
-
-[Invariants]
-  * Mechanism IDs carry zero framework-specific prefixes (no ``va_`` / ``vllm_``).
-  * Structural eligibility inspects ``ModelSpec`` / ``LayerPlan`` / ``ParallelSpec``
-    geometry, never model-name strings.
-  * Explicit caller arguments always win over track/mechanism defaults.
-  * External extensions may register new mechanisms via
-    ``register_optimization_mechanism`` without editing core dispatch.
-
-[Timeouts & Locks]
-  Pure in-memory dictionary and tuple mutations; O(layers + mechanisms), no I/O.
-
-[Side-Effect Policy]
-  Registry mutations occur only via explicit ``register_optimization_mechanism``.
-"""
+[Role] Own optimization mechanism declarations, structural applicability rules,
+  and 4-track (raw_eager -> merged -> unmerged_pr -> expected_ideal) waterfall evaluation.
+[Invariants] Mechanisms apply strictly by model/hardware structural capability,
+  never by hardcoded model names.
+[Timeouts & Locks] Delegates step evaluation to canonical Engine; no locks.
+[Side-Effect Policy] Pure planning and read-only simulation."""
 from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any
+
+from mindie_sim.prediction.operators.linear_attention.gdn_domain import (
+    GDN_CHUNK32_TOKENS,
+    model_supports_gdn_chunk32,
+)
+from mindie_sim.schema.model import ModelSpec
+
+if TYPE_CHECKING:
+    from mindie_sim.feature_mechanisms import MechanismContext, OptimizationMechanism
+
+MX_SCALE_GROUP_SIZE = 32
+MSA_MIN_BLOCK_SIZE = 64
+FUSED_MC2_ROUTED_MODE = 2
+FUSED_MC2_SHARED_MODE = 3
+QSA_MROPE_DECODE_MAX_ROWS = 64
+TEXT_GATED_RESIDUAL_MIN_ROWS = 513
+QUANTIZED_ALLREDUCE_MAX_WORLD = 8
+
+MXFP_EXPERT_WEIGHT_FORMATS = frozenset({"mxfp4", "mxfp8", "fp4_e2m1"})
+
+PASS_PRIORITY_ORDER: tuple[str, ...] = (
+    "activation_quantization",
+    "norm_quant",
+    "residual_norm",
+    "moe_tail_residual",
+    "mhc_boundary_pr",
+    "mhc_boundary_ideal",
+    "indexer_online_topk",
+    "qkv_norm_rope",
+    "kda_in_kernel_l2norm",
+    "gdn_projection_overlap",
+    "activation_quant",
+    "gmm_swiglu_quant",
+    "tp_mc2_overlap",
+)
+
+
+def _append_passes(runtime_dict: dict[str, Any], *names: str) -> None:
+    current = list(runtime_dict.get("lowering_passes") or ())
+    for name in names:
+        if name not in current:
+            current.append(name)
+    order = {name: idx for idx, name in enumerate(PASS_PRIORITY_ORDER)}
+    current.sort(key=lambda item: order.get(item, len(PASS_PRIORITY_ORDER)))
+    runtime_dict["lowering_passes"] = current
+
+
+def _set_lowering(runtime_dict: dict[str, Any], selector: str, binding: Any) -> None:
+    kernels = dict(runtime_dict.get("kernels") or {})
+    lowerings = dict(kernels.get("lowerings") or {})
+    lowerings.setdefault(selector, binding)
+    kernels["lowerings"] = lowerings
+    runtime_dict["kernels"] = kernels
+
+
+def _set_layout_strided(runtime_dict: dict[str, Any], consumer: str, *args: str) -> None:
+    layouts = dict(runtime_dict.get("tensor_layouts") or {})
+    entry = dict(layouts.get(consumer) or {})
+    for arg in args:
+        entry.setdefault(arg, "strided")
+    layouts[consumer] = entry
+    runtime_dict["tensor_layouts"] = layouts
+
+
+def _has_quant_activations(model: ModelSpec) -> bool:
+    return (model.quant is not None
+            and str(model.quant.activation_format) != str(model.activation_dtype))
+
+
+def _has_quant_moe_activations(model: ModelSpec) -> bool:
+    """True when model activations or routed-expert overrides are quantized."""
+    if _has_quant_activations(model):
+        return True
+    q = model.quant
+    if q is None:
+        return False
+    for category, override in (getattr(q, "category_overrides", ()) or ()):
+        if "routed_expert" not in str(category):
+            continue
+        if isinstance(override, dict):
+            act_fmt = str(override.get("activation_format") or "")
+            if act_fmt and act_fmt != str(model.activation_dtype):
+                return True
+    return False
+
+
+def _apply_mhc_fusion_overlap(rt: dict[str, Any], ctx: MechanismContext) -> None:
+    existing_raw = list(rt.get("lowering_passes") or ())
+    unbounded = (
+        bool(ctx.options.get("unbounded_rows", False))
+        or "mhc_boundary_ideal" in existing_raw
+    )
+    pass_name = "mhc_boundary_ideal" if unbounded else "mhc_boundary_pr"
+    # Upgrade PR-bounded pass to ideal pass cleanly and never downgrade ideal -> PR.
+    existing = [p for p in existing_raw
+                if p not in {"mhc_boundary_pr", "mhc_boundary_ideal"}]
+    rt["lowering_passes"] = existing
+    _append_passes(rt, pass_name)
+
+
+def _apply_tp_mc2_overlap(rt: dict[str, Any], ctx: MechanismContext) -> None:
+    _update_meta(rt, tp_mc2_overlap=True)
+    if ctx.arch == "a5" and int(ctx.parallel.get("tp", 1) or 1) > 1:
+        _append_passes(rt, "tp_mc2_overlap")
+
+
+def _apply_shared_expert_overlap(rt: dict[str, Any], ctx: MechanismContext) -> None:
+    if "multistream_overlap_shared_expert" in ctx.caller_explicit:
+        return
+    if int(ctx.parallel.get("ep", 1)) > 1:
+        rt["multistream_overlap_shared_expert"] = True
+        meta = dict(rt.get("metadata") or {})
+        meta["multistream_overlap_shared_expert"] = True
+        rt["metadata"] = meta
+
+
+def _is_mxfp_moe(ctx: MechanismContext) -> bool:
+    q = ctx.model.quant
+    if q is None:
+        return False
+    expert_fmt = str(getattr(q, "expert_weight_format", "") or "").lower()
+    weight_fmt = str(getattr(q, "weight_format", "") or "").lower()
+    if expert_fmt in MXFP_EXPERT_WEIGHT_FORMATS or weight_fmt in MXFP_EXPERT_WEIGHT_FORMATS:
+        return True
+    overrides = getattr(q, "category_overrides", ()) or ()
+    if any(str(fmt).lower() in MXFP_EXPERT_WEIGHT_FORMATS for _, fmt in overrides):
+        return True
+    return (
+        q.activation_format == "fp8_e4m3"
+        and q.activation_group_size == MX_SCALE_GROUP_SIZE
+        and q.activation_scale_format in {"fp8_e8m0", "e8m0"}
+    )
+
+
+def _update_meta(rt: dict[str, Any], **entries: Any) -> dict[str, Any]:
+    meta = dict(rt.get("metadata") or {})
+    meta.update(entries)
+    rt["metadata"] = meta
+    return meta
+
+
+def _update_additional(rt: dict[str, Any], **entries: Any) -> None:
+    meta = dict(rt.get("metadata") or {})
+    additional = dict(meta.get("additional_config") or {})
+    additional.update(entries)
+    meta["additional_config"] = additional
+    rt["metadata"] = meta
+
+
+def _apply_torch_compile_support(rt: dict[str, Any], ctx: MechanismContext) -> None:
+    rt["enable_torch_compile"] = True
+    meta = dict(rt.get("metadata") or {})
+    meta["enable_torch_compile"] = True
+    policy = dict(meta.get("execution_policy") or {})
+    policy["enable_torch_compile"] = True
+    meta["execution_policy"] = policy
+    rt["metadata"] = meta
+    if _has_quant_activations(ctx.model):
+        _append_passes(rt, "activation_quantization", "norm_quant")
+
+
+def _apply_fp32_residual_norm(rt: dict[str, Any], ctx: MechanismContext) -> None:
+    if _has_quant_activations(ctx.model):
+        _append_passes(rt, "activation_quantization", "norm_quant")
+    _append_passes(rt, "residual_norm")
+
+
+def _apply_gdn_chunk32(rt: dict[str, Any], ctx: MechanismContext) -> None:
+    tp = int(ctx.parallel.get("tp", 1))
+    if not model_supports_gdn_chunk32(ctx.model, tp):
+        return
+    policy = dict(rt.get("attention_policy") or {})
+    policy["recurrent_chunk"] = GDN_CHUNK32_TOKENS
+    rt["attention_policy"] = policy
+    _set_lowering(rt, "gdn_prefill", "gdn_prefill_arch35")
+
+
+def _ep_within_ub_domain(ctx: MechanismContext) -> bool:
+    ep = int(ctx.parallel.get("ep", 1))
+    rpn = int((ctx.options or {}).get("ranks_per_node", 0) or 0)
+    return ep > 1 and (rpn <= 0 or ep <= rpn)
+
+
+def _apply_cann_megamoe(rt: dict[str, Any], ctx: MechanismContext) -> None:
+    if "moe_comm_mode" in ctx.caller_explicit or "enable_fused_mc2" in ctx.caller_explicit:
+        return
+    if not _ep_within_ub_domain(ctx):
+        return
+    if int(ctx.parallel.get("redundant_experts_per_rank", 0) or 0) > 0:
+        return
+    has_latent_or_situ = any(
+        p.ffn == "moe" and (p.expert_latent_size > 0 or p.ffn_activation == "situ")
+        for p in ctx.model.layer_plans
+    )
+    default_mode = FUSED_MC2_ROUTED_MODE if has_latent_or_situ else FUSED_MC2_SHARED_MODE
+    level = int(ctx.options.get("enable_fused_mc2", default_mode))
+    _update_meta(
+        rt,
+        moe_comm_mode="dynamic",
+        moe_mega_moe_supported=1,
+        arch_family=ctx.arch.upper(),
+    )
+    _update_additional(rt, enable_mega_moe=1, enable_fused_mc2=level)
+
+
+def _apply_qsa_gbsa_fusion(rt: dict[str, Any], ctx: MechanismContext) -> None:
+    phase = str((ctx.options or {}).get("phase") or "decode")
+    if phase == "decode":
+        _append_passes(rt, "qkv_norm_rope")
+    _append_passes(rt, "indexer_online_topk")
+    _set_layout_strided(rt, "gdn_gating", "beta", "alpha")
+    _set_layout_strided(rt, "short_convolution", "input")
+    _update_meta(rt, qsa_gbsa_fused=True, qsa_mrope_decode_max_rows=QSA_MROPE_DECODE_MAX_ROWS)
+
+
+def _apply_text_gated_residual(rt: dict[str, Any], ctx: MechanismContext) -> None:
+    _apply_mhc_fusion_overlap(rt, ctx)
+    phase = str((ctx.options or {}).get("phase") or "")
+    if phase != "decode":
+        _update_meta(rt, text_gated_residual=True, text_gated_residual_min_rows=TEXT_GATED_RESIDUAL_MIN_ROWS)
+
+
+def _apply_msa_score_v2(rt: dict[str, Any], _ctx: MechanismContext) -> None:
+    _append_passes(rt, "indexer_online_topk")
+    _update_meta(rt, msa_index_score_v2=True)
+
+
+def _apply_step5_qkvg_indexer(rt: dict[str, Any], _ctx: MechanismContext) -> None:
+    _append_passes(rt, "qkv_norm_rope", "indexer_online_topk")
+    _update_meta(rt, flash_attn_npu_3=True, packed_qkvg_indexer=True)
+
+
+def _apply_dspark_static_kernel(rt: dict[str, Any], _ctx: MechanismContext) -> None:
+    _update_additional(rt, enable_static_kernel=True, enable_super_kernel=True)
+
+
+def _apply_dsv41_epilogue(rt: dict[str, Any], _ctx: MechanismContext) -> None:
+    _set_lowering(rt, "compressor", "vllm_ascend_cann_compressor")
+    _update_meta(rt, dsv41_epilogue_engram_overlap=True)
+
+
+def _apply_in_kernel_gdn_decode_gate(rt: dict[str, Any], _ctx: MechanismContext) -> None:
+    _set_layout_strided(rt, "gdn_gating", "beta", "alpha")
+    _update_meta(rt, skip_gdn_output_zero=True)
+
+
+def _apply_kimi_dspark_c8(rt: dict[str, Any], ctx: MechanismContext) -> None:
+    _apply_shared_expert_overlap(rt, ctx)
+    _update_meta(rt, kimi_dspark_c8_mla=True)
+
+
+def _has_any_local_tp(parallel: Any) -> bool:
+    return any(
+        int(parallel.get(axis, 1) or 1) > 1
+        for axis in (
+            "q_proj_tp", "o_proj_tp", "linear_proj_tp", "dcp_linear_tp",
+            "mlp_tp", "shared_expert_tp", "lm_head_tp",
+        )
+    )
+
+
+def _parallel_cp_mechanisms() -> tuple[OptimizationMechanism, ...]:
+    """Generalized Parallelism, Context-Parallel (DCP/PCP), and Local-TP mechanisms."""
+    from mindie_sim.feature_mechanisms import OptimizationMechanism
+
+    return (
+        OptimizationMechanism(
+            id="universal_dcp_query_gather", category="context_parallel",
+            phases=("decode",),
+            summary="Universal Q AllGather across DCP/TP/DP cohort conserving 100% attention FLOPs",
+            eligible=lambda ctx: (
+                int(ctx.parallel.get("cp", ctx.parallel.get("dcp", 1)) or 1) > 1
+                and any(p.attention in {"mla", "gqa"} for p in ctx.model.layer_plans)
+            ),
+            apply=lambda rt, _ctx: _update_meta(rt, universal_dcp_query_gather=True),
+        ),
+        OptimizationMechanism(
+            id="sfa_dcp_sharded_indexer", category="context_parallel",
+            phases=("decode",),
+            summary="Optional DCP-sharded LightningIndexer KV cache reducing indexer HBM by 1/dcp",
+            eligible=lambda ctx: (
+                int(ctx.parallel.get("cp", ctx.parallel.get("dcp", 1)) or 1) > 1
+                and any(p.attention == "mla" and p.indexer for p in ctx.model.layer_plans)
+            ),
+            apply=lambda rt, _ctx: _update_meta(rt, enable_sfa_dcp_sharded_indexer=True),
+        ),
+        OptimizationMechanism(
+            id="local_projection_tp", category="parallelism",
+            phases=("prefill", "decode"),
+            summary="Composable per-sublayer Local-TP across Q/O/linear/MLP/shared-expert/lm_head",
+            eligible=lambda ctx: _has_any_local_tp(ctx.parallel),
+            apply=lambda rt, _ctx: _update_meta(rt, local_projection_tp_active=True),
+        ),
+        OptimizationMechanism(
+            id="pcp_o_proj_weight_sharding", category="context_parallel",
+            phases=("prefill", "decode"),
+            summary="Shard o_proj weights across PCP ranks with async weight AllGather on cp_weight_stream",
+            eligible=lambda ctx: (
+                int(ctx.parallel.get("pcp", 1) or 1) > 1
+                and any(p.attention in {"mla", "gqa"} for p in ctx.model.layer_plans)
+            ),
+            apply=lambda rt, ctx: _update_meta(
+                rt,
+                pcp_o_proj_weight_sharding_supported=True,
+                **({"enable_pcp_o_proj_weight_sharding": True}
+                   if ctx.options.get("enable_pcp_o_proj_weight_sharding") else {}),
+            ),
+        ),
+        OptimizationMechanism(
+            id="pcp_decode_request_sharding", category="context_parallel",
+            phases=("decode",),
+            summary="Shard independent decode requests across PCP lanes when DCP=1",
+            eligible=lambda ctx: (
+                int(ctx.parallel.get("pcp", 1) or 1) > 1
+                and int(ctx.parallel.get("cp", ctx.parallel.get("dcp", 1)) or 1) == 1
+            ),
+            apply=lambda rt, _ctx: _update_meta(rt, pcp_decode_request_sharding=True),
+        ),
+        OptimizationMechanism(
+            id="kda_pcp_head_sharding", category="context_parallel",
+            phases=("prefill", "decode"),
+            summary="Shard KDA recurrent heads across TP*PCP with prefill sequence-to-head AllGather/Scatter",
+            eligible=lambda ctx: (
+                int(ctx.parallel.get("pcp", 1) or 1) > 1
+                and any(p.attention == "kda" for p in ctx.model.layer_plans)
+            ),
+            apply=lambda rt, _ctx: _update_meta(rt, kda_pcp_head_sharding=True),
+        ),
+        OptimizationMechanism(
+            id="pcp_w8a8_quantized_allgather", category="context_parallel",
+            phases=("prefill", "decode"),
+            summary="INT8/FP8 quantized PCP activation AllGather halving inter-rank wire volume",
+            eligible=lambda ctx: (
+                int(ctx.parallel.get("pcp", 1) or 1) > 1
+                and _has_quant_activations(ctx.model)
+            ),
+            apply=lambda rt, _ctx: _update_meta(rt, pcp_w8a8_quantized_allgather=True),
+        ),
+        OptimizationMechanism(
+            id="quantized_allreduce", category="parallelism",
+            phases=("prefill", "decode"),
+            summary="Opt-in INT8 quantized TP AllReduce on A2 (BF16, 2<=TP<=8, >=16M elems)",
+            eligible=lambda ctx: (
+                ctx.arch == "a2"
+                and 1 < int(ctx.parallel.get("tp", 1) or 1) <= QUANTIZED_ALLREDUCE_MAX_WORLD
+                and str(ctx.model.activation_dtype).strip().lower() in {"bf16", "bfloat16"}
+                and not (
+                    isinstance(ctx.options.get("quantized_all_reduce_config"), dict)
+                    and "enable" in ctx.options["quantized_all_reduce_config"]
+                    and str(ctx.options["quantized_all_reduce_config"]["enable"]).strip().lower()
+                    in {"false", "0", "no", "off", ""}
+                )
+                and bool(
+                    ctx.options.get("explicit_opt_in")
+                    or ctx.options.get("quantized_allreduce")
+                    or (isinstance(ctx.options.get("quantized_all_reduce_config"), dict)
+                        and bool(ctx.options["quantized_all_reduce_config"].get("enable", False)))
+                )
+            ),
+            apply=lambda rt, _ctx: _update_meta(rt, quantized_allreduce=True),
+        ),
+        OptimizationMechanism(
+            id="dsv41_pcp_c2_ring_gather", category="context_parallel",
+            phases=("prefill",),
+            summary="V4.1 PCP C2 ring-tail compressor boundary gather and restore unpermute",
+            eligible=lambda ctx: (
+                int(ctx.parallel.get("pcp", 1) or 1) > 1
+                and any(
+                    p.cache_kind == "window_compressed" and p.compressor_kind == "gated_ring"
+                    for p in ctx.model.layer_plans
+                )
+            ),
+            apply=lambda rt, _ctx: _update_meta(rt, dsv41_pcp_c2_ring_gather=True),
+        ),
+    )
+
+
+def source_mechanisms() -> tuple[OptimizationMechanism, ...]:
+    """Build the audited mechanism specs in registration order."""
+    from mindie_sim.feature_mechanisms import OptimizationMechanism
+
+    return (
+        OptimizationMechanism(
+            id="torch_compile_support", category="compilation", phases=("prefill", "decode"),
+            summary="Enable torch.compile / npugraph_ex FX fusion passes on models with do_not_compile=True",
+            eligible=lambda ctx: dict(ctx.model.catalog_facts).get("supports_torch_compile") is False,
+            apply=_apply_torch_compile_support,
+        ),
+        OptimizationMechanism(
+            id="fp32_residual_norm_fusion", category="norm_fusion", phases=("prefill", "decode"),
+            summary="Fuse FP32 residual accumulate + (1+w) RMSNorm + BF16 cast into one AIV kernel",
+            eligible=lambda ctx: bool((dict(ctx.model.catalog_facts).get("normalization") or {}).get("fp32_residual")),
+            apply=_apply_fp32_residual_norm,
+        ),
+        OptimizationMechanism(
+            id="gdn_chunk32_prefill", category="recurrent", phases=("prefill",),
+            summary="Arch35 fla-npu Chunk32 GDN prefill composite for Hv/Hk in {1,2,3,4}",
+            eligible=lambda ctx: (
+                ctx.arch == "a5"
+                and model_supports_gdn_chunk32(ctx.model, int(ctx.parallel.get("tp", 1)))
+            ),
+            apply=_apply_gdn_chunk32,
+        ),
+        OptimizationMechanism(
+            id="cann_megamoe_fusion", category="moe_comm", phases=("prefill", "decode"),
+            summary="CANN 9.3 MegaMoE composite Dispatch+GMM1+ActMxQuant+GMM2+[SharedExpert]+Combine",
+            eligible=lambda ctx: (
+                ctx.arch == "a5"
+                and _ep_within_ub_domain(ctx)
+                and int(ctx.parallel.get("redundant_experts_per_rank", 0) or 0) == 0
+                and any(p.ffn == "moe" for p in ctx.model.layer_plans)
+                and _is_mxfp_moe(ctx)
+            ),
+            apply=_apply_cann_megamoe,
+        ),
+        OptimizationMechanism(
+            id="kv_quant_sfa_scale_precompute", category="attention_fusion",
+            phases=("prefill", "decode"),
+            summary="Precompute A5 C8 FP8 scale addresses for KvQuantSparseFlashAttentionV2",
+            eligible=lambda ctx: (
+                ctx.arch == "a5"
+                and any(p.attention == "mla" and p.indexer for p in ctx.model.layer_plans)
+            ),
+            apply=lambda rt, _ctx: _update_meta(rt, kv_quant_sfa_scale_precompute=True),
+        ),
+        OptimizationMechanism(
+            id="msa_index_score_v2_topk", category="attention_fusion",
+            phases=("prefill", "decode"),
+            summary="Fused return_choice=1 in-kernel TopK inside CANN 9.3 MsaIndexScoreV2 (+ MXFP4 A4C4)",
+            eligible=lambda ctx: (
+                ctx.arch == "a5"
+                and any(p.attention == "gqa" and p.indexer and p.candidate_block_size >= MSA_MIN_BLOCK_SIZE
+                        for p in ctx.model.layer_plans)
+            ),
+            apply=_apply_msa_score_v2,
+        ),
+        OptimizationMechanism(
+            id="qsa_gbsa_prologue_fusion", category="attention_fusion",
+            phases=("prefill", "decode"),
+            summary="Fused QSA QKV/RMSNorm/MRoPE/compress prologue + GBSA([1,4]) metadata reuse",
+            eligible=lambda ctx: (
+                ctx.arch == "a5"
+                and any(p.attention == "gqa" and p.indexer and getattr(p, "hc_lowrank", 0) > 0
+                        for p in ctx.model.layer_plans)
+            ),
+            apply=_apply_qsa_gbsa_fusion,
+        ),
+        OptimizationMechanism(
+            id="text_gated_residual_fusion", category="mhc_overlap",
+            phases=("prefill",),
+            summary="CANN 9.3 native text_gated_residual (M > 512) replacing 5-op Triton Low-Rank HC chain",
+            eligible=lambda ctx: (
+                ctx.arch == "a5"
+                and any(getattr(p, "hc_lowrank", 0) > 0 for p in ctx.model.layer_plans)
+            ),
+            apply=_apply_text_gated_residual,
+        ),
+        OptimizationMechanism(
+            id="tp_mc2_overlap", category="parallelism", phases=("prefill", "decode"),
+            summary="AllGatherMatmulV2 + MatmulReduceScatterV2 overlapping TP collectives with Cube GEMMs",
+            eligible=lambda ctx: int(ctx.parallel.get("tp", 1)) > 1,
+            apply=_apply_tp_mc2_overlap,
+        ),
+        OptimizationMechanism(
+            id="step5_qkvg_indexer_fusion", category="attention_fusion",
+            phases=("prefill", "decode"),
+            summary="Packed SWA qkvg + Triton indexer_qkz_norm_rope + CANN 9.3 FA3 hd=192 SWA",
+            eligible=lambda ctx: (
+                ctx.arch == "a5"
+                and any(p.q_output_gate_kind == "headwise" and p.indexer
+                        for p in ctx.model.layer_plans)
+            ),
+            apply=_apply_step5_qkvg_indexer,
+        ),
+        OptimizationMechanism(
+            id="dspark_static_kernel_allowlist", category="compilation", phases=("decode",),
+            summary="Allow enable_static_kernel and enable_super_kernel when speculative method is dspark",
+            eligible=lambda ctx: bool(
+                ctx.model.auxiliary is not None
+                and (ctx.model.auxiliary.dspark is not None
+                     or (ctx.model.auxiliary.mtp is not None
+                         and ctx.model.auxiliary.mtp.kind == "dspark"))
+            ),
+            apply=_apply_dspark_static_kernel,
+        ),
+        OptimizationMechanism(
+            id="dsv41_indexer_epilogue_fusion", category="attention_fusion",
+            phases=("prefill", "decode"),
+            summary="Fused DSV4.1 indexer prologue, MQSMLA epilogue, C1-only DSpark share & Engram overlap",
+            eligible=lambda ctx: (
+                ctx.arch == "a5"
+                and any(p.mla_variant == "latent_mqa" and p.compressor_kind == "gated_ring"
+                        for p in ctx.model.layer_plans)
+            ),
+            apply=_apply_dsv41_epilogue,
+        ),
+        OptimizationMechanism(
+            id="in_kernel_gdn_decode_gate", category="recurrent", phases=("decode",),
+            summary="Fold GDN gating/L2Norm into recurrent_gated_delta_rule and skip output buffer zeroing",
+            eligible=lambda ctx: (
+                ctx.arch == "a5"
+                and any(p.attention == "gdn" for p in ctx.model.layer_plans)
+            ),
+            apply=_apply_in_kernel_gdn_decode_gate,
+        ),
+        OptimizationMechanism(
+            id="kimi_dspark_c8_mla", category="moe_overlap", phases=("prefill", "decode"),
+            summary="5L MLA DSpark C8 QuantFlashMLA + Kimi Latent-MoE norm/quant & full-width shared overlap",
+            eligible=lambda ctx: (
+                ctx.arch == "a5"
+                and any(p.expert_latent_size > 0 for p in ctx.model.layer_plans)
+            ),
+            apply=_apply_kimi_dspark_c8,
+        ),
+        OptimizationMechanism(
+            id="keypool_int8_indexer", category="attention_fusion",
+            phases=("prefill", "decode"),
+            summary="Dynamic INT8 quant_mode=2 pool_key_indexer + long-context sparse_flash_mla plan fix",
+            eligible=lambda ctx: (
+                ctx.arch == "a5"
+                and any(p.attention == "mla" and p.index_kpool > 1 for p in ctx.model.layer_plans)
+            ),
+            apply=lambda rt, _ctx: _update_meta(rt, keypool_int8_supported=True),
+        ),
+        *_parallel_cp_mechanisms(),
+    )
+
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from mindie_sim.feature_mechanism_catalog import (
-    MX_SCALE_GROUP_SIZE,
-    PASS_PRIORITY_ORDER,
-    _append_passes,
-    _apply_mhc_fusion_overlap,
-    _apply_shared_expert_overlap,
-    _has_quant_activations,
-    _has_quant_moe_activations,
-    _set_layout_strided,
-    _set_lowering,
-    source_mechanisms as _source_mechanisms,
-)
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.model import ModelSpec
 
@@ -103,7 +606,7 @@ def _apply_aclgraph(rt: dict[str, Any], ctx: MechanismContext) -> None:
 def _apply_sp(rt: dict[str, Any], ctx: MechanismContext) -> None:
     if "sp" in ctx.caller_explicit:
         return
-    from mindie_sim.prediction.sequence_parallel import DECLARATION, _validate_model
+    from mindie_sim.prediction.sharding.sequence_parallel import DECLARATION, _validate_model
     tp = int(ctx.parallel.get("tp", 1))
     ep = int(ctx.parallel.get("ep", 1))
     pp = int(ctx.parallel.get("pp", 1))
@@ -464,5 +967,250 @@ for _item in (
 ):
     register_optimization_mechanism(_item)
 
-for _source_item in _source_mechanisms():
+for _source_item in source_mechanisms():
     register_optimization_mechanism(_source_item)
+
+
+WATERFALL_SCHEMA = "mindie-sim.feature-waterfall/1"
+MONOTONIC_TOLERANCE_MS = 1e-5
+DEFAULT_WATERFALL_CONTEXT = 4096
+DEFAULT_WATERFALL_SEQUENCES = 8
+MS_PRECISION_DIGITS = 6
+PCT_PRECISION_DIGITS = 3
+RATIO_PRECISION_DIGITS = 4
+
+
+def _pct_delta(before_ms: float, after_ms: float) -> float:
+    if before_ms <= 0.0:
+        return 0.0
+    return ((after_ms - before_ms) / before_ms) * 100.0
+
+
+def _speedup(before_ms: float, after_ms: float) -> float:
+    if after_ms <= 0.0:
+        return 1.0
+    return before_ms / after_ms
+
+
+def _network(analysis: Mapping[str, Any]) -> dict[str, float]:
+    """Nominal network efficiency of one level, never a fitted target."""
+    return {
+        "mbu": round(float(analysis["network_mbu"]), RATIO_PRECISION_DIGITS),
+        "cube_mfu": round(float(analysis["network_cube_mfu"]), RATIO_PRECISION_DIGITS),
+        "vec_mfu": round(float(analysis["network_vec_mfu"]), RATIO_PRECISION_DIGITS),
+        "link_util": round(float(analysis["network_link_util"]), RATIO_PRECISION_DIGITS),
+        "roofline_efficiency": round(
+            float(analysis["network_roofline_efficiency"]), RATIO_PRECISION_DIGITS),
+    }
+
+
+def _compare_pr_ablations(
+    model, hardware, runtime_stack, pr_report, merged_ms, pr_ms, *,
+    phase, tokens, context, sequences, scope, compose_kwargs,
+):
+    from mindie_sim.compose import compose_case
+    from mindie_sim.prediction.efficiency import analyze_network_efficiency
+
+    pr_ablations: list[dict[str, Any]] = []
+    loo_ablations: list[dict[str, Any]] = []
+    single_cache: dict[str, float] = {}
+    loo_cache: dict[str, float] = {}
+    for pr_item in pr_report["unmerged_pr_mechanisms"]:
+        mid = pr_item["mechanism_id"]
+        if mid not in single_cache:
+            single_case = compose_case(
+                model, hardware=hardware, runtime_stack=runtime_stack,
+                feature_track="merged", optimizations=(mid,),
+                _stack_phase=phase, **compose_kwargs,
+            )
+            single_eff = analyze_network_efficiency(
+                single_case, phase=phase, tokens=tokens, context=context,
+                sequences=sequences, scope=scope,
+            )
+            single_cache[mid] = float(single_eff["graph_duration_ms"])
+        if mid not in loo_cache:
+            loo_case = compose_case(
+                model, hardware=hardware, runtime_stack=runtime_stack,
+                feature_track="unmerged_pr", exclude_optimizations=(mid,),
+                _stack_phase=phase, **compose_kwargs,
+            )
+            loo_eff = analyze_network_efficiency(
+                loo_case, phase=phase, tokens=tokens, context=context,
+                sequences=sequences, scope=scope,
+            )
+            loo_cache[mid] = float(loo_eff["graph_duration_ms"])
+        single_ms = single_cache[mid]
+        without_ms = loo_cache[mid]
+        pr_ablations.append({
+            "mechanism_id": mid,
+            "ref": pr_item["ref"],
+            "notes": pr_item["notes"],
+            "step_ms": round(single_ms, MS_PRECISION_DIGITS),
+            "delta_vs_merged_ms": round(single_ms - merged_ms, MS_PRECISION_DIGITS),
+            "delta_vs_merged_pct": round(_pct_delta(merged_ms, single_ms), PCT_PRECISION_DIGITS),
+            "speedup_vs_merged": round(_speedup(merged_ms, single_ms), RATIO_PRECISION_DIGITS),
+        })
+        loo_ablations.append({
+            "mechanism_id": mid,
+            "ref": pr_item["ref"],
+            "notes": pr_item["notes"],
+            "without_pr_step_ms": round(without_ms, MS_PRECISION_DIGITS),
+            "delta_vs_without_pr_ms": round(pr_ms - without_ms, MS_PRECISION_DIGITS),
+            "delta_vs_without_pr_pct": round(_pct_delta(without_ms, pr_ms), PCT_PRECISION_DIGITS),
+            "speedup_vs_without_pr": round(_speedup(without_ms, pr_ms), RATIO_PRECISION_DIGITS),
+        })
+    pr_ablations.sort(key=lambda row: row["delta_vs_merged_ms"])
+    loo_ablations.sort(key=lambda row: row["delta_vs_without_pr_ms"])
+
+    return pr_ablations, loo_ablations
+
+
+def compare_feature_tracks(
+    model: str | Mapping[str, Any],
+    hardware: str | Mapping[str, Any] = "a3",
+    *,
+    runtime_stack: str | Mapping[str, Any] = "vllm-ascend",
+    phase: str = "decode",
+    tokens: int = 1,
+    context: int = DEFAULT_WATERFALL_CONTEXT,
+    sequences: int = DEFAULT_WATERFALL_SEQUENCES,
+    scope: str = "body",
+    ablate_prs: bool = True,
+    **compose_kwargs: Any,
+) -> dict[str, Any]:
+    """Return the complete 4-rung software-to-silicon performance waterfall."""
+    from mindie_sim.compose import compose_case
+    from mindie_sim.prediction.efficiency import analyze_network_efficiency
+
+    cleaned_kwargs = dict(compose_kwargs)
+    cleaned_kwargs.pop("feature_track", None)
+    cleaned_kwargs.pop("optimizations", None)
+    cleaned_kwargs.pop("exclude_optimizations", None)
+    cleaned_kwargs.pop("raw_eager", None)
+    cleaned_kwargs.pop("_stack_phase", None)
+
+    cases: dict[str, dict[str, Any]] = {}
+    analyses: dict[str, dict[str, Any]] = {}
+    for track in ("merged", "unmerged_pr", "expected_ideal"):
+        case = compose_case(
+            model, hardware=hardware, runtime_stack=runtime_stack,
+            feature_track=track, _stack_phase=phase, **cleaned_kwargs,
+        )
+        cases[track] = case
+        analyses[track] = analyze_network_efficiency(
+            case, phase=phase, tokens=tokens, context=context,
+            sequences=sequences, scope=scope,
+        )
+
+    eager_kwargs = dict(cleaned_kwargs)
+    if "quant" not in eager_kwargs:
+        va_prof = (cases["merged"]["runtime"]["metadata"] or {}).get("va_profile") or {}
+        if va_prof.get("quant") is not None:
+            eager_kwargs["quant"] = va_prof["quant"]
+    cases["raw_eager"] = compose_case(
+        model, hardware=hardware, runtime_stack=runtime_stack,
+        feature_track="raw_eager", _stack_phase=phase, **eager_kwargs,
+    )
+    analyses["raw_eager"] = analyze_network_efficiency(
+        cases["raw_eager"], phase=phase, tokens=tokens, context=context,
+        sequences=sequences, scope=scope,
+    )
+
+    eager_ms = float(analyses["raw_eager"]["graph_duration_ms"])
+    merged_ms = float(analyses["merged"]["graph_duration_ms"])
+    pr_ms = float(analyses["unmerged_pr"]["graph_duration_ms"])
+    ideal_ms = float(analyses["expected_ideal"]["graph_duration_ms"])
+    ideal_eff = analyses["expected_ideal"]
+    roof_1p0_ms = max(
+        float(ideal_eff.get("critical_path_roofline_ms") or 0.0),
+        float(ideal_eff.get("physical_resource_cut_ms") or 0.0),
+    ) or float(ideal_eff.get("total_roofline_ideal_ms") or 0.0)
+
+    eager_report = cases["raw_eager"]["runtime"]["metadata"]["feature_track_report"]
+    merged_report = cases["merged"]["runtime"]["metadata"]["feature_track_report"]
+    pr_report = cases["unmerged_pr"]["runtime"]["metadata"]["feature_track_report"]
+    ideal_report = cases["expected_ideal"]["runtime"]["metadata"]["feature_track_report"]
+
+    pr_ablations, loo_ablations = [], []
+    if ablate_prs:
+        pr_ablations, loo_ablations = _compare_pr_ablations(
+            model, hardware, runtime_stack, pr_report, merged_ms, pr_ms,
+            phase=phase, tokens=tokens, context=context, sequences=sequences,
+            scope=scope, compose_kwargs=cleaned_kwargs,
+        )
+
+    monotonic = (
+        merged_ms + MONOTONIC_TOLERANCE_MS >= pr_ms
+        and pr_ms + MONOTONIC_TOLERANCE_MS >= ideal_ms
+        and ideal_ms + MONOTONIC_TOLERANCE_MS >= roof_1p0_ms
+    )
+    eager_monotonic = eager_ms + MONOTONIC_TOLERANCE_MS >= merged_ms
+
+    return {
+        "schema": WATERFALL_SCHEMA,
+        "model": cases["merged"]["model"]["name"],
+        "hardware_sku": cases["merged"]["machine"]["sku"],
+        "runtime_stack": merged_report["stack"],
+        "repository": merged_report["repository"],
+        "geometry": {
+            "phase": phase, "tokens": tokens,
+            "context": context, "sequences": sequences, "scope": scope,
+        },
+        "monotonic_verified": bool(monotonic),
+        "eager_vs_merged_monotonic": bool(eager_monotonic),
+        "waterfall": {
+            "raw_eager": {
+                "step_ms": round(eager_ms, MS_PRECISION_DIGITS),
+                "operator_sum_ms": round(float(analyses["raw_eager"]["operator_sum_ms"]), MS_PRECISION_DIGITS),
+                "hbm_bytes": float(analyses["raw_eager"]["total_hbm_bytes"]),
+                "network": _network(analyses["raw_eager"]),
+                "active_mechanisms": [m["id"] for m in eager_report["active_mechanisms"]],
+            },
+            "current_merged": {
+                "step_ms": round(merged_ms, MS_PRECISION_DIGITS),
+                "operator_sum_ms": round(float(analyses["merged"]["operator_sum_ms"]), MS_PRECISION_DIGITS),
+                "hbm_bytes": float(analyses["merged"]["total_hbm_bytes"]),
+                "network": _network(analyses["merged"]),
+                "delta_vs_raw_eager_ms": round(merged_ms - eager_ms, MS_PRECISION_DIGITS),
+                "delta_vs_raw_eager_pct": round(_pct_delta(eager_ms, merged_ms), PCT_PRECISION_DIGITS),
+                "speedup_vs_raw_eager": round(_speedup(eager_ms, merged_ms), RATIO_PRECISION_DIGITS),
+                "active_mechanisms": [m["id"] for m in merged_report["active_mechanisms"]],
+            },
+            "current_unmerged_pr": {
+                "step_ms": round(pr_ms, MS_PRECISION_DIGITS),
+                "operator_sum_ms": round(float(analyses["unmerged_pr"]["operator_sum_ms"]), MS_PRECISION_DIGITS),
+                "hbm_bytes": float(analyses["unmerged_pr"]["total_hbm_bytes"]),
+                "network": _network(analyses["unmerged_pr"]),
+                "delta_vs_merged_ms": round(pr_ms - merged_ms, MS_PRECISION_DIGITS),
+                "delta_vs_merged_pct": round(_pct_delta(merged_ms, pr_ms), PCT_PRECISION_DIGITS),
+                "speedup_vs_merged": round(_speedup(merged_ms, pr_ms), RATIO_PRECISION_DIGITS),
+                "active_open_prs": [
+                    {"mechanism_id": m["mechanism_id"], "ref": m["ref"], "notes": m["notes"]}
+                    for m in pr_report["unmerged_pr_mechanisms"]
+                ],
+                "single_pr_ablation": pr_ablations,
+                "leave_one_out_ablation": loo_ablations,
+            },
+            "expected_ideal": {
+                "step_ms": round(ideal_ms, MS_PRECISION_DIGITS),
+                "operator_sum_ms": round(float(analyses["expected_ideal"]["operator_sum_ms"]), MS_PRECISION_DIGITS),
+                "hbm_bytes": float(analyses["expected_ideal"]["total_hbm_bytes"]),
+                "network": _network(analyses["expected_ideal"]),
+                "delta_vs_unmerged_pr_ms": round(ideal_ms - pr_ms, MS_PRECISION_DIGITS),
+                "delta_vs_unmerged_pr_pct": round(_pct_delta(pr_ms, ideal_ms), PCT_PRECISION_DIGITS),
+                "delta_vs_merged_ms": round(ideal_ms - merged_ms, MS_PRECISION_DIGITS),
+                "delta_vs_merged_pct": round(_pct_delta(merged_ms, ideal_ms), PCT_PRECISION_DIGITS),
+                "speedup_vs_merged": round(_speedup(merged_ms, ideal_ms), RATIO_PRECISION_DIGITS),
+                "unimplemented_architectural_gaps": ideal_report["unimplemented_gaps"],
+                "active_mechanisms": [m["id"] for m in ideal_report["active_mechanisms"]],
+            },
+            "hardware_roofline": {
+                "physical_ideal_1p0x_ms": round(roof_1p0_ms, MS_PRECISION_DIGITS),
+                "remaining_kernel_micro_gap_to_1p0x_ms": round(max(0.0, ideal_ms - roof_1p0_ms), MS_PRECISION_DIGITS),
+            },
+        },
+        "efficiency_reference": {
+            "physical_ideal_ms": round(roof_1p0_ms, MS_PRECISION_DIGITS),
+            "basis": "physical_1p0x_critical_path_roofline",
+        },
+    }

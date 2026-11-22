@@ -30,7 +30,7 @@ _STRICT_OWNED_RECIPE_MODULES = frozenset({
     "mindie_sim.prediction.operators.sparse_indexer.bf16_lightning",
     "mindie_sim.prediction.operators.linear_attention.gdn_decode",
 })
-_OWNER_MODULE_PREFIXES = ("mindie_sim.prediction.operators.",)
+_OWNER_MODULE_PREFIXES = ("mindie_sim.prediction.operators.", "mindie_sim.prediction.sharding.")
 _NON_DEVICE_INFRA_RECIPES = frozenset({
     ("mindie_sim.prediction.physical_recipe_registry", "ControlSyncRecipe"),
     ("mindie_sim.prediction.program.binding", "TransferRecipe"),
@@ -39,11 +39,11 @@ _NON_DEVICE_INFRA_RECIPES = frozenset({
     # Transport-only programs and a single-resource service adapter.
     ("mindie_sim.prediction.collectives.ring_pairwise", "PairwiseCollective"),
     ("mindie_sim.prediction.collectives.ring_pairwise", "RingCollective"),
-    ("mindie_sim.prediction.services", "ResourceService"),
+    ("mindie_sim.prediction.service_regime_domains.services", "ResourceService"),
 })
 _RECIPE_BOOK_PATH = PurePosixPath("mindie_sim/prediction/program/recipes.py")
 _PHYSICAL_REGISTRY_PATH = PurePosixPath("mindie_sim/prediction/physical_recipe_registry.py")
-_IMPLEMENTATION_PATH = PurePosixPath("mindie_sim/prediction/implementation_registry.py")
+_IMPLEMENTATION_PATH = PurePosixPath("mindie_sim/prediction/program/implementation_registry.py")
 _SHIPPED_RECIPE_CASE = PurePosixPath("examples/cases/qwen38-a5.json")
 _GATE_PATH = PurePosixPath("scripts/check_arch_governance.py")
 
@@ -70,13 +70,13 @@ HEURISTIC_IDENTIFIER_RE = re.compile(
 CAMEL_CASE_BOUNDARY_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
 
 #: Lock B downward ratchet on flat top-level ``mindie_sim/prediction/*.py`` files
-#: (any new flat file under mindie_sim/prediction/ fails AG008).
-MAX_FLAT_PREDICTION_MODULES = 119
+#: (+25% headroom over post-Wave-7 count of 38; any uncontrolled sprawl fails AG008).
+MAX_FLAT_PREDICTION_MODULES = 48
 #: Bounded package directory fan-out ceiling for governed ``operators/<family>/``
 #: packages (+25% evolution headroom over 20; unlimited new operator families).
 MAX_OPERATOR_PACKAGE_FILES = 25
-#: Top-level ``mindie_sim/*.py`` ceiling (+25% evolution headroom over 50).
-MAX_TOPLEVEL_MODULES = 63
+#: Top-level ``mindie_sim/*.py`` ceiling (+25% evolution headroom over post-Wave-7 count of 20).
+MAX_TOPLEVEL_MODULES = 25
 #: Bounded ``mindie_sim/onboarding/**/*.py`` footprint (+25% headroom over 6 / 4,127).
 MAX_ONBOARDING_FILES = 8
 MAX_ONBOARDING_LOC = 5200
@@ -100,14 +100,8 @@ _DOMAIN_COPY_OPERATORS = frozenset({
     "mindie_sim/prediction/operators/causal_conv/conv_state_copy.py",
     "mindie_sim/prediction/operators/vector/tensor_copy.py",
 })
-_LEGACY_SHARD_FILES = frozenset({
-    "mindie_sim/prediction/execution/step_helpers.py",
-    "mindie_sim/prediction/runtime/engine_periodic_mixin.py",
-})
+_LEGACY_SHARD_FILES = frozenset()
 _LEGACY_PRIVATE_SHARD_FILES = frozenset({
-    "mindie_sim/_remote_worker.py",
-    "mindie_sim/_sweep_worker.py",
-    "mindie_sim/observations/_capture_verify.py",
     "mindie_sim/optimization/_dual_obligations.py",
     "mindie_sim/prediction/operators/attention/_cp_tiling.py",
     "mindie_sim/prediction/operators/attention/_fia.py",
@@ -152,8 +146,10 @@ _AG009_FALLBACK_FNS = frozenset({
 })
 _AG010_L1_PKGS = frozenset({"backends", "primitives", "catalog", "templates"})
 _AG010_L2_SUBS = frozenset({"program", "runtime", "execution", "collectives", "capacity"})
+_AG010_L2_SHARDING = frozenset({"local_tp", "routing", "sequence_parallel"})
+_AG010_L3_SUBS = frozenset({"operators", "sharding"})
 _AG010_L4_PKGS = frozenset({"optimization", "rewrite", "observations", "onboarding", "export"})
-_AG010_LAYER_NAMES = ("L0:schema", "L1:hardware", "L2:runtime", "L3:operators", "L4:product")
+_AG010_LAYER_NAMES = ("L0:schema", "L1:hardware", "L2:runtime", "L3:operators+sharding", "L4:product")
 #: Ratcheted legacy upward edges (40 edges / 27 files; zero L3->L4, zero primitives/loader->L4).
 _LEGACY_UPWARD_IMPORTS: Mapping[str, frozenset[str]] = {
     "mindie_sim/catalog/qwen4_exp.py": frozenset({"mindie_sim.prediction.program"}),
@@ -165,7 +161,9 @@ _LEGACY_UPWARD_IMPORTS: Mapping[str, frozenset[str]] = {
     "mindie_sim/prediction/execution/cohort_native.py": frozenset({"mindie_sim.prediction.operators"}),
     "mindie_sim/prediction/execution/context.py": frozenset({"mindie_sim.prediction.operators"}),
     "mindie_sim/prediction/execution/runner.py": frozenset({"mindie_sim.observations"}),
-    "mindie_sim/prediction/program/recipes.py": frozenset({"mindie_sim.prediction.operators"}),
+    "mindie_sim/prediction/program/recipes.py": frozenset({
+        "mindie_sim.prediction.operators", "mindie_sim.prediction.sharding",
+    }),
     "mindie_sim/primitives/_lowering_comms.py": frozenset({
         "mindie_sim.prediction.collectives", "mindie_sim.prediction.program", "mindie_sim.prediction.runtime",
     }),
@@ -208,17 +206,17 @@ _LEGACY_UPWARD_IMPORTS: Mapping[str, frozenset[str]] = {
 _AG011_DISPATCH_ROOTS = frozenset({
     "mindie_sim.prediction.spine",
     "mindie_sim.prediction.frontend",
-    "mindie_sim.prediction.frontend_body",
-    "mindie_sim.prediction.frontend_iteration",
+    "mindie_sim.prediction.frontend.body",
+    "mindie_sim.prediction.frontend.iteration",
     "mindie_sim.prediction.program.recipes",
     "mindie_sim.prediction.physical_recipe_registry",
-    "mindie_sim.prediction.implementation_registry",
+    "mindie_sim.prediction.program.implementation_registry",
     "mindie_sim.prediction.body_defaults",
     "mindie_sim.prediction.call_builders",
     "mindie_sim.prediction.operators.registry",
     "mindie_sim.prediction.operators",
     "mindie_sim.prediction.runtime.engine",
-    "mindie_sim.compose_operator_defaults",
+    "mindie_sim.compose.operator_defaults",
     "mindie_sim.stack_registry",
     "mindie_sim.templates.registry",
 })
@@ -229,16 +227,12 @@ _LEGACY_UNREACHABLE_OPERATOR_MODULES = frozenset({
     "mindie_sim/prediction/operators/vector/dynamic_quant_schedule.py",
 })
 _FLAT_PLAN_INFRA_FILES = frozenset({
-    "mindie_sim/prediction/fusion_bridge.py",
-    "mindie_sim/prediction/fusion_recipe.py",
-    "mindie_sim/prediction/implementation_registry.py",
+    "mindie_sim/prediction/graph_analysis.py",
     "mindie_sim/prediction/mechanism.py",
     "mindie_sim/prediction/native_binding.py",
-    "mindie_sim/prediction/native_coverage.py",
     "mindie_sim/prediction/physical_recipe_base.py",
     "mindie_sim/prediction/results.py",
     "mindie_sim/prediction/spine.py",
-    "mindie_sim/prediction/verification.py",
 })
 _FLAT_PREDICTION_DEPTH = 3
 
@@ -602,7 +596,9 @@ def _ag010_layer(parts: tuple[str, ...]) -> int | None:
     if top == "prediction" and len(parts) >= 3:
         if parts[2] in _AG010_L2_SUBS:
             return 2
-        if parts[2] == "operators":
+        if parts[2] == "sharding" and len(parts) >= 4 and parts[3] in _AG010_L2_SHARDING:
+            return 2
+        if parts[2] in _AG010_L3_SUBS:
             return 3
     if top in _AG010_L4_PKGS or top.startswith(("compose", "sweep")):
         return 4
@@ -769,13 +765,15 @@ def _binding_module(recipe) -> str:
 
 
 def _is_governed_module(module: str) -> bool:
-    prefix = _OWNER_MODULE_PREFIXES[0]
-    if not module.startswith(prefix):
-        return False
-    name = module.removeprefix(prefix)
-    # Registry-generated recipes dispatch through the family resolver audited
-    # below. Other flat modules directly under operators/ have no family.
-    return "." in name or name == "registry" or hasattr(sys.modules.get(module), "__path__")
+    for prefix in _OWNER_MODULE_PREFIXES:
+        if module.startswith(prefix):
+            if prefix != _OWNER_MODULE_PREFIXES[0]:
+                return True
+            name = module.removeprefix(prefix)
+            # Registry-generated recipes dispatch through the family resolver audited
+            # below. Other flat modules directly under operators/ have no family.
+            return "." in name or name == "registry" or hasattr(sys.modules.get(module), "__path__")
+    return False
 
 
 def _is_shared_transport_lowering(binding, module: str) -> bool:
@@ -790,7 +788,7 @@ def _is_shared_transport_lowering(binding, module: str) -> bool:
 
 def verify_ag006_ownership(root: Path | None = None) -> tuple[Violation, ...]:
     """Check 100% of active recipe bindings, IMPLEMENTATIONS, RecipeBook, and live dispatch."""
-    from mindie_sim.prediction.implementation_registry import IMPLEMENTATIONS
+    from mindie_sim.prediction.program.implementation_registry import IMPLEMENTATIONS
     from mindie_sim.prediction.operators import mc2
     from mindie_sim.prediction.operators.linear_attention import gdn_decode
     from mindie_sim.prediction.operators.registry import builtin_family_registry
@@ -1091,7 +1089,7 @@ def verify_ag007_discrimination(
 
 def verify_ag011_engine_reachability() -> tuple[Violation, ...]:
     """Verify governed recipes execute through runtime.Engine and registries stay wired."""
-    from mindie_sim.prediction.implementation_registry import IMPLEMENTATIONS
+    from mindie_sim.prediction.program.implementation_registry import IMPLEMENTATIONS
     from mindie_sim.prediction.operators.registry import builtin_family_registry
     from mindie_sim.prediction.runtime.engine import Engine
     from mindie_sim.prediction.runtime.engine_types import Resource

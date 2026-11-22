@@ -2,23 +2,26 @@
 
 This repository owns the `mindie_sim` runtime and `mindie-sim` CLI. Product-level entry documentation and cross-repo routing live in the sibling [`mindie-agent`](../mindie-agent) repository.
 
-Read [`docs/architecture.md`](docs/architecture.md) before changing the engine or semantic boundaries.
-Read [`docs/observations.md`](docs/observations.md) before importing observations or changing calibration.
-Read [`docs/modeling-fidelity.md`](docs/modeling-fidelity.md) when choosing operator detail or refinement work.
-Read [`CONTRIBUTING.md`](CONTRIBUTING.md) ([English](CONTRIBUTING.en.md)) for the Ascend A2/A3/A5 calibration SOP, `PhysicalRecipe` conservation contract, and linked-worktree PR workflow.
+## First-Screen Canonical Owner Map (`Rule #1`: Edit the Existing Owner)
 
-## Canonical Concept Owners (Single Source of Truth — Zero Parallel Structs)
+**Rule #1**: *Edit the existing canonical owner in place — **never** create a parallel concept struct, `*_v2.py` duplicate, or `*_helper`/`*_mixin`/`*_part*` shard (`AG006`–`AG012` & Hub Lock-6 fail CI mechanically).*
 
-Every core concept has **exactly one** authoritative owner module. Reuse and extend these canonical types in place; **never** create parallel batch/sequence/cache/rate structs or flat operator duplicates (`AG006` / `AG008` enforce this mechanically):
-
-| Concept | Canonical Types | Single Authoritative Owner |
+| Domain / Concept | Canonical Types & Entrypoints | Single Authoritative Owner |
 | --- | --- | --- |
-| **Iteration & Ragged/Padding Batch** | `RequestView`, `IterationPlan` | [`mindie_sim/schema/workload.py`](mindie_sim/schema/workload.py) |
-| **Per-Die L2 Residency & Admission** | `AdmissionMemoryView`, `bind_memory_access` | [`mindie_sim/prediction/runtime/l2_residency.py`](mindie_sim/prediction/runtime/l2_residency.py) |
-| **3-Ledger Memory Physics & Runs** | `ByteLedger`, `AddressRunPlan`, `MemoryAccessPattern` | [`mindie_sim/prediction/runtime/memory_physics.py`](mindie_sim/prediction/runtime/memory_physics.py) |
-| **L0 Primitives & Rate Overlays** | `PrimitiveTable`, `CalibratedRateOverlay` | [`mindie_sim/primitives/`](mindie_sim/primitives/) |
-| **Operator Planning & All Device Recipes** | `OperatorPlanningContext`, `FamilyRegistry`, `<family>/*` | [`mindie_sim/prediction/operators/`](mindie_sim/prediction/operators/) |
-| **Primal-Dual Optimality Bounds** | `OptimalityCertificate`, `certify_lower_bound` | [`mindie_sim/optimization/dual_bound.py`](mindie_sim/optimization/dual_bound.py) |
+| **Causal Event Engine & Resources** | `Engine`, `Event`, `ExecutionBindings`, `CostModel` | [`mindie_sim/prediction/runtime/engine.py`](mindie_sim/prediction/runtime/engine.py) & [`mindie_sim/prediction/execution/`](mindie_sim/prediction/execution/) |
+| **Workload & Iteration Batch** | `RequestView`, `IterationPlan`, `ModelSpec`, `Case` | [`mindie_sim/schema/workload.py`](mindie_sim/schema/workload.py) & [`mindie_sim/schema/`](mindie_sim/schema/) |
+| **L2 Residency & 3-Ledger Memory** | `AdmissionMemoryView`, `ByteLedger`, `AddressRunPlan` | [`mindie_sim/prediction/runtime/l2_residency.py`](mindie_sim/prediction/runtime/l2_residency.py) & [`mindie_sim/prediction/runtime/memory_physics.py`](mindie_sim/prediction/runtime/memory_physics.py) |
+| **Hardware Profiles & L0 Primitives** | `ascend.json`, `PrimitiveTable`, `CalibratedRateOverlay` | [`mindie_sim/backends/`](mindie_sim/backends/) & [`mindie_sim/primitives/`](mindie_sim/primitives/) |
+| **Single-Rank NPU Operator Kernels** | `OperatorPlanningContext`, `FamilyRegistry`, `<family>/*` | [`mindie_sim/prediction/operators/`](mindie_sim/prediction/operators/) *(single-rank kernels ONLY)* |
+| **Distributed Sharding & Collectives** | `SP`, `Local-TP`, `DCP`/`PCP` monoids, `EP`/`MC2` boundaries | [`mindie_sim/prediction/sharding/`](mindie_sim/prediction/sharding/) & [`mindie_sim/prediction/collectives/`](mindie_sim/prediction/collectives/) |
+| **Fusion, Rewrite & Primal-Dual `L*`** | `RewritePipeline`, `OptimalityCertificate`, `certify_lower_bound` | [`mindie_sim/prediction/fusion/`](mindie_sim/prediction/fusion/), [`mindie_sim/rewrite/`](mindie_sim/rewrite/), [`mindie_sim/optimization/dual_bound.py`](mindie_sim/optimization/dual_bound.py) |
+| **Model Catalog, Quant & Compose** | `load_model`, `QUANTIZATION_PRESETS`, `compose_case` | [`mindie_sim/model_catalog.py`](mindie_sim/model_catalog.py), [`mindie_sim/catalog/`](mindie_sim/catalog/), [`mindie_sim/compose/`](mindie_sim/compose/) |
+| **Deployment Solver & Pareto Sweep** | `solve_deployment`, `solve_optimal_deployment`, `sweep_topologies` | [`mindie_sim/solve.py`](mindie_sim/solve.py) & [`mindie_sim/sweep/`](mindie_sim/sweep/) |
+| **Stack Tracks & Feature Waterfall** | `compare_feature_tracks`, `resolve_runtime_stack` | [`mindie_sim/feature_mechanisms.py`](mindie_sim/feature_mechanisms.py) & [`mindie_sim/stack_tracks.py`](mindie_sim/stack_tracks.py) |
+| **Turnkey CLI, Exporters & Onboarding** | `report`, `quickstart`, `export`, `onboard-sku/operator` | [`mindie_sim/cli/`](mindie_sim/cli/), [`mindie_sim/export/`](mindie_sim/export/), [`mindie_sim/onboarding/`](mindie_sim/onboarding/) |
+| **Observations & Profiler SSOT** | `observed_contracts`, `captures`, `calibration`, `service_fitting` | [`mindie_sim/observed_contracts/`](mindie_sim/observed_contracts/) & [`mindie_sim/observations/`](mindie_sim/observations/) |
+
+Read [`docs/architecture.md`](docs/architecture.md), [`docs/observations.md`](docs/observations.md), [`docs/modeling-fidelity.md`](docs/modeling-fidelity.md), and [`CONTRIBUTING.md`](CONTRIBUTING.md) ([English](CONTRIBUTING.en.md)) when changing engine semantics, calibration, or hardware profiles.
 
 ---
 
@@ -28,7 +31,7 @@ Every core concept has **exactly one** authoritative owner module. Reuse and ext
 - Derive work and dependencies from structure with **100% structural/tensor generalization** (`0` `model_id` branches in `implementation_selection`, fusion passes, or `PhysicalRecipe`s; `model_scopes` distinguishes `target` vs `draft` subgraphs only). No serving floors, model-specific latency multipliers, body-total fits, `ResourceEnvelope` peak-division fallbacks, or measurement-presence admission checks; unmodeled core structures must raise `UnmodeledCapabilityError` (`mindie-unmodeled-structure-hint/1`).
 - Verify **fresh upstream source `HEAD`s across the full Ascend stack** (`vllm-ascend`, `cann-recipes-infer`, `MindIE-SD`, `cann/ops-transformer`, `cann/ops-nn`, `fla-npu`, `flash-attn-npu`, `cannbot-dsl`, `xllm` / `xllm-ops`, `torch-npu`) — mounting the actual owning repo whenever an operator lives outside `ops-transformer` — before altering operator graphs, fusion boundaries, or kernel ABIs; when stale issue assumptions conflict with current upstream source + real captures, follow real upstream source + captures and record the upstream evolution in the PR.
 - Keep calibration separate from validation. Heldout measurements never enter a training lookup. Preserve original boundary, units, source, and implementation.
-- Extend governed operator packages under `mindie_sim/prediction/operators/<family>/` (or `mindie_sim/templates/`). Never add device operator builders or `OperatorPlan`/`PlannedRecipe` implementations in flat `mindie_sim/prediction/*.py` (`AG006` + `AG008` strictly ratchet `MAX_FLAT_PREDICTION_MODULES` downward). A new model adapter produces existing structural records; a new mechanism supplies its own builder or executable recipe conserving prepared work across `mte2_aic`, `mte2_aiv`, `cube`, `vector`, `fixpipe`, `mte3`, `l2`, and `hbm`.
+- Extend governed single-rank kernels under `mindie_sim/prediction/operators/<family>/` (or `mindie_sim/templates/`) and distributed tensor-placement/collective rewrites under `mindie_sim/prediction/sharding/`. Never add device operator builders or `OperatorPlan`/`PlannedRecipe` implementations in flat `mindie_sim/prediction/*.py` (`AG006` + `AG008` strictly ratchet `MAX_FLAT_PREDICTION_MODULES` downward).
 - Prefer the simplest resource/phase/tile model that preserves relevant work, boundaries, and constraints. Instruction-level detail is optional and needs a material cost, trend, or ranking counterexample; nonzero timing error alone is not a reason to recreate a kernel/compiler. Calibration is a separate axis.
 - **Zero Accidental Device Context (`DEV-ZERO-CTX`)**: Simulation must not load weights, import `torch_npu`, initialize NPU contexts, or start remote work. Device measurements require resource/VRAM prechecks and explicit bounded work.
 - **Read-Only Analytical Execution & Clean Provenance (`DEV-READONLY-PATH`)**: Routine prediction/sweep/SLA/efficiency commands are read-only on inputs and never leak host `$HOME` paths, private intranet IPs, or container image SHA routing (`capture://` URIs and `{repository, revision, relative_path, source_sha256}` only).
@@ -63,6 +66,7 @@ cd ../.worktrees/sim-<topic>
 # 1. Hygiene, 39-model independent catalog conservation, LF & differential literal gates
 python3 .github/scripts/check_lf_eol.py
 python3 -B scripts/check_no_magic_numbers.py --base origin/main --root .
+python3 -B scripts/check_arch_governance.py --root . --strict
 python3 -B scripts/check_test_orthogonality.py --root . --base origin/main   # tests/<domain>/ per tests/TAXONOMY.toml
 python3 -B scripts/verify_m1.py hygiene
 python3 -B scripts/verify_m1.py catalog-meta --require-models 39

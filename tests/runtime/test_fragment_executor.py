@@ -14,11 +14,11 @@ import pytest
 
 from mindie_sim.observations.resource_services import normalize_resource_service
 from mindie_sim.prediction.capacity import Memory, MemoryPolicy
-from mindie_sim.prediction.cost import CostModel
+from mindie_sim.prediction.efficiency.cost import CostModel
 from mindie_sim.prediction.engine import Allocation, Engine, ExecutionError, Resource
 from mindie_sim.prediction.engine_periodic import CycleCorrespondence, CycleSkip, IntervalDelta, RunCorrespondence
 from mindie_sim.prediction.execution import Execution
-from mindie_sim.prediction.primitives import PrimitiveTiming
+from mindie_sim.prediction.program.primitives import PrimitiveTiming
 from mindie_sim.prediction.program import KernelProgram, PipelinePhase, PipelineTemplate, Stage
 from mindie_sim.prediction.scheduling import (FragmentConductor, FragmentContractError,
                                               UnsupportedFragmentSemantics, start_pipeline_template)

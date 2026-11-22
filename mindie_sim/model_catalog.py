@@ -271,7 +271,13 @@ def load_model(key: str, *, config_root: str | Path | None = None) -> ModelSpec:
         if fallback is not None:
             path = fallback
     if key not in entries and not path.is_file():
-        raise ModelingError(f"model_catalog_unknown:{key}")
+        import difflib
+        pool = sorted(set(entries) | set(MODEL_ALIASES) | set(ARCHITECTURE_PRESET_ALIASES))
+        matches = difflib.get_close_matches(key.lower(), pool, n=3, cutoff=0.45) or sorted(CATALOG)[:3]
+        raise ModelingError(
+            f"model_catalog_unknown:{key} — did you mean {', '.join(matches)}? "
+            "Or pass a path to HuggingFace config.json or model directory"
+        )
     if path.stat().st_size > 50 * 1024 * 1024:
         raise ModelingError(f"model_config_size_exceeds_metadata_limit:{key}")
     try:

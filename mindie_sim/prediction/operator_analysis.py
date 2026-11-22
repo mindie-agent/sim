@@ -10,17 +10,17 @@ from copy import deepcopy
 from dataclasses import replace
 from collections.abc import Mapping
 
-from .analysis_inputs import (
+from .graph_analysis import (
     FIRST_PARTICIPANT, UNIFORM_COUNT_CARDINALITY,
     analysis_view, rebind_analysis_requests,
 )
-from .cohort_traffic import bind_cohort_traffic
-from .frontend_features import FeatureConfig
-from .local_tp_groups import local_tp_spans_dp
+from .execution.cohort_traffic import bind_cohort_traffic
+from .frontend.features import FeatureConfig
+from .sharding.local_tp import local_tp_spans_dp
 from .structure import parse_case, parse_model
 from .body_defaults import (TargetGraphSet, TargetOperators,
                             effective_body_declaration)
-from .operator_replay import (
+from .execution.operator_replay import (
     cohort_operator_costs, operator_costs, physical_id, physical_signature,
     requires_collective_cohort, _replay_scope,
 )
@@ -41,7 +41,7 @@ def _analysis_prefix_fields(case, index: int, context: int) -> dict:
 
 
 def _selected_group(case, selected_replica=None, cohort=None):
-    from mindie_sim.prediction.dispatch import cohorts
+    from mindie_sim.prediction.execution.dispatch import cohorts
     groups = [tuple(group) for group in cohorts(case.runtime.parallel, case.machine)]
     if cohort is not None:
         selected = tuple(int(value) for value in cohort)
@@ -144,7 +144,7 @@ def target_operators(case, *, phase, tokens, context=0, sequences=1, scope="body
                      routing_views=None, physical_rank=None, query_position=None,
                      selected_replica=None, cohort=None, pure_model=False,
                      layer_limit=None):
-    from .dispatch import cohorts
+    from .execution.dispatch import cohorts
 
     case = parse_model(case) if pure_model else parse_case(case)
     _check_geometry(phase, tokens, sequences, context, scope)
@@ -166,7 +166,7 @@ def target_operators(case, *, phase, tokens, context=0, sequences=1, scope="body
         for index in range(max(0, view_count))
     )
     case = _media_case(case, views, scope, media_tokens_per_sequence)
-    from .local_tp_groups import local_tp_spans_dp
+    from .sharding.local_tp import local_tp_spans_dp
     if (len(group) > 1
             and (case.runtime.kernels.get("sequence_parallel")
                  or local_tp_spans_dp(case.runtime.parallel)
@@ -291,7 +291,7 @@ def _target_ops(case, views, scope, *, global_views=None, resource_fusion=True,
     from .frontend import mark_analytical_runtime
     runtime = mark_analytical_runtime(runtime, selections)
     case = replace(case, runtime=runtime)
-    from .rank_ledger import selected_lane
+    from .execution.rank_ledger import selected_lane
     local, local_tokens, pcp_prefill = frontend.partition_views(
         views, case.runtime, padded_tokens, model=case.model,
         lane=selected_lane(case.runtime.parallel, case.machine, replica, physical_rank))
@@ -516,7 +516,7 @@ def _cohort_routing_geometry(
     sp_padding = case.runtime.kernels.get("sequence_parallel", {}).get("padding")
     if len(logical_views) > 1 and (case.runtime.routing.get("policy") == "balanced"
                                    or sp_padding == "right_to_tp"):
-        from .balanced_routing import cohort_padded_tokens
+        from .sharding.routing import cohort_padded_tokens
         padded_cohort = cohort_padded_tokens(logical_views.values(), case.runtime)
     # The ordinary selector consumes the source rows each physical EP rank
     # actually owns.  With SP, valid_per_tp is that exact ownership; flattening
@@ -531,7 +531,7 @@ def _cohort_routing_geometry(
     if (len(participants) > UNIFORM_COUNT_CARDINALITY and "sequence_parallel" in case.runtime.kernels
             and case.runtime.parallel.rank_table is None):
         from .graph import GraphPolicy
-        from .sequence_parallel import select as select_sp
+        from .sharding.sequence_parallel import select as select_sp
         total_global = (padded_cohort if padded_cohort is not None
                         else sum(active_rows_by_replica.values()))
         physical_rows = []
@@ -612,7 +612,7 @@ def target_graphs(case, *, phase, tokens, context=0, sequences=1, scope="model",
     physical padding view launches the actual graph bucket and EP kernel
     participation without inventing a logical request.
     """
-    from .dispatch import cohorts
+    from .execution.dispatch import cohorts
 
     case = parse_model(case) if pure_model else parse_case(case)
     _check_geometry(phase, tokens, 1, context, scope)
@@ -717,7 +717,7 @@ def target_graphs(case, *, phase, tokens, context=0, sequences=1, scope="model",
                            layer_limit=layer_limit)
             for r, group in views.items()
         }
-    from .local_projection_tp import lower_local_projection_tp_cohort
+    from .sharding.local_tp import lower_local_projection_tp_cohort
     graphs = bind_cohort_traffic(case, raw_graphs)
     graphs = lower_local_projection_tp_cohort(
         graphs, model=case.model, runtime=case.runtime, machine=case.machine)
@@ -726,7 +726,7 @@ def target_graphs(case, *, phase, tokens, context=0, sequences=1, scope="model",
         # The same ordinary cohort producer proves and rebinds replicas; a
         # "require" declaration therefore fails before pricing an unproved
         # asymmetric cohort instead of silently running full duplicates.
-        from .cohort_reuse import prepare_cohort_graphs
+        from .execution.cohort_reuse import prepare_cohort_graphs
         prepared = prepare_cohort_graphs(case, graphs, reuse=reuse_mode)
         graphs = {replica: tuple(prepared.graphs[replica])
                   for replica in graphs}

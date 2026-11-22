@@ -651,7 +651,7 @@ def resolve_collective_cosets(
         return cosets
     seen: set[tuple[int, ...]] = set()
     cosets = []
-    from mindie_sim.prediction.local_tp_groups import expert_tp_groups
+    from mindie_sim.prediction.sharding.local_tp import expert_tp_groups
     for replica in range(total_dp):
         try:
             if not topology.ranks(replica, stage_idx):

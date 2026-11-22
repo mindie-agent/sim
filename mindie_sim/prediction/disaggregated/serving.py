@@ -16,12 +16,12 @@ from mindie_sim.schema.common import ModelingError
 
 from mindie_sim.prediction.operators.attention.attention import AttentionPolicy
 from ..capacity import Memory
-from ..cost import CostModel
-from ..dispatch import cohorts, submit_batch
+from ..efficiency.cost import CostModel
+from ..execution.dispatch import cohorts, submit_batch
 from ..engine import Engine
 from ..execution import Execution
 from ..frontend import Frontend
-from ..metrics import serving_boundaries, summarize
+from ..efficiency.metrics import serving_boundaries, summarize
 from ..pd_connector import PDConnector
 from ..scheduler import Scheduler
 from ..structure import parse_case
@@ -78,7 +78,7 @@ def predict_pd(raw, *, primitives=None, recipes=None, submission=None, memory_po
                event_limit=DEFAULT_PD_EVENT_LIMIT, scope="serving", phase=None,
                tokens=None, context=None, sequences=None, published=None):
     # The direct PD entry enforces the same structural timing gate as predict.
-    from ..unmodeled_gate import assert_timing_supported
+    from ..efficiency.unmodeled_gate import assert_timing_supported
     assert_timing_supported(raw, entry="predict")
     has_geometry = any(v is not None for v in (phase, tokens, context, sequences))
     if scope in {"body", "model"} or (scope == "serving" and has_geometry):
@@ -135,6 +135,44 @@ def predict_pd(raw, *, primitives=None, recipes=None, submission=None, memory_po
         scheduler.by_id = {state.request.request_id: state for state in scheduler.states}
         scheduler.successors = {key: shared[value.request.request_id] for key, value in scheduler.successors.items()}
     engine.now = min((r.request.arrival_ms for r in states), default=0)
+    serving_end, iterations, handoffs, handoff_bytes, handoff_records, traces = _run_pd_loop(
+        cases, engine, connector, memory, execution, lowerers, schedulers,
+        states, shared, placement, client_tails, published, trace_limit)
+    rows, boundaries = serving_boundaries(
+        states, cases["prefill"].slo,
+        host_results=any(pool.serving_io.enabled for pool in execution.values()),
+        client_delivery=all(client_declared))
+    return {
+        "schema": "mindie-sim.predict/2", "deployment": "disaggregated",
+        **combine_coverage(case.model for case in cases.values()),
+        "status": "modeled" if all(state.finish_ms is not None for state in states) else "infeasible",
+        "metrics": summarize(rows, cases["prefill"].slo, now_ms=serving_end),
+        "metric_boundaries": boundaries,
+        "throughput_window_boundary": "legacy_scheduler_completion",
+        "requests": rows, "memory": {name: ledger.to_dict() for name, ledger in memory.items()},
+        "execution": {**engine.summary(), "iterations": iterations,
+                      "handoffs": handoffs, "handoff_bytes": handoff_bytes,
+                      "connector": connector.summary(),
+                      "memory_binding": _memory_binding_report(engine, memory, execution),
+                      "pd_handoffs": [
+                          {key: value for key, value in record.items()
+                           if key != "transport_event"}
+                          | {"complete_ms": record["transport_event"].time}
+                          for record in handoff_records],
+                      "submission": {name: pool.submission_summary()
+                                     for name, pool in execution.items()},
+                      "serving_io": {name: pool.serving_io.summary()
+                                     for name, pool in execution.items()},
+                      "step_summary": {name: pool.step_summary.to_dict()
+                                       for name, pool in execution.items()},
+                      "transfer_layout": "destination_shards"},
+        "traces": traces, "events": list(engine.trace), "metric_boundary": "device_token_commit",
+    }
+
+
+def _run_pd_loop(cases, engine, connector, memory, execution, lowerers,
+                 schedulers, states, shared, placement, client_tails,
+                 published, trace_limit):
     flights, transfers, traces = {}, {}, []
     # Real event handles for the three distinct PD boundaries.  They are not
     # fabricated sleeps: source is the prefill device-complete event, grant is
@@ -146,6 +184,16 @@ def predict_pd(raw, *, primitives=None, recipes=None, submission=None, memory_po
     consumer_registered = set()
     handoff_records = []
     handoff_bytes, handoffs, iterations = 0, 0, 0
+
+    def source_release_callback(source_rank, source_released, prefill_replica):
+        def release_source(rank=source_rank, done=source_released,
+                           replica=prefill_replica):
+            if done[0]:
+                return
+            done[0] = True
+            memory["prefill"].release(replica, request)
+        return release_source
+
     while not all(state.done for state in states):
         # Admit to the destination before making any external cache service
         # ready. Waiting transfers retain source ownership and exert backpressure.
@@ -153,210 +201,14 @@ def predict_pd(raw, *, primitives=None, recipes=None, submission=None, memory_po
             if state.done or state.location != "waiting_transfer":
                 continue
             request = state.request.request_id
-            target = placement["decode", request]
-            active = sum(s.location in {"decode", "transferring"} and not s.done
-                         for s in schedulers["decode"][target].states)
-            if active >= cases["decode"].runtime.max_num_seqs:
-                continue
-            if not memory["decode"].resize(target, request, state.computed + 1):
-                continue
-            source_event = source_ready.get(request)
-            if source_event is None:
-                raise ModelingError(
-                    "pd_handoff_missing_source_ready:" + request)
-            p = cases["decode"].runtime.parallel
-            if memory["decode"].sparse_offload:
-                volume, decode_local = memory["decode"].pd_handoff_volume_and_stage_hbm(state.computed)
-            else:
-                target_stage = [0.0] * max(1, int(p.pp))
-                d_case = cases["decode"]
-                d_mem = memory["decode"]
-                for layer in d_case.model.layer_plans:
-                    comps = layer_cache_components(
-                        d_case.model, layer, p, state.computed,
-                        capacity_padded=False, interleave=d_case.runtime.kv_block_size,
-                    )
-                    target_stage[d_mem.layer_stage[layer.index]] += sum(
-                        float(v) for v in comps.values()
-                    )
-                decode_local = tuple(target_stage)
-                volume = sum(decode_local) * p.tp * p.pcp
-            demands = {}
-            for pool in ("prefill", "decode"):
-                replica = placement[pool, request]
-                local = (decode_local if pool == "decode"
-                         else memory[pool].cache_bytes(state.computed, padded=False))
-                for stage, stage_bytes in enumerate(local):
-                    roles = execution[pool].stage_names[replica, stage]
-                    demands[roles["hbm"]] = stage_bytes
-            handoff, source_ranks, destination_ranks = _pd_handoff_binding(
-                request, state.computed, placement, cases, memory, execution,
-                decode_local, volume, demands,
-                shared_buffer_prefix=(connector.receive_buffer_id
-                                      if connector.shared_receive_buffer else None),
-                shared_buffer_capacity=connector.receive_capacity_bytes,
-                published=published)
-            if not handoff.transfers:
-                transfers[request] = engine.submit(
-                    f"pd:{request}", owner=f"request:{request}",
-                    metadata={"boundary": "pd_empty_handoff",
-                              "request_id": request})
-                handoff_records.append({
-                    "request_id": request, "transport_binding": "empty",
-                    "source_ranks": list(source_ranks),
-                    "destination_ranks": list(destination_ranks),
-                    "transfers": [], "receive_buffer_ids": {},
-                    "receive_capacity_bytes": {},
-                    "memory_work": dict(demands),
-                    "chunk_bytes": connector.chunk_bytes,
-                    "transport_event": transfers[request]})
-                state.location = "decode"
-                continue
-            storage_holds = {}
-            if set(source_ranks) & set(destination_ranks):
-                # The fixture's two pools may occupy the same physical ranks;
-                # keep the existing pool-endpoint connector identity for that
-                # local case.  Disjoint pools use the actual rank binding below.
-                grant = engine.submit(
-                    f"pd:{request}:destination_grant",
-                    owner=f"decode:r{target}",
-                    metadata={"boundary": "pd_destination_admission",
-                              "request_id": request,
-                              "physical_ranks": list(destination_ranks),
-                              "tokens": state.computed + 1})
-                release = engine.future(
-                    f"pd:{request}:consumer_release")
-                consumer_release[request] = {1: release}
-                transfers[request] = connector.submit(
-                    engine, "pd:" + request, volume, demands,
-                    ready=source_event, destination_ready=grant,
-                    release_events={1: (release,)})
-                transport_binding = "pool_endpoint_overlapping_ranks"
-            else:
-                grant_by_rank = {
-                    rank: engine.submit(
-                        f"pd:{request}:destination_grant:r{rank}",
-                        owner=f"decode:r{target}",
-                        metadata={"boundary": "pd_destination_admission",
-                                  "request_id": request, "rank": rank,
-                                  "receive_buffer_id": dict(
-                                      handoff.receive_buffer_ids)[rank],
-                                  "tokens": state.computed + 1})
-                    for rank in destination_ranks}
-                releases = {
-                    rank: (engine.future(
-                        f"pd:{request}:consumer_release:r{rank}"),)
-                    for rank in destination_ranks}
-                consumer_release[request] = {
-                    rank: events[0] for rank, events in releases.items()}
-                destination_ranges = defaultdict(list)
-                for item in handoff.hbm_transfers():
-                    if item.destination_byte_range:
-                        destination_ranges[item.destination_rank].append(
-                            item.destination_byte_range)
-                release_callbacks = {}
-                for rank, events in releases.items():
-                    buffer_id = dict(handoff.receive_buffer_ids)[rank]
-                    consumer_name = f"pd:{request}:decode:r{rank}"
-                    generation = memory["decode"].request_versions.get(
-                        (target, request), 0)
-                    hold_event = events[0]
-                    fallback = ((0.0, float(handoff.capacity_for(rank) or 0.0)),)
-                    held = memory["decode"].hold_for_async_consumer(
-                        target, request, consumer_name,
-                        storage=buffer_id,
-                        ranges=tuple(destination_ranges.get(rank, fallback)),
-                        generation=generation, event=hold_event)
-                    if not held:
-                        raise ModelingError(
-                            f"pd_decode_memory_hold_rejected:{request}:r{rank}")
-                    storage_holds[rank] = buffer_id
-                    keep = (memory["decode"], target, request, consumer_name,
-                            generation, hold_event)
-                    def release_hold(keep=keep):
-                        pool, replica, req, consumer, gen, event = keep
-                        return pool.release_async_consumer(
-                            replica, req, consumer,
-                            generation=gen, event=event)
-                    # Fixed (pool, replica, request, rank, generation, event)
-                    # identity; never re-derived from a display name later.
-                    consumer_callbacks[request, rank] = release_hold
-                    release_callbacks[rank] = release_hold
-                source_released = [False]
-                source_release_state[request] = source_released
-                source_callbacks = {}
-                prefill_replica = placement["prefill", request]
-                for source_rank in source_ranks:
-                    def release_source(rank=source_rank, done=source_released,
-                                       replica=prefill_replica):
-                        if done[0]:
-                            return
-                        done[0] = True
-                        memory["prefill"].release(replica, request)
-                    source_callbacks[source_rank] = release_source
-                transfers[request] = connector.submit_handoff(
-                    engine, handoff,
-                    source_ready_by_rank={rank: source_event
-                                          for rank in source_ranks},
-                    destination_ready_by_rank=grant_by_rank,
-                    release_events=releases,
-                    source_release_callbacks=source_callbacks,
-                    release_callbacks_by_rank=release_callbacks,
-                    name="pd:" + request)
-                transport_binding = "actual_rank"
-            handoff_records.append({
-                "request_id": request,
-                "transport_binding": transport_binding,
-                "source_ranks": list(source_ranks),
-                "destination_ranks": list(destination_ranks),
-                "transfers": [
-                    {"source_rank": item.source_rank,
-                     "destination_rank": item.destination_rank,
-                     "payload_bytes": item.payload_bytes,
-                     "source_stage": item.source_stage,
-                     "destination_stage": item.destination_stage,
-                     "source_layers": list(item.source_layers),
-                     "destination_layers": list(item.destination_layers),
-                     "component": item.component,
-                     "source_version": item.source_version,
-                     "destination_version": item.destination_version,
-                     "source_heads": list(item.source_heads),
-                     "destination_heads": list(item.destination_heads),
-                     "source_token_span": list(item.source_token_span),
-                     "destination_token_span": list(item.destination_token_span),
-                     "producer": item.producer,
-                     "output": item.output,
-                     "destination_tier": item.destination_tier,
-                     "source_storage": item.source_storage,
-                     "destination_storage": item.destination_storage,
-                     "source_byte_range": list(item.source_byte_range),
-                     "destination_byte_range": list(item.destination_byte_range),
-                     "source_scope": item.source_scope,
-                     "destination_scope": item.destination_scope}
-                    for item in handoff.transfers],
-                "receive_buffer_ids": {
-                    str(rank): value for rank, value in
-                    handoff.receive_buffer_ids},
-                "receive_capacity_bytes": {
-                    str(rank): value for rank, value in
-                    handoff.receive_capacity_bytes},
-                "receive_pool_capacity_bytes": {
-                    str(rank): value for rank, value in
-                    handoff.receive_pool_capacity_bytes},
-                "receive_host_bytes": {
-                    str(rank): value for rank, value in
-                    handoff.receive_host_bytes},
-                "host_bytes": sum(float(item.payload_bytes)
-                                  for item in handoff.host_transfers()),
-                "memory_work": dict(handoff.memory_work),
-                "chunk_bytes": connector.chunk_bytes,
-                "storage_holds": {str(rank): value
-                                  for rank, value in storage_holds.items()},
-                "transport_event": transfers[request],
-            })
-            state.location = "transferring"
-            handoff_bytes += volume
-            handoffs += 1
+            volume = _admit_pd_handoff(
+                state, request, cases, engine, connector, memory, execution,
+                schedulers, placement, published, source_ready, consumer_release,
+                consumer_callbacks, source_release_state, source_release_callback,
+                transfers, handoff_records)
+            if volume is not None:
+                handoff_bytes += volume
+                handoffs += 1
         for name, case in cases.items():
             for group in cohorts(case.runtime.parallel):
                 if any((name, replica) in flights for replica in group):
@@ -388,27 +240,9 @@ def predict_pd(raw, *, primitives=None, recipes=None, submission=None, memory_po
                                     registry.get((request, rank)))
                     iterations += len(steps)
                 else:
-                    for r in group:
-                        if not schedulers[name][r].done and memory[name].has_delayed_releases(r):
-                            pool_exec = execution[name]
-                            prep = pool_exec.prepared.pop(r, None)
-                            sched_ms = pool_exec.submission.scheduler_ms if pool_exec.include_submission else 0.0
-                            comp_ms = pool_exec.submission.completion_ms if pool_exec.include_submission else 0.0
-                            sched_ev = engine.submit(
-                                f"{pool_exec.namespace}r{r}:retire_schedule:{iterations}",
-                                {f"{pool_exec.namespace}scheduler@r{r}": sched_ms},
-                                after=(prep,) if prep is not None else (),
-                                release=engine.now, owner=f"replica:{r}",
-                            )
-                            comp_ev = engine.submit(
-                                f"{pool_exec.namespace}r{r}:retire_complete:{iterations}",
-                                after=(sched_ev,), latency=comp_ms, release=engine.now, owner=f"replica:{r}",
-                            )
-                            from ..execution import ScheduledIteration
-                            flights[name, r] = ScheduledIteration(
-                                r, schedulers[name][r].iteration, comp_ev, engine.now,
-                                "retire", 0, 0, None, "none", 0, {}, comp_ev, {}, {}, (),
-                            )
+                    _submit_pd_retirements(
+                        name, group, schedulers, memory, execution,
+                        engine, flights, iterations)
         arrivals = [time for name, group in schedulers.items() for replica, scheduler in enumerate(group)
                     if (name, replica) not in flights if (time := scheduler.next_arrival(engine.now)) is not None]
         horizon = min(arrivals, default=math.inf)
@@ -458,28 +292,286 @@ def predict_pd(raw, *, primitives=None, recipes=None, submission=None, memory_po
     # is recorded at the actual end of the serving loop, not as elapsed sleep.
     final_releases = []
     for request, releases in list(consumer_release.items()):
-        for rank, release in releases.items():
-            if release.done:
-                continue
-            suffix = ("" if len(releases) == 1 and rank == 1
-                      else f":r{rank}")
-            cancel = consumer_callbacks.get((request, rank))
-            source_done = source_release_state.get(request)
-            def finish(_event, target=release, cancel=cancel,
-                       request=request, source_state=source_done):
-                if not target.done:
-                    engine.resolve(target)
-                if cancel is not None:
-                    cancel()
-                if source_state is not None and not source_state[0]:
-                    source_state[0] = True
-                    memory["prefill"].release(
-                        placement["prefill", request], request)
-            final_releases.append(engine.submit(
-                f"pd:{request}:final_release{suffix}",
-                metadata={"boundary": "pd_unconsumed_final_release",
-                          "request_id": request, "rank": rank},
-                on_complete=finish))
+        _schedule_pd_final_releases(
+            engine, memory, placement, request, releases, consumer_callbacks,
+            source_release_state, final_releases)
+    serving_end = _drain_pd_tails(
+        engine, memory, consumer_release, transfers, client_tails, final_releases)
+    return serving_end, iterations, handoffs, handoff_bytes, handoff_records, traces
+
+
+def _admit_pd_handoff(
+    state, request, cases, engine, connector, memory, execution, schedulers,
+    placement, published, source_ready, consumer_release, consumer_callbacks,
+    source_release_state, source_release_callback, transfers, handoff_records,
+):
+    target = placement["decode", request]
+    active = sum(s.location in {"decode", "transferring"} and not s.done
+                 for s in schedulers["decode"][target].states)
+    if active >= cases["decode"].runtime.max_num_seqs:
+        return None
+    if not memory["decode"].resize(target, request, state.computed + 1):
+        return None
+    source_event = source_ready.get(request)
+    if source_event is None:
+        raise ModelingError(
+            "pd_handoff_missing_source_ready:" + request)
+    p = cases["decode"].runtime.parallel
+    if memory["decode"].sparse_offload:
+        volume, decode_local = memory["decode"].pd_handoff_volume_and_stage_hbm(state.computed)
+    else:
+        target_stage = [0.0] * max(1, int(p.pp))
+        d_case = cases["decode"]
+        d_mem = memory["decode"]
+        for layer in d_case.model.layer_plans:
+            comps = layer_cache_components(
+                d_case.model, layer, p, state.computed,
+                capacity_padded=False, interleave=d_case.runtime.kv_block_size,
+            )
+            target_stage[d_mem.layer_stage[layer.index]] += sum(
+                float(v) for v in comps.values()
+            )
+        decode_local = tuple(target_stage)
+        volume = sum(decode_local) * p.tp * p.pcp
+    demands = {}
+    for pool in ("prefill", "decode"):
+        replica = placement[pool, request]
+        local = (decode_local if pool == "decode"
+                 else memory[pool].cache_bytes(state.computed, padded=False))
+        for stage, stage_bytes in enumerate(local):
+            roles = execution[pool].stage_names[replica, stage]
+            demands[roles["hbm"]] = stage_bytes
+    handoff, source_ranks, destination_ranks = _pd_handoff_binding(
+        request, state.computed, placement, cases, memory, execution,
+        decode_local, volume, demands,
+        shared_buffer_prefix=(connector.receive_buffer_id
+                              if connector.shared_receive_buffer else None),
+        shared_buffer_capacity=connector.receive_capacity_bytes,
+        published=published)
+    if not handoff.transfers:
+        transfers[request] = engine.submit(
+            f"pd:{request}", owner=f"request:{request}",
+            metadata={"boundary": "pd_empty_handoff",
+                      "request_id": request})
+        handoff_records.append({
+            "request_id": request, "transport_binding": "empty",
+            "source_ranks": list(source_ranks),
+            "destination_ranks": list(destination_ranks),
+            "transfers": [], "receive_buffer_ids": {},
+            "receive_capacity_bytes": {},
+            "memory_work": dict(demands),
+            "chunk_bytes": connector.chunk_bytes,
+            "transport_event": transfers[request]})
+        state.location = "decode"
+        return None
+    storage_holds = {}
+    if set(source_ranks) & set(destination_ranks):
+        # The fixture's two pools may occupy the same physical ranks;
+        # keep the existing pool-endpoint connector identity for that
+        # local case.  Disjoint pools use the actual rank binding below.
+        grant = engine.submit(
+            f"pd:{request}:destination_grant",
+            owner=f"decode:r{target}",
+            metadata={"boundary": "pd_destination_admission",
+                      "request_id": request,
+                      "physical_ranks": list(destination_ranks),
+                      "tokens": state.computed + 1})
+        release = engine.future(
+            f"pd:{request}:consumer_release")
+        consumer_release[request] = {1: release}
+        transfers[request] = connector.submit(
+            engine, "pd:" + request, volume, demands,
+            ready=source_event, destination_ready=grant,
+            release_events={1: (release,)})
+        transport_binding = "pool_endpoint_overlapping_ranks"
+    else:
+        transfers[request] = _submit_rank_handoff(
+            engine, connector, handoff, request, source_ranks, destination_ranks,
+            source_event, target, state, memory, placement,
+            consumer_release, consumer_callbacks, source_release_state,
+            source_release_callback, storage_holds)
+        transport_binding = "actual_rank"
+    handoff_records.append({
+        "request_id": request,
+        "transport_binding": transport_binding,
+        "source_ranks": list(source_ranks),
+        "destination_ranks": list(destination_ranks),
+        "transfers": [
+            {"source_rank": item.source_rank,
+             "destination_rank": item.destination_rank,
+             "payload_bytes": item.payload_bytes,
+             "source_stage": item.source_stage,
+             "destination_stage": item.destination_stage,
+             "source_layers": list(item.source_layers),
+             "destination_layers": list(item.destination_layers),
+             "component": item.component,
+             "source_version": item.source_version,
+             "destination_version": item.destination_version,
+             "source_heads": list(item.source_heads),
+             "destination_heads": list(item.destination_heads),
+             "source_token_span": list(item.source_token_span),
+             "destination_token_span": list(item.destination_token_span),
+             "producer": item.producer,
+             "output": item.output,
+             "destination_tier": item.destination_tier,
+             "source_storage": item.source_storage,
+             "destination_storage": item.destination_storage,
+             "source_byte_range": list(item.source_byte_range),
+             "destination_byte_range": list(item.destination_byte_range),
+             "source_scope": item.source_scope,
+             "destination_scope": item.destination_scope}
+            for item in handoff.transfers],
+        "receive_buffer_ids": {
+            str(rank): value for rank, value in
+            handoff.receive_buffer_ids},
+        "receive_capacity_bytes": {
+            str(rank): value for rank, value in
+            handoff.receive_capacity_bytes},
+        "receive_pool_capacity_bytes": {
+            str(rank): value for rank, value in
+            handoff.receive_pool_capacity_bytes},
+        "receive_host_bytes": {
+            str(rank): value for rank, value in
+            handoff.receive_host_bytes},
+        "host_bytes": sum(float(item.payload_bytes)
+                          for item in handoff.host_transfers()),
+        "memory_work": dict(handoff.memory_work),
+        "chunk_bytes": connector.chunk_bytes,
+        "storage_holds": {str(rank): value
+                          for rank, value in storage_holds.items()},
+        "transport_event": transfers[request],
+    })
+    state.location = "transferring"
+    return volume
+
+
+def _submit_rank_handoff(
+    engine, connector, handoff, request, source_ranks, destination_ranks,
+    source_event, target, state, memory, placement, consumer_release,
+    consumer_callbacks, source_release_state, source_release_callback, storage_holds,
+):
+    grant_by_rank = {
+        rank: engine.submit(
+            f"pd:{request}:destination_grant:r{rank}",
+            owner=f"decode:r{target}",
+            metadata={"boundary": "pd_destination_admission",
+                      "request_id": request, "rank": rank,
+                      "receive_buffer_id": dict(
+                          handoff.receive_buffer_ids)[rank],
+                      "tokens": state.computed + 1})
+        for rank in destination_ranks}
+    releases = {
+        rank: (engine.future(
+            f"pd:{request}:consumer_release:r{rank}"),)
+        for rank in destination_ranks}
+    consumer_release[request] = {
+        rank: events[0] for rank, events in releases.items()}
+    destination_ranges = defaultdict(list)
+    for item in handoff.hbm_transfers():
+        if item.destination_byte_range:
+            destination_ranges[item.destination_rank].append(
+                item.destination_byte_range)
+    release_callbacks = {}
+    for rank, events in releases.items():
+        buffer_id = dict(handoff.receive_buffer_ids)[rank]
+        consumer_name = f"pd:{request}:decode:r{rank}"
+        generation = memory["decode"].request_versions.get(
+            (target, request), 0)
+        hold_event = events[0]
+        fallback = ((0.0, float(handoff.capacity_for(rank) or 0.0)),)
+        held = memory["decode"].hold_for_async_consumer(
+            target, request, consumer_name,
+            storage=buffer_id,
+            ranges=tuple(destination_ranges.get(rank, fallback)),
+            generation=generation, event=hold_event)
+        if not held:
+            raise ModelingError(
+                f"pd_decode_memory_hold_rejected:{request}:r{rank}")
+        storage_holds[rank] = buffer_id
+        keep = (memory["decode"], target, request, consumer_name,
+                generation, hold_event)
+        def release_hold(keep=keep):
+            pool, replica, req, consumer, gen, event = keep
+            return pool.release_async_consumer(
+                replica, req, consumer,
+                generation=gen, event=event)
+        # Fixed (pool, replica, request, rank, generation, event)
+        # identity; never re-derived from a display name later.
+        consumer_callbacks[request, rank] = release_hold
+        release_callbacks[rank] = release_hold
+    source_released = [False]
+    source_release_state[request] = source_released
+    source_callbacks = {}
+    prefill_replica = placement["prefill", request]
+    for source_rank in source_ranks:
+        source_callbacks[source_rank] = source_release_callback(
+            source_rank, source_released, prefill_replica)
+    return connector.submit_handoff(
+        engine, handoff,
+        source_ready_by_rank={rank: source_event
+                              for rank in source_ranks},
+        destination_ready_by_rank=grant_by_rank,
+        release_events=releases,
+        source_release_callbacks=source_callbacks,
+        release_callbacks_by_rank=release_callbacks,
+        name="pd:" + request)
+
+
+def _submit_pd_retirements(name, group, schedulers, memory, execution,
+                           engine, flights, iterations):
+    for r in group:
+        if not schedulers[name][r].done and memory[name].has_delayed_releases(r):
+            pool_exec = execution[name]
+            prep = pool_exec.prepared.pop(r, None)
+            sched_ms = pool_exec.submission.scheduler_ms if pool_exec.include_submission else 0.0
+            comp_ms = pool_exec.submission.completion_ms if pool_exec.include_submission else 0.0
+            sched_ev = engine.submit(
+                f"{pool_exec.namespace}r{r}:retire_schedule:{iterations}",
+                {f"{pool_exec.namespace}scheduler@r{r}": sched_ms},
+                after=(prep,) if prep is not None else (),
+                release=engine.now, owner=f"replica:{r}",
+            )
+            comp_ev = engine.submit(
+                f"{pool_exec.namespace}r{r}:retire_complete:{iterations}",
+                after=(sched_ev,), latency=comp_ms, release=engine.now, owner=f"replica:{r}",
+            )
+            from ..execution import ScheduledIteration
+            flights[name, r] = ScheduledIteration(
+                r, schedulers[name][r].iteration, comp_ev, engine.now,
+                "retire", 0, 0, None, "none", 0, {}, comp_ev, {}, {}, (),
+            )
+
+
+def _schedule_pd_final_releases(
+    engine, memory, placement, request, releases, consumer_callbacks,
+    source_release_state, final_releases,
+):
+    for rank, release in releases.items():
+        if release.done:
+            continue
+        suffix = ("" if len(releases) == 1 and rank == 1
+                  else f":r{rank}")
+        cancel = consumer_callbacks.get((request, rank))
+        source_done = source_release_state.get(request)
+        def finish(_event, target=release, cancel=cancel,
+                   request=request, source_state=source_done):
+            if not target.done:
+                engine.resolve(target)
+            if cancel is not None:
+                cancel()
+            if source_state is not None and not source_state[0]:
+                source_state[0] = True
+                memory["prefill"].release(
+                    placement["prefill", request], request)
+        final_releases.append(engine.submit(
+            f"pd:{request}:final_release{suffix}",
+            metadata={"boundary": "pd_unconsumed_final_release",
+                      "request_id": request, "rank": rank},
+            on_complete=finish))
+
+
+def _drain_pd_tails(engine, memory, consumer_release, transfers, client_tails,
+                    final_releases):
     serving_end = engine.now
     # Complete only this service's causal tail.  An unrelated long timer is
     # not a target and stays pending; same-time service descendants (receive
@@ -499,33 +591,4 @@ def predict_pd(raw, *, primitives=None, recipes=None, submission=None, memory_po
         engine.advance(horizon=engine.now)
     for ledger in memory.values():
         ledger.flush_delayed_releases()
-    rows, boundaries = serving_boundaries(
-        states, cases["prefill"].slo,
-        host_results=any(pool.serving_io.enabled for pool in execution.values()),
-        client_delivery=all(client_declared))
-    return {
-        "schema": "mindie-sim.predict/2", "deployment": "disaggregated",
-        **combine_coverage(case.model for case in cases.values()),
-        "status": "modeled" if all(state.finish_ms is not None for state in states) else "infeasible",
-        "metrics": summarize(rows, cases["prefill"].slo, now_ms=serving_end),
-        "metric_boundaries": boundaries,
-        "throughput_window_boundary": "legacy_scheduler_completion",
-        "requests": rows, "memory": {name: ledger.to_dict() for name, ledger in memory.items()},
-        "execution": {**engine.summary(), "iterations": iterations,
-                      "handoffs": handoffs, "handoff_bytes": handoff_bytes,
-                      "connector": connector.summary(),
-                      "memory_binding": _memory_binding_report(engine, memory, execution),
-                      "pd_handoffs": [
-                          {key: value for key, value in record.items()
-                           if key != "transport_event"}
-                          | {"complete_ms": record["transport_event"].time}
-                          for record in handoff_records],
-                      "submission": {name: pool.submission_summary()
-                                     for name, pool in execution.items()},
-                      "serving_io": {name: pool.serving_io.summary()
-                                     for name, pool in execution.items()},
-                      "step_summary": {name: pool.step_summary.to_dict()
-                                       for name, pool in execution.items()},
-                      "transfer_layout": "destination_shards"},
-        "traces": traces, "events": list(engine.trace), "metric_boundary": "device_token_commit",
-    }
+    return serving_end

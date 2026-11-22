@@ -42,7 +42,7 @@ from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.structure import export_op_structure, export_structure
 from mindie_sim.structure_contracts import comparison_scope, predicted_contract
-from mindie_sim.structure_native_contracts import grouped_situ_contract
+from mindie_sim.structure.native import grouped_situ_contract
 
 pytestmark = pytest.mark.tier0
 
@@ -481,7 +481,7 @@ def test_grouped_situ_requires_native_precision_and_scale_domain(mx_case):
     assert grouped_situ_contract(dict(view, activation=dict(view["activation"], activation_linear_beta=None))) is None
 @pytest.mark.requires_capture_mount(str(MX_CAPTURE))
 def test_native_matrix_boundaries_report_reference_costs(mx_case, profiler_api):
-    from mindie_sim.cohort_comparison import compare_cohorts
+    from mindie_sim.cohort_accuracy import compare_cohorts
     block = next(plan for plan in mx_case.model.layer_plans if plan.ffn == "moe")
     model = replace(mx_case.model, layers=1, body_layers=1, layer_plans=(replace(block, index=0, kv_owner_layer_id=0),))
     lowerings = dict(mx_case.runtime.kernels.get("lowerings", {}), native_fusion={

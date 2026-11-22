@@ -20,7 +20,7 @@ from mindie_sim.optimization.dsl_solver import _replay_ops
 from mindie_sim.optimization.dual_bound import _check_region_summary_bindings
 from mindie_sim.optimization.reload_bounds import compute_compulsory_hbm_cut, measure_logical_bytes
 from mindie_sim.prediction.evaluation import ACTIVE_DEADLINE_MONO
-from mindie_sim.prediction.operator_replay import operator_costs
+from mindie_sim.prediction.execution.operator_replay import operator_costs
 from mindie_sim.prediction.results import OpOccurrence, OperatorSequenceRow, StepEvaluation
 from mindie_sim.prediction.spine import _parse_occurrence, _wave_breakdown_from_report, _work_items
 from mindie_sim.prediction.runtime.accel_tables import (
@@ -28,7 +28,7 @@ from mindie_sim.prediction.runtime.accel_tables import (
 )
 from mindie_sim.prediction.runtime.tile_solver import TilePipelineSpec
 from mindie_sim.prediction.streams import MAIN_STREAM, bind_stream_owners, proportional_coupled_placement
-from mindie_sim.prediction.weight_prefetch import residency_peak
+from mindie_sim.prediction.execution.weight_prefetch import residency_peak
 from mindie_sim.schema.common import ModelingError
 
 from .apply import (

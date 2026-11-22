@@ -22,6 +22,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping as _AbcMapping
 from copy import copy
+from functools import partial
 
 from mindie_sim.schema.common import ModelingError
 
@@ -91,27 +92,26 @@ def _bind_native_resource_view(program, resource_names, engine):
     return NativeProgram(inner, program.work)
 
 
-def launch_native_cohort(engine, launches, *, name_prefix="native_cohort",
-                         owner="native_cohort", defer=False):
-    """Two-phase launch of native peer programs on one shared Engine."""
+def _launch_field(raw, key, default=None):
+    return (raw.get(key, default) if isinstance(raw, _AbcMapping)
+            else getattr(raw, key, default))
+
+
+def _collect_cohort_launches(launches):
     from mindie_sim.prediction.operators.mc2.mc2_program import Mc2LaunchView
     from ..program import NativeProgram
-
-    def field(raw, key, default=None):
-        return (raw.get(key, default) if isinstance(raw, _AbcMapping)
-                else getattr(raw, key, default))
 
     infos, by_rank, names = [], {}, set()
     phases = None
     for raw in launches:
-        program = field(raw, "program")
+        program = _launch_field(raw, "program")
         if not isinstance(program, NativeProgram):
             raise ModelingError("native_cohort_requires_native_program")
-        name = str(field(raw, "name") or "")
+        name = str(_launch_field(raw, "name") or "")
         if not name or name in names:
             raise ModelingError(f"native_cohort_launch_name_invalid:{name}")
         names.add(name)
-        rank = field(raw, "rank_index")
+        rank = _launch_field(raw, "rank_index")
         if rank is None:
             raise ModelingError(f"native_cohort_rank_missing:{name}")
         rank = int(rank)
@@ -119,13 +119,13 @@ def launch_native_cohort(engine, launches, *, name_prefix="native_cohort",
             raise ModelingError(f"native_cohort_rank_duplicate:{rank}")
         inner = program.program
         source_view = getattr(inner, "view", None)
-        peer_count = int(field(raw, "peer_count")
+        peer_count = int(_launch_field(raw, "peer_count")
                          or getattr(inner, "peer_count", 0) or 0)
         if peer_count <= 0:
             raise ModelingError(f"native_cohort_peer_count_missing:{name}")
         if not 0 <= rank < peer_count:
             raise ModelingError(f"native_cohort_rank_out_of_range:{name}:{rank}")
-        labels = field(raw, "peer_labels")
+        labels = _launch_field(raw, "peer_labels")
         labels = (tuple(int(item) for item in labels)
                   if labels is not None else
                   tuple(item for item in range(peer_count) if item != rank))
@@ -133,22 +133,22 @@ def launch_native_cohort(engine, launches, *, name_prefix="native_cohort",
                 rank in labels
                 or any(not 0 <= item < peer_count for item in labels)):
             raise ModelingError(f"native_cohort_peer_labels_invalid:{name}")
-        node_ranks = field(raw, "node_ranks")
+        node_ranks = _launch_field(raw, "node_ranks")
         node = int(node_ranks if node_ranks is not None else
                    (getattr(source_view, "node_ranks", 0)
                     if source_view is not None else 0))
-        peer_classes = field(raw, "peer_classes")
+        peer_classes = _launch_field(raw, "peer_classes")
         classes = tuple(peer_classes or ())
         if not classes and source_view is not None and source_view.rank == rank:
             classes = tuple(source_view.peer_classes)
-        peer_weights = field(raw, "peer_weights")
+        peer_weights = _launch_field(raw, "peer_weights")
         weights = tuple(peer_weights or ())
         if not weights and source_view is not None and source_view.rank == rank:
             weights = tuple(source_view.peer_weights)
-        intra = field(raw, "intra_latency_ms")
-        inter = field(raw, "inter_latency_ms")
-        resource_names = field(raw, "resource_names")
-        frames_raw = field(raw, "payload_frames", None)
+        intra = _launch_field(raw, "intra_latency_ms")
+        inter = _launch_field(raw, "inter_latency_ms")
+        resource_names = _launch_field(raw, "resource_names")
+        frames_raw = _launch_field(raw, "payload_frames", None)
         if frames_raw is None:
             frames_for = getattr(inner, "frames_for", None)
             if callable(frames_for):
@@ -165,11 +165,11 @@ def launch_native_cohort(engine, launches, *, name_prefix="native_cohort",
                 if int(item[1]) > 0))
         else:
             payload_frames = ()
-        packet = field(raw, "payload_packet_bytes", None)
+        packet = _launch_field(raw, "payload_packet_bytes", None)
         if packet is None and source_view is not None:
             packet = getattr(source_view, "payload_packet_bytes", 0)
         payload_packet = int(packet or 0)
-        basis_raw = field(raw, "payload_basis", None)
+        basis_raw = _launch_field(raw, "payload_basis", None)
         if basis_raw is None:
             basis_for = getattr(inner, "payload_basis_for", None)
             if callable(basis_for):
@@ -178,7 +178,7 @@ def launch_native_cohort(engine, launches, *, name_prefix="native_cohort",
             basis_raw = (getattr(source_view, "payload_basis", "unknown")
                          if source_view is not None else "unknown")
         payload_basis = str(basis_raw)
-        local_frames = field(raw, "payload_local_frames", None)
+        local_frames = _launch_field(raw, "payload_local_frames", None)
         if local_frames is None:
             local_for = getattr(inner, "local_frames_for", None)
             if callable(local_for):
@@ -216,27 +216,23 @@ def launch_native_cohort(engine, launches, *, name_prefix="native_cohort",
                 f"{sorted(set(phases) ^ set(phase_names))}")
         infos.append({
             "name": name, "rank": rank, "view": view,
-            "program": program, "ready": field(raw, "ready"),
-            "operator_id": str(field(raw, "operator_id", "mc2")),
+            "program": program, "ready": _launch_field(raw, "ready"),
+            "operator_id": str(_launch_field(raw, "operator_id", "mc2")),
             "resource_names": dict(resource_names or {}),
             "payload_frames": dict(payload_frames),
             "payload_packet_bytes": payload_packet,
             "payload_basis": payload_basis,
             "payload_local_frames": payload_local,
-            "transport": field(raw, "transport", None),
+            "transport": _launch_field(raw, "transport", None),
         })
         by_rank[rank] = infos[-1]
     if not infos:
         raise ModelingError("native_cohort_empty")
-    link_phases = tuple(
-        phase for phase in (phases or ())
-        if any(getattr(info["program"].program, "link_by_phase", {}).get(phase)
-               for info in infos))
-    for info in infos:
-        info["program"] = _bind_native_resource_view(
-            info["program"], info["resource_names"], engine)
+    return infos, phases
+
+
+def _bind_peer_placeholders(engine, infos, phases, name_prefix):
     programs_by_rank = {info["rank"]: info["program"] for info in infos}
-    names_by_rank = {info["rank"]: info["name"] for info in infos}
     unresolved, partial = [], []
     placeholders = {}
     for info in infos:
@@ -336,165 +332,130 @@ def launch_native_cohort(engine, launches, *, name_prefix="native_cohort",
                     "rank": rank, "name": info["name"],
                     "phase": "payload_exchange", "basis": basis,
                     "reason": "payload_destinations_unknown"})
+    return (placeholders, unresolved, partial, protocol_edges, directed_edges,
+            directed_frames, fullmesh_by_rank, payload_packet_by_rank)
 
-    def _declared_metrics(info):
-        inner = info["program"].program
-        transport = info.get("transport") or {}
-        rank = int(info["rank"])
-        payload, count = (inner.transport_account(transport)
-                          if hasattr(inner, "transport_account") else ({}, {}))
-        phases_set = {phase.name for phase in getattr(inner, "phases", ())}
-        records = {}
-        if payload:
-            records["payload_exchange"] = {
-                **payload,
-                "basis": (inner.payload_basis_for(rank)
-                          if hasattr(inner, "payload_basis_for")
-                          else info["payload_basis"]),
-                "count": False,
-            }
-        if count and "count_status_exchange" in phases_set:
-            count_basis = (inner.payload_basis_for(rank)
-                           if hasattr(inner, "payload_basis_for")
-                           else info["payload_basis"])
-            records["count_status_exchange"] = {
-                **count,
-                "basis": count_basis,
-                "count": True,
-            }
-        links_for_rank = getattr(inner, "link_by_phase_for", None)
-        links = (dict(links_for_rank(rank)) if callable(links_for_rank)
-                 else dict(getattr(inner, "link_by_phase", {}) or {}))
-        work_for_rank = getattr(inner, "work_for_rank", None)
-        work = (tuple(work_for_rank(rank)) if callable(work_for_rank)
-                else tuple(getattr(info["program"], "work", ()) or ()))
-        transport_work = dict(payload.get("work", {}))
-        if "count_status_exchange" in phases_set:
-            for pipe, amount in (count.get("work", {}) or {}).items():
-                transport_work[pipe] = transport_work.get(pipe, 0.0) + float(amount)
-        return records, links, work, transport_work
 
-    cohort = {}
-    if defer:
-        launch_by_rank = {info["rank"]: info for info in infos}
-        parents, starts = {}, {}
-        remaining_starts = [len(infos)]
-        for info in infos:
-            name = info["name"]
-            parent = engine.future(name + ":program_complete")
-            parents[name] = parent
-            starts[name] = info["ready"]
-            records, links, work, transport_work = _declared_metrics(info)
-            cohort[info["rank"]] = {
-                "parent": parent, "start": info["ready"],
-                "operators": {}, "phases": {},
-                "handles": {"deferred": True},
-                "work": work,
-                "link_by_phase": {
-                    phase: {str(pipe): float(amount)
-                            for pipe, amount in values.items()}
-                    for phase, values in links.items()},
-                "transport": records,
-                "transport_work": transport_work,
-            }
-
-            def begin(_event, item=info, promise=parent):
-                rank_engine = _RankEngine(engine, item["resource_names"])
-                finish, _handles = item["program"].start_with_handles(
-                    rank_engine, item["name"], item["ready"],
-                    launch=item["view"], send_placeholders=placeholders,
-                    transport=item.get("transport"))
-                engine.submit(item["name"] + ":parent_finish", after=(finish,),
-                              owner=owner,
-                              on_complete=lambda _e: engine.resolve(promise),
-                              native_hook=True)
-                remaining_starts[0] -= 1
-                if remaining_starts[0] == 0:
-                    placeholders.clear()
-
-            engine.submit(name + ":begin", after=(info["ready"],), owner=owner,
-                          on_complete=begin, native_hook=True)
-        parents = {names_by_rank[rank]: item["parent"]
-                   for rank, item in cohort.items()}
-        starts = {names_by_rank[rank]: item["start"]
-                  for rank, item in cohort.items()}
-        operators = {names_by_rank[rank]: item["operators"]
-                     for rank, item in cohort.items()}
-        handles = {names_by_rank[rank]: item["handles"]
-                   for rank, item in cohort.items()}
-        phases_by_rank = {names_by_rank[rank]: item["phases"]
-                          for rank, item in cohort.items()}
-        work_by_rank = {names_by_rank[rank]: item["work"]
-                        for rank, item in cohort.items()}
-        link_by_phase_by_rank = {
-            names_by_rank[rank]: item["link_by_phase"]
-            for rank, item in cohort.items()}
-        transport_by_rank = {
-            names_by_rank[rank]: item["transport"]
-            for rank, item in cohort.items()}
-        transport_work_by_rank = {
-            names_by_rank[rank]: item["transport_work"]
-            for rank, item in cohort.items()}
-        transport_tx = sum(
-            float(phase.get("tx_bytes", 0.0))
-            for details in transport_by_rank.values()
-            for phase in details.values())
-        transport_rx = sum(
-            float(phase.get("rx_bytes", 0.0))
-            for details in transport_by_rank.values()
-            for phase in details.values())
-        transport_frames = sum(
-            int(phase.get("frames", 0))
-            for details in transport_by_rank.values()
-            for phase in details.values())
-        transport_edges = sum(
-            int(phase.get("edges", 0))
-            for details in transport_by_rank.values()
-            for phase in details.values())
-        join = engine.submit(f"{name_prefix}:join", after=tuple(parents.values()),
-                             owner=owner)
-        return {
-            "schema": "mindie-sim/native-cohort/3",
-            "finishes": parents, "parents": parents, "join": join,
-            "starts": starts, "operators": operators, "handles": handles,
-            "phases_by_rank": phases_by_rank, "work_by_rank": work_by_rank,
-            "link_by_phase_by_rank": link_by_phase_by_rank,
-            "transport_by_rank": transport_by_rank,
-            "transport_work_by_rank": transport_work_by_rank,
-            "transport_tx_bytes": transport_tx,
-            "transport_rx_bytes": transport_rx,
-            "transport_frames": transport_frames,
-            "transport_edges": transport_edges,
-            "directed_edges": sum(
-                int(value.get("edges", 0))
-                for details in transport_by_rank.values()
-                for phase, value in details.items()
-                if isinstance(value, _AbcMapping) and not value.get("count")),
-            "directed_frames": transport_frames,
-            "rank_indices": {names_by_rank[rank]: rank for rank in cohort},
-            "payload_basis": {
-                names_by_rank[rank]: str(
-                    getattr(launch_by_rank[rank]["program"].program,
-                            "payload_basis_for",
-                            lambda _r, info=launch_by_rank[rank]:
-                            info["payload_basis"])(rank))
-                for rank in cohort},
-            "payload_packet_bytes": {
-                names_by_rank[rank]: int(
-                    getattr(launch_by_rank[rank]["program"].program, "view", None).payload_packet_bytes
-                    if getattr(launch_by_rank[rank]["program"].program, "view", None) is not None else 0)
-                for rank in cohort},
-            "payload_frames": {
-                names_by_rank[rank]: dict(
-                    getattr(launch_by_rank[rank]["program"].program,
-                            "frames_for", lambda _r: ())(rank))
-                for rank in cohort},
-            "protocol_edges": sum(
-                1 for key in placeholders
-                if key[2] not in {"payload_exchange"}),
-            "unresolved_edges": len(unresolved),
-            "partial": tuple(partial),
+def _declared_metrics(info):
+    inner = info["program"].program
+    transport = info.get("transport") or {}
+    rank = int(info["rank"])
+    payload, count = (inner.transport_account(transport)
+                      if hasattr(inner, "transport_account") else ({}, {}))
+    phases_set = {phase.name for phase in getattr(inner, "phases", ())}
+    records = {}
+    if payload:
+        records["payload_exchange"] = {
+            **payload,
+            "basis": (inner.payload_basis_for(rank)
+                      if hasattr(inner, "payload_basis_for")
+                      else info["payload_basis"]),
+            "count": False,
         }
+    if count and "count_status_exchange" in phases_set:
+        count_basis = (inner.payload_basis_for(rank)
+                       if hasattr(inner, "payload_basis_for")
+                       else info["payload_basis"])
+        records["count_status_exchange"] = {
+            **count,
+            "basis": count_basis,
+            "count": True,
+        }
+    links_for_rank = getattr(inner, "link_by_phase_for", None)
+    links = (dict(links_for_rank(rank)) if callable(links_for_rank)
+             else dict(getattr(inner, "link_by_phase", {}) or {}))
+    work_for_rank = getattr(inner, "work_for_rank", None)
+    work = (tuple(work_for_rank(rank)) if callable(work_for_rank)
+            else tuple(getattr(info["program"], "work", ()) or ()))
+    transport_work = dict(payload.get("work", {}))
+    if "count_status_exchange" in phases_set:
+        for pipe, amount in (count.get("work", {}) or {}).items():
+            transport_work[pipe] = transport_work.get(pipe, 0.0) + float(amount)
+    return records, links, work, transport_work
+
+
+def _begin_deferred_rank(_event, *, engine, item, promise, placeholders,
+                         remaining_starts, owner):
+    rank_engine = _RankEngine(engine, item["resource_names"])
+    finish, _handles = item["program"].start_with_handles(
+        rank_engine, item["name"], item["ready"],
+        launch=item["view"], send_placeholders=placeholders,
+        transport=item.get("transport"))
+    engine.submit(item["name"] + ":parent_finish", after=(finish,),
+                  owner=owner,
+                  on_complete=lambda _e: engine.resolve(promise),
+                  native_hook=True)
+    remaining_starts[0] -= 1
+    if remaining_starts[0] == 0:
+        placeholders.clear()
+
+
+def _start_deferred_cohort(engine, infos, names_by_rank, placeholders,
+                           unresolved, partial_edges, name_prefix, owner):
+    cohort = {}
+    launch_by_rank = {info["rank"]: info for info in infos}
+    remaining_starts = [len(infos)]
+    for info in infos:
+        name = info["name"]
+        parent = engine.future(name + ":program_complete")
+        records, links, work, transport_work = _declared_metrics(info)
+        cohort[info["rank"]] = {
+            "parent": parent, "start": info["ready"],
+            "operators": {}, "phases": {},
+            "handles": {"deferred": True},
+            "work": work,
+            "link_by_phase": {
+                phase: {str(pipe): float(amount)
+                        for pipe, amount in values.items()}
+                for phase, values in links.items()},
+            "transport": records,
+            "transport_work": transport_work,
+        }
+        engine.submit(
+            name + ":begin", after=(info["ready"],), owner=owner, native_hook=True,
+            on_complete=partial(
+                _begin_deferred_rank, engine=engine, item=info, promise=parent,
+                placeholders=placeholders, remaining_starts=remaining_starts, owner=owner,
+            ),
+        )
+    summary = _native_cohort_summary(engine, cohort, names_by_rank, name_prefix, owner)
+    transport_by_rank = summary["transport_by_rank"]
+    return {
+        **summary,
+        "directed_edges": sum(
+            int(value.get("edges", 0))
+            for details in transport_by_rank.values()
+            for phase, value in details.items()
+            if isinstance(value, _AbcMapping) and not value.get("count")),
+        "directed_frames": summary["transport_frames"],
+        "rank_indices": {names_by_rank[rank]: rank for rank in cohort},
+        "payload_basis": {
+            names_by_rank[rank]: str(
+                getattr(launch_by_rank[rank]["program"].program,
+                        "payload_basis_for",
+                        lambda _r, info=launch_by_rank[rank]:
+                        info["payload_basis"])(rank))
+            for rank in cohort},
+        "payload_packet_bytes": {
+            names_by_rank[rank]: int(
+                getattr(launch_by_rank[rank]["program"].program, "view", None).payload_packet_bytes
+                if getattr(launch_by_rank[rank]["program"].program, "view", None) is not None else 0)
+            for rank in cohort},
+        "payload_frames": {
+            names_by_rank[rank]: dict(
+                getattr(launch_by_rank[rank]["program"].program,
+                        "frames_for", lambda _r: ())(rank))
+            for rank in cohort},
+        "protocol_edges": sum(
+            1 for key in placeholders
+            if key[2] not in {"payload_exchange"}),
+        "unresolved_edges": len(unresolved),
+        "partial": tuple(partial_edges),
+    }
+
+
+def _start_native_ranks(engine, infos, placeholders):
+    cohort = {}
     for info in infos:
         rank_engine = _RankEngine(engine, info["resource_names"])
         parent, launch_handles = info["program"].start_with_handles(
@@ -527,6 +488,10 @@ def launch_native_cohort(engine, launches, *, name_prefix="native_cohort",
             "transport": dict(launch_handles.get("transport") or {}),
             "transport_work": dict(launch_handles.get("transport_work") or {}),
         }
+    return cohort
+
+
+def _native_cohort_summary(engine, cohort, names_by_rank, name_prefix, owner):
     parents = {names_by_rank[rank]: item["parent"]
                for rank, item in cohort.items()}
     starts = {names_by_rank[rank]: item["start"]
@@ -578,6 +543,30 @@ def launch_native_cohort(engine, launches, *, name_prefix="native_cohort",
         "transport_rx_bytes": transport_rx,
         "transport_frames": transport_frames,
         "transport_edges": transport_edges,
+    }
+
+
+def launch_native_cohort(engine, launches, *, name_prefix="native_cohort",
+                         owner="native_cohort", defer=False):
+    """Two-phase launch of native peer programs on one shared Engine."""
+    infos, phases = _collect_cohort_launches(launches)
+    link_phases = tuple(
+        phase for phase in (phases or ())
+        if any(getattr(info["program"].program, "link_by_phase", {}).get(phase)
+               for info in infos))
+    for info in infos:
+        info["program"] = _bind_native_resource_view(
+            info["program"], info["resource_names"], engine)
+    names_by_rank = {info["rank"]: info["name"] for info in infos}
+    (placeholders, unresolved, partial, protocol_edges, directed_edges, directed_frames,
+     fullmesh_by_rank, payload_packet_by_rank) = _bind_peer_placeholders(
+        engine, infos, phases, name_prefix)
+    if defer:
+        return _start_deferred_cohort(
+            engine, infos, names_by_rank, placeholders, unresolved, partial, name_prefix, owner)
+    cohort = _start_native_ranks(engine, infos, placeholders)
+    return {
+        **_native_cohort_summary(engine, cohort, names_by_rank, name_prefix, owner),
         "by_rank": {rank: dict(item) for rank, item in cohort.items()},
         "names_by_rank": dict(names_by_rank),
         "phases": tuple(phases or ()), "link_phases": link_phases,

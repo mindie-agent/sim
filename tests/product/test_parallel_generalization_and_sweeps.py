@@ -38,13 +38,13 @@ from mindie_sim.catalog.weights import stage_weight_bytes
 from mindie_sim.compose import compose_case, va_recommended_config
 from mindie_sim.prediction.capacity import Memory
 from mindie_sim.prediction.efficiency import _lower_and_run_graph
-from mindie_sim.prediction.local_tp_groups import local_tp_groups
+from mindie_sim.prediction.sharding.local_tp import local_tp_groups
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.public.errors import UnmodeledCapabilityError
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.parallel import ParallelSpec, factor_dcp_axes
 from mindie_sim.sweep import sweep_topologies
-from mindie_sim.sweep_resize import enumerate_parallel_candidates
+from mindie_sim.sweep.resize import enumerate_parallel_candidates
 
 pytestmark = pytest.mark.tier0
 

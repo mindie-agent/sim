@@ -43,17 +43,17 @@ from mindie_sim.optimization import (
     check_optimality_certificate, direct_mac_pebble_reload_bound, eval_checked_path,
     solve_checked_critical_path, solve_farkas_dual, verify_epoch_trace,
 )
-from mindie_sim.prediction.collective_startup import resolve_collective_startup, validate_steps
+from mindie_sim.prediction.collectives.startup import resolve_collective_startup, validate_steps
 from mindie_sim.prediction.efficiency import extract_hardware_peaks
 from mindie_sim.prediction.operators.moe_routing.expert_slot_work import physical_slot_work
-from mindie_sim.prediction.exposed_breakdown import (
+from mindie_sim.prediction.efficiency.exposed_breakdown import (
     ExposedClocks, advance_clocks, finish_breakdown, join_clocks as prod_join_clocks, roofline_clocks,
 )
-from mindie_sim.prediction.fusion_graph import OpNode, TensorValue, TypedGraph
-from mindie_sim.prediction.local_projection_tp import lower_local_projection_tp
+from mindie_sim.prediction.fusion.graph import OpNode, TensorValue, TypedGraph
+from mindie_sim.prediction.sharding.local_tp import lower_local_projection_tp
 from mindie_sim.prediction.operators.recurrent.recover_ssm_commit import bind_recover_ssm_commits
 from mindie_sim.prediction.operators.recurrent.recover_ssm_work import FP32_RECORD_BYTES, emit_commit_op, gdn_record_head_bytes
-from mindie_sim.prediction.roofline_graph import (
+from mindie_sim.prediction.efficiency.roofline_graph import (
     PhysicalWorkGraph, PhysicalWorkNode, RooflineTargets, critical_path_roofline,
 )
 from mindie_sim.prediction.runtime.contracts import (
@@ -63,7 +63,7 @@ from mindie_sim.prediction.results import StepRequest
 from mindie_sim.prediction.runtime.engine import Engine, Resource
 from mindie_sim.prediction.runtime.ledger import Ledger, normalise_ranges, ranges_bytes
 from mindie_sim.prediction.structure import parse_case
-from mindie_sim.prediction.weight_prefetch import PrefetchDecision, PrefetchPhysics, apply_to_work, plan_prefetch
+from mindie_sim.prediction.execution.weight_prefetch import PrefetchDecision, PrefetchPhysics, apply_to_work, plan_prefetch
 from mindie_sim.rewrite import CollectiveTransform, Edit, OpRef, ScenarioRequest, finalize_plan, prepare_scenario
 from mindie_sim.schema.case import Software
 from mindie_sim.schema.common import ModelingError

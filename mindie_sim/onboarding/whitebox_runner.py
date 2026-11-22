@@ -37,8 +37,8 @@ from typing import Any
 
 import mindie_sim.backends as _backends_pkg
 from mindie_sim.backends import ascend
-import mindie_sim.compose_inputs as _compose_inputs_mod
-from mindie_sim.observations.multilevel_gate import (
+import mindie_sim.compose.inputs as _compose_inputs_mod
+from mindie_sim.observations.multilevel import (
     EngineInterval, FrozenFitManifest, GateCase, Manifest, bind_engine_interval,
     evaluate as evaluate_multilevel, parse_gate_case, validate_lineage,
 )
@@ -330,9 +330,9 @@ def _run_graphs_on_real_engine(
     sim_case: Any, graphs: Mapping[int, tuple[Any, ...]], *, start_event_name: str, end_event_name: str,
     external_inputs: Mapping[str, float] | None, family_registry: Any = None, sequences: int = 1, context: int = 0,
 ) -> tuple[Any, Any, Any, float, float, _BusyUnionObserver]:
-    from mindie_sim.prediction.cohort_traffic import bind_cohort_traffic
-    from mindie_sim.prediction.cost import CostLedger
-    from mindie_sim.prediction.dispatch import cohorts
+    from mindie_sim.prediction.execution.cohort_traffic import bind_cohort_traffic
+    from mindie_sim.prediction.efficiency.cost import CostLedger
+    from mindie_sim.prediction.execution.dispatch import cohorts
     from mindie_sim.prediction.evaluation import EvaluationContext
     from mindie_sim.prediction.execution import Execution
     from mindie_sim.prediction.graph_analysis import _name

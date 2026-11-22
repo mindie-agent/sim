@@ -30,7 +30,7 @@ from mindie_sim.catalog.draft_geometry import native_draft_layer_plans
 from mindie_sim import predict
 from mindie_sim.compose import compose_case
 from mindie_sim.prediction.capacity import Memory, MemoryPolicy
-from mindie_sim.prediction.cost import CostModel
+from mindie_sim.prediction.efficiency.cost import CostModel
 from mindie_sim.prediction.disaggregated import predict_pd
 from mindie_sim.prediction.efficiency import (
     _resolve_link_bw_bytes_per_ms, _resolve_link_peak_bw_bytes_per_ms,

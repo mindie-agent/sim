@@ -876,3 +876,26 @@ def split_metadata(split: CpSplit, *, local_rows: int = 0) -> tuple[tuple[str, A
     if local_rows:
         extra = (("cp_local_rows", int(local_rows)),)
     return split.metadata() + extra
+
+
+def runtime_cp_flag(runtime: Any, *keys: str) -> Any:
+    """Resolve a boolean/scalar CP flag from ``runtime.metadata`` or ``additional_config``."""
+    if runtime is None:
+        return None
+    meta = dict(getattr(runtime, "metadata", ()) or ())
+    extra = meta.get("additional_config")
+    extra_map = dict(extra) if isinstance(extra, dict) else {}
+    for source in (meta, extra_map):
+        for key in keys:
+            if key in source and source[key] is not None:
+                return source[key]
+    return None
+
+
+def dcp_q_replicate_enabled(
+    runtime: Any, *, pcp_factor: int, dp_width: int, sparse: bool,
+) -> bool:
+    """Opt-in Q-projection replication on dense MLA with single-axis TP DCP."""
+    if pcp_factor != 1 or dp_width != 1 or sparse:
+        return False
+    return bool(runtime_cp_flag(runtime, "dcp_q_replicate", "enable_dcp_q_replicate"))

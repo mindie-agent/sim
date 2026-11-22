@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 
 from mindie_sim.schema.common import ModelingError
 
-from ..cache_geometry import byte_spans_of_line_spans
+from ..cache_path.geometry import byte_spans_of_line_spans
 
 # granular (npu_arch_3510.md:28); no cache hit/miss policy is claimed by it.
 A5_LINE_BYTES = 128

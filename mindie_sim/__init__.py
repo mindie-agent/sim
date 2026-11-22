@@ -18,7 +18,7 @@ from .prediction.graph_analysis import graph_costs
 from .prediction.operator_analysis import operator_costs, target_graphs, target_operators
 from .prediction.structure import parse_case
 from .study import study
-from .prediction.call import call_costs
+from .prediction.call_builders import call_costs
 from .prediction.call_builders import build_call
 from .compose import compose_case, resolve_hardware_sku
 from .feature_mechanisms import (
@@ -26,7 +26,7 @@ from .feature_mechanisms import (
     list_optimization_mechanisms,
     register_optimization_mechanism,
 )
-from .feature_waterfall import compare_feature_tracks
+from .feature_mechanisms import compare_feature_tracks
 from .stack_tracks import (
     RuntimeStackProfile,
     StackMechanismBinding,
@@ -34,7 +34,7 @@ from .stack_tracks import (
     register_runtime_stack,
 )
 from .hardware_derivation import derive_hardware_sku
-from .hardware_efficiency import EfficiencyCurve
+from .hardware_derivation import EfficiencyCurve
 from .custom_hardware import (
     HARDWARE_ARCHETYPE_TEMPLATES,
     build_custom_hardware_machine,
@@ -61,7 +61,7 @@ from .prediction.efficiency import (
     solve_sla_sizing,
 )
 from .prediction.offload import OffloadPolicy
-from .prediction.speculation import compute_speculative_accept_step
+from .prediction.frontend.speculation import compute_speculative_accept_step
 from .sweep import (
     compute_pareto_frontier,
     enumerate_parallel_candidates,
@@ -136,14 +136,25 @@ __all__ = [
 ]
 
 _LAZY_SUBMODULES = frozenset({
-    "api", "cli", "cohort_comparison", "stack_registry", "structure",
+    "api", "cli", "cohort_accuracy", "stack_registry", "structure",
 })
+
+
+_LAZY_ALIASES = {
+    "cli_export": "mindie_sim.cli.export",
+    "cohort_comparison": "mindie_sim.cohort_accuracy",
+}
 
 
 def __getattr__(name: str):
     if name in _LAZY_SUBMODULES:
         import importlib
         module = importlib.import_module(f"{__name__}.{name}")
+        globals()[name] = module
+        return module
+    if name in _LAZY_ALIASES:
+        import importlib
+        module = importlib.import_module(_LAZY_ALIASES[name])
         globals()[name] = module
         return module
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

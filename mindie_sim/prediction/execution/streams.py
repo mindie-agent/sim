@@ -148,10 +148,10 @@ def _declaration_of(op):
     try:
         cached = _DECLARATION_CACHE.get(metadata)
     except TypeError:
-        from ..kernel_groups import declaration
+        from ..program.kernel_groups import declaration
         return declaration(op)
     if cached is None:
-        from ..kernel_groups import declaration
+        from ..program.kernel_groups import declaration
         cached = declaration(op)
         if len(_DECLARATION_CACHE) >= META_CACHE_LIMIT:
             _DECLARATION_CACHE.clear()
@@ -176,7 +176,7 @@ def _project_meta_pair(pair):
 
 def op_meta_key_from_metadata(metadata) -> Any:
     """Layer-zero canonical projection of one immutable metadata declaration."""
-    from ..physical_key import operator_metadata_key
+    from ..program.physical_key import operator_metadata_key
     hit = _META_KEY_CACHE.get(id(metadata))
     if hit is not None and hit[0] is metadata:
         return hit[1]
@@ -231,7 +231,7 @@ def _legacy_op_meta_key_from_metadata(metadata) -> Any:
 
 def _op_meta_key(op) -> Any:
     """Canonical occurrence-relative projection of one operator's metadata."""
-    from ..physical_key import operator_metadata_key
+    from ..program.physical_key import operator_metadata_key
     return operator_metadata_key(op.metadata, op.stage, op.layer)
 
 

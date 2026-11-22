@@ -18,11 +18,11 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from mindie_sim.__main__ import emit, read_json
 from mindie_sim.observations.service_fitting import fit_service_curve
-from mindie_sim.observations.validation import fit_resource_rate
-from mindie_sim.prediction.cost import CostModel
+from mindie_sim.observations.captures import fit_resource_rate
+from mindie_sim.prediction.efficiency.cost import CostModel
 from mindie_sim.prediction.execution import Execution
 from mindie_sim.prediction.operator_analysis import operator_costs
-from mindie_sim.prediction.services import service_identity
+from mindie_sim.prediction.service_regime_domains.services import service_identity
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.operators import IterationWork, OpSpec
 from mindie_sim.schema.workload import IterationPlan, RequestView

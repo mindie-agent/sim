@@ -19,7 +19,7 @@ from mindie_sim import predict
 from mindie_sim.prediction import runtime, scheduling
 from mindie_sim.catalog.types import QuantSpec
 from mindie_sim.compose import assemble, compose_case
-from mindie_sim.prediction.cost import CostModel
+from mindie_sim.prediction.efficiency.cost import CostModel
 from mindie_sim.prediction.engine import Engine, Event, ExecutionError, Resource
 from mindie_sim.prediction.execution import Execution
 from mindie_sim.prediction.frontend import Frontend, SERVICE_FAMILIES, _ports_for_work
@@ -36,7 +36,7 @@ from mindie_sim.prediction.runtime.contracts import (
 from mindie_sim.prediction.runtime.host import HostCursor
 from mindie_sim.prediction.runtime.periodic import IntervalSummary
 from mindie_sim.prediction.runtime.state import RuntimeState
-from mindie_sim.prediction.step_metrics import StepSummary
+from mindie_sim.prediction.efficiency.step_metrics import StepSummary
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.operators import IterationWork, OpSpec, StateEffect

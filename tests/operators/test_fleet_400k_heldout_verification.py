@@ -54,7 +54,7 @@ from mindie_sim.prediction.operators.vector.ring_update import build_ring_update
 from mindie_sim.prediction.results import OpOccurrence
 from mindie_sim.prediction.runtime.l2_residency import AdmissionMemoryView
 from mindie_sim.prediction.streams import StreamOwners
-from mindie_sim.prediction.verification import verify_operator
+from mindie_sim.prediction.graph_analysis import verify_operator
 from mindie_sim.primitives.loader import load_primitives
 from mindie_sim.primitives.schema import compute_envelope_sha256, parse_primitive_table
 from mindie_sim.public.errors import UnmodeledCapabilityError

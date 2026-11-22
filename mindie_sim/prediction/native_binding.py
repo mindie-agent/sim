@@ -18,7 +18,7 @@ from hashlib import sha256
 import json
 
 from mindie_sim.schema.common import ModelingError
-from .native_coverage import (
+from .program.native_coverage import (
     NativeAbiRegion, _attach_selection, _bound_state, bind_abi_call,
     bind_selected_native_call, coverage_from_records, join_profiler_rows,
     native_call_coverage, selection_delivery_for_op,

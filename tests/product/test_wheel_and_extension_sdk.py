@@ -399,7 +399,7 @@ def test_missing_capability_reports_a_replayable_gap(tmp_path):
 
 
 def test_pure_model_forward_bills_each_declared_occurrence_once(tmp_path):
-    from mindie_sim.prediction.body import target_graphs
+    from mindie_sim.prediction.operator_analysis import target_graphs
     from mindie_sim.prediction.structure import parse_case
     from mindie_sim.public import (load_extensions, simulate_model, simulate_operator,)
     context = load_extensions(paths=[_write_extension(tmp_path)])

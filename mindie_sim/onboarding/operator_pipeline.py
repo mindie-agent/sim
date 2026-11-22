@@ -42,7 +42,7 @@ import tomllib
 from typing import Any, Literal
 
 from mindie_sim.backends import ascend
-from mindie_sim.observations.multilevel_stream import SHA256_HEX_LENGTH
+from mindie_sim.observations.multilevel import SHA256_HEX_LENGTH
 from mindie_sim.optimization.dual_bound import (
     DagEdge,
     EventDagSpec,

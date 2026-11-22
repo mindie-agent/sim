@@ -17,13 +17,13 @@ from _support.builders import linear_layer, linear_model
 from _support.linear_cases import kda_hardware_case, sku_planning_context
 from mindie_sim.prediction.operators.linear_attention.gdn_chunk32 import PR22147_SOURCE, STATE
 from mindie_sim import compose_case, graph_costs, operator_costs, predict, target_graphs, target_operators
-from mindie_sim.observations.gdn_binding import bind_observation
-from mindie_sim.observations.historical import call_observations
+from mindie_sim.observations.calibration import bind_observation
+from mindie_sim.observations.comparison import call_observations
 from mindie_sim.prediction.operators.attention.attention import AttentionPolicy
 from mindie_sim.prediction.operators.kda.family_kda_prepare import IMPLEMENTATION as KDA_PREPARE
 from mindie_sim.prediction.body_defaults import consume_target_declaration
 from mindie_sim.prediction.operators.linear_attention.call_gdn import make_call, _gating_plan
-from mindie_sim.prediction.cost import CostModel
+from mindie_sim.prediction.efficiency.cost import CostModel
 from mindie_sim.prediction.execution import Execution
 from mindie_sim.prediction.mechanism import Geometry, PlannedRecipe
 from mindie_sim.prediction.operators.linear_attention import gdn_prepare as gdn; from mindie_sim.prediction.operators.kda import kda_prepare
@@ -32,7 +32,7 @@ from mindie_sim.prediction.operators.linear_attention import build, compute_wy_c
 from mindie_sim.prediction.program import RecipeBook, RecipeContext
 from mindie_sim.prediction.operators.recurrent.recurrent import linear
 from mindie_sim.prediction.structure import parse_case
-from mindie_sim.prediction.verification import verify_operator
+from mindie_sim.prediction.graph_analysis import verify_operator
 from mindie_sim.schema.case import Software
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.operators import IterationWork, OpSpec

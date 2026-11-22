@@ -706,7 +706,7 @@ def _verify_workspace(wheel, root, output, work, *, profiler_wheel=None):
     if profiler_wheel is not None:
         # All prediction checks above run without the optional observation
         # provider. Import checks below use an installed, identified wheel.
-        from mindie_sim.observations.store import digest_file
+        from mindie_sim.observations.captures import digest_file
         profiler_wheel = Path(profiler_wheel).resolve()
         subprocess.run(["uv", "pip", "install", "--python", str(python), str(profiler_wheel)],
                        check=True, timeout=120, **win_kw)
@@ -766,7 +766,7 @@ def _verify_workspace(wheel, root, output, work, *, profiler_wheel=None):
     assert len(service["heldout"]) == 5
     # This is an interface check using a real retained event, not an accuracy claim.
     from mindie_sim.observations.captures import iter_observations
-    from mindie_sim.observations.store import digest_file
+    from mindie_sim.observations.captures import digest_file
     fixture = fixtures / "capture_adapters"
     protocol = json.loads((root / "data/observations/protocols/grouped-call-protocol.json").read_text(encoding="utf-8"))
     protocol["producer"] = {"path": str(fixture / "grouped_producer.py.txt"),

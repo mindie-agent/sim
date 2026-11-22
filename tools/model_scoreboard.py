@@ -23,10 +23,10 @@ import time
 from mindie_sim.observations.scoreboard import (
     model_scoreboard, prediction_from_probe, render_markdown,
 )
-from mindie_sim.observations.scoreboard_accuracy import (
+from mindie_sim.observations.scoreboard import (
     annotate_kimi_report, render_kimi_markdown,
 )
-from mindie_sim.observations.cohort_scoreboard import (
+from mindie_sim.observations.scoreboard import (
     render_cohort_campaigns, summarize_cohorts,
 )
 
@@ -204,8 +204,8 @@ def scheduled_probe(spec):
     """Execute a complete fixed iteration without request-admission inference."""
     from mindie_sim import operator_costs
     from mindie_sim.prediction.operators.attention.attention import AttentionPolicy
-    from mindie_sim.prediction.cost import CostModel
-    from mindie_sim.prediction.dispatch import cohorts
+    from mindie_sim.prediction.efficiency.cost import CostModel
+    from mindie_sim.prediction.execution.dispatch import cohorts
     from mindie_sim.prediction.execution import Execution
     from mindie_sim.prediction.frontend import Frontend
     from mindie_sim.prediction.program import RecipeBook

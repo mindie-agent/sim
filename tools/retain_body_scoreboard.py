@@ -11,7 +11,7 @@ from hashlib import sha256
 import json
 from pathlib import Path
 
-from mindie_sim.observations.store import json_items
+from mindie_sim.observations.captures import json_items
 
 
 BEGIN = "<!-- current-body-evidence:start -->"

@@ -27,8 +27,8 @@ from _support.linear_cases import execute_one, gdn_decode_source_case
 from mindie_sim import graph_costs
 from mindie_sim.backends.ascend import apply_observed_aicore_clock
 from mindie_sim.compose import compose_case
-from mindie_sim.observations.multilevel_stream import verify_capture_file_consistency
-from mindie_sim.observations.accuracy import (
+from mindie_sim.observations.multilevel import verify_capture_file_consistency
+from mindie_sim.observations.comparison import (
     apply_capture_observed_clock,
     extract_observed_aicore_freq_mhz,
 )
@@ -262,7 +262,7 @@ def test_single_spine_live_execution_trace_across_architectures(
 
 @pytest.mark.parametrize("family", ("short_convolution", "gdn_gating"))
 def test_live_dispatch_rejects_flat_program_callbacks(monkeypatch, traced_plan_programs, family):
-    from mindie_sim.prediction import call_builders_operators
+    from mindie_sim.prediction import call_builders as call_builders_operators
     from mindie_sim.prediction.operators.linear_attention import _gdn_decode_programs
 
     case, views, ops = gdn_decode_source_case((1,))

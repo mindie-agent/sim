@@ -16,7 +16,7 @@ import resource
 import time
 
 from mindie_sim.prediction.operators.kda.family_kda_state import IMPLEMENTATION, SOURCE
-from mindie_sim.prediction.call import call_costs
+from mindie_sim.prediction.call_builders import call_costs
 from mindie_sim.prediction.graph_analysis import graph_costs
 from mindie_sim.prediction.operator_analysis import target_operators
 from mindie_sim.prediction.operators.kda import kda_state

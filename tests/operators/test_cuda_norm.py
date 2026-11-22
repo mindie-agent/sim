@@ -26,7 +26,7 @@ from mindie_sim.prediction.operator_analysis import operator_costs
 from mindie_sim.prediction.operators.vector import cuda_norm
 from mindie_sim.prediction.program import RecipeBook, RecipeContext
 from mindie_sim.prediction.structure import parse_case
-from mindie_sim.prediction.verification import verify_operator
+from mindie_sim.prediction.graph_analysis import verify_operator
 from mindie_sim.prediction.mechanism import PlannedRecipe
 from mindie_sim.schema.common import ModelingError
 
@@ -321,7 +321,7 @@ def hardware(*, units=4, hbm=1e12, vector=1e12, shared_rate=1e12,
 
 
 def execution(op, *, ready_ms=0, horizon=None, **device):
-    from mindie_sim.prediction.cost import CostModel
+    from mindie_sim.prediction.efficiency.cost import CostModel
     from mindie_sim.prediction.execution import Execution
     case = parse_case(hardware(**device))
     book = RecipeBook(recipes={op.recipe: PlannedRecipe(cuda_norm.build)})

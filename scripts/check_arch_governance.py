@@ -80,7 +80,7 @@ _SM_INFRA_FILES = frozenset({
 _CP_INFRA_FILES = _SM_INFRA_FILES | frozenset({
     "mindie_sim/public/services.py",
     "mindie_sim/structure.py",
-    "mindie_sim/prediction/cost.py",
+    "mindie_sim/prediction/efficiency/cost.py",
     "mindie_sim/prediction/efficiency.py",
     "mindie_sim/prediction/operators/matrix/matrix_precision.py",
 })

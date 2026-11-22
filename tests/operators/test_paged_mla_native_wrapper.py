@@ -19,7 +19,7 @@ from _support.axes import REPRESENTATIVE_SKUS
 from _support.hardware import hardware_case, sku_case
 from mindie_sim import graph_costs
 from mindie_sim.prediction.operators.mla_prolog import family_mla_prolog as prolog; from mindie_sim.prediction.operators.sparse_indexer import index_pool_native
-from mindie_sim.prediction.cost import CostModel
+from mindie_sim.prediction.efficiency.cost import CostModel
 from mindie_sim.prediction.engine import Engine
 from mindie_sim.prediction.execution import Execution
 from mindie_sim.prediction.frontend import Frontend
@@ -31,13 +31,13 @@ from mindie_sim.prediction.operators.paged_mla import DSL_FLASH_ABI, FIA_ABI, FL
 from mindie_sim.prediction.program import RecipeBook
 from mindie_sim.prediction.streams import StreamOwners
 from mindie_sim.prediction.structure import parse_case
-from mindie_sim.prediction.verification import verify_operator
+from mindie_sim.prediction.graph_analysis import verify_operator
 from mindie_sim.public.errors import UnmodeledCapabilityError
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.operators import IterationWork
 from mindie_sim.schema.parallel import ParallelSpec
 from mindie_sim.schema.workload import IterationPlan, RequestView
-from mindie_sim.structure_physical import node_physical, subgraph_physical
+from mindie_sim.structure.physical import node_physical, subgraph_physical
 
 pytestmark = pytest.mark.tier0
 

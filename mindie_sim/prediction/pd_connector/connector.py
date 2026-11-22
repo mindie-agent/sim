@@ -212,6 +212,66 @@ class PDConnector:
         plan = topology.transport_plan(handoff.flows(), transport=transport)
         plan = self._alias_plan(plan)
 
+        rank_ready, reservations = self._reserve_handoff_receivers(
+            engine, handoff, name, sources, destinations,
+            capacity_by_rank, pool_capacity_by_rank, buffer_by_rank)
+        boundary = engine.submit(
+            name + ":ready", after=tuple(rank_ready.values()),
+            owner=f"request:{handoff.request_id}",
+            metadata={"boundary": "pd_handoff_all_rank_ready",
+                      "request_id": handoff.request_id,
+                      "rank_count": len(rank_ready)})
+        memory = engine.submit(
+            name + ":memory", dict(handoff.memory_work), after=(boundary,),
+            owner=f"request:{handoff.request_id}")
+        run = plan.start(engine, name + ":transport", rank_ready,
+                         owner=f"request:{handoff.request_id}")
+        release_map = _normalize_releases(release_events) or {}
+        flow_index_by_destination = defaultdict(list)
+        source_flow_events = defaultdict(list)
+        for index, (event, path) in enumerate(zip(run.completions,
+                                                  run.plan.flows)):
+            transfer = handoff.transfers[index]
+            source_flow_events[transfer.source_rank].append(event)
+            if transfer.destination_tier == "hbm":
+                flow_index_by_destination[path.flow.destination].append(index)
+        release_events_by_rank = {}
+        for destination, allocation in reservations.items():
+            indices = flow_index_by_destination.get(destination, ())
+            flow_events = tuple(run.completions[index] for index in indices)
+            consumer_events = tuple(release_map.get(destination, ()))
+            amount = sum(float(handoff.transfers[index].payload_bytes)
+                         for index in indices)
+            release_event = self._schedule_residency(
+                engine, f"{name}:r{destination}", destination, amount,
+                flow_events, consumer_events, allocation=allocation,
+                release_name=f"{name}:receive_release:r{destination}",
+                explicit_consumer=True,
+                release_callback=release_callbacks.get(destination))
+            release_events_by_rank[destination] = release_event
+        source_release_events = {}
+        for rank in sorted(source_flow_events):
+            explicit = source_last_use.get(rank, ())
+            release = engine.submit(
+                f"{name}:source_last_use:r{rank}",
+                after=(sources[rank], *source_flow_events[rank], *explicit),
+                owner=f"request:{handoff.request_id}",
+                metadata={"boundary": "pd_source_last_use_release",
+                          "request_id": handoff.request_id,
+                          "source_rank": rank,
+                          "explicit_local_readers": len(explicit)},
+                on_complete=(
+                    (lambda _event, callback=source_callbacks.get(rank):
+                     callback() if callback is not None else None)
+                    if rank in source_callbacks else None))
+            source_release_events[rank] = release
+        return self._finish_handoff(
+            engine, name, handoff, memory, run, source_release_events)
+
+    def _reserve_handoff_receivers(
+        self, engine, handoff, name, sources, destinations,
+        capacity_by_rank, pool_capacity_by_rank, buffer_by_rank,
+    ):
         pair_ready = defaultdict(list)
         for transfer in handoff.transfers:
             pair = engine.submit(
@@ -266,63 +326,14 @@ class PDConnector:
                               for rank in sorted(capacity_by_rank)}})
             for rank in pair_ready:
                 pair_ready[rank].append(grant)
-        else:
-            grant = None
         rank_ready = {
             rank: engine.submit(f"{name}:ready:r{rank}",
                                 after=tuple(pair_ready[rank]),
                                 owner=f"request:{handoff.request_id}")
             for rank in sorted(pair_ready)}
-        boundary = engine.submit(
-            name + ":ready", after=tuple(rank_ready.values()),
-            owner=f"request:{handoff.request_id}",
-            metadata={"boundary": "pd_handoff_all_rank_ready",
-                      "request_id": handoff.request_id,
-                      "rank_count": len(rank_ready)})
-        memory = engine.submit(
-            name + ":memory", dict(handoff.memory_work), after=(boundary,),
-            owner=f"request:{handoff.request_id}")
-        run = plan.start(engine, name + ":transport", rank_ready,
-                         owner=f"request:{handoff.request_id}")
-        release_map = _normalize_releases(release_events) or {}
-        flow_index_by_destination = defaultdict(list)
-        source_flow_events = defaultdict(list)
-        for index, (event, path) in enumerate(zip(run.completions,
-                                                  run.plan.flows)):
-            transfer = handoff.transfers[index]
-            source_flow_events[transfer.source_rank].append(event)
-            if transfer.destination_tier == "hbm":
-                flow_index_by_destination[path.flow.destination].append(index)
-        release_events_by_rank = {}
-        for destination, allocation in reservations.items():
-            indices = flow_index_by_destination.get(destination, ())
-            flow_events = tuple(run.completions[index] for index in indices)
-            consumer_events = tuple(release_map.get(destination, ()))
-            amount = sum(float(handoff.transfers[index].payload_bytes)
-                         for index in indices)
-            release_event = self._schedule_residency(
-                engine, f"{name}:r{destination}", destination, amount,
-                flow_events, consumer_events, allocation=allocation,
-                release_name=f"{name}:receive_release:r{destination}",
-                explicit_consumer=True,
-                release_callback=release_callbacks.get(destination))
-            release_events_by_rank[destination] = release_event
-        source_release_events = {}
-        for rank in sorted(source_flow_events):
-            explicit = source_last_use.get(rank, ())
-            release = engine.submit(
-                f"{name}:source_last_use:r{rank}",
-                after=(sources[rank], *source_flow_events[rank], *explicit),
-                owner=f"request:{handoff.request_id}",
-                metadata={"boundary": "pd_source_last_use_release",
-                          "request_id": handoff.request_id,
-                          "source_rank": rank,
-                          "explicit_local_readers": len(explicit)},
-                on_complete=(
-                    (lambda _event, callback=source_callbacks.get(rank):
-                     callback() if callback is not None else None)
-                    if rank in source_callbacks else None))
-            source_release_events[rank] = release
+        return rank_ready, reservations
+
+    def _finish_handoff(self, engine, name, handoff, memory, run, source_release_events):
         self._engine = engine
         wire = sum(hop.wire_bytes for path in run.plan.flows
                    for chunk in path.chunks for hop in chunk.hops)

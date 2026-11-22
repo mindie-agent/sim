@@ -637,7 +637,7 @@ class PredictionSpine:
     ) -> TopologySweepResult:
         """Sweep topology or P/D disaggregation candidates and return Pareto frontier."""
         from mindie_sim.sweep import sweep_pd_disaggregation_ratios, sweep_topologies_iter
-        from mindie_sim.sweep_engine import compute_pareto_frontier
+        from mindie_sim.sweep.engine import compute_pareto_frontier
 
         if request.mode == "pd":
             total_dies = (

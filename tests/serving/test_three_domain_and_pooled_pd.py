@@ -19,7 +19,7 @@ import pytest
 from mindie_sim import api as sdk_api
 from mindie_sim.cli import _main as cli_main
 from mindie_sim.compose import compose_case
-from mindie_sim.compose_runtime import apply_va_recommended
+from mindie_sim.compose.runtime import apply_va_recommended
 from mindie_sim.prediction.disaggregated import compute_pd_handoff_plan
 from mindie_sim.prediction.offload import (
     OffloadPolicy,
@@ -351,8 +351,8 @@ def test_kimi_k31_a5_fp8_canonicalization_pd_decode_workspace_and_scope_provenan
 
 
 def test_aliases_self_correcting_errors_catalog_cli_parity_and_oneshot_solve(tmp_path):
-    from mindie_sim.cli_parser import build_parser
-    from mindie_sim.compose_inputs import _resolve_hardware
+    from mindie_sim.cli.parser import build_parser
+    from mindie_sim.compose.inputs import _resolve_hardware
 
     assert _resolve_hardware("950dt-96g")[0] == "Ascend950DT_9582"
     assert _resolve_hardware("950dt-96g-pod")[:3:2] == ("Ascend950DT_9582", "a5_pod")
@@ -478,7 +478,7 @@ def test_kimi_k31_five_live_correctness_regressions():
     assert e_ideal["graph_duration_ms"] < e_merged["graph_duration_ms"]
 
     # #365 Item 2: mindie-sim solve parses optional --xlsx / --trace / --compare-track / --target-track flags.
-    from mindie_sim.cli_parser import build_parser
+    from mindie_sim.cli.parser import build_parser
     parsed_solve = build_parser().parse_args([
         "solve", "--model", "kimi-k3.1", "--hardware", "950dt-96g-pod",
         "--num-devices", "8", "--prompt-tokens", "131072", "--output-tokens", "1024",

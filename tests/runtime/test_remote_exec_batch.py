@@ -21,7 +21,7 @@ from typing import Any
 
 import pytest
 
-from mindie_sim._remote_worker import execute_worker_request
+from mindie_sim.remote_exec import execute_worker_request
 from mindie_sim.prediction.runtime import accel_build, accel_loader
 from mindie_sim.prediction.runtime.engine import Engine, Resource
 from mindie_sim.remote_exec import (

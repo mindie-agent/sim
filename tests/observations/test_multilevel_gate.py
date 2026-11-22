@@ -19,7 +19,7 @@ from typing import Any
 
 import pytest
 
-from mindie_sim.observations.multilevel_gate import (
+from mindie_sim.observations.multilevel import (
     DEFAULT_ATOL_NS, CaptureBoundary, CohortKey, EngineInterval, EngineRunReceipt, FrozenFitManifest,
     FrozenFitParameter, GateCase, MS_TO_NS, Manifest, Residual, bind_engine_interval,
     bind_engine_rung_interval, evaluate, exceeds_physical_tolerance, gate_decision, parse_gate_case, run_l1,
@@ -429,8 +429,8 @@ def test_caller_predictions_and_uncalibrated_plans_cannot_pass() -> None:
         assert verdict["status"] == "insufficient_evidence"
         assert (verdict["calibrated_count"], verdict["plan_only"]) == (count, plan_only)
 def test_two_pass_streaming_past_64k_header_and_provenance(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    import mindie_sim.observations.multilevel_gate as mg
-    import mindie_sim.observations.multilevel_stream as ms
+    import mindie_sim.observations.multilevel as mg
+    import mindie_sim.observations.multilevel as ms
     cases = [_raw_case(f"tr_{i}", "train", f"{i:x}", pad_bytes=9000) for i in range(10)]
     raw_text = json.dumps({"cases": [*cases, _raw_case("ho_leak", "heldout", "f")], "manifest_id": "trailing_meta_manifest",
                            "strict_three_level_blind": True, "lineage_edges": [["acq-1", "acq-f"]]})

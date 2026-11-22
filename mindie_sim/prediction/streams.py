@@ -283,7 +283,7 @@ def stream_quota_resources(
     namespace: str = "",
 ) -> tuple[tuple[Any, ...], dict[tuple[StreamId, str], str]]:
     """Build aggregate lane-quota ``Resource`` objects for ``shared_cap`` lanes."""
-    from .engine import Resource
+    from mindie_sim.prediction.engine import Resource
 
     unit_map = dict(work_units) if work_units else {}
     resources: list[Any] = []
@@ -445,7 +445,7 @@ def bind_stage_to_stream(
     pool_names: Mapping[str, str] | None = None, pool_units: Mapping[str, int] | None = None,
 ) -> Any:
     """Bind one ``Stage`` to its lane's physical core owners and aggregate lane quotas."""
-    from .program import KernelProgram, ParallelProgram, Stage
+    from mindie_sim.prediction.program import KernelProgram, ParallelProgram, Stage
 
     role_by_res = {phys: role for role, phys in resource_names.items()}
     aic_res = [r for r, a in stage.work.items() if a > 0.0 and role_by_res.get(r) in AIC_ROLES]
@@ -616,7 +616,7 @@ def apply_stream_owners_to_program(
     pool_names: Mapping[str, str] | None = None, pool_units: Mapping[str, int] | None = None,
 ) -> Any:
     """Recursively bind all stages of ``program`` and its wrappers to ``owners``."""
-    from .program import (
+    from mindie_sim.prediction.program import (
         KernelProgram, NativeProgram, ParallelProgram,
         PipelineProgram, PipelineTemplateProgram,
     )

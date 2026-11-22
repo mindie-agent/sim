@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from mindie_sim.compose import compose_case
-from mindie_sim.feature_waterfall import compare_feature_tracks
+from mindie_sim.feature_mechanisms import compare_feature_tracks
 from mindie_sim.prediction.capacity import Memory
 from mindie_sim.prediction.efficiency import (
     _resolve_speculative_tokens,
@@ -34,7 +34,11 @@ from mindie_sim.prediction.offload.policy import missing_scenario_error
 from mindie_sim.prediction.results import StepRequest
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.common import ModelingError
-from mindie_sim.sweep_pd import solve_optimal_deployment
+from mindie_sim.sweep.pd import (
+    ARCHETYPE_SCREEN_MIN_LAYERS,
+    build_archetype_representative_case,
+    solve_optimal_deployment,
+)
 
 SOLVE_SCHEMA = "mindie-sim.deployment-solution/1"
 BYTES_PER_GIB = float(1024 ** 3)
@@ -269,31 +273,52 @@ def _evaluate_winner_analysis(
     win_tokens = 1 + win_mtp
     win_scope = "model"
     win_role = "pd_decode" if solved.get("winner_mode") == "pd_disaggregated" else "colocated"
+    use_arch = parsed_rec.model.layers >= ARCHETYPE_SCREEN_MIN_LAYERS
+    if use_arch:
+        rep_case, layer_weights, _ = build_archetype_representative_case(parsed_rec)
+        eval_case: Any = rep_case
+        wf_model: Any = rep_case.model.to_dict()
+        wf_layers: int | None = len(rep_case.model.layer_plans)
+    else:
+        eval_case = rec_case
+        layer_weights = {}
+        wf_model = model
+        wf_layers = layers
     bottleneck = _extract_bottleneck_roofline(
-        rec_case, prompt_tokens=prompt, sequences=win_seq,
+        eval_case, prompt_tokens=prompt, sequences=win_seq,
         tokens=win_tokens, scope=win_scope,
     )
+    if use_arch and isinstance(bottleneck, dict):
+        inc = dict(bottleneck.get("included_components") or {})
+        inc["target_layers"] = int(parsed_rec.model.layers)
+        inc["archetype_representative_layers"] = len(layer_weights)
+        bottleneck["included_components"] = inc
     par = parsed_rec.runtime.parallel
     wf_kw: dict[str, Any] = dict(
         tp=par.tp, dp=par.dp, ep=par.ep, pp=par.pp, pcp=par.pcp, dcp=par.cp,
-        num_devices=par.world_size, layers=layers, quant=quant,
+        num_devices=par.world_size, layers=wf_layers, quant=quant,
         kv_cache_dtype=kv_cache_dtype, indexer_kv_dtype=indexer_kv_dtype,
         topology_preset=topology_preset, ranks_per_node=ranks_per_node,
         prompt_tokens=prompt, output_tokens=output,
         mtp_proposal_tokens=win_mtp, role=win_role,
+        homogeneous_graph_reuse="auto",
     )
     if mtp_accept is not None and win_mtp > 0:
         wf_kw["mtp_acceptance_length"] = float(mtp_accept)
     waterfall = compare_feature_tracks(
-        model, hardware=hardware, runtime_stack=runtime_stack,
+        wf_model, hardware=hardware, runtime_stack=runtime_stack,
         phase="decode", tokens=win_tokens, context=prompt,
         sequences=win_seq, scope=win_scope, ablate_prs=ablate_prs,
         **wf_kw,
     )
+    if use_arch and isinstance(waterfall, dict):
+        waterfall["archetype_representative_layers"] = int(wf_layers or 0)
+        waterfall["full_model_layers"] = int(parsed_rec.model.layers)
+    export_kw = {**wf_kw, "layers": layers}
     exports = (
         _export_solution_artifacts(
             model=model, hardware=hardware, runtime_stack=runtime_stack,
-            wf_kw=wf_kw, prompt_tokens=prompt, sequences=win_seq,
+            wf_kw=export_kw, prompt_tokens=prompt, sequences=win_seq,
             tokens=win_tokens, scope=win_scope,
             xlsx_path=xlsx_path, trace_path=trace_path,
             compare_track=compare_track, target_track=target_track,

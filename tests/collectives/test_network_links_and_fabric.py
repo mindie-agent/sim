@@ -48,7 +48,7 @@ from mindie_sim.prediction.topology import Topology
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.hardware import Hardware, Link
 from mindie_sim.schema.parallel import ParallelSpec
-from mindie_sim.sweep_resize import (
+from mindie_sim.sweep.resize import (
     _first_link_by_channel, materialize_machine_for_devices, project_transfer_channel_input,
 )
 

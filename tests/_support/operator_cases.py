@@ -18,7 +18,7 @@ from pathlib import Path
 import pytest
 
 from mindie_sim import operator_costs, target_graphs
-from mindie_sim.prediction.cost import CostModel
+from mindie_sim.prediction.efficiency.cost import CostModel
 from mindie_sim.prediction.engine import Allocation, Engine, Resource
 from mindie_sim.prediction.execution import Execution
 from mindie_sim.prediction.mechanism import Geometry

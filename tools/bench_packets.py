@@ -44,7 +44,7 @@ import sys
 from typing import Any, Iterable, Mapping, Sequence
 from urllib.parse import unquote, urlsplit
 
-from mindie_sim.prediction.primitives import PrimitiveKey
+from mindie_sim.prediction.program.primitives import PrimitiveKey
 
 SCHEMA = "mindie-sim.bench-packets/1"
 FABRIC_SAMPLE_SCHEMA = "mindie-fabric-probe-sample/3"

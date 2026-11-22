@@ -26,7 +26,7 @@ from mindie_sim.schema.speculative import SpeculativeSpec
 from mindie_sim.schema.workload import IterationPlan, RequestView
 
 from ..capacity import Memory
-from ..serving_io import TokenTimeline
+from ..execution.serving_io import TokenTimeline
 from .batching import _PREEMPTED as _PREEMPTED
 from .batching import Scheduler
 from .batching import _live_ids as _live_ids

@@ -18,11 +18,11 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import replace
 
-from mindie_sim.prediction.cost import CostModel
+from mindie_sim.prediction.efficiency.cost import CostModel
 from mindie_sim.prediction.execution import Execution
 from mindie_sim.prediction.mechanism import OperatorPlan, PlannedRecipe, Work
 from mindie_sim.prediction.program import KernelProgram, RecipeBook, Stage
-from mindie_sim.prediction.services import ServiceCurve, service_identity
+from mindie_sim.prediction.service_regime_domains.services import ServiceCurve, service_identity
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.operators import IterationWork, OpSpec
 

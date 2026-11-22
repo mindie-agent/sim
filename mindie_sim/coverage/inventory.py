@@ -301,10 +301,9 @@ def inventory_coverage(summary, captures=None, *, ledger=None, records=None,
     a5_capture_count = None
     if capture_report is not None:
         tier_counts = capture_report.get("tier_capture_counts")
-        if isinstance(tier_counts, Mapping):
-            value = tier_counts.get("A5")
-            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
-                a5_capture_count = value
+        value = tier_counts.get("A5") if isinstance(tier_counts, Mapping) else None
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            a5_capture_count = value
     manifest_report = manifest_source = None
     if captures_manifest is not None:
         manifest_report, manifest_source = _read_object(
@@ -326,8 +325,7 @@ def inventory_coverage(summary, captures=None, *, ledger=None, records=None,
             "records_are_not_independent_captures": True,
             "tier_counts": summary.get("tier_counts"),
             "a5_scope_records": a5_records,
-            "outside_a5_scope_records": (total - a5_records
-                                         if a5_records is not None else None),
+            "outside_a5_scope_records": total - a5_records if a5_records is not None else None,
             "captures_total": captures_total,
             "capture_count_source": capture_count_source,
             "a5_capture_count": a5_capture_count,
@@ -335,31 +333,21 @@ def inventory_coverage(summary, captures=None, *, ledger=None, records=None,
             "legacy_a5_duplicate_extra_records": legacy_duplicate_extra,
             "legacy_a5_duplicate_groups": legacy_duplicate_groups,
             "a5_duplicate_identity_check": identity_counts.get("identity_check"),
-            "source_set_duplicate_groups": _int_field(
-                summary, "source_set_duplicate_groups"),
-            "source_set_duplicate_extra_records": _int_field(
-                summary, "source_set_duplicate_extra_records"),
-            "source_relations_total": _int_field(summary, "source_relations_total"),
-            "multi_source_records": _int_field(summary, "multi_source_records"),
-            "derived_records": _int_field(summary, "derived_records"),
+            **{key: _int_field(summary, key) for key in (
+                "source_set_duplicate_groups", "source_set_duplicate_extra_records",
+                "source_relations_total", "multi_source_records", "derived_records",
+            )},
             "a5_native_case_count": native_case_count,
             "a5_native_cohort_records": native_cohort_records,
-            "a5_records_with_native_evidence": _int_field(
-                summary, "a5_records_with_native_evidence"),
-            "a5_records_context_unobserved": _int_field(
-                summary, "a5_records_context_unobserved"),
-            "a5_records_runtime_state_not_restored": _int_field(
-                summary, "a5_records_runtime_state_not_restored"),
-            "a5_records_source_binding_ambiguous": _int_field(
-                summary, "a5_records_source_binding_ambiguous"),
+            **{key: _int_field(summary, key) for key in (
+                "a5_records_with_native_evidence", "a5_records_context_unobserved",
+                "a5_records_runtime_state_not_restored", "a5_records_source_binding_ambiguous",
+            )},
         },
         "unrecovered": {
-            "runtime_state_not_restored_records": _int_field(
-                summary, "a5_records_runtime_state_not_restored"),
-            "context_unobserved_records": _int_field(
-                summary, "a5_records_context_unobserved"),
-            "source_binding_ambiguous_records": _int_field(
-                summary, "a5_records_source_binding_ambiguous"),
+            **{f"{gap}_records": _int_field(summary, f"a5_records_{gap}") for gap in (
+                "runtime_state_not_restored", "context_unobserved", "source_binding_ambiguous",
+            )},
             "historical_absolute_15us_is_not_this_round": True,
         },
         "sources": {"inventory_summary": summary_source},
@@ -371,31 +359,19 @@ def inventory_coverage(summary, captures=None, *, ledger=None, records=None,
         result["capture_recovery"] = {
             "capture_count": captures_total,
             "capture_count_source": capture_count_source,
-            "tier_capture_counts": capture_report.get("tier_capture_counts"),
-            "disposition_counts": capture_report.get("disposition_counts"),
-            "schema_family_counts": capture_report.get("schema_family_counts"),
-            "sidecar_candidate_calls_total": capture_report.get(
-                "sidecar_candidate_calls_total"),
-            "full_scan_verified_calls_total": capture_report.get(
-                "full_scan_verified_calls_total"),
-            "lower_bound_calls_total": capture_report.get("lower_bound_calls_total"),
-            "upper_bound_calls_total": capture_report.get("upper_bound_calls_total"),
-            "captures_with_full_scan": capture_report.get("captures_with_full_scan"),
-            "captures_with_sidecar": capture_report.get("captures_with_sidecar"),
-            "captures_with_abi": capture_report.get("captures_with_abi"),
-            "captures_empty": capture_report.get("captures_empty"),
-            "native_archive": capture_report.get("native_archive"),
-            "recovery_depth_counts": capture_report.get("recovery_depth_counts"),
+            **{key: capture_report.get(key) for key in (
+                "tier_capture_counts", "disposition_counts", "schema_family_counts",
+                "sidecar_candidate_calls_total", "full_scan_verified_calls_total",
+                "lower_bound_calls_total", "upper_bound_calls_total",
+                "captures_with_full_scan", "captures_with_sidecar", "captures_with_abi",
+                "captures_empty", "native_archive", "recovery_depth_counts",
+            )},
             "gap_counts": capture_report.get("captures_gap_counts"),
-            "native_cohorts_validated": _int_field(
-                capture_report, "native_cohorts_validated"),
-            "native_windows_reproduced": _int_field(
-                capture_report, "native_windows_reproduced"),
-            "comparable_calls_lower_bound": capture_report.get(
-                "comparable_calls_lower_bound"),
-            "comparable_calls_upper_bound": capture_report.get(
-                "comparable_calls_upper_bound"),
-            "captures_step_values": capture_report.get("captures_step_values"),
+            "native_cohorts_validated": _int_field(capture_report, "native_cohorts_validated"),
+            "native_windows_reproduced": _int_field(capture_report, "native_windows_reproduced"),
+            **{key: capture_report.get(key) for key in (
+                "comparable_calls_lower_bound", "comparable_calls_upper_bound", "captures_step_values",
+            )},
         }
         result["sources"]["captures_summary"] = capture_source
     if manifest_report is not None:
@@ -431,13 +407,11 @@ def inventory_coverage(summary, captures=None, *, ledger=None, records=None,
         result["sources"]["a5_records"] = recovery["source"]
         flags = recovery["flags"]
         result["unrecovered"].update({
-            "runtime_state_not_restored_records": flags[
-                "per_step_runtime_state_restored"].get("false", 0),
-            "context_unobserved_records": flags[
-                "context_explicitly_unobserved"].get("true", 0),
-            "source_binding_ambiguous_records": flags[
-                "source_binding_ambiguous"].get("true", 0),
-            "full_per_call_10pct_validated_true_records": flags[
-                "full_per_call_10pct_validated"].get("true", 0),
+            key: flags[flag].get(value, 0) for key, flag, value in (
+                ("runtime_state_not_restored_records", "per_step_runtime_state_restored", "false"),
+                ("context_unobserved_records", "context_explicitly_unobserved", "true"),
+                ("source_binding_ambiguous_records", "source_binding_ambiguous", "true"),
+                ("full_per_call_10pct_validated_true_records", "full_per_call_10pct_validated", "true"),
+            )
         })
     return result

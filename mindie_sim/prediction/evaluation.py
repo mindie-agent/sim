@@ -318,7 +318,7 @@ class EvaluationContext:
     @classmethod
     def create(cls, case: CaseSpec, recipes: Any = None,
                primitives: Any = None, *, primitive_table: Any = None) -> "EvaluationContext":
-        from .cost import CostModel
+        from .efficiency.cost import CostModel
         from .program import RecipeBook
         book = recipes or RecipeBook.from_mapping(case.runtime.kernels)
         bindings = ExecutionBindings.create(case, book, primitive_table=primitive_table)

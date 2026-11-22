@@ -151,7 +151,7 @@ def test_l0_metrology_cold_ring_zero_trial_p07_p10_p15_p18_p20_regressions():
     from types import SimpleNamespace
     from mindie_sim import compose_case, parse_case
     from mindie_sim.prediction.collectives.topology import Topology
-    from mindie_sim.prediction.execution.step_helpers import _calibrated_stars_spec
+    from mindie_sim.prediction.execution.runner import _calibrated_stars_spec
     from tools._bench_l0_probes import _safe_rate, certify_cold_ring, collect_event_ms
 
     # #7: 16 KiB probe touching 3.25 MiB prefix on 192 MiB L2 is NOT cold unless evicted.
@@ -221,7 +221,7 @@ def test_dispatch_envelope_calibrated_floors_monotone_and_unmeasured_none():
     """Verify calibrated P12/P13/P15/P16 dispatch envelope monotonicity across generations."""
     from dataclasses import replace
     from mindie_sim.primitives import resolve_dispatch_envelope
-    from mindie_sim.prediction.execution.step_helpers import _calibrated_stars_spec
+    from mindie_sim.prediction.execution.runner import _calibrated_stars_spec
 
     by_arch: dict[str, list[tuple[float, float, float]]] = {}
     for sku in CALIBRATED_FLEET_SKUS:
@@ -352,7 +352,7 @@ def test_dcp_lse_merge_fused_and_eager_multi_op_lowering_across_cp():
     from mindie_sim import compose_case, parse_case
     from mindie_sim.prediction.evaluation import EvaluationContext
     from mindie_sim.prediction.graph_analysis import graph_costs
-    from mindie_sim.prediction.operators.context_parallel import (
+    from mindie_sim.prediction.sharding.context_parallel import (
         ATTENTION_UPDATE_MAX_EFFECTIVE_SP,
         DCP_LSE_MERGE_EAGER_RECIPE,
         DCP_LSE_MERGE_RECIPE,
@@ -424,7 +424,7 @@ def test_calibrated_hbm_rw_ratios_l2_bandwidth_and_cann_vector_submodes():
     from mindie_sim.prediction.evaluation import EvaluationContext
     from mindie_sim.prediction.execution.context import build_stage_profiles
     from mindie_sim.prediction.graph_analysis import graph_costs
-    from mindie_sim.prediction.operators.context_parallel import (
+    from mindie_sim.prediction.sharding.context_parallel import (
         DCP_LSE_MERGE_EAGER_RECIPE,
         expand_dcp_lse_eager_kernels,
     )

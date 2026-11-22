@@ -1,28 +1,309 @@
-"""Communication curve engine binding and diagnostic regime projection.
+"""Communication local-domain resolution, recipe synthesis and binding.
 
-[Role] Bind calibrated communication curves to engine service phases and emit
-  source-bearing diagnostic ``service_regimes`` rules while preserving measured
-  phase boundaries and physical byte coordinates.
-[Invariants] Physical link work is never deleted, shrunk, or clamped. Captured
-  per-rank payload knots convert to wire coordinates only through an explicit
-  per-collective factor, and only matching hardware identities may bind. A bound
-  measurement keeps its measured phase separate from the consumer role and is
-  never relabeled as a per-hop link price.
-[Timeouts & Locks] Pure in-memory binding; no timers, locks, or subprocesses.
-[Side-Effect Policy] Pure computation; never launches a device, writes
-  calibration, or mutates the primitive store.
-"""
+[Role] Bind normalized collective observations into calibrated transport recipes.
+[Invariants] Explicit provenance and positive physical rates.
+[Timeouts & Locks] Pure in-memory binding; no locks.
+[Side-Effect Policy] Read-only."""
 from __future__ import annotations
+
+from typing import Mapping
+
+from mindie_sim.schema.common import ModelingError
+from .schema import A5_ARCH_FAMILY, A5_HARDWARE_KEY, A5_SKU
+from .schema import (
+    NATIVE_WINDOW_ADMITTED_REPEATS,
+    NATIVE_WINDOW_WARMUP_CALLS,
+)
+
+_NATIVE_LOCAL_DIRECTION = {"all_gather": "read", "reduce_scatter": "send"}
+_NATIVE_LOCAL_COLLECTIVES = tuple(_NATIVE_LOCAL_DIRECTION)
+_NATIVE_LOCAL_COLLECTIVE_SET = frozenset(_NATIVE_LOCAL_COLLECTIVES)
+
+_APPLICABILITY_KEYS = (
+    ("platform", "family", "platform.family"),
+    ("platform", "variant", "platform.variant"),
+    ("platform", "sku", "platform.sku"),
+    ("platform", "key", "platform.key"),
+    ("platform", "arch_family", "platform.arch_family"),
+    ("topology", "kind", "topology.kind"),
+    ("topology", "scope", "topology.scope"),
+    ("topology", "group_size", "topology.group_size"),
+    ("topology", "host", "topology.host"),
+    ("topology", "nodes", "topology.nodes"),
+    ("topology", "nic", "topology.nic"),
+    ("software", "stack", "software.stack"),
+    ("software", "cann", "software.cann"),
+    ("software", "execution_core", "software.execution_core"),
+    ("software", "torch", "software.torch"),
+    ("software", "torch_npu", "software.torch_npu"),
+    ("software", "hccl_algorithm", "software.hccl_algorithm"),
+    ("software", "hccl_protocol", "software.hccl_protocol"),
+    ("transport_window", "kind", "transport_window.kind"),
+    ("transport_window", "phase", "transport_window.phase"),
+    ("transport_window", "warmup_calls", "transport_window.warmup_calls"),
+    ("transport_window", "admitted_repeats", "transport_window.admitted_repeats"),
+    ("transport_window", "concurrent_collectives",
+     "transport_window.concurrent_collectives"),
+    ("units", "work", "units.work"),
+    ("units", "duration", "units.duration"),
+    ("units", "rate", "units.rate"),
+    ("units", "rate_scope", "units.rate_scope"),
+    ("units", "active_units", "units.active_units"),
+    ("units", "dtype", "units.dtype"),
+    ("units", "service_work_unit", "units.service_work_unit"),
+    ("shared_domain", "id", "shared_domain.id"),
+    ("shared_domain", "kind", "shared_domain.kind"),
+    ("shared_domain", "scope", "shared_domain.scope"),
+    ("shared_domain", "members", "shared_domain.members"),
+    ("shared_domain", "host", "shared_domain.host"),
+    ("shared_domain", "inter_node", "shared_domain.inter_node"),
+    ("shared_domain", "nic", "shared_domain.nic"),
+)
+_APPLICABILITY_KEY_SET = frozenset(key for _, _, key in _APPLICABILITY_KEYS) | {
+    "direction", "hardware",
+}
+_LINEAGE_KEYS = (
+    ("source", "summary_sha256", "source.summary_sha256"),
+    ("source", "manifest_sha256", "source.manifest_sha256"),
+    ("source", "versions_sha256", "source.versions_sha256"),
+    ("source", "environment_image_id", "source.environment_image_id"),
+)
+_LINEAGE_KEY_SET = frozenset(key for _, _, key in _LINEAGE_KEYS)
+
+
+
+def _flatten_sections(mapping, paths):
+    flat = {}
+    for outer, inner, flat_key in paths:
+        section = mapping.get(outer)
+        if isinstance(section, Mapping) and inner in section:
+            flat[flat_key] = section[inner]
+    return flat
+
+
+def _applicability_sections(domain):
+    if "conditions" in domain and isinstance(domain["conditions"], Mapping):
+        return domain["conditions"]
+    if "applicability" in domain and isinstance(domain["applicability"], Mapping):
+        return domain["applicability"]
+    if any(isinstance(domain.get(outer), Mapping)
+           for outer, _, _ in _APPLICABILITY_KEYS):
+        return domain
+    return None
+
+
+def _complete_applicability_identity(flat):
+    """Add scalar hardware and reject a hardware/platform identity conflict."""
+    hardware = flat.get("hardware")
+    platform_key = flat.get("platform.key")
+    platform_sku = flat.get("platform.sku")
+    expected = platform_key or platform_sku
+    if hardware is not None and expected is not None and str(hardware) != str(expected):
+        raise ValueError("a5_local_service_hardware_identity_conflict")
+    return flat
+
+
+def a5_local_service_applicability_key(domain):
+    """Canonical target-applicability key; source lineage is separate."""
+    if not isinstance(domain, Mapping):
+        raise ValueError("a5_local_service_domain_requires_mapping")
+    if "applicability_key" in domain:
+        return _complete_applicability_identity(
+            {str(key): value for key, value in
+             dict(domain["applicability_key"]).items()})
+    conditions = _applicability_sections(domain)
+    if conditions is not None:
+        flat = _flatten_sections(conditions, _APPLICABILITY_KEYS)
+        if "hardware" in conditions:
+            flat["hardware"] = conditions["hardware"]
+        if "direction" in conditions:
+            flat["direction"] = conditions["direction"]
+        return _complete_applicability_identity(flat)
+    if not any(isinstance(value, Mapping) for value in domain.values()):
+        flat = {str(key): value for key, value in domain.items()
+                if key in _APPLICABILITY_KEY_SET}
+        return _complete_applicability_identity(flat)
+    return {}
+
+
+def a5_local_service_lineage_key(domain):
+    """Canonical calibration-source lineage, not target applicability."""
+    if not isinstance(domain, Mapping):
+        raise ValueError("a5_local_service_domain_requires_mapping")
+    if "lineage_key" in domain:
+        return {str(key): value for key, value in dict(domain["lineage_key"]).items()}
+    source = domain.get("source")
+    if isinstance(source, Mapping):
+        flat = _flatten_sections({"source": source}, _LINEAGE_KEYS)
+        if flat:
+            return flat
+        return {key: source.get(inner) for outer, inner, key in _LINEAGE_KEYS
+                if outer == "source" and inner in source}
+    if not any(isinstance(value, Mapping) for value in domain.values()):
+        return {str(key): value for key, value in domain.items()
+                if key in _LINEAGE_KEY_SET}
+    return {}
+
+
+def a5_local_service_domain_key(domain):
+    """Backward-compatible merged key; require() checks the two parts apart."""
+    return {**a5_local_service_applicability_key(domain),
+            **a5_local_service_lineage_key(domain)}
+
+
+def _declared_applicability(record):
+    if not isinstance(record, Mapping):
+        raise ValueError("a5_local_service_record_requires_mapping")
+    declared_app = dict(record.get("applicability_key") or {})
+    declared_lineage = dict(record.get("lineage_key") or {})
+    if not declared_app and not declared_lineage:
+        declared = dict(record.get("domain_key") or {})
+        declared_app = {key: value for key, value in declared.items()
+                        if key in _APPLICABILITY_KEY_SET}
+        declared_lineage = {key: value for key, value in declared.items()
+                            if key in _LINEAGE_KEY_SET}
+    if not declared_app and not declared_lineage:
+        raise ValueError("a5_local_service_record_requires_declared_domain")
+    return declared_app, declared_lineage
+
+
+def _presence_mismatches(declared, requested):
+    missing = sorted(key for key in declared if key not in requested)
+    changed = sorted(key for key in declared if key in requested
+                     and requested[key] != declared[key])
+    return missing, changed
+
+
+def require_a5_local_service_applicability(record, domain):
+    """Match the target environment only; calibration lineage is separate.
+
+    This is the local counterpart of T06 ``service_conditions_match``:
+    declared paths must be present and equal; extra requested paths and
+    source lineage are not applicability.
+    """
+    declared_app, _declared_lineage = _declared_applicability(record)
+    requested_app = a5_local_service_applicability_key(domain)
+    missing, changed = _presence_mismatches(declared_app, requested_app)
+    if missing or changed:
+        raise ModelingError(
+            "a5_local_service_domain_mismatch:applicability:"
+            + ",".join(missing + changed))
+    return declared_app
+
+
+def require_a5_local_service_domain(record, domain):
+    """Reject a reuse/supply respecification outside the measured domain.
+
+    Applicability (target environment) and lineage (calibration source) are
+    compared separately so a source hash cannot stand in for a changed runtime
+    condition, and a shared source cannot hide a changed torch/CANN/algorithm.
+    """
+    declared_app, declared_lineage = _declared_applicability(record)
+    require_a5_local_service_applicability(record, domain)
+    requested_lineage = a5_local_service_lineage_key(domain)
+    missing_lineage, changed_lineage = _presence_mismatches(
+        declared_lineage, requested_lineage)
+    if missing_lineage or changed_lineage:
+        raise ModelingError(
+            "a5_local_service_domain_mismatch:lineage:"
+            + ",".join(missing_lineage + changed_lineage))
+    return {**declared_app, **declared_lineage}
+
+
+def _native_local_domain(source_identity, *, group_size, stack, cann,
+                         direction, dtype):
+    software_versions = source_identity.get("python_packages") or {}
+    shared = {
+        "id": f"ub_mesh:{source_identity['host']}:W{int(group_size)}",
+        "kind": "ub_mesh", "scope": "intra_node",
+        "members": int(group_size), "host": source_identity["host"],
+        "inter_node": False, "nic": "na",
+    }
+    window = {
+        "kind": "native_single_target_call", "phase": "aicpu_child",
+        "warmup_calls": NATIVE_WINDOW_WARMUP_CALLS,
+        "admitted_repeats": NATIVE_WINDOW_ADMITTED_REPEATS,
+        "profiled_ranks": [0, int(group_size) - 1],
+        "clock_domain": "device", "concurrent_collectives": False,
+        "start": "unique hccl target-call marker/range",
+        "end": "target-call completion",
+    }
+    conditions = {
+        # ``hardware`` stays the T06/profile hardware key string; the
+        # structured identity lives under ``platform`` so conditions can be
+        # consumed by service_conditions_match without a key/type conflict.
+        "hardware": A5_HARDWARE_KEY,
+        "platform": {"family": A5_ARCH_FAMILY, "variant": "DT",
+                     "sku": A5_SKU, "key": A5_HARDWARE_KEY,
+                     "arch_family": A5_ARCH_FAMILY},
+        "topology": {"kind": "ub_mesh", "scope": "intra_node",
+                     "group_size": int(group_size),
+                     "host": source_identity["host"], "nodes": 1, "nic": "na"},
+        "software": {
+            "stack": str(stack), "cann": str(cann),
+            "execution_core": "aicpu",
+            "torch": software_versions.get("torch"),
+            "torch_npu": software_versions.get("torch_npu"),
+            "hccl_algorithm": source_identity.get("hccl_algorithm"),
+            "hccl_protocol": source_identity.get("hccl_protocol"),
+        },
+        "transport_window": window,
+        "units": {"work": "bytes_per_rank_input", "duration": "ms",
+                  "rate": "bytes_per_second", "rate_scope": "per_owner",
+                  "active_units": int(group_size), "dtype": dtype,
+                  "service_work_unit": "bytes"},
+        "direction": direction,
+        "shared_domain": shared,
+    }
+    measurement = {
+        "kind": "native_target_call", "phase": "aicpu_child",
+        "resource": "aicpu_child",
+        "work_coordinate": "per_rank_input_bytes", "duration_unit": "ms",
+        "source_kind": "native_ai_cpu_child",
+        "service_semantics": "aicpu_child_collective_phase",
+        "complete_collective_call": False, "complete_directed_call": False,
+        "link_transit_identified": False, "hop_scaling": "not_derived",
+        "algorithm_identified": False, "direction_observed": False,
+    }
+    domain = {
+        **conditions,
+        "source": source_identity,
+        "measurement_boundary": measurement,
+        "provenance": {
+            "direction_basis": "hccl_source_template_native_direction",
+            "direction_observed": False,
+            "algorithm_identified": False,
+            "shared_domain_basis": "declared_intrahost_ub_mesh_and_group_size",
+            "transport_window_basis": "native_target_call_manifest",
+        },
+    }
+    applicability_key = a5_local_service_applicability_key(conditions)
+    lineage_key = a5_local_service_lineage_key({"source": source_identity})
+    domain_key = {**applicability_key, **lineage_key}
+    return domain, domain_key, applicability_key, lineage_key
+
+
+def _local_service_evidence_gaps(collective, group_size):
+    return [
+        "link_transit_is_not_separated_from_the_aicpu_child_phase",
+        "per_hop_link_price_is_not_identified",
+        f"measured_only:{collective}:W{int(group_size)}:bf16:aicpu:intrahost:rack08:cann9.2.0",
+        "cross_node_aiv_and_other_skus_are_unmeasured",
+        "pr_variant_is_unmeasured",
+        "hccl_algorithm_and_protocol_are_not_exposed_by_the_python_abi",
+        "heldout_split_is_by_payload_not_by_environment",
+    ]
+
 
 from copy import deepcopy
 from dataclasses import replace
 from typing import Mapping
 
-from mindie_sim.prediction.services import ServiceCurve, service_identity
+from mindie_sim.prediction.service_regime_domains.services import ServiceCurve, service_identity
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.common import ModelingError
-from .golden import A5_HARDWARE_KEY
-from .normalization import (
+from .schema import A5_HARDWARE_KEY
+from .schema import (
     INTRA_NODE_MAX_RANKS,
     _collective,
     _dtype,
@@ -30,14 +311,14 @@ from .normalization import (
     _explicit_scope,
     _require_a5,
 )
-from .normalized import (
+from .schema import (
     NormalizedServiceStage,
     build_normalized_service_recipe,
     build_normalized_service_stage,
     normalized_service_duration_ms,
     service_curve_from_normalized,
 )
-from .streaming import (
+from .ingest import (
     _fold_timings,
     _iter_json_events,
     _read_stream_value,
@@ -45,19 +326,6 @@ from .streaming import (
     _weighted_median,
 )
 
-__all__ = [
-    "_A5CommPlan",
-    "_stream_json",
-    "_wire_factor",
-    "bind_service_curve",
-    "build_a5_comm_recipe",
-    "build_normalized_service_recipe",
-    "build_normalized_service_stage",
-    "normalized_service_duration_ms",
-    "NormalizedServiceStage",
-    "service_curve_from_normalized",
-    "to_service_regime",
-]
 
 _EXPANSION_MODES = frozenset({"aicpu", "aiv"})
 _BYTE_RESOURCES = frozenset({"link", "hbm", "mte1", "mte2", "mte3", "fixpipe"})
@@ -73,7 +341,7 @@ _COLLECTIVE_DIRECTIONS = {
 
 def __getattr__(name: str):
     if name in {"_A5CommPlan", "build_a5_comm_recipe"}:
-        from . import recipes as _recipes
+        import sys; _recipes = sys.modules[__name__]
         value = getattr(_recipes, name)
         globals()[name] = value
         return value
@@ -506,3 +774,243 @@ def _duration_for(curve, lookup_bytes):
     x1, t1 = curve.knots[-1]
     slope = max((t1 - t0) / (x1 - x0), (t1 - curve.startup_ms) / x1)
     return t1 + slope * (lookup_bytes - x1)
+
+
+from dataclasses import dataclass, field, replace
+from typing import Mapping
+
+from mindie_sim.prediction.mechanism import OperatorPlan, PlannedRecipe, Work
+from mindie_sim.prediction.program import KernelProgram, Stage
+from mindie_sim.schema.common import ModelingError
+from .schema import A5_HARDWARE_KEY
+from .schema import (
+    INTRA_NODE_MAX_RANKS,
+    _collective,
+    _dtype,
+    _explicit_pair,
+    _mode,
+)
+
+DEFAULT_ACTIVE_AIV_BLOCKS = 16
+_DTYPE_ELEMENT_BYTES = {
+    "int8": 1.0,
+    "fp8-e4m3": 1.0,
+    "fp32": 4.0,
+    "int32": 4.0,
+}
+_DEFAULT_ELEMENT_BYTES = 2.0
+
+
+
+@dataclass(frozen=True)
+class _A5CommPlan(OperatorPlan):
+    """A physical communication program with a measured completion floor.
+
+    ``metadata`` remains the ordinary engine selector record.  The measured
+    phase and consumer role are typed attributes so a consumer can require a
+    complete collective call without parsing free text or a filename.
+    """
+
+    minimum_ms: float = 0.0
+    measurement_boundary: Mapping = field(default_factory=dict)
+    consumer_role: str = ""
+    source_service_semantics: str = ""
+    complete_collective_call_response: bool = False
+    complete_directed_call_response: bool = False
+    direction_observed: bool = False
+    direction_basis: str = ""
+    algorithm_identified: bool = False
+    link_transit_identified: bool = False
+    hop_scaling: str = "not_derived"
+    diagnostic_only: bool = False
+    whole_call_floor: bool = False
+    production_eligible: bool = False
+
+    def lower(self, context):
+        if context.service_boundary != "device_kernel":
+            raise ModelingError("service_curve_boundary_mismatch")
+        return KernelProgram((
+            Stage("setup", latency=context.setup_ms),
+            Stage("body", after=("setup",),
+                  program=self.program(replace(context, setup_ms=0, minimum_ms=0))),
+        ), minimum_ms=max(context.minimum_ms, self.minimum_ms))
+
+
+def _a5_collective_program(context, *, hbm, mte2, mte3, vector, duration,
+                           op_mode, active_aiv_blocks):
+    _validate_hardware(
+        context.service_identity.get("hardware", {}), identity=True)
+    link_work = {res: val for res, val in context.work.items()
+                 if res not in context.resource_names.values()}
+    stages = [Stage("link", link_work) if link_work
+              else Stage("link", latency=duration)]
+    for res_name, amount in (("hbm", hbm), ("mte2", mte2), ("mte3", mte3)):
+        if amount > 0:
+            stages.append(Stage(
+                res_name, context.bind(Work(resources={res_name: amount}))))
+    if vector > 0:
+        place = {}
+        if op_mode == "aiv":
+            count = context.resource_units.get("vector", context.core_count)
+            units = tuple(range(min(max(1, int(active_aiv_blocks)), count)))
+            place = {context.resource_names["vector"]: units}
+        stages.append(Stage(
+            "vector", context.bind(Work(resources={"vector": vector})),
+            placement=place))
+    return KernelProgram(tuple(stages))
+
+
+def _recipe_from_bundle(bundle, collective=None, *, world_size=None,
+                        expansion_mode="unspecified",
+                        active_aiv_blocks=DEFAULT_ACTIVE_AIV_BLOCKS,
+                        allow_unspecified_fallback=False,
+                        require_complete_call=False, production=False,
+                        **lookup_kwargs):
+    if production:
+        raise ModelingError("measured_call_recipe_is_diagnostic_only")
+    mode = _mode(expansion_mode)
+    if mode not in _EXPANSION_MODES and mode != "unspecified":
+        raise ModelingError(f"a5_expansion_mode_unknown:{expansion_mode}")
+    spec = dict(lookup_kwargs)
+    coordinate = spec.pop("coordinate", "link")
+    if coordinate not in _BYTE_RESOURCES:
+        raise ModelingError(f"a5_comm_curve_requires_byte_resource:{coordinate}")
+    if spec.pop("boundary", None) not in (None, "device_kernel"):
+        raise ModelingError("service_curve_boundary_mismatch")
+    placement = spec.pop("placement_scope", None)
+    hardware_key = spec.pop("hardware_key", None)
+    sku = spec.pop("sku", None)
+    arch_family = spec.pop("arch_family", None)
+    _validate_hardware({"hardware_key": hardware_key, "sku": sku,
+                        "arch_family": arch_family})
+    hardware_key = hardware_key or sku
+
+    def build(op, geometry):
+        del geometry
+        meta = dict(op.metadata)
+        if meta.get("device_kernel_group"):
+            raise ModelingError("service_curve_boundary_mismatch")
+        _validate_hardware(meta)
+        op_mode = mode
+        if op_mode == "unspecified" and (
+            meta.get("expansion_mode") or meta.get("expansion_regime")
+        ):
+            op_mode = _mode(
+                meta.get("expansion_mode") or meta.get("expansion_regime"))
+            if op_mode not in _EXPANSION_MODES and op_mode != "unspecified":
+                raise ModelingError(f"a5_expansion_mode_unknown:{op_mode}")
+        name = _collective(
+            collective or meta.get("collective")
+            or meta.get("a5_collective") or op.family)
+        world = (world_size or meta.get("world_size")
+                 or meta.get("group_size") or meta.get("ranks")
+                 or INTRA_NODE_MAX_RANKS)
+        dtype = _dtype(
+            spec.get("dtype") or getattr(op, "dtype", None)
+            or meta.get("dtype") or "bf16")
+        pair = spec.get("pair") or _explicit_pair(meta.get("p2p_pair"))
+        scope = placement or _placement_for(None, op, name, world, pair)
+        software = {
+            k: spec[k] if k in spec else meta.get(k)
+            for k in ("stack", "cann", "algorithm", "protocol")
+        }
+        extra = {
+            k: v for k, v in spec.items()
+            if k not in {"dtype", "pair", "stack", "cann", "algorithm", "protocol"}
+        }
+        curve = bundle.lookup_curve(
+            name, world, placement_scope=scope, dtype=dtype,
+            expansion_mode=op_mode,
+            allow_unspecified_fallback=allow_unspecified_fallback, pair=pair,
+            hardware_key=hardware_key or A5_HARDWARE_KEY,
+            arch_family=arch_family, boundary="device_kernel",
+            **software, **extra)
+        if curve.boundary != "device_kernel":
+            raise ModelingError("service_curve_boundary_mismatch")
+        measurement = _measurement_boundary(curve, name)
+        _require_complete_call(measurement, require_complete_call)
+        curve_mode = (curve.identity.get("expansion_regime")
+                      or curve.identity.get("expansion_mode") or "unspecified")
+        metadata = {
+            "a5_collective": name, "world_size": int(world),
+            "placement_scope": scope, "dtype": dtype,
+            "requested_expansion_mode": op_mode,
+            "curve_expansion_mode": curve_mode,
+            "unspecified_fallback": bool(curve_mode != op_mode),
+            "model_id": curve.model_id,
+            **{k: software[k] if software[k] is not None else curve.identity.get(k)
+               for k in ("stack", "cann", "algorithm", "protocol")},
+        }
+        wire_factor = (
+            _wire_factor(name, world, curve) if coordinate == "link" else 1.0)
+        raw_amount = float(
+            getattr(op, coordinate + "_bytes", 0)
+            or getattr(op, "link_bytes", 0)
+            or getattr(op, "hbm_bytes", 0) or 1.0)
+        link_bytes = float(
+            getattr(op, "link_bytes", 0)
+            or (getattr(op, coordinate + "_bytes", 0)
+                if coordinate == "link" else 0) or 0.0)
+        lookup_bytes = raw_amount / wire_factor if coordinate == "link" else raw_amount
+        duration = float(_duration_for(curve, lookup_bytes) or 0.0)
+        hbm, mte2, mte3 = (
+            float(getattr(op, k, 0) or 0)
+            for k in ("hbm_bytes", "mte2_bytes", "mte3_bytes"))
+        elem_bytes = _DTYPE_ELEMENT_BYTES.get(dtype, _DEFAULT_ELEMENT_BYTES)
+        vector = (
+            (float(getattr(op, "vector_ops", 0) or 0)
+             or max(1.0, raw_amount / elem_bytes))
+            if op_mode == "aiv" else float(getattr(op, "vector_ops", 0) or 0))
+        if op_mode != "aiv":
+            hbm = max(1.0, hbm or raw_amount)
+        resources = {
+            "hbm": hbm,
+            **{k: v for k, v in (
+                ("vector", vector), ("link", link_bytes),
+                ("mte2", mte2), ("mte3", mte3)) if v > 0},
+        }
+        work = Work(resources=resources)
+
+        def program(context):
+            return _a5_collective_program(
+                context, hbm=hbm, mte2=mte2, mte3=mte3, vector=vector,
+                duration=duration, op_mode=op_mode, active_aiv_blocks=active_aiv_blocks)
+
+        return _A5CommPlan(
+            work, program, minimum_ms=duration, metadata=metadata,
+            measurement_boundary=measurement,
+            consumer_role=_consumer_role(measurement),
+            source_service_semantics=(
+                curve.provenance.get("service_semantics")
+                or measurement.get("service_semantics") or ""),
+            complete_collective_call_response=bool(
+                measurement.get("complete_collective_call")),
+            complete_directed_call_response=bool(
+                measurement.get("complete_directed_call")),
+            direction_observed=bool(measurement.get("direction_observed", False)),
+            direction_basis=str(curve.provenance.get("direction_basis") or ""),
+            algorithm_identified=bool(
+                measurement.get("algorithm_identified", False)),
+            link_transit_identified=bool(
+                measurement.get("link_transit_identified", False)),
+            hop_scaling=measurement.get("hop_scaling", "not_derived"),
+            diagnostic_only=True, whole_call_floor=True,
+            production_eligible=False)
+
+    return PlannedRecipe(build)
+
+
+def build_a5_comm_recipe(bundle_or_collective=None, collective=None,
+                         allow_unspecified_fallback=False,
+                         require_complete_call=False, production=False,
+                         **kwargs):
+    """Build a PlannedRecipe from the calibrated curve; bundle is optional."""
+    if hasattr(bundle_or_collective, "lookup_curve"):
+        bundle, name = bundle_or_collective, collective
+    else:
+        bundle, name = _fit_bundle(), (collective or bundle_or_collective)
+    return _recipe_from_bundle(
+        bundle, name,
+        allow_unspecified_fallback=allow_unspecified_fallback,
+        require_complete_call=require_complete_call,
+        production=production, **kwargs)

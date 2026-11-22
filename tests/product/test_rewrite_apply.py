@@ -17,7 +17,7 @@ import pytest
 from _support.axes import REPRESENTATIVE_SKUS
 from mindie_sim.compose import compose_case
 from mindie_sim.prediction.operators.grouped_moe.expected_grouped import ExpectedGroupedMatmul
-from mindie_sim.prediction.fusion_ports import declared_control_order, full_operand_ports
+from mindie_sim.prediction.fusion.ports import declared_control_order, full_operand_ports
 from mindie_sim.prediction.results import ReplayOptions, StepRequest
 from mindie_sim.prediction.runtime.tile_solver import LiveBufferSpec, TileCandidate, TileShape
 from mindie_sim.prediction.streams import bind_stream_owners

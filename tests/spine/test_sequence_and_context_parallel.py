@@ -30,9 +30,9 @@ from mindie_sim.catalog.ops import comm_op, vector_op
 from mindie_sim.compose import compose_case
 from mindie_sim.model_catalog import derive_expert_pruned, load_model
 from mindie_sim.prediction.operators.attention.attention_decode import StagedGQADecode
-from mindie_sim.prediction.balanced_routing import cohort_padded_tokens
+from mindie_sim.prediction.sharding.routing import cohort_padded_tokens
 from mindie_sim.prediction.body_defaults import effective_body_declaration
-from mindie_sim.prediction.cohort_traffic import bind_cohort_traffic
+from mindie_sim.prediction.execution.cohort_traffic import bind_cohort_traffic
 from mindie_sim.prediction.engine import Allocation, Engine, Resource
 from mindie_sim.prediction.operators.attention.fai_decode_mapping import host_partitions, partitions
 from mindie_sim.prediction.frontend import Frontend
@@ -41,10 +41,10 @@ from mindie_sim.prediction.operators.sparse_indexer.index_pool_native import IMP
 from mindie_sim.prediction.mechanism import Geometry
 from mindie_sim.prediction.operators.moe_routing.moe_init_mxfp8 import RECIPE as MXFP8_INIT_RECIPE
 from mindie_sim.prediction.operators.paged_mla.paged_mla import build as build_paged_mla
-from mindie_sim.prediction.peer_traffic import PeerTraffic
+from mindie_sim.prediction.collectives.peer_traffic import PeerTraffic
 from mindie_sim.prediction.program import KernelProgram, PipelinePhase, PipelineProgram, PipelineTemplateProgram, RecipeContext, Stage
-from mindie_sim.prediction.rank_ledger import rank_ledger_for
-from mindie_sim.prediction.sequence_parallel import DECLARATION, allgather, close_output, input_shard, reduce_scatter, select
+from mindie_sim.prediction.execution.rank_ledger import rank_ledger_for
+from mindie_sim.prediction.sharding.sequence_parallel import DECLARATION, allgather, close_output, input_shard, reduce_scatter, select
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.prediction.topology import Topology
 from mindie_sim.prediction.transforms import lower_implementations

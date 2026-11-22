@@ -21,9 +21,9 @@ import mindie_sim
 from mindie_sim import api as sdk_api, cli as cli_mod, predict
 from mindie_sim.__main__ import main as module_main
 from mindie_sim.backends.ascend import materialize
-from mindie_sim.cli_parser import resolve_route
+from mindie_sim.cli.parser import resolve_route
 from mindie_sim.compose import compose_case as compose_raw_case
-from mindie_sim.compose_runtime import capture_keys
+from mindie_sim.compose.runtime import capture_keys
 from mindie_sim.prediction.results import StepRequest
 from mindie_sim.compose import HARDWARE_ALIASES, apply_va_recommended, resolve_hardware_sku, va_recommended_config
 from mindie_sim.prediction.efficiency import analyze_network_efficiency, extract_hardware_peaks
@@ -38,7 +38,7 @@ from mindie_sim.schema.hardware import Hardware
 from mindie_sim.schema.operators import OpSpec
 from mindie_sim.prediction.api import run_cohort, simulate_service
 from mindie_sim.prediction.capacity import Memory
-from mindie_sim.prediction.cost import CostModel
+from mindie_sim.prediction.efficiency.cost import CostModel
 from mindie_sim.prediction.execution import Execution
 from mindie_sim.prediction.frontend import Frontend
 

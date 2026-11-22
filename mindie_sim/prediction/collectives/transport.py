@@ -500,17 +500,12 @@ class TransportPlan:
     def start(self, engine, name, ready_by_rank, *, release_events=None,
               owner="", start_ms=None):
         """Submit physical chunks with per-ready admission and Engine credits."""
-        from ..engine import Allocation
-
         required = self.ranks
         initial = _transport_ready(required, ready_by_rank)
         releases = {}
         for rank, value in (release_events or {}).items():
-            releases[int(rank)] = (tuple(value)
-                                   if isinstance(value, (tuple, list))
-                                   else (value,))
-        completions = [engine.future(f"{name}:flow{index}:complete")
-                       for index in range(len(self.flows))]
+            releases[int(rank)] = tuple(value) if isinstance(value, (tuple, list)) else (value,)
+        completions = [engine.future(f"{name}:flow{index}:complete") for index in range(len(self.flows))]
         stats = {
             "chunks": 0, "credit_waits": 0,
             "credit_wait_ms": defaultdict(float),
@@ -520,8 +515,8 @@ class TransportPlan:
             "resident_byte_us": defaultdict(float),
             "last_resident_change": {},
         }
-        started = (min((initial[rank].time or 0.0 for rank in required),
-                       default=0.0) if start_ms is None else float(start_ms))
+        started = (min((initial[rank].time or 0.0 for rank in required), default=0.0)
+                   if start_ms is None else float(start_ms))
         for path in self.flows:
             stats["last_resident_change"].setdefault(path.flow.destination, started)
         pools = {destination: self._ensure_receive_pool(engine, destination)
@@ -542,16 +537,14 @@ class TransportPlan:
             if capacity is None:
                 window.append(max(1, path.hop_count))
             else:
-                largest = min(
-                    float(self.chunk_bytes or path.flow.payload_bytes),
-                    float(path.flow.payload_bytes))
+                largest = min(float(self.chunk_bytes or path.flow.payload_bytes),
+                              float(path.flow.payload_bytes))
                 window.append(max(1, int(float(capacity) // largest + 1e-9)))
 
         def note_residency(destination, now):
             last = stats["last_resident_change"].get(destination, started)
             delta = max(0.0, float(now) - float(last))
-            stats["resident_byte_us"][destination] += (
-                delta * MS_PER_S * stats["resident"][destination])
+            stats["resident_byte_us"][destination] += delta * MS_PER_S * stats["resident"][destination]
             stats["last_resident_change"][destination] = now
             current = stats["resident"][destination]
             if current > stats["peak_resident"][destination]:
@@ -576,14 +569,12 @@ class TransportPlan:
             if not event.done:
                 engine.resolve(event)
 
-        def arrived(flow_index, destination, useful, prefix, allocation,
-                    received_event):
+        def arrived(flow_index, destination, useful, prefix, allocation, received_event):
             add_resident(destination, useful, engine.now)
             arrived_count[flow_index] += 1
             active[flow_index] -= 1
             stats["active_chunks"] -= 1
-            schedule_release(prefix, destination, useful, received_event,
-                             allocation)
+            schedule_release(prefix, destination, useful, received_event, allocation)
             pump(flow_index)
             if arrived_count[flow_index] == expected[flow_index]:
                 complete_flow(flow_index)
@@ -595,8 +586,7 @@ class TransportPlan:
             granted = engine.allocated.get(pool, 0.0)
             if granted > stats["peak_granted"][destination]:
                 stats["peak_granted"][destination] = granted
-            ready_at = max(source_event.time or 0.0,
-                           destination_event.time or 0.0)
+            ready_at = max(source_event.time or 0.0, destination_event.time or 0.0)
             wait = max(0.0, engine.now - ready_at)
             if wait > 1e-12:
                 stats["credit_waits"] += 1
@@ -615,100 +605,16 @@ class TransportPlan:
             after = [arrival]
             if cursor < len(events):
                 after.append(events[cursor])
-            callback = (
-                (lambda _event, d=destination, u=useful:
-                 remove_resident(d, u, engine.now)))
-            if allocation is not None:
-                engine.submit(
-                    prefix + ":release", after=tuple(after),
-                    free=(allocation,), owner=owner, on_complete=callback)
-            else:
-                engine.submit(
-                    prefix + ":release", after=tuple(after),
-                    owner=owner, on_complete=callback)
+            callback = lambda _event, d=destination, u=useful: remove_resident(d, u, engine.now)
+            release_credit = {"free": (allocation,)} if allocation is not None else {}
+            engine.submit(prefix + ":release", after=tuple(after), **release_credit,
+                          owner=owner, on_complete=callback)
 
         def issue_chunk(flow_index, chunk_index):
-            path = self.flows[flow_index]
-            chunk = path.chunks[chunk_index]
-            destination = path.flow.destination
-            useful = float(chunk.flow.useful_bytes)
-            prefix = f"{name}:flow{flow_index}:chunk{chunk_index}"
-            previous_services = service_events[flow_index].get(
-                chunk_index - 1) if chunk_index else None
-            dependencies = [initial[path.flow.source], initial[destination]]
-            if previous_services is not None:
-                dependencies.append(previous_services[0])
-            allocation = None
-            pool = pools.get(destination)
-            if pool is not None:
-                allocation = Allocation(
-                    prefix + ":credit", pool, useful, (0,))
-                grant = engine.submit(
-                    prefix + ":grant", after=tuple(dependencies),
-                    acquire=(allocation,), owner=owner,
-                    on_complete=lambda _event, d=destination,
-                    s=initial[path.flow.source], r=initial[destination]:
-                        track_grant(d, s, r))
-                dependencies = [grant]
-            else:
-                dependencies = [engine.submit(
-                    prefix + ":gate", after=tuple(dependencies), owner=owner)]
-            has_tx, has_rx = self._flow_ports(path)
-            previous = dependencies[0]
-            chunk_service = [None] * len(chunk.hops)
-            for hop_index, hop in enumerate(chunk.hops):
-                hop_dependencies = [previous]
-                if previous_services is not None:
-                    hop_dependencies.append(previous_services[hop_index])
-                startup = float(self.hop_startup_us)
-                if chunk_index == 0 and startup:
-                    if has_tx and hop_index == 0:
-                        gate = engine.submit(
-                            prefix + ":inject:startup",
-                            after=tuple(hop_dependencies),
-                            latency=startup / MS_PER_S, owner=owner,
-                            metadata={"startup_boundary": "source_injection_once"})
-                        hop_dependencies = [gate]
-                    gate = engine.submit(
-                        prefix + f":hop{hop_index}:startup",
-                        after=tuple(hop_dependencies),
-                        latency=startup / MS_PER_S, owner=owner,
-                        metadata={"startup_boundary": "per_hop_protocol_once"})
-                    hop_dependencies = [gate]
-                service = engine.submit(
-                    prefix + f":hop{hop_index}:service", hop.demand,
-                    after=tuple(hop_dependencies), owner=owner, coupled=True,
-                    on_complete=(
-                        (lambda _event, fi=flow_index: pump(fi))
-                        if hop_index == 0
-                        and chunk_index + 1 < expected[flow_index]
-                        else None))
-                arrival = engine.submit(
-                    prefix + f":hop{hop_index}:arrival", after=(service,),
-                    latency=hop.latency_ms, owner=owner)
-                chunk_service[hop_index] = service
-                previous = arrival
-            service_events[flow_index][chunk_index] = tuple(chunk_service)
-            if chunk_index >= 2:
-                service_events[flow_index].pop(chunk_index - 2, None)
-            if chunk_index == 0 and float(self.hop_startup_us) and has_rx:
-                previous = engine.submit(
-                    prefix + ":receive:startup", after=(previous,),
-                    latency=float(self.hop_startup_us) / MS_PER_S, owner=owner,
-                    metadata={"startup_boundary": "destination_receipt_once"})
-            engine.submit(
-                prefix + ":received", after=(previous,), owner=owner,
-                on_complete=lambda event, fi=flow_index, d=destination,
-                value=useful, p=prefix, a=allocation:
-                    arrived(fi, d, value, p, a, event))
-            active[flow_index] += 1
-            stats["active_chunks"] += 1
-            if stats["active_chunks"] > stats["peak_active_chunks"]:
-                stats["peak_active_chunks"] = stats["active_chunks"]
-            by_flow = stats["peak_active_by_flow"]
-            by_flow[flow_index] = max(by_flow.get(flow_index, 0),
-                                      active[flow_index])
-            stats["chunks"] += 1
+            self._issue_chunk(
+                engine, name, owner, flow_index, chunk_index, initial, pools,
+                service_events, expected, active, stats, track_grant, pump,
+                arrived)
 
         def pump(flow_index):
             if expected[flow_index] == 0:
@@ -724,11 +630,98 @@ class TransportPlan:
             if not path.chunks:
                 engine.submit(
                     f"{name}:flow{flow_index}:empty",
-                    after=(initial[path.flow.source],
-                           initial[path.flow.destination]),
+                    after=(initial[path.flow.source], initial[path.flow.destination]),
                     owner=owner,
                     on_complete=lambda _event, fi=flow_index: complete_flow(fi))
                 continue
             pump(flow_index)
 
         return TransportRun(self, completions, stats, started)
+
+    def _issue_chunk(
+        self, engine, name, owner, flow_index, chunk_index, initial, pools,
+        service_events, expected, active, stats, track_grant, pump, arrived,
+    ):
+        from ..engine import Allocation
+
+        path = self.flows[flow_index]
+        chunk = path.chunks[chunk_index]
+        destination = path.flow.destination
+        useful = float(chunk.flow.useful_bytes)
+        prefix = f"{name}:flow{flow_index}:chunk{chunk_index}"
+        previous_services = service_events[flow_index].get(
+            chunk_index - 1) if chunk_index else None
+        dependencies = [initial[path.flow.source], initial[destination]]
+        if previous_services is not None:
+            dependencies.append(previous_services[0])
+        allocation = None
+        pool = pools.get(destination)
+        if pool is not None:
+            allocation = Allocation(
+                prefix + ":credit", pool, useful, (0,))
+            grant = engine.submit(
+                prefix + ":grant", after=tuple(dependencies),
+                acquire=(allocation,), owner=owner,
+                on_complete=lambda _event, d=destination,
+                s=initial[path.flow.source], r=initial[destination]:
+                    track_grant(d, s, r))
+            dependencies = [grant]
+        else:
+            dependencies = [engine.submit(
+                prefix + ":gate", after=tuple(dependencies), owner=owner)]
+        has_tx, has_rx = self._flow_ports(path)
+        previous = dependencies[0]
+        chunk_service = [None] * len(chunk.hops)
+        for hop_index, hop in enumerate(chunk.hops):
+            hop_dependencies = [previous]
+            if previous_services is not None:
+                hop_dependencies.append(previous_services[hop_index])
+            startup = float(self.hop_startup_us)
+            if chunk_index == 0 and startup:
+                if has_tx and hop_index == 0:
+                    gate = engine.submit(
+                        prefix + ":inject:startup",
+                        after=tuple(hop_dependencies),
+                        latency=startup / MS_PER_S, owner=owner,
+                        metadata={"startup_boundary": "source_injection_once"})
+                    hop_dependencies = [gate]
+                gate = engine.submit(
+                    prefix + f":hop{hop_index}:startup",
+                    after=tuple(hop_dependencies),
+                    latency=startup / MS_PER_S, owner=owner,
+                    metadata={"startup_boundary": "per_hop_protocol_once"})
+                hop_dependencies = [gate]
+            service = engine.submit(
+                prefix + f":hop{hop_index}:service", hop.demand,
+                after=tuple(hop_dependencies), owner=owner, coupled=True,
+                on_complete=(
+                    (lambda _event, fi=flow_index: pump(fi))
+                    if hop_index == 0
+                    and chunk_index + 1 < expected[flow_index]
+                    else None))
+            arrival = engine.submit(
+                prefix + f":hop{hop_index}:arrival", after=(service,),
+                latency=hop.latency_ms, owner=owner)
+            chunk_service[hop_index] = service
+            previous = arrival
+        service_events[flow_index][chunk_index] = tuple(chunk_service)
+        if chunk_index >= 2:
+            service_events[flow_index].pop(chunk_index - 2, None)
+        if chunk_index == 0 and float(self.hop_startup_us) and has_rx:
+            previous = engine.submit(
+                prefix + ":receive:startup", after=(previous,),
+                latency=float(self.hop_startup_us) / MS_PER_S, owner=owner,
+                metadata={"startup_boundary": "destination_receipt_once"})
+        engine.submit(
+            prefix + ":received", after=(previous,), owner=owner,
+            on_complete=lambda event, fi=flow_index, d=destination,
+            value=useful, p=prefix, a=allocation:
+                arrived(fi, d, value, p, a, event))
+        active[flow_index] += 1
+        stats["active_chunks"] += 1
+        if stats["active_chunks"] > stats["peak_active_chunks"]:
+            stats["peak_active_chunks"] = stats["active_chunks"]
+        by_flow = stats["peak_active_by_flow"]
+        by_flow[flow_index] = max(by_flow.get(flow_index, 0),
+                                  active[flow_index])
+        stats["chunks"] += 1

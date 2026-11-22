@@ -97,19 +97,7 @@ def _declared_source_edges(value):
     return by_item
 
 
-def record_linkage(acceptance, *, dispositions, record_sources=None,
-                   source_registry=None, captures_index=None,
-                   captures_manifest=None, source_edges=None):
-    """Link T16 sample/window/request facts to actual T03 source edges.
-
-    A record may declare several sources and a source may be shared by direct
-    and derived records.  Only the source edge actually selected by the
-    comparison participates in capture/audit accounting; the complete source
-    set stays for inventory traceability.  This is identity linkage, not
-    per-call certification.
-    """
-    if not isinstance(acceptance, Mapping):
-        raise ValueError("record_linkage_requires_acceptance")
+def _read_disposition_records(dispositions):
     disposition_rows, disposition_source = _csv_records(
         dispositions, "record_dispositions",
         {"audit_id", "hardware_tier", "suite", "phase", "primary_raw_source",
@@ -159,7 +147,10 @@ def record_linkage(acceptance, *, dispositions, record_sources=None,
             "native_case_id": row.get("native_case_id") or None,
         }
 
-    sources = {"record_dispositions": disposition_source}
+    return records, disposition_source
+
+
+def _index_source_paths(records, record_sources, source_registry, sources):
     path_to_sources = {}
     for audit_id, record in records.items():
         for edge in record["source_edges"]:
@@ -214,6 +205,10 @@ def record_linkage(acceptance, *, dispositions, record_sources=None,
                 if path:
                     path_to_sources.setdefault(path, set()).add(source_id)
 
+    return path_to_sources
+
+
+def _index_captures(captures_index, captures_manifest, sources):
     capture_by_id, capture_by_path, path_to_captures = {}, {}, {}
     if captures_index is not None:
         rows, source = _csv_records(
@@ -244,45 +239,43 @@ def record_linkage(acceptance, *, dispositions, record_sources=None,
         manifest = {"capture_count": manifest_count, "source": manifest_source}
         sources["captures_manifest"] = manifest_source
 
-    source_records, source_captures = {}, {}
-    for audit_id, record in records.items():
-        for edge in record["source_edges"]:
-            source_records.setdefault(edge["source_id"], set()).add(audit_id)
-            source_captures.setdefault(edge["source_id"], set()).add(
-                edge["capture_id"])
+    return capture_by_id, capture_by_path, manifest
 
-    def resolve_reference(reference):
-        source_id = reference.get("source_id")
-        source_path = reference.get("source_path")
-        capture_id = reference.get("capture_id")
-        candidates = set()
-        if source_id:
-            candidates.add(source_id)
-        elif source_path:
-            candidates.update(path_to_sources.get(source_path, ()))
-            if not candidates and source_path in capture_by_path:
-                capture = capture_by_path[source_path]
-                candidates.update(
-                    sid for sid, captures in source_captures.items()
-                    if capture in captures)
-        else:
-            return [], "source_edge_unresolved"
-        if capture_id:
-            filtered = {sid for sid in candidates
-                        if capture_id in source_captures.get(sid, set())}
-            if not filtered:
-                return sorted(candidates), "declared_capture_conflicts_with_source"
-            candidates = filtered
-        if not candidates:
-            return [], "source_not_in_ledger"
-        if len(candidates) > 1:
-            capture_sets = {
-                tuple(sorted(source_captures.get(sid, ())))
-                for sid in candidates}
-            if len(capture_sets) != 1:
-                return sorted(candidates), "ambiguous_source_alias"
-        return sorted(candidates), None
 
+def _resolve_source_reference(reference, path_to_sources, capture_by_path, source_captures):
+    source_id = reference.get("source_id")
+    source_path = reference.get("source_path")
+    capture_id = reference.get("capture_id")
+    candidates = set()
+    if source_id:
+        candidates.add(source_id)
+    elif source_path:
+        candidates.update(path_to_sources.get(source_path, ()))
+        if not candidates and source_path in capture_by_path:
+            capture = capture_by_path[source_path]
+            candidates.update(
+                sid for sid, captures in source_captures.items()
+                if capture in captures)
+    else:
+        return [], "source_edge_unresolved"
+    if capture_id:
+        filtered = {sid for sid in candidates
+                    if capture_id in source_captures.get(sid, set())}
+        if not filtered:
+            return sorted(candidates), "declared_capture_conflicts_with_source"
+        candidates = filtered
+    if not candidates:
+        return [], "source_not_in_ledger"
+    if len(candidates) > 1:
+        capture_sets = {
+            tuple(sorted(source_captures.get(sid, ())))
+            for sid in candidates}
+        if len(capture_sets) != 1:
+            return sorted(candidates), "ambiguous_source_alias"
+    return sorted(candidates), None
+
+
+def _resolve_declared_edges(acceptance, source_edges):
     raw_declared = _declared_source_edges(source_edges)
     item_ids = {item.get("item_id") for item in acceptance.get("items", ())}
     observation_to_item, window_to_item = {}, {}
@@ -305,30 +298,41 @@ def record_linkage(acceptance, *, dispositions, record_sources=None,
             raise ValueError(f"source_edge_unknown_item_reference:{key}")
         declared_edges.setdefault(target, []).extend(edges)
 
-    def item_actual_edges(item):
-        item_id = item.get("item_id")
-        declared = declared_edges.get(item_id, ())
-        references = []
-        if declared:
-            references = list(declared)
-        else:
-            identity = acceptance.get("source_identity") or {}
-            source_path = _path_key(identity.get("path"))
-            if not source_path:
-                return [], ["no_source_identity"], False
-            references = [{"source_path": source_path}]
-        raw, errors, ambiguous = [], [], False
-        for reference in references:
-            source_ids, error = resolve_reference(reference)
-            if error == "ambiguous_source_alias":
-                ambiguous = True
-                errors.append(error)
-            elif error:
-                errors.append(error)
-            for source_id in source_ids:
-                raw.append((source_id, reference.get("capture_id")))
-        return raw, errors, ambiguous
+    return declared_edges
 
+
+def _item_actual_edges(
+    item, acceptance, declared_edges, path_to_sources, capture_by_path, source_captures,
+):
+    item_id = item.get("item_id")
+    declared = declared_edges.get(item_id, ())
+    references = []
+    if declared:
+        references = list(declared)
+    else:
+        identity = acceptance.get("source_identity") or {}
+        source_path = _path_key(identity.get("path"))
+        if not source_path:
+            return [], ["no_source_identity"], False
+        references = [{"source_path": source_path}]
+    raw, errors, ambiguous = [], [], False
+    for reference in references:
+        source_ids, error = _resolve_source_reference(
+            reference, path_to_sources, capture_by_path, source_captures)
+        if error == "ambiguous_source_alias":
+            ambiguous = True
+            errors.append(error)
+        elif error:
+            errors.append(error)
+        for source_id in source_ids:
+            raw.append((source_id, reference.get("capture_id")))
+    return raw, errors, ambiguous
+
+
+def _link_items(
+    acceptance, records, declared_edges, path_to_sources, capture_by_path,
+    source_records, source_captures,
+):
     items = []
     matched_audits, matched_captures, matched_source_sets = set(), set(), set()
     duplicate_records, derived_records, native_cases = set(), set(), set()
@@ -367,7 +371,8 @@ def record_linkage(acceptance, *, dispositions, record_sources=None,
             "status": "unmatched",
             "reason": None,
         }
-        actual, reasons, ambiguous = item_actual_edges(item)
+        actual, reasons, ambiguous = _item_actual_edges(
+            item, acceptance, declared_edges, path_to_sources, capture_by_path, source_captures)
         if ambiguous:
             row.update(status="ambiguous",
                        reason=",".join(sorted(set(reasons))) or "ambiguous_source_alias",
@@ -453,6 +458,42 @@ def record_linkage(acceptance, *, dispositions, record_sources=None,
             derived_records.update(row["derived_audit_ids"])
             native_cases.update(row["native_case_ids"])
         items.append(row)
+
+    return (items, matched_audits, matched_captures, matched_source_sets,
+            duplicate_records, derived_records, native_cases)
+
+
+def record_linkage(acceptance, *, dispositions, record_sources=None,
+                   source_registry=None, captures_index=None,
+                   captures_manifest=None, source_edges=None):
+    """Link T16 sample/window/request facts to actual T03 source edges.
+
+    A record may declare several sources and a source may be shared by direct
+    and derived records.  Only the source edge actually selected by the
+    comparison participates in capture/audit accounting; the complete source
+    set stays for inventory traceability.  This is identity linkage, not
+    per-call certification.
+    """
+    if not isinstance(acceptance, Mapping):
+        raise ValueError("record_linkage_requires_acceptance")
+    records, disposition_source = _read_disposition_records(dispositions)
+    sources = {"record_dispositions": disposition_source}
+    path_to_sources = _index_source_paths(records, record_sources, source_registry, sources)
+    capture_by_id, capture_by_path, manifest = _index_captures(
+        captures_index, captures_manifest, sources)
+
+    source_records, source_captures = {}, {}
+    for audit_id, record in records.items():
+        for edge in record["source_edges"]:
+            source_records.setdefault(edge["source_id"], set()).add(audit_id)
+            source_captures.setdefault(edge["source_id"], set()).add(
+                edge["capture_id"])
+
+    declared_edges = _resolve_declared_edges(acceptance, source_edges)
+    (items, matched_audits, matched_captures, matched_source_sets,
+     duplicate_records, derived_records, native_cases) = _link_items(
+        acceptance, records, declared_edges, path_to_sources, capture_by_path,
+        source_records, source_captures)
 
     paired = int((acceptance.get("counts") or {}).get("paired_items") or 0)
     counts = acceptance.get("counts") or {}

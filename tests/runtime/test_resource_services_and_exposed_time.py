@@ -33,10 +33,11 @@ from mindie_sim.catalog.types import QuantSpec
 from mindie_sim.compose import compose_case
 from mindie_sim.observations.service_fitting import fit_service_curve
 from mindie_sim.prediction.operators.attention.batch_prefix_attention import apply_attention_prefix_reads
-from mindie_sim.prediction.cost import CostModel
+from mindie_sim.prediction.efficiency.cost import CostModel
 from mindie_sim.prediction.engine import Allocation, Engine, Resource
-from mindie_sim.prediction import (
-    exposed_breakdown as eb, exposed_program as exposed, memory_traffic as traffic,
+from mindie_sim.prediction import memory_traffic as traffic
+from mindie_sim.prediction.efficiency import (
+    exposed_breakdown as eb, exposed_program as exposed,
     resource_attribution as attribution, roofline_graph as roof)
 from mindie_sim.prediction.execution import Execution
 from mindie_sim.prediction.operators.matrix.matrix import TiledMatmul
@@ -50,9 +51,9 @@ from mindie_sim.prediction.physical_recipe_base import Phase, _phase_amounts
 from mindie_sim.prediction.program import KernelProgram, RecipeBook, RecipeContext, Stage
 from mindie_sim.prediction.runtime import exposed_intervals as intervals
 from mindie_sim.prediction.runtime.exposed_observer import ExposedObserver
-from mindie_sim.prediction.services import ResourceService, ServiceCurve
+from mindie_sim.prediction.service_regime_domains.services import ResourceService, ServiceCurve
 from mindie_sim.prediction.structure import parse_case
-from mindie_sim.prediction.verification import verify_operator
+from mindie_sim.prediction.graph_analysis import verify_operator
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.hardware import Hardware
 from mindie_sim.schema.operators import IterationWork, OpSpec

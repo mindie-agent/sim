@@ -26,8 +26,8 @@ from mindie_sim.catalog.types import QuantSpec
 from mindie_sim.catalog.weights import cache_row_bytes_by_layer
 from mindie_sim.compose import compose_case
 from mindie_sim.observed_contracts import CONTRACT_FIELDS, FIELDS, NATIVE_CONTRACT_FAMILIES, NATIVE_FAMILIES, observed_contract
-from mindie_sim.observed_contracts.attention_contracts import observed_attention_contract
-from mindie_sim.observed_contracts.tensor_contracts import observed_contract_diagnostic
+from mindie_sim.observed_contracts.attention import observed_attention_contract
+from mindie_sim.observed_contracts.signatures import observed_contract_diagnostic
 from mindie_sim.prediction.capacity import Memory
 from mindie_sim.prediction.engine import Engine
 import mindie_sim.structure as structure
@@ -35,8 +35,8 @@ from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.operators import OpSpec
 from mindie_sim.structure import export_op_structure, export_structure, main
 from mindie_sim.structure_implementations import native_candidates, native_implementation
-from mindie_sim.structure_physical import node_physical
-from mindie_sim.structure_selection import select_structure_targets
+from mindie_sim.structure.physical import node_physical
+from mindie_sim.structure.physical import select_structure_targets
 from mindie_sim.structure_subgraphs import subgraph_contract
 from mindie_sim.subgraph_math import (ALGEBRAIC_WORK_UNAVAILABLE, BOUNDARY_LEDGER_UNAVAILABLE,
     SEMANTIC_FAMILIES, SubgraphMathSummary, attach_subgraph_math, boundary_bytes, build_subgraph_math_rollup,
@@ -46,8 +46,7 @@ pytestmark = pytest.mark.tier1
 
 FIXTURE = Path(__file__).resolve().parents[1] / "fixtures/observed_contracts/captured_descriptors.json"
 SIM_ROOT = Path(__file__).resolve().parents[2] / "mindie_sim"
-DECLARED_MODULES = ("structure_contracts.py", "structure_matrix_contracts.py",
-    "structure_native_contracts.py", "structure_subgraphs.py",)
+DECLARED_MODULES = ("structure_contracts.py", "structure/native.py", "structure_subgraphs.py",)
 
 RECOVERED_FAMILIES = frozenset({"attention_paged_active_qkv", "attention_paged_mla_qk_rope",
     "situ_mxquant_active", "dynamic_quant_v2_active", "causal_conv1d_active",})

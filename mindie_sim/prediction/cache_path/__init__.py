@@ -24,41 +24,41 @@ from dataclasses import replace as replace
 
 from mindie_sim.schema.common import ModelingError as ModelingError
 
-from ..cache_geometry import (
+from ..cache_path.geometry import (
     CacheAccessGeometry,
     TransactionSummary,
 )
-from ..cache_geometry import (
+from ..cache_path.geometry import (
     Span as Span,
 )
-from ..cache_geometry import (
+from ..cache_path.geometry import (
     byte_spans_of_line_spans as byte_spans_of_line_spans,
 )
-from ..cache_geometry import (
+from ..cache_path.geometry import (
     drop_last_spans as drop_last_spans,
 )
-from ..cache_geometry import (
+from ..cache_path.geometry import (
     full_line_spans as full_line_spans,
 )
-from ..cache_geometry import (
+from ..cache_path.geometry import (
     intersect_spans as intersect_spans,
 )
-from ..cache_geometry import (
+from ..cache_path.geometry import (
     lines_of_byte_spans as lines_of_byte_spans,
 )
-from ..cache_geometry import (
+from ..cache_path.geometry import (
     normalize_spans as normalize_spans,
 )
-from ..cache_geometry import (
+from ..cache_path.geometry import (
     range_count as range_count,
 )
-from ..cache_geometry import (
+from ..cache_path.geometry import (
     subtract_spans as subtract_spans,
 )
-from ..cache_geometry import (
+from ..cache_path.geometry import (
     take_first_spans as take_first_spans,
 )
-from ..cache_geometry import (
+from ..cache_path.geometry import (
     union_spans as union_spans,
 )
 from ..engine import Allocation as Allocation
@@ -66,7 +66,7 @@ from ..engine import Engine as Engine
 from ..engine import Event as Event
 from ..program import KernelProgram as KernelProgram
 from ..program import Stage as Stage
-from ..transfer import FiniteTransfer as FiniteTransfer
+from ..collectives.transfer import FiniteTransfer as FiniteTransfer
 from .contracts import (
     A5_LINE_BYTES,
     A5_TRANSFER_BYTES,

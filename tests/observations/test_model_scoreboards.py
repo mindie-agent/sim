@@ -16,7 +16,7 @@ from _support.captures import REPO_ROOT, fixture_json, fixture_path
 from _support.memory_cases import draft_case
 from mindie_sim.coverage import comparison_coverage, inventory_coverage, record_linkage
 from mindie_sim.observations.scoreboard import gap, model_scoreboard, prediction_from_probe, render_markdown
-from mindie_sim.observations.scoreboard_accuracy import (
+from mindie_sim.observations.scoreboard import (
     annotate_call, annotate_kimi_report, render_kimi_markdown, step_fields,
 )
 from tools.model_scoreboard_kimi import comparison_row, prediction_packet, predict_worker

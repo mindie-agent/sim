@@ -29,7 +29,7 @@ from mindie_sim.prediction.program import (
 )
 from mindie_sim.prediction.streams import StreamCoreBudget, StreamLane, StreamPlan, bind_stream_owners
 from mindie_sim.prediction.structure import parse_case
-from mindie_sim.prediction.verification import verify_operator
+from mindie_sim.prediction.graph_analysis import verify_operator
 from mindie_sim.public.errors import UnmodeledCapabilityError
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.workload import IterationPlan, RequestView

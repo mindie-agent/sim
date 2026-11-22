@@ -15,9 +15,9 @@ from types import SimpleNamespace
 import pytest
 
 from _support.axes import PHASES, REPRESENTATIVE_SKUS, SKUS
-from mindie_sim import api, feature_waterfall
+from mindie_sim import api, feature_mechanisms as feature_waterfall
 from mindie_sim.compose import compose_case
-from mindie_sim.feature_waterfall import compare_feature_tracks
+from mindie_sim.feature_mechanisms import compare_feature_tracks
 from mindie_sim.optimization.framework_solver import _TrialSearch
 from mindie_sim.optimization import (
     PrimitiveCapacityEntry, PrimitiveCapacityTable, TensorRangeObligation, build_dual_inputs_from_scenario,
@@ -31,7 +31,7 @@ from mindie_sim.prediction import efficiency
 from mindie_sim.prediction.efficiency import analysis, peaks, sla
 from mindie_sim.prediction.operators.vector import TiledPointwise
 from mindie_sim.prediction.results import OpOccurrence, OperatorSequenceRow, StepEvaluation, StepRequest
-from mindie_sim.prediction.roofline_graph import PhysicalWorkGraph, PhysicalWorkNode, RooflineTargets, critical_path_roofline
+from mindie_sim.prediction.efficiency.roofline_graph import PhysicalWorkGraph, PhysicalWorkNode, RooflineTargets, critical_path_roofline
 from mindie_sim.prediction.runtime.engine import Engine, Resource
 from mindie_sim.prediction.runtime.memory_physics import AddressRun
 from mindie_sim.prediction.spine import PredictionSpine

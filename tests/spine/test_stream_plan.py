@@ -23,7 +23,7 @@ from _support.axes import STREAM_CORE_CASES
 
 import mindie_sim.api as sdk_api
 import mindie_sim.prediction.body_defaults as body_defaults_mod
-from mindie_sim.prediction.cost import CostModel
+from mindie_sim.prediction.efficiency.cost import CostModel
 from mindie_sim.prediction.engine import Allocation, Engine, Resource
 from mindie_sim.prediction.evaluation import ExecutionBindings
 from mindie_sim.prediction.frontend import Frontend
@@ -488,7 +488,7 @@ def test_stream_pipeline_template_shared_quota_narrow_tile_and_pp_fifo():
 
 def test_stream_equal_budget_parallelism_nondividing_matrix_quota_and_validation():
     from mindie_sim.prediction.graph_analysis import graph_costs
-    from mindie_sim.prediction.operator_replay import operator_costs
+    from mindie_sim.prediction.execution.operator_replay import operator_costs
 
     build = build_accel()
     assert build["ok"] is True and build["backend"] == "c_native"

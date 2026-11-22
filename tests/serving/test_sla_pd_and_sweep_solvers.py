@@ -22,13 +22,14 @@ import pytest
 
 from _support.axes import DT_SKUS, PER_PORT_SKUS
 from _support.serving_cases import bind_pd_pool, case, linear_work, pd_case, pd_model_case
-from mindie_sim import graph_costs, predict, predict_pd, sweep as sweep_module, sweep_engine, target_graphs
+from mindie_sim import graph_costs, predict, predict_pd, sweep as sweep_module, target_graphs
+from mindie_sim.sweep import engine as sweep_engine
 from mindie_sim.__main__ import parser
 from mindie_sim.compose import compose_case
 from mindie_sim.prediction import efficiency as efficiency_module
 from mindie_sim.prediction.body_defaults import TargetGraphSet, consume_target_declaration
 from mindie_sim.prediction.capacity import Memory
-from mindie_sim.prediction.cost import CostModel
+from mindie_sim.prediction.efficiency.cost import CostModel
 from mindie_sim.prediction.efficiency import (_vram_max_sequences_per_dp, analyze_network_efficiency, analyze_operator_row, extract_hardware_peaks, fit_case_roofline_regimes, scale_case_hardware)
 from mindie_sim.prediction.evaluation import EvaluationContext
 from mindie_sim.prediction.execution import Execution
@@ -38,8 +39,8 @@ from mindie_sim.schema.hardware import Hardware
 from mindie_sim.schema.parallel import ParallelSpec
 from mindie_sim.schema.workload import IterationPlan, RequestView
 from mindie_sim.sweep import (compute_pareto_frontier, enumerate_parallel_candidates, reconstruct_sweep_summary, solve_hardware_sla_throughput, solve_sla_sizing, sweep_pd_disaggregation_ratios, sweep_topologies, sweep_topologies_iter)
-from mindie_sim.sweep_engine import SCREEN_BATCH, b1_screen, build_candidate_case, validate_candidate_statically
-from mindie_sim.sweep_resize import materialize_machine_for_devices
+from mindie_sim.sweep.engine import SCREEN_BATCH, b1_screen, build_candidate_case, validate_candidate_statically
+from mindie_sim.sweep.resize import materialize_machine_for_devices
 
 pytestmark = pytest.mark.tier0
 

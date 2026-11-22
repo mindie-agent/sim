@@ -141,13 +141,89 @@ def capacity_window(
         if b >= 2 and delayed_steps > 0 and output_eff > 0:
             staggered_delayed_b = max(1, math.ceil(b * delayed_steps / steps_per_wave))
             wave_delayed_b = retiring_waves * b
+    rows = _capacity_window_rank_rows(
+        scaled, ledger, phase, context, q_tokens, b, delayed_steps,
+        active_tokens, retiring_tokens, wave_tokens,
+        staggered_delayed_b, wave_delayed_b)
+    stages: list[dict[str, Any]] = []
+    for stage_index in range(int(scaled.runtime.parallel.pp)):
+        stage_rows = [row for row in rows if int(row["stage"]) == stage_index]
+        if not stage_rows:
+            continue
+        active = max(float(row["active_kv_bytes"]) for row in stage_rows)
+        retiring = max(float(row["retiring_kv_bytes"]) for row in stage_rows)
+        batch_wave = max(float(row["batch_wave_kv_bytes"]) for row in stage_rows)
+        wave_retiring = max(float(row["wave_retiring_kv_bytes"]) for row in stage_rows)
+        peak = max(float(row["peak_kv_bytes"]) for row in stage_rows)
+        supply = min(float(row["supply_bytes"]) for row in stage_rows)
+        headroom = min(float(row["headroom_bytes"]) for row in stage_rows)
+        stages.append({
+            "stage": stage_index,
+            "supply_bytes": round(supply, HBM_BYTES_PRECISION_DIGITS),
+            "capacity_bytes": round(max(float(row["capacity_bytes"]) for row in stage_rows), HBM_BYTES_PRECISION_DIGITS),
+            "fixed_bytes": round(max(float(row["fixed_bytes"]) for row in stage_rows), HBM_BYTES_PRECISION_DIGITS),
+            "external_held_bytes": round(max(float(row["external_held_bytes"]) for row in stage_rows), HBM_BYTES_PRECISION_DIGITS),
+            "workspace_bytes": round(max(float(row["workspace_bytes"]) for row in stage_rows), HBM_BYTES_PRECISION_DIGITS),
+            "active_kv_bytes": round(active, HBM_BYTES_PRECISION_DIGITS),
+            "retiring_kv_bytes": round(retiring, HBM_BYTES_PRECISION_DIGITS),
+            "batch_wave_kv_bytes": round(batch_wave, HBM_BYTES_PRECISION_DIGITS),
+            "wave_retiring_kv_bytes": round(wave_retiring, HBM_BYTES_PRECISION_DIGITS),
+            "peak_bytes": round(peak, HBM_BYTES_PRECISION_DIGITS),
+            "used_bytes": round(max(float(row["used_bytes"]) for row in stage_rows), HBM_BYTES_PRECISION_DIGITS),
+            "headroom_bytes": round(headroom, HBM_BYTES_PRECISION_DIGITS),
+            "active_headroom_bytes": round(min(float(row["active_headroom_bytes"]) for row in stage_rows), HBM_BYTES_PRECISION_DIGITS),
+            "hbm_bytes_per_die": round(min(float(row["hbm_bytes_per_die"]) for row in stage_rows), HBM_BYTES_PRECISION_DIGITS),
+            "hbm_utilization_ratio": round(max(float(row["hbm_utilization_ratio"]) for row in stage_rows), HBM_UTILIZATION_PRECISION_DIGITS),
+        })
+    fits = bool(rows) and all(float(row["peak_kv_bytes"]) <=
+                              float(row["supply_bytes"]) + max(1e-9, abs(float(row["supply_bytes"])) * 1e-12)
+                              for row in rows)
+    return {
+        "schema": "mindie-sim.capacity-window/1",
+        "phase": phase, "context_tokens": int(context),
+        "query_tokens_per_sequence": q_tokens, "emitted_tokens_per_sequence": emit_tokens,
+        "output_budget": int(output_budget), "sequences": b,
+        "async_scheduling": bool(scaled.runtime.async_scheduling),
+        "hbm_capacity_scale": float(hbm_capacity_scale),
+        "window": {
+            "active_tokens_per_sequence": int(active_tokens),
+            "retiring_tokens_per_sequence": int(retiring_tokens),
+            "wave_tokens_per_sequence": int(wave_tokens),
+            "lookahead_tokens": int(lookahead_tokens),
+            "delayed_release_steps": int(delayed_steps),
+            "steps_per_wave": int(steps_per_wave),
+            "retiring_waves": int(retiring_waves),
+            "staggered_delayed_sequences": int(staggered_delayed_b),
+            "wave_delayed_sequences": int(wave_delayed_b),
+        },
+        "supply_bytes": round(min((float(row["supply_bytes"]) for row in rows), default=0.0), HBM_BYTES_PRECISION_DIGITS),
+        "fixed_bytes": round(max((float(row["fixed_bytes"]) for row in rows), default=0.0), HBM_BYTES_PRECISION_DIGITS),
+        "external_held_bytes": round(max((float(row["external_held_bytes"]) for row in rows), default=0.0), HBM_BYTES_PRECISION_DIGITS),
+        "workspace_bytes": round(max((float(row["workspace_bytes"]) for row in rows), default=0.0), HBM_BYTES_PRECISION_DIGITS),
+        "weight_bytes_per_die": round(max((
+            float(row["fixed_allocations"].get("weights", 0.0)) for row in rows), default=0.0), HBM_BYTES_PRECISION_DIGITS),
+        "active_kv_bytes": round(max((float(row["active_kv_bytes"]) for row in rows), default=0.0), HBM_BYTES_PRECISION_DIGITS),
+        "retiring_kv_bytes": round(max((float(row["retiring_kv_bytes"]) for row in rows), default=0.0), HBM_BYTES_PRECISION_DIGITS),
+        "batch_wave_kv_bytes": round(max((float(row["batch_wave_kv_bytes"]) for row in rows), default=0.0), HBM_BYTES_PRECISION_DIGITS),
+        "wave_retiring_kv_bytes": round(max((float(row["wave_retiring_kv_bytes"]) for row in rows), default=0.0), HBM_BYTES_PRECISION_DIGITS),
+        "peak_bytes": round(max((float(row["peak_kv_bytes"]) for row in rows), default=0.0), HBM_BYTES_PRECISION_DIGITS),
+        "headroom_bytes": round(min((float(row["headroom_bytes"]) for row in rows), default=0.0), HBM_BYTES_PRECISION_DIGITS),
+        "active_headroom_bytes": round(min((float(row["active_headroom_bytes"]) for row in rows), default=0.0), HBM_BYTES_PRECISION_DIGITS),
+        "stages": stages, "stage_rank": rows, "fits": fits,
+    }
+
+
+def _capacity_window_rank_rows(
+    scaled, ledger, phase, context, q_tokens, b, delayed_steps,
+    active_tokens, retiring_tokens, wave_tokens, staggered_delayed_b, wave_delayed_b,
+):
     shared_prefix = getattr(
         scaled.runtime, "prefix_cache_mode", "private") == "shared"
     prefix_tokens = (
         int(scaled.workload.requests[0].prefix_tokens)
         if shared_prefix and scaled.workload.requests else 0)
     if shared_prefix:
-        from ..capacity_features import batch_cache_bytes
+        from ..capacity.features import batch_cache_bytes
 
         def batch_stage_bytes(sequences: int, tokens: int) -> list[float]:
             if sequences <= 0:
@@ -216,72 +292,7 @@ def capacity_window(
             "hbm_utilization_ratio": round(max(0.0, min(1.0, (
                 used) / max(float(row["hbm_bytes_per_die"]), 1e-12))), HBM_UTILIZATION_PRECISION_DIGITS),
         })
-    stages: list[dict[str, Any]] = []
-    for stage_index in range(int(scaled.runtime.parallel.pp)):
-        stage_rows = [row for row in rows if int(row["stage"]) == stage_index]
-        if not stage_rows:
-            continue
-        active = max(float(row["active_kv_bytes"]) for row in stage_rows)
-        retiring = max(float(row["retiring_kv_bytes"]) for row in stage_rows)
-        batch_wave = max(float(row["batch_wave_kv_bytes"]) for row in stage_rows)
-        wave_retiring = max(float(row["wave_retiring_kv_bytes"]) for row in stage_rows)
-        peak = max(float(row["peak_kv_bytes"]) for row in stage_rows)
-        supply = min(float(row["supply_bytes"]) for row in stage_rows)
-        headroom = min(float(row["headroom_bytes"]) for row in stage_rows)
-        stages.append({
-            "stage": stage_index,
-            "supply_bytes": round(supply, HBM_BYTES_PRECISION_DIGITS),
-            "capacity_bytes": round(max(float(row["capacity_bytes"]) for row in stage_rows), HBM_BYTES_PRECISION_DIGITS),
-            "fixed_bytes": round(max(float(row["fixed_bytes"]) for row in stage_rows), HBM_BYTES_PRECISION_DIGITS),
-            "external_held_bytes": round(max(float(row["external_held_bytes"]) for row in stage_rows), HBM_BYTES_PRECISION_DIGITS),
-            "workspace_bytes": round(max(float(row["workspace_bytes"]) for row in stage_rows), HBM_BYTES_PRECISION_DIGITS),
-            "active_kv_bytes": round(active, HBM_BYTES_PRECISION_DIGITS),
-            "retiring_kv_bytes": round(retiring, HBM_BYTES_PRECISION_DIGITS),
-            "batch_wave_kv_bytes": round(batch_wave, HBM_BYTES_PRECISION_DIGITS),
-            "wave_retiring_kv_bytes": round(wave_retiring, HBM_BYTES_PRECISION_DIGITS),
-            "peak_bytes": round(peak, HBM_BYTES_PRECISION_DIGITS),
-            "used_bytes": round(max(float(row["used_bytes"]) for row in stage_rows), HBM_BYTES_PRECISION_DIGITS),
-            "headroom_bytes": round(headroom, HBM_BYTES_PRECISION_DIGITS),
-            "active_headroom_bytes": round(min(float(row["active_headroom_bytes"]) for row in stage_rows), HBM_BYTES_PRECISION_DIGITS),
-            "hbm_bytes_per_die": round(min(float(row["hbm_bytes_per_die"]) for row in stage_rows), HBM_BYTES_PRECISION_DIGITS),
-            "hbm_utilization_ratio": round(max(float(row["hbm_utilization_ratio"]) for row in stage_rows), HBM_UTILIZATION_PRECISION_DIGITS),
-        })
-    fits = bool(rows) and all(float(row["peak_kv_bytes"]) <=
-                              float(row["supply_bytes"]) + max(1e-9, abs(float(row["supply_bytes"])) * 1e-12)
-                              for row in rows)
-    return {
-        "schema": "mindie-sim.capacity-window/1",
-        "phase": phase, "context_tokens": int(context),
-        "query_tokens_per_sequence": q_tokens, "emitted_tokens_per_sequence": emit_tokens,
-        "output_budget": int(output_budget), "sequences": b,
-        "async_scheduling": bool(scaled.runtime.async_scheduling),
-        "hbm_capacity_scale": float(hbm_capacity_scale),
-        "window": {
-            "active_tokens_per_sequence": int(active_tokens),
-            "retiring_tokens_per_sequence": int(retiring_tokens),
-            "wave_tokens_per_sequence": int(wave_tokens),
-            "lookahead_tokens": int(lookahead_tokens),
-            "delayed_release_steps": int(delayed_steps),
-            "steps_per_wave": int(steps_per_wave),
-            "retiring_waves": int(retiring_waves),
-            "staggered_delayed_sequences": int(staggered_delayed_b),
-            "wave_delayed_sequences": int(wave_delayed_b),
-        },
-        "supply_bytes": round(min((float(row["supply_bytes"]) for row in rows), default=0.0), HBM_BYTES_PRECISION_DIGITS),
-        "fixed_bytes": round(max((float(row["fixed_bytes"]) for row in rows), default=0.0), HBM_BYTES_PRECISION_DIGITS),
-        "external_held_bytes": round(max((float(row["external_held_bytes"]) for row in rows), default=0.0), HBM_BYTES_PRECISION_DIGITS),
-        "workspace_bytes": round(max((float(row["workspace_bytes"]) for row in rows), default=0.0), HBM_BYTES_PRECISION_DIGITS),
-        "weight_bytes_per_die": round(max((
-            float(row["fixed_allocations"].get("weights", 0.0)) for row in rows), default=0.0), HBM_BYTES_PRECISION_DIGITS),
-        "active_kv_bytes": round(max((float(row["active_kv_bytes"]) for row in rows), default=0.0), HBM_BYTES_PRECISION_DIGITS),
-        "retiring_kv_bytes": round(max((float(row["retiring_kv_bytes"]) for row in rows), default=0.0), HBM_BYTES_PRECISION_DIGITS),
-        "batch_wave_kv_bytes": round(max((float(row["batch_wave_kv_bytes"]) for row in rows), default=0.0), HBM_BYTES_PRECISION_DIGITS),
-        "wave_retiring_kv_bytes": round(max((float(row["wave_retiring_kv_bytes"]) for row in rows), default=0.0), HBM_BYTES_PRECISION_DIGITS),
-        "peak_bytes": round(max((float(row["peak_kv_bytes"]) for row in rows), default=0.0), HBM_BYTES_PRECISION_DIGITS),
-        "headroom_bytes": round(min((float(row["headroom_bytes"]) for row in rows), default=0.0), HBM_BYTES_PRECISION_DIGITS),
-        "active_headroom_bytes": round(min((float(row["active_headroom_bytes"]) for row in rows), default=0.0), HBM_BYTES_PRECISION_DIGITS),
-        "stages": stages, "stage_rank": rows, "fits": fits,
-    }
+    return rows
 
 
 def _vram_max_sequences_per_dp(

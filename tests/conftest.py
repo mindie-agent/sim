@@ -55,7 +55,7 @@ for _entry in (ROOT, TESTS):
 
 from _support.tempdirs import cleanup as cleanup_tempdirs  # noqa: E402
 from _support.tempdirs import tempdir  # noqa: E402
-from mindie_sim.observations.kernels import PROFILER_API_REQUIREMENT  # noqa: E402
+from mindie_sim.observations.captures import PROFILER_API_REQUIREMENT  # noqa: E402
 from mindie_sim.prediction.runtime import accel_build  # noqa: E402
 
 

@@ -21,7 +21,7 @@ from mindie_sim.catalog.cache import index_row_bytes
 from mindie_sim.model_catalog import load_model
 from mindie_sim.prediction.operators.sparse_indexer import family_quant_indexer as quant_indexer
 from mindie_sim.prediction.operators.sparse_indexer import sparse_indexer_pipeline
-from mindie_sim.prediction.cost import CostModel
+from mindie_sim.prediction.efficiency.cost import CostModel
 from mindie_sim.prediction.execution import Execution
 from mindie_sim.prediction.operators.mla.generic_latent_attention import (
     index_key_window, semantic_index_selection, unique_index_key_rows,
@@ -32,7 +32,7 @@ from mindie_sim.prediction.mechanism import Geometry
 from mindie_sim.prediction.operators import sparse_indexer
 from mindie_sim.prediction.program import RecipeBook, RecipeContext
 from mindie_sim.prediction.structure import parse_case
-from mindie_sim.prediction.verification import verify_operator
+from mindie_sim.prediction.graph_analysis import verify_operator
 from mindie_sim.public.errors import UnmodeledCapabilityError
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.compute_arch import NativeComputeMode
