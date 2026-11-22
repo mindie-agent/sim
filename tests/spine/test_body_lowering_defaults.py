@@ -533,7 +533,7 @@ def test_default_keeps_tier4_router_owner_grid_and_grouped_mapping_domain():
     assert router["operator"]["local_shape"] == [1, 256, 6144]
     # moe_router_dtype=float32 runs on AscendGateLinear Tier 4: BF16 Cube operands accumulate into FP32, so the matrix dtype is BF16.
     assert router["operator"]["dtype"] == "bf16"
-    assert (mapping["selected"]["tile_m"], mapping["selected"]["tile_n"], mapping["selected"]["tile_k"]) == (128, 128, 128)
+    assert (mapping["selected"]["tile_m"], mapping["selected"]["tile_n"], mapping["selected"]["tile_k"]) == (16, 128, 128)
     assert mapping["default_128_grid_tiles"] == 2 and router["peak_buffers"]["l0b@r0:s0"] <= 65536
     explicit = deepcopy(raw); explicit["runtime"]["kernels"] = {"programs": {"matmul": {"kind": "steady_matmul"}}}
     for i, op in enumerate(graph):

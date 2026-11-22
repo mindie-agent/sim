@@ -19,11 +19,11 @@
     "zero_empirical_fitting": true,
     "zero_filtering": true
   },
-  "bundle_sha256": "f4cd543ea8e7786b655d86f6f4a7f32d126204b0ff7bcf92f5ee9e8dd09cae97",
+  "bundle_sha256": "511ceed3d6e5ce404dc30022ef19f9aaf655ee9acd36bea834e508218b017e0d",
   "campaign": "all-skus-512-400k-cliff-heldout-20261121",
   "capture_quality_summary": {
-    "clean_l1_cliff_pass": 1200,
-    "clean_pass": 1056,
+    "clean_l1_cliff_pass": 1167,
+    "clean_pass": 1004,
     "clean_scored": 1532,
     "flagged_rows": 125,
     "flags": {
@@ -116,12 +116,12 @@
   },
   "overall_counts": {
     "blocked": 111,
-    "fail": 593,
+    "fail": 645,
     "inv_obs": 0,
     "inv_sim": 0,
-    "l1_cliff_fail": 449,
-    "l1_cliff_pass": 1208,
-    "pass": 1064,
+    "l1_cliff_fail": 482,
+    "l1_cliff_pass": 1175,
+    "pass": 1012,
     "total": 1768,
     "worker_diagnostics": 12
   },
@@ -295,8 +295,8 @@
       ],
       "cann_version": "9.2.1",
       "capture_quality_summary": {
-        "clean_l1_cliff_pass": 302,
-        "clean_pass": 270,
+        "clean_l1_cliff_pass": 299,
+        "clean_pass": 266,
         "clean_scored": 376,
         "flagged_rows": 17,
         "flags": {
@@ -731,7 +731,7 @@
           "lstar_us": 3.969,
           "meas_p99_us": 20.2602,
           "meas_us": 20.0425,
-          "pred_us": 20.382302579373306,
+          "pred_us": 20.382302579373302,
           "split": "gate2",
           "status": "pass"
         },
@@ -749,7 +749,7 @@
           "lstar_us": 41.96,
           "meas_p99_us": 75.456,
           "meas_us": 60.21,
-          "pred_us": 55.67491300607766,
+          "pred_us": 55.67491300607767,
           "split": "gate2",
           "status": "pass"
         },
@@ -767,7 +767,7 @@
           "lstar_us": 3.97,
           "meas_p99_us": 20.0362,
           "meas_us": 19.8825,
-          "pred_us": 20.421153858056652,
+          "pred_us": 20.42115385805665,
           "split": "gate2",
           "status": "pass"
         },
@@ -785,7 +785,7 @@
           "lstar_us": 41.981,
           "meas_p99_us": 75.677,
           "meas_us": 60.29,
-          "pred_us": 55.72661410330527,
+          "pred_us": 55.72661410330526,
           "split": "gate2",
           "status": "pass"
         },
@@ -803,7 +803,7 @@
           "lstar_us": 3.972,
           "meas_p99_us": 20.1268,
           "meas_us": 19.945,
-          "pred_us": 20.498856415423358,
+          "pred_us": 20.49885641542335,
           "split": "gate2",
           "status": "pass"
         },
@@ -839,7 +839,7 @@
           "lstar_us": 3.976,
           "meas_p99_us": 20.1818,
           "meas_us": 20.015,
-          "pred_us": 20.654261530156763,
+          "pred_us": 20.65426153015677,
           "split": "gate2",
           "status": "pass"
         },
@@ -875,7 +875,7 @@
           "lstar_us": 3.984,
           "meas_p99_us": 20.51,
           "meas_us": 20.3175,
-          "pred_us": 20.965071759623587,
+          "pred_us": 20.965071759623584,
           "split": "gate2",
           "status": "pass"
         },
@@ -911,7 +911,7 @@
           "lstar_us": 3.999,
           "meas_p99_us": 21.3485,
           "meas_us": 21.095,
-          "pred_us": 21.62560068181523,
+          "pred_us": 21.625600681815225,
           "split": "gate2",
           "status": "pass"
         },
@@ -947,7 +947,7 @@
           "lstar_us": 5.954,
           "meas_p99_us": 22.359,
           "meas_us": 22.03,
-          "pred_us": 22.286129604006874,
+          "pred_us": 22.286129604006877,
           "split": "gate2",
           "status": "pass"
         },
@@ -1019,7 +1019,7 @@
           "lstar_us": 11.912,
           "meas_p99_us": 23.4,
           "meas_us": 23.04,
-          "pred_us": 24.28783381679655,
+          "pred_us": 24.287833816796546,
           "split": "gate2",
           "status": "pass"
         },
@@ -1061,7 +1061,7 @@
         },
         {
           "acquisition_uid": "g14-ascend910b4-20261121T184700Z",
-          "ape_pct": 16.0466,
+          "ape_pct": 74.502,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend910B4/gates14/4acb5c575082c9c7",
           "case_id": "g2_gemm_M192_N4096_K4096_cold",
@@ -1073,13 +1073,13 @@
           "lstar_us": 43.906,
           "meas_p99_us": 91.387,
           "meas_us": 68.73,
-          "pred_us": 79.75883010005478,
+          "pred_us": 119.935256771149,
           "split": "gate2",
           "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend910b4-20261121T184700Z",
-          "ape_pct": 8.6909,
+          "ape_pct": 13.7579,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend910B4/gates14/4acb5c575082c9c7",
           "case_id": "g2_gemm_M192_N4096_K4096_warm",
@@ -1091,9 +1091,9 @@
           "lstar_us": 23.828,
           "meas_p99_us": 42.967,
           "meas_us": 42.42,
-          "pred_us": 46.106667818244,
+          "pred_us": 36.58389478252463,
           "split": "gate2",
-          "status": "pass"
+          "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend910b4-20261121T184700Z",
@@ -1133,7 +1133,7 @@
         },
         {
           "acquisition_uid": "g14-ascend910b4-20261121T184700Z",
-          "ape_pct": 3.2452,
+          "ape_pct": 55.5861,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend910B4/gates14/4acb5c575082c9c7",
           "case_id": "g2_gemm_M512_N4096_K4096_cold",
@@ -1141,17 +1141,17 @@
           "geometry_key": "",
           "inv_obs": false,
           "inv_sim": false,
-          "l1_cliff_status": "pass",
+          "l1_cliff_status": "fail",
           "lstar_us": 63.547,
           "meas_p99_us": 160.148,
           "meas_us": 125.27,
-          "pred_us": 129.33530849932833,
+          "pred_us": 194.90270472518648,
           "split": "gate2",
-          "status": "pass"
+          "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend910b4-20261121T184700Z",
-          "ape_pct": 6.1825,
+          "ape_pct": 24.5198,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend910B4/gates14/4acb5c575082c9c7",
           "case_id": "g2_gemm_M512_N4096_K4096_warm",
@@ -1159,13 +1159,13 @@
           "geometry_key": "",
           "inv_obs": false,
           "inv_sim": false,
-          "l1_cliff_status": "pass",
+          "l1_cliff_status": "fail",
           "lstar_us": 63.547,
           "meas_p99_us": 90.56,
           "meas_us": 90.23,
-          "pred_us": 95.80845331921607,
+          "pred_us": 112.35417181716421,
           "split": "gate2",
-          "status": "pass"
+          "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend910b4-20261121T184700Z",
@@ -1181,7 +1181,7 @@
           "lstar_us": 9.189,
           "meas_p99_us": 32.846,
           "meas_us": 31.8,
-          "pred_us": 28.525788573735593,
+          "pred_us": 28.52578857373559,
           "split": "gate2",
           "status": "fail"
         },
@@ -1235,7 +1235,7 @@
           "lstar_us": 0.869,
           "meas_p99_us": 22.1448,
           "meas_us": 21.7225,
-          "pred_us": 22.1616367762286,
+          "pred_us": 22.161636776228594,
           "split": "gate2",
           "status": "pass"
         },
@@ -1307,7 +1307,7 @@
           "lstar_us": 0.879,
           "meas_p99_us": 22.4578,
           "meas_us": 22.1675,
-          "pred_us": 22.458267802544093,
+          "pred_us": 22.45826780254409,
           "split": "gate2",
           "status": "pass"
         },
@@ -1361,7 +1361,7 @@
           "lstar_us": 9.745,
           "meas_p99_us": 45.387,
           "meas_us": 44.39,
-          "pred_us": 29.412694613271068,
+          "pred_us": 29.412694613271064,
           "split": "gate2",
           "status": "fail"
         },
@@ -1397,7 +1397,7 @@
           "lstar_us": 10.032,
           "meas_p99_us": 32.845,
           "meas_us": 32.05,
-          "pred_us": 29.43592032092267,
+          "pred_us": 29.435920320922662,
           "split": "gate2",
           "status": "pass"
         },
@@ -1469,7 +1469,7 @@
           "lstar_us": 10.892,
           "meas_p99_us": 33.31,
           "meas_us": 31.33,
-          "pred_us": 30.444671718879487,
+          "pred_us": 30.44467171887949,
           "split": "gate2",
           "status": "pass"
         },
@@ -1613,7 +1613,7 @@
           "lstar_us": 18.347,
           "meas_p99_us": 41.756,
           "meas_us": 39.54,
-          "pred_us": 36.73494515812829,
+          "pred_us": 36.7349451581283,
           "split": "gate2",
           "status": "pass"
         },
@@ -1649,7 +1649,7 @@
           "lstar_us": 36.702,
           "meas_p99_us": 93.395,
           "meas_us": 68.82,
-          "pred_us": 57.73483404248827,
+          "pred_us": 57.73483404248826,
           "split": "gate2",
           "status": "fail"
         },
@@ -1775,7 +1775,7 @@
           "lstar_us": 3.476,
           "meas_p99_us": 19.814,
           "meas_us": 19.6375,
-          "pred_us": 20.346639233149663,
+          "pred_us": 20.346639233149666,
           "split": "gate2",
           "status": "pass"
         },
@@ -1883,7 +1883,7 @@
           "lstar_us": 5.21,
           "meas_p99_us": 21.153,
           "meas_us": 20.68,
-          "pred_us": 21.9974082547128,
+          "pred_us": 21.997408254712802,
           "split": "gate2",
           "status": "pass"
         },
@@ -1955,7 +1955,7 @@
           "lstar_us": 10.423,
           "meas_p99_us": 23.582,
           "meas_us": 23.23,
-          "pred_us": 24.012141417009193,
+          "pred_us": 24.0121414170092,
           "split": "gate2",
           "status": "pass"
         },
@@ -1997,7 +1997,7 @@
         },
         {
           "acquisition_uid": "g14-ascend910b4-20261121T184700Z",
-          "ape_pct": 15.029,
+          "ape_pct": 28.9171,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend910B4/gates14/4acb5c575082c9c7",
           "case_id": "g2_gemm_M192_N7168_K2048_cold",
@@ -2009,13 +2009,13 @@
           "lstar_us": 37.68,
           "meas_p99_us": 102.106,
           "meas_us": 82.93,
-          "pred_us": 70.46643937428644,
+          "pred_us": 106.91093598632477,
           "split": "gate2",
           "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend910b4-20261121T184700Z",
-          "ape_pct": 4.4079,
+          "ape_pct": 17.4673,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend910B4/gates14/4acb5c575082c9c7",
           "case_id": "g2_gemm_M192_N7168_K2048_warm",
@@ -2023,13 +2023,13 @@
           "geometry_key": "",
           "inv_obs": false,
           "inv_sim": false,
-          "l1_cliff_status": "pass",
+          "l1_cliff_status": "fail",
           "lstar_us": 20.849,
           "meas_p99_us": 34.205,
           "meas_us": 33.68,
-          "pred_us": 35.16458748111458,
+          "pred_us": 27.797022201828856,
           "split": "gate2",
-          "status": "pass"
+          "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend910b4-20261121T184700Z",
@@ -2099,7 +2099,7 @@
           "lstar_us": 55.603,
           "meas_p99_us": 69.579,
           "meas_us": 68.62,
-          "pred_us": 72.15516318267831,
+          "pred_us": 72.1551631826783,
           "split": "gate2",
           "status": "pass"
         },
@@ -2135,7 +2135,7 @@
           "lstar_us": 0.246,
           "meas_p99_us": 13.704,
           "meas_us": 13.6025,
-          "pred_us": 12.720026842943117,
+          "pred_us": 12.720026842943115,
           "split": "gate2",
           "status": "pass"
         },
@@ -2171,7 +2171,7 @@
           "lstar_us": 0.247,
           "meas_p99_us": 13.7295,
           "meas_us": 13.3775,
-          "pred_us": 12.74959382802114,
+          "pred_us": 12.749593828021142,
           "split": "gate2",
           "status": "pass"
         },
@@ -2225,7 +2225,7 @@
           "lstar_us": 2.7,
           "meas_p99_us": 31.794,
           "meas_us": 30.04,
-          "pred_us": 16.084376464904928,
+          "pred_us": 16.084376464904924,
           "split": "gate2",
           "status": "fail"
         },
@@ -2297,7 +2297,7 @@
           "lstar_us": 2.946,
           "meas_p99_us": 34.932,
           "meas_us": 32.94,
-          "pred_us": 16.58972957832038,
+          "pred_us": 16.589729578320384,
           "split": "gate2",
           "status": "fail"
         },
@@ -2369,7 +2369,7 @@
           "lstar_us": 3.273,
           "meas_p99_us": 18.094,
           "meas_us": 17.65,
-          "pred_us": 16.61103208529765,
+          "pred_us": 16.611032085297655,
           "split": "gate2",
           "status": "pass"
         },
@@ -2441,7 +2441,7 @@
           "lstar_us": 3.929,
           "meas_p99_us": 17.319,
           "meas_us": 16.84,
-          "pred_us": 16.670133715861954,
+          "pred_us": 16.670133715861958,
           "split": "gate2",
           "status": "pass"
         },
@@ -2477,7 +2477,7 @@
           "lstar_us": 4.584,
           "meas_p99_us": 32.369,
           "meas_us": 31.28,
-          "pred_us": 17.73443129554746,
+          "pred_us": 17.734431295547463,
           "split": "gate2",
           "status": "fail"
         },
@@ -2495,7 +2495,7 @@
           "lstar_us": 1.486,
           "meas_p99_us": 27.339,
           "meas_us": 26.29,
-          "pred_us": 13.730339331715566,
+          "pred_us": 13.730339331715568,
           "split": "gate2",
           "status": "fail"
         },
@@ -2513,7 +2513,7 @@
           "lstar_us": 5.239,
           "meas_p99_us": 21.437,
           "meas_us": 20.78,
-          "pred_us": 17.801294085911724,
+          "pred_us": 17.80129408591172,
           "split": "gate2",
           "status": "fail"
         },
@@ -2531,7 +2531,7 @@
           "lstar_us": 1.982,
           "meas_p99_us": 15.96,
           "meas_us": 15.67,
-          "pred_us": 13.774914525291738,
+          "pred_us": 13.77491452529174,
           "split": "gate2",
           "status": "pass"
         },
@@ -3269,7 +3269,7 @@
           "lstar_us": 127.097,
           "meas_p99_us": 224.624,
           "meas_us": 217.4,
-          "pred_us": 183.26834875295322,
+          "pred_us": 183.2683487529532,
           "split": "gate4",
           "status": "fail"
         },
@@ -3287,7 +3287,7 @@
           "lstar_us": 127.097,
           "meas_p99_us": 188.14,
           "meas_us": 185.54,
-          "pred_us": 164.09563012178563,
+          "pred_us": 164.09563012178558,
           "split": "gate4",
           "status": "fail"
         },
@@ -7486,16 +7486,16 @@
       ],
       "counts": {
         "blocked": 15,
-        "fail": 121,
+        "fail": 125,
         "inv_obs": 0,
         "inv_sim": 0,
-        "l1_cliff_fail": 89,
-        "l1_cliff_pass": 304,
-        "pass": 272,
+        "l1_cliff_fail": 92,
+        "l1_cliff_pass": 301,
+        "pass": 268,
         "total": 408,
         "worker_diagnostics": 3
       },
-      "elapsed_s": 51.65,
+      "elapsed_s": 68.25,
       "endpoint_alias": "a2-910b4-ep",
       "family_summary": {
         "anchor": {
@@ -7709,31 +7709,31 @@
         "gate2": {
           "g2_gemm_cold": {
             "count": 52,
-            "fail": 20,
+            "fail": 21,
             "inv_obs": 0,
             "inv_sim": 0,
-            "l1_cliff_fail": 16,
-            "l1_cliff_pass": 36,
+            "l1_cliff_fail": 17,
+            "l1_cliff_pass": 35,
             "l1_two_tier_gate_pass": false,
-            "max_ape_pct": 51.45,
-            "mean_ape_pct": 14.75,
-            "med_ape_pct": 7.95,
-            "p90_ape_pct": 46.46,
-            "pass": 32
+            "max_ape_pct": 74.5,
+            "mean_ape_pct": 17.15,
+            "med_ape_pct": 7.99,
+            "p90_ape_pct": 46.58,
+            "pass": 31
           },
           "g2_gemm_warm": {
             "count": 52,
-            "fail": 4,
+            "fail": 7,
             "inv_obs": 0,
             "inv_sim": 0,
-            "l1_cliff_fail": 3,
-            "l1_cliff_pass": 49,
+            "l1_cliff_fail": 5,
+            "l1_cliff_pass": 47,
             "l1_two_tier_gate_pass": false,
             "max_ape_pct": 47.77,
-            "mean_ape_pct": 5.83,
+            "mean_ape_pct": 6.53,
             "med_ape_pct": 3.99,
-            "p90_ape_pct": 11.42,
-            "pass": 48
+            "p90_ape_pct": 14.8,
+            "pass": 45
           }
         },
         "gate3": {
@@ -8297,8 +8297,8 @@
       ],
       "cann_version": "9.3.0",
       "capture_quality_summary": {
-        "clean_l1_cliff_pass": 304,
-        "clean_pass": 252,
+        "clean_l1_cliff_pass": 298,
+        "clean_pass": 248,
         "clean_scored": 414,
         "flagged_rows": 67,
         "flags": {
@@ -8731,7 +8731,7 @@
           "lstar_us": 20.973,
           "meas_p99_us": 60.062,
           "meas_us": 40.83,
-          "pred_us": 34.90338057853985,
+          "pred_us": 34.90338057853986,
           "split": "gate2",
           "status": "fail"
         },
@@ -8767,7 +8767,7 @@
           "lstar_us": 20.978,
           "meas_p99_us": 56.907,
           "meas_us": 39.63,
-          "pred_us": 34.918781821698175,
+          "pred_us": 34.91878182169818,
           "split": "gate2",
           "status": "fail"
         },
@@ -8821,7 +8821,7 @@
           "lstar_us": 3.972,
           "meas_p99_us": 20.4503,
           "meas_us": 20.1825,
-          "pred_us": 20.498835049187687,
+          "pred_us": 20.498835049187683,
           "split": "gate2",
           "status": "pass"
         },
@@ -8839,7 +8839,7 @@
           "lstar_us": 21.009,
           "meas_p99_us": 57.257,
           "meas_us": 40.35,
-          "pred_us": 35.01118928064812,
+          "pred_us": 35.011189280648125,
           "split": "gate2",
           "status": "fail"
         },
@@ -8857,7 +8857,7 @@
           "lstar_us": 3.976,
           "meas_p99_us": 20.7243,
           "meas_us": 20.2,
-          "pred_us": 20.634263944367568,
+          "pred_us": 20.63426394436757,
           "split": "gate2",
           "status": "pass"
         },
@@ -8911,7 +8911,7 @@
           "lstar_us": 21.132,
           "meas_p99_us": 57.135,
           "meas_us": 39.43,
-          "pred_us": 35.419842192545225,
+          "pred_us": 35.41984219254522,
           "split": "gate2",
           "status": "fail"
         },
@@ -8929,7 +8929,7 @@
           "lstar_us": 3.999,
           "meas_p99_us": 21.5885,
           "meas_us": 21.23,
-          "pred_us": 21.48586039154421,
+          "pred_us": 21.485860391544215,
           "split": "gate2",
           "status": "pass"
         },
@@ -8947,7 +8947,7 @@
           "lstar_us": 21.214,
           "meas_p99_us": 58.037,
           "meas_us": 40.85,
-          "pred_us": 35.70528515917574,
+          "pred_us": 35.705285159175745,
           "split": "gate2",
           "status": "fail"
         },
@@ -8965,7 +8965,7 @@
           "lstar_us": 5.954,
           "meas_p99_us": 24.094,
           "meas_us": 23.67,
-          "pred_us": 22.066599048361102,
+          "pred_us": 22.066599048361105,
           "split": "gate2",
           "status": "pass"
         },
@@ -9001,7 +9001,7 @@
           "lstar_us": 7.94,
           "meas_p99_us": 23.641,
           "meas_us": 22.2,
-          "pred_us": 22.647337705177968,
+          "pred_us": 22.64733770517797,
           "split": "gate2",
           "status": "pass"
         },
@@ -9037,7 +9037,7 @@
           "lstar_us": 11.912,
           "meas_p99_us": 25.053,
           "meas_us": 23.94,
-          "pred_us": 23.829620142062446,
+          "pred_us": 23.829620142062442,
           "split": "gate2",
           "status": "pass"
         },
@@ -9079,7 +9079,7 @@
         },
         {
           "acquisition_uid": "g14-ascend910_9362-20261121T184428Z",
-          "ape_pct": 5.2595,
+          "ape_pct": 21.6107,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend910_9362/gates14/83abc710fca98a5b",
           "case_id": "g2_gemm_M192_N4096_K4096_cold",
@@ -9087,17 +9087,17 @@
           "geometry_key": "",
           "inv_obs": false,
           "inv_sim": false,
-          "l1_cliff_status": "pass",
+          "l1_cliff_status": "fail",
           "lstar_us": 23.828,
           "meas_p99_us": 69.941,
           "meas_us": 61.2,
-          "pred_us": 57.98119898457282,
+          "pred_us": 74.42576943827684,
           "split": "gate2",
-          "status": "pass"
+          "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend910_9362-20261121T184428Z",
-          "ape_pct": 5.8666,
+          "ape_pct": 16.4359,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend910_9362/gates14/83abc710fca98a5b",
           "case_id": "g2_gemm_M192_N4096_K4096_warm",
@@ -9105,13 +9105,13 @@
           "geometry_key": "",
           "inv_obs": false,
           "inv_sim": false,
-          "l1_cliff_status": "pass",
+          "l1_cliff_status": "fail",
           "lstar_us": 23.828,
           "meas_p99_us": 44.536,
           "meas_us": 43.26,
-          "pred_us": 45.79789248548269,
+          "pred_us": 36.14980845702383,
           "split": "gate2",
-          "status": "pass"
+          "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend910_9362-20261121T184428Z",
@@ -9127,7 +9127,7 @@
           "lstar_us": 31.772,
           "meas_p99_us": 73.468,
           "meas_us": 63.53,
-          "pred_us": 60.22978360895972,
+          "pred_us": 60.22978360895971,
           "split": "gate2",
           "status": "pass"
         },
@@ -9151,7 +9151,7 @@
         },
         {
           "acquisition_uid": "g14-ascend910_9362-20261121T184428Z",
-          "ape_pct": 5.6737,
+          "ape_pct": 39.6907,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend910_9362/gates14/83abc710fca98a5b",
           "case_id": "g2_gemm_M512_N4096_K4096_cold",
@@ -9159,17 +9159,17 @@
           "geometry_key": "",
           "inv_obs": false,
           "inv_sim": false,
-          "l1_cliff_status": "pass",
+          "l1_cliff_status": "fail",
           "lstar_us": 63.547,
           "meas_p99_us": 118.736,
           "meas_us": 108.55,
-          "pred_us": 114.70884456324445,
+          "pred_us": 151.63422304045858,
           "split": "gate2",
-          "status": "pass"
+          "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend910_9362-20261121T184428Z",
-          "ape_pct": 10.8979,
+          "ape_pct": 22.5694,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend910_9362/gates14/83abc710fca98a5b",
           "case_id": "g2_gemm_M512_N4096_K4096_warm",
@@ -9177,11 +9177,11 @@
           "geometry_key": "",
           "inv_obs": false,
           "inv_sim": false,
-          "l1_cliff_status": "pass",
+          "l1_cliff_status": "fail",
           "lstar_us": 63.547,
           "meas_p99_us": 92.921,
           "meas_us": 91.77,
-          "pred_us": 81.76904120618086,
+          "pred_us": 112.48197868041088,
           "split": "gate2",
           "status": "fail"
         },
@@ -9235,7 +9235,7 @@
           "lstar_us": 4.602,
           "meas_p99_us": 32.028,
           "meas_us": 31.0,
-          "pred_us": 34.77344063258917,
+          "pred_us": 34.773440632589164,
           "split": "gate2",
           "status": "fail"
         },
@@ -9361,7 +9361,7 @@
           "lstar_us": 0.892,
           "meas_p99_us": 22.583,
           "meas_us": 21.965,
-          "pred_us": 22.8816829395373,
+          "pred_us": 22.881682939537303,
           "split": "gate2",
           "status": "pass"
         },
@@ -9397,7 +9397,7 @@
           "lstar_us": 0.92,
           "meas_p99_us": 24.0805,
           "meas_us": 23.47,
-          "pred_us": 22.8816829395373,
+          "pred_us": 22.881682939537303,
           "split": "gate2",
           "status": "pass"
         },
@@ -9433,7 +9433,7 @@
           "lstar_us": 1.3,
           "meas_p99_us": 21.604,
           "meas_us": 19.64,
-          "pred_us": 22.88168414701139,
+          "pred_us": 22.881684147011395,
           "split": "gate2",
           "status": "fail"
         },
@@ -9469,7 +9469,7 @@
           "lstar_us": 1.734,
           "meas_p99_us": 23.734,
           "meas_us": 21.37,
-          "pred_us": 22.89319781413183,
+          "pred_us": 22.893197814131835,
           "split": "gate2",
           "status": "pass"
         },
@@ -9487,7 +9487,7 @@
           "lstar_us": 5.444,
           "meas_p99_us": 32.065,
           "meas_us": 31.57,
-          "pred_us": 36.94152444458628,
+          "pred_us": 36.94152444458627,
           "split": "gate2",
           "status": "fail"
         },
@@ -9505,7 +9505,7 @@
           "lstar_us": 2.603,
           "meas_p99_us": 23.752,
           "meas_us": 21.62,
-          "pred_us": 23.71781672680066,
+          "pred_us": 23.717816726800663,
           "split": "gate2",
           "status": "pass"
         },
@@ -9541,7 +9541,7 @@
           "lstar_us": 3.472,
           "meas_p99_us": 24.224,
           "meas_us": 22.7,
-          "pred_us": 23.74084406104154,
+          "pred_us": 23.740844061041543,
           "split": "gate2",
           "status": "pass"
         },
@@ -9559,7 +9559,7 @@
           "lstar_us": 6.304,
           "meas_p99_us": 36.435,
           "meas_us": 35.61,
-          "pred_us": 39.29288265085019,
+          "pred_us": 39.29288265085018,
           "split": "gate2",
           "status": "fail"
         },
@@ -9595,7 +9595,7 @@
           "lstar_us": 6.947,
           "meas_p99_us": 34.813,
           "meas_us": 34.16,
-          "pred_us": 39.338937319331954,
+          "pred_us": 39.33893731933195,
           "split": "gate2",
           "status": "fail"
         },
@@ -9649,7 +9649,7 @@
           "lstar_us": 13.898,
           "meas_p99_us": 36.225,
           "meas_us": 34.99,
-          "pred_us": 28.826721542499744,
+          "pred_us": 28.82672154249974,
           "split": "gate2",
           "status": "fail"
         },
@@ -9703,7 +9703,7 @@
           "lstar_us": 18.352,
           "meas_p99_us": 47.295,
           "meas_us": 39.23,
-          "pred_us": 36.9153449657394,
+          "pred_us": 36.91534496573939,
           "split": "gate2",
           "status": "pass"
         },
@@ -9721,7 +9721,7 @@
           "lstar_us": 3.473,
           "meas_p99_us": 20.3287,
           "meas_us": 19.805,
-          "pred_us": 20.122749521614864,
+          "pred_us": 20.122749521614868,
           "split": "gate2",
           "status": "pass"
         },
@@ -9829,7 +9829,7 @@
           "lstar_us": 3.48,
           "meas_p99_us": 20.3053,
           "meas_us": 20.01,
-          "pred_us": 20.610673920429495,
+          "pred_us": 20.610673920429498,
           "split": "gate2",
           "status": "pass"
         },
@@ -9883,7 +9883,7 @@
           "lstar_us": 18.469,
           "meas_p99_us": 44.446,
           "meas_us": 37.97,
-          "pred_us": 37.90738577056784,
+          "pred_us": 37.907385770567835,
           "split": "gate2",
           "status": "pass"
         },
@@ -9991,7 +9991,7 @@
           "lstar_us": 18.674,
           "meas_p99_us": 49.054,
           "meas_us": 41.83,
-          "pred_us": 39.706669446463444,
+          "pred_us": 39.70666944646345,
           "split": "gate2",
           "status": "pass"
         },
@@ -10015,7 +10015,7 @@
         },
         {
           "acquisition_uid": "g14-ascend910_9362-20261121T184428Z",
-          "ape_pct": 1.768,
+          "ape_pct": 32.9154,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend910_9362/gates14/83abc710fca98a5b",
           "case_id": "g2_gemm_M192_N7168_K2048_cold",
@@ -10023,17 +10023,17 @@
           "geometry_key": "",
           "inv_obs": false,
           "inv_sim": false,
-          "l1_cliff_status": "pass",
+          "l1_cliff_status": "fail",
           "lstar_us": 20.849,
           "meas_p99_us": 55.856,
           "meas_us": 49.91,
-          "pred_us": 49.02756800340602,
+          "pred_us": 66.33807006312229,
           "split": "gate2",
-          "status": "pass"
+          "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend910_9362-20261121T184428Z",
-          "ape_pct": 3.0703,
+          "ape_pct": 19.4945,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend910_9362/gates14/83abc710fca98a5b",
           "case_id": "g2_gemm_M192_N7168_K2048_warm",
@@ -10041,13 +10041,13 @@
           "geometry_key": "",
           "inv_obs": false,
           "inv_sim": false,
-          "l1_cliff_status": "pass",
+          "l1_cliff_status": "fail",
           "lstar_us": 20.849,
           "meas_p99_us": 35.213,
           "meas_us": 33.93,
-          "pred_us": 34.97174769622286,
+          "pred_us": 27.31550762847502,
           "split": "gate2",
-          "status": "pass"
+          "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend910_9362-20261121T184428Z",
@@ -10063,7 +10063,7 @@
           "lstar_us": 27.8,
           "meas_p99_us": 56.855,
           "meas_us": 51.71,
-          "pred_us": 50.5536674591916,
+          "pred_us": 50.55366745919161,
           "split": "gate2",
           "status": "pass"
         },
@@ -10081,13 +10081,13 @@
           "lstar_us": 27.8,
           "meas_p99_us": 39.239,
           "meas_us": 37.86,
-          "pred_us": 36.36579010932971,
+          "pred_us": 36.365790109329716,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend910_9362-20261121T184428Z",
-          "ape_pct": 1.594,
+          "ape_pct": 6.9226,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend910_9362/gates14/83abc710fca98a5b",
           "case_id": "g2_gemm_M512_N7168_K2048_cold",
@@ -10099,13 +10099,13 @@
           "lstar_us": 55.603,
           "meas_p99_us": 94.469,
           "meas_us": 92.11,
-          "pred_us": 93.57823859404068,
+          "pred_us": 85.73360416732669,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend910_9362-20261121T184428Z",
-          "ape_pct": 12.7024,
+          "ape_pct": 1.6899,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend910_9362/gates14/83abc710fca98a5b",
           "case_id": "g2_gemm_M512_N7168_K2048_warm",
@@ -10117,9 +10117,9 @@
           "lstar_us": 55.603,
           "meas_p99_us": 71.38,
           "meas_us": 70.36,
-          "pred_us": 61.422612915085814,
+          "pred_us": 71.54899295850215,
           "split": "gate2",
-          "status": "fail"
+          "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend910_9362-20261121T184428Z",
@@ -10153,7 +10153,7 @@
           "lstar_us": 0.246,
           "meas_p99_us": 13.138,
           "meas_us": 12.675,
-          "pred_us": 12.732627687750139,
+          "pred_us": 12.732627687750137,
           "split": "gate2",
           "status": "pass"
         },
@@ -10207,7 +10207,7 @@
           "lstar_us": 1.328,
           "meas_p99_us": 27.123,
           "meas_us": 26.35,
-          "pred_us": 16.852282406293156,
+          "pred_us": 16.85228240629316,
           "split": "gate2",
           "status": "fail"
         },
@@ -10261,7 +10261,7 @@
           "lstar_us": 0.252,
           "meas_p99_us": 13.3198,
           "meas_us": 13.1225,
-          "pred_us": 12.940199154976632,
+          "pred_us": 12.94019915497663,
           "split": "gate2",
           "status": "pass"
         },
@@ -10423,7 +10423,7 @@
           "lstar_us": 1.799,
           "meas_p99_us": 18.997,
           "meas_us": 18.65,
-          "pred_us": 17.674101400037916,
+          "pred_us": 17.67410140003792,
           "split": "gate2",
           "status": "pass"
         },
@@ -10513,7 +10513,7 @@
           "lstar_us": 1.486,
           "meas_p99_us": 25.731,
           "meas_us": 24.0,
-          "pred_us": 13.690898247941567,
+          "pred_us": 13.690898247941565,
           "split": "gate2",
           "status": "fail"
         },
@@ -10549,7 +10549,7 @@
           "lstar_us": 1.982,
           "meas_p99_us": 16.458,
           "meas_us": 15.2,
-          "pred_us": 13.713925582182448,
+          "pred_us": 13.713925582182446,
           "split": "gate2",
           "status": "pass"
         },
@@ -11071,7 +11071,7 @@
           "lstar_us": 42.103,
           "meas_p99_us": 64.88,
           "meas_us": 62.92,
-          "pred_us": 65.07260978468058,
+          "pred_us": 65.07260978468057,
           "split": "gate4",
           "status": "pass"
         },
@@ -11089,7 +11089,7 @@
           "lstar_us": 7.971,
           "meas_p99_us": 62.471,
           "meas_us": 61.21,
-          "pred_us": 64.82454368138218,
+          "pred_us": 64.8245436813822,
           "split": "gate4",
           "status": "pass"
         },
@@ -11125,7 +11125,7 @@
           "lstar_us": 8.064,
           "meas_p99_us": 65.01,
           "meas_us": 63.12,
-          "pred_us": 65.42853279554835,
+          "pred_us": 65.42853279554836,
           "split": "gate4",
           "status": "pass"
         },
@@ -11143,7 +11143,7 @@
           "lstar_us": 42.595,
           "meas_p99_us": 69.282,
           "meas_us": 67.97,
-          "pred_us": 67.21906688508241,
+          "pred_us": 67.2190668850824,
           "split": "gate4",
           "status": "pass"
         },
@@ -11161,7 +11161,7 @@
           "lstar_us": 8.064,
           "meas_p99_us": 64.651,
           "meas_us": 63.38,
-          "pred_us": 66.2221582358119,
+          "pred_us": 66.22215823581192,
           "split": "gate4",
           "status": "pass"
         },
@@ -11215,7 +11215,7 @@
           "lstar_us": 44.561,
           "meas_p99_us": 87.28,
           "meas_us": 84.83,
-          "pred_us": 79.09617038084382,
+          "pred_us": 79.09617038084383,
           "split": "gate4",
           "status": "pass"
         },
@@ -11233,7 +11233,7 @@
           "lstar_us": 31.772,
           "meas_p99_us": 72.557,
           "meas_us": 71.23,
-          "pred_us": 59.70628143551584,
+          "pred_us": 59.70628143551585,
           "split": "gate4",
           "status": "fail"
         },
@@ -11251,7 +11251,7 @@
           "lstar_us": 127.097,
           "meas_p99_us": 179.553,
           "meas_us": 176.47,
-          "pred_us": 175.40938564297505,
+          "pred_us": 175.40938564297497,
           "split": "gate4",
           "status": "pass"
         },
@@ -11287,7 +11287,7 @@
           "lstar_us": 127.097,
           "meas_p99_us": 190.119,
           "meas_us": 187.75,
-          "pred_us": 183.8460510555205,
+          "pred_us": 183.84605105552052,
           "split": "gate4",
           "status": "pass"
         },
@@ -11305,7 +11305,7 @@
           "lstar_us": 127.097,
           "meas_p99_us": 151.582,
           "meas_us": 150.64,
-          "pred_us": 164.3700630148747,
+          "pred_us": 164.37006301487472,
           "split": "gate4",
           "status": "pass"
         },
@@ -17259,16 +17259,16 @@
       ],
       "counts": {
         "blocked": 18,
-        "fail": 225,
+        "fail": 229,
         "inv_obs": 0,
         "inv_sim": 0,
-        "l1_cliff_fail": 173,
-        "l1_cliff_pass": 308,
-        "pass": 256,
+        "l1_cliff_fail": 179,
+        "l1_cliff_pass": 302,
+        "pass": 252,
         "total": 499,
         "worker_diagnostics": 4
       },
-      "elapsed_s": 50.46,
+      "elapsed_s": 66.25,
       "endpoint_alias": "a3-9362-ep",
       "family_summary": {
         "anchor": {
@@ -17482,31 +17482,31 @@
         "gate2": {
           "g2_gemm_cold": {
             "count": 52,
-            "fail": 31,
+            "fail": 34,
             "inv_obs": 0,
             "inv_sim": 0,
-            "l1_cliff_fail": 14,
-            "l1_cliff_pass": 38,
+            "l1_cliff_fail": 17,
+            "l1_cliff_pass": 35,
             "l1_two_tier_gate_pass": false,
             "max_ape_pct": 39.85,
-            "mean_ape_pct": 13.27,
-            "med_ape_pct": 10.52,
-            "p90_ape_pct": 35.5,
-            "pass": 21
+            "mean_ape_pct": 14.94,
+            "med_ape_pct": 11.95,
+            "p90_ape_pct": 35.68,
+            "pass": 18
           },
           "g2_gemm_warm": {
             "count": 52,
-            "fail": 6,
+            "fail": 7,
             "inv_obs": 0,
             "inv_sim": 0,
-            "l1_cliff_fail": 3,
-            "l1_cliff_pass": 49,
+            "l1_cliff_fail": 6,
+            "l1_cliff_pass": 46,
             "l1_two_tier_gate_pass": false,
             "max_ape_pct": 42.95,
-            "mean_ape_pct": 5.79,
+            "mean_ape_pct": 6.32,
             "med_ape_pct": 3.97,
-            "p90_ape_pct": 11.41,
-            "pass": 46
+            "p90_ape_pct": 16.44,
+            "pass": 45
           }
         },
         "gate3": {
@@ -18162,8 +18162,8 @@
       ],
       "cann_version": "9.2.1",
       "capture_quality_summary": {
-        "clean_l1_cliff_pass": 286,
-        "clean_pass": 266,
+        "clean_l1_cliff_pass": 282,
+        "clean_pass": 263,
         "clean_scored": 376,
         "flagged_rows": 17,
         "flags": {
@@ -18580,7 +18580,7 @@
           "lstar_us": 20.973,
           "meas_p99_us": 37.941,
           "meas_us": 31.63,
-          "pred_us": 30.53915919492666,
+          "pred_us": 30.539159194926658,
           "split": "gate2",
           "status": "pass"
         },
@@ -18598,7 +18598,7 @@
           "lstar_us": 3.031,
           "meas_p99_us": 19.1732,
           "meas_us": 18.955,
-          "pred_us": 18.705871694691055,
+          "pred_us": 18.70587169469105,
           "split": "gate2",
           "status": "pass"
         },
@@ -18634,7 +18634,7 @@
           "lstar_us": 3.032,
           "meas_p99_us": 19.0825,
           "meas_us": 18.81,
-          "pred_us": 18.73892186994234,
+          "pred_us": 18.738921869942335,
           "split": "gate2",
           "status": "pass"
         },
@@ -18652,7 +18652,7 @@
           "lstar_us": 20.989,
           "meas_p99_us": 37.497,
           "meas_us": 29.93,
-          "pred_us": 30.58197168366855,
+          "pred_us": 30.581971683668545,
           "split": "gate2",
           "status": "pass"
         },
@@ -18724,7 +18724,7 @@
           "lstar_us": 21.05,
           "meas_p99_us": 36.847,
           "meas_us": 30.21,
-          "pred_us": 30.753221638636077,
+          "pred_us": 30.75322163863607,
           "split": "gate2",
           "status": "pass"
         },
@@ -18760,7 +18760,7 @@
           "lstar_us": 21.132,
           "meas_p99_us": 37.905,
           "meas_us": 31.26,
-          "pred_us": 31.017291834943897,
+          "pred_us": 31.017291834943894,
           "split": "gate2",
           "status": "pass"
         },
@@ -18778,7 +18778,7 @@
           "lstar_us": 3.054,
           "meas_p99_us": 20.399,
           "meas_us": 20.015,
-          "pred_us": 19.76616405049871,
+          "pred_us": 19.766164050498706,
           "split": "gate2",
           "status": "pass"
         },
@@ -18796,7 +18796,7 @@
           "lstar_us": 21.214,
           "meas_p99_us": 38.848,
           "meas_us": 32.13,
-          "pred_us": 31.281362031251724,
+          "pred_us": 31.281362031251717,
           "split": "gate2",
           "status": "pass"
         },
@@ -18850,7 +18850,7 @@
           "lstar_us": 6.065,
           "meas_p99_us": 21.073,
           "meas_us": 20.74,
-          "pred_us": 20.89524350457542,
+          "pred_us": 20.895243504575415,
           "split": "gate2",
           "status": "pass"
         },
@@ -18886,7 +18886,7 @@
           "lstar_us": 9.099,
           "meas_p99_us": 22.476,
           "meas_us": 22.17,
-          "pred_us": 22.043188941203212,
+          "pred_us": 22.04318894120321,
           "split": "gate2",
           "status": "pass"
         },
@@ -18922,13 +18922,13 @@
           "lstar_us": 12.133,
           "meas_p99_us": 24.831,
           "meas_us": 24.58,
-          "pred_us": 23.22596446353769,
+          "pred_us": 23.225964463537686,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend910_9382-20261121T184659Z",
-          "ape_pct": 10.2272,
+          "ape_pct": 34.0756,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend910_9382/gates14/630f4b08c47aa238",
           "case_id": "g2_gemm_M192_N4096_K4096_cold",
@@ -18936,17 +18936,17 @@
           "geometry_key": "",
           "inv_obs": false,
           "inv_sim": false,
-          "l1_cliff_status": "pass",
+          "l1_cliff_status": "fail",
           "lstar_us": 21.951,
           "meas_p99_us": 58.651,
           "meas_us": 58.04,
-          "pred_us": 52.104146207670645,
+          "pred_us": 77.81748530202799,
           "split": "gate2",
           "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend910_9382-20261121T184659Z",
-          "ape_pct": 7.2742,
+          "ape_pct": 8.7714,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend910_9382/gates14/630f4b08c47aa238",
           "case_id": "g2_gemm_M192_N4096_K4096_warm",
@@ -18958,13 +18958,13 @@
           "lstar_us": 18.201,
           "meas_p99_us": 40.838,
           "meas_us": 39.74,
-          "pred_us": 42.630760362303654,
+          "pred_us": 43.22575113604616,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend910_9382-20261121T184659Z",
-          "ape_pct": 11.6705,
+          "ape_pct": 29.7082,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend910_9382/gates14/630f4b08c47aa238",
           "case_id": "g2_gemm_M256_N4096_K4096_cold",
@@ -18972,17 +18972,17 @@
           "geometry_key": "",
           "inv_obs": false,
           "inv_sim": false,
-          "l1_cliff_status": "pass",
+          "l1_cliff_status": "fail",
           "lstar_us": 24.269,
           "meas_p99_us": 62.806,
           "meas_us": 61.62,
-          "pred_us": 54.428649461162706,
+          "pred_us": 79.92620750709224,
           "split": "gate2",
           "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend910_9382-20261121T184659Z",
-          "ape_pct": 0.6283,
+          "ape_pct": 1.2305,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend910_9382/gates14/630f4b08c47aa238",
           "case_id": "g2_gemm_M256_N4096_K4096_warm",
@@ -18994,7 +18994,7 @@
           "lstar_us": 24.269,
           "meas_p99_us": 45.41,
           "meas_us": 44.71,
-          "pred_us": 44.9909058825658,
+          "pred_us": 45.260177125525836,
           "split": "gate2",
           "status": "pass"
         },
@@ -19030,7 +19030,7 @@
           "lstar_us": 48.542,
           "meas_p99_us": 65.091,
           "meas_us": 64.7,
-          "pred_us": 66.4442834817377,
+          "pred_us": 66.44428348173771,
           "split": "gate2",
           "status": "pass"
         },
@@ -19048,7 +19048,7 @@
           "lstar_us": 4.593,
           "meas_p99_us": 30.928,
           "meas_us": 29.99,
-          "pred_us": 27.551776381468677,
+          "pred_us": 27.551776381468674,
           "split": "gate2",
           "status": "pass"
         },
@@ -19066,7 +19066,7 @@
           "lstar_us": 0.662,
           "meas_p99_us": 20.6772,
           "meas_us": 20.0225,
-          "pred_us": 20.299896863799702,
+          "pred_us": 20.2998968637997,
           "split": "gate2",
           "status": "pass"
         },
@@ -19084,7 +19084,7 @@
           "lstar_us": 4.602,
           "meas_p99_us": 30.331,
           "meas_us": 29.58,
-          "pred_us": 27.608099716078172,
+          "pred_us": 27.60809971607817,
           "split": "gate2",
           "status": "pass"
         },
@@ -19102,7 +19102,7 @@
           "lstar_us": 0.663,
           "meas_p99_us": 20.258,
           "meas_us": 19.5575,
-          "pred_us": 20.34863441613397,
+          "pred_us": 20.348634416133965,
           "split": "gate2",
           "status": "pass"
         },
@@ -19120,7 +19120,7 @@
           "lstar_us": 4.62,
           "meas_p99_us": 30.533,
           "meas_us": 29.74,
-          "pred_us": 27.720746385297183,
+          "pred_us": 27.72074638529718,
           "split": "gate2",
           "status": "pass"
         },
@@ -19138,7 +19138,7 @@
           "lstar_us": 0.665,
           "meas_p99_us": 20.0555,
           "meas_us": 19.58,
-          "pred_us": 20.446109520802498,
+          "pred_us": 20.446109520802494,
           "split": "gate2",
           "status": "pass"
         },
@@ -19390,7 +19390,7 @@
           "lstar_us": 2.651,
           "meas_p99_us": 38.579,
           "meas_us": 37.47,
-          "pred_us": 21.861840707106367,
+          "pred_us": 21.861840707106364,
           "split": "gate2",
           "status": "fail"
         },
@@ -19408,7 +19408,7 @@
           "lstar_us": 6.304,
           "meas_p99_us": 33.719,
           "meas_us": 33.05,
-          "pred_us": 29.4404475522808,
+          "pred_us": 29.440447552280794,
           "split": "gate2",
           "status": "fail"
         },
@@ -19426,7 +19426,7 @@
           "lstar_us": 3.979,
           "meas_p99_us": 24.016,
           "meas_us": 23.17,
-          "pred_us": 21.908124886507252,
+          "pred_us": 21.90812488650725,
           "split": "gate2",
           "status": "pass"
         },
@@ -19462,7 +19462,7 @@
           "lstar_us": 5.306,
           "meas_p99_us": 23.485,
           "meas_us": 21.79,
-          "pred_us": 23.508259025765067,
+          "pred_us": 23.50825902576506,
           "split": "gate2",
           "status": "pass"
         },
@@ -19498,7 +19498,7 @@
           "lstar_us": 10.616,
           "meas_p99_us": 32.747,
           "meas_us": 32.32,
-          "pred_us": 26.801095663082457,
+          "pred_us": 26.80109566308245,
           "split": "gate2",
           "status": "fail"
         },
@@ -19516,7 +19516,7 @@
           "lstar_us": 18.349,
           "meas_p99_us": 40.957,
           "meas_us": 33.72,
-          "pred_us": 36.90605134130322,
+          "pred_us": 36.90605134130321,
           "split": "gate2",
           "status": "pass"
         },
@@ -19588,7 +19588,7 @@
           "lstar_us": 18.357,
           "meas_p99_us": 40.741,
           "meas_us": 31.66,
-          "pred_us": 36.954477475901236,
+          "pred_us": 36.95447747590123,
           "split": "gate2",
           "status": "fail"
         },
@@ -19732,7 +19732,7 @@
           "lstar_us": 18.469,
           "meas_p99_us": 38.922,
           "meas_us": 31.22,
-          "pred_us": 38.063869958187944,
+          "pred_us": 38.06386995818795,
           "split": "gate2",
           "status": "fail"
         },
@@ -19786,7 +19786,7 @@
           "lstar_us": 5.306,
           "meas_p99_us": 21.16,
           "meas_us": 20.58,
-          "pred_us": 20.90250609109795,
+          "pred_us": 20.902506091097955,
           "split": "gate2",
           "status": "pass"
         },
@@ -19858,13 +19858,13 @@
           "lstar_us": 10.616,
           "meas_p99_us": 25.293,
           "meas_us": 24.16,
-          "pred_us": 23.476245204968993,
+          "pred_us": 23.476245204968997,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend910_9382-20261121T184659Z",
-          "ape_pct": 3.3392,
+          "ape_pct": 46.4991,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend910_9382/gates14/630f4b08c47aa238",
           "case_id": "g2_gemm_M192_N7168_K2048_cold",
@@ -19872,17 +19872,17 @@
           "geometry_key": "",
           "inv_obs": false,
           "inv_sim": false,
-          "l1_cliff_status": "pass",
+          "l1_cliff_status": "fail",
           "lstar_us": 18.838,
           "meas_p99_us": 51.192,
           "meas_us": 46.8,
-          "pred_us": 48.362733535390284,
+          "pred_us": 68.56158410565807,
           "split": "gate2",
-          "status": "pass"
+          "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend910_9382-20261121T184659Z",
-          "ape_pct": 1.9287,
+          "ape_pct": 12.1028,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend910_9382/gates14/630f4b08c47aa238",
           "case_id": "g2_gemm_M192_N7168_K2048_warm",
@@ -19894,13 +19894,13 @@
           "lstar_us": 15.925,
           "meas_p99_us": 32.66,
           "meas_us": 31.95,
-          "pred_us": 32.56621602705621,
+          "pred_us": 35.81684973319292,
           "split": "gate2",
-          "status": "pass"
+          "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend910_9382-20261121T184659Z",
-          "ape_pct": 3.5764,
+          "ape_pct": 46.2192,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend910_9382/gates14/630f4b08c47aa238",
           "case_id": "g2_gemm_M256_N7168_K2048_cold",
@@ -19908,17 +19908,17 @@
           "geometry_key": "",
           "inv_obs": false,
           "inv_sim": false,
-          "l1_cliff_status": "pass",
+          "l1_cliff_status": "fail",
           "lstar_us": 21.235,
           "meas_p99_us": 52.829,
           "meas_us": 48.33,
-          "pred_us": 50.05849083276857,
+          "pred_us": 70.66773889298254,
           "split": "gate2",
-          "status": "pass"
+          "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend910_9382-20261121T184659Z",
-          "ape_pct": 3.0616,
+          "ape_pct": 7.4729,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend910_9382/gates14/630f4b08c47aa238",
           "case_id": "g2_gemm_M256_N7168_K2048_warm",
@@ -19930,7 +19930,7 @@
           "lstar_us": 21.235,
           "meas_p99_us": 35.95,
           "meas_us": 35.22,
-          "pred_us": 34.141705027143715,
+          "pred_us": 37.851946870354524,
           "split": "gate2",
           "status": "pass"
         },
@@ -19966,7 +19966,7 @@
           "lstar_us": 42.474,
           "meas_p99_us": 54.945,
           "meas_us": 54.47,
-          "pred_us": 55.59595125792513,
+          "pred_us": 55.59595125792514,
           "split": "gate2",
           "status": "pass"
         },
@@ -20002,7 +20002,7 @@
           "lstar_us": 0.187,
           "meas_p99_us": 12.7677,
           "meas_us": 12.2725,
-          "pred_us": 11.677481636273926,
+          "pred_us": 11.677481636273928,
           "split": "gate2",
           "status": "pass"
         },
@@ -20056,7 +20056,7 @@
           "lstar_us": 1.328,
           "meas_p99_us": 25.422,
           "meas_us": 24.66,
-          "pred_us": 15.568923851147304,
+          "pred_us": 15.568923851147302,
           "split": "gate2",
           "status": "fail"
         },
@@ -20074,7 +20074,7 @@
           "lstar_us": 0.189,
           "meas_p99_us": 12.6805,
           "meas_us": 12.2625,
-          "pred_us": 11.764848824417838,
+          "pred_us": 11.764848824417836,
           "split": "gate2",
           "status": "pass"
         },
@@ -20092,7 +20092,7 @@
           "lstar_us": 1.348,
           "meas_p99_us": 25.587,
           "meas_us": 25.03,
-          "pred_us": 15.817400642149318,
+          "pred_us": 15.817400642149316,
           "split": "gate2",
           "status": "fail"
         },
@@ -20110,7 +20110,7 @@
           "lstar_us": 0.192,
           "meas_p99_us": 12.904,
           "meas_us": 12.565,
-          "pred_us": 11.881338408609713,
+          "pred_us": 11.881338408609711,
           "split": "gate2",
           "status": "pass"
         },
@@ -20146,7 +20146,7 @@
           "lstar_us": 0.198,
           "meas_p99_us": 13.4388,
           "meas_us": 12.91,
-          "pred_us": 12.114317576993471,
+          "pred_us": 12.11431757699347,
           "split": "gate2",
           "status": "pass"
         },
@@ -20164,7 +20164,7 @@
           "lstar_us": 1.471,
           "meas_p99_us": 28.43,
           "meas_us": 27.68,
-          "pred_us": 16.314354224153348,
+          "pred_us": 16.31435422415335,
           "split": "gate2",
           "status": "fail"
         },
@@ -20182,7 +20182,7 @@
           "lstar_us": 0.21,
           "meas_p99_us": 14.4342,
           "meas_us": 14.135,
-          "pred_us": 12.114317576993471,
+          "pred_us": 12.11431757699347,
           "split": "gate2",
           "status": "fail"
         },
@@ -20200,7 +20200,7 @@
           "lstar_us": 1.553,
           "meas_p99_us": 27.851,
           "meas_us": 27.26,
-          "pred_us": 16.318079958497048,
+          "pred_us": 16.318079958497044,
           "split": "gate2",
           "status": "fail"
         },
@@ -20218,7 +20218,7 @@
           "lstar_us": 0.281,
           "meas_p99_us": 14.474,
           "meas_us": 14.09,
-          "pred_us": 12.114317576993471,
+          "pred_us": 12.11431757699347,
           "split": "gate2",
           "status": "pass"
         },
@@ -20254,7 +20254,7 @@
           "lstar_us": 0.376,
           "meas_p99_us": 12.797,
           "meas_us": 12.21,
-          "pred_us": 12.114317576993471,
+          "pred_us": 12.11431757699347,
           "split": "gate2",
           "status": "pass"
         },
@@ -20290,7 +20290,7 @@
           "lstar_us": 0.565,
           "meas_p99_us": 14.291,
           "meas_us": 13.54,
-          "pred_us": 12.114317576993471,
+          "pred_us": 12.114317576993468,
           "split": "gate2",
           "status": "pass"
         },
@@ -20344,7 +20344,7 @@
           "lstar_us": 2.29,
           "meas_p99_us": 18.718,
           "meas_us": 17.76,
-          "pred_us": 16.37528762316492,
+          "pred_us": 16.375287623164915,
           "split": "gate2",
           "status": "pass"
         },
@@ -20362,7 +20362,7 @@
           "lstar_us": 1.134,
           "meas_p99_us": 13.822,
           "meas_us": 13.48,
-          "pred_us": 12.145131065657214,
+          "pred_us": 12.145131065657212,
           "split": "gate2",
           "status": "pass"
         },
@@ -20398,7 +20398,7 @@
           "lstar_us": 1.514,
           "meas_p99_us": 26.198,
           "meas_us": 24.72,
-          "pred_us": 12.631355634705345,
+          "pred_us": 12.631355634705344,
           "split": "gate2",
           "status": "fail"
         },
@@ -20416,7 +20416,7 @@
           "lstar_us": 3.929,
           "meas_p99_us": 20.116,
           "meas_us": 19.56,
-          "pred_us": 19.53759178193447,
+          "pred_us": 19.537591781934474,
           "split": "gate2",
           "status": "pass"
         },
@@ -20434,7 +20434,7 @@
           "lstar_us": 3.031,
           "meas_p99_us": 14.344,
           "meas_us": 13.98,
-          "pred_us": 13.6500889522025,
+          "pred_us": 13.650088952202498,
           "split": "gate2",
           "status": "pass"
         },
@@ -20902,7 +20902,7 @@
           "lstar_us": 6.088,
           "meas_p99_us": 55.71,
           "meas_us": 54.01,
-          "pred_us": 53.20618774940824,
+          "pred_us": 53.20618774940825,
           "split": "gate4",
           "status": "pass"
         },
@@ -20920,7 +20920,7 @@
           "lstar_us": 42.103,
           "meas_p99_us": 63.912,
           "meas_us": 56.68,
-          "pred_us": 54.13390634811586,
+          "pred_us": 54.133906348115865,
           "split": "gate4",
           "status": "pass"
         },
@@ -20938,7 +20938,7 @@
           "lstar_us": 6.088,
           "meas_p99_us": 55.037,
           "meas_us": 53.92,
-          "pred_us": 53.92769534073355,
+          "pred_us": 53.92769534073354,
           "split": "gate4",
           "status": "pass"
         },
@@ -20956,7 +20956,7 @@
           "lstar_us": 42.595,
           "meas_p99_us": 61.889,
           "meas_us": 55.43,
-          "pred_us": 54.60611578555009,
+          "pred_us": 54.606115785550095,
           "split": "gate4",
           "status": "pass"
         },
@@ -20974,7 +20974,7 @@
           "lstar_us": 6.159,
           "meas_p99_us": 55.76,
           "meas_us": 54.84,
-          "pred_us": 53.791861991871144,
+          "pred_us": 53.79186199187116,
           "split": "gate4",
           "status": "pass"
         },
@@ -20992,7 +20992,7 @@
           "lstar_us": 42.595,
           "meas_p99_us": 62.648,
           "meas_us": 58.26,
-          "pred_us": 57.41669418899263,
+          "pred_us": 57.41669418899262,
           "split": "gate4",
           "status": "pass"
         },
@@ -21010,7 +21010,7 @@
           "lstar_us": 6.159,
           "meas_p99_us": 56.358,
           "meas_us": 55.26,
-          "pred_us": 56.563237849302354,
+          "pred_us": 56.56323784930236,
           "split": "gate4",
           "status": "pass"
         },
@@ -21028,7 +21028,7 @@
           "lstar_us": 44.561,
           "meas_p99_us": 66.69,
           "meas_us": 65.24,
-          "pred_us": 59.29753095698192,
+          "pred_us": 59.29753095698194,
           "split": "gate4",
           "status": "pass"
         },
@@ -21046,7 +21046,7 @@
           "lstar_us": 24.269,
           "meas_p99_us": 59.499,
           "meas_us": 57.7,
-          "pred_us": 56.04750284028455,
+          "pred_us": 56.047502840284565,
           "split": "gate4",
           "status": "pass"
         },
@@ -21118,7 +21118,7 @@
           "lstar_us": 97.087,
           "meas_p99_us": 113.697,
           "meas_us": 112.45,
-          "pred_us": 121.5859128541616,
+          "pred_us": 121.58591285416159,
           "split": "gate4",
           "status": "pass"
         },
@@ -21154,7 +21154,7 @@
           "lstar_us": 97.087,
           "meas_p99_us": 120.08,
           "meas_us": 119.51,
-          "pred_us": 131.46045380225416,
+          "pred_us": 131.4604538022542,
           "split": "gate4",
           "status": "pass"
         },
@@ -25353,16 +25353,16 @@
       ],
       "counts": {
         "blocked": 15,
-        "fail": 125,
+        "fail": 128,
         "inv_obs": 0,
         "inv_sim": 0,
-        "l1_cliff_fail": 105,
-        "l1_cliff_pass": 288,
-        "pass": 268,
+        "l1_cliff_fail": 109,
+        "l1_cliff_pass": 284,
+        "pass": 265,
         "total": 408,
         "worker_diagnostics": 4
       },
-      "elapsed_s": 49.86,
+      "elapsed_s": 65.39,
       "endpoint_alias": "a3-9382-ep",
       "family_summary": {
         "anchor": {
@@ -25576,31 +25576,31 @@
         "gate2": {
           "g2_gemm_cold": {
             "count": 52,
-            "fail": 24,
+            "fail": 26,
             "inv_obs": 0,
             "inv_sim": 0,
-            "l1_cliff_fail": 19,
-            "l1_cliff_pass": 33,
+            "l1_cliff_fail": 23,
+            "l1_cliff_pass": 29,
             "l1_two_tier_gate_pass": false,
-            "max_ape_pct": 43.01,
-            "mean_ape_pct": 14.27,
-            "med_ape_pct": 8.42,
-            "p90_ape_pct": 37.57,
-            "pass": 28
+            "max_ape_pct": 46.5,
+            "mean_ape_pct": 16.73,
+            "med_ape_pct": 10.19,
+            "p90_ape_pct": 38.3,
+            "pass": 26
           },
           "g2_gemm_warm": {
             "count": 52,
-            "fail": 4,
+            "fail": 5,
             "inv_obs": 0,
             "inv_sim": 0,
             "l1_cliff_fail": 3,
             "l1_cliff_pass": 49,
             "l1_two_tier_gate_pass": false,
             "max_ape_pct": 48.9,
-            "mean_ape_pct": 5.42,
-            "med_ape_pct": 2.78,
-            "p90_ape_pct": 10.53,
-            "pass": 48
+            "mean_ape_pct": 5.74,
+            "med_ape_pct": 3.03,
+            "p90_ape_pct": 12.1,
+            "pass": 47
           }
         },
         "gate3": {
@@ -26624,8 +26624,8 @@
       ],
       "cann_version": "9.2.0",
       "capture_quality_summary": {
-        "clean_l1_cliff_pass": 308,
-        "clean_pass": 268,
+        "clean_l1_cliff_pass": 288,
+        "clean_pass": 227,
         "clean_scored": 366,
         "flagged_rows": 24,
         "flags": {
@@ -27039,7 +27039,7 @@
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 4.3801,
+          "ape_pct": 7.0182,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M1_N4096_K4096_cold",
@@ -27051,13 +27051,13 @@
           "lstar_us": 8.387,
           "meas_p99_us": 20.8787,
           "meas_us": 18.4485,
-          "pred_us": 19.25657055486892,
+          "pred_us": 17.15373961686892,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 5.248,
+          "ape_pct": 22.7921,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M1_N4096_K4096_warm",
@@ -27069,13 +27069,13 @@
           "lstar_us": 2.48,
           "meas_p99_us": 12.7117,
           "meas_us": 11.986,
-          "pred_us": 11.356970840340585,
+          "pred_us": 9.254139902340585,
           "split": "gate2",
-          "status": "pass"
+          "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 7.651,
+          "ape_pct": 4.0891,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M2_N4096_K4096_cold",
@@ -27087,13 +27087,13 @@
           "lstar_us": 8.389,
           "meas_p99_us": 20.0161,
           "meas_us": 17.9115,
-          "pred_us": 19.281917157732607,
+          "pred_us": 17.179086219732607,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 3.0652,
+          "ape_pct": 20.9396,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M2_N4096_K4096_warm",
@@ -27105,13 +27105,13 @@
           "lstar_us": 2.48,
           "meas_p99_us": 12.2914,
           "meas_us": 11.7645,
-          "pred_us": 11.40389361728828,
+          "pred_us": 9.301062679288279,
           "split": "gate2",
-          "status": "pass"
+          "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 6.8602,
+          "ape_pct": 4.7631,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M4_N4096_K4096_cold",
@@ -27123,13 +27123,13 @@
           "lstar_us": 8.393,
           "meas_p99_us": 19.5046,
           "meas_us": 18.0915,
-          "pred_us": 19.332610363459988,
+          "pred_us": 17.229779425459988,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 3.3535,
+          "ape_pct": 21.0293,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M4_N4096_K4096_warm",
@@ -27141,13 +27141,13 @@
           "lstar_us": 2.481,
           "meas_p99_us": 12.1949,
           "meas_us": 11.8967,
-          "pred_us": 11.497739171183666,
+          "pred_us": 9.394908233183665,
           "split": "gate2",
-          "status": "pass"
+          "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 8.7004,
+          "ape_pct": 3.0614,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M8_N4096_K4096_cold",
@@ -27159,13 +27159,13 @@
           "lstar_us": 8.401,
           "meas_p99_us": 19.1474,
           "meas_us": 17.8785,
-          "pred_us": 19.433996774914736,
+          "pred_us": 17.331165836914735,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 3.723,
+          "ape_pct": 14.9423,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M8_N4096_K4096_warm",
@@ -27177,13 +27177,13 @@
           "lstar_us": 2.484,
           "meas_p99_us": 11.6673,
           "meas_us": 11.266,
-          "pred_us": 11.685430278974447,
+          "pred_us": 9.582599340974447,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 5.9757,
+          "ape_pct": 5.3728,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M16_N4096_K4096_cold",
@@ -27195,13 +27195,13 @@
           "lstar_us": 8.418,
           "meas_p99_us": 21.0343,
           "meas_us": 18.5295,
-          "pred_us": 19.63676959782424,
+          "pred_us": 17.53393865982424,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 4.0165,
+          "ape_pct": 20.7514,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M16_N4096_K4096_warm",
@@ -27213,13 +27213,13 @@
           "lstar_us": 2.489,
           "meas_p99_us": 12.9384,
           "meas_us": 12.5655,
-          "pred_us": 12.060812494556,
+          "pred_us": 9.957981556555998,
           "split": "gate2",
-          "status": "pass"
+          "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 6.6869,
+          "ape_pct": 4.4634,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M32_N4096_K4096_cold",
@@ -27231,13 +27231,13 @@
           "lstar_us": 8.451,
           "meas_p99_us": 20.3198,
           "meas_us": 18.859,
-          "pred_us": 20.12007524313477,
+          "pred_us": 18.01724430513477,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 1.5713,
+          "ape_pct": 17.6294,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M32_N4096_K4096_warm",
@@ -27249,13 +27249,13 @@
           "lstar_us": 2.498,
           "meas_p99_us": 13.3703,
           "meas_us": 13.0951,
-          "pred_us": 12.88933692521063,
+          "pred_us": 10.78650598721063,
           "split": "gate2",
-          "status": "pass"
+          "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 4.8305,
+          "ape_pct": 5.8688,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M48_N4096_K4096_cold",
@@ -27267,13 +27267,13 @@
           "lstar_us": 8.483,
           "meas_p99_us": 21.3255,
           "meas_us": 19.654,
-          "pred_us": 20.603380888445287,
+          "pred_us": 18.50054995044529,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 1.0784,
+          "ape_pct": 14.416,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M48_N4096_K4096_warm",
@@ -27285,13 +27285,13 @@
           "lstar_us": 3.72,
           "meas_p99_us": 15.6132,
           "meas_us": 13.5715,
-          "pred_us": 13.717861355865256,
+          "pred_us": 11.615030417865258,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 4.8776,
+          "ape_pct": 5.5811,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M64_N4096_K4096_cold",
@@ -27303,13 +27303,13 @@
           "lstar_us": 8.516,
           "meas_p99_us": 21.3466,
           "meas_us": 20.106,
-          "pred_us": 21.086686533755827,
+          "pred_us": 18.983855595755827,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 5.5233,
+          "ape_pct": 9.7312,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M64_N4096_K4096_warm",
@@ -27321,13 +27321,13 @@
           "lstar_us": 4.961,
           "meas_p99_us": 15.2087,
           "meas_us": 13.785,
-          "pred_us": 14.546385786519894,
+          "pred_us": 12.443554848519891,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 3.8291,
+          "ape_pct": 6.0712,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M96_N4096_K4096_cold",
@@ -27339,13 +27339,13 @@
           "lstar_us": 8.582,
           "meas_p99_us": 24.4033,
           "meas_us": 21.24,
-          "pred_us": 22.053297824376884,
+          "pred_us": 19.95046688637688,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 0.0528,
+          "ape_pct": 13.0237,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M96_N4096_K4096_warm",
@@ -27357,13 +27357,13 @@
           "lstar_us": 7.444,
           "meas_p99_us": 17.7968,
           "meas_us": 16.212,
-          "pred_us": 16.203434647829155,
+          "pred_us": 14.100603709829151,
           "split": "gate2",
-          "status": "pass"
+          "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 1.2599,
+          "ape_pct": 7.9901,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M128_N4096_K4096_cold",
@@ -27375,13 +27375,13 @@
           "lstar_us": 9.926,
           "meas_p99_us": 24.4186,
           "meas_us": 22.7335,
-          "pred_us": 23.01990911499795,
+          "pred_us": 20.91707817699795,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 0.6083,
+          "ape_pct": 11.0392,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M128_N4096_K4096_warm",
@@ -27393,13 +27393,13 @@
           "lstar_us": 9.926,
           "meas_p99_us": 19.6992,
           "meas_us": 18.054,
-          "pred_us": 18.16382236030534,
+          "pred_us": 16.06099142230533,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 3.4322,
+          "ape_pct": 11.57,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M192_N4096_K4096_cold",
@@ -27411,13 +27411,13 @@
           "lstar_us": 14.891,
           "meas_p99_us": 26.9431,
           "meas_us": 25.84,
-          "pred_us": 24.95313169624006,
+          "pred_us": 22.85030075824006,
           "split": "gate2",
-          "status": "pass"
+          "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 2.5082,
+          "ape_pct": 6.2404,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M192_N4096_K4096_warm",
@@ -27429,13 +27429,13 @@
           "lstar_us": 14.891,
           "meas_p99_us": 25.1957,
           "meas_us": 24.036,
-          "pred_us": 24.63887653777916,
+          "pred_us": 22.536045599779165,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 3.9666,
+          "ape_pct": 3.0263,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M256_N4096_K4096_cold",
@@ -27447,13 +27447,13 @@
           "lstar_us": 19.856,
           "meas_p99_us": 31.2393,
           "meas_us": 30.071,
-          "pred_us": 31.26378542294736,
+          "pred_us": 29.16095448494735,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 6.3524,
+          "ape_pct": 0.8354,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M256_N4096_K4096_warm",
@@ -27465,13 +27465,13 @@
           "lstar_us": 19.856,
           "meas_p99_us": 31.4627,
           "meas_us": 29.2555,
-          "pred_us": 31.113930715253183,
+          "pred_us": 29.011099777253182,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 2.4262,
+          "ape_pct": 4.0505,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M512_N4096_K4096_cold",
@@ -27483,13 +27483,13 @@
           "lstar_us": 39.715,
           "meas_p99_us": 44.9008,
           "meas_us": 44.7765,
-          "pred_us": 43.69014956271119,
+          "pred_us": 42.9628136407112,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 1.1815,
+          "ape_pct": 2.8265,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M512_N4096_K4096_warm",
@@ -27501,13 +27501,13 @@
           "lstar_us": 39.715,
           "meas_p99_us": 44.6056,
           "meas_us": 44.2125,
-          "pred_us": 43.69014956271119,
+          "pred_us": 42.9628136407112,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 1.5024,
+          "ape_pct": 9.9754,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M1_N512_K7168_cold",
@@ -27519,13 +27519,13 @@
           "lstar_us": 1.835,
           "meas_p99_us": 9.0856,
           "meas_us": 8.289,
-          "pred_us": 8.164463666571042,
+          "pred_us": 7.4621413329691935,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 6.9016,
+          "ape_pct": 40.0399,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M1_N512_K7168_warm",
@@ -27537,13 +27537,13 @@
           "lstar_us": 0.541,
           "meas_p99_us": 7.8768,
           "meas_us": 7.3254,
-          "pred_us": 6.819828087757401,
+          "pred_us": 4.392315941536647,
           "split": "gate2",
-          "status": "pass"
+          "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 2.8666,
+          "ape_pct": 6.0388,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M2_N512_K7168_cold",
@@ -27555,13 +27555,13 @@
           "lstar_us": 1.839,
           "meas_p99_us": 8.9845,
           "meas_us": 7.962,
-          "pred_us": 8.190234792812927,
+          "pred_us": 7.481188298665134,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 3.1052,
+          "ape_pct": 37.5297,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M2_N512_K7168_warm",
@@ -27573,13 +27573,13 @@
           "lstar_us": 0.542,
           "meas_p99_us": 7.7396,
           "meas_us": 7.0651,
-          "pred_us": 6.845715585087356,
+          "pred_us": 4.413591321364262,
           "split": "gate2",
-          "status": "pass"
+          "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 4.1286,
+          "ape_pct": 4.9996,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M4_N512_K7168_cold",
@@ -27591,13 +27591,13 @@
           "lstar_us": 1.846,
           "meas_p99_us": 9.2198,
           "meas_us": 7.915,
-          "pred_us": 8.241777045296699,
+          "pred_us": 7.519282230057015,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 2.6053,
+          "ape_pct": 37.0779,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M4_N512_K7168_warm",
@@ -27609,13 +27609,13 @@
           "lstar_us": 0.544,
           "meas_p99_us": 7.8376,
           "meas_us": 7.082,
-          "pred_us": 6.8974905797472665,
+          "pred_us": 4.456142081019487,
           "split": "gate2",
-          "status": "pass"
+          "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 9.5989,
+          "ape_pct": 0.2434,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M8_N512_K7168_cold",
@@ -27627,13 +27627,13 @@
           "lstar_us": 1.86,
           "meas_p99_us": 9.0642,
           "meas_us": 7.614,
-          "pred_us": 8.344861550264241,
+          "pred_us": 7.595470092840779,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 6.0041,
+          "ape_pct": 31.2402,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M8_N512_K7168_warm",
@@ -27645,13 +27645,13 @@
           "lstar_us": 0.548,
           "meas_p99_us": 6.8658,
           "meas_us": 6.6045,
-          "pred_us": 7.001040569067089,
+          "pred_us": 4.541243600329942,
           "split": "gate2",
-          "status": "pass"
+          "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 2.2728,
+          "ape_pct": 7.3335,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M16_N512_K7168_cold",
@@ -27663,13 +27663,13 @@
           "lstar_us": 1.889,
           "meas_p99_us": 8.9568,
           "meas_us": 8.361,
-          "pred_us": 8.551030560199328,
+          "pred_us": 7.747845818408304,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 3.4421,
+          "ape_pct": 36.887,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M16_N512_K7168_warm",
@@ -27681,13 +27681,13 @@
           "lstar_us": 0.557,
           "meas_p99_us": 8.0183,
           "meas_us": 7.4651,
-          "pred_us": 7.208140547706735,
+          "pred_us": 4.711446638950851,
           "split": "gate2",
-          "status": "pass"
+          "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 5.9216,
+          "ape_pct": 5.102,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M32_N512_K7168_cold",
@@ -27699,13 +27699,13 @@
           "lstar_us": 1.946,
           "meas_p99_us": 9.4863,
           "meas_us": 8.5265,
-          "pred_us": 9.031408579624578,
+          "pred_us": 8.091477269289117,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 3.2834,
+          "ape_pct": 31.6304,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M32_N512_K7168_warm",
@@ -27717,13 +27717,13 @@
           "lstar_us": 0.573,
           "meas_p99_us": 7.9235,
           "meas_us": 7.4459,
-          "pred_us": 7.690380504541109,
+          "pred_us": 5.090732715938428,
           "split": "gate2",
-          "status": "pass"
+          "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 5.5809,
+          "ape_pct": 6.3702,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M48_N512_K7168_cold",
@@ -27735,13 +27735,13 @@
           "lstar_us": 2.004,
           "meas_p99_us": 10.1726,
           "meas_us": 9.009,
-          "pred_us": 9.511786599049831,
+          "pred_us": 8.435108720169927,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 2.6389,
+          "ape_pct": 31.3027,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M48_N512_K7168_warm",
@@ -27753,13 +27753,13 @@
           "lstar_us": 0.811,
           "meas_p99_us": 8.7039,
           "meas_us": 7.9625,
-          "pred_us": 8.172620461375482,
+          "pred_us": 5.470018792926006,
           "split": "gate2",
-          "status": "pass"
+          "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 13.8449,
+          "ape_pct": 0.0198,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M64_N512_K7168_cold",
@@ -27771,13 +27771,13 @@
           "lstar_us": 2.061,
           "meas_p99_us": 9.3034,
           "meas_us": 8.777,
-          "pred_us": 9.992164618475082,
+          "pred_us": 8.778740171050739,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 19.9814,
+          "ape_pct": 18.9117,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M64_N512_K7168_warm",
@@ -27789,13 +27789,13 @@
           "lstar_us": 1.083,
           "meas_p99_us": 9.0704,
           "meas_us": 7.2135,
-          "pred_us": 8.654860418209854,
+          "pred_us": 5.849304869913582,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 5.5449,
+          "ape_pct": 8.7834,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M96_N512_K7168_cold",
@@ -27807,13 +27807,13 @@
           "lstar_us": 2.176,
           "meas_p99_us": 11.6733,
           "meas_us": 10.3775,
-          "pred_us": 10.95292065732559,
+          "pred_us": 9.466003072812365,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 0.0744,
+          "ape_pct": 31.3574,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M96_N512_K7168_warm",
@@ -27821,17 +27821,17 @@
           "geometry_key": "",
           "inv_obs": false,
           "inv_sim": false,
-          "l1_cliff_status": "pass",
+          "l1_cliff_status": "fail",
           "lstar_us": 1.626,
           "meas_p99_us": 10.7788,
           "meas_us": 9.6265,
-          "pred_us": 9.619340331878604,
+          "pred_us": 6.6078770238887365,
           "split": "gate2",
-          "status": "pass"
+          "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 8.6965,
+          "ape_pct": 7.3649,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M128_N512_K7168_cold",
@@ -27843,13 +27843,13 @@
           "lstar_us": 2.29,
           "meas_p99_us": 11.9893,
           "meas_us": 10.9605,
-          "pred_us": 11.913676696176092,
+          "pred_us": 10.153265974573983,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 4.0844,
+          "ape_pct": 27.9177,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M128_N512_K7168_warm",
@@ -27861,13 +27861,13 @@
           "lstar_us": 2.169,
           "meas_p99_us": 11.3601,
           "meas_us": 10.2195,
-          "pred_us": 10.636904544501535,
+          "pred_us": 7.366449177863892,
           "split": "gate2",
-          "status": "pass"
+          "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 0.8858,
+          "ape_pct": 10.2127,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M192_N512_K7168_cold",
@@ -27879,13 +27879,13 @@
           "lstar_us": 3.255,
           "meas_p99_us": 13.931,
           "meas_us": 12.839,
-          "pred_us": 12.725271764060981,
+          "pred_us": 11.52779177809723,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 4.3549,
+          "ape_pct": 27.5784,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M192_N512_K7168_warm",
@@ -27893,17 +27893,17 @@
           "geometry_key": "",
           "inv_obs": false,
           "inv_sim": false,
-          "l1_cliff_status": "pass",
+          "l1_cliff_status": "fail",
           "lstar_us": 3.255,
           "meas_p99_us": 13.0925,
           "meas_us": 12.2665,
-          "pred_us": 11.732305263770462,
+          "pred_us": 8.8835934858142,
           "split": "gate2",
-          "status": "pass"
+          "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 13.2041,
+          "ape_pct": 27.661,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M256_N512_K7168_cold",
@@ -27911,17 +27911,17 @@
           "geometry_key": "",
           "inv_obs": false,
           "inv_sim": false,
-          "l1_cliff_status": "pass",
+          "l1_cliff_status": "fail",
           "lstar_us": 4.341,
           "meas_p99_us": 15.3756,
           "meas_us": 14.5455,
-          "pred_us": 12.624904272231232,
+          "pred_us": 10.522073334231232,
           "split": "gate2",
-          "status": "pass"
+          "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 5.4279,
+          "ape_pct": 21.18,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M256_N512_K7168_warm",
@@ -27933,13 +27933,13 @@
           "lstar_us": 4.341,
           "meas_p99_us": 14.801,
           "meas_us": 13.3495,
-          "pred_us": 12.624904272231232,
+          "pred_us": 10.522073334231232,
           "split": "gate2",
-          "status": "pass"
+          "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 10.9416,
+          "ape_pct": 6.5734,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M512_N512_K7168_cold",
@@ -27951,13 +27951,13 @@
           "lstar_us": 8.685,
           "meas_p99_us": 20.5012,
           "meas_us": 18.9615,
-          "pred_us": 16.886803012590658,
+          "pred_us": 17.71508178292317,
           "split": "gate2",
-          "status": "fail"
+          "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 11.0355,
+          "ape_pct": 6.6719,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M512_N512_K7168_warm",
@@ -27969,13 +27969,13 @@
           "lstar_us": 8.685,
           "meas_p99_us": 20.2878,
           "meas_us": 18.9815,
-          "pred_us": 16.886803012590658,
+          "pred_us": 17.71508178292317,
           "split": "gate2",
-          "status": "fail"
+          "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 6.3443,
+          "ape_pct": 11.0532,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M1_N7168_K2048_cold",
@@ -27987,13 +27987,13 @@
           "lstar_us": 7.338,
           "meas_p99_us": 15.8769,
           "meas_us": 15.446,
-          "pred_us": 14.466058966575709,
+          "pred_us": 13.738723044575707,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 4.2441,
+          "ape_pct": 12.5742,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M1_N7168_K2048_warm",
@@ -28005,13 +28005,13 @@
           "lstar_us": 2.169,
           "meas_p99_us": 8.7942,
           "meas_us": 8.7314,
-          "pred_us": 8.360833388176406,
+          "pred_us": 7.633497466176408,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 3.7521,
+          "ape_pct": 8.5889,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M2_N7168_K2048_cold",
@@ -28023,13 +28023,13 @@
           "lstar_us": 7.339,
           "meas_p99_us": 15.9576,
           "meas_us": 15.0375,
-          "pred_us": 14.473272977744054,
+          "pred_us": 13.745937055744054,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 4.3947,
+          "ape_pct": 12.6814,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M2_N7168_K2048_warm",
@@ -28041,13 +28041,13 @@
           "lstar_us": 2.169,
           "meas_p99_us": 8.8194,
           "meas_us": 8.7771,
-          "pred_us": 8.391374182342053,
+          "pred_us": 7.664038260342054,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 5.7097,
+          "ape_pct": 10.4434,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M4_N7168_K2048_cold",
@@ -28059,13 +28059,13 @@
           "lstar_us": 7.341,
           "meas_p99_us": 15.809,
           "meas_us": 15.365,
-          "pred_us": 14.487701000080744,
+          "pred_us": 13.760365078080742,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 4.9474,
+          "ape_pct": 13.1267,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M4_N7168_K2048_warm",
@@ -28077,13 +28077,13 @@
           "lstar_us": 2.17,
           "meas_p99_us": 8.9436,
           "meas_us": 8.8924,
-          "pred_us": 8.452455770673348,
+          "pred_us": 7.725119848673348,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 4.045,
+          "ape_pct": 8.8527,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M8_N7168_K2048_cold",
@@ -28095,13 +28095,13 @@
           "lstar_us": 7.345,
           "meas_p99_us": 15.8502,
           "meas_us": 15.1285,
-          "pred_us": 14.516557044754114,
+          "pred_us": 13.789221122754114,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 3.6668,
+          "ape_pct": 11.8382,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M8_N7168_K2048_warm",
@@ -28113,13 +28113,13 @@
           "lstar_us": 2.171,
           "meas_p99_us": 9.069,
           "meas_us": 8.901,
-          "pred_us": 8.574618947335935,
+          "pred_us": 7.847283025335935,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 4.1293,
+          "ape_pct": 8.9137,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M16_N7168_K2048_cold",
@@ -28131,13 +28131,13 @@
           "lstar_us": 7.353,
           "meas_p99_us": 16.1474,
           "meas_us": 15.202,
-          "pred_us": 14.574269134100868,
+          "pred_us": 13.846933212100867,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 3.4482,
+          "ape_pct": 11.4112,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M16_N7168_K2048_warm",
@@ -28149,13 +28149,13 @@
           "lstar_us": 2.173,
           "meas_p99_us": 9.2456,
           "meas_us": 9.1339,
-          "pred_us": 8.81894530066111,
+          "pred_us": 8.09160937866111,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 6.1815,
+          "ape_pct": 10.8145,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M32_N7168_K2048_cold",
@@ -28167,13 +28167,13 @@
           "lstar_us": 7.369,
           "meas_p99_us": 16.4161,
           "meas_us": 15.699,
-          "pred_us": 14.728573312540133,
+          "pred_us": 14.001237390540131,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 9.5945,
+          "ape_pct": 16.6298,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M32_N7168_K2048_warm",
@@ -28185,13 +28185,13 @@
           "lstar_us": 2.178,
           "meas_p99_us": 10.465,
           "meas_us": 10.3384,
-          "pred_us": 9.346478007057218,
+          "pred_us": 8.619142085057218,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 8.5037,
+          "ape_pct": 12.9722,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M48_N7168_K2048_cold",
@@ -28203,13 +28203,13 @@
           "lstar_us": 7.386,
           "meas_p99_us": 17.5901,
           "meas_us": 16.277,
-          "pred_us": 14.892850823550011,
+          "pred_us": 14.165514901550011,
           "split": "gate2",
-          "status": "pass"
+          "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 6.8647,
+          "ape_pct": 13.7183,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M48_N7168_K2048_warm",
@@ -28221,13 +28221,13 @@
           "lstar_us": 3.255,
           "meas_p99_us": 10.9664,
           "meas_us": 10.6125,
-          "pred_us": 9.883984046023947,
+          "pred_us": 9.156648124023947,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 8.8768,
+          "ape_pct": 13.2729,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M64_N7168_K2048_cold",
@@ -28239,13 +28239,13 @@
           "lstar_us": 7.402,
           "meas_p99_us": 17.12,
           "meas_us": 16.545,
-          "pred_us": 15.076338032038064,
+          "pred_us": 14.349002110038063,
           "split": "gate2",
-          "status": "pass"
+          "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 4.7946,
+          "ape_pct": 11.4269,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M64_N7168_K2048_warm",
@@ -28257,13 +28257,13 @@
           "lstar_us": 4.341,
           "meas_p99_us": 11.1919,
           "meas_us": 10.9665,
-          "pred_us": 10.440699782468847,
+          "pred_us": 9.713363860468847,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 12.9267,
+          "ape_pct": 17.0276,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M96_N7168_K2048_cold",
@@ -28271,17 +28271,17 @@
           "geometry_key": "",
           "inv_obs": false,
           "inv_sim": false,
-          "l1_cliff_status": "pass",
+          "l1_cliff_status": "fail",
           "lstar_us": 7.435,
           "meas_p99_us": 18.5615,
           "meas_us": 17.736,
-          "pred_us": 15.443312449014176,
+          "pred_us": 14.715976527014176,
           "split": "gate2",
           "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 8.5871,
+          "ape_pct": 14.3416,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M96_N7168_K2048_warm",
@@ -28293,13 +28293,13 @@
           "lstar_us": 6.513,
           "meas_p99_us": 13.3423,
           "meas_us": 12.6395,
-          "pred_us": 11.554131255358651,
+          "pred_us": 10.826795333358652,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 14.4419,
+          "ape_pct": 18.3779,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M128_N7168_K2048_cold",
@@ -28307,17 +28307,17 @@
           "geometry_key": "",
           "inv_obs": false,
           "inv_sim": false,
-          "l1_cliff_status": "pass",
+          "l1_cliff_status": "fail",
           "lstar_us": 8.685,
           "meas_p99_us": 19.3111,
           "meas_us": 18.479,
-          "pred_us": 15.81028686599028,
+          "pred_us": 15.082950943990278,
           "split": "gate2",
           "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 6.0624,
+          "ape_pct": 11.3299,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M128_N7168_K2048_warm",
@@ -28329,13 +28329,13 @@
           "lstar_us": 8.685,
           "meas_p99_us": 14.3899,
           "meas_us": 13.808,
-          "pred_us": 12.970901579415242,
+          "pred_us": 12.243565657415244,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 20.79,
+          "ape_pct": 23.9172,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M192_N7168_K2048_cold",
@@ -28347,13 +28347,13 @@
           "lstar_us": 13.029,
           "meas_p99_us": 23.9014,
           "meas_us": 23.2585,
-          "pred_us": 18.423046227881972,
+          "pred_us": 17.695710305881974,
           "split": "gate2",
           "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 3.4031,
+          "ape_pct": 0.7022,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M192_N7168_K2048_warm",
@@ -28365,13 +28365,13 @@
           "lstar_us": 13.029,
           "meas_p99_us": 18.3726,
           "meas_us": 17.717,
-          "pred_us": 18.31993310126232,
+          "pred_us": 17.592597179262317,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 5.6153,
+          "ape_pct": 8.5145,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M256_N7168_K2048_cold",
@@ -28383,13 +28383,13 @@
           "lstar_us": 17.373,
           "meas_p99_us": 25.9649,
           "meas_us": 25.0875,
-          "pred_us": 23.67877061773982,
+          "pred_us": 22.95143469573982,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 6.442,
+          "ape_pct": 3.171,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M256_N7168_K2048_warm",
@@ -28401,13 +28401,13 @@
           "lstar_us": 17.373,
           "meas_p99_us": 22.539,
           "meas_us": 22.2365,
-          "pred_us": 23.66896462310938,
+          "pred_us": 22.941628701109376,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 5.3208,
+          "ape_pct": 3.5678,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M512_N7168_K2048_cold",
@@ -28419,13 +28419,13 @@
           "lstar_us": 34.75,
           "meas_p99_us": 42.3441,
           "meas_us": 41.4915,
-          "pred_us": 43.6991841023728,
+          "pred_us": 42.9718481803728,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 7.8121,
+          "ape_pct": 6.017,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M512_N7168_K2048_warm",
@@ -28437,13 +28437,13 @@
           "lstar_us": 34.75,
           "meas_p99_us": 40.7892,
           "meas_us": 40.519,
-          "pred_us": 43.68437083801879,
+          "pred_us": 42.957034916018785,
           "split": "gate2",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 0.4089,
+          "ape_pct": 34.5624,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M1_N256_K4096_cold",
@@ -28455,13 +28455,13 @@
           "lstar_us": 0.523,
           "meas_p99_us": 6.9578,
           "meas_us": 6.157,
-          "pred_us": 6.131823286955082,
+          "pred_us": 4.028992348955081,
           "split": "gate2",
-          "status": "pass"
+          "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 11.055,
+          "ape_pct": 43.4421,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M1_N256_K4096_warm",
@@ -28473,13 +28473,13 @@
           "lstar_us": 0.152,
           "meas_p99_us": 6.9632,
           "meas_us": 6.4928,
-          "pred_us": 5.775020497107724,
+          "pred_us": 3.6721895591077236,
           "split": "gate2",
-          "status": "pass"
+          "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 9.4128,
+          "ape_pct": 40.412,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M2_N256_K4096_cold",
@@ -28491,13 +28491,13 @@
           "lstar_us": 0.525,
           "meas_p99_us": 8.1772,
           "meas_us": 6.7835,
-          "pred_us": 6.144985969165464,
+          "pred_us": 4.042155031165463,
           "split": "gate2",
-          "status": "pass"
+          "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 12.3972,
+          "ape_pct": 44.2221,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M2_N256_K4096_warm",
@@ -28509,13 +28509,13 @@
           "lstar_us": 0.153,
           "meas_p99_us": 6.9532,
           "meas_us": 6.6075,
-          "pred_us": 5.788356080021305,
+          "pred_us": 3.685525142021304,
           "split": "gate2",
-          "status": "pass"
+          "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 9.8881,
+          "ape_pct": 40.5931,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M4_N256_K4096_cold",
@@ -28527,13 +28527,13 @@
           "lstar_us": 0.529,
           "meas_p99_us": 7.8299,
           "meas_us": 6.8485,
-          "pred_us": 6.171311333586226,
+          "pred_us": 4.068480395586226,
           "split": "gate2",
-          "status": "pass"
+          "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 3.6769,
+          "ape_pct": 38.5093,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M4_N256_K4096_warm",
@@ -28545,13 +28545,13 @@
           "lstar_us": 0.154,
           "meas_p99_us": 6.412,
           "meas_us": 6.037,
-          "pred_us": 5.815027245848467,
+          "pred_us": 3.712196307848466,
           "split": "gate2",
-          "status": "pass"
+          "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 15.1529,
+          "ape_pct": 43.8194,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M8_N256_K4096_cold",
@@ -28559,17 +28559,17 @@
           "geometry_key": "",
           "inv_obs": false,
           "inv_sim": false,
-          "l1_cliff_status": "pass",
+          "l1_cliff_status": "fail",
           "lstar_us": 0.537,
           "meas_p99_us": 9.3207,
           "meas_us": 7.3355,
-          "pred_us": 6.223962062427756,
+          "pred_us": 4.121131124427753,
           "split": "gate2",
-          "status": "pass"
+          "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 16.1817,
+          "ape_pct": 46.2166,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M8_N256_K4096_warm",
@@ -28577,17 +28577,17 @@
           "geometry_key": "",
           "inv_obs": false,
           "inv_sim": false,
-          "l1_cliff_status": "pass",
+          "l1_cliff_status": "fail",
           "lstar_us": 0.157,
           "meas_p99_us": 7.4936,
           "meas_us": 7.0013,
-          "pred_us": 5.868369577502792,
+          "pred_us": 3.76553863950279,
           "split": "gate2",
-          "status": "pass"
+          "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 16.517,
+          "ape_pct": 44.2533,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M16_N256_K4096_cold",
@@ -28595,17 +28595,17 @@
           "geometry_key": "",
           "inv_obs": false,
           "inv_sim": false,
-          "l1_cliff_status": "pass",
+          "l1_cliff_status": "fail",
           "lstar_us": 0.554,
           "meas_p99_us": 8.3834,
           "meas_us": 7.5815,
-          "pred_us": 6.329263520110808,
+          "pred_us": 4.226432582110807,
           "split": "gate2",
-          "status": "pass"
+          "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 10.8294,
+          "ape_pct": 42.2117,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M16_N256_K4096_warm",
@@ -28617,13 +28617,13 @@
           "lstar_us": 0.161,
           "meas_p99_us": 7.3166,
           "meas_us": 6.7007,
-          "pred_us": 5.97505424081144,
+          "pred_us": 3.872223302811438,
           "split": "gate2",
-          "status": "pass"
+          "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 18.9061,
+          "ape_pct": 44.8269,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M32_N256_K4096_cold",
@@ -28631,17 +28631,17 @@
           "geometry_key": "",
           "inv_obs": false,
           "inv_sim": false,
-          "l1_cliff_status": "pass",
+          "l1_cliff_status": "fail",
           "lstar_us": 0.586,
           "meas_p99_us": 9.6605,
           "meas_us": 8.1125,
-          "pred_us": 6.578746435222673,
+          "pred_us": 4.4759154972226725,
           "split": "gate2",
-          "status": "pass"
+          "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 14.2292,
+          "ape_pct": 43.1922,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M32_N256_K4096_warm",
@@ -28649,17 +28649,17 @@
           "geometry_key": "",
           "inv_obs": false,
           "inv_sim": false,
-          "l1_cliff_status": "pass",
+          "l1_cliff_status": "fail",
           "lstar_us": 0.171,
           "meas_p99_us": 7.5447,
           "meas_us": 7.2604,
-          "pred_us": 6.227303567174496,
+          "pred_us": 4.1244726291744955,
           "split": "gate2",
-          "status": "pass"
+          "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 12.5651,
+          "ape_pct": 39.4917,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M48_N256_K4096_cold",
@@ -28667,17 +28667,17 @@
           "geometry_key": "",
           "inv_obs": false,
           "inv_sim": false,
-          "l1_cliff_status": "pass",
+          "l1_cliff_status": "fail",
           "lstar_us": 0.619,
           "meas_p99_us": 9.0234,
           "meas_us": 7.8095,
-          "pred_us": 6.82822935033454,
+          "pred_us": 4.725398412334539,
           "split": "gate2",
-          "status": "pass"
+          "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 0.7393,
+          "ape_pct": 31.9539,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M48_N256_K4096_warm",
@@ -28689,13 +28689,13 @@
           "lstar_us": 0.229,
           "meas_p99_us": 8.0318,
           "meas_us": 6.432,
-          "pred_us": 6.479552893537552,
+          "pred_us": 4.376721955537551,
           "split": "gate2",
-          "status": "pass"
+          "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 16.2351,
+          "ape_pct": 41.1222,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M64_N256_K4096_cold",
@@ -28703,17 +28703,17 @@
           "geometry_key": "",
           "inv_obs": false,
           "inv_sim": false,
-          "l1_cliff_status": "pass",
+          "l1_cliff_status": "fail",
           "lstar_us": 0.652,
           "meas_p99_us": 10.5821,
           "meas_us": 8.4495,
-          "pred_us": 7.077712265446408,
+          "pred_us": 4.974881327446408,
           "split": "gate2",
-          "status": "pass"
+          "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 15.3499,
+          "ape_pct": 41.7923,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M64_N256_K4096_warm",
@@ -28721,17 +28721,17 @@
           "geometry_key": "",
           "inv_obs": false,
           "inv_sim": false,
-          "l1_cliff_status": "pass",
+          "l1_cliff_status": "fail",
           "lstar_us": 0.307,
           "meas_p99_us": 9.6819,
           "meas_us": 7.9525,
-          "pred_us": 6.731802219900608,
+          "pred_us": 4.6289712819006095,
           "split": "gate2",
-          "status": "pass"
+          "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 15.8568,
+          "ape_pct": 39.2099,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M96_N256_K4096_cold",
@@ -28739,17 +28739,17 @@
           "geometry_key": "",
           "inv_obs": false,
           "inv_sim": false,
-          "l1_cliff_status": "pass",
+          "l1_cliff_status": "fail",
           "lstar_us": 0.717,
           "meas_p99_us": 10.2536,
           "meas_us": 9.0045,
-          "pred_us": 7.576678095670142,
+          "pred_us": 5.473847157670142,
           "split": "gate2",
-          "status": "pass"
+          "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 14.4898,
+          "ape_pct": 39.3386,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M96_N256_K4096_warm",
@@ -28757,17 +28757,17 @@
           "geometry_key": "",
           "inv_obs": false,
           "inv_sim": false,
-          "l1_cliff_status": "pass",
+          "l1_cliff_status": "fail",
           "lstar_us": 0.462,
           "meas_p99_us": 9.7027,
           "meas_us": 8.4625,
-          "pred_us": 7.236300872626723,
+          "pred_us": 5.1334699346267225,
           "split": "gate2",
-          "status": "pass"
+          "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 16.5351,
+          "ape_pct": 38.2687,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M128_N256_K4096_cold",
@@ -28775,17 +28775,17 @@
           "geometry_key": "",
           "inv_obs": false,
           "inv_sim": false,
-          "l1_cliff_status": "pass",
+          "l1_cliff_status": "fail",
           "lstar_us": 0.783,
           "meas_p99_us": 11.5078,
           "meas_us": 9.6755,
-          "pred_us": 8.075643925893878,
+          "pred_us": 5.972812987893876,
           "split": "gate2",
-          "status": "pass"
+          "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 6.7991,
+          "ape_pct": 32.1176,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M128_N256_K4096_warm",
@@ -28797,13 +28797,13 @@
           "lstar_us": 0.617,
           "meas_p99_us": 10.0392,
           "meas_us": 8.3055,
-          "pred_us": 7.740799525352838,
+          "pred_us": 5.637968587352837,
           "split": "gate2",
-          "status": "pass"
+          "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 23.9444,
+          "ape_pct": 43.6264,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M192_N256_K4096_cold",
@@ -28811,17 +28811,17 @@
           "geometry_key": "",
           "inv_obs": false,
           "inv_sim": false,
-          "l1_cliff_status": "pass",
+          "l1_cliff_status": "fail",
           "lstar_us": 0.927,
           "meas_p99_us": 11.5072,
           "meas_us": 10.684,
-          "pred_us": 8.125784556727826,
+          "pred_us": 6.0229536187278265,
           "split": "gate2",
           "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 25.4847,
+          "ape_pct": 45.524,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M192_N256_K4096_warm",
@@ -28829,17 +28829,17 @@
           "geometry_key": "",
           "inv_obs": false,
           "inv_sim": false,
-          "l1_cliff_status": "pass",
+          "l1_cliff_status": "fail",
           "lstar_us": 0.927,
           "meas_p99_us": 11.5173,
           "meas_us": 10.4935,
-          "pred_us": 7.81926579992473,
+          "pred_us": 5.71643486192473,
           "split": "gate2",
           "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 33.2884,
+          "ape_pct": 50.2604,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M256_N256_K4096_cold",
@@ -28851,13 +28851,13 @@
           "lstar_us": 1.238,
           "meas_p99_us": 12.8352,
           "meas_us": 12.39,
-          "pred_us": 8.26556530415512,
+          "pred_us": 6.162734366155119,
           "split": "gate2",
           "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 32.3576,
+          "ape_pct": 49.5664,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M256_N256_K4096_warm",
@@ -28869,13 +28869,13 @@
           "lstar_us": 1.238,
           "meas_p99_us": 13.9379,
           "meas_us": 12.2195,
-          "pred_us": 8.26556530415512,
+          "pred_us": 6.162734366155119,
           "split": "gate2",
           "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 32.4083,
+          "ape_pct": 46.9839,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M512_N256_K4096_cold",
@@ -28887,13 +28887,13 @@
           "lstar_us": 2.479,
           "meas_p99_us": 15.8016,
           "meas_us": 14.427,
-          "pred_us": 9.751460498123317,
+          "pred_us": 7.648629560123314,
           "split": "gate2",
           "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 22.3208,
+          "ape_pct": 39.0717,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g2_gemm_M512_N256_K4096_warm",
@@ -28901,11 +28901,11 @@
           "geometry_key": "",
           "inv_obs": false,
           "inv_sim": false,
-          "l1_cliff_status": "pass",
+          "l1_cliff_status": "fail",
           "lstar_us": 2.479,
           "meas_p99_us": 13.3386,
           "meas_us": 12.5535,
-          "pred_us": 9.751460498123317,
+          "pred_us": 7.648629560123314,
           "split": "gate2",
           "status": "fail"
         },
@@ -29343,7 +29343,7 @@
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 6.7917,
+          "ape_pct": 2.8673,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g4_gmm_E8_T64_uniform_cold",
@@ -29355,13 +29355,13 @@
           "lstar_us": 16.839,
           "meas_p99_us": 31.1746,
           "meas_us": 25.6655,
-          "pred_us": 23.922380222742518,
+          "pred_us": 26.401413953025607,
           "split": "gate4",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 5.9982,
+          "ape_pct": 12.3647,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g4_gmm_E8_T64_uniform_warm",
@@ -29373,13 +29373,13 @@
           "lstar_us": 4.981,
           "meas_p99_us": 18.3706,
           "meas_us": 17.4315,
-          "pred_us": 16.385923059695795,
+          "pred_us": 15.276145008013088,
           "split": "gate4",
-          "status": "pass"
+          "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 5.8201,
+          "ape_pct": 4.6448,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g4_gmm_E8_T64_skew_hot1_cold",
@@ -29391,13 +29391,13 @@
           "lstar_us": 16.839,
           "meas_p99_us": 30.7213,
           "meas_us": 25.471,
-          "pred_us": 23.988569629852087,
+          "pred_us": 26.65408294386536,
           "split": "gate4",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 8.028,
+          "ape_pct": 13.0505,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g4_gmm_E8_T64_skew_hot1_warm",
@@ -29409,13 +29409,13 @@
           "lstar_us": 4.981,
           "meas_p99_us": 19.1688,
           "meas_us": 18.137,
-          "pred_us": 16.68096370330392,
+          "pred_us": 15.770028355414162,
           "split": "gate4",
-          "status": "pass"
+          "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 10.8195,
+          "ape_pct": 1.5775,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g4_gmm_E8_T256_uniform_cold",
@@ -29427,13 +29427,13 @@
           "lstar_us": 17.036,
           "meas_p99_us": 32.3112,
           "meas_us": 27.3725,
-          "pred_us": 24.410937613012642,
+          "pred_us": 26.940686151477056,
           "split": "gate4",
-          "status": "fail"
+          "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 6.5336,
+          "ape_pct": 17.7024,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g4_gmm_E8_T256_uniform_warm",
@@ -29441,17 +29441,17 @@
           "geometry_key": "",
           "inv_obs": false,
           "inv_sim": false,
-          "l1_cliff_status": "pass",
+          "l1_cliff_status": "fail",
           "lstar_us": 5.039,
           "meas_p99_us": 20.8922,
           "meas_us": 20.209,
-          "pred_us": 18.888621105519796,
+          "pred_us": 16.631516664788997,
           "split": "gate4",
-          "status": "pass"
+          "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 10.4652,
+          "ape_pct": 0.4025,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g4_gmm_E8_T256_skew_hot1_cold",
@@ -29463,13 +29463,13 @@
           "lstar_us": 17.036,
           "meas_p99_us": 32.9745,
           "meas_us": 28.092,
-          "pred_us": 25.152109892403608,
+          "pred_us": 27.978918446473507,
           "split": "gate4",
-          "status": "fail"
+          "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 5.0518,
+          "ape_pct": 10.8359,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g4_gmm_E8_T256_skew_hot1_warm",
@@ -29481,13 +29481,13 @@
           "lstar_us": 5.039,
           "meas_p99_us": 21.755,
           "meas_us": 21.266,
-          "pred_us": 20.191692865194558,
+          "pred_us": 18.961641254224535,
           "split": "gate4",
-          "status": "pass"
+          "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 14.7818,
+          "ape_pct": 14.4271,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g4_gmm_E8_T1024_uniform_cold",
@@ -29499,13 +29499,13 @@
           "lstar_us": 19.856,
           "meas_p99_us": 36.6111,
           "meas_us": 34.0035,
-          "pred_us": 28.977173288307316,
+          "pred_us": 29.097774945282854,
           "split": "gate4",
           "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 11.758,
+          "ape_pct": 11.0295,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g4_gmm_E8_T1024_uniform_warm",
@@ -29517,13 +29517,13 @@
           "lstar_us": 19.856,
           "meas_p99_us": 26.483,
           "meas_us": 25.9285,
-          "pred_us": 28.977173288307316,
+          "pred_us": 23.068703581761604,
           "split": "gate4",
           "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 5.0327,
+          "ape_pct": 6.6428,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g4_gmm_E8_T1024_skew_zipf_cold",
@@ -29535,13 +29535,13 @@
           "lstar_us": 19.856,
           "meas_p99_us": 46.1301,
           "meas_us": 45.1715,
-          "pred_us": 42.89816320601457,
+          "pred_us": 42.17082728401457,
           "split": "gate4",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 24.8164,
+          "ape_pct": 26.5704,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g4_gmm_E8_T1024_skew_zipf_warm",
@@ -29553,13 +29553,13 @@
           "lstar_us": 19.856,
           "meas_p99_us": 42.1536,
           "meas_us": 41.4685,
-          "pred_us": 31.177507751002963,
+          "pred_us": 30.450171829002965,
           "split": "gate4",
           "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 2.4708,
+          "ape_pct": 3.307,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g4_gmm_E8_T4096_uniform_cold",
@@ -29571,13 +29571,13 @@
           "lstar_us": 79.434,
           "meas_p99_us": 87.2159,
           "meas_us": 86.9775,
-          "pred_us": 84.82850289149854,
+          "pred_us": 84.10116696949854,
           "split": "gate4",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 2.6617,
+          "ape_pct": 3.5014,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g4_gmm_E8_T4096_uniform_warm",
@@ -29589,13 +29589,13 @@
           "lstar_us": 79.434,
           "meas_p99_us": 87.2549,
           "meas_us": 86.6235,
-          "pred_us": 84.31781475691591,
+          "pred_us": 83.59047883491591,
           "split": "gate4",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 10.9002,
+          "ape_pct": 11.6275,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g4_gmm_E8_T4096_skew_zipf_cold",
@@ -29607,13 +29607,13 @@
           "lstar_us": 79.434,
           "meas_p99_us": 100.7083,
           "meas_us": 100.0075,
-          "pred_us": 89.10649366448828,
+          "pred_us": 88.37915774248827,
           "split": "gate4",
           "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 10.7686,
+          "ape_pct": 11.497,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g4_gmm_E8_T4096_skew_zipf_warm",
@@ -29625,13 +29625,13 @@
           "lstar_us": 79.434,
           "meas_p99_us": 100.9101,
           "meas_us": 99.858,
-          "pred_us": 89.10468224277086,
+          "pred_us": 88.37734632077087,
           "split": "gate4",
           "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 6.6665,
+          "ape_pct": 6.1923,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g4_gmm_E64_T64_uniform_cold",
@@ -29643,13 +29643,13 @@
           "lstar_us": 134.28,
           "meas_p99_us": 156.7679,
           "meas_us": 153.3775,
-          "pred_us": 163.6023797801087,
+          "pred_us": 162.87504385810868,
           "split": "gate4",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 6.0746,
+          "ape_pct": 5.6028,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g4_gmm_E64_T64_uniform_warm",
@@ -29661,13 +29661,13 @@
           "lstar_us": 39.735,
           "meas_p99_us": 158.8799,
           "meas_us": 154.1625,
-          "pred_us": 163.52719521656113,
+          "pred_us": 162.79985929456112,
           "split": "gate4",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 3.0252,
+          "ape_pct": 1.6922,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g4_gmm_E64_T64_skew_hot1_cold",
@@ -29679,13 +29679,13 @@
           "lstar_us": 4.256,
           "meas_p99_us": 16.2562,
           "meas_us": 15.418,
-          "pred_us": 15.884427201685785,
+          "pred_us": 15.157091279685783,
           "split": "gate4",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 2.6068,
+          "ape_pct": 2.1197,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g4_gmm_E64_T64_skew_hot1_warm",
@@ -29697,13 +29697,13 @@
           "lstar_us": 1.257,
           "meas_p99_us": 15.8611,
           "meas_us": 15.3885,
-          "pred_us": 15.789650456545768,
+          "pred_us": 15.062314534545765,
           "split": "gate4",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 5.6018,
+          "ape_pct": 5.1336,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g4_gmm_E64_T256_uniform_cold",
@@ -29715,13 +29715,13 @@
           "lstar_us": 134.476,
           "meas_p99_us": 157.9593,
           "meas_us": 155.351,
-          "pred_us": 164.05348716139417,
+          "pred_us": 163.32615123939416,
           "split": "gate4",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 5.0879,
+          "ape_pct": 4.6212,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g4_gmm_E64_T256_uniform_warm",
@@ -29733,13 +29733,13 @@
           "lstar_us": 39.793,
           "meas_p99_us": 158.6142,
           "meas_us": 155.8245,
-          "pred_us": 163.75274890720388,
+          "pred_us": 163.02541298520387,
           "split": "gate4",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 6.7556,
+          "ape_pct": 6.2911,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g4_gmm_E64_T256_skew_hot1_cold",
@@ -29751,13 +29751,13 @@
           "lstar_us": 134.476,
           "meas_p99_us": 162.7599,
           "meas_us": 156.6025,
-          "pred_us": 167.181897256097,
+          "pred_us": 166.454561334097,
           "split": "gate4",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 6.6816,
+          "ape_pct": 6.2166,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g4_gmm_E64_T256_skew_hot1_warm",
@@ -29769,13 +29769,13 @@
           "lstar_us": 39.793,
           "meas_p99_us": 162.0865,
           "meas_us": 156.4235,
-          "pred_us": 166.87510163233097,
+          "pred_us": 166.14776571033096,
           "split": "gate4",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 4.6987,
+          "ape_pct": 4.2396,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g4_gmm_E64_T1024_uniform_cold",
@@ -29787,13 +29787,13 @@
           "lstar_us": 135.263,
           "meas_p99_us": 161.8031,
           "meas_us": 158.4145,
-          "pred_us": 165.85791668653602,
+          "pred_us": 165.130580764536,
           "split": "gate4",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 3.5745,
+          "ape_pct": 3.117,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g4_gmm_E64_T1024_uniform_warm",
@@ -29805,13 +29805,13 @@
           "lstar_us": 40.026,
           "meas_p99_us": 164.4583,
           "meas_us": 158.9725,
-          "pred_us": 164.6549636697748,
+          "pred_us": 163.92762774777478,
           "split": "gate4",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 0.6345,
+          "ape_pct": 1.0602,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g4_gmm_E64_T1024_skew_zipf_cold",
@@ -29823,13 +29823,13 @@
           "lstar_us": 135.263,
           "meas_p99_us": 174.7906,
           "meas_us": 170.8735,
-          "pred_us": 169.78923880490794,
+          "pred_us": 169.06190288290793,
           "split": "gate4",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 1.0394,
+          "ape_pct": 1.4662,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g4_gmm_E64_T1024_skew_zipf_warm",
@@ -29841,13 +29841,13 @@
           "lstar_us": 40.026,
           "meas_p99_us": 176.5505,
           "meas_us": 170.395,
-          "pred_us": 168.62395814685993,
+          "pred_us": 167.89662222485993,
           "split": "gate4",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 8.5449,
+          "ape_pct": 8.9292,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g4_gmm_E64_T4096_uniform_cold",
@@ -29859,13 +29859,13 @@
           "lstar_us": 138.409,
           "meas_p99_us": 191.7858,
           "meas_us": 189.2465,
-          "pred_us": 173.07563478710338,
+          "pred_us": 172.3482988651034,
           "split": "gate4",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 11.3094,
+          "ape_pct": 11.6928,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g4_gmm_E64_T4096_uniform_warm",
@@ -29877,13 +29877,13 @@
           "lstar_us": 79.434,
           "meas_p99_us": 192.1691,
           "meas_us": 189.72,
-          "pred_us": 168.26382272005847,
+          "pred_us": 167.53648679805846,
           "split": "gate4",
           "status": "fail"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 0.2698,
+          "ape_pct": 0.617,
           "boundary": "cold",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g4_gmm_E64_T4096_skew_zipf_cold",
@@ -29895,13 +29895,13 @@
           "lstar_us": 138.409,
           "meas_p99_us": 213.7031,
           "meas_us": 209.5145,
-          "pred_us": 208.9491915219453,
+          "pred_us": 208.2218555999453,
           "split": "gate4",
           "status": "pass"
         },
         {
           "acquisition_uid": "g14-ascend950dt_9582-20261121T184429Z",
-          "ape_pct": 2.3006,
+          "ape_pct": 2.6479,
           "boundary": "warm",
           "capture_uri": "capture://fleet-400k/Ascend950DT_9582/gates14/9698c62c32088577",
           "case_id": "g4_gmm_E64_T4096_skew_zipf_warm",
@@ -29913,7 +29913,7 @@
           "lstar_us": 79.434,
           "meas_p99_us": 212.4256,
           "meas_us": 209.468,
-          "pred_us": 204.64889899443017,
+          "pred_us": 203.92156307243016,
           "split": "gate4",
           "status": "pass"
         },
@@ -33802,16 +33802,16 @@
       ],
       "counts": {
         "blocked": 63,
-        "fail": 122,
+        "fail": 163,
         "inv_obs": 0,
         "inv_sim": 0,
-        "l1_cliff_fail": 82,
-        "l1_cliff_pass": 308,
-        "pass": 268,
+        "l1_cliff_fail": 102,
+        "l1_cliff_pass": 288,
+        "pass": 227,
         "total": 453,
         "worker_diagnostics": 1
       },
-      "elapsed_s": 87.47,
+      "elapsed_s": 108.51,
       "endpoint_alias": "a5-9582-ep",
       "family_summary": {
         "anchor": {
@@ -33996,31 +33996,31 @@
         "gate2": {
           "g2_gemm_cold": {
             "count": 52,
-            "fail": 7,
+            "fail": 20,
             "inv_obs": 0,
             "inv_sim": 0,
-            "l1_cliff_fail": 3,
-            "l1_cliff_pass": 49,
+            "l1_cliff_fail": 14,
+            "l1_cliff_pass": 38,
             "l1_two_tier_gate_pass": false,
-            "max_ape_pct": 33.29,
-            "mean_ape_pct": 9.19,
-            "med_ape_pct": 6.52,
-            "p90_ape_pct": 16.54,
-            "pass": 45
+            "max_ape_pct": 50.26,
+            "mean_ape_pct": 16.87,
+            "med_ape_pct": 8.88,
+            "p90_ape_pct": 43.63,
+            "pass": 32
           },
           "g2_gemm_warm": {
             "count": 52,
-            "fail": 4,
+            "fail": 30,
             "inv_obs": 0,
             "inv_sim": 0,
-            "l1_cliff_fail": 1,
-            "l1_cliff_pass": 51,
+            "l1_cliff_fail": 9,
+            "l1_cliff_pass": 43,
             "l1_two_tier_gate_pass": false,
-            "max_ape_pct": 32.36,
-            "mean_ape_pct": 7.14,
-            "med_ape_pct": 4.87,
-            "p90_ape_pct": 15.35,
-            "pass": 48
+            "max_ape_pct": 49.57,
+            "mean_ape_pct": 23.69,
+            "med_ape_pct": 20.98,
+            "p90_ape_pct": 43.19,
+            "pass": 22
           }
         },
         "gate3": {
@@ -34070,31 +34070,31 @@
         "gate4": {
           "g4_moe_gmm_cold": {
             "count": 16,
-            "fail": 4,
+            "fail": 2,
             "inv_obs": 0,
             "inv_sim": 0,
             "l1_cliff_fail": 0,
             "l1_cliff_pass": 16,
             "l1_two_tier_gate_pass": true,
-            "max_ape_pct": 14.78,
-            "mean_ape_pct": 6.45,
-            "med_ape_pct": 6.24,
-            "p90_ape_pct": 10.9,
-            "pass": 12
+            "max_ape_pct": 14.43,
+            "mean_ape_pct": 4.98,
+            "med_ape_pct": 4.44,
+            "p90_ape_pct": 11.63,
+            "pass": 14
           },
           "g4_moe_gmm_warm": {
             "count": 16,
-            "fail": 4,
+            "fail": 8,
             "inv_obs": 0,
             "inv_sim": 0,
-            "l1_cliff_fail": 1,
-            "l1_cliff_pass": 15,
+            "l1_cliff_fail": 2,
+            "l1_cliff_pass": 14,
             "l1_two_tier_gate_pass": false,
-            "max_ape_pct": 24.82,
-            "mean_ape_pct": 7.14,
-            "med_ape_pct": 6.04,
-            "p90_ape_pct": 11.76,
-            "pass": 12
+            "max_ape_pct": 26.57,
+            "mean_ape_pct": 9.0,
+            "med_ape_pct": 8.53,
+            "p90_ape_pct": 17.7,
+            "pass": 8
           }
         },
         "gate5": {

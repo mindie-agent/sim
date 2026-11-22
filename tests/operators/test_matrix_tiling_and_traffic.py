@@ -295,7 +295,7 @@ def test_equal_shared_memory_bounds_keep_a_single_owner_wave():
         tile = report["selected"]
         record = next(row for row in report["candidates"] if row["split_k"] == tile["k_splits"]
                       and row["tile"] == [tile[key] for key in ("tile_m", "tile_n", "tile_k")])
-        assert record["maximum_owner_output_tiles"] == 1 and (record["split_k"] > 1) == (factor == 2)
+        assert record["maximum_owner_output_tiles"] == 1 and record["split_k"] == 1
         engine, span = _run(ctx, recipe)
         assert engine.serviced["hbm"] == pytest.approx(2 * (258*4096 + 2*33*4096 + 258*33))
         spans.append(span)
@@ -436,14 +436,14 @@ def test_owner_grid_subtiles_and_explicit_domain(m, n, dtype):
     assert _price(m, n, dtype=dtype, options={"candidates": DEFAULT_CANDIDATES})[:2] == (span, work)
     tile = report["selected"]
     if dtype != "fp32":
-        assert tile["tile_m"] == tile["tile_n"] == (16 if n == 24 else 32)
-        assert _price(m, n, dtype=dtype, options={"underfilled_candidates": UNDERFILLED_CANDIDATES})[:2] == (span, work)
+        assert tile["tile_m"] == tile["tile_n"] == (128 if n == 288 else (32 if dtype == "bf16" else 16))
+        if dtype == "bf16" or n == 24:
+            assert _price(m, n, dtype=dtype, options={"underfilled_candidates": UNDERFILLED_CANDIDATES})[:2] == (span, work)
     else:
         control, coarse, _ = _price(options={"underfilled_candidates": ()})
-        assert span <= control and len(owner_tiles(m, n, tile["tile_m"], tile["tile_n"], 32)) >= 16
-        assert work["memory@r0:s0"] == pytest.approx(6_963_200)
-        assert coarse["memory@r0:s0"] - work["memory@r0:s0"] == pytest.approx(2 * 1_474_560)
-        assert work["mte2_aic@r0:s0"] > coarse["mte2_aic@r0:s0"]
+        assert span <= control and len(owner_tiles(m, n, tile["tile_m"], tile["tile_n"], 32)) * tile["k_splits"] >= 16
+        assert work["memory@r0:s0"] == pytest.approx(6_963_200 + 2 * tile["k_splits"] * 4 * m * n) and coarse["memory@r0:s0"] > work["memory@r0:s0"]
+        assert work["mte2_aic@r0:s0"] == pytest.approx(coarse["mte2_aic@r0:s0"])
 def test_full_grid_and_compute_sweep_preserve_logical_work():
     assert _price(1024, 4096, 128)[:2] == _price(1024, 4096, 128, options={"underfilled_candidates": ()})[:2]
     _, work, mapping = _price(57, 145, 319, groups=3)
@@ -459,7 +459,7 @@ def test_small_matrix_service_domain_and_memory_supply(hardware):
     native = hardware == GENERATION_PROFILE
     raw["model"]["layers"], raw["machine"]["sku"] = 2, OWNER_GRID_PROFILE if native else hardware
     regimes = json.loads((REPO_ROOT / "examples/service-regimes/a5-small-m-bf16-matmul-20261030.json").read_text())
-    for batch, rate, span in ((32, 2e12, 0.054272), (32, 4e12, 0.027136), (32, 8e12, 0.022096377165033765),
+    for batch, rate, span in ((32, 2e12, 0.054272), (32, 4e12, 0.027136), (32, 8e12, 0.020136971625838044),
                               (32, 1e9, None), (40, 4e12, None)):
         ops = target_graphs(raw, scope="body", phase="decode", tokens=1, context=4104, sequences=batch)[0]
         op = replace(next(op for op in ops if op.op_id == "s0.l1.latent_down"), op_id="independent_matrix", deps=(), layer=-1)

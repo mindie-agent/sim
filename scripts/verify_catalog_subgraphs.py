@@ -2638,7 +2638,7 @@ def _score_latency_pair(pred_u: float, obs_u: float) -> dict[str, Any]:
     return {
         "pred_us": round(pred_u, 3),
         "obs_us": round(obs_u, 3),
-        "signed_err_pct": round(pct, 2),
+        "signed_err_pct": pct,
         "limit_us": round(_physical_limit_us(obs_u), 3),
         "pass_physical_tol": not exceeded,
     }
@@ -3722,11 +3722,12 @@ def _score_l1_in_l2_buckets(
         p_u, o_u = sim_fine_us.get(bucket, 0.0), obs_fine_us.get(bucket, 0.0)
         if p_u <= 0.0 and o_u <= 0.0:
             continue
-        cliff_lim = round(_l1_cliff_limit_us(max(o_u, 0.0)), 3)
+        raw_cliff_lim = _l1_cliff_limit_us(max(o_u, 0.0))
+        cliff_lim = round(raw_cliff_lim, 3)
         if o_u > 0.0 and p_u > 0.0:
             sc = _score_latency_pair(p_u, o_u)
             sc["l1_cliff_limit_us"] = cliff_lim
-            sc["pass_l1_cliff_tol"] = abs(p_u - o_u) <= cliff_lim
+            sc["pass_l1_cliff_tol"] = abs(p_u - o_u) <= raw_cliff_lim
         else:
             sc = {
                 "pred_us": round(p_u, 3), "obs_us": round(o_u, 3),

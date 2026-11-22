@@ -36,11 +36,11 @@ NS_PER_MS = 1_000_000.0
 #: Upstream arch35/matmul_v3_basic_streamk_tiling.cpp:124 GetNegPerf cycle model.
 STREAMK_NEG_CYCLES_PER_SPLIT = 60.0
 STREAMK_NEG_BASE_CYCLES = 1000.0
-#: Dual-side AIC + AIV RTS/STARS sub-block launches and FFTS+ sync rounds for MIX_AIC Stream-K kernels.
+#: Dual-side AIC + AIV RTS/STARS sub-block launches for MIX_AIC Stream-K kernels.
 MIX_AIC_SUBBLOCK_DISPATCHES = 2.0
-STREAMK_AIV_BARRIER_ROUNDS = 2.0
-STREAMK_AIC_BARRIER_ROUNDS = 2.0
-STREAMK_PAIRED_SYNC_ROUNDS = 4.0
+#: Largest standard MatMul baseM tile in DEFAULT_CANDIDATES (for single-M-tile L2 checks).
+MAX_SINGLE_M_TILE = 256
+_GEMM_SHAPE_AXES = 3
 #: Blocking scalar GM load latency per group in grouped_matmul_kernel.h:314
 #: (groupListGm.GetValue(groupIdx) across declared groupNum).
 GROUP_LIST_SCALAR_LOAD_CYCLES = 200.0
@@ -501,9 +501,52 @@ def primitive_nd2nz_mte2_rate_bps_per_aic(
     return total / t_eff if t_eff > 0.0 else single_bps
 
 
+def weight_l2_cache_disabled(
+    context, *, m_tiles: int | None, row_bytes: int, stride_bytes: int, is_grouped: bool,
+) -> bool:
+    """Upstream CANN operand-scoped weight B CACHE_MODE_DISABLE rule.
+
+    - Dense MatMulV3 (arch35/matmul_v3_base_tiling_advanced.h:146-189):
+      requires total GM >= L2 capacity, single M-tile (baseM >= M and mCnt <= 1),
+      and 128B alignment on both inner stride and tile row.
+    - GroupedMatmul (grouped_matmul_kernel.h:566 /
+      arch35/grouped_no_quant_matmul_tiling.cpp:193): honors explicit
+      ``l2_weight_cache_disable`` metadata when set, else A5 total GM >= L2
+      or single M-tile + 128B alignment.
+    """
+    op = getattr(context, "op", None)
+    meta = dict(getattr(op, "metadata", ()) or ()) if op is not None else {}
+    if "l2_weight_cache_disable" in meta:
+        return bool(meta["l2_weight_cache_disable"])
+    l2_bytes, _ = primitive_l2_params(context)
+    if l2_bytes <= 0:
+        return False
+    op_hbm_bytes = float(getattr(op, "hbm_bytes", 0.0) or 0.0) if op is not None else 0.0
+    if op_hbm_bytes < float(l2_bytes):
+        return False
+    if is_grouped and is_arch35_context(context):
+        return True
+    if m_tiles is not None:
+        if int(m_tiles) > 1:
+            return False
+    elif op is not None and not is_grouped:
+        shape = getattr(op, "local_shape", ()) or ()
+        if len(shape) >= _GEMM_SHAPE_AXES:
+            groups = max(1, int(meta.get("matrix_groups", 1) or 1))
+            if (int(shape[-_GEMM_SHAPE_AXES]) // groups) > MAX_SINGLE_M_TILE:
+                return False
+    if int(stride_bytes) <= 0 or int(row_bytes) <= 0:
+        return False
+    return (
+        (int(stride_bytes) % DAV3510_L2_SECTOR_BYTES) == 0
+        and (int(row_bytes) % DAV3510_L2_SECTOR_BYTES) == 0
+    )
+
+
 def primitive_cold_hbm_bps(
     context, *, active_cores: int, row_bytes: int, stride_bytes: int,
     total_tiles: int, is_grouped: bool, is_full_row_coalesced: bool = False,
+    m_tiles: int | None = None, weight_cache_disable: bool | None = None,
 ) -> float | None:
     """Effective die cold-HBM read bandwidth from P01 scaling, strided surface and P05 stride cap."""
     pt = getattr(context, "primitive_table", None)
@@ -513,7 +556,7 @@ def primitive_cold_hbm_bps(
     p01_cold = primitive_p01_scaling_bps(context, active_cores, warm=False)
     if p01_cold is None:
         return hbm_rd
-    l2_bytes, sector = primitive_l2_params(context)
+    _, sector = primitive_l2_params(context)
     cores = max(1, int(getattr(context, "core_count", 1) or 1))
     if is_grouped and is_full_row_coalesced:
         waves = float(math.ceil(max(1, int(total_tiles)) / cores))
@@ -527,12 +570,14 @@ def primitive_cold_hbm_bps(
             steady = (waves - GROUPED_HBM_RAMP_WAVES) / hbm_rd
             return waves / (ramp + steady)
         return ramp_bw
-    op = getattr(context, "op", None)
-    op_hbm_bytes = float(getattr(op, "hbm_bytes", 0.0) or 0.0) if op is not None else 0.0
-    # Upstream CANN CACHE_MODE_DISABLE (grouped_no_quant_matmul_tiling.cpp:193 / P05.cache_disable_supported):
-    # weights exceeding L2 capacity bypass L2 allocation, eliminating P05 L2 stride conflict; on DAV_3510
-    # va_bits_62_60 bypass also avoids the DAV_2201 strided L2-sector ceiling.
-    cache_disable = bool(l2_bytes > 0 and op_hbm_bytes >= float(l2_bytes))
+    cache_disable = (
+        bool(weight_cache_disable)
+        if weight_cache_disable is not None
+        else weight_l2_cache_disabled(
+            context, m_tiles=m_tiles, row_bytes=row_bytes,
+            stride_bytes=stride_bytes, is_grouped=is_grouped,
+        )
+    )
     sector_eff = min(1.0, float(max(1, int(row_bytes))) / float(max(1, sector)))
     cap = p01_cold * sector_eff
     if hbm_rd is not None:
@@ -553,6 +598,7 @@ def primitive_cold_hbm_bps(
 def primitive_wave_cold_hbm_per_owner_bps(
     context, *, cold_tiles: int, row_bytes: int, stride_bytes: int,
     is_grouped: bool, is_full_row_coalesced: bool = False, nn_tiles: int = 1,
+    m_tiles: int | None = None, weight_cache_disable: bool | None = None,
 ) -> float | None:
     """Per-owner cold-HBM cap solving the shared-HBM fluid Engine wave equation.
 
@@ -572,6 +618,7 @@ def primitive_wave_cold_hbm_per_owner_bps(
             context, active_cores=cores, row_bytes=row_bytes,
             stride_bytes=stride_bytes, total_tiles=cold_tiles,
             is_grouped=is_grouped, is_full_row_coalesced=is_full_row_coalesced,
+            m_tiles=m_tiles, weight_cache_disable=weight_cache_disable,
         )
         if bw_full is None or bw_full <= 0.0:
             return None
@@ -582,6 +629,7 @@ def primitive_wave_cold_hbm_per_owner_bps(
             context, active_cores=tail, row_bytes=row_bytes,
             stride_bytes=stride_bytes, total_tiles=cold_tiles,
             is_grouped=is_grouped, is_full_row_coalesced=tail_coalesced,
+            m_tiles=m_tiles, weight_cache_disable=weight_cache_disable,
         )
         if bw_tail is None or bw_tail <= 0.0:
             return None
@@ -628,35 +676,28 @@ def streamk_fixup_latency_ms(
 
 
 def _pure_aic_launch_ms(context) -> float:
-    """Pure-AIC RTS/STARS dispatch + Cube pipe fill/drain + stream completion from L0 primitives."""
+    """Pure-AIC RTS/STARS dispatch + Cube pipe fill/drain from L0 P02/P03/P15."""
     issue_ms = _primitive_band_ms(context, "P15_rts_stars", "issue_interval_ns")
     pipe_ms = (
         _primitive_band_ms(context, "P02_load_data", "setup_ns")
         + _primitive_band_ms(context, "P03_fixpipe", "setup_ns")
     )
-    event_ms = _primitive_band_ms(context, "P16_multistream_core_control", "stream_event_ns")
-    return issue_ms + pipe_ms + event_ms
+    return issue_ms + pipe_ms
 
 
 def _mix_aic_launch_ms(context) -> float:
-    """MIX_AIC Stream-K dual-side launch + FFTS+ cross-core sync from L0 P02/P03/P13/P15/P16."""
+    """MIX_AIC Stream-K dual-side AIC+AIV dispatch + Cube pipe setup from L0 P02/P03/P15.
+
+    Cross-core Stream-K synchronization (1x mode-4 NotifyVector/WaitForCube +
+    1x AIV SyncAll per kernel_matmul_streamk.h:187,205-206) is charged once at
+    the ``split_sync`` dependency via ``streamk_fixup_latency_ms``.
+    """
     issue_ms = _primitive_band_ms(context, "P15_rts_stars", "issue_interval_ns")
     pipe_ms = (
         _primitive_band_ms(context, "P02_load_data", "setup_ns")
         + _primitive_band_ms(context, "P03_fixpipe", "setup_ns")
     )
-    event_ms = _primitive_band_ms(context, "P16_multistream_core_control", "stream_event_ns")
-    aiv_bar = primitive_p13_sync_ms(context, "mode0_aiv_barrier_ns")
-    aic_bar = primitive_p13_sync_ms(context, "mode0_aic_barrier_ns") or aiv_bar
-    paired = primitive_p13_sync_ms(context, "mode2_paired_ns")
-    return (
-        MIX_AIC_SUBBLOCK_DISPATCHES * issue_ms
-        + pipe_ms
-        + event_ms
-        + STREAMK_AIV_BARRIER_ROUNDS * aiv_bar
-        + STREAMK_AIC_BARRIER_ROUNDS * aic_bar
-        + STREAMK_PAIRED_SYNC_ROUNDS * paired
-    )
+    return MIX_AIC_SUBBLOCK_DISPATCHES * issue_ms + pipe_ms
 
 
 def matrix_kernel_setup_ms(

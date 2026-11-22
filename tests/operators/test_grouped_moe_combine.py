@@ -586,8 +586,14 @@ def test_uncalibrated_matrix_helpers_return_neutral_defaults():
     assert primitive_cold_hbm_bps(big_ctx, **kw) > primitive_cold_hbm_bps(cal_ctx, **kw)
     cd_lg = build_aclnn_call({"api": "aclnnMatmul", "dtype": "bf16", "m": 4, "n": 4096, "k": 4096})
     cal_lg = ctx_of(cd_lg.ops[0])
-    assert MappedMatmul(candidates=LEGACY_128_CANDIDATES).select(cal_lg)[0].tile_n == 256
-    assert MappedMatmul(candidates=LEGACY_128_CANDIDATES).select(replace(cal_lg, primitive_table=None))[0].tile_n == 128
+    cal_sel = MappedMatmul(candidates=LEGACY_128_CANDIDATES).select(cal_lg)[0]
+    assert cal_sel.tile_n == 256 and MappedMatmul(candidates=LEGACY_128_CANDIDATES).select(replace(cal_lg, primitive_table=None))[0] == cal_sel
+    cd_big = build_aclnn_call({"api": "aclnnMatmul", "dtype": "bf16", "m": 1024, "n": 32768, "k": 8192})
+    _, _, ctx_a5 = _calibrated_case_and_eval(DT_SKUS[0], cd_big.recipes)
+    ctx_big = ctx_a5(cd_big.ops[0])
+    assert primitive_cold_hbm_bps(ctx_big, active_cores=ctx_big.core_count, row_bytes=512, stride_bytes=65536, total_tiles=128, is_grouped=False, m_tiles=4) < 1200e9
+    assert primitive_cold_hbm_bps(ctx_big, active_cores=ctx_big.core_count, row_bytes=512, stride_bytes=65536, total_tiles=128, is_grouped=False, m_tiles=1) > 2000e9
+    assert matrix_kernel_setup_ms(ctx_big, is_streamk=False) == pytest.approx(matrix_kernel_floor_ms(ctx_big))
     ctx = replace(cal_ctx, primitive_table=None)
     assert matrix_kernel_setup_ms(ctx, is_streamk=True, declared_groups=16) == 0.0
     assert matrix_kernel_floor_ms(ctx) == 0.0 and streamk_fixup_latency_ms(ctx, k_splits=4, used_cores=8) == 0.0

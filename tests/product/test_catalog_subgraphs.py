@@ -582,7 +582,8 @@ def test_sanitization_and_tutorial_exec_mxfp4_and_mso_false(tmp_path: Path) -> N
     assert harness._parse_mtp_spec_tokens('{"method": "qwen3_5_mtp", "num_speculative_tokens": 3}') == 3
     assert harness._mc2_protocol_link_bytes({"mc2_phase": {"route_matrix_bytes": [[10, 40], [30, 5]]}}) == 40.0
     assert harness._l1_cliff_limit_us(10.0) == 3.0 and harness._l1_cliff_limit_us(100.0) == 15.0
-    assert harness._summarize_l1_two_tier({"a": {"signed_err_pct": 8.004, "pass_l1_cliff_tol": True}})["l1_two_tier_pass"] is False
+    assert harness._summarize_l1_two_tier({"a": {**harness._score_latency_pair(108.004, 100.0), "pass_l1_cliff_tol": True}})["l1_two_tier_pass"] is False
+    assert harness._summarize_l1_two_tier({f"p{i}": {**harness._score_latency_pair(100.0 + e, 100.0), "pass_l1_cliff_tol": True} for i, e in enumerate((1.0, 2.0, 3.0, 4.0, 12.004))})["l1_two_tier_pass"] is False
     canc = [{"l1_two_tier_pass": True, "l1_in_l2_scores": {
         f"b{i}": {"signed_err_pct": e, "pass_l1_cliff_tol": True} for i, e in enumerate((10.0, -10.0, 0.0, 0.0, 0.0))
     }}]

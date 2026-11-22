@@ -196,7 +196,7 @@ def test_mainline_seed_screens_against_its_own_faster_wall():
     assert report.dsl_plan == dossier.mainline_plan
     impact, = report.waterfall.loo_impacts
     assert impact.edit_id == SHIPPING_OVERLAY
-    assert impact.marginal_delta_ns == dossier.u_wall_ns - dossier.m_wall_ns == 354
+    assert impact.marginal_delta_ns == dossier.u_wall_ns - dossier.m_wall_ns == 82
 
 def test_unmerge_winner_has_empty_leave_one_out_despite_shipping_regression():
     case = _case(REPRESENTATIVE_SKUS["a5"], tp=1)

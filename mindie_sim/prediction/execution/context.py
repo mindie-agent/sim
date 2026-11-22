@@ -724,7 +724,12 @@ class _ContextMixin:
                         raise
             if (band_plan is not None
                     and not set(band_plan.accounting().wire_by_resource).issubset(self.engine.resources)):
-                band_plan = None
+                local_ranks = frozenset(
+                    int(die.rank) for die in self.stage_dies[replica, op.stage]
+                )
+                band_plan = band_plan.scoped_to_ranks(
+                    local_ranks, available_resources=self.engine.resources
+                )
             if band_plan is not None:
                 plan_binding = _CollectivePlanBinding(algorithm, plan=band_plan)
             else:

@@ -212,10 +212,47 @@ class BandCollectivePlan:
             tuple(
                 (group.ranks, group.lowered.band, group.lowered.api_bytes_per_rank,
                  group.lowered.total_wire_bytes, group.lowered.collective_startup_us,
-                 group.lowered.local_hbm_bytes_per_rank)
+                 group.lowered.local_hbm_bytes_per_rank,
+                 tuple(
+                     (p.name, len(p.transfers), tuple(sorted({t.source for t in p.transfers})))
+                     for p in group.lowered.phases
+                 ))
                 for group in self.groups
             ),
         )
+
+    def scoped_to_ranks(
+        self,
+        local_ranks: frozenset[int],
+        *,
+        available_resources: Mapping[str, object] | frozenset[str] | set[str],
+    ) -> BandCollectivePlan | None:
+        """Retain local-rank transfers and HBM staging on an isolated engine."""
+        scoped_groups: list[BandCollectiveGroup] = []
+        for group in self.groups:
+            if not (set(group.ranks) & local_ranks):
+                continue
+            lowered = group.lowered
+            scoped_phases = []
+            for phase in lowered.phases:
+                sourced = [t for t in phase.transfers if t.source in local_ranks]
+                chosen = sourced or [t for t in phase.transfers if t.destination in local_ranks]
+                kept_transfers = []
+                for transfer in chosen:
+                    kept_hops = []
+                    for hop in transfer.hops:
+                        res = tuple(r for r in hop.resources if r in available_resources)
+                        if res:
+                            kept_hops.append(replace(hop, resources=res))
+                    if kept_hops:
+                        kept_transfers.append(replace(transfer, hops=tuple(kept_hops)))
+                scoped_phases.append(replace(phase, transfers=tuple(kept_transfers)))
+            scoped_groups.append(
+                replace(group, lowered=replace(lowered, phases=tuple(scoped_phases)))
+            )
+        if not scoped_groups:
+            return None
+        return replace(self, groups=tuple(scoped_groups))
 
     def lower_with_local_work(self, context, base_program):
         """Wrap this lowered collective plan inside preserved local stages."""

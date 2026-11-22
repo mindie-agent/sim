@@ -95,8 +95,7 @@ class TopologyCollectiveRecipe:
             )
             base = _with_setup(context, phases)
         bound_plan = getattr(binding, "plan", None)
-        pt = getattr(context, "primitive_table", None)
-        if isinstance(bound_plan, BandCollectivePlan) and hasattr(pt, "cell"):
+        if isinstance(bound_plan, BandCollectivePlan):
             return bound_plan.lower_with_local_work(context, base)
         return base
 

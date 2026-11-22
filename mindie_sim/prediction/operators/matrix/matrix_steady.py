@@ -66,6 +66,7 @@ def _resolve_calibrated_hbm_cap(
         context, cold_tiles=cold_tiles, row_bytes=row_bytes,
         stride_bytes=stride_bytes, is_grouped=is_grouped,
         is_full_row_coalesced=coalesced, nn_tiles=int(geometry.nn),
+        m_tiles=int(geometry.nm),
     )
     if per_owner_bps is None or per_owner_bps <= 0.0:
         if geometry.nm == 1 and dram_rate is not None:

@@ -327,6 +327,7 @@ def _calibrated_hbm_rate_ms(context, geometry, recipe, *, width, hbm_declared):
         context, active_cores=active, row_bytes=row_bytes,
         stride_bytes=stride_bytes, total_tiles=geometry.tiles,
         is_grouped=is_grouped, is_full_row_coalesced=coalesced,
+        m_tiles=int(geometry.nm),
     )
     if cold_bps is None or cold_bps <= 0.0:
         return hbm_declared
@@ -337,9 +338,6 @@ def _candidate_split_k(context, *, m, n, k, tk, output_tiles, groups, compute_fo
     """Architecture-grounded Split-K / Stream-K factor for one tile candidate."""
     if output_tiles >= context.core_count or k <= tk:
         return 1
-    pt = getattr(context, "primitive_table", None)
-    if pt is None:
-        return min(k // tk, max(1, context.core_count // max(1, output_tiles)), MAX_SPLIT_K)
     if groups > 1:
         return 1
     cores = max(1, int(context.core_count))
@@ -378,6 +376,7 @@ def _arch35_streamk_perf(context, recipe, geometry, *, split_k: int, output_tile
         row_bytes=int(min(recipe.tile_n, n) * width),
         stride_bytes=int(n * width),
         total_tiles=max(1, int(output_tiles)), is_grouped=False,
+        m_tiles=int(geometry.nm),
     )
     b_hbm_full = min(hbm_full, strided_bps / MS_PER_SECOND) if strided_bps else hbm_full
     l2_agg = primitive_p01_scaling_bps(context, cores, warm=True)
@@ -444,6 +443,7 @@ def _split_k_bound(context, recipe, geometry, *, bound, split_k, output_tiles):
         row_bytes=int(min(recipe.tile_n, n) * width),
         stride_bytes=int(n * width),
         total_tiles=used_cores, is_grouped=False,
+        m_tiles=int(geometry.nm),
     )
     eff_hbm_r = min(hbm_r, cold_bps / MS_PER_SECOND) if cold_bps else hbm_r
     hbm_ms = hbm_reads / eff_hbm_r + context.op.mte3_bytes / hbm_r
@@ -646,18 +646,21 @@ class MappedMatmul:
         steady path (a caller that has no mapping observer).  Selection itself
         is identical: the same cached recipe object is returned either way.
         """
-        pt = getattr(context, "primitive_table", None)
-        pt_key = (getattr(pt, "sku", None), getattr(pt, "arch_preset", None)) if pt is not None else None
+        host_ctx = (
+            replace(context, primitive_table=None)
+            if getattr(context, "primitive_table", None) is not None
+            else context
+        )
         rows_key = tuple(int(v) for v in group_rows) if group_rows is not None else None
         cache_key = (
-            _matmul_recipe_key(self), _op_matrix_key(context.op), context.core_count,
-            tuple(sorted(context.resource_names.items())),
-            tuple(sorted(context.rates.items())),
-            tuple(sorted(context.work.items())),
-            tuple(sorted(context.resource_units.items())),
-            tuple(sorted(context.pool_capacities.items())),
-            getattr(context.physical_mechanisms, "signature", None),
-            pt_key, rows_key,
+            _matmul_recipe_key(self), _op_matrix_key(host_ctx.op), host_ctx.core_count,
+            tuple(sorted(host_ctx.resource_names.items())),
+            tuple(sorted(host_ctx.rates.items())),
+            tuple(sorted(host_ctx.work.items())),
+            tuple(sorted(host_ctx.resource_units.items())),
+            tuple(sorted(host_ctx.pool_capacities.items())),
+            getattr(host_ctx.physical_mechanisms, "signature", None),
+            rows_key,
         )
         if cache_key in _SELECT_CACHE:
             recipe, record = _SELECT_CACHE[cache_key]
@@ -665,20 +668,20 @@ class MappedMatmul:
         records = []
         selected = None
         selected_geometry = None
-        meta = dict(context.op.metadata)
+        meta = dict(host_ctx.op.metadata)
         groups = int(meta.get("matrix_groups", 1))
         if rows_key is None:
-            if groups < 1 or context.op.local_shape[(-3)] % groups:
+            if groups < 1 or host_ctx.op.local_shape[(-3)] % groups:
                 raise ModelingError("matrix_groups_require_equal_integer_rows")
-            m = context.op.local_shape[(-3)] // groups
+            m = host_ctx.op.local_shape[(-3)] // groups
         else:
             groups = len(rows_key)
             if groups < 1:
                 raise ModelingError("matrix_groups_require_positive_integer")
             m = max(rows_key, default=0)
-        compute_format = meta.get("compute_format", context.op.dtype or "bf16")
-        n = context.op.local_shape[(-2)]
-        k = context.op.local_shape[(-1)]
+        compute_format = meta.get("compute_format", host_ctx.op.dtype or "bf16")
+        n = host_ctx.op.local_shape[(-2)]
+        k = host_ctx.op.local_shape[(-1)]
         default_grid = (
             sum(math.ceil(r / REFILL_M) for r in rows_key) * math.ceil(n / REFILL_M)
             if rows_key is not None
@@ -688,15 +691,15 @@ class MappedMatmul:
         # can fill more owners, even when the usual supply budget is unmet.
         fp32_subtiles = self.candidates is None and compute_format == "fp32"
         automatic_subtiles = fp32_subtiles or (
-            _has_subtile_supply(context) and (
+            _has_subtile_supply(host_ctx) and (
                 self.candidates is None
-                or m < context.core_count * REFILL_M
-                or default_grid < context.core_count))
+                or m < host_ctx.core_count * REFILL_M
+                or default_grid < host_ctx.core_count))
         narrow = (NARROW_CANDIDATES if automatic_subtiles else ()
                   ) if self.narrow_candidates is None else self.narrow_candidates
         narrow = narrow if n <= MIN_NARROW_N else ()
         arch35_macro_streamk = (
-            pt is not None and is_arch35_context(context)
+            is_arch35_context(host_ctx)
             and compute_format != "fp32" and groups == 1
             and n >= ARCH35_MACRO_MIN_N and k >= ARCH35_MACRO_MIN_K
         )
@@ -705,23 +708,20 @@ class MappedMatmul:
             else ((UNDERFILLED_CANDIDATES if automatic_subtiles else ())
                   if self.underfilled_candidates is None else self.underfilled_candidates)
         )
-        underfilled = underfilled if default_grid < context.core_count else ()
+        underfilled = underfilled if default_grid < host_ctx.core_count else ()
         use_default_tiling = (
             self.candidates is None
-            or (
-                pt is not None
-                and tuple(tuple(t) for t in self.candidates) == LEGACY_128_CANDIDATES
-            )
+            or tuple(tuple(t) for t in self.candidates) == LEGACY_128_CANDIDATES
         )
         candidates = [(tile, False) for tile in
                       (DEFAULT_CANDIDATES if use_default_tiling else self.candidates)]
-        if (pt is not None and not is_arch35_context(context) and groups > 1
+        if (not is_arch35_context(host_ctx) and groups > 1
                 and use_default_tiling and n >= ARCH35_MACRO_MIN_N):
             # Upstream DAV_2201 SPLIT_M GroupedMatmul fixes baseN = BEST_BASEN (256)
             # (ops-transformer/gmm/grouped_matmul/op_host/op_tiling/grouped_matmul_tiling.cpp:1693-1738).
             candidates = [(tile, flag) for tile, flag in candidates if tile[1] == ARCH35_MACRO_MIN_N]
-        if (pt is not None and not is_arch35_context(context) and groups == 1
-                and use_default_tiling and default_grid < context.core_count):
+        if (not is_arch35_context(host_ctx) and groups == 1
+                and use_default_tiling and default_grid < host_ctx.core_count):
             candidates.extend((tile, True) for tile in DAV2201_SMALL_M_CANDIDATES)
         candidates.extend((tile, True) for tile in narrow)
         candidates.extend((tile, True) for tile in underfilled if tile not in narrow)
@@ -735,7 +735,7 @@ class MappedMatmul:
                 else math.ceil(m / tm) * math.ceil(n / tn) * groups
             )
             split_k = _candidate_split_k(
-                context, m=m, n=n, k=k, tk=tk, output_tiles=output_tiles,
+                host_ctx, m=m, n=n, k=k, tk=tk, output_tiles=output_tiles,
                 groups=groups, compute_format=compute_format,
             )
             recipe = HierarchicalMatmul(
@@ -747,18 +747,18 @@ class MappedMatmul:
                 raise ModelingError("matrix_tile_dimensions_and_slots_must_be_positive")
             if tm % cm or tn % cn:
                 raise ModelingError("matrix_refill_tiles_must_be_multiples_of_compute_tiles")
-            geometry = matrix_geometry(context, recipe, group_rows=rows_key)
-            buffers = footprint(context, recipe, geometry=geometry)
+            geometry = matrix_geometry(host_ctx, recipe, group_rows=rows_key)
+            buffers = footprint(host_ctx, recipe, geometry=geometry)
             exceeded = {pool: size for pool, size in buffers.items()
-                        if pool in context.pool_capacities and size > context.pool_capacities[pool]}
+                        if pool in host_ctx.pool_capacities and size > host_ctx.pool_capacities[pool]}
             # Host tiling runs from static (M, N, K) and never observes transient L2 warmth.
             if exceeded:
                 bound = None
             elif arch35_macro_streamk and split_k > 1:
                 base_perf = _arch35_streamk_perf(
-                    context, recipe, geometry, split_k=1, output_tiles=output_tiles)
+                    host_ctx, recipe, geometry, split_k=1, output_tiles=output_tiles)
                 sk_perf = _arch35_streamk_perf(
-                    context, recipe, geometry, split_k=split_k, output_tiles=output_tiles)
+                    host_ctx, recipe, geometry, split_k=split_k, output_tiles=output_tiles)
                 if sk_perf < base_perf:
                     bound = sk_perf
                 else:
@@ -770,15 +770,15 @@ class MappedMatmul:
                     bound = base_perf
             elif arch35_macro_streamk:
                 bound = _arch35_streamk_perf(
-                    context, recipe, geometry, split_k=1, output_tiles=output_tiles)
+                    host_ctx, recipe, geometry, split_k=1, output_tiles=output_tiles)
             else:
                 bound = mapping_bound(
-                    context, recipe, geometry=geometry,
+                    host_ctx, recipe, geometry=geometry,
                     allow_unequal_groups=rows_key is not None,
-                    ignore_l2_hits=(pt is not None))
-                if pt is not None and split_k > 1:
+                    ignore_l2_hits=True)
+                if split_k > 1:
                     split_bound = _split_k_bound(
-                        context, recipe, geometry, bound=bound,
+                        host_ctx, recipe, geometry, bound=bound,
                         split_k=split_k, output_tiles=output_tiles)
                     if split_bound >= bound:
                         split_k = 1
@@ -788,7 +788,7 @@ class MappedMatmul:
                             self.reuse_weights, split_k)
                     else:
                         bound = split_bound
-            waves = math.ceil(output_tiles / context.core_count)
+            waves = math.ceil(output_tiles / host_ctx.core_count)
             records.append({"tile": [tm, tn, tk], "split_k": split_k,
                             "footprint_bytes_per_owner": buffers,
                             "exceeded_pools": exceeded, "resource_bound_ms": bound,

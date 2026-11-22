@@ -548,3 +548,20 @@ def test_collective_algorithm_and_hccs_k8_alltoall_staging_independent_of_calibr
     assert low_a2a.local_hbm_bytes_per_rank == pytest.approx(4.0 * 4 * 1024 * 1024)
     low_direct = lower_collective("alltoall", (0, 1, 2, 3), topo_a2, HCCL_DEFAULT_BUFFSIZE_BYTES + 1024 * 1024)
     assert low_direct.local_hbm_bytes_per_rank == 0.0
+
+    from mindie_sim import operator_costs
+    from mindie_sim.prediction.call_builders import build_aclnn_call
+    from mindie_sim.prediction.evaluation import EvaluationContext
+    raw_ep4 = compose_case("deepseek-v2-lite", "Ascend910B4", tp=1, dp=4, pp=1, ep=4)
+    op_a2a = replace(
+        build_aclnn_call({"api": "aclnnMatmul", "dtype": "bf16", "m": 16, "n": 256, "k": 1024}).ops[0],
+        op_id="a2a_iso", family="alltoall", recipe="alltoall", flops=0, matrix_flops=(),
+        vector_ops=0, hbm_bytes=0, mte2_bytes=0, mte3_bytes=0,
+        link_bytes=3 * 1048576, link_scope="ep", metadata=(("group_axis", "ep"), ("collective", "alltoall")),
+    )
+    ev_cal = EvaluationContext.create(parse_case(raw_ep4), primitive_table=load_primitives("Ascend910B4"))
+    for ev in (None, ev_cal):
+        serviced = operator_costs(raw_ep4, [op_a2a], evaluation=ev)["operators"][0]["serviced"]
+        links = {k: v for k, v in serviced.items() if k.startswith("link:")}
+        assert len(links) == 3 and all(v == pytest.approx(1048576.0) for v in links.values())
+        assert serviced.get("memory@r0:s0", 0.0) == pytest.approx(16 * 1048576.0)

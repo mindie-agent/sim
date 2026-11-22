@@ -264,7 +264,10 @@ def _k_slices(k: float, count: int) -> tuple[int, ...]:
     return tuple(value for value in slices if value > 0)
 
 
-def _per_owner_cap(context, owners: int, *, row_bytes: int = 0, stride_bytes: int = 0) -> dict[str, float]:
+def _per_owner_cap(
+    context, owners: int, *, row_bytes: int = 0, stride_bytes: int = 0,
+    m_tiles: int | None = None,
+) -> dict[str, float]:
     """Service-mode bytes/second as a bytes/ms cap for one active owner."""
     hbm = context.resource_names.get("hbm")
     if hbm is None or owners < 1:
@@ -274,6 +277,7 @@ def _per_owner_cap(context, owners: int, *, row_bytes: int = 0, stride_bytes: in
         cold_bps = primitive_cold_hbm_bps(
             context, active_cores=active, row_bytes=row_bytes,
             stride_bytes=stride_bytes, total_tiles=owners, is_grouped=False,
+            m_tiles=m_tiles,
         )
         if cold_bps is not None and cold_bps > 0.0:
             return {hbm: cold_bps / (MS_PER_SECOND * float(active))}
@@ -519,9 +523,11 @@ def splitk_program(context, split_count: int, *, recipe=None, geometry=None,
     tile_n_dim = min(n, float(recipe.tile_n)) if recipe is not None else n
     tile_k_dim = int(recipe.tile_k) if recipe is not None else 0
     used_cores = max(1, min(cores, len(tasks)))
+    m_tiles = max(1, math.ceil(total_m / max(1.0, tile_m_dim)))
     split_caps = _per_owner_cap(
         context, len(tasks),
-        row_bytes=int(tile_n_dim) * elem_bytes, stride_bytes=int(n) * elem_bytes)
+        row_bytes=int(tile_n_dim) * elem_bytes, stride_bytes=int(n) * elem_bytes,
+        m_tiles=m_tiles)
     write_caps = _partial_write_caps(
         context, split_caps, total_partial_bytes=partial_write, active_tasks=len(tasks))
     merge_caps = _merge_owner_cap(context, len(areas), total_partial_bytes=partial_write)

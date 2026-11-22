@@ -527,4 +527,4 @@ def test_splitk_executes_each_flop_once_and_charges_partial_traffic():
     assert traffic["partial_read_bytes"] == pytest.approx(4 * 8 * 32 * 32)
     assert traffic["merge_vector_ops"] == pytest.approx((8 - 1) * 32 * 32)
     assert traffic["merge_latency_ms"] == 0.0
-    assert record["split_k_tasks"] == 4 * 8
+    assert record["split_k_tasks"] == geometry.tiles * 8
