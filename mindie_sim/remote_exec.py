@@ -1163,8 +1163,16 @@ def _candidate(entrypoint, base, candidate, deadline):
                 options["primitive_table"] = _decode_primitive_table(table)
             result = spine.optimize_ladder(case, _step_request(raw), replay=replay, **options)
         check_active_deadline()
+        wire = json_payload(result)
+        if entrypoint == "optimize_ladder":
+            # Public plan encoding lets a remote winner feed `finalize_plan` unchanged.
+            from mindie_sim.rewrite import encode_rewrite_plan
+
+            for key in ("framework_plan", "dsl_plan"):
+                wire[key] = encode_rewrite_plan(getattr(result, key))
+            wire["verification"]["passed"] = bool(result.verification.passed)
         return {"candidate_id": candidate["candidate_id"], "objective_key": candidate["objective_key"],
-                "result": json_payload(result)}
+                "result": wire}
     finally:
         ACTIVE_DEADLINE_MONO.reset(token)
 

@@ -24,7 +24,7 @@ import pytest
 
 from _support.axes import REPRESENTATIVE_SKUS
 from _support.hardware import sku_case
-from mindie_sim import api, remote_exec as remote, remote_exec as worker
+from mindie_sim import api, remote_exec as remote, remote_exec as worker, rewrite
 from mindie_sim.optimization.contracts import PrimitiveCapacityEntry, PrimitiveCapacityTable
 from mindie_sim.prediction.results import ReplayOptions, StepRequest, json_payload
 from mindie_sim.prediction.spine import default_spine
@@ -77,8 +77,7 @@ def _dispatcher(cwd, target, *, warm=False, endpoints=None, probe=None, **kwargs
 def test_local_dispatch_matches_public_prediction(tmp_path, monkeypatch, prediction_case, variant):
     monkeypatch.setattr(remote, "_read_config", _unexpected)
     monkeypatch.setattr(remote, "_exchange", _unexpected)
-    dispatcher = _dispatcher(tmp_path, "local", endpoints=_unexpected, probe=_unexpected,
-                             stage_fn=_unexpected, exec_fn=_unexpected)
+    dispatcher = _dispatcher(tmp_path, "local", endpoints=_unexpected, probe=_unexpected, stage_fn=_unexpected, exec_fn=_unexpected)
     step = StepRequest(phase="decode", context=16, sequences=(2,))
     replay = ReplayOptions(include_submission=True)
     entrypoint = "evaluate_three_tiers" if variant == "three_tiers" else "optimize_ladder"
@@ -94,8 +93,7 @@ def test_local_dispatch_matches_public_prediction(tmp_path, monkeypatch, predict
         step = replace(step, phase="prefill", context=0, tokens=1024)
         options = dict(max_trials=0, primitive_table=table)
     expected = json_payload(getattr(api, entrypoint)(prediction_case, step, replay=replay, **options))
-    spine = default_spine()
-    predict = Mock(wraps=getattr(spine, entrypoint))
+    predict = Mock(wraps=getattr(spine := default_spine(), entrypoint))
     monkeypatch.setattr(spine, entrypoint, predict)
     if entrypoint == "optimize_ladder":
         result, receipt = dispatcher.optimize_ladder(prediction_case, [dict(request=step, replay=replay, options=options)])
@@ -106,14 +104,15 @@ def test_local_dispatch_matches_public_prediction(tmp_path, monkeypatch, predict
     predict.assert_called_once_with(prediction_case, step, replay=replace(replay, deadline_mono=deadline), **options)
     actual = result["results"][0]["result"]
     if entrypoint == "optimize_ladder":
-        for report in (actual, expected):
-            del report["dual_subgradient"]["solve_ms"]
+        for key in ("framework_plan", "dsl_plan"):  # Public plan wire, so a remote winner feeds finalize_plan.
+            actual[key] = json_payload(rewrite.decode_rewrite_plan(actual[key]))
+        assert actual["verification"].pop("passed") is all(gate["passed"] for gate in actual["verification"]["gates"])
+        for row in (actual, expected): del row["dual_subgradient"]["solve_ms"]
     assert actual == expected
     if variant == "primitive_table":
         assert predict.call_args.kwargs["primitive_table"].to_envelope_dict() == table.to_envelope_dict()
-        ladder = actual["ladder"]
         assert all(gate["passed"] for gate in actual["verification"]["gates"])
-        assert 0 < ladder["l_star_hw_ns"] <= ladder["l_star_lean_ns"] <= ladder["a_star_dsl_ns"]
+        assert 0 < actual["ladder"]["l_star_hw_ns"] <= actual["ladder"]["l_star_lean_ns"] <= actual["ladder"]["a_star_dsl_ns"]
 
 
 @pytest.mark.parametrize("target,warm,count,expected,reason", [
