@@ -589,3 +589,10 @@ def test_sanitization_and_tutorial_exec_mxfp4_and_mso_false(tmp_path: Path) -> N
     assert harness._aggregate_gate_b_two_tier_stats(canc)["l1_in_l2_all_buckets_two_tier_pass"] is False
     assert harness._select_canonical_tp_width(SimpleNamespace(num_heads=16, num_kv_heads=16, layer_plans=()), is_mla=True) == 2
     assert harness._load_calibrated_primitive_table(harness.DEFAULT_A5_SKU) is not None
+    assert live_runner._single_card_ep_routed_counts(4, 8, dp=1, tp=4, ep=8, pcp=1, sequences=4, active_sequences=4, q_len=1, overlay="dec") == (1, 8)
+    assert live_runner._single_card_ep_routed_counts(8, 10, dp=1, tp=2, ep=8, pcp=1, sequences=8, active_sequences=6, q_len=1, overlay="eager_padded_b8_a6") == (1, 10)
+    assert live_runner._single_card_ep_routed_counts(4, 8, dp=8, tp=1, ep=8, pcp=1, sequences=4, active_sequences=4, q_len=1, overlay="dec") == (4, 8)
+    assert live_runner.L2_FLUSH_BYTES >= 256 * live_runner.MIB
+    copied: list[int] = []
+    live_runner._flush_l2_cache(("src", SimpleNamespace(copy_=lambda src: copied.append(1 if src == "src" else 0))))
+    assert copied == [1]

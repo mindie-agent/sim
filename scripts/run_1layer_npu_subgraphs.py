@@ -75,6 +75,7 @@ MIB = 1024 * 1024
 GIB = 1024 * MIB
 MIN_FREE_HBM_BYTES = 2 * GIB
 HBM_HEADROOM_BYTES = 512 * MIB
+L2_FLUSH_BYTES = 256 * MIB
 MAX_SYNTH_WEIGHT_BYTES = 6 * GIB
 DEFAULT_KV_BLOCK_SIZE = 128
 DEFAULT_RMS_EPS = 1e-6
@@ -659,6 +660,21 @@ def _sample_loaded_aicore_freq(torch_mod: Any, blocker_pair: tuple[Any, Any] | N
     return freq_mhz
 
 
+def _alloc_l2_flush_pair(torch_mod: Any, device: str) -> tuple[Any, Any]:
+    """Allocate two 256 MiB buffers (512 MiB R+W sweep) to evict L2 cleanly between steps."""
+    n_elem = L2_FLUSH_BYTES // BF16_BYTES
+    return (
+        torch_mod.ones((n_elem,), dtype=torch_mod.bfloat16, device=device),
+        torch_mod.empty((n_elem,), dtype=torch_mod.bfloat16, device=device),
+    )
+
+
+def _flush_l2_cache(l2_flush_pair: tuple[Any, Any] | None) -> None:
+    """Thrash L2 with >= 512 MiB R+W outside the profiled window so 1-layer weights stream cold from HBM."""
+    if l2_flush_pair is not None:
+        l2_flush_pair[1].copy_(l2_flush_pair[0])
+
+
 def _profile_callable(
     torch_mod: Any,
     torch_npu_mod: Any,
@@ -667,13 +683,14 @@ def _profile_callable(
     rank: int = 0,
     dist_group: Any = None,
     blocker_pair: tuple[Any, Any] | None = None,
+    l2_flush_pair: tuple[Any, Any] | None = None,
     ring_slots: int = 1,
     warmup_iters: int = SUBGRAPH_WARMUP_ITERS,
     cpu_store: Any = None,
     world_size: int = 1,
     barrier_tag: str = "",
 ) -> dict[str, Any]:
-    """Warm up, time StreamBlocker-saturated events, and capture all ``kernel_details.csv`` rows."""
+    """Warm up, flush L2 between steps, time events, and capture all ``kernel_details.csv`` rows."""
     for idx in range(warmup_iters):
         warm_err: Exception | None = None
         try:
@@ -699,6 +716,7 @@ def _profile_callable(
             torch_mod.distributed.barrier(group=dist_group)
         iter_err: Exception | None = None
         try:
+            _flush_l2_cache(l2_flush_pair)
             if blocker_pair is not None:
                 for _ in range(STREAM_BLOCKER_ITERS):
                     _ = torch_mod.matmul(blocker_pair[0], blocker_pair[1])
@@ -728,6 +746,9 @@ def _profile_callable(
         if blocker_pair is not None:
             for _ in range(DVFS_LOCK_PRE_ITERS):
                 _ = torch_mod.matmul(blocker_pair[0], blocker_pair[1])
+        # Flush L2 strictly outside torch_npu.profiler.profile() so 1-layer weights stream cold
+        # from HBM without injecting flush copy kernels into kernel_details.csv.
+        _flush_l2_cache(l2_flush_pair)
         if dist_group is not None:
             torch_mod.distributed.barrier(group=dist_group)
         torch_mod.npu.synchronize()
@@ -774,6 +795,8 @@ def _profile_callable(
     summary = _span_from_kernels(kernels)
     return {
         "stream_blocked": blocker_pair is not None and matched_blockers == STREAM_BLOCKER_ITERS,
+        "l2_flushed": l2_flush_pair is not None,
+        "l2_flush_bytes": (2 * L2_FLUSH_BYTES) if l2_flush_pair is not None else 0,
         "blocker_expected_count": STREAM_BLOCKER_ITERS if blocker_pair is not None else 0,
         "blocker_matched_count": matched_blockers,
         "blocker_stripped_rows": stripped,
@@ -1970,6 +1993,104 @@ def _run_moe_owner_routed_ep(
     return comb_orig.view(tokens, local_top_k, hidden)
 
 
+def _single_card_ep_routed_counts(
+    tokens: int,
+    local_top_k: int,
+    *,
+    dp: int,
+    tp: int,
+    ep: int,
+    pcp: int,
+    sequences: int,
+    active_sequences: int,
+    q_len: int,
+    overlay: str,
+) -> tuple[int, int]:
+    """Return single-EP-rank ``(routed_tokens, eff_top_k)`` matching ``mindie_sim`` TP+EP sharding."""
+    eff_tokens = max(1, int(tokens))
+    if ep > 1 and active_sequences < sequences and "eager" in overlay.lower():
+        dp_eff = max(dp, math.ceil(ep / max(1, tp * pcp)))
+        eff_tokens = max(1, math.ceil(max(1, active_sequences) / max(1, dp_eff))) * max(1, q_len)
+    if ep <= 1 or tp <= 1:
+        return eff_tokens, local_top_k
+    if eff_tokens >= tp and eff_tokens % tp == 0:
+        return eff_tokens // tp, local_top_k
+    if local_top_k >= tp and local_top_k % tp == 0:
+        return eff_tokens, local_top_k // tp
+    r_tok = max(1, eff_tokens // tp)
+    target_slots = max(1, (eff_tokens * local_top_k) // tp)
+    r_k = max(1, min(local_top_k, round(target_slots / r_tok)))
+    return r_tok, r_k
+
+
+def _build_mhc_block_wrapper(
+    torch_mod: Any,
+    torch_npu_mod: Any,
+    spec: dict[str, Any],
+    device: str,
+    *,
+    is_ffn: bool,
+) -> tuple[Callable[[Callable[..., Any]], Callable[..., Any]], dict[str, Any]] | None:
+    """Build synthetic Hyper-Connections (low-rank or Sinkhorn mHC) pre/post wrapper when ``hc_mult > 1``."""
+    hc_mult = int(spec.get("hc_mult", 0) or 0)
+    if hc_mult <= 1:
+        return None
+    hidden = int(spec["hidden_size"])
+    hc_lowrank = int(spec.get("hc_lowrank", 0) or 0)
+    hc_sinkhorn = int(spec.get("hc_sinkhorn_iters", 0) or 0)
+    wide_dim = hc_mult * hidden
+    if hc_lowrank > 0:
+        hc_norm_w = torch_mod.ones((wide_dim,), dtype=torch_mod.bfloat16, device=device)
+        down_out = hc_lowrank + hc_mult * hc_mult
+        hc_down = _make_linear_fn(torch_mod, torch_npu_mod, wide_dim, down_out, "bf16", device)
+        hc_up = _make_linear_fn(torch_mod, torch_npu_mod, hc_lowrank, wide_dim, "bf16", device)
+        mix_w = torch_mod.full((hc_mult,), 1.0 / float(hc_mult), dtype=torch_mod.bfloat16, device=device)
+
+        def _wrap_lowrank(inner_fn: Callable[..., Any]) -> Callable[..., Any]:
+            def _run(*args: Any) -> Any:
+                x_in = args[0]
+                streams = x_in.unsqueeze(1).expand(-1, hc_mult, -1).reshape(x_in.shape[0], wide_dim).contiguous()
+                normed, _ = torch_npu_mod.npu_rms_norm(streams, hc_norm_w, DEFAULT_RMS_EPS)
+                proj = hc_down(normed)
+                low = torch_mod.nn.functional.silu(proj[:, :hc_lowrank])
+                up = hc_up(low).view(x_in.shape[0], hc_mult, hidden)
+                x_mix = (up * mix_w.view(1, hc_mult, 1)).sum(dim=1)
+                sub_out = inner_fn(x_mix, *args[1:]) if is_ffn else inner_fn(x_mix)
+                post = up + sub_out.unsqueeze(1)
+                return post[:, 0, :].contiguous()
+
+            return _run
+
+        return _wrap_lowrank, {"mhc": "lowrank", "hc_mult": hc_mult, "hc_lowrank": hc_lowrank}
+
+    proj_dim = hc_mult * (hc_mult + 2)
+    hc_proj = _make_linear_fn(torch_mod, torch_npu_mod, wide_dim, proj_dim, "bf16", device)
+    iters = max(1, hc_sinkhorn) if hc_sinkhorn > 0 else 4
+
+    def _wrap_sinkhorn(inner_fn: Callable[..., Any]) -> Callable[..., Any]:
+        def _run(*args: Any) -> Any:
+            x_in = args[0]
+            t_len = x_in.shape[0]
+            streams = x_in.unsqueeze(1).expand(-1, hc_mult, -1).reshape(t_len, wide_dim).contiguous()
+            s_fp32 = streams.to(torch_mod.float32)
+            inv_rms = torch_mod.rsqrt((s_fp32 * s_fp32).mean(dim=-1, keepdim=True) + DEFAULT_RMS_EPS)
+            coeff = hc_proj(streams).to(torch_mod.float32) * inv_rms
+            mat = torch_mod.exp(coeff[:, : hc_mult * hc_mult].view(t_len, hc_mult, hc_mult).clamp(-4.0, 4.0))
+            # Single row+col normalize step proxies the fused Sinkhorn kernel without 20x eager launch inflation.
+            mat = mat / (mat.sum(dim=-1, keepdim=True) + DEFAULT_RMS_EPS)
+            mat = mat / (mat.sum(dim=-2, keepdim=True) + DEFAULT_RMS_EPS)
+            pre_w = torch_mod.sigmoid(coeff[:, hc_mult * hc_mult : hc_mult * (hc_mult + 1)]).to(x_in.dtype)
+            s_3d = streams.view(t_len, hc_mult, hidden)
+            x_mix = (s_3d * pre_w.unsqueeze(-1)).sum(dim=1)
+            sub_out = inner_fn(x_mix, *args[1:]) if is_ffn else inner_fn(x_mix)
+            mixed = torch_mod.bmm(mat.to(x_in.dtype), s_3d) + sub_out.unsqueeze(1)
+            return mixed[:, 0, :].contiguous()
+
+        return _run
+
+    return _wrap_sinkhorn, {"mhc": "sinkhorn", "hc_mult": hc_mult, "hc_sinkhorn_iters": iters}
+
+
 def _build_ffn_or_moe(
     torch_mod: Any,
     torch_npu_mod: Any,
@@ -1980,11 +2101,14 @@ def _build_ffn_or_moe(
     """Build 1-layer Dense FFN or Owner-Routed MoE with real residual, combine, and shared addition."""
     hidden = int(spec["hidden_size"])
     ffn = str(spec.get("ffn", "dense"))
+    dp = max(1, int(spec.get("dp", 1)))
     tp = max(1, int(spec.get("tp", 1)))
     ep = max(1, int(spec.get("ep", 1)))
     batch = int(spec.get("sequences", 4))
+    active_seqs = int(spec.get("active_sequences", batch))
     q_len = int(spec.get("q_len", 1))
     phase = str(spec.get("phase", "decode"))
+    overlay = str(spec.get("overlay", "canonical"))
     pcp = max(1, int(spec.get("pcp", 1)))
     tokens = max(1, (batch * q_len) // pcp) if phase == "prefill" else (batch * q_len)
     quant_mode = str(spec.get("quant_mode", "bf16"))
@@ -2009,9 +2133,12 @@ def _build_ffn_or_moe(
     moe_i = int(spec["moe_intermediate_size"])
     shared_n = int(spec.get("num_shared_experts", 0))
     shared_i = int(spec.get("shared_intermediate_size", moe_i))
+    latent_dim = int(spec.get("expert_latent_size", 0) or 0)
+    use_latent = 0 < latent_dim < hidden
+    moe_in_dim = latent_dim if use_latent else hidden
     local_e = max(1, math.ceil(num_experts / ep))
     elem_b = 1 if quant_mode in ("w8a8", "c8", "w4a8", "mxfp8", "mxfp4") else 2
-    est_bytes = local_e * 3 * hidden * moe_i * elem_b
+    est_bytes = local_e * 3 * moe_in_dim * moe_i * elem_b
     if est_bytes > MAX_SYNTH_WEIGHT_BYTES:
         raise MemoryError(f"1layer_moe_weights_exceed_budget:{est_bytes}>{MAX_SYNTH_WEIGHT_BYTES}")
 
@@ -2020,8 +2147,18 @@ def _build_ffn_or_moe(
     if world_ep == 1 and top_k > local_e:
         raise ValueError(f"top_k_exceeds_local_experts:{top_k}>{local_e}")
     local_top_k = min(top_k, world_ep * local_e)
-    active_tokens = tokens * local_top_k
-    weights = _init_moe_weights(torch_mod, torch_npu_mod, local_e, hidden, moe_i, quant_mode, device)
+    routed_tokens, eff_top_k = (
+        (tokens, local_top_k) if world_ep > 1 else _single_card_ep_routed_counts(
+            tokens, local_top_k, dp=dp, tp=tp, ep=ep, pcp=pcp,
+            sequences=batch, active_sequences=active_seqs, q_len=q_len, overlay=overlay,
+        )
+    )
+    active_tokens = routed_tokens * eff_top_k
+    weights = _init_moe_weights(torch_mod, torch_npu_mod, local_e, moe_in_dim, moe_i, quant_mode, device)
+    latent_fns = (
+        _make_linear_fn(torch_mod, torch_npu_mod, hidden, latent_dim, quant_mode, device),
+        _make_linear_fn(torch_mod, torch_npu_mod, latent_dim, hidden, quant_mode, device),
+    ) if use_latent else None
 
     shared_fns = None
     if shared_n > 0 and shared_i > 0:
@@ -2034,27 +2171,37 @@ def _build_ffn_or_moe(
         h, _, updated_res = torch_npu_mod.npu_add_rms_norm(x_in, res_in, norm_w, DEFAULT_RMS_EPS)
         logits = torch_mod.matmul(h, router_w).to(torch_mod.float32)
         w_top, idx_top, _ = torch_npu_mod.npu_moe_gating_top_k_softmax(logits, k=top_k)
+        h_moe_in = latent_fns[0](h) if latent_fns is not None else h
         if world_ep > 1 and dist_group is not None:
             routed_out = _run_moe_owner_routed_ep(
-                torch_mod, torch_npu_mod, h, idx_top, weights,
+                torch_mod, torch_npu_mod, h_moe_in, idx_top, weights,
                 quant_mode=quant_mode, world_ep=world_ep, local_e=local_e,
-                local_top_k=local_top_k, hidden=hidden, device=device, dist_group=dist_group,
+                local_top_k=local_top_k, hidden=moe_in_dim, device=device, dist_group=dist_group,
             )
+            w_norm = w_top[:, :local_top_k].to(routed_out.dtype).unsqueeze(-1)
+            out_moe = (routed_out * w_norm).sum(dim=1)
         else:
-            local_idx = (idx_top[:, :local_top_k] % local_e).to(torch_mod.int32)
+            h_sub = h_moe_in[:routed_tokens] if routed_tokens < tokens else h_moe_in
+            local_idx = (idx_top[:routed_tokens, :eff_top_k] % local_e).to(torch_mod.int32)
             exp_x, exp_row, exp_tok, exp_scale = torch_npu_mod.npu_moe_init_routing_v2(
-                h, local_idx, active_num=active_tokens, expert_capacity=0, expert_num=local_e,
+                h_sub, local_idx, active_num=active_tokens, expert_capacity=0, expert_num=local_e,
                 drop_pad_mode=0, expert_tokens_num_type=1, expert_tokens_num_flag=True,
                 quant_mode=1 if quant_mode in ("w8a8", "c8") else -1,
                 active_expert_range=[0, local_e], row_idx_type=0,
             )
             g2 = _exec_moe_local_gmm(
                 torch_mod, torch_npu_mod, exp_x, exp_tok.to(torch_mod.int64),
-                weights, quant_mode, exp_scale if quant_mode in ("w8a8", "c8") else None, hidden, device,
+                weights, quant_mode, exp_scale if quant_mode in ("w8a8", "c8") else None, moe_in_dim, device,
             )
-            routed_out = g2[exp_row.to(torch_mod.int64)].view(tokens, local_top_k, hidden)
-        w_norm = w_top[:, :local_top_k].to(routed_out.dtype).unsqueeze(-1)
-        out = (routed_out * w_norm).sum(dim=1)
+            routed_out = g2[exp_row.to(torch_mod.int64)].view(routed_tokens, eff_top_k, moe_in_dim)
+            w_norm = w_top[:routed_tokens, :eff_top_k].to(routed_out.dtype).unsqueeze(-1)
+            comb = (routed_out * w_norm).sum(dim=1)
+            if routed_tokens < tokens:
+                out_moe = torch_mod.zeros((tokens, moe_in_dim), dtype=comb.dtype, device=device)
+                out_moe[:routed_tokens] = comb
+            else:
+                out_moe = comb
+        out = latent_fns[1](out_moe) if latent_fns is not None else out_moe
         if shared_fns is not None:
             s_gu, s_dn = shared_fns
             out = out + s_dn(torch_npu_mod.npu_swiglu(s_gu(h)))
@@ -2063,6 +2210,7 @@ def _build_ffn_or_moe(
     return _run_moe, TIER_TORCHNPU_COMPOSITE, {
         "ffn": "moe", "local_experts": local_e, "top_k": top_k, "moe_intermediate": moe_i,
         "shared_experts": shared_n, "ep_comm_world": world_ep,
+        "routed_tokens": routed_tokens, "routed_top_k": eff_top_k, "expert_latent_size": latent_dim,
     }
 
 
@@ -2104,6 +2252,7 @@ def _execute_single_case(
     rank: int = 0,
     dist_group: Any = None,
     blocker_pair: tuple[Any, Any] | None = None,
+    l2_flush_pair: tuple[Any, Any] | None = None,
     cpu_store: Any = None,
     world_size: int = 1,
     case_idx: int = 0,
@@ -2153,6 +2302,14 @@ def _execute_single_case(
         else:
             attn_fn, _, attn_meta = _build_gqa_attention(torch_mod, torch_npu_mod, spec, device, dist_group=dist_group)
         ffn_fn, _, ffn_meta = _build_ffn_or_moe(torch_mod, torch_npu_mod, spec, device, dist_group=dist_group)
+        mhc_attn = _build_mhc_block_wrapper(torch_mod, torch_npu_mod, spec, device, is_ffn=False)
+        if mhc_attn is not None:
+            attn_fn = mhc_attn[0](attn_fn)
+            attn_meta = {**attn_meta, **mhc_attn[1]}
+        mhc_ffn = _build_mhc_block_wrapper(torch_mod, torch_npu_mod, spec, device, is_ffn=True)
+        if mhc_ffn is not None:
+            ffn_fn = mhc_ffn[0](ffn_fn)
+            ffn_meta = {**ffn_meta, **mhc_ffn[1]}
     except Exception as exc:  # noqa: BLE001
         setup_err = exc
 
@@ -2181,17 +2338,17 @@ def _execute_single_case(
         assert attn_fn is not None and ffn_fn is not None and x_layer is not None and sample_attn is not None
         attn_prof = _profile_callable(
             torch_mod, torch_npu_mod, lambda _s: attn_fn(x_layer),
-            rank=rank, dist_group=dist_group, blocker_pair=blocker_pair, warmup_iters=0,
+            rank=rank, dist_group=dist_group, blocker_pair=blocker_pair, l2_flush_pair=l2_flush_pair, warmup_iters=0,
             cpu_store=cpu_store, world_size=world_size, barrier_tag=f"c{case_idx}:attn",
         )
         ffn_prof = _profile_callable(
             torch_mod, torch_npu_mod, lambda _s: ffn_fn(sample_attn, x_layer),
-            rank=rank, dist_group=dist_group, blocker_pair=blocker_pair, warmup_iters=0,
+            rank=rank, dist_group=dist_group, blocker_pair=blocker_pair, l2_flush_pair=l2_flush_pair, warmup_iters=0,
             cpu_store=cpu_store, world_size=world_size, barrier_tag=f"c{case_idx}:ffn",
         )
         layer_prof = _profile_callable(
             torch_mod, torch_npu_mod, lambda _s: ffn_fn(attn_fn(x_layer), x_layer),
-            rank=rank, dist_group=dist_group, blocker_pair=blocker_pair, warmup_iters=0,
+            rank=rank, dist_group=dist_group, blocker_pair=blocker_pair, l2_flush_pair=l2_flush_pair, warmup_iters=0,
             cpu_store=cpu_store, world_size=world_size, barrier_tag=f"c{case_idx}:layer",
         )
         return {
@@ -2273,6 +2430,7 @@ def _worker_main(rank: int, world_size: int, spec_path: str, output_path: str, m
         torch.randn((STREAM_BLOCKER_M, STREAM_BLOCKER_K), dtype=torch.bfloat16, device=device) * (STREAM_BLOCKER_K ** -0.5),
         torch.randn((STREAM_BLOCKER_K, STREAM_BLOCKER_N), dtype=torch.bfloat16, device=device) * (STREAM_BLOCKER_K ** -0.5),
     )
+    l2_flush_pair = _alloc_l2_flush_pair(torch, device)
     freq_pre = _sample_loaded_aicore_freq(torch, blocker_pair, rank)
     specs_doc = json.loads(Path(spec_path).read_text(encoding="utf-8"))
     cases = [c for c in specs_doc.get("cases", []) if int(c.get("world_size", 1)) == world_size]
@@ -2284,7 +2442,7 @@ def _worker_main(rank: int, world_size: int, spec_path: str, output_path: str, m
             torch.distributed.barrier()
         rec = _execute_single_case(
             torch, torch_npu, case_spec, device, rank if world_size > 1 else 0,
-            rank=rank, dist_group=dist_group, blocker_pair=blocker_pair,
+            rank=rank, dist_group=dist_group, blocker_pair=blocker_pair, l2_flush_pair=l2_flush_pair,
             cpu_store=cpu_store, world_size=world_size, case_idx=idx,
         )
         freq_now = float((rec.get("layer_capture") or {}).get("observed_aicore_freq_mhz") or 0.0)
