@@ -438,7 +438,15 @@ class _Arch22V1Program:
             core_q_w = q_w.scaled(max(1, q_loads))
 
             def _tile_for_rows(valid: int, aic=aic, aivs=aivs, n_blks=n_blks):
-                ws = self._tile_works(valid, n_blks, sort_ratio=sort_ratio)
+                ws = self._tile_works(valid, n_blks, sort_ratio=1.0)
+                vec_caps: dict[str, float] = {}
+                if sort_ratio != 1.0:
+                    vec_res = ctx.resource_names.get("vector")
+                    b_vec = ws["vec_sort"].resources.get("vector", 0)
+                    eff_vec = self._tile_works(valid, n_blks, sort_ratio=sort_ratio)["vec_sort"].resources.get("vector", 0)
+                    if vec_res and b_vec > 0 and eff_vec > 0:
+                        aiv_rate = ctx.rates[vec_res] * len(aivs) / max(1, self.aiv_count)
+                        vec_caps[vec_res] = aiv_rate * (b_vec / eff_vec)
                 fix_lat = ceil_div(valid, ARCH22_FIXPIPE_PANEL_ROWS) * fix_setup_ms
                 # service_cube_arch22.h:43: KEY_BUF_NUM=3 triple-buffered 256-row K panels;
                 # kernel_arch22.h:665-671: per-tile CrossCoreWaitFlag/SetFlag<MODE2> (P13);
@@ -463,7 +471,8 @@ class _Arch22V1Program:
                     s5 = Stage("score_read", ctx.bind(ws["score_read"]), after=("score_handoff",),
                                placement=_place_aivs(ctx, aivs, self.aiv_count, ws["score_read"]))
                     s6 = Stage("vec_sort", ctx.bind(ws["vec_sort"]), after=vec_after,
-                               placement=_place_aivs(ctx, aivs, self.aiv_count, ws["vec_sort"]), previous=("vec_sort",))
+                               placement=_place_aivs(ctx, aivs, self.aiv_count, ws["vec_sort"]),
+                               caps=vec_caps, previous=("vec_sort",))
                     return (s0, s1, s2, s3, s4, s5, *sync_stages, s6)
                 s0 = Stage("key_load", ctx.bind(ws["key_load"]),
                            placement=_place_aic(ctx, aic, self.aic_count, ws["key_load"]))
@@ -475,7 +484,7 @@ class _Arch22V1Program:
                            placement=_place_aivs(ctx, aivs, self.aiv_count, ws["score_read"]))
                 s4 = Stage("vec_sort", ctx.bind(ws["vec_sort"]), after=vec_after,
                            placement=_place_aivs(ctx, aivs, self.aiv_count, ws["vec_sort"]),
-                           previous=("vec_sort",))
+                           caps=vec_caps, previous=("vec_sort",))
                 return (s0, s1, s2, s3, *sync_stages, s4)
 
             credit_ms = ARCH22_ENTRY_EXIT_CREDITS * p13_paired_ms(ctx)
@@ -523,14 +532,27 @@ class _Arch22V1Program:
                     q_cnt = q_per_group_base + (1 if gid < q_per_group_rem else 0)
                     if q_cnt <= 0:
                         continue
-                    m_ws = self._query_merge_works(g_owners[gid], sort_ratio=sort_ratio)
+                    m_ws = self._query_merge_works(g_owners[gid], sort_ratio=1.0)
+                    m_ws_eff = (
+                        self._query_merge_works(g_owners[gid], sort_ratio=sort_ratio)
+                        if sort_ratio != 1.0 else m_ws
+                    )
                     for name in ("split_list_load", "split_topk_merge", "index_store"):
                         if name in m_ws:
                             w = m_ws[name].scaled(q_cnt)
+                            m_caps: dict[str, float] = {}
+                            if name == "split_topk_merge" and sort_ratio != 1.0:
+                                vec_res = ctx.resource_names.get("vector")
+                                b_vec = w.resources.get("vector", 0)
+                                eff_vec = m_ws_eff[name].scaled(q_cnt).resources.get("vector", 0)
+                                if vec_res and b_vec > 0 and eff_vec > 0:
+                                    aiv_rate = ctx.rates[vec_res] * len(merge_aivs) / max(1, self.aiv_count)
+                                    m_caps[vec_res] = aiv_rate * (b_vec / eff_vec)
                             st_name = f"{name}_{gid}" if len(g_owners) > n_m_lanes else name
                             m_st.append(Stage(
                                 st_name, ctx.bind(w), after=(m_st[-1].name,) if m_st else (),
                                 placement=_place_aivs(ctx, merge_aivs, self.aiv_count, w),
+                                caps=m_caps,
                             ))
                 if m_st:
                     m_branches.append(KernelProgram(tuple(m_st)))

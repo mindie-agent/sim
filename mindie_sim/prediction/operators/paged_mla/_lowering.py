@@ -788,13 +788,11 @@ class _PagedMlaProgramBuilder:
         slots = len(layout.clocks)
         can_compact = (
             count > MLA_COMPACT_THRESHOLD
-            and eff_owners == 1
-            and layout.gm_workspace
             and layout.key_tile >= MLA_COMPACT_MIN_KEY_TILE
             and not self.contract.mixed_quant
             and not self.contract.block_table
             and self.planning is None
-            and self.contract.kv_layout == "PA_BLK_BSND"
+            and self.contract.kv_layout in {"PA_BLK_BSND", "BNSD"}
             and (layout.key_tile % self.contract.page_size == 0 or self.contract.page_size % layout.key_tile == 0)
         )
         if can_compact:
