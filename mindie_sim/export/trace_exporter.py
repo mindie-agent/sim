@@ -41,16 +41,15 @@ import tempfile
 from typing import Any
 
 from mindie_sim.prediction.results import CaseInput, ReplayOptions, StepEvaluation, StepRequest
-from .analysis import (
+from .bundle import build_export_bundle, compose_export_case
+from .models import (
     DEFAULT_SCENARIO_OUTPUT_TOKENS,
     DEFAULT_SCENARIO_PROMPT_TOKENS,
-    ExportBundle,
     GIB_BYTES,
     MIN_POSITIVE_SECONDS,
-    OperatorExportRow,
     US_PER_SECOND,
-    build_export_bundle,
-    compose_export_case,
+    ExportBundle,
+    OperatorExportRow,
 )
 
 #: Schema tag for trace export receipts.
@@ -766,20 +765,27 @@ def _iter_scheduled_full_model_trace(
             d_idx = die_map.get(coord, 0)
             base = _pid_base(d_idx)
             op_ts = l_start + max(0.0, op.start_us - tpl.min_start_us)
-            if first_op_for_scope or not is_graph_mode:
+            is_h2d_op = op.family == "engram_rh2d" or "host_uva" in op.op_id.lower()
+            if first_op_for_scope or not is_graph_mode or is_h2d_op:
                 dev_pid, dev_tid = _op_pid_tid(op, base)
-                launch_name = (
-                    f"aclGraphLaunch ({entry.scope.upper()})" if is_graph_mode
-                    else f"aclrtLaunchKernel ({op.ascend_kernel})"
-                )
+                if is_h2d_op:
+                    launch_name = f"aclrtMemcpyAsync (PLE/Engram H2D: {op.op_id})"
+                    l_dur = HOST_KERNEL_LAUNCH_US
+                elif is_graph_mode:
+                    launch_name = f"aclGraphLaunch ({entry.scope.upper()})"
+                    l_dur = HOST_GRAPH_LAUNCH_US
+                else:
+                    launch_name = f"aclrtLaunchKernel ({op.ascend_kernel})"
+                    l_dur = HOST_KERNEL_LAUNCH_US
                 l_events, flow_id = _emit_host_launch_with_flow(
                     name=launch_name, dev_ts=op_ts, dev_pid=dev_pid, dev_tid=dev_tid,
-                    launch_dur_us=HOST_GRAPH_LAUNCH_US if is_graph_mode else HOST_KERNEL_LAUNCH_US,
-                    flow_id=flow_id, extra_args={"scope": entry.scope, "layer": entry.label},
+                    launch_dur_us=l_dur,
+                    flow_id=flow_id, extra_args={"scope": entry.scope, "layer": entry.label, "transfer": "H2D" if is_h2d_op else "launch"},
                 )
                 yield from l_events
-                launched_scopes.add(entry.scope)
-                first_op_for_scope = False
+                if first_op_for_scope:
+                    launched_scopes.add(entry.scope)
+                    first_op_for_scope = False
 
             events, placement, flow_id = _emit_op_and_pipes(
                 bundle, op,
