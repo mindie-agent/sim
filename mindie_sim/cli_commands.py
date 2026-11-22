@@ -21,6 +21,7 @@ import sys
 
 from . import api as sdk_api
 from . import predict
+from .cli_export import EXPORT_COMMANDS, run_export_command
 from .cli_onboarding import ONBOARDING_COMMANDS, run_onboarding_command
 from .cli_sku import SKU_COMMANDS, run_sku_command
 from .prediction.offload.policy import missing_scenario_error
@@ -817,6 +818,8 @@ def dispatch(args: argparse.Namespace, /) -> object:
         return run_sku_command(args)
     if cmd in ONBOARDING_COMMANDS:
         return run_onboarding_command(args)
+    if cmd in EXPORT_COMMANDS:
+        return run_export_command(args)
     if cmd == "build-accel":
         from .prediction.runtime.accel_build import build_accel
         return build_accel(force=bool(args.force), check_only=bool(args.check))

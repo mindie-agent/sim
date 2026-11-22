@@ -489,3 +489,11 @@ owns = [
   "tools/onboard_sku.py",
   "tools/onboard_operator.py",
 ]
+
+[[module]]
+path = "product/test_exporters.py"
+tier = "tier0"
+owns = [
+  "mindie_sim/export",
+  "mindie_sim/cli_export.py",
+]
