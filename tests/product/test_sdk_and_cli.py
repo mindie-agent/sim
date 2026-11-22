@@ -50,7 +50,6 @@ SDK_STEP = StepRequest(phase="decode", tokens=1, context=64, sequences=1, scope=
 PREFILL = dict(phase="prefill", tokens=128, scope="body")
 DECODE = dict(phase="decode", tokens=1, context=128, scope="body")
 VECTOR_BYTES = 64
-DRAM_SERVICE_SCALE = 1 / 0.8316
 def _cli_json(output, *args):
     assert module_main([*args, "--output", str(output)]) == 0
     return json.loads(output.read_text(encoding="utf-8"))
@@ -510,8 +509,9 @@ def _op(identifier, *deps):
                   dtype="bf16", deps=deps, hbm_bytes=VECTOR_BYTES, vector_ops=VECTOR_BYTES)
 
 def _assert_vector_charge(serviced, copies):
+    # Service-mode calibration caps the stage rate; it never inflates declared physical work.
     work = copies * VECTOR_BYTES
-    assert itemgetter("memory@r0:s0", "vector@r0:s0")(serviced) == pytest.approx((work * DRAM_SERVICE_SCALE, work))
+    assert itemgetter("memory@r0:s0", "vector@r0:s0")(serviced) == pytest.approx((work, work))
 
 def test_public_operator_report_preserves_duration_after_input_release(execution_environment):
     ops = (_op("a"),)
@@ -725,5 +725,157 @@ def test_public_graph_mapping_cli_geometry_and_report_parity(tmp_path, capsys):
     assert scen["weight_quant"].upper().startswith("BF16")
     assert scen["cache_dtype"].upper() == "BF16"
     assert scen["avg_accepted_tokens"] == pytest.approx(compute_speculative_accept_step(0.70, 3), rel=1e-6)
+
+
+def test_formula_sdk_hardware_resolution_rank_guard_and_aclnn_replica():
+    from mindie_sim.optimization import FormulaKernelSpec, FormulaTensorSpec
+    from mindie_sim.public.api import simulate_aclnn_call, simulate_graph
+    from mindie_sim.public.errors import CapabilityGap
+    from mindie_sim.public.formula_sdk import (
+        BINDING_STATE_UNBOUND_FORMULA,
+        simulate_formula_kernel,
+    )
+
+    spec = FormulaKernelSpec(
+        name="rmsnorm_probe",
+        equations=("y = RMSNorm(x; gamma)",),
+        inputs=(FormulaTensorSpec("x", (16, 2048), "bf16", "input"),),
+        outputs=(FormulaTensorSpec("y", (16, 2048), "bf16", "output"),),
+        vector_ops_fp32=float(16 * 2048 * 6),
+        row_reduction=True,
+    )
+    res_str = simulate_formula_kernel(spec, "a5")
+    res_short = simulate_formula_kernel(spec, {"sku": "Ascend950DT_9582"})
+    raw_case = compose_raw_case("qwen3-32b", "a5", tp=2, layers=1, prompt_tokens=64, output_tokens=8)
+    res_case = simulate_formula_kernel(spec, raw_case)
+    assert res_str.projected_us == pytest.approx(res_short.projected_us, rel=1e-9)
+    assert res_str.projected_us == pytest.approx(res_case.projected_us, rel=1e-9)
+
+    unbound_op = OpSpec(
+        "unbound_custom", "vector", "decode", 0, 0, (), (64,), (64,), (64,), (64,),
+        dtype="bf16", hbm_bytes=64, vector_ops=64,
+        metadata=(("binding_state", BINDING_STATE_UNBOUND_FORMULA),),
+    )
+    with pytest.raises(CapabilityGap) as exc_info:
+        simulate_graph(raw_case, {0: (_op("ok_a"),), 1: (unbound_op,)})
+    assert exc_info.value.code == "unbound_operator_implementation"
+
+    from mindie_sim.schema.parallel import ParallelSpec
+
+    env_2p = ExecutionEnvironment.from_hardware(
+        Hardware.from_mapping(materialize({"sku": "Ascend950DT_9582", "num_devices": 2})),
+        parallel=ParallelSpec(dp=2, tp=1),
+    )
+    rep_r1 = simulate_aclnn_call(
+        env_2p, api="aclnnMatmul", m=64, n=128, k=128, dtype="bf16", phase="decode", replica=1,
+    )
+    assert rep_r1["timeline"] and all(row["replica"] == 1 for row in rep_r1["timeline"])
+
+
+def test_report_preserves_solved_pd_columns_pooling_phase_and_strict_tracks(tmp_path, monkeypatch):
+    from mindie_sim.cli import _main as cli_main
+    from mindie_sim.cli import report as report_mod
+    from mindie_sim.solve import _bundle_inputs_for_solution
+    from mindie_sim.sweep import pd as pd_mod
+
+    # 1. Strict simulation mode normalizes --compare-track expected_ideal -> merged.
+    assert report_mod._report_tracks(
+        "simulation", compare_track="expected_ideal", target_track="expected_ideal", enforce_eager=False,
+    ) == ("merged", "merged")
+    assert report_mod._report_tracks(
+        "simulation", compare_track="merged", target_track="unmerged_pr", enforce_eager=False,
+    ) == ("merged", "unmerged_pr")
+
+    # 2. _auto_solve_report_layout threads pd_pooled/pd_unpooled pooling mode and preserves full solved dict.
+    seen_modes: list[str | None] = []
+    p_case = compose_raw_case(
+        "deepseek-v3.2", "a3", tp=4, ep=4, prompt_tokens=128, output_tokens=32,
+        quant="w8a8_dynamic", mtp_proposal_tokens=0,
+    )
+    d_case = compose_raw_case(
+        "deepseek-v3.2", "a3", tp=4, ep=4, prompt_tokens=128, output_tokens=32,
+        quant="w8a8_dynamic", mtp_proposal_tokens=2, mtp_acceptance_length=2.1,
+    )
+
+    def _fake_solve(*_a, **kw):
+        seen_modes.append(kw.get("pd_transfer_mode"))
+        mode = kw.get("pd_transfer_mode") or "layerwise_overlap_d2d"
+        return {
+            "feasible": True,
+            "winner_mode": "pd_disaggregated",
+            "best_configuration": {
+                "deployment_mode": "pd_disaggregated",
+                "pd_transfer_mode": mode,
+                "prefill_parallel": {"dp": 1, "tp": 4, "ep": 4, "pp": 1, "pcp": 1, "cp": 1},
+                "decode_parallel": {"dp": 1, "tp": 4, "ep": 4, "pp": 1, "pcp": 1, "cp": 1},
+                "b_feasible": 4,
+                "b_vram_max": 8,
+                "mtp_proposal_tokens": 2 if kw.get("feature_track") == "expected_ideal" else 0,
+                "handoff_tpot_ms": 3.5,
+                "used_dies": 8,
+                "e2e_total_tps": 1200.0,
+                "prefill_kv_rps": 37.5,
+            },
+            "prefill_case": p_case,
+            "decode_case": d_case,
+            "recommended_case": d_case,
+            "pd_pool_summary": {
+                "pd_ratio": "1P:1D",
+                "pd_transfer_mode": mode,
+                "prefill_instances": 1,
+                "decode_instances": 1,
+                "prefill_used_dies": 4,
+                "decode_used_dies": 4,
+                "used_dies": 8,
+                "handoff_tpot_ms": 3.5,
+                "prefill_kv_rps": 37.5,
+                "e2e_total_tps": 1200.0,
+            },
+        }
+
+    with monkeypatch.context() as mp:
+        mp.setattr(pd_mod, "solve_optimal_deployment", _fake_solve)
+        lay_pool = report_mod._auto_solve_report_layout(
+            model="deepseek-v3.2", sku="Ascend910_9392", topology_preset=None, num_devices=8,
+            prompt_tokens=128, output_tokens=32, tpot_slo_ms=50.0, ttft_slo_ms=None,
+            quant="w8a8_dynamic", kv_cache_dtype="c8", indexer_kv_dtype=None,
+            deployment_mode="pd_pooled", phase="prefill",
+        )
+        lay_unpool = report_mod._auto_solve_report_layout(
+            model="deepseek-v3.2", sku="Ascend910_9392", topology_preset=None, num_devices=8,
+            prompt_tokens=128, output_tokens=32, tpot_slo_ms=50.0, ttft_slo_ms=None,
+            quant="w8a8_dynamic", kv_cache_dtype="c8", indexer_kv_dtype=None,
+            deployment_mode="pd_unpooled", phase="decode",
+        )
+        assert seen_modes == ["pooled_dram_ssd", "layerwise_overlap_d2d"]
+        assert lay_pool["deployment_mode"] == "pd_pooled"
+        assert lay_unpool["deployment_mode"] == "pd_unpooled"
+
+        raw_p, step_p, meta_p = _bundle_inputs_for_solution(
+            lay_pool["solved"], model="deepseek-v3.2", hardware="a3", runtime_stack="vllm-ascend",
+            base_kw={}, feature_track="merged", prompt_tokens=128, output_tokens=32,
+            scope="model", phase="prefill",
+        )
+        assert step_p.phase == "prefill" and step_p.tokens == 128 and meta_p["handoff_tpot_ms"] == 0.0
+        assert raw_p["runtime"]["metadata"].get("draft_proposal_tokens", 0) == 0
+
+        # End-to-end report with catalog preset w8a8_dynamic + simulation expected_ideal normalization + PD pool summary.
+        out_dir = tmp_path / "rep_pd"
+        rec_path = tmp_path / "rep_pd_rec.json"
+        rc = cli_main([
+            "report", "--model", "deepseek-v3.2", "--hardware", "a3", "--num-devices", "8",
+            "--prompt-tokens", "128", "--output-tokens", "32",
+            "--weight-quant", "w8a8_dynamic", "--deployment-mode", "pd_pooled",
+            "--mode", "simulation", "--compare-track", "expected_ideal",
+            "--no-trace", "--no-xlsx", "--out-dir", str(out_dir), "--json", "--receipt", str(rec_path),
+        ])
+        assert rc == 0 and rec_path.is_file()
+        rec = json.loads(rec_path.read_text(encoding="utf-8"))
+        kpis = rec["agent_brief"]["kpis_before_vs_after"]
+        assert kpis["after"]["analysis_mode"] == "simulation"
+        assert kpis["after"]["cluster_tps"] == pytest.approx(1200.0, rel=1e-9)
+        from mindie_sim.export.bundle import DEPLOYMENT_MODE_LABELS
+        assert rec["agent_brief"]["scenario_and_parallelism"]["deployment_mode"] == DEPLOYMENT_MODE_LABELS["pd_pooled"]
+
 
 

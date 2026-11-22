@@ -41,7 +41,7 @@ from mindie_sim.optimization.kernel_synthesis import (
 )
 from mindie_sim.schema.case import Case
 from mindie_sim.schema.datapath import DatapathCapabilitySpec
-from mindie_sim.schema.hardware import Device, Hardware
+from mindie_sim.schema.hardware import Device, Hardware, parse_hardware
 from mindie_sim.schema.operators import OpSpec
 
 from .contracts import Extension, Provider
@@ -53,6 +53,7 @@ BINDING_STATE_UNBOUND_FORMULA = "unbound_formula_projection"
 MODE_MODELING = "modeling"
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
+_FULL_HARDWARE_KEYS = ("device", "devices", "dies", "links")
 
 
 def _resolve_hardware_target(
@@ -63,16 +64,19 @@ def _resolve_hardware_target(
         return hardware
     if isinstance(hardware, ExecutionEnvironment):
         return hardware.machine
-    if isinstance(hardware, str):
-        from mindie_sim.compose import resolve_hardware_sku
-        from mindie_sim.prediction.structure import parse_hardware
-        return parse_hardware(resolve_hardware_sku(hardware))
     if isinstance(hardware, Mapping):
-        from mindie_sim.prediction.structure import parse_case, parse_hardware
-        if "model" in hardware and "hardware" in hardware:
+        keys = hardware.keys()
+        if {"machine", "model", "workload"} <= keys or {"hardware", "model"} <= keys:
+            from mindie_sim.prediction.structure import parse_case
             return parse_case(dict(hardware))
-        raw_hw = hardware.get("hardware") or hardware.get("machine") or hardware
-        return parse_hardware(dict(raw_hw))
+        hardware = hardware.get("hardware", hardware.get("machine", hardware))
+        if isinstance(hardware, Mapping) and any(k in hardware for k in _FULL_HARDWARE_KEYS):
+            return parse_hardware(dict(hardware))
+    if isinstance(hardware, (str, Mapping)):
+        # SKU strings / shorthand mappings reuse compose's single machine materializer.
+        from mindie_sim.compose import _COMPOSE_OPTION_GROUPS, _materialize_machine
+        options = dict.fromkeys(_COMPOSE_OPTION_GROUPS["machine_options"])
+        return parse_hardware(_materialize_machine(hardware, required_devices=1, **options)[2])
     raise ExtensionError("formula_kernel_hardware_invalid:" + type(hardware).__name__)
 
 
@@ -118,6 +122,9 @@ def simulate_formula_kernel(
 def _iter_ops_items(ops: Any) -> tuple[Any, ...]:
     if ops is None:
         return ()
+    if isinstance(ops, Mapping) and ops and all(isinstance(rank, int) for rank in ops):
+        # Rank-indexed graph sets (``{rank: ops}``) are inspected op by op.
+        return tuple(op for group in ops.values() for op in _iter_ops_items(group))
     if isinstance(ops, (FormulaKernelSpec, OpSpec, Mapping)):
         return (ops,)
     if isinstance(ops, Sequence) and not isinstance(ops, (str, bytes, bytearray)):

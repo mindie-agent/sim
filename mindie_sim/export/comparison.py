@@ -1348,6 +1348,11 @@ def _bundle_kpi_dict(bundle: ExportBundle) -> dict[str, Any]:
     tpot_ms = ((step_ms / acc) + handoff_ms) if is_decode else step_ms
     sla = bundle.tpot_slo_ms if is_decode else bundle.ttft_slo_ms
     l_star_ms = bundle.step_l_star_lean_us / US_PER_MS
+    # A PD winner's cluster rate is the solver's end-to-end stage-limited rate, not one decode instance's.
+    pool = bundle.pd_pool_summary if isinstance(bundle.pd_pool_summary, Mapping) else {}
+    cluster_tps = pool.get("e2e_total_tps")
+    if cluster_tps is None:
+        cluster_tps = bundle.throughput_tokens_per_s
     return {
         "analysis_mode": bundle.analysis_mode,
         "binding_state": bundle.binding_state,
@@ -1362,7 +1367,7 @@ def _bundle_kpi_dict(bundle: ExportBundle) -> dict[str, Any]:
         "n_tok_per_die": float(bundle.n_tok_per_die),
         "us_per_tok_die": float(bundle.us_per_tok_die),
         "single_die_tps": float(bundle.throughput_per_die_tokens_per_s),
-        "cluster_tps": float(bundle.throughput_tokens_per_s),
+        "cluster_tps": float(cluster_tps),
         "l_star_ms": float(l_star_ms),
         "l_star_attainment_pct": round((100.0 * l_star_ms / step_ms) if step_ms > 0.0 else 0.0, 1),
         "cube_util_pct": round(bundle.network_cube_mfu, 1),

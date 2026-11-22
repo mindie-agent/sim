@@ -73,7 +73,6 @@ DEFAULT_ELEM_BYTES = 2.0
 OVERLAP_BARRIER_EPS_US = 1e-3
 LAUNCH_SHORT_US = 12.0
 LAUNCH_WORK_SHARE = 0.35
-SLA_KEY_DECIMALS = 2
 RANK_TPS_DECIMALS = 6
 SCREEN_TTFT_MARGIN = 1.15
 SCREEN_TPOT_MARGIN = 1.25
@@ -513,7 +512,7 @@ def _measure_decode_stage(
         max(step_budget, PARETO_EPS) if step_budget > 0.0
         else tpot_sla_ms * max(1.0, float(d_emit_est))
     )
-    d_sla_key = (cache_id, round(eff_sla_ms, SLA_KEY_DECIMALS)) if (cache is not None and cache_id is not None) else None
+    d_sla_key = (cache_id, eff_sla_ms) if (cache is not None and cache_id is not None) else None
     if d_sla_key is not None and d_sla_key in cache:
         d_sla = cache[d_sla_key]
     else:
@@ -617,6 +616,8 @@ def _evaluate_pd_stages(
 ) -> dict[str, Any]:
     """Evaluate prefill, KV handoff / 3-tier pool, and decode stage rates."""
     p_dp = int(p_parsed.runtime.parallel.dp)
+    p_dcp_ok, p_dcp_reason = validate_vllm_ascend_dcp_codomain(p_parsed.model, p_parsed.runtime.parallel)
+    prefill_role_error = None if p_dcp_ok else f"prefill:{p_dcp_reason}"
     hit_tokens = int(math.floor(prompt * hit_r)) if mode == "pooled_dram_ssd" else 0
     compute_tokens = max(0, prompt - hit_tokens)
     p_mem, prefill_hbm_ok, p_slots, p_step = _measure_prefill_stage(
@@ -639,7 +640,8 @@ def _evaluate_pd_stages(
             else (float(p_dp * p_slots) * MS_PER_S if (prefill_ok and prefill_hbm_ok) else 0.0)
         )
         infeasible = (
-            "prefill_hbm_oom" if not prefill_hbm_ok
+            prefill_role_error if prefill_role_error is not None
+            else "prefill_hbm_oom" if not prefill_hbm_ok
             else "prefill_ttft_sla_exceeded" if not prefill_ok else None
         )
         return {
@@ -658,6 +660,7 @@ def _evaluate_pd_stages(
             "avg_accepted_tokens": 1.0, "n_tok_per_die": 0.0, "us_per_tok_die": 0.0,
             "unused_sla_slack_ms": 0.0, "operating_regime": "SLA_LATENCY_BOUND",
             "free_hbm_headroom_gib": 0.0,
+            "prefill_dcp_codomain_valid": bool(p_dcp_ok), "prefill_dcp_codomain_reason": p_dcp_reason,
             "dcp_codomain_valid": True, "dcp_codomain_reason": None,
         }
 
@@ -723,7 +726,8 @@ def _evaluate_pd_stages(
         rep_info=_decode_rep_info,
     )
     infeasible = (
-        dec["dcp_codomain_reason"] if not dec.get("dcp_codomain_valid", True)
+        prefill_role_error if prefill_role_error is not None
+        else dec["dcp_codomain_reason"] if not dec.get("dcp_codomain_valid", True)
         else "prefill_hbm_oom" if not prefill_hbm_ok
         else "prefill_ttft_sla_exceeded" if not prefill_compute_ok
         else "decode_max_model_len_exceeded" if not dec["length_ok"]
@@ -741,6 +745,8 @@ def _evaluate_pd_stages(
         "rps_p": rps_p, "p_kv_rps_per_inst": p_kv_rps_per_inst, "d_kv_rps_per_inst": d_kv_rps_per_inst,
         "infeasible": infeasible, "link_info": link_info,
         "pool_metrics": pool_metrics, "handoff_plan": handoff,
+        "prefill_dcp_codomain_valid": bool(p_dcp_ok),
+        "prefill_dcp_codomain_reason": p_dcp_reason,
         **dec,
     }
 
@@ -929,6 +935,8 @@ def sweep_pd_disaggregation_ratios(
             "ttft_sla_ok": bool(st["prefill_ok"]), "rps_per_instance": float(st["rps_p"]),
             "effective_prefill_tokens": int(st["compute_tokens"]),
             "prefix_hit_tokens": int(st["hit_tokens"]),
+            "dcp_codomain_valid": bool(st.get("prefill_dcp_codomain_valid", True)),
+            "dcp_codomain_reason": st.get("prefill_dcp_codomain_reason"),
         },
         "decode_instance": {
             "dies_per_instance": d_dies, "parallel": d_par.to_dict(),
@@ -1117,7 +1125,7 @@ def _build_pd_stage_candidates(
             return
         if not _matches_pinned(cand, pinned):
             return
-        if model_spec is not None and role != "pd_prefill":
+        if model_spec is not None:
             dcp_ok, _ = validate_vllm_ascend_dcp_codomain(
                 model_spec, ParallelSpec(dp=dp, tp=tp, ep=ep, pp=pp, pcp=pcp, cp=dcp),
             )
@@ -1253,14 +1261,13 @@ def _evaluate_colocated_candidate(
             reason="prefill_hbm_oom", regime="HBM_CAPACITY_BOUND",
         )
     rep_info = build_archetype_representative_case(parsed, min_layers=ARCHETYPE_FOLD_MIN_LAYERS)
-    if math.isinf(ttft_sla_ms) and output_tokens > 1:
-        p_step = 0.0
-    else:
-        p_step = _prefill_step_ms(
-            parsed, compute_tokens=prompt_tokens, hit_tokens=0,
-            min_layers=ARCHETYPE_FOLD_MIN_LAYERS,
-            rep_info=rep_info,
-        )
+    # Exact finalist always prices the prompt: an omitted TTFT bound removes the
+    # SLA check, not the prefill service time that TTFT and end-to-end TPS consume.
+    p_step = _prefill_step_ms(
+        parsed, compute_tokens=prompt_tokens, hit_tokens=0,
+        min_layers=ARCHETYPE_FOLD_MIN_LAYERS,
+        rep_info=rep_info,
+    )
     ttft_ok = bool(p_step <= ttft_sla_ms)
     decode_tokens = max(0, output_tokens - 1)
     if decode_tokens == 0:
@@ -2122,6 +2129,18 @@ def _prefill_step_ms(
     return chunk_ms * (float(compute_tokens) / float(chunk_tok))
 
 
+def _decode_batch_limit(parsed: CaseSpec, q_tok: int, b_vram: int) -> int:
+    """Largest uniform decode batch the scheduler can issue in one step.
+
+    ``b_vram`` is the physical HBM ceiling (kept for headroom reporting); every
+    sequence also consumes ``q_tok`` query tokens from ``max_num_batched_tokens``.
+    """
+    budget = int(parsed.runtime.max_num_batched_tokens or 0)
+    if budget <= 0:
+        return int(b_vram)
+    return min(int(b_vram), budget // max(1, int(q_tok)))
+
+
 def _tighten_sla_bracket(
     memo: Mapping[int, float], b_vram: int, sla_ms: float,
 ) -> tuple[int, int, int, float | None]:
@@ -2233,15 +2252,18 @@ def _solve_sla_archetype_aware(
         }
 
     try:
+        limit = _decode_batch_limit(parsed, q_tok, b_vram)
         if b_vram < 1:
             t1 = eval_b(1, require_exact=True)
             return _result(0 if t1 > sla_ms + PARETO_EPS else 1, 0, t1, None, 0)
-        lo, hi, best_b, best_t = _tighten_sla_bracket(memo, b_vram, sla_ms)
-        if hi > b_vram and lo < b_vram:
-            t_top = eval_b(b_vram, require_exact=True)
+        if limit < 1:
+            return _result(0, 0, eval_b(1, require_exact=True), None, 0)
+        lo, hi, best_b, best_t = _tighten_sla_bracket(memo, limit, sla_ms)
+        if hi > limit and lo < limit:
+            t_top = eval_b(limit, require_exact=True)
             if t_top <= sla_ms + PARETO_EPS:
-                return _result(b_vram, b_vram, memo.get(1, t_top), t_top, b_vram)
-            hi = b_vram
+                return _result(limit, limit, eval_b(1, require_exact=True), t_top, limit)
+            hi = limit
         if lo == 0:
             t1 = eval_b(1, require_exact=False)
             if t1 > sla_ms + PARETO_EPS:
@@ -2255,7 +2277,7 @@ def _solve_sla_archetype_aware(
             else:
                 hi = mid
         exact_best_t = eval_b(best_b, require_exact=True)
-        return _result(best_b, best_b, memo.get(1, exact_best_t), exact_best_t, best_b)
+        return _result(best_b, best_b, eval_b(1, require_exact=True), exact_best_t, best_b)
     finally:
         if owns_box and evaluation_context is None and ctx_box[0] is not None:
             ctx_box[0] = None
@@ -2290,7 +2312,8 @@ def _screen_colocated_job(args: tuple[Any, ...]) -> tuple[int, bool, float, dict
             parsed, base_ws=prefill_ws, decode_q=max(1, int(q_tok)),
             seq_len=prompt_tokens + output_tokens, cap_bound=int(parsed.runtime.max_num_seqs),
         )
-        if b_vram < 1:
+        limit = _decode_batch_limit(parsed, q_tok, b_vram)
+        if limit < 1:
             return idx, False, -1.0, {}
         rep_info = build_archetype_representative_case(parsed, min_layers=ARCHETYPE_SCREEN_MIN_LAYERS)
         if math.isinf(ttft_sla_ms) and output_tokens > 1:
@@ -2303,7 +2326,7 @@ def _screen_colocated_job(args: tuple[Any, ...]) -> tuple[int, bool, float, dict
             )
             if p_ms > ttft_sla_ms * SCREEN_TTFT_MARGIN:
                 return idx, False, -p_ms, {}
-        probe_b = min(b_vram, SCREEN_DECODE_BATCH_PROBE)
+        probe_b = min(limit, SCREEN_DECODE_BATCH_PROBE)
         per_dp_dies = max(1, int(par.tp) * int(par.pcp) * int(par.pp))
         screen_target = bool(apply_target_envelope or rewrite_plan is not None)
         d_ms = _archetype_weighted_step_ms(
@@ -2357,6 +2380,8 @@ def _screen_prefill_job(
     p_idx, raw_p, prompt, compute_tokens, hit_tokens, ttft_sla_ms = args
     try:
         parsed = parse_case(raw_p)
+        if not validate_vllm_ascend_dcp_codomain(parsed.model, parsed.runtime.parallel)[0]:
+            return p_idx, False, -1.0, None
         p_mem = Memory(parsed, workspace_tokens=_prefill_workspace_tokens(parsed, compute_tokens))
         p_kv = p_mem.cache_bytes(prompt + 1, padded=True)
         hbm_ok = bool(
@@ -2407,9 +2432,10 @@ def _screen_decode_job(args: tuple[Any, ...]) -> tuple[int, bool, float, dict[in
             parsed, base_ws=max(1, int(q_tok)), decode_q=max(1, int(q_tok)),
             seq_len=prompt + output, cap_bound=int(parsed.runtime.max_num_seqs),
         )
-        if b_vram < 1:
+        limit = _decode_batch_limit(parsed, q_tok, b_vram)
+        if limit < 1:
             return d_idx, False, -1.0, {}
-        probe_b = min(b_vram, SCREEN_DECODE_BATCH_PROBE)
+        probe_b = min(limit, SCREEN_DECODE_BATCH_PROBE)
         per_dp_dies = max(1, int(par.tp) * int(par.pcp) * int(par.pp))
         screen_target = bool(apply_target_envelope or rewrite_plan is not None)
         d_ms = _archetype_weighted_step_ms(
@@ -2475,7 +2501,7 @@ def _eval_decode_exact_job(
             allow_unbound_formula=allow_unbound_formula,
             vram_info=vram_info, rep_info=rep_info,
         )
-        return d_idx, round(eff_sla_ms, SLA_KEY_DECIMALS), d_sla, vram_info, rep_info
+        return d_idx, eff_sla_ms, d_sla, vram_info, rep_info
     except (ModelingError, ValueError) as exc:
         if rewrite_plan is not None and _is_rewrite_plan_error(exc):
             raise
@@ -2696,6 +2722,9 @@ def _build_pd_candidate_row(
         "free_hbm_headroom_gib": float(d_inst["free_hbm_headroom_gib"]),
         "kv_transfer_ms_per_request": float(rep["kv_transfer_ms_per_request"]),
         "sustainable_rps": float(best_ratio["sustainable_rps"]) if best_ratio else 0.0,
+        "prefill_kv_rps": (
+            min(float(best_ratio["prefill_rps"]), float(best_ratio["kv_transfer_rps"])) if best_ratio else 0.0
+        ),
         "sustainable_tps": e2e_tps,
         "sustainable_tps_per_die": d_tps_per_die if d_tps_per_die > 0.0 else e2e_per_die,
         "decode_tps_per_die": d_tps_per_die,
@@ -2926,6 +2955,8 @@ def _finalize_optimal_deployment(
             "prefill_parallel": dict(winner_row.get("prefill_parallel") or {}),
             "decode_parallel": dict(winner_row.get("decode_parallel") or {}),
             "handoff_tpot_ms": float(winner_row.get("handoff_tpot_ms", 0.0) or 0.0),
+            "prefill_kv_rps": float(winner_row.get("prefill_kv_rps", 0.0) or 0.0),
+            "e2e_total_tps": float(winner_row.get("e2e_total_tps", 0.0) or 0.0),
         }
     elif best_coloc_entry:
         winner_row, recommended_case = best_coloc_entry[0], deepcopy(best_coloc_entry[1])

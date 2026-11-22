@@ -634,6 +634,35 @@ def _populate_summary_deployment_block(
         ws.merge_range(r, SUM_RIGHT_DETAIL_START, r, SUMMARY_COLS)
 
 
+def _pd_cluster_tps_cells(bundle: ExportBundle, col: str) -> tuple[float, str | None, str] | None:
+    """Return PD ``(cluster_tps, cluster_formula, die_tps_formula)`` or ``None`` when not PD.
+
+    Cluster TPS is the solver's winning ``Output × min(prefill∧KV rps, decode rps)``; the live
+    formula is only emitted when it reproduces that cached value. Single-Die TPS stays the decode
+    instance's own ``N_tok_per_die × 1000 / Step_ms`` (Sheets 2/4 amortization source).
+    """
+    pool = bundle.pd_pool_summary if isinstance(bundle.pd_pool_summary, Mapping) else None
+    if not pool or pool.get("e2e_total_tps") is None:
+        return None
+    e2e = float(pool["e2e_total_tps"])
+    r_step, r_dtps = SUM_KPI_STEP_ROW, SUM_KPI_DIE_TPS_ROW
+    die_f = f"=IF({col}{r_step}>0,{col}{SUM_KPI_NTOK_ROW}*1000/{col}{r_step},0)"
+    if pool.get("prefill_kv_rps") is None:
+        return e2e, None, die_f
+    cap = float(pool["prefill_kv_rps"])
+    output = max(1, int(bundle.output_tokens))
+    if output > 1:
+        d_inst = max(1, int(pool.get("decode_instances", 1) or 1))
+        dies = max(1, int(bundle.memory_ledger.total_dies))
+        decode_rps = d_inst * dies * float(bundle.throughput_per_die_tokens_per_s) / (output - 1)
+        seed = output * min(cap, decode_rps)
+        formula = f"={output}*MIN({cap!r},{d_inst}*{dies}*{col}{r_dtps}/{output - 1})"
+    else:
+        seed, formula = cap, f"={cap!r}"
+    parity = abs(seed - e2e) <= 1e-6 * max(1.0, abs(e2e))
+    return e2e, (formula if parity else None), die_f
+
+
 def _populate_summary_kpi_block(
     ws: Worksheet, bundle: ExportBundle, compare_bundle: ExportBundle | None,
 ) -> None:
@@ -710,10 +739,20 @@ def _populate_summary_kpi_block(
         if is_decode else f"=C{r_step}"
     )
     dtps_b_f = f"=IF($G${SUM_ROW_MODEL}>0,B{r_ctps}/$G${SUM_ROW_MODEL},0)" if same_deploy else f"=B{r_ctps}/{b_dies}"
-    ctps_b_f = (
+    ctps_b_f: str | None = (
         f"=IF(B{r_step}>0,$G${SUM_ROW_LEN}*$B${SUM_ROW_SPEC}*1000/B{r_step},0)"
         if same_deploy else f"=IF(B{r_step}>0,{b_cluster_conc}*{b_acc!r}*1000/B{r_step},0)"
     )
+    ctps_a_f: str | None = f"=IF(C{r_step}>0,$G${SUM_ROW_LEN}*$B${SUM_ROW_SPEC}*1000/C{r_step},0)"
+    dtps_a_f = f"=IF($G${SUM_ROW_MODEL}>0,C{r_ctps}/$G${SUM_ROW_MODEL},0)"
+    ctps_note = f"= Cluster_Concurrency ($G${SUM_ROW_LEN}) × Avg_Accepted ($B${SUM_ROW_SPEC}) × 1000 / Step_ms"
+    b_pd, a_pd = _pd_cluster_tps_cells(bundle, "B"), _pd_cluster_tps_cells(after, "C")
+    if b_pd is not None:
+        b_ctps, ctps_b_f, dtps_b_f = b_pd
+    if a_pd is not None:
+        a_ctps, ctps_a_f, dtps_a_f = a_pd
+    if b_pd is not None or a_pd is not None:
+        ctps_note = "PD 集群端到端 = Output × min(Prefill∧KV rps, Decode rps)（求解器胜出配比）；单卡 TPS 仍为 Decode 实例口径"
     kpi_specs: list[tuple[int, str, Any, str | None, int, Any, str | None, int, Any, str | None, int, Any, str | None, int, Any, str | None, int, str, str]] = [
         (
             r_step, "单步总耗时 (Step Latency)",
@@ -743,7 +782,7 @@ def _populate_summary_kpi_block(
         (
             r_dtps, "单卡吞吐 (Single-Die TPS)",
             b_dtps, dtps_b_f, STYLE_KPI_HIGHLIGHT,
-            a_dtps, f"=IF($G${SUM_ROW_MODEL}>0,C{r_ctps}/$G${SUM_ROW_MODEL},0)", STYLE_KPI_HIGHLIGHT,
+            a_dtps, dtps_a_f, STYLE_KPI_HIGHLIGHT,
             a_dtps - b_dtps, f"=C{r_dtps}-B{r_dtps}", STYLE_FLOAT2,
             (a_dtps - b_dtps) / b_dtps if b_dtps > 0.0 else 0.0, f"=IF(B{r_dtps}>0,(C{r_dtps}-B{r_dtps})/B{r_dtps},0)", STYLE_PCT,
             a_dtps / b_dtps if b_dtps > 0.0 else 0.0, f"=IF(B{r_dtps}>0,C{r_dtps}/B{r_dtps},0)", STYLE_RATIO,
@@ -752,11 +791,11 @@ def _populate_summary_kpi_block(
         (
             r_ctps, "集群总吞吐 (Cluster Total TPS)",
             b_ctps, ctps_b_f, STYLE_KPI_HIGHLIGHT,
-            a_ctps, f"=IF(C{r_step}>0,$G${SUM_ROW_LEN}*$B${SUM_ROW_SPEC}*1000/C{r_step},0)", STYLE_KPI_HIGHLIGHT,
+            a_ctps, ctps_a_f, STYLE_KPI_HIGHLIGHT,
             a_ctps - b_ctps, f"=C{r_ctps}-B{r_ctps}", STYLE_FLOAT2,
             (a_ctps - b_ctps) / b_ctps if b_ctps > 0.0 else 0.0, f"=IF(B{r_ctps}>0,(C{r_ctps}-B{r_ctps})/B{r_ctps},0)", STYLE_PCT,
             a_ctps / b_ctps if b_ctps > 0.0 else 0.0, f"=IF(B{r_ctps}>0,C{r_ctps}/B{r_ctps},0)", STYLE_RATIO,
-            "tok/s", f"= Cluster_Concurrency ($G${SUM_ROW_LEN}) × Avg_Accepted ($B${SUM_ROW_SPEC}) × 1000 / Step_ms",
+            "tok/s", ctps_note,
         ),
         (
             r_ls, "Lean 4 物理极限下界 L* (Physical Lower Bound)",
@@ -1482,7 +1521,7 @@ def _populate_standalone_breakdown_sheet(
                 (exp_us, None, STYLE_FLOAT3),
                 (exp_ms, f"=J{r}*B{r}/1000", STYLE_FLOAT3),
                 (op.l_star_lean_us, None, STYLE_FLOAT3),
-                (l_ms, f"=L{r}*B{r}/1000", STYLE_FLOAT3),
+                (l_ms, "=0" if op.is_overlapped else f"=L{r}*B{r}/1000", STYLE_FLOAT3),
                 (max(0.0, exp_ms - l_ms), f"=MAX(0,K{r}-M{r})", STYLE_FLOAT3),
                 (op.bound_display, None, STYLE_OVERLAP if op.is_overlapped else STYLE_TEXT),
                 (op.source_ref or "-", None, STYLE_MUTED_TEXT),
@@ -1701,17 +1740,23 @@ def _populate_cache_block(ws: Worksheet, start_row: int, mem: MemoryCalculatorLe
     ws.merge_range(hdr_row, MEMORY_CACHE_BASIS_START_COL, hdr_row, MEMORY_TABLE_END_COL)
 
     c_start = hdr_row + 1
+    # Token-scaled rates are stored at the ledger dtype; the live T4 selector rescales them by the
+    # canonical storage-width ratio (same widths as ``memory_ledger._cache_dtype_override_ratio``).
+    base_width = float(BF16_BYTES) if mem.cache_dtype == "BF16" else C8_CACHE_FACTOR
+    live_width = f'IF({MEM_CTL_CACHE_REF}="BF16",{BF16_BYTES},{C8_CACHE_FACTOR!r})'
     for offset, row in enumerate(mem.cache_rows):
         r = c_start + offset
         if row.scales_with_tokens and row.max_stage_layers > 0 and row.bytes_per_token_per_layer > 0.0:
-            req_formula = f"=C{r}*D{r}*{MEM_CTL_LOCAL_TOK_REF}/{MIB_BYTES}"
+            rate_formula: str | None = f"={row.bytes_per_token_per_layer!r}*{live_width}/{base_width!r}"
+            req_formula: str | None = f"=C{r}*D{r}*{MEM_CTL_LOCAL_TOK_REF}/{MIB_BYTES}"
             basis = f"Scales with Local Cache Tokens (BF16/C8/FP8={mem.cache_dtype}, ratio={C8_CACHE_FACTOR:.4f}x for C8)"
         else:
+            rate_formula = None
             req_formula = None
             basis = "Fixed per-request state buffer (non-token-scaled)"
         _write_row(ws, r, (
             (row.component, None, STYLE_TEXT), (row.cache_kind, None, STYLE_TEXT),
-            (row.max_stage_layers, None, STYLE_INT), (row.bytes_per_token_per_layer, None, STYLE_FLOAT2),
+            (row.max_stage_layers, None, STYLE_INT), (row.bytes_per_token_per_layer, rate_formula, STYLE_FLOAT2),
             (row.per_request_bytes / float(MIB_BYTES), req_formula, STYLE_FLOAT3),
             (row.batch_total_bytes / float(GIB_BYTES), f"=E{r}*{MEM_CTL_CONC_REF}/{MIB_PER_GIB}", STYLE_FLOAT3),
             (basis, None, STYLE_TEXT),
@@ -1763,11 +1808,22 @@ def _populate_stage_budget_block(
             else (float(st.cache_bytes) / float(max(1, mem.concurrency)))
         )
         if cache_tot_row > 0 and sum_per_req > 0.0:
-            if abs(st_per_req - sum_per_req) <= 1.0:
-                cache_f = f"=E{cache_tot_row}*{MEM_CTL_CONC_REF}/{MIB_PER_GIB}"
-            else:
-                ratio = st_per_req / sum_per_req
-                cache_f = f"=E{cache_tot_row}*{ratio!r}*{MEM_CTL_CONC_REF}/{MIB_PER_GIB}"
+            # Each component carries its own stage share, so hybrid PP stages roll up exactly.
+            first = cache_tot_row - len(mem.cache_rows)
+            terms: list[str] = []
+            for i, crow in enumerate(mem.cache_rows, first):
+                if crow.per_request_bytes <= 0.0:
+                    continue
+                stage_vals = crow.per_stage_bytes
+                share = (
+                    float(stage_vals[st.stage]) / float(crow.per_request_bytes)
+                    if st.stage < len(stage_vals) else 1.0
+                )
+                if abs(share - 1.0) <= MIN_DENOM_EPS:
+                    terms.append(f"E{i}")
+                elif share > 0.0:
+                    terms.append(f"E{i}*{share!r}")
+            cache_f = f"=({'+'.join(terms) or '0'})*{MEM_CTL_CONC_REF}/{MIB_PER_GIB}"
         else:
             cache_f = f"={st_per_req / float(GIB_BYTES)!r}*{MEM_CTL_CONC_REF}"
         _write_row(ws, r, (
@@ -2194,6 +2250,10 @@ def _resolve_xlsx_bundles(
     mtp_proposal_tokens: int, mtp_acceptance_length: float,
     compare_track: str | None, target_track: str | None,
 ) -> tuple[ExportBundle, ExportBundle | None]:
+    # Freshly composed Cases already carry the resolved QuantSpec for ``weight_quant`` (which may
+    # be a catalog preset like ``auto_va``); only caller-supplied Cases keep the storage override.
+    compose_before = source is None
+    compose_after = compose_before and compare_source is None and bool(target_track)
     if source is None:
         if not model or not hardware:
             raise ValueError("export_comparison_xlsx_requires_source_or_model_and_hardware")
@@ -2227,7 +2287,8 @@ def _resolve_xlsx_bundles(
         source if isinstance(source, ExportBundle)
         else build_export_bundle(
             source, request=eff_req, step_eval=step_eval, replay=replay,
-            observations_path=observations_path, weight_quant=weight_quant,
+            observations_path=observations_path,
+            weight_quant=None if compose_before else weight_quant,
             cache_dtype=cache_dtype, engram_host_offload=engram_host_offload,
             include_vision_tower=include_vision_tower,
             apply_preset_to_ignored=apply_preset_to_ignored,
@@ -2244,7 +2305,7 @@ def _resolve_xlsx_bundles(
                     tokens=bundle.tokens_per_seq, context=bundle.context_tokens,
                     sequences=bundle.sequences, scope=bundle.scope,  # type: ignore[arg-type]
                 ),
-                replay=replay, weight_quant=weight_quant,
+                replay=replay, weight_quant=None if compose_after else weight_quant,
                 cache_dtype=cache_dtype, engram_host_offload=engram_host_offload,
                 include_vision_tower=include_vision_tower,
                 apply_preset_to_ignored=apply_preset_to_ignored,

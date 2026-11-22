@@ -980,3 +980,106 @@ def test_explicit_rewrite_plan_no_clamping_unrounded_rank_and_prefill_export(tmp
     assert res_prefill["exports"]["xlsx"]["phase"] == "prefill"
 
 
+def test_iso_sla_colocated_prefill_token_cap_exact_cache_b1_and_prefill_dcp(monkeypatch):
+    import math
+    from mindie_sim.catalog.context_parallel import validate_vllm_ascend_dcp_codomain
+    from mindie_sim.solve import _summarize_iso_sla_state
+    from mindie_sim.sweep import pd as pd_mod
+
+    # 1. Unconstrained TTFT still prices colocated finalist prefill so TTFT & e2e_total_tps stay physical.
+    col_raw = compose_case("qwen3-32b", "a3", tp=2, layers=2, prompt_tokens=256, output_tokens=8)
+    row = pd_mod._evaluate_colocated_candidate(
+        col_raw, prompt_tokens=256, output_tokens=8,
+        ttft_sla_ms=math.inf, tpot_sla_ms=100.0, mtp_tokens=0, max_sequences_per_dp=2,
+    )
+    assert row["feasible"] is True
+    assert row["ttft_ms"] > 0.0
+    assert row["e2e_total_tps"] > 0.0 and row["e2e_total_tps"] < row["sustainable_tps"]
+    iso_state = _summarize_iso_sla_state(
+        {"feasible": True, "winner_mode": "colocated", "best_configuration": row},
+        track="merged", mode_label="before", num_devices=2,
+    )
+    assert iso_state["cluster_tps_per_purchased_die"] == pytest.approx(row["e2e_total_tps"] / 2.0, rel=1e-12)
+
+    # 2. Decode SLA search caps batch by max_num_batched_tokens // q_tok while keeping b_vram_max physical,
+    #    and returns exact step_ms_at_b1 even when the top batch fits on the first probe.
+    cap_raw = compose_case(
+        "deepseek-v3.2", "a5", tp=8, ep=8, quant="mxfp4", prompt_tokens=256, output_tokens=16,
+        mtp_proposal_tokens=3, mtp_acceptance_length=2.5, max_num_seqs=64, max_num_batched_tokens=16,
+    )
+    parsed_cap = parse_case(cap_raw)
+    seen_seqs: list[int] = []
+
+    def _linear_step(_parsed, *, sequences, **_kw):
+        seen_seqs.append(int(sequences))
+        return 2.0 + 0.5 * float(sequences)
+
+    with monkeypatch.context() as mp:
+        mp.setattr(pd_mod, "_archetype_weighted_step_ms", _linear_step)
+        sla_res = pd_mod._solve_sla_archetype_aware(
+            parsed_cap, sla_ms=50.0, context=256, output_budget=16, max_sequences_per_dp=64,
+        )
+    scen = sla_res["scenarios"][0]
+    assert scen["b_vram_max"] > 4  # physical HBM ceiling preserved
+    assert scen["b_feasible"] == 4  # 16 batched tokens // (1 + 3) query tokens
+    assert scen["step_ms_feasible"] == pytest.approx(4.0, rel=1e-9)
+    assert scen["step_ms_at_b1"] == pytest.approx(2.5, rel=1e-9)
+    assert 1 in seen_seqs and all(s <= 4 for s in seen_seqs)
+
+    # 3. PD SLA cache keys use exact eff_sla_ms so tight/loose sub-0.01 ms budgets never collide.
+    cache: dict[tuple[int, float], dict[str, object]] = {}
+    d_parsed = parse_case(col_raw)
+
+    def _step_near_10(_parsed, *, sequences, **_kw):
+        return 10.003 if int(sequences) >= 2 else 9.0
+
+    with monkeypatch.context() as mp:
+        mp.setattr(pd_mod, "_archetype_weighted_step_ms", _step_near_10)
+        looser = pd_mod._measure_decode_stage(
+            d_parsed, prompt=256, output=101, eff_decode=256,
+            tpot_sla_ms=10.004, exposed_kv_ms=0.0, decode_tokens=100,
+            max_sequences_per_dp=2, cache=cache, cache_id=7,
+        )
+        tighter = pd_mod._measure_decode_stage(
+            d_parsed, prompt=256, output=101, eff_decode=256,
+            tpot_sla_ms=10.001, exposed_kv_ms=0.0, decode_tokens=100,
+            max_sequences_per_dp=2, cache=cache, cache_id=7,
+        )
+    assert looser["tpot_ok"] is True and looser["b_feasible"] == 2
+    assert tighter["tpot_ok"] is True and tighter["b_feasible"] == 1
+    assert len(cache) == 2
+
+    # 4. Prefill role enforces validate_vllm_ascend_dcp_codomain in candidate builder and fixed-case PD sweep.
+    sfa_case = compose_case("deepseek-v3.2", "a3", tp=4, ep=4, layers=4, prompt_tokens=256, output_tokens=32)
+    sfa_spec = parse_case(sfa_case).model
+    assert pd_mod._build_pd_stage_candidates(
+        role="pd_prefill", max_dies=8, is_moe=True, layers=4, prompt_tokens=256,
+        rec_topo=None, pinned={"tp": 4, "pcp": 1, "dcp": 2}, model_spec=sfa_spec,
+    ) == []
+    bad_p = compose_case("deepseek-v3.2", "a3", tp=4, ep=4, dcp=2, layers=4, prompt_tokens=256, output_tokens=32)
+    assert validate_vllm_ascend_dcp_codomain(sfa_spec, parse_case(bad_p).runtime.parallel)[0] is False
+    bad_p_rep = sweep_pd_disaggregation_ratios(
+        bad_p, sfa_case, total_dies=8, prompt_tokens=256, output_tokens=32,
+        ttft_sla_ms=5000.0, tpot_sla_ms=50.0,
+    )
+    assert bad_p_rep["prefill_instance"]["dcp_codomain_valid"] is False
+    assert bad_p_rep["best_configuration"] is None
+    assert all(
+        not r["feasible"] and str(r["infeasible_reason"]).startswith("prefill:")
+        for r in bad_p_rep["candidates"]
+    )
+
+    # 5. PD pool summary carries prefill_kv_rps and e2e_total_tps from the winning ratio.
+    sol_pd = solve_optimal_deployment(
+        "qwen3-32b", "a3", num_devices=4, layers=2, prompt_tokens=256, output_tokens=32,
+        ttft_sla_ms=5000.0, tpot_sla_ms=50.0, deployment="pd_disaggregated",
+        pinned_prefill_parallel={"tp": 2}, pinned_decode_parallel={"tp": 2},
+        max_sequences_per_dp=4,
+    )
+    assert sol_pd["feasible"] is True and isinstance(sol_pd["pd_pool_summary"], dict)
+    pool = sol_pd["pd_pool_summary"]
+    assert pool["e2e_total_tps"] == pytest.approx(sol_pd["best_configuration"]["e2e_total_tps"], rel=1e-9)
+    assert pool["prefill_kv_rps"] > 0.0
+
+
+

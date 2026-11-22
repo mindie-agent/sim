@@ -369,12 +369,13 @@ def _compute_cache_ledger_rows(
             comp_stage_bytes["page_metadata"][st_idx] += float(metadatas[st_idx])
             comp_stage_layers["page_metadata"][st_idx] = max(1, int(stage_layers[st_idx]))
 
-    # Account for DP-cohort DCP amplification when dcp_dp_width > 1 so per-DP cache matches Memory.
-    if abs(scale_override - 1.0) <= MIN_DENOM_EPS and int(getattr(p, "dcp_dp_width", 1) or 1) > 1:
+    # Account for DP-cohort DCP amplification when dcp_dp_width > 1 so per-DP cache matches Memory;
+    # the cohort's extra sharded KV bytes take the same cache-dtype width ratio as the local KV.
+    if int(getattr(p, "dcp_dp_width", 1) or 1) > 1:
         cohort_totals = mem.dp_cohort_cache_bytes(max(1, seq_len), padded=True)
         base_totals = mem.cache_bytes(max(1, seq_len), padded=True)
         for st_idx in range(min(n_stages, len(cohort_totals), len(base_totals))):
-            extra = float(cohort_totals[st_idx]) - float(base_totals[st_idx])
+            extra = (float(cohort_totals[st_idx]) - float(base_totals[st_idx])) * scale_override
             if extra > MIN_DENOM_EPS:
                 comp_scalable["dcp_dp_cohort_kv"] = True
                 comp_stage_bytes["dcp_dp_cohort_kv"][st_idx] += extra
@@ -411,6 +412,7 @@ def _compute_cache_ledger_rows(
             per_request_bytes=max_req_bytes,
             batch_total_bytes=max_req_bytes * float(concurrency),
             scales_with_tokens=scalable,
+            per_stage_bytes=tuple(float(v) for v in per_stage),
         ))
     return local_tokens, tuple(rows), stage_totals, stage_per_req_totals
 

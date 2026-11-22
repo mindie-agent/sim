@@ -638,6 +638,7 @@ class CacheLedgerRow:
     per_request_bytes: float
     batch_total_bytes: float
     scales_with_tokens: bool
+    per_stage_bytes: tuple[float, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

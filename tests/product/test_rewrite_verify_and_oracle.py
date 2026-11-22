@@ -1350,3 +1350,110 @@ def test_oneshot_collective_rejects_local_work_and_conserves_concurrent_link_con
     total_span_us = sum(res_conc.archetype_spans_us.values())
     assert total_span_us > single_us * 1.8
     assert all(n.dur_us > single_us * 1.8 for n in res_conc.nodes)
+
+
+def test_pairwise_alltoall_prices_routed_volume_above_launch_floor():
+    from mindie_sim.optimization.kernel_synthesis import (
+        _TargetPricingContext, _build_collective_plan, _price_collective_on_topology, extract_sku_floors,
+    )
+    from mindie_sim.prediction.structure import parse_case
+    from mindie_sim.schema.operators import OpSpec
+
+    case = parse_case(compose_case("qwen3-32b", REPRESENTATIVE_SKUS["a5"], tp=4, dp=1, layers=1))
+    route = case.machine.links[0].name
+    ctx = _TargetPricingContext(case)
+    floor_us = float(extract_sku_floors(case).launch_vec_us)
+    a2a = OpSpec(
+        op_id="s0.l0.dispatch", family="alltoall", phase="decode", stage=0, layer=0, requests=(),
+        semantic_shape=(256, 4096), local_shape=(256, 4096), padded_shape=(256, 4096), launch_shape=(256, 4096),
+        dtype="bf16", link_bytes=float(4 * 1024 * 1024), link_scope="tp", metadata=(("group_axis", "tp"),),
+    )
+    # Pairwise groups keep traffic in per-rank volumes; routed messages exist only once rounds start.
+    _, _, plan = _build_collective_plan(a2a, ctx, case, mode="pairwise", topology_route=route)
+    assert plan is not None
+    assert all(not getattr(g, "messages", ()) for g in plan.groups)
+    small_us = _price_collective_on_topology(a2a, ctx, case, mode="pairwise", topology_route=route, minimum_us=floor_us)
+    big_us = _price_collective_on_topology(
+        replace(a2a, link_bytes=4.0 * a2a.link_bytes), ctx, case,
+        mode="pairwise", topology_route=route, minimum_us=floor_us,
+    )
+    assert small_us is not None and small_us > floor_us
+    assert big_us > small_us * 2.0
+    # The automatic path (no explicit route) prices the same work instead of dropping the plan.
+    auto_us = _price_collective_on_topology(a2a, ctx, case, mode="pairwise", minimum_us=floor_us)
+    assert auto_us == pytest.approx(small_us)
+
+
+def test_oneshot_selection_reconciles_link_ledger_with_executed_sends():
+    from mindie_sim.optimization import solve_target_graph
+    from mindie_sim.prediction.structure import parse_case
+    from mindie_sim.rewrite import CollectiveTransform, Edit, OpRef, RewritePlan
+    from mindie_sim.schema.operators import OpSpec
+
+    link_rate = 50.0e9
+
+    def _check(node, dem, useful_tx):
+        assert node.link_bytes == pytest.approx(useful_tx)
+        assert dem[4] == int(useful_tx * 1.0e9 / link_rate)
+        assert node.l_star_lean_us == pytest.approx(max(dem) / 1000.0)
+        assert node.gap_us == pytest.approx(max(0.0, node.dur_us - node.l_star_lean_us))
+
+    # Automatic selection: TP8 4 KiB AllReduce, ring ledger 1.75*M -> one-shot sends M to 7 peers.
+    case8 = parse_case(compose_case("qwen3-32b", REPRESENTATIVE_SKUS["a3"], tp=8, dp=1, layers=1))
+    peaks8 = {0: {"hbm_peak_bytes_per_s": dict(case8.machine.dies[0].rates)["hbm"], "link_peak_bytes_per_s": link_rate}}
+    msg = float(4 * 1024)
+    ar = OpSpec(
+        op_id="s0.l0.ar", family="allreduce", phase="decode", stage=0, layer=0, requests=(),
+        semantic_shape=(1, 2048), local_shape=(1, 2048), padded_shape=(1, 2048), launch_shape=(1, 2048),
+        dtype="bf16", link_bytes=msg * (2.0 * 7.0 / 8.0), link_scope="tp", metadata=(("group_axis", "tp"),),
+    )
+    n_ar = _mk_target_node(0, ar, task_type="HCCL", dur_us=200.0, l_star_us=0.5, bound="link_bound")
+    res = solve_target_graph((n_ar,), ((0, 0, 0, 0, 500),), case8, peaks8, allow_unbound_formula=False)
+    assert "One-Shot" in res.nodes[0].ascend_kernel
+    _check(res.nodes[0], res.demands_ns[0], 7.0 * msg)
+
+    # Explicit CollectiveTransform: TP4 ring ledger 1.5*M -> one-shot sends M to 3 peers.
+    case4 = parse_case(compose_case("qwen3-32b", REPRESENTATIVE_SKUS["a5"], tp=4, dp=1, layers=1))
+    peaks4 = {0: {"hbm_peak_bytes_per_s": dict(case4.machine.dies[0].rates)["hbm"], "link_peak_bytes_per_s": link_rate}}
+    msg4 = float(64 * 1024)
+    ar4 = replace(ar, op_id="s0.l0.ar4", link_bytes=msg4 * (2.0 * 3.0 / 4.0))
+    n_ar4 = _mk_target_node(0, ar4, task_type="HCCL", dur_us=200.0, l_star_us=0.5, bound="link_bound")
+    plan = RewritePlan(edits=(
+        Edit("os4", operation=CollectiveTransform(OpRef("atom", "s0.l0.ar4"), "oneshot", case4.machine.links[0].name)),
+    ))
+    res4 = solve_target_graph(
+        (n_ar4,), ((0, 0, 0, 0, 500),), case4, peaks4, rewrite_plan=plan, allow_unbound_formula=False,
+    )
+    _check(res4.nodes[0], res4.demands_ns[0], 3.0 * msg4)
+
+
+def test_formula_sram_sizes_norm_row_by_reduction_width_not_downstream_vocab():
+    from mindie_sim.optimization.kernel_synthesis import FormulaKernelSpec, FormulaTensorSpec, _solve_formula_sram
+    from mindie_sim.prediction.structure import parse_case
+    from mindie_sim.schema.operators import OpSpec
+
+    # Final RMSNorm (hidden 5,120) feeding a TP2 LM head with 75,968 local logits.
+    case = parse_case(compose_case("qwen3-32b", REPRESENTATIVE_SKUS["a3"], tp=2, dp=1, layers=1))
+    datapath = datapath_for_die(case.machine.dies[0])
+    hidden, vocab = 5120, 75968
+    norm = OpSpec(
+        op_id="s0.final_norm", family="rmsnorm", phase="decode", stage=0, layer=0, requests=(),
+        semantic_shape=(1, hidden), local_shape=(1, hidden), padded_shape=(1, hidden), launch_shape=(1, hidden),
+        dtype="bf16", vector_ops=float(hidden * 4), mte2_bytes=float(hidden * 2), mte3_bytes=float(hidden * 2),
+        hbm_bytes=float(hidden * 4),
+    )
+    head = OpSpec(
+        op_id="s0.lm_head", family="gemm", recipe="gemm", phase="decode", stage=0, layer=0, requests=(),
+        deps=("s0.final_norm",), semantic_shape=(1, vocab, hidden), local_shape=(1, vocab, hidden),
+        padded_shape=(1, vocab, hidden), launch_shape=(1, vocab, hidden), dtype="bf16",
+        flops=float(2 * vocab * hidden), mte2_bytes=float(vocab * hidden * 2), mte3_bytes=float(vocab * 2),
+        hbm_bytes=float(vocab * hidden * 2 + vocab * 2),
+    )
+    spec = replace(
+        FormulaKernelSpec.from_ops((norm, head)),
+        outputs=(FormulaTensorSpec("logits", (1, vocab), "bf16", role="output"),),
+    )
+    _, algo, tile, ub_pk, ub_budget, *_rest, ok = _solve_formula_sram(spec, datapath)
+    assert "N=5120," in tile
+    assert ok is True and 0 < ub_pk <= ub_budget
+    assert algo in {"resident_1pass", "online_reduce"}

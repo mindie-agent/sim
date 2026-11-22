@@ -38,6 +38,7 @@ from typing import Any, Literal
 
 from mindie_sim.prediction.collectives import (
     OneShotCollective,
+    OneShotPlan,
     Topology,
 )
 from mindie_sim.prediction.engine import Engine, Resource
@@ -992,8 +993,14 @@ def _solve_formula_sram(
 
     width_pool = [int(sh[-1]) for sh in all_shapes] + internal_aiv_widths + internal_red_widths
     inner_dim = max(width_pool, default=CUBE_TILE_MN_ELEMS)
-    base_tile_n = inner_dim if has_row_red else min(inner_dim, CUBE_TILE_MN_ELEMS)
-    tile_n = max(base_tile_n, max(internal_red_widths, default=0))
+    if internal_red_widths:
+        # The AIV reduction row spans the reducing op's own width, never an
+        # unrelated boundary dimension (e.g. a downstream LM-head vocab axis).
+        tile_n = max(internal_red_widths)
+    elif has_row_red:
+        tile_n = inner_dim  # equation-only row-reduction specification
+    else:
+        tile_n = min(inner_dim, CUBE_TILE_MN_ELEMS)
     if has_aiv:
         # Ascend AIV upcasts vector intermediates to FP32 (4 B/elem) inside UB.
         base_row_bytes = int(tile_n * (max(in_b, float(FP32_ACCUM_BYTES)) + max(out_b, float(FP32_ACCUM_BYTES))))
@@ -2374,11 +2381,28 @@ def _build_collective_plan(
         else:
             return None
 
-    if not getattr(plan, "groups", ()) or not any(getattr(g, "messages", ()) for g in plan.groups):
+    if not _collective_plan_has_work(plan, mode):
         return (topology, op_norm, None) if topology_route is not None else None
     if mode == "oneshot":
         plan.validate_path_model(OneShotCollective().path_model)
     return topology, op_norm, plan
+
+
+def _collective_plan_has_work(plan: Any, mode: str) -> bool:
+    """Whether ``plan`` carries wire work in the representation its algorithm uses.
+
+    ``PairwiseGroup`` keeps routed traffic in ``volumes`` and materialises each
+    message lazily when its round starts, so ``messages`` is never populated;
+    ring / one-shot groups retain their routed ``messages`` eagerly.
+    """
+    groups = getattr(plan, "groups", ()) or ()
+    if mode == "pairwise":
+        return any(
+            int(getattr(g, "rounds", 0) or 0) > 0
+            and any(float(n) > 0.0 for _, n in getattr(g, "volumes", ()))
+            for g in groups
+        )
+    return any(getattr(g, "messages", ()) for g in groups)
 
 
 def _price_collective_on_topology(
@@ -3397,6 +3421,45 @@ def _verify_final_target_plan(
     return all_passed
 
 
+def _reconcile_oneshot_link_ledger(
+    nodes: Sequence[TargetOpNode],
+    demands: Sequence[tuple[int, int, int, int, int]],
+    collective_plans: Mapping[OpOccurrence, tuple[Any, float]],
+    peaks_by_stage: Mapping[int, Mapping[str, Any]],
+    default_peaks: Mapping[str, Any],
+) -> tuple[list[TargetOpNode], list[tuple[int, int, int, int, int]]]:
+    """Re-derive ``link_bytes`` / link demand / ``L*`` from executed ``OneShotPlan`` messages.
+
+    A selected one-shot plan sends the full buffer to every peer, so the ring
+    volume inherited from the source graph under-counts useful TX per rank.
+    """
+    out_nodes, out_dems = list(nodes), list(demands)
+    for i, node in enumerate(out_nodes):
+        entry = collective_plans.get(node.occurrence)
+        if entry is None or not isinstance(entry[0], OneShotPlan):
+            continue
+        peaks = peaks_by_stage.get(node.occurrence.stage) or default_peaks
+        rank = node.occurrence.rank
+        if rank is None:
+            die = peaks.get("die")
+            rank = int(getattr(die, "rank", 0) or 0)
+        tx = float(entry[0].accounting(source_ranks=(rank,)).useful_by_rank.get(rank, 0.0))
+        link_rate = float(peaks.get("link_peak_bytes_per_s") or 0.0)
+        link_ns = int(tx * NS_PER_SECOND / link_rate) if link_rate > 0.0 else int(out_dems[i][4])
+        out_dems[i] = (*out_dems[i][:4], link_ns)
+        l_star = float(max(out_dems[i])) / NS_PER_US
+        dur = float(node.dur_us)
+        eff = min(1.0, l_star / dur) if dur > 0.0 and l_star > 0.0 else None
+        out_nodes[i] = replace(
+            node, link_bytes=tx, l_star_lean_us=l_star,
+            gap_us=max(0.0, dur - l_star),
+            gap_ratio=(dur / l_star) if l_star > 0.0 else None,
+            roofline_efficiency=eff,
+            opt_attainment_pct=round(eff * PERCENT_SCALE, 1) if eff is not None else None,
+        )
+    return out_nodes, out_dems
+
+
 def solve_target_graph(
     nodes: Sequence[TargetOpNode],
     demands: Sequence[tuple[int, int, int, int, int]],
@@ -3502,6 +3565,10 @@ def solve_target_graph(
         allow_unbound_formula=allow_unbound_formula,
         collective_plans=collective_plans,
     )
+    if collective_plans:
+        enveloped, all_dems = _reconcile_oneshot_link_ledger(
+            enveloped, all_dems, collective_plans, peaks_by_stage, p0,
+        )
     _, _, topology, _ = pricing_ctx.ensure() if collective_plans else (None, None, None, False)
     scheduled = reschedule_node_timelines(
         enveloped, collective_plans=collective_plans or None, topology=topology,

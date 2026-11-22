@@ -306,13 +306,20 @@ def _auto_solve_report_layout(
     apply_target_envelope: bool = False,
     rewrite_plan: Any = None,
     allow_unbound_formula: bool = True,
+    phase: str = "decode",
 ) -> dict[str, Any]:
-    """Auto-solve HBM-safe parallelism + concurrency via fast ``solve_optimal_deployment``."""
+    """Auto-solve HBM-safe parallelism + concurrency via fast ``solve_optimal_deployment``.
+
+    The returned layout carries the full ``solved`` result so each report column
+    is built from its own winner (pool size, KV handoff, speculative settings).
+    """
+    from mindie_sim.solve import _resolve_kv_pooling_mode
     from mindie_sim.sweep.pd import solve_optimal_deployment
 
     dep = "colocated" if deployment_mode == "colocated" else (
         "pd_disaggregated" if deployment_mode.startswith("pd_") else "auto"
     )
+    pooling = {"pd_pooled": True, "pd_unpooled": False}.get(deployment_mode)
     solved = solve_optimal_deployment(
         model,
         sku,
@@ -322,6 +329,7 @@ def _auto_solve_report_layout(
         ttft_sla_ms=ttft_slo_ms,
         tpot_sla_ms=float(tpot_slo_ms),
         deployment=dep,
+        pd_transfer_mode=_resolve_kv_pooling_mode(pooling),
         quant=quant,
         kv_cache_dtype=kv_cache_dtype,
         indexer_kv_dtype=indexer_kv_dtype,
@@ -339,7 +347,10 @@ def _auto_solve_report_layout(
         cands = [c for c in solved.get("candidates", ()) if isinstance(c, Mapping) and int(c.get("b_vram", 0) or 0) >= 1]
         if cands:
             best = max(cands, key=lambda c: (int(c.get("b_vram", 0) or 0), -float(c.get("effective_tpot_ms", 1e9) or 1e9)))
-    par = (best or {}).get("decode_parallel") or (best or {}).get("parallel") or {}
+    best = best or {}
+    role_key = "prefill_parallel" if phase == "prefill" else "decode_parallel"
+    par = best.get(role_key) or best.get("parallel") or {}
+    is_pd = solved.get("winner_mode") == "pd_disaggregated"
     return {
         "dp": int(par.get("dp", 1) or 1),
         "tp": int(par.get("tp", min(num_devices, 8)) or 1),
@@ -347,11 +358,97 @@ def _auto_solve_report_layout(
         "pp": int(par.get("pp", 1) or 1),
         "dcp": int(par.get("cp", par.get("dcp", 1)) or 1),
         "pcp": int(par.get("pcp", 1) or 1),
-        "concurrency": max(1, int((best or {}).get("b_feasible") or (best or {}).get("b_vram") or 1)),
-        "spec_tokens": int((best or {}).get("mtp_proposal_tokens", 0) or 0),
-        "deployment_mode": "pd_unpooled" if solved.get("winner_mode") == "pd_disaggregated" else "colocated",
+        "concurrency": max(1, int(best.get("b_feasible") or best.get("b_vram") or 1)),
+        "spec_tokens": int(best.get("mtp_proposal_tokens", 0) or 0),
+        "deployment_mode": (
+            "colocated" if not is_pd
+            else "pd_pooled" if best.get("pd_transfer_mode") == "pooled_dram_ssd" else "pd_unpooled"
+        ),
         "solver_feasible": bool(solved.get("feasible", False)),
+        "solved": solved,
     }
+
+
+def _solved_column_inputs(
+    layout: Mapping[str, Any],
+    *,
+    model: str,
+    sku: str,
+    feature_track: str,
+    phase: str,
+    prompt_tokens: int,
+    output_tokens: int,
+    concurrency: int | None,
+    compose_kw: Mapping[str, Any],
+) -> tuple[dict[str, Any], StepRequest, dict[str, Any]]:
+    """Build one report column's ``(case, StepRequest, bundle_meta)`` from its own solved winner."""
+    from dataclasses import replace
+
+    from mindie_sim.solve import _bundle_inputs_for_solution
+
+    raw, step, meta = _bundle_inputs_for_solution(
+        layout["solved"], model=model, hardware=sku, runtime_stack="vllm-ascend",
+        base_kw=compose_kw, feature_track=feature_track,
+        prompt_tokens=prompt_tokens, output_tokens=output_tokens, scope="model", phase=phase,
+    )
+    if concurrency is not None:
+        step = replace(step, sequences=int(concurrency))
+    pool = meta.get("pd_pool_summary")
+    dep_mode = (
+        "colocated" if not pool
+        else "pd_pooled" if pool.get("pd_transfer_mode") == "pooled_dram_ssd" else "pd_unpooled"
+    )
+    rt = dict(raw.get("runtime") or {})
+    rt["metadata"] = {**dict(rt.get("metadata") or {}), "deployment_mode": dep_mode}
+    raw["runtime"] = rt
+    return raw, step, meta
+
+
+def _report_column(
+    layout: Mapping[str, Any] | None,
+    *,
+    model: str,
+    sku: str,
+    phase: str,
+    track: str,
+    quant: str | None,
+    kv: str | None,
+    par: Mapping[str, int],
+    conc: int,
+    concurrency: int | None,
+    common_kw: Mapping[str, Any],
+) -> tuple[dict[str, Any], StepRequest, dict[str, Any]]:
+    """Return one column's ``(case, StepRequest, build_export_bundle kwargs)``.
+
+    A column solved with its own track/quant uses that winner verbatim; explicit or
+    script-pinned layouts are composed from the requested parallelism instead.
+    """
+    prompt_tokens, output_tokens = int(common_kw["prompt_tokens"]), int(common_kw["output_tokens"])
+    if layout is not None and layout.get("solved") is not None:
+        compose_kw = dict(
+            quant=quant, kv_cache_dtype=kv, topology_preset=common_kw.get("topology_preset"),
+            prompt_tokens=prompt_tokens, output_tokens=output_tokens,
+        )
+        raw, step, meta = _solved_column_inputs(
+            layout, model=model, sku=sku, feature_track=track, phase=phase,
+            prompt_tokens=prompt_tokens, output_tokens=output_tokens,
+            concurrency=concurrency, compose_kw=compose_kw,
+        )
+        return raw, step, {
+            "handoff_tpot_ms": meta.get("handoff_tpot_ms"),
+            "deployment_total_dies": meta.get("deployment_total_dies") or None,
+            "pd_pool_summary": meta.get("pd_pool_summary"),
+        }
+    raw, req = compose_export_case(
+        model, sku, feature_track=track, concurrency=conc, quant=quant, kv_cache_dtype=kv,
+        **dict(par), **dict(common_kw),
+    )
+    is_decode = phase == "decode"
+    step = StepRequest(
+        phase=phase, tokens=req.tokens if is_decode else prompt_tokens,
+        context=req.context if is_decode else 0, sequences=req.sequences, scope="model",
+    )
+    return raw, step, {}
 
 
 def add_report_commands(subparsers) -> None:
@@ -479,6 +576,19 @@ def _emit_report_artifacts(
     return summary, brief_dict, digest_md
 
 
+def _report_tracks(
+    mode: str, *, compare_track: str, target_track: str, enforce_eager: bool,
+) -> tuple[str, str]:
+    """Resolve ``(before_track, after_track)``; strict simulation never selects ``expected_ideal``."""
+    before = "raw_eager" if enforce_eager else compare_track
+    if mode == MODE_SIMULATION and before.strip().lower() == "expected_ideal":
+        before = "merged"
+    after = target_track
+    if mode == MODE_SIMULATION and after.strip().lower() == "expected_ideal":
+        after = before
+    return before, after
+
+
 def run_report_command(args: argparse.Namespace, *, load_designs: Any) -> dict[str, Any]:
     """Execute ``mindie-sim report`` with Iso-SLA auto-solve, ``auto_va``, and ``--rewrite-plan``."""
     script_info = parse_script_for_report(args.from_script) if getattr(args, "from_script", None) else None
@@ -502,9 +612,9 @@ def run_report_command(args: argparse.Namespace, *, load_designs: Any) -> dict[s
     topo_preset = args.topology_preset or policy["topology_preset"]
     explicit_parallel = any(getattr(args, k, None) is not None for k in ("dp", "tp", "ep", "pp", "dcp", "pcp"))
 
-    before_track = "raw_eager" if (script_info and script_info.get("enforce_eager")) else str(args.compare_track)
-    after_track = str(args.target_track) if mode == MODE_MODELING else (
-        str(args.target_track) if str(args.target_track) != "expected_ideal" else str(args.compare_track)
+    before_track, after_track = _report_tracks(
+        mode, compare_track=str(args.compare_track), target_track=str(args.target_track),
+        enforce_eager=bool(script_info and script_info.get("enforce_eager")),
     )
     has_target_after = (mode == MODE_MODELING) or (rewrite_plan is not None)
     before_quant = (script_info.get("weight_quant") if script_info else None) or policy["weight_quant"]
@@ -522,6 +632,8 @@ def run_report_command(args: argparse.Namespace, *, load_designs: Any) -> dict[s
         after_idx_kv = after_policy["indexer_kv_dtype"]
     explicit_spec = int(args.spec_tokens) if args.spec_tokens is not None else None
     explicit_accept = float(args.accept_len) if args.accept_len is not None else None
+    layout_before: Mapping[str, Any] | None = None
+    layout_after: Mapping[str, Any] | None = None
 
     if explicit_parallel:
         dp, tp, ep = int(args.dp or 1), int(args.tp or 1), int(args.ep or 1)
@@ -549,7 +661,9 @@ def run_report_command(args: argparse.Namespace, *, load_designs: Any) -> dict[s
             apply_target_envelope=has_target_after,
             rewrite_plan=rewrite_plan if has_target_after else None,
             allow_unbound_formula=(mode == MODE_MODELING),
+            phase=args.phase,
         )
+        layout_after = solved_after
         dp, tp, ep, pp = solved_after["dp"], solved_after["tp"], solved_after["ep"], solved_after["pp"]
         dcp, pcp = solved_after["dcp"], solved_after["pcp"]
         conc = int(args.concurrency or solved_after["concurrency"])
@@ -576,7 +690,9 @@ def run_report_command(args: argparse.Namespace, *, load_designs: Any) -> dict[s
                 apply_target_envelope=False,
                 rewrite_plan=None,
                 allow_unbound_formula=False,
+                phase=args.phase,
             )
+            layout_before = solved_before
             before_par = dict(
                 dp=solved_before["dp"], tp=solved_before["tp"], ep=solved_before["ep"],
                 pp=solved_before["pp"], dcp=solved_before["dcp"], pcp=solved_before["pcp"],
@@ -585,6 +701,8 @@ def run_report_command(args: argparse.Namespace, *, load_designs: Any) -> dict[s
         else:
             before_par = dict(dp=dp, tp=tp, ep=ep, pp=pp, dcp=dcp, pcp=pcp)
             before_conc = conc
+            if (before_track, before_quant, before_kv) == (after_track, after_quant, after_kv):
+                layout_before = solved_after
 
     accept_len = float(
         explicit_accept if explicit_accept is not None
@@ -601,34 +719,29 @@ def run_report_command(args: argparse.Namespace, *, load_designs: Any) -> dict[s
         mtp_proposal_tokens=spec_toks, mtp_acceptance_length=accept_len,
         engram_cpu_offload=args.engram_offload, deployment_mode=dep_mode,
     )
-    raw_before, req_b = compose_export_case(
-        model_arg, policy["sku"], feature_track=before_track,
-        concurrency=before_conc, quant=before_quant, kv_cache_dtype=before_kv, **before_par, **common_kw,
+    column_kw = dict(model=model_arg, sku=policy["sku"], phase=args.phase, common_kw=common_kw,
+                     concurrency=args.concurrency)
+    raw_before, step_b, meta_b = _report_column(
+        layout_before, track=before_track, quant=before_quant, kv=before_kv,
+        par=before_par, conc=before_conc, **column_kw,
     )
-    raw_after, req_a = compose_export_case(
-        model_arg, policy["sku"], feature_track=after_track,
-        concurrency=conc, quant=after_quant, kv_cache_dtype=after_kv,
-        dp=dp, tp=tp, ep=ep, pp=pp, dcp=dcp, pcp=pcp, **common_kw,
+    raw_after, step_a, meta_a = _report_column(
+        layout_after, track=after_track, quant=after_quant, kv=after_kv,
+        par=dict(dp=dp, tp=tp, ep=ep, pp=pp, dcp=dcp, pcp=pcp), conc=conc, **column_kw,
     )
-    step_b = StepRequest(
-        phase=args.phase, tokens=req_b.tokens if args.phase == "decode" else prompt_tokens,
-        context=req_b.context if args.phase == "decode" else 0, sequences=req_b.sequences, scope="model",
-    )
-    step_a = StepRequest(
-        phase=args.phase, tokens=req_a.tokens if args.phase == "decode" else prompt_tokens,
-        context=req_a.context if args.phase == "decode" else 0, sequences=req_a.sequences, scope="model",
-    )
+    # Columns are composed with their quant preset already applied; re-passing the
+    # preset string as a storage override would reject catalog presets (w8a8_dynamic).
     before_bundle = build_export_bundle(
         raw_before, request=step_b, replay=replay, observations_path=args.observations,
-        weight_quant=before_quant, cache_dtype=before_kv, engram_host_offload=args.engram_offload,
-        apply_target_envelope=False,
+        cache_dtype=before_kv, engram_host_offload=args.engram_offload,
+        apply_target_envelope=False, **meta_b,
     )
     after_bundle = build_export_bundle(
         raw_after, request=step_a, replay=replay,
-        weight_quant=after_quant, cache_dtype=after_kv, engram_host_offload=args.engram_offload,
+        cache_dtype=after_kv, engram_host_offload=args.engram_offload,
         apply_target_envelope=has_target_after,
         rewrite_plan=rewrite_plan if has_target_after else None,
-        allow_unbound_formula=(mode == MODE_MODELING),
+        allow_unbound_formula=(mode == MODE_MODELING), **meta_a,
     )
     summary, brief_dict, digest_md = _emit_report_artifacts(
         before_bundle=before_bundle, after_bundle=after_bundle,
