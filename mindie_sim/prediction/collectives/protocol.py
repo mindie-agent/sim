@@ -321,7 +321,10 @@ def select_band(
                else str(expansion_mode).strip().lower() or None)
     scope = _infer_group_scope(group, topology)
     candidates = _candidate_bands(group, topology, scope)
-    is_multi_pkg = bool(_package_partition(group, topology))
+    is_multi_pkg = bool(
+        getattr(topology, "_has_primitive_table", False)
+        and _package_partition(group, topology)
+    )
 
     matches: list[tuple[tuple[int, int, int, int], CollectiveBandSpec]] = []
     physical_limit = None
@@ -920,7 +923,8 @@ def _submit_transfer_chunks(
     owner: str,
 ) -> list:
     pipelined_credit = bool(
-        credit_cap > 0.0
+        uses_calibrated_startup
+        and credit_cap > 0.0
         and credit_cap >= float(DOUBLE_BUFFER_CREDIT_FRAMES * band.wire_bytes_per_frame)
     )
     if credit_cap > 0.0 and transfer.wire_bytes > credit_cap:
@@ -980,20 +984,25 @@ def _submit_transfer_chunks(
 
 def _prepare_collective_resources(
     engine, name: str, lowered: LoweredCollective, credit_cap: float
-) -> tuple[dict[tuple[int, int], str], dict[int, str], dict[int, str], dict[int, str], dict[int, str]]:
-    credit_pools: dict[tuple[int, int], str] = {}
+) -> tuple[dict[tuple[int, int] | int, str], dict[int, str], dict[int, str], dict[int, str], dict[int, str]]:
+    credit_pools: dict[tuple[int, int] | int, str] = {}
     new_pools: dict[str, float] = {}
     flow_tx_res: dict[int, str] = {}
     flow_rx_res: dict[int, str] = {}
     new_resources: list[Resource] = []
     for phase in lowered.phases:
         for transfer in phase.transfers:
-            pair = (transfer.source, transfer.destination)
-            if credit_cap > 0.0 and pair not in credit_pools:
-                pool_name = f"{name}:credit:r{pair[0]}to{pair[1]}"
-                credit_pools[pair] = pool_name
-                if pool_name not in engine.pools:
-                    new_pools[pool_name] = credit_cap
+            if credit_cap > 0.0:
+                if lowered.uses_calibrated_startup:
+                    key: tuple[int, int] | int = (transfer.source, transfer.destination)
+                    pool_name = f"{name}:credit:r{transfer.source}to{transfer.destination}"
+                else:
+                    key = transfer.destination
+                    pool_name = f"{name}:credit:r{transfer.destination}"
+                if key not in credit_pools:
+                    credit_pools[key] = pool_name
+                    if pool_name not in engine.pools:
+                        new_pools[pool_name] = credit_cap
             if transfer.flow_cap_bytes_per_ms is not None:
                 cap = float(transfer.flow_cap_bytes_per_ms)
                 for hop in transfer.hops:
@@ -1079,10 +1088,14 @@ def submit_lowered_collective(
                 )
                 s_done = []
                 for t_idx, transfer in enumerate(s_transfers):
+                    pool_key = (
+                        (transfer.source, transfer.destination)
+                        if lowered.uses_calibrated_startup else transfer.destination
+                    )
                     s_done.extend(_submit_transfer_chunks(
                         engine, f"{name}:p{p_idx}:s{s_idx}:t{t_idx}", transfer, s_gate,
                         band=lowered.band, credit_cap=credit_cap,
-                        pool_name=credit_pools.get((transfer.source, transfer.destination)),
+                        pool_name=credit_pools.get(pool_key),
                         hop_startup_ms=hop_startup_ms,
                         uses_calibrated_startup=lowered.uses_calibrated_startup,
                         ub_tx_res=ub_tx_res, ub_rx_res=ub_rx_res,
@@ -1115,10 +1128,14 @@ def submit_lowered_collective(
         for round_index in sorted(by_round):
             round_done = []
             for t_idx, transfer in enumerate(by_round[round_index]):
+                pool_key = (
+                    (transfer.source, transfer.destination)
+                    if lowered.uses_calibrated_startup else transfer.destination
+                )
                 round_done.extend(_submit_transfer_chunks(
                     engine, f"{name}:p{p_idx}:r{round_index}:t{t_idx}", transfer, round_gate,
                     band=lowered.band, credit_cap=credit_cap,
-                    pool_name=credit_pools.get((transfer.source, transfer.destination)),
+                    pool_name=credit_pools.get(pool_key),
                     hop_startup_ms=hop_startup_ms,
                     uses_calibrated_startup=lowered.uses_calibrated_startup,
                     ub_tx_res=ub_tx_res, ub_rx_res=ub_rx_res,

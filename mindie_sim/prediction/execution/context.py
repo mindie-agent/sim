@@ -605,7 +605,8 @@ class _ContextMixin:
         measured = (diagnostic_timing.duration_ms
                     if diagnostic_timing is not None else 0)
         physical = max((value / self.engine.resources[key].rate
-                        for key, value in demands.items()), default=0)
+                        for key, value in demands.items()
+                        if key in self.engine.resources), default=0)
         context = replace(
             context, work=demands,
             minimum_ms=measured if self.legacy_diagnostics else 0.0,

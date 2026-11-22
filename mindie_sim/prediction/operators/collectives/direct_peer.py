@@ -459,14 +459,9 @@ class DirectMeshPhase:
                 service = engine.submit(
                     f"{prefix}:hop{hop_index}:service", hop.demand,
                     after=(previous,), owner=owner, coupled=True)
-                hop_lat = (
-                    max(0.0, hop.latency_ms - float(self.startup_ms))
-                    if self.startup_ms > 0.0
-                    else hop.latency_ms
-                )
                 previous = engine.submit(
                     f"{prefix}:hop{hop_index}:arrival", after=(service,),
-                    latency=hop_lat, owner=owner)
+                    latency=hop.latency_ms, owner=owner)
             received[source].append(previous)
             received[destination].append(previous)
         return {

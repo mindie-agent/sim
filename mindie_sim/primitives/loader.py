@@ -270,8 +270,11 @@ class CalibratedRateOverlay:
 
 
 def _table_band_p50(table: PrimitiveTable, primitive_id: str, metric: str, *, mode: str | None = None) -> float | None:
+    cell_fn = getattr(table, "cell", None)
+    if cell_fn is None:
+        return None
     try:
-        cell = table.cell(primitive_id)
+        cell = cell_fn(primitive_id)
     except ModelingError:
         return None
     if not cell.supported or (mode is not None and mode not in cell.modes) or cell.mode_status(mode) == "unsupported":

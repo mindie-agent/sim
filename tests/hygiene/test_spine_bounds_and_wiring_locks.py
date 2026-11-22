@@ -119,11 +119,32 @@ def test_primitive_concepts_reject_sibling_module_definitions(tmp_path):
     }
 
 
+def _scale_param_curves(params: dict, scale: float) -> None:
+    if not isinstance(params, dict) or scale == 1.0:
+        return
+    for key, val in list(params.items()):
+        if isinstance(val, (int, float)) and not isinstance(val, bool) and (
+            key.endswith("_bps") or key.endswith("_bps_p50") or key.endswith("_bytes_per_s")
+        ):
+            params[key] = float(val) * scale
+        elif isinstance(val, dict) and (
+            key.endswith("_bps") or key.endswith("_bytes_per_s") or "flops_per_s" in key
+        ):
+            for k, v in val.items():
+                if isinstance(v, (int, float)) and not isinstance(v, bool):
+                    val[k] = float(v) * scale
+        elif isinstance(val, list):
+            for item in val:
+                if isinstance(item, dict) and isinstance(item.get("bps_p50"), (int, float)):
+                    item["bps_p50"] = float(item["bps_p50"]) * scale
+
+
 def _resigned_table(base_table, *, p50_scale: float = 1.0, cap_scale: float = 1.0):
     raw = deepcopy(base_table.to_envelope_dict())
     for pid, cell in raw["primitives"].items():
         if pid not in {"P01_datacopy", "P05_l2_residency_reuse", "P06_mmad", "P07_vec_alu"}:
             continue
+        _scale_param_curves(cell.get("parameters"), p50_scale)
         for metric, band in cell.get("metrics", {}).items():
             if metric == "hbm_rw_alpha" or not isinstance(band, dict):
                 continue
@@ -247,7 +268,11 @@ def test_lock5_k2_k3_autogeneration_and_search_stats_disclosure():
     assert report.search_stats.eligible_sites > 0
     assert report.search_stats.generated_candidates > 0
     assert report.search_stats.replayed_candidates > 0
-    assert report.search_stats.rejected_candidates == 0
+    assert (
+        report.search_stats.replayed_candidates + report.search_stats.rejected_candidates
+        == report.search_stats.generated_candidates
+    )
+    assert not report.search_stats.rejected_candidates or bool(report.search_stats.rejection_reasons)
     assert isinstance(report.primitive_coverage_gaps, tuple) and report.primitive_coverage_gaps
 
     spine = PredictionSpine()

@@ -306,6 +306,7 @@ class _TopologyPlansMixin:
         if algorithm == "direct_mesh":
             from mindie_sim.prediction.operators.collectives.direct_peer import DirectMeshGroup, DirectMeshPhase, DirectMeshPlan
 
+            family = {"all_reduce": "allreduce", "all_gather": "allgather"}.get(family, family)
             if family not in DIRECT_MESH_FAMILIES:
                 raise ModelingError(
                     f"direct_mesh_collective_family_unsupported:{family}")
@@ -599,7 +600,8 @@ class _TopologyPlansMixin:
                 op, participants
             )
         except ModelingError as exc:
-            if (not str(exc).startswith("joint_collective_group_membership")
+            if (not getattr(self, "_has_primitive_table", False)
+                    or not str(exc).startswith("joint_collective_group_membership")
                     or len(participants) != 1 or transport is None
                     or "peer_traffic" in raw_meta):
                 raise
@@ -634,7 +636,7 @@ class _TopologyPlansMixin:
                     rounds = max(phases[norm_family] * (len(ranks) - 1), 0)
                     if metadata.get("steps", rounds) != rounds:
                         return None
-            elif norm_family != "alltoall":
+            elif not (getattr(self, "_has_primitive_table", False) and norm_family == "alltoall"):
                 return None
         peer = None
         if "peer_traffic" in metadata:

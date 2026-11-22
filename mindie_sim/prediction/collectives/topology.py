@@ -553,13 +553,14 @@ class Topology(_TopologyPlansMixin):
         return family, groups
 
     def declares_direct_mesh(self, op, replica) -> bool:
-        """True when this invocation declares the direct K_8 pair mesh without protocol bands."""
+        """True when this invocation declares the direct K_8 pair mesh without calibrated bands."""
         _, groups = self.direct_mesh_groups(op, replica)
         if not groups:
             return False
-        from .protocol import _candidate_bands, _infer_group_scope
-        if all(_candidate_bands(ranks, self, _infer_group_scope(ranks, self)) for ranks in groups):
-            return False
+        if self._has_primitive_table:
+            from .protocol import _candidate_bands, _infer_group_scope
+            if all(_candidate_bands(ranks, self, _infer_group_scope(ranks, self)) for ranks in groups):
+                return False
         return True
 
     def bind_direct_mesh(self, op, replica, plan) -> None:

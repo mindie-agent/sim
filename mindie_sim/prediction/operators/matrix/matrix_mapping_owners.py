@@ -276,13 +276,25 @@ def is_arch35_context(context) -> bool:
     return l0c >= ARCH35_L0C_BYTES
 
 
-def primitive_core_clock_hz(context) -> float | None:
-    """Derive AIC core frequency in Hz from certified P02_load_data L0A bus."""
+def _table_cell(context, primitive_id: str):
+    """Return the declared primitive cell when a PrimitiveTable is bound."""
     pt = getattr(context, "primitive_table", None)
-    if pt is None:
+    cell_fn = getattr(pt, "cell", None)
+    if cell_fn is None:
         return None
     try:
-        band = pt.cell("P02_load_data").band("l1_to_l0a_bytes_per_s_per_aic")
+        return cell_fn(primitive_id)
+    except ModelingError:
+        return None
+
+
+def primitive_core_clock_hz(context) -> float | None:
+    """Derive AIC core frequency in Hz from certified P02_load_data L0A bus."""
+    cell = _table_cell(context, "P02_load_data")
+    if cell is None:
+        return None
+    try:
+        band = cell.band("l1_to_l0a_bytes_per_s_per_aic")
         cap = float(getattr(band, "certified_upper_capacity", 0.0) or 0.0)
         if cap > 0.0:
             return cap / LOAD_DATA_L0A_BYTES_PER_CYCLE
@@ -293,13 +305,12 @@ def primitive_core_clock_hz(context) -> float | None:
 
 def primitive_p01_scaling_bps(context, active_cores: int, *, warm: bool) -> float | None:
     """Interpolate P01_datacopy AIC cold/warm scaling curve at ``active_cores``."""
-    pt = getattr(context, "primitive_table", None)
-    if pt is None or active_cores < 1:
+    if active_cores < 1:
         return None
-    try:
-        params = pt.cell("P01_datacopy").parameters or {}
-    except ModelingError:
+    cell = _table_cell(context, "P01_datacopy")
+    if cell is None:
         return None
+    params = cell.parameters or {}
     key = "mte2_aic_warm_scaling_bps" if warm else "mte2_aic_cold_scaling_bps"
     curve = params.get(key)
     if not isinstance(curve, Mapping) or not curve:
@@ -322,13 +333,12 @@ def primitive_p01_strided_cold_bps(
     context, row_bytes: int, stride_bytes: int,
 ) -> float | None:
     """Interpolate calibrated P01 2D strided cold-HBM bandwidth surface."""
-    pt = getattr(context, "primitive_table", None)
-    if pt is None or row_bytes < 1:
+    if row_bytes < 1:
         return None
-    try:
-        params = pt.cell("P01_datacopy").parameters or {}
-    except ModelingError:
+    cell = _table_cell(context, "P01_datacopy")
+    if cell is None:
         return None
+    params = cell.parameters or {}
     surface = params.get("strided_cold_surface")
     if not surface:
         return None
@@ -356,13 +366,12 @@ def primitive_p01_strided_cold_bps(
 
 def primitive_p05_stride_conflict_bps(context, stride_bytes: int) -> float | None:
     """Interpolate calibrated P05 L2/TLB stride-conflict ceiling on log2 stride."""
-    pt = getattr(context, "primitive_table", None)
-    if pt is None or stride_bytes < 1:
+    if stride_bytes < 1:
         return None
-    try:
-        params = pt.cell("P05_l2_residency_reuse").parameters or {}
-    except ModelingError:
+    cell = _table_cell(context, "P05_l2_residency_reuse")
+    if cell is None:
         return None
+    params = cell.parameters or {}
     curve = params.get("l2_stride_conflict")
     if not curve:
         return None
@@ -421,12 +430,10 @@ def primitive_l2_params(context) -> tuple[int, int]:
         fp = getattr(getattr(pt, "provenance", None), "silicon_fingerprint", None)
         if fp is not None and int(getattr(fp, "l2_bytes", 0) or 0) > 0:
             l2_bytes = int(fp.l2_bytes)
-        try:
-            p05 = pt.cell("P05_l2_residency_reuse").parameters or {}
-            if int(p05.get("l2_sector_bytes", 0) or 0) > 0:
-                sector = int(p05["l2_sector_bytes"])
-        except ModelingError:
-            pass
+        p05_cell = _table_cell(context, "P05_l2_residency_reuse")
+        p05 = (p05_cell.parameters or {}) if p05_cell is not None else {}
+        if int(p05.get("l2_sector_bytes", 0) or 0) > 0:
+            sector = int(p05["l2_sector_bytes"])
     return l2_bytes, sector
 
 
@@ -499,7 +506,7 @@ def primitive_cold_hbm_bps(
     cores = max(1, int(getattr(context, "core_count", 1) or 1))
     if is_grouped and is_full_row_coalesced:
         waves = float(math.ceil(max(1, int(total_tiles)) / cores))
-        ramp_bw = p01_cold
+        ramp_bw = min(p01_cold, hbm_rd) if hbm_rd is not None else p01_cold
         if not is_arch35_context(context) and row_bytes < stride_bytes:
             strided = primitive_p01_strided_cold_bps(context, row_bytes, stride_bytes)
             if strided is not None and strided > 0.0:
@@ -511,6 +518,8 @@ def primitive_cold_hbm_bps(
         return ramp_bw
     sector_eff = min(1.0, float(max(1, int(row_bytes))) / float(max(1, sector)))
     cap = p01_cold * sector_eff
+    if hbm_rd is not None:
+        cap = min(cap, hbm_rd)
     if row_bytes < stride_bytes:
         strided = primitive_p01_strided_cold_bps(context, row_bytes, stride_bytes)
         if strided is not None:
