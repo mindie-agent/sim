@@ -590,3 +590,41 @@ def test_startup_scope_and_key_validation_and_catalog_invariants():
     assert len(train_files) == 4
     for packet_path in train_files:
         assert isinstance(json.loads(packet_path.read_text(encoding="utf-8")), dict)
+
+
+def test_superpod_optical_switched_startup_and_ub_mesh_pod_limit():
+    # 32-die optical SuperPoD models a 1-hop optical switch (phase startup, never 31*3.5us per hop).
+    sp_machine = _make_machine(
+        DUAL_DIE_LARGE_SKU, num_devices=32, ranks_per_node=16, topology_preset="a3_superpod",
+    )
+    sp_topo = Topology(sp_machine, ParallelSpec(tp=32))
+    sp_group = tuple(range(32))
+    sp_band = select_band("allreduce", sp_group, sp_topo, 4 * 1024 * 1024, expansion_mode="ring")
+    assert sp_band.startup_scope == "phase"
+    sp_low = lower_collective("allreduce", sp_group, sp_topo, 4096, expansion_mode="ring")
+    assert sp_low.band.startup_scope == "phase"
+    assert all(math.isclose(p.startup_us, sp_band.startup_us, rel_tol=1e-9) for p in sp_low.phases)
+    # 32-rank ring with phase startup pays 2 phases * startup_us (not 62 ring hops * startup_us).
+    fast_sp = _make_custom_machine(DUAL_DIE_LARGE_SKU, num_devices=32, ranks_per_node=16, links=[{
+        "name": "optical_fast", "members": list(range(32)),
+        "capacity_bytes_per_ms": 1_000_000_000_000.0, "latency_us": 0.0,
+        "semantics": "per_port", "scope": "cross_node",
+        "protocol_bands": [sp_low.band.to_dict()],
+    }])
+    fast_topo = Topology(fast_sp, ParallelSpec(tp=32))
+    fast_low = lower_collective("allreduce", sp_group, fast_topo, 4096, expansion_mode="ring")
+    eng = Engine(fast_topo.resources())
+    done = submit_lowered_collective(
+        eng, "sp_ring", fast_low, {r: eng.submit(f"r{r}") for r in sp_group},
+    )
+    eng.advance()
+    assert math.isclose(float(done[0].time), 2.0 * sp_band.startup_us / 1000.0, abs_tol=1e-4)
+
+    # 32-die A5 Pod (ranks_per_node=64) admits 32-rank intra-node ub_mesh; 8-rank server stays bounded.
+    pod_machine = _make_machine(DIRECT_MESH_SKU, num_devices=32, ranks_per_node=64, topology_preset="a5_pod")
+    pod_topo = Topology(pod_machine, ParallelSpec(tp=1, dp=32, ep=32))
+    pod_band = select_band("alltoall", sp_group, pod_topo, 65536)
+    assert pod_band.protocol.startswith("ub_mesh") and pod_band.group_max == 64
+    srv_machine = _make_machine(DIRECT_MESH_SKU, num_devices=16, ranks_per_node=8, topology_preset="a5_server")
+    srv_topo = Topology(srv_machine, ParallelSpec(tp=1, dp=16, ep=16))
+    assert srv_topo.link_scope(srv_topo.route(0, 8)[0][0]) == "cross_node"

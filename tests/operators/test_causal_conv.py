@@ -23,6 +23,7 @@ from _support.linear_cases import (
 from mindie_sim import compose_case, operator_costs, target_graphs
 from mindie_sim.catalog.cache_ownership import draft_cache_components
 from mindie_sim.catalog.draft_geometry import native_draft_layer_plans
+from mindie_sim.catalog.speculative_state import resolve_speculative_query_tokens
 from mindie_sim.catalog.types import AuxiliarySpec, DraftSpec
 from mindie_sim.catalog.weights import stage_weight_bytes, stage_weight_terms
 from mindie_sim.feature_mechanisms import _apply_recover_ssm
@@ -289,8 +290,15 @@ def test_capacity_query_width_and_windowed_mtp_draft_geometry():
         runtime=replace(base.runtime,
                         dspark=DsparkSpec(6, (1.0,) * 6), metadata=()))
     memory = Memory(kda)
-    assert memory.query_tokens == 6
-    assert memory.cache_bytes(128, query_tokens=6) > memory.cache_bytes(128)
+    # DSpark verifies K proposals plus the bonus token: one ``[K+1]`` width everywhere.
+    assert memory.query_tokens == 7 == resolve_speculative_query_tokens(kda.runtime)
+    assert memory.cache_bytes(128) == memory.cache_bytes(128, query_tokens=7) > memory.cache_bytes(128, query_tokens=6)
+    truncated = replace(kda, runtime=replace(kda.runtime, dspark=DsparkSpec(
+        6, (1.0,) * 6, confidence=(0.9, 0.9, 0.1, 0.9, 0.9, 0.9), confidence_threshold=0.5)))
+    assert Memory(truncated).query_tokens == 3 == resolve_speculative_query_tokens(truncated.runtime)
+    meta_only = replace(kda, runtime=replace(kda.runtime, dspark=None, metadata=(
+        ("draft_mode", "dspark"), ("draft_proposal_tokens", 6))))
+    assert resolve_speculative_query_tokens(meta_only.runtime) == 7
 
     mtp = DraftSpec(
         kind="mtp", layers=1, hidden_size=32, intermediate_size=64,

@@ -450,6 +450,9 @@ OPTICAL_MID_MAX_EXCLUSIVE = 2097152
 OPTICAL_MID_CREDIT_BYTES = 524288
 OPTICAL_LARGE_CREDIT_BYTES = 2097152
 OPTICAL_MIN_GROUP = 2
+# CloudMatrix SuperPoD optical HCCS is a 1-hop switched fabric: every ring step crosses the
+# optical switch once, so the declared alpha is paid once per phase, never per ring hop.
+OPTICAL_STARTUP_SCOPE = "phase"
 OPTICAL_SUPERPOD_EVIDENCE_ID = (
     "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#a3_superpod_optical_hccs"
 )
@@ -469,7 +472,7 @@ def _a3_superpod_optical_bands(superpod_size: int, latency_us: float) -> list[di
             "payload_max_exclusive": OPTICAL_SMALL_MAX_EXCLUSIVE,
             "algorithm": "ring",
             "protocol": "hccs_optical_small",
-            "startup_scope": "hop",
+            "startup_scope": OPTICAL_STARTUP_SCOPE,
             "startup_us": float(latency_us),
             "payload_bytes_per_frame": OPTICAL_SMALL_FRAME_BYTES,
             "wire_bytes_per_frame": OPTICAL_SMALL_FRAME_BYTES,
@@ -487,7 +490,7 @@ def _a3_superpod_optical_bands(superpod_size: int, latency_us: float) -> list[di
             "payload_max_exclusive": OPTICAL_MID_MAX_EXCLUSIVE,
             "algorithm": "ring",
             "protocol": "hccs_optical_mid",
-            "startup_scope": "hop",
+            "startup_scope": OPTICAL_STARTUP_SCOPE,
             "startup_us": float(latency_us),
             "payload_bytes_per_frame": OPTICAL_MID_FRAME_BYTES,
             "wire_bytes_per_frame": OPTICAL_MID_FRAME_BYTES,
@@ -505,7 +508,7 @@ def _a3_superpod_optical_bands(superpod_size: int, latency_us: float) -> list[di
             "payload_max_exclusive": None,
             "algorithm": "ring",
             "protocol": "hccs_optical_large",
-            "startup_scope": "hop",
+            "startup_scope": OPTICAL_STARTUP_SCOPE,
             "startup_us": float(latency_us),
             "payload_bytes_per_frame": OPTICAL_LARGE_FRAME_BYTES,
             "wire_bytes_per_frame": OPTICAL_LARGE_FRAME_BYTES,

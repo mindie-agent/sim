@@ -88,6 +88,13 @@ _NON_KERNEL_FAMILIES = frozenset({
 })
 
 
+def _at_registry_mode_rate(reg_modes: Mapping[str, Any], mode: str, rate: float) -> bool:
+    """Whether ``rate`` still equals the SKU registry default for service ``mode``."""
+    reg_mode = reg_modes.get(mode)
+    reg_rate = float(reg_mode.get("rate", 0.0) or 0.0) if isinstance(reg_mode, Mapping) else 0.0
+    return reg_rate > 0.0 and abs(rate - reg_rate) <= _RATE_EQ_REL_TOL * reg_rate
+
+
 def _is_catalog_vector_baseline(timing: InvocationTiming) -> bool:
     """Return True only when every selected device vector declaration came from a catalog baseline."""
     prov = timing.provenance if isinstance(timing.provenance, _AbcMapping) else {}
@@ -395,17 +402,21 @@ def build_stage_profiles(case: CaseSpec, namespace: str = "", *,
             reg_dev = reg_entry.get("device") if isinstance(reg_entry, Mapping) else None
             reg_rates = dict(reg_dev.get("rates") or {}) if isinstance(reg_dev, Mapping) else {}
             reg_modes = dict(reg_dev.get("service_modes") or {}) if isinstance(reg_dev, Mapping) else {}
+            # Scarce-mte1 fallback rescales modes only when Hardware left EVERY mte1 mode at its
+            # registry default; an explicit pin or an already-rescaled sibling means it ran.
+            mte1_modes_at_registry = all(
+                _at_registry_mode_rate(reg_modes, mode, m_rate)
+                for mode, (role, m_rate) in orig_service_modes.items() if role == "mte1"
+            )
             service_modes = {}
             for mode, (role, m_rate) in orig_service_modes.items():
                 if mode in {"mte2_aic_dram", "mte2_aiv_dram"} and overlay and overlay.hbm_read_bytes_per_s is not None:
                     m_rate = min(m_rate, overlay.hbm_read_bytes_per_s)
                 elif role in overlay_rates and orig_rates_s.get(role, 0.0) > 0.0:
                     m_rate = m_rate * (overlay_rates[role] / orig_rates_s[role])
-                elif role == "mte1" and orig_rates_s.get(role, 0.0) > 0.0 and float(reg_rates.get(role, 0.0) or 0.0) > 0.0:
-                    reg_mode = reg_modes.get(mode)
-                    reg_m_rate = float(reg_mode.get("rate", 0.0) or 0.0) if isinstance(reg_mode, Mapping) else 0.0
-                    if reg_m_rate > 0.0 and abs(m_rate - reg_m_rate) <= _RATE_EQ_REL_TOL * reg_m_rate:
-                        m_rate = m_rate * (orig_rates_s[role] / float(reg_rates[role]))
+                elif (role == "mte1" and mte1_modes_at_registry and orig_rates_s.get(role, 0.0) > 0.0
+                      and float(reg_rates.get(role, 0.0) or 0.0) > 0.0):
+                    m_rate = m_rate * (orig_rates_s[role] / float(reg_rates[role]))
                 service_modes[mode] = (role, m_rate)
             hbm_cap_s = orig_rates_s.get("hbm", 0.0)
             if "mte2_aiv_dram" not in service_modes and overlay and overlay.hbm_read_bytes_per_s is not None:

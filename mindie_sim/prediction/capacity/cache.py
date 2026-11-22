@@ -54,12 +54,8 @@ _COMPONENT_POOL_MAP = {
 
 class _MemoryCacheMixin:
     def _effective_cache_query_tokens(self, query_tokens: int | None = None) -> int:
-        if query_tokens is not None:
-            return max(1, int(query_tokens))
-        dspark = getattr(self.case.runtime, "dspark", None)
-        if dspark is not None and not self.paired_sfa:
-            return 1 + int(dspark.step_spec().draft_len)
-        return self.query_tokens
+        # ``self.query_tokens`` already carries the shared DSpark ``[K+1]`` verify width.
+        return self.query_tokens if query_tokens is None else max(1, int(query_tokens))
 
     def dp_cohort_cache_bytes(
         self, tokens: int, *, padded: bool = True,

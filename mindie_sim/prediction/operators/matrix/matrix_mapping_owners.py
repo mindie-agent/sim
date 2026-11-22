@@ -9,8 +9,10 @@
 """
 from collections.abc import Mapping
 from fractions import Fraction
+from functools import lru_cache
 import math
 
+from mindie_sim.prediction.runtime.memory_physics import AddressRun
 from mindie_sim.schema.common import ModelingError
 
 
@@ -44,6 +46,8 @@ _GEMM_SHAPE_AXES = 3
 #: Blocking scalar GM load latency per group in grouped_matmul_kernel.h:314
 #: (groupListGm.GetValue(groupIdx) across declared groupNum).
 GROUP_LIST_SCALAR_LOAD_CYCLES = 200.0
+#: Distinct (row, stride, rows, sector) panel geometries memoized per process.
+PANEL_SECTOR_CACHE_ENTRIES = 4096
 
 
 def mte_owner_unit_count(resource_units):
@@ -543,6 +547,25 @@ def weight_l2_cache_disabled(
     )
 
 
+@lru_cache(maxsize=PANEL_SECTOR_CACHE_ENTRIES)
+def panel_sector_efficiency(*, row_bytes: int, stride_bytes: int, rows: int,
+                            sector_bytes: int) -> float:
+    """Useful/fetched bytes of one ``rows``-row panel from its L2 sector union.
+
+    Contiguous rows (``row_bytes >= stride_bytes``) coalesce into one run;
+    narrow strided rows share a sector whenever ``stride_bytes < sector_bytes``
+    (e.g. 32 B every 64 B gives 1/2, not 32/512).  Without a row count, a
+    strided row is charged one full sector per row.
+    """
+    row = max(1, int(row_bytes))
+    stride = max(row, int(stride_bytes))
+    sector = max(1, int(sector_bytes))
+    if rows <= 0:
+        return 1.0 if stride == row else min(1.0, float(row) / float(sector))
+    union = AddressRun(0, int(rows), row, stride).sector_union_bytes(sector)
+    return min(1.0, float(int(rows) * row) / float(max(1, union)))
+
+
 def primitive_cold_hbm_bps(
     context, *, active_cores: int, row_bytes: int, stride_bytes: int,
     total_tiles: int, is_grouped: bool, is_full_row_coalesced: bool = False,
@@ -581,25 +604,14 @@ def primitive_cold_hbm_bps(
     )
     eff_row = max(1, int(row_bytes))
     eff_stride = max(1, int(stride_bytes))
-    eff_sector = max(1, int(sector))
-    if eff_row >= eff_stride:
-        # Contiguous dense rows coalesce across adjacent rows; compute sector
-        # efficiency from the panel's contiguous sector union (matching
-        # AddressRun.sector_union_bytes) rather than per-row sub-sector caps.
-        rows = int(panel_rows) if (panel_rows is not None and int(panel_rows) > 0) else 0
-        if rows <= 0:
-            op = getattr(context, "op", None)
-            shape = getattr(op, "local_shape", ()) or ()
-            if len(shape) >= _GEMM_SHAPE_AXES:
-                rows = max(1, int(shape[-1]))
-        if rows > 0:
-            useful = rows * eff_row
-            union = ((useful + eff_sector - 1) // eff_sector) * eff_sector
-            sector_eff = min(1.0, float(useful) / float(max(1, union)))
-        else:
-            sector_eff = 1.0
-    else:
-        sector_eff = min(1.0, float(eff_row) / float(eff_sector))
+    rows = int(panel_rows) if (panel_rows is not None and int(panel_rows) > 0) else 0
+    if rows <= 0:
+        op = getattr(context, "op", None)
+        shape = getattr(op, "local_shape", ()) or ()
+        if len(shape) >= _GEMM_SHAPE_AXES:
+            rows = max(1, int(shape[-1]))
+    sector_eff = panel_sector_efficiency(
+        row_bytes=eff_row, stride_bytes=eff_stride, rows=rows, sector_bytes=sector)
     cap = p01_cold * sector_eff
     if hbm_rd is not None:
         cap = min(cap, hbm_rd)

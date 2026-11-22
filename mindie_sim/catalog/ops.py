@@ -73,7 +73,7 @@ def compute_dtype_for(quant: QuantSpec, category: str) -> tuple[str, str]:
 
 
 _LOW_OUTPUT_ACTIVATIONS = frozenset({
-    "int8", "fp8", "fp8_e4m3", "fp8_e5m2",
+    "int8", "fp8", "fp8_e4m3", "fp8_e5m2", "fp4", "fp4_e2m1",
 })
 
 
@@ -285,7 +285,7 @@ def activation_scales(quant, dtype, rows, cols):
         groups = (cols + group - 1) // group
         scale_format = quant.execution_activation_scale_format(dtype)
         return group, scale_format, (rows,) if groups == 1 else (rows, groups), float(rows * groups * dtype_bytes(scale_format))
-    if dtype in {"fp8", "fp8_e4m3", "fp8_e5m2"}:
+    if dtype in {"fp8", "fp8_e4m3", "fp8_e5m2", "fp4_e2m1"}:
         group = quant.activation_group_size or cols
         groups = (cols + group - 1) // group
         scale_format = quant.activation_scale_format or quant.scale_format

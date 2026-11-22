@@ -100,10 +100,10 @@ def capacity_window(
         raise ValueError(f"capacity_window_sequences_invalid:{sequences}")
     if isinstance(output_budget, bool) or not isinstance(output_budget, int) or output_budget < 0:
         raise ValueError(f"capacity_window_output_budget_invalid:{output_budget}")
-    base_case = (replace(case, runtime=replace(case.runtime, async_scheduling=bool(async_scheduling)))
-                 if async_scheduling is not None else case)
-    if not isinstance(base_case, CaseSpec):
-        base_case = parse_case(base_case)
+    base_case = case if isinstance(case, CaseSpec) else parse_case(case)
+    if async_scheduling is not None:
+        base_case = replace(base_case, runtime=replace(
+            base_case.runtime, async_scheduling=bool(async_scheduling)))
     scaled = (scale_case_hardware(base_case, hbm_capacity_scale=hbm_capacity_scale)
               if hbm_capacity_scale != 1.0 else base_case)
     q_tokens, b = max(1, int(tokens_per_seq)), int(sequences)
@@ -253,11 +253,11 @@ def _capacity_window_rank_rows(
             if wave_delayed_b > 0 else [0.0] * len(kv_active))
     else:
         def ledger_stage_bytes(tokens: int) -> list[float]:
-            if phase != "decode" or q_tokens == ledger.query_tokens:
-                return [float(value) for value in ledger.dp_cohort_cache_bytes(
-                    tokens, padded=True)]
+            # Decode always forwards the scheduled verify width; the ledger default only
+            # applies to prefill windows.
+            width = q_tokens if phase == "decode" else None
             return [float(value) for value in ledger.dp_cohort_cache_bytes(
-                tokens, padded=True, query_tokens=q_tokens)]
+                tokens, padded=True, query_tokens=width)]
 
         kv_active = ledger_stage_bytes(active_tokens)
         kv_retiring = (ledger_stage_bytes(retiring_tokens)

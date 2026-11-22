@@ -662,14 +662,22 @@ class _PrefillProgram:
         from dataclasses import replace
 
         from mindie_sim.prediction.operators.attention.attention_prefill import (
-            _FP32_BYTES, _ceil_div, _read_role, _task_at_for,
+            _FP32_BYTES, _ceil_div, _read_role, _task_at_for, admitted_cores,
         )
+        from mindie_sim.prediction.operators.attention.attention_kv_access import stream_pool_for_role
         from mindie_sim.prediction.mechanism import Work
         from mindie_sim.prediction.program import PipelineProgram, Stage
+        from mindie_sim.schema.common import ModelingError
 
-        total, cores = self.spec.task_count, self.context.core_count
+        total, cores = self.spec.task_count, admitted_cores(self.context)
         if not total:
             return ready
+        stream_owners = self.context.stream_owners
+        if stream_owners is not None:
+            stream = getattr(self.context.op, "stream", None) or "main"
+            for axis, limit in (("aic", stream_owners.aic_limit), ("aiv", stream_owners.aiv_limit)):
+                if int(limit) <= 0:
+                    raise ModelingError(f"stream_zero_{axis}_budget:{stream}:gqa_prefill")
         if not self.spec.native_fia:
             # Generic CVDiff/A2/A3 callers keep the historical cyclic owner
             # assignment; the arch35 S2 split is only for the bound FIA path.
@@ -737,10 +745,7 @@ class _PrefillProgram:
 
         fd_events = []
         read = _read_role(self.context, vector=True)
-        vector_name = self.context.resource_names.get("vector")
         vector_units = self.context.resource_units.get("vector", 1)
-        read_name = self.context.resource_names.get(read)
-        read_units = self.context.resource_units.get(read, vector_units)
         lane = 0
         for ti, owners in sorted(task_owners.items()):
             if len(owners) < 2:
@@ -760,10 +765,15 @@ class _PrefillProgram:
                                                 + 2 * _FP32_BYTES)
                 out = this_rows * dim * self.spec.query_bytes
                 placement = {}
-                if vector_name:
-                    placement[vector_name] = (lane % vector_units,)
-                if read_name:
-                    placement[read_name] = (lane % read_units,)
+                # One AIV lane reads, reduces and stores this fragment; a bound
+                # stream maps the lane into its own AIV partition.
+                for role in ("vector", read, "mte3"):
+                    physical = self.context.resource_names.get(role)
+                    if physical is None:
+                        continue
+                    pool = stream_pool_for_role(stream_owners, role) if stream_owners is not None else ()
+                    units = self.context.resource_units.get(role, vector_units)
+                    placement[physical] = (pool[lane % len(pool)],) if pool else (lane % units,)
                 fd_events.append(engine.submit(
                     f"{name}:fd{ti}:{fragment}",
                     work=self.context.bind(Work(resources={

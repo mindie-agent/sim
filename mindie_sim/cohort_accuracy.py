@@ -1057,6 +1057,8 @@ def compare_cohorts(case, mapping_report, *, primitive_table=None):
         geometry["apply_body_defaults"] = execution["apply_body_defaults"]
     if execution.get("draft_prepare"):
         geometry["draft_prepare"] = True
+    if execution.get("media_tokens_per_sequence") is not None:
+        geometry["media_tokens_per_sequence"] = execution["media_tokens_per_sequence"]
     manifest_geometry = dict(geometry)
     projection = execution.get("replica_projection") or {}
     selected_replicas = projection.get("selected")

@@ -21,6 +21,7 @@ from functools import lru_cache
 import math
 from typing import Any
 
+from mindie_sim.backends.ascend import DERIVED_ASCEND_SKUS
 from mindie_sim.prediction.capacity import Memory
 from mindie_sim.schema.case import Case as CaseSpec
 from mindie_sim.schema.common import ModelingError
@@ -192,7 +193,9 @@ def resolve_sku_host_dma_rates(machine: Any) -> dict[str, Any]:
       4. Registered SKU ``transfer_channels["h2d"|"d2h"]`` (PCIe Gen4/Gen5 & ``node_peak_bw_gbps``)
     """
     sku, dev_rates, tc = _extract_machine_host_fields(machine)
-    p20 = _cached_p20_metrics(sku)
+    # Derived SKUs inherit their base host channel and P20 calibration; price them identically.
+    channel_sku = str(DERIVED_ASCEND_SKUS.get(sku, {}).get("base", sku))
+    p20 = _cached_p20_metrics(channel_sku)
     h2d_ch = tc.get("h2d")
     d2h_ch = tc.get("d2h")
 
@@ -201,7 +204,7 @@ def resolve_sku_host_dma_rates(machine: Any) -> dict[str, Any]:
     h2d_effective = False
     if dev_rates.get("h2d", 0.0) > 0.0:
         h2d_bps, h2d_source, h2d_effective = dev_rates["h2d"], "explicit_device", True
-    elif _channel_is_caller_override(sku, "h2d", h2d_ch):
+    elif _channel_is_caller_override(channel_sku, "h2d", h2d_ch):
         bw, eff = _channel_bw_gbps(h2d_ch)
         if bw is not None:
             h2d_bps, h2d_source, h2d_effective = bw * BYTES_PER_GB, "explicit_transfer_channel", eff
@@ -217,7 +220,7 @@ def resolve_sku_host_dma_rates(machine: Any) -> dict[str, Any]:
     d2h_effective = False
     if dev_rates.get("d2h", 0.0) > 0.0:
         d2h_bps, d2h_source, d2h_effective = dev_rates["d2h"], "explicit_device", True
-    elif _channel_is_caller_override(sku, "d2h", d2h_ch):
+    elif _channel_is_caller_override(channel_sku, "d2h", d2h_ch):
         bw, eff = _channel_bw_gbps(d2h_ch)
         if bw is not None:
             d2h_bps, d2h_source, d2h_effective = bw * BYTES_PER_GB, "explicit_transfer_channel", eff

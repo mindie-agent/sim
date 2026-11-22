@@ -438,7 +438,12 @@ def test_owner_grid_subtiles_and_explicit_domain(m, n, dtype):
     assert _price(m, n, dtype=dtype, options={"candidates": DEFAULT_CANDIDATES})[:2] == (span, work)
     tile = report["selected"]
     if dtype != "fp32":
-        assert tile["tile_m"] == tile["tile_n"] == (128 if n == 288 else (32 if dtype == "bf16" else 16))
+        if n == 288:
+            # With exact strided sector-union pricing, 128x256 beats 128x128 on
+            # unaligned N=288 panels (higher sector efficiency and full AIC grid).
+            assert (tile["tile_m"], tile["tile_n"]) == (128, 256)
+        else:
+            assert tile["tile_m"] == tile["tile_n"] == (32 if dtype == "bf16" else 16)
         if dtype == "bf16" or n == 24:
             assert _price(m, n, dtype=dtype, options={"underfilled_candidates": UNDERFILLED_CANDIDATES})[:2] == (span, work)
     else:
@@ -658,3 +663,26 @@ def test_contiguous_narrow_matrix_panel_avoids_strided_subsector_penalty():
         total_tiles=8, is_grouped=False, panel_rows=7168,
     )
     assert strided_bps == pytest.approx(0.25 * wide_bps)
+
+    # Narrow strided slice whose stride is smaller than a sector shares sectors across rows:
+    # 32 B every 64 B across 128 rows gives exact 1/2 sector efficiency on a 512 B sector (not 1/16).
+    p05_512 = SimpleNamespace(
+        supported=True, modes={}, mode_status=lambda _m=None: "calibrated",
+        band=lambda _m, mode=None: None, metrics={}, parameters={"l2_sector_bytes": 512},
+    )
+    ctx_512 = SimpleNamespace(
+        primitive_table=SimpleNamespace(
+            cell=lambda cid: {"P01_datacopy": p01, "P05_l2_residency_reuse": p05_512}.get(cid),
+        ),
+        core_count=32, op=SimpleNamespace(local_shape=(4, 32, 128)),
+        compute_arch=SimpleNamespace(arch_id="ascend_910b"),
+    )
+    shared_sector_bps = primitive_cold_hbm_bps(
+        ctx_512, active_cores=8, row_bytes=32, stride_bytes=64,
+        total_tiles=2, is_grouped=False, panel_rows=128,
+    )
+    full_512_bps = primitive_cold_hbm_bps(
+        ctx_512, active_cores=8, row_bytes=512, stride_bytes=512,
+        total_tiles=2, is_grouped=False, panel_rows=128,
+    )
+    assert shared_sector_bps == pytest.approx(0.5 * full_512_bps)

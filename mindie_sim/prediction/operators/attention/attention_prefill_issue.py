@@ -316,7 +316,7 @@ class IssueCursor:
     def start(self, engine, name, ready, *, owner=""):
         from .attention_kv_access import gqa_fixpipe_policy
         from .attention_prefill import (
-            _allocation, _operand_role, _placement, _read_role, _write_role,
+            _allocation, _operand_role, _placement, _read_role, _write_role, admitted_cores,
         )
         from .attention_prefill_geometry import prefill_handoff_workspace_bytes
 
@@ -331,7 +331,7 @@ class IssueCursor:
         self._write = _write_role(self.context)
         self._operand = _operand_role(self.context)
         self._handoff = gqa_fixpipe_policy(
-            self.context, prefill_handoff_workspace_bytes(self.spec, self.context.core_count),
+            self.context, prefill_handoff_workspace_bytes(self.spec, admitted_cores(self.context)),
         )
         self.page_scale = {}
         self.events = {}

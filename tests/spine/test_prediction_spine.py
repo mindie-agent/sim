@@ -629,3 +629,54 @@ def test_cohort_reuse_preserves_local_tp_stride_and_scales_linearly():
     t0 = time.perf_counter()
     graphs = target_graphs(parse_case(raw_big), phase="decode", tokens=1, context=512, sequences=16, scope="body")
     assert len(graphs) == 32 and (time.perf_counter() - t0) < 10.0
+
+
+def test_step_evaluation_preserves_non_wire_calibration_streams_and_media_roundtrip():
+    import pickle
+    from _support.axes import REPRESENTATIVE_SKUS
+    from _support.hardware import sku_case
+    from mindie_sim.cohort_accuracy import compare_cohorts
+    from mindie_sim.prediction.results import StepRequest, freeze_json, json_payload
+    from mindie_sim.prediction.spine import LoweringRequest, default_spine
+    from mindie_sim.prediction.streams import StreamCoreBudget, StreamLane, StreamPlan
+    from mindie_sim.structure import export_structure
+
+    case = sku_case(REPRESENTATIVE_SKUS["a5"])
+    spine = default_spine()
+    req = StepRequest(phase="decode", tokens=1, context=16, sequences=1, scope="body")
+    stream_plan = (StreamPlan(rank=0, lanes=(StreamLane("main", StreamCoreBudget()),)),)
+    step = spine.lower(case, LoweringRequest(step=req), streams=stream_plan)
+    ev_uncal = spine.run_step(step, primitive_table=False)
+    assert ev_uncal.primitive_table is False
+    assert ev_uncal.streams == stream_plan
+    wire = json_payload(ev_uncal)
+    assert "primitive_table" not in wire and "streams" not in wire
+    assert "primitive_table" not in freeze_json(ev_uncal)
+    ev_cal = spine.run_step(step)
+    assert ev_cal.primitive_table is not False
+    assert "primitive_table" not in json_payload(ev_cal) and "streams" not in json_payload(ev_cal)
+    assert pickle.loads(pickle.dumps(ev_cal)) == ev_cal
+    uncal_rt = pickle.loads(pickle.dumps(ev_uncal))
+    assert uncal_rt == ev_uncal and uncal_rt.primitive_table is False and uncal_rt.streams == stream_plan
+
+    # Explicit media_tokens_per_sequence=0 must round-trip identically from spine to compare_cohorts.
+    media_req = StepRequest(
+        phase="prefill", tokens=8, context=0, sequences=1, scope="model",
+        media_tokens_per_sequence=0,
+    )
+    media_step = spine.lower(case, LoweringRequest(step=media_req))
+    direct = export_structure(
+        case, phase="prefill", tokens=8, context=0, sequences=1, scope="model",
+        media_tokens_per_sequence=0,
+    )
+    assert media_step.graph_id == direct["graph_id"]
+    assert media_step.structure_payload["execution"]["media_tokens_per_sequence"] == 0
+    mapping = {
+        "schema_version": "mindie-profile-structure-mapping/1",
+        "graph_id": direct["graph_id"],
+        "declared_execution": dict(direct["execution"]),
+        "observed_phase": "prefill",
+        "windows": [],
+    }
+    compared = compare_cohorts(case, mapping, primitive_table=False)
+    assert compared["graph_id"] == direct["graph_id"]

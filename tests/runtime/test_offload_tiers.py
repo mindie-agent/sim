@@ -657,3 +657,18 @@ def test_compose_accepts_full_window_speculative_requests_and_validates_draft_ca
             prompt_tokens=8192, output_tokens=16, mtp_proposal_tokens=3,
             mtp_acceptance_length=2.5, draft_max_model_len=8192,
         )
+
+
+def test_derived_sku_host_dma_inherits_base_channel_and_calibration():
+    from mindie_sim.backends.ascend import DERIVED_ASCEND_SKUS
+    from mindie_sim.compose import _COMPOSE_OPTION_GROUPS, _materialize_machine
+    from mindie_sim.prediction.offload import resolve_sku_host_dma_rates
+
+    assert DERIVED_ASCEND_SKUS
+    opts = dict.fromkeys(_COMPOSE_OPTION_GROUPS["machine_options"])
+    for derived, spec in DERIVED_ASCEND_SKUS.items():
+        own = resolve_sku_host_dma_rates(_materialize_machine(derived, required_devices=1, **opts)[2])
+        base = resolve_sku_host_dma_rates(_materialize_machine(str(spec["base"]), required_devices=1, **opts)[2])
+        assert own["sku"] == derived and own["h2d_source"] != "explicit_transfer_channel"
+        for key in ("h2d_bps", "d2h_bps", "host_memory_bps", "h2d_source", "d2h_source", "h2d_latency_us"):
+            assert own[key] == base[key], (derived, key)
