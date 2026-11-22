@@ -21,6 +21,7 @@ import sys
 
 from . import api as sdk_api
 from . import predict
+from .cli_onboarding import ONBOARDING_COMMANDS, run_onboarding_command
 from .cli_sku import SKU_COMMANDS, run_sku_command
 from .prediction.primitives import PrimitiveKey, PrimitiveStore
 from .prediction.results import ReplayOptions, StepRequest, json_payload
@@ -634,6 +635,8 @@ def dispatch(args: argparse.Namespace, /) -> object:
         return _dispatch_sla(args)
     if cmd in SKU_COMMANDS:
         return run_sku_command(args)
+    if cmd in ONBOARDING_COMMANDS:
+        return run_onboarding_command(args)
     if cmd == "build-accel":
         from .prediction.runtime.accel_build import build_accel
         return build_accel(force=bool(args.force), check_only=bool(args.check))

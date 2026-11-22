@@ -22,6 +22,8 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timezone
 import hashlib
+from contextlib import contextmanager
+from copy import deepcopy
 import json
 import math
 import os
@@ -699,6 +701,7 @@ def main(argv: list[str] | None = None) -> int:
         ("--visible-devices", ""), ("--sku", ""), ("--arch", "npu_arch_2201"), ("--cann-version", "unmeasured"),
         ("--campaign-id", "camp-202611-l0"), ("--primitives", "all"), ("--out", ""),
         ("--manifest", "data/primitives/manifest.json"), ("--from-raw-json", ""),
+        ("--profile-json", ""),
     ):
         parser.add_argument(flag, default=default)
     for flag, default in (
@@ -710,55 +713,78 @@ def main(argv: list[str] | None = None) -> int:
         parser.add_argument(flag, type=int, default=default)
     args = parser.parse_args(argv)
 
-    if args.local_npu:
+    with _register_profile_json(args.sku, args.profile_json):
+        if args.local_npu:
+            if not args.sku:
+                raise SystemExit("--sku is required with --local-npu to bind hardware geometry")
+            spec = _load_sku_hardware_spec(args.sku)
+            vis = str(args.visible_devices or "").strip()
+            obs = _check_local_idle_die(int(args.npu_id), int(args.chip_id), int(args.device_id), vis)
+            if int(args.peer_device_id) >= 0:
+                _check_local_idle_die(int(args.peer_npu_id), int(args.peer_chip_id), int(args.peer_device_id), vis)
+            if vis:
+                os.environ["ASCEND_RT_VISIBLE_DEVICES"] = vis
+            raw = run_local_npu_microbenchmarks(
+                device_id=args.device_id, peer_device_id=args.peer_device_id,
+                l2_bytes=int(spec["l2_bytes"]), aic_count=int(spec["aic_count"]), aiv_count=int(spec["aiv_count"]),
+                arch_preset=str(spec["arch_preset"]), warmup=args.warmup, repeats=args.repeats,
+                primitives=str(args.primitives or "all"),
+            )
+            raw["observed_silicon"] = obs
+            print(RESULT_MARKER + json.dumps(raw, sort_keys=True, separators=(",", ":")))
+            return 0
+
         if not args.sku:
-            raise SystemExit("--sku is required with --local-npu to bind hardware geometry")
-        spec = _load_sku_hardware_spec(args.sku)
-        vis = str(args.visible_devices or "").strip()
-        obs = _check_local_idle_die(int(args.npu_id), int(args.chip_id), int(args.device_id), vis)
-        if int(args.peer_device_id) >= 0:
-            _check_local_idle_die(int(args.peer_npu_id), int(args.peer_chip_id), int(args.peer_device_id), vis)
-        if vis:
-            os.environ["ASCEND_RT_VISIBLE_DEVICES"] = vis
-        raw = run_local_npu_microbenchmarks(
-            device_id=args.device_id, peer_device_id=args.peer_device_id,
-            l2_bytes=int(spec["l2_bytes"]), aic_count=int(spec["aic_count"]), aiv_count=int(spec["aiv_count"]),
-            arch_preset=str(spec["arch_preset"]), warmup=args.warmup, repeats=args.repeats,
-            primitives=str(args.primitives or "all"),
+            raise SystemExit("--sku is required")
+        out_path = Path(args.out) if args.out else (REPO_ROOT / "data" / "primitives" / SKU_DEFAULT_FILES[args.sku])
+        manifest_path = Path(args.manifest) if Path(args.manifest).is_absolute() else (REPO_ROOT / args.manifest)
+        if args.from_raw_json:
+            raw_meas = unwrap_raw_measurements(json.loads(Path(args.from_raw_json).read_text(encoding="utf-8")))
+        else:
+            raw_meas = None if args.emit_unmeasured else run_remote_calibration(args)
+        rec_alias = args.record_alias or sanitize_record_alias(args.endpoint_alias or args.sku, args.sku)
+        payload = build_primitive_table_payload(
+            sku=args.sku, cann_version=args.cann_version, endpoint_alias=rec_alias,
+            campaign_id=args.campaign_id, raw_measurements=raw_meas,
         )
-        raw["observed_silicon"] = obs
-        print(RESULT_MARKER + json.dumps(raw, sort_keys=True, separators=(",", ":")))
+        from mindie_sim.primitives.schema import parse_primitive_table
+
+        parse_primitive_table(payload)
+        cap_bytes = canonical_capture_bytes(args.sku, raw_meas)
+        table_text = json.dumps(payload, indent=JSON_INDENT, sort_keys=True) + "\n"
+        assert_no_privacy_leak(table_text, label="table_write")
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        cap_path = out_path.parent / "captures" / f"{out_path.stem}.capture.json"
+        cap_path.parent.mkdir(parents=True, exist_ok=True)
+        cap_path.write_bytes(cap_bytes)
+        out_path.write_text(table_text, encoding="utf-8")
+        update_manifest(manifest_path, out_path, payload)
+        cal = [k for k, v in payload["primitives"].items() if v["status"] == "calibrated"]
+        rel_out = os.path.relpath(out_path, REPO_ROOT) if out_path.resolve().is_relative_to(REPO_ROOT.resolve()) else out_path.name
+        print(json.dumps({"sku": args.sku, "out": rel_out, "calibrated_count": len(cal), "calibrated": cal, "coverage": _coverage_summary(payload), "envelope_sha256": payload["envelope_sha256"]}, indent=JSON_INDENT))
         return 0
 
-    if not args.sku:
-        raise SystemExit("--sku is required")
-    out_path = Path(args.out) if args.out else (REPO_ROOT / "data" / "primitives" / SKU_DEFAULT_FILES[args.sku])
-    manifest_path = Path(args.manifest) if Path(args.manifest).is_absolute() else (REPO_ROOT / args.manifest)
-    if args.from_raw_json:
-        raw_meas = unwrap_raw_measurements(json.loads(Path(args.from_raw_json).read_text(encoding="utf-8")))
-    else:
-        raw_meas = None if args.emit_unmeasured else run_remote_calibration(args)
-    rec_alias = args.record_alias or sanitize_record_alias(args.endpoint_alias or args.sku, args.sku)
-    payload = build_primitive_table_payload(
-        sku=args.sku, cann_version=args.cann_version, endpoint_alias=rec_alias,
-        campaign_id=args.campaign_id, raw_measurements=raw_meas,
-    )
-    from mindie_sim.primitives.schema import parse_primitive_table
 
-    parse_primitive_table(payload)
-    cap_bytes = canonical_capture_bytes(args.sku, raw_meas)
-    table_text = json.dumps(payload, indent=JSON_INDENT, sort_keys=True) + "\n"
-    assert_no_privacy_leak(table_text, label="table_write")
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    cap_path = out_path.parent / "captures" / f"{out_path.stem}.capture.json"
-    cap_path.parent.mkdir(parents=True, exist_ok=True)
-    cap_path.write_bytes(cap_bytes)
-    out_path.write_text(table_text, encoding="utf-8")
-    update_manifest(manifest_path, out_path, payload)
-    cal = [k for k, v in payload["primitives"].items() if v["status"] == "calibrated"]
-    rel_out = os.path.relpath(out_path, REPO_ROOT) if out_path.resolve().is_relative_to(REPO_ROOT.resolve()) else out_path.name
-    print(json.dumps({"sku": args.sku, "out": rel_out, "calibrated_count": len(cal), "calibrated": cal, "coverage": _coverage_summary(payload), "envelope_sha256": payload["envelope_sha256"]}, indent=JSON_INDENT))
-    return 0
+@contextmanager
+def _register_profile_json(sku: str, profile_json: str):
+    if not profile_json:
+        yield
+        return
+    from mindie_sim.backends import ascend_profiles
+
+    raw = json.loads(Path(profile_json).read_text(encoding="utf-8"))
+    entry = raw[sku] if isinstance(raw, dict) and sku in raw and isinstance(raw[sku], dict) else raw
+    if not isinstance(entry, dict) or "device" not in entry:
+        raise ValueError(f"bench_profile_json_invalid:{sku}")
+    reg = ascend_profiles()
+    already = sku in reg
+    if not already:
+        reg[sku] = deepcopy(entry)
+    try:
+        yield
+    finally:
+        if not already:
+            reg.pop(sku, None)
 
 
 if __name__ == "__main__":

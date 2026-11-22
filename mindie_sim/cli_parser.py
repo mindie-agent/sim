@@ -17,6 +17,7 @@ import argparse
 from collections.abc import Sequence
 from dataclasses import dataclass
 
+from .cli_onboarding import ONBOARDING_BOOLEAN_FLAGS, add_onboarding_commands
 from .cli_options import add_runtime_arguments
 from .cli_sku import add_sku_commands
 from .feature_waterfall import DEFAULT_WATERFALL_CONTEXT, DEFAULT_WATERFALL_SEQUENCES
@@ -47,6 +48,7 @@ _BOOLEAN_FLAGS = frozenset({
     "--force", "--check", "--discover-installed", "--async-scheduling",
     "--no-async-scheduling", "--enable-dbo", "--no-enable-dbo",
     "--multistream-overlap-shared-expert", "--no-multistream-overlap-shared-expert",
+    *ONBOARDING_BOOLEAN_FLAGS,
 })
 
 DELEGATED_COMMANDS = frozenset({
@@ -524,6 +526,7 @@ def build_parser(*, prog: str = "mindie-sim") -> argparse.ArgumentParser:
     add_runtime_arguments(sla, command="sla")
 
     add_sku_commands(sub)
+    add_onboarding_commands(sub)
 
     accel = sub.add_parser("build-accel", help="compile or verify the C11 runtime kernel")
     accel.add_argument("--force", action="store_true", help="recompile even when cached")

@@ -475,3 +475,13 @@ owns = ["mindie_sim/prediction/operators/context_parallel"]
 path = "product/test_parallel_generalization_and_sweeps.py"
 tier = "tier0"
 owns = ["mindie_sim/catalog/context_parallel.py", "mindie_sim/sweep_resize.py", "mindie_sim/runtime_profiles.py"]
+
+[[module]]
+path = "product/test_onboarding_pipelines.py"
+tier = "tier1"
+owns = [
+  "mindie_sim/onboarding",
+  "mindie_sim/cli_onboarding.py",
+  "tools/onboard_sku.py",
+  "tools/onboard_operator.py",
+]
