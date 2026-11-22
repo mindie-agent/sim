@@ -44,13 +44,11 @@ from typing import Any
 
 from mindie_sim import compose_case, graph_costs, parse_case, target_graphs
 from mindie_sim.catalog.ops import comm_op, gemm_op
-from mindie_sim.observations.multilevel_gate import (
+from mindie_sim.observations.multilevel import (
     TIME_UNIT_SCALE_NS,
+    digest_file_streaming,
     evaluate_vertical_drilldown,
     exceeds_physical_tolerance,
-)
-from mindie_sim.observations.multilevel_stream import (
-    digest_file_streaming,
     normalize_lineage_token,
     sanitize_capture_uri,
 )

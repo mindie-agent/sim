@@ -367,7 +367,7 @@ def _stage2_upstream_abi(rows: Sequence[Mapping[str, Any]]) -> tuple[StageResult
                            f"Align upstream stack/caller ABI at {findings[0]} with minimal shape reproducer."), first_abi
     if unassessed:
         missing = tuple(f"missing_abi_evidence:{cid}" for cid in unassessed)
-        return StageResult(2, "upstream_abi_and_caller", "unassessed", missing, missing[0], "observations.multilevel_gate",
+        return StageResult(2, "upstream_abi_and_caller", "unassessed", missing, missing[0], "observations.multilevel",
                            "Collect Engine receipts with expected/observed ABI and caller evidence before assessing Stage 2."), first_abi
     return StageResult(2, "upstream_abi_and_caller", "clean", (), "none", "none",
                        "Upstream ABI and caller contract aligned; proceed to Stage 3."), first_abi
@@ -407,7 +407,7 @@ def _stage3_engine_contention(rows: Sequence[Mapping[str, Any]]) -> tuple[StageR
                            f"Run per-epoch Python/C diff and single-mechanism ablation on {findings[0]}."), saturated_row, summary
     if unassessed:
         missing = tuple(f"missing_engine_receipt_evidence:{cid}" for cid in unassessed)
-        return StageResult(3, "engine_and_resource_contention", "unassessed", missing, missing[0], "observations.multilevel_gate",
+        return StageResult(3, "engine_and_resource_contention", "unassessed", missing, missing[0], "observations.multilevel",
                            "Collect Engine parity, conservation, and resource-contention receipts before assessing Stage 3."), saturated_row, summary
     return StageResult(3, "engine_and_resource_contention", "clean", (), "none", "none",
                        "Engine parity and resource contention clean; proceed to Stage 4."), saturated_row, summary
@@ -443,7 +443,7 @@ def _stage4_silicon_mechanism(rows: Sequence[Mapping[str, Any]]) -> tuple[StageR
                            f"Model physical mechanism for {findings[0]} from independent primitive train capture and verify unseen counterexamples."), max_wait_ns
     if unassessed:
         missing = tuple(f"missing_barrier_receipt_evidence:{cid}" for cid in unassessed)
-        return StageResult(4, "missing_barrier_or_silicon_mechanism", "unassessed", missing, missing[0], "observations.multilevel_gate",
+        return StageResult(4, "missing_barrier_or_silicon_mechanism", "unassessed", missing, missing[0], "observations.multilevel",
                            "Collect Engine barrier/wait telemetry receipts before assessing Stage 4."), max_wait_ns
     return StageResult(4, "missing_barrier_or_silicon_mechanism", "clean", (), "none", "none",
                        "No unmodeled STARS/D2H/HCCL/SIMT/subtile_wave barrier flagged."), max_wait_ns
@@ -461,7 +461,7 @@ def _stage5_closure_checklist(action_required: bool) -> StageResult:
     return StageResult(
         stage_number=5, stage_name="closure_and_unblocking",
         status="action_required" if action_required else "clean",
-        findings=checks, first_divergence="none", owner_module="observations.multilevel_gate",
+        findings=checks, first_divergence="none", owner_module="observations.multilevel",
         next_check="Complete all 6 closure checks with fresh unseen blind acquisitions before closing ticket.",
     )
 

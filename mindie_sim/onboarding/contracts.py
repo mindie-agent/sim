@@ -989,7 +989,7 @@ def run_tail_cluster_diagnosis(
     timeout_s: int = DEFAULT_GATE_SUBPROCESS_TIMEOUT_S,
 ) -> dict[str, Any]:
     cand = resolve_repo_root(repo_root)
-    exec_root = cand if (cand / "mindie_sim" / "observations" / "multilevel_gate.py").is_file() else resolve_repo_root(None)
+    exec_root = cand if (cand / "mindie_sim" / "observations" / "multilevel.py").is_file() else resolve_repo_root(None)
     script = exec_root / "scripts" / "diagnose_tail_cluster.py"
     if not script.is_file():
         return {"schema": "mindie-sim.tail-cluster-diagnosis/1", "status": "diagnostic_script_unavailable", "cluster_count": 0, "clusters": []}

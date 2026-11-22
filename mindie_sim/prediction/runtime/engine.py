@@ -267,10 +267,14 @@ class _EnginePeriodicMixin:
             for run in self._periodic_runs.values()
             if run.get("slots")
         )
+        active_runs = max(
+            1, sum(1 for run in self._periodic_runs.values() if run.get("slots"))
+        )
+        step_limit = detector.max_lag * active_runs
         issue_limit = (
-            detector.max_lag
+            step_limit
             if any_retired
-            else _PERIODIC_COLD_ISSUE_MULTIPLIER * detector.max_lag
+            else _PERIODIC_COLD_ISSUE_MULTIPLIER * step_limit
         )
         if epoch_key != self._periodic_stall_epoch:
             if (self._periodic_stall_obs >= miss_budget
@@ -343,10 +347,13 @@ class _EnginePeriodicMixin:
         stop_at = self._periodic_stop(stop_at)
         landmark = (self._periodic_stall_epoch, self._periodic_last_next_sum)
         clock_steps = None
+        active_runs = max(
+            1, sum(1 for run in self._periodic_runs.values() if run.get("slots"))
+        )
         if previous is not None:
             clock_steps = previous["clock_steps"]
             clock = self._periodic_clock_step
-            if (clock_steps is not None and len(clock_steps) < detector.max_lag
+            if (clock_steps is not None and len(clock_steps) < detector.max_lag * active_runs
                     and clock is not None and clock[0] == self.advance_steps == previous["advance_steps"] + 1
                     and not self._crossed_external_or_opaque(previous, stop_at)):
                 clock_steps.append(clock[1])

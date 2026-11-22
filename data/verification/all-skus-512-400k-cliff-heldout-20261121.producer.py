@@ -52,7 +52,7 @@ from mindie_sim.prediction.mechanism import PlannedRecipe
 from mindie_sim.prediction.operators import attention, linear_attention, paged_mla, sparse_indexer
 from mindie_sim.prediction.operators.attention._fia import AttentionContract
 from mindie_sim.prediction.operators.attention.common import C8_V1_ABI, QUANT_MODE_BF16, QUANT_MODE_INT8_C8, SFA_V1_ABI
-from mindie_sim.prediction.operators.context_parallel import DCP_LSE_MERGE_EAGER_RECIPE, recipes as cp_recipes
+from mindie_sim.prediction.sharding.context_parallel import DCP_LSE_MERGE_EAGER_RECIPE, recipes as cp_recipes
 from mindie_sim.prediction.operators.paged_mla import indexed_attention, indexed_quant_attention
 from mindie_sim.prediction.operators.paged_mla.common import PagedMlaContract
 from mindie_sim.prediction.operators.sparse_indexer.common import SparseIndexerContract
