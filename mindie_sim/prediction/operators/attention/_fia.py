@@ -634,16 +634,17 @@ class _FiaLoop:
                 return Stage(phase.name, after=phase.after, latency=a35_nd2nz_setup_ms, keep_empty=True)
             if not (phase.memory and (capacity or self.ctx.admission_memory_view is not None)
                     and l2 in context.rates and hbm in context.rates):
-                eff_phase = phase
                 is_kv_load = phase.name.endswith("_load") and not phase.name.startswith("probability")
-                if is_kv_load and scatter_open_bytes > 0 and phase.pages > 0 and hbm:
-                    extra_hbm = phase.pages * scatter_open_bytes
-                    eff_phase = replace(phase, work=phase.work + Work(resources={"hbm": extra_hbm}))
-                st = _stage(context, eff_phase, place)
+                st = _stage(context, phase, place)
                 if self.gm_workspace and phase.name == "k_panel_0_load":
                     st = replace(st, previous=("k_panel_0_load",))
-                if cold_kv_caps and eff_phase.work.resources.get("hbm", 0) > 0 and is_kv_load:
+                b_hbm = phase.work.resources.get("hbm", 0)
+                if cold_kv_caps and b_hbm > 0 and is_kv_load:
                     st = replace(st, caps={**st.caps, **cold_kv_caps})
+                if is_kv_load and scatter_open_bytes > 0 and phase.pages > 0 and hbm and b_hbm > 0:
+                    extra_hbm = phase.pages * scatter_open_bytes
+                    base_cap = st.caps.get(hbm, context.rates[hbm])
+                    st = replace(st, caps={**st.caps, hbm: base_cap * (b_hbm / (b_hbm + extra_hbm))})
                 if a35_decode_fix_ms > 0.0 and phase.name in {"score_fixpipe", "pv_fixpipe"}:
                     st = replace(st, latency=max(st.latency, a35_decode_fix_ms))
                 return st

@@ -25,7 +25,9 @@ from ...runtime.memory_physics import AddressRun, AddressRunPlan, ByteLedger, Hb
 from ...runtime.ring_buffer import RingBuffer, lower_generation
 from ..attention.common import AttentionMemoryRead, planning_sequence_spans, sequence_layout_metadata
 from ..contracts import OperatorPlanningContext
-from ..matrix.refill_steady import compact_periodic_pipeline
+from ..matrix.refill_steady import (
+    PeriodicPipelineSpec, compact_periodic_peer_group, compact_periodic_pipeline,
+)
 from ..sharedkv.l0_sync import (
     p01_gather_v2_cold_bps, p01_hbm_scatter_row_open_bytes, p01_paged_copy_setup_ms,
     p01_strided_cold_bps, p02_l0b_load_factor, p03_fixpipe_setup_ms, p13_syncall_ms,
@@ -517,10 +519,15 @@ class _PagedMlaProgramBuilder:
     def totals(self) -> dict[str, Work]:
         c, layout = self.contract, self.layout
         totals: dict[str, Work] = {}
+        head_groups, prefix, lanes, groups_per_wave = self._distribution()
         if c.sinks:
-            sink_owners = self._sink_owners(*self._distribution())
+            sink_owners = self._sink_owners(head_groups, prefix, lanes, groups_per_wave)
             totals["sink_load"] = self._demand("sink_load", 0).work(self.dtype).scaled(len(sink_owners))
         phases = layout.phases
+        can_fold_mid = (
+            not c.mixed_quant and c.abi != DSL_MQS_ABI and not c.block_table
+            and (layout.key_tile % c.page_size == 0 or c.page_size % layout.key_tile == 0)
+        )
         for seq in range(len(c.sequences)):
             for query, repeat in self._query_runs(seq):
                 if not repeat:
@@ -531,18 +538,41 @@ class _PagedMlaProgramBuilder:
                     live = min(heads, max(0, c.logical_heads - head_start))
                     for split in range(partials):
                         offset, count = self._split_extent(seq, query, tiles, split)
-                        for i in range(count):
+                        samples = (
+                            ((0, 1), (1, count - 2), (count - 1, 1))
+                            if can_fold_mid and count > 2
+                            else tuple((i, 1) for i in range(count))
+                        )
+                        for i, mult in samples:
                             for step in phases:
-                                demand = self._tile_demand(step, seq, query, heads, live, i, offset, count, partials,
-                                                           head_start=head_start)
-                                totals[step] = totals.get(step, Work()) + demand.work(self.dtype).scaled(repeat)
-                    for step in self._finish_steps(partials):
-                        work = self._demand(step, live, seq=seq, query=query, heads=heads, partials=partials,
-                                            head_start=head_start).work(self.dtype)
-                        totals[step] = totals.get(step, Work()) + work.scaled(repeat)
+                                demand = self._tile_demand(
+                                    step, seq, query, heads, live, i, offset, count, partials,
+                                    head_start=head_start,
+                                )
+                                totals[step] = totals.get(step, Work()) + demand.work(self.dtype).scaled(repeat * mult)
+                    finish_steps = self._finish_steps(partials)
+                    if (c.abi == FIA_ABI and partials > 1 and lanes > 1
+                            and layout.head_tile >= NATIVE_FD_REDUCE_HEAD_TILE and live > FD_REDUCE_HEAD_GRAIN):
+                        n_chunks = min(lanes, ceil_div(live, FD_REDUCE_HEAD_GRAIN))
+                        base_h, extra_h = divmod(live, n_chunks)
+                        for idx in range(n_chunks):
+                            ch_live = base_h + (1 if idx < extra_h else 0)
+                            for step in finish_steps:
+                                work = self._demand(
+                                    step, ch_live, seq=seq, query=query, heads=ch_live,
+                                    partials=partials, head_start=head_start,
+                                ).work(self.dtype)
+                                totals[step] = totals.get(step, Work()) + work.scaled(repeat)
+                    else:
+                        for step in finish_steps:
+                            work = self._demand(
+                                step, live, seq=seq, query=query, heads=heads, partials=partials,
+                                head_start=head_start,
+                            ).work(self.dtype)
+                            totals[step] = totals.get(step, Work()) + work.scaled(repeat)
         return totals
 
-    def _stage(self, context, demand, pair, name, *, after=(), previous=(), metadata=None, latency=0.0, cold_caps=None):
+    def _stage(self, context, demand, pair, name, *, after=(), previous=(), metadata=None, latency=0.0, cold_caps=None, stage_caps=None):
         aic, aivs = pair
         work = demand.work(self.dtype)
         stages = []
@@ -570,7 +600,9 @@ class _PagedMlaProgramBuilder:
         for role in roles:
             if role not in ("hbm", "l2"):
                 placement.update(context.placement(role, aivs if role in AIV_ROLES else (aic,)))
-        caps = cold_caps if (cold_caps and work.resources.get("hbm", 0) > 0 and name.startswith("kv_load")) else {}
+        caps = dict(cold_caps) if (cold_caps and work.resources.get("hbm", 0) > 0 and name.startswith("kv_load")) else {}
+        if stage_caps:
+            caps.update(stage_caps)
         stage = Stage(name, context.bind(work), after=after, previous=previous, placement=placement,
                       coupled=("hbm" in work.resources or "l2" in work.resources), caps=caps,
                       metadata={**demand.metadata, **(metadata or {})})
@@ -597,8 +629,31 @@ class _PagedMlaProgramBuilder:
             stages.append(Stage(f"aiv{aiv}", work, placement=placement, keep_empty=True))
         return KernelProgram(tuple(stages))
 
+    def _step_caps(self, ctx, step, demand, *, live, seq, query, heads, start, keys, first, last,
+                   partials, mm2_offset, head_start, pages, scatter_open_bytes, l0b_factor, split_cold_caps):
+        caps: dict[str, float] = {}
+        if step == "kv_load" and scatter_open_bytes > 0 and pages > 0:
+            hbm_res = ctx.resource_names.get("hbm")
+            b_hbm = demand.work(self.dtype).resources.get("hbm", 0)
+            if hbm_res and b_hbm > 0:
+                base_cap = (split_cold_caps or {}).get(hbm_res, ctx.rates[hbm_res])
+                extra_hbm = ARCH35_MLA_PLANE_COPY_CALLS * pages * scatter_open_bytes
+                caps[hbm_res] = base_cap * (b_hbm / (b_hbm + extra_hbm))
+        if step in {"qk_operands", "pv_operands"} and l0b_factor != 1.0:
+            mte1_res = ctx.resource_names.get("mte1")
+            b_mte1 = demand.resources.get("mte1", 0)
+            eff_mte1 = self._demand(
+                step, live, seq=seq, query=query, heads=heads, start=start, keys=keys,
+                first=first, last=last, partials=partials,
+                mm2_offset=mm2_offset, head_start=head_start, l0b_factor=l0b_factor,
+            ).resources.get("mte1", 0)
+            if mte1_res and b_mte1 > 0 and eff_mte1 > 0:
+                owner_rate = ctx.rates[mte1_res] / max(1, ctx.resource_units.get("mte1", 1))
+                caps[mte1_res] = owner_rate * (b_mte1 / eff_mte1)
+        return caps or None
+
     def _split_program(self, ctx, seq, query, heads, live, pair, offset, count, partials, interval, head_start,
-                       *, active_owners: int | None = None):
+                       *, active_owners: int | None = None, return_peer_spec: bool = False):
         layout = self.layout
         aivs = pair[1]
         aiv_owners = ",".join(map(str, aivs)) if layout.pv_panel_width else ""
@@ -705,7 +760,7 @@ class _PagedMlaProgramBuilder:
                 start, keys = self._tile_extent(seq, query, offset + index)
                 demand = self._demand(step, live, seq=seq, query=query, heads=heads, start=start, keys=keys,
                                       first=index == 0, last=index + 1 == count, partials=partials,
-                                      mm2_offset=mm2_offset, head_start=head_start, l0b_factor=l0b_factor)
+                                      mm2_offset=mm2_offset, head_start=head_start)
                 edges = dict(after=tuple(dict.fromkeys(deps)), previous=tuple(dict.fromkeys(prev)))
                 st_name = step if compact_names else name(step, index)
                 if step in {"release0", "release1"}:
@@ -713,30 +768,42 @@ class _PagedMlaProgramBuilder:
                                         metadata=metadata, **edges))
                 else:
                     pages = (ceil_div(start + keys, self.contract.page_size) - start // self.contract.page_size) if keys else 0
-                    if step == "kv_load" and scatter_open_bytes > 0 and pages > 0:
-                        demand.add("hbm", ARCH35_MLA_PLANE_COPY_CALLS * pages * scatter_open_bytes)
+                    step_caps = self._step_caps(
+                        ctx, step, demand, live=live, seq=seq, query=query, heads=heads,
+                        start=start, keys=keys, first=index == 0, last=index + 1 == count,
+                        partials=partials, mm2_offset=mm2_offset, head_start=head_start,
+                        pages=pages, scatter_open_bytes=scatter_open_bytes,
+                        l0b_factor=l0b_factor, split_cold_caps=split_cold_caps,
+                    )
                     sync_lat = _mla_step_latency_ms(
                         step, self.contract, layout, keys, pages,
                         base_sync_by_step[step], fix_setup_ms, page_setup_ms,
                     )
-                    stages.append(self._stage(ctx, demand, pair, st_name, metadata=metadata, latency=sync_lat, cold_caps=split_cold_caps, **edges))
+                    stages.append(self._stage(
+                        ctx, demand, pair, st_name, metadata=metadata, latency=sync_lat,
+                        cold_caps=split_cold_caps, stage_caps=step_caps, **edges,
+                    ))
             by_name = {stage.name: stage for stage in stages}
             order = TopologicalSorter({stage.name: stage.after for stage in stages})
             return tuple(by_name[key] for key in order.static_order())
 
         slots = len(layout.clocks)
-        can_compact = (
+        can_compact_geom = (
             count > MLA_COMPACT_THRESHOLD
-            and eff_owners == 1
-            and layout.gm_workspace
             and layout.key_tile >= MLA_COMPACT_MIN_KEY_TILE
             and not self.contract.mixed_quant
             and not self.contract.block_table
             and self.planning is None
-            and self.contract.kv_layout == "PA_BLK_BSND"
+            and self.contract.kv_layout in {"PA_BLK_BSND", "BNSD"}
             and (layout.key_tile % self.contract.page_size == 0 or self.contract.page_size % layout.key_tile == 0)
         )
-        if can_compact:
+        if return_peer_spec and can_compact_geom:
+            return PeriodicPipelineSpec(
+                count + slots - 1, slots,
+                lambda clk: _build_cycle(clk, compact_names=True),
+                head=slots + 1, tail=slots + 1, threshold=MLA_COMPACT_THRESHOLD,
+            )
+        if can_compact_geom and eff_owners == 1 and layout.gm_workspace:
             return compact_periodic_pipeline(
                 ctx, count + slots - 1, slots,
                 lambda clk: _build_cycle(clk, compact_names=True),
@@ -770,7 +837,7 @@ class _PagedMlaProgramBuilder:
                 prior += groups * max(0, ceil_div(partials - local, lanes))
             return prior
 
-        def group(group_index, owner_start):
+        def group(group_index, owner_start, *, prebuilt_splits=None):
             seq = bisect_right(prefix, group_index) - 1
             query, head_group = divmod(group_index - prefix[seq], head_groups)
             head_start = head_group * layout.head_tile
@@ -784,11 +851,14 @@ class _PagedMlaProgramBuilder:
             def wave(index):
                 for local in range(min(lanes, partials - index * lanes)):
                     split = index * lanes + local
-                    offset, count = self._split_extent(seq, query, tiles, split)
-                    program = self._split_program(
-                        context, seq, query, heads, live, self.owners[owner_start + local], offset, count, partials,
-                        owner_interval(group_index, local) + index, head_start, active_owners=wave_owners,
-                    )
+                    if prebuilt_splits is not None and index == 0:
+                        program = prebuilt_splits[local]
+                    else:
+                        offset, count = self._split_extent(seq, query, tiles, split)
+                        program = self._split_program(
+                            context, seq, query, heads, live, self.owners[owner_start + local], offset, count, partials,
+                            owner_interval(group_index, local) + index, head_start, active_owners=wave_owners,
+                        )
                     yield Stage(f"split{local}", program=program, metadata={"split": split})
 
             stages = [Stage("splits", program=PipelineProgram(ceil_div(partials, lanes), 1, wave))]
@@ -827,8 +897,53 @@ class _PagedMlaProgramBuilder:
             return KernelProgram(tuple(stages))
         def launch(index):
             start = index * groups_per_wave
-            return tuple(Stage(f"query{local}", program=group(start + local, local * lanes))
-                         for local in range(min(groups_per_wave, prefix[-1] - start)))
+            n_groups = min(groups_per_wave, prefix[-1] - start)
+            active_groups = min(groups_per_wave, prefix[-1])
+            peer_specs = []
+            slice_bounds = []
+            can_peer_compact = True
+            for local in range(n_groups):
+                g_idx = start + local
+                seq = bisect_right(prefix, g_idx) - 1
+                query, head_group = divmod(g_idx - prefix[seq], head_groups)
+                tiles, partials = self._counts(seq, query)
+                if partials <= 0 or partials > lanes:
+                    can_peer_compact = False
+                    break
+                head_start = head_group * layout.head_tile
+                heads = min(layout.head_tile, c.physical_heads - head_start)
+                live = min(heads, max(0, c.logical_heads - head_start))
+                wave_owners = min(len(self.owners), active_groups * min(lanes, max(1, partials)))
+                lo = len(peer_specs)
+                for s_idx in range(partials):
+                    offset, count = self._split_extent(seq, query, tiles, s_idx)
+                    cand = self._split_program(
+                        context, seq, query, heads, live, self.owners[local * lanes + s_idx],
+                        offset, count, partials, owner_interval(g_idx, s_idx), head_start,
+                        active_owners=wave_owners, return_peer_spec=True,
+                    )
+                    if not isinstance(cand, PeriodicPipelineSpec):
+                        can_peer_compact = False
+                        break
+                    peer_specs.append(cand)
+                if not can_peer_compact:
+                    break
+                slice_bounds.append((lo, len(peer_specs)))
+            compacted = (
+                compact_periodic_peer_group(context, peer_specs, compactor=compact_periodic_pipeline)
+                if can_peer_compact and peer_specs
+                else None
+            )
+            return tuple(
+                Stage(
+                    f"query{local}",
+                    program=group(
+                        start + local, local * lanes,
+                        prebuilt_splits=(compacted[slice_bounds[local][0]:slice_bounds[local][1]] if compacted is not None else None),
+                    ),
+                )
+                for local in range(n_groups)
+            )
 
         pipeline = PipelineProgram(ceil_div(prefix[-1], groups_per_wave), 1, launch)
         if not c.sinks:
