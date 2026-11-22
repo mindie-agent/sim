@@ -27,12 +27,16 @@ from __future__ import annotations
 from collections.abc import Mapping as _AbcMapping
 from copy import deepcopy
 from dataclasses import dataclass, replace
+import hashlib
+import json
+import math
 from typing import Any, Mapping
 
 from mindie_sim.schema.case import Case as CaseSpec
-from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.common import ModelingError, dtype_bytes
 from mindie_sim.schema.datapath import datapath_for_devices
 from mindie_sim.schema.hardware import NATIVE_WORK_UNITS
+from mindie_sim.schema.invocation import InvocationTiming
 from mindie_sim.schema.operators import IterationWork
 from ..collectives.ports import root_complex_resources_for_dies
 from ..collectives.transport import TransportOptions
@@ -61,6 +65,132 @@ DEVICE_UNITS_CACHE_LIMIT = 64
 SERVICE_IDENTITY_CACHE_LIMIT = 1024
 INLINE_FRONTIER_TASK_CAP = 49152
 PROGRAM_CACHE_ENTRY_LIMIT = 768
+DIGEST_PREFIX_CHARS = 12
+_EXECUTION_CLASS_HARDWARE_ROLES: dict[str, tuple[str, ...]] = {
+    "mixed_aic_aiv": ("cube", "vector"),
+    "mixed_aiv_aic_overlap": ("cube", "vector"),
+    "mixed_aic_aiv_mc2": ("cube", "vector"),
+    "aiv_only": ("vector",),
+    "vector_aiv": ("vector",),
+    "aic_only": ("cube",),
+    "cube_aic": ("cube",),
+}
+_ORDINARY_HARDWARE_CLASSES = frozenset({"cube", "vector"})
+_NON_KERNEL_FAMILIES = frozenset({
+    "barrier", "token_commit", "collective", "allreduce", "allgather",
+    "reduce_scatter", "alltoall", "alltoallv", "transport",
+})
+
+
+def _resolve_mapped_hardware_invocation(dies, roles: tuple[str, ...]):
+    """Resolve hardware invocation timing across ``dies`` for canonical role aliases."""
+    selected = [
+        {"rank": device.rank, "class": role, **timing.to_dict()}
+        for device in dies for role, timing in device.kernel_invocations if role in roles
+    ]
+    if not selected:
+        return None
+    timing = InvocationTiming(
+        startup_ms=max(row["startup_ms"] for row in selected),
+        minimum_ms=max(row["minimum_ms"] for row in selected),
+        provenance={"basis": "hardware_execution_class", "declarations": selected},
+    )
+    payload = json.dumps(timing.to_dict(), sort_keys=True, separators=(",", ":"))
+    return timing, {
+        "id": hashlib.sha256(payload.encode()).hexdigest(),
+        "match": {"execution_classes": roles},
+        "source": "device.kernel_invocations",
+        **timing.to_dict(),
+    }
+
+
+def _active_aiv_blocks(op, meta: Mapping[str, Any], envelope) -> int:
+    """Resolve active AIV block count from declared launch grid or I/O tile footprint."""
+    from mindie_sim.primitives.loader import AIV_MIN_TILE_BYTES
+
+    prog_exec = meta.get("program_execution")
+    declared = (
+        prog_exec.get("launched_blocks") or prog_exec.get("active_aivs")
+        if isinstance(prog_exec, _AbcMapping) else None
+    ) or meta.get("launched_blocks") or meta.get("active_aivs")
+    if isinstance(declared, int) and not isinstance(declared, bool) and declared > 0:
+        return max(1, min(envelope.aiv_count, declared))
+    elem_bytes = float(dtype_bytes(getattr(op, "dtype", None) or "bf16"))
+    io_bytes = max(
+        float(getattr(op, "mte2_bytes", 0.0) or 0.0),
+        float(getattr(op, "mte3_bytes", 0.0) or 0.0),
+        float(getattr(op, "hbm_bytes", 0.0) or 0.0),
+        float(getattr(op, "vector_ops", 0.0) or 0.0) * elem_bytes,
+    )
+    if io_bytes <= 0.0:
+        return 1
+    return max(1, min(envelope.aiv_count, math.ceil(io_bytes / float(AIV_MIN_TILE_BYTES))))
+
+
+def _apply_calibrated_dispatch_floor(context, dies, selected, envelope):
+    """Apply calibrated P12/P13/P15/P16 block-dispatch floor without overriding explicit rules."""
+    op = context.op
+    if context.service_boundary != "device_kernel" or not context.work:
+        return selected
+    if op.family in _NON_KERNEL_FAMILIES or context.native_work.get("link", 0):
+        return selected
+    meta = _metadata_dict(op)
+    prog_exec = meta.get("program_execution")
+    explicit_class = meta.get("invocation_class") or (
+        prog_exec.get("execution_class") if isinstance(prog_exec, _AbcMapping) else None
+    )
+    mapped_roles = _EXECUTION_CLASS_HARDWARE_ROLES.get(str(explicit_class)) if explicit_class else None
+    if selected is None and mapped_roles is not None:
+        selected = _resolve_mapped_hardware_invocation(dies, mapped_roles)
+    if selected is None or envelope is None:
+        return selected
+    timing, record = selected
+    if record.get("source") != "device.kernel_invocations":
+        return selected
+    if (explicit_class is not None
+            and explicit_class not in _ORDINARY_HARDWARE_CLASSES
+            and mapped_roles is None):
+        return selected
+    has_cube = float(context.native_work.get("cube", 0.0) or 0.0) > 0.0
+    has_vec = float(context.native_work.get("vector", 0.0) or 0.0) > 0.0
+    target_startup_ms = timing.startup_ms
+    if mapped_roles == ("cube", "vector") or (explicit_class is None and has_cube and has_vec):
+        cube_floor_ms = max(
+            (t.minimum_ms for d in dies for role, t in d.kernel_invocations if role == "cube"),
+            default=timing.minimum_ms,
+        )
+        floor_ms = envelope.mix_aic_floor_ms(cube_floor_ms)
+        kind = "mixed_aic_aiv"
+    elif mapped_roles == ("vector",) or (explicit_class in (None, "vector") and has_vec and not has_cube):
+        floor_ms = envelope.aiv_floor_ms(_active_aiv_blocks(op, meta, envelope))
+        kind = "vector"
+        if (
+            target_startup_ms <= 0.0
+            and str(meta.get("vector_submode") or "") in {"broadcast_elementwise", "outer_axis_reduction"}
+        ):
+            # Non-streaming CANN BroadcastSch / ReduceOpTilingDataNonContiguous
+            # AIV kernels serialize block tiling & scalar coordinate setup before
+            # the steady-state UB pipe loop (ops-math/math/{mul,reduce_sum}/op_kernel).
+            target_startup_ms = floor_ms
+    else:
+        return selected
+    target_min_ms = max(timing.minimum_ms, floor_ms)
+    if target_min_ms <= timing.minimum_ms and target_startup_ms <= timing.startup_ms:
+        return selected
+    evidence = f"p15_p13:{envelope.sku}:{envelope.envelope_sha256[:DIGEST_PREFIX_CHARS]}:{kind}"
+    upgraded = InvocationTiming(
+        startup_ms=target_startup_ms,
+        minimum_ms=target_min_ms,
+        provenance={**dict(timing.provenance), "dispatch_envelope": evidence},
+    )
+    payload = json.dumps(upgraded.to_dict(), sort_keys=True, separators=(",", ":"))
+    return upgraded, {
+        **record,
+        "id": hashlib.sha256(payload.encode()).hexdigest(),
+        "startup_ms": target_startup_ms,
+        "minimum_ms": target_min_ms,
+        "provenance": upgraded.provenance,
+    }
 
 
 def _execution_geometry(device):
@@ -105,6 +235,7 @@ class StageProfile:
     primitive_table: Any = None
     primitive_identity: tuple = ()
     primitive_coverage_gaps: tuple[str, ...] = ()
+    dispatch_envelope: Any = None
 
     @property
     def profile_key(self) -> tuple:
@@ -141,11 +272,13 @@ def build_stage_profiles(case: CaseSpec, namespace: str = "", *,
                 for role in roles
             }
             overlay = None
+            dispatch_envelope = None
             overlay_rates: dict[str, float] = {}
             overlay_peaks: dict[str, float] = {}
             if primitive_table is not None:
-                from mindie_sim.primitives.loader import resolve_sim_rate_overlay
+                from mindie_sim.primitives.loader import resolve_dispatch_envelope, resolve_sim_rate_overlay
                 overlay = resolve_sim_rate_overlay(primitive_table, datapath, sku=dies[0].sku)
+                dispatch_envelope = resolve_dispatch_envelope(primitive_table, datapath)
                 overlay_rates = {
                     role: (min(val, orig_rates_s[role]) if orig_rates_s.get(role, 0.0) > 0.0 else val)
                     for role, val in overlay.rates
@@ -206,8 +339,17 @@ def build_stage_profiles(case: CaseSpec, namespace: str = "", *,
                 service_modes[mode] = (role, m_rate)
             if "mte2_aiv_dram" not in service_modes and overlay and overlay.hbm_read_bytes_per_s is not None:
                 service_modes["mte2_aiv_dram"] = ("mte2_aiv", overlay.hbm_read_bytes_per_s)
+            if overlay and overlay.hbm_write_bytes_per_s is not None:
+                service_modes["hbm_write_dram"] = ("hbm", overlay.hbm_write_bytes_per_s)
+            if overlay and overlay.hbm_rw11_bytes_per_s is not None:
+                service_modes["hbm_rw11_dram"] = ("hbm", overlay.hbm_rw11_bytes_per_s)
             if overlay and overlay.hbm_rw21_bytes_per_s is not None:
                 service_modes["hbm_rw21_dram"] = ("hbm", overlay.hbm_rw21_bytes_per_s)
+            l2_pipe = "mte2_aiv" if "mte2_aiv" in names else ("mte2" if "mte2" in names else None)
+            if l2_pipe is not None and overlay and overlay.l2_die_bytes_per_s is not None:
+                service_modes["l2_die_bw"] = (l2_pipe, overlay.l2_die_bytes_per_s)
+            if l2_pipe is not None and overlay and overlay.l2_contiguous_bytes_per_s is not None:
+                service_modes["l2_contiguous_bw"] = (l2_pipe, overlay.l2_contiguous_bytes_per_s)
             store_queues = {
                 name: dict(queue) for name, queue in dies[0].store_queues
                 if all(dict(die.store_queues).get(name) == queue for die in dies)
@@ -225,6 +367,7 @@ def build_stage_profiles(case: CaseSpec, namespace: str = "", *,
                 datapath=datapath, host_rc_resources=host_rc, primitive_table=primitive_table,
                 primitive_identity=() if overlay is None else overlay.identity,
                 primitive_coverage_gaps=() if overlay is None else overlay.coverage_gaps,
+                dispatch_envelope=dispatch_envelope,
             ))
     return tuple(profiles)
 
@@ -491,6 +634,10 @@ class _ContextMixin:
         self._last_invocation_record = None
         selected = (None if getattr(recipe, "native", False)
                     else self.invocations.select(context, recipe, devices=dies))
+        if not getattr(recipe, "native", False):
+            profile = self.stage_profiles.get((replica, op.stage))
+            envelope = getattr(profile, "dispatch_envelope", None) if profile is not None else None
+            selected = _apply_calibrated_dispatch_floor(context, dies, selected, envelope)
         if selected is not None:
             timing, record = selected
             self._last_invocation_record = record

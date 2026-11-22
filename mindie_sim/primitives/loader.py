@@ -23,6 +23,16 @@ from mindie_sim.schema.hardware_links import UNCALIBRATED_SKU_WARNING
 from .schema import PRIMITIVE_SCHEMA_VERSION, PrimitiveCell, PrimitiveTable, compute_envelope_sha256, parse_primitive_table
 
 _MAX_DOCUMENT_BYTES = 8 * 1024 * 1024
+MS_PER_SECOND = 1000.0
+NS_PER_MS = 1_000_000.0
+P12_FLAG_CYCLES = 4.0
+AIV_SCALAR_INIT_CYCLES = 2560.0
+AIV_MIN_TILE_BYTES = 2048
+AIV_FULL_DIE_BARRIER_ROUNDS = 3.0
+MIX_AIC_AIV_BARRIER_ROUNDS = 2.0
+MIX_AIC_AIC_BARRIER_ROUNDS = 2.0
+MIX_AIC_PAIRED_SYNC_ROUNDS = 4.0
+DEFAULT_CORE_CLOCK_HZ = 1_650_000_000.0
 RateRole = Literal["sim", "dual"]
 
 
@@ -240,8 +250,11 @@ class CalibratedRateOverlay:
     compute_peaks: tuple[tuple[str, float], ...] = ()
     hbm_read_bytes_per_s: float | None = None
     hbm_write_bytes_per_s: float | None = None
+    hbm_rw11_bytes_per_s: float | None = None
     hbm_rw21_bytes_per_s: float | None = None
     hbm_rw_alpha: float | None = None
+    l2_die_bytes_per_s: float | None = None
+    l2_contiguous_bytes_per_s: float | None = None
     coverage_gaps: tuple[str, ...] = ()
 
     @property
@@ -250,7 +263,9 @@ class CalibratedRateOverlay:
             self.sku, self.cann_version, self.envelope_sha256,
             self.rates, self.compute_peaks,
             self.hbm_read_bytes_per_s, self.hbm_write_bytes_per_s,
-            self.hbm_rw21_bytes_per_s, self.hbm_rw_alpha,
+            self.hbm_rw11_bytes_per_s, self.hbm_rw21_bytes_per_s,
+            self.hbm_rw_alpha, self.l2_die_bytes_per_s,
+            self.l2_contiguous_bytes_per_s,
         )
 
 
@@ -359,13 +374,28 @@ def resolve_sim_rate_overlay(
     gaps: list[str] = []
     hbm_r = _table_band_p50(table, "P01_datacopy", "hbm_read_bytes_per_s")
     hbm_w = _table_band_p50(table, "P01_datacopy", "hbm_write_bytes_per_s")
+    hbm_rw11 = _table_band_p50(table, "P01_datacopy", "hbm_rw11_bytes_per_s")
     hbm_rw21 = _table_band_p50(table, "P01_datacopy", "hbm_rw21_bytes_per_s")
     if hbm_r is not None and datapath.hbm_read_bytes_per_s > 0.0:
         hbm_r = min(hbm_r, datapath.hbm_read_bytes_per_s)
     if hbm_w is not None and datapath.hbm_write_bytes_per_s > 0.0:
         hbm_w = min(hbm_w, datapath.hbm_write_bytes_per_s)
+    if hbm_rw11 is not None and datapath.hbm_read_bytes_per_s > 0.0:
+        hbm_rw11 = min(hbm_rw11, datapath.hbm_read_bytes_per_s)
     if hbm_rw21 is not None and datapath.hbm_read_bytes_per_s > 0.0:
         hbm_rw21 = min(hbm_rw21, datapath.hbm_read_bytes_per_s)
+    l2_die = _table_band_p50(table, "P05_l2_residency_reuse", "l2_die_bytes_per_s")
+    l2_contiguous = None
+    try:
+        p05_params = table.cell("P05_l2_residency_reuse").parameters or {}
+        for entry in p05_params.get("l2_stride_conflict") or ():
+            if isinstance(entry, Mapping) and entry.get("kind") == "contiguous":
+                val = entry.get("bps_p50")
+                if isinstance(val, (int, float)) and float(val) > 0.0:
+                    l2_contiguous = float(val)
+                    break
+    except ModelingError:
+        pass
     hbm_alpha_val = None
     try:
         alpha_band = table.cell("P01_datacopy").band("hbm_rw_alpha")
@@ -405,14 +435,103 @@ def resolve_sim_rate_overlay(
         compute_peaks=tuple(sorted(peaks_map.items())),
         hbm_read_bytes_per_s=hbm_r,
         hbm_write_bytes_per_s=hbm_w,
+        hbm_rw11_bytes_per_s=hbm_rw11,
         hbm_rw21_bytes_per_s=hbm_rw21,
         hbm_rw_alpha=hbm_alpha_val,
+        l2_die_bytes_per_s=l2_die,
+        l2_contiguous_bytes_per_s=l2_contiguous,
         coverage_gaps=tuple(sorted(dict.fromkeys(gaps))),
     )
 
 
+@dataclass(frozen=True, slots=True)
+class CalibratedDispatchEnvelope:
+    """Calibrated hardware kernel-launch and cross-core block-dispatch envelope."""
+
+    sku: str
+    envelope_sha256: str
+    aiv_count: int
+    aic_count: int
+    mode4_supported: bool
+    issue_interval_ms: float
+    aiv_barrier_ms: float
+    aic_barrier_ms: float
+    paired_sync_ms: float
+    stream_event_ms: float
+    clock_period_ms: float
+    aiv_min_block_floor_ms: float
+    aiv_full_die_floor_ms: float
+
+    def aiv_floor_ms(self, active_aiv: int) -> float:
+        """Inclusive AIV kernel completion floor scaled by active block fanout."""
+        clamped = max(1, min(self.aiv_count, int(active_aiv)))
+        if self.aiv_count <= 1:
+            return self.aiv_min_block_floor_ms
+        fanout_fraction = float(clamped - 1) / float(self.aiv_count - 1)
+        return self.aiv_min_block_floor_ms + fanout_fraction * (
+            self.aiv_full_die_floor_ms - self.aiv_min_block_floor_ms
+        )
+
+    def mix_aic_floor_ms(self, cube_floor_ms: float) -> float:
+        """Inclusive coupled MIX_AIC kernel completion floor (AIC + AIV + FFTS+ sync)."""
+        handoff_ms = (
+            MIX_AIC_AIV_BARRIER_ROUNDS * self.aiv_barrier_ms
+            + MIX_AIC_AIC_BARRIER_ROUNDS * self.aic_barrier_ms
+            + MIX_AIC_PAIRED_SYNC_ROUNDS * self.paired_sync_ms
+            + self.stream_event_ms
+        )
+        return float(cube_floor_ms) + self.aiv_full_die_floor_ms + handoff_ms
+
+
+def resolve_dispatch_envelope(
+    table: Any, datapath: DatapathCapabilitySpec,
+) -> CalibratedDispatchEnvelope | None:
+    """Derive a physical dispatch/block-startup envelope from calibrated P12/P13/P15/P16."""
+    if not isinstance(table, PrimitiveTable) or not table.provenance.calibrated:
+        return None
+    issue_ns = _table_band_p50(table, "P15_rts_stars", "issue_interval_ns")
+    aiv_bar_ns = _table_band_p50(table, "P13_crosscore_sync", "mode0_aiv_barrier_ns")
+    paired_ns = _table_band_p50(table, "P13_crosscore_sync", "mode2_paired_ns")
+    if issue_ns is None or aiv_bar_ns is None or paired_ns is None:
+        return None
+    aic_bar_ns = _table_band_p50(table, "P13_crosscore_sync", "mode0_aic_barrier_ns")
+    event_ns = _table_band_p50(table, "P16_multistream_core_control", "stream_event_ns") or 0.0
+    flag_ns = _table_band_p50(table, "P12_intracore_flag", "flag_ns")
+    if flag_ns is not None and flag_ns > 0.0:
+        clock_period_ms = (flag_ns / P12_FLAG_CYCLES) / NS_PER_MS
+    else:
+        clock_period_ms = MS_PER_SECOND / DEFAULT_CORE_CLOCK_HZ
+    p13_params = table.cell("P13_crosscore_sync").parameters or {}
+    issue_ms = issue_ns / NS_PER_MS
+    aiv_bar_ms = aiv_bar_ns / NS_PER_MS
+    aic_bar_ms = (aic_bar_ns if aic_bar_ns is not None else aiv_bar_ns) / NS_PER_MS
+    paired_ms = paired_ns / NS_PER_MS
+    event_ms = event_ns / NS_PER_MS
+    aiv_min_ms = issue_ms + aiv_bar_ms + AIV_SCALAR_INIT_CYCLES * clock_period_ms
+    aiv_full_ms = (
+        aiv_min_ms + issue_ms + AIV_FULL_DIE_BARRIER_ROUNDS * aiv_bar_ms + paired_ms
+    )
+    return CalibratedDispatchEnvelope(
+        sku=table.sku,
+        envelope_sha256=table.canonical_envelope_sha256(),
+        aiv_count=max(1, int(datapath.aiv_count)),
+        aic_count=max(1, int(datapath.aic_count)),
+        mode4_supported=bool(p13_params.get("mode4_supported", False)),
+        issue_interval_ms=issue_ms,
+        aiv_barrier_ms=aiv_bar_ms,
+        aic_barrier_ms=aic_bar_ms,
+        paired_sync_ms=paired_ms,
+        stream_event_ms=event_ms,
+        clock_period_ms=clock_period_ms,
+        aiv_min_block_floor_ms=aiv_min_ms,
+        aiv_full_die_floor_ms=aiv_full_ms,
+    )
+
+
 __all__ = [
-    "CalibratedRateOverlay", "RateRole", "default_primitives_dir",
-    "is_sku_compatible_with_table", "load_manifest", "load_primitives",
-    "resolve_primitive_rate", "resolve_sim_rate_overlay", "validate_table_sku_compatibility",
+    "AIV_MIN_TILE_BYTES", "CalibratedDispatchEnvelope", "CalibratedRateOverlay",
+    "RateRole", "default_primitives_dir", "is_sku_compatible_with_table",
+    "load_manifest", "load_primitives", "resolve_dispatch_envelope",
+    "resolve_primitive_rate", "resolve_sim_rate_overlay",
+    "validate_table_sku_compatibility",
 ]

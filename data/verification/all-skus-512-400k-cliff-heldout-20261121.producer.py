@@ -52,6 +52,7 @@ from mindie_sim.prediction.mechanism import PlannedRecipe
 from mindie_sim.prediction.operators import attention, linear_attention, paged_mla, sparse_indexer
 from mindie_sim.prediction.operators.attention._fia import AttentionContract
 from mindie_sim.prediction.operators.attention.common import C8_V1_ABI, QUANT_MODE_BF16, QUANT_MODE_INT8_C8, SFA_V1_ABI
+from mindie_sim.prediction.operators.context_parallel import DCP_LSE_MERGE_EAGER_RECIPE, recipes as cp_recipes
 from mindie_sim.prediction.operators.paged_mla import indexed_attention, indexed_quant_attention
 from mindie_sim.prediction.operators.paged_mla.common import PagedMlaContract
 from mindie_sim.prediction.operators.sparse_indexer.common import SparseIndexerContract
@@ -313,36 +314,22 @@ class _SkuReplayHarness:
     def pred_dcp_merge(
         self, cp: int, q_len: int, heads: int = GQA_HQ, dim: int = GQA_D, *, include_stack: bool = False,
     ) -> float:
-        n_lse, n_out = cp * heads * q_len, cp * heads * q_len * dim
-        lse_b, red_lse_b = n_lse * FP32_BYTES, heads * q_len * FP32_BYTES
-        ol_bf16_b, ol_fp32_b = n_out * BF16_BYTES, n_out * FP32_BYTES
-        res_fp32_b, res_bf16_b = heads * q_len * dim * FP32_BYTES, heads * q_len * dim * BF16_BYTES
-        l2_cap = self.hw["l2_bytes"]
-        _hbm = lambda rd, wr, l2_in=0: max(0, rd - (min(rd, l2_in) if (l2_cap > 0 and (rd + wr) <= l2_cap) else 0)) + wr
-        pre_lse = (("m0_lse_stack", (), "fp32", n_lse, n_lse, lse_b, lse_b, 0),) if include_stack else ()
-        amax_dep = ("m0_lse_stack",) if include_stack else ()
-        amax_l2 = lse_b if include_stack else 0
-        post_cast = (("m6b_o_stack", ("m6_cast32",), "fp32", n_out, n_out, ol_fp32_b, ol_fp32_b, ol_fp32_b),) if include_stack else ()
-        mul_dep = ("m6b_o_stack",) if include_stack else ("m6_cast32",)
-        specs = (
-            *pre_lse,
-            ("m1_amax", amax_dep, "fp32", n_lse, n_lse, lse_b, red_lse_b, amax_l2),
-            ("m2_sub", ("m1_amax",), "fp32", n_lse, n_lse, lse_b + red_lse_b, lse_b, lse_b + red_lse_b),
-            ("m3_exp", ("m2_sub",), "fp32", n_lse, FP32_BYTES * n_lse, lse_b, lse_b, lse_b),
-            ("m4_wsum", ("m3_exp",), "fp32", n_lse, n_lse, lse_b, red_lse_b, lse_b),
-            ("m5_wdiv", ("m4_wsum",), "fp32", n_lse, n_lse, lse_b + red_lse_b, lse_b, lse_b + red_lse_b),
-            ("m6_cast32", ("m5_wdiv",), "fp32", n_out, n_out, ol_bf16_b, ol_fp32_b, 0),
-            *post_cast,
-            ("m7_mul", mul_dep, "fp32", n_out, n_out, ol_fp32_b + lse_b, ol_fp32_b, ol_fp32_b + lse_b),
-            ("m8_osum", ("m7_mul",), "fp32", n_out, n_out, ol_fp32_b, res_fp32_b, ol_fp32_b),
-            ("m9_cast16", ("m8_osum",), "bf16", heads * q_len * dim, heads * q_len * dim, res_fp32_b, res_bf16_b, res_fp32_b),
+        shape = (q_len, heads, dim)
+        op = OpSpec(
+            "dcp_lse_merge", "attention_merge", "decode", 0, 0, (),
+            shape, shape, shape, shape,
+            recipe=DCP_LSE_MERGE_EAGER_RECIPE, dtype="bf16",
+            metadata=(
+                ("partial_count", cp),
+                ("l2_bytes", int(self.hw["l2_bytes"])),
+                ("include_stack", include_stack),
+            ),
         )
-        ops = [
-            OpSpec(oid, "vector", "decode", 0, 0, (), (n,), (n,), (n,), (n,), deps=deps, dtype=dt,
-                   vector_ops=vops, mte2_bytes=rd, mte3_bytes=wr, hbm_bytes=_hbm(rd, wr, l2_in))
-            for oid, deps, dt, n, vops, rd, wr, l2_in in specs
-        ]
-        return self.run_graph(ops, None, isolated=False)
+        return self.run_graph(
+            [op],
+            RecipeBook(recipes={DCP_LSE_MERGE_EAGER_RECIPE: cp_recipes()[DCP_LSE_MERGE_EAGER_RECIPE]}),
+            isolated=False,
+        )
 
     def pred_linear_attn(self, *, kind: str, seqlen: int, heads: int, cann_ver: str = "") -> float:
         if kind == "gdn_chunk":
