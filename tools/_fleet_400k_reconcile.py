@@ -28,6 +28,10 @@ from mindie_sim.observations.accuracy import apply_capture_observed_clock
 
 REL_TOL = 0.10
 ABS_FLOOR_NS = 2000.0
+L1_MEDIAN_APE_MAX_PCT = 8.0
+L1_P90_APE_MAX_PCT = 12.0
+L1_CLIFF_REL_TOL = 0.15
+L1_CLIFF_ABS_FLOOR_NS = 3000.0
 NS_PER_US = 1000.0
 LSTAR_INV_EPS = 1e-6
 DCP_MAX_VERIFIED_KV = 32768
@@ -135,6 +139,7 @@ def score_verdict(
     if not finite_ok:
         return {
             "case_id": cid, "family": family, "split": split, "status": "fail",
+            "l1_cliff_status": "fail",
             "acquisition_uid": acquisition_uid, "boundary": boundary, "geometry_key": geometry_key,
             "meas_us": float(meas_p50) if math.isfinite(meas_p50) else None,
             "meas_p99_us": float(meas_p99) if math.isfinite(meas_p99) else None,
@@ -146,13 +151,16 @@ def score_verdict(
     pred_ns = pred_us * NS_PER_US
     err_ns = abs(pred_ns - meas_ns)
     tol_ns = max(REL_TOL * meas_ns, ABS_FLOOR_NS)
+    cliff_tol_ns = max(L1_CLIFF_REL_TOL * meas_ns, L1_CLIFF_ABS_FLOOR_NS)
     inv_sim = lstar_us > pred_us * ONE_TOL
     inv_obs = (lstar_us > meas_p50 * ONE_TOL) or (lstar_us > meas_p99 * ONE_TOL)
     passed = (err_ns <= tol_ns) and (not inv_sim) and (not inv_obs)
+    cliff_passed = (err_ns <= cliff_tol_ns) and (not inv_sim) and (not inv_obs)
     ape_pct = (err_ns / meas_ns) * PCT_SCALE
     return {
         "case_id": cid, "family": family, "split": split,
         "status": "pass" if passed else "fail",
+        "l1_cliff_status": "pass" if cliff_passed else "fail",
         "acquisition_uid": acquisition_uid, "boundary": boundary, "geometry_key": geometry_key,
         "meas_us": float(meas_p50), "meas_p99_us": float(meas_p99),
         "pred_us": float(pred_us), "lstar_us": float(lstar_us),

@@ -158,6 +158,12 @@ def test_zero_drop_multiset_reconciliation_g4_warm_ragged_dcp_and_strict_lstar(s
 
     overall = sealed_bundle["overall_counts"]
     assert overall["total"] == overall["pass"] + overall["fail"] + overall["blocked"] == EXPECTED_SEALED_TOTAL
+    assert overall["l1_cliff_pass"] + overall["l1_cliff_fail"] == overall["pass"] + overall["fail"]
+    assert overall["l1_cliff_pass"] >= overall["pass"]
+    cq = sealed_bundle["capture_quality_summary"]
+    assert cq["clean_scored"] + cq["flagged_rows"] == overall["pass"] + overall["fail"]
+    t2 = sealed_bundle["acceptance_policy"]["l1_two_tier_policy"]
+    assert (t2["median_ape_max_pct"], t2["p90_ape_max_pct"], t2["cliff_relative_tolerance"], t2["cliff_absolute_floor_ns"]) == (8.0, 12.0, 0.15, 3000.0)
     assert overall["worker_diagnostics"] == EXPECTED_WORKER_DIAGS
     assert overall["inv_sim"] == 0 and overall["inv_obs"] == 0
 
@@ -240,6 +246,8 @@ def test_closed_off_grid_cliff_heldout_and_live_replay_parity(sealed_bundle: dic
             stats = summary[split][family]
             assert stats["med_ape_pct"] < 10.0, f"{sku} {split}/{family} med={stats['med_ape_pct']}%"
             assert stats["inv_sim"] == 0 and stats["inv_obs"] == 0
+            assert "p90_ape_pct" in stats and isinstance(stats["l1_two_tier_gate_pass"], bool)
+            assert stats["l1_cliff_pass"] + stats["l1_cliff_fail"] == stats["count"]
 
     def _case_row(sku: str, case_id: str) -> dict:
         return next(r for r in sealed_bundle["skus"][sku]["cases"] if r["case_id"] == case_id)
@@ -282,6 +290,17 @@ def test_closed_off_grid_cliff_heldout_and_live_replay_parity(sealed_bundle: dic
         _run_one("Ascend950DT_9582", op_a5_c8, RecipeBook(recipes={op_a5_c8.recipe: PlannedRecipe(attention.build)})),
         _case_row("Ascend950DT_9582", "c8_sfa_decode_heldout_L400000")["pred_us"], rel_tol=1e-5, abs_tol=1e-3,
     )
+    # Producer gdn_recurrent evaluator wiring returns positive non-inverting predictions on Arch22 & Arch35.
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("_fleet_producer", PRODUCER_PATH)
+    assert spec and spec.loader
+    pmod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(pmod)
+    for gdn_sku in ("Ascend910_9362", "Ascend950DT_9582"):
+        harness = pmod._SkuReplayHarness(gdn_sku, observed_clock_mhz=EXPECTED_CLOCKS_MHZ[gdn_sku])
+        pred_gdn, lst_gdn = pmod._eval_single_seq_record(harness, "gdn_recurrent", {"B": 2, "H": 16}, harness.pt.cann_version)
+        assert pred_gdn is not None and math.isfinite(pred_gdn) and pred_gdn > 0.0
+        assert math.isfinite(lst_gdn) and 0.0 < lst_gdn <= pred_gdn * (1.0 + LSTAR_INV_EPS)
 
 
 def test_whitebox_operator_physics_conservation_regressions_13_to_21() -> None:

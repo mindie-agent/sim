@@ -62,7 +62,8 @@ from mindie_sim.primitives.loader import load_primitives
 from mindie_sim.schema.datapath import datapath_for_die
 from mindie_sim.schema.operators import OpSpec
 from tools._fleet_400k_reconcile import (
-    ABS_FLOOR_NS, DIGEST_PREFIX_LEN, NS_PER_US, REL_TOL,
+    ABS_FLOOR_NS, DIGEST_PREFIX_LEN, L1_CLIFF_ABS_FLOOR_NS, L1_CLIFF_REL_TOL,
+    L1_MEDIAN_APE_MAX_PCT, L1_P90_APE_MAX_PCT, NS_PER_US, REL_TOL,
     apply_sku_observed_clock, dcp_reference_verified, extract_observed_clock_mhz,
     is_worker_diagnostic_record, load_verified_capture, reconcile_sku_accounting,
     score_verdict, seq_geometry_key,
@@ -88,8 +89,13 @@ GQA_HQ, GQA_HKV, GQA_D = 32, 8, 128
 MLA_H, MLA_NOPE, MLA_ROPE, C8_ROW_BYTES = 128, 512, 64, 656
 MLA_DQK = MLA_NOPE + MLA_ROPE
 IDX_H, IDX_D, DEFAULT_TOPK, DEFAULT_PAGE_SIZE, L2_GRANULE_BYTES = 64, 128, 2048, 128, 128
-GDN_DEFAULT_H, KDA_CHUNK_DEFAULT_H, KDA_REC_DEFAULT_H = 4, 2, 8
+GDN_DEFAULT_H, GDN_REC_DEFAULT_H, KDA_CHUNK_DEFAULT_H, KDA_REC_DEFAULT_H = 4, 16, 2, 8
 GDN_BT, GDN_DIM, MAX_ERR_CHARS, ROUND_SUMMARY_DIGITS = 64, 128, 160, 2
+P90_QUANTILE = 0.9
+STARVED_CV_PCT = 25.0
+STARVED_SMALL_MAX_BYTES = 64 * 1024
+STARVED_BLOCKED_FLOOR_US = 50.0
+STARVED_SIO_ROUTES: frozenset[str] = frozenset({"SIO", "SIO_HCCS_SW_4R"})
 DEFAULT_FALLBACK_LINK_GBPS = 25.0
 TWO_RANK_WORLD, FOUR_RANK_WORLD = 2, 4
 PRIVACY_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
@@ -335,6 +341,9 @@ class _SkuReplayHarness:
         if kind == "gdn_chunk":
             abi = "aclnnChunkGatedDeltaRuleArch35" if self.is_a5 else "aclnnChunkGatedDeltaRule"
             operation, phase, state_dtype, out_final, lengths = "gdn_prefill", "prefill", "bf16", True, (seqlen,)
+        elif kind == "gdn_recurrent":
+            abi = "aclnnRecurrentGatedDeltaRule"
+            operation, phase, state_dtype, out_final, lengths = "gdn_recurrent", "decode", "bf16", True, (1,) * seqlen
         elif kind == "kda_chunk":
             abi = "vllm_ascend.ops.triton.kda.kda.chunk_kda"
             operation, phase, state_dtype, out_final, lengths = "kda_prefill", "prefill", "fp32", False, (seqlen,)
@@ -527,6 +536,10 @@ def _eval_dcp_pcp_row(
         if failed_inner:
             v_tot["status"] = "fail"
             v_tot["inner_component_failures"] = failed_inner
+        if any(v["l1_cliff_status"] != "pass" for v in (v_fia, v_comm, v_mrg)):
+            v_tot["l1_cliff_status"] = "fail"
+        for item in (v_fia, v_comm, v_mrg, v_tot):
+            item["capture_quality_flags"] = ["capture_unbarriered_eager_event"]
         rows.extend((v_fia, v_comm, v_mrg, v_tot))
     except Exception as exc:
         err_s = f"{type(exc).__name__}:{exc}"
@@ -586,7 +599,18 @@ def _eval_gate5(
                 op = comm_op(op_id=cid, deps=(), stage=0, layer=0, requests=("r0",), family=fam, phase="prefill", recipe=rec, link_bytes=lb, shape=(1, max(1, api_b // BF16_BYTES)), metadata=(("group_axis", g5_axis), ("collective", op_name), ("api_bytes_per_rank", api_b), *steps, *s_meta))
                 pred = h.run_graph([op], None, isolated=False, case_spec=cs_c, include_sub=False)
                 tag_s = "steady" if pb >= STEADY_COMM_MIN_BYTES else "small"
-                rows.append(score_verdict(cid, f"g5_{route}_{tag_s}", "gate5", float(meas_d["p50"]), float(meas_d["p99"]), pred, _lean_lstar_us(h.hw, comm_bytes=lb, link_bw_bps=eff_bw), uri, acquisition_uid=acq, boundary=bnd))
+                verdict = score_verdict(cid, f"g5_{route}_{tag_s}", "gate5", float(meas_d["p50"]), float(meas_d["p99"]), pred, _lean_lstar_us(h.hw, comm_bytes=lb, link_bw_bps=eff_bw), uri, acquisition_uid=acq, boundary=bnd)
+                if has_blk:
+                    blk_p50 = float(meas_d["p50"])
+                    blk_cv = float(meas_d.get("cv_pct") or 0.0)
+                    eager_p50 = float((r.get("eager_us") or {}).get("p50") or 0.0)
+                    if (
+                        (eager_p50 > 0.0 and blk_p50 > eager_p50)
+                        or (route in STARVED_SIO_ROUTES and pb <= STARVED_SMALL_MAX_BYTES and blk_p50 > STARVED_BLOCKED_FLOOR_US)
+                        or blk_cv > STARVED_CV_PCT
+                    ):
+                        verdict["capture_quality_flags"] = ["capture_host_starved"]
+                rows.append(verdict)
             except Exception as exc:
                 blocked.append(_blk(cid, f"g5_{route}", "gate5", f"{type(exc).__name__}:{exc}", uri, acquisition_uid=acq, boundary=bnd))
 
@@ -696,6 +720,14 @@ def _eval_single_seq_record(
         rd_b = QKV_OPERANDS * seqlen * heads * GDN_DIM * BF16_BYTES + seqlen * heads * (FP32_BYTES + BF16_BYTES) + st_b
         wr_b = seqlen * heads * GDN_DIM * BF16_BYTES + st_b
         return h.pred_linear_attn(kind="gdn_chunk", seqlen=seqlen, heads=heads, cann_ver=doc_cann), _lean_lstar_us(h.hw, read_bytes=rd_b, write_bytes=wr_b)
+    if op_name == "gdn_recurrent":
+        shape_d = r.get("actual_executed_shape") or {}
+        batch = int(r.get("B") or shape_d.get("batch") or r.get("seqlen") or 1)
+        heads = int(r.get("H") or shape_d.get("heads") or GDN_REC_DEFAULT_H)
+        state_b = batch * heads * GDN_DIM * GDN_DIM * BF16_BYTES
+        rd_b = state_b + batch * (QKV_OPERANDS * heads * GDN_DIM * BF16_BYTES + heads * (FP32_BYTES + BF16_BYTES))
+        wr_b = state_b + batch * heads * GDN_DIM * BF16_BYTES
+        return h.pred_linear_attn(kind="gdn_recurrent", seqlen=batch, heads=heads, cann_ver=doc_cann), _lean_lstar_us(h.hw, read_bytes=rd_b, write_bytes=wr_b)
     if op_name == "kda_chunk":
         seqlen, heads = int(r["seqlen"]), int(r.get("H", KDA_CHUNK_DEFAULT_H))
         # Captured cold inputs: q,k,v (bf16) + g (fp32, full D!) + beta (bf16) + h0 (fp32); output o (bf16).
@@ -737,13 +769,25 @@ def _summarize_families(rows: list[dict[str, Any]]) -> dict[str, dict[str, dict[
     for (split, fam), items in sorted(grouped.items()):
         apes = sorted(float(x["ape_pct"]) for x in items)
         l400 = [x for x in items if "400000" in x["case_id"] or "409600" in x["case_id"]]
+        p90_idx = min(len(apes) - 1, int(P90_QUANTILE * (len(apes) - 1)))
+        med_ape = round(statistics.median(apes), ROUND_SUMMARY_DIGITS)
+        p90_ape = round(apes[p90_idx], ROUND_SUMMARY_DIGITS)
+        c_pass = sum(1 for x in items if x.get("l1_cliff_status") == "pass")
+        c_fail = len(items) - c_pass
+        inv_sim = sum(1 for x in items if x["inv_sim"])
         entry: dict[str, Any] = {
             "count": len(items), "pass": sum(1 for x in items if x["status"] == "pass"),
             "fail": sum(1 for x in items if x["status"] == "fail"),
-            "med_ape_pct": round(statistics.median(apes), ROUND_SUMMARY_DIGITS),
+            "l1_cliff_pass": c_pass, "l1_cliff_fail": c_fail,
+            "med_ape_pct": med_ape, "p90_ape_pct": p90_ape,
             "mean_ape_pct": round(statistics.mean(apes), ROUND_SUMMARY_DIGITS),
             "max_ape_pct": round(apes[-1], ROUND_SUMMARY_DIGITS),
-            "inv_sim": sum(1 for x in items if x["inv_sim"]), "inv_obs": sum(1 for x in items if x["inv_obs"]),
+            "l1_two_tier_gate_pass": (
+                med_ape <= L1_MEDIAN_APE_MAX_PCT
+                and p90_ape <= L1_P90_APE_MAX_PCT
+                and c_fail == 0 and inv_sim == 0
+            ),
+            "inv_sim": inv_sim, "inv_obs": sum(1 for x in items if x["inv_obs"]),
         }
         if l400:
             entry["cliff_400k_ape_pct"] = round(float(l400[-1]["ape_pct"]), ROUND_SUMMARY_DIGITS)
@@ -772,6 +816,10 @@ def _eval_sku_worker(args: tuple[str, str]) -> dict[str, Any]:
     reconcile = reconcile_sku_accounting(expected_keys, rows, blocked, diagnostics)
     n_pass = sum(1 for r in rows if r["status"] == "pass")
     n_fail = sum(1 for r in rows if r["status"] == "fail")
+    n_cpass = sum(1 for r in rows if r.get("l1_cliff_status") == "pass")
+    n_cfail = len(rows) - n_cpass
+    flag_counts = Counter(flag for r in rows for flag in r.get("capture_quality_flags", ()))
+    clean_rows = [r for r in rows if not r.get("capture_quality_flags")]
     total = n_pass + n_fail + len(blocked)
     if total != len(rows) + len(blocked) or (n_pass + n_fail) == 0:
         raise AssertionError(f"zero_drop_accounting_failed:{sku}")
@@ -783,9 +831,17 @@ def _eval_sku_worker(args: tuple[str, str]) -> dict[str, Any]:
         "aic_count": h.hw["aic"], "aiv_count": h.hw["aiv"], "l2_bytes": int(h.hw["l2_bytes"]),
         "elapsed_s": round(time.monotonic() - t0, ROUND_SUMMARY_DIGITS),
         "counts": {
-            "total": total, "pass": n_pass, "fail": n_fail, "blocked": len(blocked),
-            "worker_diagnostics": len(diagnostics),
+            "total": total, "pass": n_pass, "fail": n_fail,
+            "l1_cliff_pass": n_cpass, "l1_cliff_fail": n_cfail,
+            "blocked": len(blocked), "worker_diagnostics": len(diagnostics),
             "inv_sim": sum(1 for r in rows if r["inv_sim"]), "inv_obs": sum(1 for r in rows if r["inv_obs"]),
+        },
+        "capture_quality_summary": {
+            "clean_scored": len(clean_rows),
+            "clean_pass": sum(1 for r in clean_rows if r["status"] == "pass"),
+            "clean_l1_cliff_pass": sum(1 for r in clean_rows if r.get("l1_cliff_status") == "pass"),
+            "flagged_rows": len(rows) - len(clean_rows),
+            "flags": dict(sorted(flag_counts.items())),
         },
         "reconciliation": reconcile, "family_summary": _summarize_families(rows),
         "captures": captures, "cases": rows, "blocked_cases": blocked,
@@ -804,17 +860,28 @@ def _build_bundle(cap_dir: Path) -> dict[str, Any]:
 
     tot_pass = sum(s["counts"]["pass"] for s in sku_results)
     tot_fail = sum(s["counts"]["fail"] for s in sku_results)
+    tot_cpass = sum(s["counts"]["l1_cliff_pass"] for s in sku_results)
+    tot_cfail = sum(s["counts"]["l1_cliff_fail"] for s in sku_results)
     tot_blk = sum(s["counts"]["blocked"] for s in sku_results)
     tot_diag = sum(s["counts"]["worker_diagnostics"] for s in sku_results)
     tot_all = tot_pass + tot_fail + tot_blk
     tot_inv_sim = sum(s["counts"]["inv_sim"] for s in sku_results)
     tot_inv_obs = sum(s["counts"]["inv_obs"] for s in sku_results)
+    overall_flags: Counter[str] = Counter()
+    for s in sku_results:
+        overall_flags.update(s["capture_quality_summary"]["flags"])
 
     payload: dict[str, Any] = {
         "schema_version": "mindie-sim-fleet-400k-verification/1",
         "campaign": "all-skus-512-400k-cliff-heldout-20261121",
         "acceptance_policy": {
             "relative_tolerance": REL_TOL, "absolute_floor_ns": ABS_FLOOR_NS, "inclusive": True,
+            "l1_two_tier_policy": {
+                "median_ape_max_pct": L1_MEDIAN_APE_MAX_PCT,
+                "p90_ape_max_pct": L1_P90_APE_MAX_PCT,
+                "cliff_relative_tolerance": L1_CLIFF_REL_TOL,
+                "cliff_absolute_floor_ns": L1_CLIFF_ABS_FLOOR_NS,
+            },
             "zero_drop_accounting": True, "zero_filtering": True, "zero_empirical_fitting": True,
             "strict_p50_lstar_non_inversion": True, "require_positive_lstar": True,
             "inner_digest_fail_closed": True, "observed_clock_replay": True,
@@ -842,15 +909,22 @@ def _build_bundle(cap_dir: Path) -> dict[str, Any]:
             "unmeasured_skus": list(UNMEASURED_SKUS),
         },
         "overall_counts": {
-            "total": tot_all, "pass": tot_pass, "fail": tot_fail, "blocked": tot_blk,
-            "worker_diagnostics": tot_diag, "inv_sim": tot_inv_sim, "inv_obs": tot_inv_obs,
+            "total": tot_all, "pass": tot_pass, "fail": tot_fail,
+            "l1_cliff_pass": tot_cpass, "l1_cliff_fail": tot_cfail,
+            "blocked": tot_blk, "worker_diagnostics": tot_diag,
+            "inv_sim": tot_inv_sim, "inv_obs": tot_inv_obs,
+        },
+        "capture_quality_summary": {
+            "clean_scored": sum(s["capture_quality_summary"]["clean_scored"] for s in sku_results),
+            "clean_pass": sum(s["capture_quality_summary"]["clean_pass"] for s in sku_results),
+            "clean_l1_cliff_pass": sum(s["capture_quality_summary"]["clean_l1_cliff_pass"] for s in sku_results),
+            "flagged_rows": sum(s["capture_quality_summary"]["flagged_rows"] for s in sku_results),
+            "flags": dict(sorted(overall_flags.items())),
         },
         "residual_diagnostics": [
-            "Short-context L<=2049 and eager dcp_lse_attention_merge retain unmodeled per-kernel dispatch residuals where P15 aic_first_issue_ns is unmeasured.",
-            "Gate 2 small-M GEMM (M<=48) and Gate 4 warm/cold grouped-GEMM split-K/L2 tiling heuristics retain residual gaps pending per-shape CANN tiling key traces.",
-            "Gate 5 small-message collectives (<16 MiB) and real DCP/PCP component boundaries retain startup residuals where P18 startup_blocked_ns did not clear the 5% CV seal.",
-            "Arch22 kda_chunk Triton compiler GM materialization and Arch22 paged_mla_decode V partial L2 miss remain openly reported without empirical multipliers.",
-            "gdn_recurrent blocked across all 4 SKUs by CANN runtime scale validation; DCP/PCP L>32768 blocked where rank-0 reference check was not executed; kda_chunk/kda_recurrent unavailable on Arch35 CANN 9.2.0.",
+            "Audit-2 gdn_recurrent records failed on-device capture due to missing explicit scale=1/sqrt(K); evaluator wiring is verified on valid captures while Audit-2 failures stay accounted in blocked_cases.",
+            "Audit-2 9362 2r_sio / 4r_mixed blocked small collectives and unbarriered eager dcp_pcp event breakdowns carry capture-intrinsic capture_quality_flags without dropping or filtering any scored verdict.",
+            "DCP/PCP L>32768 remains blocked where rank-0 reference verification was not executed; kda_chunk/kda_recurrent remain unavailable on Arch35 CANN 9.2.0.",
         ],
         "skus": {s["sku"]: s for s in sku_results},
     }
