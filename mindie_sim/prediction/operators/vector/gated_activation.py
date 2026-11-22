@@ -6,8 +6,11 @@
 [Timeouts & Locks] Pure constant-time operator construction; no I/O or locks.
 [Side-Effect Policy] Returns operator metadata and appends requested groups.
 """
+from __future__ import annotations
+
 import math
 from dataclasses import replace
+from typing import Any
 
 from mindie_sim.catalog.ops import vector_op
 from mindie_sim.schema.common import ModelingError, dtype_bytes
@@ -66,7 +69,12 @@ def _clamped_activation_ops(alpha: float, beta: float) -> int:
 def gated_activation(*, plan, op_id, deps, rows, width, dtype, stage, requests,
                      phase, recipe):
     activation = plan.ffn_activation
-    metadata = (("activation_kind", activation),)
+    # Ascend AIV upcasts BF16/FP16 gated activations to FP32 (4B/elem) in UB.
+    metadata = (
+        ("activation_kind", activation),
+        ("activation_compute_dtype", "fp32"),
+        ("ub_working_bytes_per_elem", _FP32_BYTES),
+    )
     if activation == "swigluoai" or (activation == "silu" and plan.swiglu_limit > 0):
         # Clamped gate: min(gate, limit), clamp(up, -limit, limit) and the
         # sigmoid gate.  Plain SiLU keeps alpha=1/beta=0; only ``swigluoai``
@@ -88,6 +96,12 @@ def gated_activation(*, plan, op_id, deps, rows, width, dtype, stage, requests,
             ("activation_limit", limit),
             ("activation_alpha", alpha),
             ("activation_beta", beta),
+            ("activation_params", {
+                "activation": activation,
+                "limit": limit,
+                "alpha": alpha,
+                "beta": beta,
+            }),
             ("activation_expression",
              "min(gate,limit)*sigmoid(alpha*min(gate,limit))"
              "*(clamp(up,-limit,limit)+beta)"),
@@ -96,10 +110,12 @@ def gated_activation(*, plan, op_id, deps, rows, width, dtype, stage, requests,
         )
     elif activation == "silu":
         family, per_element = "swiglu", _SWIGLU_OPS_PER_ELEMENT
+        metadata += (("activation_params", {"activation": activation}),)
     elif activation in {"gelu", "geglu", "gelu_tanh", "gelu_pytorch_tanh"}:
         # Tanh-approximated GeGLU: cubic + scale + add + tanh + +1 + 0.5*gate
         # + gate*up.
         family, per_element = "geglu", _GEGLU_OPS_PER_ELEMENT
+        metadata += (("activation_params", {"activation": activation}),)
     elif activation == "situ":
         if plan.activation_situ_beta <= 0 or (
                 plan.activation_situ_linear_beta is not None
@@ -110,10 +126,16 @@ def gated_activation(*, plan, op_id, deps, rows, width, dtype, stage, requests,
         # the optional up-branch soft clip adds divide, tanh and multiply.
         per_element = _SITU_OPS_PER_ELEMENT + (
             _SITU_UP_CLIP_OPS_PER_ELEMENT if plan.activation_situ_linear_beta is not None else 0)
+        act_params: dict[str, Any] = {
+            "activation": "situ",
+            "beta": float(plan.activation_situ_beta),
+        }
+        if plan.activation_situ_linear_beta is not None:
+            act_params["linear_beta"] = float(plan.activation_situ_linear_beta)
         metadata += (
             ("activation_beta", plan.activation_situ_beta),
             ("activation_linear_beta", plan.activation_situ_linear_beta),
-            ("activation_compute_dtype", "fp32"),
+            ("activation_params", act_params),
             ("activation_expression", "beta*tanh(gate/beta)*sigmoid(gate)*clipped_up"),
             ("vector_count_basis", "scalar_expression_ops; transcendental_counted_once"),
             ("native_source", SITU_SOURCE),
@@ -151,11 +173,19 @@ def situ_eager_chain(*, plan, op_id, deps, rows, width, dtype, stage, requests, 
     fp32_pair = _SITU_EAGER_PAIR_TENSORS * fp32_half
     act_half = count * act_bytes
     act_pair = _SITU_EAGER_PAIR_TENSORS * act_half
+    act_params: dict[str, Any] = {
+        "activation": "situ",
+        "beta": float(plan.activation_situ_beta),
+    }
+    if plan.activation_situ_linear_beta is not None:
+        act_params["linear_beta"] = float(plan.activation_situ_linear_beta)
     base_meta = (
         ("activation_kind", "situ"),
         ("activation_beta", plan.activation_situ_beta),
         ("activation_linear_beta", plan.activation_situ_linear_beta),
+        ("activation_params", act_params),
         ("activation_compute_dtype", "fp32"),
+        ("ub_working_bytes_per_elem", _FP32_BYTES),
         ("native_source", SITU_SOURCE),
     )
 

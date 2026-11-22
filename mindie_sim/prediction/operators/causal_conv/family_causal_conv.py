@@ -30,6 +30,7 @@ from .family_causal_conv_state import (
 )
 from mindie_sim.prediction.operators.linear_attention._gdn_decode_programs import (
     CONV, CONV_SOURCE, CONV_SPECULATIVE_WIDTH, CONV_SUPPORTED_WIDTHS, conv_plan,
+    conv_spec_terms,
 )
 from mindie_sim.prediction.mechanism import OperatorPlan, PlannedRecipe
 from mindie_sim.prediction.operators.kda.kda_state_selection import (
@@ -478,6 +479,20 @@ def _validate_update_window(model, plan, *, views, q_lens, active, history_slots
     return history_acceptance, speculative
 
 
+def _resolve_conv_targets(views, padding_slots, layer_target, state_targets):
+    padded = set(padding_slots)
+    if state_targets is None:
+        return tuple(
+            None if index in padded
+            else f"{layer_target}.conv_state[{getattr(views[index], 'request_id', index)}]"
+            for index in range(len(views))
+        )
+    resolved = tuple(state_targets)
+    if len(resolved) != len(views):
+        raise ModelingError("causal_conv_update_targets_must_match_views")
+    return tuple(None if index in padded else resolved[index] for index in range(len(views)))
+
+
 def lower(b, tensors, *, plan, views, tokens, sources, key_width, value_width,
           history_acceptance=None, state_ready=(), state_values=None,
           state_slots=None, state_grants=(), state_reader_holds=None,
@@ -511,19 +526,7 @@ def lower(b, tensors, *, plan, views, tokens, sources, key_width, value_width,
     contexts = tuple(int(getattr(view, "context", 0)) for view in views)
     layer_target = (f"kda.layer[{plan.index}]" if plan.index >= 0
                     else "kda.call")
-    if state_targets is None:
-        targets_by_view = tuple(
-            None if index in set(padding_slots)
-            else f"{layer_target}.conv_state["
-                 f"{getattr(views[index], 'request_id', index)}]"
-            for index in range(len(views)))
-    else:
-        state_targets = tuple(state_targets)
-        if len(state_targets) != len(views):
-            raise ModelingError("causal_conv_update_targets_must_match_views")
-        targets_by_view = tuple(
-            None if index in set(padding_slots) else state_targets[index]
-            for index in range(len(views)))
+    targets_by_view = _resolve_conv_targets(views, padding_slots, layer_target, state_targets)
     slots = _per_sequence(state_slots, len(views))
     if all(slot is None for slot in slots):
         slots = tuple(index for index in range(len(views)))
@@ -617,11 +620,15 @@ def lower(b, tensors, *, plan, views, tokens, sources, key_width, value_width,
                           "same_shape_owner_runs_use_existing_fluid_compaction",
                           "speculative_history_requires_declared_state_capacity")),
     )
+    conv_hbm, conv_reads, conv_writes, conv_vec = conv_spec_terms(
+        q_lens, padding_slots, plan.conv_kernel, width, False, speculative,
+    )
     op_id = b.work("short_convolution",
                    (incoming, *state_ready, *rebase_ids), (rows, width),
+                   vector=conv_vec, read=conv_reads, write=conv_writes,
                    family="short_convolution", dtype=dtype, metadata=metadata)
     op = b.ops[-1]
     b.ops[-1] = replace(
-        op, recipe=CONV, source_boundary="kernel",
+        op, hbm_bytes=float(conv_hbm), recipe=CONV, source_boundary="kernel",
         metadata=op.metadata + (("state_accesses", state_accesses(op)),))
     return op_id

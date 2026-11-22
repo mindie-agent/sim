@@ -49,8 +49,10 @@ class RecurrentVector:
         vector = names["vector"]
         operand_read = read_role(names, aiv=0)
         pool = context.pool_names.get(self.state_pool)
-        # State plus the state-dot temporary and vector inputs/delta.
-        storage = 2 * dk * dv * state_byte + (2 * dk + 2 * dv) * REPLAY_OPERAND_BYTES
+        # Ascend AIV upcasts BF16/FP16 state into FP32 (4B/elem) working UB
+        # buffers alongside the state-dot temporary and vector inputs/delta.
+        working_state_byte = max(REPLAY_OPERAND_BYTES, int(state_byte))
+        storage = 2 * dk * dv * working_state_byte + (2 * dk + 2 * dv) * REPLAY_OPERAND_BYTES
 
         def copies(label, amount, role, active, after):
             if role not in names:

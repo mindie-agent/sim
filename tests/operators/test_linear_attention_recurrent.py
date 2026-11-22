@@ -597,3 +597,82 @@ def test_capacity_uses_single_checkpoint_or_full_verify_window(family):
     assert (expanded.mode, expanded.recurrent_bytes, expanded.replay_bytes) == (MODE_CHECKPOINT, 6 * state, 0)
     assert (replay.mode, replay.recurrent_bytes, replay.replay_bytes) == (MODE_REPLAY, state, 6 * record)
     assert expanded.conv_bytes == replay.conv_bytes == (4 + 5) * 64 * 2
+
+
+def test_shard2_verify_lengths_fp32_ub_and_nonzero_compulsory_spec_work():
+    from types import SimpleNamespace
+    from _support.hardware import machine
+    from mindie_sim.compose import compose_case
+    from mindie_sim.export import build_export_bundle
+    from mindie_sim.export.bundle import compose_export_case
+    from mindie_sim.prediction.mechanism import Geometry
+    from mindie_sim.prediction.operators.kda import kda_recurrent_membase
+    from mindie_sim.prediction.operators.linear_attention import call_gdn, gdn_chunk32
+    from mindie_sim.prediction.operators.linear_attention.common import (
+        LinearAttentionContract, SYNC_SCRATCH_BYTES, _resolve_recover_ssm_accepted, analyze_state_residency,
+    )
+    from mindie_sim.prediction.operators.vector import gated_activation, ring_update
+    from mindie_sim.prediction.structure import parse_case
+    from mindie_sim.schema.workload import RequestView
+
+    # 1. #408 regression: speculative decode_recurrent_scan honors q_len + draft_proposal_tokens (dur >= L*).
+    raw, req = compose_export_case(
+        "qwen3.8-flash-next", REPRESENTATIVE_SKUS["a5"],
+        tp=1, dp=8, ep=8, prompt_tokens=2048, output_tokens=64,
+        concurrency=16, mtp_proposal_tokens=3, feature_track="unmerged_pr",
+    )
+    bundle = build_export_bundle(raw, request=req, apply_target_envelope=False)
+    scans = [r for r in bundle.operators if r.op_id.endswith(".decode_recurrent_scan")]
+    assert scans and all(r.dur_us + 1e-4 >= r.l_star_lean_us > 0.0 for r in scans)
+    convs = [r for r in bundle.operators if r.recipe == "ascend_causal_conv1d_update"]
+    gates = [r for r in bundle.operators if r.recipe == "ascend_gdn_decode_gating"]
+    assert convs and all((r.hbm_read_bytes + r.hbm_write_bytes) > 0.0 and r.dur_us + 1e-4 >= r.l_star_lean_us for r in convs)
+    assert gates and all((r.hbm_read_bytes + r.hbm_write_bytes) > 0.0 and r.vector_ops > 0.0 for r in gates)
+
+    # 2. FP32 (4B/elem) UB upcast on recurrent state residency & ceiling acceptance rounding.
+    a5_geo = Geometry.from_devices(machine(REPRESENTATIVE_SKUS["a5"]).dies[:1])
+    a3_geo = Geometry.from_devices(machine(REPRESENTATIVE_SKUS["a3"]).dies[:1])
+    rec_c = LinearAttentionContract(
+        "gdn_recurrent", (1,), 16, 16, 16, 128, 128, 64, 128, 128,
+        "bf16", "fp32", "bf16", "bf16", "fp32",
+    )
+    res = analyze_state_residency(rec_c, a5_geo.datapath)
+    expected_fp32_scratch = (2 * 128 + 128 + 1 + 1 + 128) * 4
+    assert res.owner_ub_bytes == 128 * 128 * 4 + expected_fp32_scratch + SYNC_SCRATCH_BYTES
+    # Also fits A3 192 KiB UB under FP32 upcast.
+    assert analyze_state_residency(rec_c, a3_geo.datapath).owner_ub_bytes == res.owner_ub_bytes
+    ctx_acc = SimpleNamespace(requests=(
+        RequestView("r0", 4, 128, True, "decode", draft_proposal_tokens=3, draft_accepted_tokens=2),
+        RequestView("r1", 4, 128, True, "decode", draft_proposal_tokens=3, draft_accepted_tokens=3),
+    ))
+    assert _resolve_recover_ssm_accepted({"committed_tokens": (("r0", 2), ("r1", 3))}, ctx_acc, 4) == 3
+
+    # 3. Non-zero compulsory OpSpec work <= plan.work on gdn_chunk32, call_gdn, kda_membase, ring_update.
+    c32_params = {"lengths": (64, 64), "heads": 8, "key_heads": 4, "dk": 128, "dv": 128, "chunk": 32}
+    for ns in (gdn_chunk32.PREPARE, gdn_chunk32.STATE, gdn_chunk32.OUTPUT):
+        op = ns.make_op(c32_params)
+        plan = ns.build(op, a5_geo)
+        assert op.hbm_bytes > 0 and op.mte2_bytes > 0 and op.mte3_bytes > 0 and op.vector_ops > 0 and op.flops > 0
+        assert op.hbm_bytes <= plan.work.resources["hbm"] + 1e-6
+        assert op.vector_ops <= plan.work.resources["vector"] + 1e-6
+    gating_call = call_gdn.make_call("gating", {"rows": 16, "heads": 16})
+    g_op = gating_call.ops[0]
+    g_plan = gating_call.recipes.recipes[g_op.recipe].build(g_op, a5_geo)
+    assert g_op.hbm_bytes > 0 and g_op.hbm_bytes <= g_plan.work.resources["hbm"]
+    assert g_op.vector_ops > 0 and g_op.vector_ops <= g_plan.work.resources["vector"]
+    kda_m_op = kda_recurrent_membase.make_op({"lengths": (4, 4), "heads": 8, "key_heads": 8, "dk": 128, "dv": 128})
+    kda_m_plan = kda_recurrent_membase.build(kda_m_op, a3_geo)
+    assert kda_m_op.hbm_bytes > 0 and kda_m_op.hbm_bytes <= kda_m_plan.work.resources["hbm"]
+    ru_op = ring_update.make_ring_update_op(32, 8, 128)
+    assert ru_op.mte2_bytes > 0 and ru_op.mte3_bytes > 0 and ru_op.vector_ops > 0
+    assert dict(ru_op.metadata)["ub_working_bytes_per_elem"] == 4
+
+    # 4. Structured activation_params + FP32 UB metadata on gated_activation.
+    k31 = parse_case(compose_case("kimi-k3.1", REPRESENTATIVE_SKUS["a5"], tp=8, ep=8, layers=4))
+    act_op = gated_activation.gated_activation(
+        plan=k31.model.layer_plans[0], op_id="s0.l0.act", deps=("s0.l0.up",),
+        rows=8, width=128, dtype="bf16", stage=0, requests=("r0",), phase="decode", recipe="swiglu",
+    )
+    ameta = dict(act_op.metadata)
+    assert ameta["activation_compute_dtype"] == "fp32" and ameta["ub_working_bytes_per_elem"] == 4
+    assert ameta["activation_params"] == {"activation": "situ", "beta": 4.0, "linear_beta": 25.0}

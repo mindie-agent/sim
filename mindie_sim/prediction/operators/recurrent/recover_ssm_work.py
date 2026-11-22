@@ -146,6 +146,37 @@ def rewrite_gdn_analytical_scan(scan: Any, *, active_views: Sequence[Any], heads
                    metadata=tuple(meta.items()))
 
 
+def _is_gdn_record(op: Any) -> bool:
+    return str(dict(op.metadata).get("recurrent_attention_kind", "")) == "gdn" or (
+        "gdn" in str(op.recipe))
+
+
+def stamp_gdn_kernel_spec(scan: Any, *, compact_records: bool) -> Any:
+    """Declare the source kernel's exact closed-form work on the lowered ``OpSpec``.
+
+    The analytical decode scan declares ``7 * Dk * Dv`` vector work and one
+    full FP32 checkpoint per token. Once the arch35 kernel (and optionally the
+    RecoverSSM compact-record variant) is selected, the executed program issues
+    ``kernel_work_terms``; the spec must carry the same work so ``L*`` derived
+    from it never exceeds the executed duration.
+    """
+    from mindie_sim.prediction.operators.linear_attention import gdn_recurrent
+
+    meta = dict(scan.metadata)
+    lengths = tuple(int(q) for q in meta["sequence_tokens"])
+    if not any(lengths):
+        return scan
+    heads, dk, dv = (int(meta[k]) for k in ("heads", "dk", "dv"))
+    record = None
+    if compact_records:
+        record = gdn_record_head_bytes(dk, dv) if _is_gdn_record(scan) else record_head_bytes(dk, dv, scan.dtype)
+    reads, scalar, writes, vector = gdn_recurrent.kernel_work_terms(
+        lengths, heads, dk, dv, input_bytes=int(dtype_bytes(scan.dtype)),
+        state_bytes=int(dtype_bytes(meta["state_dtype"])), record_head=record)
+    return replace(scan, hbm_bytes=float(reads + scalar + writes), mte2_bytes=float(reads),
+                   mte3_bytes=float(writes), vector_ops=float(vector))
+
+
 def build_gdn_arch35_recover_ssm(
     op: Any, geometry: Any, *, compact: bool = True, ctx: OperatorPlanningContext | None = None,
 ) -> OperatorPlan:
@@ -169,23 +200,17 @@ def build_gdn_arch35_recover_ssm(
     run_counts = tuple(sum(1 for _ in gdn_recurrent.head_runs(lengths, segs, compact=compact))
                        for segs in ownership)
     read = read_role(geometry.resource_units, aiv=0)
-    total = sum(lengths) * heads
     input_bytes = int(dtype_bytes(op.dtype))
     state_bytes = int(dtype_bytes(meta["state_dtype"]))
-    tensor_reads = active_heads * dk * dv * state_bytes + total * (2 * dk + dv) * input_bytes
-    scalar_payload = total * (state_bytes + input_bytes * parts)
-    gdn = str(dict(op.metadata).get("recurrent_attention_kind", "")) == "gdn" or (
-        "gdn" in str(op.recipe))
+    gdn = _is_gdn_record(op)
     rec_head = (gdn_record_head_bytes(dk, dv) if gdn
                 else record_head_bytes(dk, dv, op.dtype))
     slice_bytes = (
         (lambda n, part: gdn_record_slice_bytes(dk, n, part)) if gdn else
         (lambda n, part: record_slice_bytes(dk, n, part, op.dtype)))
-    writes = sum(
-        q * heads * ((rec_head if q > 1 else dk * dv * state_bytes) + dv * input_bytes)
-        for q in lengths
-    )
-    vector = active_heads * ak * dv + total * gdn_recurrent.token_vector_ops(ak, av, dv)
+    tensor_reads, scalar_payload, writes, vector = gdn_recurrent.kernel_work_terms(
+        lengths, heads, dk, dv, input_bytes=input_bytes, state_bytes=state_bytes,
+        record_head=rec_head)
     work = Work(resources={"hbm": tensor_reads + scalar_payload + writes,
                            read: tensor_reads, "mte3": writes, "vector": vector})
 

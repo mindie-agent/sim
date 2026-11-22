@@ -11,7 +11,7 @@
 from dataclasses import asdict
 from functools import lru_cache
 import math
-from types import MappingProxyType
+from types import MappingProxyType, SimpleNamespace
 
 from mindie_sim.prediction.mechanism import OperatorPlan, Work
 from .mc2_instructions import phase_events, SOURCE_RANGES
@@ -20,6 +20,8 @@ from .mc2_fullmesh import dispatch_layout, combine_layout, dispatch_plan, combin
 
 RECIPE = "arch35_fullmesh_resource_phase"
 _PHASE_TEMPLATE_CACHE_ENTRIES = 128
+#: The native plan frames rows over at least two AIV owners (``max(2, units)``).
+MIN_PROTOCOL_AIV_OWNERS = 2
 
 
 class _FrozenDict(dict):
@@ -71,6 +73,22 @@ def build(op, geometry):
                      tuple(sorted(geometry.resource_units.items())))
 
 
+def declared_floor_work(raw):
+    """Owner-count floor of one native dispatch/combine call for its ``OpSpec``.
+
+    Per-owner flag, frame and count descriptors only grow with the AIV owner
+    count, so the protocol's minimum owner set yields the compulsory payload,
+    vector and link work the executed program can never undercut.
+    """
+    floor = SimpleNamespace(resource_units={"vector": MIN_PROTOCOL_AIV_OWNERS},
+                            compute_units=MIN_PROTOCOL_AIV_OWNERS)
+    resources = dict(_native_plan(raw, floor).work.resources)
+    reads = sum(float(resources.get(role, 0.0)) for role in ("mte2", "mte2_aiv", "mte2_aic"))
+    declared = {"hbm": resources.get("hbm", 0.0), "mte2": reads, "mte3": resources.get("mte3", 0.0),
+                "vector": resources.get("vector", 0.0), "link": resources.get("link", 0.0)}
+    return Work(resources={role: float(amount) for role, amount in declared.items() if amount})
+
+
 def _native_plan(raw, geometry):
     """One real native call over the existing phase contract.
 
@@ -78,7 +96,7 @@ def _native_plan(raw, geometry):
     second time as separate Work operators.  The common Execution launches the
     returned peer program on its own Engine.
     """
-    units = max(2, int(geometry.resource_units.get(
+    units = max(MIN_PROTOCOL_AIV_OWNERS, int(geometry.resource_units.get(
         "vector", geometry.compute_units)))
     plan = contract(raw, units)
     resources = {}

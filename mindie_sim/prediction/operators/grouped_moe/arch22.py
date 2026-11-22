@@ -18,7 +18,8 @@ from ...mechanism import OperatorPlan, Work
 from ..contracts import ArchStrategy, OperatorPlanningContext
 from .common import (
     FUSED_MC2_SHARED_MODE, GEMM_MODES, INT32_HANDOFF_BYTES_PER_ELEM, MX_DTYPES,
-    ROUTED_MODES, activation_stages, capability_gap,
+    ROUTED_MODES, SHIPPING_MEGAMOE_ACTIVATIONS, SHIPPING_SWIGLU_QUANT_ACTIVATIONS,
+    activation_stages, capability_gap,
     PER_TOKEN_SCALE_BYTES, StageDemand, contract_fields, element_bytes, make_plan, matrix_schedule,
     matrix_stages, validate_contract,
 )
@@ -110,8 +111,12 @@ def _validate(op, ctx, contract):
         contract.dtype_a, contract.layout_a, contract.dtype_b, contract.layout_b
     ) != ("int8", "ND", "int8", "NZ"):
         raise capability_gap(op, ctx, "xllm_requires_int8_nd_by_int8_nz")
+    fields = contract_fields(op)
+    allow_abi_ext = bool(fields.get("abi_variant_extension", False))
     if contract.mode in ROUTED_MODES:
-        if contract.dtype_b == "int32" and _excludes_packed_weight(contract_fields(op), ctx):
+        if not allow_abi_ext and contract.activation not in SHIPPING_MEGAMOE_ACTIVATIONS:
+            raise capability_gap(op, ctx, f"arch22_mega_moe_activation:{contract.activation}")
+        if contract.dtype_b == "int32" and _excludes_packed_weight(fields, ctx):
             raise capability_gap(op, ctx, "arch22_mega_moe_int32_weight")
         if contract.dtype_b == "int32" and contract.dtype_a != "int8":
             raise capability_gap(op, ctx, "arch22_mega_moe_packed_weight_requires_int8")
@@ -121,18 +126,21 @@ def _validate(op, ctx, contract):
             raise capability_gap(op, ctx, "arch22_shared_mc2")
     if contract.mode != "dequant_swiglu_quant" and contract.matrix_weight_dtype not in MATRIX_DTYPES:
         raise capability_gap(op, ctx, f"arch22_weight_dtype:{contract.dtype_b}")
-    if contract.mode == "gmm_swiglu_quant" and (
-        contract.compute_dtype not in {"int8", "w4a8"} or contract.activation_divisor != 2
-    ):
-        raise capability_gap(op, ctx, "arch22_gated_int32_accumulator")
+    if contract.mode == "gmm_swiglu_quant":
+        if not allow_abi_ext and contract.activation not in SHIPPING_SWIGLU_QUANT_ACTIVATIONS:
+            raise capability_gap(op, ctx, f"arch22_swiglu_quant_activation:{contract.activation}")
+        if contract.compute_dtype not in {"int8", "w4a8"} or contract.activation_divisor != 2:
+            raise capability_gap(op, ctx, "arch22_gated_int32_accumulator")
     if contract.mode in ROUTED_MODES | {"gmm_swiglu_quant"}:
-        fields = contract_fields(op)
         if fields.get("mask_routing") or fields.get("mask_blocked_output"):
             raise capability_gap(op, ctx, "arch22_mask_routing")
         if fields.get("l0c_to_ub") or fields.get("handoff_path") == "l0c->ub" or ctx.datapath.has_l0c_to_ub:
             raise capability_gap(op, ctx, "arch22_requires_gm_handoff")
-    if contract.mode == "dequant_swiglu_quant" and contract.handoff_dtype not in AIV_INPUT_DTYPES:
-        raise capability_gap(op, ctx, f"arch22_dequant_input:{contract.handoff_dtype}")
+    if contract.mode == "dequant_swiglu_quant":
+        if not allow_abi_ext and contract.activation not in SHIPPING_SWIGLU_QUANT_ACTIVATIONS:
+            raise capability_gap(op, ctx, f"arch22_dequant_swiglu_activation:{contract.activation}")
+        if contract.handoff_dtype not in AIV_INPUT_DTYPES:
+            raise capability_gap(op, ctx, f"arch22_dequant_input:{contract.handoff_dtype}")
 
 
 def _gated_stages(contract, ctx, name, after, metadata):

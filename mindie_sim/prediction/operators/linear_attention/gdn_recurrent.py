@@ -27,7 +27,7 @@ from ...mechanism import OperatorPlan, Work
 from ...ownership import read_role, unit_group
 from ...program import KernelProgram, ParallelProgram, PipelineProgram, Stage
 from ..contracts import OperatorPlanningContext
-from .common import owner_units, request_layout_metadata, request_lengths
+from .common import executed_request_lengths, owner_units, request_layout_metadata
 
 IMPLEMENTATION = "ascend_recurrent_gdn_fp32_state"
 STATE_CONTRACT_KEY = "gdn_state_contract"
@@ -251,9 +251,10 @@ def _state_plan_meta(meta):
 
 
 def recurrent_lengths(op, ctx: OperatorPlanningContext | None) -> tuple[int, ...]:
+    declared = tuple(dict(op.metadata)["sequence_tokens"])
     if ctx is not None and ctx.requests:
-        return request_lengths(ctx.requests)
-    return tuple(dict(op.metadata)["sequence_tokens"])
+        return executed_request_lengths(ctx.requests, declared)
+    return declared
 
 
 def state_value_step(aligned_key: int) -> int:
@@ -269,6 +270,32 @@ def token_vector_ops(aligned_key: int, aligned_value: int, dv: int) -> int:
     value_ops = dot_ops + state_ops + 2 + 1  # Delta and output cast.
     key_ops = (1 + 2 + QK_CAST_SCALE_OPS_PER_LANE) * aligned_key
     return value_ops * dv + key_ops + aligned_value
+
+
+def kernel_work_terms(lengths, heads, dk, dv, *, input_bytes, state_bytes, record_head=None):
+    """Exact ``(tensor_reads, scalar_payload, writes, vector)`` of the source kernel.
+
+    One closed form shared by the physical plan and the lowering's ``OpSpec``
+    so the declared lower-bound work can never exceed the executed program.
+    ``record_head`` replaces a speculative (``q > 1``) row's per-token FP32
+    state checkpoint with its compact RecoverSSM trajectory record.
+    """
+    ak, av = align_up(dk, VECTOR_LANE_ALIGNMENT), align_up(dv, VECTOR_LANE_ALIGNMENT)
+    value_step = state_value_step(ak)
+    if not value_step:
+        raise ValueError("source_recurrent_gdn_state_tile_exceeds_32k_buffer")
+    parts = math.ceil(dv / value_step)
+    active_heads = sum(length > 0 for length in lengths) * heads
+    total = sum(lengths) * heads
+    tensor_reads = active_heads * dk * dv * state_bytes + total * (2 * dk + dv) * input_bytes
+    scalar_payload = total * (state_bytes + input_bytes * parts)
+    full_checkpoint = dk * dv * state_bytes
+    writes = sum(
+        q * heads * ((record_head if record_head is not None and q > 1 else full_checkpoint)
+                     + dv * input_bytes)
+        for q in lengths)
+    vector = active_heads * ak * dv + total * token_vector_ops(ak, av, dv)
+    return tensor_reads, scalar_payload, writes, vector
 
 
 def build(op, geometry, *, compact=True, ctx: OperatorPlanningContext | None = None):
@@ -313,10 +340,8 @@ def build(op, geometry, *, compact=True, ctx: OperatorPlanningContext | None = N
                        for segments in ownership)
     read = read_role(geometry.resource_units, aiv=0)
     total = sum(lengths) * heads
-    tensor_reads = active_heads * dk * dv * state_bytes + total * (2 * dk + dv) * input_bytes
-    scalar_payload = total * (state_bytes + input_bytes * parts)
-    writes = total * (dk * dv * state_bytes + dv * input_bytes)
-    vector = active_heads * ak * dv + total * token_vector_ops(ak, av, dv)
+    tensor_reads, scalar_payload, writes, vector = kernel_work_terms(
+        lengths, heads, dk, dv, input_bytes=input_bytes, state_bytes=state_bytes)
     work = Work(resources={"hbm": tensor_reads + scalar_payload + writes,
                            read: tensor_reads, "mte3": writes, "vector": vector})
 

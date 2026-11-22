@@ -222,9 +222,14 @@ def _gating(params):
         raise ModelingError("gdn_gating_call_requires_contiguous_arguments")
     if params.get("beta", 1.0) != 1.0 or params.get("threshold", GATING_SOFTPLUS_THRESHOLD) != GATING_SOFTPLUS_THRESHOLD:
         raise ModelingError("gdn_gating_call_requires_default_softplus_arguments")
+    floor_reads = float(2 * GATING_FP32_BYTES * (rows * heads + heads))
+    floor_writes = float(2 * GATING_FP32_BYTES * rows * heads)
+    floor_vector = float(rows * heads * GATING_ELEMENT_OPS)
     op = OpSpec(
         "gating", "gdn_gating", params.get("phase", "prefill"), 0, 0, (),
         (rows, heads), (rows, heads), (rows, heads), (rows, heads),
+        vector_ops=floor_vector, hbm_bytes=floor_reads + floor_writes,
+        mte2_bytes=floor_reads, mte3_bytes=floor_writes,
         dtype="fp32", layout="contiguous", recipe=GATING_RECIPE,
         source_boundary="kernel",
         metadata=(("implementation", GATING_RECIPE), ("source", GATING_SOURCE),
@@ -373,7 +378,7 @@ def _conv_prefill(params):
 
 
 
-def _scan_prefill(params):
+def _validate_scan_prefill_params(params):
     lengths, batch, tokens, cu_seqlens = _normalize_partition(params, "scan_prefill")
     heads, keys = _positive(params, "v_heads"), _positive(params, "k_heads")
     dk, dv = _positive(params, "k_dim"), _positive(params, "v_dim")
@@ -386,16 +391,15 @@ def _scan_prefill(params):
             raise ModelingError(f"gdn_scan_prefill_argument_not_selected:{name}")
     if heads % keys or heads // keys not in GDN_CHUNK64_GQA_RATIOS:
         raise ModelingError("gdn_scan_prefill_requires_integral_qk_v_head_grouping")
-    if params.get("input_dtype", "bf16") != "bf16":
-        raise ModelingError("gdn_scan_prefill_requires_bf16_qkv")
-    if params.get("gate_dtype", "fp32") != "fp32":
-        raise ModelingError("gdn_scan_prefill_requires_fp32_gates")
-    if params.get("beta_dtype", "bf16") != "bf16":
-        raise ModelingError("gdn_scan_prefill_requires_bf16_beta_argument")
-    if params.get("state_dtype", "fp32") != "fp32":
-        raise ModelingError("gdn_scan_prefill_requires_fp32_state")
-    if params.get("layout", "BSND") != "BSND":
-        raise ModelingError("gdn_scan_prefill_requires_BSND_inputs")
+    for key, expected, err in (
+        ("input_dtype", "bf16", "gdn_scan_prefill_requires_bf16_qkv"),
+        ("gate_dtype", "fp32", "gdn_scan_prefill_requires_fp32_gates"),
+        ("beta_dtype", "bf16", "gdn_scan_prefill_requires_bf16_beta_argument"),
+        ("state_dtype", "fp32", "gdn_scan_prefill_requires_fp32_state"),
+        ("layout", "BSND", "gdn_scan_prefill_requires_BSND_inputs"),
+    ):
+        if params.get(key, expected) != expected:
+            raise ModelingError(err)
     for name, expected in (("use_exp2", True), ("use_qk_l2norm_in_kernel", True),
                            ("allow_neg_eigval", False), ("disable_recompute", True),
                            ("state_v_first", True), ("output_final_state", True),
@@ -405,6 +409,11 @@ def _scan_prefill(params):
                            ("initial_state", True)):
         if params.get(name, expected) is not expected:
             raise ModelingError(f"gdn_scan_prefill_argument_not_selected:{name}")
+    return lengths, batch, tokens, cu_seqlens, heads, keys, dk, dv, chunk
+
+
+def _scan_prefill(params):
+    lengths, batch, tokens, cu_seqlens, heads, keys, dk, dv, chunk = _validate_scan_prefill_params(params)
     total = tokens
     chunks = sum((length + chunk - 1) // chunk for length in lengths)
     chunk_indices = []

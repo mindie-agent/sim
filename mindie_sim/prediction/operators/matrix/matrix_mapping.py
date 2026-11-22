@@ -35,6 +35,7 @@ from .matrix_mapping_owners import (
     physical_owner_rate,
     physical_owner_units,
     primitive_cold_hbm_bps,
+    primitive_l2_params,
     primitive_nd2nz_mte2_rate_bps_per_aic,
     primitive_p01_scaling_bps,
     streamk_fixup_latency_ms,
@@ -371,14 +372,26 @@ def _arch35_streamk_perf(context, recipe, geometry, *, split_k: int, output_tile
     meta = dict(context.op.metadata)
     width = dtype_bytes(meta.get("compute_format", context.op.dtype or "bf16"))
     total_m, n, _ = geometry.local_shape
+    row_bytes = int(min(recipe.tile_n, n) * width)
+    stride_bytes = int(n * width)
     strided_bps = primitive_cold_hbm_bps(
         context, active_cores=cores,
-        row_bytes=int(min(recipe.tile_n, n) * width),
-        stride_bytes=int(n * width),
+        row_bytes=row_bytes,
+        stride_bytes=stride_bytes,
         total_tiles=max(1, int(output_tiles)), is_grouped=False,
         m_tiles=int(geometry.nm),
     )
-    b_hbm_full = min(hbm_full, strided_bps / MS_PER_SECOND) if strided_bps else hbm_full
+    if strided_bps:
+        b_hbm_full = min(hbm_full, strided_bps / MS_PER_SECOND)
+    elif row_bytes < stride_bytes:
+        # Sub-sector strided weight rows still pull complete L2 cache sectors
+        # from HBM (e.g. 128 B on DAV_3510), so host tiling must price the
+        # same sector efficiency ceiling as calibrated execution.
+        _, sector = primitive_l2_params(context)
+        sector_eff = min(1.0, float(max(1, row_bytes)) / float(max(1, sector)))
+        b_hbm_full = hbm_full * sector_eff
+    else:
+        b_hbm_full = hbm_full
     l2_agg = primitive_p01_scaling_bps(context, cores, warm=True)
     l2_full = (l2_agg / MS_PER_SECOND) if (l2_agg and l2_agg > 0.0) else hbm_full
     epilogue = MatrixEpilogue.from_op(context.op)

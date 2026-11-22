@@ -237,10 +237,21 @@ def make_ring_update_op(
     """Create a governed OpSpec for aclnnRingAttentionUpdateV2."""
     contract = RingUpdateContract(tokens, num_heads, head_dim, dtype=dtype)
     shape = (tokens, num_heads, head_dim)
+    elem_b = BF16_BYTES if contract.dtype in ("bf16", "fp16") else FP32_BYTES
+    total_th = contract.tokens * contract.num_heads
+    total_read = float(total_th * (INPUT_ATTN_TENSORS * contract.head_dim * elem_b + INPUT_STATS_TENSORS * STATS_WIDTH * FP32_BYTES))
+    total_write = float(total_th * (contract.head_dim * elem_b + OUTPUT_STATS_TENSORS * STATS_WIDTH * FP32_BYTES))
+    total_vec = float(total_th * (contract.head_dim * ATTN_ELEM_OPS + STATS_WIDTH * STATS_LANE_OPS))
     return OpSpec(
         op_id=op_id, deps=deps, stage=stage, layer=layer, requests=requests,
         family="attention_merge", phase="prefill", recipe=RING_UPDATE_RECIPE,
         semantic_shape=shape, local_shape=shape, padded_shape=shape, launch_shape=shape,
+        vector_ops=total_vec, mte2_bytes=total_read, mte3_bytes=total_write,
         dtype=dtype, layout="TND", source_boundary="kernel",
-        metadata=(("ring_update_contract", asdict(contract)), ("native_kind", RING_UPDATE_ABI)),
+        metadata=(
+            ("ring_update_contract", asdict(contract)),
+            ("native_kind", RING_UPDATE_ABI),
+            ("ub_compute_dtype", "fp32"),
+            ("ub_working_bytes_per_elem", FP32_BYTES),
+        ),
     )

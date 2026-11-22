@@ -73,6 +73,8 @@ ACTIVATION_OPS = {
     "swiglu": 5, "swigluoai": 8, "situglu": 7, "situ": 7,
     "silu": 4, "gelu": 6, "gelu_tanh": 8, "geglu": 7,
 }
+SHIPPING_MEGAMOE_ACTIVATIONS = frozenset({"swiglu", "silu", "gelu"})
+SHIPPING_SWIGLU_QUANT_ACTIVATIONS = frozenset({"swiglu", "silu"})
 GATED_ACTIVATIONS = frozenset({"swiglu", "swigluoai", "situglu", "situ", "geglu"})
 ABI_MODES = {
     "aclnnGroupedMatmul": GEMM_MODES,
