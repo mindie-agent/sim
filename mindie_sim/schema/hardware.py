@@ -137,6 +137,7 @@ class Device:
                       for name, timing in self.kernel_invocations),
                 self.store_queues,
                 arch.preset,
+                arch.clock_hz,
                 tuple((item.name, item.unit, item.owner_axis, item.per_owner_rate,
                        item.scale_with, item.resource, item.clock_hz,
                        item.cycles_per_unit)

@@ -50,7 +50,6 @@ ONLINE_UPDATE_OPS_PER_VALUE = 3
 ONLINE_UPDATE_STATE_OPS = 9
 OPERAND_MICROTILE_KIB = 32
 PROBABILITY_SLOTS = 3
-REFERENCE_FIA_AIC_COUNT = 32
 SOFTMAX_OPS_PER_SCORE = 7
 STANDARD_FIA_QUERY_TILE = 64
 WIDE_FIA_QUERY_TILE = 32
@@ -154,13 +153,14 @@ class StagedGQAPrefill:
                            read=read, vread=vread, write=write, operand=operand)
 
     def report(self, op: OpSpec, *, resource_roles=None,
-               cores: int = REFERENCE_FIA_AIC_COUNT) -> dict:
+               cores: int) -> dict:
         """Geometry ledger separating logical pairs from executed rectangles.
 
         ``cores`` enables the source S2 ownership/FD ledger.  FD bytes are a
         workspace diagnostic until the split-range execution is bound; they
         are not silently added to the cyclic task work.
         """
+        cores = _positive_int(cores, "cores")
         spec = self.spec(op)
         report = _report(spec)
         if spec.native_fia:
@@ -204,14 +204,14 @@ class StagedGQAPrefill:
                 ) if not present]
         return report
 
-    def owner_plan(self, op: OpSpec, cores: int = REFERENCE_FIA_AIC_COUNT) -> dict:
+    def owner_plan(self, op: OpSpec, cores: int) -> dict:
         """Source S2-tile ownership and FD split count for this geometry."""
-        return owner_s2_plan(self.spec(op), cores)
+        return owner_s2_plan(self.spec(op), _positive_int(cores, "cores"))
 
     def build(self, op: OpSpec, geometry: Geometry | None = None) -> OperatorPlan:
         spec = self.spec(op)
         plan = None
-        cores = REFERENCE_FIA_AIC_COUNT
+        cores = 0
         if geometry is None:
             read, vread, write, operand = "mte2", "mte2", "mte3", "mte1"
             mte1 = False

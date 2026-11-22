@@ -66,7 +66,8 @@ def _phase_op(selection, name):
 def _run_phases(selection, contract, build, rates, units, *, only=None, ub=False, setup=0, floor=0):
     buffer_args = {"buffers": {"ub": 256 * 1024}, "buffer_units": {"ub": 64}} if ub else {}
     geometry = Geometry(32 if ub else 1, units, **buffer_args)
-    phases = [p for p in contract(selection).phases if only is None or p.name == only]
+    plan_contract = contract(selection, units["vector"]) if ub else contract(selection)
+    phases = [p for p in plan_contract.phases if only is None or p.name == only]
     plans = {p.name: build(_phase_op(selection, p.name), geometry) for p in phases}
     names = dict(zip(rates, rates))
     ctx = RecipeContext(None, {}, names, rates, geometry.compute_units, resource_units=units,
@@ -190,7 +191,7 @@ def _gather_selection(size, ranks=4, blocks=64):
     (2,4,2*DATA_LIMIT+6)])
 def test_independent_owner_and_flag_byte_equations(ranks,blocks,size):
     s=_gather_selection(size,ranks,blocks)
-    owner_jobs, _, detail = hccl_aiv_gather.jobs(s)
+    owner_jobs, _, detail = hccl_aiv_gather.jobs(s, available=64)
     assert sum(a.size for actions in owner_jobs['precopy'].values() for a in actions if a.kind=='copy')==size
     assert sum(a.size for actions in owner_jobs['gather'].values() for a in actions if a.kind=='copy')==ranks*size
     if size>=DATA_LIMIT and blocks>=2*ranks:
@@ -207,7 +208,7 @@ def test_independent_owner_and_flag_byte_equations(ranks,blocks,size):
     if not detail['pingpong']:
         records += 2 * ranks
         waits += ranks
-    p=hccl_aiv_gather.contract(s)
+    p=hccl_aiv_gather.contract(s, available=64)
     totals = {k: _work(p, k) for k in ('hbm', 'mte2_aiv', 'mte3')}
     assert totals=={'hbm':2*(ranks+1)*size+(records+waits)*128,
                    'mte2_aiv':(ranks+1)*size+waits*128,

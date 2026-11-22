@@ -250,10 +250,21 @@ def owner_tiles(rows, n, tile, cores):
 SWIGLU_MX_AIV_UNITS = 64
 SWIGLU_MX_GROUP = 32
 SWIGLU_MX_PROLOGUE_DRAIN_CYCLES = 4538
-SWIGLU_MX_NOMINAL_CLOCK_HZ = 1.65e9
 SWIGLU_MS_PER_SECOND = 1000
 SWIGLU_MX_STAGES = ("load_gate_up", "swiglu_amax_ue8m0",
                     "store_payload_scale")
+
+
+def _require_swiglu_clock_hz(context, geometry) -> float:
+    for owner in (
+        getattr(context, "compute_arch", None),
+        getattr(context, "datapath", None),
+        getattr(geometry, "compute_arch", None),
+    ):
+        val = getattr(owner, "clock_hz", None)
+        if val is not None and not isinstance(val, bool) and float(val) > 0.0:
+            return float(val)
+    raise ModelingError("swiglu_mx_clock_hz_missing")
 
 
 def _a5_row_wave(geometry) -> bool:
@@ -284,9 +295,9 @@ def build_swiglu_mx_quant(op, geometry):
     write = float(op.mte3_bytes)
     vector = float(op.vector_ops)
     waves = max(1, -(-rows // SWIGLU_MX_AIV_UNITS))
-    clock_ms = SWIGLU_MX_NOMINAL_CLOCK_HZ / SWIGLU_MS_PER_SECOND
 
     def program(context):
+        clock_ms = _require_swiglu_clock_hz(context, geometry) / SWIGLU_MS_PER_SECOND
         multi_wave = rows >= SWIGLU_MX_AIV_UNITS
         read_role = "mte2"
         if multi_wave and context.service_rate("mte2_aiv_dram") is not None:

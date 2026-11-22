@@ -87,7 +87,7 @@ INT32_BYTES = 4
 def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         padded_tokens, policy=AttentionPolicy(), cp_interleave_size=DEFAULT_CP_INTERLEAVE,
         runtime=None, cache_ids=None, stage_of=None, topk_ids=None,
-        index_cache_ids=None, candidate_ids=None, machine=None,
+        index_cache_ids=None, candidate_ids=None, machine=None, hierarchy=None,
         dcp_cohort_views_by_member=None, dcp_local_pos=0,
         physical_rank=None, explicit_physical_rank=False, **_) -> AttentionResult:
     from mindie_sim.prediction.implementations import add_input_ports, select
@@ -139,7 +139,7 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         and dp_width > 1 and bool(cohort_dec_views)
     )
     requests = tuple(view.request_id for view in (cohort_dec_views if idle_dcp_owner else views))
-    hierarchy = _memory_hierarchy(machine)
+    hierarchy = _memory_hierarchy(machine, hierarchy=hierarchy)
     gate_separate = plan.q_gate_separate
     if idle_dcp_owner:
         ops, store_ids, topk_id, index_store_id, candidate_id = [], (), None, None, None

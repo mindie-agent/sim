@@ -31,7 +31,7 @@ def expand_instruction_presets(device, profile, sku):
     data = deepcopy(device)
     arch = data["compute_arch"]
     services = arch.setdefault("instruction_services", {})
-    clock = arch.pop("clock_hz", None)
+    clock = arch.get("clock_hz")
     if clock is None:
         clock = profile["source"]["declaration"]["configured_clock_mhz"] * 1e6
         clock_source = {"kind": "sku_configuration", "sku": sku,

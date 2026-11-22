@@ -53,9 +53,6 @@ _Q50 = 0.50
 _Q95 = 0.95
 _Q99 = 0.99
 _OPAQUE_ALIAS_HEX = 12
-_DEFAULT_LINK_BPS = 2.5e10
-_DEFAULT_HOST_DMA_BPS = 3.15e10
-_DEFAULT_HOST_RC_BPS = 2.0e11
 _DEFAULT_SECTOR_BYTES = 32
 _DEFAULT_FRACTAL_BYTES = 512
 _DEFAULT_GRANULE_BYTES = 128
@@ -259,20 +256,20 @@ def load_sku_hardware_spec(sku: str) -> dict[str, Any]:
         "vec_sfu_ops_per_s": float(rates.get("reg_special_lanes", rates.get("vector", 0.0))),
         "vec_reduce_ops_per_s": float(rates.get("reg_reduce_lanes", rates.get("vector", 0.0))),
         "cast_bytes_per_s": float(rates.get("ub_write_bytes", rates.get("mte2_aiv", 0.0))),
-        "link_bytes_per_s": link_uni or _DEFAULT_LINK_BPS,
-        "host_h2d_bytes_per_s": h2d_solo or _DEFAULT_HOST_DMA_BPS,
-        "host_d2h_bytes_per_s": d2h_solo or _DEFAULT_HOST_DMA_BPS,
-        "host_rc_h2d_bytes_per_s": h2d_rc or _DEFAULT_HOST_RC_BPS,
-        "host_rc_d2h_bytes_per_s": d2h_rc or _DEFAULT_HOST_RC_BPS,
+        "link_bytes_per_s": link_uni if link_uni > 0.0 else None,
+        "host_h2d_bytes_per_s": h2d_solo if h2d_solo > 0.0 else None,
+        "host_d2h_bytes_per_s": d2h_solo if d2h_solo > 0.0 else None,
+        "host_rc_h2d_bytes_per_s": h2d_rc if h2d_rc > 0.0 else None,
+        "host_rc_d2h_bytes_per_s": d2h_rc if d2h_rc > 0.0 else None,
         "peaks": {str(k): float(v) for k, v in peaks_raw.items()},
     }
 
 
-def _cell_status(metrics: Mapping[str, Mapping[str, Any]]) -> str:
+def _cell_status(metrics: Mapping[str, Mapping[str, Any] | None]) -> str:
     if not metrics:
         return "unmeasured"
     for band in metrics.values():
-        if band.get("p50") is None or band.get("cv_pct") is None:
+        if band is None or band.get("p50") is None or band.get("cv_pct") is None:
             return "unmeasured"
         if float(band["cv_pct"]) > MAX_CALIBRATED_CV_PCT:
             return "unmeasured"
@@ -302,7 +299,9 @@ def canonical_capture_bytes(sku: str, raw_measurements: Mapping[str, Any] | None
     return (json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=True) + "\n").encode("utf-8")
 
 
-def _bound_only(value: float, kind: str = "rate_upper") -> dict[str, Any]:
+def _bound_only(value: float | None, kind: str = "rate_upper") -> dict[str, Any] | None:
+    if value is None:
+        return None
     return {"certified_upper_capacity": round(float(value), _ROUND_STAT_DIGITS), "bound_kind": kind}
 
 
@@ -476,10 +475,13 @@ def build_primitive_table_with_diagnostics(
     coverage_rows: list[dict[str, Any]] = []
 
     def _band(
-        pid: str, metric: str, samples: Sequence[float] | None, bound: float,
+        pid: str, metric: str, samples: Sequence[float] | None, bound: float | None,
         *, kind: str = "rate_upper", allow_meas: bool = True, mode: str = "",
-    ) -> dict[str, Any]:
-        if not allow_meas:
+    ) -> dict[str, Any] | None:
+        if bound is None:
+            reason = "undeclared_hardware_bound"
+            out = None
+        elif not allow_meas:
             reason = "silicon_profile_conflict"
             out = _bound_only(bound, kind)
         elif not samples:
@@ -501,13 +503,18 @@ def build_primitive_table_with_diagnostics(
 
     def _make_cell(
         pid: str, units: dict[str, str], params: dict[str, Any],
-        core_metrics: dict[str, dict[str, Any]], extra_metrics: dict[str, dict[str, Any]] | None = None,
+        core_metrics: dict[str, dict[str, Any] | None],
+        extra_metrics: dict[str, dict[str, Any] | None] | None = None,
         *, status_override: str | None = None, modes: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         st = status_override if status_override is not None else _cell_status(core_metrics)
-        merged = {k: (v if st == "calibrated" else _clean_band(v)) for k, v in core_metrics.items()}
+        merged = {
+            k: (v if st == "calibrated" else _clean_band(v))
+            for k, v in core_metrics.items() if v is not None
+        }
         for k, v in (extra_metrics or {}).items():
-            merged[k] = _clean_band(v)
+            if v is not None:
+                merged[k] = _clean_band(v)
         ev = top_capture if st == "calibrated" else ""
         return {"status": st, "units": units, "parameters": params, "metrics": merged, "modes": modes or {}, "evidence_id": ev}
 

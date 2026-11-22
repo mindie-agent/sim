@@ -523,7 +523,7 @@ def test_prefix_block_transition_caller_scope_and_semantic_rejection():
         assert [point for point in points if mlp.op_id in point.deps] == [consumer]
     with pytest.raises(ModelingError, match="requires_pp1"):
         Frontend().body(selected.model, selected.runtime, (RequestView("r", 5, 0, False, "prefill"),),
-                        ready="input", tokens=5, mode="prefill", stages=(0, 0, 1))
+                        ready="input", tokens=5, mode="prefill", stages=(0, 0, 1), machine=selected.machine)
     for flag in ("engram", "hyper_connections"):
         plans = tuple(replace(layer, **{flag: True}) for layer in selected.model.layer_plans)
         with pytest.raises(ModelingError, match="selected_semantics_unsupported"):

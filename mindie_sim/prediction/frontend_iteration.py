@@ -469,7 +469,7 @@ class _FrontendIteration:
             after, _ = draft_program(
                 self, model, declared_runtime, preparation_views, committed.op_id,
                 global_views=global_preparation if global_views else None, prefill=True,
-                replica=replica, replay_scope=scope)
+                replica=replica, replay_scope=scope, machine=machine)
         # A capture descriptor is distinct from each kernel's active/sliced
         # tensor. Preserve both so native responses cannot alias two buckets
         # merely because their logical attention shapes are equal.

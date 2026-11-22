@@ -49,7 +49,7 @@ ci_scope = _load_script("ci_scope", REPO_ROOT / ".github" / "scripts" / "ci_scop
 MANIFEST = """schema_version = 1
 domains = ["schema", "runtime"]
 support_dirs = ["_support", "_oracles", "fixtures"]
-max_lines = 600
+max_lines = 1500
 
 [[module]]
 path = "schema/test_profiles.py"
@@ -93,13 +93,13 @@ def _body(code: str) -> str:
 
 VIOLATIONS = [
     pytest.param({"tests/schema/test_profiles_issue34.py": CLEAN}, "TO001", id="process-token"),
-    pytest.param({"tests/schema/test_profiles_a5.py": CLEAN}, "TO001", id="sku-token"),
+    pytest.param({"tests/schema/test_profiles_wave2a.py": CLEAN}, "TO001", id="wave-token"),
     pytest.param({"tests/test_profiles.py": CLEAN}, "TO002", id="root-level"),
     pytest.param({"tests/unknown/test_profiles.py": CLEAN}, "TO002", id="unknown-domain"),
     pytest.param({"tests/schema/test_unlisted.py": CLEAN}, "TO003", id="unlisted"),
     pytest.param({}, "TO003", id="listed-missing"),
-    pytest.param({"tests/schema/test_profiles.py": CLEAN + "\n" * 600}, "TO004", id="oversize"),
-    pytest.param({"tests/schema/test_profiles.py": CLEAN, "tests/_oracles/meta.py": "VALUE = 1\n" * 601},
+    pytest.param({"tests/schema/test_profiles.py": CLEAN + "\n" * 1500}, "TO004", id="oversize"),
+    pytest.param({"tests/schema/test_profiles.py": CLEAN, "tests/_oracles/meta.py": "VALUE = 1\n" * 1501},
                  "TO004", id="oversize-oracle"),
     pytest.param({"tests/schema/test_profiles.py": CLEAN.replace("pytestmark = pytest.mark.tier0\n", "")},
                  "TO005", id="no-tier"),
@@ -193,9 +193,9 @@ def test_gate_ratchet_catches_deleted_manifest_module_and_bad_manifests_exit_2(t
                 MANIFEST.replace('owns = ["mindie_sim/schema/hardware.py"]', 'owns = ["/"]'),
                 MANIFEST.replace('owns = ["mindie_sim/schema/hardware.py"]', 'owns = ["../escape.py"]'),
                 MANIFEST.replace('owns = ["mindie_sim/schema/hardware.py"]', 'owns = ["mindie_sim/absent.py"]'),
-                MANIFEST.replace("max_lines = 600", "max_lines = 601"),
-                MANIFEST.replace('tier = "tier0"\nowns', 'tier = "tier0"\nmax_lines = 601\nowns'),
-                MANIFEST.replace("max_lines = 600", 'max_lines = "bad"')):
+                MANIFEST.replace("max_lines = 1500", "max_lines = 1501"),
+                MANIFEST.replace('tier = "tier0"\nowns', 'tier = "tier0"\nmax_lines = 1501\nowns'),
+                MANIFEST.replace("max_lines = 1500", 'max_lines = "bad"')):
         (root / "tests/TAXONOMY.toml").write_text(bad, encoding="utf-8")
         assert gate.main(["--root", str(root), "--strict"]) == 2
 
@@ -242,10 +242,6 @@ def test_to008_inspects_param_marks_citations_raises_and_legacy_root_without_byp
         '@pytest.mark.parametrize("x", [pytest.param(1, marks=pytest.mark.xfail(strict=False, reason="https://x"))])\n'
         'def test_law(x):\n    assert x\n',
         'class _Err(AssertionError):\n    pass\n\n'
-        'MARK = pytest.mark.xfail(strict=True, raises=_Err, reason="mindie_sim/schema/hardware.py:1")\n'
-        '@pytest.mark.parametrize("x", [pytest.param("unapproved_id", marks=MARK)])\n'
-        'def test_law(x):\n    assert x\n',
-        'class _Err(AssertionError):\n    pass\n\n'
         'MARK = pytest.mark.xfail(strict=True, raises=_Err, reason="data.json:1")\n'
         'def test_law():\n    assert MARK\n',
         'MARK = pytest.mark.xfail(strict=True, raises=RuntimeError, reason="mindie_sim/schema/hardware.py:1")\n'
@@ -263,6 +259,26 @@ def test_to008_inspects_param_marks_citations_raises_and_legacy_root_without_byp
     for idx, body in enumerate(bad_cases):
         root = _tree(tmp_path / f"c{idx}", {"tests/schema/test_profiles.py": _body(body), "data.json": "{\n}\n"})
         assert "TO008" in _codes(root), idx
+    good_xfail = (
+        'class _Err(AssertionError):\n    pass\n\n'
+        'MARK = pytest.mark.xfail(strict=True, raises=_Err, reason="mindie_sim/schema/hardware.py:1")\n'
+        '@pytest.mark.parametrize("x", [pytest.param("any_case", marks=MARK)])\n'
+        'def test_param_xfail(x):\n    assert x\n\n'
+        '@pytest.mark.xfail(strict=True, raises=_Err, reason="https://example.com/issue/1")\n'
+        'def test_direct_xfail():\n    assert True\n'
+    )
+    assert _codes(_tree(tmp_path / "good_xfail", {"tests/schema/test_profiles.py": _body(good_xfail)})) == set()
+    # Natural domain/model/version filenames are allowed by TO001.
+    natural_manifest = MANIFEST + (
+        '\n[[module]]\npath = "schema/test_deepseek_unified_v2_a5.py"\ntier = "tier0"\n'
+        'owns = ["mindie_sim/schema/hardware.py"]\n'
+    )
+    natural_root = _tree(tmp_path / "natural", {
+        "tests/TAXONOMY.toml": natural_manifest,
+        "tests/schema/test_profiles.py": CLEAN,
+        "tests/schema/test_deepseek_unified_v2_a5.py": CLEAN,
+    })
+    assert _codes(natural_root) == set()
     legacy_root = _tree(tmp_path / "legacy", {
         "tests/schema/test_profiles.py": CLEAN,
         "tests/test_legacy.py": "# 1\n# 2\n# 3\n# 4\nimport pytest\n\ndef test_old():\n    assert 1\n",
@@ -467,3 +483,41 @@ def test_support_oracles_builders_and_captures_contracts():
         "activation-call", ("activation_a.json",), "activation_producer.py.txt"
     )
     assert len(manifest["captures"][0]["sha256"]) == 64
+
+
+def test_check_no_magic_numbers_scopes_to_physics_core_and_allows_bit_widths(tmp_path):
+    magic = _load_script("check_no_magic_numbers", REPO_ROOT / "scripts" / "check_no_magic_numbers.py")
+    _git(tmp_path, "init", "-q")
+    base = _commit_repo(tmp_path, {"README.md": "init\n"}, "init")
+    for rel, code in (
+        ("mindie_sim/export/excel_fmt.py", "def fmt():\n    col_width = 42\n    rgb = 0x1F4E78\n    return (col_width, rgb)\n"),
+        ("mindie_sim/cli_export.py", "def code():\n    return 42\n"),
+        ("mindie_sim/onboarding/report.py", "def widths():\n    return (24, 48)\n"),
+        (
+            "mindie_sim/prediction/clean_bits.py",
+            "def pack(bits, elems, dtype_bits):\n"
+            "    quarter = 0.25\n"
+            "    mask = (1 << 16) - 1\n"
+            "    byte_count = bits // 8\n"
+            "    table = {'fp16': 16, 'fp32': 32, 'int4': 4, 'fp64': 64}\n"
+            "    return quarter, mask, byte_count, elems * (dtype_bits // 8), table\n",
+        ),
+    ):
+        target = tmp_path / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(code, encoding="utf-8")
+    violations, checked = magic.check(tmp_path, base)
+    assert checked == 1 and violations == []
+
+    bad = tmp_path / "mindie_sim" / "prediction" / "bad_fit.py"
+    bad.write_text(
+        "THREE_FLOAT = 3.0\n"
+        "def scale(x):\n    cores = 32\n    return x * 0.83 + 37.5 + cores\n",
+        encoding="utf-8",
+    )
+    violations, _ = magic.check(tmp_path, base)
+    kinds = {(v.kind, v.value) for v in violations}
+    assert ("tautological", 3.0) in kinds
+    assert ("literal", 0.83) in kinds
+    assert ("literal", 37.5) in kinds
+    assert ("literal", 32) in kinds

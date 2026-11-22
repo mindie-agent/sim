@@ -539,7 +539,7 @@ def test_vector_recurrence_keeps_ragged_state_and_distinct_gate_payloads():
                     linear_heads=2, linear_key_head_dim=3, linear_head_dim=2, conv_kernel=3, recurrent_state_dtype="fp32")
     model = replace(case.model, layer_plans=(layer,))
     views = (RequestView("a", 2, 16, False, "decode"), RequestView("b", 4, 32, False, "decode"))
-    ops, _ = Frontend().body(model, case.runtime, views, mode="decode")
+    ops, _ = Frontend().body(model, case.runtime, views, mode="decode", machine=case.machine)
     scan, = [op for op in ops if op.family == "recurrent_vector"]
     assert dict(scan.metadata)["sequence_tokens"] == (2, 4)
     assert (scan.flops, scan.mte2_bytes, scan.mte3_bytes) == (0, 4 * 24 + 12 * ((2 * 3 + 2) * 2 + 6), 12 * (24 + 2 * 2))
@@ -553,7 +553,7 @@ def test_vector_recurrence_keeps_ragged_state_and_distinct_gate_payloads():
     runtime = replace(case.runtime, tensor_layouts={"gdn_gating": dict(beta="contiguous", alpha="contiguous"),
                                                    "short_convolution": {"input": "contiguous"}})
     for n in (1, 3):
-        ops, _ = Frontend().body(model, runtime, (RequestView("r", n, 0, False, "prefill"),))
+        ops, _ = Frontend().body(model, runtime, (RequestView("r", n, 0, False, "prefill"),), machine=case.machine)
         copies = {op.recipe: op for op in ops if op.family == "tensor_copy"}
         assert bool(copies) == (n > 1)
         if copies:

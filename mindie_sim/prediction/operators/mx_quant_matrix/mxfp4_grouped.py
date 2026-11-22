@@ -28,11 +28,10 @@ L0_ACCUMULATOR_BYTES = 256 * 1024
 KIND = "ascend_mxa8w4_nznk"
 UB_BYTES = (80 + 128 + 1 + 32) * 1024
 L0A_FRACTAL_M = 16
-B8_VF_OWNERS = 64
 B8_NATIVE_I8_PER_CYCLE_PER_VF = 256
 B8_PROLOGUE_MASK = 2
 B8_PROLOGUE_DUPLICATE = 3
-NOMINAL_CLOCK_HZ = 1.65e9
+_US_PER_SECOND = 1e6
 SOURCE = {
     "repository": "https://gitcode.com/cann/ops-transformer",
     "revision": "a3925fd49cd256ad478d2faf983bf2961b8ae2c8",
@@ -213,7 +212,10 @@ def build(op, geometry, *, compact=True, compact_panels=True, mte1_mode="base", 
             "activation_l2_fraction": activation_l2,
             "weight_l2_fraction": weight_l2,
             "logical_flops": 2 * sum(config.rows) * config.n * config.k,
-            **_source_issue_metadata(config, cores, compact, total, inventory),
+            **_source_issue_metadata(
+                config, cores, compact, total, inventory,
+                clock_hz=getattr(geometry.compute_arch, "clock_hz", None),
+            ),
             "mte1_mode": mte1_mode,
             "register_inventory": inventory.to_dict(),
             "register_capacity_work": inventory.capacity_work(CLASSES).resources,
@@ -251,7 +253,7 @@ def build(op, geometry, *, compact=True, compact_panels=True, mte1_mode="base", 
     })
 
 
-def _source_issue_metadata(config, cores, compact, total, inventory):
+def _source_issue_metadata(config, cores, compact, total, inventory, *, clock_hz=None):
     return {
         # Source-facing matrix issue distinction: MMAD/FixPipe parameter m
         # is the valid row count, L0A is a full 16-row fractal transfer.
@@ -274,8 +276,8 @@ def _source_issue_metadata(config, cores, compact, total, inventory):
                 if op in {"ShiftRightB8", "ShiftLeftB8", "SelectB8", "AndB8"}),
             "per_opcode": b8,
             "native_i8_per_cycle_per_vf": B8_NATIVE_I8_PER_CYCLE_PER_VF,
-            "vf_owners": B8_VF_OWNERS,
-            "nominal_clock_hz": NOMINAL_CLOCK_HZ,
+            "vf_owners": 2 * cores,
+            "nominal_clock_hz": clock_hz,
             "prologue": {"CreateMask": B8_PROLOGUE_MASK, "DuplicateB8": B8_PROLOGUE_DUPLICATE,
                          "width_elements": B8_NATIVE_I8_PER_CYCLE_PER_VF, "once_per_invocation": True},
             "single_port_charge": False,
@@ -285,9 +287,11 @@ def _source_issue_metadata(config, cores, compact, total, inventory):
                          "five-op single-port charge",
         })({
             op: {"raw_lanes": count.active_lanes,
-                 "bound_us": (count.active_lanes
-                              / (B8_NATIVE_I8_PER_CYCLE_PER_VF
-                                 * B8_VF_OWNERS * NOMINAL_CLOCK_HZ) * 1e6)}
+                 "bound_us": (
+                     count.active_lanes
+                     / (B8_NATIVE_I8_PER_CYCLE_PER_VF * (2 * cores) * float(clock_hz))
+                     * _US_PER_SECOND
+                 ) if clock_hz is not None and float(clock_hz) > 0.0 else None}
             for op, count in inventory.counts.items()
             if op in {"ShiftRightB8", "ShiftLeftB8", "SelectB8", "AndB8"}}),
     }

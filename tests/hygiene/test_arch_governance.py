@@ -1,9 +1,11 @@
-"""Architecture governance gate (AG001..AG007) verification.
+"""Architecture governance gate (AG001..AG011) verification.
 
 [Role] Verify ``scripts/check_arch_governance.py`` catches flat ISA/CANN module
   sprawl, direct/dynamic/re-exported leaf access, ``service_modes`` and
-  ``compute_peaks`` capability sniffing, and missing ISA leaf provenance while
-  exempting model catalog JSON configs and legal ``service_rate`` lookups.
+  ``compute_peaks`` capability sniffing, missing ISA leaf provenance, silent
+  physical hardware defaults, upward layer DAG imports, artificial shard sprawl,
+  and unreachable operator modules while exempting model catalog JSON configs,
+  legal ``service_rate`` lookups, and ``None`` optional overrides.
 [Invariants] Real repository has zero non-allowlisted violations and zero
   violations under ``mindie_sim/prediction/operators/<family>/**``. Multiset
   differential subtraction never waives governed operator packages.
@@ -507,3 +509,187 @@ def test_ag008_flat_prediction_ratchet_and_operator_package_fanout(tmp_path):
     fps = {item.fingerprint for item in findings if item.rule == "AG008"}
     assert "AG008:flat_prediction_ratchet" in fps
     assert "AG008:package_fanout:bloated" in fps
+
+
+def test_ag009_blocks_silent_physical_defaults_and_allows_none_overrides_and_custom_hw(tmp_path):
+    proj = tmp_path / "repo"
+    pred = proj / "mindie_sim" / "prediction"
+    pred.mkdir(parents=True)
+    (pred / "bad_defaults.py").write_text(
+        "DEFAULT_AIC_CORES = 32\n"
+        "_DEFAULT_VECTOR_CLOCK_HZ = 1e9\n"
+        "def default_hierarchy():\n    return None\n"
+        "def f(cores: int = 32, *, clock_hz: float = 1e9):\n"
+        "    h = default_hierarchy()\n"
+        "    eff = cores or 32\n"
+        "    return (h, eff, clock_hz)\n",
+        encoding="utf-8",
+    )
+    (pred / "clean_overrides.py").write_text(
+        "def g(cores: int | None = None, *, clock_hz: float | None = None, aiv: bool = False):\n"
+        "    return (cores or 0, clock_hz or 0.0, aiv)\n",
+        encoding="utf-8",
+    )
+    (proj / "mindie_sim" / "custom_hardware_custom.py").write_text(
+        "DEFAULT_AIC_CORES = 32\ndef derive(aic_count: int = 36):\n    return aic_count\n",
+        encoding="utf-8",
+    )
+    (proj / "mindie_sim" / "hardware_derivation.py").write_text(
+        "def derive(clock_hz: float = 1.65e9):\n    return clock_hz\n",
+        encoding="utf-8",
+    )
+    findings = [v for v in arch_gov.scan_repository(proj) if v.rule == "AG009"]
+    files = {v.path.as_posix() for v in findings}
+    fps = {v.fingerprint for v in findings}
+    assert files == {"mindie_sim/prediction/bad_defaults.py"}
+    assert any("fallback_const" in fp and "DEFAULT_AIC_CORES" in fp for fp in fps)
+    assert any("fallback_const" in fp and "_DEFAULT_VECTOR_CLOCK_HZ" in fp for fp in fps)
+    assert any("fallback_fn" in fp and "default_hierarchy" in fp for fp in fps)
+    assert any("fallback_call" in fp and "default_hierarchy" in fp for fp in fps)
+    assert any("param_default" in fp and ":cores" in fp for fp in fps)
+    assert any("param_default" in fp and ":clock_hz" in fp for fp in fps)
+    assert any("or_fallback" in fp for fp in fps)
+
+
+def test_ag010_enforces_unidirectional_layer_dag_and_ignores_type_checking(tmp_path):
+    proj = tmp_path / "repo"
+    for rel, code in (
+        ("mindie_sim/schema/bad_l0.py", "from mindie_sim.backends import ascend\n"),
+        ("mindie_sim/primitives/bad_l1.py", "from mindie_sim.prediction.runtime import engine\n"),
+        ("mindie_sim/prediction/runtime/bad_l2.py", "from mindie_sim.prediction.operators import attention\n"),
+        ("mindie_sim/prediction/operators/demo/bad_l3.py", "from mindie_sim import compose\n"),
+        (
+            "mindie_sim/prediction/runtime/clean_l2.py",
+            "from typing import TYPE_CHECKING\n"
+            "from mindie_sim.schema import hardware\n"
+            "if TYPE_CHECKING:\n    from mindie_sim import compose\n",
+        ),
+        ("mindie_sim/compose.py", "from mindie_sim.prediction.operators import demo\n"),
+    ):
+        target = proj / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(code, encoding="utf-8")
+    ag010 = [v for v in arch_gov.scan_repository(proj) if v.rule == "AG010"]
+    assert {v.path.as_posix() for v in ag010} == {
+        "mindie_sim/schema/bad_l0.py",
+        "mindie_sim/primitives/bad_l1.py",
+        "mindie_sim/prediction/runtime/bad_l2.py",
+        "mindie_sim/prediction/operators/demo/bad_l3.py",
+    }
+
+
+def test_ag008_blocks_expanded_shards_private_overflow_singletons_and_allows_arch40(tmp_path):
+    proj = tmp_path / "repo"
+    pred = proj / "mindie_sim" / "prediction"
+    ops = pred / "operators" / "demo"
+    onb = proj / "mindie_sim" / "onboarding"
+    ops.mkdir(parents=True)
+    onb.mkdir(parents=True)
+    valid_rev, valid_sha = "a" * 40, "b" * 64
+    (ops / "arch40.py").write_text(
+        '"""Future ISA leaf.\n\nUpstream-ABI: aclnnDemoV40\n"""\n'
+        "from mindie_sim.schema.datapath import SourceRef\n"
+        "STRATEGY = object()\n"
+        f"SOURCES = (SourceRef('cann/ops', '{valid_rev}', 'src/v40.cpp', '{valid_sha}'),)\n",
+        encoding="utf-8",
+    )
+    (pred / "bad_arch40.py").write_text("X = 1\n", encoding="utf-8")
+    (pred / "leaf_sneak.py").write_text("from mindie_sim.prediction.operators.demo import arch40\n", encoding="utf-8")
+    for shard in ("x_helper.py", "x_part.py", "x_shard.py", "x_extra.py", "x_copy.py", "_overflow.py"):
+        (pred / shard).write_text("X = 1\n", encoding="utf-8")
+    (pred / "dup_singletons.py").write_text("class Engine:\n    pass\nclass ParallelSpec:\n    pass\n", encoding="utf-8")
+    for idx in range(arch_gov.MAX_ONBOARDING_FILES + 1):
+        (onb / f"step_{idx}.py").write_text("X = 1\n", encoding="utf-8")
+    findings = arch_gov.scan_repository(proj)
+    assert not any(v.path.as_posix().endswith("operators/demo/arch40.py") for v in findings)
+    fps = {v.fingerprint for v in findings}
+    assert any(v.rule == "AG001" and v.path.as_posix().endswith("bad_arch40.py") for v in findings)
+    assert any(v.rule == "AG002" and v.path.as_posix().endswith("leaf_sneak.py") for v in findings)
+    assert "AG008:shard_file:mindie_sim/prediction/x_shard.py" in fps
+    assert "AG008:shard_file:mindie_sim/prediction/x_copy.py" in fps
+    assert "AG008:private_shard_file:mindie_sim/prediction/_overflow.py" in fps
+    assert "AG008:duplicate_concept:mindie_sim/prediction/dup_singletons.py:Engine" in fps
+    assert "AG008:duplicate_concept:mindie_sim/prediction/dup_singletons.py:ParallelSpec" in fps
+    assert "AG008:onboarding_file_ceiling" in fps
+
+
+def test_ag011_catches_unreachable_operator_modules_and_verifies_live_engine_reachability(tmp_path):
+    proj = tmp_path / "repo"
+    ops = proj / "mindie_sim" / "prediction" / "operators"
+    fam = ops / "demo"
+    fam.mkdir(parents=True)
+    (ops / "registry.py").write_text("from mindie_sim.prediction.operators.demo import wired\n", encoding="utf-8")
+    (fam / "__init__.py").write_text("", encoding="utf-8")
+    (fam / "wired.py").write_text("VALUE = 1\n", encoding="utf-8")
+    (fam / "orphan.py").write_text("VALUE = 2\n", encoding="utf-8")
+    ag011 = [v for v in arch_gov.scan_repository(proj) if v.rule == "AG011"]
+    assert [v.path.as_posix() for v in ag011] == ["mindie_sim/prediction/operators/demo/orphan.py"]
+    assert runtime_checks.verify_ag011_engine_reachability() == ()
+
+
+def test_fail_closed_physical_defaults_across_geometry_memory_binding_loader_and_sealer(monkeypatch):
+    from types import SimpleNamespace
+    from mindie_sim.prediction import memory_traffic
+    from mindie_sim.prediction.operators.causal_conv import native_causal_conv_spec as cc_spec
+    from mindie_sim.prediction.operators.mx_quant_matrix import mxfp4_geometry
+    from mindie_sim.prediction.program import RecipeContext
+    from mindie_sim.primitives import loader as prim_loader, sealer as prim_sealer
+    from mindie_sim.schema.datapath import datapath_for_die
+    from mindie_sim.schema.hardware import Device
+
+    cfg = SimpleNamespace(rows=(128,), k=1024, n=4096)
+    with pytest.raises(ModelingError, match="mx_quant_requires_positive_cores"):
+        mxfp4_geometry.columns(cfg, 0)
+    assert mxfp4_geometry.owner_panel_bytes(cfg, 28) != mxfp4_geometry.owner_panel_bytes(cfg, 32)
+    assert mxfp4_geometry.owner_panel_bytes(cfg, 32) != mxfp4_geometry.owner_panel_bytes(cfg, 36)
+
+    op = cc_spec.make_op({"lengths": [8], "dim": 128, "width": 4, "dtype": "bf16"})
+    assert dict(op.metadata)["host_tiling"] is None
+    with pytest.raises(ModelingError):
+        cc_spec.host_tiling(op, Geometry(1, {"vector": 4}))
+
+    with pytest.raises(ModelingError, match="machine_memory_hierarchy_missing"):
+        memory_traffic.require_machine_memory_hierarchy(None)
+
+    ctx = RecipeContext(
+        op=op, work={}, resource_names={"vector": "r0:vector", "vec_issue": "r0:vec_issue"},
+        rates={"r0:vector": 1e9, "r0:vec_issue": 1e9}, core_count=2, resource_units={"vector": 2},
+    )
+    with pytest.raises(ModelingError, match="bind_vector_clock_hz_missing"):
+        ctx.bind_vector(())
+
+    a5_table = prim_loader.load_primitives("Ascend950DT_9582")
+    stripped_prims = {
+        **a5_table.primitives,
+        "P12_intracore_flag": replace(
+            a5_table.primitives["P12_intracore_flag"], status="unmeasured", metrics={}
+        ),
+    }
+    stripped_table = replace(a5_table, primitives=stripped_prims)
+    no_clock_dp = datapath_for_die(Device(
+        rank=0, memory_bytes=1024**3, compute_peaks=(("bf16", 1e12),),
+        rates=(("hbm", 1e9), ("vector", 1e9)), buffers=(), compute_units=4,
+    ))
+    with pytest.raises(ModelingError, match="dispatch_envelope_clock_hz_missing"):
+        prim_loader.resolve_dispatch_envelope(stripped_table, no_clock_dp)
+
+    base_spec = prim_sealer.load_sku_hardware_spec("Ascend950DT_9582")
+    undeclared_spec = {
+        **base_spec,
+        "link_bytes_per_s": None, "host_h2d_bytes_per_s": None,
+        "host_d2h_bytes_per_s": None, "host_rc_h2d_bytes_per_s": None,
+        "host_rc_d2h_bytes_per_s": None,
+    }
+    monkeypatch.setattr(prim_sealer, "load_sku_hardware_spec", lambda _sku: undeclared_spec)
+    sealed = prim_sealer.build_primitive_table_payload(
+        sku="Ascend950DT_9582", cann_version="9.3.0",
+        endpoint_alias="ep-test", campaign_id="camp-test", raw_measurements=None,
+    )
+    assert sealed["provenance"]["calibrated"] is False
+    assert sealed["primitives"]["P20_host_dma_sync"]["status"] == "unmeasured"
+    for key in ("host_h2d_bytes_per_s", "host_d2h_bytes_per_s",
+                "host_rc_h2d_bytes_per_s", "host_rc_d2h_bytes_per_s"):
+        assert key not in sealed["primitives"]["P20_host_dma_sync"]["metrics"]
+    assert sealed["primitives"]["P18_hccl_collective_band"]["status"] == "unmeasured"
+    assert "link_bytes_per_s" not in sealed["primitives"]["P18_hccl_collective_band"]["metrics"]
+    assert "peer_bytes_per_s" not in sealed["primitives"]["P19_direct_peer_window"]["metrics"]

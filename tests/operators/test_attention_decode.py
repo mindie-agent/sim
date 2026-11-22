@@ -334,7 +334,7 @@ def test_frontend_preserves_ragged_decode_requests_across_batching():
     views = (RequestView("a", 1, 7, False, "decode"), RequestView("b", 3, 11, False, "decode"))
     for fused in (True, False):
         frontend = Frontend(attention_policy=AttentionPolicy(fused_batch=fused))
-        ops, _ = frontend.body(case.model, case.runtime, views, ready="input", tokens=4, mode="decode")
+        ops, _ = frontend.body(case.model, case.runtime, views, ready="input", tokens=4, mode="decode", machine=case.machine)
         attention = [op for op in ops if op.family == "attention" and op.layer == 0]
         assert len(attention) == (1 if fused else 2)
         assert sum(op.flops for op in attention) == 2 * (8 + 12 + 13 + 14) * 4 * (16 + 16)

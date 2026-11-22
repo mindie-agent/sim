@@ -427,7 +427,7 @@ def test_invalid_native_sparse_layer_is_visible():
 def test_external_draft_context_rows_are_distinct_from_query_rows():
     c = sparse_alignment_case()
     views = (RequestView('request', 4, 131072, True, 'decode', draft_proposal_tokens=3),)
-    regions, _ = draft_program(Frontend(resource_fusion=False), c.model, c.runtime, views, 'ready')
+    regions, _ = draft_program(Frontend(resource_fusion=False), c.model, c.runtime, views, 'ready', machine=c.machine)
     ops = [op for region in regions for op in region.ops]
     features = next((op for op in ops if op.recipe == 'draft_features'))
     assert features.local_shape[0] == 4

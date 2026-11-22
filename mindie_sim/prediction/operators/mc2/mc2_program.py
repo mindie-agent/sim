@@ -44,7 +44,7 @@ NATIVE_PROGRAM_CACHE_MAXSIZE = 128
 US_PER_MS = 1000
 
 
-def _resolve_aiv_units(units_map: Mapping[str, int], *, core_count: int = 0) -> int:
+def _resolve_aiv_units(units_map: Mapping[str, int], *, core_count: int | None = None) -> int:
     """Vector AIV count: declared vector units, else AIC count * AIV_PER_AIC."""
     vector = int(units_map.get("vector", 0) or 0)
     if vector > 0:

@@ -48,8 +48,19 @@ ROUTER_TILE_N = 256
 #: more partials than the K extent can populate.
 ROUTER_K_GRANULE = 1
 ROUTER_PROLOGUE_DRAIN_CYCLES = 8250
-ROUTER_NOMINAL_CLOCK_HZ = 1.65e9
 A5_AIC_UNITS = 32
+
+
+def _require_clock_hz(context, geometry) -> float:
+    for owner in (
+        getattr(context, "compute_arch", None),
+        getattr(context, "datapath", None),
+        getattr(geometry, "compute_arch", None),
+    ):
+        val = getattr(owner, "clock_hz", None)
+        if val is not None and not isinstance(val, bool) and float(val) > 0.0:
+            return float(val)
+    raise ModelingError("router_splitk_clock_hz_missing")
 
 
 def _allocate(total: float, weights: list[float]) -> list[float]:
@@ -175,9 +186,9 @@ def build_router_splitk(op, geometry):
     merge = float(splits - 1) * float(m) * float(n)
     extra = Work(resources={"hbm": 2 * partial, "vector": merge})
     plan_work = base + extra
-    clock_ms = ROUTER_NOMINAL_CLOCK_HZ / MS_PER_SECOND
 
     def program(context):
+        clock_ms = _require_clock_hz(context, geometry) / MS_PER_SECOND
         extra_demand = context.bind(extra)
         matrix_demand = {key: value - extra_demand.get(key, 0)
                          for key, value in context.work.items()}
@@ -400,7 +411,8 @@ def _placement(context, index: int, cores: int, roles) -> dict:
 def _tile_merge_program(context, names, area: float, vector_share,
                         mte3_share, hbm_write_share, partial_read, merges: int,
                         caps, index: int, cores: int, *,
-                        merge_tasks: int = 1, used_cores: int = 1) -> KernelProgram:
+                        merge_tasks: int = 1, used_cores: int | None = None) -> KernelProgram:
+    active_cores = cores if used_cores is None else used_cores
     hbm, vector, mte3 = names.get("hbm"), names.get("vector"), names.get("mte3")
     stages = []
     predecessor = ()
@@ -415,7 +427,7 @@ def _tile_merge_program(context, names, area: float, vector_share,
     if merged:
         # On calibrated Stream-K (arch35/mat_mul_stream_k_kernel.h:213-259), AIV
         # fixup shards output reduction across all paired AIVs of the active grid.
-        if getattr(context, "primitive_table", None) is not None and used_cores > merge_tasks:
+        if getattr(context, "primitive_table", None) is not None and active_cores > merge_tasks:
             vec_place = {}
         else:
             vec_place = _placement(context, index, cores, ("vector",))
@@ -427,7 +439,7 @@ def _tile_merge_program(context, names, area: float, vector_share,
     if hbm is not None and hbm_write_share > 0:
         store[hbm] = hbm_write_share
     if store:
-        if getattr(context, "primitive_table", None) is not None and used_cores > merge_tasks:
+        if getattr(context, "primitive_table", None) is not None and active_cores > merge_tasks:
             st_place = {}
         else:
             st_place = _placement(context, index, cores, ("mte3",))

@@ -29,7 +29,7 @@ from mindie_sim.schema.tensors import TensorLayout
 
 from .attention_kv_access import paged_fia_plan
 from mindie_sim.prediction.cache_representation import store as representation_store
-from mindie_sim.prediction.memory_traffic import default_hierarchy
+from mindie_sim.prediction.memory_traffic import require_machine_memory_hierarchy
 from mindie_sim.prediction.structure_groups import declare_group
 
 DEFAULT_QUERY_TILE: int = 128
@@ -48,13 +48,9 @@ _QKV_NORM_ROPE_SOURCE = {
 }
 
 
-def _memory_hierarchy(machine):
-    """Declared device hierarchy for traffic planning, or the frontend default."""
-    if machine is not None and getattr(machine, "dies", ()):
-        hierarchy = getattr(machine.dies[0].physical_mechanisms, "memory_hierarchy", None)
-        if hierarchy is not None and hierarchy.l2_capacity_bytes > 0:
-            return hierarchy
-    return default_hierarchy()
+def _memory_hierarchy(machine, *, hierarchy=None):
+    """Declared device hierarchy for traffic planning; fails closed when absent."""
+    return require_machine_memory_hierarchy(machine, hierarchy=hierarchy)
 
 
 def _qkv_views(tokens, heads, kv_heads, width, has_gate, k_eq_v=False):

@@ -121,7 +121,7 @@ def test_panels_conserve_tails_periodic_refills_and_issued_work(mx4_source, rows
         return
     cfg, l2 = Config(k, n, rows), int(effective_l2_bytes(geometry(raw)))
     l2_shares = dict(activation_l2=activation_l2_fraction(cfg, 32, l2), weight_l2=weight_l2_fraction(cfg, 32, l2))
-    work = sum((tile_work(cfg, m, w, **l2_shares) for o in range(32) for *_, m, w in owner_tiles(cfg, o, 32)),
+    work = sum((tile_work(cfg, m, w, cores=32, **l2_shares) for o in range(32) for *_, m, w in owner_tiles(cfg, o, 32)),
                Work(resources={"hbm":64*256, "mte2_aiv":64*256}))
     assert b["operator"]["flops"] == work.matrix["fp8_e4m3"]
     for role, amount in work.resources.items():
@@ -537,7 +537,7 @@ def test_geometry_cache_preserves_integer_tiles_runs_and_work(cfg):
     for cores, compact, directional in product((1, 3, 32), (False, True), (False, True)):
         ledger = geometry_ledger(cfg, cores, compact, directional)
         shapes = [[(m, n) for *_, m, n in owner_tiles(cfg, o, cores)] for o in range(cores)]
-        work = sum((tile_work(cfg, m, n, directional_mte1=directional) for ts in shapes for m, n in ts),
+        work = sum((tile_work(cfg, m, n, cores=cores, directional_mte1=directional) for ts in shapes for m, n in ts),
                    Work(resources={"hbm":512*cores, "mte2_aiv":512*cores}))
         inventory = sum((tile_inventory(cfg, m, n) for ts in shapes for m, n in ts), InstructionInventory({}))
         assert ledger.work == work and ledger.inventory == inventory

@@ -54,8 +54,10 @@ from .mla_epilogs import (
     native_fusion_active, lower_index_path,
 )
 from .mla_native import batched_matrix_metadata
-from mindie_sim.prediction.memory_traffic import (AttentionAccessSpec, AttentionSchedule,
-                             default_hierarchy, plan_attention_traffic)
+from mindie_sim.prediction.memory_traffic import (
+    AttentionAccessSpec, AttentionSchedule, plan_attention_traffic,
+    require_machine_memory_hierarchy,
+)
 from mindie_sim.prediction.projections import mla_input_projections
 from mindie_sim.prediction.operators.mla import mla_head_padding
 from mindie_sim.prediction.cache_representation import store as representation_store
@@ -92,14 +94,9 @@ def _store_rows(rows_by_view, views, parallel, block, *, contexts=None):
         rows_by_view, views, parallel, block, contexts=contexts))
 
 
-def _memory_hierarchy(machine):
-    """Declared device hierarchy for traffic planning, or the frontend default."""
-    if machine is not None and getattr(machine, "dies", ()):
-        hierarchy = getattr(machine.dies[0].physical_mechanisms,
-                            "memory_hierarchy", None)
-        if hierarchy is not None and hierarchy.l2_capacity_bytes > 0:
-            return hierarchy
-    return default_hierarchy()
+def _memory_hierarchy(machine, *, hierarchy=None):
+    """Declared device hierarchy for traffic planning; fails closed when absent."""
+    return require_machine_memory_hierarchy(machine, hierarchy=hierarchy)
 
 
 def _aic_owners(machine):
@@ -112,10 +109,11 @@ def _mla_idle_dcp_owner(
     *, prefix, plan, stage, deps, model, parallel, quant, mode, runtime, policy,
     machine, cp_interleave_size, cohort_dec_views, peer_dec_rows, local_dp_pos,
     pcp_factor, tp_gather, dp_width, physical_rank=None, explicit_physical_rank=False,
+    hierarchy=None,
 ) -> AttentionResult:
     """Idle KV-owner peer in a cross-DP DCP cohort: gather Q, run attention, return partial O/LSE."""
     b = Builder(prefix, plan, stage, cohort_dec_views, model, mode)
-    hierarchy = _memory_hierarchy(machine)
+    hierarchy = _memory_hierarchy(machine, hierarchy=hierarchy)
     b.l2_bytes = hierarchy.effective_l2_bytes
     heads = plan.num_heads // parallel.tp
     width = plan.qk_nope_head_dim + plan.qk_rope_head_dim
@@ -165,7 +163,7 @@ def _mla_idle_dcp_owner(
 def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         padded_tokens, cache_ids, topk_ids, index_cache_ids, candidate_ids,
         stage_of, cp_interleave_size=DEFAULT_INTERLEAVE, runtime=None, policy=None,
-        machine=None, reuse_index_selection=False, shared_topk=None,
+        machine=None, hierarchy=None, reuse_index_selection=False, shared_topk=None,
         dcp_cohort_views_by_member=None, dcp_local_pos=0,
         physical_rank=None, explicit_physical_rank=False):
     pcp_factor, tp_gather, raw_dp_width = layer_dcp_factors(plan, parallel)
@@ -184,9 +182,9 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
             local_dp_pos=local_dp_pos, pcp_factor=pcp_factor,
             tp_gather=tp_gather, dp_width=dp_width,
             physical_rank=physical_rank,
-            explicit_physical_rank=explicit_physical_rank)
+            explicit_physical_rank=explicit_physical_rank, hierarchy=hierarchy)
     b = Builder(prefix, plan, stage, views, model, mode)
-    hierarchy = _memory_hierarchy(machine)
+    hierarchy = _memory_hierarchy(machine, hierarchy=hierarchy)
     b.l2_bytes = hierarchy.effective_l2_bytes
     from mindie_sim.catalog.paired_sfa import execution
     layer_dcp = layer_dcp_degree(plan, parallel)

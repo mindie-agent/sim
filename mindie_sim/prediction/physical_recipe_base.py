@@ -21,7 +21,6 @@ from .program import KernelProgram, PipelineProgram, Stage
 
 MAX_TILES = 64
 MIN_TILE_BYTES = 4096
-DEFAULT_AIV_TILES = 64
 DEFAULT_PIPELINE_SLOTS = 2
 IO_HBM_CATEGORY = "hbm"
 IO_READ_CATEGORY = "mte2"

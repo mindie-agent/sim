@@ -429,7 +429,7 @@ def test_selected_quantized_prolog_rejects_unquantized_indexer_shared_output():
     # The direct frontend entry does not run parse_case.
     with pytest.raises(ModelingError, match="mla_prolog_v3_query_norm_indexer_activation_mismatch"):
         Frontend().body(excluded.model, excluded.runtime,
-                        (RequestView("probe", 32, 0, False, "prefill"),), ready="input")
+                        (RequestView("probe", 32, 0, False, "prefill"),), ready="input", machine=excluded.machine)
     # When both projections consume BF16, the real shared producer is q_norm.
     quant = replace(quant, exclusions=(*quant.exclusions, "mla"))
     report = export_structure(replace(excluded, model=replace(excluded.model, quant=quant)),

@@ -231,6 +231,9 @@ def _preset(raw):
     return merged, preset
 
 
+_MHZ_TO_HZ = 1_000_000.0
+
+
 def apply_observed_aicore_clock(device, profile, *, reference_mhz=None, explicit=None):
     """Convert clock-bound rates from their declared clock to an observed clock."""
     observed = device.get("observed_aicore_freq_mhz")
@@ -243,11 +246,19 @@ def apply_observed_aicore_clock(device, profile, *, reference_mhz=None, explicit
     reference = _positive_float(reference, "aicore_freq_mhz_invalid")
     ratio = observed / reference
     clock = {"observed_aicore_freq_mhz": observed, "aicore_freq_mhz": observed}
+    explicit = explicit or {}
+    explicit_arch = explicit.get("compute_arch", {})
     if ratio == 1:
+        if "clock_hz" not in explicit_arch:
+            data = deepcopy(device)
+            data.update(clock)
+            data.setdefault("compute_arch", {})["clock_hz"] = observed * _MHZ_TO_HZ
+            return data
         return {**device, **clock}
     data = deepcopy(device)
     data.update(clock)
-    explicit = explicit or {}
+    if "clock_hz" not in explicit_arch:
+        data.setdefault("compute_arch", {})["clock_hz"] = observed * _MHZ_TO_HZ
     explicit_rates = explicit.get("rates", {})
     clock_rates = set(profile["device"]["rates"]) - {
         "hbm", "scalar_store_issue",
@@ -263,7 +274,6 @@ def apply_observed_aicore_clock(device, profile, *, reference_mhz=None, explicit
                 and name not in {"mte2_aic_dram", "mte2_aiv_dram"}
                 and "rate" not in explicit.get("service_modes", {}).get(name, {})):
             mode["rate"] *= ratio
-    explicit_arch = explicit.get("compute_arch", {})
     for name, service in data.get("compute_arch", {}).get("instruction_services", {}).items():
         if (name in explicit_arch.get("instruction_services", {})
                 or name == "gm_hbm_cacheline_128b"
@@ -277,8 +287,14 @@ def apply_observed_aicore_clock(device, profile, *, reference_mhz=None, explicit
 
 
 def _materialize_device(device, profile, sku, explicit):
-    return apply_observed_aicore_clock(
-        expand_instruction_presets(device, profile, sku), profile, explicit=explicit)
+    materialized = expand_instruction_presets(device, profile, sku)
+    decl_mhz = profile.get("source", {}).get("declaration", {}).get("configured_clock_mhz")
+    if decl_mhz is not None:
+        materialized = deepcopy(materialized)
+        arch = materialized.setdefault("compute_arch", {})
+        if arch.get("clock_hz") is None:
+            arch["clock_hz"] = float(decl_mhz) * _MHZ_TO_HZ
+    return apply_observed_aicore_clock(materialized, profile, explicit=explicit)
 
 
 def materialize(raw):

@@ -85,8 +85,19 @@ GATING_EXPERT_TOPK_CYCLES = 355
 GATING_RENORM_CYCLES = 420
 GATING_GROUP_EXPERT_CYCLES = 0.5
 GATING_TOPK_EXPERT_CYCLES = 0.375
-GATING_NOMINAL_CLOCK_HZ = 1.65e9
 MS_PER_SECOND = 1000
+
+
+def _require_clock_hz(context, geometry) -> float:
+    for owner in (
+        getattr(context, "compute_arch", None),
+        getattr(context, "datapath", None),
+        getattr(geometry, "compute_arch", None),
+    ):
+        val = getattr(owner, "clock_hz", None)
+        if val is not None and not isinstance(val, bool) and float(val) > 0.0:
+            return float(val)
+    raise ModelingError("moe_gating_clock_hz_missing")
 GATING_WAVE_STAGES = (
     "logits_bias_load", "sigmoid_bias", "group_top2_scan", "group_mask",
     "expert_topk", "renorm_store",
@@ -155,7 +166,7 @@ def build_moe_gating_topk(op, geometry):
                            "mte3": write, "vector": logical_vector})
 
     def program(context):
-        clock_ms = GATING_NOMINAL_CLOCK_HZ / MS_PER_SECOND
+        clock_ms = _require_clock_hz(context, geometry) / MS_PER_SECOND
         read_name = context.physical_role("mte2_aiv")
         read_name = (read_name if read_name in context.resource_names
                      else context.read_pipe(aiv=0))
