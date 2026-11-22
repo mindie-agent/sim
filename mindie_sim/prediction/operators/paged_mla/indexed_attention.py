@@ -619,16 +619,16 @@ def _compact_owner_program(
             r: (sum(v for (res, _), v in eff_unit_demand.items() if res == r) if r == vec_res and dq_scale < 1.0 else amt)
             for r, amt in all_work.items()
         }
-        nominal[owner] = (max(end, duration(eff_all_work, all_placement)), dict(eff_unit_demand), eff_all_work)
-    end, u_demand, eff_all_work = nominal[owner]
-    caps = {key: amount / end for key, amount in eff_all_work.items()} if end else {}
+        nominal[owner] = (max(end, duration(eff_all_work, all_placement)), dict(unit_demand))
+    end, u_demand = nominal[owner]
+    caps = {key: amount / end for key, amount in all_work.items()} if end else {}
     has_two_vector_aivs = len(all_placement.get(ctx.resource_names.get("vector", "vector"), ())) == 2
     if has_two_vector_aivs:
         branches = []
         for idx in range(2):
             b_work = {}
             b_place = {}
-            for res, amt in eff_all_work.items():
+            for res, amt in all_work.items():
                 units = all_placement.get(res, ())
                 if len(units) == 2:
                     share = u_demand.get((res, units[idx]), 0.0)
@@ -646,7 +646,7 @@ def _compact_owner_program(
                 f"aiv{idx}", b_work, caps=b_caps, placement=b_place, coupled=True),)))
         pipe_stage = Stage("pipeline", after=("reserve",), program=ParallelProgram(tuple(branches)))
     else:
-        pipe_stage = Stage("pipeline", eff_all_work, after=("reserve",), caps=caps,
+        pipe_stage = Stage("pipeline", all_work, after=("reserve",), caps=caps,
                            placement=all_placement, coupled=True)
     return KernelProgram((
         Stage("reserve", acquire=buffers),

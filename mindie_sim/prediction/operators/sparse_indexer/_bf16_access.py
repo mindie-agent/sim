@@ -128,7 +128,7 @@ def _key_access_plan(spans, *, compression, key_row_bytes, q_row_bytes,
         aiv_units, topk, kv_heads)
     exchange_total = sum(tile["exchange_bytes"] for tile in tiles)
     exchange_per_tile = max((tile["exchange_bytes"] for tile in tiles), default=0)
-    receive_required = (topk * LOCAL_LIST_ELEMENT_BYTES if exchange_total else 0)
+    receive_required = (topk * kv_heads * LOCAL_LIST_ELEMENT_BYTES if exchange_total else 0)
     receive_bytes = 0
     receive_alias = "none"
     receive_chunks = 0
@@ -148,7 +148,7 @@ def _key_access_plan(spans, *, compression, key_row_bytes, q_row_bytes,
                 if score_row_limit is None and ub_capacity:
                     spare_rows = ((int(ub_capacity) - list_bytes
                                    - receive_required)
-                                  // max(1, q_tile_rows * SCORE_ELEMENT_BYTES))
+                                  // max(1, q_tile_rows * kv_heads * SCORE_ELEMENT_BYTES))
                     if spare_rows >= 1:
                         return _key_access_plan(
                             spans, compression=compression,
@@ -233,7 +233,7 @@ def _score_panel_layout(
     max_score_rows = 0
     if ub_capacity and list_bytes < ub_capacity:
         max_score_rows = max(
-            1, (ub_capacity - list_bytes) // max(1, q_tile_rows * SCORE_ELEMENT_BYTES))
+            1, (ub_capacity - list_bytes) // max(1, q_tile_rows * kv_heads * SCORE_ELEMENT_BYTES))
         if score_row_limit is not None:
             max_score_rows = min(max_score_rows, max(1, int(score_row_limit)))
         if panel_rows:
@@ -297,7 +297,7 @@ def _key_tiles(
                     "rows": rows, "logical_bytes": logical,
                     "gm_bytes": gm, "hbm_bytes": hbm, "pairs": pairs,
                 })
-                score_bytes = max(score_bytes, pairs * SCORE_ELEMENT_BYTES)
+                score_bytes = max(score_bytes, pairs * kv_heads * SCORE_ELEMENT_BYTES)
                 key_gm += gm
                 key_hbm += hbm
                 key_logical += logical

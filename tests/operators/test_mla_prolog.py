@@ -598,3 +598,42 @@ def test_projection_quantization_preserves_absorption_index_and_draft_formats():
     index = projection_quant(quant_preset("w8a8_int8"), _layer(indexer=True, index_heads=32, index_dim=128, index_kpool=4))
     assert compute_dtype_for(index, "indexer.weights") == ("bf16", "bf16")
     assert compute_dtype_for(index, "indexer.pool_projection") == ("fp32", "fp32")
+
+
+def test_draft_mla_prolog_accepts_bf16_kv_with_target_packed_layout_and_v4_mxfp8():
+    from mindie_sim.prediction.operators.mla_prolog import family_mla_prolog
+
+    case = parse_case(_caller_case())
+    target_plan = replace(case.model.layer_plans[3], scope="body", mla_variant="latent_mla",
+                          cache_kind="dense", q_lora_rank=1536, qk_rope_head_dim=64)
+    bf16_quant = QuantSpec("bf16", kv_dtype="bf16")
+    for draft_scope in ("draft", "dspark", "mtp"):
+        family_mla_prolog.validate(
+            plan=replace(target_plan, scope=draft_scope), parallel=ParallelSpec(),
+            model=case.model, quant=bf16_quant, lowering_passes=(), cache_layout=PACKED_LAYOUT,
+        )
+    with pytest.raises(ModelingError, match=r"^mla_prolog_v3_cache_layout_dtype_mismatch$"):
+        family_mla_prolog.validate(
+            plan=target_plan, parallel=ParallelSpec(), model=case.model, quant=bf16_quant,
+            lowering_passes=(), cache_layout=PACKED_LAYOUT,
+        )
+
+    mxfp8_model = replace(case.model, quant=quant_preset("w8a8_mxfp8"))
+    draft_no_rope = SimpleNamespace(
+        layers=1, hidden_size=4096, q_lora_rank=512, kv_lora_rank=512,
+        qk_rope_head_dim=0, activation_dtype="bf16",
+    )
+    shape = (4, 4096, 4096)
+    proj = OpSpec("proj", "gemm", "decode", 0, 0, (), shape, shape, shape, shape, dtype="bf16")
+    ops = []
+    draft_context.prepare(ops, projection=proj, model=mxfp8_model, draft=draft_no_rope,
+                          rows=4, query_rows=2, prefix="dm:", stage=0, requests=(), parallel=ParallelSpec())
+    prolog_op = next(op for op in ops if op.recipe == draft_context.PROLOG_RECIPE)
+    prolog_meta = dict(prolog_op.metadata)
+    assert prolog_meta["native_kind"] == ABI_V4_NZ
+    assert prolog_op.dtype == "fp8_e4m3"
+    assert prolog_meta["do_rope"] is False
+    assert "kv_rope" not in prolog_meta["fused_members"]
+
+    gov = _prolog(tokens=4)
+    assert gov.hbm_bytes > 0 and gov.mte2_bytes > 0 and gov.mte3_bytes > 0 and gov.vector_ops > 0

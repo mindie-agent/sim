@@ -422,6 +422,32 @@ def _declaration(*, views, plan, parallel, runtime, padded_tokens=None,
     }
 
 
+PAGED_MLA_SOFTMAX_OPS_PER_PAIR = 4
+
+
+def _declaration_work_bounds(declaration):
+    """Conservative physical (flops, vector_ops, hbm, mte2, mte3) for L* soundness."""
+    geometry = declaration['geometry']
+    operands = declaration['operands']
+    active = int(geometry['active_sequence_count'])
+    logical = int(geometry['logical_heads'])
+    latent = int(operands['latent_width'])
+    rope = int(operands['rope_width'])
+    dqk = latent + rope
+    total_kv = sum(int(k) for k in geometry['kv_lengths'])
+    retained = min(total_kv, max(0, int(geometry.get('retained_kv_rows', 0) or 0)))
+    q_elem = float(dtype_bytes(operands['query_dtype']))
+    c_elem = float(dtype_bytes(operands['cache_dtype']))
+    o_elem = float(dtype_bytes(operands['output_dtype']))
+    flops = float(2 * logical * total_kv * (dqk + latent))
+    vector_ops = float(PAGED_MLA_SOFTMAX_OPS_PER_PAIR * logical * total_kv)
+    q_bytes = float(active * logical * dqk) * q_elem
+    kv_read = float(total_kv * dqk) * c_elem
+    kv_hbm = float(max(0, total_kv - retained) * dqk) * c_elem
+    o_bytes = float(active * logical * latent) * o_elem
+    return flops, vector_ops, q_bytes + kv_hbm + o_bytes, q_bytes + kv_read, o_bytes
+
+
 def _declaration_op(declaration, *, views, plan, deps=(), op_id='paged_mla_decode'):
     geometry = declaration['geometry']
     operands = declaration['operands']
@@ -430,9 +456,12 @@ def _declaration_op(declaration, *, views, plan, deps=(), op_id='paged_mla_decod
     physical = geometry['physical_heads']
     shape = (active, physical, 1, operands['latent_width'])
     padded = (capacity, physical, 1, operands['latent_width'])
+    flops, vector_ops, hbm_bytes, mte2_bytes, mte3_bytes = _declaration_work_bounds(declaration)
     return OpSpec(
         op_id, 'attention', 'decode', 0, plan.index,
         tuple(view.request_id for view in views), shape, shape, padded, padded,
+        flops=flops, vector_ops=vector_ops, hbm_bytes=hbm_bytes,
+        mte2_bytes=mte2_bytes, mte3_bytes=mte3_bytes,
         deps=tuple(deps), recipe=declaration['implementation'],
         metadata=tuple(declaration['metadata'].items()),
         dtype=operands['query_dtype'], source_boundary='kernel')
@@ -623,8 +652,11 @@ def lower_attention(b, *, views, plan, heads, runtime, query, rotary, store,
                           ('zero_fill_bytes',
                            capacity*(physical-declared_heads)*width*byte))))
         query, rotary = packed
+    flops, vector_ops, hbm_bytes, mte2_bytes, mte3_bytes = _declaration_work_bounds(declaration)
     name = b.work('paged_mla_decode', (query, rotary, store),
                   (active, physical, 1, operands['latent_width']),
+                  flops=flops, vector=vector_ops, read=mte2_bytes,
+                  hbm_read=max(0.0, hbm_bytes - mte3_bytes), write=mte3_bytes,
                   family='attention', dtype=operands['query_dtype'])
     b.ops[-1] = replace(
         b.ops[-1], recipe=implementation, source_boundary='kernel',

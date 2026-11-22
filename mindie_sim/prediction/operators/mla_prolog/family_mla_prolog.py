@@ -62,11 +62,25 @@ def prepare_model(model, runtime):
     return replace(model, quant=quant)
 
 
+DRAFT_SCOPES = frozenset({"draft", "mtp", "dspark", "standalone_draft"})
+
+
+def _effective_cache_layout(plan, quant, cache_layout):
+    """Unpacked draft MLA layers ignore target-forwarded packed C8 cache layout."""
+    from .mla_prolog_packed import LAYOUT
+    if (cache_layout == LAYOUT
+            and getattr(plan, "scope", "body") in DRAFT_SCOPES
+            and quant.kv_dtype in BF16_CACHE_DTYPES):
+        return None
+    return cache_layout
+
+
 def validate(*, plan, parallel, model, quant, lowering_passes,
              cache_layout=None, cache_group_size=CACHE_GROUP_SIZE):
     from .mla_prolog_packed import (
         SUPPORTED_QUERY_FORMATS, LAYOUT, view,
     )
+    cache_layout = _effective_cache_layout(plan, quant, cache_layout)
     packed = cache_layout == LAYOUT
     if cache_layout not in (None, LAYOUT) or (packed and quant.kv_dtype != "int8"):
         raise ModelingError("mla_prolog_v3_cache_layout_dtype_mismatch")
@@ -117,6 +131,7 @@ def declare(ops, *, prefix, plan, model, parallel, quant, tokens, members,
         LAYOUT, MXFP8_QUERY_FORMAT, SOURCE as PACKED_SOURCE, SOURCE_V4,
         view as packed_view,
     )
+    cache_layout = _effective_cache_layout(plan, quant, cache_layout)
     packed = cache_layout == LAYOUT
     cache = packed_view(plan.kv_lora_rank, plan.qk_rope_head_dim, cache_group_size) if packed else None
     by_id = {op.op_id: op for op in ops}
@@ -267,6 +282,7 @@ def declare_semantic(ops, *, prefix, plan, model, parallel, quant, tokens, membe
 
 def cache_store(builder, *, deps, rows, plan, cache_layout=None, cache_group_size=CACHE_GROUP_SIZE):
     from .mla_prolog_packed import LAYOUT, store
+    cache_layout = _effective_cache_layout(plan, builder.quant, cache_layout)
     if cache_layout == LAYOUT:
         return store(builder, "kv_store", deps, rows, plan,
                      query_format=quant_format(builder.quant, "mla"))

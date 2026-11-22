@@ -107,6 +107,10 @@ def make_op(params: Mapping[str, Any]) -> OpSpec:
         )),
     )
 
+    s1_work = _stage1_totals(plan, seq_lens)
+    s2_work = _stage2_totals(plan, seq_lens)
+    total_work = s1_work + s2_work
+    total_flops = sum(total_work.matrix.values())
     op = OpSpec(
         op_id="mla_decode",
         family="mla_decode",
@@ -118,6 +122,12 @@ def make_op(params: Mapping[str, Any]) -> OpSpec:
         local_shape=(batch, heads, qk_dim),
         padded_shape=(batch, padded_heads, qk_dim),
         launch_shape=plan["stage1_grid"],
+        flops=float(total_flops),
+        matrix_flops=tuple(total_work.matrix.items()),
+        vector_ops=float(total_work.resources.get("vector", 0)),
+        hbm_bytes=float(total_work.resources.get("hbm", 0)),
+        mte2_bytes=float(total_work.resources.get("mte2", 0)),
+        mte3_bytes=float(total_work.resources.get("mte3", 0)),
         recipe=IMPLEMENTATION, source_boundary="call",
         dtype="bf16",
         metadata=metadata,
@@ -173,6 +183,9 @@ def kernels(op: OpSpec) -> tuple[OpSpec, OpSpec]:
     plan = metadata.get("plan")
     if not isinstance(plan, Mapping):
         raise ValueError("mla_decode_plan_metadata_required")
+    plan, seq_lens = _read_plan(op)
+    s1_work = _stage1_totals(plan, seq_lens)
+    s2_work = _stage2_totals(plan, seq_lens)
     stage1_metadata = {
         **metadata,
         "kernel_phase": "stage1",
@@ -195,6 +208,12 @@ def kernels(op: OpSpec) -> tuple[OpSpec, OpSpec]:
             source_boundary="kernel",
             deps=(),
             launch_shape=tuple(plan["stage1_grid"]),
+            flops=float(sum(s1_work.matrix.values())),
+            matrix_flops=tuple(s1_work.matrix.items()),
+            vector_ops=float(s1_work.resources.get("vector", 0)),
+            hbm_bytes=float(s1_work.resources.get("hbm", 0)),
+            mte2_bytes=float(s1_work.resources.get("mte2", 0)),
+            mte3_bytes=float(s1_work.resources.get("mte3", 0)),
             metadata=tuple(stage1_metadata.items()),
         ),
         replace(
@@ -203,6 +222,12 @@ def kernels(op: OpSpec) -> tuple[OpSpec, OpSpec]:
             source_boundary="kernel",
             deps=("stage1_grouped_decode",),
             launch_shape=tuple(plan["stage2_grid"]),
+            flops=0.0,
+            matrix_flops=(),
+            vector_ops=float(s2_work.resources.get("vector", 0)),
+            hbm_bytes=float(s2_work.resources.get("hbm", 0)),
+            mte2_bytes=float(s2_work.resources.get("mte2", 0)),
+            mte3_bytes=float(s2_work.resources.get("mte3", 0)),
             metadata=tuple(stage2_metadata.items()),
         ),
     )

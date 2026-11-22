@@ -24,6 +24,7 @@ ROPE_OPS = 6
 PROLOG_RECIPE = "draft_context_mla_prolog_v3"
 SCATTER_RECIPE = "draft_context_kv_scatter"
 PROLOG_NATIVE_KIND = "aclnnMlaPrologV3WeightNz"
+PROLOG_V4_NATIVE_KIND = "aclnnMlaPrologV4WeightNz"
 SCATTER_NATIVE_KIND = "aclnnScatterPaKvCache"
 KV_ROW_BYTES_PER_ELEMENT = int(dtype_bytes("bf16"))
 PROLOG_CUBE_SHARE = 1.0
@@ -210,6 +211,11 @@ def prepare(ops, *, projection, model, draft, rows, query_rows,
         qkv_width = (draft.q_lora_rank + draft.kv_lora_rank
                      + draft.qk_rope_head_dim)
         if use_prolog_v3:
+            mla_format = model.quant.format_for("mla")
+            is_mxfp8 = mla_format == "fp8_e4m3"
+            native_kind = PROLOG_V4_NATIVE_KIND if is_mxfp8 else PROLOG_NATIVE_KIND
+            prolog_dtype = mla_format if is_mxfp8 else draft.activation_dtype
+            do_rope = bool(draft.qk_rope_head_dim > 0)
             weight_bytes = model.quant.matrix_bytes(qkv_width, draft.hidden_size, "mla")
             prolog = OpSpec(
                 op_id=name + ".mla_prolog_v3", deps=(norm.op_id,),
@@ -218,16 +224,16 @@ def prepare(ops, *, projection, model, draft, rows, query_rows,
                 padded_shape=(rows, qkv_width), launch_shape=(rows, qkv_width),
                 flops=2 * rows * qkv_width * draft.hidden_size,
                 vector_ops=rows * (NORM_OPS * (draft.q_lora_rank + draft.kv_lora_rank)
-                                   + ROPE_OPS * draft.qk_rope_head_dim),
+                                   + (ROPE_OPS * draft.qk_rope_head_dim if do_rope else 0)),
                 hbm_bytes=(rows * draft.hidden_size * activation_bytes + weight_bytes
                            + rows * qkv_width * activation_bytes),
                 mte2_bytes=rows * draft.hidden_size * activation_bytes + weight_bytes,
                 mte3_bytes=rows * qkv_width * activation_bytes,
-                dtype=draft.activation_dtype,
-                metadata=(("native_kind", PROLOG_NATIVE_KIND),
+                dtype=prolog_dtype,
+                metadata=(("native_kind", native_kind),
                           ("native_source", SOURCE),
-                          ("do_rope", True),
-                          ("fused_members", ("qkv_a", "kv_norm", "kv_rope")),
+                          ("do_rope", do_rope),
+                          ("fused_members", ("qkv_a", "kv_norm", "kv_rope") if do_rope else ("qkv_a", "kv_norm")),
                           ("context_rows", rows), ("query_rows", query_rows),
                           ("data_parallel_context", int(getattr(parallel, "cp", 1) or 1)),
                           ("rank_owned_rows", rank_rows),

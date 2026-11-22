@@ -775,6 +775,18 @@ class _FiaLoop:
         ))
 
 
+def _visible_sequences(
+    contract: AttentionContract, sequences: tuple[tuple[int, int], ...],
+) -> tuple[tuple[int, int], ...]:
+    """Bound per-sequence KV spans by selected_tokens and sliding window for tiling/L2 math."""
+    capped: list[tuple[int, int]] = []
+    for q, kv in sequences:
+        selected = kv if contract.selected_tokens is None else contract.selected_tokens
+        win = (contract.window_size + max(0, q - 1)) if contract.window_size else kv
+        capped.append((q, min(kv, selected, win)))
+    return tuple(capped)
+
+
 def _resolve_native_tiling(
     contract: AttentionContract, ctx: OperatorPlanningContext,
     sequences: tuple[tuple[int, int], ...], *, gm_workspace: bool,
@@ -837,9 +849,11 @@ def dense_fia(
         width = solution.tile_shape.k
         plan = FiaPanelPlan(panels(contract.head_dim, width), panels(contract.v_head_dim, width),
                             1, 2, 2, 1, 1, solution.depth, 1)
-        buffers = tuple((peak.pool, peak.peak_bytes) for peak in solution.pool_peaks)
+        buffers = tuple((peak.pool, peak.peak_bytes) for peak in solution.pool_peaks if peak.pool != "ub")
+        ub_peaks = tuple(peak.peak_bytes for peak in solution.pool_peaks if peak.pool == "ub")
         metadata["tile_solution"] = {
             "algorithm": solution.algorithm, "panel_width": width,
+            "ub_peak_bytes": max(ub_peaks, default=0),
             "rejections": tuple((r.pool, r.required_bytes, r.available_bytes) for r in solution.rejections),
         }
     metadata.update(asdict(plan), k_panels=len(plan.k_panels), v_panels=len(plan.v_panels))
@@ -855,7 +869,8 @@ def dense_fia(
                                         for row, (_, kv) in zip(contract.block_table, sequences))):
         raise ModelingError("attention_fia_block_table_coverage_invalid")
     group = contract.num_heads // contract.num_kv_heads
-    native = _resolve_native_tiling(contract, ctx, sequences, gm_workspace=gm_workspace)
+    visible_sequences = _visible_sequences(contract, sequences)
+    native = _resolve_native_tiling(contract, ctx, visible_sequences, gm_workspace=gm_workspace)
     m_tile = native.m_tile if native is not None else FIA_TILE
     s2_tile = native.s2_tile if native is not None else FIA_TILE
     eff_splits = native.fd_splits_per_row if native is not None else contract.splits
@@ -880,7 +895,7 @@ def dense_fia(
     )
     ws_l2_resident = gm_workspace and l2_cap > 0 and ws_bytes <= l2_cap
     kv_reuse_hit_frac = _compute_kv_l2_reuse(
-        contract, sequences, m_tile, s2_tile, len(owners), l2_cap, ws_bytes, ws_l2_resident, gm_workspace,
+        contract, visible_sequences, m_tile, s2_tile, len(owners), l2_cap, ws_bytes, ws_l2_resident, gm_workspace,
     )
     use_balanced_fd = (
         native is not None and native.fd_enabled and contract.splits == 1

@@ -11,7 +11,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import asdict, replace
 
-from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.common import ModelingError, dtype_bytes
 from mindie_sim.schema.compute_arch import ComputeArchSpec
 from mindie_sim.schema.datapath import ArchId, ComputeArchIdentity, DatapathCapabilitySpec, GENERIC_ARCH_ID
 from mindie_sim.schema.operators import OpSpec
@@ -25,10 +25,10 @@ from ._cp_tiling import (
     with_collectives,
 )
 from .common import (
-    ARCH22, ARCH35, C8_ABI, C8_LATENT_DIM, C8_V1_ABI, FIA_ABI, FIA_TILE,
+    ARCH22, ARCH35, BF16_BYTES, C8_ABI, C8_LATENT_DIM, C8_V1_ABI, FIA_ABI, FIA_TILE,
     GBSA_ABI, MINDIE_ABIS, MINDIE_V3_ABI, NOPE_ABI, QUANT_MODE_BF16, QUANT_MODE_FP8_C8, QUANT_MODE_INT8_C8,
     QUANT_MODE_MINDIE_FP8, QUANT_MODE_MXFP4_CX, QUANT_MODE_MXFP4_OCP, QUANT_MODE_MXFP8, QUANT_MODE_TQ4,
-    SFA_V1_ABI, SUPPORTED_QUANT_MODES, AttentionContract, ContextParallelPlan,
+    SFA_V1_ABI, SOFTMAX_OPS, SUPPORTED_QUANT_MODES, TQ4_ROW_BYTES, AttentionContract, ContextParallelPlan,
     FiaPanelPlan, bsh_kv_access_plan, c8_gather_accounting, describe, lower_cp_collectives,
     shipping_fia_panel_plan, solve_wide_head_tiling, unmodeled, with_sequence_context,
 )
@@ -47,6 +47,52 @@ ABI_BY_RECIPE = {recipe: abi for abi, recipe in RECIPE_BY_ABI.items()}
 STRATEGIES = {ARCH22: arch22.STRATEGY, ARCH35: arch35.STRATEGY}
 DEFAULT_GBSA_BLOCK_SIZE = 8
 DEFAULT_SFA_SELECTED_TOKENS = 2048
+FP8_ELEMENT_BYTES = 1.0
+MXFP4_ELEMENT_BYTES = 0.5
+C8_SCALE_BYTES_PER_ROW = 16
+
+
+def _minimum_contract_io(contract: AttentionContract, dtype: str) -> tuple[float, float, float, float]:
+    """Conservative physical lower bound on (hbm, mte2, mte3, vector_ops) for L* soundness."""
+    out_elem = float(dtype_bytes(dtype))
+    if contract.abi == MINDIE_V3_ABI and contract.quant_mode in {QUANT_MODE_MXFP4_OCP, QUANT_MODE_MXFP4_CX}:
+        q_elem = MXFP4_ELEMENT_BYTES
+    elif contract.quant_mode == QUANT_MODE_MXFP8 or (
+        contract.abi in MINDIE_ABIS and contract.quant_mode == QUANT_MODE_MINDIE_FP8
+    ):
+        q_elem = FP8_ELEMENT_BYTES
+    else:
+        q_elem = out_elem
+    q_bytes = float(contract.query_tokens * contract.num_heads * contract.head_dim) * q_elem
+    o_bytes = float(contract.query_tokens * contract.num_heads * contract.v_head_dim) * out_elem
+    row_counts = tuple(contract.row_counts())
+    vector_ops = float(SOFTMAX_OPS * contract.num_heads * sum(row_counts))
+    if contract.sequences:
+        seq_vis = [
+            min(kv, kv if contract.selected_tokens is None else contract.selected_tokens,
+                (contract.window_size + max(0, q - 1)) if contract.window_size else kv)
+            for q, kv in contract.sequences
+        ]
+        unique_rows = (max(seq_vis, default=0)
+                       if (contract.shared_prefix or contract.block_table)
+                       else sum(seq_vis))
+    elif row_counts:
+        unique_rows = max(row_counts)
+    else:
+        unique_rows = 0
+    if contract.quant_mode == QUANT_MODE_TQ4:
+        kv_row_b = float(TQ4_ROW_BYTES)
+    elif contract.abi in {C8_ABI, C8_V1_ABI}:
+        rope_dim = max(0, contract.head_dim - contract.v_head_dim)
+        kv_row_b = float(contract.v_head_dim + C8_SCALE_BYTES_PER_ROW + rope_dim * BF16_BYTES)
+    elif contract.abi in {NOPE_ABI, SFA_V1_ABI} and contract.num_kv_heads == 1:
+        kv_row_b = float(contract.head_dim) * q_elem
+    else:
+        kv_row_b = float(contract.num_kv_heads * (contract.head_dim + contract.v_head_dim)) * q_elem
+    kv_read = float(unique_rows) * kv_row_b
+    # Warm external L2 backing (kv_tensor_id) may absorb KV HBM reads; Q/O remain live.
+    kv_hbm = 0.0 if contract.kv_tensor_id else kv_read
+    return q_bytes + kv_hbm + o_bytes, q_bytes + kv_read, o_bytes, vector_ops
 
 
 def _legacy_contract(op: OpSpec, meta: dict) -> AttentionContract:
@@ -214,6 +260,7 @@ def make_attention_op(
         matrix_dtype = "fp8_e4m3"
     if contract.abi == MINDIE_V3_ABI and contract.quant_mode in {QUANT_MODE_MXFP4_OCP, QUANT_MODE_MXFP4_CX}:
         matrix_dtype = "mxfp4"
+    hbm_bytes, mte2_bytes, mte3_bytes, vector_ops = _minimum_contract_io(contract, dtype)
     return OpSpec(
         op_id=op_id, deps=deps, stage=stage, layer=layer, requests=requests,
         family=family, phase=contract.phase, recipe=RECIPE_BY_ABI[contract.abi],
@@ -221,6 +268,7 @@ def make_attention_op(
         dtype=dtype, layout=contract.kv_layout,
         source_boundary="call" if contract.cp_plan else "kernel",
         flops=contract.useful_flops, matrix_flops=((matrix_dtype, contract.useful_flops),),
+        vector_ops=vector_ops, hbm_bytes=hbm_bytes, mte2_bytes=mte2_bytes, mte3_bytes=mte3_bytes,
         returns=("lse",) if return_lse else (),
         metadata=(("attention_contract", asdict(contract)), ("native_kind", contract.abi)),
     )

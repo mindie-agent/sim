@@ -182,8 +182,17 @@ def generic_work(*, spans, heads, dim, topk, ratio):
     }
 
 
+ARCH22_PRESET = "npu_arch_2201"
+
+
 def _build_arch35(op, geometry):
     """arch35 FP8 (`quant_mode=1`) block pipeline over the 32 AIC owners."""
+    compute_arch = getattr(geometry, "compute_arch", None) or getattr(
+        getattr(geometry, "datapath", None), "compute_arch", None
+    )
+    preset = str(getattr(compute_arch, "preset", "") or getattr(compute_arch, "arch_id", "") or "")
+    if preset == ARCH22_PRESET:
+        raise ModelingError("quant_lightning_indexer_v2_arch35_requires_arch35")
     ledger = dict(dict(op.metadata)[QUANT_LEDGER])
     plan = Arch35QuantIndexerRecipe().build(op, geometry)
     metadata = {

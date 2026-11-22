@@ -116,14 +116,15 @@ def _schedule(op):
     return heads, qk_dim, latent_dim, dv, kv_row, sequences
 
 
-def _alloc(context, core, cores, tag, heads, q_bytes, kv_tile, latent_dim, dv, qk_dim):
-    ham = ((heads + _CUBE_HEAD_ALIGNMENT - 1) // _CUBE_HEAD_ALIGNMENT) * _CUBE_HEAD_ALIGNMENT
+def _alloc(context, core, cores, tag, heads, q, q_bytes, kv_tile, latent_dim, dv, qk_dim):
+    m_rows = q * heads
+    ham = ((m_rows + _CUBE_HEAD_ALIGNMENT - 1) // _CUBE_HEAD_ALIGNMENT) * _CUBE_HEAD_ALIGNMENT
     pv_keys = max(1, min(KEY_TILE, _MAX_PV_OPERAND_BYTES // max(1, latent_dim * 2)))
     pv_l0 = pv_keys * latent_dim * 2
     specs = (
         ("q_l1", "l1", q_bytes),
         ("kv_l1", "l1", kv_tile),
-        ("acc_ub", "ub", heads * dv * FP32_BYTES + heads * KEY_TILE * FP32_BYTES),
+        ("acc_ub", "ub", m_rows * dv * FP32_BYTES + m_rows * KEY_TILE * FP32_BYTES),
         ("qk_l0a", "l0a", ham * min(KEY_TILE, max(1, qk_dim)) * 2),
         ("pv_l0b", "l0b", pv_l0),
         ("out_l0c", "l0c", ham * dv * FP32_BYTES),
@@ -143,8 +144,9 @@ def _item_stages(context, core, cores, tag, heads, qk_dim, latent_dim, dv,
     read = read_role(context.resource_names)
     place = context.owned(core, cores, (read, "vector", "mte3", "cube"))
     kv_tile = min(KEY_TILE, keys) * kv_row
-    alloc = _alloc(context, core, cores, tag, heads, q_bytes, kv_tile, latent_dim, dv, qk_dim)
-    ham = ((heads + _CUBE_HEAD_ALIGNMENT - 1) // _CUBE_HEAD_ALIGNMENT) * _CUBE_HEAD_ALIGNMENT
+    alloc = _alloc(context, core, cores, tag, heads, q, q_bytes, kv_tile, latent_dim, dv, qk_dim)
+    m_rows = q * heads
+    ham = ((m_rows + _CUBE_HEAD_ALIGNMENT - 1) // _CUBE_HEAD_ALIGNMENT) * _CUBE_HEAD_ALIGNMENT
 
     def tile(index):
         start = index * KEY_TILE
@@ -157,18 +159,18 @@ def _item_stages(context, core, cores, tag, heads, qk_dim, latent_dim, dv,
                 resources={"hbm": load, read: load})), placement=place),
             Stage(f"qk{tag}_{index}", context.bind(Work(
                 matrix={"bf16": qk_i},
-                resources={"vector": _QK_VECTOR_OPS_PER_HEAD_PAIR * count * heads})),
+                resources={"vector": _QK_VECTOR_OPS_PER_HEAD_PAIR * count * m_rows})),
                   after=(f"key_load{tag}_{index}",), placement=place),
             Stage(f"online{tag}_{index}", context.bind(Work(
-                resources={"vector": _ONLINE_VECTOR_OPS_PER_HEAD_PAIR * count * heads
-                           + 2 * heads})),
+                resources={"vector": _ONLINE_VECTOR_OPS_PER_HEAD_PAIR * count * m_rows
+                           + 2 * m_rows})),
                   after=(f"qk{tag}_{index}",), placement=place),
             Stage(f"pv{tag}_{index}", context.bind(Work(
                 matrix={"bf16": pv_i},
-                resources={"vector": _PV_VECTOR_OPS_PER_HEAD_PAIR * count * heads})),
+                resources={"vector": _PV_VECTOR_OPS_PER_HEAD_PAIR * count * m_rows})),
                   after=(f"online{tag}_{index}",), placement=place),
             Stage(f"update{tag}_{index}", context.bind(Work(
-                resources={"vector": _UPDATE_VECTOR_OPS_PER_OUTPUT_ELEMENT * heads * dv})),
+                resources={"vector": _UPDATE_VECTOR_OPS_PER_OUTPUT_ELEMENT * m_rows * dv})),
                   after=(f"pv{tag}_{index}",), placement=place),
         )
 
@@ -185,7 +187,7 @@ def _item_stages(context, core, cores, tag, heads, qk_dim, latent_dim, dv,
             previous = stage.name
     fin = f"finalize{tag}"
     stages.append(Stage(fin, context.bind(Work(
-        resources={"vector": 2 * heads * dv,
+        resources={"vector": 2 * m_rows * dv,
                    "hbm": out_bytes, "mte3": out_bytes})),
         after=(previous,), placement=place, free=alloc))
     return stages, fin
@@ -203,22 +205,22 @@ def _max_heads_per_owner(heads, q, keys, qk_dim, latent_dim, dv, kv_row, geometr
     limit = heads
     ub_cap = cap("ub")
     if ub_cap is not None:
-        ub_per_head = (dv + KEY_TILE) * FP32_BYTES
+        ub_per_head = q * (dv + KEY_TILE) * FP32_BYTES
         limit = min(limit, max(1, ub_cap // max(1, ub_per_head)))
     l0c_cap = cap("l0c")
     if l0c_cap is not None:
-        l0c_per_head = dv * FP32_BYTES
-        max_ham = max(alignment, (l0c_cap // max(1, l0c_per_head) // alignment) * alignment)
-        if l0c_cap < alignment * l0c_per_head:
-            max_ham = max(1, l0c_cap // max(1, l0c_per_head))
-        limit = min(limit, max_ham)
+        l0c_per_row = dv * FP32_BYTES
+        max_rows = (l0c_cap // max(1, l0c_per_row) // alignment) * alignment
+        if l0c_cap < alignment * l0c_per_row:
+            max_rows = max(1, l0c_cap // max(1, l0c_per_row))
+        limit = min(limit, max(1, max_rows // max(1, q)))
     l0a_cap = cap("l0a")
     if l0a_cap is not None:
         qk_panel = min(KEY_TILE, max(1, qk_dim)) * 2
-        max_ham = max(alignment, (l0a_cap // max(1, qk_panel) // alignment) * alignment)
+        max_rows = (l0a_cap // max(1, qk_panel) // alignment) * alignment
         if l0a_cap < alignment * qk_panel:
-            max_ham = max(1, l0a_cap // max(1, qk_panel))
-        limit = min(limit, max_ham)
+            max_rows = max(1, l0a_cap // max(1, qk_panel))
+        limit = min(limit, max(1, max_rows // max(1, q)))
     l1_cap = cap("l1")
     kv_tile = min(KEY_TILE, keys) * kv_row
     if l1_cap is not None and l1_cap > kv_tile:
@@ -248,22 +250,23 @@ def build(op, geometry):
         head_step = _max_heads_per_owner(heads, q, keys, qk_dim, latent_dim, dv, kv_row, geometry)
         for h_start in range(0, heads, head_step):
             h_cur = min(head_step, heads - h_start)
+            m_cur = q * h_cur
             owner_items.append((q, keys, h_cur))
-            q_bytes = q * h_cur * qk_dim * 2
-            out_bytes = q * h_cur * latent_dim * 2
+            q_bytes = m_cur * qk_dim * 2
+            out_bytes = m_cur * latent_dim * 2
             total_q += q_bytes
             total_kv += keys * kv_row
             total_out += out_bytes
-            logical += 2 * keys * h_cur * (qk_dim + latent_dim)
-            ham = ((h_cur + alignment - 1) // alignment) * alignment
+            logical += 2 * keys * m_cur * (qk_dim + latent_dim)
+            ham = ((m_cur + alignment - 1) // alignment) * alignment
             issued += 2 * keys * ham * (qk_dim + latent_dim)
             total += Work(resources={"hbm": q_bytes, read: q_bytes})
             total += Work(resources={"hbm": keys * kv_row, read: keys * kv_row})
             total += Work(matrix={"bf16": 2 * keys * ham * (qk_dim + latent_dim)})
             owners = (keys + KEY_TILE - 1) // KEY_TILE
-            vector = (vector_ops_per_pair * keys * h_cur + 2 * h_cur * owners
-                      + _UPDATE_VECTOR_OPS_PER_OUTPUT_ELEMENT * h_cur * dv * owners
-                      + 2 * h_cur * dv)
+            vector = (vector_ops_per_pair * keys * m_cur + 2 * m_cur * owners
+                      + _UPDATE_VECTOR_OPS_PER_OUTPUT_ELEMENT * m_cur * dv * owners
+                      + 2 * m_cur * dv)
             total += Work(resources={"vector": vector})
             total += Work(resources={"hbm": out_bytes, "mte3": out_bytes})
 

@@ -316,18 +316,33 @@ def _resolve_mla_dcp_flags(
             q_replicate, own_block, index_rope)
 
 
-def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
-        padded_tokens, cache_ids, topk_ids, index_cache_ids, candidate_ids,
-        stage_of, cp_interleave_size=DEFAULT_INTERLEAVE, runtime=None, policy=None,
-        machine=None, hierarchy=None, reuse_index_selection=False, shared_topk=None,
-        dcp_cohort_views_by_member=None, dcp_local_pos=0,
-        physical_rank=None, explicit_physical_rank=False):
+def _prepare_mla_views(plan, model, runtime, mode, parallel, views,
+                       dcp_cohort_views_by_member, dcp_local_pos):
+    from mindie_sim.prediction.operators.attention.attention import _cap_draft_views, _draft_kv_cap
+    draft_cap = _draft_kv_cap(plan, model, runtime, mode)
+    if draft_cap > 0:
+        views = _cap_draft_views(views, draft_cap)
     pcp_factor, tp_gather, raw_dp_width = layer_dcp_factors(plan, parallel)
     dp_width = raw_dp_width if int(getattr(parallel, "dp", 1) or 1) >= raw_dp_width else 1
     cohort_dec_views, peer_dec_rows, local_dp_pos = resolve_dcp_cohort_decode(
         views, dp_width=dp_width,
         cohort_views_by_member=dcp_cohort_views_by_member,
         local_dp_pos=dcp_local_pos)
+    if draft_cap > 0 and cohort_dec_views:
+        cohort_dec_views = _cap_draft_views(cohort_dec_views, draft_cap)
+    return views, pcp_factor, tp_gather, dp_width, cohort_dec_views, peer_dec_rows, local_dp_pos
+
+
+def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
+        padded_tokens, cache_ids, topk_ids, index_cache_ids, candidate_ids,
+        stage_of, cp_interleave_size=DEFAULT_INTERLEAVE, runtime=None, policy=None,
+        machine=None, hierarchy=None, reuse_index_selection=False, shared_topk=None,
+        dcp_cohort_views_by_member=None, dcp_local_pos=0,
+        physical_rank=None, explicit_physical_rank=False):
+    (views, pcp_factor, tp_gather, dp_width,
+     cohort_dec_views, peer_dec_rows, local_dp_pos) = _prepare_mla_views(
+        plan, model, runtime, mode, parallel, views,
+        dcp_cohort_views_by_member, dcp_local_pos)
     if (padded_tokens == 0 and not views and layer_dcp_degree(plan, parallel) > 1
             and dp_width > 1 and cohort_dec_views):
         return _mla_idle_dcp_owner(
@@ -355,12 +370,9 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
                      if runtime and select(runtime.kernels.get("lowerings", {}), "mla_head_padding")
                      else None)
     logical_heads = heads
-    if head_contract:
-        heads = head_contract["physical_heads"]
-    dsa_prefill = (
-        parallel.cp_plan == "dsa_cp" and parallel.tp > 1
-        and any(view.phase == "prefill" for view in views)
-    )
+    heads = head_contract["physical_heads"] if head_contract else heads
+    dsa_prefill = (parallel.cp_plan == "dsa_cp" and parallel.tp > 1
+                   and any(view.phase == "prefill" for view in views))
     width = plan.qk_nope_head_dim + plan.qk_rope_head_dim
     latent = plan.mla_variant != "latent_mqa"
     query_tile = policy.query_tile if policy else DEFAULT_QUERY_TILE
@@ -412,7 +424,8 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         cache_views=idx_views,
         cache_padded_tokens=idx_q,
         skip_pcp_index_gather=(v4_hidden_gathered or kpool_gathered is not None
-                               or v41_comp_gathered))
+                               or v41_comp_gathered),
+        machine=machine)
     attn_topk = topk
     if decode_dcp and topk and not sharded_indexer and plan.index_topk > 0:
         attn_topk = emit_sfa_index_remap(
@@ -1072,7 +1085,7 @@ def _append_mla_request(
         )
         local_cache_read = traffic.hbm_read_bytes
     vis_keys = (
-        min(local_rows, plan.window) if (plan.window > 0 and eff_cp == 1)
+        local_rows if plan.window > 0
         else local_sweeps if (plan.cache_kind == "dense" and not topk
                               and eff_q == 1)
         else local_rows

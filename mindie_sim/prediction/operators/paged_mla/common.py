@@ -432,6 +432,24 @@ def mla_step_crosscore_ms(ctx, step: str, *, gm_workspace: bool, abi: str) -> fl
     return (float(mult) * float(ns) / NS_PER_MS_MLA) if (ns is not None and ns > 0.0) else 0.0
 
 
+PAGED_MLA_MIN_SOFTMAX_OPS = 4
+
+
+def _minimum_contract_io(c: PagedMlaContract, dtype: str) -> tuple[float, float, float, float]:
+    """Conservative lower bound on (hbm, mte2, mte3, vector_ops) for L* soundness."""
+    tokens = sum(q for q, _ in c.sequences)
+    elem_b = float(dtype_bytes(dtype))
+    q_bytes = float(tokens * c.logical_heads * c.dqk) * elem_b
+    o_bytes = float(tokens * c.logical_heads * c.dv) * elem_b
+    total_pairs = c.selected_pairs
+    vector_ops = float(PAGED_MLA_MIN_SOFTMAX_OPS * c.logical_heads * total_pairs)
+    total_kv = sum(kv for _, kv in c.sequences)
+    unique_kv = min(total_kv, total_pairs) if c.mixed_quant else total_kv
+    kv_row_b = float(MQS_COMPRESSED_ROW_BYTES if c.mixed_quant else latent_record_bytes(c, dtype=dtype))
+    kv_bytes = float(unique_kv) * kv_row_b
+    return q_bytes + kv_bytes + o_bytes, q_bytes + kv_bytes, o_bytes, vector_ops
+
+
 def make_op(
     contract: PagedMlaContract | Mapping | None = None, *,
     op_id: str = FAMILY, dtype: str = "bf16", phase: str = "decode",
@@ -444,12 +462,14 @@ def make_op(
                           else _from_mapping(contract_fields if contract is None else contract))
     tokens = sum(q for q, _ in c.sequences)
     logical, padded = (tokens, c.logical_heads, c.dqk), (tokens, c.physical_heads, c.dqk)
+    hbm_bytes, mte2_bytes, mte3_bytes, vector_ops = _minimum_contract_io(c, dtype)
     return OpSpec(
         op_id=op_id, family=FAMILY, phase=phase, stage=stage, layer=layer,
         requests=tuple(f"seq{i}" for i in range(len(c.sequences))),
         semantic_shape=logical, local_shape=logical, padded_shape=padded, launch_shape=padded,
         dtype=dtype, layout=c.kv_layout, recipe=FAMILY, coverage="source",
-        deps=deps, flops=c.useful_matrix_flops,
+        deps=deps, flops=c.useful_matrix_flops, vector_ops=vector_ops,
+        hbm_bytes=hbm_bytes, mte2_bytes=mte2_bytes, mte3_bytes=mte3_bytes,
         returns=("softmax_lse",) if c.return_lse else (),
         metadata=((CONTRACT_KEY, {f.name: getattr(c, f.name) for f in fields(c)}),
                   ("requested_abi", c.abi)),

@@ -127,7 +127,11 @@ def raw_eager_requested(runtime):
     return _policy(runtime)[2]
 
 
-def _is_a5_runtime(runtime) -> bool:
+def _is_a5_runtime(runtime, machine=None) -> bool:
+    if machine is not None:
+        m_fam = str(getattr(machine, "arch_family", "") or "").upper()
+        if m_fam:
+            return m_fam == "A5"
     if runtime is None:
         return False
     meta = dict(getattr(runtime, "metadata", ()) or ())
@@ -344,11 +348,12 @@ def lower_index_path(builder, *, plan, model, quant, parallel, views, deps, runt
                      pcp_prefill, dsa_prefill, hierarchy=None, reuse_selection=False,
                      shared_topk=None, fused_compressor=False,
                      cache_hidden_dep=None, cache_views=None,
-                     cache_padded_tokens=None, skip_pcp_index_gather=False):
+                     cache_padded_tokens=None, skip_pcp_index_gather=False,
+                     machine=None):
     """Produce the index cache and (optionally) its TopK selection."""
     b = builder
     q = padded_tokens
-    native_indexer = native_indexer_active(runtime)
+    native_indexer = native_indexer_active(runtime, machine)
     ratio = max(1, plan.compress_ratio)
     eff_dcp = max(int(cp), layer_dcp_degree(plan, parallel)) if dcp_indexer_sharded(model, runtime) else int(cp)
     sharded_index = dcp_indexer_sharded(model, runtime) and eff_dcp > 1
@@ -374,7 +379,7 @@ def lower_index_path(builder, *, plan, model, quant, parallel, views, deps, runt
         b, plan, pool_binding, prod_views, prod_deps, model, quant, prod_q, long_store,
         compressed_latent, ratio, prod_valid, fused_compressor, runtime, native_indexer,
         index_rope, parallel, idx_block, sharded_index,
-        pcp_prefill=(pcp_prefill and not skip_pcp_index_gather))
+        pcp_prefill=(pcp_prefill and not skip_pcp_index_gather), machine=machine)
     if (pcp_prefill and not skip_pcp_index_gather and plan.index_kpool <= 1
             and plan.indexer and plan.owns_index_k and index_store is not None):
         # One stored index vector is index_dim wide, not index_heads copies of it.
@@ -441,7 +446,7 @@ def lower_index_path(builder, *, plan, model, quant, parallel, views, deps, runt
         topk = _select_index_rows(
             b, plan, pool_binding, views, model, quant, q_index, weights, index_store, q,
             runtime, hierarchy, shard_sizes, selection_deps, parallel, stage, ratio, shard,
-            score_rows)
+            score_rows, machine=machine)
         if shard > 1 and not dsa_prefill:
             topk = b.work(
                 "candidate_pack", (topk,), (valid, plan.index_topk),
@@ -469,7 +474,7 @@ def lower_index_path(builder, *, plan, model, quant, parallel, views, deps, runt
 def _produce_index_cache(
     b, plan, pool_binding, views, deps, model, quant, q, long_store, compressed_latent, ratio,
     valid, fused_compressor, runtime, native_indexer, index_rope, parallel, idx_block,
-    sharded_index, *, pcp_prefill=False,
+    sharded_index, *, pcp_prefill=False, machine=None,
 ):
     index_store = pool_weights = None
     if plan.owns_index_k and plan.index_kpool > 1:
@@ -546,7 +551,7 @@ def _produce_index_cache(
                            "quant_lightning_indexer") is not None
             )
             fp32_wrapper = (
-                not _is_a5_runtime(runtime)
+                not _is_a5_runtime(runtime, machine)
                 and not explicit_quant_indexer
                 and quant.index_dtype in {"bf16", "fp16"}
             )
@@ -604,6 +609,7 @@ def _produce_index_cache(
 def _select_index_rows(
     b, plan, pool_binding, views, model, quant, q_index, weights, index_store, q, runtime,
     hierarchy, shard_sizes, selection_deps, parallel, stage, ratio, shard, score_rows,
+    *, machine=None,
 ):
     if plan.index_kpool > 1:
         from mindie_sim.prediction.operators.sparse_indexer import index_pool
@@ -676,5 +682,5 @@ def _select_index_rows(
                 b, deps=selection_deps, views=views, plan=plan, model=model,
                 quant=quant, parallel=parallel, shard=shard, prefix=b.prefix,
                 padded_tokens=q, runtime=runtime, score_rows=score_rows,
-                l2_bytes=getattr(b, "l2_bytes", None))
+                l2_bytes=getattr(b, "l2_bytes", None), machine=machine)
     return topk

@@ -23,6 +23,7 @@
 """
 from __future__ import annotations
 
+from dataclasses import replace
 import math
 from typing import Any, Mapping
 
@@ -94,6 +95,38 @@ def _resolve_mode(mode: str, *, cache_dtype: str, compress_ratio: int, step5_sum
     return "scatter_pa_kv_cache" if cache_dtype in {"bf16", "fp16", "bfloat16", "float16"} else "c8_indexer_quant_cache"
 
 
+ARCH22_FAMILIES = frozenset({"A2", "A3"})
+ARCH22_PRESET = "npu_arch_2201"
+
+
+def _is_arch22_target(runtime: Any, machine: Any) -> bool:
+    """True when target architecture is Arch22 (INT8 C8/NZ, no native FP8)."""
+    if machine is not None:
+        m_fam = str(getattr(machine, "arch_family", "") or "").strip().upper()
+        if m_fam:
+            return m_fam in ARCH22_FAMILIES
+        compute_arch = getattr(machine, "compute_arch", None)
+        if compute_arch is None:
+            dies = tuple(getattr(machine, "dies", ()) or ())
+            if dies:
+                compute_arch = getattr(dies[0], "compute_arch", None)
+        preset = str(getattr(compute_arch, "preset", "") or getattr(compute_arch, "arch_id", "") or "")
+        if preset:
+            return preset == ARCH22_PRESET
+    if runtime is not None:
+        rt_meta = dict(getattr(runtime, "metadata", ()) or ())
+        r_fam = str(rt_meta.get("arch_family") or "").strip().upper()
+        if r_fam:
+            return r_fam in ARCH22_FAMILIES
+    return False
+
+
+def _with_l2_slot_hbm(op: OpSpec, slot_bytes: float) -> OpSpec:
+    """Exclude L2-resident slot table reads from op.hbm_bytes to match build_index_cache_writer."""
+    adj_read = max(0.0, float(op.mte2_bytes) - float(slot_bytes))
+    return replace(op, hbm_bytes=adj_read + float(op.mte3_bytes))
+
+
 def emit_index_cache_write(
     *, mode: str = "auto", op_id: str = "", prefix: str = "", deps: tuple[str, ...] = (),
     stage: int = 0, layer: int = 0, requests: tuple[str, ...] = (), phase: str = "decode",
@@ -106,7 +139,7 @@ def emit_index_cache_write(
     machine: Any = None, metadata: tuple[tuple[str, Any], ...] = (),
 ) -> list[OpSpec]:
     """Emit the single native paged index/summary cache write op for a layer."""
-    del runtime, machine
+    arch22 = _is_arch22_target(runtime, machine)
     resolved_owns = owns_index_k if owns_index_k is not None else (
         bool(getattr(plan, "owns_index_k", False) or getattr(plan, "indexer", False)) if plan is not None else True
     )
@@ -116,7 +149,10 @@ def emit_index_cache_write(
     resolved_op_id = str(op_id or (f"{prefix}.index_store" if prefix else "index_store"))
     total_rows, head_count = max(0, int(rows)), max(1, int(heads))
     resolved_in_dtype = str(input_dtype or (getattr(model, "activation_dtype", None) if model is not None else None) or "bf16")
-    resolved_cache_dtype = str(cache_dtype or (getattr(quant, "index_dtype", None) if quant is not None else None) or "fp8_e4m3")
+    default_cache = "int8" if arch22 else "fp8_e4m3"
+    resolved_cache_dtype = str(cache_dtype or (getattr(quant, "index_dtype", None) if quant is not None else None) or default_cache)
+    if arch22 and resolved_cache_dtype == "fp8_e4m3":
+        raise ModelingError("index_cache_writer_fp8_unsupported_on_arch22")
     default_scale = "none" if resolved_cache_dtype in {"bf16", "fp16", "bfloat16", "float16"} else "fp32"
     resolved_scale_dtype = str(scale_dtype or (getattr(quant, "index_scale_dtype", None) if quant is not None else None) or default_scale)
     plan_kpool = int(getattr(plan, "index_kpool", 1) or 1) if plan is not None else 1
@@ -133,7 +169,7 @@ def emit_index_cache_write(
     if selected in {"scatter_pa_kv_cache", "bf16_scatter_pa"}:
         payload, slot_bytes = float(total_rows * head_count * width), float(total_rows * SLOT_INDEX_BYTES)
         write_bytes = float(total_rows) * float(row_bytes) if row_bytes is not None else payload * out_elem
-        return [vector_op(
+        return [_with_l2_slot_hbm(vector_op(
             op_id=resolved_op_id, deps=deps, stage=stage, layer=layer, requests=requests, phase=phase,
             family=KV_CACHE_WRITE_FAMILY, recipe=SCATTER_PA_KV_RECIPE, dtype=resolved_cache_dtype,
             elements=int(payload), ops_per_element=0.0, read_bytes_override=payload * in_bytes + slot_bytes,
@@ -142,15 +178,16 @@ def emit_index_cache_write(
                 ("native_kind", "aclnnScatterPaKvCache"), ("read_pipe", "aiv"),
                 ("slot_table_bytes", slot_bytes), ("zero_external_casts", True), ("native_source", SCATTER_PA_KV_SOURCE),
             ),
-        )]
+        ), slot_bytes)]
 
     if selected == "qsa_dual_pages":
         ratio = max(1, int(resolved_ratio or DEFAULT_QSA_COMPRESS_RATIO))
         comp_rows = max(0, int(completed_rows)) if completed_rows is not None else (math.ceil(total_rows / ratio) if total_rows > 0 else 0)
         raw_tail_rows = min(total_rows, 2 * ratio)
-        read_bytes = float(total_rows * width * in_bytes + total_rows * SLOT_INDEX_BYTES)
+        slot_bytes = float(total_rows * SLOT_INDEX_BYTES)
+        read_bytes = float(total_rows * width * in_bytes) + slot_bytes
         write_bytes = float(raw_tail_rows * width * in_bytes + comp_rows * width * out_elem)
-        return [vector_op(
+        return [_with_l2_slot_hbm(vector_op(
             op_id=resolved_op_id, deps=deps, stage=stage, layer=layer, requests=requests, phase=phase,
             family=KV_CACHE_WRITE_FAMILY, recipe=QSA_DUAL_CACHE_RECIPE, dtype=resolved_cache_dtype,
             elements=total_rows * width, ops_per_element=float(POOL_REDUCE_OPS_PER_ELEMENT),
@@ -160,15 +197,16 @@ def emit_index_cache_write(
                 ("native_kind", "qsa_dual_page_cache_write"), ("read_pipe", "aiv"), ("compress_ratio", ratio),
                 ("raw_circular_rows", raw_tail_rows), ("compressed_rows", comp_rows), ("native_source", QSA_CACHE_SOURCE),
             ),
-        )]
+        ), slot_bytes)]
 
     if selected == "step5_summary_update":
         region = max(1, int(resolved_block or DEFAULT_STEP5_REGION_BLOCK))
         summary_rows = max(0, int(completed_rows)) if completed_rows is not None else (math.ceil(total_rows / region) if total_rows > 0 else 0)
         tail_rows = min(total_rows, region)
-        read_bytes = float(total_rows * head_count * width * in_bytes + summary_rows * SLOT_INDEX_BYTES)
+        slot_bytes = float(summary_rows * SLOT_INDEX_BYTES)
+        read_bytes = float(total_rows * head_count * width * in_bytes) + slot_bytes
         write_bytes = float(summary_rows * head_count * (width * out_elem + scale_bytes) + tail_rows * head_count * width * in_bytes)
-        return [vector_op(
+        return [_with_l2_slot_hbm(vector_op(
             op_id=resolved_op_id, deps=deps, stage=stage, layer=layer, requests=requests, phase=phase,
             family=INDEXER_QUANT_CACHE_FAMILY, recipe=STEP5_SUMMARY_RECIPE, dtype=resolved_cache_dtype,
             elements=total_rows * head_count * width, ops_per_element=float(SSMAX_OPS_PER_ELEMENT),
@@ -178,14 +216,14 @@ def emit_index_cache_write(
                 ("native_kind", "step5_csa_summary_update"), ("read_pipe", "aiv"), ("region_block_size", region),
                 ("summary_rows", summary_rows), ("summary_reduction", "ssmax"), ("native_source", STEP5_SUMMARY_SOURCE),
             ),
-        )]
+        ), slot_bytes)]
 
     if selected in {"c8_indexer_quant_cache", "indexer_quant_cache"}:
         group = max(1, int(group_size or width))
         groups = max(1, math.ceil(width / group))
         per_row = float(row_bytes) if row_bytes is not None else head_count * (width * out_elem + groups * scale_bytes)
         slot_bytes, payload = float(total_rows * SLOT_INDEX_BYTES), total_rows * head_count * width
-        return [vector_op(
+        return [_with_l2_slot_hbm(vector_op(
             op_id=resolved_op_id, deps=deps, stage=stage, layer=layer, requests=requests, phase=phase,
             family=INDEXER_QUANT_CACHE_FAMILY, recipe=C8_INDEXER_CACHE_RECIPE, dtype=resolved_cache_dtype,
             elements=payload, ops_per_element=float(QUANT_OPS_PER_ELEMENT),
@@ -196,7 +234,7 @@ def emit_index_cache_write(
                 ("payload_dtype", resolved_cache_dtype), ("scale_dtype", resolved_scale_dtype),
                 ("group_size", group), ("single_read_single_write", True), ("native_source", SFA_INDEXER_CACHE_SOURCE),
             ),
-        )]
+        ), slot_bytes)]
 
     raise ModelingError(f"unsupported_index_cache_write_mode:{mode}")
 

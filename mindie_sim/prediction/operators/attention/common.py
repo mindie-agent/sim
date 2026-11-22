@@ -168,6 +168,7 @@ class AttentionMemoryRead:
 INDEX_BYTES = 4
 SCALE_ADDRESS_BYTES = 8
 SOFTMAX_OPS = 5
+SOFTMAX_STATS_SLOTS = 2
 C8_LATENT_DIM = 512
 C8_ROPE_DIM = 64
 C8_SCALE_COUNT = 4
@@ -523,6 +524,10 @@ def solve_wide_head_tiling(
             LiveBufferSpec("p", "l1", s1 * s2 * BF16_BYTES, PROBABILITY_READY, PV_COMPLETE, "aic"),
             LiveBufferSpec("l0b", "l0b", s2 * min(width, l0_cols) * BF16_BYTES,
                            1, PV_COMPLETE, "aic", slots=operand_slots),
+            LiveBufferSpec("l0c", "l0c", s1 * s2 * FP32_BYTES, 1, PROBABILITY_READY, "aic"),
+            LiveBufferSpec("score_ub", "ub",
+                           (s1 * s2 + s1 * SOFTMAX_STATS_SLOTS) * FP32_BYTES,
+                           1, PROBABILITY_READY, "aiv"),
         )
         flops = 2 * s1 * s2 * (dk + dv)
         candidates.append(TileCandidate(

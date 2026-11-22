@@ -77,6 +77,7 @@ def lower(b, *, views, plan, parallel, quant, deps, padded_tokens, stage_of,
             'output_shape': (1024,), 'output_dtype': 'int32',
             'query_layout': 'TND', 'cache_layout': 'PA_BBND'}
     result = b.work('sparse_mla_metadata', deps, (batch, rows),
+                    read=reads, write=writes,
                     family='attention_metadata', dtype='int32', metadata=(
         ('kernel', NATIVE), ('native_kind', NATIVE), ('implementation', IMPLEMENTATION),
         ('invocation_class', 'aicpu'), ('execution_domain', 'AI_CPU'),

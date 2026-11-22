@@ -588,3 +588,63 @@ def test_mindie_v3_binds_packed_operands_and_eight_bit_scale_planes(mode, dst_ty
 def test_c8_gather_l2_admission_uses_unique_sector_union_not_duplicate_copy_bytes():
     accounting = governed.c8_gather_accounting(query_tokens=2, selected_tokens=1, selection_lists=((0, 0), (0,)), l2_capacity_bytes=1024)
     assert accounting.aligned_transfer_bytes == 3 * 672 and accounting.l2_hit_bytes == 672 and accounting.dram_sector_bytes == 2 * 672
+
+
+def test_sparse_mla_metadata_and_governed_attention_ops_declare_physical_io():
+    from mindie_sim.prediction.lowering import Builder
+    from mindie_sim.prediction.operators import paged_mla
+    from mindie_sim.prediction.operators.mla import mla_decode
+    from mindie_sim.prediction.operators.paged_mla import family_paged_mla
+    from mindie_sim.prediction.operators.sparse_indexer import sparse_mla_metadata
+    from mindie_sim.prediction.structure import parse_case
+
+    case = parse_case(compose_case(
+        "deepseek-v3.2", hardware="a5", tp=1, dp=1, ep=1, num_devices=1,
+        layers=2, quant="bf16", prompt_tokens=16, output_tokens=2))
+    nope_plan = replace(case.model.layer_plans[0], qk_rope_head_dim=0, index_topk=2048)
+    nope_model = replace(case.model, layer_plans=(nope_plan, *case.model.layer_plans[1:]))
+    views = (RequestView("r0", 1, 2048, False, "decode"),)
+    builder = Builder("s0.l0", nope_plan, 0, views, nope_model, "decode")
+    sparse_mla_metadata.lower(
+        builder, views=views, plan=nope_plan, parallel=ParallelSpec(),
+        quant=nope_model.quant, deps=(), padded_tokens=1,
+        stage_of=lambda _: 0, layer_groups=((0,),),
+    )
+    meta_op = next(op for op in builder.ops if op.recipe == METADATA_RECIPE)
+    spec = dict(meta_op.metadata)["metadata_call"]
+    assert meta_op.flops == 0 and meta_op.vector_ops == 0
+    assert meta_op.mte2_bytes == spec["input_read_bytes"] > 0
+    assert meta_op.mte3_bytes == spec["output_write_bytes"] > 0
+    assert meta_op.hbm_bytes == meta_op.mte2_bytes + meta_op.mte3_bytes
+
+    attn_op = governed.make_attention_op(
+        governed.AttentionContract(2, 8, 2, 128, 128, sequences=((2, 256),)), op_id="fia-io",
+    )
+    assert attn_op.hbm_bytes > 0 and attn_op.mte2_bytes > 0 and attn_op.mte3_bytes > 0 and attn_op.vector_ops > 0
+
+    pmla_op = paged_mla.make_op(paged_mla.PagedMlaContract(((1, 128),), 8, 64))
+    assert pmla_op.hbm_bytes > 0 and pmla_op.mte2_bytes > 0 and pmla_op.mte3_bytes > 0 and pmla_op.vector_ops > 0
+
+    decl = {
+        "implementation": family_paged_mla.IMPLEMENTATION,
+        "geometry": {"active_sequence_count": 2, "native_query_capacity": 2,
+                     "logical_heads": 16, "physical_heads": 16, "kv_lengths": (256, 256),
+                     "retained_kv_rows": 128},
+        "operands": {"latent_width": 512, "rope_width": 64, "query_dtype": "bf16",
+                     "cache_dtype": "bf16", "output_dtype": "bf16"},
+        "metadata": {},
+    }
+    decl_op = family_paged_mla._declaration_op(decl, views=views, plan=case.model.layer_plans[0])
+    assert decl_op.flops > 0 and decl_op.vector_ops > 0
+    assert 0 < decl_op.hbm_bytes < decl_op.mte2_bytes + decl_op.mte3_bytes
+
+    dec_op = mla_decode.make_op({
+        "implementation": mla_decode.IMPLEMENTATION, "is_mla": True, "is_hip": False,
+        "dtype": "bf16", "cache_dtype": "bf16", "heads": 16, "key_heads": 1,
+        "latent_dim": 512, "rope_dim": 64, "page_size": 16, "num_kv_splits": 4,
+        "contexts": [256, 512],
+    })
+    s1_op, s2_op = mla_decode.kernels(dec_op)
+    assert dec_op.flops == pytest.approx(s1_op.flops + s2_op.flops) and dec_op.flops > 0
+    assert dec_op.hbm_bytes == pytest.approx(s1_op.hbm_bytes + s2_op.hbm_bytes) and dec_op.hbm_bytes > 0
+    assert s1_op.mte2_bytes > 0 and s2_op.mte2_bytes > 0 and s2_op.vector_ops > 0

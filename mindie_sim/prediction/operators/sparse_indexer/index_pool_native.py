@@ -362,7 +362,7 @@ def _pool_ledger(views, plan, quant, local_tokens, output_width, pool_row_bytes,
         "score_pairs": float(sum(g.scanned_pools for g in geometry) * heads),
         "wave_cache_bytes": float(blocks * 1024 * pool_row_bytes),
         "wave_descale_bytes": float(blocks * heads * 1024 * FP32_ELEMENT_BYTES),
-        "weight_bytes": float(heads * width * FP8_BYTES + heads * FP32_BYTES),
+        "weight_bytes": float(heads * width * int(dtype_bytes(score_dtype)) + heads * FP32_BYTES),
         "output_bytes": float(local_tokens) * output_width * INT32_BYTES,
     }
 

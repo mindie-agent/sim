@@ -136,6 +136,54 @@ def _lower_gqa_dcp_query(
     return dcp_query_producer, dcp_heads
 
 
+DRAFT_SCOPES = frozenset({"draft", "mtp", "dspark", "standalone_draft"})
+
+
+def _draft_kv_cap(plan, model, runtime, mode: str) -> int:
+    """Explicit draft KV length cap (never reads target max_position_embeddings)."""
+    if mode not in {"draft", "draft_prefill"} and getattr(plan, "scope", "") not in DRAFT_SCOPES:
+        return 0
+    rt_meta = dict(getattr(runtime, "metadata", ()) or ()) if runtime is not None else {}
+    rt_extra = dict(rt_meta.get("additional_config") or ()) if isinstance(rt_meta.get("additional_config"), dict) else {}
+    model_meta = dict(getattr(model, "metadata", ()) or ()) if model is not None else {}
+    candidates = [
+        int(getattr(plan, attr, 0) or 0)
+        for attr in ("max_model_len", "draft_max_model_len", "max_position_embeddings")
+    ]
+    for source in (rt_meta, rt_extra, model_meta):
+        raw = source.get("draft_max_model_len")
+        if raw is not None:
+            candidates.append(int(raw or 0))
+    positive = [val for val in candidates if val > 0]
+    return min(positive) if positive else 0
+
+
+def _cap_draft_views(views, cap: int):
+    """Bound draft view contexts so draft attention never attends past its KV cap."""
+    if cap <= 0 or not views:
+        return views
+    capped = []
+    for view in views:
+        if view.kv_len <= cap:
+            capped.append(view)
+            continue
+        max_ctx = max(0, cap - int(view.q_len))
+        new_ctx = min(int(view.context), max_ctx)
+        new_pref = min(int(getattr(view, "prefix_tokens", 0) or 0), new_ctx)
+        capped.append(replace(view, context=new_ctx, prefix_tokens=new_pref))
+    return tuple(capped)
+
+
+def _resolve_gqa_recipe(cacheless: bool, mode: str, configured_recipes) -> str:
+    if cacheless:
+        return "flash_attention_prefill" if "flash_attention_prefill" in configured_recipes else "flash_attention"
+    if mode in {"decode", "draft"} and "flash_attention_decode" in configured_recipes:
+        return "flash_attention_decode"
+    if mode in {"prefill", "draft_prefill"} and "flash_attention_prefill" in configured_recipes:
+        return "flash_attention_prefill"
+    return "flash_attention"
+
+
 def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         padded_tokens, policy=AttentionPolicy(), cp_interleave_size=DEFAULT_CP_INTERLEAVE,
         runtime=None, cache_ids=None, stage_of=None, topk_ids=None,
@@ -149,6 +197,9 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         views = tuple(replace(v, context=0, prefix_tokens=0,
                               prefix_cache_key="") for v in views)
         quant = replace(quant, kv_dtype=model.activation_dtype)
+    draft_cap = _draft_kv_cap(plan, model, runtime, mode)
+    if draft_cap > 0 and not cacheless:
+        views = _cap_draft_views(views, draft_cap)
     selected = select(runtime.kernels.get("lowerings", {}), "gqa_attention") if runtime else None
     if selected:
         selected.module.validate(views=views, plan=plan, parallel=parallel, policy=policy,
@@ -156,6 +207,7 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
     heads = plan.num_heads // parallel.tp
     kv_heads = local_kv_heads(plan.num_kv_heads, parallel.tp)
     width = plan.head_dim
+    v_width = int(getattr(plan, "v_head_dim", 0) or width)
     key_fmt, value_fmt, cache_regions, shared_format = _gqa_formats(model)
     if cacheless:
         key_fmt = value_fmt = CacheFormat(model.activation_dtype)
@@ -168,17 +220,7 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
     cache_planes = 2
     projected_kv_heads = 0 if shared else kv_heads
     configured_recipes = runtime.kernels.get("recipes", {}) if runtime else {}
-    if cacheless:
-        attention_recipe = ("flash_attention_prefill"
-                            if "flash_attention_prefill" in configured_recipes
-                            else "flash_attention")
-    elif mode in {"decode", "draft"} and "flash_attention_decode" in configured_recipes:
-        attention_recipe = "flash_attention_decode"
-    elif (mode in {"prefill", "draft_prefill"}
-          and "flash_attention_prefill" in configured_recipes):
-        attention_recipe = "flash_attention_prefill"
-    else:
-        attention_recipe = "flash_attention"
+    attention_recipe = _resolve_gqa_recipe(cacheless, mode, configured_recipes)
     pcp_factor, tp_gather, raw_dp_width = layer_dcp_factors(plan, parallel)
     dp_width = raw_dp_width if int(getattr(parallel, "dp", 1) or 1) >= raw_dp_width else 1
     layer_dcp = layer_dcp_degree(plan, parallel)
@@ -186,6 +228,8 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         views, dp_width=dp_width,
         cohort_views_by_member=dcp_cohort_views_by_member,
         local_dp_pos=dcp_local_pos)
+    if draft_cap > 0 and not cacheless and cohort_dec_views:
+        cohort_dec_views = _cap_draft_views(cohort_dec_views, draft_cap)
     idle_dcp_owner = (
         padded_tokens == 0 and not views and layer_dcp > 1
         and dp_width > 1 and bool(cohort_dec_views)
@@ -244,9 +288,9 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
                      else (*store_ids, dcp_query_producer))
     streams = kv_heads if policy.reuse_kv_across_query_heads else heads
     kv_row_bytes = (
-        key_fmt.row_bytes(cache_planes * streams * width)
+        key_fmt.row_bytes(streams * (width + v_width))
         if shared_format
-        else key_fmt.row_bytes(streams * width) + value_fmt.row_bytes(streams * width)
+        else key_fmt.row_bytes(streams * width) + value_fmt.row_bytes(streams * v_width)
     )
     user_pinned_attn = (
         is_caller_pinned_binding(runtime, "families", "attention")
@@ -293,9 +337,12 @@ def _gqa_projections(
     prefix, plan, stage, deps, model, quant, mode, padded_tokens, requests, heads,
     projected_kv_heads, projection_planes, width, shared, gate_separate,
 ):
+    v_width = int(getattr(plan, "v_head_dim", 0) or width)
     q_width = plan.q_projection_width(heads, width)
     kv_width = projected_kv_heads * width
-    total_n = q_width + projection_planes * kv_width
+    v_proj_width = projected_kv_heads * v_width
+    kv_total_width = (kv_width + v_proj_width) if projection_planes == 2 else (projection_planes * kv_width)
+    total_n = q_width + kv_total_width
     packed_slices: list[dict[str, object]] = [
         {"name": "q", "shape": (padded_tokens, q_width),
          "strides": (total_n, 1), "offset_elements": 0,
@@ -309,9 +356,9 @@ def _gqa_projections(
         })
         if projection_planes > 1:
             packed_slices.append({
-                "name": "v", "shape": (padded_tokens, kv_width),
+                "name": "v", "shape": (padded_tokens, v_proj_width),
                 "strides": (total_n, 1), "offset_elements": q_width + kv_width,
-                "units": projected_kv_heads, "unit_width": width, "shard": "kv_out",
+                "units": projected_kv_heads, "unit_width": v_width, "shard": "kv_out",
             })
     qkv = gemm_op(
         op_id=prefix + ".qkv", deps=(deps,), stage=stage, layer=plan.index,
@@ -384,6 +431,8 @@ def _publish_gqa_cache(
     cache_planes, kv_heads, width, quant, cp_interleave_size, cacheless, cache_ids, stage_of,
     shared_format, model, key_fmt, value_fmt,
 ):
+    v_width = int(getattr(plan, "v_head_dim", 0) or width)
+    kv_plane_width = (width + v_width) if cache_planes == 2 else (cache_planes * width)
     valid = sum(view.q_len for view in views)
     store_ready = rope.op_id
     value_ready = (split_copies[VALUE_COPY].op_id
@@ -395,7 +444,7 @@ def _publish_gqa_cache(
             deps=(rope.op_id, value_ready) if value_ready else (rope.op_id,),
             stage=stage, layer=plan.index,
             requests=requests, family="allgather", phase=mode, recipe="pcp_kv_gather",
-            link_bytes=cache_planes * kv_heads * width * dtype_bytes(quant.kv_dtype)
+            link_bytes=kv_plane_width * kv_heads * dtype_bytes(quant.kv_dtype)
                        * sum(v.global_q_len or v.q_len for v in views if v.phase == "prefill")
                        * (parallel.pcp - 1) / parallel.pcp,
             shape=(valid, kv_heads, width), metadata=(("group_axis", "pcp"),))
@@ -434,7 +483,7 @@ def _publish_gqa_cache(
     elif shared_format:
         store_ids = (_store_cache(
             ops, prefix=prefix, deps=store_deps, rows=store_rows,
-            width=cache_planes * kv_heads * width, region="gqa_kv",
+            width=kv_plane_width * kv_heads, region="gqa_kv",
             stage=stage, layer=plan.index, requests=requests, phase=mode,
             model=model, views=views, kv_heads=kv_heads, head_width=width,
             parallel=parallel, quant=quant, key_fmt=key_fmt, value_fmt=value_fmt,
@@ -446,9 +495,9 @@ def _publish_gqa_cache(
             phase=mode, model=model, views=views, kv_heads=kv_heads, head_width=width,
             parallel=parallel, quant=quant, key_fmt=key_fmt, value_fmt=value_fmt, shared_format=False)
         value_store = _store_cache(
-            ops, prefix=prefix, deps=store_deps, rows=store_rows, width=kv_heads * width,
+            ops, prefix=prefix, deps=store_deps, rows=store_rows, width=kv_heads * v_width,
             region="gqa_kv_value", name="cache_value", stage=stage, layer=plan.index, requests=requests,
-            phase=mode, model=model, views=views, kv_heads=kv_heads, head_width=width,
+            phase=mode, model=model, views=views, kv_heads=kv_heads, head_width=v_width,
             parallel=parallel, quant=quant, key_fmt=key_fmt, value_fmt=value_fmt, shared_format=False)
         store_ids = (key_store, value_store)
     return valid, pcp_prefill, store_ids
@@ -534,11 +583,20 @@ def _gqa_rank_work(
                         if shared_hi > lo:
                             v_shared[rank] += owned_positions(
                                 lo, shared_hi - 1, eff_cp, cp_interleave_size, rank)
-        v_rows = (
-            [owned_positions(0, view.kv_len - 1, eff_cp, cp_interleave_size, r)
-             for r in range(eff_cp)]
-            if eff_cp > 1 else [view.kv_len]
-        )
+        if dense_win > 0 and win_spans and not (eff_topk > 0 and plan.index_topk > 0):
+            u_lo = min(lo for lo, _ in win_spans)
+            u_hi = max(hi for _, hi in win_spans)
+            v_rows = (
+                [owned_positions(u_lo, u_hi - 1, eff_cp, cp_interleave_size, r)
+                 for r in range(eff_cp)]
+                if eff_cp > 1 else [max(0, u_hi - u_lo)]
+            )
+        else:
+            v_rows = (
+                [owned_positions(0, view.kv_len - 1, eff_cp, cp_interleave_size, r)
+                 for r in range(eff_cp)]
+                if eff_cp > 1 else [view.kv_len]
+            )
         for r in range(eff_cp):
             rank_pairs[r] += v_pairs[r]
             rank_sweeps[r] += v_sweeps[r]
@@ -569,12 +627,14 @@ def _gqa_request_op(
     eff_local_pairs = float(local_pairs)
     q_prod = dcp_query_producer if eff_cp > 1 else query_producer
     attention_deps = dcp_attn_deps if eff_cp > 1 else local_attn_deps
+    qk_width = width
+    v_width = int(getattr(plan, "v_head_dim", 0) or width)
     traffic = plan_attention_traffic(
         AttentionAccessSpec(
             q_lengths=(q_eff,),
             context_lengths=(int(max(0, view.kv_len - view.q_len)),),
             kv_heads=int(kv_heads), q_heads=int(heads),
-            key_dim=int(width), value_dim=int(width),
+            key_dim=int(qk_width), value_dim=int(v_width),
             row_bytes=float(kv_row_bytes),
             unique_rows=int(max(0, local_rows)),
             refill_rows=int(max(0, view_sweeps)),
@@ -591,8 +651,6 @@ def _gqa_request_op(
     )
     kv_bytes = float(traffic.hbm_read_bytes)
     kv_refill_bytes = float(traffic.private_refill_bytes)
-    qk_width = width
-    v_width = int(getattr(plan, "v_head_dim", 0) or width)
     element_bytes = dtype_bytes(model.activation_dtype)
     query_bytes = q_eff * heads * qk_width * element_bytes
     output_bytes = q_eff * heads * v_width * element_bytes
@@ -913,11 +971,12 @@ def _gqa_output(
     model, mode, split_copies, qkv, quant, parallel, shared, normalized, rope, split_views,
     gate_separate, *, views=(), runtime=None, deps="",
 ):
+    v_width = int(getattr(plan, "v_head_dim", 0) or width)
     if gate_separate:
         gate = vector_op(
             op_id=prefix + ".output_gate", deps=tuple(attention) + (separate_gate,),
             stage=stage, layer=plan.index, requests=requests,
-            elements=padded_tokens * heads * width,
+            elements=padded_tokens * heads * v_width,
             ops_per_element=GATE_APPLY_OPS_PER_ELEMENT,
             dtype=model.activation_dtype, family="elementwise", phase=mode,
             recipe="attention_gate",
@@ -929,14 +988,14 @@ def _gqa_output(
         gate = vector_op(
             op_id=prefix + ".output_gate", deps=tuple(attention) + (gate_ready,),
             stage=stage, layer=plan.index, requests=requests,
-            elements=padded_tokens * heads * width, ops_per_element=OUTPUT_GATE_OPS_PER_ELEMENT,
+            elements=padded_tokens * heads * v_width, ops_per_element=OUTPUT_GATE_OPS_PER_ELEMENT,
             dtype=model.activation_dtype, family="elementwise", phase=mode, recipe="attention_gate",
         )
         ops.append(gate)
         attention = [gate.op_id]
     pcp_shard_o = (parallel.pcp > 1 and pcp_o_proj_weight_sharding_enabled(runtime))
     pcp_is_prefill = any(getattr(v, "phase", "") == "prefill" for v in views)
-    o_full_width = heads * width
+    o_full_width = heads * v_width
     o_in_width = o_full_width
     o_rows = padded_tokens
     if pcp_shard_o:

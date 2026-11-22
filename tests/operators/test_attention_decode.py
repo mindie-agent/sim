@@ -569,3 +569,223 @@ def test_fia_weighted_contiguous_partition_balances_ragged_kv_tails():
     long_per_core = [sum(1 for i in core_idxs if rects[i].kv == 65536) for core_idxs in slices]
     assert sum(len(s) for s in slices) == len(rects)
     assert max(long_per_core) == 1
+
+
+def test_draft_kv_cap_bounds_gqa_and_mla_without_leaking_target_limit():
+    from mindie_sim.prediction.operators.attention.attention import _cap_draft_views, _draft_kv_cap, gqa
+    from mindie_sim.prediction.operators.mla.mla import mla
+    from mindie_sim.schema.parallel import ParallelSpec
+
+    base = dense_case(layers=1)
+    plan_target = replace(base.model.layer_plans[0], num_heads=8, num_kv_heads=2, head_dim=128)
+    gqa_model = replace(base.model, num_heads=8, num_kv_heads=2, head_dim=128, layer_plans=(plan_target,))
+    rt_capped = replace(base.runtime, metadata=(("draft_max_model_len", 4096),))
+    long_views = (RequestView("r0", 1, 131071, False, "draft"),)
+    plan_draft = replace(plan_target, scope="draft")
+    assert _draft_kv_cap(plan_target, gqa_model, rt_capped, "decode") == 0
+    assert _draft_kv_cap(plan_draft, gqa_model, rt_capped, "draft") == 4096
+    assert _cap_draft_views(long_views, 4096)[0].kv_len == 4096
+    gqa_uncapped = gqa(prefix="d", plan=plan_draft, views=long_views, stage=0, deps="x",
+                       model=gqa_model, parallel=ParallelSpec(), quant=gqa_model.quant,
+                       mode="draft", padded_tokens=1, runtime=base.runtime, machine=base.machine)
+    gqa_capped = gqa(prefix="d", plan=plan_draft, views=long_views, stage=0, deps="x",
+                     model=gqa_model, parallel=ParallelSpec(), quant=gqa_model.quant,
+                     mode="draft", padded_tokens=1, runtime=rt_capped, machine=base.machine)
+    attn_uncapped = next(op for op in gqa_uncapped.ops if op.family == "attention")
+    attn_capped = next(op for op in gqa_capped.ops if op.family == "attention")
+    assert attn_capped.flops < attn_uncapped.flops / 16
+    assert attn_capped.hbm_bytes < attn_uncapped.hbm_bytes / 16
+
+    mla_case = parse_case(compose_case(
+        "deepseek-v3.2", hardware="a5", tp=1, dp=1, ep=1, num_devices=1,
+        layers=2, quant="bf16", prompt_tokens=16, output_tokens=2))
+    mla_plan = replace(mla_case.model.layer_plans[0], scope="draft", index_topk=0,
+                       indexer=False, owns_topk=False, owns_index_k=False,
+                       index_query_per_layer=False, topk_owner_layer_id=-1, index_k_owner_layer_id=-1)
+    mla_rt = replace(mla_case.runtime, metadata=(("draft_max_model_len", 2048),))
+    mla_uncapped = mla(prefix="dm", plan=mla_plan, views=long_views, stage=0, deps="x",
+                       model=mla_case.model, parallel=ParallelSpec(), quant=mla_case.model.quant,
+                       mode="draft", padded_tokens=1, runtime=mla_case.runtime, machine=mla_case.machine,
+                       cache_ids={}, topk_ids={}, index_cache_ids={}, candidate_ids={}, stage_of=lambda _: 0)
+    mla_capped = mla(prefix="dm", plan=mla_plan, views=long_views, stage=0, deps="x",
+                     model=mla_case.model, parallel=ParallelSpec(), quant=mla_case.model.quant,
+                     mode="draft", padded_tokens=1, runtime=mla_rt, machine=mla_case.machine,
+                     cache_ids={}, topk_ids={}, index_cache_ids={}, candidate_ids={}, stage_of=lambda _: 0)
+    mla_attn_u = next(op for op in mla_uncapped.ops if op.family == "attention")
+    mla_attn_c = next(op for op in mla_capped.ops if op.family == "attention")
+    assert mla_attn_c.hbm_bytes < mla_attn_u.hbm_bytes / 16
+
+
+def test_windowed_fia_gqa_and_mla_bound_visible_kv_rows_and_cp_spans():
+    from mindie_sim.prediction.operators.attention._fia import _visible_sequences
+    from mindie_sim.prediction.operators.attention.attention import gqa
+    from mindie_sim.prediction.operators.mla.generic_latent_attention_views import attention_view_record
+    from mindie_sim.prediction.operators.mla.mla import mla
+    from mindie_sim.schema.parallel import ParallelSpec
+
+    contract = governed.AttentionContract(1, 32, 2, 128, 128, sequences=((1, 131072),), window_size=512)
+    assert _visible_sequences(contract, ((1, 131072), (4, 131072))) == ((1, 512), (4, 515))
+    geom = geometry(governed.ARCH35)
+    win_plan = governed.build(governed.make_attention_op(contract, op_id="fia-win"), geom)
+    assert win_plan.work.matrix["bf16"] == 2 * 32 * 512 * 256
+
+    base = dense_case(layers=1)
+    full_plan = replace(base.model.layer_plans[0], num_heads=8, num_kv_heads=2, head_dim=128)
+    swa_plan = replace(full_plan, window=256)
+    gqa_model = replace(base.model, num_heads=8, num_kv_heads=2, head_dim=128, layer_plans=(full_plan,))
+    views = (RequestView("r0", 4, 8192, False, "decode"),)
+    res_swa = gqa(prefix="w", plan=swa_plan, views=views, stage=0, deps="x",
+                  model=gqa_model, parallel=ParallelSpec(), quant=gqa_model.quant,
+                  mode="decode", padded_tokens=4, runtime=base.runtime, machine=base.machine)
+    res_full = gqa(prefix="f", plan=full_plan, views=views, stage=0, deps="x",
+                   model=gqa_model, parallel=ParallelSpec(), quant=gqa_model.quant,
+                   mode="decode", padded_tokens=4, runtime=base.runtime, machine=base.machine)
+    attn_swa = next(op for op in res_swa.ops if op.family == "attention")
+    attn_full = next(op for op in res_full.ops if op.family == "attention")
+    assert attn_swa.hbm_bytes < attn_full.hbm_bytes / 10
+
+    mla_case = parse_case(compose_case(
+        "deepseek-v3.2", hardware="a5", tp=1, dp=1, ep=1, num_devices=1,
+        layers=2, quant="bf16", prompt_tokens=16, output_tokens=2))
+    mla_swa = replace(mla_case.model.layer_plans[0], window=256, index_topk=0,
+                      indexer=False, owns_topk=False, owns_index_k=False,
+                      index_query_per_layer=False, topk_owner_layer_id=-1, index_k_owner_layer_id=-1)
+    rec = attention_view_record(
+        views[0], plan=mla_swa, model=mla_case.model, quant=mla_case.model.quant,
+        query_tile=128, eff_cp=1, block=128, interleave=128, tp=1, dsa=False,
+        topk_present=False, heads=mla_swa.num_heads, latent_dim=mla_swa.kv_lora_rank,
+    )
+    assert rec["v_rows"] == [259]
+    mla_cp = mla(prefix="cp", plan=mla_swa, views=views, stage=0, deps="x",
+                 model=mla_case.model, parallel=ParallelSpec(cp=4), quant=mla_case.model.quant,
+                 mode="decode", padded_tokens=4, runtime=mla_case.runtime, machine=mla_case.machine,
+                 cache_ids={}, topk_ids={}, index_cache_ids={}, candidate_ids={}, stage_of=lambda _: 0)
+    mla_cp_attn = next(op for op in mla_cp.ops if op.family == "attention")
+    assert mla_cp_attn.flops == pytest.approx(2 * 512 * mla_swa.num_heads * (mla_swa.kv_lora_rank + mla_swa.qk_rope_head_dim + mla_swa.kv_lora_rank))
+    mla_cp_q1 = mla(prefix="cp1", plan=mla_swa, views=(RequestView("r0", 1, 8192, False, "decode"),),
+                    stage=0, deps="x", model=mla_case.model, parallel=ParallelSpec(cp=4),
+                    quant=mla_case.model.quant, mode="decode", padded_tokens=1,
+                    runtime=mla_case.runtime, machine=mla_case.machine,
+                    cache_ids={}, topk_ids={}, index_cache_ids={}, candidate_ids={}, stage_of=lambda _: 0)
+    mla_cp_q1_attn = next(op for op in mla_cp_q1.ops if op.family == "attention")
+    assert dict(mla_cp_q1_attn.metadata)["latent_attention_schedule"]["keys"] == 128
+
+
+def test_gqa_asymmetric_value_head_dim_scales_kv_bytes_and_output_gate():
+    from mindie_sim.prediction.operators.attention.attention import gqa
+    from mindie_sim.schema.parallel import ParallelSpec
+
+    base = dense_case(layers=1)
+    asym_plan = replace(base.model.layer_plans[0], num_heads=8, num_kv_heads=2,
+                        head_dim=128, v_head_dim=64, q_output_gate=True)
+    gqa_model = replace(base.model, num_heads=8, num_kv_heads=2, head_dim=128, layer_plans=(asym_plan,))
+    views = (RequestView("r0", 2, 128, False, "decode"),)
+    res = gqa(prefix="a", plan=asym_plan, views=views, stage=0, deps="x",
+              model=gqa_model, parallel=ParallelSpec(), quant=gqa_model.quant,
+              mode="decode", padded_tokens=2, runtime=base.runtime, machine=base.machine)
+    by_id = {op.op_id: op for op in res.ops}
+    by_suffix = {op.op_id.rsplit(".", 1)[-1]: op for op in res.ops}
+    assert by_id[res.cache_store_id].mte3_bytes == 2 * 2 * (128 + 64) * 2
+    assert by_suffix["output_gate"].local_shape == (2 * 8 * 64,)
+    assert by_suffix["output"].flops == 2 * 2 * gqa_model.hidden_size * (8 * 64)
+
+
+def test_wide_head_tiling_enforces_fp32_ub_and_l0c_bounds_and_keeps_aic_pools_disjoint():
+    from mindie_sim.prediction.runtime.tile_solver import TileInfeasibleError
+
+    geom = geometry(governed.ARCH22)
+    contract = governed.AttentionContract(1, 4, 2, 512, 512, selected_tokens=128,
+                                          panel_mode="tile_solver_candidate")
+    solved = governed.solve_wide_head_tiling(contract, geom, s1=128, s2=128)
+    peaks = {peak.pool: peak.peak_bytes for peak in solved.pool_peaks}
+    assert peaks["l0c"] == 128 * 128 * 4
+    assert peaks["ub"] == (128 * 128 + 128 * 2) * 4
+    plan = governed.build(governed.make_attention_op(contract, op_id="wide-fp32"), geom)
+    assert plan.metadata["tile_solution"]["ub_peak_bytes"] == peaks["ub"]
+    with pytest.raises(TileInfeasibleError, match=r"ub\(aiv\)=264192>"):
+        governed.solve_wide_head_tiling(contract, geom, s1=256, s2=256)
+
+
+def test_generic_latent_attention_scales_multi_query_work_and_flops():
+    from mindie_sim.prediction.operators.mla import generic_latent_attention as gla
+
+    geom = geometry(governed.ARCH35)
+    meta_base = {
+        "heads": 16, "qk_dim": 576, "latent_dim": 512, "dv": 512, "kv_row_bytes": 1152,
+    }
+    op1 = OpSpec("gla1", "attention", "decode", 0, 0, ("r0",), (1, 16, 512), (1, 16, 512),
+                 (1, 16, 512), (1, 16, 512), flops=float(2 * 1 * 1024 * 16 * 1088),
+                 metadata=(("latent_attention_schedule", {**meta_base, "sequences": ((1, 1024),)}),))
+    op4 = replace(op1, op_id="gla4", flops=float(2 * 4 * 1024 * 16 * 1088),
+                  metadata=(("latent_attention_schedule", {**meta_base, "sequences": ((4, 1024),)}),))
+    p1, p4 = gla.build(op1, geom), gla.build(op4, geom)
+    assert p4.work.matrix["bf16"] >= op4.flops
+    assert p4.work.matrix["bf16"] == 4 * p1.work.matrix["bf16"]
+    assert p4.work.resources["vector"] == 4 * p1.work.resources["vector"]
+
+
+def test_indexed_attention_compact_preserves_vector_work_under_calibrated_dq_scale():
+    case = sku_case(REPRESENTATIVE_SKUS["a5"])
+    geom = Geometry.from_devices(case.machine.dies)
+    op = source_cases._c8_op(((1, 512),), 512, 32, 0)
+    p07 = SimpleNamespace(status="calibrated", parameters={},
+                          metrics={"vec_alu_ops_per_s_per_aiv": SimpleNamespace(p50=100e9)})
+    p09 = SimpleNamespace(status="calibrated", parameters={},
+                          metrics={"cast_bytes_per_s_per_aiv": SimpleNamespace(p50=2000e9)})
+    pt = SimpleNamespace(warnings=(), cell=lambda cid: {"P07_vec_alu": p07, "P09_vec_reduce_cast": p09}.get(cid))
+
+    def run_mode(compact, primitive_table):
+        plan = source_cases.build_packed(op, geom, compact=compact)
+        die = case.machine.dies[0]
+        die_rates = dict(die.rates)
+        roles = set(die_rates) | {"cube"}
+        names = {r: r for r in roles}
+        rates = {r: float(die_rates.get(r, 1e12)) for r in roles}
+        units = {r: int(die.units(r)) for r in roles}
+        ctx = RecipeContext(op, {}, names, rates, die.compute_units,
+                            resource_units=units, compute_peaks=dict(die.compute_peaks),
+                            service_modes=dict(die.service_modes),
+                            pool_names={p: p for p in dict(die.buffers)},
+                            pool_capacities=dict(die.buffers),
+                            pool_units={p: die.pool_units(p) for p in dict(die.buffers)},
+                            primitive_table=primitive_table)
+        engine = Engine([Resource(r, rates[r], units=units[r]) for r in roles],
+                        pools=dict(die.buffers), pool_units=ctx.pool_units)
+        done = plan.program(ctx).start(engine, "idx", engine.submit("ready"))
+        engine.advance(until=(done,))
+        return done.time, engine.serviced["vector"], plan.work.resources["vector"]
+
+    _, vec_expanded, declared = run_mode(False, pt)
+    t_cal, vec_compact, _ = run_mode(True, pt)
+    t_uncal, vec_uncal, _ = run_mode(True, None)
+    assert vec_compact == pytest.approx(vec_expanded)
+    assert vec_compact == pytest.approx(declared)
+    assert vec_uncal == pytest.approx(declared)
+    assert t_cal <= t_uncal
+
+
+def test_mqsmla_quant_plan_avoids_per_tile_window_overcount_and_rejects_non_fp8_arch():
+    raw = compose_case(
+        "deepseek-v4.1-flash", hardware="a5", tp=4, dp=2, ep=8, num_devices=8,
+        layers=4, quant="w8a8", prompt_tokens=16, output_tokens=2)
+    packed = {"dtype": "fp8_e4m3", "group_size": 64, "scale_dtype": "bf16"}
+    raw["model"].setdefault("metadata", {})["cache_representations"] = {
+        "window": dict(packed), "compressed_kv": dict(packed),
+    }
+    parsed = parse_case(raw)
+    graph = target_graphs(parsed, phase="decode", tokens=1, context=1024, sequences=1, scope="body")[0]
+    native = next(op for op in graph if op.recipe == "aclnn_mixed_quant_sparse_flash_mla")
+    plan_a5 = mqsmla.build(native, geometry(governed.ARCH35))
+    shape = dict(native.metadata)["mqsmla_geometry"]
+    rows = tuple(mqsmla.query_rows(shape))
+    expected_mte2_tiles = sum(
+        work.resources.get("mte2_aic", 0)
+        for row in rows
+        for idx in range(mqsmla.OwnerTiles.create((row,)).count)
+        for _n, work, _a in mqsmla.quant_tile_phases_cached(
+            *mqsmla.OwnerTiles.create((row,)).key(idx)[1:], int(shape["heads"]), int(shape["kv_quant_mode"]), 0)
+    )
+    streamed = len(rows) * int(shape["heads"]) * mqsmla.MQSMLA_HEAD_WIDTH * mqsmla.BF16_ELEMENT_BYTES
+    assert plan_a5.work.resources["mte2_aic"] == expected_mte2_tiles + streamed
+    with pytest.raises(ModelingError, match=r"^mqsmla_fp8_fp4_unsupported_on_"):
+        mqsmla.build(native, geometry(governed.ARCH22))

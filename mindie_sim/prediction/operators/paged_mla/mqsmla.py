@@ -22,6 +22,7 @@ CUBE_FRACTAL_ROWS = 16
 MIN_MQS_PAGE_ROWS = 16
 MQS_TILE_KEYS = 128
 OFFSET_ENTRY_BYTES = 4
+ARCH22_PRESET = "npu_arch_2201"
 
 #: CANN 9.2.1 official source (`aclnnMixedQuantSparseFlashMla`).
 SOURCE = {
@@ -375,6 +376,63 @@ def quant_tile_phases_cached(valid, first, last, heads, quant_mode, window_bytes
                              quant_mode=quant_mode, window_bytes=window_bytes)
 
 
+def _mqsmla_stage_after(name: str, previous: str | None) -> tuple[str, ...]:
+    if name in {"query", "sinks"}:
+        return ()
+    if name.startswith("addr_index_"):
+        return ("query", "sinks")
+    if name.startswith("addr_page_"):
+        return ("addr_index_" + name.rsplit("_", 1)[-1],)
+    if name.startswith("gather_"):
+        return ("addr_page_" + name.rsplit("_", 1)[-1],)
+    if name == "addr_join":
+        return tuple(f"gather_{part}" for part in range(PHYSICAL_KV_TILE_ROWS // GATHER_SUBTILE_ROWS))
+    if name == "qk_operands":
+        return ("kv_l1", "query")
+    if name == "softmax":
+        return ("scores", "sinks")
+    return (previous,) if previous else ()
+
+
+def _mqsmla_owner_program(context, owner, stream, head_counts, *, cores: int, addressing: str):
+    @lru_cache(maxsize=OWNER_STAGE_CACHE_SIZE)
+    def cached_stages(key):
+        result = []
+        previous = None
+        for name, work in tile_phases(*key[:4], addressing=addressing, heads=key[-1]):
+            after = _mqsmla_stage_after(name, previous)
+            prior = {
+                "query": ("output",) if key[2] else (),
+                "sinks": ("output",) if key[2] else (),
+                "addr_join": ("output",) if key[2] else (),
+                "qk_operands": ("qk",), "qk": ("scores",),
+                "pv_operands": ("pv",), "pv": ("values",),
+                "accumulate": ("output",) if key[2] else ("accumulate",),
+            }.get(name, ())
+            roles = set(work.resources) - {"hbm"} | ({"cube"} if work.matrix else set())
+            result.append(Stage(
+                name, context.bind(work), after=after, previous=prior,
+                placement=context.owned(owner, cores, roles)))
+            previous = name
+        return tuple(result)
+
+    def stages(index):
+        return cached_stages(_phase_key(stream, head_counts, index))
+
+    allocations = tuple(context.allocate(
+        f"mqsmla{owner}_{pool}", pool, amount,
+        (2 * owner, 2 * owner + 1) if pool == "ub" else (owner,))
+        for pool, amount in BUFFERS.items())
+    return KernelProgram((
+        Stage("reserve", acquire=allocations),
+        # Two complete phase tiles are a conservative source subset:
+        # P and alpha have two slots. The third source KV slot can
+        # prefetch more aggressively, which this compact DAG omits.
+        Stage("tiles", after=("reserve",), program=PipelineProgram(stream.count, 2, stages)),
+        Stage("release", after=("tiles",), free=allocations),
+    ))
+
+
 def build(op, geometry):
     meta = dict(op.metadata)
     shape = meta["mqsmla_geometry"]
@@ -418,6 +476,12 @@ def build(op, geometry):
     streams = tuple((owner, OwnerTiles.create(rows[start:end]), row_heads[start:end])
                     for owner, start, end in ownership)
     quant_mode = shape.get("kv_quant_mode")
+    compute_arch = getattr(geometry, "compute_arch", None) or getattr(
+        getattr(geometry, "datapath", None), "compute_arch", None
+    )
+    preset = str(getattr(compute_arch, "preset", "") or getattr(compute_arch, "arch_id", "") or "")
+    if preset == ARCH22_PRESET and quant_mode != KV_QUANT_BF16:
+        raise ModelingError("mqsmla_fp8_fp4_unsupported_on_arch22")
     if quant_mode is not None:
         if legacy or quant_mode not in KV_QUANT_MODES:
             raise ModelingError("mqsmla_kv_quant_mode_unsupported")
@@ -441,65 +505,11 @@ def build(op, geometry):
             total += work.scaled(count)
 
     def program(context):
-        def one(owner, stream, head_counts):
-            @lru_cache(maxsize=OWNER_STAGE_CACHE_SIZE)
-            def cached_stages(key):
-                result = []
-                previous = None
-                for name, work in tile_phases(*key[:4], addressing=addressing,
-                                              heads=key[-1]):
-                    if name in {"query", "sinks"}:
-                        after = ()
-                    elif name.startswith("addr_index_"):
-                        after = ("query", "sinks")
-                    elif name.startswith("addr_page_"):
-                        after = ("addr_index_" + name.rsplit("_", 1)[-1],)
-                    elif name.startswith("gather_"):
-                        after = ("addr_page_" + name.rsplit("_", 1)[-1],)
-                    elif name == "addr_join":
-                        after = tuple(f"gather_{part}" for part in
-                                      range(PHYSICAL_KV_TILE_ROWS // GATHER_SUBTILE_ROWS))
-                    elif name == "qk_operands":
-                        after = ("kv_l1", "query")
-                    elif name == "softmax":
-                        after = ("scores", "sinks")
-                    else:
-                        after = (previous,) if previous else ()
-                    # Coarse phases preserve finite Channel reuse. Two Q
-                    # halves are replaced only after the previous row's QK;
-                    # QK/PV each hold at most one of the two shared L0C slots.
-                    prior = {
-                        "query": ("output",) if key[2] else (),
-                        "sinks": ("output",) if key[2] else (),
-                        "addr_join": ("output",) if key[2] else (),
-                        "qk_operands": ("qk",), "qk": ("scores",),
-                        "pv_operands": ("pv",), "pv": ("values",),
-                        "accumulate": ("output",) if key[2] else ("accumulate",),
-                    }.get(name, ())
-                    result.append(Stage(
-                        name, context.bind(work), after=after, previous=prior,
-                        placement=context.owned(owner, cores, set(work.resources) - {"hbm"}
-                                                | ({"cube"} if work.matrix else set()))))
-                    previous = name
-                return tuple(result)
-
-            def stages(index):
-                return cached_stages(_phase_key(stream, head_counts, index))
-
-            allocations = tuple(context.allocate(
-                f"mqsmla{owner}_{pool}", pool, amount,
-                (2 * owner, 2 * owner + 1) if pool == "ub" else (owner,))
-                for pool, amount in BUFFERS.items())
-            return KernelProgram((
-                Stage("reserve", acquire=allocations),
-                # Two complete phase tiles are a conservative source subset:
-                # P and alpha have two slots. The third source KV slot can
-                # prefetch more aggressively, which this compact DAG omits.
-                Stage("tiles", after=("reserve",), program=PipelineProgram(stream.count, 2, stages)),
-                Stage("release", after=("tiles",), free=allocations),
-            ))
-        return ParallelProgram(tuple(one(owner, stream, head_counts)
-                                     for owner, stream, head_counts in streams))
+        return ParallelProgram(tuple(
+            _mqsmla_owner_program(context, owner, stream, head_counts,
+                                  cores=cores, addressing=addressing)
+            for owner, stream, head_counts in streams
+        ))
 
     return OperatorPlan(total, program, {
         "source_execution_domain": "mixed",
@@ -563,11 +573,9 @@ def _quant_plan(shape, streams, quant_mode, addressing):
                      for _, stream, head_counts in streams
                      for index in range(stream.count))
     total = Work()
-    window_bytes = row_bytes * int(shape.get("window", 0) or 0)
     for key, count in counts.items():
         for _name, work, _after in quant_tile_phases_cached(
-                key[1], key[2], key[3], key[-1], quant_mode,
-                window_bytes if key[0] == "original" else 0):
+                key[1], key[2], key[3], key[-1], quant_mode, 0):
             total += work.scaled(count)
     external, shared_rows = quant_external_fill(shape, quant_mode)
     fill = Work(resources={"hbm": external} if external else {})
@@ -588,8 +596,7 @@ def _quant_plan(shape, streams, quant_mode, addressing):
             def stages(key):
                 result = []
                 for name, work, after in quant_tile_phases_cached(
-                        key[1], key[2], key[3], key[-1], quant_mode,
-                        window_bytes if key[0] == "original" else 0):
+                        key[1], key[2], key[3], key[-1], quant_mode, 0):
                     roles = set(work.resources) - {"hbm"}
                     if work.matrix:
                         roles |= {"cube"}

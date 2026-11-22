@@ -183,7 +183,7 @@ def unique_index_key_rows(views, *, query_tile=INDEX_QUERY_TILE, noncausal=False
 
 def semantic_index_selection(b, *, deps, views, plan, model, quant, parallel,
                             shard, prefix, padded_tokens, runtime=None,
-                            score_rows=None, l2_bytes=None):
+                            score_rows=None, l2_bytes=None, machine=None):
     """Declare the indexer score/TopK pair with local sharded row accounting."""
     valid = sum(view.q_len for view in views)
     cand_window = (
@@ -243,7 +243,7 @@ def semantic_index_selection(b, *, deps, views, plan, model, quant, parallel,
         native_sel = select(lowerings, "native_fusion")
         claimed_role = (native_sel is not None
                         and "lightning_indexer" in (native_sel.options.get("roles") or ()))
-        native_fused = (native_fusion_active(runtime)
+        native_fused = (native_fusion_active(runtime, machine)
                         and not claimed_role
                         and index_operands_quantized(quant)
                         and select(lowerings, "lightning_indexer") is None
@@ -422,6 +422,35 @@ def sparse_over_parts(parts, plan, query_tile, *, dense, kv_len=None, topk=None)
     return SparseAttentionTraffic(gather, window, reads)
 
 
+def _dense_window_tile_spans(parts, view, plan, query_tile):
+    """Yield ``(lo, hi)`` visible KV intervals for each dense query tile."""
+    for q_part, c_part in parts:
+        for start in range(0, q_part, query_tile):
+            hi = (view.kv_len if plan.noncausal_attention
+                  else c_part + min(q_part, start + query_tile))
+            lo = (
+                (max(0, hi - plan.window) if plan.noncausal_attention
+                 else max(0, c_part + start + 1 - plan.window))
+                if plan.window > 0 else 0
+            )
+            yield lo, hi
+
+
+def _window_unique_rows(win_spans, view, plan, eff_cp, interleave):
+    """Unique rank-owned KV rows bounded by dense sliding window when active."""
+    if plan.window > 0 and win_spans:
+        u_lo = min(lo for lo, _ in win_spans)
+        u_hi = max(hi for _, hi in win_spans)
+        if eff_cp > 1:
+            return [owned_positions(u_lo, u_hi - 1, eff_cp, interleave, rank)
+                    for rank in range(eff_cp)]
+        return [max(0, u_hi - u_lo)]
+    if eff_cp > 1:
+        return [owned_positions(0, view.kv_len - 1, eff_cp, interleave, rank)
+                for rank in range(eff_cp)]
+    return [math.ceil(view.kv_len / eff_cp)] * eff_cp
+
+
 def attention_view_record(view, *, plan, model, quant, query_tile, eff_cp, block,
                           interleave, tp, dsa, topk_present, heads, latent_dim,
                           shared_selection=None):
@@ -507,7 +536,11 @@ def attention_view_record(view, *, plan, model, quant, query_tile, eff_cp, block
             }),
         )
     shared = 0
-    if eff_cp > 1 and plan.cache_kind == "dense" and not topk_present:
+    raw_pref = max(0, min(
+        int(getattr(view, "prefix_tokens", 0) or 0), int(context)))
+    aligned_pref = (raw_pref // block) * block
+    dense_unindexed = plan.cache_kind == "dense" and not topk_present
+    if eff_cp > 1 and dense_unindexed:
         if plan.noncausal_attention:
             v_pairs = list(split_causal_pairs(
                 eff_q, view.kv_len - eff_q, eff_cp, interleave,
@@ -522,50 +555,35 @@ def attention_view_record(view, *, plan, model, quant, query_tile, eff_cp, block
             ]
         v_sweeps = [0] * eff_cp
         v_shared = [0] * eff_cp
-        raw_pref = max(0, min(
-            int(getattr(view, "prefix_tokens", 0) or 0), int(context)))
-        aligned_pref = (raw_pref // block) * block
-        for q_part, c_part in parts:
-            for start in range(0, q_part, query_tile):
-                hi = (view.kv_len if plan.noncausal_attention
-                      else c_part + min(q_part, start + query_tile))
-                lo = (
-                    (max(0, hi - plan.window) if plan.noncausal_attention
-                     else max(0, c_part + start + 1 - plan.window))
-                    if plan.window > 0 else 0
-                )
-                sh_hi = min(hi, aligned_pref)
-                for rank in range(eff_cp):
-                    v_sweeps[rank] += owned_positions(
-                        lo, hi - 1, eff_cp, interleave, rank)
-                    if sh_hi > lo:
-                        v_shared[rank] += owned_positions(
-                            lo, sh_hi - 1, eff_cp, interleave, rank)
-        v_rows = [owned_positions(0, view.kv_len - 1, eff_cp, interleave, rank)
-                  for rank in range(eff_cp)]
+        win_spans: list[tuple[int, int]] = []
+        for lo, hi in _dense_window_tile_spans(parts, view, plan, query_tile):
+            if hi > lo:
+                win_spans.append((lo, hi))
+            sh_hi = min(hi, aligned_pref)
+            for rank in range(eff_cp):
+                v_sweeps[rank] += owned_positions(lo, hi - 1, eff_cp, interleave, rank)
+                if sh_hi > lo:
+                    v_shared[rank] += owned_positions(lo, sh_hi - 1, eff_cp, interleave, rank)
+        v_rows = _window_unique_rows(win_spans, view, plan, eff_cp, interleave)
     else:
         v_pairs = [float(pairs) / eff_cp] * eff_cp
         v_sweeps = [math.ceil(sweeps / eff_cp)] * eff_cp
-        raw_pref = max(0, min(
-            int(getattr(view, "prefix_tokens", 0) or 0), int(context)))
-        aligned_pref = (raw_pref // block) * block
         shared_base = 0
-        if plan.cache_kind == "dense" and not topk_present:
-            for q_part, c_part in parts:
-                for start in range(0, q_part, query_tile):
-                    hi = (view.kv_len if plan.noncausal_attention
-                          else c_part + min(q_part, start + query_tile))
-                    lo = (
-                        (max(0, hi - plan.window) if plan.noncausal_attention
-                         else max(0, c_part + start + 1 - plan.window))
-                        if plan.window > 0 else 0
-                    )
-                    sh_hi = min(hi, aligned_pref)
-                    if sh_hi > lo:
-                        shared_base += sh_hi - lo
+        win_spans_single: list[tuple[int, int]] = []
+        if dense_unindexed:
+            for lo, hi in _dense_window_tile_spans(parts, view, plan, query_tile):
+                if hi > lo:
+                    win_spans_single.append((lo, hi))
+                sh_hi = min(hi, aligned_pref)
+                if sh_hi > lo:
+                    shared_base += sh_hi - lo
         shared = math.ceil(shared_base / eff_cp) if eff_cp else shared_base
         v_shared = [shared] * eff_cp
-        v_rows = [math.ceil(view.kv_len / eff_cp)] * eff_cp
+        v_rows = (
+            _window_unique_rows(win_spans_single, view, plan, eff_cp, interleave)
+            if dense_unindexed
+            else [math.ceil(view.kv_len / eff_cp)] * eff_cp
+        )
     return {
         "view": view, "parts": parts, "query": query, "eff_q": eff_q,
         "pairs": float(pairs), "sweeps": sweeps, "v_pairs": v_pairs,

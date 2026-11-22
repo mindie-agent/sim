@@ -18,18 +18,24 @@
 """
 from __future__ import annotations
 
-from mindie_sim.catalog.attention_common import _long_selected_pairs
+from mindie_sim.catalog.attention_common import _long_selected_pairs, local_kv_heads
 from mindie_sim.catalog.cache import (
     completed_rows,
     index_row_bytes,
     index_selection_cost,
 )
+from mindie_sim.catalog.context_parallel import dcp_indexer_sharded
 from mindie_sim.catalog.ops import cache_store_op, comm_op, gemm_op, vector_op
 from mindie_sim.schema.common import dtype_bytes
 from mindie_sim.schema.operators import OpSpec
 
 from .batch_prefix_indexer import apply_indexer_prefix_reads
-from mindie_sim.prediction.operators.mla.generic_latent_attention import index_key_window, visible_parts
+from mindie_sim.prediction.operators.mla.generic_latent_attention import (
+    index_key_window,
+    owned_store_rows,
+    sharded_index_visible_rows,
+    visible_parts,
+)
 from mindie_sim.prediction.implementation_selection import is_caller_pinned_binding
 from mindie_sim.prediction.structure_groups import declare_group
 
@@ -58,6 +64,7 @@ def _emit_index_store(
     completed_rows: int | None = None,
     row_bytes: float,
     idx_dim: int,
+    idx_kv_heads: int = 1,
     plan,
     model,
     quant,
@@ -82,6 +89,7 @@ def _emit_index_store(
             completed_rows=completed_rows,
             dim=idx_dim,
             index_dim=idx_dim,
+            heads=idx_kv_heads,
             row_bytes=row_bytes,
             plan=plan,
             model=model,
@@ -164,13 +172,25 @@ def lower_gqa_indexer(
     )
     requests = tuple(view.request_id for view in views)
     if eff_topk > 0 and (plan.indexer or plan.owns_index_k or plan.owns_topk):
+        tp = max(1, int(getattr(parallel, "tp", 1) or 1))
+        raw_idx_kv_heads = max(
+            1,
+            int(getattr(plan, "index_kv_heads", 0)
+                or getattr(plan, "indexer_kv_heads", 0) or 1),
+        )
+        local_idx_kv_heads = local_kv_heads(raw_idx_kv_heads, tp)
+        eff_dcp = (
+            max(1, int(getattr(parallel, "cp", 1) or 1))
+            if dcp_indexer_sharded(model, runtime) else 1
+        )
         (row_bytes, idx_heads, idx_dim, new_idx_rows, rows_by_view,
          shared_idx_by_view, scored_rows) = _index_view_work(
-            model, plan, views, idx_ratio, valid, block_size)
+            model, plan, views, idx_ratio, valid, block_size,
+            local_idx_kv_heads=local_idx_kv_heads, parallel=parallel, eff_dcp=eff_dcp)
         idx_wq, idx_wk, store_ops, pcp_idx_ops, idx_store_id, idx_ready = _index_cache_inputs(
             prefix, deps, stage, plan, requests, padded_tokens, idx_heads, idx_dim,
             model, quant, mode, valid, new_idx_rows, row_bytes, runtime, machine,
-            pcp_prefill, views, idx_ratio, parallel)
+            pcp_prefill, views, idx_ratio, parallel, local_idx_kv_heads=local_idx_kv_heads)
         q_idx_bytes = valid * idx_heads * idx_dim * dtype_bytes(quant.index_dtype)
         unique_idx_rows = sum(rows_by_view)
         l2_bounded_index_read = float(min(scored_rows, unique_idx_rows)) * row_bytes
@@ -293,11 +313,15 @@ def _declare_gqa_indexer_group(
     )
 
 
-def _index_view_work(model, plan, views, idx_ratio, valid, block_size):
+def _index_view_work(
+    model, plan, views, idx_ratio, valid, block_size, *,
+    local_idx_kv_heads: int = 1, parallel=None, eff_dcp: int = 1,
+):
     cost = index_selection_cost(
         model, plan, max((v.kv_len for v in views), default=0)
     )
-    row_bytes = cost.index_row_bytes or index_row_bytes(model, plan.index_dim)
+    row_bytes_per_head = cost.index_row_bytes or index_row_bytes(model, plan.index_dim)
+    row_bytes = row_bytes_per_head * max(1, int(local_idx_kv_heads))
     idx_heads = max(1, int(plan.index_heads or 1))
     idx_dim = max(1, int(plan.index_dim or DEFAULT_INDEX_DIM))
     cand_cap = (
@@ -305,17 +329,24 @@ def _index_view_work(model, plan, views, idx_ratio, valid, block_size):
         if plan.candidate_filter
         else 0
     )
-    new_idx_rows = (
+    new_rows_by_view = [
         sum(
             completed_rows(v.context + e_p, idx_ratio)
             - completed_rows(v.context + s_p, idx_ratio)
-            for v in views
             for s_p, e_p in (v.query_ranges or ((0, v.q_len),))
             if e_p > s_p
         )
         if idx_ratio > 1
-        else valid
-    )
+        else int(v.q_len)
+        for v in views
+    ]
+    idx_block = max(1, block_size // max(1, idx_ratio))
+    if eff_dcp > 1 and parallel is not None and any(new_rows_by_view):
+        idx_starts = [completed_rows(v.context, idx_ratio) for v in views]
+        new_idx_rows = int(owned_store_rows(
+            new_rows_by_view, views, parallel, idx_block, contexts=idx_starts))
+    else:
+        new_idx_rows = sum(new_rows_by_view) if idx_ratio > 1 else valid
     rows_by_view: list[int] = []
     shared_idx_by_view: list[int] = []
     pairs_by_view: list[int] = []
@@ -343,18 +374,24 @@ def _index_view_work(model, plan, views, idx_ratio, valid, block_size):
             visible_parts(v),
             noncausal=bool(plan.noncausal_attention),
             kv_len=v.kv_len,
+            cp=eff_dcp,
+            interleave=block_size,
             compression=idx_ratio,
         )
         pairs_by_view.append(v_scored)
         rows_by_view.append(physical_rows)
-        shared_idx_by_view.append(min(physical_rows, aligned_pref))
-    scored_rows = sum(pairs_by_view)
+        shared_idx_by_view.append(min(physical_rows, aligned_pref // eff_dcp))
+    if eff_dcp > 1 and parallel is not None:
+        scored_rows = int(sharded_index_visible_rows(views, parallel, idx_block, idx_ratio))
+    else:
+        scored_rows = sum(pairs_by_view)
     return row_bytes, idx_heads, idx_dim, new_idx_rows, rows_by_view, shared_idx_by_view, scored_rows
 
 
 def _index_cache_inputs(
     prefix, deps, stage, plan, requests, padded_tokens, idx_heads, idx_dim, model, quant, mode,
     valid, new_idx_rows, row_bytes, runtime, machine, pcp_prefill, views, idx_ratio, parallel,
+    *, local_idx_kv_heads: int = 1,
 ):
     idx_wq = gemm_op(
         op_id=prefix + ".index_wq",
@@ -378,7 +415,7 @@ def _index_cache_inputs(
         layer=plan.index,
         requests=requests,
         m=padded_tokens,
-        n=idx_dim,
+        n=max(1, int(local_idx_kv_heads)) * idx_dim,
         k=model.hidden_size,
         quant=quant,
         category="indexer",
@@ -397,6 +434,7 @@ def _index_cache_inputs(
         completed_rows=new_idx_rows,
         row_bytes=row_bytes,
         idx_dim=idx_dim,
+        idx_kv_heads=max(1, int(local_idx_kv_heads)),
         plan=plan,
         model=model,
         quant=quant,

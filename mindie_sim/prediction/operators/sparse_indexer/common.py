@@ -250,6 +250,20 @@ def request_contracts(contract: SparseIndexerContract, ctx: OperatorPlanningCont
                           scanned_rows=min(contract.scanned_rows, kv // contract.compress_ratio))
 
 
+def _minimum_indexer_io(contract: SparseIndexerContract) -> tuple[float, float, float, float]:
+    """Conservative physical (hbm, mte2, mte3, vector_ops) lower bound for L* soundness."""
+    q_elem = float(cache_row_bytes(contract.cache_dtype, contract.index_dim))
+    q_bytes = float(contract.query_tokens * contract.index_heads) * q_elem
+    k_bytes = float(contract.scanned_rows) * float(contract.cache_row_bytes)
+    out_items = contract.topk_items if contract.fused_topk else contract.score_items
+    out_heads = contract.msa_score_heads if contract.abi in MSA_ABIS else 1
+    out_elem = float(INT32_BYTES if contract.fused_topk else FP32_BYTES)
+    out_bytes = float(contract.query_tokens * out_heads * out_items) * out_elem
+    vec_ops = float(contract.query_tokens * contract.scanned_rows * contract.index_heads)
+    read_b = q_bytes + k_bytes
+    return read_b + out_bytes, read_b, out_bytes, vec_ops
+
+
 def make_op(
     contract: SparseIndexerContract, *, op_id: str, deps: tuple[str, ...] = (),
     stage: int = 0, layer: int = 0, requests: tuple[str, ...] = (),
@@ -275,12 +289,14 @@ def make_op(
         meta["native_source"] = source.to_dict()
         # Existing scorer callers expose this structural record in exports.
         meta["scorer_geometry"] = meta["indexer_contract"].copy()
+    hbm_bytes, mte2_bytes, mte3_bytes, vector_ops = _minimum_indexer_io(contract)
     return OpSpec(
         op_id=op_id, deps=deps, family="indexer", recipe=recipe or FAMILY,
         phase=phase, stage=stage, layer=layer, requests=requests,
         semantic_shape=shape, local_shape=shape, padded_shape=padded_shape, launch_shape=padded_shape,
         dtype="int32" if contract.fused_topk else "fp32", flops=contract.matrix_flops,
         matrix_flops=((contract.matrix_dtype, contract.matrix_flops),),
+        vector_ops=vector_ops, hbm_bytes=hbm_bytes, mte2_bytes=mte2_bytes, mte3_bytes=mte3_bytes,
         source_boundary="kernel", returns=returns, metadata=tuple(sorted(meta.items())),
     )
 

@@ -32,12 +32,12 @@ from functools import partial
 import math
 from typing import Any, Mapping
 
-from mindie_sim.catalog.cache import index_row_bytes
-from mindie_sim.schema.common import ModelingError, dtype_bytes
+from mindie_sim.catalog.cache import index_row_bytes, packed_region_row_bytes
+from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.operators import OpSpec
 from mindie_sim.prediction.engine import Allocation
 from mindie_sim.prediction.mechanism import Geometry, OperatorPlan, PlannedRecipe, Work
-from mindie_sim.prediction.ownership import unit_group
+from mindie_sim.prediction.ownership import read_role, unit_group
 from mindie_sim.prediction.program import KernelProgram, ParallelProgram, PipelineProgram, Stage
 
 
@@ -155,11 +155,10 @@ def sparse_kv_offload_memory_budget(
     )
 
     sample_plan = (indexed_layers or mla_layers)[0]
-    kv_dtype = (model.quant.kv_dtype if model.quant else model.kv_dtype) or "bf16"
     kv_elements = sample_plan.cache_row_elements or (
         sample_plan.kv_lora_rank + sample_plan.qk_rope_head_dim
     )
-    kv_row_bytes = int(kv_elements * dtype_bytes(kv_dtype))
+    kv_row_bytes = int(packed_region_row_bytes(model, "mla_kv", kv_elements))
     idx_row_bytes = (
         int(index_row_bytes(model, sample_plan.index_dim))
         if sample_plan.index_dim > 0 else 0
@@ -364,35 +363,28 @@ def _build_memfabric_sparse_copy(op: OpSpec, geometry: Geometry, *, direction: s
     setup_ms = cal["setup_ms"]
     minimum_ms = cal["minimum_ms"]
 
-    if direction == "d2h":
-        work = Work(resources={"hbm": payload_bytes, "mte2_aiv": payload_bytes, "mte3": payload_bytes})
-        gva_role = "mte3"
-    else:
-        work = Work(resources={"hbm": payload_bytes, "mte2_aiv": payload_bytes, "mte3": payload_bytes})
-        gva_role = "mte2_aiv"
+    rpipe = read_role(geometry.resource_units or {}, aiv=0)
+    work = Work(resources={"hbm": payload_bytes, rpipe: payload_bytes, "mte3": payload_bytes})
 
     def program(context):
         if payload_bytes <= 0:
             return KernelProgram(())
+        pipe = read_role(context.resource_names, aiv=0)
+        eff_gva = "mte3" if direction == "d2h" else pipe
         per_owner = payload_bytes / active_owners
-        gva_name = context.resource_names.get(gva_role)
+        gva_name = context.resource_names.get(eff_gva)
         per_owner_cap = {gva_name: gva_bw_bytes_per_ms / active_owners} if gva_name else {}
 
         def owner_prog(owner: int):
-            owned = context.owned(owner, aiv_units, ("vector", "mte2_aiv", "mte3"))
+            owned = context.owned(owner, aiv_units, ("vector", pipe, "mte3"))
             alloc = (
                 (Allocation("mf_sparse_ub", context.pool_names["ub"], ub_per_owner,
                             unit_group(owner, aiv_units, context.pool_units.get("ub", aiv_units))),)
                 if "ub" in context.pool_names else ()
             )
-            if direction == "d2h":
-                dma_w = context.bind(Work(resources={
-                    "hbm": per_owner, "mte2_aiv": per_owner, "mte3": per_owner,
-                }))
-            else:
-                dma_w = context.bind(Work(resources={
-                    "mte2_aiv": per_owner, "mte3": per_owner, "hbm": per_owner,
-                }))
+            dma_w = context.bind(Work(resources={
+                "hbm": per_owner, pipe: per_owner, "mte3": per_owner,
+            }))
             stages = (
                 Stage("ub_acquire", acquire=alloc),
                 Stage("double_buffered_dma", dma_w, after=("ub_acquire",),
@@ -446,25 +438,27 @@ def _build_memfabric_kv_exchange(op: OpSpec, geometry: Geometry) -> OperatorPlan
     setup_ms = cal["setup_ms"]
     minimum_ms = cal["minimum_ms"]
 
-    work = Work(resources={"hbm": payload_bytes, "mte2_aiv": payload_bytes, "mte3": payload_bytes})
-    gva_role = "mte3" if direction == "d2h" else "mte2_aiv"
+    rpipe = read_role(geometry.resource_units or {}, aiv=0)
+    work = Work(resources={"hbm": payload_bytes, rpipe: payload_bytes, "mte3": payload_bytes})
 
     def program(context):
         if payload_bytes <= 0:
             return KernelProgram(())
+        pipe = read_role(context.resource_names, aiv=0)
+        eff_gva = "mte3" if direction == "d2h" else pipe
         per_owner = payload_bytes / active_owners
-        gva_name = context.resource_names.get(gva_role)
+        gva_name = context.resource_names.get(eff_gva)
         per_owner_cap = {gva_name: gva_bw_bytes_per_ms / active_owners} if gva_name else {}
 
         def owner_prog(phys_owner: int):
-            owned = context.owned(phys_owner, aiv_units, ("vector", "mte2_aiv", "mte3"))
+            owned = context.owned(phys_owner, aiv_units, ("vector", pipe, "mte3"))
             alloc = (
                 (Allocation("mf_kv_ex_ub", context.pool_names["ub"], ub_per_owner,
                             unit_group(phys_owner, aiv_units, context.pool_units.get("ub", aiv_units))),)
                 if "ub" in context.pool_names else ()
             )
             dma_w = context.bind(Work(resources={
-                "hbm": per_owner, "mte2_aiv": per_owner, "mte3": per_owner,
+                "hbm": per_owner, pipe: per_owner, "mte3": per_owner,
             }))
             return KernelProgram((
                 Stage("ub_acquire", acquire=alloc),
@@ -511,24 +505,26 @@ def _build_memfabric_entry_gather(op: OpSpec, geometry: Geometry) -> OperatorPla
     scale = _channel_bw_scale(spec.get("channel_bw_gbps"), "entry_gather")
     gva_bw_bytes_per_ms = cal["gva_bw_bytes_per_ms"] * scale
 
-    work = Work(resources={"hbm": payload_bytes, "mte2_aiv": payload_bytes, "mte3": payload_bytes})
+    rpipe = read_role(geometry.resource_units or {}, aiv=0)
+    work = Work(resources={"hbm": payload_bytes, rpipe: payload_bytes, "mte3": payload_bytes})
 
     def program(context):
         if payload_bytes <= 0:
             return KernelProgram(())
+        pipe = read_role(context.resource_names, aiv=0)
         per_owner = payload_bytes / active_owners
-        gva_name = context.resource_names.get("mte2_aiv")
+        gva_name = context.resource_names.get(pipe)
         per_owner_cap = {gva_name: gva_bw_bytes_per_ms / active_owners} if gva_name else {}
 
         def owner_prog(owner: int):
-            owned = context.owned(owner, aiv_units, ("vector", "mte2_aiv", "mte3"))
+            owned = context.owned(owner, aiv_units, ("vector", pipe, "mte3"))
             alloc = (
                 (Allocation("mf_entry_ub", context.pool_names["ub"], ub_per_owner,
                             unit_group(owner, aiv_units, context.pool_units.get("ub", aiv_units))),)
                 if "ub" in context.pool_names else ()
             )
             dma_w = context.bind(Work(resources={
-                "mte2_aiv": per_owner, "mte3": per_owner, "hbm": per_owner,
+                pipe: per_owner, "mte3": per_owner, "hbm": per_owner,
             }))
             return KernelProgram((
                 Stage("ub_acquire", acquire=alloc),
@@ -557,11 +553,12 @@ def _build_memfabric_entry_gather(op: OpSpec, geometry: Geometry) -> OperatorPla
 
 
 def _build_lim_plan(op: OpSpec, geometry: Geometry) -> OperatorPlan:
+    rpipe = read_role(geometry.resource_units or {}, aiv=0)
     work = Work(
         matrix={op.dtype: op.flops} if op.flops else {},
         resources={
             "hbm": op.hbm_bytes,
-            "mte2_aiv": op.mte2_bytes,
+            rpipe: op.mte2_bytes,
             "mte3": op.mte3_bytes,
             "vector": op.vector_ops,
         },
@@ -585,33 +582,38 @@ def _build_overlapped_sfa_plan(op: OpSpec, geometry: Geometry) -> OperatorPlan:
     cal = A5_GVA_CALIBRATION["sparse_copy_h2d"]
     scale = _channel_bw_scale(spec.get("channel_bw_gbps"), "sparse_copy_h2d")
     gva_bw_bytes_per_ms = cal["gva_bw_bytes_per_ms"] * scale
+    aic_pipe = read_role(geometry.resource_units or {})
+    aiv_pipe = read_role(geometry.resource_units or {}, aiv=0)
 
-    work = Work(
-        matrix={dtype: op.flops} if op.flops else {},
-        resources={
-            "hbm": attn_hbm_bytes + miss_bytes,
-            "mte2_aic": attn_hbm_bytes,
-            "mte2_aiv": miss_bytes,
-            "mte3": float(op.mte3_bytes) + miss_bytes,
-            "vector": float(op.vector_ops),
-        },
-    )
+    res: dict[str, float] = {
+        "hbm": attn_hbm_bytes + miss_bytes,
+        "mte3": float(op.mte3_bytes) + miss_bytes,
+        "vector": float(op.vector_ops),
+    }
+    if aic_pipe == aiv_pipe:
+        res[aic_pipe] = attn_hbm_bytes + miss_bytes
+    else:
+        res[aic_pipe] = attn_hbm_bytes
+        res[aiv_pipe] = miss_bytes
+    work = Work(matrix={dtype: op.flops} if op.flops else {}, resources=res)
 
     def program(context):
+        c_pipe = read_role(context.resource_names)
+        v_pipe = read_role(context.resource_names, aiv=0)
         aic_work = Work(
             matrix={dtype: op.flops} if op.flops else {},
-            resources={"hbm": attn_hbm_bytes, "mte2_aic": attn_hbm_bytes,
+            resources={"hbm": attn_hbm_bytes, c_pipe: attn_hbm_bytes,
                        "mte3": float(op.mte3_bytes), "vector": float(op.vector_ops)},
         )
         aic_prog = KernelProgram((Stage("sfa_aic", context.bind(aic_work)),))
         if miss_bytes <= 0:
             return aic_prog
-        gva_name = context.resource_names.get("mte2_aiv")
+        gva_name = context.resource_names.get(v_pipe)
         cap = {gva_name: gva_bw_bytes_per_ms} if gva_name else {}
         aiv_prog = KernelProgram(
             (
                 Stage("gva_setup", latency=cal["setup_ms"]),
-                Stage("gva_h2d_gather", context.bind(Work(resources={"mte2_aiv": miss_bytes})),
+                Stage("gva_h2d_gather", context.bind(Work(resources={v_pipe: miss_bytes})),
                       after=("gva_setup",), caps=cap),
                 Stage("topk_buffer_write", context.bind(Work(resources={"hbm": miss_bytes, "mte3": miss_bytes})),
                       after=("gva_h2d_gather",)),
@@ -661,7 +663,7 @@ def lower_prefill_offload(
             ("hardware_support", budget["hardware_support"]),
         ),
     )
-    b.ops[-1] = replace(b.ops[-1], recipe="memfabric_kv_exchange", stream="offload", source_boundary="kernel")
+    b.ops[-1] = replace(b.ops[-1], hbm_bytes=payload_bytes, recipe="memfabric_kv_exchange", stream="offload", source_boundary="kernel")
     return op_id
 
 
@@ -689,7 +691,7 @@ def lower_decode_offload(
             ("hardware_support", budget["hardware_support"]),
         ),
     )
-    b.ops[-1] = replace(b.ops[-1], recipe="memfabric_sparse_copy_d2h", source_boundary="kernel")
+    b.ops[-1] = replace(b.ops[-1], hbm_bytes=d2h_bytes, recipe="memfabric_sparse_copy_d2h", source_boundary="kernel")
 
     # 2. Classify request states (-3 short, -1 first long step, -2 steady long decode).
     short_reqs, long_reqs, total_miss_tokens = 0, 0, 0
@@ -748,7 +750,7 @@ def lower_decode_offload(
                 ("skip_topk", is_shared_indexer_layer), ("hardware_support", budget["hardware_support"]),
             ),
         )
-        b.ops[-1] = replace(b.ops[-1], recipe="memfabric_sparse_copy_h2d", source_boundary="kernel")
+        b.ops[-1] = replace(b.ops[-1], hbm_bytes=miss_h2d_bytes, recipe="memfabric_sparse_copy_h2d", source_boundary="kernel")
 
     info = {
         "request_states": tuple(request_states), "short_requests": short_reqs,

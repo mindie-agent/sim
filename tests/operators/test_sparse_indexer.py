@@ -598,3 +598,128 @@ def test_indexed_reader_requires_capability_and_preserves_ordered_reader(monkeyp
     done = scheduling.start_pipeline_template(engine, ordered, "ordered", ready)
     engine.advance(until=(done,))
     assert done.time == engine.serviced["r"] == 16
+
+
+def test_gqa_indexer_replicates_kv_heads_under_tp_and_shards_under_dcp():
+    from dataclasses import fields
+    from types import SimpleNamespace
+    from _support.builders import dense_case
+    from mindie_sim.prediction.operators.sparse_indexer.gqa_indexer import lower_gqa_indexer
+    from mindie_sim.schema.parallel import ParallelSpec
+
+    base = dense_case(layers=1)
+    base_plan = replace(base.model.layer_plans[0], num_heads=16, num_kv_heads=2, head_dim=128,
+                        indexer=True, owns_index_k=True, owns_topk=True,
+                        index_heads=8, index_dim=64, index_topk=256)
+    plan = SimpleNamespace(**{f.name: getattr(base_plan, f.name) for f in fields(base_plan)}, index_kv_heads=2)
+    model = replace(base.model, num_heads=16, num_kv_heads=2, head_dim=128, layer_plans=(base_plan,))
+    views = (RequestView("r0", 1, 1024, False, "decode"),)
+
+    def lower(tp=1, cp=1, sharded=False):
+        ops = []
+        rt = replace(base.runtime, metadata=(("dcp_indexer_sharded", sharded),))
+        lower_gqa_indexer(
+            ops, prefix="idx", plan=plan, views=views, stage=0, deps="x",
+            model=model, parallel=ParallelSpec(tp=tp, cp=cp), quant=model.quant,
+            mode="decode", padded_tokens=1, valid=1, pcp_prefill=False,
+            runtime=rt, machine=sku_case(REGBASE).machine,
+        )
+        return {op.op_id.rsplit(".", 1)[-1]: op for op in ops}
+
+    tp1, tp2, tp8 = lower(tp=1), lower(tp=2), lower(tp=8)
+    assert tp1["index_wk"].local_shape[1] == 2 * 64
+    assert tp2["index_wk"].local_shape[1] == 1 * 64
+    assert tp8["index_wk"].local_shape[1] == 1 * 64
+    assert tp1["index_store"].mte3_bytes > tp2["index_store"].mte3_bytes == tp8["index_store"].mte3_bytes > 0
+
+    cp_rep = lower(tp=1, cp=4, sharded=False)
+    cp_sharded = lower(tp=1, cp=4, sharded=True)
+    assert cp_sharded["index_scores"].local_shape[0] < cp_rep["index_scores"].local_shape[0]
+
+
+def test_index_cache_writer_enforces_int8_default_fp8_guard_and_l2_slot_hbm():
+    from mindie_sim.prediction.operators.sparse_indexer import family_quant_indexer
+    from mindie_sim.prediction.operators.sparse_indexer.index_cache_writer import (
+        build_index_cache_writer,
+        emit_index_cache_write,
+    )
+
+    a3_machine = sku_case(MEMBASE).machine
+    a3_geom = _geometry(MEMBASE)
+    ops = emit_index_cache_write(rows=4, dim=128, machine=a3_machine)
+    assert len(ops) == 1
+    meta = dict(ops[0].metadata)
+    assert ops[0].dtype == "int8" and meta["payload_dtype"] == "int8"
+    plan_no_l2 = build_index_cache_writer(ops[0], a3_geom)
+    assert ops[0].hbm_bytes <= plan_no_l2.work.resources["hbm"]
+    l2_geom = replace(a3_geom, rates={**dict(a3_geom.rates), "l2": 1e12})
+    plan_with_l2 = build_index_cache_writer(ops[0], l2_geom)
+    assert ops[0].hbm_bytes == pytest.approx(plan_with_l2.work.resources["hbm"])
+
+    with pytest.raises(ModelingError, match=r"^index_cache_writer_fp8_unsupported_on_"):
+        emit_index_cache_write(rows=4, dim=128, cache_dtype="fp8_e4m3", machine=a3_machine)
+
+    dummy_op = _scorer(QLI, rows=128, cache_dtype="fp8_e4m3")
+    with pytest.raises(ModelingError, match=r"^quant_lightning_indexer_v2_.*_requires_"):
+        family_quant_indexer._build_arch35(dummy_op, a3_geom)
+
+
+def test_sparse_kv_offload_uses_packed_c8_row_bytes_read_role_and_exact_hbm():
+    from mindie_sim import compose_case
+    from mindie_sim.catalog.cache import packed_region_row_bytes
+    from mindie_sim.catalog.cache_format import with_packed_mla_cache
+    from mindie_sim.prediction.lowering import Builder
+    from mindie_sim.prediction.operators.sparse_indexer import sparse_kv_offload
+
+    raw = compose_case("deepseek-v3.2", hardware="a3", tp=1, dp=1, ep=1, num_devices=1,
+                       layers=2, quant="int8", prompt_tokens=16, output_tokens=2)
+    case = parse_case(raw)
+    c8_model = with_packed_mla_cache(replace(case.model, quant=replace(case.model.quant, kv_dtype="int8")), 64)
+    budget = sparse_kv_offload.sparse_kv_offload_memory_budget(
+        c8_model, case.runtime, case.machine,
+        options={"enabled": True, "layerwise_kv_offload": True},
+    )
+    assert budget["kv_row_bytes"] == int(packed_region_row_bytes(c8_model, "mla_kv", 576)) == 656
+
+    plan = c8_model.layer_plans[0]
+    views = (RequestView("r0", 4, 4096, False, "decode"),)
+    b_pre = Builder("p", plan, 0, views, c8_model, "prefill")
+    sparse_kv_offload.lower_prefill_offload(b_pre, plan=plan, views=views, store_id="kv", budget=budget)
+    assert b_pre.ops[-1].hbm_bytes == pytest.approx(4 * 656)
+
+    b_dec = Builder("d", plan, 0, views, c8_model, "decode")
+    sparse_kv_offload.lower_decode_offload(b_dec, plan=plan, views=views, store_id="kv", topk_id="tk", budget=budget)
+    d2h = next(op for op in b_dec.ops if op.recipe == "memfabric_sparse_copy_d2h")
+    assert d2h.hbm_bytes == pytest.approx(4 * 656)
+
+    single_mte2_geom = Geometry(1, {"hbm": 1, "mte2": 2, "mte3": 2, "vector": 2}, {"ub": 262144}, {"ub": 2})
+    plan_d2h = sparse_kv_offload.recipes()["memfabric_sparse_copy_d2h"].build(d2h, single_mte2_geom)
+    assert "mte2" in plan_d2h.work.resources
+
+
+def test_bf16_indexer_weight_bytes_ub_head_scaling_and_governed_make_op_io():
+    from mindie_sim import compose_case
+    from mindie_sim.prediction.operators.sparse_indexer import _bf16_access, index_pool_native
+
+    case = parse_case(compose_case("deepseek-v3.2", hardware="a5", tp=1, dp=1, ep=1, num_devices=1,
+                                   layers=2, quant="bf16", prompt_tokens=16, output_tokens=2))
+    plan = replace(case.model.layer_plans[0], index_heads=32, index_dim=128, index_kpool=4, index_topk=256)
+    bf16_quant = replace(case.model.quant, index_dtype="bf16")
+    views = (RequestView("r0", 1, 512, False, "decode"),)
+    _, ledger = index_pool_native._pool_ledger(views, plan, bf16_quant, 1, 256, 256, 128)
+    assert ledger["weight_bytes"] == float(32 * 128 * 2 + 32 * 4)
+
+    p1 = _bf16_access._key_access_plan(
+        ((2, 128),), compression=1, key_row_bytes=256, q_row_bytes=256, q_tile_rows=2,
+        topk=32, kv_heads=1, aiv_units=2, ub_capacity=262144, l1_capacity=524288,
+        l2_capacity=0, owner=0, identity_prefix="h1",
+    )
+    p2 = _bf16_access._key_access_plan(
+        ((2, 128),), compression=1, key_row_bytes=256, q_row_bytes=256, q_tile_rows=2,
+        topk=32, kv_heads=2, aiv_units=2, ub_capacity=262144, l1_capacity=524288,
+        l2_capacity=0, owner=0, identity_prefix="h2",
+    )
+    assert p2["workspace_bytes"] > p1["workspace_bytes"]
+
+    gov = _scorer(LIGHTNING, rows=256, cache_dtype="bf16")
+    assert gov.hbm_bytes > 0 and gov.mte2_bytes > 0 and gov.mte3_bytes > 0 and gov.vector_ops > 0

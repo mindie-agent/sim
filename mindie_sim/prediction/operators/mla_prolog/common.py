@@ -259,6 +259,26 @@ def _logical_matrix(c: PrologContract) -> dict[str, int]:
     return {dtype: flops for dtype, flops in matrix.items() if flops}
 
 
+def _minimum_prolog_io(c: PrologContract) -> tuple[float, float, float, float]:
+    """Conservative physical (hbm, mte2, mte3, vector_ops) lower bound for L* soundness."""
+    w_elem = BF16_BYTES if c.weight_quant_mode == WEIGHT_QUANT_BF16 else 1
+    in_bytes = float(c.tokens * c.hidden_size * BF16_BYTES)
+    weight_bytes = 0.0
+    for name, n, k, groups, _ in _products(c):
+        elem = BF16_BYTES if name == "mm4_w_uk" else w_elem
+        weight_bytes += float(n * k * groups * elem)
+    out_width = c.dsl_d_width if c.is_dsl else c.kv_lora_rank + c.qk_rope_head_dim
+    out_q = float(c.tokens * c.num_heads * out_width * BF16_BYTES)
+    out_kv = float(c.tokens * c.kv_row_bytes)
+    read_b = in_bytes + weight_bytes
+    write_b = out_q + out_kv
+    vec_ops = float(c.tokens * (
+        RMSNORM_OPS_PER_ELEM * (c.q_lora_rank + c.kv_lora_rank)
+        + (ROPE_OPS_PER_ELEM * (c.num_heads + 1) * c.qk_rope_head_dim if c.do_rope else 0)
+    ))
+    return read_b + write_b, read_b, write_b, vec_ops
+
+
 def make_op(
     *, op_id: str, tokens: int, hidden_size: int, num_heads: int,
     deps: tuple[str, ...] = (), stage: int = 0, layer: int = 0,
@@ -289,9 +309,11 @@ def make_op(
     width = c.dsl_d_width if c.is_dsl else c.kv_lora_rank + c.qk_rope_head_dim
     shape = (c.tokens, c.num_heads, width)
     matrix = _logical_matrix(c)
+    hbm_bytes, mte2_bytes, mte3_bytes, vector_ops = _minimum_prolog_io(c)
     return replace(
         op, semantic_shape=shape, local_shape=shape, padded_shape=shape, launch_shape=shape,
         flops=c.logical_flops, matrix_flops=tuple(matrix.items()),
+        vector_ops=vector_ops, hbm_bytes=hbm_bytes, mte2_bytes=mte2_bytes, mte3_bytes=mte3_bytes,
         metadata=(("native_kind", c.abi), ("prolog_v4_geometry", asdict(c))),
     )
 
