@@ -584,3 +584,122 @@ def test_k3_isolated_cache_key_distinguishes_same_edit_id_declarations():
     f_ub, f_gm = _replay_checked(dossier.handle, p_ub), _replay_checked(dossier.handle, p_gm)
     assert f_ub.region_summaries[0].dram_sector_bytes == 0
     assert f_gm.region_summaries[0].dram_sector_bytes == 16384 and f_gm.verification.l_star_ns is not None
+
+
+def test_simulation_mode_fails_fast_and_modeling_mode_evaluates_formula_kernel():
+    from mindie_sim.rewrite import FuseRegion, KernelBoundary, OpRef, evaluate_rewrites
+    from mindie_sim.schema.operators import OpSpec
+
+    rows, hidden = 128, 4096
+    shape = (rows, hidden)
+    tensor_bytes = float(rows * hidden * 2)
+    norm_op = OpSpec(
+        op_id="norm", family="rmsnorm", phase="decode", stage=0, layer=0,
+        requests=(), semantic_shape=shape, local_shape=shape, padded_shape=shape, launch_shape=shape,
+        dtype="bf16", vector_ops=float(rows * hidden * 4),
+        mte2_bytes=tensor_bytes, mte3_bytes=tensor_bytes, hbm_bytes=2.0 * tensor_bytes,
+    )
+    quant_op = OpSpec(
+        op_id="quant", family="quantize", phase="decode", stage=0, layer=0,
+        requests=(), semantic_shape=shape, local_shape=shape, padded_shape=shape, launch_shape=shape,
+        deps=("norm",), dtype="fp8",
+        vector_ops=float(rows * hidden * 3),
+        mte2_bytes=tensor_bytes, mte3_bytes=tensor_bytes * 0.5, hbm_bytes=1.5 * tensor_bytes,
+    )
+    dossier = prepare_scenario(
+        ScenarioRequest(_catalog_case(), StepRequest("decode")),
+        spine=_DeclaredGraphSpine(norm_op, quant_op),
+    )
+    refs = (OpRef("atom", "norm"), OpRef("atom", "quant"))
+    fuse_edit = Edit("custom_nq", operation=FuseRegion(
+        members=refs, preserve_ports=(),
+        kernel_boundaries=(KernelBoundary("CustomFormulaNormQuant", refs),),
+        fusion_tier="K3_dsl_pipeline",
+    ))
+    plan = replace(dossier.unmerge_plan, edits=(fuse_edit,))
+
+    # Simulation Mode (default allow_unbound_formula=False) MUST fail fast on unbound fusion.
+    with pytest.raises(ModelingError, match="rewrite_fusion_recipe_unbound:rewrite:custom_nq:CustomFormulaNormQuant"):
+        finalize_plan(dossier.handle, plan)
+    sim_batch = evaluate_rewrites(dossier.handle, (plan,))
+    assert sim_batch.results[0].status == "invalid"
+    assert "rewrite_fusion_recipe_unbound" in sim_batch.results[0].reason
+
+    # Modeling Mode (allow_unbound_formula=True) uses white-box FusedPipelineRecipe on Engine.
+    model_batch = evaluate_rewrites(dossier.handle, (plan,), allow_unbound_formula=True)
+    cand = model_batch.results[0]
+    assert cand.status == "ok" and cand.verification is not None and cand.verification.passed
+    assert cand.has_unbound_formula_ops is True
+    assert cand.unbound_formula_ops == ("rewrite:custom_nq",)
+    assert ("rewrite:custom_nq", "unbound_formula_projection") in cand.binding_states
+
+    baseline = finalize_plan(dossier.handle, dossier.unmerge_plan)
+    fused_full = finalize_plan(dossier.handle, plan, allow_unbound_formula=True)
+    assert fused_full.verification.passed
+    assert fused_full.verification.l_star_ns is not None
+    assert fused_full.verification.l_star_ns <= fused_full.wall_ns
+    assert fused_full.wall_ns < baseline.wall_ns
+    assert fused_full.has_unbound_formula_ops is True
+    assert fused_full.unbound_formula_ops == ("rewrite:custom_nq",)
+    assert ("rewrite:custom_nq", "unbound_formula_projection") in fused_full.binding_states
+
+
+def test_oneshot_collective_transform_replays_and_passes_all_verification_gates():
+    from mindie_sim.rewrite import CollectiveTransform, OpRef
+
+    case = compose_case("qwen3-32b", REPRESENTATIVE_SKUS["a5"], tp=2, dp=1, layers=1)
+    dossier = prepare_scenario(ScenarioRequest(case, StepRequest("decode", tokens=4, context=64)))
+    collective = next(op for op in dossier.handle.scenario.atomic_ops[0].ops if op.link_bytes > 0)
+    route = dossier.handle.scenario.case.machine.links[0].name
+    edit = Edit("oneshot_comm", operation=CollectiveTransform(OpRef("atom", collective.op_id), "oneshot", route))
+    plan = replace(dossier.unmerge_plan, edits=(edit,))
+    full = finalize_plan(dossier.handle, plan)
+    assert full.verification.passed
+    assert full.verification.l_star_ns is not None
+    assert full.verification.l_star_ns <= full.wall_ns
+    assert full.has_unbound_formula_ops is False
+    row = next(item for item in full.step_eval.operators if item.occurrence.op_id == collective.op_id)
+    assert row.implementation == "OneShotCollective"
+
+
+def test_formula_kernel_sdk_prices_whitebox_l0_pipes_and_fp32_sram():
+    from mindie_sim.optimization import (
+        FormulaKernelSpec,
+        FormulaTensorSpec,
+        evaluate_formula_kernel,
+        simulate_formula_kernel,
+    )
+
+    case = parse_case(_catalog_case())
+    vec_spec = FormulaKernelSpec(
+        name="custom_rmsnorm_quant",
+        equations=("t1 = RMSNorm(x; gamma)", "y, s = DynamicQuant(t1)"),
+        inputs=(FormulaTensorSpec("x", (64, 4096), "bf16", "input"),),
+        outputs=(FormulaTensorSpec("y", (64, 4096), "fp8", "output"),),
+        vector_ops_fp32=float(64 * 4096 * 7),
+        row_reduction=True,
+    )
+    res_vec = evaluate_formula_kernel(vec_spec, case)
+    assert res_vec == simulate_formula_kernel(vec_spec, case)
+    assert res_vec.sram_verified is True
+    assert 0 < res_vec.ub_peak_bytes <= res_vec.ub_budget_bytes
+    assert res_vec.projected_us >= res_vec.l_star_us > 0.0
+    assert res_vec.binding_state == "unbound_formula_projection"
+    assert res_vec.has_unbound_formula_ops is True
+    assert res_vec.abi_signature_id.startswith("formula:custom_rmsnorm_quant:")
+
+    cube_spec = FormulaKernelSpec(
+        name="custom_gmm_situ",
+        equations=("t1 = x @ W^T", "y = SiTU(t1_gate, t1_up; beta=1.0)"),
+        inputs=(FormulaTensorSpec("x", (32, 2048), "bf16", "input"),),
+        weights=(FormulaTensorSpec("W", (4096, 2048), "bf16", "weight"),),
+        outputs=(FormulaTensorSpec("y", (32, 2048), "bf16", "output"),),
+        matrix_flops=(("bf16", float(2 * 32 * 4096 * 2048)),),
+        vector_ops_fp32=float(32 * 2048 * 6),
+        activation="situ",
+        activation_params=(("beta", 1.0),),
+    )
+    res_cube = evaluate_formula_kernel(cube_spec, case)
+    assert res_cube.sram_verified is True
+    assert res_cube.projected_us >= res_cube.l_star_us > 0.0
+    assert res_cube.l1_peak_bytes > 0 and res_cube.l0_peak_bytes > 0

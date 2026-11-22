@@ -98,11 +98,19 @@ class WeightPrefetch:
     max_bytes: int | None = None
 
 
+COLLECTIVE_TRANSFORM_MODES = frozenset({"ring", "pairwise", "oneshot"})
+CollectiveMode: TypeAlias = Literal["ring", "pairwise", "oneshot"]
+
+
 @dataclass(frozen=True, slots=True)
 class CollectiveTransform:
     target: OpRef
-    mode: str
+    mode: CollectiveMode
     topology_route: str
+
+    def __post_init__(self) -> None:
+        if self.mode not in COLLECTIVE_TRANSFORM_MODES:
+            raise ModelingError(f"rewrite_collective_mode_invalid:{self.mode}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -357,7 +365,8 @@ def empty_plan(base_graph_sha256: str, framing_sha256: str) -> RewritePlan:
 
 
 __all__ = [
-    "REWRITE_PLAN_SCHEMA", "TemplateTier", "FusionTier", "OpRef", "PortRef",
+    "REWRITE_PLAN_SCHEMA", "COLLECTIVE_TRANSFORM_MODES", "CollectiveMode",
+    "TemplateTier", "FusionTier", "OpRef", "PortRef",
     "KernelBoundary", "VariantRef", "FuseRegion", "SelectTemplate", "PipelineTiles",
     "StreamSchedule", "WeightPrefetch", "CollectiveTransform", "QuantizeContract",
     "HoistOrDeduplicate", "RewriteOp", "Edit", "RewritePlan", "encode_rewrite_plan",
