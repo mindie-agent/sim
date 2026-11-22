@@ -37,6 +37,7 @@ _NON_DEVICE_INFRA_RECIPES = frozenset({
     ("mindie_sim.prediction.program.recipes", "HostStaging"),
     ("mindie_sim.prediction.program.recipes", "RecurrentScan"),
     # Transport-only programs and a single-resource service adapter.
+    ("mindie_sim.prediction.collectives.ring_pairwise", "OneShotCollective"),
     ("mindie_sim.prediction.collectives.ring_pairwise", "PairwiseCollective"),
     ("mindie_sim.prediction.collectives.ring_pairwise", "RingCollective"),
     ("mindie_sim.prediction.service_regime_domains.services", "ResourceService"),

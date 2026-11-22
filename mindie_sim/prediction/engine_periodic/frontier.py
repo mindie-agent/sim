@@ -50,7 +50,12 @@ def _state_equal(first: SettledFrontier, second: SettledFrontier) -> bool:
     left = first._canonical
     right = second._canonical
     if left is not None and right is not None:
-        return _canonical_equal(left, right)
+        return _canonical_equal(
+            left,
+            right,
+            clock_scale=max(abs(first.now), abs(second.now)),
+            span=abs(second.now - first.now),
+        )
     if left is None and right is None:
         # History evidence is the frozen view captured at observation, never
         # the public mutable input (which may have been rewritten since).

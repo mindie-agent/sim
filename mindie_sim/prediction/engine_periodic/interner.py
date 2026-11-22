@@ -19,9 +19,11 @@ from .snapshots import (
     _TEMPLATE_REPR_LIMIT,
     _check_canonical_snapshot,
     _check_structural,
+    _clock_rel_tol,
     _freeze_snapshot,
     _is_int,
     _measure_retained,
+    _numeric_close,
     _require_int,
     _structural_equal,
 )
@@ -493,8 +495,109 @@ def reset_state_caches() -> None:
     reset_metrics()
 
 
-def _canonical_equal(first: CanonicalState, second: CanonicalState) -> bool:
-    """Exact canonical comparison with a fast fingerprint rejection."""
+_ENGINE_DYNAMIC_ARITY = 5
+_ENGINE_TASK_DYNAMIC_ARITY = 4
+
+
+def _frozen_scalar_close(
+    left: tuple,
+    right: tuple,
+    *,
+    clock_scale: float = 0.0,
+    rel_tol: float = 0.0,
+) -> bool:
+    if left == right:
+        return True
+    if (
+        len(left) == 2
+        and len(right) == 2
+        and left[0] == "float"
+        and right[0] == "float"
+    ):
+        return _numeric_close(
+            left[1], right[1], clock_scale=clock_scale, rel_tol=rel_tol,
+        )
+    return False
+
+
+def _engine_dynamic_close(
+    first: tuple,
+    second: tuple,
+    *,
+    clock_scale: float,
+    span: float,
+) -> bool:
+    """Compare frozen ``origin=='engine'`` dynamic trees allowing clock-scale ULP jitter."""
+    if (
+        len(first) != 2
+        or len(second) != 2
+        or first[0] != "tuple"
+        or second[0] != "tuple"
+    ):
+        return False
+    f_body, s_body = first[1], second[1]
+    if len(f_body) != _ENGINE_DYNAMIC_ARITY or len(s_body) != _ENGINE_DYNAMIC_ARITY:
+        return False
+    # runs (1), allocations (2), pools (3) stay 100% bit-exact.
+    if f_body[1] != s_body[1] or f_body[2] != s_body[2] or f_body[3] != s_body[3]:
+        return False
+    rel_tol = _clock_rel_tol(clock_scale, span)
+    # task_dynamic (0): ("tuple", (task_entry, ...))
+    f_tasks, s_tasks = f_body[0], s_body[0]
+    if f_tasks != s_tasks:
+        if f_tasks[0] != "tuple" or s_tasks[0] != "tuple" or len(f_tasks[1]) != len(s_tasks[1]):
+            return False
+        for ft, st in zip(f_tasks[1], s_tasks[1]):
+            if ft == st:
+                continue
+            f_fields, s_fields = ft[1], st[1]
+            if (
+                len(f_fields) != _ENGINE_TASK_DYNAMIC_ARITY
+                or len(s_fields) != _ENGINE_TASK_DYNAMIC_ARITY
+            ):
+                return False
+            # waiting (1) is exact integer
+            if f_fields[1] != s_fields[1]:
+                return False
+            # remaining (0): ("tuple", (("tuple", (("str", key), (tag, amount))), ...))
+            f_rem, s_rem = f_fields[0][1], s_fields[0][1]
+            if len(f_rem) != len(s_rem):
+                return False
+            for fr, sr in zip(f_rem, s_rem):
+                if fr == sr:
+                    continue
+                if fr[1][0] != sr[1][0]:
+                    return False
+                if not _frozen_scalar_close(fr[1][1], sr[1][1], rel_tol=rel_tol):
+                    return False
+            # release (2) and start (3) offsets are time deltas in ms
+            if not _frozen_scalar_close(f_fields[2], s_fields[2], clock_scale=clock_scale):
+                return False
+            if not _frozen_scalar_close(f_fields[3], s_fields[3], clock_scale=clock_scale):
+                return False
+    # releases (4): ("tuple", (("tuple", ((tag, when_offset), key)), ...))
+    f_rel, s_rel = f_body[4], s_body[4]
+    if f_rel != s_rel:
+        if f_rel[0] != "tuple" or s_rel[0] != "tuple" or len(f_rel[1]) != len(s_rel[1]):
+            return False
+        for fe, se in zip(f_rel[1], s_rel[1]):
+            if fe == se:
+                continue
+            if len(fe[1]) != 2 or len(se[1]) != 2 or fe[1][1] != se[1][1]:
+                return False
+            if not _frozen_scalar_close(fe[1][0], se[1][0], clock_scale=clock_scale):
+                return False
+    return True
+
+
+def _canonical_equal(
+    first: CanonicalState,
+    second: CanonicalState,
+    *,
+    clock_scale: float = 0.0,
+    span: float = 0.0,
+) -> bool:
+    """Exact canonical comparison with clock-scale ULP tolerance for Engine dynamic floats."""
     if first.origin == "external" or second.origin == "external":
         # External canonical values keep the full exact comparison path; only
         # the trusted engine/trusted origins may use the template identity.
@@ -504,12 +607,23 @@ def _canonical_equal(first: CanonicalState, second: CanonicalState) -> bool:
         or first.template.generation != second.template.generation
     ):
         return False
+    if first.template is not second.template and first.template.template != second.template.template:
+        return False
+    if (
+        first.dynamic_fingerprint is not None
+        and second.dynamic_fingerprint is not None
+        and first.dynamic_fingerprint == second.dynamic_fingerprint
+        and first.dynamic == second.dynamic
+    ):
+        return True
+    if first.origin == "engine" and second.origin == "engine" and clock_scale > 0.0:
+        return _engine_dynamic_close(
+            first.dynamic, second.dynamic, clock_scale=clock_scale, span=span,
+        )
     if (
         first.dynamic_fingerprint is not None
         and second.dynamic_fingerprint is not None
         and first.dynamic_fingerprint != second.dynamic_fingerprint
     ):
-        return False
-    if first.template is not second.template and first.template.template != second.template.template:
         return False
     return first.dynamic == second.dynamic

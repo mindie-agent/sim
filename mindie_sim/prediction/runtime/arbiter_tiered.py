@@ -17,6 +17,9 @@ from ..ownership import unit_rates
 from .arbiter_fast_coupled import fast_single_tier_coupled
 
 
+_TRIPLE_CONTENDER_ARITY = 3
+
+
 def _max_min_rates(capacity: float, caps: Mapping[int, float]) -> dict[int, float]:
     """Unprioritized capped max-min water filling."""
     size = len(caps)
@@ -31,7 +34,7 @@ def _max_min_rates(capacity: float, caps: Mapping[int, float]) -> dict[int, floa
         rate1 = cap1 if cap1 < share else share
         remaining = capacity - rate1
         return {key1: rate1, key2: cap2 if cap2 < remaining else remaining}
-    if size == 3:
+    if size == _TRIPLE_CONTENDER_ARITY:
         (k0, c0), (k1, c1), (k2, c2) = caps.items()
         if (c1, k1) < (c0, k0):
             k0, c0, k1, c1 = k1, c1, k0, c0
@@ -39,21 +42,26 @@ def _max_min_rates(capacity: float, caps: Mapping[int, float]) -> dict[int, floa
             k1, c1, k2, c2 = k2, c2, k1, c1
             if (c1, k1) < (c0, k0):
                 k0, c0, k1, c1 = k1, c1, k0, c0
-        s0 = capacity / 3.0
-        r0 = c0 if c0 < s0 else s0
-        rem1 = capacity - r0
+        s0 = capacity / float(_TRIPLE_CONTENDER_ARITY)
+        if c0 >= s0:
+            return {k0: s0, k1: s0, k2: s0}
+        rem1 = capacity - c0
         s1 = rem1 * 0.5
-        r1 = c1 if c1 < s1 else s1
-        rem2 = rem1 - r1
-        return {k0: r0, k1: r1, k2: c2 if c2 < rem2 else rem2}
+        if c1 >= s1:
+            return {k0: c0, k1: s1, k2: s1}
+        rem2 = rem1 - c1
+        return {k0: c0, k1: c1, k2: c2 if c2 < rem2 else rem2}
     result: dict[int, float] = {}
     remaining = capacity
     ordered = sorted(caps.items(), key=lambda item: (item[1], item[0]))
     for index, (key, cap) in enumerate(ordered):
         share = remaining / (len(ordered) - index)
-        rate = min(cap, share)
-        result[key] = rate
-        remaining -= rate
+        if cap >= share:
+            for rem_key, _ in ordered[index:]:
+                result[rem_key] = share
+            break
+        result[key] = cap
+        remaining -= cap
     return result
 
 

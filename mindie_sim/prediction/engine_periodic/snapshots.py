@@ -21,6 +21,7 @@ class PeriodicContractError(ValueError):
 # Only floating measurement rounding may be tolerated.  Structural values never
 # use this tolerance; they go through ``structural_equal`` below.
 _ULP_SLOP = 8
+_MAX_CLOCK_REL_TOL = 1e-9
 _MAX_STATE_DEPTH = 64
 # A canonical tree adds a tagged tuple around every input container, so its
 # depth is bounded by roughly twice the validated input depth.
@@ -100,14 +101,37 @@ def _check_structural(
     raise PeriodicContractError(f"periodic_state_opaque:{path}:{type(value).__name__}")
 
 
-def _numeric_close(first: float, second: float) -> bool:
+def _clock_rel_tol(
+    clock_scale: float, span: float, *, slop: int = _ULP_SLOP,
+) -> float:
+    """Dimensionless Wilkinson relative tolerance from clock-scale ULP jitter."""
+    if (
+        clock_scale <= 0.0
+        or span <= 0.0
+        or not (math.isfinite(clock_scale) and math.isfinite(span))
+    ):
+        return 0.0
+    return min(_MAX_CLOCK_REL_TOL, (slop * math.ulp(clock_scale)) / span)
+
+
+def _numeric_close(
+    first: float,
+    second: float,
+    *,
+    clock_scale: float = 0.0,
+    rel_tol: float = 0.0,
+    slop: int = _ULP_SLOP,
+) -> bool:
     """Equality for measured floats, allowing only a few representation ulps."""
     if first == second:
         return True
     if not (math.isfinite(first) and math.isfinite(second)):
         return False
-    scale = max(abs(first), abs(second))
-    return abs(first - second) <= _ULP_SLOP * math.ulp(scale)
+    val_scale = max(abs(first), abs(second))
+    tol = slop * math.ulp(max(val_scale, abs(clock_scale)))
+    if rel_tol > 0.0:
+        tol = max(tol, rel_tol * val_scale)
+    return abs(first - second) <= tol
 
 
 def _structural_equal(first: Any, second: Any) -> bool:

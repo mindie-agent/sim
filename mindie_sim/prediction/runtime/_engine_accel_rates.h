@@ -54,9 +54,13 @@ static void rates_fair(msim_ctx *c, const int32_t *idx, int32_t n, double capaci
     }
     for (i = 0; i < n; i++) {
         double share = remaining / (double)(n - i), cap = c->link[order[i]].cap;
-        double rate = cap <= share ? cap : share;
-        c->link[order[i]].rate = rate;
-        remaining -= rate;
+        if (cap >= share) {
+            int32_t k;
+            for (k = i; k < n; k++) c->link[order[k]].rate = share;
+            break;
+        }
+        c->link[order[i]].rate = cap;
+        remaining -= cap;
     }
 }
 
@@ -122,9 +126,13 @@ static bool rates_partition(msim_ctx *c, const int32_t *idx, int32_t n,
         }
         for (i = 0; i < m; i++) {
             double share = capacity / (double)(m - i), cap = c->link[members[i]].cap;
-            double assigned = cap <= share ? cap : share;
-            c->link[members[i]].rate = assigned;
-            capacity -= assigned;
+            if (cap >= share) {
+                int32_t k;
+                for (k = i; k < m; k++) c->link[members[k]].rate = share;
+                break;
+            }
+            c->link[members[i]].rate = cap;
+            capacity -= cap;
         }
     }
     return true;

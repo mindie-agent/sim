@@ -29,6 +29,8 @@ from .frontier import (
 from .interner import CanonicalState, _DEFAULT_INTERNER, metrics
 from .snapshots import (
     PeriodicContractError,
+    _ULP_SLOP,
+    _clock_rel_tol,
     _measure_retained,
     _numeric_close,
     _require_float,
@@ -127,6 +129,7 @@ class _CycleEvidence:
     retired_strides: Mapping
     seq_stride: int
     delta: IntervalDelta
+    clock_scale: float = 0.0
 
 
 class CycleDetector:
@@ -464,8 +467,10 @@ class CycleDetector:
         period = end.now - start.now
         if not math.isfinite(period) or period <= 0:
             return None
+        clock_scale = max(abs(start.now), abs(end.now))
+        step_slop = max(_ULP_SLOP, len(parts) * 2)
         measured_dt = math.fsum(part.dt for part in parts)
-        if not _numeric_close(measured_dt, period):
+        if not _numeric_close(measured_dt, period, clock_scale=clock_scale, slop=step_slop):
             return None
 
         start_cursors = {item.run_id: item for item in start.cursors}
@@ -507,7 +512,12 @@ class CycleDetector:
                     amounts.setdefault(name, []).append(amount)
             counters[field] = {name: math.fsum(values) for name, values in amounts.items()}
         clock_steps = tuple(dt for part in parts for dt in part.clock_steps)
-        if clock_steps and _advance_periodic_clock(start.now, clock_steps, 1) != end.now:
+        if clock_steps and not _numeric_close(
+            _advance_periodic_clock(start.now, clock_steps, 1),
+            end.now,
+            clock_scale=clock_scale,
+            slop=max(_ULP_SLOP, len(clock_steps) * 2),
+        ):
             return None
         peaks: dict[Any, float] = {}
         for part in parts:
@@ -532,6 +542,7 @@ class CycleDetector:
             retired_strides=dict(retired),
             seq_stride=seq_stride,
             delta=aggregate_delta,
+            clock_scale=clock_scale,
         )
 
     @staticmethod
@@ -539,7 +550,14 @@ class CycleDetector:
         first: _CycleEvidence,
         second: _CycleEvidence,
     ) -> bool:
-        if not _numeric_close(first.period, second.period):
+        clock_scale = max(first.clock_scale, second.clock_scale)
+        step_slop = max(
+            _ULP_SLOP,
+            max(len(first.delta.clock_steps), len(second.delta.clock_steps)) * 2,
+        )
+        if not _numeric_close(
+            first.period, second.period, clock_scale=clock_scale, slop=step_slop,
+        ):
             return False
         if dict(first.tile_strides) != dict(second.tile_strides):
             return False
@@ -548,7 +566,9 @@ class CycleDetector:
         if first.seq_stride != second.seq_stride:
             return False
         left, right = first.delta, second.delta
-        if not _numeric_close(left.dt, right.dt):
+        if not _numeric_close(
+            left.dt, right.dt, clock_scale=clock_scale, slop=step_slop,
+        ):
             return False
         if dict(left.issued_retired_by_run) != dict(right.issued_retired_by_run):
             return False
@@ -564,11 +584,27 @@ class CycleDetector:
             return False
         if left.crossed_external_or_opaque or right.crossed_external_or_opaque:
             return False
-        if left.clock_steps != right.clock_steps:
+        if len(left.clock_steps) != len(right.clock_steps):
             return False
+        if any(
+            not _numeric_close(a, b, clock_scale=clock_scale, slop=step_slop)
+            for a, b in zip(left.clock_steps, right.clock_steps)
+        ):
+            return False
+        rel_tol = _clock_rel_tol(
+            clock_scale, min(first.period, second.period), slop=step_slop,
+        )
         for field in (*_ADDITIVE_COUNTERS, "per_unit_peaks"):
             a, b = getattr(left, field), getattr(right, field)
-            if a.keys() != b.keys() or any(not _numeric_close(a[key], b[key]) for key in a):
+            use_clock = clock_scale if field == "busy_by_resource" else 0.0
+            use_rel = 0.0 if field == "busy_by_resource" else rel_tol
+            if a.keys() != b.keys() or any(
+                not _numeric_close(
+                    a[key], b[key],
+                    clock_scale=use_clock, rel_tol=use_rel, slop=step_slop,
+                )
+                for key in a
+            ):
                 return False
         return True
 

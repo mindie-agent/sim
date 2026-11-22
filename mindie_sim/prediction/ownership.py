@@ -88,9 +88,12 @@ def _partition_rates(rate, count, caps, placements):
         for index, key in enumerate(ordered):
             cap = caps[key]
             share = capacity / (n_ord - index)
-            assigned = cap if cap < share else share
-            result[key] = assigned
-            capacity -= assigned
+            if cap >= share:
+                for rem_key in ordered[index:]:
+                    result[rem_key] = share
+                break
+            result[key] = cap
+            capacity -= cap
     return result
 
 

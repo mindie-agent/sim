@@ -324,10 +324,8 @@ class RecipeBook:
             "resource_service": ResourceService, "ring_collective": RingCollective,
             "pairwise_collective": PairwiseCollective,
             "direct_peer_collective": DirectPeerCollective,
+            "oneshot_collective": _collectives.OneShotCollective,
         }
-        oneshot_cls = getattr(_collectives, "OneShotCollective", None)
-        if oneshot_cls is not None:
-            factories["oneshot_collective"] = oneshot_cls
         return factories
 
     @classmethod
