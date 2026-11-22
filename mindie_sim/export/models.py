@@ -288,27 +288,6 @@ TRACK_FRAMEWORK = "framework_tasks"
 TRACK_KERNEL = "kernel_tasks"
 AGENT_BRIEF_SCHEMA = "mindie-sim.agent-brief/1"
 
-#: Hardware + topology preset aliases for zero-boilerplate CLI/Python UX.
-HARDWARE_PRESET_ALIASES: dict[str, tuple[str, str | None]] = {
-    "950dt": ("Ascend950DT_9582", "a5_pod"),
-    "a5": ("Ascend950DT_9582", "a5_pod"),
-    "950dt-96g": ("Ascend950DT_9582", None),
-    "950dt-96g-pod": ("Ascend950DT_9582", "a5_pod"),
-    "a5-96g-pod": ("Ascend950DT_9582", "a5_pod"),
-    "a5-pod": ("Ascend950DT_9582", "a5_pod"),
-    "950dt-144g": ("Ascend950DT_9581", None),
-    "950dt-144g-pod": ("Ascend950DT_9581", "a5_pod"),
-    "a5-144g-pod": ("Ascend950DT_9581", "a5_pod"),
-    "a3": ("Ascend910_9392", "a3_16p"),
-    "910c": ("Ascend910_9392", "a3_16p"),
-    "a3-16p": ("Ascend910_9392", "a3_16p"),
-    "a3-pod": ("Ascend910_9392", "a3_superpod"),
-    "a3-superpod": ("Ascend910_9392", "a3_superpod"),
-    "a2": ("Ascend910B4", "a2_standard"),
-    "910b": ("Ascend910B4", "a2_standard"),
-    "a2-8p": ("Ascend910B4", "a2_standard"),
-}
-
 #: Deployment mode canonical display labels.
 DEPLOYMENT_MODE_LABELS: dict[str, str] = {
     "pd_unpooled": "PD 分离 [非池化]",
@@ -499,6 +478,18 @@ class AlignedComparisonRow:
     action_note: str
     added_glue_note: str = ""
     non_adjacent_anchor_kernel: str = ""
+    before_repeat_count: int | None = None
+    after_repeat_count: int | None = None
+
+    @property
+    def effective_before_repeat(self) -> int:
+        raw = self.before_repeat_count if self.before_repeat_count is not None else self.repeat_count
+        return max(1, int(raw)) if self.before_ops else 0
+
+    @property
+    def effective_after_repeat(self) -> int:
+        raw = self.after_repeat_count if self.after_repeat_count is not None else self.repeat_count
+        return max(1, int(raw)) if self.after_ops else 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -579,6 +570,7 @@ class NewKernelBacklogItem:
     math_formula: str = ""
     sram_residency_summary: str = ""
     binding_state: str = BINDING_STATE_BOUND
+    source_row_indices: tuple[int, ...] = ()
 
 
 #: Canonical alias used by Sheet 4 (``Pending_Kernel_Details``).
@@ -632,6 +624,7 @@ class WeightLedgerRow:
     native_bf16_bytes: int = 0
     quant_rule: str = QUANT_RULE_FOLLOW_PRESET
     is_vision: bool = False
+    peak_stage_repeats: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -665,6 +658,7 @@ class StageBudgetRow:
     usable_hbm_budget_bytes: float
     headroom_bytes: float
     fits_hbm: bool
+    per_request_cache_bytes: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -712,6 +706,7 @@ class MemoryCalculatorLedger:
     native_bf16_weight_footprint_per_die_bytes: float = 0.0
     vision_weight_bytes_per_die: float = 0.0
     weight_compression_ratio: float = 1.0
+    peak_weight_stage: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -799,3 +794,7 @@ class ExportBundle:
     analysis_mode: str = MODE_SIMULATION
     binding_state: str = BINDING_STATE_BOUND
     has_unbound_formula_ops: bool = False
+    handoff_tpot_ms: float = 0.0
+    cluster_concurrency: int = 0
+    deployment_total_dies: int = 0
+    pd_pool_summary: Mapping[str, Any] | None = None

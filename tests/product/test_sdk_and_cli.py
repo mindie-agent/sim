@@ -656,3 +656,74 @@ def test_agent_first_report_and_solve_cli_flags_and_model_target_ceiling(tmp_pat
     assert brief_path.is_file() and brief_path.stat().st_size < 8192
     assert opt_sh_path.is_file() and "FULL_DECODE_ONLY" in opt_sh_path.read_text(encoding="utf-8")
 
+
+def test_public_graph_mapping_cli_geometry_and_report_parity(tmp_path, capsys):
+    from mindie_sim.cli import _main as cli_main
+    from mindie_sim.compose import compose_case
+    from mindie_sim.prediction.frontend.speculation import compute_speculative_accept_step
+    from mindie_sim.prediction.operator_analysis import target_graphs
+    from mindie_sim.prediction.structure import parse_case
+    from mindie_sim.public.api import simulate_graph
+    from mindie_sim.structure import export_structure
+
+    # 1. public.simulate_graph handles rank-keyed TargetGraphSet mappings without crashing.
+    raw = compose_case("qwen3-32b", "a3", tp=2, layers=2, prompt_tokens=256, output_tokens=32)
+    graphs = target_graphs(parse_case(raw), phase="decode", tokens=1, context=256, sequences=1, scope="model")
+    rep = simulate_graph(raw, graphs)
+    assert float(rep["duration_ms"]) > 0.0
+
+    # 2. CLI graph command emits canonical phase/context/execution_geometry and threads media_tokens into structure.
+    case_path = tmp_path / "case.json"
+    case_path.write_text(json.dumps(raw), encoding="utf-8")
+    graph_out = tmp_path / "graph_out.json"
+    struct_out = tmp_path / "struct_out.json"
+    rc_g = cli_main([
+        "graph", str(case_path), "--phase", "prefill", "--tokens", "64", "--context", "0",
+        "--sequences", "1", "--scope", "model", "--media-tokens-per-sequence", "0",
+        "--export-structure", str(struct_out), "-o", str(graph_out),
+    ])
+    err_g = capsys.readouterr().err
+    assert rc_g == 0, err_g
+    assert graph_out.is_file() and struct_out.is_file()
+    g_data = json.loads(graph_out.read_text(encoding="utf-8"))
+    s_data = json.loads(struct_out.read_text(encoding="utf-8"))
+    assert g_data["phase"] == "prefill" and g_data["context"] == 0
+    assert g_data["execution_geometry"]["phase"] == "prefill"
+    assert g_data["execution_geometry"]["media_tokens_per_sequence"] == 0
+    assert s_data["execution"]["media_tokens_per_sequence"] == 0
+    from mindie_sim.structure.export import _structure_inputs
+    media_case_path = Path(__file__).resolve().parents[2] / "examples/cases/qwen3.8-27b-media.json"
+    media_raw = json.loads(media_case_path.read_text(encoding="utf-8"))
+    graphs_media, opts_media = _structure_inputs(
+        media_raw, phase="prefill", tokens=5, context=0, sequences=1, media_tokens_per_sequence=4,
+    )
+    graphs_lang, opts_lang = _structure_inputs(
+        media_raw, phase="prefill", tokens=5, context=0, sequences=1, media_tokens_per_sequence=0,
+    )
+    assert opts_media["execution"]["media_tokens_per_sequence"] == 4
+    assert opts_lang["execution"]["media_tokens_per_sequence"] == 0
+    assert len(graphs_media[0]) > len(graphs_lang[0])
+    direct_s = export_structure(raw, phase="prefill", tokens=64, context=0, sequences=1, media_tokens_per_sequence=0)
+    assert direct_s["execution"]["media_tokens_per_sequence"] == 0
+
+    # 3. CLI report uses geometric speculative accept length & honors explicit --weight-quant bf16 --cache-dtype bf16.
+    out_dir = tmp_path / "rep_bf16"
+    rec_path = tmp_path / "rep_bf16_rec.json"
+    rc_r = cli_main([
+        "report", "--model", "deepseek-v3.2", "--hardware", "a5",
+        "--dp", "1", "--tp", "8", "--ep", "8", "--concurrency", "1",
+        "--prompt-tokens", "256", "--output-tokens", "32",
+        "--weight-quant", "bf16", "--cache-dtype", "bf16",
+        "--spec-tokens", "3", "--mode", "simulation",
+        "--no-trace", "--no-xlsx", "--out-dir", str(out_dir), "--json", "--receipt", str(rec_path),
+    ])
+    err_r = capsys.readouterr().err
+    assert rc_r == 0, err_r
+    assert rec_path.is_file()
+    rec_r = json.loads(rec_path.read_text(encoding="utf-8"))
+    scen = rec_r["agent_brief"]["scenario_and_parallelism"]
+    assert scen["weight_quant"].upper().startswith("BF16")
+    assert scen["cache_dtype"].upper() == "BF16"
+    assert scen["avg_accepted_tokens"] == pytest.approx(compute_speculative_accept_step(0.70, 3), rel=1e-6)
+
+

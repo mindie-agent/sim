@@ -285,6 +285,21 @@ def _cache_dtype_override_ratio(model: Any, target_dtype: str) -> float:
     return target_w / max(base_w, MIN_DENOM_EPS)
 
 
+_FIXED_STATE_CACHE_COMPONENTS = frozenset({
+    "recurrent_state",
+    "conv_state",
+    "compressor_state",
+    "index_compressor_state",
+    "index_pool_tail",
+    "ple_conv_state",
+    "draft_state",
+    "replay_records",
+    "state_transient",
+    "page_group_reserve",
+    "page_metadata",
+})
+
+
 def _compute_cache_ledger_rows(
     case: Case,
     mem: Memory,
@@ -309,10 +324,7 @@ def _compute_cache_ledger_rows(
     comp_scalable: dict[str, bool] = {}
 
     scale_override = _cache_dtype_override_ratio(model, cache_dtype)
-    fixed_state_comps = frozenset({
-        "recurrent_state", "conv_state", "compressor_state",
-        "page_group_reserve", "page_metadata",
-    })
+    fixed_state_comps = _FIXED_STATE_CACHE_COMPONENTS
     # Count active target layers per component so per-token-per-layer rates stay exact.
     for lp in model.layer_plans:
         stage = layer_stage[lp.index] if lp.index < len(layer_stage) else 0
@@ -382,10 +394,10 @@ def _compute_cache_ledger_rows(
         layers_per_stage = tuple(comp_stage_layers[comp_name])
         max_layers = max(layers_per_stage, default=0)
         max_req_bytes = max(per_stage, default=0.0)
-        scalable = comp_scalable.get(comp_name, True)
+        scalable = comp_scalable.get(comp_name, True) and (max_layers > 0)
         b_per_tok = (
             max_req_bytes / float(max(1, max_layers * local_tokens))
-            if (scalable and max_layers > 0) else 0.0
+            if scalable else 0.0
         )
         for st_idx, st_val in enumerate(per_stage):
             stage_per_req_totals[st_idx] += st_val
@@ -527,6 +539,7 @@ def _collect_weight_ledger_rows(
     explicit_override: bool,
     include_vision_tower: bool = False,
     apply_preset_to_ignored: bool = False,
+    engram_host_offload: bool = False,
 ) -> tuple[
     tuple[WeightLedgerRow, ...],
     list[float],
@@ -534,6 +547,7 @@ def _collect_weight_ledger_rows(
     list[float],
     list[float],
     list[float],
+    int,
 ]:
     p = case.runtime.parallel
     stage_terms = stage_weight_terms(
@@ -592,12 +606,12 @@ def _collect_weight_ledger_rows(
                 grouped[key] = entry
             entry["stage_repeats"][stage_idx] += max(1, int(local_cnt))
 
-    weight_rows: list[WeightLedgerRow] = []
     stage_w_payload = [0.0] * p.pp
     stage_w_scale = [0.0] * p.pp
     stage_engram_total = [0.0] * p.pp
     stage_native_bf16 = [0.0] * p.pp
     stage_vision_total = [0.0] * p.pp
+    evaluated: list[tuple[dict[str, Any], int, int, int, int, int, tuple[int, ...], int]] = []
     for entry in grouped.values():
         payload_1, scale_1, aux_1, total_1 = evaluate_weight_storage_bytes(
             entry["local_rows"], entry["local_cols"], entry["quant"],
@@ -620,6 +634,25 @@ def _collect_weight_ledger_rows(
                 stage_w_payload[st_idx] += float(payload_1 * rep)
                 stage_w_scale[st_idx] += float((scale_1 + aux_1) * rep)
                 stage_native_bf16[st_idx] += float(native_bf16_1 * rep)
+        evaluated.append((entry, payload_1, scale_1, aux_1, total_1, native_bf16_1, repeats, max_rep))
+
+    peak_stage = max(
+        range(p.pp),
+        key=lambda st: (
+            stage_w_payload[st]
+            + stage_w_scale[st]
+            + (0.0 if engram_host_offload else stage_engram_total[st])
+        ),
+        default=0,
+    )
+    weight_rows: list[WeightLedgerRow] = []
+    for entry, payload_1, scale_1, aux_1, total_1, native_bf16_1, repeats, max_rep in evaluated:
+        is_hbm_row = (
+            not (entry["is_engram"] and engram_host_offload)
+            and not (entry["is_vision"] and not include_vision_tower)
+        )
+        peak_rep = repeats[peak_stage] if peak_stage < len(repeats) else 0
+        row_rep = peak_rep if is_hbm_row else max_rep
         weight_rows.append(WeightLedgerRow(
             group=_weight_group_label(entry["category"], entry["name"]),
             name=entry["name"],
@@ -633,16 +666,17 @@ def _collect_weight_ledger_rows(
             stage_repeats=repeats,
             max_stage_repeats=max_rep,
             quant_format=entry["quant"],
-            payload_bytes=payload_1 * max_rep,
-            scale_bytes=scale_1 * max_rep,
-            aux_bytes=aux_1 * max_rep,
-            per_die_bytes=total_1 * max_rep,
+            payload_bytes=payload_1 * row_rep,
+            scale_bytes=scale_1 * row_rep,
+            aux_bytes=aux_1 * row_rep,
+            per_die_bytes=total_1 * row_rep,
             is_engram_or_ple=entry["is_engram"],
             is_quant_excluded=entry["is_excluded"],
             quant_note=entry["quant_note"],
-            native_bf16_bytes=native_bf16_1 * max_rep,
+            native_bf16_bytes=native_bf16_1 * row_rep,
             quant_rule=entry["quant_rule"],
             is_vision=entry["is_vision"],
+            peak_stage_repeats=row_rep,
         ))
     weight_rows.sort(key=lambda r: (r.group, r.name))
     return (
@@ -652,29 +686,77 @@ def _collect_weight_ledger_rows(
         stage_engram_total,
         stage_native_bf16,
         stage_vision_total,
+        peak_stage,
     )
 
 
 def _compute_max_hbm_concurrency(
+    case: Case,
     stage_budgets: Sequence[StageBudgetRow],
     stage_per_req_cache: Sequence[float],
     fallback_conc: int,
+    *,
+    phase: str,
+    resolved_seq: int,
 ) -> int:
+    """Binary-search exact per-DP HBM concurrency honoring per-batch workspace growth."""
+    static_fixed = [
+        st.weight_payload_bytes
+        + st.weight_scale_aux_bytes
+        + st.engram_ple_hbm_bytes
+        + st.reserve_bytes
+        for st in stage_budgets
+    ]
+    ws_1_tok = _resolve_ledger_workspace_tokens(
+        case, phase=phase, resolved_seq=resolved_seq, resolved_conc=1,
+    )
+    mem_1 = Memory(case, workspace_tokens=ws_1_tok)
+    ws_1 = [
+        float(mem_1.workspace[st.stage] if st.stage < len(mem_1.workspace) else 0.0)
+        + float(mem_1.temporary_dequant[st.stage] if st.stage < len(mem_1.temporary_dequant) else 0.0)
+        for st in stage_budgets
+    ]
     caps: list[int] = []
-    for st, per_req in zip(stage_budgets, stage_per_req_cache):
-        fixed = (
-            st.weight_payload_bytes
-            + st.weight_scale_aux_bytes
-            + st.engram_ple_hbm_bytes
-            + st.workspace_peak_bytes
-            + st.reserve_bytes
-        )
-        avail = st.usable_hbm_budget_bytes - fixed
+    for st, base_fixed, ws_b, per_req in zip(stage_budgets, static_fixed, ws_1, stage_per_req_cache):
+        avail = st.usable_hbm_budget_bytes - (base_fixed + ws_b)
         if avail <= 0.0:
             return 0
         if per_req > 0.0:
             caps.append(int(avail // per_req))
-    return min(caps) if caps else max(0, int(fallback_conc))
+    if not caps:
+        return max(0, int(fallback_conc))
+    hi = min(caps)
+    if hi <= 1:
+        return max(0, hi)
+
+    def _fits(cand_b: int) -> bool:
+        cand_ws_tok = _resolve_ledger_workspace_tokens(
+            case, phase=phase, resolved_seq=resolved_seq, resolved_conc=cand_b,
+        )
+        if cand_ws_tok <= ws_1_tok:
+            cand_ws = ws_1
+        else:
+            cand_mem = Memory(case, workspace_tokens=cand_ws_tok)
+            cand_ws = [
+                float(cand_mem.workspace[st.stage] if st.stage < len(cand_mem.workspace) else 0.0)
+                + float(cand_mem.temporary_dequant[st.stage] if st.stage < len(cand_mem.temporary_dequant) else 0.0)
+                for st in stage_budgets
+            ]
+        return all(
+            base_fixed + ws_b + float(cand_b) * per_req <= st.usable_hbm_budget_bytes
+            for st, base_fixed, ws_b, per_req in zip(stage_budgets, static_fixed, cand_ws, stage_per_req_cache)
+        )
+
+    if _fits(hi):
+        return hi
+    lo = 0
+    while lo + 1 < hi:
+        mid = (lo + hi) // 2
+        if _fits(mid):
+            lo = mid
+        else:
+            hi = mid
+    return lo
 
 
 def _build_stage_budget_rows(
@@ -685,6 +767,7 @@ def _build_stage_budget_rows(
     stage_w_scale: list[float],
     stage_engram_total: list[float],
     stage_cache_bytes: list[float],
+    stage_per_req_cache: list[float],
     ws_by_stage: list[float],
     deq_by_stage: list[float],
     reserve_bytes: float,
@@ -716,6 +799,7 @@ def _build_stage_budget_rows(
             usable_hbm_budget_bytes=usable_hbm,
             headroom_bytes=usable_hbm - total_hbm,
             fits_hbm=total_hbm <= usable_hbm,
+            per_request_cache_bytes=stage_per_req_cache[st] if st < len(stage_per_req_cache) else 0.0,
         ))
     return tuple(rows)
 
@@ -784,7 +868,11 @@ def compute_memory_quant_ledger(
         _workload_has_media(case)
         if include_vision_tower is None else bool(include_vision_tower)
     )
-    block_size = int(getattr(case.runtime, "block_size", DEFAULT_CACHE_BLOCK_SIZE) or DEFAULT_CACHE_BLOCK_SIZE)
+    block_size = int(
+        getattr(case.runtime, "kv_block_size", None)
+        or getattr(case.runtime, "block_size", None)
+        or DEFAULT_CACHE_BLOCK_SIZE
+    )
     spec_tokens = int(dict(case.runtime.metadata).get("draft_proposal_tokens", 0) or 0)
     ws_tokens = _resolve_ledger_workspace_tokens(
         case, phase=phase, resolved_seq=resolved_seq, resolved_conc=resolved_conc,
@@ -798,11 +886,13 @@ def compute_memory_quant_ledger(
         stage_engram_total,
         stage_native_bf16,
         stage_vision_total,
+        peak_weight_stage,
     ) = _collect_weight_ledger_rows(
         case, mem, stage_layers, resolved_wq,
         explicit_override=explicit_override,
         include_vision_tower=resolved_vit,
         apply_preset_to_ignored=bool(apply_preset_to_ignored),
+        engram_host_offload=resolved_offload,
     )
     local_tokens, cache_rows, stage_cache_bytes, stage_per_req_cache = _compute_cache_ledger_rows(
         case,
@@ -825,6 +915,7 @@ def compute_memory_quant_ledger(
         stage_w_scale=stage_w_scale,
         stage_engram_total=stage_engram_total,
         stage_cache_bytes=stage_cache_bytes,
+        stage_per_req_cache=stage_per_req_cache,
         ws_by_stage=[float(x) for x in alloc["workspace"]["total_bytes_per_stage_rank"]],
         deq_by_stage=[float(x) for x in alloc["temporary_dequant"]["bytes_per_stage_rank"]],
         reserve_bytes=float(alloc["reserve"]["total_bytes_per_rank"]),
@@ -842,17 +933,21 @@ def compute_memory_quant_ledger(
     sim_cache_by_stage = tuple(
         float(v) for v in mem.dp_cohort_cache_bytes(resolved_seq, padded=True)
     )
-    weight_footprint = max(
-        (st.weight_payload_bytes + st.weight_scale_aux_bytes + st.engram_ple_hbm_bytes for st in stage_budgets),
-        default=0.0,
+    peak_budget = stage_budgets[peak_weight_stage] if peak_weight_stage < len(stage_budgets) else None
+    weight_footprint = (
+        peak_budget.weight_payload_bytes + peak_budget.weight_scale_aux_bytes + peak_budget.engram_ple_hbm_bytes
+        if peak_budget is not None else 0.0
     )
-    native_bf16_footprint = max(
-        (stage_native_bf16[st.stage] + st.engram_ple_hbm_bytes for st in stage_budgets),
-        default=0.0,
+    native_bf16_footprint = (
+        stage_native_bf16[peak_weight_stage] + (0.0 if resolved_offload else stage_engram_total[peak_weight_stage])
+        if peak_weight_stage < len(stage_native_bf16) else 0.0
     )
     vision_bytes = max(stage_vision_total, default=0.0)
     comp_ratio = (native_bf16_footprint / weight_footprint) if weight_footprint > 0.0 else 1.0
-    max_conc = _compute_max_hbm_concurrency(stage_budgets, stage_per_req_cache, resolved_conc)
+    max_conc = _compute_max_hbm_concurrency(
+        case, stage_budgets, stage_per_req_cache, resolved_conc,
+        phase=phase, resolved_seq=resolved_seq,
+    )
     return MemoryCalculatorLedger(
         model_name=str(case.model.name),
         hardware_sku=str(case.machine.sku or case.machine.name),
@@ -884,4 +979,5 @@ def compute_memory_quant_ledger(
         native_bf16_weight_footprint_per_die_bytes=native_bf16_footprint,
         vision_weight_bytes_per_die=vision_bytes,
         weight_compression_ratio=comp_ratio,
+        peak_weight_stage=peak_weight_stage,
     )

@@ -265,8 +265,8 @@ def test_domain_three_auto_optimal_joint_pd_colocated_and_pinned_constraints():
     assert solved["feasible"] is True
     assert solved["winner_mode"] in {"pd_disaggregated", "colocated"}
     assert solved["best_pd"] is not None and solved["best_colocated"] is not None
-    assert solved["best_configuration"]["sustainable_tps"] == pytest.approx(
-        max(solved["best_pd"]["sustainable_tps"], solved["best_colocated"]["sustainable_tps"])
+    assert solved["best_configuration"]["sustainable_tps_per_die"] == pytest.approx(
+        max(solved["best_pd"]["sustainable_tps_per_die"], solved["best_colocated"]["sustainable_tps_per_die"])
     )
 
     coloc_only = solve_optimal_deployment(
@@ -772,3 +772,211 @@ def test_kimi_k31_32die_solve_deployment_peak_rss_bounded():
     assert metrics["feasible"] is True, f"32-die kimi-k3.1 solve unexpectedly infeasible: {metrics}"
     assert metrics["after"]["b_feasible"] >= 1
     assert metrics["after"]["effective_tpot_ms"] <= 30.0 + 1e-6
+
+
+def test_iso_sla_target_graph_ranking_dcp_rejection_and_b_vram_binary_search(monkeypatch):
+    """Verify target-graph After search, single-die TPS ranking, DCP rejection, and binary-search b_vram."""
+    from mindie_sim.export import build_export_bundle
+    from mindie_sim.model_catalog import load_model
+    from mindie_sim.prediction.results import StepRequest
+    from mindie_sim.prediction.structure import parse_case
+    from mindie_sim.solve import solve_deployment
+    from mindie_sim.sweep import pd as pd_mod
+
+    # 1. Single-Die Decode TPS ranking: 900 TPS / 4 dies (225/die) MUST beat 1000 TPS / 8 dies (125/die).
+    row_4die = {
+        "deployment_mode": "colocated", "used_dies": 4, "parallel": {"dp": 1, "tp": 4},
+        "feasible": True, "effective_tpot_ms": 20.0,
+        "sustainable_tps": 900.0, "sustainable_tps_per_die": 225.0,
+        "decode_tps_per_die": 225.0, "us_per_tok_die": 1e6 / 225.0,
+        "e2e_total_tps": 800.0, "e2e_tps_per_die": 200.0,
+    }
+    row_8die = {
+        "deployment_mode": "colocated", "used_dies": 8, "parallel": {"dp": 2, "tp": 4},
+        "feasible": True, "effective_tpot_ms": 20.0,
+        "sustainable_tps": 1000.0, "sustainable_tps_per_die": 125.0,
+        "decode_tps_per_die": 125.0, "us_per_tok_die": 1e6 / 125.0,
+        "e2e_total_tps": 880.0, "e2e_tps_per_die": 110.0,
+    }
+    fin = pd_mod._finalize_optimal_deployment(
+        model_id="test", sku="a3", n_dev=8, prompt=512, output=64, ttft=5000.0, tpot=50.0,
+        dep_norm="colocated", all_candidates=[row_8die, row_4die],
+        coloc_entries=[(row_8die, {"id": 8}), (row_4die, {"id": 4})],
+        pd_entries=[], compose_for=lambda *_a, **_kw: {},
+    )
+    assert fin["best_configuration"]["used_dies"] == 4
+    assert [r["used_dies"] for r in fin["pareto_frontier"]] == [4]
+
+    # Colocated candidate separates decode-step Single_Die_TPS (1e6/us_per_tok_die) from full-request E2E TPS.
+    col_raw = compose_case("qwen3-32b", "a3", tp=2, layers=2, prompt_tokens=512, output_tokens=64)
+    col_row = pd_mod._evaluate_colocated_candidate(
+        col_raw, prompt_tokens=512, output_tokens=64, ttft_sla_ms=5000.0, tpot_sla_ms=50.0,
+        mtp_tokens=0, max_sequences_per_dp=8,
+    )
+    assert col_row["feasible"] is True
+    assert col_row["sustainable_tps_per_die"] == pytest.approx(1e6 / col_row["us_per_tok_die"], rel=1e-9)
+    assert col_row["decode_tps_per_die"] == pytest.approx(col_row["sustainable_tps_per_die"], rel=1e-9)
+    assert 0.0 < col_row["e2e_tps_per_die"] < col_row["decode_tps_per_die"]
+
+    # 2. Pinned and enumerated illegal DCP configurations are rejected before feasible is computed.
+    sfa_spec = load_model("deepseek-v3.2")
+    gqa_spec = load_model("qwen3-32b")
+    # PCP-only SFA (dcp=1) is valid, while dcp=4 violates SFA replicated-indexer {1, pcp, pcp*tp}.
+    assert pd_mod._build_colocated_candidates(
+        num_devices=8, is_moe=True, layers=4, rec_topo=None,
+        pinned={"tp": 4, "pcp": 2, "dcp": 1}, model_spec=sfa_spec, prompt_tokens=4096,
+    ) != []
+    assert pd_mod._build_colocated_candidates(
+        num_devices=8, is_moe=True, layers=4, rec_topo=None,
+        pinned={"tp": 4, "pcp": 2, "dcp": 4}, model_spec=sfa_spec, prompt_tokens=4096,
+    ) == []
+    assert pd_mod._build_pd_stage_candidates(
+        role="pd_decode", max_dies=8, is_moe=False, layers=4, prompt_tokens=4096,
+        rec_topo=None, pinned={"tp": 4, "pcp": 2, "dcp": 4}, model_spec=gqa_spec,
+    ) == []
+    assert pd_mod._build_pd_stage_candidates(
+        role="pd_prefill", max_dies=8, is_moe=True, layers=4, prompt_tokens=4096,
+        rec_topo=None, pinned={"tp": 2, "pcp": 2, "dcp": 1}, model_spec=sfa_spec,
+    ) != []
+    bad_dcp_case = compose_case("deepseek-v3.2", "a3", tp=4, ep=4, dcp=2, layers=4, prompt_tokens=256, output_tokens=64)
+    p_sfa_case = compose_case("deepseek-v3.2", "a3", tp=4, ep=4, layers=4, prompt_tokens=256, output_tokens=64)
+    bad_col = pd_mod._evaluate_colocated_candidate(
+        bad_dcp_case, prompt_tokens=256, output_tokens=64,
+        ttft_sla_ms=5000.0, tpot_sla_ms=50.0, mtp_tokens=0,
+    )
+    assert bad_col["feasible"] is False and bad_col["dcp_codomain_valid"] is False
+    assert bad_col["infeasible_reason"] is not None and "vllm_ascend_sfa_dcp_must_equal_tp" in bad_col["infeasible_reason"]
+    bad_pd = sweep_pd_disaggregation_ratios(
+        p_sfa_case, bad_dcp_case, total_dies=8, prompt_tokens=256, output_tokens=64,
+        ttft_sla_ms=5000.0, tpot_sla_ms=50.0,
+    )
+    assert bad_pd["decode_instance"]["dcp_codomain_valid"] is False
+    assert all(
+        not r["feasible"] and r["infeasible_reason"] is not None
+        and "vllm_ascend_sfa_dcp_must_equal_tp" in r["infeasible_reason"]
+        for r in bad_pd["candidates"]
+    )
+
+    # 3. Binary-search _solve_b_vram_max avoids 99 -> 1 collapse and matches Sheet 3 max_hbm_concurrency_per_dp.
+    parsed_col = parse_case(col_raw)
+    fake_kv = 1000.0
+
+    class _LinearWorkspaceMemory:
+        def __init__(self, _parsed, *, workspace_tokens=1):
+            ws = max(1, int(workspace_tokens))
+            # At ws=1: 99*kv free (upper=99); at ws=99: 0 free; exact crossing at b=50 (100 - 50 >= 50).
+            free = max(0.0, (100.0 - float(ws)) * fake_kv)
+            self.capacity = [[free]]
+
+        def dp_cohort_cache_bytes(self, _seq_len, padded=True):
+            return [fake_kv]
+
+    with monkeypatch.context() as mp:
+        mp.setattr(pd_mod, "Memory", _LinearWorkspaceMemory)
+        _, _, b_exact = pd_mod._solve_b_vram_max(
+            parsed_col, base_ws=1, decode_q=1, seq_len=576, cap_bound=256,
+        )
+    assert b_exact == 50
+
+    dec_case = compose_case(
+        "qwen3-32b", "a3", tp=2, layers=2, role="pd_decode",
+        prompt_tokens=8192, output_tokens=2048, max_num_seqs=4096,
+    )
+    parsed_dec = parse_case(dec_case)
+    _, _, sweep_b_vram = pd_mod._solve_b_vram_max(
+        parsed_dec, base_ws=1, decode_q=1, seq_len=10240, cap_bound=int(parsed_dec.runtime.max_num_seqs),
+    )
+    s3_bundle = build_export_bundle(
+        dec_case, request=StepRequest(phase="decode", tokens=1, context=8192, sequences=1, scope="model"),
+        apply_target_envelope=False,
+    )
+    assert sweep_b_vram == s3_bundle.memory_ledger.max_hbm_concurrency_per_dp
+
+    # 4. After Iso-SLA search evaluates target graph even when compare_track == target_track and unlocks larger B1*.
+    orig_target_step = pd_mod._solve_target_step_ms
+    target_calls: list[int] = []
+
+    def _accelerated_target(*args, **kwargs):
+        target_calls.append(1)
+        return orig_target_step(*args, **kwargs) * 0.5
+
+    probe_before = solve_deployment(
+        "qwen3-32b", "a3", num_devices=2, layers=2, prompt_tokens=512, output_tokens=64,
+        tpot_slo_ms=50.0, deployment="colocated", pinned_parallel={"tp": 2},
+        max_sequences_per_dp=16, mode="simulation", compare_track="merged", target_track="merged",
+    )
+    b1_ms = probe_before["iso_sla_comparison"]["before"]["decode_step_ms"]
+    tight_slo = max(0.05, b1_ms * 1.15)
+    with monkeypatch.context() as mp:
+        mp.setattr(pd_mod, "_solve_target_step_ms", _accelerated_target)
+        sol_same_track = solve_deployment(
+            "qwen3-32b", "a3", num_devices=2, layers=2, prompt_tokens=512, output_tokens=64,
+            tpot_slo_ms=tight_slo, deployment="colocated", pinned_parallel={"tp": 2},
+            max_sequences_per_dp=64, mode="modeling", compare_track="merged", target_track="merged",
+        )
+    assert len(target_calls) >= 1
+    iso = sol_same_track["iso_sla_comparison"]
+    assert iso["before"]["feasible"] is True and iso["after"]["feasible"] is True
+    assert iso["after"]["b_feasible"] >= iso["before"]["b_feasible"]
+    assert iso["after"]["sustainable_tps_per_die"] > iso["before"]["sustainable_tps_per_die"]
+
+
+def test_explicit_rewrite_plan_no_clamping_unrounded_rank_and_prefill_export(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from mindie_sim.schema.common import ModelingError
+    from mindie_sim.sweep import pd as pd_mod
+    from mindie_sim.solve import solve_deployment
+
+    # 1. Unrounded decode TPS ranking & zero E2E fallback when decode_step_ms > 0.
+    r_lo = {"feasible": True, "decode_tps_per_die": 100.0000001, "used_dies": 2, "e2e_tps_per_die": 90.0, "effective_tpot_ms": 10.0}
+    r_hi = {"feasible": True, "decode_tps_per_die": 100.0000004, "used_dies": 4, "e2e_tps_per_die": 90.0, "effective_tpot_ms": 10.0}
+    assert pd_mod._single_die_decode_tps(r_hi) > pd_mod._single_die_decode_tps(r_lo)
+    r_zero_dec = {"feasible": True, "decode_tps_per_die": 0.0, "us_per_tok_die": 0.0, "decode_step_ms": 5.0, "sustainable_tps_per_die": 88.0}
+    assert pd_mod._single_die_decode_tps(r_zero_dec) == 0.0
+
+    # 2. Typed draft metadata classification never misclassifies target ops containing '.draft.' in op_id.
+    target_op = SimpleNamespace(op_id="target.l0.draft.proj", metadata=(("layer_scope", "target"),))
+    draft_op = SimpleNamespace(op_id="mtp.step0.l0.proj", metadata=(("layer_scope", "draft"),))
+    assert pd_mod._is_draft_op(target_op) is False
+    assert pd_mod._is_draft_op(draft_op) is True
+
+    # 3. Explicit rewrite_plan preserves regressions (no min(baseline, solved) clamp) and no Before fallback.
+    dummy_plan = SimpleNamespace(edits=(SimpleNamespace(operation=None),))
+    with monkeypatch.context() as mp:
+        mp.setattr(pd_mod, "load_rewrite_plan", lambda _p: dummy_plan)
+        mp.setattr(pd_mod, "_solve_target_step_ms", lambda *_a, **_kw: 999.0)
+        res_reg = solve_deployment(
+            "qwen3-32b", "a3", num_devices=2, layers=2, prompt_tokens=512, output_tokens=32,
+            tpot_slo_ms=50.0, deployment="colocated", pinned_parallel={"tp": 2},
+            max_sequences_per_dp=4, mode="simulation", rewrite_plan={"edits": [{"id": "reg"}]},
+        )
+    assert res_reg["iso_sla_comparison"]["before"]["feasible"] is True
+    assert res_reg["iso_sla_comparison"]["after"]["feasible"] is False
+    assert res_reg["feasible"] is False
+
+    # 4. Strict rewrite-plan binding errors propagate out of solver instead of being swallowed.
+    def _raise_unbound(*_a, **_kw):
+        raise ModelingError("rewrite_fusion_recipe_unbound:custom:FusedOp")
+
+    with monkeypatch.context() as mp:
+        mp.setattr(pd_mod, "load_rewrite_plan", lambda _p: dummy_plan)
+        mp.setattr(pd_mod, "_solve_target_step_ms", _raise_unbound)
+        with pytest.raises(ModelingError, match="rewrite_fusion_recipe_unbound"):
+            solve_deployment(
+                "qwen3-32b", "a3", num_devices=2, layers=2, prompt_tokens=512, output_tokens=32,
+                tpot_slo_ms=50.0, deployment="colocated", pinned_parallel={"tp": 2},
+                max_sequences_per_dp=4, mode="simulation", rewrite_plan={"edits": [{"id": "fail"}]},
+            )
+
+    # 5. Prefill-only workload (output_tokens == 1) exports phase='prefill'.
+    xlsx_prefill = tmp_path / "prefill_only.xlsx"
+    res_prefill = solve_deployment(
+        "qwen3-32b", "a3", num_devices=2, layers=2, prompt_tokens=512, output_tokens=1,
+        tpot_slo_ms=50.0, ttft_slo_ms=5000.0, deployment="colocated", pinned_parallel={"tp": 2},
+        mode="simulation", xlsx_path=xlsx_prefill,
+    )
+    assert res_prefill["feasible"] is True
+    assert res_prefill["exports"]["phase"] == "prefill"
+    assert res_prefill["exports"]["xlsx"]["phase"] == "prefill"
+
+

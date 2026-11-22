@@ -533,7 +533,7 @@ def _canonicalize_single_atom(
         return ()
     scope = _atom_scope_prefix(suf)
     if "mla_prolog" in suf or "mla_prolog" in rec:
-        return ("q_a", "kv_a", "q_norm", "q_b", "kv_norm", "rotary", "kv_store", "q_absorb")
+        return ("q_a", "kv_a", "q_norm", "q_b", "kv_norm", "q_rotary", "kv_rotary", "rotary", "kv_store", "q_absorb")
     if "megamoe" in rec or "dispatch_ffn_combine" in rec or "dispatch_ffn_combine" in suf:
         return ("moe_dispatch", "expert_up", "expert_act", "expert_down", "moe_combine")
     if suf in {"dispatch"} or (fam == "dispatch"):
@@ -542,7 +542,9 @@ def _canonicalize_single_atom(
         return ("moe_combine",)
     if suf in {"qkv_a"}:
         return ("q_a", "kv_a")
-    if suf in {"q_rotary", "kv_rotary", "rotary", "rope"}:
+    if suf in {"q_rotary", "kv_rotary"}:
+        return (suf,)
+    if suf in {"rotary", "rope"}:
         return ("rotary",)
     if suf in {"kv_scatter", "kv_store", "cache"}:
         return ("kv_store",)
