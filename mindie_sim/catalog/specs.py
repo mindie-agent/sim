@@ -256,7 +256,7 @@ def _build_model_spec(key: str, config: Mapping[str, Any]) -> ModelSpec:
         model = replace(model, metadata=model.metadata + (
             ("cache_allocator", "paired_sfa"),
             ("attention_execution", {
-                "dcp_query_gather": True, "dcp_indexer_sharded": True,
+                "dcp_indexer_sharded": True,
                 "dcp_output_merge": "alltoall", "recurrent_context_sharded": False,
                 "index_rope_dim": int(c["dsa_config"].get("index_rope_dim", ZERO)),
             }),

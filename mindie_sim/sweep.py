@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Iterator, Mapping, Sequence
+from concurrent.futures import ProcessPoolExecutor
 from copy import deepcopy
 from dataclasses import replace
 import hashlib
@@ -47,12 +48,13 @@ from mindie_sim.sweep_engine import (
     DEFAULT_MAX_SEQUENCES, DEFAULT_OUTPUT_BUDGET, DEFAULT_SLA_MS,
     FULL_STAGE, LOCKED_PROGRAM_ERROR, LOCKED_STAGE, STATIC_STAGE,
     TIMEOUT_STAGE,
-    SweepEvaluationCache, b1_screen, build_candidate_case,
+    SweepEvaluationCache, _parallel_short, b1_screen, build_candidate_case,
     compute_pareto_frontier, compute_sweep_candidate_id,
-    enumerate_case_candidates, full_row, parallel_report,
-    project_replica_row, set_deadline, static_row,
-    timeout_row, validate_candidate_statically,
+    enumerate_case_candidates, evaluate_candidate_worker, full_row,
+    kv_replication_fields, parallel_report, project_replica_row,
+    set_deadline, static_row, timeout_row, validate_candidate_statically,
 )
+from mindie_sim.runtime_advisor import resolve_jobs
 from mindie_sim.sweep_checkpoint import (
     STAGE_FULL, STAGE_SCREEN, checkpoint_index, open_checkpoint,
     read_checkpoint_row, write_checkpoint_row,
@@ -192,6 +194,7 @@ def sweep_topologies_iter(
     finalist_top_k: int | None = None,
     checkpoint_jsonl: str | Path | None = None,
     isolate_workers: bool = False,
+    jobs: int | str = 1,
     _finalist_sink: list | None = None,
 ) -> Iterator[dict[str, Any]]:
     """Stream deterministic candidate rows, optionally checkpointing each row."""
@@ -247,6 +250,7 @@ def sweep_topologies_iter(
                     progress_callback=progress_callback,
                     finalist_top_k=finalist_top_k,
                     isolate_workers=isolate_workers,
+                    jobs=jobs,
                     _finalist_sink=finalist_sink):
                 row["derived_sku"] = sku
                 row["derivation"] = {
@@ -304,6 +308,7 @@ def sweep_topologies_iter(
                 base_emit=base_emit, locked_plan=_locked_plan,
                 finalist_top_k=finalist_top_k,
                 isolate_workers=isolate_workers,
+                jobs=jobs,
                 finalist_sink=finalist_sink,
                 pinned_devices=(num_devices is not None
                                 or bool(devices_grid))):
@@ -320,6 +325,127 @@ def sweep_topologies_iter(
             max_sequences_per_dp=max_sequences_per_dp)
 
 
+LOCAL_TP_CANDIDATE_KEYS = (
+    "q_proj_tp", "o_proj_tp", "linear_proj_tp", "dcp_linear_tp",
+    "mlp_tp", "shared_expert_tp", "lm_head_tp", "redundant_experts_per_rank",
+)
+
+
+def _parallel_batch_eval(
+    parsed, cache, *, cand_list, devices, pinned_devices, phase, scope,
+    context, base_q, base_emit, output_budget, sla_ms, max_sequences_per_dp,
+    allow_dp, allow_ep, allow_pp, allow_pcp, two_stage, fixed_parallel,
+    checkpoint, resume, stream, progress_callback, workers,
+):
+    """Evaluate independent candidates in parallel using pickle-safe plain dicts."""
+    case_dict = parsed.to_dict()
+    probe = {
+        "phase": phase, "scope": scope, "context": int(context),
+        "q_tokens": int(base_q), "emit_tokens": float(base_emit),
+        "sla_ms": float(sla_ms), "output_budget": int(output_budget),
+        "max_sequences_per_dp": int(max_sequences_per_dp),
+    }
+    prepared: list[tuple[str, Any, dict[str, Any]]] = []
+    pending_indices: list[int] = []
+    pending_tasks: list[dict[str, Any]] = []
+    for raw_candidate in cand_list:
+        cand_dict = {key: int(raw_candidate.get(key, 1))
+                     for key in ("dp", "tp", "ep", "pp", "pcp")}
+        cand_dict.update({key: raw_candidate[key]
+                          for key in ("cp", "dcp", "cp_plan", *LOCAL_TP_CANDIDATE_KEYS)
+                          if key in raw_candidate})
+        cand_p = ParallelSpec.from_mapping(cand_dict)
+        part = (parsed.runtime.pp_layer_partition
+                if len(parsed.runtime.pp_layer_partition) == cand_p.pp else ())
+        cand_devices = (
+            int(devices) if pinned_devices
+            else int(raw_candidate["num_devices"]) if raw_candidate.get("num_devices")
+            else cand_p.world_size
+        )
+        ranks = resolve_ranks_per_node(parsed, cand_devices)
+        cand_id = compute_sweep_candidate_id(
+            parsed, cand_p, cand_devices=cand_devices, ranks_per_node=ranks,
+            phase=phase, scope=scope, context=context, q_tokens=base_q,
+            emit_tokens=base_emit, output_budget=output_budget, sla_ms=sla_ms,
+            max_sequences_per_dp=max_sequences_per_dp, lock_parallel=False)
+        meta = {
+            "num_devices": int(cand_devices), "sla_ms": float(sla_ms),
+            "context": int(context), "phase": phase, "scope": scope,
+            "allow_dp": bool(allow_dp), "allow_ep": bool(allow_ep),
+            "allow_pp": bool(allow_pp), "allow_pcp": bool(allow_pcp),
+            "output_budget": int(output_budget),
+            "emitted_tokens_per_seq": float(base_emit),
+            "two_stage": bool(two_stage),
+            "parallel_signature": str(fixed_parallel or {}),
+        }
+        if dict(parsed.machine.assumptions).get("derivation.base"):
+            die = parsed.machine.dies[0] if parsed.machine.dies else None
+            meta["derived_row_fields"] = {
+                "derived_sku": parsed.machine.sku,
+                "derivation": {
+                    "sku": parsed.machine.sku,
+                    "aic_count": die.compute_units if die else None,
+                    "aiv_count": dict(die.resource_units).get("vector") if die else None,
+                    "memory_bytes": die.memory_bytes if die else None,
+                    "assumptions": dict(parsed.machine.assumptions),
+                },
+            }
+        if resume and cand_id in checkpoint and checkpoint[cand_id].stage != STAGE_SCREEN:
+            row = read_checkpoint_row(stream, checkpoint[cand_id])
+            row["resumed_from_checkpoint"] = True
+            row["elapsed_ms"] = 0.0
+            prepared.append(("resumed", row, meta))
+            continue
+        common = {
+            CANDIDATE_ID_KEY: cand_id,
+            "parallel": _parallel_short(cand_p),
+            "parallel_spec": parallel_report(cand_p),
+            "num_devices": int(cand_devices),
+            "ranks_per_node": int(ranks),
+            **kv_replication_fields(parsed.model, cand_p),
+        }
+        pending_indices.append(len(prepared))
+        pending_tasks.append({
+            "case_dict": case_dict,
+            "parallel_spec": cand_p.to_dict(),
+            "num_devices": int(cand_devices),
+            "part": tuple(part or ()),
+            "common": common,
+            "probe": probe,
+        })
+        prepared.append(("pending", None, meta))
+    if pending_tasks:
+        pool_size = min(workers, len(pending_tasks))
+        with ProcessPoolExecutor(max_workers=pool_size) as pool:
+            futures = [pool.submit(evaluate_candidate_worker, task)
+                       for task in pending_tasks]
+            fut_iter = iter(futures)
+            computed_seen = 0
+            for kind, row, meta in prepared:
+                if kind == "pending":
+                    row = next(fut_iter).result()
+                    if computed_seen > 0:
+                        cache.model_spec_reuses += 1
+                    computed_seen += 1
+                    if row.get("evaluation_stage") == STATIC_STAGE:
+                        if row.get("feasibility_status") == "capacity_infeasible":
+                            cache.static_capacity_rejections += 1
+                        else:
+                            cache.static_topology_rejections += 1
+                    _screen_row_meta(row, cache, meta)
+                    _write_row(stream, row)
+                    if progress_callback is not None:
+                        progress_callback(row)
+                    yield row
+                else:
+                    _screen_row_meta(row, cache, meta)
+                    yield row
+        return
+    for _, row, meta in prepared:
+        _screen_row_meta(row, cache, meta)
+        yield row
+
+
 def _sweep_one_device_count(parsed, cache, *, devices, candidates, sla_ms,
                             context, phase, scope, output_budget,
                             max_sequences_per_dp, allow_dp, allow_ep,
@@ -331,7 +457,7 @@ def _sweep_one_device_count(parsed, cache, *, devices, candidates, sla_ms,
                             output_jsonl, resume, progress_callback, base_q,
                             base_emit, locked_plan, pinned_devices,
                             finalist_top_k=None, isolate_workers=False,
-                            finalist_sink=None):
+                            jobs=1, finalist_sink=None):
     path = Path(output_jsonl) if output_jsonl is not None else None
     checkpoint = _load_checkpoint(path) if (resume and path is not None) else {}
     stream = _open_stream(path, resume)
@@ -353,11 +479,11 @@ def _sweep_one_device_count(parsed, cache, *, devices, candidates, sla_ms,
     else:
         cand_list = enumerate_case_candidates(
             parsed, num_devices=devices, allow_dp=allow_dp, allow_ep=allow_ep,
-            allow_pp=allow_pp, allow_pcp=allow_pcp,
+            allow_pp=allow_pp, allow_pcp=allow_pcp, allow_dcp=allow_dcp,
             candidate_tps=candidate_tps, ep_candidates=ep_candidates,
             pp_candidates=pp_candidates, pcp_candidates=pcp_candidates,
-            explicit=candidates)
-    if allow_dcp and dcp_candidates and locked is None:
+            dcp_candidates=dcp_candidates, explicit=candidates)
+    if candidates is not None and allow_dcp and dcp_candidates and locked is None:
         expanded: list[dict[str, Any]] = []
         for candidate in cand_list:
             for degree in dcp_candidates:
@@ -368,8 +494,32 @@ def _sweep_one_device_count(parsed, cache, *, devices, candidates, sla_ms,
                     expanded.append({**dict(candidate), "cp": degree,
                                      "dcp": degree})
         cand_list = expanded
+    if locked is None:
+        for raw_candidate in cand_list:
+            cand_dict = {key: int(raw_candidate.get(key, 1))
+                         for key in ("dp", "tp", "ep", "pp", "pcp")}
+            cand_dict.update({key: raw_candidate[key]
+                              for key in ("cp", "dcp", "cp_plan", *LOCAL_TP_CANDIDATE_KEYS)
+                              if key in raw_candidate})
+            ParallelSpec.from_mapping(cand_dict)
+    resolved_jobs = resolve_jobs(jobs, task_count=max(1, len(cand_list)))
     promoted: list[dict[str, Any]] = []
     try:
+        if (resolved_jobs > 1 and locked is None and not two_stage
+                and not isolate_workers and candidate_timeout_s is None
+                and deadline_monotonic is None and len(cand_list) > 1):
+            yield from _parallel_batch_eval(
+                parsed, cache, cand_list=cand_list, devices=devices,
+                pinned_devices=pinned_devices, phase=phase, scope=scope,
+                context=context, base_q=base_q, base_emit=base_emit,
+                output_budget=output_budget, sla_ms=sla_ms,
+                max_sequences_per_dp=max_sequences_per_dp,
+                allow_dp=allow_dp, allow_ep=allow_ep, allow_pp=allow_pp,
+                allow_pcp=allow_pcp, two_stage=two_stage,
+                fixed_parallel=fixed_parallel, checkpoint=checkpoint,
+                resume=resume, stream=stream,
+                progress_callback=progress_callback, workers=resolved_jobs)
+            return
         for index, raw_candidate in enumerate(cand_list):
             if (deadline_monotonic is not None
                     and time.monotonic() >= deadline_monotonic):
@@ -377,7 +527,8 @@ def _sweep_one_device_count(parsed, cache, *, devices, candidates, sla_ms,
             cand_dict = {key: int(raw_candidate.get(key, 1))
                          for key in ("dp", "tp", "ep", "pp", "pcp")}
             cand_dict.update({key: raw_candidate[key]
-                              for key in ("cp", "dcp", "cp_plan")
+                              for key in ("cp", "dcp", "cp_plan",
+                                          *LOCAL_TP_CANDIDATE_KEYS)
                               if key in raw_candidate})
             cand_p = locked["parallel"] if locked is not None else None
             if cand_p is None:
@@ -436,11 +587,11 @@ def _sweep_one_device_count(parsed, cache, *, devices, candidates, sla_ms,
                 continue
             common = {
                 CANDIDATE_ID_KEY: cand_id,
-                "parallel": {key: int(getattr(cand_p, key))
-                             for key in ("dp", "tp", "ep", "pp", "pcp")},
+                "parallel": _parallel_short(cand_p),
                 "parallel_spec": parallel_report(cand_p),
                 "num_devices": int(cand_devices),
                 "ranks_per_node": int(ranks),
+                **kv_replication_fields(parsed.model, cand_p),
             }
             token = set_deadline(candidate_timeout_s, deadline_monotonic)
             started = time.monotonic()
@@ -539,6 +690,7 @@ def _sweep_one_device_count(parsed, cache, *, devices, candidates, sla_ms,
                             key = None
                             if (not cand_p.ep_spans_dp
                                     and not local_tp_spans_dp(cand_p)
+                                    and not cand_p.cp_spans_dp
                                     and cand_p.rank_table is None):
                                 key = (
                                     _derivation_key(parsed), phase, scope,
@@ -546,9 +698,8 @@ def _sweep_one_device_count(parsed, cache, *, devices, candidates, sla_ms,
                                     int(output_budget), float(sla_ms), eff_max,
                                     int(cand_p.tp), int(cand_p.ep),
                                     int(cand_p.pp), int(cand_p.pcp),
-                                    int(cand_p.cp), int(cand_p.o_proj_tp),
-                                    int(cand_p.linear_proj_tp),
-                                    int(cand_p.lm_head_tp),
+                                    int(cand_p.cp),
+                                    tuple(cand_p.local_tp_widths),
                                     int(cand_p.redundant_experts_per_rank),
                                     tuple(part or ()),
                                 )

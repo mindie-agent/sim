@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+from mindie_sim.catalog.context_parallel import cp_interleave
 from . import frontend as _frontend
 
 
@@ -52,13 +53,31 @@ def _strip_recover_intents(ops):
     return tuple(result)
 
 
+def _dcp_cohort_context(parallel, replica, views, cohort_views_by_replica):
+    """Resolve cross-DP DCP cohort member views and local position for one replica."""
+    if not bool(getattr(parallel, "cp_spans_dp", False)):
+        return None, 0, False
+    dp_w = max(1, int(getattr(parallel, "dcp_dp_width", 1) or 1))
+    first = (int(replica) // dp_w) * dp_w
+    members = tuple(range(first, min(int(parallel.dp), first + dp_w)))
+    if cohort_views_by_replica is not None:
+        by_member = tuple(tuple(cohort_views_by_replica.get(m, ())) for m in members)
+        pos = members.index(int(replica)) if int(replica) in members else 0
+    else:
+        by_member = tuple(tuple(views) for _ in members)
+        pos = 0
+    has_decode = any(v.phase != "prefill" for grp in by_member for v in grp)
+    return by_member, pos, has_decode
+
+
 class _FrontendBody:
     def body(self, model, runtime, views, *, prefix="", ready="", tokens=None,
              mode="prefill", global_tokens=None, stages=None, replica=0,
              features=None, source_rows_by_replica=None,
              routing_global_tokens=None, routing_views=None,
              cohort_views_by_replica=None,
-             physical_rank=None, query_position=None,
+             physical_rank=None, explicit_physical_rank: bool = False,
+             query_position=None,
              include_recover_commits: bool = False, machine=None,
              layer_limit: int | None = None,
              topk_scope=None, reuse_index_selection: bool = False, rank_ledger=None):
@@ -85,6 +104,11 @@ class _FrontendBody:
                     "force_eplb_source") else rank_ledger.allocated)
         requests = tuple(view.request_id for view in views)
         tokens = sum(view.q_len for view in views) if tokens is None else tokens
+        if (tokens == 0 and p.pcp > 1
+                and any(v.phase == "prefill" and int(getattr(v, "global_q_len", 0) or 0) > 0
+                        for v in views)):
+            from mindie_sim.prediction.operators.context_parallel.graph import pcp_uniform_peer_rows
+            tokens, _ = pcp_uniform_peer_rows(views, p.pcp, local_rows=0)
         stages = stages or _frontend.stage_map(model, runtime)
         ops, previous = [], ready
         sp = _frontend.sequence_parallel.select(runtime, model, views, tokens=tokens,
@@ -116,6 +140,8 @@ class _FrontendBody:
                 model=model, runtime=runtime, ready=previous, tokens=tokens,
                 mode=mode, requests=requests,
                 optimize_prefill=attnres["optimize_prefill"])
+        dcp_cohort_views, dcp_local_pos, has_dcp_decode = _dcp_cohort_context(
+            p, replica, views, cohort_views_by_replica)
         for index, layer in enumerate(model.layer_plans):
             stage = stages[index]
             name = f"{prefix}s{stage}.l{index}"
@@ -167,16 +193,25 @@ class _FrontendBody:
                             dtype=model.activation_dtype)
                         ops.extend(_frontend._scope((sliced,), "attention"))
                         attention_ready = sliced.op_id
-                selection_kwargs = (
-                    {"reuse_index_selection": True, "shared_topk": topks}
-                    if reuse_index_selection and layer.attention == "mla" else {})
+                selection_kwargs = {}
+                if reuse_index_selection and layer.attention == "mla":
+                    selection_kwargs["reuse_index_selection"] = True
+                    selection_kwargs["shared_topk"] = topks
+                if dcp_cohort_views is not None and layer.attention in {"gqa", "mla"}:
+                    selection_kwargs["dcp_cohort_views_by_member"] = dcp_cohort_views
+                    selection_kwargs["dcp_local_pos"] = dcp_local_pos
+                if layer.attention in {"gqa", "mla", "gdn", "kda"}:
+                    selection_kwargs["physical_rank"] = (
+                        rank_ledger.owner if rank_ledger is not None else physical_rank
+                    )
+                    selection_kwargs["explicit_physical_rank"] = bool(explicit_physical_rank)
                 attention = self.attention[layer.attention](
                     prefix=name, plan=layer, views=views, stage=stage, deps=attention_ready,
                     model=model, parallel=p, quant=model.quant, mode=mode,
                     padded_tokens=sp.attention_tokens if sp else tokens,
                     cache_ids=caches, topk_ids=topks, index_cache_ids=indices,
                     candidate_ids=candidates, stage_of=lambda layer: stages[layer],
-                    cp_interleave_size=runtime.kv_block_size, runtime=runtime,
+                    cp_interleave_size=cp_interleave(runtime), runtime=runtime,
                     policy=self.attention_policy, machine=machine,
                     **selection_kwargs,
                 )
@@ -224,6 +259,23 @@ class _FrontendBody:
                         )
                         ops.extend(_frontend._scope((normalization,), "ffn"))
                         hidden = normalization.op_id
+            elif has_dcp_decode and layer.attention in {"gqa", "mla"}:
+                attention = self.attention[layer.attention](
+                    prefix=name, plan=layer, views=(), stage=stage, deps=previous,
+                    model=model, parallel=p, quant=model.quant, mode=mode,
+                    padded_tokens=0, cache_ids=caches, topk_ids=topks,
+                    index_cache_ids=indices, candidate_ids=candidates,
+                    stage_of=lambda layer: stages[layer],
+                    cp_interleave_size=cp_interleave(runtime), runtime=runtime,
+                    policy=self.attention_policy, machine=machine,
+                    dcp_cohort_views_by_member=dcp_cohort_views,
+                    dcp_local_pos=dcp_local_pos,
+                    physical_rank=(rank_ledger.owner if rank_ledger is not None else physical_rank),
+                    explicit_physical_rank=bool(explicit_physical_rank),
+                )
+                ops.extend(_frontend._scope(attention.ops, "attention"))
+                previous = attention.last
+                hidden = previous
             else:
                 hidden = previous
             if tokens or layer.ffn == "moe":
@@ -461,7 +513,7 @@ def _representative_attention(
         mode=mode, padded_tokens=local_tokens,
         cache_ids=caches, topk_ids=topks, index_cache_ids=indices_map,
         candidate_ids=candidates, stage_of=lambda _l: 0,
-        cp_interleave_size=runtime.kv_block_size, runtime=runtime,
+        cp_interleave_size=cp_interleave(runtime), runtime=runtime,
         policy=frontend.attention_policy, machine=machine,
     )
     post_a, cur_prev = residual.after(

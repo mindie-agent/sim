@@ -28,7 +28,8 @@ from mindie_sim.sweep_engine import (
 PARETO_EPS = 1e-12
 FINALIST_COMMON_KEYS = (
     CANDIDATE_ID_KEY, "parallel", "parallel_spec", "num_devices",
-    "ranks_per_node",
+    "ranks_per_node", "kv_cache_replicated_tp",
+    "kv_cache_replication_factor", "canonical_kv_sharding",
 )
 
 
@@ -119,7 +120,7 @@ def evaluate_finalists(items, *, finalist_top_k, cache, stream, full_row_fn,
                        max_sequences_per_dp, meta=None):
     """Evaluate the retained finalists and stream their complete rows."""
     for item in select_finalists(items, finalist_top_k):
-        common = {key: item[key] for key in FINALIST_COMMON_KEYS}
+        common = {key: item[key] for key in FINALIST_COMMON_KEYS if key in item}
         cand_p = ParallelSpec.from_mapping(item["parallel_spec"])
         item_meta = item.get("meta") or meta or {}
         started = time.monotonic()

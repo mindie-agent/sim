@@ -37,12 +37,13 @@ SLOT_AND_POSITION_BYTES = 8
 
 IMPLEMENTATION = "vllm_ascend_cann_keypool_caller"
 FP8_INDEX_DTYPE = "fp8_e4m3"
+FP8_INDEX_DTYPES = frozenset({"fp8", FP8_INDEX_DTYPE})
 FP32_BYTES = int(dtype_bytes("fp32"))
 FP8_BYTES = int(dtype_bytes("fp8_e4m3"))
 INT32_BYTES = int(dtype_bytes("int32"))
 INT64_BYTES = int(dtype_bytes("int64"))
 INDEX_POOL_SCALES = 1
-SUPPORTED_INDEX_DTYPES = frozenset({"bf16", FP8_INDEX_DTYPE})
+SUPPORTED_INDEX_DTYPES = frozenset({"bf16", *FP8_INDEX_DTYPES})
 #: The native caller consumes FP32 scales (or none) for an FP8 pool row.
 SUPPORTED_INDEX_SCALES = frozenset({"fp32", "none"})
 #: Checkpoint categories whose native caller keeps BF16 wk/wgate projections.
@@ -143,7 +144,7 @@ def _supported(views, plan, model, quant):
         and not plan.qk_rope_head_dim
         and model.activation_dtype == "bf16"
         and resolved.index_dtype in SUPPORTED_INDEX_DTYPES
-        and (resolved.index_dtype != FP8_INDEX_DTYPE
+        and (resolved.index_dtype not in FP8_INDEX_DTYPES
              or resolved.index_scale_dtype in SUPPORTED_INDEX_SCALES)
         and all(v.phase in SUPPORTED_PHASES and v.q_len >= 1 for v in views)
         and weights in SUPPORTED_HEAD_WEIGHTS)
@@ -162,7 +163,7 @@ def _contract(b, views, plan, quant):
 
 def _pooled_scale_bytes(quant):
     """Declared scale bytes of one FP8 pool row (FP32 or none)."""
-    if quant.index_dtype != FP8_INDEX_DTYPE:
+    if quant.index_dtype not in FP8_INDEX_DTYPES:
         return 0
     if str(quant.index_scale_dtype) in {"", "none"}:
         return 0
@@ -171,7 +172,7 @@ def _pooled_scale_bytes(quant):
 
 def _pooled_row_bytes(quant, width):
     """One quantized pool row: payload plus its declared group scale."""
-    if quant.index_dtype == FP8_INDEX_DTYPE:
+    if quant.index_dtype in FP8_INDEX_DTYPES:
         return width * FP8_BYTES + _pooled_scale_bytes(quant)
     return width * int(dtype_bytes(quant.index_dtype))
 
@@ -344,9 +345,12 @@ def _pool_ledger(views, plan, quant, local_tokens, output_width, pool_row_bytes,
     geometry = tuple(_selection_for(v, plan) for v in views)
     heads, width, pool = plan.index_heads, plan.index_dim, plan.index_kpool
     blocks = key_blocks(visited_pools)
+    score_dtype = (
+        FP8_INDEX_DTYPE if quant.index_dtype in FP8_INDEX_DTYPES else str(quant.index_dtype)
+    )
     return geometry, {
         "query_rows": int(local_tokens),
-        "score_dtype": str(quant.index_dtype),
+        "score_dtype": score_dtype,
         "wave_rows": INDEXER_WAVE_ROWS,
         "waves": indexer_waves(local_tokens),
         "blocks": blocks,
@@ -401,7 +405,7 @@ def selection(b, *, query, weights, cache, views, plan, quant, padded_tokens,
     declaration = _contract(b, views, plan, quant)
     if score_mode not in {"linear_weighted_query", "per_head_relu"}:
         raise ModelingError("native_keypool_reference_score_mode_unknown")
-    tokens, batch, heads, width, pool = padded_tokens, len(views), plan.index_heads, plan.index_dim, plan.index_kpool
+    tokens, heads, width, pool = padded_tokens, plan.index_heads, plan.index_dim, plan.index_kpool
     pool_topk = plan.index_topk // pool
     forced = _explicit_width(options, runtime) is not None
     if not forced:
@@ -456,7 +460,6 @@ def selection(b, *, query, weights, cache, views, plan, quant, padded_tokens,
         selected_tokens_by_request=tuple(g.selected_tokens for g in geometry),
         blocks=ledger["blocks"], waves=ledger["waves"],
         score_mode=score_mode, score_algebra_basis="declared_analytical_reference; native_CANN_algebra_unbound")
-    start = len(b.ops)
     input_bytes = (local_tokens * heads * (width + 1) * 2
                    + len(owned_views) * (REQUEST_METADATA_BYTES
                                          + columns * INT32_BYTES))
@@ -471,12 +474,12 @@ def selection(b, *, query, weights, cache, views, plan, quant, padded_tokens,
     indices = _planned(
         b, POOL_KEY_RECIPE, (prepared, cache), (native_rows, heads, width),
         pool_key_indexer_work(ledger), kernel="PoolKeyIndexer",
-        family="indexer", dtype=quant.index_dtype, recipe=POOL_KEY_RECIPE,
+        family="indexer", dtype=ledger["score_dtype"], recipe=POOL_KEY_RECIPE,
         metadata=common + (
             (POOL_LEDGER, ledger),
             ("output_shape", (native_rows, output_width)),
             ("topk_tokens", plan.index_topk), ("native_output", "expanded_token_indices"),
-            ("pool_row_bytes", pool_row_bytes), ("score_dtype", quant.index_dtype),
+            ("pool_row_bytes", pool_row_bytes), ("score_dtype", ledger["score_dtype"]),
             ("score_arithmetic", "cube_dot_product_per_query_head"),
             ("cache_reuse", "batch_shared_prefix_l2_deduplicated"),
             ("internal_traffic", "declared_wave_stream_and_score_tile")))
@@ -494,15 +497,30 @@ def selection(b, *, query, weights, cache, views, plan, quant, padded_tokens,
             kv_mte2_bytes=kv_bytes)
     # The generic MLA composer creates cache producers first. This caller
     # computes Q/head weights before entering the producer, then gathers state
-    # and calls KeyPool. Restore that real enqueue/dependency order.
+    # and calls KeyPool. Restore that real enqueue/dependency order while
+    # keeping producer ops (and any PCP index gather consuming them) strictly
+    # before ``cann_keypool_nonempty_inputs`` so the DAG stays topological.
     group = b.prefix + ".key_pool"
     producer_ops = [op for op in b.ops if group in dict(op.metadata).get(
         "structure_subgraph_memberships", ())]
     producer_ids = {op.op_id for op in producer_ops}
-    b.ops = [op for op in b.ops if op.op_id not in producer_ids]
-    b.ops.extend(replace(op, deps=tuple(dict.fromkeys((*op.deps, query, weights))))
-                 if op.recipe == "cann_keypool_state_gather" else op
-                 for op in producer_ops)
+    pcp_gathers = [
+        op for op in b.ops
+        if op.op_id not in producer_ids and op.recipe == "pcp_index_gather"
+        and any(dep in producer_ids for dep in op.deps)
+    ]
+    moved_ids = producer_ids | {op.op_id for op in pcp_gathers}
+    remaining = [op for op in b.ops if op.op_id not in moved_ids]
+    rewired_producers = [
+        replace(op, deps=tuple(dict.fromkeys((*op.deps, query, weights))))
+        if op.recipe == "cann_keypool_state_gather" else op
+        for op in producer_ops
+    ]
+    insert_at = next(
+        (idx for idx, op in enumerate(remaining) if op.op_id == prepared),
+        len(remaining),
+    )
+    b.ops = remaining[:insert_at] + rewired_producers + pcp_gathers + remaining[insert_at:]
     packed = b.work("index_topk", (indices,), (local_tokens, output_width),
         read=selected * pool * INT32_BYTES + (valid_rows + local_tokens) * INT64_BYTES,
         write=local_tokens * output_columns * INT32_BYTES, vector=local_tokens * output_columns,

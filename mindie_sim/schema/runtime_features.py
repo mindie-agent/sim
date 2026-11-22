@@ -60,8 +60,21 @@ EXPERT_SLOT_POLICY_KEY = "expert_slot_policy"
 EXPERT_SLOT_MAP_KEY = "expert_slot_map"
 EXPERT_SLOT_SCOPE_KEY = "expert_slot_scope"
 REDUNDANT_EXPERTS_KEY = "redundant_experts_per_rank"
+LOCAL_TP_AXIS_NAMES = (
+    "q_proj_tp",
+    "o_proj_tp",
+    "dcp_linear_tp",
+    "mlp_tp",
+    "shared_expert_tp",
+    "linear_proj_tp",
+    "lm_head_tp",
+)
 LOCAL_PARALLEL_DEFAULTS = MappingProxyType({
+    "q_proj_tp": ONE,
     "o_proj_tp": ONE,
+    "dcp_linear_tp": ONE,
+    "mlp_tp": ONE,
+    "shared_expert_tp": ONE,
     "linear_proj_tp": ONE,
     "lm_head_tp": ONE,
     REDUNDANT_EXPERTS_KEY: ZERO,

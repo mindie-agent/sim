@@ -293,6 +293,7 @@ class RecipeBook:
         from mindie_sim.prediction.operators.collectives.direct_peer import DirectPeerCollective
         from mindie_sim.prediction.operators.paged_mla.indexed_attention import recipe as indexed_attention
         from mindie_sim.prediction.operators.paged_mla.indexed_quant_attention import recipe as indexed_quant_attention
+        from mindie_sim.prediction.operators.context_parallel.graph import recipes as cp_graph_recipes
         from mindie_sim.prediction.operators.matrix.matrix import HierarchicalMatmul, TiledMatmul
         from mindie_sim.prediction.operators.matrix.matrix_mapping import MappedMatmul
         from mindie_sim.prediction.operators.matrix.matrix_phase import PhaseMatmul
@@ -348,7 +349,7 @@ class RecipeBook:
         declared_recipes = build(raw.get("recipes", {}))
         explicit = {
             **native_moe_recipes(raw), **hccl_recipes(raw),
-            **sparse_kv_offload_recipes(), **latent_dcp_recipes(),
+            **sparse_kv_offload_recipes(), **cp_graph_recipes(),
             **implementation_recipes(raw.get("lowerings", {})),
             **kda_recurrent_recipes(),
             "attn_res_fwd": hyper_connections.GovernedAttnResRecipe(hyper_connections.build),

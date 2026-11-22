@@ -54,12 +54,14 @@ def capture_keys(max_num_seqs: int, mtp_proposal_tokens: int = 0) -> list[int]:
     return sorted(keys)
 
 
-def va_recommended_config(model: str, hardware: str = "a3") -> dict[str, Any]:
+def va_recommended_config(
+    model: str, hardware: str = "a3", *, role: str | None = None,
+) -> dict[str, Any]:
     """Return a source-scoped simulation subset, not a complete vLLM launch file."""
     key = str(model).strip()
     canonical = MODEL_ALIASES.get(key, ARCHITECTURE_PRESET_ALIASES.get(key, key))
     sku, _, _ = _resolve_hardware(hardware)
-    return simulation_config(canonical, sku, _arch_key(sku))
+    return simulation_config(canonical, sku, _arch_key(sku), role=role)
 
 
 def _supports_sequence_parallel(

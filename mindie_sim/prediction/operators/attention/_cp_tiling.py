@@ -11,7 +11,6 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from math import prod
 
-from mindie_sim.catalog.attention_common import MERGE_OPS_PER_ELEM, PACK_LSE_OPS
 from mindie_sim.catalog.context_parallel import merge_update_elements
 from mindie_sim.catalog.ops import comm_op, vector_op
 from mindie_sim.schema.common import ModelingError, dtype_bytes
@@ -19,6 +18,9 @@ from mindie_sim.schema.operators import OpSpec
 from ...mechanism import Work
 from ...program import KernelProgram, Stage
 from ...results import PipelinePhase, WorkItem
+
+MERGE_OPS_PER_ELEM = 3.0
+PACK_LSE_OPS = 4.0
 
 VLLM_REVISION = "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb"
 VLLM_MLA_REVISION = "7a7ed073c481d5e3a2fc2194c5b879efb2d373c0"

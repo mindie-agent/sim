@@ -224,7 +224,7 @@ def _validate_declaration(raw: Any) -> Mapping:
     return raw
 
 
-def _validate_views(views, tokens, *, padding: str = "none") -> tuple[Any, ...]:
+def _validate_views(views, tokens, *, padding: str = "none", pcp: int = 1) -> tuple[Any, ...]:
     try:
         values = tuple(views)
     except TypeError as exc:
@@ -233,7 +233,15 @@ def _validate_views(views, tokens, *, padding: str = "none") -> tuple[Any, ...]:
     logical = []
     for view in values:
         q_len = getattr(view, "q_len", None)
-        if not isinstance(q_len, int) or isinstance(q_len, bool) or q_len <= 0:
+        pcp_idle_peer = (
+            pcp > 1
+            and padding == "right_to_tp"
+            and isinstance(q_len, int)
+            and not isinstance(q_len, bool)
+            and q_len == 0
+            and int(getattr(view, "global_q_len", 0) or 0) > 0
+        )
+        if not pcp_idle_peer and (not isinstance(q_len, int) or isinstance(q_len, bool) or q_len <= 0):
             raise ModelingError(f"sequence_parallel_requires_positive_q_len:{q_len!r}")
         if getattr(view, "padding", False):
             if padding != "right_to_tp":
@@ -309,13 +317,13 @@ def select(runtime, model, views, *, tokens, global_tokens=None, rank_ledger=Non
     padding = declaration["padding"]
     if type(tokens) is not int or tokens < 0:
         raise ModelingError(f"sequence_parallel_requires_nonnegative_tokens:{tokens!r}")
-    values = _validate_views(views, tokens, padding=padding)
+    parallel = _parallel(runtime)
+    values = _validate_views(views, tokens, padding=padding, pcp=int(parallel.pcp))
     # A padding view is a physical graph row, not a logical request.  Its
     # q_len remains the source allocation; valid_global excludes it.
     valid = sum(view.q_len for view in values
                 if not getattr(view, "padding", False))
     input_rows = tokens
-    parallel = _parallel(runtime)
     pp, cp, pcp = int(parallel.pp), int(parallel.cp), int(parallel.pcp)
     tp, ep, dp = int(parallel.tp), int(parallel.ep), int(parallel.dp)
     if pp < 1:

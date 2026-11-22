@@ -449,3 +449,13 @@ owns = ["mindie_sim/primitives/loader.py", "mindie_sim/optimization/_dual_obliga
 path = "product/test_catalog_subgraphs.py"
 tier = "tier0"
 owns = ["scripts/verify_catalog_subgraphs.py", "scripts/run_1layer_npu_subgraphs.py"]
+
+[[module]]
+path = "operators/test_context_parallel_graph.py"
+tier = "tier0"
+owns = ["mindie_sim/prediction/operators/context_parallel"]
+
+[[module]]
+path = "product/test_parallel_generalization_and_sweeps.py"
+tier = "tier0"
+owns = ["mindie_sim/catalog/context_parallel.py", "mindie_sim/sweep_resize.py", "mindie_sim/runtime_profiles.py"]

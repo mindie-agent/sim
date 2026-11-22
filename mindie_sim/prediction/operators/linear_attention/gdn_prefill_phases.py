@@ -79,11 +79,12 @@ def state_slot_inputs(runtime: Any, ordered: tuple[Any, ...]):
     return tuple(indices), capacity, source, 0
 
 
-def _initial_conv_transfer(b, conv_input, *, view, plan, width, pcp, first_start, version):
+def _initial_conv_transfer(b, conv_input, *, view, plan, width, pcp, first_start, version, view_index=0):
     remote_initial = None
     if pcp > 1 and first_start > 0:
+        op_name = "pcp_remote_conv_state" if view_index == 0 else f"pcp_remote_conv_state_{view_index}"
         remote_initial = b.work(
-            "pcp_remote_conv_state", (conv_input.producer,), (0,),
+            op_name, (conv_input.producer,), (0,),
             family="state_transfer",
             metadata=(
                 ("status", "pending_external_rank"),
@@ -152,7 +153,7 @@ def _lower_segmented_conv(b, tensors, *, prefix, plan, parallel, prefill, conv_i
         version = view.context + first_start
         remote_initial = _initial_conv_transfer(
             b, conv_input, view=view, plan=plan, width=width, pcp=parallel.pcp,
-            first_start=first_start, version=version)
+            first_start=first_start, version=version, view_index=view_index)
         for range_index, (start, end) in enumerate(ranges):
             length = int(end) - int(start)
             if length <= 0:
@@ -173,18 +174,14 @@ def _lower_segmented_conv(b, tensors, *, prefix, plan, parallel, prefill, conv_i
             exchange = None
             if previous_seg is not None:
                 exchange = b.communicate(
-                    f"pcp_conv_state_step{segment_index}", (previous_seg,),
-                    max(0, plan.conv_kernel - 1) * width * 2
-                    * (2 * parallel.pcp - 1) / parallel.pcp,
-                    "state_transfer", "pcp",
+                    f"pcp_conv_tail_gather{segment_index}", (conv_input.producer,),
+                    max(0, plan.conv_kernel - 1) * width * 2 * (parallel.pcp - 1),
+                    "allgather", "pcp",
                     state_scope="conv_history",
                     request=view.request_id,
                     from_version=version,
                     to_version=view.context + int(start),
-                    remote_producer="external_rank",
-                    completion_owner="T09/COMM-LEAVES",
-                    source_implementation="pcp1_only",
-                    status="pending_external_rank",
+                    source="vllm_ascend.ops.gdn",
                 )
                 deps.append(exchange)
             segment_context = view.context + int(start)

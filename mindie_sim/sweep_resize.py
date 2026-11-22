@@ -136,10 +136,20 @@ def extract_model_geometry(
         return extract_model_geometry(case_or_model.model)
     if isinstance(case_or_model, ModelSpec):
         meta = dict(case_or_model.metadata)
+        plans = tuple(getattr(case_or_model, "layer_plans", ()) or ())
+        gqa_kv_heads = tuple(sorted({
+            int(p.num_kv_heads) for p in plans
+            if str(p.attention).strip().lower() == "gqa" and int(p.num_kv_heads) > 0
+        }))
+        has_mla = any(str(p.attention).strip().lower() == "mla" for p in plans)
+        from mindie_sim.catalog.context_parallel import is_v41_replicated_cache_model
         return {
             "num_heads": int(case_or_model.num_heads),
             "num_kv_heads": int(case_or_model.num_kv_heads
                                or case_or_model.num_heads),
+            "gqa_kv_heads": gqa_kv_heads,
+            "has_mla": has_mla,
+            "replicated_cache_dcp_disallowed": is_v41_replicated_cache_model(case_or_model),
             "num_experts": int(case_or_model.num_experts),
             "attention": str(case_or_model.attention).strip().lower(),
             "attention_types": attention_types(case_or_model),
@@ -186,23 +196,77 @@ def extract_model_geometry(
         f"unsupported_case_or_model_type:{type(case_or_model).__name__}")
 
 
+def _valid_dcp_options(
+    *, dp: int, tp: int, pcp: int, has_mla: bool, gqa_kv_heads: Sequence[int],
+    allowed_dcps: set[int] | None,
+    replicated_cache_dcp_disallowed: bool = False,
+) -> list[int]:
+    """Enumerate valid 3-axis DCP degrees for one ``(dp, tp, pcp)`` tuple."""
+    from mindie_sim.schema.parallel import factor_dcp_axes
+
+    if replicated_cache_dcp_disallowed:
+        return [1] if (allowed_dcps is None or 1 in allowed_dcps) else []
+    kv_reps = tuple(
+        (tp // kv if (tp >= kv and tp % kv == 0) else 1)
+        for kv in gqa_kv_heads
+    )
+    domain = dp * tp * pcp
+    options: list[int] = []
+    for dcp in _divisors(domain):
+        if allowed_dcps is not None and dcp not in allowed_dcps:
+            continue
+        if dcp == 1:
+            options.append(1)
+            continue
+        pcp_f, tp_g, dp_w = factor_dcp_axes(dcp, pcp=pcp, tp=tp, dp=dp)
+        if (pcp % pcp_f != 0 or tp % tp_g != 0 or dp % dp_w != 0
+                or pcp_f * tp_g * dp_w != dcp):
+            continue
+        if not has_mla:
+            if not kv_reps:
+                continue
+            valid_gqa = True
+            max_layer_tp = 1
+            for kv_rep in kv_reps:
+                if tp_g <= 1:
+                    ltp = 1
+                elif kv_rep > 1 and tp_g <= kv_rep and kv_rep % tp_g == 0:
+                    ltp = tp_g
+                elif kv_rep == 1:
+                    ltp = 1
+                else:
+                    valid_gqa = False
+                    break
+                if ltp > max_layer_tp:
+                    max_layer_tp = ltp
+            if not valid_gqa or pcp_f * max_layer_tp * dp_w < dcp:
+                continue
+        options.append(dcp)
+    return options
+
+
 def enumerate_parallel_candidates(
     case_or_model: CaseSpec | ModelSpec | Mapping[str, Any] | str, *,
     num_devices: int,
     allow_dp: bool = True, allow_ep: bool = True,
     allow_pp: bool = False, allow_pcp: bool = False,
+    allow_dcp: bool = False,
     candidate_tps: Sequence[int] | None = None,
     ep_candidates: Sequence[int] | None = None,
     pp_candidates: Sequence[int] | None = None,
     pcp_candidates: Sequence[int] | None = None,
+    dcp_candidates: Sequence[int] | None = None,
 ) -> list[dict[str, int]]:
     """Deterministically generate valid parallel shardings."""
     devices = check_pos_int("num_devices", num_devices, minimum=1)
     geometry = extract_model_geometry(case_or_model)
     num_heads, kv_heads = geometry["num_heads"], geometry["num_kv_heads"]
+    gqa_kv_heads = tuple(geometry.get("gqa_kv_heads") or ())
+    has_mla = bool(geometry.get("has_mla") or geometry["attention"] == "mla")
     experts = geometry["num_experts"]
     kinds = set(geometry["attention_types"])
     layers, mla_replicate = geometry["layers"], geometry["mla_replicate"]
+    include_dcp = bool(allow_dcp or dcp_candidates is not None)
     all_divs = _divisors(devices)
     allowed_tps = ({check_pos_int("candidate_tp", item, minimum=1)
                     for item in candidate_tps}
@@ -218,13 +282,17 @@ def enumerate_parallel_candidates(
     allowed_pcps = ({check_pos_int("pcp_candidate", item, minimum=1)
                      for item in pcp_candidates}
                     if pcp_candidates is not None else None)
+    allowed_dcps = ({check_pos_int("dcp_candidate", item, minimum=1)
+                     for item in dcp_candidates}
+                    if dcp_candidates is not None else None)
     candidates: list[dict[str, int]] = []
     for tp in tps:
-        if (num_heads > 0 and not mla_replicate
-                and (num_heads % tp != 0
-                     or (kv_heads > 0 and kv_heads % tp != 0
-                         and tp % kv_heads != 0))):
-            continue
+        if num_heads > 0 and not mla_replicate:
+            if num_heads % tp != 0:
+                continue
+            kv_list = gqa_kv_heads or (() if has_mla else ((kv_heads,) if kv_heads > 0 else ()))
+            if any(kv % tp != 0 and tp % kv != 0 for kv in kv_list):
+                continue
         remainder_tp = devices // tp
         pps = ([item for item in _divisors(remainder_tp)
                 if item in allowed_pps and (layers <= 0 or item <= layers)]
@@ -251,11 +319,23 @@ def enumerate_parallel_candidates(
                 if allowed_eps is not None:
                     ep_options = [item for item in ep_options
                                   if item in allowed_eps]
+                dcp_options = (
+                    _valid_dcp_options(
+                        dp=dp, tp=tp, pcp=pcp, has_mla=has_mla,
+                        gqa_kv_heads=gqa_kv_heads or ((kv_heads,) if (kv_heads > 0 and not has_mla) else ()),
+                        allowed_dcps=allowed_dcps,
+                        replicated_cache_dcp_disallowed=bool(geometry.get("replicated_cache_dcp_disallowed")),
+                    )
+                    if include_dcp else [1]
+                )
                 for ep in sorted(ep_options):
-                    candidates.append({"dp": dp, "tp": tp, "ep": ep,
-                                       "pp": pp, "pcp": pcp})
+                    for dcp in dcp_options:
+                        row = {"dp": dp, "tp": tp, "ep": ep, "pp": pp, "pcp": pcp}
+                        if include_dcp:
+                            row["dcp"] = dcp
+                        candidates.append(row)
     candidates.sort(key=lambda item: (item["tp"], item["dp"], item["ep"],
-                                      item["pp"], item["pcp"]))
+                                      item["pp"], item["pcp"], item.get("dcp", 1)))
     return candidates
 
 

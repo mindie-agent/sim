@@ -28,7 +28,7 @@ INDEXED_LATENT_DIM = 512
 INDEXED_ROPE_DIM = 64
 KV_SCALE_ELEMENT_BYTES = 4
 KV_SCALE_GROUP_SIZE = 128
-MAX_QUANT_INDEXED_HEADS = 64
+MAX_QUANT_INDEXED_HEADS = 128
 
 
 VECTOR_BUFFER_BYTES = (64 + 32 + 32 + 4 + 32 + 8 + 8) * 1024 + (3 * 3 + 2) * 512
@@ -71,9 +71,10 @@ C8_ALIAS_READS = 2
 #: ``sparse_indices -> block_table`` resolves two dependent INT32 scalar reads.
 C8_ADDRESS_LOOKUPS = 2
 C8_ADDRESS_ENTRY_BYTES = 4
-#: ``arch35`` C8 key tile and the declared two KV/accumulator slots per owner.
+#: ``arch35`` C8 key tile, two KV/accumulator slots, and single-core head cap.
 C8_KEY_TILE = 128
 C8_TILE_SLOTS = 2
+C8_MAX_SINGLE_CORE_HEADS = 64
 #: C8 INT8 -> FP16 -> FP32 * scale -> BF16 -> ND-to-NZ vector service.
 #: Weights are active lanes per value element of one declared source call; the
 #: rotary lanes are copied, not dequantized.
@@ -201,6 +202,22 @@ def build(op, geometry, *, scratch_policy, compact=True, operand_modes=True,
         source_items=tuple(SOURCE.items()), paired_vector_stages=("dequantize",),
         vector_buffer_bytes=VECTOR_BUFFER_BYTES,
         phase_unit_weights=phase_unit_weights_rope64 if shape["rope"] else phase_unit_weights)
+    paired = max(1, int(shape.get("paired_calls", 1)))
+    if paired > 1:
+        base_program = plan.program
+
+        def _paired_arch22_program(context):
+            stages = tuple(
+                Stage(
+                    f"call{idx}",
+                    after=() if idx == 0 else (f"call{idx - 1}",),
+                    program=base_program(context),
+                )
+                for idx in range(paired)
+            )
+            return KernelProgram(stages)
+
+        plan = replace(plan, work=plan.work.scaled(paired), program=_paired_arch22_program)
     row_bytes = packed_row_bytes(shape["rope"])
     return replace(plan, metadata={
         "kind": "indexed_attention_packed_int8",
@@ -211,6 +228,7 @@ def build(op, geometry, *, scratch_policy, compact=True, operand_modes=True,
                          "local_padded_row_bytes": -(-row_bytes // ROW_ALIGNMENT_BYTES)
                          * ROW_ALIGNMENT_BYTES},
         "kernel_schedule": SCHEDULE_ARCH22,
+        "paired_calls": paired,
         "vector_buffer_bytes_per_aiv": VECTOR_BUFFER_BYTES,
         "buffer_basis": "retained_InitBuffers_preload3; no_rope_adaptation_keeps_allocation",
         "unmodeled_features": [
@@ -342,8 +360,24 @@ def _priced_streams(streams, sequences, units, private):
     return tuple(result)
 
 
+def _arch35_split_g_phases(keys, head_splits, latent, rope, *, first, last, private_hbm=0):
+    """``IS_SPLIT_G`` (``heads > 64``) pair of AIC cores sharing one dequantized KV tile."""
+    h0, h1 = head_splits
+    base = cached_tile(keys, h0, latent, rope, first, last, private_hbm)
+    peer = cached_tile(keys, h1, latent, rope, first, last, 0)
+    stages = [(name, work, after, 0) for name, work, after in base]
+    for name, work, after in peer:
+        if name == "kv_stage":
+            continue
+        remapped = tuple(
+            "kv_stage" if dep == "kv_stage" else f"{dep}_g1" for dep in after
+        )
+        stages.append((f"{name}_g1", work, remapped, 1))
+    return tuple(stages)
+
+
 def arch35_plan(shape, geometry, *, tile_size=None, slots=None):
-    """Declared ``arch35`` C8 schedule: one ``1c2v`` group per query row."""
+    """Declared ``arch35`` C8 schedule: one ``1c2v`` group (or pair when ``G > 64``)."""
     tile_size = C8_KEY_TILE if tile_size is None else tile_size
     slots = C8_TILE_SLOTS if slots is None else slots
     if tile_size != C8_KEY_TILE or slots != C8_TILE_SLOTS:
@@ -353,11 +387,16 @@ def arch35_plan(shape, geometry, *, tile_size=None, slots=None):
     heads, latent, rope = shape["heads"], shape["latent"], shape["rope"]
     topk, paired = shape["topk"], max(1, int(shape.get("paired_calls", 1)))
     compute_units = geometry.compute_units
+    split_g = heads > C8_MAX_SINGLE_CORE_HEADS
+    if split_g and compute_units < 2:
+        raise ModelingError("arch35_c8_split_g_requires_two_compute_units")
+    head_splits = (((heads + 1) // 2, heads // 2) if split_g else (heads,))
+    owner_units = (compute_units // 2) if split_g else compute_units
     _owners, streams = tile_stream(
-        sequences, topk, compute_units, tile_size,
+        sequences, topk, owner_units, tile_size,
         shape.get("index_pool_size", 1), shape.get("index_pool_tail", False))
     kv_slot_bytes = tile_size * (latent + rope) * C8_BF16_BYTES
-    accumulator_bytes = _align(heads, C8_HEAD_ALIGN) * latent * C8_FP32_BYTES
+    accumulator_bytes = _align(max(head_splits), C8_HEAD_ALIGN) * latent * C8_FP32_BYTES
     if (geometry.buffer_units.get("l1", 0) < compute_units
             or geometry.buffer_units.get("l0c", 0) < compute_units
             or C8_TILE_SLOTS * kv_slot_bytes > geometry.buffers.get("l1", 0)
@@ -365,26 +404,33 @@ def arch35_plan(shape, geometry, *, tile_size=None, slots=None):
         raise ModelingError("arch35_c8_requires_two_kv_and_accumulator_slots_per_owner")
     shared_rows, private, _ = _row_partition(shape, sequences, topk)
     private_rows = sum(map(sum, private))
-    streams = _priced_streams(streams, sequences, compute_units, private)
+    streams = _priced_streams(streams, sequences, owner_units, private)
     external = shared_rows * packed_row_bytes(rope)
     from collections import Counter
     counts = Counter(tile for parts in streams for tile in parts)
     call_work = Work()
     for tile, count in counts.items():
-        for _name, work, _after in _tile_phases(tile, heads, latent, rope):
-            call_work += work.scaled(count)
+        if split_g:
+            keys, first, last, priv = tile
+            for _name, work, _after, _half in _arch35_split_g_phases(
+                    keys, head_splits, latent, rope,
+                    first=first, last=last, private_hbm=priv * packed_row_bytes(rope)):
+                call_work += work.scaled(count)
+        else:
+            for _name, work, _after in _tile_phases(tile, heads, latent, rope):
+                call_work += work.scaled(count)
     fill = Work(resources={"hbm": external} if external else {})
     stats_bytes = int(shape.get("statistics_bytes", 0) or 0)
     extra = stats_bytes + int(shape.get("padding_output_bytes", 0))
     stats_work = Work(resources={"hbm": extra, "mte3": extra}) if extra else Work()
-    shape = {**shape, "waves": -(-sum(q for q, _ in sequences) // compute_units)}
+    shape = {**shape, "waves": -(-sum(q for q, _ in sequences) // owner_units)}
     return OperatorPlan(
         call_work.scaled(paired) + fill + stats_work,
-        _arch35_program(streams, heads, latent, rope, kv_slot_bytes,
+        _arch35_program(streams, head_splits, latent, rope, kv_slot_bytes,
                         accumulator_bytes, fill, paired,
                         stats_work),
         _arch35_metadata(shape, external, private_rows, sequences, tile_size,
-                         slots, paired))
+                         slots, paired, head_splits))
 
 
 def _tile_phases(key, heads, latent, rope):
@@ -393,35 +439,47 @@ def _tile_phases(key, heads, latent, rope):
                        private * packed_row_bytes(rope))
 
 
-def _arch35_program(streams, heads, latent, rope, kv_slot_bytes, accumulator_bytes,
+def _arch35_program(streams, head_splits, latent, rope, kv_slot_bytes, accumulator_bytes,
                     fill, paired, stats_work):
     """Cold prefix fill once, then the declared paired query-owner programs."""
+    split_g = len(head_splits) == 2
+
     def program(context):
         context = bind_sustained_dram(context)
 
         def one(owner, parts):
             flat = parts
+            phys_owners = (2 * owner, 2 * owner + 1) if split_g else (owner,)
             allocations = tuple(
-                [context.allocate(f"c8kv{owner}_{index}", "l1", kv_slot_bytes, (owner,))
-                 for index in range(C8_TILE_SLOTS)]
-                + [context.allocate(f"c8acc{owner}_{index}", "l0c", accumulator_bytes,
-                                    (owner,))
-                   for index in range(C8_TILE_SLOTS)])
+                [context.allocate(f"c8kv{phys}_{index}", "l1", kv_slot_bytes, (phys,))
+                 for phys in phys_owners for index in range(C8_TILE_SLOTS)]
+                + [context.allocate(f"c8acc{phys}_{index}", "l0c", accumulator_bytes,
+                                    (phys,))
+                   for phys in phys_owners for index in range(C8_TILE_SLOTS)])
 
             @lru_cache(maxsize=OWNER_TILE_CACHE_SIZE)
             def stages(key):
                 result = []
-                for name, work, after in _tile_phases(key, heads, latent, rope):
+                if split_g:
+                    keys, first, last, priv = key
+                    items = _arch35_split_g_phases(
+                        keys, head_splits, latent, rope,
+                        first=first, last=last, private_hbm=priv * packed_row_bytes(rope))
+                else:
+                    items = tuple(
+                        (name, work, after, 0)
+                        for name, work, after in _tile_phases(key, head_splits[0], latent, rope))
+                for name, work, after, half in items:
                     roles = set(work.resources) | ({"cube"} if work.matrix else set())
                     # The two declared KV slots bound the live tiles; inside a
                     # row the online-softmax accumulator is a strict recurrence.
-                    previous = (("accumulate",) if name == "accumulate" and not key[1]
-                                else ())
+                    is_acc = name in {"accumulate", "accumulate_g1"}
+                    previous = ((name,) if is_acc and not key[1] else ())
                     result.append(Stage(
                         name, context.bind(work), after=tuple(after),
                         previous=previous,
                         placement=context.owned(
-                            owner, context.core_count, roles - {"hbm"})))
+                            phys_owners[half], context.core_count, roles - {"hbm"})))
                 return tuple(result)
 
             return KernelProgram((
@@ -446,7 +504,7 @@ def _arch35_program(streams, heads, latent, rope, kv_slot_bytes, accumulator_byt
 
 
 def _arch35_metadata(shape, external, private_rows, sequences, tile_size, slots,
-                     paired):
+                     paired, head_splits):
     return {
         "kind": "indexed_attention_packed_int8",
         "coverage": "source_phases_declared_dispatch",
@@ -457,12 +515,17 @@ def _arch35_metadata(shape, external, private_rows, sequences, tile_size, slots,
             "key_tile": tile_size, "tile_slots": slots,
             "query_rows": sum(query for query, _ in sequences),
             "waves": shape["waves"],
-            "head_tile": _align(shape["heads"], C8_HEAD_ALIGN),
+            "head_tile": _align(max(head_splits), C8_HEAD_ALIGN),
+            "head_splits": head_splits,
+            "split_g": len(head_splits) == 2,
             "dequant_lane_ops_per_value": sum(
                 weight for _name, weight in C8_DEQUANT_PASSES),
             "external_fill_bytes": external, "private_rows": private_rows,
             "paired_calls": paired,
-            "key_tile_owners": "one_1c2v_group_per_query_row",
+            "key_tile_owners": (
+                "two_1c2v_groups_split_g_per_query_row"
+                if len(head_splits) == 2 else "one_1c2v_group_per_query_row"
+            ),
         },
         "unmodeled_features": [
             "captured_kernel_dispatch_and_binary", "captured_valid_index_values",

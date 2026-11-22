@@ -178,9 +178,9 @@ def capacity_window(
     else:
         def ledger_stage_bytes(tokens: int) -> list[float]:
             if phase != "decode" or q_tokens == ledger.query_tokens:
-                return [float(value) for value in ledger.cache_bytes(
+                return [float(value) for value in ledger.dp_cohort_cache_bytes(
                     tokens, padded=True)]
-            return [float(value) for value in ledger.cache_bytes(
+            return [float(value) for value in ledger.dp_cohort_cache_bytes(
                 tokens, padded=True, query_tokens=q_tokens)]
 
         kv_active = ledger_stage_bytes(active_tokens)

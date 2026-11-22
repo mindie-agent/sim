@@ -39,7 +39,12 @@ from mindie_sim.schema.common import ModelingError, align_up
 ZERO = 0
 ONE = 1
 ZERO_FLOAT = 0.0
+ROLE_ATTENTION_INPUT = "attention_input"
 ROLE_ATTENTION_OUTPUT = "attention_output"
+ROLE_DENSE_MLP_UP = "dense_mlp_up"
+ROLE_DENSE_MLP_DOWN = "dense_mlp_down"
+ROLE_SHARED_EXPERT_UP = "shared_expert_up"
+ROLE_SHARED_EXPERT_DOWN = "shared_expert_down"
 ROLE_LINEAR_INPUT = "linear_input"
 ROLE_LINEAR_GATE = "linear_gate"
 ROLE_LINEAR_OUTPUT = "linear_output"
@@ -49,18 +54,36 @@ ROLE_TARGET_HEAD_ALIAS = "target_lm_head_alias"
 PARTITION_COLUMN = "column"
 PARTITION_ROW = "row"
 PARTITION_GROUP_PAIR = "group_pair"
+ATTENTION_INPUT_ROLES = frozenset({ROLE_ATTENTION_INPUT})
 ATTENTION_ROLES = frozenset({ROLE_ATTENTION_OUTPUT})
+DENSE_MLP_ROLES = frozenset({ROLE_DENSE_MLP_UP, ROLE_DENSE_MLP_DOWN})
+SHARED_EXPERT_ROLES = frozenset({ROLE_SHARED_EXPERT_UP, ROLE_SHARED_EXPERT_DOWN})
 LINEAR_ROLES = frozenset({ROLE_LINEAR_INPUT, ROLE_LINEAR_OUTPUT})
 #: ``ROLE_LINEAR_GATE`` is a declared role but never a sharded one: the
 #: low-rank decay/gate matrices (``f_b_proj`` / ``g_b_proj``) execute locally
 #: on the rank that already owns the tokens, so they carry no collective.
 LOCAL_LINEAR_ROLES = frozenset({ROLE_LINEAR_GATE})
 LOGIT_ROLES = frozenset({ROLE_LOGITS, ROLE_DRAFT_LOGITS})
-SHARDED_ROLES = ATTENTION_ROLES | LINEAR_ROLES | LOCAL_LINEAR_ROLES | LOGIT_ROLES
+SHARDED_ROLES = (
+    ATTENTION_INPUT_ROLES
+    | ATTENTION_ROLES
+    | DENSE_MLP_ROLES
+    | SHARED_EXPERT_ROLES
+    | LINEAR_ROLES
+    | LOCAL_LINEAR_ROLES
+    | LOGIT_ROLES
+)
 #: Declared catalog shard kinds that keep every output feature on each owner.
 REPLICATED_SHARD = "replicated"
 _GROUP_PAIR_TERMS = frozenset({"wo_a", "wo_b", "draft_wo_a", "draft_wo_b"})
+_ATTENTION_INPUT_TERMS = frozenset({
+    "q_a", "q_b", "q_proj", "kv_a", "wkv", "k_proj", "v_proj", "g_proj", "mla_g",
+})
 _ATTENTION_OUTPUT_TERMS = frozenset({"o_proj", "output", "draft_o"})
+_DENSE_MLP_UP_TERMS = frozenset({"dense_gate", "dense_up"})
+_DENSE_MLP_DOWN_TERMS = frozenset({"dense_down"})
+_SHARED_EXPERT_UP_TERMS = frozenset({"shared_gate", "shared_up"})
+_SHARED_EXPERT_DOWN_TERMS = frozenset({"shared_down"})
 _LINEAR_INPUT_TERMS = frozenset({
     "kda_q", "kda_k", "kda_v", "kda_b", "kda_f_a", "kda_g_a", "kda_g",
     "gdn_qkvz", "gdn_ba", "linear_qkvbfg_a", "linear_q", "linear_k",
@@ -113,8 +136,18 @@ class ProjectionPlacement:
 def _role_from_name_category(name: str, category: str) -> str:
     if name in _GROUP_PAIR_TERMS:
         return ROLE_ATTENTION_OUTPUT
+    if name in _ATTENTION_INPUT_TERMS:
+        return ROLE_ATTENTION_INPUT
     if name in _ATTENTION_OUTPUT_TERMS:
         return ROLE_ATTENTION_OUTPUT
+    if name in _DENSE_MLP_UP_TERMS:
+        return ROLE_DENSE_MLP_UP
+    if name in _DENSE_MLP_DOWN_TERMS:
+        return ROLE_DENSE_MLP_DOWN
+    if name in _SHARED_EXPERT_UP_TERMS:
+        return ROLE_SHARED_EXPERT_UP
+    if name in _SHARED_EXPERT_DOWN_TERMS:
+        return ROLE_SHARED_EXPERT_DOWN
     if name in _LINEAR_INPUT_TERMS:
         return ROLE_LINEAR_INPUT
     if name in _LINEAR_GATE_TERMS:
@@ -133,6 +166,8 @@ def _role_from_name_category(name: str, category: str) -> str:
 def role_from_category(category: str) -> str:
     """Map a declared quant category to its dense projection role."""
     name = str(category or "").strip().lower()
+    if name in {"mla.q_a", "mla.q_b", "mla.q_proj", "mla.kv_a", "mla.g", "attn.qkv", "attn.gate"}:
+        return ROLE_ATTENTION_INPUT
     if name in {"attn.o", "mla.o", "mla.o_a", "mla.o_b"}:
         return ROLE_ATTENTION_OUTPUT
     if name in {
@@ -163,15 +198,23 @@ def projection_role(plan: Any, term_name: str, *, scope: str) -> str:
 
 def role_width(role: str, parallel: Any) -> int:
     """Resolve the local width that owns ``role``."""
+    if role in ATTENTION_INPUT_ROLES:
+        dcp_lin = int(getattr(parallel, "dcp_linear_tp", ONE) or ONE)
+        return dcp_lin if dcp_lin > ONE else int(getattr(parallel, "q_proj_tp", ONE) or ONE)
     if role in ATTENTION_ROLES:
-        return int(parallel.o_proj_tp)
+        dcp_lin = int(getattr(parallel, "dcp_linear_tp", ONE) or ONE)
+        return dcp_lin if dcp_lin > ONE else int(getattr(parallel, "o_proj_tp", ONE) or ONE)
+    if role in DENSE_MLP_ROLES:
+        return int(getattr(parallel, "mlp_tp", ONE) or ONE)
+    if role in SHARED_EXPERT_ROLES:
+        return int(getattr(parallel, "shared_expert_tp", ONE) or ONE)
     if role == ROLE_LINEAR_GATE:
         # The low-rank decay/gate matrices are local to the token-owning rank.
         return ONE
     if role in LINEAR_ROLES:
-        return int(parallel.linear_proj_tp)
+        return int(getattr(parallel, "linear_proj_tp", ONE) or ONE)
     if role in LOGIT_ROLES:
-        return int(parallel.lm_head_tp)
+        return int(getattr(parallel, "lm_head_tp", ONE) or ONE)
     return ONE
 
 
@@ -234,18 +277,34 @@ def placed_weight_shape(
         return rows, cols, count
     if width <= ONE:
         return _legacy_shape(term, parallel, count)
+    tp = max(ONE, int(getattr(parallel, "tp", ONE) or ONE))
+    pcp = max(ONE, int(getattr(parallel, "pcp", ONE) or ONE))
+    eff_width = width
+    if str(getattr(term, "shard", "")) != REPLICATED_SHARD and tp > ONE:
+        eff_width = max(width, tp)
+    if pcp > ONE and str(getattr(term, "name", "")).startswith("kda_") and str(
+            getattr(term, "shard", "")) in {"out_tp", "in_tp"}:
+        eff_width = max(eff_width, tp * pcp)
     if role == ROLE_ATTENTION_OUTPUT and (term.name in {"wo_a", "wo_b", "draft_wo_a", "draft_wo_b"}):
         groups = int(term.groups)
-        if groups <= ZERO or groups % width != ZERO:
+        if groups <= ZERO or groups % eff_width != ZERO:
             raise ModelingError("local_tp_group_geometry_indivisible")
         if term.name.endswith("_a"):
-            return rows // width, cols, count
-        return rows, cols // width, count
-    if role in {ROLE_ATTENTION_OUTPUT, ROLE_LINEAR_OUTPUT}:
-        return rows, _padded_local(cols, width, term), count
+            return rows // eff_width, cols, count
+        return rows, cols // eff_width, count
+    if role == ROLE_ATTENTION_INPUT and str(getattr(term, "shard", "")) == "kv_out":
+        if int(term.units) <= ZERO or int(term.unit_width) <= ZERO:
+            raise ModelingError(f"catalog_kv_shard_granularity_missing:{term.name}")
+        local_units = max(ONE, (int(term.units) + eff_width - ONE) // eff_width)
+        return local_units * int(term.unit_width), cols, count
+    if role in {ROLE_ATTENTION_OUTPUT, ROLE_LINEAR_OUTPUT, ROLE_DENSE_MLP_DOWN, ROLE_SHARED_EXPERT_DOWN}:
+        return rows, _padded_local(cols, eff_width, term), count
     if role == ROLE_LINEAR_INPUT:
-        return _term_local_output(term, width), cols, count
-    return _padded_local(rows, width, term), cols, count
+        return _term_local_output(term, eff_width), cols, count
+    if role in {ROLE_ATTENTION_INPUT, ROLE_DENSE_MLP_UP, ROLE_SHARED_EXPERT_UP,
+                ROLE_LOGITS, ROLE_DRAFT_LOGITS}:
+        return _output_local(rows, eff_width), cols, count
+    return _padded_local(rows, eff_width, term), cols, count
 
 
 def _legacy_shape(term: Any, parallel: Any, count: int) -> tuple[int, int, int]:
@@ -282,7 +341,7 @@ def _placement_for_terms(
             role, width, PARTITION_GROUP_PAIR, rows, cols, physical_rows,
             physical_cols, groups, tuple(terms), "activation_rows",
             "activation_rows")
-    if role in {ROLE_ATTENTION_OUTPUT, ROLE_LINEAR_OUTPUT}:
+    if role in {ROLE_ATTENTION_OUTPUT, ROLE_LINEAR_OUTPUT, ROLE_DENSE_MLP_DOWN, ROLE_SHARED_EXPERT_DOWN}:
         representative = terms[ZERO]
         rows, cols = int(representative.rows), int(representative.cols)
         physical_cols = _padded_local(cols, width, representative)

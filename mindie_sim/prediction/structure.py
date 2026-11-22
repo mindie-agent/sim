@@ -247,7 +247,7 @@ def _normalize_parsed_case(case: Case) -> Case:
                         degraded_submodules=tuple(sorted(degraded)))
         model = replace(model, metadata=tuple(sorted(metadata.items())))
     case.machine.validate_placement(p)
-    if max(int(p.o_proj_tp), int(p.linear_proj_tp), int(p.lm_head_tp)) > ONE:
+    if p.has_local_tp:
         from .local_tp_groups import validate_local_projection_tp
         validate_local_projection_tp(case)
     case.workload.validate_model(model, runtime)
@@ -257,6 +257,10 @@ def _normalize_parsed_case(case: Case) -> Case:
     # the deployment identity, not a measured supply or model-label branch.
     from .frontend_features import _identity_metadata
     metadata.update(_identity_metadata(case.machine, model))
+    from .operators.context_parallel.graph import validate_quantized_allreduce_runtime
+    validate_quantized_allreduce_runtime(
+        metadata, arch=str(case.machine.arch_family or ""), tp=int(p.tp),
+    )
     media = {request.request_id: request.media_tokens for request in case.workload.requests if request.media_tokens}
     if media:
         metadata["media_tokens_by_request"] = media

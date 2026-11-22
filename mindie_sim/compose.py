@@ -209,6 +209,125 @@ def _materialize_machine(
     return sku, backend, machine
 
 
+_KPOOL_ALLOWED_INDEXER_KV_DTYPES = frozenset({
+    "auto", "bf16", "fp8",
+})
+
+
+def _apply_cache_dtype_overrides(
+    model_spec: Any,
+    *,
+    kv_cache_dtype: str | None,
+    indexer_kv_dtype: str | None,
+) -> Any:
+    """Apply and validate KV & indexer cache dtype/scale overrides onto ModelSpec."""
+    from dataclasses import replace as _replace
+    from mindie_sim.catalog.types import QuantSpec
+    from mindie_sim.schema.common import dtype_bytes
+
+    has_kpool = any(
+        int(getattr(lp, "index_kpool", 1) or 1) > 1
+        for lp in getattr(model_spec, "layer_plans", ())
+    )
+    if kv_cache_dtype is None and indexer_kv_dtype is None:
+        if not has_kpool or model_spec.quant is None:
+            return model_spec
+        cur_idx = str(model_spec.quant.index_dtype or "bf16").strip().lower()
+        if cur_idx not in {"bf16", "fp8", "fp8_e4m3"}:
+            raise ModelingError(f"kpool_indexer_kv_dtype_unsupported:{cur_idx}")
+        if cur_idx in {"fp8", "fp8_e4m3"} and str(model_spec.quant.index_scale_dtype or "") in {"", "none"}:
+            return _replace(
+                model_spec,
+                quant=_replace(model_spec.quant, index_scale_dtype="fp32"),
+            )
+        return model_spec
+
+    kv_raw = str(kv_cache_dtype).strip().lower() if kv_cache_dtype is not None else None
+    idx_raw = str(indexer_kv_dtype).strip().lower() if indexer_kv_dtype is not None else None
+    if has_kpool and idx_raw is not None and idx_raw not in _KPOOL_ALLOWED_INDEXER_KV_DTYPES:
+        raise ModelingError(f"kpool_indexer_kv_dtype_unsupported:{idx_raw}")
+
+    quant = model_spec.quant
+    act = str(model_spec.activation_dtype or "bf16")
+    if quant is None:
+        quant = QuantSpec(
+            name=act, weight_format=act, activation_format=act,
+            expert_weight_format=act, kv_dtype=act, index_dtype=act,
+            index_scale_dtype="none", native_format=act,
+        )
+
+    resolved_kv = quant.kv_dtype if kv_raw in {None, "", "auto"} else kv_raw
+    if idx_raw == "auto" and has_kpool:
+        # Upstream ``glm5next/attention.py:115``: ``auto`` selects BF16 (no scales).
+        resolved_idx = "bf16"
+    elif idx_raw in {None, "", "auto"}:
+        resolved_idx = quant.index_dtype
+    else:
+        resolved_idx = idx_raw
+    if has_kpool and str(resolved_idx).strip().lower() not in {"bf16", "fp8", "fp8_e4m3"}:
+        raise ModelingError(f"kpool_indexer_kv_dtype_unsupported:{resolved_idx}")
+    if kv_raw not in {None, "", "auto"}:
+        dtype_bytes(resolved_kv)
+    if idx_raw not in {None, "", "auto"}:
+        dtype_bytes(resolved_idx)
+
+    resolved_scale = quant.index_scale_dtype
+    if has_kpool:
+        idx_norm = str(resolved_idx).strip().lower()
+        if idx_norm in {"fp8", "fp8_e4m3"}:
+            # Upstream ``glm5next/kv_cache.py:117`` & ``indexer_kpool.py:1039``:
+            # GLM KPool FP8 cache requires one FP32 per-pool scale.
+            resolved_scale = "fp32"
+        elif idx_norm == "bf16":
+            resolved_scale = "none"
+
+    updated = _replace(
+        quant,
+        kv_dtype=resolved_kv,
+        index_dtype=resolved_idx,
+        index_scale_dtype=resolved_scale,
+    )
+    return _replace(model_spec, quant=updated)
+
+
+def _apply_cp_and_tutorial_flags(
+    runtime_meta: dict[str, Any],
+    *,
+    model_spec: Any,
+    parallel_dict: Mapping[str, Any],
+    enable_flashcomm1: bool | None,
+    enable_fused_mc2: int | None,
+    enable_prefill_mc2: bool | None,
+    enable_pcp_o_proj_weight_sharding: bool,
+    enable_sfa_dcp_sharded_indexer: bool,
+    dcp_q_replicate: bool,
+) -> None:
+    """Attach tutorial execution flags and non-blocking KV-replication metadata."""
+    from mindie_sim.catalog.context_parallel import kv_cache_replication_info
+    from mindie_sim.schema.parallel import ParallelSpec
+
+    additional = dict(runtime_meta.get("additional_config") or {})
+    if enable_flashcomm1 is not None:
+        additional["enable_flashcomm1"] = bool(enable_flashcomm1)
+    if enable_fused_mc2 is not None:
+        additional["enable_fused_mc2"] = int(enable_fused_mc2)
+    if enable_prefill_mc2 is not None:
+        additional["enable_prefill_mc2"] = bool(enable_prefill_mc2)
+    if additional:
+        runtime_meta["additional_config"] = additional
+    if enable_pcp_o_proj_weight_sharding:
+        runtime_meta["enable_pcp_o_proj_weight_sharding"] = True
+    if enable_sfa_dcp_sharded_indexer:
+        runtime_meta["enable_sfa_dcp_sharded_indexer"] = True
+    if dcp_q_replicate:
+        runtime_meta["dcp_q_replicate"] = True
+    p_spec = ParallelSpec.from_mapping(parallel_dict)
+    kv_rep = kv_cache_replication_info(model_spec, p_spec)
+    runtime_meta["kv_cache_replicated_tp"] = bool(kv_rep["kv_cache_replicated_tp"])
+    runtime_meta["kv_cache_replication_factor"] = int(kv_rep["kv_cache_replication_factor"])
+    runtime_meta["canonical_kv_sharding"] = str(kv_rep["canonical_kv_sharding"])
+
+
 def compose_case(
     model: str | Path | Mapping[str, Any],
     hardware: str | Mapping[str, Any] = "a3",
@@ -271,9 +390,21 @@ def compose_case(
     engram_cpu_offload: bool | None = None,
     enable_dbo: bool = False,
     moe_comm_mode: str | None = None,
+    q_proj_tp: int = DEFAULT_LOCAL_WIDTH,
     o_proj_tp: int = DEFAULT_LOCAL_WIDTH,
     linear_proj_tp: int = DEFAULT_LOCAL_WIDTH,
+    dcp_linear_tp: int = DEFAULT_LOCAL_WIDTH,
+    mlp_tp: int = DEFAULT_LOCAL_WIDTH,
+    shared_expert_tp: int = DEFAULT_LOCAL_WIDTH,
     lm_head_tp: int = DEFAULT_LOCAL_WIDTH,
+    enable_flashcomm1: bool | None = None,
+    enable_fused_mc2: int | None = None,
+    enable_prefill_mc2: bool | None = None,
+    enable_pcp_o_proj_weight_sharding: bool = False,
+    enable_sfa_dcp_sharded_indexer: bool = False,
+    dcp_q_replicate: bool = False,
+    kv_cache_dtype: str | None = None,
+    indexer_kv_dtype: str | None = None,
     redundant_experts_per_rank: int = DEFAULT_REDUNDANT_EXPERTS,
     collective_startup_mode: str | None = None,
     matrix_compute_policy: str = "auto",
@@ -334,21 +465,47 @@ def compose_case(
     production = ascend_backend and va_recommended is not False and not raw_eager
 
     explicit_graph_capture = graph_capture_mode is not None
-    explicit_sp = sp is not None
+    explicit_sp = (sp is not None) or (enable_flashcomm1 is not None)
+    if sp is None and enable_flashcomm1 is not None and not raw_eager:
+        sp = bool(enable_flashcomm1)
     model_spec = _resolve_model_spec(model)
     model_limit = _resolve_max_position_embeddings(model, model_spec)
+    explicit_quant = quant is not None
     va_profile: dict[str, Any] | None = None
     if production:
         model_id = str(model) if isinstance(model, str) else str(model_spec.name)
         va_profile = va_recommended_config(model_id, sku)
         va_profile["quantization_action"] = (
-            "explicit_quant_preserved" if quant is not None else
+            "explicit_quant_preserved" if explicit_quant else
             "documented_alternative_applied" if va_profile["quant"] is not None else
             "no_profile_override")
         va_profile.setdefault("graph_capture_mode", None)
-        if quant is None:
+        if not explicit_quant:
             quant = va_profile["quant"]
     model_spec = _apply_quant_override(model_spec, quant, machine)
+    resolved_kv_dtype = kv_cache_dtype
+    resolved_idx_dtype = indexer_kv_dtype
+    explicit_kv_in_quant = isinstance(quant, Mapping) and bool(quant.get("kv_dtype"))
+    explicit_idx_in_quant = isinstance(quant, Mapping) and bool(quant.get("index_dtype"))
+    unquantized_override = (
+        explicit_quant
+        and isinstance(quant, str)
+        and quant.strip().lower() in {"bf16", "bfloat16", "fp16", "float16", "fp32"}
+    )
+    if (
+        production
+        and va_profile is not None
+        and va_profile.get("quant") is not None
+        and not unquantized_override
+    ):
+        prof_flags = dict(va_profile.get("tutorial_flags") or {})
+        if resolved_kv_dtype is None and not explicit_kv_in_quant and prof_flags.get("kv_cache_dtype"):
+            resolved_kv_dtype = str(prof_flags["kv_cache_dtype"])
+        if resolved_idx_dtype is None and not explicit_idx_in_quant and prof_flags.get("indexer_kv_dtype"):
+            resolved_idx_dtype = str(prof_flags["indexer_kv_dtype"])
+    model_spec = _apply_cache_dtype_overrides(
+        model_spec, kv_cache_dtype=resolved_kv_dtype, indexer_kv_dtype=resolved_idx_dtype,
+    )
     from mindie_sim.compose_operator_defaults import structural_v41_latent_mqa
     v41_structural = structural_v41_latent_mqa(model_spec.layer_plans)
     model_spec = _apply_structural_overrides(
@@ -485,6 +642,24 @@ def compose_case(
         runtime_meta["draft_proposal_tokens"] = int(mtp_proposal_tokens)
     if enable_shared_expert_dp:
         runtime_meta["enable_shared_expert_dp"] = True
+    _apply_cp_and_tutorial_flags(
+        runtime_meta,
+        model_spec=model_spec,
+        parallel_dict={
+            "dp": dp, "tp": tp, "pp": pp, "ep": ep, "cp": dcp, "dcp": dcp, "pcp": pcp,
+            "q_proj_tp": int(q_proj_tp), "o_proj_tp": int(o_proj_tp),
+            "linear_proj_tp": int(linear_proj_tp), "dcp_linear_tp": int(dcp_linear_tp),
+            "mlp_tp": int(mlp_tp), "shared_expert_tp": int(shared_expert_tp),
+            "lm_head_tp": int(lm_head_tp),
+            "redundant_experts_per_rank": int(redundant_experts_per_rank),
+        },
+        enable_flashcomm1=enable_flashcomm1,
+        enable_fused_mc2=enable_fused_mc2,
+        enable_prefill_mc2=enable_prefill_mc2,
+        enable_pcp_o_proj_weight_sharding=enable_pcp_o_proj_weight_sharding,
+        enable_sfa_dcp_sharded_indexer=enable_sfa_dcp_sharded_indexer,
+        dcp_q_replicate=dcp_q_replicate,
+    )
 
     runtime_dict: dict[str, Any] = {
         "parallel": {
@@ -503,8 +678,12 @@ def compose_case(
             ]}
                if int(pcp) > 1 and int(ep) > int(dp) * int(tp)
                and (int(dp) * int(tp) * int(pcp)) % int(ep) == 0 else {}),
+            "q_proj_tp": int(q_proj_tp),
             "o_proj_tp": int(o_proj_tp),
             "linear_proj_tp": int(linear_proj_tp),
+            "dcp_linear_tp": int(dcp_linear_tp),
+            "mlp_tp": int(mlp_tp),
+            "shared_expert_tp": int(shared_expert_tp),
             "lm_head_tp": int(lm_head_tp),
             "redundant_experts_per_rank": int(redundant_experts_per_rank),
         },
@@ -629,6 +808,8 @@ def compose_case(
                     ("enable_super_kernel", enable_super_kernel is not None),
                     ("multistream_overlap_shared_expert", multistream_overlap_shared_expert is not None),
                     ("moe_comm_mode", moe_comm_mode is not None),
+                    ("enable_fused_mc2", enable_fused_mc2 is not None),
+                    ("enable_flashcomm1", enable_flashcomm1 is not None),
                     ("recover_ssm", recover_ssm is True),
                 ) if explicit)
             ctx_opts: dict[str, Any] = {

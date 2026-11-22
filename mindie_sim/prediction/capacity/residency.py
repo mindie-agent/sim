@@ -127,16 +127,25 @@ def _routed_expert_bytes_by_stage(
     return result, payload, staging
 
 
-def _resident_weight_parallel(term, parallel, enable_shared_expert_dp: bool):
-    """Mirror the weight ledger's shared-expert placement without duplicating it."""
-    if enable_shared_expert_dp and term.category == "shared_expert":
-        return replace(parallel, tp=1)
-    return parallel
+def _resident_weight_parallel(
+    term, parallel, enable_shared_expert_dp: bool,
+    enable_pcp_o_proj_weight_sharding: bool = False,
+    dcp_q_replicate: bool = False,
+):
+    """Delegate to the weight ledger's single-source placement rule."""
+    from mindie_sim.catalog.weights import _resident_parallel
+    return _resident_parallel(
+        term, parallel, enable_shared_expert_dp,
+        pcp_o_proj_weight_sharding=enable_pcp_o_proj_weight_sharding,
+        dcp_q_replicate=dcp_q_replicate,
+    )
 
 
 def _weight_ledger_by_stage(
     case: CaseSpec, layer_stage: tuple[int, ...], *, draft_kind: str,
     include_draft: bool, include_engram_tables: bool, enable_shared_expert_dp: bool,
+    enable_pcp_o_proj_weight_sharding: bool = False,
+    dcp_q_replicate: bool = False,
     slot_plans=None, ep_rank: int | None = None,
 ) -> tuple[list[float], list[float]]:
     """Persistent weight payload and quant metadata per PP stage.
@@ -154,11 +163,16 @@ def _weight_ledger_by_stage(
         slot_plans=slot_plans, ep_rank=ep_rank,
     ):
         total = payload = 0.0
+        from mindie_sim.catalog.weights import _expand_resident_terms
         for term in terms:
-            placed = _resident_weight_parallel(term, parallel, enable_shared_expert_dp)
-            total += term_bytes(term, quant, placed, case.machine.ranks_per_node)
-            payload += term_payload_bytes(
-                term, quant, placed, case.machine.ranks_per_node)
+            for t_sub, placed in _expand_resident_terms(
+                term, parallel, enable_shared_expert_dp,
+                pcp_o_proj_weight_sharding=enable_pcp_o_proj_weight_sharding,
+                dcp_q_replicate=dcp_q_replicate, model=model,
+            ):
+                total += term_bytes(t_sub, quant, placed, case.machine.ranks_per_node)
+                payload += term_payload_bytes(
+                    t_sub, quant, placed, case.machine.ranks_per_node)
         total_by_stage.append(float(total))
         payload_by_stage.append(float(payload))
     return total_by_stage, payload_by_stage

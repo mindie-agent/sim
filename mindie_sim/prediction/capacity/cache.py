@@ -17,10 +17,60 @@ from mindie_sim.catalog.cache import (
     local_kv_heads,
     owned_token_rows,
 )
+from mindie_sim.catalog.context_parallel import (
+    cp_interleave,
+    dcp_indexer_sharded,
+    layer_dcp_factors,
+)
 from mindie_sim.schema.common import dtype_bytes
+
+_DCP_KV_SHARDED_COMPONENTS = frozenset({
+    "gqa_kv", "mla_kv", "window", "compressed_kv",
+})
 
 
 class _MemoryCacheMixin:
+    def dp_cohort_cache_bytes(
+        self, tokens: int, *, padded: bool = True,
+        query_tokens: int | None = None,
+    ) -> tuple[float, ...]:
+        """Per-DP-sequence HBM bytes on one die conserving DP-cohort DCP capacity.
+
+        When ``dcp_dp_width > 1``, evaluating ``b`` sequences per DP replica
+        means ``b * dcp_dp_width`` cohort sequences share this die's KV pool,
+        so KV-sharded components scale by ``dcp_dp_width`` while per-replica
+        recurrent/conv/replicated-index state stays at ``1x``.
+        """
+        base = list(
+            self.cache_bytes(tokens, padded=padded)
+            if query_tokens is None
+            else self.cache_bytes(tokens, padded=padded, query_tokens=query_tokens)
+        )
+        p = self.case.runtime.parallel
+        dp_width = int(getattr(p, "dcp_dp_width", 1) or 1)
+        if dp_width <= 1 or not self.case.model.layer_plans:
+            return tuple(base)
+        case, model = self.case, self.case.model
+        q_tok = self.query_tokens if query_tokens is None else max(1, int(query_tokens))
+        interleave = cp_interleave(case.runtime)
+        sharded_idx = dcp_indexer_sharded(model, case.runtime)
+        for layer in model.layer_plans:
+            _, _, layer_dp = layer_dcp_factors(layer, p)
+            if layer_dp <= 1:
+                continue
+            components = layer_cache_components(
+                model, layer, p, tokens, capacity_padded=padded,
+                interleave=interleave, runtime=case.runtime, query_tokens=q_tok,
+            )
+            covered = self.pages.covered.get(layer.index, ()) if padded else ()
+            stage = self.layer_stage[layer.index]
+            for name, value in components.items():
+                if name in covered:
+                    continue
+                if name in _DCP_KV_SHARDED_COMPONENTS or (name == "index_k" and sharded_idx):
+                    base[stage] += float(value) * float(layer_dp - 1)
+        return tuple(base)
+
     def cache_bytes(self, tokens: int, *, padded=True,
                     query_tokens: int | None = None) -> tuple[float, ...]:
         case, model, p = self.case, self.case.model, self.case.runtime.parallel
@@ -35,11 +85,12 @@ class _MemoryCacheMixin:
             q_tok = 1
         result = (self.pages.allocation_stage_bytes(tokens, case.runtime.max_model_len, p.pp)
                   if padded else [0.0] * p.pp)
+        interleave = cp_interleave(case.runtime)
         if model.layer_plans:
             for layer in model.layer_plans:
                 components = layer_cache_components(
                     model, layer, p, tokens, capacity_padded=padded,
-                    interleave=case.runtime.kv_block_size,
+                    interleave=interleave,
                     runtime=case.runtime, query_tokens=q_tok)
                 covered = self.pages.covered.get(layer.index, ()) if padded else ()
                 result[self.layer_stage[layer.index]] += sum(
@@ -109,7 +160,7 @@ class _MemoryCacheMixin:
                 layer = by_index[layer_index]
                 components = layer_cache_components(
                     model, layer, p, valid_tokens, capacity_padded=False,
-                    interleave=case.runtime.kv_block_size,
+                    interleave=cp_interleave(case.runtime),
                     rank=rank, owner_spans=self.rank_token_owners,
                     runtime=case.runtime, query_tokens=self.query_tokens,
                 )
@@ -173,19 +224,16 @@ class _MemoryCacheMixin:
                 return None
             region = "gqa_kv"
             width = 2 * local_kv_heads(layer.num_kv_heads, parallel.tp) * layer.head_dim
-            cap = layer.window or 0
         elif name == "mla_kv":
             if layer.attention != "mla" or layer.cache_kind != "dense":
                 return None
             region = "mla_kv"
             width = layer.cache_row_elements
-            cap = layer.window or 0
         else:  # window
             if layer.attention != "mla" or not layer.window:
                 return None
             region = "window"
             width = layer.cache_row_elements
-            cap = layer.window
         if name not in components and valid_tokens > 0:
             return None
         # The physical page owns all allocated slots.  Valid content comes from
@@ -227,7 +275,7 @@ class _MemoryCacheMixin:
         for layer in model.layer_plans:
             components = layer_cache_components(
                 model, layer, p, tokens, capacity_padded=padded,
-                interleave=case.runtime.kv_block_size,
+                interleave=cp_interleave(case.runtime),
                 rank=rank, owner_spans=self.rank_token_owners,
                 runtime=case.runtime, query_tokens=self.query_tokens,
             )
@@ -279,7 +327,7 @@ class _MemoryCacheMixin:
         Without one the legacy stage-level per-rank value is retained, so old
         callers and even CP=2 slices are unchanged.
         """
-        if self.paired_sfa or self.rank_token_owners is None:
+        if self.paired_sfa or (self.rank_token_owners is None and int(self.case.runtime.parallel.cp) <= 1):
             return list(self.cache_bytes(tokens, padded=padded))
         case, model, p = self.case, self.case.model, self.case.runtime.parallel
         result = (
@@ -289,7 +337,7 @@ class _MemoryCacheMixin:
         for layer in model.layer_plans:
             components = layer_cache_components(
                 model, layer, p, tokens, capacity_padded=padded,
-                interleave=case.runtime.kv_block_size,
+                interleave=cp_interleave(case.runtime),
                 rank=int(rank), owner_spans=self.rank_token_owners,
                 runtime=case.runtime, query_tokens=self.query_tokens,
             )
@@ -309,7 +357,8 @@ class _MemoryCacheMixin:
                        else 2 * local_kv_heads(draft.num_kv_heads, p.tp) * draft.head_dim)
                 draft_tokens = (math.ceil(tokens / case.runtime.kv_block_size)
                                 * case.runtime.kv_block_size if padded else tokens)
-                rows = owned_token_rows(draft_tokens, self.rank_token_owners, int(rank))
+                rows = (owned_token_rows(draft_tokens, self.rank_token_owners, int(rank))
+                        if self.rank_token_owners is not None else draft_tokens)
                 result[-1] += rows * row * dtype_bytes(model.kv_dtype) * draft.layers
         return result
 
@@ -321,7 +370,7 @@ class _MemoryCacheMixin:
         for layer in model.layer_plans:
             comps = layer_cache_components(
                 model, layer, p, tokens, capacity_padded=False,
-                interleave=self.case.runtime.kv_block_size,
+                interleave=cp_interleave(self.case.runtime),
                 rank=int(rank), owner_spans=self.rank_token_owners,
                 runtime=self.case.runtime, query_tokens=self.query_tokens,
             )
@@ -467,12 +516,17 @@ class _MemoryCacheMixin:
 
     def rank_cache_allocation(self, tokens: int) -> tuple[dict, ...]:
         """Per-physical-rank allocated/valid/page-tail view (same ledger basis)."""
-        if self.rank_token_owners is None:
+        p = self.case.runtime.parallel
+        stage_world = max(1, int(p.dp)) * max(1, int(p.tp)) * max(1, int(p.pcp))
+        rank_count = (max(self.width, stage_world)
+                      if (self.rank_token_owners is None and p.cp_spans_dp)
+                      else self.width)
+        if self.rank_token_owners is None and (self.paired_sfa or int(p.cp) <= 1):
             view = self._allocation_view(tokens, rank=None)
-            return tuple(dict(view) for _ in range(self.width))
+            return tuple(dict(view) for _ in range(rank_count))
         return tuple(
             self._allocation_view(tokens, rank=rank)
-            for rank in range(self.width)
+            for rank in range(rank_count)
         )
 
     def cache_allocation(self, tokens: int, *, include_components: bool = True) -> dict:
@@ -501,7 +555,7 @@ class _MemoryCacheMixin:
         for layer in model.layer_plans:
             comps = layer_cache_components(
                 model, layer, p, tokens, capacity_padded=False,
-                interleave=self.case.runtime.kv_block_size,
+                interleave=cp_interleave(self.case.runtime),
                 runtime=self.case.runtime, query_tokens=self.query_tokens)
             st = self.layer_stage[layer.index]
             result[st] = max(result[st], float(sum(comps.values())))
@@ -530,7 +584,7 @@ class _MemoryCacheMixin:
         for layer in self.case.model.layer_plans:
             components = layer_cache_components(
                 self.case.model, layer, p, tokens, capacity_padded=False,
-                interleave=self.case.runtime.kv_block_size,
+                interleave=cp_interleave(self.case.runtime),
                 runtime=self.case.runtime, query_tokens=self.query_tokens,
             )
             st = self.layer_stage[layer.index]

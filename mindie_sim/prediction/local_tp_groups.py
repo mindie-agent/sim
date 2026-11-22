@@ -9,9 +9,10 @@
   causal cohort.
 
 [Invariants]
-  * The initial supported configuration is global ``tp=1`` and no CP/DCP
-    subdivision.  Widths are positive, bounded by node ranks and ``dp*tp``, and
-    divide the eligible ranks in every actual node/lane.
+  * Local projection TP composes freely with DP, TP, DCP, PCP, and EP.  Widths
+    are positive, bounded by node ranks and ``dp*tp``, divide the eligible ranks
+    in every actual node/lane, and when exceeding global ``tp > 1`` are multiples
+    of ``tp`` so lane-offset groups shard DP-replicated copies cleanly.
   * Every rank belongs to exactly one group per enabled width and no group is
     silently moved across a node boundary.
   * ``R=0``/width-one deployments keep the historical EP partition exactly.
@@ -27,6 +28,7 @@ from __future__ import annotations
 from typing import Any, Iterable, Mapping, Sequence
 
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.runtime_features import LOCAL_TP_AXIS_NAMES
 
 
 ZERO = 0
@@ -38,8 +40,8 @@ LOCAL_TP_AXIS = "local_tp"
 
 def _enabled_widths(parallel: Any) -> tuple[int, ...]:
     return tuple(sorted({
-        int(parallel.o_proj_tp), int(parallel.linear_proj_tp),
-        int(parallel.lm_head_tp),
+        int(getattr(parallel, name, ONE) or ONE)
+        for name in LOCAL_TP_AXIS_NAMES
     } - {ONE}))
 
 
@@ -52,15 +54,17 @@ def _device_map(machine: Any) -> dict[int, Any]:
 
 
 def _stage_rank_buckets(
-    machine: Any, parallel: Any, *, stage: int,
-) -> dict[tuple[int, int, int], list[int]]:
+    machine: Any, parallel: Any, *, stage: int, stride: int = ONE,
+) -> dict[tuple[int, int, int, int], list[int]]:
     from mindie_sim.prediction.topology import Topology
 
     topology = Topology(machine, parallel)
-    buckets: dict[tuple[int, int, int], list[int]] = {}
+    buckets: dict[tuple[int, int, int, int], list[int]] = {}
     ext_dp = max(ONE, int(getattr(parallel, "external_dp", ONE) or ONE))
     internal_replicas = max(ONE, int(parallel.dp) * int(parallel.active_pcp_lanes))
     devices = _device_map(machine)
+    tp = max(ONE, int(parallel.tp))
+    lane_stride = max(ONE, int(stride))
     for ext in range(ext_dp):
         for local_rep in range(internal_replicas):
             replica = ext * internal_replicas + local_rep
@@ -73,21 +77,24 @@ def _stage_rank_buckets(
                 device = devices.get(int(rank))
                 if device is None:
                     raise ModelingError(f"local_tp_rank_undeclared:{rank}")
-                lane = (position // max(ONE, int(parallel.tp))
-                        if int(parallel.pcp) > ONE else ZERO)
-                key = (ext, int(getattr(device, "node", ZERO)), lane)
+                lane = (position // tp if int(parallel.pcp) > ONE else ZERO)
+                tp_offset = (position % tp) % lane_stride if lane_stride > ONE else ZERO
+                key = (ext, int(getattr(device, "node", ZERO)), lane, tp_offset)
                 buckets.setdefault(key, []).append(int(rank))
     return buckets
 
 
 def local_tp_groups(
-    machine: Any, parallel: Any, *, stage: int, width: int,
+    machine: Any, parallel: Any, *, stage: int, width: int, stride: int = ONE,
 ) -> tuple[tuple[int, ...], ...]:
-    """Partition actual external-DP/node/stage/PCP ranks into consecutive groups of width."""
+    """Partition actual external-DP/node/stage/PCP ranks into groups of width."""
     if isinstance(width, bool) or not isinstance(width, int) or width < ONE:
         raise ModelingError(f"local_tp_width_invalid:{width}")
+    if isinstance(stride, bool) or not isinstance(stride, int) or stride < ONE:
+        raise ModelingError(f"local_tp_stride_invalid:{stride}")
     groups: list[tuple[int, ...]] = []
-    for (ext, node, lane), ranks in sorted(_stage_rank_buckets(machine, parallel, stage=stage).items()):
+    buckets = _stage_rank_buckets(machine, parallel, stage=stage, stride=stride)
+    for (ext, node, lane, _tp_off), ranks in sorted(buckets.items()):
         del ext
         ordered = tuple(sorted(ranks))
         if width > len(ordered):
@@ -137,24 +144,35 @@ def local_tp_cohorts(
     edges: list[tuple[int, int]] = []
     ext_dp = max(ONE, int(getattr(parallel, "external_dp", ONE) or ONE))
     replicas = max(ONE, ext_dp * int(parallel.dp) * int(parallel.active_pcp_lanes))
+    cp_spans = bool(getattr(parallel, "cp_spans_dp", False))
+    tp = max(ONE, int(parallel.tp))
     for stage in range(max(ONE, int(parallel.pp))):
         for replica in range(replicas):
             for group in topology.groups("ep", replica, stage):
                 edges.extend((group[ZERO], rank) for rank in group[ONE:])
+            if cp_spans:
+                for group in topology.groups("cp", replica, stage):
+                    edges.extend((group[ZERO], rank) for rank in group[ONE:])
         for width in _enabled_widths(parallel):
             for group in local_tp_groups(machine, parallel, stage=stage, width=width):
                 edges.extend((group[ZERO], rank) for rank in group[ONE:])
+            if tp > ONE and width > tp and width % tp == ZERO:
+                for group in local_tp_groups(
+                        machine, parallel, stage=stage, width=width // tp, stride=tp):
+                    edges.extend((group[ZERO], rank) for rank in group[ONE:])
     return _union_components(_rank_order(machine), edges)
 
 
 def local_tp_replica_cohorts(
     machine: Any, parallel: Any,
 ) -> tuple[tuple[int, ...], ...]:
-    """Projection of physical EP + local-TP connected components onto DP replicas."""
+    """Projection of physical EP + DCP-DP + local-TP connected components onto DP replicas."""
     from mindie_sim.prediction.topology import Topology
 
     topology = Topology(machine, parallel)
     dp = max(ONE, int(parallel.dp))
+    cp_spans = bool(getattr(parallel, "cp_spans_dp", False))
+    tp = max(ONE, int(parallel.tp))
     edges: list[tuple[int, int]] = []
     for stage in range(max(ONE, int(parallel.pp))):
         owner = {int(rank): r for r in range(dp)
@@ -163,10 +181,19 @@ def local_tp_replica_cohorts(
             for group in topology.groups("ep", r, stage):
                 reps = [owner[int(rk)] for rk in group if int(rk) in owner]
                 edges.extend((reps[ZERO], rep) for rep in reps[ONE:])
+            if cp_spans:
+                for group in topology.groups("cp", r, stage):
+                    reps = [owner[int(rk)] for rk in group if int(rk) in owner]
+                    edges.extend((reps[ZERO], rep) for rep in reps[ONE:])
         for width in _enabled_widths(parallel):
             for group in local_tp_groups(machine, parallel, stage=stage, width=width):
                 reps = [owner[int(rk)] for rk in group if int(rk) in owner]
                 edges.extend((reps[ZERO], rep) for rep in reps[ONE:])
+            if tp > ONE and width > tp and width % tp == ZERO:
+                for group in local_tp_groups(
+                        machine, parallel, stage=stage, width=width // tp, stride=tp):
+                    reps = [owner[int(rk)] for rk in group if int(rk) in owner]
+                    edges.extend((reps[ZERO], rep) for rep in reps[ONE:])
     return _union_components(range(dp), edges)
 
 
@@ -177,10 +204,6 @@ def validate_local_projection_tp(case: Any) -> None:
     widths = _enabled_widths(parallel)
     if not widths:
         return
-    if int(parallel.tp) > ONE:
-        raise ModelingError("local_projection_tp_requires_attention_dp")
-    if int(parallel.cp) > ONE or int(parallel.dcp) > ONE:
-        raise ModelingError("local_projection_tp_excludes_context_parallel")
     lane_plane = int(parallel.dp) * int(parallel.tp)
     ranks_per_node = max(ONE, int(getattr(hardware, "ranks_per_node", ONE) or ONE))
     hardware.validate_placement(parallel)
@@ -198,6 +221,7 @@ def validate_local_projection_tp(case: Any) -> None:
     }
     if not expected <= declared:
         raise ModelingError("local_tp_physical_rank_missing")
+    tp = max(ONE, int(parallel.tp))
     for width in widths:
         if width > ranks_per_node:
             raise ModelingError(
@@ -205,6 +229,8 @@ def validate_local_projection_tp(case: Any) -> None:
         if width > lane_plane:
             raise ModelingError(
                 f"local_tp_width_exceeds_lane_plane:{width}>{lane_plane}")
+        if tp > ONE and width > tp and width % tp != ZERO:
+            raise ModelingError(f"local_tp_width_not_multiple_of_tp:{width}%{tp}")
         seen: set[int] = set()
         for stage in range(max(ONE, int(parallel.pp))):
             groups = local_tp_groups(hardware, parallel, stage=stage, width=width)
@@ -226,14 +252,21 @@ def validate_local_projection_tp(case: Any) -> None:
 
 
 def local_tp_spans_dp(parallel: Any) -> bool:
-    """True when an enabled local width can cross a DP replica boundary."""
-    return int(parallel.dp) > ONE and max(_enabled_widths(parallel), default=ONE) > ONE
+    """True when an enabled local width or DP-cohort DCP crosses a DP boundary."""
+    tp = max(ONE, int(getattr(parallel, "tp", ONE) or ONE))
+    if int(parallel.dp) <= ONE:
+        return False
+    if bool(getattr(parallel, "cp_spans_dp", False)):
+        return True
+    return any(width > tp for width in _enabled_widths(parallel))
 
 
 def rank_zero_graph_reuse(parallel: Any, replicas: int, has_device_group: bool) -> bool:
     """Legacy rank-zero graph reuse remains valid only without cross-DP groups."""
     return (int(replicas) > ONE and not has_device_group
-            and not parallel.ep_spans_dp and not local_tp_spans_dp(parallel))
+            and not parallel.ep_spans_dp
+            and not bool(getattr(parallel, "cp_spans_dp", False))
+            and not local_tp_spans_dp(parallel))
 
 
 def expert_tp_groups(
@@ -298,7 +331,10 @@ def collective_requires_cohort(op: Any, topology: Any) -> bool:
         for rank in topology.ranks(replica, stage):
             owner[int(rank)] = replica
     axis = str(metadata.get("group_axis", "tp"))
-    if axis not in {"cp", "etp", "pcp", "ep", "tp", "dp", LOCAL_TP_AXIS}:
+    if axis not in {
+        "cp", "dcp_tp", "dcp_pcp", "dcp_dp", "dcp_a2a",
+        "etp", "pcp", "ep", "tp", "dp", LOCAL_TP_AXIS,
+    }:
         return False
     declared = metadata.get("group_ranks")
     rep = int(metadata.get("replica", ZERO))
