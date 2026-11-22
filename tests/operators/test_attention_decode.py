@@ -530,3 +530,42 @@ def test_padded_latent_attention_producer_writes_the_entire_pack_input():
     assert ops["dcp_output_pack"].mte3_bytes == ops["dcp_lse_merge"].mte2_bytes == 792576
     assert ops["dcp_output_alltoall"].link_bytes == 693504
     assert ops["dcp_lse_merge"].mte3_bytes == 98304
+
+
+def test_cold_mte2_cap_keeps_unsaturated_knee_when_curve_plateaus():
+    from types import SimpleNamespace
+    from mindie_sim.prediction.operators.sharedkv.split_core import p01_cold_mte2_aic_cap
+
+    p01 = SimpleNamespace(
+        status="calibrated",
+        parameters={"mte2_aic_cold_scaling_bps": {"1": 160e9, "8": 1280e9, "16": 2480e9, "32": 2720e9}},
+        metrics={
+            "hbm_read_bytes_per_s": SimpleNamespace(p50=3750e9, certified_upper_capacity=4000e9),
+            "mte2_aic_hit_bytes_per_s_per_core": SimpleNamespace(p50=300e9, certified_upper_capacity=320e9),
+        },
+    )
+    pt = SimpleNamespace(warnings=(), cell=lambda cid: p01)
+    ctx = SimpleNamespace(
+        primitive_table=pt,
+        resource_names={"mte2_aic": "mte2_aic@r0", "hbm": "memory@r0"},
+        rates={"memory@r0": 3185e6},
+    )
+    caps_unsat = p01_cold_mte2_aic_cap(ctx, 8, include_hbm=True)
+    assert caps_unsat["mte2_aic@r0"] == pytest.approx(160e6)
+    assert caps_unsat["memory@r0"] == pytest.approx(160e6)
+    caps_sat = p01_cold_mte2_aic_cap(ctx, 32, include_hbm=True)
+    assert caps_sat["mte2_aic@r0"] == pytest.approx(2480e9 / 16.0 / 1000.0)
+    assert caps_sat["memory@r0"] == pytest.approx(2480e9 / 16.0 / 1000.0)
+
+
+def test_fia_weighted_contiguous_partition_balances_ragged_kv_tails():
+    from mindie_sim.prediction.operators.attention._fia import _FiaRect, _weighted_contiguous_rect_partition
+
+    rects = tuple(
+        _FiaRect(seq, 4, head, 65536 if seq == 7 else 512, 0, 0, 256 if seq == 7 else 2)
+        for seq in range(8) for head in range(8)
+    )
+    slices = _weighted_contiguous_rect_partition(rects, 32)
+    long_per_core = [sum(1 for i in core_idxs if rects[i].kv == 65536) for core_idxs in slices]
+    assert sum(len(s) for s in slices) == len(rects)
+    assert max(long_per_core) == 1

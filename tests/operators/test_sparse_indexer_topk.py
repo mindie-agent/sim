@@ -579,3 +579,18 @@ def test_native_pool_indexer_charges_cold_scan_and_fused_score_work():
     assert not any(op.recipe in {"index_pool_scores", "index_pool_topk"} for op in ops)
     topk = next(op for op in ops if op.recipe == "index_topk")
     assert topk.mte2_bytes > 0.0
+
+
+def test_arch22_block_run_assignment_tracks_exact_group_owner_counts():
+    from mindie_sim.prediction.operators.sharedkv.l0_sync import p10_sort_to_alu_op_ratio
+    from mindie_sim.prediction.operators.sharedkv.sparse_indexer_v1 import _assign_block_runs
+
+    straggler = [(gid, 1, 512) for gid in range(7)] + [(7, 128, 512)]
+    _, _, _, owners_20 = _assign_block_runs(straggler, 20, 8)
+    assert owners_20[:7] == (1,) * 7 and owners_20[7] == 19
+    _, _, _, owners_24 = _assign_block_runs(straggler, 24, 8)
+    assert owners_24[7] == 23
+    uniform = [(gid, 17, 512) for gid in range(8)]
+    _, _, _, u_owners = _assign_block_runs(uniform, 20, 8)
+    assert min(u_owners) >= 3 and max(u_owners) == 4
+    assert p10_sort_to_alu_op_ratio(SimpleNamespace(primitive_table=None)) == 1.0

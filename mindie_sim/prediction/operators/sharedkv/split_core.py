@@ -472,11 +472,11 @@ def compact_arch35_preload_s2(
     def _split(ti: int):
         mm1, vec1, mm2, vec2 = [], [], [], []
         for p in s2_phases_fn(ti):
-            if p.name.startswith(("k_panel_", "qk_panel_")) or p.name in {"block_table", "score_fixpipe"}:
+            if p.name.startswith(("k_panel_", "qk_panel_", "k_page_", "k_nd2nz_")) or p.name in {"block_table", "score_fixpipe"}:
                 mm1.append(p)
             elif p.name in {"online_softmax", "probability_transfer"}:
                 vec1.append(p)
-            elif p.name.startswith(("v_panel_", "pv_panel_")) or p.name == "pv_fixpipe":
+            elif p.name.startswith(("v_panel_", "pv_panel_", "v_page_", "v_nd2nz_")) or p.name == "pv_fixpipe":
                 mm2.append(p)
             else:
                 vec2.append(p)
@@ -484,7 +484,7 @@ def compact_arch35_preload_s2(
 
     def cycle(c: int):
         stages = []
-        last_k = last_qk = last_fix = None
+        last_qk = last_fix = last_k_page = None
         if 0 <= c < n_tiles:
             mm1, _, _, _ = _split(c)
             for p in mm1:
@@ -496,14 +496,18 @@ def compact_arch35_preload_s2(
                     elif p.name == "score_fixpipe":
                         prev = ("pv_fixpipe",)
                     elif p.name.startswith("k_panel_0"):
+                        prev = ("qk_panel_0",)
+                    elif p.name == "k_nd2nz_issue":
                         prev = ("v_panel_0_load",)
+                    elif p.name == "k_page_cmd":
+                        prev = ("v_page_cmd",)
                 stages.append(_replace(st, previous=prev))
-                if p.name.startswith("k_panel_"):
-                    last_k = st.name
-                elif p.name.startswith("qk_panel_"):
+                if p.name.startswith("qk_panel_"):
                     last_qk = st.name
                 elif p.name == "score_fixpipe":
                     last_fix = st.name
+                elif p.name == "k_page_cmd":
+                    last_k_page = st.name
         if 0 <= c - 1 < n_tiles:
             _, vec1, _, _ = _split(c - 1)
             for p in vec1:
@@ -516,13 +520,20 @@ def compact_arch35_preload_s2(
                 stages.append(st)
         if 0 <= c - 2 < n_tiles:
             _, _, mm2, _ = _split(c - 2)
+            has_v_issue = any(p.name == "v_nd2nz_issue" for p in mm2)
+            has_v_page = any(p.name == "v_page_cmd" for p in mm2)
             for idx_p, p in enumerate(mm2):
                 st = lower_phase(p, place)
-                if p.name.startswith("v_panel_0"):
-                    st = _replace(st, after=(last_k,) if last_k else (), previous=())
+                if p.name == "v_nd2nz_issue":
+                    st = _replace(st, after=("k_panel_0_load",) if (0 <= c < n_tiles) else (), previous=())
+                elif p.name == "v_page_cmd":
+                    st = _replace(st, after=(last_k_page,) if last_k_page else (), previous=())
+                elif p.name.startswith("v_panel_0"):
+                    after_v = ("v_nd2nz_issue",) if has_v_issue else ()
+                    st = _replace(st, after=after_v, previous=("pv_panel_0",) if c >= preload_slots else ())
                 elif p.name.startswith("pv_panel_0"):
-                    st = _replace(st, after=tuple(x for x in (last_qk, "v_panel_0_load") if x),
-                                  previous=("probability_transfer",))
+                    pv_deps = tuple(x for x in (last_qk, "v_panel_0_load", "v_page_cmd" if has_v_page else None) if x)
+                    st = _replace(st, after=pv_deps, previous=("probability_transfer",))
                 elif p.name == "pv_fixpipe":
                     st = _replace(st, after=tuple(x for x in (last_fix, mm2[idx_p - 1].name) if x), previous=())
                 stages.append(st)
@@ -543,12 +554,13 @@ def compact_arch35_preload_s2(
 
 MS_PER_SECOND_SC = 1000.0
 P01_CAPACITY_EPS = 1.0 + 1e-6
+P01_HBM_SAT_FRAC = 0.96
 
 
-def _p01_active_core_bps(context, active_owners: int, *, warm: bool = False) -> float | None:
-    """Interpolate P01 active-core MTE2-AIC scaling curve (bytes/s) within certified capacity."""
+def _p01_cold_curve_info(context, *, warm: bool = False) -> tuple[list[tuple[int, float]], float] | None:
+    """Return validated (sorted_points, hbm_read_p50_bps) from P01_datacopy."""
     pt = getattr(context, "primitive_table", None)
-    if pt is None or active_owners < 1:
+    if pt is None:
         return None
     if any("silicon_profile_conflict" in str(w) for w in (getattr(pt, "warnings", ()) or ())):
         return None
@@ -570,6 +582,7 @@ def _p01_active_core_bps(context, active_owners: int, *, warm: bool = False) -> 
         return None
     hbm_band = cell.metrics.get("hbm_read_bytes_per_s")
     hbm_cap = float(hbm_band.certified_upper_capacity) if (hbm_band and hbm_band.certified_upper_capacity) else 0.0
+    hbm_read_p50 = float(hbm_band.p50) if (hbm_band and hbm_band.p50) else 0.0
     mte2_band = cell.metrics.get("mte2_aic_hit_bytes_per_s_per_core")
     mte2_cap = float(mte2_band.certified_upper_capacity) if (mte2_band and mte2_band.certified_upper_capacity) else 0.0
     for k_cores, rate in pts:
@@ -577,16 +590,35 @@ def _p01_active_core_bps(context, active_owners: int, *, warm: bool = False) -> 
             return None
         if mte2_cap > 0.0 and rate > k_cores * mte2_cap * P01_CAPACITY_EPS:
             return None
+    return pts, hbm_read_p50
+
+
+def _p01_interp_bps(pts: list[tuple[int, float]], active_owners: int) -> float:
     if active_owners <= pts[0][0]:
-        val = pts[0][1] * (active_owners / pts[0][0])
-    else:
-        val = pts[-1][1]
-        for i in range(len(pts) - 1):
-            c0, r0 = pts[i]
-            c1, r1 = pts[i + 1]
-            if c0 <= active_owners <= c1:
-                val = r0 + (r1 - r0) * (active_owners - c0) / max(1, c1 - c0)
-                break
+        return pts[0][1] * (active_owners / pts[0][0])
+    val = pts[-1][1]
+    for i in range(len(pts) - 1):
+        c0, r0 = pts[i]
+        c1, r1 = pts[i + 1]
+        if c0 <= active_owners <= c1:
+            return r0 + (r1 - r0) * (active_owners - c0) / max(1, c1 - c0)
+    return val
+
+
+def _p01_active_core_bps(context, active_owners: int, *, warm: bool = False) -> float | None:
+    """Interpolate P01 active-core MTE2-AIC scaling curve (bytes/s) within certified capacity."""
+    if active_owners < 1:
+        return None
+    info = _p01_cold_curve_info(context, warm=warm)
+    if info is None:
+        return None
+    pts, _ = info
+    val = _p01_interp_bps(pts, active_owners)
+    cell = context.primitive_table.cell("P01_datacopy")
+    hbm_band = cell.metrics.get("hbm_read_bytes_per_s")
+    hbm_cap = float(hbm_band.certified_upper_capacity) if (hbm_band and hbm_band.certified_upper_capacity) else 0.0
+    mte2_band = cell.metrics.get("mte2_aic_hit_bytes_per_s_per_core")
+    mte2_cap = float(mte2_band.certified_upper_capacity) if (mte2_band and mte2_band.certified_upper_capacity) else 0.0
     if not warm and hbm_cap > 0.0:
         val = min(val, hbm_cap)
     if mte2_cap > 0.0:
@@ -599,25 +631,39 @@ def p01_cold_mte2_aic_cap(
 ) -> dict[str, float]:
     """Per-owner MTE2-AIC (and optional HBM) cold DRAM cap (bytes/ms) from P01.
 
-    Only binds when ``active_owners`` cold MTE2-AIC supply is strictly below the
-    die HBM ceiling; once full-die HBM saturates, the shared HBM resource enforces
-    work-conserving sharing without artificially throttling imbalanced tail waves.
+    Per-core MTE2-AIC retains its unsaturated cold pipe rate even after full-die
+    HBM saturates (so strided/burst-amplified transfers do not revert to the L2-hit
+    rate), while HBM cap binds only when ``active_owners`` supply is below die HBM.
     """
+    if active_owners < 1:
+        return {}
+    info = _p01_cold_curve_info(context, warm=False)
+    if info is None:
+        return {}
+    pts, hbm_read_p50 = info
     total_bps = _p01_active_core_bps(context, active_owners, warm=False)
     if total_bps is None:
         return {}
     hbm_name = context.resource_names.get("hbm")
     die_hbm_bps = float(context.rates.get(hbm_name, 0.0)) * MS_PER_SECOND_SC if hbm_name else 0.0
-    if die_hbm_bps > 0.0 and total_bps >= die_hbm_bps:
-        return {}
-    per_owner = total_bps / (MS_PER_SECOND_SC * float(active_owners))
     caps: dict[str, float] = {}
+    curve_max_bps = max(r for _, r in pts)
+    sat_ref = curve_max_bps if curve_max_bps > 0.0 else (hbm_read_p50 if hbm_read_p50 > 0.0 else die_hbm_bps)
+    is_saturated = sat_ref > 0.0 and total_bps >= sat_ref * P01_HBM_SAT_FRAC
+    if is_saturated:
+        unsat = [(k, r) for k, r in pts if r < sat_ref * P01_HBM_SAT_FRAC]
+        per_core_bps = (unsat[-1][1] / float(unsat[-1][0])) if unsat else (total_bps / float(active_owners))
+    else:
+        per_core_bps = total_bps / float(active_owners)
     if not hbm_only:
         mte2_name = context.resource_names.get("mte2_aic")
         if mte2_name:
-            caps[mte2_name] = per_owner
-    if (include_hbm or hbm_only) and hbm_name:
-        caps[hbm_name] = per_owner
+            # When total_bps saturates the AIC cold DRAM plateau, keep the per-core cold MTE2
+            # rate at the highest unsaturated knee rather than dividing saturated HBM by active_owners.
+            caps[mte2_name] = per_core_bps / MS_PER_SECOND_SC
+    if (include_hbm or hbm_only) and hbm_name and (die_hbm_bps <= 0.0 or total_bps < die_hbm_bps):
+        hbm_per_core = (total_bps / float(active_owners)) if hbm_only else per_core_bps
+        caps[hbm_name] = hbm_per_core / MS_PER_SECOND_SC
     return caps
 
 
