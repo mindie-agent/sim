@@ -564,7 +564,7 @@ def test_chunk32_requires_exact_primitive_for_each_recurrence():
     op = STATE.make_op({"lengths": (512,), "heads": 1, "key_heads": 1})
     with pytest.raises(ModelingError, match=pid):
         STATE.build(op, Geometry(1, {"vector": 2})).program(RecipeContext(op, {}, {}, {}, 1))
-    for table in (None, shipped, replace(shipped, primitives={**cells, pid: mode2}),
+    for table in (None, replace(shipped, primitives={**cells, pid: replace(cells[pid], status="unmeasured", metrics={})}), replace(shipped, primitives={**cells, pid: mode2}),
                   replace(shipped, primitives={**cells, pid: replace(mode2, metrics={
                       **mode2.metrics, metric: UncertaintyBand(140, bound_kind="latency_lower")})})):
         with pytest.raises(ModelingError, match=pid):
@@ -573,7 +573,7 @@ def test_chunk32_requires_exact_primitive_for_each_recurrence():
     duration, trace = run(replace(shipped, primitives=cells), 512)
     waits = [row["end_ms"] - row["start_ms"] for row in trace if row["task"].endswith(":recurrence_sync")]
     assert waits == pytest.approx([140e-6] * 16)
-    cells["P12_intracore_flag"] = replace(flag, metrics={**flag.metrics, "flag_ns": band(100)})
+    cells["P12_intracore_flag"] = replace(flag, metrics={**flag.metrics, "flag_ns": band((flag.band("flag_ns").p50 or 0.0) + 100)})
     assert run(replace(shipped, primitives=cells), 512)[0] - duration == pytest.approx(100e-6)
 
 def test_replay_lowers_mixed_gdn_and_preserves_ragged_attention_per_replica(monkeypatch):

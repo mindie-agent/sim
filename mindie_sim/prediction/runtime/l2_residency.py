@@ -813,16 +813,19 @@ class AdmissionMemoryView:
 
 def _burst_service_bytes(plan: AddressRunPlan, sectors: int, run: AddressRun, rules: Sequence[BurstTurnRule],
                         *, width: int | None = None, stride: int | None = None) -> float:
-    if rules:
-        return sectors / burst_turnaround_efficiency(
-            run.row_bytes if width is None else width,
-            run.stride_bytes if stride is None else stride, rules,
-        )
-    granule = 0
+    granule = 0.0
     if run.layout in {"scatter", "scattered", "gather", "indexed"}:
-        granule = plan.hbm_scatter_row_open_bytes
+        granule = float(plan.hbm_scatter_row_open_bytes)
     if run.stride_bytes > run.row_bytes:
-        granule = max(granule, plan.hbm_burst_granule_bytes)
+        granule = max(granule, float(plan.hbm_burst_granule_bytes))
+    if rules:
+        w = run.row_bytes if width is None else width
+        s = run.stride_bytes if stride is None else stride
+        eff = burst_turnaround_efficiency(w, s, rules)
+        if granule <= 0.0:
+            return sectors / eff
+        if eff < 1.0:
+            granule = max(granule, w / eff)
     if granule <= run.row_bytes:
         return float(sectors)
     # Sector fills may already pay for part or all of the service granule.

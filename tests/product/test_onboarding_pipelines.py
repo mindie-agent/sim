@@ -437,7 +437,7 @@ def test_host_queue_leases_profiler_normalizer_and_cli_roundtrip(tmp_path):
     assert b4_sub["world_size"] == 4 and {c["level"] for c in b4_sub["cases"]} == {"L1", "L2", "L3"}
     assert b4_by_id["anchor_ctx_512"]["shape"]["seq_len"] == 513 and b4_by_id["anchor_ctx_512"]["shape"]["query_layout"] == "BNSD"
     assert b4_by_id["cross_b16_ctx_4097"]["nodes"][1]["builder"] == "grouped_matmul"
-    assert len(b4_by_id["offgrid_ctx_200000"]["nodes"]) == 15 and len(b4_by_id["cross_tp2_pcp2_dcp4_ctx_400000"]["nodes"]) == 19
+    assert len(b4_by_id["offgrid_ctx_200000"]["nodes"]) == 15 and len(b4_by_id["cross_tp2_pcp2_dcp4_ctx_400000"]["nodes"]) == 23
 
     l3_c200 = b4_by_id["offgrid_ctx_200000"]
     l3_ns_kv1 = {

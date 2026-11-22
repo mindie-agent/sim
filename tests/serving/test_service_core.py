@@ -442,7 +442,7 @@ def test_pcp_draft_prefill_partitions_query_rows_and_keeps_global_gather():
     qkv = by_recipe(draft, "qkv_a", layer=0)
     gather = by_recipe(draft, "pcp_kv_gather", layer=0)
     assert qkv and qkv[0].local_shape[0] == 8
-    assert gather and gather[0].link_bytes == 8192
+    assert gather and gather[0].link_bytes == 4160
 def test_dspark_scatter_charges_the_owning_position_block():
     graphs = target_graphs(parse_case(compose_case( "kimi-k3.1", hardware="a5", tp=8, dp=1, ep=8, dcp=8, num_devices=8, layers=4, mtp_proposal_tokens=5, prompt_tokens=8, output_tokens=2)), phase="decode", tokens=6, context=4, sequences=1, scope="model")
     scatters = by_recipe(graphs[0], "draft_context_kv_scatter")

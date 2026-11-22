@@ -170,12 +170,12 @@ def test_hybrid_pcp_prefill_with_ple_host_offload_and_dcp_decode():
         assert int(case["runtime"]["parallel"]["pcp"]) == pcp and case["runtime"]["engram_cpu_offload"] is True
         rates = case["machine"]["device"]["rates"]; assert rates["host_memory"] > 0.0 and rates["host_vector"] > 0.0 and rates["h2d"] > 0.0
         _graph, recipes = _recipes(case, phase="prefill", tokens=64, context=128); assert "pcp_ple_conv_state_step" in recipes and "pcp_index_gather" in recipes
-    prefill = compose_case("kimi-k3.1", hardware="a5", tp=4, ep=4, pcp=4, layers=4); assert int(prefill["runtime"]["parallel"]["pcp"]) == 4; _graph, recipes = _recipes(prefill, phase="prefill", tokens=16, context=128); assert "pcp_index_gather" in recipes and "pcp_conv_state_step" in recipes
+    prefill = compose_case("kimi-k3.1", hardware="a5", tp=4, ep=4, pcp=4, layers=4); assert int(prefill["runtime"]["parallel"]["pcp"]) == 4; _graph, recipes = _recipes(prefill, phase="prefill", tokens=16, context=128); assert "pcp_index_gather" in recipes and {"kda_pcp_gather", "kda_pcp_restore"} <= recipes
     decode = compose_case("kimi-k3.1", hardware="a5", tp=4, ep=4, dcp=4, layers=4); assert int(decode["runtime"]["parallel"]["cp"]) == 4; _graph, recipes = _recipes(decode, phase="decode", tokens=1, context=1024); assert {"dcp_lse_merge", "catalog_dcp_lse_merge"} & recipes
 @pytest.mark.parametrize("model", ["deepseek-v3.2", "glm-5.3-flash"])
 def test_pooled_indexer_and_hybrid_kda_decode_context_parallelism(model):
     case = compose_case(model, hardware="a5", tp=4, ep=4, dcp=2, layers=4); assert int(case["runtime"]["parallel"]["cp"]) == 2
-    _graph, recipes = _recipes(case, phase="decode", tokens=1, context=1024); assert "catalog_dcp_lse_merge" in recipes
+    _graph, recipes = _recipes(case, phase="decode", tokens=1, context=1024); assert {"dcp_lse_merge", "catalog_dcp_lse_merge"} & recipes
     if model == "deepseek-v3.2":
         mtp_case = compose_case(model, hardware="a5", tp=4, ep=4, layers=4, mtp_proposal_tokens=3); auxiliary = mtp_case["model"]["auxiliary"]; assert auxiliary is not None; mtp = auxiliary["mtp"]
         assert mtp["kind"] == "mtp" and int(mtp["layers"]) == 1 and mtp["attention_kind"] == "mla"

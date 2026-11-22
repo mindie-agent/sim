@@ -22,7 +22,6 @@ from _support.hardware import sku_case
 from _support.operator_cases import mqsmla_attention, mqsmla_case
 from mindie_sim import compose_case, graph_costs, target_graphs
 from mindie_sim.backends.ascend import materialize
-from mindie_sim.catalog.attention_common import dcp_partial_merge_ops
 from mindie_sim.catalog.ops import gemm_op
 from mindie_sim.catalog.types import QuantSpec
 from mindie_sim.model_catalog import load_model

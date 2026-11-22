@@ -14,7 +14,6 @@ from functools import lru_cache
 import math
 
 from mindie_sim.schema.common import dtype_bytes
-from ..sharedkv.split_core import _p01_active_core_bps
 from .matrix_cycle import matrix_cycle
 from .matrix_epilogue import MatrixEpilogue
 from .matrix_mapping import (MappedMatmul, footprint, matrix_geometry,
@@ -26,28 +25,8 @@ from mindie_sim.prediction.program import (KernelProgram, ParallelProgram, Pipel
 
 DEFAULT_SPLIT_K = 1
 MS_PER_SECOND = 1000
-FP32_BYTES = 4
-SPLIT_K_MIN_M = 64
-ARCH35_L0C_BYTES = 256 * 1024
-
-
-def _resolve_single_m_hbm_cap(context, geometry, dram_rate, hbm_read_scale):
-    """Per-owner cold HBM or warm MTE2-AIC cap for single-M-tile matmul waves."""
-    names = context.resource_names
-    if geometry.nm != 1 or dram_rate is None:
-        return {}
-    active_owners = max(1, min(int(context.core_count), int(geometry.tiles)))
-    if "hbm" in names and hbm_read_scale >= 1.0:
-        p01_cold = _p01_active_core_bps(context, active_owners, warm=False)
-        if p01_cold is not None:
-            return {names["hbm"]: min(dram_rate, p01_cold) / (MS_PER_SECOND * active_owners)}
-        return {names["hbm"]: dram_rate / (MS_PER_SECOND * max(1, int(context.core_count)))}
-    if hbm_read_scale < 1.0:
-        p01_warm = _p01_active_core_bps(context, active_owners, warm=True)
-        mte2_key = names.get("mte2_aic", names.get("mte2"))
-        if p01_warm is not None and mte2_key:
-            return {mte2_key: p01_warm / (MS_PER_SECOND * active_owners)}
-    return {}
+#: Minimum L0C accumulator capacity (256 KiB) required for implicit Split-K lowering.
+SPLIT_K_MIN_L0C_BYTES = 256 * 1024
 
 
 @lru_cache(maxsize=1024)
@@ -84,7 +63,10 @@ def _make_tile_builder(context, recipe, geometry, dram_rate, output, directional
         max(0.0, 1.0 - min(admitted_l2_hit, full_hbm_reads) / full_hbm_reads)
         if (admitted_l2_hit > 0.0 and full_hbm_reads > 0.0) else 1.0
     )
-    single_m_hbm_cap = _resolve_single_m_hbm_cap(context, geometry, dram_rate, hbm_read_scale)
+    single_m_hbm_cap = {}
+    if nm == 1 and dram_rate is not None and "hbm" in names:
+        single_m_hbm_cap[names["hbm"]] = (
+            dram_rate / (MS_PER_SECOND * max(1, int(context.core_count))))
     operand_read = read_role(names)
     scale_read = read_role(names, aiv=0)
     width = dtype_bytes(meta.get("compute_format", op.dtype or "bf16"))
@@ -307,11 +289,8 @@ class SteadyMatmul(MappedMatmul):
                 "geometry": geometry.to_dict(),
             })
         dram_rate = context.service_rate("mte2_aic_dram")
-        l0c_cap = int((context.pool_capacities or {}).get("l0c", 0))
-        tile_l0c = int(recipe.tile_m) * int(recipe.tile_n) * FP32_BYTES
-        m_dim = int(geometry.m_per_group)
-        supports_implicit_splitk = l0c_cap >= tile_l0c and (
-            l0c_cap >= ARCH35_L0C_BYTES or m_dim >= SPLIT_K_MIN_M
+        supports_implicit_splitk = (
+            int((context.pool_capacities or {}).get("l0c", 0)) >= SPLIT_K_MIN_L0C_BYTES
         )
         if (getattr(recipe, "k_splits", DEFAULT_SPLIT_K) > DEFAULT_SPLIT_K
                 and dram_rate is not None and supports_implicit_splitk):
@@ -488,7 +467,7 @@ class SteadyMatmul(MappedMatmul):
             merged = None
             if len(clones) == len(members):
                 merged = merge_programs(
-                    clones, scale_coupled_cohort=True)
+                    clones, scale_coupled_cohort=(tiles > 1))
             if merged is not None:
                 owners.append(merged)
             else:

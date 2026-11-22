@@ -516,7 +516,7 @@ def test_packed_compressor_feeds_the_indexer_from_its_latent_port():
 def test_pcp_group_completions_follow_owned_query_ranges(ranges, completed):
     assert owned_completed_rows(SimpleNamespace(context=0, q_len=2, query_ranges=ranges), 4) == completed
 PCP_CASES = (
-    ('deepseek-v4-flash-0731', 3, 4, {}, 'compressed_store', 'pcp_compressed_kv_gather', 1024),
+    ('deepseek-v4-flash-0731', 3, 4, {}, 'compressed_store', 'pcp_hidden_gather', 1024),
     ('glm-5.3-flash', 4, 8, {'quant': {'name': 'C8', 'kv_dtype': 'fp8_e4m3'}}, 'kv_store', 'pcp_kv_gather', 2080),
 )
 @pytest.mark.parametrize('model,layers,tokens,options,store,gather,expected', PCP_CASES)
@@ -597,4 +597,4 @@ def test_sparse_gqa_topk_writes_int32_ids_and_attention_reads_them():
     assert (topk.mte2_bytes, topk.mte3_bytes) == pytest.approx((8193 * 4, valid * selected * 4))
     kv_sweeps = dict(attention.metadata)['kv_sweeps']
     assert attention.mte2_bytes == pytest.approx(
-        kv_sweeps * kv_heads * width * 2 * 2 + valid * heads * width * 2 + valid * selected * 4)
+        kv_sweeps * cache_format(case.model, 'kv').row_bytes(kv_heads * width * 2) + valid * heads * width * 2 + valid * selected * 4)
