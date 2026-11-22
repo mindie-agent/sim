@@ -146,15 +146,19 @@ def test_hardware_scaling_roundtrip_and_independent_graph_costs():
         assert same(net["graph_duration_ms"], _decode_costs(scaled_case, 4)["duration_ms"], EXACT)
 def test_sla_solver_exact_threshold_and_speculative_tokens():
     raw = _moe_case(layers=4); raw["machine"]["device"]["rates"]["hbm"] = 4e11; parsed = parse_case(raw)
-    report = solve_sla_sizing(parsed, sla_ms=1.25, context=4096, tokens_per_seq=1, max_sequences_per_dp=8, scope="body", scenarios=[{"id": "2x_hbm", "label": "2x HBM", "hbm_bw_scale": 2.0}, {"id": "baseline", "label": "1x Baseline", "hbm_bw_scale": 1.0}, {"id": "2x_compute", "label": "2x Compute", "cube_flops_scale": 2.0, "vector_ops_scale": 2.0}])
+    b3_ms = _decode_costs(parsed, 3)["duration_ms"]
+    b4_ms = _decode_costs(parsed, 4)["duration_ms"]
+    assert b3_ms < b4_ms
+    sla_ms = 0.5 * (b3_ms + b4_ms)
+    report = solve_sla_sizing(parsed, sla_ms=sla_ms, context=4096, tokens_per_seq=1, max_sequences_per_dp=8, scope="body", scenarios=[{"id": "2x_hbm", "label": "2x HBM", "hbm_bw_scale": 2.0}, {"id": "baseline", "label": "1x Baseline", "hbm_bw_scale": 1.0}, {"id": "2x_compute", "label": "2x Compute", "cube_flops_scale": 2.0, "vector_ops_scale": 2.0}])
     rows = {row["scenario_id"]: row for row in report["scenarios"]}; base, faster = rows["baseline"], rows["2x_hbm"]
     assert same(base["tps_gain_vs_baseline"], 1.0) and same(base["tps_feasible_gain_vs_baseline"], 1.0)
-    assert 1 < base["b_sla"] < 8 and base["step_ms_at_sla"] <= 1.25 and base["step_ms_feasible"] <= 1.25
+    assert base["b_sla"] == 3 and base["step_ms_at_sla"] <= sla_ms and base["step_ms_feasible"] <= sla_ms
     assert base["total_feasible_concurrency"] == base["b_feasible"] * parsed.runtime.parallel.dp
     assert faster["b_sla"] > base["b_sla"] and faster["tps_gain_vs_baseline"] > 1.0
     at_sla = _decode_costs(parsed, base["b_sla"])
-    assert same(base["step_ms_at_sla"], at_sla["duration_ms"], EXACT) and at_sla["duration_ms"] <= 1.25
-    assert _decode_costs(parsed, base["b_sla"] + 1)["duration_ms"] > 1.25
+    assert same(base["step_ms_at_sla"], at_sla["duration_ms"], EXACT) and at_sla["duration_ms"] <= sla_ms
+    assert _decode_costs(parsed, base["b_sla"] + 1)["duration_ms"] > sla_ms
     speculative = _moe_case(layers=2)
     speculative["runtime"]["metadata"] = {"speculative": {"draft_len": 3, "acceptance": [0.7, 0.7, 0.7], "acceptance_mode": "conditional"}}
     resolved = solve_sla_sizing(speculative, sla_ms=30.0, context=4096, max_sequences_per_dp=2, scope="body", scenarios=[{"id": "baseline"}])

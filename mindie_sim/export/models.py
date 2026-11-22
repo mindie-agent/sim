@@ -19,9 +19,8 @@ from typing import Any
 
 from mindie_sim.prediction.results import FusedPipelineDescriptor, OpOccurrence
 
-#: Export bundle schema version.
+#: Export bundle schema version and binary/decimal unit divisors.
 EXPORT_BUNDLE_SCHEMA = "mindie-sim.export-bundle/2"
-#: Binary GiB, MiB, KiB, and decimal TB divisors.
 GIB_BYTES = 1024 * 1024 * 1024
 MIB_BYTES = 1024 * 1024
 KIB_BYTES = 1024
@@ -798,3 +797,4 @@ class ExportBundle:
     cluster_concurrency: int = 0
     deployment_total_dies: int = 0
     pd_pool_summary: Mapping[str, Any] | None = None
+    calibration_basis: Mapping[str, Any] | None = None

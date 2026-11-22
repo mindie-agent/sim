@@ -1619,6 +1619,13 @@ def build_agent_brief(
     }
     if after.pd_pool_summary:
         scen_block["pd_pool"] = dict(after.pd_pool_summary)
+    if after.calibration_basis:
+        scen_block["calibration_basis"] = {
+            "mode": after.calibration_basis.get("mode"),
+            "calibrated": bool(after.calibration_basis.get("calibrated")),
+            "pt_sku": after.calibration_basis.get("primitive_table_sku"),
+            "cann": after.calibration_basis.get("cann_version"),
+        }
     brief: dict[str, Any] = {
         "schema": AGENT_BRIEF_SCHEMA,
         "scenario_and_parallelism": scen_block,

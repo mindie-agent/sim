@@ -1628,6 +1628,7 @@ def build_export_bundle(
         handoff_tpot_ms=handoff_tpot_ms,
         deployment_total_dies=deployment_total_dies,
         pd_pool_summary=pd_pool_summary,
+        rebound_primitive_table=rebound_primitive_table,
     )
 
 
@@ -1743,6 +1744,7 @@ def _assemble_export_bundle(
     handoff_tpot_ms: float | None = None,
     deployment_total_dies: int | None = None,
     pd_pool_summary: Mapping[str, Any] | None = None,
+    rebound_primitive_table: Any = None,
 ) -> ExportBundle:
     exposed_total_us = sum(r.exposed_dur_us * r.repeat_count for r in final_rows)
     if use_archetype_dedup or target_envelope_applied:
@@ -1835,6 +1837,12 @@ def _assemble_export_bundle(
         else (eff_pd_pool.get("used_dies") if eff_pd_pool else meta_dict.get("deployment_total_dies"))
     )
     eff_dep_dies = max(0, int(raw_dep_dies or 0))
+    from mindie_sim.prediction.efficiency.cost import CostModel
+
+    cal_basis = CostModel(
+        eff_case,
+        primitive_table=(None if rebound_primitive_table is False else rebound_primitive_table),
+    ).summary().get("calibration_basis")
     return ExportBundle(
         schema=EXPORT_BUNDLE_SCHEMA, model_name=str(parsed.model.name),
         hardware_sku=str(parsed.machine.sku or parsed.machine.name),
@@ -1873,6 +1881,7 @@ def _assemble_export_bundle(
         cluster_concurrency=eff_cluster_conc,
         deployment_total_dies=eff_dep_dies,
         pd_pool_summary=eff_pd_pool,
+        calibration_basis=cal_basis,
         **scen,
     )
 
