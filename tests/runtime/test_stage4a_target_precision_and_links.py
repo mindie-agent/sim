@@ -23,13 +23,16 @@ from mindie_sim.compose import compose_case
 from mindie_sim.export.bundle import StepRequest, build_export_bundle
 from mindie_sim.optimization import TargetOpNode, solve_target_graph
 from mindie_sim.optimization.causal_tail import (
+    _active_comm_width,
     _directional_hbm_bus_params,
     _effective_die_supply,
     _node_physical_demand_and_placement,
+    _resolve_die_link_supply_bps,
     schedule_target_graph_on_engine,
     weighted_step_span_us,
 )
 from mindie_sim.optimization.dual_bound import build_dual_inputs_from_scenario, certify_lower_bound
+from mindie_sim.optimization.kernel_synthesis import _extract_hardware_supply
 from mindie_sim.prediction.efficiency.peaks import extract_hardware_peaks, parse_case
 from mindie_sim.prediction.evaluation import EvaluationContext
 from mindie_sim.prediction.execution.layer_runs import execute_native_cohort_graph
@@ -449,3 +452,31 @@ def test_hbm_sustained_cap_and_multinode_link_supply_eliminate_lower_bound_inver
             bundle = build_export_bundle(raw_case, request=req, apply_target_envelope=True)
             assert all(op.dur_us + NON_REGRESSION_TOL_US >= op.l_star_lean_us for op in bundle.operators)
             assert bundle.step_span_us + NON_REGRESSION_TOL_US >= bundle.step_l_star_lean_us
+
+
+def test_formula_kernel_link_supply_matches_per_pair_mesh_without_inversion() -> None:
+    """Scale formula-kernel per_pair link supply to match causal_tail and avoid L* inversion."""
+    expected_bps = PER_PAIR_SINGLE_LINK_GBPS * BYTES_PER_GB * float(TP_OCT - 1)
+    req = StepRequest(phase="prefill", tokens=PREFILL_TOKENS, context=0, sequences=1, scope="body")
+    for model_name in ("deepseek-v3", "deepseek-r1", "deepseek-v3.2"):
+        raw_case = compose_case(
+            model_name, GEN5_DT_SKU, tp=TP_OCT, ep=TP_OCT, dp=1,
+            prompt_tokens=PREFILL_TOKENS, output_tokens=2, mtp_proposal_tokens=1,
+        )
+        parsed = parse_case(raw_case)
+        die0 = parsed.machine.dies[0]
+        _, _, _, _, _, _, synth_link_bps, _ = _extract_hardware_supply(parsed)
+        ct_link_bps = _resolve_die_link_supply_bps(
+            int(die0.rank),
+            parsed.machine.links,
+            active_width=_active_comm_width(parsed),
+            ranks_per_node=parsed.machine.ranks_per_node,
+            dies_per_package=parsed.machine.dies_per_package,
+            fallback_bps=float(dict(die0.rates).get("link") or 0.0),
+        )
+        assert synth_link_bps == pytest.approx(expected_bps, rel=1e-6)
+        assert synth_link_bps == pytest.approx(ct_link_bps, rel=1e-6)
+        bundle = build_export_bundle(raw_case, request=req, apply_target_envelope=True)
+        assert any("shared.down" in op.op_id for op in bundle.operators)
+        assert all(op.dur_us + NON_REGRESSION_TOL_US >= op.l_star_lean_us for op in bundle.operators)
+        assert bundle.step_span_us + NON_REGRESSION_TOL_US >= bundle.step_l_star_lean_us

@@ -130,8 +130,10 @@ from .causal_tail import (
     ZERO_AIC_COMM_FAMILIES,
     DieScheduleResult,
     MoERouteDecision,
+    _active_comm_width,
     _die_for_occurrence,
     _node_cube_peak_ms,
+    _resolve_die_link_supply_bps,
     build_discrete_mso_candidate_nodes,
     enforce_moe_mutex_on_nodes,
     evaluate_disjoint_core_budgets,
@@ -199,8 +201,6 @@ MXFP_BLOCK_GROUP = 32
 HALF_SPLIT_RATIO = 0.5
 #: ABI signature hash prefix length.
 ABI_DIGEST_LEN = 12
-#: Decimal GB/s conversion for Link.capacity_gbps.
-BYTES_PER_GB = 1_000_000_000.0
 #: Percent multiplier.
 PERCENT_SCALE = 100.0
 #: Default AIV vector ops per element when declarative formula omits explicit vector_ops_fp32.
@@ -973,14 +973,17 @@ def _extract_hardware_supply(
     links: tuple[Any, ...] = ()
     channels: tuple[Any, ...] = ()
     die: Device | None = None
+    mac: Hardware | None = None
     if isinstance(hardware, Case):
-        die = hardware.machine.dies[0]
-        links = tuple(hardware.machine.links)
-        channels = tuple(hardware.machine.transfer_channels)
+        mac = hardware.machine
+        die = mac.dies[0]
+        links = tuple(mac.links)
+        channels = tuple(mac.transfer_channels)
     elif isinstance(hardware, Hardware):
-        die = hardware.dies[0]
-        links = tuple(hardware.links)
-        channels = tuple(hardware.transfer_channels)
+        mac = hardware
+        die = mac.dies[0]
+        links = tuple(mac.links)
+        channels = tuple(mac.transfer_channels)
     elif isinstance(hardware, Device):
         die = hardware
     elif isinstance(hardware, DatapathCapabilitySpec):
@@ -1047,17 +1050,15 @@ def _extract_hardware_supply(
     link_bps = float(rates.get("link") or 0.0)
     link_lat_us = 0.0
     if links:
-        def _link_bps(item: Any) -> float:
-            b_per_ms = float(getattr(item, "capacity_bytes_per_ms", 0.0) or 0.0)
-            if b_per_ms > 0.0:
-                return b_per_ms * MS_PER_SECOND
-            return float(getattr(item, "capacity_gbps", 0.0) or 0.0) * BYTES_PER_GB
-
-        best = max(links, key=_link_bps)
-        best_bps = _link_bps(best)
-        if best_bps > 0.0:
-            link_bps = best_bps
-        link_lat_us = float(getattr(best, "latency_us", 0.0) or 0.0)
+        link_bps = _resolve_die_link_supply_bps(
+            int(die.rank) if die is not None else 0,
+            links,
+            active_width=_active_comm_width(hardware) if isinstance(hardware, Case) else None,
+            ranks_per_node=int(getattr(mac, "ranks_per_node", 0) or 0),
+            dies_per_package=int(getattr(mac, "dies_per_package", 1) or 1),
+            fallback_bps=link_bps,
+        )
+        link_lat_us = min((float(getattr(lnk, "latency_us", 0.0) or 0.0) for lnk in links), default=0.0)
     return datapath, rates, peaks, service_modes, launch_vec, launch_cube, link_bps, link_lat_us
 
 
