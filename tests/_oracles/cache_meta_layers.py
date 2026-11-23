@@ -87,6 +87,7 @@ class RefLayer:
     shared_i: int = 0; shared_gate: bool = False; latent: int = 0
     qk_norm: bool = False; qgate: bool = False; gate_separate: bool = False
     k_eq_v: bool = False; mhc: bool = False; hc_mult: int = 0; hc_lowrank: int = 0
+    hc_final_collapse: str = "learned"
     residual: int = 0; indexer: bool = False; owns_index_k: bool = False
     owns_topk: bool = False; index_shared: bool = False; index_query: bool = False
     index_input: str = "hidden"; index_heads: int = 0; index_dim: int = 0
@@ -290,7 +291,8 @@ def _glm(c: Mapping[str, Any]) -> list[RefLayer]:
                     lin_value_heads=kda_heads, conv_k=conv_k, conv_width=conv_width,
                     rec_state=kda_heads * kda_dim * kda_dim,
                     conv_state=conv_width * (conv_k - 1), gate_rank=kda_dim,
-                    mhc=hyper, hc_mult=hc, **ffn_fields,
+                    mhc=hyper, hc_mult=hc, hc_final_collapse="mean" if hyper else "learned",
+                    **ffn_fields,
                 ))
             else:
                 out.append(RefLayer(
@@ -299,7 +301,9 @@ def _glm(c: Mapping[str, Any]) -> list[RefLayer]:
                     nope=nope, rope=rope, v_dim=v_dim, variant="latent_mla",
                     indexer=True, owns_index_k=True, owns_topk=True, index_query=True,
                     index_heads=idx_heads, index_dim=idx_dim, index_topk=idx_topk,
-                    index_kpool=kpool, mhc=hyper, hc_mult=hc, cache_row=kv_rank + rope,
+                    index_kpool=kpool, mhc=hyper, hc_mult=hc,
+                    hc_final_collapse="mean" if hyper else "learned",
+                    cache_row=kv_rank + rope,
                     **ffn_fields,
                 ))
         return out

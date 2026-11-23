@@ -326,7 +326,9 @@ def default_dispatch_spec(model, plan=None, width=None):
             "combine_row_bytes": combine_row_bytes,
             "element_bytes": float(dtype_bytes(combine_dtype)),
         }
-    quant = model.quant.for_category("routed_expert")
+    from mindie_sim.catalog.quant import projection_quant
+    layer_quant = projection_quant(model.quant, plan) if plan is not None else model.quant
+    quant = layer_quant.for_category("routed_expert")
     _, act = compute_dtype_for(quant, "routed_expert")
     if act in _FP4:
         # MXFP4 is a 0.5 B E2M1 payload plus one E8M0 byte per 32-element
@@ -487,7 +489,9 @@ def _transport_format(case, layer, width):
 
 def validate_contract(model, plan, transport=None):
     """Reject expert representations this selected transport cannot honor."""
-    quant = model.quant.for_category("routed_expert")
+    from mindie_sim.catalog.quant import projection_quant
+    layer_quant = projection_quant(model.quant, plan) if plan is not None else model.quant
+    quant = layer_quant.for_category("routed_expert")
     weight_format = quant.format_for("routed_expert")
     width = plan.expert_latent_size or model.hidden_size
     if transport is not None and transport.mxfp8:

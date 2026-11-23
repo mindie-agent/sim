@@ -437,7 +437,7 @@ def _head_entries(model: ReferenceModel) -> list[Entry]:
         _add(out, "hc_head_norm", hc_dim, 1)
         _add(out, "hc_head_down", lr, hc_dim)
         _add(out, "hc_head_up", hc_dim, lr)
-    elif any(layer.mhc for layer in model.layers):
+    elif any(layer.mhc and layer.hc_final_collapse == "learned" for layer in model.layers):
         _add(out, "hc_head_fn", MHC_HEAD_ROWS, MHC_HEAD_ROWS * h)
         _add(out, "hc_head_base", MHC_HEAD_ROWS, 1)
         _add(out, "hc_head_scale", 1, 1)

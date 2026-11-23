@@ -313,7 +313,7 @@ def _output_res_quant(model: ModelSpec) -> QuantSpec:
 
 
 def _ngram_embedding_terms(model: ModelSpec) -> list[WeightTerm]:
-    """LongCat-Flash-Lite packed N-gram embedding tables (BF16, out_tp sharded)."""
+    """LongCat-Flash-Lite packed N-gram embedding tables and replicated post-projection."""
     cfg = dict(getattr(model, "metadata", ()) or ()).get("ngram_embedding")
     if not isinstance(cfg, Mapping):
         return []
@@ -326,7 +326,10 @@ def _ngram_embedding_terms(model: ModelSpec) -> list[WeightTerm]:
     table_width = max(1, int(model.hidden_size) // num_tables)
     base_rows = int(model.vocab_size) * ratio
     total_rows = sum(base_rows + 2 * i + 1 for i in range(num_tables))
-    return [_t("ngram_embedding", total_rows, table_width, "embedding", "out_tp")]
+    return [
+        _t("ngram_embedding", total_rows, table_width, "embedding", "out_tp"),
+        _t("ngram_post_proj", table_width, int(model.hidden_size), "embedding", "replicated", count=num_tables),
+    ]
 
 
 def body_head_terms(model: ModelSpec) -> list[WeightTerm]:
@@ -347,7 +350,11 @@ def body_head_terms(model: ModelSpec) -> list[WeightTerm]:
     if lowrank_hc:
         from mindie_sim.catalog.qwen4_exp import lowrank_hc_head_terms
         terms.extend(lowrank_hc_head_terms(model))
-    elif any(plan.hyper_connections for plan in model.layer_plans):
+    elif any(
+        plan.hyper_connections
+        and getattr(plan, "hc_final_collapse", "learned") == "learned"
+        for plan in model.layer_plans
+    ):
         terms.extend([
             _t("hc_head_fn", MHC_HEAD_STREAMS, MHC_HEAD_STREAMS * h, "mhc"),
             _t("hc_head_base", MHC_HEAD_STREAMS, 1, "param_fp32"),

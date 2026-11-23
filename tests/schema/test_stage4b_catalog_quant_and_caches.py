@@ -43,6 +43,13 @@ MINIMAX_INDEX_DIM = 128
 MINIMAX_HIDDEN = 6144
 LONGCAT_LAYERS = 28
 LONGCAT_MOE_LAYERS = 14
+LONGCAT_NGRAM_POST_PROJ_BYTES = 12 * 256 * 3072 * 2
+W4A16_BYTES_PER_WEIGHT = 0.625
+W4A16_CHECK_ROWS = 64
+W4A16_CHECK_COLS = 128
+W4A8_SCALE_BYTES = 4.0
+EP_EIGHT = 8
+STEP5_LAYER_COUNT = 92
 LONGCAT_DENSE_LAYERS = 14
 LONGCAT_ZERO_EXPERTS = 128
 LONGCAT_ROUTER_WIDTH = 384
@@ -274,9 +281,53 @@ def test_longcat_flash_lite_ngram_zero_experts_and_dual_mla_blocks():
     assert term_bytes(ngram[0], lc.quant, ParallelSpec(tp=1)) / GIB == pytest.approx(
         LONGCAT_NGRAM_EXPECTED_GIB, rel=1e-4
     )
+    post_proj = [t for t in body if t.name == "ngram_post_proj"]
+    assert len(post_proj) == 1
+    assert term_bytes(post_proj[0], lc.quant, ParallelSpec(tp=1)) == LONGCAT_NGRAM_POST_PROJ_BYTES
+    assert term_bytes(post_proj[0], lc.quant, ParallelSpec(tp=EP_EIGHT)) == LONGCAT_NGRAM_POST_PROJ_BYTES
     routers = [t for t in body if t.name == "router"]
     assert len(routers) == LONGCAT_MOE_LAYERS
     assert all(t.rows == LONGCAT_ROUTER_WIDTH for t in routers)
 
     kv_gib = request_cache_breakdown(lc, ParallelSpec(tp=1), 4224)["total_bytes"] * 4 / GIB
     assert kv_gib == pytest.approx(LONGCAT_KV_EXPECTED_GIB, rel=1e-4)
+
+
+def test_w4a16_offset_residency_glm_mean_collapse_step5_qk_norm_and_dspark_causal_mask():
+    """Verify W4A16 scale+offset bytes, GLM mean collapse weights, Step-5 qk_norm, and DSpark causal mask."""
+    # 1. W4A16 groupwise (wna16) charges BF16 scale + BF16 offset = 0.625 B/weight; W4A8 keeps single scale.
+    w4a16_q = QuantSpec(
+        name="w4a16", weight_format="int4", activation_format="bf16",
+        expert_weight_format="int4", expert_block=MX_GROUP_SIZE,
+        scale_format="bf16", scale_bytes=BF16_SCALE_BYTES,
+    )
+    expected_w4a16 = float(W4A16_CHECK_ROWS * W4A16_CHECK_COLS) * W4A16_BYTES_PER_WEIGHT
+    assert w4a16_q.matrix_bytes(W4A16_CHECK_ROWS, W4A16_CHECK_COLS, "routed_expert") == pytest.approx(
+        expected_w4a16
+    )
+    w4a8_q = _quant_w4a8_dynamic()
+    expected_w4a8 = float(W4A16_CHECK_ROWS * (W4A16_CHECK_COLS // 2) + W4A16_CHECK_ROWS * W4A8_SCALE_BYTES)
+    assert w4a8_q.matrix_bytes(W4A16_CHECK_ROWS, W4A16_CHECK_COLS, "routed_expert") == pytest.approx(
+        expected_w4a8
+    )
+
+    # 2. GLM-5.3-Flash uses parameterless mean stream collapse (0 learned hc_head weights),
+    #    whereas DeepSeek-V4 retains learned hc_head_fn/base/scale weights.
+    glm_flash = load_model("glm-5.3-flash")
+    assert all(lp.hc_final_collapse == "mean" for lp in glm_flash.layer_plans)
+    assert glm_flash.auxiliary.mtp.mhc_final_collapse == "none"
+    assert not any(t.name.startswith("hc_head_") for t in _body_terms(glm_flash))
+    ds_v4 = load_model("deepseek-v4-flash-0731")
+    assert all(lp.hc_final_collapse == "learned" for lp in ds_v4.layer_plans)
+    assert any(t.name == "hc_head_fn" for t in _body_terms(ds_v4))
+
+    # 3. Step-5-Preview enables qk_norm on all target attention layers.
+    step5 = load_model("step-5-preview")
+    assert len(step5.layer_plans) == STEP5_LAYER_COUNT
+    assert all(lp.qk_norm is True for lp in step5.layer_plans)
+
+    # 4. Kimi-K3.1 external kimi-k3-dspark-block5 inherits full_attention_causal=True -> causal mask.
+    k31 = load_model("kimi-k3.1")
+    assert k31.auxiliary.dspark.noncausal_query_block is False
+    k3 = load_model("kimi-k3")
+    assert k3.auxiliary.dspark.noncausal_query_block is True

@@ -205,7 +205,9 @@ def _physical_graph(model="qwen3-32b", *, tp=1, layers=4, **options):
     return target_graphs(case, phase="decode", tokens=1, context=16, sequences=1, scope="body")[0]
 
 def test_corresponding_layers_share_one_physical_identity():
-    ops = _physical_graph()
+    # Use homogeneous W8A8 so layers 1..3 correspond 1-to-1 (default a3 W8A8_MIX
+    # overrides layers 1..2 dense_mlp to bf16 via layer_quant_overrides).
+    ops = _physical_graph(quant="w8a8")
     by_recipe = {}
     for op in ops:
         key = op.recipe, op.local_shape, dict(op.metadata).get("structure_block"), op.op_id.rsplit(".", 1)[-1]

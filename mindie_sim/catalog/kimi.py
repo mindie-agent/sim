@@ -20,6 +20,9 @@
 """
 from __future__ import annotations
 
+from functools import lru_cache
+import json
+from pathlib import Path
 from typing import Any, Mapping
 
 from mindie_sim.catalog.config import _int, _require, flatten_config
@@ -59,6 +62,26 @@ KIMI_DSPARK_GQA_SOURCE: dict[str, str] = {
     "relative_path": "vllm_ascend/models/qwen3_dspark.py",
     "source_sha256": "62d27df987013fc808b3d03a0730056e1a37f941790ad8299c090f2e3ef48d38",
 }
+
+
+@lru_cache(maxsize=None)
+def _external_dspark_config(filename: str) -> Mapping[str, Any]:
+    path = Path(__file__).resolve().parent.parent / "model_configs" / filename
+    if not path.is_file():
+        return {}
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _dspark_block5_causal(c: Mapping[str, Any], config: Mapping[str, Any]) -> bool:
+    if "full_attention_causal" in c:
+        return bool(c.get("full_attention_causal", False))
+    if "full_attention_causal" in config:
+        return bool(config.get("full_attention_causal", False))
+    companion = _external_dspark_config("kimi-k3-dspark-block5.json")
+    dflash = c.get("dflash_config") or companion.get("dflash_config")
+    if isinstance(dflash, Mapping) and "causal" in dflash:
+        return bool(dflash["causal"])
+    return bool(companion.get("full_attention_causal", False))
 
 
 def _draft_compat_kwargs(**candidates: Any) -> dict[str, Any]:
@@ -233,7 +256,8 @@ def _aux_kimi(c: Mapping[str, Any], config: Mapping[str, Any]) -> AuxiliarySpec:
             confidence_input_width=h + markov,
             target_shared_embedding=True, target_shared_lm_head=True,
             base_logits=True, markov_replicated=True,
-            noncausal_query_block=True, pp_capability=KIMI_DSPARK_PP_CAPABILITY,
+            noncausal_query_block=not _dspark_block5_causal(c, config),
+            pp_capability=KIMI_DSPARK_PP_CAPABILITY,
             vocab_size=int(c.get("vocab_size", KIMI_DEFAULT_VOCAB_SIZE)),
             num_experts=0, top_k=0,
             max_position_embeddings=draft_max_len,

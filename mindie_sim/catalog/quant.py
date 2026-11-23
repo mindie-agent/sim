@@ -26,6 +26,68 @@ BF16_SCALE_BYTES = 2.0
 FP32_SCALE_BYTES = 4.0
 
 
+_LAYER_QUANT_OVERRIDE_FIELDS = (
+    "weight_format", "activation_format", "expert_weight_format",
+    "kv_dtype", "index_dtype", "index_scale_dtype", "scale_format",
+    "scale_bytes", "weight_block", "expert_block",
+    "activation_group_size", "activation_scale_format",
+    "activation_scale_pack", "output_format", "native_format",
+)
+
+
+def merge_layer_quant_override(base: QuantSpec, raw: Any) -> QuantSpec:
+    """Apply one per-layer quant override (``QuantSpec`` or mapping) onto ``base``."""
+    if isinstance(raw, QuantSpec):
+        return raw
+    if not isinstance(raw, Mapping):
+        return base
+    updates: dict[str, Any] = {}
+    for field in _LAYER_QUANT_OVERRIDE_FIELDS:
+        if field in raw and raw[field] is not None:
+            updates[field] = raw[field]
+    if "exclusions" in raw and raw["exclusions"] is not None:
+        updates["exclusions"] = tuple(dict.fromkeys((*base.exclusions, *raw["exclusions"])))
+    if "category_overrides" in raw and isinstance(raw["category_overrides"], Mapping):
+        merged = {k: dict(v) for k, v in base.category_overrides}
+        for cat, fields in raw["category_overrides"].items():
+            cur = dict(merged.get(str(cat), {}))
+            cur.update(dict(fields))
+            merged[str(cat)] = cur
+        updates["category_overrides"] = merged
+    return replace(base, **updates) if updates else base
+
+
+def lookup_layer_quant_override(overrides: Mapping[str, Any] | None, plan: Any) -> Any | None:
+    """Resolve one per-layer override entry from ``layers`` / ``native_layers``."""
+    if not isinstance(overrides, Mapping) or plan is None:
+        return None
+    raw_idx = getattr(plan, "index", None)
+    if raw_idx is None:
+        raw_idx = getattr(plan, "layer", None)
+    layers_map = overrides.get("layers") if isinstance(overrides.get("layers"), Mapping) else overrides
+    if raw_idx is not None:
+        idx = int(raw_idx)
+        for key in (str(idx), idx):
+            if key in layers_map and layers_map[key] is not None:
+                return layers_map[key]
+    native_id = int(getattr(plan, "native_layer_id", -1))
+    native_map = overrides.get("native_layers")
+    if isinstance(native_map, Mapping) and native_id >= 0:
+        for key in (str(native_id), native_id):
+            if key in native_map and native_map[key] is not None:
+                return native_map[key]
+    return None
+
+
+def apply_layer_quant_override(quant: QuantSpec, plan: Any) -> QuantSpec:
+    """Merge any matching ``quant.layer_quant_overrides`` entry for ``plan``."""
+    if quant is None or plan is None or not getattr(quant, "layer_quant_overrides", ()):
+        return quant
+    ov_dict = quant.layer_quant_overrides_dict()
+    matched = lookup_layer_quant_override(ov_dict, plan)
+    return merge_layer_quant_override(quant, matched) if matched is not None else quant
+
+
 def projection_quant(quant: QuantSpec, plan) -> QuantSpec:
     """Resolve per-layer native projection defaults before explicit roles.
 
@@ -33,6 +95,10 @@ def projection_quant(quant: QuantSpec, plan) -> QuantSpec:
     source modules may opt out; user parent and child category declarations
     still win. This same record is used by execution and resident weights.
     """
+    if quant is None:
+        return quant
+    if plan is not None and getattr(quant, "layer_quant_overrides", ()):
+        quant = apply_layer_quant_override(quant, plan)
     defaults = {}
     if plan.attention == "mla":
         # Historically the index weighting projection stayed native while

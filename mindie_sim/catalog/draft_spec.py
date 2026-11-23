@@ -90,6 +90,7 @@ class DraftSpec:
     mhc_mult: int = 0
     mhc_sinkhorn_iters: int = 0
     mhc_lowrank: int = 0
+    mhc_final_collapse: str = ""
     activation_dtype: str = "bf16"
     input_projection_category: str = "dspark_input"
     layer_plans: tuple[Any, ...] = ()
@@ -252,6 +253,7 @@ class DraftSpec:
             "mhc_mult": self.mhc_mult,
             "mhc_sinkhorn_iters": self.mhc_sinkhorn_iters,
             "mhc_lowrank": self.mhc_lowrank,
+            **({"mhc_final_collapse": self.mhc_final_collapse} if self.mhc_final_collapse else {}),
             "activation_dtype": self.activation_dtype,
             "input_mode": self.input_mode,
             "weight_category": self.weight_category,

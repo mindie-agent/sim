@@ -14,7 +14,8 @@ from mindie_sim.feature_mechanisms import (
 )
 from mindie_sim.model_catalog import load_model
 from mindie_sim.prediction import body_defaults
-from mindie_sim.prediction.feedforward import moe
+from mindie_sim.prediction.execution.layer_runs import discover_layer_cohorts
+from mindie_sim.prediction.feedforward import _absorb_redundant_mc2_unpack, moe
 from mindie_sim.prediction.operator_analysis import target_operators
 from mindie_sim.prediction.operators.attention.attention_decode import StagedGQADecode
 from mindie_sim.prediction.operators.mc2.megamoe import try_lower_fused_frame
@@ -46,6 +47,29 @@ from mindie_sim.schema.operators import OpSpec
 from mindie_sim.schema.parallel import ParallelSpec
 
 pytestmark = pytest.mark.tier0
+
+MTP_TARGET_MEGAMOE_FLOPS = 1_207_959_552.0
+MTP_DRAFT_MEGAMOE_FLOPS = 603_979_776.0
+MTP_TARGET_ASSIGNMENTS = 24
+MTP_DRAFT_ASSIGNMENTS = 12
+MTP_BATCH_SEQUENCES = 4
+MTP_VERIFY_TOKENS = 2
+MTP_CONTEXT_LEN = 512
+MINIMAX_TOPK_BLOCKS = 16
+MINIMAX_TOPK_TOKENS = 2048
+MINIMAX_TOPK_OUTPUT_BYTES = 256.0
+MC2_TEST_EP = 8
+MC2_TEST_HIDDEN = 1024
+GEMMA4_BF16_LAYERS = {1, 9, 10, 11, 27, 28}
+GEMMA4_BF16_COHORT_TOTAL = 6
+GEMMA4_COHORT_COUNT = 4
+STEP5_BF16_EXPERT_LAYERS = {88, 89, 90}
+STEP5_BF16_COHORT_TOTAL = 3
+STEP5_COHORT_COUNT = 5
+STEP5_MOE_FP8_LAYER = 4
+STEP5_MOE_BF16_LAYER = 88
+SMALL_CONTEXT = 128
+FOUR_LAYERS = 4
 
 
 def _ops(model: str, *, hardware: str = "a5", phase: str = "decode",
@@ -462,3 +486,91 @@ def test_minimax_index_q_tp_sharding_clamped_swiglu_keypool_pack_and_nextn_norms
     )
     assert any(op.op_id.endswith("enorm") and op.recipe == "draft_input_norm" for op in step_ops)
     assert any(op.op_id.endswith("hnorm") and op.recipe == "draft_input_norm" for op in step_ops)
+
+
+def test_mtp_verify_moe_tokens_glm_mean_collapse_minimax_topk_mc2_unpack_and_layer_quant() -> None:
+    # 1. MTP target verification counts expanded verification tokens (8) while draft stays at 4.
+    _, mtp_ops = _ops(
+        "deepseek-v4-flash-0731", hardware="a5", phase="decode", tokens=MTP_VERIFY_TOKENS,
+        sequences=MTP_BATCH_SEQUENCES, context=MTP_CONTEXT_LEN, tp=2, ep=2, num_devices=2,
+        mtp_proposal_tokens=1, scope="model",
+    )
+    tgt_mega = next(op for op in mtp_ops if op.recipe == "megamoe_arch35" and not op.op_id.startswith("draft"))
+    drf_mega = next(op for op in mtp_ops if op.recipe == "megamoe_arch35" and op.op_id.startswith("draft"))
+    assert tgt_mega.flops == pytest.approx(MTP_TARGET_MEGAMOE_FLOPS)
+    assert dict(tgt_mega.metadata)["megamoe_geometry"]["routed_rows"] == pytest.approx(MTP_TARGET_ASSIGNMENTS)
+    assert drf_mega.flops == pytest.approx(MTP_DRAFT_MEGAMOE_FLOPS)
+    assert dict(drf_mega.metadata)["megamoe_geometry"]["routed_rows"] == pytest.approx(MTP_DRAFT_ASSIGNMENTS)
+
+    # 2. GLM-5.3-Flash uses parameterless mean stream collapse (0 FLOPs) and omits draft collapse.
+    _, glm_ops = _ops(
+        "glm-5.3-flash", hardware="a5", phase="decode", tokens=MTP_VERIFY_TOKENS,
+        sequences=MTP_BATCH_SEQUENCES, context=SMALL_CONTEXT, layers=FOUR_LAYERS,
+        tp=1, ep=1, num_devices=1, mtp_proposal_tokens=1, scope="model",
+    )
+    assert not any(op.recipe == "hc_final_collapse_proj" for op in glm_ops)
+    mean_ops = [op for op in glm_ops if op.recipe == "hc_final_collapse_mean" and not op.op_id.startswith("draft")]
+    assert len(mean_ops) == 1 and mean_ops[0].flops == 0.0
+    assert not any(op.op_id.startswith("draft") and "hc_head" in op.op_id for op in glm_ops)
+
+    # 3. MiniMax-M3 / M3.1-Flash TopKV2 emits 16 block IDs (256 B at B=4) while keeping index_topk=2048.
+    for mm_name, idx_layer in (("minimax-m3", 3), ("minimax-m3.1-flash", 0)):
+        mm_case, mm_ops = _ops(
+            mm_name, hardware="a5", phase="decode", tokens=1, sequences=MTP_BATCH_SEQUENCES,
+            context=MTP_CONTEXT_LEN, layers=FOUR_LAYERS, tp=MC2_TEST_EP, ep=MC2_TEST_EP,
+            num_devices=MC2_TEST_EP,
+        )
+        assert mm_case.model.layer_plans[idx_layer].index_topk == MINIMAX_TOPK_TOKENS
+        topk_op = next(op for op in mm_ops if op.layer == idx_layer and op.op_id.endswith(".index_topk"))
+        assert topk_op.local_shape == (MTP_BATCH_SEQUENCES, MINIMAX_TOPK_BLOCKS)
+        assert topk_op.mte3_bytes == pytest.approx(MINIMAX_TOPK_OUTPUT_BYTES)
+
+    # 4. _absorb_redundant_mc2_unpack absorbs route_unpack on MoeDistributeCombine* even when caller is set.
+    comb = OpSpec(
+        op_id="s0.l0.combine", family="alltoallv", phase="decode", stage=0, layer=0,
+        requests=("r0",), semantic_shape=(MTP_BATCH_SEQUENCES, MC2_TEST_HIDDEN),
+        local_shape=(MTP_BATCH_SEQUENCES, MC2_TEST_HIDDEN),
+        padded_shape=(MTP_BATCH_SEQUENCES, MC2_TEST_HIDDEN),
+        launch_shape=(MTP_BATCH_SEQUENCES, MC2_TEST_HIDDEN),
+        deps=("s0.l0.expert_down",), recipe="expert_combine", dtype="bf16",
+        metadata=(("native_kind", "MoeDistributeCombineV2"),),
+    )
+    unp = OpSpec(
+        op_id="s0.l0.unpack", family="routing", phase="decode", stage=0, layer=0,
+        requests=("r0",), semantic_shape=(MTP_BATCH_SEQUENCES, MC2_TEST_HIDDEN),
+        local_shape=(MTP_BATCH_SEQUENCES, MC2_TEST_HIDDEN),
+        padded_shape=(MTP_BATCH_SEQUENCES, MC2_TEST_HIDDEN),
+        launch_shape=(MTP_BATCH_SEQUENCES, MC2_TEST_HIDDEN),
+        deps=("s0.l0.combine", "s0.l0.pack", "s0.l0.router"), recipe="route_unpack", dtype="bf16",
+    )
+    absorbed, new_last = _absorb_redundant_mc2_unpack(
+        [comb, unp], unp.op_id, prefix="s0.l0", runtime=SimpleNamespace(moe_recipe="alltoall", metadata=()),
+        parallel=ParallelSpec(tp=1, ep=MC2_TEST_EP), transport=None, caller=object(),
+    )
+    assert new_last == comb.op_id
+    assert not any(op.recipe == "route_unpack" for op in absorbed)
+
+    # 5. Per-layer layer_quant_overrides propagate to FFN/MoE lowering & cohort discovery.
+    g4_case, g4_ops = _ops(
+        "gemma-4-31b", hardware="a5", phase="decode", tokens=1, sequences=1, context=SMALL_CONTEXT,
+        tp=1, ep=1, num_devices=1,
+    )
+    g4_cohorts = discover_layer_cohorts(g4_case)
+    assert len(g4_cohorts.cohorts) == GEMMA4_COHORT_COUNT
+    assert sum(c.count for c in g4_cohorts.cohorts if c.representative_layer in GEMMA4_BF16_LAYERS) == GEMMA4_BF16_COHORT_TOTAL
+    g4_l0 = next(op for op in g4_ops if op.layer == 0 and op.op_id.endswith(".gate_up"))
+    g4_l1 = next(op for op in g4_ops if op.layer == 1 and op.op_id.endswith(".gate_up"))
+    assert dict(g4_l0.metadata)["weight_format"] != "bf16"
+    assert dict(g4_l1.metadata)["weight_format"] == "bf16"
+
+    s5_case, s5_ops = _ops(
+        "step-5-preview", hardware="a5", phase="decode", tokens=1, sequences=1, context=SMALL_CONTEXT,
+        tp=MC2_TEST_EP, ep=MC2_TEST_EP, num_devices=MC2_TEST_EP,
+    )
+    s5_cohorts = discover_layer_cohorts(s5_case)
+    assert len(s5_cohorts.cohorts) == STEP5_COHORT_COUNT
+    assert sum(c.count for c in s5_cohorts.cohorts if c.representative_layer in STEP5_BF16_EXPERT_LAYERS) == STEP5_BF16_COHORT_TOTAL
+    s5_l4 = next(op for op in s5_ops if op.layer == STEP5_MOE_FP8_LAYER and op.op_id.endswith(".expert_up"))
+    s5_l88 = next(op for op in s5_ops if op.layer == STEP5_MOE_BF16_LAYER and op.op_id.endswith(".expert_up"))
+    assert dict(s5_l4.metadata)["weight_format"] != "bf16"
+    assert dict(s5_l88.metadata)["weight_format"] == "bf16"

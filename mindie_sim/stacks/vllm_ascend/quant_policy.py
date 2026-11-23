@@ -396,7 +396,7 @@ def _resolve_int_tag_to_abi(
             weight_scale_bytes=SCALE_BYTES_FP16,
             weight_metadata=(
                 (("weight_only_bits", W8A16_WEIGHT_BITS),)
-                if is_w8 else (("packed_int4_per_byte", INT4_PACKED_PER_BYTE),)
+                if is_w8 else (("packed_int4_per_byte", INT4_PACKED_PER_BYTE), ("weight_offset_dtype", nat))
             ),
         )
     return None

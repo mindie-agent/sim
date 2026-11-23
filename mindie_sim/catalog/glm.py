@@ -248,6 +248,7 @@ def _glm_hybrid_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
         "hyper_connections": hyper,
         "hc_mult": hc_mult,
         "hc_sinkhorn_iters": hc_iters,
+        "hc_final_collapse": "mean" if hyper else "learned",
         "native_layer_id": 0,
         "scope": "body",
         **_router_tier4(c),
@@ -346,6 +347,7 @@ def _aux_glm(c: Mapping[str, Any]) -> AuxiliarySpec:
         vocab_size=int(c["vocab_size"]),
         mhc_mult=_int(c, "hc_mult") if hyper else 0,
         mhc_sinkhorn_iters=_int(c, "hc_sinkhorn_iters") if hyper else 0,
+        mhc_final_collapse="none" if hyper else "",
         max_position_embeddings=parse_draft_max_position_embeddings(c),
         source=merge_source(
             GLM_MTP_SOURCE,

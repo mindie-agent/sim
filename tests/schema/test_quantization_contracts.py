@@ -551,8 +551,10 @@ def test_odd_width_packing_and_scale_tails_are_recomputed_after_tensor_sharding(
     assert term_payload_bytes(term, quant, shard) == 3 * 17
     assert term_bytes(term, quant, shard) == 3 * 17 + 3 * 2
     assert term_bytes(term, quant, shard) * 2 > term_bytes(term, quant, whole)
-    grouped_int4 = replace(quant, expert_weight_format="int4", scale_bytes=4)
+    grouped_int4 = replace(quant, expert_weight_format="int4", activation_format="int8", scale_bytes=4)
     assert term_bytes(term, grouped_int4, whole) == 3 * 33 + 3 * 3 * 4
+    w4a16_int4 = replace(quant, expert_weight_format="int4", activation_format="bf16", scale_bytes=2)
+    assert term_bytes(term, w4a16_int4, whole) == 3 * 33 + 2 * 3 * 3 * 2
     channel_int4 = replace(grouped_int4, expert_block=1)
     assert term_bytes(term, channel_int4, whole) == 3 * 33 + 3 * 4
 

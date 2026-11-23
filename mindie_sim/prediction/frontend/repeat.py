@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
 import re
 
 from mindie_sim.prediction import frontend as _frontend
@@ -21,7 +22,7 @@ _META_DICT_KEY_AND_VALUE_EDITS = 6
 _LAYER_QUANT_INDEX_RE = re.compile(r"(?:^|[.:/_-])layers?[.:/_-]?(\d+)(?:$|[.:/_-])", re.IGNORECASE)
 
 
-def _layer_quant_signature(model, layer_index: int) -> tuple:
+def _layer_quant_signature(model, layer_index: int, *, native_layer_id: int = -1) -> tuple:
     """Capture any per-layer quant exclusions/overrides targeting ``layer_index``."""
     quant = getattr(model, "quant", None)
     matched: list[str] = []
@@ -33,7 +34,7 @@ def _layer_quant_signature(model, layer_index: int) -> tuple:
                     matched.append(f"excl:{text}")
                     break
         overrides = getattr(quant, "category_overrides", ()) or ()
-        items = overrides.items() if isinstance(overrides, dict) else overrides
+        items = overrides.items() if isinstance(overrides, Mapping) else overrides
         for key, val in items:
             text = str(key)
             for m in _LAYER_QUANT_INDEX_RE.finditer(text):
@@ -49,20 +50,31 @@ def _layer_quant_signature(model, layer_index: int) -> tuple:
     raw_meta = getattr(model, "metadata", None)
     meta_dict = dict(raw_meta) if raw_meta else {}
     meta_lq = meta_dict.get("layer_quant_overrides")
-    if isinstance(meta_lq, dict) and meta_lq:
+    if isinstance(meta_lq, Mapping) and meta_lq:
         lq_overrides = {**lq_overrides, **meta_lq}
     if lq_overrides:
         str_idx = str(layer_index)
-        if str_idx in lq_overrides:
-            matched.append(f"lqo:{str_idx}={lq_overrides[str_idx]!r}")
-        elif layer_index in lq_overrides:
-            matched.append(f"lqo:{str_idx}={lq_overrides[layer_index]!r}")
-        else:
-            native = lq_overrides.get("native_layers")
-            if isinstance(native, (list, tuple, set, frozenset)) and (
-                layer_index in native or str_idx in native
-            ):
-                matched.append(f"lqo:native:{str_idx}")
+        layers_map = (
+            lq_overrides.get("layers")
+            if isinstance(lq_overrides.get("layers"), Mapping)
+            else lq_overrides
+        )
+        if str_idx in layers_map and layers_map[str_idx] is not None:
+            matched.append(f"lqo:layer={layers_map[str_idx]!r}")
+        elif layer_index in layers_map and layers_map[layer_index] is not None:
+            matched.append(f"lqo:layer={layers_map[layer_index]!r}")
+        native = lq_overrides.get("native_layers")
+        nat_id = int(native_layer_id) if int(native_layer_id) >= 0 else int(layer_index)
+        str_nat = str(nat_id)
+        if isinstance(native, Mapping):
+            if str_nat in native and native[str_nat] is not None:
+                matched.append(f"lqo:native={native[str_nat]!r}")
+            elif nat_id in native and native[nat_id] is not None:
+                matched.append(f"lqo:native={native[nat_id]!r}")
+        elif isinstance(native, (list, tuple, set, frozenset)) and (
+            nat_id in native or str_nat in native
+        ):
+            matched.append(f"lqo:native:{str_nat}")
     return tuple(sorted(matched))
 
 
@@ -154,7 +166,13 @@ class _FrontendRepeat:
                     index_source_layer_id=(-1 if lyr.index_source_layer_id == -1 else 0),
                     native_layer_id=(-1 if lyr.native_layer_id == -1 else 0),
                 )
-                akey = (norm_lyr, norm_real, _layer_quant_signature(model, lyr.index))
+                akey = (
+                    norm_lyr,
+                    norm_real,
+                    _layer_quant_signature(
+                        model, lyr.index, native_layer_id=int(getattr(lyr, "native_layer_id", -1)),
+                    ),
+                )
                 arch_for_layer_list.append(akey)
                 if akey not in unique_archs:
                     unique_archs[akey] = idx

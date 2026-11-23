@@ -119,6 +119,7 @@ Q_PROJECTION_PLAIN_WIDTH = 1
 KV_CACHE_PLANES = 2
 DEFAULT_NORM_EPS = 1e-6
 Q_GATE_PROJECTIONS = frozenset({"packed_q", "separate"})
+HC_FINAL_COLLAPSE_MODES = frozenset({"learned", "mean", "none"})
 ACCOUNTING_SCOPES = frozenset({"text_backbone", "full_checkpoint"})
 
 @dataclass(frozen=True)
@@ -211,6 +212,7 @@ class LayerPlan:
     hc_mult: int = 0
     hc_sinkhorn_iters: int = 0
     hc_lowrank: int = 0
+    hc_final_collapse: str = "learned"
     residual_block_size: int = 0
     native_layer_id: int = -1
     scope: str = "body"                 # body | mtp | dspark | standalone_draft
@@ -275,6 +277,11 @@ class LayerPlan:
         object.__setattr__(self, "q_output_gate_kind", kind)
         object.__setattr__(self, "q_gate_projection", projection)
         object.__setattr__(self, "q_output_gate", kind != "none")
+        collapse = str(self.hc_final_collapse or "learned").strip().lower()
+        if collapse not in HC_FINAL_COLLAPSE_MODES:
+            raise ModelingError(f"layer_plan_hc_final_collapse_unknown:{collapse}")
+        if collapse != self.hc_final_collapse:
+            object.__setattr__(self, "hc_final_collapse", collapse)
 
     def q_projection_width(self, local_heads: int, head_dim: int) -> int:
         if self.q_gate_separate:

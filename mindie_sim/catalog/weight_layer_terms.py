@@ -24,7 +24,11 @@ from collections.abc import Mapping
 from dataclasses import replace
 from typing import Any
 
-from mindie_sim.catalog.quant import projection_quant
+from mindie_sim.catalog.quant import (
+    lookup_layer_quant_override,
+    merge_layer_quant_override,
+    projection_quant,
+)
 from mindie_sim.catalog.types import QuantSpec
 from mindie_sim.catalog.weight_terms import WeightTerm, _t
 from mindie_sim.schema.common import ModelingError
@@ -39,30 +43,7 @@ LINEAR_KDA_FAMILY_KINDS = frozenset({
 
 def _merge_layer_quant_override(base: QuantSpec, raw: Any) -> QuantSpec:
     """Apply one per-layer quant override (``QuantSpec`` or mapping) onto ``base``."""
-    if isinstance(raw, QuantSpec):
-        return raw
-    if not isinstance(raw, Mapping):
-        return base
-    updates: dict[str, Any] = {}
-    for field in (
-        "weight_format", "activation_format", "expert_weight_format",
-        "kv_dtype", "index_dtype", "index_scale_dtype", "scale_format",
-        "scale_bytes", "weight_block", "expert_block",
-        "activation_group_size", "activation_scale_format",
-        "activation_scale_pack", "output_format", "native_format",
-    ):
-        if field in raw and raw[field] is not None:
-            updates[field] = raw[field]
-    if "exclusions" in raw and raw["exclusions"] is not None:
-        updates["exclusions"] = tuple(dict.fromkeys((*base.exclusions, *raw["exclusions"])))
-    if "category_overrides" in raw and isinstance(raw["category_overrides"], Mapping):
-        merged = {k: dict(v) for k, v in base.category_overrides}
-        for cat, fields in raw["category_overrides"].items():
-            cur = dict(merged.get(str(cat), {}))
-            cur.update(dict(fields))
-            merged[str(cat)] = cur
-        updates["category_overrides"] = merged
-    return replace(base, **updates) if updates else base
+    return merge_layer_quant_override(base, raw)
 
 
 def _lookup_layer_quant_override(model: ModelSpec, plan: LayerPlan) -> Any | None:
@@ -76,17 +57,10 @@ def _lookup_layer_quant_override(model: ModelSpec, plan: LayerPlan) -> Any | Non
         quant_ov = quant.layer_quant_overrides_dict()
         if quant_ov:
             sources.append(quant_ov)
-    native_id = int(getattr(plan, "native_layer_id", -1))
     for overrides in sources:
-        layers_map = overrides.get("layers") if isinstance(overrides.get("layers"), Mapping) else overrides
-        for key in (str(plan.index), plan.index):
-            if key in layers_map and layers_map[key] is not None:
-                return layers_map[key]
-        native_map = overrides.get("native_layers")
-        if isinstance(native_map, Mapping) and native_id >= 0:
-            for key in (str(native_id), native_id):
-                if key in native_map and native_map[key] is not None:
-                    return native_map[key]
+        matched = lookup_layer_quant_override(overrides, plan)
+        if matched is not None:
+            return matched
     return None
 
 

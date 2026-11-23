@@ -1074,7 +1074,8 @@ def test_export_binding_conservation_pp_reconciliation_and_brief_precision(tmp_p
     parsed_pp2 = parse_case(raw_pp2)
     cohort_pp2 = discover_layer_cohorts(parsed_pp2)
     assert cohort_pp2.stage_counts == (3, 1)
-    assert [c.layer_indices for c in cohort_pp2.cohorts] == [(0, 1, 2), (3,)]
+    # qwen3-32b on a3 defaults to W8A8_MIX where layers 1-2 override dense_mlp to bf16.
+    assert [c.layer_indices for c in cohort_pp2.cohorts] == [(0,), (1, 2), (3,)]
     assert not hasattr(bundle_mod, "_build_archetype_representative_case")
     led_pp2 = compute_memory_quant_ledger(parsed_pp2, phase="decode", seq_len=512, concurrency=2)
     assert led_pp2.block_size == 64

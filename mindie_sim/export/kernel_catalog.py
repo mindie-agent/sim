@@ -875,6 +875,12 @@ _A3_ONLY_KERNELS_FORBIDDEN_ON_A5 = (
     "aclnnFusedInferAttentionScoreV3",
     "aclnnGroupedMatmulV4",
 )
+_A5_ONLY_KERNELS_FORBIDDEN_ON_A23 = (
+    "SparseFlashMla",
+    "aclnnSparseFlashMla",
+    "SituMxQuant",
+)
+_SITU_MX_OUTPUT_DTYPES = frozenset({"fp8", "fp8_e4m3", "mxfp8", "mxfp4"})
 
 
 def _is_gemm_like(fam: str, rec: str) -> bool:
@@ -919,8 +925,14 @@ def _sanitize_cross_gen_kernel(
     kernel: str, *, arch_family: str, fam: str, rec: str, suffix: str,
     meta: Mapping[str, Any], layer_plan: Any | None,
 ) -> str:
-    """Block A3-only kernel names from leaking onto A5."""
-    if not kernel or arch_family != "A5":
+    """Block cross-generation kernel names from leaking across A2/A3 and A5."""
+    if not kernel:
+        return kernel
+    if arch_family in {"A2", "A3"}:
+        if any(tok in kernel for tok in _A5_ONLY_KERNELS_FORBIDDEN_ON_A23):
+            return ""
+        return kernel
+    if arch_family != "A5":
         return kernel
     if any(tok in kernel for tok in _A3_ONLY_KERNELS_FORBIDDEN_ON_A5):
         return ""
@@ -1137,16 +1149,37 @@ def _project_attention(
             kern, BACKEND_CANN, KERNEL_STATUS_EXISTING, False, "", "gbsa_attention",
         )
     if is_sparse:
+        is_a2_or_a3 = arch_family in {"A2", "A3"}
         meta_nat_k = _clean_native_symbol(meta.get("native_kernel"))
-        sparse_allowed = {
-            "SparseFlashMla", "aclnnSparseFlashAttention", "npu_kv_quant_sparse_flash_attention_vllm",
-        }
-        if meta_nat_k == "npu_kv_quant_sparse_flash_attention_vllm":
-            kern = meta_nat_k
-        elif bound_kernel in sparse_allowed:
-            kern = bound_kernel
+        kv_meta = str(meta.get("kv_cache_dtype") or meta.get("kv_dtype") or "").strip().lower()
+        is_quant_sparse_kv = is_c8_kv or kv_meta in {"int8", "c8", "faquant"}
+        if is_a2_or_a3:
+            a23_sparse_allowed = {
+                "aclnnSparseFlashAttention",
+                "npu_sparse_flash_attention",
+                "npu_kv_quant_sparse_flash_attention_vllm",
+            }
+            if meta_nat_k == "npu_kv_quant_sparse_flash_attention_vllm":
+                kern = meta_nat_k
+            elif bound_kernel in a23_sparse_allowed:
+                kern = bound_kernel
+            else:
+                kern = (
+                    "npu_kv_quant_sparse_flash_attention_vllm"
+                    if is_quant_sparse_kv
+                    else "npu_sparse_flash_attention"
+                )
         else:
-            kern = "SparseFlashMla"
+            sparse_allowed = {
+                "SparseFlashMla", "aclnnSparseFlashAttention",
+                "npu_sparse_flash_attention", "npu_kv_quant_sparse_flash_attention_vllm",
+            }
+            if meta_nat_k == "npu_kv_quant_sparse_flash_attention_vllm":
+                kern = meta_nat_k
+            elif bound_kernel in sparse_allowed:
+                kern = bound_kernel
+            else:
+                kern = "SparseFlashMla"
         role = (
             f"Quantized Sparse Flash MLA (TopK={topk or DEFAULT_SPARSE_INDEX_TOPK})"
             if kern == "npu_kv_quant_sparse_flash_attention_vllm"
@@ -1347,7 +1380,8 @@ def _project_linear_attn(
 def _project_moe(
     suffix: str, fam: str, rec: str, meta: Mapping[str, Any], bound_kernel: str,
     mm_kernel: str, *, arch_family: str, is_ideal: bool, is_quant_mm: bool,
-    is_mxfp4_w: bool, is_int4_w: bool, layer_plan: Any | None,
+    is_mxfp4_w: bool, is_int4_w: bool, ep_degree: int = 1, is_situ_mx: bool = False,
+    layer_plan: Any | None,
 ) -> tuple[str, str, str, str, bool, str, str]:
     is_a2_or_a3 = arch_family in {"A2", "A3"}
     if "megamoe" in rec or "dispatch_ffn_combine" in rec:
@@ -1367,6 +1401,11 @@ def _project_moe(
     if suffix == "latent_norm":
         return ("MoE Routed Latent RMSNorm", bound_kernel or "RmsNorm", BACKEND_CANN, KERNEL_STATUS_EXISTING, False, "", "latent_norm")
     if suffix == "dispatch" or "dispatch" in rec:
+        if fam in {"alltoall", "alltoallv"} and "moedistribute" not in bound_kernel.lower():
+            return (
+                "MoE EP Token Dispatch (AllToAllV)",
+                "HcclAlltoAllV", BACKEND_HCCL_MC2, KERNEL_STATUS_EXISTING, False, "", "dispatch",
+            )
         kern = bound_kernel if (bound_kernel and "Dispatch" in bound_kernel) else "MoeDistributeDispatchV2"
         return ("MoE EP Token Distribute Dispatch (MC2)", kern, BACKEND_HCCL_MC2, KERNEL_STATUS_EXISTING, False, "", "dispatch")
     is_local_unpermute = (
@@ -1381,16 +1420,22 @@ def _project_moe(
     )
     if is_local_unpermute:
         b_low = bound_kernel.lower()
-        kern = (
-            bound_kernel
-            if (bound_kernel and ("finalizerouting" in b_low or b_low == "npu_moe_token_unpermute"))
-            else "aclnnFinalizeRoutingV2"
-        )
+        if bound_kernel and "finalizerouting" in b_low:
+            kern, backend = bound_kernel, BACKEND_CANN
+        elif int(ep_degree) <= 1 or b_low == "npu_moe_token_unpermute":
+            kern, backend = "npu_moe_token_unpermute", BACKEND_TORCH_NPU
+        else:
+            kern, backend = "aclnnFinalizeRoutingV2", BACKEND_CANN
         return (
             "MoE Finalize Routing (Weighted TopK Unpermute)",
-            kern, BACKEND_CANN, KERNEL_STATUS_EXISTING, False, "", "route_unpack",
+            kern, backend, KERNEL_STATUS_EXISTING, False, "", "route_unpack",
         )
     if suffix in {"unpack", "combine"} or "combine" in rec:
+        if fam in {"alltoall", "alltoallv"} and "moedistribute" not in bound_kernel.lower():
+            return (
+                "MoE EP Token Combine (AllToAllV)",
+                "HcclAlltoAllV", BACKEND_HCCL_MC2, KERNEL_STATUS_EXISTING, False, "", "combine",
+            )
         kern = bound_kernel if (bound_kernel and "Combine" in bound_kernel) else "MoeDistributeCombineV2"
         return ("MoE EP Token Distribute Combine (MC2)", kern, BACKEND_HCCL_MC2, KERNEL_STATUS_EXISTING, False, "", "unpack")
     if suffix in {"expert_up", "expert_down"} or fam in {"grouped_gemm", "grouped_moe"}:
@@ -1415,10 +1460,16 @@ def _project_moe(
         if fam == "situ" or "situ" in rec:
             p_str = _format_situ_params(meta, layer_plan)
             role = f"{'Routed' if suffix == 'expert_act' else 'Shared'} Expert SiTU+Mul Activation {p_str}".strip()
+            if is_situ_mx:
+                return (
+                    role, bound_kernel or "SituMxQuant", BACKEND_TILELANG,
+                    f"{KERNEL_STATUS_NEW_OP} SituMxQuant{p_str}", True,
+                    f"Fused SituMxQuant{p_str} activation + MX dynamic quant epilogue", suffix,
+                )
             return (
-                role, bound_kernel or "SituAndMul", BACKEND_TILELANG,
-                f"{KERNEL_STATUS_NEW_OP} SituAndMul{p_str} + Quant", True,
-                f"Fused SituAndMul{p_str} + optional dynamic quant epilogue", suffix,
+                role, "SiTU", BACKEND_TILELANG,
+                f"{KERNEL_STATUS_NEW_OP} SiTU{p_str}", True,
+                f"Fused SiTU{p_str} gated activation", suffix,
             )
         act_kern = bound_kernel or ("aclnnSwiGluQuant" if (is_a2_or_a3 and is_quant_mm) else "SwiGlu")
         return ("Routed Expert SwiGLU Activation", act_kern, BACKEND_CANN, KERNEL_STATUS_EXISTING, False, "", suffix)
@@ -1468,6 +1519,11 @@ def _project_engram_mhc_indexer(
                 BACKEND_ASCENDC if is_ideal else BACKEND_CANN,
                 KERNEL_STATUS_NEW_OP if is_ideal else KERNEL_STATUS_FRAMEWORK,
                 bool(is_ideal), "UB-resident fused FusedMHCGatedResidualMix" if is_ideal else "", suffix,
+            )
+        if rec == "hc_final_collapse_mean" or suffix.endswith("hc_head_mean"):
+            return (
+                f"mHC Stream Mean Collapse ({suffix})", bound_kernel or "Mean",
+                BACKEND_CANN, KERNEL_STATUS_EXISTING, False, "", suffix,
             )
         kern = bound_kernel or ("mhc_sinkhorn_mix_kernel" if ("sinkhorn" in suffix or "mix" in suffix) else "HcPre")
         return (f"mHC Hyper-Connection ({suffix})", kern, BACKEND_TRITON if fam == "mhc" else BACKEND_CANN, KERNEL_STATUS_FRAMEWORK if fam == "mhc" else KERNEL_STATUS_EXISTING, False, "", suffix)
@@ -1519,7 +1575,8 @@ def _project_engram_mhc_indexer(
 def _project_family_tuple(
     *, suffix: str, fam: str, rec: str, meta: Mapping[str, Any], bound_kernel: str,
     arch_family: str, is_ideal: bool, is_raw_eager: bool, is_quant_mm: bool,
-    is_mxfp4_w: bool, is_int4_w: bool, is_c8_kv: bool, layer_plan: Any | None,
+    is_mxfp4_w: bool, is_int4_w: bool, is_c8_kv: bool,
+    ep_degree: int = 1, is_situ_mx: bool = False, layer_plan: Any | None,
 ) -> tuple[str, str, str, str, bool, str, str]:
     is_a2_or_a3 = arch_family in {"A2", "A3"}
     mm_kernel = (
@@ -1570,7 +1627,8 @@ def _project_family_tuple(
         return _project_moe(
             suffix, fam, rec, meta, bound_kernel, mm_kernel,
             arch_family=arch_family, is_ideal=is_ideal, is_quant_mm=is_quant_mm,
-            is_mxfp4_w=is_mxfp4_w, is_int4_w=is_int4_w, layer_plan=layer_plan,
+            is_mxfp4_w=is_mxfp4_w, is_int4_w=is_int4_w,
+            ep_degree=ep_degree, is_situ_mx=is_situ_mx, layer_plan=layer_plan,
         )
     if fam in COLLECTIVE_FAMILIES:
         return _project_collective(suffix, fam, rec, bound_kernel)
@@ -1591,10 +1649,16 @@ def _project_family_tuple(
     if fam in {"swiglu", "situ"}:
         if fam == "situ":
             p_str = _format_situ_params(meta, layer_plan)
+            if is_situ_mx:
+                return (
+                    f"SiTU Gated Activation + MX Quant {p_str}".strip(), bound_kernel or "SituMxQuant", BACKEND_TILELANG,
+                    f"{KERNEL_STATUS_NEW_OP} SituMxQuant{p_str}", True,
+                    f"Fused SituMxQuant{p_str} activation + MX dynamic quant epilogue", suffix,
+                )
             return (
-                f"SiTU Gated Activation {p_str}".strip(), bound_kernel or "SituAndMul", BACKEND_TILELANG,
-                f"{KERNEL_STATUS_NEW_OP} SituAndMul{p_str}", True,
-                f"Fused SituAndMul{p_str} activation (non-standard gated variant)", suffix,
+                f"SiTU Gated Activation {p_str}".strip(), "SiTU", BACKEND_TILELANG,
+                f"{KERNEL_STATUS_NEW_OP} SiTU{p_str}", True,
+                f"Fused SiTU{p_str} activation (non-standard gated variant)", suffix,
             )
         return ("SwiGLU Activation", bound_kernel or "SwiGlu", BACKEND_CANN, KERNEL_STATUS_EXISTING, False, "", suffix)
     if fam in {"embedding", "engram_gather"}:
@@ -1607,6 +1671,9 @@ def _project_family_tuple(
     if suffix in {"q_absorb", "v_expand"}:
         role = "W_UK Absorbed Q BMM" if suffix == "q_absorb" else "W_UV Value Expand BMM"
         return (role, bound_kernel or "BatchMatMulV2 (npu_transpose_batchmatmul)", BACKEND_CANN, KERNEL_STATUS_EXISTING, False, "", suffix)
+    if suffix == "grouped_output_a" or rec == "grouped_output_a":
+        wo_a_kern = "npu_transpose_quant_batchmatmul" if is_quant_mm else "TransposeBatchMatMul"
+        return (_PROJ_ROLES.get(suffix, "Grouped Low-Rank O-Proj Stage A"), wo_a_kern, BACKEND_CANN, KERNEL_STATUS_EXISTING, False, "", suffix)
     if fam in {"gemm", "projection", "gate_up_projection", "down_projection", "qkv_projection", "output_projection"}:
         return (_PROJ_ROLES.get(suffix, f"Linear Projection ({suffix})"), bound_kernel or mm_kernel, BACKEND_CANN, KERNEL_STATUS_EXISTING, False, "", suffix)
     if suffix in _EAGER_VECTOR_MAP or fam in _EAGER_VECTOR_MAP:
@@ -1650,14 +1717,23 @@ def resolve_ascend_kernel_identity(
     ).lower()
     is_c8_kv = kv_raw in {"int8", "c8"}
 
+    is_a2_or_a3 = arch_family in {"A2", "A3"}
+    situ_out_dt = str(meta.get("output_format") or dtype or "").strip().lower()
+    is_situ_mx = (not is_a2_or_a3) and (situ_out_dt in _SITU_MX_OUTPUT_DTYPES)
+    ep_degree = int(case.runtime.parallel.ep)
+
     birth_kernel, birth_backend_raw, birth_readiness, birth_source, has_birth = _extract_birth_kernel_binding(spec, meta)
     birth_kernel = _sanitize_cross_gen_kernel(
         birth_kernel, arch_family=arch_family, fam=fam, rec=rec, suffix=suffix, meta=meta, layer_plan=layer_plan,
     )
+    if not is_situ_mx and birth_kernel == "SituMxQuant":
+        birth_kernel = ""
     bound_kernel, bound_source, bound_backend = _extract_binding_identity(spec, meta, native_binding)
     struct_nat = _extract_struct_native(struct_node)
     reg_spec = _lookup_registry_spec(fam, rec) if (not birth_kernel and not bound_kernel and not struct_nat) else None
     reg_nat = _clean_native_symbol(reg_spec.native_kinds[0]) if (reg_spec and reg_spec.native_kinds) else ""
+    if not is_situ_mx and reg_nat == "SituMxQuant":
+        reg_nat = ""
     fallback_src = ""
     if isinstance(struct_node, Mapping) and struct_node.get("source_ref"):
         fallback_src = str(struct_node["source_ref"]).strip()
@@ -1668,6 +1744,8 @@ def resolve_ascend_kernel_identity(
     effective_bound = _sanitize_cross_gen_kernel(
         effective_bound, arch_family=arch_family, fam=fam, rec=rec, suffix=suffix, meta=meta, layer_plan=layer_plan,
     )
+    if not is_situ_mx and effective_bound == "SituMxQuant":
+        effective_bound = ""
 
     is_gemm = _is_gemm_like(fam, rec)
     contract_txt = _format_tensor_contract(op_id, fam, rec, shape, dtype, meta, case, layer_plan)
@@ -1675,7 +1753,7 @@ def resolve_ascend_kernel_identity(
         suffix=suffix, fam=fam, rec=rec, meta=meta, bound_kernel=effective_bound,
         arch_family=arch_family, is_ideal=is_ideal, is_raw_eager=is_raw_eager,
         is_quant_mm=is_quant_mm, is_mxfp4_w=is_mxfp4_w, is_int4_w=is_int4_w,
-        is_c8_kv=is_c8_kv, layer_plan=layer_plan,
+        is_c8_kv=is_c8_kv, ep_degree=ep_degree, is_situ_mx=is_situ_mx, layer_plan=layer_plan,
     )
 
     # Birth KernelBinding is authoritative first (zero post-hoc kernel/backend override).
@@ -1693,12 +1771,12 @@ def resolve_ascend_kernel_identity(
                 if is_synth else normalize_public_backend(birth_backend_raw, is_gemm=is_gemm)
             )
     else:
-        is_fused_mrope = "split_qkv_rmsnorm_mrope" in rec
-        if bound_backend and not needs_new and not (is_raw_eager and fam == "rmsnorm") and not is_fused_mrope:
+        preserve_backend = "split_qkv_rmsnorm_mrope" in rec or kernel == "npu_moe_token_unpermute"
+        if bound_backend and not needs_new and not (is_raw_eager and fam == "rmsnorm") and not preserve_backend:
             backend = bound_backend
         if isinstance(struct_node, Mapping):
             raw_backend = str(struct_node.get("backend_stack") or "").strip().lower()
-            if raw_backend and not bound_backend and not (is_raw_eager and fam == "rmsnorm") and not is_fused_mrope:
+            if raw_backend and not bound_backend and not (is_raw_eager and fam == "rmsnorm") and not preserve_backend:
                 backend = normalize_public_backend(raw_backend, is_gemm=is_gemm)
             raw_readiness = str(struct_node.get("readiness") or "").strip().lower()
             if raw_readiness in STRUCTURE_READINESS_MAP:
@@ -1706,7 +1784,7 @@ def resolve_ascend_kernel_identity(
                 if mapped_new or not needs_new:
                     status = mapped_status if not new_spec else f"{mapped_status} {new_spec}"
                     needs_new = mapped_new
-        elif reg_spec is not None and reg_spec.backend_stack and not needs_new and not bound_backend and not is_fused_mrope:
+        elif reg_spec is not None and reg_spec.backend_stack and not needs_new and not bound_backend and not preserve_backend:
             backend = normalize_public_backend(reg_spec.backend_stack, is_gemm=is_gemm)
         if bool(meta.get("target_rewrite_fused")):
             fused_name = _clean_native_symbol(meta.get("fused_kernel_name"))

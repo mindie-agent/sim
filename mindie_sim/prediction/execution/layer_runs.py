@@ -524,33 +524,75 @@ def _stage_counts_for_case(case: Any) -> tuple[int, ...]:
     return tuple(base + (1 if s < rem else 0) for s in range(pp))
 
 
-def _layer_quant_signature(quant: Any, layer_idx: int) -> tuple[Any, ...]:
+def _freeze_quant_sig(val: Any) -> Any:
+    if isinstance(val, Mapping):
+        return tuple(sorted((str(k), _freeze_quant_sig(v)) for k, v in val.items()))
+    if isinstance(val, (list, tuple)):
+        return tuple(_freeze_quant_sig(v) for v in val)
+    return repr(val)
+
+
+def _lookup_layer_override_sig(
+    overrides: Any, layer_idx: int, native_layer_id: int,
+) -> Any | None:
+    if not isinstance(overrides, Mapping):
+        return None
+    layers_map = overrides.get("layers") if isinstance(overrides.get("layers"), Mapping) else overrides
+    for key in (str(layer_idx), layer_idx):
+        if key in layers_map and layers_map[key] is not None:
+            return _freeze_quant_sig(layers_map[key])
+    native_map = overrides.get("native_layers")
+    if isinstance(native_map, Mapping) and native_layer_id >= 0:
+        for key in (str(native_layer_id), native_layer_id):
+            if key in native_map and native_map[key] is not None:
+                return _freeze_quant_sig(native_map[key])
+    return None
+
+
+def _layer_quant_signature(
+    quant: Any,
+    layer_idx: int,
+    *,
+    native_layer_id: int = -1,
+    model_metadata: Any = None,
+) -> tuple[Any, ...]:
     """Per-layer quant exclusion/override signature normalized to the layer token."""
-    if quant is None:
-        return ()
     target = str(int(layer_idx))
     exclusions: list[str] = []
-    for raw in getattr(quant, "exclusions", ()) or ():
-        tok = str(raw)
-        match = _QUANT_LAYER_TOKEN_RE.search(tok)
-        if match is not None and match.group(2) == target:
-            exclusions.append(_QUANT_LAYER_TOKEN_RE.sub(r"\1*\3", tok))
     overrides: list[tuple[str, tuple[tuple[str, str], ...]]] = []
-    raw_ov = getattr(quant, "category_overrides", ()) or ()
-    items = raw_ov.items() if isinstance(raw_ov, Mapping) else raw_ov
-    for key, val in items:
-        tok = str(key)
-        match = _QUANT_LAYER_TOKEN_RE.search(tok)
-        if match is not None and match.group(2) == target:
-            norm = _QUANT_LAYER_TOKEN_RE.sub(r"\1*\3", tok)
-            if isinstance(val, Mapping):
-                ov_sig = tuple(sorted((str(k), repr(v)) for k, v in val.items()))
-            else:
-                ov_sig = (("value", repr(val)),)
-            overrides.append((norm, ov_sig))
-    if not exclusions and not overrides:
+    lqo_entries: list[Any] = []
+    if quant is not None:
+        for raw in getattr(quant, "exclusions", ()) or ():
+            tok = str(raw)
+            match = _QUANT_LAYER_TOKEN_RE.search(tok)
+            if match is not None and match.group(2) == target:
+                exclusions.append(_QUANT_LAYER_TOKEN_RE.sub(r"\1*\3", tok))
+        raw_ov = getattr(quant, "category_overrides", ()) or ()
+        items = raw_ov.items() if isinstance(raw_ov, Mapping) else raw_ov
+        for key, val in items:
+            tok = str(key)
+            match = _QUANT_LAYER_TOKEN_RE.search(tok)
+            if match is not None and match.group(2) == target:
+                norm = _QUANT_LAYER_TOKEN_RE.sub(r"\1*\3", tok)
+                if isinstance(val, Mapping):
+                    ov_sig = tuple(sorted((str(k), repr(v)) for k, v in val.items()))
+                else:
+                    ov_sig = (("value", repr(val)),)
+                overrides.append((norm, ov_sig))
+        if hasattr(quant, "layer_quant_overrides_dict") and getattr(quant, "layer_quant_overrides", ()):
+            q_lqo = _lookup_layer_override_sig(quant.layer_quant_overrides_dict(), int(layer_idx), int(native_layer_id))
+            if q_lqo is not None:
+                lqo_entries.append(q_lqo)
+    if model_metadata:
+        meta_dict = dict(model_metadata) if not isinstance(model_metadata, Mapping) else model_metadata
+        m_lqo = _lookup_layer_override_sig(meta_dict.get("layer_quant_overrides"), int(layer_idx), int(native_layer_id))
+        if m_lqo is not None and m_lqo not in lqo_entries:
+            lqo_entries.append(m_lqo)
+    if not exclusions and not overrides and not lqo_entries:
         return ()
-    return (tuple(sorted(set(exclusions))), tuple(sorted(set(overrides))))
+    if not lqo_entries:
+        return (tuple(sorted(set(exclusions))), tuple(sorted(set(overrides))))
+    return (tuple(sorted(set(exclusions))), tuple(sorted(set(overrides))), tuple(lqo_entries))
 
 
 def _cohort_layer_signature(
@@ -559,8 +601,10 @@ def _cohort_layer_signature(
     *,
     cand_producers: frozenset[int],
     quant: Any,
+    model_metadata: Any = None,
 ) -> tuple[Any, ...]:
     idx = int(getattr(plan, "index", 0))
+    native_id = int(getattr(plan, "native_layer_id", -1))
     cand_src = int(getattr(plan, "candidate_source_layer_id", -1))
     idx_src = int(getattr(plan, "index_source_layer_id", -1))
     kv_own = int(getattr(plan, "kv_owner_layer_id", -1))
@@ -583,13 +627,14 @@ def _cohort_layer_signature(
         idx in cand_producers,
         cand_src >= 0,
         (idx_src >= 0, idx_src == idx),
-        _layer_quant_signature(quant, idx),
+        _layer_quant_signature(quant, idx, native_layer_id=native_id, model_metadata=model_metadata),
     )
 
 
 def discover_layer_cohorts(case: Any) -> LayerCohortPlan:
     """Group native body layers into structural cohorts without mutating ``model.layers``."""
-    plans = tuple(getattr(getattr(case, "model", None), "layer_plans", ()) or ())
+    model = getattr(case, "model", None)
+    plans = tuple(getattr(model, "layer_plans", ()) or ())
     stage_counts = _stage_counts_for_case(case)
     layer_stage = [s for s, cnt in enumerate(stage_counts) for _ in range(cnt)]
     cand_producers = frozenset(
@@ -597,12 +642,15 @@ def discover_layer_cohorts(case: Any) -> LayerCohortPlan:
         for lp in plans
         if int(getattr(lp, "candidate_source_layer_id", -1)) >= 0
     )
-    quant = getattr(getattr(case, "model", None), "quant", None)
+    quant = getattr(model, "quant", None)
+    model_metadata = getattr(model, "metadata", None)
     groups: OrderedDict[tuple[Any, ...], list[Any]] = OrderedDict()
     for lp in plans:
         idx = int(lp.index)
         st = layer_stage[idx] if idx < len(layer_stage) else 0
-        sig = _cohort_layer_signature(lp, st, cand_producers=cand_producers, quant=quant)
+        sig = _cohort_layer_signature(
+            lp, st, cand_producers=cand_producers, quant=quant, model_metadata=model_metadata,
+        )
         groups.setdefault(sig, []).append((st, lp))
 
     cohorts: list[LayerCohortSpec] = []

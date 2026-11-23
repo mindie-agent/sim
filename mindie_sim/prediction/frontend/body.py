@@ -18,6 +18,23 @@ _HC_COLLAPSE_SIGMOID_OPS = 4
 _HC_COLLAPSE_FP32_BYTES = 4
 
 
+def _mhc_mean_collapse_ops(model, ready, *, prefix, mode, stage, tokens, requests, hc_mult):
+    """Parameterless ``x.mean(dim=1)`` contraction across ``hc_mult`` streams (0 matrix FLOPs)."""
+    h = int(model.hidden_size)
+    act_bytes = _frontend.dtype_bytes(model.activation_dtype)
+    mean = _frontend.vector_op(
+        op_id=prefix + "hc_head_mean", deps=(ready,), stage=stage,
+        layer=_frontend.FINAL_LAYER, requests=requests,
+        elements=tokens * h, ops_per_element=hc_mult,
+        dtype=model.activation_dtype, family="mhc", phase=mode,
+        recipe="hc_final_collapse_mean", shape=(tokens, h),
+        read_bytes_override=tokens * hc_mult * h * act_bytes,
+        write_bytes_override=tokens * h * act_bytes,
+        metadata=(("hc_mult", hc_mult), ("collapse_mode", "mean")),
+    )
+    return [mean], mean.op_id
+
+
 def _mhc_stream_collapse_ops(model, ready, *, prefix, mode, stage, tokens, requests, hc_mult):
     """Collapse ``hc_mult`` hyper-connection streams into one hidden state before final norm."""
     h = int(model.hidden_size)
@@ -443,9 +460,20 @@ class _FrontendBody:
             tokens, _ = pcp_uniform_peer_rows(views, p.pcp, local_rows=0)
         stages = stages or _frontend.stage_map(model, runtime)
         ops, previous = [], ready
+        include_spec_tokens = mode not in {"draft", "draft_prefill"}
         cohort_valid = (
-            sum(view.q_len for grp in cohort_views_by_replica.values()
-                for view in grp if not getattr(view, "padding", False))
+            sum(
+                int(getattr(view, "global_q_len", 0) or 0)
+                or (
+                    int(view.q_len)
+                    + (
+                        int(getattr(view, "draft_proposal_tokens", 0) or 0)
+                        if include_spec_tokens else 0
+                    )
+                )
+                for grp in cohort_views_by_replica.values()
+                for view in grp if not getattr(view, "padding", False)
+            )
             if cohort_views_by_replica is not None else None
         )
         sp = _frontend.sequence_parallel.select(
@@ -553,17 +581,33 @@ class _FrontendBody:
             return _frontend.lowrank_hyper_final_mixer(
                 prefix=prefix + "final", deps=ready, stage=stage,
                 requests=requests, tokens=tokens, model=model, mode=mode)
-        hc_mult = max(
-            (int(getattr(plan, "hc_mult", 1) or 1)
-             for plan in model.layer_plans if getattr(plan, "hyper_connections", False)),
-            default=1,
+        hc_plans = [
+            plan for plan in model.layer_plans
+            if getattr(plan, "hyper_connections", False) and int(getattr(plan, "hc_mult", 1) or 1) > 1
+        ]
+        hc_mult = max((int(getattr(plan, "hc_mult", 1) or 1) for plan in hc_plans), default=1)
+        collapse_modes = {
+            str(getattr(plan, "hc_final_collapse", "learned") or "learned").strip().lower()
+            for plan in hc_plans
+        }
+        collapse_mode = (
+            "none" if "none" in collapse_modes
+            else "mean" if "mean" in collapse_modes
+            else "learned"
         )
         prefix_ops = []
         if hc_mult > 1 and tokens > 0:
-            prefix_ops, ready = _mhc_stream_collapse_ops(
-                model, ready, prefix=prefix, mode=mode, stage=stage,
-                tokens=tokens, requests=requests, hc_mult=hc_mult,
-            )
+            if collapse_mode == "mean":
+                if mode not in {"draft", "draft_prefill"}:
+                    prefix_ops, ready = _mhc_mean_collapse_ops(
+                        model, ready, prefix=prefix, mode=mode, stage=stage,
+                        tokens=tokens, requests=requests, hc_mult=hc_mult,
+                    )
+            elif collapse_mode == "learned":
+                prefix_ops, ready = _mhc_stream_collapse_ops(
+                    model, ready, prefix=prefix, mode=mode, stage=stage,
+                    tokens=tokens, requests=requests, hc_mult=hc_mult,
+                )
         final = _frontend.norm(name=prefix + "final_norm", deps=(ready,), stage=stage,
                      layer=_frontend.FINAL_LAYER, requests=requests, tokens=tokens,
                      width=model.hidden_size, model=model, mode=mode)

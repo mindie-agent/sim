@@ -416,7 +416,7 @@ class QuantSpec:
             return float(rows * cols * 4)
         if fmt in {"fp8", "fp8_e4m3", "fp8_e5m2", "int8", "w8a8"}:
             return float(rows * cols)
-        if fmt in {"mxfp4", "fp4", "fp4_e2m1", "int4", "w4a8"}:
+        if fmt in {"mxfp4", "fp4", "fp4_e2m1", "int4", "w4a8", "w4a16"}:
             return float(rows * _ceil_div(cols, 2))
         raise ModelingError(f"catalog_weight_format_unsupported:{fmt}")
 
@@ -459,15 +459,22 @@ class QuantSpec:
             data = float(rows * _ceil_div(cols, 2))
             scales = float(rows * _ceil_div(cols, group))
             return data + scales
-        if fmt in {"int4", "w4a8"}:
+        if fmt in {"int4", "w4a8", "w4a16"}:
             # W4A8_DYNAMIC packs two int4 values per byte and keeps one fp32
-            # scale per output row (per-channel, ``expert_block=1``).  A
-            # declared group size >1 is the group-per-channel spelling and
-            # charges one scale per group instead.
+            # scale per output row (per-channel, ``expert_block=1``).  Groupwise
+            # W4A16 (``wna16``, BF16/FP16 activations with ``group > 1``)
+            # allocates both ``weight_scale`` and ``weight_offset`` per group.
             group = max(1, int(self.expert_block))
             data = float(rows * _ceil_div(cols, 2))
             scale_count = rows if group <= 1 else rows * _ceil_div(cols, group)
-            return data + float(scale_count) * float(scale_bytes)
+            act_fmt = str(self.activation_format or "").strip().lower()
+            is_w4a16_groupwise = (
+                fmt in {"int4", "w4a16"}
+                and act_fmt in {"bf16", "bfloat16", "fp16", "float16"}
+                and group > 1
+            )
+            scale_tensors = 2 if is_w4a16_groupwise else 1
+            return data + float(scale_tensors * scale_count) * float(scale_bytes)
         if str(category) == "shared_expert_payload":
             # Payload only; the shared expert's scale is charged once.
             return float(rows * cols)

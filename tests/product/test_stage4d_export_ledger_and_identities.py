@@ -27,6 +27,7 @@ from mindie_sim.catalog.cache_format import dense_c8_kv_planes
 from mindie_sim.export import (
     BACKEND_CANN,
     BACKEND_HCCL_MC2,
+    BACKEND_TORCH_NPU,
     BACKEND_TRITON,
     build_export_bundle,
     compose_export_case,
@@ -65,7 +66,14 @@ DECODE_TEST_CTX = 512
 DECODE_TEST_SEQS = 2
 W4A16_TEST_ROWS = 16
 W4A16_TEST_COLS = 64
-W4A16_EXPECTED_TUPLE = (512, 64, 0, 576)
+W4A16_EXPECTED_TUPLE = (512, 128, 0, 640)
+W4A16_EP8_EXPECTED_GIB = 78.3334
+W4A16_EP8_TOL_GIB = 0.05
+A3_EP_DEGREE = 16
+A3_TP_DEGREE = 8
+A3_DP_DEGREE = 4
+GIB_DIVISOR = float(1024 ** 3)
+GEMMA4_SMALL_CTX = 128
 
 
 def _make_op(
@@ -367,19 +375,19 @@ def test_shipping_kernel_identities_route_unpack_sparse_attn_mrope_and_mx_quant(
         phase="decode", tokens=1, context=DECODE_TEST_CTX, sequences=DECODE_TEST_SEQS, scope="body",
     )
 
-    # 1. qwen3.8-flash-next @ A5 (EP=1): local route_unpack -> aclnnFinalizeRoutingV2;
+    # 1. qwen3.8-flash-next @ A5 (EP=1): local route_unpack -> npu_moe_token_unpermute (torch_npu);
     #    sparse GQA attention -> aclnnGenericBlockSparseAttention; group=32 MX quant -> DynamicMxQuant.
     raw_q38, _ = compose_export_case(
         "qwen3.8-flash-next", REPRESENTATIVE_SKUS["a5"], topology_preset="a5_pod", tp=1, ep=1, dp=1,
     )
     b_q38 = build_export_bundle(raw_q38, request=req)
     q38_ops = {o.op_id: o for o in b_q38.operators}
-    assert q38_ops["s0.l0.unpack"].ascend_kernel == "aclnnFinalizeRoutingV2"
-    assert q38_ops["s0.l0.unpack"].kernel_backend == BACKEND_CANN
+    assert q38_ops["s0.l0.unpack"].ascend_kernel == "npu_moe_token_unpermute"
+    assert q38_ops["s0.l0.unpack"].kernel_backend == BACKEND_TORCH_NPU
     assert q38_ops["s0.l3.attention"].ascend_kernel == "aclnnGenericBlockSparseAttention"
     assert q38_ops["s0.l0.expert_up.quantize"].ascend_kernel == "DynamicMxQuant"
 
-    # Explicit npu_moe_token_unpermute binding is preserved on local route_unpack.
+    # Explicit FinalizeRouting binding is preserved even at EP=1, while default EP=1 stays npu_moe_token_unpermute.
     case_q38 = parse_case(raw_q38)
     unperm_spec = _make_op(
         "s0.l0.unpack", "routing", "route_unpack",
@@ -390,11 +398,11 @@ def test_shipping_kernel_identities_route_unpack_sparse_attn_mrope_and_mx_quant(
         (), "bf16", case_q38, case_q38.model.layer_plans[0], (),
     )
     assert unperm_desc.ascend_kernel == "npu_moe_token_unpermute"
-    assert unperm_desc.kernel_backend == BACKEND_CANN
+    assert unperm_desc.kernel_backend == BACKEND_TORCH_NPU
 
     # 2. deepseek-v3.2 @ A5: group=128 blockwise FP8 quant -> DynamicQuant (NOT DynamicMxQuant);
-    #    expert_combine -> MoeDistributeCombineV2; local route_unpack -> aclnnFinalizeRoutingV2;
-    #    sparse MLA stays SparseFlashMla.
+    #    generic alltoall expert_combine -> HcclAlltoAllV; local route_unpack -> aclnnFinalizeRoutingV2;
+    #    sparse MLA stays SparseFlashMla on A5.
     raw_ds, _ = compose_export_case(
         "deepseek-v3.2", REPRESENTATIVE_SKUS["a5"], topology_preset="a5_pod",
         tp=8, ep=32, dp=4, dcp=8,
@@ -403,7 +411,8 @@ def test_shipping_kernel_identities_route_unpack_sparse_attn_mrope_and_mx_quant(
     ds_ops = {o.op_id: o for o in b_ds.operators}
     assert ds_ops["s0.l0.q_a.quantize"].ascend_kernel == "DynamicQuant"
     assert "MxQuant" not in ds_ops["s0.l0.q_a.quantize"].ascend_kernel
-    assert ds_ops["s0.l3.combine"].ascend_kernel == "MoeDistributeCombineV2"
+    assert ds_ops["s0.l3.dispatch"].ascend_kernel == "HcclAlltoAllV"
+    assert ds_ops["s0.l3.combine"].ascend_kernel == "HcclAlltoAllV"
     assert ds_ops["s0.l3.combine"].kernel_backend == BACKEND_HCCL_MC2
     assert ds_ops["s0.l3.unpack"].ascend_kernel == "aclnnFinalizeRoutingV2"
     assert ds_ops["s0.l3.unpack"].kernel_backend == BACKEND_CANN
@@ -438,7 +447,7 @@ def test_shipping_kernel_identities_route_unpack_sparse_attn_mrope_and_mx_quant(
         assert "Quant" in d128.ascend_kernel and "MxQuant" not in d128.ascend_kernel
 
     # 3. kimi-k3.1 @ A3 C8: preserve npu_kv_quant_sparse_flash_attention_vllm (NOT SparseFlashMla),
-    #    while kimi-k3.1 @ A5 MC2 unpack keeps MoeDistributeCombineV3.
+    #    generic alltoall -> HcclAlltoAllV, plain BF16 SiTU -> SiTU, while A5 MC2 keeps MoeDistributeCombineV3.
     raw_k3_a3, _ = compose_export_case(
         "kimi-k3.1", REPRESENTATIVE_SKUS["a3"], topology_preset="a3_superpod",
         tp=8, ep=32, dp=4, dcp=8, quant="w4a8", kv_cache_dtype="int8",
@@ -446,8 +455,10 @@ def test_shipping_kernel_identities_route_unpack_sparse_attn_mrope_and_mx_quant(
     b_k3_a3 = build_export_bundle(raw_k3_a3, request=req)
     k3_a3_ops = {o.op_id: o for o in b_k3_a3.operators}
     assert k3_a3_ops["s0.l3.latent_attention_batch"].ascend_kernel == "npu_kv_quant_sparse_flash_attention_vllm"
-    assert k3_a3_ops["s0.l3.combine"].ascend_kernel == "MoeDistributeCombineV2"
+    assert k3_a3_ops["s0.l3.combine"].ascend_kernel == "HcclAlltoAllV"
     assert k3_a3_ops["s0.l3.unpack"].ascend_kernel == "aclnnFinalizeRoutingV2"
+    assert k3_a3_ops["s0.l1.expert_act"].ascend_kernel == "SiTU"
+    assert k3_a3_ops["s0.l1.shared.situ"].ascend_kernel == "SiTU"
 
     raw_k3_a5, _ = compose_export_case(
         "kimi-k3.1", REPRESENTATIVE_SKUS["a5"], topology_preset="a5_pod",
@@ -486,3 +497,87 @@ def test_shipping_kernel_identities_route_unpack_sparse_attn_mrope_and_mx_quant(
         megamoe_int8.op_id, megamoe_int8, megamoe_int8.family, megamoe_int8.recipe,
         "bf16", case_ds, None,
     ) == "int8"
+
+
+def test_sparse_mla_a3_situ_wo_a_w4a16_parity_and_gemma4_decode_read_conservation():
+    req = StepRequest(
+        phase="decode", tokens=1, context=DECODE_TEST_CTX, sequences=DECODE_TEST_SEQS, scope="body",
+    )
+
+    # 1. A3 sparse MLA never emits A5-only SparseFlashMla: C8 -> npu_kv_quant_sparse_flash_attention_vllm,
+    #    BF16 -> npu_sparse_flash_attention.
+    raw_g53_c8, _ = compose_export_case(
+        "glm-5.3", REPRESENTATIVE_SKUS["a3"], topology_preset="a3_superpod",
+        tp=1, ep=A3_EP_DEGREE, dp=A3_EP_DEGREE,
+    )
+    b_g53_c8 = build_export_bundle(raw_g53_c8, request=req)
+    g53_c8_ops = {o.op_id: o for o in b_g53_c8.operators}
+    assert g53_c8_ops["s0.l0.latent_attention_batch"].ascend_kernel == "npu_kv_quant_sparse_flash_attention_vllm"
+    assert g53_c8_ops["s0.l3.dispatch"].ascend_kernel == "HcclAlltoAllV"
+    assert g53_c8_ops["s0.l3.combine"].ascend_kernel == "HcclAlltoAllV"
+
+    case_g53_bf16 = parse_case(raw_g53_c8)
+    case_g53_bf16 = replace(
+        case_g53_bf16,
+        model=replace(case_g53_bf16.model, kv_dtype="bf16", quant=replace(case_g53_bf16.model.quant, kv_dtype="bf16")),
+    )
+    bf16_sparse_op = _make_op("s0.l0.latent_attention_batch", "attention", "latent_attention_batch")
+    bf16_sparse_desc = resolve_ascend_kernel_identity(
+        bf16_sparse_op.op_id, bf16_sparse_op, "attention", "latent_attention_batch",
+        (), "bf16", case_g53_bf16, case_g53_bf16.model.layer_plans[0], (),
+    )
+    assert bf16_sparse_desc.ascend_kernel == "npu_sparse_flash_attention"
+
+    # 2. SiTU vs SituMxQuant discrimination on A5 (MX output -> SituMxQuant; BF16 -> SiTU; A3 -> SiTU).
+    raw_v4, _ = compose_export_case(
+        "deepseek-v4-flash-0731", REPRESENTATIVE_SKUS["a5"], topology_preset="a5_pod", tp=2, ep=2, dp=1,
+    )
+    case_v4 = parse_case(raw_v4)
+    situ_bf16 = _make_op("s0.l1.expert_act", "situ", "grouped_situ", dtype="bf16", metadata=(("output_format", "bf16"),))
+    situ_mx = _make_op("s0.l1.expert_act", "situ", "grouped_situ", dtype="fp8_e4m3", metadata=(("output_format", "fp8_e4m3"),))
+    assert resolve_ascend_kernel_identity(
+        situ_bf16.op_id, situ_bf16, "situ", "grouped_situ", (), "bf16", case_v4, None, (),
+    ).ascend_kernel == "SiTU"
+    assert resolve_ascend_kernel_identity(
+        situ_mx.op_id, situ_mx, "situ", "grouped_situ", (), "fp8_e4m3", case_v4, None, (),
+    ).ascend_kernel == "SituMxQuant"
+    assert resolve_ascend_kernel_identity(
+        situ_mx.op_id, situ_mx, "situ", "grouped_situ", (), "fp8_e4m3", case_g53_bf16, None, (),
+    ).ascend_kernel == "SiTU"
+
+    # 3. DeepSeek-V4 grouped_output_a (wo_a): quantized -> npu_transpose_quant_batchmatmul, BF16 -> TransposeBatchMatMul.
+    b_v4 = build_export_bundle(raw_v4, request=req)
+    v4_ops = {o.op_id: o for o in b_v4.operators}
+    assert v4_ops["s0.l0.grouped_output_a"].ascend_kernel == "npu_transpose_quant_batchmatmul"
+    wo_a_bf16 = _make_op(
+        "s0.l0.grouped_output_a", "gemm", "grouped_output_a", dtype="bf16",
+        metadata=(("activation_format", "bf16"), ("weight_format", "bf16")),
+    )
+    assert resolve_ascend_kernel_identity(
+        wo_a_bf16.op_id, wo_a_bf16, "gemm", "grouped_output_a", (), "bf16", case_v4, None, (),
+    ).ascend_kernel == "TransposeBatchMatMul"
+
+    # 4. W4A16 EP=8 kimi-k2-thinking includes BF16 weight_offset (+7.38 GiB/die) with exact ledger parity.
+    raw_k2_ep8, _ = compose_export_case(
+        "kimi-k2-thinking", REPRESENTATIVE_SKUS["a5"], topology_preset="a5_pod",
+        tp=A3_TP_DEGREE, ep=A3_TP_DEGREE, dp=1,
+    )
+    case_k2_ep8 = parse_case(raw_k2_ep8)
+    mem_k2 = Memory(case_k2_ep8)
+    led_k2 = compute_memory_quant_ledger(case_k2_ep8, seq_len=DECODE_TEST_CTX, concurrency=TEST_CONCURRENCY)
+    w_gib = mem_k2.weights[0] / GIB_DIVISOR
+    led_w_gib = (led_k2.stage_budgets[0].weight_payload_bytes + led_k2.stage_budgets[0].weight_scale_aux_bytes) / GIB_DIVISOR
+    assert abs(w_gib - W4A16_EP8_EXPECTED_GIB) < W4A16_EP8_TOL_GIB
+    assert abs(w_gib - led_w_gib) <= PARITY_ABS_TOL_BYTES / GIB_DIVISOR
+
+    # 5. gemma-4-31b per-layer BF16 overrides conserve total decode HBM reads >= receipt weight bytes.
+    raw_g4, _ = compose_export_case(
+        "gemma-4-31b", REPRESENTATIVE_SKUS["a5"], topology_preset="a5_pod", tp=1, ep=1, dp=1,
+    )
+    case_g4 = parse_case(raw_g4)
+    receipt_w_gib = Memory(case_g4).weights[0] / GIB_DIVISOR
+    b_g4 = build_export_bundle(
+        raw_g4, request=StepRequest(phase="decode", tokens=1, context=GEMMA4_SMALL_CTX, sequences=1, scope="model"),
+    )
+    bundle_read_gib = sum(o.hbm_read_bytes * o.repeat_count for o in b_g4.operators) / GIB_DIVISOR
+    assert bundle_read_gib >= receipt_w_gib

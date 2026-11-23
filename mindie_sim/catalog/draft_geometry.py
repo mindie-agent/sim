@@ -86,7 +86,7 @@ def _reference_attention_plan(model, draft, index: int) -> LayerPlan | None:
 
 
 def _draft_common_kwargs(draft, index: int, *, mhc: int, mhc_lr: int, mhc_iters: int,
-                         kv_elems: int, qk_norm: bool, q_gate: bool,
+                         hc_final_collapse: str, kv_elems: int, qk_norm: bool, q_gate: bool,
                          mla_use_nope: bool, packed_input: bool,
                          index_share: bool) -> dict:
     return {
@@ -100,6 +100,7 @@ def _draft_common_kwargs(draft, index: int, *, mhc: int, mhc_lr: int, mhc_iters:
         "kv_cache_elements": kv_elems, "qk_norm": qk_norm, "q_output_gate": q_gate,
         "hyper_connections": bool(mhc), "hc_mult": mhc,
         "hc_lowrank": mhc_lr, "hc_sinkhorn_iters": mhc_iters,
+        "hc_final_collapse": hc_final_collapse,
     }
 
 
@@ -124,6 +125,10 @@ def _draft_layer_plan(model, draft, index: int, plan_fields: dict) -> LayerPlan:
     mhc = int(draft.mhc_mult or (ref.hc_mult if ref and ref.hyper_connections else ZERO))
     mhc_lr = int(draft.mhc_lowrank or (ref.hc_lowrank if ref and ref.hyper_connections else ZERO))
     mhc_iters = int(draft.mhc_sinkhorn_iters or (ref.hc_sinkhorn_iters if ref and ref.hyper_connections else ZERO))
+    hc_collapse = str(
+        getattr(draft, "mhc_final_collapse", "")
+        or (getattr(ref, "hc_final_collapse", "learned") if ref and ref.hyper_connections else "learned")
+    )
     kv_elems = int(
         draft.kv_cache_elements
         or (ref.kv_cache_elements if ref else 0)
@@ -153,7 +158,7 @@ def _draft_layer_plan(model, draft, index: int, plan_fields: dict) -> LayerPlan:
         or (getattr(ref, "index_share_for_mtp_iteration", False) if ref else False))
     common = _draft_common_kwargs(
         draft, index, mhc=mhc, mhc_lr=mhc_lr, mhc_iters=mhc_iters,
-        kv_elems=kv_elems, qk_norm=qk_norm, q_gate=q_gate,
+        hc_final_collapse=hc_collapse, kv_elems=kv_elems, qk_norm=qk_norm, q_gate=q_gate,
         mla_use_nope=mla_use_nope, packed_input=packed_input, index_share=index_share,
     )
 

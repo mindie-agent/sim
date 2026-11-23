@@ -1143,9 +1143,28 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
     return ops, last
 
 
+def _combine_bound_to_mc2(combine, combine_meta: dict) -> bool:
+    """True when a combine op is explicitly bound to ``MoeDistributeCombine*``."""
+    group = combine_meta.get("device_kernel_group")
+    group_kernel = str(group.get("kernel") or "") if isinstance(group, dict) else ""
+    binding = getattr(combine, "kernel_binding", None)
+    bind_kernel = (
+        str(binding.get("kernel_id") or "")
+        if isinstance(binding, dict)
+        else str(getattr(binding, "kernel_id", "") or "")
+    )
+    candidates = (
+        str(combine_meta.get("native_kind") or ""),
+        str(combine_meta.get("native_kernel") or ""),
+        group_kernel,
+        bind_kernel,
+    )
+    return any("MoeDistributeCombine" in cand for cand in candidates)
+
+
 def _absorb_redundant_mc2_unpack(ops, last, *, prefix, runtime, parallel, transport, caller):
     """Omit trailing route_unpack when MC2 combine returns weighted unpermuted output."""
-    if parallel.ep <= 1 or transport is not None or caller is not None:
+    if parallel.ep <= 1 or transport is not None:
         return ops, last
     by_id = {op.op_id: op for op in ops}
     combine = by_id.get(prefix + ".combine")
@@ -1156,9 +1175,14 @@ def _absorb_redundant_mc2_unpack(ops, last, *, prefix, runtime, parallel, transp
     comm_mode = str(meta.get("moe_comm_mode") or "").strip().lower()
     combine_meta = dict(combine.metadata)
     is_mc2_combine = (
-        getattr(runtime, "moe_recipe", "") == "mc2"
-        or comm_mode == "mc2"
-        or "MoeDistributeCombine" in str(combine_meta.get("native_kind") or "")
+        _combine_bound_to_mc2(combine, combine_meta)
+        or (
+            caller is None
+            and (
+                getattr(runtime, "moe_recipe", "") == "mc2"
+                or comm_mode == "mc2"
+            )
+        )
     )
     if not is_mc2_combine:
         return ops, last

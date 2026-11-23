@@ -119,7 +119,7 @@ def _step5(c: Mapping[str, Any]) -> list[RefLayer]:
         out.append(RefLayer(
             index=index, attention="gqa", arch="gqa", ffn="moe" if moe else "dense",
             window=0 if full else window, heads=heads, kv_heads=kv_heads,
-            head_dim=head_dim, dense_i=0 if moe else intermediate,
+            head_dim=head_dim, qk_norm=True, dense_i=0 if moe else intermediate,
             experts=experts if moe else 0, moe_i=moe_i if moe else 0,
             shared=1 if moe else 0, shared_i=shared_i if moe else 0,
             qgate=gate, gate_separate=gate, indexer=sparse_layer,

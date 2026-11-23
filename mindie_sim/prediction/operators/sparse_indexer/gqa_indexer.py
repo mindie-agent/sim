@@ -158,7 +158,11 @@ def lower_gqa_indexer(
     index_store_id = candidate_id = None
     topk_id = (topk_ids or {}).get(sel_owner) if sel_owner >= 0 else None
     idx_ratio = max(1, int(plan.compress_ratio or 1), int(plan.index_kpool or 1))
-    sel_topk = max(1, eff_topk // idx_ratio) if idx_ratio > 1 else eff_topk
+    cand_topk = int(getattr(plan, "candidate_topk_blocks", 0) or 0)
+    if _is_block_msa_indexer(plan) and cand_topk > 0:
+        sel_topk = cand_topk
+    else:
+        sel_topk = max(1, eff_topk // idx_ratio) if idx_ratio > 1 else eff_topk
     block_size = max(
         1,
         int(
@@ -192,79 +196,27 @@ def lower_gqa_indexer(
             prefix, deps, stage, plan, requests, padded_tokens, idx_heads, idx_dim,
             model, quant, mode, valid, new_idx_rows, row_bytes, runtime, machine,
             pcp_prefill, views, idx_ratio, parallel, local_idx_kv_heads=local_idx_kv_heads)
-        q_idx_bytes = valid * idx_heads * idx_dim * dtype_bytes(quant.index_dtype)
-        unique_idx_rows = sum(rows_by_view)
-        l2_bounded_index_read = float(min(scored_rows, unique_idx_rows)) * row_bytes
-        shape = (scored_rows, idx_heads, idx_dim)
-        score_bytes = float(scored_rows * FP32_SCORE_BYTES)
-        score_meta: tuple[tuple[str, object], ...] = (
-            ("score_materialization", "separate_fp32_score_then_topk"),
-        )
-        if _is_block_msa_indexer(plan):
-            score_meta += (
-                ("indexer_kind", "msa_block_score"),
-                ("native_kind", "aclnnMsaIndexScore"),
-            )
-        elif _is_region_csa_indexer(plan):
-            score_meta += (
-                ("indexer_kind", "step5_region_score"),
-                ("native_kind", "step5_indexer_region_score_arch35"),
-            )
-        idx_scores = OpSpec(
-            op_id=prefix + ".index_scores",
-            family="indexer",
-            phase=mode,
-            stage=stage,
-            layer=plan.index,
-            requests=requests,
-            semantic_shape=shape,
-            local_shape=shape,
-            padded_shape=shape,
-            launch_shape=shape,
-            flops=float(2 * scored_rows * idx_heads * idx_dim),
-            vector_ops=float(INDEX_SCORE_VECTOR_OPS_PER_ROW * scored_rows * idx_heads),
-            hbm_bytes=float(l2_bounded_index_read + q_idx_bytes + score_bytes),
-            mte2_bytes=float(scored_rows * row_bytes + q_idx_bytes),
-            mte3_bytes=score_bytes,
-            deps=(idx_wq.op_id, idx_ready),
-            recipe="index_scores",
-            dtype=quant.index_dtype,
-            metadata=score_meta,
-        )
-        idx_scores = apply_indexer_prefix_reads(
-            idx_scores,
+        idx_scores, idx_topk = _build_index_score_and_topk_ops(
+            prefix=prefix,
+            plan=plan,
             views=views,
-            rows_by_view=rows_by_view,
-            shared_rows_by_view=shared_idx_by_view,
-            row_bytes=float(row_bytes),
-            layer_index=plan.index,
-            runtime=runtime,
-            compression_ratio=idx_ratio,
-            kernel_reuse=(
-                "native_per_sequence"
-                if user_pinned_idx or plan.candidate_filter
-                else "tile"
-            ),
-            allow_recipe_rebind=not user_pinned_idx,
-            hbm_component=l2_bounded_index_read,
-            mte2_component=float(scored_rows) * row_bytes,
-        )
-        idx_topk = vector_op(
-            op_id=prefix + ".index_topk",
-            deps=(idx_scores.op_id,),
             stage=stage,
-            layer=plan.index,
             requests=requests,
-            elements=scored_rows,
-            ops_per_element=TOPK_OPS_PER_ELEMENT,
-            dtype="fp32",
-            family="topk",
-            phase=mode,
-            recipe="index_topk",
-            shape=(valid, sel_topk),
-            read_bytes_override=float(scored_rows * FP32_SCORE_BYTES),
-            write_bytes_override=float(valid * sel_topk * INT32_INDEX_BYTES),
-            metadata=(("selection_output_dtype", "int32"),),
+            quant=quant,
+            mode=mode,
+            valid=valid,
+            idx_heads=idx_heads,
+            idx_dim=idx_dim,
+            row_bytes=row_bytes,
+            rows_by_view=rows_by_view,
+            shared_idx_by_view=shared_idx_by_view,
+            scored_rows=scored_rows,
+            idx_wq_id=idx_wq.op_id,
+            idx_ready=idx_ready,
+            idx_ratio=idx_ratio,
+            sel_topk=sel_topk,
+            user_pinned_idx=user_pinned_idx,
+            runtime=runtime,
         )
         ops.extend((idx_wq, idx_wk, *store_ops, *pcp_idx_ops, idx_scores, idx_topk))
         _declare_gqa_indexer_group(
@@ -277,6 +229,107 @@ def lower_gqa_indexer(
     elif idx_owner >= 0:
         index_store_id = (index_cache_ids or {}).get(idx_owner)
     return eff_topk, sel_topk, block_size, index_store_id, topk_id, candidate_id
+
+
+def _build_index_score_and_topk_ops(
+    *,
+    prefix: str,
+    plan,
+    views,
+    stage: int,
+    requests: tuple[str, ...],
+    quant,
+    mode: str,
+    valid: int,
+    idx_heads: int,
+    idx_dim: int,
+    row_bytes: float,
+    rows_by_view: list[int],
+    shared_idx_by_view: list[int],
+    scored_rows: int,
+    idx_wq_id: str,
+    idx_ready: str,
+    idx_ratio: int,
+    sel_topk: int,
+    user_pinned_idx: bool,
+    runtime,
+) -> tuple[OpSpec, OpSpec]:
+    """Construct the sparse indexer score sweep and TopK selection OpSpecs."""
+    q_idx_bytes = valid * idx_heads * idx_dim * dtype_bytes(quant.index_dtype)
+    unique_idx_rows = sum(rows_by_view)
+    l2_bounded_index_read = float(min(scored_rows, unique_idx_rows)) * row_bytes
+    shape = (scored_rows, idx_heads, idx_dim)
+    score_bytes = float(scored_rows * FP32_SCORE_BYTES)
+    score_meta: tuple[tuple[str, object], ...] = (
+        ("score_materialization", "separate_fp32_score_then_topk"),
+    )
+    if _is_block_msa_indexer(plan):
+        score_meta += (
+            ("indexer_kind", "msa_block_score"),
+            ("native_kind", "aclnnMsaIndexScore"),
+        )
+    elif _is_region_csa_indexer(plan):
+        score_meta += (
+            ("indexer_kind", "step5_region_score"),
+            ("native_kind", "step5_indexer_region_score_arch35"),
+        )
+    idx_scores = OpSpec(
+        op_id=prefix + ".index_scores",
+        family="indexer",
+        phase=mode,
+        stage=stage,
+        layer=plan.index,
+        requests=requests,
+        semantic_shape=shape,
+        local_shape=shape,
+        padded_shape=shape,
+        launch_shape=shape,
+        flops=float(2 * scored_rows * idx_heads * idx_dim),
+        vector_ops=float(INDEX_SCORE_VECTOR_OPS_PER_ROW * scored_rows * idx_heads),
+        hbm_bytes=float(l2_bounded_index_read + q_idx_bytes + score_bytes),
+        mte2_bytes=float(scored_rows * row_bytes + q_idx_bytes),
+        mte3_bytes=score_bytes,
+        deps=(idx_wq_id, idx_ready),
+        recipe="index_scores",
+        dtype=quant.index_dtype,
+        metadata=score_meta,
+    )
+    idx_scores = apply_indexer_prefix_reads(
+        idx_scores,
+        views=views,
+        rows_by_view=rows_by_view,
+        shared_rows_by_view=shared_idx_by_view,
+        row_bytes=float(row_bytes),
+        layer_index=plan.index,
+        runtime=runtime,
+        compression_ratio=idx_ratio,
+        kernel_reuse=(
+            "native_per_sequence"
+            if user_pinned_idx or plan.candidate_filter
+            else "tile"
+        ),
+        allow_recipe_rebind=not user_pinned_idx,
+        hbm_component=l2_bounded_index_read,
+        mte2_component=float(scored_rows) * row_bytes,
+    )
+    idx_topk = vector_op(
+        op_id=prefix + ".index_topk",
+        deps=(idx_scores.op_id,),
+        stage=stage,
+        layer=plan.index,
+        requests=requests,
+        elements=scored_rows,
+        ops_per_element=TOPK_OPS_PER_ELEMENT,
+        dtype="fp32",
+        family="topk",
+        phase=mode,
+        recipe="index_topk",
+        shape=(valid, sel_topk),
+        read_bytes_override=float(scored_rows * FP32_SCORE_BYTES),
+        write_bytes_override=float(valid * sel_topk * INT32_INDEX_BYTES),
+        metadata=(("selection_output_dtype", "int32"),),
+    )
+    return idx_scores, idx_topk
 
 
 def _is_block_msa_indexer(plan) -> bool:

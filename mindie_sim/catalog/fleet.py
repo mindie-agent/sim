@@ -536,6 +536,7 @@ def _step5(key: str, config: Mapping[str, Any]) -> ModelSpec:
             ffn="moe" if moe else "dense",
             window=0 if full else window,
             num_heads=heads, num_kv_heads=kv_heads, head_dim=head_dim,
+            qk_norm=True,
             qk_rope_head_dim=rope_dim, qk_nope_head_dim=nope_dim,
             intermediate_size=0 if moe else intermediate,
             num_experts=experts if moe else 0,
