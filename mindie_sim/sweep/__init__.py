@@ -69,6 +69,14 @@ from mindie_sim.sweep.stage import (
     pareto_screen as _b1_pareto, retain_finalist,
     screen_row_meta as _screen_row_meta,
 )
+from mindie_sim.sweep.mapreduce import (
+    GRANTED_WORKERS_ENV,
+    MAX_GRANTED_WORKERS,
+    MIN_GRANTED_WORKERS,
+    BoundedMapPool,
+    map_ordered,
+    resolve_granted_workers,
+)
 from mindie_sim.sweep.pd import (
     solve_optimal_deployment,
     sweep_pd_disaggregation_ratios,

@@ -31,9 +31,12 @@ import math
 import re
 from typing import Any, Literal
 
+from mindie_sim.schema.scenario import canonical_comparison_stages
+
 from .models import (
     BINDING_STATE_BOUND, BINDING_STATE_MEASURED, BINDING_STATE_UNBOUND_FORMULA,
-    DEFAULT_TOP_OPTIMIZE_KERNELS, KIB_BYTES, MIN_DENOM_EPS, OVERLAP_EXPOSED_EPS_US,
+    DEFAULT_TOP_OPTIMIZE_KERNELS, KIB_BYTES, MIN_DENOM_EPS, MODE_MODELING,
+    OVERLAP_EXPOSED_EPS_US,
     PENDING_KIND_AT_FLOOR, PENDING_KIND_TO_IMPLEMENT, PENDING_KIND_TO_OPTIMIZE,
     TRACK_CONFIG_ENV, TRACK_FRAMEWORK, TRACK_KERNEL, US_PER_MS,
     ActionRoadmapRow, AlignedComparisonRow, ExportBundle, NewKernelBacklogItem,
@@ -143,6 +146,7 @@ class ComparisonPlan:
     pending_items: tuple[PendingKernelItem, ...]
     roadmap: tuple[ActionRoadmapRow, ...]
     codesign_note: str
+    stage_waterfall: tuple[dict[str, Any], ...] = ()
 
 
 def format_signed_gain_text(saved_ms: float) -> str:
@@ -184,6 +188,93 @@ def _extract_deployment_diffs(before: ExportBundle, after: ExportBundle) -> list
 def build_parallelism_codesign_note(before_bundle: ExportBundle, after_bundle: ExportBundle) -> str:
     """Render concise factual diff of resolved deployment winner fields (empty if unchanged)."""
     return " | ".join(f"{f}: {bv} -> {av}" for f, bv, av in _extract_deployment_diffs(before_bundle, after_bundle))
+
+
+def anchor_stage_waterfall(
+    before_bundle: ExportBundle,
+    after_bundle: ExportBundle,
+    *,
+    config_bridge_span_us: float | None = None,
+    config_saved_us: float | None = None,
+) -> tuple[dict[str, Any], ...]:
+    """Anchor 4-stage Engine waterfall onto ``before_bundle.step_span_us -> after_bundle.step_span_us``.
+
+    Bridges cross-track pairs (e.g. ``merged`` -> ``expected_ideal``) so Stage 0
+    is always ``before_bundle.step_span_us``, Stage 1 is the config/parallel bridge
+    (or ``before`` when deployment config is identical), Stage 2 is ``after_bundle``'s
+    pre-synthesis / framework-rewrite span (bounded monotonically when latency drops),
+    and Stage 3 is ``after_bundle.step_span_us`` with zero telescoping gap.
+    """
+    before_us = max(0.0, float(before_bundle.step_span_us))
+    after_us = max(0.0, float(after_bundle.step_span_us))
+    raw_wf = tuple(dict(item) for item in (after_bundle.stage_waterfall or ()) if isinstance(item, Mapping))
+    raw_by_stage = {str(item.get("stage") or ""): item for item in raw_wf}
+    raw_before_us = float(raw_by_stage["before"]["step_span_us"]) if "before" in raw_by_stage else None
+    raw_cfg_us = float(raw_by_stage["config_only"]["step_span_us"]) if "config_only" in raw_by_stage else None
+    raw_fwk_us = float(raw_by_stage["framework_rewrite"]["step_span_us"]) if "framework_rewrite" in raw_by_stage else None
+
+    is_modeling = (
+        "framework_rewrite" in raw_by_stage
+        or after_bundle.analysis_mode == MODE_MODELING
+        or bool(after_bundle.target_envelope_applied)
+    )
+    stage_specs = canonical_comparison_stages("modeling" if is_modeling else "simulation")
+    same_cfg = _is_same_deployment_config(before_bundle, after_bundle)
+    fwk_raw = (
+        raw_fwk_us if raw_fwk_us is not None
+        else (raw_before_us if raw_before_us is not None else after_us)
+    )
+
+    if before_us >= after_us:
+        s2 = min(before_us, max(after_us, fwk_raw))
+        if same_cfg:
+            s1 = before_us
+        elif config_bridge_span_us is not None:
+            s1 = min(before_us, max(s2, float(config_bridge_span_us)))
+        elif config_saved_us is not None:
+            s1 = min(before_us, max(s2, before_us - float(config_saved_us)))
+        elif (
+            raw_cfg_us is not None
+            and raw_before_us is not None
+            and abs(raw_before_us - before_us) <= OVERLAP_EXPOSED_EPS_US
+        ):
+            s1 = min(before_us, max(s2, raw_cfg_us))
+        else:
+            s1 = before_us
+    else:
+        s2 = fwk_raw if (raw_fwk_us is not None or raw_before_us is not None) else after_us
+        if same_cfg:
+            s1 = before_us
+        elif config_bridge_span_us is not None:
+            s1 = max(0.0, float(config_bridge_span_us))
+        elif config_saved_us is not None:
+            s1 = max(0.0, before_us - float(config_saved_us))
+        else:
+            s1 = before_us
+
+    span_by_stage = {
+        "before": before_us,
+        "config_only": s1,
+        "framework_rewrite": s2,
+        "after": after_us,
+    }
+    rows: list[dict[str, Any]] = []
+    prev_us = before_us
+    for idx, st in enumerate(stage_specs):
+        cur_us = float(span_by_stage[st.stage])
+        existing = raw_by_stage.get(st.stage, {})
+        rows.append({
+            "stage": st.stage,
+            "owner": str(existing.get("owner") or st.owner),
+            "step_span_us": cur_us,
+            "delta_from_prev_us": 0.0 if idx == 0 else (cur_us - prev_us),
+            "cumulative_saved_us": before_us - cur_us,
+            "allowed_readiness": tuple(existing.get("allowed_readiness") or sorted(st.allowed_readiness)),
+            "allowed_rewrite_tracks": tuple(existing.get("allowed_rewrite_tracks") or st.allowed_rewrite_tracks),
+            "engine_uid": str(existing.get("engine_uid") or "unified_die_engine"),
+        })
+        prev_us = cur_us
+    return tuple(rows)
 
 
 def _row_exposed_metrics(row: AlignedComparisonRow, before_ntok: float, after_ntok: float) -> tuple[float, float, float, float, float, float]:
@@ -801,10 +892,16 @@ def build_comparison_plan(
         )
         for item in final_cards[:MAX_ROADMAP_KERNEL_ITEMS]
     ]
+    anchored_stage_wf = (
+        anchor_stage_waterfall(before_bundle, after, config_saved_us=totals["cfg_ms"] * US_PER_MS)
+        if is_comparison
+        else tuple(dict(item) for item in (before_bundle.stage_waterfall or ()) if isinstance(item, Mapping))
+    )
     return ComparisonPlan(
         aligned_rows=tuple(aligned_rows), group_accounting=tuple(accounting), waterfall=waterfall,
         pending_items=final_cards, roadmap=tuple(roadmap),
         codesign_note=build_parallelism_codesign_note(before_bundle, after) if is_comparison else "",
+        stage_waterfall=anchored_stage_wf,
     )
 
 
@@ -859,6 +956,6 @@ def build_actionable_roadmap(
 __all__ = [
     "CONSERVATION_EPS_MS", "MAX_DISPLAY_CARDS", "NEW_KERNEL_MIN_SAVED_MS", "TUNE_MIN_SAVED_MS",
     "ComparisonPlan", "GroupAccounting", "WaterfallSummary",
-    "build_actionable_roadmap", "build_comparison_plan", "build_new_kernel_backlog",
+    "anchor_stage_waterfall", "build_actionable_roadmap", "build_comparison_plan", "build_new_kernel_backlog",
     "build_parallelism_codesign_note", "build_pending_kernel_details", "format_signed_gain_text",
 ]

@@ -81,6 +81,7 @@ from mindie_sim.schema.common import ModelingError, dtype_bytes
 from mindie_sim.schema.datapath import datapath_for_die
 from mindie_sim.schema.operators import OpSpec
 
+from .action_plan import anchor_stage_waterfall
 from .kernel_catalog import (
     classify_stream_index,
     classify_submodule,
@@ -89,6 +90,7 @@ from .kernel_catalog import (
     extract_semantic_atoms,
     resolve_ascend_kernel_identity,
     resolve_comm_domain_tag,
+    resolve_operator_display_dtype,
     strip_op_prefix,
 )
 from .memory_ledger import compute_memory_quant_ledger
@@ -1824,30 +1826,42 @@ def _prepare_bundle_records(
     return filtered, tail_closure
 
 
-def build_export_bundle(
+def _apply_display_dtypes(
+    rows: Sequence[OperatorExportRow],
+    *,
+    eff_case: Case,
+    archetypes: Sequence[LayerArchetypeSpec],
+    rep_lp_by_idx: Mapping[int, Any],
+    op_spec_by_key: Mapping[tuple[int, str], OpSpec],
+) -> list[OperatorExportRow]:
+    """Surface precision ABI display tags (e.g. ``mxfp4``) after Engine & target synthesis."""
+    arch_by_id = {a.archetype_id: a for a in archetypes}
+    out: list[OperatorExportRow] = []
+    for row in rows:
+        arch = arch_by_id.get(row.archetype_id)
+        lp = (
+            rep_lp_by_idx.get(arch.rep_layer_index)
+            if (arch is not None and arch.scope == "target" and arch.rep_layer_index is not None)
+            else None
+        )
+        spec = op_spec_by_key.get((0, row.op_id))
+        disp_dt = resolve_operator_display_dtype(
+            row.op_id, spec, row.family, row.recipe, row.dtype, eff_case, lp,
+            absorbed_source_ops=row.absorbed_source_ops,
+            op_spec_by_key=op_spec_by_key,
+        )
+        out.append(replace(row, dtype=disp_dt) if disp_dt != row.dtype else row)
+    return out
+
+
+def _resolve_bundle_step_context(
     case: CaseInput,
     *,
-    request: StepRequest | None = None,
-    step_eval: StepEvaluation | None = None,
-    replay: ReplayOptions = ReplayOptions(),
-    observations_path: str | Path | None = None,
-    weight_quant: str | None = None,
-    cache_dtype: str | None = None,
-    engram_host_offload: bool | None = None,
-    include_vision_tower: bool | None = None,
-    apply_preset_to_ignored: bool = False,
-    apply_target_envelope: bool | None = None,
-    rewrite_plan: Any = None,
-    allow_unbound_formula: bool = True,
-    top_k_radar: int = DEFAULT_GAP_RADAR_TOP_K,
-    primitive_table: Any = None,
-    streams: tuple[Any, ...] = (),
-    handoff_tpot_ms: float | None = None,
-    deployment_total_dies: int | None = None,
-    pd_pool_summary: Mapping[str, Any] | None = None,
-    serve_script_supplied: bool = False,
-) -> ExportBundle:
-    """Evaluate unique layer archetypes once on ``runtime.Engine`` into ``ExportBundle``."""
+    request: StepRequest | None,
+    step_eval: StepEvaluation | None,
+    apply_target_envelope: bool | None,
+    rewrite_plan: Any,
+) -> tuple[Case, str, StepRequest, int, int, Any, bool, bool]:
     parsed = case if isinstance(case, Case) else parse_case(dict(case))
     meta = dict(parsed.runtime.metadata)
     spec_tokens = int(meta.get("draft_proposal_tokens", 0) or 0)
@@ -1878,6 +1892,40 @@ def build_export_bundle(
     include_draft = (
         step_req.scope == "model" and spec_tokens > 0 and step_req.tokens > 1
         and getattr(parsed.model, "auxiliary", None) is not None
+    )
+    return parsed, track_name, step_req, seq_count, cluster_conc, ext_plan, has_explicit_edits, include_draft
+
+
+def build_export_bundle(
+    case: CaseInput,
+    *,
+    request: StepRequest | None = None,
+    step_eval: StepEvaluation | None = None,
+    replay: ReplayOptions = ReplayOptions(),
+    observations_path: str | Path | None = None,
+    weight_quant: str | None = None,
+    cache_dtype: str | None = None,
+    engram_host_offload: bool | None = None,
+    include_vision_tower: bool | None = None,
+    apply_preset_to_ignored: bool = False,
+    apply_target_envelope: bool | None = None,
+    rewrite_plan: Any = None,
+    allow_unbound_formula: bool = True,
+    top_k_radar: int = DEFAULT_GAP_RADAR_TOP_K,
+    primitive_table: Any = None,
+    streams: tuple[Any, ...] = (),
+    handoff_tpot_ms: float | None = None,
+    deployment_total_dies: int | None = None,
+    pd_pool_summary: Mapping[str, Any] | None = None,
+    serve_script_supplied: bool = False,
+    compare_source: ExportBundle | None = None,
+) -> ExportBundle:
+    """Evaluate unique layer archetypes once on ``runtime.Engine`` into ``ExportBundle``."""
+    parsed, track_name, step_req, seq_count, cluster_conc, ext_plan, has_explicit_edits, include_draft = (
+        _resolve_bundle_step_context(
+            case, request=request, step_eval=step_eval,
+            apply_target_envelope=apply_target_envelope, rewrite_plan=rewrite_plan,
+        )
     )
     archetypes, full_schedule, rep_lp_by_idx, total_target_layers, total_draft_layers = (
         _discover_model_archetypes(parsed, include_draft=include_draft)
@@ -1954,12 +2002,16 @@ def build_export_bundle(
             per_layer_timings, prelim_rows, archetypes, parsed.model.layer_plans,
         )
 
-    # Display grouping belongs strictly after target synthesis and DAG dependency attribution.
+    # Display grouping and precision ABI display tags belong strictly after target synthesis.
+    prelim_rows = _apply_display_dtypes(
+        prelim_rows, eff_case=eff_case, archetypes=archetypes,
+        rep_lp_by_idx=rep_lp_by_idx, op_spec_by_key=op_spec_by_key,
+    )
     prelim_rows, demands_ns = _collapse_micro_split_ops(prelim_rows, demands_ns)
     prelim_rows, demands_ns = _reorder_rows_by_archetype(prelim_rows, demands_ns, archetypes)
     final_rows, rank_order, reconcile_summary = _finalize_ranked_rows(prelim_rows, observations_path)
 
-    return _assemble_export_bundle(
+    assembled = _assemble_export_bundle(
         parsed=parsed, eff_case=eff_case, step_req=step_req, step_eval=step_eval,
         seq_count=seq_count, cluster_conc=cluster_conc,
         graph_id=graph_id, pipelines=pipelines, final_rows=final_rows,
@@ -1985,6 +2037,10 @@ def build_export_bundle(
         co_design_opportunities=co_design_opportunities,
         stage_waterfall=stage_waterfall,
     )
+    if compare_source is not None:
+        anchored_wf = anchor_stage_waterfall(compare_source, assembled)
+        return replace(assembled, stage_waterfall=anchored_wf)
+    return assembled
 
 
 def _build_checkpoint_and_va_summary(

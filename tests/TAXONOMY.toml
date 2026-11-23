@@ -476,6 +476,10 @@ owns = ["mindie_sim/runtime_advisor.py", "mindie_sim/study.py", "mindie_sim/__ma
 path = "serving/test_three_domain_and_pooled_pd.py"
 tier = "tier0"
 owns = ["mindie_sim/compose/__init__.py", "mindie_sim/compose/runtime.py", "mindie_sim/sweep/pd.py", "mindie_sim/prediction/offload/policy.py", "mindie_sim/prediction/disaggregated/handoff.py"]
+[[module]]
+path = "serving/test_mapreduce_solver_and_export_polish.py"
+tier = "tier1"
+owns = ["mindie_sim/sweep/mapreduce.py", "mindie_sim/sweep/pd.py", "mindie_sim/solve.py", "mindie_sim/export/bundle.py", "mindie_sim/export/action_plan.py", "mindie_sim/export/kernel_catalog.py", "mindie_sim/export/xlsx_summary.py"]
 # ---------------------------------------------------------------- observations
 [[module]]
 path = "observations/test_multilevel_gate.py"

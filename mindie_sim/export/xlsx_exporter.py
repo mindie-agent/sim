@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -180,6 +180,7 @@ def _resolve_xlsx_bundles(
                 cache_dtype=cache_dtype, engram_host_offload=engram_host_offload,
                 include_vision_tower=include_vision_tower,
                 apply_preset_to_ignored=apply_preset_to_ignored,
+                compare_source=bundle,
             )
         )
     return bundle, compare_bundle
@@ -201,6 +202,7 @@ def _populate_workbook_sheets(
         ws_summary, bundle, compare_bundle=compare_bundle,
         macro_rows=macro_rows, roadmap=plan.roadmap,
         codesign_note=plan.codesign_note, is_script_audit=is_script_audit,
+        stage_waterfall=plan.stage_waterfall,
     )
     ws_summary.validate_max_column(SUMMARY_COLS)
     if compare_bundle is not None:
@@ -321,6 +323,8 @@ def export_comparison_xlsx(
         plan = enrich_comparison_plan_stage_receipts(
             plan, bundle, compare_bundle, plan.aligned_rows,
         )
+        if plan.stage_waterfall:
+            compare_bundle = replace(compare_bundle, stage_waterfall=plan.stage_waterfall)
 
     pending_items = plan.pending_items
     wb = Workbook()

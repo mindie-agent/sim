@@ -23,6 +23,7 @@ from collections.abc import Mapping, Sequence
 import re
 from typing import Any
 
+from mindie_sim.catalog.quant import projection_quant
 from mindie_sim.prediction.native_binding import bind_native_call
 from mindie_sim.schema.case import Case
 from mindie_sim.schema.common import ModelingError
@@ -98,6 +99,7 @@ _DTYPE_UPPER_MAP: dict[str, str] = {
     "fp4_e2m1": "MXFP4", "mxfp8": "MXFP8", "mx_fp8": "MXFP8",
     "int8": "INT8", "int4": "INT4", "int32": "INT32", "int64": "INT64",
 }
+_MXFP4_DTYPE_TOKENS = frozenset({"mxfp4", "mx_fp4", "mxfp4_e2m1", "fp4", "fp4_e2m1"})
 _NAMESPACE_BACKEND_MAP: dict[str, str] = {
     "aclnn": BACKEND_CANN,
     "cann_kernel": BACKEND_CANN,
@@ -633,6 +635,87 @@ def extract_semantic_atoms(
     return tuple(atoms)
 
 
+def _resolve_expert_weight_format(
+    spec: OpSpec | None,
+    meta: Mapping[str, Any],
+    case: Case,
+    layer_plan: Any | None,
+    *,
+    allow_model_fallback: bool = True,
+) -> str:
+    """Resolve expert weight precision format from ABI, metadata, or layer quant."""
+    abi = getattr(spec, "precision_abi", None) if spec is not None else None
+    if abi is not None:
+        w_dt = str(getattr(abi, "weight_dtype", "") or "").strip().lower()
+        if w_dt:
+            return w_dt
+        lin_m = str(getattr(abi, "linear_method", "") or "").strip().lower()
+        if lin_m in _MXFP4_DTYPE_TOKENS:
+            return "mxfp4"
+    meta_w = str(meta.get("weight_format") or meta.get("weight_dtype") or "").strip().lower()
+    if meta_w:
+        return meta_w
+    if not allow_model_fallback:
+        return ""
+    model_quant = getattr(case.model, "quant", None)
+    if model_quant is not None:
+        pq = projection_quant(model_quant, layer_plan) if layer_plan is not None else model_quant
+        exp_w = str(getattr(pq, "expert_weight_format", "") or "").strip().lower()
+        if exp_w:
+            return exp_w
+    return ""
+
+
+def _is_expert_matrix_op(op_id: str, family: str, recipe: str) -> bool:
+    suffix = strip_op_prefix(op_id).lower()
+    fam = str(family or "").strip().lower()
+    rec = str(recipe or "").strip().lower()
+    return (
+        fam in {"grouped_gemm", "grouped_moe"}
+        or suffix in {"expert_up", "expert_down"}
+        or "megamoe" in rec
+        or "dispatch_ffn_combine" in rec
+    )
+
+
+def resolve_operator_display_dtype(
+    op_id: str,
+    spec: OpSpec | None,
+    family: str,
+    recipe: str,
+    raw_dtype: str,
+    case: Case,
+    layer_plan: Any | None = None,
+    *,
+    absorbed_source_ops: Sequence[str] = (),
+    op_spec_by_key: Mapping[tuple[int, str], OpSpec] | None = None,
+) -> str:
+    """Resolve public display ``dtype`` surfacing ``mxfp4`` on MXFP4 expert operators."""
+    base_dt = str(raw_dtype or "bf16").strip() or "bf16"
+    meta = dict(spec.metadata) if (spec is not None and spec.metadata) else {}
+    direct_w = _resolve_expert_weight_format(
+        spec, meta, case, layer_plan, allow_model_fallback=False,
+    )
+    if direct_w in _MXFP4_DTYPE_TOKENS:
+        return "mxfp4"
+    if _is_expert_matrix_op(op_id, family, recipe):
+        if _resolve_expert_weight_format(spec, meta, case, layer_plan, allow_model_fallback=True) in _MXFP4_DTYPE_TOKENS:
+            return "mxfp4"
+    if absorbed_source_ops and op_spec_by_key:
+        for src_id in absorbed_source_ops:
+            src_spec = op_spec_by_key.get((0, str(src_id)))
+            if src_spec is None:
+                continue
+            src_meta = dict(src_spec.metadata) if src_spec.metadata else {}
+            src_is_exp = _is_expert_matrix_op(src_spec.op_id, src_spec.family, src_spec.recipe)
+            src_w = _resolve_expert_weight_format(
+                src_spec, src_meta, case, layer_plan, allow_model_fallback=src_is_exp,
+            )
+            if src_w in _MXFP4_DTYPE_TOKENS:
+                return "mxfp4"
+    return base_dt
+
+
 def _format_tensor_contract(
     op_id: str, family: str, recipe: str, shape: Sequence[int],
     dtype: str, meta: Mapping[str, Any], case: Case, layer_plan: Any | None,
@@ -640,6 +723,7 @@ def _format_tensor_contract(
     """Format a readable rank-local tensor contract."""
     suffix = strip_op_prefix(op_id).lower()
     fam = str(family or "").lower()
+    rec = str(recipe or "").lower()
     act_dt = _format_dtype_upper(str(meta.get("activation_format") or meta.get("input_format") or dtype or "bf16"))
     w_dt = _format_dtype_upper(str(meta.get("weight_format") or dtype or "bf16"))
     out_dt = _format_dtype_upper(str(meta.get("output_format") or dtype or "bf16"))
@@ -653,6 +737,15 @@ def _format_tensor_contract(
             e_local = max(1, int(getattr(layer_plan, "num_experts", 0) or 0) // ep)
         w_shape = f"[{e_local},{n_dim},{k_dim}]" if e_local > 0 else f"[{n_dim},{k_dim}]"
         return f"x:[{m_dim},{k_dim}] {act_dt} × W:{w_shape} {w_dt} -> y:[{m_dim},{n_dim}] {out_dt}"
+    if "megamoe" in rec or "dispatch_ffn_combine" in rec:
+        exp_w = _resolve_expert_weight_format(None, meta, case, layer_plan)
+        w_label = _format_dtype_upper(exp_w or dtype or "bf16")
+        act_label = _format_dtype_upper(
+            str(meta.get("activation_format") or meta.get("input_format") or meta.get("compute_format") or dtype or "bf16")
+        )
+        tag = domain_tag or f"EP={max(1, int(case.runtime.parallel.ep))}"
+        sh_txt = ",".join(str(d) for d in dims) if dims else "tokens"
+        return f"x:[{sh_txt}] {act_label} × W:{w_label} -> y:[{sh_txt}] {out_dt} ({tag})"
     if len(dims) == GEMM_SHAPE_RANK and (
         fam in {
             "gemm", "projection", "gate_up_projection", "down_projection",

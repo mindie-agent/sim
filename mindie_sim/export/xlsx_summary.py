@@ -279,7 +279,35 @@ def _pd_cluster_tps_cells(bundle: ExportBundle, col: str) -> tuple[float, str | 
     return e2e, (formula if abs(seed - e2e) <= 1e-6 * max(1.0, abs(e2e)) else None), die_f
 
 
-def _populate_summary_kpi_block(ws: Worksheet, bundle: ExportBundle, compare_bundle: ExportBundle | None) -> None:
+_STAGE_WF_SHORT_LABELS: dict[str, str] = {
+    "before": "Before",
+    "config_only": "[1]配置",
+    "framework_rewrite": "[2]框架",
+    "after": "[3]算子/After",
+}
+
+
+def _format_stage_waterfall_note(stage_waterfall: Sequence[Mapping[str, Any]]) -> str:
+    """Format anchored 4-stage waterfall spans in ms without altering row layout."""
+    parts: list[str] = []
+    for item in stage_waterfall:
+        if not isinstance(item, Mapping):
+            continue
+        stage = str(item.get("stage") or "").strip()
+        if stage not in _STAGE_WF_SHORT_LABELS:
+            continue
+        span_ms = float(item.get("step_span_us", 0.0) or 0.0) / US_PER_MS
+        parts.append(f"{_STAGE_WF_SHORT_LABELS[stage]} {span_ms:.3f}")
+    return f"4-Stage: {' -> '.join(parts)} ms" if len(parts) >= 2 else ""
+
+
+def _populate_summary_kpi_block(
+    ws: Worksheet,
+    bundle: ExportBundle,
+    compare_bundle: ExportBundle | None,
+    *,
+    stage_waterfall: Sequence[Mapping[str, Any]] = (),
+) -> None:
     after = compare_bundle or bundle
     is_cmp, is_decode = compare_bundle is not None, bundle.phase == "decode"
     is_modeling = after.analysis_mode == MODE_MODELING or after.has_unbound_formula_ops
@@ -371,6 +399,10 @@ def _populate_summary_kpi_block(ws: Worksheet, bundle: ExportBundle, compare_bun
         step_note = f"全网端到端单步耗时 (单步预算 <= {a_sla * acc if is_decode else a_sla:.1f} ms，与 Block 3 实际暴露总和 100% 守恒)"
         tpot_note = f"{'= 单步耗时 / 平均每步接受 Token 数' if is_decode else '首字延迟 (Prefill TTFT)'} | SLA 目标 <= {a_sla:.1f} ms"
         sla_note = "等效延迟 <= 各自 SLA 目标为 PASS；左侧差异列为优化后余量"
+
+    wf_note = _format_stage_waterfall_note(stage_waterfall) if is_cmp else ""
+    if wf_note:
+        step_note = f"{step_note} | {wf_note}"
 
     bottleneck_note = _format_physical_bottleneck_note(after.step_tight_resources)
     kpi_specs = (
@@ -595,6 +627,7 @@ def populate_summary_sheet(
     ws: Worksheet, bundle: ExportBundle, *, compare_bundle: ExportBundle | None = None,
     macro_rows: Sequence[MacroModuleRow] = (), roadmap: Sequence[ActionRoadmapRow] = (),
     codesign_note: str = "", is_script_audit: bool = False,
+    stage_waterfall: Sequence[Mapping[str, Any]] = (),
 ) -> None:
     """Populate Sheet 1 (``Summary``)."""
     apply_col_widths(ws, SUMMARY_COL_WIDTHS)
@@ -610,7 +643,7 @@ def populate_summary_sheet(
         track_note = ""
     write_banner(ws, 1, SUMMARY_COLS, f"MindIE-Sim Ascend Performance & Optimization Summary | {bundle.model_name} @ {bundle.hardware_sku}{track_note}", STYLE_TITLE)
     _populate_summary_deployment_block(ws, bundle, compare_bundle, codesign_note=codesign_note)
-    _populate_summary_kpi_block(ws, bundle, compare_bundle)
+    _populate_summary_kpi_block(ws, bundle, compare_bundle, stage_waterfall=stage_waterfall)
     next_row = _populate_summary_macro_modules_block(ws, bundle, compare_bundle, macro_rows)
     next_row = _populate_summary_action_roadmap_block(ws, next_row, roadmap, is_script_audit=is_script_audit)
     if bundle.reconciliation is not None:

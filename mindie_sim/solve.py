@@ -52,6 +52,7 @@ from mindie_sim.prediction.sharding.local_tp import rank_zero_graph_reuse
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.scenario import validate_deployment_mode
+from mindie_sim.sweep.mapreduce import map_ordered, resolve_granted_workers
 from mindie_sim.sweep.pd import (
     _prefill_workspace_tokens,
     _reclaim_sweep_memory,
@@ -301,13 +302,23 @@ def _track_summary_from_eff(eff: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _analyze_track_worker(task: tuple[Any, ...]) -> tuple[str, dict[str, Any]]:
+    """Top-level pickle-safe worker evaluating one feature-track case summary."""
+    fp, raw_case, phase, tokens, context, sequences, scope = task
+    eff = _analyze_case_bounded(
+        raw_case, phase=phase, tokens=tokens, context=context, sequences=sequences, scope=scope,
+    )
+    return fp, _track_summary_from_eff(eff)
+
+
 def _compare_feature_tracks_bounded(
     model: Any, *, hardware: str | Mapping[str, Any], runtime_stack: str | Mapping[str, Any],
     phase: str, tokens: int, context: int, sequences: int, scope: str,
     compose_kwargs: Mapping[str, Any], use_archetype_folding: bool = False,
     precomputed_summaries: Mapping[str, Mapping[str, Any]] | None = None,
+    granted_workers: int | None = None,
 ) -> dict[str, Any]:
-    """Evaluate the 4-track waterfall sequentially with replica-0 bounding to keep RSS low."""
+    """Evaluate the 4-track waterfall with bounded concurrency and replica-0 memory caps."""
     del use_archetype_folding
     skip_keys = {"feature_track", "optimizations", "exclude_optimizations", "raw_eager", "_stack_phase"}
     cleaned = {k: v for k, v in compose_kwargs.items() if k not in skip_keys}
@@ -317,6 +328,9 @@ def _compare_feature_tracks_bounded(
     }
     meta_info: dict[str, Any] = {}
     va_quant: Any = None
+    track_entries: list[tuple[str, str, dict[str, Any]]] = []
+    uncached_tasks: list[tuple[Any, ...]] = []
+    queued_fps: set[str] = set()
     for track in ("merged", "unmerged_pr", "expected_ideal", "raw_eager"):
         kw = dict(cleaned)
         if track == "raw_eager" and kw.get("quant") is None and va_quant is not None:
@@ -330,18 +344,18 @@ def _compare_feature_tracks_bounded(
             meta_info.update(model=case["model"]["name"], sku=case["machine"]["sku"])
         rep_meta = case["runtime"]["metadata"]["feature_track_report"]
         fp = _case_execution_fingerprint(case)
-        cached = summary_cache.get(fp)
-        if cached is not None:
-            summaries[track] = {**cached, "report": rep_meta}
-            del case
-            continue
-        eff = _analyze_case_bounded(case, phase=phase, tokens=tokens, context=context, sequences=sequences, scope=scope)
-        del case
-        base_summary = _track_summary_from_eff(eff)
-        summary_cache[fp] = base_summary
-        summaries[track] = {**base_summary, "report": rep_meta}
-        del eff
+        track_entries.append((track, fp, rep_meta))
+        if fp not in summary_cache and fp not in queued_fps:
+            queued_fps.add(fp)
+            uncached_tasks.append((fp, case, phase, tokens, context, sequences, scope))
+    if uncached_tasks:
+        for fp, base_summary in map_ordered(
+            _analyze_track_worker, uncached_tasks, granted_workers=granted_workers,
+        ):
+            summary_cache[fp] = base_summary
         _reclaim_sweep_memory()
+    for track, fp, rep_meta in track_entries:
+        summaries[track] = {**summary_cache[fp], "report": rep_meta}
 
     eager, merged, pr_s, ideal = (summaries[k] for k in ("raw_eager", "merged", "unmerged_pr", "expected_ideal"))
     e_ms, m_ms, p_ms, i_ms, roof_ms = (
@@ -601,6 +615,7 @@ def _export_solution_artifacts(
         handoff_tpot_ms=after_meta["handoff_tpot_ms"],
         deployment_total_dies=after_meta["deployment_total_dies"] or None,
         pd_pool_summary=after_meta["pd_pool_summary"],
+        compare_source=before_bundle if has_target_after else None,
     )
     out: dict[str, Any] = {
         "mode": mode,
@@ -649,6 +664,7 @@ def _evaluate_winner_analysis(
     target_track: str,
     mode: str,
     rewrite_plan: Any = None,
+    granted_workers: int | None = None,
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None, dict[str, Any] | None]:
     """Compute bottleneck roofline, 4-track waterfall, and optional exports for winner."""
     rec_case = solved.get("recommended_case")
@@ -724,6 +740,7 @@ def _evaluate_winner_analysis(
             phase=win_phase, tokens=win_tokens, context=win_context,
             sequences=win_seq, scope=win_scope, compose_kwargs=wf_kw,
             precomputed_summaries=precomputed_tracks,
+            granted_workers=granted_workers,
         )
     if isinstance(waterfall, dict):
         waterfall["structural_cohorts"] = len(cohort_plan.cohorts)
@@ -860,8 +877,10 @@ def solve_deployment(
     xlsx_path: str | Path | None = None, trace_path: str | Path | None = None,
     compare_track: str = "merged", target_track: str = "expected_ideal",
     mode: str = "modeling", rewrite_plan: Any = None,
+    granted_workers: int | None = None,
 ) -> dict[str, Any]:
     """One-shot deployment solver requiring explicit ``deployment_mode``."""
+    eff_workers = resolve_granted_workers(granted_workers)
     solve_mode, dep_norm, eff_tpot = _validate_solve_deployment_inputs(
         mode=mode, deployment=deployment, deployment_mode=deployment_mode,
         num_devices=num_devices, prompt_tokens=prompt_tokens, output_tokens=output_tokens,
@@ -883,6 +902,7 @@ def solve_deployment(
         runtime_stack=runtime_stack, optimizations=optimizations,
         exclude_optimizations=exclude_optimizations, kv_cache_dtype=kv_cache_dtype,
         indexer_kv_dtype=indexer_kv_dtype, allow_unconstrained_ttft=(ttft_slo_ms is None),
+        granted_workers=eff_workers,
     )
     before_track = (
         "merged"
@@ -942,6 +962,7 @@ def solve_deployment(
         xlsx_path=xlsx_path, trace_path=trace_path,
         compare_track=before_track, target_track=str(target_track),
         mode=solve_mode, rewrite_plan=rewrite_plan,
+        granted_workers=eff_workers,
     )
     iso_sla = _build_iso_sla_comparison(
         before_solved, after_solved, solve_mode=solve_mode,
