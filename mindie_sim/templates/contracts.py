@@ -32,6 +32,15 @@ LEGACY_MATRIX_ARCH_IDS = frozenset({"npu_arch_2201", "arch22"})
 DIRECT_MATRIX_ARCH_IDS = frozenset({"npu_arch_3510", "arch35"})
 FULL_LOAD_A_MAX_K = 2048
 FP16_ELEMENTS_PER_BLOCK = 16
+TILELANG_BACKENDS = frozenset({"TileLang", "tilelang_simt", "tilelang_simd"})
+
+TileLangApiTier = Literal["tilelang_simt", "tilelang_simd"]
+TileLangDispatchMode = Literal["aclgraph", "eager_prealloc", "eager_callee_alloc"]
+TileLangDmaPattern = Literal["rw11", "rw21"]
+TileLangCubeEpilogue = Literal["fixpipe", "dual_copy", "atomic_add"]
+FuseRegionBackend = Literal[
+    "catlass_evg", "dsl_mix", "dsl_vec", "tla_simt", "tilelang_simt", "tilelang_simd",
+]
 
 EvgKind = Literal[
     "acc_load", "aux_load", "row_broadcast", "col_broadcast", "exp", "relu",
@@ -358,6 +367,27 @@ class EdgeRouteBinding:
 
 
 @dataclass(frozen=True, slots=True)
+class TileLangLoweringProfile:
+    """Resolved TileLang-Ascend silicon calibration profile for template lowering."""
+
+    api_tier: TileLangApiTier
+    uses_simt: bool
+    ub_ceiling_bytes: int
+    simd_ub_ceiling_bytes: int
+    pipelined_stages: int
+    dma_pattern: TileLangDmaPattern
+    dma_attainment: float
+    dispatch_mode: TileLangDispatchMode
+    dispatch_us: float
+    vector_mode: str
+    vector_gops_per_aiv: float
+    cube_epilogue: TileLangCubeEpilogue
+    blockscaled: bool
+    hf32: bool
+    calibration_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
 class FuseRegionSpec:
     region_id: str
     op_ids: tuple[str, ...]
@@ -366,7 +396,8 @@ class FuseRegionSpec:
     edge_routes: tuple[EdgeRouteBinding, ...]
     reduction_class: AlgorithmKind
     tile_solution: TileSolution
-    backend: Literal["catlass_evg", "dsl_mix", "dsl_vec", "tla_simt"]
+    backend: FuseRegionBackend
+    tilelang_profile: TileLangLoweringProfile | None = None
 
 
 @dataclass(frozen=True, slots=True)

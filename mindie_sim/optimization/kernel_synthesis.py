@@ -76,6 +76,7 @@ from mindie_sim.prediction.runtime.tile_solver import (
     TileShape,
 )
 from mindie_sim.primitives.loader import resolve_dispatch_envelope, resolve_sim_rate_overlay
+from mindie_sim.primitives.tilelang import try_load_tilelang_calibration
 from mindie_sim.rewrite.algebra import (
     FP32_ACCUM_BYTES,
     MATMUL_SHAPE_RANK,
@@ -687,9 +688,10 @@ class KernelSynthesisSpec:
     abi_signature_id: str = ""
     binding_state: BindingState = "unbound_formula_projection"
     exposed_before_us: float | None = None
+    ub_wall_warning: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "spec_id": self.spec_id,
             "kernel_name": self.kernel_name,
             "abi_tier": self.abi_tier,
@@ -723,6 +725,9 @@ class KernelSynthesisSpec:
             "abi_signature_id": self.abi_signature_id,
             "binding_state": self.binding_state,
         }
+        if self.ub_wall_warning:
+            payload["ub_wall_warning"] = self.ub_wall_warning
+        return payload
 
     def format_formula_block(self) -> str:
         eq_txt = " ; ".join(self.symbolic_equations)
@@ -731,12 +736,13 @@ class KernelSynthesisSpec:
         l1_kb = self.l1_peak_bytes / KIB_BYTES
         l1_cap_kb = self.l1_budget_bytes / KIB_BYTES
         elided_kb = self.elided_hbm_bytes / KIB_BYTES
+        warn_suffix = f" | WARN: {self.ub_wall_warning}" if self.ub_wall_warning else ""
         return (
             f"Math: {eq_txt} | "
             f"Tile: {self.tile_algorithm} {self.tile_shape} ({self.ub_precision_mode}) | "
             f"UB={ub_kb:.1f}/{ub_cap_kb:.1f}KiB, L1={l1_kb:.1f}/{l1_cap_kb:.1f}KiB "
             f"({'PASS' if self.sram_verified else 'FAIL'}) | "
-            f"Elided HBM={elided_kb:.1f}KiB"
+            f"Elided HBM={elided_kb:.1f}KiB{warn_suffix}"
         )
 
 
@@ -1106,7 +1112,12 @@ def _solve_formula_sram(
     l0_tile = int(CUBE_TILE_MN_ELEMS * CUBE_TILE_MN_ELEMS * L0C_ACCUM_BYTES) if has_cube else 0
 
     candidates: list[TileCandidate] = []
-    for slots in (UB_DOUBLE_BUFFER_SLOTS, 1):
+    has_simd_ub_headroom = bool(has_aiv and int(datapath.simt_ub_carveout_bytes or 0) > 0 and ub_raw > ub_budget)
+    cand_modes: tuple[tuple[int, bool], ...] = (
+        ((UB_DOUBLE_BUFFER_SLOTS, True), (1, True), (1, False))
+        if has_simd_ub_headroom else ((UB_DOUBLE_BUFFER_SLOTS, has_aiv), (1, has_aiv))
+    )
+    for slots, cand_simt in cand_modes:
         live: list[LiveBufferSpec] = []
         if has_aiv and row_fp32_bytes > 0:
             live.append(LiveBufferSpec("ub_fp32_work", "ub", row_fp32_bytes, 0, 1, owner_kind="aiv", slots=slots))
@@ -1125,7 +1136,7 @@ def _solve_formula_sram(
             work_items=1,
             tiles_per_owner=1,
             buffers=tuple(live),
-            uses_simt=has_aiv,
+            uses_simt=cand_simt,
             owner_axis="aic" if (has_cube and not has_aiv) else "aiv",
         ))
     tile_spec = TilePipelineSpec(spec.family or "formula_kernel", tuple(candidates), simt_ub_carveout_bytes=carveout)
@@ -1135,28 +1146,31 @@ def _solve_formula_sram(
         buffer_units={"ub": datapath.aiv_count, "l1": datapath.aic_count, "l0c": datapath.aic_count, "l2": 1},
         stream_owners=None,
     )
+    max_ub_budget = ub_raw if has_simd_ub_headroom else ub_budget
     if has_aiv and ub_raw <= 0:
         return tile_spec, "unbounded", f"(M=1, N={tile_n}, K=1)", 0, 0, l1_tile, l1_budget, l0_tile, l0_budget, 1, False
     try:
         solved = tile_solver.solve(tile_spec, None, hw)
         peaks = {p.pool: int(p.peak_bytes) for p in solved.pool_peaks}
+        caps = {p.pool: int(p.capacity_bytes) for p in solved.pool_peaks}
         ub_pk = peaks.get("ub", row_fp32_bytes) if has_aiv else 0
+        eff_ub_budget = caps.get("ub", ub_budget) if has_aiv else ub_budget
         l1_pk = peaks.get("l1", l1_tile) if has_cube else 0
         l0_pk = peaks.get("l0c", l0_tile) if has_cube else 0
         ok = (
-            (not has_aiv or ub_pk <= ub_budget)
+            (not has_aiv or ub_pk <= eff_ub_budget)
             and (not has_cube or (l1_pk <= l1_budget and l0_pk <= l0_budget))
         )
         sh = solved.tile_shape
         return (
             tile_spec, solved.algorithm, f"(M={sh.m}, N={sh.n}, K={sh.k})",
-            ub_pk, ub_budget, l1_pk, l1_budget, l0_pk, l0_budget, solved.depth, ok,
+            ub_pk, eff_ub_budget, l1_pk, l1_budget, l0_pk, l0_budget, solved.depth, ok,
         )
     except tile_solver.TileInfeasibleError:
-        fail_algo = "ub_infeasible" if (has_aiv and row_fp32_bytes > ub_budget) else "sram_infeasible"
+        fail_algo = "ub_infeasible" if (has_aiv and row_fp32_bytes > max_ub_budget) else "sram_infeasible"
         return (
             tile_spec, fail_algo, f"(M=1, N={tile_n}, K={CUBE_TILE_K_ELEMS if has_cube else 1})",
-            row_fp32_bytes, ub_budget, l1_tile, l1_budget, l0_tile, l0_budget, 1, False,
+            row_fp32_bytes, max_ub_budget, l1_tile, l1_budget, l0_tile, l0_budget, 1, False,
         )
 
 
@@ -2018,7 +2032,12 @@ def _verify_sram_residency(
         stream_owners=None,
     )
     cands: list[TileCandidate] = []
-    for slots in (UB_DOUBLE_BUFFER_SLOTS, 1):
+    has_simd_ub_headroom = bool(has_aiv and int(datapath.simt_ub_carveout_bytes or 0) > 0 and ub_raw > ub_budget)
+    cand_modes: tuple[tuple[int, bool], ...] = (
+        ((UB_DOUBLE_BUFFER_SLOTS, True), (1, True), (1, False))
+        if has_simd_ub_headroom else ((UB_DOUBLE_BUFFER_SLOTS, has_aiv), (1, has_aiv))
+    )
+    for slots, cand_simt in cand_modes:
         live_bufs: list[LiveBufferSpec] = []
         if has_aiv and max_row_ub > 0:
             live_bufs.append(LiveBufferSpec("ub_fp32_work", "ub", max_row_ub, 0, 1, owner_kind="aiv", slots=slots))
@@ -2038,9 +2057,10 @@ def _verify_sram_residency(
             work_items=1,
             tiles_per_owner=1,
             buffers=tuple(live_bufs),
-            uses_simt=has_aiv,
+            uses_simt=cand_simt,
             owner_axis="aiv" if has_aiv else "aic",
         ))
+    max_ub_budget = ub_raw if has_simd_ub_headroom else ub_budget
     try:
         solved = tile_solver.solve(
             TilePipelineSpec("kernel_synthesis", tuple(cands), simt_ub_carveout_bytes=carveout),
@@ -2048,23 +2068,25 @@ def _verify_sram_residency(
             hw,
         )
         peaks = {p.pool: int(p.peak_bytes) for p in solved.pool_peaks}
+        caps = {p.pool: int(p.capacity_bytes) for p in solved.pool_peaks}
         ub_pk = peaks.get("ub", max_row_ub) if has_aiv else 0
+        eff_ub_budget = caps.get("ub", ub_budget) if has_aiv else ub_budget
         l1_pk = peaks.get("l1", l1_tile) if has_cube else 0
         l0_pk = peaks.get("l0c", l0_tile) if has_cube else 0
         ok = (
-            (not has_aiv or ub_pk <= ub_budget)
+            (not has_aiv or ub_pk <= eff_ub_budget)
             and (not has_cube or (l1_pk <= l1_budget and l0_pk <= l0_budget))
         )
         sh = solved.tile_shape
         return (
             solved.algorithm, f"(M={sh.m}, N={sh.n}, K={sh.k})",
-            ub_pk, ub_budget, l1_pk, l1_budget, l0_pk, l0_budget, ok,
+            ub_pk, eff_ub_budget, l1_pk, l1_budget, l0_pk, l0_budget, ok,
         )
     except tile_solver.TileInfeasibleError:
-        fail_algo = "ub_infeasible" if (has_aiv and max_row_ub > ub_budget) else "sram_infeasible"
+        fail_algo = "ub_infeasible" if (has_aiv and max_row_ub > max_ub_budget) else "sram_infeasible"
         return (
             fail_algo, f"(M=1, N={max(1, max_row_ub // FP32_ACCUM_BYTES)}, K=1)",
-            max_row_ub, ub_budget, l1_tile, l1_budget, l0_tile, l0_budget, False,
+            max_row_ub, max_ub_budget, l1_tile, l1_budget, l0_tile, l0_budget, False,
         )
 
 
@@ -2104,6 +2126,11 @@ def synthesize_kernel_spec(
     algo, t_shape, ub_pk, ub_cap, l1_pk, l1_cap, l0_pk, l0_cap, ok = _verify_sram_residency(
         members, member_traits, datapath,
     )
+    ub_warn: str | None = None
+    if datapath is not None and any(tr.trait != AlgebraicTrait.BILINEAR_MATMUL for tr in member_traits):
+        tl_cal = try_load_tilelang_calibration(str(datapath.arch_id))
+        if tl_cal is not None:
+            ub_warn = tl_cal.simt_vs_simd_ub_wall_warning(ub_pk)
     achieved = (
         min(1.0, l_star_us / target_us)
         if target_us > 0.0 and l_star_us > 0.0 else min(1.0, max(0.0, float(eta_target)))
@@ -2139,6 +2166,7 @@ def synthesize_kernel_spec(
         abi_signature_id=abi_signature_id,
         binding_state=binding_state,
         exposed_before_us=exposed_before_us,
+        ub_wall_warning=ub_warn,
     )
 
 
@@ -3336,6 +3364,7 @@ def _apply_pillar_c_tiler_extensions(
     ``GDN/KDA scan``, ``RecoverSSM``, ``MoE gating``, ``PLE``) to launch floors.
     """
     locked = locked_ids or set()
+    datapath = datapath_for_die(case.machine.dies[0])
     out: list[TargetOpNode] = []
     tiler_opps: list[CoDesignOpportunity] = []
     for node, dem in zip(nodes, demands):
@@ -3392,6 +3421,19 @@ def _apply_pillar_c_tiler_extensions(
         before_ms = float(node.dur_us) / US_PER_MS
         l_star_ms = l_star / US_PER_MS
         tiled_ms = t_after / US_PER_MS
+        ub_live = max(0, int(eval_res.ub_peak_bytes))
+        simt_gain_ms, simd_gain_ms, ub_warn = _resolve_tilelang_dual_tier_bounds(
+            datapath=datapath,
+            before_ms=before_ms,
+            l_star_ms=l_star_ms,
+            tiled_ms=tiled_ms,
+            ub_live_bytes=ub_live,
+            has_cube=True,
+            has_aiv=(ub_live > 0),
+            cube_dtype=str(node.dtype or "bf16"),
+            vector_ops=float(node.vector_ops),
+            is_vector_or_norm_region=False,
+        )
         tiler_opps.append(CoDesignOpportunity(
             opportunity_id=f"tiler_{_strip_op_prefix(node.op_id)}",
             kind="tiler_tune",
@@ -3407,9 +3449,12 @@ def _apply_pillar_c_tiler_extensions(
                 gain_ceiling_ms=before_ms - l_star_ms,
                 gain_expected_ms=before_ms - tiled_ms,
                 eliminated_gm_bytes=0,
-                ub_live_bytes=max(0, int(eval_res.ub_peak_bytes)),
-                ub_capacity_bytes=max(int(eval_res.ub_budget_bytes), int(eval_res.ub_peak_bytes)),
+                ub_live_bytes=ub_live,
+                ub_capacity_bytes=max(int(eval_res.ub_budget_bytes), ub_live),
                 requires_unabsorbed_split_cost_check=False,
+                tilelang_simt_gain_ms=simt_gain_ms,
+                tilelang_simd_or_ascendc_gain_ms=simd_gain_ms,
+                ub_wall_warning=ub_warn,
             ),
         ))
     return out, tiler_opps
@@ -4288,6 +4333,63 @@ def _collect_cross_hw_offload_opportunities(
     )]
 
 
+def _resolve_tilelang_dual_tier_bounds(
+    *,
+    datapath: DatapathCapabilitySpec,
+    before_ms: float,
+    l_star_ms: float,
+    tiled_ms: float,
+    ub_live_bytes: int,
+    has_cube: bool,
+    has_aiv: bool,
+    cube_dtype: str = "bf16",
+    vector_ops: float = 0.0,
+    is_vector_or_norm_region: bool = True,
+) -> tuple[float | None, float | None, str | None]:
+    """Compute calibrated TileLang ``T.SimtVF`` quick-win vs ``T.SimdVF / AscendC`` ceiling gains."""
+    cal = try_load_tilelang_calibration(str(datapath.arch_id))
+    if cal is None:
+        return None, None, None
+    simd_target_ms = max(l_star_ms, tiled_ms)
+    ceil_gain_ms = before_ms - l_star_ms
+    simd_gain_ms = min(ceil_gain_ms, before_ms - simd_target_ms)
+    ub_warn = (
+        cal.simt_vs_simd_ub_wall_warning(ub_live_bytes)
+        if (is_vector_or_norm_region or has_aiv) else None
+    )
+    if (is_vector_or_norm_region or has_aiv) and ub_live_bytes > cal.simt_usable_ub_bytes:
+        # T.SimtVF exceeds the 216 KiB UB ceiling (ACL 107000) and yields zero quick-win gain.
+        return min(0.0, simd_gain_ms), simd_gain_ms, ub_warn
+
+    disp_ms = cal.aclgraph_issue_us / US_PER_MS
+    cube_tl_ms = 0.0
+    if has_cube:
+        eta_cube = cal.cube_attainment(
+            cube_dtype, blockscaled=(str(cube_dtype or "").strip().lower() == "mxfp8"),
+        )
+        cube_tl_ms = tiled_ms / eta_cube
+    if has_cube and not has_aiv:
+        t_quick_ms = max(simd_target_ms, cube_tl_ms, disp_ms)
+    else:
+        dma_simt_ms = tiled_ms / cal.dma_attainment(uses_simt=True, rw_pattern="rw21")
+        vec_simt_ms = 0.0
+        if vector_ops > 0.0:
+            aiv_count = max(1, int(datapath.aiv_count))
+            simt_ops_per_ms = (
+                float(aiv_count)
+                * cal.vector_ops_per_s_per_aiv(uses_simt=True, op_kind="ub_fma")
+                / MS_PER_SECOND
+            )
+            vec_simt_ms = float(vector_ops) / simt_ops_per_ms
+        t_quick_ms = max(simd_target_ms, dma_simt_ms, vec_simt_ms, cube_tl_ms, disp_ms)
+    raw_simt_gain = before_ms - t_quick_ms
+    if simd_gain_ms >= 0.0:
+        simt_gain_ms = min(simd_gain_ms, max(0.0, raw_simt_gain))
+    else:
+        simt_gain_ms = min(simd_gain_ms, raw_simt_gain)
+    return simt_gain_ms, simd_gain_ms, ub_warn
+
+
 def _collect_codesign_opportunities(
     case: Case,
     nodes: Sequence[TargetOpNode],
@@ -4298,6 +4400,12 @@ def _collect_codesign_opportunities(
     step_request: StepRequest | None,
 ) -> tuple[CoDesignOpportunity, ...]:
     """Assemble typed ``MegaFusionBound``, ``SpaceTimeTradeoffSpec`` & ``CrossHwOffloadSpec`` records."""
+    datapath = datapath_for_die(case.machine.dies[0])
+    node_by_spec_id = {
+        n.synthesis_spec.spec_id: n
+        for n in nodes
+        if n.synthesis_spec is not None and n.synthesis_spec.spec_id
+    }
     opps: list[CoDesignOpportunity] = []
     for spec in specs:
         if not spec.sram_verified or len(spec.constituent_op_ids) < MIN_FUSE_MEMBERS:
@@ -4308,6 +4416,24 @@ def _collect_codesign_opportunities(
         l_star_ms = min(tiled_ms, max(0.0, float(spec.l_star_us) / US_PER_MS))
         ub_live = max(0, int(spec.ub_peak_bytes))
         ub_cap = max(int(spec.ub_budget_bytes), ub_live)
+        matched = node_by_spec_id.get(spec.spec_id)
+        has_cube = (
+            AlgebraicTrait.BILINEAR_MATMUL.value in spec.constituent_traits
+            or (matched is not None and float(matched.flops) > 0.0)
+        )
+        has_aiv = any(t != AlgebraicTrait.BILINEAR_MATMUL.value for t in spec.constituent_traits) or not has_cube
+        simt_gain_ms, simd_gain_ms, ub_warn = _resolve_tilelang_dual_tier_bounds(
+            datapath=datapath,
+            before_ms=before_ms,
+            l_star_ms=l_star_ms,
+            tiled_ms=tiled_ms,
+            ub_live_bytes=ub_live,
+            has_cube=has_cube,
+            has_aiv=has_aiv,
+            cube_dtype=str(matched.dtype or "bf16") if matched is not None else "bf16",
+            vector_ops=float(matched.vector_ops) if matched is not None else 0.0,
+            is_vector_or_norm_region=has_aiv,
+        )
         is_shipping = spec.binding_state == "bound_implementation"
         opps.append(CoDesignOpportunity(
             opportunity_id=f"mega_{spec.spec_id}",
@@ -4327,6 +4453,9 @@ def _collect_codesign_opportunities(
                 ub_live_bytes=ub_live,
                 ub_capacity_bytes=ub_cap,
                 requires_unabsorbed_split_cost_check=True,
+                tilelang_simt_gain_ms=simt_gain_ms,
+                tilelang_simd_or_ascendc_gain_ms=simd_gain_ms,
+                ub_wall_warning=ub_warn or spec.ub_wall_warning,
             ),
         ))
     opps.extend(tiler_opps)

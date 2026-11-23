@@ -291,6 +291,14 @@ path = "operators/test_catlass_and_dsl_templates.py"
 tier = "tier0"
 owns = ["mindie_sim/templates", "scripts/check_template_provenance.py"]
 [[module]]
+path = "operators/test_tilelang_0115_calibration_and_lowering.py"
+tier = "tier0"
+owns = [
+  "data/primitives/arch35_a5_950dt_tilelang.json",
+  "mindie_sim/primitives/tilelang.py",
+  "tools/bench_tilelang_primitives.py",
+]
+[[module]]
 path = "operators/test_hyper_connections.py"
 tier = "tier0"
 owns = ["mindie_sim/prediction/operators/hyper_connections"]

@@ -18,6 +18,7 @@ from .contracts import (
     TemplateLoweringResult,
     TemplateSourceRef,
     TensorRangeObligation,
+    TileLangLoweringProfile,
     compose_step_obligations,
 )
 from .dsl_catalog import (
@@ -33,7 +34,7 @@ from .dsl_catalog import (
     resolve_flash_kda_route,
 )
 from .dsl_lower import lower_dsl_spec
-from .fuse_region import compile_fuse_region
+from .fuse_region import compile_fuse_region, resolve_tilelang_profile
 from .registry import TemplateCatalog, all_template_source_refs, builtin_template_catalog
 
 __all__ = [
@@ -57,6 +58,7 @@ __all__ = [
     "TemplateLoweringResult",
     "TemplateSourceRef",
     "TensorRangeObligation",
+    "TileLangLoweringProfile",
     "all_template_source_refs",
     "builtin_template_catalog",
     "compile_fuse_region",
@@ -66,4 +68,5 @@ __all__ = [
     "lower_catlass_spec",
     "lower_dsl_spec",
     "resolve_flash_kda_route",
+    "resolve_tilelang_profile",
 ]

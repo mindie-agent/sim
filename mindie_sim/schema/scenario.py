@@ -414,6 +414,9 @@ class MegaFusionBound:
     ub_live_bytes: int
     ub_capacity_bytes: int
     requires_unabsorbed_split_cost_check: bool = True
+    tilelang_simt_gain_ms: float | None = None
+    tilelang_simd_or_ascendc_gain_ms: float | None = None
+    ub_wall_warning: str | None = None
 
     def __post_init__(self) -> None:
         ops = tuple(_req_str(op, "mega_fusion_op_id_invalid") for op in self.region_op_ids)
@@ -441,6 +444,27 @@ class MegaFusionBound:
         ub_cap = _int_val(self.ub_capacity_bytes, "mega_fusion_ub_cap_invalid", minimum=0)
         if ub_cap > 0 and ub_live > ub_cap:
             raise ModelingError(f"mega_fusion_ub_overflow:ub_live={ub_live}>ub_cap={ub_cap}")
+        simt_gain = (
+            _finite_float(self.tilelang_simt_gain_ms, "mega_fusion_tilelang_simt_gain_invalid", allow_negative=True)
+            if self.tilelang_simt_gain_ms is not None else None
+        )
+        simd_gain = (
+            _finite_float(self.tilelang_simd_or_ascendc_gain_ms, "mega_fusion_tilelang_simd_gain_invalid", allow_negative=True)
+            if self.tilelang_simd_or_ascendc_gain_ms is not None else None
+        )
+        if simd_gain is not None and simd_gain > ceil_gain + FLOAT_TOL:
+            raise ModelingError(
+                f"mega_fusion_simd_gain_exceeds_ceiling:simd={simd_gain}>ceiling={ceil_gain}"
+            )
+        if simt_gain is not None and simd_gain is not None and simt_gain > simd_gain + FLOAT_TOL:
+            raise ModelingError(
+                f"mega_fusion_simt_gain_exceeds_simd:simt={simt_gain}>simd={simd_gain}"
+            )
+        warning: str | None = None
+        if self.ub_wall_warning is not None:
+            if not isinstance(self.ub_wall_warning, str) or not self.ub_wall_warning.strip():
+                raise ModelingError("mega_fusion_ub_wall_warning_invalid")
+            warning = self.ub_wall_warning.strip()
         object.__setattr__(self, "region_op_ids", ops)
         object.__setattr__(self, "exposed_before_ms", before)
         object.__setattr__(self, "boundary_lower_bound_ms", l_star)
@@ -450,6 +474,9 @@ class MegaFusionBound:
         object.__setattr__(self, "eliminated_gm_bytes", elim)
         object.__setattr__(self, "ub_live_bytes", ub_live)
         object.__setattr__(self, "ub_capacity_bytes", ub_cap)
+        object.__setattr__(self, "tilelang_simt_gain_ms", simt_gain)
+        object.__setattr__(self, "tilelang_simd_or_ascendc_gain_ms", simd_gain)
+        object.__setattr__(self, "ub_wall_warning", warning)
 
 
 @dataclass(frozen=True, slots=True)

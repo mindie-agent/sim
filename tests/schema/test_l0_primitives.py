@@ -29,7 +29,7 @@ from mindie_sim.prediction.runtime.memory_physics import (
 from mindie_sim.prediction.runtime.tile_solver import LiveBufferSpec
 from mindie_sim.prediction.streams import StreamCoreBudget, StreamLane, StreamPlan
 from mindie_sim.primitives import (
-    UncertaintyBand, default_primitives_dir, frame_wire_bytes, load_manifest, load_primitives,
+    TILELANG_SEALED_FILES, UncertaintyBand, default_primitives_dir, frame_wire_bytes, load_manifest, load_primitives,
     lower_primitive, parse_primitive_table, resolve_primitive_rate, submit_lowered_primitive,
 )
 from mindie_sim.public.errors import UnmodeledCapabilityError
@@ -157,7 +157,9 @@ def test_sealed_envelopes_match_manifest_and_preserve_calibrated_rate_bounds():
     manifest = load_manifest()
     entries = manifest["tables"]
     assert len(entries) == 5 and not PRIVATE_SOURCE.search(json.dumps(manifest))
-    assert {e["file"] for e in entries.values()} == {p.name for p in PRIMITIVES_DIR.glob("*.json") if p.name != "manifest.json"}
+    assert {e["file"] for e in entries.values()} | set(TILELANG_SEALED_FILES.values()) == {
+        p.name for p in PRIMITIVES_DIR.glob("*.json") if p.name != "manifest.json"
+    }
     for sku, entry in entries.items():
         path = PRIMITIVES_DIR / entry["file"]
         cap = PRIMITIVES_DIR / "captures" / f"{path.stem}.capture.json"

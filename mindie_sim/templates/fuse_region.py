@@ -29,13 +29,21 @@ from mindie_sim.prediction.runtime.ring_buffer import RingBuffer, lower_generati
 from mindie_sim.prediction.runtime.tile_solver import (
     AIC_POOLS, LiveBufferSpec, TileCandidate, TilePipelineSpec, TileShape, solve,
 )
+from mindie_sim.primitives.tilelang import (
+    TILELANG_DMA_STAGE_DOUBLE,
+    TILELANG_OPS_PER_GOP,
+    TileLangCalibration,
+    load_tilelang_calibration,
+)
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.datapath import DatapathCapabilitySpec
 from mindie_sim.schema.hardware import NATIVE_WORK_UNITS
 
 from .contracts import (
+    TILELANG_BACKENDS,
     EdgeRouteBinding, FuseRegionSpec, FusedRegionSummary, SemanticWorkItem,
-    TemplateLoweringResult, TensorRangeObligation, _external_reads, _logical_obligation, _obligation_runs,
+    TemplateLoweringResult, TensorRangeObligation, TileLangLoweringProfile,
+    _external_reads, _logical_obligation, _obligation_runs,
     _record_produced, _region_order, _run_end, _split_entry_residency, _topological,
     _union_obligations, ceil_div,
 )
@@ -44,6 +52,70 @@ from .fuse_region_live import _BoundTemplateProgram, _LiveAccess, _ReuseLifetime
 _VECTOR_PIPES = {"vector", "vec_alu", "vec_sfu", "vec_reduce", "aiv_simt", "sort_topk"}
 _AIC_RESOURCES = {"cube", "fixpipe", "mte2_aic", "mte1"}
 _AIV_RESOURCES = _VECTOR_PIPES | {"mte2_aiv", "mte3"}
+_VALID_FUSE_BACKENDS = frozenset({"catlass_evg", "dsl_mix", "dsl_vec", "tla_simt", *TILELANG_BACKENDS})
+_TILELANG_DISPATCH_MODES = frozenset({"aclgraph", "eager_prealloc", "eager_callee_alloc"})
+_TILELANG_DMA_PATTERNS = frozenset({"rw11", "rw21"})
+_TILELANG_CUBE_EPILOGUES = frozenset({"fixpipe", "dual_copy", "atomic_add"})
+_OPS_PER_MS_PER_GOP = TILELANG_OPS_PER_GOP / 1000.0
+
+
+def resolve_tilelang_profile(
+    datapath: DatapathCapabilitySpec,
+    *,
+    backend: str = "TileLang",
+    uses_simt: bool = False,
+    stages: int = TILELANG_DMA_STAGE_DOUBLE,
+    dma_pattern: str = "rw11",
+    dispatch_mode: str = "aclgraph",
+    vector_mode: str | None = None,
+    cube_epilogue: str = "fixpipe",
+    blockscaled: bool = False,
+    hf32: bool = False,
+    calibration: TileLangCalibration | None = None,
+) -> tuple[TileLangLoweringProfile, TileLangCalibration]:
+    """Resolve explicit ``tilelang_simt`` / ``tilelang_simd`` lowering profile from sealed data."""
+    if backend not in TILELANG_BACKENDS:
+        raise ModelingError(f"tilelang_backend_invalid:{backend}")
+    if backend == "tilelang_simd" and uses_simt:
+        raise ModelingError("tilelang_simd_incompatible_with_uses_simt")
+    eff_simt = True if backend == "tilelang_simt" else (False if backend == "tilelang_simd" else bool(uses_simt))
+    api_tier = "tilelang_simt" if eff_simt else "tilelang_simd"
+    if dispatch_mode not in _TILELANG_DISPATCH_MODES:
+        raise ModelingError(f"tilelang_dispatch_mode_invalid:{dispatch_mode}")
+    if dma_pattern not in _TILELANG_DMA_PATTERNS:
+        raise ModelingError(f"tilelang_dma_pattern_invalid:{dma_pattern}")
+    if cube_epilogue not in _TILELANG_CUBE_EPILOGUES:
+        raise ModelingError(f"tilelang_cube_epilogue_invalid:{cube_epilogue}")
+    cal = calibration if calibration is not None else load_tilelang_calibration(str(datapath.arch_id))
+    dp_ub = int(dict(datapath.buffers).get("ub", 0))
+    simd_ceiling = min(dp_ub, cal.simd_usable_ub_bytes) if dp_ub > 0 else 0
+    if eff_simt:
+        dp_simt_ub = max(0, simd_ceiling - int(datapath.simt_ub_carveout_bytes))
+        ub_ceiling = min(dp_simt_ub, cal.simt_usable_ub_bytes)
+    else:
+        ub_ceiling = simd_ceiling
+    eff_vec_mode = vector_mode or ("ub_fma" if eff_simt else "ub_stream")
+    profile = TileLangLoweringProfile(
+        api_tier=api_tier,
+        uses_simt=eff_simt,
+        ub_ceiling_bytes=ub_ceiling,
+        simd_ub_ceiling_bytes=simd_ceiling,
+        pipelined_stages=int(stages),
+        dma_pattern=dma_pattern,
+        dma_attainment=cal.dma_attainment(int(stages), uses_simt=eff_simt, rw_pattern=dma_pattern),
+        dispatch_mode=dispatch_mode,
+        dispatch_us=cal.dispatch_floor_us(
+            aclgraph_captured=(dispatch_mode == "aclgraph"),
+            callee_alloc=(dispatch_mode == "eager_callee_alloc"),
+        ),
+        vector_mode=eff_vec_mode,
+        vector_gops_per_aiv=cal.vector_gops_per_aiv(uses_simt=eff_simt, op_kind=eff_vec_mode),
+        cube_epilogue=cube_epilogue,
+        blockscaled=bool(blockscaled),
+        hf32=bool(hf32),
+        calibration_sha256=cal.envelope_sha256,
+    )
+    return profile, cal
 
 
 def validate_live_buffer_owners(buffers: Sequence[LiveBufferSpec]) -> None:
@@ -56,19 +128,30 @@ def validate_live_buffer_owners(buffers: Sequence[LiveBufferSpec]) -> None:
             raise ModelingError(f"live_buffer_pool_owner_mismatch:{buffer.name}:{buffer.pool}:{buffer.owner_kind}")
 
 
-def solve_template_tile(datapath, family, candidate, *, state=None, die=0, reserved=0):
+def solve_template_tile(
+    datapath, family, candidate, *, state=None, die=0, reserved=0,
+    tilelang_profile: TileLangLoweringProfile | None = None,
+):
     validate_live_buffer_owners(candidate.buffers)
     if candidate.uses_simt and datapath.simt_ub_carveout_bytes <= 0:
         raise ModelingError("template_simt_carveout_required")
     existing = state.reserved_bytes(die) if state is not None else 0
     capacity = dict(datapath.buffers)
+    simt_carveout = datapath.simt_ub_carveout_bytes if candidate.uses_simt else 0
+    if tilelang_profile is not None:
+        capacity["ub"] = tilelang_profile.simd_ub_ceiling_bytes
+        if candidate.uses_simt:
+            simt_carveout = max(
+                int(datapath.simt_ub_carveout_bytes),
+                max(0, capacity["ub"] - tilelang_profile.ub_ceiling_bytes),
+            )
     if reserved < 0 or reserved + existing > capacity.get("l2", 0):
         raise ModelingError(f"template_l2_reservation_overflow:{family}")
     streams = max(1, state.active_stream_count(die)) if state is not None else 1
     options = dict(l2_granule_bytes=state.granule_bytes) if state is not None else {}
     pipeline = TilePipelineSpec(
         family, (candidate,),
-        simt_ub_carveout_bytes=datapath.simt_ub_carveout_bytes if candidate.uses_simt else 0,
+        simt_ub_carveout_bytes=simt_carveout,
         subtile_waves=datapath.subtile_wave,
         active_l2_streams=streams, l2_reserved_bytes=reserved + existing, **options,
     )
@@ -160,6 +243,23 @@ def bind_template_access_ledger(
     return stage
 
 
+def _scaled_copy_rates(context: RecipeContext, pipe: str, attainment: float) -> tuple[float | None, float | None]:
+    if attainment >= 1.0:
+        return None, None
+    pipe_role = pipe
+    if pipe_role not in context.resource_names and pipe_role.startswith("mte2"):
+        pipe_role = "mte2"
+    if pipe_role not in context.resource_names:
+        return None, None
+    pipe_row = context.resource_names[pipe_role]
+    pipe_units = context._units_for(pipe, pipe_row, context._units_for(pipe_role, pipe_row, 1))
+    pipe_rate = float(context.rates[pipe_row]) / float(pipe_units)
+    primitive = context._datacopy_cell()
+    hit_rate = context._copy_rate(pipe, "hit", pipe_units, pipe_rate, primitive)
+    miss_rate = context._copy_rate(pipe, "miss", pipe_units, pipe_rate, primitive)
+    return hit_rate * attainment, miss_rate * attainment
+
+
 class Lowering:
     """Shared stage and byte ledger construction for the catalog lowerers."""
 
@@ -167,10 +267,15 @@ class Lowering:
         self, datapath, *, context: RecipeContext | None = None,
         memory_view: AdmissionMemoryView | None = None, die: int = 0,
         live_admission: bool = False,
+        tilelang_profile: TileLangLoweringProfile | None = None,
+        tilelang_calibration: TileLangCalibration | None = None,
     ):
         self.datapath = datapath
         self.context = context
         self.die = die
+        self.tilelang_profile = tilelang_profile
+        self.tilelang_calibration = tilelang_calibration
+        dma_eta = tilelang_profile.dma_attainment if tilelang_profile is not None else 1.0
         memory = datapath.memory_access
         self.state = deepcopy(memory_view) if memory_view is not None else AdmissionMemoryView(
             {die: dict(datapath.buffers).get("l2", 0)}, memory_access=memory,
@@ -182,8 +287,8 @@ class Lowering:
             hbm = context.resource_names["hbm"]
             rate = context.rates[hbm]
             self.hbm_bus = HbmBusSpec(
-                die, min(rate, datapath.hbm_read_bytes_per_s / 1000 or rate),
-                min(rate, datapath.hbm_write_bytes_per_s / 1000 or rate), datapath.hbm_rw_alpha,
+                die, min(rate, datapath.hbm_read_bytes_per_s / 1000 or rate) * dma_eta,
+                min(rate, datapath.hbm_write_bytes_per_s / 1000 or rate) * dma_eta, datapath.hbm_rw_alpha,
                 row_r=hbm + ":r", row_w=hbm + ":w",
                 ctr_r=hbm + ":ctr_r", ctr_w=hbm + ":ctr_w",
                 memory_access=bus_memory,
@@ -216,6 +321,16 @@ class Lowering:
         return stage.name
 
     def launch(self, name="launch", *, after=()) -> str:
+        if self.tilelang_profile is not None:
+            latency = self.tilelang_profile.dispatch_us / 1000.0
+            meta = {
+                "stars_launch": True,
+                "tilelang_api_tier": self.tilelang_profile.api_tier,
+                "tilelang_dispatch_mode": self.tilelang_profile.dispatch_mode,
+                "tilelang_dispatch_us": self.tilelang_profile.dispatch_us,
+            }
+            self.launches += 1
+            return self.add(Stage(name, after=after, latency=latency, metadata=meta))
         stars = self.datapath.stars_spec
         latency = 0
         if stars is not None:
@@ -338,9 +453,12 @@ class Lowering:
         name, after = placeholder.name, placeholder.after
         pattern = lifetimes.resolve(declared)
         plan = pattern.runs
+        dma_eta = self.tilelang_profile.dma_attainment if self.tilelang_profile is not None else 1.0
         if self.context is not None:
+            copy_hit, copy_miss = _scaled_copy_rates(self.context, pattern.pipe, dma_eta)
             bound = self.context.bind_access(
-                pattern, self.state, hbm_bus=self.hbm_bus, burst_rules=self.burst_rules, commit=True,
+                pattern, self.state, hbm_bus=self.hbm_bus, burst_rules=self.burst_rules,
+                copy_hit_bytes_per_ms=copy_hit, copy_miss_bytes_per_ms=copy_miss, commit=True,
             )
             stage = bound.to_stage(name, after=after)
             if bound.l2_row_id not in self.context.rates and bound.l2_row_id in stage.work:
@@ -350,14 +468,21 @@ class Lowering:
         else:
             # Unit-rate normalization recovers native byte work independently
             # of hardware service rates. An Engine supplies real rates later.
-            bus = HbmBusSpec(self.die, 1, 1, 0, row_r="hbm", row_w="hbm",
+            bus = HbmBusSpec(self.die, dma_eta, dma_eta, 0, row_r="hbm", row_w="hbm",
                              memory_access=self.state.memory_access)
             bound = bind_memory_access(
-                pattern, self.state, hbm_bus=bus, copy_hit_bytes_per_ms=1,
-                copy_miss_bytes_per_ms=1, l2_bytes_per_ms=1, pipe_row_id=pattern.pipe,
+                pattern, self.state, hbm_bus=bus, copy_hit_bytes_per_ms=dma_eta,
+                copy_miss_bytes_per_ms=dma_eta, l2_bytes_per_ms=1, pipe_row_id=pattern.pipe,
                 l2_row_id="l2", burst_rules=self.burst_rules, commit=True,
             )
             stage = bound.to_stage(name, after=after)
+        if self.tilelang_profile is not None:
+            stage = replace(stage, metadata={
+                **stage.metadata,
+                "tilelang_api_tier": self.tilelang_profile.api_tier,
+                "tilelang_dma_attainment": dma_eta,
+                "tilelang_stages": self.tilelang_profile.pipelined_stages,
+            })
         resident = (
             getattr(self.state, "_last_prior_coverage", SectorCoverage())
             if (bound.ledger.l2_hit_bytes and bound.ledger.dram_sector_bytes)
@@ -392,7 +517,7 @@ class Lowering:
         return TemplateLoweringResult(program, summary, len(stages))
 
 
-def _route_edge(datapath, edge, owners, tile, explicit_bytes):
+def _route_edge(datapath, edge, owners, tile, explicit_bytes, *, ub_limit: int | None = None):
     source, dest = owners
     counts = {"aic": datapath.aic_count, "aiv": datapath.aiv_count}
     if not (0 <= source < counts[edge.src_owner_axis] and 0 <= dest < counts[edge.dst_owner_axis]):
@@ -411,7 +536,8 @@ def _route_edge(datapath, edge, owners, tile, explicit_bytes):
         raise ModelingError(f"fuse_region_private_l1_unreachable:{edge.view_id}")
     if src == dst == "ub" and source == dest:
         # A same-owner UB view is an alias, not a physical inter-owner transfer.
-        if explicit_bytes > datapath.usable_bytes("ub"):
+        eff_ub_limit = datapath.usable_bytes("ub") if ub_limit is None else min(datapath.usable_bytes("ub"), ub_limit)
+        if explicit_bytes > eff_ub_limit:
             raise ModelingError(f"fuse_region_ub_alias_too_large:{edge.view_id}")
         return None
     if src == dst == "ub" and (source, dest) not in datapath.ub_peer_edges:
@@ -453,7 +579,10 @@ def _route_publication(scope, i, edge):
     return f"{scope}:edge:{i}" + (":write" if edge.route_kind == "gm_spill" else "")
 
 
-def _route_region_edges(datapath, edges, edge_bytes, edge_owners, route_tiles, buffers, tile_count):
+def _route_region_edges(
+    datapath, edges, edge_bytes, edge_owners, route_tiles, buffers, tile_count,
+    *, ub_limit: int | None = None,
+):
     routed = []
     source_buffers = {}
     for idx, edge in enumerate(edges):
@@ -462,7 +591,9 @@ def _route_region_edges(datapath, edges, edge_bytes, edge_owners, route_tiles, b
             raise ModelingError(f"fuse_region_edge_bytes_required:{edge.view_id}")
         dest_pool = edge.route_kind.split("->")[-1]
         owners = (edge_owners or {}).get(edge.view_id, (0, 0))
-        route = _route_edge(datapath, edge, owners, (route_tiles or {}).get(edge.view_id, size), size)
+        route = _route_edge(
+            datapath, edge, owners, (route_tiles or {}).get(edge.view_id, size), size, ub_limit=ub_limit,
+        )
         routed.append((idx, edge, size, owners, route))
         if route is not None or edge.route_kind == "ub->ub":
             src_pool = edge.route_kind.split("->")[0]
@@ -585,6 +716,14 @@ def compile_fuse_region(
     l2_reservation_bytes: int = 0, uses_simt: bool = False,
     context: RecipeContext | None = None, memory_view: AdmissionMemoryView | None = None,
     die: int = 0, live_admission: bool = False,
+    tilelang_stages: int | None = None,
+    tilelang_dma_pattern: str = "rw11",
+    tilelang_dispatch_mode: str = "aclgraph",
+    tilelang_vector_mode: str | None = None,
+    tilelang_cube_epilogue: str = "fixpipe",
+    tilelang_blockscaled: bool = False,
+    tilelang_hf32: bool = False,
+    tilelang_calibration: TileLangCalibration | None = None,
 ) -> tuple[FuseRegionSpec, TemplateLoweringResult]:
     """Compile per-tile stage declarations with explicit tensor and alias facts.
 
@@ -592,7 +731,7 @@ def compile_fuse_region(
     operations repeated after the global first-pass barrier.
     """
     edges, buffers = tuple(edge_routes), tuple(live_buffers)
-    if not region_id or type(tile_count) is not int or tile_count < 1 or backend not in {"catlass_evg", "dsl_mix", "dsl_vec", "tla_simt"}:
+    if not region_id or type(tile_count) is not int or tile_count < 1 or backend not in _VALID_FUSE_BACKENDS:
         raise ModelingError("fuse_region_geometry_invalid")
     order, parents = _region_order(
         op_ids, dependencies, collective_ops, edges, waits,
@@ -609,15 +748,50 @@ def compile_fuse_region(
         if stage.after and not set(stage.after) <= set(order):
             raise ModelingError("fuse_region_stage_dependency_unknown")
 
+    tl_profile: TileLangLoweringProfile | None = None
+    tl_cal: TileLangCalibration | None = None
+    resolved_backend = backend
+    if backend in TILELANG_BACKENDS:
+        eff_stages = (
+            tilelang_stages if tilelang_stages is not None
+            else max((e.ring_depth for e in edges), default=TILELANG_DMA_STAGE_DOUBLE)
+        )
+        tl_profile, tl_cal = resolve_tilelang_profile(
+            datapath,
+            backend=backend,
+            uses_simt=uses_simt,
+            stages=eff_stages,
+            dma_pattern=tilelang_dma_pattern,
+            dispatch_mode=tilelang_dispatch_mode,
+            vector_mode=tilelang_vector_mode,
+            cube_epilogue=tilelang_cube_epilogue,
+            blockscaled=tilelang_blockscaled,
+            hf32=tilelang_hf32,
+            calibration=tilelang_calibration,
+        )
+        resolved_backend = tl_profile.api_tier
+        uses_simt = tl_profile.uses_simt
+    else:
+        uses_simt = uses_simt or backend == "tla_simt"
+
     routed, buffers = _route_region_edges(
         datapath, edges, edge_bytes, edge_owners, route_tiles, buffers, tile_count,
+        ub_limit=tl_profile.ub_ceiling_bytes if tl_profile is not None else None,
     )
-    uses_simt = uses_simt or backend == "tla_simt"
+    has_cube_stage = any(
+        role in {"cube", "matrix"}
+        for stage in (*op_stages.values(), *second.values())
+        for role, amount in stage.work.items() if amount
+    )
+    owner_axis = (
+        "aic" if (tl_profile is not None and has_cube_stage)
+        else ("aiv" if resolved_backend in {"dsl_vec", "tla_simt", "tilelang_simt", "tilelang_simd"} else "aic")
+    )
     solution = solve_template_tile(datapath, region_id, TileCandidate(
         reduction_class, tile_shape, max((e.ring_depth for e in edges), default=1),
         (datapath.aic_count, datapath.aiv_count), tile_count, ceil_div(tile_count, max(1, datapath.aic_count)),
-        buffers, uses_simt=uses_simt, owner_axis="aiv" if backend in {"dsl_vec", "tla_simt"} else "aic",
-    ), state=memory_view, die=die, reserved=l2_reservation_bytes)
+        buffers, uses_simt=uses_simt, owner_axis=owner_axis,
+    ), state=memory_view, die=die, reserved=l2_reservation_bytes, tilelang_profile=tl_profile)
     reads = dict(reads_by_op) if reads_by_op is not None else {order[0]: live_in_obligations}
     writes = dict(writes_by_op) if writes_by_op is not None else {order[-1]: live_out_obligations}
     if not (reads.keys() | writes.keys()) <= set(order):
@@ -628,8 +802,14 @@ def compile_fuse_region(
         _record_produced(produced, writes.get(op, ()))
     read_ranges = _union_obligations(external)
     write_ranges = _union_obligations((*live_out_obligations, *(entry for rows in writes.values() for entry in rows)))
-    spec = FuseRegionSpec(region_id, order, read_ranges, write_ranges, edges, reduction_class, solution, backend)
-    plan = Lowering(datapath, context=context, memory_view=memory_view, die=die, live_admission=live_admission)
+    spec = FuseRegionSpec(
+        region_id, order, read_ranges, write_ranges, edges, reduction_class, solution,
+        resolved_backend, tilelang_profile=tl_profile,
+    )
+    plan = Lowering(
+        datapath, context=context, memory_view=memory_view, die=die, live_admission=live_admission,
+        tilelang_profile=tl_profile, tilelang_calibration=tl_cal,
+    )
     if l2_reservation_bytes:
         plan.state.grant_reservation(die, region_id, l2_reservation_bytes)
         plan.l2_reservation = (die, l2_reservation_bytes, datapath.usable_bytes("l2"))
@@ -656,11 +836,58 @@ def compile_fuse_region(
     return spec, plan.result("K3", region_id, order, spec, semantic_work, solution)
 
 
+def _apply_tilelang_cube_attainment(
+    plan: Lowering, stage: Stage, dtype: str, bound: float, stage_meta: dict[str, Any],
+) -> float:
+    profile, cal = plan.tilelang_profile, plan.tilelang_calibration
+    if profile is None or cal is None:
+        return bound
+    epilogue = str(stage.metadata.get("tilelang_cube_epilogue", profile.cube_epilogue))
+    is_blockscaled = bool(
+        stage.metadata.get("tilelang_blockscaled", profile.blockscaled or dtype.lower() == "mxfp8")
+    )
+    is_hf32 = bool(stage.metadata.get("tilelang_hf32", profile.hf32))
+    eta = cal.cube_attainment(dtype, epilogue=epilogue, blockscaled=is_blockscaled, hf32=is_hf32)
+    stage_meta["tilelang_api_tier"] = profile.api_tier
+    stage_meta["tilelang_cube_attainment"] = eta
+    stage_meta["tilelang_blockscaled"] = is_blockscaled
+    return bound / eta
+
+
+def _apply_tilelang_vector_rate(
+    plan: Lowering, stage: Stage, pipe: str, role_for_binding: str, row: str,
+    amount: float, bound: float, stage_meta: dict[str, Any],
+) -> float:
+    profile, cal = plan.tilelang_profile, plan.tilelang_calibration
+    if profile is None or cal is None:
+        return bound
+    vec_mode = stage.metadata.get("tilelang_vector_mode")
+    if vec_mode is None:
+        if pipe == "vec_sfu":
+            vec_mode = "ub_exp" if profile.uses_simt else "sfu_exp"
+        elif pipe == "vec_reduce":
+            vec_mode = "reduce"
+        else:
+            vec_mode = profile.vector_mode
+    tl_gops = cal.vector_gops_per_aiv(uses_simt=profile.uses_simt, op_kind=str(vec_mode))
+    stage_meta["tilelang_api_tier"] = profile.api_tier
+    stage_meta["tilelang_vector_mode"] = str(vec_mode)
+    stage_meta["tilelang_vector_gops_per_aiv"] = tl_gops
+    context = plan.context
+    if context is not None and row in context.rates and float(context.rates[row]) > 0.0:
+        row_units = max(1, int(context._units_for(role_for_binding, row, plan.datapath.aiv_count)))
+        row_rate_per_aiv = float(context.rates[row]) / float(row_units)
+        tl_ops_per_ms_per_aiv = tl_gops * _OPS_PER_MS_PER_GOP
+        return float(amount) * (row_rate_per_aiv / tl_ops_per_ms_per_aiv)
+    return bound
+
+
 def _bind_declared_work(plan, stage, semantic):
     context = plan.context
     resource_names = context.resource_names if context else {}
     cube_row = resource_names.get("cube", "cube")
     work, placement, caps, units = Counter(), {}, {}, {}
+    stage_meta = dict(stage.metadata)
     physical_pipes = {resource_names.get(pipe, pipe): pipe for pipe in _VECTOR_PIPES}
     for role, amount in stage.work.items():
         if not amount:
@@ -684,12 +911,14 @@ def _bind_declared_work(plan, stage, semantic):
                 row, bound = next(iter(context.bind(Work(matrix={dtype: raw})).items()))
             else:
                 bound = 1000 * raw / plan.datapath.cube_peak(dtype)
+            bound = _apply_tilelang_cube_attainment(plan, stage, dtype, bound, stage_meta)
             unit = "peak_ms"
         else:
             pipe = physical_pipes.get(role)
             if pipe is not None:
                 plan.vector[pipe] += stage.metadata.get(f"issued_{pipe}_ops", amount)
             bound = amount
+            role_for_binding = role
             if context and (role not in context.rates or context.service_rate(role) is not None):
                 role_for_binding = plan.binding_role(role)
                 bound_work = context.bind(Work(resources={role_for_binding: amount}))
@@ -697,6 +926,10 @@ def _bind_declared_work(plan, stage, semantic):
                     continue
                 row, bound = next(iter(bound_work.items()))
                 unit = context.work_units.get(context.physical_role(role_for_binding), unit)
+            if pipe is not None:
+                bound = _apply_tilelang_vector_rate(
+                    plan, stage, pipe, role_for_binding, row, amount, bound, stage_meta,
+                )
             if unit is None:
                 unit = "ops" if pipe is not None else NATIVE_WORK_UNITS.get(role)
         work[row] += bound
@@ -709,6 +942,8 @@ def _bind_declared_work(plan, stage, semantic):
             caps[row] = stage.caps[role] * bound / amount
         if unit is not None:
             units[row] = unit
+    if stage_meta != stage.metadata:
+        return replace(stage, work=work, placement=placement, caps=caps, work_units=units, metadata=stage_meta)
     return replace(stage, work=work, placement=placement, caps=caps, work_units=units)
 
 
