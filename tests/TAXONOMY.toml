@@ -389,6 +389,10 @@ owns = [
   "mindie_sim/sweep/pd.py",
   "tests/_support/rss_probe.py",
 ]
+[[module]]
+path = "spine/test_vllm_ascend_stack_adapter.py"
+tier = "tier0"
+owns = ["mindie_sim/stacks/vllm_ascend"]
 # ---------------------------------------------------------------- serving
 [[module]]
 path = "serving/test_service_core.py"
