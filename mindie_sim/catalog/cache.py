@@ -29,10 +29,9 @@
 """
 from __future__ import annotations
 
-import math
 from typing import Any
 
-from mindie_sim.catalog.cache_format import cache_format
+from mindie_sim.catalog.cache_format import cache_format, gqa_kv_formats
 from mindie_sim.catalog.cache_index import (
     INDEX_INTERLEAVE_TOKENS,
     IndexReadCost,
@@ -45,6 +44,7 @@ from mindie_sim.catalog.cache_index import (
     index_k_ownership_rows,
     index_k_store_rows,
     index_row_bytes,
+    index_row_parts,
     index_scale_bytes,
     index_selection_cost,
     new_completed_rows,
@@ -64,7 +64,7 @@ from mindie_sim.catalog.cache_pools import (
     target_mla_page_bytes,
 )
 from mindie_sim.catalog.context_parallel import (
-    cp_plan_kind, dcp_indexer_sharded, layer_dcp_degree,
+    cp_interleave, cp_plan_kind, dcp_indexer_sharded, layer_dcp_degree,
 )
 from mindie_sim.schema.common import ModelingError, dtype_bytes
 from mindie_sim.schema.model import WorkloadSpec
@@ -80,9 +80,14 @@ DEFAULT_CACHE_BLOCK_SIZE = 128
 
 
 def block_round(rows: int, block_size: int) -> int:
-    if block_size <= 1:
-        return int(rows)
-    return int(math.ceil(int(rows) / int(block_size)) * int(block_size))
+    """Exact integer ceiling multiple of ``block_size`` (immune to float53 rounding)."""
+    count = int(rows)
+    block = int(block_size)
+    if count <= 0:
+        return 0
+    if block <= 1:
+        return count
+    return ((count + block - 1) // block) * block
 
 
 def local_kv_heads(num_kv_heads: int, tp: int) -> int:
@@ -105,94 +110,140 @@ def kv_bytes_for(model: Any, elements: float) -> float:
     return float(elements) * kv_element_bytes(model)
 
 
-def _mqsmla_mode_row_split(model: Any, region: str, width: int) -> tuple[float, float] | None:
+def cache_row_parts(
+    model: Any,
+    region: str,
+    width: int,
+    *,
+    plan: Any = None,
+    phase: str | None = None,
+) -> tuple[int, int, int]:
+    """Exact integer ``(payload_bytes, scale_bytes, padding_bytes)`` per row."""
     parts = packed_row_parts(model, region, width)
     if parts is not None:
         data, scales, padding = parts
-        return float(data), float(scales + padding)
-    return None
+        return int(data), int(scales), int(padding)
+    return cache_format(model, region, plan=plan, phase=phase).row_parts(int(width))
 
 
-def cache_row_split(model: Any, region: str, width: int) -> tuple[float, float]:
+def cache_row_split(
+    model: Any,
+    region: str,
+    width: int,
+    *,
+    plan: Any = None,
+    phase: str | None = None,
+) -> tuple[float, float]:
     """Return materialized data and allocated scale-plane bytes (including pad).
 
-    These two allocation columns exhaust the physical row. Typed operator
-    views obtain the numerical scales and alignment bytes from packed_row_parts.
+    Callers that need trailing alignment padding separated from numerical scales
+    use ``cache_row_parts`` directly.
     """
-    packed = _mqsmla_mode_row_split(model, region, width)
-    if packed is not None:
-        return packed
-    fmt = cache_format(model, region)
-    quantized = int(width) - int(fmt.suffix_elements)
-    if quantized < 0:
-        raise ModelingError("cache_suffix_exceeds_row_width")
-    total = int(fmt.row_bytes(int(width)))
-    scale = (
-        exact_element_bytes(_ceil_div(quantized, fmt.group_size), fmt.scale_dtype)
-        if fmt.group_size else 0
+    data, scales, padding = cache_row_parts(
+        model, region, width, plan=plan, phase=phase,
     )
-    payload = total - scale
-    if payload < 0:
-        raise ModelingError("cache_row_split_negative_payload")
-    return float(payload), float(scale)
+    return float(data), float(scales + padding)
 
 
-def packed_region_row_bytes(model: Any, region: str, width: int) -> int:
-    """Physical row width for ``region``, honoring arch35 MQSMLA Mode-1/2."""
-    parts = packed_row_parts(model, region, width)
-    if parts is not None:
-        data, scales, padding = parts
-        return int(data) + int(scales) + int(padding)
-    return int(cache_format(model, region).row_bytes(int(width)))
+def packed_region_row_bytes(
+    model: Any,
+    region: str,
+    width: int,
+    *,
+    plan: Any = None,
+    phase: str | None = None,
+) -> int:
+    """Physical row width for ``region``, honoring per-layer ABI and MQSMLA modes."""
+    data, scales, padding = cache_row_parts(
+        model, region, width, plan=plan, phase=phase,
+    )
+    return int(data + scales + padding)
+
+
+def cache_component_parts(
+    model: Any,
+    plan: Any,
+    parallel: ParallelSpec,
+    component: str,
+    total: float,
+    *,
+    phase: str | None = None,
+) -> tuple[float, float, float]:
+    """Decompose one ``layer_cache_components`` total into ``(payload, scale, padding)``."""
+    total = float(total)
+    if total <= 0.0:
+        return 0.0, 0.0, 0.0
+    if component in {"mla_kv", "window", "compressed_kv"}:
+        packed_parts = (
+            _packed_mla_row_parts(model, plan, phase=phase)
+            if component == "mla_kv" else None
+        )
+        if packed_parts is not None:
+            payload, scale, padding = float(packed_parts[0]), float(packed_parts[1]), 0.0
+        else:
+            p_b, s_b, pad_b = cache_row_parts(
+                model, component, plan.cache_row_elements, plan=plan, phase=phase,
+            )
+            payload, scale, padding = float(p_b), float(s_b), float(pad_b)
+    elif component == "gqa_kv":
+        heads = local_kv_heads(plan.num_kv_heads, parallel.tp)
+        key_fmt, val_fmt, is_shared = gqa_kv_formats(model, plan=plan, phase=phase)
+        if is_shared:
+            p_b, s_b, pad_b = cache_row_parts(
+                model, "gqa_kv", 2 * heads * plan.head_dim, plan=plan, phase=phase,
+            )
+            payload, scale, padding = float(p_b), float(s_b), float(pad_b)
+        else:
+            side_width = heads * plan.head_dim
+            kp, ks, kpad = key_fmt.row_parts(side_width)
+            vp, vs, vpad = val_fmt.row_parts(side_width)
+            payload, scale, padding = float(kp + vp), float(ks + vs), float(kpad + vpad)
+    elif component == "index_k":
+        p_b, s_b, pad_b = index_row_parts(model, plan.index_dim, plan=plan, phase=phase)
+        payload, scale, padding = float(p_b), float(s_b), float(pad_b)
+    else:
+        return total, 0.0, 0.0
+    row_total = payload + scale + padding
+    if row_total <= 0.0:
+        return total, 0.0, 0.0
+    return (
+        total * (payload / row_total),
+        total * (scale / row_total),
+        total * (padding / row_total),
+    )
 
 
 def cache_component_split(
     model: Any, plan: Any, parallel: ParallelSpec, component: str, total: float,
+    *, phase: str | None = None,
 ) -> tuple[float, float]:
-    """Decompose one ``layer_cache_components`` value without rounding it again."""
-    total = float(total)
-    if total <= 0.0:
-        return 0.0, 0.0
-    if component in {"mla_kv", "window", "compressed_kv"}:
-        packed_parts = _packed_mla_row_parts(model, plan) if component == "mla_kv" else None
-        if packed_parts is not None:
-            payload, scale = float(packed_parts[0]), float(packed_parts[1])
-        else:
-            payload, scale = cache_row_split(model, component, plan.cache_row_elements)
-    elif component == "gqa_kv":
-        width = 2 * local_kv_heads(plan.num_kv_heads, parallel.tp) * plan.head_dim
-        payload, scale = cache_row_split(model, "gqa_kv", width)
-    elif component == "index_k":
-        raw = dict(getattr(model, "metadata", ())).get("cache_representations", {})
-        if "index_k" in raw:
-            payload, scale = cache_row_split(model, "index_k", plan.index_dim)
-        else:
-            payload = float(plan.index_dim) * index_element_bytes(model)
-            scale = index_scale_bytes(model)
-    else:
-        return total, 0.0
-    row_total = payload + scale
-    if row_total <= 0.0:
-        return total, 0.0
-    return total * (payload / row_total), total * (scale / row_total)
+    """Decompose one ``layer_cache_components`` value into ``(payload, scale+pad)``."""
+    payload, scale, padding = cache_component_parts(
+        model, plan, parallel, component, total, phase=phase,
+    )
+    return payload, scale + padding
 
 
 def layer_cache_decomposition(
     model: Any, plan: Any, parallel: ParallelSpec, sequence_tokens: int, *,
     capacity_padded: bool = True, interleave: int = INDEX_INTERLEAVE_TOKENS,
+    phase: str = "decode",
 ) -> dict[str, dict[str, float]]:
-    """Per-component payload/scale decomposition for one layer's cache."""
+    """Per-component payload/scale/padding decomposition for one layer's cache."""
     components = layer_cache_components(
         model, plan, parallel, sequence_tokens,
-        capacity_padded=capacity_padded, interleave=interleave,
+        capacity_padded=capacity_padded, interleave=interleave, phase=phase,
     )
     result: dict[str, dict[str, float]] = {}
     for name, value in components.items():
-        payload, scale = cache_component_split(model, plan, parallel, name, value)
+        payload, scale, padding = cache_component_parts(
+            model, plan, parallel, name, value, phase=phase,
+        )
         result[name] = {
             "total": float(value),
             "payload": float(payload),
             "scale": float(scale),
+            "padding": float(padding),
         }
     return result
 
@@ -223,17 +274,19 @@ def _local_state_sharded(plan: Any, tp: int) -> tuple[float, float]:
 
 
 def _context_shard_rows(rows: int, cp: int) -> int:
-    """Block-interleaved context rows owned by one rank (ceil of blocks)."""
+    """Block-interleaved context rows owned by one rank (exact integer ceil)."""
     if cp <= 1:
-        return int(rows)
-    return int(math.ceil(int(rows) / int(cp)))
+        return max(0, int(rows))
+    return _ceil_div(max(0, int(rows)), int(cp))
 
 
 def _context_shard_blocks(seq: int, block: int, cp: int) -> int:
+    rows = max(0, int(seq))
+    blk = max(1, int(block))
     if cp <= 1:
-        return block_round(seq, block)
-    blocks = int(math.ceil(max(0, int(seq)) / max(1, int(block))))
-    return int(math.ceil(blocks / int(cp)) * int(block))
+        return block_round(rows, blk)
+    blocks = _ceil_div(rows, blk)
+    return _ceil_div(blocks, int(cp)) * blk
 
 
 def owned_block_rows(rows: int, block: int, cp: int, rank: int) -> int:
@@ -246,7 +299,7 @@ def owned_block_rows(rows: int, block: int, cp: int, rank: int) -> int:
         raise ModelingError(f"cache_owner_rank_out_of_range:{rank}")
     if cp == 1:
         return block_round(rows, block)
-    blocks = int(math.ceil(rows / block)) if rows else 0
+    blocks = _ceil_div(rows, block) if rows else 0
     if rank >= blocks:
         return 0
     count = (blocks - 1 - rank) // cp + 1
@@ -314,9 +367,77 @@ def _active_state_components(model: Any, plan: Any, parallel: ParallelSpec, *,
     return result
 
 
+def _local_cache_rows(
+    plan: Any,
+    parallel: ParallelSpec,
+    rows: int,
+    *,
+    cp: int,
+    cp_stride: int,
+    alloc_block: int,
+    capacity_padded: bool,
+    rank: int | None,
+    owner_spans: Any,
+    start: int = 0,
+    ratio: int = 1,
+) -> float:
+    """Compute rank-local or aggregate rows keeping CP stride and page block distinct."""
+    stride = max(1, int(cp_stride))
+    page_blk = max(1, int(alloc_block))
+    if rank is not None:
+        spans = (
+            tuple((lo // ratio, hi // ratio) for lo, hi in owner_spans)
+            if owner_spans is not None and ratio > 1 else owner_spans
+        )
+        owned = owned_token_rows(rows, spans, rank, start=start)
+        if owned is not None:
+            return float(block_round(owned, page_blk) if capacity_padded else owned)
+        if cp <= 1:
+            return float(block_round(rows, page_blk) if capacity_padded else rows)
+        if rows <= 0:
+            return 0.0
+        from mindie_sim.catalog.context_parallel import layer_dcp_factors, owned_positions
+        pcp_f, tp_g, dp_w = layer_dcp_factors(plan, parallel)
+        tp_dim = max(1, int(parallel.tp))
+        pcp_dim = max(1, int(parallel.pcp))
+        dp_dim = max(1, int(parallel.dp))
+        r_int = int(rank)
+        tp_i = r_int % tp_dim
+        pcp_i = (r_int // tp_dim) % pcp_dim
+        dp_i = (r_int // (tp_dim * pcp_dim)) % dp_dim
+        cp_rank = ((dp_i % dp_w) * (pcp_f * tp_g) + (pcp_i % pcp_f) * tp_g + (tp_i % tp_g)) % cp
+        exact = owned_positions(start, start + rows - 1, cp, stride, cp_rank)
+        return float(block_round(exact, page_blk) if capacity_padded else exact)
+    if capacity_padded:
+        if cp <= 1:
+            return float(block_round(rows, page_blk))
+        if rows <= 0:
+            return 0.0
+        if stride == page_blk and start == 0:
+            return float(_context_shard_blocks(rows, page_blk, cp))
+        from mindie_sim.catalog.context_parallel import owned_positions
+        worst = max(owned_positions(start, start + rows - 1, cp, stride, r) for r in range(cp))
+        return float(block_round(worst, page_blk))
+    return float(rows) if cp <= 1 else rows / cp
+
+
+def _gqa_layer_row_bytes(
+    model: Any, plan: Any, tp: int, *, int8_fa3: bool, phase: str,
+) -> int:
+    heads = local_kv_heads(plan.num_kv_heads, tp)
+    if int8_fa3:
+        return 2 * heads * (int(plan.head_dim) + C8_SCALE_RESERVED_BYTES)
+    key_fmt, val_fmt, is_shared = gqa_kv_formats(model, plan=plan, phase=phase)
+    if is_shared:
+        return int(key_fmt.row_bytes(2 * heads * int(plan.head_dim)))
+    side_width = heads * int(plan.head_dim)
+    return int(key_fmt.row_bytes(side_width) + val_fmt.row_bytes(side_width))
+
+
 def layer_cache_components(model: Any, plan: Any, parallel: ParallelSpec,
                            sequence_tokens: int, *, capacity_padded: bool = True,
                            interleave: int = INDEX_INTERLEAVE_TOKENS,
+                           block_size: int | None = None,
                            rank: int | None = None, owner_spans: Any = None,
                            runtime: Any = None, query_tokens: int | None = None,
                            phase: str = "decode") -> dict[str, float]:
@@ -324,33 +445,19 @@ def layer_cache_components(model: Any, plan: Any, parallel: ParallelSpec,
     int8_fa3 = gbsa_cache_layout(runtime) == "int8_fa3"
     tp = parallel.tp
     cp = layer_dcp_degree(plan, parallel)
+    page_block = int(
+        block_size if block_size is not None
+        else (getattr(runtime, "kv_block_size", 0) or interleave)
+    )
     result: dict[str, float] = {}
 
-    def local_rows(rows: int, block: int = interleave, *, start: int = 0, ratio: int = 1) -> float:
-        if rank is not None:
-            spans = (tuple((lo // ratio, hi // ratio) for lo, hi in owner_spans)
-                     if owner_spans is not None and ratio > 1 else owner_spans)
-            owned = owned_token_rows(rows, spans, rank, start=start)
-            if owned is not None:
-                return owned
-            if cp <= 1:
-                return float(block_round(rows, block) if capacity_padded else rows)
-            if rows <= 0:
-                return 0.0
-            from mindie_sim.catalog.context_parallel import layer_dcp_factors, owned_positions
-            pcp_f, tp_g, dp_w = layer_dcp_factors(plan, parallel)
-            tp_dim = max(1, int(parallel.tp))
-            pcp_dim = max(1, int(parallel.pcp))
-            dp_dim = max(1, int(parallel.dp))
-            r_int = int(rank)
-            tp_i = r_int % tp_dim
-            pcp_i = (r_int // tp_dim) % pcp_dim
-            dp_i = (r_int // (tp_dim * pcp_dim)) % dp_dim
-            cp_rank = ((dp_i % dp_w) * (pcp_f * tp_g) + (pcp_i % pcp_f) * tp_g + (tp_i % tp_g)) % cp
-            exact = owned_positions(start, start + rows - 1, cp, block, cp_rank)
-            return float(block_round(exact, block) if capacity_padded else exact)
-        return (_context_shard_blocks(rows, block, cp) if capacity_padded
-                else rows / cp)
+    def local_rows(rows: int, stride: int = interleave, *, start: int = 0, ratio: int = 1) -> float:
+        alloc_blk = max(1, page_block // max(1, ratio))
+        return _local_cache_rows(
+            plan, parallel, rows, cp=cp, cp_stride=stride, alloc_block=alloc_blk,
+            capacity_padded=capacity_padded, rank=rank, owner_spans=owner_spans,
+            start=start, ratio=ratio,
+        )
 
     if plan.attention in _LINEAR_ATTENTION_KINDS:
         if runtime is not None or query_tokens is not None:
@@ -380,31 +487,30 @@ def layer_cache_components(model: Any, plan: Any, parallel: ParallelSpec,
         if not 0 <= plan.kv_owner_layer_id < plan.index:
             rows = min(seq, plan.window) if plan.window else seq
             start = max(0, seq - rows) if plan.window else 0
-            heads = local_kv_heads(plan.num_kv_heads, tp)
-            if int8_fa3:
-                row_bytes = 2 * heads * (plan.head_dim + C8_SCALE_RESERVED_BYTES)
-            else:
-                width = 2 * heads * plan.head_dim
-                row_bytes = cache_format(model, "gqa_kv").row_bytes(width)
+            row_bytes = _gqa_layer_row_bytes(
+                model, plan, tp, int8_fa3=int8_fa3, phase=phase,
+            )
             result["gqa_kv"] = local_rows(rows, start=start) * row_bytes
     elif plan.attention != "mla":
         raise ModelingError(f"cache_attention_unknown:{plan.attention}")
     elif plan.cache_kind == "dense":
         rows = min(seq, plan.window) if plan.window else seq
         start = max(0, seq - rows) if plan.window else 0
-        result["mla_kv"] = local_rows(rows, start=start) * _packed_mla_row_bytes(model, plan)
+        result["mla_kv"] = local_rows(rows, start=start) * _packed_mla_row_bytes(
+            model, plan, phase=phase,
+        )
     else:
         if plan.window:
             rows = min(seq, plan.window)
             result["window"] = local_rows(
                 rows, start=max(0, seq - rows)) * packed_region_row_bytes(
-                model, "window", plan.cache_row_elements)
+                model, "window", plan.cache_row_elements, plan=plan, phase=phase)
         if plan.owns_long_kv:
             ratio = max(1, plan.compress_ratio)
             compressed = local_rows(completed_rows(seq, plan.compress_ratio),
                                     max(1, interleave // ratio), ratio=ratio)
             result["compressed_kv"] = compressed * packed_region_row_bytes(
-                model, "compressed_kv", plan.cache_row_elements)
+                model, "compressed_kv", plan.cache_row_elements, plan=plan, phase=phase)
             if plan.compressor_state_rows and seq:
                 rows = plan.compressor_state_rows if capacity_padded else min(seq, plan.compressor_state_rows)
                 result["compressor_state"] = rows * 2 * plan.compressor_width * plan.head_dim * FP32_ELEMENT_BYTES
@@ -433,7 +539,9 @@ def layer_cache_components(model: Any, plan: Any, parallel: ParallelSpec,
         if int8_fa3:
             result["index_k"] = rows * (plan.index_dim + C8_SCALE_RESERVED_BYTES)
         else:
-            result["index_k"] = rows * index_row_bytes(model, plan.index_dim)
+            result["index_k"] = rows * index_row_bytes(
+                model, plan.index_dim, plan=plan, phase=phase,
+            )
         if plan.index_kpool > 1 and seq:
             if plan.attention == "gqa":
                 ring_rows = 2 * plan.index_kpool if capacity_padded else min(seq, 2 * plan.index_kpool)
@@ -485,8 +593,8 @@ def uses_inherited_draft_cache(model: Any, draft_kind: str | None) -> bool:
 def stage_cache_components(
     model: Any, parallel: ParallelSpec, sequence_tokens: int,
     *, capacity_padded: bool = True, draft_kind: str | None = None,
-    interleave: int = INDEX_INTERLEAVE_TOKENS, runtime: Any = None,
-    query_tokens: int | None = None, phase: str = "decode",
+    interleave: int = INDEX_INTERLEAVE_TOKENS, block_size: int | None = None,
+    runtime: Any = None, query_tokens: int | None = None, phase: str = "decode",
 ) -> list[dict[str, float]]:
     pp = max(1, parallel.pp)
     stages: list[dict[str, float]] = [{} for _ in range(pp)]
@@ -496,7 +604,8 @@ def stage_cache_components(
         for key, value in layer_cache_components(
             model, plan, parallel, sequence_tokens,
             capacity_padded=capacity_padded, interleave=interleave,
-            runtime=runtime, query_tokens=query_tokens, phase=phase,
+            block_size=block_size, runtime=runtime,
+            query_tokens=query_tokens, phase=phase,
         ).items():
             stages[stage][key] = stages[stage].get(key, 0.0) + value
     if draft_kind and getattr(model, "auxiliary", None) is not None:
@@ -517,7 +626,9 @@ def stage_cache_components(
             draft = optional_draft_spec(model, draft_kind)
             row_bytes = _draft_row_bytes_int(model, draft, tp=parallel.tp)
             seq = max(0, int(sequence_tokens))
-            block = max(1, int(interleave))
+            block = max(1, int(block_size if block_size is not None else (
+                getattr(runtime, "kv_block_size", 0) or interleave
+            )))
             draft_sharded = _draft_is_dcp_sharded(
                 model, parallel, draft_kind,
                 dcp=int(getattr(parallel, "cp", 1) or 1),
@@ -543,8 +654,13 @@ def request_cache_breakdown(
         interleave if interleave is not None
         else (getattr(runtime, "kv_block_size", 0) or INDEX_INTERLEAVE_TOKENS)
     )
+    cp_stride = int(
+        interleave if interleave is not None
+        else (cp_interleave(runtime) if runtime is not None else block_size)
+    )
     stages = stage_cache_components(
-        model, parallel, sequence_tokens, draft_kind=draft_kind, interleave=block_size,
+        model, parallel, sequence_tokens, draft_kind=draft_kind,
+        interleave=cp_stride, block_size=block_size,
         runtime=runtime, query_tokens=query_tokens, phase=phase,
     )
     totals: dict[str, float] = {}
@@ -648,11 +764,11 @@ __all__ = [
     "candidate_valid_rows", "block_round", "index_element_bytes",
     "index_k_block_rows", "index_k_capacity_rows", "index_k_owned_block_rows",
     "index_k_ownership_rows", "index_k_store_rows",
-    "index_row_bytes", "index_scale_bytes", "kv_bytes_for", "kv_element_bytes",
+    "index_row_bytes", "index_row_parts", "index_scale_bytes", "kv_bytes_for", "kv_element_bytes",
     "local_kv_heads", "cp_plan_kind",
-    "index_selection_cost", "attention_rows", "cache_row_split",
+    "index_selection_cost", "attention_rows", "cache_row_parts", "cache_row_split",
     "packed_region_row_bytes",
-    "cache_component_split", "layer_cache_components",
+    "cache_component_parts", "cache_component_split", "layer_cache_components",
     "layer_cache_decomposition", "layer_stage_map", "stage_cache_components",
     "request_cache_breakdown",
     "gbsa_cache_layout", "target_mla_page_bytes", "separate_pool_page_pitches",

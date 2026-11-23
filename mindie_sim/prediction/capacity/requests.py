@@ -84,11 +84,34 @@ class _MemoryRequestsMixin:
             changed = changed or before != tuple(staging_physical)
         self._sync_usage()
 
+    def _resolve_request_query_tokens(
+        self,
+        key: tuple[int, str],
+        *,
+        query_tokens: int | None = None,
+        proposal_tokens: int | None = None,
+    ) -> int | None:
+        if query_tokens is not None:
+            if isinstance(query_tokens, bool) or not isinstance(query_tokens, int) or query_tokens < 1:
+                raise ValueError("memory_admission_query_tokens_requires_positive_integer")
+            return int(query_tokens)
+        if proposal_tokens is not None:
+            if isinstance(proposal_tokens, bool) or not isinstance(proposal_tokens, int) or proposal_tokens < 0:
+                raise ValueError("memory_admission_proposal_tokens_requires_nonnegative_integer")
+            return int(proposal_tokens) + 1
+        return self.request_query_tokens.get(key)
+
     def _resident_admission(
         self, replica: int, request: str, tokens: int,
+        *, query_tokens: int | None = None, proposal_tokens: int | None = None,
     ) -> dict:
         key = replica, request
-        resident_ranks, staging_ranks = self._kv_residency_ranks(tokens)
+        eff_q = self._resolve_request_query_tokens(
+            key, query_tokens=query_tokens, proposal_tokens=proposal_tokens,
+        )
+        resident_ranks, staging_ranks = self._kv_residency_ranks(
+            tokens, query_tokens=eff_q,
+        )
         demand = tuple(max(row) for row in resident_ranks)
         demand_staging = tuple(max(row) for row in staging_ranks)
         host_demand = self.host_dram_cache_bytes(tokens) if self.sparse_offload else 0.0
@@ -114,6 +137,7 @@ class _MemoryRequestsMixin:
         hbm, host = self._state_usage(
             exclude_request=key, request_usage=request_usage,
             staging_usage=staging_usage, host_request=host_request)
+        resolved_q = self._effective_cache_query_tokens(eff_q)
         return {
             "demand": demand, "physical": physical,
             "physical_ranks": physical_ranks,
@@ -124,12 +148,14 @@ class _MemoryRequestsMixin:
             "physical_staging_ranks": physical_staging_ranks,
             "host_demand": float(host_demand),
             "host_physical": float(host_physical),
+            "query_tokens": int(resolved_q),
             "candidate_hbm": hbm, "candidate_host": host,
             "ok": self._usage_budget_ok(hbm, host),
         }
 
     def admissible_tokens(
         self, replica: int, request: str, tokens: int, *, granularity: int = 1,
+        query_tokens: int | None = None, proposal_tokens: int | None = None,
     ) -> int:
         """Largest requested KV span that fits without changing the ledger.
 
@@ -153,7 +179,10 @@ class _MemoryRequestsMixin:
                 mid -= mid % granularity
             if mid < lo:
                 break
-            candidate = self._resident_admission(replica, request, mid)
+            candidate = self._resident_admission(
+                replica, request, mid,
+                query_tokens=query_tokens, proposal_tokens=proposal_tokens,
+            )
             if candidate["ok"]:
                 best = max(best, mid)
                 lo = mid + granularity
@@ -163,6 +192,7 @@ class _MemoryRequestsMixin:
 
     def admission_decision(
         self, replica: int, request: str, tokens: int,
+        *, query_tokens: int | None = None, proposal_tokens: int | None = None,
     ) -> dict:
         """Pure request-admission decision with the same refusal vocabulary.
 
@@ -176,20 +206,30 @@ class _MemoryRequestsMixin:
         if isinstance(tokens, bool) or not isinstance(tokens, int) or tokens < 0:
             raise ValueError("memory_admission_tokens_requires_nonnegative_integer")
         key = (replica, request)
-        candidate = self._resident_admission(replica, request, tokens)
+        candidate = self._resident_admission(
+            replica, request, tokens,
+            query_tokens=query_tokens, proposal_tokens=proposal_tokens,
+        )
         base_hbm, base_host = self._state_usage(exclude_request=key)
         decision = self._grant_decision_payload(
             replica, candidate["candidate_hbm"], candidate["candidate_host"],
             base_hbm, base_host, [], exclude_request=key)
         decision.update({
             "request": request, "tokens": int(tokens),
+            "query_tokens": int(candidate["query_tokens"]),
             "physical_ranks": candidate["physical_ranks"],
         })
         return decision
 
-    def resize(self, replica: int, request: str, tokens: int) -> bool:
+    def resize(
+        self, replica: int, request: str, tokens: int,
+        *, query_tokens: int | None = None, proposal_tokens: int | None = None,
+    ) -> bool:
         key = replica, request
-        candidate = self._resident_admission(replica, request, tokens)
+        candidate = self._resident_admission(
+            replica, request, tokens,
+            query_tokens=query_tokens, proposal_tokens=proposal_tokens,
+        )
         if not candidate["ok"]:
             return False
         changed = (
@@ -198,6 +238,7 @@ class _MemoryRequestsMixin:
             or self.logical_owners.get(key) != candidate["demand"]
             or self.host_dram_owners.get(key) != candidate["host_physical"]
             or self.staging_owners.get(key) != candidate["physical_staging"]
+            or self.request_query_tokens.get(key) != candidate["query_tokens"]
         )
         self._set_physical(
             replica, key, candidate["physical"], candidate["host_physical"],
@@ -209,10 +250,18 @@ class _MemoryRequestsMixin:
         self.logical_host_owners[key] = candidate["host_demand"]
         self.logical_staging_owners[key] = candidate["demand_staging"]
         self.logical_staging_rank[key] = candidate["demand_staging_ranks"]
+        self.request_query_tokens[key] = int(candidate["query_tokens"])
         self.request_versions[key] = self.request_versions.get(key, 0) + 1
         if changed:
             self.budget_version += 1
         return True
+
+    def active_verify_token_width(self, replica: int) -> int:
+        """Exact active verify width ``sum(1 + k_i)`` across live requests on ``replica``."""
+        return int(sum(
+            width for (rep, req), width in self.request_query_tokens.items()
+            if rep == int(replica) and (rep, req) not in self.retired_requests
+        ))
 
     def _free_request(self, replica: int, request: str) -> None:
         """Remove the request's physical cache once it is safe to do so."""
@@ -226,6 +275,7 @@ class _MemoryRequestsMixin:
         self.logical_staging_rank.pop(key, None)
         self.staging_owners.pop(key, None)
         self.staging_owner_ranks.pop(key, None)
+        self.request_query_tokens.pop(key, None)
         self.request_versions.pop(key, None)
         self.retired_requests.discard(key)
         self.delayed_owners.pop(key, None)

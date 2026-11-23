@@ -14,12 +14,15 @@ from typing import Any
 
 from mindie_sim.catalog.cache import (
     _context_shard_blocks,
+    block_round,
     cache_component_split,
     cache_row_split,
+    index_row_parts,
     layer_cache_components,
     local_kv_heads,
     owned_token_rows,
 )
+from mindie_sim.catalog.cache_format import gqa_kv_formats
 from mindie_sim.catalog.cache_pools import (
     _draft_is_dcp_sharded,
     _draft_row_bytes_int,
@@ -173,9 +176,7 @@ class _MemoryCacheMixin:
             draft_page=block * int(row_bytes),
         )
         if draft_sharded and rank is not None and self.rank_token_owners is not None:
-            base_tokens = (
-                math.ceil(eff_tokens / block) * block if padded else eff_tokens
-            )
+            base_tokens = block_round(eff_tokens, block) if padded else eff_tokens
             rows = float(owned_token_rows(base_tokens, self.rank_token_owners, int(rank)))
         else:
             draft_cp = int(p.cp) if draft_sharded else 1
@@ -221,15 +222,17 @@ class _MemoryCacheMixin:
         )
         return draft_kv + draft_state
 
-    def _group_cache_parts(self, tokens: int, rank: int | None = None) -> list[dict]:
+    def _group_cache_parts(
+        self, tokens: int, rank: int | None = None,
+        *, query_tokens: int | None = None,
+    ) -> list[dict]:
         """Known physical and valid components inside declared page groups.
 
         Token-paged components use the group's allocated token slots for
-        capacity and its valid/window span for content.  Compressed/index and
-        fixed-state components use their own valid geometry; the undeclared
-        remainder of the group quote is kept as ``reserve``, never asserted as
-        precise payload.  With ``rank`` the valid components are that physical
-        rank's owner rows, while every rank still holds the full page slots.
+        capacity and its valid/window span for content (both ordinary page
+        groups and paired SFA groups).  With ``rank`` the valid components are
+        that physical rank's owner rows, while every rank still holds the full
+        allocated page slots.
         """
         case, model, p = self.case, self.case.model, self.case.runtime.parallel
         stages = [
@@ -237,12 +240,18 @@ class _MemoryCacheMixin:
              "valid_payload": 0.0, "valid_scale": 0.0, "components": {}}
             for _ in range(p.pp)
         ]
-        q_tok = self._effective_cache_query_tokens()
+        q_tok = self._effective_cache_query_tokens(query_tokens)
         by_index = {plan.index: plan for plan in model.layer_plans}
+        block = max(1, int(getattr(case.runtime, "kv_block_size", 0) or cp_interleave(case.runtime)))
         for group in self.pages.groups:
             owned = self.pages.group_components(group)
             valid_tokens = group.valid_tokens(tokens, case.runtime.max_model_len)
             alloc_tokens = group.allocated_token_slots(tokens, case.runtime.max_model_len)
+            paired_local_alloc = (
+                group.pages(tokens, case.runtime.max_model_len) * block
+                if (self.paired_sfa and not group.auxiliary and group.fixed_pages <= 0)
+                else 0
+            )
             for layer_index in group.layers:
                 layer = by_index[layer_index]
                 components = layer_cache_components(
@@ -258,6 +267,10 @@ class _MemoryCacheMixin:
                         part = self._group_token_component(
                             model, layer, p, group, name, valid_tokens,
                             alloc_tokens, components,
+                        )
+                    elif self.paired_sfa and name in {"mla_kv", "index_k"} and paired_local_alloc > 0:
+                        part = self._paired_group_token_component(
+                            model, layer, p, name, paired_local_alloc, components,
                         )
                     if part is None:
                         value = components.get(name, 0.0)
@@ -282,54 +295,127 @@ class _MemoryCacheMixin:
                     detail["valid_payload"] += valid_payload
                     detail["valid_scale"] += valid_scale
         if self.paired_sfa and self.draft_kind:
-            value = self._paired_draft_bytes(tokens, rank=rank)
+            alloc_draft = self._paired_draft_bytes(tokens, rank=rank, padded=True)
+            valid_draft = self._paired_draft_bytes(tokens, rank=rank, padded=False)
             stage = stages[-1]
-            for name in ("alloc_payload", "valid_payload"):
-                stage[name] += value
+            stage["alloc_payload"] += alloc_draft
+            stage["valid_payload"] += valid_draft
             stage["components"]["draft_kv"] = {
-                "alloc_payload": value, "alloc_scale": 0,
-                "valid_payload": value, "valid_scale": 0}
+                "alloc_payload": alloc_draft, "alloc_scale": 0.0,
+                "valid_payload": valid_draft, "valid_scale": 0.0,
+            }
         return stages
 
-    def _paired_draft_bytes(self, tokens: int, *, rank=None) -> float:
+    def _paired_group_token_component(
+        self, model, layer, parallel, name: str, alloc_local_rows: int,
+        components: dict[str, float],
+    ) -> tuple[float, float, float, float] | None:
+        """Separate allocated local slots from rank-local valid rows in paired SFA."""
+        if name == "mla_kv":
+            if layer.attention != "mla" or layer.cache_kind != "dense":
+                return None
+            payload_b, scale_b = cache_row_split(
+                model, "mla_kv", layer.cache_row_elements, plan=layer,
+            )
+        elif name == "index_k":
+            if not layer.owns_index_k:
+                return None
+            p_b, s_b, pad_b = index_row_parts(model, layer.index_dim, plan=layer)
+            payload_b, scale_b = float(p_b), float(s_b + pad_b)
+        else:
+            return None
+        valid_value = float(components.get(name, 0.0))
+        if valid_value > 0.0:
+            valid_payload, valid_scale = cache_component_split(
+                model, layer, parallel, name, valid_value,
+            )
+        else:
+            valid_payload = valid_scale = 0.0
+        return (
+            float(alloc_local_rows) * payload_b,
+            float(alloc_local_rows) * scale_b,
+            valid_payload,
+            valid_scale,
+        )
+
+    def _paired_draft_bytes(
+        self, tokens: int, *, rank: int | None = None, padded: bool = False,
+    ) -> float:
+        """Draft KV bytes inside paired SFA honoring draft TP, draft DCP, and cap."""
         from mindie_sim.catalog.draft import optional_draft_spec
         from mindie_sim.catalog.paired_sfa import draft_row
+
+        p = self.case.runtime.parallel
         draft = optional_draft_spec(self.case.model, self.draft_kind)
         draft_cap = self._draft_context_cap(draft)
         eff_tokens = min(tokens, draft_cap) if draft_cap > 0 else tokens
-        rows = eff_tokens / self.case.runtime.parallel.cp
-        if rank is not None and self.rank_token_owners is not None:
-            rows = owned_token_rows(eff_tokens, self.rank_token_owners, rank)
-        return rows * draft_row(self.case.model, draft) * draft.layers
+        row_bytes = float(draft_row(self.case.model, draft, tp=p.tp))
+        block = max(1, int(self.case.runtime.kv_block_size or cp_interleave(self.case.runtime)))
+        sharded = _draft_is_dcp_sharded(
+            self.case.model, p, self.draft_kind,
+            dcp=int(getattr(p, "cp", 1) or 1),
+            draft_page=block * int(row_bytes),
+        )
+        draft_cp = int(p.cp) if sharded else 1
+        if rank is not None and sharded:
+            if self.rank_token_owners is not None:
+                base_tokens = block_round(eff_tokens, block) if padded else eff_tokens
+                rows = float(owned_token_rows(base_tokens, self.rank_token_owners, int(rank)))
+            elif eff_tokens > 0:
+                from mindie_sim.catalog.context_parallel import owned_positions
+                exact = owned_positions(
+                    0, eff_tokens - 1, draft_cp,
+                    cp_interleave(self.case.runtime), int(rank) % draft_cp,
+                )
+                rows = float(block_round(exact, block) if padded else exact)
+            else:
+                rows = 0.0
+        elif padded:
+            rows = float(_context_shard_blocks(eff_tokens, block, draft_cp))
+        else:
+            rows = float(eff_tokens) / float(draft_cp)
+        return rows * row_bytes * float(draft.layers)
 
     def _group_token_component(
         self, model, layer, parallel, group, name: str, valid_tokens: int,
         alloc_tokens: int, components: dict[str, float],
     ):
         """Rows/bytes for a token-paged component inside one group page."""
+        del group
         if name == "gqa_kv":
             if (layer.attention not in {"gqa", "projection_only"}
                     or 0 <= layer.kv_owner_layer_id < layer.index):
                 return None
-            region = "gqa_kv"
-            width = 2 * local_kv_heads(layer.num_kv_heads, parallel.tp) * layer.head_dim
+            if name not in components and valid_tokens > 0:
+                return None
+            heads = local_kv_heads(layer.num_kv_heads, parallel.tp)
+            key_fmt, val_fmt, is_shared = gqa_kv_formats(model, plan=layer)
+            if is_shared:
+                payload, scale = cache_row_split(
+                    model, "gqa_kv", 2 * heads * layer.head_dim, plan=layer,
+                )
+            else:
+                side = heads * layer.head_dim
+                kp, ks, kpad = key_fmt.row_parts(side)
+                vp, vs, vpad = val_fmt.row_parts(side)
+                payload, scale = float(kp + vp), float(ks + kpad + vs + vpad)
         elif name == "mla_kv":
             if layer.attention != "mla" or layer.cache_kind != "dense":
                 return None
-            region = "mla_kv"
-            width = layer.cache_row_elements
+            if name not in components and valid_tokens > 0:
+                return None
+            payload, scale = cache_row_split(
+                model, "mla_kv", layer.cache_row_elements, plan=layer,
+            )
         else:  # window
             if layer.attention != "mla" or not layer.window:
                 return None
-            region = "window"
-            width = layer.cache_row_elements
-        if name not in components and valid_tokens > 0:
-            return None
-        # The physical page owns all allocated slots.  Valid content comes from
-        # the already CP/TP-local layer_cache_components range, not a second
-        # global valid_tokens calculation that would overwrite the local shard.
+            if name not in components and valid_tokens > 0:
+                return None
+            payload, scale = cache_row_split(
+                model, "window", layer.cache_row_elements, plan=layer,
+            )
         alloc_rows = alloc_tokens
-        payload, scale = cache_row_split(model, region, width)
         valid_value = components.get(name, 0.0)
         if valid_value > 0.0:
             valid_payload, valid_scale = cache_component_split(
@@ -339,15 +425,17 @@ class _MemoryCacheMixin:
         return (alloc_rows * payload, alloc_rows * scale,
                 valid_payload, valid_scale)
 
-    def _kv_residency(self, tokens: int) -> tuple[list[float], list[float], list[float]]:
+    def _kv_residency(
+        self, tokens: int, *, query_tokens: int | None = None,
+    ) -> tuple[list[float], list[float], list[float]]:
         """(gross, HBM-resident, staging) KV bytes, same basis as resize."""
-        gross = list(self.cache_bytes(tokens))
+        gross = list(self.cache_bytes(tokens, query_tokens=query_tokens))
         if self.kvc_hbm_ratio == 1.0:
             return gross, list(gross), [0.0] * len(gross)
         resident = [value * self.kvc_hbm_ratio for value in gross]
         staging = [
             value * (1.0 - self.kvc_hbm_ratio)
-            for value in self._max_layer_cache_bytes(tokens)
+            for value in self._max_layer_cache_bytes(tokens, query_tokens=query_tokens)
         ]
         return gross, resident, staging
 
@@ -407,17 +495,22 @@ class _MemoryCacheMixin:
                 s_detail["total"] += float(draft_state)
         return stages
 
-    def _rank_cache_bytes(self, tokens: int, *, padded: bool, rank: int) -> list[float]:
+    def _rank_cache_bytes(
+        self, tokens: int, *, padded: bool, rank: int,
+        query_tokens: int | None = None,
+    ) -> list[float]:
         """Allocation bytes for one physical rank.
 
-        With an explicit T05 owner partition the rank owns its exact rows.
-        Without one the legacy stage-level per-rank value is retained, so old
-        callers and even CP=2 slices are unchanged.
+        With an explicit T05 owner partition or CP > 1, each rank owns its exact
+        rows.  Paired SFA rank-local unpadded queries resolve per-rank valid
+        bytes while padded pool quotes retain per-rank shared group pages.
         """
-        if self.paired_sfa or (self.rank_token_owners is None and int(self.case.runtime.parallel.cp) <= 1):
-            return list(self.cache_bytes(tokens, padded=padded))
+        if self.paired_sfa and padded:
+            return list(self.cache_bytes(tokens, padded=True, query_tokens=query_tokens))
+        if not self.paired_sfa and (self.rank_token_owners is None and int(self.case.runtime.parallel.cp) <= 1):
+            return list(self.cache_bytes(tokens, padded=padded, query_tokens=query_tokens))
         case, model, p = self.case, self.case.model, self.case.runtime.parallel
-        q_tok = self._effective_cache_query_tokens()
+        q_tok = self._effective_cache_query_tokens(query_tokens)
         result = (
             self.pages.allocation_stage_bytes(tokens, case.runtime.max_model_len, p.pp)
             if padded else [0.0] * p.pp
@@ -433,7 +526,9 @@ class _MemoryCacheMixin:
             result[self.layer_stage[layer.index]] += sum(
                 value for name, value in components.items() if name not in covered)
         mode = self.draft_kind
-        if mode and model.auxiliary is not None:
+        if self.paired_sfa and mode and not padded:
+            result[-1] += self._paired_draft_bytes(tokens, rank=int(rank), padded=False)
+        elif mode and model.auxiliary is not None and not self.paired_sfa:
             if self._uses_inherited_draft_cache(model):
                 draft_kv, draft_state = self._inherited_draft_cache_parts(
                     model, tokens, padded=padded, rank=int(rank), query_tokens=q_tok)
@@ -444,11 +539,13 @@ class _MemoryCacheMixin:
                 result[-1] += draft_kv
         return result
 
-    def _rank_max_layer_cache_bytes(self, tokens: int, rank: int) -> tuple[float, ...]:
+    def _rank_max_layer_cache_bytes(
+        self, tokens: int, rank: int, *, query_tokens: int | None = None,
+    ) -> tuple[float, ...]:
         if self.rank_token_owners is None:
-            return self._max_layer_cache_bytes(tokens)
+            return self._max_layer_cache_bytes(tokens, query_tokens=query_tokens)
         model, p = self.case.model, self.case.runtime.parallel
-        q_tok = self._effective_cache_query_tokens()
+        q_tok = self._effective_cache_query_tokens(query_tokens)
         result = [0.0] * p.pp
         for layer in model.layer_plans:
             comps = layer_cache_components(
@@ -462,12 +559,14 @@ class _MemoryCacheMixin:
         return tuple(result)
 
     def _kv_residency_ranks(
-        self, tokens: int,
+        self, tokens: int, *, query_tokens: int | None = None,
     ) -> tuple[list[list[float]], list[list[float]]]:
         """(HBM-resident, staging) per stage and physical rank."""
         p = self.case.runtime.parallel
         if self.rank_token_owners is None:
-            _gross, resident, staging = self._kv_residency(tokens)
+            _gross, resident, staging = self._kv_residency(
+                tokens, query_tokens=query_tokens,
+            )
             return (
                 [[float(resident[stage])] * self.width for stage in range(p.pp)],
                 [[float(staging[stage])] * self.width for stage in range(p.pp)],
@@ -475,8 +574,12 @@ class _MemoryCacheMixin:
         resident = [[0.0] * self.width for _ in range(p.pp)]
         staging = [[0.0] * self.width for _ in range(p.pp)]
         for rank in range(self.width):
-            gross = self._rank_cache_bytes(tokens, padded=True, rank=rank)
-            layer_max = self._rank_max_layer_cache_bytes(tokens, rank)
+            gross = self._rank_cache_bytes(
+                tokens, padded=True, rank=rank, query_tokens=query_tokens,
+            )
+            layer_max = self._rank_max_layer_cache_bytes(
+                tokens, rank, query_tokens=query_tokens,
+            )
             for stage in range(p.pp):
                 if self.kvc_hbm_ratio == 1.0:
                     resident[stage][rank] = float(gross[stage])
@@ -604,7 +707,7 @@ class _MemoryCacheMixin:
         rank_count = (max(self.width, stage_world)
                       if (self.rank_token_owners is None and p.cp_spans_dp)
                       else self.width)
-        if self.rank_token_owners is None and (self.paired_sfa or int(p.cp) <= 1):
+        if self.rank_token_owners is None and int(p.cp) <= 1:
             view = self._allocation_view(tokens, rank=None)
             return tuple(dict(view) for _ in range(rank_count))
         return tuple(
@@ -642,7 +745,8 @@ class _MemoryCacheMixin:
             tokens, padded=padded, skip_covered=padded, query_tokens=q_tok,
         )
         group_parts = (
-            self._group_cache_parts(tokens) if padded and self.pages.groups else None
+            self._group_cache_parts(tokens, query_tokens=q_tok)
+            if padded and self.pages.groups else None
         )
         group_payload = (
             self.pages.stage_bytes(tokens, case.runtime.max_model_len, p.pp)
@@ -713,9 +817,11 @@ class _MemoryCacheMixin:
             **pools,
         }
 
-    def _max_layer_cache_bytes(self, tokens: int) -> tuple[float, ...]:
+    def _max_layer_cache_bytes(
+        self, tokens: int, *, query_tokens: int | None = None,
+    ) -> tuple[float, ...]:
         model, p = self.case.model, self.case.runtime.parallel
-        q_tok = self._effective_cache_query_tokens()
+        q_tok = self._effective_cache_query_tokens(query_tokens)
         result = [0.0] * p.pp
         for layer in model.layer_plans:
             comps = layer_cache_components(
@@ -730,7 +836,7 @@ class _MemoryCacheMixin:
         if not self.sparse_offload:
             return 0.0
         block_size = int(self.sparse_offload["block_size"])
-        eff_tokens = math.ceil(tokens / block_size) * block_size if padded else tokens
+        eff_tokens = block_round(tokens, block_size) if padded else tokens
         offload_layers = len(self.sparse_offload["offload_layers"])
         return float(eff_tokens * int(self.sparse_offload["kv_row_bytes"]) * offload_layers)
 

@@ -143,6 +143,7 @@ def _resident_weight_parallel(
 def _weight_ledger_by_stage(
     case: CaseSpec, layer_stage: tuple[int, ...], *, draft_kind: str,
     include_draft: bool, include_engram_tables: bool, enable_shared_expert_dp: bool,
+    include_vision: bool | None = None,
     enable_pcp_o_proj_weight_sharding: bool = False,
     dcp_q_replicate: bool = False,
     slot_plans=None, ep_rank: int | None = None,
@@ -158,8 +159,8 @@ def _weight_ledger_by_stage(
     payload_by_stage: list[float] = []
     for terms in stage_weight_terms(
         model, parallel, include_draft=include_draft, draft_kind=draft_kind or None,
-        include_engram_tables=include_engram_tables, layer_partition=layer_stage,
-        slot_plans=slot_plans, ep_rank=ep_rank,
+        include_engram_tables=include_engram_tables, include_vision=include_vision,
+        layer_partition=layer_stage, slot_plans=slot_plans, ep_rank=ep_rank,
     ):
         total = payload = 0.0
         from mindie_sim.catalog.weights import _expand_resident_terms
@@ -187,6 +188,30 @@ class _MemoryWorkspaceMixin:
             raise ValueError("memory_workspace_tokens_require_nonnegative_integer")
         return tokens
 
+    def _draft_tap_stage_bytes(self, tokens: int) -> list[float]:
+        """Place draft-tap hidden buffers only on producing-to-consuming PP stages."""
+        model = self.case.model
+        pp = max(1, int(self.case.runtime.parallel.pp))
+        per_stage = [0.0] * pp
+        if not (self.draft_kind and model.auxiliary):
+            return per_stage
+        from mindie_sim.catalog.draft import optional_draft_spec
+        draft = optional_draft_spec(model, self.draft_kind)
+        per_tap = float(tokens) * float(model.hidden_size) * dtype_bytes(model.activation_dtype)
+        draft_stage = pp - 1
+        for layer_id in draft.target_layer_ids:
+            idx = int(layer_id)
+            if 0 <= idx < len(self.layer_stage):
+                prod_stage = int(self.layer_stage[idx])
+            elif idx < 0:
+                resolved_idx = max(0, len(self.layer_stage) + idx)
+                prod_stage = int(self.layer_stage[resolved_idx]) if self.layer_stage else 0
+            else:
+                prod_stage = draft_stage
+            for stage in range(min(prod_stage, draft_stage), draft_stage + 1):
+                per_stage[stage] += per_tap
+        return per_stage
+
     def _async_inflight_workspace(self, tokens=None) -> list[float]:
         """Ping-pong step input/residual/output buffer retained across overlapped async steps."""
         model, runtime = self.case.model, self.case.runtime
@@ -198,11 +223,8 @@ class _MemoryWorkspaceMixin:
             residual = model.hidden_size * (2 + max(1, layer.hc_mult))
             step_buffer = resolved * residual * dtype_bytes(model.activation_dtype)
             result[stage] = max(result[stage], step_buffer)
-        if self.draft_kind and model.auxiliary:
-            from mindie_sim.catalog.draft import optional_draft_spec
-            draft = optional_draft_spec(model, self.draft_kind)
-            feature_bytes = resolved * model.hidden_size * len(draft.target_layer_ids) * dtype_bytes(model.activation_dtype)
-            result = [value + feature_bytes for value in result]
+        tap_bytes = self._draft_tap_stage_bytes(resolved)
+        result = [value + tap for value, tap in zip(result, tap_bytes)]
         return [value * self.async_workspace_buffer_multiplier for value in result]
 
     def _workspace(self, tokens=None):
@@ -232,11 +254,8 @@ class _MemoryWorkspaceMixin:
             footprint = tokens * (residual + max(attention, ffn)) * dtype_bytes(model.activation_dtype)
             stage = self.layer_stage[layer.index]
             result[stage] = max(result[stage], footprint)
-        if self.draft_kind and model.auxiliary:
-            from mindie_sim.catalog.draft import optional_draft_spec
-            draft = optional_draft_spec(model, self.draft_kind)
-            feature_bytes = tokens * model.hidden_size * len(draft.target_layer_ids) * dtype_bytes(model.activation_dtype)
-            result = [value + feature_bytes for value in result]
+        tap_bytes = self._draft_tap_stage_bytes(tokens)
+        result = [value + tap for value, tap in zip(result, tap_bytes)]
         if model.vision:
             from mindie_sim.catalog.media import media_geometry
             for request in self.case.workload.requests:

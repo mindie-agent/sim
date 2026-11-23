@@ -53,7 +53,16 @@ from .contracts import (
     _normalise_owner_spans,
 )
 from .grants import _MemoryGrantsMixin
-from .ledger import _MemoryLedgerMixin
+from .ledger import (
+    DieResidentReceipt,
+    RecoverSsmRingBreakdown,
+    ResidentGrantEntry,
+    ResidentMemoryReceipt,
+    _MemoryLedgerMixin,
+    estimate_recover_ssm_snapshot_ring_bytes,
+    prepared_weight_bytes,
+    recover_ssm_snapshot_ring_breakdown,
+)
 from .reporting import _MemoryReportingMixin
 from .requests import _MemoryRequestsMixin
 from .residency import (
@@ -73,6 +82,7 @@ __all__ = [
     "CachePages",
     "CapacityDomainState",
     "CaseSpec",
+    "DieResidentReceipt",
     "EventKey",
     "FIRST",
     "Ledger",
@@ -84,6 +94,9 @@ __all__ = [
     "OccurrenceKey",
     "PoolKey",
     "QuantSpec",
+    "RecoverSsmRingBreakdown",
+    "ResidentGrantEntry",
+    "ResidentMemoryReceipt",
     "ZERO",
     "ZERO_FLOAT",
     "annotations",
@@ -91,11 +104,14 @@ __all__ = [
     "cache_row_split",
     "dataclass",
     "dtype_bytes",
+    "estimate_recover_ssm_snapshot_ring_bytes",
     "layer_cache_components",
     "layer_weight_terms",
     "local_kv_heads",
     "math",
     "owned_token_rows",
+    "prepared_weight_bytes",
+    "recover_ssm_snapshot_ring_breakdown",
     "replace",
     "stage_weight_bytes",
     "stage_weight_terms",
@@ -214,9 +230,21 @@ class Memory(
                 for plan in case.model.layer_plans
                 if plan.ffn == "moe" and int(plan.num_experts) > 0
             }
+        self.vision_accounting = str(
+            meta.get("vision_accounting")
+            or (
+                "full_checkpoint"
+                if (case.model.vision is not None and (
+                    case.model.auxiliary is None or case.model.auxiliary.include_vision_weights
+                ))
+                else "text_backbone"
+            )
+        )
+        include_vision_opt = self.vision_accounting == "full_checkpoint"
         self.gross_weights = stage_weight_bytes(
             case.model, p, case.machine.ranks_per_node, include_draft=draft,
             include_engram_tables=not case.runtime.engram_cpu_offload,
+            include_vision=include_vision_opt,
             layer_partition=self.layers, draft_kind=self.draft_kind or None,
             enable_shared_expert_dp=shared_expert_dp,
             enable_pcp_o_proj_weight_sharding=pcp_o_proj_shard,
@@ -227,6 +255,7 @@ class Memory(
             case, self.layers, draft_kind=self.draft_kind,
             include_draft=draft,
             include_engram_tables=not case.runtime.engram_cpu_offload,
+            include_vision=include_vision_opt,
             enable_shared_expert_dp=shared_expert_dp,
             enable_pcp_o_proj_weight_sharding=pcp_o_proj_shard,
             dcp_q_replicate=dcp_q_rep,
@@ -349,6 +378,10 @@ class Memory(
             ]
             for replica in range(p.dp)
         ]
+        self._base_rank_capacity = [
+            [list(row) for row in replica_ranks]
+            for replica_ranks in self.rank_capacity
+        ]
         self.capacity = [
             [min(row) for row in replica_ranks]
             for replica_ranks in self.rank_capacity
@@ -356,7 +389,14 @@ class Memory(
 
     def _init_allocation_state(self, case, p):
         self.peak = [[0.0] * p.pp for _ in range(p.dp)]
+        self.peak_rank = [
+            [[0.0] * self.width for _ in range(p.pp)] for _ in range(p.dp)
+        ]
         self.live = [[0.0] * p.pp for _ in range(p.dp)]
+        self.request_query_tokens: dict[tuple[int, str], int] = {}
+        self._prepared_weights: dict[str, object] = {}
+        self._prepared_persistent_by_stage = [0.0] * p.pp
+        self._prepared_load_peak_by_stage = [0.0] * p.pp
         self.live_rank = [
             [[0.0] * self.width for _ in range(p.pp)] for _ in range(p.dp)
         ]

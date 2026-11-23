@@ -114,36 +114,50 @@ def gbsa_cache_layout(runtime: Any) -> str:
         "gbsa_cache_layout", "") or "")
 
 
-def _packed_mla_row_parts(model: Any, plan: Any) -> tuple[int, int] | None:
+def _packed_mla_row_parts(
+    model: Any, plan: Any, *, phase: str | None = None,
+) -> tuple[int, int] | None:
     """Return ``(payload_bytes, scale_bytes)`` for implicit packed INT8 MLA rows."""
+    from mindie_sim.catalog.cache_format import _lookup_region_decl
+
     width = int(plan.cache_row_elements)
-    regions = dict(getattr(model, "metadata", ()) or ()).get(
-        "cache_representations", {})
+    metadata = dict(getattr(model, "metadata", ()) or ())
+    if _lookup_region_decl(metadata, "mla_kv", plan=plan, phase=phase) is not None:
+        return None
     quant = getattr(model, "quant", None)
-    kv_dtype = str(getattr(quant, "kv_dtype", "") or "")
+    kv_dtype = str(getattr(quant, "kv_dtype", "") or "").strip().lower()
     latent = int(getattr(plan, "kv_lora_rank", 0) or 0)
     rope = int(getattr(plan, "qk_rope_head_dim", 0) or 0)
-    if ("mla_kv" not in dict(regions) and kv_dtype in INT8_PACKED_KV_DTYPES
-            and latent > 0 and latent + rope == width):
-        scales = _ceil_div(latent, C8_SCALE_GROUP) * FP32_BYTES
+    if kv_dtype in INT8_PACKED_KV_DTYPES and latent > 0 and latent + rope == width:
+        scale_dtype = str(
+            metadata.get("kv_scale_dtype")
+            or (getattr(quant, "kv_scale_dtype", "") if quant is not None else "")
+            or "fp32"
+        ).strip().lower()
+        scales = exact_element_bytes(_ceil_div(latent, C8_SCALE_GROUP), scale_dtype)
         return int(latent + rope * BF16_BYTES), int(scales)
     return None
 
 
-def _packed_mla_row_bytes(model: Any, plan: Any) -> int:
-    """Physical MLA row width from the declared cache representation.
+def _packed_mla_row_bytes(
+    model: Any, plan: Any, *, phase: str | None = None,
+) -> int:
+    """Physical MLA row width from the declared per-layer cache representation.
 
-    An explicit ``cache_representations['mla_kv']`` mapping is authoritative.
-    A declared INT8 KV row is the packed C8 record ``latent + FP32 group
-    scales + BF16 rotary`` (512 + 16 + 0 = 528 B for NoPE C8); every other
-    row keeps its declared ``CacheFormat`` price as an exact integer.
+    An explicit per-layer or global ``mla_kv`` declaration is authoritative.
+    A declared INT8 KV row is the packed C8 record ``latent + group scales +
+    BF16 rotary`` (512 + 16 + 0 = 528 B for NoPE C8, 512 + 16 + 128 = 656 B
+    for 64-wide rotary); a NoPE FP8 row resolves to 520 B (FP16 scales) or
+    528 B (FP32 scales).
     """
     from mindie_sim.catalog.cache import packed_region_row_bytes
 
-    parts = _packed_mla_row_parts(model, plan)
+    parts = _packed_mla_row_parts(model, plan, phase=phase)
     if parts is not None:
         return parts[0] + parts[1]
-    return int(packed_region_row_bytes(model, "mla_kv", int(plan.cache_row_elements)))
+    return int(packed_region_row_bytes(
+        model, "mla_kv", int(plan.cache_row_elements), plan=plan, phase=phase,
+    ))
 
 
 def target_mla_page_bytes(model: Any, block_size: int, *,

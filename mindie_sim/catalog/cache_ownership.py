@@ -32,6 +32,8 @@ from typing import Any
 from mindie_sim.catalog.cache import (
     _LINEAR_ATTENTION_KINDS, layer_cache_components, layer_stage_map,
 )
+from mindie_sim.catalog.cache_pools import _ceil_div
+from mindie_sim.catalog.context_parallel import cp_interleave
 from mindie_sim.schema.common import ModelingError
 
 
@@ -52,7 +54,7 @@ WINDOW_BOUND_COMPONENTS = frozenset({"window", "gqa_kv", "mla_kv"})
 
 @dataclass(frozen=True)
 class CacheRange:
-    """One physical cache interval with explicit sharing ownership."""
+    """One physical cache interval with explicit sharing ownership and page IDs."""
 
     layer: int
     component: str
@@ -66,6 +68,7 @@ class CacheRange:
     allocated_bytes: float
     valid_bytes: float
     owner_key: str = ""
+    page_ids: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -137,72 +140,103 @@ def _component_prefix_tokens(plan: Any, tokens: int) -> int:
     return int(tokens)
 
 
+def _page_id_span(start_token: int, end_token: int, page_tokens: int) -> tuple[int, ...]:
+    lo = max(0, int(start_token))
+    hi = max(lo, int(end_token))
+    if hi <= lo:
+        return ()
+    stride = max(1, int(page_tokens))
+    first_page = lo // stride
+    last_page = _ceil_div(hi, stride)
+    return tuple(range(first_page, last_page))
+
+
 def cache_component_ranges(
     model: Any, layer: Any, parallel: Any, *, sequence_tokens: int,
     prefix_tokens: int, interleave: int, rank: int | None,
     capacity_padded: bool, owner_spans=None, runtime: Any = None,
-    query_tokens: int | None = None,
+    query_tokens: int | None = None, block_size: int | None = None,
+    generation: int = 0,
 ) -> tuple[CacheRange, ...]:
-    """Physical shared-prefix and private-suffix ranges for one layer."""
-    length = max(ZERO, int(sequence_tokens))
-    prefix = max(ZERO, min(int(prefix_tokens), length))
+    """Physical shared-prefix and private-suffix ranges for one layer.
+
+    Always computes ``valid_bytes`` from ``capacity_padded=False`` and
+    ``allocated_bytes`` from ``capacity_padded=True`` (when requested) so
+    padded page tails are never misclassified as valid content.
+    """
+    length = max(0, int(sequence_tokens))
+    page_tokens = max(
+        1,
+        int(block_size if block_size is not None else (
+            getattr(runtime, "kv_block_size", 0) or interleave
+        )),
+    )
+    prefix = max(0, min(int(prefix_tokens), length))
     prefix = _component_prefix_tokens(layer, prefix)
-    prefix = _block_tokens(prefix, int(interleave))
-    full = layer_cache_components(
-        model, layer, parallel, length, capacity_padded=capacity_padded,
-        interleave=interleave, rank=rank, owner_spans=owner_spans,
-        runtime=runtime, query_tokens=query_tokens)
-    if prefix <= ZERO:
-        prefix_values = {name: ZERO_FLOAT for name in full}
+    prefix = _block_tokens(prefix, page_tokens)
+    unpadded = layer_cache_components(
+        model, layer, parallel, length, capacity_padded=False,
+        interleave=interleave, block_size=page_tokens, rank=rank,
+        owner_spans=owner_spans, runtime=runtime, query_tokens=query_tokens,
+    )
+    if prefix <= 0:
+        prefix_values = {name: 0.0 for name in unpadded}
     else:
         prefix_values = layer_cache_components(
             model, layer, parallel, prefix, capacity_padded=False,
-            interleave=interleave, rank=rank, owner_spans=owner_spans,
-            runtime=runtime, query_tokens=query_tokens)
-    if capacity_padded and int(interleave) > ONE:
+            interleave=interleave, block_size=page_tokens, rank=rank,
+            owner_spans=owner_spans, runtime=runtime, query_tokens=query_tokens,
+        )
+    if capacity_padded:
         allocated = layer_cache_components(
-            model, layer, parallel,
-            (length + int(interleave) - ONE) // int(interleave) * int(interleave),
-            capacity_padded=True, interleave=interleave, rank=rank,
-            owner_spans=owner_spans, runtime=runtime, query_tokens=query_tokens)
+            model, layer, parallel, length, capacity_padded=True,
+            interleave=interleave, block_size=page_tokens, rank=rank,
+            owner_spans=owner_spans, runtime=runtime, query_tokens=query_tokens,
+        )
     else:
-        allocated = full
-    win = max(ZERO, int(getattr(layer, "window", ZERO) or ZERO))
+        allocated = unpadded
+    win = max(0, int(getattr(layer, "window", 0) or 0))
+    gen = int(generation)
     ranges: list[CacheRange] = []
-    for name, value in full.items():
+    for name, value in unpadded.items():
         valid = float(value)
         allocated_value = float(allocated.get(name, valid))
-        if name in STATE_COMPONENTS or valid <= ZERO_FLOAT:
+        if name in STATE_COMPONENTS or valid <= 0.0:
             component = str(name)
             ranges.append(CacheRange(
-                int(layer.index), component, str(component), ZERO, length,
-                "", ZERO, SHARING_PRIVATE, rank, allocated_value, valid,
-                f"layer{layer.index}:{component}:private:{rank}"))
+                int(layer.index), component, str(component), 0, length,
+                "", gen, SHARING_PRIVATE, rank, allocated_value, valid,
+                f"layer{layer.index}:{component}:private:{rank}", (),
+            ))
             continue
-        if win > ZERO and str(name) in WINDOW_BOUND_COMPONENTS:
-            win_start = max(ZERO, length - win)
-            live_len = max(ZERO, length - win_start)
-            live_shared = max(ZERO, min(prefix, length) - win_start)
+        if win > 0 and str(name) in WINDOW_BOUND_COMPONENTS:
+            win_start = max(0, length - win)
+            live_len = max(0, length - win_start)
+            live_shared = max(0, min(prefix, length) - win_start)
             shared = (
                 valid * (float(live_shared) / float(live_len))
-                if live_len > ZERO and live_shared > ZERO else ZERO_FLOAT
+                if live_len > 0 and live_shared > 0 else 0.0
             )
             sh_start = win_start
             sh_end = max(win_start, min(prefix, length))
         else:
-            shared = min(valid, float(prefix_values.get(name, ZERO_FLOAT)))
-            sh_start = ZERO
+            shared = min(valid, float(prefix_values.get(name, 0.0)))
+            sh_start = 0
             sh_end = prefix
-        private = max(ZERO_FLOAT, valid - shared)
-        if shared > ZERO_FLOAT:
+        private = max(0.0, valid - shared)
+        if shared > 0.0:
             ranges.append(CacheRange(
                 int(layer.index), str(name), str(name), sh_start, sh_end,
-                "", ZERO, SHARING_SHARED, rank, shared, shared,
-                f"layer{layer.index}:{name}:{sh_start}:{sh_end}:shared"))
+                "", gen, SHARING_SHARED, rank, shared, shared,
+                f"layer{layer.index}:{name}:{sh_start}:{sh_end}:shared",
+                _page_id_span(sh_start, sh_end, page_tokens),
+            ))
         ranges.append(CacheRange(
             int(layer.index), str(name), str(name), sh_end, length,
-            "", ZERO, SHARING_PRIVATE, rank, max(ZERO_FLOAT, allocated_value - shared),
-            private, f"layer{layer.index}:{name}:private:{rank}"))
+            "", gen, SHARING_PRIVATE, rank, max(0.0, allocated_value - shared),
+            private, f"layer{layer.index}:{name}:private:{rank}",
+            _page_id_span(sh_end, length, page_tokens),
+        ))
     return tuple(ranges)
 
 
@@ -214,7 +248,8 @@ def _prefixed(ranges: Sequence[CacheRange], prefix_key: str,
             item.end_token, prefix_key, generation, item.sharing, item.rank,
             item.allocated_bytes, item.valid_bytes,
             (f"prefix:{prefix_key}:g{generation}:{item.owner_key}"
-             if item.sharing == SHARING_SHARED else item.owner_key))
+             if item.sharing == SHARING_SHARED else item.owner_key),
+            item.page_ids)
         for item in ranges)
 
 
@@ -263,6 +298,165 @@ def _active_draft_kind(model: Any, runtime: Any) -> str:
     return ""
 
 
+def _view_generation(view: Any) -> int:
+    raw = getattr(view, "prefix_generation", None)
+    if raw is None:
+        raw = getattr(view, "generation", 0)
+    return int(raw or 0)
+
+
+def _resolve_group_stage(
+    group: Mapping[str, Any],
+    layer_stages: Mapping[int, int],
+    stages: int,
+) -> int:
+    layers = group.get("layers") or ()
+    if layers:
+        first = int(layers[0])
+        if first in layer_stages:
+            return int(layer_stages[first])
+    members = group.get("members") or ()
+    if members:
+        first = int(members[0]["layer"])
+        if first in layer_stages:
+            return int(layer_stages[first])
+    return max(0, stages - 1)
+
+
+def _paired_group_covered_members(groups: Sequence[Mapping[str, Any]]) -> tuple[set[int], set[tuple[int, str]]]:
+    full_layers: set[int] = set()
+    member_pairs: set[tuple[int, str]] = set()
+    for group in groups:
+        if group.get("auxiliary"):
+            continue
+        if "members" in group and group["members"]:
+            for item in group["members"]:
+                member_pairs.add((int(item["layer"]), str(item["component"])))
+        else:
+            for layer_id in group.get("layers") or ():
+                full_layers.add(int(layer_id))
+    return full_layers, member_pairs
+
+
+def _paired_sfa_batch_footprint(
+    case: Any,
+    *,
+    requests: Sequence[Any],
+    phase: str,
+    padded: bool,
+    layer_stages: Mapping[int, int],
+    stages: int,
+    shared_mode: bool,
+) -> BatchCacheFootprint:
+    from mindie_sim.catalog.paired_sfa import page_groups
+    from mindie_sim.schema.runtime_features import canonical_prefix_cache_key
+
+    model, runtime = case.model, case.runtime
+    parallel = runtime.parallel
+    query_tokens = max(
+        (max(1, int(getattr(v, "q_len", 1) or 1)) for v in requests),
+        default=1,
+    )
+    groups = page_groups(case, layer_stages, query_tokens)
+    covered_layers, covered_members = _paired_group_covered_members(groups)
+    shared_once = [0.0] * stages
+    private = [0.0] * stages
+    state = [0.0] * stages
+    draft = [0.0] * stages
+    boundary = [0.0] * stages
+    shared_page_sets: dict[tuple[str, int, int], set[int]] = {}
+    interleave = cp_interleave(runtime)
+    block_size = max(1, int(getattr(runtime, "kv_block_size", DEFAULT_INTERLEAVE) or DEFAULT_INTERLEAVE))
+
+    for view in requests:
+        length = max(0, int(getattr(view, "kv_len", 0) or 0))
+        q_tok = max(1, int(getattr(view, "q_len", 1) or 1))
+        declared = max(0, min(int(getattr(view, "prefix_tokens", 0) or 0), length))
+        generation = _view_generation(view)
+        key = (
+            canonical_prefix_cache_key("shared", getattr(view, "prefix_cache_key", ""))
+            if shared_mode else f"private:{getattr(view, 'request_id', '')}"
+        )
+        for group_idx, group in enumerate(groups):
+            stage = _resolve_group_stage(group, layer_stages, stages)
+            tpp = max(1, int(group["tokens_per_page"]))
+            page_bytes = float(group["bytes_per_group_page"])
+            is_aux = bool(group.get("auxiliary", False))
+            fixed = int(group.get("fixed_pages", 0) or 0)
+            rec_pages = int(group.get("recycling_pages", 0) or 0)
+            if fixed > 0:
+                fixed_bytes = float(fixed + rec_pages) * page_bytes
+                private[stage] += fixed_bytes
+                state[stage] += fixed_bytes
+                continue
+            cap = group.get("resident_tokens")
+            eff_len = min(length, int(cap)) if (cap is not None and int(cap) > 0) else length
+            eff_declared = min(declared, eff_len)
+            prefix_pages = eff_declared // tpp if shared_mode else 0
+            history_pages = _ceil_div(eff_len, tpp) if eff_len > 0 else 0
+            if prefix_pages > 0:
+                page_key = (key, generation, group_idx)
+                seen = shared_page_sets.setdefault(page_key, set())
+                new_ids = set(range(prefix_pages)) - seen
+                if new_ids:
+                    shared_once[stage] += float(len(new_ids)) * page_bytes
+                    seen.update(new_ids)
+            priv_history_pages = max(0, history_pages - prefix_pages)
+            if is_aux:
+                draft[stage] += float(priv_history_pages) * page_bytes
+            else:
+                private[stage] += float(priv_history_pages + rec_pages) * page_bytes
+                state[stage] += float(rec_pages) * page_bytes
+
+        # Account for separately allocated components excluded from paired pools
+        # (for example RecoverSSM replay_records / state_transient).
+        for plan in model.layer_plans:
+            if plan.index in covered_layers:
+                continue
+            comps = layer_cache_components(
+                model, plan, parallel, length, capacity_padded=bool(padded),
+                interleave=interleave, block_size=block_size, runtime=runtime,
+                query_tokens=q_tok, phase=phase,
+            )
+            stage = layer_stages[int(plan.index)]
+            for comp_name, comp_bytes in comps.items():
+                if (int(plan.index), str(comp_name)) in covered_members:
+                    continue
+                val = float(comp_bytes)
+                if val <= 0.0:
+                    continue
+                private[stage] += val
+                if comp_name in STATE_COMPONENTS:
+                    state[stage] += val
+
+    totals = tuple(
+        shared_once[s] + private[s] + draft[s] + boundary[s] for s in range(stages)
+    )
+    return BatchCacheFootprint(
+        tuple(shared_once), tuple(private), tuple(state),
+        tuple(draft), tuple(boundary), totals,
+        requests=len(requests), stages=stages,
+    )
+
+
+def _union_elementary_spans(spans: Sequence[tuple[int, int, float]]) -> float:
+    """Exact piecewise-constant union integral without inflating non-overlapping tails."""
+    if not spans:
+        return 0.0
+    points = sorted({pt for lo, hi, _ in spans for pt in (lo, hi) if hi > lo})
+    if len(points) < 2:
+        return 0.0
+    total = 0.0
+    for idx in range(len(points) - 1):
+        a, b = points[idx], points[idx + 1]
+        if b <= a:
+            continue
+        active = [rate for lo, hi, rate in spans if lo <= a and hi >= b]
+        if active:
+            total += float(b - a) * max(active)
+    return total
+
+
 def batch_cache_footprint(
     case: Any, *, requests: Sequence[Any], replica: int, phase: str,
     padded: bool,
@@ -270,78 +464,53 @@ def batch_cache_footprint(
     """Physical batch footprint for one DP replica and phase."""
     del replica
     model, parallel = case.model, case.runtime.parallel
-    stages = max(ONE, int(parallel.pp))
+    stages = max(1, int(parallel.pp))
     runtime = case.runtime
     layer_stages = _layer_stages(model, parallel, runtime)
-    shared: dict[tuple[int, str, str, int], list[tuple[int, int, float]]] = {}
-    private = [ZERO_FLOAT] * stages
-    state = [ZERO_FLOAT] * stages
-    draft = [ZERO_FLOAT] * stages
-    boundary = [ZERO_FLOAT] * stages
     shared_mode = getattr(runtime, "prefix_cache_mode", "private") == "shared"
     if dict(model.metadata).get("cache_allocator") == "paired_sfa":
-        from mindie_sim.catalog.paired_sfa import page_groups
-        from mindie_sim.schema.runtime_features import canonical_prefix_cache_key
-        query_tokens = max((max(ONE, int(getattr(v, "q_len", ONE) or ONE)) for v in requests), default=ONE)
-        groups = page_groups(case, layer_stages, query_tokens)
-        shared_once, shared_pages = [ZERO_FLOAT] * stages, {}
-        for view in requests:
-            length = max(ZERO, int(getattr(view, "kv_len", ZERO) or ZERO))
-            declared = max(ZERO, min(int(getattr(view, "prefix_tokens", ZERO) or ZERO), length))
-            key = ((canonical_prefix_cache_key("shared", getattr(view, "prefix_cache_key", "")))
-                   if shared_mode else f"private:{getattr(view, 'request_id', '')}")
-            for stage, group in enumerate(groups):
-                tokens_per_page = max(ONE, int(group["tokens_per_page"]))
-                page_bytes = float(group["bytes_per_group_page"])
-                prefix_pages = declared // tokens_per_page if shared_mode else ZERO
-                history_pages = (length + tokens_per_page - ONE) // tokens_per_page
-                # A shared prefix is one physical page set per key and stage.
-                # Charge only the growth of the longest declared prefix so the
-                # total is invariant under request ordering.
-                previous_pages = int(shared_pages.get((key, stage), ZERO))
-                if prefix_pages > previous_pages:
-                    shared_once[stage] += (prefix_pages - previous_pages) * page_bytes
-                    shared_pages[(key, stage)] = prefix_pages
-                state_pages = int(group["recycling_pages"])
-                private[stage] += (history_pages - prefix_pages + state_pages) * page_bytes
-                state[stage] += state_pages * page_bytes
-        return BatchCacheFootprint(
-            tuple(shared_once), tuple(private), tuple(state),
-            (ZERO_FLOAT,) * stages, (ZERO_FLOAT,) * stages,
-            tuple(a + b for a, b in zip(shared_once, private)),
-            requests=len(requests), stages=stages)
-    interleave = max(ONE, int(getattr(runtime, "kv_block_size", DEFAULT_INTERLEAVE) or DEFAULT_INTERLEAVE))
+        return _paired_sfa_batch_footprint(
+            case, requests=requests, phase=phase, padded=padded,
+            layer_stages=layer_stages, stages=stages, shared_mode=shared_mode,
+        )
+    shared: dict[tuple[int, str, str, int, int], list[tuple[int, int, float]]] = {}
+    private = [0.0] * stages
+    state = [0.0] * stages
+    draft = [0.0] * stages
+    boundary = [0.0] * stages
+    block_size = max(1, int(getattr(runtime, "kv_block_size", DEFAULT_INTERLEAVE) or DEFAULT_INTERLEAVE))
+    interleave = cp_interleave(runtime)
     draft_kind = _active_draft_kind(model, runtime)
     for view in requests:
-        length = int(getattr(view, "kv_len", ZERO) or ZERO)
-        q_tok = max(ONE, int(getattr(view, "q_len", ONE) or ONE))
-        declared_prefix = int(getattr(view, "prefix_tokens", ZERO) or ZERO)
-        declared_prefix = max(ZERO, min(declared_prefix, length))
+        length = int(getattr(view, "kv_len", 0) or 0)
+        q_tok = max(1, int(getattr(view, "q_len", 1) or 1))
+        declared_prefix = max(0, min(int(getattr(view, "prefix_tokens", 0) or 0), length))
         if shared_mode:
             from mindie_sim.schema.runtime_features import canonical_prefix_cache_key
             key = canonical_prefix_cache_key(
                 "shared", getattr(view, "prefix_cache_key", ""))
         else:
             key = f"private:{getattr(view, 'request_id', '')}"
-        generation = ZERO
+        generation = _view_generation(view)
         for layer in model.layer_plans:
             ranges = cache_component_ranges(
                 model, layer, parallel, sequence_tokens=length,
                 prefix_tokens=declared_prefix, interleave=interleave,
-                rank=None, capacity_padded=bool(padded), runtime=runtime,
-                query_tokens=q_tok)
+                block_size=block_size, rank=None, capacity_padded=bool(padded),
+                runtime=runtime, query_tokens=q_tok, generation=generation,
+            )
             stage = layer_stages[int(layer.index)]
             for item in _prefixed(ranges, key, generation):
-                if item.sharing == SHARING_SHARED and item.valid_bytes > ZERO_FLOAT:
-                    span_len = max(ONE, item.end_token - item.start_token)
+                if item.sharing == SHARING_SHARED and item.valid_bytes > 0.0:
+                    span_len = max(1, item.end_token - item.start_token)
                     rate = float(item.valid_bytes) / float(span_len)
-                    grp_key = (int(item.layer), item.component, key, stage)
+                    grp_key = (int(item.layer), item.component, key, generation, stage)
                     shared.setdefault(grp_key, []).append(
                         (int(item.start_token), int(item.end_token), rate))
                     continue
                 private[stage] += float(item.valid_bytes)
                 boundary[stage] += max(
-                    ZERO_FLOAT, float(item.allocated_bytes) - float(item.valid_bytes))
+                    0.0, float(item.allocated_bytes) - float(item.valid_bytes))
                 if item.component in STATE_COMPONENTS:
                     state[stage] += float(item.valid_bytes)
         if str(phase) == "decode" and draft_kind:
@@ -349,21 +518,12 @@ def batch_cache_footprint(
                 model, parallel, draft_kind=draft_kind, sequence_tokens=length,
                 runtime=runtime, capacity_padded=bool(padded), query_tokens=q_tok,
                 phase=phase)
-            draft[-ONE] += float(values.get("draft_kv", ZERO_FLOAT))
-            state[-ONE] += float(values.get("draft_state", ZERO_FLOAT))
-            private[-ONE] += float(values.get("draft_state", ZERO_FLOAT))
-    shared_once = [ZERO_FLOAT] * stages
-    for (_lyr, _comp, _key, stage), spans in shared.items():
-        ordered = sorted(spans, key=lambda s: (s[ZERO], s[ONE]))
-        cur_lo, cur_hi, cur_rate = ordered[ZERO]
-        for lo, hi, rate in ordered[ONE:]:
-            if lo <= cur_hi:
-                cur_hi = max(cur_hi, hi)
-                cur_rate = max(cur_rate, rate)
-            else:
-                shared_once[stage] += float(cur_hi - cur_lo) * cur_rate
-                cur_lo, cur_hi, cur_rate = lo, hi, rate
-        shared_once[stage] += float(cur_hi - cur_lo) * cur_rate
+            draft[-1] += float(values.get("draft_kv", 0.0))
+            state[-1] += float(values.get("draft_state", 0.0))
+            private[-1] += float(values.get("draft_state", 0.0))
+    shared_once = [0.0] * stages
+    for (_lyr, _comp, _key, _gen, stage), spans in shared.items():
+        shared_once[stage] += _union_elementary_spans(spans)
     total = [
         shared_once[stage] + private[stage] + draft[stage] + boundary[stage]
         for stage in range(stages)
