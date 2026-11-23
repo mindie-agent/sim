@@ -36,6 +36,7 @@ from .bundle import (
 )
 from .comparison import (
     align_before_after_operators,
+    anchor_stage_waterfall,
     build_actionable_roadmap,
     build_agent_brief,
     build_macro_module_breakdown,
@@ -50,6 +51,7 @@ from .kernel_catalog import (
     classify_macro_module,
     classify_submodule,
     extract_layer_index,
+    resolve_operator_display_dtype,
 )
 from .memory_ledger import (
     compute_memory_quant_ledger,
@@ -318,6 +320,7 @@ __all__ = [
     "XLSX_EXPORT_RECEIPT_SCHEMA",
     "XlsxExportSummary",
     "align_before_after_operators",
+    "anchor_stage_waterfall",
     "build_actionable_roadmap",
     "build_agent_brief",
     "build_export_bundle",
@@ -356,6 +359,7 @@ __all__ = [
     "project_two_step_gain",
     "reconcile_operators_with_kernels",
     "resolve_hardware_alias",
+    "resolve_operator_display_dtype",
     "sanitize_public_text",
     "sanitize_source_ref",
 ]

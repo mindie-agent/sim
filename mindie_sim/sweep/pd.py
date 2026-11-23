@@ -79,6 +79,10 @@ from mindie_sim.schema.scenario import (
     DeploymentOutcome,
     validate_deployment_mode,
 )
+from mindie_sim.sweep.mapreduce import (
+    BoundedMapPool,
+    resolve_granted_workers,
+)
 from mindie_sim.sweep.resize import check_pos_float, check_pos_int
 
 MS_PER_S = 1000.0
@@ -88,6 +92,9 @@ NS_PER_US = 1000.0
 BYTES_PER_GIB = float(1024 ** 3)
 BYTES_PER_MS_PER_GBPS = 1_000_000.0
 PARETO_EPS = 1e-12
+CLOSED_FORM_TIE_EPS = 1e-11
+KV_RATE_FLOOR_MS = 1e-9
+POOL_RATIO_SUM_TOL = 1e-6
 HALF_RATIO = 0.5
 DEFAULT_ELEM_BYTES = 2.0
 EMBED_MAX_ELEM_BYTES = 4.0
@@ -641,6 +648,83 @@ def _classify_decode_regime(
     return REGIME_SLA_LATENCY_BOUND, "tpot_sla"
 
 
+def _assemble_decode_stage_from_sla(
+    d_parsed: CaseSpec,
+    *,
+    d_sla: Mapping[str, Any],
+    length_ok: bool,
+    tpot_sla_ms: float,
+    exposed_kv_ms: float,
+    decode_tokens: int,
+    output: int,
+) -> dict[str, Any]:
+    """Assemble canonical decode-stage metrics from an SLA concurrency solve."""
+    d_par = d_parsed.runtime.parallel
+    d_dp = int(d_par.dp)
+    handoff_tpot = exposed_kv_ms / float(decode_tokens)
+    decode_budget = tpot_sla_ms - handoff_tpot
+    d_scen = d_sla["scenarios"][0]
+    emitted = float(d_sla["emitted_tokens_per_seq"])
+    b_vram = int(d_scen["b_vram_max"]) if length_ok else 0
+    cfg_seqs = int(d_scen.get("configured_max_num_seqs", d_parsed.runtime.max_num_seqs))
+    tok_lim = int(d_scen.get("token_batch_limit", b_vram))
+    b_sla = int(d_scen["b_sla"]) if decode_budget > 0.0 else 0
+    b_feasible = int(d_scen["b_feasible"])
+    b1_step = float(d_scen.get("step_ms_at_b1") or 0.0)
+    decode_step = (
+        float(d_scen["step_ms_feasible"])
+        if b_feasible >= 1 and d_scen.get("step_ms_feasible") is not None
+        else b1_step
+    )
+    effective_tpot = (decode_step / max(emitted, PARETO_EPS) + handoff_tpot) if decode_step > 0.0 else 0.0
+    first_itl = exposed_kv_ms + decode_step
+    tpot_ok = bool(b_feasible >= 1 and effective_tpot <= tpot_sla_ms + PARETO_EPS)
+    rps_d = (
+        (b_feasible * d_dp * emitted * MS_PER_S)
+        / (max(decode_step, PARETO_EPS) * float(decode_tokens))
+        if tpot_ok else 0.0
+    )
+    raw_rps_d = (
+        (max(1, b_feasible) * d_dp * emitted * MS_PER_S)
+        / (max(decode_step, PARETO_EPS) * float(decode_tokens))
+        if decode_step > 0.0 else 0.0
+    )
+    per_dp_dies = max(1, int(d_par.tp) * int(d_par.pcp) * int(d_par.pp))
+    n_tok_per_die = (float(max(1, b_feasible)) * emitted) / float(per_dp_dies) if b_feasible >= 1 else 0.0
+    us_per_tok_die = (decode_step * US_PER_MS) / n_tok_per_die if n_tok_per_die > 0.0 else 0.0
+    decode_tps_per_die = (US_PER_SECOND / us_per_tok_die) if (tpot_ok and us_per_tok_die > 0.0) else 0.0
+    unused_sla_slack_ms = max(0.0, float(tpot_sla_ms) - float(effective_tpot)) if tpot_ok else 0.0
+    operating_regime, limiting_constraint = _classify_decode_regime(
+        feasible=tpot_ok,
+        b_feasible=b_feasible,
+        b_vram=b_vram,
+        configured_max_seqs=cfg_seqs,
+        token_batch_limit=tok_lim,
+        unused_sla_slack_ms=unused_sla_slack_ms,
+    )
+    free_hbm_gib = float(d_scen.get("free_hbm_headroom_gib", 0.0) or 0.0)
+    return {
+        "decode_budget": decode_budget, "length_ok": length_ok,
+        "b_vram": b_vram, "configured_max_num_seqs": cfg_seqs,
+        "token_batch_limit": tok_lim, "b_sla": b_sla, "b_feasible": b_feasible,
+        "b1_step": b1_step, "decode_step": decode_step,
+        "handoff_tpot_ms": float(handoff_tpot),
+        "effective_tpot": effective_tpot, "first_itl": first_itl,
+        "tpot_ok": tpot_ok, "rps_d": rps_d, "raw_rps_d": raw_rps_d,
+        "decode_tps": rps_d * float(output),
+        "decode_tps_per_die": decode_tps_per_die,
+        "avg_accepted_tokens": emitted,
+        "n_tok_per_die": n_tok_per_die,
+        "us_per_tok_die": us_per_tok_die,
+        "unused_sla_slack_ms": unused_sla_slack_ms,
+        "operating_regime": operating_regime,
+        "limiting_constraint": limiting_constraint,
+        "free_hbm_headroom_gib": free_hbm_gib,
+        "dcp_codomain_valid": True,
+        "dcp_codomain_reason": None,
+    }
+
+
 def _measure_decode_stage(
     d_parsed: CaseSpec,
     *,
@@ -682,7 +766,6 @@ def _measure_decode_stage(
             "free_hbm_headroom_gib": 0.0,
             "dcp_codomain_valid": False, "dcp_codomain_reason": dcp_reason,
         }
-    d_dp = int(d_par.dp)
     d_q_tok, d_emit_est = _resolve_speculative_tokens(
         d_parsed, output_budget=output, tokens_per_seq=None, emitted_tokens_per_seq=None,
     )
@@ -730,66 +813,11 @@ def _measure_decode_stage(
         )
         if d_sla_key is not None:
             cache[d_sla_key] = d_sla
-    d_scen = d_sla["scenarios"][0]
-    emitted = float(d_sla["emitted_tokens_per_seq"])
-    b_vram = int(d_scen["b_vram_max"]) if length_ok else 0
-    cfg_seqs = int(d_scen.get("configured_max_num_seqs", d_parsed.runtime.max_num_seqs))
-    tok_lim = int(d_scen.get("token_batch_limit", b_vram))
-    b_sla = int(d_scen["b_sla"]) if decode_budget > 0.0 else 0
-    b_feasible = int(d_scen["b_feasible"])
-    b1_step = float(d_scen.get("step_ms_at_b1") or 0.0)
-    decode_step = (
-        float(d_scen["step_ms_feasible"])
-        if b_feasible >= 1 and d_scen.get("step_ms_feasible") is not None
-        else b1_step
+    return _assemble_decode_stage_from_sla(
+        d_parsed, d_sla=d_sla, length_ok=length_ok,
+        tpot_sla_ms=tpot_sla_ms, exposed_kv_ms=exposed_kv_ms,
+        decode_tokens=decode_tokens, output=output,
     )
-    effective_tpot = (decode_step / max(emitted, PARETO_EPS) + handoff_tpot) if decode_step > 0.0 else 0.0
-    first_itl = exposed_kv_ms + decode_step
-    tpot_ok = bool(dcp_ok and b_feasible >= 1 and effective_tpot <= tpot_sla_ms + PARETO_EPS)
-    rps_d = (
-        (b_feasible * d_dp * emitted * MS_PER_S)
-        / (max(decode_step, PARETO_EPS) * float(decode_tokens))
-        if tpot_ok else 0.0
-    )
-    raw_rps_d = (
-        (max(1, b_feasible) * d_dp * emitted * MS_PER_S)
-        / (max(decode_step, PARETO_EPS) * float(decode_tokens))
-        if decode_step > 0.0 else 0.0
-    )
-    per_dp_dies = max(1, int(d_par.tp) * int(d_par.pcp) * int(d_par.pp))
-    n_tok_per_die = (float(max(1, b_feasible)) * emitted) / float(per_dp_dies) if b_feasible >= 1 else 0.0
-    us_per_tok_die = (decode_step * US_PER_MS) / n_tok_per_die if n_tok_per_die > 0.0 else 0.0
-    decode_tps_per_die = (US_PER_SECOND / us_per_tok_die) if (tpot_ok and us_per_tok_die > 0.0) else 0.0
-    unused_sla_slack_ms = max(0.0, float(tpot_sla_ms) - float(effective_tpot)) if tpot_ok else 0.0
-    operating_regime, limiting_constraint = _classify_decode_regime(
-        feasible=tpot_ok,
-        b_feasible=b_feasible,
-        b_vram=b_vram,
-        configured_max_seqs=cfg_seqs,
-        token_batch_limit=tok_lim,
-        unused_sla_slack_ms=unused_sla_slack_ms,
-    )
-    free_hbm_gib = float(d_scen.get("free_hbm_headroom_gib", 0.0) or 0.0)
-    return {
-        "decode_budget": decode_budget, "length_ok": length_ok,
-        "b_vram": b_vram, "configured_max_num_seqs": cfg_seqs,
-        "token_batch_limit": tok_lim, "b_sla": b_sla, "b_feasible": b_feasible,
-        "b1_step": b1_step, "decode_step": decode_step,
-        "handoff_tpot_ms": float(handoff_tpot),
-        "effective_tpot": effective_tpot, "first_itl": first_itl,
-        "tpot_ok": tpot_ok, "rps_d": rps_d, "raw_rps_d": raw_rps_d,
-        "decode_tps": rps_d * float(output),
-        "decode_tps_per_die": decode_tps_per_die,
-        "avg_accepted_tokens": emitted,
-        "n_tok_per_die": n_tok_per_die,
-        "us_per_tok_die": us_per_tok_die,
-        "unused_sla_slack_ms": unused_sla_slack_ms,
-        "operating_regime": operating_regime,
-        "limiting_constraint": limiting_constraint,
-        "free_hbm_headroom_gib": free_hbm_gib,
-        "dcp_codomain_valid": True,
-        "dcp_codomain_reason": None,
-    }
 
 
 def _prefill_only_pd_stage_result(
@@ -830,62 +858,46 @@ def _prefill_only_pd_stage_result(
     }
 
 
-def _evaluate_pd_stages(
+def _compute_pd_handoff_metrics(
     p_parsed: CaseSpec,
     d_parsed: CaseSpec,
     *,
+    p_mem: Memory,
+    d_mem: Memory,
+    p_step: float,
+    p_slots: int,
+    prefill_hbm_ok: bool,
+    p_dcp_ok: bool,
+    p_dcp_reason: str | None,
     total: int,
     prompt: int,
     output: int,
-    eff_decode: int,
     ttft_sla_ms: float,
     tpot_sla_ms: float,
     mode: str,
     dram_r: float,
     ssd_r: float,
-    hit_r: float,
+    compute_tokens: int,
+    hit_tokens: int,
     kv_transfer_bw_gbps: float | None,
     ddr_bw_gbps: float | None,
     ssd_bw_gbps: float | None,
-    max_sequences_per_dp: int | None = None,
-    apply_target_envelope: bool = False,
-    rewrite_plan: Any = None,
-    allow_unbound_formula: bool = True,
-    _prefill_step_cache: dict[tuple[int, int, int], tuple[Memory, bool, int, float]] | None = None,
-    _prefill_cache_id: int | None = None,
-    _decode_sla_cache: dict[tuple[int, float], dict[str, Any]] | None = None,
-    _decode_cache_id: int | None = None,
-    _decode_probe_cache: dict[int, float] | None = None,
-    _decode_vram_info: tuple[Memory, tuple[float, ...], int] | None = None,
-    _decode_rep_info: tuple[CaseSpec, dict[int, int], float] | None = None,
 ) -> dict[str, Any]:
-    """Evaluate prefill, KV handoff / 3-tier pool, and decode stage rates."""
+    """Compute exact P->D handoff/pool overlap and prefill rates without Engine calls."""
     p_dp = int(p_parsed.runtime.parallel.dp)
-    p_dcp_ok, p_dcp_reason = validate_vllm_ascend_dcp_codomain(p_parsed.model, p_parsed.runtime.parallel)
     prefill_role_error = None if p_dcp_ok else f"prefill:{p_dcp_reason}"
-    hit_tokens = min(int(math.floor(prompt * hit_r)), max(0, prompt - 1)) if mode == "pooled_dram_ssd" else 0
-    compute_tokens = max(0, prompt - hit_tokens)
-    p_mem, prefill_hbm_ok, p_slots, p_step = _measure_prefill_stage(
-        p_parsed, prompt=prompt, compute_tokens=compute_tokens, hit_tokens=hit_tokens,
-        cache=_prefill_step_cache, cache_id=_prefill_cache_id,
-        apply_target_envelope=apply_target_envelope, rewrite_plan=rewrite_plan,
-        allow_unbound_formula=allow_unbound_formula, allow_plan_fallback=(output > 1),
-    )
-    decode_q_tokens, _ = _resolve_speculative_tokens(
-        d_parsed, output_budget=output, tokens_per_seq=None, emitted_tokens_per_seq=None,
-    )
-    d_mem = Memory(d_parsed, workspace_tokens=decode_q_tokens)
     decode_tokens = output - 1
     link_info = _resolve_pd_link_bandwidth(
         p_parsed, d_parsed, total_dies=total, kv_transfer_bw_gbps=kv_transfer_bw_gbps,
     )
     if decode_tokens <= 0:
-        return _prefill_only_pd_stage_result(
+        res = _prefill_only_pd_stage_result(
             p_dp=p_dp, p_step=p_step, p_slots=p_slots, prefill_hbm_ok=prefill_hbm_ok,
             prefill_role_error=prefill_role_error, p_dcp_ok=p_dcp_ok, p_dcp_reason=p_dcp_reason,
             ttft_sla_ms=ttft_sla_ms, tpot_sla_ms=tpot_sla_ms, compute_tokens=compute_tokens,
             hit_tokens=hit_tokens, output=output, d_parsed=d_parsed, link_info=link_info,
         )
+        return {"prefill_only": True, "stage": res}
 
     handoff = compute_pd_handoff_plan(
         p_parsed, d_parsed, tokens=prompt, prefill_memory=p_mem, decode_memory=d_mem,
@@ -917,8 +929,8 @@ def _evaluate_pd_stages(
                 (float(p_slots) * MS_PER_S) / max(p_slot_hold_ms, PARETO_EPS),
             ) if p_slot_hold_ms > 0.0 else float(p_slots) * MS_PER_S
         )
-        p_kv_rps_per_inst = (MS_PER_S / max(p_flush_ms, 1e-9)) if p_flush_ms > 0.0 else float("inf")
-        d_kv_rps_per_inst = MS_PER_S / max(d_pull_ms, 1e-9)
+        p_kv_rps_per_inst = (MS_PER_S / max(p_flush_ms, KV_RATE_FLOOR_MS)) if p_flush_ms > 0.0 else float("inf")
+        d_kv_rps_per_inst = MS_PER_S / max(d_pull_ms, KV_RATE_FLOOR_MS)
     else:
         wire_ms = _compute_d2d_wire_ms(handoff, link_info)
         kv_ms = max(wire_ms, _pool_kv_hbm_ms(p_parsed, p_mem, prompt), _pool_kv_hbm_ms(d_parsed, d_mem, prompt))
@@ -936,15 +948,135 @@ def _evaluate_pd_stages(
             MS_PER_S / max(p_step, PARETO_EPS),
             (float(p_slots) * MS_PER_S) / max(p_slot_hold_ms, PARETO_EPS),
         )
-        p_kv_rps_per_inst = MS_PER_S / max(kv_ms, 1e-9)
+        p_kv_rps_per_inst = MS_PER_S / max(kv_ms, KV_RATE_FLOOR_MS)
 
     prefill_compute_ok = bool(p_step <= ttft_sla_ms)
     effective_ttft_ms = p_step + (exposed_kv_ms if mode == "direct_blocking_d2d" else 0.0)
     prefill_ok = bool(effective_ttft_ms <= ttft_sla_ms)
     rps_p = (p_dp * per_rep) if (prefill_ok and prefill_hbm_ok) else 0.0
+    return {
+        "prefill_only": False,
+        "prefill_role_error": prefill_role_error,
+        "p_dcp_ok": bool(p_dcp_ok),
+        "p_dcp_reason": p_dcp_reason,
+        "prefill_hbm_ok": bool(prefill_hbm_ok),
+        "prefill_compute_ok": prefill_compute_ok,
+        "prefill_ok": prefill_ok,
+        "p_step": float(p_step),
+        "effective_ttft_ms": float(effective_ttft_ms),
+        "compute_tokens": int(compute_tokens),
+        "hit_tokens": int(hit_tokens),
+        "kv_bytes": kv_bytes,
+        "unique_kv_bytes": float(handoff["unique_kv_bytes"]),
+        "kv_ms": kv_ms,
+        "exposed_kv_ms": exposed_kv_ms,
+        "tail_layer_kv_ms": tail_layer_kv_ms,
+        "rps_p": rps_p,
+        "p_kv_rps_per_inst": p_kv_rps_per_inst,
+        "d_kv_rps_per_inst": d_kv_rps_per_inst,
+        "link_info": link_info,
+        "pool_metrics": pool_metrics,
+        "handoff_plan": handoff,
+        "decode_tokens": decode_tokens,
+    }
+
+
+def _finalize_pd_stage_dict(handoff_info: Mapping[str, Any], dec: Mapping[str, Any]) -> dict[str, Any]:
+    """Combine prefill+handoff stage metrics with decode stage metrics."""
+    prefill_role_error = handoff_info["prefill_role_error"]
+    infeasible = (
+        prefill_role_error if prefill_role_error is not None
+        else dec["dcp_codomain_reason"] if not dec.get("dcp_codomain_valid", True)
+        else "prefill_hbm_oom" if not handoff_info["prefill_hbm_ok"]
+        else "prefill_ttft_sla_exceeded" if not handoff_info["prefill_compute_ok"]
+        else "decode_max_model_len_exceeded" if not dec["length_ok"]
+        else "decode_hbm_oom" if dec["b_vram"] < 1
+        else "effective_tpot_sla_exceeded" if not dec["tpot_ok"]
+        else "prefill_ttft_sla_exceeded" if not handoff_info["prefill_ok"]
+        else None
+    )
+    return {
+        "p_step": handoff_info["p_step"],
+        "effective_ttft_ms": handoff_info["effective_ttft_ms"],
+        "prefill_hbm_ok": handoff_info["prefill_hbm_ok"],
+        "prefill_ok": handoff_info["prefill_ok"],
+        "compute_tokens": handoff_info["compute_tokens"],
+        "hit_tokens": handoff_info["hit_tokens"],
+        "kv_bytes": handoff_info["kv_bytes"],
+        "unique_kv_bytes": handoff_info["unique_kv_bytes"],
+        "kv_ms": handoff_info["kv_ms"],
+        "exposed_kv_ms": handoff_info["exposed_kv_ms"],
+        "tail_layer_kv_ms": handoff_info["tail_layer_kv_ms"],
+        "rps_p": handoff_info["rps_p"],
+        "p_kv_rps_per_inst": handoff_info["p_kv_rps_per_inst"],
+        "d_kv_rps_per_inst": handoff_info["d_kv_rps_per_inst"],
+        "infeasible": infeasible,
+        "link_info": handoff_info["link_info"],
+        "pool_metrics": handoff_info["pool_metrics"],
+        "handoff_plan": handoff_info["handoff_plan"],
+        "prefill_dcp_codomain_valid": handoff_info["p_dcp_ok"],
+        "prefill_dcp_codomain_reason": handoff_info["p_dcp_reason"],
+        **dec,
+    }
+
+
+def _evaluate_pd_stages(
+    p_parsed: CaseSpec,
+    d_parsed: CaseSpec,
+    *,
+    total: int,
+    prompt: int,
+    output: int,
+    eff_decode: int,
+    ttft_sla_ms: float,
+    tpot_sla_ms: float,
+    mode: str,
+    dram_r: float,
+    ssd_r: float,
+    hit_r: float,
+    kv_transfer_bw_gbps: float | None,
+    ddr_bw_gbps: float | None,
+    ssd_bw_gbps: float | None,
+    max_sequences_per_dp: int | None = None,
+    apply_target_envelope: bool = False,
+    rewrite_plan: Any = None,
+    allow_unbound_formula: bool = True,
+    _prefill_step_cache: dict[tuple[int, int, int], tuple[Memory, bool, int, float]] | None = None,
+    _prefill_cache_id: int | None = None,
+    _decode_sla_cache: dict[tuple[int, float], dict[str, Any]] | None = None,
+    _decode_cache_id: int | None = None,
+    _decode_probe_cache: dict[int, float] | None = None,
+    _decode_vram_info: tuple[Memory, tuple[float, ...], int] | None = None,
+    _decode_rep_info: tuple[CaseSpec, dict[int, int], float] | None = None,
+) -> dict[str, Any]:
+    """Evaluate prefill, KV handoff / 3-tier pool, and decode stage rates."""
+    p_dcp_ok, p_dcp_reason = validate_vllm_ascend_dcp_codomain(p_parsed.model, p_parsed.runtime.parallel)
+    hit_tokens = min(int(math.floor(prompt * hit_r)), max(0, prompt - 1)) if mode == "pooled_dram_ssd" else 0
+    compute_tokens = max(0, prompt - hit_tokens)
+    p_mem, prefill_hbm_ok, p_slots, p_step = _measure_prefill_stage(
+        p_parsed, prompt=prompt, compute_tokens=compute_tokens, hit_tokens=hit_tokens,
+        cache=_prefill_step_cache, cache_id=_prefill_cache_id,
+        apply_target_envelope=apply_target_envelope, rewrite_plan=rewrite_plan,
+        allow_unbound_formula=allow_unbound_formula, allow_plan_fallback=(output > 1),
+    )
+    decode_q_tokens, _ = _resolve_speculative_tokens(
+        d_parsed, output_budget=output, tokens_per_seq=None, emitted_tokens_per_seq=None,
+    )
+    d_mem = Memory(d_parsed, workspace_tokens=decode_q_tokens)
+    handoff_info = _compute_pd_handoff_metrics(
+        p_parsed, d_parsed, p_mem=p_mem, d_mem=d_mem, p_step=p_step, p_slots=p_slots,
+        prefill_hbm_ok=prefill_hbm_ok, p_dcp_ok=p_dcp_ok, p_dcp_reason=p_dcp_reason,
+        total=total, prompt=prompt, output=output, ttft_sla_ms=ttft_sla_ms,
+        tpot_sla_ms=tpot_sla_ms, mode=mode, dram_r=dram_r, ssd_r=ssd_r,
+        compute_tokens=compute_tokens, hit_tokens=hit_tokens,
+        kv_transfer_bw_gbps=kv_transfer_bw_gbps, ddr_bw_gbps=ddr_bw_gbps, ssd_bw_gbps=ssd_bw_gbps,
+    )
+    if handoff_info["prefill_only"]:
+        return handoff_info["stage"]
     dec = _measure_decode_stage(
         d_parsed, prompt=prompt, output=output, eff_decode=eff_decode,
-        tpot_sla_ms=tpot_sla_ms, exposed_kv_ms=exposed_kv_ms, decode_tokens=decode_tokens,
+        tpot_sla_ms=tpot_sla_ms, exposed_kv_ms=handoff_info["exposed_kv_ms"],
+        decode_tokens=handoff_info["decode_tokens"],
         max_sequences_per_dp=max_sequences_per_dp,
         cache=_decode_sla_cache, cache_id=_decode_cache_id,
         apply_target_envelope=apply_target_envelope,
@@ -955,30 +1087,7 @@ def _evaluate_pd_stages(
         vram_info=_decode_vram_info,
         rep_info=_decode_rep_info,
     )
-    infeasible = (
-        prefill_role_error if prefill_role_error is not None
-        else dec["dcp_codomain_reason"] if not dec.get("dcp_codomain_valid", True)
-        else "prefill_hbm_oom" if not prefill_hbm_ok
-        else "prefill_ttft_sla_exceeded" if not prefill_compute_ok
-        else "decode_max_model_len_exceeded" if not dec["length_ok"]
-        else "decode_hbm_oom" if dec["b_vram"] < 1
-        else "effective_tpot_sla_exceeded" if not dec["tpot_ok"]
-        else "prefill_ttft_sla_exceeded" if not prefill_ok
-        else None
-    )
-    return {
-        "p_step": p_step, "effective_ttft_ms": float(effective_ttft_ms),
-        "prefill_hbm_ok": prefill_hbm_ok, "prefill_ok": prefill_ok,
-        "compute_tokens": compute_tokens, "hit_tokens": hit_tokens,
-        "kv_bytes": kv_bytes, "unique_kv_bytes": float(handoff["unique_kv_bytes"]),
-        "kv_ms": kv_ms, "exposed_kv_ms": exposed_kv_ms, "tail_layer_kv_ms": tail_layer_kv_ms,
-        "rps_p": rps_p, "p_kv_rps_per_inst": p_kv_rps_per_inst, "d_kv_rps_per_inst": d_kv_rps_per_inst,
-        "infeasible": infeasible, "link_info": link_info,
-        "pool_metrics": pool_metrics, "handoff_plan": handoff,
-        "prefill_dcp_codomain_valid": bool(p_dcp_ok),
-        "prefill_dcp_codomain_reason": p_dcp_reason,
-        **dec,
-    }
+    return _finalize_pd_stage_dict(handoff_info, dec)
 
 
 def _single_die_decode_tps(row: Mapping[str, Any]) -> float:
@@ -1028,51 +1137,161 @@ def _mark_pd_pareto(
     return [row for row in rows if row.get("pareto_optimal")]
 
 
+def _build_pd_ratio_row(
+    st: Mapping[str, Any],
+    *,
+    n_p: int,
+    n_d: int,
+    total: int,
+    p_dies: int,
+    d_dies: int,
+    output: int,
+    mode: str,
+) -> dict[str, Any]:
+    decode_tokens = output - 1
+    used = n_p * p_dies + n_d * d_dies
+    r_p = n_p * float(st["rps_p"])
+    if decode_tokens <= 0:
+        r_kv, r_d = r_p, r_p
+    else:
+        r_kv_p = n_p * float(st["p_kv_rps_per_inst"])
+        r_kv = (
+            min(r_kv_p, n_d * float(st["d_kv_rps_per_inst"]))
+            if st["d_kv_rps_per_inst"] is not None else r_kv_p
+        )
+        r_d = n_d * float(st["rps_d"])
+    feasible = bool(st["infeasible"] is None and min(r_p, r_kv, r_d) > 0.0)
+    r_sys = min(r_p, r_kv, r_d) if feasible else 0.0
+    sustainable = r_sys * float(output)
+    e2e_per_die = sustainable / float(used)
+    d_tps_per_die = float(st.get("decode_tps_per_die", 0.0) or 0.0) if feasible else 0.0
+    if decode_tokens <= 0:
+        bottleneck = "prefill"
+    else:
+        d_cmp = r_d if st["decode_budget"] > 0.0 else n_d * float(st["raw_rps_d"])
+        bottleneck = min(
+            (("prefill", r_p), ("kv_transfer", r_kv), ("decode", d_cmp)),
+            key=lambda item: item[1],
+        )[0]
+    return {
+        "n_prefill": n_p, "n_decode": n_d, "pd_ratio": f"{n_p}P:{n_d}D",
+        "pd_transfer_mode": mode, "prefill_dies": n_p * p_dies, "decode_dies": n_d * d_dies,
+        "used_dies": used, "idle_dies": total - used,
+        "prefill_rps": r_p, "kv_transfer_rps": r_kv, "decode_rps": r_d,
+        "sustainable_rps": r_sys, "sustainable_tps": sustainable,
+        "sustainable_tps_per_die": e2e_per_die, "e2e_total_tps": sustainable,
+        "e2e_tps_per_die": e2e_per_die, "decode_tps_per_die": d_tps_per_die,
+        "decode_step_ms": st["decode_step"], "effective_tpot_ms": st["effective_tpot"],
+        "first_decode_itl_ms": st["first_itl"], "bottleneck_stage": bottleneck,
+        "feasible": feasible, "infeasible_reason": st["infeasible"], "reason": st["infeasible"],
+        "metrics_boundary": "one_pipeline_stage_rate_composition",
+    }
+
+
+def _stern_brocot_pd_candidates(
+    total: int, p_dies: int, d_dies: int, rate_p: float, rate_d: float,
+) -> set[tuple[int, int]]:
+    """Bounded Stern-Brocot / continued-fraction search for optimal ``(n_p, n_d)`` splits."""
+    cands: set[tuple[int, int]] = {
+        (1, (total - p_dies) // d_dies),
+        ((total - d_dies) // p_dies, 1),
+    }
+    lo_p, lo_q, hi_p, hi_q = 0, 1, 1, 0
+    while True:
+        mp, mq = lo_p + hi_p, lo_q + hi_q
+        if mp * p_dies + mq * d_dies > total:
+            break
+        lo_cost = lo_p * p_dies + lo_q * d_dies
+        hi_cost = hi_p * p_dies + hi_q * d_dies
+        if mp * rate_p <= mq * rate_d:
+            k_bud = (total - lo_cost) // hi_cost
+            denom = hi_p * rate_p - hi_q * rate_d
+            k_val = int(math.floor((lo_q * rate_d - lo_p * rate_p) / denom)) if denom > 0.0 else k_bud
+            step = max(1, min(k_bud, k_val))
+            lo_p += step * hi_p
+            lo_q += step * hi_q
+            if lo_p >= 1 and lo_q >= 1:
+                cands.add((lo_p, lo_q))
+                if step > 1 and (lo_p - hi_p) >= 1 and (lo_q - hi_q) >= 1:
+                    cands.add((lo_p - hi_p, lo_q - hi_q))
+        else:
+            k_bud = (total - hi_cost) // lo_cost
+            denom = lo_q * rate_d - lo_p * rate_p
+            k_val = int(math.floor((hi_p * rate_p - hi_q * rate_d) / denom)) if denom > 0.0 else k_bud
+            step = max(1, min(k_bud, k_val))
+            hi_p += step * lo_p
+            hi_q += step * lo_q
+            if hi_p >= 1 and hi_q >= 1:
+                cands.add((hi_p, hi_q))
+                if step > 1 and (hi_p - lo_p) >= 1 and (hi_q - lo_q) >= 1:
+                    cands.add((hi_p - lo_p, hi_q - lo_q))
+    return cands
+
+
+def _solve_optimal_pd_ratio_closed_form(
+    st: Mapping[str, Any], *, total: int, p_dies: int, d_dies: int, output: int, mode: str,
+) -> dict[str, Any] | None:
+    """Closed-form O(log total) join selecting optimal feasible ``(n_p, n_d)`` split."""
+    if p_dies + d_dies > total or st["infeasible"] is not None:
+        return None
+    decode_tokens = output - 1
+    if decode_tokens <= 0:
+        if float(st["rps_p"]) <= 0.0:
+            return None
+        return _build_pd_ratio_row(
+            st, n_p=(total - d_dies) // p_dies, n_d=1,
+            total=total, p_dies=p_dies, d_dies=d_dies, output=output, mode=mode,
+        )
+    rate_p = min(float(st["rps_p"]), float(st["p_kv_rps_per_inst"]))
+    rate_d = (
+        min(float(st["rps_d"]), float(st["d_kv_rps_per_inst"]))
+        if st["d_kv_rps_per_inst"] is not None else float(st["rps_d"])
+    )
+    if rate_p <= 0.0 or rate_d <= 0.0:
+        return None
+    raw_cands = _stern_brocot_pd_candidates(total, p_dies, d_dies, rate_p, rate_d)
+    scaled_pairs: set[tuple[int, int]] = set()
+    for cp, cq in raw_cands:
+        cost = cp * p_dies + cq * d_dies
+        if cp >= 1 and cq >= 1 and cost <= total:
+            mult = total // cost
+            scaled_pairs.add((cp * mult, cq * mult))
+    best: dict[str, Any] | None = None
+    for n_p, n_d in sorted(scaled_pairs):
+        row = _build_pd_ratio_row(
+            st, n_p=n_p, n_d=n_d, total=total, p_dies=p_dies, d_dies=d_dies,
+            output=output, mode=mode,
+        )
+        if not row["feasible"]:
+            continue
+        if best is None:
+            best = row
+            continue
+        e_diff = float(row["e2e_tps_per_die"]) - float(best["e2e_tps_per_die"])
+        if e_diff > CLOSED_FORM_TIE_EPS:
+            best = row
+        elif abs(e_diff) <= CLOSED_FORM_TIE_EPS:
+            cur_tie = (float(row["sustainable_tps"]), -int(row["used_dies"]), -n_p, -n_d)
+            best_tie = (
+                float(best["sustainable_tps"]), -int(best["used_dies"]),
+                -int(best["n_prefill"]), -int(best["n_decode"]),
+            )
+            if cur_tie > best_tie:
+                best = row
+    return best
+
+
 def _build_pd_ratio_rows(
     st: Mapping[str, Any], *, total: int, p_dies: int, d_dies: int, output: int, mode: str,
 ) -> list[dict[str, Any]]:
-    decode_tokens = output - 1
     rows: list[dict[str, Any]] = []
     for n_p in range(1, (total // p_dies) + 1):
         max_nd = (total - n_p * p_dies) // d_dies
         for n_d in range(1, max_nd + 1):
-            used = n_p * p_dies + n_d * d_dies
-            r_p = n_p * float(st["rps_p"])
-            if decode_tokens <= 0:
-                r_kv, r_d = r_p, r_p
-            else:
-                r_kv_p = n_p * float(st["p_kv_rps_per_inst"])
-                r_kv = (
-                    min(r_kv_p, n_d * float(st["d_kv_rps_per_inst"]))
-                    if st["d_kv_rps_per_inst"] is not None else r_kv_p
-                )
-                r_d = n_d * float(st["rps_d"])
-            feasible = bool(st["infeasible"] is None and min(r_p, r_kv, r_d) > 0.0)
-            r_sys = min(r_p, r_kv, r_d) if feasible else 0.0
-            sustainable = r_sys * float(output)
-            e2e_per_die = sustainable / float(used)
-            d_tps_per_die = float(st.get("decode_tps_per_die", 0.0) or 0.0) if feasible else 0.0
-            if decode_tokens <= 0:
-                bottleneck = "prefill"
-            else:
-                d_cmp = r_d if st["decode_budget"] > 0.0 else n_d * float(st["raw_rps_d"])
-                bottleneck = min(
-                    (("prefill", r_p), ("kv_transfer", r_kv), ("decode", d_cmp)),
-                    key=lambda item: item[1],
-                )[0]
-            rows.append({
-                "n_prefill": n_p, "n_decode": n_d, "pd_ratio": f"{n_p}P:{n_d}D",
-                "pd_transfer_mode": mode, "prefill_dies": n_p * p_dies, "decode_dies": n_d * d_dies,
-                "used_dies": used, "idle_dies": total - used,
-                "prefill_rps": r_p, "kv_transfer_rps": r_kv, "decode_rps": r_d,
-                "sustainable_rps": r_sys, "sustainable_tps": sustainable,
-                "sustainable_tps_per_die": e2e_per_die, "e2e_total_tps": sustainable,
-                "e2e_tps_per_die": e2e_per_die, "decode_tps_per_die": d_tps_per_die,
-                "decode_step_ms": st["decode_step"], "effective_tpot_ms": st["effective_tpot"],
-                "first_decode_itl_ms": st["first_itl"], "bottleneck_stage": bottleneck,
-                "feasible": feasible, "infeasible_reason": st["infeasible"], "reason": st["infeasible"],
-                "metrics_boundary": "one_pipeline_stage_rate_composition",
-            })
+            rows.append(_build_pd_ratio_row(
+                st, n_p=n_p, n_d=n_d, total=total, p_dies=p_dies, d_dies=d_dies,
+                output=output, mode=mode,
+            ))
     return rows
 
 
@@ -2928,6 +3147,54 @@ def _static_admit_single_pool_candidate(
     }, None
 
 
+def _rebuild_worker_error(err_info: tuple[bool, str]) -> Exception:
+    is_modeling_err, msg = err_info
+    return ModelingError(msg) if is_modeling_err else ValueError(msg)
+
+
+def _eval_single_pool_worker(task: tuple[Any, ...]) -> tuple[bool, Any]:
+    """Top-level pickle-safe Map worker evaluating one single-pool candidate."""
+    (
+        eval_case, prompt, output, ttft, tpot, mtp_n, max_sequences_per_dp,
+        apply_target_envelope, rewrite_plan, allow_unbound_formula, dep_mode, num_devices,
+    ) = task
+    try:
+        row = _evaluate_colocated_candidate(
+            eval_case, prompt_tokens=prompt, output_tokens=output,
+            ttft_sla_ms=ttft, tpot_sla_ms=tpot, mtp_tokens=mtp_n,
+            max_sequences_per_dp=max_sequences_per_dp,
+            apply_target_envelope=apply_target_envelope,
+            rewrite_plan=rewrite_plan, allow_unbound_formula=allow_unbound_formula,
+            deployment_mode=dep_mode, measure_b1=False,
+        )
+        return True, row
+    except (ModelingError, ValueError) as exc:
+        return False, (isinstance(exc, ModelingError), str(exc))
+    finally:
+        if num_devices >= GC_RECLAIM_MIN_WORLD_SIZE:
+            _reclaim_sweep_memory()
+
+
+def _eval_pd_prefill_worker(task: tuple[Any, ...]) -> tuple[bool, Any]:
+    """Top-level pickle-safe Map worker evaluating one standalone ``pd_prefill`` candidate."""
+    (
+        raw_p, prompt, output, ttft, mtp_n,
+        apply_target_envelope, rewrite_plan, allow_unbound_formula, num_devices,
+    ) = task
+    try:
+        row = _evaluate_pd_prefill_candidate(
+            raw_p, prompt_tokens=prompt, output_tokens=output, ttft_sla_ms=ttft,
+            mtp_tokens=mtp_n, apply_target_envelope=apply_target_envelope,
+            rewrite_plan=rewrite_plan, allow_unbound_formula=allow_unbound_formula,
+        )
+        return True, row
+    except (ModelingError, ValueError) as exc:
+        return False, (isinstance(exc, ModelingError), str(exc))
+    finally:
+        if num_devices >= GC_RECLAIM_MIN_WORLD_SIZE:
+            _reclaim_sweep_memory()
+
+
 def _search_single_pool_deployments(
     compose_for: Any,
     *,
@@ -2947,8 +3214,9 @@ def _search_single_pool_deployments(
     apply_target_envelope: bool = False,
     rewrite_plan: Any = None,
     allow_unbound_formula: bool = True,
+    granted_workers: int | None = None,
 ) -> tuple[list[dict[str, Any]], list[tuple[dict[str, Any], dict[str, Any]]], dict[str, int]]:
-    """Full-grid single-pool search for ``colocated`` or ``pd_decode`` with sound upper-bound pruning."""
+    """Full-grid single-pool MapReduce search for ``colocated`` or ``pd_decode``."""
     topos = _build_colocated_candidates(
         num_devices=num_devices, is_moe=is_moe, layers=layers,
         rec_topo=rec_topo, pinned=pinned,
@@ -2991,43 +3259,68 @@ def _search_single_pool_deployments(
     best_entry: tuple[dict[str, Any], dict[str, Any]] | None = None
     incumbent_tps = 0.0
     incumbent_dies = num_devices + 1
-    for desc in viable:
-        raw_c = desc["raw_case"]
-        desc["raw_case"] = None
-        if (best_entry is not None
-                and desc["used_dies"] >= incumbent_dies
-                and desc["ub_tps"] < incumbent_tps - PARETO_EPS):
-            coverage["pruned_by_upper_bound"] += 1
-            continue
-        eval_case = (
-            _sync_derived_runtime_limits(
-                raw_c, max_num_seqs=desc["b_limit"], mtp_n=desc["mtp_n"], role=dep_mode,
-            )
-            if (max_sequences_per_dp is None and not (dep_mode == "colocated" and output <= 1))
-            else raw_c
+
+    def _is_prunable(desc: Mapping[str, Any]) -> bool:
+        return bool(
+            best_entry is not None
+            and desc["used_dies"] >= incumbent_dies
+            and desc["ub_tps"] < incumbent_tps - PARETO_EPS
         )
-        try:
-            row = _evaluate_colocated_candidate(
-                eval_case, prompt_tokens=prompt, output_tokens=output,
-                ttft_sla_ms=ttft, tpot_sla_ms=tpot, mtp_tokens=desc["mtp_n"],
-                max_sequences_per_dp=max_sequences_per_dp,
-                apply_target_envelope=apply_target_envelope,
-                rewrite_plan=rewrite_plan, allow_unbound_formula=allow_unbound_formula,
-                deployment_mode=dep_mode, measure_b1=False,
-            )
-        except (ModelingError, ValueError) as exc:
-            if rewrite_plan is not None and _is_rewrite_plan_error(exc):
-                raise
-            continue
-        coverage["exact_evaluated"] += 1
-        rows.append(row)
-        if row["feasible"]:
-            if best_entry is None or _rank_single_pool_row(row) > _rank_single_pool_row(best_entry[0]):
-                best_entry = (row, eval_case)
-                incumbent_tps = _single_die_decode_tps(row)
-                incumbent_dies = int(row["used_dies"])
-        if num_devices >= GC_RECLAIM_MIN_WORLD_SIZE:
-            _reclaim_sweep_memory()
+
+    eff_workers = resolve_granted_workers(granted_workers, task_count=len(viable))
+    cursor = 0
+    with BoundedMapPool(granted_workers=eff_workers, max_tasks=len(viable)) as pool:
+        while cursor < len(viable):
+            while cursor < len(viable) and _is_prunable(viable[cursor]):
+                viable[cursor]["raw_case"] = None
+                coverage["pruned_by_upper_bound"] += 1
+                cursor += 1
+            if cursor >= len(viable):
+                break
+            wave_items: list[tuple[dict[str, Any], dict[str, Any]]] = []
+            wave_tasks: list[tuple[Any, ...]] = []
+            while cursor < len(viable) and len(wave_items) < eff_workers:
+                desc = viable[cursor]
+                cursor += 1
+                if (wave_items and best_entry is not None
+                        and desc["used_dies"] == num_devices
+                        and desc["ub_tps"] < incumbent_tps - PARETO_EPS):
+                    desc["raw_case"] = None
+                    coverage["pruned_by_upper_bound"] += 1
+                    continue
+                raw_c = desc["raw_case"]
+                desc["raw_case"] = None
+                eval_case = (
+                    _sync_derived_runtime_limits(
+                        raw_c, max_num_seqs=desc["b_limit"], mtp_n=desc["mtp_n"], role=dep_mode,
+                    )
+                    if (max_sequences_per_dp is None and not (dep_mode == "colocated" and output <= 1))
+                    else raw_c
+                )
+                wave_items.append((desc, eval_case))
+                wave_tasks.append((
+                    eval_case, prompt, output, ttft, tpot, desc["mtp_n"],
+                    max_sequences_per_dp, apply_target_envelope, rewrite_plan,
+                    allow_unbound_formula, dep_mode, num_devices,
+                ))
+            wave_results = pool.map_ordered(_eval_single_pool_worker, wave_tasks)
+            for (desc, eval_case), (ok, payload) in zip(wave_items, wave_results):
+                if _is_prunable(desc):
+                    coverage["pruned_by_upper_bound"] += 1
+                    continue
+                if not ok:
+                    exc = _rebuild_worker_error(payload)
+                    if rewrite_plan is not None and _is_rewrite_plan_error(exc):
+                        raise exc
+                    continue
+                row = payload
+                coverage["exact_evaluated"] += 1
+                rows.append(row)
+                if row["feasible"]:
+                    if best_entry is None or _rank_single_pool_row(row) > _rank_single_pool_row(best_entry[0]):
+                        best_entry = (row, eval_case)
+                        incumbent_tps = _single_die_decode_tps(row)
+                        incumbent_dies = int(row["used_dies"])
     return rows, ([best_entry] if best_entry is not None else []), coverage
 
 
@@ -3047,8 +3340,9 @@ def _search_pd_prefill_deployments(
     apply_target_envelope: bool = False,
     rewrite_plan: Any = None,
     allow_unbound_formula: bool = True,
+    granted_workers: int | None = None,
 ) -> tuple[list[dict[str, Any]], list[tuple[dict[str, Any], dict[str, Any]]], dict[str, int]]:
-    """Full-grid standalone ``pd_prefill`` search over the full device budget."""
+    """Full-grid standalone ``pd_prefill`` MapReduce search over the full device budget."""
     topos = _build_pd_stage_candidates(
         role="pd_prefill", max_dies=num_devices, is_moe=is_moe,
         layers=layers, prompt_tokens=prompt, rec_topo=rec_topo,
@@ -3096,27 +3390,31 @@ def _search_pd_prefill_deployments(
     if not viable:
         return rows, [], coverage
     viable.sort(key=lambda c: (int(c["used_dies"] == num_devices), int(c["pp"] == 1), c["used_dies"]), reverse=True)
-    best_entry: tuple[dict[str, Any], dict[str, Any]] | None = None
+    raw_cases = [desc["raw_case"] for desc in viable]
     for desc in viable:
-        raw_p = desc["raw_case"]
         desc["raw_case"] = None
-        try:
-            row = _evaluate_pd_prefill_candidate(
-                raw_p, prompt_tokens=prompt, output_tokens=output, ttft_sla_ms=ttft,
-                mtp_tokens=desc["mtp_n"], apply_target_envelope=apply_target_envelope,
-                rewrite_plan=rewrite_plan, allow_unbound_formula=allow_unbound_formula,
-            )
-        except (ModelingError, ValueError) as exc:
+    tasks = [
+        (
+            raw_p, prompt, output, ttft, desc["mtp_n"],
+            apply_target_envelope, rewrite_plan, allow_unbound_formula, num_devices,
+        )
+        for desc, raw_p in zip(viable, raw_cases)
+    ]
+    with BoundedMapPool(granted_workers=granted_workers, max_tasks=len(tasks)) as pool:
+        results = pool.map_ordered(_eval_pd_prefill_worker, tasks)
+    best_entry: tuple[dict[str, Any], dict[str, Any]] | None = None
+    for raw_p, (ok, payload) in zip(raw_cases, results):
+        if not ok:
+            exc = _rebuild_worker_error(payload)
             if rewrite_plan is not None and _is_rewrite_plan_error(exc):
-                raise
+                raise exc
             continue
+        row = payload
         coverage["exact_evaluated"] += 1
         rows.append(row)
         if row["feasible"]:
             if best_entry is None or _rank_pd_prefill_row(row) > _rank_pd_prefill_row(best_entry[0]):
                 best_entry = (row, raw_p)
-        if num_devices >= GC_RECLAIM_MIN_WORLD_SIZE:
-            _reclaim_sweep_memory()
     return rows, ([best_entry] if best_entry is not None else []), coverage
 
 
@@ -3312,6 +3610,508 @@ def _static_admit_pd_stages(
     return p_by_pmtp, d_by_mtp, coverage
 
 
+def _eval_pd_stage_worker(task: tuple[Any, ...]) -> tuple[bool, Any]:
+    """Top-level pickle-safe Map worker evaluating one Prefill or Decode PD stage."""
+    kind = task[0]
+    num_devices = int(task[-1])
+    try:
+        if kind == "prefill":
+            (
+                _, p_idx, compute_tokens, hit_tokens, p_raw, prompt, output,
+                apply_target_envelope, rewrite_plan, allow_unbound_formula, _,
+            ) = task
+            p_parsed = parse_case(p_raw)
+            _, prefill_hbm_ok, p_slots, p_step = _measure_prefill_stage(
+                p_parsed, prompt=prompt, compute_tokens=compute_tokens, hit_tokens=hit_tokens,
+                cache=None, cache_id=None, apply_target_envelope=apply_target_envelope,
+                rewrite_plan=rewrite_plan, allow_unbound_formula=allow_unbound_formula,
+                allow_plan_fallback=(output > 1),
+            )
+            return True, (
+                "prefill",
+                (p_idx, compute_tokens, hit_tokens),
+                {"prefill_hbm_ok": bool(prefill_hbm_ok), "p_slots": int(p_slots), "p_step": float(p_step)},
+            )
+        (
+            _, d_idx, d_raw, prompt, output, tpot, max_sequences_per_dp,
+            apply_target_envelope, rewrite_plan, allow_unbound_formula,
+            explicit_eff_sla_ms, seed_probe_cache, _,
+        ) = task
+        d_parsed = parse_case(d_raw)
+        dcp_ok, _ = validate_vllm_ascend_dcp_codomain(d_parsed.model, d_parsed.runtime.parallel)
+        d_q_tok, d_emit_est = _resolve_speculative_tokens(
+            d_parsed, output_budget=output, tokens_per_seq=None, emitted_tokens_per_seq=None,
+        )
+        length_ok = bool(prompt + output <= d_parsed.runtime.max_model_len)
+        vram_info = _solve_b_vram_max(
+            d_parsed, base_ws=max(1, int(d_q_tok)), decode_q=max(1, int(d_q_tok)),
+            seq_len=prompt + output, cap_bound=None,
+        )
+        key = (d_idx, explicit_eff_sla_ms)
+        if not dcp_ok or not length_ok or int(vram_info[2]) < 1:
+            return True, ("decode", key, {"static_skip": True, "d_sla": None, "probe_cache": {}})
+        eff_sla_ms = (
+            float(explicit_eff_sla_ms)
+            if explicit_eff_sla_ms is not None
+            else (float(tpot) * max(1.0, float(d_emit_est)))
+        )
+        probe_sink: dict[int, float] = dict(seed_probe_cache or {})
+        d_sla = _solve_sla_archetype_aware(
+            d_parsed, sla_ms=eff_sla_ms, context=prompt, output_budget=output,
+            max_sequences_per_dp=max_sequences_per_dp,
+            apply_target_envelope=apply_target_envelope, rewrite_plan=rewrite_plan,
+            allow_unbound_formula=allow_unbound_formula,
+            probe_cache=probe_sink, probe_sink=probe_sink,
+            vram_info=vram_info, rep_info=discover_layer_cohorts(d_parsed), measure_b1=False,
+        )
+        return True, (
+            "decode",
+            key,
+            {"static_skip": False, "eff_sla_ms": eff_sla_ms, "d_sla": d_sla, "probe_cache": probe_sink},
+        )
+    except (ModelingError, ValueError) as exc:
+        err_key = (task[1], task[2], task[3]) if kind == "prefill" else (task[1], task[10])
+        return False, (kind, err_key, isinstance(exc, ModelingError), str(exc))
+    finally:
+        if num_devices >= GC_RECLAIM_MIN_WORLD_SIZE:
+            _reclaim_sweep_memory()
+
+
+def _resolve_decode_sla_from_cache(
+    d_parsed: CaseSpec,
+    *,
+    d_sla_zero: Mapping[str, Any],
+    probe_cache: Mapping[int, float],
+    vram_info: tuple[Memory, tuple[float, ...], int],
+    eff_sla_ms: float,
+    zero_sla_ms: float,
+    d_q_tok: int,
+    d_emit_est: float,
+    max_sequences_per_dp: int | None,
+) -> dict[str, Any] | None:
+    """Resolve exact decode SLA concurrency in O(1) from Phase-1 baseline + probe cache."""
+    if eff_sla_ms >= zero_sla_ms - PARETO_EPS:
+        return dict(d_sla_zero)
+    scen0 = d_sla_zero["scenarios"][0]
+    b_zero = int(scen0["b_feasible"])
+    t_zero = scen0.get("step_ms_feasible")
+    if b_zero < 1:
+        return dict(d_sla_zero)
+    if t_zero is not None and float(t_zero) <= eff_sla_ms + PARETO_EPS:
+        return dict(d_sla_zero)
+    d_mem, d_kv, b_vram = vram_info
+    base_ws = max(1, int(d_q_tok))
+    limit, cfg_seqs, tok_lim = _resolve_decode_batch_bounds(
+        d_parsed, q_tok=d_q_tok, b_vram=b_vram, max_sequences_per_dp=max_sequences_per_dp,
+    )
+    lo, hi, best_b, best_t = _tighten_sla_bracket(probe_cache, limit, eff_sla_ms)
+    if lo == 0 and 1 in probe_cache and float(probe_cache[1]) > eff_sla_ms + PARETO_EPS:
+        return {
+            "emitted_tokens_per_seq": float(d_emit_est),
+            "scenarios": [{
+                "b_vram_max": b_vram, "configured_max_num_seqs": cfg_seqs,
+                "token_batch_limit": tok_lim, "b_sla": 0, "b_feasible": 0,
+                "step_ms_at_b1": float(probe_cache[1]), "step_ms_feasible": None,
+                "free_hbm_headroom_gib": _headroom_gib_at_batch(
+                    d_parsed, d_mem, d_kv, b_vram=b_vram, batch=0,
+                    base_ws=base_ws, decode_q=base_ws,
+                ),
+            }],
+        }
+    if lo >= 1 and hi == lo + 1 and best_t is not None:
+        t1 = float(probe_cache.get(1) or (best_t if best_b == 1 else 0.0))
+        return {
+            "emitted_tokens_per_seq": float(d_emit_est),
+            "scenarios": [{
+                "b_vram_max": b_vram, "configured_max_num_seqs": cfg_seqs,
+                "token_batch_limit": tok_lim, "b_sla": best_b, "b_feasible": best_b,
+                "step_ms_at_b1": t1, "step_ms_feasible": float(best_t),
+                "free_hbm_headroom_gib": _headroom_gib_at_batch(
+                    d_parsed, d_mem, d_kv, b_vram=b_vram, batch=best_b,
+                    base_ws=base_ws, decode_q=base_ws,
+                ),
+            }],
+        }
+    return None
+
+
+def _build_pd_candidate_row_from_stage(
+    st: Mapping[str, Any],
+    *,
+    p_parsed: CaseSpec,
+    d_parsed: CaseSpec,
+    best_ratio: Mapping[str, Any] | None,
+    pd_mode: str,
+    mtp_n: int,
+    p_world: int,
+    d_world: int,
+) -> dict[str, Any]:
+    """Assemble one PD candidate row directly from factorized stage metrics + closed-form join."""
+    d_us = float(st["us_per_tok_die"])
+    e2e_tps = float(best_ratio["sustainable_tps"]) if best_ratio else 0.0
+    e2e_per_die = float(best_ratio["e2e_tps_per_die"]) if best_ratio else 0.0
+    d_tps_per_die = (US_PER_SECOND / d_us) if (best_ratio is not None and d_us > 0.0) else 0.0
+    return {
+        "deployment_mode": "pd_disaggregated",
+        "pd_transfer_mode": pd_mode,
+        "mtp_proposal_tokens": mtp_n,
+        "prefill_parallel": p_parsed.runtime.parallel.to_dict(),
+        "decode_parallel": d_parsed.runtime.parallel.to_dict(),
+        "pd_ratio": best_ratio["pd_ratio"] if best_ratio else None,
+        "prefill_instances": int(best_ratio["n_prefill"]) if best_ratio else 1,
+        "decode_instances": int(best_ratio["n_decode"]) if best_ratio else 1,
+        "prefill_used_dies": int(best_ratio["prefill_dies"]) if best_ratio else p_world,
+        "decode_used_dies": int(best_ratio["decode_dies"]) if best_ratio else d_world,
+        "used_dies": int(best_ratio["used_dies"]) if best_ratio else (p_world + d_world),
+        "b_feasible": int(st["b_feasible"]),
+        "b_vram_max": int(st["b_vram"]),
+        "configured_max_num_seqs": int(st.get("configured_max_num_seqs", d_parsed.runtime.max_num_seqs)),
+        "ttft_ms": float(st.get("effective_ttft_ms", st["p_step"])),
+        "decode_step_ms": float(st["decode_step"]),
+        "handoff_tpot_ms": float(st.get("handoff_tpot_ms", 0.0) or 0.0),
+        "effective_tpot_ms": float(st["effective_tpot"]),
+        "avg_accepted_tokens": float(st["avg_accepted_tokens"]),
+        "n_tok_per_die": float(st["n_tok_per_die"]),
+        "us_per_tok_die": d_us,
+        "unused_sla_slack_ms": float(st["unused_sla_slack_ms"]),
+        "operating_regime": str(st["operating_regime"]),
+        "limiting_constraint": str(st.get("limiting_constraint", "")),
+        "free_hbm_headroom_gib": float(st["free_hbm_headroom_gib"]),
+        "kv_transfer_ms_per_request": float(st["kv_ms"]),
+        "sustainable_rps": float(best_ratio["sustainable_rps"]) if best_ratio else 0.0,
+        "prefill_kv_rps": (
+            min(float(best_ratio["prefill_rps"]), float(best_ratio["kv_transfer_rps"])) if best_ratio else 0.0
+        ),
+        "sustainable_tps": e2e_tps,
+        "sustainable_tps_per_die": d_tps_per_die if d_tps_per_die > 0.0 else e2e_per_die,
+        "decode_tps_per_die": d_tps_per_die,
+        "e2e_total_tps": e2e_tps,
+        "e2e_tps_per_die": e2e_per_die,
+        "dcp_codomain_valid": bool(st.get("dcp_codomain_valid", True)),
+        "dcp_codomain_reason": st.get("dcp_codomain_reason"),
+        "feasible": bool(best_ratio is not None),
+        "infeasible_reason": None if best_ratio is not None else st["infeasible"],
+    }
+
+
+def _resolve_pd_mode_params(
+    pd_modes: tuple[str, ...],
+    *,
+    prompt: int,
+    pool_dram_ratio: float | None,
+    pool_ssd_ratio: float,
+    pool_prefix_hit_ratio: float,
+    ssd_bw_gbps: float | None,
+) -> dict[str, tuple[float, float, float, int, int]]:
+    """Validate per-mode KV pool ratios and derive ``(dram_r, ssd_r, hit_r, hit_tok, comp_tok)``."""
+    resolved: dict[str, tuple[float, float, float, int, int]] = {}
+    for pd_mode in pd_modes:
+        try:
+            is_pool = pd_mode == "pooled_dram_ssd"
+            ssd_r = float(pool_ssd_ratio) if is_pool else 0.0
+            hit_r = float(pool_prefix_hit_ratio) if is_pool else 0.0
+            if not (0.0 <= ssd_r <= 1.0) or not (0.0 <= hit_r <= 1.0):
+                raise ModelingError(f"invalid_pool_ratios:ssd={ssd_r},prefix_hit={hit_r}")
+            dram_r = (1.0 - ssd_r) if (not is_pool or pool_dram_ratio is None) else float(pool_dram_ratio)
+            if not (0.0 <= dram_r <= 1.0) or abs((dram_r + ssd_r) - 1.0) > POOL_RATIO_SUM_TOL:
+                raise ModelingError(f"invalid_pool_dram_ssd_ratios:dram={dram_r},ssd={ssd_r}")
+            if ssd_r > 0.0 and ssd_bw_gbps is None:
+                raise missing_scenario_error(("ssd_bw_gbps",))
+            hit_tokens = min(int(math.floor(prompt * hit_r)), max(0, prompt - 1)) if is_pool else 0
+            compute_tokens = max(0, prompt - hit_tokens)
+            resolved[pd_mode] = (dram_r, ssd_r, hit_r, hit_tokens, compute_tokens)
+        except (ModelingError, ValueError) as exc:
+            if _is_ingress_contradiction(exc):
+                raise
+    return resolved
+
+
+def _build_pd_factorized_handoff_records(
+    pair_specs: Sequence[tuple[int, dict[str, Any], dict[str, Any], str]],
+    *,
+    mode_params: Mapping[str, tuple[float, float, float, int, int]],
+    p_parsed: Mapping[int, CaseSpec],
+    d_parsed: Mapping[int, CaseSpec],
+    p_results: Mapping[tuple[int, int, int], Mapping[str, Any]],
+    p_errors: Mapping[tuple[int, int, int], tuple[bool, str]],
+    d_base_results: Mapping[int, Mapping[str, Any]],
+    d_base_errors: Mapping[int, tuple[bool, str]],
+    d_vram_caches: Mapping[int, tuple[Memory, tuple[float, ...], int]],
+    d_spec_tokens: Mapping[int, tuple[int, float]],
+    num_devices: int,
+    prompt: int,
+    output: int,
+    ttft: float,
+    tpot: float,
+    kv_transfer_bw_gbps: float | None,
+    ddr_bw_gbps: float | None,
+    ssd_bw_gbps: float | None,
+    max_sequences_per_dp: int | None,
+    rewrite_plan: Any,
+) -> tuple[list[dict[str, Any]], list[tuple[int, float]]]:
+    """Phase 2: Pure-arithmetic KV handoff & O(1) decode bracket resolution across all pairs."""
+    p_mem_cache: dict[tuple[int, int], Memory] = {}
+    p_dcp_cache: dict[int, tuple[bool, str | None]] = {}
+    d_mem_cache: dict[int, Memory] = {}
+    records: list[dict[str, Any]] = []
+    refine_seen: set[tuple[int, float]] = set()
+    refine_keys: list[tuple[int, float]] = []
+
+    for mtp_n, p_item, d_item, pd_mode in pair_specs:
+        p_idx, d_idx = int(p_item["id"]), int(d_item["id"])
+        dram_r, ssd_r, _, hit_tokens, compute_tokens = mode_params[pd_mode]
+        p_key = (p_idx, compute_tokens, hit_tokens)
+        if p_key in p_errors:
+            exc = _rebuild_worker_error(p_errors[p_key])
+            if _is_ingress_contradiction(exc) or (rewrite_plan is not None and _is_rewrite_plan_error(exc)):
+                raise exc
+            continue
+        if output > 1 and d_idx in d_base_errors:
+            exc = _rebuild_worker_error(d_base_errors[d_idx])
+            if _is_ingress_contradiction(exc) or (rewrite_plan is not None and _is_rewrite_plan_error(exc)):
+                raise exc
+            continue
+        parsed_p, parsed_d = p_parsed[p_idx], d_parsed[d_idx]
+        p_res = p_results[p_key]
+        if (p_idx, compute_tokens) not in p_mem_cache:
+            p_mem_cache[(p_idx, compute_tokens)] = Memory(
+                parsed_p, workspace_tokens=_prefill_workspace_tokens(parsed_p, compute_tokens),
+            )
+        if p_idx not in p_dcp_cache:
+            p_dcp_cache[p_idx] = validate_vllm_ascend_dcp_codomain(parsed_p.model, parsed_p.runtime.parallel)
+        if d_idx not in d_mem_cache:
+            d_mem_cache[d_idx] = Memory(parsed_d, workspace_tokens=d_spec_tokens[d_idx][0])
+        p_dcp_ok, p_dcp_reason = p_dcp_cache[p_idx]
+        try:
+            handoff_info = _compute_pd_handoff_metrics(
+                parsed_p, parsed_d,
+                p_mem=p_mem_cache[(p_idx, compute_tokens)], d_mem=d_mem_cache[d_idx],
+                p_step=float(p_res["p_step"]), p_slots=int(p_res["p_slots"]),
+                prefill_hbm_ok=bool(p_res["prefill_hbm_ok"]),
+                p_dcp_ok=p_dcp_ok, p_dcp_reason=p_dcp_reason,
+                total=num_devices, prompt=prompt, output=output,
+                ttft_sla_ms=ttft, tpot_sla_ms=tpot, mode=pd_mode,
+                dram_r=dram_r, ssd_r=ssd_r, compute_tokens=compute_tokens, hit_tokens=hit_tokens,
+                kv_transfer_bw_gbps=kv_transfer_bw_gbps, ddr_bw_gbps=ddr_bw_gbps, ssd_bw_gbps=ssd_bw_gbps,
+            )
+        except (ModelingError, ValueError) as exc:
+            if _is_ingress_contradiction(exc) or (rewrite_plan is not None and _is_rewrite_plan_error(exc)):
+                raise
+            continue
+        resolved_sla: dict[str, Any] | None = None
+        refine_key: tuple[int, float] | None = None
+        if not handoff_info["prefill_only"]:
+            d_base = d_base_results[d_idx]
+            if not d_base["static_skip"]:
+                d_q_tok, d_emit_est = d_spec_tokens[d_idx]
+                zero_sla_ms = float(d_base["eff_sla_ms"])
+                decode_tokens = int(handoff_info["decode_tokens"])
+                decode_budget = float(tpot) - (float(handoff_info["exposed_kv_ms"]) / float(decode_tokens))
+                step_budget = decode_budget * max(1.0, float(d_emit_est))
+                eff_sla_ms = max(step_budget, PARETO_EPS) if step_budget > 0.0 else zero_sla_ms
+                resolved_sla = _resolve_decode_sla_from_cache(
+                    parsed_d, d_sla_zero=d_base["d_sla"], probe_cache=d_base["probe_cache"],
+                    vram_info=d_vram_caches[d_idx], eff_sla_ms=eff_sla_ms, zero_sla_ms=zero_sla_ms,
+                    d_q_tok=d_q_tok, d_emit_est=d_emit_est, max_sequences_per_dp=max_sequences_per_dp,
+                )
+                if resolved_sla is None:
+                    refine_key = (d_idx, eff_sla_ms)
+                    if refine_key not in refine_seen:
+                        refine_seen.add(refine_key)
+                        refine_keys.append(refine_key)
+        records.append({
+            "mtp_n": mtp_n, "p_item": p_item, "d_item": d_item, "pd_mode": pd_mode,
+            "handoff_info": handoff_info, "resolved_sla": resolved_sla, "refine_key": refine_key,
+        })
+    return records, refine_keys
+
+
+def _execute_pd_stage_mapreduce(
+    *,
+    pair_specs: Sequence[tuple[int, dict[str, Any], dict[str, Any], str]],
+    p_task_items: Mapping[tuple[int, int, int], dict[str, Any]],
+    d_active: Mapping[int, dict[str, Any]],
+    mode_params: Mapping[str, tuple[float, float, float, int, int]],
+    num_devices: int,
+    prompt: int,
+    output: int,
+    ttft: float,
+    tpot: float,
+    kv_transfer_bw_gbps: float | None,
+    ddr_bw_gbps: float | None,
+    ssd_bw_gbps: float | None,
+    max_sequences_per_dp: int | None,
+    apply_target_envelope: bool,
+    rewrite_plan: Any,
+    allow_unbound_formula: bool,
+    granted_workers: int | None,
+    coverage: dict[str, int],
+) -> tuple[
+    dict[int, CaseSpec],
+    dict[int, CaseSpec],
+    dict[int, tuple[Memory, tuple[float, ...], int]],
+    list[dict[str, Any]],
+    dict[tuple[int, float], dict[str, Any]],
+    dict[tuple[int, float], tuple[bool, str]],
+]:
+    """Run Phases 1-3 of PD Stage Factorization in ONE flat bounded worker pool."""
+    stage_tasks: list[tuple[Any, ...]] = [
+        (
+            "prefill", p_idx, comp_tok, hit_tok, p_item["raw"], prompt, output,
+            apply_target_envelope, rewrite_plan, allow_unbound_formula, num_devices,
+        )
+        for (p_idx, comp_tok, hit_tok), p_item in p_task_items.items()
+    ]
+    if output > 1:
+        stage_tasks.extend(
+            (
+                "decode", d_idx, d_item["raw"], prompt, output, tpot, max_sequences_per_dp,
+                apply_target_envelope, rewrite_plan, allow_unbound_formula, None, None, num_devices,
+            )
+            for d_idx, d_item in d_active.items()
+        )
+    coverage["stage_p_evaluated"] = len(p_task_items)
+    coverage["stage_d_evaluated"] = len(d_active) if output > 1 else 0
+    coverage["stage_d_refinements"] = 0
+
+    p_results: dict[tuple[int, int, int], dict[str, Any]] = {}
+    p_errors: dict[tuple[int, int, int], tuple[bool, str]] = {}
+    d_base_results: dict[int, dict[str, Any]] = {}
+    d_base_errors: dict[int, tuple[bool, str]] = {}
+    refine_results: dict[tuple[int, float], dict[str, Any]] = {}
+    refine_errors: dict[tuple[int, float], tuple[bool, str]] = {}
+
+    with BoundedMapPool(granted_workers=granted_workers, max_tasks=len(stage_tasks)) as pool:
+        for ok, payload in pool.map_ordered(_eval_pd_stage_worker, stage_tasks):
+            if ok:
+                kind, key, data = payload
+                if kind == "prefill":
+                    p_results[key] = data
+                else:
+                    d_base_results[int(key[0])] = data
+            else:
+                kind, err_key, is_mod_err, err_msg = payload
+                if kind == "prefill":
+                    p_errors[err_key] = (is_mod_err, err_msg)
+                else:
+                    d_base_errors[int(err_key[0])] = (is_mod_err, err_msg)
+
+        p_parsed = {p_idx: parse_case(p_item["raw"]) for (p_idx, _, _), p_item in p_task_items.items()}
+        d_parsed: dict[int, CaseSpec] = {}
+        d_vram_caches: dict[int, tuple[Memory, tuple[float, ...], int]] = {}
+        d_spec_tokens: dict[int, tuple[int, float]] = {}
+        for d_idx, d_item in d_active.items():
+            parsed_d = parse_case(d_item["raw"])
+            d_parsed[d_idx] = parsed_d
+            d_q_tok, d_emit_est = _resolve_speculative_tokens(
+                parsed_d, output_budget=output, tokens_per_seq=None, emitted_tokens_per_seq=None,
+            )
+            d_spec_tokens[d_idx] = (max(1, int(d_q_tok)), float(d_emit_est))
+            d_vram_caches[d_idx] = _solve_b_vram_max(
+                parsed_d, base_ws=max(1, int(d_q_tok)), decode_q=max(1, int(d_q_tok)),
+                seq_len=prompt + output, cap_bound=None,
+            )
+
+        records, refine_keys = _build_pd_factorized_handoff_records(
+            pair_specs, mode_params=mode_params, p_parsed=p_parsed, d_parsed=d_parsed,
+            p_results=p_results, p_errors=p_errors,
+            d_base_results=d_base_results, d_base_errors=d_base_errors,
+            d_vram_caches=d_vram_caches, d_spec_tokens=d_spec_tokens,
+            num_devices=num_devices, prompt=prompt, output=output, ttft=ttft, tpot=tpot,
+            kv_transfer_bw_gbps=kv_transfer_bw_gbps, ddr_bw_gbps=ddr_bw_gbps,
+            ssd_bw_gbps=ssd_bw_gbps, max_sequences_per_dp=max_sequences_per_dp,
+            rewrite_plan=rewrite_plan,
+        )
+        if refine_keys:
+            coverage["stage_d_refinements"] = len(refine_keys)
+            refine_tasks = [
+                (
+                    "decode", d_idx, d_active[d_idx]["raw"], prompt, output, tpot,
+                    max_sequences_per_dp, apply_target_envelope, rewrite_plan,
+                    allow_unbound_formula, eff_sla_ms,
+                    d_base_results[d_idx]["probe_cache"], num_devices,
+                )
+                for d_idx, eff_sla_ms in refine_keys
+            ]
+            for ok, payload in pool.map_ordered(_eval_pd_stage_worker, refine_tasks):
+                if ok:
+                    _, r_key, data = payload
+                    refine_results[r_key] = data
+                else:
+                    _, r_key, is_mod_err, err_msg = payload
+                    refine_errors[r_key] = (is_mod_err, err_msg)
+
+    return p_parsed, d_parsed, d_vram_caches, records, refine_results, refine_errors
+
+
+def _reduce_pd_factorized_pairs(
+    records: Sequence[Mapping[str, Any]],
+    *,
+    p_parsed: Mapping[int, CaseSpec],
+    d_parsed: Mapping[int, CaseSpec],
+    d_vram_caches: Mapping[int, tuple[Memory, tuple[float, ...], int]],
+    refine_results: Mapping[tuple[int, float], Mapping[str, Any]],
+    refine_errors: Mapping[tuple[int, float], tuple[bool, str]],
+    num_devices: int,
+    prompt: int,
+    output: int,
+    tpot: float,
+    max_sequences_per_dp: int | None,
+    rewrite_plan: Any,
+    coverage: dict[str, int],
+) -> tuple[list[dict[str, Any]], list[tuple[dict[str, Any], dict[str, Any], dict[str, Any]]]]:
+    """Phase 4: Deterministic closed-form Join/Reduce across all factorized PD pairs."""
+    rows: list[dict[str, Any]] = []
+    best_entry: tuple[dict[str, Any], dict[str, Any], dict[str, Any]] | None = None
+    for rec in records:
+        p_item, d_item = rec["p_item"], rec["d_item"]
+        p_idx, d_idx = int(p_item["id"]), int(d_item["id"])
+        p_world, d_world = int(p_item["world"]), int(d_item["world"])
+        parsed_p, parsed_d = p_parsed[p_idx], d_parsed[d_idx]
+        handoff_info = rec["handoff_info"]
+        if handoff_info["prefill_only"]:
+            st = handoff_info["stage"]
+        else:
+            d_sla = rec["resolved_sla"]
+            if d_sla is None and rec["refine_key"] is not None:
+                r_key = rec["refine_key"]
+                if r_key in refine_errors:
+                    exc = _rebuild_worker_error(refine_errors[r_key])
+                    if _is_ingress_contradiction(exc) or (rewrite_plan is not None and _is_rewrite_plan_error(exc)):
+                        raise exc
+                    continue
+                d_sla = refine_results[r_key]["d_sla"]
+            if d_sla is None:
+                dec = _measure_decode_stage(
+                    parsed_d, prompt=prompt, output=output, eff_decode=prompt,
+                    tpot_sla_ms=tpot, exposed_kv_ms=float(handoff_info["exposed_kv_ms"]),
+                    decode_tokens=int(handoff_info["decode_tokens"]),
+                    max_sequences_per_dp=max_sequences_per_dp, cache=None, cache_id=None,
+                    vram_info=d_vram_caches[d_idx],
+                )
+            else:
+                dec = _assemble_decode_stage_from_sla(
+                    parsed_d, d_sla=d_sla, length_ok=True, tpot_sla_ms=tpot,
+                    exposed_kv_ms=float(handoff_info["exposed_kv_ms"]),
+                    decode_tokens=int(handoff_info["decode_tokens"]), output=output,
+                )
+            st = _finalize_pd_stage_dict(handoff_info, dec)
+        best_ratio = _solve_optimal_pd_ratio_closed_form(
+            st, total=num_devices, p_dies=p_world, d_dies=d_world,
+            output=output, mode=rec["pd_mode"],
+        )
+        coverage["exact_evaluated"] += 1
+        row = _build_pd_candidate_row_from_stage(
+            st, p_parsed=parsed_p, d_parsed=parsed_d, best_ratio=best_ratio,
+            pd_mode=rec["pd_mode"], mtp_n=rec["mtp_n"], p_world=p_world, d_world=d_world,
+        )
+        rows.append(row)
+        if row["feasible"]:
+            if best_entry is None or _rank_single_pool_row(row) > _rank_single_pool_row(best_entry[0]):
+                best_entry = (row, p_item["raw"], d_item["raw"])
+    return rows, ([best_entry] if best_entry is not None else [])
+
+
 def _search_pd_deployments(
     compose_for: Any,
     *,
@@ -3340,7 +4140,9 @@ def _search_pd_deployments(
     apply_target_envelope: bool = False,
     rewrite_plan: Any = None,
     allow_unbound_formula: bool = True,
+    granted_workers: int | None = None,
 ) -> tuple[list[dict[str, Any]], list[tuple[dict[str, Any], dict[str, Any], dict[str, Any]]], dict[str, int]]:
+    """PD Stage Factorization: Map |P|+|D| stages concurrently, then closed-form Join."""
     p_topos = _build_pd_stage_candidates(
         role="pd_prefill", max_dies=num_devices - 1, is_moe=is_moe,
         layers=layers, prompt_tokens=prompt, rec_topo=rec_topo, pinned=p_pin,
@@ -3373,13 +4175,27 @@ def _search_pd_deployments(
         max_sequences_per_dp=max_sequences_per_dp,
         rewrite_plan=rewrite_plan, allow_unbound_formula=allow_unbound_formula,
     )
-    has_valid_pair = any(
-        (p_item["world"] + d_item["world"]) <= num_devices
-        for mtp_n, d_list in d_by_mtp
-        for p_item in p_by_pmtp.get(p_mtp_by_d_mtp[mtp_n], ())
-        for d_item in d_list
+    mode_params = _resolve_pd_mode_params(
+        pd_modes, prompt=prompt, pool_dram_ratio=pool_dram_ratio,
+        pool_ssd_ratio=pool_ssd_ratio, pool_prefix_hit_ratio=pool_prefix_hit_ratio,
+        ssd_bw_gbps=ssd_bw_gbps,
     )
-    if not has_valid_pair:
+    valid_modes = tuple(m for m in pd_modes if m in mode_params)
+    pair_specs: list[tuple[int, dict[str, Any], dict[str, Any], str]] = []
+    p_task_items: dict[tuple[int, int, int], dict[str, Any]] = {}
+    d_active: dict[int, dict[str, Any]] = {}
+    for mtp_n, d_list in d_by_mtp:
+        p_list = p_by_pmtp.get(p_mtp_by_d_mtp[mtp_n], ())
+        for p_item in p_list:
+            for d_item in d_list:
+                if int(p_item["world"]) + int(d_item["world"]) > num_devices:
+                    continue
+                d_active.setdefault(int(d_item["id"]), d_item)
+                for pd_mode in valid_modes:
+                    _, _, _, hit_tok, comp_tok = mode_params[pd_mode]
+                    p_task_items.setdefault((int(p_item["id"]), comp_tok, hit_tok), p_item)
+                    pair_specs.append((mtp_n, p_item, d_item, pd_mode))
+    if not pair_specs:
         has_p = any(bool(v) for v in p_by_pmtp.values())
         has_d = any(bool(v) for _, v in d_by_mtp)
         reason = (
@@ -3394,72 +4210,25 @@ def _search_pd_deployments(
             ),
         ], [], coverage
 
-    p_parsed: dict[int, CaseSpec] = {}
-    d_parsed: dict[int, CaseSpec] = {}
-    prefill_cache: dict[tuple[Any, ...], tuple[Memory, bool, int, float]] = {}
-    decode_cache: dict[tuple[int, float], dict[str, Any]] = {}
-    d_probe_caches: dict[int, dict[int, float]] = {}
-    d_vram_caches: dict[int, tuple[Memory, tuple[float, ...], int]] = {}
-    d_rep_caches: dict[int, LayerCohortPlan] = {}
-    rows: list[dict[str, Any]] = []
-    best_entry: tuple[dict[str, Any], dict[str, Any], dict[str, Any]] | None = None
-    for mtp_n, d_list in d_by_mtp:
-        p_list = p_by_pmtp.get(p_mtp_by_d_mtp[mtp_n], ())
-        for p_item in p_list:
-            p_idx, p_world, p_raw = p_item["id"], p_item["world"], p_item["raw"]
-            if p_idx not in p_parsed:
-                p_parsed[p_idx] = parse_case(p_raw)
-            for d_item in d_list:
-                d_idx, d_world, d_raw = d_item["id"], d_item["world"], d_item["raw"]
-                if p_world + d_world > num_devices:
-                    continue
-                if d_idx not in d_parsed:
-                    parsed_d = parse_case(d_raw)
-                    d_parsed[d_idx] = parsed_d
-                    d_q_tok, _ = _resolve_speculative_tokens(
-                        parsed_d, output_budget=output, tokens_per_seq=None, emitted_tokens_per_seq=None,
-                    )
-                    d_vram_caches[d_idx] = _solve_b_vram_max(
-                        parsed_d, base_ws=max(1, int(d_q_tok)), decode_q=max(1, int(d_q_tok)),
-                        seq_len=prompt + output, cap_bound=None,
-                    )
-                    d_rep_caches[d_idx] = discover_layer_cohorts(parsed_d)
-                for pd_mode in pd_modes:
-                    try:
-                        rep = sweep_pd_disaggregation_ratios(
-                            p_parsed[p_idx], d_parsed[d_idx],
-                            total_dies=num_devices, prompt_tokens=prompt, output_tokens=output,
-                            ttft_sla_ms=(None if math.isinf(ttft) else ttft), tpot_sla_ms=tpot,
-                            kv_transfer_bw_gbps=kv_transfer_bw_gbps, pd_transfer_mode=pd_mode,
-                            pool_dram_ratio=(pool_dram_ratio if pd_mode == "pooled_dram_ssd" else None),
-                            pool_ssd_ratio=(pool_ssd_ratio if pd_mode == "pooled_dram_ssd" else 0.0),
-                            pool_prefix_hit_ratio=(pool_prefix_hit_ratio if pd_mode == "pooled_dram_ssd" else 0.0),
-                            ddr_bw_gbps=ddr_bw_gbps, ssd_bw_gbps=ssd_bw_gbps,
-                            max_sequences_per_dp=max_sequences_per_dp,
-                            allow_unconstrained_ttft=math.isinf(ttft),
-                            apply_target_envelope=apply_target_envelope,
-                            rewrite_plan=rewrite_plan, allow_unbound_formula=allow_unbound_formula,
-                            _prefill_step_cache=prefill_cache, _prefill_cache_id=p_idx,
-                            _decode_sla_cache=decode_cache, _decode_cache_id=d_idx,
-                            _decode_probe_cache=d_probe_caches.setdefault(d_idx, {}),
-                            _decode_vram_info=d_vram_caches.get(d_idx),
-                            _decode_rep_info=d_rep_caches.get(d_idx),
-                        )
-                    except (ModelingError, ValueError) as exc:
-                        if _is_ingress_contradiction(exc) or (rewrite_plan is not None and _is_rewrite_plan_error(exc)):
-                            raise
-                        continue
-                    coverage["exact_evaluated"] += 1
-                    row = _build_pd_candidate_row(
-                        rep, pd_mode=pd_mode, mtp_n=mtp_n, p_world=p_world, d_world=d_world,
-                    )
-                    rows.append(row)
-                    if row["feasible"]:
-                        if best_entry is None or _rank_single_pool_row(row) > _rank_single_pool_row(best_entry[0]):
-                            best_entry = (row, p_raw, d_raw)
-        if num_devices >= GC_RECLAIM_MIN_WORLD_SIZE:
-            _reclaim_sweep_memory()
-    return rows, ([best_entry] if best_entry is not None else []), coverage
+    p_parsed, d_parsed, d_vram_caches, records, refine_results, refine_errors = _execute_pd_stage_mapreduce(
+        pair_specs=pair_specs, p_task_items=p_task_items, d_active=d_active,
+        mode_params=mode_params, num_devices=num_devices, prompt=prompt, output=output,
+        ttft=ttft, tpot=tpot, kv_transfer_bw_gbps=kv_transfer_bw_gbps,
+        ddr_bw_gbps=ddr_bw_gbps, ssd_bw_gbps=ssd_bw_gbps,
+        max_sequences_per_dp=max_sequences_per_dp,
+        apply_target_envelope=apply_target_envelope, rewrite_plan=rewrite_plan,
+        allow_unbound_formula=allow_unbound_formula, granted_workers=granted_workers,
+        coverage=coverage,
+    )
+    rows, best_entries = _reduce_pd_factorized_pairs(
+        records, p_parsed=p_parsed, d_parsed=d_parsed, d_vram_caches=d_vram_caches,
+        refine_results=refine_results, refine_errors=refine_errors,
+        num_devices=num_devices, prompt=prompt, output=output, tpot=tpot,
+        max_sequences_per_dp=max_sequences_per_dp, rewrite_plan=rewrite_plan, coverage=coverage,
+    )
+    if num_devices >= GC_RECLAIM_MIN_WORLD_SIZE:
+        _reclaim_sweep_memory()
+    return rows, best_entries, coverage
 
 
 _ALLOWED_PINNED_AXES = frozenset({
@@ -3858,8 +4627,10 @@ def solve_optimal_deployment(
     allow_unconstrained_ttft: bool = False, apply_target_envelope: bool = False,
     rewrite_plan: Any = None, allow_unbound_formula: bool = True,
     compose_overrides: Mapping[str, Any] | None = None,
+    granted_workers: int | None = None,
 ) -> dict[str, Any]:
     """Search optimal deployment topology under explicit ``deployment_mode`` and user SLAs."""
+    eff_workers = resolve_granted_workers(granted_workers)
     if deployment_mode is not None and deployment is not None:
         if str(deployment_mode).strip().lower() != str(deployment).strip().lower():
             raise ModelingError(f"conflicting_deployment_mode:{deployment_mode}!={deployment}")
@@ -3943,6 +4714,7 @@ def solve_optimal_deployment(
             mtp_grid=mtp_grid, prompt=prompt, output=output, ttft=ttft, tpot=tpot,
             max_sequences_per_dp=max_sequences_per_dp, apply_target_envelope=use_target_env,
             rewrite_plan=ext_plan, allow_unbound_formula=allow_unbound_formula,
+            granted_workers=eff_workers,
         )
         all_candidates.extend(c_rows)
     elif dep_norm == "pd_prefill":
@@ -3951,6 +4723,7 @@ def solve_optimal_deployment(
             model_spec=model_spec, rec_topo=rec_topo, pinned=p_pin, mtp_grid=mtp_grid,
             prompt=prompt, output=output, ttft=ttft, apply_target_envelope=use_target_env,
             rewrite_plan=ext_plan, allow_unbound_formula=allow_unbound_formula,
+            granted_workers=eff_workers,
         )
         all_candidates.extend(pf_rows)
     elif dep_norm == "pd_disaggregated":
@@ -3964,6 +4737,7 @@ def solve_optimal_deployment(
             ddr_bw_gbps=ddr_bw_gbps, ssd_bw_gbps=ssd_bw_gbps,
             max_sequences_per_dp=max_sequences_per_dp, apply_target_envelope=use_target_env,
             rewrite_plan=ext_plan, allow_unbound_formula=allow_unbound_formula,
+            granted_workers=eff_workers,
         )
         all_candidates.extend(p_rows)
 

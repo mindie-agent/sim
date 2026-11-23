@@ -25,8 +25,8 @@ from mindie_sim.schema.common import ModelingError
 
 from .action_plan import (
     CONSERVATION_EPS_MS, ComparisonPlan, GroupAccounting, WaterfallSummary,
-    build_actionable_roadmap, build_comparison_plan, build_new_kernel_backlog,
-    build_parallelism_codesign_note, build_pending_kernel_details,
+    anchor_stage_waterfall, build_actionable_roadmap, build_comparison_plan,
+    build_new_kernel_backlog, build_parallelism_codesign_note, build_pending_kernel_details,
 )
 from .agent_brief import (
     AGENT_BRIEF_MAX_BYTES, _compact_agent_brief_to_budget, build_agent_brief,
@@ -1033,13 +1033,22 @@ def enrich_comparison_plan_stage_receipts(
         residual_saved_ms=res_ms_tot,
         residual_saved_upt=res_upt_tot,
     )
-    return replace(plan, waterfall=new_wf, group_accounting=tuple(updated_acc))
+    anchored_stage_wf = anchor_stage_waterfall(
+        before_bundle,
+        after_bundle,
+        config_bridge_span_us=(float(config_bundle.step_span_us) if config_bundle is not None else None),
+        config_saved_us=cfg_ms_tot * US_PER_MS,
+    )
+    return replace(
+        plan, waterfall=new_wf, group_accounting=tuple(updated_acc), stage_waterfall=anchored_stage_wf,
+    )
 
 
 __all__ = [
     "AGENT_BRIEF_MAX_BYTES", "ComparisonPlan", "GroupAccounting", "WF_STAGE_CONFIG",
     "WF_STAGE_FRAMEWORK", "WF_STAGE_KERNEL", "WF_STAGE_RESIDUAL", "WaterfallSummary",
-    "_compact_agent_brief_to_budget", "align_before_after_operators", "build_actionable_roadmap",
+    "_compact_agent_brief_to_budget", "align_before_after_operators", "anchor_stage_waterfall",
+    "build_actionable_roadmap",
     "build_agent_brief", "build_comparison_plan", "build_macro_module_breakdown",
     "build_new_kernel_backlog", "build_parallelism_codesign_note",
     "build_pending_kernel_details", "classify_waterfall_stage",
