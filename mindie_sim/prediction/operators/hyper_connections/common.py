@@ -15,7 +15,14 @@ from typing import Literal
 
 from mindie_sim.schema.common import ModelingError, dtype_bytes
 from mindie_sim.schema.datapath import ArchId, SourceRef
-from mindie_sim.schema.operators import OpSpec
+from mindie_sim.schema.operators import (
+    KernelBinding,
+    OpSpec,
+    OwnerMemoryResidency,
+    OwnerScheduleSpec,
+    SerialPhaseSpec,
+    TensorPrecisionABI,
+)
 from ...mechanism import OperatorPlan, Work
 from ...runtime.memory_physics import AddressRun, AddressRunPlan, ReuseKey
 from ..contracts import OperatorPlanningContext
@@ -59,14 +66,17 @@ ATTNRES_UB_ALIGNMENT_BYTES = 32
 ATTNRES_FP32_VECTOR_LANES = 64
 ATTNRES_FP32_ALIGNED_SCRATCH_ROWS = 3
 ATTNRES_FP32_SCRATCH_ROWS = 4
+MAX_OWNER_SERIAL_PHASES = 8
 UINT32_MAX = (1 << 32) - 1
 ENGRAM_REDUCTIONS = 3
 ENGRAM_CHUNK_BYTES_PER_ELEMENT = 12
 
 VLLM_REVISION = "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb"
-VLLM_CALLER_SOURCES: tuple[SourceRef, ...] = (
-    SourceRef("vllm-ascend", VLLM_REVISION, "csrc/moe/hc_pre/op_host/hc_pre_tiling.cpp",
-              "29bd7606b274d6a9289ce02b6e6cc03ff947c3a163850263cfea622b53b5d26c"),
+HC_PRE_TILING_SOURCE = SourceRef(
+    "vllm-ascend", VLLM_REVISION, "csrc/moe/hc_pre/op_host/hc_pre_tiling.cpp",
+    "29bd7606b274d6a9289ce02b6e6cc03ff947c3a163850263cfea622b53b5d26c",
+)
+ATTNRES_CALLER_SOURCES: tuple[SourceRef, ...] = (
     SourceRef("vllm-ascend", VLLM_REVISION, "csrc/attention/attn_res_fwd/op_host/attn_res_fwd_tiling.cpp",
               "b77dc41317386e5ac4d9b6b71e9ef5249c52895b5d37163c54b0cd603ff4c361"),
     SourceRef("vllm-ascend", VLLM_REVISION, "csrc/attention/attn_res_fwd/op_host/attn_res_fwd_legacy_plan.h",
@@ -75,8 +85,15 @@ VLLM_CALLER_SOURCES: tuple[SourceRef, ...] = (
               "b1898c8cc2d84fd4e66573623198fbac395fec58a802f9dd6028927aa229daff"),
     SourceRef("vllm-ascend", VLLM_REVISION, "csrc/attention/attn_res_fwd/op_kernel/arch35/attn_res_fwd_reload.h",
               "46b3a1fcec42b5bac511021d1059b4e91ddbb78426563b5a0343d1a9e73db611"),
+)
+ENGRAM_GATE_SOURCES: tuple[SourceRef, ...] = (
     SourceRef("vllm-ascend", VLLM_REVISION, "vllm_ascend/ops/triton/engram_gate.py",
               "aa52205e9207af272e6179ebf1b6bbd552de65ef6f1472db6de893aded29e47b"),
+)
+VLLM_CALLER_SOURCES: tuple[SourceRef, ...] = (
+    HC_PRE_TILING_SOURCE,
+    *ATTNRES_CALLER_SOURCES,
+    *ENGRAM_GATE_SOURCES,
 )
 SHARED_SOURCES: tuple[SourceRef, ...] = (
     SourceRef("cann/cann-recipes-infer", "3c9266727c2a25bd17d503ad37d189a134ff364b",
@@ -86,6 +103,21 @@ SHARED_SOURCES: tuple[SourceRef, ...] = (
               "mhc/text_gated_residual/op_kernel/catlass_hc_forward_mul_sum_tiling_data.h",
               "392ea8212ca6ec2ce53d8a8e5704194ca6e7f1b177ab25f4b12e1fac18f43788"),
 )
+
+
+def sources_for_kind(kind: str, strategy_sources: tuple[SourceRef, ...]) -> tuple[SourceRef, ...]:
+    """Select verified upstream provenance strictly for the active operator kind."""
+    if kind == "engram_gate":
+        return ENGRAM_GATE_SOURCES
+    if kind == "attn_res_fwd":
+        return ATTNRES_CALLER_SOURCES
+    if kind == "text_gated_residual":
+        ops_tx = tuple(ref for ref in strategy_sources if "text_gated_residual" in ref.relative_path)
+        shared_tx = tuple(ref for ref in SHARED_SOURCES if "text_gated_residual" in ref.relative_path)
+        return ops_tx + shared_tx or strategy_sources
+    hc_strategy = tuple(ref for ref in strategy_sources if "hc_pre" in ref.relative_path)
+    hc_shared = tuple(ref for ref in SHARED_SOURCES if "hc_pre" in ref.relative_path)
+    return (hc_strategy or strategy_sources) + hc_shared + (HC_PRE_TILING_SOURCE,)
 
 MHC_KINDS = frozenset({"hc_pre", "hc_post", "hc_pre_sinkhorn", "mhc_post_collapse"})
 LEGACY_ALIASES = {
@@ -603,22 +635,31 @@ def attnres_spec_terms(op: OpSpec) -> dict[str, float]:
 
     Mirrors ``model_attnres`` per token (vector work is owner-independent);
     bytes count each compulsory tensor once: prefix (+addend), the ``j`` valid
-    history rows, the score/norm weights and the stored rows. UB-capacity
-    re-reads and per-owner weight reloads only add traffic on top.
+    history rows, the score/norm weights (only when mixing is active) and the
+    stored rows. Zero-history calls bypass scoring, Softmax, mixing, and score
+    weight reads. UB-capacity re-reads and per-owner weight reloads only add
+    traffic on top.
     """
     contract, options = operator_contract(op, "attn_res_fwd")
     m, h, j = contract.tokens, contract.hidden_size, contract.valid_history
     row = int(dtype_bytes(contract.dtype)) * h
     fuse = int(contract.fuse_add)
-    weights = (2 + int(contract.output_norm)) * row
+    mixing = j > 0
+    weights = (2 * int(mixing) + int(contract.output_norm)) * row
     if not m:
         return {"hbm_bytes": 0.0, "mte2_bytes": 0.0, "mte3_bytes": 0.0, "vector_ops": 0.0}
-    reads = m * (1 + fuse + j) * row + weights
-    writes = m * (1 + fuse + int(options["bank_write"])) * row
-    score_per_row = 2 * (h - 1) + (2 + 2) * h + RMS_SCALAR_OPS
+    reads = m * (1 + fuse + (j if mixing else 0)) * row + weights
+    writes = m * (
+        1 + fuse + int(options["bank_write"]) + int(options.get("save_materialized", False))
+    ) * row
     norm = (2 + 2) * h + 2 * h + h + RMS_SCALAR_OPS if contract.output_norm else 0
-    per_token = ((j + 1) * score_per_row + (2 + 2) * h * fuse
-                 + ATTNRES_SOFTMAX_OPS_PER_ROW * (j + 1) - 1 + 2 * (j + 1) * h + norm)
+    if mixing:
+        score_per_row = 2 * (h - 1) + (2 + 2) * h + RMS_SCALAR_OPS
+        per_token = ((j + 1) * score_per_row + (2 + 2) * h * fuse
+                     + ATTNRES_SOFTMAX_OPS_PER_ROW * (j + 1) - 1 + 2 * (j + 1) * h + norm)
+    else:
+        # Zero-history bypass: optional fused add + BF16->FP32 bypass + FP32->BF16 round + optional norm.
+        per_token = (2 + 2) * h * fuse + 2 * h + norm
     return {"hbm_bytes": float(reads + writes), "mte2_bytes": float(reads),
             "mte3_bytes": float(writes), "vector_ops": float(m * per_token)}
 
@@ -697,7 +738,11 @@ class HyperConnectionsStrategy:
                           decision.excluded_fusion or decision.selected_template)
             metadata = model_text_gate(graph, contract, decision)
         elif kind == "attn_res_fwd":
-            metadata = model_attnres(graph, contract, ub, regbase=self.arch_id == ARCH35, **options)
+            attn_options = {
+                "physical_cap": options.get("physical_cap"),
+                "bank_write": bool(options.get("bank_write", False)),
+            }
+            metadata = model_attnres(graph, contract, ub, regbase=self.arch_id == ARCH35, **attn_options)
         else:
             metadata = model_engram(graph, contract, ub)
         if graph.phases and ctx.datapath.usable_paths:
@@ -706,7 +751,103 @@ class HyperConnectionsStrategy:
                     raise gap("hyper_connections_datapath_unsupported", f"{source}->{target}")
         metadata.update(arch_id=str(self.arch_id), datapath=self.datapath_name,
                         ub_bytes=ub, implementation=kind, governed_family=FAMILY)
-        return graph.finish(kind, contract.dtype, self.sources + SHARED_SOURCES + VLLM_CALLER_SOURCES, metadata)
+        selected_sources = sources_for_kind(kind, self.sources)
+        return graph.finish(kind, contract.dtype, selected_sources, metadata)
+
+
+def build_governed_bindings(
+    op: OpSpec, ctx: OperatorPlanningContext, plan: OperatorPlan,
+    kind: str, sources: tuple[SourceRef, ...],
+) -> tuple[TensorPrecisionABI, KernelBinding, OwnerScheduleSpec]:
+    """Construct birth TensorPrecisionABI, KernelBinding, and OwnerScheduleSpec."""
+    meta = dict(plan.metadata)
+    dtype = str(op.dtype or "bf16").lower()
+    arch_str = "A5" if ctx.compute_arch.arch_id == ARCH35 else "A3"
+    kernel_map = {
+        "hc_pre": ("npu_hc_pre", "CANN", "hyper_connections"),
+        "hc_post": ("npu_hc_post", "CANN", "hyper_connections"),
+        "hc_pre_sinkhorn": ("aclnnHcPreSinkhorn", "CANN", "hyper_connections"),
+        "mhc_post_collapse": ("mhc_post_collapse_norm", "CANN", "hyper_connections"),
+        "text_gated_residual": ("aclnnTextGatedResidual", "CANN", "hyper_connections"),
+        "attn_res_fwd": ("AttnResFwd", "CANN", "attention_residual"),
+        "engram_gate": ("fused_engram_gate", "Triton", "engram_gate"),
+    }
+    kernel_id, backend, submodule = kernel_map.get(kind, (kind, "CANN", FAMILY))
+    precision_abi = TensorPrecisionABI(
+        linear_method="dense" if plan.work.matrix else "none",
+        input_dtype=dtype,
+        weight_dtype=dtype,
+        output_dtype=dtype,
+        compute_dtype="fp32" if kind == "attn_res_fwd" else dtype,
+        accum_dtype="fp32",
+    )
+    kernel_binding = KernelBinding(
+        kernel_id=kernel_id,
+        backend=backend,
+        arch_family=arch_str,
+        submodule=submodule,
+        macro_module="residual",
+        readiness="shipping",
+        source_ref=sources[0] if sources else None,
+        recipe_id=kind,
+        template_id=str(meta.get("selected_template") or ""),
+    )
+    owner_schedule = _owner_schedule_from_plan(op, ctx, plan, kind, meta)
+    return precision_abi, kernel_binding, owner_schedule
+
+
+def _owner_schedule_from_plan(
+    op: OpSpec, ctx: OperatorPlanningContext, plan: OperatorPlan,
+    kind: str, meta: Mapping[str, Any],
+) -> OwnerScheduleSpec:
+    shape = op.local_shape or op.semantic_shape
+    rows = int(shape[0]) if shape else 0
+    total_aiv = max(0, int(ctx.effective_aiv_cores))
+    total_aic = max(0, int(ctx.effective_aic_cores))
+    uses_aic = bool(plan.work.matrix)
+    owner_kind: Literal["aic", "aiv", "mix"] = "mix" if uses_aic and total_aiv else ("aic" if uses_aic else "aiv")
+    total_owners = total_aiv if owner_kind != "aic" else total_aic
+    launched = min(rows, total_owners) if rows > 0 and total_owners > 0 else 0
+    max_tiles = _ceil(rows, launched) if launched > 0 else 0
+    active = _ceil(rows, max_tiles) if max_tiles > 0 else 0
+    ub_cap = int(meta.get("ub_bytes") or dict(ctx.datapath.buffers).get("ub", 0) or 0)
+    res_map = plan.work.resources
+    mte2_total = float(res_map.get("mte2_aiv", 0.0) + res_map.get("mte2_aic", 0.0) + res_map.get("mte2", 0.0))
+    mte3_total = float(res_map.get("mte3", 0.0) + res_map.get("fixpipe", 0.0))
+    hbm_total = float(res_map.get("hbm", 0.0))
+    divisor = float(max(1, active))
+    residency = OwnerMemoryResidency(
+        ub_live_bytes=min(ub_cap, int(meta.get("ub_bytes_per_owner", 0) or 0)),
+        ub_capacity_bytes=ub_cap,
+        spill_reload_passes=2 if str(meta.get("selected_template", "")).endswith("reload") else (1 if rows > 0 else 0),
+        owner_mte2_bytes=mte2_total / divisor,
+        owner_mte3_bytes=mte3_total / divisor,
+        shared_hbm_read_bytes=min(hbm_total, mte2_total),
+        shared_hbm_write_bytes=min(hbm_total, mte3_total),
+        l2_admission_mode="reuse",
+    )
+    serial_phases: list[SerialPhaseSpec] = []
+    if plan.pipeline_spec is not None:
+        for phase in plan.pipeline_spec.phases[:MAX_OWNER_SERIAL_PHASES]:
+            vec = sum(item.amount for item in phase.work if item.resource == "vector")
+            cube = sum(item.amount for item in phase.work if item.resource == "cube")
+            if cube > 0.0:
+                serial_phases.append(SerialPhaseSpec(phase.phase_id, "cube", cube / divisor, "flop"))
+            elif vec > 0.0:
+                serial_phases.append(SerialPhaseSpec(phase.phase_id, "vec_alu", vec / divisor, "op"))
+    return OwnerScheduleSpec(
+        owner_kind=owner_kind,
+        tiling_strategy=str(meta.get("selected_template") or "row_owner"),
+        parallel_axis="token_rows",
+        work_tiles=rows,
+        launched_owners=launched,
+        active_owners=active,
+        total_owners=total_owners,
+        max_tiles_per_owner=max_tiles,
+        residency=residency,
+        serial_phases=tuple(serial_phases),
+        dispatch_envelope_source="P15_dispatch",
+    )
 
 
 def operator_contract(op: OpSpec, kind: str):
@@ -758,7 +899,8 @@ def operator_contract(op: OpSpec, kind: str):
             meta.setdefault("valid_history", meta.get("valid_blocks", 0) if meta.get("mix", True) else 0)
             meta.setdefault("token_stride", meta.get("block_token_stride"))
             options = {"physical_cap": meta.get("physical_capacity_cap"),
-                       "bank_write": meta.get("block_write_idx", -1) >= 0}
+                       "bank_write": meta.get("block_write_idx", -1) >= 0,
+                       "save_materialized": bool(meta.get("save_materialized", False))}
         else:
             schema = EngramGateContract
             meta["branches"] = shape[1] if len(shape) == RESIDUAL_RANK else 1

@@ -227,6 +227,7 @@ def semantic_graph_key(
     runtime = case.runtime
     parallel = runtime.parallel
     model = case.model
+    quant = getattr(model, "quant", None)
     signature = freeze_value({
         "schema": "mindie-sim.semantic-graph/1",
         "scope": str(scope),
@@ -235,11 +236,35 @@ def semantic_graph_key(
             "hidden_size": model.hidden_size, "num_heads": model.num_heads,
             "num_kv_heads": model.num_kv_heads, "head_dim": model.head_dim,
             "vocab_size": model.vocab_size, "num_experts": model.num_experts,
-            "top_k": model.top_k, "quant": getattr(model.quant, "name", ""),
+            "top_k": model.top_k,
+            "quant": getattr(quant, "name", ""),
+            "quant_contract": (
+                getattr(quant, "weight_format", ""),
+                getattr(quant, "activation_format", ""),
+                getattr(quant, "expert_weight_format", ""),
+                getattr(quant, "kv_dtype", ""),
+                getattr(quant, "index_dtype", ""),
+                getattr(quant, "engram_table_format", ""),
+                tuple(getattr(quant, "exclusions", ()) or ()),
+                tuple(getattr(quant, "category_overrides", ()) or ()),
+            ) if quant is not None else (),
             "layer_plans": tuple(
                 (item.index, item.attention, item.ffn, item.scope,
                  item.cache_kind, item.window, item.compress_ratio,
-                 item.num_experts, item.top_k)
+                 item.num_experts, item.top_k,
+                 getattr(item, "residual_block_size", 0),
+                 getattr(item, "hc_mult", 1),
+                 getattr(item, "hc_lowrank", 0),
+                 getattr(item, "hc_sinkhorn_iters", 0),
+                 getattr(item, "index_kpool", 1),
+                 getattr(item, "kv_owner_layer_id", -1),
+                 getattr(item, "index_k_owner_layer_id", -1),
+                 getattr(item, "topk_owner_layer_id", -1),
+                 getattr(item, "candidate_source_layer_id", -1),
+                 getattr(item, "index_source_layer_id", -1),
+                 getattr(item, "native_layer_id", None),
+                 bool(getattr(item, "engram", False)),
+                 bool(getattr(item, "hyper_connections", False)))
                 for item in model.layer_plans),
             "auxiliary": freeze_value(getattr(model, "auxiliary", None)),
         },
@@ -835,11 +860,53 @@ def _prepare_graphs(case, ops, book, replay_scope, external):
 def _run_graph(
     case, ops, graphs, scopes, groups, ctx, book, external, input_ready_ms, *,
     include_submission, trace_limit, fast_span_only, stream_plans, request_views,
-    padded_tokens, sequence_layout, timeline_replicas=None,
+    padded_tokens, sequence_layout, timeline_replicas=None, compact=False,
+    isolated=False, group_for=None,
 ):
+    from .runtime.exposed_observer import ExposedObserver
+
     records, streams = [], {}
+    filter_at_observe = timeline_replicas is not None and not compact
+    replica_observer = ExposedObserver(
+        observed_replicas=timeline_replicas if filter_at_observe else None,
+    )
+    filtered_non_barrier = 0
+    ep_spans = bool(case.runtime.parallel.ep_spans_dp)
+    from .sharding.local_tp import local_tp_spans_dp
+    ltp_spans = bool(local_tp_spans_dp(case.runtime.parallel))
+    cp_spans = bool(case.runtime.parallel.cp_spans_dp)
+    cross_dp_axes = set()
+    if ep_spans:
+        cross_dp_axes.add("ep")
+    if ltp_spans:
+        cross_dp_axes.add("local_tp")
+    if cp_spans:
+        cross_dp_axes.update({"cp", "dcp_dp", "dcp_a2a"})
+    non_observed_peer_events: list[tuple[Any, int, Any, str]] = []
 
     def observe(op, replica, program, ready, complete):
+        nonlocal filtered_non_barrier
+        if filter_at_observe and not replica_observer.should_retain_replica(replica):
+            if op.family != "barrier":
+                filtered_non_barrier += 1
+            if cross_dp_axes:
+                meta = dict(op.metadata) if op.metadata else {}
+                axis = meta.get("group_axis")
+                if axis in cross_dp_axes:
+                    if isolated:
+                        # Isolated joint-collective pricing needs peer descriptors;
+                        # keep only cross-DP collective records when isolated=True.
+                        key = _name(replica, op.op_id)
+                        records.append({
+                            "id": key, "op": op, "replica": replica, "program": program,
+                            "predecessors": tuple(_name(replica, dep) for dep in op.deps),
+                            "ready": ready, "complete": complete,
+                            "collective_algorithm": getattr(book.select(op), "algorithm", None),
+                            "_peer_only": True,
+                        })
+                    else:
+                        non_observed_peer_events.append((op, replica, ready, str(axis)))
+            return
         key = _name(replica, op.op_id)
         stream = replica, op.stage, op.stream or "main"
         predecessors = [_name(replica, dep) for dep in op.deps]
@@ -914,13 +981,25 @@ def _run_graph(
                 steps[r] = execution.add(work, r, input_ready_ms, external_inputs=inputs[r])
     unique_completions = tuple(dict.fromkeys(step.completion for step in steps.values()))
     engine.advance(until=unique_completions, first=False)
-    skipped_occurrences = 0
+    skipped_occurrences = filtered_non_barrier
     if not fast_span_only and getattr(execution, "_dedup_cohorts", None):
         from .runtime.dp_cohort_dedup import expand_dedup_graph_artifacts
-        skipped_occurrences = expand_dedup_graph_artifacts(
+        skipped_occurrences += expand_dedup_graph_artifacts(
             execution, records, graphs, timeline_replicas=timeline_replicas,
         )
-    return execution, engine, records, steps, stream_plans, skipped_occurrences
+    if non_observed_peer_events and group_for is not None:
+        from .topology import Topology
+        topology = Topology(case.machine, case.runtime.parallel) if cp_spans else None
+        for op, replica, ready, axis in non_observed_peer_events:
+            meta = dict(op.metadata) if op.metadata else {}
+            if axis == "ep":
+                grp = group_for[replica]
+            elif axis == "local_tp":
+                grp = tuple(meta.get("group_ranks") or group_for[replica])
+            else:
+                grp = _dcp_replica_subgroup(topology, axis, replica, op.stage, meta, group_for[replica])
+            replica_observer.record_peer_readiness((grp, op.op_id), replica, ready.time)
+    return execution, engine, records, steps, stream_plans, skipped_occurrences, replica_observer
 
 
 def _dcp_replica_subgroup(topology, axis, replica, stage, meta, fallback):
@@ -936,7 +1015,7 @@ def _dcp_replica_subgroup(topology, axis, replica, stage, meta, fallback):
     return matched or fallback
 
 
-def _bind_collective_readiness(case, records, group_for, execution):
+def _bind_collective_readiness(case, records, group_for, execution, replica_observer=None):
     from .sharding.local_tp import local_tp_spans_dp
     from .topology import Topology
 
@@ -960,7 +1039,7 @@ def _bind_collective_readiness(case, records, group_for, execution):
                 grp = _dcp_replica_subgroup(
                     topology, axis, r, op.stage, meta, group_for[r])
                 joins.setdefault((grp, op.op_id), []).append(record)
-    for participants in joins.values():
+    for join_key, participants in joins.items():
         if all(item["collective_algorithm"] for item in participants):
             for item in participants:
                 item["joint_collective"] = True
@@ -974,6 +1053,10 @@ def _bind_collective_readiness(case, records, group_for, execution):
             continue
         dependencies = tuple(dict.fromkeys(dep for item in participants for dep in item["predecessors"]))
         ready_ms = max(item["ready"].time for item in participants)
+        if replica_observer is not None:
+            peer_ready = replica_observer.collective_peer_ready_ms(join_key)
+            if peer_ready is not None and peer_ready > ready_ms:
+                ready_ms = peer_ready
         for item in participants:
             item["predecessors"] = dependencies
             item["collective_ready_ms"] = ready_ms
@@ -1336,8 +1419,10 @@ def _assemble_graph_result(
                 key: tuple(spans) for key, spans in evicted_spans.items()
             }
     if graphs:
+        observed_reps = {record["replica"] for record in records if not record.get("_peer_only")}
+        exposed_rep = min(graphs) if (not observed_reps or min(graphs) in observed_reps) else min(observed_reps)
         result.update(_exposed_breakdown(
-            records, duration, input_ready_ms, min(graphs),
+            records, duration, input_ready_ms, exposed_rep,
             stage_rates_by_key=_stage_role_rates(execution)))
     else:
         result.update(unavailable_breakdown(
@@ -1416,12 +1501,12 @@ def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=Non
         frozenset(int(r) for r in timeline_replicas)
         if timeline_replicas is not None else None
     )
-    execution, engine, records, steps, stream_plans, skipped_occurrences = _run_graph(
+    execution, engine, records, steps, stream_plans, skipped_occurrences, replica_observer = _run_graph(
         case, ops, graphs, scopes, groups, ctx, book, external, input_ready_ms,
         include_submission=include_submission, trace_limit=trace_limit,
         fast_span_only=fast_span_only, stream_plans=stream_plans,
         request_views=request_views, padded_tokens=padded_tokens, sequence_layout=sequence_layout,
-        timeline_replicas=keep_replicas)
+        timeline_replicas=keep_replicas, compact=compact, isolated=isolated, group_for=group_for)
     end = max((step.completion.time for step in steps.values()), default=input_ready_ms)
     duration = end - input_ready_ms
     if fast_span_only:
@@ -1441,13 +1526,13 @@ def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=Non
             "accel_status": accel_status(engine.accel_status()),
             "fast_span_only": True,
         }
-    joins = _bind_collective_readiness(case, records, group_for, execution)
+    joins = _bind_collective_readiness(case, records, group_for, execution, replica_observer=replica_observer)
     costs, durations, isolated_sum, cohort_cache = [], {}, 0.0, {}
     if isolated:
         costs, durations, isolated_sum, cohort_cache = _price_isolated_graph(
             case, graphs, joins, scopes, book, primitives, ctx, stream_plans)
     row_records = (
-        [record for record in records if record["replica"] in keep_replicas]
+        [record for record in records if not record.get("_peer_only") and record["replica"] in keep_replicas]
         if (keep_replicas is not None and not compact) else records
     )
     rows, profile = _graph_operator_rows(
@@ -1475,7 +1560,8 @@ def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=Non
         "replicas": list(graphs), "replay_scope": replay_scope,
         "replay_scope_by_replica": scopes,
         "operator_occurrences": sum(
-            record["op"].family != "barrier" for record in records) + skipped_occurrences,
+            record["op"].family != "barrier" and not record.get("_peer_only")
+            for record in records) + skipped_occurrences,
     }
     return _assemble_graph_result(
         case, graphs, records, steps, execution, engine, rows, profile,

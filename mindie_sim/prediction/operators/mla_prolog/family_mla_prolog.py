@@ -44,11 +44,13 @@ def recipes():
 
 
 def prepare_model(model, runtime):
+    from mindie_sim.catalog.quant import projection_quant
     from mindie_sim.prediction.implementation_selection import prepared_selection
     options = prepared_selection(runtime.kernels.get("lowerings", {}), "mla_prolog").options
     for plan in model.layer_plans:
         if plan.attention == "mla":
-            validate(plan=plan, parallel=runtime.parallel, model=model, quant=model.quant,
+            validate(plan=plan, parallel=runtime.parallel, model=model,
+                     quant=projection_quant(model.quant, plan),
                      lowering_passes=runtime.lowering_passes, **options)
     if options.get("cache_layout"):
         from mindie_sim.catalog.cache_format import with_packed_mla_cache
@@ -75,6 +77,27 @@ def _effective_cache_layout(plan, quant, cache_layout):
     return cache_layout
 
 
+def _indexer_q_category(quant) -> str:
+    overrides = dict(getattr(quant, "category_overrides", ()) or ())
+    exclusions = set(getattr(quant, "exclusions", ()) or ())
+    if ("indexer.wq" in overrides or "indexer.wq" in exclusions
+            or "indexer" in overrides or "indexer" in exclusions):
+        return "indexer.wq"
+    if "indexer_fp8" in overrides or "indexer_fp8" in exclusions:
+        return "indexer_fp8"
+    return "indexer.wq"
+
+
+def _prolog_port_formats(quant) -> tuple[tuple[str, str, str], tuple[str, str, str]]:
+    qa_w = quant.format_for("mla.q_a")
+    qb_w = quant.format_for("mla.q_b")
+    kva_w = quant.format_for("mla.kv_a")
+    qa_act = compute_dtype_for(quant, "mla.q_a")[1]
+    qb_act = compute_dtype_for(quant, "mla.q_b")[1]
+    kva_act = compute_dtype_for(quant, "mla.kv_a")[1]
+    return (qa_w, qb_w, kva_w), (qa_act, qb_act, kva_act)
+
+
 def validate(*, plan, parallel, model, quant, lowering_passes,
              cache_layout=None, cache_group_size=CACHE_GROUP_SIZE):
     from .mla_prolog_packed import (
@@ -84,19 +107,21 @@ def validate(*, plan, parallel, model, quant, lowering_passes,
     packed = cache_layout == LAYOUT
     if cache_layout not in (None, LAYOUT) or (packed and quant.kv_dtype != "int8"):
         raise ModelingError("mla_prolog_v3_cache_layout_dtype_mismatch")
+    w_ports, act_ports = _prolog_port_formats(quant)
+    if len(set(w_ports)) != 1 or len(set(act_ports)) != 1:
+        raise ModelingError("mla_prolog_v3_projection_port_precision_mismatch")
+    proj_w, proj_act = w_ports[0], act_ports[0]
     if packed:
         # DCP keeps one rank-owned row slice; it does not change the C8 row ABI.
         view(plan.kv_lora_rank, plan.qk_rope_head_dim, cache_group_size)
-        if quant.format_for("mla") not in SUPPORTED_QUERY_FORMATS:
-            raise ModelingError("mla_prolog_packed_requires_declared_projection_operands")
-        if compute_dtype_for(quant, "mla")[1] != quant.format_for("mla"):
+        if proj_w not in SUPPORTED_QUERY_FORMATS or proj_act != proj_w:
             raise ModelingError("mla_prolog_packed_requires_declared_projection_operands")
     if (plan.mla_variant != "latent_mla" or plan.cache_kind != "dense"
             or plan.qk_rope_head_dim <= 0
             or parallel.cp < 1 or parallel.pcp < 1
             or model.activation_dtype != "bf16"
             or (quant.kv_dtype not in BF16_CACHE_DTYPES and not packed)
-            or quant.format_for("mla") not in {"bf16", "int8", "fp8_e4m3"}):
+            or proj_w not in {"bf16", "int8", "fp8_e4m3"}):
         raise ModelingError("mla_prolog_v3_declared_operand_domain_unsupported")
     # The V3/V4 prolog owns one fused Q-A reduction; its source kernel is
     # admitted only for the two declared LoRA ranks.
@@ -105,12 +130,12 @@ def validate(*, plan, parallel, model, quant, lowering_passes,
         # A direct-Q plan has no Q-LoRA prolog at all; its own builder raises
         # the direct-Q boundary instead of this rank guard.
         raise ModelingError("mla_prolog_v3_query_lora_rank_unsupported")
-    projection_activation = compute_dtype_for(quant, "mla")[1]
-    if projection_activation != model.activation_dtype:
+    if proj_act != model.activation_dtype:
         if "activation_quantization" not in lowering_passes:
             raise ModelingError("mla_prolog_v3_quantized_operands_require_activation_quantization")
+        idx_q_cat = _indexer_q_category(quant)
         if ((plan.indexer or plan.owns_topk or plan.index_query_per_layer)
-                and compute_dtype_for(quant, "indexer_fp8")[1] != projection_activation):
+                and compute_dtype_for(quant, idx_q_cat)[1] != proj_act):
             # The selected source exposes the same quantized normalized query
             # and scales to q_b and index_q. A BF16 indexer needs a different
             # externally visible producer and therefore another source domain.
@@ -120,7 +145,8 @@ def validate(*, plan, parallel, model, quant, lowering_passes,
 def _native_kind(packed, quant):
     from .mla_prolog_packed import NATIVE_KIND_V3, NATIVE_KIND_V4, MXFP8_QUERY_FORMAT
     del packed
-    if quant.format_for("mla") == MXFP8_QUERY_FORMAT:
+    w_ports, _ = _prolog_port_formats(quant)
+    if all(fmt == MXFP8_QUERY_FORMAT for fmt in w_ports):
         return NATIVE_KIND_V4
     return NATIVE_KIND_V3
 
@@ -181,7 +207,7 @@ def declare(ops, *, prefix, plan, model, parallel, quant, tokens, members,
             "do_rope": do_rope,
             "parallel_cp": int(parallel.cp),
             "query_quant_mode": (MXFP8_QUERY_QUANT_MODE
-                                 if quant.format_for("mla") == MXFP8_QUERY_FORMAT
+                                 if qb["activation_format"] == MXFP8_QUERY_FORMAT
                                  else BF16_QUERY_QUANT_MODE),
         },
         implementation={

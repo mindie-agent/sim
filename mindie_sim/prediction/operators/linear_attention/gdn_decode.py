@@ -15,7 +15,7 @@ from dataclasses import replace
 import math
 
 from mindie_sim.catalog.attention_common import AttentionResult
-from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.common import ModelingError, dtype_bytes
 from mindie_sim.schema.tensors import TensorLayout, TensorValue
 from ...graph import GraphPolicy
 from ...lowering import Builder
@@ -92,8 +92,10 @@ def _lower_convolution(b, tensors, *, conv_input, deps, views, active, active_ro
                                     output="causal_cache_indices").narrow(1, 0, 1)
     cache_indices = tensors.contiguous(cache_indices, "state_indices_contiguous",
                                        reason="_normalize_causal_cache_indices.contiguous")
+    conv_elem_bytes = int(dtype_bytes(conv_dtype))
     state_write_bytes = sum(
-        (2 + view.q_len if speculative else plan.conv_kernel - 1) * width * 2
+        ((plan.conv_kernel - 1 + max(0, view.q_len - 1)) if speculative else (plan.conv_kernel - 1))
+        * width * conv_elem_bytes
         for view in active)
     conv_deps = tuple(dict.fromkeys((conv_input.producer, cache_indices.producer)))
     conv_views, cursor = [], 0
@@ -216,7 +218,8 @@ def _lower_recurrence(b, tensors, *, decode_core, values, gate_values, views,
         if use_recover_ssm:
             updated_scan = rewrite_gdn_analytical_scan(
                 updated_scan, active_views=active, heads=heads, dk=dk, dv=dv,
-                state_dtype=plan.recurrent_state_dtype, kg_dtype=model.activation_dtype)
+                state_dtype=plan.recurrent_state_dtype, kg_dtype=model.activation_dtype,
+                attention_kind="gdn")
         b.ops[-1] = updated_scan
     else:
         raise ModelingError("gdn_decode_recurrent_implementation_unknown:" + recurrent_implementation)
@@ -399,18 +402,19 @@ def lower(*, prefix, plan, views, stage, deps, model, parallel, mode,
     dk, dv = plan.linear_key_head_dim or plan.linear_head_dim, plan.linear_head_dim
     if heads % keys:
         raise ModelingError("gdn_decode_requires_integer_value_to_key_head_ratio")
+    from mindie_sim.prediction.projections import gdn_input_projections
+
     width, value_width = 2 * keys * dk + heads * dv, heads * dv
-    qkvz = b.matrix("linear_qkvz", (deps,), tokens, width + value_width, model.hidden_size, category="gdn.qkvz")
-    ba = b.matrix("linear_beta_alpha", (deps,), tokens, 2 * heads, model.hidden_size, category="gdn.beta_alpha")
-    projection = tensors.result(qkvz, (tokens, width + value_width))
-    gates = tensors.result(ba, (tokens, 2 * heads))
-    gate_inputs = [tensors.contiguous(gates.narrow(1, index * heads, heads),
-                                     name + "_contiguous", reason="gdn_split_ba.contiguous")
-                   for index, name in enumerate(("beta", "alpha"))]
+    conv_view, z_view, (beta_view, alpha_view) = gdn_input_projections(
+        b, tensors, deps=deps, tokens=tokens, hidden=model.hidden_size,
+        conv_width=width, value_width=value_width, heads=heads,
+    )
+    gate_inputs = [tensors.contiguous(view, name + "_contiguous", reason="gdn_split_ba.contiguous")
+                   for view, name in ((beta_view, "beta"), (alpha_view, "alpha"))]
     zero = b.work("core_output_zero", (deps,), (tokens, heads, dv),
                   vector=tokens * value_width, write=tokens * value_width * 2,
                   family="tensor_fill", dtype="bf16")
-    conv_input = tensors.contiguous(projection.narrow(0, 0, core_tokens).narrow(1, 0, width),
+    conv_input = tensors.contiguous(conv_view.narrow(0, 0, core_tokens),
                                     "convolution_input_contiguous", reason="causal_conv1d_update.contiguous")
     conv = _lower_convolution(
         b, tensors, conv_input=conv_input, deps=deps, views=views, active=active,
@@ -444,7 +448,7 @@ def lower(*, prefix, plan, views, stage, deps, model, parallel, mode,
     # gdn.py flattens token and head axes before norm. This crosses the
     # QKVZ row gap for multi-token/multi-head z and needs a materialization;
     # singleton/view-compatible layouts remain free through TensorLowering.
-    gate = projection.narrow(1, width, value_width)
+    gate = z_view
     gate = tensors.reshape(gate, (tokens * heads, dv), name="z_norm_materialize")
     normalized = b.vector(
         "linear_output_norm_gate", (copied.producer, gate.producer), tokens * value_width,

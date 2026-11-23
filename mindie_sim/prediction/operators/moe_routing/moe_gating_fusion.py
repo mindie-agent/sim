@@ -34,6 +34,12 @@ from dataclasses import dataclass, replace
 
 from mindie_sim.catalog.ops import vector_op
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.operators import (
+    KernelBinding,
+    OwnerMemoryResidency,
+    OwnerScheduleSpec,
+    SerialPhaseSpec,
+)
 
 from mindie_sim.prediction.mechanism import PlannedRecipe
 from mindie_sim.prediction.sharding.ffn_rules import (
@@ -85,6 +91,12 @@ GATING_EXPERT_TOPK_CYCLES = 355
 GATING_RENORM_CYCLES = 420
 GATING_GROUP_EXPERT_CYCLES = 0.5
 GATING_TOPK_EXPERT_CYCLES = 0.375
+GATING_SOFTMAX_PROLOGUE_CYCLES = 4800
+GATING_SOFTMAX_REDUCE_CYCLES = 420
+GATING_SOFTMAX_EXPERT_CYCLES = 0.45
+GATING_SOFTMAX_WAVE_STAGES = (
+    "logits_load", "softmax_reduce", "expert_topk", "renorm_store",
+)
 MS_PER_SECOND = 1000
 
 
@@ -124,6 +136,90 @@ def _group_limited(op) -> bool:
             and bool(meta.get("noaux_tc")))
 
 
+def _general_softmax_topk(op) -> bool:
+    """General (non-noaux_tc) MoE gating top-k eligible for row-wave ownership."""
+    meta = dict(op.metadata)
+    if meta.get("selection_mode") == CONTRACT_HASH or meta.get("hash_table"):
+        return False
+    return (
+        int(meta.get("num_experts", 0) or 0) > 0
+        and int(meta.get("top_k", 0) or 0) > 0
+        and not bool(meta.get("noaux_tc"))
+    )
+
+
+def _general_wave_cycles(meta, share=1.0):
+    experts = int(meta.get("num_experts", 0) or 0)
+    share = float(share)
+    return (
+        GATING_LOGITS_BIAS_CYCLES,
+        GATING_SOFTMAX_REDUCE_CYCLES + GATING_SOFTMAX_EXPERT_CYCLES * experts * share,
+        GATING_EXPERT_TOPK_CYCLES + GATING_TOPK_EXPERT_CYCLES * experts * share,
+        GATING_RENORM_CYCLES,
+    )
+
+
+def _gating_owner_schedule(
+    op, geometry, *, tokens: int, waves: int, stage_names: tuple[str, ...],
+    read: float, write: float, logical_vector: float, aiv_units: int,
+) -> OwnerScheduleSpec:
+    active = max(1, min(int(tokens), int(aiv_units))) if tokens > 0 else 0
+    ub_raw = dict(getattr(geometry, "buffers", ())).get("ub")
+    ub_cap = int(ub_raw) if ub_raw is not None else 0
+    meta = dict(op.metadata)
+    experts = max(1, int(meta.get("num_experts", 1) or 1))
+    ub_est = max(experts * SELECTED_WEIGHT_BYTES * 2, SELECTED_WEIGHT_BYTES)
+    ub_live = min(ub_cap, ub_est) if ub_cap > 0 else ub_est
+    per_owner_read = read / float(max(1, active))
+    per_owner_write = write / float(max(1, active))
+    per_stage_vec = logical_vector / float(max(1, active * len(stage_names)))
+    phases = []
+    for idx, name in enumerate(stage_names):
+        if idx == 0:
+            phases.append(SerialPhaseSpec(name, "mte2", per_owner_read, "bytes"))
+        elif idx == len(stage_names) - 1:
+            phases.append(SerialPhaseSpec(name, "mte3", per_owner_write, "bytes"))
+        else:
+            phases.append(SerialPhaseSpec(name, "vec_reduce", per_stage_vec, "op"))
+    return OwnerScheduleSpec(
+        owner_kind="aiv",
+        tiling_strategy="token_row_waves",
+        parallel_axis="token_rows",
+        work_tiles=max(0, int(tokens)),
+        launched_owners=active,
+        active_owners=active,
+        total_owners=max(1, int(aiv_units)),
+        max_tiles_per_owner=max(1, int(waves)) if tokens > 0 else 0,
+        residency=OwnerMemoryResidency(
+            ub_live_bytes=ub_live,
+            ub_capacity_bytes=ub_cap,
+            owner_mte2_bytes=per_owner_read,
+            owner_mte3_bytes=per_owner_write,
+            shared_hbm_read_bytes=read,
+            shared_hbm_write_bytes=write,
+            l2_admission_mode="reuse",
+        ),
+        serial_phases=tuple(phases),
+        dispatch_envelope_source="P15_dispatch",
+    )
+
+
+def _gating_kernel_binding(op, *, group_limited: bool) -> KernelBinding:
+    meta = dict(op.metadata)
+    native = str(meta.get("native_kind") or (
+        "aclnnMoeGatingTopK" if group_limited else SOFTMAX_NATIVE_KIND
+    ))
+    return KernelBinding(
+        kernel_id=native,
+        backend="CANN",
+        arch_family="A5",
+        submodule="moe_gating",
+        macro_module="moe_routing",
+        readiness="shipping",
+        recipe_id="moe_gating_topk",
+    )
+
+
 def _wave_cycles(meta, share=1.0):
     """Serial UB cycles of one 64-token wave, split over its declared stages.
 
@@ -143,36 +239,57 @@ def _wave_cycles(meta, share=1.0):
     )
 
 
+def _try_clock_hz(context, geometry) -> float | None:
+    for owner in (
+        getattr(context, "compute_arch", None),
+        getattr(context, "datapath", None),
+        getattr(geometry, "compute_arch", None),
+    ):
+        val = getattr(owner, "clock_hz", None)
+        if val is not None and not isinstance(val, bool) and float(val) > 0.0:
+            return float(val)
+    return None
+
+
 def build_moe_gating_topk(op, geometry):
-    """A5 group-limited gating row waves; otherwise the registered vector plan."""
-    from mindie_sim.prediction.physical_recipe_base import build_plan, work_from_op
+    """Row-wave owner model for group-limited and general MoE gating top-k."""
+    from mindie_sim.prediction.physical_recipe_base import build_plan
     from mindie_sim.prediction.program import KernelProgram, PipelineProgram, Stage
     from mindie_sim.prediction.mechanism import OperatorPlan, Work
     from mindie_sim.prediction.operators.vector.vector_pipeline import AIVTiledVectorAndGatherRecipe
-    if not (_a5_row_wave(geometry) and _group_limited(op)):
-        # A2/A3 and non-group gating keep their existing Class D vector recipe.
+    is_group = _group_limited(op)
+    is_general = _general_softmax_topk(op)
+    if not (_a5_row_wave(geometry) and (is_group or is_general)):
+        # A2/A3 and hash/unstructured routing keep their Class D vector recipe.
         return build_plan(AIVTiledVectorAndGatherRecipe(), op, geometry)
-    base = work_from_op(op)
     meta = dict(op.metadata)
-    tokens = int(meta.get("row_tokens", op.local_shape[0]))
-    waves = max(1, -(-tokens // GATING_AIV_UNITS))
+    aiv_units = max(1, int((getattr(geometry, "resource_units", {}) or {}).get("vector", GATING_AIV_UNITS)))
+    wave_width = GATING_AIV_UNITS if is_group else aiv_units
+    tokens = max(1, int(meta.get("row_tokens", op.local_shape[0])))
+    waves = max(1, -(-tokens // wave_width))
     read = float(op.hbm_bytes) - float(op.mte3_bytes)
     write = float(op.mte3_bytes)
     logical_vector = float(op.vector_ops)
-    # One serial UB pipeline is issued per covered token on its own AIV; each
-    # stage's instruction recurrence is modeled as serial stage latency while
-    # conserving ``op.vector_ops`` across plan, bound context and Engine trace.
+    stage_names = GATING_WAVE_STAGES if is_group else GATING_SOFTMAX_WAVE_STAGES
+    prologue_cycles = GATING_PROLOGUE_DRAIN_CYCLES if is_group else GATING_SOFTMAX_PROLOGUE_CYCLES
+    cycle_fn = _wave_cycles if is_group else _general_wave_cycles
     work = Work(resources={"hbm": read + write, "mte2": read,
                            "mte3": write, "vector": logical_vector})
+    owner_schedule = _gating_owner_schedule(
+        op, geometry, tokens=tokens, waves=waves, stage_names=stage_names,
+        read=read, write=write, logical_vector=logical_vector, aiv_units=wave_width,
+    )
+    kernel_binding = _gating_kernel_binding(op, group_limited=is_group)
 
     def program(context):
-        clock_ms = _require_clock_hz(context, geometry) / MS_PER_SECOND
+        clock_hz = _require_clock_hz(context, geometry) if is_group else _try_clock_hz(context, geometry)
+        clock_ms = (clock_hz / MS_PER_SECOND) if clock_hz is not None else None
         read_name = context.physical_role("mte2_aiv")
         read_name = (read_name if read_name in context.resource_names
                      else context.read_pipe(aiv=0))
         stage_roles = tuple(role for role in (read_name, "vector", "mte3")
                             if role in context.resource_names)
-        stage_count = len(GATING_WAVE_STAGES)
+        stage_count = len(stage_names)
 
         def placement(active):
             units = tuple(range(active))
@@ -180,56 +297,80 @@ def build_moe_gating_topk(op, geometry):
                     for role in stage_roles}
 
         def tile(wave):
-            covered = min(GATING_AIV_UNITS, tokens - wave * GATING_AIV_UNITS)
-            share = covered / GATING_AIV_UNITS
+            covered = min(wave_width, tokens - wave * wave_width)
+            share = covered / wave_width
             token_share = covered / tokens
             loads = read * token_share
             stores = write * token_share
-            cycles = _wave_cycles(meta, share)
+            cycles = cycle_fn(meta, share)
             stage_vector = (logical_vector * token_share) / stage_count
             owned = placement(covered)
             stages = []
             previous = ()
-            for index, name in enumerate(GATING_WAVE_STAGES):
+            for index, name in enumerate(stage_names):
                 resources = {"vector": stage_vector}
                 if index == 0:
                     resources.update({"hbm": loads, "mte2": loads})
                 if index == stage_count - 1:
                     resources.update({"hbm": stores, "mte3": stores})
+                lat = (cycles[index] / clock_ms) if clock_ms is not None else 0.0
                 stages.append(Stage(
                     name, context.bind(Work(resources=resources)),
-                    latency=cycles[index] / clock_ms,
-                    after=previous, placement=owned))
+                    latency=lat, after=previous, placement=owned))
                 previous = (name,)
             return tuple(stages)
 
+        if clock_ms is not None:
+            return KernelProgram((
+                Stage("kernel_prologue_drain",
+                      latency=prologue_cycles / clock_ms),
+                Stage("row_waves", after=("kernel_prologue_drain",),
+                      program=PipelineProgram(waves, GATING_PIPELINE_SLOTS, tile)),
+            ))
         return KernelProgram((
-            Stage("kernel_prologue_drain",
-                  latency=GATING_PROLOGUE_DRAIN_CYCLES / clock_ms),
-            Stage("row_waves", after=("kernel_prologue_drain",),
+            Stage("row_waves",
                   program=PipelineProgram(waves, GATING_PIPELINE_SLOTS, tile)),
         ))
 
     return OperatorPlan(work, program, {
-        "native_kind": meta.get("native_kind"),
+        "native_kind": meta.get("native_kind") or kernel_binding.kernel_id,
         "row_waves": waves,
-        "row_program": {"aiv_units": min(tokens, GATING_AIV_UNITS),
-                        "wave_stages": GATING_WAVE_STAGES,
-                        "wave_cycles": _wave_cycles(meta),
+        "owner_schedule": owner_schedule.to_dict(),
+        "kernel_binding": kernel_binding.to_dict(),
+        "row_program": {"aiv_units": min(tokens, wave_width),
+                        "wave_stages": stage_names,
+                        "wave_cycles": cycle_fn(meta),
                         "effective_groups": _effective_groups(meta),
-                        "prologue_drain_cycles": GATING_PROLOGUE_DRAIN_CYCLES},
+                        "prologue_drain_cycles": prologue_cycles},
     })
 
 
 @dataclass(frozen=True)
 class ScopedGatingRecipe(PlannedRecipe):
-    """Register the A5 row planner without rebinding other gating domains."""
+    """Register the A5 row planner for both group-limited and general top-k gating."""
 
     def prepare(self, op, geometry):
-        if not (_a5_row_wave(geometry) and _group_limited(op)):
+        is_group = _group_limited(op)
+        is_general = _general_softmax_topk(op)
+        if not (_a5_row_wave(geometry) and (is_group or is_general)):
             from mindie_sim.prediction.physical_recipe_registry import VECTOR
             return op, VECTOR
-        return super().prepare(op, geometry)
+        bound, plan = super().prepare(op, geometry)
+        meta = dict(op.metadata)
+        aiv_units = max(1, int((getattr(geometry, "resource_units", {}) or {}).get("vector", GATING_AIV_UNITS)))
+        wave_width = GATING_AIV_UNITS if is_group else aiv_units
+        tokens = max(1, int(meta.get("row_tokens", op.local_shape[0])))
+        waves = max(1, -(-tokens // wave_width))
+        stage_names = GATING_WAVE_STAGES if is_group else GATING_SOFTMAX_WAVE_STAGES
+        read = float(op.hbm_bytes) - float(op.mte3_bytes)
+        write = float(op.mte3_bytes)
+        owner_schedule = _gating_owner_schedule(
+            op, geometry, tokens=tokens, waves=waves, stage_names=stage_names,
+            read=read, write=write, logical_vector=float(op.vector_ops), aiv_units=wave_width,
+        )
+        kernel_binding = _gating_kernel_binding(op, group_limited=is_group)
+        bound = replace(bound, owner_schedule=owner_schedule, kernel_binding=kernel_binding)
+        return bound, plan
 
 
 @dataclass(frozen=True)

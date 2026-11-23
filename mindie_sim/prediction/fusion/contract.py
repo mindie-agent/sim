@@ -500,7 +500,48 @@ def _contract(graph: TypedGraph, op: OpNode) -> ContractCheck:
         if not values or outs[0].shape[:-1] != values[0].shape[:-1] or (
                 outs[0].shape[-1] * 2 != values[0].shape[-1]):
             _fail(bad, "shape_or_layout_mismatch")
-    elif kind == "grouped_matmul":
+    elif kind == "grouped_matmul" or kind in CUBE_KINDS:
+        group_sizes = _check_grouped_and_cube_contracts(op, kind, values, outs, bad)
+    elif kind not in STATE_KINDS:
+        _fail(bad, "unknown_shape_contract")
+    policy = NUMERICAL_EXACT if op.numerical_policy == NUMERICAL_EXACT \
+        and not bad and not relaxed else "relaxed"
+    return ContractCheck(tuple(bad), policy, reduction_width, group_sizes)
+
+
+_CONTRACT_FLOAT_DTYPES = frozenset({"bf16", "bfloat16", "fp16", "float16", "fp32", "float32"})
+_CONTRACT_QUANT_DTYPES = frozenset({
+    "int8", "int4", "w8a8", "w4a8", "fp8", "fp8_e4m3", "fp8_e5m2",
+    "mxfp8", "mxfp4", "fp4", "fp4_e2m1",
+})
+
+
+def _validate_matrix_precision_ports(
+    op: OpNode, values: list[TensorValue], outs: list[TensorValue], bad: list[str],
+) -> None:
+    if len(values) < 2 or not outs:
+        return
+    act_param = str(op.param("activation_format") or "").strip().lower()
+    wt_param = str(op.param("weight_format") or "").strip().lower()
+    out_param = str(op.param("output_format") or "").strip().lower()
+    val0_dt = str(values[0].dtype or "").strip().lower()
+    val1_dt = str(values[1].dtype or "").strip().lower()
+    out_dt = str(outs[0].dtype or "").strip().lower()
+    for declared_dt, port_dt in ((act_param, val0_dt), (wt_param, val1_dt), (out_param, out_dt)):
+        if declared_dt and port_dt:
+            if (declared_dt in _CONTRACT_FLOAT_DTYPES) != (port_dt in _CONTRACT_FLOAT_DTYPES):
+                if declared_dt in _CONTRACT_QUANT_DTYPES or port_dt in _CONTRACT_QUANT_DTYPES:
+                    _fail(bad, "precision_abi_mismatch")
+    if act_param in _CONTRACT_FLOAT_DTYPES and wt_param in _CONTRACT_FLOAT_DTYPES:
+        if op.param("activation_scale_format") and str(op.param("linear_method") or "") in {"", "none", "dense"}:
+            _fail(bad, "precision_abi_mismatch")
+
+
+def _check_grouped_and_cube_contracts(
+    op: OpNode, kind: str, values: list[TensorValue], outs: list[TensorValue], bad: list[str],
+) -> tuple[int, ...] | None:
+    group_sizes: tuple[int, ...] | None = None
+    if kind == "grouped_matmul":
         rows = op.param("group_sizes")
         group_list = op.param("group_list")
         if rows is None or group_list is None:
@@ -519,16 +560,14 @@ def _contract(graph: TypedGraph, op: OpNode) -> ContractCheck:
                 _fail(bad, "grouped_matmul_group_rows_mismatch")
             if not isinstance(group_list, (tuple, list)) or len(group_sizes) != len(group_list):
                 _fail(bad, "grouped_matmul_group_list_mismatch")
+        _validate_matrix_precision_ports(op, values, outs, bad)
     elif kind in CUBE_KINDS:
         if len(values) < 2 or any(len(v.shape) != 2 for v in values[:2]) or (
                 values[0].shape[-1] != values[1].shape[0]) or (
                 outs[0].shape != (values[0].shape[0], values[1].shape[1])):
             _fail(bad, "shape_or_layout_mismatch")
-    elif kind not in STATE_KINDS:
-        _fail(bad, "unknown_shape_contract")
-    policy = NUMERICAL_EXACT if op.numerical_policy == NUMERICAL_EXACT \
-        and not bad and not relaxed else "relaxed"
-    return ContractCheck(tuple(bad), policy, reduction_width, group_sizes)
+        _validate_matrix_precision_ports(op, values, outs, bad)
+    return group_sizes
 
 
 def _cube_operands(graph: TypedGraph, op: OpNode, tile_rows: int,

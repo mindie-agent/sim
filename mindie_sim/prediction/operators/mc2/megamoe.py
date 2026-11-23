@@ -656,6 +656,31 @@ def _attach_absorbed_structure_groups(ops, removed_ids, target_id, mega_op):
     return rebuilt
 
 
+_FLOAT_DTYPE_NAMES = frozenset({"bf16", "bfloat16", "fp16", "float16", "fp32", "float32"})
+
+
+def _matrix_mxfp_eligible(meta: Mapping[str, Any]) -> bool:
+    comp = str(meta.get("compute_format") or "").lower()
+    wfmt = str(meta.get("weight_format") or "").lower()
+    afmt = str(meta.get("activation_format") or "").lower()
+    if wfmt in _FLOAT_DTYPE_NAMES or afmt in _FLOAT_DTYPE_NAMES:
+        return False
+    mx_act = (
+        meta.get("activation_group_size") == MX_GROUP_SIZE
+        and meta.get("activation_scale_format") in {"fp8_e8m0", "e8m0"}
+    )
+    return mx_act and (
+        comp in {"fp8_e4m3", "mxfp4", "fp4_e2m1"}
+        or wfmt in {"mxfp8", "mxfp4", "fp8_e4m3", "fp4_e2m1"}
+    )
+
+
+def _matrix_int8_eligible(meta: Mapping[str, Any]) -> bool:
+    wfmt = str(meta.get("weight_format") or "").lower()
+    afmt = str(meta.get("activation_format") or "").lower()
+    return afmt == "int8" and wfmt in {"int8", "int4", "w4a8"}
+
+
 def try_lower_fused_frame(
     ops, by_id, selected, runtime, prefix, tokens, width, top_k, received_assignments,
     ep, dtype, pack, dispatch, combine, unpack, pack_quant,
@@ -664,18 +689,13 @@ def try_lower_fused_frame(
     """Lower a complete connected MoE dispatch->GMM1->act->GMM2->combine frame."""
     e_up, e_act, e_down = by_id.get(prefix + ".expert_up"), by_id.get(prefix + ".expert_act"), by_id.get(prefix + ".expert_down")
     up_meta = dict(e_up.metadata) if e_up is not None else {}
-    e_comp = str(up_meta.get("compute_format") or "").lower()
-    e_wfmt = str(up_meta.get("weight_format") or "").lower()
-    e_afmt = str(up_meta.get("activation_format") or "").lower()
-    mx_act = (
-        up_meta.get("activation_group_size") == MX_GROUP_SIZE
-        and up_meta.get("activation_scale_format") in {"fp8_e8m0", "e8m0"}
+    down_meta = dict(e_down.metadata) if e_down is not None else {}
+    mxfp_eligible = _matrix_mxfp_eligible(up_meta) and _matrix_mxfp_eligible(down_meta)
+    int8_eligible = (
+        allow_int8_arch22
+        and _matrix_int8_eligible(up_meta)
+        and _matrix_int8_eligible(down_meta)
     )
-    mxfp_eligible = mx_act and (
-        e_comp in {"fp8_e4m3", "mxfp4", "fp4_e2m1"}
-        or e_wfmt in {"mxfp8", "mxfp4", "fp8_e4m3", "fp4_e2m1"}
-    )
-    int8_eligible = allow_int8_arch22 and e_afmt == "int8" and e_wfmt in {"int8", "int4", "w4a8"}
     if not (e_up is not None and e_act is not None and e_down is not None
             and e_up.deps == (dispatch.op_id,) and e_act.deps == (e_up.op_id,)
             and e_down.deps == (e_act.op_id,) and combine.deps == (e_down.op_id,)
@@ -694,15 +714,26 @@ def try_lower_fused_frame(
         else FUSED_MC2_ROUTED_MODE
     )
     moe_inter = int(e_down.local_shape[-1])
-    down_meta = dict(e_down.metadata)
     w13_b = float(up_meta.get("packed_weight_bytes") or max(0.0, e_up.mte2_bytes - received_assignments * width))
     w2_b = float(down_meta.get("packed_weight_bytes") or max(0.0, e_down.mte2_bytes - received_assignments * moe_inter))
     sh_ops = [item for item in ops if item.op_id.startswith(prefix + ".shared.")]
     join_op = by_id.get(prefix + ".join")
     sh_up, sh_down = by_id.get(prefix + ".shared.gate_up"), by_id.get(prefix + ".shared.down")
+    sh_up_meta = dict(sh_up.metadata) if sh_up is not None else {}
+    sh_down_meta = dict(sh_down.metadata) if sh_down is not None else {}
+    shared_precision_compatible = (
+        mxfp_eligible
+        and _matrix_mxfp_eligible(sh_up_meta)
+        and _matrix_mxfp_eligible(sh_down_meta)
+        and str(sh_up_meta.get("activation_format") or "").lower()
+        == str(up_meta.get("activation_format") or "").lower()
+        and str(sh_down_meta.get("activation_format") or "").lower()
+        == str(down_meta.get("activation_format") or "").lower()
+    )
     has_latent_moe = (by_id.get(prefix + ".latent_down") is not None or by_id.get(prefix + ".latent_up") is not None)
     fuse_shared = (
         fused_lvl == FUSED_MC2_SHARED_MODE and not has_latent_moe
+        and shared_precision_compatible
         and bool(sh_ops) and sh_up is not None and sh_down is not None and join_op is not None
         and len(join_op.deps) == 2 and unpack.op_id in join_op.deps
         and any(dep.startswith(prefix + ".shared.") for dep in join_op.deps)

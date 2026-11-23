@@ -34,6 +34,30 @@ def recipes():
     return {}
 
 
+def _resolve_kda_f_quant(quant):
+    """Derive ``kda.f`` representation from declared ``(kda.f_a, kda.f_b)`` factors.
+
+    When a mixed checkpoint declares ``kda.f_a`` and ``kda.f_b`` as BF16 without
+    a raw ``kda.f`` tensor, the load-time composition ``F = F_b @ F_a`` is BF16
+    and must not be shadowed by a quantized generic ``kda`` default.
+    """
+    overrides = dict(quant.category_overrides)
+    if "kda.f" in overrides or "kda.f" in quant.exclusions:
+        return quant
+    fa_fmt = quant.for_category("kda.f_a").format_for("kda.f_a")
+    fb_fmt = quant.for_category("kda.f_b").format_for("kda.f_b")
+    if fa_fmt == "bf16" and fb_fmt == "bf16":
+        if "kda.f_a" in overrides:
+            new_overrides = (*quant.category_overrides, ("kda.f", overrides["kda.f_a"]))
+            return replace(
+                quant,
+                exclusions=tuple(dict.fromkeys((*quant.exclusions, "kda.f"))),
+                category_overrides=new_overrides,
+            )
+        return replace(quant, exclusions=tuple(dict.fromkeys((*quant.exclusions, "kda.f"))))
+    return quant
+
+
 def _validate(plan, model, tp):
     heads = plan.linear_value_heads or plan.linear_heads
     keys = plan.linear_key_heads or plan.linear_heads
@@ -41,7 +65,7 @@ def _validate(plan, model, tp):
     if (heads != keys or heads % tp or plan.gate_rank
             or dk != plan.linear_head_dim or model.activation_dtype != 'bf16'):
         raise ModelingError('kda_mixed_projection_requires_integral_equal_heads_and_full_rank_bf16_gate')
-    quant = projection_quant(model.quant, plan)
+    quant = _resolve_kda_f_quant(projection_quant(model.quant, plan))
     if len({_representation(quant, 'kda.' + role) for role in ('q', 'k', 'v')}) != 1:
         raise ModelingError('kda_qkv_group_requires_one_operand_representation')
     if any(quant.for_category('kda.' + role).format_for('kda.' + role) != 'bf16'
@@ -81,11 +105,18 @@ def lower(b, tensors, *, plan, tokens, hidden, key_width, value_width, heads, dk
     """Return QKV producers, output gate, FP32 beta, raw decay, and join event."""
     # The three hidden-input groups use the same K dimension. Composition is
     # performed on weights at load time, so online F is one hidden->decay GEMM.
-    bfg = input_projections(
-        b, name='linear_bfg', deps=deps, tokens=tokens, hidden=hidden,
-        roles=(('b', 'linear_beta', heads, 'kda.b'),
-               ('f', 'linear_decay', heads * dk, 'kda.f'),
-               ('g', 'linear_gate', value_width, 'kda.g')), packed=True)
+    saved_quant = b.quant
+    b.quant = _resolve_kda_f_quant(saved_quant)
+    try:
+        bfg = input_projections(
+            b, name='linear_bfg', deps=deps, tokens=tokens, hidden=hidden,
+            roles=(('b', 'linear_beta', heads, 'kda.b'),
+                   ('f', 'linear_decay', heads * dk, 'kda.f'),
+                   ('g', 'linear_gate', value_width, 'kda.g')), packed=True)
+    finally:
+        b.quant = saved_quant
+    if len({bfg['b'], bfg['f'], bfg['g']}) != 1:
+        raise ModelingError('kda_bfg_group_requires_one_operand_representation')
     bfg_id = bfg['b']
     b.ops[-1] = replace(b.ops[-1], stream='kda_bfg', metadata=b.ops[-1].metadata + (
         ('projection_group', ('b', 'f', 'g')), ('source', SOURCE),
@@ -95,6 +126,8 @@ def lower(b, tensors, *, plan, tokens, hidden, key_width, value_width, heads, dk
         roles=(('q', 'linear_q', key_width, 'kda.q'),
                ('k', 'linear_k', key_width, 'kda.k'),
                ('v', 'linear_v', value_width, 'kda.v')), packed=True)
+    if len({qkv['q'], qkv['k'], qkv['v']}) != 1:
+        raise ModelingError('kda_qkv_group_requires_one_operand_representation')
     matrix = b.ops.pop()
     # Quantize before attaching the BFG join: the input conversion overlaps
     # BFG, while the two matrix kernels are explicitly serialized in source.

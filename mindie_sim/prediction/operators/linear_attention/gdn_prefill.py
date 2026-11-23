@@ -672,7 +672,7 @@ def _lower_idle_pcp_peer(
         fusion_reason="arch35_gdn_idle_pcp_peer_sync",
         native_fusion_eligible=False,
     )
-    gate = tensors.reshape(projection.narrow(1, width, value_width), (tokens * heads, dv),
+    gate = tensors.reshape(projection, (tokens * heads, dv),
                            name="output_gate_reshape")
     gate = tensors.require(gate, "linear_output_norm_gate", "gate", name="output_gate_contiguous")
     normalized = b.vector(
@@ -786,27 +786,26 @@ def lower(*, prefix, plan, views, stage, deps, model, parallel, mode,
     keys = math.ceil((plan.linear_key_heads or plan.linear_heads) / tp)
     heads = math.ceil((plan.linear_value_heads or plan.linear_heads) / tp)
     dk, dv = plan.linear_key_head_dim or plan.linear_head_dim, plan.linear_head_dim
+    from mindie_sim.prediction.projections import gdn_input_projections
+
     width, value_width = 2 * keys * dk + heads * dv, heads * dv
     caller = (("caller_branch", "qkvz_ba_noninterleaved_non_spec"),)
-    qkvz = b.matrix("linear_qkvz", (deps,), tokens, width + value_width,
-                    model.hidden_size, category="gdn.qkvz", metadata=caller)
-    ba = b.matrix("linear_beta_alpha", (deps,), tokens, 2 * heads, model.hidden_size,
-                  category="gdn.beta_alpha", metadata=caller)
-    projection = tensors.result(qkvz, (tokens, width + value_width))
-    gates = tensors.result(ba, (tokens, 2 * heads))
-    gate_inputs = [tensors.contiguous(gates.narrow(1, index * heads, heads),
-                                     name + "_contiguous", reason="gdn_split_ba.contiguous")
-                   for index, name in enumerate(("beta", "alpha"))]
+    conv_view, z_view, (beta_view, alpha_view) = gdn_input_projections(
+        b, tensors, deps=deps, tokens=tokens, hidden=model.hidden_size,
+        conv_width=width, value_width=value_width, heads=heads, metadata=caller,
+    )
+    gate_inputs = [tensors.contiguous(view, name + "_contiguous", reason="gdn_split_ba.contiguous")
+                   for view, name in ((beta_view, "beta"), (alpha_view, "alpha"))]
     zero = b.work("core_output_zero", (deps,), (tokens, heads, dv),
                   vector=tokens * value_width, write=tokens * value_width * 2,
                   family="tensor_fill", dtype=model.activation_dtype)
     if actual == 0 and int(parallel.pcp) > 1:
         return _lower_idle_pcp_peer(
-            b, tensors, projection=projection, zero=zero, prefill=prefill,
+            b, tensors, projection=z_view, zero=zero, prefill=prefill,
             model=model, plan=plan, parallel=parallel, tokens=tokens, tp=tp,
             heads=heads, dk=dk, dv=dv, width=width, value_width=value_width,
         )
-    conv_input = tensors.contiguous(projection.narrow(0, 0, actual).narrow(1, 0, width),
+    conv_input = tensors.contiguous(conv_view.narrow(0, 0, actual),
                                     "convolution_input_contiguous",
                                     reason="causal_conv1d_fn.contiguous")
     padding_slots = tuple(index for index, view in enumerate(ordered) if view.padding)
@@ -864,7 +863,7 @@ def lower(*, prefix, plan, views, stage, deps, model, parallel, mode,
     copied = tensors.copy_into(output_value,
                                tensors.result(zero, (tokens, heads, dv)).narrow(0, 0, actual),
                                "core_output_copy")
-    gate = tensors.reshape(projection.narrow(1, width, value_width), (tokens * heads, dv),
+    gate = tensors.reshape(z_view, (tokens * heads, dv),
                            name="output_gate_reshape")
     gate = tensors.require(gate, "linear_output_norm_gate", "gate", name="output_gate_contiguous")
     normalized = b.vector(

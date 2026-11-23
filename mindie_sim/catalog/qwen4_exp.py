@@ -22,6 +22,7 @@
 """
 from __future__ import annotations
 
+from dataclasses import replace
 import math
 from typing import Any, Mapping
 
@@ -38,7 +39,13 @@ from mindie_sim.catalog.types import (
 from mindie_sim.catalog.weight_terms import WeightTerm, _ceil_div, _t
 from mindie_sim.schema.common import ModelingError, dtype_bytes
 from mindie_sim.schema.model import LayerPlan, ModelSpec
-from mindie_sim.schema.operators import OpSpec
+from mindie_sim.schema.operators import (
+    KernelBinding,
+    OpSpec,
+    OwnerMemoryResidency,
+    OwnerScheduleSpec,
+    SerialPhaseSpec,
+)
 from mindie_sim.schema.parallel import ParallelSpec
 
 ZERO = 0
@@ -51,8 +58,11 @@ FP32_BYTES = 4
 MX_GROUP = 32
 INT8_SCALE_BYTES = 4
 MXFP8_SCALE_BYTES = 1
+PLE_HBM_SECTOR_BYTES = 128
+PLE_OWNER_CAPACITY_DEFAULT = 64
 PLE_UVA_RECIPE = "ple_host_uva_lookup"
 PLE_QUANTIZED_FORMATS = frozenset({"int8", "mxfp8"})
+PLE_FLOAT_FORMATS = frozenset({"bf16", "bfloat16", "fp16", "float16", "fp32", "float32"})
 KERNEL_BLOCK_TOKENS = 128
 DEFAULT_PLE_CONV_KERNEL = 4
 DEFAULT_PLE_DIVISOR = 128
@@ -187,32 +197,57 @@ def ple_gate_terms_by_layer(model: ModelSpec) -> dict[int, list[WeightTerm]]:
     return by_layer
 
 
-def ple_lookup_format(model: Any, runtime: Any = None) -> str:
-    """Resolve the declared PLE table representation.
+def _table_marker_format(quant: Any) -> str | None:
+    """Resolve PLE table precision from checkpoint table markers, or None if undeclared."""
+    if quant is None:
+        return None
+    overrides = dict(getattr(quant, "category_overrides", ()) or ())
+    for role in ("ple_table", "engram_table"):
+        if role in overrides:
+            fields = dict(overrides[role])
+            wf = str(fields.get("weight_format", "") or "").lower().replace("-", "_")
+            if wf in PLE_FLOAT_FORMATS:
+                return "bf16"
+            if wf in {"mxfp8", "mx_fp8", "fp8_e4m3", "fp8"}:
+                sf = str(fields.get("scale_format", "") or getattr(quant, "scale_format", "") or "").lower()
+                return "mxfp8" if sf in {"fp8_e8m0", "ue8m0"} or "mx" in wf else "int8"
+            if wf in {"int8", "w8a8"}:
+                return "int8"
+    exclusions = set(getattr(quant, "exclusions", ()) or ())
+    if exclusions & {"ple_table", "engram_table", "ple"}:
+        return "bf16"
+    table_fmt = str(getattr(quant, "engram_table_format", "") or "").lower().replace("-", "_")
+    if table_fmt in PLE_FLOAT_FORMATS:
+        return "bf16"
+    if table_fmt in {"mxfp8", "mx_fp8", "fp8_e4m3", "fp8"}:
+        sf = str(getattr(quant, "scale_format", "") or "").lower()
+        return "mxfp8" if sf in {"fp8_e8m0", "ue8m0"} else "int8"
+    if table_fmt == "int8":
+        return "int8"
+    return None
 
-    A model whose quantization plan is MXFP8 keeps MXFP8 group-32 code/scales;
-    otherwise an active quantized-lookup declaration selects INT8; without one
-    the table stays BF16.  The declared runtime metadata only states *that* a
-    quantized lookup is active, never which weight format the model uses.
+
+def ple_lookup_format(model: Any, runtime: Any = None) -> str:
+    """Resolve the declared PLE table representation from table checkpoint markers.
+
+    A FLOAT table has two bytes per element and zero dequant work, including on
+    host offload.  Table markers take precedence over model-wide MX names.
     """
+    quant = getattr(model, "quant", None)
+    marker_fmt = _table_marker_format(quant)
+    if marker_fmt == "bf16":
+        return "bf16"
     metadata = dict(getattr(runtime, "metadata", ()) or ())
     declared = str(metadata.get("ple_lookup_format", "") or "")
     active = (declared in PLE_QUANTIZED_FORMATS
               or "ple_quantized_lookup" in tuple(
                   getattr(runtime, "lowering_passes", ()) or ()))
     if not active:
-        return "bf16"
-    quant = getattr(model, "quant", None)
-    if quant is not None:
-        name = str(getattr(quant, "name", "") or "").lower()
-        source = dict(getattr(quant, "source", ()) or ())
-        if ("mxfp8" in name
-                or "mxfp8" in str(source.get("quant_method", "") or "").lower()
-                or (int(getattr(quant, "activation_group_size", 0) or 0)
-                    == MX_GROUP
-                    and str(getattr(quant, "scale_format", "") or "")
-                    == "fp8_e8m0")):
-            return "mxfp8"
+        return marker_fmt if marker_fmt in PLE_QUANTIZED_FORMATS else "bf16"
+    if marker_fmt in PLE_QUANTIZED_FORMATS:
+        return marker_fmt
+    if declared in PLE_QUANTIZED_FORMATS:
+        return declared
     return "int8"
 
 
@@ -234,19 +269,183 @@ def _ple_scale_bytes(lookup_format: str) -> int:
     return MXFP8_SCALE_BYTES if lookup_format == "mxfp8" else INT8_SCALE_BYTES
 
 
-def _ple_read_bytes(hits_local: int, width: int, lookup_format: str) -> float:
-    """Owner read for one table: BF16 rows or quantized codes plus group scales."""
+def _ple_row_bytes(width: int, lookup_format: str) -> int:
     width = int(width)
     if lookup_format == "bf16":
-        return float(int(hits_local) * width * BF16_BYTES)
+        return width * BF16_BYTES
     scales = _ceil_div(width, MX_GROUP) * _ple_scale_bytes(lookup_format)
-    return float(int(hits_local) * (width + scales))
+    return width + scales
+
+
+def _ple_read_bytes(hits_local: int, width: int, lookup_format: str, *, sector_aligned: bool = False) -> float:
+    """Owner read for one table: BF16 rows or quantized codes plus group scales."""
+    row_bytes = _ple_row_bytes(width, lookup_format)
+    if sector_aligned and row_bytes > ZERO:
+        row_bytes = _round_up(row_bytes, PLE_HBM_SECTOR_BYTES)
+    return float(int(hits_local) * row_bytes)
+
+
+def _ple_lookup_owner_schedule(
+    hits_local: int,
+    read_bytes: float,
+    write_bytes: float,
+    index_ops: float,
+    dequant_ops: float,
+    row_bytes: int,
+) -> OwnerScheduleSpec:
+    owners = max(ONE, min(PLE_OWNER_CAPACITY_DEFAULT, max(ONE, int(hits_local))))
+    max_tiles = _ceil_div(max(ONE, int(hits_local)), owners)
+    per_owner_read = read_bytes / float(owners)
+    per_owner_write = write_bytes / float(owners)
+    phases = [
+        SerialPhaseSpec("index_address", "vec_alu", index_ops / float(owners), "op"),
+        SerialPhaseSpec("table_gather", "mte2", per_owner_read, "bytes"),
+    ]
+    if dequant_ops > ZERO_FLOAT:
+        phases.append(SerialPhaseSpec("table_dequant", "vec_alu", dequant_ops / float(owners), "op"))
+    phases.append(SerialPhaseSpec("activation_publish", "mte3", per_owner_write, "bytes"))
+    return OwnerScheduleSpec(
+        owner_kind="aiv",
+        tiling_strategy="lookup_row_owners",
+        parallel_axis="lookup_rows",
+        work_tiles=max(ONE, int(hits_local)),
+        launched_owners=owners,
+        active_owners=owners,
+        total_owners=PLE_OWNER_CAPACITY_DEFAULT,
+        max_tiles_per_owner=max_tiles,
+        residency=OwnerMemoryResidency(
+            ub_live_bytes=max(PLE_HBM_SECTOR_BYTES, max_tiles * max(ONE, row_bytes) * TWO),
+            ub_capacity_bytes=ZERO,
+            owner_mte2_bytes=per_owner_read,
+            owner_mte3_bytes=per_owner_write,
+            shared_hbm_read_bytes=read_bytes,
+            shared_hbm_write_bytes=write_bytes,
+            l2_admission_mode="bypass",
+        ),
+        serial_phases=tuple(phases),
+        dispatch_envelope_source="P15_dispatch",
+    )
+
+
+def _ple_gate_owner_schedule(
+    padded_tokens: int,
+    hc_mult: int,
+    hidden: int,
+    read_bytes: float,
+    write_bytes: float,
+) -> OwnerScheduleSpec:
+    rows = max(ONE, int(padded_tokens))
+    owners = max(ONE, min(PLE_OWNER_CAPACITY_DEFAULT, rows))
+    max_tiles = _ceil_div(rows, owners)
+    per_owner_read = read_bytes / float(owners)
+    per_owner_write = write_bytes / float(owners)
+    elems_per_owner = float(max_tiles * hc_mult * hidden)
+    return OwnerScheduleSpec(
+        owner_kind="aiv",
+        tiling_strategy="token_row_reduction",
+        parallel_axis="token_rows",
+        work_tiles=rows,
+        launched_owners=owners,
+        active_owners=owners,
+        total_owners=PLE_OWNER_CAPACITY_DEFAULT,
+        max_tiles_per_owner=max_tiles,
+        residency=OwnerMemoryResidency(
+            ub_live_bytes=max(PLE_HBM_SECTOR_BYTES, int(hc_mult * hidden * BF16_BYTES)),
+            ub_capacity_bytes=ZERO,
+            owner_mte2_bytes=per_owner_read,
+            owner_mte3_bytes=per_owner_write,
+            shared_hbm_read_bytes=read_bytes,
+            shared_hbm_write_bytes=write_bytes,
+            l2_admission_mode="reuse",
+        ),
+        serial_phases=(
+            SerialPhaseSpec("kv_query_load", "mte2", per_owner_read, "bytes"),
+            SerialPhaseSpec("key_query_rmsnorm", "vec_reduce", elems_per_owner * TWO, "op"),
+            SerialPhaseSpec("dot_sigmoid_gate", "vec_sfu", elems_per_owner * TWO, "op"),
+            SerialPhaseSpec("gated_combine_store", "mte3", per_owner_write, "bytes"),
+        ),
+        dispatch_envelope_source="P15_dispatch",
+    )
 
 
 def _ple_activation_bytes(padded_tokens: int, columns: int, width: int,
                           act_bytes: int) -> float:
     """Publish all ``columns_per_table * width`` activation lanes exactly once."""
     return float(int(padded_tokens) * int(columns) * int(width) * int(act_bytes))
+
+
+def _build_ple_table_lookup_op(
+    *, prefix: str, table: Any, query_id: str, stage: int, layer: int,
+    requests: tuple[Any, ...], mode: str, padded_tokens: int, embed: int,
+    width: int, lookups: int, hits_local: int, lookup_format: str,
+    read_bytes: float, activation_bytes: float, dequant_ops: float,
+    lookup_meta: tuple[tuple[str, Any], ...], has_host: bool,
+) -> OpSpec:
+    if has_host:
+        # The baseline UVA caller keeps the host lookup, one host-vector
+        # decode pass and the H2D payload; it never charges device work.
+        # ``ple_uva_lookup`` (when active) annotates ``uva_dequant_device``
+        # and the registered scoped recipe moves the decode onto the NPU.
+        return vector_op(
+            op_id=f"{prefix}.ple_host_uva_t{table.table_id}", deps=(query_id,),
+            stage=stage, layer=layer, requests=requests,
+            elements=ZERO, ops_per_element=ZERO_FLOAT,
+            dtype="bf16", family="engram_rh2d", phase=mode,
+            recipe=PLE_UVA_RECIPE, shape=(padded_tokens, embed),
+            read_bytes_override=ZERO_FLOAT,
+            write_bytes_override=ZERO_FLOAT,
+            metadata=((("resource_work", {
+                "host_memory": read_bytes,
+                "host_vector": float(lookups * PLE_LOOKUP_OPS_PER_ELEM),
+                "h2d": read_bytes,
+            }),) + lookup_meta + (
+                ("table_id", table.table_id),
+                ("activation_output_bytes", activation_bytes),
+                ("ple_dequant_ops", dequant_ops),
+                ("device_table_read_bytes", ZERO_FLOAT),
+            )))
+    sector_read = _ple_read_bytes(hits_local, width, lookup_format, sector_aligned=True)
+    index_pack_ops = float(lookups * PLE_LOOKUP_OPS_PER_ELEM + hits_local * width)
+    lookup_owners = max(ONE, min(PLE_OWNER_CAPACITY_DEFAULT, max(ONE, int(hits_local))))
+    lookup = vector_op(
+        op_id=f"{prefix}.ple_device_lookup_t{table.table_id}", deps=(query_id,),
+        stage=stage, layer=layer, requests=requests,
+        elements=max(ONE, padded_tokens * embed),
+        ops_per_element=PLE_LOOKUP_OPS_PER_ELEM, dtype="bf16",
+        family="engram_gather", phase=mode, recipe="ple_device_lookup",
+        shape=(padded_tokens, embed),
+        read_bytes_override=sector_read,
+        write_bytes_override=activation_bytes,
+        vector_ops_override=index_pack_ops + dequant_ops,
+        metadata=lookup_meta + (
+            ("table_id", table.table_id),
+            ("activation_output_bytes", activation_bytes),
+            ("logical_table_read_bytes", read_bytes),
+            ("sector_aligned_read_bytes", sector_read),
+            ("ple_dequant_ops", dequant_ops),
+            ("quantized_lookup_charged", lookup_format in PLE_QUANTIZED_FORMATS),
+            ("dequantize_on_npu", lookup_format in PLE_QUANTIZED_FORMATS),
+            ("invocation_class", "vector"),
+            ("vector_submode", "outer_axis_reduction"),
+            ("launched_blocks", lookup_owners),
+            ("active_aivs", lookup_owners),
+        ))
+    return replace(
+        lookup,
+        owner_schedule=_ple_lookup_owner_schedule(
+            hits_local, sector_read, activation_bytes,
+            index_pack_ops, dequant_ops, _ple_row_bytes(width, lookup_format),
+        ),
+        kernel_binding=KernelBinding(
+            kernel_id="PLEDeviceLookup",
+            backend="Custom-Ops",
+            arch_family="A5",
+            submodule="ple_lookup",
+            macro_module="engram",
+            readiness="shipping",
+            recipe_id="ple_device_lookup",
+        ),
+    )
 
 
 def lower_ple(
@@ -260,12 +459,12 @@ def lower_ple(
     engram.validate()
     requests = tuple(view.request_id for view in views)
     h = model.hidden_size
-    hc_mult = plan.hc_mult or 1
+    hc_mult = plan.hc_mult or ONE
     columns = engram.columns_per_table
     width = engram.width
     embed = columns * width
     act_bytes = dtype_bytes(model.activation_dtype)
-    lookups = max(1, padded_tokens * engram.lookups_per_token_per_table)
+    lookups = max(ONE, padded_tokens * engram.lookups_per_token_per_table)
     lookup_format = ple_lookup_format(model, runtime)
     hits_local = _ple_owned_hits(lookups, parallel.tp)
     read_bytes = _ple_read_bytes(hits_local, width, lookup_format)
@@ -278,14 +477,15 @@ def lower_ple(
         ("ple_lookup_format", lookup_format),
     )
     conv_k = int(dict(engram.source).get("ple_conv_kernel_size", DEFAULT_PLE_CONV_KERNEL))
-    state_bytes = ple_conv_state_bytes(model, runtime) * max(1, len(views))
+    state_bytes = ple_conv_state_bytes(model, runtime) * max(ONE, len(views))
     conv_input = float(padded_tokens * hc_mult * h * act_bytes)
     gated_output = float(padded_tokens * hc_mult * h * act_bytes)
     outer_residual = float(padded_tokens * hc_mult * h * act_bytes)
     activation_bytes = _ple_activation_bytes(
         padded_tokens, columns, width, act_bytes)
     dequant_ops = (float(hits_local * width)
-                   if lookup_format in PLE_QUANTIZED_FORMATS else 0.0)
+                   if lookup_format in PLE_QUANTIZED_FORMATS else ZERO_FLOAT)
+    has_host = bool(getattr(runtime, "engram_cpu_offload", False))
     ops: list[OpSpec] = []
     last = ""
     for table in engram.tables:
@@ -300,48 +500,14 @@ def lower_ple(
             metadata=(("table_id", table.table_id), ("lookups", lookups),
                       ("columns_per_table", columns), ("row_width", width)))
         ops.append(query)
-        has_host = bool(getattr(runtime, "engram_cpu_offload", False))
-        if has_host:
-            # The baseline UVA caller keeps the host lookup, one host-vector
-            # decode pass and the H2D payload; it never charges device work.
-            # ``ple_uva_lookup`` (when active) annotates ``uva_dequant_device``
-            # and the registered scoped recipe moves the decode onto the NPU.
-            payload = read_bytes
-            lookup = vector_op(
-                op_id=f"{prefix}.ple_host_uva_t{table.table_id}", deps=(query.op_id,),
-                stage=stage, layer=plan.index, requests=requests,
-                elements=0, ops_per_element=0.0,
-                dtype="bf16", family="engram_rh2d", phase=mode,
-                recipe=PLE_UVA_RECIPE, shape=(padded_tokens, embed),
-                read_bytes_override=0.0,
-                write_bytes_override=0.0,
-                metadata=((("resource_work", {
-                    "host_memory": payload,
-                    "host_vector": float(lookups * PLE_LOOKUP_OPS_PER_ELEM),
-                    "h2d": payload,
-                }),) + lookup_meta + (
-                    ("table_id", table.table_id),
-                    ("activation_output_bytes", activation_bytes),
-                    ("ple_dequant_ops", dequant_ops),
-                    ("device_table_read_bytes", 0.0),
-                )))
-        else:
-            lookup = vector_op(
-                op_id=f"{prefix}.ple_device_lookup_t{table.table_id}", deps=(query.op_id,),
-                stage=stage, layer=plan.index, requests=requests,
-                elements=max(1, padded_tokens * embed),
-                ops_per_element=PLE_LOOKUP_OPS_PER_ELEM, dtype="bf16",
-                family="engram_gather", phase=mode, recipe="ple_device_lookup",
-                shape=(padded_tokens, embed),
-                read_bytes_override=read_bytes,
-                write_bytes_override=activation_bytes,
-                vector_ops_override=dequant_ops,
-                metadata=lookup_meta + (
-                    ("table_id", table.table_id),
-                    ("activation_output_bytes", activation_bytes),
-                    ("quantized_lookup_charged", True),
-                    ("dequantize_on_npu", lookup_format in PLE_QUANTIZED_FORMATS),
-                ))
+        lookup = _build_ple_table_lookup_op(
+            prefix=prefix, table=table, query_id=query.op_id, stage=stage,
+            layer=plan.index, requests=requests, mode=mode,
+            padded_tokens=padded_tokens, embed=embed, width=width,
+            lookups=lookups, hits_local=hits_local, lookup_format=lookup_format,
+            read_bytes=read_bytes, activation_bytes=activation_bytes,
+            dequant_ops=dequant_ops, lookup_meta=lookup_meta, has_host=has_host,
+        )
         ops.append(lookup)
         gathered = lookup.op_id
         if parallel.tp > ONE:
@@ -361,6 +527,9 @@ def lower_ple(
             phase=mode, family="gemm", recipe="ple_kv_proj",
             metadata=(("table_id", table.table_id),
                       ("replicated_projection", True)))
+        gate_read = float((TWO * hc_mult + ONE) * h * padded_tokens * act_bytes)
+        gate_write = float(TWO * hc_mult * h * padded_tokens * act_bytes)
+        gate_owners = max(ONE, min(PLE_OWNER_CAPACITY_DEFAULT, max(ONE, int(padded_tokens))))
         gate = vector_op(
             op_id=f"{prefix}.ple_gate_t{table.table_id}", deps=(kv.op_id,),
             stage=stage, layer=plan.index, requests=requests,
@@ -368,8 +537,30 @@ def lower_ple(
             ops_per_element=PLE_GATE_OPS_PER_ELEM, dtype=model.activation_dtype,
             family="engram_apply", phase=mode, recipe="ple_gate",
             shape=(padded_tokens, TWO * hc_mult * h),
-            read_bytes_override=float((TWO * hc_mult + ONE) * h * padded_tokens * act_bytes),
-            write_bytes_override=float(TWO * hc_mult * h * padded_tokens * act_bytes))
+            read_bytes_override=gate_read,
+            write_bytes_override=gate_write,
+            metadata=(
+                ("table_id", table.table_id),
+                ("invocation_class", "vector"),
+                ("vector_submode", "outer_axis_reduction"),
+                ("launched_blocks", gate_owners),
+                ("active_aivs", gate_owners),
+            ))
+        gate = replace(
+            gate,
+            owner_schedule=_ple_gate_owner_schedule(
+                padded_tokens, hc_mult, h, gate_read, gate_write,
+            ),
+            kernel_binding=KernelBinding(
+                kernel_id="PLEGateResidual",
+                backend="Triton",
+                arch_family="A5",
+                submodule="ple_gate",
+                macro_module="engram",
+                readiness="shipping",
+                recipe_id="ple_gate",
+            ),
+        )
         conv = vector_op(
             op_id=f"{prefix}.ple_short_conv_t{table.table_id}",
             deps=(gate.op_id, deps), stage=stage, layer=plan.index,

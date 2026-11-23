@@ -21,6 +21,12 @@ from mindie_sim.prediction.mechanism import OperatorPlan, Work
 from mindie_sim.prediction.physical_recipe_base import (IO_HBM_CATEGORY, Phase, build_plan,
                                    io_weight, tiled_phased_program)
 from mindie_sim.prediction.program import KernelProgram, ParallelProgram, PipelineProgram, Stage
+from mindie_sim.schema.operators import (
+    KernelBinding,
+    OwnerMemoryResidency,
+    OwnerScheduleSpec,
+    SerialPhaseSpec,
+)
 
 QUERY_LOAD_SHARE = 0.30
 KEY_LOAD_SHARE = 0.70
@@ -65,6 +71,80 @@ QUANT_LEDGER = "quant_indexer_arch35_work"
 KEYPOOL_LEDGER = "cann_key_pool_work"
 
 
+def _geometry_ub_capacity(geometry) -> int:
+    if geometry is None:
+        return 0
+    raw = dict(getattr(geometry, "buffers", ())).get("ub")
+    return int(raw) if raw is not None else 0
+
+
+def _indexer_owner_schedule(
+    *,
+    owner_kind: str,
+    tiling_strategy: str,
+    parallel_axis: str,
+    work_tiles: int,
+    total_owners: int,
+    read_bytes: float,
+    write_bytes: float,
+    score_flops: float,
+    topk_ops: float,
+    ub_capacity_bytes: int | None = None,
+    dependent_steps: int = 1,
+) -> OwnerScheduleSpec:
+    ub_cap = int(ub_capacity_bytes) if ub_capacity_bytes is not None else 0
+    total = max(1, int(total_owners))
+    tiles = max(0, int(work_tiles))
+    active = max(1, min(total, tiles)) if tiles > 0 else 0
+    max_per_owner = ((tiles + active - 1) // active) if active > 0 else 0
+    denom = float(max(1, active))
+    phases: tuple[SerialPhaseSpec, ...] = ()
+    if active > 0:
+        phases = (
+            SerialPhaseSpec("kv_query_load", "mte2", read_bytes / denom, "bytes"),
+            SerialPhaseSpec("tile_score_dot", "cube", score_flops / denom, "flop",
+                            dependent_chain_steps=max(1, int(dependent_steps))),
+            SerialPhaseSpec("online_topk_merge", "vec_reduce", topk_ops / denom, "op",
+                            dependent_chain_steps=max(1, int(dependent_steps))),
+            SerialPhaseSpec("index_store", "mte3", write_bytes / denom, "bytes"),
+        )
+    ub_est = max(POOL_KEY_BLOCK * FP32_ELEMENT_BYTES, FP32_ELEMENT_BYTES)
+    ub_live = min(ub_cap, ub_est) if ub_cap > 0 else ub_est
+    return OwnerScheduleSpec(
+        owner_kind=owner_kind,
+        tiling_strategy=tiling_strategy,
+        parallel_axis=parallel_axis,
+        work_tiles=tiles,
+        launched_owners=active,
+        active_owners=active,
+        total_owners=total,
+        max_tiles_per_owner=max_per_owner,
+        residency=OwnerMemoryResidency(
+            ub_live_bytes=ub_live,
+            ub_capacity_bytes=ub_cap,
+            owner_mte2_bytes=(read_bytes / denom) if active > 0 else 0.0,
+            owner_mte3_bytes=(write_bytes / denom) if active > 0 else 0.0,
+            shared_hbm_read_bytes=read_bytes,
+            shared_hbm_write_bytes=write_bytes,
+            l2_admission_mode="reuse",
+        ),
+        serial_phases=phases,
+        dispatch_envelope_source="P15_dispatch",
+    )
+
+
+def _indexer_kernel_binding(kernel_id: str, recipe_id: str) -> KernelBinding:
+    return KernelBinding(
+        kernel_id=kernel_id,
+        backend="CANN",
+        arch_family="A5",
+        submodule="sparse_indexer",
+        macro_module="attention",
+        readiness="shipping",
+        recipe_id=recipe_id,
+    )
+
+
 def bind_sustained_hbm(service_modes, rates, resource_names):
     """Cap the `hbm` service at the declared sustainable DRAM rate."""
     dram = service_modes.get(DRAM_SERVICE_MODE)
@@ -84,7 +164,32 @@ class TiledSparseIndexerRecipe:
     traffic_rewrite_capable: bool = True
 
     def build(self, op, geometry):
-        return build_plan(self, op, geometry)
+        plan = build_plan(self, op, geometry)
+        total_aic = int(
+            (getattr(geometry, "resource_units", {}) or {}).get("mte2_aic", INDEXER_WAVE_ROWS)
+            or INDEXER_WAVE_ROWS
+        )
+        rows = int(op.local_shape[0]) if op.local_shape else 1
+        ub_cap = _geometry_ub_capacity(geometry)
+        owner_schedule = _indexer_owner_schedule(
+            owner_kind="mix",
+            tiling_strategy="tiled_sparse_indexer",
+            parallel_axis="query_rows",
+            work_tiles=max(1, rows),
+            total_owners=total_aic,
+            read_bytes=float(op.mte2_bytes or 0.0),
+            write_bytes=float(op.mte3_bytes or 0.0),
+            score_flops=float(op.flops or 0.0),
+            topk_ops=float(op.vector_ops or 0.0),
+            ub_capacity_bytes=ub_cap,
+        )
+        meta = dict(getattr(plan, "metadata", {}) or {})
+        meta["owner_schedule"] = owner_schedule.to_dict()
+        meta["kernel_binding"] = _indexer_kernel_binding(
+            str(dict(op.metadata).get("native_kind") or "SparseIndexerScoreTopK"),
+            str(op.recipe or "sparse_indexer"),
+        ).to_dict()
+        return replace(plan, metadata=meta)
 
     def lower(self, context):
         read_share = io_weight(context, "hbm")
@@ -201,7 +306,6 @@ class PoolKeyIndexerRecipe:
             **context.service_modes, "hbm": mode})
 
     def build(self, op, geometry):
-        del geometry
         metadata = dict(op.metadata)
         ledger = dict(metadata.get(POOL_LEDGER, {}))
         work = pool_key_indexer_work(ledger)
@@ -216,12 +320,28 @@ class PoolKeyIndexerRecipe:
             resources["hbm"] = (float(work.resources.get("hbm", 0.0))
                                 - kv_component + float(prefix_hbm))
             work = Work(work.matrix, resources)
+        ub_cap = _geometry_ub_capacity(geometry)
+        owner_schedule = _indexer_owner_schedule(
+            owner_kind="mix",
+            tiling_strategy="pool_key_indexer_aic_waves",
+            parallel_axis="query_rows",
+            work_tiles=max(1, int(ledger.get("query_rows", 1) or 1)),
+            total_owners=int(ledger.get("wave_rows", INDEXER_WAVE_ROWS) or INDEXER_WAVE_ROWS),
+            read_bytes=float(work.resources.get("mte2", 0.0)),
+            write_bytes=float(work.resources.get("mte3", 0.0)),
+            score_flops=float(sum(work.matrix.values())),
+            topk_ops=float(work.resources.get("vector", 0.0)),
+            ub_capacity_bytes=ub_cap,
+            dependent_steps=max(1, int(ledger.get("blocks", 1) or 1)),
+        )
         return OperatorPlan(work, self.lower, metadata={
             "schedule": "pool_key_indexer_aic_waves",
             "native_dispatch_reconstructed": False,
             "wave_rows": ledger.get("wave_rows"),
             "waves": ledger.get("waves"),
             "blocks": ledger.get("blocks"),
+            "owner_schedule": owner_schedule.to_dict(),
+            "kernel_binding": _indexer_kernel_binding("aclnnPoolKeyIndexer", str(op.recipe or "pool_key_indexer")).to_dict(),
         })
 
     def lower(self, context):
@@ -361,13 +481,29 @@ class Arch35QuantIndexerRecipe:
             **context.service_modes, "hbm": mode})
 
     def build(self, op, geometry):
-        del geometry
         ledger = dict(dict(op.metadata).get(QUANT_LEDGER, {}))
-        return OperatorPlan(arch35_indexer_work(ledger), self.lower, metadata={
+        work = arch35_indexer_work(ledger)
+        ub_cap = _geometry_ub_capacity(geometry)
+        owner_schedule = _indexer_owner_schedule(
+            owner_kind="mix",
+            tiling_strategy="quant_lightning_indexer_v2_arch35_blocks",
+            parallel_axis="query_rows",
+            work_tiles=max(1, int(ledger.get("query_rows", 1) or 1)),
+            total_owners=int(ledger.get("wave_rows", INDEXER_WAVE_ROWS) or INDEXER_WAVE_ROWS),
+            read_bytes=float(work.resources.get("mte2_aic", 0.0)) + float(work.resources.get("mte2_aiv", 0.0)),
+            write_bytes=float(work.resources.get("mte3", 0.0)),
+            score_flops=float(sum(work.matrix.values())),
+            topk_ops=float(work.resources.get("vector", 0.0)),
+            ub_capacity_bytes=ub_cap,
+            dependent_steps=max(1, int(ledger.get("blocks", 1) or 1)),
+        )
+        return OperatorPlan(work, self.lower, metadata={
             "schedule": "quant_lightning_indexer_v2_arch35_blocks",
             "native_dispatch_reconstructed": False,
             "waves": ledger.get("waves"),
             "blocks": ledger.get("blocks"),
+            "owner_schedule": owner_schedule.to_dict(),
+            "kernel_binding": _indexer_kernel_binding("aclnnQuantLightningIndexerV2", str(op.recipe or "quant_lightning_indexer")).to_dict(),
         })
 
     def lower(self, context):
@@ -479,13 +615,30 @@ class KeyPoolRingRecipe:
             **context.service_modes, "hbm": mode})
 
     def build(self, op, geometry):
-        del geometry
         ledger = dict(dict(op.metadata).get(KEYPOOL_LEDGER, {}))
-        return OperatorPlan(key_pool_work(ledger), self.lower, metadata={
+        work = key_pool_work(ledger)
+        ub_cap = _geometry_ub_capacity(geometry)
+        aiv_total = int((getattr(geometry, "resource_units", {}) or {}).get("vector", INDEXER_TILE_CAP) or INDEXER_TILE_CAP) if geometry is not None else INDEXER_TILE_CAP
+        owner_schedule = _indexer_owner_schedule(
+            owner_kind="mix",
+            tiling_strategy="cann_key_pool_aic_projection_then_aiv_ring",
+            parallel_axis="sequence_ring",
+            work_tiles=max(1, int(ledger.get("batch", 1) or 1)),
+            total_owners=aiv_total,
+            read_bytes=float(work.resources.get("mte2", 0.0)) + float(work.resources.get("mte2_aiv", 0.0)),
+            write_bytes=float(work.resources.get("mte3", 0.0)),
+            score_flops=float(sum(work.matrix.values())),
+            topk_ops=float(work.resources.get("vector", 0.0)),
+            ub_capacity_bytes=ub_cap,
+            dependent_steps=max(1, int(ledger.get("steps", 1) or 1)),
+        )
+        return OperatorPlan(work, self.lower, metadata={
             "schedule": "cann_key_pool_aic_projection_then_aiv_ring",
             "native_dispatch_reconstructed": False,
             "completed_pools": ledger.get("completed_pools"),
             "ring_steps": ledger.get("steps"),
+            "owner_schedule": owner_schedule.to_dict(),
+            "kernel_binding": _indexer_kernel_binding("aclnnKeyPool", str(op.recipe or "cann_key_pool")).to_dict(),
         })
 
     def lower(self, context):

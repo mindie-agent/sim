@@ -95,6 +95,21 @@ def _shared_expert_fusion_block_reason(
         for p in moe_plans
     ):
         return "shared_activation_mismatch"
+    from mindie_sim.catalog.quant import projection_quant
+    from mindie_sim.prediction.projections import effective_linear_method
+
+    model_quant = getattr(model, "quant", None)
+    if model_quant is not None:
+        for p in moe_plans:
+            if not int(getattr(p, "num_shared_experts", 0) or 0):
+                continue
+            lq = projection_quant(model_quant, p)
+            r_method = effective_linear_method(lq, "routed_expert")
+            s_method = effective_linear_method(lq, "shared_expert")
+            if r_method in {"mx_fp4", "mx_fp8"} and s_method not in {"mx_fp4", "mx_fp8"}:
+                return f"shared_expert_precision_mismatch:{r_method}:{s_method}"
+            if r_method in {"w8a8", "w4a8"} and s_method not in {"w8a8", "w4a8"}:
+                return f"shared_expert_precision_mismatch:{r_method}:{s_method}"
     return ""
 
 
@@ -255,12 +270,15 @@ def dense(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mode,
           category="dense_mlp", runtime=None, reduce_output=True, **_):
     # A declared selector is configuration even when this FFN is dense. Validate
     # it here so an unsupported declaration cannot sit silently unused.
+    from mindie_sim.catalog.quant import projection_quant
+
     moe_transport.select(runtime)
+    layer_quant = projection_quant(model.quant, plan)
     width = math.ceil(plan.intermediate_size / parallel.tp)
     gate = gemm_op(
         op_id=prefix + ".gate_up", deps=(deps,), stage=stage, layer=plan.index,
         requests=requests, m=tokens, n=2 * width, k=model.hidden_size,
-        quant=model.quant, category=category, phase=mode,
+        quant=layer_quant, category=category, phase=mode,
         family="gate_up_projection", recipe="dense_gate_up",
         metadata=(("ffn_role", "gate_up"), ("ffn_category", category)),
     )
@@ -289,7 +307,7 @@ def dense(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mode,
     down = gemm_op(
         op_id=prefix + ".down", deps=(activation.op_id,), stage=stage, layer=plan.index,
         requests=requests, m=tokens, n=model.hidden_size, k=width,
-        quant=model.quant, category=category, phase=mode,
+        quant=layer_quant, category=category, phase=mode,
         family="down_projection", recipe="dense_down",
         metadata=(("ffn_role", "down"), ("ffn_category", category)),
     )
@@ -442,9 +460,12 @@ def _pack_routed_inputs(
         ops.extend(transport_ops)
     source = routed_input
     if latent != hidden and tokens:
+        from mindie_sim.catalog.quant import projection_quant
+
+        layer_quant = projection_quant(model.quant, plan)
         projection = gemm_op(
             op_id=prefix + ".latent_down", deps=(deps,), stage=stage, layer=plan.index,
-            requests=requests, m=tokens, n=latent, k=hidden, quant=model.quant,
+            requests=requests, m=tokens, n=latent, k=hidden, quant=layer_quant,
             category="latent_moe", phase=mode, family="projection", recipe="latent_projection",
         )
         ops.append(projection)
@@ -633,10 +654,13 @@ def _run_routed_experts(
 ):
     if not local_rows:
         return last, None
-    gate_weight = model.quant.matrix_bytes(2 * expert_width, latent, "routed_expert") * active
-    down_weight = model.quant.matrix_bytes(latent, expert_width, "routed_expert") * active
+    from mindie_sim.catalog.quant import projection_quant
+
+    layer_quant = projection_quant(model.quant, plan)
+    gate_weight = layer_quant.matrix_bytes(2 * expert_width, latent, "routed_expert") * active
+    down_weight = layer_quant.matrix_bytes(latent, expert_width, "routed_expert") * active
     common = dict(stage=stage, layer=plan.index, requests=requests,
-                  quant=model.quant, category="routed_expert", phase=mode, m=math.ceil(local_rows))
+                  quant=layer_quant, category="routed_expert", phase=mode, m=math.ceil(local_rows))
     expert_input_deps = (last,)
     if transport is not None and parallel.ep > 1:
         # Both received quantities are real inputs. The payload already
@@ -854,9 +878,12 @@ def _combine_routed_outputs(
                 prefix, last, stage, plan, requests, tokens, latent, model, mode)
             ops.append(latent_norm)
             last = latent_norm.op_id
+        from mindie_sim.catalog.quant import projection_quant
+
         projection = gemm_op(
             op_id=prefix + ".latent_up", deps=(last,), stage=stage, layer=plan.index,
-            requests=requests, m=tokens, n=hidden, k=latent, quant=model.quant,
+            requests=requests, m=tokens, n=hidden, k=latent,
+            quant=projection_quant(model.quant, plan),
             category="latent_moe", phase=mode, family="projection", recipe="latent_projection",
         )
         ops.append(projection)
@@ -907,9 +934,12 @@ def _join_routed_and_shared(
             shared.append(scattered)
             shared_last = scattered.op_id
         if plan.shared_expert_gate:
+            from mindie_sim.catalog.quant import projection_quant
+
             gate = gemm_op(
                 op_id=prefix + ".shared_gate", deps=(deps,), stage=stage, layer=plan.index,
-                requests=requests, m=tokens, n=1, k=hidden, quant=model.quant,
+                requests=requests, m=tokens, n=1, k=hidden,
+                quant=projection_quant(model.quant, plan),
                 category="router", phase=mode, recipe="shared_gate", family="router")
             applied = vector_op(
                 op_id=prefix + ".shared_gate_apply", deps=(shared_last, gate.op_id),

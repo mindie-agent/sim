@@ -16,6 +16,7 @@ from ..contracts import OperatorFamilySpec, OperatorPlanningContext, ResolvedOpe
 from .arch22 import STRATEGY as MEMBASE_STRATEGY
 from .arch35 import STRATEGY as REGBASE_STRATEGY
 from .common import (
+    ATTNRES_CALLER_SOURCES,
     FAMILY,
     OWNED_RECIPES,
     AttnResContract,
@@ -24,8 +25,10 @@ from .common import (
     TextGatedGuardDecision,
     TextGatedResidualContract,
     attnres_max_resident_rows,
+    build_governed_bindings,
     evaluate_text_gated_guard,
     gap,
+    recipe_kind,
     sinkhorn_vector_ops,
 )
 
@@ -37,10 +40,19 @@ _STRATEGIES = {
 def resolve_operator_plan(op: OpSpec, ctx: OperatorPlanningContext) -> ResolvedOperator:
     """Resolve one occurrence against an explicitly declared device datapath."""
     if op.family == "attn_res_prefix" and "attn_res_view" in dict(op.metadata):
-        from mindie_sim.prediction.operators.hyper_connections.family_attnres import IMPLEMENTATION as PREFIX_IMPL, SOURCE as PREFIX_SOURCE, build as build_prefix
+        from mindie_sim.prediction.operators.hyper_connections.family_attnres import (
+            IMPLEMENTATION as PREFIX_IMPL,
+            build as build_prefix,
+        )
 
         plan = build_prefix(op, ctx.geometry)
-        return ResolvedOperator(ctx.occurrence, op, plan, PREFIX_IMPL, (PREFIX_SOURCE,), None)
+        p_meta = dict(plan.metadata)
+        return ResolvedOperator(
+            ctx.occurrence, op, plan, PREFIX_IMPL, ATTNRES_CALLER_SOURCES, None,
+            precision_abi=p_meta.get("precision_abi"),
+            kernel_binding=p_meta.get("kernel_binding"),
+            owner_schedule=p_meta.get("owner_schedule"),
+        )
     arch_id = ctx.compute_arch.arch_id
     strategy = _STRATEGIES.get(arch_id)
     if strategy is None:
@@ -57,7 +69,15 @@ def resolve_operator_plan(op: OpSpec, ctx: OperatorPlanningContext) -> ResolvedO
         sources=spec.sources,
         repeats=spec.repeats,
     )
-    return ResolvedOperator(ctx.occurrence, op, plan, spec.implementation, spec.sources, descriptor)
+    precision_abi, kernel_binding, owner_schedule = build_governed_bindings(
+        op, ctx, plan, recipe_kind(op), spec.sources,
+    )
+    return ResolvedOperator(
+        ctx.occurrence, op, plan, spec.implementation, spec.sources, descriptor,
+        precision_abi=precision_abi,
+        kernel_binding=kernel_binding,
+        owner_schedule=owner_schedule,
+    )
 
 
 def build(op: OpSpec, geometry: Geometry) -> OperatorPlan:

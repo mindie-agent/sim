@@ -32,12 +32,6 @@ SOURCES: tuple[SourceRef, ...] = (
         relative_path="ops/ascendc/src/hc_pre_sinkhorn/op_kernel/hc_pre_sinkhorn_regbase_base.h",
         source_sha256="bc252a6a996370d852e3a9c4c9d3564cc990ec799b6256e3205e880df6deacc6",
     ),
-    SourceRef(
-        repository="cannbot-dsl",
-        revision="5e7ace8cdcc16a5b062ba69d8fdf93d4f1d62223",
-        relative_path="samples/vector/engram_gate/engram_gate.py",
-        source_sha256="28eb5b828be6d09539e618f70f6674559b7548e6e4a8a63a2a19ef929d2fef9e",
-    ),
 )
 STRATEGY: ArchStrategy = HyperConnectionsStrategy(
     arch_id=ARCH35, abi="aclnnTextGatedResidual", sources=SOURCES, ub_bytes=REGBASE_UB_BYTES,

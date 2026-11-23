@@ -22,7 +22,7 @@
 """
 from __future__ import annotations
 
-from collections import Counter
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
@@ -46,6 +46,228 @@ INT_ZERO = 0
 MAX_EVENTS = 32768
 MAX_SCOPES = 64
 SCOPE_DEVICE_STEP = "device_step"
+STREAM0_INDEX = 0
+COMM_STREAM_INDEX = 2
+SECONDARY_MASKER_SHARE = 0.35
+MAX_MASKED_LABEL_LEN = 96
+NS_PER_MS = 1_000_000
+
+
+@dataclass(frozen=True)
+class ObservedInterval:
+    """One half-open execution interval ``[start_ns, end_ns)`` on a device stream."""
+
+    occurrence_id: str
+    stream: str
+    stream_index: int
+    start_ns: int
+    end_ns: int
+    ordinal: int = INT_ZERO
+    label: str = ""
+    replica: int = INT_ZERO
+
+
+@dataclass(frozen=True)
+class ObservedServiceGrant:
+    """Delivered physical resource service slice for contention attribution."""
+
+    occurrence_id: str
+    resource: str
+    start_ns: int
+    end_ns: int
+    delivered: float
+
+
+@dataclass(frozen=True)
+class StreamExposureResult:
+    """Exact integer-nanosecond exposed attribution with strict conservation."""
+
+    start_ns: int
+    terminal_ns: int
+    exposed_ns_by_op: dict[str, int]
+    idle_or_wait_ns: int
+    masked_by: dict[str, str]
+    conservation_delta_ns: int
+
+
+def _is_stream0(interval: ObservedInterval) -> bool:
+    return int(interval.stream_index) == STREAM0_INDEX or str(interval.stream or "main") == "main"
+
+
+def _trace_stream0_witness_set(
+    intervals: Sequence[ObservedInterval],
+    causal_preds: Mapping[str, Sequence[str]] | None,
+) -> frozenset[str]:
+    active = [iv for iv in intervals if iv.end_ns > iv.start_ns]
+    if not active:
+        return frozenset()
+    by_id = {iv.occurrence_id: iv for iv in active}
+    cur = max(active, key=lambda iv: (iv.end_ns, int(_is_stream0(iv)), -iv.ordinal))
+    witness: set[str] = set()
+    preds_map = causal_preds or {}
+    while cur.occurrence_id not in witness:
+        witness.add(cur.occurrence_id)
+        candidates = [
+            by_id[pid] for pid in preds_map.get(cur.occurrence_id, ())
+            if pid in by_id and by_id[pid].end_ns <= cur.start_ns
+        ]
+        if not candidates:
+            break
+        cur = max(candidates, key=lambda iv: (iv.end_ns, int(_is_stream0(iv)), -iv.ordinal))
+    return frozenset(witness)
+
+
+def _pick_stream0_witness(
+    active: Sequence[ObservedInterval],
+    witness_set: frozenset[str],
+) -> ObservedInterval:
+    main_active = [iv for iv in active if _is_stream0(iv)]
+    pool = main_active if main_active else list(active)
+    in_witness = [iv for iv in pool if iv.occurrence_id in witness_set]
+    candidates = in_witness if in_witness else pool
+    return min(
+        candidates,
+        key=lambda iv: (
+            0 if _is_stream0(iv) else (1 if int(iv.stream_index) == COMM_STREAM_INDEX else 2),
+            -iv.end_ns,
+            -(iv.end_ns - iv.start_ns),
+            iv.ordinal,
+            iv.occurrence_id,
+        ),
+    )
+
+
+def _allocate_integer_shares(dt: int, weights: Mapping[str, float]) -> dict[str, int]:
+    """Divide ``dt`` integer nanoseconds proportionally with zero rounding drift."""
+    total = sum(v for v in weights.values() if v > ZERO)
+    if dt <= INT_ZERO or total <= ZERO:
+        return {}
+    exact = [(oid, dt * (val / total)) for oid, val in weights.items() if val > ZERO]
+    floors = {oid: int(share) for oid, share in exact}
+    remainder = dt - sum(floors.values())
+    if remainder > INT_ZERO:
+        order = sorted(exact, key=lambda item: (-(item[1] - int(item[1])), item[0]))
+        for idx in range(remainder):
+            oid = order[idx % len(order)][0]
+            floors[oid] += ONE
+    return floors
+
+
+def attribute_stream0_intervals(
+    intervals: Sequence[ObservedInterval],
+    *,
+    start_ns: int,
+    terminal_ns: int,
+    grants: Sequence[ObservedServiceGrant] = (),
+    causal_preds: Mapping[str, Sequence[str]] | None = None,
+) -> StreamExposureResult:
+    """Assign every half-open ``[t0, t1)`` slice once with Stream 0 primary witness priority.
+
+    * Stream 0 (``main``) is preferred whenever active; aux side-streams or
+      collective/comm tails are exposed only when Stream 0 is idle (or while
+      physically contesting a shared resource with Stream 0).
+    * Contested resources divide slice duration by delivered service grants
+      using exact largest-remainder integer-nanosecond conservation.
+    * Uncovered gaps are assigned to ``idle_or_wait_ns`` so
+      ``sum(exposed_ns_by_op.values()) + idle_or_wait_ns == terminal_ns - start_ns``.
+    """
+    start_i = int(start_ns)
+    term_i = max(start_i, int(terminal_ns))
+    exposed: dict[str, int] = {iv.occurrence_id: INT_ZERO for iv in intervals}
+    mask_overlap: dict[str, dict[str, int]] = {iv.occurrence_id: defaultdict(int) for iv in intervals}
+    if term_i <= start_i:
+        return StreamExposureResult(start_i, term_i, exposed, INT_ZERO, {iv.occurrence_id: "" for iv in intervals}, INT_ZERO)
+
+    clamped = [
+        ObservedInterval(
+            iv.occurrence_id, iv.stream, iv.stream_index,
+            max(start_i, min(term_i, int(iv.start_ns))),
+            max(start_i, min(term_i, int(iv.end_ns))),
+            iv.ordinal, iv.label or iv.occurrence_id, iv.replica,
+        )
+        for iv in intervals
+    ]
+    active_ivs = [iv for iv in clamped if iv.end_ns > iv.start_ns]
+    witness_set = _trace_stream0_witness_set(active_ivs, causal_preds)
+    cuts_set: set[int] = {start_i, term_i}
+    for iv in active_ivs:
+        cuts_set.add(iv.start_ns)
+        cuts_set.add(iv.end_ns)
+    clamped_grants: list[ObservedServiceGrant] = []
+    for gr in grants:
+        lo = max(start_i, min(term_i, int(gr.start_ns)))
+        hi = max(start_i, min(term_i, int(gr.end_ns)))
+        if hi > lo and gr.delivered > ZERO:
+            clamped_grants.append(ObservedServiceGrant(gr.occurrence_id, gr.resource, lo, hi, float(gr.delivered)))
+            cuts_set.add(lo)
+            cuts_set.add(hi)
+
+    cuts = sorted(cuts_set)
+    idle_wait_ns = INT_ZERO
+    for lo, hi in zip(cuts, cuts[1:]):
+        dt = hi - lo
+        if dt <= INT_ZERO:
+            continue
+        live = [iv for iv in active_ivs if iv.start_ns <= lo and iv.end_ns >= hi]
+        if not live:
+            idle_wait_ns += dt
+            continue
+        if len(live) == ONE:
+            exposed[live[FIRST].occurrence_id] += dt
+            continue
+        witness = _pick_stream0_witness(live, witness_set)
+        live_ids = {iv.occurrence_id for iv in live}
+        grants_by_res: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
+        for gr in clamped_grants:
+            if gr.start_ns <= lo and gr.end_ns >= hi and gr.occurrence_id in live_ids:
+                span = float(gr.end_ns - gr.start_ns)
+                grants_by_res[gr.resource][gr.occurrence_id] += gr.delivered * (float(dt) / span)
+        contested = [res for res, claimants in grants_by_res.items()
+                     if witness.occurrence_id in claimants and len(claimants) >= 2]
+        if contested:
+            combined: dict[str, float] = defaultdict(float)
+            for res in contested:
+                claimants = grants_by_res[res]
+                res_tot = sum(claimants.values())
+                if res_tot > ZERO:
+                    for oid, amt in claimants.items():
+                        combined[oid] += amt / res_tot
+            shares = _allocate_integer_shares(dt, combined)
+            for oid, ns in shares.items():
+                exposed[oid] += ns
+            for iv in live:
+                if iv.occurrence_id not in shares and iv.stream_index != witness.stream_index:
+                    mask_overlap[iv.occurrence_id][witness.label] += dt
+        else:
+            exposed[witness.occurrence_id] += dt
+            for iv in live:
+                if iv.occurrence_id != witness.occurrence_id and iv.stream_index != witness.stream_index:
+                    mask_overlap[iv.occurrence_id][witness.label] += dt
+
+    masked_by: dict[str, str] = {}
+    for iv in clamped:
+        dur = max(INT_ZERO, iv.end_ns - iv.start_ns)
+        ov = mask_overlap[iv.occurrence_id]
+        if dur - exposed[iv.occurrence_id] <= INT_ZERO or not ov:
+            masked_by[iv.occurrence_id] = ""
+            continue
+        ordered = sorted(ov.items(), key=lambda item: (-item[1], item[0]))
+        top_lbl, top_ov = ordered[FIRST]
+        if len(ordered) > ONE and ordered[ONE][1] > top_ov * SECONDARY_MASKER_SHARE:
+            masked_by[iv.occurrence_id] = f"{top_lbl} + {ordered[ONE][0]}"[:MAX_MASKED_LABEL_LEN]
+        else:
+            masked_by[iv.occurrence_id] = top_lbl[:MAX_MASKED_LABEL_LEN]
+
+    total_attributed = sum(exposed.values()) + idle_wait_ns
+    delta_ns = total_attributed - (term_i - start_i)
+    return StreamExposureResult(
+        start_ns=start_i,
+        terminal_ns=term_i,
+        exposed_ns_by_op=exposed,
+        idle_or_wait_ns=idle_wait_ns,
+        masked_by=masked_by,
+        conservation_delta_ns=delta_ns,
+    )
 
 
 @dataclass
@@ -134,12 +356,75 @@ def _edge_keys(after: Any) -> tuple[Any, ...]:
 
 
 class ExposedObserver:
-    """Bounded side-table observer implementing the public contract."""
+    """Bounded side-table observer with Stream 0 attribution and replica filtering."""
 
-    def __init__(self, *, max_events: int = MAX_EVENTS) -> None:
+    def __init__(
+        self,
+        *,
+        max_events: int = MAX_EVENTS,
+        observed_replicas: Sequence[int] | None = None,
+    ) -> None:
         self.max_events = max(ONE, int(max_events))
+        self.observed_replicas: frozenset[int] | None = (
+            frozenset(int(r) for r in observed_replicas)
+            if observed_replicas is not None else None
+        )
         self._scopes: dict[Any, _Scope] = {}
         self._active: Any = None
+        self._intervals: list[ObservedInterval] = []
+        self._grants: list[ObservedServiceGrant] = []
+        self._peer_ready_ms: dict[Any, float] = {}
+        self._peer_counts: Counter = Counter()
+        self.filtered_occurrences: int = INT_ZERO
+
+    def should_retain_replica(self, replica: int) -> bool:
+        """True if full per-occurrence records are retained for ``replica``."""
+        return self.observed_replicas is None or int(replica) in self.observed_replicas
+
+    def record_peer_readiness(self, join_key: Any, replica: int, ready_ms: float) -> None:
+        """Retain only lightweight collective peer readiness for non-observed replicas."""
+        del replica
+        prev = self._peer_ready_ms.get(join_key)
+        val = float(ready_ms)
+        if prev is None or val > prev:
+            self._peer_ready_ms[join_key] = val
+        self._peer_counts[join_key] += ONE
+
+    def collective_peer_ready_ms(self, join_key: Any) -> float | None:
+        return self._peer_ready_ms.get(join_key)
+
+    def collective_peer_count(self, join_key: Any) -> int:
+        return int(self._peer_counts.get(join_key, INT_ZERO))
+
+    def record_interval(self, interval: ObservedInterval) -> bool:
+        """Record an occurrence interval only for observed replicas."""
+        if not self.should_retain_replica(interval.replica):
+            self.filtered_occurrences += ONE
+            return False
+        self._intervals.append(interval)
+        return True
+
+    def record_service_grant(self, grant: ObservedServiceGrant, *, replica: int = INT_ZERO) -> bool:
+        if not self.should_retain_replica(replica):
+            return False
+        self._grants.append(grant)
+        return True
+
+    def finish_stream0_exposure(
+        self,
+        *,
+        start_ns: int,
+        terminal_ns: int,
+        causal_preds: Mapping[str, Sequence[str]] | None = None,
+    ) -> StreamExposureResult:
+        """Compute exact conserved Stream 0 exposed attribution over recorded intervals."""
+        return attribute_stream0_intervals(
+            self._intervals,
+            start_ns=start_ns,
+            terminal_ns=terminal_ns,
+            grants=self._grants,
+            causal_preds=causal_preds,
+        )
 
     def begin_scope(self, scope_id: Any, start_ms: float, inputs: Any = ()) -> None:
         clocks = ()
