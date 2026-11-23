@@ -206,8 +206,13 @@ def test_norm_quant_declarations_flow_through_real_cases():
     for producer in producers:
         meta = dict(producer.metadata)
         consumers = [op for op in ops if producer.op_id in op.deps]
-        assert len(consumers) == 1
-        cm = dict(consumers[0].metadata)
+        matrix_consumers = [
+            op for op in consumers
+            if op.family not in {"add_rmsnorm_quant", "add_rmsnorm", "rmsnorm", "rmsnorm_quant", "elementwise"}
+        ]
+        assert len(matrix_consumers) == 1
+        assert len(consumers) == (2 if producer.family == "add_rmsnorm_quant" else 1)
+        cm = dict(matrix_consumers[0].metadata)
         assert cm["activation_scale_shape"] == meta["native_norm_quant_scale_shape"]
         assert cm["activation_scale_bytes"] == meta["native_norm_quant_scale_bytes"]
 def test_activation_closures_and_retained_protocols():

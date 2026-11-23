@@ -186,7 +186,8 @@ def lower_gqa_indexer(
         (row_bytes, idx_heads, idx_dim, new_idx_rows, rows_by_view,
          shared_idx_by_view, scored_rows) = _index_view_work(
             model, plan, views, idx_ratio, valid, block_size,
-            local_idx_kv_heads=local_idx_kv_heads, parallel=parallel, eff_dcp=eff_dcp)
+            local_idx_kv_heads=local_idx_kv_heads, parallel=parallel, eff_dcp=eff_dcp,
+            tp=tp)
         idx_wq, idx_wk, store_ops, pcp_idx_ops, idx_store_id, idx_ready = _index_cache_inputs(
             prefix, deps, stage, plan, requests, padded_tokens, idx_heads, idx_dim,
             model, quant, mode, valid, new_idx_rows, row_bytes, runtime, machine,
@@ -196,6 +197,19 @@ def lower_gqa_indexer(
         l2_bounded_index_read = float(min(scored_rows, unique_idx_rows)) * row_bytes
         shape = (scored_rows, idx_heads, idx_dim)
         score_bytes = float(scored_rows * FP32_SCORE_BYTES)
+        score_meta: tuple[tuple[str, object], ...] = (
+            ("score_materialization", "separate_fp32_score_then_topk"),
+        )
+        if _is_block_msa_indexer(plan):
+            score_meta += (
+                ("indexer_kind", "msa_block_score"),
+                ("native_kind", "aclnnMsaIndexScore"),
+            )
+        elif _is_region_csa_indexer(plan):
+            score_meta += (
+                ("indexer_kind", "step5_region_score"),
+                ("native_kind", "step5_indexer_region_score_arch35"),
+            )
         idx_scores = OpSpec(
             op_id=prefix + ".index_scores",
             family="indexer",
@@ -215,7 +229,7 @@ def lower_gqa_indexer(
             deps=(idx_wq.op_id, idx_ready),
             recipe="index_scores",
             dtype=quant.index_dtype,
-            metadata=(("score_materialization", "separate_fp32_score_then_topk"),),
+            metadata=score_meta,
         )
         idx_scores = apply_indexer_prefix_reads(
             idx_scores,
@@ -265,13 +279,38 @@ def lower_gqa_indexer(
     return eff_topk, sel_topk, block_size, index_store_id, topk_id, candidate_id
 
 
+def _is_block_msa_indexer(plan) -> bool:
+    """True for block-maxima MSA indexers whose Q heads shard across TP."""
+    return (
+        int(getattr(plan, "candidate_block_size", 0) or 0) > 0
+        and int(getattr(plan, "candidate_topk_blocks", 0) or 0) > 0
+        and not bool(getattr(plan, "index_kpool_compress", False))
+    )
+
+
+def _is_region_csa_indexer(plan) -> bool:
+    """True for compressed region-score CSA indexers without Q output gating."""
+    kpool = int(getattr(plan, "index_kpool", 1) or 1)
+    return (
+        bool(getattr(plan, "index_kpool_compress", False))
+        and kpool > 1
+        and int(getattr(plan, "candidate_block_size", 0) or 0) == kpool
+        and int(getattr(plan, "candidate_topk_blocks", 0) or 0) > 0
+        and not bool(getattr(plan, "q_output_gate", False))
+    )
+
+
 def _declare_gqa_indexer_group(
     ops, *, prefix, plan, parallel, model, quant, views, padded_tokens,
     idx_heads, idx_dim, sel_topk, idx_ratio, scores_id, topk_id,
 ):
     """Unconditionally declare the GQA sparse indexer semantic subgraph."""
     quantized = quant.index_dtype not in {"bf16", "fp16"}
-    if int(plan.index_kpool or 1) > 1:
+    if _is_region_csa_indexer(plan):
+        role, family, native_kind = "pool_key_indexer", "pooled_indexer", "Step5RegionScore"
+    elif _is_block_msa_indexer(plan):
+        role, family, native_kind = "lightning_indexer", "dsa", "MsaIndexScore"
+    elif int(plan.index_kpool or 1) > 1:
         role, family, native_kind = "pool_key_indexer", "pooled_indexer", "PoolKeyIndexer"
     elif quantized:
         role, family, native_kind = (
@@ -315,14 +354,19 @@ def _declare_gqa_indexer_group(
 
 def _index_view_work(
     model, plan, views, idx_ratio, valid, block_size, *,
-    local_idx_kv_heads: int = 1, parallel=None, eff_dcp: int = 1,
+    local_idx_kv_heads: int = 1, parallel=None, eff_dcp: int = 1, tp: int = 1,
 ):
     cost = index_selection_cost(
         model, plan, max((v.kv_len for v in views), default=0)
     )
     row_bytes_per_head = cost.index_row_bytes or index_row_bytes(model, plan.index_dim)
     row_bytes = row_bytes_per_head * max(1, int(local_idx_kv_heads))
-    idx_heads = max(1, int(plan.index_heads or 1))
+    raw_idx_heads = max(1, int(plan.index_heads or 1))
+    idx_heads = (
+        local_kv_heads(raw_idx_heads, max(1, int(tp)))
+        if _is_block_msa_indexer(plan)
+        else raw_idx_heads
+    )
     idx_dim = max(1, int(plan.index_dim or DEFAULT_INDEX_DIM))
     cand_cap = (
         plan.candidate_topk_blocks * plan.candidate_block_size

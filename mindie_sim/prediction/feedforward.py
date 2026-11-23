@@ -327,12 +327,32 @@ def dense(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mode,
     return ops, last
 
 
+def _zero_expert_count(plan, model) -> int:
+    """Number of zero/identity MoE slots competing in routing (e.g. LongCat)."""
+    facts = dict(getattr(model, "catalog_facts", ()) or {})
+    return max(0, int(
+        getattr(plan, "zero_expert_num", 0)
+        or getattr(model, "zero_expert_num", 0)
+        or facts.get("zero_expert_num", 0)
+        or 0
+    ))
+
+
 def _route_expert_rows(
     plan, model, parallel, runtime, routing, routing_realization, *,
     caller, token_partition, sequence_plan, group_tokens, ep_owner, price_owner,
 ):
     local_experts = max(1, (int(plan.num_experts) + int(parallel.ep) - 1)
                         // int(parallel.ep))
+    zero_experts = _zero_expert_count(plan, model)
+    routing_group_tokens = (
+        sequence_plan.valid_cohort_tokens
+        if (routing_realization is None
+            and sequence_plan is not None
+            and sequence_plan.padding == "right_to_tp"
+            and 0 < sequence_plan.valid_cohort_tokens < group_tokens)
+        else group_tokens
+    )
     partitions = (sequence_plan.source_partitions if sequence_plan else
                   getattr(routing_realization, "source_partitions",
                           min(parallel.tp, parallel.ep)))
@@ -340,7 +360,7 @@ def _route_expert_rows(
         # One replicated source owns the complete token selection; the native
         # ledger is projected onto this rank's contiguous expert bank.
         projected = caller.prepare(
-            routing, model, plan, parallel, group_tokens, routing_realization)
+            routing, model, plan, parallel, routing_group_tokens, routing_realization)
         routing_realization = projected.routing_realization
         local_rows, active = projected.local_rows, projected.active
         routing_metadata = projected.routing_metadata
@@ -353,17 +373,31 @@ def _route_expert_rows(
                 # changes from implicit replicated assignment division to TP views.
                 routing_realization = replace(routing_realization, source_partitions=1)
         local_rows, active = (
-            routing.local(model, plan, parallel, group_tokens, owner=price_owner)
+            routing.local(model, plan, parallel, routing_group_tokens, owner=price_owner)
             if routing_realization is None and price_owner is not None and type(routing) is RoutingPolicy
-            else routing.local(model, plan, parallel, group_tokens)
+            else routing.local(model, plan, parallel, routing_group_tokens)
             if routing_realization is None
             else (routing_realization.rows, routing_realization.active))
+        if routing_realization is None and zero_experts > 0 and int(plan.num_experts) > 0:
+            total_experts = int(plan.num_experts) + zero_experts
+            local_rows = float(local_rows) * (float(plan.num_experts) / float(total_experts))
+            if routing_group_tokens > 0 and int(plan.top_k) > 0:
+                p_real = min(1.0, float(plan.top_k) / float(total_experts))
+                per_expert = (
+                    -math.expm1(float(routing_group_tokens) * math.log1p(-p_real))
+                    if 0.0 < p_real < 1.0 else float(p_real > 0.0)
+                )
+                active = float(local_experts) * per_expert
+            else:
+                active = 0.0
         routing_metadata = (
             (("routing_basis", "probability_moments"), ("expected_rows", local_rows),
              ("expected_active_experts", active))
             if routing_realization is None else
             (("routing_basis", routing_realization.basis),
              ("routing_realization", routing_realization.to_dict())))
+        if zero_experts > 0:
+            routing_metadata += (("zero_expert_num", zero_experts),)
     if token_partition:
         routing_metadata += token_partition.metadata()
     # The local EP owner this graph represents. Base and redundant physical
@@ -406,23 +440,28 @@ def _route_expert_rows(
 def _pack_routed_inputs(
     *, prefix, plan, stage, requests, model, parallel, mode, runtime,
     deps, tokens, full_tokens, hidden, latent, transport, token_partition, sequence_plan,
-    routing_realization, local_rows, partitions, caller, routing_metadata,
+    routing_realization, local_rows, partitions, caller, routing_metadata, ep_owner=None,
 ):
+    zero_experts = _zero_expert_count(plan, model)
+    router_plan = (
+        replace(plan, num_experts=int(plan.num_experts) + zero_experts)
+        if zero_experts > 0 else plan
+    )
     router_prefix, router, weight_dtype, weight_bytes = router_gemm(
-        prefix=prefix, plan=plan, deps=deps, stage=stage, requests=requests,
+        prefix=prefix, plan=router_plan, deps=deps, stage=stage, requests=requests,
         tokens=tokens, model=model, hidden=hidden, mode=mode)
     routed_input, logits_input = deps, router.op_id
     partition_views = ()
     if token_partition:
         partition_views = token_partition.prepare(
             prefix=prefix, input_id=deps, logits_id=router.op_id, width=hidden,
-            experts=plan.num_experts, stage=stage, layer=plan.index,
+            experts=router_plan.num_experts, stage=stage, layer=plan.index,
             requests=requests, phase=mode, dtype=model.activation_dtype,
             logits_dtype=token_partition.logits_dtype or weight_dtype)
         routed_input, logits_input = (op.op_id for op in partition_views[-2:])
         tokens = token_partition.local_rows
     selection = build_selection(
-        prefix=prefix, plan=plan, logits_input=logits_input,
+        prefix=prefix, plan=router_plan, logits_input=logits_input,
         weight_dtype=weight_dtype, weight_bytes=weight_bytes, stage=stage,
         requests=requests, tokens=tokens, mode=mode, runtime=runtime)
     # An idle representative owns no local hidden-state row: its router and
@@ -442,7 +481,7 @@ def _pack_routed_inputs(
     source_traffic, payload_tokens = source_issuance(
         routing_realization=routing_realization, token_partition=token_partition,
         sequence_plan=sequence_plan, plan=plan, tokens=tokens,
-        full_tokens=full_tokens)
+        full_tokens=full_tokens, ep_owner=ep_owner)
     transport_rows = None
     transport_histogram_gather = None
     if transport is not None:
@@ -912,7 +951,13 @@ def _join_routed_and_shared(
                 stage=stage, layer=plan.index, requests=requests, phase=mode,
                 width=hidden, dtype=model.activation_dtype)
             shared_prefix.append(gathered)
-            shared_input, shared_tokens = gathered.op_id, sequence_plan.tokens_global
+            shared_tokens = (
+                sequence_plan.valid_global
+                if (sequence_plan.padding == "right_to_tp"
+                    and 0 < sequence_plan.valid_global < sequence_plan.tokens_global)
+                else sequence_plan.tokens_global
+            )
+            shared_input = gathered.op_id
         shared, shared_last = dense(
             prefix=prefix + ".shared", plan=replace(
                 plan,
@@ -1022,7 +1067,7 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
         deps=deps, tokens=tokens, full_tokens=full_tokens, hidden=hidden, latent=latent,
         transport=transport, token_partition=token_partition, sequence_plan=sequence_plan,
         routing_realization=routing_realization, local_rows=local_rows, partitions=partitions,
-        caller=caller, routing_metadata=routing_metadata,
+        caller=caller, routing_metadata=routing_metadata, ep_owner=ep_owner,
     )
     (packing, last, transport_scale, transport_payload, transport_quantized,
      dispatch_overlap_id, dispatch_source, gate_row_cut, absorbed_routing,
@@ -1090,12 +1135,55 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
         dtype=model.activation_dtype, source_routing=source_traffic,
         valid_tokens=payload_tokens, features=features,
         source_rows_by_replica=source_rows_by_replica,
-        destination_rows_by_rank=destination_rows)
+        destination_rows_by_rank=destination_rows,
+        phase=mode, tp_scale=(sequence_plan.tp if sequence_plan is not None else 1))
+    ops, last = _absorb_redundant_mc2_unpack(
+        ops, last, prefix=prefix, runtime=runtime, parallel=parallel,
+        transport=transport, caller=caller)
     return ops, last
 
 
+def _absorb_redundant_mc2_unpack(ops, last, *, prefix, runtime, parallel, transport, caller):
+    """Omit trailing route_unpack when MC2 combine returns weighted unpermuted output."""
+    if parallel.ep <= 1 or transport is not None or caller is not None:
+        return ops, last
+    by_id = {op.op_id: op for op in ops}
+    combine = by_id.get(prefix + ".combine")
+    unpack = by_id.get(prefix + ".unpack")
+    if combine is None or unpack is None or unpack.recipe != "route_unpack":
+        return ops, last
+    meta = dict(getattr(runtime, "metadata", ()) or ()) if runtime is not None else {}
+    comm_mode = str(meta.get("moe_comm_mode") or "").strip().lower()
+    combine_meta = dict(combine.metadata)
+    is_mc2_combine = (
+        getattr(runtime, "moe_recipe", "") == "mc2"
+        or comm_mode == "mc2"
+        or "MoeDistributeCombine" in str(combine_meta.get("native_kind") or "")
+    )
+    if not is_mc2_combine:
+        return ops, last
+    pack_id = prefix + ".pack"
+    extra_deps = tuple(d for d in unpack.deps if d not in {combine.op_id, pack_id})
+    merged_deps = tuple(dict.fromkeys((*combine.deps, *extra_deps)))
+    combine_meta["absorbs_route_unpack"] = True
+    merged_combine = replace(combine, deps=merged_deps, metadata=tuple(combine_meta.items()))
+    rebuilt = []
+    for op in ops:
+        if op.op_id == unpack.op_id:
+            continue
+        if op.op_id == combine.op_id:
+            rebuilt.append(merged_combine)
+            continue
+        if unpack.op_id in op.deps:
+            rebuilt.append(replace(
+                op, deps=tuple(combine.op_id if d == unpack.op_id else d for d in op.deps)))
+        else:
+            rebuilt.append(op)
+    return rebuilt, (combine.op_id if last == unpack.op_id else last)
+
+
 def source_issuance(*, routing_realization, token_partition, sequence_plan,
-                    plan, tokens, full_tokens):
+                    plan, tokens, full_tokens, ep_owner=None):
     """Declared source-traffic view and the rows this owner really issues."""
     source_traffic = (
         routing_realization if getattr(routing_realization, "basis", "")
@@ -1114,6 +1202,13 @@ def source_issuance(*, routing_realization, token_partition, sequence_plan,
     elif source_traffic is not None:
         # A source-mask / exact token ledger owns its valid outgoing rows.
         issued = source_traffic.valid_local_tokens
+    elif (sequence_plan is not None
+          and sequence_plan.padding == "right_to_tp"
+          and routing_realization is None
+          and sequence_plan.valid_per_tp
+          and 0 < sequence_plan.valid_global < sequence_plan.tokens_global):
+        local_rank = (int(ep_owner) % sequence_plan.tp) if ep_owner is not None else 0
+        issued = sequence_plan.valid_per_tp[local_rank]
     else:
         # Ordinary balanced and probability plans route the physical graph
         # rows, including full-capture padding.  ``valid_local_tokens`` is a

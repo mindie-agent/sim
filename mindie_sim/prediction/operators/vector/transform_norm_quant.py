@@ -288,7 +288,15 @@ def residual_norm(ops, _, *, capture_state=None):
     values_by_id = _value_map(ops)
     replacements, removed, residual_map, ports = {}, set(), {}, {}
     for norm in ops:
-        if (norm.plan_required or "implementation_binding" in dict(norm.metadata)
+        raw_norm_meta = dict(norm.metadata)
+        norm_binding = raw_norm_meta.get("implementation_binding")
+        rebindable_native_norm = (
+            norm.family == "rmsnorm_quant"
+            and isinstance(norm_binding, Mapping)
+            and norm_binding.get("implementation") == "vllm_ascend_native_norm"
+        )
+        if (norm.plan_required
+                or (norm_binding is not None and not rebindable_native_norm)
                 or norm.family not in {"rmsnorm", "rmsnorm_quant"} or len(norm.deps) != 1):
             continue
         residual = by_id.get(norm.deps[0])
@@ -353,6 +361,11 @@ def residual_norm(ops, _, *, capture_state=None):
             ("primary_output", "payload" if quantized else "norm"),
             ("residual_output_materialized", True),
         ))
+        if rebindable_native_norm:
+            for stale in ("implementation_binding", "native_kind", "native_implementation"):
+                meta.pop(stale, None)
+            for stale in [k for k in meta if str(k).startswith("native_norm_")]:
+                meta.pop(stale, None)
         audit = {
             **boundary, "transform_members": member_contracts((residual, norm)),
             "typed_outputs": outputs, "typed_roles": merge_typed_roles(residual, norm),

@@ -425,7 +425,7 @@ def test_plain_body_executes_caller_copies_and_separate_source_programs(sku, que
     result = predict(raw, scope="body", tokens=query, context=128, sequences=2); recipes = [row["recipe"] for row in result["timeline"]]
     assert recipes.count("ascend_causal_conv1d_update") == 1 and recipes.count("ascend_gdn_decode_gating") == 1
     assert recipes.count("decode_q_l2norm") == recipes.count("decode_k_l2norm") == 1
-    assert sum(row["family"] == "tensor_copy" for row in result["timeline"]) == 9
+    assert sum(row["family"] == "tensor_copy" for row in result["timeline"]) == 5
     assert result["execution"]["serviced"]["mte2_aiv@r0:s0"] > 0 and result["execution"]["live_tasks"] == result["execution"]["live_programs"] == 0
     assert result["default_mechanisms"]["selections"][0]["selection"] == "default_installed" and raw == before
 def test_explicit_program_and_unsupported_precision_keep_their_existing_execution():

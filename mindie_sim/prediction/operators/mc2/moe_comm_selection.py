@@ -170,8 +170,8 @@ class MoeCommConfig:
             raise ModelingError("moe_comm_value_invalid:fused_mc2_level")
         object.__setattr__(self, "capture_sizes", tuple(self.capture_sizes))
 
-    def select(self, num_tokens: int) -> str:
-        """Selected source method for one forward's local token count."""
+    def select(self, num_tokens: int, *, phase: str = "") -> str:
+        """Selected source method for one forward's TP-global DP-group token count."""
         if isinstance(num_tokens, bool) or not isinstance(num_tokens, int) or num_tokens < 0:
             raise ModelingError("moe_comm_num_tokens_invalid")
         if self.mode == ALWAYS_MC2:
@@ -180,8 +180,10 @@ class MoeCommConfig:
             return ALLGATHER
         if self.lora:
             return ALLTOALL
+        allow_plain_mc2 = phase != "prefill" or self.enable_prefill_mc2
         if self.policy == CAPACITY_AND_EXPERT_DENSITY:
-            if (self.experts_per_device <= _DENSITY_MC2_MAX_EXPERTS_PER_DEVICE
+            if (allow_plain_mc2
+                    and self.experts_per_device <= _DENSITY_MC2_MAX_EXPERTS_PER_DEVICE
                     and self.world_size >= _DENSITY_MC2_MIN_WORLD_SIZE
                     and num_tokens <= self.capacity):
                 return MC2
@@ -191,7 +193,7 @@ class MoeCommConfig:
                 return FUSED_MC2
             if self.enable_fused_mc2 and self.world_size <= _FUSED_OR_CAPACITY_MAX_FUSED_WORLD_SIZE:
                 return FUSED_MC2
-            if num_tokens <= self.capacity:
+            if allow_plain_mc2 and num_tokens <= self.capacity:
                 return MC2
             return ALLTOALL
         if self.policy == CAPACITY_AND_WORLD_SIZE:
@@ -204,7 +206,7 @@ class MoeCommConfig:
                     return FUSED_MC2
             else:
                 capacity = self.capacity
-            if num_tokens <= capacity and self.world_size > 1:
+            if allow_plain_mc2 and num_tokens <= capacity and self.world_size > 1:
                 return MC2
             if self.world_size <= self.top_k:
                 return ALLGATHER

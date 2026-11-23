@@ -446,7 +446,6 @@ def test_absorption_bytes_and_group_expansion_conserve_declared_work():
     after = {op.op_id: op for op in target_operators(selected, phase="prefill", tokens=32)}
     quant, parallel = selected.model.quant, selected.runtime.parallel
     assert quant.format_for("mla_absorb") == quant.source_format_for("mla_absorb") == "bf16"
-    expected_delta = 0
     for plan in selected.model.layer_plans:
         term = next(t for t in layer_weight_terms(plan, selected.model) if t.name == "kv_b")
         expected = term_bytes(term, quant, parallel)
@@ -455,10 +454,14 @@ def test_absorption_bytes_and_group_expansion_conserve_declared_work():
         for op in pair:
             _same((op.flops, dict(op.metadata)["weight_format"],
                    op.op_id + ".quantize" in after), (before[op.op_id].flops, "bf16", False))
-        old_plan = baseline.model.layer_plans[plan.index]
-        old_term = next(t for t in layer_weight_terms(old_plan, baseline.model) if t.name == "kv_b")
-        expected_delta += expected - term_bytes(old_term, baseline.model.quant, parallel)
     for source in (False, True):
+        expected_delta = sum(
+            term_bytes(next(t for t in layer_weight_terms(plan, selected.model) if t.name == "kv_b"),
+                       quant, parallel, source=source)
+            - term_bytes(next(t for t in layer_weight_terms(baseline.model.layer_plans[plan.index], baseline.model) if t.name == "kv_b"),
+                         baseline.model.quant, parallel, source=source)
+            for plan in selected.model.layer_plans
+        )
         assert (sum(stage_weight_bytes(selected.model, parallel, source=source)) - sum(stage_weight_bytes(baseline.model, parallel, source=source))) == expected_delta
     case = parse_case(mla_case())
     ops = list(target_operators(case, phase="decode", tokens=1, context=16))
@@ -528,11 +531,11 @@ def test_typed_state_and_matrix_representations_keep_their_gaps(declared_report)
     fused = next(node for node in export_structure(_tiny_ops()[0], phase="prefill", tokens=8, scope="body")["nodes"] if node["family"] == "add_rmsnorm")
     outputs = {value["name"]: value for value in fused["values"]["outputs"]}
     _same((fused["values"]["basis"], outputs["residual"]["role"], fused["values"]["selection"]), ("typed_records", "residual", {"basis": "selected_software_plan", "kind": "residual_norm"}))
-    nmap = _nodes(declared_report); cout = nmap["rank:0/s0.l0.qkv_concatenate"]["values"]["outputs"]
-    _same([(v["name"], v["shape"], v["dtype"], v["bytes"]) for v in cout], [("output", [2048], "bf16", 4096.0)])
+    nmap = _nodes(declared_report)
+    assert "rank:0/s0.l0.qkv_concatenate" not in nmap
     rin = {v["name"]: v for v in nmap["rank:0/s0.l0.decode_recurrent_scan"]["values"]["inputs"] if v["name"] in {"query", "key"}}
     for view, off in ((rin["query"], 0), (rin["key"], 512)):
-        _same((view["producer"], view["output"], view["shape"], view["bytes"], view["storage_shape"], view["storage_bytes"], view["offset"], view["attrs"]["root_storage_shape"], view["attrs"]["root_storage_bytes"]), ("s0.l0.qkv_concatenate", "output", [1, 1, 4, 128], 1024.0, [2048], 4096.0, off, [2048], 4096.0))
+        _same((view["producer"], view["output"], view["shape"], view["bytes"], view["storage_shape"], view["storage_bytes"], view["offset"], view["attrs"]["root_storage_shape"], view["attrs"]["root_storage_bytes"]), ("s0.l0.short_convolution", "output", [1, 1, 4, 128], 1024.0, [1, 2048], 4096.0, off, [1, 2048], 4096.0))
     node = next(node for node in declared_report["nodes"] if node["family"] == "recurrent_vector")
     inputs = {value["name"]: value for value in node["values"]["inputs"]}
     _same((inputs["state"]["dtype"], inputs["state"]["shape"], inputs["state"]["storage_shape"], inputs["state"]["storage_bytes"], "state_capacity_not_declared" in {gap["code"] for gap in node["values"]["gaps"]}, [effect["action"] for effect in node["values"]["state_effects"]]), ("fp32", [1, 8, 128, 128], None, None, True, ["read", "write", "commit"]))

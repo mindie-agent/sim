@@ -56,6 +56,7 @@ from .gqa_contracts import (
     _cache_tensor_view,
     _contiguous_tensor_view,
     _decode_contract,
+    _declare_ordinary_qk_norm_rope,
     _declare_qkv_norm_rope,
     _gqa_formats,
     _memory_hierarchy,
@@ -63,6 +64,7 @@ from .gqa_contracts import (
     _qkv_output_copy,
     _qkv_views,
     _store_cache,
+    uses_mrope_qkv_kernel,
 )
 from mindie_sim.prediction.operators.sparse_indexer.gqa_indexer import lower_gqa_indexer
 from mindie_sim.prediction.implementation_selection import is_caller_pinned_binding
@@ -213,10 +215,10 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         key_fmt = value_fmt = CacheFormat(model.activation_dtype)
         shared_format = True
     shared = not cacheless and 0 <= plan.kv_owner_layer_id < plan.index
-    # ``k_eq_v`` shares the *projection weight*; it never shares the post-norm /
-    # post-RoPE cache tensor.  K and V are distinct planes for store, read and
-    # PCP gather, so capacity and execution bytes conserve.
-    projection_planes = 1 if plan.k_eq_v else 2
+    # Shipping vLLM/vLLM-Ascend clones checkpoint K into the runtime V slot for
+    # ``k_eq_v`` layers (e.g. Gemma-4 full attention), so QKV projects both K
+    # and V planes (``(heads + 2 * kv_heads) * width``) into distinct cache planes.
+    projection_planes = 2
     cache_planes = 2
     projected_kv_heads = 0 if shared else kv_heads
     configured_recipes = runtime.kernels.get("recipes", {}) if runtime else {}
@@ -333,6 +335,41 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
                            candidate_id=candidate_id)
 
 
+def _emit_ordinary_qk_norm(
+    prefix, plan, stage, ready, model, mode, padded_tokens, requests,
+    heads, projected_kv_heads, width, shared, split_views,
+):
+    """Emit separate Q-norm and K-norm for ordinary text RoPE (zero-copy V)."""
+    act_bytes = dtype_bytes(model.activation_dtype)
+    q_norm = vector_op(
+        op_id=prefix + ".q_norm", deps=(ready,), stage=stage, layer=plan.index,
+        requests=requests, elements=padded_tokens * heads * width,
+        ops_per_element=RMS_NORM_OPS_PER_ELEMENT, dtype=model.activation_dtype,
+        family="rmsnorm", phase=mode, recipe="q_norm",
+        shape=(padded_tokens, heads, width),
+        read_bytes_override=padded_tokens * heads * width * act_bytes + width * act_bytes,
+        write_bytes_override=padded_tokens * heads * width * act_bytes,
+        metadata=(("reduction_width", width), ("norm_has_weight", True),
+                  ("input_views", {"query": split_views["query"].to_dict()})),
+    )
+    emitted = [q_norm]
+    if not shared and projected_kv_heads > 0:
+        k_norm = vector_op(
+            op_id=prefix + ".k_norm", deps=(ready,), stage=stage, layer=plan.index,
+            requests=requests, elements=padded_tokens * projected_kv_heads * width,
+            ops_per_element=RMS_NORM_OPS_PER_ELEMENT, dtype=model.activation_dtype,
+            family="rmsnorm", phase=mode, recipe="k_norm",
+            shape=(padded_tokens, projected_kv_heads, width),
+            read_bytes_override=(padded_tokens * projected_kv_heads * width * act_bytes
+                                 + width * act_bytes),
+            write_bytes_override=padded_tokens * projected_kv_heads * width * act_bytes,
+            metadata=(("reduction_width", width), ("norm_has_weight", True),
+                      ("input_views", {"key": split_views["key"].to_dict()})),
+        )
+        emitted.append(k_norm)
+    return emitted, tuple(op.op_id for op in emitted)
+
+
 def _gqa_projections(
     prefix, plan, stage, deps, model, quant, mode, padded_tokens, requests, heads,
     projected_kv_heads, projection_planes, width, shared, gate_separate,
@@ -360,12 +397,15 @@ def _gqa_projections(
                 "strides": (total_n, 1), "offset_elements": q_width + kv_width,
                 "units": projected_kv_heads, "unit_width": v_width, "shard": "kv_out",
             })
+    qkv_meta = [("packed_projection_slices", tuple(packed_slices))]
+    if plan.k_eq_v:
+        qkv_meta.append(("k_eq_v_runtime_cloned_v", True))
     qkv = gemm_op(
         op_id=prefix + ".qkv", deps=(deps,), stage=stage, layer=plan.index,
         requests=requests, m=padded_tokens, n=total_n,
         k=model.hidden_size, quant=quant, category="attn.qkv", phase=mode,
         family="qkv_projection", recipe="qkv_projection",
-        metadata=(("packed_projection_slices", tuple(packed_slices)),),
+        metadata=tuple(qkv_meta),
     )
     ops = [qkv]
     ready = qkv.op_id
@@ -389,32 +429,59 @@ def _gqa_projections(
         separate_gate = gate_sigmoid.op_id
     split_views, split_copies = {}, []
     normalized = None
+    mrope_active = uses_mrope_qkv_kernel(model, plan)
+    rope_deps = (ready,)
     if plan.qk_norm:
         split_views = _qkv_views(
             padded_tokens, heads, projected_kv_heads, width,
-            plan.q_output_gate and not gate_separate, plan.k_eq_v)
-        normalized = vector_op(
-            op_id=prefix + ".qk_norm", deps=(ready,), stage=stage, layer=plan.index,
-            requests=requests, elements=padded_tokens * (heads + projected_kv_heads) * width,
-            ops_per_element=RMS_NORM_OPS_PER_ELEMENT, dtype=model.activation_dtype, family="rmsnorm",
-            phase=mode, recipe="qk_norm", shape=(padded_tokens, heads + projected_kv_heads, width),
-            metadata=(("input_views", {
-                name: split_views[name].to_dict()
-                for name in (("query",) if shared else ("query", "key"))}),))
-        ops.append(normalized)
-        ready = normalized.op_id
-        split_copies = [
-            _qkv_output_copy(qkv, split_views[name], name, model.activation_dtype)
-            for name in ("value", "gate")
-            if name in split_views and (name != "value" or not shared)
-        ]
-        ops.extend(split_copies)
+            plan.q_output_gate and not gate_separate, False)
+        if mrope_active:
+            normalized = vector_op(
+                op_id=prefix + ".qk_norm", deps=(ready,), stage=stage, layer=plan.index,
+                requests=requests, elements=padded_tokens * (heads + projected_kv_heads) * width,
+                ops_per_element=RMS_NORM_OPS_PER_ELEMENT, dtype=model.activation_dtype, family="rmsnorm",
+                phase=mode, recipe="qk_norm", shape=(padded_tokens, heads + projected_kv_heads, width),
+                metadata=(("input_views", {
+                    name: split_views[name].to_dict()
+                    for name in (("query",) if shared else ("query", "key"))}),))
+            ops.append(normalized)
+            rope_deps = (normalized.op_id,)
+            split_copies = [
+                _qkv_output_copy(qkv, split_views[name], name, model.activation_dtype)
+                for name in ("value", "gate")
+                if name in split_views and (name != "value" or not shared)
+            ]
+            ops.extend(split_copies)
+        else:
+            # Ordinary text RoPE invokes Q-norm and K-norm separately and keeps
+            # V as a zero-copy view off QKV (no standalone V copy or MRoPE fusion).
+            norm_ops, rope_deps = _emit_ordinary_qk_norm(
+                prefix, plan, stage, ready, model, mode, padded_tokens, requests,
+                heads, projected_kv_heads, width, shared, split_views,
+            )
+            ops.extend(norm_ops)
+    if (dict(getattr(model, "catalog_facts", ()) or {}).get("gemma4_v_norm")
+            and not shared and projected_kv_heads > 0):
+        act_bytes = dtype_bytes(model.activation_dtype)
+        v_norm_elems = padded_tokens * projected_kv_heads * v_width
+        v_norm = vector_op(
+            op_id=prefix + ".v_norm", deps=(qkv.op_id,), stage=stage, layer=plan.index,
+            requests=requests, elements=v_norm_elems,
+            ops_per_element=RMS_NORM_OPS_PER_ELEMENT, dtype=model.activation_dtype,
+            family="rmsnorm", phase=mode, recipe="v_norm",
+            shape=(padded_tokens, projected_kv_heads, v_width),
+            read_bytes_override=v_norm_elems * act_bytes,
+            write_bytes_override=v_norm_elems * act_bytes,
+            metadata=(("reduction_width", v_width), ("norm_has_weight", False)),
+        )
+        ops.append(v_norm)
+        split_copies = [v_norm, *split_copies]
     # A declared partial-RoPE width rotates only that prefix of each head; the
     # remaining tail is an unchanged view, never a shrunk projection.
     rotary_width = (plan.qk_rope_head_dim
                     if plan.qk_rope_head_dim or plan.qk_nope_head_dim else width)
     rope = vector_op(
-        op_id=prefix + ".rope", deps=(ready,), stage=stage, layer=plan.index,
+        op_id=prefix + ".rope", deps=rope_deps, stage=stage, layer=plan.index,
         requests=requests,
         elements=padded_tokens * (heads + projected_kv_heads) * rotary_width,
         ops_per_element=ROTARY_OPS_PER_ELEMENT, dtype=model.activation_dtype,
@@ -972,14 +1039,19 @@ def _gqa_output(
     gate_separate, *, views=(), runtime=None, deps="",
 ):
     v_width = int(getattr(plan, "v_head_dim", 0) or width)
+    act_bytes = dtype_bytes(model.activation_dtype)
+    gate_elems = padded_tokens * heads * v_width
     if gate_separate:
         gate = vector_op(
             op_id=prefix + ".output_gate", deps=tuple(attention) + (separate_gate,),
             stage=stage, layer=plan.index, requests=requests,
-            elements=padded_tokens * heads * v_width,
+            elements=gate_elems,
             ops_per_element=GATE_APPLY_OPS_PER_ELEMENT,
             dtype=model.activation_dtype, family="elementwise", phase=mode,
             recipe="attention_gate",
+            read_bytes_override=gate_elems * act_bytes + padded_tokens * heads * dtype_bytes("fp32"),
+            write_bytes_override=gate_elems * act_bytes,
+            metadata=(("input_tensor_count", 2),),
         )
         ops.append(gate)
         attention = [gate.op_id]
@@ -988,8 +1060,11 @@ def _gqa_output(
         gate = vector_op(
             op_id=prefix + ".output_gate", deps=tuple(attention) + (gate_ready,),
             stage=stage, layer=plan.index, requests=requests,
-            elements=padded_tokens * heads * v_width, ops_per_element=OUTPUT_GATE_OPS_PER_ELEMENT,
+            elements=gate_elems, ops_per_element=OUTPUT_GATE_OPS_PER_ELEMENT,
             dtype=model.activation_dtype, family="elementwise", phase=mode, recipe="attention_gate",
+            read_bytes_override=2 * gate_elems * act_bytes,
+            write_bytes_override=gate_elems * act_bytes,
+            metadata=(("input_tensor_count", 2),),
         )
         ops.append(gate)
         attention = [gate.op_id]
@@ -1061,9 +1136,17 @@ def _gqa_output(
                                mode=mode, tokens=padded_tokens)
         ops.append(reduction)
         last = reduction.op_id
-    if plan.qk_norm and not shared and not plan.k_eq_v:
+    if (plan.qk_norm and normalized is not None and not shared
+            and not plan.k_eq_v and uses_mrope_qkv_kernel(model, plan)):
         _declare_qkv_norm_rope(
             ops, qkv, normalized, rope, split_copies, split_views, model.activation_dtype)
+    elif plan.qk_norm and normalized is None and not shared and not plan.k_eq_v and split_views:
+        norm_ids = tuple(
+            op.op_id for op in ops if op.op_id in (prefix + ".q_norm", prefix + ".k_norm")
+        )
+        if norm_ids:
+            _declare_ordinary_qk_norm_rope(
+                ops, qkv, norm_ids, rope, split_views, model.activation_dtype)
     return last
 
 

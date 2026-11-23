@@ -450,7 +450,8 @@ def test_gating_conserves_score_work_and_preserves_external_hash_normalization(m
     selected = build_selection(**options, runtime=case.runtime)
     fused = next(op for op in selected.ops if op.recipe == "moe_gating_topk")
     meta = dict(fused.metadata)
-    kind = HASH_NATIVE_KIND if mode == "hash" else SOFTMAX_NATIVE_KIND
+    kind = (HASH_NATIVE_KIND if mode in {"hash", "sqrtsoftplus"}
+            else ("aclnnMoeGatingTopK" if mode == "noaux_tc" else SOFTMAX_NATIVE_KIND))
     assert (meta["native_kind"], meta["fused_member_count"]) == (kind, members)
     if mode == "hash":
         assert not meta["renorm"] and fused.vector_ops == raw[0].vector_ops

@@ -18,8 +18,8 @@ IMPLEMENTATION = "vllm_ascend_mla_prolog_v3"
 ABSORBED_CATEGORY = "mla_absorb"
 CACHE_GROUP_SIZE = 128
 BF16_CACHE_DTYPES = frozenset({"bf16", "fp8_e4m3"})
-#: Declared V3 prolog Q-LoRA ranks; any other rank is a different caller.
-MLA_PROLOG_QUERY_LORA_RANKS = frozenset({1536, 2048})
+#: Declared V3/V4 prolog Q-LoRA ranks (V4-Flash 1024, V4.1 1280, V3/R1 1536, GLM 2048).
+MLA_PROLOG_QUERY_LORA_RANKS = frozenset({1024, 1280, 1536, 2048})
 MXFP8_FORMAT = "fp8_e4m3"
 MXFP8_QUERY_QUANT_MODE = 3
 E8M0_GROUP_SIZE = 32
@@ -80,8 +80,7 @@ def _effective_cache_layout(plan, quant, cache_layout):
 def _indexer_q_category(quant) -> str:
     overrides = dict(getattr(quant, "category_overrides", ()) or ())
     exclusions = set(getattr(quant, "exclusions", ()) or ())
-    if ("indexer.wq" in overrides or "indexer.wq" in exclusions
-            or "indexer" in overrides or "indexer" in exclusions):
+    if "indexer.wq" in overrides or "indexer.wq" in exclusions:
         return "indexer.wq"
     if "indexer_fp8" in overrides or "indexer_fp8" in exclusions:
         return "indexer_fp8"

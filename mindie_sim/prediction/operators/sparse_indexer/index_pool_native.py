@@ -529,7 +529,9 @@ def selection(b, *, query, weights, cache, views, plan, quant, padded_tokens,
     packed = b.work("index_topk", (indices,), (local_tokens, output_width),
         read=selected * pool * INT32_BYTES + (valid_rows + local_tokens) * INT64_BYTES,
         write=local_tokens * output_columns * INT32_BYTES, vector=local_tokens * output_columns,
-        family="topk", dtype="int32", metadata=common + (
+        family="elementwise", dtype="int32", metadata=common + (
+            ("native_kind", "glm5_next_cann_keypool_pack"),
+            ("kernel", "glm5_next_cann_keypool_pack"),
             ("selection_capacity", output_width), ("selection_output_dtype", "int32"),
             ("selection_layout", "native_token_indices_then_causal_tail; padded_rows_minus_one"),
             ("pool_id_expansion_in_adapter", False),
