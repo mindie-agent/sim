@@ -119,8 +119,15 @@ def _draft_layer_plan(model, draft, index: int, plan_fields: dict) -> LayerPlan:
     # A draft block executes the target's MLA subgraph.  Its fused QKV-A
     # projection and NoPE declaration are properties of that subgraph, not of
     # the draft's own short declaration.
-    packed_input = bool(ref.packed_input_projection) if ref else False
+    packed_input = (
+        bool(ref.packed_input_projection) if ref
+        else bool(draft.attention_kind == "mla" and int(draft.q_lora_rank or ZERO) > ZERO)
+    )
     mla_use_nope = bool(ref.mla_use_nope) if ref else False
+    if ref is not None and int(plan_fields.get("qk_rope_head_dim", ZERO) or ZERO) <= ZERO and int(ref.qk_rope_head_dim or ZERO) > ZERO:
+        plan_fields = dict(plan_fields)
+        plan_fields["qk_rope_head_dim"] = int(ref.qk_rope_head_dim)
+        plan_fields["qk_nope_head_dim"] = int(ref.qk_nope_head_dim)
     # A body layer may declare the selection sharing; the draft spec keeps its
     # own explicit override so an external draft can opt out.
     index_share = bool(

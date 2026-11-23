@@ -205,11 +205,35 @@ def _mhc_terms(plan: LayerPlan, model: ModelSpec) -> list[WeightTerm]:
     terms: list[WeightTerm] = []
     for part in ("attn", "ffn"):
         terms.extend([
-            _t(f"hc_{part}_fn", mix, hc_dim, "mhc"),
+            replace(_t(f"hc_{part}_fn", mix, hc_dim, "mhc"), runtime_dtype="fp32"),
             _t(f"hc_{part}_base", mix, 1, "param_fp32"),
             _t(f"hc_{part}_scale", MHC_SCALE_ELEMENTS, 1, "param_fp32"),
         ])
     return terms
+
+
+def _model_profile_name(model: ModelSpec) -> str:
+    facts = dict(getattr(model, "catalog_facts", ()) or ())
+    profile = str(facts.get("profile", "") or "").strip().lower()
+    if profile:
+        return profile
+    meta = dict(getattr(model, "metadata", ()) or ())
+    return str(meta.get("source_model_type", "") or "").strip().lower()
+
+
+def _step5_csa_indexer_terms(plan: LayerPlan, model: ModelSpec) -> list[WeightTerm]:
+    """Step-5 CSA indexer weights: Q, K, Z, W projections plus norms and ssmax."""
+    h = model.hidden_size
+    return [
+        _t("sparse_indexer_q", plan.index_heads * plan.index_dim, h, "indexer.wq", "out_tp"),
+        _t("sparse_indexer_k", plan.index_dim, h, "indexer.wk"),
+        _t("sparse_indexer_z", plan.index_dim, h, "indexer.wk"),
+        _t("sparse_indexer_w", plan.index_heads, h, "indexer.weights"),
+        _t("indexer_q_norm", plan.index_dim, 1, "norm"),
+        _t("indexer_k_norm", plan.index_dim, 1, "norm"),
+        _t("indexer_k_norm_bias", plan.index_dim, 1, "norm"),
+        _t("ssmax_s", plan.index_heads, 1, "param_fp32"),
+    ]
 
 
 def _indexer_terms(plan: LayerPlan, model: ModelSpec) -> list[WeightTerm]:
@@ -217,7 +241,10 @@ def _indexer_terms(plan: LayerPlan, model: ModelSpec) -> list[WeightTerm]:
         return []
     if plan.index_heads <= 0 or plan.index_dim <= 0:
         raise ModelingError(f"indexer_dimensions_missing:{plan.index}")
+    profile = _model_profile_name(model)
     if plan.attention == "gqa" and plan.index_kpool > 1:
+        if "step5" in profile:
+            return _step5_csa_indexer_terms(plan, model)
         from mindie_sim.catalog.qwen4_exp import qsa_indexer_terms
         return qsa_indexer_terms(plan, model)
     terms: list[WeightTerm] = []
@@ -247,9 +274,17 @@ def _indexer_terms(plan: LayerPlan, model: ModelSpec) -> list[WeightTerm]:
                     _t("indexer_pool_ape", plan.index_kpool, plan.index_dim, "param_fp32"),
                 ])
     if plan.indexer or plan.owns_topk or plan.index_query_per_layer:
-        terms.extend([
+        wq_sharded = plan.attention == "gqa" and ("minimax" in profile or plan.candidate_block_size > 1)
+        wq_term = (
             _t("indexer_wq", plan.index_heads * plan.index_dim,
-               plan.q_lora_rank or model.hidden_size, "indexer.wq"),
+               plan.q_lora_rank or model.hidden_size, "indexer.wq", "kv_out",
+               units=plan.index_heads, unit_width=plan.index_dim)
+            if wq_sharded else
+            _t("indexer_wq", plan.index_heads * plan.index_dim,
+               plan.q_lora_rank or model.hidden_size, "indexer.wq")
+        )
+        terms.extend([
+            wq_term,
             _t("indexer_weights", plan.index_heads, model.hidden_size,
                "linear_param_bf16" if plan.index_kpool > 1 else "indexer.weights"),
         ])
@@ -367,9 +402,9 @@ def _attention_terms(plan: LayerPlan, model: ModelSpec) -> list[WeightTerm]:
             _t("k_proj", kv_width, h, "attn.qkv", "kv_out",
                units=plan.num_kv_heads, unit_width=plan.head_dim),
         ])
-        if not plan.k_eq_v:
-            terms.append(_t("v_proj", kv_width, h, "attn.qkv", "kv_out",
-                            units=plan.num_kv_heads, unit_width=plan.head_dim))
+        v_term = _t("v_proj", kv_width, h, "attn.qkv", "kv_out",
+                    units=plan.num_kv_heads, unit_width=plan.head_dim)
+        terms.append(replace(v_term, source_owned=False) if plan.k_eq_v else v_term)
         if gate_separate:
             terms.append(_t("g_proj", heads, h, "attn.gate", "out_tp"))
         terms.append(_t("o_proj", h, heads * plan.head_dim, "attn.o", "in_tp"))
@@ -444,8 +479,9 @@ def _ffn_terms(plan: LayerPlan, model: ModelSpec) -> list[WeightTerm]:
         raise ModelingError(f"catalog_moe_dims_missing:layer{plan.index}")
     expert_input = plan.expert_latent_size or h
     expert_output = plan.expert_latent_size or h
+    router_rows = int(plan.num_experts) + int(getattr(plan, "zero_expert_num", 0) or 0)
     terms.extend([
-        replace(_t("router", plan.num_experts, plan.router_input_size or h, "router"),
+        replace(_t("router", router_rows, plan.router_input_size or h, "router"),
                 runtime_dtype="" if plan.router_precast_weight_copy else plan.router_dtype),
         _t("expert_gate", plan.moe_intermediate_size, expert_input,
            "routed_expert", "expert_gate_up", count=plan.num_experts),

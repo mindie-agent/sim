@@ -220,7 +220,7 @@ def _aux_deepseek(c: Mapping[str, Any], *, v41: bool, d: Mapping[str, Any]) -> A
     block = _int(c, "dspark_block_size", 1)
     markov = _int(c, "dspark_markov_rank", 0)
     nextn = _int(c, "num_nextn_predict_layers", 0)
-    layers = len(targets) if targets else nextn
+    layers = nextn if nextn > 0 else len(targets)
     if layers <= 0:
         return AuxiliarySpec()
     body_layers = int(_require(c, "num_hidden_layers"))
@@ -301,7 +301,9 @@ def _aux_deepseek(c: Mapping[str, Any], *, v41: bool, d: Mapping[str, Any]) -> A
     )
 
 
-def _standard_deepseek_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
+def _standard_deepseek_plans(
+    c: Mapping[str, Any], *, packed_input_projection: bool = False,
+) -> list[LayerPlan]:
     """Body plans for the native DeepSeek V2/V2-Lite/V3/R1 checkpoints."""
     layers = int(_require(c, "num_hidden_layers"))
     h = int(_require(c, "hidden_size"))
@@ -344,6 +346,7 @@ def _standard_deepseek_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
             q_lora_rank=q_rank, kv_lora_rank=kv_rank,
             qk_nope_head_dim=nope, qk_rope_head_dim=rope, v_head_dim=v_dim,
             mla_variant="latent_mla", kv_cache_elements=kv_rank + rope,
+            packed_input_projection=bool(packed_input_projection and q_rank > 0),
             kv_owner_layer_id=index, owns_long_kv=True,
             indexer=has_indexer, indexer_type="full" if has_indexer else "none",
             index_topk=idx_topk if has_indexer else 0,

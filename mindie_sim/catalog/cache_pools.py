@@ -37,6 +37,8 @@ C8_SCALE_GROUP = 128
 FP32_BYTES = 4
 BF16_BYTES = 2
 INT8_PACKED_KV_DTYPES = frozenset({"int8"})
+FP8_PACKED_KV_DTYPES = frozenset({"fp8", "fp8_e4m3"})
+FP8_MLA_DEFAULT_SCALE_DTYPE = "fp16"
 MX_GROUP_SIZE = 32
 MXFP8_DTYPES = frozenset({"mxfp8", "mx_fp8", "mxfp8_e4m3"})
 MXFP4_DTYPES = frozenset({"mxfp4", "mx_fp4", "mxfp4_e2m1"})
@@ -133,6 +135,14 @@ def _packed_mla_row_parts(
             metadata.get("kv_scale_dtype")
             or (getattr(quant, "kv_scale_dtype", "") if quant is not None else "")
             or "fp32"
+        ).strip().lower()
+        scales = exact_element_bytes(_ceil_div(latent, C8_SCALE_GROUP), scale_dtype)
+        return int(latent + rope * BF16_BYTES), int(scales)
+    if kv_dtype in FP8_PACKED_KV_DTYPES and latent > 0 and rope > 0 and latent + rope == width:
+        scale_dtype = str(
+            metadata.get("kv_scale_dtype")
+            or (getattr(quant, "kv_scale_dtype", "") if quant is not None else "")
+            or FP8_MLA_DEFAULT_SCALE_DTYPE
         ).strip().lower()
         scales = exact_element_bytes(_ceil_div(latent, C8_SCALE_GROUP), scale_dtype)
         return int(latent + rope * BF16_BYTES), int(scales)

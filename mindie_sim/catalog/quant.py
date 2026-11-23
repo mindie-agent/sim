@@ -22,6 +22,7 @@ from dataclasses import replace
 
 from mindie_sim.catalog.types import QuantSpec, merge_source
 
+BF16_SCALE_BYTES = 2.0
 FP32_SCALE_BYTES = 4.0
 
 
@@ -110,6 +111,12 @@ def _quant_deepseek(c: Mapping[str, Any], *, v41: bool) -> QuantSpec:
         activation_scale_format="fp8_e8m0" if scale_bytes == 1 else "fp32",
         activation_scale_pack=2 if scale_bytes == 1 else 1,
         index_dtype="int8", index_scale_dtype="fp16",
+        category_overrides=(
+            {} if v41 else {
+                "routed_expert": dict(_MXFP4_ROUTED_ACTIVATION),
+                "dspark_routed_expert": dict(_MXFP4_ROUTED_ACTIVATION),
+            }
+        ),
         # V4.1 executes the Engram gate as an MXFP8 (32, 32) projection; the
         # earlier V4 checkpoint keeps it in the BF16 exclusion set.
         exclusions=(("router", "lm_head", "embedding", "norm", "mhc", "attn_res_proj",
@@ -302,6 +309,16 @@ def _quant_w4a8_dynamic() -> QuantSpec:
         expert_weight_format="int4",
         weight_block=(1, 1), expert_block=1,
         scale_format="fp32", scale_bytes=FP32_SCALE_BYTES,
+        runtime_weight_scale_format="bf16",
+        runtime_weight_scale_bytes=BF16_SCALE_BYTES,
+        runtime_activation_scale_format="fp32",
+        runtime_int8_weight_metadata="scale_only",
+        category_overrides={
+            "routed_expert": {
+                "runtime_weight_scale_format": "fp32",
+                "runtime_weight_scale_bytes": FP32_SCALE_BYTES,
+            },
+        },
         kv_dtype="bf16", index_dtype="bf16", index_scale_dtype="none",
         exclusions=("mtp", "norm", "router", "lm_head", "embedding", "mhc", "attn_res_proj",
                     "compressor", "vision", "projector",

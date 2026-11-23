@@ -362,7 +362,8 @@ def test_expert_rank_table_groups_follow_declared_pipeline_and_context_membershi
         table = (tuple(range(8)) + tuple(range(16, 24)), tuple(range(8, 16)) + tuple(range(24, 32)))
     else:
         raw = stack_case("qwen3-30b-a3b", tp=1, dp=4, ep=2, pcp=2, num_devices=8, layers=1,
-                         enable_dbo=False, prompt_tokens=8, output_tokens=2, max_num_seqs=2)
+                         enable_dbo=False, exclude_optimizations=("cann_megamoe_fusion",),
+                         prompt_tokens=8, output_tokens=2, max_num_seqs=2)
         table = ((3, 2), (1, 0), (7, 6), (5, 4))
         raw["runtime"]["parallel"]["rank_table"] = table
     case = parse_case(raw)
@@ -475,8 +476,8 @@ def test_mla_projection_dependencies_and_weight_placement_follow_declared_format
                        runtime=replace(case.runtime, kernels=kernels))
     ops = layer_graph(case, 3)
     if mode in {"mixed", "source"}:
-        assert "qkv_a" not in ops and ops["kv_a"].dtype == "bf16"
-        assert ops["q_a"].dtype == ("int8" if mode == "mixed" else "bf16")
+        assert "qkv_a" not in ops and ops["kv_a"].dtype == ("bf16" if mode == "mixed" else "int8")
+        assert ops["q_a"].dtype == "int8"
     else:
         assert ops["qkv_a"].local_shape == (24, 2048, 4096)
         assert ops["q_norm"].deps == ops["kv_norm"].deps == (ops["qkv_a"].op_id,)

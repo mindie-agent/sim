@@ -290,11 +290,16 @@ def _gemma4(key: str, config: Mapping[str, Any]) -> ModelSpec:
     donor_by_kind: dict[str, int] = {}
     for donor_idx in range(first_shared):
         donor_by_kind[kinds[donor_idx]] = donor_idx
+    from mindie_sim.catalog.hf_config import rotary_dimensions
+    rope_params = c.get("rope_parameters") if isinstance(c.get("rope_parameters"), Mapping) else {}
     plans = []
     for index, kind in enumerate(kinds):
         full = kind == "full_attention"
         layer_kv = global_kv_heads if full else kv_heads
         layer_hd = global_head_dim if full else head_dim
+        rope_cfg = rope_params.get(kind) if isinstance(rope_params.get(kind), Mapping) else {}
+        partial_factor = float(rope_cfg.get("partial_rotary_factor", 1.0) or 1.0)
+        rope_dim, nope_dim = rotary_dimensions(layer_hd, partial_factor)
         shares_kv = index >= first_shared and kind in donor_by_kind
         kv_owner = donor_by_kind[kind] if shares_kv else index
         # Two cache planes are retained on KV-owning layers even when V=v_norm(K).
@@ -304,6 +309,7 @@ def _gemma4(key: str, config: Mapping[str, Any]) -> ModelSpec:
             ffn="moe" if moe else "dense",
             window=0 if full else window,
             num_heads=heads, num_kv_heads=layer_kv, head_dim=layer_hd,
+            qk_rope_head_dim=rope_dim, qk_nope_head_dim=nope_dim,
             intermediate_size=0 if moe else intermediate,
             num_experts=experts,
             top_k=top_k, moe_intermediate_size=moe_i,
@@ -388,6 +394,8 @@ def _minimax_m3(key: str, config: Mapping[str, Any]) -> ModelSpec:
     else:
         oai_limit = oai_alpha = oai_beta = 0
     shared_limit = float(c.get("swiglu_limits_shared") or oai_limit)
+    use_routing_bias = bool(c.get("use_routing_bias", False))
+    routed_scale = float(c.get("routed_scaling_factor") or 1.0)
     plans = []
     for index in range(layers):
         moe = moe_flags[index]
@@ -395,6 +403,7 @@ def _minimax_m3(key: str, config: Mapping[str, Any]) -> ModelSpec:
                                 or index >= start)
         if active and min(block, topk_blocks, index_heads, index_dim) <= 0:
             raise ModelingError(f"model_config_minimax_sparse_dims_missing:{index}")
+        noaux = bool(moe and use_routing_bias)
         plans.append(LayerPlan(
             index=index, attention="gqa", architecture="gqa",
             ffn="moe" if moe else "dense", num_heads=heads,
@@ -407,6 +416,10 @@ def _minimax_m3(key: str, config: Mapping[str, Any]) -> ModelSpec:
             shared_intermediate_size=shared_i if moe else 0,
             router_input_size=hidden if moe else 0,
             router_mode=str(c.get("scoring_func", "softmax")),
+            router_noaux_tc=noaux,
+            router_groups=1 if noaux else 0,
+            router_group_topk=1 if noaux else 0,
+            routed_scaling_factor=routed_scale,
             qk_norm=qk_norm, q_output_gate=gate,
             qk_rope_head_dim=rope_dim, qk_nope_head_dim=nope_dim,
             ffn_activation=activation,
@@ -419,10 +432,9 @@ def _minimax_m3(key: str, config: Mapping[str, Any]) -> ModelSpec:
             topk_owner_layer_id=index if active else (-1),
             index_heads=index_heads if active else 0,
             index_dim=index_dim if active else 0,
-            index_topk=(topk_blocks + local_blocks) * block if active else 0,
+            index_topk=topk_blocks * block if active else 0,
             candidate_block_size=block if active else 1,
-            candidate_topk_blocks=(topk_blocks + local_blocks if active
-                                   else 0),
+            candidate_topk_blocks=topk_blocks if active else 0,
             kv_cache_elements=KV_CACHE_PLANES * kv_heads * head_dim,
             kv_owner_layer_id=index, owns_long_kv=True,
             native_layer_id=index, scope="body",
@@ -512,6 +524,9 @@ def _step5(key: str, config: Mapping[str, Any]) -> ModelSpec:
                         if isinstance(shared_limits, (list, tuple)) else limit)
         return rope_dim, nope_dim, limit, shared_limit, factor
 
+    need_fp32_gate = bool(c.get("need_fp32_gate", False))
+    use_router_bias = bool(c.get("use_moe_router_bias", False))
+    routed_scale = float(c.get("moe_router_scaling_factor") or 1.0)
     for index, kind in enumerate(kinds):
         full = kind == "full_attention"; moe = index in moe_set
         sparse_layer = bool(sparse_on and kind in apply_types)
@@ -529,7 +544,11 @@ def _step5(key: str, config: Mapping[str, Any]) -> ModelSpec:
             num_shared_experts=1 if moe else 0,
             shared_intermediate_size=shared_i if moe else 0,
             router_input_size=hidden if moe else 0,
-            router_mode="softmax",
+            router_mode="sigmoid",
+            router_dtype="fp32" if (moe and need_fp32_gate) else "",
+            router_output_dtype="fp32" if (moe and need_fp32_gate) else "",
+            router_noaux_tc=bool(moe and use_router_bias),
+            routed_scaling_factor=routed_scale,
             q_output_gate_kind="headwise" if gate else "none",
             q_gate_projection="separate" if gate else "packed_q",
             ffn_activation="silu",
@@ -558,6 +577,7 @@ def _step5(key: str, config: Mapping[str, Any]) -> ModelSpec:
     step5_facts = _facts(
         "step5", config, c, plans,
         supports_torch_compile=False,
+        need_fp32_gate=need_fp32_gate,
         norm_weight_offset=NORM_WEIGHT_OFFSET,
         normalization={
             "norm_weight_offset": NORM_WEIGHT_OFFSET,

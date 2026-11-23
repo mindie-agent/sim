@@ -281,6 +281,7 @@ def _glm(c: Mapping[str, Any]) -> list[RefLayer]:
                 experts=experts if ffn == "moe" else 0, moe_i=moe_i if ffn == "moe" else 0,
                 shared=shared if ffn == "moe" else 0,
                 shared_i=shared * moe_i if ffn == "moe" else 0,
+                router_bias=bool(ffn == "moe" and str(c.get("topk_method", "")) == "noaux_tc"),
             )
             if kind in {"linear_attention", "kda"}:
                 out.append(RefLayer(
@@ -312,6 +313,7 @@ def _glm(c: Mapping[str, Any]) -> list[RefLayer]:
             experts=experts if ffn == "moe" else 0, moe_i=moe_i if ffn == "moe" else 0,
             shared=shared if ffn == "moe" else 0,
             shared_i=shared * moe_i if ffn == "moe" else 0,
+            router_bias=bool(ffn == "moe" and str(c.get("topk_method", "")) == "noaux_tc"),
         )
         indexer_type = (index_types[index] if index < len(index_types)
                         else ("full" if not index_types else "shared"))

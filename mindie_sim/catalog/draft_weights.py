@@ -119,7 +119,7 @@ def _draft_attention_terms(draft: DraftSpec, quant: QuantSpec) -> list[WeightTer
         terms.extend([
             _t("draft_enorm", h, ONE, "linear_param_bf16"),
             _t("draft_hnorm", h, ONE, "linear_param_bf16"),
-            _t("draft_eh_proj", h, 2 * h, "linear_param_bf16", "replicated"),
+            _t("draft_eh_proj", h, 2 * h, "linear_param_bf16", "out_tp"),
         ])
     if draft.mhc_lowrank <= ZERO:
         terms.extend([_t("draft_input_norm", h, ONE, "norm"),
@@ -249,7 +249,7 @@ def draft_terms(
                             "replicated"))
             terms.append(_t("draft_h_proj", h, h, "linear_param_bf16",
                             "replicated"))
-        else:
+        elif draft.input_mode != "normalized_concat":
             terms.append(_t("draft_input_proj", h, draft.input_width,
                             draft.input_projection_category, "out_tp"))
         if draft.embedding_owned and int(draft.embedding_count) > ZERO:
@@ -268,7 +268,7 @@ def draft_terms(
                 if int(draft.output_head_count) > ZERO:
                     terms.append(WeightTerm(
                         "draft_output_head", draft.vocab_size, h, "lm_head",
-                        "replicated", ONE, 0, 0, 0, False, True))
+                        "out_tp", ONE, 0, 0, 0, False, True))
         if draft.mhc_lowrank > ZERO:
             from mindie_sim.catalog.qwen4_exp import lowrank_hc_draft_head_terms
             terms.extend(lowrank_hc_draft_head_terms(draft))

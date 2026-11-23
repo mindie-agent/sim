@@ -317,7 +317,7 @@ VA_RECOMMENDED_PROFILES: dict[str, dict[str, Any]] = {
         topologies={"a5": _topo(colocated={"dp": 2, "tp": 1, "pcp": 8, "ep": 16, "block_size": 32})},
     ),
     "deepseek-v4-flash-0731": _p(
-        {"a2": "w8a8", "a3": "w8a8"}, SINGLE_MTP_PROPOSAL_TOKEN, "DeepSeek-V4-Flash.md", mso=True,
+        {"a2": "w4a8", "a3": "w4a8"}, SINGLE_MTP_PROPOSAL_TOKEN, "DeepSeek-V4-Flash.md", mso=True,
         topologies={
             "a5": _topo(
                 colocated={"dp": 8, "tp": 1, "ep": 8, "block_size": 32, "kv_cache_dtype": "fp8"},
@@ -368,8 +368,8 @@ VA_RECOMMENDED_PROFILES: dict[str, dict[str, Any]] = {
         tutorial_flags={"enable_flashcomm1": True, "enable_fused_mc2": 1},
     ),
     "glm-5.3": _p(
-        {"a2": "w8a8", "a3": "w8a8"}, MTP_STANDARD_PROPOSAL_TOKENS, "GLM5.2.md", mlapo=True, mso=True,
-        topologies={"a5": _topo(colocated={"dp": 8, "tp": 4, "ep": 32, "kv_cache_dtype": "int8"})},
+        {"a2": "w8a8", "a3": "w8a8", "a5": "mxfp8"}, MTP_STANDARD_PROPOSAL_TOKENS, "GLM5.2.md", mlapo=True, mso=True,
+        topologies={"a5": _topo(colocated={"dp": 8, "tp": 4, "ep": 32, "kv_cache_dtype": "fp8"})},
         tutorial_flags={"enable_flashcomm1": True, "enable_fused_mc2": 1},
     ),
     "glm-5.3-flash": _p(
@@ -423,7 +423,7 @@ VA_RECOMMENDED_PROFILES: dict[str, dict[str, Any]] = {
     "kimi-k3-dspark": _p({}, NO_MTP_PROPOSAL_TOKENS, "Kimi-K3.md", sp=False),
     "kimi-k3-dspark-block5": _p({}, NO_MTP_PROPOSAL_TOKENS, "Kimi-K3.1-Pro.md", mlapo=True, sp=False),
     "qwen3-235b-a22b": _p({"a2": "w8a8", "a3": "w8a8", "a5": "mxfp8"}, NO_MTP_PROPOSAL_TOKENS, "Qwen3-MoE.md"),
-    "qwen3-30b-a3b": _p({"a2": "w8a8", "a3": "w8a8"}, NO_MTP_PROPOSAL_TOKENS, "Qwen3-MoE.md"),
+    "qwen3-30b-a3b": _p({"a2": "w8a8", "a3": "w8a8", "a5": "mxfp8"}, NO_MTP_PROPOSAL_TOKENS, "Qwen3-MoE.md"),
     "qwen3-32b": _p({"a2": "w8a8", "a3": "w8a8", "a5": "mxfp8"}, NO_MTP_PROPOSAL_TOKENS, "Qwen3.md", sp=False),
     "qwen3-next-80b-a3b": _p(
         {"a2": "w8a8", "a3": "w8a8", "a5": "mxfp8"}, SINGLE_MTP_PROPOSAL_TOKEN, "Qwen3-Next.md", mso=True,
@@ -460,7 +460,7 @@ VA_RECOMMENDED_PROFILES: dict[str, dict[str, Any]] = {
         tutorial_flags={"enable_flashcomm1": True, "enable_fused_mc2": 1},
     ),
     "qwen3.8-2.4t-a95b": _p(
-        {"a2": "w8a8", "a3": "w8a8", "a5": "mxfp8"}, MTP_STANDARD_PROPOSAL_TOKENS, "Qwen3.8-2.4T.md", mso=True,
+        {"a2": "w4a8", "a3": "w4a8", "a5": "mxfp8"}, MTP_STANDARD_PROPOSAL_TOKENS, "Qwen3.8-2.4T.md", mso=True,
         topologies={
             "a5": _topo(colocated={"dp": 8, "tp": 8, "ep": 64}),
             "a3": _topo(colocated={"dp": 4, "tp": 16, "ep": 64}),
@@ -493,7 +493,7 @@ VA_RECOMMENDED_PROFILES: dict[str, dict[str, Any]] = {
     ),
     "minimax-m3.1-flash": _p(
         {"a2": "w8a8", "a3": "w8a8", "a5": "mxfp8"}, MTP_KIMI_K3_PROPOSAL_TOKENS, "MiniMax-M3.1-Flash.md", mso=True,
-        topologies={"a5": _topo(colocated={"dp": 4, "tp": 4, "ep": 16})},
+        topologies={"a5": _topo(colocated={"dp": 4, "tp": 4, "ep": 16, "kv_cache_dtype": "fp8"})},
     ),
     "step-5-preview": _p(
         {"a5": "mxfp8"}, MTP_STANDARD_PROPOSAL_TOKENS, "Step-5-Preview.md", mso=True,

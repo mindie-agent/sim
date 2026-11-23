@@ -232,8 +232,7 @@ def _normalize_family_plans(
                                                 DEFAULT_CANDIDATE_BLOCK_SIZE)),
         candidate_topk_blocks=_int(c, "candidate_topk_blocks",
                                                DEFAULT_CANDIDATE_TOPK_BLOCKS),
-        qk_norm=(plan.qk_norm or (family == "qwen" and plan.attention == "gqa"))
-        if family == "qwen" else False,
+        qk_norm=(plan.qk_norm or (family == "qwen" and plan.attention == "gqa")),
     ) for plan in plans]
     if family == "kimi" and c.get("dsa_config"):
         plans = [replace(plan, index_query_per_layer=plan.indexer) for plan in plans]

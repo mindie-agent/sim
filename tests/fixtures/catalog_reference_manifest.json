@@ -729,9 +729,9 @@
           "dense": 3,
           "moe": 58
         },
-        "index_dtype": "bf16",
+        "index_dtype": "int8",
         "index_k_layers": 61,
-        "index_scale_dtype": "none",
+        "index_scale_dtype": "fp16",
         "kv_dtype": "bf16",
         "layers": 61,
         "recurrent_layers": 0,
@@ -743,8 +743,8 @@
       "parameter_scope": "text_backbone",
       "quantization": {
         "expert_dtype": "",
-        "index_dtype": "bf16",
-        "index_scale_dtype": "none",
+        "index_dtype": "int8",
+        "index_scale_dtype": "fp16",
         "kv_dtype": "bf16",
         "native_dtype": "bfloat16",
         "scheme": "fp8",
@@ -882,7 +882,7 @@
       "auxiliary_modes": {
         "block_size": 5,
         "kind": "dspark",
-        "layers": 3,
+        "layers": 1,
         "standalone": false,
         "target_layer_ids": [
           58,
@@ -1123,7 +1123,7 @@
       "auxiliary_modes": {
         "block_size": 5,
         "kind": "dspark",
-        "layers": 3,
+        "layers": 1,
         "standalone": false,
         "target_layer_ids": [
           40,
@@ -1308,7 +1308,7 @@
       "auxiliary_modes": {
         "block_size": 5,
         "kind": "dspark",
-        "layers": 3,
+        "layers": 1,
         "standalone": false,
         "target_layer_ids": [
           58,
@@ -6715,7 +6715,7 @@
         "window": 0
       },
       "config": "mindie_sim/model_configs/qwen3.5-27b.json",
-      "config_sha256": "16bcb0acef89ec5a9eaba99f1ba49e20feea2036150e28ea9e2cd4b6cdcba9c8",
+      "config_sha256": "61cc8f0cd261f5508c9aea499237cfeb90757aa0f1deb7b185a1afbcd0348697",
       "family": "qwen",
       "parameter_scope": "text_backbone",
       "quantization": {

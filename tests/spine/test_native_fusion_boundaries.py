@@ -437,7 +437,10 @@ def by_id(ops):
 def outputs(ports_or_values):
     return {entry.get('output') for entry in ports_or_values}
 def test_quantized_ports_attach_only_to_the_matrix_activation_operand():
-    ops = by_id(_ops(_case('deepseek-v3.2', ep=1, quant='w8a8'), phase='decode', tokens=1, context=128))
+    ops = by_id(_ops(
+        _case('deepseek-v3.2', ep=1, quant='w8a8', exclude_optimizations=('mla_prolog_fusion',)),
+        phase='decode', tokens=1, context=128,
+    ))
     assert outputs(input_ports(ops['s0.l1.q_a.quantize'])) == {'residual'}
     assert {'payload', 'activation_scales'} <= outputs(input_ports(ops['s0.l1.q_a']))
 def test_moe_routing_accounts_for_the_inverse_permutation():

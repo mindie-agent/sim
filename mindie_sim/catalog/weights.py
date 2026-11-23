@@ -312,12 +312,30 @@ def _output_res_quant(model: ModelSpec) -> QuantSpec:
     return replace(base, category_overrides=merged)
 
 
+def _ngram_embedding_terms(model: ModelSpec) -> list[WeightTerm]:
+    """LongCat-Flash-Lite packed N-gram embedding tables (BF16, out_tp sharded)."""
+    cfg = dict(getattr(model, "metadata", ()) or ()).get("ngram_embedding")
+    if not isinstance(cfg, Mapping):
+        return []
+    ratio = int(cfg.get("ngram_vocab_size_ratio") or 0)
+    neighbors = int(cfg.get("emb_neighbor_num") or 0)
+    splits = int(cfg.get("emb_split_num") or 0)
+    if ratio <= 0 or neighbors <= 1 or splits <= 0:
+        return []
+    num_tables = splits * (neighbors - 1)
+    table_width = max(1, int(model.hidden_size) // num_tables)
+    base_rows = int(model.vocab_size) * ratio
+    total_rows = sum(base_rows + 2 * i + 1 for i in range(num_tables))
+    return [_t("ngram_embedding", total_rows, table_width, "embedding", "out_tp")]
+
+
 def body_head_terms(model: ModelSpec) -> list[WeightTerm]:
     h = model.hidden_size
     lowrank_hc = any(plan.hc_lowrank > 0 for plan in model.layer_plans)
     terms = [] if lowrank_hc else [_t("final_norm", h, 1, "norm")]
     if not model.is_standalone_draft:
         terms.insert(0, _t("embedding", model.vocab_size, h, "embedding", "embedding"))
+        terms.extend(_ngram_embedding_terms(model))
         if not model.tie_word_embeddings:
             terms.append(replace(_t("lm_head", model.vocab_size, h, "lm_head", "out_tp"), placement_role="logits"))
     if any(plan.residual_block_size for plan in model.layer_plans):

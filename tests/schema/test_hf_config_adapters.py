@@ -309,7 +309,7 @@ def test_architecture_presets_reach_real_frontend_and_engine(key: str) -> None:
     raw["runtime"]["kernels"] = {"programs": {"matmul": {"kind": "steady_matmul"}}}
     graph = graph_costs(raw, target_graphs(raw, phase="prefill", tokens=1), isolated=False)
     assert graph["duration_ms"] > 0 and graph["execution"]["live_tasks"] == 0
-    assert graph["model_coverage"] == "partial"
+    assert graph["model_coverage"] == ("complete" if key == "qwen3.5-moe" else "partial")
     assert predict(raw)["status"] == "modeled"
 
 @pytest.mark.parametrize("short,canonical", ( ("deepseek-v4-flash", "deepseek-v4-flash-0731"),
@@ -323,7 +323,8 @@ def test_quant_aliases_preserve_real_packed_bytes_and_checkpoint_exclusions() ->
     w4 = quant_preset("w4a8")
     assert w4 == quant_preset("w4a8_dynamic")
     assert w4.matrix_bytes(3, 5, "routed_expert") == 3 * 3 + 3 * 4
-    assert w4.matrix_bytes(3, 5, "attn") == 3 * 5 + 3 * 4 * 2
+    assert w4.matrix_bytes(3, 5, "attn") == 3 * 5 + 3 * 2
+    assert w4.matrix_bytes(3, 5, "attn", source=True) == 3 * 5 + 3 * 4 * 2
     assert quant_preset("w8a8") == quant_preset("w8a8_dynamic")
     assert quant_preset("bf16").matrix_bytes(3, 5, "routed_expert") == 3 * 5 * 2
     fp8 = quant_preset(" FP8 ")

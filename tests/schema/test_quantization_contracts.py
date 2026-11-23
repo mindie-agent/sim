@@ -306,12 +306,12 @@ def mxa8w4(activation="fp8_e4m3", *, category="moe.routed"):
 def test_structural_identity_and_two_argument_dtype_contract():
     op = mxa8w4()
     metadata = dict(op.metadata)
-    assert op.dtype == "bf16"
+    assert op.dtype == "fp8_e4m3"
     assert tuple(metadata[key] for key in ("weight_format", "activation_format", "output_format")) == (
         "mxfp4", "fp8_e4m3", "bf16")
     assert compute_dtype_for(quant(weight_format="mxfp4",
                                    activation_format="fp8_e4m3"),
-                             "moe.routed") == ("bf16", "fp8_e4m3")
+                             "moe.routed") == ("fp8_e4m3", "fp8_e4m3")
     assert metadata["compute_format_origin"] == "catalog_default"
 
 def test_eligible_generic_work_resolves_to_native_fp8():
@@ -321,7 +321,7 @@ def test_eligible_generic_work_resolves_to_native_fp8():
     metadata = dict(resolved.metadata)
     assert resolved.dtype == "fp8_e4m3"
     assert resolve_matrix_precision(resolved, devices=ascend_dies(), policy="auto", recipe=None) == resolved
-    assert metadata["declared_compute_format"] == "bf16"
+    assert metadata["declared_compute_format"] == "fp8_e4m3"
     assert metadata["execution_compute_format"] == "fp8_e4m3"
     assert metadata["weight_format"] == "mxfp4"
     assert metadata["activation_format"] == "fp8_e4m3"
@@ -358,7 +358,7 @@ def test_declared_policy_and_source_bound_identity_are_preserved():
     source = replace(op, source_boundary="kernel")
     kept = resolve_matrix_precision(source, devices=ascend_dies(), policy="auto",
                                     recipe=None)
-    assert kept.dtype == "bf16"
+    assert kept.dtype == "fp8_e4m3"
     assert dict(kept.metadata)["precision_resolution_reason"] == "explicit_compute_identity"
     explicit = gemm_op(
         op_id="e", deps=(), stage=0, layer=0, requests=(), m=2, n=8, k=8,
@@ -425,7 +425,7 @@ def test_fp4_preserves_declared_fp8_payload_and_real_mx_quantization_producer():
         m=3, n=5, k=65, quant=quant_plan(), category="shared_expert", phase="prefill",
     )
     meta = dict(op.metadata)
-    assert op.dtype == "bf16"  # Explicit expanded compute; no FP4 peak inferred.
+    assert op.dtype == "fp8_e4m3"
     assert op.flops == 1950
     assert (meta["weight_format"], meta["activation_format"]) == ("mxfp4", "fp8_e4m3")
     assert (meta["activation_scale_shape"], meta["activation_scale_bytes"]) == ((3, 2, 2), 12)

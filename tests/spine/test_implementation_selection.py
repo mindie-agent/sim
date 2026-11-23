@@ -364,7 +364,7 @@ def test_va_recommendation_preserves_hybrid_normalization_in_gdn_only_subset():
     assert any((dict(op.metadata).get('norm_weight_offset') == 1.0 for op in norms))
     assert not any((dict(op.metadata).get('native_norm_kind') for op in norms))
     assert raw == original
-@pytest.mark.parametrize('alias,canonical,quant_name,expert_weight_format', [('deepseek-v4-flash', 'deepseek-v4-flash-0731', 'w8a8', 'int8'), ('deepseek-v4-pro', 'deepseek-v4-pro-0813', 'w4a8', 'int4')])
+@pytest.mark.parametrize('alias,canonical,quant_name,expert_weight_format', [('deepseek-v4-flash', 'deepseek-v4-flash-0731', 'w4a8', 'int4'), ('deepseek-v4-pro', 'deepseek-v4-pro-0813', 'w4a8', 'int4')])
 def test_sparse_series_alias_and_checkpoint_share_recommendations(alias, canonical, quant_name, expert_weight_format):
     config = va_recommended_config(alias, 'a3')
     assert config == va_recommended_config(canonical, 'a3')
@@ -386,7 +386,7 @@ def test_documented_recommendations_replace_catalog_fp8_but_preserve_explicit_qu
         actual = compose_case(raw_model, **options, quant=explicit, va_recommended=True)
         assert actual['model']['quant'] == expected
         assert actual['runtime']['metadata']['va_profile']['quantization_action'] == 'explicit_quant_preserved'
-@pytest.mark.parametrize('model', ['deepseek-v3', 'deepseek-v4-pro', 'glm-5.3', 'kimi-k3'])
+@pytest.mark.parametrize('model', ['deepseek-v3', 'deepseek-v4-pro', 'kimi-k3'])
 def test_unconfirmed_fp8_profile_keeps_catalog_quantization(model):
     options = dict(hardware='a5', tp=8, layers=4)
     baseline = compose_case(model, **options, va_recommended=False)

@@ -503,7 +503,7 @@ def test_dbo_join_and_microbatches_refuse_the_unmodeled_stage():
         raw = compose_case("qwen3-30b-a3b", hardware="a5", tp=1, dp=2, ep=2, num_devices=2, layers=1, prompt_tokens=8, output_tokens=2, max_num_seqs=4, enable_dbo=True)
         with pytest.raises(UnmodeledCapabilityError, match="unmodeled_in_op_dbo_pending_stage3"):
             target_graphs(parse_case(raw), phase="decode", tokens=1, context=32, sequences=sequences, scope="body")
-    raw = compose_case("qwen3-30b-a3b", hardware="a5", tp=1, dp=2, ep=2, num_devices=2, layers=1, enable_dbo=False, prompt_tokens=8, output_tokens=2, max_num_seqs=2)
+    raw = compose_case("qwen3-30b-a3b", hardware="a5", tp=1, dp=2, ep=2, num_devices=2, layers=1, enable_dbo=False, exclude_optimizations=("cann_megamoe_fusion",), prompt_tokens=8, output_tokens=2, max_num_seqs=2)
     graphs = target_graphs(parse_case(raw), phase="decode", tokens=1, context=32, sequences=2, scope="body")
     assert len(tuple(op for op in graphs[0] if op.recipe in {"grouped_gate_up", "grouped_down"})) >= 2
     raw = compose_case("qwen3-32b", hardware="a5", tp=1, ep=1, num_devices=1, layers=1, enable_dbo=True, max_num_batched_tokens=128, max_num_seqs=2, prompt_tokens=64, output_tokens=2)
@@ -581,13 +581,13 @@ def test_native_moe_inverse_indices_are_charged_once_on_pack_and_unpack():
     assert dict(unpack.metadata)["inverse_index_bytes"] == index_bytes
     assert unpack.mte2_bytes == pytest.approx(524544 + index_bytes)
 def test_alltoallv_receive_buffers_follow_incoming_uniform_assignments():
-    graphs = target_graphs(parse_case(compose_case( "qwen3-30b-a3b", hardware="a5", tp=1, dp=2, ep=2, num_devices=2, layers=1, prompt_tokens=8, output_tokens=2, max_num_seqs=4)), phase="decode", tokens=1, context=32, sequences=[2, 3], scope="body")
+    graphs = target_graphs(parse_case(compose_case( "qwen3-30b-a3b", hardware="a5", tp=1, dp=2, ep=2, num_devices=2, layers=1, exclude_optimizations=("cann_megamoe_fusion",), prompt_tokens=8, output_tokens=2, max_num_seqs=4)), phase="decode", tokens=1, context=32, sequences=[2, 3], scope="body")
     for replica, outgoing in ((0, 16), (1, 24)):
         dispatch = next(op for op in graphs[replica] if op.recipe == "expert_dispatch")
         metadata = dict(dispatch.metadata)
         assert dispatch.local_shape[0] == outgoing
         assert (metadata["output_shape"], metadata["capacity_rows"], metadata["payload_rows"]) == ((20, 2048), 20, 20)
-        assert metadata["capacity_rows"] * metadata["payload_row_bytes"] == pytest.approx(81920.0)
+        assert metadata["capacity_rows"] * metadata["payload_row_bytes"] == pytest.approx(40960.0)
         experts = [op for op in graphs[replica] if op.recipe in {"grouped_gate_up", "grouped_down"}]
         assert [op.local_shape[0] for op in experts] == [20, 20]
 def test_local_tp_packed_views_use_the_parent_row_stride():

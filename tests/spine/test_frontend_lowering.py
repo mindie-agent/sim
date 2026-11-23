@@ -546,13 +546,12 @@ def test_feedforward_and_collective_lowering_enforce_mutex_and_architecture_guar
         "deepseek-v3.2", REPRESENTATIVE_SKUS["a5"],
         tp=1, dp=8, ep=8, layers=4, feature_track="merged",
     )
-    # Shipping Before track activates MLAPO lowering on eligible MLA layers.
+    # Shipping Before track activates MLAPO native fusion on eligible MLA layers.
     merged_ops = target_graphs(parse_case(base), phase="decode", tokens=1, context=128, sequences=1, scope="body")[0]
     assert any(
-        group.get("role") == "mla_prolog"
-        and group.get("fusion_status") == "fused_framework_enable"
+        item.op_id.endswith(".mla_prolog.native")
+        and dict(item.metadata).get("fusion_role") == "mla_prolog"
         for item in merged_ops
-        for group in dict(item.metadata).get("structure_subgraphs", ())
     )
 
     # Raw uncomposed runtime with BOTH enable_fused_mc2 > 0 and MSO enabled:

@@ -8,8 +8,8 @@
 
 [Invariants]
   * GEMM work remains 2*M*N*K; packed weight bytes never change logical FLOPs.
-  * FP4 experts are dequantized to a declared compute format; no unsupported
-    FP4 hardware peak is inferred.
+  * FP4/MXFP4 compute dtype follows the paired activation format (mxfp4 for FP4
+    activations, fp8_e4m3 for FP8 activations, bf16 for BF16/FP16 W4A16).
   * Every op has distinct semantic/local/padded/launch shapes.
   * A cache store is a real dependent event; a shared consumer must depend on
     the producer store or an explicit cross-stage transfer.
@@ -35,6 +35,8 @@ W4A16_DEQUANT_OPS_PER_WEIGHT = 3
 #: Packed integer weights whose activation stays floating point dequantize
 #: in-kernel; the op's compute identity is that activation format.
 W4A16_WEIGHT_FORMATS = frozenset({"int4", "w4a8"})
+FP4_FORMATS = frozenset({"mxfp4", "fp4", "fp4_e2m1"})
+FP8_FORMATS = frozenset({"fp8", "fp8_e4m3", "fp8_e5m2", "mxfp8"})
 INT8_EPILOGUE_FP32_OPS = 3
 INT8_EPILOGUE_CAST_OPS = 4
 CUBE_TILE_ALIGN = 16
@@ -61,19 +63,23 @@ def compute_dtype_for(quant: QuantSpec, category: str) -> tuple[str, str]:
         if quant.activation_format == "int8":
             return "int8", "int8"
         return quant.activation_format, quant.activation_format
-    if fmt in {"mxfp4", "fp4", "fp4_e2m1"}:
-        # Explicit dequant/accumulation path; not an FP4 peak claim.
+    if fmt in FP4_FORMATS:
+        act = str(quant.activation_format).strip().lower()
+        if act in FP4_FORMATS:
+            return "mxfp4", quant.activation_format
+        if act in FP8_FORMATS:
+            return ("fp8_e5m2" if act == "fp8_e5m2" else "fp8_e4m3"), quant.activation_format
         return "bf16", quant.activation_format
-    if fmt in {"fp8", "fp8_e4m3", "fp8_e5m2"}:
-        act = quant.activation_format
-        if act in {"fp8", "fp8_e4m3", "fp8_e5m2"}:
+    if fmt in FP8_FORMATS:
+        act = str(quant.activation_format).strip().lower()
+        if act in FP8_FORMATS:
             return "fp8_e4m3", "fp8_e4m3"
         return "bf16", "bf16"
     raise ModelingError(f"compute_format_undeclared:{category}:{fmt}")
 
 
 _LOW_OUTPUT_ACTIVATIONS = frozenset({
-    "int8", "fp8", "fp8_e4m3", "fp8_e5m2", "fp4", "fp4_e2m1",
+    "int8", "fp8", "fp8_e4m3", "fp8_e5m2", "mxfp8", "fp4", "fp4_e2m1", "mxfp4",
 })
 
 
@@ -395,7 +401,7 @@ def activation_scales(quant, dtype, rows, cols):
         groups = (cols + group - 1) // group
         scale_format = quant.execution_activation_scale_format(dtype)
         return group, scale_format, (rows,) if groups == 1 else (rows, groups), float(rows * groups * dtype_bytes(scale_format))
-    if dtype in {"fp8", "fp8_e4m3", "fp8_e5m2", "fp4_e2m1"}:
+    if dtype in (FP8_FORMATS | FP4_FORMATS):
         group = quant.activation_group_size or cols
         groups = (cols + group - 1) // group
         scale_format = quant.activation_scale_format or quant.scale_format

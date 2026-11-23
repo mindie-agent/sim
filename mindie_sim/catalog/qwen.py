@@ -191,11 +191,14 @@ def _aux_qwen(c: Mapping[str, Any]) -> AuxiliarySpec:
     kv_heads = int(c["num_key_value_heads"])
     head_dim = int(c["head_dim"])
     gate = _qwen_output_gate(c)
+    partial = declared_partial_rotary(c)
+    rope_dim, nope_dim = rotary_dimensions(head_dim, partial)
     experts = _int(c, "num_experts")
     moe_i = _int(c, "moe_intermediate_size") if experts else _int(c, "intermediate_size")
     mtp = DraftSpec(
         kind="mtp", layers=nextn, hidden_size=h, intermediate_size=moe_i,
         num_heads=heads, num_kv_heads=kv_heads, head_dim=head_dim,
+        qk_rope_head_dim=rope_dim, qk_nope_head_dim=nope_dim,
         q_width=(2 if gate else 1) * heads * head_dim,
         kv_width=kv_heads * head_dim, attention_kind="gqa",
         kv_cache_elements=2 * kv_heads * head_dim,
@@ -243,6 +246,7 @@ def _dspark_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
                 qk_nope_head_dim=nope, qk_rope_head_dim=rope, v_head_dim=v_dim,
                 head_dim=head_dim, mla_variant="latent_mla",
                 mla_output_gate=bool(c.get("mla_use_output_gate", False)),
+                packed_input_projection=True,
                 kv_cache_elements=kv_lora + rope, intermediate_size=dense_i,
                 noncausal_attention=not causal,
                 kv_owner_layer_id=index, native_layer_id=index, scope="body",
@@ -257,6 +261,7 @@ def _dspark_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
             index=index, attention="gqa", architecture="gqa", ffn="dense",
             num_heads=heads, num_kv_heads=kv_heads, head_dim=head_dim,
             intermediate_size=dense_i,
+            qk_norm=True,
             noncausal_attention=True,
             kv_cache_elements=2 * kv_heads * head_dim,
             kv_owner_layer_id=index,
