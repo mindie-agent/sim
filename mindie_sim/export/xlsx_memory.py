@@ -15,11 +15,15 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Any
 
+from .memory_ledger import (
+    _PREPARED_WEIGHT_GROUP,
+    C8_CACHE_WIDTH_BYTES,
+    FP8_CACHE_WIDTH_BYTES,
+    KV_DTYPE_SENSITIVE_COMPONENTS,
+)
 from .models import (
     BF16_BYTES,
-    FP32_BYTES,
     GIB_BYTES,
-    KV_QUANT_GROUP_SIZE,
     MIB_BYTES,
     MIN_DENOM_EPS,
     QUANT_RULE_CHECKPOINT_IGNORE,
@@ -63,8 +67,11 @@ from .xlsx_summary import (
     write_row,
 )
 
-#: Cache bytes/elem factor matching closed-form memory ledger formulas.
-C8_CACHE_FACTOR = 1.0 + float(FP32_BYTES) / float(KV_QUANT_GROUP_SIZE)
+#: Default Sheet 3 quant mode preserving every row's evaluated format and scale bytes.
+QUANT_MODE_AS_EVALUATED = "As evaluated"
+#: Cache bytes/elem factors matching closed-form memory ledger formulas.
+C8_CACHE_FACTOR = C8_CACHE_WIDTH_BYTES
+FP8_CACHE_FACTOR = FP8_CACHE_WIDTH_BYTES
 
 #: Sheet 3 structural layout constants (24 columns A..X).
 MEMORY_COLS = 24
@@ -159,7 +166,7 @@ def _populate_memory_control_panel(
     ws.set_cell(2, c_lbl, "Parallel & Quant Control Panel", style=STYLE_SECTION)
     ws.merge_range(2, c_lbl, 2, c_val)
     controls: tuple[tuple[str, Any, str | None, int], ...] = (
-        ("Weight Quant Preset", mem.weight_quant, None, STYLE_INPUT_TEXT),
+        ("Weight Quant Preset", QUANT_MODE_AS_EVALUATED, None, STYLE_INPUT_TEXT),
         ("KV/Indexer/KeyPool Dtype", mem.cache_dtype, None, STYLE_INPUT_TEXT),
         ("Engram / PLE Host Offload", "ON" if mem.engram_host_offload else "OFF", None, STYLE_INPUT_TEXT),
         ("Apply Preset To Ignored Attn/Linear", "ON" if mem.apply_preset_to_ignored else "OFF", None, STYLE_INPUT_TEXT),
@@ -188,7 +195,8 @@ def _populate_memory_control_panel(
         ws.set_cell(r, c_lbl, label, style=STYLE_TEXT)
         ws.set_cell(r, c_val, val, formula=formula, style=style)
 
-    ws.add_data_validation("T3", formula1='"' + ",".join(w_opts) + '"')
+    w_dropdown = (QUANT_MODE_AS_EVALUATED, *(opt for opt in w_opts if opt != QUANT_MODE_AS_EVALUATED))
+    ws.add_data_validation("T3", formula1='"' + ",".join(w_dropdown) + '"')
     ws.add_data_validation("T4", formula1='"' + ",".join(c_opts) + '"')
     ws.add_data_validation("T5", formula1='"ON,OFF"')
     ws.add_data_validation("T6", formula1='"OFF,ON"')
@@ -207,8 +215,8 @@ def _populate_memory_control_panel(
     return MEMORY_LOOKUP_FIRST_ROW + len(lookup_order) - 1
 
 
-def _quant_format_formula(quant_rule: str, arch: str) -> str | None:
-    """Return hardware-scoped live Excel formula linking Col J to Control Panel $T$3 & $T$6."""
+def _quant_format_formula(quant_rule: str, eval_fmt: str, arch: str) -> str | None:
+    """Return hardware-scoped live Excel formula honoring ``As evaluated`` default mode."""
     if quant_rule in {QUANT_RULE_FIXED_BF16, QUANT_RULE_FIXED_FP32}:
         return None
     if arch == "a5":
@@ -218,10 +226,21 @@ def _quant_format_formula(quant_rule: str, arch: str) -> str | None:
     else:
         linear_expr = f'IF({MEM_CTL_QUANT_REF}="W4A8","W8A8",IF({MEM_CTL_QUANT_REF}="MXFP4","MXFP8",{MEM_CTL_QUANT_REF}))'
     if quant_rule == QUANT_RULE_PRESET_LINEAR_FP8:
-        return f"={linear_expr}"
-    if quant_rule == QUANT_RULE_CHECKPOINT_IGNORE:
-        return f'=IF({MEM_CTL_OVERRIDE_IGN_REF}="ON",{linear_expr},"BF16")'
-    return f"={MEM_CTL_QUANT_REF}"
+        what_if_expr = linear_expr
+    elif quant_rule == QUANT_RULE_CHECKPOINT_IGNORE:
+        what_if_expr = f'IF({MEM_CTL_OVERRIDE_IGN_REF}="ON",{linear_expr},"BF16")'
+    else:
+        what_if_expr = MEM_CTL_QUANT_REF
+    return f'=IF({MEM_CTL_QUANT_REF}="{QUANT_MODE_AS_EVALUATED}","{eval_fmt}",{what_if_expr})'
+
+
+def _cache_width_factor(dtype_name: str) -> float:
+    upper = str(dtype_name or "BF16").strip().upper()
+    if upper == "BF16":
+        return float(BF16_BYTES)
+    if upper == "FP8":
+        return FP8_CACHE_FACTOR
+    return C8_CACHE_FACTOR
 
 
 def _populate_cache_block(
@@ -238,15 +257,23 @@ def _populate_cache_block(
     ws.merge_range(hdr_row, MEMORY_CACHE_BASIS_START_COL, hdr_row, MEMORY_TABLE_END_COL)
 
     c_start = hdr_row + 1
-    base_width = float(BF16_BYTES) if mem.cache_dtype == "BF16" else C8_CACHE_FACTOR
-    live_width = f'IF({MEM_CTL_CACHE_REF}="BF16",{BF16_BYTES},{C8_CACHE_FACTOR!r})'
+    base_width = _cache_width_factor(mem.cache_dtype)
+    live_width = (
+        f'IF({MEM_CTL_CACHE_REF}="BF16",{BF16_BYTES},'
+        f'IF({MEM_CTL_CACHE_REF}="FP8",{FP8_CACHE_FACTOR!r},{C8_CACHE_FACTOR!r}))'
+    )
     opts_txt = "/".join(c_opts)
     for offset, row in enumerate(mem.cache_rows):
         r = c_start + offset
+        kv_scaled = row.component in KV_DTYPE_SENSITIVE_COMPONENTS
         if row.scales_with_tokens and row.max_stage_layers > 0 and row.bytes_per_token_per_layer > 0.0:
-            rate_formula: str | None = f"={row.bytes_per_token_per_layer!r}*{live_width}/{base_width!r}"
+            if kv_scaled:
+                rate_formula: str | None = f"={row.bytes_per_token_per_layer!r}*{live_width}/{base_width!r}"
+                basis = f"Scales with Local Cache Tokens & KV Dtype ({opts_txt}, active={mem.cache_dtype})"
+            else:
+                rate_formula = None
+                basis = f"Scales with Local Cache Tokens (independent dtype: {row.cache_kind})"
             req_formula: str | None = f"=C{r}*D{r}*{MEM_CTL_LOCAL_TOK_REF}/{MIB_BYTES}"
-            basis = f"Scales with Local Cache Tokens ({opts_txt}, active={mem.cache_dtype})"
         else:
             rate_formula = None
             req_formula = None
@@ -474,7 +501,24 @@ def populate_memory_sheet(ws: Worksheet, bundle: ExportBundle) -> None:
         else:
             res_text = f"NPU HBM ({row.quant_note})" if row.quant_note else "NPU HBM"
             res_formula = None
-        q_formula = _quant_format_formula(row.quant_rule, arch)
+        q_formula = (
+            None if row.group == _PREPARED_WEIGHT_GROUP
+            else _quant_format_formula(row.quant_rule, row.quant_format, arch)
+        )
+        if row.group == _PREPARED_WEIGHT_GROUP:
+            payload_formula: str | None = None
+            scale_formula: str | None = None
+            aux_formula: str | None = None
+        else:
+            vlookup_p = f"F{r}*ROUNDUP(G{r}*VLOOKUP(J{r},{lookup_ref},2,FALSE),0)*H{r}"
+            vlookup_s = (
+                f"IF(VLOOKUP(J{r},{lookup_ref},3,FALSE)>0,"
+                f"F{r}*ROUNDUP(G{r}/VLOOKUP(J{r},{lookup_ref},3,FALSE),0)*H{r},0)"
+            )
+            vlookup_a = f"F{r}*VLOOKUP(J{r},{lookup_ref},4,FALSE)*H{r}"
+            payload_formula = f'=IF({MEM_CTL_QUANT_REF}="{QUANT_MODE_AS_EVALUATED}",{int(row.payload_bytes)},{vlookup_p})'
+            scale_formula = f'=IF({MEM_CTL_QUANT_REF}="{QUANT_MODE_AS_EVALUATED}",{int(row.scale_bytes)},{vlookup_s})'
+            aux_formula = f'=IF({MEM_CTL_QUANT_REF}="{QUANT_MODE_AS_EVALUATED}",{int(row.aux_bytes)},{vlookup_a})'
         native_gib = float(row.native_bf16_bytes) / float(GIB_BYTES)
         write_row(ws, r, (
             (row.name, None, STYLE_TEXT), (row.global_rows, None, STYLE_INT),
@@ -483,9 +527,9 @@ def populate_memory_sheet(ws: Worksheet, bundle: ExportBundle) -> None:
             (row.peak_stage_repeats, None, STYLE_INT),
             (row.quant_rule, None, STYLE_TEXT),
             (row.quant_format, q_formula, STYLE_INPUT_TEXT if q_formula else STYLE_TEXT),
-            (row.payload_bytes, f"=F{r}*ROUNDUP(G{r}*VLOOKUP(J{r},{lookup_ref},2,FALSE),0)*H{r}", STYLE_INT),
-            (row.scale_bytes, f"=IF(VLOOKUP(J{r},{lookup_ref},3,FALSE)>0,F{r}*ROUNDUP(G{r}/VLOOKUP(J{r},{lookup_ref},3,FALSE),0)*H{r},0)", STYLE_INT),
-            (row.aux_bytes, f"=F{r}*VLOOKUP(J{r},{lookup_ref},4,FALSE)*H{r}", STYLE_INT),
+            (row.payload_bytes, payload_formula, STYLE_INT),
+            (row.scale_bytes, scale_formula, STYLE_INT),
+            (row.aux_bytes, aux_formula, STYLE_INT),
             (native_gib, f"=F{r}*G{r}*{BF16_BYTES}*H{r}/{GIB_BYTES}", STYLE_FLOAT3),
             (float(row.per_die_bytes) / float(GIB_BYTES), f"=(K{r}+L{r}+M{r})/{GIB_BYTES}", STYLE_FLOAT3),
             (res_text, res_formula, STYLE_OVERLAP if row.is_engram_or_ple or row.is_vision else STYLE_TEXT),
@@ -543,4 +587,4 @@ def populate_memory_sheet(ws: Worksheet, bundle: ExportBundle) -> None:
     )
 
 
-__all__ = ["populate_memory_sheet"]
+__all__ = ["MEMORY_COLS", "QUANT_MODE_AS_EVALUATED", "populate_memory_sheet"]

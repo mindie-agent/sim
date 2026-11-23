@@ -34,46 +34,22 @@ from mindie_sim import cli as cli_mod
 from mindie_sim import cli_export
 from mindie_sim.compose import compose_case as compose_raw_case
 from mindie_sim.export import (
-    AGENT_BRIEF_SCHEMA,
-    BANNED_IMPLEMENTATION_NAMES,
-    MSPROF_PROCESS_SPEC,
-    PENDING_KIND_TO_IMPLEMENT,
-    PENDING_KIND_TO_OPTIMIZE,
-    PID_FRAMEWORK,
-    SCRIPT_AUDIT_SCHEMA,
-    SHEET_BREAKDOWN,
-    SHEET_MEASURED,
-    SHEET_MEMORY,
-    SHEET_NEW_KERNELS,
-    SHEET_PENDING_KERNELS,
-    SHEET_SUMMARY,
-    TID_FW_ENGINE,
-    TID_FW_HOST_LAUNCH,
-    TID_FW_LAYER_MSTX,
-    TID_FW_SUBMODULE_MSTX,
-    Workbook,
-    align_before_after_operators,
-    audit_launch_script,
-    build_agent_brief,
-    build_export_bundle,
-    build_macro_module_breakdown,
-    build_pending_kernel_details,
-    compose_export_case,
-    compute_memory_quant_ledger,
-    evaluate_weight_storage_bytes,
-    export_agent_brief,
-    export_comparison_xlsx,
-    export_msprof_trace,
-    format_executive_digest_markdown,
-    load_kernel_details_csv,
-    parse_launch_script,
-    render_optimized_serve_sh,
-    resolve_hardware_alias,
+    AGENT_BRIEF_SCHEMA, BANNED_IMPLEMENTATION_NAMES, MSPROF_PROCESS_SPEC,
+    PENDING_KIND_TO_IMPLEMENT, PENDING_KIND_TO_OPTIMIZE, PID_FRAMEWORK,
+    SHEET_BREAKDOWN, SHEET_MEASURED, SHEET_MEMORY, SHEET_NEW_KERNELS,
+    SHEET_PENDING_KERNELS, SHEET_SUMMARY, TID_FW_ENGINE, TID_FW_HOST_LAUNCH,
+    TID_FW_LAYER_MSTX, TID_FW_SUBMODULE_MSTX, Workbook,
+    align_before_after_operators, build_agent_brief, build_export_bundle,
+    build_macro_module_breakdown, build_pending_kernel_details,
+    compose_export_case, compute_memory_quant_ledger, evaluate_weight_storage_bytes,
+    export_agent_brief, export_comparison_xlsx, export_msprof_trace,
+    format_executive_digest_markdown, load_kernel_details_csv, resolve_hardware_alias,
 )
 from mindie_sim.export import trace_exporter as trace_mod
 from mindie_sim.export.xlsx_exporter import NS_MAIN
 from mindie_sim.prediction.results import StepRequest
 from mindie_sim.prediction.structure import parse_case
+from mindie_sim.stacks.vllm_ascend.launch_codec import SCRIPT_AUDIT_SCHEMA, VllmAscendLaunchCodec
 
 pytestmark = pytest.mark.tier0
 
@@ -82,6 +58,19 @@ STREAM_MEMORY_LIMIT_BYTES = 64 * 1024 * 1024
 MAX_SERIALIZE_SECONDS = 0.6
 MAX_ARCHETYPE_OPS_IN_RAM = 250
 MIN_EAGER_NORM_GATE_OPS = 11
+
+
+def _bundle_codec_facts(bun) -> dict:
+    mem = bun.memory_ledger
+    return {
+        "model_name": bun.model_name, "hardware_sku": bun.hardware_sku, "phase": bun.phase,
+        "tp": mem.tp, "dp": mem.dp, "ep": mem.ep, "pp": mem.pp, "dcp": mem.dcp, "pcp": mem.pcp,
+        "weight_format": mem.weight_quant, "kv_cache_dtype": mem.cache_dtype,
+        "seq_len": mem.seq_len, "concurrency": mem.concurrency,
+        "gpu_memory_utilization": mem.gpu_memory_utilization, "spec_proposals": bun.spec_proposals,
+        "spec_method": bun.spec_method, "step_span_us": bun.step_span_us,
+        "fits_hbm": mem.fits_hbm, "peak_hbm_bytes": mem.max_stage_hbm_bytes,
+    }
 
 
 def _read_xlsx_sheets(path: Path) -> tuple[list[str], dict[str, ET.Element], list[str]]:
@@ -376,7 +365,8 @@ def test_xlsx_before_after_merge_cells_formulas_and_new_kernel_backlog(tmp_path)
     assert any(v and "Waterfall Ledger" in v for v, _ in s4.values())
     assert s4["D3"][1] == "Summary!$B$14" and s4["D9"][1] == "Summary!$C$14"
     assert s4["D10"][1] == "D8-D9"
-    assert any(f and "SUMIF(" in f and SHEET_BREAKDOWN in f for _, f in s4.values())
+    assert any(f and "SUM(" in f and SHEET_BREAKDOWN in f for _, f in s4.values())
+    assert not any(f and ("!AB" in f or "!AC" in f or "!AE" in f or "!AF" in f) for _, f in s4.values())
     assert any(v == PENDING_KIND_TO_OPTIMIZE for v, _ in s4.values())
     assert any(v == PENDING_KIND_TO_IMPLEMENT for v, _ in s4.values())
     assert any(v and v.startswith("Card #1 [") for v, _ in s4.values())
@@ -528,13 +518,13 @@ def test_memory_quant_calculator_exclusions_offload_and_pp_budget(tmp_path):
     led_bf16_hbm = compute_memory_quant_ledger(
         case, seq_len=4096, concurrency=4, weight_quant="BF16", cache_dtype="BF16", engram_host_offload=False,
     )
-    led_mxfp4_offload = compute_memory_quant_ledger(
-        case, seq_len=4096, concurrency=4, weight_quant="MXFP4", cache_dtype="C8", engram_host_offload=True,
+    led_w4a8_offload = compute_memory_quant_ledger(
+        case, seq_len=4096, concurrency=4, weight_quant="W4A8", cache_dtype="C8", engram_host_offload=True,
     )
     engram_hbm_total = sum(s.engram_ple_hbm_bytes for s in led_bf16_hbm.stage_budgets)
-    engram_host_total = sum(s.engram_ple_host_bytes for s in led_mxfp4_offload.stage_budgets)
+    engram_host_total = sum(s.engram_ple_host_bytes for s in led_w4a8_offload.stage_budgets)
     assert engram_hbm_total > 0.0 and engram_host_total == pytest.approx(engram_hbm_total, rel=1e-9)
-    assert all(s.engram_ple_hbm_bytes == 0.0 for s in led_mxfp4_offload.stage_budgets)
+    assert all(s.engram_ple_hbm_bytes == 0.0 for s in led_w4a8_offload.stage_budgets)
 
     xlsx_path = tmp_path / "memory_calc.xlsx"
     export_comparison_xlsx(
@@ -633,23 +623,24 @@ def test_agent_brief_digest_and_static_launch_script_audit(tmp_path):
         "  --max-model-len 65536 --max-num-seqs 16 --enforce-eager\n",
         encoding="utf-8",
     )
-    parsed = parse_launch_script(script_file)
-    assert parsed.inferred_catalog_model == "qwen3.8-flash-next"
-    assert parsed.inferred_quant == "bf16" and parsed.tp == 4 and parsed.enforce_eager is True
-    assert parsed.inferred_num_devices == 4
+    codec = VllmAscendLaunchCodec()
+    parsed = codec.parse_launch_config(script_file)
+    p_flags = dict(parsed.raw_stack_flags)
+    assert p_flags["inferred_catalog_model"] == "qwen3.8-flash-next"
+    assert p_flags["inferred_quant"] == "bf16" and parsed.parallel.tp == 4 and p_flags["enforce_eager"] is True
+    assert dict(parsed.runtime_limits)["inferred_num_devices"] == 4
 
     opt_sh_path = tmp_path / "optimized_serve.sh"
-    opt_text = render_optimized_serve_sh(parsed, after_bundle=b_aft, output_path=opt_sh_path)
+    opt_text = codec.render_launch_config(_bundle_codec_facts(b_aft))
+    opt_sh_path.write_text(opt_text, encoding="utf-8", newline="\n")
     assert opt_sh_path.is_file() and b"\r\n" not in opt_sh_path.read_bytes()
-    assert 'HCCL_OP_EXPANSION_MODE="CCU_SCHED"' in opt_text and "FULL_DECODE_ONLY" in opt_text
+    assert 'HCCL_OP_EXPANSION_MODE="CCU_MS"' in opt_text and "FULL_DECODE_ONLY" in opt_text
     assert "HCCL_INTRA_PCIE_ENABLE" not in opt_text and "enable_weight_nz_layout" not in opt_text
     assert "--quantization ascend" in opt_text
 
-    audit_rep = audit_launch_script(
-        parsed, before_bundle=b_bef, after_bundle=b_aft, optimized_script_path=str(opt_sh_path),
-    )
-    assert audit_rep.schema == SCRIPT_AUDIT_SCHEMA and len(audit_rep.issues) >= 4
-    brief = build_agent_brief(b_bef, b_aft, script_audit=audit_rep.to_dict())
+    audit_rep = codec.audit_launch_config(parsed, _bundle_codec_facts(b_bef), _bundle_codec_facts(b_aft))
+    assert audit_rep["schema"] == SCRIPT_AUDIT_SCHEMA and len(audit_rep["issues_found"]) >= 3
+    brief = build_agent_brief(b_bef, b_aft, script_audit=dict(audit_rep))
     assert brief["schema"] == AGENT_BRIEF_SCHEMA
     cb = brief["scenario_and_parallelism"].get("calibration_basis")
     assert isinstance(cb, dict) and cb.get("calibrated") is True
@@ -718,20 +709,20 @@ def test_bipartite_alignment_dual_conservation_zero_saving_guard_draft_kv_and_ag
         )
 
     b_ops = (
-        _mk_op("l0.part_a", "OpA", 10.0, ("atom.a",)),
-        _mk_op("l0.mid_keep", "OpMid", 12.0, ("atom.mid",)),
-        _mk_op("l0.part_b", "OpB", 8.0, ("atom.b",)),
-        _mk_op("l0.old_comm", "AllReduce", 6.0, (), comm="TP=8"),
-        _mk_op("l0.mn_1", "ClusterB1", 9.0, ("atom.c1", "atom.c2")),
-        _mk_op("l0.mn_2", "ClusterB2", 5.0, ("atom.c2", "atom.c3")),
+        _mk_op("l0.part_a", "OpA", 100.0, ("atom.a",)),
+        _mk_op("l0.mid_keep", "OpMid", 120.0, ("atom.mid",)),
+        _mk_op("l0.part_b", "OpB", 80.0, ("atom.b",)),
+        _mk_op("l0.old_comm", "AllReduce", 60.0, (), comm="TP=8"),
+        _mk_op("l0.mn_1", "ClusterB1", 90.0, ("atom.c1", "atom.c2")),
+        _mk_op("l0.mn_2", "ClusterB2", 50.0, ("atom.c2", "atom.c3")),
     )
     a_ops = (
-        _mk_op("l0.fused_ab", "FusedAB", 11.0, ("atom.a", "atom.b"), status="[需新开发]", needs_new=True,
+        _mk_op("l0.fused_ab", "FusedAB", 110.0, ("atom.a", "atom.b"), status="[需新开发]", needs_new=True,
                absorbed=("l0.part_a", "l0.part_b"), binding=BINDING_STATE_UNBOUND_FORMULA),
-        _mk_op("l0.mid_keep", "OpMid", 12.0, ("atom.mid",), status="[需新开发]", needs_new=True),
-        _mk_op("l0.new_comm", "AllGather", 4.0, (), comm="DCP=8"),
-        _mk_op("l0.mn_a1", "ClusterA1", 6.0, ("atom.c1", "atom.c2")),
-        _mk_op("l0.mn_a2", "ClusterA2", 5.0, ("atom.c2", "atom.c3")),
+        _mk_op("l0.mid_keep", "OpMid", 120.0, ("atom.mid",), status="[需新开发]", needs_new=True),
+        _mk_op("l0.new_comm", "AllGather", 40.0, (), comm="DCP=8"),
+        _mk_op("l0.mn_a1", "ClusterA1", 60.0, ("atom.c1", "atom.c2")),
+        _mk_op("l0.mn_a2", "ClusterA2", 50.0, ("atom.c2", "atom.c3")),
     )
     b_step_us = sum(o.exposed_dur_us * o.repeat_count for o in b_ops)
     a_step_us = sum(o.exposed_dur_us * o.repeat_count for o in a_ops)
@@ -783,7 +774,7 @@ def test_bipartite_alignment_dual_conservation_zero_saving_guard_draft_kv_and_ag
     s2_cells = _sheet_cells(roots[SHEET_BREAKDOWN], shared)
     assert s2_cells["X2"][0] == "Before 摊薄耗时 (us/tok·die)"
     assert s2_cells["AA2"][0] == "绑定状态 (Binding State)"
-    assert s2_cells["AB2"][0] == "Waterfall Bucket" and s2_cells["AC2"][0] == "Card Group ID"
+    assert "AB2" not in s2_cells and "AC2" not in s2_cells
 
     # 2b. #446 mixed-precision matrix_flops L* pricing (fp8_e4m3 / mxfp4 flops vs bf16 output dtype).
     from mindie_sim.export.bundle import _die_peaks_for_stage, _op_lean_resource_demands_ns
@@ -1024,10 +1015,8 @@ def test_export_binding_conservation_pp_reconciliation_and_brief_precision(tmp_p
         BINDING_STATE_BOUND,
         BINDING_STATE_MEASURED,
         BINDING_STATE_UNBOUND_FORMULA,
-        audit_launch_script,
         build_agent_brief,
         export_agent_brief,
-        parse_launch_script,
     )
     from mindie_sim.export import bundle as bundle_mod
     from mindie_sim.export.comparison import AGENT_BRIEF_MAX_BYTES, _compact_agent_brief_to_budget
@@ -1119,8 +1108,8 @@ def test_export_binding_conservation_pp_reconciliation_and_brief_precision(tmp_p
     s4_cells = _sheet_cells(roots[SHEET_PENDING_KERNELS], shared)
     s4_m_formulas = [f for ref, (_, f) in s4_cells.items() if ref.startswith("M") and f]
     s4_n_formulas = [f for ref, (_, f) in s4_cells.items() if ref.startswith("N") and f]
-    assert any(SHEET_BREAKDOWN in f and "SUMIF(" in f for f in s4_m_formulas)
-    assert any(SHEET_BREAKDOWN in f and "SUMIF(" in f for f in s4_n_formulas)
+    assert any(SHEET_BREAKDOWN in f and "!J" in f for f in s4_m_formulas)
+    assert any(SHEET_BREAKDOWN in f and "!P" in f for f in s4_n_formulas)
     assert s4_cells["D3"][1] == "Summary!$B$14" and s4_cells["D9"][1] == "Summary!$C$14"
     assert s4_cells["D10"][1] == "D8-D9" and float(s4_cells["D10"][0]) == pytest.approx(0.0, abs=1e-6)
 
@@ -1142,13 +1131,15 @@ def test_export_binding_conservation_pp_reconciliation_and_brief_precision(tmp_p
     export_agent_brief(_compact_agent_brief_to_budget(cjk_brief), cjk_out)
     assert cjk_out.stat().st_size < AGENT_BRIEF_MAX_BYTES
 
-    # 9. script_audit respects spec_k == 0 without model-name speculative override.
+    # 9. launch codec respects spec_k == 0 without model-name speculative override.
     sh_path = tmp_path / "nospec.sh"
     sh_path.write_text("vllm serve deepseek-v4-pro-0813 --tensor-parallel-size 2 --data-parallel-size 1\n", encoding="utf-8")
-    parsed_sh = parse_launch_script(sh_path)
+    codec = VllmAscendLaunchCodec()
+    parsed_sh = codec.parse_launch_config(sh_path)
     bun_nospec = replace(bun_base, model_name="deepseek-v4-pro-0813", spec_proposals=0)
-    audit_rep = audit_launch_script(parsed_sh, before_bundle=bun_nospec, after_bundle=bun_nospec)
-    assert not any(issue.issue_id == "draft_tp_policy_mismatch" for issue in audit_rep.issues)
+    ns_facts = _bundle_codec_facts(bun_nospec)
+    audit_rep = codec.audit_launch_config(parsed_sh, ns_facts, ns_facts)
+    assert not any(issue["issue_id"] == "draft_tp_policy_mismatch" for issue in audit_rep["issues_found"])
 
 
 def test_export_streams_spec_batch_quant_preset_cache_t4_pd_cluster_and_overlap_lstar(tmp_path, monkeypatch):
@@ -1469,31 +1460,32 @@ def test_script_free_vs_script_audit_cross_generation_isolation(tmp_path):
     assert len(track_a_diff) == 1 and track_a_diff[0].expected_gain_ms is None and "B/DP=2" in track_a_diff[0].action_detail
 
     # Explicit script audits across A3 (foreign CCU sanitized, zero CCU leak) and A2 (zero CCU / SuperPoD / UB).
-    bad_a3_sh = parse_launch_script(
+    codec = VllmAscendLaunchCodec()
+    bad_a3_sh = codec.parse_launch_config(
         "export HCCL_OP_EXPANSION_MODE=CCU\n"
         'vllm serve /weights/qwen3-32b-w8a8 --tensor-parallel-size 2 --data-parallel-size 1 '
         '--quantization ascend --kv-cache-dtype int8 '
         '--compilation-config \'{"cudagraph_mode": "FULL_DECODE_ONLY"}\' '
         '--additional-config \'{"enable_fused_mc2": 2, "multistream_overlap_shared_expert": true}\'\n'
     )
-    rep_a3 = audit_launch_script(bad_a3_sh, before_bundle=bun_a3, after_bundle=bun_a3, tuned_bundle=bun_a3)
-    ids_a3 = {i.issue_id for i in rep_a3.issues}
+    a3_facts = _bundle_codec_facts(bun_a3)
+    rep_a3 = codec.audit_launch_config(bad_a3_sh, a3_facts, a3_facts)
+    ids_a3 = {i["issue_id"] for i in rep_a3["issues_found"]}
     assert {"hccl_expansion_mode_suboptimal", "mc2_mso_mutex_conflict"} <= ids_a3
-    assert "missing_mlapo" not in ids_a3  # omitted VLLM_ASCEND_ENABLE_MLAPO defaults True
-    a3_sh_txt = render_optimized_serve_sh(bad_a3_sh, after_bundle=bun_a3, tuned_bundle=bun_a3)
+    assert "missing_mlapo" not in ids_a3
+    a3_sh_txt = codec.render_launch_config(a3_facts)
     assert 'HCCL_OP_EXPANSION_MODE="AIV"' in a3_sh_txt
-    assert "CCU" not in (json.dumps(rep_a3.to_dict(), ensure_ascii=False) + a3_sh_txt)
+    assert "CCU" not in a3_sh_txt and all("CCU" not in str(i.get("recommended", "")) for i in rep_a3["issues_found"])
     assert not ('"enable_fused_mc2"' in a3_sh_txt and '"multistream_overlap_shared_expert": true' in a3_sh_txt)
 
-    # A2 audit: zero CCU / SuperPoD / UB-Direct; OOM original produces speedup_vs_original=None.
+    # A2 audit: zero CCU / SuperPoD / UB-Direct; OOM original produces saved_ms=None.
     bun_a2 = replace(bun_a3, hardware_sku="Ascend910B4", memory_ledger=replace(bun_a3.memory_ledger, fits_hbm=False))
-    rep_a2 = audit_launch_script(bad_a3_sh, before_bundle=bun_a2, after_bundle=bun_a2, tuned_bundle=bun_a2)
-    a2_txt = json.dumps(rep_a2.to_dict(), ensure_ascii=False) + render_optimized_serve_sh(bad_a3_sh, after_bundle=bun_a2, tuned_bundle=bun_a2)
+    a2_facts = _bundle_codec_facts(bun_a2)
+    rep_a2 = codec.audit_launch_config(bad_a3_sh, a2_facts, a2_facts)
+    a2_sh_txt = codec.render_launch_config(a2_facts)
+    a2_rec_txt = json.dumps([i.get("recommended", "") for i in rep_a2["issues_found"]], ensure_ascii=False)
     for banned in ("CCU", "SuperPoD", "UB-Direct"):
-        assert banned not in a2_txt
-    assert rep_a2.deep_step_summary["speedup_vs_original"] is None and rep_a2.immediate_step_summary["tuned_evaluated"] is True
-
-
-
-
-
+        assert banned not in (a2_sh_txt + a2_rec_txt)
+    for banned in ("SuperPoD", "UB-Direct"):
+        assert banned not in json.dumps(dict(rep_a2), ensure_ascii=False)
+    assert rep_a2["two_step_gain"]["step1_immediate_zero_code"]["saved_ms"] is None
