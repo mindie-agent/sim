@@ -433,6 +433,7 @@ owns = [
 path = "spine/test_vllm_ascend_stack_adapter.py"
 tier = "tier0"
 owns = ["mindie_sim/stacks/vllm_ascend"]
+[[module]]
 path = "spine/test_stack_registry_and_extensibility.py"
 tier = "tier0"
 owns = [
