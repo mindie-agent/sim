@@ -14,9 +14,10 @@
 """
 from __future__ import annotations
 
+from collections import OrderedDict
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
-from dataclasses import fields as dataclass_fields, replace
+from dataclasses import replace
 from fractions import Fraction
 import ctypes
 import gc
@@ -48,8 +49,17 @@ from mindie_sim.prediction.efficiency import (
     extract_hardware_peaks,
 )
 from mindie_sim.prediction.evaluation import EvaluationContext
+from mindie_sim.prediction.execution.layer_runs import (
+    LayerCohortPlan,
+    discover_layer_cohorts,
+    execute_native_cohort_graph,
+)
 from mindie_sim.prediction.graph_analysis import graph_costs
 from mindie_sim.prediction.results import OpOccurrence
+from mindie_sim.prediction.runtime.exposed_observer import (
+    ObservedInterval,
+    attribute_stream0_intervals,
+)
 from mindie_sim.prediction.sharding.local_tp import rank_zero_graph_reuse
 from mindie_sim.prediction.offload.policy import (
     _DEFAULT_SSD_BANDWIDTH_UTILIZATION,
@@ -75,6 +85,7 @@ PARETO_EPS = 1e-12
 HALF_RATIO = 0.5
 DEFAULT_ELEM_BYTES = 2.0
 OVERLAP_BARRIER_EPS_US = 1e-3
+DEMAND_CHANNELS = 5
 LAUNCH_SHORT_US = 12.0
 LAUNCH_WORK_SHARE = 0.35
 RANK_TPS_DECIMALS = 6
@@ -101,12 +112,7 @@ PD_PREFILL_STAGE2_FINALISTS = 3
 PD_DECODE_STAGE2_FINALISTS = 4
 SCREEN_DECODE_BATCH_PROBE = 8
 SLA_SLACK_BOUND_TOLERANCE_MS = 0.5
-_LAYER_POSITION_FIELDS = frozenset({
-    "index", "native_layer_id", "kv_owner_layer_id",
-    "index_k_owner_layer_id", "topk_owner_layer_id",
-    "candidate_source_layer_id", "index_source_layer_id",
-})
-_LAYER_EXCLUSION_INDEX_RE = re.compile(r"((?:layers|layer|blocks|h)[._])(\d+)([._]|$)")
+_OP_LAYER_PREFIX_RE = re.compile(r"^(?:draft\.)?s\d+\.l\d+\.")
 _POW2_WIDTHS = (1, 2, 4, 8, 16)
 _PREFILL_PCP_WIDTHS = (1, 2, 4)
 PREFILL_PCP_MIN_PROMPT_TOKENS = 1024
@@ -1362,7 +1368,7 @@ def _evaluate_colocated_candidate(
             par, used_dies=used_dies, mtp_tokens=mtp_tokens,
             reason="prefill_hbm_oom", regime="HBM_CAPACITY_BOUND",
         )
-    rep_info = build_archetype_representative_case(parsed, min_layers=ARCHETYPE_FOLD_MIN_LAYERS)
+    rep_info = discover_layer_cohorts(parsed)
     decode_tokens = max(0, output_tokens - 1)
     ctx_box: list[EvaluationContext | None] = [None]
     try:
@@ -1476,217 +1482,109 @@ def _evaluate_colocated_candidate(
     }
 
 
-def _layer_quant_exclusion_signature(quant: Any, layer_idx: int) -> tuple[Any, ...]:
-    """Normalized per-layer quant exclusions & category overrides matching ``layer_idx``."""
-    if quant is None:
-        return ()
-    target = str(int(layer_idx))
-    matched_excl: list[str] = []
-    for item in (getattr(quant, "exclusions", ()) or ()):
-        text = str(item)
-        m = _LAYER_EXCLUSION_INDEX_RE.search(text)
-        if m is not None and m.group(2) == target:
-            matched_excl.append(_LAYER_EXCLUSION_INDEX_RE.sub(r"\1*\3", text))
-    matched_ov: list[tuple[str, Any]] = []
-    raw_ov = getattr(quant, "category_overrides", ()) or ()
-    ov_items = raw_ov.items() if isinstance(raw_ov, Mapping) else raw_ov
-    for cat, fields in ov_items:
-        cat_s = str(cat)
-        m = _LAYER_EXCLUSION_INDEX_RE.search(cat_s)
-        if m is not None and m.group(2) == target:
-            norm_cat = _LAYER_EXCLUSION_INDEX_RE.sub(r"\1*\3", cat_s)
-            norm_f = tuple(sorted(fields.items())) if isinstance(fields, Mapping) else tuple(fields)
-            matched_ov.append((norm_cat, norm_f))
-    if not matched_excl and not matched_ov:
-        return ()
-    return (tuple(sorted(matched_excl)), tuple(sorted(matched_ov)))
+def _strip_layer_site_key(op_id: str) -> str:
+    return _OP_LAYER_PREFIX_RE.sub("", str(op_id))
 
 
-def _remap_layer_quant_exclusions(
-    quant: Any, old_to_new: Mapping[int, int],
-) -> Any:
-    """Remap per-layer quant exclusions & category overrides onto deduplicated indices."""
-    if quant is None:
-        return quant
-    exclusions = getattr(quant, "exclusions", ()) or ()
-    updated_excl: list[str] = []
-    excl_changed = False
-    for item in exclusions:
-        text = str(item)
-        m = _LAYER_EXCLUSION_INDEX_RE.search(text)
-        if m is None:
-            updated_excl.append(text)
-            continue
-        excl_changed = True
-        orig = int(m.group(2))
-        if orig in old_to_new:
-            mapped = _LAYER_EXCLUSION_INDEX_RE.sub(
-                rf"\g<1>{int(old_to_new[orig])}\g<3>", text,
-            )
-            updated_excl.append(mapped)
-    raw_ov = getattr(quant, "category_overrides", ()) or ()
-    ov_items = list(raw_ov.items()) if isinstance(raw_ov, Mapping) else list(raw_ov)
-    updated_ov: list[tuple[str, Any]] = []
-    ov_changed = False
-    for cat, fields in ov_items:
-        cat_s = str(cat)
-        m = _LAYER_EXCLUSION_INDEX_RE.search(cat_s)
-        if m is None:
-            updated_ov.append((cat_s, fields))
-            continue
-        ov_changed = True
-        orig = int(m.group(2))
-        if orig in old_to_new:
-            mapped_cat = _LAYER_EXCLUSION_INDEX_RE.sub(
-                rf"\g<1>{int(old_to_new[orig])}\g<3>", cat_s,
-            )
-            updated_ov.append((mapped_cat, fields))
-    if not excl_changed and not ov_changed:
-        return quant
-    kwargs: dict[str, Any] = {}
-    if excl_changed:
-        kwargs["exclusions"] = tuple(dict.fromkeys(updated_excl))
-    if ov_changed:
-        kwargs["category_overrides"] = tuple(sorted(updated_ov))
-    return replace(quant, **kwargs)
-
-
-def _layer_archetype_key(
-    lp: Any,
-    stage: int,
-    *,
-    cand_producers: frozenset[int] = frozenset(),
-    quant: Any = None,
-) -> tuple[Any, ...]:
-    """Automatic structural equivalence hash over every LayerPlan + quant contract field."""
-    idx = int(getattr(lp, "index", 0))
-    kv_own = int(getattr(lp, "kv_owner_layer_id", -1))
-    idx_own = int(getattr(lp, "index_k_owner_layer_id", -1))
-    topk_own = int(getattr(lp, "topk_owner_layer_id", -1))
-    cand_src = int(getattr(lp, "candidate_source_layer_id", -1))
-    idx_src = int(getattr(lp, "index_source_layer_id", -1))
-    field_sig = tuple(
-        (f.name, getattr(lp, f.name))
-        for f in dataclass_fields(lp)
-        if f.name not in _LAYER_POSITION_FIELDS
-    )
-    return (
-        int(stage),
-        field_sig,
-        (kv_own >= 0, kv_own == idx),
-        (idx_own >= 0, idx_own == idx),
-        (topk_own >= 0, topk_own == idx),
-        idx in cand_producers,
-        cand_src >= 0,
-        (idx_src >= 0, idx_src == idx),
-        _layer_quant_exclusion_signature(quant, idx),
-    )
-
-
-def _stage_counts_for_case(parsed: CaseSpec) -> tuple[int, ...]:
-    pp = max(1, int(parsed.runtime.parallel.pp))
-    part = tuple(int(v) for v in (getattr(parsed.runtime, "pp_layer_partition", ()) or ()))
-    n_layers = len(parsed.model.layer_plans)
-    if len(part) == pp and sum(part) == n_layers:
-        return part
-    base, rem = divmod(n_layers, pp)
-    return tuple(base + (1 if s < rem else 0) for s in range(pp))
-
-
-def build_archetype_representative_case(
-    parsed: CaseSpec,
-    *,
-    min_layers: int = ARCHETYPE_SCREEN_MIN_LAYERS,
-) -> tuple[CaseSpec, dict[int, int], float]:
-    """Deduplicate structurally identical layers while conserving quant, KeyPool, Engram, and Draft."""
-    plans = tuple(parsed.model.layer_plans)
-    if len(plans) < max(2, int(min_layers)):
-        return parsed, {int(lp.index): 1 for lp in plans}, 1.0
-    stage_counts = _stage_counts_for_case(parsed)
-    layer_stage = [s for s, cnt in enumerate(stage_counts) for _ in range(cnt)]
-    cand_producers = frozenset(
-        int(getattr(lp, "candidate_source_layer_id", -1))
-        for lp in plans if int(getattr(lp, "candidate_source_layer_id", -1)) >= 0
-    )
-    groups: dict[tuple[Any, ...], list[Any]] = {}
-    for lp in plans:
-        st = layer_stage[lp.index] if lp.index < len(layer_stage) else 0
-        key = _layer_archetype_key(
-            lp, st, cand_producers=cand_producers, quant=parsed.model.quant,
-        )
-        groups.setdefault(key, []).append(lp)
-    if len(groups) >= len(plans) or parsed.runtime.parallel.pp > len(groups):
-        return parsed, {int(lp.index): 1 for lp in plans}, 1.0
-
-    old_to_new: dict[int, int] = {}
-    layer_weights: dict[int, int] = {}
-    rep_orig: dict[int, Any] = {}
-    rep_stages: list[int] = []
-    rep_list: list[Any] = []
-    last_kv = last_idx = last_topk = last_cand = -1
-    for new_idx, (grp_key, members) in enumerate(groups.items()):
-        lp = members[0]
-        old_idx = int(lp.index)
-        old_to_new[old_idx] = new_idx
-        layer_weights[new_idx] = len(members)
-        rep_orig[new_idx] = lp
-        rep_stages.append(int(grp_key[0]))
-        kv_own = int(getattr(lp, "kv_owner_layer_id", -1))
-        idx_own = int(getattr(lp, "index_k_owner_layer_id", -1))
-        topk_own = int(getattr(lp, "topk_owner_layer_id", -1))
-        cand_src = int(getattr(lp, "candidate_source_layer_id", -1))
-        idx_src = int(getattr(lp, "index_source_layer_id", -1))
-        prev_kv, prev_idx, prev_topk, prev_cand = last_kv, last_idx, last_topk, last_cand
-        new_kv = (last_kv := new_idx) if kv_own == old_idx else (old_to_new.get(kv_own, prev_kv) if kv_own >= 0 else -1)
-        new_idx_own = (last_idx := new_idx) if idx_own == old_idx else (old_to_new.get(idx_own, prev_idx) if idx_own >= 0 else -1)
-        new_topk = (last_topk := new_idx) if topk_own == old_idx else (old_to_new.get(topk_own, prev_topk) if topk_own >= 0 else -1)
-        if old_idx in cand_producers:
-            last_cand = new_idx
-        new_idx_src = new_idx if idx_src == old_idx else (old_to_new.get(idx_src, prev_idx) if idx_src >= 0 else -1)
-        new_cand_src = old_to_new.get(cand_src, prev_cand) if cand_src >= 0 else -1
-        rep_list.append(replace(
-            lp, index=new_idx, kv_owner_layer_id=new_kv, index_k_owner_layer_id=new_idx_own,
-            topk_owner_layer_id=new_topk, candidate_source_layer_id=new_cand_src,
-            index_source_layer_id=new_idx_src,
+def _attribute_full_records_stream0(
+    kept: Sequence[Mapping[str, Any]],
+) -> tuple[list[float], list[str]]:
+    """Run conserved ``ExposedObserver`` Stream 0 attribution over real Engine intervals."""
+    if not kept:
+        return [], []
+    stream_idx: dict[str, int] = {"main": 0}
+    occ_to_id = {rec["occurrence"]: str(idx) for idx, rec in enumerate(kept)}
+    intervals: list[ObservedInterval] = []
+    preds: dict[str, tuple[str, ...]] = {}
+    min_ns: int | None = None
+    max_ns = 0
+    for idx, rec in enumerate(kept):
+        s_ns = max(0, int(round(float(rec["start_us"]) * NS_PER_US)))
+        e_ns = max(s_ns, int(round(float(rec["end_us"]) * NS_PER_US)))
+        min_ns = s_ns if min_ns is None else min(min_ns, s_ns)
+        max_ns = max(max_ns, e_ns)
+        st = str(rec["stream"] or "main")
+        s_i = stream_idx.setdefault(st, len(stream_idx))
+        oid = str(idx)
+        intervals.append(ObservedInterval(
+            occurrence_id=oid, stream=st, stream_index=s_i,
+            start_ns=s_ns, end_ns=e_ns, ordinal=idx, label=str(rec["family"] or rec["op_id"]),
         ))
+        preds[oid] = tuple(occ_to_id[p] for p in rec.get("predecessors", ()) if p in occ_to_id)
+    start_i = min_ns if min_ns is not None else 0
+    res = attribute_stream0_intervals(intervals, start_ns=start_i, terminal_ns=max_ns, causal_preds=preds)
+    exposed_us = [float(res.exposed_ns_by_op.get(str(i), 0)) / NS_PER_US for i in range(len(kept))]
+    masked = [res.masked_by.get(str(i), "") for i in range(len(kept))]
+    return exposed_us, masked
 
-    rep_plans = tuple(rep_list)
-    aux = getattr(parsed.model, "auxiliary", None)
-    rep_aux = aux
-    draft_scale = 1.0
-    if aux is not None and getattr(aux, "dspark", None) is not None:
-        dsp = aux.dspark
-        if dsp.layer_plans and len(dsp.layer_plans) > 1:
-            draft_scale = float(len(dsp.layer_plans))
-            d0 = replace(dsp.layer_plans[0], index=0, kv_owner_layer_id=0)
-            clamped = tuple(min(int(lid), len(rep_plans) - 1) for lid in dsp.target_layer_ids)
-            rep_aux = replace(aux, dspark=replace(dsp, layers=1, layer_plans=(d0,), target_layer_ids=clamped))
-    rep_engram = getattr(parsed.model, "engram", None)
-    if rep_engram is not None and getattr(rep_engram, "tables", ()):
-        by_orig = {int(t.layer_id): t for t in rep_engram.tables}
-        default_tbl = rep_engram.tables[0]
-        remapped = tuple(
-            replace(by_orig.get(int(orig_lp.index), default_tbl), layer_id=new_idx)
-            for new_idx, orig_lp in sorted(rep_orig.items())
-            if bool(getattr(orig_lp, "engram", False))
-        )
-        if remapped:
-            rep_engram = replace(rep_engram, tables=remapped)
-    rep_quant = _remap_layer_quant_exclusions(parsed.model.quant, old_to_new)
-    rep_model = replace(
-        parsed.model, layers=len(rep_plans), layer_plans=rep_plans,
-        auxiliary=rep_aux, engram=rep_engram, quant=rep_quant,
-    )
-    pp = max(1, int(parsed.runtime.parallel.pp))
-    rep_pp_part: tuple[int, ...] = ()
-    if pp > 1:
-        counts = tuple(sum(1 for st in rep_stages if st == s) for s in range(pp))
-        if all(c >= 1 for c in counts) and sum(counts) == len(rep_plans):
-            rep_pp_part = counts
+
+def _aggregate_cohort_target_nodes(
+    nodes: Sequence[TargetOpNode],
+    demands_ns: Sequence[tuple[int, int, int, int, int]],
+) -> tuple[list[TargetOpNode], list[tuple[int, int, int, int, int]]]:
+    """Fold full-depth native occurrences into structural cohort rows with exact unrounded means."""
+    groups: OrderedDict[tuple[str, str], list[int]] = OrderedDict()
+    for idx, node in enumerate(nodes):
+        if node.archetype_id.startswith("target_arch_") or node.archetype_id == "draft_arch_0":
+            key = (node.archetype_id, _strip_layer_site_key(node.op_id))
         else:
-            return parsed, {int(lp.index): 1 for lp in plans}, 1.0
-    rep_case = replace(parsed, model=rep_model, runtime=replace(parsed.runtime, pp_layer_partition=rep_pp_part))
-    return rep_case, layer_weights, draft_scale
+            key = (node.archetype_id, f"__exact_{idx}")
+        groups.setdefault(key, []).append(idx)
+
+    occ_remap: dict[OpOccurrence, OpOccurrence] = {}
+    out_nodes: list[TargetOpNode] = []
+    out_dems: list[tuple[int, int, int, int, int]] = []
+    for idxs in groups.values():
+        anchor = nodes[idxs[0]]
+        cnt = len(idxs)
+        for i in idxs:
+            occ_remap[nodes[i].occurrence] = anchor.occurrence
+        if cnt == 1:
+            out_nodes.append(anchor)
+            out_dems.append(demands_ns[idxs[0]])
+            continue
+        inv = 1.0 / float(cnt)
+        mean_dur = sum(nodes[i].dur_us for i in idxs) * inv
+        mean_exp = sum(nodes[i].exposed_dur_us for i in idxs) * inv
+        mean_dem = tuple(int(round(sum(demands_ns[i][k] for i in idxs) * inv)) for k in range(DEMAND_CHANNELS))
+        l_star = float(max(mean_dem)) / NS_PER_US
+        eff = min(1.0, l_star / mean_dur) if (mean_dur > 0.0 and l_star > 0.0) else None
+        out_dems.append(mean_dem)  # type: ignore[arg-type]
+        out_nodes.append(replace(
+            anchor,
+            ordinal=len(out_nodes),
+            repeat_count=cnt,
+            end_us=anchor.start_us + mean_dur,
+            dur_us=mean_dur,
+            exposed_dur_us=mean_exp,
+            is_overlapped=(mean_exp <= OVERLAP_BARRIER_EPS_US and mean_dur > OVERLAP_BARRIER_EPS_US),
+            flops=sum(nodes[i].flops for i in idxs) * inv,
+            vector_ops=sum(nodes[i].vector_ops for i in idxs) * inv,
+            hbm_read_bytes=sum(nodes[i].hbm_read_bytes for i in idxs) * inv,
+            hbm_write_bytes=sum(nodes[i].hbm_write_bytes for i in idxs) * inv,
+            hbm_total_bytes=sum(nodes[i].hbm_total_bytes for i in idxs) * inv,
+            mte2_bytes=sum(nodes[i].mte2_bytes for i in idxs) * inv,
+            mte3_bytes=sum(nodes[i].mte3_bytes for i in idxs) * inv,
+            fixpipe_bytes=sum(nodes[i].fixpipe_bytes for i in idxs) * inv,
+            link_bytes=sum(nodes[i].link_bytes for i in idxs) * inv,
+            l_star_lean_us=l_star,
+            gap_us=max(0.0, mean_dur - l_star),
+            gap_ratio=(mean_dur / l_star) if l_star > 0.0 else None,
+            roofline_efficiency=eff,
+        ))
+    valid_occs = {n.occurrence for n in out_nodes}
+    rewired = [
+        replace(
+            n,
+            ordinal=i,
+            predecessors=tuple(dict.fromkeys(
+                mapped for p in n.predecessors
+                if (mapped := occ_remap.get(p, p)) != n.occurrence and mapped in valid_occs
+            )),
+        )
+        for i, n in enumerate(out_nodes)
+    ]
+    return rewired, out_dems
 
 
 def _die_peaks_for_target_stage(case: CaseSpec, stage: int) -> dict[str, Any]:
@@ -1878,8 +1776,7 @@ def _solve_target_step_ms(
     spec_by_id: Mapping[str, Any],
     *,
     phase: str,
-    layer_weights: Mapping[int, int],
-    draft_scale: float,
+    cohort_plan: LayerCohortPlan | None = None,
     n_tok_per_die: float,
     ext_plan: Any,
     primitive_table: Any,
@@ -1887,15 +1784,17 @@ def _solve_target_step_ms(
     step_request: Any = None,
     scenario_case: CaseSpec | None = None,
 ) -> float:
-    """Evaluate rewritten target graph via ``solve_target_graph`` and return exposed step ms."""
+    """Evaluate rewritten target graph on the same Engine + PrimitiveTable and return exposed ms."""
     kept, tail_closure = _prepare_target_records(eff_case, timeline_rows, spec_by_id)
     if not kept:
         return 0.0
+    plan = cohort_plan if cohort_plan is not None else discover_layer_cohorts(eff_case)
+    exposed_us_list, masked_list = _attribute_full_records_stream0(kept)
     peaks_by_stage: dict[int, dict[str, Any]] = {}
     stream_indices: dict[str, int] = {"main": 0}
     nodes: list[TargetOpNode] = []
     demands_ns: list[tuple[int, int, int, int, int]] = []
-    for rec in kept:
+    for idx, rec in enumerate(kept):
         occ: OpOccurrence = rec["occurrence"]
         spec = rec["spec"]
         if occ.stage not in peaks_by_stage:
@@ -1904,19 +1803,17 @@ def _solve_target_step_ms(
         oid = rec["op_id"]
         is_draft = _is_draft_op(spec, rec)
         lyr = spec.layer if (spec is not None and spec.layer is not None) else rec["row_layer"]
-        if occ in tail_closure:
+        if occ in tail_closure or oid.startswith("final."):
             arch_id = "target_tail"
-            rep_count = max(1, int(layer_weights.get(int(lyr), 1))) if (lyr is not None and int(lyr) >= 0) else 1
         elif is_draft:
             arch_id = "draft_arch_0" if (lyr is not None and int(lyr) >= 0) else "draft_misc"
-            rep_count = max(1, int(round(draft_scale))) if (lyr is not None and int(lyr) >= 0) else 1
         elif lyr is not None and int(lyr) >= 0:
-            arch_id = f"target_arch_{int(lyr)}"
-            rep_count = max(1, int(layer_weights.get(int(lyr), 1)))
+            c_idx = plan.cohort_by_layer.get(int(lyr), int(lyr))
+            arch_id = f"target_arch_{c_idx}"
         else:
             arch_id = "target_embed" if str(rec["family"]).lower() == "embedding" else "target_tail"
-            rep_count = 1
         dur_us = max(0.0, float(rec["end_us"]) - float(rec["start_us"]))
+        exp_us = min(dur_us, max(0.0, float(exposed_us_list[idx])))
         dem, flops, vec_ops, hbm_r, hbm_w, hbm_tot, mte2, mte3, fixpipe, link_b = _target_op_work_and_demands(
             spec, dur_us=dur_us, shape=rec["shape"], dtype=rec["dtype"], family=rec["family"], peaks=peaks,
         )
@@ -1940,11 +1837,13 @@ def _solve_target_step_ms(
         demands_ns.append(dem)
         nodes.append(TargetOpNode(
             ordinal=len(nodes), occurrence=occ, op_id=oid, archetype_id=arch_id,
-            repeat_count=rep_count, family=rec["family"], recipe=rec["recipe"],
+            repeat_count=1, family=rec["family"], recipe=rec["recipe"],
             stream=rec["stream"], stream_index=s_idx, task_type=task_type,
             shape=rec["shape"], dtype=rec["dtype"], predecessors=rec["predecessors"],
             start_us=float(rec["start_us"]), end_us=float(rec["end_us"]),
-            dur_us=dur_us, exposed_dur_us=dur_us, is_overlapped=False, masked_by="",
+            dur_us=dur_us, exposed_dur_us=exp_us,
+            is_overlapped=(exp_us <= OVERLAP_BARRIER_EPS_US and dur_us > OVERLAP_BARRIER_EPS_US),
+            masked_by=masked_list[idx],
             flops=flops, vector_ops=vec_ops,
             hbm_read_bytes=hbm_r, hbm_write_bytes=hbm_w, hbm_total_bytes=hbm_tot,
             mte2_bytes=mte2, mte3_bytes=mte3, fixpipe_bytes=fixpipe, link_bytes=link_b,
@@ -1956,6 +1855,13 @@ def _solve_target_step_ms(
             kernel_backend="", kernel_status="", needs_new_kernel=False,
             new_kernel_spec="", canonical_op_key=oid, spec=spec,
         ))
+    has_explicit_plan = ext_plan is not None and (
+        bool(getattr(ext_plan, "edits", ()))
+        or bool(getattr(ext_plan, "base_graph_sha256", ""))
+        or bool(getattr(ext_plan, "framing_sha256", ""))
+    )
+    if not has_explicit_plan:
+        nodes, demands_ns = _aggregate_cohort_target_nodes(nodes, demands_ns)
     solved = solve_target_graph(
         nodes, demands_ns, eff_case, peaks_by_stage,
         phase=phase, rewrite_plan=ext_plan,
@@ -1964,83 +1870,9 @@ def _solve_target_step_ms(
         allow_unbound_formula=allow_unbound_formula,
         step_request=step_request,
         scenario_case=scenario_case,
+        compute_waterfall_and_codesign=False,
     )
     return sum(n.exposed_dur_us * max(1, int(n.repeat_count)) for n in solved.nodes) / US_PER_MS
-
-
-def _expand_reduced_timeline_ms(
-    rep_total: float,
-    timeline_rows: Sequence[Mapping[str, Any]],
-    layer_weights: Mapping[int, int],
-    draft_scale: float,
-    *,
-    draft_op_ids: frozenset[str] = frozenset(),
-    tail_op_ids: frozenset[str] = frozenset(),
-) -> float:
-    stage_layer_end: dict[int, dict[int, float]] = {}
-    stage_layer_dep_start: dict[int, dict[int, float]] = {}
-    stage_layer_any_start: dict[int, dict[int, float]] = {}
-    draft_dep_start: float | None = None
-    draft_any_start: float | None = None
-    draft_end: float | None = None
-    extra_tail = 0.0
-    for occ in timeline_rows:
-        if not isinstance(occ, Mapping) or int(occ.get("replica", 0) or 0) != 0:
-            continue
-        st = float(occ.get("ready_ms", 0.0) or 0.0)
-        en = float(occ.get("complete_ms", 0.0) or 0.0)
-        if en < st:
-            continue
-        has_pred = bool(occ.get("predecessors"))
-        op_id = str(occ.get("op_id") or "")
-        if op_id in draft_op_ids or _is_draft_op(None, occ):
-            draft_any_start = st if draft_any_start is None else min(draft_any_start, st)
-            if has_pred:
-                draft_dep_start = st if draft_dep_start is None else min(draft_dep_start, st)
-            draft_end = en if draft_end is None else max(draft_end, en)
-            continue
-        lyr = occ.get("layer")
-        if op_id in tail_op_ids:
-            if lyr is not None and int(lyr) >= 0:
-                extra_tail += float(max(0, int(layer_weights.get(int(lyr), 1)) - 1)) * max(0.0, en - st)
-            continue
-        if lyr is None or int(lyr) < 0:
-            continue
-        stage_id = int(occ.get("stage", 0) or 0)
-        idx = int(lyr)
-        ends = stage_layer_end.setdefault(stage_id, {})
-        ends[idx] = en if idx not in ends else max(ends[idx], en)
-        starts_any = stage_layer_any_start.setdefault(stage_id, {})
-        starts_any[idx] = st if idx not in starts_any else min(starts_any[idx], st)
-        if has_pred:
-            starts_dep = stage_layer_dep_start.setdefault(stage_id, {})
-            starts_dep[idx] = st if idx not in starts_dep else min(starts_dep[idx], st)
-
-    extra_target = 0.0
-    max_target_end = 0.0
-    for stage_id, ends in stage_layer_end.items():
-        prev_end: float | None = None
-        for idx in sorted(ends):
-            end_ms = ends[idx]
-            max_target_end = max(max_target_end, end_ms)
-            if prev_end is not None:
-                layer_span = max(0.0, end_ms - prev_end)
-            else:
-                first_start = stage_layer_dep_start.get(stage_id, {}).get(
-                    idx, stage_layer_any_start.get(stage_id, {}).get(idx, 0.0),
-                )
-                layer_span = max(0.0, end_ms - first_start)
-            prev_end = max(prev_end, end_ms) if prev_end is not None else end_ms
-            extra_target += float(layer_weights.get(idx, 1) - 1) * layer_span
-
-    draft_start = draft_dep_start if draft_dep_start is not None else draft_any_start
-    if draft_start is not None and draft_end is not None and draft_start < max_target_end <= draft_end:
-        draft_start = max_target_end
-    extra_draft = (
-        (draft_scale - 1.0) * max(0.0, draft_end - draft_start)
-        if (draft_scale > 1.0 and draft_start is not None and draft_end is not None) else 0.0
-    )
-    return rep_total + extra_target + extra_tail + extra_draft
 
 
 def _archetype_weighted_step_ms(
@@ -2052,7 +1884,7 @@ def _archetype_weighted_step_ms(
     sequences: int,
     scope: str = "model",
     min_layers: int = ARCHETYPE_FOLD_MIN_LAYERS,
-    rep_info: tuple[CaseSpec, dict[int, int], float] | None = None,
+    rep_info: LayerCohortPlan | None = None,
     evaluation_context: EvaluationContext | None = None,
     apply_target_envelope: bool = False,
     rewrite_plan: Any = None,
@@ -2062,34 +1894,16 @@ def _archetype_weighted_step_ms(
     skip_target_if_baseline_le_ms: float | None = None,
     reclaim_on_exit: bool = True,
 ) -> float:
-    """Exact O(Unique Archetypes x 1 Representative Rank) step latency."""
-    if rep_info is not None:
-        rep_case, layer_weights, draft_scale = rep_info
-    else:
-        rep_case, layer_weights, draft_scale = build_archetype_representative_case(
-            parsed, min_layers=min_layers,
-        )
-    reduced = (
-        len(rep_case.model.layer_plans) < len(parsed.model.layer_plans)
-        or draft_scale > 1.0
-    )
+    """Exact native ``0..L-1 + final`` Engine replay with unified ``PrimitiveTable`` binding."""
+    del min_layers
+    cohort_plan = rep_info if isinstance(rep_info, LayerCohortPlan) else discover_layer_cohorts(parsed)
     use_target = bool(apply_target_envelope or rewrite_plan is not None)
     ext_plan = load_rewrite_plan(rewrite_plan) if (use_target and rewrite_plan is not None) else None
-    has_explicit_or_sealed_plan = ext_plan is not None and (
-        bool(getattr(ext_plan, "edits", ()))
-        or bool(getattr(ext_plan, "base_graph_sha256", ""))
-        or bool(getattr(ext_plan, "framing_sha256", ""))
-    )
-    if use_target and has_explicit_or_sealed_plan and reduced:
-        rep_case = parsed
-        layer_weights = {int(lp.index): 1 for lp in parsed.model.layer_plans}
-        draft_scale = 1.0
-        reduced = False
     graphs, eff_case, _ = _lower_and_run_graph(
-        rep_case, phase=phase, tokens=tokens, context=context,
+        parsed, phase=phase, tokens=tokens, context=context,
         sequences=sequences, scope=scope, run_graph=False,
     )
-    need_timeline = bool(reduced or use_target)
+    need_timeline = bool(use_target)
     if evaluation_context is not None:
         eval_ctx = evaluation_context
         owns_ctx = False
@@ -2107,16 +1921,17 @@ def _archetype_weighted_step_ms(
         TargetGraphSet({0: graphs[0]}, kernels=graphs.effective_kernels, selection=graphs.default_selection)
         if isinstance(graphs, TargetGraphSet) else {0: graphs[0]}
     ) if rank_zero_graph_reuse(eff_case.runtime.parallel, len(graphs), has_kg) else graphs
-    draft_op_ids = frozenset(op.op_id for op in graphs[0] if _is_draft_op(op)) if reduced else frozenset()
     spec_by_id = {op.op_id: op for op in graphs[0]} if need_timeline else {}
-    rebound_pt = eval_ctx.bindings.primitive_table if use_target else None
+    # Unify Before and After on the EXACT SAME PrimitiveTable (zero conditional None split).
+    rebound_pt = eval_ctx.bindings.primitive_table
     try:
-        graph = graph_costs(
-            eff_case, sg, external_inputs=ext_in, isolated=False,
+        graph, _, _ = execute_native_cohort_graph(
+            eff_case, sg, cohort_plan=cohort_plan,
+            external_inputs=ext_in, isolated=False,
             evaluation=eval_ctx, fast_span_only=(not need_timeline),
             timeline_replicas=(0,) if need_timeline else None,
         )
-        rep_total = float(graph["duration_ms"])
+        baseline_ms = float(graph["duration_ms"])
         timeline_rows = tuple(graph.get("timeline", ()) or ()) if need_timeline else ()
     finally:
         del graphs, sg
@@ -2124,32 +1939,20 @@ def _archetype_weighted_step_ms(
             del eval_ctx
             if reclaim_on_exit and (len(parsed.machine.dies) >= GC_RECLAIM_MIN_WORLD_SIZE or int(parsed.runtime.parallel.dp) > 1):
                 _reclaim_sweep_memory()
-    tail_op_ids: frozenset[str] = frozenset()
-    if reduced and timeline_rows:
-        _, tc = _prepare_target_records(eff_case, timeline_rows, spec_by_id)
-        tail_op_ids = frozenset(occ.op_id for occ in tc)
-    baseline_ms = (
-        _expand_reduced_timeline_ms(
-            rep_total, timeline_rows, layer_weights, draft_scale,
-            draft_op_ids=draft_op_ids, tail_op_ids=tail_op_ids,
-        )
-        if reduced else rep_total
-    )
     if not use_target:
         return baseline_ms
     if ext_plan is None and skip_target_if_baseline_le_ms is not None and baseline_ms <= skip_target_if_baseline_le_ms:
         return baseline_ms
     from mindie_sim.prediction.results import StepRequest
 
-    solved_ms = _solve_target_step_ms(
+    return _solve_target_step_ms(
         eff_case, timeline_rows, spec_by_id,
-        phase=phase, layer_weights=layer_weights, draft_scale=draft_scale,
+        phase=phase, cohort_plan=cohort_plan,
         n_tok_per_die=n_tok_per_die, ext_plan=ext_plan,
         primitive_table=rebound_pt, allow_unbound_formula=allow_unbound_formula,
         step_request=StepRequest(phase=phase, tokens=tokens, context=context, sequences=sequences, scope=scope),
         scenario_case=parsed,
     )
-    return solved_ms if solved_ms > 0.0 else baseline_ms
 
 
 def _free_hbm_gib_for_batch(memory: Memory, kv_by_stage: Sequence[float], batch: int) -> float:
@@ -2343,7 +2146,7 @@ def _solve_sla_archetype_aware(
             parsed, base_ws=base_ws, decode_q=max(1, int(q_tok)),
             seq_len=context + output_budget, cap_bound=cap_bound,
         )
-    rep_info = rep_info or build_archetype_representative_case(parsed, min_layers=ARCHETYPE_FOLD_MIN_LAYERS)
+    rep_info = rep_info or discover_layer_cohorts(parsed)
     memo: dict[int, float] = {}
     exact_keys: set[int] = set()
     for raw_k, raw_v in (probe_cache or {}).items():
@@ -2466,7 +2269,7 @@ def _screen_colocated_job(args: tuple[Any, ...]) -> tuple[int, bool, float, dict
         limit = _decode_batch_limit(parsed, q_tok, b_vram)
         if limit < 1:
             return idx, False, -1.0, {}
-        rep_info = build_archetype_representative_case(parsed, min_layers=ARCHETYPE_SCREEN_MIN_LAYERS)
+        rep_info = discover_layer_cohorts(parsed)
         prefill_plan_matched = False
         if math.isinf(ttft_sla_ms) and output_tokens > 1:
             p_ms = 0.0
@@ -2678,7 +2481,7 @@ def _eval_decode_exact_job(
             parsed, base_ws=max(1, int(q_tok)), decode_q=max(1, int(q_tok)),
             seq_len=prompt + output, cap_bound=cap_bound,
         )
-        rep_info = build_archetype_representative_case(parsed, min_layers=ARCHETYPE_FOLD_MIN_LAYERS)
+        rep_info = discover_layer_cohorts(parsed)
         eff_sla_ms = tpot_sla_ms * max(1.0, float(d_emit_est))
         d_sla = _solve_sla_archetype_aware(
             parsed, sla_ms=eff_sla_ms, context=prompt,

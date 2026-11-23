@@ -504,14 +504,14 @@ def _resolve_symbolic_kind(
 ) -> str:
     if rec == "megamoe_arch35" or "megamoe" in rec:
         return "megamoe"
-    if fam in {"router", "moe_router", "moe_gating"} or any(
-        t in rec for t in ("moe_gating", "topk_softmax", "gating_topk", "router")
-    ):
-        return "moe_router_topk"
     if fam in {"grouped_gemm", "grouped_matmul", "grouped_moe"}:
         return "grouped_matmul"
     if trait == AlgebraicTrait.BILINEAR_MATMUL:
         return "matmul"
+    if fam in {"router", "moe_router", "moe_gating"} or any(
+        t in rec for t in ("moe_gating", "topk_softmax", "gating_topk", "router")
+    ):
+        return "moe_router_topk"
     if fam in {"all_gather_matmul", "matmul_reduce_scatter"}:
         return fam
     if fam == "add_rmsnorm_quant":
@@ -548,7 +548,11 @@ def _resolve_symbolic_kind(
         return "view_copy"
     if fam in {"short_convolution", "causal_conv1d_fn", "conv1d"} or "conv" in rec:
         return "conv1d"
-    if fam == "gdn_gating" or ("gating" in rec and not any(t in rec for t in ("moe", "router", "topk"))):
+    if fam == "gdn_gating" or (
+        "gating" in rec
+        and not any(t in rec for t in ("moe", "router", "topk"))
+        and not any(t in fam for t in ("moe", "router", "topk"))
+    ):
         return "gating"
     if "recover_ssm" in rec:
         return "recover_ssm"

@@ -33,7 +33,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import os
 from pathlib import Path
@@ -695,6 +695,31 @@ def _layer_metric_sample(
     return ts_mid, bw_gbps, cube_pct, vec_pct, ws_gib
 
 
+def _resolve_host_launch_spec(
+    op_eff: OperatorExportRow,
+    entry: Any,
+    *,
+    is_graph_mode: bool,
+    is_h2d_op: bool,
+) -> tuple[str, float]:
+    if is_h2d_op:
+        return f"aclrtMemcpyAsync (PLE/Engram H2D: {op_eff.op_id})", HOST_KERNEL_LAUNCH_US
+    if is_graph_mode:
+        return f"aclGraphLaunch ({entry.scope.upper()})", HOST_GRAPH_LAUNCH_US
+    label = op_eff.ascend_kernel or op_eff.logical_role or op_eff.op_id
+    return f"aclrtLaunchKernel ({label})", HOST_KERNEL_LAUNCH_US
+
+
+def _entry_layer_span(
+    entry: Any, tpl: Any, per_layer: Mapping[tuple[str, int], Mapping[str, Any]],
+) -> float:
+    if entry.full_layer_index is not None:
+        rec = per_layer.get((entry.scope, int(entry.full_layer_index)))
+        if isinstance(rec, Mapping) and float(rec.get("span_us", 0.0) or 0.0) > 0.0:
+            return float(rec["span_us"])
+    return float(tpl.span_us)
+
+
 def _iter_scheduled_full_model_trace(
     bundle: ExportBundle,
     die_map: Mapping[tuple[int, int, int], int],
@@ -704,10 +729,14 @@ def _iter_scheduled_full_model_trace(
     include_counters: bool,
     include_overlap: bool,
 ) -> Iterator[dict[str, Any]]:
-    """Stream full multi-layer Target + Draft schedule from compact archetype templates."""
+    """Stream full multi-layer Target + Draft schedule using native per-layer timings when recorded."""
+    from .kernel_catalog import strip_op_prefix
+
     templates = _build_archetype_templates(bundle)
+    per_layer = dict(getattr(bundle, "per_layer_timings", None) or {})
     total_span_us = sum(
-        templates[e.archetype_id].span_us for e in bundle.full_trace_schedule if e.archetype_id in templates
+        _entry_layer_span(e, templates[e.archetype_id], per_layer)
+        for e in bundle.full_trace_schedule if e.archetype_id in templates
     )
     yield {
         "name": f"ModelRunner.execute_model [{bundle.model_name} | {bundle.phase.upper()} | graph={bundle.graph_capture_mode}]",
@@ -735,8 +764,14 @@ def _iter_scheduled_full_model_trace(
         tpl = templates.get(entry.archetype_id)
         if tpl is None or not tpl.ops:
             continue
+        layer_rec = (
+            per_layer.get((entry.scope, int(entry.full_layer_index)))
+            if entry.full_layer_index is not None else None
+        )
+        layer_ops_map = layer_rec.get("ops", {}) if isinstance(layer_rec, Mapping) else {}
+        layer_span = _entry_layer_span(entry, tpl, per_layer)
         l_start = ts_cursor
-        l_end = ts_cursor + tpl.span_us
+        l_end = ts_cursor + layer_span
         if entry.scope not in scope_bounds:
             scope_bounds[entry.scope] = [l_start, l_end]
         else:
@@ -744,16 +779,17 @@ def _iter_scheduled_full_model_trace(
 
         yield {
             "name": entry.label, "cat": "MSTX_Layer", "ph": "X",
-            "ts": _round_us(l_start), "dur": _round_us(tpl.span_us),
+            "ts": _round_us(l_start), "dur": _round_us(layer_span),
             "pid": PID_FRAMEWORK, "tid": TID_FW_LAYER_MSTX,
             "args": {"Scope": entry.scope, "Archetype": entry.archetype_id, "Layer": entry.full_layer_index},
         }
+        scale_span = (layer_span / tpl.span_us) if tpl.span_us > 0.0 else 1.0
         for sub_name, r_lo, r_hi in tpl.sub_spans:
             if r_hi <= r_lo:
                 continue
             yield {
                 "name": f"{sub_name} ({entry.label})", "cat": "MSTX_Submodule", "ph": "X",
-                "ts": _round_us(l_start + r_lo), "dur": _round_us(r_hi - r_lo),
+                "ts": _round_us(l_start + r_lo * scale_span), "dur": _round_us((r_hi - r_lo) * scale_span),
                 "pid": PID_FRAMEWORK, "tid": TID_FW_SUBMODULE_MSTX,
                 "args": {"Submodule": sub_name, "Layer": entry.label},
             }
@@ -764,19 +800,19 @@ def _iter_scheduled_full_model_trace(
             coord = (op.occurrence.replica, op.occurrence.stage, int(op.occurrence.rank or 0))
             d_idx = die_map.get(coord, 0)
             base = _pid_base(d_idx)
-            op_ts = l_start + max(0.0, op.start_us - tpl.min_start_us)
-            is_h2d_op = op.family == "engram_rh2d" or "host_uva" in op.op_id.lower()
+            exact_timing = layer_ops_map.get(strip_op_prefix(op.op_id)) if layer_ops_map else None
+            if exact_timing is not None:
+                op_ts = l_start + float(exact_timing[0])
+                op_eff = replace(op, dur_us=float(exact_timing[1]), end_us=op.start_us + float(exact_timing[1]))
+            else:
+                op_ts = l_start + max(0.0, op.start_us - tpl.min_start_us)
+                op_eff = op
+            is_h2d_op = op_eff.family == "engram_rh2d" or "host_uva" in op_eff.op_id.lower()
             if first_op_for_scope or not is_graph_mode or is_h2d_op:
-                dev_pid, dev_tid = _op_pid_tid(op, base)
-                if is_h2d_op:
-                    launch_name = f"aclrtMemcpyAsync (PLE/Engram H2D: {op.op_id})"
-                    l_dur = HOST_KERNEL_LAUNCH_US
-                elif is_graph_mode:
-                    launch_name = f"aclGraphLaunch ({entry.scope.upper()})"
-                    l_dur = HOST_GRAPH_LAUNCH_US
-                else:
-                    launch_name = f"aclrtLaunchKernel ({op.ascend_kernel or op.logical_role or op.op_id})"
-                    l_dur = HOST_KERNEL_LAUNCH_US
+                dev_pid, dev_tid = _op_pid_tid(op_eff, base)
+                launch_name, l_dur = _resolve_host_launch_spec(
+                    op_eff, entry, is_graph_mode=is_graph_mode, is_h2d_op=is_h2d_op,
+                )
                 l_events, flow_id = _emit_host_launch_with_flow(
                     name=launch_name, dev_ts=op_ts, dev_pid=dev_pid, dev_tid=dev_tid,
                     launch_dur_us=l_dur,
@@ -788,24 +824,24 @@ def _iter_scheduled_full_model_trace(
                     first_op_for_scope = False
 
             events, placement, flow_id = _emit_op_and_pipes(
-                bundle, op,
+                bundle, op_eff,
                 ts_start=op_ts, task_id=task_id, layer_label=entry.label,
                 base_pid=base, flow_id=flow_id, include_pipe_lanes=include_pipe_lanes,
-                pipeline_info=pipeline_by_occ.get(op.occurrence),
+                pipeline_info=pipeline_by_occ.get(op_eff.occurrence),
                 op_placement=op_placement,
             )
             yield from events
-            op_placement[op.occurrence] = placement
+            op_placement[op_eff.occurrence] = placement
             task_id += 1
 
         # Accumulate compact per-layer overlap intervals & counter samples (O(1) per layer).
         d0 = die_map.get((tpl.ops[0].occurrence.replica, tpl.ops[0].occurrence.stage, int(tpl.ops[0].occurrence.rank or 0)), 0)
         for r_lo, r_hi in tpl.comp_intervals:
-            comp_by_die[d0].append((l_start + r_lo, l_start + r_hi))
+            comp_by_die[d0].append((l_start + r_lo * scale_span, l_start + r_hi * scale_span))
         for r_lo, r_hi in tpl.comm_intervals:
-            comm_by_die[d0].append((l_start + r_lo, l_start + r_hi))
-        if include_counters and tpl.span_us > 0.0:
-            samples_by_die[d0].append(_layer_metric_sample(tpl.ops, l_start + tpl.span_us * MIDPOINT_FRACTION, tpl.span_us, bundle.hardware_peaks))
+            comm_by_die[d0].append((l_start + r_lo * scale_span, l_start + r_hi * scale_span))
+        if include_counters and layer_span > 0.0:
+            samples_by_die[d0].append(_layer_metric_sample(tpl.ops, l_start + layer_span * MIDPOINT_FRACTION, layer_span, bundle.hardware_peaks))
         ts_cursor = l_end
 
     for sc_key, (s_lo, s_hi) in scope_bounds.items():

@@ -327,7 +327,7 @@ def _has_tuning_evidence(b_op: OperatorExportRow, a_op: OperatorExportRow, *, sa
     return (
         a_op.formula_eval is not None or a_op.measured_sum_us is not None
         or a_op.binding_state in {BINDING_STATE_UNBOUND_FORMULA, BINDING_STATE_MEASURED}
-        or a_op.opt_pillar in {"pillar2_roofline", "pillar1_fusion"}
+        or a_op.opt_pillar in {"pillar2_roofline", "pillar2_tiler_extension", "pillar1_fusion"}
         or (same_config and (b_op.dur_us - a_op.dur_us) > OVERLAP_EXPOSED_EPS_US)
     )
 

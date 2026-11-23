@@ -608,3 +608,13 @@ owns = [
   "mindie_sim/export",
   "mindie_sim/cli/export.py",
 ]
+
+[[module]]
+path = "product/test_unified_engine_and_codesign.py"
+tier = "tier1"
+owns = [
+  "mindie_sim/optimization/kernel_synthesis.py",
+  "mindie_sim/optimization/causal_tail.py",
+  "mindie_sim/prediction/runtime/exposed_observer.py",
+  "mindie_sim/rewrite/algebra.py",
+]

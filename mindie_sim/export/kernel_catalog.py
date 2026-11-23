@@ -34,7 +34,6 @@ from .models import (
     ATTN_4D_RANK,
     ATTN_5D_RANK,
     BACKEND_CANN,
-    BACKEND_CANNBOT_DSL,
     BACKEND_HCCL_MC2,
     BACKEND_TORCH_NPU,
     BACKEND_TRITON,
@@ -1038,9 +1037,9 @@ def _project_linear_attn(
         if is_ideal:
             return (
                 "Fused Recurrent KDA (Spec Verify + Persistent State)",
-                bound_kernel or "flash_kda_persistent", BACKEND_CANNBOT_DSL,
+                bound_kernel or "flash_kda_persistent", BACKEND_CANN,
                 f"{KERNEL_STATUS_NEW_OR_EXTEND} Spec 2D State-Slot Writeback & Persistent UB",
-                True, "Persistent cannbot-dsl / AscendC recurrent KDA with 2D state-slot writeback", "recurrent_scan",
+                True, "Persistent TileLang / AscendC recurrent KDA with 2D state-slot writeback", "recurrent_scan",
             )
         return (
             "Fused Recurrent KDA Decode", bound_kernel or "fused_recurrent_kda", BACKEND_TRITON,

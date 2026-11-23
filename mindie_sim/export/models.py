@@ -119,6 +119,9 @@ BANNED_IMPLEMENTATION_NAMES = frozenset({
 
 #: Kernel backend / ecosystem taxonomy.
 BACKEND_CANN = "CANN aclnn/AscendC"
+BACKEND_ASCENDC = "AscendC"
+BACKEND_TILELANG = "TileLang"
+BACKEND_CATLASS = "Catlass"
 BACKEND_CANNBOT_DSL = "cannbot-dsl"
 BACKEND_TRITON = "Triton-Ascend"
 BACKEND_TORCH_NPU = "torch_npu Custom Op"
@@ -126,10 +129,12 @@ BACKEND_HCCL_MC2 = "HCCL / MC2"
 #: Normalized mapping from core ``structure.py`` ``backend_stack`` tokens.
 STRUCTURE_BACKEND_MAP: dict[str, str] = {
     "aclnn": BACKEND_CANN,
-    "ascendc": BACKEND_CANN,
+    "ascendc": BACKEND_ASCENDC,
     "cann": BACKEND_CANN,
-    "cannbot_dsl": BACKEND_CANNBOT_DSL,
-    "cannbot-dsl": BACKEND_CANNBOT_DSL,
+    "tilelang": BACKEND_TILELANG,
+    "catlass": BACKEND_CATLASS,
+    "cannbot_dsl": BACKEND_TILELANG,
+    "cannbot-dsl": BACKEND_TILELANG,
     "triton": BACKEND_TRITON,
     "triton_ascend": BACKEND_TRITON,
     "triton-ascend": BACKEND_TRITON,
@@ -789,3 +794,6 @@ class ExportBundle:
     applied_edit_receipts: tuple[dict[str, Any], ...] = ()
     effective_config: dict[str, Any] = field(default_factory=dict)
     serve_script_supplied: bool = False
+    per_layer_timings: Mapping[tuple[str, int], Mapping[str, Any]] = field(default_factory=dict)
+    co_design_opportunities: tuple[Any, ...] = ()
+    stage_waterfall: tuple[dict[str, Any], ...] = ()

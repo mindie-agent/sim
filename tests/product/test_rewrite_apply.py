@@ -966,7 +966,7 @@ def _make_v5_target_node(
 
 def test_redline1_same_stream_fifo_and_disjoint_core_split():
     from mindie_sim.compose import compose_case
-    from mindie_sim.optimization.target_schedule import schedule_target_graph_on_engine
+    from mindie_sim.optimization.causal_tail import schedule_target_graph_on_engine
     from mindie_sim.prediction.streams import StreamCoreBudget, StreamLane, StreamPlan
     from mindie_sim.prediction.structure import parse_case
 
@@ -1005,9 +1005,8 @@ def test_redline2_causal_target_tail_placement_and_barrier_rewiring():
     from mindie_sim.optimization.causal_tail import (
         compute_acceptance_tail_closure,
         resolve_barrier_predecessors,
-        restore_folded_tail_commits,
+        schedule_target_graph_on_engine,
     )
-    from mindie_sim.optimization.target_schedule import schedule_target_graph_on_engine
     from mindie_sim.prediction.results import OpOccurrence
     from mindie_sim.prediction.structure import parse_case
     from mindie_sim.schema.operators import OpSpec
@@ -1016,7 +1015,7 @@ def test_redline2_causal_target_tail_placement_and_barrier_rewiring():
     occ_acc = OpOccurrence(0, 0, 0, "accept")
     occ_b1 = OpOccurrence(0, 0, 0, "accept_barrier_1")
     occ_b2 = OpOccurrence(0, 0, 0, "accept_barrier_2")
-    occ_rec = OpOccurrence(0, 0, 0, "s0.l0.recover_ssm_commit")
+    occ_recs = tuple(OpOccurrence(0, 0, 0, f"s0.l{idx}.recover_ssm_commit") for idx in range(3))
     occ_draft = OpOccurrence(0, 0, 0, "draft.s0.l0.qkv")
 
     spec_acc = OpSpec(
@@ -1024,9 +1023,13 @@ def test_redline2_causal_target_tail_placement_and_barrier_rewiring():
         semantic_shape=(1,), local_shape=(1,), padded_shape=(1,), launch_shape=(1,),
         metadata=(("acceptance_boundary", "sampling_acceptance"),),
     )
-    spec_rec = OpSpec(
-        op_id="s0.l0.recover_ssm_commit", family="recover_ssm_commit", phase="decode", stage=0, layer=0, requests=(),
-        semantic_shape=(1,), local_shape=(1,), padded_shape=(1,), launch_shape=(1,),
+    spec_recs = tuple(
+        OpSpec(
+            op_id=f"s0.l{idx}.recover_ssm_commit", family="recover_ssm_commit", phase="decode",
+            stage=0, layer=idx, requests=(), semantic_shape=(1,), local_shape=(1,),
+            padded_shape=(1,), launch_shape=(1,),
+        )
+        for idx in range(3)
     )
     spec_draft = OpSpec(
         op_id="draft.s0.l0.qkv", family="gemm", phase="decode", stage=0, layer=0, requests=(),
@@ -1038,11 +1041,18 @@ def test_redline2_causal_target_tail_placement_and_barrier_rewiring():
         {"occurrence": occ_acc, "op_id": occ_acc.op_id, "family": "accept", "spec": spec_acc, "predecessors": (occ_fwd,), "start_us": 20.0, "end_us": 30.0},
         {"occurrence": occ_b1, "op_id": occ_b1.op_id, "family": "barrier", "spec": None, "predecessors": (occ_acc,), "start_us": 30.0, "end_us": 30.0},
         {"occurrence": occ_b2, "op_id": occ_b2.op_id, "family": "barrier", "spec": None, "predecessors": (occ_b1,), "start_us": 30.0, "end_us": 30.0},
-        {"occurrence": occ_rec, "op_id": occ_rec.op_id, "family": "recover_ssm_commit", "spec": spec_rec, "predecessors": (occ_b2,), "start_us": 30.0, "end_us": 36.0},
-        {"occurrence": occ_draft, "op_id": occ_draft.op_id, "family": "gemm", "spec": spec_draft, "predecessors": (occ_rec,), "start_us": 36.0, "end_us": 50.0},
+        *[
+            {
+                "occurrence": occ_recs[idx], "op_id": occ_recs[idx].op_id, "family": "recover_ssm_commit",
+                "spec": spec_recs[idx], "predecessors": (occ_b2 if idx == 0 else occ_recs[idx - 1],),
+                "start_us": 30.0 + idx * 6.0, "end_us": 36.0 + idx * 6.0,
+            }
+            for idx in range(3)
+        ],
+        {"occurrence": occ_draft, "op_id": occ_draft.op_id, "family": "gemm", "spec": spec_draft, "predecessors": (occ_recs[-1],), "start_us": 48.0, "end_us": 62.0},
     ]
     closure = compute_acceptance_tail_closure(recs)
-    assert occ_acc in closure and occ_rec in closure
+    assert occ_acc in closure and all(o in closure for o in occ_recs)
     assert occ_fwd not in closure and occ_draft not in closure
 
     # Transitive barrier rewiring preserves accept -> recover_ssm_commit across multi-hop zero-dur barriers.
@@ -1050,22 +1060,21 @@ def test_redline2_causal_target_tail_placement_and_barrier_rewiring():
     rec_row = next(r for r in rewired if r["op_id"] == "s0.l0.recover_ssm_commit")
     assert occ_acc in rec_row["predecessors"]
 
-    # Folded representative layer (layers 0, 1, 2) restores 3 distinct per-layer commits inside target_tail.
-    expanded, new_closure = restore_folded_tail_commits(rewired, tail_closure=closure, layer_indices_by_rep_layer={0: (0, 1, 2)})
-    commits = [r for r in expanded if r["family"] == "recover_ssm_commit"]
+    # Real per-layer commits remain distinct in target_tail without synthetic cloning.
+    commits = [r for r in rewired if r["family"] == "recover_ssm_commit"]
     assert len(commits) == 3
-    assert all(r["occurrence"] in new_closure for r in commits)
+    assert all(r["occurrence"] in closure for r in commits)
 
     # Die Engine schedule enforces Redline #2: every recover_ssm_commit starts >= accept.end_us.
     case = parse_case(compose_case("qwen3-32b", "a3", tp=1, dp=1, layers=1))
     nodes = [
         _make_v5_target_node(
             i, r["op_id"],
-            archetype_id=("target_tail" if r["occurrence"] in new_closure else ("draft_arch_0" if r["op_id"].startswith("draft") else "target_arch_0")),
+            archetype_id=("target_tail" if r["occurrence"] in closure else ("draft_arch_0" if r["op_id"].startswith("draft") else "target_arch_0")),
             family=r["family"], predecessors=r["predecessors"], dur_us=max(1.0, r["end_us"] - r["start_us"]),
             vector_ops=1.0e8, spec=r["spec"],
         )
-        for i, r in enumerate(expanded)
+        for i, r in enumerate(rewired)
     ]
     sched = schedule_target_graph_on_engine(nodes, case)
     acc_node = next(n for n in sched.nodes if n.op_id == "accept")
@@ -1077,9 +1086,12 @@ def test_redline2_causal_target_tail_placement_and_barrier_rewiring():
 
 def test_redline3_persistent_whole_die_and_moe_mutex_head_to_head():
     from mindie_sim.compose import compose_case
-    from mindie_sim.optimization.causal_tail import enforce_moe_mutex_on_nodes, moe_route_legality
+    from mindie_sim.optimization.causal_tail import (
+        enforce_moe_mutex_on_nodes,
+        moe_route_legality,
+        schedule_target_graph_on_engine,
+    )
     from mindie_sim.optimization.kernel_synthesis import solve_target_graph
-    from mindie_sim.optimization.target_schedule import schedule_target_graph_on_engine
     from mindie_sim.prediction.structure import parse_case
 
     case_a3 = parse_case(compose_case("deepseek-v3.2", "a3", tp=1, dp=4, ep=4, layers=4))

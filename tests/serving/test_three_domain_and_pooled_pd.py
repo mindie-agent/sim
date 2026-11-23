@@ -663,16 +663,14 @@ def test_memory_hbm_pools_draft_cap_engram_offload_and_pd_runtime_sharding():
 
 def test_archetype_folding_zero_drift_on_unseen_irregular_hybrid_with_prime_quant_exclusions():
     from mindie_sim.prediction.evaluation import EvaluationContext
+    from mindie_sim.prediction.execution.layer_runs import discover_layer_cohorts
     from mindie_sim.prediction.graph_analysis import graph_costs
     from mindie_sim.prediction.operator_analysis import target_graphs
     from mindie_sim.prediction.structure import parse_case
-    from mindie_sim.sweep.pd import (
-        _archetype_weighted_step_ms,
-        build_archetype_representative_case,
-    )
+    from mindie_sim.sweep import pd as pd_mod
 
     # Synthetic unseen 10-layer irregular hybrid (Dense+MoE+KDA+MLA) with prime-numbered per-layer
-    # quant exclusions and category_overrides so archetype keys must preserve exact per-layer quant.
+    # quant exclusions and category_overrides so cohort discovery preserves exact per-layer quant.
     raw = compose_case(
         "kimi-k3.1", "950dt-96g-pod",
         dp=1, tp=2, ep=2, pp=1, layers=10,
@@ -686,16 +684,17 @@ def test_archetype_folding_zero_drift_on_unseen_irregular_hybrid_with_prime_quan
         "model.layers.7.mlp": {"weight_format": "bf16"},
     }
     case = parse_case(raw)
-    _rep_case, weights, _draft_scale = build_archetype_representative_case(case, min_layers=2)
-    assert sum(weights.values()) == 10
-    assert len(weights) >= 5  # Mixed KDA/MLA/Dense/MoE + prime quant exclusions + layer-7 override.
+    assert not hasattr(pd_mod, "build_archetype_representative_case")
+    plan = discover_layer_cohorts(case)
+    assert sum(c.count for c in plan.cohorts) == 10
+    assert len(plan.cohorts) >= 5  # Mixed KDA/MLA/Dense/MoE + prime quant exclusions + layer-7 override.
 
     full_graphs = target_graphs(case, phase="decode", tokens=1, context=2048, sequences=2, scope="model")
     full_ctx = EvaluationContext.create(case)
     full_ms = float(graph_costs(
         case, full_graphs, isolated=False, evaluation=full_ctx, timeline_replicas=(0,),
     )["duration_ms"])
-    folded_ms = _archetype_weighted_step_ms(
+    folded_ms = pd_mod._archetype_weighted_step_ms(
         case, phase="decode", tokens=1, context=2048, sequences=2, scope="model", min_layers=2,
     )
     assert folded_ms == pytest.approx(full_ms, rel=1e-6, abs=1e-6)

@@ -84,6 +84,9 @@ pytestmark = pytest.mark.tier0
 
 ATTNRES_HIDDEN = 7168
 ATTNRES_CAPACITY = 12
+#: Eager Python Triton host-launch rate plateau (80 Python ``kernel[grid]`` calls
+#: inside one Event pair on A5); inside ``ACLGraph``, device execution duration
+#: is legitimately 4..24 us (> 1.686 us) without host-dispatch clamping.
 ATTNRES_AUDIT_PLATEAU_US = 25.3
 ATTNRES_MAX_MEAN_APE = 4.0
 ATTNRES_MAX_POINT_APE = 9.0
@@ -145,10 +148,17 @@ def test_attnres_prefix_matches_measured_curve_and_owner_waves() -> None:
         pred_us = float(rec["duration_ms"]) * 1000.0
         by_point[(tokens, valid)] = pred_us
         assert pred_us > DECODE_FLOOR_US
+        # Compare device-side prediction against eager Python Triton measurement
+        # (80 Python kernel[grid] calls inside one Event pair saturate at the
+        # 25.3 us host-launch plateau; inside ACLGraph, device duration stays 4..24 us).
         audit_us = max(pred_us, ATTNRES_AUDIT_PLATEAU_US)
         apes.append(abs(audit_us - meas) / meas * 100.0)
         for delta in rec["service_delta"].values():
             assert abs(float(delta)) < 1e-4
+
+    from mindie_sim.prediction.operators.hyper_connections import family_attnres as _fa
+    assert not hasattr(_fa, "ATTNRES_RESIDENT_TREE_DELTA_NS")
+    assert not hasattr(_fa, "ATTNRES_RELOAD_TREE_DELTA_NS")
 
     assert sum(apes) / len(apes) <= ATTNRES_MAX_MEAN_APE
     assert max(apes) <= ATTNRES_MAX_POINT_APE

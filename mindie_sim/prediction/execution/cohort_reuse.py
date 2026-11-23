@@ -97,29 +97,50 @@ def _ops(value: Any) -> tuple:
     return tuple(value)
 
 
+_SKIP_NORM_META_KEYS = frozenset({"rank", "ep_rank", "group_ranks", "replica"})
+_REBIND_ATOMIC = (int, float, bool, type(None))
+
+
+def _common_prefix(tokens: Sequence[str]) -> str:
+    non_empty = [t for t in tokens if t]
+    if not non_empty:
+        return ""
+    pfx = non_empty[0]
+    for tok in non_empty[1:]:
+        while pfx and not tok.startswith(pfx):
+            pfx = pfx[:-1]
+        if not pfx:
+            break
+    return pfx
+
+
 def _normalized(
     value: Any,
     request_pattern: re.Pattern | None = None,
     request_set: frozenset[str] = frozenset(),
+    request_prefix: str = "",
 ) -> Any:
-    if isinstance(value, str):
+    t = type(value)
+    if t in _REBIND_ATOMIC:
+        return value
+    if t is str:
         if request_set and value in request_set:
             return "@request"
         text = RANK_TOKEN.sub("@r*", value) if "@r" in value else value
-        if request_pattern is not None:
+        if request_pattern is not None and (not request_prefix or request_prefix in text):
             text = request_pattern.sub("@request", text)
         return text
     if isinstance(value, Mapping):
         return tuple(sorted(
-            ((str(key), _normalized(item, request_pattern, request_set))
+            ((str(key), _normalized(item, request_pattern, request_set, request_prefix))
              for key, item in value.items()
-             if str(key) not in {"rank", "ep_rank", "group_ranks", "replica"}),
+             if str(key) not in _SKIP_NORM_META_KEYS),
             key=lambda pair: pair[0]))
     if isinstance(value, (tuple, list)):
-        return tuple(_normalized(item, request_pattern, request_set) for item in value)
+        return tuple(_normalized(item, request_pattern, request_set, request_prefix) for item in value)
     if isinstance(value, (set, frozenset)):
         return tuple(sorted(
-            (_normalized(item, request_pattern, request_set) for item in value),
+            (_normalized(item, request_pattern, request_set, request_prefix) for item in value),
             key=repr))
     return value
 
@@ -128,6 +149,7 @@ def _op_signature(
     op: Any,
     request_pattern: re.Pattern | None = None,
     request_set: frozenset[str] = frozenset(),
+    request_prefix: str = "",
 ) -> tuple:
     metadata = dict(getattr(op, "metadata", ()) or {})
     return (
@@ -146,20 +168,108 @@ def _op_signature(
         float(getattr(op, "link_bytes", 0) or 0),
         str(getattr(op, "source_boundary", "")),
         str(getattr(op, "stream", "") or ""),
-        _normalized(tuple(getattr(op, "deps", ()) or ()), request_pattern, request_set),
-        _normalized(tuple(getattr(op, "matrix_flops", ()) or ()), request_pattern, request_set),
-        _normalized(metadata.get("matrix_flops"), request_pattern, request_set),
+        _normalized(tuple(getattr(op, "deps", ()) or ()), request_pattern, request_set, request_prefix),
+        _normalized(tuple(getattr(op, "matrix_flops", ()) or ()), request_pattern, request_set, request_prefix),
+        _normalized(metadata.get("matrix_flops"), request_pattern, request_set, request_prefix),
         len(tuple(getattr(op, "requests", ()) or ())),
-        _normalized(metadata, request_pattern, request_set),
+        _normalized(metadata, request_pattern, request_set, request_prefix),
     )
+
+
+def _values_isomorphic(
+    v0: Any,
+    vr: Any,
+    request_pattern: re.Pattern | None,
+    request_set: frozenset[str],
+    request_prefix: str,
+) -> bool:
+    """Short-circuit structural equality matching ``_normalized(v0) == _normalized(vr)``."""
+    if v0 == vr:
+        return True
+    t0 = type(v0)
+    tr = type(vr)
+    if t0 is str and tr is str:
+        return _normalized(v0, request_pattern, request_set, request_prefix) == _normalized(
+            vr, request_pattern, request_set, request_prefix
+        )
+    if (t0 is tuple or t0 is list) and (tr is tuple or tr is list):
+        if len(v0) != len(vr):
+            return False
+        for a, b in zip(v0, vr):
+            if a != b and not _values_isomorphic(a, b, request_pattern, request_set, request_prefix):
+                return False
+        return True
+    if t0 is dict and tr is dict:
+        keys0 = {str(k) for k in v0 if str(k) not in _SKIP_NORM_META_KEYS}
+        keys_r = {str(k) for k in vr if str(k) not in _SKIP_NORM_META_KEYS}
+        if keys0 != keys_r:
+            return False
+        for k in keys0:
+            a, b = v0[k], vr[k]
+            if a != b and not _values_isomorphic(a, b, request_pattern, request_set, request_prefix):
+                return False
+        return True
+    return _normalized(v0, request_pattern, request_set, request_prefix) == _normalized(
+        vr, request_pattern, request_set, request_prefix
+    )
+
+
+def _ops_isomorphic(
+    op0: Any,
+    op_r: Any,
+    request_pattern: re.Pattern | None,
+    request_set: frozenset[str],
+    request_prefix: str,
+) -> bool:
+    """Zero-allocation structural isomorphism check matching ``_op_signature`` exactly."""
+    if op0 == op_r:
+        return True
+    if (
+        str(getattr(op0, "family", "")) != str(getattr(op_r, "family", ""))
+        or str(getattr(op0, "recipe", "")) != str(getattr(op_r, "recipe", ""))
+        or str(getattr(op0, "phase", "")) != str(getattr(op_r, "phase", ""))
+        or int(getattr(op0, "stage", 0)) != int(getattr(op_r, "stage", 0))
+        or str(getattr(op0, "dtype", "")) != str(getattr(op_r, "dtype", ""))
+        or str(getattr(op0, "layout", "")) != str(getattr(op_r, "layout", ""))
+        or tuple(getattr(op0, "semantic_shape", ()) or ()) != tuple(getattr(op_r, "semantic_shape", ()) or ())
+        or tuple(getattr(op0, "local_shape", ()) or ()) != tuple(getattr(op_r, "local_shape", ()) or ())
+        or tuple(getattr(op0, "padded_shape", ()) or ()) != tuple(getattr(op_r, "padded_shape", ()) or ())
+        or tuple(getattr(op0, "launch_shape", ()) or ()) != tuple(getattr(op_r, "launch_shape", ()) or ())
+        or float(getattr(op0, "flops", 0) or 0) != float(getattr(op_r, "flops", 0) or 0)
+        or float(getattr(op0, "hbm_bytes", 0) or 0) != float(getattr(op_r, "hbm_bytes", 0) or 0)
+        or float(getattr(op0, "mte2_bytes", 0) or 0) != float(getattr(op_r, "mte2_bytes", 0) or 0)
+        or float(getattr(op0, "mte3_bytes", 0) or 0) != float(getattr(op_r, "mte3_bytes", 0) or 0)
+        or float(getattr(op0, "vector_ops", 0) or 0) != float(getattr(op_r, "vector_ops", 0) or 0)
+        or float(getattr(op0, "link_bytes", 0) or 0) != float(getattr(op_r, "link_bytes", 0) or 0)
+        or str(getattr(op0, "source_boundary", "")) != str(getattr(op_r, "source_boundary", ""))
+        or str(getattr(op0, "stream", "") or "") != str(getattr(op_r, "stream", "") or "")
+        or len(tuple(getattr(op0, "requests", ()) or ())) != len(tuple(getattr(op_r, "requests", ()) or ()))
+    ):
+        return False
+    deps0 = tuple(getattr(op0, "deps", ()) or ())
+    deps_r = tuple(getattr(op_r, "deps", ()) or ())
+    if deps0 != deps_r and not _values_isomorphic(deps0, deps_r, request_pattern, request_set, request_prefix):
+        return False
+    mf0 = tuple(getattr(op0, "matrix_flops", ()) or ())
+    mf_r = tuple(getattr(op_r, "matrix_flops", ()) or ())
+    if mf0 != mf_r and not _values_isomorphic(mf0, mf_r, request_pattern, request_set, request_prefix):
+        return False
+    raw_m0 = getattr(op0, "metadata", ()) or ()
+    raw_mr = getattr(op_r, "metadata", ()) or ()
+    if raw_m0 == raw_mr:
+        return True
+    d0 = dict(raw_m0)
+    dr = dict(raw_mr)
+    return _values_isomorphic(d0, dr, request_pattern, request_set, request_prefix)
 
 
 def _graph_signature(
     ops: Sequence[Any],
     request_pattern: re.Pattern | None = None,
     request_set: frozenset[str] = frozenset(),
+    request_prefix: str = "",
 ) -> tuple:
-    return tuple(_op_signature(op, request_pattern, request_set) for op in ops)
+    return tuple(_op_signature(op, request_pattern, request_set, request_prefix) for op in ops)
 
 
 def _request_tokens(graphs: Sequence[Sequence[Any]]) -> tuple[str, ...]:
@@ -181,13 +291,14 @@ def prove_homogeneous_cohort(
     reasons: list[str] = []
     if any(len(graph) != len(ordered[0]) for graph in ordered[1:]):
         reasons.append("asymmetric_replica_graph")
-    else:
+    elif len(ordered) > 1:
         request_tokens = _request_tokens(ordered)
         req_set = frozenset(tok for tok in request_tokens if tok)
         req_pat = _compile_token_pattern(request_tokens)
-        base_sig = _graph_signature(ordered[0], req_pat, req_set)
+        req_pfx = _common_prefix(request_tokens)
+        base_ops = ordered[0]
         for graph in ordered[1:]:
-            if _graph_signature(graph, req_pat, req_set) != base_sig:
+            if not all(_ops_isomorphic(o0, o_r, req_pat, req_set, req_pfx) for o0, o_r in zip(base_ops, graph)):
                 reasons.append("asymmetric_replica_graph")
                 break
     if selected_implementations is not None:
@@ -229,24 +340,98 @@ def _request_binding_pattern(binding: Mapping[str, str]) -> re.Pattern | None:
     return _compile_token_pattern(tuple(str(key) for key in binding if str(key)))
 
 
-def _rebind_nested_requests(value: Any, pattern: re.Pattern | None,
-                            binding: Mapping[str, str]) -> Any:
+def _scan_meta_prefix(value: Any, prefix: str, memo: dict[int, bool]) -> bool:
+    t = type(value)
+    if t in _REBIND_ATOMIC:
+        return False
+    if t is str:
+        return prefix in value
+    oid = id(value)
+    hit = memo.get(oid)
+    if hit is not None:
+        return hit
+    found = False
+    if t is tuple or t is list:
+        for item in value:
+            it = type(item)
+            if it is str:
+                if prefix in item:
+                    found = True
+            elif it not in _REBIND_ATOMIC and _scan_meta_prefix(item, prefix, memo):
+                found = True
+    elif t is dict:
+        for item in value.values():
+            it = type(item)
+            if it is str:
+                if prefix in item:
+                    found = True
+            elif it not in _REBIND_ATOMIC and _scan_meta_prefix(item, prefix, memo):
+                found = True
+    elif isinstance(value, Mapping):
+        for item in value.values():
+            if _scan_meta_prefix(item, prefix, memo):
+                found = True
+    elif isinstance(value, (set, frozenset)):
+        for item in value:
+            if _scan_meta_prefix(item, prefix, memo):
+                found = True
+    memo[oid] = found
+    return found
+
+
+def _rebind_nested_requests(
+    value: Any,
+    pattern: re.Pattern | None,
+    binding: Mapping[str, str],
+    prefix: str = "",
+    has_prefix: Mapping[int, bool] | None = None,
+) -> Any:
     """Rename request identities nested in metadata without touching types."""
     if pattern is None:
         return value
-    if isinstance(value, str):
+    t = type(value)
+    if t in _REBIND_ATOMIC:
+        return value
+    if t is str:
+        if prefix and prefix not in value:
+            return value
+        if value in binding:
+            return binding[value]
         return pattern.sub(lambda match: binding[match.group()], value)
+    if has_prefix is not None and not has_prefix.get(id(value), True):
+        return value
+    if t is dict:
+        changed = False
+        out = {}
+        for k, item in value.items():
+            ni = _rebind_nested_requests(item, pattern, binding, prefix, has_prefix)
+            if ni is not item:
+                changed = True
+            out[k] = ni
+        return out if changed else value
+    if t is tuple:
+        changed = False
+        out_t = []
+        for item in value:
+            ni = _rebind_nested_requests(item, pattern, binding, prefix, has_prefix)
+            if ni is not item:
+                changed = True
+            out_t.append(ni)
+        return tuple(out_t) if changed else value
+    if t is list:
+        changed = False
+        out_l = []
+        for item in value:
+            ni = _rebind_nested_requests(item, pattern, binding, prefix, has_prefix)
+            if ni is not item:
+                changed = True
+            out_l.append(ni)
+        return out_l if changed else value
     if isinstance(value, Mapping):
-        return type(value)((key, _rebind_nested_requests(item, pattern, binding))
+        return type(value)((key, _rebind_nested_requests(item, pattern, binding, prefix, has_prefix))
                            for key, item in value.items())
-    if isinstance(value, tuple):
-        return tuple(_rebind_nested_requests(item, pattern, binding)
-                     for item in value)
-    if isinstance(value, list):
-        return [_rebind_nested_requests(item, pattern, binding)
-                for item in value]
     if isinstance(value, (set, frozenset)):
-        return type(value)(_rebind_nested_requests(item, pattern, binding)
+        return type(value)(_rebind_nested_requests(item, pattern, binding, prefix, has_prefix)
                            for item in value)
     return value
 
@@ -305,6 +490,7 @@ def rebind_replica_graph(
     case: Any = None,
     topology: Any = None,
     local_groups_cache: dict[tuple[int, int, int], tuple[tuple[int, ...], ...]] | None = None,
+    meta_prefix_cache: Mapping[int, bool] | None = None,
 ) -> tuple[Any, ...]:
     """Rebind rank/request/state identities of one semantic template."""
     rank_map = {int(key): int(value) for key, value in dict(placement or {}).items()}
@@ -312,6 +498,7 @@ def rebind_replica_graph(
     requests = {str(key): str(value)
                 for key, value in dict(request_binding or {}).items()}
     request_pattern = _request_binding_pattern(requests)
+    request_prefix = _common_prefix(tuple(requests)) if requests else ""
     states = dict(state_bindings or {})
     groups_cache = {} if local_groups_cache is None else local_groups_cache
     rebound = []
@@ -320,32 +507,55 @@ def rebind_replica_graph(
         if "@r" in op_id:
             op_id = RANK_TOKEN.sub(
                 lambda match: f"@r{rank_map.get(int(match.group(RANK_GROUP)), fallback)}", op_id)
-        metadata = dict(getattr(op, "metadata", ()) or {})
+        raw_meta = getattr(op, "metadata", ()) or ()
+        meta_may_have_req = (
+            request_pattern is not None
+            and (meta_prefix_cache is None or meta_prefix_cache.get(id(raw_meta), True))
+        )
+        metadata = dict(raw_meta)
+        meta_changed = False
         for key in ("rank", "ep_rank", "destination_rank", "source_rank"):
             if key in metadata and isinstance(metadata[key], int):
-                metadata[key] = rank_map.get(int(metadata[key]), metadata[key])
+                nv = rank_map.get(int(metadata[key]), metadata[key])
+                if nv != metadata[key]:
+                    metadata[key] = nv
+                    meta_changed = True
         if "group_ranks" in metadata:
+            before_gr = metadata["group_ranks"]
             topology = _rebind_group_ranks(
                 metadata, op, replica, rank_map, case, topology, groups_cache)
+            if metadata["group_ranks"] != before_gr:
+                meta_changed = True
         for key in ("state_owner", "recurrent_state_owner", "input_state_version",
                     "published_state_version"):
             if key in metadata and str(metadata[key]) in states:
-                metadata[key] = states[str(metadata[key])]
-        if "replica" in metadata:
+                nv = states[str(metadata[key])]
+                if nv != metadata[key]:
+                    metadata[key] = nv
+                    meta_changed = True
+        if "replica" in metadata and metadata["replica"] != int(replica):
             metadata["replica"] = int(replica)
-        if request_pattern is not None:
-            metadata = dict(_rebind_nested_requests(
-                metadata, request_pattern, requests))
+            meta_changed = True
+        if meta_may_have_req:
+            rebound_meta = _rebind_nested_requests(
+                metadata, request_pattern, requests, request_prefix, meta_prefix_cache)
+            if rebound_meta is not metadata:
+                metadata = dict(rebound_meta)
+                meta_changed = True
         deps = tuple(
             RANK_TOKEN.sub(
                 lambda match: f"@r{rank_map.get(int(match.group(RANK_GROUP)), fallback)}",
                 str(dep)) if "@r" in str(dep) else str(dep)
             for dep in (getattr(op, "deps", ()) or ()))
+        new_meta = (
+            tuple(sorted(metadata.items(), key=lambda pair: pair[0]))
+            if meta_changed else raw_meta
+        )
         rebound.append(replace(
             op, op_id=op_id, deps=deps,
             requests=tuple(requests.get(str(request), str(request))
                            for request in (getattr(op, "requests", ()) or ())),
-            metadata=tuple(sorted(metadata.items(), key=lambda pair: pair[0])),
+            metadata=new_meta,
         ))
     return tuple(rebound)
 
@@ -410,6 +620,13 @@ def prepare_cohort_graphs(
     else:
         template = graphs[template_rep]
     rebound = {template_rep: tuple(template)}
+    template_req_pfx = _common_prefix(request_ids[template_rep])
+    meta_prefix_cache: dict[int, bool] | None = None
+    if template_req_pfx:
+        meta_prefix_cache = {}
+        for op in template:
+            raw_meta = getattr(op, "metadata", ()) or ()
+            _scan_meta_prefix(raw_meta, template_req_pfx, meta_prefix_cache)
     for replica in sorted(graphs):
         if replica == template_rep:
             continue
@@ -423,7 +640,8 @@ def prepare_cohort_graphs(
             request_binding=request_binding, state_bindings=None,
             physical_rank=ranks_by_replica.get(replica, replica),
             case=case, topology=shared_topology,
-            local_groups_cache=local_groups_cache)
+            local_groups_cache=local_groups_cache,
+            meta_prefix_cache=meta_prefix_cache)
     return PreparedCohort(
         rebound, proof, True, proof.execution_quotient,
         proof.fallback_reason, cache_stats)

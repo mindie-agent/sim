@@ -1073,15 +1073,16 @@ def test_export_binding_conservation_pp_reconciliation_and_brief_precision(tmp_p
         build_export_bundle(raw_base, request=req_base, step_eval=step_eval, rewrite_plan={"edits": []}, apply_target_envelope=False)
 
     # 6. PP2 peak-stage weight conservation (untied embed on S0 + lm_head on S1) & kv_block_size lookup.
+    from mindie_sim.prediction.execution.layer_runs import discover_layer_cohorts
+
     raw_pp2 = compose_case("qwen3-32b", "a3", tp=2, pp=2, layers=4, prompt_tokens=256, output_tokens=32)
     raw_pp2["runtime"]["kv_block_size"] = 64
     raw_pp2["runtime"]["pp_layer_partition"] = [3, 1]
     parsed_pp2 = parse_case(raw_pp2)
-    rep_pp2 = bundle_mod._build_archetype_representative_case(
-        parsed_pp2, {0: parsed_pp2.model.layer_plans[0], 1: parsed_pp2.model.layer_plans[3]},
-        allow_draft_dedup=True,
-    )
-    assert rep_pp2.runtime.pp_layer_partition == (1, 1)
+    cohort_pp2 = discover_layer_cohorts(parsed_pp2)
+    assert cohort_pp2.stage_counts == (3, 1)
+    assert [c.layer_indices for c in cohort_pp2.cohorts] == [(0, 1, 2), (3,)]
+    assert not hasattr(bundle_mod, "_build_archetype_representative_case")
     led_pp2 = compute_memory_quant_ledger(parsed_pp2, phase="decode", seq_len=512, concurrency=2)
     assert led_pp2.block_size == 64
     hbm_rows = [

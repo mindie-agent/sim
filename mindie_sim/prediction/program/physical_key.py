@@ -4,7 +4,10 @@
   with alpha-renamed graph references and on-demand serialization.
 [Invariants] Only declared graph-reference leaves are alpha-renamed; every
   tensor shape, stride, layout, dtype, routing, cache, and state field is
-  preserved verbatim.
+  preserved verbatim.  Cross-layer loop-invariant ops hoisted to step prologue
+  (e.g., ``s0.pre_forward.<name>`` without ``.l<N>.``) do not match the
+  layer-indexed occurrence pattern and therefore stay invariant across all
+  consumer layers without generating distinct ``0 - l`` relative offsets.
 [Timeouts & Locks] O(op metadata size) pure projection; no I/O or locks.
 [Side-Effect Policy] Pure immutable key construction; zero mutation.
 
@@ -41,6 +44,9 @@ from typing import Any
 
 #: Version tag of the physical identity projection.
 IDENTITY_VERSION = "physical-key/4"
+#: Canonical stage-level prologue segment for hoisted cross-layer loop-invariant ops
+#: (``s<stage>.pre_forward.<name>``, intentionally omitting ``.l<layer>.``).
+HOISTED_PROLOGUE_PREFIX = "pre_forward."
 
 #: Fields excluded from physical identity.  They name one occurrence, not work.
 OCCURRENCE_FIELDS = frozenset({
@@ -60,6 +66,7 @@ REFERENCE_KEYS = frozenset({
     "composite_shared_subgraphs",
     "device_kernel_group",
     "folded_subgraph_key",
+    "fused_from",
     "fused_members",
     "fused_origin_scopes",
     "fusion_boundary",
@@ -97,8 +104,13 @@ REFERENCE_PREFIXES = ("state_", "attn_res_", "structure_subgraph")
 #: Suffix families whose value names the producer occurrence.
 REFERENCE_SUFFIXES = ("_producer", "_consumer", "_parent")
 
-#: Instance pairing ids: they name one collective occurrence, not its work.
-PAIRING_ONLY_KEYS = frozenset({"collective_id", "reverse_of_collective"})
+#: Instance pairing ids: they name one collective or bank-slot provenance occurrence, not its work.
+PAIRING_ONLY_KEYS = frozenset({
+    "collective_id",
+    "reverse_of_collective",
+    "attn_res_bank_ids",
+    "attn_res_bank_rows",
+})
 
 #: Metadata leaves carrying an absolute stage/layer pair to be made relative.
 STATE_ACCESS_KEY = "state_accesses"
@@ -148,6 +160,12 @@ def is_reference_key(key: str) -> bool:
 
 def normalize_reference(value: str, stage: int, layer: int) -> str:
     """Rename occurrence prefixes relative to one anchor, preserving offsets."""
+    has_occ = ".l" in value
+    has_layer_ref = ".layer[" in value
+    has_ctx_kv = "context_kv" in value
+    if not (has_occ or has_layer_ref or has_ctx_kv):
+        return value
+
     def _rename(match: "re.Match[str]") -> str:
         return (f"{match.group('draft') or ''}s{int(match.group(_STAGE_GROUP)) - int(stage)}"
                 f".l{int(match.group(_LAYER_GROUP)) - int(layer)}")
@@ -161,9 +179,12 @@ def normalize_reference(value: str, stage: int, layer: int) -> str:
         return (f"{match.group('draft') or ''}context_kv"
                 f"{int(match.group(_CONTEXT_KV_GROUP)) - int(layer)}")
 
-    renamed = _OCCURRENCE.sub(_rename, value)
-    renamed = _LAYER_REFERENCE.sub(_layer, renamed)
-    return _CONTEXT_KV_OCCURRENCE.sub(_context_kv, renamed)
+    renamed = _OCCURRENCE.sub(_rename, value) if has_occ else value
+    if has_layer_ref:
+        renamed = _LAYER_REFERENCE.sub(_layer, renamed)
+    if has_ctx_kv:
+        renamed = _CONTEXT_KV_OCCURRENCE.sub(_context_kv, renamed)
+    return renamed
 
 
 def _normalize_mapping_entry(key: Any, item: Any, stage: int,

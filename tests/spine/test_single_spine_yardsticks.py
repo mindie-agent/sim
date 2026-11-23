@@ -5,8 +5,9 @@
   module/bucket key), prove all six negative controls fail loudly (exact
   ``0.01%`` boundary, cancelling module drift, missing point, fabricated or
   uncomputed ``predicted_ns``, mismatched ``PrimitiveTable`` digest, and
-  cross-layer auxiliary-stream tail exposure drift), lock the empirical
-  93-layer Kimi-K3.1 ``layers=3`` fold error as a strict xfail ready for H4,
+  cross-layer auxiliary-stream tail exposure drift), lock strict ``< 0.01%``
+  cohort equivalence against literal full-depth Engine replay across 93-layer
+  Kimi-K3.1, 48-layer Qwen3.8-Flash-Next, and 61-layer DeepSeek-V4.1-Flash,
   and validate the isolated Linux child-process VmRSS/VmHWM probe.
 [Invariants] Strict integer-ns arithmetic only; zero silent fallbacks; zero
   caller-supplied prediction bypasses; zero local host pollution.
@@ -39,6 +40,7 @@ from mindie_sim.onboarding.contracts import (
 )
 from mindie_sim.onboarding.whitebox_runner import score_sealed_gate_cases
 from mindie_sim.prediction.evaluation import EvaluationContext
+from mindie_sim.prediction.execution.layer_runs import discover_layer_cohorts
 from mindie_sim.prediction.graph_analysis import graph_costs
 from mindie_sim.prediction.runtime.engine import Engine, Resource
 from mindie_sim.prediction.structure import parse_case
@@ -49,6 +51,8 @@ pytestmark = pytest.mark.tier1
 
 COHORT_TOLERANCE_DENOMINATOR = 10_000  # strict < 0.01% == 1 / 10_000
 KIMI_EXPECTED_TARGET_LAYERS = 93
+HYBRID_GDN_EXPECTED_LAYERS = 48
+SPARSE_MLA_EXPECTED_LAYERS = 61
 A2_SKU = REPRESENTATIVE_SKUS["a2"]
 
 
@@ -414,18 +418,19 @@ def test_cohort_equivalence_rejects_cross_layer_aux_stream_tail_drift() -> None:
         )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=CohortEquivalenceError,
-    reason=(
-        "H4 replaces mindie_sim/sweep/pd.py:1596 layers=3 fold with "
-        "mindie_sim/prediction/execution/layer_runs.py:232 exact cohort"
-    ),
-)
-def test_kimi_ninety_three_layer_fold_equivalence_against_literal_engine() -> None:
-    """Empirical 93L Kimi-K3.1 reference: current 3-layer fold fails < 0.01% until H4."""
+def _assert_flagship_cohort_equivalence(
+    model_name: str,
+    expected_layers: int,
+    *,
+    layers: int | None = None,
+    cand_uid: str,
+    ref_uid: str,
+) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {}
+    if layers is not None:
+        kwargs["layers"] = layers
     raw = compose_case(
-        "kimi-k3.1",
+        model_name,
         GEN5_DT_SKU,
         dp=1,
         tp=1,
@@ -434,9 +439,18 @@ def test_kimi_ninety_three_layer_fold_equivalence_against_literal_engine() -> No
         prompt_tokens=32,
         output_tokens=1,
         concurrency=1,
+        **kwargs,
     )
     parsed = parse_case(raw)
-    assert len(parsed.model.layer_plans) == KIMI_EXPECTED_TARGET_LAYERS
+    assert len(parsed.model.layer_plans) == expected_layers
+
+    cohort_plan = discover_layer_cohorts(parsed)
+    assert cohort_plan.total_target_layers == expected_layers
+    covered_indices = tuple(
+        sorted(idx for cohort in cohort_plan.cohorts for idx in cohort.layer_indices)
+    )
+    assert covered_indices == tuple(range(expected_layers))
+    assert sum(c.count for c in cohort_plan.cohorts) == expected_layers
 
     eval_ctx = EvaluationContext.create(parsed)
     table = eval_ctx.bindings.primitive_table
@@ -473,7 +487,7 @@ def test_kimi_ninety_three_layer_fold_equivalence_against_literal_engine() -> No
     cand_ns = int(round(float(cand_ms) * NS_PER_MS))
     assert cand_ns > 0
 
-    assert_cohort_equivalence_ns(
+    return assert_cohort_equivalence_ns(
         cand_ns,
         ref_ns,
         {"model_step": cand_ns},
@@ -483,9 +497,43 @@ def test_kimi_ninety_three_layer_fold_equivalence_against_literal_engine() -> No
         ref_table_digest=table_digest,
         cand_clock_operator="device_graph_duration",
         ref_clock_operator="device_graph_duration",
-        cand_receipt={"source": "engine", "engine_uid": "sweep_archetype_fold"},
-        ref_receipt={"source": "engine", "engine_uid": "literal_93l_engine"},
+        cand_receipt={"source": "engine", "engine_uid": cand_uid},
+        ref_receipt={"source": "engine", "engine_uid": ref_uid},
     )
+
+
+def test_kimi_ninety_three_layer_fold_equivalence_against_literal_engine() -> None:
+    """93-layer Kimi-K3.1 cohort replay matches literal full-depth Engine within < 0.01%."""
+    report = _assert_flagship_cohort_equivalence(
+        "kimi-k3.1",
+        KIMI_EXPECTED_TARGET_LAYERS,
+        cand_uid="layer_runs_93l_cohort",
+        ref_uid="literal_93l_engine",
+    )
+    assert report["total_err_pct"] < 0.01
+
+
+def test_hybrid_gdn_forty_eight_layer_cohort_equivalence_against_literal_engine() -> None:
+    """48-layer Qwen3.8-Flash-Next cohort replay matches literal full-depth Engine within < 0.01%."""
+    report = _assert_flagship_cohort_equivalence(
+        "qwen3.8-flash-next",
+        HYBRID_GDN_EXPECTED_LAYERS,
+        cand_uid="layer_runs_48l_cohort",
+        ref_uid="literal_48l_engine",
+    )
+    assert report["total_err_pct"] < 0.01
+
+
+def test_sparse_mla_sixty_one_layer_cohort_equivalence_against_literal_engine() -> None:
+    """61-layer DeepSeek-V4.1-Flash cohort replay matches literal full-depth Engine within < 0.01%."""
+    report = _assert_flagship_cohort_equivalence(
+        "deepseek-v4.1-flash",
+        SPARSE_MLA_EXPECTED_LAYERS,
+        layers=SPARSE_MLA_EXPECTED_LAYERS,
+        cand_uid="layer_runs_61l_cohort",
+        ref_uid="literal_61l_engine",
+    )
+    assert report["total_err_pct"] < 0.01
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux /proc/self/status VmRSS/VmHWM required")

@@ -1073,14 +1073,15 @@ def test_attribute_node_overlap_conserves_step_time_across_archetypes():
     assert spans["arch1"] == pytest.approx(0.0)
     assert sum(spans.values()) == pytest.approx(20.0)
 
-    # Partial cross-archetype overlap (primary first): [0, 20] + [10, 25] -> exposed 20.0 + 5.0 == 25.0 == T_step.
-    n2 = _mk_target_node(1, op_c, archetype_id="arch1", start_us=10.0, dur_us=15.0)
-    attr2, spans2 = attribute_node_overlap((n0, n2))
+    # Partial cross-stream overlap (Stream 0 primary witness): [0, 20] + aux [10, 25] -> exposed 20.0 + 5.0 == 25.0 == T_step.
+    n2_aux = replace(_mk_target_node(1, op_c, archetype_id="arch1", start_us=10.0, dur_us=15.0), stream="aux", stream_index=1)
+    attr2, spans2 = attribute_node_overlap((n0, n2_aux))
     assert attr2[0].exposed_dur_us == pytest.approx(20.0)
     assert attr2[1].exposed_dur_us == pytest.approx(5.0)
     assert sum(spans2.values()) == pytest.approx(25.0)
 
-    # Partial tail-covered overlap (tail node claims first): [0, 20] + [10, 25] -> exposed 10.0 + 15.0 == 25.0.
+    # Partial same-stream tail-covered overlap (tail node claims first): [0, 20] + [10, 25] -> exposed 10.0 + 15.0 == 25.0.
+    n2 = _mk_target_node(1, op_c, archetype_id="arch1", start_us=10.0, dur_us=15.0)
     n0_eq = _mk_target_node(0, replace(op_a, flops=0.0), archetype_id="arch0", start_us=0.0, dur_us=20.0)
     attr3, spans3 = attribute_node_overlap((n0_eq, n2))
     assert attr3[0].exposed_dur_us == pytest.approx(10.0)

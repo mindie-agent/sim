@@ -34,6 +34,7 @@ from mindie_sim.prediction.mechanism import OperatorPlan, PlannedRecipe, Work
 from mindie_sim.prediction.ownership import read_role, unit_group
 from mindie_sim.prediction.program import KernelProgram, ParallelProgram, PipelineProgram, Stage
 from mindie_sim.prediction.structure_groups import declare_group
+from mindie_sim.primitives.loader import P12_FLAG_CYCLES
 from .common import (
     ATTNRES_CALLER_SOURCES,
     ATTNRES_FP32_ALIGNED_SCRATCH_ROWS,
@@ -127,10 +128,13 @@ _PROJECTION_SETUP_OPS_PER_ELEMENT = 3
 _OUTPUT_NORM_OPS_PER_ELEMENT = 7
 _OUTPUT_NORM_SCALAR_OPS = 3
 ATTNRES_TREE_GROUP_LANES = 64
+ATTNRES_REGBASE_GROUP_ELEMS = 512
 ATTNRES_CAST_BYTES_PER_ELEMENT = 6
 ATTNRES_SFU_STRIP_OPS = 4
-ATTNRES_RESIDENT_TREE_DELTA_NS = 4.316
-ATTNRES_RELOAD_TREE_DELTA_NS = 5.713
+#: Integer AIV vector-strip reduction stall cycles per 64-lane FP32 strip
+#: paired with calibrated ``P12_intracore_flag`` sync latency (zero duration fit).
+ATTNRES_RESIDENT_STRIP_STALL_CYCLES = 3
+ATTNRES_RELOAD_STRIP_STALL_CYCLES = 5
 ATTNRES_RELOAD_PIPELINE_SLOTS = 2
 ATTNRES_NOMINAL_UB_COPY_BPS_PER_AIV = 422_400_000_000.0
 ATTNRES_COOP_CORE_GAIN = 2
@@ -144,6 +148,7 @@ ATTNRES_COOP_HIDDEN_ALIGN = 64
 ATTNRES_COOP_SLOT_BYTES = 32
 MS_PER_SECOND = 1000.0
 NS_PER_MS = 1_000_000.0
+NS_PER_SECOND = 1_000_000_000.0
 
 
 def _ceil_div(value, divisor):
@@ -861,7 +866,7 @@ def _physical_metrics(op, geometry):
     return metrics, role, aiv
 
 
-def _primitive_p50_per_ms(table: Any, pid: str, metric: str) -> float | None:
+def _primitive_p50_ns(table: Any, pid: str, metric: str) -> float | None:
     cell_fn = getattr(table, "cell", None)
     if not callable(cell_fn):
         return None
@@ -872,7 +877,12 @@ def _primitive_p50_per_ms(table: Any, pid: str, metric: str) -> float | None:
     val = getattr(band, "p50", None)
     if val is None or float(val) <= 0.0:
         return None
-    return float(val) / MS_PER_SECOND
+    return float(val)
+
+
+def _primitive_p50_per_ms(table: Any, pid: str, metric: str) -> float | None:
+    val = _primitive_p50_ns(table, pid, metric)
+    return (val / MS_PER_SECOND) if val is not None else None
 
 
 def _attnres_phase_timings(context: Any, view: dict[str, Any], role: str, aiv: int) -> dict[str, Any]:
@@ -909,10 +919,31 @@ def _attnres_phase_timings(context: Any, view: dict[str, Any], role: str, aiv: i
             if ub_copy_bps is not None and float(ub_copy_bps) > 0.0
             else (ATTNRES_NOMINAL_UB_COPY_BPS_PER_AIV / MS_PER_SECOND)
         )
+    p12_flag_ns = _primitive_p50_ns(tbl, "P12_intracore_flag", "flag_ns")
+    p12_mte2_v_ns = _primitive_p50_ns(tbl, "P12_intracore_flag", "flag_mte2_v_ns")
+    clock_hz = getattr(getattr(context, "compute_arch", None), "clock_hz", None)
+    if p12_flag_ns is not None:
+        cycle_ns = p12_flag_ns / P12_FLAG_CYCLES
+        flag_ns = p12_flag_ns
+    elif clock_hz is not None and float(clock_hz) > 0.0:
+        cycle_ns = NS_PER_SECOND / float(clock_hz)
+        flag_ns = P12_FLAG_CYCLES * cycle_ns
+    else:
+        cycle_ns = 0.0
+        flag_ns = 0.0
+    mte2_v_ns = p12_mte2_v_ns if p12_mte2_v_ns is not None else flag_ns
     tree_groups = _ceil_div(hidden, ATTNRES_TREE_GROUP_LANES)
-    delta_ns = ATTNRES_RESIDENT_TREE_DELTA_NS if resident else ATTNRES_RELOAD_TREE_DELTA_NS
+    regbase_groups = _ceil_div(hidden, ATTNRES_REGBASE_GROUP_ELEMS)
+    stall_cycles = (
+        ATTNRES_RESIDENT_STRIP_STALL_CYCLES if resident
+        else ATTNRES_RELOAD_STRIP_STALL_CYCLES
+    )
     has_calibrated_vec = p09_red_raw is not None or p07_raw is not None
-    tree_delta_ms = ((tree_groups * delta_ns) / NS_PER_MS) * scale if has_calibrated_vec else 0.0
+    per_row_stall_ns = (
+        float(tree_groups) * (float(stall_cycles) * cycle_ns + flag_ns)
+        + (0.0 if resident else float(regbase_groups) * mte2_v_ns)
+    )
+    tree_delta_ms = ((per_row_stall_ns / NS_PER_MS) * scale) if has_calibrated_vec else 0.0
 
     alu_row = float(hidden) / p07_ms
     cast_row = float(ATTNRES_CAST_BYTES_PER_ELEMENT * hidden) / p09_cast_ms

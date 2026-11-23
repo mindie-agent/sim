@@ -36,6 +36,10 @@ import re
 from types import SimpleNamespace
 from typing import Any, Literal
 
+from mindie_sim.prediction.capacity import Memory
+from mindie_sim.prediction.capacity.ledger import (
+    recover_ssm_snapshot_ring_breakdown,
+)
 from mindie_sim.prediction.collectives import (
     OneShotCollective,
     OneShotPlan,
@@ -46,6 +50,7 @@ from mindie_sim.prediction.evaluation import EvaluationContext
 from mindie_sim.prediction.execution.operator_replay import operator_costs
 from mindie_sim.prediction.fusion.pool import register_recipe
 from mindie_sim.prediction.fusion.ports import input_port_entries
+from mindie_sim.prediction.offload.policy import _cached_p20_metrics
 from mindie_sim.prediction.physical_recipe_base import (
     IO_HBM_CATEGORY,
     Phase,
@@ -60,6 +65,10 @@ from mindie_sim.prediction.program.primitives import PrimitiveStore
 from mindie_sim.prediction.program.stages import KernelProgram, Stage
 from mindie_sim.prediction.results import OpOccurrence, StepRequest
 from mindie_sim.prediction.runtime import tile_solver
+from mindie_sim.prediction.runtime.exposed_observer import (
+    ObservedInterval,
+    attribute_stream0_intervals,
+)
 from mindie_sim.prediction.runtime.tile_solver import (
     LiveBufferSpec,
     TileCandidate,
@@ -101,24 +110,30 @@ from mindie_sim.schema.case import Case
 from mindie_sim.schema.common import ModelingError, dtype_bytes
 from mindie_sim.schema.datapath import DatapathCapabilitySpec, datapath_for_die, ub_peer_edges_for_rank
 from mindie_sim.schema.hardware import Device, Hardware
-from mindie_sim.schema.operators import OpSpec
+from mindie_sim.schema.operators import OpSpec, TensorPrecisionABI
+from mindie_sim.schema.scenario import (
+    CoDesignOpportunity,
+    CrossHwOffloadSpec,
+    MegaFusionBound,
+    OptimizationMode,
+    SpaceTimeTradeoffSpec,
+    canonical_comparison_stages,
+)
 from mindie_sim.stack_registry import RankOps
 from .causal_tail import (
     FUSED_MC2_ROUTED_LEVEL,
     FUSED_MC2_SHARED_LEVEL,
     SHIPPING_MOE_ACTIVATIONS,
+    DieScheduleResult,
     MoERouteDecision,
     build_discrete_mso_candidate_nodes,
     enforce_moe_mutex_on_nodes,
+    evaluate_disjoint_core_budgets,
     is_a5_hardware,
     is_persistent_whole_die_node,
     is_shared_expert_op_id,
     moe_route_legality,
     resolve_arch_family_tag,
-)
-from .target_schedule import (
-    DieScheduleResult,
-    evaluate_disjoint_core_budgets,
     schedule_target_graph_on_engine,
     weighted_step_span_us,
 )
@@ -146,6 +161,7 @@ SECONDARY_MASKER_SHARE = 0.25
 MS_PER_SECOND = 1000.0
 US_PER_MS = 1000.0
 NS_PER_US = 1000.0
+NS_PER_MS = 1_000_000.0
 NS_PER_SECOND = 1_000_000_000.0
 US_PER_SECOND = 1_000_000.0
 #: Binary KiB / GiB divisors.
@@ -189,8 +205,27 @@ STATUS_NEW_OP = "[需新开发算子]"
 STATUS_EXTEND_ABI = "[需扩展算子 ABI]"
 STATUS_TUNE_PREFIX = "[需算子深度调优"
 BACKEND_CANN_LABEL = "CANN aclnn/AscendC"
+BACKEND_TILELANG_LABEL = "TileLang"
+BACKEND_ASCENDC_LABEL = "AscendC"
+BACKEND_CATLASS_LABEL = "Catlass"
 BACKEND_TRITON_LABEL = "Triton-Ascend"
 BACKEND_HCCL_LABEL = "HCCL / MC2"
+FLOAT_PREC_DTYPES = frozenset({"bf16", "bfloat16", "fp16", "float16", "fp32", "float32"})
+QUANT_PREC_DTYPES = frozenset({"fp8", "fp8_e4m3", "fp8_e5m2", "int8", "mxfp4", "fp4", "int4"})
+TILER_EXT_FAMILIES = frozenset({
+    "gemm", "matmul", "grouped_gemm", "grouped_matmul",
+    "linear", "projection", "gate_up_projection", "down_projection",
+    "dense_gate_up", "dense_down",
+})
+BOUND_NON_COLLAPSIBLE_FAMILIES = frozenset({
+    "attn_res_prefix", "mhc", "hyper_connections", "short_convolution",
+    "causal_conv1d_fn", "conv1d", "recurrent_scan", "recurrent_vector",
+    "gdn_gating", "recover_ssm_commit", "moe_gating", "engram_rh2d", "ple",
+})
+P20_FALLBACK_H2D_BPS = 32_000_000_000.0
+P20_FALLBACK_STARTUP_NS = 5_000.0
+DEFAULT_BF16_BYTES = 2
+L_STAR_INVERSION_TOL_US = 1e-2
 
 _COLLECTIVE_FAMILIES = frozenset({
     "allreduce", "allgather", "reducescatter", "reduce_scatter", "alltoall",
@@ -813,6 +848,9 @@ class SolvedTargetGraph:
     step_start_us: float = 0.0
     step_end_us: float = 0.0
     step_span_us: float = 0.0
+    co_design_opportunities: tuple[CoDesignOpportunity, ...] = ()
+    stage_waterfall: tuple[dict[str, Any], ...] = ()
+    optimization_mode: OptimizationMode = "modeling"
 
     @property
     def exposed_us(self) -> float:
@@ -1373,119 +1411,52 @@ def evaluate_macro_wall_trigger(
     )
 
 
-def _merge_intervals(intervals: Sequence[tuple[float, float]]) -> list[tuple[float, float]]:
-    ordered = sorted((max(0.0, a), max(a, b)) for a, b in intervals if b > a)
-    if not ordered:
-        return []
-    merged: list[tuple[float, float]] = [ordered[0]]
-    for lo, hi in ordered[1:]:
-        p_lo, p_hi = merged[-1]
-        if lo <= p_hi:
-            merged[-1] = (p_lo, max(p_hi, hi))
-        else:
-            merged.append((lo, hi))
-    return merged
-
-
-def _exposed_length_outside(
-    interval: tuple[float, float], cover: Sequence[tuple[float, float]],
-) -> float:
-    lo, hi = interval
-    if hi <= lo:
-        return 0.0
-    cur = lo
-    exposed = 0.0
-    for c_lo, c_hi in cover:
-        if c_hi <= cur:
-            continue
-        if c_lo >= hi:
-            break
-        if c_lo > cur:
-            exposed += min(hi, c_lo) - cur
-        cur = max(cur, c_hi)
-        if cur >= hi:
-            return exposed
-    return exposed + max(0.0, hi - cur)
-
-
-def _short_primary_label(node: TargetOpNode) -> str:
-    fam = node.family.lower()
-    if fam in {"grouped_gemm", "grouped_moe", "mc2"} or "megamoe" in node.recipe.lower():
-        return "MoE Routed GMM / MegaMoE"
-    if fam in {"allgather", "all_gather"}:
-        return "Collective AllGather"
-    if fam in {"indexer", "index_pool"}:
-        return "Sparse Indexer"
-    role = node.logical_role or node.ascend_kernel or _strip_op_prefix(node.op_id)
-    return role[:MAX_MASKED_BY_LEN]
-
-
-def _find_dominant_masker(
-    interval: tuple[float, float], claimed_labeled: Sequence[tuple[float, float, str]],
-) -> str:
-    lo, hi = interval
-    overlap_by_lbl: dict[str, float] = defaultdict(float)
-    for c_lo, c_hi, lbl in claimed_labeled:
-        ov = min(hi, c_hi) - max(lo, c_lo)
-        if ov > OVERLAP_EXPOSED_EPS_US:
-            overlap_by_lbl[lbl] += ov
-    if not overlap_by_lbl:
-        return "主计算流并发算子"
-    ordered = sorted(overlap_by_lbl.items(), key=lambda kv: -kv[1])
-    top_lbl, top_ov = ordered[0]
-    if len(ordered) > 1 and ordered[1][1] > top_ov * SECONDARY_MASKER_SHARE:
-        return f"{top_lbl} + {ordered[1][0]}"[:MAX_MASKED_BY_LEN]
-    return top_lbl
-
-
-def _overlap_priority_key(node: TargetOpNode) -> tuple[Any, ...]:
-    if node.stream_index == 1:
-        return (2, node.start_us, node.ordinal)
-    if node.stream_index == 2:
-        return (1, -node.end_us, -node.dur_us, node.ordinal)
-    return (0, -(node.hbm_total_bytes + node.flops), -node.end_us, -node.dur_us, node.ordinal)
-
-
 def attribute_node_overlap(
     nodes: Sequence[TargetOpNode],
 ) -> tuple[list[TargetOpNode], dict[str, float]]:
-    """Attribute cross-stream/cross-archetype overlap globally across the step timeline."""
-    updated: list[TargetOpNode] = list(nodes)
-    span_by_arch: dict[str, float] = {}
-    for node in nodes:
-        span_by_arch.setdefault(node.archetype_id, 0.0)
-
-    ordered = sorted(enumerate(nodes), key=lambda item: _overlap_priority_key(item[1]))
-    claimed: list[tuple[float, float]] = []
-    claimed_labeled: list[tuple[float, float, str]] = []
-    for idx, node in ordered:
+    """Attribute cross-stream/cross-archetype overlap via conserved ``ExposedObserver`` sweep-line."""
+    span_by_arch: dict[str, float] = {n.archetype_id: 0.0 for n in nodes}
+    if not nodes:
+        return [], span_by_arch
+    occ_to_id = {n.occurrence: str(i) for i, n in enumerate(nodes)}
+    intervals: list[ObservedInterval] = []
+    preds: dict[str, tuple[str, ...]] = {}
+    min_ns: int | None = None
+    max_ns = 0
+    for idx, node in enumerate(nodes):
+        s_ns = max(0, int(round(float(node.start_us) * NS_PER_US)))
+        e_ns = max(s_ns, int(round(float(node.end_us) * NS_PER_US)))
+        if e_ns > s_ns:
+            min_ns = s_ns if min_ns is None else min(min_ns, s_ns)
+            max_ns = max(max_ns, e_ns)
+        oid = str(idx)
+        label = (node.logical_role or node.ascend_kernel or _strip_op_prefix(node.op_id))[:MAX_MASKED_BY_LEN]
+        intervals.append(ObservedInterval(
+            occurrence_id=oid, stream=node.stream, stream_index=int(node.stream_index),
+            start_ns=s_ns, end_ns=e_ns, ordinal=int(node.ordinal), label=label,
+            replica=int(node.occurrence.replica),
+        ))
+        preds[oid] = tuple(occ_to_id[p] for p in node.predecessors if p in occ_to_id)
+    start_i = min_ns if min_ns is not None else 0
+    res = attribute_stream0_intervals(intervals, start_ns=start_i, terminal_ns=max_ns, causal_preds=preds)
+    updated: list[TargetOpNode] = []
+    for idx, node in enumerate(nodes):
+        oid = str(idx)
         if node.dur_us <= 0.0:
-            updated[idx] = replace(node, is_overlapped=False, exposed_dur_us=0.0, masked_by="")
+            updated.append(replace(node, is_overlapped=False, exposed_dur_us=0.0, masked_by=""))
             continue
-        iv = (node.start_us, node.end_us)
-        exp_us = _exposed_length_outside(iv, claimed)
-        masked_us = max(0.0, node.dur_us - exp_us)
+        exp_us = min(node.dur_us, float(res.exposed_ns_by_op.get(oid, 0)) / NS_PER_US)
         fully_hidden = exp_us <= OVERLAP_EXPOSED_EPS_US
         eff_exp = 0.0 if fully_hidden else exp_us
-        masker = _find_dominant_masker(iv, claimed_labeled) if masked_us > OVERLAP_EXPOSED_EPS_US else ""
+        masker = res.masked_by.get(oid, "") if (node.dur_us - eff_exp > OVERLAP_EXPOSED_EPS_US) else ""
         eff_gap = 0.0 if fully_hidden else max(0.0, eff_exp - node.l_star_lean_us)
-        eff_ratio = None if fully_hidden else (
-            (eff_exp / node.l_star_lean_us) if node.l_star_lean_us > 0.0 else None
-        )
-        b_disp = f"Overlapped by {masker} (0 exposed)" if fully_hidden else node.bound_display
-        updated[idx] = replace(
-            node,
-            is_overlapped=fully_hidden,
-            exposed_dur_us=eff_exp,
-            masked_by=masker,
-            gap_us=eff_gap,
-            gap_ratio=eff_ratio,
-            bound_display=b_disp,
-        )
+        eff_ratio = None if fully_hidden else ((eff_exp / node.l_star_lean_us) if node.l_star_lean_us > 0.0 else None)
+        b_disp = f"Overlapped by {masker} (0 exposed)" if (fully_hidden and masker) else node.bound_display
+        updated.append(replace(
+            node, is_overlapped=fully_hidden, exposed_dur_us=eff_exp, masked_by=masker,
+            gap_us=eff_gap, gap_ratio=eff_ratio, bound_display=b_disp,
+        ))
         span_by_arch[node.archetype_id] = span_by_arch.get(node.archetype_id, 0.0) + eff_exp
-        if not fully_hidden:
-            claimed = _merge_intervals([*claimed, iv])
-            claimed_labeled.append((iv[0], iv[1], _short_primary_label(node)))
     return updated, span_by_arch
 
 
@@ -1558,18 +1529,88 @@ def _op_output_shape(op: OpSpec, trait: OpTraitInfo) -> tuple[int, ...]:
     return sh
 
 
+def _format_megamoe_equation(
+    prev: str,
+    out: str,
+    shape_tag: str,
+    param_txt: str,
+    trait: OpTraitInfo,
+    meta: Mapping[str, Any],
+) -> str:
+    """Render ``aclnnMegaMoe`` equation from resolved geometry (conditional EP + mode-3 shared)."""
+    raw_geo = meta.get("megamoe_geometry")
+    geo = raw_geo if isinstance(raw_geo, Mapping) else {}
+    ep = int(geo.get("ep", 0) or (2 if trait.collective_axis == "ep" else 1))
+    mc2_mode = int(geo.get("enable_fused_mc2", FUSED_MC2_ROUTED_LEVEL if ep > 1 else 1) or 0)
+    has_ep = (ep > 1 and mc2_mode >= FUSED_MC2_ROUTED_LEVEL) or (not geo and trait.collective_axis == "ep")
+    act = str(geo.get("activation") or trait.activation_kind or "swiglu")
+    comp_dt = str(geo.get("compute_dtype") or trait.input_dtype or "bf16")
+    shared_inter = int(geo.get("shared_intermediate", 0) or 0)
+    has_shared = shared_inter > 0 or mc2_mode == FUSED_MC2_SHARED_LEVEL
+
+    disp_step = f"h_disp = AllToAllDispatch({prev}, ep={ep})" if has_ep else f"h_disp = LocalTokenPermute({prev})"
+    gmm1 = f"u = GroupedMatMul(h_disp, W_gate_up^T [{comp_dt}])"
+    act_step = f"a, s = ActMxQuant({act}(u{param_txt}))"
+    gmm2 = "y_loc = GroupedMatMul(a, W_down^T, scales=s)"
+    comb_expr = "AllToAllCombine(y_loc, topk_w)" if has_ep else "LocalWeightedCombine(y_loc, topk_w)"
+    if has_shared:
+        shared_tag = f", inter={shared_inter}" if shared_inter > 0 else ""
+        tail = f"y_routed = {comb_expr}; y_shared = SharedFFN({prev}{shared_tag}); {out} = y_routed + y_shared"
+    else:
+        tail = f"{out} = {comb_expr}"
+    return f"{disp_step}; {gmm1}; {act_step}; {gmm2}; {tail} [{shape_tag}, Persistent Megakernel]"
+
+
+def _format_moe_gating_equation(
+    prev: str,
+    out: str,
+    shape_tag: str,
+    meta: Mapping[str, Any],
+) -> str:
+    """Render ``aclnnMoeGatingTopKSoftmaxV2`` strictly from logits -> ``(weights, ids)``."""
+    raw_mode = str(meta.get("router_mode") or meta.get("score_function") or "").strip().lower()
+    score_fn = raw_mode if raw_mode in {"softmax", "sigmoid"} else "softmax/sigmoid"
+    noaux = bool(meta.get("noaux_tc"))
+    groups = int(meta.get("groups", 0) or 0)
+    group_topk = int(meta.get("group_topk", 0) or 0)
+    top_k = int(meta.get("top_k", 0) or 0)
+    has_bias = bool(meta.get("correction_bias") or meta.get("bias") or noaux)
+    norm_topk = meta.get("norm_topk")
+    scale = meta.get("routed_scaling_factor")
+    sel_name = "group_limited_topk" if (noaux or groups > 1) else "TopK"
+    score_expr = f"{score_fn}({prev})"
+    if has_bias:
+        score_expr = f"{score_expr} + e_bias"
+    extras: list[str] = []
+    if top_k > 0:
+        extras.append(f"k={top_k}")
+    if groups > 1:
+        extras.append(f"groups={groups}")
+    if group_topk > 0:
+        extras.append(f"group_topk={group_topk}")
+    if norm_topk is not None:
+        extras.append(f"norm={bool(norm_topk)}")
+    if scale is not None and float(scale) != 1.0:
+        extras.append(f"scale={float(scale):g}")
+    extra_txt = (", " + ", ".join(extras)) if extras else ""
+    return f"{out}, topk_ids = {sel_name}({score_expr}{extra_txt}) [{shape_tag}, UB FP32]"
+
+
 def _format_dag_equation(
     op_id: str,
     shape: Sequence[int],
     trait: OpTraitInfo,
     input_syms: Sequence[str],
     out_sym: str,
+    *,
+    op_meta: Mapping[str, Any] | None = None,
 ) -> str:
     prev = input_syms[0] if input_syms else "x"
     rhs_second = input_syms[1] if len(input_syms) > 1 else ""
     all_args = ", ".join(input_syms) if input_syms else "x"
     out = out_sym
     k = trait.symbolic_op_kind
+    meta = op_meta or {}
     gs = trait.group_size or MXFP_BLOCK_GROUP
     shape_tag = "x".join(str(d) for d in shape) if shape else "?"
     param_txt = (
@@ -1578,14 +1619,12 @@ def _format_dag_equation(
     )
     w_tag = _strip_op_prefix(op_id)
     w_sym = f"W_{w_tag}" if w_tag else "W"
+    if k == "megamoe":
+        return _format_megamoe_equation(prev, out, shape_tag, param_txt, trait, meta)
+    if k == "moe_router_topk":
+        return _format_moe_gating_equation(prev, out, shape_tag, meta)
     eq_map = {
         "view_copy": f"{out} = strided_view({prev}) [zero-copy metadata elision]",
-        "megamoe": (
-            f"h_disp = AllToAllDispatch({prev}); u = GroupedMatMul(h_disp, W_gate_up^T); "
-            f"a, s = ActMxQuant(u{param_txt}); y_loc = GroupedMatMul(a, W_down^T); "
-            f"{out} = AllToAllCombine(y_loc, topk_w) [{shape_tag}, Persistent Megakernel]"
-        ),
-        "moe_router_topk": f"{out}, topk_idx = TopK(softmax/sigmoid({prev} @ {w_sym}^T)) [{shape_tag}, UB FP32]",
         "grouped_matmul": f"{out} = GroupedMatMul({prev}, {w_sym}_e^T) [{shape_tag}, L0C FP32]",
         "matmul": f"{out} = {prev} @ {w_sym}^T [{shape_tag}, L0C FP32]",
         "allgather": f"{out} = AllGather({prev}, axis={trait.collective_axis or 'tp'})",
@@ -1740,7 +1779,10 @@ def _compose_dag_equations_and_ports(
                     in_syms_list.append(base_sym)
             else:
                 in_syms_list.append(ext_sym[(prod_id, pname, ver)])
-        equations.append(_format_dag_equation(op.op_id, op.local_shape, tr, tuple(in_syms_list), sym_by_id[op.op_id]))
+        equations.append(_format_dag_equation(
+            op.op_id, op.local_shape, tr, tuple(in_syms_list), sym_by_id[op.op_id],
+            op_meta=dict(op.metadata) if op.metadata else None,
+        ))
     elided_ids = tuple(
         op.op_id for op in ordered
         if op.op_id not in live_out_set and internal_users[op.op_id]
@@ -2628,7 +2670,7 @@ def _resolve_candidate_metadata(
             _strip_op_prefix(anchor.op_id),
             f"Fused Routed Expert GMM1 + {act_lbl} + Quant",
             kern,
-            BACKEND_CANN_LABEL,
+            BACKEND_ASCENDC_LABEL if is_ext else BACKEND_CATLASS_LABEL,
             status,
             is_ext,
             b_state,
@@ -2648,11 +2690,13 @@ def _resolve_candidate_metadata(
         f"{STATUS_NEW_OP} {cand.abi_id} (UB FP32 驻留融合)"
         if is_new else f"[配置/算子融合: {cand.abi_id} -> L0 流水线目标]"
     )
+    has_mm = any(t.trait == AlgebraicTrait.BILINEAR_MATMUL for t in member_traits)
+    new_backend = BACKEND_CATLASS_LABEL if has_mm else BACKEND_TILELANG_LABEL
     return (
         f"fused_{_strip_op_prefix(members[-1].op_id)}",
         f"Fused UB Pipeline ({' + '.join(_strip_op_prefix(m.op_id) for m in members)})",
         cand.abi_id,
-        BACKEND_TRITON_LABEL if is_new else BACKEND_CANN_LABEL,
+        new_backend if is_new else BACKEND_CANN_LABEL,
         status,
         is_new,
         "unbound_formula_projection" if is_new else "bound_implementation",
@@ -2778,6 +2822,71 @@ def _external_read_member_ids(
     return tuple(mid for mid in member_ids if mid in read_set)
 
 
+def _node_precision_class(node: TargetOpNode) -> tuple[str, str, bool]:
+    """Return ``(precision_class, signature, has_explicit_cast)`` for ABI legality checks."""
+    spec = node.spec
+    abi: TensorPrecisionABI | None = getattr(spec, "precision_abi", None) if spec is not None else None
+    meta = dict(spec.metadata) if (spec is not None and spec.metadata) else {}
+    if abi is not None:
+        has_cast = bool(abi.explicit_cast_on_entry or abi.explicit_cast_on_exit)
+        dts = {str(abi.input_dtype).lower(), str(abi.weight_dtype).lower(), str(abi.compute_dtype).lower()}
+        if dts & QUANT_PREC_DTYPES:
+            return "quant", abi.abi_signature, has_cast
+        if dts & FLOAT_PREC_DTYPES:
+            return "float", abi.abi_signature, has_cast
+        return "other", abi.abi_signature, has_cast
+    dts = {
+        str(meta.get(k) or "").strip().lower()
+        for k in ("activation_format", "weight_format", "compute_format")
+        if meta.get(k)
+    }
+    if not dts:
+        dts.add(str(node.dtype or "bf16").strip().lower())
+    has_cast = bool(meta.get("explicit_cast_on_entry") or meta.get("explicit_cast_on_exit"))
+    if dts & QUANT_PREC_DTYPES:
+        return "quant", "|".join(sorted(dts)), has_cast
+    if dts & FLOAT_PREC_DTYPES:
+        return "float", "|".join(sorted(dts)), has_cast
+    return "other", "|".join(sorted(dts)), has_cast
+
+
+def _has_illegal_cross_precision_merge(group_nodes: Sequence[TargetOpNode]) -> bool:
+    """Return True if matrix members mix FLOAT and FP8/INT8/MXFP4 without explicit cast."""
+    matrix_members = [n for n in group_nodes if float(n.flops) > 0.0]
+    if len(matrix_members) < MIN_FUSE_MEMBERS:
+        return False
+    classes = set()
+    abis: list[TensorPrecisionABI] = []
+    for node in matrix_members:
+        p_cls, _sig, has_cast = _node_precision_class(node)
+        if not has_cast and p_cls in {"float", "quant"}:
+            classes.add(p_cls)
+        abi = getattr(node.spec, "precision_abi", None) if node.spec is not None else None
+        if abi is not None:
+            abis.append(abi)
+    if "float" in classes and "quant" in classes:
+        return True
+    if len(abis) >= MIN_FUSE_MEMBERS:
+        base = abis[0]
+        if any(not base.is_fusion_compatible(other) for other in abis[1:]):
+            return True
+    return False
+
+
+def _validate_final_graph_invariants(
+    nodes: Sequence[TargetOpNode],
+    demands: Sequence[tuple[int, int, int, int, int]],
+) -> None:
+    """Verify zero ``L* > T_Engine`` inversions and ABI legality on the selected target graph."""
+    for node, dem in zip(nodes, demands):
+        l_star_dem = float(max(dem)) / NS_PER_US if dem else 0.0
+        l_star = max(float(node.l_star_lean_us), l_star_dem)
+        if node.dur_us > 0.0 and l_star > float(node.dur_us) + L_STAR_INVERSION_TOL_US:
+            raise ModelingError(
+                f"lower_bound_inversion:{node.op_id}:dur_us={node.dur_us:.4f}<l_star_us={l_star:.4f}"
+            )
+
+
 def _collapse_candidate_group(
     group_nodes: Sequence[TargetOpNode],
     group_demands: Sequence[tuple[int, int, int, int, int]],
@@ -2797,6 +2906,8 @@ def _collapse_candidate_group(
     allow_unbound_formula: bool = True,
 ) -> tuple[TargetOpNode, tuple[int, int, int, int, int], KernelSynthesisSpec, Edit] | None:
     """Collapse a verified candidate via canonical ``apply_plan`` + bound/formula pricing."""
+    if _has_illegal_cross_precision_merge(group_nodes):
+        return None
     suffix, role, kern, backend, status, needs_new, meta_state = _resolve_candidate_metadata(
         cand, group_nodes, member_traits, floors,
     )
@@ -2955,6 +3066,8 @@ def _materialize_external_fused_op(
 ) -> tuple[TargetOpNode, tuple[int, int, int, int, int], KernelSynthesisSpec]:
     """Price and materialize an explicit caller ``FuseRegion`` applied by ``apply_plan``."""
     group_nodes = [node_by_id[mid] for mid in member_ids if mid in node_by_id]
+    if _has_illegal_cross_precision_merge(group_nodes):
+        raise ModelingError(f"cross_precision_abi_merge_forbidden:{op.op_id}")
     group_dems = [dem_by_id[mid] for mid in member_ids if mid in dem_by_id]
     group_ops = tuple(_node_to_op_spec(n, None, phase=phase) for n in group_nodes)
     member_traits = tuple(classify_op_traits(item) for item in group_ops)
@@ -3008,11 +3121,16 @@ def _materialize_external_fused_op(
 
     before_sum_us = sum(n.dur_us for n in group_nodes)
     achieved_eta = min(1.0, l_star_us / dur_us) if dur_us > 0.0 and l_star_us > 0.0 else 1.0
+    has_mm_ext = any(t.trait == AlgebraicTrait.BILINEAR_MATMUL for t in member_traits)
+    eff_backend = (
+        (BACKEND_CATLASS_LABEL if has_mm_ext else BACKEND_TILELANG_LABEL)
+        if needs_new else BACKEND_CANN_LABEL
+    )
     spec = synthesize_kernel_spec(
         spec_id=f"plan_{edit.edit_id}" if edit is not None else op.op_id,
         kernel_name=abi,
         abi_tier=tier,
-        suggested_backend=BACKEND_TRITON_LABEL if needs_new else BACKEND_CANN_LABEL,
+        suggested_backend=eff_backend,
         status_tag=status,
         opt_pillar="pillar1_fusion",
         members=group_nodes,
@@ -3036,7 +3154,7 @@ def _materialize_external_fused_op(
         group_nodes=group_nodes, fused_op=op, demand=demand, dom_bound=dom_bound,
         new_op_id=op.op_id, new_family="rewrite_fused", suffix=abi,
         role=f"RewritePlan Fused ({' + '.join(_strip_op_prefix(m.op_id) for m in group_nodes)})",
-        kern=abi, backend=BACKEND_TRITON_LABEL if needs_new else BACKEND_CANN_LABEL,
+        kern=abi, backend=eff_backend,
         status=status, needs_new=needs_new, b_state=b_state,
         dur_us=dur_us, l_star_us=l_star_us,
         hbm_r=hbm_r, hbm_w=hbm_w, mte2=mte2, mte3=mte3, useful_hbm=useful_hbm, spec=spec,
@@ -3123,14 +3241,18 @@ def _materialize_external_plan(
             if bound_res is None:
                 raise ModelingError(f"rewrite_template_recipe_unbound:{op.op_id}:{tb.template_id}")
             dur_us, b_state, _prog = bound_res
-            eff = min(1.0, base_node.l_star_lean_us / dur_us) if dur_us > 0.0 and base_node.l_star_lean_us > 0.0 else None
+            dur_ns = int(round(dur_us * NS_PER_US))
+            base_dem = tuple(min(int(d), dur_ns) for d in base_dem)  # type: ignore[assignment]
+            eff_l_star = min(float(base_node.l_star_lean_us), dur_us)
+            eff = min(1.0, eff_l_star / dur_us) if dur_us > 0.0 and eff_l_star > 0.0 else None
             updated_node = replace(
                 updated_node,
                 dur_us=dur_us, exposed_dur_us=dur_us,
+                l_star_lean_us=eff_l_star,
                 recipe=tb.template_id, ascend_kernel=tb.template_id,
                 kernel_status=f"[模板切换: {tb.template_id}]", needs_new_kernel=False,
-                gap_us=max(0.0, dur_us - base_node.l_star_lean_us),
-                gap_ratio=(dur_us / base_node.l_star_lean_us) if base_node.l_star_lean_us > 0.0 else None,
+                gap_us=max(0.0, dur_us - eff_l_star),
+                gap_ratio=(dur_us / eff_l_star) if eff_l_star > 0.0 else None,
                 roofline_efficiency=eff, opt_pillar="pillar2_roofline",
                 opt_attainment_pct=round(eff * PERCENT_SCALE, 1) if eff is not None else None,
                 binding_state=b_state,
@@ -3155,16 +3277,20 @@ def _materialize_external_plan(
                 eng.advance(until=(done,))
                 col_us = max(float(done.time) * US_PER_MS, float(floors.launch_vec_us))
             base_k = updated_node.ascend_kernel.split(" (", 1)[0]
-            eff = min(1.0, base_node.l_star_lean_us / col_us) if col_us > 0.0 and base_node.l_star_lean_us > 0.0 else None
+            col_ns = int(round(col_us * NS_PER_US))
+            base_dem = tuple(min(int(d), col_ns) for d in base_dem)  # type: ignore[assignment]
+            eff_l_star_c = min(float(updated_node.l_star_lean_us), col_us)
+            eff = min(1.0, eff_l_star_c / col_us) if col_us > 0.0 and eff_l_star_c > 0.0 else None
             updated_node = replace(
                 updated_node,
                 dur_us=col_us, exposed_dur_us=col_us,
+                l_star_lean_us=eff_l_star_c,
                 recipe=f"collective_{col_rec.mode}",
                 ascend_kernel=f"{base_k} ({col_rec.mode}:{col_rec.topology_route})",
                 kernel_status=f"[通信方案切换: {col_rec.mode} @ {col_rec.topology_route}]",
                 needs_new_kernel=False,
-                gap_us=max(0.0, col_us - base_node.l_star_lean_us),
-                gap_ratio=(col_us / base_node.l_star_lean_us) if base_node.l_star_lean_us > 0.0 else None,
+                gap_us=max(0.0, col_us - eff_l_star_c),
+                gap_ratio=(col_us / eff_l_star_c) if eff_l_star_c > 0.0 else None,
                 roofline_efficiency=eff, opt_pillar="pillar3_comm",
                 opt_attainment_pct=round(eff * PERCENT_SCALE, 1) if eff is not None else None,
                 binding_state="bound_implementation",
@@ -3184,57 +3310,37 @@ def _materialize_external_plan(
     return rewired_nodes, out_dems, out_specs, touched_ids, remap, col_plans
 
 
-def _apply_pillar23_envelopes(
+def _apply_pillar_c_tiler_extensions(
     nodes: Sequence[TargetOpNode],
     demands: Sequence[tuple[int, int, int, int, int]],
-    floors: SkuTargetFloors,
     case: Case,
-    pricing_ctx: _TargetPricingContext,
     *,
     phase: str,
     locked_ids: set[str] | None = None,
     primitive_table: Any = None,
     allow_unbound_formula: bool = True,
-    collective_plans: dict[OpOccurrence, tuple[Any, float]] | None = None,
-) -> list[TargetOpNode]:
-    """Price remaining single operators via bound ``OneShotCollective`` or Modeling Mode formulas."""
-    is_decode = str(phase or "decode").lower() == "decode"
+) -> tuple[list[TargetOpNode], list[CoDesignOpportunity]]:
+    """Evaluate UB-legal Pillar C CATLASS/AscendC tile schedules strictly on unbound matrix ops.
+
+    Never collapses bound single ops (``AttnResFwd``, ``HC combine``, ``Conv1d``,
+    ``GDN/KDA scan``, ``RecoverSSM``, ``MoE gating``, ``PLE``) to launch floors.
+    """
     locked = locked_ids or set()
     out: list[TargetOpNode] = []
+    tiler_opps: list[CoDesignOpportunity] = []
     for node, dem in zip(nodes, demands):
-        if node.op_id in locked or node.opt_pillar in {"pillar1_fusion", "pillar3_comm"} or node.dur_us <= 0.0:
+        fam = str(node.family or "").strip().lower()
+        if (
+            not allow_unbound_formula
+            or node.op_id in locked
+            or node.opt_pillar in {"pillar1_fusion", "pillar3_comm"}
+            or node.dur_us <= 0.0
+            or fam in BOUND_NON_COLLAPSIBLE_FAMILIES
+            or fam not in TILER_EXT_FAMILIES
+            or node.flops <= 0.0
+            or (node.spec is not None and getattr(node.spec, "owner_schedule", None) is not None)
+        ):
             out.append(node)
-            continue
-        fam = node.family.lower()
-        if fam in {"engram_rh2d", "h2d", "offload"} or node.task_type == "HOST":
-            out.append(replace(node, kernel_status=STATUS_AT_FLOOR, needs_new_kernel=False))
-            continue
-
-        rec = node.recipe.lower()
-        kern_l = node.ascend_kernel.lower()
-        l_link = float(dem[4]) / NS_PER_US
-        is_mc2 = fam in {"all_gather_matmul", "matmul_reduce_scatter"}
-        is_megamoe = fam in {"grouped_moe", "mc2"} or "megamoe" in rec or "dispatch_ffn_combine" in kern_l
-        has_local_work = (
-            node.flops > 0.0 or node.vector_ops > 0.0
-            or node.hbm_total_bytes > 0.0 or node.mte2_bytes > 0.0 or node.mte3_bytes > 0.0
-        )
-        is_pure_comm = (
-            (node.task_type == "HCCL" or fam in _COLLECTIVE_FAMILIES)
-            and not is_mc2 and not is_megamoe and not has_local_work
-        )
-
-        if is_pure_comm:
-            # D6 baseline purity: shipping intra-pod One-Shot is already active in Before.
-            # Never fabricate After-only pure-communication One-Shot promotion without an explicit CollectiveTransform.
-            out.append(replace(
-                node, kernel_status=STATUS_AT_FLOOR, needs_new_kernel=False, is_shipping_abi=True,
-            ))
-            continue
-
-        # Strict Simulation Mode (allow_unbound_formula=False) NEVER runs unbound formula projections.
-        if not allow_unbound_formula:
-            out.append(replace(node, kernel_status=STATUS_AT_FLOOR, needs_new_kernel=False))
             continue
 
         op_stub = _node_to_op_spec(node, set(), phase=phase)
@@ -3242,66 +3348,61 @@ def _apply_pillar23_envelopes(
         try:
             eval_res = evaluate_formula_kernel(formula_spec, case, primitive_table=primitive_table)
         except ModelingError:
-            out.append(replace(node, kernel_status=STATUS_AT_FLOOR, needs_new_kernel=False))
+            out.append(node)
             continue
         if not eval_res.sram_verified:
-            out.append(replace(node, kernel_status=STATUS_AT_FLOOR, needs_new_kernel=False))
+            out.append(node)
             continue
 
-        t_target = max(eval_res.projected_us, node.l_star_lean_us)
-        mc2_kernel = node.ascend_kernel
-        needs_new = fam == "attn_res_prefix" or bool(node.needs_new_kernel)
-        if is_mc2:
-            t_target = max(t_target, floors.oneshot_floor_us + l_link) + floors.mc2_sync_us
-            pillar = "pillar3_comm"
-            if fam == "all_gather_matmul" and "allgathermatmul" not in kern_l:
-                mc2_kernel = "aclnnAllGatherMatmulV2"
-            elif fam == "matmul_reduce_scatter" and "matmulreducescatter" not in kern_l:
-                mc2_kernel = "aclnnMatmulReduceScatterV2"
-            exec_tag = "CCU" if floors.is_a5_ub else "AIV"
-            status_lbl = f"[通算融合: MC2 ({exec_tag}) + L0 流水线]"
-        elif is_megamoe:
-            t_target = max(t_target, floors.oneshot_floor_us + l_link)
-            pillar = "pillar2_roofline"
-            status_lbl = f"{STATUS_TUNE_PREFIX} -> L0 流水线目标]"
-        else:
-            pillar = "pillar2_roofline"
-            status_lbl = (
-                f"{STATUS_NEW_OP} UB 驻留 Block-AttnRes 融合前缀"
-                if (needs_new and fam == "attn_res_prefix")
-                else (
-                    f"{STATUS_NEW_OP} {node.ascend_kernel or node.logical_role}"
-                    if needs_new
-                    else f"{STATUS_TUNE_PREFIX} -> L0 流水线目标]"
-                )
-            )
+        l_star = max(float(node.l_star_lean_us), float(max(dem)) / NS_PER_US)
+        t_target = max(float(eval_res.projected_us), l_star)
+        t_after = min(float(node.dur_us), t_target)
+        gain = float(node.dur_us) - t_after
+        if gain < TARGET_OPT_MIN_GAIN_US or gain < float(node.dur_us) * TARGET_OPT_MIN_RATIO:
+            out.append(replace(node, kernel_status=STATUS_AT_FLOOR))
+            continue
 
-        t_after = min(node.dur_us, t_target)
-        gain = node.dur_us - t_after
-        if gain >= TARGET_OPT_MIN_GAIN_US and gain >= node.dur_us * TARGET_OPT_MIN_RATIO:
-            eff = min(1.0, node.l_star_lean_us / t_after) if t_after > 0.0 and node.l_star_lean_us > 0.0 else None
-            out.append(replace(
-                node, dur_us=t_after, exposed_dur_us=t_after, ascend_kernel=mc2_kernel,
-                kernel_status=status_lbl, needs_new_kernel=needs_new,
-                is_shipping_abi=not needs_new,
-                persistent_whole_die=bool(node.persistent_whole_die or is_megamoe),
-                formula_eval=eval_res,
-                gap_us=max(0.0, t_after - node.l_star_lean_us),
-                gap_ratio=(t_after / node.l_star_lean_us) if node.l_star_lean_us > 0.0 else None,
-                roofline_efficiency=eff,
-                opt_pillar=pillar,
-                opt_attainment_pct=round(eff * PERCENT_SCALE, 1) if eff is not None else None,
-                binding_state="unbound_formula_projection",
-            ))
-        else:
-            out.append(replace(
-                node,
-                kernel_status=STATUS_AT_FLOOR,
-                needs_new_kernel=bool(node.needs_new_kernel),
-                is_shipping_abi=not bool(node.needs_new_kernel),
-                persistent_whole_die=bool(node.persistent_whole_die or is_megamoe),
-            ))
-    return out
+        eff = min(1.0, l_star / t_after) if (t_after > 0.0 and l_star > 0.0) else None
+        out.append(replace(
+            node,
+            dur_us=t_after, exposed_dur_us=t_after,
+            kernel_backend=BACKEND_CATLASS_LABEL,
+            kernel_status=f"{STATUS_TUNE_PREFIX} -> Catlass/AscendC Tiler]",
+            needs_new_kernel=False,
+            is_shipping_abi=True,
+            formula_eval=eval_res,
+            l_star_lean_us=l_star,
+            gap_us=max(0.0, t_after - l_star),
+            gap_ratio=(t_after / l_star) if l_star > 0.0 else None,
+            roofline_efficiency=eff,
+            opt_pillar="pillar2_roofline",
+            opt_attainment_pct=round(eff * PERCENT_SCALE, 1) if eff is not None else None,
+            binding_state="unbound_formula_projection",
+        ))
+        before_ms = float(node.dur_us) / US_PER_MS
+        l_star_ms = l_star / US_PER_MS
+        tiled_ms = t_after / US_PER_MS
+        tiler_opps.append(CoDesignOpportunity(
+            opportunity_id=f"tiler_{_strip_op_prefix(node.op_id)}",
+            kind="tiler_tune",
+            track="kernel_tune",
+            readiness="tiler_extension",
+            title=f"Catlass/AscendC Tiler Extension: {node.ascend_kernel or node.op_id}",
+            evidence_refs=(node.op_id,),
+            mega_fusion=MegaFusionBound(
+                region_op_ids=(node.op_id,),
+                exposed_before_ms=before_ms,
+                boundary_lower_bound_ms=l_star_ms,
+                tiled_engine_ms=tiled_ms,
+                gain_ceiling_ms=before_ms - l_star_ms,
+                gain_expected_ms=before_ms - tiled_ms,
+                eliminated_gm_bytes=0,
+                ub_live_bytes=max(0, int(eval_res.ub_peak_bytes)),
+                ub_capacity_bytes=max(int(eval_res.ub_budget_bytes), int(eval_res.ub_peak_bytes)),
+                requires_unabsorbed_split_cost_check=False,
+            ),
+        ))
+    return out, tiler_opps
 
 
 def _solve_one_archetype(
@@ -3545,7 +3646,28 @@ def _collapse_moe_archetype_group(
     vec_peak = float(p0.get("vector_peak_ops_per_s") or 0.0)
     hbm_peak = float(p0.get("hbm_peak_bytes_per_s") or 0.0)
     link_peak = float(p0.get("link_peak_bytes_per_s") or 0.0)
-    cube_ns = int(fused_flops * NS_PER_SECOND / cube_peak) if cube_peak > 0.0 else sum(d[0] for d in member_dems)
+    merged_mflops: dict[str, float] = defaultdict(float)
+    for m in members:
+        m_spec = getattr(m, "spec", None)
+        entries = getattr(m_spec, "matrix_flops", ()) if m_spec is not None else ()
+        if entries:
+            for dt, fl in entries:
+                if float(fl) > 0.0:
+                    merged_mflops[str(dt)] += float(fl)
+        elif float(m.flops) > 0.0:
+            merged_mflops[str(m.dtype or "bf16")] += float(m.flops)
+    die_obj = p0.get("die")
+    if merged_mflops and die_obj is not None:
+        cube_ns_f = 0.0
+        for dt, fl in merged_mflops.items():
+            try:
+                cube_ns_f += fl * NS_PER_SECOND / float(die_obj.peak(dt))
+            except (ModelingError, ZeroDivisionError):
+                if cube_peak > 0.0:
+                    cube_ns_f += fl * NS_PER_SECOND / cube_peak
+        cube_ns = int(cube_ns_f) if cube_ns_f > 0.0 else sum(d[0] for d in member_dems)
+    else:
+        cube_ns = int(fused_flops * NS_PER_SECOND / cube_peak) if cube_peak > 0.0 else sum(d[0] for d in member_dems)
     vec_ns = int(fused_vec * NS_PER_SECOND / vec_peak) if vec_peak > 0.0 else sum(d[1] for d in member_dems)
     hbm_ns = int(fused_hbm * NS_PER_SECOND / hbm_peak) if hbm_peak > 0.0 else sum(d[2] for d in member_dems)
     link_ns = int(fused_link * NS_PER_SECOND / link_peak) if link_peak > 0.0 else sum(d[4] for d in member_dems)
@@ -3562,6 +3684,13 @@ def _collapse_moe_archetype_group(
     new_occ = replace(first.occurrence, op_id=new_oid)
     bstate: BindingState = "unbound_formula_projection" if decision.needs_new_kernel else "bound_implementation"
     kstatus = STATUS_EXTEND_ABI if decision.needs_new_kernel else STATUS_AT_FLOOR
+    fused_spec = (
+        replace(
+            first.spec, op_id=new_oid, flops=fused_flops,
+            matrix_flops=tuple(sorted(merged_mflops.items())),
+        )
+        if first.spec is not None else None
+    )
 
     fused_node = replace(
         first,
@@ -3576,10 +3705,12 @@ def _collapse_moe_archetype_group(
         roofline_efficiency=eff,
         opt_attainment_pct=round(eff * PERCENT_SCALE, 1) if eff is not None else None,
         absorbed_source_ops=tuple(m.op_id for m in members),
-        ascend_kernel=decision.abi_id, kernel_backend=BACKEND_CANN_LABEL, kernel_status=kstatus,
+        ascend_kernel=decision.abi_id,
+        kernel_backend=BACKEND_ASCENDC_LABEL if decision.needs_new_kernel else BACKEND_CANN_LABEL,
+        kernel_status=kstatus,
         needs_new_kernel=decision.needs_new_kernel, binding_state=bstate,
         is_shipping_abi=decision.is_shipping_abi, persistent_whole_die=True,
-        opt_pillar="Pillar-1/MC2",
+        opt_pillar="Pillar-1/MC2", spec=fused_spec,
     )
     receipt = {
         "edit_id": f"{first.archetype_id}_moe_fused_mc2_l{level}",
@@ -3825,65 +3956,305 @@ def _build_applied_edit_receipts(
     return tuple(receipts)
 
 
-def solve_target_graph(
-    nodes: Sequence[TargetOpNode],
-    demands: Sequence[tuple[int, int, int, int, int]],
+def _p20_host_h2d_params(case: Case, primitive_table: Any) -> tuple[float, float]:
+    """Read calibrated ``P20_host_dma_sync`` H2D bandwidth (B/s) and startup (ns)."""
+    h2d_bps: float | None = None
+    startup_ns: float | None = None
+    cell_fn = getattr(primitive_table, "cell", None)
+    if callable(cell_fn):
+        try:
+            cell = cell_fn("P20_host_dma_sync")
+            bw_band = cell.band("host_h2d_bytes_per_s")
+            if bw_band.p50 is not None and float(bw_band.p50) > 0.0:
+                h2d_bps = float(bw_band.p50)
+            st_band = cell.band("pinned_h2d_startup_ns")
+            if st_band.p50 is not None and float(st_band.p50) > 0.0:
+                startup_ns = float(st_band.p50)
+        except ModelingError:
+            pass
+    if h2d_bps is None or startup_ns is None:
+        sku = str(getattr(case.machine, "sku", "") or getattr(case.machine, "name", "") or "")
+        cached = _cached_p20_metrics(sku)
+        if h2d_bps is None and cached.get("h2d_bps"):
+            h2d_bps = float(cached["h2d_bps"])
+        if startup_ns is None and cached.get("h2d_startup_ns"):
+            startup_ns = float(cached["h2d_startup_ns"])
+    return (
+        h2d_bps if (h2d_bps is not None and h2d_bps > 0.0) else P20_FALLBACK_H2D_BPS,
+        startup_ns if (startup_ns is not None and startup_ns >= 0.0) else P20_FALLBACK_STARTUP_NS,
+    )
+
+
+def _resident_free_headroom_bytes(case: Case, step_request: StepRequest | None) -> int:
+    try:
+        mem = Memory(case)
+        seqs = max(1, int(getattr(step_request, "sequences", 1) or 1)) if step_request is not None else max(1, len(case.workload.requests))
+        ctx = int(getattr(step_request, "context", 0) or 0) if step_request is not None else 0
+        q_tok = max(1, int(getattr(step_request, "tokens", 1) or 1)) if step_request is not None else 1
+        receipt = mem.resident_memory_receipt(
+            phase=str(getattr(step_request, "phase", "decode") or "decode"),
+            sequence_tokens=(ctx + q_tok) if ctx > 0 else None,
+            batch_per_dp=seqs,
+            query_tokens=q_tok,
+        )
+        return min((int(d.free_hbm_headroom_bytes) for d in receipt.dies), default=0)
+    except (ModelingError, ValueError, ZeroDivisionError):
+        return 0
+
+
+def _collect_space_time_opportunities(
     case: Case,
-    peaks_by_stage: Mapping[int, Mapping[str, Any]],
+    nodes: Sequence[TargetOpNode],
     *,
-    phase: str = "decode",
-    rewrite_plan: RewritePlan | Mapping[str, Any] | str | Path | None = None,
-    n_tok_per_die: float = 1.0,
-    primitive_table: Any = None,
-    allow_unbound_formula: bool = True,
-    step_request: StepRequest | None = None,
-    stack_id: str | None = None,
-    scenario_case: Case | None = None,
-) -> SolvedTargetGraph:
-    """Solve target-state graph via Tier-P2 algebra + Die + Topology contention Engine."""
-    floors = extract_sku_floors(case, primitive_table=primitive_table)
-    die = case.machine.dies[0]
-    ub_edges = ub_peer_edges_for_rank(die.rank, case.machine.links, case.machine.transfer_channels)
-    datapath = datapath_for_die(die, ub_peer_edges=ub_edges)
-    p0 = peaks_by_stage.get(0) or next(iter(peaks_by_stage.values()), {})
-    ext_plan = load_rewrite_plan(rewrite_plan)
-    pricing_ctx = _TargetPricingContext(case, primitive_table=primitive_table)
-    safe_n_tok = max(float(n_tok_per_die), SAVING_POSITIVE_EPS_US)
-
-    all_known_ids = {n.op_id for n in nodes}
-    base_ops_all = [_node_to_op_spec(n, all_known_ids, phase=phase) for n in nodes]
-    base_scenario = _build_target_scenario(
-        case, base_ops_all, datapath, phase=phase, primitive_table=primitive_table,
+    step_request: StepRequest | None,
+) -> list[CoDesignOpportunity]:
+    """Build typed ``SpaceTimeTradeoffSpec`` records backed by ``ResidentMemoryLedger``."""
+    out: list[CoDesignOpportunity] = []
+    headroom = _resident_free_headroom_bytes(case, step_request)
+    meta = dict(getattr(case.runtime, "metadata", ()) or ())
+    k_prop = int(meta.get("draft_proposal_tokens", 0) or 0)
+    if k_prop <= 0 and step_request is not None and step_request.phase == "decode":
+        k_prop = max(0, int(step_request.tokens) - 1)
+    seqs = max(1, int(getattr(step_request, "sequences", 1) or 1)) if step_request is not None else max(1, len(case.workload.requests))
+    plans = tuple(getattr(case.model, "layer_plans", ()) or ())
+    linear_plans = [lp for lp in plans if str(getattr(lp, "attention", "")).lower() in {"kda", "gdn"}]
+    recover_us = sum(
+        float(n.exposed_dur_us) * max(1, int(n.repeat_count))
+        for n in nodes
+        if "recover_ssm" in n.op_id.lower() or "recover_ssm" in n.recipe.lower()
     )
+    if linear_plans and (k_prop > 0 or recover_us > 0.0):
+        eff_k = max(1, k_prop)
+        try:
+            bd = recover_ssm_snapshot_ring_breakdown(case, seqs, eff_k)
+            delta_b = int(bd.delta_hbm_vs_recover_ssm_bytes)
+        except (ModelingError, ValueError):
+            delta_b = 0
+        direction = "space_for_time" if delta_b >= 0 else "time_for_space"
+        feasible = bool(delta_b <= headroom) if delta_b > 0 else True
+        out.append(CoDesignOpportunity(
+            opportunity_id="space_time_recover_ssm_snapshot_ring",
+            kind="space_time_tradeoff",
+            track="framework",
+            readiness="proposed_pr",
+            title=f"RecoverSSM Snapshot Ring [B={seqs}, K+1={eff_k + 1}] vs {len(linear_plans)}-Layer Recompute",
+            evidence_refs=("ResidentMemoryLedger", "recover_ssm_snapshot_ring_breakdown"),
+            space_time=SpaceTimeTradeoffSpec(
+                direction=direction,
+                mechanism="recover_ssm_snapshot_ring",
+                delta_hbm_bytes=delta_b,
+                free_hbm_headroom_bytes=headroom,
+                delta_step_ms=-(recover_us / US_PER_MS),
+                delta_concurrency_per_dp=0,
+                delta_tps_per_die=0.0,
+                feasible_under_hbm_and_sla=feasible,
+            ),
+        ))
 
-    all_specs: list[KernelSynthesisSpec] = []
-    executed_ext_edits: list[Edit] = []
-    locked_ids: set[str] = set()
-    global_remap: dict[OpOccurrence, OpOccurrence] = {}
-    collective_plans: dict[OpOccurrence, tuple[Any, float]] = {}
+    tp = max(1, int(case.runtime.parallel.tp))
+    mla_plans = [lp for lp in plans if int(getattr(lp, "kv_lora_rank", 0) or 0) > 0]
+    if mla_plans:
+        lp0 = mla_plans[0]
+        kv_r = int(getattr(lp0, "kv_lora_rank", 0) or 0)
+        n_heads = max(1, int(getattr(lp0, "num_heads", 1) or 1))
+        v_dim = max(1, int(getattr(lp0, "v_head_dim", 0) or getattr(lp0, "head_dim", 1) or 1))
+        qk_nope = max(1, int(getattr(lp0, "qk_nope_head_dim", 0) or getattr(lp0, "head_dim", 1) or 1))
+        prep_bytes = (len(mla_plans) * kv_r * n_heads * (qk_nope + v_dim) * DEFAULT_BF16_BYTES) // tp
+        feasible_mla = bool(prep_bytes <= headroom)
+        out.append(CoDesignOpportunity(
+            opportunity_id="space_time_absorbed_kv_projection",
+            kind="space_time_tradeoff",
+            track="framework",
+            readiness="shipping",
+            title=f"Absorbed MLA Projection Weights vs Factorized ({len(mla_plans)} MLA Layers)",
+            evidence_refs=("ResidentMemoryLedger",),
+            space_time=SpaceTimeTradeoffSpec(
+                direction="space_for_time",
+                mechanism="absorbed_kv_projection",
+                delta_hbm_bytes=int(prep_bytes),
+                free_hbm_headroom_bytes=headroom,
+                delta_step_ms=0.0,
+                delta_concurrency_per_dp=0,
+                delta_tps_per_die=0.0,
+                feasible_under_hbm_and_sla=feasible_mla,
+            ),
+        ))
+    elif linear_plans:
+        hidden = max(1, int(getattr(case.model, "hidden_size", 0) or 1))
+        lp0 = linear_plans[0]
+        lh = max(1, int(getattr(lp0, "linear_heads", 1) or 1))
+        ld = max(1, int(getattr(lp0, "linear_head_dim", 1) or 1))
+        prep_f_bytes = (len(linear_plans) * hidden * lh * ld * DEFAULT_BF16_BYTES) // tp
+        out.append(CoDesignOpportunity(
+            opportunity_id="space_time_prepared_weight_materialization",
+            kind="space_time_tradeoff",
+            track="framework",
+            readiness="shipping",
+            title=f"Prepared Materialized F = F_b @ F_a vs Factorized ({len(linear_plans)} Linear Layers)",
+            evidence_refs=("ResidentMemoryLedger",),
+            space_time=SpaceTimeTradeoffSpec(
+                direction="space_for_time",
+                mechanism="prepared_weight_materialization",
+                delta_hbm_bytes=int(prep_f_bytes),
+                free_hbm_headroom_bytes=headroom,
+                delta_step_ms=0.0,
+                delta_concurrency_per_dp=0,
+                delta_tps_per_die=0.0,
+                feasible_under_hbm_and_sla=bool(prep_f_bytes <= headroom),
+            ),
+        ))
+    return out
 
-    rebind_ext = (
-        _verify_external_plan_digests(
-            ext_plan, scenario_case or case, base_scenario,
-            step_request=step_request, stack_id=stack_id, primitive_table=primitive_table,
-        )
-        if ext_plan is not None else False
+
+def _collect_cross_hw_offload_opportunities(
+    case: Case,
+    nodes: Sequence[TargetOpNode],
+    *,
+    primitive_table: Any,
+) -> list[CoDesignOpportunity]:
+    """Build ``CrossHwOffloadSpec`` for Engram/PLE Host DDR async H2D prefetch vs hide window."""
+    plans = tuple(getattr(case.model, "layer_plans", ()) or ())
+    engram_layers = [int(lp.index) for lp in plans if bool(getattr(lp, "engram", False))]
+    engram_cfg = getattr(case.model, "engram", None)
+    engram_tables = tuple(getattr(engram_cfg, "tables", ()) or ()) if engram_cfg is not None else ()
+    engram_nodes = [
+        n for n in nodes
+        if str(n.family).lower() in {"engram_rh2d", "ple", "engram"}
+        or "engram" in n.op_id.lower()
+        or "ple_" in n.op_id.lower()
+    ]
+    if not engram_layers and not engram_tables and not engram_nodes:
+        return []
+
+    first_k = (
+        min(engram_layers) if engram_layers
+        else (min((int(t.layer_id) for t in engram_tables), default=1) if engram_tables else 1)
     )
+    hide_us = 0.0
+    for node in nodes:
+        lyr = getattr(node.spec, "layer", None) if node.spec is not None else None
+        if lyr is not None and 0 <= int(lyr) < first_k:
+            hide_us += float(node.exposed_dur_us) * max(1, int(node.repeat_count))
+    if hide_us <= 0.0:
+        hide_us = sum(
+            float(n.exposed_dur_us) * max(1, int(n.repeat_count))
+            for n in nodes if n not in engram_nodes
+        ) * HALF_SPLIT_RATIO
 
-    if ext_plan is not None and ext_plan.edits:
-        work_nodes, work_dems, ext_specs, locked_ids, ext_remap, ext_col_plans = _materialize_external_plan(
-            nodes, demands, ext_plan, case, datapath, floors, p0, pricing_ctx,
-            phase=phase, primitive_table=primitive_table,
-            allow_unbound_formula=allow_unbound_formula, rebind_digests=rebind_ext,
-        )
-        all_specs.extend(ext_specs)
-        executed_ext_edits.extend(ext_plan.edits)
-        global_remap.update(ext_remap)
-        collective_plans.update(ext_col_plans)
-    else:
-        work_nodes = list(nodes)
-        work_dems = list(demands)
+    xfer_bytes = sum(
+        max(float(n.hbm_read_bytes), float(n.mte2_bytes), float(n.hbm_total_bytes)) * max(1, int(n.repeat_count))
+        for n in engram_nodes
+    )
+    freed_hbm = 0
+    if engram_cfg is not None and callable(getattr(engram_cfg, "table_storage_bytes", None)):
+        try:
+            freed_hbm = int(round(float(engram_cfg.table_storage_bytes())))
+        except (ModelingError, ValueError):
+            freed_hbm = 0
+    if freed_hbm <= 0:
+        for tbl in engram_tables:
+            rows = max(1, int(getattr(tbl, "rows", 0) or 1))
+            width = max(1, int(getattr(tbl, "width", 0) or case.model.hidden_size))
+            freed_hbm += rows * width * DEFAULT_BF16_BYTES
+    if freed_hbm <= 0:
+        freed_hbm = max(int(round(xfer_bytes)), len(engram_layers) * max(1, case.model.hidden_size) * DEFAULT_BF16_BYTES)
+    if xfer_bytes <= 0.0:
+        xfer_bytes = float(max(1, len(engram_layers)) * max(1, case.model.hidden_size) * DEFAULT_BF16_BYTES)
 
+    h2d_bps, startup_ns = _p20_host_h2d_params(case, primitive_table)
+    transfer_ms = (startup_ns / NS_PER_MS) + (xfer_bytes / h2d_bps) * MS_PER_SECOND
+    hide_ms = max(0.0, hide_us / US_PER_MS)
+    net_exposed_ms = max(0.0, transfer_ms - hide_ms)
+    return [CoDesignOpportunity(
+        opportunity_id="cross_hw_engram_ple_host_ddr_prefetch",
+        kind="cross_hw_offload_multistream",
+        track="framework",
+        readiness="shipping",
+        title=f"Engram/PLE Host DDR Async H2D Prefetch vs NPU Layers 0..{max(0, first_k - 1)} Hide Window",
+        evidence_refs=("P20_host_dma_sync",),
+        cross_hw=CrossHwOffloadSpec(
+            target_component="engram_ple_table",
+            source_tier="host_ddr",
+            transfer_engine="h2d",
+            compute_hide_window_ms=hide_ms,
+            transfer_ms=transfer_ms,
+            net_exposed_ms=net_exposed_ms,
+            freed_hbm_bytes=int(freed_hbm),
+            delta_concurrency_per_dp=0,
+            delta_tps_per_die=0.0,
+        ),
+    )]
+
+
+def _collect_codesign_opportunities(
+    case: Case,
+    nodes: Sequence[TargetOpNode],
+    specs: Sequence[KernelSynthesisSpec],
+    tiler_opps: Sequence[CoDesignOpportunity],
+    *,
+    primitive_table: Any,
+    step_request: StepRequest | None,
+) -> tuple[CoDesignOpportunity, ...]:
+    """Assemble typed ``MegaFusionBound``, ``SpaceTimeTradeoffSpec`` & ``CrossHwOffloadSpec`` records."""
+    opps: list[CoDesignOpportunity] = []
+    for spec in specs:
+        if not spec.sram_verified or len(spec.constituent_op_ids) < MIN_FUSE_MEMBERS:
+            continue
+        before_ms = max(0.0, float(spec.before_us) / US_PER_MS)
+        tiled_ms = max(0.0, float(spec.target_us) / US_PER_MS)
+        l_star_ms = min(tiled_ms, max(0.0, float(spec.l_star_us) / US_PER_MS))
+        ub_live = max(0, int(spec.ub_peak_bytes))
+        ub_cap = max(int(spec.ub_budget_bytes), ub_live)
+        is_shipping = spec.binding_state == "bound_implementation"
+        opps.append(CoDesignOpportunity(
+            opportunity_id=f"mega_{spec.spec_id}",
+            kind="mega_fusion",
+            track="framework" if is_shipping else "kernel_new",
+            readiness="shipping" if is_shipping else "synthesized_target",
+            title=f"{spec.kernel_name} ({spec.suggested_backend})",
+            evidence_refs=tuple(spec.constituent_op_ids),
+            mega_fusion=MegaFusionBound(
+                region_op_ids=tuple(spec.constituent_op_ids),
+                exposed_before_ms=before_ms,
+                boundary_lower_bound_ms=l_star_ms,
+                tiled_engine_ms=tiled_ms,
+                gain_ceiling_ms=before_ms - l_star_ms,
+                gain_expected_ms=before_ms - tiled_ms,
+                eliminated_gm_bytes=max(0, int(spec.elided_hbm_bytes)),
+                ub_live_bytes=ub_live,
+                ub_capacity_bytes=ub_cap,
+                requires_unabsorbed_split_cost_check=True,
+            ),
+        ))
+    opps.extend(tiler_opps)
+    opps.extend(_collect_space_time_opportunities(case, nodes, step_request=step_request))
+    opps.extend(_collect_cross_hw_offload_opportunities(case, nodes, primitive_table=primitive_table))
+    return tuple(opps)
+
+
+def _run_archetype_rewrites(
+    work_nodes: Sequence[TargetOpNode],
+    work_dems: Sequence[tuple[int, int, int, int, int]],
+    locked_ids: set[str],
+    used_edit_ids: set[str],
+    floors: SkuTargetFloors,
+    p0: Mapping[str, Any],
+    case: Case,
+    datapath: DatapathCapabilitySpec,
+    pricing_ctx: _TargetPricingContext,
+    *,
+    phase: str,
+    safe_n_tok: float,
+    primitive_table: Any,
+    allow_unbound_formula: bool,
+) -> tuple[
+    list[TargetOpNode],
+    list[tuple[int, int, int, int, int]],
+    list[KernelSynthesisSpec],
+    list[SemanticAuditTrigger],
+    list[Edit],
+    dict[OpOccurrence, OpOccurrence],
+]:
     by_arch: dict[str, tuple[list[TargetOpNode], list[tuple[int, int, int, int, int]]]] = {}
     arch_order: list[str] = []
     for node, dem in zip(work_nodes, work_dems):
@@ -3892,18 +4263,17 @@ def solve_target_graph(
             arch_order.append(node.archetype_id)
         by_arch[node.archetype_id][0].append(node)
         by_arch[node.archetype_id][1].append(dem)
-
-    all_nodes: list[TargetOpNode] = []
-    all_dems: list[tuple[int, int, int, int, int]] = []
-    all_triggers: list[SemanticAuditTrigger] = []
-    auto_edits: list[Edit] = []
-    used_edit_ids = {e.edit_id for e in executed_ext_edits}
     work_unique_ids = {n.op_id for n in work_nodes}
     verify_work_ops = (
         [_node_to_op_spec(n, work_unique_ids, phase=phase) for n in work_nodes]
         if len(work_unique_ids) == len(work_nodes) else None
     )
-
+    all_nodes: list[TargetOpNode] = []
+    all_dems: list[tuple[int, int, int, int, int]] = []
+    all_specs: list[KernelSynthesisSpec] = []
+    all_triggers: list[SemanticAuditTrigger] = []
+    auto_edits: list[Edit] = []
+    remap: dict[OpOccurrence, OpOccurrence] = {}
     for aid in arch_order:
         a_nodes, a_dems = by_arch[aid]
         o_nodes, o_dems, o_specs, o_trigs, o_edits, o_remap = _solve_one_archetype(
@@ -3916,44 +4286,150 @@ def solve_target_graph(
         all_specs.extend(o_specs)
         all_triggers.extend(o_trigs)
         auto_edits.extend(o_edits)
-        global_remap.update(o_remap)
+        remap.update(o_remap)
+    return all_nodes, all_dems, all_specs, all_triggers, auto_edits, remap
 
-    base_sha = base_scenario.base_graph_sha256
-    frame_sha = base_scenario.framing_sha256
-    combined_edits = (*executed_ext_edits, *auto_edits)
-    final_plan = (
-        RewritePlan(base_graph_sha256=base_sha, framing_sha256=frame_sha, edits=combined_edits)
-        if combined_edits else empty_plan(base_sha, frame_sha)
-    )
-    verification_passed = _verify_final_target_plan(
-        nodes, final_plan, case, datapath, phase=phase, primitive_table=primitive_table,
-    )
 
-    rewired = _rewire_node_preds(all_nodes, global_remap)
-    enveloped = _apply_pillar23_envelopes(
-        rewired, all_dems, floors, case, pricing_ctx,
-        phase=phase, locked_ids=locked_ids, primitive_table=primitive_table,
-        allow_unbound_formula=allow_unbound_formula,
-        collective_plans=collective_plans,
+def _build_stage_waterfall(
+    opt_mode: OptimizationMode,
+    base_nodes: Sequence[TargetOpNode],
+    base_dems: Sequence[tuple[int, int, int, int, int]],
+    case: Case,
+    floors: SkuTargetFloors,
+    p0: Mapping[str, Any],
+    datapath: DatapathCapabilitySpec,
+    pricing_ctx: _TargetPricingContext,
+    after_sched: DieScheduleResult,
+    *,
+    phase: str,
+    safe_n_tok: float,
+    primitive_table: Any,
+    topology: Topology | None,
+    has_ext_plan: bool,
+    base_sched: DieScheduleResult | None = None,
+) -> tuple[dict[str, Any], ...]:
+    """Evaluate canonical causal stages on ONE Engine + ONE PrimitiveTable with exact conservation."""
+    stage_specs = canonical_comparison_stages(opt_mode)
+    eff_base_sched = base_sched if base_sched is not None else schedule_target_graph_on_engine(
+        base_nodes, case, primitive_table=primitive_table, launch_floor_us=floors.launch_vec_us,
     )
-    if collective_plans:
-        enveloped, all_dems = _reconcile_oneshot_link_ledger(
-            enveloped, all_dems, collective_plans, peaks_by_stage, p0,
+    before_us = weighted_step_span_us(eff_base_sched.nodes)
+    cfg_sched, _, _, _ = _select_best_moe_and_die_schedule(
+        base_nodes, base_dems, case, floors, p0, locked_ids=set(),
+        collective_plans={}, topology=topology,
+        primitive_table=primitive_table, allow_unbound_formula=False,
+    )
+    cfg_us = min(before_us, weighted_step_span_us(cfg_sched.nodes))
+    after_us = weighted_step_span_us(after_sched.nodes)
+    if opt_mode == "modeling":
+        fwk_nodes, fwk_dems, _, _, _, fwk_remap = _run_archetype_rewrites(
+            base_nodes, base_dems, set(), set(), floors, p0, case, datapath, pricing_ctx,
+            phase=phase, safe_n_tok=safe_n_tok, primitive_table=primitive_table,
+            allow_unbound_formula=False,
         )
-    _, _, topology, _ = pricing_ctx.ensure() if collective_plans else (None, None, None, False)
-    die_sched, final_dems, moe_dec, extra_receipts = _select_best_moe_and_die_schedule(
-        enveloped, all_dems, case, floors, p0, locked_ids=locked_ids,
-        collective_plans=collective_plans, topology=topology,
-        primitive_table=primitive_table, allow_unbound_formula=allow_unbound_formula,
+        fwk_rewired = _rewire_node_preds(fwk_nodes, fwk_remap)
+        fwk_sched, _, _, _ = _select_best_moe_and_die_schedule(
+            fwk_rewired, fwk_dems, case, floors, p0, locked_ids=set(),
+            collective_plans={}, topology=topology,
+            primitive_table=primitive_table, allow_unbound_formula=False,
+        )
+        fwk_us = min(cfg_us, weighted_step_span_us(fwk_sched.nodes))
+        if not has_ext_plan:
+            after_us = min(fwk_us, after_us)
+        spans = {"before": before_us, "config_only": cfg_us, "framework_rewrite": fwk_us, "after": after_us}
+    else:
+        if not has_ext_plan:
+            after_us = min(cfg_us, after_us)
+        spans = {"before": before_us, "config_only": cfg_us, "after": after_us}
+
+    rows: list[dict[str, Any]] = []
+    prev_us = before_us
+    for st in stage_specs:
+        cur_us = spans[st.stage]
+        rows.append({
+            "stage": st.stage,
+            "owner": st.owner,
+            "step_span_us": cur_us,
+            "delta_from_prev_us": cur_us - prev_us,
+            "cumulative_saved_us": before_us - cur_us,
+            "allowed_readiness": tuple(sorted(st.allowed_readiness)),
+            "allowed_rewrite_tracks": st.allowed_rewrite_tracks,
+            "engine_uid": "unified_die_engine",
+        })
+        prev_us = cur_us
+    return tuple(rows)
+
+
+def _enforce_engine_monotonicity(
+    nodes: Sequence[TargetOpNode],
+    demands: Sequence[tuple[int, int, int, int, int]],
+    case: Case,
+    floors: SkuTargetFloors,
+    die_sched: DieScheduleResult,
+    final_dems: list[tuple[int, int, int, int, int]],
+    final_plan: RewritePlan,
+    all_specs: list[KernelSynthesisSpec],
+    tiler_opps: list[CoDesignOpportunity],
+    extra_receipts: list[dict[str, Any]],
+    moe_dec: MoERouteDecision | None,
+    *,
+    base_sha: str,
+    frame_sha: str,
+    topology: Topology | None,
+    primitive_table: Any,
+    has_ext_edits: bool,
+) -> tuple[
+    DieScheduleResult,
+    list[tuple[int, int, int, int, int]],
+    RewritePlan,
+    list[KernelSynthesisSpec],
+    list[CoDesignOpportunity],
+    list[dict[str, Any]],
+    MoERouteDecision | None,
+    DieScheduleResult | None,
+]:
+    """Reject net-negative automatic rewrites/routes when slower than baseline on the same Engine."""
+    if has_ext_edits:
+        return die_sched, final_dems, final_plan, all_specs, tiler_opps, extra_receipts, moe_dec, None
+    after_w = weighted_step_span_us(die_sched.nodes)
+    baseline_exposed_w = weighted_step_span_us(nodes)
+    if after_w <= baseline_exposed_w + SAVING_POSITIVE_EPS_US:
+        return die_sched, final_dems, final_plan, all_specs, tiler_opps, extra_receipts, moe_dec, None
+    orig_sched = schedule_target_graph_on_engine(
+        nodes, case, collective_plans=None, topology=topology,
+        primitive_table=primitive_table, launch_floor_us=floors.launch_vec_us,
     )
-    indexed = tuple(replace(n, ordinal=idx) for idx, n in enumerate(die_sched.nodes))
+    if after_w > weighted_step_span_us(orig_sched.nodes) + SAVING_POSITIVE_EPS_US:
+        return (
+            orig_sched, list(demands), empty_plan(base_sha, frame_sha),
+            [], [], [], None, orig_sched,
+        )
+    return die_sched, final_dems, final_plan, all_specs, tiler_opps, extra_receipts, moe_dec, orig_sched
+
+
+def _build_solved_target_graph(
+    *,
+    indexed: tuple[TargetOpNode, ...],
+    final_dems: Sequence[tuple[int, int, int, int, int]],
+    die_sched: DieScheduleResult,
+    all_specs: Sequence[KernelSynthesisSpec],
+    all_triggers: Sequence[SemanticAuditTrigger],
+    final_plan: RewritePlan,
+    verification_passed: bool,
+    floors: SkuTargetFloors,
+    eff_allow_unbound: bool,
+    extra_receipts: Sequence[dict[str, Any]],
+    moe_dec: MoERouteDecision | None,
+    codesign_opps: tuple[CoDesignOpportunity, ...],
+    stage_waterfall: tuple[dict[str, Any], ...],
+    opt_mode: OptimizationMode,
+) -> SolvedTargetGraph:
     edit_receipts = _build_applied_edit_receipts(final_plan, all_specs, indexed, die_sched, extra_receipts)
     unbound_ops = tuple(n.op_id for n in indexed if n.binding_state == "unbound_formula_projection")
     has_unbound = bool(unbound_ops)
-    if not allow_unbound_formula and has_unbound:
+    if not eff_allow_unbound and has_unbound:
         raise ModelingError(f"strict_simulation_unbound_formula_ops:{','.join(unbound_ops)}")
     graph_state: BindingState = "unbound_formula_projection" if has_unbound else "bound_implementation"
-
     return SolvedTargetGraph(
         nodes=indexed,
         demands_ns=tuple(final_dems),
@@ -3974,10 +4450,154 @@ def solve_target_graph(
         step_start_us=die_sched.step_start_us,
         step_end_us=die_sched.step_end_us,
         step_span_us=die_sched.step_span_us,
+        co_design_opportunities=codesign_opps,
+        stage_waterfall=stage_waterfall,
+        optimization_mode=opt_mode,
+    )
+
+
+def solve_target_graph(
+    nodes: Sequence[TargetOpNode],
+    demands: Sequence[tuple[int, int, int, int, int]],
+    case: Case,
+    peaks_by_stage: Mapping[int, Mapping[str, Any]],
+    *,
+    phase: str = "decode",
+    rewrite_plan: RewritePlan | Mapping[str, Any] | str | Path | None = None,
+    n_tok_per_die: float = 1.0,
+    primitive_table: Any = None,
+    allow_unbound_formula: bool = True,
+    optimization_mode: OptimizationMode | None = None,
+    step_request: StepRequest | None = None,
+    stack_id: str | None = None,
+    scenario_case: Case | None = None,
+    compute_waterfall_and_codesign: bool = True,
+) -> SolvedTargetGraph:
+    """Solve target-state graph on ONE Engine + ONE PrimitiveTable across causal stages."""
+    opt_mode: OptimizationMode = (
+        optimization_mode if optimization_mode is not None
+        else ("modeling" if allow_unbound_formula else "simulation")
+    )
+    if opt_mode == "simulation" and allow_unbound_formula:
+        raise ModelingError("simulation_mode_forbids_unbound_formula_ops")
+    eff_allow_unbound = bool(allow_unbound_formula and opt_mode == "modeling")
+
+    floors = extract_sku_floors(case, primitive_table=primitive_table)
+    die = case.machine.dies[0]
+    ub_edges = ub_peer_edges_for_rank(die.rank, case.machine.links, case.machine.transfer_channels)
+    datapath = datapath_for_die(die, ub_peer_edges=ub_edges)
+    p0 = peaks_by_stage.get(0) or next(iter(peaks_by_stage.values()), {})
+    ext_plan = load_rewrite_plan(rewrite_plan)
+    pricing_ctx = _TargetPricingContext(case, primitive_table=primitive_table)
+    safe_n_tok = max(float(n_tok_per_die), SAVING_POSITIVE_EPS_US)
+
+    all_known_ids = {n.op_id for n in nodes}
+    base_ops_all = [_node_to_op_spec(n, all_known_ids, phase=phase) for n in nodes]
+    base_scenario = _build_target_scenario(
+        case, base_ops_all, datapath, phase=phase, primitive_table=primitive_table,
+    )
+    all_specs: list[KernelSynthesisSpec] = []
+    executed_ext_edits: list[Edit] = []
+    locked_ids: set[str] = set()
+    global_remap: dict[OpOccurrence, OpOccurrence] = {}
+    collective_plans: dict[OpOccurrence, tuple[Any, float]] = {}
+
+    rebind_ext = (
+        _verify_external_plan_digests(
+            ext_plan, scenario_case or case, base_scenario,
+            step_request=step_request, stack_id=stack_id, primitive_table=primitive_table,
+        )
+        if ext_plan is not None else False
+    )
+    if ext_plan is not None and ext_plan.edits:
+        work_nodes, work_dems, ext_specs, locked_ids, ext_remap, ext_col_plans = _materialize_external_plan(
+            nodes, demands, ext_plan, case, datapath, floors, p0, pricing_ctx,
+            phase=phase, primitive_table=primitive_table,
+            allow_unbound_formula=eff_allow_unbound, rebind_digests=rebind_ext,
+        )
+        all_specs.extend(ext_specs)
+        executed_ext_edits.extend(ext_plan.edits)
+        global_remap.update(ext_remap)
+        collective_plans.update(ext_col_plans)
+    else:
+        work_nodes = list(nodes)
+        work_dems = list(demands)
+
+    used_edit_ids = {e.edit_id for e in executed_ext_edits}
+    all_nodes, all_dems, auto_specs, all_triggers, auto_edits, auto_remap = _run_archetype_rewrites(
+        work_nodes, work_dems, locked_ids, used_edit_ids, floors, p0, case, datapath, pricing_ctx,
+        phase=phase, safe_n_tok=safe_n_tok, primitive_table=primitive_table,
+        allow_unbound_formula=eff_allow_unbound,
+    )
+    all_specs.extend(auto_specs)
+    global_remap.update(auto_remap)
+
+    base_sha = base_scenario.base_graph_sha256
+    frame_sha = base_scenario.framing_sha256
+    combined_edits = (*executed_ext_edits, *auto_edits)
+    final_plan = (
+        RewritePlan(base_graph_sha256=base_sha, framing_sha256=frame_sha, edits=combined_edits)
+        if combined_edits else empty_plan(base_sha, frame_sha)
+    )
+    verification_passed = _verify_final_target_plan(
+        nodes, final_plan, case, datapath, phase=phase, primitive_table=primitive_table,
+    )
+
+    rewired = _rewire_node_preds(all_nodes, global_remap)
+    tuned_nodes, tiler_opps = _apply_pillar_c_tiler_extensions(
+        rewired, all_dems, case, phase=phase, locked_ids=locked_ids,
+        primitive_table=primitive_table, allow_unbound_formula=eff_allow_unbound,
+    )
+    if collective_plans:
+        tuned_nodes, all_dems = _reconcile_oneshot_link_ledger(
+            tuned_nodes, all_dems, collective_plans, peaks_by_stage, p0,
+        )
+    _, _, topology, _ = pricing_ctx.ensure() if collective_plans else (None, None, None, False)
+    die_sched, final_dems, moe_dec, extra_receipts = _select_best_moe_and_die_schedule(
+        tuned_nodes, all_dems, case, floors, p0, locked_ids=locked_ids,
+        collective_plans=collective_plans, topology=topology,
+        primitive_table=primitive_table, allow_unbound_formula=eff_allow_unbound,
+    )
+    die_sched, final_dems, final_plan, all_specs, tiler_opps, extra_receipts, moe_dec, orig_sched = (
+        _enforce_engine_monotonicity(
+            nodes, demands, case, floors, die_sched, final_dems, final_plan,
+            all_specs, tiler_opps, extra_receipts, moe_dec,
+            base_sha=base_sha, frame_sha=frame_sha, topology=topology,
+            primitive_table=primitive_table, has_ext_edits=bool(executed_ext_edits),
+        )
+    )
+    indexed = tuple(replace(n, ordinal=idx) for idx, n in enumerate(die_sched.nodes))
+    _validate_final_graph_invariants(indexed, final_dems)
+    stage_waterfall = (
+        _build_stage_waterfall(
+            opt_mode, nodes, demands, case, floors, p0, datapath, pricing_ctx, die_sched,
+            phase=phase, safe_n_tok=safe_n_tok, primitive_table=primitive_table,
+            topology=topology, has_ext_plan=bool(executed_ext_edits),
+            base_sched=orig_sched,
+        )
+        if compute_waterfall_and_codesign else ()
+    )
+    codesign_opps = (
+        _collect_codesign_opportunities(
+            case, indexed, all_specs, tiler_opps,
+            primitive_table=primitive_table, step_request=step_request,
+        )
+        if compute_waterfall_and_codesign else ()
+    )
+    return _build_solved_target_graph(
+        indexed=indexed, final_dems=final_dems, die_sched=die_sched,
+        all_specs=all_specs, all_triggers=all_triggers, final_plan=final_plan,
+        verification_passed=verification_passed, floors=floors,
+        eff_allow_unbound=eff_allow_unbound, extra_receipts=extra_receipts,
+        moe_dec=moe_dec, codesign_opps=codesign_opps,
+        stage_waterfall=stage_waterfall, opt_mode=opt_mode,
     )
 
 
 __all__ = [
+    "BACKEND_ASCENDC_LABEL",
+    "BACKEND_CATLASS_LABEL",
+    "BACKEND_TILELANG_LABEL",
     "BindingState",
     "PipeStageSpec",
     "FormulaTensorSpec",

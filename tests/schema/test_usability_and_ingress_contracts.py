@@ -334,16 +334,16 @@ def test_v5_five_content_bugs_regression_locks() -> None:
     from mindie_sim.export.kernel_catalog import resolve_ascend_kernel_identity
     from mindie_sim.export.models import OperatorExportRow
     from mindie_sim.optimization.kernel_synthesis import _format_dag_equation
-    from mindie_sim.optimization.target_schedule import _pick_witness_for_slice
     from mindie_sim.prediction.results import OpOccurrence
+    from mindie_sim.prediction.runtime.exposed_observer import ObservedInterval, _pick_stream0_witness
     from mindie_sim.rewrite.algebra import AlgebraicTrait, OpTraitInfo, _resolve_symbolic_kind
 
     # Bug 1: Stream 0 takes witness priority over Stream 1 (MSO) even if Stream 1 is in witness_set.
-    nodes = [
-        SimpleNamespace(stream_index=0, ordinal=1),
-        SimpleNamespace(stream_index=1, ordinal=0),
+    ivs = [
+        ObservedInterval("main0", "main", 0, 0, 10_000, ordinal=1),
+        ObservedInterval("aux0", "aux", 1, 0, 10_000, ordinal=0),
     ]
-    assert _pick_witness_for_slice([0, 1], nodes, [(0.0, 10.0), (0.0, 10.0)], frozenset({1})) == 0
+    assert _pick_stream0_witness(ivs, frozenset({"aux0"})).occurrence_id == "main0"
 
     # Bug 2a/2b: 69 target_tail RecoverSSM rows collapse to 1 and never use generic Add kernel name.
     a5_case_obj = parse_case(compose_case(

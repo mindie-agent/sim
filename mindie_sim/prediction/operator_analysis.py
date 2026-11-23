@@ -14,7 +14,7 @@ from mindie_sim.schema.common import ModelingError
 
 from .graph_analysis import (
     FIRST_PARTICIPANT, UNIFORM_COUNT_CARDINALITY,
-    analysis_view, rebind_analysis_requests,
+    analysis_view, rebind_analysis_requests, rebind_analysis_requests_many,
 )
 from .execution.cohort_traffic import bind_cohort_traffic
 from .frontend.features import FeatureConfig
@@ -702,16 +702,21 @@ def target_graphs(case, *, phase, tokens, context=0, sequences=1, scope="model",
             model_programs=model_programs, layer_limit=layer_limit,
         )
         raw_graphs = {first_r: base_ops}
-        for r in participants[UNIFORM_COUNT_CARDINALITY:]:
+        peer_replicas = participants[UNIFORM_COUNT_CARDINALITY:]
+        rebound_by_r = (
+            rebind_analysis_requests_many(
+                base_ops, views[first_r], {r: views[r] for r in peer_replicas},
+            )
+            if (scope == "model" and peer_replicas) else {}
+        )
+        for r in peer_replicas:
             owner_rank = int(
                 _physical_rank_for(case, r, cohort_topology) or r) % ep_degree
             if scope == "model":
                 # Only the graph is rebound here.  The attached program is
                 # materialized from this replica's final cohort-bound graph on
                 # first ``program(r)`` access.
-                raw_graphs[r] = _rebind_ep_owner(
-                    rebind_analysis_requests(base_ops, views[first_r], views[r]),
-                    owner_rank)
+                raw_graphs[r] = _rebind_ep_owner(rebound_by_r[r], owner_rank)
                 program_bindings[r] = (views[first_r], views[r])
                 program_owners[r] = owner_rank
             else:
@@ -744,7 +749,7 @@ def target_graphs(case, *, phase, tokens, context=0, sequences=1, scope="model",
     graphs = lower_local_projection_tp_cohort(
         graphs, model=case.model, runtime=case.runtime, machine=case.machine)
     reuse_mode = str(getattr(case.runtime, "homogeneous_graph_reuse", "off"))
-    if len(graphs) > 1 and reuse_mode != "off":
+    if len(graphs) > 1 and reuse_mode != "off" and not (uniform_replicas and reuse_mode == "auto"):
         # The same ordinary cohort producer proves and rebinds replicas; a
         # "require" declaration therefore fails before pricing an unproved
         # asymmetric cohort instead of silently running full duplicates.

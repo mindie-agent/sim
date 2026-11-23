@@ -52,6 +52,179 @@ def analysis_view(case, request_id, tokens, context, scope, phase, *,
         **fields)
 
 
+_REBIND_ATOMIC_TYPES = (int, float, bool, type(None))
+
+
+def _longest_common_prefix(keys: Sequence[str]) -> str:
+    prefix = keys[0]
+    for key in keys[1:]:
+        while prefix and not key.startswith(prefix):
+            prefix = prefix[:-1]
+        if not prefix:
+            break
+    return prefix
+
+
+def _scan_prefix_presence(root: Any, prefix: str, dc_fields: dict[type, tuple[str, ...]]) -> dict[int, bool]:
+    """Memoize which subtrees contain ``prefix`` so untouched branches skip traversal."""
+    has_pfx: dict[int, bool] = {}
+
+    def scan(item: Any) -> bool:
+        t = type(item)
+        if t in _REBIND_ATOMIC_TYPES:
+            return False
+        if t is str:
+            return prefix in item
+        oid = id(item)
+        cached = has_pfx.get(oid)
+        if cached is not None:
+            return cached
+        found = False
+        if t is tuple or t is list:
+            for part in item:
+                pt = type(part)
+                if pt is str:
+                    if prefix in part:
+                        found = True
+                elif pt not in _REBIND_ATOMIC_TYPES and scan(part):
+                    found = True
+        elif t is dict:
+            for k, v in item.items():
+                kt, vt = type(k), type(v)
+                if (kt is str and prefix in k) or (vt is str and prefix in v):
+                    found = True
+                if kt not in _REBIND_ATOMIC_TYPES and kt is not str and scan(k):
+                    found = True
+                if vt not in _REBIND_ATOMIC_TYPES and vt is not str and scan(v):
+                    found = True
+        elif is_dataclass(item) and not isinstance(item, type):
+            fnames = dc_fields.get(t)
+            if fnames is None:
+                fnames = tuple(f.name for f in fields(t) if f.init)
+                dc_fields[t] = fnames
+            for name in fnames:
+                val = getattr(item, name)
+                vt = type(val)
+                if vt is str:
+                    if prefix in val:
+                        found = True
+                elif vt not in _REBIND_ATOMIC_TYPES and scan(val):
+                    found = True
+        elif isinstance(item, str):
+            found = prefix in item
+        elif isinstance(item, (tuple, list)):
+            for part in item:
+                if scan(part):
+                    found = True
+        elif isinstance(item, dict):
+            for k, v in item.items():
+                if scan(k) or scan(v):
+                    found = True
+        has_pfx[oid] = found
+        return found
+
+    scan(root)
+    return has_pfx
+
+
+def _rebind_with_binding(
+    value: Any,
+    binding: Mapping[str, str],
+    prefix: str,
+    pattern: "re.Pattern[str]",
+    dc_fields: dict[type, tuple[str, ...]],
+    has_pfx: Mapping[int, bool] | None = None,
+) -> Any:
+    memo: dict[int, Any] = {}
+
+    def _sub(match: "re.Match[str]") -> str:
+        return binding[match.group()]
+
+    def visit(item: Any) -> Any:
+        t = type(item)
+        if t in _REBIND_ATOMIC_TYPES:
+            return item
+        if t is str:
+            if prefix and prefix not in item:
+                return item
+            return pattern.sub(_sub, item)
+        oid = id(item)
+        if has_pfx is not None and not has_pfx.get(oid, True):
+            return item
+        if oid in memo:
+            return memo[oid]
+        out = transform(item, t)
+        memo[oid] = out
+        return out
+
+    def transform(item: Any, t: type) -> Any:
+        if isinstance(item, str):
+            if prefix and prefix not in item:
+                return item
+            return pattern.sub(_sub, item)
+        if t is tuple:
+            changed = False
+            out_list = []
+            for part in item:
+                pt = type(part)
+                if pt in _REBIND_ATOMIC_TYPES:
+                    after = part
+                elif pt is str:
+                    after = pattern.sub(_sub, part) if (not prefix or prefix in part) else part
+                elif has_pfx is not None and not has_pfx.get(id(part), True):
+                    after = part
+                else:
+                    after = visit(part)
+                if after is not part:
+                    changed = True
+                out_list.append(after)
+            return tuple(out_list) if changed else item
+        if t is list:
+            return [visit(part) for part in item]
+        if t is dict:
+            changed = False
+            out_dict = {}
+            for k, v in item.items():
+                nk = visit(k)
+                nv = visit(v)
+                if nk is not k or nv is not v:
+                    changed = True
+                out_dict[nk] = nv
+            return out_dict if changed else item
+        if is_dataclass(item) and not isinstance(item, type):
+            fnames = dc_fields.get(t)
+            if fnames is None:
+                fnames = tuple(f.name for f in fields(t) if f.init)
+                dc_fields[t] = fnames
+            updates = {}
+            for name in fnames:
+                before = getattr(item, name)
+                bt = type(before)
+                if bt in _REBIND_ATOMIC_TYPES:
+                    continue
+                if bt is str:
+                    if prefix and prefix not in before:
+                        continue
+                    after = pattern.sub(_sub, before)
+                elif has_pfx is not None and not has_pfx.get(id(before), True):
+                    continue
+                else:
+                    after = visit(before)
+                if after is not before:
+                    updates[name] = after
+            return replace(item, **updates) if updates else item
+        if isinstance(item, tuple):
+            result = tuple(visit(part) for part in item)
+            return item if all(a is b for a, b in zip(item, result)) else result
+        if isinstance(item, list):
+            return [visit(part) for part in item]
+        if isinstance(item, dict):
+            return {visit(key): visit(part) for key, part in item.items()}
+        return item
+
+    return visit(value)
+
+
 def rebind_analysis_requests(value, source_views, target_views):
     """Rename every complete program record from one replica to another.
 
@@ -67,36 +240,32 @@ def rebind_analysis_requests(value, source_views, target_views):
         r"(?<![\w@])(?:" + "|".join(
             re.escape(key) for key in sorted(binding, key=len, reverse=True))
         + r")(?![\w@])")
-    memo = {}
+    prefix = _longest_common_prefix(tuple(binding))
+    return _rebind_with_binding(value, binding, prefix, pattern, {})
 
-    def visit(item):
-        key = id(item)
-        if key not in memo:
-            memo[key] = transform(item)
-        return memo[key]
 
-    def transform(item):
-        if isinstance(item, str):
-            return pattern.sub(lambda match: binding[match.group()], item)
-        if is_dataclass(item) and not isinstance(item, type):
-            updates = {}
-            for field in fields(item):
-                if field.init:
-                    before = getattr(item, field.name)
-                    after = visit(before)
-                    if after is not before:
-                        updates[field.name] = after
-            return replace(item, **updates) if updates else item
-        if isinstance(item, tuple):
-            result = tuple(visit(part) for part in item)
-            return item if all(a is b for a, b in zip(item, result)) else result
-        if isinstance(item, list):
-            return [visit(part) for part in item]
-        if isinstance(item, dict):
-            return {visit(key): visit(part) for key, part in item.items()}
-        return item
-
-    return visit(value)
+def rebind_analysis_requests_many(value, source_views, target_views_by_key):
+    """Rebind one canonical replica graph to many target replicas sharing one prefix scan."""
+    source_ids = tuple(v.request_id for v in source_views)
+    if not source_ids or not target_views_by_key:
+        return {k: value for k in target_views_by_key}
+    prefix = _longest_common_prefix(source_ids)
+    pattern = re.compile(
+        r"(?<![\w@])(?:" + "|".join(
+            re.escape(key) for key in sorted(set(source_ids), key=len, reverse=True))
+        + r")(?![\w@])")
+    dc_fields: dict[type, tuple[str, ...]] = {}
+    has_pfx = _scan_prefix_presence(value, prefix, dc_fields) if prefix else None
+    out = {}
+    for replica_key, target_views in target_views_by_key.items():
+        binding = {
+            src: tgt.request_id
+            for src, tgt in zip(source_ids, target_views, strict=True)
+        }
+        out[replica_key] = _rebind_with_binding(
+            value, binding, prefix, pattern, dc_fields, has_pfx=has_pfx,
+        )
+    return out
 
 
 from collections import OrderedDict
@@ -857,11 +1026,25 @@ def _prepare_graphs(case, ops, book, replay_scope, external):
     return graphs, scopes, replay_scope, groups, group_for
 
 
+def _make_fast_layer_observer(
+    body_key_by_op: Mapping[str, Any],
+) -> tuple[Callable[..., None], dict[Any, list[tuple[int, Any, Any]]]]:
+    events_by_layer: dict[Any, list[tuple[int, Any, Any]]] = {}
+
+    def _observe(op, replica, _program, ready, complete):
+        if replica == 0:
+            key = body_key_by_op.get(op.op_id)
+            if key is not None:
+                events_by_layer.setdefault(key, []).append((int(op.stage), ready, complete))
+
+    return _observe, events_by_layer
+
+
 def _run_graph(
     case, ops, graphs, scopes, groups, ctx, book, external, input_ready_ms, *,
     include_submission, trace_limit, fast_span_only, stream_plans, request_views,
     padded_tokens, sequence_layout, timeline_replicas=None, compact=False,
-    isolated=False, group_for=None,
+    isolated=False, group_for=None, fast_observer=None,
 ):
     from .runtime.exposed_observer import ExposedObserver
 
@@ -930,7 +1113,7 @@ def _run_graph(
                 if isinstance(ops, Mapping) else len(ops))
     execution = Execution(case, cost, recipes=book, bindings=ctx.bindings,
                           ledger=CostLedger(), include_submission=include_submission,
-                          on_operator=None if fast_span_only else observe,
+                          on_operator=(fast_observer if fast_span_only else observe),
                           trace_limit=trace_limit, evaluation=ctx,
                           accel_eager_attach=op_count >= EAGER_GRAPH_MIN_OPS,
                           stream_plans=stream_plans)
@@ -1461,7 +1644,7 @@ def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=Non
                 audit_allocations=False, evaluation=None,
                 fast_span_only=False, stream_plans=None,
                 request_views=None, padded_tokens=0, sequence_layout="",
-                timeline_replicas=None):
+                timeline_replicas=None, layer_span_body_ids=None):
     """Run a declared DAG or replica->DAG mapping without a request scheduler.
 
     External input keys are operator dependency names and values are absolute
@@ -1501,19 +1684,27 @@ def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=Non
         frozenset(int(r) for r in timeline_replicas)
         if timeline_replicas is not None else None
     )
+    fast_observer, fast_layer_events = (
+        _make_fast_layer_observer(
+            layer_span_body_ids if isinstance(layer_span_body_ids, Mapping)
+            else {oid: ("target", -1) for oid in layer_span_body_ids}
+        )
+        if (fast_span_only and layer_span_body_ids) else (None, None)
+    )
     execution, engine, records, steps, stream_plans, skipped_occurrences, replica_observer = _run_graph(
         case, ops, graphs, scopes, groups, ctx, book, external, input_ready_ms,
         include_submission=include_submission, trace_limit=trace_limit,
         fast_span_only=fast_span_only, stream_plans=stream_plans,
         request_views=request_views, padded_tokens=padded_tokens, sequence_layout=sequence_layout,
-        timeline_replicas=keep_replicas, compact=compact, isolated=isolated, group_for=group_for)
+        timeline_replicas=keep_replicas, compact=compact, isolated=isolated,
+        group_for=group_for, fast_observer=fast_observer)
     end = max((step.completion.time for step in steps.values()), default=input_ready_ms)
     duration = end - input_ready_ms
     if fast_span_only:
         # Same Engine, same declared work, same virtual timestamps: only the
         # per-operator timeline and the isolated pricing pass are omitted.
         summary = execution.summary()
-        return {
+        out_fast = {
             "schema": "mindie-sim.graph/1", **model_coverage(case.model),
             "boundary": ("submitted_device_graph" if include_submission
                          else "device_graph"),
@@ -1526,6 +1717,16 @@ def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=Non
             "accel_status": accel_status(engine.accel_status()),
             "fast_span_only": True,
         }
+        if fast_layer_events is not None:
+            out_fast["layer_bounds"] = {
+                lyr: (
+                    evs[0][0],
+                    min(float(r.time) for _, r, _ in evs),
+                    max(float(c.time) for _, _, c in evs),
+                )
+                for lyr, evs in fast_layer_events.items() if evs
+            }
+        return out_fast
     joins = _bind_collective_readiness(case, records, group_for, execution, replica_observer=replica_observer)
     costs, durations, isolated_sum, cohort_cache = [], {}, 0.0, {}
     if isolated:

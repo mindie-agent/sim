@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 import importlib
+import json
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +43,7 @@ from mindie_sim.prediction.efficiency import (
     analyze_network_efficiency,
 )
 from mindie_sim.prediction.evaluation import EvaluationContext
+from mindie_sim.prediction.execution.layer_runs import discover_layer_cohorts
 from mindie_sim.prediction.graph_analysis import graph_costs
 from mindie_sim.prediction.offload.policy import missing_scenario_error
 from mindie_sim.prediction.operator_analysis import operator_costs, target_graphs
@@ -50,10 +52,8 @@ from mindie_sim.prediction.sharding.local_tp import rank_zero_graph_reuse
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.sweep.pd import (
-    ARCHETYPE_SCREEN_MIN_LAYERS,
     _reclaim_sweep_memory,
     _single_die_decode_tps,
-    build_archetype_representative_case,
     solve_optimal_deployment,
 )
 
@@ -210,8 +210,10 @@ def _analyze_case_bounded(
     if use_r0:
         del graphs
     _reclaim_sweep_memory()
+    from mindie_sim.prediction.execution.layer_runs import execute_native_cohort_graph
+
     ctx = EvaluationContext.create(eff_case)
-    graph_rep = graph_costs(
+    graph_rep, _, _ = execute_native_cohort_graph(
         eff_case, sg, external_inputs=ext_in,
         isolated=False, evaluation=ctx, timeline_replicas=(0,),
     )
@@ -245,15 +247,49 @@ def _analyze_case_bounded(
         _reclaim_sweep_memory()
 
 
+def _case_execution_fingerprint(raw_case: Mapping[str, Any]) -> str:
+    """Canonical execution fingerprint ignoring pure provenance ``feature_track_report``."""
+    rt = dict(raw_case.get("runtime") or {})
+    meta = dict(rt.get("metadata") or {})
+    meta.pop("feature_track_report", None)
+    meta.pop("feature_track", None)
+    rt["metadata"] = meta
+    payload = {
+        "model": raw_case.get("model"),
+        "machine": raw_case.get("machine"),
+        "runtime": rt,
+    }
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=repr)
+
+
+def _track_summary_from_eff(eff: Mapping[str, Any]) -> dict[str, Any]:
+    roof_1p0 = max(
+        float(eff.get("critical_path_roofline_ms") or 0.0),
+        float(eff.get("physical_resource_cut_ms") or 0.0),
+    ) or float(eff.get("total_roofline_ideal_ms") or 0.0)
+    return {
+        "step_ms": float(eff["graph_duration_ms"]),
+        "operator_sum_ms": float(eff["operator_sum_ms"]),
+        "hbm_bytes": float(eff["total_hbm_bytes"]),
+        "network": _network(eff),
+        "roof_1p0_ms": roof_1p0,
+    }
+
+
 def _compare_feature_tracks_bounded(
     model: Any, *, hardware: str | Mapping[str, Any], runtime_stack: str | Mapping[str, Any],
     phase: str, tokens: int, context: int, sequences: int, scope: str,
     compose_kwargs: Mapping[str, Any], use_archetype_folding: bool = False,
+    precomputed_summaries: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Evaluate the 4-track waterfall sequentially with replica-0 bounding to keep RSS low."""
+    del use_archetype_folding
     skip_keys = {"feature_track", "optimizations", "exclude_optimizations", "raw_eager", "_stack_phase"}
     cleaned = {k: v for k, v in compose_kwargs.items() if k not in skip_keys}
     summaries: dict[str, dict[str, Any]] = {}
+    summary_cache: dict[str, dict[str, Any]] = {
+        k: dict(v) for k, v in (precomputed_summaries or {}).items()
+    }
     meta_info: dict[str, Any] = {}
     va_quant: Any = None
     for track in ("merged", "unmerged_pr", "expected_ideal", "raw_eager"):
@@ -268,23 +304,17 @@ def _compare_feature_tracks_bounded(
             va_quant = ((case["runtime"]["metadata"] or {}).get("va_profile") or {}).get("quant")
             meta_info.update(model=case["model"]["name"], sku=case["machine"]["sku"])
         rep_meta = case["runtime"]["metadata"]["feature_track_report"]
-        eval_case: Any = (
-            build_archetype_representative_case(parse_case(case))[0]
-            if use_archetype_folding else case
-        )
+        fp = _case_execution_fingerprint(case)
+        cached = summary_cache.get(fp)
+        if cached is not None:
+            summaries[track] = {**cached, "report": rep_meta}
+            del case
+            continue
+        eff = _analyze_case_bounded(case, phase=phase, tokens=tokens, context=context, sequences=sequences, scope=scope)
         del case
-        _reclaim_sweep_memory()
-        eff = _analyze_case_bounded(eval_case, phase=phase, tokens=tokens, context=context, sequences=sequences, scope=scope)
-        del eval_case
-        roof_1p0 = max(
-            float(eff.get("critical_path_roofline_ms") or 0.0),
-            float(eff.get("physical_resource_cut_ms") or 0.0),
-        ) or float(eff.get("total_roofline_ideal_ms") or 0.0)
-        summaries[track] = {
-            "step_ms": float(eff["graph_duration_ms"]), "operator_sum_ms": float(eff["operator_sum_ms"]),
-            "hbm_bytes": float(eff["total_hbm_bytes"]), "network": _network(eff),
-            "roof_1p0_ms": roof_1p0, "report": rep_meta,
-        }
+        base_summary = _track_summary_from_eff(eff)
+        summary_cache[fp] = base_summary
+        summaries[track] = {**base_summary, "report": rep_meta}
         del eff
         _reclaim_sweep_memory()
 
@@ -357,12 +387,15 @@ def _extract_bottleneck_roofline(
     tokens: int,
     scope: str,
     phase: str = "decode",
+    summary_sink: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     eff = _analyze_case_bounded(
         raw_case, phase=phase, tokens=tokens,
         context=(0 if phase == "prefill" else prompt_tokens),
         sequences=max(1, int(sequences)), scope=scope,
     )
+    if summary_sink is not None:
+        summary_sink[_case_execution_fingerprint(raw_case)] = _track_summary_from_eff(eff)
     top_families = [
         {
             "family": row["family"],
@@ -596,36 +629,26 @@ def _evaluate_winner_analysis(
         ("pd_prefill" if is_prefill_only else "pd_decode")
         if solved.get("winner_mode") == "pd_disaggregated" else "colocated"
     )
-    use_arch = parsed_rec.model.layers >= ARCHETYPE_SCREEN_MIN_LAYERS
-    if use_arch:
-        rep_case, layer_weights, _ = build_archetype_representative_case(parsed_rec)
-        eval_case: Any = rep_case
-        wf_model: Any = rep_case.model.to_dict()
-        wf_layers: int | None = len(rep_case.model.layer_plans)
-    else:
-        eval_case = rec_case
-        layer_weights = {}
-        wf_model = model
-        wf_layers = layers
+    cohort_plan = discover_layer_cohorts(parsed_rec)
+    precomputed_tracks: dict[str, dict[str, Any]] = {}
     bottleneck = _extract_bottleneck_roofline(
-        eval_case, prompt_tokens=prompt, sequences=win_seq,
+        rec_case, prompt_tokens=prompt, sequences=win_seq,
         tokens=win_tokens, scope=win_scope, phase=win_phase,
+        summary_sink=precomputed_tracks,
     )
-    if use_arch and isinstance(bottleneck, dict):
+    if isinstance(bottleneck, dict):
         inc = dict(bottleneck.get("included_components") or {})
         inc["target_layers"] = int(parsed_rec.model.layers)
-        inc["archetype_representative_layers"] = len(layer_weights)
+        inc["structural_cohorts"] = len(cohort_plan.cohorts)
         bottleneck["included_components"] = inc
     par = parsed_rec.runtime.parallel
     full_model_layers = int(parsed_rec.model.layers)
     max_batched = parsed_rec.runtime.max_num_batched_tokens
-    del eval_case, parsed_rec
-    if use_arch:
-        del rep_case
+    del parsed_rec
     _reclaim_sweep_memory()
     wf_kw: dict[str, Any] = dict(
         tp=par.tp, dp=par.dp, ep=par.ep, pp=par.pp, pcp=par.pcp, dcp=par.cp,
-        num_devices=par.world_size, layers=wf_layers, quant=quant,
+        num_devices=par.world_size, layers=layers, quant=quant,
         kv_cache_dtype=kv_cache_dtype, indexer_kv_dtype=indexer_kv_dtype,
         topology_preset=topology_preset, ranks_per_node=ranks_per_node,
         prompt_tokens=prompt, output_tokens=output,
@@ -637,21 +660,20 @@ def _evaluate_winner_analysis(
         wf_kw["mtp_acceptance_length"] = float(mtp_accept)
     if ablate_prs:
         waterfall = compare_feature_tracks(
-            wf_model, hardware=hardware, runtime_stack=runtime_stack,
+            model, hardware=hardware, runtime_stack=runtime_stack,
             phase=win_phase, tokens=win_tokens, context=win_context,
             sequences=win_seq, scope=win_scope, ablate_prs=True,
             **wf_kw,
         )
     else:
-        wf_full_kw = {**wf_kw, "layers": layers}
         waterfall = _compare_feature_tracks_bounded(
             model, hardware=hardware, runtime_stack=runtime_stack,
             phase=win_phase, tokens=win_tokens, context=win_context,
-            sequences=win_seq, scope=win_scope, compose_kwargs=wf_full_kw,
-            use_archetype_folding=use_arch,
+            sequences=win_seq, scope=win_scope, compose_kwargs=wf_kw,
+            precomputed_summaries=precomputed_tracks,
         )
-    if use_arch and isinstance(waterfall, dict):
-        waterfall["archetype_representative_layers"] = int(wf_layers or 0)
+    if isinstance(waterfall, dict):
+        waterfall["structural_cohorts"] = len(cohort_plan.cohorts)
         waterfall["full_model_layers"] = full_model_layers
     export_kw = {**wf_kw, "layers": layers}
     exports = (

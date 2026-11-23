@@ -24,6 +24,8 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
+import heapq
+import re
 from typing import Any, Mapping, Sequence
 
 from mindie_sim.schema.common import ModelingError
@@ -51,6 +53,91 @@ COMM_STREAM_INDEX = 2
 SECONDARY_MASKER_SHARE = 0.35
 MAX_MASKED_LABEL_LEN = 96
 NS_PER_MS = 1_000_000
+NS_PER_US = 1000.0
+_COLLECTIVE_TASK_IDX_RE = re.compile(r"^c:(\d+):")
+
+
+class ServiceGrantObserver:
+    """Lightweight read-only ``WaveRecorder`` observer capturing per-op Engine grants."""
+
+    __slots__ = ("current_node_idx", "task_to_node", "admit_ms_by_node", "_grant_acc", "_slot_gen")
+
+    def __init__(self) -> None:
+        self.current_node_idx: int | None = None
+        self.task_to_node: dict[int, int] = {}
+        self.admit_ms_by_node: dict[int, float] = {}
+        self._grant_acc: dict[tuple[float, float, str, int], float] = {}
+        self._slot_gen: dict[tuple[str, int, str], int] = {}
+
+    @property
+    def grants(self) -> list[tuple[float, float, str, int, float]]:
+        return [(t0, t1, rname, idx, deliv) for (t0, t1, rname, idx), deliv in self._grant_acc.items()]
+
+    def to_observed_grants(
+        self,
+        node_ids: Sequence[str],
+        *,
+        step_start_ns: int = 0,
+    ) -> tuple[ObservedServiceGrant, ...]:
+        """Convert accumulated Engine grants to integer-ns ``ObservedServiceGrant`` records."""
+        out: list[ObservedServiceGrant] = []
+        n_nodes = len(node_ids)
+        for (t0_ms, t1_ms, rname, idx), deliv in self._grant_acc.items():
+            if deliv <= 0.0 or t1_ms <= t0_ms or idx < 0 or idx >= n_nodes:
+                continue
+            s_ns = max(0, int(round(t0_ms * float(NS_PER_MS))) - step_start_ns)
+            e_ns = max(s_ns, int(round(t1_ms * float(NS_PER_MS))) - step_start_ns)
+            if e_ns > s_ns:
+                out.append(ObservedServiceGrant(node_ids[idx], rname, s_ns, e_ns, float(deliv)))
+        return tuple(out)
+
+    def register_pipe(self, _name: str) -> int:
+        return 0
+
+    def on_submit(self, task_id: int, name: str = "", *_args: Any, **_kwargs: Any) -> None:
+        idx = self.current_node_idx
+        if idx is None and name:
+            match = _COLLECTIVE_TASK_IDX_RE.match(str(name))
+            if match is not None:
+                idx = int(match.group(1))
+        if idx is not None:
+            self.task_to_node[int(task_id)] = idx
+
+    def on_admit(self, task_id: int, now_ms: float, *_args: Any, **_kwargs: Any) -> None:
+        idx = self.task_to_node.get(int(task_id))
+        if idx is not None:
+            prev = self.admit_ms_by_node.get(idx)
+            if prev is None or now_ms < prev:
+                self.admit_ms_by_node[idx] = float(now_ms)
+
+    def on_service(
+        self, task_id: int, physical_row: str, _owner: int,
+        t0_ms: float, t1_ms: float, delivered: float, **_kwargs: Any,
+    ) -> None:
+        if delivered <= 0.0 or t1_ms <= t0_ms:
+            return
+        idx = self.task_to_node.get(int(task_id))
+        if idx is not None:
+            key = (float(t0_ms), float(t1_ms), str(physical_row), idx)
+            self._grant_acc[key] = self._grant_acc.get(key, 0.0) + float(delivered)
+
+    def allocate_slot_generation(self, pool: str, unit: int, name: str) -> tuple[int, int]:
+        key = (str(pool), int(unit), str(name))
+        gen = self._slot_gen.get(key, 0) + 1
+        self._slot_gen[key] = gen
+        return 0, gen
+
+    def release_slot_generation(self, pool: str, unit: int, name: str) -> tuple[int, int]:
+        return 0, self._slot_gen.get((str(pool), int(unit), str(name)), 0)
+
+    def on_allocation(self, *_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    def extract_cycle_pattern(self, *_args: Any, **_kwargs: Any) -> tuple[tuple[Any, ...], tuple[Any, ...]]:
+        return (), ()
+
+    def on_period(self, *_args: Any, **_kwargs: Any) -> None:
+        return None
 
 
 @dataclass(frozen=True)
@@ -153,6 +240,48 @@ def _allocate_integer_shares(dt: int, weights: Mapping[str, float]) -> dict[str,
     return floors
 
 
+def _attribute_live_slice(
+    dt: int,
+    live: Sequence[ObservedInterval],
+    live_grants: Sequence[ObservedServiceGrant],
+    witness_set: frozenset[str],
+    exposed: dict[str, int],
+    mask_overlap: dict[str, dict[str, int]],
+) -> None:
+    """Attribute one concurrent slice ``dt`` ns across active intervals and grants."""
+    witness = _pick_stream0_witness(live, witness_set)
+    live_ids = {iv.occurrence_id for iv in live}
+    grants_by_res: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
+    for gr in live_grants:
+        if gr.occurrence_id in live_ids:
+            span = float(gr.end_ns - gr.start_ns)
+            if span > 0.0:
+                grants_by_res[gr.resource][gr.occurrence_id] += gr.delivered * (float(dt) / span)
+    contested = [
+        res for res, claimants in grants_by_res.items()
+        if witness.occurrence_id in claimants and len(claimants) >= 2
+    ]
+    if contested:
+        combined: dict[str, float] = defaultdict(float)
+        for res in contested:
+            claimants = grants_by_res[res]
+            res_tot = sum(claimants.values())
+            if res_tot > 0.0:
+                for oid, amt in claimants.items():
+                    combined[oid] += amt / res_tot
+        shares = _allocate_integer_shares(dt, combined)
+        for oid, ns in shares.items():
+            exposed[oid] += ns
+        for iv in live:
+            if iv.occurrence_id not in shares and iv.stream_index != witness.stream_index:
+                mask_overlap[iv.occurrence_id][witness.label] += dt
+        return
+    exposed[witness.occurrence_id] += dt
+    for iv in live:
+        if iv.occurrence_id != witness.occurrence_id and iv.stream_index != witness.stream_index:
+            mask_overlap[iv.occurrence_id][witness.label] += dt
+
+
 def attribute_stream0_intervals(
     intervals: Sequence[ObservedInterval],
     *,
@@ -161,7 +290,7 @@ def attribute_stream0_intervals(
     grants: Sequence[ObservedServiceGrant] = (),
     causal_preds: Mapping[str, Sequence[str]] | None = None,
 ) -> StreamExposureResult:
-    """Assign every half-open ``[t0, t1)`` slice once with Stream 0 primary witness priority.
+    """Assign every half-open ``[t0, t1)`` slice once via O((N+G) log(N+G)) sweep-line.
 
     * Stream 0 (``main``) is preferred whenever active; aux side-streams or
       collective/comm tails are exposed only when Stream 0 is idle (or while
@@ -173,10 +302,10 @@ def attribute_stream0_intervals(
     """
     start_i = int(start_ns)
     term_i = max(start_i, int(terminal_ns))
-    exposed: dict[str, int] = {iv.occurrence_id: INT_ZERO for iv in intervals}
+    exposed: dict[str, int] = {iv.occurrence_id: 0 for iv in intervals}
     mask_overlap: dict[str, dict[str, int]] = {iv.occurrence_id: defaultdict(int) for iv in intervals}
     if term_i <= start_i:
-        return StreamExposureResult(start_i, term_i, exposed, INT_ZERO, {iv.occurrence_id: "" for iv in intervals}, INT_ZERO)
+        return StreamExposureResult(start_i, term_i, exposed, 0, {iv.occurrence_id: "" for iv in intervals}, 0)
 
     clamped = [
         ObservedInterval(
@@ -187,7 +316,10 @@ def attribute_stream0_intervals(
         )
         for iv in intervals
     ]
-    active_ivs = [iv for iv in clamped if iv.end_ns > iv.start_ns]
+    active_ivs = sorted(
+        (iv for iv in clamped if iv.end_ns > iv.start_ns),
+        key=lambda iv: (iv.start_ns, iv.end_ns, iv.ordinal, iv.occurrence_id),
+    )
     witness_set = _trace_stream0_witness_set(active_ivs, causal_preds)
     cuts_set: set[int] = {start_i, term_i}
     for iv in active_ivs:
@@ -197,64 +329,71 @@ def attribute_stream0_intervals(
     for gr in grants:
         lo = max(start_i, min(term_i, int(gr.start_ns)))
         hi = max(start_i, min(term_i, int(gr.end_ns)))
-        if hi > lo and gr.delivered > ZERO:
+        if hi > lo and gr.delivered > 0.0:
             clamped_grants.append(ObservedServiceGrant(gr.occurrence_id, gr.resource, lo, hi, float(gr.delivered)))
             cuts_set.add(lo)
             cuts_set.add(hi)
+    clamped_grants.sort(key=lambda gr: (gr.start_ns, gr.end_ns, gr.occurrence_id, gr.resource))
 
     cuts = sorted(cuts_set)
-    idle_wait_ns = INT_ZERO
+    idle_wait_ns = 0
+    iv_ptr = gr_ptr = 0
+    n_ivs, n_grants = len(active_ivs), len(clamped_grants)
+    iv_heap: list[tuple[int, int]] = []
+    gr_heap: list[tuple[int, int]] = []
+    live_ivs: dict[int, ObservedInterval] = {}
+    live_grants: dict[int, ObservedServiceGrant] = {}
+
     for lo, hi in zip(cuts, cuts[1:]):
         dt = hi - lo
-        if dt <= INT_ZERO:
+        if dt <= 0:
             continue
-        live = [iv for iv in active_ivs if iv.start_ns <= lo and iv.end_ns >= hi]
-        if not live:
+        while iv_ptr < n_ivs and active_ivs[iv_ptr].start_ns <= lo:
+            iv = active_ivs[iv_ptr]
+            if iv.end_ns > lo:
+                live_ivs[iv_ptr] = iv
+                heapq.heappush(iv_heap, (iv.end_ns, iv_ptr))
+            iv_ptr += 1
+        while iv_heap and iv_heap[0][0] <= lo:
+            _, expired_idx = heapq.heappop(iv_heap)
+            live_ivs.pop(expired_idx, None)
+        while gr_ptr < n_grants and clamped_grants[gr_ptr].start_ns <= lo:
+            gr = clamped_grants[gr_ptr]
+            if gr.end_ns > lo:
+                live_grants[gr_ptr] = gr
+                heapq.heappush(gr_heap, (gr.end_ns, gr_ptr))
+            gr_ptr += 1
+        while gr_heap and gr_heap[0][0] <= lo:
+            _, expired_g = heapq.heappop(gr_heap)
+            live_grants.pop(expired_g, None)
+
+        if not live_ivs:
             idle_wait_ns += dt
             continue
-        if len(live) == ONE:
-            exposed[live[FIRST].occurrence_id] += dt
+        if len(live_ivs) == 1:
+            only_iv = next(iter(live_ivs.values()))
+            exposed[only_iv.occurrence_id] += dt
             continue
-        witness = _pick_stream0_witness(live, witness_set)
-        live_ids = {iv.occurrence_id for iv in live}
-        grants_by_res: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
-        for gr in clamped_grants:
-            if gr.start_ns <= lo and gr.end_ns >= hi and gr.occurrence_id in live_ids:
-                span = float(gr.end_ns - gr.start_ns)
-                grants_by_res[gr.resource][gr.occurrence_id] += gr.delivered * (float(dt) / span)
-        contested = [res for res, claimants in grants_by_res.items()
-                     if witness.occurrence_id in claimants and len(claimants) >= 2]
-        if contested:
-            combined: dict[str, float] = defaultdict(float)
-            for res in contested:
-                claimants = grants_by_res[res]
-                res_tot = sum(claimants.values())
-                if res_tot > ZERO:
-                    for oid, amt in claimants.items():
-                        combined[oid] += amt / res_tot
-            shares = _allocate_integer_shares(dt, combined)
-            for oid, ns in shares.items():
-                exposed[oid] += ns
-            for iv in live:
-                if iv.occurrence_id not in shares and iv.stream_index != witness.stream_index:
-                    mask_overlap[iv.occurrence_id][witness.label] += dt
-        else:
-            exposed[witness.occurrence_id] += dt
-            for iv in live:
-                if iv.occurrence_id != witness.occurrence_id and iv.stream_index != witness.stream_index:
-                    mask_overlap[iv.occurrence_id][witness.label] += dt
+        _attribute_live_slice(
+            dt,
+            tuple(live_ivs.values()),
+            tuple(live_grants.values()),
+            witness_set,
+            exposed,
+            mask_overlap,
+        )
 
     masked_by: dict[str, str] = {}
     for iv in clamped:
-        dur = max(INT_ZERO, iv.end_ns - iv.start_ns)
+        dur = max(0, iv.end_ns - iv.start_ns)
         ov = mask_overlap[iv.occurrence_id]
-        if dur - exposed[iv.occurrence_id] <= INT_ZERO or not ov:
+        if dur - exposed[iv.occurrence_id] <= 0 or not ov:
             masked_by[iv.occurrence_id] = ""
             continue
         ordered = sorted(ov.items(), key=lambda item: (-item[1], item[0]))
-        top_lbl, top_ov = ordered[FIRST]
-        if len(ordered) > ONE and ordered[ONE][1] > top_ov * SECONDARY_MASKER_SHARE:
-            masked_by[iv.occurrence_id] = f"{top_lbl} + {ordered[ONE][0]}"[:MAX_MASKED_LABEL_LEN]
+        top_lbl, top_ov = ordered[0]
+        if len(ordered) > 1 and ordered[1][1] > top_ov * SECONDARY_MASKER_SHARE:
+            masked_by[iv.occurrence_id] = f"{top_lbl} + {ordered[1][0]}"[:MAX_MASKED_LABEL_LEN]
         else:
             masked_by[iv.occurrence_id] = top_lbl[:MAX_MASKED_LABEL_LEN]
 
@@ -268,6 +407,73 @@ def attribute_stream0_intervals(
         masked_by=masked_by,
         conservation_delta_ns=delta_ns,
     )
+
+
+def _short_exposed_label(node: Any) -> str:
+    fam = str(getattr(node, "family", "") or "").lower()
+    rec = str(getattr(node, "recipe", "") or "").lower()
+    if fam in {"grouped_moe", "mc2", "fused_moe_mc2", "moe"} or "megamoe" in rec or "dispatch_ffn_combine" in rec:
+        return "MoE Routed GMM / MegaMoE"
+    if fam in {"allgather", "all_gather"}:
+        return "Collective AllGather"
+    if fam in {"indexer", "index_pool"}:
+        return "Sparse Indexer"
+    role = str(getattr(node, "logical_role", "") or getattr(node, "ascend_kernel", "") or getattr(node, "op_id", ""))
+    return role[:MAX_MASKED_LABEL_LEN]
+
+
+def attribute_engine_exposure(
+    nodes: Sequence[Any],
+    intervals_us: Sequence[tuple[float, float]],
+    observer: ServiceGrantObserver | None,
+    causal_preds: Mapping[int, tuple[int, ...]] | None,
+    step_span_us: float,
+    *,
+    step_start_ns: int = INT_ZERO,
+) -> tuple[list[float], list[str]]:
+    """Attribute Engine wall time additively via ``attribute_stream0_intervals``."""
+    n = len(nodes)
+    if n == INT_ZERO or step_span_us <= ZERO:
+        return [ZERO] * n, [""] * n
+    term_ns = max(INT_ZERO, int(round(float(step_span_us) * NS_PER_US)))
+    if term_ns <= INT_ZERO:
+        return [ZERO] * n, [""] * n
+    node_ids = tuple(str(i) for i in range(n))
+    obs_intervals: list[ObservedInterval] = []
+    for idx, node in enumerate(nodes):
+        s_us, e_us = intervals_us[idx]
+        s_ns = max(INT_ZERO, min(term_ns, int(round(float(s_us) * NS_PER_US))))
+        e_ns = max(s_ns, min(term_ns, int(round(float(e_us) * NS_PER_US))))
+        occ = getattr(node, "occurrence", None)
+        obs_intervals.append(ObservedInterval(
+            occurrence_id=node_ids[idx],
+            stream=str(getattr(node, "stream", "main") or "main"),
+            stream_index=int(getattr(node, "stream_index", INT_ZERO) or INT_ZERO),
+            start_ns=s_ns,
+            end_ns=e_ns,
+            ordinal=int(getattr(node, "ordinal", idx) or idx),
+            label=_short_exposed_label(node),
+            replica=int(getattr(occ, "replica", INT_ZERO) or INT_ZERO),
+        ))
+    obs_grants = (
+        observer.to_observed_grants(node_ids, step_start_ns=step_start_ns)
+        if observer is not None else ()
+    )
+    preds_str = (
+        {
+            node_ids[k]: tuple(node_ids[p] for p in v if INT_ZERO <= p < n)
+            for k, v in causal_preds.items()
+            if INT_ZERO <= k < n
+        }
+        if causal_preds else None
+    )
+    res = attribute_stream0_intervals(
+        obs_intervals, start_ns=INT_ZERO, terminal_ns=term_ns,
+        grants=obs_grants, causal_preds=preds_str,
+    )
+    exposed_us = [float(res.exposed_ns_by_op.get(node_ids[i], INT_ZERO)) / NS_PER_US for i in range(n)]
+    masked = [res.masked_by.get(node_ids[i], "") for i in range(n)]
+    return exposed_us, masked
 
 
 @dataclass
