@@ -878,4 +878,83 @@ def test_report_preserves_solved_pd_columns_pooling_phase_and_strict_tracks(tmp_
         assert rec["agent_brief"]["scenario_and_parallelism"]["deployment_mode"] == DEPLOYMENT_MODE_LABELS["pd_pooled"]
 
 
+def test_report_shipping_defaults_partial_pins_and_script_free_purity(tmp_path, monkeypatch):
+    from mindie_sim.cli import _main as cli_main
+    from mindie_sim.cli.parser import build_parser
+    from mindie_sim.export import export_comparison_xlsx as real_export_xlsx
+    from mindie_sim.sweep import pd as pd_mod
+
+    # 1. Default --compare-track is merged; auto-device estimation works; retired --kernel-designs-json exits 2.
+    from mindie_sim.cli import report as report_mod
+    rep_args = build_parser().parse_args(["report", "--model", "qwen3-32b", "--hardware", "a3"])
+    assert rep_args.compare_track == "merged"
+    pol = report_mod.resolve_auto_va_policy("qwen3-32b", "a3")
+    assert report_mod._estimate_auto_num_devices(pol["model_spec"], pol["sku"], pol["weight_quant"]) >= 1
+    bad_designs = tmp_path / "designs.json"
+    bad_designs.write_text("{}", encoding="utf-8")
+    assert cli_main([
+        "report", "--model", "qwen3-32b", "--hardware", "a3",
+        "--dp", "1", "--tp", "2", "--ep", "1", "--concurrency", "1",
+        "--kernel-designs-json", str(bad_designs), "--out-dir", str(tmp_path / "bad_out"),
+    ]) == 2
+
+    # 2. Partial parallel pin (--tp 2 --num-devices 4) forwards pinned_parallel to solver instead of bypassing search.
+    seen_pins: list[dict[str, int] | None] = []
+    seen_audit_in_xlsx: list[bool] = []
+    sample_case = compose_raw_case("qwen3-32b", "a3", tp=2, layers=1, prompt_tokens=128, output_tokens=32, quant="w8a8_dynamic")
+
+    def _stub_solve(*_a, **kw):
+        seen_pins.append(kw.get("pinned_parallel"))
+        return {
+            "feasible": True, "winner_mode": "colocated",
+            "best_configuration": {
+                "deployment_mode": "colocated",
+                "parallel": {"dp": 2, "tp": 2, "ep": 1, "pp": 1, "pcp": 1, "cp": 1},
+                "b_feasible": 2, "b_vram_max": 4, "mtp_proposal_tokens": 0, "used_dies": 4,
+            },
+            "recommended_case": sample_case,
+        }
+
+    def _spy_xlsx(*args, **kwargs):
+        seen_audit_in_xlsx.append(kwargs.get("script_audit") is not None)
+        return real_export_xlsx(*args, **kwargs)
+
+    from mindie_sim.cli import report as report_mod
+    with monkeypatch.context() as mp:
+        mp.setattr(pd_mod, "solve_optimal_deployment", _stub_solve)
+        mp.setattr(report_mod, "export_comparison_xlsx", _spy_xlsx)
+        sf_dir = tmp_path / "sf_out"
+        sf_rec = tmp_path / "sf_rec.json"
+        rc_sf = cli_main([
+            "report", "--model", "qwen3-32b", "--hardware", "a3", "--num-devices", "4", "--tp", "2",
+            "--prompt-tokens", "128", "--output-tokens", "32", "--mode", "simulation",
+            "--no-trace", "--out-dir", str(sf_dir), "--json", "--receipt", str(sf_rec),
+        ])
+        assert rc_sf == 0 and seen_pins and seen_pins[0] == {"tp": 2}
+        assert seen_audit_in_xlsx == [False]
+        sf_payload = json.loads(sf_rec.read_text(encoding="utf-8"))
+        assert "optimized_serve_sh" not in sf_payload["agent_brief"]["generated_files"]
+        assert "script_audit" not in sf_payload["agent_brief"]
+
+        # 3. --from-script builds audit BEFORE XLSX and passes same audit to XLSX + JSON.
+        sh_file = tmp_path / "serve.sh"
+        sh_file.write_text(
+            "export HCCL_OP_EXPANSION_MODE=AI_CPU\n"
+            "vllm serve /weights/qwen3-32b-bf16 --tensor-parallel-size 2 --data-parallel-size 1 --enforce-eager\n",
+            encoding="utf-8",
+        )
+        sa_dir = tmp_path / "sa_out"
+        sa_rec = tmp_path / "sa_rec.json"
+        rc_sa = cli_main([
+            "report", "--from-script", str(sh_file), "--hardware", "a3", "--num-devices", "4", "--tp", "2",
+            "--prompt-tokens", "128", "--output-tokens", "32", "--mode", "simulation",
+            "--no-trace", "--out-dir", str(sa_dir), "--json", "--receipt", str(sa_rec),
+        ])
+        assert rc_sa == 0 and seen_audit_in_xlsx[-1] is True
+        sa_payload = json.loads(sa_rec.read_text(encoding="utf-8"))
+        assert "script_audit" in sa_payload["agent_brief"]
+        assert "optimized_serve_sh" in sa_payload["agent_brief"]["generated_files"]
+
+
+
 

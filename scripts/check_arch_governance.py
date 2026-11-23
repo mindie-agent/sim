@@ -704,6 +704,360 @@ _AG013_MODULE_STR_TABLE_RE = re.compile(
     re.IGNORECASE,
 )
 _AG013_TARGET_ETA_RE = re.compile(r"(?:^|_)target_eta(?:$|_)", re.IGNORECASE)
+_AG013_EXPORT_PCT_HARD_RE = re.compile(r">=\s*(?:75|78|85)(?:\.0+)?\s*%")
+_AG013_EXPORT_PCT_LSTAR_RE = re.compile(
+    r"(?:目标|达成|>=|>)\s*(?:\d+(?:\.\d+)?|\{_\})\s*%\s*(?:[A-Za-z0-9_/\s]{0,16})?L\*"
+)
+_AG013_EXPORT_LSTAR_PCT_RE = re.compile(r"L\*\s*达成率\s*>=\s*(?:\d+(?:\.\d+)?|\{_\})\s*%")
+_AG013_EXPORT_SOURCE_PATH_RE = re.compile(
+    r"(?:^|[\s`'\"(])(?:vllm[-_]ascend|vllm|cann|mindie[-_]llm|sglang)/[A-Za-z0-9_./-]+\.py(?=$|[\s`'\"):,])",
+    re.IGNORECASE,
+)
+_AG013_AIV_CCU_RE = re.compile(r"\b(?:AIV\s*/\s*CCU|CCU\s*/\s*AIV)\b", re.IGNORECASE)
+_AG013_ACLGRAPH_CATCHALL = "避免 ACLGraph 图断裂"
+_AG013_GUIDANCE_TARGETS = frozenset({
+    "config_howto", "kernel_action", "framework_action",
+    "action_note", "action_detail", "default_design_slot", "default_acceptance_slot",
+})
+_AG013_DISPATCH_KEYS = frozenset({
+    "op_id", "suffix", "family", "recipe", "ascend_kernel",
+    "submodule", "sku", "dominant_bound",
+})
+_AG013_HINT_TABLE_NAME_RE = re.compile(
+    r"(?:^|_)(?:design_?hints?|op_?hints?|kernel_?hints?|guidance_?table|guidance_?map|action_?templates?|howto_?map|prose_?table)(?:$|_)",
+    re.IGNORECASE,
+)
+_AG013_GUIDANCE_FUNC_RE = re.compile(
+    r"(?:guidance|design_slot|acceptance_slot|action_howto|kernel_hint)",
+    re.IGNORECASE,
+)
+_AG013_PLACEHOLDER_DEFAULTS = frozenset({"", "-", "—", "--", "N/A", "none", "None"})
+_AG013_PRESCRIPTIVE_MIN_LEN = 6
+
+
+def _ag013_fold_export_str(node: ast.AST, env: Mapping[str, str]) -> str | None:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.Name):
+        return env.get(node.id)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = _ag013_fold_export_str(node.left, env)
+        right = _ag013_fold_export_str(node.right, env)
+        return None if left is None or right is None else left + right
+    if isinstance(node, ast.JoinedStr):
+        parts: list[str] = []
+        for val in node.values:
+            if isinstance(val, ast.Constant) and isinstance(val.value, str):
+                parts.append(val.value)
+            else:
+                parts.append("{_}")
+        return "".join(parts)
+    return None
+
+
+def _ag013_norm_text(raw: str) -> str:
+    return " ".join(raw.replace("\u2265", ">=").replace("\u2264", "<=").split())
+
+
+def _ag013_is_source_ref_call(node: ast.AST | None) -> bool:
+    if not isinstance(node, ast.Call):
+        return False
+    fn = node.func.id if isinstance(node.func, ast.Name) else (
+        node.func.attr if isinstance(node.func, ast.Attribute) else ""
+    )
+    return fn == "SourceRef"
+
+
+def _ag013_node_references_key(node: ast.AST, tainted: set[str]) -> bool:
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Name) and sub.id in tainted:
+            return True
+        if isinstance(sub, ast.Attribute) and sub.attr in _AG013_DISPATCH_KEYS:
+            return True
+    return False
+
+
+def _ag013_unwrap_dict_expr(node: ast.AST) -> ast.Dict | None:
+    if isinstance(node, ast.Call):
+        fn = node.func.id if isinstance(node.func, ast.Name) else (
+            node.func.attr if isinstance(node.func, ast.Attribute) else ""
+        )
+        if fn in {"MappingProxyType", "dict"} and len(node.args) == 1:
+            return _ag013_unwrap_dict_expr(node.args[0])
+        return None
+    if isinstance(node, ast.Dict) and node.keys:
+        if all(isinstance(k, ast.Constant) and isinstance(k.value, str) for k in node.keys):
+            return node
+    return None
+
+
+def _ag013_is_prose_string(text: str) -> bool:
+    stripped = text.strip()
+    if len(stripped) < _AG013_PRESCRIPTIVE_MIN_LEN:
+        return False
+    return (" " in stripped) or ("\n" in stripped) or any(ord(ch) > 127 for ch in stripped)
+
+
+def _ag013_dict_has_prose_values(node: ast.AST) -> bool:
+    dict_node = _ag013_unwrap_dict_expr(node)
+    if dict_node is None:
+        return False
+    for val in dict_node.values:
+        if isinstance(val, ast.Constant) and isinstance(val.value, str):
+            if _ag013_is_prose_string(val.value):
+                return True
+        elif isinstance(val, (ast.Tuple, ast.List)):
+            for elt in val.elts:
+                if isinstance(elt, ast.Constant) and isinstance(elt.value, str) and _ag013_is_prose_string(elt.value):
+                    return True
+    return False
+
+
+def _ag013_is_literal_map_expr(node: ast.AST) -> bool:
+    return _ag013_unwrap_dict_expr(node) is not None
+
+
+def _ag013_stmt_writes_guidance(stmts: Sequence[ast.stmt], *, is_guidance_fn: bool) -> bool:
+    for st in stmts:
+        for sub in ast.walk(st):
+            if isinstance(sub, (ast.Assign, ast.AnnAssign)):
+                targets = sub.targets if isinstance(sub, ast.Assign) else [sub.target]
+                for tgt in targets:
+                    if isinstance(tgt, ast.Name) and tgt.id in _AG013_GUIDANCE_TARGETS:
+                        return True
+                    if isinstance(tgt, ast.Attribute) and tgt.attr in _AG013_GUIDANCE_TARGETS:
+                        return True
+                    if isinstance(tgt, ast.Tuple):
+                        for elt in tgt.elts:
+                            if isinstance(elt, ast.Name) and elt.id in _AG013_GUIDANCE_TARGETS:
+                                return True
+            elif is_guidance_fn and isinstance(sub, ast.Return) and sub.value is not None:
+                if isinstance(sub.value, (ast.Constant, ast.JoinedStr, ast.BinOp, ast.Tuple)):
+                    return True
+    return False
+
+
+def _ag013_is_prescriptive_default(node: ast.AST, str_consts: Mapping[str, str]) -> str | None:
+    folded = _ag013_fold_export_str(node, str_consts)
+    if folded is None:
+        return None
+    stripped = folded.strip()
+    if stripped in _AG013_PLACEHOLDER_DEFAULTS or len(stripped) < _AG013_PRESCRIPTIVE_MIN_LEN:
+        return None
+    return stripped
+
+
+def _ag013_check_export_receipts(
+    tree: ast.Module,
+    docs: set[int],
+    parents: Mapping[ast.AST, ast.AST],
+    emit: Callable[[int, str, str, str], None],
+) -> None:
+    """Enforce zero canned prose, zero percentage L* targets, zero guessed .py paths, and zero AIV/CCU in export/."""
+    str_consts = _module_string_constants(tree)
+    literal_maps: set[str] = set()
+    for stmt in tree.body:
+        if isinstance(stmt, ast.Assign):
+            targets, value = stmt.targets, stmt.value
+        elif isinstance(stmt, ast.AnnAssign) and stmt.value is not None:
+            targets, value = (stmt.target,), stmt.value
+        else:
+            continue
+        if not _ag013_is_literal_map_expr(value):
+            continue
+        has_prose = _ag013_dict_has_prose_values(value)
+        for tgt in targets:
+            if isinstance(tgt, ast.Name):
+                literal_maps.add(tgt.id)
+                if has_prose and _AG013_HINT_TABLE_NAME_RE.search(tgt.id):
+                    emit(
+                        int(getattr(stmt, "lineno", 1)),
+                        "export_guidance_dispatch",
+                        tgt.id,
+                        f"canned prose hint table {tgt.id!r} forbidden in export/; emit typed receipts instead",
+                    )
+
+    for node in ast.walk(tree):
+        lineno = int(getattr(node, "lineno", 1))
+        if isinstance(node, (ast.Constant, ast.BinOp, ast.JoinedStr)):
+            if isinstance(node, ast.Constant) and (not isinstance(node.value, str) or id(node) in docs):
+                continue
+            parent = parents.get(node)
+            if isinstance(parent, (ast.BinOp, ast.JoinedStr)):
+                continue
+            folded = _ag013_fold_export_str(node, str_consts)
+            if folded is None:
+                continue
+            norm = _ag013_norm_text(folded)
+            if (
+                _AG013_EXPORT_PCT_HARD_RE.search(norm)
+                or _AG013_EXPORT_PCT_LSTAR_RE.search(norm)
+                or _AG013_EXPORT_LSTAR_PCT_RE.search(norm)
+            ):
+                emit(
+                    lineno, "export_percent_target", norm[:48],
+                    f"hardcoded percentage/L* efficiency target {folded!r} forbidden in export/",
+                )
+            in_source_ref = _ag013_is_source_ref_call(parent) or (
+                isinstance(parent, ast.keyword) and _ag013_is_source_ref_call(parents.get(parent))
+            )
+            if not in_source_ref and _AG013_EXPORT_SOURCE_PATH_RE.search(folded):
+                emit(
+                    lineno, "export_source_path_guess", folded[:48],
+                    f"guessed upstream .py source path {folded!r} forbidden in export/; use verified SourceRef",
+                )
+            if _AG013_ACLGRAPH_CATCHALL in folded:
+                emit(
+                    lineno, "export_unbound_guidance", _AG013_ACLGRAPH_CATCHALL,
+                    "catch-all canned guidance '避免 ACLGraph 图断裂' forbidden in export/",
+                )
+            if _AG013_AIV_CCU_RE.search(folded):
+                emit(
+                    lineno, "export_unbound_guidance", "aiv_ccu_hybrid",
+                    f"hybrid AIV/CCU label {folded!r} forbidden in export/; isolate A5 CCU vs A2/A3 AIV",
+                )
+
+        if isinstance(node, ast.BoolOp) and isinstance(node.op, ast.Or) and len(node.values) >= 2:
+            head, tail = node.values[0], node.values[-1]
+            head_is_src = (
+                (isinstance(head, ast.Name) and head.id == "source_ref")
+                or (isinstance(head, ast.Attribute) and head.attr == "source_ref")
+            )
+            if head_is_src:
+                tail_str = _ag013_fold_export_str(tail, str_consts)
+                if tail_str and ".py" in tail_str:
+                    emit(
+                        lineno, "export_source_path_guess", tail_str[:48],
+                        f"fallback guessed source_ref path {tail_str!r} forbidden in export/",
+                    )
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "get"
+            and len(node.args) >= 2
+            and isinstance(node.args[0], ast.Constant)
+            and node.args[0].value == "source_ref"
+        ):
+            def_str = _ag013_fold_export_str(node.args[1], str_consts)
+            if def_str and ".py" in def_str:
+                emit(
+                    lineno, "export_source_path_guess", def_str[:48],
+                    f"fallback .get('source_ref', {def_str!r}) forbidden in export/",
+                )
+
+    for fn_node in ast.walk(tree):
+        if not isinstance(fn_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        is_guidance_fn = bool(_AG013_GUIDANCE_FUNC_RE.search(fn_node.name))
+        tainted: set[str] = {
+            arg.arg for arg in (*fn_node.args.posonlyargs, *fn_node.args.args, *fn_node.args.kwonlyargs)
+            if arg.arg in _AG013_DISPATCH_KEYS
+        }
+        body_nodes = list(_scope_nodes(fn_node.body))
+        for sub in body_nodes:
+            if isinstance(sub, (ast.Assign, ast.AnnAssign)) and sub.value is not None:
+                targets = sub.targets if isinstance(sub, ast.Assign) else [sub.target]
+                is_key_derived = _ag013_node_references_key(sub.value, tainted)
+                for tgt in targets:
+                    if isinstance(tgt, ast.Name):
+                        if is_key_derived:
+                            tainted.add(tgt.id)
+                        if tgt.id in _AG013_GUIDANCE_TARGETS:
+                            _ag013_check_guidance_rhs(
+                                sub.value, int(getattr(sub, "lineno", 1)), tgt.id,
+                                tainted, literal_maps, str_consts, emit,
+                            )
+                    elif isinstance(tgt, ast.Attribute) and tgt.attr in _AG013_GUIDANCE_TARGETS:
+                        _ag013_check_guidance_rhs(
+                            sub.value, int(getattr(sub, "lineno", 1)), tgt.attr,
+                            tainted, literal_maps, str_consts, emit,
+                        )
+        for sub in body_nodes:
+            lineno = int(getattr(sub, "lineno", 1))
+            if isinstance(sub, ast.If):
+                if _ag013_node_references_key(sub.test, tainted) and _ag013_stmt_writes_guidance(
+                    (*sub.body, *sub.orelse), is_guidance_fn=is_guidance_fn,
+                ):
+                    emit(
+                        lineno, "export_guidance_dispatch", fn_node.name,
+                        f"op-key prose dispatch branch in {fn_node.name!r} forbidden in export/",
+                    )
+            elif isinstance(sub, ast.Match):
+                if _ag013_node_references_key(sub.subject, tainted) and any(
+                    _ag013_stmt_writes_guidance(case.body, is_guidance_fn=is_guidance_fn)
+                    for case in sub.cases
+                ):
+                    emit(
+                        lineno, "export_guidance_dispatch", fn_node.name,
+                        f"op-key match prose dispatch in {fn_node.name!r} forbidden in export/",
+                    )
+            elif is_guidance_fn and isinstance(sub, ast.Return) and sub.value is not None:
+                _ag013_check_guidance_rhs(
+                    sub.value, lineno, fn_node.name, tainted, literal_maps, str_consts, emit,
+                )
+
+
+def _ag013_check_guidance_rhs(
+    rhs: ast.AST,
+    lineno: int,
+    target_name: str,
+    tainted: set[str],
+    literal_maps: set[str],
+    str_consts: Mapping[str, str],
+    emit: Callable[[int, str, str, str], None],
+) -> None:
+    if isinstance(rhs, ast.Subscript) and isinstance(rhs.value, ast.Name) and rhs.value.id in literal_maps:
+        if _ag013_node_references_key(rhs.slice, tainted):
+            emit(
+                lineno, "export_guidance_dispatch", f"{rhs.value.id}->{target_name}",
+                f"literal prose map lookup {rhs.value.id}[...] feeding {target_name!r} forbidden in export/",
+            )
+    elif (
+        isinstance(rhs, ast.Call)
+        and isinstance(rhs.func, ast.Attribute)
+        and rhs.func.attr == "get"
+    ):
+        if (
+            isinstance(rhs.func.value, ast.Name)
+            and rhs.func.value.id in literal_maps
+            and rhs.args
+            and _ag013_node_references_key(rhs.args[0], tainted)
+        ):
+            emit(
+                lineno, "export_guidance_dispatch", f"{rhs.func.value.id}->{target_name}",
+                f"literal prose map .get() on {rhs.func.value.id!r} feeding {target_name!r} forbidden in export/",
+            )
+        if len(rhs.args) >= 2:
+            prescriptive = _ag013_is_prescriptive_default(rhs.args[1], str_consts)
+            if prescriptive is not None:
+                emit(
+                    lineno, "export_unbound_guidance", f"{target_name}:get_default",
+                    f"unbound prescriptive .get() default {prescriptive!r} on {target_name!r} forbidden in export/",
+                )
+    elif isinstance(rhs, ast.BoolOp) and isinstance(rhs.op, ast.Or) and len(rhs.values) >= 2:
+        prescriptive = _ag013_is_prescriptive_default(rhs.values[-1], str_consts)
+        if prescriptive is not None:
+            emit(
+                lineno, "export_unbound_guidance", f"{target_name}:or_default",
+                f"unbound prescriptive fallback {prescriptive!r} on {target_name!r} forbidden in export/",
+            )
+    elif isinstance(rhs, ast.IfExp) and _ag013_node_references_key(rhs.test, tainted):
+        if (
+            _ag013_is_prescriptive_default(rhs.body, str_consts) is not None
+            or _ag013_is_prescriptive_default(rhs.orelse, str_consts) is not None
+        ):
+            emit(
+                lineno, "export_guidance_dispatch", f"ifexp->{target_name}",
+                f"op-key conditional prose expression feeding {target_name!r} forbidden in export/",
+            )
+    elif isinstance(rhs, ast.Tuple):
+        for elt in rhs.elts:
+            prescriptive = _ag013_is_prescriptive_default(elt, str_consts)
+            if prescriptive is not None:
+                emit(
+                    lineno, "export_unbound_guidance", f"{target_name}:tuple_literal",
+                    f"canned guidance literal {prescriptive!r} returned by {target_name!r} forbidden in export/",
+                )
 
 
 def _ag013_is_string_table_expr(node: ast.AST) -> bool:
@@ -801,6 +1155,8 @@ def _check_ag013_anti_hardcoding(rel: PurePosixPath, tree: ast.Module) -> list[V
             ))
 
     _ag013_check_module_string_tables(tree, _emit, top)
+    if top == "export":
+        _ag013_check_export_receipts(tree, docs, _parents(tree), _emit)
     for node in ast.walk(tree):
         lineno = int(getattr(node, "lineno", 1))
         if isinstance(node, ast.Constant) and isinstance(node.value, str):

@@ -693,3 +693,60 @@ def test_fail_closed_physical_defaults_across_geometry_memory_binding_loader_and
     assert sealed["primitives"]["P18_hccl_collective_band"]["status"] == "unmeasured"
     assert "link_bytes_per_s" not in sealed["primitives"]["P18_hccl_collective_band"]["metrics"]
     assert "peer_bytes_per_s" not in sealed["primitives"]["P19_direct_peer_window"]["metrics"]
+
+
+def test_ag013_export_receipts_blocks_canned_prose_paths_targets_and_hybrid_labels(tmp_path):
+    proj = tmp_path / "repo"
+    exp = proj / "mindie_sim" / "export"
+    exp.mkdir(parents=True)
+
+    # Failing fixtures covering all 4 new AG013 export receipt rules (including split strings & renamed tables).
+    (exp / "bad_prose.py").write_text(
+        'from types import MappingProxyType\n'
+        '_CUSTOM_KERNEL_HINTS = {"matmul": "Tune Cube tiling and double buffer"}\n'
+        '_RENAMED_MAP = MappingProxyType({"rmsnorm": "Use fused vector kernel"})\n'
+        'def build_card(op, raw_map, source_ref, pct):\n'
+        '    t1 = "目标 7" + "8% HBM L*"\n'
+        '    t2 = f"L* 达成率 >= {pct}%"\n'
+        '    t3 = "≥ 75% Cube"\n'
+        '    p1 = "vllm_ascend/ops/linear.py"\n'
+        '    p2 = source_ref or "vllm/ops/fused.py"\n'
+        '    p3 = raw_map.get("source_ref", "cann/ops/norm.py")\n'
+        '    g1 = "避免 ACLGraph 图断裂"\n'
+        '    g2 = "AIV/CCU small packet"\n'
+        '    g3 = "CCU / AIV mode"\n'
+        '    k = op.ascend_kernel.lower()\n'
+        '    kernel_action = _RENAMED_MAP.get(k, "Fallback prescriptive tuning prose")\n'
+        '    action_note = ""\n'
+        '    if k.endswith("norm"):\n'
+        '        action_note = "Fuse vector epilogue"\n'
+        '    framework_action = raw_map.get("fw") or "Register custom op in framework"\n'
+        '    return (t1, t2, t3, p1, p2, p3, g1, g2, g3, kernel_action, action_note, framework_action)\n',
+        encoding="utf-8",
+    )
+
+    # Clean passing fixture: factual measurements, verified SourceRef, token-alias table, arch-isolated labels.
+    valid_rev, valid_sha = "a" * 40, "b" * 64
+    (exp / "clean_receipts.py").write_text(
+        'from mindie_sim.schema.datapath import SourceRef\n'
+        '_TOKEN_ALIASES = {"gemm": ("matmul", "mm")}\n'
+        f'REF = SourceRef(repository="vllm-ascend", revision="{valid_rev}", '
+        f'relative_path="vllm_ascend/ops/linear.py", source_sha256="{valid_sha}")\n'
+        'def render_receipt(lstar_us: float, raw_note: str):\n'
+        '    fmt = "0.0%"\n'
+        '    meas = f"L*={lstar_us:.2f} us"\n'
+        '    a5_lbl, a3_lbl = "A5 CCU", "A3 AIV"\n'
+        '    kernel_action = raw_note or ""\n'
+        '    return (fmt, meas, a5_lbl, a3_lbl, kernel_action, REF)\n',
+        encoding="utf-8",
+    )
+
+    findings = [v for v in arch_gov.scan_repository(proj) if v.rule == "AG013"]
+    assert {v.path.as_posix() for v in findings} == {"mindie_sim/export/bad_prose.py"}
+    fps = {v.fingerprint for v in findings}
+    assert any("export_percent_target" in fp for fp in fps)
+    assert any("export_source_path_guess" in fp for fp in fps)
+    assert any("export_guidance_dispatch" in fp for fp in fps)
+    assert any("export_unbound_guidance" in fp for fp in fps)
+    assert any("aiv_ccu_hybrid" in fp for fp in fps)
+
