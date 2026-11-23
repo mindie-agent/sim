@@ -243,6 +243,66 @@ class _Strategy:
 STRATEGY: ArchStrategy = _Strategy()
 
 NATIVE_PROTOCOL_KIND = "arch22_v2_caller"
+DISPATCH_FFN_COMBINE_ABI = "aclnnDispatchFFNCombine"
+DISPATCH_FFN_COMBINE_W4A8_ABI = "aclnnDispatchFFNCombineW4A8"
+DISPATCH_FFN_COMBINE_ENTRY = "torch_npu.npu_moe_distribute_dispatch_ffn_combine"
+MEGAMOE_ABI = "aclnnMegaMoe"
+MEGAMOE_ENTRY = "cann_ops_transformer.ops.mega_moe"
+_FUSED_MC2_MODE_DISPATCH = 1
+_FUSED_MC2_MODE_MEGAMOE = 2
+_INT4_WEIGHT_FORMATS = frozenset({"int4", "w4a8"})
+_DISPATCH_FFN_SOURCE = {
+    "repository": "vllm-project/vllm-ascend",
+    "revision": "405617bae227fe5b097ff163efaa60bb7f22c698",
+    "relative_path": "csrc/mc2/dispatch_ffn_combine/dispatch_ffn_combine_torch_adpt.h",
+    "source_sha256": "b22b033d36406958bdf87de1489d207377836b0dfbfbc17148743952ddd35094",
+}
+
+
+def fused_mc2_native_binding(weight_dtype: str = "int8", *, fused_level: int = _FUSED_MC2_MODE_DISPATCH) -> dict:
+    """Resolve the exact Arch22 (A3) fused MoE MC2 public identity and ACLNN symbol."""
+    level = int(fused_level or _FUSED_MC2_MODE_DISPATCH)
+    if level > _FUSED_MC2_MODE_MEGAMOE:
+        raise ModelingError("arch22_fused_mc2_mode3_requires_arch35")
+    if level == _FUSED_MC2_MODE_MEGAMOE:
+        return {
+            "public_name": MEGAMOE_ABI,
+            "api": {
+                "namespace": "aclnn",
+                "entry": MEGAMOE_ENTRY,
+                "aclnn_symbol": MEGAMOE_ABI,
+            },
+            "source": _DISPATCH_FFN_SOURCE,
+            "execution_core": "mix",
+        }
+    w_fmt = str(weight_dtype or "int8").strip().lower()
+    is_w4 = w_fmt in _INT4_WEIGHT_FORMATS
+    public_name = "dispatch_ffn_combine_w4_a8" if is_w4 else "dispatch_ffn_combine"
+    symbol = DISPATCH_FFN_COMBINE_W4A8_ABI if is_w4 else DISPATCH_FFN_COMBINE_ABI
+    return {
+        "public_name": public_name,
+        "api": {
+            "namespace": "aclnn",
+            "entry": DISPATCH_FFN_COMBINE_ENTRY,
+            "aclnn_symbol": symbol,
+        },
+        "source": _DISPATCH_FFN_SOURCE,
+        "execution_core": "mix",
+    }
+
+
+def common_native_protocol(chosen, fused_level, moe_comm):
+    """Describe the Arch22 (A3) protocol selected by common MoE communication selection."""
+    return {
+        "kind": NATIVE_PROTOCOL_KIND,
+        "arch_family": "A3",
+        "dispatch_quant": "per_token_int8",
+        "max_inflight_per_rank": None,
+        "selection": "moe_comm_config",
+        "selected_method": chosen,
+        "fused_mc2_level": int(fused_level or 0),
+        "moe_comm": moe_comm,
+    }
 
 
 def validate_native_protocol(raw):
@@ -262,11 +322,70 @@ def native_protocol_recipes(selected):
     return mc2_local_caller.recipes(selected)
 
 
+def _rebind_fused_mc2_op(ops, fused_level: int, weight_dtype: str):
+    """Project Arch22 (A3) fused MoE native binding onto the lowered fused MC2 op."""
+    from dataclasses import replace
+
+    binding = fused_mc2_native_binding(weight_dtype, fused_level=fused_level)
+    public_name = binding["public_name"]
+    api = binding["api"]
+    rebuilt = []
+    for item in ops:
+        if item.recipe != "megamoe_arch35":
+            rebuilt.append(item)
+            continue
+        meta = dict(item.metadata)
+        meta["native_kind"] = public_name
+        meta["aclnn_symbol"] = api["aclnn_symbol"]
+        meta["native_source"] = binding["source"]
+        meta["fused_mc2_level"] = int(fused_level)
+        meta["native_call"] = {
+            "api": dict(api),
+            "source": binding["source"],
+            "kernels": ({"name": public_name, "role": "fused_moe_mc2", "evidence": "source_declared"},),
+            "execution_core": binding["execution_core"],
+        }
+        rebuilt.append(replace(item, metadata=tuple(meta.items())))
+    return rebuilt
+
+
 def lower_native_protocol(
     ops, *, selected, runtime, prefix, tokens, top_k, width, experts, ep,
     source_partitions, received_assignments, dtype, source_routing=None,
     valid_tokens=None, source_rows_by_replica=None, destination_rows_by_rank=None,
 ):
+    if selected.get("selection") == "moe_comm_config":
+        by_id = {op.op_id: op for op in ops}
+        gate = by_id.get(prefix + ".expert_up")
+        gmeta = dict(gate.metadata) if gate is not None else {}
+        if selected.get("selected_method") == "fused_mc2" and received_assignments:
+            parallel_cfg = getattr(runtime, "parallel", None)
+            has_redundant = int(getattr(parallel_cfg, "redundant_experts_per_rank", 0) or 0) > 0
+            if not has_redundant and all(
+                prefix + sfx in by_id for sfx in (".pack", ".dispatch", ".combine", ".unpack")
+            ):
+                from . import megamoe as mc2_megamoe
+
+                fused_lvl = min(
+                    _FUSED_MC2_MODE_MEGAMOE,
+                    max(_FUSED_MC2_MODE_DISPATCH, int(selected.get("fused_mc2_level") or _FUSED_MC2_MODE_DISPATCH)),
+                )
+                pack, dispatch, combine, unpack = (
+                    by_id[prefix + sfx] for sfx in (".pack", ".dispatch", ".combine", ".unpack")
+                )
+                fused = mc2_megamoe.try_lower_fused_frame(
+                    ops, by_id, {**selected, "fused_mc2_level": fused_lvl},
+                    runtime, prefix, tokens, width, top_k, received_assignments,
+                    ep, dtype, pack, dispatch, combine, unpack, by_id.get(prefix + ".pack.quantize"),
+                    allow_int8_arch22=True,
+                )
+                if fused is not None:
+                    w_fmt = str(gmeta.get("weight_format") or gmeta.get("activation_format") or "int8")
+                    return _rebind_fused_mc2_op(fused, fused_lvl, w_fmt)
+        if gmeta.get("activation_format") != "int8":
+            return ops
+        if selected.get("max_inflight_per_rank") is None:
+            selected = {**selected, "max_inflight_per_rank": max(1, int(ep) - 1)}
     return mc2_local_caller.lower(
         ops, selected=selected, runtime=runtime, prefix=prefix, tokens=tokens,
         top_k=top_k, width=width, experts=experts, ep=ep,

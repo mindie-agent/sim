@@ -270,7 +270,9 @@ def _hcomm_algorithm(fabric, collective, ranks, size, expansion, *, is_multi_pac
                 return "one_shot_mesh"
             if collective == "reduce_scatter":
                 return "mesh"
-        if expansion is None and collective == "alltoall":
+        if collective in {"alltoall", "alltoallv"} and (
+            expansion is None or (fabric == "hccs_optical" and expansion == "aiv")
+        ):
             return "direct_mesh"
         if collective == "allreduce" and expansion in (None, "aiv", "aicpu"):
             aiv = size <= A3_AIV_NODE_BYTES if ranks <= K8_RANKS else size < A3_AIV_POD_BYTES

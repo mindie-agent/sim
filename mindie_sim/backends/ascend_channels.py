@@ -460,62 +460,42 @@ OPTICAL_SUPERPOD_EVIDENCE_ID = (
 
 def _a3_superpod_optical_bands(superpod_size: int, latency_us: float) -> list[dict]:
     max_group = max(OPTICAL_MIN_GROUP, int(superpod_size))
-    return [
-        {
-            "collective": "all",
+    tiers = (
+        ("small", 0, OPTICAL_SMALL_MAX_EXCLUSIVE, OPTICAL_SMALL_FRAME_BYTES, OPTICAL_MID_FRAME_BYTES),
+        ("mid", OPTICAL_SMALL_MAX_EXCLUSIVE, OPTICAL_MID_MAX_EXCLUSIVE, OPTICAL_MID_FRAME_BYTES, OPTICAL_MID_CREDIT_BYTES),
+        ("large", OPTICAL_MID_MAX_EXCLUSIVE, None, OPTICAL_LARGE_FRAME_BYTES, OPTICAL_LARGE_CREDIT_BYTES),
+    )
+    bands: list[dict] = []
+    for tier, lo, hi, frame_bytes, credit_bytes in tiers:
+        common = {
             "stack_id": "default",
             "topology_scope": "cross_node",
             "group_min": OPTICAL_MIN_GROUP,
             "group_max": max_group,
-            "expansion_mode": "ring",
-            "payload_min_inclusive": 0,
-            "payload_max_exclusive": OPTICAL_SMALL_MAX_EXCLUSIVE,
-            "algorithm": "ring",
-            "protocol": "hccs_optical_small",
+            "payload_min_inclusive": lo,
+            "payload_max_exclusive": hi,
+            "protocol": f"hccs_optical_{tier}",
             "startup_scope": OPTICAL_STARTUP_SCOPE,
             "startup_us": float(latency_us),
-            "payload_bytes_per_frame": OPTICAL_SMALL_FRAME_BYTES,
-            "wire_bytes_per_frame": OPTICAL_SMALL_FRAME_BYTES,
-            "credit_bytes": OPTICAL_MID_FRAME_BYTES,
+            "payload_bytes_per_frame": frame_bytes,
+            "wire_bytes_per_frame": frame_bytes,
+            "credit_bytes": credit_bytes,
             "evidence_id": OPTICAL_SUPERPOD_EVIDENCE_ID,
-        },
-        {
+        }
+        bands.append({
             "collective": "all",
-            "stack_id": "default",
-            "topology_scope": "cross_node",
-            "group_min": OPTICAL_MIN_GROUP,
-            "group_max": max_group,
             "expansion_mode": "ring",
-            "payload_min_inclusive": OPTICAL_SMALL_MAX_EXCLUSIVE,
-            "payload_max_exclusive": OPTICAL_MID_MAX_EXCLUSIVE,
             "algorithm": "ring",
-            "protocol": "hccs_optical_mid",
-            "startup_scope": OPTICAL_STARTUP_SCOPE,
-            "startup_us": float(latency_us),
-            "payload_bytes_per_frame": OPTICAL_MID_FRAME_BYTES,
-            "wire_bytes_per_frame": OPTICAL_MID_FRAME_BYTES,
-            "credit_bytes": OPTICAL_MID_CREDIT_BYTES,
-            "evidence_id": OPTICAL_SUPERPOD_EVIDENCE_ID,
-        },
-        {
-            "collective": "all",
-            "stack_id": "default",
-            "topology_scope": "cross_node",
-            "group_min": OPTICAL_MIN_GROUP,
-            "group_max": max_group,
-            "expansion_mode": "ring",
-            "payload_min_inclusive": OPTICAL_MID_MAX_EXCLUSIVE,
-            "payload_max_exclusive": None,
-            "algorithm": "ring",
-            "protocol": "hccs_optical_large",
-            "startup_scope": OPTICAL_STARTUP_SCOPE,
-            "startup_us": float(latency_us),
-            "payload_bytes_per_frame": OPTICAL_LARGE_FRAME_BYTES,
-            "wire_bytes_per_frame": OPTICAL_LARGE_FRAME_BYTES,
-            "credit_bytes": OPTICAL_LARGE_CREDIT_BYTES,
-            "evidence_id": OPTICAL_SUPERPOD_EVIDENCE_ID,
-        },
-    ]
+            **common,
+        })
+        for coll in ("alltoall", "alltoallv"):
+            bands.append({
+                "collective": coll,
+                "expansion_mode": "aiv",
+                "algorithm": "direct_mesh",
+                **common,
+            })
+    return bands
 
 
 def _generated_links(combined, raw, preset, channels, count, per_package,

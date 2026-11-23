@@ -194,7 +194,7 @@ def emit_index_cache_write(
             read_bytes_override=read_bytes, write_bytes_override=write_bytes,
             shape=(max(total_rows, comp_rows), width),
             metadata=metadata + (
-                ("native_kind", "qsa_dual_page_cache_write"), ("read_pipe", "aiv"), ("compress_ratio", ratio),
+                ("read_pipe", "aiv"), ("compress_ratio", ratio),
                 ("raw_circular_rows", raw_tail_rows), ("compressed_rows", comp_rows), ("native_source", QSA_CACHE_SOURCE),
             ),
         ), slot_bytes)]
@@ -213,7 +213,7 @@ def emit_index_cache_write(
             read_bytes_override=read_bytes, write_bytes_override=write_bytes,
             shape=(max(total_rows, summary_rows), head_count, width),
             metadata=metadata + (
-                ("native_kind", "step5_csa_summary_update"), ("read_pipe", "aiv"), ("region_block_size", region),
+                ("read_pipe", "aiv"), ("region_block_size", region),
                 ("summary_rows", summary_rows), ("summary_reduction", "ssmax"), ("native_source", STEP5_SUMMARY_SOURCE),
             ),
         ), slot_bytes)]

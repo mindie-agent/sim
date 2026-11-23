@@ -55,10 +55,26 @@ def _text(value):
 
 
 def _source_record(raw):
-    if not isinstance(raw, dict) or not raw:
+    if raw is None:
         return None
-    record = {"repository": _text(raw.get("repository")), "path": _text(raw.get("path")),
-              "sha256": _text(raw.get("sha256")), "symbol": _text(raw.get("symbol")),
+    if not isinstance(raw, dict):
+        if hasattr(raw, "relative_path") or hasattr(raw, "source_sha256"):
+            raw = {
+                "repository": getattr(raw, "repository", None),
+                "relative_path": getattr(raw, "relative_path", None),
+                "source_sha256": getattr(raw, "source_sha256", None),
+                "revision": getattr(raw, "revision", None),
+                "symbol": getattr(raw, "symbol", None),
+                "state": getattr(raw, "state", None),
+            }
+        else:
+            return None
+    if not raw:
+        return None
+    record = {"repository": _text(raw.get("repository")),
+              "path": _text(raw.get("path") or raw.get("relative_path")),
+              "sha256": _text(raw.get("sha256") or raw.get("source_sha256")),
+              "symbol": _text(raw.get("symbol")),
               "revision": _text(raw.get("revision") or raw.get("base_revision")),
               "state": _text(raw.get("source_state") or raw.get("state")) or "unknown"}
     return record if record["path"] or record["sha256"] else None
@@ -190,17 +206,22 @@ def _kernel_records(op, meta, children):
             # The expansion join is a logical barrier, never a child kernel.
             continue
         child_meta = dict(child.metadata)
+        child_call = child_meta.get("native_call") or child_meta.get("native_call_binding")
+        if isinstance(child_call, dict) and child_call.get("kernels"):
+            records.extend(_normalize_kernels(child_call.get("kernels", ())))
+            continue
         implementation = child_meta.get("native_implementation") or {}
-        name = (child_meta.get("native_kind")
-                or (implementation.get("native_kinds") or [None])[0]
-                or child.recipe or child.family)
+        name = (_text(child_meta.get("native_kind"))
+                or _text((implementation.get("native_kinds") or [None])[0]))
+        if not name:
+            # Never promote internal simulator recipe or family identifiers.
+            continue
         source = _first_source(child_meta) or {}
         records.append({
             "name": str(name), "role": _text(child_meta.get("kernel_role")) or "unknown",
             "source_path": source.get("path"), "source_sha256": source.get("sha256"),
             "launch_shape": list(child.launch_shape) if child.launch_shape else None,
-            "evidence": ("source_declared" if child_meta.get("native_kind")
-                         or implementation else "unresolved")})
+            "evidence": "source_declared"})
     unique = {}
     for record in records:
         unique.setdefault(record["name"], record)

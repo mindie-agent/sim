@@ -59,7 +59,7 @@ def _fragment(declaration, *, views, plan, occurrence=None):
         occurrence=occurrence,
         semantic_refs=(SemanticRef('subgraph', 'mla_attention', role='mla_decode'),),
         attrs=(
-            SemanticAttr('native_kind', 'FusedInferAttentionScore',
+            SemanticAttr('native_kind', declaration.get('native_kind') or 'FusedInferAttentionScore',
                          source='source_binding'),
             SemanticAttr('implementation', declaration['implementation'],
                          source='selected_program'),

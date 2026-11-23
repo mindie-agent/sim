@@ -234,7 +234,33 @@ def lower_attention(ops, outputs, *, selection, views, plan, topk_present, prefi
                 if quant_mode is not None else COMPRESSED_CACHE_ROW_BYTES,
                 "kv_quant_mode": quant_mode,
                 "compressed_cache": effective_ratio > 0},
-            "native_kind": LEGACY_NATIVE_KIND if legacy else NATIVE_KIND}
+            "native_kind": LEGACY_NATIVE_KIND if legacy else NATIVE_KIND,
+            "aclnn_symbol": None if legacy else NATIVE_KIND,
+            "native_call": {
+                "api": {
+                    "namespace": "cann_kernel" if legacy else "aclnn",
+                    "entry": (
+                        "cannbot_dsl.mixed_quant_sparse_flash_mla"
+                        if legacy else "cann_ops_transformer.ops.mixed_quant_sparse_flash_mla"
+                    ),
+                    "aclnn_symbol": None if legacy else NATIVE_KIND,
+                },
+                "source": LEGACY_SOURCE if legacy else SOURCE,
+                "kernels": [{
+                    "name": "MixedQuantSparseFlashMla",
+                    "role": "mix",
+                    "source_path": (
+                        LEGACY_SOURCE["kernel"]["path"]
+                        if legacy else SOURCE["path"]
+                    ),
+                    "source_sha256": (
+                        LEGACY_SOURCE["kernel"]["sha256"]
+                        if legacy else None
+                    ),
+                    "evidence": "source_declared",
+                }],
+                "execution_core": "mix",
+            }}
     result = replace(members[0], op_id=prefix + ".mqsmla",
                      recipe=LEGACY_RECIPE if legacy else RECIPE,
                      deps=tuple(dict.fromkeys(dep for op in members for dep in op.deps)),

@@ -456,7 +456,7 @@ class OneShotGroup:
     """Single-round concurrent direct collective conserving physical wire bytes.
 
     All remote peers transmit concurrently in one round over their routed links.
-    ``startup_ms`` carries the hardware-derived AIV/CCU kernel launch floor
+    ``startup_ms`` carries the hardware-derived vector kernel launch floor
     (from SKU ``kernel_invocations["vector"]`` / L0 ``P15``+``P16``) charged
     once at the joint synchronization boundary; each routed hop still pays its
     own physical propagation latency ``hop.latency_ms`` and link bandwidth.

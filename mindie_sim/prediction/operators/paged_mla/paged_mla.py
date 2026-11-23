@@ -22,15 +22,19 @@ from .paged_mla_dispatch import Dispatch
 from mindie_sim.prediction.operators.paged_mla import paged_mla_host_v2
 
 IMPLEMENTATION = 'ascend_paged_mla_decode_arch35'
+NATIVE_KIND = 'FlashMla'
+ACLNN_SYMBOL = 'aclnnFlashMla'
+NATIVE_ENTRY = 'cann_ops_transformer.ops.flash_mla'
 SOURCE = {
     'repository': 'cann/ops-transformer',
-    'branch': 'arch35 BF16 noquant paged MLA',
-    'kernel': 'attention/fused_infer_attention_score/op_kernel/arch35/fia_kernel_noquant_mla.h',
-    'cube': 'attention/fused_infer_attention_score/op_kernel/arch35/fia_block_cube_noquant_mla.h',
-    'vector': 'attention/fused_infer_attention_score/op_kernel/arch35/fia_block_vec_noquant_mla.h',
-    'sha256': {'kernel': 'e2de9d747702b384de60e67e62d584dced476e47ace5f68a235af61e018dbbbb',
-               'cube': 'c7ecef63fb1754133d8b2588b297cb4621a72a82d3faea6945d10a440ee21574',
-               'vector': '176bd97f6286611570cf99549395a6b23d74ecd212fc9cd5d8d13ebb417b87b8'},
+    'revision': '2d3f4f6db0231ac2e9e487cf62e94f6e173eb946',
+    'branch': 'arch35 BF16 noquant FlashMLA',
+    'relative_path': 'attention/flash_mla/op_kernel/arch35/flash_mla_block_cube.h',
+    'source_sha256': 'a6369c827ddca2d5d6a03e8cd058c0331eb9c63b416e3ebb6d83f633b5bf01da',
+    'cube': 'attention/flash_mla/op_kernel/arch35/flash_mla_block_cube.h',
+    'vector': 'attention/flash_mla/op_kernel/arch35/flash_mla_block_vec.h',
+    'sha256': {'cube': 'a6369c827ddca2d5d6a03e8cd058c0331eb9c63b416e3ebb6d83f633b5bf01da',
+               'vector': 'e57170b54c8a97e60d2500604c24a4623d7aef3356be49b55a98411d5e7e7a3f'},
     'scope': 'M64/S2_128/D512/rope64; declared split count; source-compatible not binary identity',
 }
 KEY_TILE = 128

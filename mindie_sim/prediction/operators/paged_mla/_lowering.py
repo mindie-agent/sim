@@ -937,9 +937,12 @@ def make_plan(op: OpSpec, ctx: OperatorPlanningContext, c: PagedMlaContract,
         preds = {"release0": ("partial0",), "release1": ("partial1", "release0")}.get(
             step, (phases[-1].phase_id,) if phases else ())
         phases.append(PipelinePhase(step, preds, items))
+    from .common import ABI_PUBLIC_IDENTITY
+    public_name, native_entry, native_ns = ABI_PUBLIC_IDENTITY.get(c.abi, (c.abi, "", "aclnn"))
     return OperatorPlan(
         total, builder, metadata={
             "implementation": c.abi, "arch_id": ctx.compute_arch.arch_id, "governed_family": FAMILY,
+            "native_kind": public_name, "native_entry": native_entry, "native_namespace": native_ns,
             "s2_base_size": c.s2_base_size, "key_tile": layout.key_tile, "dqk": c.dqk, "dv": c.dv,
             "useful_matrix_flops": c.useful_matrix_flops, "issued_matrix_flops": c.issued_matrix_flops,
             "latent_record_bytes": 0 if c.mixed_quant else latent_record_bytes(c, dtype=dtype),

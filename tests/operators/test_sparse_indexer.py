@@ -783,3 +783,43 @@ def test_arch22_v1_lightning_indexer_charges_per_group_q_rows_on_heterogeneous_b
     done = plan.program(ctx).start(engine, "idx_v1", engine.submit("in"))
     engine.advance(until=(done,))
     assert {r: v for r, v in engine.serviced.items() if v} == pytest.approx(ctx.bind(plan.work))
+
+
+def test_internal_indexer_stage_does_not_leak_into_native_binding_or_export():
+    """Producer must never emit synthetic stage names as native_kind or child kernels."""
+    from _support.axes import REPRESENTATIVE_SKUS
+    from mindie_sim.compose import compose_case
+    from mindie_sim.export.kernel_catalog import resolve_ascend_kernel_identity
+    from mindie_sim.prediction.native_binding import bind_native_call
+    from mindie_sim.prediction.operators.sparse_indexer import index_cache_writer
+    from mindie_sim.prediction.structure import parse_case
+    from mindie_sim.schema.operators import OpSpec
+
+    # 1. step5_csa_summary_update and qsa_dual_page_cache_write carry no synthetic native_kind.
+    summary_op = index_cache_writer.emit_index_cache_write(
+        mode="step5_summary_update", op_id="l0.csa_summary", deps=(), stage=0, layer=0,
+        requests=("r",), phase="decode", rows=4, dim=64, block_size=16, input_dtype="bf16",
+    )[0]
+    smeta = dict(summary_op.metadata)
+    assert "native_kind" not in smeta
+    bound = bind_native_call(summary_op)
+    assert bound is not None
+    assert not any("step5_" in str(k.get("name", "")) for k in bound.kernels)
+    assert "step5_" not in str(bound.api.get("entry") or "")
+
+    # 2. _kernel_records never promotes child recipe or family names when undeclared.
+    _sh = dict(requests=("r",), semantic_shape=(1, 16), local_shape=(1, 16), padded_shape=(1, 16), launch_shape=(1, 16))
+    parent = OpSpec(op_id="l0.parent", family="indexer", recipe="indexer_parent", phase="decode", stage=0, layer=0, dtype="bf16", **_sh)
+    child = OpSpec(op_id="l0.child", family="internal_stage_family", recipe="step5_internal_stage", phase="decode", stage=0, layer=0, dtype="bf16", **_sh)
+    bound_parent = bind_native_call(parent, children=(child,))
+    assert bound_parent is not None
+    assert bound_parent.kernels == ()
+
+    # 3. Export projection stays honest empty rather than leaking internal stage names.
+    a5_case = parse_case(compose_case("deepseek-v3.2", REPRESENTATIVE_SKUS["a5"], dp=1, tp=2, ep=2, layers=4))
+    desc = resolve_ascend_kernel_identity(
+        summary_op.op_id, summary_op, summary_op.family, summary_op.recipe,
+        summary_op.local_shape, summary_op.dtype, a5_case, None, (),
+    )
+    assert "step5_" not in desc.ascend_kernel
+    assert desc.ascend_kernel not in {"aclnnCustomOp", "aclnnAdd / VectorOp"}

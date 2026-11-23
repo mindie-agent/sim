@@ -186,23 +186,50 @@ class ShippingAbiPredicate:
     supported_activations: frozenset[str] = frozenset()
     supported_dtypes: frozenset[str] = frozenset()
     supported_weight_dtypes: frozenset[str] = frozenset()
+    supported_arch_families: frozenset[str] = frozenset()
     supports_draft_scope: bool = True
 
     def supports_activation(self, activation: str) -> bool:
-        if not self.supported_activations or not activation:
+        if not self.supported_activations:
             return True
+        if not activation:
+            return False
         return activation.strip().lower() in self.supported_activations
 
     def supports_dtype(self, dtype: str) -> bool:
-        if not self.supported_dtypes or not dtype:
+        if not self.supported_dtypes:
             return True
+        if not dtype:
+            return False
         return dtype.strip().lower() in self.supported_dtypes
+
+    def supports_weight_dtype(self, weight_dtype: str) -> bool:
+        if not self.supported_weight_dtypes:
+            return True
+        if not weight_dtype:
+            return False
+        return weight_dtype.strip().lower() in self.supported_weight_dtypes
+
+    def supports_arch(self, arch_family: str) -> bool:
+        if not self.supported_arch_families:
+            return True
+        if not arch_family:
+            return False
+        return arch_family.strip().upper() in self.supported_arch_families
 
 
 _SHIPPING_STD_DTYPES = frozenset({
     "bf16", "bfloat16", "fp16", "float16", "int8", "fp8", "fp8_e4m3", "fp8_e5m2", "mxfp8",
 })
 _SHIPPING_STD_ACTIVATIONS = frozenset({"swiglu", "silu", "gelu"})
+_ARCH35_ARCH_ID = "npu_arch_3510"
+_ARCH22_ARCH_ID = "npu_arch_2201"
+_FUSED_MC2_MEGAMOE_MODE = 2
+_INT4_WEIGHT_DTYPES = frozenset({"int4", "w4a8"})
+_INT8_WEIGHT_DTYPES = frozenset({"int8", "w8a8"})
+_MEGAMOE_WEIGHT_DTYPES = frozenset({
+    "fp8", "fp8_e4m3", "fp8_e5m2", "mxfp8", "mxfp4", "mx_fp4", "fp4", "fp4_e2m1", "int8",
+})
 
 #: Typed capability predicates for shipping Tier-K1 composite CANN/HCCL ABIs.
 SHIPPING_ABI_PREDICATES: Mapping[str, ShippingAbiPredicate] = {
@@ -249,15 +276,75 @@ SHIPPING_ABI_PREDICATES: Mapping[str, ShippingAbiPredicate] = {
         supported_dtypes=_SHIPPING_STD_DTYPES,
         supports_draft_scope=True,
     ),
+    "aclnnMegaMoe": ShippingAbiPredicate(
+        abi_id="aclnnMegaMoe",
+        fusion_tier="K1_shipping",
+        pattern="moe_dispatch_ffn_combine",
+        supported_activations=_SHIPPING_STD_ACTIVATIONS,
+        supported_dtypes=_SHIPPING_STD_DTYPES,
+        supported_weight_dtypes=_MEGAMOE_WEIGHT_DTYPES,
+        supported_arch_families=frozenset({"A5", "A3"}),
+        supports_draft_scope=False,
+    ),
     "dispatch_ffn_combine": ShippingAbiPredicate(
         abi_id="dispatch_ffn_combine",
         fusion_tier="K1_shipping",
         pattern="moe_dispatch_ffn_combine",
         supported_activations=_SHIPPING_STD_ACTIVATIONS,
         supported_dtypes=_SHIPPING_STD_DTYPES,
+        supported_weight_dtypes=_INT8_WEIGHT_DTYPES,
+        supported_arch_families=frozenset({"A3"}),
+        supports_draft_scope=False,
+    ),
+    "dispatch_ffn_combine_w4_a8": ShippingAbiPredicate(
+        abi_id="dispatch_ffn_combine_w4_a8",
+        fusion_tier="K1_shipping",
+        pattern="moe_dispatch_ffn_combine",
+        supported_activations=_SHIPPING_STD_ACTIVATIONS,
+        supported_dtypes=_SHIPPING_STD_DTYPES,
+        supported_weight_dtypes=_INT4_WEIGHT_DTYPES,
+        supported_arch_families=frozenset({"A3"}),
         supports_draft_scope=False,
     ),
 }
+
+
+def _resolve_arch_family(
+    datapath: DatapathCapabilitySpec | None, arch_family: str = "",
+) -> str:
+    explicit = str(arch_family or "").strip().upper()
+    if explicit in {"A2", "A3", "A5"}:
+        return explicit
+    arch_id = str(getattr(getattr(datapath, "compute_arch", None), "arch_id", "") or "")
+    if arch_id == _ARCH35_ARCH_ID:
+        return "A5"
+    if arch_id == _ARCH22_ARCH_ID:
+        return "A3"
+    return ""
+
+
+def resolve_shipping_moe_predicate(
+    arch_family: str,
+    *,
+    weight_dtype: str = "",
+    enable_fused_mc2: int | None = None,
+) -> ShippingAbiPredicate | None:
+    """Resolve the architecture-qualified shipping fused-MoE predicate (zero cross-gen leak)."""
+    arch = str(arch_family or "").strip().upper()
+    w_fmt = str(weight_dtype or "").strip().lower()
+    if arch == "A5":
+        return SHIPPING_ABI_PREDICATES["aclnnMegaMoe"]
+    if arch == "A3":
+        if enable_fused_mc2 == _FUSED_MC2_MEGAMOE_MODE:
+            return SHIPPING_ABI_PREDICATES["aclnnMegaMoe"]
+        if w_fmt in _INT4_WEIGHT_DTYPES:
+            return SHIPPING_ABI_PREDICATES["dispatch_ffn_combine_w4_a8"]
+        return SHIPPING_ABI_PREDICATES["dispatch_ffn_combine"]
+    if arch == "A2":
+        return None
+    if w_fmt in _MEGAMOE_WEIGHT_DTYPES - _INT8_WEIGHT_DTYPES:
+        return SHIPPING_ABI_PREDICATES["aclnnMegaMoe"]
+    return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -448,6 +535,8 @@ def _resolve_symbolic_kind(
     if fam in _CONCAT_COLLECTIVE_FAMILIES:
         return "allgather"
     if fam in _PERMUTE_COLLECTIVE_FAMILIES:
+        if "combine" in rec:
+            return "combine"
         return "dispatch" if fam == "dispatch" or "dispatch" in rec else "alltoall"
     if trait == AlgebraicTrait.VIEW_METADATA:
         return "view_copy"
@@ -1073,16 +1162,40 @@ def _has_moe_dispatch_combine_frame(
     traits: Mapping[str, OpTraitInfo],
     succ: Mapping[str, list[str]],
 ) -> bool:
-    has_dispatch = any(
-        dep in by_id and traits[dep].symbolic_op_kind in {"dispatch", "alltoall"}
-        for dep in op.deps
-    )
-    if not has_dispatch:
+    """Require a complete connected ``dispatch -> GMM1 -> gate [-> quant] -> GMM2 -> combine`` frame."""
+    dispatch_ops = [
+        by_id[dep] for dep in op.deps
+        if dep in by_id and traits[dep].symbolic_op_kind in {"dispatch", "alltoall"}
+        and _same_domain(by_id[dep], op)
+    ]
+    if not dispatch_ops:
+        return False
+    disp_axes = {
+        str(dict(d.metadata).get("group_axis") or traits[d.op_id].collective_axis or "").strip().lower()
+        for d in dispatch_ops
+    }
+    disp_axes.discard("")
+    if disp_axes and disp_axes != {"ep"}:
         return False
     for nxt_id in succ.get(tail.op_id, ()):
         if nxt_id not in by_id or not traits[nxt_id].is_grouped_matmul:
             continue
-        if any(u in by_id and traits[u].symbolic_op_kind == "combine" for u in succ.get(nxt_id, ())):
+        gmm2 = by_id[nxt_id]
+        if not _same_domain(tail, gmm2):
+            continue
+        for comb_id in succ.get(nxt_id, ()):
+            if comb_id not in by_id or traits[comb_id].symbolic_op_kind != "combine":
+                continue
+            comb = by_id[comb_id]
+            if not _same_domain(gmm2, comb):
+                continue
+            comb_axis = str(
+                dict(comb.metadata).get("group_axis") or traits[comb_id].collective_axis or ""
+            ).strip().lower()
+            if comb_axis and comb_axis != "ep":
+                continue
+            if disp_axes and comb_axis and comb_axis not in disp_axes:
+                continue
             return True
     return False
 
@@ -1098,10 +1211,12 @@ def _discover_gmm_act_candidates(
     trigger_keys: set[tuple[str, tuple[str, ...]]],
     *,
     include_abi_extensions: bool,
+    arch_family: str = "",
+    enable_fused_mc2: int | None = None,
 ) -> list[AlgebraicCandidate]:
-    """Match GroupedMatmul -> Activation (-> Quant) via typed ABI capability predicates."""
+    """Match GroupedMatmul -> Activation (-> Quant) via arch-qualified ABI capability predicates."""
     swiglu_pred = SHIPPING_ABI_PREDICATES["aclnnSwiGluQuant"]
-    moe_pred = SHIPPING_ABI_PREDICATES["dispatch_ffn_combine"]
+    eff_arch = _resolve_arch_family(datapath, arch_family)
     found: list[AlgebraicCandidate] = []
     for op in ordered:
         if op.op_id in claimed or not traits[op.op_id].is_grouped_matmul:
@@ -1122,14 +1237,33 @@ def _discover_gmm_act_candidates(
         m_ids = tuple(x.op_id for x in chain)
         if not _convex(ordered, set(m_ids)):
             continue
+        op_tr = traits[op.op_id]
         in_moe_frame = _has_moe_dispatch_combine_frame(op, chain[-1], by_id, traits, succ)
-        pred = moe_pred if in_moe_frame else swiglu_pred
-        supported = pred.supports_activation(act_tr.activation_kind)
+        moe_pred = (
+            resolve_shipping_moe_predicate(
+                eff_arch, weight_dtype=op_tr.weight_dtype, enable_fused_mc2=enable_fused_mc2,
+            )
+            if in_moe_frame else None
+        )
+        use_moe_abi = in_moe_frame and moe_pred is not None
+        pred = moe_pred if use_moe_abi else swiglu_pred
+        act_supported = pred.supports_activation(act_tr.activation_kind)
+        dtype_supported = pred.supports_dtype(op_tr.input_dtype)
+        weight_supported = (
+            not use_moe_abi or not op_tr.weight_dtype or pred.supports_weight_dtype(op_tr.weight_dtype)
+        )
+        supported = act_supported and dtype_supported and weight_supported
         fits, ub_pk, ub_cap = _check_ub_chain_fits(chain[1:], traits, datapath)
         if not supported:
             ext_abi = (
-                f"dispatch_ffn_combine_{act_tr.activation_kind}_ext"
-                if in_moe_frame else "GroupedMatmulCustomActQuant"
+                f"{pred.abi_id}_{act_tr.activation_kind}_ext"
+                if use_moe_abi else "GroupedMatmulCustomActQuant"
+            )
+            reason = (
+                f"activation={act_tr.activation_kind!r} not in shipping "
+                f"supported_activations={sorted(pred.supported_activations)}"
+                if not act_supported else
+                f"dtype={op_tr.input_dtype!r}/weight={op_tr.weight_dtype!r} outside shipping {pred.abi_id}"
             )
             _append_audit_trigger(
                 triggers,
@@ -1137,8 +1271,7 @@ def _discover_gmm_act_candidates(
                 traits,
                 "ABI_UNSUPPORTED_VARIANT",
                 chain,
-                f"activation={act_tr.activation_kind!r} not in shipping "
-                f"supported_activations={sorted(pred.supported_activations)}",
+                reason,
                 cand_abi=ext_abi,
             )
             if fits and include_abi_extensions:
@@ -1346,6 +1479,8 @@ def _discover_law1_and_law4_chains(
     datapath: DatapathCapabilitySpec | None,
     *,
     include_abi_extensions: bool = True,
+    arch_family: str = "",
+    enable_fused_mc2: int | None = None,
 ) -> tuple[list[AlgebraicCandidate], list[SemanticAuditTrigger]]:
     """Law 1 (UB pointwise/reduction chains) + Law 4 (pure view elision & ABI match)."""
     by_id = {op.op_id: op for op in ordered}
@@ -1354,6 +1489,8 @@ def _discover_law1_and_law4_chains(
     found = _discover_gmm_act_candidates(
         ordered, by_id, traits, claimed, succ, datapath, triggers, trigger_keys,
         include_abi_extensions=include_abi_extensions,
+        arch_family=arch_family,
+        enable_fused_mc2=enable_fused_mc2,
     )
     _collect_semantic_audit_triggers(ordered, by_id, traits, deps, succ, triggers, trigger_keys)
     found.extend(_discover_ub_chains(ordered, by_id, traits, claimed, deps, succ, datapath))
@@ -1396,6 +1533,8 @@ def discover_algebraic_rewrites_for_ops(
     datapath: DatapathCapabilitySpec | None = None,
     allow_mc2: bool = True,
     include_abi_extensions: bool = True,
+    arch_family: str = "",
+    enable_fused_mc2: int | None = None,
     base_graph_sha256: str = "",
     framing_sha256: str = "",
 ) -> AlgebraicRewriteResult:
@@ -1425,6 +1564,8 @@ def discover_algebraic_rewrites_for_ops(
     law1_cands, triggers = _discover_law1_and_law4_chains(
         ordered, traits, claimed, deps, succ, datapath,
         include_abi_extensions=include_abi_extensions,
+        arch_family=arch_family,
+        enable_fused_mc2=enable_fused_mc2,
     )
     candidates.extend(law1_cands)
 
@@ -1472,9 +1613,11 @@ def discover_algebraic_rewrites(
 
     meta = dict(scenario.case.runtime.metadata) if scenario.case.runtime.metadata else {}
     add_cfg = meta.get("additional_config") if isinstance(meta.get("additional_config"), Mapping) else {}
+    raw_mc2 = add_cfg.get("enable_fused_mc2")
+    fused_mc2_level = int(raw_mc2) if raw_mc2 is not None else None
     if allow_mc2 is None:
-        raw_mc2 = add_cfg.get("enable_fused_mc2")
-        allow_mc2 = (int(raw_mc2) != 0) if raw_mc2 is not None else True
+        allow_mc2 = (fused_mc2_level != 0) if fused_mc2_level is not None else True
+    arch_family = str(getattr(scenario.case.machine, "arch_family", "") or "")
 
     rep_ops = scenario.atomic_ops[0].ops if scenario.atomic_ops else ()
     raw_res = discover_algebraic_rewrites_for_ops(
@@ -1482,6 +1625,8 @@ def discover_algebraic_rewrites(
         datapath=scenario.datapath,
         allow_mc2=bool(allow_mc2),
         include_abi_extensions=include_abi_extensions,
+        arch_family=arch_family,
+        enable_fused_mc2=fused_mc2_level,
         base_graph_sha256=scenario.base_graph_sha256,
         framing_sha256=scenario.framing_sha256,
     )
@@ -1536,6 +1681,7 @@ __all__ = [
     "AlgebraicTrait",
     "ShippingAbiPredicate",
     "SHIPPING_ABI_PREDICATES",
+    "resolve_shipping_moe_predicate",
     "OpTraitInfo",
     "AlgebraicCandidate",
     "SemanticAuditTrigger",

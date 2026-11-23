@@ -15,9 +15,10 @@ from math import ceil
 from mindie_sim.schema.common import ModelingError, dtype_bytes
 
 _GDN_CALLER = "vllm_ascend_gdn_decode"
-# Dense paged-MLA source domains. A5 keeps source split-core v2 for every
-# integral local head count; A2/A3 use the page-tile kernel.
+# Dense paged-MLA source domains. A5 binds FlashMla (aclnnFlashMla) for
+# supported head counts; A2/A3 use the FIA page-tile kernel.
 MAX_PAGED_MLA_HEADS = 64
+FLASH_MLA_SUPPORTED_Q_HEADS = frozenset({8, 12, 64, 96})
 PAGED_MLA_A5_PAGE_TILE = 128
 ARCH22_PAGED_MLA_PAGE_TILE = 512
 # The arch22 split-core tile rounds local heads to these power-of-two ceilings.
@@ -734,9 +735,25 @@ def attention_defaults(case, phase, *, tokens=1):
                 "cases": [{"domain": domain, "binding": binding}],
                 "otherwise": "analytical",
             }
+        a5_flash_eligible = bool(
+            is_a5 and parallel.pcp == 1
+            and case.model.activation_dtype in {"bf16", "fp16"}
+            and case.model.quant.kv_dtype in {"bf16", "fp16"}
+            and all(
+                not p.window and not p.noncausal_attention
+                and (p.kv_lora_rank, p.qk_rope_head_dim) == PAGED_MLA_HEAD_GEOMETRY
+                and (p.num_heads // max(parallel.tp, 1)) in FLASH_MLA_SUPPORTED_Q_HEADS
+                and ((p.num_heads // max(parallel.tp, 1)) * max(parallel.cp, 1)) in FLASH_MLA_SUPPORTED_Q_HEADS
+                for p in dense_mla
+            )
+        )
         records.append({"family": "paged_mla_decode",
                         "selection": "preserved" if reason else "default_installed",
-                        "reason": reason or "supported_tensor_and_resource_geometry"})
+                        "reason": reason or "supported_tensor_and_resource_geometry",
+                        **({"abi": "aclnnFlashMla", "native_kind": "FlashMla"}
+                           if (is_a5 and (not reason or a5_flash_eligible))
+                           else ({"abi": "aclnnFusedInferAttentionScore", "native_kind": "FusedInferAttentionScore"}
+                                 if not reason else {}))})
     gdn = _gdn_default(case, phase, tokens, kernels)
     if gdn is not None:
         records.append(gdn)

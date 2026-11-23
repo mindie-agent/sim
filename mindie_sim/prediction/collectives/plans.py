@@ -694,7 +694,7 @@ class _TopologyPlansMixin:
         ``protocol_bands``, when explicit non-band ``transport`` options or
         non-band algorithms are requested, or when group size ``<= 1``.
         """
-        if algorithm not in {"ring", "pairwise"}:
+        if algorithm not in {"ring", "pairwise", "auto"}:
             return None
         if transport is not None:
             opts = (
@@ -763,6 +763,13 @@ class _TopologyPlansMixin:
                         return None
             elif norm_family != "alltoall":
                 return None
+        elif algorithm == "auto":
+            phases = {"allreduce": 2, "reduce_scatter": 1, "allgather": 1}
+            if norm_family in phases and "peer_traffic" not in metadata:
+                for ranks in unique_groups:
+                    rounds = max(phases[norm_family] * (len(ranks) - 1), 0)
+                    if metadata.get("steps", rounds) != rounds:
+                        return None
         peer = None
         if "peer_traffic" in metadata:
             if norm_family not in {"alltoall", "alltoallv"}:
