@@ -1,0 +1,42 @@
+{
+  "schema": "mindie-sim.stack-manifest/1",
+  "protocol_version": "mindie-sim.stack-adapter/1",
+  "stack_id": "diffusion-native",
+  "manifest_revision": "1.0.0",
+  "description": "Built-in Diffusion/DiT runtime stack adapter declaring denoise timesteps, latent patches, CFG branches, and optional encoder/VAE phases bound to prediction/operators/diffusion without fabricating LLM KV-Cache.",
+  "supported_domains": ["diffusion"],
+  "supported_work_units": ["denoise_timestep", "vae_decode", "text_encode"],
+  "default_work_unit": "denoise_timestep",
+  "supported_hardware_backends": ["ascend", "nvidia", "generic"],
+  "supported_phases": ["denoise_step", "vae_decode", "text_encode"],
+  "supported_checkpoint_formats": [
+    "modelslim_description",
+    "hf_quantization_config",
+    "unquantized_native",
+    "explicit_synthetic_preset"
+  ],
+  "supported_tracks": ["eager", "shipping", "proposed", "target"],
+  "default_track": "shipping",
+  "capture_mode": "full",
+  "allowed_rewrite_tracks": ["config"],
+  "allowed_rewrite_classes": ["shipping"],
+  "allowed_framework_rewrites": [],
+  "supported_recipe_ids": [
+    "mindie_sd_rainfusion",
+    "mindie_sd_ada_bsa",
+    "mindie_sd_eagle_bsa",
+    "mindie_sd_eagle_qbsa",
+    "mindie_sd_adalayernorm",
+    "mindie_sd_norm_rope_concat",
+    "mindie_sd_laurel",
+    "mindie_sd_quant_four_over_six_a5",
+    "mindie_sd_eagle_ffn"
+  ],
+  "lowering_passes": [],
+  "recipe_bindings": [
+    ["adalayernorm", "mindie_sd_adalayernorm", []],
+    ["norm_rope_concat", "mindie_sd_norm_rope_concat", []],
+    ["eagle_ffn", "mindie_sd_eagle_ffn", []]
+  ],
+  "has_launch_codec": false
+}

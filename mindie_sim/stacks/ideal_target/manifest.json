@@ -1,0 +1,77 @@
+{
+  "schema": "mindie-sim.stack-manifest/1",
+  "protocol_version": "mindie-sim.stack-adapter/1",
+  "stack_id": "ideal-target",
+  "manifest_revision": "1.0.0",
+  "description": "Pure hardware-limit target-modeling stack adapter enabling full Pillar A/B/C exploration on Engine while honoring on-disk CheckpointQuantMap precision boundaries.",
+  "supported_domains": ["llm", "vlm", "diffusion"],
+  "supported_work_units": [
+    "prefill_decode_step",
+    "vision_encode",
+    "denoise_timestep",
+    "vae_decode",
+    "text_encode"
+  ],
+  "supported_hardware_backends": ["ascend", "nvidia", "generic"],
+  "supported_phases": [
+    "prefill",
+    "decode",
+    "mixed",
+    "denoise_step",
+    "vae_decode",
+    "text_encode"
+  ],
+  "supported_checkpoint_formats": [
+    "modelslim_description",
+    "hf_quantization_config",
+    "unquantized_native",
+    "explicit_synthetic_preset"
+  ],
+  "supported_tracks": ["eager", "shipping", "proposed", "target"],
+  "default_track": "target",
+  "capture_mode": "full_and_piecewise",
+  "allowed_rewrite_tracks": ["config", "framework", "kernel_new", "kernel_tune"],
+  "allowed_rewrite_classes": [
+    "shipping",
+    "proposed_pr",
+    "synthesized_target",
+    "tiler_extension"
+  ],
+  "allowed_framework_rewrites": [
+    "merge_sibling_projections",
+    "bind_shipping_op",
+    "multistream_overlap",
+    "eliminate_graph_break"
+  ],
+  "supported_recipe_ids": [
+    "ascend_paged_mla_decode_arch35",
+    "ascend_paged_mla_decode_arch22",
+    "ascend_grouped_int32_dequant_swiglu",
+    "ascend_prepared_mx32_matrix",
+    "ascend_causal_conv1d_update",
+    "ascend_moe_init_routing_v3_mxfp8",
+    "aclnn_mixed_quant_sparse_flash_mla",
+    "cann_bf16_lightning_indexer_v2_complete",
+    "cann_quant_lightning_indexer_v2_complete",
+    "mindie_sd_rainfusion",
+    "mindie_sd_ada_bsa",
+    "mindie_sd_eagle_bsa",
+    "mindie_sd_eagle_qbsa",
+    "mindie_sd_adalayernorm",
+    "mindie_sd_norm_rope_concat",
+    "mindie_sd_laurel",
+    "mindie_sd_quant_four_over_six_a5",
+    "mindie_sd_eagle_ffn"
+  ],
+  "lowering_passes": [
+    "activation_quantization",
+    "residual_norm",
+    "activation_quant",
+    "qkv_norm_rope",
+    "gmm_swiglu_quant",
+    "moe_tail_residual",
+    "tp_mc2_overlap"
+  ],
+  "recipe_bindings": [],
+  "has_launch_codec": false
+}
