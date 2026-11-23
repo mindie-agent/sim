@@ -69,6 +69,10 @@ _NORM_FORMATS = {
     "fp32": "fp32", "float32": "fp32", "f32": "fp32",
     "bf16": "bf16", "bfloat16": "bf16",
 }
+MX_SCALE_GROUP_SIZE = 32
+_HIGH_PRECISION_WEIGHT_FORMATS = frozenset({
+    "bf16", "bfloat16", "fp16", "float16", "fp32", "float32",
+})
 
 
 def norm_role(name: str) -> str:
@@ -170,6 +174,8 @@ class QuantSpec:
             "scale_format", "scale_bytes", "activation_group_size",
             "activation_scale_format", "activation_scale_pack",
             "int8_weight_metadata", "output_format",
+            "runtime_weight_scale_format", "runtime_weight_scale_bytes",
+            "runtime_activation_scale_format", "runtime_int8_weight_metadata",
         }
         entries = (self.category_overrides.items() if isinstance(self.category_overrides, Mapping)
                    else self.category_overrides)
@@ -231,15 +237,21 @@ class QuantSpec:
     def linear_method(self, category: str) -> str:
         """Authoritative runtime linear method for one resolved role."""
         resolved = self.for_category(category)
-        wf = str(resolved.weight_format or "").lower().replace("-", "_")
+        wf = str(resolved.format_for(category) or "").lower().replace("-", "_")
+        if wf in _HIGH_PRECISION_WEIGHT_FORMATS:
+            return "dense"
         af = str(resolved.activation_format or "").lower().replace("-", "_")
         sf = str(resolved.scale_format or "").lower().replace("-", "_")
         block = resolved.weight_block
         group = int(block[1] if isinstance(block, (tuple, list)) and len(block) > 1 else 0)
-        mx_scale = sf in {"fp8_e8m0", "ue8m0"} and group == 32 and int(resolved.activation_group_size or 0) == 32
-        if mx_scale and wf in {"mxfp4", "mx_fp4", "mxfp4_e2m1"}:
+        exp_group = int(resolved.expert_block or 0)
+        mx_scale_fmt = sf in {"fp8_e8m0", "ue8m0"}
+        act_mx_group = int(resolved.activation_group_size or 0) == MX_SCALE_GROUP_SIZE
+        if mx_scale_fmt and (group == MX_SCALE_GROUP_SIZE or exp_group == MX_SCALE_GROUP_SIZE) and wf in {
+                "mxfp4", "mx_fp4", "mxfp4_e2m1", "fp4", "fp4_e2m1"}:
             return "mx_fp4"
-        if mx_scale and wf in {"mxfp8", "mx_fp8", "mxfp8_e4m3", "fp8_e4m3", "fp8_e5m2"} and af in {
+        if mx_scale_fmt and group == MX_SCALE_GROUP_SIZE and act_mx_group and wf in {
+                "mxfp8", "mx_fp8", "mxfp8_e4m3", "fp8_e4m3", "fp8_e5m2"} and af in {
                 "mxfp8", "mx_fp8", "mxfp8_e4m3", "fp8_e4m3", "fp8_e5m2"}:
             return "mx_fp8"
         if wf in {"int4", "w4a8", "int4_weight"}:

@@ -71,6 +71,16 @@ owns = [
   "scripts/check_arch_governance.py",
 ]
 
+[[module]]
+path = "schema/test_checkpoint_71_admission.py"
+tier = "tier0"
+owns = [
+  "mindie_sim/catalog/checkpoint_reader.py",
+  "mindie_sim/catalog/data/curated_checkpoints.json",
+  "mindie_sim/catalog/npu_checkpoints.py",
+  "scripts/build_curated_checkpoints.py",
+]
+
 # ---------------------------------------------------------------- runtime
 [[module]]
 path = "runtime/test_engine_core.py"

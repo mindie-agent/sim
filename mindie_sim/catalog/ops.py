@@ -26,7 +26,7 @@ from __future__ import annotations
 from typing import Any
 
 from mindie_sim.catalog.types import QuantSpec
-from mindie_sim.schema.operators import OpSpec
+from mindie_sim.schema.operators import LinearMethod, OpSpec, TensorPrecisionABI
 from mindie_sim.schema.common import ModelingError, align_up, dtype_bytes
 
 #: Fused groupwise INT4 kernels unpack two nibbles per stored byte, widen the
@@ -176,6 +176,105 @@ def _gemm_packed_and_epilogue_meta(
     return extra, vector_ops
 
 
+_HIGH_PRECISION_GEMM_FORMATS = frozenset({
+    "bf16", "bfloat16", "fp16", "float16", "fp32", "float32",
+})
+
+
+def precision_abi_for_gemm(
+    quant: QuantSpec,
+    category: str,
+    *,
+    activation_dtype: str = "",
+    output_dtype: str = "",
+    compute_dtype: str = "",
+    prequant_dtype: str = "",
+    act_group: int | None = None,
+    act_scale_format: str | None = None,
+    act_scale_bytes: float | None = None,
+) -> TensorPrecisionABI:
+    """Resolve the authoritative ``TensorPrecisionABI`` for one GEMM role."""
+    resolved = quant.for_category(category)
+    fmt = packed_weight_format(resolved, category)
+    default_compute, default_act = compute_dtype_for(resolved, category)
+    act = str(activation_dtype or default_act)
+    compute = str(compute_dtype or default_compute)
+    out_dt = matrix_output_format(
+        resolved, category, activation_dtype=act, output_dtype=output_dtype,
+        prequant=prequant_dtype or resolved.native_format or "",
+    )
+    high_prec = fmt in _HIGH_PRECISION_GEMM_FORMATS
+    if high_prec:
+        method: LinearMethod = "dense"
+        weight_block: tuple[int, ...] = ()
+        scale_dtype = ""
+        scale_bytes_int = 0
+        weight_meta: tuple[tuple[str, Any], ...] = ()
+    else:
+        raw_method = resolved.linear_method(category)
+        if fmt in {"int4", "w4a8"}:
+            raw_method = "w4a8" if act == "int8" else "w4a16"
+        method = raw_method  # type: ignore[assignment]
+        if fmt in {"mxfp4", "fp4", "fp4_e2m1", "int4", "w4a8"}:
+            weight_block = (1, max(1, int(resolved.expert_block)))
+        elif (
+            len(resolved.weight_block) == 2
+            and int(resolved.weight_block[0]) > 0
+            and int(resolved.weight_block[1]) > 0
+        ):
+            weight_block = (int(resolved.weight_block[0]), int(resolved.weight_block[1]))
+        else:
+            weight_block = ()
+        scale_dtype = str(resolved.execution_weight_scale_format())
+        scale_bytes_int = max(0, int(round(float(resolved.execution_weight_scale_bytes()))))
+        meta_items: list[tuple[str, Any]] = [
+            ("storage_scale_format", str(resolved.scale_format)),
+            ("storage_scale_bytes", float(resolved.scale_bytes)),
+        ]
+        if fmt in {"int8", "w8a8", "int4", "w4a8"}:
+            meta_items.append(("int8_weight_metadata", str(resolved.execution_int8_weight_metadata())))
+        weight_meta = tuple(meta_items)
+
+    has_act_scale = (act_scale_bytes is not None and act_scale_bytes > 0.0) or (
+        act_scale_bytes is None and act in _LOW_OUTPUT_ACTIVATIONS
+    )
+    if has_act_scale:
+        eff_act_group = int(act_group if act_group is not None else (resolved.activation_group_size or 0))
+        eff_act_scale = str(
+            act_scale_format
+            if act_scale_format is not None
+            else (
+                resolved.execution_activation_scale_format(act)
+                if act == "int8"
+                else (resolved.activation_scale_format or resolved.scale_format)
+            )
+        )
+        eff_act_pack = (
+            f"pack{int(resolved.activation_scale_pack)}"
+            if int(resolved.activation_scale_pack) > 1
+            else ("scalar" if eff_act_scale else "")
+        )
+    else:
+        eff_act_group, eff_act_scale, eff_act_pack = 0, "", ""
+
+    return TensorPrecisionABI(
+        linear_method=method,
+        input_dtype=act,
+        weight_dtype=fmt,
+        output_dtype=out_dt,
+        compute_dtype=compute,
+        accum_dtype="int32" if compute == "int8" else "fp32",
+        weight_layout=_layout_name(fmt, resolved),
+        weight_block=weight_block,
+        weight_scale_dtype=scale_dtype,
+        weight_scale_bytes=scale_bytes_int,
+        weight_metadata=weight_meta,
+        act_group_size=max(0, eff_act_group),
+        act_scale_dtype=eff_act_scale,
+        act_scale_pack=eff_act_pack,
+    )
+
+
 def gemm_op(
     *, op_id: str, deps: tuple[str, ...], stage: int, layer: int,
     requests: tuple[str, ...], m: int, n: int, k: int, quant: QuantSpec,
@@ -229,8 +328,18 @@ def gemm_op(
     weight_elements = (weight_bytes / bytes_per_weight
                        if bytes_per_weight > 0 else 0.0)
     recipe = recipe or semantic_family or family
+    abi = precision_abi_for_gemm(
+        quant, category,
+        activation_dtype=act, output_dtype=out_dtype, compute_dtype=compute,
+        prequant_dtype=prequant_dtype or quant.native_format or "",
+        act_group=group if scale_bytes > 0 else 0,
+        act_scale_format=scale_format if scale_bytes > 0 else "",
+        act_scale_bytes=scale_bytes,
+    )
     meta = tuple(metadata) + (
         ("semantic_family", semantic_family or family),
+        ("linear_method", abi.linear_method),
+        ("precision_abi_signature", abi.abi_signature),
         ("weight_format", fmt),
         ("weight_dtype", fmt),
         ("activation_format", act),
@@ -275,6 +384,7 @@ def gemm_op(
                               "weight_bytes_use_declared_packing"),
         metadata=meta + (("program_kind", "matmul"),), dtype=compute,
         layout=_layout_name(fmt, quant),
+        precision_abi=abi,
     )
 
 
@@ -493,5 +603,6 @@ def cache_store_op(
 
 __all__ = [
     "compute_dtype_for", "packed_weight_bytes", "packed_weight_format",
-    "gemm_op", "vector_op", "comm_op", "barrier_op", "cache_store_op",
+    "precision_abi_for_gemm", "gemm_op", "vector_op", "comm_op", "barrier_op",
+    "cache_store_op",
 ]

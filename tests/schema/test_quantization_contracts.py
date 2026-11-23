@@ -599,16 +599,17 @@ def test_named_dtype_preset_controls_each_cache_and_weight_format():
     assert graph[0]
 
 
-def test_routed_mxfp4_preset_quantizes_latent_moe_and_attn_res_projections():
+def test_routed_mxfp4_preset_keeps_attn_res_bf16_and_mxfp8_mxfp4_quantizes_latent_moe():
     q = quant_preset("mxfp4_routed_only")
     assert q.format_for("routed_expert") == "mxfp4"
-    assert q.format_for("latent_moe") == "mxfp4"
-    assert q.format_for("attn_res_proj") == "mxfp4"
-    overrides = {key: dict(val) for key, val in q.category_overrides}
-    assert overrides["latent_moe"]["activation_format"] == "fp8_e4m3"
-    assert overrides["attn_res_proj"]["activation_format"] == "fp8_e4m3"
-    for excluded in ("attn", "mla", "kda", "shared_expert", "dense_mlp", "router", "norm", "lm_head", "embedding", "vision"):
+    assert q.linear_method("routed_expert") == "mx_fp4"
+    assert q.format_for("latent_moe") == "bf16"
+    assert q.linear_method("latent_moe") == "dense"
+    assert q.format_for("attn_res_proj") == "bf16"
+    assert q.linear_method("attn_res_proj") == "dense"
+    for excluded in ("attn", "mla", "kda", "shared_expert", "dense_mlp", "router", "norm", "lm_head", "embedding", "vision", "attn_res_proj", "latent_moe"):
         assert q.format_for(excluded) == "bf16"
+        assert q.linear_method(excluded) == "dense"
 
     case = parse_case(compose_case(
         "kimi-k3.1", hardware=REPRESENTATIVE_SKUS["a5"], topology_preset="a5_pod",
@@ -620,7 +621,11 @@ def test_routed_mxfp4_preset_quantizes_latent_moe_and_attn_res_projections():
     assert by_name["mlp_res_proj"].category == "attn_res_proj"
     assert by_name["latent_down"].category == "latent_moe"
     assert by_name["latent_up"].category == "latent_moe"
-    assert term_bytes(by_name["latent_down"], case.model.quant, case.runtime.parallel) < 2 * 3584 * 7168
+    assert term_bytes(by_name["attn_res_proj"], case.model.quant, case.runtime.parallel) == 14336
+    assert term_bytes(by_name["latent_down"], case.model.quant, case.runtime.parallel) == 2 * 3584 * 7168
+    q_prod = quant_preset("mxfp8_mxfp4")
+    assert term_bytes(by_name["attn_res_proj"], q_prod, case.runtime.parallel) == 14336
+    assert term_bytes(by_name["latent_down"], q_prod, case.runtime.parallel) == 26492928
 
 
 def test_production_mxfp8_mxfp4_preset_and_hardware_aware_quant_selection():
@@ -628,7 +633,10 @@ def test_production_mxfp8_mxfp4_preset_and_hardware_aware_quant_selection():
     assert q.format_for("attn") == "fp8_e4m3"
     assert q.format_for("shared_expert") == "fp8_e4m3"
     assert q.format_for("routed_expert") == "mxfp4"
-    assert q.format_for("latent_moe") == "mxfp4"
+    assert q.format_for("latent_moe") == "fp8_e4m3"
+    assert q.linear_method("latent_moe") == "mx_fp8"
+    assert q.format_for("attn_res_proj") == "bf16"
+    assert q.linear_method("attn_res_proj") == "dense"
     assert q.format_for("norm") == "bf16" and q.format_for("router") == "bf16"
 
     moe_spec = load_model("kimi-k3.1")

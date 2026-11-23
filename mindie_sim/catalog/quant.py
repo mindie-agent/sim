@@ -73,7 +73,7 @@ MX_EXPERT_BLOCK = 32
 MX_EXPERT_SCALE_PACK = 2
 LONG_CONTEXT_KV_QUANT_THRESHOLD = 32768
 _STANDARD_MXFP4_EXCLUSIONS: tuple[str, ...] = (
-    "mtp", "norm", "router", "lm_head", "embedding", "mhc",
+    "mtp", "norm", "router", "lm_head", "embedding", "mhc", "attn_res_proj",
     "compressor", "vision", "projector", "conv_weight_f32", "conv_weight_bf16",
 )
 _MXFP4_ROUTED_ACTIVATION = {
@@ -82,8 +82,8 @@ _MXFP4_ROUTED_ACTIVATION = {
     "activation_scale_format": "fp8_e8m0",
     "activation_scale_pack": MX_EXPERT_SCALE_PACK,
 }
-_MXFP4_LINEAR_OVERRIDE = {
-    "weight_format": "mxfp4",
+_MXFP8_LINEAR_OVERRIDE = {
+    "weight_format": "fp8_e4m3",
     "weight_block": (1, MX_EXPERT_BLOCK),
     "expert_block": MX_EXPERT_BLOCK,
     "scale_format": "fp8_e8m0",
@@ -112,7 +112,7 @@ def _quant_deepseek(c: Mapping[str, Any], *, v41: bool) -> QuantSpec:
         index_dtype="int8", index_scale_dtype="fp16",
         # V4.1 executes the Engram gate as an MXFP8 (32, 32) projection; the
         # earlier V4 checkpoint keeps it in the BF16 exclusion set.
-        exclusions=(("router", "lm_head", "embedding", "norm", "mhc",
+        exclusions=(("router", "lm_head", "embedding", "norm", "mhc", "attn_res_proj",
                      "compressor", "vision", "projector")
                     + (() if v41 else ("engram_gate",))),
         source=merge_source({"quant_method": q.get("quant_method", "fp8"),
@@ -141,11 +141,11 @@ def _quant_glm(c: Mapping[str, Any]) -> QuantSpec:
         name="fp8_dynamic",
         weight_format="fp8_e4m3", activation_format="fp8_e4m3",
         expert_weight_format="fp8_e4m3",
-        weight_block=block, expert_block=32,
-        scale_format="fp32", scale_bytes=4.0,
+        weight_block=block, expert_block=MX_EXPERT_BLOCK,
+        scale_format="fp32", scale_bytes=FP32_SCALE_BYTES,
         activation_group_size=block[1], activation_scale_format="fp32",
         kv_dtype="bf16", index_dtype="bf16", index_scale_dtype="none",
-        exclusions=("router", "lm_head", "embedding", "norm", "mhc",
+        exclusions=("router", "lm_head", "embedding", "norm", "mhc", "attn_res_proj",
                     "compressor", "vision", "projector")
         + (tuple("module:" + name for name in excludes) if excludes else ()),
         source=merge_source({"quant_method": q.get("quant_method", "fp8"),
@@ -168,17 +168,16 @@ def _quant_kimi(c: Mapping[str, Any]) -> QuantSpec:
         category_overrides={
             "routed_expert": _MXFP4_ROUTED_ACTIVATION,
             "dspark_routed_expert": _MXFP4_ROUTED_ACTIVATION,
-            "latent_moe": _MXFP4_LINEAR_OVERRIDE,
-            "attn_res_proj": _MXFP4_LINEAR_OVERRIDE,
         },
         exclusions=("attn", "mla", "kda", "shared_expert", "dense_mlp",
+                    "latent_moe", "attn_res_proj",
                     "router", "lm_head", "embedding", "norm", "mhc",
                     "vision", "projector", "conv_weight_f32"),
         source=merge_source({"quant_method": q.get("quant_method", "compressed-tensors"),
                              "format": q.get("format", "mxfp4-pack-quantized")}),
-        notes=("MXFP4 group32 applies to routed expert, latent MoE (down/up) and "
-               "AttnRes projection matrices with FP8 E4M3 activations and E8M0 "
-               "microscales; attention/shared/dense/router/LM-head/vision stay BF16",),
+        notes=("MXFP4 group32 applies only to routed expert matrices with FP8 E4M3 "
+               "activations and E8M0 microscales; attention/shared/dense/latent_moe/"
+               "attn_res_proj/router/LM-head/vision stay BF16",),
     )
 
 
@@ -200,14 +199,14 @@ def _quant_qwen_mxfp8() -> QuantSpec:
         name="W8A8_MXFP8",
         weight_format="fp8_e4m3", activation_format="fp8_e4m3",
         expert_weight_format="fp8_e4m3",
-        weight_block=(1, 32), expert_block=32,
+        weight_block=(1, MX_EXPERT_BLOCK), expert_block=MX_EXPERT_BLOCK,
         scale_format="fp8_e8m0", scale_bytes=1.0,
-        activation_group_size=32, activation_scale_format="fp8_e8m0", activation_scale_pack=2,
+        activation_group_size=MX_EXPERT_BLOCK, activation_scale_format="fp8_e8m0", activation_scale_pack=2,
         kv_dtype="bf16", index_dtype="bf16", index_scale_dtype="none",
         # ``gdn``: every GDN linear_attn projection is stored BF16 in this
         # checkpoint; ``mtp``: the draft/MTP layer is BF16 too.  Leaving them
         # unexcluded priced 1 872 GDN projection calls at p4096 on the FP8 row.
-        exclusions=("gdn", "mtp", "norm", "lm_head", "embedding", "vision",
+        exclusions=("gdn", "mtp", "norm", "lm_head", "embedding", "attn_res_proj", "vision",
                     "projector", "conv_weight_f32", "conv_weight_bf16"),
         source=merge_source({
             "quant_method": "mxfp8",
@@ -264,7 +263,7 @@ def _quant_w8a8_dynamic() -> QuantSpec:
             "attn.o": {"output_format": "bf16"},
         },
         kv_dtype="bf16", index_dtype="bf16", index_scale_dtype="none",
-        exclusions=("mtp", "norm", "router", "lm_head", "embedding", "mhc",
+        exclusions=("mtp", "norm", "router", "lm_head", "embedding", "mhc", "attn_res_proj",
                     "compressor", "vision", "projector",
                     "conv_weight_f32", "conv_weight_bf16"),
         source=merge_source({
@@ -304,7 +303,7 @@ def _quant_w4a8_dynamic() -> QuantSpec:
         weight_block=(1, 1), expert_block=1,
         scale_format="fp32", scale_bytes=FP32_SCALE_BYTES,
         kv_dtype="bf16", index_dtype="bf16", index_scale_dtype="none",
-        exclusions=("mtp", "norm", "router", "lm_head", "embedding", "mhc",
+        exclusions=("mtp", "norm", "router", "lm_head", "embedding", "mhc", "attn_res_proj",
                     "compressor", "vision", "projector",
                     "conv_weight_f32", "conv_weight_bf16"),
         source=merge_source({
@@ -329,6 +328,32 @@ def _quant_fp16() -> QuantSpec:
         index_scale_dtype="none", native_format="fp16",
         exclusions=(), source=merge_source({"quantization": "none"}),
         notes=("no weight quantization declared; compute and activation are FP16",),
+    )
+
+
+def _quant_w4a4_mxfp4(
+    *, exclusions: tuple[str, ...] = _STANDARD_MXFP4_EXCLUSIONS,
+) -> QuantSpec:
+    return QuantSpec(
+        name="W4A4_MXFP4", weight_format="mxfp4", activation_format="fp4_e2m1",
+        expert_weight_format="mxfp4",
+        weight_block=(1, MX_EXPERT_BLOCK),
+        expert_block=MX_EXPERT_BLOCK,
+        scale_format="fp8_e8m0", scale_bytes=1.0,
+        activation_group_size=MX_EXPERT_BLOCK,
+        activation_scale_format="fp8_e8m0",
+        activation_scale_pack=MX_EXPERT_SCALE_PACK,
+        kv_dtype="bf16", index_dtype="bf16", index_scale_dtype="none",
+        exclusions=exclusions,
+        source=merge_source({
+            "quant_method": "w4a4_mxfp4",
+            "weight_block_size": "1x32",
+            "scale_fmt": "ue8m0",
+        }),
+        notes=(
+            "MXFP4 group32 weights and FP4 E2M1 activations with E8M0 microscales",
+            "MTP, norms, router, embedding, LM head, mHC, attn_res_proj, vision and conv stay BF16/FP32",
+        ),
     )
 
 
@@ -374,8 +399,7 @@ def _quant_w4a8_mxfp() -> QuantSpec:
         category_overrides={
             "routed_expert": _MXFP4_ROUTED_ACTIVATION,
             "dspark_routed_expert": _MXFP4_ROUTED_ACTIVATION,
-            "latent_moe": _MXFP4_LINEAR_OVERRIDE,
-            "attn_res_proj": _MXFP4_LINEAR_OVERRIDE,
+            "latent_moe": _MXFP8_LINEAR_OVERRIDE,
         },
         exclusions=_STANDARD_MXFP4_EXCLUSIONS,
         source=merge_source({
@@ -384,8 +408,9 @@ def _quant_w4a8_mxfp() -> QuantSpec:
             "scale_fmt": "ue8m0",
         }),
         notes=(
-            "MXFP8 group32 linears + MXFP4 group32 routed experts with FP8 E4M3 activations",
-            "norm, router, embedding, LM head, MTP, mHC, vision and conv stay BF16/FP32",
+            "MXFP8 group32 linears (including latent MoE) + MXFP4 group32 routed experts "
+            "with FP8 E4M3 activations",
+            "norm, router, embedding, LM head, MTP, mHC, attn_res_proj, vision and conv stay BF16/FP32",
         ),
     )
 
@@ -406,8 +431,7 @@ def _quant_mxfp8_mxfp4() -> QuantSpec:
         category_overrides={
             "routed_expert": _MXFP4_ROUTED_ACTIVATION,
             "dspark_routed_expert": _MXFP4_ROUTED_ACTIVATION,
-            "latent_moe": _MXFP4_LINEAR_OVERRIDE,
-            "attn_res_proj": _MXFP4_LINEAR_OVERRIDE,
+            "latent_moe": _MXFP8_LINEAR_OVERRIDE,
         },
         exclusions=_STANDARD_MXFP4_EXCLUSIONS,
         source=merge_source({
@@ -418,9 +442,8 @@ def _quant_mxfp8_mxfp4() -> QuantSpec:
         }),
         notes=(
             "Ascend A5 production quantization (QuaRot/msmodelslim): MXFP8 group32 on "
-            "MLA/GQA/KDA/GDN/shared/dense linears + MXFP4 group32 on routed experts, "
-            "latent MoE down/up, and AttnRes projections",
-            "norm, router, embedding, LM head, MTP, mHC, vision and conv stay BF16/FP32",
+            "MLA/GQA/KDA/GDN/shared/dense/latent_moe linears + MXFP4 group32 on routed experts",
+            "norm, router, embedding, LM head, MTP, mHC, attn_res_proj, vision and conv stay BF16/FP32",
         ),
     )
 
@@ -471,7 +494,10 @@ QUANTIZATION_PRESETS: dict[str, Any] = {
     "w4a8-mxfp4": _quant_w4a8_mxfp,
     "mxfp4_w4a8": _quant_w4a8_mxfp,
     "mxfp4": _quant_mxfp4_all,
+    "w4a4_mxfp4": _quant_w4a4_mxfp4,
+    "w4a4-mxfp4": _quant_w4a4_mxfp4,
     "mxfp4_all": lambda: _quant_mxfp4_all(exclusions=()),
+    "fp8_dynamic+mxfp4_experts": lambda: _quant_deepseek({}, v41=True),
     "mxfp4_routed_only": lambda: _quant_kimi({}),
     "w8a8_dynamic": _quant_w8a8_dynamic,
     "w8a8": _quant_w8a8_dynamic,
