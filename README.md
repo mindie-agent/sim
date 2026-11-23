@@ -27,19 +27,18 @@
 在昇腾（Ascend）NPU 上优化算子或大模型推理（如 DeepSeek、Qwen、GLM、Kimi 在 A2 / A3 / A5 上的 `DP × TP × EP × PP × DCP / DSA-CP / PCP` 部署与 PD 分离服务）时，最消耗工程时间的往往不是写代码，而是**在没有物理依据的方向上盲目试错**：
 
 - **“这个算子或整网到底卡在哪一维硬件资源？”** —— 仅凭粗略的 `FLOPs / 峰值算力` 估算会忽略片上 `UB`/`L1` 容量对齐、尾块（tile tail）开销、多流并发争用以及 Kernel 启动固定耗时（`startup_ms` / `minimum_ms`）。`mindie-sim` 对每个算子、子图和整网显式分解 **`Cube_MFU`、`Vec_MFU`、`MBU`、`Link_Util` 与 `CV_Overlap`**，直接指出瓶颈属于 `memory_bound`、`cube_bound`、`vector_bound`、`link_bound` 还是 `launch_bound`。
-- **“这个算子或整网距离硬件理论极限还有多少真实可挖掘的优化空间？”** —— 在动手重写 AscendC / Triton 融合算子之前，可以通过五级 Primal-Dual 认证优化阶梯（`optimize_ladder`），由 Lean 4 证明的理论下界 $L^*_{\text{Lean}}$ 与可执行重排/融合方案（$A^*_{\text{DSL/CATLASS+Fusion}} \le A^*_{\text{Framework}} \le \min(M, U)$）定量给出可实现的优化收益。
-- **“在 Decode TPOT `<= 30 ms` 的 SLA 约束下，当前硬件最多能跑多大并发？如果升级带宽或算力呢？”** —— 通过硬件缩放与 SLA 吞吐求解器（`solve_sla_sizing`），一行调用即可联合求解显存容量上限 `B*_VRAM`、SLA 延迟上限 `B*_SLA` 以及不同硬件缩放场景（如 `2x HBM`、`2x Compute`、`2x Cube`、`2x HBM + 2x Compute`）下的最大吞吐（`tokens/s`）。
-- **“怎么用同一套机制同时分析单算子、局部子图、算子回调与整网在线服务？”** —— `mindie-sim` 采用**单一统一因果引擎（`prediction.engine.Engine`）**，算子评估（`operators`）、共享设备资源子图（`graph`）、完整回调协议（`call`）、多方案对比（`study`）与整网/PD 分离预测（`predict` / `predict_pd`）全部基于同一套物理工作量与因果资源调度契约。
+- **“这个算子或整网距离硬件理论极限还有多少真实可挖掘的优化空间？”** —— 在动手重写 `TileLang / AscendC / Catlass` 融合算子之前，可以通过 4 阶段 / 3 责任人因果瀑布（`Before -> Graph_cfg -> Graph_fwk -> Graph_After`）与五级 Primal-Dual 认证优化阶梯（`optimize_ladder`），由 Lean 4 证明的理论下界 $L^*_{\text{Lean}}$ 与同引擎可达成方案（$A^*_{\text{DSL/CATLASS+Fusion}} \le A^*_{\text{Framework}} \le \min(M, U)$）定量给出可实现的优化收益。
+- **“在 Decode TPOT `<= 30 ms` 的 SLA 约束下，当前硬件最多能跑多大并发？如果升级带宽或算力呢？”** —— 通过全网格部署求解器（`solve_deployment`）与硬件缩放 SLA 求解器（`solve_sla_sizing`），在显式四形态部署契约（`colocated | pd_disaggregated | pd_prefill | pd_decode`）下联合求解统一逐 Die 显存账本（`ResidentMemoryReceipt`）、SLA 延迟上限与跨硬件缩放吞吐（`tokens/s`）。
+- **“怎么用同一套机制同时分析单算子、局部子图、多框架栈与整网在线服务？”** —— `mindie-sim` 采用**运行时无关的单主干架构（`Core <-> RuntimeStackAdapter`）**与**唯一离散事件因果引擎（`prediction.runtime.engine.Engine` + 唯一 `PrimitiveTable`）**，所有推理栈插件（`vllm-ascend`、`diffusion-native`、`ideal-target`、`raw-eager` 及自定义清单）与算子/子图/纯模型/服务求解全部运行在同一套物理守恒契约上。
 
 ```mermaid
 flowchart TB
-    Input["📥 输入规格与实测证据<br/>(Case JSON / 源模型目录 / 硬件配置 / Profiler 结构映射与观测库)"]
-    Frontend["🧱 结构解析与物理工作量展开 (schema / catalog / frontend)<br/>(Attention / MLA / GDN / KDA / MoE 路由 / 量化与 KV Cache 容量规划)"]
-    Program["⚙️ 算子资源程序与流水建模 (program / matrix / invocations)<br/>(M/N/K 分块与尾块 · Cube/Vector/MTE/HBM/Link 并发服务 · 启动下界约束)"]
-    Engine["🔗 统一因果事件引擎 (prediction.engine.Engine)<br/>(operators 独立算子 · graph 共享资源子图 · call 回调协议 · predict 整网服务)"]
-    Analysis["🧭 四维效率、Primal-Dual 认证优化阶梯与 SLA 硬件缩放求解 (efficiency / optimization / study)<br/>(Cube_MFU · Vec_MFU · MBU · Link_Util · CV_Overlap · L*_Lean 认证下界 · B*_SLA 吞吐)"]
+    Input["📥 唯一强类型入参 (Resolve Once)<br/>(ModelIR + 流式 71 份 CheckpointQuantMap + 硬件/原语表 + 显式 4 形态 SLA + RuntimeStackAdapter)"]
+    Lower["🧱 插件降维与可执行图 (stacks/ -> Unified GraphIR)<br/>(TensorPrecisionABI · 逐层 CacheStateABI · KernelBinding · OwnerScheduleSpec)"]
+    Engine["🔗 唯一因果执行引擎与内存真值 (Engine + PrimitiveTable + ResidentMemoryLedger)<br/>(精确原生层 Cohort 回放 0 ns 漂移 · O((N+G)log(N+G)) 扫描线归因 · 逐 Die 同时并存峰值)"]
+    Analysis["🧭 四阶段三责任人瀑布、全网格寻优与纯四表导出 (sweep/ · optimization/ · export/public_view.py)<br/>(4D 效率 · L* 物理下界 · CoDesignOpportunity [TileLang/AscendC/Catlass] · 纯 4 表 XLSX / trace / agent_brief)"]
 
-    Input --> Frontend --> Program --> Engine --> Analysis
+    Input --> Lower --> Engine --> Analysis
 ```
 
 ---
@@ -48,23 +47,30 @@ flowchart TB
 
 ### 一行开箱即用评估与启动脚本调优（推荐首选）
 
-`mindie-sim report` 默认自动求解 HBM 安全的并行策略（`DP/TP/EP/DCP/PP` + 并发）与芯片匹配的 `auto_va` 生产量化（**优先推荐 `*-QuaRot` 权重 / `msmodelslim` QuaRot 离群值旋转**），一次运行即可输出 `.xlsx` 对比表、`trace_view.json`（MindStudio Insight 原生打开）、紧凑 `<8 KB` 的 `*_agent_brief.json` 与终端 Markdown 结论摘要：
+`mindie-sim report` 强制要求显式指定四形态 `--deployment-mode`（`colocated | pd_disaggregated | pd_prefill | pd_decode`，或由 `--from-script` 静态唯一推导，零静默猜测、零 `5000.0 ms` TTFT 强转）并按模型域自动路由 `--stack`（LLM/VLM -> `vllm-ascend`，Diffusion/DiT -> `diffusion-native`），一次运行即可输出**纯 4 可见表（0 隐藏表、Sheet 2 `A:AA` 27 列、Sheet 3 默认 `"As evaluated"`、Sheet 4 活区间公式）**的 `.xlsx` 对比表、`trace_view.json`（MindStudio Insight 原生打开）、紧凑 `<8 KB` 的 `*_agent_brief.json` 与终端 Markdown 结论摘要：
 
 ```bash
-# 1. 零配置目录模型评估（自动求解并行与量化 -> .xlsx + trace + agent_brief.json）
-mindie-sim report --model kimi-k3.1 --hardware 950dt --num-devices 32 --context 128k --out-dir ./out
+# 1. 显式部署形态一键评估（自动求解满网格并行与盘上量化 -> 纯 4 表 .xlsx + trace + agent_brief.json）
+mindie-sim report \
+  --model kimi-k3.1 --hardware 950dt \
+  --deployment-mode pd_decode --stack vllm-ascend \
+  --num-devices 32 --context 128k --tpot-ms 30 \
+  --out-dir ./out
 
-# 2. 零执行静态审计用户启动脚本 serve.sh（自动生成 *_optimized_serve.sh 并量化两阶段收益）
+# 2. 零执行静态审计用户启动脚本 serve.sh（经 adapter.launch_codec 仅在传入脚本时生成 *_optimized_serve.sh）
 mindie-sim report --from-script ./serve.sh --hardware a3 --out-dir ./out
 
 # 3. 盲盒新模型（直接传入未入库的 HuggingFace config.json 或本地模型目录）
-mindie-sim report --model ./new_hf_model/config.json --hardware a3 --tpot-ms 20 --out-dir ./out
+mindie-sim report \
+  --model ./new_hf_model/config.json --hardware a3 \
+  --deployment-mode colocated --tpot-ms 20 \
+  --out-dir ./out
 
 # 4. 查看 45 行速查手册、硬件别名与量化默认策略
 mindie-sim quickstart
 ```
 
-或者直接复制下面这句话发给你的 Codex、Claude Code、Kimi Code、DeepSeek Harness（DSH）或 Google Antigravity（AGY），由 AI Agent 自动完成 `mindie-sim` 的安装与校验：
+或者直接复制下面这句话发给你的 Codex、Claude Code、Kimi Code、DeepSeek Harness（DSH）、Google Antigravity（AGY）、WorkBuddy 或 OpenCode，由 AI Agent 自动完成 `mindie-sim` 的安装与校验：
 
 ```text
 帮我安装并配置 https://github.com/mindie-agent/sim
@@ -91,10 +97,10 @@ mindie-sim quickstart
    mindie-sim catalog
    mindie-sim predict examples/quickstart.json
    ```
-4. **Agent 三步调优工作流规范（参见 `skills/mindie-sim/SKILL.md`）**：
-   - 优先调用 `mindie-sim report`（或用户提供脚本时使用 `mindie-sim report --from-script <serve.sh>`），切勿手写原始 `Case` JSON。
-   - 直接读取 `<prefix>_agent_brief.json`（`< 8 KB`）获取完整 KPI、瓶颈与 Sheet 4 `card_id`，切勿编写 XML 脚本解析二进制 `.xlsx`。
-   - 按三轨行动清单（`Config/Env`、`Framework`、`Kernels`，默认 `auto_va` 生产量化且优先 `*-QuaRot` 权重）向用户汇报结论并附带 `.xlsx` 与 `trace_view.json`；有实测 profiling 时附带 `--kernel-csv kernel_details.csv`，需要写深度代码设计时用 `--kernel-designs-json` 二次出表。
+4. **Agent 调优工作流规范（参见 `skills/mindie-sim/SKILL.md`）**：
+   - 运行规划或报告前**先与用户确认显式 `--deployment-mode`**（`colocated | pd_disaggregated | pd_prefill | pd_decode`）及角色对应 SLA（`pd_decode` 禁填 `ttft_slo_ms`；`pd_prefill` 必填 `ttft_slo_ms` 且禁填 `tpot_slo_ms`）。
+   - 优先调用 `mindie-sim report`（或用户提供脚本时使用 `mindie-sim report --from-script <serve.sh>`），直接读取 `<prefix>_agent_brief.json`（`< 8 KB`）获取完整 KPI、4 阶段 / 3 责任人瀑布与 Sheet 4 `card_id`，切勿编写 XML 脚本解析二进制 `.xlsx`。
+   - 按三责任人瀑布（`[1] 配置与并行`、`[2] 框架图与多流改造`、`[3] 新算子开发与 Tiling 调优`，推荐 `TileLang / AscendC / Catlass`）汇报结论并附带纯 4 表 `.xlsx` 与 `trace_view.json`；有实测 profiling 时附带 `--kernel-csv kernel_details.csv`，Pass-2 深度改写使用 `--rewrite-plan <plan.json>`（旧 `--kernel-designs-json` 已彻底退场）。
 
 </details>
 
@@ -102,11 +108,14 @@ mindie-sim quickstart
 
 ## 核心特性与全量收敛基准
 
-最新主干全面落地 **CANN `9.3.0` + `vllm-ascend@405617bae` 全栈校准、四阶特性叠加瀑布（4-Rung Feature Waterfall）、`Software` 正交编译主干与 `G1–G11` 41 款模型结构闭环**：
-- **CANN `9.3.0` + `vllm-ascend@405617bae` 栈真源与 `_A5_PROFILE` 硬件能力真相**：通过内置清单 [`mindie_sim/stacks/vllm_ascend/manifest.json`](./mindie_sim/stacks/vllm_ascend/manifest.json) 与 `python3 scripts/audit_stack_prs.py --stack cann93` 锁定公开 SHA-256 源码溯源——精确建模 A5 已合入的 `MegaMoE(enable_fused_mc2=3)`、`fla_npu` `Chunk64`（`Hv/Hk in {1, 2, 3, 4}`）、`_C_ascend.npu_hc_pre_v3/v2`（`C in {2560, 4096, 5120, 7168}`）、统一 `GBSA`（`[1, 4]` / `[1, 8]` / `[1, 128]`）、`MlaPrologV4` 及 `_A5_PROFILE` 缺省 `GRAPH_QKV_NORM_ROPE_FUSION`，并覆盖 35 个活跃未合入优化 PR（含 `PR #22147` `Chunk32` 预填充（同样约束 `Hv/Hk in {1, 2, 3, 4}`，`Hv/Hk=8` 回退 Triton）、`PR #21794` 原生 `text_gated_residual`（`M > 512`）、`PR #22333` `situglu` MegaMoE、`PR #22467` C8 `KvQuantSFA` Scale 地址预计算、`PR #22235` `msa_index_score_v2` `return_choice=1` 核内 TopK、`PR #21449` `(1+w)` RMSNorm 预折叠、`PR #22385` TP `MC2`、`PR #22342` Step-5 `@support_torch_compile`、`PR #22164`/`#22473` A5 CANN 9.3 `FA3` 与 `PR #22184` DSpark Static Kernel）。
-- **四阶特性叠加瀑布与双视角 PR 消融（`stack_tracks` / `feature_waterfall`）**：`mindie-sim feature-tracks` 在同一套物理引擎上连续评估 **`raw_eager` -> `merged` -> `unmerged_pr` -> `expected_ideal` -> `exact_target` 物理 Roofline**，显式审计单调性，并同时输出正向单加 `single_pr_ablation`（`merged + {PR}`）与留一剔除 `leave_one_out_ablation`（`unmerged_pr - {PR}`）。
-- **CANN `9.3.0` A5 双硅基（`Ascend950DT_9582` / `Ascend950PR_958b`）三级盲测 `< 10%` 精度收敛**：基于无交集 `train` / `heldout` 观测包（[`data/observations/a5-cann93-regimes-20261120/`](./data/observations/a5-cann93-regimes-20261120/) 与 [`data/verification/a5-cann93-multilevel-accuracy-20261120.json`](./data/verification/a5-cann93-multilevel-accuracy-20261120.json)，跨 `512 -> 409,600` 上下文及商用派生规格 `425-96`、`486-96`、`547-96`、`547-144`），在 **Level 1 单算子与 `2P/8P` UB-Mesh 集合通信**（`268` heldout：`MAPE = 9.07%`、`MedAPE = 6.77%`）、**Level 2 FX `piecewise` 子图与周期层块**（`18` heldout，`14/14` 子图数精确一致：`MAPE = 9.96%`、`MedAPE = 8.78%`）与 **Level 3 端到端 Prefill/Decode Step**（覆盖 `merged`/`piecewise`/`unmerged_pr` 与 `TP×EP`/`DP×EP`：`MAPE = 9.96%`、`MedAPE = 8.78%`）三级全部达成 **`< 10%`** 盲测误差。
-- **正交编译开关、泛化 `DraftSpec` 与 `draft_prepare=True` 结构闭环**：`Software` 正交解耦 `graph_capture_mode`（`do_not_compile=True` 仍保留外层 `FULL_DECODE_ONLY` `ACLGraph`）与 `enable_torch_compile`、`enable_npugraph_ex`、`enable_static_kernel`、`enable_super_kernel`（`piecewise` 自动关闭内层三项开关）；`DraftSpec` 泛化支持 `independent_context`、`context_projection_mode`（`fused_kv_bank` / `per_layer_qkv` / `mla_prolog`）与 `dcp_sharded`，并在 `structure`、`graph --export-structure`、`operators` 与 `compare_cohorts`（含 `mindie-profiler` `sim_structure_ingress`）全链路打通 `--draft-prepare` / `draft_prepare=True`，CLI 导出默认脱敏为 `source: {"kind": "case_file", "sha256": ...}`。
+最新主干全面落地 **运行时无关单主干架构（`Core <-> RuntimeStackAdapter`）、显式四形态部署契约、流式 71 份实扫 Checkpoint 量化真值、统一 `Engine` 精确 Cohort 回放（`0 ns` 漂移）、四阶段三责任人因果瀑布、纯四表无脚本白名单导出，以及 CANN `9.3.0` + `vllm-ascend` 全栈校准与 `G1–G11` 41 款模型结构闭环**：
+- **运行时无关单主干与域感知插件路由（`schema/{checkpoint,stack,scenario,operators}.py` + `stacks/`）**：L0–L3 Core 100% 脱离具体推理引擎，全部框架适配收敛在 `mindie_sim/stacks/`（内置 `vllm-ascend`、`diffusion-native`、`ideal-target`、`raw-eager`，支持 `mindie-sim.stack-manifest/1` JSON 清单与 `mindie_sim.stacks` Python entry points）；`resolve_stack_for_scenario` 按 `WorkloadDomain` 自动路由（LLM/VLM -> `vllm-ascend`，Diffusion/DiT -> `diffusion-native`，强制不兼容栈立即抛 `ModelingError`）。历史重叠栈/旁路模块已零垫片清退（见 [`docs/migration.md`](./docs/migration.md)）。
+- **显式四形态部署契约与满网格 HBM 准入求解（`solve.py` / `sweep/pd.py`）**：仅接受 `colocated | pd_disaggregated | pd_prefill | pd_decode`（禁用 `"auto"`/`"pd"`，省略 `ttft_slo_ms` 保持显式无约束、零 `5000.0 ms` 强转；`pd_decode` 拒绝 `ttft_slo_ms` 并要求 `ReadyStateAssumption`；`pd_prefill` 要求 `ttft_slo_ms` 且拒绝 `tpot_slo_ms`）；全网格枚举 `(DP, TP, EP, PP, co-domain DCP, PCP)` 并解除硬编码并发上限，诚实区分 `HBM_CAPACITY_BOUND` / `CONFIGURED_SEQ_CAP_BOUND` / `TOKEN_BUDGET_BOUND` / `SLA_LATENCY_BOUND`，因果建模 PD 逐层重叠与池化交接。
+- **流式 71 份实扫 Checkpoint 与统一逐 Die 显存收据（`catalog/checkpoint_reader.py` + `prediction/capacity/ledger.py`）**：`ijson` 流式解析支持 `> 50 MiB` ModelSlim 描述文件与原生 HF `quantization_config`，打包 71 份实扫开源权重描述（[`mindie_sim/catalog/data/curated_checkpoints.json`](./mindie_sim/catalog/data/curated_checkpoints.json)），严格按 `layer_exceptions -> ignored_modules -> rules` 绑定精确 `TensorPrecisionABI` 与逐原生层 `CacheStateABI`（MLA、DSA Indexer、KDA/GDN 卷积+循环态、KPool/PLE、`C8`/`FAQuant`/`QK_MXFP8_DYNAMIC_V_MXFP8_PER_CHANNEL`、7 族 `RecoverSSM` 快照环），并产出唯一逐 Die 同时并存峰值 `ResidentMemoryReceipt`（自动卡数估算 == 求解器 == Excel Sheet 3 逐字节一致）。
+- **统一 `Engine` 精确 Cohort 回放、扫描线归因与四阶段三责任人瀑布**：`Before -> Graph_cfg ([1] 配置与并行) -> Graph_fwk ([2] 框架图与多流改造) -> Graph_After ([3] 新算子开发与 Tiling 调优)` 全部运行在同一 `Engine` 与同一 `PrimitiveTable` 上；`prediction/execution/layer_runs.py` 对 93L/61L/48L 模型实现 **`0.0000%`（`0 ns`）** 无漂移原生层 Cohort 回放；`prediction/runtime/exposed_observer.py` 以 $O((N+G)\log(N+G))$ 扫描线实现 Stream-0 守恒暴露归因；强类型 `CoDesignOpportunity`（`MegaFusionBound`、`SpaceTimeTradeoffSpec`、`CrossHwOffloadSpec`）与内核卡片统一推荐 **`TileLang / AscendC / Catlass`**。
+- **纯四可见表无脚本 `.xlsx` 导出与严格白名单投影（`export/public_view.py`）**：零隐藏表，Sheet 2 严格封口 `A:AA`（27 列），Sheet 3 默认 `"As evaluated"` 零重算篡改，Sheet 4 活区间公式汇总并在超 Excel 上限时自动在 `A:N` 内展开可见分组归因表；所有对外视图均经 `export/public_view.py` 封闭白名单过滤，杜绝内部枚举或审计词泄漏。
+- **CANN `9.3.0` + `vllm-ascend` 栈真源清单、特性瀑布与 A5 双硅基三级 `< 10%` 盲测收敛**：通过 [`mindie_sim/stacks/vllm_ascend/manifest.json`](./mindie_sim/stacks/vllm_ascend/manifest.json) 与 `mindie-sim feature-tracks`（[`mindie_sim/feature_mechanisms.py`](./mindie_sim/feature_mechanisms.py)）在同一物理引擎上连续评估 **`raw_eager` -> `merged` -> `unmerged_pr` -> `expected_ideal` -> `exact_target` 物理 Roofline** 并输出 `single_pr_ablation` / `leave_one_out_ablation`；基于无交集 `train` / `heldout` 观测包（[`data/observations/a5-cann93-regimes-20261120/`](./data/observations/a5-cann93-regimes-20261120/) 与 [`data/verification/a5-cann93-multilevel-accuracy-20261120.json`](./data/verification/a5-cann93-multilevel-accuracy-20261120.json)），在 **Level 1 单算子与 `2P/8P` UB-Mesh 集合通信**（`268` heldout：`MAPE = 9.07%`、`MedAPE = 6.77%`）、**Level 2 FX `piecewise` 子图与周期层块**（`18` heldout，`14/14` 子图数精确一致：`MAPE = 9.96%`、`MedAPE = 8.78%`）与 **Level 3 端到端 Prefill/Decode Step**（`MAPE = 9.96%`、`MedAPE = 8.78%`）三级全部达成 **`< 10%`** 盲测误差。
+- **正交编译开关、泛化 `DraftSpec` 与 `draft_prepare=True` 结构闭环**：`Software` 正交解耦 `graph_capture_mode` 与 `enable_torch_compile`、`enable_npugraph_ex`、`enable_static_kernel`、`enable_super_kernel`；`DraftSpec` 泛化支持 `independent_context`、`context_projection_mode`（`fused_kv_bank` / `per_layer_qkv` / `mla_prolog`）与 `dcp_sharded`，全链路打通 `--draft-prepare` / `draft_prepare=True`，CLI 导出默认脱敏为 `source: {"kind": "case_file", "sha256": ...}`。
 
 `mindie-sim v0.9.19`（配套 `mindie-profiler v0.5.17+`）在统一因果资源引擎之上，提供完整的**跨平台 Windows `CP936` UTF-8 / Unix `LF` 确定性 I/O 与 `TimeoutError` 严格透传、标准化原生调用结构绑定与覆盖率核算契约（`native_binding` / `native_coverage`）、独立原语规范评估接口（`evaluate_primitive_spec`）、多机集群扩展模型离线目录（涵盖 `minimax-m3`、`minimax-m3.1-flash`、`gemma-4-26b-a4b`、`gemma-4-31b`、`qwen3.6-35b-a3b`、`qwen3.8-flash-next`、`step-5-preview`、`kimi-k3.1` 等）、第一性原理正交多维并行与特性叠加定量守恒与实测回放验证（`TP × DP × EP × PP × PCP × DCP`、`SP`、`MC2`、`AllToAll`、`MTP/DSpark`、`MLA/GQA/KDA/GDN`、`KeyPool/DSA`、`AttnRes`、`W4A8/W8A8/MXFP8/MXFP4`、`enable_shared_expert_dp`、`EPLB` 无人工框架排期拦截）、单一因果执行引擎上的算子—模型—服务连续物理求解、全量 `7,337 / 7,337` 跨代际无历史缓存实时重算算子与 Step 级物理建模、16 款昇腾 SKU 官方 CANN Vector/Cube 硬件管线规格、四维效率分析、反事实多管线 Roofline 目标拟合、硬件缩放 SLA 吞吐求解器、A5 多级拓扑与 MoE 量化通信建模、分层卸载策略与容量反馈**（详见 [`docs/releases/sim-0.9.19.md`](./docs/releases/sim-0.9.19.md)、[`docs/releases/sim-0.9.17.md`](./docs/releases/sim-0.9.17.md)、[`docs/releases/sim-0.9.16.md`](./docs/releases/sim-0.9.16.md)、[`docs/releases/sim-0.9.15.md`](./docs/releases/sim-0.9.15.md)、[`docs/releases/sim-0.9.12.md`](./docs/releases/sim-0.9.12.md)、[`docs/releases/sim-0.9.11.md`](./docs/releases/sim-0.9.11.md) 与 [`docs/releases/sim-0.9.5.md`](./docs/releases/sim-0.9.5.md)）。
 
@@ -207,9 +216,9 @@ mindie-sim quickstart
 
 | 子命令 | 典型用途 | 示例 |
 | --- | --- | --- |
-| `mindie-sim report` | **开箱即用一键评估/脚本审计**：自动求解并行与 `auto_va` 量化（支持 `--from-script`、盲盒 `config.json`、`--kernel-csv`），输出 `.xlsx` + `trace_view.json` + `*_agent_brief.json` | `mindie-sim report --model kimi-k3.1 --hardware 950dt --num-devices 32 --context 128k --out-dir ./out` |
-| `mindie-sim quickstart` | 输出 `< 45` 行黄金命令、硬件/量化别名（`QuaRot` 优先）与 Agent 三步闭环（支持 `--json`） | `mindie-sim quickstart` |
-| `mindie-sim solve` / `export` | 一键 PD/混部最优求解器与固定并行 `.xlsx`/`trace_view.json` 导出 | `mindie-sim solve --model qwen3.8-flash-next --hardware 950dt-96g-pod --num-devices 16 --prompt-tokens 32768 --output-tokens 1024 --tpot-slo-ms 25` |
+| `mindie-sim report` | **开箱即用一键评估/脚本审计**：显式四形态 `--deployment-mode`（`colocated\|pd_disaggregated\|pd_prefill\|pd_decode`）+ 域感知 `--stack` 路由，输出纯 4 表 `.xlsx` + `trace_view.json` + `*_agent_brief.json`（支持 `--from-script`、`--rewrite-plan`、`--kernel-csv`） | `mindie-sim report --model kimi-k3.1 --hardware 950dt --deployment-mode pd_decode --stack vllm-ascend --num-devices 32 --context 128k --tpot-ms 30 --out-dir ./out` |
+| `mindie-sim quickstart` | 输出 `< 45` 行黄金命令、硬件/量化别名与 Agent 调优闭环（支持 `--json`） | `mindie-sim quickstart` |
+| `mindie-sim solve` / `export` | 一键全网格部署求解器（显式 `--deployment-mode` + 角色 SLA）与固定并行 `.xlsx`/`trace_view.json` 导出 | `mindie-sim solve --model qwen3.8-flash-next --hardware 950dt-96g-pod --deployment-mode pd_decode --num-devices 16 --prompt-tokens 32768 --output-tokens 1024 --tpot-slo-ms 25` |
 | `mindie-sim predict` | 运行端到端服务或模型主干（`--scope serving\|body`）性能预测 | `mindie-sim predict examples/quickstart.json` |
 | `mindie-sim inspect` | 解析 Case 并输出模型结构、KV 显存规划与展开后的算子序列 | `mindie-sim inspect examples/quickstart.json` |
 | `mindie-sim operators` | 评估单次 Prefill/Decode 前向中各算子的独立设备资源耗时（支持 `--draft-prepare`） | `mindie-sim operators examples/quickstart.json --phase decode --tokens 1` |
@@ -327,18 +336,22 @@ for row in sla_report["scenarios"]:
 
 ```text
 sim/
-├── mindie_sim/                      # 核心 Python 包
-│   ├── __init__.py / __main__.py    # 顶层 Python API 导出与 mindie-sim CLI 入口
-│   ├── schema/                      # Case、Hardware、ModelSpec、ParallelSpec、SloSpec 数据契约
-│   ├── catalog/ & model_catalog.py  # 硬件配置目录与标准模型结构目录
-│   ├── backends/                    # 原生模型配置与昇腾运行时参数解析适配器
-│   ├── prediction/                  # 统一因果资源引擎、算子/计算图/回调评估、4D 效率与 SLA 求解器
-│   ├── observations/                # 观测数据流式索引、原语校准导入、边界验证与服务曲线拟合
-│   ├── structure*.py                # 模型结构契约、子图映射与实现选择规则
-│   └── study.py                     # 多候选方案对比与探针评估
+├── mindie_sim/                      # 核心 Python 包（运行时无关单主干）
+│   ├── __init__.py / api.py         # 顶层 Python API 与强类型 SDK 入口
+│   ├── schema/                      # L0 不可变契约：checkpoint / stack / scenario / operators / model / hardware / case
+│   ├── catalog/ & model_catalog.py  # 模型目录、流式 checkpoint_reader.py 与 71 份 curated_checkpoints.json
+│   ├── backends/ & primitives/      # 硬件/互联规格与常驻 PrimitiveTable
+│   ├── stacks/                      # L4 可插拔 RuntimeStackAdapter（vllm-ascend / diffusion-native / ideal-target / raw-eager）
+│   ├── compose/                     # 唯一 ScenarioContract 组合根
+│   ├── prediction/                  # L2/L3 统一 Engine、layer_runs 精确回放、exposed_observer、capacity/ledger 与治理算子族
+│   ├── sweep/ & solve.py            # 满网格 HBM 准入、PD/混部最优求解与 Pareto 扫描
+│   ├── rewrite/ & optimization/     # 合法 GraphIR 改写与独立物理下界 L*（dual_bound.py）
+│   ├── export/                      # 纯 4 表无脚本 XLSX、trace_view.json、agent_brief.json 与 public_view.py 白名单
+│   ├── cli/                         # mindie-sim CLI（report / solve / export / quickstart / sweep / optimize 等）
+│   └── observations/ & structure*   # 观测流式索引、原语校准、边界验证与 mindie-profiler 跨仓 SSOT
 ├── examples/                        # 开箱即用的 Case、Call、Study 与组件示例
-├── docs/                            # 架构设计、算子机制、收敛基准与版本发布说明
-├── tests/                           # 单元测试与全量回归测试套件
+├── docs/                            # 架构设计、迁移契约、算子机制、收敛基准与版本发布说明
+├── tests/                           # 按 tests/TAXONOMY.toml 组织的分级单测与回归套件
 └── pyproject.toml                   # 包构建配置与命令行入口定义
 ```
 
@@ -349,8 +362,9 @@ sim/
 | 主题 | 文档链接 |
 | --- | --- |
 | **`v0.9.19` / `v0.9.17` / `v0.9.16` / `v0.9.15` / `v0.9.12` / `v0.9.11` / `v0.9.5` 版本发布说明** | [`docs/releases/sim-0.9.19.md`](./docs/releases/sim-0.9.19.md) · [`docs/releases/sim-0.9.17.md`](./docs/releases/sim-0.9.17.md) · [`docs/releases/sim-0.9.16.md`](./docs/releases/sim-0.9.16.md) · [`docs/releases/sim-0.9.15.md`](./docs/releases/sim-0.9.15.md) · [`docs/releases/sim-0.9.12.md`](./docs/releases/sim-0.9.12.md) · [`docs/releases/sim-0.9.11.md`](./docs/releases/sim-0.9.11.md) · [`docs/releases/sim-0.9.5.md`](./docs/releases/sim-0.9.5.md) |
-| **统一因果建模架构与资源时间语义** | [`docs/architecture.md`](./docs/architecture.md) |
-| **建模保真度、边界与设计原则** | [`docs/modeling-fidelity.md`](./docs/modeling-fidelity.md) |
+| **运行时无关单主干架构与资源时间语义** | [`docs/architecture.md`](./docs/architecture.md) |
+| **建模保真度、单主干不变量与精化准则** | [`docs/modeling-fidelity.md`](./docs/modeling-fidelity.md) |
+| **单主干迁移指南与零垫片退场边界** | [`docs/migration.md`](./docs/migration.md) |
 | **输入 Case 契约与硬件/并行配置说明** | [`docs/inputs.md`](./docs/inputs.md) |
 | **计算图评估（`graph`）与运行时诊断** | [`docs/graph-analysis.md`](./docs/graph-analysis.md) · [`docs/graph-runtime-diagnosis.md`](./docs/graph-runtime-diagnosis.md) |
 | **算子回调分析（`call`）与调用开销契约** | [`docs/call-analysis.md`](./docs/call-analysis.md) · [`docs/invocation-costs.md`](./docs/invocation-costs.md) |

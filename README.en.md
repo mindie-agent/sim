@@ -27,19 +27,18 @@
 When optimizing custom kernels or distributed LLM inference (`DP × TP × EP × PP × DCP / DSA-CP / PCP` and disaggregated Prefill-Decode serving for DeepSeek, Qwen, GLM, or Kimi) on Ascend NPUs, the biggest waste of engineering time is **blind trial-and-error without a causal performance baseline**:
 
 - **"Which hardware resource actually bottlenecks this operator or model?"** — Back-of-the-envelope `FLOPs / peak_tflops` estimates ignore on-chip `UB`/`L1` alignment, tile tails, multi-stream contention, and kernel invocation overheads (`startup_ms` / `minimum_ms`). `mindie-sim` decomposes every operator, subgraph, and network pass into **`Cube_MFU`, `Vec_MFU`, `MBU`, `Link_Util`, and `CV_Overlap`**, pinpointing whether work is `memory_bound`, `cube_bound`, `vector_bound`, `link_bound`, or `launch_bound`.
-- **"How much physically achievable headroom remains between our current schedule and the hardware lower bound?"** — Before writing hundreds of lines of AscendC or Triton code, the five-level Primal-Dual certified ladder (`optimize_ladder`) pairs a Lean 4-verified theoretical floor ($L^*_{\text{Lean}}$) with replay-verified framework and CATLASS/DSL fusion plans ($A^*_{\text{DSL/CATLASS+Fusion}} \le A^*_{\text{Framework}} \le \min(M, U)$).
-- **"Under a `<= 30 ms` Decode TPOT SLA, what is the maximum batch size and throughput — and what if we scale HBM bandwidth or compute by `2x`?"** — The hardware scaling & SLA solver (`solve_sla_sizing`) jointly solves the VRAM capacity ceiling (`B*_VRAM`) and SLA latency ceiling (`B*_SLA`) across hardware scaling scenarios (`2x HBM`, `2x Compute`, `2x Cube`, `2x HBM + 2x Compute`).
-- **"How do we evaluate isolated operators, subgraphs, callbacks, and full serving with consistent physics?"** — `mindie-sim` uses a **single unified causal engine (`prediction.engine.Engine`)** across isolated operator programs (`operators`), shared-resource target graphs (`graph`), callback protocols (`call`), candidate comparisons (`study`), and full-service scheduling (`predict` / `predict_pd`).
+- **"How much physically achievable headroom remains between our current schedule and the hardware lower bound?"** — Before writing `TileLang / AscendC / Catlass` fused kernels, the 4-stage / 3-owner causal waterfall (`Before -> Graph_cfg -> Graph_fwk -> Graph_After`) and five-level Primal-Dual certified ladder (`optimize_ladder`) pair a Lean 4-verified theoretical floor ($L^*_{\text{Lean}}$) with replay-verified framework and CATLASS/DSL fusion plans ($A^*_{\text{DSL/CATLASS+Fusion}} \le A^*_{\text{Framework}} \le \min(M, U)$) on the exact same engine.
+- **"Under a `<= 30 ms` Decode TPOT SLA, what is the maximum batch size and throughput — and what if we scale HBM bandwidth or compute by `2x`?"** — The full-grid deployment solver (`solve_deployment`) and hardware scaling SLA solver (`solve_sla_sizing`) enforce the explicit 4-mode deployment contract (`colocated | pd_disaggregated | pd_prefill | pd_decode`) over the unified per-die `ResidentMemoryReceipt` to solve optimal parallelism, concurrency, and scaled throughput (`tokens/s`).
+- **"How do we evaluate isolated operators, subgraphs, multiple serving stacks, and distributed serving with consistent physics?"** — `mindie-sim` enforces a **runtime-agnostic single-spine architecture (`Core <-> RuntimeStackAdapter`)** backed by **one discrete-event causal engine (`prediction.runtime.engine.Engine` + one immutable `PrimitiveTable`)**, isolating all runtime plugins (`vllm-ascend`, `diffusion-native`, `ideal-target`, `raw-eager`, plus custom manifests) behind `mindie_sim/stacks/`.
 
 ```mermaid
 flowchart TB
-    Input["📥 Input Specs & Empirical Evidence<br/>(Case JSON / Model Catalog / Hardware Specs / Profiler Structure & Observations)"]
-    Frontend["🧱 Structural Lowering & Work Conservation (schema / catalog / frontend)<br/>(Attention / MLA / GDN / KDA / MoE Routing / Quantization & KV Cache Capacity)"]
-    Program["⚙️ Finite Resource Programs & Pipelines (program / matrix / invocations)<br/>(M/N/K Tiling & Tails · Cube/Vector/MTE/HBM/Link Service · Startup & Completion Floors)"]
-    Engine["🔗 Unified Causal Event Engine (prediction.engine.Engine)<br/>(operators Isolated Costs · graph Shared-Resource DAG · call Protocols · predict Serving)"]
-    Analysis["🧭 4D Efficiency, Primal-Dual Certified Ladder & SLA Scaling Solver (efficiency / optimization / study)<br/>(Cube_MFU · Vec_MFU · MBU · Link_Util · CV_Overlap · L*_Lean Certified Floor · B*_SLA Throughput)"]
+    Input["📥 Single Strongly Typed Ingress (Resolve Once)<br/>(ModelIR + Streamed 71-Checkpoint QuantMap + Hardware/Primitives + Explicit 4-Mode SLA + RuntimeStackAdapter)"]
+    Lower["🧱 Plugin Lowering & Executable Graph (stacks/ -> Unified GraphIR)<br/>(TensorPrecisionABI · Per-Layer CacheStateABI · KernelBinding · OwnerScheduleSpec)"]
+    Engine["🔗 Single Causal Engine & Capacity Truth (Engine + PrimitiveTable + ResidentMemoryLedger)<br/>(Exact Native Cohort Replay 0 ns Drift · O((N+G)log(N+G)) Sweep-Line · Simultaneous Per-Die Peak)"]
+    Analysis["🧭 4-Stage / 3-Owner Waterfall, Full-Grid Solver & Pure 4-Sheet Export (sweep/ · optimization/ · export/public_view.py)<br/>(4D Efficiency · L* Lower Bound · CoDesignOpportunity [TileLang/AscendC/Catlass] · 4-Sheet XLSX / trace / agent_brief)"]
 
-    Input --> Frontend --> Program --> Engine --> Analysis
+    Input --> Lower --> Engine --> Analysis
 ```
 
 ---
@@ -48,23 +47,30 @@ flowchart TB
 
 ### One-Shot Evaluation & Launch-Script Audit (Recommended First Step)
 
-`mindie-sim report` automatically solves HBM-safe parallelism (`DP/TP/EP/DCP/PP` + concurrency) and chip-matched `auto_va` production quantization (**preferring `*-QuaRot` checkpoints / `msmodelslim` QuaRot outlier rotation**), emitting a comparison `.xlsx`, a MindStudio Insight `trace_view.json`, a compact `<8 KB` `*_agent_brief.json`, and a stdout Markdown digest in one command:
+`mindie-sim report` enforces the explicit 4-mode `--deployment-mode` contract (`colocated | pd_disaggregated | pd_prefill | pd_decode`, or unambiguous `--from-script` inference—zero silent guessing, zero `5000.0 ms` TTFT coercion) and domain-aware `--stack` routing (LLM/VLM -> `vllm-ascend`, Diffusion/DiT -> `diffusion-native`). One command emits a **pure 4-visible-sheet `.xlsx` workbook (0 hidden sheets, Sheet 2 `A:AA` 27 cols, Sheet 3 `"As evaluated"`, Sheet 4 live span formulas)**, a MindStudio Insight `trace_view.json`, a compact `<8 KB` `*_agent_brief.json`, and a stdout Markdown digest:
 
 ```bash
-# 1. Zero-config catalog evaluation (auto-solves parallelism & quant -> .xlsx + trace + agent_brief.json)
-mindie-sim report --model kimi-k3.1 --hardware 950dt --num-devices 32 --context 128k --out-dir ./out
+# 1. Explicit-mode catalog evaluation (full-grid solver & checkpoint quant -> pure 4-sheet .xlsx + trace + agent_brief.json)
+mindie-sim report \
+  --model kimi-k3.1 --hardware 950dt \
+  --deployment-mode pd_decode --stack vllm-ascend \
+  --num-devices 32 --context 128k --tpot-ms 30 \
+  --out-dir ./out
 
-# 2. Zero-exec static audit of a user serve.sh (emits *_optimized_serve.sh + two-step speedup)
+# 2. Zero-exec static audit of a user serve.sh (emits *_optimized_serve.sh via adapter.launch_codec only when --from-script is passed)
 mindie-sim report --from-script ./serve.sh --hardware a3 --out-dir ./out
 
 # 3. True blind-box model (point --model directly at an uncataloged HuggingFace config.json or directory)
-mindie-sim report --model ./new_hf_model/config.json --hardware a3 --tpot-ms 20 --out-dir ./out
+mindie-sim report \
+  --model ./new_hf_model/config.json --hardware a3 \
+  --deployment-mode colocated --tpot-ms 20 \
+  --out-dir ./out
 
-# 4. Print <45-line golden commands, hardware/quant aliases & 3-step Agent loop
+# 4. Print <45-line golden commands, hardware/quant aliases & Agent workflow
 mindie-sim quickstart
 ```
 
-Or copy and paste the line below to Codex, Claude Code, Kimi Code, DeepSeek Harness (DSH), or Google Antigravity (AGY) so your AI Agent installs and verifies `mindie-sim` automatically:
+Or copy and paste the line below to Codex, Claude Code, Kimi Code, DeepSeek Harness (DSH), Google Antigravity (AGY), WorkBuddy, or OpenCode so your AI Agent installs and verifies `mindie-sim` automatically:
 
 ```text
 Please install and configure https://github.com/mindie-agent/sim for me
@@ -91,10 +97,10 @@ If you are an AI Agent receiving the prompt above, execute the following steps t
    mindie-sim catalog
    mindie-sim predict examples/quickstart.json
    ```
-4. **3-Step Agent Optimization Workflow (see `skills/mindie-sim/SKILL.md`)**:
-   - Run `mindie-sim report` first (or `mindie-sim report --from-script <serve.sh>` when auditing a launch script)—never hand-author raw `Case` JSONs for routine evaluations.
-   - Read `<prefix>_agent_brief.json` (`< 8 KB`) for KPIs, bottlenecks, and Sheet 4 `card_id`s—never write XML scrapers for `.xlsx`.
-   - Present the 3-Track action plan (`Config/Env`, `Framework`, `Kernels`, defaulting to `auto_va` production quant with `*-QuaRot` checkpoint priority) and link `.xlsx` + `trace_view.json`; pass `--kernel-csv` when real `msprof` data exists or `--kernel-designs-json` for Pass-2 deep kernel co-design.
+4. **Agent Optimization Workflow (see `skills/mindie-sim/SKILL.md`)**:
+   - **Always confirm `--deployment-mode` upfront** (`colocated | pd_disaggregated | pd_prefill | pd_decode`) and the role-appropriate SLA (`pd_decode` forbids `ttft_slo_ms`; `pd_prefill` requires `ttft_slo_ms` and forbids `tpot_slo_ms`).
+   - Run `mindie-sim report` (or `mindie-sim report --from-script <serve.sh>` when auditing a launch script), and read `<prefix>_agent_brief.json` (`< 8 KB`) for KPIs, the 4-stage / 3-owner waterfall, and Sheet 4 `card_id`s—never write XML scrapers for `.xlsx`.
+   - Present the 3-owner waterfall (`[1] Config & Parallelism`, `[2] Framework Graph & Multi-Stream`, `[3] New Kernels & Tiling Tuning` targeting `TileLang / AscendC / Catlass`) alongside the pure 4-sheet `.xlsx` and `trace_view.json`; pass `--kernel-csv` when measured `msprof` data exists or `--rewrite-plan <plan.json>` for Pass-2 verified rewrites (`--kernel-designs-json` is retired).
 
 </details>
 
@@ -102,11 +108,14 @@ If you are an AI Agent receiving the prompt above, execute the following steps t
 
 ## Highlights & Full-Fleet Convergence
 
-Mainline `mindie-sim` ships **CANN `9.3.0` + `vllm-ascend@405617bae` full-stack calibration, a 4-rung feature waterfall, an orthogonal compilation spine on `Software`, and `G1–G11` 41-model structural closure**:
-- **CANN `9.3.0` + `vllm-ascend@405617bae` Provenance & `_A5_PROFILE` Capability Truth**: [`mindie_sim/stacks/vllm_ascend/manifest.json`](./mindie_sim/stacks/vllm_ascend/manifest.json) and `python3 scripts/audit_stack_prs.py --stack cann93` lock public SHA-256 provenance across `vllm-ascend@405617bae`, CANN `9.3.0`, `cann_ops_transformer 1.0.0`, and `fla_npu 26.10.0+feature`—capturing merged A5 `MegaMoE(enable_fused_mc2=3)`, `fla_npu` `Chunk64` (`Hv/Hk in {1, 2, 3, 4}`), `_C_ascend.npu_hc_pre_v3/v2` (`C in {2560, 4096, 5120, 7168}`), unified `GBSA` (`[1, 4]` / `[1, 8]` / `[1, 128]`), `MlaPrologV4`, and omitted `GRAPH_QKV_NORM_ROPE_FUSION`, plus 35 audited open PRs (`PR #22147` `Chunk32` prefill for `Hv/Hk in {1, 2, 3, 4}` with Triton fallback at `Hv/Hk=8`, `PR #21794` native `text_gated_residual` for `M > 512`, `PR #22333` `situglu` MegaMoE, `PR #22467` C8 `KvQuantSFA` scale precomputation, `PR #22235` `msa_index_score_v2` `return_choice=1` in-kernel TopK, `PR #21449` `(1+w)` RMSNorm fold, `PR #22385` TP `MC2`, `PR #22342` Step-5 `@support_torch_compile`, `PR #22164`/`#22473` A5 CANN 9.3 `FA3`, and `PR #22184` DSpark Static Kernel).
-- **4-Rung Feature Waterfall & Dual PR Ablations (`stack_tracks` / `feature_waterfall`)**: `mindie-sim feature-tracks` evaluates **`raw_eager` -> `merged` -> `unmerged_pr` -> `expected_ideal` -> `exact_target` physical Roofline** on the same causal engine, verifying rung monotonicity and reporting both **`single_pr_ablation`** (`merged + {PR}`) and **`leave_one_out_ablation`** (`unmerged_pr - {PR}`).
-- **Sub-10% Three-Level CANN `9.3.0` Dual-Silicon Calibration (`Ascend950DT_9582` & `Ascend950PR_958b`)**: Verified on strictly disjoint `train` / `heldout` silicon packets ([`data/observations/a5-cann93-regimes-20261120/`](./data/observations/a5-cann93-regimes-20261120/) and [`data/verification/a5-cann93-multilevel-accuracy-20261120.json`](./data/verification/a5-cann93-multilevel-accuracy-20261120.json) across `512 -> 409,600` sequence lengths plus derived commercial SKUs `425-96`, `486-96`, `547-96`, `547-144`), achieving **`< 10%` heldout MAPE and MedAPE across all three levels**: **Level 1 Operators & `2P/8P` UB-Mesh Collectives** (`268` heldout: `MAPE = 9.07%`, `MedAPE = 6.77%`), **Level 2 FX `piecewise` Subgraphs & Layer Blocks** (`18` heldout, `14/14` exact FX subgraph count matches: `MAPE = 9.96%`, `MedAPE = 8.78%`), and **Level 3 End-to-End Prefill/Decode Model Steps** (`merged`/`piecewise`/`unmerged_pr` across `TP×EP` and `DP×EP`: `MAPE = 9.96%`, `MedAPE = 8.78%`).
-- **Orthogonal Compilation Flags, Generalized `DraftSpec` & `draft_prepare=True` Spine**: `Software` decouples `graph_capture_mode` (`do_not_compile=True` preserves outer `FULL_DECODE_ONLY` `ACLGraph`) from `enable_torch_compile`, `enable_npugraph_ex`, `enable_static_kernel`, and `enable_super_kernel` (`piecewise` disables all three inner flags); `DraftSpec` generalizes `independent_context`, `context_projection_mode` (`fused_kv_bank` / `per_layer_qkv` / `mla_prolog`), and `dcp_sharded`, wired through `--draft-prepare` / `draft_prepare=True` across `structure`, `graph --export-structure`, `operators`, and `compare_cohorts` (paired with `mindie-profiler` `sim_structure_ingress`), while CLI structure exports sanitize file paths to `source: {"kind": "case_file", "sha256": ...}`.
+Mainline `mindie-sim` ships a **runtime-agnostic single-spine architecture (`Core <-> RuntimeStackAdapter`), explicit 4-mode deployment & role-SLA contracts, streaming 71-checkpoint quantization fidelity, unified-Engine exact cohort replay (`0 ns` drift), a 4-stage / 3-owner causal waterfall, pure 4-sheet script-free export, CANN `9.3.0` + `vllm-ascend` full-stack calibration, and `G1–G11` 41-model structural closure**:
+- **Runtime-Agnostic Single Spine & Domain-Aware Stack Plugins (`schema/{checkpoint,stack,scenario,operators}.py` + `stacks/`)**: L0–L3 Core is 100% engine-agnostic, while all runtime specifics live inside `mindie_sim/stacks/` (built-in `vllm-ascend`, `diffusion-native`, `ideal-target`, `raw-eager`, plus `mindie-sim.stack-manifest/1` JSON manifests and `mindie_sim.stacks` entry points). `resolve_stack_for_scenario` routes by `WorkloadDomain` (LLM/VLM -> `vllm-ascend`, Diffusion/DiT -> `diffusion-native`) and rejects mismatched forced stacks with `ModelingError`. Legacy overlapping stack/schedule/audit modules are retired with zero shims (see [`docs/migration.md`](./docs/migration.md)).
+- **Explicit 4-Mode Deployment Contract & Full-Grid HBM Solver (`solve.py` / `sweep/pd.py`)**: Accepts only `colocated | pd_disaggregated | pd_prefill | pd_decode` (rejects `"auto"`/`"pd"`, never coerces omitted `ttft_slo_ms` to `5000.0 ms`; `pd_decode` forbids `ttft_slo_ms` and requires `ReadyStateAssumption`; `pd_prefill` requires `ttft_slo_ms` and forbids `tpot_slo_ms`). Enumerates the full `(DP, TP, EP, PP, co-domain DCP, PCP)` grid with unlocked physical HBM admission (`HBM_CAPACITY_BOUND` vs `CONFIGURED_SEQ_CAP_BOUND` / `TOKEN_BUDGET_BOUND` / `SLA_LATENCY_BOUND`) and causal PD layerwise overlap / pooled handoffs.
+- **Streaming 71-Checkpoint Reader & Single Per-Die Memory Receipt (`catalog/checkpoint_reader.py` + `prediction/capacity/ledger.py`)**: Streams `> 50 MiB` ModelSlim descriptions via `ijson` alongside native HF `quantization_config` and 71 curated real checkpoints ([`mindie_sim/catalog/data/curated_checkpoints.json`](./mindie_sim/catalog/data/curated_checkpoints.json)), honoring `layer_exceptions -> ignored_modules -> rules` precedence without silent BF16 fallbacks. Models exact per-native-layer `CacheStateABI` (MLA, DSA Indexer, KDA/GDN conv+recurrent, KPool/PLE, `C8`/`FAQuant`/`QK_MXFP8_DYNAMIC_V_MXFP8_PER_CHANNEL`, and 7-family `RecoverSSM` snapshot rings) into one simultaneous per-die `ResidentMemoryReceipt` shared identically across sizer, solver, and Excel Sheet 3.
+- **Unified `Engine` Exact Cohort Replay, Sweep-Line Attribution & 4-Stage / 3-Owner Waterfall**: Evaluates `Before -> Graph_cfg ([1] ops_config) -> Graph_fwk ([2] framework_python) -> Graph_After ([3] kernel_dev_tune)` on ONE `Engine` and ONE `PrimitiveTable`; `prediction/execution/layer_runs.py` achieves **`0.0000%` (`0 ns`) drift** against unrolled 93L/61L/48L models; `prediction/runtime/exposed_observer.py` performs $O((N+G)\log(N+G))$ sweep-line Stream-0 conservation; typed `CoDesignOpportunity` (`MegaFusionBound`, `SpaceTimeTradeoffSpec`, `CrossHwOffloadSpec`) and kernel cards target **`TileLang / AscendC / Catlass`**.
+- **Pure 4-Sheet Script-Free `.xlsx` Export & Allowlist View (`export/public_view.py`)**: Zero hidden sheets, Sheet 2 strictly `A:AA` (27 cols), Sheet 3 defaulting to `"As evaluated"` for exact byte parity, Sheet 4 live visible Sheet 2 span formulas with automatic visible `A:N` Group Attribution Table fallback when exceeding Excel limits, and strict `export/public_view.py` filtering eliminating internal jargon and raw track tokens.
+- **CANN `9.3.0` + `vllm-ascend` Manifest, Feature Waterfall & Sub-10% A5 Dual-Silicon Calibration**: [`mindie_sim/stacks/vllm_ascend/manifest.json`](./mindie_sim/stacks/vllm_ascend/manifest.json) and `mindie-sim feature-tracks` ([`mindie_sim/feature_mechanisms.py`](./mindie_sim/feature_mechanisms.py)) evaluate **`raw_eager` -> `merged` -> `unmerged_pr` -> `expected_ideal` -> `exact_target` physical Roofline** with `single_pr_ablation` and `leave_one_out_ablation`. Verified on strictly disjoint `train` / `heldout` silicon packets ([`data/observations/a5-cann93-regimes-20261120/`](./data/observations/a5-cann93-regimes-20261120/) and [`data/verification/a5-cann93-multilevel-accuracy-20261120.json`](./data/verification/a5-cann93-multilevel-accuracy-20261120.json)), achieving **`< 10%` heldout MAPE and MedAPE across all three levels**: **Level 1 Operators & `2P/8P` UB-Mesh Collectives** (`268` heldout: `MAPE = 9.07%`, `MedAPE = 6.77%`), **Level 2 FX `piecewise` Subgraphs & Layer Blocks** (`18` heldout, `14/14` exact subgraph counts: `MAPE = 9.96%`, `MedAPE = 8.78%`), and **Level 3 End-to-End Prefill/Decode Model Steps** (`MAPE = 9.96%`, `MedAPE = 8.78%`).
+- **Orthogonal Compilation Flags, Generalized `DraftSpec` & `draft_prepare=True` Spine**: `Software` decouples `graph_capture_mode` from `enable_torch_compile`, `enable_npugraph_ex`, `enable_static_kernel`, and `enable_super_kernel`; `DraftSpec` generalizes `independent_context`, `context_projection_mode` (`fused_kv_bank` / `per_layer_qkv` / `mla_prolog`), and `dcp_sharded`, wired through `--draft-prepare` / `draft_prepare=True` with sanitized `source: {"kind": "case_file", "sha256": ...}` CLI structure exports.
 
 `mindie-sim v0.9.19` (paired with `mindie-profiler v0.5.17+`) extends the unified causal engine with **cross-platform Windows `CP936` UTF-8 / Unix `LF` I/O determinism and strict `TimeoutError` propagation, normalized native-call structural binding & coverage contracts (`native_binding` / `native_coverage`), canonical standalone primitive evaluation (`evaluate_primitive_spec`), packaged offline fleet model catalog configs (`minimax-m3`, `minimax-m3.1-flash`, `gemma-4-26b-a4b`, `gemma-4-31b`, `qwen3.6-35b-a3b`, `qwen3.8-flash-next`, `step-5-preview`, `kimi-k3.1`, etc.), first-principles orthogonal multi-dimensional parallelism & feature superposition with quantitative conservation laws and real-trace replay verification (`TP × DP × EP × PP × PCP × DCP`, `SP`, `MC2`, `AllToAll`, `MTP/DSpark`, `MLA/GQA/KDA/GDN`, `KeyPool/DSA`, `AttnRes`, `W4A8/W8A8/MXFP8/MXFP4`, `enable_shared_expert_dp`, `EPLB` without artificial framework-schedule guards), one causal operator-to-model-to-service physical solver, unified `7,337 / 7,337` multi-tier live-recomputed operator & step physical modeling, official CANN Vector/Cube hardware pipeline specifications across all 16 Ascend SKUs, 4D efficiency attribution, counterfactual multi-pipe Roofline target fitting, hardware scaling SLA throughput solving, A5 hierarchical topology & quantized MoE transport, hierarchical offload policy, and capacity feedback** (see [`docs/releases/sim-0.9.19.en.md`](./docs/releases/sim-0.9.19.en.md), [`docs/releases/sim-0.9.17.en.md`](./docs/releases/sim-0.9.17.en.md), [`docs/releases/sim-0.9.16.en.md`](./docs/releases/sim-0.9.16.en.md), [`docs/releases/sim-0.9.15.en.md`](./docs/releases/sim-0.9.15.en.md), [`docs/releases/sim-0.9.12.en.md`](./docs/releases/sim-0.9.12.en.md), [`docs/releases/sim-0.9.11.en.md`](./docs/releases/sim-0.9.11.en.md), and [`docs/releases/sim-0.9.5.md`](./docs/releases/sim-0.9.5.md)).
 
@@ -207,9 +216,9 @@ The full reproducible NPU profiling benchmark dataset is published on HuggingFac
 
 | Subcommand | Purpose | Example |
 | --- | --- | --- |
-| `mindie-sim report` | **Turnkey evaluation & script audit**: auto-solves parallelism & `auto_va` quant (supports `--from-script`, blind-box `config.json`, `--kernel-csv`), emitting `.xlsx` + `trace_view.json` + `*_agent_brief.json` | `mindie-sim report --model kimi-k3.1 --hardware 950dt --num-devices 32 --context 128k --out-dir ./out` |
-| `mindie-sim quickstart` | Print `< 45`-line golden commands, hardware/quant aliases (`QuaRot`-first), and the 3-step Agent loop (`--json` supported) | `mindie-sim quickstart` |
-| `mindie-sim solve` / `export` | One-shot PD/colocated deployment solver and fixed-parallel `.xlsx`/`trace_view.json` exporter | `mindie-sim solve --model qwen3.8-flash-next --hardware 950dt-96g-pod --num-devices 16 --prompt-tokens 32768 --output-tokens 1024 --tpot-slo-ms 25` |
+| `mindie-sim report` | **Turnkey evaluation & script audit**: explicit 4-mode `--deployment-mode` (`colocated\|pd_disaggregated\|pd_prefill\|pd_decode`) + domain-aware `--stack` routing, emitting pure 4-sheet `.xlsx` + `trace_view.json` + `*_agent_brief.json` (supports `--from-script`, `--rewrite-plan`, `--kernel-csv`) | `mindie-sim report --model kimi-k3.1 --hardware 950dt --deployment-mode pd_decode --stack vllm-ascend --num-devices 32 --context 128k --tpot-ms 30 --out-dir ./out` |
+| `mindie-sim quickstart` | Print `< 45`-line golden commands, hardware/quant aliases, and the Agent loop (`--json` supported) | `mindie-sim quickstart` |
+| `mindie-sim solve` / `export` | One-shot full-grid deployment solver (explicit `--deployment-mode` + role SLAs) and fixed-parallel `.xlsx`/`trace_view.json` exporter | `mindie-sim solve --model qwen3.8-flash-next --hardware 950dt-96g-pod --deployment-mode pd_decode --num-devices 16 --prompt-tokens 32768 --output-tokens 1024 --tpot-slo-ms 25` |
 | `mindie-sim predict` | End-to-end serving or body-forward (`--scope serving\|body`) performance prediction | `mindie-sim predict examples/quickstart.json` |
 | `mindie-sim inspect` | Parse a Case and emit normalized model structure, KV memory plan, and lowered operators | `mindie-sim inspect examples/quickstart.json` |
 | `mindie-sim operators` | Evaluate isolated device resource costs for each operator in a Prefill/Decode pass (supports `--draft-prepare`) | `mindie-sim operators examples/quickstart.json --phase decode --tokens 1` |
@@ -327,18 +336,22 @@ for row in sla_report["scenarios"]:
 
 ```text
 sim/
-├── mindie_sim/                      # Core Python package
-│   ├── __init__.py / __main__.py    # Public Python API exports and mindie-sim CLI entrypoint
-│   ├── schema/                      # Case, Hardware, ModelSpec, ParallelSpec, and SloSpec contracts
-│   ├── catalog/ & model_catalog.py  # Hardware profile catalog and built-in standard model definitions
-│   ├── backends/                    # Native model config and Ascend runtime parameter adapters
-│   ├── prediction/                  # Unified causal engine, operator/graph/call evaluators, 4D efficiency & SLA solver
-│   ├── observations/                # Streaming observation index, primitive calibration, validation & service fitting
-│   ├── structure*.py                # Model structure contracts, subgraph mapping, and implementation selection
-│   └── study.py                     # Multi-candidate comparative study runner
+├── mindie_sim/                      # Core Python package (runtime-agnostic single spine)
+│   ├── __init__.py / api.py         # Public Python API exports and typed SDK entrypoint
+│   ├── schema/                      # L0 immutable contracts: checkpoint / stack / scenario / operators / model / hardware / case
+│   ├── catalog/ & model_catalog.py  # Model catalog, streaming checkpoint_reader.py & 71 curated_checkpoints.json
+│   ├── backends/ & primitives/      # Hardware/interconnect specs and immutable PrimitiveTable
+│   ├── stacks/                      # L4 pluggable RuntimeStackAdapter (vllm-ascend / diffusion-native / ideal-target / raw-eager)
+│   ├── compose/                     # Single ScenarioContract composition root
+│   ├── prediction/                  # L2/L3 unified Engine, exact layer_runs replay, exposed_observer, capacity/ledger & operator families
+│   ├── sweep/ & solve.py            # Full-grid HBM admission, PD/colocated deployment solver & Pareto sweeps
+│   ├── rewrite/ & optimization/     # Legal GraphIR rewrites and independent physical lower bound L* (dual_bound.py)
+│   ├── export/                      # Pure 4-sheet script-free XLSX, trace_view.json, agent_brief.json & public_view.py allowlist
+│   ├── cli/                         # mindie-sim CLI (report / solve / export / quickstart / sweep / optimize, etc.)
+│   └── observations/ & structure*   # Streaming observation index, calibration, validation & mindie-profiler SSOT
 ├── examples/                        # Ready-to-run Case, Call, Study, and component examples
-├── docs/                            # Architecture, operator mechanisms, convergence reports & release notes
-├── tests/                           # Unit and full-fleet regression test suite
+├── docs/                            # Architecture, migration, operator mechanisms, convergence reports & release notes
+├── tests/                           # Tiered unit & regression suite organized per tests/TAXONOMY.toml
 └── pyproject.toml                   # Package build configuration and CLI script definition
 ```
 
@@ -349,8 +362,9 @@ sim/
 | Topic | Link |
 | --- | --- |
 | **`v0.9.19` / `v0.9.17` / `v0.9.16` / `v0.9.15` / `v0.9.12` / `v0.9.11` / `v0.9.5` Release Notes** | [`docs/releases/sim-0.9.19.en.md`](./docs/releases/sim-0.9.19.en.md) · [`docs/releases/sim-0.9.17.en.md`](./docs/releases/sim-0.9.17.en.md) · [`docs/releases/sim-0.9.16.en.md`](./docs/releases/sim-0.9.16.en.md) · [`docs/releases/sim-0.9.15.en.md`](./docs/releases/sim-0.9.15.en.md) · [`docs/releases/sim-0.9.12.en.md`](./docs/releases/sim-0.9.12.en.md) · [`docs/releases/sim-0.9.11.en.md`](./docs/releases/sim-0.9.11.en.md) · [`docs/releases/sim-0.9.5.md`](./docs/releases/sim-0.9.5.md) |
-| **Unified Causal Architecture & Resource Time Semantics** | [`docs/architecture.md`](./docs/architecture.md) |
-| **Modeling Fidelity, Scope & Refinement Policy** | [`docs/modeling-fidelity.md`](./docs/modeling-fidelity.md) |
+| **Runtime-Agnostic Single-Spine Architecture & Resource Time Semantics** | [`docs/architecture.md`](./docs/architecture.md) |
+| **Modeling Fidelity, Single-Spine Invariants & Refinement Policy** | [`docs/modeling-fidelity.md`](./docs/modeling-fidelity.md) |
+| **Single-Spine Migration & Zero-Shim Retirement Boundaries** | [`docs/migration.md`](./docs/migration.md) |
 | **Input Case Contracts & Hardware/Parallel Specs** | [`docs/inputs.md`](./docs/inputs.md) |
 | **Target Graph Evaluation (`graph`) & Runtime Diagnosis** | [`docs/graph-analysis.md`](./docs/graph-analysis.md) · [`docs/graph-runtime-diagnosis.md`](./docs/graph-runtime-diagnosis.md) |
 | **Callback Analysis (`call`) & Invocation Cost Contracts** | [`docs/call-analysis.md`](./docs/call-analysis.md) · [`docs/invocation-costs.md`](./docs/invocation-costs.md) |

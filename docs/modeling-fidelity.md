@@ -209,6 +209,53 @@ keeps input hashes, ranked repeated costs, candidate matching limits, separate
 signed/absolute residuals and unpaired predicted cost. No DSH wave or hardware
 experiment is launched by this diagnostic.
 
+## Single-spine fidelity invariants
+
+The runtime-agnostic single-spine architecture locks five additional fidelity
+invariants on top of the separation between structure, timing detail, and
+calibration:
+
+1. **One `Engine`, One `PrimitiveTable`, Zero Sidecar Clocks**: `Before`,
+   intermediate legal rewrites (`Graph_cfg`, `Graph_fwk`), and `Graph_After`
+   all evaluate on the exact same `Engine` and immutable `PrimitiveTable`,
+   preserving tiler-emitted `OwnerScheduleSpec` active core counts, UB
+   residency/reload passes, and serial reduction chains. Target projections never
+   bypass the engine with peak-division envelopes or secondary schedule clocks,
+   and the independent physical lower bound `L*` (`optimization/dual_bound.py`)
+   never substitutes for achievable primal latency.
+2. **Exact Native-Layer Cohort Execution (`0 ns` Drift)**: Destructive layer
+   collapsing is retired. `prediction/execution/layer_runs.py` caches compiled
+   `LayerRunProgram` templates for structurally identical body layers while
+   replaying native layer order `0..L-1` + `final` on the live `Engine` (only
+   skipping repeated frontiers with mechanical state-equivalence proof), locked
+   to `0.0000%` (`0 ns`) drift under strict `< 0.01%` integer-ns gates across
+   93-layer, 61-layer, and 48-layer models.
+3. **Checkpoint-Faithful Quantization & Single Per-Die Memory Receipt**:
+   `catalog/checkpoint_reader.py` streams `> 50 MiB` ModelSlim and native HF
+   `quantization_config` descriptors read-only alongside 71 curated real
+   checkpoints (`curated_checkpoints.json`), honoring exact
+   `layer_exceptions -> ignored_modules -> rules` precedence and rejecting
+   unknown non-empty weight tags with `ModelingError` instead of silently
+   falling back to `BF16`. Per-native-layer `CacheStateABI` (MLA, DSA Indexer,
+   KDA/GDN conv+recurrent, PLE, `C8`/`FAQuant`/`QK_MXFP8_DYNAMIC_V_MXFP8_PER_CHANNEL`,
+   and 7-family `RecoverSSM` snapshot rings) and simultaneous per-die peaks flow
+   through one `ResidentMemoryReceipt` (`prediction/capacity/ledger.py`) shared
+   identically by auto-sizing, the full-grid solver, and Sheet 3 (`"As evaluated"`).
+4. **Explicit 4-Mode Deployment & Role-SLA Boundaries**: `colocated`,
+   `pd_disaggregated`, `pd_prefill`, and `pd_decode` are declared explicitly
+   (never guessed via `"auto"`/`"pd"`), omitted `ttft_slo_ms` stays
+   unconstrained (never coerced to `5000.0 ms`), `pd_decode` forbids `ttft_slo_ms`,
+   `pd_prefill` requires `ttft_slo_ms` and forbids `tpot_slo_ms`/`itl_ms`, and
+   `DeploymentOutcome` never fabricates a `B=1` winner on infeasible cases.
+5. **Sweep-Line Conservation & Pure Public Views**:
+   `prediction/runtime/exposed_observer.py` attributes half-open `[t0, t1)`
+   slices in $O((N+G)\log(N+G))$ integer nanoseconds with exact Stream-0
+   conservation (`sum(exposed_ns) + idle_or_wait_ns == terminal_ns - start_ns`).
+   All user-facing exports (4 visible `.xlsx` sheets, Sheet 2 strictly `A:AA`,
+   Sheet 4 live span formulas + visible `A:N` fallback, and `agent_brief.json`)
+   project strictly through `export/public_view.py` with zero internal jargon
+   or silent recomputation drift.
+
 ## Issue #34 refinement boundaries
 
 Runtime verify-window state/record geometry, local projection placement, prefix

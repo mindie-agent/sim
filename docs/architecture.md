@@ -1,7 +1,14 @@
 # Architecture
 
-The public entry point is `mindie_sim.predict`. Every supported deployment uses
-`prediction.engine.Engine`. There is no separate GPU, A3, PD or calibrated engine.
+`mindie-sim` is a **runtime-agnostic, hardware-neutral single-spine causal simulator**.
+Public entry points include `mindie_sim.api` (`compose_case`, `evaluate_step`,
+`evaluate_three_tiers`, `optimize_ladder`, `evaluate_service`, `solve_sla`,
+`sweep_topology`, `export_structure`), `mindie_sim.solve.solve_deployment`,
+`mindie_sim.export`, and `mindie_sim.predict`. Every supported workload domain
+(LLM, VLM, Diffusion/DiT), hardware generation, and deployment mode executes on
+the same discrete-event `prediction.runtime.engine.Engine` and one immutable
+`PrimitiveTable`. There is no separate GPU, A3, PD, target-projection, or
+calibrated engine.
 
 The intended level is analytical resource/phase modeling plus causal event
 simulation. Timing is approximate. Correct structure does not require reproducing
@@ -9,24 +16,51 @@ kernel instructions or a compiler schedule. Choose detail by repeated cost,
 heldout trends and decision stability; see `modeling-fidelity.md` for the
 industry comparison, refinement policy and current calibration limits.
 
-## Contracts and ownership
+## Single-spine layering & `Core <-> RuntimeStackAdapter` firewall
 
-| Layer | Input -> output | Responsibility |
-| --- | --- | --- |
-| `schema`, `catalog`, `backends` | native configuration -> `Case`, `ModelSpec`, `LayerPlan`, `Hardware` | Units, structure, representation and placement |
-| `prediction.frontend` and block builders | scheduled request views -> `IterationWork` / `OpSpec` DAG | Arithmetic, storage traffic, logical dependencies and streams |
-| `prediction.program`, `matrix` | physical work + implementation -> finite resource program | Tile tails, stage ordering, supply limits, allocations and lifetimes |
-| `prediction.engine` | resource tasks -> completion events | Shared capacity, fair/FIFO service, releases and causal time |
-| `scheduler`, `capacity`, `dispatch`, `disaggregated` | request progress + resource completion -> next iteration | Admission, cache ownership, batching, preemption and handoff |
-| `metrics` | real commit events -> latency, throughput, SLO | Request-level accounting without token histories |
-| `observations`, `primitives` | raw data -> explicit parameters or independent comparisons | Provenance, exact matching, train/heldout separation |
-| `study` | explicit candidates + probes -> cost concentration and comparable rankings | Compose existing operator/graph/serving paths; retain failures and separate timing boundaries |
-| `prediction.call`, `observations.call_alignment` | callback arguments/protocol -> graph cost; preserved events -> conditional comparison | Reuse the graph engine, preserve complete callback work and independent event identities |
+Core packages (L0–L3 plus generic solver, rewrite, and export frameworks) are
+100% runtime-agnostic and follow a strict acyclic unidirectional DAG enforced by
+`AG010` (layer ordering + package SCC checks):
+
+| Layer | Canonical Modules | Input -> Output | Responsibility |
+| --- | --- | --- | --- |
+| **L0 Contracts** | `schema/{checkpoint,stack,scenario,operators,model,hardware,case}.py` | validated inputs -> frozen `ScenarioContract`, `CheckpointQuantMap`, `SLAContract`, `DeploymentMode`, `TensorPrecisionABI`, `OwnerScheduleSpec`, `CoDesignOpportunity` | Immutable domain types, explicit 4-mode deployment & role-SLA validation, deterministic digests; zero runtime-vendor imports |
+| **L1 Hardware & On-Disk Facts** | `backends/`, `primitives/`, `catalog/`, `catalog/checkpoint_reader.py`, `templates/` | native `config.json` / `> 50 MiB` streamed ModelSlim or HF quant metadata + 71 curated checkpoints (`curated_checkpoints.json`) -> `ModelSpec`, `CheckpointQuantMap`, `Hardware`, `PrimitiveTable` | Hardware resource & 4-tier interconnect profiles, read-only streaming quantization descriptors, zero silent BF16 degradation |
+| **L2 Unified Engine & Ledger** | `prediction/{runtime,execution,program,collectives,capacity}/`, `prediction/spine.py` | lowered `GraphIR` + injected lowering/quant plans -> `StepEvaluation`, `LayerRunProgram`, `StreamExposureResult`, `ResidentMemoryReceipt` | Single `Engine` + `PrimitiveTable`, exact native-layer cohort replay (`layer_runs.py`, `0 ns` drift on 93L/61L/48L), $O((N+G)\log(N+G))$ sweep-line observer (`exposed_observer.py`), simultaneous per-die HBM peak ledger (`capacity/ledger.py`) |
+| **L3 Operator Families & Sharding** | `prediction/operators/<family>/`, `prediction/sharding/` | `OpSpec` + geometry -> `KernelBinding`, `OwnerScheduleSpec`, `Program` | Governed single-rank physical kernels (`arch<NN>.py` leaves with AST-grounded `Upstream-ABI`) and distributed tensor placement / local-TP / collective monoids |
+| **L4 Pluggable Runtime Stacks** | `stacks/registry.py`, `stacks/{vllm_ascend,diffusion_native,ideal_target,raw_eager}/` | `(ModelSpec, CheckpointQuantMap, Hardware, ParallelSpec)` -> `ResolvedStackOptions`, `RuntimeQuantPlan` (`CacheStateABI` + `PreparedWeightSpec`), `StackLoweringPlan`, optional `LaunchConfigCodec` | Encapsulates all inference-engine specifics behind `RuntimeStackAdapter` (`mindie-sim.stack-adapter/1`), custom JSON manifests (`mindie-sim.stack-manifest/1`), and `mindie_sim.stacks` entry points; domain-aware default routing (`llm`/`vlm` -> `vllm-ascend`, `diffusion` -> `diffusion-native`; mismatched forced stacks raise `ModelingError`); never imports `compose/` or `export/` |
+| **L4 Composition, Solvers & Pure Export** | `compose/`, `sweep/`, `rewrite/`, `optimization/`, `export/`, `cli/`, `solve.py`, `api.py` | frozen `ScenarioContract` -> `DeploymentOutcome`, 4-stage causal waterfall, pure 4-sheet `.xlsx`, `trace_view.json`, `agent_brief.json` | Full-grid `(DP, TP, EP, PP, co-domain DCP, PCP)` admission & PD overlap solver, legal GraphIR rewrites + independent `L*` dual bound (`dual_bound.py`), strict `export/public_view.py` allowlist (4 visible sheets, 0 hidden sheets, Sheet 2 `A:AA` 27 cols, Sheet 3 `"As evaluated"`, Sheet 4 live span formulas + visible `A:N` fallback) |
+| **Observations & Profiler SSOT** | `observations/`, `observed_contracts/`, `structure*`, `subgraph_math.py`, `study.py` | captures / protocols / candidates -> calibrated parameters, independent heldout accuracy, `mindie-model-structure/1`, cohort comparisons | Provenance, train/heldout separation, and cross-repo SSOT contract with `mindie-profiler` |
 
 Model labels and source revisions are provenance. Physical work does not branch
 on them. Family adapters decode native configurations into structural records;
 they contain no latency correction tables. Hardware profiles are data, not
 alternate execution algorithms.
+
+## Explicit deployment modes, 4-stage waterfall & co-design
+
+- **Explicit 4-Mode `--deployment-mode` Contract (`schema/scenario.py`)**: Every
+  sizing or report invocation binds one of four explicit modes—`colocated`,
+  `pd_disaggregated`, `pd_prefill`, or `pd_decode`—with zero `"auto"`/`"pd"`
+  guessing and zero `5000.0 ms` TTFT coercion. `pd_decode` requires an explicit
+  `ReadyStateAssumption` and rejects `ttft_slo_ms`; `pd_prefill` requires
+  `ttft_slo_ms` and rejects `tpot_slo_ms`/`itl_ms`; `colocated` and
+  `pd_disaggregated` require `tpot_slo_ms` while keeping omitted `ttft_slo_ms`
+  explicitly unconstrained.
+- **4-Stage / 3-Owner Causal Waterfall**: Before-vs-After comparison executes on
+  one causal graph chain on the same `Engine` and `PrimitiveTable`:
+  `Before -> Graph_cfg ([1] ops_config) -> Graph_fwk ([2] framework_python) -> Graph_After ([3] kernel_dev_tune)`.
+  `OptimizationMode="simulation"` restricts execution to shipping/proposed
+  kernels and `config` track tuning only; `OptimizationMode="modeling"` unlocks
+  verified framework rewrites and tiled kernel targets while keeping the
+  independent physical lower bound `L*` (`optimization/dual_bound.py`) strictly
+  separate from primal latencies.
+- **Typed Co-Design Opportunities (`CoDesignOpportunity`)**: `MegaFusionBound`,
+  `SpaceTimeTradeoffSpec` (`recover_ssm_snapshot_ring`,
+  `prepared_weight_materialization`, `absorbed_kv_projection`,
+  `activation_recompute`), and `CrossHwOffloadSpec` feed `ComparisonPlan`,
+  Sheet 4 cards, and `agent_brief.json` with open Ascend/NPU kernel
+  recommendations targeting **`TileLang / AscendC / Catlass`**.
 
 ## Resource time
 

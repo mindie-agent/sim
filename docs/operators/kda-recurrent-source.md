@@ -25,7 +25,7 @@ The implementation follows committed local vLLM-Ascend revision
   inplace state updates and no duplicate final-state output tensor.
 
 This explicitly selected source is distinct from the retained Triton KDA
-BV=8 program and the cannbot DSL implementation. A profiler kernel name
+BV=8 program and custom-DSL kernel implementations. A profiler kernel name
 `FusedRecurrentKda` alone does not establish compiled binary equivalence.
 
 ## Executed physical mechanism

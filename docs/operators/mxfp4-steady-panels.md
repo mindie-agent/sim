@@ -50,6 +50,6 @@ Sources and reproducible controls:
   [producer/interior composition](../../mindie_sim/prediction/operators/matrix/refill_steady.py).
 - Independent A5 scans
   and mechanism/pressure controls.
-- The retained official table is
-  `refs/cannbot-knowledge/knowledge/ops/ascendc/apis/appendix/cube_instruction_theoretical_perf_summary.md`,
-  table 8, F322BF16 row. No per-model parameter was added.
+- The retained official CANN AscendC appendix table
+  (`cube_instruction_theoretical_perf_summary.md`, table 8, `F322BF16` row). No
+  per-model parameter was added.
