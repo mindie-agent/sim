@@ -122,7 +122,6 @@ BACKEND_CANN = "CANN aclnn/AscendC"
 BACKEND_ASCENDC = "AscendC"
 BACKEND_TILELANG = "TileLang"
 BACKEND_CATLASS = "Catlass"
-BACKEND_CANNBOT_DSL = "cannbot-dsl"
 BACKEND_TRITON = "Triton-Ascend"
 BACKEND_TORCH_NPU = "torch_npu Custom Op"
 BACKEND_HCCL_MC2 = "HCCL / MC2"
@@ -133,8 +132,6 @@ STRUCTURE_BACKEND_MAP: dict[str, str] = {
     "cann": BACKEND_CANN,
     "tilelang": BACKEND_TILELANG,
     "catlass": BACKEND_CATLASS,
-    "cannbot_dsl": BACKEND_TILELANG,
-    "cannbot-dsl": BACKEND_TILELANG,
     "triton": BACKEND_TRITON,
     "triton_ascend": BACKEND_TRITON,
     "triton-ascend": BACKEND_TRITON,

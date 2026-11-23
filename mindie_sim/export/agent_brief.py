@@ -1,13 +1,16 @@
 """Compact (< 8 KB) ``agent_brief.json`` builder, budget compactor & Markdown digest.
 
 [Role] Project ``ExportBundle`` comparisons and ``ComparisonPlan`` receipts into
-  a deterministic ``< 8 KB`` JSON brief (atomic same-directory persistence) and
-  crisp ~25-line Markdown executive digest sharing the exact same Waterfall,
-  cards, and 3-track roadmap rendered in the OOXML workbook.
+  a deterministic ``< 8 KB`` allowlist-only JSON brief (atomic same-directory
+  persistence) and crisp ~25-line Markdown executive digest sharing the exact
+  same Waterfall, cards, and 3-track roadmap rendered in the OOXML workbook.
 [Invariants] Strictly enforces ``len(utf8_bytes) < 8192`` including trailing LF,
-  preserves full-precision KPIs and Waterfall reconciliation fields, omits
-  ``script_audit`` and shell env-switch nags in script-free mode, and never
-  swallows ``TimeoutError`` under ``except OSError:``.
+  routes BOTH bundle and mapping overloads plus Markdown digest through
+  ``public_view.project_agent_brief_mapping`` (zero unknown keys, zero raw
+  internal track enums, zero ``str(dict)`` leaks), preserves full-precision KPIs
+  and Waterfall reconciliation fields, omits ``script_audit`` and shell
+  env-switch nags in script-free mode, and never swallows ``TimeoutError`` under
+  ``except OSError:``.
 [Timeouts & Locks] Pure O(Archetypes) in-memory projection; atomic ``os.replace``
   only inside ``export_agent_brief``.
 [Side-Effect Policy] Writes only the caller-requested brief JSON path.
@@ -39,20 +42,36 @@ from .models import (
     PENDING_KIND_TO_IMPLEMENT,
     TRACK_CONFIG_ENV,
     TRACK_FRAMEWORK,
+    TRACK_KERNEL,
     US_PER_MS,
     AlignedComparisonRow,
     ExportBundle,
     MacroModuleRow,
     format_binding_badge,
 )
+from .public_view import (
+    THREE_TRACK_LABELS,
+    format_track_label,
+    normalize_public_backend,
+    project_agent_brief_mapping,
+    project_artifacts,
+    project_codesign_opportunities,
+    project_pd_pool,
+    project_recommended_checkpoint,
+    project_script_audit,
+    project_serving_rules,
+    sanitize_public_text,
+    sanitize_source_ref,
+)
 
 #: Maximum number of compact kernel tasks embedded inside ``agent_brief.json``.
 BRIEF_MAX_KERNEL_TASKS = 5
 #: Maximum number of framework/config tasks embedded inside ``agent_brief.json``.
 BRIEF_MAX_FRAMEWORK_TASKS = 3
-#: Maximum number of synthesis specs & audit triggers embedded in ``agent_brief.json``.
+#: Maximum number of synthesis specs, co-design opportunities & audit triggers embedded.
 BRIEF_MAX_TRIGGERS = 4
 BRIEF_MAX_SPECS = 4
+BRIEF_MAX_CODESIGN_OPPS = 4
 BRIEF_MAX_CAPTURE_SIZES = 8
 #: Maximum character lengths for compact string fields inside ``agent_brief.json``.
 BRIEF_TEXT_LIMIT = 72
@@ -72,9 +91,19 @@ AGENT_BRIEF_MAX_BYTES = 8192
 AGENT_BRIEF_PRETTY_LIMIT_BYTES = 6400
 
 
-def _trim_text(text: str, limit: int = BRIEF_TEXT_LIMIT) -> str:
-    clean = " ".join(str(text or "").split())
+def _trim_text(text: Any, limit: int = BRIEF_TEXT_LIMIT) -> str:
+    clean = sanitize_public_text(text)
     return clean if len(clean) <= limit else (clean[: max(0, limit - 3)] + "...")
+
+
+def _bundle_track_label(bundle: ExportBundle) -> str:
+    raw = bundle.feature_track or (
+        bundle.effective_config.get("feature_track")
+        if isinstance(bundle.effective_config, Mapping) else ""
+    )
+    if not raw and bundle.target_envelope_applied:
+        raw = "expected_ideal"
+    return format_track_label(raw or "merged")
 
 
 def _bundle_kpi_dict(bundle: ExportBundle) -> dict[str, Any]:
@@ -85,12 +114,13 @@ def _bundle_kpi_dict(bundle: ExportBundle) -> dict[str, Any]:
     tpot_ms = ((step_ms / acc) + handoff_ms) if is_decode else step_ms
     sla = bundle.tpot_slo_ms if is_decode else bundle.ttft_slo_ms
     l_star_ms = bundle.step_l_star_lean_us / US_PER_MS
-    pool = bundle.pd_pool_summary if isinstance(bundle.pd_pool_summary, Mapping) else {}
+    pool = project_pd_pool(bundle.pd_pool_summary) or {}
     cluster_tps = pool.get("e2e_total_tps")
     if cluster_tps is None:
         cluster_tps = bundle.throughput_tokens_per_s
     return {
         "analysis_mode": bundle.analysis_mode,
+        "track_label": _bundle_track_label(bundle),
         "binding_state": bundle.binding_state,
         "has_unbound_formula_ops": bool(bundle.has_unbound_formula_ops),
         "step_ms": float(step_ms),
@@ -177,7 +207,7 @@ def _compact_agent_brief_to_budget(brief: dict[str, Any]) -> dict[str, Any]:
     if _brief_utf8_len(brief) < AGENT_BRIEF_MAX_BYTES:
         return brief
     trimmed = dict(brief)
-    for key in ("kernel_synthesis_specs", "semantic_audit_triggers"):
+    for key in ("codesign_opportunities", "kernel_synthesis_specs", "semantic_audit_triggers"):
         val = trimmed.get(key)
         if isinstance(val, list) and len(val) > 2 and _brief_utf8_len(trimmed) >= AGENT_BRIEF_MAX_BYTES:
             trimmed[key] = val[:2]
@@ -193,7 +223,7 @@ def _compact_agent_brief_to_budget(brief: dict[str, Any]) -> dict[str, Any]:
             for grp in trimmed.get("module_hierarchy", ())
         ]
     if _brief_utf8_len(trimmed) >= AGENT_BRIEF_MAX_BYTES:
-        for key in ("kernel_synthesis_specs", "semantic_audit_triggers"):
+        for key in ("codesign_opportunities", "kernel_synthesis_specs", "semantic_audit_triggers"):
             val = trimmed.get(key)
             if isinstance(val, list) and len(val) > 1:
                 trimmed[key] = val[:1]
@@ -204,8 +234,8 @@ def _compact_agent_brief_to_budget(brief: dict[str, Any]) -> dict[str, Any]:
         sc.pop("recommended_checkpoint", None)
         trimmed["scenario_and_parallelism"] = sc
     for drop_key in (
-        "va_serving_rules", "kernel_synthesis_specs", "semantic_audit_triggers",
-        "macro_wall_trigger", "generated_files",
+        "codesign_opportunities", "va_serving_rules", "kernel_synthesis_specs",
+        "semantic_audit_triggers", "macro_wall_trigger", "generated_files",
     ):
         if _brief_utf8_len(trimmed) < AGENT_BRIEF_MAX_BYTES:
             break
@@ -216,6 +246,7 @@ def _compact_agent_brief_to_budget(brief: dict[str, Any]) -> dict[str, Any]:
             )
     if _brief_utf8_len(trimmed) >= AGENT_BRIEF_MAX_BYTES and isinstance(trimmed.get("action_plan_3_tracks"), Mapping):
         plan = dict(trimmed["action_plan_3_tracks"])
+        plan.pop("track_labels", None)
         for list_key in ("kernel_tasks", "framework_tasks", "config_and_env"):
             items = plan.get(list_key)
             if isinstance(items, list) and len(items) > 2:
@@ -247,13 +278,7 @@ def _factual_wall_summary(bundle: ExportBundle) -> dict[str, Any] | None:
 
 
 def _factual_serving_facts(bundle: ExportBundle) -> dict[str, Any] | None:
-    raw = bundle.va_serving_rules_summary
-    if not isinstance(raw, Mapping):
-        return None
-    return {
-        k: v for k, v in raw.items()
-        if k != "hw_isa_guidance"
-    }
+    return project_serving_rules(bundle.va_serving_rules_summary)
 
 
 def _build_brief_l1_groups(macro_rows: Sequence[MacroModuleRow]) -> list[dict[str, Any]]:
@@ -314,10 +339,11 @@ def _build_brief_action_items(
     ][:BRIEF_MAX_FRAMEWORK_TASKS]
     kern_items = [
         {
-            "card_id": item.card_id,
+            "card_id": sanitize_public_text(item.card_id),
             "prio": f"P{item.priority}",
             "cat": "new" if item.category == PENDING_KIND_TO_IMPLEMENT else "tune",
             "kernel": _trim_text(item.target_kernel, BRIEF_KERNEL_LIMIT),
+            "backend": normalize_public_backend(item.suggested_backend),
             "submodule": _trim_text(item.submodule, BRIEF_KERNEL_LIMIT),
             "saved_ms": round(item.expected_gain_ms, 3),
             "saved_us_per_tok_die": round(item.saved_us_per_tok_die, 2),
@@ -344,34 +370,42 @@ def _build_brief_scenario_block(after: ExportBundle, par_short: str, par_detail:
         else (mem.concurrency * mem.dp)
     )
     scen_block: dict[str, Any] = {
-        "model": after.model_name, "hardware_sku": after.hardware_sku,
-        "topology_preset": after.topology_preset, "phase": after.phase,
-        "deployment_mode": after.deployment_mode, "total_dies": eff_total_dies,
+        "model": sanitize_public_text(after.model_name),
+        "hardware_sku": sanitize_public_text(after.hardware_sku),
+        "topology_preset": sanitize_public_text(after.topology_preset),
+        "phase": sanitize_public_text(after.phase),
+        "deployment_mode": sanitize_public_text(after.deployment_mode),
+        "track_label": _bundle_track_label(after),
+        "total_dies": eff_total_dies,
         "dp": mem.dp, "tp": mem.tp, "ep": mem.ep, "pp": mem.pp,
         "dcp": mem.dcp, "pcp": mem.pcp, "local_tp": mem.local_tp,
         "sequence_parallel": after.sequence_parallel,
-        "parallelism_co_domain": par_short, "module_parallel_domains": par_detail,
+        "parallelism_co_domain": sanitize_public_text(par_short),
+        "module_parallel_domains": sanitize_public_text(par_detail),
         "prompt_tokens": after.prompt_tokens, "output_tokens": after.output_tokens,
         "tpot_slo_ms": after.tpot_slo_ms, "ttft_slo_ms": after.ttft_slo_ms,
         "concurrency_per_dp": mem.concurrency, "cluster_concurrency": eff_cluster_conc,
         "max_hbm_concurrency_per_dp": mem.max_hbm_concurrency_per_dp,
-        "spec_method": after.spec_method, "spec_proposals": after.spec_proposals,
+        "spec_method": sanitize_public_text(after.spec_method),
+        "spec_proposals": after.spec_proposals,
         "avg_accepted_tokens": after.avg_accepted_tokens,
-        "weight_quant": mem.weight_quant_display or mem.weight_quant,
-        "cache_dtype": mem.cache_dtype,
+        "weight_quant": sanitize_public_text(mem.weight_quant_display or mem.weight_quant),
+        "cache_dtype": sanitize_public_text(mem.cache_dtype),
         "native_bf16_weight_gib_per_die": round(mem.native_bf16_weight_footprint_per_die_bytes / float(GIB_BYTES), 2),
         "quantized_weight_gib_per_die": round(mem.weight_footprint_per_die_bytes / float(GIB_BYTES), 2),
         "weight_compression_ratio": round(mem.weight_compression_ratio, 2),
-        "fits_hbm": mem.fits_hbm, "recommended_checkpoint": after.recommended_checkpoint,
+        "fits_hbm": mem.fits_hbm,
+        "recommended_checkpoint": project_recommended_checkpoint(after.recommended_checkpoint),
     }
-    if after.pd_pool_summary:
-        scen_block["pd_pool"] = dict(after.pd_pool_summary)
-    if after.calibration_basis:
+    pd_pool = project_pd_pool(after.pd_pool_summary)
+    if pd_pool is not None:
+        scen_block["pd_pool"] = pd_pool
+    if isinstance(after.calibration_basis, Mapping) and after.calibration_basis:
         scen_block["calibration_basis"] = {
-            "mode": after.calibration_basis.get("mode"),
+            "mode": sanitize_public_text(after.calibration_basis.get("mode") or ""),
             "calibrated": bool(after.calibration_basis.get("calibrated")),
-            "pt_sku": after.calibration_basis.get("primitive_table_sku"),
-            "cann": after.calibration_basis.get("cann_version"),
+            "pt_sku": sanitize_public_text(after.calibration_basis.get("primitive_table_sku") or ""),
+            "cann": sanitize_public_text(after.calibration_basis.get("cann_version") or ""),
         }
     return scen_block
 
@@ -384,7 +418,7 @@ def build_agent_brief(
     script_audit: Mapping[str, Any] | None = None,
     comparison_plan: ComparisonPlan | None = None,
 ) -> dict[str, Any]:
-    """Build compact (< 8 KB) deterministic JSON brief for Agent workflows."""
+    """Build compact (< 8 KB) allowlist-only deterministic JSON brief for Agent workflows."""
     from .comparison import (
         align_before_after_operators,
         build_macro_module_breakdown,
@@ -421,22 +455,36 @@ def build_agent_brief(
     speedup = round(b_kpi["step_ms"] / a_kpi["step_ms"], 2) if a_kpi["step_ms"] > 0.0 else 1.0
     synth_brief = [
         {
-            "kernel": sp.kernel_name, "tier": sp.abi_tier, "sram_ok": sp.sram_verified,
+            "kernel": sanitize_public_text(sp.kernel_name),
+            "tier": sanitize_public_text(sp.abi_tier),
+            "sram_ok": bool(sp.sram_verified),
             "ub_kb": f"{sp.ub_peak_bytes / KIB_BYTES:.1f}/{sp.ub_budget_bytes / KIB_BYTES:.1f}",
-            "math": _trim_text(" ; ".join(sp.symbolic_equations), BRIEF_MATH_LIMIT),
+            "math": _trim_text(
+                " ; ".join(
+                    sanitize_public_text(eq)
+                    for eq in (sp.symbolic_equations or ())
+                    if isinstance(eq, str)
+                ),
+                BRIEF_MATH_LIMIT,
+            ),
         }
         for sp in list(after.kernel_synthesis_specs)[:BRIEF_MAX_SPECS]
     ]
     trig_brief = [
         {
-            "id": tr.trigger_id, "kind": tr.kind,
-            "ops": list(tr.blocked_ops[:BRIEF_MAX_BLOCKED_OPS]),
+            "id": sanitize_public_text(tr.trigger_id),
+            "kind": sanitize_public_text(tr.kind),
+            "ops": [sanitize_public_text(op) for op in list(tr.blocked_ops[:BRIEF_MAX_BLOCKED_OPS]) if isinstance(op, str)],
             "gain_us_tok_die": round(tr.potential_gain_us_per_tok_die, 2),
             "reason": _trim_text(tr.blocking_reason, BRIEF_TEXT_LIMIT),
-            "refs": list(tr.source_refs[:BRIEF_MAX_REFS]),
+            "refs": [sanitize_source_ref(ref) for ref in list(tr.source_refs[:BRIEF_MAX_REFS]) if isinstance(ref, str)],
         }
         for tr in sorted(after.semantic_audit_triggers, key=lambda t: -t.potential_gain_us_per_tok_die)[:BRIEF_MAX_TRIGGERS]
     ]
+    codesign_opps = project_codesign_opportunities(
+        getattr(after, "co_design_opportunities", ()),
+        max_items=BRIEF_MAX_CODESIGN_OPPS,
+    )
     brief: dict[str, Any] = {
         "schema": AGENT_BRIEF_SCHEMA,
         "scenario_and_parallelism": _build_brief_scenario_block(after, par_short, par_detail),
@@ -451,29 +499,27 @@ def build_agent_brief(
         },
         "module_hierarchy": l1_groups,
         "action_plan_3_tracks": {
+            "track_labels": dict(THREE_TRACK_LABELS),
             "config_and_env": cfg_items, "framework_tasks": fw_items,
             "kernel_tasks": kern_items,
             "parallelism_codesign_note": _trim_text(codesign, BRIEF_CODESIGN_LIMIT),
         },
+        "codesign_opportunities": codesign_opps,
         "kernel_synthesis_specs": synth_brief,
         "semantic_audit_triggers": trig_brief,
         "macro_wall_trigger": _factual_wall_summary(after),
         "va_serving_rules": _factual_serving_facts(after),
-        "generated_files": dict(generated_files or {}),
+        "generated_files": project_artifacts(generated_files),
     }
     if script_audit is not None:
-        raw_issues = script_audit.get("issues_found") or ()
-        brief["script_audit"] = {
-            "source_script": script_audit.get("source_script", ""),
-            "issues_count": len(raw_issues),
-            "top_issues": [
-                {"id": i.get("issue_id", ""), "title": _trim_text(str(i.get("title", "")), BRIEF_KERNEL_LIMIT)}
-                for i in list(raw_issues)[:BRIEF_MAX_FRAMEWORK_TASKS]
-            ],
-            "two_step_gain": script_audit.get("two_step_gain", {}),
-            "optimized_script_path": script_audit.get("optimized_script_path", ""),
-        }
-    return _compact_agent_brief_to_budget(brief)
+        projected_sa = project_script_audit(
+            script_audit,
+            max_top_issues=BRIEF_MAX_FRAMEWORK_TASKS,
+            title_limit=BRIEF_KERNEL_LIMIT,
+        )
+        if projected_sa is not None:
+            brief["script_audit"] = projected_sa
+    return _compact_agent_brief_to_budget(project_agent_brief_mapping(brief))
 
 
 def export_agent_brief(
@@ -485,7 +531,7 @@ def export_agent_brief(
     script_audit: Mapping[str, Any] | None = None,
     comparison_plan: ComparisonPlan | None = None,
 ) -> Path | dict[str, Any]:
-    """Atomically persist compact (< 8 KB) ``agent_brief.json``."""
+    """Atomically persist compact (< 8 KB) allowlist-projected ``agent_brief.json``."""
     return_dict = False
     if isinstance(first, ExportBundle):
         after_b = second if isinstance(second, ExportBundle) else None
@@ -502,7 +548,7 @@ def export_agent_brief(
     else:
         if not isinstance(second, (str, Path)):
             raise ValueError("export_agent_brief_requires_output_path")
-        brief = _compact_agent_brief_to_budget(dict(first))
+        brief = _compact_agent_brief_to_budget(project_agent_brief_mapping(first))
         target = Path(second)
 
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -530,16 +576,58 @@ def export_agent_brief(
     return brief if return_dict else target
 
 
+def _format_infeasible_digest_lines(
+    sc: Mapping[str, Any], infeasible: Mapping[str, Any],
+) -> list[str]:
+    lines = [
+        f"## MindIE-Sim Executive Digest: {sc.get('model') or 'Model'} @ {sc.get('hardware_sku') or 'NPU'} [INFEASIBLE]",
+        (
+            f"- **Outcome**: `{infeasible.get('status') or 'infeasible'}` "
+            f"(Deployment={infeasible.get('deployment_mode') or sc.get('deployment_mode') or '—'})"
+        ),
+        f"- **Limiting Constraint**: {infeasible.get('limiting_constraint') or 'no_feasible_configuration'}",
+        (
+            f"- **Capacity & Concurrency**: Feasible B/DP={infeasible.get('feasible_b_per_dp', 0)}, "
+            f"Physical B_vram_max={infeasible.get('physical_b_vram_max', 0)}"
+            + (
+                f", Requested={infeasible['requested_concurrency']}"
+                if infeasible.get("requested_concurrency") is not None else ""
+            )
+        ),
+    ]
+    return lines
+
+
 def format_executive_digest_markdown(brief: Mapping[str, Any]) -> str:
-    """Format a crisp ~25-line executive Markdown digest for stdout or chat."""
-    sc = brief.get("scenario_and_parallelism") or {}
-    kp = brief.get("kpis_before_vs_after") or {}
+    """Format a crisp ~25-line allowlist-sanitized executive Markdown digest for stdout or chat."""
+    clean_brief = project_agent_brief_mapping(brief)
+    sc = clean_brief.get("scenario_and_parallelism") or {}
+    kp = clean_brief.get("kpis_before_vs_after") or {}
+    infeasible = clean_brief.get("infeasible_outcome")
+    if isinstance(infeasible, Mapping) and not kp:
+        lines = _format_infeasible_digest_lines(sc, infeasible)
+        artifacts = project_artifacts(clean_brief.get("generated_files"), basenames_only=True)
+        if artifacts:
+            lines.append("- **Artifacts**: " + ", ".join(f"{k}=`{v}`" for k, v in artifacts.items()))
+        return "\n".join(lines) + "\n"
+
     bef = kp.get("before") or {}
     aft = kp.get("after") or {}
-    plan = brief.get("action_plan_3_tracks") or {}
+    plan = clean_brief.get("action_plan_3_tracks") or {}
     is_modeling = str(aft.get("analysis_mode") or "") == MODE_MODELING or bool(aft.get("has_unbound_formula_ops"))
-    aft_col = "After [卡SLA目标建模终态]" if is_modeling else "After [仿真对比]"
+    bef_track = format_track_label(bef.get("track_label") or "merged")
+    aft_track = format_track_label(aft.get("track_label") or ("expected_ideal" if is_modeling else "merged"))
+    aft_col = f"After [{aft_track} · 卡SLA目标建模终态]" if is_modeling else f"After [{aft_track}]"
     bind_badge = format_binding_badge(str(aft.get("binding_state") or BINDING_STATE_BOUND))
+    sla_target = aft.get("sla_target_ms")
+    sla_cell = (
+        f"SLA <= {sla_target} ms ({aft.get('sla_regime')})"
+        if sla_target is not None
+        else f"SLA: 不限 ({aft.get('sla_regime') or 'UNCONSTRAINED'})"
+    )
+    t1_lbl = THREE_TRACK_LABELS[TRACK_CONFIG_ENV]
+    t2_lbl = THREE_TRACK_LABELS[TRACK_FRAMEWORK]
+    t3_lbl = THREE_TRACK_LABELS[TRACK_KERNEL]
     lines = [
         f"## MindIE-Sim Executive Digest: {sc.get('model')} @ {sc.get('hardware_sku')} {bind_badge}",
         (
@@ -553,17 +641,19 @@ def format_executive_digest_markdown(brief: Mapping[str, Any]) -> str:
             f"Quant={sc.get('weight_quant')}, KV={sc.get('cache_dtype')})"
         ),
         "",
-        f"| KPI | Before [当前栈仿真基线] | {aft_col} | Delta / Verdict |",
+        f"| KPI | Before [{bef_track}] | {aft_col} | Delta / Verdict |",
         "| --- | ---: | ---: | --- |",
         f"| Step Latency (ms) | {bef.get('step_ms')} | **{aft.get('step_ms')}** | -{kp.get('saved_step_ms')} ms (**{kp.get('speedup')}x**) |",
-        f"| Effective TPOT (ms) | {bef.get('effective_tpot_ms')} ({bef.get('sla_verdict')}) | **{aft.get('effective_tpot_ms')} ({aft.get('sla_verdict')})** | SLA <= {aft.get('sla_target_ms')} ms ({aft.get('sla_regime')}) |",
+        f"| Effective TPOT (ms) | {bef.get('effective_tpot_ms')} ({bef.get('sla_verdict')}) | **{aft.get('effective_tpot_ms')} ({aft.get('sla_verdict')})** | {sla_cell} |",
         f"| Amortized Cost (us/tok·die) | {bef.get('us_per_tok_die')} | **{aft.get('us_per_tok_die')}** | -{kp.get('saved_us_per_tok_die')} us/tok·die |",
         f"| Single-Die / Cluster TPS | {bef.get('single_die_tps')} / {bef.get('cluster_tps')} | **{aft.get('single_die_tps')} / {aft.get('cluster_tps')}** | tok/s |",
         f"| Physical Limit Attainment (L*/Step) | {bef.get('l_star_attainment_pct')}% | **{aft.get('l_star_attainment_pct')}%** | L*={aft.get('l_star_ms')} ms |",
         "",
-        "### 3-Track Action Plan (`Config / Diff` / `Framework` / `Kernel`)",
+        f"### 3-Track Action Plan ({t1_lbl} / {t2_lbl} / {t3_lbl})",
     ]
-    wall = brief.get("macro_wall_trigger")
+    if isinstance(infeasible, Mapping):
+        lines.append(f"- **Infeasible Constraint**: {infeasible.get('limiting_constraint') or infeasible.get('status')}")
+    wall = clean_brief.get("macro_wall_trigger")
     if isinstance(wall, Mapping) and wall.get("wall_kind") not in {None, "", "BALANCED"}:
         lines.append(
             f"- **Macro Wall (`{wall.get('wall_kind')}`)**: "
@@ -571,18 +661,21 @@ def format_executive_digest_markdown(brief: Mapping[str, Any]) -> str:
         )
     for cfg in (plan.get("config_and_env") or ())[:BRIEF_DIGEST_MAX_CFG]:
         detail = cfg.get("cmd") or f"{cfg.get('before', '')} -> {cfg.get('after', '')}"
-        lines.append(f"- **[Config]** {cfg.get('title')}: `{detail}`")
+        lines.append(f"- **{t1_lbl}** {cfg.get('title')}: `{detail}`")
     for fw in (plan.get("framework_tasks") or ())[:BRIEF_DIGEST_MAX_FW]:
-        lines.append(f"- **[Framework]** {fw.get('title')} (-{fw.get('saved_ms')} ms): {fw.get('work')}")
+        lines.append(f"- **{t2_lbl}** {fw.get('title')} (-{fw.get('saved_ms')} ms): {fw.get('work')}")
     for kt in (plan.get("kernel_tasks") or ())[:BRIEF_DIGEST_MAX_KERN]:
         lines.append(
-            f"- **[Kernel `{kt.get('card_id')}`]** {kt.get('kernel')} "
+            f"- **{t3_lbl} (`{kt.get('card_id')}`)** {kt.get('kernel')} "
             f"({kt.get('before_ms')}->{kt.get('after_ms')} ms, -{kt.get('saved_us_per_tok_die')} us/tok·die): {kt.get('summary')}"
         )
+    for opp in (clean_brief.get("codesign_opportunities") or ())[:BRIEF_DIGEST_MAX_FW]:
+        lines.append(f"- **Co-Design Opp (`{opp.get('kind')}`)**: {opp.get('title')}")
     if plan.get("parallelism_codesign_note"):
         lines.append(f"- **Co-Design**: {plan['parallelism_codesign_note']}")
-    if brief.get("generated_files"):
-        files_str = ", ".join(f"{k}=`{v}`" for k, v in brief["generated_files"].items())
+    artifacts = project_artifacts(clean_brief.get("generated_files"), basenames_only=True)
+    if artifacts:
+        files_str = ", ".join(f"{k}=`{v}`" for k, v in artifacts.items())
         lines.append(f"- **Artifacts**: {files_str}")
     return "\n".join(lines) + "\n"
 

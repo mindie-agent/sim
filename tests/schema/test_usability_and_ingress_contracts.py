@@ -357,7 +357,7 @@ def test_v5_five_content_bugs_regression_locks() -> None:
         (4, 128), "bf16", a5_case_obj, None, (),
         native_binding={"kernels": [{"name": "Add"}]},
     )
-    assert desc.ascend_kernel == "recover_ssm_state_commit"
+    assert desc.ascend_kernel == "RecoverSSMStateCommit"
     rows, demands = [], []
     for idx in range(69):
         oid = f"s0.l{idx}.recover_ssm_commit"
@@ -390,15 +390,17 @@ def test_v5_five_content_bugs_regression_locks() -> None:
     assert "feature_track" not in pub and "moe_route" not in pub
     assert pub["enable_fused_mc2"] == 3 and pub["multistream_overlap_shared_expert"] is False
 
-    # Bug 4: Sub-threshold (<NEW_KERNEL_MIN_SAVED_MS) new_groups entry is filtered out under comparison mode.
+    # Bug 4: Sub-threshold (<NEW_KERNEL_MIN_SAVED_MS = 0.050 ms) new_groups entries are filtered out under comparison mode.
+    assert NEW_KERNEL_MIN_SAVED_MS == pytest.approx(0.050)
     q_new, q_keys = _qualify_action_groups(
         {
             "micro_quant": {"gain_ms": 0.000988, "gain_upt": 0.05, "has_split": False, "gap_ms": 0.001},
-            "material_op": {"gain_ms": 0.014, "gain_upt": 0.7, "has_split": False, "gap_ms": 0.02},
+            "sub_50us_fusion": {"gain_ms": 0.014, "gain_upt": 0.7, "has_split": False, "gap_ms": 0.02},
+            "material_op": {"gain_ms": 0.050, "gain_upt": 1.2, "has_split": False, "gap_ms": 0.06},
         },
         is_comparison=True, check_gap_when_single=False, min_saved_ms=NEW_KERNEL_MIN_SAVED_MS,
     )
-    assert [e["gain_ms"] for e in q_new] == [0.014] and q_keys == {"material_op"}
+    assert [e["gain_ms"] for e in q_new] == [0.050] and q_keys == {"material_op"}
 
     # Bug 5: Symbolic equations for megamoe_arch35 and moe_gating_topk are accurate.
     k_mm = _resolve_symbolic_kind("grouped_moe", "megamoe_arch35", {}, AlgebraicTrait.BILINEAR_MATMUL, "situ")

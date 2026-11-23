@@ -633,3 +633,13 @@ owns = [
   "mindie_sim/prediction/runtime/exposed_observer.py",
   "mindie_sim/rewrite/algebra.py",
 ]
+
+[[module]]
+path = "product/test_public_allowlist_and_codec.py"
+tier = "tier0"
+owns = [
+  "mindie_sim/export/public_view.py",
+  "mindie_sim/export/action_plan.py",
+  "mindie_sim/export/agent_brief.py",
+  "mindie_sim/export/kernel_catalog.py",
+]

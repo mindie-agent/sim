@@ -9,7 +9,7 @@
     Host Launch`` (``aclGraphLaunch`` / ``aclrtLaunchKernel`` + ``HostToDevice``
     flow arrows);
   - ``Ascend Hardware`` (``Stream 0/1/2`` named with real Ascend/CANN/Triton/
-    cannbot-dsl kernels + physically grounded ``Cube (AIC)``, ``Vector (AIV)``,
+    TileLang/AscendC kernels + physically grounded ``Cube (AIC)``, ``Vector (AIV)``,
     ``MTE2``, ``MTE3``, ``Fixpipe`` pipe durations and ``aic_mac_ratio`` /
     ``aiv_vec_ratio`` / ``mte2_ratio`` / ``mte3_ratio`` / ``fixpipe_ratio``);
   - ``HCCL`` (Planes 0/1/2 named with ``hcom_*`` / MC2 kernels);

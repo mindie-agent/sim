@@ -1,4 +1,4 @@
-"""Executable SRAM, GM and synchronization schedules for the DSL reference ABIs.
+"""Executable SRAM, GM and synchronization schedules for TileLang/AscendC DSL ABIs.
 
 [Role] Lower each admitted K3 specialization onto shared engine stages.
 [Invariants] GM scratch remains visible in the ledger. Direct routes carry
