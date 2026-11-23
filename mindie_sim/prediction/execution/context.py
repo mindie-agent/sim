@@ -62,6 +62,7 @@ from .streams import (
 MS_PER_S = 1000.0
 _RATE_EQ_REL_TOL = 1e-9
 PREPARE_CACHE_LIMIT = 512
+PREPARED_OPS_CACHE_LIMIT = 16384
 DEVICE_UNITS_CACHE_LIMIT = 64
 SERVICE_IDENTITY_CACHE_LIMIT = 1024
 INLINE_FRONTIER_TASK_CAP = 49152
@@ -529,6 +530,29 @@ class _ContextMixin:
     def _apply_stream_owners_program(self, context, program):
         return apply_stream_owners(self.stream_quota_by_res, context, program)
 
+    def _record_prepared_op(self, replica: int, op: Any) -> None:
+        """Persist the prepared executable OpSpec on Execution and EvaluationContext."""
+        op_id = getattr(op, "op_id", None)
+        if not op_id:
+            return
+        key = (int(replica), str(op_id))
+        own_map = getattr(self, "prepared_ops", None)
+        if own_map is None:
+            own_map = {}
+            self.prepared_ops = own_map
+        if len(own_map) >= PREPARED_OPS_CACHE_LIMIT and key not in own_map:
+            own_map.pop(next(iter(own_map)))
+        own_map[key] = op
+        evaluation = getattr(self, "evaluation", None)
+        if evaluation is not None:
+            eval_map = getattr(evaluation, "prepared_ops", None)
+            if eval_map is None:
+                eval_map = {}
+                evaluation.prepared_ops = eval_map
+            if len(eval_map) >= PREPARED_OPS_CACHE_LIMIT and key not in eval_map:
+                eval_map.pop(next(iter(eval_map)))
+            eval_map[key] = op
+
     def prepare(self, op, replica=0):
         from ..efficiency.unmodeled_gate import assert_timing_supported
         assert_timing_supported(None, (op,), entry="execution_prepare")
@@ -573,11 +597,13 @@ class _ContextMixin:
             if meta_diff is not None:
                 patched = _meta_patch(dict(op.metadata), meta_diff)
                 meta = tuple(sorted(patched.items()))
-            return replace(
+            resolved = replace(
                 cached_op, op_id=op.op_id, layer=op.layer, deps=op.deps,
                 requests=op.requests, stream=op.stream, notes=op.notes,
                 metadata=meta,
-            ), recipe
+            )
+            self._record_prepared_op(replica, resolved)
+            return resolved, recipe
         res_op, recipe = self.recipes.prepare(op, geom)
         from ..collectives.waves import startup_waves_recipe
         recipe = startup_waves_recipe(res_op, recipe, startup_mode)
@@ -593,6 +619,7 @@ class _ContextMixin:
         if len(self._prepare_cache) >= PREPARE_CACHE_LIMIT:
             self._prepare_cache.pop(next(iter(self._prepare_cache)))
         self._prepare_cache[prep_key] = (res_op, meta_diff, recipe)
+        self._record_prepared_op(replica, res_op)
         return res_op, recipe
 
     def destination_window_resource(self, destination_rank: int, stage: int) -> str | None:
@@ -672,9 +699,12 @@ class _ContextMixin:
         recipe = startup_waves_recipe(
             op, recipe, self.case.runtime.collective_startup_mode)
         dies = self.stage_dies[replica, op.stage]
+        orig_op = op
         op = resolve_matrix_precision(
             op, devices=dies,
             policy=self.case.runtime.matrix_compute_policy, recipe=recipe)
+        if op is not orig_op or (replica, op.op_id) not in getattr(self, "prepared_ops", ()):
+            self._record_prepared_op(replica, op)
         cost = self.cost.price(op, scope)
         template = self.stage_contexts[replica, op.stage]
         transport_options = (resolve_transport_options(recipe, op)

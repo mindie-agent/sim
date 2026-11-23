@@ -647,9 +647,12 @@ def test_synthesis_dp_tuples_causal_tail_no_byte_inflation_opportunity_bounds_an
         contended_node, die_tag="d0", lane_id="main", datapath=dp_cap, rates=rates, peaks=peaks,
         service_modes=svc_modes, link_bps=link_bps, owners=None, has_topology_plan=False, launch_floor_us=0.0,
     )
-    hbm_peak = float(rates.get("hbm") or max(dp_cap.hbm_read_bytes_per_s, dp_cap.hbm_write_bytes_per_s))
-    eff_hbm = causal_tail_mod._effective_hbm_rate_bps(1024.0, 1024.0, hbm_peak, svc_modes)
-    assert demand.get("memory@d0", 0.0) == pytest.approx(2048.0 * (hbm_peak / eff_hbm))
+    hbm_r_bps, hbm_w_bps, alpha_rw = causal_tail_mod._directional_hbm_bus_params(dp_cap, rates)
+    exp_r_ms = (1024.0 / (hbm_r_bps / 1000.0)) + alpha_rw * (1024.0 / (hbm_w_bps / 1000.0))
+    exp_w_ms = (1024.0 / (hbm_w_bps / 1000.0)) + alpha_rw * (1024.0 / (hbm_r_bps / 1000.0))
+    assert "memory@d0" not in demand
+    assert demand.get("memory@d0:r", 0.0) == pytest.approx(exp_r_ms)
+    assert demand.get("memory@d0:w", 0.0) == pytest.approx(exp_w_ms)
     assert lat_ms == pytest.approx(0.012)
 
     # 3. Unaggregated hybrid nodes (repeat_count==1) preserve native ordinal order with zero arch_barrier.

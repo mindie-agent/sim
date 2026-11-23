@@ -26,6 +26,7 @@ from typing import Any
 
 from mindie_sim.prediction.collectives import Topology
 from mindie_sim.prediction.engine import Allocation, Engine, Resource
+from mindie_sim.prediction.operators.matrix.matrix_precision import resolve_matrix_precision
 from mindie_sim.prediction.results import OpOccurrence
 from mindie_sim.prediction.runtime.exposed_observer import (
     ServiceGrantObserver,
@@ -44,6 +45,7 @@ from mindie_sim.schema.case import Case
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.datapath import DatapathCapabilitySpec, datapath_for_die, ub_peer_edges_for_rank
 from mindie_sim.schema.hardware import Device
+from mindie_sim.schema.operators import OpSpec
 
 BARRIER_EPS_US = 1e-3
 US_PER_MS = 1000.0
@@ -67,8 +69,10 @@ DEFAULT_CUBE_TILE_M = 128
 DEFAULT_CUBE_TILE_N = 128
 MATMUL_3D_RANK = 3
 DEFAULT_VEC_TILE_ELEMS = 4096
-HBM_RW_ASYMMETRY_RATIO = 1.5
 ZERO_AIC_COMM_FAMILIES = frozenset({"dispatch", "combine", "alltoall", "alltoallv", "mc2_transport", "mc2_protocol"})
+EP_DEFAULT_COMM_FAMILIES = frozenset({"dispatch", "combine", "alltoall", "alltoallv", "grouped_moe", "mc2", "fused_moe_mc2"})
+INTRA_LINK_SCOPES = frozenset({"package", "node", "intra_node", "intra_package"})
+INTRA_PACKAGE_SCOPES = frozenset({"package", "intra_package"})
 #: Legal ``enable_fused_mc2`` level constants (matching upstream ``vllm-ascend``).
 FUSED_MC2_ROUTED_LEVEL = 2
 FUSED_MC2_SHARED_LEVEL = 3
@@ -568,12 +572,152 @@ def format_stream_core_budget_receipt(owners_by_lane: Mapping[str, StreamOwners]
     return f"disjoint ({', '.join(parts)})"
 
 
+def _active_comm_width(case: Case) -> int:
+    parallel = case.runtime.parallel
+    return max(
+        1,
+        int(parallel.tp) * int(parallel.pcp),
+        int(parallel.ep),
+        int(parallel.cp),
+    )
+
+
+def _node_group_width(node: Any, case: Case | None, default_width: int) -> int:
+    if case is None:
+        return max(1, int(default_width))
+    parallel = case.runtime.parallel
+    spec = getattr(node, "spec", None)
+    meta = dict(getattr(spec, "metadata", ()) or ()) if spec is not None else {}
+    axis = str(meta.get("group_axis") or "").strip().lower()
+    if not axis:
+        fam = str(getattr(node, "family", "") or "").strip().lower()
+        axis = "ep" if fam in EP_DEFAULT_COMM_FAMILIES else "tp"
+    if axis == "ep":
+        width = int(parallel.ep)
+    elif axis in {"cp", "dcp_a2a", "dcp_dp"}:
+        width = int(parallel.cp)
+    elif axis == "pcp":
+        width = int(parallel.pcp)
+    elif axis == "pp":
+        width = int(parallel.pp)
+    elif axis == "local_tp":
+        width = max(
+            int(parallel.tp),
+            int(getattr(parallel, "o_proj_tp", 1) or 1),
+            int(getattr(parallel, "linear_proj_tp", 1) or 1),
+            int(getattr(parallel, "lm_head_tp", 1) or 1),
+        )
+    else:
+        width = int(parallel.tp) * int(parallel.pcp)
+    return max(1, width if width > 1 else int(default_width))
+
+
+def _link_effective_bps(lnk: Any, active_width: int) -> float:
+    b_ms = float(getattr(lnk, "capacity_bytes_per_ms", 0.0) or 0.0)
+    raw_bps = (
+        b_ms * MS_PER_SECOND
+        if b_ms > 0.0
+        else float(getattr(lnk, "capacity_gbps", 0.0) or 0.0) * BYTES_PER_GB
+    )
+    if raw_bps <= 0.0:
+        return 0.0
+    sem = str(getattr(lnk, "semantics", "") or "").strip().lower()
+    members = getattr(lnk, "members", ()) or ()
+    width = max(1, int(active_width))
+    span = min(width, len(members)) if members else width
+    if sem == "per_pair":
+        eff = raw_bps * float(max(1, span - 1))
+        ep_rates = [
+            float(r) * MS_PER_SECOND
+            for _, r in (getattr(lnk, "endpoint_rates", ()) or ())
+            if float(r) > 0.0
+        ]
+        if ep_rates:
+            eff = min(eff, max(ep_rates))
+    elif sem == "shared":
+        eff = raw_bps / float(max(1, span))
+    else:
+        eff = raw_bps
+    sw_cap = getattr(lnk, "switch_capacity_bytes_per_ms", None)
+    if sw_cap is not None and float(sw_cap) > 0.0:
+        eff = min(eff, float(sw_cap) * MS_PER_SECOND)
+    return eff
+
+
+def _is_intra_link(lnk: Any) -> bool:
+    ch = str(getattr(lnk, "channel", "") or "").lower()
+    scope = str(getattr(lnk, "scope", "") or "").lower()
+    return "intra_node" in ch or "intra_package" in ch or scope in INTRA_LINK_SCOPES
+
+
+def _is_intra_package_link(lnk: Any, dies_per_package: int) -> bool:
+    ch = str(getattr(lnk, "channel", "") or "").lower()
+    scope = str(getattr(lnk, "scope", "") or "").lower()
+    members = getattr(lnk, "members", ()) or ()
+    return (
+        "intra_package" in ch
+        or scope in INTRA_PACKAGE_SCOPES
+        or (dies_per_package > 1 and bool(members) and len(members) <= dies_per_package)
+    )
+
+
+def _resolve_die_link_supply_bps(
+    die_rank: int,
+    links: Sequence[Any],
+    *,
+    active_width: int | None = None,
+    ranks_per_node: int = 0,
+    dies_per_package: int = 1,
+    fallback_bps: float = 0.0,
+) -> float:
+    if not links:
+        return fallback_bps
+    die_links = [
+        lnk for lnk in links
+        if not getattr(lnk, "members", ()) or int(die_rank) in lnk.members
+    ] or list(links)
+    width = (
+        max(1, int(active_width))
+        if active_width is not None and int(active_width) > 0
+        else max((len(getattr(lnk, "members", ()) or ()) for lnk in die_links), default=1)
+    )
+    width = max(1, width)
+    covering = [
+        lnk for lnk in die_links
+        if not getattr(lnk, "members", ()) or len(lnk.members) >= width
+    ]
+    pool = covering if covering else die_links
+    if dies_per_package > 1 and width <= dies_per_package:
+        pkg_links = [lnk for lnk in pool if _is_intra_package_link(lnk, dies_per_package)]
+        if pkg_links:
+            pool = pkg_links
+    elif ranks_per_node > 0:
+        within_node = width <= ranks_per_node
+        tier = [lnk for lnk in pool if _is_intra_link(lnk) == within_node]
+        if tier:
+            pool = tier
+    elif dies_per_package > 1 and width > dies_per_package:
+        non_pkg = [lnk for lnk in pool if not _is_intra_package_link(lnk, dies_per_package)]
+        if non_pkg:
+            pool = non_pkg
+    bws = [bw for lnk in pool if (bw := _link_effective_bps(lnk, width)) > 0.0]
+    return min(bws) if bws else fallback_bps
+
+
 def _effective_die_supply(
-    die: Device, links: Sequence[Any], channels: Sequence[Any], primitive_table: Any = None,
+    die: Device,
+    links: Sequence[Any],
+    channels: Sequence[Any],
+    primitive_table: Any = None,
+    *,
+    active_width: int | None = None,
+    ranks_per_node: int = 0,
+    dies_per_package: int = 1,
 ) -> tuple[DatapathCapabilitySpec, dict[str, float], dict[str, float], dict[str, tuple[str, float]], float]:
     ub_edges = ub_peer_edges_for_rank(die.rank, links, channels)
     datapath = datapath_for_die(die, ub_peer_edges=ub_edges)
     rates = dict(die.rates)
+    orig_hbm_cap = float(rates.get("hbm") or 0.0)
     peaks = dict(die.compute_peaks)
     service_modes = dict(die.service_modes)
     if primitive_table is not None:
@@ -584,29 +728,45 @@ def _effective_die_supply(
         for dt, pk in overlay.compute_peaks:
             if pk > 0.0:
                 peaks[dt] = pk
+        dp_updates: dict[str, Any] = {}
         if overlay.hbm_read_bytes_per_s is not None:
-            service_modes["mte2_aiv_dram"] = ("mte2_aiv" if "mte2_aiv" in rates else "mte2", overlay.hbm_read_bytes_per_s)
+            hbm_r_ov = float(overlay.hbm_read_bytes_per_s)
+            dp_updates["hbm_read_bytes_per_s"] = min(hbm_r_ov, orig_hbm_cap) if orig_hbm_cap > 0.0 else hbm_r_ov
+            service_modes["mte2_aiv_dram"] = ("mte2_aiv" if "mte2_aiv" in rates else "mte2", hbm_r_ov)
         if overlay.hbm_write_bytes_per_s is not None:
-            service_modes["hbm_write_dram"] = ("hbm", overlay.hbm_write_bytes_per_s)
+            hbm_w_ov = float(overlay.hbm_write_bytes_per_s)
+            dp_updates["hbm_write_bytes_per_s"] = min(hbm_w_ov, orig_hbm_cap) if orig_hbm_cap > 0.0 else hbm_w_ov
+            service_modes["hbm_write_dram"] = ("hbm", hbm_w_ov)
+        if overlay.hbm_rw_alpha is not None:
+            dp_updates["hbm_rw_alpha"] = float(overlay.hbm_rw_alpha)
+        if dp_updates:
+            datapath = replace(datapath, **dp_updates)
         if overlay.hbm_rw11_bytes_per_s is not None:
             service_modes["hbm_rw11_dram"] = ("hbm", overlay.hbm_rw11_bytes_per_s)
         if overlay.hbm_rw21_bytes_per_s is not None:
             service_modes["hbm_rw21_dram"] = ("hbm", overlay.hbm_rw21_bytes_per_s)
-    link_bps = float(rates.get("link") or 0.0)
-    if links:
-        def _lbps(lnk: Any) -> float:
-            b_ms = float(getattr(lnk, "capacity_bytes_per_ms", 0.0) or 0.0)
-            return b_ms * MS_PER_SECOND if b_ms > 0.0 else float(getattr(lnk, "capacity_gbps", 0.0) or 0.0) * BYTES_PER_GB
-
-        best_bps = max((_lbps(lnk) for lnk in links), default=0.0)
-        if best_bps > 0.0:
-            link_bps = best_bps
+    link_bps = _resolve_die_link_supply_bps(
+        int(die.rank),
+        links,
+        active_width=active_width,
+        ranks_per_node=ranks_per_node,
+        dies_per_package=dies_per_package,
+        fallback_bps=float(rates.get("link") or 0.0),
+    )
     return datapath, rates, peaks, service_modes, link_bps
 
 
 def _cube_peak_for_dtype(peaks: Mapping[str, float], dtype: str) -> float:
     tok = str(dtype or "bf16").strip().lower()
-    aliases = {"bfloat16": "bf16", "float16": "fp16", "float32": "fp32", "fp8_e4m3": "fp8", "fp8_e5m2": "fp8"}
+    aliases = {
+        "bfloat16": "bf16",
+        "float16": "fp16",
+        "float32": "fp32",
+        "fp8_e4m3": "fp8",
+        "fp8_e5m2": "fp8",
+        "fp4_e2m1": "mxfp4",
+        "fp4": "mxfp4",
+    }
     for key in (tok, aliases.get(tok, tok), "bf16", "fp16"):
         val = float(peaks.get(key, 0.0) or 0.0)
         if val > 0.0:
@@ -614,8 +774,22 @@ def _cube_peak_for_dtype(peaks: Mapping[str, float], dtype: str) -> float:
     return max((float(v) for v in peaks.values() if float(v) > 0.0), default=0.0)
 
 
-def _node_cube_peak_ms(node: Any, peaks: Mapping[str, float]) -> float:
-    spec = getattr(node, "spec", None)
+def _node_cube_peak_ms(
+    node: Any,
+    peaks: Mapping[str, float],
+    *,
+    die: Device | None = None,
+    policy: str = "auto",
+) -> tuple[float, bool]:
+    raw_spec = getattr(node, "spec", None)
+    spec = (
+        resolve_matrix_precision(raw_spec, devices=(die,), policy=policy, recipe=None)
+        if (raw_spec is not None and die is not None and isinstance(raw_spec, OpSpec))
+        else raw_spec
+    )
+    node_dt = str(getattr(node, "dtype", "bf16") or "bf16").strip().lower()
+    resolved_dt = str(getattr(spec, "dtype", "") or node_dt).strip().lower() if spec is not None else node_dt
+    upgraded = bool(raw_spec is not None and spec is not None and resolved_dt != node_dt)
     entries = getattr(spec, "matrix_flops", ()) if spec is not None else ()
     if entries:
         total = sum(
@@ -624,32 +798,75 @@ def _node_cube_peak_ms(node: Any, peaks: Mapping[str, float]) -> float:
             if float(fl) > 0.0 and (pk := _cube_peak_for_dtype(peaks, str(dt))) > 0.0
         )
         if total > 0.0:
-            return total
+            return total, upgraded
     flops = float(getattr(node, "flops", 0.0) or 0.0)
     if flops <= 0.0:
-        return 0.0
-    pk = _cube_peak_for_dtype(peaks, str(getattr(node, "dtype", "bf16") or "bf16"))
-    return (MS_PER_SECOND * flops / pk) if pk > 0.0 else 0.0
+        return 0.0, False
+    pk = _cube_peak_for_dtype(peaks, resolved_dt)
+    return ((MS_PER_SECOND * flops / pk) if pk > 0.0 else 0.0), upgraded
 
 
-def _effective_hbm_rate_bps(
-    hbm_read: float, hbm_write: float, hbm_peak: float, service_modes: Mapping[str, tuple[str, float]],
-) -> float:
-    def _mode_rate(name: str) -> float | None:
-        entry = service_modes.get(name)
-        return float(entry[1]) if (entry is not None and float(entry[1]) > 0.0) else None
+def _directional_hbm_bus_params(
+    datapath: DatapathCapabilitySpec, rates: Mapping[str, float],
+) -> tuple[float, float, float]:
+    """Return ``(read_bps, write_bps, alpha_rw)`` matching Engine's directional HBM bus."""
+    fallback = float(rates.get("hbm") or 0.0)
+    read_bps = float(getattr(datapath, "hbm_read_bytes_per_s", 0.0) or 0.0) or fallback
+    write_bps = float(getattr(datapath, "hbm_write_bytes_per_s", 0.0) or 0.0) or fallback
+    alpha_rw = max(0.0, min(1.0, float(getattr(datapath, "hbm_rw_alpha", 0.0) or 0.0)))
+    return read_bps, write_bps, alpha_rw
 
-    if hbm_read <= 0.0 or hbm_write > HBM_RW_ASYMMETRY_RATIO * hbm_read:
-        rate = _mode_rate("hbm_write_dram") or _mode_rate("mte2_aiv_dram")
-    elif hbm_write <= 0.0:
-        rate = _mode_rate("mte2_aiv_dram")
-    elif hbm_read > HBM_RW_ASYMMETRY_RATIO * hbm_write:
-        rate = _mode_rate("hbm_rw21_dram") or _mode_rate("mte2_aiv_dram")
-    else:
-        rate = _mode_rate("hbm_rw11_dram") or _mode_rate("hbm_rw21_dram") or _mode_rate("mte2_aiv_dram")
-    if rate is None or rate <= 0.0:
-        return hbm_peak
-    return min(rate, hbm_peak) if hbm_peak > 0.0 else rate
+
+def _node_hbm_rw_bytes(
+    hbm_r: float, hbm_w: float, hbm_tot: float, mte2_b: float, mte3_b: float, fixpipe_b: float,
+) -> tuple[float, float]:
+    if hbm_r > 0.0 or hbm_w > 0.0:
+        return hbm_r, hbm_w
+    if hbm_tot <= 0.0:
+        return 0.0, 0.0
+    w_pipe = mte3_b + fixpipe_b
+    if mte2_b > 0.0 and w_pipe > 0.0:
+        r_share = mte2_b / (mte2_b + w_pipe)
+        return hbm_tot * r_share, hbm_tot * (1.0 - r_share)
+    if w_pipe > 0.0 and mte2_b <= 0.0:
+        return 0.0, hbm_tot
+    return hbm_tot, 0.0
+
+
+def _split_mte2_bytes(
+    mte2_b: float,
+    *,
+    cube_ms: float,
+    vec_ms: float,
+    spec: Any,
+    has_aic_pipe: bool,
+    has_aiv_pipe: bool,
+    is_disjoint: bool,
+    aic_eff: int,
+    aiv_eff: int,
+) -> tuple[float, float]:
+    """Partition ``mte2_b`` conservatively across ``(mte2_aic, mte2_aiv)``."""
+    if not (has_aic_pipe and has_aiv_pipe):
+        return (mte2_b, 0.0) if (has_aic_pipe and cube_ms > 0.0 and vec_ms <= 0.0) else (0.0, mte2_b)
+    if is_disjoint and aiv_eff <= 0 and aic_eff > 0:
+        return mte2_b, 0.0
+    if is_disjoint and aic_eff <= 0 and aiv_eff > 0:
+        return 0.0, mte2_b
+    if spec is not None:
+        meta = dict(getattr(spec, "metadata", ()) or ())
+        res_work = meta.get("resource_work")
+        if isinstance(res_work, Mapping):
+            rw_aic = max(0.0, float(res_work.get("mte2_aic", 0.0) or 0.0))
+            rw_aiv = max(0.0, float(res_work.get("mte2_aiv", 0.0) or 0.0))
+            if rw_aic + rw_aiv > 0.0:
+                aic_share = rw_aic / (rw_aic + rw_aiv)
+                return mte2_b * aic_share, mte2_b * (1.0 - aic_share)
+    if cube_ms > 0.0 and vec_ms <= 0.0:
+        return mte2_b, 0.0
+    if cube_ms <= 0.0:
+        return 0.0, mte2_b
+    aic_share = cube_ms / (cube_ms + vec_ms)
+    return mte2_b * aic_share, mte2_b * (1.0 - aic_share)
 
 
 def _estimate_core_tiles(node: Any, *, kind: str, full_cores: int) -> int:
@@ -678,19 +895,79 @@ def _wave_scale_factor(tiles: int, full_cores: int, eff_cores: int) -> float:
     return float(max(1, math.ceil(tiles / eff_cores))) / float(max(1, math.ceil(tiles / full_cores)))
 
 
+def _add_mte2_demands(
+    demand: dict[str, float],
+    solo_ms: dict[str, float],
+    aic_res: list[str],
+    aiv_res: list[str],
+    *,
+    mte2_b: float,
+    cube_ms: float,
+    vec_ms: float,
+    spec: Any,
+    die_tag: str,
+    sfx: str,
+    rates: Mapping[str, float],
+    hbm_peak: float,
+    is_disjoint: bool,
+    aic_eff: int,
+    aiv_eff: int,
+) -> None:
+    if mte2_b <= 0.0:
+        return
+    has_aic_pipe = "mte2_aic" in rates
+    has_aiv_pipe = "mte2_aiv" in rates
+    if not has_aic_pipe and not has_aiv_pipe:
+        m2_r = float(rates.get("mte2") or hbm_peak or 0.0)
+        if m2_r <= 0.0:
+            return
+        use_aic = (cube_ms > 0.0 and vec_ms <= 0.0) or (is_disjoint and aiv_eff <= 0 and aic_eff > 0)
+        m2_sfx = sfx if (is_disjoint and (aic_eff > 0 if use_aic else aiv_eff > 0)) else ""
+        rname = f"mte2@{die_tag}{m2_sfx}"
+        demand[rname], solo_ms[rname] = mte2_b, (mte2_b / m2_r) * MS_PER_SECOND
+        (aic_res if use_aic else aiv_res).append(rname)
+        return
+    aic_b, aiv_b = _split_mte2_bytes(
+        mte2_b, cube_ms=cube_ms, vec_ms=vec_ms, spec=spec,
+        has_aic_pipe=has_aic_pipe, has_aiv_pipe=has_aiv_pipe,
+        is_disjoint=is_disjoint, aic_eff=aic_eff, aiv_eff=aiv_eff,
+    )
+    for bytes_amt, pipe_key, target_list, eff_units in (
+        (aic_b, "mte2_aic" if has_aic_pipe else "mte2", aic_res, aic_eff),
+        (aiv_b, "mte2_aiv" if has_aiv_pipe else "mte2", aiv_res, aiv_eff),
+    ):
+        if bytes_amt <= 0.0:
+            continue
+        m2_r = float(rates.get(pipe_key) or hbm_peak or 0.0)
+        if m2_r <= 0.0:
+            continue
+        m2_sfx = sfx if (is_disjoint and eff_units > 0) else ""
+        rname = f"{pipe_key}@{die_tag}{m2_sfx}"
+        demand[rname] = demand.get(rname, 0.0) + bytes_amt
+        solo_ms[rname] = (demand[rname] / m2_r) * MS_PER_SECOND
+        if rname not in target_list:
+            target_list.append(rname)
+
+
 def _node_physical_demand_and_placement(
     node: Any, *, die_tag: str, lane_id: str, datapath: DatapathCapabilitySpec,
     rates: Mapping[str, float], peaks: Mapping[str, float],
     service_modes: Mapping[str, tuple[str, float]], link_bps: float,
     owners: StreamOwners | None, has_topology_plan: bool, launch_floor_us: float,
+    die: Device | None = None, case: Case | None = None, active_width: int = 1,
 ) -> tuple[dict[str, float], dict[str, tuple[int, ...]], float, bool]:
+    del service_modes
     aic_full, aiv_full = max(1, int(datapath.aic_count)), max(1, int(datapath.aiv_count))
     is_disjoint = owners is not None and owners.isolation == "disjoint"
     aic_eff = int(owners.aic_limit) if is_disjoint else aic_full
     aiv_eff = int(owners.aiv_limit) if is_disjoint else aiv_full
     sfx = f":{lane_id}" if is_disjoint else ""
+    policy = (
+        str(getattr(getattr(case, "runtime", None), "matrix_compute_policy", "auto") or "auto")
+        if case is not None else "auto"
+    )
 
-    cube_ms = _node_cube_peak_ms(node, peaks)
+    cube_ms, precision_upgraded = _node_cube_peak_ms(node, peaks, die=die, policy=policy)
     vec_ops = max(0.0, float(getattr(node, "vector_ops", 0.0) or 0.0))
     hbm_r = max(0.0, float(getattr(node, "hbm_read_bytes", 0.0) or 0.0))
     hbm_w = max(0.0, float(getattr(node, "hbm_write_bytes", 0.0) or 0.0))
@@ -708,7 +985,8 @@ def _node_physical_demand_and_placement(
 
     demand: dict[str, float] = {}
     solo_ms: dict[str, float] = {}
-    aic_res, aiv_res = [], []
+    aic_res: list[str] = []
+    aiv_res: list[str] = []
     pure_cube = cube_ms > 0.0 and vec_ops <= 0.0
 
     if cube_ms > 0.0:
@@ -716,25 +994,38 @@ def _node_physical_demand_and_placement(
         demand[rname], solo_ms[rname] = cube_ms, cube_ms
         aic_res.append(rname)
     vec_rate_s = float(rates.get("vector") or 0.0)
-    if vec_ops > 0.0 and vec_rate_s > 0.0:
+    vec_ms = (vec_ops / vec_rate_s) * MS_PER_SECOND if (vec_ops > 0.0 and vec_rate_s > 0.0) else 0.0
+    if vec_ms > 0.0:
         rname = f"vector@{die_tag}{sfx}"
-        demand[rname], solo_ms[rname] = vec_ops, (vec_ops / vec_rate_s) * MS_PER_SECOND
+        demand[rname], solo_ms[rname] = vec_ops, vec_ms
         aiv_res.append(rname)
-    hbm_peak = float(rates.get("hbm") or max(datapath.hbm_read_bytes_per_s, datapath.hbm_write_bytes_per_s) or 0.0)
-    if hbm_tot > 0.0 and hbm_peak > 0.0:
-        rname = f"memory@{die_tag}"
-        eff_hbm = _effective_hbm_rate_bps(hbm_r, hbm_w, hbm_peak, service_modes)
-        scaled = hbm_tot * (hbm_peak / eff_hbm) if eff_hbm > 0.0 else hbm_tot
-        demand[rname], solo_ms[rname] = scaled, (scaled / hbm_peak) * MS_PER_SECOND
-    if mte2_b > 0.0:
-        use_aic_m2 = pure_cube or (is_disjoint and aiv_eff <= 0 and aic_eff > 0)
-        m2_key = "mte2_aic" if (use_aic_m2 and "mte2_aic" in rates) else ("mte2_aiv" if (not use_aic_m2 and "mte2_aiv" in rates) else "mte2")
-        m2_r = float(rates.get(m2_key) or hbm_peak or 0.0)
-        if m2_r > 0.0:
-            m2_sfx = sfx if (is_disjoint and (aic_eff > 0 if use_aic_m2 else aiv_eff > 0)) else ""
-            rname = f"{m2_key}@{die_tag}{m2_sfx}"
-            demand[rname], solo_ms[rname] = mte2_b, (mte2_b / m2_r) * MS_PER_SECOND
-            (aic_res if use_aic_m2 else aiv_res).append(rname)
+
+    eff_r, eff_w = _node_hbm_rw_bytes(hbm_r, hbm_w, hbm_tot, mte2_b, mte3_b, fixpipe_b)
+    hbm_read_bps, hbm_write_bps, alpha_rw = _directional_hbm_bus_params(datapath, rates)
+    hbm_peak = max(hbm_read_bps, hbm_write_bps)
+    if (eff_r > 0.0 or eff_w > 0.0) and hbm_read_bps > 0.0 and hbm_write_bps > 0.0:
+        read_bpms = hbm_read_bps / MS_PER_SECOND
+        write_bpms = hbm_write_bps / MS_PER_SECOND
+        t_r_ms = (eff_r / read_bpms if eff_r > 0.0 else 0.0) + (
+            alpha_rw * eff_w / write_bpms if eff_w > 0.0 else 0.0
+        )
+        t_w_ms = (eff_w / write_bpms if eff_w > 0.0 else 0.0) + (
+            alpha_rw * eff_r / read_bpms if eff_r > 0.0 else 0.0
+        )
+        if t_r_ms > 0.0:
+            rname = f"memory@{die_tag}:r"
+            demand[rname], solo_ms[rname] = t_r_ms, t_r_ms
+        if t_w_ms > 0.0:
+            wname = f"memory@{die_tag}:w"
+            demand[wname], solo_ms[wname] = t_w_ms, t_w_ms
+
+    _add_mte2_demands(
+        demand, solo_ms, aic_res, aiv_res,
+        mte2_b=mte2_b, cube_ms=cube_ms, vec_ms=vec_ms,
+        spec=getattr(node, "spec", None), die_tag=die_tag, sfx=sfx,
+        rates=rates, hbm_peak=hbm_peak, is_disjoint=is_disjoint,
+        aic_eff=aic_eff, aiv_eff=aiv_eff,
+    )
     if mte3_b > 0.0:
         m3_r = float(rates.get("mte3") or hbm_peak or 0.0)
         if m3_r > 0.0:
@@ -752,8 +1043,21 @@ def _node_physical_demand_and_placement(
             demand[rname], solo_ms[rname] = fixpipe_b, (fixpipe_b / fp_r) * MS_PER_SECOND
             aic_res.append(rname)
     if link_b > 0.0 and not has_topology_plan and link_bps > 0.0:
+        op_link_bps = link_bps
+        if case is not None and case.machine.links and die is not None:
+            op_width = _node_group_width(node, case, active_width)
+            op_link_bps = _resolve_die_link_supply_bps(
+                int(die.rank),
+                case.machine.links,
+                active_width=op_width,
+                ranks_per_node=int(getattr(case.machine, "ranks_per_node", 0) or 0),
+                dies_per_package=int(getattr(case.machine, "dies_per_package", 1) or 1),
+                fallback_bps=link_bps,
+            )
         rname = f"link@{die_tag}"
-        demand[rname], solo_ms[rname] = link_b, (link_b / link_bps) * MS_PER_SECOND
+        scaled_link = link_b * (link_bps / op_link_bps) if op_link_bps > 0.0 else link_b
+        eff_rate = op_link_bps if op_link_bps > 0.0 else link_bps
+        demand[rname], solo_ms[rname] = scaled_link, (link_b / eff_rate) * MS_PER_SECOND
 
     base_dur_ms = max(0.0, float(getattr(node, "dur_us", 0.0) or 0.0)) / US_PER_MS
     l_star_ms = max(0.0, float(getattr(node, "l_star_lean_us", 0.0) or 0.0)) / US_PER_MS
@@ -776,16 +1080,17 @@ def _node_physical_demand_and_placement(
                         solo_ms[rname] /= max(frac, TIME_EPS_US)
 
     max_pipe_ms = max(solo_ms.values(), default=0.0)
+    eff_l_star_ms = min(l_star_ms, max_pipe_ms) if (precision_upgraded and max_pipe_ms > 0.0) else l_star_ms
     eff_floor_ms = min(floor_ms, base_dur_ms) if base_dur_ms > 0.0 else 0.0
     if has_topology_plan:
         latency_ms = 0.0
     elif is_disjoint or is_overlapped:
-        if max_pipe_ms > 0.0 or l_star_ms > 0.0:
-            latency_ms = max(eff_floor_ms, l_star_ms, max_pipe_ms)
+        if max_pipe_ms > 0.0 or eff_l_star_ms > 0.0:
+            latency_ms = max(eff_floor_ms, eff_l_star_ms, max_pipe_ms)
         else:
             latency_ms = base_dur_ms
     else:
-        latency_ms = max(l_star_ms, base_dur_ms, max_pipe_ms)
+        latency_ms = max(eff_l_star_ms, base_dur_ms, max_pipe_ms)
     return demand, {}, latency_ms, bool(cube_ms > 0.0 or vec_ops > 0.0 or is_persistent_whole_die_node(node))
 
 
@@ -831,9 +1136,11 @@ def _build_die_resources_and_pools(
         vec_r = float(rates.get("vector") or 0.0)
         if vec_r > 0.0:
             _add(Resource(f"vector@{die_tag}", vec_r / MS_PER_SECOND, "ops", "fair", 1))
-        hbm_r = float(rates.get("hbm") or max(datapath.hbm_read_bytes_per_s, datapath.hbm_write_bytes_per_s) or 0.0)
-        if hbm_r > 0.0:
-            _add(Resource(f"memory@{die_tag}", hbm_r / MS_PER_SECOND, "bytes", "fair", 1))
+        hbm_read_bps, hbm_write_bps, _alpha_rw = _directional_hbm_bus_params(datapath, rates)
+        hbm_r = max(hbm_read_bps, hbm_write_bps)
+        if hbm_read_bps > 0.0 and hbm_write_bps > 0.0:
+            _add(Resource(f"memory@{die_tag}:r", 1.0, "row_fraction", "fair", 1))
+            _add(Resource(f"memory@{die_tag}:w", 1.0, "row_fraction", "fair", 1))
         m_rates: dict[str, float] = {}
         for mkey in ("mte2_aic", "mte2_aiv", "mte2", "mte3", "fixpipe"):
             mrate = float(rates.get(mkey) or (hbm_r if mkey in {"mte2", "mte3", "fixpipe"} else 0.0))
@@ -997,6 +1304,7 @@ def _submit_scheduled_node(
         node, die_tag=die_tag, lane_id=lane_id, datapath=datapath, rates=rates, peaks=peaks,
         service_modes=service_modes, link_bps=link_bps, owners=owners,
         has_topology_plan=(col_entry is not None), launch_floor_us=launch_floor_us,
+        die=die, case=case, active_width=_active_comm_width(case),
     )
     is_persist = is_persistent_whole_die_node(node)
     if is_persist and owners is not None and owners.isolation == "disjoint":
@@ -1062,8 +1370,14 @@ def schedule_target_graph_on_engine(
         stream_indices_by_coord[coord].add(int(node.stream_index))
 
     die_coords = sorted(die_by_coord)
+    active_width = _active_comm_width(case)
+    ranks_per_node = int(getattr(case.machine, "ranks_per_node", 0) or 0)
+    dies_per_package = int(getattr(case.machine, "dies_per_package", 1) or 1)
     supply_by_coord = {
-        c: _effective_die_supply(die_by_coord[c], case.machine.links, case.machine.transfer_channels, primitive_table)
+        c: _effective_die_supply(
+            die_by_coord[c], case.machine.links, case.machine.transfer_channels, primitive_table,
+            active_width=active_width, ranks_per_node=ranks_per_node, dies_per_package=dies_per_package,
+        )
         for c in die_coords
     }
     owners_by_coord, receipt_by_coord, budget_summary = _bind_stream_plan_by_coord(

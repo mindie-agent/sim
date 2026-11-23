@@ -16,6 +16,11 @@ from collections import defaultdict
 from collections.abc import Mapping
 from fractions import Fraction
 
+from mindie_sim.prediction.operators.matrix.matrix_precision import (
+    PACKED_FP4_FORMATS,
+    resolve_matrix_precision,
+)
+from mindie_sim.schema.operators import OpSpec
 from .contracts import FusedRegionSummary, SemanticWorkItem, TensorRangeObligation
 
 _COLD_WEIGHT_FAMILIES = frozenset({
@@ -87,6 +92,13 @@ def _pure_copy_boundary(op, meta: Mapping[str, object], die: int, replica: int, 
     return read_ob, write_ob, mte2_copy, write_copy
 
 
+def _resolve_op_precision(op, stage_devices, policy: str):
+    """Align matrix compute dtype/matrix_flops with hardware-bound Engine execution."""
+    if not stage_devices or not isinstance(op, OpSpec):
+        return op
+    return resolve_matrix_precision(op, devices=stage_devices, policy=policy, recipe=None)
+
+
 def derive_default_obligations(scenario, demands, aliases, covered, rank_ops_fn):
     """Derive per-(replica, stage, die, op) default obligations and die placements."""
     atomic = getattr(scenario, "atomic_step", None)
@@ -96,6 +108,7 @@ def derive_default_obligations(scenario, demands, aliases, covered, rank_ops_fn)
     tp_width = (int(parallel.tp) * int(parallel.pcp)) if parallel is not None else 1
     pp_stages = int(parallel.pp) if parallel is not None else 1
     default_dt = str(getattr(getattr(case, "model", None), "compute_dtype", "") or "bf16")
+    matrix_policy = str(getattr(getattr(case, "runtime", None), "matrix_compute_policy", "auto") or "auto")
 
     rank_ops = tuple(rank_ops_fn(scenario))
     consumed = {(replica, dep) for replica, op in rank_ops for dep in getattr(op, "deps", ())}
@@ -109,6 +122,7 @@ def derive_default_obligations(scenario, demands, aliases, covered, rank_ops_fn)
     read_obs: list[TensorRangeObligation] = []
     write_obs: list[TensorRangeObligation] = []
     placements: dict[int, tuple[int, int]] = {}
+    stage_devices_cache: dict[tuple[int, int], tuple] = {}
     seen: set[tuple[int, int, str]] = set()
 
     for replica, op in rank_ops:
@@ -126,8 +140,22 @@ def derive_default_obligations(scenario, demands, aliases, covered, rank_ops_fn)
         has_link = False
         if not has_explicit_work and key not in seen and key not in covered:
             seen.add(key)
-            dtype = getattr(op, "dtype", "") or default_dt
-            pairs = getattr(op, "matrix_flops", ()) or ((dtype, getattr(op, "flops", 0)),)
+            resolved_op = op
+            weight_fmt = str(meta.get("weight_format") or meta.get("weight_dtype") or "").strip().lower()
+            if weight_fmt in PACKED_FP4_FORMATS and isinstance(op, OpSpec):
+                sd_key = (replica, stage)
+                stage_devices = stage_devices_cache.get(sd_key)
+                if stage_devices is None:
+                    stage_ranks = (
+                        dies[die_idx:die_idx + tp_width]
+                        if 0 <= die_idx < len(dies)
+                        else ((die,) if die in demands.devices else ())
+                    )
+                    stage_devices = tuple(demands.devices[r] for r in stage_ranks if r in demands.devices)
+                    stage_devices_cache[sd_key] = stage_devices
+                resolved_op = _resolve_op_precision(op, stage_devices, matrix_policy)
+            dtype = getattr(resolved_op, "dtype", "") or default_dt
+            pairs = getattr(resolved_op, "matrix_flops", ()) or ((dtype, getattr(resolved_op, "flops", 0)),)
             for dt, flops in pairs:
                 if flops > 0:
                     matrix_work[replica, stage, die, str(dt)] += int(flops)

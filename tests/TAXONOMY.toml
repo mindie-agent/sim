@@ -188,6 +188,16 @@ owns = ["mindie_sim/remote_exec.py", "mindie_sim/prediction/runtime/accel_build.
 path = "runtime/test_formal_lean_locks.py"
 tier = "tier0"
 owns = ["formal/MindIESimSpec", "formal/AxiomCheck.lean", "mindie_sim/prediction/efficiency/exposed_breakdown.py", "mindie_sim/prediction/execution/weight_prefetch.py", "mindie_sim/prediction/sharding/local_tp.py", "mindie_sim/prediction/operators/recurrent/recover_ssm_work.py", "mindie_sim/prediction/collectives/startup.py", "mindie_sim/prediction/efficiency/roofline_graph.py", "mindie_sim/optimization/dual_bound.py", "mindie_sim/optimization/reload_bounds.py"]
+[[module]]
+path = "runtime/test_stage4a_target_precision_and_links.py"
+tier = "tier0"
+owns = [
+  "mindie_sim/optimization/causal_tail.py",
+  "mindie_sim/optimization/kernel_synthesis.py",
+  "mindie_sim/optimization/_dual_obligations.py",
+  "mindie_sim/prediction/operators/matrix/matrix_precision.py",
+  "mindie_sim/prediction/execution/context.py",
+]
 # ---------------------------------------------------------------- collectives
 [[module]]
 path = "collectives/test_topology_and_ports.py"

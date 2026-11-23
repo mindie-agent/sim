@@ -28,6 +28,7 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
+from fractions import Fraction
 import hashlib
 import json
 from math import prod
@@ -51,6 +52,7 @@ from mindie_sim.prediction.execution.operator_replay import operator_costs
 from mindie_sim.prediction.fusion.pool import register_recipe
 from mindie_sim.prediction.fusion.ports import input_port_entries
 from mindie_sim.prediction.offload.policy import _cached_p20_metrics
+from mindie_sim.prediction.operators.matrix.matrix_precision import resolve_case_matrix_precision
 from mindie_sim.prediction.physical_recipe_base import (
     IO_HBM_CATEGORY,
     Phase,
@@ -125,8 +127,11 @@ from .causal_tail import (
     FUSED_MC2_ROUTED_LEVEL,
     FUSED_MC2_SHARED_LEVEL,
     SHIPPING_MOE_ACTIVATIONS,
+    ZERO_AIC_COMM_FAMILIES,
     DieScheduleResult,
     MoERouteDecision,
+    _die_for_occurrence,
+    _node_cube_peak_ms,
     build_discrete_mso_candidate_nodes,
     enforce_moe_mutex_on_nodes,
     evaluate_disjoint_core_budgets,
@@ -138,6 +143,7 @@ from .causal_tail import (
     schedule_target_graph_on_engine,
     weighted_step_span_us,
 )
+from .dual_bound import inward_floor_ns
 
 SIMT_UB_CARVEOUT_BYTES = 16384
 
@@ -861,6 +867,7 @@ class SolvedTargetGraph:
     co_design_opportunities: tuple[CoDesignOpportunity, ...] = ()
     stage_waterfall: tuple[dict[str, Any], ...] = ()
     optimization_mode: OptimizationMode = "modeling"
+    reverted_to_native_baseline: bool = False
 
     @property
     def exposed_us(self) -> float:
@@ -4522,9 +4529,133 @@ def _run_archetype_rewrites(
     return all_nodes, all_dems, all_specs, all_triggers, auto_edits, remap
 
 
+def _resolved_die_cube_rate(die: Device | None, dtype: str, default_dtype: str = "bf16") -> float:
+    if die is None:
+        return 0.0
+    for candidate in (dtype, default_dtype, "bf16", "fp16"):
+        if not candidate:
+            continue
+        try:
+            return float(die.peak(str(candidate).strip().lower()))
+        except ModelingError:
+            continue
+    return 0.0
+
+
+def _normalize_nodes_matrix_precision(
+    nodes: Sequence[TargetOpNode],
+    demands: Sequence[tuple[int, int, int, int, int]],
+    case: Case,
+    peaks_by_stage: Mapping[int, Mapping[str, Any]],
+) -> tuple[list[TargetOpNode], list[tuple[int, int, int, int, int]]]:
+    """Align input nodes & cube demands with hardware-resolved native FP4/FP8 precision."""
+    default_dt = str(getattr(case.model, "compute_dtype", "") or "bf16")
+    out_nodes: list[TargetOpNode] = []
+    out_dems: list[tuple[int, int, int, int, int]] = []
+    dies = case.machine.dies
+    for node, dem in zip(nodes, demands):
+        raw_spec = node.spec
+        if raw_spec is None or not isinstance(raw_spec, OpSpec):
+            out_nodes.append(node)
+            out_dems.append(dem)
+            continue
+        resolved = resolve_case_matrix_precision(raw_spec, case, replica=int(node.occurrence.replica))
+        res_dt = str(resolved.dtype or node.dtype or default_dt)
+        if resolved is raw_spec and res_dt == node.dtype:
+            out_nodes.append(node)
+            out_dems.append(dem)
+            continue
+        stage_peaks = peaks_by_stage.get(int(node.occurrence.stage)) or {}
+        die = stage_peaks.get("die") if isinstance(stage_peaks, Mapping) else None
+        if die is None and dies:
+            die = dies[0]
+        pairs = resolved.matrix_flops or (((res_dt, float(node.flops)),) if node.flops > 0.0 else ())
+        cube_frac = Fraction(0)
+        for dt, mf in pairs:
+            if float(mf) <= 0.0:
+                continue
+            rate = _resolved_die_cube_rate(die, str(dt), default_dt)
+            if rate > 0.0:
+                cube_frac += Fraction(float(mf)) * Fraction(int(NS_PER_SECOND)) / Fraction(rate)
+        cube_ns = inward_floor_ns(cube_frac) if cube_frac > 0 else (dem[0] if dem else 0)
+        new_dem = (cube_ns, *dem[1:]) if dem else dem
+        new_l_star = float(max(new_dem)) / NS_PER_US if new_dem else node.l_star_lean_us
+        dur_us = float(node.dur_us)
+        new_roof = min(1.0, new_l_star / dur_us) if (dur_us > 0.0 and new_l_star > 0.0) else node.roofline_efficiency
+        out_nodes.append(replace(
+            node,
+            spec=resolved,
+            dtype=res_dt,
+            l_star_lean_us=new_l_star,
+            gap_us=max(0.0, dur_us - new_l_star),
+            gap_ratio=(dur_us / new_l_star) if new_l_star > 0.0 else None,
+            roofline_efficiency=new_roof,
+        ))
+        out_dems.append(new_dem)
+    return out_nodes, out_dems
+
+
+def _has_physically_valid_native_baseline(
+    nodes: Sequence[TargetOpNode],
+    case: Case,
+    baseline_exposed_w: float,
+) -> bool:
+    """True when ``nodes`` carry a physically valid Engine ``Before`` span."""
+    if not nodes:
+        return False
+    if baseline_exposed_w <= SAVING_POSITIVE_EPS_US and any(
+        float(n.dur_us) > SAVING_POSITIVE_EPS_US for n in nodes
+    ):
+        return False
+    if not case.machine.dies:
+        return True
+    policy = str(getattr(case.runtime, "matrix_compute_policy", "auto") or "auto")
+    for node in nodes:
+        dur_us = float(node.dur_us)
+        if dur_us <= SAVING_POSITIVE_EPS_US:
+            continue
+        die = _die_for_occurrence(case, node.occurrence)
+        fam = str(getattr(node, "family", "") or "").strip().lower()
+        cube_ms = 0.0
+        if fam not in ZERO_AIC_COMM_FAMILIES:
+            cube_ms, _ = _node_cube_peak_ms(node, dict(die.compute_peaks), die=die, policy=policy)
+        vec_rate = float(dict(die.rates).get("vector") or 0.0)
+        vec_ms = (
+            (float(node.vector_ops) / vec_rate) * MS_PER_SECOND
+            if (node.vector_ops > 0.0 and vec_rate > 0.0) else 0.0
+        )
+        if max(cube_ms, vec_ms) * US_PER_MS > dur_us + L_STAR_INVERSION_TOL_US:
+            return False
+    return True
+
+
+def _native_baseline_schedule(nodes: Sequence[TargetOpNode]) -> DieScheduleResult:
+    """Wrap unmodified native ``Before`` Engine nodes as a clean ``DieScheduleResult``."""
+    arch_spans: dict[str, float] = {}
+    for node in nodes:
+        aid = str(node.archetype_id)
+        arch_spans[aid] = arch_spans.get(aid, 0.0) + max(0.0, float(node.exposed_dur_us))
+    starts = [float(n.start_us) for n in nodes]
+    ends = [float(n.end_us) for n in nodes]
+    step_start = min(starts) if starts else 0.0
+    span_us = sum(arch_spans.values()) if arch_spans else max(0.0, (max(ends) - step_start) if ends else 0.0)
+    return DieScheduleResult(
+        nodes=tuple(nodes),
+        archetype_spans_us=arch_spans,
+        step_start_us=step_start,
+        step_end_us=step_start + span_us,
+        step_span_us=span_us,
+        stream_core_budget={},
+        stream_core_budget_summary="",
+        max_same_stream_overlap_us=0.0,
+    )
+
+
 def _build_stage_waterfall(
     opt_mode: OptimizationMode,
     stage_scheds: Mapping[str, DieScheduleResult],
+    *,
+    reverted_to_native_baseline: bool = False,
 ) -> tuple[dict[str, Any], ...]:
     """Build canonical stage waterfall strictly from winning Engine schedules (zero scalar clamping)."""
     stage_specs = canonical_comparison_stages(opt_mode)
@@ -4533,7 +4664,7 @@ def _build_stage_waterfall(
     prev_us = before_us
     for st in stage_specs:
         cur_us = weighted_step_span_us(stage_scheds[st.stage].nodes)
-        rows.append({
+        row: dict[str, Any] = {
             "stage": st.stage,
             "owner": st.owner,
             "step_span_us": cur_us,
@@ -4542,7 +4673,10 @@ def _build_stage_waterfall(
             "allowed_readiness": tuple(sorted(st.allowed_readiness)),
             "allowed_rewrite_tracks": st.allowed_rewrite_tracks,
             "engine_uid": "unified_die_engine",
-        })
+        }
+        if reverted_to_native_baseline:
+            row["reverted_to_native_baseline"] = True
+        rows.append(row)
         prev_us = cur_us
     return tuple(rows)
 
@@ -4581,10 +4715,16 @@ def _enforce_engine_monotonicity(
     list[dict[str, Any]],
     MoERouteDecision | None,
     dict[str, DieScheduleResult],
+    bool,
 ]:
-    """Compare stage Engine schedules and return the exact winning (sched, dems, plan, specs) tuple."""
+    """Compare stage Engine schedules against native baseline & return the exact non-regressing winner."""
     if not compute_waterfall and has_ext_edits:
-        return die_sched, final_dems, final_plan, all_specs, tiler_opps, extra_receipts, moe_dec, {}
+        return die_sched, final_dems, final_plan, all_specs, tiler_opps, extra_receipts, moe_dec, {}, False
+
+    baseline_exposed_w = weighted_step_span_us(nodes)
+    has_native_baseline = _has_physically_valid_native_baseline(nodes, case, baseline_exposed_w)
+    native_sched = _native_baseline_schedule(nodes)
+    native_bundle = (native_sched, list(demands), empty_plan(base_sha, frame_sha), [], [], [], None)
 
     orig_sched = schedule_target_graph_on_engine(
         nodes, case, collective_plans=None, topology=topology,
@@ -4592,6 +4732,9 @@ def _enforce_engine_monotonicity(
     )
     orig_bundle = (orig_sched, list(demands), empty_plan(base_sha, frame_sha), [], [], [], None)
     orig_us = weighted_step_span_us(orig_sched.nodes)
+    orig_exceeds_native = bool(has_native_baseline and orig_us > baseline_exposed_w + SAVING_POSITIVE_EPS_US)
+    base_bundle = native_bundle if orig_exceeds_native else orig_bundle
+    base_us = min(baseline_exposed_w, orig_us) if has_native_baseline else orig_us
 
     cfg_sched, cfg_dems, cfg_moe, cfg_receipts = _select_best_moe_and_die_schedule(
         nodes, demands, case, floors, p0, locked_ids=set(),
@@ -4600,11 +4743,11 @@ def _enforce_engine_monotonicity(
     )
     cfg_bundle = (
         (cfg_sched, list(cfg_dems), empty_plan(base_sha, frame_sha), [], [], list(cfg_receipts), cfg_moe)
-        if weighted_step_span_us(cfg_sched.nodes) <= orig_us + SAVING_POSITIVE_EPS_US
-        else orig_bundle
+        if weighted_step_span_us(cfg_sched.nodes) <= base_us + SAVING_POSITIVE_EPS_US
+        else base_bundle
     )
     stage_scheds: dict[str, DieScheduleResult] = {
-        "before": orig_sched,
+        "before": base_bundle[0],
         "config_only": cfg_bundle[0],
     }
 
@@ -4625,7 +4768,8 @@ def _enforce_engine_monotonicity(
             RewritePlan(base_graph_sha256=base_sha, framing_sha256=frame_sha, edits=tuple(fwk_edits))
             if fwk_edits else empty_plan(base_sha, frame_sha)
         )
-        if weighted_step_span_us(fwk_sched.nodes) <= weighted_step_span_us(best_prior[0].nodes) + SAVING_POSITIVE_EPS_US:
+        fwk_ceiling = min(base_us, weighted_step_span_us(best_prior[0].nodes))
+        if weighted_step_span_us(fwk_sched.nodes) <= fwk_ceiling + SAVING_POSITIVE_EPS_US:
             best_prior = (
                 fwk_sched, list(fwk_final_dems), fwk_plan, list(fwk_specs), [], list(fwk_receipts), fwk_moe,
             )
@@ -4633,17 +4777,20 @@ def _enforce_engine_monotonicity(
 
     if has_ext_edits:
         stage_scheds["after"] = die_sched
-        return die_sched, final_dems, final_plan, all_specs, tiler_opps, extra_receipts, moe_dec, stage_scheds
+        return die_sched, final_dems, final_plan, all_specs, tiler_opps, extra_receipts, moe_dec, stage_scheds, False
 
     after_us = weighted_step_span_us(die_sched.nodes)
     prior_us = weighted_step_span_us(best_prior[0].nodes)
-    if after_us > prior_us + SAVING_POSITIVE_EPS_US:
-        win_sched, win_dems, win_plan, win_specs, win_tiler, win_rcpts, win_moe = best_prior
+    ceiling_us = min(prior_us, base_us)
+    if after_us > ceiling_us + SAVING_POSITIVE_EPS_US:
+        winner = best_prior if prior_us <= base_us + SAVING_POSITIVE_EPS_US else base_bundle
+        win_sched, win_dems, win_plan, win_specs, win_tiler, win_rcpts, win_moe = winner
         stage_scheds["after"] = win_sched
-        return win_sched, win_dems, win_plan, win_specs, win_tiler, win_rcpts, win_moe, stage_scheds
+        reverted = bool(win_sched is native_sched)
+        return win_sched, win_dems, win_plan, win_specs, win_tiler, win_rcpts, win_moe, stage_scheds, reverted
 
     stage_scheds["after"] = die_sched
-    return die_sched, final_dems, final_plan, all_specs, tiler_opps, extra_receipts, moe_dec, stage_scheds
+    return die_sched, final_dems, final_plan, all_specs, tiler_opps, extra_receipts, moe_dec, stage_scheds, False
 
 
 def _build_solved_target_graph(
@@ -4662,6 +4809,7 @@ def _build_solved_target_graph(
     codesign_opps: tuple[CoDesignOpportunity, ...],
     stage_waterfall: tuple[dict[str, Any], ...],
     opt_mode: OptimizationMode,
+    reverted_to_native_baseline: bool = False,
 ) -> SolvedTargetGraph:
     edit_receipts = _build_applied_edit_receipts(final_plan, all_specs, indexed, die_sched, extra_receipts)
     unbound_ops = tuple(n.op_id for n in indexed if n.binding_state == "unbound_formula_projection")
@@ -4692,6 +4840,7 @@ def _build_solved_target_graph(
         co_design_opportunities=codesign_opps,
         stage_waterfall=stage_waterfall,
         optimization_mode=opt_mode,
+        reverted_to_native_baseline=reverted_to_native_baseline,
     )
 
 
@@ -4729,6 +4878,7 @@ def solve_target_graph(
     ext_plan = load_rewrite_plan(rewrite_plan)
     pricing_ctx = _TargetPricingContext(case, primitive_table=primitive_table)
     safe_n_tok = max(float(n_tok_per_die), SAVING_POSITIVE_EPS_US)
+    nodes, demands = _normalize_nodes_matrix_precision(nodes, demands, case, peaks_by_stage)
 
     all_known_ids = {n.op_id for n in nodes}
     base_ops_all = [_node_to_op_spec(n, all_known_ids, phase=phase) for n in nodes]
@@ -4797,21 +4947,22 @@ def solve_target_graph(
         collective_plans=collective_plans, topology=topology,
         primitive_table=primitive_table, allow_unbound_formula=eff_allow_unbound,
     )
-    die_sched, final_dems, final_plan, all_specs, tiler_opps, extra_receipts, moe_dec, stage_scheds = (
-        _enforce_engine_monotonicity(
-            nodes, demands, case, floors, p0, datapath, pricing_ctx,
-            die_sched, final_dems, final_plan,
-            all_specs, tiler_opps, extra_receipts, moe_dec,
-            opt_mode=opt_mode, phase=phase, safe_n_tok=safe_n_tok,
-            base_sha=base_sha, frame_sha=frame_sha, topology=topology,
-            primitive_table=primitive_table, has_ext_edits=bool(executed_ext_edits),
-            compute_waterfall=compute_waterfall_and_codesign,
-        )
+    (
+        die_sched, final_dems, final_plan, all_specs, tiler_opps,
+        extra_receipts, moe_dec, stage_scheds, reverted_to_native,
+    ) = _enforce_engine_monotonicity(
+        nodes, demands, case, floors, p0, datapath, pricing_ctx,
+        die_sched, final_dems, final_plan,
+        all_specs, tiler_opps, extra_receipts, moe_dec,
+        opt_mode=opt_mode, phase=phase, safe_n_tok=safe_n_tok,
+        base_sha=base_sha, frame_sha=frame_sha, topology=topology,
+        primitive_table=primitive_table, has_ext_edits=bool(executed_ext_edits),
+        compute_waterfall=compute_waterfall_and_codesign,
     )
     indexed = tuple(replace(n, ordinal=idx) for idx, n in enumerate(die_sched.nodes))
     _validate_final_graph_invariants(indexed, final_dems)
     stage_waterfall = (
-        _build_stage_waterfall(opt_mode, stage_scheds)
+        _build_stage_waterfall(opt_mode, stage_scheds, reverted_to_native_baseline=reverted_to_native)
         if compute_waterfall_and_codesign else ()
     )
     codesign_opps = (
@@ -4828,6 +4979,7 @@ def solve_target_graph(
         eff_allow_unbound=eff_allow_unbound, extra_receipts=extra_receipts,
         moe_dec=moe_dec, codesign_opps=codesign_opps,
         stage_waterfall=stage_waterfall, opt_mode=opt_mode,
+        reverted_to_native_baseline=reverted_to_native,
     )
 
 
