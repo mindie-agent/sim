@@ -29,6 +29,7 @@
 """
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Sequence
 
@@ -36,6 +37,8 @@ from mindie_sim.schema.common import ModelingError
 
 
 MIN_RUN_LENGTH = 2
+DEFAULT_COHORT_CACHE_LIMIT = 1024
+NS_PER_MS = 1_000_000.0
 
 
 def _metadata(op: Any) -> Mapping[str, Any]:
@@ -52,9 +55,9 @@ TEMPLATE_FIELDS = (
     "num_shared_experts", "shared_intermediate_size", "intermediate_size",
     "router_input_size", "router_mode", "qk_norm", "q_output_gate_kind",
     "q_gate_projection", "k_eq_v", "residual_block_size", "engram",
-    "hyper_connections", "hc_mult", "scope", "cache_kind",
-    "compressor_kind", "compressor_width",
-    "index_topk", "index_heads", "index_dim", "index_input",
+    "hyper_connections", "hc_mult", "hc_lowrank", "hc_sinkhorn_iters",
+    "scope", "cache_kind", "compressor_kind", "compressor_width",
+    "index_topk", "index_heads", "index_dim", "index_input", "index_kpool",
 )
 
 #: Cross-layer owners.  Each is stored as a labelled delta, never absolute.
@@ -132,6 +135,21 @@ def _first_layer_segment(ops: Sequence[Any]) -> int | None:
 
 def _op_run_key(op: Any, plan: Any, base_segment: int | None = None) -> tuple:
     from mindie_sim.prediction.program.physical_key import physical_key
+    meta = _metadata(op)
+    abi = getattr(op, "precision_abi", None)
+    sched = getattr(op, "owner_schedule", None)
+    attnres_view = meta.get("attn_res_view")
+    attnres_sig = ()
+    if isinstance(attnres_view, Mapping):
+        attnres_sig = (
+            int(attnres_view.get("valid_blocks", 0) or 0),
+            int(attnres_view.get("block_write_idx", -1)),
+            bool(attnres_view.get("fuse_add", False)),
+            bool(attnres_view.get("output_norm", False)),
+            bool(attnres_view.get("mix", True)),
+            bool(attnres_view.get("save_materialized", False)),
+            int(attnres_view.get("bank_capacity", 0) or 0),
+        )
     # physical_key already normalizes occurrence references relative to this
     # operator, so identical layers produce the same ordered key sequence.
     return (
@@ -139,12 +157,17 @@ def _op_run_key(op: Any, plan: Any, base_segment: int | None = None) -> tuple:
         str(getattr(op, "stream", "") or ""),
         str(getattr(op, "dtype", "") or ""),
         _plan_template(plan),
-        bool(_metadata(op).get("graph_captured")),
+        bool(meta.get("graph_captured")),
         _segment_signature(op, base_segment),
-        tuple(sorted((str(key), repr(value)) for key, value in _metadata(op).items()
+        abi.abi_signature if abi is not None else "",
+        (sched.tiling_strategy, sched.active_owners, sched.work_tiles) if sched is not None else (),
+        attnres_sig,
+        tuple(sorted((str(key), repr(value)) for key, value in meta.items()
                      if key in {"group_axis", "collective", "local_tp_width",
                                 "capture_bucket", "recipe", "kernel",
-                                "valid_blocks", "residual_block_id"})),
+                                "valid_blocks", "residual_block_id",
+                                "block_write_idx", "linear_method",
+                                "precision_abi_signature"})),
         physical_key(op),
     )
 
@@ -229,24 +252,154 @@ def homogeneous_layer_runs(ops: Sequence[Any],
 
 
 @dataclass(frozen=True)
+class ExecutionStateSnapshot:
+    """Full live-Engine state fingerprint across a layer transition boundary."""
+
+    l2_residency: tuple[tuple[str, int], ...] = ()
+    l2_dirty: tuple[str, ...] = ()
+    stream_tail_offsets_ns: tuple[tuple[str, int], ...] = ()
+    bank_state: tuple[tuple[str, Any], ...] = ()
+    owner_queues: tuple[tuple[str, int], ...] = ()
+    queue_credits: tuple[tuple[str, int], ...] = ()
+    state_versions: tuple[tuple[str, Any], ...] = ()
+    active_allocations: tuple[tuple[str, int], ...] = ()
+
+    @classmethod
+    def capture(
+        cls,
+        engine: Any,
+        *,
+        stream_tails_ms: Mapping[str, float] | None = None,
+        bank_state: Mapping[str, Any] | Sequence[tuple[str, Any]] = (),
+        owner_queues: Mapping[str, int] | Sequence[tuple[str, int]] = (),
+        queue_credits: Mapping[str, int] | Sequence[tuple[str, int]] = (),
+    ) -> "ExecutionStateSnapshot":
+        now_ms = float(getattr(engine, "now", getattr(engine, "now_ms", 0.0)) or 0.0)
+        now_ns = int(round(now_ms * NS_PER_MS))
+        cache_domains = getattr(engine, "cache_domains", None) or {}
+        l2_res = tuple(sorted(
+            (str(k), int(len(v)) if hasattr(v, "__len__") else int(bool(v)))
+            for k, v in (cache_domains.items() if isinstance(cache_domains, Mapping) else ())
+        ))
+        dirty_raw = getattr(engine, "dirty_resource_components", None) or ()
+        l2_dirty = tuple(sorted(str(x) for x in dirty_raw))
+        stream_offsets = tuple(sorted(
+            (str(s), max(0, int(round(float(t) * NS_PER_MS)) - now_ns))
+            for s, t in (stream_tails_ms or {}).items()
+        ))
+        bank_items = tuple(sorted(
+            (str(k), v) for k, v in (bank_state.items() if isinstance(bank_state, Mapping) else bank_state)
+        ))
+        oq_items = tuple(sorted(
+            (str(k), int(v)) for k, v in (owner_queues.items() if isinstance(owner_queues, Mapping) else owner_queues)
+        ))
+        qc_source = queue_credits
+        if not qc_source:
+            fifos = getattr(engine, "host_fifos", None) or {}
+            if isinstance(fifos, Mapping):
+                qc_source = tuple(
+                    (str(k), int(getattr(f, "available_credits", getattr(f, "credits", 0)) or 0))
+                    for k, f in fifos.items()
+                )
+        qc_items = tuple(sorted(
+            (str(k), int(v)) for k, v in (qc_source.items() if isinstance(qc_source, Mapping) else qc_source)
+        ))
+        versions_raw = getattr(engine, "state_versions", None) or {}
+        versions = tuple(sorted(
+            (str(k), v) for k, v in (versions_raw.items() if isinstance(versions_raw, Mapping) else ())
+        ))
+        allocs_raw = getattr(engine, "allocated", None) or {}
+        allocs = tuple(sorted(
+            (str(k), int(v)) for k, v in (allocs_raw.items() if isinstance(allocs_raw, Mapping) else ())
+            if int(v) > 0
+        ))
+        return cls(
+            l2_residency=l2_res,
+            l2_dirty=l2_dirty,
+            stream_tail_offsets_ns=stream_offsets,
+            bank_state=bank_items,
+            owner_queues=oq_items,
+            queue_credits=qc_items,
+            state_versions=versions,
+            active_allocations=allocs,
+        )
+
+
+@dataclass(frozen=True)
+class TransitionEquivalenceProof:
+    """Mechanical proof that repeating a layer transition preserves full Engine state."""
+
+    before_state: ExecutionStateSnapshot
+    after_state: ExecutionStateSnapshot
+    cycle_delta_ns: int
+    correspondence: tuple[tuple[Any, Any], ...] = ()
+    verified_by: str = "engine_frontier_equivalence"
+
+    def __post_init__(self) -> None:
+        if self.before_state != self.after_state:
+            raise ModelingError("layer_run_state_equivalence_failed")
+        if isinstance(self.cycle_delta_ns, bool) or not isinstance(self.cycle_delta_ns, int) or self.cycle_delta_ns < 0:
+            raise ModelingError("layer_run_cycle_delta_invalid")
+
+    @property
+    def is_valid(self) -> bool:
+        return self.before_state == self.after_state and self.cycle_delta_ns >= 0
+
+
+class CompiledCohortProgramCache:
+    """Bounded LRU cache compiling structural cohort programs once per execution context."""
+
+    def __init__(self, max_entries: int = DEFAULT_COHORT_CACHE_LIMIT) -> None:
+        self.max_entries = max(1, int(max_entries))
+        self._store: OrderedDict[Any, Any] = OrderedDict()
+        self.hits = 0
+        self.misses = 0
+        self.evictions = 0
+
+    def get_or_compile(self, key: Any, compiler: Callable[[], Any]) -> Any:
+        if key in self._store:
+            self.hits += 1
+            self._store.move_to_end(key)
+            return self._store[key]
+        self.misses += 1
+        compiled = compiler()
+        self._store[key] = compiled
+        while len(self._store) > self.max_entries:
+            self._store.popitem(last=False)
+            self.evictions += 1
+        return compiled
+
+    def stats(self) -> dict[str, int]:
+        return {
+            "entries": len(self._store),
+            "hits": self.hits,
+            "misses": self.misses,
+            "evictions": self.evictions,
+        }
+
+
+@dataclass(frozen=True)
 class LayerRunProgram:
     """Sequential execution of one run's caller-prepared occurrence programs.
 
-    Template reuse always executes every occurrence.  A caller that wants time
-    skipping must first certify a repeated Engine frontier; otherwise
-    construction refuses instead of inventing ``duration x count``.
+    Template reuse always executes every occurrence on the live Engine.  Time
+    skipping requires an explicit ``TransitionEquivalenceProof`` certifying
+    full execution-state equivalence (L2 residency/dirty, stream tails, bank
+    state, owner queues, queue credits, state versions, and allocations);
+    otherwise construction refuses instead of inventing ``duration x count``.
     """
 
     run: LayerRun
     occurrences: tuple[Any, ...]
     skip_authorized: bool = False
+    certification: TransitionEquivalenceProof | None = None
 
     def __post_init__(self) -> None:
         if len(self.occurrences) != self.run.count:
             raise ModelingError(
                 "layer_run_occurrence_count_mismatch:"
                 f"{len(self.occurrences)}!={self.run.count}")
-        if self.skip_authorized:
+        if self.skip_authorized and (self.certification is None or not self.certification.is_valid):
             raise ModelingError("layer_run_time_skip_requires_engine_certification")
 
     def start(self, engine: Any, name: str, ready: Any, *, owner: str = "") -> Any:
@@ -254,6 +407,41 @@ class LayerRunProgram:
         for position, program in enumerate(self.occurrences):
             event = program.start(engine, f"{name}:l{position}", event, owner=owner)
         return event
+
+
+@dataclass(frozen=True)
+class CohortOccurrenceBinding:
+    """One native layer or tail occurrence bound in original execution order."""
+
+    occurrence_index: int
+    native_layer_id: int
+    template_key: Any
+    context_key: Any
+    is_final_tail: bool = False
+
+
+def replay_ordered_cohort(
+    bindings: Sequence[CohortOccurrenceBinding],
+    *,
+    compile_template: Callable[[CohortOccurrenceBinding], Any],
+    bind_occurrence: Callable[[Any, CohortOccurrenceBinding], Any] | None = None,
+    cache: CompiledCohortProgramCache | None = None,
+) -> tuple[Any, ...]:
+    """Compile each distinct structural cohort once and emit real ordered occurrences.
+
+    Preserves exact original execution order ``0..L-1 + final`` without
+    mutating layer indices or multiplying representative durations.
+    """
+    active_cache = cache if cache is not None else CompiledCohortProgramCache()
+    programs: list[Any] = []
+    for binding in bindings:
+        cache_key = (binding.template_key, binding.context_key)
+        compiled = active_cache.get_or_compile(
+            cache_key, lambda b=binding: compile_template(b),
+        )
+        bound = bind_occurrence(compiled, binding) if bind_occurrence is not None else compiled
+        programs.append(bound)
+    return tuple(programs)
 
 
 def run_summary(runs: Sequence[LayerRun]) -> dict[str, Any]:

@@ -476,15 +476,153 @@ def _sharding_key(op: OpSpec) -> tuple[str, str]:
     )
 
 
+_FLOAT_PRECISION_DTYPES = frozenset({"bf16", "bfloat16", "fp16", "float16", "fp32", "float32"})
+_QUANT_PRECISION_DTYPES = frozenset({
+    "int8", "int4", "w8a8", "w4a8", "fp8", "fp8_e4m3", "fp8_e5m2",
+    "mxfp8", "mxfp4", "fp4", "fp4_e2m1",
+})
+# Equivalent HBM byte penalty of an unabsorbed SplitV / DataCopyPad kernel launch
+# (~1.7 us @ 3.5 TB/s ~ 6 KB, ensuring marginal micro-saves never emit SplitV).
+SPLITV_LAUNCH_OVERHEAD_BYTES = 8192
+
+
 def _weight_dtype_key(op: OpSpec) -> str:
     meta = dict(op.metadata) if op.metadata else {}
-    return str(meta.get("weight_format") or meta.get("weight_dtype") or op.dtype or "").strip().lower()
+    abi = getattr(op, "precision_abi", None)
+    return str(
+        meta.get("weight_format")
+        or meta.get("weight_dtype")
+        or (abi.weight_dtype if abi is not None else "")
+        or op.dtype
+        or ""
+    ).strip().lower()
+
+
+def _precision_abi_tuple(op: OpSpec) -> tuple[Any, ...]:
+    """Full TensorPrecisionABI equality tuple for homogeneous sibling GEMM packing."""
+    meta = dict(op.metadata) if op.metadata else {}
+    abi = getattr(op, "precision_abi", None)
+    a_dt, group_size, scale_fmt = _activation_quant_key(op)
+    w_dt = _weight_dtype_key(op)
+    out_dt = str(meta.get("output_format") or (abi.output_dtype if abi else "") or op.dtype or "bf16").strip().lower()
+    comp_dt = str(meta.get("compute_format") or (abi.compute_dtype if abi else "") or op.dtype or "bf16").strip().lower()
+    method = str(meta.get("linear_method") or (abi.linear_method if abi else "") or "").strip().lower()
+    w_layout = str(meta.get("weight_layout") or meta.get("weight_representation") or (abi.weight_layout if abi else "") or "").strip().lower()
+    w_block = tuple(meta.get("weight_block") or ()) if isinstance(meta.get("weight_block"), (tuple, list)) else ()
+    w_scale_fmt = str(meta.get("weight_scale_format") or (abi.weight_scale_dtype if abi else "") or "").strip().lower()
+    act_scale_pack = str(meta.get("activation_scale_pack") or (abi.act_scale_pack if abi else "") or "").strip().lower()
+    abi_sig = str(meta.get("precision_abi_signature") or (abi.abi_signature if abi else "") or "")
+    return (
+        method,
+        w_dt,
+        w_layout,
+        w_block,
+        w_scale_fmt,
+        a_dt,
+        group_size,
+        scale_fmt,
+        act_scale_pack,
+        out_dt,
+        comp_dt,
+        abi_sig,
+    )
+
+
+def _unabsorbed_splitv_cost(
+    siblings: Sequence[OpSpec],
+    all_ops: Mapping[str, OpSpec] | None,
+) -> tuple[float, int]:
+    """Price physical unabsorbed SplitV / DataCopyPad HBM R+W and launch count.
+
+    Single-row outputs (``M <= 1``) slice contiguously with zero copy.
+    Multi-row outputs (``M > 1``) consumed by distinct downstream operators
+    that do not accept strided packed views require physical contiguous slice
+    materialization (``SplitV`` / ``DataCopyPad``): reading the packed rows and
+    writing contiguous per-slice buffers (``2 * sum(M * N_i * elem_bytes)``).
+    """
+    if not all_ops or len(siblings) < 2:
+        return 0.0, 0
+    sib_ids = {op.op_id for op in siblings}
+    m_dim = int(siblings[0].local_shape[0]) if len(siblings[0].local_shape) >= 2 else 0
+    if m_dim <= 1:
+        return 0.0, 0
+    consumers_by_sib: dict[str, set[str]] = {op.op_id: set() for op in siblings}
+    for cand in all_ops.values():
+        if cand.op_id in sib_ids:
+            continue
+        meta = dict(cand.metadata) if cand.metadata else {}
+        if meta.get("accepts_strided_view") or meta.get("packed_view_compatible"):
+            continue
+        for dep in cand.deps:
+            if dep in consumers_by_sib:
+                consumers_by_sib[dep].add(cand.op_id)
+    nonempty = [cs for cs in consumers_by_sib.values() if cs]
+    if not nonempty:
+        return 0.0, 0
+    # If all siblings feed the exact same single fused consumer (e.g. SwiGLU
+    # over packed [gate | up]), SplitV is absorbed into that consumer.
+    union_consumers = set().union(*nonempty)
+    if len(union_consumers) == 1 and len(nonempty) == len(siblings):
+        return 0.0, 0
+    total_slice_bytes = 0.0
+    unabsorbed_slices = 0
+    for op in siblings:
+        if not consumers_by_sib[op.op_id]:
+            continue
+        n_dim = int(op.local_shape[1]) if len(op.local_shape) >= 2 else 0
+        meta = dict(op.metadata) if op.metadata else {}
+        out_dt = str(meta.get("output_format") or op.dtype or "bf16")
+        try:
+            elem = float(dtype_bytes(out_dt))
+        except Exception:
+            elem = 2.0
+        total_slice_bytes += float(m_dim * n_dim) * elem
+        unabsorbed_slices += 1
+    if total_slice_bytes <= 0.0 or unabsorbed_slices == 0:
+        return 0.0, 0
+    # Physical SplitV reads the packed output and writes each contiguous slice.
+    return 2.0 * total_slice_bytes, 1
+
+
+def _has_cross_precision_sibling_gemm(
+    ordered: Sequence[OpSpec],
+    kernel_for: Mapping[str, int],
+    dependencies: Mapping[str, set[str]],
+    keys: set[str],
+) -> bool:
+    """Detect forbidden FLOAT-vs-quantized or incompatible TensorPrecisionABI sibling GEMM merge."""
+    if len(ordered) < 2 or len(set(kernel_for.values())) != 1:
+        return False
+    if not all(op.flops > 0 and not op.link_bytes and len(op.local_shape) == _GEMM_SHAPE_RANK for op in ordered):
+        return False
+    if any(dependencies[op.op_id] & keys for op in ordered):
+        return False
+    # Check explicit TensorPrecisionABI incompatibility first.
+    abis = [getattr(op, "precision_abi", None) for op in ordered]
+    if all(abi is not None for abi in abis):
+        if any(not abis[0].is_fusion_compatible(other) for other in abis[1:]):
+            return True
+    # Check FLOAT vs quantized weight or activation boundary.
+    w_classes = set()
+    a_classes = set()
+    for op in ordered:
+        w_dt = _weight_dtype_key(op)
+        a_dt, _, _ = _activation_quant_key(op)
+        if w_dt in _FLOAT_PRECISION_DTYPES:
+            w_classes.add("float")
+        elif w_dt in _QUANT_PRECISION_DTYPES:
+            w_classes.add("quant")
+        if a_dt in _FLOAT_PRECISION_DTYPES:
+            a_classes.add("float")
+        elif a_dt in _QUANT_PRECISION_DTYPES:
+            a_classes.add("quant")
+    return len(w_classes) > 1 or len(a_classes) > 1
 
 
 def _law2_sibling_key(
     op: OpSpec, all_ops: Mapping[str, OpSpec] | None = None,
 ) -> tuple[Any, ...] | None:
-    """Single canonical Law-2 shared-activation predicate over PortRef, (M, K), quant, weight, and sharding."""
+    """Single canonical Law-2 shared-activation predicate over PortRef, (M, K), full ABI, and sharding."""
     fam = str(op.family or "").strip().lower()
     rec = str(op.recipe or "").strip().lower()
     if fam in _GROUPED_MATMUL_FAMILIES or "grouped" in rec:
@@ -504,6 +642,7 @@ def _law2_sibling_key(
         scale_fmt,
         _weight_dtype_key(op),
         _sharding_key(op),
+        _precision_abi_tuple(op),
     )
 
 
@@ -773,6 +912,99 @@ class _RankDraft:
                 (key, value) for key, value in assign.items() if key not in removed
             ), events=tuple(events))
 
+    def _assemble_fused_op(
+        self, *, fused_id, spec, ordered, keys, kernel_for, dependencies,
+        boundary, typed, named, cut, live, declared, read, write,
+    ):
+        tail = ordered[-1]
+        matrix = Counter()
+        for op in ordered:
+            for dtype, amount in (op.matrix_flops or (((op.dtype, op.flops),) if op.flops else ())):
+                matrix[dtype] += amount
+        link_scope = next((item.link_scope for item in ordered if item.link_bytes), tail.link_scope)
+        boundary_abis = tuple(b.abi_id for b in spec.kernel_boundaries)
+        abi = boundary_abis[0] if len(boundary_abis) == 1 else "+".join(boundary_abis)
+        reserved = {name for _, name, _ in live} | set(tail.returns) | {"op", "out"}
+        outputs, used = {}, set()
+        for dep, name, version in sorted(live, key=lambda item: (item[0] != tail.op_id, item)):
+            port = name
+            while (port, version) in used or (port != name and port in reserved):
+                port = f"{port}__{dep}"
+            outputs[dep, name, version] = port
+            used.add((port, version))
+        source_ports = {(op.op_id, *_port_key(port)): port for op in ordered
+                        for key, ports in op.metadata if key == "typed_outputs" for port in ports
+                        if isinstance(port, Mapping)}
+        typed_keys = (declared | source_ports.keys()) & live | {key for key in live if key[-1]}
+        typed_outputs = tuple({**source_ports.get(key, {}), "producer": fused_id,
+                               "port": outputs[key], "output": outputs[key], "name": outputs[key], "version": key[-1]}
+                              for key in sorted(typed_keys))
+        fused_shape = tail.local_shape
+        law2_keys = [_law2_sibling_key(op, all_ops=self.ops) for op in ordered]
+        is_law2_sibling_gemm = (
+            len(ordered) >= 2
+            and len(set(kernel_for.values())) == 1
+            and all(not (dependencies[op.op_id] & keys) for op in ordered)
+            and all(k is not None for k in law2_keys)
+            and len(set(law2_keys)) == 1
+            and all(not any(prod_id in keys for prod_id, _, _ in k[0]) for k in law2_keys if k is not None)
+        )
+        splitv_hbm = 0.0
+        splitv_launches = 0
+        if is_law2_sibling_gemm:
+            fused_shape = (
+                int(ordered[0].local_shape[0]),
+                sum(int(op.local_shape[1]) for op in ordered),
+                int(ordered[0].local_shape[2]),
+            )
+            splitv_hbm, splitv_launches = _unabsorbed_splitv_cost(ordered, self.ops)
+        splitv_half = 0.5 * splitv_hbm
+        fused_mte2 = sum(op.mte2_bytes for op in ordered) - read + splitv_half
+        fused_mte3 = sum(op.mte3_bytes for op in ordered) - write + splitv_half
+        fused_hbm = sum(op.hbm_bytes for op in ordered) - read - write + splitv_hbm
+        extra_meta: list[tuple[str, Any]] = [
+            ("fusion_tier", spec.fusion_tier),
+            ("kernel_abi", abi),
+            ("kernel_boundary_count", len(spec.kernel_boundaries) + splitv_launches),
+            ("gm_round_trip_eliminated_bytes", read + write),
+            ("fusion_route", "resident" if read or write else "gm_spill"),
+        ]
+        if splitv_hbm > 0.0:
+            extra_meta.append(("splitv_unabsorbed_hbm_bytes", splitv_hbm))
+            extra_meta.append(("splitv_launch_count", splitv_launches))
+        if is_law2_sibling_gemm:
+            extra_meta.append(("law2_block_gemm", True))
+            extra_meta.extend(_law2_matrix_metadata(ordered, fused_shape, fused_mte2))
+        for op in ordered:
+            axis = dict(op.metadata).get("group_axis")
+            if isinstance(axis, str) and axis:
+                extra_meta.append(("group_axis", axis))
+                break
+        fused = replace(
+            tail, op_id=fused_id, family="rewrite_fused", recipe=abi, source_boundary="",
+            semantic_shape=fused_shape if is_law2_sibling_gemm else tail.semantic_shape,
+            local_shape=fused_shape,
+            padded_shape=fused_shape if is_law2_sibling_gemm else tail.padded_shape,
+            launch_shape=fused_shape if is_law2_sibling_gemm else tail.launch_shape,
+            returns=tuple(dict.fromkeys((*tail.returns, *(ref.name for ref in spec.preserve_ports),
+                                        *outputs.values()))),
+            flops=sum(op.flops for op in ordered), matrix_flops=tuple(sorted(matrix.items())),
+            vector_ops=sum(op.vector_ops for op in ordered),
+            link_bytes=sum(op.link_bytes for op in ordered), link_scope=link_scope,
+            hbm_bytes=fused_hbm, mte2_bytes=fused_mte2, mte3_bytes=fused_mte3,
+            metadata=tuple(extra_meta),
+        )
+        fused = apply_incoming_controls(fused, ordered, keys, boundary, self.ops)
+        explicit = {port for op in ordered for port in input_port_entries(op.metadata)}
+        metadata = replace_input_ports(fused.metadata, tuple(port for port in boundary if port in explicit))
+        metadata += tuple(named.items())
+        metadata += tuple((key, tuple(port for name, port in typed if name == key))
+                          for key in dict.fromkeys(name for name, _ in typed))
+        if typed_outputs:
+            metadata += (("typed_outputs", typed_outputs),)
+        fused = replace(fused, deps=tuple(dict.fromkeys((*fused.deps, *sorted(cut)))), metadata=metadata)
+        return fused, outputs
+
     def fuse(self, edit, scenario):
         spec = edit.operation
         members = tuple(self.resolve(ref) for ref in spec.members)
@@ -823,92 +1055,20 @@ class _RankDraft:
             raise ModelingError("rewrite_fusion_live_out_unpreserved")
         if any(op.link_bytes for op in ordered) and len({op.link_scope for op in ordered if op.link_bytes}) > 1:
             raise ModelingError("rewrite_fusion_mixed_link_scopes")
-        tail = ordered[-1]
+        if _has_cross_precision_sibling_gemm(ordered, kernel_for, dependencies, keys):
+            raise ModelingError("rewrite_fusion_precision_abi_mismatch")
         fused_id = f"rewrite:{edit.edit_id}"
         if fused_id in self.ops:
             raise ModelingError(f"rewrite_duplicate_fused_id:{fused_id}")
-        path = _path(scenario, self.replica, tail.stage)
+        path = _path(scenario, self.replica, ordered[-1].stage)
         read, write = _resident_savings(ordered, kernel_for, preserved, readers, path, all_ops=self.ops)
-        matrix = Counter()
-        for op in ordered:
-            for dtype, amount in (op.matrix_flops or (((op.dtype, op.flops),) if op.flops else ())):
-                matrix[dtype] += amount
-        link_scope = next((item.link_scope for item in ordered if item.link_bytes), tail.link_scope)
-        boundary_abis = tuple(b.abi_id for b in spec.kernel_boundaries)
-        abi = boundary_abis[0] if len(boundary_abis) == 1 else "+".join(boundary_abis)
         live = consumed | declared | {key for key in retained if key[0] in keys}
-        reserved = {name for _, name, _ in live} | set(tail.returns) | {"op", "out"}
-        outputs, used = {}, set()
-        for dep, name, version in sorted(live, key=lambda item: (item[0] != tail.op_id, item)):
-            port = name
-            while (port, version) in used or (port != name and port in reserved):
-                port = f"{port}__{dep}"
-            outputs[dep, name, version] = port
-            used.add((port, version))
-        source_ports = {(op.op_id, *_port_key(port)): port for op in ordered
-                        for key, ports in op.metadata if key == "typed_outputs" for port in ports
-                        if isinstance(port, Mapping)}
-        typed_keys = (declared | source_ports.keys()) & live | {key for key in live if key[-1]}
-        typed_outputs = tuple({**source_ports.get(key, {}), "producer": fused_id,
-                               "port": outputs[key], "output": outputs[key], "name": outputs[key], "version": key[-1]}
-                              for key in sorted(typed_keys))
-        fused_shape = tail.local_shape
-        law2_keys = [_law2_sibling_key(op, all_ops=self.ops) for op in ordered]
-        is_law2_sibling_gemm = (
-            len(ordered) >= 2
-            and len(set(kernel_for.values())) == 1
-            and all(not (dependencies[op.op_id] & keys) for op in ordered)
-            and all(k is not None for k in law2_keys)
-            and len(set(law2_keys)) == 1
-            and all(not any(prod_id in keys for prod_id, _, _ in k[0]) for k in law2_keys if k is not None)
+        fused, outputs = self._assemble_fused_op(
+            fused_id=fused_id, spec=spec, ordered=ordered, keys=keys,
+            kernel_for=kernel_for, dependencies=dependencies, boundary=boundary,
+            typed=typed, named=named, cut=cut, live=live, declared=declared,
+            read=read, write=write,
         )
-        if is_law2_sibling_gemm:
-            fused_shape = (
-                int(ordered[0].local_shape[0]),
-                sum(int(op.local_shape[1]) for op in ordered),
-                int(ordered[0].local_shape[2]),
-            )
-        fused_mte2 = sum(op.mte2_bytes for op in ordered) - read
-        extra_meta: list[tuple[str, Any]] = [
-            ("fusion_tier", spec.fusion_tier),
-            ("kernel_abi", abi),
-            ("kernel_boundary_count", len(spec.kernel_boundaries)),
-            ("gm_round_trip_eliminated_bytes", read + write),
-            ("fusion_route", "resident" if read or write else "gm_spill"),
-        ]
-        if is_law2_sibling_gemm:
-            extra_meta.append(("law2_block_gemm", True))
-            extra_meta.extend(_law2_matrix_metadata(ordered, fused_shape, fused_mte2))
-        for op in ordered:
-            axis = dict(op.metadata).get("group_axis")
-            if isinstance(axis, str) and axis:
-                extra_meta.append(("group_axis", axis))
-                break
-        fused = replace(
-            tail, op_id=fused_id, family="rewrite_fused", recipe=abi, source_boundary="",
-            semantic_shape=fused_shape if is_law2_sibling_gemm else tail.semantic_shape,
-            local_shape=fused_shape,
-            padded_shape=fused_shape if is_law2_sibling_gemm else tail.padded_shape,
-            launch_shape=fused_shape if is_law2_sibling_gemm else tail.launch_shape,
-            returns=tuple(dict.fromkeys((*tail.returns, *(ref.name for ref in spec.preserve_ports),
-                                        *outputs.values()))),
-            flops=sum(op.flops for op in ordered), matrix_flops=tuple(sorted(matrix.items())),
-            vector_ops=sum(op.vector_ops for op in ordered),
-            link_bytes=sum(op.link_bytes for op in ordered), link_scope=link_scope,
-            hbm_bytes=sum(op.hbm_bytes for op in ordered) - read - write,
-            mte2_bytes=fused_mte2,
-            mte3_bytes=sum(op.mte3_bytes for op in ordered) - write,
-            metadata=tuple(extra_meta),
-        )
-        fused = apply_incoming_controls(fused, ordered, keys, boundary, self.ops)
-        explicit = {port for op in ordered for port in input_port_entries(op.metadata)}
-        metadata = replace_input_ports(fused.metadata, tuple(port for port in boundary if port in explicit))
-        metadata += tuple(named.items())
-        metadata += tuple((key, tuple(port for name, port in typed if name == key))
-                          for key in dict.fromkeys(name for name, _ in typed))
-        if typed_outputs:
-            metadata += (("typed_outputs", typed_outputs),)
-        fused = replace(fused, deps=tuple(dict.fromkeys((*fused.deps, *sorted(cut)))), metadata=metadata)
         insertion = next(key for key in self.ops if key in keys)
         self.ops = {key: item for previous, op in self.ops.items() for key, item in (
             ((fused_id, fused), (previous, op)) if previous == insertion else ((previous, op),))}

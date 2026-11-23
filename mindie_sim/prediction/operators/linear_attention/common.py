@@ -18,7 +18,13 @@ from typing import Any, Literal
 from mindie_sim.public.errors import UnmodeledCapabilityError
 from mindie_sim.schema.common import ModelingError, dtype_bytes
 from mindie_sim.schema.datapath import DatapathCapabilitySpec, SourceRef
-from mindie_sim.schema.operators import OpSpec
+from mindie_sim.schema.operators import (
+    KernelBinding,
+    OpSpec,
+    OwnerMemoryResidency,
+    OwnerScheduleSpec,
+    SerialPhaseSpec,
+)
 from mindie_sim.schema.workload import RequestView
 from mindie_sim.templates.dsl_catalog import KDA_AIC_CORE_LIMIT as KDA_MAX_AIC_CORES
 from mindie_sim.templates.dsl_catalog import KDA_DEFAULT_WORKSPACE_SLOTS as KDA_WORKSPACE_SLOTS
@@ -39,6 +45,7 @@ DEFAULT_VALUE_TILE = 128
 DEFAULT_KEY_TILE = 64
 REPLAY_OPS_PER_STATE_ELEMENT = 4
 SILU_OPS_PER_ELEMENT = 4
+CONV_CHANNEL_TILE_WIDTH = 256
 SYNC_SCRATCH_BYTES = 32
 ACCEPTANCE_WORD_BYTES = 4
 CHUNK32_KERNELS = (
@@ -726,7 +733,16 @@ def build_causal_conv1d_plan(contract: CausalConvContract, ctx: OperatorPlanning
     row_bytes = c.channels * stored
     history = len(c.lengths) * history_rows * row_bytes
     output = tokens * c.channels * size
-    workers = min(ctx.effective_aiv_cores, len(c.lengths) * c.channels)
+    raw_meta = getattr(c, "metadata", None)
+    raw_tile = raw_meta.get("channel_tile") if isinstance(raw_meta, Mapping) else None
+    tile_width = (
+        int(raw_tile)
+        if isinstance(raw_tile, int) and not isinstance(raw_tile, bool) and raw_tile > 0
+        else CONV_CHANNEL_TILE_WIDTH
+    )
+    channel_tiles = max(1, ceil_div(c.channels, tile_width))
+    work_tiles = max(1, len(c.lengths) * channel_tiles)
+    workers = max(1, min(ctx.effective_aiv_cores, work_tiles))
     _positive(weight_copies)
     macs = 2 * c.channels * tokens * c.width
     state_writes = history
@@ -752,10 +768,44 @@ def build_causal_conv1d_plan(contract: CausalConvContract, ctx: OperatorPlanning
     phases.append(Phase("output", transfer(ctx, write=output), (tail,)))
     if c.write_state:
         phases.append(Phase("state_writeback", transfer(ctx, write=state_writes), ("history", "input", "output")))
+    total_read = float(output + history + weight_copies * c.channels * c.width * size
+                       + (weight_copies * c.channels * size if c.has_bias else 0))
+    total_write = float(output + (state_writes if c.write_state else 0))
+    ub_raw = dict(getattr(ctx.geometry, "buffers", ())).get("ub")
+    ub_cap = int(ub_raw) if ub_raw is not None else 0
+    ub_est = max(tile_width * (history_rows + 1) * max(size, stored), SYNC_SCRATCH_BYTES)
+    ub_live = min(ub_cap, ub_est) if ub_cap > 0 else ub_est
+    owner_schedule = OwnerScheduleSpec(
+        owner_kind="aiv",
+        tiling_strategy="sequence_channel_tile",
+        parallel_axis="sequence_x_channel_tile",
+        work_tiles=work_tiles,
+        launched_owners=workers,
+        active_owners=workers,
+        total_owners=max(1, int(ctx.effective_aiv_cores)),
+        max_tiles_per_owner=ceil_div(work_tiles, workers),
+        residency=OwnerMemoryResidency(
+            ub_live_bytes=ub_live,
+            ub_capacity_bytes=ub_cap,
+            owner_mte2_bytes=total_read / float(workers),
+            owner_mte3_bytes=total_write / float(workers),
+            shared_hbm_read_bytes=total_read,
+            shared_hbm_write_bytes=total_write,
+            l2_admission_mode="reuse",
+        ),
+        serial_phases=(
+            SerialPhaseSpec("history_input_load", "mte2", total_read / float(workers), "bytes"),
+            SerialPhaseSpec("conv_taps_act", "vec_alu", float(macs) / float(workers), "op"),
+            SerialPhaseSpec("output_state_store", "mte3", total_write / float(workers), "bytes"),
+        ),
+        dispatch_envelope_source="P15_dispatch",
+    )
     return make_plan(ctx, implementation, phases, sources=sources, family="causal_conv1d", owners=workers,
                      metadata={"mode": c.mode, "mac_flops": macs, "history_rows": history_rows,
                                "state_len": c.state_len, "state_offsets": c.state_offsets,
-                               "speculative_width": c.speculative_width})
+                               "speculative_width": c.speculative_width,
+                               "channel_tile_width": tile_width, "channel_tiles": channel_tiles,
+                               "owner_schedule": owner_schedule.to_dict()})
 
 def _resolve_recover_ssm_window(
     c: LinearAttentionContract, ctx: OperatorPlanningContext,
@@ -779,37 +829,165 @@ def _resolve_recover_ssm_window(
     return max(q, 1 + max(proposals)) if proposals and max(proposals) > 0 else q
 
 
+def _resolve_recover_ssm_accepted_per_request(
+    m: Mapping[str, Any], ctx: OperatorPlanningContext, q: int, sequences: int,
+) -> tuple[int, ...] | Any:
+    """Resolve per-request integer accepted prefixes without averaging across requests."""
+    raw_vec = m.get("accepted_per_request")
+    if isinstance(raw_vec, (tuple, list)) and raw_vec:
+        parsed = []
+        for item in raw_vec:
+            if isinstance(item, bool) or not isinstance(item, int):
+                raise ModelingError("recover_ssm_requires_integer_acceptance")
+            if item < 0 or item > q:
+                raise ModelingError(f"recover_ssm_acceptance_out_of_range:{item}:{q}")
+            parsed.append(int(item))
+        return tuple(parsed)
+    raw_a = m.get("a", m.get("accepted", m.get("accepted_tokens")))
+    if raw_a is not None:
+        if isinstance(raw_a, (tuple, list)):
+            parsed = []
+            for item in raw_a:
+                if isinstance(item, bool) or not isinstance(item, int):
+                    raise ModelingError("recover_ssm_requires_integer_acceptance")
+                if item < 0 or item > q:
+                    raise ModelingError(f"recover_ssm_acceptance_out_of_range:{item}:{q}")
+                parsed.append(int(item))
+            return tuple(parsed)
+        return raw_a
+    committed = m.get("committed_tokens")
+    if isinstance(committed, (tuple, list)) and committed:
+        parsed = []
+        for item in committed:
+            val = item[1] if isinstance(item, (tuple, list)) and len(item) >= 2 else item
+            if isinstance(val, bool) or not isinstance(val, int):
+                raise ModelingError("recover_ssm_requires_integer_acceptance")
+            if val < 0 or val > q:
+                raise ModelingError(f"recover_ssm_acceptance_out_of_range:{val}:{q}")
+            parsed.append(int(val))
+        return tuple(parsed)
+    views = [
+        v for v in (getattr(ctx, "requests", ()) or getattr(ctx, "request_views", ()) or ())
+        if not getattr(v, "padding", False)
+    ]
+    if views:
+        adv = [int(getattr(v, "draft_advanced_tokens", 0) or 0) for v in views]
+        vals = adv if any(v > 0 for v in adv) else [
+            int(getattr(v, "draft_accepted_tokens", 0) or 0) for v in views
+        ]
+        for v in vals:
+            if v < 0 or v > q:
+                raise ModelingError(f"recover_ssm_acceptance_out_of_range:{v}:{q}")
+        return tuple(vals)
+    return None
+
+
 def _resolve_recover_ssm_accepted(
     m: Mapping[str, Any], ctx: OperatorPlanningContext, q: int,
 ) -> Any:
-    raw_a = m.get("a", m.get("accepted", m.get("accepted_tokens")))
-    if raw_a is None:
-        committed = m.get("committed_tokens")
-        if isinstance(committed, (tuple, list)) and committed:
-            counts = [
-                item[1] if isinstance(item, (tuple, list)) and len(item) >= 2 else item
-                for item in committed
-            ]
-            nums = [
-                float(v) for v in counts
-                if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(float(v))
-            ]
-            if nums:
-                raw_a = sum(nums) / len(nums)
-    if raw_a is None:
-        views = [
-            v for v in (getattr(ctx, "requests", ()) or getattr(ctx, "request_views", ()) or ())
-            if not getattr(v, "padding", False)
-        ]
-        if views:
-            adv = [int(getattr(v, "draft_advanced_tokens", 0) or 0) for v in views]
-            vals = adv if any(v > 0 for v in adv) else [
-                int(getattr(v, "draft_accepted_tokens", 0) or 0) for v in views
-            ]
-            raw_a = sum(vals) / len(vals)
-    if isinstance(raw_a, float) and not isinstance(raw_a, bool) and math.isfinite(raw_a):
-        return max(0, min(q, math.ceil(raw_a)))
-    return raw_a
+    """Backward-compatible wrapper returning exact scalar or per-request tuple (never averaged)."""
+    return _resolve_recover_ssm_accepted_per_request(m, ctx, q, 1)
+
+
+def _build_recover_ssm_commit_phases(
+    c: LinearAttentionContract,
+    ctx: OperatorPlanningContext,
+    *,
+    family: str,
+    q: int,
+    options: Mapping[str, Any],
+    replay_bytes: Callable[[RecoverSsmCommitPlan], int] | None,
+) -> tuple[list[Phase], dict[str, Any], Any]:
+    m = c.metadata
+    accepted_raw = _resolve_recover_ssm_accepted_per_request(m, ctx, q, len(c.lengths))
+    if isinstance(accepted_raw, tuple):
+        per_req = accepted_raw
+        active_seqs = sum(1 for a_i in per_req if a_i > 0)
+        total_replay = sum(per_req)
+        max_depth = max(per_req, default=0)
+        # Validate transition family and base geometry via a single-sequence commit plan.
+        ref_a = max_depth
+        commit = build_recover_ssm_commit(
+            family, c.dk, c.dv, a=ref_a,
+            base_version=m.get("base_version", 0),
+            boundary_checkpoints=m.get("boundary_checkpoints", m.get("boundaries", ())),
+            **{**options, "sequences": max(1, active_seqs)},
+        )
+        per_seq_state = c.hv * c.dk * c.dv * element_bytes(c.state_dtype)
+        state_read = active_seqs * per_seq_state
+        state_write = active_seqs * per_seq_state
+        record_read = total_replay * c.hv * commit.transition.record_bytes
+        if replay_bytes and record_read:
+            scaled_commit = replace(commit, record_read_bytes=record_read)
+            record_read = replay_bytes(scaled_commit)
+        vector_ops = total_replay * REPLAY_OPS_PER_STATE_ELEMENT * c.hv * c.dk * c.dv
+        published_ver = commit.base_version + total_replay
+    else:
+        commit = build_recover_ssm_commit(
+            family, c.dk, c.dv, a=accepted_raw,
+            base_version=m.get("base_version", 0),
+            boundary_checkpoints=m.get("boundary_checkpoints", m.get("boundaries", ())),
+            **options,
+        )
+        per_req = (commit.a,) * len(c.lengths)
+        active_seqs = len(c.lengths) if commit.a > 0 else 0
+        total_replay = commit.a * len(c.lengths)
+        max_depth = commit.a
+        state_read = commit.state_read_bytes
+        state_write = commit.state_write_bytes
+        record_read = replay_bytes(commit) if replay_bytes and commit.record_read_bytes else commit.record_read_bytes
+        vector_ops = commit.vector_ops
+        published_ver = commit.published_version
+
+    phases: list[Phase] = []
+    if c.abi == "commit_recurrent_kda" or (q == 1 and total_replay > 0):
+        phases.append(Phase("read_acceptance", transfer(ctx, read=len(c.lengths) * ACCEPTANCE_WORD_BYTES)))
+    accepted_after = ("read_acceptance",) if phases else ()
+    if q == 1 and total_replay > 0:
+        phases.extend((
+            Phase("read_checkpoint", transfer(ctx, read=state_read), accepted_after),
+            Phase("publish", transfer(ctx, write=state_write), ("read_checkpoint",)),
+        ))
+    elif total_replay > 0:
+        phases.extend((
+            Phase("read_base_state", transfer(ctx, read=state_read), accepted_after),
+            Phase("read_records", transfer(ctx, read=record_read), accepted_after),
+        ))
+        after, previous = ("read_base_state", "read_records"), 0
+        for end in dict.fromkeys((*commit.boundary_checkpoints, max_depth)):
+            name = f"replay_to_{end}" if commit.boundary_checkpoints else "replay"
+            share = (end - previous) / float(max(1, max_depth))
+            replay_ops = int(round(vector_ops * share)) if commit.boundary_checkpoints else vector_ops
+            phases.append(Phase(name, Work(resources={"vector": replay_ops}), after))
+            after, previous = (name,), end
+            if end < max_depth:
+                checkpoint = f"publish_boundary_{end}"
+                phases.append(Phase(checkpoint, transfer(ctx, write=state_read), after))
+                after = (checkpoint,)
+        phases.append(Phase("publish", transfer(ctx, write=state_read), after))
+    result = {
+        "q": q,
+        "a": max_depth,
+        "accepted_per_request": per_req,
+        "active_sequences": active_seqs,
+        "total_replay_tokens": total_replay,
+        "max_replay_depth": max_depth,
+        "published_version": published_ver,
+        "base_version": commit.base_version,
+        "skipped_zero_accept": total_replay == 0,
+        "boundary_checkpoints": commit.boundary_checkpoints,
+        "physical_record_read_bytes": record_read,
+        "kernel_binding": KernelBinding(
+            kernel_id="RecoverSSMStateCommit",
+            backend="CANN",
+            arch_family=str(ctx.compute_arch.arch_id),
+            submodule="recurrent_state",
+            macro_module="attention",
+            readiness="shipping",
+            recipe_id=str(c.abi or c.operation or "recover_ssm_commit"),
+        ).to_dict(),
+    }
+    return phases, result, commit.transition
 
 
 def build_recover_ssm_plan(contract: LinearAttentionContract, ctx: OperatorPlanningContext, *,
@@ -860,42 +1038,13 @@ def build_recover_ssm_plan(contract: LinearAttentionContract, ctx: OperatorPlann
         result = {"q": q, "single_checkpoint": checkpoint, "output_tokens": tokens}
         transition = verify.transition
     else:
-        accepted = _resolve_recover_ssm_accepted(m, ctx, q)
-        commit = build_recover_ssm_commit(
-            family, c.dk, c.dv, a=accepted,
-            base_version=m.get("base_version", 0),
-            boundary_checkpoints=m.get("boundary_checkpoints", m.get("boundaries", ())), **options,
+        phases, result, transition = _build_recover_ssm_commit_phases(
+            c, ctx, family=family, q=q, options=options, replay_bytes=replay_bytes,
         )
-        record_read = replay_bytes(commit) if replay_bytes and commit.record_read_bytes else commit.record_read_bytes
-        phases = []
-        if c.abi == "commit_recurrent_kda" or q == 1 and commit.a:
-            phases.append(Phase("read_acceptance", transfer(ctx, read=len(c.lengths) * ACCEPTANCE_WORD_BYTES)))
-        accepted_after = ("read_acceptance",) if phases else ()
-        if q == 1 and commit.a:
-            phases.extend((
-                Phase("read_checkpoint", transfer(ctx, read=commit.state_read_bytes), accepted_after),
-                Phase("publish", transfer(ctx, write=commit.state_write_bytes), ("read_checkpoint",)),
-            ))
-        elif commit.a:
-            phases.extend((Phase("read_base_state", transfer(ctx, read=commit.state_read_bytes), accepted_after),
-                           Phase("read_records", transfer(ctx, read=record_read), accepted_after)))
-            after, previous = ("read_base_state", "read_records"), 0
-            for end in dict.fromkeys((*commit.boundary_checkpoints, commit.a)):
-                name = f"replay_to_{end}" if commit.boundary_checkpoints else "replay"
-                replay = Work(resources={"vector": commit.vector_ops // commit.a * (end - previous)})
-                phases.append(Phase(name, replay, after))
-                after, previous = (name,), end
-                if end < commit.a:
-                    checkpoint = f"publish_boundary_{end}"
-                    phases.append(Phase(checkpoint, transfer(ctx, write=commit.state_read_bytes), after))
-                    after = (checkpoint,)
-            phases.append(Phase("publish", transfer(ctx, write=commit.state_read_bytes), after))
-        result = {"q": q, "a": commit.a, "published_version": commit.published_version,
-                  "base_version": commit.base_version, "skipped_zero_accept": commit.skipped_zero_accept,
-                  "boundary_checkpoints": commit.boundary_checkpoints, "physical_record_read_bytes": record_read}
-        transition = commit.transition
+        active_seqs = int(result.get("active_sequences", 0))
+        owners = max(1, active_seqs * c.hv * ceil_div(c.dv, c.bv)) if active_seqs > 0 else 0
     return make_plan(ctx, c.abi or c.operation, phases, sources=sources, family="recover_ssm",
-                     launch_count=int(bool(phases)), owners=owners, metadata={
+                     launch_count=int(bool(phases)), owners=owners if owners > 0 else None, metadata={
                          **result, "ssm_family": family, "record_bytes": transition.record_bytes,
                          "upstream_verified": transition.upstream_verified,
                      })

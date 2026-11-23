@@ -267,6 +267,18 @@ path = "operators/test_hyper_connections.py"
 tier = "tier0"
 owns = ["mindie_sim/prediction/operators/hyper_connections"]
 [[module]]
+path = "operators/test_attnres_and_floor_physics.py"
+tier = "tier0"
+owns = [
+  "mindie_sim/catalog/qwen4_exp.py",
+  "mindie_sim/prediction/operators/hyper_connections/family_attnres.py",
+  "mindie_sim/prediction/operators/moe_routing/moe_gating_fusion.py",
+  "mindie_sim/prediction/operators/recurrent/recover_ssm_commit.py",
+  "mindie_sim/prediction/execution/layer_runs.py",
+  "mindie_sim/prediction/runtime/exposed_observer.py",
+  "mindie_sim/prediction/graph_analysis.py",
+]
+[[module]]
 path = "operators/test_mc2_dispatch_combine.py"
 tier = "tier0"
 owns = ["mindie_sim/prediction/operators/mc2", "mindie_sim/prediction/operators/moe_routing/moe_token_partition.py"]

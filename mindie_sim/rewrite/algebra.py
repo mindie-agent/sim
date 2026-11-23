@@ -1105,6 +1105,18 @@ def _discover_law2_block_matmul(
             m_ids = tuple(op.op_id for op in independent)
             if not _convex(ordered, set(m_ids)):
                 continue
+            saved_bytes = _law2_avoidable_read_bytes(independent, traits)
+            from .apply import SPLITV_LAUNCH_OVERHEAD_BYTES, _unabsorbed_splitv_cost
+
+            splitv_hbm, splitv_launches = _unabsorbed_splitv_cost(independent, by_id)
+            splitv_total_penalty = splitv_hbm + float(splitv_launches * SPLITV_LAUNCH_OVERHEAD_BYTES)
+            if splitv_hbm > 0.0 and float(saved_bytes) <= splitv_total_penalty:
+                rejected.append((
+                    "+".join(m_ids[:2]),
+                    "splitv_unabsorbed_cost_exceeds_activation_savings",
+                ))
+                continue
+            net_avoidable = max(0, int(round(float(saved_bytes) - splitv_hbm)))
             claimed.update(m_ids)
             found.append(AlgebraicCandidate(
                 candidate_id=f"law2_block_mm_{independent[0].op_id}",
@@ -1114,7 +1126,7 @@ def _discover_law2_block_matmul(
                 member_ids=m_ids,
                 preserve_port_ids=m_ids,
                 shipping_supported=True,
-                avoidable_hbm_bytes=_law2_avoidable_read_bytes(independent, traits),
+                avoidable_hbm_bytes=net_avoidable,
                 traits=("BILINEAR_MATMUL",),
             ))
     return found, rejected

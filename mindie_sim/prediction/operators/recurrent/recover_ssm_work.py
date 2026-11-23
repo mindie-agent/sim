@@ -60,17 +60,26 @@ def record_slice_bytes(dk: int, slice_width: int, part_index: int, kg_dtype: str
 
 
 def commit_tokens_for_view(view: Any, runtime: Any = None) -> int:
-    """Integer commitment only; a configured mean is never rounded here."""
+    """Integer commitment only; never averages, silently commits all q, or clamps overlarge values."""
+    del runtime
     q = max(1, int(getattr(view, "q_len", 1)))
-    advanced = int(getattr(view, "draft_advanced_tokens", 0) or 0)
-    if advanced > 0:
-        return min(q, advanced)
-    accept = float(getattr(runtime, "mtp_acceptance_length", 1) or 1)
-    if q > 1 and accept > 1.0:
+    raw_advanced = getattr(view, "draft_advanced_tokens", 0)
+    if isinstance(raw_advanced, bool) or not isinstance(raw_advanced, int):
         raise ModelingError(
             "recover_ssm_commit_requires_resolved_integer_advancement:"
             + str(getattr(view, "request_id", "")))
-    return q
+    if raw_advanced < 0 or raw_advanced > q:
+        raise ModelingError(
+            f"recover_ssm_commit_advancement_out_of_range:{getattr(view, 'request_id', '')}:{raw_advanced}:{q}")
+    if raw_advanced > 0:
+        return int(raw_advanced)
+    if bool(getattr(view, "draft_acceptance_resolved", False)):
+        return 0
+    if q > 1:
+        raise ModelingError(
+            "recover_ssm_commit_requires_resolved_integer_advancement:"
+            + str(getattr(view, "request_id", "")))
+    return 1
 
 
 def emit_commit_op(b: Any, *, name: str, deps: Sequence[str], views: Sequence[Any],

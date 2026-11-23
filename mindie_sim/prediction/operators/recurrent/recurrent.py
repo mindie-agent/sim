@@ -83,21 +83,20 @@ def _sum_valid_powers(tokens: int, chunk: int, power: int) -> int:
 def _lower_gdn_projections(b, tensors, *, deps, tokens, hidden, conv_width, value_width, heads):
     # Checkpoints can retain gate/output projections in native precision
     # while quantizing QKV. Role overrides inherit the existing gdn parent.
-    qkv = b.matrix("linear_qkvz", (deps,), tokens, conv_width + value_width, hidden,
-                   category="gdn.qkvz")
-    gates = b.matrix("linear_beta_alpha", (deps,), tokens, 2 * heads, hidden,
-                     category="gdn.beta_alpha")
-    projection = tensors.result(qkv, (tokens, conv_width + value_width))
+    from mindie_sim.prediction.projections import gdn_input_projections
+
+    conv_view, output_gate_view, (beta_view, alpha_view) = gdn_input_projections(
+        b, tensors, deps=deps, tokens=tokens, hidden=hidden,
+        conv_width=conv_width, value_width=value_width, heads=heads,
+    )
     conv_input = tensors.require(
-        projection.narrow(1, 0, conv_width), "short_convolution", "input",
+        conv_view, "short_convolution", "input",
         name="convolution_input_contiguous")
-    gate_projection = tensors.result(gates, (tokens, 2 * heads))
     gate_inputs = [
-        tensors.require(gate_projection.narrow(1, index * heads, heads), "gdn_gating", name,
+        tensors.require(view, "gdn_gating", name,
                         name=f"gate_{name}_contiguous").producer
-        for index, name in enumerate(("beta", "alpha"))
+        for view, name in ((beta_view, "beta"), (alpha_view, "alpha"))
     ]
-    output_gate_view = projection.narrow(1, conv_width, value_width)
     return conv_input, gate_inputs, output_gate_view
 
 
@@ -1282,7 +1281,12 @@ def linear(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
     dk, dv = plan.linear_key_head_dim or plan.linear_head_dim, plan.linear_head_dim
     key_width, value_width = key_heads * dk, heads * dv
     use_recover_ssm = recover_ssm_enabled(runtime)
-    rec_bytes = heads * record_head_bytes(dk, dv, model.activation_dtype)
+    from .recover_ssm_work import gdn_record_head_bytes
+    rec_bytes = heads * (
+        gdn_record_head_bytes(dk, dv)
+        if plan.attention == "gdn"
+        else record_head_bytes(dk, dv, model.activation_dtype)
+    )
     kda_source = (select(runtime.kernels.get("lowerings", {}), "kda")
                   if runtime and plan.attention == "kda" else None
                   ) or serving_source(runtime, model, views, plan)

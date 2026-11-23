@@ -347,6 +347,24 @@ def _opnode(op: OpSpec, dep_ids: tuple[str, ...], inputs: tuple[str, ...],
         params.append(("unversioned_state", True))
     if meta.get("capture_ineligible"):
         params.append(("capture_ineligible", True))
+    if kind in {"matmul", "grouped_matmul"}:
+        abi = getattr(op, "precision_abi", None)
+        precision_fields = (
+            ("linear_method", meta.get("linear_method") or (abi.linear_method if abi else None)),
+            ("activation_format", meta.get("activation_format") or (abi.input_dtype if abi else None)),
+            ("weight_format", meta.get("weight_format") or meta.get("weight_dtype") or (abi.weight_dtype if abi else None)),
+            ("output_format", meta.get("output_format") or (abi.output_dtype if abi else None)),
+            ("compute_format", meta.get("compute_format") or (abi.compute_dtype if abi else None)),
+            ("weight_layout", meta.get("weight_layout") or (abi.weight_layout if abi else None)),
+            ("weight_block", meta.get("weight_block")),
+            ("weight_scale_format", meta.get("weight_scale_format") or (abi.weight_scale_dtype if abi else None)),
+            ("activation_group_size", meta.get("activation_group_size") or (abi.act_group_size if abi and abi.act_group_size else None)),
+            ("activation_scale_format", meta.get("activation_scale_format") or (abi.act_scale_dtype if abi else None)),
+            ("precision_abi_signature", meta.get("precision_abi_signature") or (abi.abi_signature if abi else None)),
+        )
+        for pkey, pval in precision_fields:
+            if pval is not None and pval != "":
+                params.append((pkey, pval))
     policy = str(meta.get("numerical_policy", "exact"))
     return OpNode(
         op_id=op.op_id, kind=kind, resource=resource, inputs=inputs,
@@ -455,13 +473,21 @@ def _project_weights(op, meta, kind, in_shape, out_shape, dtype,
         {**meta, "tensor_parallel_hint": tensor_parallel})
     if weight_bytes:
         weight_id = f"{op.op_id}:weight"
-        weight_dtype = str(meta.get("weight_dtype", dtype))
+        abi = getattr(op, "precision_abi", None)
+        weight_dtype = str(
+            meta.get("weight_format")
+            or meta.get("weight_dtype")
+            or (abi.weight_dtype if abi is not None else dtype)
+        )
         element = int(DTYPE_BYTES.get(weight_dtype, 2))
         if kind in {"matmul", "grouped_matmul"} and len(in_shape) >= 2:
             weight_shape = (int(in_shape[-1]), int(out_shape[-1]))
         else:
             weight_shape = (1, weight_bytes // max(1, element))
-        layout = str(meta.get("weight_layout", "contiguous"))
+        layout = str(
+            meta.get("weight_layout")
+            or (abi.weight_layout.lower() if abi is not None else "contiguous")
+        )
         values[weight_id] = TensorValue(
             weight_id, weight_dtype, weight_shape, role="weight",
             storage_bytes=weight_bytes, sharded=True, layout=layout

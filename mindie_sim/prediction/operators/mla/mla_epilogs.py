@@ -273,6 +273,18 @@ def index_row_quantization(builder, store_id, quantize_id, *, width, native):
     return builder.add(fused)
 
 
+def _indexer_matrix_category(quant, role: str) -> str:
+    """Resolve role-specific indexer Q/K category with unscanned ``indexer_fp8`` fallback."""
+    overrides = dict(getattr(quant, "category_overrides", ()) or ())
+    exclusions = set(getattr(quant, "exclusions", ()) or ())
+    family = role.split(".", 1)[0]
+    if role in overrides or role in exclusions or family in overrides or family in exclusions:
+        return role
+    if "indexer_fp8" in overrides or "indexer_fp8" in exclusions:
+        return "indexer_fp8"
+    return role
+
+
 def index_head_weights(builder, *, plan, model, quant, deps, pool_weights, tokens,
                        native):
     """Project indexer head weights and never wrap a native consumer in casts."""
@@ -414,9 +426,12 @@ def lower_index_path(builder, *, plan, model, quant, parallel, views, deps, runt
                 shard_sizes = _row_shard(views, plan, options=opts, runtime=runtime)
                 if len(shard_sizes) > 1:
                     score_q = shard_sizes[opts.get("row_shard_rank", 0)]
-        q_index = b.matrix("index_q", (q_norm,), score_q,
-                           plan.index_heads * plan.index_dim,
-                           plan.q_lora_rank, category="indexer_fp8")
+        q_index = b.matrix(
+            "index_q", (q_norm,), score_q,
+            plan.index_heads * plan.index_dim,
+            plan.q_lora_rank,
+            category=_indexer_matrix_category(b.quant, "indexer.wq"),
+        )
         if plan.index_kpool == 1 and index_rope:
             q_index = b.vector(
                 "index_query_rotary", (q_index,),
@@ -532,8 +547,11 @@ def _produce_index_cache(
                 valid_rows=index_rows, width=plan.index_dim, plan=plan, model=model,
                 fused=fused_compressor)
         else:
-            projected = b.matrix("index_k", (index_source,), input_rows, plan.index_dim,
-                                 input_width, category="indexer_fp8")
+            projected = b.matrix(
+                "index_k", (index_source,), input_rows, plan.index_dim,
+                input_width,
+                category=_indexer_matrix_category(b.quant, "indexer.wk"),
+            )
             if plan.index_input == "compressed":
                 producer = next((op for op in reversed(b.ops)
                                  if op.op_id == index_source), None)

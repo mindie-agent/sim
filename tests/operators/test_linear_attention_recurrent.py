@@ -352,7 +352,10 @@ def test_integer_commits_sum_and_publish_after_acceptance():
     assert commit.deps == ("x", "accept0", "accept1", "base0")
     metadata = dict(commit.metadata)
     assert metadata["committed_tokens"] == (("r0", 3), ("r1", 4))
-    assert metadata["published_state_version"] == "v0"
+    assert metadata["published_state_version"] == "v7"
+    assert metadata["published_state_version"] != metadata["input_state_version"]
+    assert commit.kernel_binding is not None
+    assert commit.kernel_binding.kernel_id == "RecoverSSMStateCommit"
     assert metadata["acceptance_boundary"] == "sampling_acceptance"
     state = 2 * 4 * 8 * 4
     assert commit.vector_ops == 4 * 7 * 2 * 4 * 8
@@ -372,7 +375,10 @@ def test_missing_acceptance_duplicate_owner_and_ambiguous_mean_fail():
     ambiguous = view("r0", 6)
     with pytest.raises(ModelingError, match="resolved_integer_advancement"):
         commit_tokens_for_view(ambiguous, Software(mtp_acceptance_length=3.5))
-    assert commit_tokens_for_view(ambiguous, Software()) == 6
+    with pytest.raises(ModelingError, match="resolved_integer_advancement"):
+        commit_tokens_for_view(ambiguous, Software())
+    with pytest.raises(ModelingError, match="advancement_out_of_range"):
+        commit_tokens_for_view(view("r0", 4, advanced=6), Software())
     assert commit_tokens_for_view(view("r0", 1), Software(
         mtp_acceptance_length=3.5)) == 1
 
@@ -389,7 +395,7 @@ def test_pending_commit_is_rebound_without_duplication():
         (pending,), views=(view("r0", 6, advanced=3),),
         acceptance_events={"r0": "accept"}, state_bindings={}, runtime=None)
     commit, = bound
-    assert commit.deps == ("verify", "accept") and dict(commit.metadata)["published_state_version"] == "v1"
+    assert commit.deps == ("verify", "accept") and dict(commit.metadata)["published_state_version"] == "v4"
     op = intent(requests=("r0",))
     marked, = bind_declared_body_commits((op,), views=(view("r0", 6, advanced=2),))
     assert dict(marked.metadata)["acceptance_boundary"] == "declared_body_input"
@@ -645,7 +651,7 @@ def test_shard2_verify_lengths_fp32_ub_and_nonzero_compulsory_spec_work():
         RequestView("r0", 4, 128, True, "decode", draft_proposal_tokens=3, draft_accepted_tokens=2),
         RequestView("r1", 4, 128, True, "decode", draft_proposal_tokens=3, draft_accepted_tokens=3),
     ))
-    assert _resolve_recover_ssm_accepted({"committed_tokens": (("r0", 2), ("r1", 3))}, ctx_acc, 4) == 3
+    assert _resolve_recover_ssm_accepted({"committed_tokens": (("r0", 2), ("r1", 3))}, ctx_acc, 4) == (2, 3)
 
     # 3. Non-zero compulsory OpSpec work <= plan.work on gdn_chunk32, call_gdn, kda_membase, ring_update.
     c32_params = {"lengths": (64, 64), "heads": 8, "key_heads": 4, "dk": 128, "dv": 128, "chunk": 32}
