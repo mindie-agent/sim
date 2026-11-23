@@ -94,7 +94,7 @@ _ARITIES = {
     "ChunkGatedDeltaRuleFwd": ({9, 10}, {4}),
     "RecurrentGatedDeltaRule": ({9, 10}, {2}),
 }
-# cannbot mixed-quant sparse MLA profile slots: original-only 7/8 inputs,
+# Mixed-quant sparse MLA profile slots: original-only 7/8 inputs,
 # compressed cache 10/11/12 inputs, one or two outputs.
 _ARITIES.update({kind: (MQSMLA_INPUT_COUNTS, MQSMLA_OUTPUT_COUNTS) for kind in MQSMLA_KINDS})
 ATTENTION_CACHE_TYPES = frozenset(_ARITIES) | {"PaMlaAttention"}

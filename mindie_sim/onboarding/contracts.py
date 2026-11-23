@@ -2,7 +2,7 @@
 
 [Role] Define shared immutable dataclasses, domain constants, ISA-scoped
   ``TilingAxes`` / ``validate_abi`` rules, deterministic 512..400K Anchor +
-  Off-Grid Cliff plan synthesis, SHA-256 receipt sealing, Lean 4
+  Off-Grid Cliff plan synthesis, SHA-256 receipt sealing, formal optimality-certificate
   ``OptimalityCertificate`` non-inversion checks, privacy sanitization, bounded
   atomic JSON I/O, and bounded subprocess repo-gate / tail-diagnosis runners.
 [Invariants] Every ``TimeoutBudget`` enforces
@@ -1018,7 +1018,7 @@ def finalize_stage4_certification(
     repo_root: str | Path | None = None, run_repo_gates: bool = True, orthogonality_base: str | None = None,
     out_receipt: str | Path | None = None, diagnosis_out: str | Path | None = None,
 ) -> tuple[bool, str, dict[str, Any], dict[str, Any] | None]:
-    """Shared Stage-4 gate verification (APE tolerance, Lean 4 non-inversion, repo gates, tail diagnosis, SHA-256 receipt)."""
+    """Shared Stage-4 gate verification (APE tolerance, certified lower-bound non-inversion, repo gates, tail diagnosis, SHA-256 receipt)."""
     residuals = list(score_doc.get("residuals") or ())
     heldout = [r for r in residuals if r.get("split") == "heldout"]
     failing = [r for r in heldout if exceeds_physical_tolerance(int(r.get("predicted_ns") or 0), int(r.get("measured_ns") or 0), threshold_pct=cap_pct, atol_ns=eff_atol)]

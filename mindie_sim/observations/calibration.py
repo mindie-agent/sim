@@ -251,7 +251,7 @@ from mindie_sim.schema.common import ModelingError
 
 ACTIVATION_PRODUCER_SHA256 = "ea76c64cd935e2d35c849f957f2179701d81d72c951a738a430260de4b251136"
 ACTIVATION_PRODUCER_PATH = (
-    "repository://mindie-agent/.workstreams/composability/scripts/bench_activation.py"
+    "capture://calibration/scripts/bench_activation.py"
 )
 
 

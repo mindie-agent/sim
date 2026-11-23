@@ -257,7 +257,7 @@ def test_region_mask_and_retained_index_order_preserve_selection_extent():
 
 @pytest.mark.parametrize("candidates,tiles", [(512, 1), (513, 2), (520, 2)])
 def test_packed_candidate_tiles_cross_gm_before_cube(candidates, tiles):
-    op = _make(candidates, abi="cannbot_dsl.quant_sparse_lightning_indexer",
+    op = _make(candidates, abi="tilelang_dsl.quant_sparse_lightning_indexer",
                cache_dtype="mxfp4", index_heads=32, topk_items=64)
     case = sku_case(REGBASE)
     die, = case.machine.dies

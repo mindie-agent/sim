@@ -13,6 +13,7 @@ from dataclasses import replace
 from mindie_sim.catalog.cache_format import CacheFormat, cache_format
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.prediction.mechanism import PlannedRecipe
+from .common import DSL_MQS_ABI
 from .mqsmla import (
     COMPRESSED_CACHE_ROW_BYTES,
     KV_QUANT_BF16,
@@ -155,7 +156,7 @@ def unsupported_reason(*, views, plan, parallel, model, padded_tokens,
            for v in views):
         return "mqsmla_binding_requires_contiguous_unpadded_decode_or_draft_rows"
     if cores is not None and implementation == LEGACY_RECIPE:
-        # ``SELECTIVE_FD_72`` is a retired ``cannbot-dsl`` geometry. The
+        # ``SELECTIVE_FD_72`` is a retired custom-DSL geometry. The
         # official CANN program accepts the same rows, so the refusal follows
         # the explicitly selected implementation, never the row count alone.
         rows = tuple(query_rows(query_shape(views, plan, topk_present=topk_present)))
@@ -240,7 +241,7 @@ def lower_attention(ops, outputs, *, selection, views, plan, topk_present, prefi
                 "api": {
                     "namespace": "cann_kernel" if legacy else "aclnn",
                     "entry": (
-                        "cannbot_dsl.mixed_quant_sparse_flash_mla"
+                        DSL_MQS_ABI
                         if legacy else "cann_ops_transformer.ops.mixed_quant_sparse_flash_mla"
                     ),
                     "aclnn_symbol": None if legacy else NATIVE_KIND,

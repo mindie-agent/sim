@@ -16,8 +16,8 @@
     and turnkey ``< 8 KB`` ``agent_brief.json`` + Markdown digest;
   - ``reconcile``: streaming ``msprof`` ``kernel_details.csv`` ingress and 1-to-N
     sample-conserving reconciliation;
-  - ``bundle``: O(Unique Archetypes) ``runtime.Engine`` evaluation and Lean-4
-    ``L*`` certification;
+  - ``bundle``: O(Unique Archetypes) ``runtime.Engine`` evaluation and certified
+    physical lower-bound (``L*``) verification;
   - ``ooxml`` & ``xlsx_exporter``: zero-dependency OOXML ``.xlsx`` workbook;
   - ``trace_exporter``: streaming 1:1 full-model ``msprof`` ``trace_view.json``.
 [Invariants] Strictly a top-layer consumer in the unidirectional import DAG;

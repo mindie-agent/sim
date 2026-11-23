@@ -9,7 +9,7 @@
     and canonical ``runtime.Engine`` L0 pipes (``MTE2``, ``Cube``, ``AIV FP32``,
     ``MTE3``, ``HBM``, ``Link``, single launch floor, wave fill/drain) with
     zero heuristic efficiency multipliers;
-  - Discover provable Tier-P2 algebraic fusions via ``rewrite.algebra`` (zero
+  - Discover provable algebraic fusions via ``rewrite.algebra`` (zero
     suffix tables or model branches), accept and mechanically verify optional
     Agent-supplied ``RewritePlan`` edits through ``rewrite.verify.verify_plan``;
   - Enforce strict mode separation (``allow_unbound_formula``), hard zero-saving

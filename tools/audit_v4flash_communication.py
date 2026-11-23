@@ -20,6 +20,7 @@ from collections import Counter, defaultdict
 from decimal import Decimal, InvalidOperation
 from hashlib import blake2b, sha256
 import json
+import os
 from pathlib import Path
 import re
 import statistics
@@ -59,8 +60,9 @@ AICPU_FAMILIES = {
 }
 MODEL_FAMILIES = ("allreduce", "allgather", "alltoall")
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_CAPTURE = Path(
-    "/Volumes/data/mindie-sim-data/a3/2026-10-23/v4f-prefill/raw/pre4096.kernel_details.csv"
+DEFAULT_CAPTURE = (
+    Path(os.environ.get("MINDIE_SIM_DATA_ROOT", "."))
+    / "a3/2026-10-23/v4f-prefill/raw/pre4096.kernel_details.csv"
 )
 DEFAULT_SCOREBOARD = ROOT / "tests/fixtures/verification/v4flash-communication-scoreboard.json"
 DEFAULT_INPUT = ROOT / "tests/fixtures/verification/v4flash-communication-input.json"

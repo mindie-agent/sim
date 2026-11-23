@@ -74,7 +74,7 @@ IMPLEMENTATIONS = {
         options=("dispatch", "retained_kv_rows", "native_query_capacity")),
     "vllm_ascend_mla_head_padding": Implementation(
         "mindie_sim.prediction.operators.mla.mla_head_padding", blocks=("mla_head_padding",)),
-    # CANN 9.2.1 official mixed-quant sparse MLA.  The retired ``cannbot-dsl``
+    # CANN 9.2.1 official mixed-quant sparse MLA.  The retired custom-DSL
     # prototype stays registered as an explicit alias for retained callers.
     "aclnn_mixed_quant_sparse_flash_mla": Implementation(
         "mindie_sim.prediction.operators.paged_mla.family_mqsmla", blocks=("mqsmla_attention",),

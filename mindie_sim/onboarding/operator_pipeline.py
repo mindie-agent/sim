@@ -10,7 +10,7 @@
     and orthogonal Tier-0 test + ``TAXONOMY.toml`` snippet.
   * Stage 1B (``validate_operator_contract``): validate AST ``Upstream-ABI:``,
     verified Git blob ``SourceRef`` provenance, real Sim ``FamilyRegistry`` /
-    ``TemplateCatalog`` lowering + Lean 4 dual-bound certification, paired 1:1
+    ``TemplateCatalog`` lowering + formal optimality-certificate dual-bound certification, paired 1:1
     ``mindie-profiler`` ``resolve_builder_strict``, and ``TAXONOMY.toml``.
   * Stage 2 (``generate_operator_cliff_plan``): synthesize disjoint Anchor +
     Off-Grid Cliff + ABI-rejection bench plan.
@@ -619,7 +619,7 @@ def certify_operator(
     atol_ns: int = DEFAULT_PHYSICAL_ATOL_NS, run_repo_gates: bool = True, orthogonality_base: str | None = None,
     out_receipt: str | Path | None = None, diagnosis_out: str | Path | None = None,
 ) -> dict[str, Any]:
-    """Stage 4: Certify operator contract, pointwise cliff APE, Lean 4 non-inversion, and repo gates."""
+    """Stage 4: Certify operator contract, pointwise cliff APE, certified lower-bound non-inversion, and repo gates."""
     del capture_root, require_capture_files
     cap_pct, eff_atol = validate_strict_threshold_pct(threshold_pct), validate_strict_atol_ns(atol_ns)
     c_doc = dict(read_bounded_json(contract_report) if isinstance(contract_report, (str, Path)) else contract_report)

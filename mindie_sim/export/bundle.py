@@ -2,7 +2,7 @@
 
 [Role] Compose scenarios (``resolve_hardware_alias``, ``compose_export_case``),
   discover unique Target/Draft layer archetypes, and evaluate each archetype
-  once on ``runtime.Engine`` with Lean-4 certified ``L*`` bounds, exact
+  once on ``runtime.Engine`` with certified physical lower bounds (``L*``), exact
   cross-stream overlap attribution, hardware efficiency (AIC MFU / AIV Util /
   HBM MBU / HCCL Link Util), 3-pillar ``expected_ideal`` target envelope, and
   Memory/Quant/PP ledgers into an immutable ``ExportBundle``.

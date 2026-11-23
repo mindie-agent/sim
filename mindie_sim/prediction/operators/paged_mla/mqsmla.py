@@ -464,7 +464,7 @@ def build(op, geometry):
     cores = geometry.compute_units
     if not rows or not 1 <= cores <= MAX_MQSMLA_AIC_CORES:
         raise ModelingError("mqsmla_requires_positive_rows_and_at_most36_aic")
-    # The retired ``cannbot-dsl`` wrapper's SELECTIVE_FD_72 split reduction is
+    # The retired custom-DSL wrapper's SELECTIVE_FD_72 split reduction is
     # not the official CANN program. Keep the guard only for its explicit alias.
     if legacy and selective_fd_excluded(cores, rows):
         raise ModelingError("mqsmla_selective_72_row_fd_branch_not_modeled")

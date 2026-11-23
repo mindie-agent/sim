@@ -13,7 +13,7 @@
   * Stage 3 (``validate_512_400k``): synthesize the disjoint 512..400K Anchor +
     Off-Grid Cliff + 2D + L1/L2/L3 plan and score via ``score_sealed_gate_cases``.
   * Stage 4 (``verify_sku_gates`` & ``run_sku_onboarding``): enforce pointwise
-    ``max(10%, 2.0 us)`` multilevel gate, Lean 4 ``OptimalityCertificate``
+    ``max(10%, 2.0 us)`` multilevel gate, formal ``OptimalityCertificate``
     non-inversion, ``check_arch_governance.py --strict``,
     ``check_test_orthogonality.py``, auto-trigger ``diagnose_tail_cluster.py``
     on failure, and seal a SHA-256 ``OnboardingReceipt``.
@@ -566,7 +566,7 @@ def verify_sku_gates(
     out_receipt: str | Path | None = None, diagnosis_out: str | Path | None = None,
     stage2_lease: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Stage 4: Enforce multilevel <10% / max(10%, 2us), Lean 4 non-inversion, governance & orthogonality gates."""
+    """Stage 4: Enforce multilevel <10% / max(10%, 2us), certified lower-bound non-inversion, governance & orthogonality gates."""
     del fits_json
     cap_pct, eff_atol = validate_strict_threshold_pct(threshold_pct), validate_strict_atol_ns(atol_ns)
     if validation_report_json is None and multilevel_manifest_json is None:

@@ -6,7 +6,7 @@
  "provenance": {
   "hf": "zai-org/GLM-5.3-Flash",
   "revision": "46a050bec13002ad29ee795c16e61cf4fa3c4a9c",
-  "served_checkpoint": "/mnt/weight/GLM-5.3-Flash-BF16 (config.json sha256 33e63ec7fe607658be712bd6dd3c16c6549960d8e7f0483d34b939881b55f943)",
+  "served_checkpoint": "GLM-5.3-Flash-BF16 (config.json sha256 33e63ec7fe607658be712bd6dd3c16c6549960d8e7f0483d34b939881b55f943)",
   "scope": "text body only; the served workload is text-only and the vision tower is not priced",
   "normalisation": "The archived HF config declares fp8 quantization and head_dim 0; the measured checkpoint is the dequantised BF16 release (642,652,070,880 B = BF16, no quantization signature in the serve log), so the fp8 quantization block is dropped and head_dim is set to the 256-wide MLA qk dimension."
  },

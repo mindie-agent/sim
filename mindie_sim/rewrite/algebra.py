@@ -1,4 +1,4 @@
-"""Universal Tier-P2 algebraic graph rewrite passes over typed operator traits.
+"""Universal algebraic graph rewrite passes over typed operator traits.
 
 [Role] Classify operators into typed algebraic traits (``POINTWISE``,
   ``ROW_REDUCTION``, ``BILINEAR_MATMUL``, ``ASSOCIATIVE_COLLECTIVE``,
@@ -81,7 +81,7 @@ MAX_LAW1_CHAIN_LEN = 12
 
 
 class AlgebraicTrait(str, Enum):
-    """Typed algebraic classification driving provable Tier-P2 rewrites."""
+    """Typed algebraic classification driving provable graph rewrites."""
 
     POINTWISE = "POINTWISE"
     ROW_REDUCTION = "ROW_REDUCTION"
@@ -430,7 +430,7 @@ class SemanticAuditTrigger:
 
 @dataclass(frozen=True, slots=True)
 class AlgebraicRewriteResult:
-    """Output of Tier-P2 algebraic discovery over a rank DAG or ``ResolvedScenario``."""
+    """Output of algebraic rewrite discovery over a rank DAG or ``ResolvedScenario``."""
 
     plan: RewritePlan
     candidates: tuple[AlgebraicCandidate, ...]
@@ -1629,7 +1629,7 @@ def discover_algebraic_rewrites(
     include_abi_extensions: bool = True,
     verify: bool = True,
 ) -> AlgebraicRewriteResult:
-    """Discover Tier-P2 algebraic rewrites on a ``ResolvedScenario`` and verify via ``verify_plan``."""
+    """Discover algebraic rewrites on a ``ResolvedScenario`` and verify via ``verify_plan``."""
     from .apply import apply_plan
     from .verify import verify_plan
 

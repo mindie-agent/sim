@@ -3160,7 +3160,7 @@
         "window": 0
       },
       "config": "mindie_sim/model_configs/glm-5.3-flash.json",
-      "config_sha256": "903c9653a66bd4ee585843d29094922768fff6a18eec7d8e163c8767766f3954",
+      "config_sha256": "32468f8ffa4eb930031c393e402814f1e97aa3e2c31a715636b0f33145181ad1",
       "family": "glm",
       "parameter_scope": "text_backbone",
       "quantization": {

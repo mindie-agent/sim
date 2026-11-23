@@ -6,7 +6,7 @@
   ``Measured_msprof_Calibration`` worksheet (``A..N``).
 [Invariants] Every independent ``N->1`` fusion renders as ONE contiguous merged
   After cell with zero ``[↑ 已并入`` split rows; Sheet 2 populated column index
-  never exceeds ``27`` (``AA``); zero ``Lean 4`` or raw internal track tokens;
+  never exceeds ``27`` (``AA``); zero internal proof-engine or raw internal track tokens;
   zero free-text prose overrides; zero guessed ``.py`` source paths.
 [Timeouts & Locks] Single-pass O(Aligned Rows) OOXML cell population; no I/O.
 [Side-Effect Policy] Mutates only caller-provided ``Worksheet`` instances.

@@ -35,7 +35,7 @@ SOURCE_METADATA = "dequant_swiglu_quant"
 
 SOURCE = {
     "caller": {
-        "repository": "vllm-ascend-v41-private",
+        "repository": "vllm-project/vllm-ascend",
         "revision": "ae923905948f360f4b7ab06df52d0789a0c9316e",
         "path": "vllm_ascend/ops/fused_moe/shared_experts.py",
         "sha256": "f1780df8ec2fc290bfeb946e5d48edcb8c1b4aee0f50c1bd9d10291def201e77",
@@ -46,14 +46,14 @@ SOURCE = {
                 "activation_scale FP32, quant_mode=1) -> INT8 + FP32 row scale",
     },
     "kernel": {
-        "repository": "vllm-ascend-v41-private",
+        "repository": "vllm-project/vllm-ascend",
         "revision": "ae923905948f360f4b7ab06df52d0789a0c9316e",
         "path": "csrc/moe/dequant_swiglu_quant/op_kernel/dequant_swiglu_quant.h",
         "sha256": "2e516dc7332449057ea8379eebd61a0b6f2a2917907b7f88d07b6025d3cf72b2",
         "lines": "244-817",
     },
     "kernel_entry": {
-        "repository": "vllm-ascend-v41-private",
+        "repository": "vllm-project/vllm-ascend",
         "revision": "ae923905948f360f4b7ab06df52d0789a0c9316e",
         "path": "csrc/moe/dequant_swiglu_quant/op_kernel/dequant_swiglu_quant.cpp",
         "sha256": "bfc9cac8008acdc9c4b9ab3933c7a275bcb362681bd9128bbe6090ceed7456d5",

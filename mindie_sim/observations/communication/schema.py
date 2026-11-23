@@ -343,7 +343,7 @@ EMBEDDED_A5_CAMPAIGNS = {
         "arch_family": A5_ARCH_FAMILY, "stack": "rack06", "cann": "9.1.0",
         "date": "2026-10-21", "dtype": "bf16", "observed_expansion_mode": "not_observed",
         "placement": "a5-ub-mesh/rack06/intra-node", "nodes": ("rack06",),
-        "requested_expansion_mode": "unspecified", "source": "/Volumes/data/mindie-sim-data/a5/2026-10-21/comm-rack06/a5-comm-rack06-calibration.json",
+        "requested_expansion_mode": "unspecified", "source": "capture://mindie-sim-data/a5/2026-10-21/comm-rack06/a5-comm-rack06-calibration.json",
         "series": (
             ("all_gather", 2, "intra_node_ub", None, ((1024, 0.050598), (4096, 0.049899), (16384, 0.049841), (65536, 0.051102), (262144, 0.052241), (1048576, 0.054034), (4194304, 0.113933), (16777216, 0.377593), (67108864, 1.462068), (134217728, 2.910362))),
             ("all_gather", 4, "intra_node_ub", None, ((1024, 0.056646), (4096, 0.057046), (16384, 0.057128), (65536, 0.057845), (262144, 0.059926), (1048576, 0.062663), (4194304, 0.119794), (16777216, 0.382312), (67108864, 1.468641), (134217728, 2.950437))),
@@ -386,7 +386,7 @@ EMBEDDED_A5_CAMPAIGNS = {
         "arch_family": A5_ARCH_FAMILY, "stack": "rack08", "cann": "9.2.0",
         "date": "2026-10-21", "dtype": "bf16", "observed_expansion_mode": "not_observed",
         "placement": "a5-ub-mesh/rack08/intra-node", "nodes": ("rack08",),
-        "requested_expansion_mode": "unspecified", "source": "/Volumes/data/mindie-sim-data/a5/2026-10-21/comm-rack08/a5-comm-rack08-calibration.json",
+        "requested_expansion_mode": "unspecified", "source": "capture://mindie-sim-data/a5/2026-10-21/comm-rack08/a5-comm-rack08-calibration.json",
         "series": (
             ("all_gather", 8, "intra_node_ub", None, ((1024, 0.057542), (4096, 0.051507), (16384, 0.060556), (65536, 0.050979), (262144, 0.053263), (1048576, 0.053907), (4194304, 0.119734), (16777216, 0.248473), (67108864, 0.950504), (134217728, 1.931796))),
             ("all_reduce", 2, "intra_node_ub", None, ((1024, 0.048851), (4096, 0.049171), (16384, 0.050588), (65536, 0.051537), (262144, 0.051087), (1048576, 0.054255), (4194304, 0.114074), (16777216, 0.377803), (67108864, 1.435099), (134217728, 2.873427))),
@@ -412,8 +412,8 @@ EMBEDDED_A5_CAMPAIGNS = {
         "hardware_key": A5_HARDWARE_KEY,
         "arch_family": A5_ARCH_FAMILY, "stack": "rack06", "cann": "9.1.0",
         "date": "2026-10-22", "dtype": "bf16", "observed_expansion_mode": "not_observed",
-        "placement": "a5-ub-mesh/rack06/inter-node/2-node-16rank", "nodes": ("rack06os5", "rack06os6"),
-        "requested_expansion_mode": "unspecified", "source": "/Volumes/data/mindie-sim-data/a5/2026-10-22/comm-w16/artifacts/a5-comm-w16-calibration.json",
+        "placement": "a5-ub-mesh/rack06/inter-node/2-node-16rank", "nodes": ("node-0", "node-1"),
+        "requested_expansion_mode": "unspecified", "source": "capture://mindie-sim-data/a5/2026-10-22/comm-w16/artifacts/a5-comm-w16-calibration.json",
         "series": (
             ("all_gather", 16, "cross_node_urma", None, ((1024, 0.075925), (4096, 0.077139), (16384, 0.080643), (65536, 0.089330), (262144, 0.110689), (1048576, 0.170982), (4194304, 0.370355), (16777216, 0.681688), (67108864, 2.695952), (134217728, 5.705244))),
             ("all_reduce", 16, "cross_node_urma", None, ((1024, 0.122519), (4096, 0.123304), (16384, 0.126710), (65536, 0.133490), (262144, 0.144056), (1048576, 0.164739), (4194304, 0.218155), (16777216, 0.333294), (67108864, 0.636665), (134217728, 0.980338))),
@@ -437,8 +437,8 @@ EMBEDDED_A5_CAMPAIGNS = {
         "hardware_key": A5_HARDWARE_KEY,
         "arch_family": A5_ARCH_FAMILY, "stack": "rack06", "cann": "9.1.0",
         "date": "2026-10-22", "dtype": "bf16", "observed_expansion_mode": "not_observed",
-        "placement": "a5-ub-mesh/rack06/inter-node/4-node-32rank", "nodes": ("rack06os4", "rack06os5", "rack06os6", "rack06os7"),
-        "requested_expansion_mode": "unspecified", "source": "/Volumes/data/mindie-sim-data/a5/2026-10-22/comm-w32/artifacts/a5-comm-w32-calibration.json",
+        "placement": "a5-ub-mesh/rack06/inter-node/4-node-32rank", "nodes": ("node-0", "node-1", "node-2", "node-3"),
+        "requested_expansion_mode": "unspecified", "source": "capture://mindie-sim-data/a5/2026-10-22/comm-w32/artifacts/a5-comm-w32-calibration.json",
         "series": (
             ("all_gather", 32, "cross_node_urma", None, ((1024, 0.114313), (4096, 0.111618), (16384, 0.113686), (65536, 0.124429), (262144, 0.165558), (1048576, 0.291884), (4194304, 0.518425), (16777216, 1.214689), (67108864, 4.846047), (134217728, 10.479134))),
             ("all_reduce", 32, "cross_node_urma", None, ((1024, 0.160401), (4096, 0.159696), (16384, 0.163973), (65536, 0.169966), (262144, 0.185857), (1048576, 0.212545), (4194304, 0.272354), (16777216, 0.394652), (67108864, 0.755183), (134217728, 1.036680))),
@@ -459,7 +459,7 @@ EMBEDDED_A5_CAMPAIGNS = {
 }
 
 A5_NATIVE_GROUP2 = {
-    "source": "/Volumes/data/mindie-sim-data/calibration-20261107/a5/hccl-native/raw/parsed/native-summary.json",
+    "source": "capture://mindie-sim-data/calibration-20261107/a5/hccl-native/raw/parsed/native-summary.json",
     "manifest_sha256": "7ab3030edaf471d907fd83e1fec766ae37a4b2effde94411ee3bf14a975cc2b9",
     "platform": "A5 Ascend950DT intrahost",
     "stack": "rack08",
@@ -531,8 +531,8 @@ EMBEDDED_A5_MC2_CAMPAIGNS = {
         "hardware_key": A5_HARDWARE_KEY, "arch_family": A5_ARCH_FAMILY,
         "stack": "rack06", "date": "2026-10-21", "dtype": "bf16",
         "observed_expansion_mode": "not_observed", "requested_expansion_mode": "unspecified",
-        "placement": "intra-node-ub", "nodes": ("rack06os6",),
-        "source": "/Volumes/data/mindie-sim-data/a5/2026-10-21/mc2/a5mc2-rack06-r1",
+        "placement": "intra-node-ub", "nodes": ("node-0",),
+        "source": "capture://mindie-sim-data/a5/2026-10-21/mc2/a5mc2-rack06-r1",
         "chains": (
             ("bf16", 2, 64, 512, 0.519084, 0.644950, 0.042783, 0.341566, 0.531807, 2.210635),
             ("bf16", 2, 64, 1024, 0.954289, 0.735582, 0.044903, 0.387475, 1.004513, 3.293601),
@@ -550,7 +550,7 @@ EMBEDDED_A5_MC2_CAMPAIGNS = {
         "stack": "rack08", "date": "2026-10-21", "dtype": "bf16",
         "observed_expansion_mode": "not_observed", "requested_expansion_mode": "unspecified",
         "placement": "intra-node-ub", "nodes": ("rack08",),
-        "source": "/Volumes/data/mindie-sim-data/a5/2026-10-21/mc2/a5mc2-rack08-r1",
+        "source": "capture://mindie-sim-data/a5/2026-10-21/mc2/a5mc2-rack08-r1",
         "chains": (
             ("bf16", 2, 64, 512, 0.725649, 0.640399, 0.060283, 0.339579, 0.736450, 2.450751),
             ("bf16", 2, 64, 1024, 1.169757, 0.735081, 0.059138, 0.382390, 1.170900, 3.485126),
@@ -567,7 +567,7 @@ EMBEDDED_A5_MC2_CAMPAIGNS = {
         "hardware_key": A5_HARDWARE_KEY, "arch_family": A5_ARCH_FAMILY,
         "stack": "rack06", "date": "2026-10-22", "dtype": "int8+fp8-e4m3",
         "observed_expansion_mode": "not_observed", "requested_expansion_mode": "unspecified",
-        "source": "/Volumes/data/mindie-sim-data/a5/2026-10-22/mc2-quant/results/a5-mc2-quant-chain-validation.json",
+        "source": "capture://mindie-sim-data/a5/2026-10-22/mc2-quant/results/a5-mc2-quant-chain-validation.json",
         "all_to_allv_series": (
             ("fp8-e4m3", 2, ((14680064, 0.697195), (29360128, 1.161461))),
             ("fp8-e4m3", 4, ((11010048, 0.580367), (22020096, 0.680918), (44040192, 0.912123))),
