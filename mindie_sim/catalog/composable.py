@@ -337,5 +337,9 @@ def build_composable(key, config, family="generic"):
                              for kind in sorted({p.attention for p in plans})}),
         ("ffn_types", {kind: sum(p.ffn == kind for p in plans)
                        for kind in sorted({p.ffn for p in plans})}),
+        ("routed_expert_hidden_size", (
+            None if c.get("routed_expert_hidden_size") is None
+            else int(c["routed_expert_hidden_size"])
+        )),
     ))
     return model

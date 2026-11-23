@@ -400,21 +400,24 @@ def resolve_auto_va_quant(
     context_tokens: int = 0,
 ) -> tuple[str, str, str]:
     """Resolve chip-matched ``vllm-ascend`` production ``(weight_quant, kv_dtype, indexer_dtype)``."""
-    sku_low = str(hardware_sku or "").strip().lower()
-    is_a5 = any(tok in sku_low for tok in ("950", "a5", "dav_3510", "3510", "arch35"))
+    from mindie_sim.catalog.npu_checkpoints import normalize_hw_family
+
+    del context_tokens  # Production target KV quantization stays active across prompt lengths.
+    hw = normalize_hw_family(str(hardware_sku or ""))
     plans = tuple(getattr(model_spec, "layer_plans", ()) or ())
     is_moe = (
         int(getattr(model_spec, "num_experts", 0) or 0) > 1
         or any(str(getattr(lp, "ffn", "")).lower() == "moe" for lp in plans)
     )
-    long_ctx = int(context_tokens or 0) >= LONG_CONTEXT_KV_QUANT_THRESHOLD
-    if is_a5:
-        if is_moe:
-            return ("mxfp8_mxfp4", "fp8_e4m3", "fp8_e4m3")
-        kv = "fp8_e4m3" if long_ctx else "bf16"
-        return ("mxfp8", kv, kv)
-    kv = "int8" if long_ctx else "bf16"
-    return ("w4a8" if is_moe else "w8a8", kv, kv)
+    has_kpool = any(int(getattr(lp, "index_kpool", 1) or 1) > 1 for lp in plans)
+    if hw == "a5":
+        return ("mxfp8_mxfp4" if is_moe else "mxfp8", "fp8_e4m3", "fp8_e4m3")
+    if hw in {"a2", "a3"}:
+        # K-pool index caches reject INT8 storage; keep BF16 indexer KV for K-pool on A2/A3.
+        idx_dtype = "bf16" if has_kpool else "int8"
+        return ("w4a8" if is_moe else "w8a8", "int8", idx_dtype)
+    native = str(getattr(model_spec, "activation_dtype", None) or "bf16")
+    return (native, native, native)
 
 
 #: Explicit quantization presets a case may declare on a catalog model.

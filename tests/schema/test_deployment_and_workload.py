@@ -270,7 +270,7 @@ def test_paired_allocator_resolves_defaults_and_honors_explicit_page_size(width,
         assert width == 1 or memory.capacity[0][0] > 0
 
 @pytest.mark.parametrize("model,phase,level,ep,path,expected", [
-    ("qwen3.5-397b-a17b", "decode", "merged", 8, ("metadata", "additional_config", "enable_fused_mc2"), 3),
+    ("qwen3.5-397b-a17b", "decode", "merged", 8, ("metadata", "additional_config", "enable_fused_mc2"), 2),
     ("qwen3.8-flash-next", "prefill", "unmerged_pr", 8, ("metadata", "text_gated_residual_min_rows"), 513),
     ("qwen3.8-flash-next", "decode", "unmerged_pr", 8, ("metadata", "text_gated_residual"), None),
     ("qwen3.8-27b", "prefill", "merged", 1, ("attention_policy", "recurrent_chunk"), 64),
@@ -589,3 +589,142 @@ def test_workload_copies_metadata_and_roundtrips_request_boundaries(container):
         WorkloadSpec(duplicated)
     with pytest.raises(ModelingError):
         replace(workload, metadata=(entry for entry in (pair,)))
+
+
+def test_shipping_baseline_enables_quant_capture_mlapo_and_arch_disjoint_collectives():
+    from _support.axes import REPRESENTATIVE_SKUS
+    from mindie_sim.catalog.quant import resolve_auto_va_quant
+
+    expected = {
+        "a5": ("CCU_MS", "ub_direct", None, "fp8_e4m3"),
+        "a3": ("AIV", "hccs_sw", True, "int8"),
+        "a2": ("AIV", "hccs_8p_roce", True, "int8"),
+    }
+    for family, (exp_mode, fabric, expect_nz, expect_kv) in expected.items():
+        case_dict = compose_case(
+            "deepseek-v3.2", REPRESENTATIVE_SKUS[family],
+            tp=1, dp=8, ep=8, layers=4, feature_track="merged",
+        )
+        rt = case_dict["runtime"]
+        meta = rt["metadata"]
+        policy = meta["execution_policy"]
+        assert rt["graph_capture_mode"] == "full"
+        assert rt["compilation_config"]["cudagraph_mode"] == "FULL_DECODE_ONLY"
+        assert policy["mlapo"] is True
+        assert meta["va_env"]["VLLM_ASCEND_ENABLE_MLAPO"] == "1"
+        assert "HCCL_INTRA_PCIE_ENABLE" not in meta["va_env"]
+        assert meta["va_env"]["HCCL_OP_EXPANSION_MODE"] == exp_mode
+        assert meta["shipping_collective_policy"]["fabric"] == fabric
+        assert rt["kernels"]["lowerings"]["mla_prolog"] == "vllm_ascend_mla_prolog_v3"
+        assert meta.get("additional_config", {}).get("enable_weight_nz_layout") is expect_nz
+        if family != "a5":
+            assert "CCU" not in json.dumps(meta)
+        _, kv_dt, _ = resolve_auto_va_quant(
+            load_model("deepseek-v3.2"), REPRESENTATIVE_SKUS[family], context_tokens=128,
+        )
+        assert kv_dt == expect_kv
+
+    _, kpool_kv, kpool_idx = resolve_auto_va_quant(
+        load_model("glm-5.3-flash"), REPRESENTATIVE_SKUS["a3"], context_tokens=128,
+    )
+    assert kpool_kv == "int8" and kpool_idx == "bf16"
+
+    prefill = compose_case(
+        "deepseek-v3.2", REPRESENTATIVE_SKUS["a5"],
+        tp=1, dp=8, ep=8, layers=4, role="pd_prefill", feature_track="merged",
+    )
+    assert prefill["runtime"]["metadata"]["execution_policy"]["mlapo"] is False
+    assert "VLLM_ASCEND_ENABLE_MLAPO" not in prefill["runtime"]["metadata"]["va_env"]
+
+    non_mla = compose_case(
+        "qwen3.5-397b-a17b", REPRESENTATIVE_SKUS["a5"], tp=8, ep=8, layers=2, feature_track="merged",
+    )
+    assert non_mla["runtime"]["metadata"]["execution_policy"]["mlapo"] is False
+    assert "VLLM_ASCEND_ENABLE_MLAPO" not in non_mla["runtime"]["metadata"]["va_env"]
+
+
+def test_moe_route_policy_enforces_fused_collective_mutex_and_shared_fusion_guards():
+    from _support.axes import REPRESENTATIVE_SKUS
+
+    eligible = compose_case(
+        "deepseek-v3.2", REPRESENTATIVE_SKUS["a5"],
+        tp=1, dp=8, ep=8, layers=4, feature_track="merged",
+        enable_fused_mc2=3, multistream_overlap_shared_expert=True,
+    )
+    rt = eligible["runtime"]
+    assert rt["metadata"]["additional_config"]["enable_fused_mc2"] == 3
+    assert not rt.get("multistream_overlap_shared_expert", False)
+    assert rt["metadata"]["moe_route"]["megamoe_shared_expert_fusion"] is True
+    assert rt["metadata"]["moe_route"]["mutex_disabled_mso"] is True
+
+    gated = compose_case(
+        "qwen3.5-397b-a17b", REPRESENTATIVE_SKUS["a5"],
+        tp=8, ep=8, layers=2, feature_track="merged",
+        multistream_overlap_shared_expert=True,
+    )
+    assert gated["runtime"]["metadata"]["additional_config"]["enable_fused_mc2"] == 2
+    assert not gated["runtime"].get("multistream_overlap_shared_expert", False)
+
+    kimi_merged = compose_case(
+        "kimi-k3.1", REPRESENTATIVE_SKUS["a5"],
+        tp=8, ep=8, layers=4, role="pd_decode", feature_track="merged",
+    )
+    assert kimi_merged["runtime"]["metadata"]["additional_config"]["enable_fused_mc2"] == 0
+    assert kimi_merged["runtime"].get("multistream_overlap_shared_expert") is True
+
+    for family in ("a3", "a2"):
+        with pytest.raises(ModelingError, match="enable_fused_mc2_level3_requires_a5"):
+            compose_case(
+                "deepseek-v3.2", REPRESENTATIVE_SKUS[family],
+                tp=1, dp=8, ep=8, layers=4, enable_fused_mc2=3,
+            )
+
+    from mindie_sim.model_catalog import CONFIG_DIR
+    latent_cfg = json.loads((CONFIG_DIR / "deepseek-v3.2.json").read_text())
+    latent_cfg["routed_expert_hidden_size"] = latent_cfg["hidden_size"]
+    with pytest.raises(ModelingError, match="enable_fused_mc2_level3_unsupported_latent_moe"):
+        compose_case(
+            latent_cfg, REPRESENTATIVE_SKUS["a5"],
+            tp=1, dp=8, ep=8, layers=4, enable_fused_mc2=3,
+        )
+
+
+def test_architecture_isolation_rejects_cross_generation_presets_and_knobs():
+    from _support.axes import REPRESENTATIVE_SKUS
+    from mindie_sim.catalog.npu_checkpoints import normalize_hw_family
+    from mindie_sim.catalog.va_speculative_rules import build_va_serving_rules
+
+    assert normalize_hw_family("Arch20") == "a2"
+    assert normalize_hw_family("Arch22") == "a3"
+    assert normalize_hw_family("Arch35") == "a5"
+    assert normalize_hw_family("H100") == "other"
+    assert normalize_hw_family("") == "other"
+
+    for family, bad_preset in (("a5", "a3_superpod"), ("a3", "a5_pod"), ("a2", "a5_pod")):
+        with pytest.raises(ModelingError, match="ascend_topology_preset_incompatible"):
+            compose_case(
+                "deepseek-v3.2", REPRESENTATIVE_SKUS[family],
+                tp=1, dp=8, ep=8, layers=4, topology_preset=bad_preset,
+            )
+    with pytest.raises(ModelingError, match="a2_superpod_unsupported"):
+        compose_case(
+            "deepseek-v3.2", REPRESENTATIVE_SKUS["a2"],
+            tp=1, dp=8, ep=8, layers=4, superpod_size=384,
+        )
+
+    for family in ("a2", "a3", "a5"):
+        rules = build_va_serving_rules(
+            "deepseek-v3.2", hw_family=REPRESENTATIVE_SKUS[family],
+            tp=8, dp=1, ep=8, pp=1, enable_weight_nz_layout=True,
+        )
+        blob = f"{rules.collective_guidance} {rules.hw_isa_guidance}"
+        assert "AIV/CCU" not in blob and "CCU/AIV" not in blob
+        if family == "a5":
+            assert "enable_weight_nz_layout" not in rules.additional_config
+            assert any("weight_nz_layout_not_applicable" in w for w in rules.warnings)
+            assert "CCU" in blob and "UB-Direct" in blob
+        else:
+            assert rules.additional_config.get("enable_weight_nz_layout") is True
+            assert "CCU" not in blob
+            if family == "a2":
+                assert "SuperPoD" not in blob and "UB-Direct" not in blob

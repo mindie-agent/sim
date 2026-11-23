@@ -62,17 +62,26 @@ from mindie_sim.compose.runtime import (
     _execution_policy,
     _resolve_va_lowerings,
     _supports_sequence_parallel,
+    apply_arch_weight_nz_policy,
     apply_va_recommended,
     bind_sku_host_dma_rates,
     capture_keys,
     finalize_compilation_spine,
     snapshot_kernel_keys,
     stamp_stack_profile_origins,
+    sync_moe_route_on_runtime,
     va_recommended_config,
+)
+from mindie_sim.prediction.feedforward import (
+    FUSED_MC2_MEGAMOE_SHARED,
+    resolve_moe_route_policy,
 )
 from mindie_sim.prediction.offload.policy import missing_scenario_error
 from mindie_sim.prediction.structure import parse_case
-from mindie_sim.runtime_profiles import VA_RECOMMENDED_PROFILES
+from mindie_sim.runtime_profiles import (
+    VA_RECOMMENDED_PROFILES,
+    shipping_collective_policy,
+)
 from mindie_sim.schema.common import ModelingError
 
 BYTES_PER_GB = 1_000_000_000.0
@@ -96,6 +105,7 @@ _PARALLEL_AXES = ("tp", "dp", "ep", "pp", "pcp", "dcp")
 _VALID_DEPLOYMENT_MODES = frozenset({"auto", "pd", "pd_disaggregated", "colocated"})
 _VALID_DEPLOYMENT_ROLES = frozenset({"colocated", "pd_prefill", "pd_decode"})
 _CACHE_DTYPE_ALIASES = {"fp8": "fp8_e4m3", "c8": "int8"}
+_TOPOLOGY_PRESET_ARCH_PREFIXES = {"a2": "a2_", "a3": "a3_", "a5": "a5_"}
 
 
 def _materialize_machine(
@@ -117,6 +127,14 @@ def _materialize_machine(
         raise ModelingError(f"hardware_topology_preset_unsupported:{backend}:{preset}")
     if preset and preset not in ASCEND_TOPOLOGY_PRESETS:
         raise ModelingError(f"ascend_topology_preset_unknown:{preset}")
+    arch = _arch_key(sku) if backend == "ascend" else ""
+    if preset and arch in _TOPOLOGY_PRESET_ARCH_PREFIXES:
+        expected_prefix = _TOPOLOGY_PRESET_ARCH_PREFIXES[arch]
+        if not preset.startswith(expected_prefix):
+            raise ModelingError(f"ascend_topology_preset_incompatible:{sku}:{preset}")
+    resolved_superpod = superpod_size if superpod_size is not None else hw_raw.get("superpod_size")
+    if arch == "a2" and resolved_superpod is not None:
+        raise ModelingError(f"a2_superpod_unsupported:{sku}:superpod_size={resolved_superpod}")
     preset_defaults = ASCEND_TOPOLOGY_PRESETS.get(preset, {})
     resolved_devices = int(
         num_devices if num_devices is not None else hw_raw.get("num_devices", required_devices)
@@ -556,8 +574,43 @@ def _resolve_bool_feature(
     return False, "default"
 
 
+def _resolve_shipping_mlapo_and_collective(
+    *,
+    production: bool,
+    arch: str,
+    model_spec: Any,
+    prof: Mapping[str, Any],
+    exclude_set: frozenset[str],
+    norm_role: str | None,
+    pcp: int,
+) -> tuple[bool, dict[str, Any] | None]:
+    """Resolve shipping MLAPO eligibility and arch-disjoint collective policy."""
+    has_eligible_mla = any(
+        p.attention == "mla" and p.q_lora_rank > 0 and p.mla_variant != "latent_mqa"
+        for p in getattr(model_spec, "layer_plans", ())
+    )
+    env_mlapo = str((prof.get("env") or {}).get("VLLM_ASCEND_ENABLE_MLAPO", "")).strip().lower()
+    mlapo_active = bool(
+        production
+        and has_eligible_mla
+        and "mla_prolog_fusion" not in exclude_set
+        and norm_role != "pd_prefill"
+        and int(pcp) == 1
+        and (not prof or env_mlapo not in {"0", "false", "no"})
+    )
+    collective_policy = (
+        deepcopy(prof["shipping_collective_policy"])
+        if prof.get("shipping_collective_policy")
+        else shipping_collective_policy(arch, role=norm_role)
+        if (production and arch)
+        else None
+    )
+    return mlapo_active, collective_policy
+
+
 def _resolve_domain2_policy(
     *,
+    sku: str,
     hardware_backend: str,
     production: bool,
     va_recommended: bool | None,
@@ -579,10 +632,12 @@ def _resolve_domain2_policy(
     exclude_set: frozenset[str],
     notes: list[dict[str, Any]],
     canonical_track: str = "merged",
+    norm_role: str | None = None,
 ) -> dict[str, Any]:
     """Resolve Domain-2 model-intrinsic offload & production stack features (opt-out only)."""
     prof = va_profile or {}
     prof_flags = dict(prof.get("tutorial_flags") or {})
+    arch = _arch_key(sku) if hardware_backend == "ascend" else ""
     # Preserve explicit stack disable workarounds (e.g. enable_fused_mc2=0) on
     # both merged and unmerged_pr ('Before') tracks; only expected_ideal lifts
     # them when evaluating theoretical ceiling unless caller explicitly pins 0.
@@ -621,6 +676,20 @@ def _resolve_domain2_policy(
         None if "cann_megamoe_fusion" in exclude_set else
         int(prof_fused_mc2) if use_prof_fused_mc2 else None
     )
+    moe_route = resolve_moe_route_policy(
+        arch=arch,
+        model=model_spec,
+        requested_fused_mc2=resolved_fused_mc2,
+        requested_mso=resolved_mso,
+        tp=int(axes.get("tp", 1)),
+        enable_shared_expert_dp=resolved_se_dp,
+        strict_level3=(not raw_eager and enable_fused_mc2 == FUSED_MC2_MEGAMOE_SHARED),
+    )
+    resolved_fused_mc2 = moe_route["effective_enable_fused_mc2"]
+    if moe_route["mutex_disabled_mso"]:
+        resolved_mso, mso_src = False, "disabled_by_fused_mc2_mutex"
+    else:
+        resolved_mso = bool(moe_route["effective_multistream_overlap_shared_expert"])
     resolved_prefill_mc2 = (
         None if raw_eager else
         bool(enable_prefill_mc2) if enable_prefill_mc2 is not None else
@@ -667,6 +736,10 @@ def _resolve_domain2_policy(
             ("enable_prefill_mc2", resolved_prefill_mc2),
         ) if v is not None
     }
+    mlapo_active, collective_policy = _resolve_shipping_mlapo_and_collective(
+        production=production, arch=arch, model_spec=model_spec, prof=prof,
+        exclude_set=exclude_set, norm_role=norm_role, pcp=int(axes.get("pcp", 1)),
+    )
     policy = {
         "backend": hardware_backend, "production": bool(production),
         "va_recommended": va_recommended, "raw_eager": bool(raw_eager),
@@ -677,7 +750,9 @@ def _resolve_domain2_policy(
         "engram_cpu_offload": bool(resolved_engram), "engram_cpu_offload_source": engram_src,
         "multistream_overlap_shared_expert": bool(resolved_mso), "mso_source": mso_src,
         "enable_shared_expert_dp": bool(resolved_se_dp), "enable_shared_expert_dp_source": se_dp_src,
-        "mlapo": bool(production and "VLLM_ASCEND_ENABLE_MLAPO" in (prof.get("env") or {})),
+        "mlapo": mlapo_active,
+        "moe_route": moe_route,
+        **({"shipping_collective_policy": collective_policy} if collective_policy else {}),
         "tutorial_flags_applied": tutorial_applied,
         "mtp_proposal_tokens": int(mtp_tokens), "mtp_source": str(mtp_source),
         "recommended_mtp_proposal_tokens": int(prof.get("mtp_proposal_tokens", 0) or 0),
@@ -689,6 +764,7 @@ def _resolve_domain2_policy(
         "enable_shared_expert_dp": resolved_se_dp,
         "enable_flashcomm1": resolved_flashcomm1, "enable_fused_mc2": resolved_fused_mc2,
         "enable_prefill_mc2": resolved_prefill_mc2,
+        "moe_route": moe_route, "shipping_collective_policy": collective_policy,
         "sp": resolved_sp, "explicit_sp": explicit_sp_flag,
         "graph_capture_mode": resolved_capture, "enable_torch_compile": initial_compile,
         "execution_policy": policy,
@@ -718,6 +794,8 @@ def _apply_va_profile_lowerings(
     if isinstance(all2all, str) and all2all:
         runtime_dict["all2all_backend"] = all2all
     runtime_meta["va_env"] = dict(va_profile["env"])
+    if va_profile.get("shipping_collective_policy"):
+        runtime_meta["shipping_collective_policy"] = deepcopy(va_profile["shipping_collective_policy"])
     runtime_meta["va_recommended_mtp_proposal_tokens"] = int(va_profile["mtp_proposal_tokens"])
     passes: tuple[str, ...] = ()
     if (model_spec.quant is not None
@@ -745,20 +823,56 @@ def _apply_va_profile_lowerings(
     runtime_dict["metadata"] = runtime_meta
 
 
-def _attach_expected_ideal_mla_prolog_fusion(
+def _every_pp_stage_has_mla(
+    model_spec: Any,
+    runtime_dict: Mapping[str, Any],
+    pp: int,
+) -> bool:
+    """Return True when every pipeline stage owns at least one eligible MLA layer."""
+    eligible = [
+        p.attention == "mla" and p.q_lora_rank > 0 and p.mla_variant != "latent_mqa"
+        for p in getattr(model_spec, "layer_plans", ())
+    ]
+    if not any(eligible):
+        return False
+    stages = int(pp)
+    if stages <= 1:
+        return True
+    part = runtime_dict.get("pp_layer_partition")
+    if isinstance(part, Sequence) and len(part) == stages:
+        counts = [int(c) for c in part]
+    else:
+        total = len(eligible)
+        counts = [total // stages + (1 if idx < total % stages else 0) for idx in range(stages)]
+    cursor = 0
+    for count in counts:
+        if not any(eligible[cursor:cursor + count]):
+            return False
+        cursor += count
+    return True
+
+
+def _attach_mla_prolog_native_fusion(
     lowerings: dict[str, Any],
     *,
     canonical_track: str,
+    raw_eager: bool,
+    norm_role: str | None,
+    model_spec: Any,
+    runtime_dict: Mapping[str, Any],
     exclude_optimizations: Sequence[str],
     axes: Mapping[str, int],
     sku: str,
 ) -> None:
-    """Fold ``mla_prolog`` into one ``aclnnMlaPrologV3`` native kernel on ``expected_ideal``."""
+    """Fold ``mla_prolog`` into one ``aclnnMlaPrologV3/V4`` kernel on ``expected_ideal``."""
     if not (
         canonical_track == "expected_ideal"
+        and not raw_eager
+        and norm_role != "pd_prefill"
         and "mla_prolog" in lowerings
         and "mla_prolog_fusion" not in set(exclude_optimizations)
         and int(axes.get("pcp", 1)) == 1
+        and _every_pp_stage_has_mla(model_spec, runtime_dict, int(axes.get("pp", 1)))
     ):
         return
     prolog_cfg = lowerings["mla_prolog"]
@@ -798,6 +912,68 @@ def _attach_expected_ideal_mla_prolog_fusion(
     }
 
 
+def _finalize_stack_runtime_policy(
+    runtime_dict: dict[str, Any],
+    *,
+    ascend_backend: bool,
+    raw_eager: bool,
+    va_recommended: bool | None,
+    mechanism_track_active: bool,
+    sku: str,
+    model_spec: Any,
+    axes: Mapping[str, int],
+    norm_role: str | None,
+    prior_kernels: Mapping[str, set[str]],
+) -> None:
+    """Enforce MoE/weight-NZ/collective invariants, finalize compilation spine, and sync policy."""
+    if ascend_backend and not raw_eager:
+        arch = _arch_key(sku)
+        runtime_meta = dict(runtime_dict.get("metadata") or {})
+        if va_recommended is not False or mechanism_track_active:
+            additional_cfg = dict(runtime_meta.get("additional_config") or {})
+            apply_arch_weight_nz_policy(additional_cfg, arch=arch, model_spec=model_spec)
+            if additional_cfg:
+                runtime_meta["additional_config"] = additional_cfg
+            elif "additional_config" in runtime_meta:
+                runtime_meta.pop("additional_config", None)
+            if "shipping_collective_policy" not in runtime_meta:
+                runtime_meta["shipping_collective_policy"] = shipping_collective_policy(
+                    arch, role=norm_role,
+                )
+            runtime_dict["metadata"] = runtime_meta
+        sync_moe_route_on_runtime(
+            runtime_dict, arch=arch, model_spec=model_spec, tp=axes["tp"],
+        )
+
+    finalize_compilation_spine(runtime_dict, raw_eager=raw_eager)
+    stamp_stack_profile_origins(runtime_dict, prior_keys=prior_kernels)
+    runtime_meta = dict(runtime_dict.get("metadata") or {})
+    policy = dict(runtime_meta.get("execution_policy") or {})
+    policy["multistream_overlap_shared_expert"] = bool(
+        runtime_dict.get("multistream_overlap_shared_expert", False)
+    )
+    policy["engram_cpu_offload"] = bool(runtime_dict.get("engram_cpu_offload", False))
+    policy["sp"] = bool(runtime_meta.get("sp", False))
+    if "moe_route" in runtime_meta:
+        policy["moe_route"] = runtime_meta["moe_route"]
+        eff_mc2 = runtime_meta["moe_route"].get("effective_enable_fused_mc2")
+        if eff_mc2 is not None:
+            t_flags = dict(policy.get("tutorial_flags_applied") or {})
+            t_flags["enable_fused_mc2"] = int(eff_mc2)
+            policy["tutorial_flags_applied"] = t_flags
+    if "shipping_collective_policy" in runtime_meta:
+        policy["shipping_collective_policy"] = runtime_meta["shipping_collective_policy"]
+    lowerings_final = (runtime_dict.get("kernels") or {}).get("lowerings") or {}
+    policy["mlapo"] = bool(
+        not raw_eager
+        and norm_role != "pd_prefill"
+        and int(axes.get("pcp", 1)) == 1
+        and "mla_prolog" in lowerings_final
+    )
+    runtime_meta["execution_policy"] = policy
+    runtime_dict["metadata"] = runtime_meta
+
+
 def _apply_stack_and_lowerings(
     runtime_dict: dict[str, Any],
     *,
@@ -806,6 +982,7 @@ def _apply_stack_and_lowerings(
     machine: Mapping[str, Any],
     sku: str,
     hardware_backend: str,
+    norm_role: str | None,
     va_profile: Mapping[str, Any] | None,
     va_recommended: bool | None,
     raw_eager: bool,
@@ -909,9 +1086,13 @@ def _apply_stack_and_lowerings(
             model_dict.setdefault("metadata", {})["native_keypool_caller"] = True
         if "norm_quant" in tuple(runtime_dict.get("lowering_passes") or ()):
             kernels = ensure_norm_quant_domain(kernels)
-        _attach_expected_ideal_mla_prolog_fusion(
+        _attach_mla_prolog_native_fusion(
             lowerings,
             canonical_track=canonical_track,
+            raw_eager=raw_eager,
+            norm_role=norm_role,
+            model_spec=model_spec,
+            runtime_dict=runtime_dict,
             exclude_optimizations=exclude_optimizations,
             axes=axes,
             sku=sku,
@@ -921,17 +1102,13 @@ def _apply_stack_and_lowerings(
         if kernels:
             runtime_dict["kernels"] = kernels
 
-    finalize_compilation_spine(runtime_dict, raw_eager=raw_eager)
-    stamp_stack_profile_origins(runtime_dict, prior_keys=prior_kernels)
-    runtime_meta = dict(runtime_dict.get("metadata") or {})
-    policy = dict(runtime_meta.get("execution_policy") or {})
-    policy["multistream_overlap_shared_expert"] = bool(
-        runtime_dict.get("multistream_overlap_shared_expert", False)
+    _finalize_stack_runtime_policy(
+        runtime_dict,
+        ascend_backend=ascend_backend, raw_eager=raw_eager,
+        va_recommended=va_recommended, mechanism_track_active=mechanism_track_active,
+        sku=sku, model_spec=model_spec, axes=axes, norm_role=norm_role,
+        prior_kernels=prior_kernels,
     )
-    policy["engram_cpu_offload"] = bool(runtime_dict.get("engram_cpu_offload", False))
-    policy["sp"] = bool(runtime_meta.get("sp", False))
-    runtime_meta["execution_policy"] = policy
-    runtime_dict["metadata"] = runtime_meta
 
 
 def _apply_hardware_derivation(
@@ -1303,12 +1480,13 @@ def _compose_explicit_case(
         str(x).strip() for x in stack_options["exclude_optimizations"] if str(x).strip()
     )
     policy_out = _resolve_domain2_policy(
-        hardware_backend=hardware_backend, production=production,
+        sku=sku, hardware_backend=hardware_backend, production=production,
         va_recommended=va_recommended, raw_eager=raw_eager,
         va_profile=va_profile, model_spec=model_spec, axes=resolved_axes,
         graph_capture_mode=graph_capture_mode,
         mtp_tokens=mtp_tokens, mtp_source=mtp_source,
         exclude_set=exclude_set, notes=notes, canonical_track=canonical_track,
+        norm_role=norm_role,
         **policy_options,
     )
 
@@ -1372,6 +1550,10 @@ def _assemble_composed_case(
             "h2d": host_rates["h2d_source"],
             "host_memory": host_rates["host_memory_source"],
         }
+    if policy_out.get("moe_route"):
+        runtime_meta["moe_route"] = deepcopy(policy_out["moe_route"])
+    if policy_out.get("shipping_collective_policy"):
+        runtime_meta["shipping_collective_policy"] = deepcopy(policy_out["shipping_collective_policy"])
     if policy_out["mso"]:
         runtime_meta["multistream_overlap_shared_expert"] = True
     if moe_comm_mode is not None:
@@ -1439,7 +1621,10 @@ def _assemble_composed_case(
             ("multistream_overlap_shared_expert", policy_options["multistream_overlap_shared_expert"] is not None),
             ("moe_comm_mode", moe_comm_mode is not None),
             ("enable_fused_mc2", policy_options["enable_fused_mc2"] is not None or (
-                canonical_track in {"merged", "unmerged_pr"} and policy_out["enable_fused_mc2"] == 0
+                canonical_track in {"merged", "unmerged_pr"} and (
+                    policy_out["enable_fused_mc2"] == 0
+                    or (policy_out["mso"] and policy_out["execution_policy"].get("mso_source") == "profile")
+                )
             )),
             ("enable_flashcomm1", policy_options["enable_flashcomm1"] is not None),
             ("recover_ssm", runtime_options["recover_ssm"] is True),
@@ -1448,8 +1633,8 @@ def _assemble_composed_case(
     _apply_stack_and_lowerings(
         runtime_dict,
         model_spec=model_spec, model_dict=model_dict, machine=machine,
-        sku=sku, hardware_backend=hardware_backend, va_profile=va_profile,
-        va_recommended=va_recommended, raw_eager=raw_eager,
+        sku=sku, hardware_backend=hardware_backend, norm_role=norm_role,
+        va_profile=va_profile, va_recommended=va_recommended, raw_eager=raw_eager,
         track_raw_eager=track_raw_eager, canonical_track=canonical_track,
         caller_explicit=caller_explicit, v41_structural=v41_structural,
         axes=resolved_axes, notes=notes, **stack_options,

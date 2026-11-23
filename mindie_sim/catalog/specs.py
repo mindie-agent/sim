@@ -147,6 +147,10 @@ def _assemble_catalog_facts(
         ("dense_layers", sum(1 for p in plans if p.ffn == "dense")),
         ("moe_layers", sum(1 for p in plans if p.ffn == "moe")),
         ("latent_moe_layers", sum(1 for p in plans if p.expert_latent_size > 0)),
+        ("routed_expert_hidden_size", (
+            None if c.get("routed_expert_hidden_size") is None
+            else int(c["routed_expert_hidden_size"])
+        )),
         ("indexer_layers", sum(1 for p in plans if p.indexer)),
         ("indexer_full_layers", sum(1 for p in plans if p.indexer and p.indexer_type in {"full", "c4"})),
         ("indexer_shared_layers", sum(1 for p in plans if p.indexer_type == "shared")),

@@ -153,11 +153,25 @@ _SUGGESTION_CUTOFF = 0.35
 
 
 def _arch_key(sku: str) -> str:
-    if sku.startswith(("Ascend950", "Ascend910_95")):
+    raw = str(sku or "").strip()
+    if not raw:
+        return "other"
+    profiles = _ensure_registered_profiles()
+    entry = profiles.get(raw)
+    if entry is None and raw in DERIVED_ASCEND_SKUS:
+        entry = profiles.get(DERIVED_ASCEND_SKUS[raw]["base"])
+    if isinstance(entry, Mapping):
+        arch = str(entry.get("architecture") or "").strip().lower()
+        if arch in {"a2", "a3", "a5"}:
+            return arch
+    low = raw.lower()
+    if low in {"a5", "arch35", "dav_3510"} or low.startswith(("ascend950", "ascend910_95")):
         return "a5"
-    if sku.startswith("Ascend910_93"):
+    if low in {"a3", "arch22"} or low.startswith("ascend910_93"):
         return "a3"
-    return "a2" if sku.startswith("Ascend910B") else "other"
+    if low in {"a2", "arch20"} or low.startswith("ascend910b"):
+        return "a2"
+    return "other"
 
 
 def _ensure_registered_profiles() -> dict[str, Any]:

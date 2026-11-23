@@ -342,9 +342,57 @@ def insert_representations(ops, runtime, source_dtype):
     return result, inserted
 
 
+def _resolve_runtime_arch_family(runtime, machine=None) -> str:
+    """Resolve declared Ascend architecture family (``a2``/``a3``/``a5`` or ``""``)."""
+    candidates: list[object] = []
+    if machine is not None:
+        if isinstance(machine, Mapping):
+            candidates.extend((machine.get("arch_family"), machine.get("architecture"), machine.get("sku")))
+        else:
+            candidates.extend((
+                getattr(machine, "arch_family", None),
+                getattr(machine, "architecture", None),
+                getattr(machine, "sku", None),
+            ))
+    meta = dict(getattr(runtime, "metadata", ()) or ()) if runtime is not None else {}
+    candidates.append(meta.get("arch_family"))
+    va_prof = meta.get("va_profile")
+    if isinstance(va_prof, Mapping):
+        candidates.extend((va_prof.get("hardware_arch"), va_prof.get("sku")))
+    for raw in candidates:
+        low = str(raw or "").strip().lower()
+        if not low:
+            continue
+        if low in {"a5", "arch35", "dav_3510"} or low.startswith(("ascend950", "ascend910_95")):
+            return "a5"
+        if low in {"a3", "arch22"} or low.startswith("ascend910_93"):
+            return "a3"
+        if low in {"a2", "arch20"} or low.startswith("ascend910b"):
+            return "a2"
+    return ""
+
+
+def _validate_hccl_arch_compatibility(runtime, machine=None) -> None:
+    """Reject explicit hardware CCU collective bindings on non-CCU architectures."""
+    bindings = (getattr(runtime, "kernels", None) or {}).get("hccl", {})
+    if not isinstance(bindings, Mapping) or not bindings:
+        return
+    arch = _resolve_runtime_arch_family(runtime, machine=machine)
+    if arch not in {"a2", "a3"}:
+        return
+    for collective, raw in bindings.items():
+        if not isinstance(raw, Mapping):
+            continue
+        expansion = str(raw.get("expansion") or "").strip().upper()
+        if expansion.startswith("CCU"):
+            raise ModelingError(
+                f"hccl_ccu_unsupported_on_arch:{arch.upper()}:{collective}:{expansion}"
+            )
+
+
 def lower_implementations(ops, runtime, source_dtype, *, passes=None, resource_fusion=True,
                           local_tokens=None, replay_scope=None, capture_state=None,
-                          skip_passes=(), preactivated=False):
+                          skip_passes=(), preactivated=False, machine=None):
     from .implementations import capture_partition, lower_operators, select
 
     bindings = runtime.kernels.get("lowerings", {})
@@ -421,6 +469,7 @@ def lower_implementations(ops, runtime, source_dtype, *, passes=None, resource_f
     mx_matrix = select(bindings, "mx_matrix")
     if mx_matrix:
         ops = mx_matrix.module.apply(ops, mx_matrix, local_tokens=local_tokens)
+    _validate_hccl_arch_compatibility(runtime, machine=machine)
     from mindie_sim.prediction.operators.collectives.hccl_graph import lower as lower_hccl
     ops = lower_hccl(ops, runtime, source_dtype)
     if resource_fusion:

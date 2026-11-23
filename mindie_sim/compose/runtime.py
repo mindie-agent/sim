@@ -27,6 +27,7 @@ from typing import Any
 
 from mindie_sim.compose.inputs import _arch_key, _resolve_hardware
 from mindie_sim.model_catalog import ARCHITECTURE_PRESET_ALIASES, MODEL_ALIASES
+from mindie_sim.prediction.feedforward import resolve_moe_route_policy
 from mindie_sim.prediction.offload.policy import resolve_sku_host_dma_rates
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.runtime_profiles import simulation_config
@@ -43,6 +44,85 @@ PIECEWISE_CAPTURE_BASE_KEYS = (
 )
 MIN_DEFAULT_MAX_SEQS = 16
 TRACKED_KERNEL_SECTIONS = ("families", "recipes", "lowerings", "programs")
+FULL_DECODE_CUDAGRAPH_MODE = "FULL_DECODE_ONLY"
+FULL_CUDAGRAPH_MODES = frozenset({"FULL", FULL_DECODE_CUDAGRAPH_MODE})
+_INT_WEIGHT_FORMATS = frozenset({"int8", "int4"})
+_WEIGHT_NZ_ARCHES = frozenset({"a2", "a3"})
+
+
+def uses_integer_weights(model_spec: ModelSpec) -> bool:
+    """Return True when resident target weights use integer quantization (W8/W4)."""
+    quant = getattr(model_spec, "quant", None)
+    if quant is None:
+        return False
+    return (
+        str(getattr(quant, "weight_format", "") or "").strip().lower() in _INT_WEIGHT_FORMATS
+        or str(getattr(quant, "expert_weight_format", "") or "").strip().lower() in _INT_WEIGHT_FORMATS
+    )
+
+
+def apply_arch_weight_nz_policy(
+    additional: dict[str, Any],
+    *,
+    arch: str,
+    model_spec: ModelSpec,
+) -> None:
+    """Enable FRACTAL_NZ weight layout only on A2/A3 integer weights; never on A5 MXFP."""
+    if arch in _WEIGHT_NZ_ARCHES and uses_integer_weights(model_spec):
+        additional.setdefault("enable_weight_nz_layout", True)
+    elif arch == "a5":
+        additional.pop("enable_weight_nz_layout", None)
+
+
+def sync_moe_route_on_runtime(
+    runtime_dict: dict[str, Any],
+    *,
+    arch: str,
+    model_spec: ModelSpec,
+    tp: int,
+    strict_level3: bool = False,
+) -> dict[str, Any]:
+    """Enforce upstream ``enable_fused_mc2`` vs MSO mutex and level-3 legality on runtime."""
+    meta = dict(runtime_dict.get("metadata") or {})
+    additional = dict(meta.get("additional_config") or {})
+    prev_route = meta.get("moe_route") if isinstance(meta.get("moe_route"), Mapping) else {}
+    requested_fused = additional.get("enable_fused_mc2")
+    if requested_fused is None and prev_route.get("requested_enable_fused_mc2") is not None:
+        requested_fused = prev_route.get("requested_enable_fused_mc2")
+    requested_mso = bool(
+        runtime_dict.get("multistream_overlap_shared_expert", False)
+        or meta.get("multistream_overlap_shared_expert", False)
+        or prev_route.get("requested_multistream_overlap_shared_expert", False)
+    )
+    route = resolve_moe_route_policy(
+        arch=arch,
+        model=model_spec,
+        requested_fused_mc2=requested_fused,
+        requested_mso=requested_mso,
+        tp=int(tp),
+        enable_shared_expert_dp=bool(meta.get("enable_shared_expert_dp", False)),
+        strict_level3=strict_level3,
+    )
+    if (prev_route.get("requested_enable_fused_mc2") is not None
+            and requested_fused == prev_route.get("effective_enable_fused_mc2")
+            and prev_route.get("requested_enable_fused_mc2") != requested_fused):
+        route["requested_enable_fused_mc2"] = prev_route["requested_enable_fused_mc2"]
+        if not route["shared_fusion_disabled_reason"] and prev_route.get("shared_fusion_disabled_reason"):
+            route["shared_fusion_disabled_reason"] = prev_route["shared_fusion_disabled_reason"]
+    eff_fused = route["effective_enable_fused_mc2"]
+    if eff_fused is not None:
+        additional["enable_fused_mc2"] = int(eff_fused)
+    if additional:
+        meta["additional_config"] = additional
+    if route["effective_multistream_overlap_shared_expert"]:
+        runtime_dict["multistream_overlap_shared_expert"] = True
+        meta["multistream_overlap_shared_expert"] = True
+    else:
+        runtime_dict.pop("multistream_overlap_shared_expert", None)
+        meta.pop("multistream_overlap_shared_expert", None)
+    meta["moe_route"] = route
+    runtime_dict["metadata"] = meta
+    return route
 
 
 def capture_keys(max_num_seqs: int, mtp_proposal_tokens: int = 0) -> list[int]:
@@ -232,6 +312,23 @@ def finalize_compilation_spine(
     capture_mode = "none" if raw_eager else str(runtime_dict.get("graph_capture_mode") or "none")
     runtime_dict["graph_capture_mode"] = capture_mode
     runtime_dict["graph_mode"] = capture_mode
+    raw_comp = runtime_dict.get("compilation_config")
+    if capture_mode == "full":
+        comp = dict(raw_comp) if isinstance(raw_comp, Mapping) else {}
+        if str(comp.get("cudagraph_mode") or "").upper() not in FULL_CUDAGRAPH_MODES:
+            comp["cudagraph_mode"] = FULL_DECODE_CUDAGRAPH_MODE
+        runtime_dict["compilation_config"] = comp
+        captured_mode = str(comp["cudagraph_mode"]).upper()
+    else:
+        if isinstance(raw_comp, Mapping):
+            comp = dict(raw_comp)
+            if str(comp.get("cudagraph_mode") or "").upper() in FULL_CUDAGRAPH_MODES:
+                comp.pop("cudagraph_mode", None)
+            if comp:
+                runtime_dict["compilation_config"] = comp
+            else:
+                runtime_dict.pop("compilation_config", None)
+        captured_mode = "PIECEWISE" if capture_mode == "piecewise" else "NONE"
     compile_on = False if raw_eager else bool(runtime_dict.get("enable_torch_compile", True))
     raw_npugraph = runtime_dict.get("enable_npugraph_ex")
     npugraph_on = bool(
@@ -249,6 +346,7 @@ def finalize_compilation_spine(
     policy = dict(meta.get("execution_policy") or {})
     policy.update({
         "graph_capture_mode": capture_mode,
+        "captured_execution_mode": captured_mode,
         "enable_torch_compile": compile_on,
         "enable_npugraph_ex": npugraph_on,
         "enable_static_kernel": static_on,
@@ -321,6 +419,7 @@ def apply_va_recommended(case: Mapping[str, Any]) -> dict[str, Any]:
     if rt.get("graph_capture_mode", "none") == "none":
         rt["graph_mode"] = "full"
         rt["graph_capture_mode"] = "full"
+        rt.setdefault("compilation_config", {"cudagraph_mode": FULL_DECODE_CUDAGRAPH_MODE})
         max_seqs = int(rt.get("max_num_seqs", MIN_DEFAULT_MAX_SEQS))
         rt["graph_capture_keys"] = capture_keys(
             max_seqs, int(rt.get("mtp_proposal_tokens", 0) or 0))
@@ -328,6 +427,8 @@ def apply_va_recommended(case: Mapping[str, Any]) -> dict[str, Any]:
     meta["va_recommended"] = True
     meta["va_profile"] = deepcopy(va_profile)
     meta["va_env"] = dict(va_profile["env"])
+    if va_profile.get("shipping_collective_policy"):
+        meta["shipping_collective_policy"] = deepcopy(va_profile["shipping_collective_policy"])
     meta.setdefault("moe_dispatch_quantization", "routed_expert")
     if (rt.get("multistream_overlap_shared_expert") is not False
             and va_profile.get("multistream_overlap_shared_expert")):
@@ -356,8 +457,14 @@ def apply_va_recommended(case: Mapping[str, Any]) -> dict[str, Any]:
         if flag_key == "enable_fused_mc2" and not allow_merged_workarounds and int(prof_flags[flag_key]) == 0:
             continue
         additional[flag_key] = prof_flags[flag_key]
+    apply_arch_weight_nz_policy(additional, arch=_arch_key(sku), model_spec=parsed.model)
     if additional:
         meta["additional_config"] = additional
+    rt["metadata"] = meta
+    sync_moe_route_on_runtime(
+        rt, arch=_arch_key(sku), model_spec=parsed.model, tp=int(par.get("tp", 1)),
+    )
+    meta = dict(rt.get("metadata") or {})
     notes: list[dict[str, Any]] = []
     kernels = dict(rt.get("kernels", {}))
     tp, ep = int(par.get("tp", 1)), int(par.get("ep", 1))

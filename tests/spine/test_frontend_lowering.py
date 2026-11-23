@@ -537,3 +537,51 @@ def test_situ_eager_chain_activation_params_and_router_contract_unshadowed():
             "mc2_chains": [{"condition": "bad", "dtype": "bf16", "chain_p50_ms": 1.0,
                             "sum_leg_p50_ms": 0.0, "legs_ms": {}}],
         })
+
+
+def test_feedforward_and_collective_lowering_enforce_mutex_and_architecture_guards():
+    from _support.axes import REPRESENTATIVE_SKUS
+
+    base = compose_case(
+        "deepseek-v3.2", REPRESENTATIVE_SKUS["a5"],
+        tp=1, dp=8, ep=8, layers=4, feature_track="merged",
+    )
+    # Shipping Before track activates MLAPO lowering on eligible MLA layers.
+    merged_ops = target_graphs(parse_case(base), phase="decode", tokens=1, context=128, sequences=1, scope="body")[0]
+    assert any(
+        group.get("role") == "mla_prolog"
+        and group.get("fusion_status") == "fused_framework_enable"
+        for item in merged_ops
+        for group in dict(item.metadata).get("structure_subgraphs", ())
+    )
+
+    # Raw uncomposed runtime with BOTH enable_fused_mc2 > 0 and MSO enabled:
+    # feedforward.alltoall must enforce mutex BEFORE assigning stream="shared_stream".
+    conflicting = deepcopy(base)
+    conflicting["runtime"]["multistream_overlap_shared_expert"] = True
+    conflicting["runtime"]["metadata"]["additional_config"] = {"enable_fused_mc2": 2}
+    ops_fused = target_graphs(parse_case(conflicting), phase="decode", tokens=1, context=128, sequences=1, scope="body")[0]
+    assert not any(item.stream == "shared_stream" for item in ops_fused)
+
+    # Disabling fused MC2 (enable_fused_mc2=0) preserves MSO shared_stream overlap.
+    mso_only = deepcopy(base)
+    mso_only["runtime"]["multistream_overlap_shared_expert"] = True
+    mso_only["runtime"]["metadata"]["additional_config"] = {"enable_fused_mc2": 0}
+    ops_mso = target_graphs(parse_case(mso_only), phase="decode", tokens=1, context=128, sequences=1, scope="body")[0]
+    assert any(item.stream == "shared_stream" for item in ops_mso)
+
+    # Explicit hardware CCU collective bindings are rejected on non-CCU generations and accepted on CCU generation.
+    ccu_binding = {"allreduce": {"expansion": "CCU_MS", "template": "mesh_oneshot_v1"}}
+    tiny_model = {
+        "model_type": "qwen3", "hidden_size": 512, "intermediate_size": 1024,
+        "num_hidden_layers": 1, "num_attention_heads": 8, "num_key_value_heads": 4,
+        "head_dim": 64, "vocab_size": 1024, "max_position_embeddings": 2048,
+    }
+    for family in ("a2", "a3"):
+        bad = compose_case(tiny_model, REPRESENTATIVE_SKUS[family], tp=2, layers=1, raw_eager=True)
+        bad["runtime"]["kernels"] = {"hccl": ccu_binding}
+        with pytest.raises(ModelingError, match="hccl_ccu_unsupported_on_arch"):
+            target_graphs(parse_case(bad), phase="decode", tokens=1, context=64, sequences=1, scope="body")
+    good = compose_case(tiny_model, REPRESENTATIVE_SKUS["a5"], tp=2, layers=1, raw_eager=True)
+    good["runtime"]["kernels"] = {"hccl": ccu_binding}
+    assert target_graphs(parse_case(good), phase="decode", tokens=1, context=64, sequences=1, scope="body")[0]

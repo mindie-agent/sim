@@ -18,8 +18,15 @@ from typing import Any
 
 _REPO = "vllm-project/vllm-ascend"
 _DOC_ROOT = "docs/source/tutorials/models/"
-_ENV = {"HCCL_OP_EXPANSION_MODE": "AIV", "OMP_PROC_BIND": "false"}
-_MLAPO_ENV = {**_ENV, "VLLM_ASCEND_ENABLE_MLAPO": "1"}
+_BASE_ENV = {"OMP_PROC_BIND": "false"}
+_MLAPO_BASE_ENV = {**_BASE_ENV, "VLLM_ASCEND_ENABLE_MLAPO": "1"}
+
+FUSED_MC2_DISABLED = 0
+FUSED_MC2_DISPATCH_FFN_COMBINE = 1
+FUSED_MC2_MEGAMOE_ROUTED = 2
+FUSED_MC2_MEGAMOE_SHARED = 3
+_A5_CCU_SCHED_MODELS = frozenset({"kimi-k3.1", "deepseek-v4.1-flash"})
+_A3_PREFILL_UNSET_HCCL_MODELS = frozenset({"kimi-k3.1"})
 
 NO_MTP_PROPOSAL_TOKENS = 0
 SINGLE_MTP_PROPOSAL_TOKEN = 1
@@ -36,12 +43,13 @@ def _p(quant_by_arch, mtp, doc, *, mlapo=False, sp=True, mso=False,
         "quant": quant_by_arch,
         "graph_capture_mode": capture,
         "sp": sp,
+        "mlapo": bool(mlapo),
         "mtp_proposal_tokens": mtp,
         "multistream_overlap_shared_expert": mso,
         "engram_cpu_offload": engram_offload,
         "framework_support": support,
         "kv_block_size": kv_block_size,
-        "env": _MLAPO_ENV if mlapo else _ENV,
+        "env": dict(_MLAPO_BASE_ENV if mlapo else _BASE_ENV),
         "topologies": dict(topologies or {}),
         "tutorial_flags": dict(tutorial_flags or {}),
         "source": {
@@ -188,7 +196,7 @@ VA_RECOMMENDED_PROFILES = {
         tutorial_flags={"enable_flashcomm1": True},
     ),
     "kimi-k3.1": _p(
-        {"a3": "w4a8", "a5": "mxfp4_routed_only"}, MTP_STANDARD_PROPOSAL_TOKENS,
+        {"a2": "w4a8", "a3": "w4a8", "a5": "mxfp4_routed_only"}, MTP_STANDARD_PROPOSAL_TOKENS,
         "Kimi-K3.1-Pro.md", mlapo=True, mso=True,
         kv_block_size=PAIRED_SFA_DOC_BLOCK_SIZE,
         topologies={
@@ -201,6 +209,9 @@ VA_RECOMMENDED_PROFILES = {
             "a3": _topo(
                 pd_prefill={"dp": 1, "tp": 1, "pp": 4, "pcp": 4, "ep": 4, "block_size": 768, "kv_cache_dtype": "int8"},
                 pd_decode={"dp": 1, "tp": 16, "dcp": 16, "ep": 16, "block_size": 768, "kv_cache_dtype": "int8"},
+            ),
+            "a2": _topo(
+                colocated={"dp": 1, "tp": 8, "ep": 8, "block_size": 768, "kv_cache_dtype": "int8"},
             ),
         },
         tutorial_flags={"enable_fused_mc2": 0},
@@ -237,8 +248,8 @@ VA_RECOMMENDED_PROFILES = {
         MTP_STANDARD_PROPOSAL_TOKENS, "Qwen3.5-397B-A17B.md", mso=True,
         topologies={
             "a5": _topo(
-                colocated={"dp": 1, "tp": 8, "ep": 8},
-                pd_decode={"dp": 2, "tp": 4, "ep": 8},
+                colocated={"dp": 1, "tp": 8, "ep": 8, "enable_fused_mc2": 2},
+                pd_decode={"dp": 2, "tp": 4, "ep": 8, "enable_fused_mc2": 2},
             ),
             "a3": _topo(colocated={"dp": 1, "tp": 16, "ep": 16}),
         },
@@ -258,11 +269,12 @@ VA_RECOMMENDED_PROFILES = {
         mso=True, engram_offload=True,
         topologies={
             "a5": _topo(
-                colocated={"dp": 1, "tp": 8, "ep": 8},
-                pd_prefill={"dp": 1, "tp": 4, "pp": 2, "ep": 4},
-                pd_decode={"dp": 4, "tp": 2, "ep": 8},
+                colocated={"dp": 1, "tp": 8, "ep": 8, "kv_cache_dtype": "fp8"},
+                pd_prefill={"dp": 1, "tp": 4, "pp": 2, "ep": 4, "kv_cache_dtype": "fp8"},
+                pd_decode={"dp": 4, "tp": 2, "ep": 8, "kv_cache_dtype": "fp8"},
             ),
-            "a3": _topo(colocated={"dp": 1, "tp": 8, "ep": 8}),
+            "a3": _topo(colocated={"dp": 1, "tp": 8, "ep": 8, "kv_cache_dtype": "int8"}),
+            "a2": _topo(colocated={"dp": 1, "tp": 8, "ep": 8, "kv_cache_dtype": "int8"}),
         },
         tutorial_flags={
             "enable_flashcomm1": True, "enable_shared_expert_dp": True,
@@ -332,7 +344,7 @@ def _supports_structural_draft(canonical: str) -> bool:
     return spec.attention == "mla"
 
 
-_ROLE_SCOPED_TUTORIAL_FLAGS = ("kv_cache_dtype", "indexer_kv_dtype")
+_ROLE_SCOPED_TUTORIAL_FLAGS = ("kv_cache_dtype", "indexer_kv_dtype", "enable_fused_mc2")
 
 
 def _select_role_topology(
@@ -347,6 +359,86 @@ def _select_role_topology(
         return dict(arch_topos["colocated"])
     first_role = next(iter(arch_topos))
     return dict(arch_topos[first_role])
+
+
+def shipping_collective_policy(
+    arch: str, *, canonical: str = "", role: str | None = None,
+) -> dict[str, Any] | None:
+    """Resolve arch-disjoint shipping collective policy without cross-gen leaks."""
+    arch_norm = str(arch or "").strip().lower()
+    role_norm = str(role or "").strip().lower() or "colocated"
+    if arch_norm == "a5":
+        env_mode = "CCU_SCHED" if canonical in _A5_CCU_SCHED_MODELS else "CCU_MS"
+        return {
+            "arch": "a5",
+            "role": role_norm,
+            "process_env_mode": env_mode,
+            "executor": "ccu_ms",
+            "fabric": "ub_direct",
+            "oneshot_active": True,
+        }
+    if arch_norm == "a3":
+        if canonical in _A3_PREFILL_UNSET_HCCL_MODELS and role_norm == "pd_prefill":
+            return {
+                "arch": "a3",
+                "role": role_norm,
+                "process_env_mode": "",
+                "executor": "default",
+                "fabric": "hccs_sw",
+                "oneshot_active": True,
+            }
+        return {
+            "arch": "a3",
+            "role": role_norm,
+            "process_env_mode": "AIV",
+            "executor": "aiv",
+            "fabric": "hccs_sw",
+            "oneshot_active": True,
+        }
+    if arch_norm == "a2":
+        return {
+            "arch": "a2",
+            "role": role_norm,
+            "process_env_mode": "AIV",
+            "executor": "aiv",
+            "fabric": "hccs_8p_roce",
+            "oneshot_active": True,
+        }
+    return None
+
+
+def _resolve_arch_env(
+    arch: str, *, canonical: str, role: str | None, mlapo: bool,
+) -> tuple[dict[str, str], dict[str, Any] | None]:
+    """Build hardware-isolated shipping environment variables and collective policy."""
+    env = dict(_BASE_ENV)
+    coll_policy = shipping_collective_policy(arch, canonical=canonical, role=role)
+    if coll_policy and coll_policy.get("process_env_mode"):
+        env["HCCL_OP_EXPANSION_MODE"] = str(coll_policy["process_env_mode"])
+    if mlapo and str(role or "").strip().lower() != "pd_prefill":
+        env["VLLM_ASCEND_ENABLE_MLAPO"] = "1"
+    return env, coll_policy
+
+
+def _filter_tutorial_fused_mc2(flags: dict[str, Any], arch: str) -> None:
+    """Keep only arch-legal ``enable_fused_mc2`` levels from static tutorial defaults."""
+    if "enable_fused_mc2" not in flags or flags["enable_fused_mc2"] is None:
+        return
+    lvl = int(flags["enable_fused_mc2"])
+    arch_norm = str(arch or "").strip().lower()
+    if lvl == FUSED_MC2_DISABLED:
+        flags["enable_fused_mc2"] = FUSED_MC2_DISABLED
+    elif lvl == FUSED_MC2_DISPATCH_FFN_COMBINE:
+        if arch_norm != "a3":
+            flags.pop("enable_fused_mc2", None)
+    elif lvl == FUSED_MC2_MEGAMOE_ROUTED:
+        if arch_norm not in {"a3", "a5"}:
+            flags.pop("enable_fused_mc2", None)
+    elif lvl == FUSED_MC2_MEGAMOE_SHARED:
+        if arch_norm != "a5":
+            flags.pop("enable_fused_mc2", None)
+    else:
+        flags.pop("enable_fused_mc2", None)
 
 
 def simulation_config(canonical, sku, arch, *, role: str | None = None):
@@ -373,8 +465,19 @@ def simulation_config(canonical, sku, arch, *, role: str | None = None):
     for flag in _ROLE_SCOPED_TUTORIAL_FLAGS:
         if flag in selected_topo:
             resolved_flags[flag] = selected_topo[flag]
-        else:
+        elif flag != "enable_fused_mc2":
             resolved_flags.pop(flag, None)
+    _filter_tutorial_fused_mc2(resolved_flags, arch)
+    requested_mso = bool(profile.get("multistream_overlap_shared_expert", False))
+    eff_mc2 = resolved_flags.get("enable_fused_mc2")
+    effective_mso = (
+        False if (eff_mc2 is not None and int(eff_mc2) > FUSED_MC2_DISABLED)
+        else requested_mso
+    )
+    prof_mlapo = bool(profile.get("mlapo", False))
+    env, coll_policy = _resolve_arch_env(
+        arch, canonical=resolved, role=role, mlapo=prof_mlapo,
+    )
     return {
         "model": canonical, "sku": sku, "hardware_family": arch,
         "canonical_model": resolved, "hardware_arch": arch, "quant": quant,
@@ -382,16 +485,19 @@ def simulation_config(canonical, sku, arch, *, role: str | None = None):
         "compilation_config": (dict(profile["compilation_config"])
                                if "compilation_config" in profile else None),
         "sp": documented_sp,
+        "mlapo": bool(prof_mlapo and str(role or "").strip().lower() != "pd_prefill"),
         "mtp_proposal_tokens": mtp_tokens,
         **({"kv_block_size": profile["kv_block_size"]}
            if profile.get("kv_block_size") else {}),
-        "multistream_overlap_shared_expert": bool(
-            profile.get("multistream_overlap_shared_expert", False)),
+        "multistream_overlap_shared_expert": effective_mso,
+        "requested_multistream_overlap_shared_expert": requested_mso,
         "engram_cpu_offload": bool(profile.get("engram_cpu_offload", False)),
         "framework_support": str(profile.get("framework_support", "analytical_projection")),
-        "env": dict(profile.get("env", {})),
+        "env": env,
+        "shipping_collective_policy": coll_policy,
         "topologies": deepcopy(profile.get("topologies") or {}),
         "recommended_topology": deepcopy((profile.get("topologies") or {}).get(arch)),
+        "active_role_topology": deepcopy(selected_topo) if selected_topo else None,
         "tutorial_flags": resolved_flags,
         "source": deepcopy(profile.get("source")),
         "coverage": "supported_simulation_subset",

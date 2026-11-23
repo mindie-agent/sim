@@ -677,31 +677,38 @@ def _collective_and_isa_guidance(hw_family: str, *, tp: int, ep: int, pp: int) -
         tp_note = (
             f"TP={tp} crosses single-node 8-card HCCS domain onto RoCE; keep TP <= {A2_MAX_INTRA_NODE_TP} and use PP/EP across nodes"
             if tp > A2_MAX_INTRA_NODE_TP else
-            f"TP={tp} fits inside single-node 8-card HCCS full-mesh; cross-node traffic (EP={ep}, PP={pp}) rides RoCE"
+            f"TP={tp} fits inside single-node 8-card HCCS AIV full-mesh; cross-node traffic (EP={ep}, PP={pp}) rides RoCE"
         )
         isa = (
             "Atlas A2 (910B, 64 GiB): INT8 (W8A8_DYNAMIC) / INT4 routed experts (W4A8_DYNAMIC) + "
-            "C8 INT8 KV cache only; enable FRACTAL_NZ weight layout (enable_weight_nz_layout=true)."
+            "C8 INT8 KV cache only; enable FRACTAL_NZ weight layout for integer weight ABIs."
         )
         return tp_note, isa
     if hw == "a3":
         node_note = (
             f"Atlas A3 dual-Die (910C, 64 GiB/die, {A3_DUAL_DIE_NODE_RANKS} dies/node): align TP={tp} pairs "
-            f"across intra-package SIO links, use HCCS/HCCS_SW across dies/SuperPoD, and enable A3 INT4 MegaMoE/MC2 for EP={ep}."
+            f"across intra-package SIO links, use HCCS_SW/optical HCCS AIV expansion across dies/SuperPoD, "
+            f"and select A3 dispatch_ffn_combine or MegaMoE when eligible for EP={ep}."
         )
         isa = (
             "Atlas A3 (910C dual-Die, 64 GiB/die): INT8 (W8A8_DYNAMIC) / INT4 routed experts (W4A8_DYNAMIC) + "
-            "C8 INT8 KV cache only; enable FRACTAL_NZ weight layout (enable_weight_nz_layout=true)."
+            "C8 INT8 KV cache only; enable FRACTAL_NZ weight layout for integer weight ABIs."
         )
         return node_note, isa
-    coll = (
-        f"Atlas A5 (950DT/950PR, DAV_3510): native UB/HCCS SuperPoD fabric across TP={tp}, EP={ep}, PP={pp}."
+    if hw == "a5":
+        coll = (
+            f"Atlas A5 (950DT/950PR, DAV_3510): hardware CCU + UB-Direct fabric inside the UB domain "
+            f"(routed inter-domain transport outside UB) across TP={tp}, EP={ep}, PP={pp}."
+        )
+        isa = (
+            "Atlas A5 (950DT/950PR): native MXFP8/MXFP4 Tensor Cores (group=32, E8M0) and FP8 KV cache; "
+            "keep DSpark/EAGLE3 draft kv_cache_dtype=bfloat16 when target KV is fp8."
+        )
+        return coll, isa
+    return (
+        f"Hardware ({hw_family}): TP={tp}, EP={ep}, PP={pp} using declared physical links.",
+        "Use declared device compute precision and KV cache formats.",
     )
-    isa = (
-        "Atlas A5 (950DT/950PR): native MXFP8/MXFP4 Tensor Cores (group=32, E8M0) and FP8 KV cache; "
-        "keep DSpark/EAGLE3 draft kv_cache_dtype=bfloat16 when target KV is fp8."
-    )
-    return coll, isa
 
 
 def _build_pd_spec_configs(
@@ -815,10 +822,12 @@ def build_va_serving_rules(
     if eff_k > 0 and comp_cfg["cudagraph_mode"] in FULL_GRAPH_CUDAGRAPH_MODES:
         rules.append(f"aclgraph_capture_multiples_of_{eff_k + 1}")
 
-    nz_enabled = (
-        bool(enable_weight_nz_layout) if enable_weight_nz_layout is not None
-        else (hw in A2_A3_INT_ONLY_FAMILIES)
-    )
+    if hw in A2_A3_INT_ONLY_FAMILIES:
+        nz_enabled = True if enable_weight_nz_layout is None else bool(enable_weight_nz_layout)
+    else:
+        nz_enabled = False
+        if enable_weight_nz_layout is True:
+            warnings.append(f"weight_nz_layout_not_applicable_on_{hw}")
     add_cfg: dict[str, Any] = {}
     if enable_cpu_binding:
         add_cfg["enable_cpu_binding"] = True

@@ -427,18 +427,33 @@ class CheckpointMetadataResult:
         }
 
 
+_A5_FAMILY_TOKENS = (
+    "arch35", "dav_3510", "3510", "950", "a5", "910_95",
+    "9582", "9581", "9579", "958b", "9599",
+    "425-96", "486-96", "547-96", "547-144",
+    "425_96", "486_96", "547_96", "547_144",
+)
+_A3_FAMILY_TOKENS = (
+    "arch22", "910_93", "910c", "a3",
+    "9391", "9392", "9381", "9382", "9372", "9362",
+)
+_A2_FAMILY_TOKENS = ("arch20", "910b", "a2", "310p", "300i")
+
+
 def normalize_hw_family(hardware_or_family: str) -> str:
-    """Normalize any Ascend SKU, topology alias, or family label to ``a2``/``a3``/``a5``."""
-    raw = str(hardware_or_family or "a5").strip().lower()
+    """Normalize an Ascend SKU, topology alias, or arch token to ``a2``/``a3``/``a5``/``other``."""
+    raw = str(hardware_or_family or "").strip().lower()
+    if not raw:
+        return "other"
     if raw in _SUPPORTED_HW_FAMILIES:
         return raw
-    if any(tok in raw for tok in ("950", "a5", "910_95", "9582", "9581", "9579", "958b", "9599")):
+    if any(tok in raw for tok in _A5_FAMILY_TOKENS):
         return "a5"
-    if any(tok in raw for tok in ("910_93", "910c", "a3", "9392", "9382")):
+    if any(tok in raw for tok in _A3_FAMILY_TOKENS):
         return "a3"
-    if any(tok in raw for tok in ("910b", "a2", "310p", "300i")):
+    if any(tok in raw for tok in _A2_FAMILY_TOKENS):
         return "a2"
-    return "a5"
+    return "other"
 
 
 def _repo_urls(repo_id: str) -> tuple[str, str, str]:
@@ -515,9 +530,12 @@ def msmodelslim_quarot_guidance(
     if hw in A2_A3_INT_ONLY_FAMILIES:
         recipe = quant_preset or "W4A8_DYNAMIC + C8 (INT8 Attn/Linear + INT4 Experts + INT8 KV)"
         algo = "QuaRot (Hadamard rotation) + W8A8_DYNAMIC/W4A8_DYNAMIC + C8 KV"
-    else:
+    elif hw == "a5":
         recipe = quant_preset or "W4A8_MXFP / W8A8_MXFP8 (MXFP8 Attn + MXFP4 Experts)"
         algo = "QuaRot (Hadamard rotation) + MXFP8/MXFP4 microscaling (group=32, E8M0)"
+    else:
+        recipe = quant_preset or "declared_hardware_quantization"
+        algo = "declared_hardware_quantization"
     return {
         "hw_family": hw, "prefer_quarot": True,
         "recommended_algorithm": algo, "target_recipe": recipe,
@@ -806,6 +824,8 @@ def resolve_default_checkpoint(
     """Look up the curated default NPU checkpoint for ``(model_id, hw_family)``."""
     canon = normalize_model_key(model_id)
     hw = normalize_hw_family(hw_family)
+    if hw not in _SUPPORTED_HW_FAMILIES:
+        return None
     direct = DEFAULT_NPU_CHECKPOINTS.get((canon, hw))
     if direct is not None:
         return direct

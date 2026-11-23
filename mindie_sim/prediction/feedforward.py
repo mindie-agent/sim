@@ -37,6 +37,179 @@ from mindie_sim.prediction.operators.moe_routing import moe_token_partition
 
 INVERSE_INDEX_DTYPE = "int32"
 _PACK_ROUTING_INDEX_BYTES = 4
+FUSED_MC2_DISABLED = 0
+FUSED_MC2_DISPATCH_FFN_COMBINE = 1
+FUSED_MC2_MEGAMOE_ROUTED = 2
+FUSED_MC2_MEGAMOE_SHARED = 3
+SUPPORTED_FUSED_MC2_LEVELS = frozenset({
+    FUSED_MC2_DISABLED,
+    FUSED_MC2_DISPATCH_FFN_COMBINE,
+    FUSED_MC2_MEGAMOE_ROUTED,
+    FUSED_MC2_MEGAMOE_SHARED,
+})
+
+
+def _normalize_arch_family(raw_arch: str | None) -> str:
+    low = str(raw_arch or "").strip().lower()
+    if low in {"a5", "arch35", "dav_3510"}:
+        return "a5"
+    if low in {"a3", "arch22"}:
+        return "a3"
+    if low in {"a2", "arch20"}:
+        return "a2"
+    return ""
+
+
+def _model_is_latent_moe(model) -> bool:
+    """Literal upstream ``routed_expert_hidden_size is not None`` + latent check."""
+    facts = dict(getattr(model, "catalog_facts", ()) or ())
+    if facts.get("routed_expert_hidden_size") is not None:
+        return True
+    return any(
+        int(getattr(p, "expert_latent_size", 0) or 0) > 0
+        for p in getattr(model, "layer_plans", ())
+        if getattr(p, "ffn", "") == "moe"
+    )
+
+
+def _shared_expert_fusion_block_reason(
+    arch_norm: str, model, *, tp: int = 1, enable_shared_expert_dp: bool = False,
+) -> str:
+    """Upstream ``ascend_config.py:1118-1145`` & ``shared_experts.py:216-253`` guards."""
+    del tp, enable_shared_expert_dp
+    if arch_norm and arch_norm != "a5":
+        return f"requires_a5_arch35:{arch_norm}"
+    if _model_is_latent_moe(model):
+        return "latent_moe_routed_expert_hidden_size"
+    moe_plans = [
+        p for p in getattr(model, "layer_plans", ())
+        if getattr(p, "ffn", "") == "moe"
+    ]
+    if not any(int(getattr(p, "num_shared_experts", 0) or 0) > 0 for p in moe_plans):
+        return "no_shared_expert"
+    if any(bool(getattr(p, "shared_expert_gate", False)) for p in moe_plans):
+        return "shared_expert_gate_unsupported"
+    if any(
+        float(getattr(p, "swiglu_shared_limit", 0.0) or 0.0)
+        not in {0.0, float(getattr(p, "swiglu_limit", 0.0) or 0.0)}
+        for p in moe_plans
+    ):
+        return "shared_activation_mismatch"
+    return ""
+
+
+def resolve_moe_route_policy(
+    *,
+    arch: str | None,
+    model,
+    requested_fused_mc2: int | None,
+    requested_mso: bool,
+    tp: int = 1,
+    enable_shared_expert_dp: bool = False,
+    strict_level3: bool = False,
+    mega_moe_requested: bool = False,
+) -> dict[str, object]:
+    """Resolve upstream-faithful ``enable_fused_mc2`` vs MSO mutex and level-3 legality."""
+    if requested_fused_mc2 is not None:
+        if isinstance(requested_fused_mc2, bool) or int(requested_fused_mc2) not in SUPPORTED_FUSED_MC2_LEVELS:
+            raise ModelingError(f"invalid_enable_fused_mc2:{requested_fused_mc2!r}")
+        raw_level: int | None = int(requested_fused_mc2)
+    else:
+        raw_level = None
+
+    arch_norm = _normalize_arch_family(arch)
+    fused_requested = (
+        (raw_level is not None and raw_level > FUSED_MC2_DISABLED)
+        or (raw_level is None and bool(mega_moe_requested) and arch_norm == "a3")
+    )
+    # Upstream ``ascend_config.py:936-941``: fused MC2 disables MSO unconditionally;
+    # any later eligibility downgrade never re-enables MSO implicitly.
+    effective_mso = False if fused_requested else bool(requested_mso)
+    effective_level = raw_level
+    shared_fusion = False
+    disabled_reason = ""
+
+    if raw_level == FUSED_MC2_DISPATCH_FFN_COMBINE:
+        if arch_norm in {"a2", "a5"}:
+            effective_level = FUSED_MC2_DISABLED
+            disabled_reason = f"dispatch_ffn_combine_unsupported_on_{arch_norm}"
+    elif raw_level == FUSED_MC2_MEGAMOE_ROUTED:
+        if arch_norm == "a2":
+            effective_level = FUSED_MC2_DISABLED
+            disabled_reason = "megamoe_unsupported_on_a2"
+    elif raw_level == FUSED_MC2_MEGAMOE_SHARED:
+        if arch_norm and arch_norm != "a5":
+            if strict_level3:
+                raise ModelingError(f"enable_fused_mc2_level3_requires_a5:{arch_norm}")
+            effective_level = FUSED_MC2_MEGAMOE_ROUTED if arch_norm == "a3" else FUSED_MC2_DISABLED
+            disabled_reason = f"requires_a5_arch35:{arch_norm}"
+        elif _model_is_latent_moe(model):
+            if strict_level3:
+                raise ModelingError("enable_fused_mc2_level3_unsupported_latent_moe")
+            effective_level = FUSED_MC2_MEGAMOE_ROUTED
+            disabled_reason = "latent_moe_routed_expert_hidden_size"
+        else:
+            block_reason = _shared_expert_fusion_block_reason(
+                arch_norm, model, tp=tp, enable_shared_expert_dp=enable_shared_expert_dp,
+            )
+            if block_reason:
+                effective_level = FUSED_MC2_MEGAMOE_ROUTED
+                disabled_reason = block_reason
+            else:
+                effective_level = FUSED_MC2_MEGAMOE_SHARED
+                shared_fusion = True
+
+    return {
+        "requested_enable_fused_mc2": raw_level,
+        "effective_enable_fused_mc2": effective_level,
+        "requested_multistream_overlap_shared_expert": bool(requested_mso),
+        "effective_multistream_overlap_shared_expert": bool(effective_mso),
+        "megamoe_shared_expert_fusion": bool(shared_fusion),
+        "shared_fusion_disabled_reason": disabled_reason,
+        "mutex_disabled_mso": bool(fused_requested and requested_mso),
+    }
+
+
+def _resolve_alltoall_moe_route(model, plan, parallel, runtime, *, overlap_shared: bool):
+    """Resolve effective MoE route & mutex once before shared-expert stream assignment."""
+    meta = dict(getattr(runtime, "metadata", ()) or ()) if runtime is not None else {}
+    additional = meta.get("additional_config")
+    additional = dict(additional) if isinstance(additional, dict) else {}
+    raw_mso = bool(
+        overlap_shared or getattr(plan, "overlap_shared", False)
+        or getattr(runtime, "multistream_overlap_shared_expert", False)
+        or meta.get("overlap_shared_expert", False)
+        or meta.get("enable_shared_expert_overlap", False)
+    )
+    arch = meta.get("arch_family") or (meta.get("va_profile") or {}).get("hardware_arch")
+    raw_fused = additional.get("enable_fused_mc2")
+    mega_req = bool(
+        int(additional.get("enable_mega_moe", 0) or 0)
+        or int(meta.get("moe_mega_moe_supported", 0) or 0)
+    )
+    route = resolve_moe_route_policy(
+        arch=arch,
+        model=model,
+        requested_fused_mc2=raw_fused,
+        requested_mso=raw_mso,
+        tp=int(getattr(parallel, "tp", 1) or 1),
+        enable_shared_expert_dp=bool(meta.get("enable_shared_expert_dp", False)),
+        strict_level3=False,
+        mega_moe_requested=mega_req,
+    )
+    eff_mso = bool(route["effective_multistream_overlap_shared_expert"])
+    eff_fused = route["effective_enable_fused_mc2"]
+    eff_runtime = runtime
+    if runtime is not None and eff_fused != raw_fused:
+        updated_additional = dict(additional)
+        updated_additional["enable_fused_mc2"] = eff_fused
+        updated_meta = dict(meta)
+        if eff_fused == FUSED_MC2_DISABLED:
+            updated_additional.pop("enable_mega_moe", None)
+            updated_meta.pop("moe_mega_moe_supported", None)
+        updated_meta["additional_config"] = updated_additional
+        eff_runtime = replace(runtime, metadata=tuple(updated_meta.items()))
+    return eff_mso, eff_runtime
 
 
 def _latent_norm(prefix, source, stage, plan, requests, tokens, latent, model, mode):
@@ -800,13 +973,9 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
             raise ModelingError("moe_transport_requires_alltoall_recipe")
         # Reject incompatible expert representations before building any graph.
         moe_transport.validate_contract(model, plan, transport)
-    overlap_shared = bool(
-        overlap_shared or getattr(plan, "overlap_shared", False)
-        or getattr(runtime, "multistream_overlap_shared_expert", False)
-        or dict(getattr(runtime, "metadata", ()) or ()).get(
-            "overlap_shared_expert", False)
-        or dict(getattr(runtime, "metadata", ()) or ()).get(
-            "enable_shared_expert_overlap", False))
+    overlap_shared, runtime = _resolve_alltoall_moe_route(
+        model, plan, parallel, runtime, overlap_shared=bool(overlap_shared),
+    )
     group_tokens = global_tokens if global_tokens is not None else pre_sp_tokens
     (routing_realization, local_rows, active, routing_metadata, partitions,
      local_experts, local_ep_rank, receive_rows, runtime_routing, has_slots,
