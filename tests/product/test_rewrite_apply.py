@@ -911,3 +911,298 @@ def test_multi_boundary_fusion_does_not_alias_final_abi_as_single_recipe(dense):
     assert fused.recipe != "pointwise"
     assert fused.recipe == "UnknownFirstAbi+pointwise"
     assert dict(fused.metadata)["kernel_boundary_count"] == 2
+
+
+def _make_v5_target_node(
+    ordinal: int,
+    op_id: str,
+    *,
+    archetype_id: str = "target_arch_0",
+    repeat_count: int = 1,
+    family: str = "gemm",
+    recipe: str = "matmul",
+    stream: str = "main",
+    stream_index: int = 0,
+    shape: tuple[int, ...] = (128, 4096),
+    predecessors: tuple = (),
+    start_us: float = 0.0,
+    dur_us: float = 20.0,
+    flops: float = 0.0,
+    vector_ops: float = 0.0,
+    hbm_read_bytes: float = 0.0,
+    hbm_write_bytes: float = 0.0,
+    link_bytes: float = 0.0,
+    ascend_kernel: str = "",
+    persistent_whole_die: bool = False,
+    spec: Any = None,
+):
+    from mindie_sim.optimization.kernel_synthesis import TargetOpNode
+    from mindie_sim.prediction.results import OpOccurrence
+
+    occ = OpOccurrence(replica=0, stage=0, rank=0, op_id=op_id)
+    hbm_tot = hbm_read_bytes + hbm_write_bytes
+    return TargetOpNode(
+        ordinal=ordinal, occurrence=occ, op_id=op_id, archetype_id=archetype_id,
+        repeat_count=repeat_count, family=family, recipe=recipe, stream=stream,
+        stream_index=stream_index, task_type="HCCL" if link_bytes > 0.0 else "AI_CORE",
+        shape=shape, dtype="bf16", predecessors=predecessors,
+        start_us=start_us, end_us=start_us + dur_us, dur_us=dur_us,
+        exposed_dur_us=dur_us, is_overlapped=False, masked_by="",
+        flops=flops, vector_ops=vector_ops,
+        hbm_read_bytes=hbm_read_bytes, hbm_write_bytes=hbm_write_bytes,
+        hbm_total_bytes=hbm_tot, mte2_bytes=hbm_read_bytes, mte3_bytes=hbm_write_bytes,
+        fixpipe_bytes=0.0, link_bytes=link_bytes, dominant_bound="cube_bound",
+        bound_display="Cube Bound", l_star_lean_us=min(dur_us, max(1.0, dur_us * 0.5)),
+        gap_us=max(0.0, dur_us * 0.5), gap_ratio=2.0, roofline_efficiency=0.5,
+        absorbed_source_ops=(), semantic_atoms=(), logical_role=family,
+        ascend_kernel=ascend_kernel or recipe, kernel_backend="CANN aclnn/AscendC",
+        kernel_status="existing", needs_new_kernel=False, new_kernel_spec="",
+        canonical_op_key=op_id, spec=spec, persistent_whole_die=persistent_whole_die,
+    )
+
+
+def test_redline1_same_stream_fifo_and_disjoint_core_split():
+    from mindie_sim.compose import compose_case
+    from mindie_sim.optimization.target_schedule import schedule_target_graph_on_engine
+    from mindie_sim.prediction.streams import StreamCoreBudget, StreamLane, StreamPlan
+    from mindie_sim.prediction.structure import parse_case
+
+    case = parse_case(compose_case("qwen3-32b", "a3", tp=1, dp=1, layers=1))
+    # Two independent ops on stream_0 with initially overlapping timestamps MUST serialize FIFO (0.0 us overlap).
+    n0 = _make_v5_target_node(0, "s0.l0.gemm_a", stream="main", stream_index=0, start_us=0.0, dur_us=30.0, flops=2.0e11, shape=(512, 1024))
+    n1 = _make_v5_target_node(1, "s0.l0.gemm_b", stream="main", stream_index=0, start_us=5.0, dur_us=25.0, flops=1.5e11, shape=(512, 1024))
+    res = schedule_target_graph_on_engine((n0, n1), case)
+    assert res.max_same_stream_overlap_us == 0.0
+    assert res.nodes[1].start_us >= res.nodes[0].end_us - 1e-6
+    assert res.step_span_us >= 55.0 - 1e-3
+
+    # Disjoint StreamCoreBudget splits AIC/AIV physically with discrete wave quantization and emits receipt.
+    m0 = _make_v5_target_node(0, "s0.l0.main_gemm", stream="main", stream_index=0, dur_us=20.0, flops=3.0e11, shape=(512, 1024))
+    a0 = _make_v5_target_node(1, "s0.l0.aux_gemm", stream="aux", stream_index=1, dur_us=20.0, flops=3.0e11, shape=(512, 1024))
+    shared = schedule_target_graph_on_engine((m0, a0), case)
+    die = case.machine.dies[0]
+    aic_half = max(1, int(die.aic_count) // 2)
+    aiv_half = max(1, int(die.owner_count("vector") or 2) // 2)
+    plan = StreamPlan(
+        rank=int(die.rank),
+        lanes=(
+            StreamLane("main", StreamCoreBudget(aic=aic_half, aiv=aiv_half, isolation="disjoint")),
+            StreamLane("aux", StreamCoreBudget(aic=int(die.aic_count) - aic_half, aiv=int(die.owner_count("vector") or 2) - aiv_half, isolation="disjoint")),
+        ),
+    )
+    disjoint = schedule_target_graph_on_engine((m0, a0), case, stream_plan=plan)
+    assert "disjoint" in disjoint.stream_core_budget_summary
+    assert disjoint.max_same_stream_overlap_us == 0.0
+    assert disjoint.nodes[0].stream_core_budget == disjoint.stream_core_budget_summary
+    assert sum(n.exposed_dur_us for n in shared.nodes) == pytest.approx(shared.step_span_us, rel=1e-3)
+
+
+def test_redline2_causal_target_tail_placement_and_barrier_rewiring():
+    from mindie_sim.compose import compose_case
+    from mindie_sim.optimization.causal_tail import (
+        compute_acceptance_tail_closure,
+        resolve_barrier_predecessors,
+        restore_folded_tail_commits,
+    )
+    from mindie_sim.optimization.target_schedule import schedule_target_graph_on_engine
+    from mindie_sim.prediction.results import OpOccurrence
+    from mindie_sim.prediction.structure import parse_case
+    from mindie_sim.schema.operators import OpSpec
+
+    occ_fwd = OpOccurrence(0, 0, 0, "s0.l0.attn")
+    occ_acc = OpOccurrence(0, 0, 0, "accept")
+    occ_b1 = OpOccurrence(0, 0, 0, "accept_barrier_1")
+    occ_b2 = OpOccurrence(0, 0, 0, "accept_barrier_2")
+    occ_rec = OpOccurrence(0, 0, 0, "s0.l0.recover_ssm_commit")
+    occ_draft = OpOccurrence(0, 0, 0, "draft.s0.l0.qkv")
+
+    spec_acc = OpSpec(
+        op_id="accept", family="accept", phase="decode", stage=0, layer=-1, requests=(),
+        semantic_shape=(1,), local_shape=(1,), padded_shape=(1,), launch_shape=(1,),
+        metadata=(("acceptance_boundary", "sampling_acceptance"),),
+    )
+    spec_rec = OpSpec(
+        op_id="s0.l0.recover_ssm_commit", family="recover_ssm_commit", phase="decode", stage=0, layer=0, requests=(),
+        semantic_shape=(1,), local_shape=(1,), padded_shape=(1,), launch_shape=(1,),
+    )
+    spec_draft = OpSpec(
+        op_id="draft.s0.l0.qkv", family="gemm", phase="decode", stage=0, layer=0, requests=(),
+        semantic_shape=(1,), local_shape=(1,), padded_shape=(1,), launch_shape=(1,),
+        metadata=(("layer_scope", "draft"),),
+    )
+    recs = [
+        {"occurrence": occ_fwd, "op_id": occ_fwd.op_id, "family": "attention", "spec": None, "predecessors": (), "start_us": 0.0, "end_us": 20.0},
+        {"occurrence": occ_acc, "op_id": occ_acc.op_id, "family": "accept", "spec": spec_acc, "predecessors": (occ_fwd,), "start_us": 20.0, "end_us": 30.0},
+        {"occurrence": occ_b1, "op_id": occ_b1.op_id, "family": "barrier", "spec": None, "predecessors": (occ_acc,), "start_us": 30.0, "end_us": 30.0},
+        {"occurrence": occ_b2, "op_id": occ_b2.op_id, "family": "barrier", "spec": None, "predecessors": (occ_b1,), "start_us": 30.0, "end_us": 30.0},
+        {"occurrence": occ_rec, "op_id": occ_rec.op_id, "family": "recover_ssm_commit", "spec": spec_rec, "predecessors": (occ_b2,), "start_us": 30.0, "end_us": 36.0},
+        {"occurrence": occ_draft, "op_id": occ_draft.op_id, "family": "gemm", "spec": spec_draft, "predecessors": (occ_rec,), "start_us": 36.0, "end_us": 50.0},
+    ]
+    closure = compute_acceptance_tail_closure(recs)
+    assert occ_acc in closure and occ_rec in closure
+    assert occ_fwd not in closure and occ_draft not in closure
+
+    # Transitive barrier rewiring preserves accept -> recover_ssm_commit across multi-hop zero-dur barriers.
+    rewired = resolve_barrier_predecessors(recs, protected_occurrences=closure)
+    rec_row = next(r for r in rewired if r["op_id"] == "s0.l0.recover_ssm_commit")
+    assert occ_acc in rec_row["predecessors"]
+
+    # Folded representative layer (layers 0, 1, 2) restores 3 distinct per-layer commits inside target_tail.
+    expanded, new_closure = restore_folded_tail_commits(rewired, tail_closure=closure, layer_indices_by_rep_layer={0: (0, 1, 2)})
+    commits = [r for r in expanded if r["family"] == "recover_ssm_commit"]
+    assert len(commits) == 3
+    assert all(r["occurrence"] in new_closure for r in commits)
+
+    # Die Engine schedule enforces Redline #2: every recover_ssm_commit starts >= accept.end_us.
+    case = parse_case(compose_case("qwen3-32b", "a3", tp=1, dp=1, layers=1))
+    nodes = [
+        _make_v5_target_node(
+            i, r["op_id"],
+            archetype_id=("target_tail" if r["occurrence"] in new_closure else ("draft_arch_0" if r["op_id"].startswith("draft") else "target_arch_0")),
+            family=r["family"], predecessors=r["predecessors"], dur_us=max(1.0, r["end_us"] - r["start_us"]),
+            vector_ops=1.0e8, spec=r["spec"],
+        )
+        for i, r in enumerate(expanded)
+    ]
+    sched = schedule_target_graph_on_engine(nodes, case)
+    acc_node = next(n for n in sched.nodes if n.op_id == "accept")
+    commit_nodes = [n for n in sched.nodes if n.family == "recover_ssm_commit"]
+    assert len(commit_nodes) == 3
+    assert all(c.archetype_id == "target_tail" for c in commit_nodes)
+    assert all(c.start_us >= acc_node.end_us - 1e-6 for c in commit_nodes)
+
+
+def test_redline3_persistent_whole_die_and_moe_mutex_head_to_head():
+    from mindie_sim.compose import compose_case
+    from mindie_sim.optimization.causal_tail import enforce_moe_mutex_on_nodes, moe_route_legality
+    from mindie_sim.optimization.kernel_synthesis import solve_target_graph
+    from mindie_sim.optimization.target_schedule import schedule_target_graph_on_engine
+    from mindie_sim.prediction.structure import parse_case
+
+    case_a3 = parse_case(compose_case("deepseek-v3.2", "a3", tp=1, dp=4, ep=4, layers=4))
+    case_a5 = parse_case(compose_case("deepseek-v3.2", "a5", tp=1, dp=4, ep=4, layers=4))
+
+    # 1. Persistent whole-die kernel (aclnnMegaMoe) blocks concurrent Stream 1 op (zero fake 0-exposed overlap).
+    mega = _make_v5_target_node(
+        0, "s0.l0.mega_moe", family="moe", recipe="aclnnMegaMoe", ascend_kernel="aclnnMegaMoe",
+        stream="main", stream_index=0, dur_us=80.0, flops=2.0e11, vector_ops=1.0e9,
+        hbm_read_bytes=2.0e7, persistent_whole_die=True,
+    )
+    shared_s1 = _make_v5_target_node(
+        1, "s0.l0.shared_expert_gate", family="gemm", recipe="matmul",
+        stream="aux", stream_index=1, dur_us=20.0, flops=1.0e11, hbm_read_bytes=4.0e6,
+    )
+    sched = schedule_target_graph_on_engine((mega, shared_s1), case_a5)
+    assert sched.step_span_us >= 99.0
+    assert sched.nodes[1].exposed_dur_us > 15.0 and not sched.nodes[1].is_overlapped
+
+    # 2. MoE mutex legality: enable_fused_mc2 perpendicular to MSO; level=3 A5 non-latent only; situglu extended ABI.
+    assert moe_route_legality(case_a5, enable_fused_mc2=2, multistream_overlap_shared_expert=True).legal is False
+    assert moe_route_legality(case_a3, enable_fused_mc2=3, multistream_overlap_shared_expert=False, nodes=(shared_s1,)).legal is False
+    assert moe_route_legality(case_a5, enable_fused_mc2=3, multistream_overlap_shared_expert=False, nodes=(shared_s1,)).legal is True
+    case_latent = replace(case_a5, model=replace(case_a5.model, metadata=(("routed_expert_hidden_size", 512),)))
+    assert moe_route_legality(case_latent, enable_fused_mc2=3, multistream_overlap_shared_expert=False, nodes=(shared_s1,)).legal is False
+    assert moe_route_legality(case_a5, enable_fused_mc2=2, multistream_overlap_shared_expert=False, activation="situglu", allow_unbound_formula=False).legal is False
+    kimi_mod = moe_route_legality(case_a5, enable_fused_mc2=2, multistream_overlap_shared_expert=False, activation="situglu", allow_unbound_formula=True)
+    assert kimi_mod.legal is True and kimi_mod.needs_new_kernel is True and kimi_mod.is_shipping_abi is False
+
+    # 3. enforce_moe_mutex_on_nodes sanitizes illegal fused_mc2 + Stream-1 shared expert.
+    clean_nodes, dec = enforce_moe_mutex_on_nodes((mega, shared_s1), case_a5)
+    assert dec is not None and dec.enable_fused_mc2 > 0 and dec.multistream_overlap_shared_expert is False
+    assert clean_nodes[1].stream_index == 0
+
+    # 4. Head-to-head MoE selection in solve_target_graph enforces mutex & emits applied_edit_receipts.
+    die5 = case_a5.machine.dies[0]
+    peaks5 = {0: {
+        "cube_peak_flops_per_s": float(die5.peak("bf16")),
+        "vector_peak_ops_per_s": float(dict(die5.rates).get("vector", 1.0e13)),
+        "hbm_peak_bytes_per_s": float(dict(die5.rates)["hbm"]),
+        "link_peak_bytes_per_s": 2.0e11,
+    }}
+    disp = _make_v5_target_node(0, "s0.l0.dispatch", family="dispatch", recipe="mc2_dispatch", dur_us=25.0, vector_ops=5.0e8, hbm_read_bytes=1.0e6, hbm_write_bytes=2.0e6, link_bytes=2.0e6)
+    gmm = _make_v5_target_node(1, "s0.l0.expert_gmm", family="grouped_gemm", recipe="grouped_matmul", predecessors=(disp.occurrence,), dur_us=60.0, flops=4.0e11, hbm_read_bytes=3.0e7, hbm_write_bytes=2.0e6)
+    comb = _make_v5_target_node(2, "s0.l0.combine", family="combine", recipe="mc2_combine", predecessors=(gmm.occurrence,), dur_us=25.0, vector_ops=5.0e8, hbm_read_bytes=2.0e6, hbm_write_bytes=1.0e6, link_bytes=2.0e6)
+    sh = _make_v5_target_node(3, "s0.l0.shared_expert_ffn", family="gemm", recipe="matmul", dur_us=20.0, flops=1.0e11, hbm_read_bytes=5.0e6, hbm_write_bytes=1.0e6)
+    dems = ((0, 5000, 3000, 0, 10000), (20000, 0, 20000, 0, 0), (0, 5000, 3000, 0, 10000), (5000, 0, 4000, 0, 0))
+    solved = solve_target_graph((disp, gmm, comb, sh), dems, case_a5, peaks5, allow_unbound_formula=True)
+    assert not (solved.moe_route.get("enable_fused_mc2", 0) > 0 and solved.moe_route.get("multistream_overlap_shared_expert"))
+    assert solved.step_span_us > 0.0
+    assert solved.applied_edit_receipts
+
+
+def test_d6_baseline_purity_collapse_occurrence_and_bundle_receipts(monkeypatch):
+    from mindie_sim import solve as solve_mod
+    from mindie_sim.compose import compose_case
+    from mindie_sim.export.bundle import _collapse_micro_split_ops, build_export_bundle
+    from mindie_sim.export.models import OperatorExportRow
+    from mindie_sim.optimization.kernel_synthesis import evaluate_macro_wall_trigger, extract_sku_floors
+    from mindie_sim.prediction.results import OpOccurrence, StepRequest
+    from mindie_sim.prediction.structure import parse_case
+    from mindie_sim.solve import solve_deployment
+
+    # 1. Default script-free Before track in solve_deployment executes 'merged' (D6).
+    seen_tracks: list[str] = []
+    orig_opt = solve_mod.solve_optimal_deployment
+
+    def _capture_track(*args, **kwargs):
+        seen_tracks.append(str(kwargs.get("feature_track", "")))
+        return orig_opt(*args, **kwargs)
+
+    with monkeypatch.context() as mp:
+        mp.setattr(solve_mod, "solve_optimal_deployment", _capture_track)
+        solve_deployment(
+            "qwen3-32b", "a3", num_devices=2, layers=1, prompt_tokens=256, output_tokens=32,
+            tpot_slo_ms=50.0, deployment="colocated", pinned_parallel={"tp": 2},
+            max_sequences_per_dp=2, mode="simulation",
+        )
+    assert seen_tracks and seen_tracks[0] == "merged"
+
+    # 2. Zero AIV/CCU hybrid labels and zero SuperPoD on A2.
+    case_a2 = parse_case(compose_case("qwen3-32b", "a2", tp=1, dp=1, layers=1))
+    floors_a2 = extract_sku_floors(case_a2)
+    assert "SuperPoD" not in floors_a2.interconnect_label and "CCU" not in floors_a2.interconnect_label
+    wall = evaluate_macro_wall_trigger(tpot_ms=60.0, tpot_slo_ms=50.0, hbm_used_bytes=20e9, hbm_usable_bytes=64e9, hbm_headroom_bytes=44e9)
+    assert all("CCU" not in act for act in wall.recommended_actions)
+
+    # 3. _collapse_micro_split_ops updates occurrence.op_id and preserves external predecessors.
+    occ_pre = OpOccurrence(0, 0, 0, "s0.l0.pre")
+    occ_s0 = OpOccurrence(0, 0, 0, "s0.l0.recurrent_scan0")
+    occ_s1 = OpOccurrence(0, 0, 0, "s0.l0.recurrent_scan1")
+    occ_ext = OpOccurrence(0, 0, 0, "s0.l0.ext_bias")
+    occ_post = OpOccurrence(0, 0, 0, "s0.l0.post")
+
+    def _mk_row(idx: int, occ: OpOccurrence, preds: tuple[OpOccurrence, ...]) -> OperatorExportRow:
+        return OperatorExportRow(
+            ordinal=idx, occurrence=occ, op_id=occ.op_id, layer=0, layer_label="L0", submodule="Attention",
+            family="linear_attn", recipe="recurrent_scan", implementation="recurrent_scan",
+            stream="main", stream_index=0, task_type="AI_VECTOR_CORE", shape=(1, 128), dtype="bf16",
+            predecessors=preds, start_us=float(idx * 5), end_us=float(idx * 5 + 5), dur_us=5.0,
+            flops=0.0, vector_ops=1e6, hbm_read_bytes=1e4, hbm_write_bytes=1e4, hbm_total_bytes=2e4,
+            mte2_bytes=1e4, mte3_bytes=1e4, fixpipe_bytes=0.0, link_bytes=0.0, l2_hit_pct=0.0,
+            dominant_bound="vector_bound", l_star_lean_us=1.0, gap_us=4.0, gap_ratio=5.0,
+            gap_radar_rank=0, roofline_efficiency=0.2, absorbed_source_ops=(),
+            archetype_id="target_arch_0", archetype_title="L0", model_scope="target", repeat_count=1,
+            exposed_dur_us=5.0,
+        )
+
+    rows = [
+        _mk_row(0, occ_pre, ()),
+        _mk_row(1, occ_s0, (occ_pre,)),
+        _mk_row(2, occ_s1, (occ_s0, occ_ext)),
+        _mk_row(3, occ_post, (occ_s1,)),
+    ]
+    dems = [(0, 1000, 0, 0, 0)] * 4
+    c_rows, _ = _collapse_micro_split_ops(rows, dems)
+    scan_row = next(r for r in c_rows if r.op_id == "s0.l0.recurrent_scan")
+    post_row = next(r for r in c_rows if r.op_id == "s0.l0.post")
+    assert scan_row.occurrence.op_id == "s0.l0.recurrent_scan"
+    assert occ_pre in scan_row.predecessors and occ_ext in scan_row.predecessors
+    assert scan_row.occurrence in post_row.predecessors
+
+    # 4. build_export_bundle no longer attaches deployment commands to every op row (D6).
+    bundle = build_export_bundle(
+        compose_case("qwen3-32b", "a3", tp=1, dp=1, layers=1),
+        request=StepRequest(phase="decode", tokens=1, context=128, sequences=1, scope="model"),
+        apply_target_envelope=False,
+    )
+    assert all(r.config_howto == "" for r in bundle.operators)

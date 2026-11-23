@@ -5,6 +5,14 @@
 [Timeouts & Locks] No import-time replay or locks.
 [Side-Effect Policy] Re-exports only.
 """
+from .causal_tail import (
+    MoERouteDecision,
+    compute_acceptance_tail_closure,
+    enforce_moe_mutex_on_nodes,
+    moe_route_legality,
+    resolve_barrier_predecessors,
+    restore_folded_tail_commits,
+)
 from .contracts import (
     BilinearContractionSpec, CatlassKernelSpec, DslKernelSpec, EdgeRouteBinding,
     EvgVisitorNode, FuseRegionSpec, FusedRegionSummary, PrimitiveCapacityEntry,
@@ -43,8 +51,22 @@ from .reload_bounds import (
     PebbleReloadResult, SurplusCouplingSite, build_surplus_coupling_sites,
     compute_compulsory_hbm_cut, direct_mac_pebble_reload_bound,
 )
+from .target_schedule import (
+    DieScheduleResult,
+    ServiceGrantObserver,
+    attribute_engine_exposure,
+    evaluate_disjoint_core_budgets,
+    format_stream_core_budget_receipt,
+    schedule_target_graph_on_engine,
+    weighted_step_span_us,
+)
 
 __all__ = (
+    "MoERouteDecision", "compute_acceptance_tail_closure", "enforce_moe_mutex_on_nodes",
+    "moe_route_legality", "resolve_barrier_predecessors", "restore_folded_tail_commits",
+    "DieScheduleResult", "ServiceGrantObserver", "attribute_engine_exposure",
+    "evaluate_disjoint_core_budgets", "format_stream_core_budget_receipt",
+    "schedule_target_graph_on_engine", "weighted_step_span_us",
     "BilinearContractionSpec", "CatlassKernelSpec", "DslKernelSpec", "EdgeRouteBinding",
     "EvgVisitorNode", "FuseRegionSpec", "FusedRegionSummary", "PrimitiveCapacityEntry",
     "PrimitiveCapacityTable", "SemanticWorkItem", "TensorRangeObligation", "UpperCapacityProvider",

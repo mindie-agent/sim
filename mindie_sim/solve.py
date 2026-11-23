@@ -739,7 +739,7 @@ def solve_deployment(
     raw_eager: bool = False, runtime_stack: str | Mapping[str, Any] = "vllm-ascend",
     optimizations: Sequence[str] = (), exclude_optimizations: Sequence[str] = (),
     xlsx_path: str | Path | None = None, trace_path: str | Path | None = None,
-    compare_track: str = "unmerged_pr", target_track: str = "expected_ideal",
+    compare_track: str = "merged", target_track: str = "expected_ideal",
     mode: str = "modeling", rewrite_plan: Any = None,
 ) -> dict[str, Any]:
     """One-shot deployment solver with first-class ``simulation`` vs ``modeling`` split."""

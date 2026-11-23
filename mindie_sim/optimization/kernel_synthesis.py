@@ -27,7 +27,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 import hashlib
 import json
 from math import prod
@@ -103,6 +103,25 @@ from mindie_sim.schema.datapath import DatapathCapabilitySpec, datapath_for_die,
 from mindie_sim.schema.hardware import Device, Hardware
 from mindie_sim.schema.operators import OpSpec
 from mindie_sim.stack_registry import RankOps
+from .causal_tail import (
+    FUSED_MC2_ROUTED_LEVEL,
+    FUSED_MC2_SHARED_LEVEL,
+    SHIPPING_MOE_ACTIVATIONS,
+    MoERouteDecision,
+    build_discrete_mso_candidate_nodes,
+    enforce_moe_mutex_on_nodes,
+    is_a5_hardware,
+    is_persistent_whole_die_node,
+    is_shared_expert_op_id,
+    moe_route_legality,
+    resolve_arch_family_tag,
+)
+from .target_schedule import (
+    DieScheduleResult,
+    evaluate_disjoint_core_budgets,
+    schedule_target_graph_on_engine,
+    weighted_step_span_us,
+)
 
 SIMT_UB_CARVEOUT_BYTES = 16384
 
@@ -760,6 +779,15 @@ class TargetOpNode:
     spec: OpSpec | None = None
     synthesis_spec: KernelSynthesisSpec | None = None
     binding_state: BindingState = "bound_implementation"
+    is_shipping_abi: bool = True
+    stream_core_budget: str = ""
+    formula_eval: FormulaKernelEvaluation | None = None
+    persistent_whole_die: bool = False
+    source_ref: str = ""
+
+    @property
+    def exposed_us(self) -> float:
+        return self.exposed_dur_us
 
 
 @dataclass(frozen=True, slots=True)
@@ -778,6 +806,17 @@ class SolvedTargetGraph:
     has_unbound_formula_ops: bool = False
     binding_state: BindingState = "bound_implementation"
     unbound_formula_ops: tuple[str, ...] = ()
+    applied_edit_receipts: tuple[dict[str, Any], ...] = ()
+    stream_core_budget: Mapping[tuple[int, int, int], Mapping[str, Any]] = field(default_factory=dict)
+    stream_core_budget_summary: str = ""
+    moe_route: Mapping[str, Any] = field(default_factory=dict)
+    step_start_us: float = 0.0
+    step_end_us: float = 0.0
+    step_span_us: float = 0.0
+
+    @property
+    def exposed_us(self) -> float:
+        return self.step_span_us
 
 
 TargetGraphResult = SolvedTargetGraph
@@ -839,20 +878,24 @@ def _min_link_latency_us(machine: Hardware) -> tuple[float, float, bool]:
 def extract_sku_floors(case: Case, *, primitive_table: Any = None) -> SkuTargetFloors:
     """Read SKU L0 kernel launch & interconnect floors purely from ``Case`` capabilities."""
     die = case.machine.dies[0]
+    arch = resolve_arch_family_tag(case)
     ub_edges = ub_peer_edges_for_rank(die.rank, case.machine.links, case.machine.transfer_channels)
     datapath = datapath_for_die(die, ub_peer_edges=ub_edges)
     launch_vec, launch_cube, launch_norm = _die_launch_us(die, datapath, primitive_table)
     intra_lat, any_lat, has_intra_links = _min_link_latency_us(case.machine)
     tp = max(1, int(case.runtime.parallel.tp))
     rpn = max(1, int(getattr(case.machine, "ranks_per_node", tp) or tp))
-    has_ub_direct = bool(ub_edges) or bool(datapath.has_l0c_to_ub and has_intra_links)
+    is_a5 = arch == "Arch35"
+    has_ub_direct = bool(is_a5 and (ub_edges or (datapath.has_l0c_to_ub and has_intra_links)))
     is_pod = bool(has_ub_direct or has_intra_links or rpn >= tp)
     link_alpha = intra_lat if (is_pod and intra_lat > 0.0) else any_lat
     oneshot = launch_vec + link_alpha
     if has_ub_direct and is_pod:
-        label = "UB-Direct (CCU / AIV One-Shot)"
-    elif is_pod:
-        label = "Intra-Pod Direct (AIV One-Shot)"
+        label = "UB-Direct (CCU)"
+    elif arch == "Arch22" and is_pod:
+        label = "HCCS SuperPoD (AIV)"
+    elif arch == "Arch20" and is_pod:
+        label = "8P HCCS (AIV)"
     else:
         label = "Inter-Node Collective"
     return SkuTargetFloors(
@@ -1300,10 +1343,7 @@ def evaluate_macro_wall_trigger(
             hbm_utilization_pct=util_pct,
             tradeoff_direction="compute_for_memory_and_offload",
             recommended_actions=(
-                "以算换存: 优先启用 MLA 矩阵吸收 / KV Cache 低比特量化 (C8/FP8) 释放单卡 HBM",
-                "内存卸载: 评估 KV Offloading / Host DRAM-SSD Prefix Cache 分级池化与 Engram Host Offload",
-                "投机状态权衡: 对比周期检查点重算 vs 多槽 SSM 状态快照，扩大可承载 Batch B 吃满 SLA 余量",
-                "并行重分配: 适度调低 DP/调高 TP 或切换高压缩权重量化以突破 HBM 并发上限",
+                f"HBM 利用率 {util_pct:.1f}% 且 SLA 余量 {slack_ms:.2f} ms: 优先评估存储换并发（KV 分级池化/状态压缩/并行重分配）",
             ),
         )
     if tpot_ms >= slo * SLA_NEAR_BOUND_RATIO and headroom_gib >= LATENCY_WALL_FREE_GIB:
@@ -1316,9 +1356,7 @@ def evaluate_macro_wall_trigger(
             hbm_utilization_pct=util_pct,
             tradeoff_direction="memory_for_compute",
             recommended_actions=(
-                "以存换算: 利用充裕 HBM 余量预展开高频投影/索引权重或增大 L1/UB 驻留分块",
-                "投机多槽快照: 分配 [K+1] 多槽状态缓冲并做 in-place 2D 槽位别名消除回滚拷贝",
-                "降低单步通信/算力瓶颈: 评估 Attention Local-TP / 提升 TP 或 EP 分摊权重读取延迟",
+                f"TPOT {tpot_ms:.2f} ms 逼近 SLA {tpot_slo_ms:.2f} ms 且 HBM 空余 {headroom_gib:.2f} GiB: 优先评估以存换算与片上融合降延迟",
             ),
         )
     return MacroWallTrigger(
@@ -1330,7 +1368,7 @@ def evaluate_macro_wall_trigger(
         hbm_utilization_pct=util_pct,
         tradeoff_direction="balanced",
         recommended_actions=(
-            "当前延迟与 HBM 利用率处于均衡区间，优先落地已验证的片上融合与超节点通信展开方案",
+            f"延迟 ({tpot_ms:.2f}/{tpot_slo_ms:.2f} ms) 与 HBM ({util_pct:.1f}%, 余量 {headroom_gib:.2f} GiB) 处于均衡区间",
         ),
     )
 
@@ -1451,108 +1489,31 @@ def attribute_node_overlap(
     return updated, span_by_arch
 
 
-def _reschedule_with_shared_topology(
-    nodes: Sequence[TargetOpNode],
-    arch_order: Sequence[str],
-    by_arch: Mapping[str, list[tuple[int, TargetOpNode]]],
-    collective_plans: Mapping[OpOccurrence, tuple[Any, float]],
-    topology: Topology,
-) -> list[TargetOpNode]:
-    """Schedule nodes on one shared topology ``Engine`` so concurrent collectives contend on physical links."""
-    all_ranks = tuple(sorted({r for plan, _ in collective_plans.values() for r in plan.ranks}))
-    engine = Engine(topology.resources_for_ranks(all_ranks), backend="python")
-    root_ev = engine.submit("step_root")
-    updated = list(nodes)
-    arch_barrier = root_ev
-    prev_arch_orig_end = 0.0
-    global_end_by_occ: dict[Any, Any] = {}
-    global_stream_history: dict[tuple[str, int], list[tuple[float, float, Any]]] = defaultdict(list)
-    start_events: dict[int, Any] = {}
-    end_events: dict[int, Any] = {}
-
-    for arch_idx, aid in enumerate(arch_order):
-        ordered = sorted(by_arch[aid], key=lambda item: (item[1].start_us, item[1].ordinal))
-        end_by_occ: dict[Any, Any] = {}
-        stream_history: dict[tuple[str, int], list[tuple[float, float, Any]]] = defaultdict(list)
-        arch_orig_max = prev_arch_orig_end
-        arch_done: list[Any] = []
-        for idx, node in ordered:
-            overlaps_prev = (
-                arch_idx > 0
-                and node.dur_us > 0.0
-                and node.start_us < prev_arch_orig_end - ORIG_OVERLAP_EPS_US
-            )
-            origin_ev = root_ev if overlaps_prev else arch_barrier
-            occ_lookup = global_end_by_occ if overlaps_prev else end_by_occ
-            deps_ev: list[Any] = [origin_ev]
-            for pred in node.predecessors:
-                pev = occ_lookup.get(pred)
-                if pev is not None:
-                    deps_ev.append(pev)
-            s_key = (node.stream, node.stream_index)
-            hist = global_stream_history[s_key] if overlaps_prev else stream_history[s_key]
-            for orig_s, orig_e, new_ev in hist:
-                if node.start_us >= orig_e - ORIG_OVERLAP_EPS_US and orig_e > orig_s:
-                    deps_ev.append(new_ev)
-            unique_deps = tuple({id(ev): ev for ev in deps_ev}.values())
-            start_ev = engine.submit(f"s:{idx}", after=unique_deps)
-            col_entry = collective_plans.get(node.occurrence)
-            if col_entry is not None:
-                plan, min_us = col_entry
-                plan_done = plan.start(engine, f"c:{idx}:{node.op_id}", start_ev)
-                if min_us > 0.0:
-                    floor_done = engine.submit(f"f:{idx}", after=(start_ev,), latency=min_us / US_PER_MS)
-                    end_ev = engine.submit(f"e:{idx}", after=(plan_done, floor_done))
-                else:
-                    end_ev = plan_done
-            else:
-                end_ev = engine.submit(f"op:{idx}", after=(start_ev,), latency=max(0.0, node.dur_us) / US_PER_MS)
-            start_events[idx] = start_ev
-            end_events[idx] = end_ev
-            end_by_occ[node.occurrence] = end_ev
-            global_end_by_occ[node.occurrence] = end_ev
-            arch_done.append(end_ev)
-            arch_orig_max = max(arch_orig_max, node.end_us)
-            entry = (node.start_us, node.end_us, end_ev)
-            stream_history[s_key].append(entry)
-            global_stream_history[s_key].append(entry)
-        arch_barrier = engine.submit(f"arch:{arch_idx}", after=tuple(arch_done)) if arch_done else arch_barrier
-        prev_arch_orig_end = arch_orig_max
-
-    if end_events:
-        step_done = engine.submit("step_done", after=tuple(end_events.values()))
-        engine.advance(until=(step_done,))
-    for idx, node in enumerate(nodes):
-        if idx not in start_events:
-            continue
-        new_s = float(start_events[idx].time) * US_PER_MS
-        new_e = float(end_events[idx].time) * US_PER_MS
-        if node.occurrence in collective_plans:
-            new_dur = max(0.0, new_e - new_s)
-            eff = min(1.0, node.l_star_lean_us / new_dur) if new_dur > 0.0 and node.l_star_lean_us > 0.0 else None
-            updated[idx] = replace(
-                node,
-                start_us=new_s,
-                end_us=new_e,
-                dur_us=new_dur,
-                exposed_dur_us=new_dur,
-                gap_us=max(0.0, new_dur - node.l_star_lean_us),
-                gap_ratio=(new_dur / node.l_star_lean_us) if node.l_star_lean_us > 0.0 else None,
-                roofline_efficiency=eff,
-                opt_attainment_pct=round(eff * PERCENT_SCALE, 1) if eff is not None else None,
-            )
-        else:
-            updated[idx] = replace(node, start_us=new_s, end_us=new_e)
-    return updated
-
-
 def reschedule_node_timelines(
     nodes: Sequence[TargetOpNode],
     *,
     collective_plans: Mapping[OpOccurrence, tuple[Any, float]] | None = None,
     topology: Topology | None = None,
+    case: Case | None = None,
+    primitive_table: Any = None,
+    stream_plan: Any = None,
+    launch_floor_us: float = 0.0,
 ) -> list[TargetOpNode]:
-    """Recompute exact causal ``(start_us, end_us)`` preserving parallel, cross-layer, and link contention."""
+    """Recompute exact causal ``(start_us, end_us)`` via Die + Topology Engine with strict FIFO."""
+    if not nodes:
+        return []
+    if case is not None:
+        return list(schedule_target_graph_on_engine(
+            nodes,
+            case,
+            collective_plans=collective_plans,
+            topology=topology,
+            primitive_table=primitive_table,
+            stream_plan=stream_plan,
+            launch_floor_us=launch_floor_us,
+        ).nodes)
+
+    # Pure structural fallback when called without a Case: still enforces strict per-stream FIFO.
     by_arch: dict[str, list[tuple[int, TargetOpNode]]] = defaultdict(list)
     arch_order: list[str] = []
     for idx, node in enumerate(nodes):
@@ -1560,48 +1521,26 @@ def reschedule_node_timelines(
             arch_order.append(node.archetype_id)
         by_arch[node.archetype_id].append((idx, node))
 
-    if collective_plans and topology is not None and any(n.occurrence in collective_plans for n in nodes):
-        return _reschedule_with_shared_topology(nodes, arch_order, by_arch, collective_plans, topology)
-
     updated = list(nodes)
     cursor_us = 0.0
-    prev_arch_orig_end = 0.0
-    global_end_by_occ: dict[Any, float] = {}
-    global_stream_history: dict[tuple[str, int], list[tuple[float, float, float]]] = defaultdict(list)
-    for arch_idx, aid in enumerate(arch_order):
-        ordered = sorted(by_arch[aid], key=lambda item: (item[1].start_us, item[1].ordinal))
-        end_by_occ: dict[Any, float] = {}
-        stream_history: dict[tuple[str, int], list[tuple[float, float, float]]] = defaultdict(list)
+    end_by_occ: dict[Any, float] = {}
+    stream_tail: dict[tuple[int, int, int, int], float] = {}
+    for aid in arch_order:
+        ordered = sorted(by_arch[aid], key=lambda item: (item[1].ordinal, item[1].start_us))
         arch_origin = cursor_us
         arch_max_end = arch_origin
-        arch_orig_max = prev_arch_orig_end
         for idx, node in ordered:
-            overlaps_prev = (
-                arch_idx > 0
-                and node.dur_us > 0.0
-                and node.start_us < prev_arch_orig_end - ORIG_OVERLAP_EPS_US
-            )
-            base_origin = 0.0 if overlaps_prev else arch_origin
-            occ_lookup = global_end_by_occ if overlaps_prev else end_by_occ
-            pred_ready = max((occ_lookup.get(p, base_origin) for p in node.predecessors), default=base_origin)
-            s_key = (node.stream, node.stream_index)
-            hist = global_stream_history[s_key] if overlaps_prev else stream_history[s_key]
-            stream_ready = base_origin
-            for orig_s, orig_e, new_e in hist:
-                if node.start_us >= orig_e - ORIG_OVERLAP_EPS_US and orig_e > orig_s:
-                    stream_ready = max(stream_ready, new_e)
-            new_s = max(pred_ready, stream_ready)
-            new_e = new_s + node.dur_us
-            end_by_occ[node.occurrence] = new_e
-            global_end_by_occ[node.occurrence] = new_e
+            occ = node.occurrence
+            pred_ready = max((end_by_occ.get(p, arch_origin) for p in node.predecessors), default=arch_origin)
+            q_key = (int(occ.replica), int(occ.stage), int(occ.rank or 0), int(node.stream_index))
+            stream_ready = stream_tail.get(q_key, arch_origin)
+            new_s = max(arch_origin, pred_ready, stream_ready)
+            new_e = new_s + max(0.0, float(node.dur_us))
+            end_by_occ[occ] = new_e
+            stream_tail[q_key] = new_e
             arch_max_end = max(arch_max_end, new_e)
-            arch_orig_max = max(arch_orig_max, node.end_us)
-            entry = (node.start_us, node.end_us, new_e)
-            stream_history[s_key].append(entry)
-            global_stream_history[s_key].append(entry)
             updated[idx] = replace(node, start_us=new_s, end_us=new_e)
         cursor_us = arch_max_end
-        prev_arch_orig_end = arch_orig_max
     return updated
 
 
@@ -2643,13 +2582,13 @@ def _resolve_candidate_metadata(
     anchor = members[0]
     has_gmm = any(t.is_grouped_matmul for t in member_traits)
     if cand.law == "law3_mc2":
-        tag = "CCU/AIV" if floors.is_a5_ub else "AIV"
+        tag = "CCU" if floors.is_a5_ub else "AIV"
         return (
             _strip_op_prefix(members[-1].op_id if cand.abi_id == "aclnnAllGatherMatmulV2" else anchor.op_id),
             f"MC2 通算融合 ({cand.abi_id})",
             cand.abi_id,
             BACKEND_HCCL_LABEL,
-            f"[通信方案优化: MC2 切 {tag} + L0 流水线建模]",
+            f"[通算融合: MC2 ({tag}) + L0 流水线]",
             False,
             "bound_implementation",
         )
@@ -2659,7 +2598,7 @@ def _resolve_candidate_metadata(
             "MLA Prolog 融合 (Q/KV 低秩投影 + Norm + RoPE + KV Write)",
             "aclnnMlaPrologV3",
             BACKEND_CANN_LABEL,
-            "[配置开启 MLAPO + L0 流水线建模]",
+            "[MLA Prolog 融合: aclnnMlaPrologV3]",
             False,
             "bound_implementation",
         )
@@ -2667,8 +2606,12 @@ def _resolve_candidate_metadata(
         is_ext = not cand.shipping_supported
         acts = [t.activation_kind for t in member_traits if t.activation_kind]
         act_lbl = acts[0].upper() if acts else "ACT"
-        kern = cand.abi_id if not is_ext else (
-            cand.abi_id if "dispatch_ffn_combine" in cand.abi_id else f"GroupedMatmul{act_lbl.capitalize()}Quant"
+        raw_abi = cand.abi_id
+        if floors.is_a5_ub and "dispatch_ffn_combine" in raw_abi.lower():
+            raw_abi = f"aclnnMegaMoe_{act_lbl.lower()}_ext" if is_ext else "aclnnMegaMoe"
+        kern = raw_abi if not is_ext else (
+            raw_abi if ("dispatch_ffn_combine" in raw_abi or "megamoe" in raw_abi.lower())
+            else f"GroupedMatmul{act_lbl.capitalize()}Quant"
         )
         status = (
             f"{STATUS_EXTEND_ABI} {kern} (非标激活 {act_lbl} 融合)"
@@ -2733,6 +2676,9 @@ def _build_fused_target_node(
     mte3: float,
     useful_hbm: float,
     spec: KernelSynthesisSpec,
+    formula_eval: FormulaKernelEvaluation | None = None,
+    is_shipping_abi: bool = True,
+    persistent_whole_die: bool = False,
 ) -> TargetOpNode:
     anchor = group_nodes[0]
     absorbed = tuple(dict.fromkeys(
@@ -2742,6 +2688,13 @@ def _build_fused_target_node(
     group_occs = {n.occurrence for n in group_nodes}
     ext_preds = tuple(dict.fromkeys(p for n in group_nodes for p in n.predecessors if p not in group_occs))
     new_occ = replace(anchor.occurrence, op_id=new_op_id)
+    fused_meta = dict(fused_op.metadata) if fused_op.metadata else {}
+    raw_fixpipe = fused_meta.get("fixpipe_bytes")
+    fused_fixpipe = (
+        max(0.0, float(raw_fixpipe))
+        if raw_fixpipe is not None
+        else sum(float(n.fixpipe_bytes) for n in group_nodes)
+    )
     return replace(
         anchor,
         occurrence=new_occ,
@@ -2761,7 +2714,7 @@ def _build_fused_target_node(
         hbm_total_bytes=useful_hbm,
         mte2_bytes=mte2,
         mte3_bytes=mte3,
-        fixpipe_bytes=0.0,
+        fixpipe_bytes=fused_fixpipe,
         link_bytes=float(fused_op.link_bytes),
         dominant_bound=dom_bound,
         bound_display=_BOUND_LABELS.get(dom_bound, dom_bound),
@@ -2783,6 +2736,9 @@ def _build_fused_target_node(
         spec=fused_op,
         synthesis_spec=spec,
         binding_state=b_state,
+        is_shipping_abi=bool(is_shipping_abi),
+        formula_eval=formula_eval,
+        persistent_whole_die=bool(persistent_whole_die),
     )
 
 
@@ -2880,6 +2836,7 @@ def _collapse_candidate_group(
         )
     except ModelingError:
         bound_res = None
+    eval_res: FormulaKernelEvaluation | None = None
     if bound_res is not None:
         projected_us, b_state, _prog = bound_res
         abi_sig = cand.abi_id
@@ -2942,12 +2899,15 @@ def _collapse_candidate_group(
             "matmul_reduce_scatter" if cand.abi_id == "aclnnMatmulReduceScatterV2" else anchor.family
         )
     )
+    eff_needs_new = bool(needs_new or meta_state == "unbound_formula_projection")
+    is_persist = ("megamoe" in kern.lower()) or ("dispatch_ffn_combine" in kern.lower())
     fused_node = _build_fused_target_node(
         group_nodes=group_nodes, fused_op=fused_op, demand=demand, dom_bound=dom_bound,
         new_op_id=new_op_id, new_family=new_family, suffix=suffix, role=role, kern=kern,
-        backend=backend, status=status, needs_new=(needs_new or meta_state == "unbound_formula_projection"),
+        backend=backend, status=status, needs_new=eff_needs_new,
         b_state=b_state, dur_us=dur_us, l_star_us=l_star_us,
         hbm_r=hbm_r, hbm_w=hbm_w, mte2=mte2, mte3=mte3, useful_hbm=useful_hbm, spec=spec,
+        formula_eval=eval_res, is_shipping_abi=not eff_needs_new, persistent_whole_die=is_persist,
     )
     return fused_node, demand, spec, edit
 
@@ -3012,6 +2972,7 @@ def _materialize_external_fused_op(
         scenario=scenario, atomic_entry=scenario.atomic_ops[0],
         template_binding=template_binding, applied=applied,
     )
+    eval_res: FormulaKernelEvaluation | None = None
     if bound_res is not None:
         dur_us, b_state, _prog = bound_res
         abi_sig = template_binding.template_id if template_binding is not None else abi
@@ -3073,6 +3034,8 @@ def _materialize_external_fused_op(
         status=status, needs_new=needs_new, b_state=b_state,
         dur_us=dur_us, l_star_us=l_star_us,
         hbm_r=hbm_r, hbm_w=hbm_w, mte2=mte2, mte3=mte3, useful_hbm=useful_hbm, spec=spec,
+        formula_eval=eval_res, is_shipping_abi=not needs_new,
+        persistent_whole_die=("megamoe" in abi.lower() or "dispatch_ffn_combine" in abi.lower()),
     )
     return fused_node, demand, spec
 
@@ -3256,48 +3219,11 @@ def _apply_pillar23_envelopes(
         )
 
         if is_pure_comm:
-            op_stub = _node_to_op_spec(node, set(), phase=phase)
-            built = (
-                _build_collective_plan(op_stub, pricing_ctx, case, mode="oneshot")
-                if floors.is_intra_pod else None
-            )
-            oneshot_us: float | None = None
-            os_plan = None
-            if built is not None:
-                topology, op_norm, os_plan = built
-                if os_plan is None:
-                    oneshot_us = float(floors.launch_vec_us)
-                else:
-                    eng = Engine(topology.resources_for_ranks(os_plan.ranks), backend="python")
-                    rdy = eng.submit("ready")
-                    done = os_plan.start(eng, op_norm.op_id, rdy)
-                    eng.advance(until=(done,))
-                    oneshot_us = max(float(done.time) * US_PER_MS, float(floors.launch_vec_us))
-            t_after = min(node.dur_us, oneshot_us) if oneshot_us is not None else node.dur_us
-            gain = node.dur_us - t_after
-            if oneshot_us is not None and gain >= TARGET_OPT_MIN_GAIN_US and gain >= node.dur_us * TARGET_OPT_MIN_RATIO:
-                if collective_plans is not None and os_plan is not None:
-                    collective_plans[node.occurrence] = (os_plan, float(floors.launch_vec_us))
-                tag = "CCU/AIV UB-Direct One-Shot" if floors.is_a5_ub else "AIV Intra-Pod One-Shot"
-                is_small_sp = fam in {"allgather", "reduce_scatter"} and node.link_bytes <= UB_ONESHOT_SMALL_MSG_BYTES
-                status = (
-                    f"[通信方案优化: 切 {tag} / 小Batch Decode 可关 SP]"
-                    if (is_small_sp and is_decode) else f"[通信方案优化: 切 {tag}]"
-                )
-                base_k = node.ascend_kernel.split(" (", 1)[0]
-                eff = min(1.0, node.l_star_lean_us / t_after) if t_after > 0.0 and node.l_star_lean_us > 0.0 else None
-                out.append(replace(
-                    node, dur_us=t_after, exposed_dur_us=t_after,
-                    ascend_kernel=f"{base_k} ({tag})", kernel_status=status, needs_new_kernel=False,
-                    gap_us=max(0.0, t_after - node.l_star_lean_us),
-                    gap_ratio=(t_after / node.l_star_lean_us) if node.l_star_lean_us > 0.0 else None,
-                    roofline_efficiency=eff,
-                    opt_pillar="pillar3_comm",
-                    opt_attainment_pct=round(eff * PERCENT_SCALE, 1) if eff is not None else None,
-                    binding_state="bound_implementation",
-                ))
-            else:
-                out.append(replace(node, kernel_status=STATUS_AT_FLOOR, needs_new_kernel=False))
+            # D6 baseline purity: shipping intra-pod One-Shot is already active in Before.
+            # Never fabricate After-only pure-communication One-Shot promotion without an explicit CollectiveTransform.
+            out.append(replace(
+                node, kernel_status=STATUS_AT_FLOOR, needs_new_kernel=False, is_shipping_abi=True,
+            ))
             continue
 
         # Strict Simulation Mode (allow_unbound_formula=False) NEVER runs unbound formula projections.
@@ -3318,7 +3244,7 @@ def _apply_pillar23_envelopes(
 
         t_target = max(eval_res.projected_us, node.l_star_lean_us)
         mc2_kernel = node.ascend_kernel
-        needs_new = fam == "attn_res_prefix"
+        needs_new = fam == "attn_res_prefix" or bool(node.needs_new_kernel)
         if is_mc2:
             t_target = max(t_target, floors.oneshot_floor_us + l_link) + floors.mc2_sync_us
             pillar = "pillar3_comm"
@@ -3326,7 +3252,8 @@ def _apply_pillar23_envelopes(
                 mc2_kernel = "aclnnAllGatherMatmulV2"
             elif fam == "matmul_reduce_scatter" and "matmulreducescatter" not in kern_l:
                 mc2_kernel = "aclnnMatmulReduceScatterV2"
-            status_lbl = f"[通信方案优化: MC2 切 {'CCU/AIV' if floors.is_a5_ub else 'AIV'} + L0 流水线]"
+            exec_tag = "CCU" if floors.is_a5_ub else "AIV"
+            status_lbl = f"[通算融合: MC2 ({exec_tag}) + L0 流水线]"
         elif is_megamoe:
             t_target = max(t_target, floors.oneshot_floor_us + l_link)
             pillar = "pillar2_roofline"
@@ -3345,6 +3272,9 @@ def _apply_pillar23_envelopes(
             out.append(replace(
                 node, dur_us=t_after, exposed_dur_us=t_after, ascend_kernel=mc2_kernel,
                 kernel_status=status_lbl, needs_new_kernel=needs_new,
+                is_shipping_abi=not needs_new,
+                persistent_whole_die=bool(node.persistent_whole_die or is_megamoe),
+                formula_eval=eval_res,
                 gap_us=max(0.0, t_after - node.l_star_lean_us),
                 gap_ratio=(t_after / node.l_star_lean_us) if node.l_star_lean_us > 0.0 else None,
                 roofline_efficiency=eff,
@@ -3353,7 +3283,13 @@ def _apply_pillar23_envelopes(
                 binding_state="unbound_formula_projection",
             ))
         else:
-            out.append(replace(node, kernel_status=STATUS_AT_FLOOR, needs_new_kernel=False))
+            out.append(replace(
+                node,
+                kernel_status=STATUS_AT_FLOOR,
+                needs_new_kernel=bool(node.needs_new_kernel),
+                is_shipping_abi=not bool(node.needs_new_kernel),
+                persistent_whole_die=bool(node.persistent_whole_die or is_megamoe),
+            ))
     return out
 
 
@@ -3531,6 +3467,353 @@ def _reconcile_oneshot_link_ledger(
     return out_nodes, out_dems
 
 
+def _classify_moe_frame_role(node: TargetOpNode) -> str | None:
+    if is_shared_expert_op_id(node.op_id):
+        return "shared"
+    fam = str(node.family or "").strip().lower()
+    oid = str(node.op_id or "").strip().lower()
+    if fam in {"dispatch", "alltoall", "alltoallv"} or ".dispatch" in oid:
+        return "dispatch"
+    if fam == "combine" or ".combine" in oid:
+        return "combine"
+    if fam == "grouped_gemm" or ".expert_" in oid:
+        return "gmm"
+    return None
+
+
+def _has_external_cycle_bridge(
+    arch_nodes: Sequence[TargetOpNode], member_occs: frozenset[OpOccurrence],
+) -> bool:
+    preds_by_occ = {n.occurrence: n.predecessors for n in arch_nodes}
+    ext_after_member: set[OpOccurrence] = set()
+    changed = True
+    while changed:
+        changed = False
+        for node in arch_nodes:
+            occ = node.occurrence
+            if occ in member_occs or occ in ext_after_member:
+                continue
+            if any(p in member_occs or p in ext_after_member for p in preds_by_occ.get(occ, ())):
+                ext_after_member.add(occ)
+                changed = True
+    return any(
+        p in ext_after_member
+        for node in arch_nodes if node.occurrence in member_occs
+        for p in node.predecessors
+    )
+
+
+def _collapse_moe_archetype_group(
+    members: Sequence[TargetOpNode],
+    member_dems: Sequence[tuple[int, int, int, int, int]],
+    decision: MoERouteDecision,
+    floors: SkuTargetFloors,
+    p0: Mapping[str, Any],
+    *,
+    level: int,
+) -> tuple[TargetOpNode, tuple[int, int, int, int, int], dict[str, Any]]:
+    first = members[0]
+    member_occs = frozenset(m.occurrence for m in members)
+    combines = [m for m in members if _classify_moe_frame_role(m) == "combine"]
+    last_combine = combines[-1] if combines else members[-1]
+    raw_read = sum(float(m.hbm_read_bytes) for m in members)
+    raw_write = sum(float(m.hbm_write_bytes) for m in members)
+    internal_writes = sum(float(m.hbm_write_bytes) for m in members if m.occurrence != last_combine.occurrence)
+    elided_act = min(raw_read, raw_write, internal_writes)
+    fused_read = max(0.0, raw_read - elided_act)
+    fused_write = max(0.0, raw_write - elided_act)
+    fused_hbm = fused_read + fused_write
+    fused_flops = sum(float(m.flops) for m in members)
+    fused_vec = sum(float(m.vector_ops) for m in members)
+    fused_mte2 = max(0.0, sum(float(m.mte2_bytes) for m in members) - elided_act)
+    fused_mte3 = max(0.0, sum(float(m.mte3_bytes) for m in members) - elided_act)
+    fused_fix = sum(float(m.fixpipe_bytes) for m in members)
+    fused_link = sum(float(m.link_bytes) for m in members)
+
+    cube_peak = float(p0.get("cube_peak_flops_per_s") or 0.0)
+    vec_peak = float(p0.get("vector_peak_ops_per_s") or 0.0)
+    hbm_peak = float(p0.get("hbm_peak_bytes_per_s") or 0.0)
+    link_peak = float(p0.get("link_peak_bytes_per_s") or 0.0)
+    cube_ns = int(fused_flops * NS_PER_SECOND / cube_peak) if cube_peak > 0.0 else sum(d[0] for d in member_dems)
+    vec_ns = int(fused_vec * NS_PER_SECOND / vec_peak) if vec_peak > 0.0 else sum(d[1] for d in member_dems)
+    hbm_ns = int(fused_hbm * NS_PER_SECOND / hbm_peak) if hbm_peak > 0.0 else sum(d[2] for d in member_dems)
+    link_ns = int(fused_link * NS_PER_SECOND / link_peak) if link_peak > 0.0 else sum(d[4] for d in member_dems)
+    fused_dem = (cube_ns, vec_ns, hbm_ns, 0, link_ns)
+
+    l_star_us = float(max(fused_dem)) / NS_PER_US
+    fused_dur_us = max(l_star_us, float(floors.launch_cube_us) + float(floors.mc2_sync_us))
+    raw_dur_us = sum(float(m.dur_us) for m in members)
+    ext_preds = tuple(dict.fromkeys(p for m in members for p in m.predecessors if p not in member_occs))
+    dom_map = (("cube_bound", cube_ns), ("vector_bound", vec_ns), ("memory_bound", hbm_ns), ("link_bound", link_ns))
+    dom_bound = max(dom_map, key=lambda kv: kv[1])[0]
+    eff = min(1.0, l_star_us / fused_dur_us) if (fused_dur_us > 0.0 and l_star_us > 0.0) else None
+    new_oid = f"{first.archetype_id}.fused_moe_l{level}"
+    new_occ = replace(first.occurrence, op_id=new_oid)
+    bstate: BindingState = "unbound_formula_projection" if decision.needs_new_kernel else "bound_implementation"
+    kstatus = STATUS_EXTEND_ABI if decision.needs_new_kernel else STATUS_AT_FLOOR
+
+    fused_node = replace(
+        first,
+        occurrence=new_occ, op_id=new_oid, family="moe", recipe=decision.abi_id,
+        stream="main", stream_index=0, task_type="MIX", predecessors=ext_preds,
+        dur_us=fused_dur_us, exposed_dur_us=fused_dur_us, is_overlapped=False, masked_by="",
+        flops=fused_flops, vector_ops=fused_vec, hbm_read_bytes=fused_read, hbm_write_bytes=fused_write,
+        hbm_total_bytes=fused_hbm, mte2_bytes=fused_mte2, mte3_bytes=fused_mte3,
+        fixpipe_bytes=fused_fix, link_bytes=fused_link, dominant_bound=dom_bound,
+        l_star_lean_us=l_star_us, gap_us=max(0.0, fused_dur_us - l_star_us),
+        gap_ratio=(fused_dur_us / l_star_us) if l_star_us > 0.0 else None,
+        roofline_efficiency=eff,
+        opt_attainment_pct=round(eff * PERCENT_SCALE, 1) if eff is not None else None,
+        absorbed_source_ops=tuple(m.op_id for m in members),
+        ascend_kernel=decision.abi_id, kernel_backend=BACKEND_CANN_LABEL, kernel_status=kstatus,
+        needs_new_kernel=decision.needs_new_kernel, binding_state=bstate,
+        is_shipping_abi=decision.is_shipping_abi, persistent_whole_die=True,
+        opt_pillar="Pillar-1/MC2",
+    )
+    receipt = {
+        "edit_id": f"{first.archetype_id}_moe_fused_mc2_l{level}",
+        "opcode": "MoERouteFusion",
+        "archetype_id": first.archetype_id,
+        "repeat_count": int(first.repeat_count),
+        "input_occurrences": [m.op_id for m in members],
+        "output_occurrences": [new_oid],
+        "abi_id": decision.abi_id,
+        "needs_new_kernel": bool(decision.needs_new_kernel),
+        "is_shipping_abi": bool(decision.is_shipping_abi),
+        "stream_core_budget": "",
+        "before_us": round(raw_dur_us, 3),
+        "after_us": round(fused_dur_us, 3),
+        "saved_us": round(max(0.0, raw_dur_us - fused_dur_us), 3),
+    }
+    return fused_node, fused_dem, receipt
+
+
+def _build_fused_moe_candidate(
+    nodes: Sequence[TargetOpNode],
+    demands: Sequence[tuple[int, int, int, int, int]],
+    case: Case,
+    floors: SkuTargetFloors,
+    p0: Mapping[str, Any],
+    *,
+    locked_ids: set[str],
+    collective_plans: Mapping[OpOccurrence, tuple[Any, float]],
+    allow_unbound_formula: bool,
+    level: int,
+) -> tuple[list[TargetOpNode], list[tuple[int, int, int, int, int]], MoERouteDecision, list[dict[str, Any]]] | None:
+    """Build a legal persistent whole-die ``fused_mc2`` candidate from discrete MoE frames."""
+    if not any(_classify_moe_frame_role(n) == "dispatch" for n in nodes):
+        return None
+    decision = moe_route_legality(
+        case, enable_fused_mc2=level, multistream_overlap_shared_expert=False,
+        nodes=nodes, allow_unbound_formula=allow_unbound_formula,
+    )
+    if not decision.legal:
+        return None
+
+    by_arch: dict[str, list[int]] = defaultdict(list)
+    for i, node in enumerate(nodes):
+        by_arch[node.archetype_id].append(i)
+
+    consumed: set[int] = set()
+    replacements: dict[int, tuple[TargetOpNode, tuple[int, int, int, int, int]]] = {}
+    remap: dict[OpOccurrence, OpOccurrence] = {}
+    receipts: list[dict[str, Any]] = []
+
+    for idxs in by_arch.values():
+        arch_nodes = [nodes[i] for i in idxs]
+        if any(is_persistent_whole_die_node(n) for n in arch_nodes):
+            continue
+        roles = {i: _classify_moe_frame_role(nodes[i]) for i in idxs}
+        routed = [
+            i for i in idxs
+            if roles[i] in {"dispatch", "gmm", "combine"}
+            and nodes[i].op_id not in locked_ids
+            and nodes[i].occurrence not in collective_plans
+        ]
+        found_roles = {roles[i] for i in routed}
+        if not {"dispatch", "gmm", "combine"} <= found_roles:
+            continue
+        frame = list(routed)
+        if level == FUSED_MC2_SHARED_LEVEL:
+            shared = [
+                i for i in idxs
+                if roles[i] == "shared" and nodes[i].op_id not in locked_ids
+                and nodes[i].occurrence not in collective_plans
+            ]
+            frame.extend(shared)
+            frame.sort()
+        member_occs = frozenset(nodes[i].occurrence for i in frame)
+        if _has_external_cycle_bridge(arch_nodes, member_occs):
+            continue
+        fused_node, fused_dem, rec = _collapse_moe_archetype_group(
+            [nodes[i] for i in frame], [demands[i] for i in frame], decision, floors, p0, level=level,
+        )
+        consumed.update(frame)
+        replacements[frame[0]] = (fused_node, fused_dem)
+        receipts.append(rec)
+        for i in frame:
+            remap[nodes[i].occurrence] = fused_node.occurrence
+
+    if not replacements:
+        return None
+    out_nodes: list[TargetOpNode] = []
+    out_dems: list[tuple[int, int, int, int, int]] = []
+    for i, (node, dem) in enumerate(zip(nodes, demands)):
+        if i in replacements:
+            out_nodes.append(replacements[i][0])
+            out_dems.append(replacements[i][1])
+        elif i not in consumed:
+            if int(node.stream_index) == 1 and is_shared_expert_op_id(node.op_id):
+                node = replace(node, stream="main", stream_index=0)
+            out_nodes.append(node)
+            out_dems.append(dem)
+    return _rewire_node_preds(out_nodes, remap), out_dems, decision, receipts
+
+
+def _select_best_moe_and_die_schedule(
+    enveloped: Sequence[TargetOpNode],
+    demands: Sequence[tuple[int, int, int, int, int]],
+    case: Case,
+    floors: SkuTargetFloors,
+    p0: Mapping[str, Any],
+    *,
+    locked_ids: set[str],
+    collective_plans: Mapping[OpOccurrence, tuple[Any, float]],
+    topology: Topology | None,
+    primitive_table: Any,
+    allow_unbound_formula: bool,
+) -> tuple[DieScheduleResult, list[tuple[int, int, int, int, int]], MoERouteDecision | None, list[dict[str, Any]]]:
+    """Enforce MoE mutex and pick the lowest-makespan legal MoE + core-split schedule on Engine."""
+    col_plans = collective_plans or None
+
+    def _run_die_engine(cand_nodes: Sequence[TargetOpNode]) -> DieScheduleResult:
+        shared = schedule_target_graph_on_engine(
+            cand_nodes, case, collective_plans=col_plans, topology=topology,
+            primitive_table=primitive_table, launch_floor_us=floors.launch_vec_us,
+        )
+        return evaluate_disjoint_core_budgets(
+            cand_nodes, case, shared_result=shared, collective_plans=col_plans,
+            topology=topology, primitive_table=primitive_table, launch_floor_us=floors.launch_vec_us,
+        )
+
+    base_nodes, base_moe = enforce_moe_mutex_on_nodes(
+        enveloped, case, allow_unbound_formula=allow_unbound_formula,
+    )
+    best_sched = _run_die_engine(base_nodes)
+    best_dems = list(demands)
+    best_moe = base_moe
+    best_receipts: list[dict[str, Any]] = []
+    best_w = weighted_step_span_us(best_sched.nodes)
+
+    if base_moe is None or any(is_persistent_whole_die_node(n) for n in base_nodes):
+        return best_sched, best_dems, best_moe, best_receipts
+
+    mso_leg = moe_route_legality(
+        case, enable_fused_mc2=0, multistream_overlap_shared_expert=True,
+        nodes=base_nodes, allow_unbound_formula=allow_unbound_formula,
+    )
+    if mso_leg.legal:
+        mso_nodes = build_discrete_mso_candidate_nodes(base_nodes)
+        if mso_nodes is not None and any(
+            int(n.stream_index) != int(b.stream_index) for n, b in zip(mso_nodes, base_nodes)
+        ) and not any(
+            n.op_id in locked_ids and int(n.stream_index) != int(b.stream_index)
+            for n, b in zip(mso_nodes, base_nodes)
+        ):
+            mso_sched = _run_die_engine(mso_nodes)
+            mso_w = weighted_step_span_us(mso_sched.nodes)
+            if mso_w + SAVING_POSITIVE_EPS_US < best_w:
+                moved_ops = [n.op_id for n, b in zip(mso_nodes, base_nodes) if int(n.stream_index) != int(b.stream_index)]
+                best_receipts = [{
+                    "edit_id": "moe_discrete_mso_stream1",
+                    "opcode": "MoERouteMSO",
+                    "archetype_id": "step",
+                    "repeat_count": 1,
+                    "input_occurrences": moved_ops,
+                    "output_occurrences": moved_ops,
+                    "abi_id": mso_leg.abi_id,
+                    "needs_new_kernel": False,
+                    "is_shipping_abi": True,
+                    "stream_core_budget": mso_sched.stream_core_budget_summary,
+                    "before_us": round(best_w, 3),
+                    "after_us": round(mso_w, 3),
+                    "saved_us": round(max(0.0, best_w - mso_w), 3),
+                }]
+                best_sched, best_dems, best_moe, best_w = mso_sched, list(demands), mso_leg, mso_w
+
+    for lvl in (FUSED_MC2_SHARED_LEVEL, FUSED_MC2_ROUTED_LEVEL, 1):
+        fused_cand = _build_fused_moe_candidate(
+            base_nodes, demands, case, floors, p0, locked_ids=locked_ids,
+            collective_plans=collective_plans, allow_unbound_formula=allow_unbound_formula, level=lvl,
+        )
+        if fused_cand is None:
+            continue
+        f_nodes, f_dems, f_dec, f_recs = fused_cand
+        f_sched = _run_die_engine(f_nodes)
+        f_w = weighted_step_span_us(f_sched.nodes)
+        if f_w + SAVING_POSITIVE_EPS_US < best_w:
+            best_sched, best_dems, best_moe, best_receipts, best_w = f_sched, f_dems, f_dec, f_recs, f_w
+
+    return best_sched, best_dems, best_moe, best_receipts
+
+
+def _build_applied_edit_receipts(
+    final_plan: RewritePlan,
+    specs: Sequence[KernelSynthesisSpec],
+    indexed_nodes: Sequence[TargetOpNode],
+    die_sched: DieScheduleResult,
+    extra_receipts: Sequence[dict[str, Any]],
+) -> tuple[dict[str, Any], ...]:
+    """Emit structured producer receipts for verified rewrite, MoE, and core-split edits."""
+    node_by_id = {n.op_id: n for n in indexed_nodes}
+    spec_by_out: dict[str, KernelSynthesisSpec] = {
+        s.constituent_op_ids[0]: s for s in specs if s.constituent_op_ids
+    }
+    receipts: list[dict[str, Any]] = []
+    for edit in final_plan.edits:
+        in_ops = [ref.op_id for ref in getattr(edit, "members", ())] or (
+            [edit.target.op_id] if hasattr(edit, "target") and hasattr(edit.target, "op_id") else []
+        )
+        out_id = str(getattr(edit, "fused_op_id", "") or (in_ops[0] if in_ops else ""))
+        node = node_by_id.get(out_id)
+        kspec = spec_by_out.get(in_ops[0]) if in_ops else None
+        before_us = float(kspec.before_us) if kspec is not None else (float(node.dur_us) if node is not None else 0.0)
+        after_us = float(node.dur_us) if node is not None else (float(kspec.target_us) if kspec is not None else 0.0)
+        receipts.append({
+            "edit_id": str(edit.edit_id),
+            "opcode": type(edit).__name__,
+            "archetype_id": str(node.archetype_id) if node is not None else "",
+            "repeat_count": int(node.repeat_count) if node is not None else 1,
+            "input_occurrences": list(in_ops),
+            "output_occurrences": [out_id] if out_id else [],
+            "abi_id": str((node.ascend_kernel if node is not None else "") or (kspec.abi_signature_id if kspec is not None else "")),
+            "needs_new_kernel": bool(node.needs_new_kernel) if node is not None else False,
+            "is_shipping_abi": bool(node.is_shipping_abi) if node is not None else True,
+            "stream_core_budget": die_sched.stream_core_budget_summary,
+            "before_us": round(before_us, 3),
+            "after_us": round(after_us, 3),
+            "saved_us": round(max(0.0, before_us - after_us), 3),
+        })
+    receipts.extend(dict(r) for r in extra_receipts)
+    if die_sched.stream_core_budget_summary and "disjoint" in die_sched.stream_core_budget_summary:
+        receipts.append({
+            "edit_id": "die_stream_core_budget_disjoint",
+            "opcode": "StreamCoreBudget",
+            "archetype_id": "step",
+            "repeat_count": 1,
+            "input_occurrences": [],
+            "output_occurrences": [],
+            "abi_id": "stream_core_budget_disjoint",
+            "needs_new_kernel": False,
+            "is_shipping_abi": True,
+            "stream_core_budget": die_sched.stream_core_budget_summary,
+            "before_us": 0.0,
+            "after_us": round(float(die_sched.step_span_us), 3),
+            "saved_us": 0.0,
+        })
+    return tuple(receipts)
+
+
 def solve_target_graph(
     nodes: Sequence[TargetOpNode],
     demands: Sequence[tuple[int, int, int, int, int]],
@@ -3546,7 +3829,7 @@ def solve_target_graph(
     stack_id: str | None = None,
     scenario_case: Case | None = None,
 ) -> SolvedTargetGraph:
-    """Solve target-state graph via Tier-P2 algebra + canonical ``apply_plan``/``verify_plan``."""
+    """Solve target-state graph via Tier-P2 algebra + Die + Topology contention Engine."""
     floors = extract_sku_floors(case, primitive_table=primitive_table)
     die = case.machine.dies[0]
     ub_edges = ub_peer_edges_for_rank(die.rank, case.machine.links, case.machine.transfer_channels)
@@ -3647,11 +3930,13 @@ def solve_target_graph(
             enveloped, all_dems, collective_plans, peaks_by_stage, p0,
         )
     _, _, topology, _ = pricing_ctx.ensure() if collective_plans else (None, None, None, False)
-    scheduled = reschedule_node_timelines(
-        enveloped, collective_plans=collective_plans or None, topology=topology,
+    die_sched, final_dems, moe_dec, extra_receipts = _select_best_moe_and_die_schedule(
+        enveloped, all_dems, case, floors, p0, locked_ids=locked_ids,
+        collective_plans=collective_plans, topology=topology,
+        primitive_table=primitive_table, allow_unbound_formula=allow_unbound_formula,
     )
-    attributed, arch_spans = attribute_node_overlap(scheduled)
-    indexed = tuple(replace(n, ordinal=idx) for idx, n in enumerate(attributed))
+    indexed = tuple(replace(n, ordinal=idx) for idx, n in enumerate(die_sched.nodes))
+    edit_receipts = _build_applied_edit_receipts(final_plan, all_specs, indexed, die_sched, extra_receipts)
     unbound_ops = tuple(n.op_id for n in indexed if n.binding_state == "unbound_formula_projection")
     has_unbound = bool(unbound_ops)
     if not allow_unbound_formula and has_unbound:
@@ -3660,8 +3945,8 @@ def solve_target_graph(
 
     return SolvedTargetGraph(
         nodes=indexed,
-        demands_ns=tuple(all_dems),
-        archetype_spans_us=arch_spans,
+        demands_ns=tuple(final_dems),
+        archetype_spans_us=die_sched.archetype_spans_us,
         synthesis_specs=tuple(all_specs),
         semantic_audit_triggers=tuple(all_triggers),
         applied_plan=final_plan,
@@ -3671,6 +3956,13 @@ def solve_target_graph(
         has_unbound_formula_ops=has_unbound,
         binding_state=graph_state,
         unbound_formula_ops=unbound_ops,
+        applied_edit_receipts=edit_receipts,
+        stream_core_budget=die_sched.stream_core_budget,
+        stream_core_budget_summary=die_sched.stream_core_budget_summary,
+        moe_route=moe_dec.to_dict() if moe_dec is not None else {},
+        step_start_us=die_sched.step_start_us,
+        step_end_us=die_sched.step_end_us,
+        step_span_us=die_sched.step_span_us,
     )
 
 
