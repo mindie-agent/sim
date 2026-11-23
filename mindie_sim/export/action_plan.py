@@ -44,6 +44,7 @@ MAX_ROADMAP_KERNEL_ITEMS = 8
 CARD_SLUG_MAX_LEN = 44
 CARD_DIGEST_HEX_LEN = 6
 SUB_MS_DISPLAY_THRESHOLD = 0.001
+NEW_KERNEL_MIN_SAVED_MS = SUB_MS_DISPLAY_THRESHOLD
 MIN_FUSION_MEMBERS = 2
 MAX_SOURCE_REF_SUMMARY_LEN = 160
 MAX_ROLES_IN_CHAIN = 3
@@ -55,7 +56,7 @@ _SLUG_RE = re.compile(r"[^a-z0-9]+")
 _ARCH_FAMILY_A5_TOKENS = ("950", "a5", "3510")
 _ARCH_FAMILY_A3_TOKENS = ("910_93", "910c", "a3", "9392", "9382", "9372", "9362", "9391", "9381")
 _ARCH_FAMILY_A2_TOKENS = ("910b", "a2", "310p", "300i")
-_INTERNAL_EFFECTIVE_KEYS = frozenset({"solver_feasible"})
+_INTERNAL_EFFECTIVE_KEYS = frozenset({"solver_feasible", "feature_track", "moe_route"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -150,7 +151,18 @@ def _short_arch_name(title: str) -> str:
 
 
 def _public_effective_config(bundle: ExportBundle) -> dict[str, Any]:
-    return {k: v for k, v in dict(bundle.effective_config or {}).items() if k not in _INTERNAL_EFFECTIVE_KEYS}
+    raw = dict(bundle.effective_config or {})
+    out: dict[str, Any] = {}
+    moe_route = raw.get("moe_route")
+    if isinstance(moe_route, Mapping):
+        for sub_k in ("enable_fused_mc2", "multistream_overlap_shared_expert"):
+            if sub_k in moe_route and sub_k not in raw and moe_route[sub_k] is not None:
+                out[sub_k] = moe_route[sub_k]
+    for k, v in raw.items():
+        if k in _INTERNAL_EFFECTIVE_KEYS or isinstance(v, (Mapping, list, tuple, set)):
+            continue
+        out[k] = v
+    return out
 
 
 def _is_same_deployment_config(before: ExportBundle, after: ExportBundle) -> bool:
@@ -596,6 +608,32 @@ def _build_track_a_rows(before_bundle: ExportBundle, after_bundle: ExportBundle,
     return []
 
 
+def _qualify_action_groups(
+    groups: Mapping[str, dict[str, Any]],
+    *,
+    is_comparison: bool,
+    check_gap_when_single: bool,
+    min_saved_ms: float = TUNE_MIN_SAVED_MS,
+) -> tuple[list[dict[str, Any]], set[str]]:
+    qualified: list[dict[str, Any]] = []
+    qualified_keys: set[str] = set()
+    threshold = float(min_saved_ms) - TUNE_THRESHOLD_TOL_MS
+    for key, entry in groups.items():
+        if is_comparison:
+            net_ok = float(entry["gain_ms"]) >= threshold and float(entry["gain_upt"]) > 0.0
+            split_ok = (not entry["has_split"]) or (
+                float(entry["attr_gain_ms"]) >= threshold
+                and float(entry["attr_gain_upt"]) > 0.0
+            )
+            if net_ok and split_ok:
+                qualified.append(entry)
+                qualified_keys.add(key)
+        elif (not check_gap_when_single) or float(entry["gap_ms"]) >= threshold:
+            qualified.append(entry)
+            qualified_keys.add(key)
+    return qualified, qualified_keys
+
+
 def build_comparison_plan(
     before_bundle: ExportBundle, after_bundle: ExportBundle | None, aligned_rows: Sequence[AlignedComparisonRow],
     *, top_k_optimize: int = MAX_DISPLAY_CARDS, include_to_optimize: bool = True, script_audit: Any = None,
@@ -648,17 +686,14 @@ def build_comparison_plan(
             "cfg_ms": cfg_ms, "cfg_upt": cfg_upt, "kern_ms": kern_ms, "kern_upt": kern_upt, "reason": reason,
         })
 
-    qualified_new, qualified_tune, qualified_tune_keys = list(new_groups.values()), [], set()
-    for key, entry in tune_groups.items():
-        if is_comparison:
-            net_ok = float(entry["gain_ms"]) >= TUNE_MIN_SAVED_MS - TUNE_THRESHOLD_TOL_MS and float(entry["gain_upt"]) > 0.0
-            split_ok = (not entry["has_split"]) or (float(entry["attr_gain_ms"]) >= TUNE_MIN_SAVED_MS - TUNE_THRESHOLD_TOL_MS and float(entry["attr_gain_upt"]) > 0.0)
-            if net_ok and split_ok:
-                qualified_tune.append(entry)
-                qualified_tune_keys.add(key)
-        elif float(entry["gap_ms"]) >= TUNE_MIN_SAVED_MS - TUNE_THRESHOLD_TOL_MS:
-            qualified_tune.append(entry)
-            qualified_tune_keys.add(key)
+    qualified_new, qualified_new_keys = _qualify_action_groups(
+        new_groups, is_comparison=is_comparison, check_gap_when_single=False,
+        min_saved_ms=NEW_KERNEL_MIN_SAVED_MS,
+    )
+    qualified_tune, qualified_tune_keys = _qualify_action_groups(
+        tune_groups, is_comparison=is_comparison, check_gap_when_single=True,
+        min_saved_ms=TUNE_MIN_SAVED_MS,
+    )
 
     card_id_by_key = _assign_deterministic_card_ids([*qualified_new, *qualified_tune])
     ordered_new = sorted(qualified_new, key=lambda e: (-float(e["gain_upt"]), -float(e["gain_ms"]), card_id_by_key[e["kernel_key"]]))
@@ -675,7 +710,10 @@ def build_comparison_plan(
     for rec in prelim_rows:
         bucket: Literal["config", "new", "tune", "residual"] = rec["cand_bucket"]
         gkey = rec["group_key"]
-        if bucket == "tune" and gkey not in qualified_tune_keys:
+        if bucket == "new" and gkey not in qualified_new_keys:
+            bucket, cfg_ms, cfg_upt, kern_ms, kern_upt = "residual", 0.0, 0.0, rec["saved_ms"], rec["saved_upt"]
+            reason, cid, cat = "below_materiality_threshold", "", PENDING_KIND_AT_FLOOR
+        elif bucket == "tune" and gkey not in qualified_tune_keys:
             bucket, cfg_ms, cfg_upt, kern_ms, kern_upt = "residual", 0.0, 0.0, rec["saved_ms"], rec["saved_upt"]
             reason, cid, cat = "below_tuning_threshold", "", PENDING_KIND_AT_FLOOR
         else:

@@ -200,6 +200,8 @@ def _update_additional(rt: dict[str, Any], **entries: Any) -> None:
 
 
 def _apply_torch_compile_support(rt: dict[str, Any], ctx: MechanismContext) -> None:
+    if "enable_torch_compile" in ctx.caller_explicit:
+        return
     rt["enable_torch_compile"] = True
     meta = dict(rt.get("metadata") or {})
     meta["enable_torch_compile"] = True
@@ -286,8 +288,16 @@ def _apply_step5_qkvg_indexer(rt: dict[str, Any], _ctx: MechanismContext) -> Non
     _update_meta(rt, flash_attn_npu_3=True, packed_qkvg_indexer=True)
 
 
-def _apply_dspark_static_kernel(rt: dict[str, Any], _ctx: MechanismContext) -> None:
-    _update_additional(rt, enable_static_kernel=True, enable_super_kernel=True)
+def _apply_dspark_static_kernel(rt: dict[str, Any], ctx: MechanismContext) -> None:
+    if "enable_static_kernel" not in ctx.caller_explicit:
+        rt["enable_static_kernel"] = True
+    if "enable_super_kernel" not in ctx.caller_explicit:
+        rt["enable_super_kernel"] = True
+    _update_additional(
+        rt,
+        enable_static_kernel=bool(rt.get("enable_static_kernel", True)),
+        enable_super_kernel=bool(rt.get("enable_super_kernel", True)),
+    )
 
 
 def _apply_dsv41_epilogue(rt: dict[str, Any], _ctx: MechanismContext) -> None:

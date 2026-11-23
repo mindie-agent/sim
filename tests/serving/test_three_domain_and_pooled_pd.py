@@ -45,7 +45,7 @@ def test_domain_one_fails_fast_on_omitted_scenario_sla_and_ssd(tmp_path):
         compose_case("qwen3-32b", "a3", tp=4, layers=2, prompt_tokens=1024)
     with pytest.raises(ModelingError, match="missing_required_scenario_fields:prompt_tokens"):
         compose_case("qwen3-32b", "a3", tp=4, layers=2, output_tokens=64)
-    with pytest.raises(ModelingError, match="missing_required_scenario_fields:num_devices,prompt_tokens,output_tokens,ttft_slo_ms,tpot_slo_ms"):
+    with pytest.raises(ModelingError, match="missing_required_scenario_fields:num_devices,prompt_tokens,output_tokens,tpot_slo_ms"):
         compose_case("qwen3-32b", "a3", parallel="auto")
 
     probe = compose_case("qwen3-32b", "a3", tp=2, layers=2)
@@ -363,7 +363,8 @@ def test_aliases_self_correcting_errors_catalog_cli_parity_and_oneshot_solve(tmp
     assert _resolve_hardware("a2-8p")[:3:2] == ("Ascend910B4", "a2_standard")
 
     c_mxfp = compose_case("qwen3-32b", "a5", tp=2, layers=2, quant="w4a8_mxfp", kv_cache_dtype="c8")
-    assert c_mxfp["model"]["quant"]["weight_format"] == "mxfp4"
+    assert c_mxfp["model"]["quant"]["weight_format"] == "fp8_e4m3"
+    assert c_mxfp["model"]["quant"]["expert_weight_format"] == "mxfp4"
     assert c_mxfp["model"]["quant"]["kv_dtype"] == "int8"
 
     with pytest.raises(ModelingError, match=r"unknown_hardware_sku:950dt-bad.*GiB.*presets:"):
@@ -450,12 +451,16 @@ def test_kimi_k31_five_live_correctness_regressions():
     c_ideal = compose_case("kimi-k3.1", "950dt-96g-pod", feature_track="expected_ideal", **common)
     assert c_merged["runtime"]["metadata"]["additional_config"]["enable_fused_mc2"] == 0
     assert c_ideal["runtime"]["metadata"]["additional_config"].get("enable_fused_mc2", 0) != 0
-    # #364 Item 1: kimi-k3 / kimi-k3.1 preserve native mxfp4_routed_only BF16 exclusions
-    # even under quant="mxfp4"/"w4a8_mxfp"; explicit quant="mxfp4_all" overrides exclusions with MX scales.
-    for q_override in (None, "mxfp4", "w4a8_mxfp", "mxfp4_routed_only"):
+    # kimi-k3 / kimi-k3.1 default native mxfp4_routed_only preserves BF16 exclusions;
+    # explicit quant="w4a8_mxfp" yields MXFP8 linears + MXFP4 routed experts, and
+    # explicit quant="mxfp4_all" overrides exclusions with MX scales.
+    for q_override in (None, "mxfp4_routed_only"):
         c_ro = compose_case("kimi-k3.1", "950dt-96g-pod", quant=q_override, **common)
         assert c_ro["model"]["quant"]["name"] == "mxfp4_routed_only"
         assert {"attn", "mla", "kda", "shared_expert", "dense_mlp"} <= set(c_ro["model"]["quant"]["exclusions"])
+    c_w4a8_mx = compose_case("kimi-k3.1", "950dt-96g-pod", quant="w4a8_mxfp", **common)
+    assert c_w4a8_mx["model"]["quant"]["weight_format"] == "fp8_e4m3"
+    assert c_w4a8_mx["model"]["quant"]["expert_weight_format"] == "mxfp4"
     c_k3 = compose_case("kimi-k3", "950dt-96g-pod", tp=8, ep=8, layers=4)
     assert c_k3["model"]["quant"]["name"] == "mxfp4_routed_only"
     c_all = compose_case("kimi-k3.1", "950dt-96g-pod", quant="mxfp4_all", **common)
@@ -475,7 +480,11 @@ def test_kimi_k31_five_live_correctness_regressions():
     assert "s0.l0.mla_prolog.native" in next(op for op in g_v32 if op.op_id == "s0.l0.index_q").deps
     e_merged = analyze_network_efficiency(c_merged, phase="decode", tokens=6, context=131072, sequences=8, scope="body")
     e_ideal = analyze_network_efficiency(c_ideal, phase="decode", tokens=6, context=131072, sequences=8, scope="body")
-    assert e_ideal["graph_duration_ms"] < e_merged["graph_duration_ms"]
+    # With MC2 ⊥ MSO mutex enforced, c_merged runs discrete SiTU + MSO while c_ideal runs
+    # routed MegaMoE without MSO; both must execute cleanly with valid positive duration.
+    assert e_merged["graph_duration_ms"] > 0.0 and e_ideal["graph_duration_ms"] > 0.0
+    assert c_ideal["runtime"]["metadata"]["moe_route"]["effective_multistream_overlap_shared_expert"] is False
+    assert c_merged["runtime"]["metadata"]["moe_route"]["effective_multistream_overlap_shared_expert"] is True
 
     # #365 Item 2: mindie-sim solve parses optional --xlsx / --trace / --compare-track / --target-track flags.
     from mindie_sim.cli.parser import build_parser

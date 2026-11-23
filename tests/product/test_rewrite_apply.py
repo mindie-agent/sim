@@ -213,7 +213,10 @@ def test_tile_cohort_and_collective_route_bind_to_physical_graph(dense, routed):
 
 
 def test_tile_cohort_admits_lowered_collective_protocol():
-    case = compose_case("deepseek-v4-flash", REPRESENTATIVE_SKUS["a5"], tp=2, ep=2, layers=1)
+    case = compose_case(
+        "deepseek-v4-flash", REPRESENTATIVE_SKUS["a5"], tp=2, ep=2, layers=1,
+        enable_fused_mc2=0, exclude_optimizations=("cann_megamoe_fusion",),
+    )
     scenario = resolve_scenario(case, StepRequest("decode", tokens=4, context=64))
     dispatch = next(op for op in scenario.atomic_ops[0].ops
                     if op.family == "mc2_protocol" and op.op_id.endswith(".dispatch"))

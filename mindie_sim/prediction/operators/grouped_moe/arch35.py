@@ -178,7 +178,7 @@ def _validate(op, ctx, contract):
             raise capability_gap(op, ctx, f"arch35_dequant_input:{contract.handoff_dtype}")
 
 
-def _fit_ub(contract, ctx):
+def fit_ub(contract, ctx):
     """Reserve the largest AIV share of a handoff and leave room for DBO credits."""
     capacity = ctx.datapath.usable_bytes("ub")
     if contract.enable_dbo:
@@ -205,7 +205,7 @@ def _fit_ub(contract, ctx):
 
 def _gated_stages(contract, ctx, name, after, metadata, *, start_core=0, owner_ready=None):
     """Lower paired MMADs with a UB credit and an AIV acknowledgement per tile."""
-    tiled, slot_bytes = _fit_ub(contract, ctx)
+    tiled, slot_bytes = fit_ub(contract, ctx)
     n_alignment = MX_SCALE_GROUP_SIZE if contract.uses_mx_scales else 1
     schedule = matrix_schedule(tiled, ctx, contract.group_rows, contract.intermediate,
                                contract.k, start_core=start_core, n_tail_alignment=n_alignment)

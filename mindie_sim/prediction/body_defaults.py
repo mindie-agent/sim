@@ -600,6 +600,72 @@ def _attnres_default(case, phase, kernels):
             "reason": reason or "supported_tensor_and_resource_geometry"}
 
 
+def _dense_mla_default(case, phase, tokens, dense_mla, *, kernels, pipes, parallel):
+    from mindie_sim.prediction.operators.paged_mla import paged_mla, paged_mla_membase
+    recipes, lowerings = kernels["recipes"], kernels["lowerings"]
+    explicit = ("attention" in kernels.get("families", {}) or "mla_attention" in recipes
+                or any(k in lowerings for k in ("paged_mla_attention", "mla_decode")))
+    arch_family = case.machine.arch_family
+    is_a5 = arch_family == "A5"
+    valid_heads = ((lambda h: 1 <= h <= MAX_PAGED_MLA_HEADS)
+                   if is_a5 else (lambda h: h > 0 and (1 << (h - 1).bit_length())
+                                  in ARCH22_PAGED_MLA_HEAD_CEILINGS))
+    page_tile = PAGED_MLA_A5_PAGE_TILE if is_a5 else ARCH22_PAGED_MLA_PAGE_TILE
+    req_buffers = paged_mla.BUFFERS if is_a5 else paged_mla_membase.BUFFERS
+    paired_pipes = all(
+        all(dict(d.buffers).get(pool, 0) >= needed for pool, needed in req_buffers.items())
+        and all(d.units(role) == d.compute_units * ratio for role, ratio in (
+            ("mte1", 1), ("mte2_aic", 1), ("fixpipe", 1),
+            ("vector", 2), ("mte2_aiv", 2), ("mte3", 2)))
+        for d in case.machine.dies
+    )
+    reason = ("explicit_implementation_preserved" if explicit else
+              "partitioned_attention_domain" if phase != "decode" and parallel.pcp != 1 else
+              "decode_profile_only" if phase != "decode" else
+              "independent_copy_pipes_not_declared" if not (pipes and paired_pipes) else
+              "partitioned_attention_domain" if parallel.cp != 1 else
+              "paged_mla_source_geometry_outside_reviewed_domain" if (
+                  arch_family not in PAGED_MLA_ARCH_FAMILIES
+                  or tokens != 1 or case.model.activation_dtype != "bf16"
+                  or case.model.quant.kv_dtype != "bf16"
+                  or case.runtime.kv_block_size < 1 or page_tile % case.runtime.kv_block_size != 0
+                  or any(p.window or p.noncausal_attention
+                         or (p.kv_lora_rank, p.qk_rope_head_dim) != PAGED_MLA_HEAD_GEOMETRY
+                         or not valid_heads(p.num_heads // max(parallel.tp, 1))
+                         for p in dense_mla)) else "")
+    if not reason:
+        domain = {"phases": ["decode"], "max_query_tokens": {"min": 1, "max": 1}, "sequences": {"min": 1}}
+        if is_a5:
+            binding = {"implementation": "ascend_paged_mla_decode_arch35",
+                       "options": {"dispatch": "source_split_core_v2"}}
+        else:
+            domain["min_context_tokens"] = {"min": ARCH22_PAGED_MLA_PAGE_TILE}
+            binding = {"implementation": "ascend_paged_mla_decode_arch22"}
+        lowerings["paged_mla_attention"] = {
+            "cases": [{"domain": domain, "binding": binding}],
+            "otherwise": "analytical",
+        }
+    a5_flash_eligible = bool(
+        is_a5 and parallel.pcp == 1
+        and case.model.activation_dtype in {"bf16", "fp16"}
+        and case.model.quant.kv_dtype in {"bf16", "fp16"}
+        and all(
+            not p.window and not p.noncausal_attention
+            and (p.kv_lora_rank, p.qk_rope_head_dim) == PAGED_MLA_HEAD_GEOMETRY
+            and (p.num_heads // max(parallel.tp, 1)) in FLASH_MLA_SUPPORTED_Q_HEADS
+            and ((p.num_heads // max(parallel.tp, 1)) * max(parallel.cp, 1)) in FLASH_MLA_SUPPORTED_Q_HEADS
+            for p in dense_mla
+        )
+    )
+    return {"family": "paged_mla_decode",
+            "selection": "preserved" if reason else "default_installed",
+            "reason": reason or "supported_tensor_and_resource_geometry",
+            **({"abi": "aclnnFlashMla", "native_kind": "FlashMla"}
+               if (is_a5 and (not reason or a5_flash_eligible))
+               else ({"abi": "aclnnFusedInferAttentionScore", "native_kind": "FusedInferAttentionScore"}
+                     if not reason else {}))}
+
+
 def attention_defaults(case, phase, *, tokens=1):
     prior_kernels = case.runtime.kernels or {}
     prior_keys = {
@@ -684,76 +750,9 @@ def attention_defaults(case, phase, *, tokens=1):
         records.append({"family": family, "selection": "preserved" if reason else "default_installed",
                         "reason": reason or "supported_tensor_and_resource_geometry"})
     if dense_mla:
-        from mindie_sim.prediction.operators.paged_mla import paged_mla, paged_mla_membase
-        explicit = ("attention" in kernels.get("families", {}) or "mla_attention" in recipes
-                    or any(k in lowerings for k in ("paged_mla_attention", "mla_decode")))
-        arch_family = case.machine.arch_family
-        is_a5 = arch_family == "A5"
-        # A5 keeps the source split-core v2 kernel for every integral local head
-        # count. A2/A3 use the page-tile kernel whose split-core domain is the
-        # power-of-two ceiling {8, 16}.
-        valid_heads = ((lambda h: 1 <= h <= MAX_PAGED_MLA_HEADS)
-                       if is_a5 else (lambda h: h > 0 and (1 << (h - 1).bit_length())
-                                      in ARCH22_PAGED_MLA_HEAD_CEILINGS))
-        page_tile = PAGED_MLA_A5_PAGE_TILE if is_a5 else ARCH22_PAGED_MLA_PAGE_TILE
-        req_buffers = paged_mla.BUFFERS if is_a5 else paged_mla_membase.BUFFERS
-        paired_pipes = all(
-            all(dict(d.buffers).get(pool, 0) >= needed for pool, needed in req_buffers.items())
-            and all(d.units(role) == d.compute_units * ratio for role, ratio in (
-                ("mte1", 1), ("mte2_aic", 1), ("fixpipe", 1),
-                ("vector", 2), ("mte2_aiv", 2), ("mte3", 2)))
-            for d in case.machine.dies
-        )
-        reason = ("explicit_implementation_preserved" if explicit else
-                  "partitioned_attention_domain" if phase != "decode" and parallel.pcp != 1 else
-                  "decode_profile_only" if phase != "decode" else
-                  "independent_copy_pipes_not_declared" if not (pipes and paired_pipes) else
-                  "partitioned_attention_domain" if parallel.cp != 1 else
-                  "paged_mla_source_geometry_outside_reviewed_domain" if (
-                      arch_family not in PAGED_MLA_ARCH_FAMILIES
-                      or tokens != 1 or case.model.activation_dtype != "bf16"
-                      or case.model.quant.kv_dtype != "bf16"
-                      or case.runtime.kv_block_size < 1 or page_tile % case.runtime.kv_block_size != 0
-                      or any(p.window or p.noncausal_attention
-                             or (p.kv_lora_rank, p.qk_rope_head_dim) != PAGED_MLA_HEAD_GEOMETRY
-                             or not valid_heads(p.num_heads // max(parallel.tp, 1))
-                             for p in dense_mla)) else "")
-        if not reason:
-            domain = {"phases": ["decode"],
-                      "max_query_tokens": {"min": 1, "max": 1},
-                      "sequences": {"min": 1}}
-            if is_a5:
-                binding = {"implementation": "ascend_paged_mla_decode_arch35",
-                           "options": {"dispatch": "source_split_core_v2"}}
-            else:
-                # The arch22 split-core tile needs a declared page-aligned
-                # context; a shorter context stays analytical instead of
-                # becoming a planner exception.
-                domain["min_context_tokens"] = {"min": ARCH22_PAGED_MLA_PAGE_TILE}
-                binding = {"implementation": "ascend_paged_mla_decode_arch22"}
-            lowerings["paged_mla_attention"] = {
-                "cases": [{"domain": domain, "binding": binding}],
-                "otherwise": "analytical",
-            }
-        a5_flash_eligible = bool(
-            is_a5 and parallel.pcp == 1
-            and case.model.activation_dtype in {"bf16", "fp16"}
-            and case.model.quant.kv_dtype in {"bf16", "fp16"}
-            and all(
-                not p.window and not p.noncausal_attention
-                and (p.kv_lora_rank, p.qk_rope_head_dim) == PAGED_MLA_HEAD_GEOMETRY
-                and (p.num_heads // max(parallel.tp, 1)) in FLASH_MLA_SUPPORTED_Q_HEADS
-                and ((p.num_heads // max(parallel.tp, 1)) * max(parallel.cp, 1)) in FLASH_MLA_SUPPORTED_Q_HEADS
-                for p in dense_mla
-            )
-        )
-        records.append({"family": "paged_mla_decode",
-                        "selection": "preserved" if reason else "default_installed",
-                        "reason": reason or "supported_tensor_and_resource_geometry",
-                        **({"abi": "aclnnFlashMla", "native_kind": "FlashMla"}
-                           if (is_a5 and (not reason or a5_flash_eligible))
-                           else ({"abi": "aclnnFusedInferAttentionScore", "native_kind": "FusedInferAttentionScore"}
-                                 if not reason else {}))})
+        records.append(_dense_mla_default(
+            case, phase, tokens, dense_mla, kernels=kernels, pipes=pipes, parallel=parallel,
+        ))
     gdn = _gdn_default(case, phase, tokens, kernels)
     if gdn is not None:
         records.append(gdn)

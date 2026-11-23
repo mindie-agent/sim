@@ -469,6 +469,29 @@ class Topology(_TopologyPlansMixin):
         """True when sealed P18 link capacity was calibrated on 2-phase AllReduce."""
         return bool(self._p18_link_bytes_per_ms > 0.0 and self._p18_measured_collective == "allreduce")
 
+    def p18_allreduce_rate_applies(
+        self,
+        collective: str,
+        group: tuple[int, ...],
+        *,
+        algorithm: str = "",
+        scope: str = "",
+    ) -> bool:
+        """True only when P18 AllReduce rate calibration priced this group's scope."""
+        del algorithm
+        if not self.has_calibrated_p18_allreduce_rate():
+            return False
+        if collective not in {"allreduce", "reduce_scatter"}:
+            return False
+        if not group or len(group) < 2:
+            return False
+        resolved_scope = scope or self.scope_for_group(group)
+        if resolved_scope == "cross_node" and self._p18_measured_scope in {"", "package", "node"}:
+            return False
+        if resolved_scope in {"package", "node"}:
+            return True
+        return bool(self._matches_p18_scope(group))
+
     def single_peer_flow_cap_bytes_per_ms(self, link_name: str) -> float | None:
         """Per-die SDMA rate cap on A3 switched HCCS_SW links without mutating link capacity."""
         if self._p18_link_bytes_per_ms <= 0.0 or self._dies_per_package < 2:

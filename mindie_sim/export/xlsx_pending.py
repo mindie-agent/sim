@@ -383,6 +383,57 @@ def _sheet2_spans_sum_formula(col_let: str, spans: Sequence[tuple[int, int]]) ->
     return f"=SUM({','.join(tokens)})"
 
 
+def _write_pending_index_totals(
+    ws: Worksheet,
+    pending_items: Sequence[PendingKernelItem],
+    target_bundle: ExportBundle,
+    *,
+    idx_data_start: int,
+    r_end: int,
+    r_tot: int,
+    is_comparison: bool,
+) -> None:
+    n_new = sum(1 for x in pending_items if x.category == PENDING_KIND_TO_IMPLEMENT)
+    n_tune = len(pending_items) - n_new
+    ws.set_cell(
+        r_tot, 1,
+        f"DISPLAYED CARDS SUBTOTAL ({n_new} 需新开发融合 + {n_tune} 现成算子调优 = {len(pending_items)} 项)",
+        style=STYLE_TOTAL_TEXT,
+    )
+    ws.merge_range(r_tot, 1, r_tot, PENDING_LABEL_MERGE_END)
+    ws.set_cell(
+        r_tot, PENDING_COL_GAIN,
+        sum(x.expected_gain_ms for x in pending_items),
+        formula=f"=SUM(G{idx_data_start}:G{r_end})",
+        style=STYLE_TOTAL_FLOAT3,
+    )
+    ws.set_cell(
+        r_tot, PENDING_COL_GAIN + 1,
+        "已展示高价值算子卡片小计（全网 100% 端到端对账见上方 Waterfall 表）",
+        style=STYLE_TOTAL_TEXT,
+    )
+    ws.merge_range(r_tot, PENDING_COL_GAIN + 1, r_tot, PENDING_COL_GAIN_UPT - 1)
+    ws.set_cell(
+        r_tot, PENDING_COL_GAIN_UPT,
+        sum(x.saved_us_per_tok_die for x in pending_items),
+        formula=f"=SUM(K{idx_data_start}:K{r_end})",
+        style=STYLE_TOTAL_NUM,
+    )
+    ws.set_cell(r_tot, PENDING_COL_BINDING, format_binding_badge(target_bundle.binding_state), style=STYLE_TOTAL_TEXT)
+    ws.set_cell(
+        r_tot, PENDING_COL_BEF_MS,
+        sum(x.before_model_ms if is_comparison else x.after_model_ms for x in pending_items),
+        formula=f"=SUM(M{idx_data_start}:M{r_end})",
+        style=STYLE_TOTAL_FLOAT3,
+    )
+    ws.set_cell(
+        r_tot, PENDING_COL_AFT_MS,
+        sum(x.after_model_ms if is_comparison else x.lstar_model_ms for x in pending_items),
+        formula=f"=SUM(N{idx_data_start}:N{r_end})",
+        style=STYLE_TOTAL_FLOAT3,
+    )
+
+
 def populate_pending_kernel_details_sheet(
     ws: Worksheet,
     pending_items: Sequence[PendingKernelItem],
@@ -493,42 +544,10 @@ def populate_pending_kernel_details_sheet(
             (n_val, n_formula, STYLE_FLOAT3),
         ))
 
-    ws.set_cell(
-        r_tot, 1,
-        f"DISPLAYED CARDS SUBTOTAL ({n_new} 需新开发融合 + {n_tune} 现成算子调优 = {len(pending_items)} 项)",
-        style=STYLE_TOTAL_TEXT,
-    )
-    ws.merge_range(r_tot, 1, r_tot, PENDING_LABEL_MERGE_END)
-    ws.set_cell(
-        r_tot, PENDING_COL_GAIN,
-        sum(x.expected_gain_ms for x in pending_items),
-        formula=f"=SUM(G{idx_data_start}:G{r_end})",
-        style=STYLE_TOTAL_FLOAT3,
-    )
-    ws.set_cell(
-        r_tot, PENDING_COL_GAIN + 1,
-        "已展示高价值算子卡片小计（全网 100% 端到端对账见上方 Waterfall 表）",
-        style=STYLE_TOTAL_TEXT,
-    )
-    ws.merge_range(r_tot, PENDING_COL_GAIN + 1, r_tot, PENDING_COL_GAIN_UPT - 1)
-    ws.set_cell(
-        r_tot, PENDING_COL_GAIN_UPT,
-        sum(x.saved_us_per_tok_die for x in pending_items),
-        formula=f"=SUM(K{idx_data_start}:K{r_end})",
-        style=STYLE_TOTAL_NUM,
-    )
-    ws.set_cell(r_tot, PENDING_COL_BINDING, format_binding_badge(target_bundle.binding_state), style=STYLE_TOTAL_TEXT)
-    ws.set_cell(
-        r_tot, PENDING_COL_BEF_MS,
-        sum(x.before_model_ms if is_comparison else x.after_model_ms for x in pending_items),
-        formula=f"=SUM(M{idx_data_start}:M{r_end})",
-        style=STYLE_TOTAL_FLOAT3,
-    )
-    ws.set_cell(
-        r_tot, PENDING_COL_AFT_MS,
-        sum(x.after_model_ms if is_comparison else x.lstar_model_ms for x in pending_items),
-        formula=f"=SUM(N{idx_data_start}:N{r_end})",
-        style=STYLE_TOTAL_FLOAT3,
+    _write_pending_index_totals(
+        ws, pending_items, target_bundle,
+        idx_data_start=idx_data_start, r_end=r_end, r_tot=r_tot,
+        is_comparison=is_comparison,
     )
 
     write_banner(

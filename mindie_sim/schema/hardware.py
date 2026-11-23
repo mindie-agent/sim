@@ -501,10 +501,9 @@ class Hardware:
         links = tuple(Link.from_mapping(link, default_members=range(len(devices)))
                       for link in raw.get("links", ()))
         if not backend or _network_override_keys(raw):
-            scale = (GBPS_TO_BYTES_PER_MS / BITS_PER_BYTE
-                     if backend == "ascend" and not raw.get("topology_preset")
-                     else GBPS_TO_BYTES_PER_MS)
-            links = apply_network_overrides(links, raw, gbps_to_bytes_per_ms=scale)
+            links = apply_network_overrides(
+                links, raw, gbps_to_bytes_per_ms=GBPS_TO_BYTES_PER_MS,
+            )
         for link in links:
             if link.semantics not in {"shared", "per_port", "per_pair", "direct", "fully_connected", "mesh"}:
                 raise ModelingError(f"link_semantics_unknown:{link.semantics}")
@@ -539,6 +538,11 @@ class Hardware:
             collective_protocols=_collective_protocols(
                 raw.get("collective_protocols", ())),
         )
+
+    @property
+    def physical_ranks_per_node(self) -> int:
+        raw_val = dict(self.topology_options).get("physical_ranks_per_node")
+        return int(raw_val) if raw_val is not None else int(self.ranks_per_node)
 
     def to_dict(self):
         return {"name": self.name, "architecture": self.arch_family,

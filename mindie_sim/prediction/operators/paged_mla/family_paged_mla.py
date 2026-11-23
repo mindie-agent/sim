@@ -290,6 +290,45 @@ def _build_declaration_metadata(
     }
 
 
+def _build_native_attention_abi(
+    *, native_kind, selected_abi, native_entry, branch, implementation, program_recipe,
+    operands, geometry, active, capacity, logical, physical,
+    kv_owner, owner_source, kv_version, kv_condition, kv_producer, kv_output,
+    kv_storage, spans, request_ids, request_rank,
+):
+    return {
+        'call': native_kind, 'aclnn_symbol': selected_abi, 'entry': native_entry,
+        'branch': branch, 'implementation': implementation, 'program_recipe': program_recipe,
+        'query_layout': operands['query_layout'], 'output_layout': operands['output_layout'],
+        'cache_layout': operands['cache_layout'], 'query_dtype': operands['query_dtype'],
+        'cache_dtype': operands['cache_dtype'], 'output_dtype': operands['output_dtype'],
+        'dtype': operands['query_dtype'],
+        'active_query_shape': (active, physical, 1, operands['latent_width']),
+        'query_storage_shape': (capacity, physical, 1, operands['latent_width']),
+        'query_rope_shape': (capacity, physical, 1, operands['rope_width']),
+        'output_shape': (physical, capacity, 1, operands['latent_width']),
+        'cache_head_shape': (1, operands['latent_width']),
+        'rope_cache_head_shape': (1, operands['rope_width']),
+        'latent_width': operands['latent_width'], 'rope_width': operands['rope_width'],
+        'page_size': geometry['page_size'], 'page_table_dtype': 'int32',
+        'page_entries': geometry['page_entries'], 'position_ranges': geometry['position_ranges'],
+        'kv_lengths': geometry['kv_lengths'], 'kv_split_source': geometry['kv_split_source'],
+        'effective_kv_splits': geometry['effective_kv_splits'],
+        'retained_kv_rows': geometry['retained_kv_rows'],
+        'retained_kv_layout': geometry['retained_kv_layout'],
+        'retained_kv_capacity_owner': geometry['retained_kv_capacity_owner'],
+        'inactive_sequence_kv_length': 0, 'quant_scales': operands['quant_scales'],
+        'attention_scale': operands['attention_scale'],
+        'attention_scale_source': operands['attention_scale_source'],
+        'active_sequence_count': active, 'native_query_capacity': capacity,
+        'logical_heads': logical, 'physical_heads': physical,
+        'kv_owner': kv_owner, 'kv_owner_source': owner_source, 'kv_version': kv_version,
+        'kv_condition': kv_condition, 'kv_producer': kv_producer, 'kv_output': kv_output,
+        'kv_storage': kv_storage, 'kv_span': spans, 'kv_request_ids': request_ids,
+        'kv_request_rank': request_rank,
+    }
+
+
 def _declaration(*, views, plan, parallel, runtime, padded_tokens=None,
                  kv_splits=1, native_query_capacity=None, dispatch=None,
                  source_host_dispatch=False, retained_kv_rows=0,
@@ -321,24 +360,18 @@ def _declaration(*, views, plan, parallel, runtime, padded_tokens=None,
         cache_layout=cache_layout, output_layout=output_layout,
         quant_scales=quant_scales, attention_scale=attention_scale,
         attention_scale_source=attention_scale_source)
-    active = geometry['active_sequence_count']
-    capacity = geometry['native_query_capacity']
-    logical = geometry['logical_heads']
-    physical = geometry['physical_heads']
+    active, capacity = geometry['active_sequence_count'], geometry['native_query_capacity']
+    logical, physical = geometry['logical_heads'], geometry['physical_heads']
     is_arch22 = implementation != IMPLEMENTATION
     host_dispatch = (
         'source_common_SplitCore_q1_geometry' if dispatch is None
         else 'declared_common_SplitCore_endpoints')
-    # The model adapter supplies the actual selected store owner.  A bare
-    # wrapper without that explicit value keeps the neutral self binding
-    # instead of guessing ownership from the consumer layer.
     owner_source = 'explicit' if kv_owner else 'default_self'
     if kv_producer and not kv_owner:
         raise ModelingError('paged_mla_state_producer_requires_owner')
     kv_owner = kv_owner or 'self'
     request_ids = tuple(view.request_id for view in views)
-    spans = (tuple(tuple(item) for item in kv_span)
-             if kv_span is not None
+    spans = (tuple(tuple(item) for item in kv_span) if kv_span is not None
              else tuple((0, length) for length in geometry['kv_lengths']))
     unresolved = ['native_binary_identity', 'actual_split_segments_before_plan',
                   'kv_state_version_before_invocation']
@@ -353,57 +386,14 @@ def _declaration(*, views, plan, parallel, runtime, padded_tokens=None,
     source_rec = _ARCH22_SOURCE if is_arch22 else paged_mla.SOURCE
     source_path = str(source_rec.get('relative_path') or source_rec.get('cube') or '')
     source_sha = str(source_rec.get('source_sha256') or '')
-    abi = {
-        'call': native_kind,
-        'aclnn_symbol': selected_abi,
-        'entry': native_entry,
-        'branch': branch,
-        'implementation': implementation,
-        'program_recipe': program_recipe,
-        'query_layout': operands['query_layout'],
-        'output_layout': operands['output_layout'],
-        'cache_layout': operands['cache_layout'],
-        'query_dtype': operands['query_dtype'],
-        'cache_dtype': operands['cache_dtype'],
-        'output_dtype': operands['output_dtype'],
-        'dtype': operands['query_dtype'],
-        'active_query_shape': (active, physical, 1, operands['latent_width']),
-        'query_storage_shape': (capacity, physical, 1, operands['latent_width']),
-        'query_rope_shape': (capacity, physical, 1, operands['rope_width']),
-        'output_shape': (physical, capacity, 1, operands['latent_width']),
-        'cache_head_shape': (1, operands['latent_width']),
-        'rope_cache_head_shape': (1, operands['rope_width']),
-        'latent_width': operands['latent_width'],
-        'rope_width': operands['rope_width'],
-        'page_size': geometry['page_size'],
-        'page_table_dtype': 'int32',
-        'page_entries': geometry['page_entries'],
-        'position_ranges': geometry['position_ranges'],
-        'kv_lengths': geometry['kv_lengths'],
-        'kv_split_source': geometry['kv_split_source'],
-        'effective_kv_splits': geometry['effective_kv_splits'],
-        'retained_kv_rows': geometry['retained_kv_rows'],
-        'retained_kv_layout': geometry['retained_kv_layout'],
-        'retained_kv_capacity_owner': geometry['retained_kv_capacity_owner'],
-        'inactive_sequence_kv_length': 0,
-        'quant_scales': operands['quant_scales'],
-        'attention_scale': operands['attention_scale'],
-        'attention_scale_source': operands['attention_scale_source'],
-        'active_sequence_count': active,
-        'native_query_capacity': capacity,
-        'logical_heads': logical,
-        'physical_heads': physical,
-        'kv_owner': kv_owner,
-        'kv_owner_source': owner_source,
-        'kv_version': kv_version,
-        'kv_condition': kv_condition,
-        'kv_producer': kv_producer,
-        'kv_output': kv_output,
-        'kv_storage': kv_storage,
-        'kv_span': spans,
-        'kv_request_ids': request_ids,
-        'kv_request_rank': request_rank,
-    }
+    abi = _build_native_attention_abi(
+        native_kind=native_kind, selected_abi=selected_abi, native_entry=native_entry,
+        branch=branch, implementation=implementation, program_recipe=program_recipe,
+        operands=operands, geometry=geometry, active=active, capacity=capacity,
+        logical=logical, physical=physical, kv_owner=kv_owner, owner_source=owner_source,
+        kv_version=kv_version, kv_condition=kv_condition, kv_producer=kv_producer,
+        kv_output=kv_output, kv_storage=kv_storage, spans=spans,
+        request_ids=request_ids, request_rank=request_rank)
     metadata = _build_declaration_metadata(
         geometry=geometry, operands=operands, abi=abi, kv_splits=kv_splits,
         dispatch=dispatch, is_arch22=is_arch22, host_dispatch=host_dispatch,
@@ -417,49 +407,26 @@ def _declaration(*, views, plan, parallel, runtime, padded_tokens=None,
     metadata['aclnn_symbol'] = selected_abi
     metadata['native_source'] = source_rec
     metadata['native_call'] = {
-        'api': {
-            'namespace': native_ns,
-            'entry': native_entry,
-            'aclnn_symbol': selected_abi,
-        },
+        'api': {'namespace': native_ns, 'entry': native_entry, 'aclnn_symbol': selected_abi},
         'source': {
-            'repository': source_rec.get('repository'),
-            'revision': source_rec.get('revision'),
-            'relative_path': source_path,
-            'source_sha256': source_sha,
+            'repository': source_rec.get('repository'), 'revision': source_rec.get('revision'),
+            'relative_path': source_path, 'source_sha256': source_sha,
         },
         'kernels': [{
-            'name': native_kind,
-            'role': 'mix',
-            'source_path': source_path,
-            'source_sha256': source_sha,
-            'evidence': 'source_declared',
+            'name': native_kind, 'role': 'mix', 'source_path': source_path,
+            'source_sha256': source_sha, 'evidence': 'source_declared',
         }],
         'execution_core': 'mix',
     }
     return {
-        'geometry': geometry,
-        'operands': operands,
-        'implementation': implementation,
-        'native_kind': native_kind,
-        'aclnn_symbol': selected_abi,
-        'native_entry': native_entry,
-        'branch': branch,
-        'program_recipe': program_recipe,
-        'metadata': metadata,
-        'dispatch': dispatch,
-        'retained_kv_rows': geometry['retained_kv_rows'],
-        'kv_owner': kv_owner,
-        'kv_owner_source': owner_source,
-        'kv_version': kv_version,
-        'kv_condition': kv_condition,
-        'kv_producer': kv_producer,
-        'kv_output': kv_output,
-        'kv_storage': kv_storage,
-        'kv_span': spans,
-        'request_ids': request_ids,
-        'request_rank': request_rank,
-        'unresolved_fields': tuple(unresolved),
+        'geometry': geometry, 'operands': operands, 'implementation': implementation,
+        'native_kind': native_kind, 'aclnn_symbol': selected_abi, 'native_entry': native_entry,
+        'branch': branch, 'program_recipe': program_recipe, 'metadata': metadata,
+        'dispatch': dispatch, 'retained_kv_rows': geometry['retained_kv_rows'],
+        'kv_owner': kv_owner, 'kv_owner_source': owner_source, 'kv_version': kv_version,
+        'kv_condition': kv_condition, 'kv_producer': kv_producer, 'kv_output': kv_output,
+        'kv_storage': kv_storage, 'kv_span': spans, 'request_ids': request_ids,
+        'request_rank': request_rank, 'unresolved_fields': tuple(unresolved),
     }
 
 

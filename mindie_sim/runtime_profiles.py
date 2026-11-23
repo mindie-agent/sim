@@ -478,6 +478,7 @@ def simulation_config(canonical, sku, arch, *, role: str | None = None):
     env, coll_policy = _resolve_arch_env(
         arch, canonical=resolved, role=role, mlapo=prof_mlapo,
     )
+    resolved_kv_block = selected_topo.get("block_size") or profile.get("kv_block_size")
     return {
         "model": canonical, "sku": sku, "hardware_family": arch,
         "canonical_model": resolved, "hardware_arch": arch, "quant": quant,
@@ -487,8 +488,7 @@ def simulation_config(canonical, sku, arch, *, role: str | None = None):
         "sp": documented_sp,
         "mlapo": bool(prof_mlapo and str(role or "").strip().lower() != "pd_prefill"),
         "mtp_proposal_tokens": mtp_tokens,
-        **({"kv_block_size": profile["kv_block_size"]}
-           if profile.get("kv_block_size") else {}),
+        **({"kv_block_size": int(resolved_kv_block)} if resolved_kv_block else {}),
         "multistream_overlap_shared_expert": effective_mso,
         "requested_multistream_overlap_shared_expert": requested_mso,
         "engram_cpu_offload": bool(profile.get("engram_cpu_offload", False)),

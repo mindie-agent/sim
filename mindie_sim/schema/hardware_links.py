@@ -36,8 +36,10 @@ _NETWORK_OVERRIDE_SUFFIXES = ("bw_gbps", "bw_bytes_per_s", "bw_util", "latency_u
 _PRESERVED_TOPOLOGY_KEYS = (
     "intra_bw_4p_gbps", "intra_bw_8p_gbps", "superpod_size", "max_dies",
     "superpod_bw_gbps", "inter_pod_bw_gbps", "superpod_latency_us",
-    "inter_pod_latency_us", "topology_preset",
+    "inter_pod_latency_us", "topology_preset", "physical_ranks_per_node",
 )
+_BAND_WILDCARDS = frozenset({"*", "any", "all"})
+_BAND_STACK_WILDCARDS = frozenset({"*", "default"})
 
 COLLECTIVE_PROTOCOL_KEYS = frozenset({"alltoall", "alltoallv"})
 COLLECTIVE_PROTOCOL_VALUES = frozenset({"ring", "log2", "concurrent"})
@@ -84,9 +86,13 @@ class CollectiveBandSpec:
     evidence_id: str
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "collective", _band_str(self.collective, "collective").lower())
-        object.__setattr__(self, "stack_id", _band_str(self.stack_id, "stack_id"))
+        raw_coll = _band_str(self.collective, "collective").lower()
+        object.__setattr__(self, "collective", "all" if raw_coll in _BAND_WILDCARDS else raw_coll)
+        raw_stack = _band_str(self.stack_id, "stack_id")
+        object.__setattr__(self, "stack_id", "default" if raw_stack.lower() in _BAND_STACK_WILDCARDS else raw_stack)
         scope = _band_str(self.topology_scope, "topology_scope").lower()
+        if scope in _BAND_WILDCARDS:
+            scope = "any"
         if scope not in VALID_LINK_SCOPES and scope != "any":
             raise ModelingError(f"collective_band_topology_scope_unknown:{scope}")
         object.__setattr__(self, "topology_scope", scope)
@@ -96,7 +102,8 @@ class CollectiveBandSpec:
             raise ModelingError(f"collective_band_group_range_invalid:{gmin}:{gmax}")
         object.__setattr__(self, "group_min", gmin)
         object.__setattr__(self, "group_max", gmax)
-        object.__setattr__(self, "expansion_mode", _band_str(self.expansion_mode, "expansion_mode").lower())
+        raw_exp = _band_str(self.expansion_mode, "expansion_mode").lower()
+        object.__setattr__(self, "expansion_mode", "*" if raw_exp in _BAND_WILDCARDS else raw_exp)
         pmin = _band_nonneg_int(self.payload_min_inclusive, "payload_min_inclusive")
         object.__setattr__(self, "payload_min_inclusive", pmin)
         if self.payload_max_exclusive is not None:
@@ -147,8 +154,8 @@ class CollectiveBandSpec:
         if not isinstance(raw, Mapping):
             raise ModelingError("collective_band_mapping_required")
         return cls(
-            collective=raw.get("collective", "any"),
-            stack_id=raw.get("stack_id", "*"),
+            collective=raw.get("collective", "all"),
+            stack_id=raw.get("stack_id", "default"),
             topology_scope=raw.get("topology_scope", "any"),
             group_min=raw.get("group_min", 2),
             group_max=raw.get("group_max", 1024),

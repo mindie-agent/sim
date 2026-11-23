@@ -16,7 +16,7 @@ from ...ownership import unit_group
 from ...results import OpOccurrence
 from ..contracts import ArchStrategy, OperatorFamilySpec, OperatorPlanningContext, ResolvedOperator
 from .arch22 import STRATEGY as _ARCH22
-from .arch35 import STRATEGY as _ARCH35
+from .arch35 import STRATEGY as _ARCH35, fit_ub as _arch35_fit_ub
 from .common import (
     BlazeGroupSchedule,
     BlazeGroupSlice,
@@ -90,6 +90,16 @@ def build(op: OpSpec, geometry: Geometry) -> OperatorPlan:
     return resolve_operator_plan(op, ctx).recipe
 
 
+def strategy_for_arch(arch_id: ArchId) -> ArchStrategy | None:
+    """Return the governed grouped-MoE strategy registered for ``arch_id``."""
+    return _STRATEGIES.get(arch_id)
+
+
+def fit_arch35_ub(contract: GroupedMoeContract, ctx: OperatorPlanningContext) -> tuple[int, int]:
+    """Return the Arch35 UB tile rows and slot byte budget for ``contract``."""
+    return _arch35_fit_ub(contract, ctx)
+
+
 def register_family() -> OperatorFamilySpec:
     """Return the package's family and recipe ownership declaration."""
     return OperatorFamilySpec(
@@ -110,10 +120,12 @@ __all__ = [
     "GroupedMoeContract",
     "MoECohortSplit",
     "build",
+    "fit_arch35_ub",
     "fractal_issues",
     "fractal_k0",
     "normalize_group_rows",
     "register_family",
     "resolve_operator_plan",
     "schedule_blaze_groups",
+    "strategy_for_arch",
 ]

@@ -5,9 +5,8 @@
   assumptions are exposed and can be overridden; they are never measurements.
   Machine transfer declarations merge by channel over the registered profile;
   explicit machine links replace generated links. Transfer-channel ``*_bw_gbps``
-  values retain the historical GB/s meaning. The convenience
-  ``inter_node_bw_gbps``/``intra_node_bw_gbps`` fields are decimal Gb/s unless a
-  ``topology_preset`` is active, in which case they are GB/s like the preset.
+  and convenience ``inter_node_bw_gbps``/``intra_node_bw_gbps`` fields use a
+  single canonical GB/s unit regardless of whether a ``topology_preset`` is set.
   Multi-tier 4P/8P and SuperPod links preserve every declared boundary; a
   measured channel rate resolves each generated tier once and a unity
   bandwidth utilization emits exactly the historical link key set.
@@ -33,6 +32,7 @@ from .ascend_channels import (
     _generated_links,
     _merge_channels,
     _merge_mapping,
+    default_ranks_per_node,
 )
 from .instruction_presets import expand_instruction_presets
 
@@ -129,15 +129,14 @@ _PRESERVED_TOPOLOGY_FIELDS = (
     "inter_pod_latency_us", "topology_preset",
 )
 _TOPOLOGY_FIELDS = _CONVENIENCE_FIELDS | set(_PRESERVED_TOPOLOGY_FIELDS)
+_PRESET_ARCH_PREFIXES = {"a2": "a2_", "a3": "a3_", "a5": "a5_"}
+
+
 _ASSUMPTIONS = {
     "transfer_bandwidth_units": (
-        "inter_node_bw_gbps/intra_node_bw_gbps are decimal Gb/s and divided by 8 "
-        "unless a topology_preset is selected; preset bandwidths, "
-        "intra_package_bw_gbps, intra_bw_4p/8p_gbps, superpod_bw_gbps and "
-        "inter_pod_bw_gbps are GB/s; inter_node_bw_bytes_per_s/ "
-        "intra_node_bw_bytes_per_s are B/s and win over same-layer Gb/s; "
-        "transfer_channels.*_bw_gbps and Link.capacity_gbps keep the historical "
-        "GB/s meaning"
+        "All *_bw_gbps convenience, preset, transfer_channels, and "
+        "Link.capacity_gbps fields use canonical GB/s; *_bw_bytes_per_s fields "
+        "use B/s and win over same-layer GB/s"
     ),
     "transfer_bandwidth_precedence": (
         "explicit machine.links > explicit transfer_channels channel bandwidth > "
@@ -347,6 +346,13 @@ def materialize(raw):
     merged, preset = _preset(raw)
     preset_active = bool(preset)
     profile = profiles()[raw["sku"]]
+    arch_low = str(profile.get("architecture") or "").strip().lower()
+    preset_name = merged.get("topology_preset")
+    if preset_name and arch_low in _PRESET_ARCH_PREFIXES:
+        if not str(preset_name).startswith(_PRESET_ARCH_PREFIXES[arch_low]):
+            raise ModelingError(
+                f"ascend_topology_preset_incompatible:{raw['sku']}:{preset_name}"
+            )
     explicit_device = merge_device_inputs(machine_device_defaults(merged), merged.get("device", {}))
     device = merge_device_inputs(profile["device"], explicit_device)
     channels, explicit, declared = _merge_channels(merged, profile)
@@ -363,15 +369,27 @@ def materialize(raw):
                 for record in merged[field_name]]
     count = int(merged.get("num_devices", len(merged.get(
         "devices", merged.get("dies", ()))) or 1))
-    per_node = int(merged.get("ranks_per_node", count))
+    phys_rpn = int(
+        raw.get("physical_ranks_per_node")
+        or preset.get("ranks_per_node")
+        or default_ranks_per_node(raw["sku"])
+    )
+    per_node = int(merged.get("ranks_per_node", min(count, phys_rpn)))
+    phys_rpn = max(phys_rpn, per_node)
     per_package = int(merged.get("dies_per_package", profile["dies_per_package"]))
-    data.update(ranks_per_node=per_node, dies_per_package=per_package)
+    data.update(
+        ranks_per_node=per_node,
+        physical_ranks_per_node=phys_rpn,
+        dies_per_package=per_package,
+    )
     if "collective_protocols" not in raw:
-        domain = int(merged.get("superpod_size", DIRECT_MESH_RANKS))
-        if "links" in raw or count > domain:
+        is_ub_domain = (
+            preset_name == "a5_pod"
+            or (not preset and per_node <= DIRECT_MESH_RANKS and count <= per_node)
+        )
+        if "links" in raw or not is_ub_domain:
             data.pop("collective_protocols", None)
-        elif (raw["sku"].startswith("Ascend950") and not preset
-              and per_node <= DIRECT_MESH_RANKS and count <= per_node):
+        elif raw["sku"].startswith("Ascend950"):
             data["collective_protocols"] = {
                 "alltoall": "concurrent", "alltoallv": "concurrent"}
     if "links" not in raw:

@@ -29,6 +29,7 @@ from typing import Any
 
 from mindie_sim.backends.ascend import (
     ASCEND_TOPOLOGY_PRESETS,
+    default_ranks_per_node,
     materialize as materialize_ascend,
 )
 from mindie_sim.backends.nvidia import materialize as materialize_nvidia
@@ -141,13 +142,15 @@ def _materialize_machine(
     )
     if resolved_devices < required_devices:
         raise ModelingError(f"insufficient_num_devices:{resolved_devices}:required:{required_devices}")
-    base_rpn = A3_DEFAULT_RANKS_PER_NODE if sku.startswith("Ascend910_93") else DEFAULT_RANKS_PER_NODE
+    base_rpn = default_ranks_per_node(sku) if backend == "ascend" else DEFAULT_RANKS_PER_NODE
+    phys_rpn = int(preset_defaults.get("ranks_per_node", base_rpn))
     default_rpn = min(resolved_devices, base_rpn)
     if preset_defaults:
         default_rpn = int(preset_defaults.get("ranks_per_node", default_rpn))
     resolved_rpn = int(
         ranks_per_node if ranks_per_node is not None else hw_raw.get("ranks_per_node", default_rpn)
     )
+    phys_rpn = max(phys_rpn, resolved_rpn)
     network: dict[str, Any] = {}
     for kind, value in (
         ("inter_node", inter_node_bw_gbps),
@@ -168,7 +171,9 @@ def _materialize_machine(
             network[name] = value
     machine_input = {
         **hw_raw, **network, "sku": sku,
-        "num_devices": resolved_devices, "ranks_per_node": resolved_rpn,
+        "num_devices": resolved_devices,
+        "ranks_per_node": resolved_rpn,
+        "physical_ranks_per_node": phys_rpn,
     }
     if preset:
         machine_input["topology_preset"] = preset
@@ -266,9 +271,11 @@ def _apply_cache_dtype_overrides(
             cur_scale = "fp32"
         if (cur_kv != model_spec.quant.kv_dtype
                 or cur_idx != model_spec.quant.index_dtype
-                or cur_scale != model_spec.quant.index_scale_dtype):
+                or cur_scale != model_spec.quant.index_scale_dtype
+                or str(model_spec.kv_dtype) != str(cur_kv)):
             return _replace(
                 model_spec,
+                kv_dtype=str(cur_kv),
                 quant=_replace(
                     model_spec.quant, kv_dtype=cur_kv,
                     index_dtype=cur_idx, index_scale_dtype=cur_scale,
@@ -321,7 +328,7 @@ def _apply_cache_dtype_overrides(
         index_dtype=resolved_idx,
         index_scale_dtype=resolved_scale,
     )
-    return _replace(model_spec, quant=updated)
+    return _replace(model_spec, quant=updated, kv_dtype=str(updated.kv_dtype))
 
 
 def _apply_cp_and_tutorial_flags(
@@ -400,6 +407,10 @@ def _resolve_parallel_axes(
     }
     parallel_mode: str | None = None
     if isinstance(parallel, Mapping):
+        allowed_keys = set(_PARALLEL_AXES) | {"cp"}
+        unknown_keys = sorted(str(k) for k in parallel if str(k) not in allowed_keys)
+        if unknown_keys:
+            raise ModelingError(f"unknown_parallel_axis:{','.join(unknown_keys)}")
         for axis in _PARALLEL_AXES:
             if axis in parallel and raw_axes[axis] is None:
                 raw_axes[axis] = int(parallel[axis])
@@ -419,7 +430,6 @@ def _resolve_parallel_axes(
         num_devices is not None
         and prompt_tokens is not None
         and output_tokens is not None
-        and ttft_slo_ms is not None
         and tpot_slo_ms is not None
     )
     auto_mode = (
@@ -432,7 +442,6 @@ def _resolve_parallel_axes(
                 ("num_devices", num_devices),
                 ("prompt_tokens", prompt_tokens),
                 ("output_tokens", output_tokens),
-                ("ttft_slo_ms", ttft_slo_ms),
                 ("tpot_slo_ms", tpot_slo_ms),
             ) if val is None
         ]
@@ -710,18 +719,14 @@ def _resolve_domain2_policy(
         profile_on=sp_profile_on, profile_source="production",
     )
     documented_capture = prof.get("graph_capture_mode")
-    if raw_eager:
-        resolved_capture, cap_src = "none", "raw_eager"
-    elif graph_capture_mode is not None:
-        resolved_capture, cap_src = str(graph_capture_mode), "explicit"
-    elif "aclgraph_decode_capture" in exclude_set:
-        resolved_capture, cap_src = "none", "excluded"
-    elif production and documented_capture in {"full", "piecewise", "none"}:
-        resolved_capture, cap_src = str(documented_capture), "profile"
-    elif production:
-        resolved_capture, cap_src = "full", "production_default"
-    else:
-        resolved_capture, cap_src = "none", "none"
+    resolved_capture, cap_src = (
+        ("none", "raw_eager") if raw_eager else
+        (str(graph_capture_mode), "explicit") if graph_capture_mode is not None else
+        ("none", "excluded") if "aclgraph_decode_capture" in exclude_set else
+        (str(documented_capture), "profile") if (production and documented_capture in {"full", "piecewise", "none"}) else
+        ("full", "production_default") if production else
+        ("none", "none")
+    )
 
     supports_compile = bool(dict(model_spec.catalog_facts).get("supports_torch_compile", True))
     initial_compile = (
@@ -1214,7 +1219,7 @@ def _build_runtime_dict(
             else "topology" if machine.get("collective_protocols") else "legacy"
         ),
         "matrix_compute_policy": str(matrix_compute_policy),
-        "recover_ssm": bool(recover_ssm),
+        "recover_ssm": bool(recover_ssm) if recover_ssm is not None else False,
         "prefix_cache_mode": str(prefix_cache_mode),
         "prefix_read_mode": str(prefix_read_mode),
         "homogeneous_graph_reuse": str(homogeneous_graph_reuse),
@@ -1352,7 +1357,8 @@ def _prepare_composed_model(
     promote_dense_to_moe: bool,
     role: str | None = None,
 ) -> tuple[Any, int, dict[str, Any] | None, bool]:
-    model_spec = _resolve_model_spec(model)
+    hw_family = _arch_key(sku)
+    model_spec = _resolve_model_spec(model, hw_family=hw_family)
     model_limit = _resolve_max_position_embeddings(model, model_spec)
     explicit_quant = quant is not None
     spec_meta = dict(getattr(model_spec, "metadata", ()) or ())
@@ -1383,7 +1389,8 @@ def _prepare_composed_model(
         and quant.strip().lower() in {"bf16", "bfloat16", "fp16", "float16", "fp32"}
     )
     if (production and va_profile is not None
-            and va_profile.get("quant") is not None and not unquantized_override
+            and va_profile.get("quant") is not None
+            and not unquantized_override
             and not (checkpoint_quant_declared and not explicit_quant)):
         prof_flags = dict(va_profile.get("tutorial_flags") or {})
         if resolved_kv_dtype is None and not explicit_kv_in_quant and prof_flags.get("kv_cache_dtype"):
@@ -1408,12 +1415,23 @@ def _compose_auto_deployment(
 ):
     from mindie_sim.sweep.pd import solve_optimal_deployment
 
+    direct_keys = set(_COMPOSE_OPTION_GROUPS["auto"])
+    direct_opts = {k: v for k, v in options.items() if k in direct_keys}
+    extra_opts = {k: v for k, v in options.items() if k not in direct_keys and v is not None}
     solved = solve_optimal_deployment(
         model=model, hardware=hardware, num_devices=int(num_devices),
         prompt_tokens=int(prompt_tokens), output_tokens=int(output_tokens),
-        ttft_sla_ms=float(ttft_slo_ms), tpot_sla_ms=float(tpot_slo_ms),
-        deployment=str(deployment or "auto"), pinned_parallel=axes, **options,
+        ttft_sla_ms=(None if ttft_slo_ms is None else float(ttft_slo_ms)),
+        tpot_sla_ms=float(tpot_slo_ms),
+        allow_unconstrained_ttft=(ttft_slo_ms is None),
+        deployment=str(deployment or "auto"), pinned_parallel=axes,
+        compose_overrides=extra_opts or None,
+        **direct_opts,
     )
+    if not solved.get("feasible") or solved.get("recommended_case") is None:
+        raise ModelingError(
+            f"auto_deployment_infeasible:{model}:{hardware}:devices={num_devices}:tpot={tpot_slo_ms}"
+        )
     winner_case = deepcopy(solved["recommended_case"])
     winner_case.setdefault("runtime", {}).setdefault("metadata", {})["optimal_deployment"] = {
         k: v for k, v in solved.items() if k not in {"recommended_case", "prefill_case", "decode_case"}
@@ -1627,7 +1645,7 @@ def _assemble_composed_case(
                 )
             )),
             ("enable_flashcomm1", policy_options["enable_flashcomm1"] is not None),
-            ("recover_ssm", runtime_options["recover_ssm"] is True),
+            ("recover_ssm", runtime_options["recover_ssm"] is not None),
         ) if explicit
     )
     _apply_stack_and_lowerings(
@@ -1658,6 +1676,15 @@ _COMPOSE_OPTION_GROUPS: dict[str, tuple[str, ...]] = {
         "exclude_optimizations", "engram_cpu_offload", "multistream_overlap_shared_expert",
         "enable_shared_expert_dp", "sp", "graph_capture_mode", "mtp_proposal_tokens",
         "mtp_acceptance_length", "kv_cache_dtype", "indexer_kv_dtype",
+    ),
+    "auto_extra": (
+        "enable_fused_mc2", "enable_prefill_mc2", "enable_flashcomm1",
+        "enable_torch_compile", "recover_ssm", "block_size",
+        "inter_node_bw_gbps", "intra_node_bw_gbps", "intra_package_bw_gbps",
+        "inter_node_bw_util", "intra_node_bw_util", "intra_package_bw_util",
+        "inter_node_latency_us", "intra_node_latency_us", "intra_package_latency_us",
+        "superpod_size", "superpod_bw_gbps", "inter_pod_bw_gbps",
+        "intra_bw_4p_gbps", "intra_bw_8p_gbps",
     ),
     "machine_options": (
         "num_devices", "ranks_per_node", "topology_preset",
@@ -1787,7 +1814,7 @@ def compose_case(
     redundant_experts_per_rank: int = DEFAULT_REDUNDANT_EXPERTS,
     collective_startup_mode: str | None = None,
     matrix_compute_policy: str = "auto",
-    recover_ssm: bool = False,
+    recover_ssm: bool | None = None,
     prefix_cache_mode: str = "private",
     prefix_read_mode: str = "auto",
     homogeneous_graph_reuse: str = "off",
@@ -1822,10 +1849,11 @@ def compose_case(
         ttft_slo_ms=ttft_slo_ms, tpot_slo_ms=tpot_slo_ms,
     )
     if auto_mode:
+        auto_opts = {**_select_group(args, "auto"), **_select_group(args, "auto_extra")}
         return _compose_auto_deployment(
             model, hardware, axes, num_devices=num_devices, prompt_tokens=prompt_tokens,
             output_tokens=output_tokens, ttft_slo_ms=ttft_slo_ms, tpot_slo_ms=tpot_slo_ms,
-            deployment=deployment, **_select_group(args, "auto"),
+            deployment=deployment, **auto_opts,
         )
     grouped = {
         key: _select_group(args, key)

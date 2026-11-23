@@ -336,6 +336,68 @@ def _replay_scope(ops, declared):
     return next(iter(scopes), "none")
 
 
+def _evaluate_isolated_group(
+    execution, op, *, replica: int, replay_scope: str, input_ready_ms: float,
+    identity: str, count: int,
+):
+    from mindie_sim.prediction.program import NativeProgram
+
+    op, recipe = execution.prepare(op, replica)
+    if requires_collective_cohort(execution.case, op, recipe):
+        raise ValueError("operator_collective_requires_complete_cohort:use_graph_costs")
+    context = execution._context(op, replica, replay_scope, recipe=recipe)
+    engine = execution.engine
+    ready = engine.submit("input_ready", release=input_ready_ms)
+    program = execution.lower_program(context, recipe)
+    cp_binding = getattr(context, "collective_plan", None)
+    cp_plan = getattr(cp_binding, "plan", None) if cp_binding is not None else None
+    if (cp_plan is not None
+            and hasattr(cp_plan, "lower_with_local_work")
+            and getattr(recipe, "algorithm", None) is None
+            and getattr(cp_binding, "algorithm", None) != "direct_mesh"
+            and context.joint_native_service is None):
+        program = cp_plan.lower_with_local_work(context, program)
+    program = execution._apply_resource_service_program(context, program)
+    program = execution._apply_stream_owners_program(context, program)
+    if isinstance(program, NativeProgram):
+        rank_index = execution.participant_rank_index(replica, op.stage)
+        complete = execution.start_native_participant_with_handles(
+            program, "operator", ready, rank_index=rank_index,
+            resource_names=execution.native_resource_names(
+                context, program, rank=rank_index, replica=replica),
+            transport=execution.native_transport(op, replica))[0]
+    else:
+        complete = program.start(engine, "operator", ready)
+    engine.advance(horizon=input_ready_ms)
+    early_service = {k: v for k, v in engine.serviced.items() if v and "stream_quota@" not in k}
+    engine.advance(until=(complete,))
+    duration = complete.time - input_ready_ms
+    hw_serviced = {k: v for k, v in engine.serviced.items() if "stream_quota@" not in k}
+    comm_accounting = (
+        execution.topology.accounting(
+            op, replica, volume=context.native_work["link"],
+            transport=execution.transport_options_for(op, replica, replay_scope),
+            recipe=recipe)
+        if context.native_work.get("link") else None
+    )
+    row_context = (
+        replace(context, work=dict(comm_accounting.wire_by_resource))
+        if (comm_accounting is not None
+            and getattr(recipe, "algorithm", None) == "oneshot"
+            and context.joint_native_service is None)
+        else context
+    )
+    return {
+        **_cost_row(
+            execution, op, recipe, row_context, identity=identity,
+            count=count, duration=duration,
+            input_ready_ms=input_ready_ms, serviced=hw_serviced,
+            early_service=early_service),
+        **({"communication": _communication_description(comm_accounting, recipe)}
+           if comm_accounting is not None else {}),
+    }
+
+
 def operator_costs(case, ops, *, recipes=None, primitives=None, replay_scope=None,
                     input_ready_ms=0, replica=0, evaluation=None, stream_plans=None):
     """Price local operators or complete replica->operators cohort mappings."""
@@ -418,67 +480,10 @@ def operator_costs(case, ops, *, recipes=None, primitives=None, replay_scope=Non
         else:
             execution.reset_engine()
         execution.engine._compact_step = execution._compact_step
-        op, recipe = execution.prepare(op, replica)
-        if requires_collective_cohort(case, op, recipe):
-            raise ValueError(
-                "operator_collective_requires_complete_cohort:use_graph_costs")
-        context = execution._context(op, replica, replay_scope, recipe=recipe)
-        engine = execution.engine
-        ready = engine.submit("input_ready", release=input_ready_ms)
-        program = execution.lower_program(context, recipe)
-        cp_binding = getattr(context, "collective_plan", None)
-        cp_plan = getattr(cp_binding, "plan", None) if cp_binding is not None else None
-        if (cp_plan is not None
-                and hasattr(cp_plan, "lower_with_local_work")
-                and getattr(recipe, "algorithm", None) is None
-                and getattr(cp_binding, "algorithm", None) != "direct_mesh"
-                and context.joint_native_service is None):
-            program = cp_plan.lower_with_local_work(context, program)
-        program = execution._apply_resource_service_program(context, program)
-        program = execution._apply_stream_owners_program(context, program)
-        from mindie_sim.prediction.program import NativeProgram
-        if isinstance(program, NativeProgram):
-            # An isolated native call still uses its declared physical rank
-            # ports; it is the same launch view, not an unbound synthetic one.
-            rank_index = execution.participant_rank_index(replica, op.stage)
-            complete = execution.start_native_participant_with_handles(
-                program, "operator", ready, rank_index=rank_index,
-                resource_names=execution.native_resource_names(
-                    context, program, rank=rank_index, replica=replica),
-                transport=execution.native_transport(op, replica))[0]
-        else:
-            complete = program.start(engine, "operator", ready)
-        engine.advance(horizon=input_ready_ms)
-        early_service = {key: value for key, value in engine.serviced.items()
-                         if value and "stream_quota@" not in key}
-        engine.advance(until=(complete,))
-        duration = complete.time - input_ready_ms
-        hw_serviced = {key: value for key, value in engine.serviced.items()
-                       if "stream_quota@" not in key}
-        comm_accounting = (
-            execution.topology.accounting(
-                op, replica, volume=context.native_work["link"],
-                transport=execution.transport_options_for(
-                    op, replica, replay_scope),
-                recipe=recipe)
-            if context.native_work.get("link") else None
+        row = _evaluate_isolated_group(
+            execution, op, replica=replica, replay_scope=replay_scope,
+            input_ready_ms=input_ready_ms, identity=identity, count=group["count"],
         )
-        row_context = (
-            replace(context, work=dict(comm_accounting.wire_by_resource))
-            if (comm_accounting is not None
-                and getattr(recipe, "algorithm", None) == "oneshot"
-                and context.joint_native_service is None)
-            else context
-        )
-        row = {
-            **_cost_row(
-                execution, op, recipe, row_context, identity=identity,
-                count=group["count"], duration=duration,
-                input_ready_ms=input_ready_ms, serviced=hw_serviced,
-                early_service=early_service),
-            **({"communication": _communication_description(comm_accounting, recipe)}
-               if comm_accounting is not None else {}),
-        }
         rows.append(row)
         if isolated_cache is not None:
             isolated_cache.put(

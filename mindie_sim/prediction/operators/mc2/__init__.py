@@ -90,6 +90,14 @@ def common_native_protocol(chosen, fused_level, moe_comm, *, arch_family: str = 
     return leaf.common_native_protocol(chosen, fused_level, moe_comm)
 
 
+def fused_mc2_native_binding(weight_dtype: str, *, fused_level: int = 1, arch_family: str = "A3"):
+    """Return arch-dispatched native MC2 kernel identity binding."""
+    leaf = _protocol_module_for_arch(arch_family)
+    if hasattr(leaf, "fused_mc2_native_binding"):
+        return leaf.fused_mc2_native_binding(weight_dtype, fused_level=fused_level)
+    return arch22.fused_mc2_native_binding(weight_dtype, fused_level=fused_level)
+
+
 def lower_native_protocol(ops, *, selected, **caller):
     """Apply the selected protocol's graph lowering."""
     return _NATIVE_PROTOCOLS[selected["kind"]].lower_native_protocol(

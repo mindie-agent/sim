@@ -291,6 +291,55 @@ class StageProfile:
         return (int(self.stage), self.geometry, self.primitive_identity)
 
 
+def _resolve_stage_service_modes(
+    dies,
+    orig_rates_s: Mapping[str, float],
+    orig_service_modes: Mapping[str, tuple[str, float]],
+    overlay_rates: Mapping[str, float],
+    overlay: Any,
+    names: Mapping[str, str],
+) -> dict[str, tuple[str, float]]:
+    reg_entry = None
+    if dies[0].sku:
+        from mindie_sim.backends.ascend import profiles as ascend_profiles
+        reg_entry = ascend_profiles().get(str(dies[0].sku))
+    reg_dev = reg_entry.get("device") if isinstance(reg_entry, Mapping) else None
+    reg_rates = dict(reg_dev.get("rates") or {}) if isinstance(reg_dev, Mapping) else {}
+    reg_modes = dict(reg_dev.get("service_modes") or {}) if isinstance(reg_dev, Mapping) else {}
+    mte1_modes_at_registry = all(
+        _at_registry_mode_rate(reg_modes, mode, m_rate)
+        for mode, (role, m_rate) in orig_service_modes.items() if role == "mte1"
+    )
+    service_modes: dict[str, tuple[str, float]] = {}
+    for mode, (role, m_rate) in orig_service_modes.items():
+        if mode in {"mte2_aic_dram", "mte2_aiv_dram"} and overlay and overlay.hbm_read_bytes_per_s is not None:
+            m_rate = min(m_rate, overlay.hbm_read_bytes_per_s)
+        elif role in overlay_rates and orig_rates_s.get(role, 0.0) > 0.0:
+            m_rate = m_rate * (overlay_rates[role] / orig_rates_s[role])
+        elif (role == "mte1" and mte1_modes_at_registry and orig_rates_s.get(role, 0.0) > 0.0
+              and float(reg_rates.get(role, 0.0) or 0.0) > 0.0):
+            m_rate = m_rate * (orig_rates_s[role] / float(reg_rates[role]))
+        service_modes[mode] = (role, m_rate)
+    hbm_cap_s = orig_rates_s.get("hbm", 0.0)
+    if "mte2_aiv_dram" not in service_modes and overlay and overlay.hbm_read_bytes_per_s is not None:
+        hbm_r = overlay.hbm_read_bytes_per_s
+        service_modes["mte2_aiv_dram"] = ("mte2_aiv", min(hbm_r, hbm_cap_s) if hbm_cap_s > 0.0 else hbm_r)
+    for attr, mode_name in (
+        ("hbm_write_bytes_per_s", "hbm_write_dram"),
+        ("hbm_rw11_bytes_per_s", "hbm_rw11_dram"),
+        ("hbm_rw21_bytes_per_s", "hbm_rw21_dram"),
+    ):
+        val = getattr(overlay, attr, None) if overlay is not None else None
+        if val is not None:
+            service_modes[mode_name] = ("hbm", min(val, hbm_cap_s) if hbm_cap_s > 0.0 else val)
+    l2_pipe = "mte2_aiv" if "mte2_aiv" in names else ("mte2" if "mte2" in names else None)
+    if l2_pipe is not None and overlay and overlay.l2_die_bytes_per_s is not None:
+        service_modes["l2_die_bw"] = (l2_pipe, overlay.l2_die_bytes_per_s)
+    if l2_pipe is not None and overlay and overlay.l2_contiguous_bytes_per_s is not None:
+        service_modes["l2_contiguous_bw"] = (l2_pipe, overlay.l2_contiguous_bytes_per_s)
+    return service_modes
+
+
 def build_stage_profiles(case: CaseSpec, namespace: str = "", *,
                          replicas=None, primitive_table: Any = None) -> tuple[StageProfile, ...]:
     """Resolve every stage's immutable hardware binding exactly once."""
@@ -395,55 +444,9 @@ def build_stage_profiles(case: CaseSpec, namespace: str = "", *,
                 "compute_peaks": orig_compute_peaks,
                 "service_modes": orig_service_modes,
             }
-            reg_entry = None
-            if dies[0].sku:
-                from mindie_sim.backends.ascend import profiles as ascend_profiles
-                reg_entry = ascend_profiles().get(str(dies[0].sku))
-            reg_dev = reg_entry.get("device") if isinstance(reg_entry, Mapping) else None
-            reg_rates = dict(reg_dev.get("rates") or {}) if isinstance(reg_dev, Mapping) else {}
-            reg_modes = dict(reg_dev.get("service_modes") or {}) if isinstance(reg_dev, Mapping) else {}
-            # Scarce-mte1 fallback rescales modes only when Hardware left EVERY mte1 mode at its
-            # registry default; an explicit pin or an already-rescaled sibling means it ran.
-            mte1_modes_at_registry = all(
-                _at_registry_mode_rate(reg_modes, mode, m_rate)
-                for mode, (role, m_rate) in orig_service_modes.items() if role == "mte1"
+            service_modes = _resolve_stage_service_modes(
+                dies, orig_rates_s, orig_service_modes, overlay_rates, overlay, names,
             )
-            service_modes = {}
-            for mode, (role, m_rate) in orig_service_modes.items():
-                if mode in {"mte2_aic_dram", "mte2_aiv_dram"} and overlay and overlay.hbm_read_bytes_per_s is not None:
-                    m_rate = min(m_rate, overlay.hbm_read_bytes_per_s)
-                elif role in overlay_rates and orig_rates_s.get(role, 0.0) > 0.0:
-                    m_rate = m_rate * (overlay_rates[role] / orig_rates_s[role])
-                elif (role == "mte1" and mte1_modes_at_registry and orig_rates_s.get(role, 0.0) > 0.0
-                      and float(reg_rates.get(role, 0.0) or 0.0) > 0.0):
-                    m_rate = m_rate * (orig_rates_s[role] / float(reg_rates[role]))
-                service_modes[mode] = (role, m_rate)
-            hbm_cap_s = orig_rates_s.get("hbm", 0.0)
-            if "mte2_aiv_dram" not in service_modes and overlay and overlay.hbm_read_bytes_per_s is not None:
-                hbm_r = overlay.hbm_read_bytes_per_s
-                service_modes["mte2_aiv_dram"] = (
-                    "mte2_aiv", min(hbm_r, hbm_cap_s) if hbm_cap_s > 0.0 else hbm_r,
-                )
-            if overlay and overlay.hbm_write_bytes_per_s is not None:
-                hbm_w = overlay.hbm_write_bytes_per_s
-                service_modes["hbm_write_dram"] = (
-                    "hbm", min(hbm_w, hbm_cap_s) if hbm_cap_s > 0.0 else hbm_w,
-                )
-            if overlay and overlay.hbm_rw11_bytes_per_s is not None:
-                hbm_rw11 = overlay.hbm_rw11_bytes_per_s
-                service_modes["hbm_rw11_dram"] = (
-                    "hbm", min(hbm_rw11, hbm_cap_s) if hbm_cap_s > 0.0 else hbm_rw11,
-                )
-            if overlay and overlay.hbm_rw21_bytes_per_s is not None:
-                hbm_rw21 = overlay.hbm_rw21_bytes_per_s
-                service_modes["hbm_rw21_dram"] = (
-                    "hbm", min(hbm_rw21, hbm_cap_s) if hbm_cap_s > 0.0 else hbm_rw21,
-                )
-            l2_pipe = "mte2_aiv" if "mte2_aiv" in names else ("mte2" if "mte2" in names else None)
-            if l2_pipe is not None and overlay and overlay.l2_die_bytes_per_s is not None:
-                service_modes["l2_die_bw"] = (l2_pipe, overlay.l2_die_bytes_per_s)
-            if l2_pipe is not None and overlay and overlay.l2_contiguous_bytes_per_s is not None:
-                service_modes["l2_contiguous_bw"] = (l2_pipe, overlay.l2_contiguous_bytes_per_s)
             store_queues = {
                 name: dict(queue) for name, queue in dies[0].store_queues
                 if all(dict(die.store_queues).get(name) == queue for die in dies)

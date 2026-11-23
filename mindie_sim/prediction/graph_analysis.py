@@ -871,6 +871,7 @@ def _run_graph(
     # keeps the uncoalesced per-tile shape.
     execution._compact_step = not execution.legacy_diagnostics
     execution.engine._compact_step = execution._compact_step
+    execution._fast_span_only = bool(fast_span_only)
     views_source = request_views if request_views is not None else getattr(ops, "request_views", None)
     eff_padded = int(padded_tokens or getattr(ops, "padded_tokens", 0) or 0)
     eff_layout = str(sequence_layout or getattr(ops, "sequence_layout", "") or "")

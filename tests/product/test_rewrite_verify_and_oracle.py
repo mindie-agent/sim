@@ -722,9 +722,9 @@ def test_algebraic_rewrite_laws_enforce_port_quant_contracts_and_activation_pred
                flops=float(2 * 16 * 2048 * 2048), hbm_bytes=8388608.0)
     comb = _op("s0.l0.combine", "combine", (16, 2048), deps=("s0.l0.gmm2",), dtype="bf16", link_bytes=65536.0)
     moe_res = discover_algebraic_rewrites_for_ops((disp, gmm1, situ, quant, gmm2, comb), datapath=path)
-    assert any(t.kind == "ABI_UNSUPPORTED_VARIANT" and t.candidate_abi == "dispatch_ffn_combine_situ_ext"
+    assert any(t.kind == "ABI_UNSUPPORTED_VARIANT" and t.candidate_abi == "aclnnMegaMoe_situ_ext"
                for t in moe_res.semantic_audit_triggers)
-    assert any(c.abi_id == "dispatch_ffn_combine_situ_ext" and not c.shipping_supported for c in moe_res.candidates)
+    assert any(c.abi_id == "aclnnMegaMoe_situ_ext" and not c.shipping_supported for c in moe_res.candidates)
 
 
 def test_solve_target_graph_enforces_mode_separation_and_whitebox_l0_pricing():

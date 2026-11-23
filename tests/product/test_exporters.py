@@ -206,7 +206,7 @@ def test_trace_streaming_memory_and_speed_budget_on_full_multilayer_model(tmp_pa
     assert any("Target Archetype C" in t and "×24" in t for t in arch_titles)
     assert any(t.startswith("Draft [DSpark]") and "×5" in t for t in arch_titles)
     recover_ops = [o for o in bundle.operators if "recover_ssm" in o.op_id]
-    assert recover_ops and all(o.archetype_id.startswith("target_arch_") for o in recover_ops)
+    assert recover_ops and all(o.archetype_id == "target_tail" for o in recover_ops)
     assert not any(o.op_id.endswith(("recurrent_scan0", "recurrent_scan1")) for o in bundle.operators)
 
     out_trace = tmp_path / "full_trace_view.json"
@@ -295,8 +295,9 @@ def test_xlsx_before_after_merge_cells_formulas_and_new_kernel_backlog(tmp_path)
     assert summary.sheets == (SHEET_SUMMARY, SHEET_BREAKDOWN, SHEET_MEMORY, SHEET_PENDING_KERNELS)
     assert SHEET_MEASURED not in summary.sheets
     assert summary.has_comparison is True and summary.has_measured is False
-    # Shipping N->1 (MLAPO) & 1->1 ops never inflate [需新开发融合算子]; shipping tuning cards clear >=0.050 ms.
-    assert summary.new_kernel_backlog_count == 0 and summary.to_optimize_kernel_count >= 1
+    # Shipping N->1 (MLAPO) stays in tuning; genuine ABI extensions (SiTU MegaMoE) enter backlog.
+    assert summary.new_kernel_backlog_count >= 1 and summary.to_optimize_kernel_count >= 1
+    assert not any("aclnnMlaPrologV3" in str(i.get("op_name", "")) and i.get("category") == "to_implement" for i in json.loads(brief_path.read_text(encoding="utf-8")).get("pending_kernels", ()))
     assert brief_path.is_file() and brief_path.stat().st_size < 8192
 
     sheet_names, roots, shared = _read_xlsx_sheets(xlsx_path)
@@ -331,7 +332,7 @@ def test_xlsx_before_after_merge_cells_formulas_and_new_kernel_backlog(tmp_path)
     assert any(v and "1. Attention" in v for v, _ in s1.values())
     assert any(v and "KDA / GDN Linear Attention" in v for v, _ in s1.values())
     assert any(v and "MoE Routed Experts (GMM1 / Act / GMM2)" in v for v, _ in s1.values())
-    assert any(v and "100% 掩盖" in v for v, _ in s1.values())
+    assert any(v and ("多流掩盖" in v or "流内原始 + 被掩盖 = 实际暴露" in v) for v, _ in s1.values())
     assert not any(v and "Cross-Stream Overlap Credit" in v for v, _ in s1.values())
 
     # Sheet 2 — Strict topological order, up-front Stream&Masking (Col E), trailing Source Ref (Col W).
@@ -377,7 +378,7 @@ def test_xlsx_before_after_merge_cells_formulas_and_new_kernel_backlog(tmp_path)
     assert s4["D10"][1] == "D8-D9"
     assert any(f and "SUMIF(" in f and SHEET_BREAKDOWN in f for _, f in s4.values())
     assert any(v == PENDING_KIND_TO_OPTIMIZE for v, _ in s4.values())
-    assert not any(v == PENDING_KIND_TO_IMPLEMENT for v, _ in s4.values())
+    assert any(v == PENDING_KIND_TO_IMPLEMENT for v, _ in s4.values())
     assert any(v and v.startswith("Card #1 [") for v, _ in s4.values())
     assert not any("① 已有特效开关与通信展开配置" in s for s in shared)
     assert not any("避免 ACLGraph 图断裂" in s for s in shared)

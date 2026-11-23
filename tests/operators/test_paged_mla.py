@@ -629,7 +629,6 @@ def test_arch_aware_mla_and_mc2_native_binding_projection():
     from mindie_sim.export.kernel_catalog import resolve_ascend_kernel_identity
     from mindie_sim.export.trace_exporter import export_msprof_trace
     from mindie_sim.prediction.operators import mc2
-    from mindie_sim.prediction.operators.mc2 import arch22 as mc2_arch22
     from mindie_sim.prediction.operators.paged_mla.common import default_dense_abi
     from mindie_sim.prediction.structure import parse_case
     from mindie_sim.rewrite.algebra import (
@@ -653,11 +652,11 @@ def test_arch_aware_mla_and_mc2_native_binding_projection():
     proto_a3 = mc2.common_native_protocol("fused_mc2", 1, (), arch_family="A3")
     assert proto_a5["kind"] == "arch35_fullmesh"
     assert proto_a3["kind"] == "arch22_v2_caller"
-    assert mc2_arch22.fused_mc2_native_binding("int8", fused_level=1)["public_name"] == "dispatch_ffn_combine"
-    assert mc2_arch22.fused_mc2_native_binding("int4", fused_level=1)["public_name"] == "dispatch_ffn_combine_w4_a8"
-    assert mc2_arch22.fused_mc2_native_binding("int8", fused_level=2)["public_name"] == "aclnnMegaMoe"
+    assert mc2.fused_mc2_native_binding("int8", fused_level=1, arch_family="A3")["public_name"] == "dispatch_ffn_combine"
+    assert mc2.fused_mc2_native_binding("int4", fused_level=1, arch_family="A3")["public_name"] == "dispatch_ffn_combine_w4_a8"
+    assert mc2.fused_mc2_native_binding("int8", fused_level=2, arch_family="A3")["public_name"] == "aclnnMegaMoe"
     with pytest.raises(ModelingError, match="arch22_fused_mc2_mode3_requires_arch35"):
-        mc2_arch22.fused_mc2_native_binding("int8", fused_level=3)
+        mc2.fused_mc2_native_binding("int8", fused_level=3, arch_family="A3")
 
     # 3. Rewrite SHIPPING_ABI_PREDICATES: arch-qualified, complete MoE frame required, situglu rejected.
     assert resolve_shipping_moe_predicate("A5").abi_id == "aclnnMegaMoe"

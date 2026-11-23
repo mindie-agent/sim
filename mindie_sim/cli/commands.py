@@ -174,6 +174,97 @@ def _inspect_case(raw_case) -> dict:
     }
 
 
+def _dispatch_predict_step(args: argparse.Namespace) -> object:
+    raw = _case_with_supply(args)
+    view = str(getattr(args, "view", "step"))
+    if view == "efficiency":
+        from mindie_sim.prediction.efficiency import analyze_network_efficiency
+        from mindie_sim.prediction.evaluation import EvaluationContext
+        from mindie_sim.prediction.graph_analysis import graph_costs
+        from mindie_sim.prediction.operator_analysis import operator_costs, target_graphs
+
+        with PrimitiveStore(args.primitives) if args.primitives else nullcontext(None) as store:
+            if (
+                args.draft_prepare
+                or args.media_tokens_per_sequence is not None
+                or store is not None
+                or bool(getattr(args, "include_submission", False))
+            ):
+                case = parse_case(raw)
+                ops = target_graphs(
+                    case, phase=args.phase, tokens=args.tokens, context=args.context,
+                    sequences=args.sequences, scope=args.scope,
+                    media_tokens_per_sequence=args.media_tokens_per_sequence,
+                    draft_prepare=bool(args.draft_prepare),
+                )
+                ext_inputs = (
+                    {"analysis_input": 0.0}
+                    if any("analysis_input" in op.deps for g in ops.values() for op in g)
+                    else None
+                )
+                ctx = EvaluationContext.create(case, None, store)
+                op_report = operator_costs(case, ops, primitives=store, evaluation=ctx)
+                gr_report = graph_costs(
+                    case, ops, primitives=store,
+                    external_inputs=ext_inputs,
+                    include_submission=bool(args.include_submission),
+                    isolated=False, evaluation=ctx,
+                )
+                return analyze_network_efficiency(
+                    case, phase=args.phase, tokens=args.tokens, context=args.context,
+                    sequences=args.sequences, scope=args.scope,
+                    operator_report=op_report, graph_report=gr_report,
+                    evaluation_context=ctx,
+                )
+            return analyze_network_efficiency(
+                raw, phase=args.phase, tokens=args.tokens, context=args.context,
+                sequences=args.sequences, scope=args.scope,
+            )
+    if view in {"operators", "graph"}:
+        from mindie_sim.prediction.graph_analysis import graph_costs
+        from mindie_sim.prediction.operator_analysis import operator_costs, target_graphs
+        case = parse_case(raw)
+        ops = target_graphs(
+            case, phase=args.phase, tokens=args.tokens, context=args.context,
+            sequences=args.sequences, scope=args.scope,
+            media_tokens_per_sequence=args.media_tokens_per_sequence,
+            draft_prepare=args.draft_prepare,
+        )
+        with PrimitiveStore(args.primitives) if args.primitives else nullcontext(None) as store:
+            body = (
+                operator_costs(case, ops, primitives=store)
+                if view == "operators"
+                else graph_costs(
+                    case, ops, primitives=store,
+                    include_submission=bool(args.include_submission),
+                    isolated=bool(args.isolated),
+                )
+            )
+            return {
+                **body,
+                "graph_scope": args.scope,
+                "tokens_per_sequence": args.tokens,
+                "sequences": args.sequences,
+                "sequences_per_replica": args.sequences,
+                "draft_prepare": args.draft_prepare,
+                "deployment_scope": "first_independent_dp_cohort",
+            }
+    req = StepRequest(
+        phase=args.phase, tokens=args.tokens, context=args.context,
+        sequences=args.sequences, scope=args.scope,
+        media_tokens_per_sequence=args.media_tokens_per_sequence,
+        draft_prepare=bool(args.draft_prepare),
+    )
+    replay = ReplayOptions(
+        include_submission=bool(args.include_submission),
+        isolated=bool(args.isolated),
+        event_limit=int(args.event_limit),
+    )
+    with PrimitiveStore(args.primitives) if args.primitives else nullcontext(None) as store:
+        result = sdk_api.evaluate_step(raw, req, replay=replay, primitives=store)
+    return json_payload(result)
+
+
 def _dispatch_sdk(args: argparse.Namespace) -> object | None:
     cmd = args.command
     if cmd == "predict-service":
@@ -183,111 +274,7 @@ def _dispatch_sdk(args: argparse.Namespace) -> object | None:
             result = sdk_api.evaluate_service(raw, replay=replay, primitives=store)
         return json_payload(result)
     if cmd == "predict-step":
-        raw = _case_with_supply(args)
-        view = str(getattr(args, "view", "step"))
-        if view == "efficiency":
-            from mindie_sim.prediction.efficiency import analyze_network_efficiency
-            from mindie_sim.prediction.evaluation import EvaluationContext
-            from mindie_sim.prediction.graph_analysis import graph_costs
-            from mindie_sim.prediction.operator_analysis import operator_costs, target_graphs
-
-            with PrimitiveStore(args.primitives) if args.primitives else nullcontext(None) as store:
-                if (
-                    args.draft_prepare
-                    or args.media_tokens_per_sequence is not None
-                    or store is not None
-                    or bool(getattr(args, "include_submission", False))
-                ):
-                    case = parse_case(raw)
-                    ops = target_graphs(
-                        case, phase=args.phase, tokens=args.tokens, context=args.context,
-                        sequences=args.sequences, scope=args.scope,
-                        media_tokens_per_sequence=args.media_tokens_per_sequence,
-                        draft_prepare=bool(args.draft_prepare),
-                    )
-                    ext_inputs = (
-                        {"analysis_input": 0.0}
-                        if any("analysis_input" in op.deps for g in ops.values() for op in g)
-                        else None
-                    )
-                    ctx = EvaluationContext.create(case, None, store)
-                    op_report = operator_costs(case, ops, primitives=store, evaluation=ctx)
-                    gr_report = graph_costs(
-                        case, ops, primitives=store,
-                        external_inputs=ext_inputs,
-                        include_submission=bool(args.include_submission),
-                        isolated=False, evaluation=ctx,
-                    )
-                    return analyze_network_efficiency(
-                        case, phase=args.phase, tokens=args.tokens, context=args.context,
-                        sequences=args.sequences, scope=args.scope,
-                        operator_report=op_report, graph_report=gr_report,
-                        evaluation_context=ctx,
-                    )
-                return analyze_network_efficiency(
-                    raw, phase=args.phase, tokens=args.tokens, context=args.context,
-                    sequences=args.sequences, scope=args.scope,
-                )
-        if view == "operators":
-            from mindie_sim.prediction.operator_analysis import operator_costs, target_graphs
-            case = parse_case(raw)
-            ops = target_graphs(
-                case, phase=args.phase, tokens=args.tokens, context=args.context,
-                sequences=args.sequences, scope=args.scope,
-                media_tokens_per_sequence=args.media_tokens_per_sequence,
-                draft_prepare=args.draft_prepare,
-            )
-            with PrimitiveStore(args.primitives) if args.primitives else nullcontext(None) as store:
-                return {
-                    **operator_costs(case, ops, primitives=store),
-                    "graph_scope": args.scope,
-                    "tokens_per_sequence": args.tokens,
-                    "sequences": args.sequences,
-                    "sequences_per_replica": args.sequences,
-                    "draft_prepare": args.draft_prepare,
-                    "deployment_scope": "first_independent_dp_cohort",
-                }
-        if view == "graph":
-            from mindie_sim.prediction.graph_analysis import graph_costs
-            from mindie_sim.prediction.operator_analysis import target_graphs
-            case = parse_case(raw)
-            ops = target_graphs(
-                case, phase=args.phase, tokens=args.tokens, context=args.context,
-                sequences=args.sequences, scope=args.scope,
-                media_tokens_per_sequence=args.media_tokens_per_sequence,
-                draft_prepare=args.draft_prepare,
-            )
-            with PrimitiveStore(args.primitives) if args.primitives else nullcontext(None) as store:
-                return {
-                    **graph_costs(
-                        case, ops, primitives=store,
-                        include_submission=bool(args.include_submission),
-                        isolated=bool(args.isolated),
-                    ),
-                    "graph_scope": args.scope,
-                    "tokens_per_sequence": args.tokens,
-                    "sequences": args.sequences,
-                    "sequences_per_replica": args.sequences,
-                    "draft_prepare": args.draft_prepare,
-                    "deployment_scope": "first_independent_dp_cohort",
-                }
-        req = StepRequest(
-            phase=args.phase,
-            tokens=args.tokens,
-            context=args.context,
-            sequences=args.sequences,
-            scope=args.scope,
-            media_tokens_per_sequence=args.media_tokens_per_sequence,
-            draft_prepare=bool(args.draft_prepare),
-        )
-        replay = ReplayOptions(
-            include_submission=bool(args.include_submission),
-            isolated=bool(args.isolated),
-            event_limit=int(args.event_limit),
-        )
-        with PrimitiveStore(args.primitives) if args.primitives else nullcontext(None) as store:
-            result = sdk_api.evaluate_step(raw, req, replay=replay, primitives=store)
-        return json_payload(result)
+        return _dispatch_predict_step(args)
     if cmd == "predict-tiers":
         raw = _case_with_supply(args)
         req = StepRequest(

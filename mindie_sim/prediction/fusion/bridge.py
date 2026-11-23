@@ -156,6 +156,32 @@ def add_recipe(book: RecipeBook, recipe_id: str, recipe: PlannedRecipe) -> Recip
     return register_recipe(book, recipe_id, recipe)
 
 
+def _resolve_fused_output_interface(retained_value, retained_spec, leader, first):
+    if retained_value is not None:
+        observed = tuple(int(dim) for dim in retained_value.shape) or (1,)
+        if retained_spec is not None and tuple(int(dim) for dim in retained_spec.local_shape) == observed:
+            local_shape = observed
+            padded_shape = tuple(int(dim) for dim in (retained_spec.padded_shape or observed)) or observed
+            launch_shape = tuple(int(dim) for dim in (retained_spec.launch_shape or observed)) or observed
+            semantic_shape = tuple(int(dim) for dim in (retained_spec.semantic_shape or observed)) or observed
+        else:
+            local_shape = padded_shape = launch_shape = semantic_shape = observed
+        dtype = retained_value.dtype or (leader.dtype if leader is not None else first.dtype)
+        layout = retained_value.layout or (leader.layout if leader is not None else "contiguous")
+        return local_shape, padded_shape, launch_shape, semantic_shape, dtype, layout
+    local_shape = tuple(int(dim) for dim in (leader.local_shape if leader is not None else (1,))) or (1,)
+    padded_shape = tuple(int(dim) for dim in (leader.padded_shape if leader is not None else local_shape)) or local_shape
+    launch_shape = tuple(int(dim) for dim in (leader.launch_shape if leader is not None else local_shape)) or local_shape
+    semantic_shape = (
+        tuple(int(dim) for dim in leader.semantic_shape)
+        if leader is not None and leader.semantic_shape
+        else first.param("semantic_shape", (1,))
+    )
+    dtype = leader.dtype if leader is not None else first.dtype
+    layout = leader.layout if leader is not None else first.layout
+    return local_shape, padded_shape, launch_shape, semantic_shape, dtype, layout
+
+
 def fused_op_spec(candidate, *, phase: str | None = None,
                   declared_hbm: int | None = None,
                   member_specs: tuple[OpSpec, ...] = (),
@@ -272,38 +298,9 @@ def fused_op_spec(candidate, *, phase: str | None = None,
         # a prior contraction may expose two distinct ports of one producer.
         metadata = (*metadata, (INPUT_PORTS_KEY, tuple(boundary_ports)))
     leader = member_specs[0] if member_specs else None
-    if retained_value is not None:
-        # A retained output is an external interface: its dtype/shape/layout is
-        # authoritative even under relaxed numerics.  Never copy the first
-        # member's dtype into the surviving output.
-        observed = tuple(int(dim) for dim in retained_value.shape) or (1,)
-        if retained_spec is not None \
-                and tuple(int(dim) for dim in retained_spec.local_shape) == observed:
-            local_shape = observed
-            padded_shape = tuple(int(dim) for dim in
-                                 (retained_spec.padded_shape or observed)) or observed
-            launch_shape = tuple(int(dim) for dim in
-                                 (retained_spec.launch_shape or observed)) or observed
-            semantic_shape = tuple(int(dim) for dim in
-                                   (retained_spec.semantic_shape or observed)) or observed
-        else:
-            local_shape = padded_shape = launch_shape = semantic_shape = observed
-        dtype = retained_value.dtype or (leader.dtype if leader is not None
-                                         else first.dtype)
-        layout = retained_value.layout or (
-            leader.layout if leader is not None else "contiguous")
-    else:
-        local_shape = tuple(int(dim) for dim in (
-            leader.local_shape if leader is not None else (1,))) or (1,)
-        padded_shape = tuple(int(dim) for dim in (
-            leader.padded_shape if leader is not None else local_shape)) or local_shape
-        launch_shape = tuple(int(dim) for dim in (
-            leader.launch_shape if leader is not None else local_shape)) or local_shape
-        semantic_shape = (tuple(int(dim) for dim in leader.semantic_shape)
-                          if leader is not None and leader.semantic_shape
-                          else first.param("semantic_shape", (1,)))
-        dtype = (leader.dtype if leader is not None else first.dtype)
-        layout = (leader.layout if leader is not None else first.layout)
+    local_shape, padded_shape, launch_shape, semantic_shape, dtype, layout = (
+        _resolve_fused_output_interface(retained_value, retained_spec, leader, first)
+    )
     return OpSpec(
         op_id=fused_id, family="native_fusion",
         phase=phase or first.phase, stage=first.stage, layer=first.stage,

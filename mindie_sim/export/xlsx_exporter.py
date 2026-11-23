@@ -177,6 +177,54 @@ def _resolve_xlsx_bundles(
     return bundle, compare_bundle
 
 
+def _populate_workbook_sheets(
+    wb: Workbook,
+    bundle: ExportBundle,
+    compare_bundle: ExportBundle | None,
+    macro_rows: Any,
+    plan: ComparisonPlan,
+    *,
+    is_script_audit: bool,
+) -> tuple[list[str], dict[str, int]]:
+    ws_summary = wb.create_sheet(SHEET_SUMMARY)
+    ws_breakdown = wb.create_sheet(SHEET_BREAKDOWN)
+    ws_memory = wb.create_sheet(SHEET_MEMORY)
+    populate_summary_sheet(
+        ws_summary, bundle, compare_bundle=compare_bundle,
+        macro_rows=macro_rows, roadmap=plan.roadmap,
+        codesign_note=plan.codesign_note, is_script_audit=is_script_audit,
+    )
+    if compare_bundle is not None:
+        s2_receipt = populate_comparison_breakdown_sheet(
+            ws_breakdown, bundle, compare_bundle, plan.aligned_rows, plan.group_accounting,
+        )
+    else:
+        s2_receipt = populate_standalone_breakdown_sheet(ws_breakdown, bundle)
+    populate_memory_sheet(ws_memory, compare_bundle or bundle)
+    sheet_names = [SHEET_SUMMARY, SHEET_BREAKDOWN, SHEET_MEMORY]
+    merge_counts = {
+        SHEET_SUMMARY: len(ws_summary.merged_ranges),
+        SHEET_BREAKDOWN: len(ws_breakdown.merged_ranges),
+        SHEET_MEMORY: len(ws_memory.merged_ranges),
+    }
+    if compare_bundle is not None or plan.pending_items:
+        ws_pending = wb.create_sheet(SHEET_PENDING_KERNELS)
+        populate_pending_kernel_details_sheet(
+            ws_pending, plan.pending_items, compare_bundle or bundle,
+            is_comparison=(compare_bundle is not None),
+            waterfall=(plan.waterfall if compare_bundle is not None else None),
+            breakdown_receipt=s2_receipt,
+        )
+        sheet_names.append(SHEET_PENDING_KERNELS)
+        merge_counts[SHEET_PENDING_KERNELS] = len(ws_pending.merged_ranges)
+    if bundle.reconciliation is not None:
+        ws_meas = wb.create_sheet(SHEET_MEASURED)
+        populate_measured_calibration_sheet(ws_meas, bundle)
+        sheet_names.append(SHEET_MEASURED)
+        merge_counts[SHEET_MEASURED] = len(ws_meas.merged_ranges)
+    return sheet_names, merge_counts
+
+
 def export_comparison_xlsx(
     source: ExportBundle | CaseInput | None = None,
     output_path: str | Path = "",
@@ -254,46 +302,10 @@ def export_comparison_xlsx(
 
     pending_items = plan.pending_items
     wb = Workbook()
-    ws_summary = wb.create_sheet(SHEET_SUMMARY)
-    ws_breakdown = wb.create_sheet(SHEET_BREAKDOWN)
-    ws_memory = wb.create_sheet(SHEET_MEMORY)
-
-    populate_summary_sheet(
-        ws_summary, bundle, compare_bundle=compare_bundle,
-        macro_rows=macro_rows, roadmap=plan.roadmap,
-        codesign_note=plan.codesign_note, is_script_audit=(script_audit is not None),
+    sheet_names, merge_counts = _populate_workbook_sheets(
+        wb, bundle, compare_bundle, macro_rows, plan,
+        is_script_audit=(script_audit is not None),
     )
-    if compare_bundle is not None:
-        s2_receipt = populate_comparison_breakdown_sheet(
-            ws_breakdown, bundle, compare_bundle, plan.aligned_rows, plan.group_accounting,
-        )
-    else:
-        s2_receipt = populate_standalone_breakdown_sheet(ws_breakdown, bundle)
-    populate_memory_sheet(ws_memory, compare_bundle or bundle)
-
-    sheet_names = [SHEET_SUMMARY, SHEET_BREAKDOWN, SHEET_MEMORY]
-    merge_counts = {
-        SHEET_SUMMARY: len(ws_summary.merged_ranges),
-        SHEET_BREAKDOWN: len(ws_breakdown.merged_ranges),
-        SHEET_MEMORY: len(ws_memory.merged_ranges),
-    }
-
-    if compare_bundle is not None or pending_items:
-        ws_pending = wb.create_sheet(SHEET_PENDING_KERNELS)
-        populate_pending_kernel_details_sheet(
-            ws_pending, pending_items, compare_bundle or bundle,
-            is_comparison=(compare_bundle is not None),
-            waterfall=(plan.waterfall if compare_bundle is not None else None),
-            breakdown_receipt=s2_receipt,
-        )
-        sheet_names.append(SHEET_PENDING_KERNELS)
-        merge_counts[SHEET_PENDING_KERNELS] = len(ws_pending.merged_ranges)
-
-    if bundle.reconciliation is not None:
-        ws_meas = wb.create_sheet(SHEET_MEASURED)
-        populate_measured_calibration_sheet(ws_meas, bundle)
-        sheet_names.append(SHEET_MEASURED)
-        merge_counts[SHEET_MEASURED] = len(ws_meas.merged_ranges)
 
     out = Path(output_path)
     size = wb.save(out)

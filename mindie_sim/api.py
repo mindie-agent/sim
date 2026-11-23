@@ -167,7 +167,6 @@ def solve_sla(case: CaseInput, request: SlaRequest, /) -> SlaEvaluation:
 def solve_optimal_deployment(
     model: ModelInput,
     hardware: HardwareInput = "a3",
-    /,
     **kwargs: Any,
 ) -> dict[str, Any]:
     """Jointly optimize PD Disaggregated vs Colocated + MTP under Domain 1/2/3."""
@@ -185,7 +184,6 @@ def solve_optimal_deployment(
 def solve_deployment(
     model: ModelInput,
     hardware: HardwareInput = "a3",
-    /,
     **kwargs: Any,
 ) -> dict[str, Any]:
     """One-shot agent entrypoint: capacity ledger, PD/colocated optimum, 4-track waterfall, roofline."""
@@ -203,7 +201,6 @@ def solve_deployment(
 def model_target_ceiling(
     model: ModelInput,
     hardware: HardwareInput = "a5",
-    /,
     **kwargs: Any,
 ) -> dict[str, Any]:
     """First-class Modeling Mode entrypoint solving Before vs After Iso-SLA ceiling."""

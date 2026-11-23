@@ -358,6 +358,38 @@ def _quant_mxfp4_all(
     )
 
 
+def _quant_w4a8_mxfp() -> QuantSpec:
+    """MXFP8 linears + MXFP4 routed experts (matching Eco-Tech W4A8_MXFP checkpoints)."""
+    return QuantSpec(
+        name="W8A8_MXFP8+W4A8_MXFP",
+        weight_format="fp8_e4m3", activation_format="fp8_e4m3",
+        expert_weight_format="mxfp4",
+        weight_block=(1, MX_EXPERT_BLOCK),
+        expert_block=MX_EXPERT_BLOCK,
+        scale_format="fp8_e8m0", scale_bytes=1.0,
+        activation_group_size=MX_EXPERT_BLOCK,
+        activation_scale_format="fp8_e8m0",
+        activation_scale_pack=MX_EXPERT_SCALE_PACK,
+        kv_dtype="bf16", index_dtype="bf16", index_scale_dtype="none",
+        category_overrides={
+            "routed_expert": _MXFP4_ROUTED_ACTIVATION,
+            "dspark_routed_expert": _MXFP4_ROUTED_ACTIVATION,
+            "latent_moe": _MXFP4_LINEAR_OVERRIDE,
+            "attn_res_proj": _MXFP4_LINEAR_OVERRIDE,
+        },
+        exclusions=_STANDARD_MXFP4_EXCLUSIONS,
+        source=merge_source({
+            "quant_method": "w4a8_mxfp",
+            "weight_block_size": "1x32",
+            "scale_fmt": "ue8m0",
+        }),
+        notes=(
+            "MXFP8 group32 linears + MXFP4 group32 routed experts with FP8 E4M3 activations",
+            "norm, router, embedding, LM head, MTP, mHC, vision and conv stay BF16/FP32",
+        ),
+    )
+
+
 def _quant_mxfp8_mxfp4() -> QuantSpec:
     """QuaRot / msmodelslim Ascend A5 production mixed MXFP8 linear + MXFP4 expert recipe."""
     return QuantSpec(
@@ -433,6 +465,11 @@ QUANTIZATION_PRESETS: dict[str, Any] = {
     "mxfp8_mxfp4": _quant_mxfp8_mxfp4,
     "mxfp8+mxfp4": _quant_mxfp8_mxfp4,
     "quarot_mxfp8_mxfp4": _quant_mxfp8_mxfp4,
+    "w4a8_mxfp": _quant_w4a8_mxfp,
+    "w4a8-mxfp": _quant_w4a8_mxfp,
+    "w4a8_mxfp4": _quant_w4a8_mxfp,
+    "w4a8-mxfp4": _quant_w4a8_mxfp,
+    "mxfp4_w4a8": _quant_w4a8_mxfp,
     "mxfp4": _quant_mxfp4_all,
     "mxfp4_all": lambda: _quant_mxfp4_all(exclusions=()),
     "mxfp4_routed_only": lambda: _quant_kimi({}),

@@ -46,11 +46,6 @@ ADDED_ROW_TIE_OFFSET = 0.5
 _SCOPE_PREFIXES = ("attention.", "ffn.", "shared.", "final.")
 
 
-def build_op_action_guidance(*_args: Any, **_kwargs: Any) -> tuple[str, str, str, str]:
-    """POST-MERGE DELETE: temporary empty-receipt shim for pre-merge ``bundle.py:1008``."""
-    return ("", "", "", "")
-
-
 def format_parallelism_codomain_summary(bundle: ExportBundle) -> tuple[str, str]:
     """Render coherent DCP<->TP co-domain banner and per-module parallel breakdown."""
     mem = bundle.memory_ledger
@@ -740,7 +735,7 @@ __all__ = [
     "AGENT_BRIEF_MAX_BYTES", "ComparisonPlan", "GroupAccounting", "WaterfallSummary",
     "_compact_agent_brief_to_budget", "align_before_after_operators", "build_actionable_roadmap",
     "build_agent_brief", "build_comparison_plan", "build_macro_module_breakdown",
-    "build_new_kernel_backlog", "build_op_action_guidance", "build_parallelism_codesign_note",
+    "build_new_kernel_backlog", "build_parallelism_codesign_note",
     "build_pending_kernel_details", "export_agent_brief", "format_executive_digest_markdown",
     "format_parallelism_codomain_summary",
 ]

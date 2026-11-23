@@ -607,7 +607,7 @@ def test_grouped_moe_abi_fp32_ub_expected_groups_and_a5_sector_eff_monotonicity(
     from mindie_sim.prediction.evaluation import EvaluationContext
     from mindie_sim.prediction.mechanism import Geometry
     from mindie_sim.prediction.operators.contracts import OperatorPlanningContext
-    from mindie_sim.prediction.operators.grouped_moe import arch22 as gm_arch22, arch35 as gm_arch35
+    from mindie_sim.prediction.operators import grouped_moe as gm_pkg
     from mindie_sim.prediction.operators.grouped_moe.common import validate_contract
     from mindie_sim.prediction.operators.grouped_moe.expected_grouped import ExpectedGroupedMatmul
     from mindie_sim.prediction.operators.matrix.matrix_steady import SteadyMatmul
@@ -620,6 +620,8 @@ def test_grouped_moe_abi_fp32_ub_expected_groups_and_a5_sector_eff_monotonicity(
     a3_geo = Geometry.from_devices(machine(GEN2_SKU).dies[:1])
     a5_ctx = OperatorPlanningContext(OpOccurrence(0, 0, 0, "gm_abi"), a5_geo, a5_geo.datapath)
     a3_ctx = OperatorPlanningContext(OpOccurrence(0, 0, 0, "gm_abi"), a3_geo, a3_geo.datapath)
+    gm_arch35_strat = gm_pkg.strategy_for_arch(a5_ctx.compute_arch.arch_id)
+    gm_arch22_strat = gm_pkg.strategy_for_arch(a3_ctx.compute_arch.arch_id)
     situ_meta = (
         ("mode", "mega_moe"), ("group_rows", (4, 4)), ("n", 128), ("k", 64),
         ("dtype_a", "bf16"), ("dtype_b", "bf16"), ("output_dtype", "bf16"),
@@ -628,12 +630,12 @@ def test_grouped_moe_abi_fp32_ub_expected_groups_and_a5_sector_eff_monotonicity(
     situ_op = OpSpec("gm_situ", "grouped_moe", "decode", 0, 0, ("r0",), (8, 128, 64),
                      (8, 128, 64), (8, 128, 64), (8, 128, 64), dtype="bf16",
                      recipe="mega_moe", metadata=situ_meta)
-    assert not gm_arch35.STRATEGY.accepts(situ_op, a5_ctx)
-    assert not gm_arch22.STRATEGY.accepts(situ_op, a3_ctx)
+    assert gm_arch35_strat is not None and not gm_arch35_strat.accepts(situ_op, a5_ctx)
+    assert gm_arch22_strat is not None and not gm_arch22_strat.accepts(situ_op, a3_ctx)
     ext_op = replace(situ_op, metadata=situ_meta + (("abi_variant_extension", True),))
-    assert gm_arch35.STRATEGY.accepts(ext_op, a5_ctx)
-    assert gm_arch22.STRATEGY.accepts(ext_op, a3_ctx)
-    _, slot_bytes = gm_arch35._fit_ub(validate_contract(ext_op, a5_ctx), a5_ctx)
+    assert gm_arch35_strat.accepts(ext_op, a5_ctx)
+    assert gm_arch22_strat.accepts(ext_op, a3_ctx)
+    _, slot_bytes = gm_pkg.fit_arch35_ub(validate_contract(ext_op, a5_ctx), a5_ctx)
     # BF16 handoff still budgets FP32 (4 B/elem) * 2 (gate+up) * rows * cols in UB.
     assert slot_bytes == 4 * 64 * 2 * 4
 

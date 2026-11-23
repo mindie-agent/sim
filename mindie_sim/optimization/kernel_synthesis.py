@@ -1580,6 +1580,12 @@ def _format_dag_equation(
     w_sym = f"W_{w_tag}" if w_tag else "W"
     eq_map = {
         "view_copy": f"{out} = strided_view({prev}) [zero-copy metadata elision]",
+        "megamoe": (
+            f"h_disp = AllToAllDispatch({prev}); u = GroupedMatMul(h_disp, W_gate_up^T); "
+            f"a, s = ActMxQuant(u{param_txt}); y_loc = GroupedMatMul(a, W_down^T); "
+            f"{out} = AllToAllCombine(y_loc, topk_w) [{shape_tag}, Persistent Megakernel]"
+        ),
+        "moe_router_topk": f"{out}, topk_idx = TopK(softmax/sigmoid({prev} @ {w_sym}^T)) [{shape_tag}, UB FP32]",
         "grouped_matmul": f"{out} = GroupedMatMul({prev}, {w_sym}_e^T) [{shape_tag}, L0C FP32]",
         "matmul": f"{out} = {prev} @ {w_sym}^T [{shape_tag}, L0C FP32]",
         "allgather": f"{out} = AllGather({prev}, axis={trait.collective_axis or 'tp'})",
@@ -3262,7 +3268,12 @@ def _apply_pillar23_envelopes(
             pillar = "pillar2_roofline"
             status_lbl = (
                 f"{STATUS_NEW_OP} UB 驻留 Block-AttnRes 融合前缀"
-                if needs_new else f"{STATUS_TUNE_PREFIX} -> L0 流水线目标]"
+                if (needs_new and fam == "attn_res_prefix")
+                else (
+                    f"{STATUS_NEW_OP} {node.ascend_kernel or node.logical_role}"
+                    if needs_new
+                    else f"{STATUS_TUNE_PREFIX} -> L0 流水线目标]"
+                )
             )
 
         t_after = min(node.dur_us, t_target)

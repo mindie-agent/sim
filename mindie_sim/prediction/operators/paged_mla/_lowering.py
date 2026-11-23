@@ -650,6 +650,35 @@ class _PagedMlaProgramBuilder:
                 caps[mte1_res] = owner_rate * (b_mte1 / eff_mte1)
         return caps or None
 
+    def _ring_credits(self, owner: int) -> dict[str, list[tuple[str, str, int]]]:
+        credits: dict[str, list[tuple[str, str, int]]] = {}
+        for region, depth, producer, consumer in self.layout.rings:
+            ring = RingBuffer(owner=owner, allocation=region, depth=depth)
+            for k in range(depth + 1):
+                generation = lower_generation(ring, k, producer, (consumer,))
+            credit_index = next(g.index for g in ring.generations if g.last_use == generation.credit)
+            credits.setdefault(producer, []).append((region, consumer, generation.index - credit_index))
+        return credits
+
+    def _cycle_stage_metadata(
+        self, step: str, index: int, offset: int, clock: int, interval: int,
+        mm2_slot: int, mm2_offset: int, aiv_owners: str, *, compact_names: bool,
+    ) -> dict[str, Any]:
+        if compact_names:
+            return {}
+        layout = self.layout
+        metadata: dict[str, Any] = {"kv_tile": offset + index, "clock": clock}
+        if layout.gm_workspace:
+            metadata.update(task_record_idx=index % len(layout.clocks),
+                            workspace_buf_idx=index % FIA_WORKSPACE_DEPTH)
+            if step in {"partial", "atomic_rescale", "atomic_write", "output_read"}:
+                metadata.update(bn2_idx_in_cur_core=interval, mm2_slot=mm2_slot, mm2_offset_bytes=mm2_offset)
+        if layout.pv_panel_width and step in {"pv0", "pv1", "partial0", "partial1", "release0", "release1"}:
+            panel = int(step[-1])
+            metadata.update(mm2_slot=panel, mm2_generation=index, aiv_owners=aiv_owners,
+                            column_start=panel * layout.pv_panel_width, columns=layout.pv_panel_width)
+        return metadata
+
     def _split_program(self, ctx, seq, query, heads, live, pair, offset, count, partials, interval, head_start,
                        *, active_owners: int | None = None):
         layout = self.layout
@@ -661,13 +690,7 @@ class _PagedMlaProgramBuilder:
         phases = layout.phases
         delays = {step: delay for delay, steps in enumerate(layout.clocks) for step in steps}
         period = lcm(len(layout.clocks), *(depth for _, depth, _, _ in layout.rings))
-        credits = {}
-        for region, depth, producer, consumer in layout.rings:
-            ring = RingBuffer(owner=pair[0], allocation=region, depth=depth)
-            for k in range(depth + 1):
-                generation = lower_generation(ring, k, producer, (consumer,))
-            credit_index = next(g.index for g in ring.generations if g.last_use == generation.credit)
-            credits.setdefault(producer, []).append((region, consumer, generation.index - credit_index))
+        credits = self._ring_credits(pair[0])
 
         def name(step, index):
             return f"{step}:{index % period}"
@@ -712,20 +735,13 @@ class _PagedMlaProgramBuilder:
                     depend("release1" if step == "release0" else "release0",
                            index - 1 if step == "release0" else index)
                 elif layout.gm_workspace and layout.head_tile > SINGLE_AIV_HEAD_LIMIT:
-                    if step == "qk":
-                        depend("kv_load", index)
-                    elif step == "score_store":
-                        depend("qk_operands", index)
-                        depend("qk", index)
-                    elif step == "pv":
-                        depend("pv_load", index)
-                    elif step == "atomic_rescale":
-                        depend("probability", index)
-                    elif step == "partial":
-                        depend("pv_operands", index)
-                        depend("pv", index)
-                    elif position:
-                        depend(phases[position - 1], index)
+                    gm_dep_map = {
+                        "qk": ("kv_load",), "score_store": ("qk_operands", "qk"),
+                        "pv": ("pv_load",), "atomic_rescale": ("probability",),
+                        "partial": ("pv_operands", "pv"),
+                    }
+                    for dep_step in gm_dep_map.get(step, (phases[position - 1],) if position else ()):
+                        depend(dep_step, index)
                 elif position:
                     depend(phases[position - 1], index)
                 if step in {"softmax", "output_update", "qk", "pv"}:
@@ -737,19 +753,10 @@ class _PagedMlaProgramBuilder:
                     depend("partial", index - 1)
                 if step == "pv0":
                     depend("partial1", index - 1)
-                metadata = {} if compact_names else {"kv_tile": offset + index, "clock": clock}
-                if not compact_names and layout.gm_workspace:
-                    metadata.update(task_record_idx=index % len(layout.clocks),
-                                    workspace_buf_idx=index % FIA_WORKSPACE_DEPTH)
-                    if step in {"partial", "atomic_rescale", "atomic_write", "output_read"}:
-                        metadata.update(bn2_idx_in_cur_core=interval, mm2_slot=mm2_slot,
-                                        mm2_offset_bytes=mm2_offset)
-                if not compact_names and layout.pv_panel_width and step in {
-                    "pv0", "pv1", "partial0", "partial1", "release0", "release1",
-                }:
-                    panel = int(step[-1])
-                    metadata.update(mm2_slot=panel, mm2_generation=index, aiv_owners=aiv_owners,
-                                    column_start=panel * layout.pv_panel_width, columns=layout.pv_panel_width)
+                metadata = self._cycle_stage_metadata(
+                    step, index, offset, clock, interval, mm2_slot, mm2_offset, aiv_owners,
+                    compact_names=compact_names,
+                )
                 for region, consumer, depth in credits.get(step, ()):
                     depend(consumer, index - depth)
                     if not compact_names:

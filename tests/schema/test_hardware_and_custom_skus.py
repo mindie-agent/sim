@@ -333,12 +333,12 @@ def test_bandwidth_units_converge_and_explicit_channel_beats_convenience_fields(
     def inter(**extra):
         return _channel(_fabric(**extra), "d2d_inter_node")[0].capacity_bytes_per_ms
     base = inter()
-    # x Gb/s == x/8 GB/s == x/8 * 1e9 B/s; the explicit B/s field beats Gb/s on its layer.
-    assert inter(inter_node_bw_gbps=base * 8 / 1e6) == pytest.approx(base)
+    # Canonical GB/s: x GB/s == x * 1e9 B/s; explicit B/s beats GB/s on its layer.
+    assert inter(inter_node_bw_gbps=base / 1e6) == pytest.approx(base)
     assert inter(inter_node_bw_gbps=1, inter_node_bw_bytes_per_s=base * 1e3) == pytest.approx(base)
     assert inter(transfer_channels={"d2d_inter_node": {"effective_uni_bw_gbps": 50.0}},
                  inter_node_bw_gbps=200) == 50e6
-    intra = _fabric(intra_node_bw_gbps=400)
+    intra = _fabric(intra_node_bw_gbps=50)
     assert all(link.capacity_bytes_per_ms == 50e6 for link in _channel(intra, "d2d_intra_node"))
     assert _channel(intra, "d2d_inter_node")[0].capacity_bytes_per_ms == base
     explicit = [{"name": "declared", "members": list(range(16)), "capacity_gbps": 25,

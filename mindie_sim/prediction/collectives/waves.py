@@ -269,8 +269,11 @@ class WavePlan:
         return tuple(sorted({rank for group in self.groups for rank in group.ranks}))
 
     def start(self, engine, name, ready, *, owner=""):
-        return self.start_participants(
+        from .ring_pairwise import _joint_complete
+
+        events = self.start_participants(
             engine, name, {rank: ready for rank in self.ranks}, owner=owner)
+        return _joint_complete(engine, name, events.values(), ready, owner)
 
     def start_participants(self, engine, name, ready_by_rank, *, owner=""):
         from .ring_pairwise import _ready_by_rank

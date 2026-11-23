@@ -33,11 +33,21 @@ from mindie_sim.schema.device_input import (
 )
 
 DIRECT_MESH_RANKS = 8
+A3_FULL_NODE_RANKS = 16
 SUBGROUP_QUAD_DIE_RANKS = 4
 SUBGROUP_OCTA_DIE_RANKS = 8
 BITS_PER_BYTE = 8
 GBPS_TO_BYTES_PER_MS = 1_000_000.0
 BYTES_PER_S_TO_GBPS = 1_000_000_000.0
+_COMPACT_A3_SKUS = frozenset({"Ascend910_9381", "Ascend910_9382"})
+
+
+def default_ranks_per_node(sku: str) -> int:
+    """Return canonical physical dies-per-node for an Ascend SKU."""
+    name = str(sku or "").strip()
+    if name in _COMPACT_A3_SKUS:
+        return DIRECT_MESH_RANKS
+    return A3_FULL_NODE_RANKS if name.startswith("Ascend910_93") else DIRECT_MESH_RANKS
 
 _LINK_FIELDS = (
     "transaction_bytes", "alignment_bytes", "protocol_overhead_bytes",
@@ -230,8 +240,10 @@ def _merge_channels(raw, profile):
                     channels[name]["peak_capacity_bytes_per_ms"] = value * GBPS_TO_BYTES_PER_MS
             channels[name]["effective_uni_bw_gbps"] = value
             channels[name]["bandwidth_provenance"] = provenance
-    node_ranks = int(raw.get("ranks_per_node", DIRECT_MESH_RANKS)
-                     or DIRECT_MESH_RANKS)
+    node_ranks = int(
+        raw.get("ranks_per_node")
+        or default_ranks_per_node(str(raw.get("sku", "")))
+    )
     if node_ranks > DIRECT_MESH_RANKS:
         declared_semantics = declared.get("d2d_intra_node", set())
         if not ({"semantics", "channel_semantics"} & declared_semantics):
@@ -287,13 +299,13 @@ def _finalize_channel_utilization(channels, explicit=(), declared=None):
 
 
 def _topology_bandwidth(raw, kind, preset_active):
+    del preset_active
     channel, bytes_field, gbps_field, util_field, latency_field = _CONVENIENCE[kind]
     peak = None
     if raw.get(bytes_field) is not None:
         peak = _number(bytes_field, raw[bytes_field]) / BYTES_PER_S_TO_GBPS
     elif raw.get(gbps_field) is not None:
-        value = _number(gbps_field, raw[gbps_field])
-        peak = value if (preset_active or kind == "intra_package") else value / BITS_PER_BYTE
+        peak = _number(gbps_field, raw[gbps_field])
     util = None
     if raw.get(util_field) is not None:
         util = _positive_float(raw[util_field], f"{util_field}_invalid",
@@ -456,6 +468,64 @@ OPTICAL_STARTUP_SCOPE = "phase"
 OPTICAL_SUPERPOD_EVIDENCE_ID = (
     "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#a3_superpod_optical_hccs"
 )
+A5_SUPERPOD_UB_EVIDENCE_ID = "a5-cann93/ub_superpod_optical"
+A5_PCIE_GEN5_EVIDENCE_ID = "a5-cann93/pcie_gen5_16p"
+_PROTOCOL_PIN_FIELDS = frozenset({"protocol", "protocol_bands", "transport_mode"})
+_BAND_TIERS = (
+    ("small", 0, OPTICAL_SMALL_MAX_EXCLUSIVE, OPTICAL_SMALL_FRAME_BYTES, OPTICAL_MID_FRAME_BYTES),
+    ("mid", OPTICAL_SMALL_MAX_EXCLUSIVE, OPTICAL_MID_MAX_EXCLUSIVE, OPTICAL_MID_FRAME_BYTES, OPTICAL_MID_CREDIT_BYTES),
+    ("large", OPTICAL_MID_MAX_EXCLUSIVE, None, OPTICAL_LARGE_FRAME_BYTES, OPTICAL_LARGE_CREDIT_BYTES),
+)
+
+
+def _a5_superpod_ub_bands(superpod_size: int, latency_us: float) -> list[dict]:
+    max_group = max(OPTICAL_MIN_GROUP, int(superpod_size))
+    return [
+        {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "cross_node",
+            "group_min": OPTICAL_MIN_GROUP,
+            "group_max": max_group,
+            "expansion_mode": "concurrent",
+            "payload_min_inclusive": lo,
+            "payload_max_exclusive": hi,
+            "algorithm": "ring",
+            "protocol": f"ub_superpod_{tier}",
+            "startup_scope": OPTICAL_STARTUP_SCOPE,
+            "startup_us": float(latency_us),
+            "payload_bytes_per_frame": frame_bytes,
+            "wire_bytes_per_frame": frame_bytes,
+            "credit_bytes": credit_bytes,
+            "evidence_id": A5_SUPERPOD_UB_EVIDENCE_ID,
+        }
+        for tier, lo, hi, frame_bytes, credit_bytes in _BAND_TIERS
+    ]
+
+
+def _a5_pcie_bands(per_node: int, latency_us: float) -> list[dict]:
+    max_group = max(OPTICAL_MIN_GROUP, int(per_node))
+    return [
+        {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "node",
+            "group_min": OPTICAL_MIN_GROUP,
+            "group_max": max_group,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": lo,
+            "payload_max_exclusive": hi,
+            "algorithm": "ring",
+            "protocol": f"pcie_gen5_{tier}",
+            "startup_scope": "hop",
+            "startup_us": float(latency_us),
+            "payload_bytes_per_frame": frame_bytes,
+            "wire_bytes_per_frame": frame_bytes,
+            "credit_bytes": credit_bytes,
+            "evidence_id": A5_PCIE_GEN5_EVIDENCE_ID,
+        }
+        for tier, lo, hi, frame_bytes, credit_bytes in _BAND_TIERS
+    ]
 
 
 def _a3_superpod_optical_bands(superpod_size: int, latency_us: float) -> list[dict]:
@@ -498,6 +568,97 @@ def _a3_superpod_optical_bands(superpod_size: int, latency_us: float) -> list[di
     return bands
 
 
+def _apply_superpod_inter_node_protocol(combined, raw, channels, declared, superpod_size, same_latency):
+    preset_name = raw.get("topology_preset")
+    sku_name = str(combined.get("sku", ""))
+    is_a3_superpod = (
+        preset_name == "a3_superpod"
+        or (sku_name.startswith("Ascend910_93") and preset_name is None and combined.get("superpod_size") is not None)
+    )
+    is_a5_pod = (
+        preset_name == "a5_pod"
+        or (sku_name.startswith("Ascend950") and preset_name is None and raw.get("superpod_size") is not None)
+    )
+    if _PROTOCOL_PIN_FIELDS & declared.get("d2d_inter_node", set()):
+        return
+    if is_a3_superpod:
+        channels["d2d_inter_node"].update(
+            protocol="HCCS_OPTICAL_SUPERPOD", transport_mode="optical_hccs",
+            rail_id="hccs_optical_r0", switch_id="superpod_sw0",
+            scope="cross_node", alpha_us=same_latency,
+            protocol_bands=_a3_superpod_optical_bands(superpod_size, same_latency),
+        )
+    elif is_a5_pod:
+        channels["d2d_inter_node"].update(
+            protocol="UB_SUPERPOD", transport_mode="ub_optical",
+            rail_id="ub_pod_r0", switch_id="ub_pod_sw0",
+            scope="cross_node", alpha_us=same_latency,
+            protocol_bands=_a5_superpod_ub_bands(superpod_size, same_latency),
+        )
+
+
+def _inter_node_links(combined, raw, preset, channels, placements, count, per_node, explicit, bw_caller, declared):
+    superpod_size = combined.get("superpod_size", combined.get("max_dies"))
+    if superpod_size is not None:
+        if isinstance(superpod_size, bool):
+            raise ModelingError("ascend_superpod_size_invalid")
+        superpod_size = int(superpod_size)
+        if superpod_size <= 0:
+            raise ModelingError("ascend_superpod_size_invalid")
+        if superpod_size < per_node:
+            raise ModelingError("ascend_superpod_size_smaller_than_node")
+    inter_tier = _tier_bandwidth(channels, "d2d_inter_node") if "d2d_inter_node" in channels else None
+    orig_inter_decl = deepcopy(channels["d2d_inter_node"]) if "d2d_inter_node" in channels else None
+    same_peak = same_util = same_capacity = same_latency = None
+    if superpod_size is not None and inter_tier is not None:
+        same_peak, same_util, same_capacity, same_latency = resolve_same_pod_tier(
+            combined, raw, preset, declared, "d2d_inter_node" in explicit,
+            "d2d_inter_node" in bw_caller, inter_tier,
+            _declaration_latency(channels["d2d_inter_node"]))
+        channels["d2d_inter_node"].update(
+            uni_peak_bw_gbps=same_peak, bw_utilization=same_util,
+            effective_uni_bw_gbps=same_capacity,
+            peak_capacity_bytes_per_ms=same_peak * GBPS_TO_BYTES_PER_MS,
+            latency_us=same_latency)
+        _apply_superpod_inter_node_protocol(combined, raw, channels, declared, superpod_size, same_latency)
+    if not (per_node > 0 and count > per_node and inter_tier is not None):
+        return []
+    links = []
+    inter_peak, inter_util, inter_effective = inter_tier
+    inter_decl = orig_inter_decl or channels["d2d_inter_node"]
+    inter_latency = _declaration_latency(inter_decl)
+    if superpod_size is not None:
+        links.extend(_group_links(
+            channels, "d2d_inter_node", placement_node_order_groups(placements, superpod_size),
+            peak=same_peak, util=same_util, latency=same_latency, capacity=same_capacity))
+        if superpod_size < count:
+            if "d2d_inter_pod" in declared:
+                pod_peak, pod_util, pod_effective = _tier_bandwidth(channels, "d2d_inter_pod")
+                pod_latency = _declaration_latency(channels["d2d_inter_pod"], inter_latency)
+            else:
+                pod_peak = _number("inter_pod_bw_gbps", raw.get(
+                    "inter_pod_bw_gbps", preset.get("inter_pod_bw_gbps", inter_peak)))
+                pod_util = _positive_float(
+                    raw.get("inter_node_bw_util", preset.get("inter_node_bw_util", 1.0)),
+                    "inter_node_bw_util_invalid", allow_zero=False)
+                pod_latency = _positive_float(
+                    raw.get("inter_pod_latency_us", preset.get("inter_pod_latency_us", inter_latency)),
+                    "inter_pod_latency_us_invalid", allow_zero=True)
+                pod_effective = pod_peak * pod_util
+            pod_decl = {**inter_decl, "channel": "d2d_inter_pod"}
+            if pod_decl.get("rail_id"):
+                pod_decl["rail_id"] = f"{pod_decl['rail_id']}_pod"
+            channels.setdefault("d2d_inter_pod", pod_decl)
+            links.extend(_group_links(
+                channels, "d2d_inter_pod", placement_node_order_groups(placements),
+                peak=pod_peak, util=pod_util, latency=pod_latency, capacity=pod_effective))
+    else:
+        links.extend(_group_links(
+            channels, "d2d_inter_node", placement_node_order_groups(placements),
+            peak=inter_peak, util=inter_util, latency=inter_latency, capacity=inter_effective))
+    return links
+
+
 def _generated_links(combined, raw, preset, channels, count, per_package,
                      per_node, explicit, bw_caller, declared):
     placements = resolve_device_placements(
@@ -514,6 +675,13 @@ def _generated_links(combined, raw, preset, channels, count, per_package,
         node_peak, node_util, node_effective = node_tier
         node_decl = channels["d2d_intra_node"]
         node_latency = _declaration_latency(node_decl)
+        if (raw.get("topology_preset") == "a5_pcie_16p"
+                and not (_PROTOCOL_PIN_FIELDS & declared.get("d2d_intra_node", set()))):
+            node_decl.update(
+                protocol="PCIe_Gen5", transport_mode="pcie_p2p", rail_id="pcie_r0",
+                scope="node", alpha_us=node_latency,
+                protocol_bands=_a5_pcie_bands(per_node, node_latency),
+            )
         node_caller = "d2d_intra_node" in bw_caller
         quad = _subgroup_tier(
             channels, raw, preset, declared, explicit, "d2d_intra_4p",
@@ -541,8 +709,7 @@ def _generated_links(combined, raw, preset, channels, count, per_package,
                 channels, "d2d_intra_8p",
                 placement_node_groups(placements, SUBGROUP_OCTA_DIE_RANKS),
                 peak=peak, util=util, latency=latency, capacity=effective))
-        node_peak_eff, node_util_eff, node_capacity = (
-            node_peak, node_util, node_effective)
+        node_peak_eff, node_util_eff, node_capacity = node_peak, node_util, node_effective
         if per_node <= SUBGROUP_QUAD_DIE_RANKS and quad is not None:
             node_peak_eff, node_util_eff, node_capacity, node_latency = quad
         elif per_node <= SUBGROUP_OCTA_DIE_RANKS and octa is not None:
@@ -552,87 +719,7 @@ def _generated_links(combined, raw, preset, channels, count, per_package,
             peak=node_peak_eff, util=node_util_eff, latency=node_latency,
             capacity=node_capacity))
 
-    superpod_size = combined.get("superpod_size", combined.get("max_dies"))
-    if superpod_size is not None:
-        if isinstance(superpod_size, bool):
-            raise ModelingError("ascend_superpod_size_invalid")
-        superpod_size = int(superpod_size)
-        if superpod_size <= 0:
-            raise ModelingError("ascend_superpod_size_invalid")
-        if superpod_size < per_node:
-            raise ModelingError("ascend_superpod_size_smaller_than_node")
-    inter_tier = (_tier_bandwidth(channels, "d2d_inter_node")
-                  if "d2d_inter_node" in channels else None)
-    orig_inter_decl = (
-        deepcopy(channels["d2d_inter_node"])
-        if "d2d_inter_node" in channels else None
-    )
-    if superpod_size is not None and inter_tier is not None:
-        same_peak, same_util, same_capacity, same_latency = resolve_same_pod_tier(
-            combined, raw, preset, declared, "d2d_inter_node" in explicit,
-            "d2d_inter_node" in bw_caller, inter_tier,
-            _declaration_latency(channels["d2d_inter_node"]))
-        channels["d2d_inter_node"].update(
-            uni_peak_bw_gbps=same_peak, bw_utilization=same_util,
-            effective_uni_bw_gbps=same_capacity,
-            peak_capacity_bytes_per_ms=same_peak * GBPS_TO_BYTES_PER_MS,
-            latency_us=same_latency)
-        is_a3_superpod = (
-            raw.get("topology_preset") == "a3_superpod"
-            or str(combined.get("sku", "")).startswith("Ascend910_93")
-        )
-        if is_a3_superpod and "d2d_inter_node" not in explicit:
-            channels["d2d_inter_node"].update(
-                protocol="HCCS_OPTICAL_SUPERPOD",
-                transport_mode="optical_hccs",
-                rail_id="hccs_optical_r0",
-                switch_id="superpod_sw0",
-                scope="cross_node",
-                alpha_us=same_latency,
-                protocol_bands=_a3_superpod_optical_bands(superpod_size, same_latency),
-            )
-    if per_node > 0 and count > per_node and inter_tier is not None:
-        inter_peak, inter_util, inter_effective = inter_tier
-        inter_decl = orig_inter_decl or channels["d2d_inter_node"]
-        inter_latency = _declaration_latency(inter_decl)
-        if superpod_size is not None:
-            links.extend(_group_links(
-                channels, "d2d_inter_node",
-                placement_node_order_groups(placements, superpod_size),
-                peak=same_peak, util=same_util, latency=same_latency,
-                capacity=same_capacity))
-            if superpod_size < count:
-                if "d2d_inter_pod" in declared:
-                    pod_peak, pod_util, pod_effective = _tier_bandwidth(
-                        channels, "d2d_inter_pod")
-                    pod_latency = _declaration_latency(
-                        channels["d2d_inter_pod"], inter_latency)
-                else:
-                    pod_peak = _number("inter_pod_bw_gbps", raw.get(
-                        "inter_pod_bw_gbps",
-                        preset.get("inter_pod_bw_gbps", inter_peak)))
-                    pod_util = _positive_float(
-                        raw.get("inter_node_bw_util", preset.get(
-                            "inter_node_bw_util", 1.0)),
-                        "inter_node_bw_util_invalid", allow_zero=False)
-                    pod_latency = _positive_float(
-                        raw.get("inter_pod_latency_us", preset.get(
-                            "inter_pod_latency_us", inter_latency)),
-                        "inter_pod_latency_us_invalid", allow_zero=True)
-                    pod_effective = pod_peak * pod_util
-                pod_decl = {**inter_decl, "channel": "d2d_inter_pod"}
-                if pod_decl.get("rail_id"):
-                    pod_decl["rail_id"] = f"{pod_decl['rail_id']}_pod"
-                channels.setdefault("d2d_inter_pod", pod_decl)
-                links.extend(_group_links(
-                    channels, "d2d_inter_pod",
-                    placement_node_order_groups(placements), peak=pod_peak,
-                    util=pod_util, latency=pod_latency,
-                    capacity=pod_effective))
-        else:
-            links.extend(_group_links(
-                channels, "d2d_inter_node",
-                placement_node_order_groups(placements), peak=inter_peak,
-                util=inter_util, latency=inter_latency,
-                capacity=inter_effective))
+    links.extend(_inter_node_links(
+        combined, raw, preset, channels, placements, count, per_node, explicit, bw_caller, declared,
+    ))
     return links

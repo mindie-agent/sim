@@ -67,7 +67,7 @@ HARDWARE_ALIASES: dict[str, str] = {
     "a2": "Ascend910B4", "910b": "Ascend910B4", "910b4": "Ascend910B4",
     "910b1": "Ascend910B1", "910b2": "Ascend910B2", "910b3": "Ascend910B3",
     "a3": "Ascend910_9392", "910c": "Ascend910_9392", "910_9392": "Ascend910_9392",
-    "910_9382": "Ascend910_9382",
+    "910_9362": "Ascend910_9362", "910_9382": "Ascend910_9382",
     "a5": "Ascend950DT_9582", "950": "Ascend950DT_9582",
     "a5-pod": "Ascend950DT_9581", "atlas-950-superpod": "Ascend950DT_9581",
     "950pr_958b": "Ascend950PR_958b", "ascend950pr_958b": "Ascend950PR_958b",
@@ -136,11 +136,6 @@ HARDWARE_TOPOLOGY_ALIASES: dict[str, tuple[str, str]] = {
 }
 
 _QUANT_ALIASES: dict[str, str] = {
-    "w4a8_mxfp": "mxfp4",
-    "w4a8-mxfp": "mxfp4",
-    "w4a8_mxfp4": "mxfp4",
-    "w4a8-mxfp4": "mxfp4",
-    "mxfp4_w4a8": "mxfp4",
     "w8a8_mxfp": "mxfp8",
     "w8a8-mxfp": "mxfp8",
     "w8a8_mxfp8": "mxfp8",
@@ -333,7 +328,7 @@ def _read_companion_quant_spec(path: Path, raw_config: Mapping[str, Any]) -> Any
     return parse_quant_model_description(desc_data, base_config=raw_config)
 
 
-def _resolve_checkpoint_model_spec(key: str) -> ModelSpec | None:
+def _resolve_checkpoint_model_spec(key: str, *, hw_family: str = "a5") -> ModelSpec | None:
     from mindie_sim.catalog.npu_checkpoints import (
         lookup_eco_tech_repo,
         resolve_checkpoint_metadata,
@@ -345,7 +340,7 @@ def _resolve_checkpoint_model_spec(key: str) -> ModelSpec | None:
     )
     if not is_repo_or_url:
         return None
-    meta = resolve_checkpoint_metadata(key, allow_network=False)
+    meta = resolve_checkpoint_metadata(key, hw_family=hw_family, allow_network=False)
     canon = MODEL_ALIASES.get(
         meta.canonical_model,
         ARCHITECTURE_PRESET_ALIASES.get(meta.canonical_model, meta.canonical_model),
@@ -360,7 +355,9 @@ def _resolve_checkpoint_model_spec(key: str) -> ModelSpec | None:
     return None
 
 
-def _resolve_model_spec(model: str | Path | Mapping[str, Any]) -> ModelSpec:
+def _resolve_model_spec(
+    model: str | Path | Mapping[str, Any], *, hw_family: str = "a5",
+) -> ModelSpec:
     if isinstance(model, Mapping):
         raw = dict(model)
         if "layers" in raw and "hidden_size" in raw and "model_type" not in raw:
@@ -389,17 +386,39 @@ def _resolve_model_spec(model: str | Path | Mapping[str, Any]) -> ModelSpec:
         return load_model(canonical)
     candidate = Path(key).expanduser()
     if candidate.exists():
-        return _resolve_model_spec(candidate)
+        return _resolve_model_spec(candidate, hw_family=hw_family)
     cfg_candidate = CONFIG_DIR / (key if key.endswith(".json") else f"{key}.json")
     if cfg_candidate.is_file():
-        return _resolve_model_spec(cfg_candidate)
-    checkpoint_spec = _resolve_checkpoint_model_spec(key)
+        return _resolve_model_spec(cfg_candidate, hw_family=hw_family)
+    checkpoint_spec = _resolve_checkpoint_model_spec(key, hw_family=hw_family)
     if checkpoint_spec is not None:
         return checkpoint_spec
     try:
         return load_model(key)
     except (KeyError, ValueError, ModelingError) as exc:
         raise ModelingError(f"unknown_model:{key} — {_format_model_suggestions(key)}") from exc
+
+
+def _validate_explicit_quant_for_hardware(
+    spec: ModelSpec, machine: Mapping[str, Any], raw_quant: Any,
+) -> None:
+    if spec.quant is None:
+        return
+    sku = str(machine.get("sku") or "")
+    arch = _arch_key(sku)
+    peaks = machine.get("device", {}).get("compute_peaks", {})
+    has_fp8 = any(k in peaks for k in ("fp8", "fp8_e4m3", "mxfp4"))
+    if arch not in {"a2", "a3"} and has_fp8:
+        return
+    fmts = (
+        str(spec.quant.weight_format or "").lower(),
+        str(spec.quant.activation_format or "").lower(),
+        str(spec.quant.expert_weight_format or "").lower(),
+    )
+    if any(tok in fmt for fmt in fmts for tok in ("fp8", "mxfp4", "fp4")):
+        raise ModelingError(
+            f"quant_unsupported_on_hardware:{sku or arch}:{raw_quant}"
+        )
 
 
 def _apply_quant_override(
@@ -419,26 +438,22 @@ def _apply_quant_override(
     if isinstance(quant, str):
         raw_key = quant.strip().lower()
         qkey = _QUANT_ALIASES.get(raw_key, raw_key)
-        native_q = model_spec.quant
-        native_mxfp4_excluded = (
-            native_q is not None
-            and str(native_q.expert_weight_format) == "mxfp4"
-            and bool(native_q.exclusions)
-        )
-        if qkey in {"mxfp4", "mxfp4_routed_only"} and native_mxfp4_excluded:
-            return model_spec
         try:
-            return apply_model_overrides(model_spec, {"quantization": qkey})
+            updated = apply_model_overrides(model_spec, {"quantization": qkey})
         except (ValueError, ModelingError) as exc:
             raise ModelingError(
                 f"invalid_quant_override:{quant} — {_format_quant_suggestions(raw_key)}"
             ) from exc
+        _validate_explicit_quant_for_hardware(updated, machine, quant)
+        return updated
     if isinstance(quant, Mapping):
         qdict = dict(quant)
-        return apply_model_overrides(
+        updated = apply_model_overrides(
             model_spec,
             {"quant": qdict, "kv_dtype": str(qdict.get("kv_dtype", model_spec.kv_dtype))},
         )
+        _validate_explicit_quant_for_hardware(updated, machine, qdict.get("name", qdict))
+        return updated
     raise ModelingError(f"invalid_quant_override:{quant} — {_format_quant_suggestions(str(quant))}")
 
 

@@ -282,6 +282,9 @@ class _CohortMixin(_CohortNativeMixin):
                 key, synth_band, symmetric_canonical_only=can_r0_only,
             ):
                 continue
+            for p in synth_band:
+                if p is not item0 and not p.completion.done:
+                    self.engine.resolve(p.completion)
             if can_r0_only:
                 comp0 = self._start_program(
                     item0.context, item0.recipe, item0.name, item0.ready,
@@ -417,7 +420,9 @@ class _CohortMixin(_CohortNativeMixin):
             placeholders = {}
             owned_futures = []
             for pname in phase_names:
-                for peer in labels:
+                for peer in range(peer_count):
+                    if peer == rank0:
+                        continue
                     ev_p = self.engine.future(
                         f"{name0}:sym_send:{rank0}->{peer}:{pname}")
                     owned_futures.append(ev_p)
@@ -641,16 +646,25 @@ class _CohortMixin(_CohortNativeMixin):
                 native_hook=True)
         return completions
 
+    def _split_cohort_band_programs(self, band_plan, active_items):
+        pre_by_replica, post_by_replica = {}, {}
+        for item in active_items:
+            base_prog = self.lower_program(item.context, item.recipe)
+            if not hasattr(base_prog, "stages"):
+                return None, None
+            local_res = frozenset(item.context.resource_names.values())
+            extra_links = frozenset(k for k in item.context.work if k not in local_res)
+            pre_prog, post_prog = band_plan.split_local_programs(
+                item.context, base_prog, extra_link_names=extra_links,
+            )
+            pre_by_replica[item.replica] = pre_prog
+            post_by_replica[item.replica] = post_prog
+        return pre_by_replica, post_by_replica
+
     def _try_start_cohort_band_collective(
         self, key, participants, *, symmetric_canonical_only: bool = False,
     ) -> bool:
-        """Bind ONE cohort-wide BandCollectivePlan over all participating ranks.
-
-        Preserves per-replica local pack/unpack stages while routing the network
-        phase once across the complete communicator so cross-DP collectives (e.g.
-        32-die A3 SuperPoD EP AllToAll/AllToAllV) select direct optical bands
-        instead of falling back to per-replica legacy ring startup.
-        """
+        """Bind ONE cohort-wide BandCollectivePlan over all participating ranks."""
         first = participants[0]
         op = first.context.op
         meta = dict(op.metadata)
@@ -670,24 +684,17 @@ class _CohortMixin(_CohortNativeMixin):
             if str(exc).startswith("joint_collective_group_membership"):
                 return False
             raise
-        if band_plan is None:
+        if band_plan is None or not set(band_plan.accounting().wire_by_resource).issubset(self.engine.resources):
             return False
-        if not set(band_plan.accounting().wire_by_resource).issubset(self.engine.resources):
+        if not any(
+            g.lowered.band.protocol.startswith(("hccs_optical", "ub_superpod"))
+            for g in band_plan.groups
+        ):
             return False
-
         active_items = (first,) if symmetric_canonical_only else tuple(participants)
-        pre_by_replica, post_by_replica = {}, {}
-        for item in active_items:
-            base_prog = self.lower_program(item.context, item.recipe)
-            if not hasattr(base_prog, "stages"):
-                return False
-            local_res = frozenset(item.context.resource_names.values())
-            extra_links = frozenset(k for k in item.context.work if k not in local_res)
-            pre_prog, post_prog = band_plan.split_local_programs(
-                item.context, base_prog, extra_link_names=extra_links,
-            )
-            pre_by_replica[item.replica] = pre_prog
-            post_by_replica[item.replica] = post_prog
+        pre_by_replica, post_by_replica = self._split_cohort_band_programs(band_plan, active_items)
+        if pre_by_replica is None:
+            return False
 
         source_stage = int(meta.get("source_stage", op.stage))
         net_ready_by_replica = {}

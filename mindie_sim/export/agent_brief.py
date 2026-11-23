@@ -256,6 +256,125 @@ def _factual_serving_facts(bundle: ExportBundle) -> dict[str, Any] | None:
     }
 
 
+def _build_brief_l1_groups(macro_rows: Sequence[MacroModuleRow]) -> list[dict[str, Any]]:
+    l1_groups: list[dict[str, Any]] = []
+    by_l1: dict[str, list[MacroModuleRow]] = defaultdict(list)
+    for row in macro_rows:
+        by_l1[row.l1_group].append(row)
+    tot_aft = max(sum(r.after_ms for r in macro_rows), CONSERVATION_EPS_MS)
+    for l1_name, _ in MACRO_L1_HIERARCHY:
+        children = by_l1.get(l1_name)
+        if not children:
+            continue
+        l1_bef = sum(c.before_ms for c in children)
+        l1_aft = sum(c.after_ms for c in children)
+        l1_groups.append({
+            "l1": l1_name.split(" (", 1)[0],
+            "before_ms": round(l1_bef, 3),
+            "after_ms": round(l1_aft, 3),
+            "share_pct": round(100.0 * l1_aft / tot_aft, 1),
+            "children": [
+                {
+                    "l2": c.module_name.split(" (", 1)[0],
+                    "exposed_ms": round(c.after_ms, 3),
+                    "before_ms": round(c.before_ms, 3),
+                    "saved_us_per_tok_die": round(c.saved_us_per_tok_die, 2),
+                }
+                for c in children
+            ],
+        })
+    return l1_groups
+
+
+def _build_brief_action_items(
+    roadmap: Sequence[Any],
+    pending: Sequence[Any],
+    *,
+    is_script_audit: bool,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    cfg_items: list[dict[str, Any]] = []
+    for r in roadmap:
+        if r.track != TRACK_CONFIG_ENV:
+            continue
+        item = {
+            "title": _trim_text(r.title, BRIEF_TITLE_LIMIT),
+            "before": _trim_text(r.before_value, BRIEF_TITLE_LIMIT),
+            "after": _trim_text(r.after_value, BRIEF_CMD_LIMIT if is_script_audit else BRIEF_TITLE_LIMIT),
+        }
+        if is_script_audit:
+            item["cmd"] = _trim_text(r.action_detail, BRIEF_CMD_LIMIT)
+        cfg_items.append(item)
+    fw_items = [
+        {
+            "title": _trim_text(r.title, BRIEF_TITLE_LIMIT),
+            "saved_ms": round(float(r.expected_gain_ms or 0.0), 3),
+            "work": _trim_text(r.action_detail, BRIEF_TEXT_LIMIT),
+        }
+        for r in roadmap if r.track == TRACK_FRAMEWORK
+    ][:BRIEF_MAX_FRAMEWORK_TASKS]
+    kern_items = [
+        {
+            "card_id": item.card_id,
+            "prio": f"P{item.priority}",
+            "cat": "new" if item.category == PENDING_KIND_TO_IMPLEMENT else "tune",
+            "kernel": _trim_text(item.target_kernel, BRIEF_KERNEL_LIMIT),
+            "submodule": _trim_text(item.submodule, BRIEF_KERNEL_LIMIT),
+            "saved_ms": round(item.expected_gain_ms, 3),
+            "saved_us_per_tok_die": round(item.saved_us_per_tok_die, 2),
+            "before_ms": round(item.before_model_ms, 3),
+            "after_ms": round(item.after_model_ms, 3),
+            "binding": item.binding_state,
+            "summary": _trim_text(item.kernel_action, BRIEF_SUMMARY_LIMIT),
+        }
+        for item in pending[:BRIEF_MAX_KERNEL_TASKS]
+    ]
+    return cfg_items[:BRIEF_MAX_FRAMEWORK_TASKS], fw_items, kern_items
+
+
+def _build_brief_scenario_block(after: ExportBundle, par_short: str, par_detail: str) -> dict[str, Any]:
+    mem = after.memory_ledger
+    eff_total_dies = (
+        int(after.deployment_total_dies)
+        if int(getattr(after, "deployment_total_dies", 0) or 0) > 0
+        else mem.total_dies
+    )
+    eff_cluster_conc = (
+        int(after.cluster_concurrency)
+        if int(getattr(after, "cluster_concurrency", 0) or 0) > 0
+        else (mem.concurrency * mem.dp)
+    )
+    scen_block: dict[str, Any] = {
+        "model": after.model_name, "hardware_sku": after.hardware_sku,
+        "topology_preset": after.topology_preset, "phase": after.phase,
+        "deployment_mode": after.deployment_mode, "total_dies": eff_total_dies,
+        "dp": mem.dp, "tp": mem.tp, "ep": mem.ep, "pp": mem.pp,
+        "dcp": mem.dcp, "pcp": mem.pcp, "local_tp": mem.local_tp,
+        "sequence_parallel": after.sequence_parallel,
+        "parallelism_co_domain": par_short, "module_parallel_domains": par_detail,
+        "prompt_tokens": after.prompt_tokens, "output_tokens": after.output_tokens,
+        "concurrency_per_dp": mem.concurrency, "cluster_concurrency": eff_cluster_conc,
+        "max_hbm_concurrency_per_dp": mem.max_hbm_concurrency_per_dp,
+        "spec_method": after.spec_method, "spec_proposals": after.spec_proposals,
+        "avg_accepted_tokens": after.avg_accepted_tokens,
+        "weight_quant": mem.weight_quant_display or mem.weight_quant,
+        "cache_dtype": mem.cache_dtype,
+        "native_bf16_weight_gib_per_die": round(mem.native_bf16_weight_footprint_per_die_bytes / float(GIB_BYTES), 2),
+        "quantized_weight_gib_per_die": round(mem.weight_footprint_per_die_bytes / float(GIB_BYTES), 2),
+        "weight_compression_ratio": round(mem.weight_compression_ratio, 2),
+        "fits_hbm": mem.fits_hbm, "recommended_checkpoint": after.recommended_checkpoint,
+    }
+    if after.pd_pool_summary:
+        scen_block["pd_pool"] = dict(after.pd_pool_summary)
+    if after.calibration_basis:
+        scen_block["calibration_basis"] = {
+            "mode": after.calibration_basis.get("mode"),
+            "calibrated": bool(after.calibration_basis.get("calibrated")),
+            "pt_sku": after.calibration_basis.get("primitive_table_sku"),
+            "cann": after.calibration_basis.get("cann_version"),
+        }
+    return scen_block
+
+
 def build_agent_brief(
     before_bundle: ExportBundle,
     after_bundle: ExportBundle | None = None,
@@ -291,93 +410,17 @@ def build_agent_brief(
     else:
         plan = comparison_plan
 
-    pending = plan.pending_items
-    roadmap = plan.roadmap
-    codesign = plan.codesign_note
+    pending, roadmap, codesign = plan.pending_items, plan.roadmap, plan.codesign_note
     par_short, par_detail = format_parallelism_codomain_summary(after)
-    mem = after.memory_ledger
-
-    l1_groups: list[dict[str, Any]] = []
-    by_l1: dict[str, list[MacroModuleRow]] = defaultdict(list)
-    for row in macro_rows:
-        by_l1[row.l1_group].append(row)
-    tot_aft = max(sum(r.after_ms for r in macro_rows), CONSERVATION_EPS_MS)
-    for l1_name, _ in MACRO_L1_HIERARCHY:
-        children = by_l1.get(l1_name)
-        if not children:
-            continue
-        l1_bef = sum(c.before_ms for c in children)
-        l1_aft = sum(c.after_ms for c in children)
-        l1_groups.append({
-            "l1": l1_name.split(" (", 1)[0],
-            "before_ms": round(l1_bef, 3),
-            "after_ms": round(l1_aft, 3),
-            "share_pct": round(100.0 * l1_aft / tot_aft, 1),
-            "children": [
-                {
-                    "l2": c.module_name.split(" (", 1)[0],
-                    "exposed_ms": round(c.after_ms, 3),
-                    "before_ms": round(c.before_ms, 3),
-                    "saved_us_per_tok_die": round(c.saved_us_per_tok_die, 2),
-                }
-                for c in children
-            ],
-        })
-
-    is_script_audit = script_audit is not None
-    cfg_items: list[dict[str, Any]] = []
-    for r in roadmap:
-        if r.track != TRACK_CONFIG_ENV:
-            continue
-        if is_script_audit:
-            cfg_items.append({
-                "title": _trim_text(r.title, BRIEF_TITLE_LIMIT),
-                "before": _trim_text(r.before_value, BRIEF_TITLE_LIMIT),
-                "after": _trim_text(r.after_value, BRIEF_CMD_LIMIT),
-                "cmd": _trim_text(r.action_detail, BRIEF_CMD_LIMIT),
-            })
-        else:
-            cfg_items.append({
-                "title": _trim_text(r.title, BRIEF_TITLE_LIMIT),
-                "before": _trim_text(r.before_value, BRIEF_TITLE_LIMIT),
-                "after": _trim_text(r.after_value, BRIEF_TITLE_LIMIT),
-            })
-    cfg_items = cfg_items[:BRIEF_MAX_FRAMEWORK_TASKS]
-
-    fw_items = [
-        {
-            "title": _trim_text(r.title, BRIEF_TITLE_LIMIT),
-            "saved_ms": round(float(r.expected_gain_ms or 0.0), 3),
-            "work": _trim_text(r.action_detail, BRIEF_TEXT_LIMIT),
-        }
-        for r in roadmap if r.track == TRACK_FRAMEWORK
-    ][:BRIEF_MAX_FRAMEWORK_TASKS]
-
-    kern_items = [
-        {
-            "card_id": item.card_id,
-            "prio": f"P{item.priority}",
-            "cat": "new" if item.category == PENDING_KIND_TO_IMPLEMENT else "tune",
-            "kernel": _trim_text(item.target_kernel, BRIEF_KERNEL_LIMIT),
-            "submodule": _trim_text(item.submodule, BRIEF_KERNEL_LIMIT),
-            "saved_ms": round(item.expected_gain_ms, 3),
-            "saved_us_per_tok_die": round(item.saved_us_per_tok_die, 2),
-            "before_ms": round(item.before_model_ms, 3),
-            "after_ms": round(item.after_model_ms, 3),
-            "binding": item.binding_state,
-            "summary": _trim_text(item.kernel_action, BRIEF_SUMMARY_LIMIT),
-        }
-        for item in pending[:BRIEF_MAX_KERNEL_TASKS]
-    ]
-    b_kpi = _bundle_kpi_dict(before_bundle)
-    a_kpi = _bundle_kpi_dict(after)
+    l1_groups = _build_brief_l1_groups(macro_rows)
+    cfg_items, fw_items, kern_items = _build_brief_action_items(
+        roadmap, pending, is_script_audit=(script_audit is not None),
+    )
+    b_kpi, a_kpi = _bundle_kpi_dict(before_bundle), _bundle_kpi_dict(after)
     speedup = round(b_kpi["step_ms"] / a_kpi["step_ms"], 2) if a_kpi["step_ms"] > 0.0 else 1.0
-
     synth_brief = [
         {
-            "kernel": sp.kernel_name,
-            "tier": sp.abi_tier,
-            "sram_ok": sp.sram_verified,
+            "kernel": sp.kernel_name, "tier": sp.abi_tier, "sram_ok": sp.sram_verified,
             "ub_kb": f"{sp.ub_peak_bytes / KIB_BYTES:.1f}/{sp.ub_budget_bytes / KIB_BYTES:.1f}",
             "math": _trim_text(" ; ".join(sp.symbolic_equations), BRIEF_MATH_LIMIT),
         }
@@ -385,8 +428,7 @@ def build_agent_brief(
     ]
     trig_brief = [
         {
-            "id": tr.trigger_id,
-            "kind": tr.kind,
+            "id": tr.trigger_id, "kind": tr.kind,
             "ops": list(tr.blocked_ops[:BRIEF_MAX_BLOCKED_OPS]),
             "gain_us_tok_die": round(tr.potential_gain_us_per_tok_die, 2),
             "reason": _trim_text(tr.blocking_reason, BRIEF_TEXT_LIMIT),
@@ -394,59 +436,11 @@ def build_agent_brief(
         }
         for tr in sorted(after.semantic_audit_triggers, key=lambda t: -t.potential_gain_us_per_tok_die)[:BRIEF_MAX_TRIGGERS]
     ]
-    eff_total_dies = (
-        int(after.deployment_total_dies)
-        if int(getattr(after, "deployment_total_dies", 0) or 0) > 0
-        else mem.total_dies
-    )
-    eff_cluster_conc = (
-        int(after.cluster_concurrency)
-        if int(getattr(after, "cluster_concurrency", 0) or 0) > 0
-        else (mem.concurrency * mem.dp)
-    )
-    scen_block: dict[str, Any] = {
-        "model": after.model_name,
-        "hardware_sku": after.hardware_sku,
-        "topology_preset": after.topology_preset,
-        "phase": after.phase,
-        "deployment_mode": after.deployment_mode,
-        "total_dies": eff_total_dies,
-        "dp": mem.dp, "tp": mem.tp, "ep": mem.ep, "pp": mem.pp,
-        "dcp": mem.dcp, "pcp": mem.pcp, "local_tp": mem.local_tp,
-        "sequence_parallel": after.sequence_parallel,
-        "parallelism_co_domain": par_short,
-        "module_parallel_domains": par_detail,
-        "prompt_tokens": after.prompt_tokens,
-        "output_tokens": after.output_tokens,
-        "concurrency_per_dp": mem.concurrency,
-        "cluster_concurrency": eff_cluster_conc,
-        "max_hbm_concurrency_per_dp": mem.max_hbm_concurrency_per_dp,
-        "spec_method": after.spec_method,
-        "spec_proposals": after.spec_proposals,
-        "avg_accepted_tokens": after.avg_accepted_tokens,
-        "weight_quant": mem.weight_quant_display or mem.weight_quant,
-        "cache_dtype": mem.cache_dtype,
-        "native_bf16_weight_gib_per_die": round(mem.native_bf16_weight_footprint_per_die_bytes / float(GIB_BYTES), 2),
-        "quantized_weight_gib_per_die": round(mem.weight_footprint_per_die_bytes / float(GIB_BYTES), 2),
-        "weight_compression_ratio": round(mem.weight_compression_ratio, 2),
-        "fits_hbm": mem.fits_hbm,
-        "recommended_checkpoint": after.recommended_checkpoint,
-    }
-    if after.pd_pool_summary:
-        scen_block["pd_pool"] = dict(after.pd_pool_summary)
-    if after.calibration_basis:
-        scen_block["calibration_basis"] = {
-            "mode": after.calibration_basis.get("mode"),
-            "calibrated": bool(after.calibration_basis.get("calibrated")),
-            "pt_sku": after.calibration_basis.get("primitive_table_sku"),
-            "cann": after.calibration_basis.get("cann_version"),
-        }
     brief: dict[str, Any] = {
         "schema": AGENT_BRIEF_SCHEMA,
-        "scenario_and_parallelism": scen_block,
+        "scenario_and_parallelism": _build_brief_scenario_block(after, par_short, par_detail),
         "kpis_before_vs_after": {
-            "before": b_kpi,
-            "after": a_kpi,
+            "before": b_kpi, "after": a_kpi,
             "saved_step_ms": float(b_kpi["step_ms"] - a_kpi["step_ms"]),
             "saved_us_per_tok_die": float(b_kpi["us_per_tok_die"] - a_kpi["us_per_tok_die"]),
             "speedup": speedup,
@@ -456,8 +450,7 @@ def build_agent_brief(
         },
         "module_hierarchy": l1_groups,
         "action_plan_3_tracks": {
-            "config_and_env": cfg_items,
-            "framework_tasks": fw_items,
+            "config_and_env": cfg_items, "framework_tasks": fw_items,
             "kernel_tasks": kern_items,
             "parallelism_codesign_note": _trim_text(codesign, BRIEF_CODESIGN_LIMIT),
         },

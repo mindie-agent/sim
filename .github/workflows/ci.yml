@@ -60,18 +60,22 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            python: '3.11'
-          - os: ubuntu-latest
-            python: '3.13'
-          - os: windows-latest
-            python: '3.13'
-          - os: macos-latest
-            python: '3.13'
+          - { os: ubuntu-latest, python: '3.11', shard: 0, num_shards: 4 }
+          - { os: ubuntu-latest, python: '3.11', shard: 1, num_shards: 4 }
+          - { os: ubuntu-latest, python: '3.11', shard: 2, num_shards: 4 }
+          - { os: ubuntu-latest, python: '3.11', shard: 3, num_shards: 4 }
+          - { os: ubuntu-latest, python: '3.13', shard: 0, num_shards: 4 }
+          - { os: ubuntu-latest, python: '3.13', shard: 1, num_shards: 4 }
+          - { os: ubuntu-latest, python: '3.13', shard: 2, num_shards: 4 }
+          - { os: ubuntu-latest, python: '3.13', shard: 3, num_shards: 4 }
+          - { os: windows-latest, python: '3.13', shard: 0, num_shards: 3 }
+          - { os: windows-latest, python: '3.13', shard: 1, num_shards: 3 }
+          - { os: windows-latest, python: '3.13', shard: 2, num_shards: 3 }
+          - { os: macos-latest, python: '3.13', shard: 0, num_shards: 3 }
+          - { os: macos-latest, python: '3.13', shard: 1, num_shards: 3 }
+          - { os: macos-latest, python: '3.13', shard: 2, num_shards: 3 }
     runs-on: ${{ matrix.os }}
-    # The Windows/macOS legs run the full 7,270+ test suite under 4-worker xdist
-    # slower than Linux; keep generous outer headroom above contended runners.
-    timeout-minutes: 45
+    timeout-minutes: 20
     env:
       PYTHONDONTWRITEBYTECODE: '1'
     steps:
@@ -101,11 +105,11 @@ jobs:
           VIRTUAL_ENV: ${{ runner.temp }}/sim-venv
           UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/sim-venv
           MINDIE_CACHE_HOME: ${{ runner.temp }}/mindie-sim-cache
-        run: uv run --no-project python -B -m pytest -q -n auto --dist worksteal -p no:cacheprovider --basetemp="${{ runner.temp }}/pt" -m "not live_npu" --durations=20 --junitxml="${{ runner.temp }}/results.xml"
+        run: uv run --no-project python -B -m pytest -q -n auto --dist worksteal --shard-index=${{ matrix.shard }} --num-shards=${{ matrix.num_shards }} -p no:cacheprovider --basetemp="${{ runner.temp }}/pt" -m "not live_npu" --durations=20 --junitxml="${{ runner.temp }}/results.xml"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: sim-${{ matrix.os }}-${{ matrix.python }}
+          name: sim-${{ matrix.os }}-${{ matrix.python }}-s${{ matrix.shard }}
           path: ${{ runner.temp }}/results.xml
 
   catalog-gate:

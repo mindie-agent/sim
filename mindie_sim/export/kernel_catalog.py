@@ -1050,9 +1050,14 @@ def _project_linear_attn(
     if suffix == "decode_recurrent_scan" or fam == "recurrent_vector":
         return ("Fused Recurrent GDN Decode", bound_kernel or "RecurrentGatedDeltaRule", BACKEND_CANN, KERNEL_STATUS_EXISTING, False, "", "decode_recurrent_scan")
     if "recover_ssm" in suffix or "recover_ssm" in rec:
+        k_name = (
+            bound_kernel
+            if (bound_kernel and "recover_ssm" in bound_kernel.lower())
+            else "recover_ssm_state_commit"
+        )
         return (
             "Speculative Accepted-Token SSM State Commit (RecoverSSM)",
-            bound_kernel or "recover_ssm_state_commit", BACKEND_TRITON,
+            k_name, BACKEND_TRITON,
             f"{KERNEL_STATUS_NEW_OR_EXTEND} Speculative Accepted-State Commit Kernel",
             True, "Compact accepted-token SSM/KDA state replay & single HBM writeback commit kernel", "recover_ssm_commit",
         )

@@ -911,14 +911,26 @@ def _extract_native_format(base_config: Mapping[str, Any] | None) -> str:
     return "fp32" if "32" in raw else "bf16"
 
 
+def _parse_kv_cache_value(raw_val: str) -> str:
+    upper = str(raw_val or "").strip().upper().replace("-", "_")
+    if not upper:
+        return ""
+    if upper == "C8" or "INT8" in upper:
+        return "int8"
+    if "FP8" in upper or "MXFP8" in upper:
+        return "fp8_e4m3"
+    if upper in {"BF16", "BFLOAT16", "FLOAT"}:
+        return "bf16"
+    if upper in {"FP16", "FLOAT16"}:
+        return "fp16"
+    return ""
+
+
 def _flatten_desc_mapping(desc_mapping: Mapping[str, Any]) -> tuple[dict[str, str], str]:
     pattern_to_tag: dict[str, str] = {}
-    kv_dtype = ""
-    raw_kv = str(desc_mapping.get("kv_cache_type") or desc_mapping.get("fa_quant_type") or "").strip().upper()
-    if raw_kv == "C8" or "INT8" in raw_kv:
-        kv_dtype = "int8"
-    elif "FP8" in raw_kv or "MXFP8" in raw_kv:
-        kv_dtype = "fp8"
+    kv_dtype = _parse_kv_cache_value(
+        str(desc_mapping.get("kv_cache_type") or desc_mapping.get("fa_quant_type") or "")
+    )
     for key, val in desc_mapping.items():
         key_str = str(key)
         if key_str.lower() in _METADATA_KEYS_TO_SKIP:
@@ -929,7 +941,11 @@ def _flatten_desc_mapping(desc_mapping: Mapping[str, Any]) -> tuple[dict[str, st
                 pattern_to_tag[str(pattern)] = upper_key
         elif isinstance(val, str):
             upper_val = val.strip().upper().replace("-", "_")
-            if upper_val == "C8" or "kv_cache" in key_str.lower():
+            if "kv_cache" in key_str.lower():
+                parsed_kv = _parse_kv_cache_value(upper_val)
+                if parsed_kv:
+                    kv_dtype = kv_dtype or parsed_kv
+            elif upper_val == "C8":
                 kv_dtype = kv_dtype or "int8"
             else:
                 pattern_to_tag[key_str] = upper_val
@@ -1086,8 +1102,8 @@ def parse_quant_model_description(
         expert_block=exp_spec["expert_block"] or lin_spec["expert_block"] or MXFP_GROUP_SIZE,
         scale_format=lin_spec["scale_format"] if lin_spec["is_quantized"] else "fp32",
         scale_bytes=float(lin_spec["scale_bytes"] if lin_spec["is_quantized"] else FP32_SCALE_BYTES),
-        kv_dtype=kv_dtype, index_dtype=kv_dtype if kv_dtype in {"int8", "fp8"} else "bf16",
-        index_scale_dtype="fp16" if kv_dtype in {"int8", "fp8"} else "none",
+        kv_dtype=kv_dtype, index_dtype=kv_dtype if kv_dtype in {"int8", "fp8", "fp8_e4m3"} else "bf16",
+        index_scale_dtype="fp16" if kv_dtype in {"int8", "fp8", "fp8_e4m3"} else "none",
         exclusions=tuple(exclusions),
         activation_group_size=int(lin_spec["activation_group_size"]),
         activation_scale_format=str(lin_spec["activation_scale_format"]),
@@ -1142,7 +1158,7 @@ def _quant_spec_from_preset(
         expert_weight_format=rec["ef"], weight_block=rec["wb"], expert_block=rec["eb"],
         scale_format=rec["sf"], scale_bytes=float(rec["sb"]),
         kv_dtype=kv_dtype, index_dtype=idx_dt,
-        index_scale_dtype="fp16" if idx_dt in {"int8", "fp8"} else "none",
+        index_scale_dtype="fp16" if idx_dt in {"int8", "fp8", "fp8_e4m3"} else "none",
         activation_group_size=int(rec["ags"]), activation_scale_format=str(rec["asf"]),
         activation_scale_pack=int(rec["asp"]), exclusions=rec["excl"],
         native_format=native,
@@ -1356,9 +1372,20 @@ def _infer_offline_spec_for_repo(
     repo_id: str, hw_family: str,
 ) -> tuple[NpuCheckpointSpec | None, QuantSpec | None, tuple[str, ...]]:
     hw = normalize_hw_family(hw_family)
+    repo_lower = repo_id.lower()
+    fallback_match: NpuCheckpointSpec | None = None
     for (_m, _hw), spec in DEFAULT_NPU_CHECKPOINTS.items():
-        if spec.repo_id.lower() == repo_id.lower():
-            return spec, spec.build_quant_spec(), validate_quant_for_hardware(spec.quant_preset, hw, kv_cache_dtype=spec.kv_cache_dtype)
+        if spec.repo_id.lower() == repo_lower:
+            if _hw == hw:
+                return spec, spec.build_quant_spec(), validate_quant_for_hardware(spec.quant_preset, hw, kv_cache_dtype=spec.kv_cache_dtype)
+            if fallback_match is None:
+                fallback_match = spec
+    if fallback_match is not None:
+        return (
+            fallback_match,
+            fallback_match.build_quant_spec(),
+            validate_quant_for_hardware(fallback_match.quant_preset, hw, kv_cache_dtype=fallback_match.kv_cache_dtype),
+        )
     if repo_id in SCANNED_QUANT_PATTERNS:
         m_url, ms_url, hf_url = _repo_urls(repo_id)
         qspec = parse_quant_model_description(SCANNED_QUANT_PATTERNS[repo_id], checkpoint_repo=repo_id, checkpoint_url=m_url or ms_url or hf_url)
@@ -1484,10 +1511,22 @@ def resolve_checkpoint_metadata(
         return _build_remote_result(raw, source_kind, repo_id, hw, cfg, desc, qcfg, warnings=warnings)
 
     warnings.append("network_disabled_using_builtin_registry" if not allow_network else "remote_metadata_unreachable_using_builtin_registry")
-    ckpt, _q, _w = _infer_offline_spec_for_repo(repo_id, hw)
+    ckpt, offline_q, isa_warns = _infer_offline_spec_for_repo(repo_id, hw)
+    if ckpt is not None:
+        m_url, ms_url, hf_url = _repo_urls(repo_id)
+        all_warns = tuple(dict.fromkeys([*warnings, *isa_warns]))
+        return CheckpointMetadataResult(
+            spec_or_url=raw, source_kind="builtin_registry", repo_id=ckpt.repo_id,
+            canonical_model=ckpt.canonical_model, hw_family=hw,
+            modelers_url=ckpt.modelers_url or m_url,
+            modelscope_url=ckpt.modelscope_url or ms_url,
+            hf_url=ckpt.hf_url or hf_url,
+            config={}, quant_model_description=ckpt.weight_pattern_map(), quantize_config={},
+            quant_spec=offline_q or ckpt.build_quant_spec(), checkpoint=ckpt,
+            offline_fallback=True, warnings=all_warns,
+        )
     return _build_remote_result(
-        raw, "builtin_registry", repo_id, hw, {},
-        ckpt.weight_pattern_map() if ckpt else {}, {},
+        raw, "builtin_registry", repo_id, hw, {}, {}, {},
         offline_fallback=True, warnings=warnings,
     )
 

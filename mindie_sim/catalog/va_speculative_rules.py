@@ -798,7 +798,7 @@ def build_va_serving_rules(
         if pd_disaggregated:
             p_spec_cfg, d_spec_cfg, pd_rule = _build_pd_spec_configs(resolved, is_hybrid=hybrid)
             rules.append(pd_rule)
-            role_low = str(pd_role or "decode").strip().lower()
+            role_low = str(pd_role or "decode").strip().lower().removeprefix("pd_")
             spec_cfg = dict(p_spec_cfg if role_low == "prefill" else d_spec_cfg)
             eff_k = int(spec_cfg.get("num_speculative_tokens", eff_k))
         else:
@@ -854,8 +854,9 @@ def build_va_serving_rules(
     if mm_cache is not None:
         flags.append(f"--mm-processor-cache-gb {mm_cache}")
         rules.append("mm_processor_cache_gb_0_text_only")
-    if eff_kv in {"int8", "fp8"}:
-        flags.append(f"--kv-cache-dtype {eff_kv}")
+    if eff_kv in {"int8", "fp8", "fp8_e4m3"}:
+        cli_kv = "fp8" if eff_kv == "fp8_e4m3" else eff_kv
+        flags.append(f"--kv-cache-dtype {cli_kv}")
     if resolved is not None and resolved.companion.requires_no_prefix_caching:
         flags.append("--no-enable-prefix-caching")
         rules.append("no_enable_prefix_caching_for_block_drafter")

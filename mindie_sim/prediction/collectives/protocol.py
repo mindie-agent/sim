@@ -47,8 +47,10 @@ UB_DIE_INJECTION_CEILING_BYTES_PER_MS = 280_000_000.0
 UB_INJECTION_CEILING_MIN_RANKS = 5
 DOUBLE_BUFFER_CREDIT_FRAMES = 2
 _HCOMM_EXPANSIONS = {
-    "aiv": "aiv", "ccu_ms": "ccu_ms", "ai_cpu": "aicpu", "aicpu": "aicpu", "aicpu_ts": "aicpu", "nhr": "nhr",
+    "aiv": "aiv", "ccu_ms": "ccu_ms", "ccu_sched": "ccu_ms",
+    "ai_cpu": "aicpu", "aicpu": "aicpu", "aicpu_ts": "aicpu", "nhr": "nhr",
 }
+_PROCESS_ADVISORY_EXPANSIONS = frozenset({"aiv", "ccu_ms", "ccu_sched"})
 # UB mesh spans the A5 Pod node scope (ascend.json group_max=64); a5_server ranks_per_node=8 still bounds it.
 _PHYSICAL_BAND_LIMITS = {"hccs_k8": K8_RANKS, "ub_mesh": A5_POD_RANKS_PER_NODE, "hccs_sw": A3_NODE_RANKS, "sio": TWO_RANKS}
 _MESH_ALGORITHMS = frozenset({
@@ -285,7 +287,9 @@ def _hcomm_algorithm(fabric, collective, ranks, size, expansion, *, is_multi_pac
             if size <= A3_RS_LARGE_MESH_BYTES:
                 return "chunked_mesh"
             return "ring"
-    if fabric == "ub_mesh":
+        if fabric == "hccs_optical" and collective in {"allgather", "reduce_scatter"} and expansion == "aiv":
+            return "mesh"
+    if fabric in {"ub_mesh", "ub_superpod"}:
         if collective == "allreduce":
             if expansion in (None, "ccu_ms"):
                 return "one_shot_mesh" if size <= ranks * A5_CCU_ONE_SHOT_SHARD_BYTES else "mesh"
@@ -297,12 +301,70 @@ def _hcomm_algorithm(fabric, collective, ranks, size, expansion, *, is_multi_pac
                 return "two_shot_mesh"
         if collective in {"allgather", "reduce_scatter"} and expansion in (None, "ccu_ms"):
             return "mesh"
-        if collective == "alltoall" and expansion in (None, "ccu_ms"):
+        if collective in {"alltoall", "alltoallv"} and expansion in (None, "ccu_ms"):
             return "direct_mesh"
         if collective == "reduce_scatter" and expansion == "aicpu":
             return ("chunked_mesh" if size * K8_RANKS ** 2 > A5_AICPU_RS_CHUNK_BYTES * ranks ** 2
                     else "mesh")
     return None
+
+
+def _match_candidate_bands(
+    candidates: tuple[CollectiveBandSpec, ...],
+    *,
+    collective: str,
+    group_len: int,
+    payload: float,
+    stack_key: str,
+    scope: str,
+    exp_key: str | None,
+    is_multi_pkg: bool,
+) -> tuple[list[tuple[tuple[int, int, int, int], CollectiveBandSpec]], int | None]:
+    matches: list[tuple[tuple[int, int, int, int], CollectiveBandSpec]] = []
+    physical_limit = None
+    for band in candidates:
+        if band.collective not in (collective, "all"):
+            continue
+        if band.stack_id not in (stack_key, "default"):
+            continue
+        if band.topology_scope not in (scope, "any"):
+            continue
+        if not band.matches_payload(payload):
+            continue
+        fabric = band.protocol.rsplit("_", 1)[0]
+        algorithm = None
+        if band.algorithm == "ring" and (exp_key in (None, "concurrent") or exp_key in _HCOMM_EXPANSIONS):
+            spec_exp = None if exp_key == "concurrent" else _HCOMM_EXPANSIONS.get(exp_key)
+            algorithm = _hcomm_algorithm(
+                fabric, collective, group_len, payload, spec_exp,
+                is_multi_package=is_multi_pkg,
+            )
+        explicit_executor = exp_key in _HCOMM_EXPANSIONS and algorithm is not None
+        band_exp_matches = (
+            exp_key is None
+            or band.expansion_mode in (exp_key, "*")
+            or explicit_executor
+        )
+        if not band_exp_matches:
+            continue
+        limit = _PHYSICAL_BAND_LIMITS.get(fabric)
+        if limit is not None and group_len > limit:
+            physical_limit = limit
+            continue
+        group_max = min(band.group_max, limit) if limit is not None else band.group_max
+        if not band.group_min <= group_len <= group_max:
+            continue
+        specificity = (
+            1 if band.collective == collective else 0,
+            1 if band.stack_id == stack_key else 0,
+            1 if band.topology_scope == scope else 0,
+            1 if (exp_key is not None and band.expansion_mode == exp_key) else 0,
+        )
+        if group_max != band.group_max or algorithm is not None:
+            band = replace(band, group_max=group_max, algorithm=algorithm or band.algorithm,
+                           expansion_mode=exp_key if explicit_executor else band.expansion_mode)
+        matches.append((specificity, band))
+    return matches, physical_limit
 
 
 def select_band(
@@ -330,44 +392,15 @@ def select_band(
     candidates = _candidate_bands(group, topology, scope)
     is_multi_pkg = bool(_package_partition(group, topology))
 
-    matches: list[tuple[tuple[int, int, int, int], CollectiveBandSpec]] = []
-    physical_limit = None
-    for band in candidates:
-        if band.collective not in (collective, "all"):
-            continue
-        if band.stack_id not in (stack_key, "default"):
-            continue
-        if band.topology_scope not in (scope, "any"):
-            continue
-        if not band.matches_payload(payload):
-            continue
-        fabric = band.protocol.rsplit("_", 1)[0]
-        algorithm = None
-        if band.algorithm == "ring" and band.stack_id == "default" and (exp_key is None or exp_key in _HCOMM_EXPANSIONS):
-            algorithm = _hcomm_algorithm(
-                fabric, collective, len(group), payload, _HCOMM_EXPANSIONS.get(exp_key),
-                is_multi_package=is_multi_pkg,
-            )
-        explicit_executor = exp_key in _HCOMM_EXPANSIONS and algorithm is not None
-        if exp_key is not None and band.expansion_mode != exp_key and not explicit_executor:
-            continue
-        limit = _PHYSICAL_BAND_LIMITS.get(fabric)
-        if limit is not None and len(group) > limit:
-            physical_limit = limit
-            continue
-        group_max = min(band.group_max, limit) if limit is not None else band.group_max
-        if not band.group_min <= len(group) <= group_max:
-            continue
-        specificity = (
-            1 if band.collective == collective else 0,
-            1 if band.stack_id == stack_key else 0,
-            1 if band.topology_scope == scope else 0,
-            1 if (exp_key is not None and band.expansion_mode == exp_key) else 0,
+    matches, physical_limit = _match_candidate_bands(
+        candidates, collective=collective, group_len=len(group), payload=payload,
+        stack_key=stack_key, scope=scope, exp_key=exp_key, is_multi_pkg=is_multi_pkg,
+    )
+    if not matches and exp_key in _PROCESS_ADVISORY_EXPANSIONS:
+        matches, physical_limit = _match_candidate_bands(
+            candidates, collective=collective, group_len=len(group), payload=payload,
+            stack_key=stack_key, scope=scope, exp_key=None, is_multi_pkg=is_multi_pkg,
         )
-        if group_max != band.group_max or algorithm is not None:
-            band = replace(band, group_max=group_max, algorithm=algorithm or band.algorithm,
-                           expansion_mode=exp_key if explicit_executor else band.expansion_mode)
-        matches.append((specificity, band))
 
     if not matches:
         if physical_limit is not None:
@@ -772,10 +805,18 @@ def _resolve_collective_startup_and_hbm(
         if fabric == "ub_mesh" and count >= UB_INJECTION_CEILING_MIN_RANKS and uses_per_pair_mesh
         else None
     )
-    has_p18_ar = bool(
-        hasattr(topology, "has_calibrated_p18_allreduce_rate")
-        and topology.has_calibrated_p18_allreduce_rate()
-    )
+    scope = _infer_group_scope(group, topology)
+    if hasattr(topology, "p18_allreduce_rate_applies"):
+        has_p18_ar = bool(
+            topology.p18_allreduce_rate_applies(
+                collective, group, algorithm=str(band.algorithm), scope=scope,
+            )
+        )
+    else:
+        has_p18_ar = bool(
+            hasattr(topology, "has_calibrated_p18_allreduce_rate")
+            and topology.has_calibrated_p18_allreduce_rate()
+        )
     local_hbm_bytes = 0.0
     if api_bytes > 0.0 and count >= TWO_RANKS:
         if collective in {"reduce_scatter", "allreduce"} and has_p18_ar:
@@ -808,6 +849,7 @@ def lower_collective(
     *,
     stack: str = "default",
     expansion_mode: str | None = None,
+    band_override: CollectiveBandSpec | None = None,
     peer_matrix: Sequence[Sequence[int]] | None = None,
     send_splits: Sequence[int] | None = None,
     recv_splits: Sequence[int] | None = None,
@@ -834,7 +876,7 @@ def lower_collective(
         row_sums = tuple(sum(row) for row in matrix)
         band_payload = float(max(row_sums)) if sum(row_sums) > 0 else 0.0
 
-    band = select_band(
+    band = band_override if band_override is not None else select_band(
         collective, group, topology, band_payload,
         stack="default" if stack == "eager" else stack, expansion_mode=expansion_mode,
     )

@@ -746,8 +746,8 @@ class _TopologyPlansMixin:
             return None
         if not unique_groups or all(len(ranks) <= 1 for ranks in unique_groups):
             return None
-        if any(
-            not _candidate_bands(ranks, self, _infer_group_scope(ranks, self))
+        if not any(
+            _candidate_bands(ranks, self, _infer_group_scope(ranks, self))
             for ranks in unique_groups
             if len(ranks) > 1
         ):
@@ -764,12 +764,23 @@ class _TopologyPlansMixin:
             elif norm_family != "alltoall":
                 return None
         elif algorithm == "auto":
+            if "peer_traffic" in metadata or norm_family == "alltoallv":
+                has_superpod_band = any(
+                    band.protocol.startswith(("hccs_optical", "ub_superpod"))
+                    for ranks in unique_groups
+                    if len(ranks) > 1
+                    for band in _candidate_bands(ranks, self, _infer_group_scope(ranks, self))
+                )
+                if not has_superpod_band:
+                    return None
             phases = {"allreduce": 2, "reduce_scatter": 1, "allgather": 1}
             if norm_family in phases and "peer_traffic" not in metadata:
                 for ranks in unique_groups:
                     rounds = max(phases[norm_family] * (len(ranks) - 1), 0)
                     if metadata.get("steps", rounds) != rounds:
                         return None
+            elif "peer_traffic" not in metadata and norm_family not in {"alltoall", "alltoallv"}:
+                return None
         peer = None
         if "peer_traffic" in metadata:
             if norm_family not in {"alltoall", "alltoallv"}:

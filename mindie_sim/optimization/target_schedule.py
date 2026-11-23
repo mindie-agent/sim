@@ -175,8 +175,10 @@ def _pick_witness_for_slice(
     intervals_us: Sequence[tuple[float, float]],
     witness_set: frozenset[int],
 ) -> int:
-    in_witness = [i for i in active_idxs if i in witness_set]
-    pool = in_witness if in_witness else list(active_idxs)
+    main_active = [i for i in active_idxs if int(nodes[i].stream_index) == 0]
+    candidates = main_active if main_active else list(active_idxs)
+    in_witness = [i for i in candidates if i in witness_set]
+    pool = in_witness if in_witness else candidates
     return min(
         pool,
         key=lambda i: (
@@ -700,6 +702,43 @@ def _bind_stream_plan_by_coord(
     return owners_by_coord, receipt_by_coord, summary
 
 
+def _materialize_scheduled_result(
+    nodes: Sequence[Any], case: Case, arch_order: Sequence[str], intervals_us: Sequence[tuple[float, float]],
+    exposed_list: Sequence[float], masked_list: Sequence[str], step_span_us: float,
+    receipt_by_coord: Mapping[tuple[int, int, int], dict[str, Any]], budget_summary: str,
+) -> DieScheduleResult:
+    arch_spans: dict[str, float] = {aid: 0.0 for aid in arch_order}
+    out_nodes: list[Any] = []
+    for idx, node in enumerate(nodes):
+        s_us, e_us = intervals_us[idx]
+        dur_us = max(0.0, e_us - s_us)
+        exp_us = min(dur_us, max(0.0, exposed_list[idx]))
+        fully_hidden = dur_us > EXPOSED_EPS_US and exp_us <= EXPOSED_EPS_US
+        eff_exp = 0.0 if fully_hidden else exp_us
+        masker = masked_list[idx] if (dur_us - eff_exp > EXPOSED_EPS_US and masked_list[idx]) else ""
+        l_star = float(node.l_star_lean_us)
+        roof_eff = min(1.0, l_star / dur_us) if (dur_us > 0.0 and l_star > 0.0) else None
+        upd: dict[str, Any] = dict(
+            start_us=s_us, end_us=e_us, dur_us=dur_us, exposed_dur_us=eff_exp,
+            is_overlapped=fully_hidden, masked_by=masker,
+            gap_us=0.0 if fully_hidden else max(0.0, dur_us - l_star),
+            gap_ratio=None if fully_hidden else ((dur_us / l_star) if l_star > 0.0 else None),
+            roofline_efficiency=roof_eff,
+            opt_attainment_pct=round(roof_eff * PERCENT_SCALE, 1) if roof_eff is not None else node.opt_attainment_pct,
+            bound_display=f"Overlapped by {masker} (0 exposed)" if (fully_hidden and masker) else node.bound_display,
+        )
+        if hasattr(node, "stream_core_budget") and budget_summary:
+            upd["stream_core_budget"] = budget_summary
+        out_nodes.append(replace(node, **upd))
+        arch_spans[str(node.archetype_id)] = arch_spans.get(str(node.archetype_id), 0.0) + eff_exp
+    return DieScheduleResult(
+        nodes=tuple(out_nodes), archetype_spans_us=arch_spans,
+        step_start_us=0.0, step_end_us=step_span_us, step_span_us=step_span_us,
+        stream_core_budget=dict(receipt_by_coord), stream_core_budget_summary=budget_summary,
+        max_same_stream_overlap_us=_max_same_stream_overlap(nodes, case, intervals_us),
+    )
+
+
 def schedule_target_graph_on_engine(
     nodes: Sequence[Any],
     case: Case,
@@ -833,8 +872,7 @@ def schedule_target_graph_on_engine(
     engine.detach_wave_recorder()
 
     step_start_us = float(root_ev.time or 0.0) * US_PER_MS
-    step_end_us = float(step_done.time or 0.0) * US_PER_MS
-    step_span_us = max(0.0, step_end_us - step_start_us)
+    step_span_us = max(0.0, float(step_done.time or 0.0) * US_PER_MS - step_start_us)
     intervals_us = [
         (
             s_u := max(0.0, float(
@@ -847,41 +885,9 @@ def schedule_target_graph_on_engine(
         for i in range(len(nodes))
     ]
     exposed_list, masked_list = attribute_engine_exposure(nodes, intervals_us, observer, causal_preds, step_span_us)
-
-    arch_spans: dict[str, float] = {aid: 0.0 for aid in arch_order}
-    out_nodes: list[Any] = []
-    for idx, node in enumerate(nodes):
-        s_us, e_us = intervals_us[idx]
-        dur_us = max(0.0, e_us - s_us)
-        exp_us = min(dur_us, max(0.0, exposed_list[idx]))
-        fully_hidden = dur_us > EXPOSED_EPS_US and exp_us <= EXPOSED_EPS_US
-        eff_exp = 0.0 if fully_hidden else exp_us
-        masker = masked_list[idx] if (dur_us - eff_exp > EXPOSED_EPS_US and masked_list[idx]) else ""
-        l_star = float(node.l_star_lean_us)
-        roof_eff = min(1.0, l_star / dur_us) if (dur_us > 0.0 and l_star > 0.0) else None
-        upd: dict[str, Any] = dict(
-            start_us=s_us, end_us=e_us, dur_us=dur_us, exposed_dur_us=eff_exp,
-            is_overlapped=fully_hidden, masked_by=masker,
-            gap_us=0.0 if fully_hidden else max(0.0, dur_us - l_star),
-            gap_ratio=None if fully_hidden else ((dur_us / l_star) if l_star > 0.0 else None),
-            roofline_efficiency=roof_eff,
-            opt_attainment_pct=round(roof_eff * PERCENT_SCALE, 1) if roof_eff is not None else node.opt_attainment_pct,
-            bound_display=f"Overlapped by {masker} (0 exposed)" if (fully_hidden and masker) else node.bound_display,
-        )
-        if hasattr(node, "stream_core_budget") and budget_summary:
-            upd["stream_core_budget"] = budget_summary
-        out_nodes.append(replace(node, **upd))
-        arch_spans[str(node.archetype_id)] = arch_spans.get(str(node.archetype_id), 0.0) + eff_exp
-
-    return DieScheduleResult(
-        nodes=tuple(out_nodes),
-        archetype_spans_us=arch_spans,
-        step_start_us=0.0,
-        step_end_us=step_span_us,
-        step_span_us=step_span_us,
-        stream_core_budget=receipt_by_coord,
-        stream_core_budget_summary=budget_summary,
-        max_same_stream_overlap_us=_max_same_stream_overlap(nodes, case, intervals_us),
+    return _materialize_scheduled_result(
+        nodes, case, arch_order, intervals_us, exposed_list, masked_list,
+        step_span_us, receipt_by_coord, budget_summary,
     )
 
 

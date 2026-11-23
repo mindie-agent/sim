@@ -132,6 +132,7 @@ from .models import (
 from .reconcile import load_observation_bundle, reconcile_operators_with_kernels
 
 _RECURRENT_MICRO_PATTERN = re.compile(r"^(.*)\.(recurrent_scan|chunk_kda)(\d+)$")
+_RECOVER_SSM_MICRO_PATTERN = re.compile(r"^(s\d+)\.l\d+\.(recover_ssm_commit\w*)$")
 _OP_ROW_FIELDS = frozenset(f.name for f in dataclass_fields(OperatorExportRow))
 _BUNDLE_FIELDS = frozenset(f.name for f in dataclass_fields(ExportBundle))
 
@@ -753,14 +754,19 @@ def _collapse_micro_split_ops(
     rows: list[OperatorExportRow],
     demands: list[tuple[int, int, int, int, int]],
 ) -> tuple[list[OperatorExportRow], list[tuple[int, int, int, int, int]]]:
-    """Group micro-split recurrent scan rows for display after pricing & DAG attribution."""
+    """Group micro-split recurrent scan & tail RecoverSSM commit rows after pricing & DAG attribution."""
     out_rows: list[OperatorExportRow] = []
     out_demands: list[tuple[int, int, int, int, int]] = []
     group_pos: dict[tuple[str, str], int] = {}
+    group_counts: dict[tuple[str, str], int] = {}
     group_preds: dict[tuple[str, str], list[OpOccurrence]] = {}
     renamed: dict[str, str] = {}
     for row, dem in zip(rows, demands):
         match = _RECURRENT_MICRO_PATTERN.match(row.op_id)
+        is_recover_ssm = False
+        if match is None and row.archetype_id == "target_tail":
+            match = _RECOVER_SSM_MICRO_PATTERN.match(row.op_id)
+            is_recover_ssm = match is not None
         if match is None:
             out_rows.append(row)
             out_demands.append(dem)
@@ -771,14 +777,17 @@ def _collapse_micro_split_ops(
         prev_idx = group_pos.get(key)
         if prev_idx is None:
             group_pos[key] = len(out_rows)
+            group_counts[key] = 1
             group_preds[key] = list(row.predecessors)
             out_rows.append(replace(
                 row,
                 occurrence=replace(row.occurrence, op_id=collapsed_id),
                 op_id=collapsed_id,
+                layer=None if is_recover_ssm else row.layer,
             ))
             out_demands.append(dem)
             continue
+        group_counts[key] += 1
         group_preds[key].extend(row.predecessors)
         base = out_rows[prev_idx]
         b_dem = out_demands[prev_idx]
@@ -803,7 +812,12 @@ def _collapse_micro_split_ops(
         out_demands[prev_idx] = merged_dem  # type: ignore[assignment]
     if renamed:
         for key, pos in group_pos.items():
-            out_rows[pos] = replace(out_rows[pos], predecessors=tuple(group_preds[key]))
+            cnt = group_counts.get(key, 1)
+            row_cur = out_rows[pos]
+            role_txt = row_cur.logical_role
+            if cnt > 1 and "recover_ssm" in row_cur.op_id and "(×" not in role_txt:
+                role_txt = f"{role_txt} (×{cnt} layers)"
+            out_rows[pos] = replace(row_cur, predecessors=tuple(group_preds[key]), logical_role=role_txt)
         out_rows = [
             replace(
                 r,

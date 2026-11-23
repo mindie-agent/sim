@@ -53,10 +53,35 @@ for _entry in (ROOT, TESTS):
     if str(_entry) not in sys.path:
         sys.path.insert(0, str(_entry))
 
+from _support.sharding import partition_shard_items  # noqa: E402
 from _support.tempdirs import cleanup as cleanup_tempdirs  # noqa: E402
 from _support.tempdirs import tempdir  # noqa: E402
 from mindie_sim.observations.captures import PROFILER_API_REQUIREMENT  # noqa: E402
 from mindie_sim.prediction.runtime import accel_build  # noqa: E402
+
+
+def pytest_addoption(parser):
+    group = parser.getgroup("sharding")
+    group.addoption(
+        "--shard-index", action="store", type=int, default=0,
+        help="0-based shard index for deterministic CI sharding (default: 0)",
+    )
+    group.addoption(
+        "--num-shards", action="store", type=int, default=1,
+        help="Total number of deterministic CI shards (default: 1)",
+    )
+
+
+def pytest_collection_modifyitems(config, items):
+    num_shards = config.getoption("--num-shards")
+    shard_index = config.getoption("--shard-index")
+    try:
+        selected, deselected = partition_shard_items(items, shard_index, num_shards)
+    except ValueError as exc:
+        raise pytest.UsageError(str(exc)) from exc
+    if deselected:
+        items[:] = selected
+        config.hook.pytest_deselected(items=deselected)
 
 
 def _missing(reason: str) -> None:

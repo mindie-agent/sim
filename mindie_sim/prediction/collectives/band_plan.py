@@ -29,6 +29,7 @@ from dataclasses import dataclass, field, replace
 
 from mindie_sim.schema.common import ModelingError
 from ..communication import CommunicationWork
+from ..mechanism import Work
 from .protocol import (
     MS_PER_S,
     LoweredCollective,
@@ -467,6 +468,96 @@ class BandCollectivePlan:
         return pre_prog, post_prog
 
 
+def _fallback_band_for_group(topology, family: str, ranks: tuple[int, ...]) -> object:
+    """Synthesize a neutral link-backed band only for a bandless sibling group."""
+    from mindie_sim.schema.hardware_links import CollectiveBandSpec
+    from .protocol import _infer_group_scope
+
+    scope = _infer_group_scope(ranks, topology)
+    latency_us = 0.0
+    frame_bytes = 1024
+    wire_bytes = 1024
+    if len(ranks) >= TWO_PHASES:
+        try:
+            path = topology.route(ranks[0], ranks[1])
+        except ValueError:
+            path = ()
+        for link_name, _, _ in path:
+            link = topology.links.get(link_name)
+            if link is not None:
+                latency_us = float(link.latency_us)
+                if getattr(link, "transaction_bytes", 0):
+                    frame_bytes = int(link.transaction_bytes)
+                    wire_bytes = frame_bytes + int(getattr(link, "protocol_overhead_bytes", 0) or 0)
+                break
+    return CollectiveBandSpec(
+        collective=family,
+        stack_id="default",
+        topology_scope=scope,
+        group_min=TWO_PHASES,
+        group_max=max(TWO_PHASES, len(ranks)),
+        expansion_mode="ring",
+        payload_min_inclusive=0,
+        payload_max_exclusive=None,
+        algorithm="ring",
+        protocol="link_default",
+        startup_scope="hop",
+        startup_us=latency_us,
+        payload_bytes_per_frame=frame_bytes,
+        wire_bytes_per_frame=wire_bytes,
+        credit_bytes=0,
+        evidence_id="sibling_group_link_fallback",
+    )
+
+
+def _lower_group_with_sibling_fallback(
+    topology,
+    family: str,
+    ranks: tuple[int, ...],
+    api_bytes: float,
+    *,
+    stack: str,
+    expansion_mode: str | None,
+    peer_matrix=None,
+    send_splits=None,
+    recv_splits=None,
+    communicator_id: str,
+    coset_id: str,
+    allow_sibling_fallback: bool,
+) -> LoweredCollective:
+    try:
+        return lower_collective(
+            family, ranks, topology, api_bytes,
+            stack=stack, expansion_mode=expansion_mode,
+            peer_matrix=peer_matrix, send_splits=send_splits, recv_splits=recv_splits,
+            communicator_id=communicator_id, coset_id=coset_id,
+        )
+    except ModelingError as exc:
+        if not str(exc).startswith("collective_band_missing"):
+            raise
+        if expansion_mode is not None:
+            try:
+                return lower_collective(
+                    family, ranks, topology, api_bytes,
+                    stack=stack, expansion_mode=None,
+                    peer_matrix=peer_matrix, send_splits=send_splits, recv_splits=recv_splits,
+                    communicator_id=communicator_id, coset_id=coset_id,
+                )
+            except ModelingError as inner_exc:
+                if not str(inner_exc).startswith("collective_band_missing") or not allow_sibling_fallback:
+                    raise
+        elif not allow_sibling_fallback:
+            raise
+        from mindie_sim.prediction.collectives.protocol import lower_collective as _lower_col
+        return _lower_col(
+            family, ranks, topology, api_bytes,
+            stack=stack,
+            band_override=_fallback_band_for_group(topology, family, ranks),
+            peer_matrix=peer_matrix, send_splits=send_splits, recv_splits=recv_splits,
+            communicator_id=communicator_id, coset_id=coset_id,
+        )
+
+
 def build_band_collective_plan(
     topology,
     family: str,
@@ -480,6 +571,7 @@ def build_band_collective_plan(
 ) -> BandCollectivePlan:
     """Lower all groups in a cohort through ``lower_collective`` into one plan."""
     stack = str(metadata.get("collective_stack", stack) or stack)
+    multi_group = len(unique_groups) > 1
     groups: list[BandCollectiveGroup] = []
     for idx, ranks in enumerate(unique_groups):
         if family == "alltoallv" or peer is not None:
@@ -495,12 +587,13 @@ def build_band_collective_plan(
                 for c in range(len(ranks))
             )
             api_bytes = float(max(send_splits)) if send_splits else 0.0
-            lowered = lower_collective(
-                "alltoallv", ranks, topology, api_bytes,
+            lowered = _lower_group_with_sibling_fallback(
+                topology, "alltoallv", ranks, api_bytes,
                 stack=stack, expansion_mode=expansion_mode,
                 peer_matrix=matrix, send_splits=send_splits, recv_splits=recv_splits,
                 communicator_id=str(metadata.get("collective_id", "")),
                 coset_id=f"g{idx}",
+                allow_sibling_fallback=multi_group,
             )
         else:
             volumes = {rank: volume_by_rank[rank] for rank in ranks}
@@ -521,21 +614,23 @@ def build_band_collective_plan(
                     for c_i in range(n_ranks)
                 )
                 api_bytes = float(max(send_splits)) if send_splits else 0.0
-                lowered = lower_collective(
-                    "alltoallv", ranks, topology, api_bytes,
+                lowered = _lower_group_with_sibling_fallback(
+                    topology, "alltoallv", ranks, api_bytes,
                     stack=stack, expansion_mode=expansion_mode,
                     peer_matrix=matrix, send_splits=send_splits, recv_splits=recv_splits,
                     communicator_id=str(metadata.get("collective_id", "")),
                     coset_id=f"g{idx}",
+                    allow_sibling_fallback=multi_group,
                 )
             else:
                 vol = next(iter(volumes.values()), 0.0)
                 api_bytes = api_bytes_from_link_volume(family, len(ranks), vol, metadata)
-                lowered = lower_collective(
-                    family, ranks, topology, api_bytes,
+                lowered = _lower_group_with_sibling_fallback(
+                    topology, family, ranks, api_bytes,
                     stack=stack, expansion_mode=expansion_mode,
                     communicator_id=str(metadata.get("collective_id", "")),
                     coset_id=f"g{idx}",
+                    allow_sibling_fallback=multi_group,
                 )
         groups.append(BandCollectiveGroup(ranks=ranks, lowered=lowered, topology=topology))
     return BandCollectivePlan(family=family, groups=tuple(groups), topology=topology)

@@ -581,139 +581,110 @@ def _append_prefill_key_load(
     return k_ready, k_free
 
 
-def _prefill_tile_stages(
-    valid, slot, context, core, spec, cache, rows, dim, outer, max_tile, q_bytes, read, write,
-    operand, vector_copy_in, handoff: FixpipeHandoffPolicy = FixpipeHandoffPolicy(),
+def _append_prefill_value_load(
+    emitted, context, core, cache, valid, suffix, value_needs, value_payload, value_operand,
+    value_scale, v_l1, v_l0b, read, write, operand, vector_copy_in,
 ):
     copy_in = (read,)
     copy_out = (write,) if write else ()
     operand_roles = (operand,) if operand else ()
-    cube, vector = ("cube",), ("vector",)
-    rect = rows * valid
-    key_needs = cache.key_needs_conversion
-    value_needs = cache.value_needs_conversion
-    key_payload = valid * cache.key_payload_row
-    value_payload = valid * cache.value_payload_row
-    key_operand = valid * cache.key_operand_row
-    value_operand = valid * cache.value_operand_row
-    key_scale = (valid * cache.key_scale_row
-                 if cache.scale_scope == "row" else 0)
-    value_scale = (valid * cache.value_scale_row
-                   if cache.scale_scope == "row" else 0)
-    suffix = f"s{slot}"
-    k_l1 = (_allocation(context, core, "l1", f"k_l1_{suffix}", key_payload)
-            if not key_needs else None)
-    k_l0b = (_allocation(
-        context, core, "l0b", f"k_l0b_{suffix}",
-        min(key_payload, OPERAND_MICROTILE_KIB * 1024)) if not key_needs else None)
-    # CVDiff softmax/PV cuts the probability panel to
-    # softmaxSOuterFactor rows; it does not materialize the full Souter
-    # row set in L0A/UB at once.
-    scores = _allocation(context, core, "l0c", f"scores_{suffix}",
-                         outer * max_tile * _FP32_BYTES)
-    probs = _allocation(context, core, "ub", f"probs_{suffix}",
-                        outer * max_tile * _FP32_BYTES)
-    p_l0a = _allocation(context, core, "l0a", f"p_l0a_{suffix}",
-                       min(outer * valid * spec.query_bytes, OPERAND_MICROTILE_KIB * 1024))
-    v_l1 = (_allocation(context, core, "l1", f"v_l1_{suffix}", value_payload)
-            if not value_needs else None)
-    v_l0b = (_allocation(
-        context, core, "l0b", f"v_l0b_{suffix}",
-        min(value_payload, OPERAND_MICROTILE_KIB * 1024)) if not value_needs else None)
-    pv_acc = _allocation(context, core, "l0c", f"pv_acc_{suffix}",
-                         rows * dim * _FP32_BYTES)
-    score_acquire = _allocations((scores,))
-    prob_acquire = _allocations((probs,))
-    pv_acquire = _allocations((pv_acc,))
-    score_release = _allocations((scores,))
-    prob_release = _allocations((probs,))
-
-    qk = Work(matrix={spec.query_dtype: 2 * dim * rect},
-              resources=({"mte1": q_bytes} if operand else {}))
-    softmax = Work(resources={"vector": SOFTMAX_OPS_PER_SCORE * rect + rows})
-    pv = Work(matrix={spec.query_dtype: 2 * dim * rect})
-    online = Work(resources={"vector": rows * (ONLINE_UPDATE_OPS_PER_VALUE * dim + ONLINE_UPDATE_STATE_OPS)})
-    dequant = cache.dequant_ops_per_element
-    emitted = []
-
-    # K: packed payload -> UB, vector conversion -> UB, MTE3 -> L1,
-    # MTE1 -> L0B, QK.  Non-converting sides keep the direct path.
-    key_needs = cache.key_needs_conversion
-    value_needs = cache.value_needs_conversion
-    k_ready, k_free = _append_prefill_key_load(
-        emitted, context, core, cache, valid, suffix, key_needs, key_payload, key_operand,
-        key_scale, k_l1, k_l0b, read, write, operand, vector_copy_in)
-    emitted.append(Stage(
-        "qk", context.bind(qk), after=(k_ready,),
-        acquire=score_acquire, free=k_free,
-        placement={**_placement(context, core, *cube),
-                   **_placement(context, core, *operand_roles)}))
-    score_ready, softmax_free = append_gqa_handoff_stages(
-        emitted, "score", "qk", rect * _FP32_BYTES,
-        score_release, handoff, context, core, vector_copy_in[0],
-    )
-    emitted.append(Stage(
-        "softmax", context.bind(softmax), after=(score_ready,),
-        acquire=prob_acquire, free=softmax_free,
-        placement=_placement(context, core, *vector)))
-
-    # V mirrors K; PV consumes the materialized V operand and probability.
+    vector = ("vector",)
     if value_needs:
-        v_payload_ub = _allocation(
-            context, core, "ub", f"v_payload_{suffix}", value_payload)
-        v_conv_ub = _allocation(
-            context, core, "ub", f"v_conv_{suffix}", value_operand)
-        v_post_l1 = _allocation(
-            context, core, "l1", f"v_post_{suffix}", value_operand)
-        v_l0b = _allocation(
-            context, core, "l0b", f"v_l0b_{suffix}", value_operand)
-        v_scale_ub = (_allocation(
-            context, core, "ub", f"v_scale_{suffix}", value_scale)
-            if value_scale else None)
+        v_payload_ub = _allocation(context, core, "ub", f"v_payload_{suffix}", value_payload)
+        v_conv_ub = _allocation(context, core, "ub", f"v_conv_{suffix}", value_operand)
+        v_post_l1 = _allocation(context, core, "l1", f"v_post_{suffix}", value_operand)
+        v_l0b = _allocation(context, core, "l0b", f"v_l0b_{suffix}", value_operand)
+        v_scale_ub = (
+            _allocation(context, core, "ub", f"v_scale_{suffix}", value_scale)
+            if value_scale else None
+        )
         emitted.append(Stage(
             "v_load", context.bind(Work(resources={
-                "hbm": value_payload,
-                _read_role(context, vector=True): value_payload})),
-            after=("softmax",), acquire=_allocations((v_payload_ub,)),
+                "hbm": value_payload, _read_role(context, vector=True): value_payload,
+            })), after=("softmax",), acquire=_allocations((v_payload_ub,)),
             placement=_placement(context, core, *vector_copy_in)))
         after = ("v_load",)
         if value_scale:
             emitted.append(Stage(
                 "v_scale_load", context.bind(Work(resources={
-                    "hbm": value_scale,
-                    _read_role(context, vector=True): value_scale})),
-                after=("v_load",), acquire=_allocations((v_scale_ub,)),
+                    "hbm": value_scale, _read_role(context, vector=True): value_scale,
+                })), after=("v_load",), acquire=_allocations((v_scale_ub,)),
                 placement=_placement(context, core, *vector_copy_in)))
             after = ("v_scale_load",)
         emitted.append(Stage(
-            "dequant_v", context.bind(Work(resources={
-                "vector": cache.value_conversion_ops(valid)})),
+            "dequant_v", context.bind(Work(resources={"vector": cache.value_conversion_ops(valid)})),
             after=after, acquire=_allocations((v_conv_ub,)),
-            free=_allocations((v_payload_ub, v_scale_ub)),
-            placement=_placement(context, core, *vector)))
+            free=_allocations((v_payload_ub, v_scale_ub)), placement=_placement(context, core, *vector)))
         emitted.append(Stage(
             "conv_store_v", context.bind(Work(resources={write: value_operand})),
             after=("dequant_v",), acquire=_allocations((v_post_l1,)),
-            free=_allocations((v_conv_ub,)),
-            placement=_placement(context, core, *copy_out)))
+            free=_allocations((v_conv_ub,)), placement=_placement(context, core, *copy_out)))
         emitted.append(Stage(
             "operand_v", context.bind(Work(resources={operand: value_operand})),
             after=("conv_store_v",), acquire=_allocations((v_l0b,)),
-            free=_allocations((v_post_l1,)),
-            placement=_placement(context, core, *operand_roles)))
-        v_ready = "operand_v"
-        v_free = _allocations((v_l0b,))
-    else:
-        v_load = {"hbm": value_payload, read: value_payload}
-        if operand:
-            v_load["mte1"] = value_payload
-        emitted.append(Stage(
-            "v_load", context.bind(Work(resources=v_load)),
-            after=("softmax",), acquire=_allocations((v_l1, v_l0b)),
-            placement={**_placement(context, core, *copy_in),
-                       **_placement(context, core, *operand_roles)}))
-        v_ready = "v_load"
-        v_free = _allocations((v_l1, v_l0b))
+            free=_allocations((v_post_l1,)), placement=_placement(context, core, *operand_roles)))
+        return "operand_v", v_l0b
+    v_load = {"hbm": value_payload, read: value_payload}
+    if operand:
+        v_load["mte1"] = value_payload
+    emitted.append(Stage(
+        "v_load", context.bind(Work(resources=v_load)),
+        after=("softmax",), acquire=_allocations((v_l1, v_l0b)),
+        placement={**_placement(context, core, *copy_in), **_placement(context, core, *operand_roles)}))
+    return "v_load", v_l0b
+
+
+def _prefill_tile_stages(
+    valid, slot, context, core, spec, cache, rows, dim, outer, max_tile, q_bytes, read, write,
+    operand, vector_copy_in, handoff: FixpipeHandoffPolicy = FixpipeHandoffPolicy(),
+):
+    operand_roles = (operand,) if operand else ()
+    cube, vector = ("cube",), ("vector",)
+    rect = rows * valid
+    key_needs, value_needs = cache.key_needs_conversion, cache.value_needs_conversion
+    key_payload, value_payload = valid * cache.key_payload_row, valid * cache.value_payload_row
+    key_operand, value_operand = valid * cache.key_operand_row, valid * cache.value_operand_row
+    key_scale = (valid * cache.key_scale_row if cache.scale_scope == "row" else 0)
+    value_scale = (valid * cache.value_scale_row if cache.scale_scope == "row" else 0)
+    suffix = f"s{slot}"
+    k_l1 = (_allocation(context, core, "l1", f"k_l1_{suffix}", key_payload) if not key_needs else None)
+    k_l0b = (_allocation(
+        context, core, "l0b", f"k_l0b_{suffix}",
+        min(key_payload, OPERAND_MICROTILE_KIB * 1024)) if not key_needs else None)
+    scores = _allocation(context, core, "l0c", f"scores_{suffix}", outer * max_tile * _FP32_BYTES)
+    probs = _allocation(context, core, "ub", f"probs_{suffix}", outer * max_tile * _FP32_BYTES)
+    p_l0a = _allocation(context, core, "l0a", f"p_l0a_{suffix}",
+                        min(outer * valid * spec.query_bytes, OPERAND_MICROTILE_KIB * 1024))
+    v_l1 = (_allocation(context, core, "l1", f"v_l1_{suffix}", value_payload) if not value_needs else None)
+    v_l0b = (_allocation(
+        context, core, "l0b", f"v_l0b_{suffix}",
+        min(value_payload, OPERAND_MICROTILE_KIB * 1024)) if not value_needs else None)
+    pv_acc = _allocation(context, core, "l0c", f"pv_acc_{suffix}", rows * dim * _FP32_BYTES)
+    score_acquire, prob_acquire, pv_acquire = _allocations((scores,)), _allocations((probs,)), _allocations((pv_acc,))
+    score_release, prob_release = _allocations((scores,)), _allocations((probs,))
+
+    qk = Work(matrix={spec.query_dtype: 2 * dim * rect}, resources=({"mte1": q_bytes} if operand else {}))
+    softmax = Work(resources={"vector": SOFTMAX_OPS_PER_SCORE * rect + rows})
+    pv = Work(matrix={spec.query_dtype: 2 * dim * rect})
+    online = Work(resources={"vector": rows * (ONLINE_UPDATE_OPS_PER_VALUE * dim + ONLINE_UPDATE_STATE_OPS)})
+    emitted = []
+
+    k_ready, k_free = _append_prefill_key_load(
+        emitted, context, core, cache, valid, suffix, key_needs, key_payload, key_operand,
+        key_scale, k_l1, k_l0b, read, write, operand, vector_copy_in)
+    emitted.append(Stage(
+        "qk", context.bind(qk), after=(k_ready,), acquire=score_acquire, free=k_free,
+        placement={**_placement(context, core, *cube), **_placement(context, core, *operand_roles)}))
+    score_ready, softmax_free = append_gqa_handoff_stages(
+        emitted, "score", "qk", rect * _FP32_BYTES, score_release, handoff, context, core, vector_copy_in[0],
+    )
+    emitted.append(Stage(
+        "softmax", context.bind(softmax), after=(score_ready,),
+        acquire=prob_acquire, free=softmax_free, placement=_placement(context, core, *vector)))
+
+    v_ready, v_l0b = _append_prefill_value_load(
+        emitted, context, core, cache, valid, suffix, value_needs, value_payload, value_operand,
+        value_scale, v_l1, v_l0b, read, write, operand, vector_copy_in)
     pv_free = (
         _allocations((v_l0b, p_l0a))
         + (_allocations((v_l1,)) if not value_needs else ())
@@ -721,23 +692,18 @@ def _prefill_tile_stages(
     )
     emitted.extend((
         Stage("probability_operand",
-              context.bind(Work(resources=(
-                  {"mte1": rect * spec.query_bytes} if operand else {}))),
+              context.bind(Work(resources=({"mte1": rect * spec.query_bytes} if operand else {}))),
               after=("softmax",), acquire=_allocations((p_l0a,)),
               placement=_placement(context, core, *operand_roles)),
-        Stage("pv", context.bind(pv),
-              after=(v_ready, "probability_operand"),
-              acquire=pv_acquire, free=pv_free,
-              placement=_placement(context, core, *cube)),
+        Stage("pv", context.bind(pv), after=(v_ready, "probability_operand"),
+              acquire=pv_acquire, free=pv_free, placement=_placement(context, core, *cube)),
     ))
     pv_ready, _ = append_gqa_handoff_stages(
-        emitted, "pv", "pv", rows * dim * _FP32_BYTES,
-        tuple(pv_acquire), handoff, context, core, vector_copy_in[0],
+        emitted, "pv", "pv", rows * dim * _FP32_BYTES, tuple(pv_acquire), handoff, context, core, vector_copy_in[0],
     )
     emitted.append(Stage(
         "online_update", context.bind(online), after=(pv_ready,),
-        free=prob_release, previous=("online_update",),
-        placement=_placement(context, core, *vector)))
+        free=prob_release, previous=("online_update",), placement=_placement(context, core, *vector)))
     return tuple(emitted)
 
 
