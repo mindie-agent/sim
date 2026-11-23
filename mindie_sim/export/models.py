@@ -281,6 +281,7 @@ WEIGHT_QUANT_FORMATS: dict[str, dict[str, float | int]] = {
     "FP8": {"bytes": 1.0, "group": 0, "scale": 0, "aux": 0},
     "W8A8": {"bytes": 1.0, "group": 0, "scale": 0, "aux": INT8_CHANNEL_AUX_BYTES},
     "W4A8": {"bytes": 0.5, "group": 0, "scale": 0, "aux": INT4_CHANNEL_AUX_BYTES},
+    "W4A16": {"bytes": 0.5, "group": MXFP_GROUP_SIZE, "scale": BF16_BYTES, "aux": 0},
     "MXFP8": {"bytes": 1.0, "group": MXFP_GROUP_SIZE, "scale": 1, "aux": 0},
     "MXFP4": {"bytes": 0.5, "group": MXFP_GROUP_SIZE, "scale": 1, "aux": 0},
     "INT8": {"bytes": 1.0, "group": 0, "scale": 0, "aux": INT8_CHANNEL_AUX_BYTES},
@@ -288,7 +289,7 @@ WEIGHT_QUANT_FORMATS: dict[str, dict[str, float | int]] = {
 }
 
 SUPPORTED_WEIGHT_QUANTS = ("BF16", "W8A8", "W4A8", "MXFP8", "MXFP4")
-SUPPORTED_CACHE_DTYPES = ("BF16", "C8", "FP8")
+SUPPORTED_CACHE_DTYPES = ("BF16", "C8", "FP8", "MXFP8")
 
 COLLECTIVE_FAMILIES = frozenset({
     "allreduce", "allgather", "reducescatter", "reduce_scatter", "alltoall",
