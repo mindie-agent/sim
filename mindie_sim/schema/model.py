@@ -247,6 +247,7 @@ class LayerPlan:
     router_noaux_tc: bool = False
     k_eq_v: bool = False
     kda_batch_chunk_norm: bool = False
+    zero_expert_num: int = 0
 
     def __post_init__(self) -> None:
         # Normalise the declared indexer role once, so every downstream reader
@@ -356,6 +357,7 @@ class ModelSpec:
     #: ``text_backbone`` excludes undeclared multimodal towers; a
     #: ``full_checkpoint`` scope requires exact tower/projector declarations.
     accounting_scope: str = "text_backbone"
+    zero_expert_num: int = 0
 
     def __post_init__(self) -> None:
         scope = str(self.accounting_scope or "text_backbone")
@@ -428,7 +430,7 @@ class ModelSpec:
             "ffn_intermediate_size", "vocab_size", "attention", "ffn", "architecture",
             "activation_dtype", "weight_dtype", "kv_dtype", "compute_dtype", "quantization",
             "num_experts", "n_routed_experts", "top_k", "moe_intermediate_size",
-            "num_shared_experts", "expert_routing", "expert_routing_histogram",
+            "num_shared_experts", "zero_expert_num", "expert_routing", "expert_routing_histogram",
             "expert_routing_distribution", "mla", "tie_word_embeddings",
             "catalog_key", "model_catalog_key", "preset", "metadata",
             "accounting_scope",
@@ -546,6 +548,7 @@ class ModelSpec:
             tie_word_embeddings=bool(raw.get("tie_word_embeddings", False)),
             metadata=_metadata(raw),
             accounting_scope=str(raw.get("accounting_scope", "text_backbone")),
+            zero_expert_num=_int(raw.get("zero_expert_num", 0), "model.zero_expert_num_invalid"),
         )
 
     @property

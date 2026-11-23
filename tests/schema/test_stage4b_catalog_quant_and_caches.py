@@ -1,0 +1,282 @@
+"""Stage 4B catalog geometry, curated checkpoint preservation, and cache/weight laws."""
+from __future__ import annotations
+
+from dataclasses import replace
+
+import pytest
+
+from mindie_sim.catalog.cache import layer_cache_components, request_cache_breakdown
+from mindie_sim.catalog.cache_format import cache_format
+from mindie_sim.catalog.cache_index import index_row_bytes
+from mindie_sim.catalog.cache_pools import _packed_mla_row_bytes
+from mindie_sim.catalog.draft_weights import draft_terms
+from mindie_sim.catalog.ops import compute_dtype_for
+from mindie_sim.catalog.quant import _quant_w4a8_dynamic
+from mindie_sim.catalog.types import QuantSpec
+from mindie_sim.catalog.weight_layer_terms import _layer_resolved_quant, layer_weight_terms
+from mindie_sim.catalog.weight_terms import term_bytes
+from mindie_sim.catalog.weights import _body_terms
+from mindie_sim.compose import compose_case
+from mindie_sim.model_catalog import load_model
+from mindie_sim.prediction.structure import parse_case
+from mindie_sim.schema.parallel import ParallelSpec
+from mindie_sim.stacks.vllm_ascend.profiles import VA_RECOMMENDED_PROFILES
+
+pytestmark = pytest.mark.tier0
+
+GIB = float(1024 ** 3)
+MX_GROUP_SIZE = 32
+BF16_SCALE_BYTES = 2.0
+FP8_MLA_FP16_SCALE_ROW_BYTES = 648
+FP8_MLA_FP32_SCALE_ROW_BYTES = 656
+V32_INDEX_ROW_BYTES = 130.0
+SINGLE_NODE_BLOCK_ROWS = 128
+GEMMA4_WINDOW_ROWS = 1024
+GEMMA4_PADDED_WINDOW_ROWS = 1152
+STEP5_WINDOW_ROWS = 512
+STEP5_PADDED_WINDOW_ROWS = 640
+STEP5_ROUTER_BYTES_FP32 = 352 * 4096 * 4
+GLM_FLASH_HC_FN_BYTES_FP32 = 24 * 16384 * 4
+MINIMAX_TOPK_BLOCKS = 16
+MINIMAX_TOPK_TOKENS = 2048
+MINIMAX_INDEX_DIM = 128
+MINIMAX_HIDDEN = 6144
+LONGCAT_LAYERS = 28
+LONGCAT_MOE_LAYERS = 14
+LONGCAT_DENSE_LAYERS = 14
+LONGCAT_ZERO_EXPERTS = 128
+LONGCAT_ROUTER_WIDTH = 384
+LONGCAT_NGRAM_EXPECTED_GIB = 58.50007
+LONGCAT_KV_EXPECTED_GIB = 0.507568
+
+
+def test_mxfp4_compute_dtype_follows_activation_format():
+    """MXFP4 weights resolve compute dtype from the paired activation format."""
+    w4a4 = QuantSpec(name="w4a4", weight_format="mxfp4", activation_format="fp4_e2m1", expert_weight_format="mxfp4")
+    w4a4_mx = QuantSpec(name="w4a4_mx", weight_format="mxfp4", activation_format="mxfp4", expert_weight_format="mxfp4")
+    w4a8 = QuantSpec(name="w4a8", weight_format="mxfp4", activation_format="fp8_e4m3", expert_weight_format="mxfp4")
+    w4a8_mx = QuantSpec(name="w4a8_mx", weight_format="mxfp4", activation_format="mxfp8", expert_weight_format="mxfp4")
+    w4a16 = QuantSpec(name="w4a16", weight_format="mxfp4", activation_format="bf16", expert_weight_format="mxfp4")
+    assert compute_dtype_for(w4a4, "routed_expert") == ("mxfp4", "fp4_e2m1")
+    assert compute_dtype_for(w4a4_mx, "routed_expert") == ("mxfp4", "mxfp4")
+    assert compute_dtype_for(w4a8, "routed_expert") == ("fp8_e4m3", "fp8_e4m3")
+    assert compute_dtype_for(w4a8_mx, "routed_expert") == ("fp8_e4m3", "mxfp8")
+    assert compute_dtype_for(w4a16, "routed_expert") == ("bf16", "bf16")
+
+
+def test_curated_checkpoints_preserved_when_quant_is_none():
+    """Production compose preserves curated per-layer and per-category rules on A5/A3."""
+    step5_a5 = parse_case(compose_case("step-5-preview", "a5", tp=4, dp=4, ep=16, num_devices=16))
+    assert step5_a5.model.quant.format_for("attn.qkv") == "bf16"
+    assert step5_a5.model.quant.format_for("shared_expert") == "bf16"
+    assert _layer_resolved_quant(step5_a5.model, step5_a5.model.layer_plans[10]).format_for("routed_expert") == "fp8_e4m3"
+    for layer_idx in (88, 89, 90):
+        layer_q = _layer_resolved_quant(step5_a5.model, step5_a5.model.layer_plans[layer_idx])
+        assert layer_q.format_for("routed_expert") == "bf16"
+
+    qfn_a5 = parse_case(compose_case("qwen3.8-flash-next", "a5", tp=4, dp=1, ep=4, num_devices=4))
+    assert qfn_a5.model.quant.format_for("gdn.qkvz") == "bf16"
+    assert qfn_a5.model.quant.format_for("ple") == "bf16"
+    assert qfn_a5.model.quant.format_for("attn.qkv") == "fp8_e4m3"
+    assert qfn_a5.model.quant.format_for("routed_expert") == "mxfp4"
+
+    g31_a5 = parse_case(compose_case("gemma-4-31b", "a5", tp=4, dp=2, ep=1, num_devices=8))
+    assert g31_a5.model.quant.format_for("attn.qkv") == "fp8_e4m3"
+    assert _layer_resolved_quant(g31_a5.model, g31_a5.model.layer_plans[0]).format_for("dense_mlp") == "mxfp4"
+    for exc_layer in (1, 9, 10, 11, 27, 28):
+        assert _layer_resolved_quant(g31_a5.model, g31_a5.model.layer_plans[exc_layer]).format_for("dense_mlp") == "bf16"
+
+    g26_a5 = parse_case(compose_case("gemma-4-26b-a4b", "a5", tp=4, dp=2, ep=8, num_devices=8))
+    assert g26_a5.model.quant.format_for("attn.qkv") == "fp8_e4m3"
+    assert g26_a5.model.quant.format_for("dense_mlp") == "fp8_e4m3"
+    assert g26_a5.model.quant.format_for("routed_expert") == "mxfp4"
+
+
+def test_profile_quant_updates_and_quant_spec_metadata():
+    """Profile arch mappings, V4 routed activation group size, and W4A8 scale_only ABI."""
+    assert VA_RECOMMENDED_PROFILES["qwen3-30b-a3b"]["quant"]["a5"] == "mxfp8"
+    assert VA_RECOMMENDED_PROFILES["glm-5.3"]["quant"]["a5"] == "mxfp8"
+    assert VA_RECOMMENDED_PROFILES["qwen3.8-2.4t-a95b"]["quant"]["a3"] == "w4a8"
+    assert VA_RECOMMENDED_PROFILES["deepseek-v4-flash-0731"]["quant"]["a3"] == "w4a8"
+
+    q30_a5 = parse_case(compose_case("qwen3-30b-a3b", "a5", tp=4, dp=1, ep=4, num_devices=4))
+    assert q30_a5.model.quant.weight_format == "fp8_e4m3"
+
+    glm53_a5 = parse_case(compose_case("glm-5.3", "a5", tp=4, dp=8, ep=32, num_devices=32))
+    assert glm53_a5.model.quant.weight_format == "fp8_e4m3"
+    assert glm53_a5.model.quant.kv_dtype in {"fp8", "fp8_e4m3"}
+
+    mm31_a5 = parse_case(compose_case("minimax-m3.1-flash", "a5", tp=4, dp=4, ep=16, num_devices=16))
+    assert mm31_a5.model.quant.kv_dtype in {"fp8", "fp8_e4m3"}
+
+    v4_flash = load_model("deepseek-v4-flash-0731")
+    routed_q = v4_flash.quant.for_category("routed_expert")
+    assert routed_q.activation_group_size == MX_GROUP_SIZE
+    assert routed_q.activation_scale_format == "fp8_e8m0"
+
+    w4a8 = _quant_w4a8_dynamic()
+    assert w4a8.runtime_int8_weight_metadata == "scale_only"
+    assert w4a8.runtime_weight_scale_format == "bf16"
+    assert w4a8.runtime_weight_scale_bytes == BF16_SCALE_BYTES
+    assert w4a8.runtime_activation_scale_format == "fp32"
+
+
+def test_compose_lowering_activation_quant_mlapo_and_profile_mso():
+    """Kimi-K3.1 activation quant, merged MLAPO native fusion, and profile MSO non-lock."""
+    k31_a5 = compose_case("kimi-k3.1", "a5", tp=8, dp=1, ep=8, num_devices=8, layers=4)
+    assert "activation_quantization" in (k31_a5["runtime"].get("lowering_passes") or ())
+
+    dsv3_merged = compose_case("deepseek-v3", "a5", tp=8, dp=1, ep=8, num_devices=8, layers=4, feature_track="merged")
+    lowerings = (dsv3_merged["runtime"].get("kernels") or {}).get("lowerings") or {}
+    native_fusion = lowerings.get("native_fusion") or {}
+    assert "mla_prolog" in (native_fusion.get("options") or {}).get("roles", ())
+
+    qm_a5 = compose_case("qwen3.5-moe", "a5", tp=2, dp=1, ep=2, num_devices=2, layers=4, feature_track="merged")
+    policy = (qm_a5["runtime"].get("metadata") or {}).get("execution_policy") or {}
+    assert policy.get("mso_source") != "caller"
+    mc2_level = (policy.get("moe_route") or {}).get("effective_enable_fused_mc2")
+    assert mc2_level != 0
+
+
+def test_fp8_mla_kpe_bf16_tail_and_v32_int8_index_k():
+    """FP8 MLA retains BF16 k_pe tail + scales; DeepSeek-V3.2 index_k is INT8+FP16 (130 B/tok)."""
+    glm52_a5 = parse_case(compose_case("glm-5.2", "a5", tp=8, dp=1, ep=8, num_devices=8, layers=4))
+    plan = glm52_a5.model.layer_plans[0]
+    assert _packed_mla_row_bytes(glm52_a5.model, plan) == FP8_MLA_FP16_SCALE_ROW_BYTES
+    fmt = cache_format(glm52_a5.model, "mla_kv", plan=plan)
+    assert fmt.row_bytes(plan.cache_row_elements) == FP8_MLA_FP16_SCALE_ROW_BYTES
+
+    meta = dict(glm52_a5.model.metadata)
+    meta["kv_scale_dtype"] = "fp32"
+    glm52_fp32_scale = replace(glm52_a5.model, metadata=tuple(sorted(meta.items())))
+    assert _packed_mla_row_bytes(glm52_fp32_scale, plan) == FP8_MLA_FP32_SCALE_ROW_BYTES
+
+    v32 = load_model("deepseek-v3.2")
+    assert (v32.quant.index_dtype, v32.quant.index_scale_dtype) == ("int8", "fp16")
+    assert index_row_bytes(v32, v32.layer_plans[0].index_dim) == V32_INDEX_ROW_BYTES
+    v32_a3 = parse_case(compose_case("deepseek-v3.2", "a3", tp=8, dp=1, ep=8, num_devices=8, layers=4))
+    assert index_row_bytes(v32_a3.model, v32_a3.model.layer_plans[0].index_dim) == V32_INDEX_ROW_BYTES
+
+
+def test_single_node_index_k_block_padding_and_swa_plus_one_page():
+    """cp=1 index_k rounds up to full pages when padded; SWA allocates +1 page when seq > window."""
+    parallel = ParallelSpec(tp=1, dp=1, ep=1, pp=1, cp=1)
+    v32 = load_model("deepseek-v3.2")
+    idx_plan = v32.layer_plans[0]
+    padded = layer_cache_components(v32, idx_plan, parallel, 1, capacity_padded=True)
+    unpadded = layer_cache_components(v32, idx_plan, parallel, 1, capacity_padded=False)
+    assert unpadded["index_k"] == V32_INDEX_ROW_BYTES
+    assert padded["index_k"] == SINGLE_NODE_BLOCK_ROWS * V32_INDEX_ROW_BYTES
+
+    g26 = load_model("gemma-4-26b-a4b")
+    swa_g26 = next(p for p in g26.layer_plans if p.window > 0)
+    row_bytes_g26 = 2 * swa_g26.num_kv_heads * swa_g26.head_dim * 2
+    assert layer_cache_components(g26, swa_g26, parallel, GEMMA4_WINDOW_ROWS, capacity_padded=True)["gqa_kv"] == (
+        GEMMA4_WINDOW_ROWS * row_bytes_g26
+    )
+    assert layer_cache_components(g26, swa_g26, parallel, GEMMA4_WINDOW_ROWS + 1, capacity_padded=True)["gqa_kv"] == (
+        GEMMA4_PADDED_WINDOW_ROWS * row_bytes_g26
+    )
+    assert layer_cache_components(g26, swa_g26, parallel, GEMMA4_WINDOW_ROWS + 1, capacity_padded=False)["gqa_kv"] == (
+        GEMMA4_WINDOW_ROWS * row_bytes_g26
+    )
+
+    step5 = load_model("step-5-preview")
+    swa_s5 = next(p for p in step5.layer_plans if p.window > 0)
+    row_bytes_s5 = 2 * swa_s5.num_kv_heads * swa_s5.head_dim * 2
+    assert layer_cache_components(step5, swa_s5, parallel, STEP5_WINDOW_ROWS + 1, capacity_padded=True)["gqa_kv"] == (
+        STEP5_PADDED_WINDOW_ROWS * row_bytes_s5
+    )
+
+
+def test_qwen_gemma_glm_minimax_step5_deepseek_kimi_geometry_and_weights():
+    """Model family geometry, router dtypes, CSA/MiniMax indexers, clones, and drafts."""
+    qm = load_model("qwen3.5-moe")
+    assert len(qm.layer_plans) == 64
+    qm_gqa = next(p for p in qm.layer_plans if p.attention == "gqa")
+    assert (qm_gqa.q_output_gate, qm_gqa.qk_norm, qm_gqa.qk_rope_head_dim, qm_gqa.shared_expert_gate) == (
+        True, True, 32, True
+    )
+    assert qm.auxiliary.mtp.layer_plans[0].qk_rope_head_dim == 32
+
+    q27 = load_model("qwen3.5-27b")
+    q27_gqa = next(p for p in q27.layer_plans if p.attention == "gqa")
+    assert (q27_gqa.qk_rope_head_dim, q27_gqa.qk_nope_head_dim) == (64, 192)
+    assert q27.auxiliary.mtp.layer_plans[0].qk_rope_head_dim == 64
+    q36 = load_model("qwen3.6-27b")
+    assert q36.auxiliary.mtp.layer_plans[0].qk_rope_head_dim == 64
+
+    for key in ("gemma-4-26b-a4b", "gemma-4-31b"):
+        gm = load_model(key)
+        full_plan = next(p for p in gm.layer_plans if p.window == 0)
+        assert (full_plan.qk_rope_head_dim, full_plan.qk_nope_head_dim) == (128, 384)
+        v_terms = [t for t in layer_weight_terms(full_plan, gm) if t.name == "v_proj"]
+        assert len(v_terms) == 1 and not v_terms[0].source_owned and v_terms[0].runtime_owned
+
+    glm_f = load_model("glm-5.3-flash")
+    glm_mla = next(p for p in glm_f.layer_plans if p.attention == "mla")
+    assert glm_mla.projection_dtype == ""
+    assert (glm_mla.router_noaux_tc, glm_mla.routed_scaling_factor, glm_mla.swiglu_limit) == (True, 2.5, 10.0)
+    hc_fn = next(t for t in layer_weight_terms(glm_f.layer_plans[0], glm_f) if t.name == "hc_attn_fn")
+    assert term_bytes(hc_fn, glm_f.quant, ParallelSpec(tp=1)) == float(GLM_FLASH_HC_FN_BYTES_FP32)
+
+    mm = load_model("minimax-m3")
+    mm_moe = next(p for p in mm.layer_plans if p.ffn == "moe")
+    assert (mm_moe.index_topk, mm_moe.candidate_topk_blocks, mm_moe.router_noaux_tc, mm_moe.routed_scaling_factor) == (
+        MINIMAX_TOPK_TOKENS, MINIMAX_TOPK_BLOCKS, True, 2.0
+    )
+    mm_wq = next(t for t in layer_weight_terms(mm_moe, mm) if t.name == "indexer_wq")
+    assert mm_wq.shard == "kv_out"
+    assert term_bytes(mm_wq, mm.quant, ParallelSpec(tp=8)) == float(MINIMAX_INDEX_DIM * MINIMAX_HIDDEN * 2)
+
+    s5 = load_model("step-5-preview")
+    s5_moe = next(p for p in s5.layer_plans if p.ffn == "moe")
+    assert (s5_moe.router_mode, s5_moe.router_dtype, s5_moe.router_output_dtype) == ("sigmoid", "fp32", "fp32")
+    s5_router = next(t for t in layer_weight_terms(s5_moe, s5) if t.name == "router")
+    assert term_bytes(s5_router, s5.quant, ParallelSpec(tp=8)) == float(STEP5_ROUTER_BYTES_FP32)
+    s5_a5 = parse_case(compose_case("step-5-preview", "a5", tp=4, dp=4, ep=16, num_devices=16))
+    s5_a5_moe = next(p for p in s5_a5.model.layer_plans if p.ffn == "moe")
+    assert s5_a5_moe.router_dtype == "fp32"
+    s5_csa = next(p for p in s5.layer_plans if p.indexer)
+    csa_names = {t.name for t in layer_weight_terms(s5_csa, s5)}
+    assert {"sparse_indexer_q", "sparse_indexer_k", "sparse_indexer_z", "sparse_indexer_w", "ssmax_s"} <= csa_names
+    s5_dterms = draft_terms(s5.auxiliary.mtp, s5)
+    assert not any(t.name == "draft_input_proj" for t in s5_dterms)
+    assert all(t.shard == "out_tp" for t in s5_dterms if t.name in {"draft_output_head", "draft_eh_proj"})
+
+    for key in ("deepseek-v4-flash-0731", "deepseek-v4-pro-0813", "deepseek-v4-10t"):
+        v4_aux = load_model(key).auxiliary
+        assert (v4_aux.mtp or v4_aux.dspark).layers == 1
+    v41_aux = load_model("deepseek-v4.1-flash").auxiliary
+    assert (v41_aux.mtp or v41_aux.dspark).layers == 3
+
+    assert load_model("kimi-k3-dspark").layer_plans[0].qk_norm is True
+    assert load_model("kimi-k3").auxiliary.dspark.qk_norm is True
+    assert load_model("kimi-k2").layer_plans[0].packed_input_projection is True
+    assert load_model("kimi-k3-dspark-block5").layer_plans[0].packed_input_projection is True
+    assert load_model("kimi-k3.1").auxiliary.dspark.layer_plans[0].packed_input_projection is True
+
+
+def test_longcat_flash_lite_ngram_zero_experts_and_dual_mla_blocks():
+    """LongCat-Flash-Lite models 31.41B ngram table, zero_expert_num=128, and 28 MLA + 28 dense MLPs."""
+    lc = load_model("longcat-flash-lite")
+    assert len(lc.layer_plans) == LONGCAT_LAYERS
+    assert sum(p.attention == "mla" for p in lc.layer_plans) == LONGCAT_LAYERS
+    assert sum(p.ffn == "moe" for p in lc.layer_plans) == LONGCAT_MOE_LAYERS
+    assert sum(p.ffn == "dense" for p in lc.layer_plans) == LONGCAT_DENSE_LAYERS
+    assert sum(p.shared_intermediate_size == 6144 for p in lc.layer_plans) == LONGCAT_MOE_LAYERS
+    assert lc.zero_expert_num == LONGCAT_ZERO_EXPERTS
+    assert all(p.zero_expert_num == LONGCAT_ZERO_EXPERTS for p in lc.layer_plans if p.ffn == "moe")
+
+    body = _body_terms(lc)
+    ngram = [t for t in body if t.name == "ngram_embedding"]
+    assert len(ngram) == 1
+    assert term_bytes(ngram[0], lc.quant, ParallelSpec(tp=1)) / GIB == pytest.approx(
+        LONGCAT_NGRAM_EXPECTED_GIB, rel=1e-4
+    )
+    routers = [t for t in body if t.name == "router"]
+    assert len(routers) == LONGCAT_MOE_LAYERS
+    assert all(t.rows == LONGCAT_ROUTER_WIDTH for t in routers)
+
+    kv_gib = request_cache_breakdown(lc, ParallelSpec(tp=1), 4224)["total_bytes"] * 4 / GIB
+    assert kv_gib == pytest.approx(LONGCAT_KV_EXPECTED_GIB, rel=1e-4)

@@ -266,7 +266,9 @@ def _attention_entries(out, model, layer) -> None:
         kv_width = layer.kv_heads * layer.head_dim
         _add(out, "q_proj", q_width, h)
         _add(out, "k_proj", kv_width, h)
-        if not layer.k_eq_v:
+        if layer.k_eq_v:
+            _add(out, "v_proj", kv_width, h, owner="runtime")
+        else:
             _add(out, "v_proj", kv_width, h)
         if layer.gate_separate:
             _add(out, "g_proj", layer.heads, h)
@@ -318,6 +320,16 @@ def _indexer_entries(out, model, layer) -> None:
         raise ValueError(f"reference_indexer_dims_missing:{layer.index}")
     h = model.hidden
     if layer.attention == "gqa" and layer.index_kpool > 1:
+        if model.builder == "step5":
+            _add(out, "sparse_indexer_q", layer.index_heads * layer.index_dim, h)
+            _add(out, "sparse_indexer_k", layer.index_dim, h)
+            _add(out, "sparse_indexer_z", layer.index_dim, h)
+            _add(out, "sparse_indexer_w", layer.index_heads, h)
+            _add(out, "indexer_q_norm", layer.index_dim, 1)
+            _add(out, "indexer_k_norm", layer.index_dim, 1)
+            _add(out, "indexer_k_norm_bias", layer.index_dim, 1)
+            _add(out, "ssmax_s", layer.index_heads, 1)
+            return
         _add(out, "index_qk_proj", (layer.index_heads + 1) * layer.index_dim, h)
         _add(out, "indexer_q_norm", layer.index_dim, 1)
         _add(out, "indexer_k_norm", layer.index_dim, 1)
@@ -460,7 +472,11 @@ def _quant_decl(c: Mapping[str, Any], builder: str) -> dict[str, Any]:
     scheme = str(declared.get("quant_method", "none") or "none")
     native = str(c.get("torch_dtype") or c.get("dtype") or "bf16")
     index_dtype, scale = "bf16", "none"
-    if builder in {"deepseek_v4", "deepseek_v41"}:
+    has_dsa_indexer = (
+        builder == "standard_deepseek"
+        and min(_i(c, "index_topk"), _i(c, "index_n_heads"), _i(c, "index_head_dim"), _i(c, "q_lora_rank")) > 0
+    )
+    if builder in {"deepseek_v4", "deepseek_v41"} or has_dsa_indexer:
         index_dtype, scale = "int8", "fp16"
     return {"scheme": scheme, "native_dtype": native, "kv_dtype": "bf16",
             "index_dtype": index_dtype, "index_scale_dtype": scale,

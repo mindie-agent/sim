@@ -81,7 +81,10 @@ def test_domain_two_defaults_intrinsic_offload_stack_features_and_opt_out():
         defaults = stack.model_defaults[model_key]
         assert defaults["engram_cpu_offload"] is True
         assert defaults["multistream_overlap_shared_expert"] is True
-        case = compose_case(model_key, "a5", tp=4, ep=4, layers=2, prompt_tokens=1024, output_tokens=64)
+        case = compose_case(
+            model_key, "a5", tp=4, ep=4, layers=2, prompt_tokens=1024, output_tokens=64,
+            exclude_optimizations=("cann_megamoe_fusion",),
+        )
         rt = case["runtime"]
         meta = rt["metadata"]
         policy = meta["execution_policy"]

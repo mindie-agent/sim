@@ -162,6 +162,59 @@ _FP8_FMT_TOKENS = frozenset({"fp8", "fp8_e4m3", "fp8_e5m2", "mxfp8", "mx_fp8", "
 _MX_SCALE_FMT_TOKENS = frozenset({"fp8_e8m0", "ue8m0", "e8m0"})
 _INT4_FMT_TOKENS = frozenset({"int4", "int4_weight", "w4a8", "w4a16"})
 _AUTO_VA_QUANT_TOKENS = frozenset({"auto_va", "auto"})
+_MX_FP8_FORMATS = frozenset({"fp8", "fp8_e4m3", "fp8_e5m2", "mxfp8"})
+_MX_FP4_FORMATS = frozenset({"mxfp4", "fp4", "fp4_e2m1"})
+_MX_PROFILE_KEYS = frozenset({"mxfp8", "mxfp4", "mxfp8_mxfp4", "w4a8_mxfp", "w4a4_mxfp4"})
+_INT8_PROFILE_KEYS = frozenset({"w8a8", "w8a8_dynamic", "w8a8_int8", "int8"})
+_INT4_PROFILE_KEYS = frozenset({"w4a8", "w4a8_dynamic", "w4a8-int8"})
+
+
+def _qspec_weight_formats(qspec: QuantSpec) -> set[str]:
+    fmts = {str(qspec.weight_format).lower(), str(qspec.expert_weight_format).lower()}
+    for _, override in getattr(qspec, "category_overrides", ()) or ():
+        for key, value in override:
+            if key in {"weight_format", "expert_weight_format"}:
+                fmts.add(str(value).lower())
+    return fmts
+
+
+def curated_quant_compatible_with_profile(
+    ckpt_qspec: QuantSpec | None,
+    profile_quant: str | None,
+    *,
+    model_spec: ModelSpec | None = None,
+    mlapo: bool = False,
+) -> bool:
+    """Return True when a curated checkpoint matches the profile's precision family."""
+    if ckpt_qspec is None or not profile_quant:
+        return False
+    pq = str(profile_quant).strip().lower()
+    if pq == "mxfp4_routed_only":
+        return False
+    if mlapo and model_spec is not None and any(
+        p.attention == "mla" and (p.indexer or p.owns_topk or p.index_query_per_layer)
+        for p in model_spec.layer_plans
+    ):
+        proj_act = str(ckpt_qspec.for_category("mla.q_b").activation_format).strip().lower()
+        idx_act = str(ckpt_qspec.for_category("indexer.wq").activation_format).strip().lower()
+        native_act = str(model_spec.activation_dtype or "bf16").strip().lower()
+        if proj_act != native_act and idx_act != proj_act:
+            return False
+    fmts = _qspec_weight_formats(ckpt_qspec)
+    has_int = bool(fmts & {"int8", "int4"})
+    has_fp8 = bool(fmts & _MX_FP8_FORMATS)
+    has_fp4 = bool(fmts & _MX_FP4_FORMATS)
+    if pq in _MX_PROFILE_KEYS:
+        if has_int or not (has_fp8 or has_fp4):
+            return False
+        if pq == "mxfp8":
+            return has_fp8 and not has_fp4
+        return has_fp4
+    if pq in _INT8_PROFILE_KEYS:
+        return "int8" in fmts and "int4" not in fmts and not (has_fp8 or has_fp4)
+    if pq in _INT4_PROFILE_KEYS:
+        return "int4" in fmts and not (has_fp8 or has_fp4)
+    return False
 _CHECKPOINT_NATIVE_QUANT_TOKENS = frozenset({"checkpoint", "native"})
 _UNQUANTIZED_QUANT_TOKENS = frozenset({"bf16", "bfloat16", "fp16", "float16", "fp32", "none"})
 DEFAULT_CONTEXT_TOKENS_FOR_QUANT = 4096
@@ -642,6 +695,12 @@ def resolve_checkpoint_quant_map(
         )
         return unquant, None, proj, auto_kv, auto_idx
 
+    if quant is None and adapter is not None and hardware_obj is not None:
+        default_repo = adapter.default_checkpoint_for(canon, hardware_obj)
+        curated = lookup_curated_checkpoint(default_repo) if default_repo else None
+        if curated is not None and curated.source_format != "unquantized_native":
+            return curated, quant_spec_from_checkpoint_map(curated), "", None, None
+
     return (
         synthetic_checkpoint_quant_map(model_spec, canon=canon, native_dtype=native_dtype),
         None, "", None, None,
@@ -747,6 +806,18 @@ def _apply_quant_override(
     machine: Mapping[str, Any],
 ) -> ModelSpec:
     if isinstance(quant, QuantSpec):
+        base_quant = getattr(model_spec, "quant", None)
+        if (
+            base_quant is not None
+            and str(quant.index_dtype or "bf16") == "bf16"
+            and str(quant.index_scale_dtype or "none") in {"", "none"}
+            and str(base_quant.index_dtype or "bf16") not in {"", "bf16", "fp16"}
+        ):
+            quant = replace(
+                quant,
+                index_dtype=str(base_quant.index_dtype),
+                index_scale_dtype=str(base_quant.index_scale_dtype),
+            )
         meta = dict(model_spec.metadata)
         if getattr(quant, "layer_quant_overrides", ()) and "layer_quant_overrides" not in meta:
             meta["layer_quant_overrides"] = quant.layer_quant_overrides_dict()
@@ -907,6 +978,8 @@ def ensure_native_mla_draft(model_spec: ModelSpec, proposals: int) -> ModelSpec:
 def _tier4_router_spec(model_spec: ModelSpec, sku: str, *, raw_eager: bool) -> ModelSpec:
     """A5 production executes FP32 checkpoint routers directly in Tier-4 form."""
     if raw_eager or _arch_key(sku) != "a5":
+        return model_spec
+    if bool(dict(getattr(model_spec, "catalog_facts", ()) or ()).get("need_fp32_gate", False)):
         return model_spec
 
     def rewrite(plans):

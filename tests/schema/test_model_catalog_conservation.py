@@ -363,7 +363,7 @@ def test_fleet_layer_plan_geometries_match_declared_configs() -> None:
         assert active == (list(range(3, 60)) if key == "minimax-m3" else list(range(60)))
         assert all((p.indexer_type, p.index_heads, p.index_dim, p.index_topk,
                     p.candidate_block_size, p.candidate_topk_blocks)
-                   == ("full", 4, 128, 2176, 128, 17) for p in plans if p.indexer)
+                   == ("full", 4, 128, 2048, 128, 16) for p in plans if p.indexer)
     qwen38 = load_model("qwen3.8-flash-next")
     assert (qwen38.hidden_size, qwen38.num_experts, qwen38.top_k) == (2560, 512, 10)
     assert len([p for p in qwen38.layer_plans if p.attention == "gdn"]) == 36
@@ -466,7 +466,8 @@ def test_shared_value_projection_keeps_two_cache_planes_and_qkv_widths() -> None
     assert global_plan.k_eq_v and not local_plan.k_eq_v
     terms = {term.name: term for term in layer_weight_terms(global_plan, model)}
     assert terms["q_proj"].rows == 16 * 512
-    assert terms["k_proj"].rows == 2 * 512 and "v_proj" not in terms
+    assert terms["k_proj"].rows == 2 * 512
+    assert terms["v_proj"].rows == 2 * 512 and not terms["v_proj"].source_owned and terms["v_proj"].runtime_owned
     local_terms = {term.name: term for term in layer_weight_terms(local_plan, model)}
     assert local_terms["k_proj"].rows == local_terms["v_proj"].rows == 8 * 256
     assert global_plan.cache_row_elements == 2 * 2 * 512
@@ -573,9 +574,9 @@ def test_draft_indexer_and_prepared_router_are_resident() -> None:
     prepared = [term for term in draft_terms(
         pro.model.auxiliary.mtp or pro.model.auxiliary.dspark, pro.model)
         if term.name == "draft_router_precast"]
-    assert len(prepared) == 3
+    assert len(prepared) == 1
     assert sum(term_bytes(term, pro.model.quant, pro.runtime.parallel,
-                          pro.machine.ranks_per_node) for term in prepared) == pytest.approx(33_030_144)
+                          pro.machine.ranks_per_node) for term in prepared) == pytest.approx(11_010_048)
     staged = [term for group in stage_weight_terms(
         pro.model, pro.runtime.parallel, include_draft=True, draft_kind="dspark")
         for term in group]

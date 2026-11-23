@@ -265,7 +265,7 @@ def _aux_kimi(c: Mapping[str, Any], config: Mapping[str, Any]) -> AuxiliarySpec:
         kv_cache_elements=KIMI_DSPARK_KV_PLANES * KIMI_DSPARK_GQA_KV_HEADS * KIMI_DSPARK_GQA_HEAD_DIM,
         q_width=KIMI_DSPARK_GQA_HEADS * KIMI_DSPARK_GQA_HEAD_DIM,
         kv_width=KIMI_DSPARK_GQA_KV_HEADS * KIMI_DSPARK_GQA_HEAD_DIM,
-        attention_kind="gqa",
+        attention_kind="gqa", qk_norm=True,
         target_layer_ids=target_ids, block_size=block, markov_rank=markov,
         confidence_enabled=True, confidence_executes=False,
         confidence_input_width=h + markov,
@@ -312,7 +312,7 @@ def _standard_kimi_plans(config: Mapping[str, Any]) -> list[LayerPlan]:
     from mindie_sim.catalog.deepseek import _standard_deepseek_plans
 
     c, _ = _standard_kimi_flat(config)
-    return _standard_deepseek_plans(c)
+    return _standard_deepseek_plans(c, packed_input_projection=True)
 
 
 def _aux_standard_kimi(config: Mapping[str, Any]) -> AuxiliarySpec:

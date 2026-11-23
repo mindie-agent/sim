@@ -289,7 +289,7 @@ def _aux_decl(c: Mapping[str, Any], builder: str) -> dict[str, Any]:
     targets = tuple(int(v) for v in c.get("dspark_target_layer_ids", ()) or ())
     nextn = _i(c, "num_nextn_predict_layers")
     if builder in {"deepseek_v4", "deepseek_v41"}:
-        layers = len(targets) if targets else nextn
+        layers = nextn if nextn > 0 else len(targets)
         if layers <= 0:
             return {}
         block = _i(c, "dspark_block_size", 1)

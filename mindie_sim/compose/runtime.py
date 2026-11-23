@@ -50,6 +50,14 @@ TRACKED_KERNEL_SECTIONS = ("families", "recipes", "lowerings", "programs")
 FULL_DECODE_CUDAGRAPH_MODE = "FULL_DECODE_ONLY"
 FULL_CUDAGRAPH_MODES = frozenset({"FULL", FULL_DECODE_CUDAGRAPH_MODE})
 _INT_WEIGHT_FORMATS = frozenset({"int8", "int4"})
+_FP4_ACT_FORMATS = frozenset({"fp4", "fp4_e2m1", "mxfp4"})
+_NORM_QUANT_FAMILY_CATEGORIES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("gate_up_projection", ("dense_mlp", "shared_expert")),
+    ("qkv_projection", ("attn.qkv", "attn")),
+    ("latent_projection", ("mla", "mla.q_a", "mla.kv_a")),
+    ("index_projection", ("indexer", "indexer.wq")),
+    ("router", ("router",)),
+)
 _WEIGHT_NZ_ARCHES = frozenset({"a2", "a3"})
 MAX_CACHED_SINGLE_SPINE_CONTRACTS = 64
 
@@ -258,6 +266,41 @@ def _supports_sequence_parallel(
         notes.append(fallback_note("sequence_parallel", str(exc)))
         return False
     return True
+
+
+def filter_fp4_norm_quant_domain(
+    kernels: Mapping[str, Any], quant: Any,
+) -> dict[str, Any]:
+    """Exclude FP4-activation consumers from ``norm_quant`` fusion domains.
+
+    Native Ascend ``RmsNormDynamicMxQuant`` only emits FP8/INT8 outputs; keeping
+    FP4-activation consumers (e.g. Gemma-4-31B W4A4 ``dense_mlp``) out of the
+    norm-quant consumer domain preserves FP8 norm-quant fusion on attention while
+    leaving FP4 activation quantizers cleanly unfused.
+    """
+    out = dict(kernels)
+    if quant is None:
+        return out
+    domains = dict(out.get("fusion_domains") or {})
+    nq = domains.get("norm_quant")
+    if not isinstance(nq, Mapping):
+        return out
+    blocked: set[str] = set()
+    for family, categories in _NORM_QUANT_FAMILY_CATEGORIES:
+        if any(
+            str(quant.for_category(cat).activation_format).strip().lower() in _FP4_ACT_FORMATS
+            for cat in categories
+        ):
+            blocked.add(family)
+    if not blocked:
+        return out
+    consumers = [
+        item for item in (nq.get("consumers") or ())
+        if not (isinstance(item, Mapping) and str(item.get("family", "")) in blocked)
+    ]
+    domains["norm_quant"] = {**nq, "consumers": consumers}
+    out["fusion_domains"] = domains
+    return out
 
 
 def _execution_policy(case: Mapping[str, Any]) -> dict[str, Any]:
@@ -497,6 +540,21 @@ def bind_sku_host_dma_rates(
     return updated, host_rates
 
 
+def needs_activation_quantization(model_spec: Any) -> bool:
+    """Return True when top-level or any category override quantizes activations."""
+    quant = getattr(model_spec, "quant", None)
+    if quant is None:
+        return False
+    act_dtype = str(getattr(model_spec, "activation_dtype", "bf16"))
+    if str(quant.activation_format) != act_dtype:
+        return True
+    for _, override in getattr(quant, "category_overrides", ()) or ():
+        for key, value in override:
+            if key == "activation_format" and str(value) != act_dtype:
+                return True
+    return False
+
+
 def apply_va_recommended(case: Mapping[str, Any]) -> dict[str, Any]:
     """Apply supported vLLM-Ascend execution subset while preserving quantization."""
     out = deepcopy(dict(case))
@@ -576,7 +634,7 @@ def apply_va_recommended(case: Mapping[str, Any]) -> dict[str, Any]:
             from mindie_sim.prediction.implementation_selection import fallback_note
             notes.append(fallback_note("sequence_parallel", str(exc)))
     passes = tuple(rt.get("lowering_passes", ()))
-    if not passes and str(parsed.model.quant.activation_format) != str(parsed.model.activation_dtype):
+    if not passes and needs_activation_quantization(parsed.model):
         passes = ("activation_quantization", "norm_quant")
         rt["lowering_passes"] = list(passes)
     lowerings = _resolve_va_lowerings(parsed.model, par, sku, passes, notes=notes)

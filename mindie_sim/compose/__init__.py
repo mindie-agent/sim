@@ -55,6 +55,7 @@ from mindie_sim.compose.inputs import (
     _resolve_model_spec,
     _tier4_router_spec,
     _to_jsonable,
+    curated_quant_compatible_with_profile,
     default_work_unit_for_domain,
     ensure_native_mla_draft,
     infer_workload_domain,
@@ -72,7 +73,9 @@ from mindie_sim.compose.runtime import (
     apply_va_recommended,
     bind_sku_host_dma_rates,
     capture_keys,
+    filter_fp4_norm_quant_domain,
     finalize_compilation_spine,
+    needs_activation_quantization,
     register_composed_contracts,
     resolve_case_contracts,
     snapshot_kernel_keys,
@@ -823,8 +826,7 @@ def _apply_va_profile_lowerings(
         runtime_meta["shipping_collective_policy"] = deepcopy(va_profile["shipping_collective_policy"])
     runtime_meta["va_recommended_mtp_proposal_tokens"] = int(va_profile["mtp_proposal_tokens"])
     passes: tuple[str, ...] = ()
-    if (model_spec.quant is not None
-            and str(model_spec.quant.activation_format) != str(model_spec.activation_dtype)):
+    if needs_activation_quantization(model_spec):
         passes = ("activation_quantization", "norm_quant")
         runtime_dict["lowering_passes"] = list(passes)
     lowerings = _resolve_va_lowerings(
@@ -889,9 +891,16 @@ def _attach_mla_prolog_native_fusion(
     axes: Mapping[str, int],
     sku: str,
 ) -> None:
-    """Fold ``mla_prolog`` into one ``aclnnMlaPrologV3/V4`` kernel on ``expected_ideal``."""
-    if not (
+    """Fold ``mla_prolog`` into one ``aclnnMlaPrologV3/V4`` kernel when active."""
+    policy_mlapo = bool(
+        ((runtime_dict.get("metadata") or {}).get("execution_policy") or {}).get("mlapo", False)
+    )
+    track_allows_mlapo = (
         canonical_track == "expected_ideal"
+        or (canonical_track in {"merged", "unmerged_pr"} and policy_mlapo)
+    )
+    if not (
+        track_allows_mlapo
         and not raw_eager
         and norm_role != "pd_prefill"
         and "mla_prolog" in lowerings
@@ -1339,7 +1348,7 @@ def _apply_stack_and_lowerings(
             lowerings.setdefault("pool_key_indexer", "vllm_ascend_cann_keypool_caller")
             model_dict.setdefault("metadata", {})["native_keypool_caller"] = True
         if "norm_quant" in tuple(runtime_dict.get("lowering_passes") or ()):
-            kernels = ensure_norm_quant_domain(kernels)
+            kernels = filter_fp4_norm_quant_domain(ensure_norm_quant_domain(kernels), model_spec.quant)
         _attach_mla_prolog_native_fusion(
             lowerings,
             canonical_track=canonical_track,
@@ -1638,8 +1647,10 @@ def _prepare_composed_model(
     checkpoint_quant_declared = bool(spec_meta.get("checkpoint_quant_declared"))
     va_profile: dict[str, Any] | None = None
     eff_quant: Any = quant
+    used_curated_ckpt = False
     if is_auto_va:
         eff_quant = ckpt_qspec if ckpt_qspec is not None else (target_proj or None)
+        used_curated_ckpt = ckpt_qspec is not None
     if production and workload_domain != "diffusion" and adapter.capabilities().stack_id != "raw-eager":
         model_id = (
             str(model_spec.name)
@@ -1647,8 +1658,20 @@ def _prepare_composed_model(
             else str(model)
         )
         va_profile = va_recommended_config(model_id, sku, role=role)
+        use_curated_for_profile = (
+            not explicit_quant
+            and not is_auto_va
+            and not (checkpoint_quant_declared and model_spec.quant is not None)
+            and curated_quant_compatible_with_profile(
+                ckpt_qspec, va_profile["quant"],
+                model_spec=model_spec, mlapo=bool(va_profile.get("mlapo")),
+            )
+        )
         va_profile["quantization_action"] = (
-            "checkpoint_descriptor_applied" if (is_auto_va and ckpt_qspec is not None) else
+            "checkpoint_descriptor_applied" if (
+                (is_auto_va and ckpt_qspec is not None)
+                or (use_curated_for_profile and va_profile["quant"] is None)
+            ) else
             "stack_default_quant_projection" if (is_auto_va and target_proj) else
             "explicit_quant_preserved" if explicit_quant else
             "checkpoint_quant_preserved" if (checkpoint_quant_declared and model_spec.quant is not None) else
@@ -1657,12 +1680,22 @@ def _prepare_composed_model(
         )
         va_profile.setdefault("graph_capture_mode", None)
         if not explicit_quant and not is_auto_va and not (checkpoint_quant_declared and model_spec.quant is not None):
-            eff_quant = va_profile["quant"]
+            if use_curated_for_profile:
+                eff_quant = ckpt_qspec
+                used_curated_ckpt = True
+            else:
+                eff_quant = va_profile["quant"]
     model_spec = _apply_quant_override(model_spec, eff_quant, machine)
     if (
         not is_auto_va
-        and checkpoint_map.source_format in {"explicit_synthetic_preset", "unquantized_native"}
-        and checkpoint_map.provenance.checkpoint_id.startswith(("explicit-preset/", "native/"))
+        and not used_curated_ckpt
+        and (
+            (
+                checkpoint_map.source_format in {"explicit_synthetic_preset", "unquantized_native"}
+                and checkpoint_map.provenance.checkpoint_id.startswith(("explicit-preset/", "native/"))
+            )
+            or (quant is None and ckpt_qspec is not None)
+        )
     ):
         checkpoint_map = synthetic_checkpoint_quant_map(
             model_spec,
@@ -1984,7 +2017,7 @@ def _assemble_composed_case(
             ("enable_fused_mc2", policy_options["enable_fused_mc2"] is not None or (
                 canonical_track in {"merged", "unmerged_pr"} and (
                     policy_out["enable_fused_mc2"] == 0
-                    or (policy_out["mso"] and policy_out["execution_policy"].get("mso_source") == "profile")
+                    or (policy_out["mso"] and policy_out["execution_policy"].get("mso_source") == "caller")
                 )
             )),
             ("enable_flashcomm1", policy_options["enable_flashcomm1"] is not None),

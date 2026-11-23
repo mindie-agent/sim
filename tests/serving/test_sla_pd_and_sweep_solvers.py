@@ -266,7 +266,7 @@ def test_dsa_cp_tp2_cp1_handoff_reads_the_single_cp_shard():
     for pool, tp, plan in (("prefill", 2, "dsa_cp"), ("decode", 1, "none")):
         raw["pools"][pool]["runtime"]["parallel"].update(tp=tp, cp=1, dcp=1, cp_plan=plan)
     rows = {(row["component"], row["source_rank"], row["destination_rank"]): row["payload_bytes"] for row in _handoff(raw)[1]}
-    assert rows == {("index_k", 0, 2): pytest.approx(1024.0), ("mla_kv", 0, 2): pytest.approx(4608.0)}
+    assert rows == {("index_k", 0, 2): pytest.approx(520.0), ("mla_kv", 0, 2): pytest.approx(4608.0)}
 def test_pd_dense_mla_window_owns_only_the_intersected_source_rows():
     raw = _composed_pd_case(10, (("prefill", (0, 1)), ("decode", (2, 3))))
     for pool in ("prefill", "decode"):

@@ -81,6 +81,32 @@ owns = [
   "scripts/build_curated_checkpoints.py",
 ]
 
+[[module]]
+path = "schema/test_stage4b_catalog_quant_and_caches.py"
+tier = "tier0"
+owns = [
+  "mindie_sim/catalog/ops.py",
+  "mindie_sim/catalog/quant.py",
+  "mindie_sim/catalog/cache.py",
+  "mindie_sim/catalog/cache_pools.py",
+  "mindie_sim/catalog/cache_format.py",
+  "mindie_sim/catalog/glm.py",
+  "mindie_sim/catalog/deepseek.py",
+  "mindie_sim/catalog/qwen.py",
+  "mindie_sim/catalog/kimi.py",
+  "mindie_sim/catalog/fleet.py",
+  "mindie_sim/catalog/composable.py",
+  "mindie_sim/catalog/weights.py",
+  "mindie_sim/catalog/weight_layer_terms.py",
+  "mindie_sim/catalog/draft_weights.py",
+  "mindie_sim/catalog/draft_geometry.py",
+  "mindie_sim/catalog/specs.py",
+  "mindie_sim/stacks/vllm_ascend/profiles.py",
+  "mindie_sim/compose/__init__.py",
+  "mindie_sim/compose/inputs.py",
+  "mindie_sim/compose/runtime.py",
+]
+
 # ---------------------------------------------------------------- runtime
 [[module]]
 path = "runtime/test_engine_core.py"

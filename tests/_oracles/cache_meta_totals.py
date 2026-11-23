@@ -73,7 +73,8 @@ def _minimax(c: Mapping[str, Any]) -> list[RefLayer]:
             qk_norm=qk_norm, qgate=gate, indexer=active,
             owns_index_k=active, owns_topk=active,
             index_heads=idx_heads if active else 0, index_dim=idx_dim if active else 0,
-            index_topk=(topk_blocks + local_blocks) * block if active else 0,
+            index_topk=topk_blocks * block if active else 0,
+            router_bias=bool(moe and c.get("use_routing_bias", False)),
             cache_row=KV_CACHE_PLANES * kv_heads * head_dim,
         ))
     return out
@@ -127,6 +128,7 @@ def _step5(c: Mapping[str, Any]) -> list[RefLayer]:
             index_dim=idx_dim if sparse_layer else 0,
             index_topk=topk * block if sparse_layer else 0,
             index_kpool=block if sparse_layer else 1,
+            router_bias=bool(moe and c.get("use_moe_router_bias", False)),
             cache_row=KV_CACHE_PLANES * kv_heads * head_dim,
         ))
     return out
@@ -155,7 +157,7 @@ def _dspark(c: Mapping[str, Any]) -> tuple[list[RefLayer], dict[str, Any]]:
         kv_heads = _i(c, "num_key_value_heads")
         rows = [RefLayer(
             index=index, attention="gqa", arch="gqa", ffn="dense", heads=heads,
-            kv_heads=kv_heads, head_dim=head_dim, dense_i=dense_i,
+            kv_heads=kv_heads, head_dim=head_dim, dense_i=dense_i, qk_norm=True,
             cache_row=KV_CACHE_PLANES * kv_heads * head_dim,
         ) for index in range(layers)]
         kind = "gqa"
@@ -224,6 +226,15 @@ def _local_kv_heads(num_kv_heads: int, tp: int) -> int:
     return max(1, (int(num_kv_heads) + max(1, tp) - 1) // max(1, tp))
 
 
+def _window_rows(seq: int, window: int, *, padded: bool, block: int) -> int:
+    if window <= 0:
+        return seq
+    if padded and seq > window:
+        blk = max(1, int(block))
+        return ((int(window) + blk - 1) // blk + 1) * blk
+    return min(seq, window)
+
+
 def _layer_cache_bytes(layer: RefLayer, seq: int, *, quant: Mapping[str, Any],
                        padded: bool, tp: int, cp: int) -> int:
     kv_bytes = _dtype_bytes(str(quant.get("kv_dtype", "bf16")))
@@ -236,7 +247,7 @@ def _layer_cache_bytes(layer: RefLayer, seq: int, *, quant: Mapping[str, Any],
         total += layer.conv_state // max(1, tp) * _dtype_bytes("bf16")
         return total
     if layer.attention in {"gqa", "projection_only"}:
-        rows = min(seq, layer.window) if layer.window else seq
+        rows = _window_rows(seq, layer.window, padded=padded, block=INDEX_INTERLEAVE)
         width = KV_CACHE_PLANES * _local_kv_heads(layer.kv_heads, tp) * layer.head_dim
         total += _local_rows(rows, INDEX_INTERLEAVE, cp, padded) * width * kv_bytes
         if layer.owns_index_k and layer.index_dim:
@@ -246,7 +257,10 @@ def _layer_cache_bytes(layer: RefLayer, seq: int, *, quant: Mapping[str, Any],
         return total
     width = layer.cache_row
     if not layer.compress_ratio:
-        rows = min(seq, layer.window) if layer.window else seq
+        rows = (
+            min(seq, layer.window) if layer.arch == "swa"
+            else _window_rows(seq, layer.window, padded=padded, block=INDEX_INTERLEAVE)
+        )
         total += _local_rows(rows, INDEX_INTERLEAVE, cp, padded) * width * kv_bytes
     elif layer.window:
         total += _local_rows(min(seq, layer.window), INDEX_INTERLEAVE, cp, padded) * width * kv_bytes
@@ -266,8 +280,13 @@ def _index_entries(layer: RefLayer, seq: int, padded: bool, tp: int, cp: int,
                    index_bytes: int, scale_bytes: int) -> int:
     ratio = max(1, layer.compress_ratio, layer.index_kpool)
     rows = seq // ratio
+    block = max(1, INDEX_INTERLEAVE // ratio)
     if layer.index_cp_shard and cp > 1:
-        rows = _local_rows(rows, max(1, INDEX_INTERLEAVE // ratio), cp, padded)
+        rows = _local_rows(rows, block, cp, padded)
+    elif cp <= 1:
+        rows = _local_rows(rows, block, cp, padded)
+    elif padded:
+        rows = _block_round(rows, block)
     total = rows * (layer.index_dim * index_bytes + scale_bytes)
     if layer.index_kpool > 1 and seq:
         if layer.attention == "gqa":

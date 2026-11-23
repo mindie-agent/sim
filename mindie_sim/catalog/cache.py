@@ -421,6 +421,16 @@ def _local_cache_rows(
     return float(rows) if cp <= 1 else rows / cp
 
 
+def _window_cache_rows(seq: int, window: int, *, padded: bool, block: int) -> int:
+    """Sliding-window row count, adding +1 active write page when padded and seq > window."""
+    if window <= 0:
+        return seq
+    if padded and seq > window:
+        blk = max(1, int(block))
+        return (_ceil_div(window, blk) + 1) * blk
+    return min(seq, window)
+
+
 def _gqa_layer_row_bytes(
     model: Any, plan: Any, tp: int, *, int8_fa3: bool, phase: str,
 ) -> int:
@@ -487,8 +497,8 @@ def layer_cache_components(model: Any, plan: Any, parallel: ParallelSpec,
         return result
     if plan.attention in {"gqa", "projection_only"}:
         if not 0 <= plan.kv_owner_layer_id < plan.index:
-            rows = min(seq, plan.window) if plan.window else seq
-            start = max(0, seq - rows) if plan.window else 0
+            rows = _window_cache_rows(seq, plan.window, padded=capacity_padded, block=page_block)
+            start = max(0, seq - min(seq, plan.window)) if plan.window else 0
             row_bytes = _gqa_layer_row_bytes(
                 model, plan, tp, int8_fa3=int8_fa3, phase=phase,
             )
@@ -496,16 +506,15 @@ def layer_cache_components(model: Any, plan: Any, parallel: ParallelSpec,
     elif plan.attention != "mla":
         raise ModelingError(f"cache_attention_unknown:{plan.attention}")
     elif plan.cache_kind == "dense":
-        rows = min(seq, plan.window) if plan.window else seq
-        start = max(0, seq - rows) if plan.window else 0
+        rows = _window_cache_rows(seq, plan.window, padded=capacity_padded, block=page_block)
+        start = max(0, seq - min(seq, plan.window)) if plan.window else 0
         result["mla_kv"] = local_rows(rows, start=start) * _packed_mla_row_bytes(
             model, plan, phase=phase,
         )
     else:
         if plan.window:
-            rows = min(seq, plan.window)
             result["window"] = local_rows(
-                rows, start=max(0, seq - rows)) * packed_region_row_bytes(
+                min(seq, plan.window), start=max(0, seq - min(seq, plan.window))) * packed_region_row_bytes(
                 model, "window", plan.cache_row_elements, plan=plan, phase=phase)
         if plan.owns_long_kv:
             ratio = max(1, plan.compress_ratio)
@@ -525,9 +534,10 @@ def layer_cache_components(model: Any, plan: Any, parallel: ParallelSpec,
     if plan.owns_index_k:
         index_ratio = max(1, plan.compress_ratio, plan.index_kpool)
         rows = completed_rows(seq, index_ratio)
+        index_block = max(1, page_block // index_ratio)
         if dcp_indexer_sharded(model, runtime) and cp > 1:
             rows = local_rows(rows, max(1, interleave // index_ratio), ratio=index_ratio)
-        elif parallel.cp_plan == "dsa_cp":
+        elif parallel.cp_plan == "dsa_cp" and cp > 1:
             if rank is not None:
                 cp_rank = (int(rank) % max(1, int(cp))
                            if owner_spans is not None else int(rank))
@@ -540,6 +550,10 @@ def layer_cache_components(model: Any, plan: Any, parallel: ParallelSpec,
                 )
             else:
                 rows = index_k_capacity_rows(rows, cp, index_ratio) if capacity_padded else rows / cp
+        elif cp <= 1:
+            rows = local_rows(rows, max(1, interleave // index_ratio), ratio=index_ratio)
+        elif capacity_padded:
+            rows = float(block_round(rows, index_block))
         if int8_fa3:
             result["index_k"] = rows * (plan.index_dim + C8_SCALE_RESERVED_BYTES)
         else:

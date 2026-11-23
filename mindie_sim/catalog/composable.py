@@ -27,6 +27,67 @@ from mindie_sim.schema.model import LayerPlan, MlaSpec, ModelSpec
 _INDEXED_LAYER_ATTN_EXCLUSION_RE = re.compile(
     r"(?:^|\.)layers\.(\d+)\.(?:self_attn|linear_attn|attention)(?:\.|$)"
 )
+_LONGCAT_MODEL_TYPES = frozenset({"longcat_flash", "longcat_flash_ngram"})
+_LONGCAT_SUBLAYERS_PER_BLOCK = 2
+
+
+def _longcat_plans(c: Mapping[str, Any]) -> tuple[list[LayerPlan], list[str]]:
+    """Expand LongCat-Flash blocks into native dual-MLA + dual-dense-MLP + 1 MoE sublayers."""
+    h = positive(c, "hidden_size")
+    blocks = positive(c, "num_hidden_layers")
+    heads = positive(c, "num_attention_heads")
+    kv = positive(c, "num_key_value_heads", heads)
+    q_rank = int(c.get("q_lora_rank") or 0)
+    kv_rank = positive(c, "kv_lora_rank")
+    nope = positive(c, "qk_nope_head_dim")
+    rope = int(c.get("qk_rope_head_dim") or 0)
+    v_dim = positive(c, "v_head_dim", positive(c, "head_dim", h // heads))
+    dense_i = positive(c, "intermediate_size", c.get("moe_intermediate_size"))
+    experts = int(c.get("n_routed_experts") or 0)
+    zero_experts = int(c.get("zero_expert_num") or 0)
+    topk = int(c.get("num_experts_per_tok") or 0)
+    moe_i = int(c.get("moe_intermediate_size") or dense_i)
+    routed_scale = float(c.get("routed_scaling_factor") or 1.0)
+    if experts and not 0 < topk <= experts + zero_experts:
+        raise ModelingError("model_moe_topk_out_of_range")
+    mla_common = dict(
+        attention="mla", architecture="mla",
+        num_heads=heads, num_kv_heads=kv, head_dim=nope + rope,
+        q_lora_rank=q_rank, kv_lora_rank=kv_rank,
+        qk_nope_head_dim=nope, qk_rope_head_dim=rope, v_head_dim=v_dim,
+        mla_variant="latent_mla", kv_cache_elements=kv_rank + rope,
+        owns_long_kv=True, scope="body",
+    )
+    plans: list[LayerPlan] = []
+    for block_idx in range(blocks):
+        even_idx = block_idx * _LONGCAT_SUBLAYERS_PER_BLOCK
+        odd_idx = even_idx + 1
+        # Sublayer 0 of block: MLA_0 + Dense MLP_0 (modeled as shared dense path) + Block MoE.
+        plans.append(LayerPlan(
+            index=even_idx, native_layer_id=even_idx, kv_owner_layer_id=even_idx,
+            ffn="moe" if experts else "dense",
+            intermediate_size=0 if experts else dense_i,
+            num_experts=experts, zero_expert_num=zero_experts if experts else 0,
+            top_k=topk if experts else 0, moe_intermediate_size=moe_i if experts else 0,
+            num_shared_experts=1 if experts else 0,
+            shared_intermediate_size=dense_i if experts else 0,
+            router_input_size=h if experts else 0,
+            router_mode=str(c.get("scoring_func", "softmax")),
+            router_norm_topk=bool(c.get("norm_topk_prob", False)),
+            routed_scaling_factor=routed_scale,
+            **mla_common,
+        ))
+        # Sublayer 1 of block: MLA_1 + Dense MLP_1.
+        plans.append(LayerPlan(
+            index=odd_idx, native_layer_id=odd_idx, kv_owner_layer_id=odd_idx,
+            ffn="dense", intermediate_size=dense_i,
+            **mla_common,
+        ))
+    gaps: list[str] = []
+    for name in ("num_mtp_layers", "num_nextn_predict_layers", "mtp_num_hidden_layers"):
+        if c.get(name):
+            gaps.append(f"optional_draft_structure_unresolved:{name}")
+    return plans, gaps
 
 
 def _indexed_layer_projection_exclusions(c: Mapping[str, Any]) -> set[int]:
@@ -249,6 +310,8 @@ def build_composable(key, config, family="generic"):
         from .kimi import _standard_kimi_plans, _standard_kimi_gaps, _aux_standard_kimi
         plans = _standard_kimi_plans(c)
         gaps, aux = list(_standard_kimi_gaps(c)), _aux_standard_kimi(c)
+    elif str(c.get("model_type", "")).lower() in _LONGCAT_MODEL_TYPES:
+        plans, gaps = _longcat_plans(c)
     else:
         plans, gaps = generic_plans(c)
         if str(c.get("model_type", "")) not in {"llama", "mistral"}:
@@ -256,12 +319,21 @@ def build_composable(key, config, family="generic"):
     plans = shared_owners(c, plans, gaps)
     quant, quant_gaps = resolve_quant(c)
     quant = resolve_native_formats(quant, c)
+    if (
+        family == "standard_deepseek"
+        and any(p.owns_index_k for p in plans)
+        and str(quant.index_dtype or "bf16") == "bf16"
+        and str(quant.index_scale_dtype or "none") in {"", "none"}
+    ):
+        quant = replace(quant, index_dtype="int8", index_scale_dtype="fp16")
     gaps.extend(quant_gaps)
     if c.get("hidden_act", "silu") not in {"silu", "swiglu", "situ"}:
         gaps.append(f"ffn_activation:{c['hidden_act']}:silu_proxy")
     consumed_extra = (
         {"index_topk", "index_n_heads", "index_head_dim"}
-        if family in {"standard_deepseek", "standard_glm"} else ()
+        if family in {"standard_deepseek", "standard_glm"} else
+        {"zero_expert_num", "ngram_embedding", "dual_sublayers_per_block", "routed_scaling_factor"}
+        if str(c.get("model_type", "")).lower() in _LONGCAT_MODEL_TYPES else ()
     )
     unknown = unrecognized_fields(config, consumed=consumed_extra)
     gaps.extend("unrecognized_config_field:" + field for field in unknown)
@@ -300,6 +372,8 @@ def build_composable(key, config, family="generic"):
         **({"routed_scaling_factor": c["routed_scaling_factor"]}
            if isinstance(c.get("routed_scaling_factor"), (int, float))
            and not isinstance(c.get("routed_scaling_factor"), bool) else {}),
+        **({"ngram_embedding": dict(c["ngram_embedding"])}
+           if isinstance(c.get("ngram_embedding"), Mapping) else {}),
         **({"rope_parameters": rope} if rope else {}),
         **({"max_position_embeddings": int(context["max_position_embeddings"])}
            if "max_position_embeddings" in context else {}),
@@ -319,6 +393,7 @@ def build_composable(key, config, family="generic"):
         num_experts=max(p.num_experts for p in plans), top_k=max(p.top_k for p in plans),
         moe_intermediate_size=max(p.moe_intermediate_size for p in plans),
         num_shared_experts=max(p.num_shared_experts for p in plans),
+        zero_expert_num=max((int(getattr(p, "zero_expert_num", 0) or 0) for p in plans), default=0),
         tie_word_embeddings=bool(c.get("tie_word_embeddings", False)),
         expert_routing_source="uniform", layer_plans=tuple(plans), mla=mla,
         auxiliary=aux, metadata=metadata,

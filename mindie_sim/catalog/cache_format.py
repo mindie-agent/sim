@@ -538,9 +538,18 @@ def cache_format(
             rope = int(getattr(plan, "qk_rope_head_dim", 0) or 0)
             latent = int(getattr(plan, "kv_lora_rank", 0) or 0)
             is_nope = rope == 0
-            if resolved in NOPE_FP8_PAYLOAD_DTYPES and is_nope:
+            if resolved in NOPE_FP8_PAYLOAD_DTYPES:
                 scale = scale_override or NOPE_BLOCK_SCALE_DTYPE
-                return block_quantized_mla_format(scale_dtype=scale)
+                if is_nope:
+                    return block_quantized_mla_format(scale_dtype=scale)
+                if latent > 0 and (
+                    int(getattr(plan, "cache_row_elements", 0) or 0) in {0, latent + rope}
+                ):
+                    return block_quantized_mla_format(
+                        NOPE_BLOCK_QUANT_TILE, scale_dtype=scale,
+                        payload_dtype=NOPE_BLOCK_PAYLOAD_DTYPE,
+                        suffix_elements=rope, suffix_dtype=C8_MLA_ROTARY_DTYPE,
+                    )
             if resolved == "int8" and latent > 0 and (
                 int(getattr(plan, "cache_row_elements", 0) or 0) in {0, latent + rope}
             ):
