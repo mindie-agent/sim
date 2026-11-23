@@ -50,8 +50,24 @@ from mindie_sim.prediction.sharding.ffn_rules import (
 )
 
 HASH_NATIVE_KIND = "aclnnMoeGatingTopKHash"
+TOPK_NATIVE_KIND = "aclnnMoeGatingTopK"
 SOFTMAX_NATIVE_KIND = "aclnnMoeGatingTopKSoftmaxV2"
 INIT_ROUTING_NATIVE_KIND = "aclnnMoeInitRoutingV3"
+NORM_TYPE_SOFTMAX = 0
+NORM_TYPE_SIGMOID = 1
+NORM_TYPE_SQRTSOFTPLUS = 2
+
+
+def _native_gating_dispatch(plan, *, hash_table: bool, noaux_tc: bool) -> tuple[str, int]:
+    """Select CANN fused gating symbol and norm_type from the declared score mode."""
+    mode = str(getattr(plan, "router_mode", "softmax") or "softmax").strip().lower()
+    if hash_table or mode == "hash":
+        return HASH_NATIVE_KIND, NORM_TYPE_SOFTMAX
+    if mode == "sqrtsoftplus":
+        return HASH_NATIVE_KIND, NORM_TYPE_SQRTSOFTPLUS
+    if mode == "sigmoid" or noaux_tc:
+        return TOPK_NATIVE_KIND, NORM_TYPE_SIGMOID
+    return SOFTMAX_NATIVE_KIND, NORM_TYPE_SOFTMAX
 #: One FP32 selected weight per routed slot beside its INT32 id.
 SELECTED_WEIGHT_BYTES = 4
 #: ``quant_mode=1`` carries MXFP8 (group-32 E8M0) or dynamic per-token INT8
@@ -436,9 +452,14 @@ def cann_native_active(runtime) -> bool:
 
 
 def _fused_gating(*, prefix, plan, logits_input, members, stage, requests,
-                  tokens, mode, weight_dtype, weight_bytes, hash_table, noaux_tc):
+                  tokens, mode, weight_dtype, weight_bytes, hash_table, noaux_tc,
+                  cann_kind=None, norm_type=None):
     """One ``moe_gating_topk`` call conserving the whole member expression."""
     experts, selected = int(plan.num_experts), int(plan.top_k)
+    resolved_kind, resolved_norm_type = _native_gating_dispatch(
+        plan, hash_table=hash_table, noaux_tc=noaux_tc)
+    native_kind = cann_kind or resolved_kind
+    effective_norm_type = resolved_norm_type if norm_type is None else int(norm_type)
     vector = sum(float(member.vector_ops) for member in members)
     read = float(tokens * experts) * float(weight_bytes)
     if noaux_tc:
@@ -454,7 +475,8 @@ def _fused_gating(*, prefix, plan, logits_input, members, stage, requests,
         shape=(tokens, selected),
         read_bytes_override=read, write_bytes_override=write,
         returns=("weights", "ids"),
-        metadata=(("native_kind", HASH_NATIVE_KIND if hash_table else SOFTMAX_NATIVE_KIND),
+        metadata=(("native_kind", native_kind),
+                  ("norm_type", effective_norm_type),
                   ("input_format", weight_dtype), ("output_format", "fp32"),
                   ("topk_ids_dtype", "int32"), ("router_weight_dtype", "fp32"),
                   ("score_function", plan.router_mode),
@@ -506,7 +528,8 @@ def build_selection(*, prefix, plan, logits_input, weight_dtype, weight_bytes,
     hash_table = plan.router_mode == "hash"
     noaux_tc = bool(plan.router_noaux_tc) and not hash_table
     contract = CONTRACT_HASH if hash_table else CONTRACT_SCORE
-    cann_kind = HASH_NATIVE_KIND if hash_table else SOFTMAX_NATIVE_KIND
+    cann_kind, norm_type = _native_gating_dispatch(
+        plan, hash_table=hash_table, noaux_tc=noaux_tc)
     fused = cann_native_active(runtime)
     if fused:
         split = _fused_boundary(ops, hash_table=hash_table, noaux_tc=noaux_tc)
@@ -514,7 +537,8 @@ def build_selection(*, prefix, plan, logits_input, weight_dtype, weight_bytes,
             prefix=prefix, plan=plan, logits_input=logits_input,
             members=tuple(ops[:split]), stage=stage, requests=requests,
             tokens=tokens, mode=mode, weight_dtype=weight_dtype,
-            weight_bytes=weight_bytes, hash_table=hash_table, noaux_tc=noaux_tc)
+            weight_bytes=weight_bytes, hash_table=hash_table, noaux_tc=noaux_tc,
+            cann_kind=cann_kind, norm_type=norm_type)
         replaced = {op.op_id for op in ops[:split]}
         tail = [replace(op, deps=tuple(
             gating.op_id if dependency in replaced else dependency

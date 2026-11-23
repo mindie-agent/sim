@@ -143,6 +143,7 @@ def _model_supports_shipping_megamoe_activation(ctx: MechanismContext) -> bool:
     return all(
         str(getattr(p, "ffn_activation", "silu") or "silu").strip().lower()
         in SHIPPING_MEGAMOE_SUPPORTED_ACTIVATIONS
+        and float(getattr(p, "swiglu_limit", 0.0) or 0.0) <= 0.0
         for p in moe_plans
     )
 
@@ -218,6 +219,11 @@ def _update_additional(rt: dict[str, Any], **entries: Any) -> None:
     rt["metadata"] = meta
 
 
+def _has_unit_offset_norm(model: ModelSpec) -> bool:
+    normalization = dict(model.catalog_facts).get("normalization") or {}
+    return bool(normalization.get("norm_weight_offset", 0.0))
+
+
 def _apply_torch_compile_support(rt: dict[str, Any], ctx: MechanismContext) -> None:
     if "enable_torch_compile" in ctx.caller_explicit:
         return
@@ -229,7 +235,10 @@ def _apply_torch_compile_support(rt: dict[str, Any], ctx: MechanismContext) -> N
     meta["execution_policy"] = policy
     rt["metadata"] = meta
     if _has_quant_activations(ctx.model):
-        _append_passes(rt, "activation_quantization", "norm_quant")
+        if _has_unit_offset_norm(ctx.model):
+            _append_passes(rt, "activation_quantization")
+        else:
+            _append_passes(rt, "activation_quantization", "norm_quant")
 
 
 def _apply_fp32_residual_norm(rt: dict[str, Any], ctx: MechanismContext) -> None:
@@ -685,13 +694,26 @@ def _apply_sp(rt: dict[str, Any], ctx: MechanismContext) -> None:
     ep = int(ctx.parallel.get("ep", 1))
     pp = int(ctx.parallel.get("pp", 1))
     pcp = int(ctx.parallel.get("pcp", 1))
-    if pcp >= 1 and pp >= 1 and tp > 1 and ep >= tp and ep % tp == 0:
+    has_moe_layers = any(getattr(p, "ffn", "") == "moe" for p in ctx.model.layer_plans)
+    dense_sp_requested = bool(
+        ctx.options.get("enable_flashcomm1")
+        or ctx.options.get("explicit_opt_in")
+        or ctx.options.get("phase") == "prefill"
+    )
+    ep_compatible = (
+        (ep >= tp and ep % tp == 0)
+        or (ep == 1 and not has_moe_layers and dense_sp_requested)
+    )
+    if pcp >= 1 and pp >= 1 and tp > 1 and ep_compatible:
         try:
             _validate_model(ctx.model, padding="right_to_tp")
         except ModelingError:
             return
         kernels = dict(rt.get("kernels") or {})
-        kernels.setdefault("sequence_parallel", dict(DECLARATION, padding="right_to_tp"))
+        kernels.setdefault(
+            "sequence_parallel",
+            dict(DECLARATION, padding="right_to_tp", enable_expert_parallel=bool(has_moe_layers)),
+        )
         rt["kernels"] = kernels
         meta = dict(rt.get("metadata") or {})
         meta["sp"] = True
@@ -700,16 +722,16 @@ def _apply_sp(rt: dict[str, Any], ctx: MechanismContext) -> None:
 
 def _apply_basic_norm_quant(rt: dict[str, Any], ctx: MechanismContext) -> None:
     compile_on = _torch_compile_active(rt, ctx.model)
+    normalization = dict(ctx.model.catalog_facts).get("normalization") or {}
+    has_unit_offset = bool(normalization.get("norm_weight_offset", 0.0))
     if _has_quant_activations(ctx.model):
         _append_passes(rt, "activation_quantization")
-        if compile_on:
+        if compile_on and not has_unit_offset:
             _append_passes(rt, "norm_quant")
     if not compile_on:
         return
-    normalization = dict(ctx.model.catalog_facts).get("normalization") or {}
     # ``add_rmsnorm`` is the residual boundary and is independent of qk_norm.
-    if (ctx.model.activation_dtype == "bf16"
-            and not normalization.get("norm_weight_offset", 0.0)):
+    if ctx.model.activation_dtype == "bf16" and not has_unit_offset:
         _append_passes(rt, "residual_norm")
         _set_lowering(rt, "add_rmsnorm", "vllm_ascend_native_norm")
         q = ctx.model.quant

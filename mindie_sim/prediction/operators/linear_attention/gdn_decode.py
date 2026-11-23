@@ -38,6 +38,50 @@ SOURCE = {"path": "data/observations/sources/gdn-image-c3d00a196905/gdn.py.txt",
           "caller_lines": ((298, 379), (505, 575), (705, 737))}
 CACHE_INDEX_SOURCE_LINES = ((138, 143), (435, 445))
 OUTPUT_NORM_GATE_OPS_PER_ELEMENT = 9
+FUSED_QKVZBA_RECIPE = "fused_qkvzba_split_reshape_cat"
+FUSED_QKVZBA_OUTPUT_COUNT = 4
+FUSED_QKVZBA_OPS_PER_ELEMENT = 1
+INTERLEAVED_GDN_MODEL_TYPES = frozenset({"qwen3_next"})
+
+
+def _is_interleaved_qkvzba(model) -> bool:
+    """True when the model uses interleaved QKVZ/BA packing (e.g. Qwen3-Next)."""
+    facts = dict(getattr(model, "catalog_facts", ()) or {})
+    if "gdn_interleaved_qkvzba" in facts:
+        return bool(facts["gdn_interleaved_qkvzba"])
+    return str(facts.get("model_type") or "").strip().lower() in INTERLEAVED_GDN_MODEL_TYPES
+
+
+def _split_conv_qkv(tensors, conv, tokens, heads, key_heads, dk, dv):
+    """Return three contiguous Q/K/V views directly from conv output (no qkv_concatenate)."""
+    qkv = tensors.result(conv, (tokens, 2 * key_heads * dk + heads * dv))
+    values, start = [], 0
+    for name, count, width in (("q", key_heads, dk), ("k", key_heads, dk), ("v", heads, dv)):
+        sliced = qkv.narrow(1, start, count * width)
+        values.append(tensors.reshape(sliced, (1, tokens, count, width), name=name + "_view"))
+        start += count * width
+    return values
+
+
+def _resolve_local_gdn_heads(plan, tp: int) -> tuple[int, int, int, int, int]:
+    """Resolve local (keys, heads, dk, dv, key_replication) with exact TP>H_k replication."""
+    total_k_heads = int(plan.linear_key_heads or plan.linear_heads)
+    total_v_heads = int(plan.linear_value_heads or plan.linear_heads)
+    dk = int(plan.linear_key_head_dim or plan.linear_head_dim)
+    dv = int(plan.linear_head_dim)
+    if tp > total_k_heads:
+        if tp % total_k_heads or (2 * total_k_heads * dk) % tp:
+            raise ModelingError(
+                f"gdn_decode_requires_divisible_key_head_replication:{total_k_heads}:{tp}")
+        key_replication = tp // total_k_heads
+        keys = 1
+    else:
+        key_replication = 1
+        keys = math.ceil(total_k_heads / tp)
+    heads = math.ceil(total_v_heads / tp)
+    if heads % keys:
+        raise ModelingError("gdn_decode_requires_integer_value_to_key_head_ratio")
+    return keys, heads, dk, dv, key_replication
 
 
 def _build_conv(op, geometry):
@@ -149,6 +193,7 @@ def _lower_convolution(b, tensors, *, conv_input, deps, views, active, active_ro
         },
         "gdn_state_contract": conv_contract,
         "gdn_state_effects": conv_effects,
+        "source_layouts": (TensorLayout.contiguous((core_tokens, width)).to_dict(),),
     }.items())))
     external, reads, writes, vector = conv_spec_terms(
         lengths, padding_slots, plan.conv_kernel, width, False, speculative)
@@ -329,11 +374,76 @@ def _resolve_decode_slot_indices(raw_slots, views):
     return "caller_metadata", indices
 
 
+def _lower_gdn_inputs(b, tensors, *, deps, model, plan, tp: int, tokens: int, core_tokens: int):
+    """Project GDN inputs with optional TP>H_k replication and interleaved split."""
+    from mindie_sim.prediction.projections import gdn_input_projections
+
+    keys, heads, dk, dv, key_replication = _resolve_local_gdn_heads(plan, tp)
+    width, value_width = 2 * keys * dk + heads * dv, heads * dv
+    proj_qk_width = (2 * keys * dk) // key_replication
+    proj_conv_width = proj_qk_width + value_width
+    proj_meta = (
+        (("gdn_key_head_replication", key_replication),
+         ("checkpoint_qkvz_width", proj_conv_width + value_width))
+        if key_replication > 1 else ()
+    )
+    conv_view, z_view, (beta_view, alpha_view) = gdn_input_projections(
+        b, tensors, deps=deps, tokens=tokens, hidden=model.hidden_size,
+        conv_width=proj_conv_width, value_width=value_width, heads=heads,
+        metadata=proj_meta,
+    )
+    if key_replication > 1:
+        elem_bytes = dtype_bytes(model.activation_dtype)
+        rep_bytes = (tokens * 2 * keys * dk * elem_bytes
+                     * (key_replication - 1) / key_replication)
+        rep_id = b.communicate(
+            "gdn_key_head_replicate", (conv_view.producer,), rep_bytes, "allgather",
+            recipe="ring_allgather", shape=(tokens, width),
+            metadata=(("group_axis", "tp"), ("comm_group_size", key_replication),
+                      ("steps", key_replication - 1),
+                      ("gdn_key_head_replication", key_replication)),
+        )
+        conv_view = tensors.result(rep_id, (tokens, width))
+    if _is_interleaved_qkvzba(model):
+        elem_bytes = dtype_bytes(model.activation_dtype)
+        split_elems = tokens * (width + value_width + 2 * heads)
+        split_deps = tuple(dict.fromkeys((
+            conv_view.producer, z_view.producer, beta_view.producer, alpha_view.producer,
+        )))
+        split_id = b.vector(
+            FUSED_QKVZBA_RECIPE, split_deps, split_elems, FUSED_QKVZBA_OPS_PER_ELEMENT,
+            family="tensor_copy",
+            shape=(tokens, width + value_width + 2 * heads),
+            read_bytes_override=split_elems * elem_bytes,
+            write_bytes_override=split_elems * elem_bytes,
+            returns=("mixed_qkv", "z", "beta", "alpha"),
+            metadata=(("native_kind", FUSED_QKVZBA_RECIPE),
+                      ("interleaved_qkvzba", True),
+                      ("output_count", FUSED_QKVZBA_OUTPUT_COUNT)),
+        )
+        conv_input = tensors.result(
+            split_id, (tokens, width), output="mixed_qkv").narrow(0, 0, core_tokens)
+        z_view = tensors.result(split_id, (tokens, value_width), output="z")
+        gate_inputs = [
+            tensors.result(split_id, (tokens, heads), output="beta"),
+            tensors.result(split_id, (tokens, heads), output="alpha"),
+        ]
+    else:
+        gate_inputs = [
+            tensors.contiguous(view, name + "_contiguous", reason="gdn_split_ba.contiguous")
+            for view, name in ((beta_view, "beta"), (alpha_view, "alpha"))
+        ]
+        conv_input = tensors.contiguous(
+            conv_view.narrow(0, 0, core_tokens),
+            "convolution_input_contiguous", reason="causal_conv1d_update.contiguous")
+    return keys, heads, dk, dv, width, value_width, conv_input, z_view, gate_inputs
+
+
 def lower(*, prefix, plan, views, stage, deps, model, parallel, mode,
           padded_tokens, policy, runtime, gating_beta_store=None, gating_programs=None,
           recurrent_implementation="analytical", cache_index_row_stride=1):
     from mindie_sim.prediction.operators.linear_attention.call_gdn import GATING_SOURCE
-    from mindie_sim.prediction.operators.linear_attention.gdn_prefill import decode_core, rearrange_qkv
+    from mindie_sim.prediction.operators.linear_attention.gdn_prefill import decode_core
 
     if not views or any(view.phase != "decode" for view in views):
         raise ModelingError("gdn_decode_selected_caller_requires_decode_only")
@@ -398,32 +508,20 @@ def lower(*, prefix, plan, views, stage, deps, model, parallel, mode,
         initial_state=initial_flags, direction="token", target_kind="conv",
         slot_source=slot_source, state_capacity=state_capacity,
         slot_indices=slot_indices)
-    keys = math.ceil((plan.linear_key_heads or plan.linear_heads) / tp)
-    heads = math.ceil((plan.linear_value_heads or plan.linear_heads) / tp)
-    dk, dv = plan.linear_key_head_dim or plan.linear_head_dim, plan.linear_head_dim
-    if heads % keys:
-        raise ModelingError("gdn_decode_requires_integer_value_to_key_head_ratio")
-    from mindie_sim.prediction.projections import gdn_input_projections
-
-    width, value_width = 2 * keys * dk + heads * dv, heads * dv
-    conv_view, z_view, (beta_view, alpha_view) = gdn_input_projections(
-        b, tensors, deps=deps, tokens=tokens, hidden=model.hidden_size,
-        conv_width=width, value_width=value_width, heads=heads,
-    )
-    gate_inputs = [tensors.contiguous(view, name + "_contiguous", reason="gdn_split_ba.contiguous")
-                   for view, name in ((beta_view, "beta"), (alpha_view, "alpha"))]
+    (keys, heads, dk, dv, width, value_width, conv_input, z_view,
+     gate_inputs) = _lower_gdn_inputs(
+        b, tensors, deps=deps, model=model, plan=plan, tp=tp,
+        tokens=tokens, core_tokens=core_tokens)
     zero = b.work("core_output_zero", (deps,), (tokens, heads, dv),
                   vector=tokens * value_width, write=tokens * value_width * 2,
                   family="tensor_fill", dtype="bf16")
-    conv_input = tensors.contiguous(conv_view.narrow(0, 0, core_tokens),
-                                    "convolution_input_contiguous", reason="causal_conv1d_update.contiguous")
     conv = _lower_convolution(
         b, tensors, conv_input=conv_input, deps=deps, views=views, active=active,
         active_rows=active_rows, core_tokens=core_tokens, lengths=lengths,
         padding_slots=padding_slots, speculative=speculative, max_query=max_query,
         conv_dtype=conv_dtype, conv_contract=conv_contract, conv_effects=conv_effects,
         heads=heads, width=width, cache_index_row_stride=cache_index_row_stride)
-    values = rearrange_qkv(tensors, conv, core_tokens, heads, keys, dk, dv)
+    values = _split_conv_qkv(tensors, conv, core_tokens, heads, keys, dk, dv)
     beta_store = _resolve_beta_store(runtime, gating_beta_store, gating_programs)
     gated = b.work("delta_gates", tuple(value.producer for value in gate_inputs), (core_tokens, heads),
                    family="gdn_gating", dtype="bf16",

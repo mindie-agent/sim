@@ -432,7 +432,10 @@ def test_long_prefill_index_scores_read_each_key_union_once():
                        sequences=1, scope="body")[0]
     expected_key_bytes = PREFILL_TOKENS * INDEX_ROW_BYTES
     refill_rows = sum(range(INDEX_QUERY_TILE, PREFILL_TOKENS + 1, INDEX_QUERY_TILE))
-    scores = [op for op in ops if op.recipe == "quant_lightning_indexer"]
+    scores = [
+        op for op in ops
+        if op.family == "indexer" and dict(op.metadata).get("fused_members")
+    ]
     assert len(scores) == INDEX_LAYERS
     first = scores[0]
     by_id = {op.op_id: op for op in ops}

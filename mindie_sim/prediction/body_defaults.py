@@ -46,6 +46,20 @@ GQA_QUERY_TILE_CANDIDATES = (64, 32, 16, 8, 4, 2, 1)
 GQA_KEY_TILE_CANDIDATES = (128, 64, 32, 16, 8, 4, 2, 1)
 GQA_SCORE_ACCUM_BYTES = 4
 GQA_ONLINE_STATS_BYTES = 8
+_QUANTIZED_GQA_KV_DTYPES = frozenset({
+    "int8", "c8", "fp8", "fp8_e4m3", "mxfp8",
+    "qk_mxfp8_dynamic_v_mxfp8_per_channel", "fp4", "fp4_e2m1",
+})
+_KV_DTYPE_ALIASES = {
+    "c8": "int8",
+    "mxfp8": "fp8_e4m3",
+    "qk_mxfp8_dynamic_v_mxfp8_per_channel": "fp8_e4m3",
+}
+
+
+def _kv_cache_element_bytes(kv_dtype: str) -> float:
+    norm = str(kv_dtype or "").strip().lower()
+    return float(dtype_bytes(_KV_DTYPE_ALIASES.get(norm, norm)))
 
 _GDN_CONV_MIN_UB_BYTES = 188416
 _GDN_CONV_WIDTHS = (2, 3, 4)
@@ -369,7 +383,8 @@ def _gqa_tiles(case, layers, tokens=1):
     remain resident. Two window slots may each retain probabilities. This is
     a capacity policy, not a prediction of the vendor's tiling dispatch.
     """
-    qb, kb = dtype_bytes(case.model.activation_dtype), dtype_bytes(case.model.quant.kv_dtype)
+    qb = dtype_bytes(case.model.activation_dtype)
+    kb = _kv_cache_element_bytes(case.model.quant.kv_dtype)
     tp = max(case.runtime.parallel.tp, 1)
     cores = min((d.compute_units for d in case.machine.dies), default=0)
     is_a5 = case.machine.arch_family == "A5"
@@ -680,7 +695,7 @@ def attention_defaults(case, phase, *, tokens=1):
                       for d in case.machine.dies)
     parallel = case.runtime.parallel
     floating = {"bf16", "fp16", "fp32", "bfloat16", "float16", "float32"}
-    quantized_kv = {"int8", "fp8", "fp8_e4m3", "fp4", "fp4_e2m1"}
+    kv_norm = str(case.model.quant.kv_dtype or "").strip().lower()
     gqa = [p for p in case.model.layer_plans if p.attention == "gqa"]
     indexed = [p for p in case.model.layer_plans if p.attention == "mla" and p.index_topk]
     dense_mla = [p for p in case.model.layer_plans if p.attention == "mla" and not p.index_topk
@@ -705,8 +720,8 @@ def attention_defaults(case, phase, *, tokens=1):
         if not reason and family == "gqa_decode":
             if case.model.activation_dtype not in floating:
                 reason = "gqa_activation_precision_outside_fattention_domain"
-            elif (case.model.quant.kv_dtype not in floating
-                  and case.model.quant.kv_dtype not in quantized_kv):
+            elif (kv_norm not in floating
+                  and kv_norm not in _QUANTIZED_GQA_KV_DTYPES):
                 reason = "gqa_kv_storage_outside_fattention_domain"
             elif any(p.window or p.index_topk or p.noncausal_attention for p in layers):
                 # The declared staged decode source rejects any non-zero

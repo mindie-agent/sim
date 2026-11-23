@@ -45,6 +45,9 @@ _SITU_EAGER_TANH_OPS = 2
 _SITU_EAGER_MUL_OPS = 1
 _SITU_EAGER_SIGMOID_OPS = 4
 _SITU_EAGER_PAIR_TENSORS = 2
+STEP5_SWIGLU_CLAMP_LIMIT = 7.0
+STEP5_SWIGLU_KIND = "swiglustep"
+CLAMPED_SWIGLU_KIND = "swiglu_clamped"
 SITU_QUANT_SOURCE = {
     "repository": "vllm-ascend",
     "base_revision": "175ef4d49c2072f9233619636f0309f4f88b4e2c",
@@ -90,14 +93,22 @@ def gated_activation(*, plan, op_id, deps, rows, width, dtype, stage, requests,
         if activation == "swigluoai" and not 0.0 < alpha:
             raise ModelingError("swigluoai_requires_positive_alpha")
         per_element = _clamped_activation_ops(alpha, beta)
-        recipe = (recipe.replace("swiglu", "swigluoai")
-                  if activation == "swigluoai" else recipe)
-        metadata += (
+        if activation == "swigluoai":
+            clamped_kind = "swigluoai"
+        elif math.isclose(limit, STEP5_SWIGLU_CLAMP_LIMIT):
+            clamped_kind = STEP5_SWIGLU_KIND
+        else:
+            clamped_kind = CLAMPED_SWIGLU_KIND
+        recipe = recipe.replace("swiglu", clamped_kind)
+        metadata = (
+            ("activation_kind", clamped_kind),
+            ("activation_compute_dtype", "fp32"),
+            ("ub_working_bytes_per_elem", _FP32_BYTES),
             ("activation_limit", limit),
             ("activation_alpha", alpha),
             ("activation_beta", beta),
             ("activation_params", {
-                "activation": activation,
+                "activation": clamped_kind,
                 "limit": limit,
                 "alpha": alpha,
                 "beta": beta,

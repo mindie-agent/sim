@@ -43,7 +43,7 @@ NATIVE_KIND = "aclnnMegaMoe"
 #: admission on shipping ``merged`` / ``unmerged_pr`` baselines.
 SHIPPING_SUPPORTED_ACTIVATIONS = frozenset({"swiglu", "silu", "gelu"})
 EXTENDED_ABI_ACTIVATIONS = frozenset({
-    "swigluoai", "situglu", "situ", "gelu_tanh", "geglu",
+    "swigluoai", "swiglustep", "swiglu_clamped", "situglu", "situ", "gelu_tanh", "geglu",
 })
 SUPPORTED_ACTIVATIONS = SHIPPING_SUPPORTED_ACTIVATIONS
 ALL_ACTIVATIONS = SHIPPING_SUPPORTED_ACTIVATIONS | EXTENDED_ABI_ACTIVATIONS
@@ -687,7 +687,10 @@ def try_lower_fused_frame(
     *, allow_int8_arch22: bool = False,
 ):
     """Lower a complete connected MoE dispatch->GMM1->act->GMM2->combine frame."""
-    e_up, e_act, e_down = by_id.get(prefix + ".expert_up"), by_id.get(prefix + ".expert_act"), by_id.get(prefix + ".expert_down")
+    e_up = by_id.get(prefix + ".expert_up")
+    e_act = by_id.get(prefix + ".expert_act")
+    e_down_quant = by_id.get(prefix + ".expert_down.quantize")
+    e_down = by_id.get(prefix + ".expert_down")
     up_meta = dict(e_up.metadata) if e_up is not None else {}
     down_meta = dict(e_down.metadata) if e_down is not None else {}
     mxfp_eligible = _matrix_mxfp_eligible(up_meta) and _matrix_mxfp_eligible(down_meta)
@@ -696,15 +699,27 @@ def try_lower_fused_frame(
         and _matrix_int8_eligible(up_meta)
         and _matrix_int8_eligible(down_meta)
     )
-    if not (e_up is not None and e_act is not None and e_down is not None
-            and e_up.deps == (dispatch.op_id,) and e_act.deps == (e_up.op_id,)
-            and e_down.deps == (e_act.op_id,) and combine.deps == (e_down.op_id,)
+    direct_act_down = (
+        e_act is not None and e_down is not None
+        and e_act.deps == (e_up.op_id,) and e_down.deps == (e_act.op_id,)
+    ) if e_up is not None else False
+    quant_act_down = (
+        e_act is not None and e_down_quant is not None and e_down is not None
+        and e_act.deps == (e_up.op_id,)
+        and e_down_quant.deps == (e_act.op_id,)
+        and e_down.deps == (e_down_quant.op_id,)
+    ) if e_up is not None else False
+    if not (e_up is not None and e_down is not None
+            and e_up.deps == (dispatch.op_id,)
+            and (direct_act_down or quant_act_down)
+            and combine.deps == (e_down.op_id,)
             and (mxfp_eligible or int8_eligible)):
         return None
     act_meta = dict(e_act.metadata)
     act_kind = str(act_meta.get("activation_kind") or e_act.family or "swiglu").lower()
+    act_limit = float(act_meta.get("activation_limit", 0.0) or 0.0)
     allow_ext = allow_abi_extension(runtime)
-    if act_kind not in (ALL_ACTIVATIONS if allow_ext else SUPPORTED_ACTIVATIONS):
+    if (act_limit > 0.0 and not allow_ext) or act_kind not in (ALL_ACTIVATIONS if allow_ext else SUPPORTED_ACTIVATIONS):
         return None
 
     fused_lvl = int(selected.get("fused_mc2_level") or FUSED_MC2_ROUTED_MODE)
@@ -744,6 +759,8 @@ def try_lower_fused_frame(
     removed_ids = {
         pack.op_id, dispatch.op_id, e_up.op_id, e_act.op_id, e_down.op_id, combine.op_id, unpack.op_id,
     }
+    if quant_act_down and e_down_quant is not None:
+        removed_ids.add(e_down_quant.op_id)
     if pack_quant is not None:
         removed_ids.add(pack_quant.op_id)
     target_id, mega_deps = unpack.op_id, list(pack.deps)

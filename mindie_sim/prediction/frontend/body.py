@@ -9,10 +9,80 @@ from __future__ import annotations
 
 from mindie_sim.catalog.context_parallel import cp_interleave
 from mindie_sim.prediction import frontend as _frontend
+from mindie_sim.schema.model import QuantSpec
 
 
 _SAMPLING_OPS_PER_LOGIT = 5
 _HIDDEN_SELECTION_INDEX_BYTES = 8
+_HC_COLLAPSE_SIGMOID_OPS = 4
+_HC_COLLAPSE_FP32_BYTES = 4
+
+
+def _mhc_stream_collapse_ops(model, ready, *, prefix, mode, stage, tokens, requests, hc_mult):
+    """Collapse ``hc_mult`` hyper-connection streams into one hidden state before final norm."""
+    h = int(model.hidden_size)
+    act_bytes = _frontend.dtype_bytes(model.activation_dtype)
+    fp32_quant = QuantSpec(name="hc_head_fp32", weight_format="fp32", activation_format="fp32")
+    proj = _frontend.gemm_op(
+        op_id=prefix + "hc_head_proj", deps=(ready,), stage=stage,
+        layer=_frontend.FINAL_LAYER, requests=requests,
+        m=tokens, n=hc_mult, k=hc_mult * h, quant=fp32_quant,
+        category="mhc_final_collapse", phase=mode, family="gemm",
+        recipe="hc_final_collapse_proj",
+        metadata=(("hc_mult", hc_mult), ("collapse_input_width", hc_mult * h)),
+    )
+    sig = _frontend.vector_op(
+        op_id=prefix + "hc_head_sigmoid", deps=(proj.op_id,), stage=stage,
+        layer=_frontend.FINAL_LAYER, requests=requests,
+        elements=tokens * hc_mult, ops_per_element=_HC_COLLAPSE_SIGMOID_OPS,
+        dtype="fp32", family="mhc", phase=mode, recipe="hc_final_collapse_sigmoid",
+        shape=(tokens, hc_mult),
+    )
+    mix = _frontend.vector_op(
+        op_id=prefix + "hc_head_mix", deps=(ready, sig.op_id), stage=stage,
+        layer=_frontend.FINAL_LAYER, requests=requests,
+        elements=tokens * h, ops_per_element=2 * hc_mult,
+        dtype=model.activation_dtype, family="mhc", phase=mode,
+        recipe="hc_final_collapse_mix", shape=(tokens, h),
+        read_bytes_override=(tokens * hc_mult * h * act_bytes
+                             + tokens * hc_mult * _HC_COLLAPSE_FP32_BYTES),
+        write_bytes_override=tokens * h * act_bytes,
+        metadata=(("hc_mult", hc_mult),),
+    )
+    return [proj, sig, mix], mix.op_id
+
+
+def _emit_gemma4_post_ffn_norms(
+    ops, previous, saved, *, name, layer, stage, index, requests, tokens, model, mode,
+):
+    """Emit Gemma-4 post-FFN (and MoE parallel branch) RMSNorms on the causal DAG."""
+    if layer.ffn == "moe":
+        pre_exp = _frontend.norm(
+            name=name + ".pre_experts_norm", deps=(saved,), stage=stage, layer=index,
+            requests=requests, tokens=tokens, width=model.hidden_size, model=model, mode=mode,
+        )
+        router_norm = _frontend.norm(
+            name=name + ".router_norm", deps=(saved,), stage=stage, layer=index,
+            requests=requests, tokens=tokens, width=model.hidden_size, model=model, mode=mode,
+        )
+        post_exp = _frontend.norm(
+            name=name + ".post_experts_norm",
+            deps=(previous, pre_exp.op_id, router_norm.op_id),
+            stage=stage, layer=index, requests=requests, tokens=tokens,
+            width=model.hidden_size, model=model, mode=mode,
+        )
+        post_ffn = _frontend.norm(
+            name=name + ".post_ffn_norm", deps=(post_exp.op_id,), stage=stage, layer=index,
+            requests=requests, tokens=tokens, width=model.hidden_size, model=model, mode=mode,
+        )
+        ops.extend(_frontend._scope((pre_exp, router_norm, post_exp, post_ffn), "ffn"))
+        return post_ffn.op_id
+    post_ffn = _frontend.norm(
+        name=name + ".post_ffn_norm", deps=(previous,), stage=stage, layer=index,
+        requests=requests, tokens=tokens, width=model.hidden_size, model=model, mode=mode,
+    )
+    ops.extend(_frontend._scope((post_ffn,), "ffn"))
+    return post_ffn.op_id
 
 
 def _scope(ops, block, role="body"):
@@ -159,9 +229,18 @@ class _FrontendBody:
                     attention_id=attention.last)
                 ops.extend(_frontend._scope(post.ops, "ffn", "residual"))
             else:
+                attn_out = attention.last
+                if layer.architecture == "gemma4":
+                    post_attn = _frontend.norm(
+                        name=name + ".post_attn_norm", deps=(attn_out,), stage=stage,
+                        layer=index, requests=requests, tokens=tokens,
+                        width=model.hidden_size, model=model, mode=mode,
+                    )
+                    ops.extend(_frontend._scope((post_attn,), "attention"))
+                    attn_out = post_attn.op_id
                 post, previous = residual.after({**common, "prefix": name + ".attention",
                                                 "structure_block": "attention"},
-                                                attention.last, saved)
+                                                attn_out, saved)
                 ops.extend(_frontend._scope(post, "attention", "residual"))
             if layer.engram and not _frontend.is_qwen4_exp_ple(model.engram):
                 if attn_state is not None:
@@ -259,6 +338,11 @@ class _FrontendBody:
             if attn_state is not None:
                 attn_state.defer_mlp(previous)
             else:
+                if layer.architecture == "gemma4":
+                    previous = _emit_gemma4_post_ffn_norms(
+                        ops, previous, saved, name=name, layer=layer, stage=stage,
+                        index=index, requests=requests, tokens=tokens, model=model, mode=mode,
+                    )
                 post, previous = residual.after(
                     {**common, "prefix": name + ".ffn", "structure_block": "ffn"}, previous, saved)
                 ops.extend(_frontend._scope(post, "ffn", "residual"))
@@ -359,8 +443,16 @@ class _FrontendBody:
             tokens, _ = pcp_uniform_peer_rows(views, p.pcp, local_rows=0)
         stages = stages or _frontend.stage_map(model, runtime)
         ops, previous = [], ready
-        sp = _frontend.sequence_parallel.select(runtime, model, views, tokens=tokens,
-                                      global_tokens=global_tokens, rank_ledger=rank_ledger)
+        cohort_valid = (
+            sum(view.q_len for grp in cohort_views_by_replica.values()
+                for view in grp if not getattr(view, "padding", False))
+            if cohort_views_by_replica is not None else None
+        )
+        sp = _frontend.sequence_parallel.select(
+            runtime, model, views, tokens=tokens,
+            global_tokens=global_tokens, rank_ledger=rank_ledger,
+            valid_global_tokens=cohort_valid,
+        )
         if sp:
             if runtime.moe_recipe != "alltoall":
                 raise ValueError("sequence_parallel_requires_unchunked_alltoall")
@@ -456,15 +548,26 @@ class _FrontendBody:
 
     @staticmethod
     def final_mixer(model, ready, *, prefix, mode, stage, tokens, requests):
-        """Emit the Qwen4Exp stream collapse, or the ordinary final norm."""
+        """Emit low-rank or full-stream mHC collapse before final norm, or plain final norm."""
         if any(getattr(plan, "hc_lowrank", 0) > 0 for plan in model.layer_plans):
             return _frontend.lowrank_hyper_final_mixer(
                 prefix=prefix + "final", deps=ready, stage=stage,
                 requests=requests, tokens=tokens, model=model, mode=mode)
+        hc_mult = max(
+            (int(getattr(plan, "hc_mult", 1) or 1)
+             for plan in model.layer_plans if getattr(plan, "hyper_connections", False)),
+            default=1,
+        )
+        prefix_ops = []
+        if hc_mult > 1 and tokens > 0:
+            prefix_ops, ready = _mhc_stream_collapse_ops(
+                model, ready, prefix=prefix, mode=mode, stage=stage,
+                tokens=tokens, requests=requests, hc_mult=hc_mult,
+            )
         final = _frontend.norm(name=prefix + "final_norm", deps=(ready,), stage=stage,
                      layer=_frontend.FINAL_LAYER, requests=requests, tokens=tokens,
                      width=model.hidden_size, model=model, mode=mode)
-        return [final], final.op_id
+        return [*prefix_ops, final], final.op_id
 
     def logits(self, model, runtime, views, ready, *, prefix="", mode="decode", stage=None, sample=True,
                input_tokens=None, normalized=False):

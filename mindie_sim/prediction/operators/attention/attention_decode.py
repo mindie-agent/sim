@@ -41,6 +41,8 @@ RECIPE_ID = IMPLEMENTATION
 DEFAULT_DECODE_KEY_TILE = 128
 DEFAULT_DECODE_QUERY_TILE = 64
 FP32_BYTES = 4
+_MX_SCALE_GROUP_SIZE = 32
+_MXFP8_KV_TAGS = frozenset({"mxfp8", "qk_mxfp8_dynamic_v_mxfp8_per_channel"})
 
 # Mechanism-only references pinning represented source features.
 SOURCE_REFERENCES = (
@@ -56,9 +58,41 @@ _DTYPE_ALIASES = {
     # Quantized cache payloads retain their storage dtype.  Conversion and
     # scale work are separate declarations, not a re-labelled BF16 tensor.
     "fp8": "fp8_e4m3", "fp8_e4m3": "fp8_e4m3", "fp8_e5m2": "fp8_e5m2",
-    "int8": "int8", "uint8": "uint8", "int4": "int4",
+    "mxfp8": "fp8_e4m3", "qk_mxfp8_dynamic_v_mxfp8_per_channel": "fp8_e4m3",
+    "int8": "int8", "c8": "int8", "uint8": "uint8", "int4": "int4",
     "fp4": "fp4_e2m1", "fp4_e2m1": "fp4_e2m1",
 }
+
+
+def _resolve_arch35_mxfp8_access(
+    raw_kv_dtype: Any, query_dtype: str, kv_dtype: str, dim: int,
+    cache: KVCacheAccess, recipe: StagedGQADecode,
+) -> tuple[str, KVCacheAccess]:
+    """Use direct PA_NZ MXFP8 Cube MMA without AIV BF16 dequant writeback on Arch35."""
+    raw_norm = str(raw_kv_dtype or "").strip().lower()
+    is_mxfp8_kv = (
+        raw_norm in _MXFP8_KV_TAGS
+        or (recipe.kv_mapping == "fai_host_arch35" and kv_dtype == "fp8_e4m3"
+            and cache.scale_scope == "row" and cache.key_scale_row > 0)
+    )
+    if not is_mxfp8_kv:
+        return query_dtype, cache
+    row_bytes = dim + _ceil_div(dim, _MX_SCALE_GROUP_SIZE)
+    direct = replace(
+        cache,
+        key_payload_row=row_bytes,
+        value_payload_row=row_bytes,
+        key_operand_row=row_bytes,
+        value_operand_row=row_bytes,
+        key_scale_row=0,
+        value_scale_row=0,
+        scale_scope="none",
+        dequant_ops_per_element=0,
+        key_needs_conversion=False,
+        value_needs_conversion=False,
+        query_dtype="fp8_e4m3",
+    )
+    return "fp8_e4m3", direct
 
 
 def _positive_int(value, name: str) -> int:
@@ -252,12 +286,15 @@ def _spec(op: OpSpec, recipe: StagedGQADecode) -> _Spec:
                 for index, (owner, start, end) in enumerate(
                     mapping[output.request, output.kv_head]))) for output in outputs]
             splits = max((len(output.contributions) for output in outputs), default=1)
+    access = kv_access(op, query_dtype=query_dtype, kv_dtype=kv_dtype, head_dim=dim)
+    effective_query_dtype, access = _resolve_arch35_mxfp8_access(
+        raw.get("kv_dtype"), query_dtype, kv_dtype, dim, access, recipe,
+    )
     return _Spec(
-        requests, heads, kv_heads, dim, query_dtype, kv_dtype,
+        requests, heads, kv_heads, dim, effective_query_dtype, kv_dtype,
         recipe.key_tile, recipe.query_tile, splits, recipe.slots,
         tuple(outputs),
-        kv_access(op, query_dtype=query_dtype, kv_dtype=kv_dtype,
-                  head_dim=dim),
+        access,
     )
 
 

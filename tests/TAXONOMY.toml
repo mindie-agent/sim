@@ -367,6 +367,33 @@ owns = [
     "mindie_sim/prediction/operators/mx_quant_matrix/shared_w4a8.py",
     "mindie_sim/prediction/operators/hyper_connections/lowrank_hc_vector.py",
 ]
+[[module]]
+path = "operators/test_stage4c_before_graph_and_sp_padding.py"
+tier = "tier0"
+owns = [
+    "mindie_sim/feature_mechanisms.py",
+    "mindie_sim/prediction/body_defaults.py",
+    "mindie_sim/prediction/feedforward.py",
+    "mindie_sim/prediction/frontend/body.py",
+    "mindie_sim/prediction/frontend/speculation.py",
+    "mindie_sim/prediction/sharding/sequence_parallel.py",
+    "mindie_sim/prediction/transforms.py",
+    "mindie_sim/prediction/operators/attention/attention.py",
+    "mindie_sim/prediction/operators/attention/attention_decode.py",
+    "mindie_sim/prediction/operators/attention/gqa_contracts.py",
+    "mindie_sim/prediction/operators/linear_attention/gdn_decode.py",
+    "mindie_sim/prediction/operators/mc2/mc2_graph.py",
+    "mindie_sim/prediction/operators/mc2/megamoe.py",
+    "mindie_sim/prediction/operators/mc2/moe_comm_selection.py",
+    "mindie_sim/prediction/operators/mla/generic_latent_attention_views.py",
+    "mindie_sim/prediction/operators/mla/mla.py",
+    "mindie_sim/prediction/operators/mla_prolog/family_mla_prolog.py",
+    "mindie_sim/prediction/operators/moe_routing/moe_gating_fusion.py",
+    "mindie_sim/prediction/operators/sparse_indexer/gqa_indexer.py",
+    "mindie_sim/prediction/operators/sparse_indexer/index_pool_native.py",
+    "mindie_sim/prediction/operators/vector/gated_activation.py",
+    "mindie_sim/prediction/operators/vector/transform_norm_quant.py",
+]
 # ---------------------------------------------------------------- spine
 [[module]]
 path = "spine/test_stream_plan.py"

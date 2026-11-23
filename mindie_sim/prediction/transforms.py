@@ -460,7 +460,8 @@ def lower_implementations(ops, runtime, source_dtype, *, passes=None, resource_f
     )
     rt_meta = dict(getattr(runtime, "metadata", ()) or ())
     qkv_fx_only = rt_meta.get("qkv_norm_rope_mode") == "fx"
-    for name in runtime.lowering_passes:
+    lowering_passes = tuple(runtime.lowering_passes)
+    for pass_index, name in enumerate(lowering_passes):
         if name in skip_passes:
             continue
         if name in TORCH_COMPILE_PASSES and not enable_compile:
@@ -491,7 +492,19 @@ def lower_implementations(ops, runtime, source_dtype, *, passes=None, resource_f
                 registry[name], ops, source_dtype, excluded)
         else:
             transformed = registry[name](ops, source_dtype)
-        ops = lower_operators(transformed, bindings,
+        # Defer rmsnorm_quant native binding until a pending residual_norm pass
+        # has had a chance to fuse Add + RmsNormDynamicMxQuant into one op.
+        pending_residual = (
+            "residual_norm" in lowering_passes[pass_index + 1:]
+            and "residual_norm" not in skip_passes
+            and ("residual_norm" not in TORCH_COMPILE_PASSES or enable_compile)
+        )
+        step_bindings = (
+            {key: value for key, value in bindings.items() if key != "rmsnorm_quant"}
+            if (pending_residual and "rmsnorm_quant" in bindings)
+            else bindings
+        )
+        ops = lower_operators(transformed, step_bindings,
                               activation_quantized=activation_quantized)
         if capture_state is not None:
             generated = capture_partition(ops, runtime, replay_scope)

@@ -49,19 +49,24 @@ UNQUANTIZED_INDEX_DTYPES = frozenset({"bf16", "fp16", "fp32"})
 BF16_OPERAND_FORMAT = "bf16"
 
 
-def index_operands_quantized(quant):
-    """True when the fused indexer has a quantized operand to consume.
+BF16_INDEXER_NATIVE_KIND = "npu_lightning_indexer"
 
-    A quantized index dtype is one. An unquantized index dtype still pairs
-    with a quantized activation or KV cache (W8A8/W4A8), so those cases keep
-    the fused kernel; a pure BF16/FP16 chain has no quantized operand at all.
+
+def index_operands_quantized(quant, model=None):
+    """True ONLY when index_q / index_k operands are actually quantized.
+
+    An unquantized BF16/FP16 index_k / index_q pair must dispatch to
+    ``npu_lightning_indexer`` (not ``aclnnQuantLightningIndexerV2``), even
+    when the surrounding model weights or main KV cache are quantized.
     """
-    if str(getattr(quant, "index_dtype", "") or "") not in UNQUANTIZED_INDEX_DTYPES:
-        return True
-    return (str(getattr(quant, "activation_format", BF16_OPERAND_FORMAT)
-                or BF16_OPERAND_FORMAT) not in UNQUANTIZED_INDEX_DTYPES
-            or str(getattr(quant, "kv_dtype", BF16_OPERAND_FORMAT)
-                   or BF16_OPERAND_FORMAT) not in UNQUANTIZED_INDEX_DTYPES)
+    if model is not None:
+        raw = dict(getattr(model, "metadata", ())).get("cache_representations", {})
+        if "index_k" in raw:
+            fmt = str((raw["index_k"] or {}).get("dtype") or "").strip().lower()
+            if fmt:
+                return fmt not in UNQUANTIZED_INDEX_DTYPES
+    index_dtype = str(getattr(quant, "index_dtype", "") or "").strip().lower()
+    return bool(index_dtype) and index_dtype not in UNQUANTIZED_INDEX_DTYPES
 
 
 def stack_compressor_kind(model, plan):
@@ -234,6 +239,7 @@ def semantic_index_selection(b, *, deps, views, plan, model, quant, parallel,
             spill = max(0.0, 1 - float(l2_bytes) / working)
             hbm_rows += max(0.0, float(refill_rows) - hbm_rows) * spill
     native_fused = False
+    native_bf16_indexer = False
     if runtime is not None:
         # Imported lazily: the epilog module imports this builder for the
         # shared index representation, so a module-level edge would cycle.
@@ -243,21 +249,28 @@ def semantic_index_selection(b, *, deps, views, plan, model, quant, parallel,
         native_sel = select(lowerings, "native_fusion")
         claimed_role = (native_sel is not None
                         and "lightning_indexer" in (native_sel.options.get("roles") or ()))
-        native_fused = (native_fusion_active(runtime, machine)
-                        and not claimed_role
-                        and index_operands_quantized(quant)
-                        and select(lowerings, "lightning_indexer") is None
-                        and select(lowerings, "quant_lightning_indexer") is None)
+        native_eligible = (native_fusion_active(runtime, machine)
+                           and not claimed_role
+                           and select(lowerings, "lightning_indexer") is None
+                           and select(lowerings, "quant_lightning_indexer") is None)
+        quantized_index = index_operands_quantized(quant, model)
+        native_fused = native_eligible
     # Query and head-weight operands are real reads in both lowerings.
     by_id = {op.op_id: op for op in b.ops}
     operand_bytes = sum(float(by_id[dep].mte3_bytes)
                         for dep in deps[:2] if dep in by_id)
     if native_fused:
-        # One CANN 9.2.1 kernel consumes Q, head weights and the candidate
-        # cache rows and writes only the token indices. The FP32 score plane
-        # is never materialized, so its write+read disappears.
+        # One CANN kernel consumes Q, head weights and the candidate cache rows
+        # and writes only the token indices; dispatch QuantLightningIndexerV2
+        # only when index Q/K operands are actually quantized, else BF16
+        # npu_lightning_indexer.
+        op_name = "index_quant_lightning" if quantized_index else "index_lightning"
+        op_recipe = "quant_lightning_indexer" if quantized_index else "index_scores"
+        native_kind = (
+            "aclnnQuantLightningIndexerV2" if quantized_index else BF16_INDEXER_NATIVE_KIND
+        )
         fused = b.work(
-            "index_quant_lightning", deps, (valid, plan.index_heads, plan.index_dim),
+            op_name, deps, (valid, plan.index_heads, plan.index_dim),
             flops=2 * rows * plan.index_heads * plan.index_dim / divisor,
             vector=(rows * plan.index_heads * 2 / divisor
                     + rows * math.log2(max(MIN_LOG_TOPK, plan.index_topk)) / divisor),
@@ -265,8 +278,8 @@ def semantic_index_selection(b, *, deps, views, plan, model, quant, parallel,
             hbm_read=operand_bytes + hbm_rows * row_b / divisor,
             write=valid * plan.index_topk * INT32_BYTES,
             family="indexer", dtype=index_arithmetic_dtype(model, quant),
-            recipe="quant_lightning_indexer",
-            metadata=(("native_kind", "aclnnQuantLightningIndexerV2"),
+            recipe=op_recipe,
+            metadata=(("native_kind", native_kind),
                       ("fused_members", ("index_scores", "index_topk")),
                       ("intermediate_score_bytes", 0),
                       ("selection_output_dtype", "int32"),

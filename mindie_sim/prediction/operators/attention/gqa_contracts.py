@@ -19,6 +19,7 @@
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 import math
 
@@ -51,6 +52,49 @@ _QKV_NORM_ROPE_SOURCE = {
 def _memory_hierarchy(machine, *, hierarchy=None):
     """Declared device hierarchy for traffic planning; fails closed when absent."""
     return require_machine_memory_hierarchy(machine, hierarchy=hierarchy)
+
+
+def uses_mrope_qkv_kernel(model, plan) -> bool:
+    """True only when the layer uses AscendMRotaryEmbedding (split_qkv_rmsnorm_mrope).
+
+    Ordinary text RoPE models (e.g. Qwen3-32B, Qwen3-30B-A3B, Qwen3-235B-A22B,
+    Gemma-4, MiniMax) split QKV into zero-copy views and invoke Q/K RMSNorm
+    separately rather than the Triton MRoPE fused kernel.
+    """
+    if getattr(plan, "q_output_gate", False) and not getattr(plan, "q_gate_separate", False):
+        return True
+    facts = dict(getattr(model, "catalog_facts", ()) or {})
+    if not facts:
+        return True
+    if facts.get("vision_config") or facts.get("has_vision_tower"):
+        return True
+    rope_params = facts.get("rope_parameters") or {}
+    if isinstance(rope_params, Mapping):
+        if rope_params.get("mrope_section") or rope_params.get("mrope_interleaved"):
+            return True
+    return False
+
+
+def _declare_ordinary_qk_norm_rope(ops, qkv, norm_ids, rope, views, dtype):
+    """Declare unfused ordinary text Q-norm + K-norm + RoPE (no MRoPE fusion)."""
+    members = (*norm_ids, rope.op_id)
+    declare_group(
+        ops, key=qkv.op_id + ".norm_rope", role="qkv_norm_rope",
+        family="qkv_preprocess", members=members,
+        entries=tuple(norm_ids), anchor=rope.op_id,
+        view={
+            "input_shape": views["query"].storage_shape, "dtype": dtype,
+            "input_views": {name: layout.to_dict() for name, layout in views.items()},
+        },
+        implementation={
+            "native_kind": "RmsNorm+Rotary", "selection": None,
+            "conditions": {"qk_norm": True, "mrope_fused_kernel": False},
+        },
+        source=_QKV_NORM_ROPE_SOURCE,
+        fusion_status="unfused_decomposed",
+        fusion_reason="ordinary_text_rope_no_mrope_kernel",
+        native_fusion_eligible=False,
+    )
 
 
 def _qkv_views(tokens, heads, kv_heads, width, has_gate, k_eq_v=False):

@@ -262,6 +262,31 @@ def _draft_features(model, draft, draft_model, step_model, runtime, *, previous,
             dtype=draft.activation_dtype, family="elementwise", phase="draft",
             recipe="draft_feature_add")
         ops.append(projection)
+    elif rows and draft.input_mode == "normalized_concat":
+        norm_ids = []
+        for component in ("enorm", "hnorm"):
+            norm_op = vector_op(
+                op_id=prefix + component, deps=tuple(feature_deps), stage=stage,
+                layer=-1, requests=requests, elements=rows * draft.hidden_size,
+                ops_per_element=_DRAFT_RMSNORM_OPS_PER_ELEMENT,
+                dtype=draft.activation_dtype, family="rmsnorm",
+                phase="draft", recipe="draft_input_norm",
+                shape=(rows, draft.hidden_size),
+            )
+            ops.append(norm_op)
+            norm_ids.append(norm_op.op_id)
+        projection = replace(projection, deps=tuple(norm_ids))
+        ops.append(projection)
+        if tp > 1:
+            gathered = comm_op(
+                op_id=prefix + "features_gather", deps=(projection.op_id,), stage=stage,
+                layer=-1, requests=requests, family="allgather", phase="draft",
+                recipe="draft_features_gather",
+                link_bytes=feature_rows * draft.hidden_size
+                * dtype_bytes(draft.activation_dtype) * (tp - 1) / tp,
+                shape=(feature_rows, draft.hidden_size), metadata=(("group_axis", "tp"), ("steps", tp - 1)))
+            ops.append(gathered)
+            projection = gathered
     elif rows:
         ops.append(projection)
         if tp > 1:

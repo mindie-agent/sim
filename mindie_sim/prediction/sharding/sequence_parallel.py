@@ -115,6 +115,7 @@ class SequenceParallelPlan:
     input_rows: int = 0
     valid_global: int = 0
     valid_per_tp: tuple[int, ...] = ()
+    valid_cohort_tokens: int = 0
 
     @property
     def physical_global(self):
@@ -159,6 +160,7 @@ class SequenceParallelPlan:
             "tokens_global": self.tokens_global,
             "tokens_local": self.tokens_local,
             "cohort_tokens": self.cohort_tokens,
+            "valid_cohort_tokens": self.valid_cohort_tokens,
             "source_partitions": self.source_partitions,
             "tp": self.tp,
             "ep": self.ep,
@@ -203,7 +205,7 @@ def _tuple_names(value, reason: str) -> tuple[str, ...]:
     return result
 
 
-def _validate_declaration(raw: Any) -> Mapping:
+def _validate_declaration(raw: Any, *, has_moe_layers: bool = True) -> Mapping:
     if not isinstance(raw, Mapping):
         raise ModelingError("sequence_parallel_declaration_must_be_mapping")
     unknown = set(raw) - set(DECLARATION)
@@ -215,7 +217,10 @@ def _validate_declaration(raw: Any) -> Mapping:
     for key, expected in DECLARATION.items():
         actual = raw[key]
         if key == "enable_expert_parallel":
-            if actual is not True:
+            if has_moe_layers and actual is not True:
+                raise ModelingError(
+                    f"sequence_parallel_option_unsupported:{key}={actual!r}")
+            if not isinstance(actual, bool):
                 raise ModelingError(
                     f"sequence_parallel_option_unsupported:{key}={actual!r}")
         elif key == "implementation" and actual in _ACCEPTED_IMPLEMENTATIONS:
@@ -307,7 +312,8 @@ def sequence_parallel_enabled(metadata: Mapping | None, tp: int) -> bool:
             and int(tp) > 1)
 
 
-def select(runtime, model, views, *, tokens, global_tokens=None, rank_ledger=None):
+def select(runtime, model, views, *, tokens, global_tokens=None, rank_ledger=None,
+           valid_global_tokens=None):
     """Return the immutable plan, or ``None`` when no declaration is present.
 
     ``none`` retains the divisible-input contract. ``right_to_tp`` pads the
@@ -317,7 +323,12 @@ def select(runtime, model, views, *, tokens, global_tokens=None, rank_ledger=Non
     kernels = _kernels(runtime)
     if "sequence_parallel" not in kernels:
         return None
-    declaration = _validate_declaration(kernels["sequence_parallel"])
+    has_moe_layers = any(
+        getattr(layer, "ffn", "") == "moe"
+        for layer in tuple(getattr(model, "layer_plans", ()))
+    )
+    declaration = _validate_declaration(
+        kernels["sequence_parallel"], has_moe_layers=has_moe_layers)
     padding = declaration["padding"]
     if type(tokens) is not int or tokens < 0:
         raise ModelingError(f"sequence_parallel_requires_nonnegative_tokens:{tokens!r}")
@@ -339,7 +350,8 @@ def select(runtime, model, views, *, tokens, global_tokens=None, rank_ledger=Non
         raise ModelingError(f"sequence_parallel_requires_pcp1:{pcp}")
     if tp <= 1:
         raise ModelingError(f"sequence_parallel_requires_tp_gt_1:{tp}")
-    if ep < tp or ep % tp:
+    dense_flashcomm = ep == 1 and not has_moe_layers
+    if not dense_flashcomm and (ep < tp or ep % tp):
         raise ModelingError(f"sequence_parallel_requires_ep_ge_tp_and_divisible:{ep}:{tp}")
     _validate_model(model, padding=padding)
     if padding == "right_to_tp":
@@ -372,10 +384,30 @@ def select(runtime, model, views, *, tokens, global_tokens=None, rank_ledger=Non
         cohort = tokens
         if not cohort:
             raise ModelingError("sequence_parallel_requires_nonempty_ep_cohort")
-        if global_tokens is not None and global_tokens != tokens:
+        if (global_tokens is not None and global_tokens != tokens
+                and not (padding == "right_to_tp" and global_tokens in {input_rows, valid})):
             raise ModelingError(
                 f"sequence_parallel_global_tokens_outside_ep_cohort:"
                 f"{global_tokens}!={tokens}")
+    if rank_ledger is not None:
+        valid_cohort = int(sum(rank_ledger.valid))
+    elif valid_global_tokens is not None:
+        valid_cohort = max(0, int(valid_global_tokens))
+    elif ep <= tp:
+        valid_cohort = valid
+    elif padding == "right_to_tp":
+        if dp == 1:
+            pcp_in_ep = (min(pcp, max(1, ep // tp))
+                         if getattr(parallel, "ep_spans_pcp", False) else 1)
+            valid_cohort = (valid * pcp_in_ep
+                            if any(getattr(v, "phase", "") == "prefill" for v in values)
+                            else valid)
+        elif tokens > 0:
+            valid_cohort = min(cohort, valid * max(1, cohort // tokens))
+        else:
+            valid_cohort = cohort
+    else:
+        valid_cohort = cohort
     phases = tuple(sorted({str(getattr(view, "phase", "")) for view in values}))
     return SequenceParallelPlan(
         implementation=IMPLEMENTATION,
@@ -398,6 +430,7 @@ def select(runtime, model, views, *, tokens, global_tokens=None, rank_ledger=Non
             )),
         padding=padding, input_rows=input_rows, valid_global=valid,
         valid_per_tp=tuple(max(0, min(local, valid - rank * local)) for rank in range(tp)),
+        valid_cohort_tokens=valid_cohort,
     )
 
 
@@ -439,6 +472,7 @@ def _common(plan: SequenceParallelPlan, *, role: str, input_shape: tuple[int, ..
         ("tokens_global", plan.tokens_global),
         ("tokens_local", plan.tokens_local),
         ("cohort_tokens", plan.cohort_tokens),
+        ("valid_cohort_tokens", plan.valid_cohort_tokens),
     ]
     if collective is not None:
         items.extend((("collective", collective), ("group_axis", "tp"),

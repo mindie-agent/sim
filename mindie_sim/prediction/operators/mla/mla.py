@@ -740,6 +740,18 @@ def _project_mla_inputs(
                       ("norm_eps", model.norm_eps)))
         q_b = q_ready = b.matrix("q_b", (q_norm,), q, proj_heads * width, plan.q_lora_rank,
                                 category="mla.q_b")
+        if (plan.mla_variant == "latent_mqa"
+                and plan.cache_kind == "window_compressed" and not is_v41):
+            # V4 DSA (Flash-0731 / Pro-0813 / 10t) applies a weightless RMSNorm
+            # over each 512-dim projected query head between q_b and RoPE.
+            q_ready = b.vector(
+                "q_head_norm", (q_ready,), q * proj_heads * width, RMSNORM_OPS_PER_ELEM,
+                family="rmsnorm", shape=(q, proj_heads, width),
+                read_bytes_override=q * proj_heads * width * norm_bytes,
+                write_bytes_override=q * proj_heads * width * norm_bytes,
+                metadata=(("reduction_width", width),
+                          ("norm_has_weight", False),
+                          ("norm_eps", model.norm_eps)))
     else:
         if prolog:
             raise ModelingError("mla_prolog_v3_direct_q_unsupported")
@@ -1429,6 +1441,19 @@ def _project_mla_output(
         outputs = [partial_rotary.module.declare(
             b, name="output_inverse_rotary", deps=outputs, tokens=q, heads=heads,
             head_dim=plan.head_dim, rotary_width=plan.qk_rope_head_dim, inverse=True)]
+    elif (plan.mla_variant == "latent_mqa"
+            and plan.cache_kind == "window_compressed"
+            and plan.mla_do_rope and plan.qk_rope_head_dim > 0):
+        rope_elems = q * heads * plan.qk_rope_head_dim
+        rope_bytes = rope_elems * dtype_bytes(model.activation_dtype)
+        outputs = [b.work(
+            "output_inverse_rotary", tuple(outputs), (q, heads, plan.qk_rope_head_dim),
+            vector=rope_elems * ROPE_OPS, read=rope_bytes, write=rope_bytes,
+            family="vector", dtype=model.activation_dtype, recipe="output_inverse_rotary",
+            metadata=(("rotary_dim", plan.qk_rope_head_dim),
+                      ("head_dim", plan.head_dim), ("inverse", True),
+                      ("native_kind", "InplacePartialRotaryMul"),
+                      ("rotary_role", "output_inverse_rotary")))]
     pcp_shard_o = (parallel.pcp > 1 and pcp_o_proj_weight_sharding_enabled(runtime))
     pcp_is_prefill = any(getattr(v, "phase", "") == "prefill" for v in views)
     o_in_width = output_width
