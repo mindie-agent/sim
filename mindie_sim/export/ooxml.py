@@ -34,9 +34,11 @@ NS_REL_DOC = "http://schemas.openxmlformats.org/officeDocument/2006/relationship
 NS_REL_PKG = "http://schemas.openxmlformats.org/package/2006/relationships"
 NS_CONTENT_TYPES = "http://schemas.openxmlformats.org/package/2006/content-types"
 
-#: Excel column alphabet radix and ASCII anchor.
+#: Excel column alphabet radix, ASCII anchor, and formula limits.
 EXCEL_COL_RADIX = 26
 ASCII_UPPER_A = 65
+EXCEL_MAX_FORMULA_ARGS = 255
+EXCEL_MAX_FORMULA_CHARS = 8192
 #: Row heights (pt) and Excel calc ID.
 DEFAULT_ROW_HEIGHT_PT = 19.0
 HEADER_ROW_HEIGHT_PT = 28.0
@@ -158,6 +160,27 @@ class Worksheet:
     def merged_ranges(self) -> tuple[str, ...]:
         return tuple(item[4] for item in self._merges)
 
+    @property
+    def max_row(self) -> int:
+        cell_max = max((r for r, _ in self._cells), default=0)
+        merge_max = max((r2 for _, _, r2, _, _ in self._merges), default=0)
+        return max(cell_max, merge_max)
+
+    @property
+    def max_column(self) -> int:
+        cell_max = max((c for _, c in self._cells), default=0)
+        merge_max = max((c2 for _, _, _, c2, _ in self._merges), default=0)
+        width_max = max(self._col_widths, default=0)
+        return max(cell_max, merge_max, width_max)
+
+    def validate_max_column(self, limit: int) -> None:
+        """Raise ``ValueError`` if populated cells, merges, or widths exceed ``limit``."""
+        col_lim = int(limit)
+        if self.max_column > col_lim:
+            raise ValueError(
+                f"worksheet_column_limit_exceeded:{self.title}:{self.max_column}>{col_lim}"
+            )
+
     def set_col_width(self, col: int, width: float) -> None:
         self._col_widths[int(col)] = max(MIN_COL_WIDTH, min(MAX_COL_WIDTH, float(width)))
 
@@ -176,12 +199,23 @@ class Worksheet:
         formula: str | None = None,
         style: int = STYLE_DEFAULT,
     ) -> None:
+        r_idx, c_idx = int(row), int(col)
+        if r_idx < 1 or c_idx < 1:
+            raise ValueError(f"invalid_xlsx_cell_coord:({r_idx},{c_idx})")
+        if value is not None and not isinstance(value, (bool, int, float, str)):
+            raise TypeError(
+                f"non_primitive_xlsx_cell_value:{r_idx}:{c_idx}:{type(value).__name__}"
+            )
         if isinstance(value, float) and not math.isfinite(value):
-            raise ValueError(f"non_finite_xlsx_cell_value:{row}:{col}:{value!r}")
+            raise ValueError(f"non_finite_xlsx_cell_value:{r_idx}:{c_idx}:{value!r}")
         clean_formula = None
         if formula is not None:
+            if not isinstance(formula, str):
+                raise TypeError(
+                    f"non_string_xlsx_formula:{r_idx}:{c_idx}:{type(formula).__name__}"
+                )
             clean_formula = formula[1:] if formula.startswith("=") else formula
-        self._cells[(int(row), int(col))] = _CellRecord(
+        self._cells[(r_idx, c_idx)] = _CellRecord(
             value=value, formula=clean_formula, style=int(style),
         )
 

@@ -27,7 +27,11 @@ from mindie_sim.schema.common import ModelingError
 from .action_plan import ComparisonPlan, build_comparison_plan
 from .agent_brief import build_agent_brief, export_agent_brief
 from .bundle import build_export_bundle, compose_export_case
-from .comparison import align_before_after_operators, build_macro_module_breakdown
+from .comparison import (
+    align_before_after_operators,
+    build_macro_module_breakdown,
+    enrich_comparison_plan_stage_receipts,
+)
 from .models import (
     DEFAULT_SCENARIO_OUTPUT_TOKENS,
     DEFAULT_SCENARIO_PROMPT_TOKENS,
@@ -37,12 +41,15 @@ from .models import (
 )
 from .ooxml import NS_MAIN as NS_MAIN, Workbook
 from .xlsx_breakdown import (
+    CMP_COLS,
+    MEAS_COLS,
+    STD_COLS,
     populate_comparison_breakdown_sheet,
     populate_measured_calibration_sheet,
     populate_standalone_breakdown_sheet,
 )
-from .xlsx_memory import populate_memory_sheet
-from .xlsx_pending import populate_pending_kernel_details_sheet
+from .xlsx_memory import MEMORY_COLS, populate_memory_sheet
+from .xlsx_pending import PENDING_COLS, populate_pending_kernel_details_sheet
 from .xlsx_summary import (
     SHEET_BREAKDOWN,
     SHEET_MEASURED,
@@ -50,6 +57,7 @@ from .xlsx_summary import (
     SHEET_NEW_KERNELS,
     SHEET_PENDING_KERNELS,
     SHEET_SUMMARY,
+    SUMMARY_COLS,
     populate_summary_sheet,
 )
 
@@ -194,32 +202,42 @@ def _populate_workbook_sheets(
         macro_rows=macro_rows, roadmap=plan.roadmap,
         codesign_note=plan.codesign_note, is_script_audit=is_script_audit,
     )
+    ws_summary.validate_max_column(SUMMARY_COLS)
     if compare_bundle is not None:
         s2_receipt = populate_comparison_breakdown_sheet(
             ws_breakdown, bundle, compare_bundle, plan.aligned_rows, plan.group_accounting,
         )
+        ws_breakdown.validate_max_column(CMP_COLS)
     else:
         s2_receipt = populate_standalone_breakdown_sheet(ws_breakdown, bundle)
+        ws_breakdown.validate_max_column(STD_COLS)
     populate_memory_sheet(ws_memory, compare_bundle or bundle)
+    ws_memory.validate_max_column(MEMORY_COLS)
     sheet_names = [SHEET_SUMMARY, SHEET_BREAKDOWN, SHEET_MEMORY]
     merge_counts = {
         SHEET_SUMMARY: len(ws_summary.merged_ranges),
         SHEET_BREAKDOWN: len(ws_breakdown.merged_ranges),
         SHEET_MEMORY: len(ws_memory.merged_ranges),
     }
-    if compare_bundle is not None or plan.pending_items:
+    target_bundle = compare_bundle or bundle
+    if compare_bundle is not None or plan.pending_items or target_bundle.co_design_opportunities:
         ws_pending = wb.create_sheet(SHEET_PENDING_KERNELS)
         populate_pending_kernel_details_sheet(
-            ws_pending, plan.pending_items, compare_bundle or bundle,
+            ws_pending, plan.pending_items, target_bundle,
             is_comparison=(compare_bundle is not None),
             waterfall=(plan.waterfall if compare_bundle is not None else None),
             breakdown_receipt=s2_receipt,
+            before_bundle=bundle,
+            group_accounting=plan.group_accounting,
+            co_design_opportunities=target_bundle.co_design_opportunities,
         )
+        ws_pending.validate_max_column(PENDING_COLS)
         sheet_names.append(SHEET_PENDING_KERNELS)
         merge_counts[SHEET_PENDING_KERNELS] = len(ws_pending.merged_ranges)
     if bundle.reconciliation is not None:
         ws_meas = wb.create_sheet(SHEET_MEASURED)
         populate_measured_calibration_sheet(ws_meas, bundle)
+        ws_meas.validate_max_column(MEAS_COLS)
         sheet_names.append(SHEET_MEASURED)
         merge_counts[SHEET_MEASURED] = len(ws_meas.merged_ranges)
     return sheet_names, merge_counts
@@ -298,6 +316,10 @@ def export_comparison_xlsx(
             )
         plan = build_comparison_plan(
             bundle, compare_bundle, aligned_rows, script_audit=script_audit,
+        )
+    if compare_bundle is not None:
+        plan = enrich_comparison_plan_stage_receipts(
+            plan, bundle, compare_bundle, plan.aligned_rows,
         )
 
     pending_items = plan.pending_items

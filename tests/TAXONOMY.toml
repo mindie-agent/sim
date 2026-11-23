@@ -610,6 +610,21 @@ owns = [
 ]
 
 [[module]]
+path = "product/test_workbook_4sheet_and_formulas.py"
+tier = "tier0"
+owns = [
+  "mindie_sim/export/comparison.py",
+  "mindie_sim/export/ooxml.py",
+  "mindie_sim/export/xlsx_exporter.py",
+  "mindie_sim/export/xlsx_summary.py",
+  "mindie_sim/export/xlsx_breakdown.py",
+  "mindie_sim/export/xlsx_pending.py",
+  "mindie_sim/export/xlsx_memory.py",
+  "mindie_sim/export/memory_ledger.py",
+  "mindie_sim/export/bundle.py",
+]
+
+[[module]]
 path = "product/test_unified_engine_and_codesign.py"
 tier = "tier1"
 owns = [

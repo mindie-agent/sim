@@ -136,7 +136,9 @@ from .models import (
 from .reconcile import load_observation_bundle, reconcile_operators_with_kernels
 
 _RECURRENT_MICRO_PATTERN = re.compile(r"^(.*)\.(recurrent_scan|chunk_kda)(\d+)$")
-_RECOVER_SSM_MICRO_PATTERN = re.compile(r"^(s\d+)\.l\d+\.(recover_ssm_commit\w*)$")
+_RECOVER_SSM_MICRO_PATTERN = re.compile(r"^(?:(s\d+)\.)?l\d+\.(recover_ssm_commit\w*)$")
+_RECOVER_SSM_KERNEL_NAME = "RecoverSSMStateCommit"
+_RECOVER_SSM_ROLE_CLEAN_RE = re.compile(r"\s*\(×\d+\s*layers?\)\s*$")
 _OP_ROW_FIELDS = frozenset(f.name for f in dataclass_fields(OperatorExportRow))
 _BUNDLE_FIELDS = frozenset(f.name for f in dataclass_fields(ExportBundle))
 
@@ -585,6 +587,7 @@ def _collapse_micro_split_ops(
     out_demands: list[tuple[int, int, int, int, int]] = []
     group_pos: dict[tuple[str, str], int] = {}
     group_counts: dict[tuple[str, str], int] = {}
+    group_is_recover: dict[tuple[str, str], bool] = {}
     group_preds: dict[tuple[str, str], list[OpOccurrence]] = {}
     renamed: dict[str, str] = {}
     for row, dem in zip(rows, demands):
@@ -597,13 +600,17 @@ def _collapse_micro_split_ops(
             out_rows.append(row)
             out_demands.append(dem)
             continue
-        collapsed_id = f"{match.group(1)}.{match.group(2)}"
+        collapsed_id = (
+            f"{match.group(1)}.{match.group(2)}"
+            if match.group(1) else str(match.group(2))
+        )
         key = (row.archetype_id, collapsed_id)
         renamed[row.op_id] = collapsed_id
         prev_idx = group_pos.get(key)
         if prev_idx is None:
             group_pos[key] = len(out_rows)
             group_counts[key] = 1
+            group_is_recover[key] = is_recover_ssm
             group_preds[key] = list(row.predecessors)
             out_rows.append(replace(
                 row,
@@ -625,7 +632,7 @@ def _collapse_micro_split_ops(
             base,
             start_us=min(base.start_us, row.start_us), end_us=max(base.end_us, row.end_us),
             dur_us=new_dur, exposed_dur_us=new_exposed,
-            is_overlapped=(new_exposed <= 1e-9 and new_dur > 0.0),
+            is_overlapped=(new_exposed <= OVERLAP_EXPOSED_EPS_US and new_dur > 0.0),
             flops=base.flops + row.flops, vector_ops=base.vector_ops + row.vector_ops,
             hbm_read_bytes=base.hbm_read_bytes + row.hbm_read_bytes,
             hbm_write_bytes=base.hbm_write_bytes + row.hbm_write_bytes,
@@ -638,12 +645,47 @@ def _collapse_micro_split_ops(
         out_demands[prev_idx] = merged_dem  # type: ignore[assignment]
     if renamed:
         for key, pos in group_pos.items():
-            cnt = group_counts.get(key, 1)
+            cnt = max(1, int(group_counts.get(key, 1)))
             row_cur = out_rows[pos]
-            role_txt = row_cur.logical_role
-            if cnt > 1 and "recover_ssm" in row_cur.op_id and "(×" not in role_txt:
-                role_txt = f"{role_txt} (×{cnt} layers)"
-            out_rows[pos] = replace(row_cur, predecessors=tuple(group_preds[key]), logical_role=role_txt)
+            if group_is_recover.get(key, False):
+                inv = 1.0 / float(cnt)
+                per_call_dem = tuple(int(out_demands[pos][k]) // cnt for k in range(CERT_RESOURCE_COUNT))
+                per_call_dur = row_cur.dur_us * inv
+                per_call_exp = row_cur.exposed_dur_us * inv
+                per_call_lstar = float(max(per_call_dem)) / NS_PER_US
+                fully_hidden = per_call_exp <= OVERLAP_EXPOSED_EPS_US and per_call_dur > 0.0
+                eff = (
+                    min(1.0, per_call_lstar / per_call_dur)
+                    if (per_call_dur > 0.0 and per_call_lstar > 0.0) else None
+                )
+                clean_role = _RECOVER_SSM_ROLE_CLEAN_RE.sub("", row_cur.logical_role or "").strip()
+                out_demands[pos] = per_call_dem  # type: ignore[assignment]
+                out_rows[pos] = replace(
+                    row_cur,
+                    repeat_count=cnt,
+                    end_us=row_cur.start_us + per_call_dur,
+                    dur_us=per_call_dur,
+                    exposed_dur_us=0.0 if fully_hidden else per_call_exp,
+                    is_overlapped=fully_hidden,
+                    flops=row_cur.flops * inv,
+                    vector_ops=row_cur.vector_ops * inv,
+                    hbm_read_bytes=row_cur.hbm_read_bytes * inv,
+                    hbm_write_bytes=row_cur.hbm_write_bytes * inv,
+                    hbm_total_bytes=row_cur.hbm_total_bytes * inv,
+                    mte2_bytes=row_cur.mte2_bytes * inv,
+                    mte3_bytes=row_cur.mte3_bytes * inv,
+                    fixpipe_bytes=row_cur.fixpipe_bytes * inv,
+                    link_bytes=row_cur.link_bytes * inv,
+                    l_star_lean_us=per_call_lstar,
+                    gap_us=0.0 if fully_hidden else max(0.0, per_call_dur - per_call_lstar),
+                    gap_ratio=None if fully_hidden else ((per_call_dur / per_call_lstar) if per_call_lstar > 0.0 else None),
+                    roofline_efficiency=eff,
+                    ascend_kernel=_RECOVER_SSM_KERNEL_NAME,
+                    logical_role=clean_role or row_cur.logical_role,
+                    predecessors=tuple(group_preds[key]),
+                )
+            else:
+                out_rows[pos] = replace(row_cur, predecessors=tuple(group_preds[key]))
         out_rows = [
             replace(
                 r,
@@ -1045,10 +1087,59 @@ def _attribute_full_bundle_stream0(
     return out_rows, updated_archs
 
 
+def _is_attnres_op(op_id: str, family: str = "") -> bool:
+    low = f"{op_id} {family}".lower()
+    return any(tok in low for tok in ("attn_res", "attnres", "self_attention_res", "mlp_res"))
+
+
+def format_attnres_depth_note(
+    op_id: str,
+    layer_indices: Sequence[int],
+    durs_us: Sequence[float],
+    block_size: int,
+    *,
+    total_target_layers: int = 0,
+    family: str = "",
+) -> str:
+    """Format exact physical layer depth & ``valid_blocks`` progression note."""
+    low = str(op_id or "").lower()
+    is_attnres = _is_attnres_op(low, family)
+    if is_attnres and block_size > 0 and low.startswith("final."):
+        n_layers = int(total_target_layers) or (max(layer_indices, default=0) + 1)
+        v_final = (n_layers + int(block_size) - 1) // int(block_size)
+        return f"final={n_layers}，valid_blocks={v_final}，Repeats=1"
+    if not layer_indices or not durs_us:
+        return ""
+    pairs = sorted(zip(layer_indices, durs_us), key=lambda kv: kv[0])
+    first_l, first_d = int(pairs[0][0]), float(pairs[0][1])
+    last_l, last_d = int(pairs[-1][0]), float(pairs[-1][1])
+    if is_attnres and block_size > 0:
+        bs = int(block_size)
+        if "mlp" in low or "ffn" in low:
+            v_min = (first_l // bs) + 1
+            v_max = (last_l // bs) + 1
+        else:
+            v_min = (first_l + bs - 1) // bs
+            v_max = (last_l + bs - 1) // bs
+        return (
+            f"L{first_l} -> L{last_l}，随层深 valid_blocks={v_min}..{v_max} 递增: "
+            f"{first_d:.2f} us -> {last_d:.2f} us"
+        )
+    min_d, max_d = min(durs_us), max(durs_us)
+    if min_d > 0.0 and (max_d - min_d) / min_d > DEPTH_VARY_REL_THRESHOLD:
+        return f"L{first_l} -> L{last_l}，随层深递增: {first_d:.2f} us -> {last_d:.2f} us"
+    return ""
+
+
 def _extract_per_layer_timings(
     rows: Sequence[OperatorExportRow],
+    layer_plans: Sequence[Any] = (),
 ) -> dict[tuple[str, int], dict[str, Any]]:
-    """Capture exact native per-layer physical timings for full-depth trace replay."""
+    """Capture exact native per-layer physical timings for trace replay & slice reaggregation."""
+    block_by_layer = {
+        int(lp.index): int(getattr(lp, "residual_block_size", 0) or 0)
+        for lp in layer_plans
+    }
     by_layer: dict[tuple[str, int], list[OperatorExportRow]] = defaultdict(list)
     for row in rows:
         if row.layer is not None and row.layer >= 0 and row.archetype_id != "target_tail":
@@ -1058,11 +1149,123 @@ def _extract_per_layer_timings(
         min_s = min(r.start_us for r in l_rows)
         max_e = max(r.end_us for r in l_rows)
         op_map: dict[str, tuple[float, float]] = {}
+        op_exp_map: dict[str, float] = {}
+        op_lstar_map: dict[str, float] = {}
         for r in l_rows:
             site = strip_op_prefix(r.op_id)
             if site not in op_map:
                 op_map[site] = (max(0.0, r.start_us - min_s), max(0.0, r.dur_us))
-        out[key] = {"span_us": max(0.0, max_e - min_s), "ops": op_map}
+                op_exp_map[site] = 0.0 if r.is_overlapped else max(0.0, r.exposed_dur_us)
+                op_lstar_map[site] = 0.0 if r.is_overlapped else max(0.0, r.l_star_lean_us)
+        out[key] = {
+            "span_us": max(0.0, max_e - min_s),
+            "ops": op_map,
+            "ops_exposed": op_exp_map,
+            "ops_lstar": op_lstar_map,
+            "residual_block_size": block_by_layer.get(key[1], 0) if key[0] == "target" else 0,
+        }
+    return out
+
+
+def _rebuild_synthesized_per_layer_timings(
+    pre_synth: Mapping[tuple[str, int], Mapping[str, Any]],
+    synth_rows: Sequence[OperatorExportRow],
+    archetypes: Sequence[LayerArchetypeSpec],
+    layer_plans: Sequence[Any] = (),
+) -> dict[tuple[str, int], dict[str, Any]]:
+    """Rebuild ``per_layer_timings`` from post-synthesis rows so After traces use After timings."""
+    block_by_layer = {
+        int(lp.index): int(getattr(lp, "residual_block_size", 0) or 0)
+        for lp in layer_plans
+    }
+    rows_by_arch: dict[str, list[OperatorExportRow]] = defaultdict(list)
+    for row in synth_rows:
+        rows_by_arch[row.archetype_id].append(row)
+
+    out: dict[tuple[str, int], dict[str, Any]] = {}
+    for arch in archetypes:
+        if not arch.layer_indices or arch.archetype_id == "target_tail":
+            continue
+        a_rows = rows_by_arch.get(arch.archetype_id, ())
+        if not a_rows:
+            continue
+        distinct_layers = {int(r.layer) for r in a_rows if r.layer is not None}
+        if len(distinct_layers) > 1:
+            sub = _extract_per_layer_timings(a_rows, layer_plans)
+            out.update(sub)
+            continue
+        min_s = min(r.start_us for r in a_rows)
+        max_e = max(r.end_us for r in a_rows)
+        base_span = float(arch.single_span_us) if arch.single_span_us > 0.0 else max(0.0, max_e - min_s)
+        site_pre_durs: dict[str, list[float]] = defaultdict(list)
+        site_pre_exps: dict[str, list[float]] = defaultdict(list)
+        for lyr in arch.layer_indices:
+            rec = pre_synth.get((arch.scope, int(lyr)))
+            if not isinstance(rec, Mapping):
+                continue
+            ops_d = rec.get("ops") or {}
+            exps_d = rec.get("ops_exposed") or {}
+            for r in a_rows:
+                site = strip_op_prefix(r.op_id)
+                if site in ops_d:
+                    site_pre_durs[site].append(float(ops_d[site][1]))
+                    site_pre_exps[site].append(float(exps_d.get(site, ops_d[site][1])))
+        site_mean_pre = {
+            s: (sum(vals) / float(len(vals)))
+            for s, vals in site_pre_durs.items() if vals
+        }
+        site_mean_pre_exp = {
+            s: (sum(vals) / float(len(vals)))
+            for s, vals in site_pre_exps.items() if vals
+        }
+        for lyr in arch.layer_indices:
+            key = (arch.scope, int(lyr))
+            pre_rec = pre_synth.get(key)
+            pre_ops = pre_rec.get("ops", {}) if isinstance(pre_rec, Mapping) else {}
+            pre_exps = pre_rec.get("ops_exposed", {}) if isinstance(pre_rec, Mapping) else {}
+            op_map: dict[str, tuple[float, float]] = {}
+            op_exp_map: dict[str, float] = {}
+            op_lstar_map: dict[str, float] = {}
+            layer_max_end = 0.0
+            for r in a_rows:
+                site = strip_op_prefix(r.op_id)
+                rel_s = max(0.0, r.start_us - min_s)
+                synth_dur = max(0.0, r.dur_us)
+                synth_exp = 0.0 if r.is_overlapped else max(0.0, r.exposed_dur_us)
+                synth_lstar = 0.0 if r.is_overlapped else max(0.0, r.l_star_lean_us)
+                # Preserve depth-varying relative profile while conserving synthesized mean exactly.
+                pre_mean = site_mean_pre.get(site, 0.0)
+                if (
+                    site in pre_ops
+                    and len(site_pre_durs.get(site, ())) == len(arch.layer_indices)
+                    and pre_mean > OVERLAP_EXPOSED_EPS_US
+                ):
+                    pre_d = float(pre_ops[site][1])
+                    d_vals = site_pre_durs[site]
+                    if min(d_vals) > 0.0 and (max(d_vals) - min(d_vals)) / min(d_vals) > DEPTH_VARY_REL_THRESHOLD:
+                        dur_l = synth_dur * (pre_d / pre_mean)
+                        pre_e_mean = site_mean_pre_exp.get(site, 0.0)
+                        exp_l = (
+                            synth_exp * (float(pre_exps.get(site, pre_d)) / pre_e_mean)
+                            if (pre_e_mean > OVERLAP_EXPOSED_EPS_US and not r.is_overlapped)
+                            else synth_exp
+                        )
+                    else:
+                        dur_l, exp_l = synth_dur, synth_exp
+                else:
+                    dur_l, exp_l = synth_dur, synth_exp
+                if site not in op_map:
+                    op_map[site] = (rel_s, dur_l)
+                    op_exp_map[site] = exp_l
+                    op_lstar_map[site] = synth_lstar
+                layer_max_end = max(layer_max_end, rel_s + dur_l)
+            out[key] = {
+                "span_us": max(base_span, layer_max_end) if base_span > 0.0 else layer_max_end,
+                "ops": op_map,
+                "ops_exposed": op_exp_map,
+                "ops_lstar": op_lstar_map,
+                "residual_block_size": block_by_layer.get(int(lyr), 0) if arch.scope == "target" else 0,
+            }
     return out
 
 
@@ -1070,8 +1273,16 @@ def _aggregate_bundle_cohort_rows(
     rows: Sequence[OperatorExportRow],
     demands_ns: Sequence[tuple[int, int, int, int, int]],
     archetypes: Sequence[LayerArchetypeSpec],
+    *,
+    layer_plans: Sequence[Any] = (),
+    total_target_layers: int = 0,
 ) -> tuple[list[OperatorExportRow], list[tuple[int, int, int, int, int]], tuple[LayerArchetypeSpec, ...]]:
     """Fold full-depth native rows into compact cohort rows conserving exact sums."""
+    block_by_layer = {
+        int(lp.index): int(getattr(lp, "residual_block_size", 0) or 0)
+        for lp in layer_plans
+    }
+    default_block = next((b for b in block_by_layer.values() if b > 0), 0)
     groups: OrderedDict[tuple[str, str], list[int]] = OrderedDict()
     for idx, row in enumerate(rows):
         if row.archetype_id.startswith("target_arch_") or row.archetype_id in {"draft_arch_0", "draft_context_kv"}:
@@ -1090,6 +1301,16 @@ def _aggregate_bundle_cohort_rows(
         for i in idxs:
             occ_remap[rows[i].occurrence] = anchor.occurrence
         if cnt == 1:
+            contract = anchor.tensor_contract
+            if _is_attnres_op(anchor.op_id, anchor.family) and default_block > 0 and anchor.op_id.lower().startswith("final."):
+                final_note = format_attnres_depth_note(
+                    anchor.op_id, (), (anchor.dur_us,), default_block,
+                    total_target_layers=total_target_layers or len(layer_plans),
+                    family=anchor.family,
+                )
+                if final_note and final_note not in contract:
+                    contract = f"{contract} | {final_note}" if contract else final_note
+                    anchor = replace(anchor, tensor_contract=contract)
             out_rows.append(anchor)
             out_dems.append(demands_ns[idxs[0]])
             arch_spans[anchor.archetype_id] += anchor.exposed_dur_us
@@ -1101,13 +1322,16 @@ def _aggregate_bundle_cohort_rows(
         mean_dem = tuple(int(round(sum(demands_ns[i][k] for i in idxs) * inv)) for k in range(CERT_RESOURCE_COUNT))
         l_star = float(max(mean_dem)) / NS_PER_US
         eff = min(1.0, l_star / mean_dur) if (mean_dur > 0.0 and l_star > 0.0) else None
-        min_d, max_d = min(durs), max(durs)
         contract = anchor.tensor_contract
-        if min_d > 0.0 and (max_d - min_d) / min_d > DEPTH_VARY_REL_THRESHOLD:
-            lyrs = [rows[i].layer for i in idxs if rows[i].layer is not None]
-            rng = f"L{min(lyrs)}..L{max(lyrs)}" if lyrs else f"×{cnt}"
-            note = f"depth-varying {rng}: {min_d:.2f}..{max_d:.2f} us (mean {mean_dur:.2f} us)"
-            contract = f"{contract} | {note}" if contract else note
+        lyrs = [int(rows[i].layer) for i in idxs if rows[i].layer is not None]
+        bs = block_by_layer.get(lyrs[0], default_block) if lyrs else default_block
+        depth_note = format_attnres_depth_note(
+            anchor.op_id, lyrs, durs, bs,
+            total_target_layers=total_target_layers or len(layer_plans),
+            family=anchor.family,
+        )
+        if depth_note and depth_note not in contract:
+            contract = f"{contract} | {depth_note}" if contract else depth_note
         fully_hidden = mean_dur > OVERLAP_EXPOSED_EPS_US and mean_exp <= OVERLAP_EXPOSED_EPS_US
         out_dems.append(mean_dem)  # type: ignore[arg-type]
         out_rows.append(replace(
@@ -1696,10 +1920,12 @@ def build_export_bundle(
         prepared_work_by_op=prepared_work_by_op, tail_closure=tail_closure,
     )
     prelim_rows, archetypes = _attribute_full_bundle_stream0(prelim_rows, archetypes)
-    per_layer_timings = _extract_per_layer_timings(prelim_rows)
+    per_layer_timings = _extract_per_layer_timings(prelim_rows, parsed.model.layer_plans)
     if use_archetype_dedup:
         prelim_rows, demands_ns, archetypes = _aggregate_bundle_cohort_rows(
             prelim_rows, demands_ns, archetypes,
+            layer_plans=parsed.model.layer_plans,
+            total_target_layers=total_target_layers,
         )
     should_synthesize = True if rewrite_plan is not None else (
         apply_target_envelope if apply_target_envelope is not None
@@ -1723,6 +1949,9 @@ def build_export_bundle(
             step_req=step_req, cluster_conc=cluster_conc, op_spec_by_key=op_spec_by_key,
             peaks_by_stage=peaks_by_stage, ext_plan=ext_plan,
             rebound_primitive_table=rebound_primitive_table, allow_unbound_formula=allow_unbound_formula,
+        )
+        per_layer_timings = _rebuild_synthesized_per_layer_timings(
+            per_layer_timings, prelim_rows, archetypes, parsed.model.layer_plans,
         )
 
     # Display grouping belongs strictly after target synthesis and DAG dependency attribution.

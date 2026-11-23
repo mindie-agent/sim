@@ -1,13 +1,13 @@
 """Sheet 2 (``Layer_Operator_Breakdown``) & conditional ``Measured_msprof_Calibration`` writers.
 
-[Role] Render topological Before-vs-After operator breakdown (columns ``A..AF``
-  including Sheet 4 Waterfall accounting columns ``AB..AF``), standalone
-  breakdown, and conditional 1-to-N ``Measured_msprof_Calibration`` worksheet.
+[Role] Render topological Before-vs-After operator breakdown strictly inside
+  visible columns ``A..AA`` (``CMP_COLS = 27``, zero ``AB..AF`` accounting
+  columns), standalone breakdown (``A..P``), and conditional 1-to-N
+  ``Measured_msprof_Calibration`` worksheet (``A..N``).
 [Invariants] Every independent ``N->1`` fusion renders as ONE contiguous merged
-  After cell with zero ``[↑ 已并入`` split rows; accounting columns ``AB..AF``
-  remain blank on subtotal and grand-total rows so bounded ``SUMIF`` formulas
-  on Sheet 4 never double-count; zero free-text prose overrides; zero guessed
-  ``.py`` source paths.
+  After cell with zero ``[↑ 已并入`` split rows; Sheet 2 populated column index
+  never exceeds ``27`` (``AA``); zero ``Lean 4`` or raw internal track tokens;
+  zero free-text prose overrides; zero guessed ``.py`` source paths.
 [Timeouts & Locks] Single-pass O(Aligned Rows) OOXML cell population; no I/O.
 [Side-Effect Policy] Mutates only caller-provided ``Worksheet`` instances.
 """
@@ -15,9 +15,12 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+import re
 
 from .action_plan import GroupAccounting
+from .comparison import format_public_track_label
 from .models import (
+    BACKEND_TILELANG,
     MIN_DENOM_EPS,
     OVERLAP_EXPOSED_EPS_US,
     US_PER_MS,
@@ -63,8 +66,8 @@ from .xlsx_summary import (
     write_row,
 )
 
-#: Sheet 2 Before-vs-After mode column indices (32 columns A..AF).
-CMP_COLS = 32
+#: Sheet 2 Before-vs-After mode column indices (strictly 27 visible columns A..AA).
+CMP_COLS = 27
 CMP_DATA_START_ROW = 3
 CMP_FREEZE_ROWS = 2
 CMP_FREEZE_COLS = 5
@@ -91,12 +94,6 @@ CMP_COL_BEF_UPT = 24
 CMP_COL_AFT_UPT = 25
 CMP_COL_SAVED_UPT = 26
 CMP_COL_BINDING = 27
-#: Waterfall accounting columns (AB..AF) referenced by Sheet 4 live SUMIF formulas.
-CMP_COL_WF_BUCKET = 28
-CMP_COL_CARD_ID = 29
-CMP_COL_PRE_EDIT_MS = 30
-CMP_COL_CFG_SHARE_MS = 31
-CMP_COL_CFG_SHARE_UPT = 32
 
 CMP_AFTER_MERGE_COLS = (
     CMP_COL_AFT_KERN, CMP_COL_STATUS, CMP_COL_AFT_RAW_US, CMP_COL_AFT_EXP_US,
@@ -139,7 +136,7 @@ MEAS_TOTAL_SUM_COLS = (8, 9, 11, 12)
 CMP_COL_WIDTHS = (
     30.0, 9.0, 22.0, 28.0, 34.0, 32.0, 26.0, 13.0, 13.0, 14.0, 20.0,
     26.0, 28.0, 13.0, 13.0, 14.0, 13.0, 10.0, 20.0, 13.0, 12.0, 38.0, 30.0,
-    15.0, 15.0, 15.0, 26.0, 13.0, 24.0, 16.0, 15.0, 16.0,
+    15.0, 15.0, 15.0, 26.0,
 )
 STD_COL_WIDTHS = (
     30.0, 9.0, 22.0, 28.0, 34.0, 32.0, 26.0, 28.0, 13.0, 13.0,
@@ -148,6 +145,7 @@ STD_COL_WIDTHS = (
 MEAS_COL_WIDTHS = (
     28.0, 22.0, 24.0, 24.0, 24.0, 28.0, 12.0, 14.0, 14.0, 28.0, 14.0, 14.0, 12.0, 20.0,
 )
+_LEGACY_BACKEND_RE = re.compile(r"cannbot[-_]?dsl|cannbot", re.IGNORECASE)
 
 
 @dataclass(frozen=True, slots=True)
@@ -180,9 +178,14 @@ def _stream_masking_badge(op: OperatorExportRow) -> tuple[str, int]:
     return "主计算流 [暴露 100%]", STYLE_TEXT
 
 
+def _sanitize_backend_text(text: str) -> str:
+    return _LEGACY_BACKEND_RE.sub(BACKEND_TILELANG, str(text or ""))
+
+
 def _kernel_with_backend(op: OperatorExportRow) -> str:
-    kern = op.ascend_kernel or op.implementation
-    return f"{kern} [{op.kernel_backend}]" if op.kernel_backend else kern
+    kern = _sanitize_backend_text(op.ascend_kernel or op.implementation)
+    backend = _sanitize_backend_text(op.kernel_backend)
+    return f"{kern} [{backend}]" if backend else kern
 
 
 def _write_cmp_before_sides(
@@ -289,36 +292,12 @@ def _write_cmp_after_cluster(
     ws.set_cell(r_start, CMP_COL_SAVED_MS, before_ms_sum - aft_ms_sum, formula=f"=SUM(J{r_start}:J{r_end})-SUM(P{r_start}:P{r_end})", style=STYLE_FLOAT3)
     ws.set_cell(r_start, CMP_COL_SPEEDUP, spd, formula=f"=IF(SUM(P{r_start}:P{r_end})>0,SUM(J{r_start}:J{r_end})/SUM(P{r_start}:P{r_end}),0)", style=STYLE_RATIO)
     ws.set_cell(r_start, CMP_COL_GAP_MS, max(0.0, aft_ms_sum - lstar_ms_sum), formula=f"=MAX(0,SUM(P{r_start}:P{r_end})-SUM(T{r_start}:T{r_end}))", style=STYLE_FLOAT3)
-    ws.set_cell(r_start, CMP_COL_ACTION, item.action_note, style=STYLE_TEXT_WRAP)
+    ws.set_cell(r_start, CMP_COL_ACTION, _sanitize_backend_text(item.action_note), style=STYLE_TEXT_WRAP)
     ws.set_cell(r_start, CMP_COL_SAVED_UPT, before_upt_sum - aft_upt_sum, formula=f"=SUM(X{r_start}:X{r_end})-SUM(Y{r_start}:Y{r_end})", style=STYLE_FLOAT2)
     if r_end > r_start:
         for col in CMP_CLUSTER_MERGE_COLS:
             ws.merge_range(r_start, col, r_end, col)
     return aft_ms_sum, lstar_ms_sum, aft_upt_sum
-
-
-def _write_accounting_columns(
-    ws: Worksheet, r_start: int, r_end: int, acc: GroupAccounting | None,
-) -> None:
-    """Populate Sheet 2 accounting columns AB..AF for live Sheet 4 Waterfall SUMIFs."""
-    if acc is None:
-        return
-    ws.set_cell(r_start, CMP_COL_WF_BUCKET, acc.bucket, style=STYLE_TEXT)
-    if acc.card_id:
-        for r in range(r_start, r_end + 1):
-            ws.set_cell(r, CMP_COL_CARD_ID, acc.card_id, style=STYLE_MUTED_TEXT)
-    if acc.after_pre_edit_ms is not None:
-        ws.set_cell(r_start, CMP_COL_PRE_EDIT_MS, acc.after_pre_edit_ms, style=STYLE_FLOAT3)
-        cfg_ms_f: str | None = f"=SUM(J{r_start}:J{r_end})-AD{r_start}"
-        cfg_upt_f: str | None = f"=SUM(X{r_start}:X{r_end})-IF({SUM_AFT_NTOK_REF}>0,AD{r_start}*1000/{SUM_AFT_NTOK_REF},0)"
-    elif acc.bucket == "config":
-        cfg_ms_f = f"=Q{r_start}"
-        cfg_upt_f = f"=Z{r_start}"
-    else:
-        cfg_ms_f = None
-        cfg_upt_f = None
-    ws.set_cell(r_start, CMP_COL_CFG_SHARE_MS, acc.config_share_ms, formula=cfg_ms_f, style=STYLE_FLOAT3)
-    ws.set_cell(r_start, CMP_COL_CFG_SHARE_UPT, acc.config_share_upt, formula=cfg_upt_f, style=STYLE_FLOAT2)
 
 
 def _write_comparison_group(
@@ -342,7 +321,6 @@ def _write_comparison_group(
         aft_ms, lstar_ms, aft_upt = _write_cmp_after_cluster(
             ws, r_start, r_end, item, rep, before_ms_sum, before_upt_sum, a_ntok, a_rep=a_rep,
         )
-        _write_accounting_columns(ws, r_start, r_end, acc)
         return before_ms_sum, aft_ms, lstar_ms, before_upt_sum, aft_upt
 
     a_primary = item.after_ops[0] if item.after_ops else None
@@ -373,7 +351,7 @@ def _write_comparison_group(
             (a_primary.bound_display, None, STYLE_OVERLAP if a_primary.is_overlapped else STYLE_TEXT),
             (lstar_ms, None, STYLE_FLOAT3),
             (gap_ms, f"=MAX(0,P{r_start}-T{r_start})", STYLE_FLOAT3),
-            (item.action_note, None, STYLE_TEXT_WRAP),
+            (_sanitize_backend_text(item.action_note), None, STYLE_TEXT_WRAP),
         ), start_col=CMP_COL_AFT_KERN)
         ws.set_cell(r_start, CMP_COL_AFT_UPT, aft_upt, formula=f"=IF({SUM_AFT_NTOK_REF}>0,P{r_start}*1000/{SUM_AFT_NTOK_REF},0)", style=STYLE_FLOAT2)
         ws.set_cell(r_start, CMP_COL_SAVED_UPT, before_upt_sum - aft_upt, formula=f"=SUM(X{r_start}:X{r_end})-Y{r_start}", style=STYLE_FLOAT2)
@@ -386,7 +364,7 @@ def _write_comparison_group(
             (0.0, "=0", STYLE_FLOAT3), (before_ms_sum, f"=SUM(J{r_start}:J{r_end})-P{r_start}", STYLE_FLOAT3),
             (0.0, f"=IF(P{r_start}>0,SUM(J{r_start}:J{r_end})/P{r_start},0)", STYLE_RATIO),
             ("已移除", None, STYLE_OVERLAP), (0.0, None, STYLE_FLOAT3),
-            (0.0, f"=MAX(0,P{r_start}-T{r_start})", STYLE_FLOAT3), (item.action_note, None, STYLE_TEXT_WRAP),
+            (0.0, f"=MAX(0,P{r_start}-T{r_start})", STYLE_FLOAT3), (_sanitize_backend_text(item.action_note), None, STYLE_TEXT_WRAP),
         ), start_col=CMP_COL_AFT_KERN)
         ws.set_cell(r_start, CMP_COL_AFT_UPT, 0.0, formula="=0", style=STYLE_FLOAT2)
         ws.set_cell(r_start, CMP_COL_SAVED_UPT, before_upt_sum, formula=f"=SUM(X{r_start}:X{r_end})-Y{r_start}", style=STYLE_FLOAT2)
@@ -395,7 +373,6 @@ def _write_comparison_group(
     if r_end > r_start:
         for col in CMP_AFTER_MERGE_COLS:
             ws.merge_range(r_start, col, r_end, col)
-    _write_accounting_columns(ws, r_start, r_end, acc)
     return before_ms_sum, aft_ms, lstar_ms, before_upt_sum, aft_upt
 
 
@@ -421,7 +398,6 @@ def _write_comparison_subtotal_row(
     ws.set_cell(r_sub, CMP_COL_AFT_UPT, aft_upt, formula=f"=SUM(Y{r_start}:Y{r_end})", style=STYLE_SUBTOTAL_NUM)
     ws.set_cell(r_sub, CMP_COL_SAVED_UPT, bef_upt - aft_upt, formula=f"=X{r_sub}-Y{r_sub}", style=STYLE_SUBTOTAL_NUM)
     ws.set_cell(r_sub, CMP_COL_BINDING, "", style=STYLE_SUBTOTAL_TEXT)
-    # Columns AB..AF intentionally left blank on subtotal rows for bounded SUMIF isolation.
 
 
 def _write_comparison_grand_total(
@@ -452,7 +428,6 @@ def _write_comparison_grand_total(
     ws.set_cell(tot_row, CMP_COL_AFT_UPT, tot_aft_upt, formula=sum_y, style=STYLE_TOTAL_NUM)
     ws.set_cell(tot_row, CMP_COL_SAVED_UPT, tot_bef_upt - tot_aft_upt, formula=f"=X{tot_row}-Y{tot_row}", style=STYLE_TOTAL_NUM)
     ws.set_cell(tot_row, CMP_COL_BINDING, "= 10^6 / Single-Die TPS", style=STYLE_TOTAL_TEXT)
-    # Columns AB..AF intentionally left blank on grand-total row.
 
 
 def populate_comparison_breakdown_sheet(
@@ -462,13 +437,15 @@ def populate_comparison_breakdown_sheet(
     aligned_rows: Sequence[AlignedComparisonRow],
     group_accounting: Sequence[GroupAccounting] = (),
 ) -> BreakdownSheetReceipt:
-    """Populate Sheet 2 in comparison mode with accounting columns AB..AF."""
+    """Populate Sheet 2 in comparison mode strictly within visible columns ``A:AA``."""
     apply_col_widths(ws, CMP_COL_WIDTHS)
     ws.freeze_panes(CMP_FREEZE_ROWS, CMP_FREEZE_COLS)
+    b_track_lbl = format_public_track_label(before_bundle, role="before")
+    a_track_lbl = format_public_track_label(after_bundle, role="after")
     write_banner(
         ws, 1, CMP_COLS,
         (
-            f"Before ({before_bundle.feature_track or 'baseline'}) vs After ({after_bundle.feature_track or 'candidate'}) "
+            f"Before ({b_track_lbl}) vs After ({a_track_lbl}) "
             f"Topological Operator Breakdown | {before_bundle.model_name} @ {before_bundle.hardware_sku} ({before_bundle.phase.upper()})"
         ),
         STYLE_TITLE,
@@ -482,12 +459,10 @@ def populate_comparison_breakdown_sheet(
         "After Ascend Kernel [Backend]", "分类 / 算子状态 (Category / Status)",
         "After 流内单次 (us)", "After 单次暴露 (us)", "After 全网暴露 (ms)",
         "暴露净省 Δ (ms)", "Speedup", "After Bound",
-        "Lean L* Model (ms)", "Gap vs L* (ms)",
+        "物理下界 L* (ms)", "Gap vs L* (ms)",
         "物理收据与变化说明 (Receipt Summary)", "源码出处 / Source Ref",
         "Before 摊薄耗时 (us/tok·die)", "After 摊薄耗时 (us/tok·die)",
         "摊薄净省 Δ (us/tok·die)", "绑定状态 (Binding State)",
-        "Waterfall Bucket", "Card Group ID", "After Pre-Edit (ms)",
-        "Config Share Δ (ms)", "Config Share Δ (us/tok·die)",
     )
     write_headers(ws, 2, headers)
 
@@ -548,6 +523,7 @@ def populate_comparison_breakdown_sheet(
     _write_comparison_grand_total(
         ws, row_cursor, subtotal_rows, tot_bef_ms, tot_aft_ms, tot_lstar_ms, tot_bef_upt, tot_aft_upt,
     )
+    ws.validate_max_column(CMP_COLS)
     return BreakdownSheetReceipt(
         row_spans=row_spans,
         last_detail_row=last_detail_row,
@@ -572,7 +548,7 @@ def populate_standalone_breakdown_sheet(
         "Rank-Local Shapes & Dtype", "Ascend Kernel [Backend]",
         "Kernel Status (算子状态)",
         "流内单次 (us)", "单次暴露 (us)", "全网暴露 (ms)",
-        "Lean L* Single (us)", "Lean L* Model (ms)", "Gap vs L* (ms)",
+        "物理下界 L* 单次 (us)", "物理下界 L* 全网 (ms)", "Gap vs L* (ms)",
         "Bottleneck Bound", "源码出处 / Source Ref",
     )
     write_headers(ws, 2, headers)
@@ -653,6 +629,7 @@ def populate_standalone_breakdown_sheet(
     ws.set_cell(row_cursor, STD_COL_GAP_MS, max(0.0, tot_ms - tot_lstar_ms), formula=f"=MAX(0,K{row_cursor}-M{row_cursor})", style=STYLE_TOTAL_FLOAT3)
     ws.set_cell(row_cursor, STD_COL_BOUND, f"{len(bundle.operators)} archetype ops", style=STYLE_TOTAL_TEXT)
     ws.merge_range(row_cursor, STD_COL_BOUND, row_cursor, STD_COL_SOURCE_REF)
+    ws.validate_max_column(STD_COLS)
     return BreakdownSheetReceipt(
         row_spans=row_spans,
         last_detail_row=last_detail_row,
@@ -726,18 +703,20 @@ def populate_measured_calibration_sheet(ws: Worksheet, bundle: ExportBundle) -> 
     sim_tot = sum(op.dur_us for op in bundle.operators if op.measured_sum_us is not None)
     agg_ape = (abs(sim_tot - meas_tot) / meas_tot) if meas_tot > 0.0 else 0.0
     ws.set_cell(tot_row, MEAS_COL_APE, agg_ape, formula=f"=IF(L{tot_row}>0,ABS(I{tot_row}-L{tot_row})/L{tot_row},0)", style=STYLE_TOTAL_PCT)
+    ws.validate_max_column(MEAS_COLS)
 
 
 __all__ = [
+    "CMP_COLS",
     "CMP_COL_AFT_EXP_MS",
+    "CMP_COL_AFT_UPT",
     "CMP_COL_BEF_EXP_MS",
-    "CMP_COL_CARD_ID",
-    "CMP_COL_CFG_SHARE_MS",
-    "CMP_COL_CFG_SHARE_UPT",
+    "CMP_COL_BEF_UPT",
     "CMP_COL_SAVED_MS",
     "CMP_COL_SAVED_UPT",
-    "CMP_COL_WF_BUCKET",
     "CMP_DATA_START_ROW",
+    "MEAS_COLS",
+    "STD_COLS",
     "STD_COL_EXP_MS",
     "STD_COL_LSTAR_MS",
     "BreakdownSheetReceipt",
