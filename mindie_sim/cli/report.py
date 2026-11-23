@@ -44,9 +44,10 @@ from mindie_sim.compose.inputs import (
 )
 from mindie_sim.export import (
     AGENT_BRIEF_SCHEMA, DEFAULT_SCENARIO_OUTPUT_TOKENS, DEFAULT_TPOT_SLO_MS,
-    MODE_MODELING, MODE_SIMULATION, build_export_bundle,
-    compose_export_case, export_agent_brief, export_comparison_xlsx, export_msprof_trace,
-    format_executive_digest_markdown,
+    DEPLOYMENT_MODE_LABELS, MODE_MODELING, MODE_SIMULATION, US_PER_MS,
+    build_export_bundle, compose_export_case, export_agent_brief,
+    export_comparison_xlsx, export_msprof_trace, format_executive_digest_markdown,
+    project_two_step_gain, sanitize_public_text,
 )
 from mindie_sim.prediction.frontend.speculation import compute_speculative_accept_step
 from mindie_sim.prediction.results import ReplayOptions, StepRequest
@@ -63,7 +64,9 @@ DEFAULT_REPORT_PROMPT_TOKENS = 32768
 AUTO_SIZING_WEIGHT_FRACTION = 0.65
 DEFAULT_FALLBACK_MEM_GIB = 64
 DEFAULT_FALLBACK_TP_CAP = 8
-FALLBACK_TPOT_SENTINEL_MS = 1e9
+STEP_MS_ROUND_DIGITS = 3
+TPS_ROUND_DIGITS = 2
+SPEEDUP_ROUND_DIGITS = 2
 TOKEN_SHORTHAND_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([kKmM]?)\s*$")
 TOKEN_MULTIPLIERS = {"": 1, "k": 1024, "m": 1024 * 1024}
 SAFE_PREFIX_RE = re.compile(r"[^A-Za-z0-9._-]+")
@@ -288,6 +291,52 @@ def _estimate_auto_num_devices(model_spec: Any, sku: str, weight_quant: str | No
     return count
 
 
+def _extract_infeasible_details(
+    solved: Mapping[str, Any],
+    *,
+    deployment_mode: str,
+    requested_concurrency: int | None,
+) -> dict[str, Any]:
+    """Extract honest infeasible outcome & limiting constraint without fabricating B=1."""
+    outcome = solved.get("outcome") if isinstance(solved.get("outcome"), Mapping) else {}
+    raw_cands = [c for c in (solved.get("candidates") or ()) if isinstance(c, Mapping)]
+    max_b_vram = max(
+        (int(c.get("b_vram_max") or c.get("b_vram") or 0) for c in raw_cands),
+        default=0,
+    )
+    if isinstance(outcome.get("physical_b_vram_max"), int) and not isinstance(outcome.get("physical_b_vram_max"), bool):
+        max_b_vram = max(max_b_vram, int(outcome["physical_b_vram_max"]))
+    reason = ""
+    for candidate_val in (
+        outcome.get("limiting_constraint"),
+        solved.get("limiting_constraint"),
+        solved.get("infeasible_reason"),
+    ):
+        if isinstance(candidate_val, str) and candidate_val.strip():
+            reason = sanitize_public_text(candidate_val)
+            break
+    if not reason:
+        for cand in raw_cands:
+            for key in ("limiting_constraint", "infeasible_reason", "infeasible", "dcp_codomain_reason"):
+                val = cand.get(key)
+                if isinstance(val, str) and val.strip():
+                    reason = sanitize_public_text(val)
+                    break
+            if reason:
+                break
+    if not reason:
+        reason = "hbm_capacity_oom" if max_b_vram <= 0 else "sla_latency_bound"
+    status = sanitize_public_text(outcome.get("status") or "infeasible") or "infeasible"
+    return {
+        "status": status,
+        "deployment_mode": deployment_mode,
+        "limiting_constraint": reason,
+        "physical_b_vram_max": int(max_b_vram),
+        "feasible_b_per_dp": 0,
+        "requested_concurrency": (int(requested_concurrency) if requested_concurrency is not None else None),
+    }
+
+
 def _auto_solve_report_layout(
     *, model: str, sku: str, topology_preset: str | None, num_devices: int,
     prompt_tokens: int, output_tokens: int, tpot_slo_ms: float, ttft_slo_ms: float | None,
@@ -329,28 +378,31 @@ def _auto_solve_report_layout(
     if max_sequences_per_dp is not None:
         solve_kw["max_sequences_per_dp"] = int(max_sequences_per_dp)
     solved = solve_optimal_deployment(model, sku, **solve_kw)
-    best = solved.get("best_configuration")
-    if best is None:
-        cands = [c for c in solved.get("candidates", ()) if isinstance(c, Mapping) and int(c.get("b_vram_max") or c.get("b_vram") or 0) >= 1]
-        if cands:
-            best = max(cands, key=lambda c: (int(c.get("b_vram_max") or c.get("b_vram") or 0), -float(c.get("effective_tpot_ms", FALLBACK_TPOT_SENTINEL_MS) or FALLBACK_TPOT_SENTINEL_MS)))
-    best = best or {}
+    is_feasible = bool(solved.get("feasible", False)) and isinstance(solved.get("best_configuration"), Mapping)
+    best = dict(solved["best_configuration"]) if is_feasible else {}
+    infeasible_outcome = (
+        None if is_feasible else _extract_infeasible_details(
+            solved, deployment_mode=validated_mode, requested_concurrency=max_sequences_per_dp,
+        )
+    )
     par = best.get("prefill_parallel" if phase == "prefill" else "decode_parallel") or best.get("parallel") or {}
     return {
         "dp": int(par.get("dp", 1) or 1), "tp": int(par.get("tp", min(num_devices, DEFAULT_FALLBACK_TP_CAP)) or 1),
         "ep": int(par.get("ep", par.get("dp", 1) * par.get("tp", 1)) or 1),
         "pp": int(par.get("pp", 1) or 1), "dcp": int(par.get("cp", par.get("dcp", 1)) or 1), "pcp": int(par.get("pcp", 1) or 1),
-        "concurrency": max(1, int(best.get("b_feasible") or best.get("b_vram_max") or best.get("b_vram") or 1)),
+        "concurrency": (max(1, int(best.get("b_feasible") or 1)) if is_feasible else 0),
         "spec_tokens": int(best.get("mtp_proposal_tokens", 0) or 0),
         "deployment_mode": validated_mode,
-        "solver_feasible": bool(solved.get("feasible", False)), "solved": solved,
+        "solver_feasible": is_feasible,
+        "infeasible_outcome": infeasible_outcome,
+        "solved": solved,
     }
 
 
 def _solved_column_inputs(
     layout: Mapping[str, Any], *, model: str, sku: str, runtime_stack: str | None,
     feature_track: str, phase: str, prompt_tokens: int, output_tokens: int,
-    concurrency: int | None, compose_kw: Mapping[str, Any], deployment_mode: str,
+    compose_kw: Mapping[str, Any], deployment_mode: str,
 ) -> tuple[dict[str, Any], StepRequest, dict[str, Any]]:
     from mindie_sim.solve import _bundle_inputs_for_solution
 
@@ -359,8 +411,6 @@ def _solved_column_inputs(
         base_kw=compose_kw, feature_track=feature_track,
         prompt_tokens=prompt_tokens, output_tokens=output_tokens, scope="model", phase=phase,
     )
-    if concurrency is not None:
-        step = dc_replace(step, sequences=int(concurrency))
     rt = dict(raw.get("runtime") or {})
     rt["metadata"] = {**dict(rt.get("metadata") or {}), "deployment_mode": deployment_mode}
     raw["runtime"] = rt
@@ -374,7 +424,7 @@ def _solved_column_inputs(
 def _report_column(
     layout: Mapping[str, Any] | None, *, model: str, sku: str, phase: str, track: str,
     quant: str | None, kv: str | None, idx_kv: str | None, par: Mapping[str, int],
-    conc: int, concurrency: int | None, common_kw: Mapping[str, Any],
+    conc: int, common_kw: Mapping[str, Any],
     spec_tokens: int | None = None, accept_len: float | None = None,
 ) -> tuple[dict[str, Any], StepRequest, dict[str, Any]]:
     prompt_tokens, output_tokens = int(common_kw["prompt_tokens"]), int(common_kw["output_tokens"])
@@ -385,11 +435,13 @@ def _report_column(
             quant=quant, kv_cache_dtype=kv, indexer_kv_dtype=idx_kv,
             topology_preset=common_kw.get("topology_preset"),
             prompt_tokens=prompt_tokens, output_tokens=output_tokens,
+            tpot_slo_ms=common_kw.get("tpot_slo_ms"),
+            ttft_slo_ms=common_kw.get("ttft_slo_ms"),
         )
         raw, step, meta = _solved_column_inputs(
             layout, model=model, sku=sku, runtime_stack=runtime_stack,
             feature_track=track, phase=phase, prompt_tokens=prompt_tokens,
-            output_tokens=output_tokens, concurrency=concurrency,
+            output_tokens=output_tokens,
             compose_kw=compose_kw, deployment_mode=dep_mode,
         )
         return raw, step, {
@@ -510,6 +562,43 @@ def add_report_commands(subparsers) -> None:
     qs.add_argument("--output", "-o", default=None)
 
 
+def _enrich_two_step_gain(
+    audit_dict: dict[str, Any],
+    *,
+    before_bundle: Any,
+    tuned_bundle: Any | None,
+    after_bundle: Any,
+) -> dict[str, Any]:
+    two_step = dict(audit_dict.get("two_step_gain") or {})
+    orig_fits = bool(before_bundle.memory_ledger.fits_hbm)
+    b_step = float(before_bundle.step_span_us) / US_PER_MS
+    a_step = float(after_bundle.step_span_us) / US_PER_MS
+    t_step = (float(tuned_bundle.step_span_us) / US_PER_MS) if tuned_bundle is not None else None
+    a_acc = max(1.0, float(after_bundle.avg_accepted_tokens))
+    a_tpot = (
+        (a_step / a_acc) + float(getattr(after_bundle, "handoff_tpot_ms", 0.0) or 0.0)
+        if after_bundle.phase == "decode" else a_step
+    )
+    two_step["step2_deep_kernel_and_framework"] = {
+        "label": "Step 2: Deep Kernel & Framework Optimization",
+        "original_fits_hbm": orig_fits,
+        "before_step_ms": round(b_step, STEP_MS_ROUND_DIGITS),
+        "after_step_ms": round(a_step, STEP_MS_ROUND_DIGITS),
+        "saved_ms": (round(b_step - a_step, STEP_MS_ROUND_DIGITS) if orig_fits else None),
+        "saved_from_tuned_ms": (
+            round(t_step - a_step, STEP_MS_ROUND_DIGITS)
+            if (t_step is not None and t_step > 0.0) else None
+        ),
+        "after_effective_tpot_ms": round(a_tpot, STEP_MS_ROUND_DIGITS),
+        "after_single_die_tps": round(float(after_bundle.throughput_per_die_tokens_per_s), TPS_ROUND_DIGITS),
+        "speedup_vs_original": (
+            round(b_step / a_step, SPEEDUP_ROUND_DIGITS) if (orig_fits and a_step > 0.0) else None
+        ),
+    }
+    audit_dict["two_step_gain"] = project_two_step_gain(two_step)
+    return audit_dict
+
+
 def _emit_report_artifacts(
     *, before_bundle: Any, after_bundle: Any, tuned_bundle: Any | None,
     args: argparse.Namespace, script_info: Mapping[str, Any] | None,
@@ -534,6 +623,9 @@ def _emit_report_artifacts(
         generated["optimized_serve_sh"] = str(opt_sh_path)
         audit_dict = dict(codec.audit_launch_config(ingress, before_facts, tuned_facts))
         audit_dict["optimized_script_path"] = str(opt_sh_path)
+        audit_dict = _enrich_two_step_gain(
+            audit_dict, before_bundle=before_bundle, tuned_bundle=tuned_bundle, after_bundle=after_bundle,
+        )
 
     if not getattr(args, "no_xlsx", False):
         xlsx_path = out_dir / f"{prefix}_comparison.xlsx"
@@ -633,17 +725,20 @@ def _solve_report_columns(
             rewrite_plan=rewrite_plan if has_target_after else None, allow_unbound_formula=(mode == MODE_MODELING),
         )
         after_par = {k: layout_after[k] for k in _PARALLEL_AXES}
-        conc = int(args.concurrency or layout_after["concurrency"])
+        conc = int(layout_after["concurrency"])
         after_spec = int(explicit_spec if explicit_spec is not None else layout_after["spec_tokens"])
 
-        if script_info:
+        if not layout_after["solver_feasible"]:
+            before_par, before_conc, before_spec = dict(after_par), 0, after_spec
+            tuned_par, tuned_conc = dict(after_par), 0
+        elif script_info:
             layout_tuned = _auto_solve_report_layout(
                 **common_solve, quant=after_quant, kv_cache_dtype=after_kv, indexer_kv_dtype=after_idx_kv,
                 feature_track="merged", apply_target_envelope=False, rewrite_plan=None, allow_unbound_formula=False,
             )
-            tuned_par, tuned_conc = {k: layout_tuned[k] for k in _PARALLEL_AXES}, int(args.concurrency or layout_tuned["concurrency"])
+            tuned_par, tuned_conc = {k: layout_tuned[k] for k in _PARALLEL_AXES}, int(layout_tuned["concurrency"])
             before_par = dict(dp=script_info["dp"], tp=script_info["tp"], ep=script_info["ep"], pp=script_info["pp"], dcp=script_info["dcp"], pcp=script_info["pcp"])
-            before_conc = int(script_info.get("concurrency") or tuned_conc)
+            before_conc = int(script_info.get("concurrency") or max(1, tuned_conc))
             before_spec = int(script_info["spec_tokens"] if script_info.get("spec_tokens") is not None else (explicit_spec or 0))
         elif has_target_after or (before_track, before_quant, before_kv) != (after_track, after_quant, after_kv):
             layout_before = _auto_solve_report_layout(
@@ -651,7 +746,7 @@ def _solve_report_columns(
                 feature_track=before_track, apply_target_envelope=False, rewrite_plan=None, allow_unbound_formula=False,
             )
             before_par = {k: layout_before[k] for k in _PARALLEL_AXES}
-            before_conc = int(args.concurrency or layout_before["concurrency"])
+            before_conc = int(layout_before["concurrency"])
             before_spec = int(explicit_spec if explicit_spec is not None else layout_before["spec_tokens"])
             tuned_par, tuned_conc = dict(before_par), before_conc
         else:
@@ -664,6 +759,84 @@ def _solve_report_columns(
         "after_par": after_par, "conc": conc, "after_spec": after_spec,
         "explicit_accept": explicit_accept, "has_target_after": has_target_after,
     }
+
+
+def _build_infeasible_report_result(
+    *,
+    args: argparse.Namespace,
+    policy: Mapping[str, Any],
+    cols: Mapping[str, Any],
+    dep_mode: str,
+    eff_phase: str,
+    eff_ttft: float | None,
+    mode: str,
+    resolved_stack_id: str,
+    prompt_tokens: int,
+    output_tokens: int,
+) -> dict[str, Any]:
+    """Emit honest infeasible ``agent_brief.json``, digest, and receipt (zero fake B=1)."""
+    infeasible = dict(cols["layout_after"]["infeasible_outcome"] or {
+        "status": "infeasible",
+        "deployment_mode": dep_mode,
+        "limiting_constraint": "no_feasible_configuration",
+        "physical_b_vram_max": 0,
+        "feasible_b_per_dp": 0,
+        "requested_concurrency": (int(args.concurrency) if args.concurrency is not None else None),
+    })
+    out_dir = Path(args.out_dir).expanduser().resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    model_name = str(policy["model_spec"].name)
+    sku = str(policy["sku"])
+    raw_prefix = args.prefix or f"{model_name}_{sku}_{eff_phase}"
+    prefix = SAFE_PREFIX_RE.sub("_", raw_prefix).strip("_") or "mindie_sim_report"
+    brief_path = out_dir / f"{prefix}_agent_brief.json"
+    raw_brief: dict[str, Any] = {
+        "schema": AGENT_BRIEF_SCHEMA,
+        "scenario_and_parallelism": {
+            "model": model_name,
+            "hardware_sku": sku,
+            "topology_preset": str(args.topology_preset or policy.get("topology_preset") or ""),
+            "phase": eff_phase,
+            "deployment_mode": DEPLOYMENT_MODE_LABELS.get(dep_mode, dep_mode),
+            "prompt_tokens": int(prompt_tokens),
+            "output_tokens": int(output_tokens),
+            "tpot_slo_ms": float(args.tpot_ms),
+            "ttft_slo_ms": eff_ttft,
+            "concurrency_per_dp": 0,
+            "cluster_concurrency": 0,
+            "physical_b_vram_max": int(infeasible["physical_b_vram_max"]),
+            "requested_concurrency": infeasible.get("requested_concurrency"),
+            "limiting_constraint": infeasible["limiting_constraint"],
+            "outcome_status": infeasible["status"],
+            "fits_hbm": bool(infeasible["physical_b_vram_max"] > 0),
+        },
+        "infeasible_outcome": infeasible,
+        "generated_files": {"agent_brief_json": str(brief_path)},
+    }
+    export_agent_brief(raw_brief, brief_path)
+    projected_brief = json.loads(brief_path.read_text(encoding="utf-8"))
+    digest_md = format_executive_digest_markdown(projected_brief)
+    receipt: dict[str, Any] = {
+        "ok": True,
+        "feasible": False,
+        "status": infeasible["status"],
+        "limiting_constraint": infeasible["limiting_constraint"],
+        "physical_b_vram_max": int(infeasible["physical_b_vram_max"]),
+        "feasible_b_per_dp": 0,
+        "requested_concurrency": infeasible.get("requested_concurrency"),
+        "command": "report",
+        "mode": mode,
+        "stack_id": resolved_stack_id,
+        "deployment_mode": dep_mode,
+        "ttft_slo_ms": eff_ttft,
+        "model_name": model_name,
+        "hardware_sku": sku,
+        "phase": eff_phase,
+        "agent_brief": projected_brief,
+    }
+    if not getattr(args, "emit_json", False):
+        receipt["_stdout_markdown"] = digest_md
+    return receipt
 
 
 def run_report_command(args: argparse.Namespace, *, load_designs: Any) -> dict[str, Any]:
@@ -725,6 +898,13 @@ def run_report_command(args: argparse.Namespace, *, load_designs: Any) -> dict[s
         before_quant=before_quant, before_kv=before_kv,
         after_quant=after_quant, after_kv=after_kv, after_idx_kv=after_idx_kv,
     )
+    if cols["layout_after"] is not None and not cols["layout_after"]["solver_feasible"]:
+        return _build_infeasible_report_result(
+            args=args, policy=policy, cols=cols, dep_mode=dep_mode,
+            eff_phase=eff_phase, eff_ttft=eff_ttft, mode=mode,
+            resolved_stack_id=resolved_stack_id,
+            prompt_tokens=prompt_tokens, output_tokens=output_tokens,
+        )
     replay = ReplayOptions(include_submission=bool(getattr(args, "include_submission", False)))
     common_kw = dict(
         topology_preset=topo_preset, prompt_tokens=prompt_tokens, output_tokens=output_tokens,
@@ -734,7 +914,7 @@ def run_report_command(args: argparse.Namespace, *, load_designs: Any) -> dict[s
         engram_cpu_offload=args.engram_offload, deployment_mode=dep_mode,
         runtime_stack=stack_arg,
     )
-    column_kw = dict(model=model_arg, sku=policy["sku"], phase=eff_phase, common_kw=common_kw, concurrency=args.concurrency)
+    column_kw = dict(model=model_arg, sku=policy["sku"], phase=eff_phase, common_kw=common_kw)
     raw_before, step_b, meta_b = _report_column(
         cols["layout_before"], track=before_track, quant=before_quant, kv=before_kv,
         idx_kv=policy["indexer_kv_dtype"], par=cols["before_par"], conc=cols["before_conc"],
@@ -785,11 +965,13 @@ def run_report_command(args: argparse.Namespace, *, load_designs: Any) -> dict[s
         args=args, script_info=script_info, dep_mode=dep_mode, load_designs=load_designs,
     )
     receipt: dict[str, Any] = {
-        "ok": True, "command": "report", "mode": mode, "stack_id": resolved_stack_id,
+        "ok": True, "feasible": True, "command": "report", "mode": mode, "stack_id": resolved_stack_id,
         "deployment_mode": dep_mode, "ttft_slo_ms": after_bundle.ttft_slo_ms,
         "model_name": after_bundle.model_name, "hardware_sku": after_bundle.hardware_sku,
         "phase": after_bundle.phase, "agent_brief": brief_dict, **summary,
     }
+    if args.concurrency is not None:
+        receipt["requested_concurrency"] = int(args.concurrency)
     if not getattr(args, "emit_json", False):
         receipt["_stdout_markdown"] = digest_md
     return receipt

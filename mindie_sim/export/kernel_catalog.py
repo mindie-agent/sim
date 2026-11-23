@@ -33,8 +33,11 @@ from mindie_sim.structure_implementations import _lookup_registry_spec, native_i
 from .models import (
     ATTN_4D_RANK,
     ATTN_5D_RANK,
+    BACKEND_ASCENDC,
     BACKEND_CANN,
+    BACKEND_CATLASS,
     BACKEND_HCCL_MC2,
+    BACKEND_TILELANG,
     BACKEND_TORCH_NPU,
     BACKEND_TRITON,
     BANNED_IMPLEMENTATION_NAMES,
@@ -62,7 +65,6 @@ from .models import (
     MACRO_MOD_VERIFY_HEAD,
     MACRO_MOD_VISION,
     MATRIX_2D_RANK,
-    STRUCTURE_BACKEND_MAP,
     STRUCTURE_READINESS_MAP,
     SUB_ATTN_RES,
     SUB_DENSE_FFN,
@@ -82,6 +84,7 @@ from .models import (
     AscendKernelDescriptor,
     OperatorExportRow,
 )
+from .public_view import normalize_public_backend, sanitize_source_ref
 
 _LAYER_PATTERN = re.compile(r"(?:^|\.)l(\d+)(?:\.|$)")
 _CONTEXT_KV_PATTERN = re.compile(r"context_kv(\d+)(?:\.|$)")
@@ -412,7 +415,7 @@ def _is_moe_router_dispatch_op(suffix: str, fam: str, rec: str) -> bool:
 
 
 def _is_moe_routed_op(suffix: str, fam: str, rec: str) -> bool:
-    if fam == "grouped_gemm":
+    if fam in {"grouped_gemm", "grouped_moe"}:
         return True
     if suffix in {
         "expert_up", "expert_act", "expert_down", "expert_down.quantize",
@@ -421,7 +424,7 @@ def _is_moe_routed_op(suffix: str, fam: str, rec: str) -> bool:
         return True
     return any(tok in rec for tok in (
         "grouped_gate_up", "grouped_down", "grouped_situ",
-        "grouped_swiglu", "megamoe", "expert_add", "route_unpack",
+        "grouped_swiglu", "megamoe", "dispatch_ffn_combine", "expert_add", "route_unpack",
     ))
 
 
@@ -747,14 +750,80 @@ def _format_source_record(raw: Any) -> str:
     return f"{repo}/{rel}" if (repo and not rel.startswith(f"{repo}/")) else rel
 
 
+_GEMM_SYNTH_FAMILIES = frozenset({
+    "gemm", "grouped_gemm", "projection", "gate_up_projection", "down_projection",
+    "qkv_projection", "output_projection", "router", "logits", "index_projection",
+    "all_gather_matmul", "matmul_reduce_scatter", "mc2",
+})
+_BIRTH_READINESS_MAP: dict[str, tuple[str, bool]] = {
+    "shipping": (KERNEL_STATUS_EXISTING, False),
+    "proposed_pr": (KERNEL_STATUS_FRAMEWORK, False),
+    "synthesized_target": (KERNEL_STATUS_NEW_OP, True),
+    "tiler_extension": (KERNEL_STATUS_EXTEND_TILING, True),
+    "logical_only": (KERNEL_STATUS_EXISTING, False),
+}
+_A3_ONLY_KERNELS_FORBIDDEN_ON_A5 = (
+    "dispatch_ffn_combine",
+    "aclnnFusedInferAttentionScoreV3",
+    "aclnnGroupedMatmulV4",
+)
+
+
+def _is_gemm_like(fam: str, rec: str) -> bool:
+    return fam in _GEMM_SYNTH_FAMILIES or any(tok in rec for tok in ("gemm", "matmul", "megamoe", "gmm"))
+
+
 def _format_source_ref(resolved_sources: Sequence[Any], bound_source: str, fallback_ref: str) -> str:
-    """Format canonical repository/path source reference without guessed paths."""
-    parts = [formatted for src in resolved_sources if (formatted := _format_source_record(src))]
+    """Format canonical repository/path source reference without guessed or banned paths."""
+    parts = [
+        cleaned
+        for src in resolved_sources
+        if (cleaned := sanitize_source_ref(_format_source_record(src)))
+    ]
     if bound_source:
-        parts.append(bound_source)
+        cleaned_bound = sanitize_source_ref(bound_source)
+        if cleaned_bound:
+            parts.append(cleaned_bound)
     if parts:
         return "; ".join(dict.fromkeys(parts))
-    return fallback_ref
+    return sanitize_source_ref(fallback_ref)
+
+
+def _extract_birth_kernel_binding(
+    spec: OpSpec | None, meta: Mapping[str, Any],
+) -> tuple[str, str, str, str, bool]:
+    """Read authoritative birth ``KernelBinding`` from ``spec.kernel_binding`` or ``meta``."""
+    raw = getattr(spec, "kernel_binding", None) if spec is not None else None
+    if raw is None:
+        raw = meta.get("kernel_binding")
+    if raw is None:
+        return "", "", "", "", False
+    get = raw.get if isinstance(raw, Mapping) else lambda k, d=None: getattr(raw, k, d)
+    raw_backend = str(get("backend") or "").strip()
+    readiness = str(get("readiness") or "").strip().lower()
+    is_logical = raw_backend == "Logical" or readiness == "logical_only"
+    kernel_id = "" if is_logical else _clean_native_symbol(get("kernel_id"))
+    source_ref = sanitize_source_ref(_format_source_record(get("source_ref")))
+    return kernel_id, raw_backend, readiness, source_ref, True
+
+
+def _sanitize_cross_gen_kernel(
+    kernel: str, *, arch_family: str, fam: str, rec: str, suffix: str,
+    meta: Mapping[str, Any], layer_plan: Any | None,
+) -> str:
+    """Block A3-only kernel names from leaking onto A5."""
+    if not kernel or arch_family != "A5":
+        return kernel
+    if any(tok in kernel for tok in _A3_ONLY_KERNELS_FORBIDDEN_ON_A5):
+        return ""
+    if fam == "attention" and "FusedInferAttentionScore" in kernel:
+        layer_attn = str(getattr(layer_plan, "attention", "") or "").lower() if layer_plan is not None else ""
+        if (
+            layer_attn in {"mla", "mla_dsa", "dsa"} or "mla" in rec or "mla" in suffix
+            or "latent" in suffix or meta.get("paged_mla_geometry") or meta.get("indexed_attention_geometry")
+        ):
+            return ""
+    return kernel
 
 
 def _extract_binding_identity(
@@ -964,8 +1033,9 @@ def _project_fused_mc2(
             f"{KERNEL_STATUS_EXTEND_TILING} MXFP4 MegaMoE Compact Tiling"
             if needs_new else KERNEL_STATUS_EXISTING
         )
+        backend = BACKEND_CATLASS if needs_new else BACKEND_CANN
         spec_txt = "Fused aclnnMegaMoe supporting packed MXFP4 + gated activation compact tiling" if needs_new else ""
-        return ("Fused MegaMoE (Dispatch + GMM1 + Act + GMM2 + Combine)", kern, BACKEND_CANN, status, needs_new, spec_txt, "megamoe")
+        return ("Fused MegaMoE (Dispatch + GMM1 + Act + GMM2 + Combine)", kern, backend, status, needs_new, spec_txt, "megamoe")
     if arch_family == "A3":
         if bound_kernel in {"aclnnMegaMoe", "dispatch_ffn_combine", "dispatch_ffn_combine_w4_a8"}:
             kern = bound_kernel
@@ -1037,32 +1107,35 @@ def _project_linear_attn(
         if is_ideal:
             return (
                 "Fused Recurrent KDA (Spec Verify + Persistent State)",
-                bound_kernel or "flash_kda_persistent", BACKEND_CANN,
+                bound_kernel or "flash_kda_persistent", BACKEND_TILELANG,
                 f"{KERNEL_STATUS_NEW_OR_EXTEND} Spec 2D State-Slot Writeback & Persistent UB",
                 True, "Persistent TileLang / AscendC recurrent KDA with 2D state-slot writeback", "recurrent_scan",
             )
         return (
-            "Fused Recurrent KDA Decode", bound_kernel or "fused_recurrent_kda", BACKEND_TRITON,
+            "Fused Recurrent KDA Decode", bound_kernel or "fused_recurrent_kda",
+            BACKEND_TILELANG if has_spec else BACKEND_TRITON,
             f"{KERNEL_STATUS_NEW_OR_EXTEND} Speculative KDA State-Slot Writeback" if has_spec else KERNEL_STATUS_EXISTING,
             has_spec, "Speculative 2D state-slot writeback extension for fused_recurrent_kda" if has_spec else "", "recurrent_scan",
         )
     if suffix == "decode_recurrent_scan" or fam == "recurrent_vector":
         return ("Fused Recurrent GDN Decode", bound_kernel or "RecurrentGatedDeltaRule", BACKEND_CANN, KERNEL_STATUS_EXISTING, False, "", "decode_recurrent_scan")
-    if "recover_ssm" in suffix or "recover_ssm" in rec:
+    if str(meta.get("recover_ssm_stage") or "").strip().lower() == "commit" or "recover_ssm" in suffix or "recover_ssm" in rec:
+        bound_compact = bound_kernel.lower().replace("_", "")
         k_name = (
             bound_kernel
-            if (bound_kernel and "recover_ssm" in bound_kernel.lower())
-            else "recover_ssm_state_commit"
+            if (bound_kernel and "recoverssm" in bound_compact and bound_kernel != "Add")
+            else "RecoverSSMStateCommit"
         )
         return (
             "Speculative Accepted-Token SSM State Commit (RecoverSSM)",
-            k_name, BACKEND_TRITON,
+            k_name, BACKEND_TILELANG,
             f"{KERNEL_STATUS_NEW_OR_EXTEND} Speculative Accepted-State Commit Kernel",
-            True, "Compact accepted-token SSM/KDA state replay & single HBM writeback commit kernel", "recover_ssm_commit",
+            True, "Compact accepted-token SSM/KDA state replay & single HBM writeback commit kernel", "recover_ssm",
         )
     if suffix == "short_convolution" or fam in {"short_convolution", "causal_conv1d_fn"}:
         return (
-            "Causal Conv1d + SiLU (Kernel=4)", bound_kernel or "CausalConv1d", BACKEND_CANN,
+            "Causal Conv1d + SiLU (Kernel=4)", bound_kernel or "CausalConv1d",
+            BACKEND_ASCENDC if is_ideal else BACKEND_CANN,
             f"{KERNEL_STATUS_NEW_OR_EXTEND} Spec Accepted-Token Rolling Conv Update" if is_ideal else KERNEL_STATUS_EXISTING,
             is_ideal, "Speculative multi-token rolling conv_state update for CausalConv1d" if is_ideal else "", "short_convolution",
         )
@@ -1074,7 +1147,7 @@ def _project_linear_attn(
                 BACKEND_TORCH_NPU, KERNEL_STATUS_EXISTING, False, "", "linear_output_norm_gate",
             )
         return (
-            "Fused RMSNorm + Sigmoid Output Gate", bound_kernel or "FusedRMSNormGated", BACKEND_TRITON,
+            "Fused RMSNorm + Sigmoid Output Gate", bound_kernel or "FusedRMSNormGated", BACKEND_TILELANG,
             f"{KERNEL_STATUS_NEW_OR_EXTEND} FusedRMSNormGated(eps=1e-5, sigmoid)",
             True, "Fused RMSNorm + sigmoid gate kernel replacing eager chain", "linear_output_norm_gate",
         )
@@ -1128,7 +1201,7 @@ def _project_moe(
     if suffix in {"unpack", "combine"} or "combine" in rec:
         kern = bound_kernel if (bound_kernel and "Combine" in bound_kernel) else "MoeDistributeCombineV2"
         return ("MoE EP Token Distribute Combine (MC2)", kern, BACKEND_HCCL_MC2, KERNEL_STATUS_EXISTING, False, "", "unpack")
-    if suffix in {"expert_up", "expert_down"} or fam == "grouped_gemm":
+    if suffix in {"expert_up", "expert_down"} or fam in {"grouped_gemm", "grouped_moe"}:
         is_up = suffix == "expert_up" or "gate_up" in rec
         if is_a2_or_a3:
             q_tag = "W4A8 INT4" if is_int4_w else ("W8A8 INT8" if is_quant_mm else "BF16")
@@ -1141,7 +1214,7 @@ def _project_moe(
         role = f"Routed Expert {'Gate+Up GMM1' if is_up else 'Down GMM2'} ({q_tag})"
         if is_ideal and is_mxfp4_w:
             return (
-                role, bound_kernel or "GroupedMatmul (MXFP4 Compact Tiling)", BACKEND_CANN,
+                role, bound_kernel or "GroupedMatmul (MXFP4 Compact Tiling)", BACKEND_CATLASS,
                 f"{KERNEL_STATUS_EXTEND_TILING} MXFP4 GroupedMatmul Compact Tiling", True,
                 f"MXFP4 group=32 compact tiling + AIV/Cube double-buffering for {role}", suffix,
             )
@@ -1151,7 +1224,7 @@ def _project_moe(
             p_str = _format_situ_params(meta, layer_plan)
             role = f"{'Routed' if suffix == 'expert_act' else 'Shared'} Expert SiTU+Mul Activation {p_str}".strip()
             return (
-                role, bound_kernel or "SituAndMul", BACKEND_TRITON,
+                role, bound_kernel or "SituAndMul", BACKEND_TILELANG,
                 f"{KERNEL_STATUS_NEW_OP} SituAndMul{p_str} + Quant", True,
                 f"Fused SituAndMul{p_str} + optional dynamic quant epilogue", suffix,
             )
@@ -1192,13 +1265,15 @@ def _project_engram_mhc_indexer(
         if rec in {"hc_combine", "hc_combine_rmsnorm"} or suffix.endswith("hc_post"):
             kern = bound_kernel or ("FusedMHCCombine" if is_lr else "mhc_post_combine")
             return (
-                f"mHC Post Combine ({suffix})", kern, BACKEND_CANN if is_lr else BACKEND_TRITON,
+                f"mHC Post Combine ({suffix})", kern,
+                BACKEND_ASCENDC if (is_lr and is_ideal) else (BACKEND_CANN if is_lr else BACKEND_TILELANG),
                 KERNEL_STATUS_NEW_OP if (is_lr and is_ideal) else KERNEL_STATUS_FRAMEWORK,
                 bool(is_lr and is_ideal), "UB-resident fused FusedMHCCombine" if (is_lr and is_ideal) else "", suffix,
             )
         if is_lr:
             return (
-                f"mHC Low-Rank Gated Residual Mix ({suffix})", bound_kernel or "FusedMHCGatedResidualMix", BACKEND_CANN,
+                f"mHC Low-Rank Gated Residual Mix ({suffix})", bound_kernel or "FusedMHCGatedResidualMix",
+                BACKEND_ASCENDC if is_ideal else BACKEND_CANN,
                 KERNEL_STATUS_NEW_OP if is_ideal else KERNEL_STATUS_FRAMEWORK,
                 bool(is_ideal), "UB-resident fused FusedMHCGatedResidualMix" if is_ideal else "", suffix,
             )
@@ -1259,7 +1334,7 @@ def _project_family_tuple(
     if fam == "attn_res_prefix" or "attn_res" in suffix:
         return (
             "Block Attention Residual Prefix (Norm+Score+Softmax+BMM)",
-            bound_kernel or "vllm_ascend_attn_res_prefix", BACKEND_TRITON,
+            bound_kernel or "ascend_attn_res_prefix", BACKEND_TILELANG,
             f"{KERNEL_STATUS_NEW_OR_EXTEND} AttnRes Cross-Layer Fused Prefix", True,
             "Fused block residual norm+projection+softmax+weighted sum across block history", suffix,
         )
@@ -1290,7 +1365,7 @@ def _project_family_tuple(
         )
     if fam == "attention_merge" or suffix == "dcp_lse_merge":
         return ("DCP Attention LSE Merge", bound_kernel or "aclnnAttentionUpdate", BACKEND_CANN, KERNEL_STATUS_EXISTING, False, "", "dcp_lse_merge")
-    if _is_linear_attn_op(suffix, fam, rec, "kda" if "kda" in rec else ""):
+    if _is_linear_attn_op(suffix, fam, rec, "kda" if "kda" in rec else "") or str(meta.get("recover_ssm_stage") or "").strip().lower() == "commit":
         return _project_linear_attn(
             suffix, fam, rec, meta, bound_kernel, mm_kernel,
             is_ideal=is_ideal, is_raw_eager=is_raw_eager, layer_plan=layer_plan,
@@ -1311,7 +1386,7 @@ def _project_family_tuple(
         if fam == "situ":
             p_str = _format_situ_params(meta, layer_plan)
             return (
-                f"SiTU Gated Activation {p_str}".strip(), bound_kernel or "SituAndMul", BACKEND_TRITON,
+                f"SiTU Gated Activation {p_str}".strip(), bound_kernel or "SituAndMul", BACKEND_TILELANG,
                 f"{KERNEL_STATUS_NEW_OP} SituAndMul{p_str}", True,
                 f"Fused SituAndMul{p_str} activation (non-standard gated variant)", suffix,
             )
@@ -1369,9 +1444,13 @@ def resolve_ascend_kernel_identity(
     ).lower()
     is_c8_kv = kv_raw in {"int8", "c8"}
 
+    birth_kernel, birth_backend_raw, birth_readiness, birth_source, has_birth = _extract_birth_kernel_binding(spec, meta)
+    birth_kernel = _sanitize_cross_gen_kernel(
+        birth_kernel, arch_family=arch_family, fam=fam, rec=rec, suffix=suffix, meta=meta, layer_plan=layer_plan,
+    )
     bound_kernel, bound_source, bound_backend = _extract_binding_identity(spec, meta, native_binding)
     struct_nat = _extract_struct_native(struct_node)
-    reg_spec = _lookup_registry_spec(fam, rec) if (not bound_kernel and not struct_nat) else None
+    reg_spec = _lookup_registry_spec(fam, rec) if (not birth_kernel and not bound_kernel and not struct_nat) else None
     reg_nat = _clean_native_symbol(reg_spec.native_kinds[0]) if (reg_spec and reg_spec.native_kinds) else ""
     fallback_src = ""
     if isinstance(struct_node, Mapping) and struct_node.get("source_ref"):
@@ -1379,17 +1458,12 @@ def resolve_ascend_kernel_identity(
     elif reg_spec is not None and reg_spec.source_ref:
         fallback_src = str(reg_spec.source_ref).strip()
 
-    effective_bound = bound_kernel or struct_nat or reg_nat or _native_kernel_from_structure(op_id, spec, shape, dtype)
-    # Cross-generation guard: never let legacy/generic structure symbols override A5 MLA or A5 MegaMoE.
-    if arch_family == "A5":
-        if "dispatch_ffn_combine" in effective_bound:
-            effective_bound = ""
-        if fam == "attention" and "FusedInferAttentionScore" in effective_bound:
-            layer_attn = str(getattr(layer_plan, "attention", "") or "").lower() if layer_plan is not None else ""
-            if (layer_attn in {"mla", "mla_dsa", "dsa"} or "mla" in rec or "mla" in suffix
-                    or "latent" in suffix or meta.get("paged_mla_geometry") or meta.get("indexed_attention_geometry")):
-                effective_bound = ""
+    effective_bound = birth_kernel or bound_kernel or struct_nat or reg_nat or _native_kernel_from_structure(op_id, spec, shape, dtype)
+    effective_bound = _sanitize_cross_gen_kernel(
+        effective_bound, arch_family=arch_family, fam=fam, rec=rec, suffix=suffix, meta=meta, layer_plan=layer_plan,
+    )
 
+    is_gemm = _is_gemm_like(fam, rec)
     contract_txt = _format_tensor_contract(op_id, fam, rec, shape, dtype, meta, case, layer_plan)
     role, kernel, backend, status, needs_new, new_spec, canon_key = _project_family_tuple(
         suffix=suffix, fam=fam, rec=rec, meta=meta, bound_kernel=effective_bound,
@@ -1397,20 +1471,44 @@ def resolve_ascend_kernel_identity(
         is_quant_mm=is_quant_mm, is_mxfp4_w=is_mxfp4_w, is_int4_w=is_int4_w,
         is_c8_kv=is_c8_kv, layer_plan=layer_plan,
     )
-    if bound_backend and not needs_new and not (is_raw_eager and fam == "rmsnorm"):
-        backend = bound_backend
-    if isinstance(struct_node, Mapping):
-        raw_backend = str(struct_node.get("backend_stack") or "").strip().lower()
-        if raw_backend in STRUCTURE_BACKEND_MAP and not bound_backend and not (is_raw_eager and fam == "rmsnorm"):
-            backend = STRUCTURE_BACKEND_MAP[raw_backend]
-        raw_readiness = str(struct_node.get("readiness") or "").strip().lower()
-        if raw_readiness in STRUCTURE_READINESS_MAP:
-            mapped_status, mapped_new = STRUCTURE_READINESS_MAP[raw_readiness]
-            if mapped_new or not needs_new:
-                status = mapped_status if not new_spec else f"{mapped_status} {new_spec}"
-                needs_new = mapped_new
-    elif reg_spec is not None and reg_spec.backend_stack in STRUCTURE_BACKEND_MAP and not needs_new and not bound_backend:
-        backend = STRUCTURE_BACKEND_MAP[reg_spec.backend_stack]
+
+    # Birth KernelBinding is authoritative first (zero post-hoc kernel/backend override).
+    if has_birth:
+        if birth_readiness in _BIRTH_READINESS_MAP:
+            status, needs_new = _BIRTH_READINESS_MAP[birth_readiness]
+        if birth_kernel:
+            kernel = birth_kernel
+        elif birth_readiness == "logical_only":
+            kernel = ""
+        if birth_backend_raw:
+            is_synth = needs_new and birth_backend_raw.lower() in {"custom-ops", "custom_ops"}
+            backend = (
+                (BACKEND_CATLASS if is_gemm else BACKEND_TILELANG)
+                if is_synth else normalize_public_backend(birth_backend_raw, is_gemm=is_gemm)
+            )
+    else:
+        if bound_backend and not needs_new and not (is_raw_eager and fam == "rmsnorm"):
+            backend = bound_backend
+        if isinstance(struct_node, Mapping):
+            raw_backend = str(struct_node.get("backend_stack") or "").strip().lower()
+            if raw_backend and not bound_backend and not (is_raw_eager and fam == "rmsnorm"):
+                backend = normalize_public_backend(raw_backend, is_gemm=is_gemm)
+            raw_readiness = str(struct_node.get("readiness") or "").strip().lower()
+            if raw_readiness in STRUCTURE_READINESS_MAP:
+                mapped_status, mapped_new = STRUCTURE_READINESS_MAP[raw_readiness]
+                if mapped_new or not needs_new:
+                    status = mapped_status if not new_spec else f"{mapped_status} {new_spec}"
+                    needs_new = mapped_new
+        elif reg_spec is not None and reg_spec.backend_stack and not needs_new and not bound_backend:
+            backend = normalize_public_backend(reg_spec.backend_stack, is_gemm=is_gemm)
+        if bool(meta.get("target_rewrite_fused")):
+            fused_name = _clean_native_symbol(meta.get("fused_kernel_name"))
+            if fused_name:
+                kernel = fused_name
+            needs_new = True
+            if status == KERNEL_STATUS_EXISTING:
+                status = KERNEL_STATUS_NEW_OP
+            backend = BACKEND_CATLASS if is_gemm else BACKEND_TILELANG
 
     if isinstance(subgraph_info, Mapping):
         f_status = str(subgraph_info.get("fusion_status") or "").strip().lower()
@@ -1419,16 +1517,22 @@ def resolve_ascend_kernel_identity(
             status = f"{KERNEL_STATUS_NEW_OP} {reason}".strip()
             needs_new = True
             new_spec = new_spec or reason
+            if not has_birth:
+                backend = BACKEND_CATLASS if is_gemm else BACKEND_TILELANG
         elif f_status == "fused_framework_enable" and status == KERNEL_STATUS_EXISTING:
             status = KERNEL_STATUS_FRAMEWORK
 
+    if needs_new and backend in {BACKEND_TRITON, BACKEND_TORCH_NPU}:
+        backend = BACKEND_CATLASS if is_gemm else BACKEND_TILELANG
+    backend = normalize_public_backend(backend, is_gemm=is_gemm)
     kernel = _clean_native_symbol(kernel)
+    primary_source = birth_source or bound_source
     return AscendKernelDescriptor(
         logical_role=_disambiguate_scoped_role(suffix, role),
         ascend_kernel=kernel,
         kernel_backend=backend,
         kernel_status=status,
-        source_ref=_format_source_ref(resolved_sources, bound_source, fallback_src),
+        source_ref=_format_source_ref(resolved_sources, primary_source, fallback_src),
         tensor_contract=contract_txt,
         needs_new_kernel=needs_new,
         new_kernel_spec=new_spec,

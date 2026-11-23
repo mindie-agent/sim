@@ -1,6 +1,6 @@
-"""Reference tile pipelines and host dispatch for Tier K3.
+"""Reference TileLang/AscendC tile pipelines and host dispatch for Tier K3.
 
-[Role] Describe concrete DSL kernel ABIs, capacity and scheduler decisions.
+[Role] Describe concrete open-source DSL kernel ABIs, capacity and scheduler decisions.
 [Invariants] Workspace extents and source-pinned constants have explicit units.
 [Timeouts & Locks] Local finite schedule arithmetic. No I/O or locks.
 [Side-Effect Policy] Pure CPU modeling of launcher and kernel structures.
@@ -21,7 +21,7 @@ from .contracts import (
 )
 from .fuse_region import solve_template_tile
 
-DSL_REPOSITORY = "cann/cannbot-dsl"
+DSL_REPOSITORY = "Ascend/tilelang-ascend"
 DSL_REVISION = "5e7ace8cdcc16a5b062ba69d8fdf93d4f1d62223"
 DSL_SOURCE_REFS = (
     TemplateSourceRef(DSL_REPOSITORY, DSL_REVISION, "samples/attention/flash_kda/flash_kda_metadata.py",

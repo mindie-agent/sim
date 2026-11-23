@@ -2,19 +2,23 @@
 
 [Role] Own single-source comparison accounting and actionable task projection over
   aligned ``ExportBundle`` comparisons:
-  (1) Strict 3-category operator taxonomy separating genuine ``N->1`` new fused
-      kernels (``[需新开发融合算子]``), shipping ``1->1`` tuning groups clearing
-      ``>= 0.050 ms`` and ``> 0 us/(tok*die)`` (``[现成算子深度调优]``), and
-      at-floor/residual operators (``[已近物理下界 / 无需改动]``, zero cards);
+  (1) Strict 3-category operator taxonomy enforcing the unified inclusive
+      ``>= 0.050 ms`` materiality gate (and ``> 0 us/(tok*die)``) across BOTH
+      genuine ``N->1`` new fused kernels (``[需新开发融合算子]``) and shipping
+      ``1->1`` tuning groups (``[现成算子深度调优]``), routing sub-threshold
+      micro-fusions cleanly to ``Residual Ops`` (``[已近物理下界 / 无需改动]``,
+      zero cards and zero framework roadmap badges);
   (2) Exact signed Waterfall Ledger accounting conserving ``Step_ms`` and
       ``us/(tok*die)`` across Sheet 2 columns ``AB..AF`` and Sheet 4;
   (3) Deterministic canonical ABI ``card_id`` generation (zero ``_2`` serial
       suffixes), max-gain submodule attribution, and ``<= 12`` high-signal cards;
-  (4) Pure receipt-driven ``[A]/[B]/[C]`` roadmap with strict script-free vs
-      ``--from-script`` separation and pre-rounding sign veto.
+  (4) Pure receipt-driven 3-track roadmap (``[1] 配置与并行`` /
+      ``[2] 框架图与多流改造`` / ``[3] 新算子开发与 Tiling 调优``) with strict
+      allowlist-only public view projection and inclusive ``>= 0.050 ms`` gate.
 [Invariants] Zero string-sniffing prose dispatch tables, zero ``>=75%/78%/85%``
   target phrases, zero guessed ``.py`` paths, zero ACLGraph catch-all defaults,
-  zero ``1->1`` native ops in ``[B]``, and zero negative ``saved_ms`` in ``[B]``.
+  zero ``1->1`` native ops in Track ``[2]``, zero sub-``0.050 ms`` promotions,
+  and zero raw internal keys or ``str(dict)`` leaks in public diffs/receipts.
 [Timeouts & Locks] Pure O(Aligned Rows) in-memory passes; no I/O or locks.
 [Side-Effect Policy] Read-only over immutable export data records.
 """
@@ -23,6 +27,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 import hashlib
+import math
 import re
 from typing import Any, Literal
 
@@ -34,6 +39,16 @@ from .models import (
     ActionRoadmapRow, AlignedComparisonRow, ExportBundle, NewKernelBacklogItem,
     OperatorExportRow, PendingKernelItem,
 )
+from .public_view import (
+    PUBLIC_PIPE_NAMES,
+    THREE_TRACK_LABELS,
+    diff_public_scenario_configs,
+    is_same_public_config,
+    normalize_public_backend,
+    project_public_effective_config,
+    sanitize_public_text,
+    sanitize_source_ref,
+)
 
 CONSERVATION_EPS_MS = 1e-6
 TUNE_MIN_SAVED_MS = 0.05
@@ -44,7 +59,8 @@ MAX_ROADMAP_KERNEL_ITEMS = 8
 CARD_SLUG_MAX_LEN = 44
 CARD_DIGEST_HEX_LEN = 6
 SUB_MS_DISPLAY_THRESHOLD = 0.001
-NEW_KERNEL_MIN_SAVED_MS = SUB_MS_DISPLAY_THRESHOLD
+#: Unified inclusive materiality threshold (>= 0.050 ms) for new kernels, tuning, and framework promotion.
+NEW_KERNEL_MIN_SAVED_MS = TUNE_MIN_SAVED_MS
 MIN_FUSION_MEMBERS = 2
 MAX_SOURCE_REF_SUMMARY_LEN = 160
 MAX_ROLES_IN_CHAIN = 3
@@ -56,7 +72,6 @@ _SLUG_RE = re.compile(r"[^a-z0-9]+")
 _ARCH_FAMILY_A5_TOKENS = ("950", "a5", "3510")
 _ARCH_FAMILY_A3_TOKENS = ("910_93", "910c", "a3", "9392", "9382", "9372", "9362", "9391", "9381")
 _ARCH_FAMILY_A2_TOKENS = ("910b", "a2", "310p", "300i")
-_INTERNAL_EFFECTIVE_KEYS = frozenset({"solver_feasible", "feature_track", "moe_route"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,78 +166,19 @@ def _short_arch_name(title: str) -> str:
 
 
 def _public_effective_config(bundle: ExportBundle) -> dict[str, Any]:
-    raw = dict(bundle.effective_config or {})
-    out: dict[str, Any] = {}
-    moe_route = raw.get("moe_route")
-    if isinstance(moe_route, Mapping):
-        for sub_k in ("enable_fused_mc2", "multistream_overlap_shared_expert"):
-            if sub_k in moe_route and sub_k not in raw and moe_route[sub_k] is not None:
-                out[sub_k] = moe_route[sub_k]
-    for k, v in raw.items():
-        if k in _INTERNAL_EFFECTIVE_KEYS or isinstance(v, (Mapping, list, tuple, set)):
-            continue
-        out[k] = v
-    return out
+    return project_public_effective_config(bundle)
 
 
 def _is_same_deployment_config(before: ExportBundle, after: ExportBundle) -> bool:
-    bm, am = before.memory_ledger, after.memory_ledger
     return (
-        (bm.dp, bm.tp, bm.ep, bm.pp, bm.dcp, bm.pcp, bm.local_tp, bm.shared_tp)
-        == (am.dp, am.tp, am.ep, am.pp, am.dcp, am.pcp, am.local_tp, am.shared_tp)
-        and bm.concurrency == am.concurrency and before.cluster_concurrency == after.cluster_concurrency
-        and before.sequence_parallel == after.sequence_parallel and before.spec_proposals == after.spec_proposals
-        and abs(float(before.avg_accepted_tokens) - float(after.avg_accepted_tokens)) <= MIN_DENOM_EPS
-        and (bm.weight_quant_display or bm.weight_quant) == (am.weight_quant_display or am.weight_quant)
-        and bm.cache_dtype == am.cache_dtype and bm.engram_host_offload == am.engram_host_offload
-        and before.deployment_mode == after.deployment_mode
+        is_same_public_config(before, after)
         and abs(float(before.n_tok_per_die or 1.0) - float(after.n_tok_per_die or 1.0)) <= MIN_DENOM_EPS
-        and _public_effective_config(before) == _public_effective_config(after)
     )
 
 
 def _extract_deployment_diffs(before: ExportBundle, after: ExportBundle) -> list[tuple[str, str, str]]:
-    """Return factual ``(field_label, before_value, after_value)`` tuples for changed config."""
-    if (before.effective_config or {}).get("solver_feasible") is False or (after.effective_config or {}).get("solver_feasible") is False:
-        return []
-    diffs: list[tuple[str, str, str]] = []
-    bm, am = before.memory_ledger, after.memory_ledger
-    if (before.deployment_mode or "") != (after.deployment_mode or "") and (before.deployment_mode or after.deployment_mode):
-        diffs.append(("部署形态 (Deployment Mode)", before.deployment_mode or "—", after.deployment_mode or "—"))
-    bp = before.pd_pool_summary if isinstance(before.pd_pool_summary, Mapping) else {}
-    ap = after.pd_pool_summary if isinstance(after.pd_pool_summary, Mapping) else {}
-    if (bp.get("pd_ratio"), bp.get("pd_transfer_mode"), bp.get("used_dies")) != (ap.get("pd_ratio"), ap.get("pd_transfer_mode"), ap.get("used_dies")) and (bp or ap):
-        b_txt = f"{bp.get('pd_ratio', '—')} ({bp.get('pd_transfer_mode', '—')}, {bp.get('used_dies', bm.total_dies)} dies)" if bp else "Colocated"
-        a_txt = f"{ap.get('pd_ratio', '—')} ({ap.get('pd_transfer_mode', '—')}, {ap.get('used_dies', am.total_dies)} dies)" if ap else "Colocated"
-        diffs.append(("PD 池化配比 (PD Pool)", b_txt, a_txt))
-    par_axes = (
-        ("DP", bm.dp, am.dp), ("TP", bm.tp, am.tp), ("EP", bm.ep, am.ep), ("PP", bm.pp, am.pp),
-        ("DCP", bm.dcp, am.dcp), ("PCP", bm.pcp, am.pcp), ("Local-TP", bm.local_tp, am.local_tp),
-        ("Shared-TP", bm.shared_tp, am.shared_tp),
-        ("SP", "ON" if before.sequence_parallel else "OFF", "ON" if after.sequence_parallel else "OFF"),
-    )
-    changed_axes = [(n, str(bv), str(av)) for n, bv, av in par_axes if bv != av]
-    if changed_axes:
-        diffs.append(("并行切分策略 (Parallelism)", ", ".join(f"{n}={bv}" for n, bv, _ in changed_axes), ", ".join(f"{n}={av}" for n, _, av in changed_axes)))
-    b_cc, a_cc = int(before.cluster_concurrency or (bm.concurrency * bm.dp)), int(after.cluster_concurrency or (am.concurrency * am.dp))
-    if bm.concurrency != am.concurrency or b_cc != a_cc:
-        diffs.append(("并发批量 (Batch / Concurrency)", f"B/DP={bm.concurrency}, Cluster={b_cc}", f"B/DP={am.concurrency}, Cluster={a_cc}"))
-    if before.spec_method != after.spec_method or before.spec_proposals != after.spec_proposals or abs(float(before.avg_accepted_tokens) - float(after.avg_accepted_tokens)) > CONSERVATION_EPS_MS:
-        diffs.append((
-            "投机解码配置 (Speculative)",
-            f"{before.spec_method or 'None'} (K={before.spec_proposals}, acc={before.avg_accepted_tokens:.2f})",
-            f"{after.spec_method or 'None'} (K={after.spec_proposals}, acc={after.avg_accepted_tokens:.2f})",
-        ))
-    bq, aq = bm.weight_quant_display or bm.weight_quant, am.weight_quant_display or am.weight_quant
-    if bq != aq or bm.cache_dtype != am.cache_dtype or bm.engram_host_offload != am.engram_host_offload:
-        diffs.append(("量化与缓存配置 (Quant / Cache)", f"Weight={bq}, KV={bm.cache_dtype}, Offload={'ON' if bm.engram_host_offload else 'OFF'}", f"Weight={aq}, KV={am.cache_dtype}, Offload={'ON' if am.engram_host_offload else 'OFF'}"))
-    if (before.graph_capture_mode or "") != (after.graph_capture_mode or ""):
-        diffs.append(("图捕获模式 (Graph Capture)", before.graph_capture_mode or "—", after.graph_capture_mode or "—"))
-    b_eff, a_eff = _public_effective_config(before), _public_effective_config(after)
-    for key in sorted(set(b_eff) | set(a_eff)):
-        if b_eff.get(key) != a_eff.get(key):
-            diffs.append((f"生效配置 ({key})", str(b_eff.get(key) if b_eff.get(key) is not None else "unset"), str(a_eff.get(key) if a_eff.get(key) is not None else "unset")))
-    return diffs
+    """Return factual ``(field_label, before_value, after_value)`` tuples strictly from allowlisted fields."""
+    return diff_public_scenario_configs(before, after)
 
 
 def build_parallelism_codesign_note(before_bundle: ExportBundle, after_bundle: ExportBundle) -> str:
@@ -238,14 +194,45 @@ def _row_exposed_metrics(row: AlignedComparisonRow, before_ntok: float, after_nt
     return b_ms, a_ms, b_ms - a_ms, b_upt, a_upt, b_upt - a_upt
 
 
+def _extract_clean_equations(raw_eqs: Any) -> list[str]:
+    if not isinstance(raw_eqs, (list, tuple)):
+        return []
+    out: list[str] = []
+    for item in raw_eqs:
+        if not isinstance(item, str):
+            continue
+        cleaned = sanitize_public_text(item)
+        if cleaned:
+            out.append(cleaned)
+    return out
+
+
+def _safe_nonneg_int(val: Any) -> int:
+    return int(val) if isinstance(val, int) and not isinstance(val, bool) and val > 0 else 0
+
+
+def _safe_nonneg_float(val: Any) -> float:
+    if isinstance(val, (int, float)) and not isinstance(val, bool):
+        fval = float(val)
+        if math.isfinite(fval) and fval > 0.0:
+            return fval
+    return 0.0
+
+
 def _format_formula_eval_receipt(formula_eval: Any) -> str:
     if formula_eval is None:
         return ""
     get = formula_eval.get if isinstance(formula_eval, Mapping) else lambda k, d=None: getattr(formula_eval, k, d)
-    eqs, ub_p, ub_b = get("composed_equations") or (), int(get("ub_peak_bytes", 0) or 0), int(get("ub_budget_bytes", 0) or 0)
-    sram_ok, proj_us, pipe = bool(get("sram_verified", False)), float(get("projected_us", 0.0) or 0.0), str(get("dominant_pipe", "") or "")
+    eqs = _extract_clean_equations(get("composed_equations"))
+    ub_p = _safe_nonneg_int(get("ub_peak_bytes"))
+    ub_b = _safe_nonneg_int(get("ub_budget_bytes"))
+    sram_ok = bool(get("sram_verified", False)) if isinstance(get("sram_verified", False), bool) else False
+    proj_us = _safe_nonneg_float(get("projected_us"))
+    raw_pipe = get("dominant_pipe")
+    pipe_cand = sanitize_public_text(raw_pipe) if isinstance(raw_pipe, str) else ""
+    pipe = pipe_cand if pipe_cand.lower() in PUBLIC_PIPE_NAMES else ""
     parts = [p for p in (
-        ("Formula: " + " ; ".join(str(e) for e in eqs)) if eqs else "",
+        ("Formula: " + " ; ".join(eqs)) if eqs else "",
         f"UB={ub_p / KIB_BYTES:.1f}/{ub_b / KIB_BYTES:.1f}KiB ({'PASS' if sram_ok else 'FAIL'})" if ub_b > 0 else "",
         (f"Projected={proj_us:.2f}us" + (f", pipe={pipe}" if pipe else "")) if proj_us > 0.0 else "",
     ) if p]
@@ -384,25 +371,43 @@ def _add_row_to_group(
     gain_ms = saved_ms if is_comparison else gap_ms
     gain_upt = saved_upt if is_comparison else (gap_ms * US_PER_MS / max(float(after_bundle.n_tok_per_die or 1.0), MIN_DENOM_EPS))
     kspec, fe = a_op.kernel_synthesis_spec, a_op.formula_eval
-    math_formula = " ; ".join(kspec.symbolic_equations) if kspec is not None else (" ; ".join(getattr(fe, "composed_equations", ()) or ()) if fe is not None and not isinstance(fe, Mapping) else "")
-    sram_sum = kspec.format_formula_block() if kspec is not None else _format_formula_eval_receipt(fe)
+    raw_eqs = (
+        getattr(kspec, "symbolic_equations", ())
+        if kspec is not None
+        else (fe.get("composed_equations") if isinstance(fe, Mapping) else getattr(fe, "composed_equations", ()))
+        if fe is not None else ()
+    )
+    math_formula = " ; ".join(_extract_clean_equations(raw_eqs))
+    sram_sum = (
+        sanitize_public_text(kspec.format_formula_block())
+        if kspec is not None else _format_formula_eval_receipt(fe)
+    )
     occ_tie = (row.archetype_id, a_op.op_id)
     bef_bounds = " / ".join(dict.fromkeys(b.bound_display or b.dominant_bound for b in row.before_ops if b.bound_display or b.dominant_bound)) or (a_op.bound_display or a_op.dominant_bound)
 
     entry = groups.get(key)
     if entry is None:
+        raw_target = (
+            str(getattr(kspec, "kernel_name", "") or "").strip()
+            if kspec is not None and category == PENDING_KIND_TO_IMPLEMENT else ""
+        ) or a_op.ascend_kernel or a_op.implementation
         entry = {
             "kernel_key": key, "stem": stem, "category": category,
-            "target_kernel": (str(getattr(kspec, "kernel_name", "") or "").strip() if kspec is not None and category == PENDING_KIND_TO_IMPLEMENT else "") or a_op.ascend_kernel or a_op.implementation,
-            "backend": a_op.kernel_backend or "CANN aclnn/AscendC", "status": a_op.kernel_status,
-            "submodule": a_op.submodule, "logical_role": a_op.logical_role or a_op.op_id,
+            "target_kernel": sanitize_public_text(raw_target),
+            "backend": normalize_public_backend(a_op.kernel_backend or "CANN aclnn/AscendC"),
+            "status": sanitize_public_text(a_op.kernel_status),
+            "submodule": sanitize_public_text(a_op.submodule),
+            "logical_role": sanitize_public_text(a_op.logical_role or a_op.op_id),
             "roles": [], "replaces": [], "sources": [], "archetypes": [], "calls": 0,
             "before_ms": 0.0, "after_ms": 0.0, "lstar_ms": 0.0, "before_lstar_ms": 0.0, "gap_ms": 0.0,
             "gain_ms": 0.0, "before_upt": 0.0, "after_upt": 0.0, "gain_upt": 0.0,
             "attr_gain_ms": 0.0, "attr_gain_upt": 0.0, "has_split": False,
-            "before_bound": bef_bounds, "after_bound": a_op.bound_display or a_op.dominant_bound,
-            "contract": a_op.tensor_contract, "single_lstar_us": a_op.l_star_lean_us, "single_sim_us": a_op.dur_us,
-            "die_summary": after_bundle.hardware_die_summary, "core_budget": a_op.stream_core_budget,
+            "before_bound": sanitize_public_text(bef_bounds),
+            "after_bound": sanitize_public_text(a_op.bound_display or a_op.dominant_bound),
+            "contract": sanitize_public_text(a_op.tensor_contract),
+            "single_lstar_us": a_op.l_star_lean_us, "single_sim_us": a_op.dur_us,
+            "die_summary": sanitize_public_text(after_bundle.hardware_die_summary),
+            "core_budget": sanitize_public_text(a_op.stream_core_budget),
             "opt_pillar": a_op.opt_pillar or ("pillar1_fusion" if category == PENDING_KIND_TO_IMPLEMENT else "pillar2_roofline"),
             "synthesis_spec": kspec, "math_formula": math_formula, "sram_residency_summary": sram_sum,
             "formula_summary": _format_formula_eval_receipt(fe), "binding_state": a_op.binding_state or BINDING_STATE_BOUND,
@@ -413,24 +418,31 @@ def _add_row_to_group(
     if (gain_ms, gain_upt) > entry["best_member_rank"] or ((gain_ms, gain_upt) == entry["best_member_rank"] and occ_tie < entry["best_member_occ"]):
         entry.update({
             "best_member_rank": (gain_ms, gain_upt), "best_member_occ": occ_tie,
-            "submodule": a_op.submodule, "logical_role": a_op.logical_role or a_op.op_id,
-            "before_bound": bef_bounds, "after_bound": a_op.bound_display or a_op.dominant_bound,
-            "contract": a_op.tensor_contract, "single_lstar_us": a_op.l_star_lean_us, "single_sim_us": a_op.dur_us,
+            "submodule": sanitize_public_text(a_op.submodule),
+            "logical_role": sanitize_public_text(a_op.logical_role or a_op.op_id),
+            "before_bound": sanitize_public_text(bef_bounds),
+            "after_bound": sanitize_public_text(a_op.bound_display or a_op.dominant_bound),
+            "contract": sanitize_public_text(a_op.tensor_contract),
+            "single_lstar_us": a_op.l_star_lean_us, "single_sim_us": a_op.dur_us,
         })
         if a_op.stream_core_budget:
-            entry["core_budget"] = a_op.stream_core_budget
+            entry["core_budget"] = sanitize_public_text(a_op.stream_core_budget)
 
     entry["source_row_indices"].append(int(row_idx))
     if a_op.binding_state == BINDING_STATE_UNBOUND_FORMULA:
         entry["binding_state"] = BINDING_STATE_UNBOUND_FORMULA
     for b_op in row.before_ops:
-        entry["replaces"].append(b_op.ascend_kernel)
+        entry["replaces"].append(sanitize_public_text(b_op.ascend_kernel))
         if b_op.source_ref:
-            entry["sources"].append(b_op.source_ref)
+            clean_ref = sanitize_source_ref(b_op.source_ref)
+            if clean_ref:
+                entry["sources"].append(clean_ref)
     if a_op.source_ref:
-        entry["sources"].append(a_op.source_ref)
-    role_lbl = a_op.logical_role or a_op.op_id
-    if role_lbl not in entry["roles"]:
+        clean_ref = sanitize_source_ref(a_op.source_ref)
+        if clean_ref:
+            entry["sources"].append(clean_ref)
+    role_lbl = sanitize_public_text(a_op.logical_role or a_op.op_id)
+    if role_lbl and role_lbl not in entry["roles"]:
         entry["roles"].append(role_lbl)
     entry["archetypes"].append(f"{_short_arch_name(row.archetype_title)} (×{rep})")
     entry["calls"] += rep
@@ -508,8 +520,14 @@ def _materialize_card(prio: int, entry: Mapping[str, Any], card_id: str, fw_by_c
     )
 
 
-def _passes_sign_veto(saved_ms: float, saved_upt: float) -> bool:
-    return saved_ms > 0.0 or (saved_ms == 0.0 and saved_upt > 0.0)
+def _passes_materiality_gate(
+    saved_ms: float, saved_upt: float, *, min_saved_ms: float = NEW_KERNEL_MIN_SAVED_MS,
+) -> bool:
+    """Enforce the inclusive ``>= 0.050 ms`` and ``> 0 us/(tok*die)`` materiality gate."""
+    return (
+        float(saved_ms) >= float(min_saved_ms) - TUNE_THRESHOLD_TOL_MS
+        and float(saved_upt) > 0.0
+    )
 
 
 def _build_framework_track_rows(
@@ -526,7 +544,7 @@ def _build_framework_track_rows(
         opcode = str(rec.get("opcode") or "").strip()
         if opcode not in STRUCTURAL_EDIT_OPCODES:
             continue
-        edit_id = str(rec.get("edit_id") or opcode).strip()
+        edit_id = sanitize_public_text(rec.get("edit_id") or opcode) or opcode
         in_ops = {str(x) for x in (rec.get("input_occurrences") or rec.get("affected_ops") or ()) if x}
         out_ops = {str(x) for x in (rec.get("output_occurrences") or ()) if x}
         matched = [
@@ -539,35 +557,38 @@ def _build_framework_track_rows(
             only_row = aligned_rows[matched[0]]
             if len(only_row.before_ops) == 1 and len(only_row.after_ops) == 1:
                 continue
-        if opcode == "FuseRegion" and not any(len(aligned_rows[i].before_ops) >= MIN_FUSION_MEMBERS and len(aligned_rows[i].after_ops) == 1 for i in matched):
-            continue
+        if opcode == "FuseRegion":
+            if not any(len(aligned_rows[i].before_ops) >= MIN_FUSION_MEMBERS and len(aligned_rows[i].after_ops) == 1 for i in matched):
+                continue
+            if all(accounting[i].bucket == "residual" for i in matched):
+                continue
         rkey = (opcode, tuple(sorted(matched)))
         if rkey in seen_regions:
             continue
         seen_regions.add(rkey)
         saved_ms, saved_upt = sum(accounting[i].saved_ms for i in matched), sum(accounting[i].saved_upt for i in matched)
-        if not _passes_sign_veto(saved_ms, saved_upt):
+        if not _passes_materiality_gate(saved_ms, saved_upt):
             continue
-        b_names = [op.ascend_kernel for i in matched for op in aligned_rows[i].before_ops]
-        a_names = [op.ascend_kernel for i in matched for op in aligned_rows[i].after_ops]
+        b_names = [sanitize_public_text(op.ascend_kernel) for i in matched for op in aligned_rows[i].before_ops]
+        a_names = [sanitize_public_text(op.ascend_kernel) for i in matched for op in aligned_rows[i].after_ops]
         chain = f"{' + '.join(dict.fromkeys(b_names))} -> {' + '.join(dict.fromkeys(a_names)) or 'eliminated'}"
         linked = [card_by_row[i] for i in matched if i in card_by_row]
         detail = f"[{opcode}] {chain} (Δ={format_signed_gain_text(saved_ms)}, Δ摊薄={saved_upt:.2f} us/(tok·die))"
         for card in linked:
             fw_by_card.setdefault(card.card_id, detail)
         fw_rows.append(ActionRoadmapRow(
-            track=TRACK_FRAMEWORK, track_label="[B] 框架图改写项 (Graph Rewrite)",
+            track=TRACK_FRAMEWORK, track_label=THREE_TRACK_LABELS[TRACK_FRAMEWORK],
             title=f"{opcode}: {' + '.join(dict.fromkeys(a_names)) or edit_id}", expected_gain_ms=saved_ms,
             action_detail=detail, cross_ref=f"Sheet 4 Card #{linked[0].priority} ({linked[0].card_id})" if linked else f"Edit {edit_id}",
         ))
 
     if not fw_rows:
         for item in pending_items:
-            if item.category == PENDING_KIND_TO_IMPLEMENT and _passes_sign_veto(item.expected_gain_ms, item.saved_us_per_tok_die):
+            if item.category == PENDING_KIND_TO_IMPLEMENT and _passes_materiality_gate(item.expected_gain_ms, item.saved_us_per_tok_die):
                 detail = f"[FuseRegion] {item.replaces_chain} -> {item.target_kernel} (Δ={format_signed_gain_text(item.expected_gain_ms)})"
                 fw_by_card.setdefault(item.card_id, detail)
                 fw_rows.append(ActionRoadmapRow(
-                    track=TRACK_FRAMEWORK, track_label="[B] 框架图改写项 (Graph Rewrite)",
+                    track=TRACK_FRAMEWORK, track_label=THREE_TRACK_LABELS[TRACK_FRAMEWORK],
                     title=f"FuseRegion: {item.target_kernel.split('[', 1)[0].strip()} ({item.submodule})",
                     expected_gain_ms=item.expected_gain_ms, action_detail=detail,
                     cross_ref=f"Sheet 4 Card #{item.priority} ({item.card_id})",
@@ -580,9 +601,25 @@ def _extract_audit_issues(script_audit: Any) -> list[tuple[str, str, str, str]]:
     if script_audit is None:
         return []
     if hasattr(script_audit, "issues"):
-        return [(str(getattr(i, "title", "")), str(getattr(i, "current_value", "")), str(getattr(i, "recommended_value", "")), str(getattr(i, "impact_note", ""))) for i in (getattr(script_audit, "issues") or ())]
+        return [
+            (
+                sanitize_public_text(getattr(i, "title", "")),
+                sanitize_public_text(getattr(i, "current_value", "")),
+                sanitize_public_text(getattr(i, "recommended_value", "")),
+                sanitize_public_text(getattr(i, "impact_note", "")),
+            )
+            for i in (getattr(script_audit, "issues") or ())
+        ]
     if isinstance(script_audit, Mapping):
-        return [(str(r.get("title") or ""), str(r.get("current") or ""), str(r.get("recommended") or ""), str(r.get("impact") or "")) for r in (script_audit.get("issues_found") or ()) if isinstance(r, Mapping)]
+        return [
+            (
+                sanitize_public_text(r.get("title") or ""),
+                sanitize_public_text(r.get("current") or ""),
+                sanitize_public_text(r.get("recommended") or ""),
+                sanitize_public_text(r.get("impact") or ""),
+            )
+            for r in (script_audit.get("issues_found") or ()) if isinstance(r, Mapping)
+        ]
     return []
 
 
@@ -590,7 +627,7 @@ def _build_track_a_rows(before_bundle: ExportBundle, after_bundle: ExportBundle,
     if script_audit is not None:
         return [
             ActionRoadmapRow(
-                track=TRACK_CONFIG_ENV, track_label="[A] 部署脚本配置整改项 (Script Audit)",
+                track=TRACK_CONFIG_ENV, track_label=THREE_TRACK_LABELS[TRACK_CONFIG_ENV],
                 title=title, expected_gain_ms=None, action_detail=f"{cur_val} -> {rec_val} | {impact}",
                 cross_ref="Script Audit / optimized_serve.sh", before_value=cur_val, after_value=rec_val,
             )
@@ -599,7 +636,7 @@ def _build_track_a_rows(before_bundle: ExportBundle, after_bundle: ExportBundle,
     if is_comparison:
         return [
             ActionRoadmapRow(
-                track=TRACK_CONFIG_ENV, track_label="[A] 并行与配置变更 (Co-Design Diff)",
+                track=TRACK_CONFIG_ENV, track_label=THREE_TRACK_LABELS[TRACK_CONFIG_ENV],
                 title=field_lbl, expected_gain_ms=None, action_detail=f"{field_lbl} · {bv} -> {av}",
                 cross_ref="Sheet 1 Block 1", before_value=bv, after_value=av,
             )
@@ -757,7 +794,7 @@ def build_comparison_plan(
     final_cards = tuple(_materialize_card(p, e, card_id_by_key[e["kernel_key"]], fw_by_card) for p, e in enumerate(displayed_entries, 1))
     roadmap = _build_track_a_rows(before_bundle, after, is_comparison=is_comparison, script_audit=script_audit) + fw_rows + [
         ActionRoadmapRow(
-            track=TRACK_KERNEL, track_label=f"[C] {item.category}",
+            track=TRACK_KERNEL, track_label=f"{THREE_TRACK_LABELS[TRACK_KERNEL]} · {item.category}",
             title=f"{item.target_kernel} ({item.before_model_ms:.3f} -> {item.after_model_ms:.3f} ms)",
             expected_gain_ms=item.expected_gain_ms, action_detail=item.kernel_action,
             cross_ref=f"Sheet 4 Card #{item.priority} ({item.card_id})",
@@ -801,9 +838,9 @@ def build_actionable_roadmap(
         ).roadmap
     roadmap = _build_track_a_rows(before_bundle, after_bundle, is_comparison=(after_bundle is not before_bundle), script_audit=script_audit)
     for item in pending_items:
-        if item.category == PENDING_KIND_TO_IMPLEMENT and _passes_sign_veto(item.expected_gain_ms, item.saved_us_per_tok_die):
+        if item.category == PENDING_KIND_TO_IMPLEMENT and _passes_materiality_gate(item.expected_gain_ms, item.saved_us_per_tok_die):
             roadmap.append(ActionRoadmapRow(
-                track=TRACK_FRAMEWORK, track_label="[B] 框架图改写项 (Graph Rewrite)",
+                track=TRACK_FRAMEWORK, track_label=THREE_TRACK_LABELS[TRACK_FRAMEWORK],
                 title=f"FuseRegion: {item.target_kernel.split('[', 1)[0].strip()} ({item.submodule})",
                 expected_gain_ms=item.expected_gain_ms,
                 action_detail=item.framework_action or f"[FuseRegion] {item.replaces_chain} -> {item.target_kernel}",
@@ -811,7 +848,7 @@ def build_actionable_roadmap(
             ))
     for item in pending_items[:MAX_ROADMAP_KERNEL_ITEMS]:
         roadmap.append(ActionRoadmapRow(
-            track=TRACK_KERNEL, track_label=f"[C] {item.category}",
+            track=TRACK_KERNEL, track_label=f"{THREE_TRACK_LABELS[TRACK_KERNEL]} · {item.category}",
             title=f"{item.target_kernel} ({item.before_model_ms:.3f} -> {item.after_model_ms:.3f} ms)",
             expected_gain_ms=item.expected_gain_ms, action_detail=item.kernel_action,
             cross_ref=f"Sheet 4 Card #{item.priority} ({item.card_id})",
@@ -820,7 +857,7 @@ def build_actionable_roadmap(
 
 
 __all__ = [
-    "CONSERVATION_EPS_MS", "MAX_DISPLAY_CARDS", "TUNE_MIN_SAVED_MS",
+    "CONSERVATION_EPS_MS", "MAX_DISPLAY_CARDS", "NEW_KERNEL_MIN_SAVED_MS", "TUNE_MIN_SAVED_MS",
     "ComparisonPlan", "GroupAccounting", "WaterfallSummary",
     "build_actionable_roadmap", "build_comparison_plan", "build_new_kernel_backlog",
     "build_parallelism_codesign_note", "build_pending_kernel_details", "format_signed_gain_text",
