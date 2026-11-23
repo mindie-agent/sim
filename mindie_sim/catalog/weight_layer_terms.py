@@ -20,7 +20,9 @@
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import replace
+from typing import Any
 
 from mindie_sim.catalog.quant import projection_quant
 from mindie_sim.catalog.types import QuantSpec
@@ -33,6 +35,89 @@ MX32_WEIGHT_BLOCK = (1, 32)
 LINEAR_KDA_FAMILY_KINDS = frozenset({
     "kda", "mamba", "gla", "deltanet", "lightning", "retnet",
 })
+
+
+def _merge_layer_quant_override(base: QuantSpec, raw: Any) -> QuantSpec:
+    """Apply one per-layer quant override (``QuantSpec`` or mapping) onto ``base``."""
+    if isinstance(raw, QuantSpec):
+        return raw
+    if not isinstance(raw, Mapping):
+        return base
+    updates: dict[str, Any] = {}
+    for field in (
+        "weight_format", "activation_format", "expert_weight_format",
+        "kv_dtype", "index_dtype", "index_scale_dtype", "scale_format",
+        "scale_bytes", "weight_block", "expert_block",
+        "activation_group_size", "activation_scale_format",
+        "activation_scale_pack", "output_format", "native_format",
+    ):
+        if field in raw and raw[field] is not None:
+            updates[field] = raw[field]
+    if "exclusions" in raw and raw["exclusions"] is not None:
+        updates["exclusions"] = tuple(dict.fromkeys((*base.exclusions, *raw["exclusions"])))
+    if "category_overrides" in raw and isinstance(raw["category_overrides"], Mapping):
+        merged = {k: dict(v) for k, v in base.category_overrides}
+        for cat, fields in raw["category_overrides"].items():
+            cur = dict(merged.get(str(cat), {}))
+            cur.update(dict(fields))
+            merged[str(cat)] = cur
+        updates["category_overrides"] = merged
+    return replace(base, **updates) if updates else base
+
+
+def _lookup_layer_quant_override(model: ModelSpec, plan: LayerPlan) -> Any | None:
+    meta = dict(getattr(model, "metadata", ()) or ())
+    overrides = meta.get("layer_quant_overrides")
+    if not isinstance(overrides, Mapping):
+        return None
+    layers_map = overrides.get("layers") if isinstance(overrides.get("layers"), Mapping) else overrides
+    for key in (str(plan.index), plan.index):
+        if key in layers_map and layers_map[key] is not None:
+            return layers_map[key]
+    native_map = overrides.get("native_layers")
+    native_id = int(getattr(plan, "native_layer_id", -1))
+    if isinstance(native_map, Mapping) and native_id >= 0:
+        for key in (str(native_id), native_id):
+            if key in native_map and native_map[key] is not None:
+                return native_map[key]
+    return None
+
+
+def _layer_resolved_quant(model: ModelSpec, plan: LayerPlan) -> QuantSpec:
+    """Resolve effective per-layer ``QuantSpec`` shared by all layer weight terms.
+
+    Applies per-layer ``layer_quant_overrides``, native defaults for
+    ``attn_res_proj`` (when not explicitly overridden), ``ple_proj`` (honoring
+    ``ple`` exclusions), and fallback propagation from generic ``indexer_fp8``
+    to ``indexer.wk`` / ``indexer.wq`` for unscanned models.
+    """
+    base = model.quant or QuantSpec("bf16")
+    layer_override = _lookup_layer_quant_override(model, plan)
+    if layer_override is not None:
+        base = _merge_layer_quant_override(base, layer_override)
+    resolved = projection_quant(base, plan)
+    explicit = {key: dict(value) for key, value in base.category_overrides}
+    merged = {key: dict(value) for key, value in resolved.category_overrides}
+    native = {"weight_format": base.native_format, "activation_format": base.native_format}
+    changed = False
+
+    if plan.residual_block_size and "attn_res_proj" not in explicit:
+        merged["attn_res_proj"] = dict(native)
+        changed = True
+    if "ple" in base.exclusions and "ple_proj" not in explicit:
+        merged["ple_proj"] = dict(native)
+        changed = True
+    if "indexer" not in explicit and "indexer" not in base.exclusions:
+        for role in ("indexer.wk", "indexer.wq"):
+            if role in explicit or role in base.exclusions:
+                continue
+            if "indexer_fp8" in base.exclusions:
+                merged[role] = dict(native)
+                changed = True
+            elif "indexer_fp8" in merged:
+                merged[role] = dict(merged["indexer_fp8"])
+                changed = True
+    return replace(resolved, category_overrides=merged) if changed else resolved
 
 
 def _gemma4_norm_terms(plan: LayerPlan, model: ModelSpec) -> list[WeightTerm]:
@@ -143,7 +228,7 @@ def _indexer_terms(plan: LayerPlan, model: ModelSpec) -> list[WeightTerm]:
         else:
             terms.extend([
                 _t("indexer_wk", plan.index_dim, width,
-                   "linear_param_bf16" if plan.index_kpool > 1 else "indexer_fp8"),
+                   "linear_param_bf16" if plan.index_kpool > 1 else "indexer.wk"),
                 _t("indexer_k_norm", plan.index_dim, 1,
                    "param_fp32" if plan.index_kpool > 1 else "norm"),
                 _t("indexer_k_norm_bias", plan.index_dim, 1,
@@ -157,7 +242,7 @@ def _indexer_terms(plan: LayerPlan, model: ModelSpec) -> list[WeightTerm]:
     if plan.indexer or plan.owns_topk or plan.index_query_per_layer:
         terms.extend([
             _t("indexer_wq", plan.index_heads * plan.index_dim,
-               plan.q_lora_rank or model.hidden_size, "indexer_fp8"),
+               plan.q_lora_rank or model.hidden_size, "indexer.wq"),
             _t("indexer_weights", plan.index_heads, model.hidden_size,
                "linear_param_bf16" if plan.index_kpool > 1 else "indexer.weights"),
         ])
@@ -397,8 +482,8 @@ def _tag_projection_roles(terms: list[WeightTerm], plan: LayerPlan,
 
 
 def layer_weight_terms(plan: LayerPlan, model: ModelSpec) -> list[WeightTerm]:
-    """Build all tagged weight terms for one model layer."""
-    quant = projection_quant(model.quant or QuantSpec("bf16"), plan)
+    """Build all tagged weight terms for one model layer with layer-resolved quant."""
+    quant = _layer_resolved_quant(model, plan)
     attention = [replace(term, quant=quant) for term in _attention_terms(plan, model)]
     prepared = dict(model.metadata).get("prepared_mx32_matrix", {}).get("layers", {}).get(str(plan.index), ())
     if prepared:
@@ -409,19 +494,22 @@ def layer_weight_terms(plan: LayerPlan, model: ModelSpec) -> list[WeightTerm]:
             if term.name in prepared else term
             for term in attention
         ]
-    return _tag_projection_roles(
-        _norm_terms(plan, model)
-        + gemma4_ple_layer_terms(plan, model)
-        + attention
-        + _mhc_terms(plan, model)
-        + [replace(term, quant=quant) for term in _indexer_terms(plan, model)]
-        + _compressor_terms(plan, model)
-        + _ffn_terms(plan, model),
-        plan,
-    )
+    other = [
+        replace(term, quant=term.quant or quant)
+        for term in (
+            _norm_terms(plan, model)
+            + gemma4_ple_layer_terms(plan, model)
+            + _mhc_terms(plan, model)
+            + _indexer_terms(plan, model)
+            + _compressor_terms(plan, model)
+            + _ffn_terms(plan, model)
+        )
+    ]
+    return _tag_projection_roles(attention + other, plan)
 
 
 __all__ = [
+    "_layer_resolved_quant",
     "gemma4_ple_layer_terms",
     "gemma4_ple_terms",
     "layer_weight_terms",

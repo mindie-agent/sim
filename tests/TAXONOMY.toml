@@ -113,6 +113,24 @@ path = "runtime/test_memory_ledger_and_capacity.py"
 tier = "tier0"
 owns = ["mindie_sim/prediction/cache_path", "mindie_sim/prediction/capacity", "mindie_sim/prediction/efficiency/cost.py", "mindie_sim/prediction/execution"]
 [[module]]
+path = "runtime/test_resident_memory_and_cache_abi.py"
+tier = "tier0"
+owns = [
+  "mindie_sim/prediction/capacity/ledger.py",
+  "mindie_sim/prediction/capacity/cache.py",
+  "mindie_sim/prediction/capacity/requests.py",
+  "mindie_sim/prediction/capacity/residency.py",
+  "mindie_sim/catalog/cache_format.py",
+  "mindie_sim/catalog/cache_index.py",
+  "mindie_sim/catalog/cache_ownership.py",
+  "mindie_sim/catalog/paired_sfa.py",
+  "mindie_sim/catalog/speculative_state.py",
+  "mindie_sim/catalog/weight_layer_terms.py",
+  "mindie_sim/catalog/weights.py",
+  "mindie_sim/catalog/draft.py",
+  "mindie_sim/catalog/draft_weights.py",
+]
+[[module]]
 path = "runtime/test_capacity_allocation_geometry.py"
 tier = "tier0"
 owns = ["mindie_sim/catalog/cache.py", "mindie_sim/catalog/cache_format.py", "mindie_sim/catalog/cache_pages.py", "mindie_sim/catalog/types.py"]

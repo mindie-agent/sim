@@ -109,16 +109,35 @@ def _head_geometry(layer: Any) -> tuple[int, int]:
 
 def record_head_bytes(dk: int, dv: int, kg_dtype: str = DEFAULT_RECORD_KG_DTYPE) -> int:
     """Per-token per-head compact record: FP32 correction + two k/g arrays."""
-    return int(dv) * CORRECTION_BYTES + TWO * int(dk) * int(dtype_bytes(kg_dtype))
+    return int(dv) * CORRECTION_BYTES + 2 * exact_element_bytes(int(dk), kg_dtype)
+
+
+def _conv_slice_width(layer: Any, total_shards: int, local_conv: int, kernel: int) -> int:
+    """Exact per-token convolution channel width on this shard.
+
+    Catalog models store ``conv_width * (kernel - 1)`` history elements and
+    declare ``conv_width > 0`` explicitly. Legacy synthetic layers with
+    ``conv_width == 0`` fall back cleanly to ``kernel - 1`` (or ``kernel`` when
+    the declared buffer is an exact ``kernel``-multiple synthetic fixture).
+    """
+    conv_width = int(getattr(layer, "conv_width", 0) or 0)
+    if conv_width > 0:
+        return _ceil_div(conv_width, total_shards)
+    if local_conv <= 0:
+        return 0
+    history_slots = max(1, kernel - 1)
+    if kernel > 1 and local_conv % history_slots != 0 and local_conv % kernel == 0:
+        return local_conv // kernel
+    return _ceil_div(local_conv, history_slots)
 
 
 def _conv_geometry(layer: Any, parallel: Any, shards: int = 1) -> tuple[int, int, str]:
-    elements = float(getattr(layer, "conv_state_elements", 0) or 0)
-    elements /= max(1, int(parallel.tp)) * max(1, int(shards))
+    total_shards = max(1, int(parallel.tp)) * max(1, int(shards))
+    local_conv = _ceil_div(int(getattr(layer, "conv_state_elements", 0) or 0), total_shards)
     kernel = max(1, int(getattr(layer, "conv_kernel", 0) or 1))
-    width = elements / float(kernel) if kernel else elements
+    width = _conv_slice_width(layer, total_shards, local_conv, kernel)
     dtype = str(getattr(layer, "conv_state_dtype", "") or "bf16")
-    return int(round(width)), kernel, dtype
+    return int(width), kernel, dtype
 
 
 def speculative_state_plan(
@@ -149,10 +168,14 @@ def speculative_state_plan(
     local_conv = _ceil_div(conv_raw, total_shards)
     kernel = max(1, int(getattr(layer, "conv_kernel", 0) or 1))
     conv_dtype = str(getattr(layer, "conv_state_dtype", "") or "bf16")
-    slice_width = _ceil_div(local_conv, kernel) if local_conv > 0 else 0
-    history = max(1, int(contract.get("kernel_history", kernel)))
+    slice_width = _conv_slice_width(layer, total_shards, local_conv, kernel)
+    default_history = max(1, kernel - 1) if (
+        int(getattr(layer, "conv_width", 0) or 0) > 0
+        or (local_conv > 0 and local_conv % max(1, kernel - 1) == 0)
+    ) else kernel
+    history = max(1, int(contract.get("kernel_history", default_history)))
     conv_snapshots = int(contract.get("conv_snapshot_slots", 0) or 0)
-    base_conv_elements = local_conv if history == kernel else slice_width * history
+    base_conv_elements = local_conv if history == default_history else slice_width * history
     if conv_snapshots > 0:
         conv_bytes = float(exact_element_bytes(conv_snapshots * base_conv_elements, conv_dtype))
     else:

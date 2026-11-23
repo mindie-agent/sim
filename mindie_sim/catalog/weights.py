@@ -36,6 +36,7 @@ from mindie_sim.catalog.weight_layer_terms import (
     _ffn_terms,
     _gemma4_norm_terms,
     _indexer_terms,
+    _layer_resolved_quant,
     _mhc_terms,
     _norm_terms,
     _tag_projection_roles,
@@ -125,17 +126,24 @@ def _expand_resident_terms(
     return ((term, placed),)
 
 
-def _special_layer_keys(model: ModelSpec) -> set[str]:
+def _special_layer_keys(model: ModelSpec) -> tuple[set[str], set[str]]:
     meta = dict(model.metadata)
-    found: set[str] = set()
+    by_index: set[str] = set()
+    by_native: set[str] = set()
     for name in ("prepared_mx32_matrix", "mla_head_padding",
-                 "kda_input_projection", "causal_conv_update"):
+                 "kda_input_projection", "causal_conv_update",
+                 "layer_quant_overrides"):
         block = meta.get(name)
-        if isinstance(block, dict):
+        if isinstance(block, Mapping):
             layers = block.get("layers")
-            if isinstance(layers, dict):
-                found.update(str(k) for k in layers)
-    return found
+            if isinstance(layers, Mapping):
+                by_index.update(str(k) for k in layers)
+            elif name == "layer_quant_overrides":
+                by_index.update(str(k) for k in block if k != "native_layers")
+            native_layers = block.get("native_layers")
+            if isinstance(native_layers, Mapping):
+                by_native.update(str(k) for k in native_layers)
+    return by_index, by_native
 
 
 def _cache_key(obj: Any) -> Any:
@@ -147,14 +155,16 @@ def _cache_key(obj: Any) -> Any:
 
 
 def _iter_model_layer_terms(model: ModelSpec):
-    special = _special_layer_keys(model)
+    special_idx, special_native = _special_layer_keys(model)
     memo: dict[Any, tuple[WeightTerm, ...]] = {}
     for plan in model.layer_plans:
-        if str(plan.index) in special:
+        native_id = int(getattr(plan, "native_layer_id", -1))
+        if str(plan.index) in special_idx or (native_id >= 0 and str(native_id) in special_native):
             yield plan.index, tuple(layer_weight_terms(plan, model))
             continue
         shares_kv = 0 <= plan.kv_owner_layer_id < plan.index
-        ck = _cache_key((replace(plan, index=0, native_layer_id=0), shares_kv))
+        layer_quant = _layer_resolved_quant(model, plan)
+        ck = _cache_key((replace(plan, index=0, native_layer_id=0), shares_kv, layer_quant))
         cached = memo.get(ck) if ck is not None else None
         if cached is None:
             cached = tuple(layer_weight_terms(plan, model))
@@ -167,6 +177,7 @@ def stage_weight_decomposition(
     model: ModelSpec, parallel: ParallelSpec, node_ranks: int = 1, *,
     include_draft: bool = False, include_engram: bool = True,
     include_engram_tables: bool | None = None,
+    include_vision: bool | None = None,
     layer_partition: Sequence[int] | None = None,
     enable_shared_expert_dp: bool = False,
     enable_pcp_o_proj_weight_sharding: bool = False,
@@ -178,7 +189,8 @@ def stage_weight_decomposition(
     pair_memo: dict[Any, tuple[float, float]] = {}
     for terms in stage_weight_terms(
         model, parallel, include_draft=include_draft, include_engram=include_engram,
-        include_engram_tables=include_engram_tables, layer_partition=layer_partition,
+        include_engram_tables=include_engram_tables, include_vision=include_vision,
+        layer_partition=layer_partition,
     ):
         total = 0.0
         payload = 0.0
@@ -204,9 +216,15 @@ def stage_weight_decomposition(
     return stages
 
 
-def vision_weight_terms(model: ModelSpec) -> list[WeightTerm]:
+def vision_weight_terms(
+    model: ModelSpec, *, include_vision: bool | None = None,
+) -> list[WeightTerm]:
     vision = model.vision
-    if vision is None or (model.auxiliary is not None and not model.auxiliary.include_vision_weights):
+    if vision is None:
+        return []
+    if include_vision is False:
+        return []
+    if include_vision is None and (model.auxiliary is not None and not model.auxiliary.include_vision_weights):
         return []
     terms = [
         _t("vision_patch", vision.hidden_size, vision.patch_input_width, "vision"),
@@ -270,6 +288,19 @@ def vision_weight_terms(model: ModelSpec) -> list[WeightTerm]:
     return terms
 
 
+def _output_res_quant(model: ModelSpec) -> QuantSpec:
+    base = model.quant or QuantSpec("bf16")
+    explicit = {key: dict(val) for key, val in base.category_overrides}
+    if "attn_res_proj" in explicit:
+        return base
+    merged = dict(explicit)
+    merged["attn_res_proj"] = {
+        "weight_format": base.native_format,
+        "activation_format": base.native_format,
+    }
+    return replace(base, category_overrides=merged)
+
+
 def body_head_terms(model: ModelSpec) -> list[WeightTerm]:
     h = model.hidden_size
     lowrank_hc = any(plan.hc_lowrank > 0 for plan in model.layer_plans)
@@ -279,7 +310,11 @@ def body_head_terms(model: ModelSpec) -> list[WeightTerm]:
         if not model.tie_word_embeddings:
             terms.append(replace(_t("lm_head", model.vocab_size, h, "lm_head", "out_tp"), placement_role="logits"))
     if any(plan.residual_block_size for plan in model.layer_plans):
-        terms.extend([_t("output_attn_res_norm", h, 1, "norm"), _t("output_attn_res_proj", 1, h, "attn_res_proj")])
+        res_quant = _output_res_quant(model)
+        terms.extend([
+            _t("output_attn_res_norm", h, 1, "norm"),
+            replace(_t("output_attn_res_proj", 1, h, "attn_res_proj"), quant=res_quant),
+        ])
     if lowrank_hc:
         from mindie_sim.catalog.qwen4_exp import lowrank_hc_head_terms
         terms.extend(lowrank_hc_head_terms(model))
@@ -309,7 +344,16 @@ def engram_gate_terms_by_layer(model: ModelSpec) -> dict[int, list[WeightTerm]]:
         return {}
     from mindie_sim.catalog.qwen4_exp import is_qwen4_exp_ple, ple_gate_terms_by_layer
     if is_qwen4_exp_ple(engram):
-        return ple_gate_terms_by_layer(model)
+        raw_ple = ple_gate_terms_by_layer(model)
+        plans_by_idx = {int(p.index): p for p in model.layer_plans}
+        resolved_ple: dict[int, list[WeightTerm]] = {}
+        for layer_id, layer_terms in raw_ple.items():
+            plan = plans_by_idx.get(int(layer_id))
+            lquant = _layer_resolved_quant(model, plan) if plan is not None else (model.quant or QuantSpec("bf16"))
+            resolved_ple[int(layer_id)] = [
+                replace(term, quant=term.quant or lquant) for term in layer_terms
+            ]
+        return resolved_ple
     hc = max((p.hc_mult for p in model.layer_plans), default=0)
     columns = engram.columns_per_table
     by_layer: dict[int, list[WeightTerm]] = {}
@@ -372,6 +416,7 @@ def stage_weight_terms(
     model: ModelSpec, parallel: ParallelSpec, *,
     include_draft: bool = False, include_engram: bool = True,
     include_engram_tables: bool | None = None,
+    include_vision: bool | None = None,
     layer_partition: Sequence[int] | None = None,
     draft_kind: str | None = None,
     slot_plans: Mapping[int, Any] | None = None,
@@ -403,7 +448,7 @@ def stage_weight_terms(
     for term in body_head_terms(model):
         stages[0 if term.name == "embedding" else pp - 1].append(term)
     if model.vision is not None:
-        stages[0].extend(vision_weight_terms(model))
+        stages[0].extend(vision_weight_terms(model, include_vision=include_vision))
     tables_in_hbm = include_engram if include_engram_tables is None else include_engram_tables
     if include_engram:
         if tables_in_hbm:
@@ -435,6 +480,7 @@ def stage_weight_bytes(
     model: ModelSpec, parallel: ParallelSpec, node_ranks: int = 1, *,
     include_draft: bool = False, include_engram: bool = True,
     include_engram_tables: bool | None = None,
+    include_vision: bool | None = None,
     source: bool = False, layer_partition: Sequence[int] | None = None,
     draft_kind: str | None = None, enable_shared_expert_dp: bool = False,
     enable_pcp_o_proj_weight_sharding: bool = False,
@@ -447,7 +493,8 @@ def stage_weight_bytes(
     for terms in stage_weight_terms(
         model, parallel, include_draft=include_draft, draft_kind=draft_kind,
         include_engram=include_engram, include_engram_tables=include_engram_tables,
-        layer_partition=layer_partition, slot_plans=slot_plans, ep_rank=ep_rank,
+        include_vision=include_vision, layer_partition=layer_partition,
+        slot_plans=slot_plans, ep_rank=ep_rank,
     ):
         stage_total = 0.0
         for term in terms:
@@ -471,7 +518,8 @@ def stage_weight_bytes(
 def sharded_weight_bytes(
     model: ModelSpec, parallel: ParallelSpec, node_ranks: int = 1, *,
     include_draft: bool = False, include_engram: bool = True,
-    include_engram_tables: bool = True, enable_shared_expert_dp: bool = False,
+    include_engram_tables: bool = True, include_vision: bool | None = None,
+    enable_shared_expert_dp: bool = False,
     enable_pcp_o_proj_weight_sharding: bool = False,
     dcp_q_replicate: bool = False,
 ) -> float:
@@ -479,6 +527,7 @@ def sharded_weight_bytes(
         model, parallel, node_ranks, include_draft=include_draft,
         include_engram=include_engram,
         include_engram_tables=include_engram_tables,
+        include_vision=include_vision,
         enable_shared_expert_dp=enable_shared_expert_dp,
         enable_pcp_o_proj_weight_sharding=enable_pcp_o_proj_weight_sharding,
         dcp_q_replicate=dcp_q_replicate,
@@ -486,24 +535,31 @@ def sharded_weight_bytes(
 
 
 def cache_row_bytes_by_layer(model: ModelSpec) -> tuple[tuple[int, int], ...]:
-    """Per-layer cache row width using the declared cache representation."""
+    """Per-layer cache row width using each layer's resolved cache ABI."""
     from mindie_sim.catalog.cache import packed_region_row_bytes
-    from mindie_sim.catalog.cache_format import cache_format
+    from mindie_sim.catalog.cache_format import gqa_kv_formats
     from mindie_sim.catalog.cache_pools import _packed_mla_row_bytes
-    gqa = cache_format(model, "gqa_kv")
     rows = []
     for plan in model.layer_plans:
         if (plan.attention in {"gqa", "projection_only"} and plan.cache_kind == "dense"
                 and not 0 <= plan.kv_owner_layer_id < plan.index):
-            row = gqa.row_bytes(plan.cache_row_elements)
+            key_fmt, val_fmt, is_shared = gqa_kv_formats(model, plan=plan)
+            if is_shared:
+                row = key_fmt.row_bytes(plan.cache_row_elements)
+            else:
+                side = int(plan.num_kv_heads) * int(plan.head_dim)
+                row = key_fmt.row_bytes(side) + val_fmt.row_bytes(side)
         elif plan.attention == "mla":
             if plan.cache_kind == "dense":
                 row = _packed_mla_row_bytes(model, plan)
             elif plan.window > 0:
-                row = packed_region_row_bytes(model, "window", plan.cache_row_elements)
+                row = packed_region_row_bytes(
+                    model, "window", plan.cache_row_elements, plan=plan,
+                )
             elif plan.owns_long_kv:
                 row = packed_region_row_bytes(
-                    model, "compressed_kv", plan.cache_row_elements)
+                    model, "compressed_kv", plan.cache_row_elements, plan=plan,
+                )
             else:
                 row = 0
         else:

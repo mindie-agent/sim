@@ -1,16 +1,31 @@
-"""Runtime capacity bindings and physical allocation accounting.
+"""Runtime capacity bindings, simultaneous per-die peaks, and resident receipts.
 
-[Role] Bind typed pools and charge live physical backing ranges.
-[Invariants] Each physical generation is charged for the union of live ranges.
-  Budget checks and peak counters use the same committed accounting.
+[Role] Bind typed pools, charge live physical backing ranges, and emit the
+  authoritative per-die ``ResidentMemoryReceipt`` and ``RecoverSSM`` snapshot
+  ring HBM headroom calculations consumed by admission, solvers, and export.
+[Invariants] Each physical ``(backing_id, generation, die, tier)`` is billed
+  once for the union of live ranges. Invalid ranks raise
+  ``ValueError("memory_rank_out_of_range")`` instead of coercing to rank 0.
+  Peaks are true simultaneous per-die maxima, never cross-rank sums of separate
+  resident and staging maxima.
 [Timeouts & Locks] Bounded by physical ranks and live holders. No locks or I/O.
-[Side-Effect Policy] Mutates this prediction’s capacity domain and usage counters.
+[Side-Effect Policy] Mutates only this prediction's capacity domain and usage
+  counters; receipt builders are pure read-only projections.
 """
 from __future__ import annotations
 
+from collections.abc import Sequence
+from dataclasses import dataclass
 import math
+from typing import Any
 
 from mindie_sim.catalog.cache_pages import Allocation
+from mindie_sim.catalog.cache_pools import exact_element_bytes
+from mindie_sim.schema.scenario import (
+    VISION_ACCOUNTING_SCOPES,
+    SpaceTimeTradeoffSpec,
+)
+from mindie_sim.schema.stack import PreparedWeightSpec
 
 from ..runtime.contracts import (
     AllocationBinding,
@@ -28,6 +43,292 @@ from .contracts import (
     _hashable_generation,
     _union_bytes,
 )
+
+
+@dataclass(frozen=True)
+class ResidentGrantEntry:
+    """One physical backing grant inside a per-die ``ResidentMemoryReceipt``."""
+
+    grant_id: str
+    category: str
+    physical_backing_id: str
+    alias_of: str = ""
+    generation: int = 0
+    tier: str = "hbm"
+    checkpoint_bytes: int = 0
+    runtime_bytes: int = 0
+    allocated_bytes: int = 0
+    valid_bytes: int = 0
+    lifetime: str = "persistent"
+    billed_once_bytes: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "grant_id": self.grant_id,
+            "category": self.category,
+            "physical_backing_id": self.physical_backing_id,
+            "alias_of": self.alias_of,
+            "generation": int(self.generation),
+            "tier": self.tier,
+            "checkpoint_bytes": int(self.checkpoint_bytes),
+            "runtime_bytes": int(self.runtime_bytes),
+            "allocated_bytes": int(self.allocated_bytes),
+            "valid_bytes": int(self.valid_bytes),
+            "lifetime": self.lifetime,
+            "billed_once_bytes": int(self.billed_once_bytes),
+        }
+
+
+@dataclass(frozen=True)
+class DieResidentReceipt:
+    """Simultaneous live and peak HBM residency on one physical die."""
+
+    replica: int
+    stage: int
+    rank: int
+    die_id: int
+    usable_hbm_bytes: int
+    checkpoint_weight_bytes: int
+    prepared_weight_bytes: int
+    prepared_load_peak_bytes: int
+    vision_weight_bytes: int
+    kv_cache_allocated_bytes: int
+    kv_cache_valid_bytes: int
+    index_cache_allocated_bytes: int
+    index_cache_valid_bytes: int
+    recurrent_state_bytes: int
+    draft_cache_bytes: int
+    workspace_bytes: int
+    reserve_bytes: int
+    staging_bytes: int
+    dynamic_grant_bytes: int
+    simultaneous_live_hbm_bytes: int
+    simultaneous_peak_hbm_bytes: int
+    load_peak_hbm_bytes: int
+    free_hbm_headroom_bytes: int
+    host_dram_bytes: int
+    grants: tuple[ResidentGrantEntry, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "replica": int(self.replica),
+            "stage": int(self.stage),
+            "rank": int(self.rank),
+            "die_id": int(self.die_id),
+            "usable_hbm_bytes": int(self.usable_hbm_bytes),
+            "checkpoint_weight_bytes": int(self.checkpoint_weight_bytes),
+            "prepared_weight_bytes": int(self.prepared_weight_bytes),
+            "prepared_load_peak_bytes": int(self.prepared_load_peak_bytes),
+            "vision_weight_bytes": int(self.vision_weight_bytes),
+            "kv_cache_allocated_bytes": int(self.kv_cache_allocated_bytes),
+            "kv_cache_valid_bytes": int(self.kv_cache_valid_bytes),
+            "index_cache_allocated_bytes": int(self.index_cache_allocated_bytes),
+            "index_cache_valid_bytes": int(self.index_cache_valid_bytes),
+            "recurrent_state_bytes": int(self.recurrent_state_bytes),
+            "draft_cache_bytes": int(self.draft_cache_bytes),
+            "workspace_bytes": int(self.workspace_bytes),
+            "reserve_bytes": int(self.reserve_bytes),
+            "staging_bytes": int(self.staging_bytes),
+            "dynamic_grant_bytes": int(self.dynamic_grant_bytes),
+            "simultaneous_live_hbm_bytes": int(self.simultaneous_live_hbm_bytes),
+            "simultaneous_peak_hbm_bytes": int(self.simultaneous_peak_hbm_bytes),
+            "load_peak_hbm_bytes": int(self.load_peak_hbm_bytes),
+            "free_hbm_headroom_bytes": int(self.free_hbm_headroom_bytes),
+            "host_dram_bytes": int(self.host_dram_bytes),
+            "grants": [grant.to_dict() for grant in self.grants],
+        }
+
+
+@dataclass(frozen=True)
+class ResidentMemoryReceipt:
+    """Authoritative per-die resident memory receipt keyed by scenario/phase/occurrence."""
+
+    scenario: str
+    phase: str
+    occurrence: str
+    vision_accounting: str
+    dies: tuple[DieResidentReceipt, ...]
+
+    @property
+    def peak_die_hbm_bytes(self) -> int:
+        return max((die.simultaneous_peak_hbm_bytes for die in self.dies), default=0)
+
+    @property
+    def min_free_hbm_headroom_bytes(self) -> int:
+        return min((die.free_hbm_headroom_bytes for die in self.dies), default=0)
+
+    def die_receipt(self, replica: int, stage: int, rank: int) -> DieResidentReceipt:
+        for die in self.dies:
+            if die.replica == replica and die.stage == stage and die.rank == rank:
+                return die
+        raise KeyError((replica, stage, rank))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "scenario": self.scenario,
+            "phase": self.phase,
+            "occurrence": self.occurrence,
+            "vision_accounting": self.vision_accounting,
+            "peak_die_hbm_bytes": self.peak_die_hbm_bytes,
+            "min_free_hbm_headroom_bytes": self.min_free_hbm_headroom_bytes,
+            "dies": [die.to_dict() for die in self.dies],
+        }
+
+
+@dataclass(frozen=True)
+class RecoverSsmRingBreakdown:
+    """Exact HBM cost of storing ``K`` speculative SSM snapshots vs ``RecoverSSM``."""
+
+    batch_per_dp: int
+    k_proposals: int
+    verify_width: int
+    linear_layers: int
+    max_stage_linear_layers: int
+    snapshot_ring_bytes_per_die: int
+    base_state_bytes_per_die: int
+    replay_records_bytes_per_die: int
+    delta_hbm_vs_recover_ssm_bytes: int
+    stage_snapshot_ring_bytes: tuple[int, ...]
+    stage_delta_vs_recover_ssm_bytes: tuple[int, ...]
+
+
+def prepared_weight_bytes(spec: PreparedWeightSpec) -> int:
+    """Exact runtime HBM bytes for one ``PreparedWeightSpec`` (0 when aliased)."""
+    if spec.alias_of:
+        return 0
+    elements = math.prod(spec.local_shape) if spec.local_shape else 0
+    payload = exact_element_bytes(elements, spec.dtype) if elements > 0 else 0
+    return int(payload + int(spec.extra_metadata_bytes))
+
+
+def recover_ssm_snapshot_ring_breakdown(
+    case: Any,
+    batch_per_dp: int,
+    k_proposals: int,
+    *,
+    runtime: Any = None,
+) -> RecoverSsmRingBreakdown:
+    """Exact per-die HBM cost of keeping ``K`` SSM snapshot ring slots per request."""
+    from mindie_sim.catalog.cache import layer_stage_map
+    from mindie_sim.catalog.cache_pools import LINEAR_ATTENTION_KINDS
+    from mindie_sim.catalog.speculative_state import speculative_state_plan
+
+    batch = int(batch_per_dp)
+    k = int(k_proposals)
+    if batch < 0 or k < 0:
+        raise ValueError("recover_ssm_ring_args_must_be_nonnegative")
+    rt = runtime if runtime is not None else case.runtime
+    model = case.model
+    parallel = rt.parallel
+    pp = max(1, int(parallel.pp))
+    stage_map = layer_stage_map(model, parallel, rt)
+    stage_extra = [0] * pp
+    stage_base = [0] * pp
+    stage_replay = [0] * pp
+    stage_delta = [0] * pp
+    stage_layers = [0] * pp
+    verify_width = k + 1
+    for plan in model.layer_plans:
+        if plan.attention not in LINEAR_ATTENTION_KINDS:
+            continue
+        stage = stage_map[plan.index] if plan.index < len(stage_map) else pp - 1
+        stage_layers[stage] += 1
+        if batch == 0:
+            continue
+        ckpt = speculative_state_plan(
+            model, plan, parallel, query_tokens=verify_width,
+            recover_ssm=False, capacity_padded=True,
+            state_contract=getattr(plan, "state_contract", None), runtime=rt,
+        )
+        replay = speculative_state_plan(
+            model, plan, parallel, query_tokens=verify_width,
+            recover_ssm=True, capacity_padded=True,
+            state_contract=getattr(plan, "state_contract", None), runtime=rt,
+        )
+        base_b = int(round(replay.recurrent_bytes))
+        extra_b = max(0, int(round(ckpt.recurrent_bytes)) - base_b)
+        replay_b = int(round(replay.replay_bytes))
+        delta_b = int(round(ckpt.total_bytes - replay.total_bytes))
+        stage_base[stage] += batch * base_b
+        stage_extra[stage] += batch * extra_b
+        stage_replay[stage] += batch * replay_b
+        stage_delta[stage] += batch * delta_b
+    return RecoverSsmRingBreakdown(
+        batch_per_dp=batch,
+        k_proposals=k,
+        verify_width=verify_width,
+        linear_layers=sum(stage_layers),
+        max_stage_linear_layers=max(stage_layers, default=0),
+        snapshot_ring_bytes_per_die=max(stage_extra, default=0),
+        base_state_bytes_per_die=max(stage_base, default=0),
+        replay_records_bytes_per_die=max(stage_replay, default=0),
+        delta_hbm_vs_recover_ssm_bytes=max(stage_delta, default=0),
+        stage_snapshot_ring_bytes=tuple(stage_extra),
+        stage_delta_vs_recover_ssm_bytes=tuple(stage_delta),
+    )
+
+
+def estimate_recover_ssm_snapshot_ring_bytes(
+    case: Any,
+    batch_per_dp: int,
+    k_proposals: int,
+    *,
+    net_over_replay: bool = False,
+    runtime: Any = None,
+) -> int:
+    """Exact bottleneck-die HBM bytes required for ``RecoverSSM`` snapshot ring."""
+    bd = recover_ssm_snapshot_ring_breakdown(
+        case, batch_per_dp, k_proposals, runtime=runtime,
+    )
+    return (
+        bd.delta_hbm_vs_recover_ssm_bytes
+        if net_over_replay else bd.snapshot_ring_bytes_per_die
+    )
+
+
+def _deduplicate_grant_entries(
+    entries: Sequence[ResidentGrantEntry],
+) -> tuple[tuple[ResidentGrantEntry, ...], int]:
+    """Resolve ``alias_of`` chains and bill each ``(backing_id, gen, tier)`` ONCE."""
+    by_id = {entry.grant_id: entry for entry in entries}
+    billed_peaks: dict[tuple[str, int, str], int] = {}
+    resolved_entries: list[ResidentGrantEntry] = []
+    for entry in entries:
+        backing = entry.physical_backing_id or entry.grant_id
+        seen: set[str] = set()
+        alias = entry.alias_of
+        while alias and alias not in seen:
+            seen.add(alias)
+            target = by_id.get(alias)
+            if target is None:
+                backing = alias
+                break
+            backing = target.physical_backing_id or target.grant_id
+            alias = target.alias_of
+        raw_bytes = int(entry.allocated_bytes or entry.runtime_bytes)
+        if entry.tier.lower() in {"hbm", ""} and entry.lifetime != "load_peak_only":
+            key = (backing, int(entry.generation), entry.tier.lower() or "hbm")
+            prev = billed_peaks.get(key, 0)
+            delta = max(0, raw_bytes - prev)
+            if raw_bytes > prev:
+                billed_peaks[key] = raw_bytes
+        else:
+            delta = 0
+        resolved_entries.append(ResidentGrantEntry(
+            grant_id=entry.grant_id,
+            category=entry.category,
+            physical_backing_id=backing,
+            alias_of=entry.alias_of,
+            generation=entry.generation,
+            tier=entry.tier,
+            checkpoint_bytes=entry.checkpoint_bytes,
+            runtime_bytes=entry.runtime_bytes,
+            allocated_bytes=entry.allocated_bytes,
+            valid_bytes=entry.valid_bytes,
+            lifetime=entry.lifetime,
+            billed_once_bytes=delta,
+        ))
+    return tuple(resolved_entries), sum(billed_peaks.values())
 
 
 class _MemoryLedgerMixin:
@@ -244,9 +545,14 @@ class _MemoryLedgerMixin:
     # Unified physical reference ledger
     # ------------------------------------------------------------------
     def _account_rank(self, rank) -> int:
-        """Rank used for byte accounting; legacy out-of-range values clamp to 0."""
-        value = 0 if rank is None else int(rank)
-        return value if 0 <= value < self.width else 0
+        """Validate physical rank; never coerce invalid ranks silently to 0."""
+        if rank is None:
+            return 0
+        if isinstance(rank, bool) or not isinstance(rank, int):
+            raise ValueError("memory_rank_out_of_range")
+        if not 0 <= rank < self.width:
+            raise ValueError("memory_rank_out_of_range")
+        return int(rank)
 
     def _make_ref(
         self, replica: int, *, rank, stage, storage, tier, physical_key,
@@ -324,10 +630,16 @@ class _MemoryLedgerMixin:
         return refs
 
     def _grant_ref(self, spec: dict) -> _PhysicalRef:
+        backing_key = (
+            spec.get("alias_of")
+            or spec.get("physical_backing_id")
+            or spec.get("physical_key")
+            or spec["name"]
+        )
         return self._make_ref(
             spec["replica"], rank=spec.get("rank"), stage=spec["stage"],
             storage=spec.get("storage"), tier=spec.get("tier", "hbm"),
-            physical_key=spec.get("physical_key") or spec["name"],
+            physical_key=backing_key,
             generation=spec.get("generation"), size=spec["bytes"],
             ranges=spec.get("_ranges"),
             host_bytes=spec.get("host_bytes", 0.0),
@@ -527,13 +839,26 @@ class _MemoryLedgerMixin:
             self.host_dram_peak[replica] = max(
                 self.host_dram_peak[replica], self.host_dram_live[replica])
             for stage in range(p.pp):
-                total = max(hbm[replica][stage])
-                resident = max(request[replica][stage])
-                stage_staging = max(staging[replica][stage])
+                stage_hbm = hbm[replica][stage]
+                stage_req = request[replica][stage]
+                stage_stg = staging[replica][stage]
+                for rank_idx, die_used in enumerate(stage_hbm):
+                    self.peak_rank[replica][stage][rank_idx] = max(
+                        self.peak_rank[replica][stage][rank_idx], float(die_used),
+                    )
+                total = max(stage_hbm, default=0.0)
+                resident = max(stage_req, default=0.0)
+                stage_staging = max(stage_stg, default=0.0)
+                # True simultaneous per-die peak: NEVER sum resident and staging
+                # maxima that occurred on different physical ranks.
+                simultaneous_req_stage = max(
+                    (float(r) + float(s) for r, s in zip(stage_req, stage_stg)),
+                    default=0.0,
+                )
                 self.peak_combined[replica][stage] = max(
                     self.peak_combined[replica][stage], total)
                 self.peak[replica][stage] = max(
-                    self.peak[replica][stage], resident + stage_staging)
+                    self.peak[replica][stage], simultaneous_req_stage)
                 self.peak_kv_resident[replica][stage] = max(
                     self.peak_kv_resident[replica][stage], resident)
                 self.peak_kv_staging[replica][stage] = max(
@@ -595,3 +920,412 @@ class _MemoryLedgerMixin:
     def _update_combined_peak(self, replica: int, stage: int) -> None:
         """Compatibility wrapper: peaks are committed-state only."""
         self._sync_usage()
+
+    # ------------------------------------------------------------------
+    # Prepared weights, authoritative per-die receipt & HBM headroom
+    # ------------------------------------------------------------------
+    def _stage_prepared_weight_totals(
+        self,
+        specs: Sequence[PreparedWeightSpec],
+    ) -> tuple[list[int], list[int], list[list[ResidentGrantEntry]]]:
+        """Project ``PreparedWeightSpec`` allocations onto PP stages, billing aliases once."""
+        p = self.case.runtime.parallel
+        pp = max(1, int(p.pp))
+        persistent = [0] * pp
+        load_peak = [0] * pp
+        per_stage_grants: list[list[ResidentGrantEntry]] = [[] for _ in range(pp)]
+        seen_backings: dict[tuple[int, str], int] = {}
+        for spec in specs:
+            if not isinstance(spec, PreparedWeightSpec):
+                raise ValueError("memory_prepared_weight_spec_invalid")
+            raw_bytes = (
+                exact_element_bytes(math.prod(spec.local_shape), spec.dtype)
+                if spec.local_shape else 0
+            ) + int(spec.extra_metadata_bytes)
+            target_stages: list[int] = []
+            if spec.layer_indices:
+                for layer_idx in spec.layer_indices:
+                    st = (
+                        self.layer_stage[layer_idx]
+                        if 0 <= layer_idx < len(self.layer_stage) else pp - 1
+                    )
+                    target_stages.append(st)
+            else:
+                target_stages.append(pp - 1 if spec.scope == "draft" else 0)
+            for idx, st in enumerate(target_stages):
+                backing = spec.alias_of or f"{spec.allocation_id}:s{st}:i{idx}"
+                if spec.alias_of:
+                    billed = 0
+                else:
+                    key = (st, backing)
+                    prev = seen_backings.get(key, 0)
+                    billed = max(0, raw_bytes - prev)
+                    if raw_bytes > prev:
+                        seen_backings[key] = raw_bytes
+                if spec.lifetime == "load_peak_only":
+                    load_peak[st] += billed
+                    billed_steady = 0
+                else:
+                    persistent[st] += billed
+                    billed_steady = billed
+                per_stage_grants[st].append(ResidentGrantEntry(
+                    grant_id=f"prepared:{spec.allocation_id}:s{st}:i{idx}",
+                    category="prepared_weights",
+                    physical_backing_id=backing,
+                    alias_of=spec.alias_of,
+                    generation=0,
+                    tier="hbm",
+                    checkpoint_bytes=0,
+                    runtime_bytes=raw_bytes,
+                    allocated_bytes=raw_bytes,
+                    valid_bytes=raw_bytes,
+                    lifetime=spec.lifetime,
+                    billed_once_bytes=billed_steady,
+                ))
+        return persistent, load_peak, per_stage_grants
+
+    def register_prepared_weights(self, specs: Sequence[PreparedWeightSpec]) -> None:
+        """Register post-load ``PreparedWeightSpec`` copies on the unified ledger."""
+        for spec in specs:
+            if not isinstance(spec, PreparedWeightSpec):
+                raise ValueError("memory_prepared_weight_spec_invalid")
+            self._prepared_weights[spec.allocation_id] = spec
+        persistent, load_peak, _ = self._stage_prepared_weight_totals(
+            tuple(self._prepared_weights.values()),
+        )
+        self._prepared_persistent_by_stage = [float(v) for v in persistent]
+        self._prepared_load_peak_by_stage = [float(v) for v in load_peak]
+        p = self.case.runtime.parallel
+        for replica in range(p.dp):
+            for stage in range(p.pp):
+                for rank in range(self.width):
+                    self.rank_capacity[replica][stage][rank] = (
+                        self._base_rank_capacity[replica][stage][rank]
+                        - self._prepared_persistent_by_stage[stage]
+                    )
+            self.capacity[replica] = [
+                min(row) for row in self.rank_capacity[replica]
+            ]
+        self.budget_version += 1
+
+    def free_hbm_headroom_bytes(
+        self,
+        replica: int = 0,
+        stage: int | None = None,
+        rank: int | None = None,
+    ) -> int:
+        """Authoritative free HBM headroom on the bottleneck (or addressed) die."""
+        p = self.case.runtime.parallel
+        if not 0 <= int(replica) < p.dp:
+            raise ValueError("memory_grant_index_out_of_range")
+        hbm, _ = self._state_usage()
+        stages = (int(stage),) if stage is not None else tuple(range(p.pp))
+        ranks = (self._account_rank(rank),) if rank is not None else tuple(range(self.width))
+        headrooms: list[int] = []
+        for st in stages:
+            if not 0 <= st < p.pp:
+                raise ValueError("memory_stage_out_of_range")
+            for rk in ranks:
+                cap = float(self.rank_capacity[replica][st][rk])
+                used = max(float(hbm[replica][st][rk]), float(self.peak_rank[replica][st][rk]))
+                headrooms.append(int(math.floor(cap - used)))
+        return min(headrooms, default=0)
+
+    def _resolve_vision_delta_by_stage(self, vision_accounting: str) -> tuple[list[int], list[int]]:
+        """Return ``(vision_bytes_by_stage, weight_delta_by_stage)`` for vision scope."""
+        from mindie_sim.catalog.types import QuantSpec
+        from mindie_sim.catalog.weight_terms import term_bytes
+        from mindie_sim.catalog.weights import vision_weight_terms
+
+        p = self.case.runtime.parallel
+        pp = max(1, int(p.pp))
+        if vision_accounting not in VISION_ACCOUNTING_SCOPES:
+            raise ValueError(f"vision_accounting_invalid:{vision_accounting!r}")
+        model = self.case.model
+        quant = model.quant or QuantSpec("bf16")
+        vision_all = int(round(sum(
+            term_bytes(term, quant, p, self.case.machine.ranks_per_node)
+            for term in vision_weight_terms(model, include_vision=True)
+        )))
+        currently_included = (self.vision_accounting == "full_checkpoint") and (vision_all > 0)
+        want_included = (vision_accounting == "full_checkpoint") and (vision_all > 0)
+        vision_stage = [0] * pp
+        delta_stage = [0] * pp
+        if want_included:
+            vision_stage[0] = vision_all
+        if want_included and not currently_included:
+            delta_stage[0] = vision_all
+        elif currently_included and not want_included:
+            delta_stage[0] = -vision_all
+        return vision_stage, delta_stage
+
+    def _stage_checkpoint_vs_prepared_split(self, stage: int) -> tuple[int, int]:
+        """Split ``self.weights[stage]`` into source checkpoint vs runtime-only prepared bytes."""
+        from mindie_sim.catalog.types import QuantSpec
+        from mindie_sim.catalog.weight_terms import term_bytes
+        from mindie_sim.catalog.weights import _expand_resident_terms, stage_weight_terms
+
+        model = self.case.model
+        p = self.case.runtime.parallel
+        quant = model.quant or QuantSpec("bf16")
+        include_vision = self.vision_accounting == "full_checkpoint"
+        all_stage_terms = stage_weight_terms(
+            model, p, include_draft=bool(self.draft_kind),
+            draft_kind=self.draft_kind or None,
+            include_engram_tables=not self.case.runtime.engram_cpu_offload,
+            include_vision=include_vision, layer_partition=self.layers,
+            slot_plans=self.slot_plans,
+        )
+        runtime_only = 0.0
+        for term in all_stage_terms[stage]:
+            if term.source_owned:
+                continue
+            for t_sub, placed in _expand_resident_terms(term, p, False, model=model):
+                runtime_only += term_bytes(t_sub, quant, placed, self.case.machine.ranks_per_node)
+        prep_b = int(round(runtime_only))
+        ckpt_b = max(0, int(round(self.weights[stage])) - prep_b)
+        return ckpt_b, prep_b
+
+    def _projected_stage_cache_pools(
+        self,
+        sequence_tokens: int | None,
+        batch_per_dp: int,
+        query_tokens: int | None,
+    ) -> list[dict[str, int]] | None:
+        """Per-stage projected KV/Index/State/Draft bytes for ``batch_per_dp`` requests."""
+        if sequence_tokens is None or int(batch_per_dp) <= 0:
+            return None
+        from .cache import _COMPONENT_POOL_MAP
+
+        p = self.case.runtime.parallel
+        b_int = int(batch_per_dp)
+        alloc_stages = self._cache_component_breakdown(
+            int(sequence_tokens), padded=True, skip_covered=True, query_tokens=query_tokens,
+        )
+        valid_stages = self._cache_component_breakdown(
+            int(sequence_tokens), padded=False, skip_covered=True, query_tokens=query_tokens,
+        )
+        group_parts = (
+            self._group_cache_parts(int(sequence_tokens))
+            if self.pages.groups else None
+        )
+        per_stage: list[dict[str, int]] = []
+        for stage in range(p.pp):
+            alloc_pools = {"target_kv_bytes": 0.0, "indexer_k_bytes": 0.0,
+                           "recurrent_state_bytes": 0.0, "draft_kv_bytes": 0.0,
+                           "draft_state_bytes": 0.0}
+            valid_pools = {"target_kv_bytes": 0.0, "indexer_k_bytes": 0.0}
+            for name, detail in alloc_stages[stage]["components"].items():
+                key = _COMPONENT_POOL_MAP.get(name)
+                if key in alloc_pools:
+                    alloc_pools[key] += float(detail["total"])
+            for name, detail in valid_stages[stage]["components"].items():
+                key = _COMPONENT_POOL_MAP.get(name)
+                if key in valid_pools:
+                    valid_pools[key] += float(detail["total"])
+            if group_parts is not None:
+                for name, detail in group_parts[stage]["components"].items():
+                    key = _COMPONENT_POOL_MAP.get(name)
+                    if key in alloc_pools:
+                        alloc_pools[key] += float(detail["alloc_payload"]) + float(detail["alloc_scale"])
+                    if key in valid_pools:
+                        valid_pools[key] += float(detail["valid_payload"]) + float(detail["valid_scale"])
+            per_stage.append({
+                "kv_alloc": b_int * int(round(alloc_pools["target_kv_bytes"])),
+                "kv_valid": b_int * int(round(valid_pools["target_kv_bytes"])),
+                "idx_alloc": b_int * int(round(alloc_pools["indexer_k_bytes"])),
+                "idx_valid": b_int * int(round(valid_pools["indexer_k_bytes"])),
+                "rec": b_int * int(round(alloc_pools["recurrent_state_bytes"])),
+                "draft": b_int * int(round(alloc_pools["draft_kv_bytes"] + alloc_pools["draft_state_bytes"])),
+            })
+        return per_stage
+
+    def _build_die_receipt(
+        self,
+        *,
+        replica: int,
+        stage: int,
+        rank: int,
+        die_obj: Any,
+        ckpt_b: int,
+        vision_b: int,
+        term_prep_b: int,
+        prep_persist_b: int,
+        prep_load_b: int,
+        stage_prep_grants: Sequence[ResidentGrantEntry],
+        extra_grants: Sequence[ResidentGrantEntry],
+        projected: dict[str, int] | None,
+        dyn_live_b: int,
+        dyn_peak_b: int,
+        req_b: int,
+        stg_b: int,
+        host_b: int,
+    ) -> DieResidentReceipt:
+        usable = int(math.floor(die_obj.hbm_bytes * self.case.runtime.gpu_memory_utilization))
+        ws_b = int(round(self.workspace[stage] + self.temporary_dequant[stage]))
+        res_b = int(round(self.policy.reserved))
+        dyn_grant_only = max(0, dyn_live_b - req_b - stg_b)
+        kv_a = projected["kv_alloc"] if projected is not None else req_b
+        kv_v = projected["kv_valid"] if projected is not None else req_b
+        idx_a = projected["idx_alloc"] if projected is not None else 0
+        idx_v = projected["idx_valid"] if projected is not None else 0
+        rec_b = projected["rec"] if projected is not None else 0
+        drf_b = projected["draft"] if projected is not None else 0
+
+        ckpt_gid = f"r{replica}:s{stage}:k{rank}:checkpoint_weights"
+        vis_gid = f"r{replica}:s{stage}:k{rank}:vision_weights"
+        term_gid = f"r{replica}:s{stage}:k{rank}:prepared_terms"
+        raw_entries: list[ResidentGrantEntry] = [
+            ResidentGrantEntry(
+                grant_id=ckpt_gid, category="checkpoint_weights",
+                physical_backing_id=ckpt_gid, checkpoint_bytes=ckpt_b,
+                runtime_bytes=ckpt_b, allocated_bytes=ckpt_b, valid_bytes=ckpt_b,
+            ),
+        ]
+        if vision_b > 0:
+            raw_entries.append(ResidentGrantEntry(
+                grant_id=vis_gid, category="vision_weights",
+                physical_backing_id=vis_gid, checkpoint_bytes=vision_b,
+                runtime_bytes=vision_b, allocated_bytes=vision_b, valid_bytes=vision_b,
+            ))
+        if term_prep_b > 0:
+            raw_entries.append(ResidentGrantEntry(
+                grant_id=term_gid, category="prepared_weights",
+                physical_backing_id=term_gid, checkpoint_bytes=0,
+                runtime_bytes=term_prep_b, allocated_bytes=term_prep_b, valid_bytes=term_prep_b,
+            ))
+        raw_entries.extend(stage_prep_grants)
+        raw_entries.extend(extra_grants)
+        dedup_grants, _ = _deduplicate_grant_entries(raw_entries)
+        base_gids = {ckpt_gid, vis_gid, term_gid}
+        extra_only_billed = sum(
+            g.billed_once_bytes for g in dedup_grants
+            if g.grant_id not in base_gids and not g.grant_id.startswith("prepared:")
+        )
+        prep_total = term_prep_b + prep_persist_b
+        fixed_total = ckpt_b + vision_b + prep_total + ws_b + res_b
+        if projected is not None:
+            live_dyn = kv_a + idx_a + rec_b + drf_b + dyn_grant_only + stg_b + extra_only_billed
+        else:
+            live_dyn = dyn_live_b + extra_only_billed
+        peak_dyn = max(live_dyn, dyn_peak_b + extra_only_billed)
+        sim_live = fixed_total + live_dyn
+        sim_peak = fixed_total + peak_dyn
+        return DieResidentReceipt(
+            replica=replica,
+            stage=stage,
+            rank=rank,
+            die_id=int(getattr(die_obj, "rank", rank)),
+            usable_hbm_bytes=usable,
+            checkpoint_weight_bytes=ckpt_b,
+            prepared_weight_bytes=prep_total,
+            prepared_load_peak_bytes=prep_load_b,
+            vision_weight_bytes=vision_b,
+            kv_cache_allocated_bytes=kv_a,
+            kv_cache_valid_bytes=kv_v,
+            index_cache_allocated_bytes=idx_a,
+            index_cache_valid_bytes=idx_v,
+            recurrent_state_bytes=rec_b,
+            draft_cache_bytes=drf_b,
+            workspace_bytes=ws_b,
+            reserve_bytes=res_b,
+            staging_bytes=stg_b,
+            dynamic_grant_bytes=dyn_grant_only + extra_only_billed,
+            simultaneous_live_hbm_bytes=sim_live,
+            simultaneous_peak_hbm_bytes=sim_peak,
+            load_peak_hbm_bytes=sim_peak + prep_load_b,
+            free_hbm_headroom_bytes=usable - sim_peak,
+            host_dram_bytes=host_b,
+            grants=dedup_grants,
+        )
+
+    def resident_memory_receipt(
+        self,
+        *,
+        scenario: str = "",
+        phase: str = "decode",
+        occurrence: str = "steady",
+        sequence_tokens: int | None = None,
+        batch_per_dp: int = 0,
+        query_tokens: int | None = None,
+        vision_accounting: str | None = None,
+        prepared_weights: Sequence[PreparedWeightSpec] = (),
+        extra_grants: Sequence[ResidentGrantEntry] = (),
+    ) -> ResidentMemoryReceipt:
+        """Build the single authoritative per-die ``ResidentMemoryReceipt``."""
+        p = self.case.runtime.parallel
+        vis_scope = vision_accounting or self.vision_accounting
+        vision_stage, vision_delta = self._resolve_vision_delta_by_stage(vis_scope)
+        combined_prepared = list(self._prepared_weights.values())
+        known_ids = set(self._prepared_weights)
+        for spec in prepared_weights:
+            if spec.allocation_id not in known_ids:
+                combined_prepared.append(spec)
+                known_ids.add(spec.allocation_id)
+        prep_persist, prep_load, prep_grants = self._stage_prepared_weight_totals(combined_prepared)
+        hbm_live, host_live = self._state_usage()
+        request_ranks = self._request_usage_ranks()
+        staging_ranks = self._staging_usage_ranks()
+        ckpt_by_stage: list[int] = []
+        term_prep_by_stage: list[int] = []
+        for st in range(p.pp):
+            ck, tp_b = self._stage_checkpoint_vs_prepared_split(st)
+            ckpt_by_stage.append(max(0, ck + vision_delta[st] - vision_stage[st]))
+            term_prep_by_stage.append(tp_b)
+        projected_stages = self._projected_stage_cache_pools(
+            sequence_tokens, batch_per_dp, query_tokens,
+        )
+        dies: list[DieResidentReceipt] = []
+        for replica in range(p.dp):
+            for stage in range(p.pp):
+                stage_dies = self._stage_dies(replica, stage)
+                projected = projected_stages[stage] if projected_stages is not None else None
+                host_b = int(round(host_live[replica] + self.engram_host_dram_bytes[stage]))
+                for rank in range(self.width):
+                    dyn_live_b = int(round(hbm_live[replica][stage][rank]))
+                    dyn_peak_b = max(dyn_live_b, int(round(self.peak_rank[replica][stage][rank])))
+                    dies.append(self._build_die_receipt(
+                        replica=replica, stage=stage, rank=rank, die_obj=stage_dies[rank],
+                        ckpt_b=ckpt_by_stage[stage], vision_b=vision_stage[stage],
+                        term_prep_b=term_prep_by_stage[stage],
+                        prep_persist_b=prep_persist[stage], prep_load_b=prep_load[stage],
+                        stage_prep_grants=prep_grants[stage], extra_grants=extra_grants,
+                        projected=projected, dyn_live_b=dyn_live_b, dyn_peak_b=dyn_peak_b,
+                        req_b=int(round(request_ranks[replica][stage][rank])),
+                        stg_b=int(round(staging_ranks[replica][stage][rank])),
+                        host_b=host_b,
+                    ))
+        return ResidentMemoryReceipt(
+            scenario=scenario or str(getattr(self.case.model, "name", "")),
+            phase=str(phase),
+            occurrence=str(occurrence),
+            vision_accounting=vis_scope,
+            dies=tuple(dies),
+        )
+
+    def evaluate_space_time_tradeoff(
+        self,
+        *,
+        mechanism: str,
+        delta_hbm_bytes: int,
+        delta_step_ms: float = 0.0,
+        delta_concurrency_per_dp: int = 0,
+        delta_tps_per_die: float = 0.0,
+        replica: int = 0,
+        stage: int | None = None,
+        rank: int | None = None,
+    ) -> SpaceTimeTradeoffSpec:
+        """Evaluate a space-time trade-off against the authoritative free HBM headroom."""
+        headroom = self.free_hbm_headroom_bytes(replica=replica, stage=stage, rank=rank)
+        direction = "space_for_time" if int(delta_hbm_bytes) >= 0 else "time_for_space"
+        feasible = bool(int(delta_hbm_bytes) <= headroom)
+        return SpaceTimeTradeoffSpec(
+            direction=direction,
+            mechanism=mechanism,
+            delta_hbm_bytes=int(delta_hbm_bytes),
+            free_hbm_headroom_bytes=int(headroom),
+            delta_step_ms=float(delta_step_ms),
+            delta_concurrency_per_dp=int(delta_concurrency_per_dp),
+            delta_tps_per_die=float(delta_tps_per_die),
+            feasible_under_hbm_and_sla=feasible,
+        )

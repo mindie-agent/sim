@@ -180,7 +180,9 @@ def _draft_ffn_terms(
     return terms
 
 
-def _draft_plan_terms(plan, draft: DraftSpec, model: ModelSpec) -> list[WeightTerm]:
+def _draft_plan_terms(
+    plan, draft: DraftSpec, model: ModelSpec, *, dq: QuantSpec | None = None,
+) -> list[WeightTerm]:
     """Resident matrices owned by one declared draft ``LayerPlan``.
 
     Draft attention/FFN geometry is declared once by ``DraftSpec``, but an
@@ -188,12 +190,13 @@ def _draft_plan_terms(plan, draft: DraftSpec, model: ModelSpec) -> list[WeightTe
     plan.  They are counted here rather than synthesized from a donor layer.
     """
     terms: list[WeightTerm] = []
+    resolved_dq = dq or draft_quant(model, draft)
     if (plan.owns_index_k or plan.owns_topk or plan.indexer
             or plan.index_query_per_layer):
         from mindie_sim.catalog.weights import _indexer_terms
         draft_model = replace(
             model, hidden_size=int(draft.hidden_size),
-            quant=draft_quant(model, draft))
+            quant=resolved_dq)
         terms.extend(_indexer_terms(plan, draft_model))
     if (plan.ffn == "moe" and plan.router_precast_weight_copy
             and plan.router_dtype):
@@ -209,6 +212,7 @@ def draft_terms(
     ep: int = ONE,
 ) -> list[WeightTerm]:
     h = draft.hidden_size
+    dq = draft_quant(model, draft) if getattr(model, "quant", None) is not None else QuantSpec("bf16")
     terms: list[WeightTerm] = []
     if standalone_heads_only and draft.kind == "standalone_draft":
         # The standalone draft always consumes concatenated target features.
@@ -255,10 +259,10 @@ def draft_terms(
                 False, True))
         plans = tuple(getattr(draft, "layer_plans", ()) or ())
         for index in range(max(ZERO, draft.layers)):
-            terms.extend(_draft_attention_terms(draft, model.quant or QuantSpec("bf16")))
+            terms.extend(_draft_attention_terms(draft, dq))
             terms.extend(_draft_ffn_terms(draft, model, ep=ep))
             if index < len(plans):
-                terms.extend(_draft_plan_terms(plans[index], draft, model))
+                terms.extend(_draft_plan_terms(plans[index], draft, model, dq=dq))
             if draft.output_head_owned:
                 terms.append(_t("draft_output_norm", h, ONE, "norm"))
                 if int(draft.output_head_count) > ZERO:
@@ -282,7 +286,7 @@ def draft_terms(
             width = draft.confidence_input_width or (h + draft.markov_rank)
             terms.append(_t("confidence_head", 1, width, "norm"))
     from mindie_sim.catalog.projection_placement import projection_role
-    return [replace(term, quant=draft_quant(model, draft),
+    return [replace(term, quant=dq,
                     placement_role=projection_role(
                         None, term.name, scope="draft"))
             for term in terms]
