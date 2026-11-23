@@ -2601,6 +2601,7 @@ def _archetype_weighted_step_ms(
     eval_ctx_box: list[EvaluationContext | None] | None = None,
     skip_target_if_baseline_le_ms: float | None = None,
     reclaim_on_exit: bool = True,
+    exact_flag_out: list[bool] | None = None,
 ) -> float:
     """Exact native ``0..L-1 + final`` Engine replay with unified ``PrimitiveTable`` binding."""
     del min_layers
@@ -2612,9 +2613,6 @@ def _archetype_weighted_step_ms(
         sequences=sequences, scope=scope, run_graph=False,
     )
     need_timeline = bool(use_target)
-    can_fast_probe = bool(
-        use_target and ext_plan is None and skip_target_if_baseline_le_ms is not None
-    )
     if evaluation_context is not None:
         eval_ctx = evaluation_context
         owns_ctx = False
@@ -2637,16 +2635,6 @@ def _archetype_weighted_step_ms(
     rebound_pt = eval_ctx.bindings.primitive_table
     timeline_rows: tuple[Mapping[str, Any], ...] = ()
     try:
-        if can_fast_probe:
-            probe_graph, _, _ = execute_native_cohort_graph(
-                eff_case, sg, cohort_plan=cohort_plan,
-                external_inputs=ext_in, isolated=False,
-                evaluation=eval_ctx, fast_span_only=True,
-                timeline_replicas=None,
-            )
-            baseline_ms = float(probe_graph["duration_ms"])
-            if baseline_ms <= float(skip_target_if_baseline_le_ms):
-                return baseline_ms
         graph, _, _ = execute_native_cohort_graph(
             eff_case, sg, cohort_plan=cohort_plan,
             external_inputs=ext_in, isolated=False,
@@ -2662,12 +2650,16 @@ def _archetype_weighted_step_ms(
             if reclaim_on_exit and (len(parsed.machine.dies) >= GC_RECLAIM_MIN_WORLD_SIZE or int(parsed.runtime.parallel.dp) > 1):
                 _reclaim_sweep_memory()
     if not use_target:
+        if exact_flag_out is not None:
+            exact_flag_out.append(True)
         return baseline_ms
     if ext_plan is None and skip_target_if_baseline_le_ms is not None and baseline_ms <= skip_target_if_baseline_le_ms:
+        if exact_flag_out is not None:
+            exact_flag_out.append(False)
         return baseline_ms
     from mindie_sim.prediction.results import StepRequest
 
-    return _solve_target_step_ms(
+    target_ms = _solve_target_step_ms(
         eff_case, timeline_rows, spec_by_id,
         phase=phase, cohort_plan=cohort_plan,
         n_tok_per_die=n_tok_per_die, ext_plan=ext_plan,
@@ -2675,6 +2667,9 @@ def _archetype_weighted_step_ms(
         step_request=StepRequest(phase=phase, tokens=tokens, context=context, sequences=sequences, scope=scope),
         scenario_case=parsed,
     )
+    if exact_flag_out is not None:
+        exact_flag_out.append(True)
+    return target_ms
 
 
 def _free_hbm_gib_for_batch(memory: Memory, kv_by_stage: Sequence[float], batch: int) -> float:
@@ -2971,6 +2966,7 @@ def _solve_sla_archetype_aware(
             if (use_target and rewrite_plan is None and not require_exact)
             else None
         )
+        exact_box: list[bool] = []
         t_val = _archetype_weighted_step_ms(
             parsed, phase="decode", tokens=max(1, int(q_tok)),
             context=context, sequences=key,
@@ -2981,9 +2977,15 @@ def _solve_sla_archetype_aware(
             n_tok_per_die=(float(key) * float(emit_est)) / float(per_dp_dies),
             eval_ctx_box=ctx_box,
             skip_target_if_baseline_le_ms=skip_thresh,
+            exact_flag_out=exact_box,
         )
         memo[key] = t_val
-        is_exact = (not use_target) or require_exact or (t_val > sla_ms + PARETO_EPS)
+        is_exact = (
+            bool(exact_box and exact_box[-1])
+            or (not use_target)
+            or require_exact
+            or (t_val > sla_ms + PARETO_EPS)
+        )
         if is_exact:
             exact_keys.add(key)
             if probe_sink is not None:
@@ -3253,7 +3255,7 @@ def _search_single_pool_deployments(
         return rows, [], coverage
 
     viable.sort(
-        key=lambda c: (int(c["used_dies"] == num_devices), int(c["pp"] == 1), c["ub_tps"], c["b_vram"]),
+        key=lambda c: (int(c["used_dies"] == num_devices), -int(c["pp"]), c["ub_tps"], c["b_vram"]),
         reverse=True,
     )
     best_entry: tuple[dict[str, Any], dict[str, Any]] | None = None
@@ -3279,12 +3281,13 @@ def _search_single_pool_deployments(
                 break
             wave_items: list[tuple[dict[str, Any], dict[str, Any]]] = []
             wave_tasks: list[tuple[Any, ...]] = []
+            wave_group = (viable[cursor]["used_dies"] == num_devices, int(viable[cursor]["pp"]))
             while cursor < len(viable) and len(wave_items) < eff_workers:
                 desc = viable[cursor]
+                if wave_items and (desc["used_dies"] == num_devices, int(desc["pp"])) != wave_group:
+                    break
                 cursor += 1
-                if (wave_items and best_entry is not None
-                        and desc["used_dies"] == num_devices
-                        and desc["ub_tps"] < incumbent_tps - PARETO_EPS):
+                if _is_prunable(desc):
                     desc["raw_case"] = None
                     coverage["pruned_by_upper_bound"] += 1
                     continue

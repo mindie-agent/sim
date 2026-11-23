@@ -25,6 +25,7 @@
 """
 from __future__ import annotations
 
+from collections import OrderedDict
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -186,6 +187,15 @@ _KIMI_K3_TYPES = frozenset({"kimi_k3", "kimi_k31"})
 _GLM5_NEXT_TYPES = frozenset({"glm5_next", "glm5_next_text"})
 _QWEN4_EXP_TYPES = frozenset({"qwen4_exp", "qwen4_exp_text"})
 _DEFAULT_DRAFT_KV_CAP = 0
+PORT_ABI_PLAN_CACHE_MAX = 64
+_PORT_ABI_PLAN_CACHE: OrderedDict[
+    tuple[Any, ...],
+    tuple[
+        tuple[tuple[tuple[str, int, str], TensorPrecisionABI], ...],
+        tuple[tuple[str, tuple[str, ...], str], ...],
+        bool,
+    ],
+] = OrderedDict()
 
 _PROJECTION_PRESET_TAGS: dict[str, tuple[str, str]] = {
     "mxfp8": ("W8A8_MXFP8", "W8A8_MXFP8"),
@@ -1929,25 +1939,81 @@ def _build_prepared_weights(
     return tuple(prepared)
 
 
-def instantiate_runtime_quant_plan(
+def _port_plan_model_fingerprint(model: ModelSpec, model_type: str) -> tuple[Any, ...]:
+    """Hashable structural fingerprint of every ModelSpec field read during port ABI resolution."""
+    aux = model.auxiliary
+    if aux is None or (aux.mtp is None and aux.dspark is None):
+        aux_sig: tuple[Any, ...] | None = None
+    else:
+        draft_spec = aux.mtp if aux.mtp is not None else aux.dspark
+        aux_sig = (
+            aux.mtp is not None,
+            aux.dspark is not None,
+            max(1, int(getattr(draft_spec, "layers", 1) or 1)),
+        )
+    layer_sigs = tuple(
+        (
+            int(p.index),
+            int(p.native_layer_id),
+            str(p.attention or model.attention).lower(),
+            bool(p.mla_output_gate),
+            bool(p.indexer),
+            int(p.residual_block_size),
+            bool(p.hyper_connections),
+            bool(p.engram),
+            str(p.ffn).lower(),
+            int(p.expert_latent_size),
+            int(p.num_shared_experts),
+        )
+        for p in model.layer_plans
+    )
+    return (
+        model_type,
+        int(model.hidden_size),
+        int(model.intermediate_size),
+        int(model.moe_intermediate_size),
+        int(model.num_shared_experts),
+        str(model.attention).lower(),
+        int(model.body_layers or model.layers),
+        int(model.num_experts),
+        aux_sig,
+        layer_sigs,
+    )
+
+
+def _resolve_port_abis_and_packs_cached(
     model: ModelSpec,
     checkpoint: CheckpointQuantMap,
-    hardware: Hardware,
-    parallel: ParallelSpec,
-    options: ResolvedStackOptions,
     *,
-    role: str,
+    ckpt_digest: str,
+    hw: str,
+    model_type: str,
+    native_float: str,
+    use_nz: bool,
+    target_proj: str,
     phase: str,
-) -> RuntimeQuantPlan:
-    """Instantiate exact ``RuntimeQuantPlan`` mirroring ``vllm-ascend`` load/pack logic."""
-    hw = normalize_hw_family(hardware)
-    model_type = resolve_model_type(model)
-    native_float = _normalize_native_float(checkpoint, model)
-    eff_opts = _effective_option_map(options)
-    use_nz = bool(eff_opts.get("enable_weight_nz_layout", hw in A2_A3_INT_ONLY_FAMILIES))
-    target_proj = str(eff_opts.get("target_quant_projection") or "").strip()
-    hf_cfg = dict(checkpoint.hf_quant_config)
+    role: str,
+) -> tuple[
+    tuple[tuple[tuple[str, int, str], TensorPrecisionABI], ...],
+    tuple[tuple[str, tuple[str, ...], str], ...],
+    bool,
+]:
+    """Resolve parallel-independent port ABIs & homogeneous packs with bounded caching."""
+    cache_key = (
+        ckpt_digest,
+        _port_plan_model_fingerprint(model, model_type),
+        hw,
+        native_float,
+        use_nz,
+        target_proj,
+        phase,
+        role,
+    )
+    cached = _PORT_ABI_PLAN_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
 
+    hf_cfg = dict(checkpoint.hf_quant_config)
     port_abis: list[tuple[tuple[str, int, str], TensorPrecisionABI]] = []
     packed_groups: list[tuple[str, tuple[str, ...], str]] = []
     used_projection = False
@@ -2006,6 +2072,39 @@ def instantiate_runtime_quant_plan(
     port_abis.extend(draft_ports)
     used_projection = used_projection or draft_proj
 
+    result = (tuple(port_abis), tuple(packed_groups), used_projection)
+    _PORT_ABI_PLAN_CACHE[cache_key] = result
+    _PORT_ABI_PLAN_CACHE.move_to_end(cache_key)
+    while len(_PORT_ABI_PLAN_CACHE) > PORT_ABI_PLAN_CACHE_MAX:
+        _PORT_ABI_PLAN_CACHE.popitem(last=False)
+    return result
+
+
+def instantiate_runtime_quant_plan(
+    model: ModelSpec,
+    checkpoint: CheckpointQuantMap,
+    hardware: Hardware,
+    parallel: ParallelSpec,
+    options: ResolvedStackOptions,
+    *,
+    role: str,
+    phase: str,
+) -> RuntimeQuantPlan:
+    """Instantiate exact ``RuntimeQuantPlan`` mirroring ``vllm-ascend`` load/pack logic."""
+    hw = normalize_hw_family(hardware)
+    model_type = resolve_model_type(model)
+    native_float = _normalize_native_float(checkpoint, model)
+    eff_opts = _effective_option_map(options)
+    use_nz = bool(eff_opts.get("enable_weight_nz_layout", hw in A2_A3_INT_ONLY_FAMILIES))
+    target_proj = str(eff_opts.get("target_quant_projection") or "").strip()
+    ckpt_digest = checkpoint.digest()
+
+    port_abis, packed_groups, used_projection = _resolve_port_abis_and_packs_cached(
+        model, checkpoint, ckpt_digest=ckpt_digest, hw=hw, model_type=model_type,
+        native_float=native_float, use_nz=use_nz, target_proj=target_proj,
+        phase=phase, role=role,
+    )
+
     spec_k = int(options.speculative.draft_len if options.speculative is not None else eff_opts.get("speculative_k", 0))
     recoverssm_active = bool(eff_opts.get("recoverssm_enabled", False))
     kv_abis, idx_abis, rec_abis, cache_disps, has_faquant, is_mxfp_gqa = build_cache_state_abis(
@@ -2032,10 +2131,10 @@ def instantiate_runtime_quant_plan(
         ))
 
     return RuntimeQuantPlan(
-        checkpoint_digest=checkpoint.digest(),
+        checkpoint_digest=ckpt_digest,
         stack_id=VLLM_ASCEND_STACK_ID,
-        port_abis=tuple(port_abis),
-        packed_groups=tuple(packed_groups),
+        port_abis=port_abis,
+        packed_groups=packed_groups,
         kv_cache_abi=kv_abis,
         index_cache_abi=idx_abis,
         recurrent_state_abi=rec_abis,

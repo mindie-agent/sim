@@ -15,6 +15,7 @@
 """
 from __future__ import annotations
 
+from collections import OrderedDict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 import hashlib
@@ -25,6 +26,7 @@ from typing import Any, Literal
 from .common import ModelingError
 
 CHECKPOINT_QUANT_MAP_SCHEMA = "mindie-sim.checkpoint-quant-map/1"
+QUANT_MAP_INDEX_CACHE_MAX = 64
 
 CheckpointFormat = Literal[
     "modelslim_description",
@@ -134,6 +136,139 @@ def _ignored_module_matches(entry: str, tensor_path: str) -> bool:
     if "*" in entry and _pattern_matches(entry, tensor_path):
         return True
     return tensor_path.startswith(entry + ".")
+
+
+def _presence_matches(
+    p_scope: str | None,
+    p_layers: frozenset[int] | None,
+    p_experts: frozenset[int] | None,
+    scope: ModelScope,
+    source_native_layer_id: int | None,
+    expert_id: int | None,
+) -> bool:
+    if p_scope is None:
+        return True
+    if p_scope != scope:
+        return False
+    if p_layers is not None and (
+        source_native_layer_id is None or source_native_layer_id not in p_layers
+    ):
+        return False
+    if p_experts is not None and (expert_id is None or expert_id not in p_experts):
+        return False
+    return True
+
+
+def _parts_match(parts: list[str], non_star: tuple[tuple[int, str], ...]) -> bool:
+    for idx, tok in non_star:
+        if parts[idx] != tok:
+            return False
+    return True
+
+
+class _CompiledQuantMapIndex:
+    """Immutable O(1)-bucketed lookup index & lazy digest memo for a CheckpointQuantMap."""
+
+    __slots__ = (
+        "has_exceptions",
+        "exc_by_key",
+        "ignored_exact",
+        "ignored_wildcards",
+        "rules_exact",
+        "rules_wc",
+        "digest_hex",
+    )
+
+    def __init__(self, qmap: CheckpointQuantMap) -> None:
+        exc_buckets: dict[
+            tuple[str, int, str],
+            list[tuple[int, tuple[tuple[int, str], ...], frozenset[int], frozenset[int] | None, str]],
+        ] = {}
+        ordered_exc = sorted(
+            qmap.layer_exceptions, key=lambda item: item.specificity(), reverse=True
+        )
+        for rank, exc in enumerate(ordered_exc):
+            pat_parts = exc.pattern.split(".")
+            non_star = tuple((i, tok) for i, tok in enumerate(pat_parts) if tok != "*")
+            layers_set = frozenset(exc.layer_indices)
+            experts_set = frozenset(exc.expert_indices) if exc.expert_indices else None
+            exc_buckets.setdefault((exc.scope, len(pat_parts), pat_parts[-1]), []).append(
+                (rank, non_star, layers_set, experts_set, exc.raw_tag)
+            )
+        self.has_exceptions = bool(exc_buckets)
+        self.exc_by_key = {k: tuple(v) for k, v in exc_buckets.items()}
+
+        ign_exact: list[str] = []
+        ign_wc: list[str] = []
+        for entry in qmap.ignored_modules:
+            if "*" in entry:
+                ign_wc.append(entry)
+            else:
+                ign_exact.append(entry)
+        self.ignored_exact = frozenset(ign_exact)
+        self.ignored_wildcards = tuple(ign_wc)
+
+        exact_buckets: dict[
+            str,
+            list[tuple[int, str | None, frozenset[int] | None, frozenset[int] | None, str]],
+        ] = {}
+        wc_buckets: dict[
+            tuple[int, str],
+            list[
+                tuple[
+                    int,
+                    tuple[tuple[int, str], ...],
+                    str | None,
+                    frozenset[int] | None,
+                    frozenset[int] | None,
+                    str,
+                ]
+            ],
+        ] = {}
+        for order_idx, rule in enumerate(qmap.rules):
+            pres = rule.presence
+            p_scope = pres.scope if pres is not None else None
+            p_layers = (
+                frozenset(pres.layer_indices)
+                if (pres is not None and pres.layer_indices)
+                else None
+            )
+            p_experts = (
+                frozenset(pres.expert_indices)
+                if (pres is not None and pres.expert_indices)
+                else None
+            )
+            if "*" not in rule.pattern:
+                exact_buckets.setdefault(rule.pattern, []).append(
+                    (order_idx, p_scope, p_layers, p_experts, rule.raw_tag)
+                )
+            else:
+                pat_parts = rule.pattern.split(".")
+                non_star = tuple((i, tok) for i, tok in enumerate(pat_parts) if tok != "*")
+                wc_buckets.setdefault((len(pat_parts), pat_parts[-1]), []).append(
+                    (order_idx, non_star, p_scope, p_layers, p_experts, rule.raw_tag)
+                )
+        self.rules_exact = {k: tuple(v) for k, v in exact_buckets.items()}
+        self.rules_wc = {k: tuple(v) for k, v in wc_buckets.items()}
+        self.digest_hex: str | None = None
+
+
+_QUANT_MAP_INDEX_CACHE: OrderedDict[int, tuple[CheckpointQuantMap, _CompiledQuantMapIndex]] = (
+    OrderedDict()
+)
+
+
+def _get_quant_map_index(qmap: CheckpointQuantMap) -> _CompiledQuantMapIndex:
+    key = id(qmap)
+    cached = _QUANT_MAP_INDEX_CACHE.get(key)
+    if cached is not None and cached[0] is qmap:
+        return cached[1]
+    compiled = _CompiledQuantMapIndex(qmap)
+    _QUANT_MAP_INDEX_CACHE[key] = (qmap, compiled)
+    _QUANT_MAP_INDEX_CACHE.move_to_end(key)
+    while len(_QUANT_MAP_INDEX_CACHE) > QUANT_MAP_INDEX_CACHE_MAX:
+        _QUANT_MAP_INDEX_CACHE.popitem(last=False)
+    return compiled
 
 
 @dataclass(frozen=True, slots=True)
@@ -480,20 +615,39 @@ class CheckpointQuantMap:
         """Exact lossless lookup over (1) layer_exceptions -> (2) ignored_modules only."""
         if scope not in MODEL_SCOPES:
             raise ModelingError(f"checkpoint_lookup_scope_invalid:{scope!r}")
-        matched_exc = [
-            exc
-            for exc in self.layer_exceptions
-            if exc.matches(
-                tensor_path,
-                scope=scope,
-                source_native_layer_id=source_native_layer_id,
-                expert_id=expert_id,
-            )
-        ]
-        if matched_exc:
-            matched_exc.sort(key=lambda item: item.specificity(), reverse=True)
-            return matched_exc[0].raw_tag
-        for ignored in self.ignored_modules:
+        idx = _get_quant_map_index(self)
+        if idx.has_exceptions and source_native_layer_id is not None:
+            parts = tensor_path.split(".")
+            n_parts = len(parts)
+            tail = parts[-1]
+            best_rank: int | None = None
+            best_tag: str | None = None
+            for bkey in ((scope, n_parts, tail), (scope, n_parts, "*")) if tail != "*" else ((scope, n_parts, "*"),):
+                bucket = idx.exc_by_key.get(bkey)
+                if not bucket:
+                    continue
+                for rank, non_star, layers_set, experts_set, raw_tag in bucket:
+                    if best_rank is not None and rank >= best_rank:
+                        break
+                    if source_native_layer_id not in layers_set:
+                        continue
+                    if experts_set is not None and (expert_id is None or expert_id not in experts_set):
+                        continue
+                    if _parts_match(parts, non_star):
+                        best_rank = rank
+                        best_tag = raw_tag
+                        break
+            if best_tag is not None:
+                return best_tag
+        if idx.ignored_exact:
+            if tensor_path in idx.ignored_exact:
+                return "FLOAT"
+            dot = tensor_path.find(".")
+            while dot != -1:
+                if tensor_path[:dot] in idx.ignored_exact:
+                    return "FLOAT"
+                dot = tensor_path.find(".", dot + 1)
+        for ignored in idx.ignored_wildcards:
             if _ignored_module_matches(ignored, tensor_path):
                 return "FLOAT"
         return None
@@ -515,15 +669,35 @@ class CheckpointQuantMap:
         )
         if exc_or_ignored is not None:
             return exc_or_ignored
-        for rule in self.rules:
-            if rule.matches(
-                tensor_path,
-                scope=scope,
-                source_native_layer_id=source_native_layer_id,
-                expert_id=expert_id,
-            ):
-                return rule.raw_tag
-        return None
+        idx = _get_quant_map_index(self)
+        best_order: int | None = None
+        best_tag: str | None = None
+        exact_bucket = idx.rules_exact.get(tensor_path)
+        if exact_bucket:
+            for order_idx, p_scope, p_layers, p_experts, raw_tag in exact_bucket:
+                if _presence_matches(p_scope, p_layers, p_experts, scope, source_native_layer_id, expert_id):
+                    best_order = order_idx
+                    best_tag = raw_tag
+                    break
+        if idx.rules_wc:
+            parts = tensor_path.split(".")
+            n_parts = len(parts)
+            tail = parts[-1]
+            wc_keys = ((n_parts, tail), (n_parts, "*")) if tail != "*" else ((n_parts, "*"),)
+            for bkey in wc_keys:
+                bucket = idx.rules_wc.get(bkey)
+                if not bucket:
+                    continue
+                for order_idx, non_star, p_scope, p_layers, p_experts, raw_tag in bucket:
+                    if best_order is not None and order_idx >= best_order:
+                        break
+                    if not _presence_matches(p_scope, p_layers, p_experts, scope, source_native_layer_id, expert_id):
+                        continue
+                    if _parts_match(parts, non_star):
+                        best_order = order_idx
+                        best_tag = raw_tag
+                        break
+        return best_tag
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -541,8 +715,11 @@ class CheckpointQuantMap:
 
     def digest(self) -> str:
         """Deterministic SHA-256 hex digest of this checkpoint quant map."""
-        payload = json.dumps(self.to_dict(), sort_keys=True, separators=(",", ":"))
-        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        idx = _get_quant_map_index(self)
+        if idx.digest_hex is None:
+            payload = json.dumps(self.to_dict(), sort_keys=True, separators=(",", ":"))
+            idx.digest_hex = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        return idx.digest_hex
 
 
 __all__ = [
