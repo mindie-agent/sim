@@ -23,7 +23,9 @@ from mindie_sim.catalog.cache import (
     DEFAULT_CACHE_BLOCK_SIZE,
     INDEX_INTERLEAVE_TOKENS,
     layer_cache_components,
+    local_kv_heads,
 )
+from mindie_sim.catalog.cache_format import dense_c8_kv_planes
 from mindie_sim.catalog.cache_pools import exact_element_bytes
 from mindie_sim.catalog.context_parallel import dcp_q_replicate_enabled
 from mindie_sim.catalog.npu_checkpoints import (
@@ -85,9 +87,16 @@ _FIXED_BF16_CATEGORIES = frozenset({
     "vision_pos", "image_token", "conv_weight_bf16", "linear_param_bf16",
     "compressor_bf16_runtime", "dspark_input",
 })
-#: Distinct KV-cache bytes/element factors (C8 uses FP32/128 scale; FP8 uses FP16/128 scale).
+#: Distinct KV-cache bytes/element factors:
+#: MLA C8 uses FP32/128 scales; GQA static C8 stores INT8 payload (1.0 B/elem)
+#: plus static per-channel checkpoint scales/offsets (no block-128 inflation);
+#: FP8 uses FP16/128 scales; MXFP8 uses E8M0/32 scales (33/32 B/elem).
 C8_CACHE_WIDTH_BYTES = 1.0 + float(FP32_BYTES) / float(KV_QUANT_GROUP_SIZE)
+GQA_STATIC_C8_CACHE_WIDTH_BYTES = 1.0
 FP8_CACHE_WIDTH_BYTES = 1.0 + float(BF16_BYTES) / float(KV_QUANT_GROUP_SIZE)
+MXFP8_CACHE_WIDTH_BYTES = 1.0 + 1.0 / float(MXFP_GROUP_SIZE)
+_FLOAT16_FORMATS = frozenset({"bf16", "fp16", "bfloat16", "float16"})
+_GQA_CACHE_COMPONENTS = frozenset({"gqa_kv", "window"})
 #: Cache components whose byte width scales with the target KV cache dtype override.
 KV_DTYPE_SENSITIVE_COMPONENTS = frozenset({
     "gqa_kv", "mla_kv", "window", "compressed_kv", "dcp_dp_cohort_kv",
@@ -110,6 +119,11 @@ _WEIGHT_QUANT_ALIASES: dict[str, str] = {
     "fp8_e5m2": "FP8",
     "w8a8": "W8A8",
     "int8": "INT8",
+    "w4a16": "W4A16",
+    "compressed_tensors_w4a16": "W4A16",
+    "w4a16_compressed": "W4A16",
+    "w4a16_awq": "W4A16",
+    "w4a16_gptq": "W4A16",
     "w4a8": "W4A8",
     "int4": "INT4",
     "mxfp8": "MXFP8",
@@ -132,9 +146,14 @@ _CACHE_DTYPE_ALIASES: dict[str, str] = {
     "float16": "BF16",
     "c8": "C8",
     "int8": "C8",
+    "faquant": "C8",
     "fp8": "FP8",
     "fp8_e4m3": "FP8",
     "fp8_e5m2": "FP8",
+    "mxfp8": "MXFP8",
+    "mx_fp8": "MXFP8",
+    "qk_mxfp8_dynamic_v_mxfp8_per_channel": "MXFP8",
+    "qk-mxfp8-dynamic-v-mxfp8-per-channel": "MXFP8",
 }
 _QUANT_FORMAT_DISPLAY: dict[str, str] = {
     "bf16": "BF16",
@@ -148,6 +167,7 @@ _QUANT_FORMAT_DISPLAY: dict[str, str] = {
     "fp8_e5m2": "FP8",
     "int8": "W8A8",
     "w8a8": "W8A8",
+    "w4a16": "W4A16",
     "int4": "W4A8",
     "w4a8": "W4A8",
     "mxfp8": "MXFP8",
@@ -187,11 +207,18 @@ def _normalize_quant_preset(quant: QuantSpec | None, fallback: str = "BF16") -> 
     name = str(getattr(quant, "name", "") or "").strip().lower()
     exp_fmt = str(getattr(quant, "expert_weight_format", "") or "").strip().lower()
     w_fmt = str(getattr(quant, "weight_format", "") or "").strip().lower()
+    act_fmt = str(getattr(quant, "activation_format", "") or "").strip().lower()
     combined = f"{name} {exp_fmt} {w_fmt}"
     if "mxfp4" in combined or "mx_fp4" in combined:
         return "MXFP4"
     if "mxfp8" in combined or "mx_fp8" in combined:
         return "MXFP8"
+    if "w4a16" in combined or (
+        (exp_fmt == "int4" or w_fmt == "int4")
+        and act_fmt in _FLOAT16_FORMATS
+        and "w4a8" not in name
+    ):
+        return "W4A16"
     if "w4a8" in combined or "int4" in combined or "fp4" in combined:
         return "W4A8"
     if "w8a8" in combined or "int8" in combined:
@@ -231,6 +258,10 @@ def _describe_quant_display(
         if "mxfp8" in q_name:
             return "MXFP8 Linear + MXFP4 Routed/Latent (QuaRot / msmodelslim)", exclusions
         return "FP8 Linear + MXFP4 Routed Experts (Router/Norm/Head BF16)", exclusions
+    if resolved_wq == "W4A16":
+        if ({"attn", "mla", "kda"} & excl_set) and "shared_expert" in excl_set:
+            return "W4A16 (INT4 Group-32 Routed Experts, Attn/Shared BF16)", exclusions
+        return "W4A16 (Compressed INT4 Group-32, BF16 Activations)", exclusions
     if resolved_wq == "W4A8":
         return "W4A8_DYNAMIC (INT8 Linear + INT4 Routed Experts, Norm/Router/Head BF16)", exclusions
     if resolved_wq == "W8A8":
@@ -249,15 +280,20 @@ def _canonicalize_cache_dtype_override(raw: str) -> str:
 
 
 def _normalize_cache_dtype(model: Any) -> str:
+    meta = dict(getattr(model, "metadata", ()) or ())
     quant = getattr(model, "quant", None)
-    raw = str(
-        (getattr(quant, "kv_dtype", "") if quant is not None else "")
-        or getattr(model, "kv_dtype", "")
-        or "bf16"
-    ).strip().lower()
-    if "int8" in raw or raw == "c8":
+    tokens = (
+        str(meta.get("kv_cache_tag") or "").strip().lower(),
+        str(meta.get("kv_cache_type") or "").strip().lower(),
+        str(getattr(quant, "kv_dtype", "") if quant is not None else "").strip().lower(),
+        str(getattr(model, "kv_dtype", "") or "").strip().lower(),
+    )
+    joined = " ".join(tok for tok in tokens if tok)
+    if "mxfp8" in joined or "mx_fp8" in joined:
+        return "MXFP8"
+    if "int8" in joined or "faquant" in joined or any(tok == "c8" for tok in tokens):
         return "C8"
-    if "fp8" in raw:
+    if "fp8" in joined:
         return "FP8"
     return "BF16"
 
@@ -303,19 +339,77 @@ def stage_layer_counts(case: Case) -> tuple[int, ...]:
     )
 
 
-def _cache_dtype_override_ratio(model: Any, target_dtype: str) -> float:
+def _model_has_mla(model: Any) -> bool:
+    return any(getattr(lp, "attention", "") == "mla" for lp in getattr(model, "layer_plans", ()) or ())
+
+
+def _cache_dtype_width_bytes(dtype: str, *, is_gqa: bool) -> float:
+    if dtype == "MXFP8":
+        return MXFP8_CACHE_WIDTH_BYTES
+    if dtype == "C8":
+        return GQA_STATIC_C8_CACHE_WIDTH_BYTES if is_gqa else C8_CACHE_WIDTH_BYTES
+    if dtype == "FP8":
+        return FP8_CACHE_WIDTH_BYTES
+    return float(BF16_BYTES)
+
+
+def _cache_dtype_override_ratio(model: Any, target_dtype: str, *, component: str = "") -> float:
     base = _normalize_cache_dtype(model)
     target = str(target_dtype or base).strip().upper()
     if target == base:
         return 1.0
-    width_by_dtype = {
-        "BF16": float(BF16_BYTES),
-        "C8": C8_CACHE_WIDTH_BYTES,
-        "FP8": FP8_CACHE_WIDTH_BYTES,
-    }
-    base_w = width_by_dtype.get(base, float(BF16_BYTES))
-    target_w = width_by_dtype.get(target, float(BF16_BYTES))
+    is_gqa = (
+        component in _GQA_CACHE_COMPONENTS
+        or (component == "" and not _model_has_mla(model))
+    )
+    base_w = _cache_dtype_width_bytes(base, is_gqa=is_gqa)
+    target_w = _cache_dtype_width_bytes(target, is_gqa=is_gqa)
     return target_w / max(base_w, MIN_DENOM_EPS)
+
+
+def _gqa_c8_static_scale_bytes_by_stage(
+    case: Case,
+    stage_layers: Sequence[int],
+    block_size: int,
+) -> tuple[list[float], list[int]]:
+    """Per-stage static checkpoint C8 channel scale + offset bytes for GQA layers."""
+    n_stages = len(stage_layers)
+    by_stage = [0.0] * n_stages
+    layers_by_stage = [0] * n_stages
+    layer_stage = [s for s, count in enumerate(stage_layers) for _ in range(count)]
+    tp = max(1, int(case.runtime.parallel.tp))
+    blk = max(1, int(block_size))
+    for lp in getattr(case.model, "layer_plans", ()) or ():
+        if getattr(lp, "attention", "") != "gqa":
+            continue
+        k_dim = int(getattr(lp, "head_dim", 0) or getattr(case.model, "head_dim", 0) or 0)
+        v_dim = int(getattr(lp, "v_head_dim", 0) or k_dim)
+        n_kv = int(getattr(lp, "num_kv_heads", 0) or getattr(case.model, "kv_heads", 0) or 0)
+        if k_dim <= 0 or n_kv <= 0:
+            continue
+        local_kv = local_kv_heads(n_kv, tp)
+        k_planes = dense_c8_kv_planes(local_kv, blk, k_dim)
+        if v_dim == k_dim:
+            static_b = float(sum(
+                pl.bytes_per_unit for pl in k_planes if pl.allocation_frequency == "checkpoint"
+            ))
+        else:
+            v_planes = dense_c8_kv_planes(local_kv, blk, v_dim)
+            static_b = float(
+                sum(
+                    pl.bytes_per_unit for pl in k_planes
+                    if pl.allocation_frequency == "checkpoint" and pl.plane_id.startswith("k_")
+                )
+                + sum(
+                    pl.bytes_per_unit for pl in v_planes
+                    if pl.allocation_frequency == "checkpoint" and pl.plane_id.startswith("v_")
+                )
+            )
+        st = layer_stage[lp.index] if lp.index < len(layer_stage) else 0
+        if 0 <= st < n_stages:
+            by_stage[st] += static_b
+            layers_by_stage[st] += 1
+    return by_stage, layers_by_stage
 
 
 _FIXED_STATE_CACHE_COMPONENTS = frozenset({
@@ -330,7 +424,34 @@ _FIXED_STATE_CACHE_COMPONENTS = frozenset({
     "state_transient",
     "page_group_reserve",
     "page_metadata",
+    "c8_static_channel_scale",
 })
+
+
+def _add_fixed_cache_stage_values(
+    comp_name: str,
+    values: Sequence[float],
+    stage_layers: Sequence[int],
+    comp_stage_bytes: dict[str, list[float]],
+    comp_stage_layers: dict[str, list[int]],
+    comp_scalable: dict[str, bool],
+    comp_kv_scaled: dict[str, bool],
+    *,
+    layer_counts: Sequence[int] | None = None,
+) -> None:
+    for st_idx in range(min(len(stage_layers), len(values))):
+        val = float(values[st_idx] or 0.0)
+        if val <= 0.0:
+            continue
+        comp_scalable[comp_name] = False
+        comp_kv_scaled[comp_name] = False
+        comp_stage_bytes[comp_name][st_idx] += val
+        layers_val = (
+            int(layer_counts[st_idx])
+            if layer_counts is not None and st_idx < len(layer_counts)
+            else int(stage_layers[st_idx])
+        )
+        comp_stage_layers[comp_name][st_idx] = max(1, layers_val)
 
 
 def _compute_cache_ledger_rows(
@@ -356,7 +477,6 @@ def _compute_cache_ledger_rows(
     comp_stage_layers: dict[str, list[int]] = defaultdict(lambda: [0] * n_stages)
     comp_scalable: dict[str, bool] = {}
 
-    scale_override = _cache_dtype_override_ratio(model, cache_dtype)
     fixed_state_comps = _FIXED_STATE_CACHE_COMPONENTS
     # Count active target layers per component so per-token-per-layer rates stay exact.
     for lp in model.layer_plans:
@@ -388,7 +508,8 @@ def _compute_cache_ledger_rows(
             kv_scaled = scalable and (comp_name in KV_DTYPE_SENSITIVE_COMPONENTS)
             comp_scalable[comp_name] = scalable
             comp_kv_scaled[comp_name] = kv_scaled
-            comp_stage_bytes[comp_name][st_idx] += val * (scale_override if kv_scaled else 1.0)
+            ratio = _cache_dtype_override_ratio(model, cache_dtype, component=comp_name) if kv_scaled else 1.0
+            comp_stage_bytes[comp_name][st_idx] += val * ratio
         for comp_name, detail in (entry.get("group_allocated") or {}).items():
             val = float(detail.get("alloc_payload", 0.0) or 0.0) + float(detail.get("alloc_scale", 0.0) or 0.0)
             if val <= 0.0:
@@ -397,25 +518,38 @@ def _compute_cache_ledger_rows(
             kv_scaled = scalable and (comp_name in KV_DTYPE_SENSITIVE_COMPONENTS)
             comp_scalable[comp_name] = scalable
             comp_kv_scaled[comp_name] = kv_scaled
-            comp_stage_bytes[comp_name][st_idx] += val * (scale_override if kv_scaled else 1.0)
-        if st_idx < len(reserves) and float(reserves[st_idx] or 0.0) > 0.0:
-            comp_scalable["page_group_reserve"] = False
-            comp_kv_scaled["page_group_reserve"] = False
-            comp_stage_bytes["page_group_reserve"][st_idx] += float(reserves[st_idx])
-            comp_stage_layers["page_group_reserve"][st_idx] = max(1, int(stage_layers[st_idx]))
-        if st_idx < len(metadatas) and float(metadatas[st_idx] or 0.0) > 0.0:
-            comp_scalable["page_metadata"] = False
-            comp_kv_scaled["page_metadata"] = False
-            comp_stage_bytes["page_metadata"][st_idx] += float(metadatas[st_idx])
-            comp_stage_layers["page_metadata"][st_idx] = max(1, int(stage_layers[st_idx]))
+            ratio = _cache_dtype_override_ratio(model, cache_dtype, component=comp_name) if kv_scaled else 1.0
+            comp_stage_bytes[comp_name][st_idx] += val * ratio
+    _add_fixed_cache_stage_values(
+        "page_group_reserve", reserves, stage_layers,
+        comp_stage_bytes, comp_stage_layers, comp_scalable, comp_kv_scaled,
+    )
+    stride_reserves = mem._unified_pool_stride_reserve_by_stage(max(1, seq_len))
+    _add_fixed_cache_stage_values(
+        "page_group_reserve", stride_reserves, stage_layers,
+        comp_stage_bytes, comp_stage_layers, comp_scalable, comp_kv_scaled,
+    )
+    _add_fixed_cache_stage_values(
+        "page_metadata", metadatas, stage_layers,
+        comp_stage_bytes, comp_stage_layers, comp_scalable, comp_kv_scaled,
+    )
+    if cache_dtype == "C8" and (_GQA_CACHE_COMPONENTS & set(comp_stage_bytes)):
+        c8_static_b, c8_gqa_layers = _gqa_c8_static_scale_bytes_by_stage(case, stage_layers, block_size)
+        amortized_static = [v / float(max(1, concurrency)) for v in c8_static_b]
+        _add_fixed_cache_stage_values(
+            "c8_static_channel_scale", amortized_static, stage_layers,
+            comp_stage_bytes, comp_stage_layers, comp_scalable, comp_kv_scaled,
+            layer_counts=c8_gqa_layers,
+        )
 
     # Account for DP-cohort DCP amplification when dcp_dp_width > 1 so per-DP cache matches Memory;
     # the cohort's extra sharded KV bytes take the same cache-dtype width ratio as the local KV.
     if int(getattr(p, "dcp_dp_width", 1) or 1) > 1:
+        cohort_ratio = _cache_dtype_override_ratio(model, cache_dtype, component="dcp_dp_cohort_kv")
         cohort_totals = mem.dp_cohort_cache_bytes(max(1, seq_len), padded=True)
         base_totals = mem.cache_bytes(max(1, seq_len), padded=True)
         for st_idx in range(min(n_stages, len(cohort_totals), len(base_totals))):
-            extra = (float(cohort_totals[st_idx]) - float(base_totals[st_idx])) * scale_override
+            extra = (float(cohort_totals[st_idx]) - float(base_totals[st_idx])) * cohort_ratio
             if extra > MIN_DENOM_EPS:
                 comp_scalable["dcp_dp_cohort_kv"] = True
                 comp_kv_scaled["dcp_dp_cohort_kv"] = True
@@ -468,18 +602,6 @@ def _compute_cache_ledger_rows(
             per_stage_bytes=tuple(float(v) for v in per_stage),
         ))
     return local_tokens, tuple(rows), stage_totals, stage_per_req_totals
-
-
-def _workload_has_media(case: Case) -> bool:
-    for req in getattr(case.workload, "requests", ()) or ():
-        if (
-            int(getattr(req, "image_tokens", 0) or 0) > 0
-            or int(getattr(req, "media_tokens", 0) or 0) > 0
-            or int(getattr(req, "images", 0) or 0) > 0
-            or bool(getattr(req, "media", None))
-        ):
-            return True
-    return False
 
 
 def _is_vision_term(term: WeightTerm) -> bool:
@@ -541,6 +663,7 @@ def _resolve_term_quant_format(
             resolved_q = term_quant.for_category(cat)
             eff_raw = str(resolved_q.format_for(cat) or "bf16").lower()
             lin_method = str(resolved_q.linear_method(cat) or "").lower()
+            act_fmt = str(getattr(resolved_q, "activation_format", "") or "").lower()
             w_blk = tuple(getattr(resolved_q, "weight_block", (0, 0)) or (0, 0))
             if lin_method == "mx_fp8" or (
                 eff_raw in {"fp8", "fp8_e4m3", "fp8_e5m2"} and w_blk == (1, MXFP_GROUP_SIZE)
@@ -548,6 +671,8 @@ def _resolve_term_quant_format(
                 mapped = "MXFP8"
             elif lin_method == "mx_fp4":
                 mapped = "MXFP4"
+            elif lin_method == "w4a16" or (eff_raw == "int4" and act_fmt in _FLOAT16_FORMATS):
+                mapped = "W4A16"
             else:
                 mapped = _QUANT_FORMAT_DISPLAY.get(eff_raw, resolved_wq)
             if resolved_wq == "W4A8" and not is_w4_expert and mapped == "W4A8":
@@ -555,8 +680,9 @@ def _resolve_term_quant_format(
             note = (
                 "MXFP4 (group=32)" if mapped == "MXFP4"
                 else ("MXFP8 (group=32 E8M0)" if mapped == "MXFP8"
-                      else ("W4A8_DYNAMIC (INT4 Packed Expert)" if mapped == "W4A8"
-                            else ("W8A8_DYNAMIC (INT8 Linear)" if mapped == "W8A8" else mapped)))
+                      else ("W4A16 (INT4 Group-32, BF16 Act)" if mapped == "W4A16"
+                            else ("W4A8_DYNAMIC (INT4 Packed Expert)" if mapped == "W4A8"
+                                  else ("W8A8_DYNAMIC (INT8 Linear)" if mapped == "W8A8" else mapped))))
             )
             rule = QUANT_RULE_FOLLOW_PRESET if (is_mxfp4_expert or is_w4_expert) else QUANT_RULE_PRESET_LINEAR_FP8
             return mapped, (mapped == "BF16"), note, rule
@@ -578,8 +704,9 @@ def _resolve_term_quant_format(
     note = (
         "MXFP4 (group=32)" if resolved_wq == "MXFP4"
         else ("MXFP8 (group=32 E8M0)" if resolved_wq == "MXFP8"
-              else ("W4A8_DYNAMIC (INT4 Packed Expert)" if resolved_wq == "W4A8"
-                    else ("W8A8_DYNAMIC (INT8)" if resolved_wq == "W8A8" else resolved_wq)))
+              else ("W4A16 (INT4 Group-32, BF16 Act)" if resolved_wq == "W4A16"
+                    else ("W4A8_DYNAMIC (INT4 Packed Expert)" if resolved_wq == "W4A8"
+                          else ("W8A8_DYNAMIC (INT8)" if resolved_wq == "W8A8" else resolved_wq))))
     )
     rule = QUANT_RULE_FOLLOW_PRESET if (is_mxfp4_expert or is_w4_expert) else QUANT_RULE_PRESET_LINEAR_FP8
     return resolved_wq, (resolved_wq == "BF16"), note, rule
@@ -1120,12 +1247,7 @@ def _resolve_ledger_parameters(
         if engram_host_offload is None else bool(engram_host_offload)
     )
     rt_meta = dict(case.runtime.metadata)
-    if include_vision_tower is not None:
-        resolved_vit = bool(include_vision_tower)
-    elif rt_meta.get("vision_accounting"):
-        resolved_vit = str(rt_meta.get("vision_accounting")).strip() == "full_checkpoint"
-    else:
-        resolved_vit = _workload_has_media(case)
+    explicit_vit = None if include_vision_tower is None else bool(include_vision_tower)
     block_size = int(
         getattr(case.runtime, "kv_block_size", None)
         or getattr(case.runtime, "block_size", None)
@@ -1150,7 +1272,7 @@ def _resolve_ledger_parameters(
         "q_exclusions": q_exclusions,
         "resolved_cd": resolved_cd,
         "resolved_offload": resolved_offload,
-        "resolved_vit": resolved_vit,
+        "explicit_vit": explicit_vit,
         "block_size": block_size,
         "spec_tokens": spec_tokens,
         "ws_tokens": ws_tokens,
@@ -1227,10 +1349,14 @@ def compute_memory_quant_ledger(
     )
     resolved_seq, resolved_conc = cfg["resolved_seq"], cfg["resolved_conc"]
     resolved_wq, resolved_cd = cfg["resolved_wq"], cfg["resolved_cd"]
-    resolved_offload, resolved_vit = cfg["resolved_offload"], cfg["resolved_vit"]
+    resolved_offload = cfg["resolved_offload"]
     resolved_prepared = cfg["resolved_prepared"]
 
     mem = Memory(case, workspace_tokens=cfg["ws_tokens"])
+    resolved_vit = (
+        bool(mem.vision_accounting == "full_checkpoint")
+        if cfg["explicit_vit"] is None else bool(cfg["explicit_vit"])
+    )
     if resolved_prepared:
         mem.register_prepared_weights(resolved_prepared)
     alloc = mem.allocation_report(resolved_seq)
@@ -1285,7 +1411,11 @@ def compute_memory_quant_ledger(
         int(getattr(p, "dcp_linear_tp", 1) or 1),
     )
     shared_tp = 1 if bool(cfg["rt_meta"].get("enable_shared_expert_dp", False)) else int(p.tp)
-    sim_cache_by_stage = tuple(float(v) for v in mem.dp_cohort_cache_bytes(resolved_seq, padded=True))
+    stride_reserves = mem._unified_pool_stride_reserve_by_stage(resolved_seq)
+    sim_cache_by_stage = tuple(
+        float(v) + (float(stride_reserves[idx]) if idx < len(stride_reserves) else 0.0)
+        for idx, v in enumerate(mem.dp_cohort_cache_bytes(resolved_seq, padded=True))
+    )
     receipt_weights_by_stage, weight_footprint, native_bf16_footprint, vision_bytes, comp_ratio = (
         _extract_receipt_weight_totals(
             pp=int(p.pp),

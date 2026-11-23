@@ -1086,6 +1086,60 @@ class _MemoryLedgerMixin:
         ckpt_b = max(0, int(round(self.weights[stage])) - prep_b)
         return ckpt_b, prep_b
 
+    def _unified_pool_stride_reserve_by_stage(
+        self,
+        sequence_tokens: int,
+        *,
+        query_tokens: int | None = None,
+    ) -> list[float]:
+        """Per-stage per-request unified hybrid-pool stride alignment reserve."""
+        p = self.case.runtime.parallel
+        zeros = [0.0] * p.pp
+        seq = int(sequence_tokens)
+        if seq <= 0:
+            return zeros
+        from mindie_sim.catalog.qwen4_exp import qwen4_exp_pool_breakdown
+
+        q_tok = self._effective_cache_query_tokens(query_tokens)
+        cp = max(1, int(getattr(p, "cp", 1) or 1))
+        eff_seq = (seq + cp - 1) // cp if cp > 1 else seq
+        qwen4_pool = qwen4_exp_pool_breakdown(
+            self.case.model, p, eff_seq,
+            runtime=self.case.runtime, query_tokens=q_tok,
+        )
+        if not qwen4_pool:
+            return zeros
+        alloc_stages = self._cache_component_breakdown(
+            seq, padded=True, skip_covered=True, query_tokens=q_tok,
+        )
+        target_base = 0.0
+        for st in range(p.pp):
+            for name, detail in alloc_stages[st]["components"].items():
+                if not name.startswith("draft_"):
+                    target_base += float(detail.get("total", 0.0) or 0.0)
+        if self.pages.groups:
+            group_payload = self.pages.stage_bytes(seq, self.case.runtime.max_model_len, p.pp)
+            group_parts = self._group_cache_parts(seq, query_tokens=q_tok)
+            for st in range(p.pp):
+                target_base += max(
+                    float(group_payload[st]),
+                    float(group_parts[st]["alloc_payload"]) + float(group_parts[st]["alloc_scale"]),
+                )
+        stride_reserve = max(0.0, float(qwen4_pool["total_pool_bytes"]) - target_base)
+        if stride_reserve <= 0.0:
+            return zeros
+        qsa_per_stage = [0] * p.pp
+        for lp in self.case.model.layer_plans:
+            if lp.attention == "gqa" and lp.indexer:
+                st = self.layer_stage[lp.index]
+                if 0 <= st < p.pp:
+                    qsa_per_stage[st] += 1
+        total_qsa = sum(qsa_per_stage)
+        if total_qsa <= 0:
+            zeros[0] = stride_reserve
+            return zeros
+        return [stride_reserve * (float(cnt) / float(total_qsa)) for cnt in qsa_per_stage]
+
     def _projected_stage_cache_pools(
         self,
         sequence_tokens: int | None,
@@ -1120,6 +1174,9 @@ class _MemoryLedgerMixin:
         stage_cache_bytes = self.cache_bytes(
             int(sequence_tokens), padded=True, query_tokens=query_tokens,
         )
+        stride_reserves = self._unified_pool_stride_reserve_by_stage(
+            int(sequence_tokens), query_tokens=query_tokens,
+        )
         per_stage: list[dict[str, int]] = []
         for stage in range(p.pp):
             alloc_pools = {"target_kv_bytes": 0.0, "indexer_k_bytes": 0.0,
@@ -1134,6 +1191,7 @@ class _MemoryLedgerMixin:
                 key = _COMPONENT_POOL_MAP.get(name)
                 if key in valid_pools:
                     valid_pools[key] += float(detail["total"])
+            group_reserve = 0.0
             if group_parts is not None and group_payload is not None and group_metadata is not None:
                 known_group = 0.0
                 for name, detail in group_parts[stage]["components"].items():
@@ -1146,10 +1204,13 @@ class _MemoryLedgerMixin:
                         valid_pools[key] += float(detail["valid_payload"]) + float(detail["valid_scale"])
                 group_reserve = max(0.0, float(group_payload[stage]) - known_group)
                 alloc_pools["target_kv_bytes"] += group_reserve + float(group_metadata[stage])
+            stride_reserve = float(stride_reserves[stage]) if stage < len(stride_reserves) else 0.0
+            if stride_reserve > 0.0:
+                alloc_pools["target_kv_bytes"] += stride_reserve
             idx_a = int(round(b_int * alloc_pools["indexer_k_bytes"]))
             rec_a = int(round(b_int * alloc_pools["recurrent_state_bytes"]))
             drf_a = int(round(b_int * (alloc_pools["draft_kv_bytes"] + alloc_pools["draft_state_bytes"])))
-            expected_total = int(round(b_int * float(stage_cache_bytes[stage])))
+            expected_total = int(round(b_int * (float(stage_cache_bytes[stage]) + stride_reserve)))
             non_kv = idx_a + rec_a + drf_a
             kv_a = (
                 expected_total - non_kv
@@ -1163,6 +1224,7 @@ class _MemoryLedgerMixin:
                 "idx_valid": int(round(b_int * valid_pools["indexer_k_bytes"])),
                 "rec": rec_a,
                 "draft": drf_a,
+                "page_group_reserve": int(round(b_int * (group_reserve + stride_reserve))),
             })
         return per_stage
 

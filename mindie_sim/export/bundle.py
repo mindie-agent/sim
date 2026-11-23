@@ -484,9 +484,14 @@ def _classify_dominant_bound(
 
 def _hbm_read_write_l2(spec: OpSpec | None) -> tuple[float, float, float, float, float, float, float]:
     meta = dict(spec.metadata) if (spec is not None and spec.metadata) else {}
-    mte2 = float((spec.mte2_bytes if spec is not None else 0.0) or 0.0)
+    res_work = meta.get("resource_work") if isinstance(meta.get("resource_work"), Mapping) else {}
+    mte2 = (
+        float((spec.mte2_bytes if spec is not None else 0.0) or 0.0)
+        + float(res_work.get("mte2_aic", 0.0) or 0.0)
+        + float(res_work.get("mte2_aiv", 0.0) or 0.0)
+    )
     mte3 = float((spec.mte3_bytes if spec is not None else 0.0) or 0.0)
-    fixpipe = float(meta.get("fixpipe_bytes", 0.0) or 0.0)
+    fixpipe = float(meta.get("fixpipe_bytes", 0.0) or 0.0) + float(res_work.get("fixpipe", 0.0) or 0.0)
     hbm_total = float(spec.hbm_bytes if spec is not None else 0.0)
     raw_write = mte3 + fixpipe
     copy_total = mte2 + raw_write
@@ -778,7 +783,14 @@ def _extract_prepared_work_fallback(
         if work is None:
             continue
         res = dict(getattr(work, "resources", {}) or {})
-        mat = sum(float(v) for v in dict(getattr(work, "matrix", {}) or {}).values())
+        mat_pairs = tuple(
+            sorted(
+                (str(k), float(v))
+                for k, v in dict(getattr(work, "matrix", {}) or {}).items()
+                if float(v) > 0.0
+            )
+        )
+        mat = sum(v for _, v in mat_pairs)
         hbm_b = float(res.get("hbm", 0.0) or 0.0)
         m2_b = (
             float(res.get("mte2_aiv", 0.0) or 0.0)
@@ -793,6 +805,7 @@ def _extract_prepared_work_fallback(
         if mat > 0.0 or vec_ops > 0.0 or hbm_b > 0.0 or link_b > 0.0:
             out[op.op_id] = {
                 "flops": mat,
+                "matrix_flops": mat_pairs,
                 "vector_ops": vec_ops,
                 "hbm_bytes": hbm_b,
                 "mte2_bytes": m2_b,
@@ -800,6 +813,188 @@ def _extract_prepared_work_fallback(
                 "link_bytes": link_b,
             }
     return out
+
+
+def _resolved_execution_dtype(spec: OpSpec | None) -> str:
+    """Read resolved execution Cube/compute precision from a prepared ``OpSpec``."""
+    if spec is None:
+        return ""
+    meta = dict(spec.metadata) if spec.metadata else {}
+    exec_dt = str(meta.get("execution_compute_format") or "").strip()
+    if exec_dt:
+        return exec_dt
+    return str(spec.dtype or "").strip()
+
+
+def _collect_persisted_prepared_ops(
+    evaluation: Any,
+    report: Mapping[str, Any] | None = None,
+) -> dict[tuple[int, str], OpSpec]:
+    """Read persisted prepared ``OpSpec`` entries from ``EvaluationContext`` or report."""
+    persisted: dict[tuple[int, str], OpSpec] = {}
+    candidates = (
+        getattr(evaluation, "prepared_ops", None),
+        getattr(evaluation, "_prepared_ops", None),
+        getattr(evaluation, "resolved_ops", None),
+        (report.get("prepared_ops") if isinstance(report, Mapping) else None),
+    )
+    for mapping in candidates:
+        if not isinstance(mapping, Mapping) or not mapping:
+            continue
+        for key, val in mapping.items():
+            if not isinstance(val, OpSpec):
+                continue
+            if isinstance(key, tuple) and len(key) == 2:
+                persisted[(int(key[0]), str(key[1]))] = val
+            elif isinstance(key, str):
+                persisted[(0, key)] = val
+        if persisted:
+            break
+    return persisted
+
+
+def _stage_devices_for_replica(case: Case, stage: int, replica: int = 0) -> tuple[Any, ...]:
+    p = case.runtime.parallel
+    width = max(1, int(p.tp) * int(p.pcp))
+    start = (int(replica) * max(1, int(p.pp)) + int(stage)) * width
+    dies = tuple(case.machine.dies[start:start + width])
+    return dies if dies else (case.machine.dies[0],)
+
+
+def _prepare_op_spec_via_book(
+    phys_op: OpSpec,
+    *,
+    case: Case,
+    book: ReplayRecipeBook,
+    stage_dies: Sequence[Any],
+    stage_geom: Geometry,
+) -> OpSpec:
+    from mindie_sim.prediction.collectives.waves import startup_waves_recipe
+    from mindie_sim.prediction.operators.matrix.matrix_precision import resolve_matrix_precision
+
+    prep_op, plan = book.prepare(phys_op, stage_geom)
+    plan = startup_waves_recipe(prep_op, plan, case.runtime.collective_startup_mode)
+    return resolve_matrix_precision(
+        prep_op, devices=stage_dies,
+        policy=case.runtime.matrix_compute_policy, recipe=plan,
+    )
+
+
+def _resolve_prepared_op_specs(
+    entries: Sequence[Any],
+    evaluation: Any,
+    *,
+    case: Case | None = None,
+    book: ReplayRecipeBook | None = None,
+    report: Mapping[str, Any] | None = None,
+    request_views: Sequence[Any] = (),
+    padded_tokens: int = 0,
+    sequence_layout: str = "",
+    reduced_r0: Sequence[OpSpec] | None = None,
+    op_rep_map: Mapping[str, str] | None = None,
+) -> dict[tuple[int, str], OpSpec]:
+    """Populate ``op_spec_by_key`` from prepared execution ``OpSpec``s on replica 0."""
+    op_spec_by_key: dict[tuple[int, str], OpSpec] = {
+        (int(entry.replica), op.op_id): op for entry in entries for op in entry.ops
+    }
+    persisted = _collect_persisted_prepared_ops(evaluation, report)
+    op_spec_by_key.update(persisted)
+    prepare_fn = getattr(evaluation, "prepare", None)
+    eff_case = case if case is not None else getattr(evaluation, "case", None)
+    if not callable(prepare_fn) and (book is None or eff_case is None):
+        return op_spec_by_key
+    stage_cache: dict[int, tuple[tuple[Any, ...], Geometry]] = {}
+    op_memo: dict[tuple[Any, ...], tuple[tuple[Any, ...], OpSpec]] = {}
+    req_tuple = tuple(request_views or ())
+    pad_tok = int(padded_tokens or 0)
+    seq_layout = str(sequence_layout or "")
+    rep_map = op_rep_map or {}
+
+    def _prepare_one(phys_op: OpSpec) -> OpSpec:
+        if phys_op.family == "barrier" or phys_op.source_boundary == "call":
+            return phys_op
+        if callable(prepare_fn):
+            try:
+                prep_op, _plan = prepare_fn(phys_op, 0)
+            except ModelingError:
+                return phys_op
+            return prep_op if isinstance(prep_op, OpSpec) else phys_op
+        assert eff_case is not None and book is not None
+        st = int(phys_op.stage)
+        if st not in stage_cache:
+            s_dies = _stage_devices_for_replica(eff_case, st, 0)
+            s_geom = Geometry.from_devices(
+                s_dies, links=eff_case.machine.links,
+                transfer_channels=eff_case.machine.transfer_channels,
+            )
+            if req_tuple or pad_tok or seq_layout:
+                s_geom = replace(
+                    s_geom, requests=req_tuple,
+                    padded_tokens=pad_tok, layout=seq_layout,
+                )
+            stage_cache[st] = (s_dies, s_geom)
+        s_dies, s_geom = stage_cache[st]
+        memo_key = (
+            st, phys_op.family, phys_op.recipe, phys_op.phase, phys_op.dtype,
+            phys_op.layout, phys_op.local_shape, phys_op.padded_shape,
+            phys_op.flops, phys_op.matrix_flops, phys_op.mte2_bytes,
+            phys_op.mte3_bytes, phys_op.vector_ops, phys_op.hbm_bytes,
+            phys_op.link_bytes, phys_op.source_boundary,
+        )
+        cached = op_memo.get(memo_key)
+        if cached is not None and cached[0] == phys_op.metadata:
+            return replace(
+                cached[1], op_id=phys_op.op_id, layer=phys_op.layer,
+                deps=phys_op.deps, requests=phys_op.requests,
+                stream=phys_op.stream, notes=phys_op.notes,
+            )
+        try:
+            resolved = _prepare_op_spec_via_book(
+                phys_op, case=eff_case, book=book,
+                stage_dies=s_dies, stage_geom=s_geom,
+            )
+        except ModelingError:
+            resolved = phys_op
+        op_memo[memo_key] = (phys_op.metadata, resolved)
+        return resolved
+
+    if reduced_r0 is not None and rep_map:
+        rep_phys = tuple(book.expand(reduced_r0)) if book is not None else tuple(reduced_r0)
+        for phys_op in rep_phys:
+            key = (0, phys_op.op_id)
+            if key not in persisted:
+                op_spec_by_key[key] = _prepare_one(phys_op)
+        for oid, rep_oid in rep_map.items():
+            key = (0, oid)
+            if key in persisted:
+                continue
+            orig = op_spec_by_key.get(key)
+            rep_spec = op_spec_by_key.get((0, rep_oid))
+            if orig is not None and rep_spec is not None and (
+                orig.family == rep_spec.family
+                and orig.recipe == rep_spec.recipe
+                and orig.local_shape == rep_spec.local_shape
+                and orig.flops == rep_spec.flops
+                and orig.hbm_bytes == rep_spec.hbm_bytes
+            ):
+                op_spec_by_key[key] = replace(
+                    rep_spec, op_id=orig.op_id, layer=orig.layer,
+                    deps=orig.deps, requests=orig.requests,
+                    stream=orig.stream, notes=orig.notes,
+                )
+            elif orig is not None:
+                op_spec_by_key[key] = _prepare_one(orig)
+        return op_spec_by_key
+
+    for entry in entries:
+        if int(entry.replica) != 0:
+            continue
+        phys_ops = tuple(book.expand(entry.ops)) if book is not None else tuple(entry.ops)
+        for phys_op in phys_ops:
+            key = (0, phys_op.op_id)
+            if key not in persisted:
+                op_spec_by_key[key] = _prepare_one(phys_op)
+    return op_spec_by_key
 
 
 def _evaluate_representative_step(
@@ -835,7 +1030,15 @@ def _evaluate_representative_step(
         padded_tokens=step_req.padded_tokens, sequence_layout=step_req.layout,
         timeline_replicas=(0,),
     )
-    op_spec_by_key = {(entry.replica, op.op_id): op for entry in rewritten.executable for op in entry.ops}
+    op_spec_by_key = _resolve_prepared_op_specs(
+        rewritten.executable, evaluation,
+        case=eff_case, book=book, report=report,
+        request_views=rewritten.request_views,
+        padded_tokens=step_req.padded_tokens,
+        sequence_layout=step_req.layout,
+        reduced_r0=(reduced_graphs[0] if (reduced_graphs is not None and 0 in reduced_graphs) else None),
+        op_rep_map=op_rep_map,
+    )
     if reduced_graphs is not None and 0 in reduced_graphs:
         rep_r0 = reduced_graphs[0]
         prepared_work_by_op = _extract_prepared_work_fallback(eff_case, book, rep_r0)
@@ -890,7 +1093,7 @@ def _timeline_to_raw_records(
                 "ordinal": row.ordinal, "occurrence": row.occurrence, "op_id": row.occurrence.op_id,
                 "spec": spec, "family": row.family, "recipe": spec.recipe if spec is not None else "",
                 "stream": row.stream, "shape": row.shape,
-                "dtype": row.dtype or (spec.dtype if spec is not None else "") or case.model.compute_dtype or "bf16",
+                "dtype": _resolved_execution_dtype(spec) or row.dtype or case.model.compute_dtype or "bf16",
                 "predecessors": row.predecessors,
                 "start_us": max(0.0, float(row.start_ms or 0.0) * US_PER_MS),
                 "end_us": max(0.0, float(row.end_ms or row.start_ms or 0.0) * US_PER_MS),
@@ -918,7 +1121,7 @@ def _timeline_to_raw_records(
             "recipe": str(spec.recipe if spec is not None else row.get("recipe", "")),
             "stream": str((spec.stream if spec is not None else "") or row.get("stream", "") or "main"),
             "shape": tuple(spec.local_shape) if spec is not None else tuple(row.get("shape", ())),
-            "dtype": str((spec.dtype if spec is not None else "") or row.get("dtype", "") or case.model.compute_dtype or "bf16"),
+            "dtype": str(_resolved_execution_dtype(spec) or row.get("dtype", "") or case.model.compute_dtype or "bf16"),
             "raw_preds": tuple(row.get("predecessors") or ()), "start_us": start_us, "end_us": end_us,
         })
     for rec in records:
@@ -1533,6 +1736,9 @@ def _build_prelim_operator_rows(
         stream_idx = classify_stream_index(rec["stream"], rec["family"], rec["op_id"])
         dur_us = max(0.0, float(rec["end_us"]) - float(rec["start_us"]))
         flops = float((spec.flops if spec is not None else 0.0) or 0.0)
+        matrix_flops: Sequence[tuple[str, float]] = (
+            spec.matrix_flops if (spec is not None and spec.matrix_flops) else ()
+        )
         vec_ops = float((spec.vector_ops if spec is not None else 0.0) or 0.0)
         link_bytes = float((spec.link_bytes if spec is not None else 0.0) or 0.0)
         hbm_r, hbm_w, hbm_tot, mte2, mte3, fixpipe, l2_hit = _hbm_read_write_l2(spec)
@@ -1540,6 +1746,8 @@ def _build_prelim_operator_rows(
             pw = prep_map.get(rec["op_id"])
             if pw is not None:
                 flops = float(pw.get("flops", 0.0))
+                if not matrix_flops and pw.get("matrix_flops"):
+                    matrix_flops = tuple(pw["matrix_flops"])
                 vec_ops = float(pw.get("vector_ops", 0.0))
                 hbm_tot = float(pw.get("hbm_bytes", 0.0))
                 mte2 = float(pw.get("mte2_bytes", 0.0))
@@ -1563,7 +1771,7 @@ def _build_prelim_operator_rows(
         op_demand, cube_peak = _op_lean_resource_demands_ns(
             flops=flops, vector_ops=vec_ops, hbm_read=hbm_r, hbm_write=hbm_w,
             link_bytes=link_bytes, dtype=rec["dtype"], peaks=peaks,
-            matrix_flops=(spec.matrix_flops if spec is not None else ()),
+            matrix_flops=matrix_flops,
         )
         l_star_us = float(max(op_demand)) / NS_PER_US
         dom_bound, roof_eff = _classify_dominant_bound(op_demand, dur_us, link_bytes)
@@ -1704,6 +1912,50 @@ def _normalize_bundle_sequences(
     return max(1, max(counts.values(), default=1)), max(1, sum(counts.values()))
 
 
+def _should_rollback_to_native_baseline(
+    solved: Any,
+    prelim_rows: Sequence[OperatorExportRow],
+    out_rows: Sequence[OperatorExportRow],
+    *,
+    has_ext_edits: bool,
+) -> bool:
+    """True when target synthesis signaled native-baseline rollback or regressed past Before."""
+    if not prelim_rows:
+        return False
+    rollback_flags = (
+        "reverted_to_native_baseline",
+        "baseline_rollback",
+        "noop_rollback",
+        "retained_native_baseline",
+        "no_op",
+        "is_noop",
+    )
+    if any(bool(getattr(solved, attr, False)) for attr in rollback_flags):
+        return True
+    if not getattr(solved, "nodes", ()):
+        return True
+    if has_ext_edits:
+        return False
+    baseline_exposed_us = sum(r.exposed_dur_us * r.repeat_count for r in prelim_rows)
+    solved_exposed_us = sum(r.exposed_dur_us * r.repeat_count for r in out_rows)
+    return solved_exposed_us > baseline_exposed_us + OVERLAP_EXPOSED_EPS_US
+
+
+def _normalize_rollback_waterfall(
+    raw_wf: Sequence[Any], baseline_exposed_us: float,
+) -> tuple[dict[str, Any], ...]:
+    return tuple(
+        {
+            **dict(item),
+            "step_span_us": baseline_exposed_us,
+            "delta_from_prev_us": 0.0,
+            "cumulative_saved_us": 0.0,
+        }
+        for item in raw_wf
+        if isinstance(item, Mapping)
+    )
+
+
 def _apply_target_envelope_to_rows(
     prelim_rows: list[OperatorExportRow],
     demands_ns: list[tuple[int, int, int, int, int]],
@@ -1758,6 +2010,24 @@ def _apply_target_envelope_to_rows(
         )
         for node in solved.nodes
     ]
+    has_ext_edits = ext_plan is not None and bool(getattr(ext_plan, "edits", ()))
+    if _should_rollback_to_native_baseline(solved, prelim_rows, out_rows, has_ext_edits=has_ext_edits):
+        baseline_exposed_us = sum(r.exposed_dur_us * r.repeat_count for r in prelim_rows)
+        raw_wf = tuple(getattr(solved, "stage_waterfall", ()) or ())
+        return (
+            list(prelim_rows),
+            list(demands_ns),
+            tuple(archetypes),
+            (),
+            tuple(getattr(solved, "semantic_audit_triggers", ()) or ()),
+            str(getattr(solved, "rewrite_plan_sha256", "") or ""),
+            bool(getattr(solved, "verification_passed", True)),
+            (),
+            "",
+            {},
+            tuple(getattr(solved, "co_design_opportunities", ()) or ()),
+            _normalize_rollback_waterfall(raw_wf, baseline_exposed_us),
+        )
     out_archs = tuple(
         replace(a, single_span_us=solved.archetype_spans_us.get(a.archetype_id, 0.0))
         for a in archetypes
@@ -1789,13 +2059,25 @@ def _resolve_bundle_step_eval(
     eff_pt_arg = primitive_table if primitive_table is not None else getattr(step_eval, "primitive_table", None)
     prepared = spine.lower(eval_case, LoweringRequest(step=step_req), streams=eff_streams)
     eff_case = prepared.case
+    book = ReplayRecipeBook.from_mapping(eff_case.runtime.kernels, family_registry=spine.families)
+    book.graph = prepared.graph
+    eval_ctx = EvaluationContext.create(
+        eff_case, book, None,
+        primitive_table=(False if eff_pt_arg is False else eff_pt_arg),
+    )
     if eff_pt_arg is False:
         rebound_pt: Any = False
     elif eff_pt_arg is not None:
         rebound_pt = eff_pt_arg
     else:
-        rebound_pt = EvaluationContext.create(eff_case).bindings.primitive_table
-    op_spec_by_key = {(e.replica, op.op_id): op for e in prepared.graph.executable for op in e.ops}
+        rebound_pt = eval_ctx.bindings.primitive_table
+    op_spec_by_key = _resolve_prepared_op_specs(
+        prepared.graph.executable, eval_ctx,
+        case=eff_case, book=book,
+        request_views=getattr(prepared.graph, "request_views", ()),
+        padded_tokens=step_req.padded_tokens,
+        sequence_layout=step_req.layout,
+    )
     exec_graphs = {e.replica: e.ops for e in prepared.graph.executable}
     struct_by_op, subgraph_by_op = _extract_structure_registry_view(
         eff_case, exec_graphs, step_req, semantic_graphs=prepared.graph.target_graphs,

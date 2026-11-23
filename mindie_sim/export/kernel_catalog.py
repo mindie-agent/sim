@@ -66,6 +66,7 @@ from .models import (
     MACRO_MOD_VERIFY_HEAD,
     MACRO_MOD_VISION,
     MATRIX_2D_RANK,
+    MXFP_GROUP_SIZE,
     STRUCTURE_READINESS_MAP,
     SUB_ATTN_RES,
     SUB_DENSE_FFN,
@@ -113,6 +114,9 @@ _INTERNAL_SYMBOL_PREFIXES = (
 _INTERNAL_ARCH_TAG_RE = re.compile(r"_arch\d+$")
 _REJECTED_SYMBOLS = frozenset({
     "MegaMoeArch35", "megamoe_arch35",
+})
+_GENERIC_NATIVE_KERNEL_TAGS = frozenset({
+    "mla_attention", "attention", "gqa_attention",
 })
 _EAGER_VECTOR_MAP: dict[str, tuple[str, str]] = {
     "cast": ("Dtype Cast", "Cast"),
@@ -701,6 +705,17 @@ def resolve_operator_display_dtype(
     if _is_expert_matrix_op(op_id, family, recipe):
         if _resolve_expert_weight_format(spec, meta, case, layer_plan, allow_model_fallback=True) in _MXFP4_DTYPE_TOKENS:
             return "mxfp4"
+        rec_low = str(recipe or "").strip().lower()
+        if "megamoe" in rec_low or "dispatch_ffn_combine" in rec_low:
+            mega_geo = meta.get("megamoe_geometry") if isinstance(meta.get("megamoe_geometry"), Mapping) else {}
+            comp_dt = str(
+                meta.get("compute_dtype")
+                or mega_geo.get("compute_dtype")
+                or meta.get("compute_format")
+                or ""
+            ).strip().lower()
+            if comp_dt in {"fp8_e4m3", "fp8_e5m2", "int8", "fp8", "mxfp8"}:
+                return comp_dt
     if absorbed_source_ops and op_spec_by_key:
         for src_id in absorbed_source_ops:
             src_spec = op_spec_by_key.get((0, str(src_id)))
@@ -954,11 +969,14 @@ def _extract_binding_identity(
     api_symbol = _clean_native_symbol(api.get("aclnn_symbol"))
     api_entry = _clean_native_symbol(api.get("entry"))
     meta_kind = _clean_native_symbol(meta.get("native_kind"))
+    meta_nat_raw = _clean_native_symbol(meta.get("native_kernel"))
+    meta_nat_kernel = "" if meta_nat_raw.lower() in _GENERIC_NATIVE_KERNEL_TAGS else meta_nat_raw
     meta_sym = _clean_native_symbol(meta.get("aclnn_symbol"))
     # Prefer concise kernel/symbol identity over dotted Python module paths.
     kernel = (
         first_kernel
         or meta_kind
+        or meta_nat_kernel
         or api_symbol
         or meta_sym
         or (api_entry if ("." not in api_entry) else "")
@@ -1088,20 +1106,53 @@ def _project_attention(
         or "mixed_quant_sparse" in rec or suffix == "mqsmla" or bool(meta.get("mqsmla_geometry"))
     )
     is_sparse = (
-        is_mqs or bound_kernel in {"SparseFlashMla", "aclnnSparseFlashAttention", "SparseFlashAttention"}
-        or topk > 0 or "sparse" in rec or "paired_mla" in rec or bool(meta.get("indexed_attention_geometry"))
+        is_mqs
+        or bound_kernel in {
+            "SparseFlashMla", "aclnnSparseFlashAttention", "SparseFlashAttention",
+            "npu_kv_quant_sparse_flash_attention_vllm",
+            "aclnnGenericBlockSparseAttention", "GenericBlockSparseAttention",
+        }
+        or topk > 0 or "sparse" in rec or "paired_mla" in rec or "paired_fp8_qsfa" in rec
+        or "gbsa" in rec or bool(meta.get("indexed_attention_geometry"))
+    )
+    is_gbsa = (
+        bound_kernel in {"aclnnGenericBlockSparseAttention", "GenericBlockSparseAttention"}
+        or "gbsa" in rec
+        or "generic_block_sparse" in rec
+        or (is_sparse and not is_mla)
     )
     if is_mqs:
         return (
             f"Mixed-Quant Sparse Flash MLA (topk={topk or DEFAULT_SPARSE_INDEX_TOPK})",
             "MixedQuantSparseFlashMla", BACKEND_CANN, KERNEL_STATUS_EXISTING, False, "", "mqsmla",
         )
-    if is_sparse:
-        kern = bound_kernel if bound_kernel in {"SparseFlashMla", "aclnnSparseFlashAttention"} else "SparseFlashMla"
-        return (
-            f"Sparse Flash MLA (TopK={topk or DEFAULT_SPARSE_INDEX_TOPK})",
-            kern, BACKEND_CANN, KERNEL_STATUS_EXISTING, False, "", "latent_attention_batch",
+    if is_gbsa:
+        kern = (
+            bound_kernel
+            if bound_kernel in {"aclnnGenericBlockSparseAttention", "GenericBlockSparseAttention"}
+            else "aclnnGenericBlockSparseAttention"
         )
+        return (
+            f"Generic Block-Sparse GQA Attention (TopK={topk or DEFAULT_SPARSE_INDEX_TOPK})",
+            kern, BACKEND_CANN, KERNEL_STATUS_EXISTING, False, "", "gbsa_attention",
+        )
+    if is_sparse:
+        meta_nat_k = _clean_native_symbol(meta.get("native_kernel"))
+        sparse_allowed = {
+            "SparseFlashMla", "aclnnSparseFlashAttention", "npu_kv_quant_sparse_flash_attention_vllm",
+        }
+        if meta_nat_k == "npu_kv_quant_sparse_flash_attention_vllm":
+            kern = meta_nat_k
+        elif bound_kernel in sparse_allowed:
+            kern = bound_kernel
+        else:
+            kern = "SparseFlashMla"
+        role = (
+            f"Quantized Sparse Flash MLA (TopK={topk or DEFAULT_SPARSE_INDEX_TOPK})"
+            if kern == "npu_kv_quant_sparse_flash_attention_vllm"
+            else f"Sparse Flash MLA (TopK={topk or DEFAULT_SPARSE_INDEX_TOPK})"
+        )
+        return (role, kern, BACKEND_CANN, KERNEL_STATUS_EXISTING, False, "", "latent_attention_batch")
     if arch_family == "A5" and is_mla:
         # A5 dense MLA (including DSpark draft) binds FlashMla — never FIA.
         kern = bound_kernel if (bound_kernel and "FusedInferAttentionScore" not in bound_kernel) else "FlashMla"
@@ -1162,25 +1213,52 @@ def _project_collective(suffix: str, fam: str, rec: str, bound_kernel: str) -> t
     return (f"TP Sum AllReduce ({suffix})", bound_kernel or "hcom_allReduce_", BACKEND_HCCL_MC2, KERNEL_STATUS_EXISTING, False, "", suffix)
 
 
+def _is_mxfp_quant_meta(meta: Mapping[str, Any], *, is_a2_or_a3: bool) -> bool:
+    """True strictly for MXFP microscaling (group=32 E8M0), never blockwise group=128 FP8."""
+    if is_a2_or_a3:
+        return False
+    out_fmt = str(meta.get("output_format") or "").strip().lower()
+    scale_fmt = str(meta.get("activation_scale_format") or "").strip().lower()
+    raw_group = meta.get("activation_group_size", meta.get("quant_group_size"))
+    try:
+        group_size = int(raw_group or 0)
+    except (TypeError, ValueError):
+        group_size = 0
+    return (
+        out_fmt in {"fp8_e4m3", "mxfp8"}
+        and scale_fmt in {"fp8_e8m0", "ue8m0"}
+        and group_size == MXFP_GROUP_SIZE
+    )
+
+
+def _normalize_quant_bound_symbol(bound_kernel: str, *, is_mx: bool) -> str:
+    b_low = bound_kernel.lower()
+    if not is_mx and "mxquant" in b_low:
+        return ""
+    if is_mx and "mxquant" not in b_low and "quant" in b_low:
+        return ""
+    return bound_kernel
+
+
 def _project_norm_quant(
     suffix: str, fam: str, rec: str, meta: Mapping[str, Any], bound_kernel: str,
     *, is_raw_eager: bool, is_a2_or_a3: bool,
 ) -> tuple[str, str, str, str, bool, str, str]:
-    out_fmt = str(meta.get("output_format") or "").lower()
-    is_mx = (not is_a2_or_a3) and out_fmt in {"fp8_e4m3", "mxfp8"} and str(meta.get("activation_scale_format") or "") == "fp8_e8m0"
+    is_mx = _is_mxfp_quant_meta(meta, is_a2_or_a3=is_a2_or_a3)
+    eff_bound = _normalize_quant_bound_symbol(bound_kernel, is_mx=is_mx)
     if fam == "layernorm":
         role = "Indexer K LayerNorm (1-kernel FP32-UB)" if "index" in suffix else "LayerNorm (1-kernel FP32-UB)"
         return (role, "aclnnLayerNorm_LayerNormV3", BACKEND_CANN, KERNEL_STATUS_EXISTING, False, "", suffix)
     if fam == "add_rmsnorm_quant":
-        kern = bound_kernel or ("AddRmsNormDynamicMxQuant" if is_mx else ("aclnnAddRmsNormDynamicQuant" if is_a2_or_a3 else "AddRmsNormDynamicQuant"))
+        kern = eff_bound or ("AddRmsNormDynamicMxQuant" if is_mx else ("aclnnAddRmsNormDynamicQuant" if is_a2_or_a3 else "AddRmsNormDynamicQuant"))
         return ("Fused Residual Add + RMSNorm + Dynamic Quant", kern, BACKEND_CANN, KERNEL_STATUS_EXISTING, False, "", suffix)
     if fam == "rmsnorm_quant":
-        kern = bound_kernel or ("RmsNormDynamicMxQuant" if is_mx else ("aclnnRmsNormDynamicQuant" if is_a2_or_a3 else "RmsNormDynamicQuant"))
+        kern = eff_bound or ("RmsNormDynamicMxQuant" if is_mx else ("aclnnRmsNormDynamicQuant" if is_a2_or_a3 else "RmsNormDynamicQuant"))
         return ("Fused RMSNorm + Dynamic Quant", kern, BACKEND_CANN, KERNEL_STATUS_EXISTING, False, "", suffix)
     if fam == "add_rmsnorm":
         return ("Fused Residual Add + RMSNorm", bound_kernel or "AddRmsNorm", BACKEND_CANN, KERNEL_STATUS_EXISTING, False, "", suffix)
     if fam == "quantize":
-        kern = bound_kernel or ("DynamicMxQuant" if is_mx else ("aclnnDynamicQuant" if is_a2_or_a3 else "DynamicQuant"))
+        kern = eff_bound or ("DynamicMxQuant" if is_mx else ("aclnnDynamicQuant" if is_a2_or_a3 else "DynamicQuant"))
         return (f"Dynamic Activation Quantize ({suffix})", kern, BACKEND_CANN, KERNEL_STATUS_EXISTING, False, "", suffix)
     if is_raw_eager or "unfused" in rec or "eager" in rec:
         return (
@@ -1291,6 +1369,27 @@ def _project_moe(
     if suffix == "dispatch" or "dispatch" in rec:
         kern = bound_kernel if (bound_kernel and "Dispatch" in bound_kernel) else "MoeDistributeDispatchV2"
         return ("MoE EP Token Distribute Dispatch (MC2)", kern, BACKEND_HCCL_MC2, KERNEL_STATUS_EXISTING, False, "", "dispatch")
+    is_local_unpermute = (
+        rec == "route_unpack"
+        or (
+            suffix == "unpack"
+            and fam not in _MOE_EP_COMM_FAMILIES
+            and "combine" not in rec
+            and "distribute" not in bound_kernel.lower()
+            and "combine" not in bound_kernel.lower()
+        )
+    )
+    if is_local_unpermute:
+        b_low = bound_kernel.lower()
+        kern = (
+            bound_kernel
+            if (bound_kernel and ("finalizerouting" in b_low or b_low == "npu_moe_token_unpermute"))
+            else "aclnnFinalizeRoutingV2"
+        )
+        return (
+            "MoE Finalize Routing (Weighted TopK Unpermute)",
+            kern, BACKEND_CANN, KERNEL_STATUS_EXISTING, False, "", "route_unpack",
+        )
     if suffix in {"unpack", "combine"} or "combine" in rec:
         kern = bound_kernel if (bound_kernel and "Combine" in bound_kernel) else "MoeDistributeCombineV2"
         return ("MoE EP Token Distribute Combine (MC2)", kern, BACKEND_HCCL_MC2, KERNEL_STATUS_EXISTING, False, "", "unpack")
@@ -1340,8 +1439,8 @@ def _project_moe(
 
 
 def _project_engram_mhc_indexer(
-    suffix: str, fam: str, rec: str, bound_kernel: str, mm_kernel: str,
-    *, is_ideal: bool, layer_plan: Any | None,
+    suffix: str, fam: str, rec: str, meta: Mapping[str, Any], bound_kernel: str, mm_kernel: str,
+    *, is_ideal: bool, is_a2_or_a3: bool, layer_plan: Any | None,
 ) -> tuple[str, str, str, str, bool, str, str] | None:
     if fam == "mhc" or ".hc_" in f".{suffix}":
         hc_lr = int(getattr(layer_plan, "hc_lowrank", 0) or 0) if layer_plan is not None else 0
@@ -1383,7 +1482,10 @@ def _project_engram_mhc_indexer(
         if fam in {"conv1d", "short_convolution"} or "conv" in suffix:
             return ("PLE / Engram Depthwise Short Conv1d", bound_kernel or "CausalConv1d", BACKEND_CANN, KERNEL_STATUS_EXISTING, False, "", suffix)
         if fam == "quantize" or suffix.endswith(".quantize"):
-            return ("PLE / Engram Activation Quantize", bound_kernel or "DynamicMxQuant", BACKEND_CANN, KERNEL_STATUS_EXISTING, False, "", suffix)
+            is_mx = _is_mxfp_quant_meta(meta, is_a2_or_a3=is_a2_or_a3)
+            eff_bound = _normalize_quant_bound_symbol(bound_kernel, is_mx=is_mx)
+            kern = eff_bound or ("DynamicMxQuant" if is_mx else ("aclnnDynamicQuant" if is_a2_or_a3 else "DynamicQuant"))
+            return ("PLE / Engram Activation Quantize", kern, BACKEND_CANN, KERNEL_STATUS_EXISTING, False, "", suffix)
         if fam in {"gemm", "projection"} or "proj" in suffix:
             return ("PLE / Engram KV Projection", bound_kernel or mm_kernel, BACKEND_CANN, KERNEL_STATUS_EXISTING, False, "", suffix)
         if fam in COLLECTIVE_FAMILIES or "allreduce" in suffix or "broadcast" in suffix:
@@ -1439,7 +1541,8 @@ def _project_family_tuple(
             BACKEND_HCCL_MC2, KERNEL_STATUS_FRAMEWORK, False, "", suffix or fam,
         )
     special = _project_engram_mhc_indexer(
-        suffix, fam, rec, bound_kernel, mm_kernel, is_ideal=is_ideal, layer_plan=layer_plan,
+        suffix, fam, rec, meta, bound_kernel, mm_kernel,
+        is_ideal=is_ideal, is_a2_or_a3=is_a2_or_a3, layer_plan=layer_plan,
     )
     if special is not None:
         return special
@@ -1474,6 +1577,16 @@ def _project_family_tuple(
     if fam in {"cache_store", "kv_compress_epilog", "kv_cache_write"} or suffix in {"kv_store", "kv_scatter", "cache"}:
         return ("Paged KV Cache Scatter Write", bound_kernel or "aclnnScatterPaKvCache", BACKEND_CANN, KERNEL_STATUS_EXISTING, False, "", "kv_store")
     if fam == "rotary" or suffix in {"rotary", "rope", "q_rotary", "kv_rotary", "output_inverse_rotary"}:
+        if "split_qkv_rmsnorm_mrope" in rec or "split_qkv_rmsnorm_mrope" in bound_kernel.lower():
+            kern = (
+                bound_kernel
+                if (bound_kernel and "split_qkv_rmsnorm_mrope" in bound_kernel.lower())
+                else "split_qkv_rmsnorm_mrope_kernel"
+            )
+            return (
+                "Fused QKV Split + QK RMSNorm + MRoPE",
+                kern, BACKEND_TRITON, KERNEL_STATUS_EXISTING, False, "", "split_qkv_rmsnorm_mrope_fused",
+            )
         return (f"Rotary Position Embedding ({suffix})", bound_kernel or "InplacePartialRotaryMul", BACKEND_CANN, KERNEL_STATUS_EXISTING, False, "", suffix)
     if fam in {"swiglu", "situ"}:
         if fam == "situ":
@@ -1580,11 +1693,12 @@ def resolve_ascend_kernel_identity(
                 if is_synth else normalize_public_backend(birth_backend_raw, is_gemm=is_gemm)
             )
     else:
-        if bound_backend and not needs_new and not (is_raw_eager and fam == "rmsnorm"):
+        is_fused_mrope = "split_qkv_rmsnorm_mrope" in rec
+        if bound_backend and not needs_new and not (is_raw_eager and fam == "rmsnorm") and not is_fused_mrope:
             backend = bound_backend
         if isinstance(struct_node, Mapping):
             raw_backend = str(struct_node.get("backend_stack") or "").strip().lower()
-            if raw_backend and not bound_backend and not (is_raw_eager and fam == "rmsnorm"):
+            if raw_backend and not bound_backend and not (is_raw_eager and fam == "rmsnorm") and not is_fused_mrope:
                 backend = normalize_public_backend(raw_backend, is_gemm=is_gemm)
             raw_readiness = str(struct_node.get("readiness") or "").strip().lower()
             if raw_readiness in STRUCTURE_READINESS_MAP:
@@ -1592,7 +1706,7 @@ def resolve_ascend_kernel_identity(
                 if mapped_new or not needs_new:
                     status = mapped_status if not new_spec else f"{mapped_status} {new_spec}"
                     needs_new = mapped_new
-        elif reg_spec is not None and reg_spec.backend_stack and not needs_new and not bound_backend:
+        elif reg_spec is not None and reg_spec.backend_stack and not needs_new and not bound_backend and not is_fused_mrope:
             backend = normalize_public_backend(reg_spec.backend_stack, is_gemm=is_gemm)
         if bool(meta.get("target_rewrite_fused")):
             fused_name = _clean_native_symbol(meta.get("fused_kernel_name"))

@@ -493,7 +493,10 @@ def test_memory_quant_calculator_exclusions_offload_and_pp_budget(tmp_path):
     led_routed = compute_memory_quant_ledger(parse_case(raw_k), seq_len=4096, concurrency=4)
     assert led_routed.weight_quant == "MXFP4"
     assert led_routed.weight_quant_display == "MXFP4 (Routed-Only, Attn/Shared BF16)"
-    assert led_routed.include_vision_tower is False
+    assert led_routed.include_vision_tower is True
+    assert compute_memory_quant_ledger(
+        parse_case(raw_k), seq_len=4096, concurrency=4, include_vision_tower=False,
+    ).include_vision_tower is False
     assert led_routed.native_bf16_weight_footprint_per_die_bytes > led_routed.weight_footprint_per_die_bytes
     by_name = {r.name: r for r in led_routed.weight_rows}
     assert by_name["q_a"].quant_format == "BF16" and by_name["q_a"].is_quant_excluded is True
@@ -537,7 +540,7 @@ def test_memory_quant_calculator_exclusions_offload_and_pp_budget(tmp_path):
     assert mem_cells["T21"][1] == "ROUNDUP(T17/(T19*T12),0)*T19"
     assert mem_cells["T24"][1] == "T22*T23"
     assert mem_cells["T25"][0] == "MXFP4 (Routed-Only, Attn/Shared BF16)"
-    assert mem_cells["T6"][0] == "OFF" and mem_cells["T7"][0] == "OFF"
+    assert mem_cells["T6"][0] == "OFF" and mem_cells["T7"][0] == "ON"
     assert any(f and "SUMIFS(" in f and '"NPU HBM*"' in f for _, f in mem_cells.values())
     assert any(f and "SUMIFS(" in f and '"Host DRAM*"' in f for _, f in mem_cells.values())
     assert any(f and "VLOOKUP(" in f and "ROUNDUP(" in f for _, f in mem_cells.values())

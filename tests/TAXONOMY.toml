@@ -655,3 +655,14 @@ owns = [
   "mindie_sim/export/agent_brief.py",
   "mindie_sim/export/kernel_catalog.py",
 ]
+
+[[module]]
+path = "product/test_stage4d_export_ledger_and_identities.py"
+tier = "tier0"
+owns = [
+  "mindie_sim/export/bundle.py",
+  "mindie_sim/export/memory_ledger.py",
+  "mindie_sim/export/kernel_catalog.py",
+  "mindie_sim/export/models.py",
+  "mindie_sim/prediction/capacity/ledger.py",
+]
