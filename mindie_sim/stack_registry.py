@@ -29,7 +29,9 @@ from mindie_sim.schema.case import Case
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.schema.operators import OpSpec
+from mindie_sim.schema.scenario import ScenarioContract
 from mindie_sim.schema.speculative import SpeculativeSpec
+from mindie_sim.schema.stack import RuntimeQuantPlan, StackLoweringPlan
 from mindie_sim.schema.workload import IterationPlan
 from mindie_sim.stack_tracks import (
     RUNTIME_STACKS,
@@ -77,6 +79,9 @@ class LoweringRequest:
     apply_body_defaults: bool = True
     production_capture: bool = False
     stack: str | None = None
+    scenario_contract: ScenarioContract | None = None
+    runtime_quant_plan: RuntimeQuantPlan | None = None
+    stack_lowering_plan: StackLoweringPlan | None = None
 
     def __post_init__(self) -> None:
         active = int(self.step is not None) + int(bool(self.iterations)) + int(bool(self.declared_ops))
@@ -84,6 +89,24 @@ class LoweringRequest:
             raise ModelingError(f"lowering_request_requires_exactly_one_input:{active}")
         if self.tier not in {"unmerge", "mainline", "should_achieve"}:
             raise ModelingError(f"lowering_request_invalid_tier:{self.tier}")
+        if self.scenario_contract is not None and not isinstance(self.scenario_contract, ScenarioContract):
+            raise ModelingError("lowering_request_invalid_scenario_contract")
+        if self.runtime_quant_plan is not None and not isinstance(self.runtime_quant_plan, RuntimeQuantPlan):
+            raise ModelingError("lowering_request_invalid_runtime_quant_plan")
+        if self.stack_lowering_plan is not None and not isinstance(self.stack_lowering_plan, StackLoweringPlan):
+            raise ModelingError("lowering_request_invalid_stack_lowering_plan")
+        if (
+            self.scenario_contract is not None
+            and self.runtime_quant_plan is not None
+            and self.scenario_contract.quant_plan.plan_digest != self.runtime_quant_plan.plan_digest
+        ):
+            raise ModelingError("lowering_request_quant_plan_mismatch")
+        if (
+            self.scenario_contract is not None
+            and self.stack_lowering_plan is not None
+            and self.scenario_contract.lowering_plan.plan_digest != self.stack_lowering_plan.plan_digest
+        ):
+            raise ModelingError("lowering_request_lowering_plan_mismatch")
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,9 +115,12 @@ class ResolvedBase:
 
     case: Case
     request: LoweringRequest
-    stack: SoftwareStackSpec
+    stack: SoftwareStackSpec | None
     recipe_origins: tuple[tuple[str, OriginKind], ...]
     sources: tuple[SourceRef, ...]
+    scenario_contract: ScenarioContract | None = None
+    runtime_quant_plan: RuntimeQuantPlan | None = None
+    stack_lowering_plan: StackLoweringPlan | None = None
 
 
 def _extract_origins(metadata: Mapping[str, object]) -> tuple[tuple[str, OriginKind], ...]:

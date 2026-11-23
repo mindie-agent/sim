@@ -23,7 +23,12 @@ from mindie_sim.schema.datapath import (
     DatapathCapabilitySpec,
     SourceRef,
 )
-from mindie_sim.schema.operators import OpSpec
+from mindie_sim.schema.operators import (
+    KernelBinding,
+    OpSpec,
+    OwnerScheduleSpec,
+    TensorPrecisionABI,
+)
 from mindie_sim.schema.workload import RequestView
 from ..mechanism import Geometry, OperatorPlan
 from ..program import Recipe, RecipeBook
@@ -76,6 +81,9 @@ class ResolvedOperator:
     implementation: str
     sources: tuple[SourceRef, ...] = ()
     descriptor: FusedPipelineDescriptor | None = None
+    precision_abi: TensorPrecisionABI | None = None
+    kernel_binding: KernelBinding | None = None
+    owner_schedule: OwnerScheduleSpec | None = None
 
 
 class ArchStrategy(Protocol):

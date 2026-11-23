@@ -57,6 +57,20 @@ path = "schema/test_usability_and_ingress_contracts.py"
 tier = "tier0"
 owns = ["mindie_sim/api.py", "mindie_sim/backends/ascend_channels.py", "mindie_sim/catalog/npu_checkpoints.py", "mindie_sim/catalog/va_speculative_rules.py", "mindie_sim/cli/report.py", "mindie_sim/compose/__init__.py", "mindie_sim/compose/inputs.py", "mindie_sim/prediction/collectives/protocol.py", "mindie_sim/schema/hardware_links.py", "mindie_sim/sweep/pd.py"]
 
+[[module]]
+path = "schema/test_single_spine_contracts.py"
+tier = "tier0"
+owns = [
+  "mindie_sim/schema/checkpoint.py",
+  "mindie_sim/schema/stack.py",
+  "mindie_sim/schema/scenario.py",
+  "mindie_sim/schema/operators.py",
+  "mindie_sim/schema/case.py",
+  "mindie_sim/prediction/spine.py",
+  "mindie_sim/prediction/results.py",
+  "scripts/check_arch_governance.py",
+]
+
 # ---------------------------------------------------------------- runtime
 [[module]]
 path = "runtime/test_engine_core.py"

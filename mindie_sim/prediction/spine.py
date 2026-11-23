@@ -16,15 +16,20 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from copy import deepcopy
+from dataclasses import dataclass, replace
 from functools import lru_cache
 from typing import Any
 
 from mindie_sim.schema.case import Case
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.operators import OpSpec
+from mindie_sim.schema.scenario import ScenarioContract
+from mindie_sim.schema.stack import RuntimeQuantPlan, StackLoweringPlan
 from mindie_sim.stack_registry import (
     LoweringRequest,
+    OriginKind,
+    ResolvedBase,
     SoftwareStackRegistry,
     default_stack_registry,
 )
@@ -84,6 +89,162 @@ class PreparedStep:
     operators: tuple[ResolvedOperator, ...]
     graph_id: str
     structure_payload: JsonObject | None = None
+    scenario_contract: ScenarioContract | None = None
+    runtime_quant_plan: RuntimeQuantPlan | None = None
+    stack_lowering_plan: StackLoweringPlan | None = None
+
+
+_CAPTURE_MODE_TO_CASE: Mapping[str, tuple[str, str]] = {
+    "none": ("none", "NONE"),
+    "piecewise": ("piecewise", "PIECEWISE"),
+    "full": ("full", "FULL"),
+    "full_decode_only": ("full", "FULL_DECODE_ONLY"),
+    "full_and_piecewise": ("piecewise", "FULL_AND_PIECEWISE"),
+}
+
+
+def _reconcile_injected_contracts(
+    request: LoweringRequest,
+    *,
+    scenario_contract: ScenarioContract | None,
+    runtime_quant_plan: RuntimeQuantPlan | None,
+    stack_lowering_plan: StackLoweringPlan | None,
+) -> tuple[ScenarioContract | None, RuntimeQuantPlan | None, StackLoweringPlan | None]:
+    if (
+        request.scenario_contract is not None
+        and scenario_contract is not None
+        and request.scenario_contract.digest() != scenario_contract.digest()
+    ):
+        raise ModelingError("spine_lower_scenario_contract_conflict")
+    eff_scenario = scenario_contract or request.scenario_contract
+    if (
+        request.runtime_quant_plan is not None
+        and runtime_quant_plan is not None
+        and request.runtime_quant_plan.plan_digest != runtime_quant_plan.plan_digest
+    ):
+        raise ModelingError("spine_lower_runtime_quant_plan_conflict")
+    eff_quant = runtime_quant_plan or request.runtime_quant_plan
+    if eff_scenario is not None:
+        if eff_quant is None:
+            eff_quant = eff_scenario.quant_plan
+        elif eff_quant.plan_digest != eff_scenario.quant_plan.plan_digest:
+            raise ModelingError("spine_lower_quant_plan_scenario_mismatch")
+    if (
+        request.stack_lowering_plan is not None
+        and stack_lowering_plan is not None
+        and request.stack_lowering_plan.plan_digest != stack_lowering_plan.plan_digest
+    ):
+        raise ModelingError("spine_lower_stack_lowering_plan_conflict")
+    eff_lowering = stack_lowering_plan or request.stack_lowering_plan
+    if eff_scenario is not None:
+        if eff_lowering is None:
+            eff_lowering = eff_scenario.lowering_plan
+        elif eff_lowering.plan_digest != eff_scenario.lowering_plan.plan_digest:
+            raise ModelingError("spine_lower_lowering_plan_scenario_mismatch")
+    return eff_scenario, eff_quant, eff_lowering
+
+
+def _build_injected_base(
+    case: Case,
+    request: LoweringRequest,
+    *,
+    scenario_contract: ScenarioContract | None,
+    runtime_quant_plan: RuntimeQuantPlan | None,
+    stack_lowering_plan: StackLoweringPlan,
+) -> ResolvedBase:
+    kernels = deepcopy(dict(case.runtime.kernels))
+    meta = deepcopy(dict(case.runtime.metadata))
+    layouts = deepcopy(dict(case.runtime.tensor_layouts))
+    lowerings = dict(kernels.get("lowerings") or {})
+    for selector, recipe_id, _opts in stack_lowering_plan.recipe_bindings:
+        lowerings[selector] = recipe_id
+    if lowerings:
+        kernels["lowerings"] = lowerings
+    for scope_key, role_key, layout_name in stack_lowering_plan.tensor_layouts:
+        layouts[f"{scope_key}.{role_key}" if scope_key else role_key] = layout_name
+    rt_updates: dict[str, Any] = {
+        "kernels": kernels,
+        "tensor_layouts": layouts,
+    }
+    if stack_lowering_plan.lowering_passes:
+        rt_updates["lowering_passes"] = stack_lowering_plan.lowering_passes
+    cap_rule = stack_lowering_plan.scheduling.capture_bucket_rule
+    if cap_rule is not None:
+        graph_mode, raw_mode = _CAPTURE_MODE_TO_CASE[cap_rule.mode]
+        rt_updates["graph_capture_mode"] = graph_mode
+        if cap_rule.full_keys:
+            rt_updates["graph_capture_keys"] = cap_rule.full_keys
+        if cap_rule.piecewise_keys:
+            rt_updates["piecewise_capture_keys"] = cap_rule.piecewise_keys
+        meta["captured_execution_mode"] = raw_mode
+    rt_updates["metadata"] = tuple(sorted(meta.items()))
+    working = replace(case, runtime=replace(case.runtime, **rt_updates))
+    origins: list[tuple[str, OriginKind]] = []
+    for key, origin in stack_lowering_plan.binding_origins:
+        label = origin if origin in {"caller", "stack_profile", "body_default"} else "stack_profile"
+        origins.append((key, label))  # type: ignore[arg-type]
+    eff_req = replace(
+        request,
+        scenario_contract=scenario_contract,
+        runtime_quant_plan=runtime_quant_plan,
+        stack_lowering_plan=stack_lowering_plan,
+    )
+    return ResolvedBase(
+        case=working,
+        request=eff_req,
+        stack=None,
+        recipe_origins=tuple(origins),
+        sources=(),
+        scenario_contract=scenario_contract,
+        runtime_quant_plan=runtime_quant_plan,
+        stack_lowering_plan=stack_lowering_plan,
+    )
+
+
+def _step_seam_metadata(
+    step: PreparedStep,
+    scenario_contract: ScenarioContract | None,
+    bound_table: Any,
+) -> dict[str, Any]:
+    if (
+        scenario_contract is not None
+        and step.scenario_contract is not None
+        and scenario_contract.digest() != step.scenario_contract.digest()
+    ):
+        raise ModelingError("spine_run_step_scenario_contract_conflict")
+    active_scenario = scenario_contract or step.scenario_contract
+    pt_digest = str(getattr(bound_table, "envelope_sha256", "") or "")
+    if (
+        active_scenario is not None
+        and active_scenario.primitive_table_digest
+        and pt_digest
+        and active_scenario.primitive_table_digest != pt_digest
+    ):
+        raise ModelingError(
+            "spine_primitive_table_digest_mismatch:"
+            f"contract={active_scenario.primitive_table_digest}:bound={pt_digest}"
+        )
+    quant_plan = step.runtime_quant_plan or (
+        active_scenario.quant_plan if active_scenario is not None else None
+    )
+    lowering_plan = step.stack_lowering_plan or (
+        active_scenario.lowering_plan if active_scenario is not None else None
+    )
+    stack_id = (
+        active_scenario.stack_id
+        if active_scenario is not None
+        else (lowering_plan.stack_id if lowering_plan is not None else (
+            quant_plan.stack_id if quant_plan is not None else ""
+        ))
+    )
+    return {
+        "execution_stage": active_scenario.execution_stage if active_scenario is not None else None,
+        "stack_id": stack_id,
+        "scenario_digest": active_scenario.digest() if active_scenario is not None else "",
+        "quant_plan_digest": quant_plan.plan_digest if quant_plan is not None else "",
+        "lowering_plan_digest": lowering_plan.plan_digest if lowering_plan is not None else "",
+        "primitive_table_digest": pt_digest,
+    }
 
 
 def _work_items(op: OpSpec) -> tuple[WorkItem, ...]:
@@ -331,9 +492,33 @@ class PredictionSpine:
         /,
         *,
         streams: tuple[StreamPlan, ...] = (),
+        scenario_contract: ScenarioContract | None = None,
+        runtime_quant_plan: RuntimeQuantPlan | None = None,
+        stack_lowering_plan: StackLoweringPlan | None = None,
     ) -> PreparedStep:
         """Lower ``case`` + ``request`` into a prepared step with canonical ``graph_id``."""
-        base = self.stacks.resolve_base(case, request)
+        eff_scenario, eff_quant, eff_lowering = _reconcile_injected_contracts(
+            request,
+            scenario_contract=scenario_contract,
+            runtime_quant_plan=runtime_quant_plan,
+            stack_lowering_plan=stack_lowering_plan,
+        )
+        if eff_lowering is not None:
+            base = _build_injected_base(
+                case,
+                request,
+                scenario_contract=eff_scenario,
+                runtime_quant_plan=eff_quant,
+                stack_lowering_plan=eff_lowering,
+            )
+        else:
+            base = self.stacks.resolve_base(case, request)
+            if eff_quant is not None or eff_scenario is not None:
+                base = replace(
+                    base,
+                    scenario_contract=eff_scenario,
+                    runtime_quant_plan=eff_quant,
+                )
         rewritten = self.rewrite.apply(base, streams=streams)
         effective_case = (
             consume_target_declaration(base.case, rewritten.target_graphs)
@@ -356,6 +541,9 @@ class PredictionSpine:
             operators=resolved_ops,
             graph_id=graph_id,
             structure_payload=payload,
+            scenario_contract=eff_scenario,
+            runtime_quant_plan=eff_quant,
+            stack_lowering_plan=eff_lowering,
         )
 
     def run_step(
@@ -366,6 +554,7 @@ class PredictionSpine:
         *,
         primitives: Any = None,
         primitive_table: Any = None,
+        scenario_contract: ScenarioContract | None = None,
     ) -> StepEvaluation:
         """Execute ``step`` once on ``runtime.Engine`` using a single ``EvaluationContext``."""
         case = step.case
@@ -480,6 +669,12 @@ class PredictionSpine:
         )
         accel = report.get("accel_status") or {}
         wave = _wave_breakdown_from_report(report)
+        bound_pt = (
+            False if primitive_table is False else evaluation.bindings.primitive_table
+        )
+        seam_meta = _step_seam_metadata(
+            step, scenario_contract, None if bound_pt is False else bound_pt
+        )
         return StepEvaluation(
             graph_id=step.graph_id,
             request=step_req,
@@ -495,10 +690,9 @@ class PredictionSpine:
                 or ""
             ),
             native_steps=int(accel.get("native_steps", 0) or 0),
-            primitive_table=(
-                False if primitive_table is False else evaluation.bindings.primitive_table
-            ),
+            primitive_table=bound_pt,
             streams=step.graph.streams,
+            **seam_meta,
         )
 
     def optimize_ladder(

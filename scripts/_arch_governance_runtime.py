@@ -149,8 +149,39 @@ _AG010_L1_PKGS = frozenset({"backends", "primitives", "catalog", "templates"})
 _AG010_L2_SUBS = frozenset({"program", "runtime", "execution", "collectives", "capacity"})
 _AG010_L2_SHARDING = frozenset({"local_tp", "routing", "sequence_parallel"})
 _AG010_L3_SUBS = frozenset({"operators", "sharding"})
-_AG010_L4_PKGS = frozenset({"optimization", "rewrite", "observations", "onboarding", "export"})
-_AG010_LAYER_NAMES = ("L0:schema", "L1:hardware", "L2:runtime", "L3:operators+sharding", "L4:product")
+_AG010_L4_STACK_PKGS = frozenset({"stacks"})
+_AG010_L5_PKGS = frozenset({
+    "optimization", "rewrite", "observations", "onboarding", "export", "cli", "solve",
+})
+_AG010_LAYER_NAMES = (
+    "L0:schema",
+    "L1:hardware",
+    "L2:runtime",
+    "L3:operators+sharding",
+    "L4:stacks",
+    "L5:product",
+)
+#: Ratcheted legacy same-layer package SCCs (zero stacks, zero schema, zero cross-layer).
+_LEGACY_PACKAGE_SCCS: frozenset[frozenset[str]] = frozenset({
+    frozenset({
+        "mindie_sim.prediction.collectives",
+        "mindie_sim.prediction.program",
+        "mindie_sim.prediction.runtime",
+    }),
+    frozenset({"mindie_sim.prediction.operators", "mindie_sim.prediction.sharding"}),
+    frozenset({"mindie_sim.optimization", "mindie_sim.rewrite"}),
+    frozenset({"mindie_sim.compose", "mindie_sim.sweep"}),
+})
+#: Ratcheted legacy intra-schema module SCCs (zero new schema cycles allowed).
+_LEGACY_SCHEMA_MODULE_SCCS: frozenset[frozenset[str]] = frozenset({
+    frozenset({"mindie_sim.schema.compute_arch", "mindie_sim.schema.compute_arch_presets"}),
+    frozenset({"mindie_sim.schema.datapath", "mindie_sim.schema.hardware"}),
+    frozenset({
+        "mindie_sim.schema.model",
+        "mindie_sim.schema.serialization",
+        "mindie_sim.schema.workload_validation",
+    }),
+})
 #: Ratcheted legacy upward edges (40 edges / 27 files; zero L3->L4, zero primitives/loader->L4).
 _LEGACY_UPWARD_IMPORTS: Mapping[str, frozenset[str]] = {
     "mindie_sim/catalog/qwen4_exp.py": frozenset({"mindie_sim.prediction.program"}),
@@ -601,8 +632,10 @@ def _ag010_layer(parts: tuple[str, ...]) -> int | None:
             return 2
         if parts[2] in _AG010_L3_SUBS:
             return 3
-    if top in _AG010_L4_PKGS or top.startswith(("compose", "sweep")):
+    if top in _AG010_L4_STACK_PKGS:
         return 4
+    if top in _AG010_L5_PKGS or top.startswith(("compose", "sweep")):
+        return 5
     return None
 
 
@@ -610,6 +643,69 @@ def _ag010_bucket(parts: tuple[str, ...]) -> str:
     if len(parts) >= 3 and parts[1] == "prediction":
         return ".".join(parts[:3])
     return ".".join(parts[:2])
+
+
+def _ag010_scc_package(parts: tuple[str, ...]) -> str | None:
+    if len(parts) < 2 or parts[0] != "mindie_sim":
+        return None
+    if (
+        len(parts) >= 4
+        and parts[1] == "prediction"
+        and parts[2] == "sharding"
+        and parts[3] in _AG010_L2_SHARDING
+    ):
+        return "mindie_sim.prediction.sharding._l2"
+    if len(parts) >= 3 and parts[1] in {"prediction", "stacks"}:
+        return ".".join(parts[:3])
+    return ".".join(parts[:2])
+
+
+def _tarjan_sccs(graph: Mapping[str, set[str]]) -> list[tuple[str, ...]]:
+    """Return all strongly connected components of size >= 2 using iterative Tarjan."""
+    index = 0
+    indices: dict[str, int] = {}
+    lowlink: dict[str, int] = {}
+    stack: list[str] = []
+    on_stack: set[str] = set()
+    sccs: list[tuple[str, ...]] = []
+    for start in sorted(graph):
+        if start in indices:
+            continue
+        frames: list[tuple[str, list[str], int]] = [(start, sorted(graph.get(start, ())), 0)]
+        indices[start] = lowlink[start] = index
+        index += 1
+        stack.append(start)
+        on_stack.add(start)
+        while frames:
+            node, neighbors, pos = frames[-1]
+            if pos < len(neighbors):
+                frames[-1] = (node, neighbors, pos + 1)
+                nxt = neighbors[pos]
+                if nxt not in indices:
+                    indices[nxt] = lowlink[nxt] = index
+                    index += 1
+                    stack.append(nxt)
+                    on_stack.add(nxt)
+                    frames.append((nxt, sorted(graph.get(nxt, ())), 0))
+                elif nxt in on_stack:
+                    lowlink[node] = min(lowlink[node], indices[nxt])
+            else:
+                frames.pop()
+                if frames:
+                    parent = frames[-1][0]
+                    lowlink[parent] = min(lowlink[parent], lowlink[node])
+                if lowlink[node] == indices[node]:
+                    comp: list[str] = []
+                    while True:
+                        member = stack.pop()
+                        on_stack.remove(member)
+                        comp.append(member)
+                        if member == node:
+                            break
+                    if len(comp) > 1:
+                        sccs.append(tuple(sorted(comp)))
+    sccs.sort()
+    return sccs
 
 
 def _resolve_relative_import(rel: PurePosixPath, module: str | None, level: int) -> tuple[str, ...]:
@@ -645,9 +741,11 @@ def _iter_runtime_import_nodes(stmts: Sequence[ast.stmt]):
 
 
 def _check_ag010_layer_dag(rel: PurePosixPath, tree: ast.Module) -> list[Violation]:
-    """Enforce unidirectional L0->L1->L2->L3->L4 layer import DAG (AG010)."""
-    src_layer = _ag010_layer(rel.with_suffix("").parts)
-    if src_layer is None:
+    """Enforce unidirectional L0->L1->L2->L3->L4:stacks->L5:product layer DAG (AG010)."""
+    parts = rel.with_suffix("").parts
+    src_layer = _ag010_layer(parts)
+    is_core_prediction = len(parts) >= 2 and parts[:2] == ("mindie_sim", "prediction")
+    if src_layer is None and not is_core_prediction:
         return []
     pos = rel.as_posix()
     allowed = _LEGACY_UPWARD_IMPORTS.get(pos, frozenset())
@@ -660,16 +758,26 @@ def _check_ag010_layer_dag(rel: PurePosixPath, tree: ast.Module) -> list[Violati
         elif isinstance(node, ast.ImportFrom):
             base = _resolve_relative_import(rel, node.module, node.level)
             base_layer = _ag010_layer(base) if base else None
-            if base_layer is not None and base_layer > src_layer:
+            if base_layer is not None and src_layer is not None and base_layer > src_layer:
                 targets.append(base)
             elif base:
+                targets.append(base)
                 targets.extend((*base, alias.name) for alias in node.names if alias.name != "*")
         for target in targets:
             dst_layer = _ag010_layer(target)
-            if dst_layer is None or dst_layer <= src_layer:
+            if dst_layer is None:
                 continue
             bucket = _ag010_bucket(target)
-            if bucket in allowed or bucket in seen:
+            if src_layer is None:
+                if is_core_prediction and dst_layer == 4 and bucket not in seen:
+                    seen.add(bucket)
+                    violations.append(Violation(
+                        "AG010", rel, getattr(node, "lineno", 1),
+                        f"AG010:core_imports_stacks:{pos}:{bucket}",
+                        f"core prediction module must not import L4:stacks ({bucket})",
+                    ))
+                continue
+            if dst_layer <= src_layer or bucket in allowed or bucket in seen:
                 continue
             seen.add(bucket)
             violations.append(Violation(
@@ -677,6 +785,83 @@ def _check_ag010_layer_dag(rel: PurePosixPath, tree: ast.Module) -> list[Violati
                 f"AG010:upward_import:{pos}:{bucket}",
                 f"upward layer import {_AG010_LAYER_NAMES[src_layer]} -> "
                 f"{_AG010_LAYER_NAMES[dst_layer]} ({bucket}) violates unidirectional DAG",
+            ))
+    return violations
+
+
+def _check_ag010_package_sccs(
+    parsed_files: Sequence[tuple[PurePosixPath, ast.Module]],
+) -> list[Violation]:
+    """Detect strongly connected import cycles across ``mindie_sim`` packages & strict scopes."""
+    pkg_graph: dict[str, set[str]] = {}
+    pkg_anchor: dict[str, PurePosixPath] = {}
+    mod_graph: dict[str, set[str]] = {}
+    mod_rel: dict[str, PurePosixPath] = {}
+    for rel, _tree in parsed_files:
+        mod = _module_name_of_rel(rel)
+        mod_rel[mod] = rel
+        mod_graph.setdefault(mod, set())
+        parts = rel.with_suffix("").parts
+        if _ag010_layer(parts) is not None:
+            pkg = _ag010_scc_package(parts)
+            if pkg is not None:
+                pkg_graph.setdefault(pkg, set())
+                pkg_anchor.setdefault(pkg, rel)
+
+    for rel, tree in parsed_files:
+        src_mod = _module_name_of_rel(rel)
+        parts = rel.with_suffix("").parts
+        src_layer = _ag010_layer(parts)
+        src_pkg = _ag010_scc_package(parts) if src_layer is not None else None
+        for node in _iter_runtime_import_nodes(tree.body):
+            targets: list[tuple[str, ...]] = []
+            if isinstance(node, ast.Import):
+                targets.extend(tuple(alias.name.split(".")) for alias in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                base = _resolve_relative_import(rel, node.module, node.level)
+                if base:
+                    targets.append(base)
+                    targets.extend((*base, alias.name) for alias in node.names if alias.name != "*")
+            for target in targets:
+                dst_mod = ".".join(target)
+                if dst_mod in mod_rel and dst_mod != src_mod:
+                    mod_graph[src_mod].add(dst_mod)
+                if src_layer is None or src_pkg is None:
+                    continue
+                dst_layer = _ag010_layer(target)
+                if dst_layer is None or dst_layer > src_layer:
+                    continue
+                dst_pkg = _ag010_scc_package(target)
+                if dst_pkg is not None and dst_pkg != src_pkg:
+                    pkg_graph.setdefault(src_pkg, set()).add(dst_pkg)
+
+    violations: list[Violation] = []
+    for comp in _tarjan_sccs(pkg_graph):
+        if frozenset(comp) in _LEGACY_PACKAGE_SCCS:
+            continue
+        anchor = pkg_anchor.get(comp[0], PurePosixPath("mindie_sim/__init__.py"))
+        joined = ",".join(comp)
+        violations.append(Violation(
+            "AG010", anchor, 1, f"AG010:package_scc:{joined}",
+            f"strongly connected package import cycle detected: {' <-> '.join(comp)}",
+        ))
+    for prefix, legacy_set in (
+        ("mindie_sim.schema.", _LEGACY_SCHEMA_MODULE_SCCS),
+        ("mindie_sim.stacks.", frozenset()),
+    ):
+        scoped = {
+            u: {v for v in vs if v.startswith(prefix)}
+            for u, vs in mod_graph.items()
+            if u.startswith(prefix)
+        }
+        for comp in _tarjan_sccs(scoped):
+            if frozenset(comp) in legacy_set:
+                continue
+            anchor = mod_rel.get(comp[0], PurePosixPath("mindie_sim/__init__.py"))
+            joined = ",".join(comp)
+            violations.append(Violation(
+                "AG010", anchor, 1, f"AG010:module_scc:{joined}",
+                f"strongly connected module import cycle detected: {' <-> '.join(comp)}",
             ))
     return violations
 

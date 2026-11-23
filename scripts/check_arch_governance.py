@@ -37,7 +37,7 @@ if __package__:
         MAX_OPERATOR_PACKAGE_FILES, MAX_TOPLEVEL_MODULES, OPERATORS_PARTS, Violation,
         _check_ag006_flat_prediction, _check_ag007, _check_ag008_module, _check_ag008_repo_bounds,
         _check_ag009_silent_physical_defaults, _check_ag010_layer_dag,
-        _check_ag011_operator_reachability,
+        _check_ag010_package_sccs, _check_ag011_operator_reachability,
         _check_ag013_anti_hardcoding as _base_ag013_anti_hardcoding,
         _is_governed_family_path, scan_runtime,
         verify_ag007_discrimination, verify_ag011_engine_reachability,
@@ -50,7 +50,7 @@ else:
         MAX_OPERATOR_PACKAGE_FILES, MAX_TOPLEVEL_MODULES, OPERATORS_PARTS, Violation,
         _check_ag006_flat_prediction, _check_ag007, _check_ag008_module, _check_ag008_repo_bounds,
         _check_ag009_silent_physical_defaults, _check_ag010_layer_dag,
-        _check_ag011_operator_reachability,
+        _check_ag010_package_sccs, _check_ag011_operator_reachability,
         _check_ag013_anti_hardcoding as _base_ag013_anti_hardcoding,
         _is_governed_family_path, scan_runtime,
         verify_ag007_discrimination, verify_ag011_engine_reachability,
@@ -118,6 +118,19 @@ CANONICAL_CONCEPT_OWNERS: Mapping[str, tuple[str, ...]] = MappingProxyType({
     "RecipeBook": ("mindie_sim/prediction/program/recipes.py",),
     "RecipeContext": ("mindie_sim/prediction/program/binding.py",),
     "PredictionSpine": ("mindie_sim/prediction/spine.py",),
+    "CheckpointQuantMap": ("mindie_sim/schema/checkpoint.py",),
+    "TensorPrecisionABI": ("mindie_sim/schema/operators.py",),
+    "KernelBinding": ("mindie_sim/schema/operators.py",),
+    "OwnerScheduleSpec": ("mindie_sim/schema/operators.py",),
+    "CachePlaneABI": ("mindie_sim/schema/stack.py",),
+    "CacheStateABI": ("mindie_sim/schema/stack.py",),
+    "RuntimeQuantPlan": ("mindie_sim/schema/stack.py",),
+    "StackLoweringPlan": ("mindie_sim/schema/stack.py",),
+    "RuntimeStackAdapter": ("mindie_sim/schema/stack.py",),
+    "ScenarioContract": ("mindie_sim/schema/scenario.py",),
+    "SLAContract": ("mindie_sim/schema/scenario.py",),
+    "DeploymentOutcome": ("mindie_sim/schema/scenario.py",),
+    "CoDesignOpportunity": ("mindie_sim/schema/scenario.py",),
 })
 
 def _is_allowed_isa_leaf(rel: PurePosixPath) -> bool:
@@ -1229,6 +1242,7 @@ def scan_repository(
         violations.extend(_check_ag010_layer_dag(rel, tree))
         violations.extend(_check_ag013_anti_hardcoding(rel, tree))
     violations.extend(_check_ag008_repo_bounds([rel for rel, _ in files], texts=texts))
+    violations.extend(_check_ag010_package_sccs(parsed_files))
     violations.extend(_check_ag011_operator_reachability(parsed_files))
     violations.sort(key=lambda v: (v.path.as_posix(), v.line, v.rule, v.message))
     return tuple(violations)

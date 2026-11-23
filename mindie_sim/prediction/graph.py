@@ -67,14 +67,19 @@ class GraphPolicy:
                   if gdn_slot_capture and views and uniform
                   and not any(view.padding for view in views)
                   else 1)
-        full = runtime.graph_capture_mode == "full" and decode and uniform and not runtime.invalid_full_modes
+        full_decode_eligible = (
+            runtime.graph_capture_mode == "full"
+            or getattr(runtime, "supports_full_decode_capture", False)
+        )
+        full = full_decode_eligible and decode and uniform and not runtime.invalid_full_modes
         if full:
             full_sizes = runtime.graph_capture_keys or runtime.graph_buckets
             bucket = next((size for size in sorted(full_sizes)
                            if size >= tokens and (q_unit <= 0 or size % q_unit == 0)), None)
             if bucket is not None:
                 return bucket, "full"
-        if not (decode or runtime.mixed_mode not in {"none", "off"}):
+        is_full_and_piecewise = getattr(runtime, "captured_execution_mode", "") == "FULL_AND_PIECEWISE"
+        if not (decode or is_full_and_piecewise or runtime.mixed_mode not in {"none", "off"}):
             return None, "none"
         bucket = next((size for size in sorted(runtime.piecewise_capture_keys) if size >= tokens), None)
         return (bucket, "piecewise") if bucket is not None else (None, "none")

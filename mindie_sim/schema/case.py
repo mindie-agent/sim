@@ -208,13 +208,70 @@ class Software:
             val = getattr(self, flag)
             if not isinstance(val, bool):
                 raise ModelingError(f"runtime_feature_invalid:{flag}:{val!r}")
-        if not self.enable_torch_compile or self.graph_capture_mode != "full":
+        full_decode_eligible = (
+            self.graph_capture_mode == "full"
+            or self.captured_execution_mode == "FULL_AND_PIECEWISE"
+        )
+        if not self.enable_torch_compile or not full_decode_eligible:
             object.__setattr__(self, "enable_npugraph_ex", False)
             object.__setattr__(self, "enable_static_kernel", False)
             object.__setattr__(self, "enable_super_kernel", False)
         elif not self.enable_npugraph_ex:
             object.__setattr__(self, "enable_static_kernel", False)
             object.__setattr__(self, "enable_super_kernel", False)
+
+    @property
+    def captured_execution_mode(self) -> str:
+        """Return declared raw capture mode (preserving ``FULL_AND_PIECEWISE`` and ``FULL_DECODE_ONLY``)."""
+        for key, value in self.metadata:
+            if key == "captured_execution_mode" and isinstance(value, str):
+                return value.strip().upper()
+        return ""
+
+    @property
+    def supports_full_decode_capture(self) -> bool:
+        """True when decode steps may select full-graph capture (including ``FULL_AND_PIECEWISE``)."""
+        return (
+            not self.invalid_full_modes
+            and (
+                self.graph_capture_mode == "full"
+                or self.captured_execution_mode == "FULL_AND_PIECEWISE"
+            )
+        )
+
+    @property
+    def supports_full_prefill_capture(self) -> bool:
+        """True when prefill steps may select full-graph capture (excludes ``FULL_DECODE_ONLY``)."""
+        return (
+            not self.invalid_full_modes
+            and self.graph_capture_mode == "full"
+            and self.captured_execution_mode != "FULL_DECODE_ONLY"
+        )
+
+    @property
+    def supports_piecewise_capture(self) -> bool:
+        """True when piecewise capture is eligible (``piecewise`` or ``FULL_AND_PIECEWISE``)."""
+        return (
+            self.graph_capture_mode == "piecewise"
+            or self.captured_execution_mode == "FULL_AND_PIECEWISE"
+        )
+
+    def effective_capture_scope(self, phase: str, *, uniform: bool = True) -> str:
+        """Resolve non-lossy capture scope for ``phase`` without collapsing ``FULL_AND_PIECEWISE``."""
+        if self.graph_mode.lower() in {"none", "off", "eager", "disabled"} or self.deepep_high_throughput:
+            return "none"
+        norm_phase = str(phase or "").strip().lower()
+        if norm_phase == "decode" and uniform and self.supports_full_decode_capture:
+            return "full"
+        if norm_phase == "prefill" and uniform and self.supports_full_prefill_capture:
+            return "full"
+        if self.supports_piecewise_capture and (
+            norm_phase == "decode"
+            or self.mixed_mode not in {"none", "off"}
+            or self.captured_execution_mode == "FULL_AND_PIECEWISE"
+        ):
+            return "piecewise"
+        return "none"
 
     @staticmethod
     def parallel_mapping(raw):

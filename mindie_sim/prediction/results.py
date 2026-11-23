@@ -23,6 +23,7 @@ from typing import Literal, TypeAlias
 
 from mindie_sim.schema.case import Case
 from mindie_sim.schema.datapath import SourceRef
+from mindie_sim.schema.scenario import ExecutionStage
 from mindie_sim.schema.workload import RequestView
 from .streams import MAIN_STREAM, StreamId, StreamPlan, validate_stream_id
 
@@ -282,6 +283,24 @@ class StepEvaluation:
     streams: tuple[StreamPlan, ...] = field(
         default=(), repr=False, compare=False, kw_only=True, metadata={"wire": False},
     )
+    execution_stage: ExecutionStage | None = field(
+        default=None, kw_only=True, metadata={"wire": False},
+    )
+    stack_id: str = field(
+        default="", kw_only=True, metadata={"wire": False},
+    )
+    scenario_digest: str = field(
+        default="", kw_only=True, metadata={"wire": False},
+    )
+    quant_plan_digest: str = field(
+        default="", kw_only=True, metadata={"wire": False},
+    )
+    lowering_plan_digest: str = field(
+        default="", kw_only=True, metadata={"wire": False},
+    )
+    primitive_table_digest: str = field(
+        default="", kw_only=True, metadata={"wire": False},
+    )
 
     def __reduce__(self):
         # ``PrimitiveTable`` wraps ``MappingProxyType`` (unpicklable), so serialize
@@ -300,13 +319,22 @@ class StepEvaluation:
             self.operators, self.pipelines, self.wave_breakdown,
             self.accel_backend, self.native_steps,
         )
-        return (_unpickle_step_evaluation, (wire_args, self.streams, pt_state))
+        seam_meta = (
+            self.execution_stage,
+            self.stack_id,
+            self.scenario_digest,
+            self.quant_plan_digest,
+            self.lowering_plan_digest,
+            self.primitive_table_digest,
+        )
+        return (_unpickle_step_evaluation, (wire_args, self.streams, pt_state, seam_meta))
 
 
 def _unpickle_step_evaluation(
     wire_args: tuple[object, ...],
     streams: tuple[StreamPlan, ...],
     pt_state: object,
+    seam_meta: tuple[object, ...] = (None, "", "", "", "", ""),
 ) -> StepEvaluation:
     if isinstance(pt_state, tuple) and pt_state and pt_state[0] == "primitive_table":
         from mindie_sim.primitives.schema import parse_primitive_table
@@ -316,7 +344,18 @@ def _unpickle_step_evaluation(
             object.__setattr__(pt, "warnings", tuple(warnings))
     else:
         pt = pt_state
-    return StepEvaluation(*wire_args, primitive_table=pt, streams=streams)
+    stage, stack_id, scen_dig, quant_dig, low_dig, pt_dig = seam_meta
+    return StepEvaluation(
+        *wire_args,
+        primitive_table=pt,
+        streams=streams,
+        execution_stage=stage,  # type: ignore[arg-type]
+        stack_id=str(stack_id),
+        scenario_digest=str(scen_dig),
+        quant_plan_digest=str(quant_dig),
+        lowering_plan_digest=str(low_dig),
+        primitive_table_digest=str(pt_dig),
+    )
 
 
 @dataclass(frozen=True, slots=True)

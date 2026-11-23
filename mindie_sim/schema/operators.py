@@ -23,10 +23,13 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+import hashlib
+import json
 import math
 from typing import Any, Literal
 
 from .common import ModelingError
+from .datapath import SourceRef
 from .invocation import Occurrence
 from .subgraphs import PortSet
 from .workload import IterationPlan
@@ -48,6 +51,373 @@ FIELD_ACTIONS = frozenset({"preserve", "rewrite", "consume"})
 #: Useful work is what the user asked for; issued work is what the selected
 #: implementation really executes.  Only issued work consumes resource service.
 WORK_KINDS = frozenset({"useful", "issued"})
+
+LinearMethod = Literal["dense", "w8a8", "w4a8", "w4a16", "fp8", "mx_fp8", "mx_fp4", "none"]
+LINEAR_METHODS = frozenset({"dense", "w8a8", "w4a8", "w4a16", "fp8", "mx_fp8", "mx_fp4", "none"})
+
+KernelReadiness = Literal["shipping", "proposed_pr", "synthesized_target", "tiler_extension"]
+KERNEL_READINESS_VALUES = frozenset({
+    "shipping", "proposed_pr", "synthesized_target", "tiler_extension",
+})
+
+KernelBackend = Literal[
+    "CANN", "HCCL/MC2", "Triton", "PyTorch-NPU", "Custom-Ops", "Host", "Logical",
+]
+KERNEL_BACKENDS = frozenset({
+    "CANN", "HCCL/MC2", "Triton", "PyTorch-NPU", "Custom-Ops", "Host", "Logical",
+})
+
+SerialPhasePipe = Literal[
+    "cube", "vec_alu", "vec_sfu", "vec_reduce", "cast",
+    "mte1", "mte2", "mte3", "fixpipe", "ub_copy", "link",
+]
+SERIAL_PHASE_PIPES = frozenset({
+    "cube", "vec_alu", "vec_sfu", "vec_reduce", "cast",
+    "mte1", "mte2", "mte3", "fixpipe", "ub_copy", "link",
+})
+
+SerialPhaseUnit = Literal["flop", "op", "bytes", "groups"]
+SERIAL_PHASE_UNITS = frozenset({"flop", "op", "bytes", "groups"})
+
+L2AdmissionMode = Literal["stream", "reuse", "bypass"]
+L2_ADMISSION_MODES = frozenset({"stream", "reuse", "bypass"})
+
+OwnerKind = Literal["aic", "aiv", "mix", "hccl", "host"]
+OWNER_KINDS = frozenset({"aic", "aiv", "mix", "hccl", "host"})
+
+
+def _nonneg_int(value: Any, code: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ModelingError(f"{code}:{value!r}")
+    return int(value)
+
+
+def _nonneg_finite(value: Any, code: str) -> float:
+    if isinstance(value, bool):
+        raise ModelingError(f"{code}:{value!r}")
+    try:
+        num = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ModelingError(f"{code}:{value!r}") from exc
+    if not math.isfinite(num) or num < 0.0:
+        raise ModelingError(f"{code}:{value!r}")
+    return num
+
+
+@dataclass(frozen=True, slots=True)
+class TensorPrecisionABI:
+    """Exact per-port execution precision, scaling, and layout ABI."""
+
+    linear_method: LinearMethod
+    input_dtype: str
+    weight_dtype: str = ""
+    output_dtype: str = ""
+    compute_dtype: str = ""
+    accum_dtype: str = "fp32"
+    weight_layout: str = "ND"
+    weight_block: tuple[int, ...] = ()
+    weight_scale_dtype: str = ""
+    weight_scale_bytes: int = 0
+    weight_metadata: tuple[tuple[str, Any], ...] = ()
+    act_group_size: int = 0
+    act_scale_dtype: str = ""
+    act_scale_pack: str = ""
+    explicit_cast_on_entry: str = ""
+    explicit_cast_on_exit: str = ""
+
+    def __post_init__(self) -> None:
+        if self.linear_method not in LINEAR_METHODS:
+            raise ModelingError(f"tensor_precision_abi_method_invalid:{self.linear_method!r}")
+        if not isinstance(self.input_dtype, str) or not self.input_dtype.strip():
+            raise ModelingError("tensor_precision_abi_input_dtype_required")
+        for attr in (
+            "weight_dtype", "output_dtype", "compute_dtype", "accum_dtype",
+            "weight_layout", "weight_scale_dtype", "act_scale_dtype",
+            "act_scale_pack", "explicit_cast_on_entry", "explicit_cast_on_exit",
+        ):
+            if not isinstance(getattr(self, attr), str):
+                raise ModelingError(f"tensor_precision_abi_field_invalid:{attr}")
+        block = tuple(self.weight_block)
+        if any(isinstance(dim, bool) or not isinstance(dim, int) or dim < 1 for dim in block):
+            raise ModelingError(f"tensor_precision_abi_weight_block_invalid:{block!r}")
+        object.__setattr__(self, "input_dtype", self.input_dtype.strip().lower())
+        object.__setattr__(self, "weight_block", block)
+        object.__setattr__(
+            self,
+            "weight_scale_bytes",
+            _nonneg_int(self.weight_scale_bytes, "tensor_precision_abi_scale_bytes_invalid"),
+        )
+        object.__setattr__(
+            self,
+            "act_group_size",
+            _nonneg_int(self.act_group_size, "tensor_precision_abi_act_group_invalid"),
+        )
+        raw_meta = self.weight_metadata
+        if isinstance(raw_meta, Mapping):
+            raw_meta = tuple(sorted(raw_meta.items()))
+        frozen_meta = tuple(
+            (str(k), _frozen_attr(v, f"tensor_precision_abi_meta_invalid:{k}"))
+            for k, v in raw_meta
+        )
+        object.__setattr__(self, "weight_metadata", frozen_meta)
+
+    @property
+    def abi_signature(self) -> str:
+        """Deterministic SHA-256 signature governing fusion and rewrite legality."""
+        payload = json.dumps(self.to_dict(), sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def is_fusion_compatible(self, other: "TensorPrecisionABI") -> bool:
+        """Return True iff two ports can merge without an undeclared precision cast."""
+        if not isinstance(other, TensorPrecisionABI):
+            return False
+        if self.abi_signature == other.abi_signature:
+            return True
+        return (
+            self.linear_method == other.linear_method
+            and self.input_dtype == other.input_dtype
+            and self.weight_dtype == other.weight_dtype
+            and self.compute_dtype == other.compute_dtype
+            and self.act_group_size == other.act_group_size
+            and self.act_scale_dtype == other.act_scale_dtype
+            and self.weight_scale_dtype == other.weight_scale_dtype
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "linear_method": self.linear_method,
+            "input_dtype": self.input_dtype,
+            "weight_dtype": self.weight_dtype,
+            "output_dtype": self.output_dtype,
+            "compute_dtype": self.compute_dtype,
+            "accum_dtype": self.accum_dtype,
+            "weight_layout": self.weight_layout,
+            "weight_block": list(self.weight_block),
+            "weight_scale_dtype": self.weight_scale_dtype,
+            "weight_scale_bytes": self.weight_scale_bytes,
+            "weight_metadata": dict(self.weight_metadata),
+            "act_group_size": self.act_group_size,
+            "act_scale_dtype": self.act_scale_dtype,
+            "act_scale_pack": self.act_scale_pack,
+            "explicit_cast_on_entry": self.explicit_cast_on_entry,
+            "explicit_cast_on_exit": self.explicit_cast_on_exit,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class KernelBinding:
+    """Architecture-verified kernel identity bound at executable operator birth."""
+
+    kernel_id: str
+    backend: KernelBackend
+    arch_family: str
+    submodule: str = ""
+    macro_module: str = ""
+    readiness: KernelReadiness = "shipping"
+    source_ref: SourceRef | None = None
+    recipe_id: str = ""
+    template_id: str = ""
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.backend, str):
+            raise ModelingError("kernel_binding_backend_invalid")
+        if "cannbot" in self.backend.lower():
+            raise ModelingError(f"kernel_binding_banned_backend:{self.backend}")
+        if self.backend not in KERNEL_BACKENDS:
+            raise ModelingError(f"kernel_binding_backend_unknown:{self.backend!r}")
+        if not isinstance(self.kernel_id, str):
+            raise ModelingError("kernel_binding_kernel_id_invalid")
+        if "cannbot" in self.kernel_id.lower():
+            raise ModelingError(f"kernel_binding_banned_kernel_id:{self.kernel_id}")
+        if self.backend != "Logical" and not self.kernel_id.strip():
+            raise ModelingError("kernel_binding_kernel_id_required")
+        if not isinstance(self.arch_family, str) or not self.arch_family.strip():
+            raise ModelingError("kernel_binding_arch_family_required")
+        if self.readiness not in KERNEL_READINESS_VALUES:
+            raise ModelingError(f"kernel_binding_readiness_invalid:{self.readiness!r}")
+        if self.source_ref is not None and not isinstance(self.source_ref, SourceRef):
+            raise ModelingError("kernel_binding_source_ref_invalid")
+        for attr in ("submodule", "macro_module", "recipe_id", "template_id"):
+            if not isinstance(getattr(self, attr), str):
+                raise ModelingError(f"kernel_binding_field_invalid:{attr}")
+        object.__setattr__(self, "kernel_id", self.kernel_id.strip())
+        object.__setattr__(self, "arch_family", self.arch_family.strip())
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "kernel_id": self.kernel_id,
+            "backend": self.backend,
+            "arch_family": self.arch_family,
+            "submodule": self.submodule,
+            "macro_module": self.macro_module,
+            "readiness": self.readiness,
+            "source_ref": self.source_ref.to_dict() if self.source_ref is not None else None,
+            "recipe_id": self.recipe_id,
+            "template_id": self.template_id,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class SerialPhaseSpec:
+    """One causally ordered execution phase inside the busiest hardware owner."""
+
+    name: str
+    pipe: SerialPhasePipe
+    owner_work: float
+    unit: SerialPhaseUnit
+    dependent_chain_steps: int = 0
+    overlap_with: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.name, str) or not self.name.strip():
+            raise ModelingError("serial_phase_name_required")
+        if self.pipe not in SERIAL_PHASE_PIPES:
+            raise ModelingError(f"serial_phase_pipe_invalid:{self.pipe!r}")
+        if self.unit not in SERIAL_PHASE_UNITS:
+            raise ModelingError(f"serial_phase_unit_invalid:{self.unit!r}")
+        object.__setattr__(self, "name", self.name.strip())
+        object.__setattr__(self, "owner_work", _nonneg_finite(self.owner_work, "serial_phase_work_invalid"))
+        object.__setattr__(
+            self,
+            "dependent_chain_steps",
+            _nonneg_int(self.dependent_chain_steps, "serial_phase_chain_steps_invalid"),
+        )
+        overlaps = tuple(self.overlap_with)
+        if not all(isinstance(item, str) and item.strip() for item in overlaps):
+            raise ModelingError("serial_phase_overlap_with_invalid")
+        object.__setattr__(self, "overlap_with", overlaps)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "pipe": self.pipe,
+            "owner_work": self.owner_work,
+            "unit": self.unit,
+            "dependent_chain_steps": self.dependent_chain_steps,
+            "overlap_with": list(self.overlap_with),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class OwnerMemoryResidency:
+    """Distinguishes on-chip UB residency, owner-local DMA traffic, and shared HBM traffic."""
+
+    ub_live_bytes: int
+    ub_capacity_bytes: int
+    spill_reload_passes: int = 1
+    owner_mte2_bytes: float = 0.0
+    owner_mte3_bytes: float = 0.0
+    shared_hbm_read_bytes: float = 0.0
+    shared_hbm_write_bytes: float = 0.0
+    l2_admission_mode: L2AdmissionMode = "reuse"
+
+    def __post_init__(self) -> None:
+        ub_live = _nonneg_int(self.ub_live_bytes, "owner_residency_ub_live_invalid")
+        ub_cap = _nonneg_int(self.ub_capacity_bytes, "owner_residency_ub_capacity_invalid")
+        if ub_cap > 0 and ub_live > ub_cap:
+            raise ModelingError(
+                f"owner_residency_ub_overflow:ub_live_bytes={ub_live}>ub_capacity_bytes={ub_cap}"
+            )
+        if self.l2_admission_mode not in L2_ADMISSION_MODES:
+            raise ModelingError(f"owner_residency_l2_mode_invalid:{self.l2_admission_mode!r}")
+        object.__setattr__(self, "ub_live_bytes", ub_live)
+        object.__setattr__(self, "ub_capacity_bytes", ub_cap)
+        object.__setattr__(
+            self,
+            "spill_reload_passes",
+            _nonneg_int(self.spill_reload_passes, "owner_residency_spill_passes_invalid"),
+        )
+        for attr in (
+            "owner_mte2_bytes", "owner_mte3_bytes",
+            "shared_hbm_read_bytes", "shared_hbm_write_bytes",
+        ):
+            object.__setattr__(
+                self, attr, _nonneg_finite(getattr(self, attr), f"owner_residency_{attr}_invalid")
+            )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "ub_live_bytes": self.ub_live_bytes,
+            "ub_capacity_bytes": self.ub_capacity_bytes,
+            "spill_reload_passes": self.spill_reload_passes,
+            "owner_mte2_bytes": self.owner_mte2_bytes,
+            "owner_mte3_bytes": self.owner_mte3_bytes,
+            "shared_hbm_read_bytes": self.shared_hbm_read_bytes,
+            "shared_hbm_write_bytes": self.shared_hbm_write_bytes,
+            "l2_admission_mode": self.l2_admission_mode,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class OwnerScheduleSpec:
+    """Tiler-emitted physical owner schedule preserved through Engine and Rewrite."""
+
+    owner_kind: OwnerKind
+    tiling_strategy: str
+    parallel_axis: str
+    work_tiles: int
+    launched_owners: int
+    active_owners: int
+    total_owners: int
+    max_tiles_per_owner: int
+    residency: OwnerMemoryResidency
+    serial_phases: tuple[SerialPhaseSpec, ...] = ()
+    dispatch_envelope_source: str = ""
+
+    def __post_init__(self) -> None:
+        if self.owner_kind not in OWNER_KINDS:
+            raise ModelingError(f"owner_schedule_kind_invalid:{self.owner_kind!r}")
+        if not isinstance(self.tiling_strategy, str) or not self.tiling_strategy.strip():
+            raise ModelingError("owner_schedule_tiling_strategy_required")
+        if not isinstance(self.parallel_axis, str) or not self.parallel_axis.strip():
+            raise ModelingError("owner_schedule_parallel_axis_required")
+        work_tiles = _nonneg_int(self.work_tiles, "owner_schedule_work_tiles_invalid")
+        launched = _nonneg_int(self.launched_owners, "owner_schedule_launched_owners_invalid")
+        active = _nonneg_int(self.active_owners, "owner_schedule_active_owners_invalid")
+        total = _nonneg_int(self.total_owners, "owner_schedule_total_owners_invalid")
+        max_tiles = _nonneg_int(self.max_tiles_per_owner, "owner_schedule_max_tiles_invalid")
+        if active > launched:
+            raise ModelingError(f"owner_schedule_active_exceeds_launched:{active}>{launched}")
+        if total > 0 and launched > total:
+            raise ModelingError(f"owner_schedule_launched_exceeds_total:{launched}>{total}")
+        if work_tiles > 0 and active < 1:
+            raise ModelingError(f"owner_schedule_zero_active_for_positive_tiles:{work_tiles}")
+        if work_tiles > 0 and launched > 0:
+            min_max_tiles = (work_tiles + launched - 1) // launched
+            if max_tiles < min_max_tiles:
+                raise ModelingError(
+                    f"owner_schedule_max_tiles_understated:{max_tiles}<{min_max_tiles}"
+                )
+        if not isinstance(self.residency, OwnerMemoryResidency):
+            raise ModelingError("owner_schedule_residency_invalid")
+        phases = tuple(self.serial_phases)
+        if not all(isinstance(phase, SerialPhaseSpec) for phase in phases):
+            raise ModelingError("owner_schedule_serial_phases_invalid")
+        if not isinstance(self.dispatch_envelope_source, str):
+            raise ModelingError("owner_schedule_dispatch_source_invalid")
+        object.__setattr__(self, "tiling_strategy", self.tiling_strategy.strip())
+        object.__setattr__(self, "parallel_axis", self.parallel_axis.strip())
+        object.__setattr__(self, "work_tiles", work_tiles)
+        object.__setattr__(self, "launched_owners", launched)
+        object.__setattr__(self, "active_owners", active)
+        object.__setattr__(self, "total_owners", total)
+        object.__setattr__(self, "max_tiles_per_owner", max_tiles)
+        object.__setattr__(self, "serial_phases", phases)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "owner_kind": self.owner_kind,
+            "tiling_strategy": self.tiling_strategy,
+            "parallel_axis": self.parallel_axis,
+            "work_tiles": self.work_tiles,
+            "launched_owners": self.launched_owners,
+            "active_owners": self.active_owners,
+            "total_owners": self.total_owners,
+            "max_tiles_per_owner": self.max_tiles_per_owner,
+            "residency": self.residency.to_dict(),
+            "serial_phases": [phase.to_dict() for phase in self.serial_phases],
+            "dispatch_envelope_source": self.dispatch_envelope_source,
+        }
 
 
 def _frozen_attr(value: Any, reason: str) -> Any:
@@ -580,10 +950,28 @@ class OpSpec:
     #: A source call expands into kernels before pricing and host submission.
     #: Both source boundaries require an exact planner; empty is semantic work.
     source_boundary: Literal["", "kernel", "call"] = ""
+    #: Optional logical port precision requirements prior to executable birth.
+    logical_precision_reqs: tuple[tuple[str, str], ...] = ()
+    #: Executable birth bindings populated once hardware/tiler lowering resolves.
+    precision_abi: TensorPrecisionABI | None = None
+    kernel_binding: KernelBinding | None = None
+    owner_schedule: OwnerScheduleSpec | None = None
 
     @property
     def plan_required(self) -> bool:
         return bool(self.source_boundary)
+
+    @property
+    def is_executable_bound(self) -> bool:
+        return self.precision_abi is not None and self.kernel_binding is not None
+
+    def require_executable_binding(self) -> tuple[TensorPrecisionABI, KernelBinding]:
+        """Assert non-empty executable birth bindings (precision ABI + kernel binding)."""
+        if self.precision_abi is None:
+            raise ModelingError(f"op_missing_precision_abi:{self.op_id}")
+        if self.kernel_binding is None:
+            raise ModelingError(f"op_missing_kernel_binding:{self.op_id}")
+        return self.precision_abi, self.kernel_binding
 
     def to_dict(self, *, include_work: bool = True) -> dict[str, Any]:
         payload = {
@@ -605,6 +993,14 @@ class OpSpec:
             payload["source_boundary"] = self.source_boundary
         if self.stream:
             payload["stream"] = self.stream
+        if self.logical_precision_reqs:
+            payload["logical_precision_reqs"] = dict(self.logical_precision_reqs)
+        if self.precision_abi is not None:
+            payload["precision_abi"] = self.precision_abi.to_dict()
+        if self.kernel_binding is not None:
+            payload["kernel_binding"] = self.kernel_binding.to_dict()
+        if self.owner_schedule is not None:
+            payload["owner_schedule"] = self.owner_schedule.to_dict()
         if include_work:
             payload.update({
                 "flops": self.flops, "hbm_bytes": self.hbm_bytes,
@@ -731,8 +1127,14 @@ class IterationWork:
 
 
 __all__ = [
-    "FIELD_ACTIONS", "SEMANTIC_REF_KINDS", "STATE_EFFECT_ACTIONS",
-    "WORK_KINDS", "AllocationEffect", "FieldDisposition", "IterationWork",
-    "OpSpec", "ProgramFragment", "ResourcePolicy", "RoutingStats",
-    "SemanticAttr", "SemanticRef", "StateEffect", "WorkItem", "WorkSet",
+    "FIELD_ACTIONS", "KERNEL_BACKENDS", "KERNEL_READINESS_VALUES",
+    "L2_ADMISSION_MODES", "LINEAR_METHODS", "OWNER_KINDS",
+    "SEMANTIC_REF_KINDS", "SERIAL_PHASE_PIPES", "SERIAL_PHASE_UNITS",
+    "STATE_EFFECT_ACTIONS", "WORK_KINDS", "AllocationEffect",
+    "FieldDisposition", "IterationWork", "KernelBackend", "KernelBinding",
+    "KernelReadiness", "L2AdmissionMode", "LinearMethod", "OpSpec",
+    "OwnerKind", "OwnerMemoryResidency", "OwnerScheduleSpec",
+    "ProgramFragment", "ResourcePolicy", "RoutingStats", "SemanticAttr",
+    "SemanticRef", "SerialPhasePipe", "SerialPhaseSpec", "SerialPhaseUnit",
+    "StateEffect", "TensorPrecisionABI", "WorkItem", "WorkSet",
 ]
