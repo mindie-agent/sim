@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from collections import OrderedDict, defaultdict
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields as dataclass_fields, replace
 from fractions import Fraction
 import hashlib
 from pathlib import Path
@@ -28,6 +28,12 @@ from typing import Any
 
 from mindie_sim.catalog.npu_checkpoints import normalize_hw_family, resolve_default_checkpoint
 from mindie_sim.catalog.va_speculative_rules import build_va_serving_rules
+from mindie_sim.optimization.causal_tail import (
+    compute_acceptance_tail_closure,
+    resolve_arch_family_tag,
+    resolve_barrier_predecessors,
+    restore_folded_tail_commits,
+)
 from mindie_sim.optimization.dual_bound import (
     NS_PER_SECOND,
     DagEdge,
@@ -45,6 +51,7 @@ from mindie_sim.optimization.kernel_synthesis import (
     load_rewrite_plan,
     solve_target_graph,
 )
+from mindie_sim.optimization.target_schedule import schedule_target_graph_on_engine
 from mindie_sim.prediction.body_defaults import consume_target_declaration
 from mindie_sim.prediction.efficiency import extract_hardware_peaks
 from mindie_sim.prediction.efficiency.capacity_window import _resolve_speculative_tokens
@@ -125,6 +132,12 @@ from .models import (
 from .reconcile import load_observation_bundle, reconcile_operators_with_kernels
 
 _RECURRENT_MICRO_PATTERN = re.compile(r"^(.*)\.(recurrent_scan|chunk_kda)(\d+)$")
+_OP_ROW_FIELDS = frozenset(f.name for f in dataclass_fields(OperatorExportRow))
+_BUNDLE_FIELDS = frozenset(f.name for f in dataclass_fields(ExportBundle))
+
+
+def _filter_dataclass_kwargs(allowed: frozenset[str], extra: Mapping[str, Any]) -> dict[str, Any]:
+    return {k: v for k, v in extra.items() if k in allowed}
 
 
 def resolve_hardware_alias(
@@ -213,10 +226,12 @@ def compose_export_case(
         from mindie_sim.model_catalog import load_model
 
         m_spec = load_model(model)
-        auto_w, auto_kv, _ = resolve_auto_va_quant(m_spec, sku, context_tokens=p_tok)
+        auto_w, auto_kv, auto_idx = resolve_auto_va_quant(m_spec, sku, context_tokens=p_tok)
         resolved_quant = auto_w
         if resolved_kv is None:
             resolved_kv = auto_kv
+        if auto_idx and "indexer_kv_dtype" not in compose_kw:
+            compose_kw["indexer_kv_dtype"] = auto_idx
     if resolved_quant is not None:
         compose_kw["quant"] = resolved_quant
     if resolved_kv is not None:
@@ -709,7 +724,12 @@ def _assign_op_archetype(
     spec: OpSpec | None,
     archetypes_by_id: Mapping[str, LayerArchetypeSpec],
     target_arch_by_rep_layer: Mapping[int, LayerArchetypeSpec],
+    *,
+    occurrence: OpOccurrence | None = None,
+    tail_closure: frozenset[OpOccurrence] = frozenset(),
 ) -> LayerArchetypeSpec:
+    if occurrence is not None and occurrence in tail_closure:
+        return archetypes_by_id["target_tail"]
     oid = str(op_id or "")
     layer_idx = extract_layer_index(oid, spec.layer if spec is not None else None)
     if oid.startswith("draft"):
@@ -737,6 +757,7 @@ def _collapse_micro_split_ops(
     out_rows: list[OperatorExportRow] = []
     out_demands: list[tuple[int, int, int, int, int]] = []
     group_pos: dict[tuple[str, str], int] = {}
+    group_preds: dict[tuple[str, str], list[OpOccurrence]] = {}
     renamed: dict[str, str] = {}
     for row, dem in zip(rows, demands):
         match = _RECURRENT_MICRO_PATTERN.match(row.op_id)
@@ -750,9 +771,15 @@ def _collapse_micro_split_ops(
         prev_idx = group_pos.get(key)
         if prev_idx is None:
             group_pos[key] = len(out_rows)
-            out_rows.append(replace(row, op_id=collapsed_id))
+            group_preds[key] = list(row.predecessors)
+            out_rows.append(replace(
+                row,
+                occurrence=replace(row.occurrence, op_id=collapsed_id),
+                op_id=collapsed_id,
+            ))
             out_demands.append(dem)
             continue
+        group_preds[key].extend(row.predecessors)
         base = out_rows[prev_idx]
         b_dem = out_demands[prev_idx]
         merged_dem = tuple(b_dem[i] + dem[i] for i in range(CERT_RESOURCE_COUNT))
@@ -775,6 +802,8 @@ def _collapse_micro_split_ops(
         )
         out_demands[prev_idx] = merged_dem  # type: ignore[assignment]
     if renamed:
+        for key, pos in group_pos.items():
+            out_rows[pos] = replace(out_rows[pos], predecessors=tuple(group_preds[key]))
         out_rows = [
             replace(
                 r,
@@ -784,7 +813,8 @@ def _collapse_micro_split_ops(
                     if renamed.get(p.op_id, p.op_id) != r.op_id
                 )),
             )
-            if any(p.op_id in renamed for p in r.predecessors) else r
+            if (any(p.op_id in renamed for p in r.predecessors) or (r.archetype_id, r.op_id) in group_pos)
+            else r
             for r in out_rows
         ]
     return out_rows, out_demands
@@ -821,10 +851,18 @@ def _extract_structure_registry_view(
         physical_graphs=r0_phys,
     )
     report = export_op_structure(s_graphs, native_evidence=True, **options)
+    native_by_node_id: dict[str, dict[str, Any]] = {}
+    for call in report.get("native_calls") or ():
+        if isinstance(call, Mapping) and call.get("node_id"):
+            native_by_node_id[str(call["node_id"])] = dict(call)
     node_by_op: dict[str, dict[str, Any]] = {}
     for node in (*report.get("nodes", ()), *report.get("resource_operators", ())):
         if isinstance(node, Mapping) and node.get("op_id"):
-            node_by_op[str(node["op_id"])] = dict(node)
+            nd = dict(node)
+            nid = str(nd.get("node_id") or "")
+            if nid and nid in native_by_node_id:
+                nd["native_call"] = native_by_node_id[nid]
+            node_by_op[str(nd["op_id"])] = nd
     subgraph_by_op: dict[str, dict[str, Any]] = {}
     for sg in report.get("subgraphs", ()):
         if not isinstance(sg, Mapping):
@@ -978,44 +1016,16 @@ def _timeline_to_raw_records(
     return records
 
 
-def _filter_barriers_and_rewire_preds(records: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    barrier_preds: dict[OpOccurrence, tuple[OpOccurrence, ...]] = {}
-    kept: list[dict[str, Any]] = []
-    for rec in records:
-        dur = max(0.0, float(rec["end_us"]) - float(rec["start_us"]))
-        if str(rec["family"]).lower() == "barrier" and dur <= OVERLAP_EXPOSED_EPS_US:
-            barrier_preds[rec["occurrence"]] = tuple(rec["predecessors"])
-            continue
-        rewired: list[OpOccurrence] = []
-        for pred in rec["predecessors"]:
-            if pred in barrier_preds:
-                rewired.extend(barrier_preds[pred])
-            else:
-                rewired.append(pred)
-        copy = dict(rec)
-        copy["predecessors"] = tuple(dict.fromkeys(rewired))
-        kept.append(copy)
-    return kept
-
-
-def _attach_action_guidance(
-    rows: Sequence[OperatorExportRow],
-    case: Case,
+def _filter_barriers_and_rewire_preds(
+    records: Sequence[Mapping[str, Any]],
     *,
-    phase: str,
-    primitive_table: Any = None,
-) -> list[OperatorExportRow]:
-    from .comparison import build_op_action_guidance
-
-    floors = extract_sku_floors(case, primitive_table=primitive_table)
-    sku_str = str(case.machine.sku or case.machine.name or "")
-    out: list[OperatorExportRow] = []
-    for row in rows:
-        cfg, kern, fw, _ = build_op_action_guidance(
-            row, is_a5_ub=floors.is_a5_ub, phase=phase, hardware_sku=sku_str,
-        )
-        out.append(replace(row, config_howto=cfg, kernel_action=kern, framework_action=fw))
-    return out
+    protected_occurrences: frozenset[OpOccurrence] = frozenset(),
+) -> list[dict[str, Any]]:
+    return resolve_barrier_predecessors(
+        records,
+        protected_occurrences=protected_occurrences,
+        barrier_eps_us=OVERLAP_EXPOSED_EPS_US,
+    )
 
 
 def _row_to_target_node(row: OperatorExportRow, spec: OpSpec | None) -> TargetOpNode:
@@ -1040,6 +1050,10 @@ def _row_to_target_node(row: OperatorExportRow, spec: OpSpec | None) -> TargetOp
         opt_pillar=row.opt_pillar,
         binding_state=row.binding_state,
         spec=spec, synthesis_spec=row.kernel_synthesis_spec,
+        is_shipping_abi=bool(getattr(row, "is_shipping_abi", not row.needs_new_kernel)),
+        stream_core_budget=str(getattr(row, "stream_core_budget", "") or ""),
+        formula_eval=getattr(row, "formula_eval", None),
+        source_ref=row.source_ref,
     )
 
 
@@ -1059,10 +1073,19 @@ def _apply_node_to_row(base_row: OperatorExportRow, node: TargetOpNode) -> Opera
             if (getattr(node, "needs_new_kernel", False) or (synth is not None and not getattr(synth, "shipping_supported", True)))
             else base_row.binding_state
         )
+    extra_fields = _filter_dataclass_kwargs(
+        _OP_ROW_FIELDS,
+        {
+            "is_shipping_abi": bool(getattr(node, "is_shipping_abi", not node.needs_new_kernel)),
+            "stream_core_budget": str(getattr(node, "stream_core_budget", "") or ""),
+            "formula_eval": getattr(node, "formula_eval", None),
+        },
+    )
     return replace(
         base_row,
         ordinal=node.ordinal, occurrence=node.occurrence, op_id=node.op_id,
         family=node.family, recipe=node.recipe, implementation=node.ascend_kernel or base_row.implementation,
+        stream=node.stream, stream_index=node.stream_index,
         predecessors=node.predecessors, start_us=node.start_us, end_us=node.end_us,
         dur_us=node.dur_us, exposed_dur_us=node.exposed_dur_us,
         is_overlapped=node.is_overlapped, masked_by=node.masked_by,
@@ -1078,15 +1101,32 @@ def _apply_node_to_row(base_row: OperatorExportRow, node: TargetOpNode) -> Opera
         kernel_status=node.kernel_status, needs_new_kernel=node.needs_new_kernel,
         new_kernel_spec=node.new_kernel_spec, canonical_op_key=node.canonical_op_key,
         opt_pillar=node.opt_pillar, opt_attainment_pct=att_pct,
+        source_ref=getattr(node, "source_ref", "") or base_row.source_ref,
         kernel_synthesis_spec=synth, binding_state=b_state,
+        **extra_fields,
     )
 
 
 def _attribute_rows_overlap(
-    rows: Sequence[OperatorExportRow], archetypes: Sequence[LayerArchetypeSpec],
+    rows: Sequence[OperatorExportRow],
+    archetypes: Sequence[LayerArchetypeSpec],
+    *,
+    eff_case: Case | None = None,
+    primitive_table: Any = None,
+    op_spec_by_key: Mapping[tuple[int, str], OpSpec] | None = None,
+    use_die_engine: bool = False,
 ) -> tuple[list[OperatorExportRow], tuple[LayerArchetypeSpec, ...]]:
-    nodes = [_row_to_target_node(r, None) for r in rows]
-    attributed, spans = attribute_node_overlap(nodes)
+    spec_map = op_spec_by_key or {}
+    nodes = [_row_to_target_node(r, spec_map.get((0, r.op_id))) for r in rows]
+    if use_die_engine and eff_case is not None and nodes:
+        floors = extract_sku_floors(eff_case, primitive_table=primitive_table)
+        die_sched = schedule_target_graph_on_engine(
+            nodes, eff_case, primitive_table=primitive_table, launch_floor_us=floors.launch_vec_us,
+        )
+        attributed: Sequence[TargetOpNode] = die_sched.nodes
+        spans = die_sched.archetype_spans_us
+    else:
+        attributed, spans = attribute_node_overlap(nodes)
     updated_rows = [_apply_node_to_row(r, n) for r, n in zip(rows, attributed)]
     updated_archs = tuple(replace(a, single_span_us=spans.get(a.archetype_id, 0.0)) for a in archetypes)
     return updated_rows, updated_archs
@@ -1217,6 +1257,7 @@ def _build_prelim_operator_rows(
     struct_by_op: Mapping[str, Mapping[str, Any]],
     subgraph_by_op: Mapping[str, Mapping[str, Any]],
     prepared_work_by_op: Mapping[str, Mapping[str, float]] | None = None,
+    tail_closure: frozenset[OpOccurrence] = frozenset(),
 ) -> tuple[list[OperatorExportRow], list[tuple[int, int, int, int, int]], dict[int, dict[str, Any]]]:
     archetypes_by_id = {a.archetype_id: a for a in archetypes}
     target_arch_by_rep_layer = (
@@ -1235,9 +1276,12 @@ def _build_prelim_operator_rows(
         if occ.stage not in peaks_by_stage:
             peaks_by_stage[occ.stage] = _die_peaks_for_stage(eff_case, occ.stage, 0)
         peaks = peaks_by_stage[occ.stage]
-        arch = _assign_op_archetype(rec["op_id"], spec, archetypes_by_id, target_arch_by_rep_layer)
+        arch = _assign_op_archetype(
+            rec["op_id"], spec, archetypes_by_id, target_arch_by_rep_layer,
+            occurrence=occ, tail_closure=tail_closure,
+        )
         lp = rep_lp_by_idx.get(arch.rep_layer_index) if (arch.scope == "target" and arch.rep_layer_index is not None) else None
-        rep_count = arch.repeat_count if use_archetype_dedup else 1
+        rep_count = 1 if occ in tail_closure else (arch.repeat_count if use_archetype_dedup else 1)
         if use_archetype_dedup and arch.scope == "draft":
             dedup_key = (arch.archetype_id, strip_op_prefix(rec["op_id"]))
             if dedup_key in seen_full_dedup:
@@ -1300,6 +1344,10 @@ def _build_prelim_operator_rows(
             BINDING_STATE_UNBOUND_FORMULA if meta.get("unbound_formula_op") else BINDING_STATE_BOUND
         )
         demands_ns.append(op_demand)
+        row_extras = _filter_dataclass_kwargs(
+            _OP_ROW_FIELDS,
+            {"is_shipping_abi": not bool(desc.needs_new_kernel)},
+        )
         prelim_rows.append(OperatorExportRow(
             ordinal=len(prelim_rows), occurrence=occ, op_id=rec["op_id"],
             layer=layer_idx, layer_label=arch.title, submodule=submodule,
@@ -1326,6 +1374,7 @@ def _build_prelim_operator_rows(
             canonical_op_key=desc.canonical_op_key,
             semantic_atoms=sem_atoms, comm_domain_tag=comm_dom,
             binding_state=op_binding,
+            **row_extras,
         ))
     return prelim_rows, demands_ns, peaks_by_stage
 
@@ -1433,6 +1482,9 @@ def _apply_target_envelope_to_rows(
     tuple[Any, ...],
     str,
     bool,
+    tuple[dict[str, Any], ...],
+    str,
+    Mapping[str, Any],
 ]:
     row_by_occ = {r.occurrence: r for r in prelim_rows}
     row_by_arch: dict[str, OperatorExportRow] = {}
@@ -1453,16 +1505,13 @@ def _apply_target_envelope_to_rows(
         step_request=step_req,
         scenario_case=parsed,
     )
-    new_rows = [
+    out_rows = [
         _apply_node_to_row(
             row_by_occ.get(node.occurrence) or row_by_arch.get(node.archetype_id) or prelim_rows[0],
             node,
         )
         for node in solved.nodes
     ]
-    out_rows = _attach_action_guidance(
-        new_rows, eff_case, phase=step_req.phase, primitive_table=rebound_primitive_table,
-    )
     out_archs = tuple(
         replace(a, single_span_us=solved.archetype_spans_us.get(a.archetype_id, 0.0))
         for a in archetypes
@@ -1471,6 +1520,7 @@ def _apply_target_envelope_to_rows(
         out_rows, list(solved.demands_ns), out_archs,
         solved.synthesis_specs, solved.semantic_audit_triggers,
         solved.rewrite_plan_sha256, solved.verification_passed,
+        solved.applied_edit_receipts, solved.stream_core_budget_summary, solved.moe_route,
     )
 
 
@@ -1514,6 +1564,30 @@ def _resolve_bundle_step_eval(
     )
 
 
+def _prepare_bundle_records(
+    raw_records: Sequence[Mapping[str, Any]],
+    *,
+    archetypes: Sequence[LayerArchetypeSpec],
+    use_archetype_dedup: bool,
+) -> tuple[list[dict[str, Any]], frozenset[OpOccurrence]]:
+    tail_closure = compute_acceptance_tail_closure(raw_records)
+    filtered = _filter_barriers_and_rewire_preds(
+        raw_records, protected_occurrences=tail_closure,
+    )
+    if use_archetype_dedup and tail_closure:
+        layer_indices_by_rep = {
+            int(a.rep_layer_index): tuple(int(i) for i in a.layer_indices)
+            for a in archetypes
+            if a.scope == "target" and a.rep_layer_index is not None and len(a.layer_indices) > 1
+        }
+        filtered, tail_closure = restore_folded_tail_commits(
+            filtered,
+            tail_closure=tail_closure,
+            layer_indices_by_rep_layer=layer_indices_by_rep,
+        )
+    return filtered, tail_closure
+
+
 def build_export_bundle(
     case: CaseInput,
     *,
@@ -1535,6 +1609,7 @@ def build_export_bundle(
     handoff_tpot_ms: float | None = None,
     deployment_total_dies: int | None = None,
     pd_pool_summary: Mapping[str, Any] | None = None,
+    serve_script_supplied: bool = False,
 ) -> ExportBundle:
     """Evaluate unique layer archetypes once on ``runtime.Engine`` into ``ExportBundle``."""
     parsed = case if isinstance(case, Case) else parse_case(dict(case))
@@ -1601,41 +1676,39 @@ def build_export_bundle(
         raw_records = _timeline_to_raw_records(timeline, is_step_eval=False, case=eff_case, op_spec_by_key=op_spec_by_key)
         pipelines = ()
 
-    filtered_records = _filter_barriers_and_rewire_preds(raw_records)
+    filtered_records, tail_closure = _prepare_bundle_records(
+        raw_records, archetypes=archetypes, use_archetype_dedup=use_archetype_dedup,
+    )
     prelim_rows, demands_ns, peaks_by_stage = _build_prelim_operator_rows(
         filtered_records, eff_case=eff_case, archetypes=archetypes, rep_lp_by_idx=rep_lp_by_idx,
         use_archetype_dedup=use_archetype_dedup, sources_by_op=sources_by_op,
         struct_by_op=struct_by_op, subgraph_by_op=subgraph_by_op,
-        prepared_work_by_op=prepared_work_by_op,
+        prepared_work_by_op=prepared_work_by_op, tail_closure=tail_closure,
     )
-    should_synthesize = (
-        True if rewrite_plan is not None
-        else (
-            apply_target_envelope
-            if apply_target_envelope is not None
-            else (track_name == "expected_ideal" and step_eval is None and observations_path is None)
-        )
+    should_synthesize = True if rewrite_plan is not None else (
+        apply_target_envelope if apply_target_envelope is not None
+        else (track_name == "expected_ideal" and step_eval is None and observations_path is None)
     )
     synthesis_specs: tuple[Any, ...] = ()
     audit_triggers: tuple[Any, ...] = ()
-    plan_digest = ""
-    plan_verified = True
+    plan_digest, plan_verified = "", True
+    applied_edit_receipts: tuple[dict[str, Any], ...] = ()
+    stream_core_budget_summary, moe_route_summary = "", {}
     if should_synthesize:
         (
             prelim_rows, demands_ns, archetypes,
             synthesis_specs, audit_triggers, plan_digest, plan_verified,
+            applied_edit_receipts, stream_core_budget_summary, moe_route_summary,
         ) = _apply_target_envelope_to_rows(
-            prelim_rows, demands_ns, archetypes,
-            parsed=parsed, eff_case=eff_case, step_req=step_req,
-            cluster_conc=cluster_conc, op_spec_by_key=op_spec_by_key,
+            prelim_rows, demands_ns, archetypes, parsed=parsed, eff_case=eff_case,
+            step_req=step_req, cluster_conc=cluster_conc, op_spec_by_key=op_spec_by_key,
             peaks_by_stage=peaks_by_stage, ext_plan=ext_plan,
-            rebound_primitive_table=rebound_primitive_table,
-            allow_unbound_formula=allow_unbound_formula,
+            rebound_primitive_table=rebound_primitive_table, allow_unbound_formula=allow_unbound_formula,
         )
     else:
-        prelim_rows, archetypes = _attribute_rows_overlap(prelim_rows, archetypes)
-        prelim_rows = _attach_action_guidance(
-            prelim_rows, eff_case, phase=step_req.phase, primitive_table=rebound_primitive_table,
+        prelim_rows, archetypes = _attribute_rows_overlap(
+            prelim_rows, archetypes, eff_case=eff_case, primitive_table=rebound_primitive_table,
+            op_spec_by_key=op_spec_by_key, use_die_engine=(step_eval is None and observations_path is None),
         )
 
     # Display grouping belongs strictly after target synthesis and DAG dependency attribution.
@@ -1661,6 +1734,10 @@ def build_export_bundle(
         deployment_total_dies=deployment_total_dies,
         pd_pool_summary=pd_pool_summary,
         rebound_primitive_table=rebound_primitive_table,
+        applied_edit_receipts=applied_edit_receipts,
+        stream_core_budget_summary=stream_core_budget_summary,
+        moe_route_summary=moe_route_summary,
+        serve_script_supplied=bool(serve_script_supplied),
     )
 
 
@@ -1670,7 +1747,7 @@ def _build_checkpoint_and_va_summary(
     scen: Mapping[str, Any],
     seq_count: int,
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
-    hw_fam = normalize_hw_family(str(parsed.machine.sku or parsed.machine.name or "a5"))
+    hw_fam = normalize_hw_family(str(parsed.machine.sku or parsed.machine.name or resolve_arch_family_tag(parsed)))
     ckpt = resolve_default_checkpoint(str(parsed.model.name), hw_family=hw_fam)
     ckpt_summary = (
         {
@@ -1763,6 +1840,85 @@ def _build_bundle_memory_and_sla(
     return mem_ledger, eff_handoff, sla_slack, sla_regime, macro_wall
 
 
+def _resolve_graph_capture_mode(parsed: Case) -> str:
+    explicit = str(getattr(parsed.runtime, "graph_capture_mode", "") or "").strip()
+    if explicit:
+        return explicit
+    meta = dict(parsed.runtime.metadata)
+    comp = meta.get("compilation_config")
+    if isinstance(comp, Mapping):
+        cg_mode = str(comp.get("cudagraph_mode") or comp.get("mode") or "").strip()
+        if cg_mode:
+            return cg_mode
+    return "none"
+
+
+def _build_effective_config_dict(
+    parsed: Case,
+    mem_ledger: Any,
+    scen: Mapping[str, Any],
+    *,
+    graph_capture_mode: str,
+    track_name: str,
+    stream_core_budget_summary: str,
+    moe_route_summary: Mapping[str, Any],
+    serve_script_supplied: bool,
+) -> dict[str, Any]:
+    p = parsed.runtime.parallel
+    meta = dict(parsed.runtime.metadata)
+    return {
+        "hardware_sku": str(parsed.machine.sku or parsed.machine.name),
+        "arch_family": resolve_arch_family_tag(parsed),
+        "tp": int(p.tp),
+        "dp": int(p.dp),
+        "ep": int(p.ep),
+        "pp": int(p.pp),
+        "dcp": int(p.cp),
+        "pcp": int(p.pcp),
+        "graph_capture_mode": graph_capture_mode,
+        "feature_track": track_name,
+        "weight_quant": str(getattr(mem_ledger, "weight_quant", "") or ""),
+        "cache_dtype": str(getattr(mem_ledger, "cache_dtype", "") or ""),
+        "spec_method": str(scen.get("spec_method", "None")),
+        "spec_proposals": int(scen.get("spec_proposals", 0) or 0),
+        "multistream_overlap_shared_expert": bool(
+            moe_route_summary.get("multistream_overlap_shared_expert")
+            if moe_route_summary else meta.get("multistream_overlap_shared_expert", False)
+        ),
+        "enable_fused_mc2": int(moe_route_summary.get("enable_fused_mc2", 0) or 0) if moe_route_summary else 0,
+        "moe_route": dict(moe_route_summary) if moe_route_summary else {},
+        "stream_core_budget": stream_core_budget_summary,
+        "serve_script_supplied": bool(serve_script_supplied),
+    }
+
+
+def _build_bundle_gap_radar(
+    final_rows: Sequence[OperatorExportRow],
+    rank_order: Sequence[int],
+    *,
+    step_span_us: float,
+    top_k_radar: int,
+) -> tuple[GapRadarRow, ...]:
+    return tuple(
+        GapRadarRow(
+            rank=final_rows[idx].gap_radar_rank,
+            layer_label=final_rows[idx].archetype_title or final_rows[idx].layer_label,
+            submodule=final_rows[idx].submodule, op_id=final_rows[idx].op_id,
+            family=final_rows[idx].family,
+            implementation=final_rows[idx].ascend_kernel or final_rows[idx].implementation,
+            dominant_bound=final_rows[idx].bound_display or final_rows[idx].dominant_bound,
+            l_star_lean_us=final_rows[idx].l_star_lean_us * final_rows[idx].repeat_count,
+            pred_us=final_rows[idx].exposed_dur_us * final_rows[idx].repeat_count,
+            gap_us=final_rows[idx].gap_us * final_rows[idx].repeat_count,
+            gap_ratio=final_rows[idx].gap_ratio,
+            share_of_step_pct=(100.0 * final_rows[idx].exposed_dur_us * final_rows[idx].repeat_count / step_span_us if step_span_us > 0.0 else 0.0),
+            repeat_count=final_rows[idx].repeat_count,
+            logical_role=final_rows[idx].logical_role, kernel_status=final_rows[idx].kernel_status,
+        )
+        for idx in rank_order[: max(1, int(top_k_radar))]
+    )
+
+
 def _assemble_export_bundle(
     *, parsed: Case, eff_case: Case, step_req: StepRequest, step_eval: StepEvaluation | None,
     seq_count: int, cluster_conc: int, graph_id: str, pipelines: tuple[FusedPipelineDescriptor, ...],
@@ -1780,6 +1936,10 @@ def _assemble_export_bundle(
     deployment_total_dies: int | None = None,
     pd_pool_summary: Mapping[str, Any] | None = None,
     rebound_primitive_table: Any = None,
+    applied_edit_receipts: tuple[dict[str, Any], ...] = (),
+    stream_core_budget_summary: str = "",
+    moe_route_summary: Mapping[str, Any] = (),
+    serve_script_supplied: bool = False,
 ) -> ExportBundle:
     exposed_total_us = sum(r.exposed_dur_us * r.repeat_count for r in final_rows)
     if use_archetype_dedup or target_envelope_applied:
@@ -1795,23 +1955,8 @@ def _assemble_export_bundle(
     cube_mfu, vec_mfu, hbm_mbu, link_util, net_roof, exposed_us, b_mix = _compute_network_efficiency_summary(
         final_rows, step_span_us, p0,
     )
-    gap_radar = tuple(
-        GapRadarRow(
-            rank=final_rows[idx].gap_radar_rank,
-            layer_label=final_rows[idx].archetype_title or final_rows[idx].layer_label,
-            submodule=final_rows[idx].submodule, op_id=final_rows[idx].op_id,
-            family=final_rows[idx].family,
-            implementation=final_rows[idx].ascend_kernel or final_rows[idx].implementation,
-            dominant_bound=final_rows[idx].bound_display or final_rows[idx].dominant_bound,
-            l_star_lean_us=final_rows[idx].l_star_lean_us * final_rows[idx].repeat_count,
-            pred_us=final_rows[idx].exposed_dur_us * final_rows[idx].repeat_count,
-            gap_us=final_rows[idx].gap_us * final_rows[idx].repeat_count,
-            gap_ratio=final_rows[idx].gap_ratio,
-            share_of_step_pct=(100.0 * final_rows[idx].exposed_dur_us * final_rows[idx].repeat_count / step_span_us if step_span_us > 0.0 else 0.0),
-            repeat_count=final_rows[idx].repeat_count,
-            logical_role=final_rows[idx].logical_role, kernel_status=final_rows[idx].kernel_status,
-        )
-        for idx in rank_order[: max(1, int(top_k_radar))]
+    gap_radar = _build_bundle_gap_radar(
+        final_rows, rank_order, step_span_us=step_span_us, top_k_radar=top_k_radar,
     )
     scen = _extract_scenario_meta(parsed, step_req, final_rows)
     step_s = max(step_span_us / US_PER_SECOND, MIN_POSITIVE_SECONDS)
@@ -1840,9 +1985,8 @@ def _assemble_export_bundle(
     ckpt_summary, va_summary = _build_checkpoint_and_va_summary(parsed, mem_ledger, scen, seq_count)
     d0 = parsed.machine.dies[0]
     d_bufs = dict(d0.buffers)
-    aiv_cnt = int(d0.owner_count("vector") or 0)
     die_summary = (
-        f"AIC={d0.aic_count}, AIV={aiv_cnt}, "
+        f"AIC={d0.aic_count}, AIV={int(d0.owner_count('vector') or 0)}, "
         f"L2={int(d_bufs.get('l2', 0)) // MIB_BYTES} MiB, "
         f"UB={int(d_bufs.get('ub', 0)) // KIB_BYTES} KiB, "
         f"HBM={hw_peaks_summary['hbm_peak_bytes_per_s'] / TB_BYTES:.2f} TB/s"
@@ -1855,11 +1999,7 @@ def _assemble_export_bundle(
     active_ids = {r.archetype_id for r in final_rows}
     filtered_schedule = tuple(e for e in full_schedule if e.archetype_id in active_ids) if use_archetype_dedup else ()
     has_unbound = any(r.binding_state == BINDING_STATE_UNBOUND_FORMULA for r in final_rows)
-    bundle_mode = (
-        MODE_MODELING
-        if ((target_envelope_applied and allow_unbound_formula) or track_name == "expected_ideal")
-        else MODE_SIMULATION
-    )
+    bundle_mode = MODE_MODELING if ((target_envelope_applied and allow_unbound_formula) or track_name == "expected_ideal") else MODE_SIMULATION
     has_measured_match = reconcile_summary is not None and int(reconcile_summary.matched_sim_ops) > 0
     bundle_binding = (
         BINDING_STATE_UNBOUND_FORMULA if has_unbound
@@ -1872,12 +2012,27 @@ def _assemble_export_bundle(
         else (eff_pd_pool.get("used_dies") if eff_pd_pool else meta_dict.get("deployment_total_dies"))
     )
     eff_dep_dies = max(0, int(raw_dep_dies or 0))
+    graph_mode = _resolve_graph_capture_mode(parsed)
+    eff_cfg = _build_effective_config_dict(
+        parsed, mem_ledger, scen, graph_capture_mode=graph_mode, track_name=track_name,
+        stream_core_budget_summary=stream_core_budget_summary,
+        moe_route_summary=moe_route_summary if isinstance(moe_route_summary, Mapping) else {},
+        serve_script_supplied=serve_script_supplied,
+    )
     from mindie_sim.prediction.efficiency.cost import CostModel
 
     cal_basis = CostModel(
         eff_case,
         primitive_table=(None if rebound_primitive_table is False else rebound_primitive_table),
     ).summary().get("calibration_basis")
+    bundle_extras = _filter_dataclass_kwargs(
+        _BUNDLE_FIELDS,
+        {
+            "applied_edit_receipts": applied_edit_receipts,
+            "effective_config": eff_cfg,
+            "serve_script_supplied": bool(serve_script_supplied),
+        },
+    )
     return ExportBundle(
         schema=EXPORT_BUNDLE_SCHEMA, model_name=str(parsed.model.name),
         hardware_sku=str(parsed.machine.sku or parsed.machine.name),
@@ -1895,28 +2050,19 @@ def _assemble_export_bundle(
         archetypes=tuple(a for a in archetypes if a.archetype_id in active_ids),
         full_trace_schedule=filtered_schedule,
         total_target_layers=total_target_layers, total_draft_layers=total_draft_layers,
-        graph_capture_mode=str(parsed.runtime.graph_capture_mode or "full"),
+        graph_capture_mode=graph_mode,
         feature_track=track_name, hardware_die_summary=die_summary,
         target_envelope_applied=target_envelope_applied,
-        n_tok_per_die=n_tok_per_die,
-        us_per_tok_die=us_per_tok_die,
-        sla_regime=sla_regime,
-        sla_slack_ms=sla_slack,
-        kernel_synthesis_specs=synthesis_specs,
-        semantic_audit_triggers=audit_triggers,
-        macro_wall_trigger=macro_wall,
-        rewrite_plan_sha256=rewrite_plan_sha256,
+        n_tok_per_die=n_tok_per_die, us_per_tok_die=us_per_tok_die,
+        sla_regime=sla_regime, sla_slack_ms=sla_slack,
+        kernel_synthesis_specs=synthesis_specs, semantic_audit_triggers=audit_triggers,
+        macro_wall_trigger=macro_wall, rewrite_plan_sha256=rewrite_plan_sha256,
         rewrite_verification_passed=rewrite_verification_passed,
-        recommended_checkpoint=ckpt_summary,
-        va_serving_rules_summary=va_summary,
-        analysis_mode=bundle_mode,
-        binding_state=bundle_binding,
-        has_unbound_formula_ops=has_unbound,
-        handoff_tpot_ms=eff_handoff,
-        cluster_concurrency=eff_cluster_conc,
-        deployment_total_dies=eff_dep_dies,
-        pd_pool_summary=eff_pd_pool,
-        calibration_basis=cal_basis,
-        **scen,
+        recommended_checkpoint=ckpt_summary, va_serving_rules_summary=va_summary,
+        analysis_mode=bundle_mode, binding_state=bundle_binding,
+        has_unbound_formula_ops=has_unbound, handoff_tpot_ms=eff_handoff,
+        cluster_concurrency=eff_cluster_conc, deployment_total_dies=eff_dep_dies,
+        pd_pool_summary=eff_pd_pool, calibration_basis=cal_basis,
+        **scen, **bundle_extras,
     )
 

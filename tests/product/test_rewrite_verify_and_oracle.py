@@ -1006,18 +1006,23 @@ def test_oneshot_collective_pricing_respects_switched_egress_wire_demand():
     assert res_large.nodes[0].dur_us == pytest.approx(ring_us)
     assert "One-Shot" not in res_large.nodes[0].ascend_kernel
 
-    # Small 4 KiB AllReduce on TP=8: OneShot beats 14-hop ring latency and legitimately improves duration.
+    from mindie_sim.rewrite import CollectiveTransform, Edit, OpRef, RewritePlan
     msg_small = float(4 * 1024)
-    ring_link_small = msg_small * (2.0 * 7.0 / 8.0)
-    ar_small = replace(ar_large, op_id="s0.l0.ar_small", local_shape=(1, 2048), link_bytes=ring_link_small)
+    ar_small = replace(ar_large, op_id="s0.l0.ar_small", local_shape=(1, 2048), link_bytes=msg_small * (2.0 * 7.0 / 8.0))
     ring_small_us = _price_collective_on_topology(ar_small, ctx, case, mode="ring")
     oneshot_small_us = _price_collective_on_topology(ar_small, ctx, case, mode="oneshot")
-    assert ring_small_us is not None and oneshot_small_us is not None
-    assert oneshot_small_us < ring_small_us
+    assert ring_small_us is not None and oneshot_small_us is not None and oneshot_small_us < ring_small_us
     n_small = _mk_target_node(0, ar_small, task_type="HCCL", dur_us=ring_small_us, l_star_us=0.5, bound="link_bound")
-    res_small = solve_target_graph((n_small,), ((0, 0, 0, 0, 500),), case, peaks, allow_unbound_formula=False)
-    assert res_small.nodes[0].dur_us < ring_small_us
-    assert "One-Shot" in res_small.nodes[0].ascend_kernel
+    res_auto = solve_target_graph((n_small,), ((0, 0, 0, 0, 500),), case, peaks, allow_unbound_formula=False)
+    assert res_auto.nodes[0].dur_us == pytest.approx(ring_small_us) and "One-Shot" not in res_auto.nodes[0].ascend_kernel
+    case_mesh = parse_case(compose_case("qwen3-32b", REPRESENTATIVE_SKUS["a5"], tp=8, dp=1, layers=1))
+    mesh_peaks = {0: {"hbm_peak_bytes_per_s": dict(case_mesh.machine.dies[0].rates)["hbm"]}}
+    ring_m = _price_collective_on_topology(ar_small, _TargetPricingContext(case_mesh), case_mesh, mode="ring")
+    assert ring_m is not None
+    n_m = _mk_target_node(0, ar_small, task_type="HCCL", dur_us=ring_m, l_star_us=0.5, bound="link_bound")
+    plan_small = RewritePlan(edits=(Edit("os_small", operation=CollectiveTransform(OpRef("atom", "s0.l0.ar_small"), "oneshot", case_mesh.machine.links[0].name)),))
+    res_small = solve_target_graph((n_m,), ((0, 0, 0, 0, 500),), case_mesh, mesh_peaks, rewrite_plan=plan_small, allow_unbound_formula=False)
+    assert res_small.nodes[0].dur_us < ring_m and "oneshot" in res_small.nodes[0].ascend_kernel.lower()
 
     # AllGather on TP=8 splits M/(G-1) per peer so oneshot stays well-defined and finite.
     ag_op = replace(ar_small, op_id="s0.l0.ag", family="allgather", link_bytes=msg_large * (7.0 / 8.0))
@@ -1399,8 +1404,9 @@ def test_oneshot_selection_reconciles_link_ledger_with_executed_sends():
         assert node.l_star_lean_us == pytest.approx(max(dem) / 1000.0)
         assert node.gap_us == pytest.approx(max(0.0, node.dur_us - node.l_star_lean_us))
 
-    # Automatic selection: TP8 4 KiB AllReduce, ring ledger 1.75*M -> one-shot sends M to 7 peers.
-    case8 = parse_case(compose_case("qwen3-32b", REPRESENTATIVE_SKUS["a3"], tp=8, dp=1, layers=1))
+    # D6: automatic path preserves baseline ring without After-only pure-comm OneShot promotion;
+    # explicit CollectiveTransform on TP8 reconciles one-shot sends (M to 7 peers).
+    case8 = parse_case(compose_case("qwen3-32b", REPRESENTATIVE_SKUS["a5"], tp=8, dp=1, layers=1))
     peaks8 = {0: {"hbm_peak_bytes_per_s": dict(case8.machine.dies[0].rates)["hbm"], "link_peak_bytes_per_s": link_rate}}
     msg = float(4 * 1024)
     ar = OpSpec(
@@ -1409,8 +1415,11 @@ def test_oneshot_selection_reconciles_link_ledger_with_executed_sends():
         dtype="bf16", link_bytes=msg * (2.0 * 7.0 / 8.0), link_scope="tp", metadata=(("group_axis", "tp"),),
     )
     n_ar = _mk_target_node(0, ar, task_type="HCCL", dur_us=200.0, l_star_us=0.5, bound="link_bound")
-    res = solve_target_graph((n_ar,), ((0, 0, 0, 0, 500),), case8, peaks8, allow_unbound_formula=False)
-    assert "One-Shot" in res.nodes[0].ascend_kernel
+    res_auto = solve_target_graph((n_ar,), ((0, 0, 0, 0, 500),), case8, peaks8, allow_unbound_formula=False)
+    assert "One-Shot" not in res_auto.nodes[0].ascend_kernel
+    plan8 = RewritePlan(edits=(Edit("os8", operation=CollectiveTransform(OpRef("atom", "s0.l0.ar"), "oneshot", case8.machine.links[0].name)),))
+    res = solve_target_graph((n_ar,), ((0, 0, 0, 0, 500),), case8, peaks8, rewrite_plan=plan8, allow_unbound_formula=False)
+    assert "oneshot" in res.nodes[0].ascend_kernel.lower()
     _check(res.nodes[0], res.demands_ns[0], res.nodes[0].link_bytes, 7.0 * msg)
 
     # Explicit CollectiveTransform: TP4 on framed one-credit link (1,024 B -> 3 x 400 B = 1,200 B wire/peer).

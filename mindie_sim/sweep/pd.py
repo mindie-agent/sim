@@ -29,6 +29,10 @@ from mindie_sim.catalog.context_parallel import (
     legal_vllm_ascend_dcp_values,
     validate_vllm_ascend_dcp_codomain,
 )
+from mindie_sim.optimization.causal_tail import (
+    compute_acceptance_tail_closure,
+    resolve_barrier_predecessors,
+)
 from mindie_sim.optimization.dual_bound import NS_PER_SECOND, inward_floor_ns
 from mindie_sim.optimization.kernel_synthesis import (
     TargetOpNode,
@@ -443,6 +447,7 @@ def _eval_prefill_with_plan(
     hit_tokens: int,
     min_layers: int,
     rep_info: tuple[CaseSpec, dict[int, int], float] | None = None,
+    eval_ctx_box: list[EvaluationContext | None] | None = None,
     reclaim_on_exit: bool = True,
     apply_target_envelope: bool = False,
     rewrite_plan: Any = None,
@@ -453,7 +458,8 @@ def _eval_prefill_with_plan(
     try:
         ms = _prefill_step_ms(
             parsed, compute_tokens=compute_tokens, hit_tokens=hit_tokens,
-            min_layers=min_layers, rep_info=rep_info, reclaim_on_exit=reclaim_on_exit,
+            min_layers=min_layers, rep_info=rep_info, eval_ctx_box=eval_ctx_box,
+            reclaim_on_exit=reclaim_on_exit,
             apply_target_envelope=apply_target_envelope,
             rewrite_plan=rewrite_plan,
             allow_unbound_formula=allow_unbound_formula,
@@ -463,7 +469,8 @@ def _eval_prefill_with_plan(
         if allow_plan_fallback and rewrite_plan is not None and _is_plan_phase_mismatch(exc):
             ms = _prefill_step_ms(
                 parsed, compute_tokens=compute_tokens, hit_tokens=hit_tokens,
-                min_layers=min_layers, rep_info=rep_info, reclaim_on_exit=reclaim_on_exit,
+                min_layers=min_layers, rep_info=rep_info, eval_ctx_box=eval_ctx_box,
+                reclaim_on_exit=reclaim_on_exit,
                 apply_target_envelope=apply_target_envelope,
                 rewrite_plan=None,
                 allow_unbound_formula=allow_unbound_formula,
@@ -1292,6 +1299,27 @@ def _colocated_infeasible_row(
     }
 
 
+def _colocated_prefill_only_row(
+    par: ParallelSpec, *, used_dies: int, mtp_tokens: int, p_step: float,
+    output_tokens: int, feasible: bool,
+) -> dict[str, Any]:
+    rps = (par.dp * MS_PER_S) / max(p_step, PARETO_EPS) if feasible else 0.0
+    e2e_tps = rps * float(output_tokens)
+    e2e_per_die = e2e_tps / float(used_dies)
+    return {
+        "deployment_mode": "colocated", "used_dies": used_dies, "parallel": par.to_dict(),
+        "mtp_proposal_tokens": mtp_tokens, "ttft_ms": p_step, "decode_step_ms": 0.0,
+        "effective_tpot_ms": 0.0, "b_feasible": 1 if feasible else 0,
+        "b_vram_max": 1 if feasible else 0, "sustainable_rps": rps,
+        "sustainable_tps": e2e_tps, "sustainable_tps_per_die": e2e_per_die,
+        "decode_tps_per_die": 0.0, "e2e_total_tps": e2e_tps, "e2e_tps_per_die": e2e_per_die,
+        "avg_accepted_tokens": 1.0, "n_tok_per_die": 0.0, "us_per_tok_die": 0.0,
+        "unused_sla_slack_ms": 0.0, "operating_regime": "SLA_LATENCY_BOUND",
+        "free_hbm_headroom_gib": 0.0, "dcp_codomain_valid": True, "dcp_codomain_reason": None,
+        "feasible": feasible, "infeasible_reason": None if feasible else "prefill_sla_or_oom",
+    }
+
+
 def _evaluate_colocated_candidate(
     raw_case: Mapping[str, Any],
     *,
@@ -1330,69 +1358,66 @@ def _evaluate_colocated_candidate(
             reason="prefill_hbm_oom", regime="HBM_CAPACITY_BOUND",
         )
     rep_info = build_archetype_representative_case(parsed, min_layers=ARCHETYPE_FOLD_MIN_LAYERS)
-    # Exact finalist always prices the prompt: an omitted TTFT bound removes the
-    # SLA check, not the prefill service time that TTFT and end-to-end TPS consume.
-    p_step, prefill_plan_matched = _eval_prefill_with_plan(
-        parsed, compute_tokens=prompt_tokens, hit_tokens=0,
-        min_layers=ARCHETYPE_FOLD_MIN_LAYERS,
-        rep_info=rep_info,
-        apply_target_envelope=apply_target_envelope,
-        rewrite_plan=rewrite_plan,
-        allow_unbound_formula=allow_unbound_formula,
-        allow_plan_fallback=(output_tokens > 1),
-    )
-    ttft_ok = bool(p_step <= ttft_sla_ms)
     decode_tokens = max(0, output_tokens - 1)
-    if decode_tokens == 0:
-        feasible = bool(dcp_ok and prefill_hbm_ok and ttft_ok)
-        rps = (par.dp * MS_PER_S) / max(p_step, PARETO_EPS) if feasible else 0.0
-        e2e_tps = rps * float(output_tokens)
-        e2e_per_die = e2e_tps / float(used_dies)
-        return {
-            "deployment_mode": "colocated", "used_dies": used_dies, "parallel": par.to_dict(),
-            "mtp_proposal_tokens": mtp_tokens, "ttft_ms": p_step, "decode_step_ms": 0.0,
-            "effective_tpot_ms": 0.0,
-            "b_feasible": 1 if feasible else 0, "b_vram_max": 1 if feasible else 0,
-            "sustainable_rps": rps,
-            "sustainable_tps": e2e_tps,
-            "sustainable_tps_per_die": e2e_per_die,
-            "decode_tps_per_die": 0.0,
-            "e2e_total_tps": e2e_tps,
-            "e2e_tps_per_die": e2e_per_die,
-            "avg_accepted_tokens": 1.0, "n_tok_per_die": 0.0, "us_per_tok_die": 0.0,
-            "unused_sla_slack_ms": 0.0, "operating_regime": "SLA_LATENCY_BOUND",
-            "free_hbm_headroom_gib": 0.0,
-            "dcp_codomain_valid": True, "dcp_codomain_reason": None,
-            "feasible": feasible, "infeasible_reason": None if feasible else "prefill_sla_or_oom",
-        }
-    _, emit_est = _resolve_speculative_tokens(
-        parsed, output_budget=output_tokens, tokens_per_seq=None, emitted_tokens_per_seq=None,
-    )
+    ctx_box: list[EvaluationContext | None] = [None]
     try:
-        d_sla = _solve_sla_archetype_aware(
-            parsed, sla_ms=tpot_sla_ms * max(1.0, float(emit_est)),
-            context=prompt_tokens, output_budget=output_tokens,
-            max_sequences_per_dp=max_sequences_per_dp,
-            workspace_tokens=prefill_ws,
-            rep_info=rep_info, probe_cache=probe_cache,
-            apply_target_envelope=apply_target_envelope,
-            rewrite_plan=rewrite_plan,
-            allow_unbound_formula=allow_unbound_formula,
+        if decode_tokens == 0:
+            p_step, _ = _eval_prefill_with_plan(
+                parsed, compute_tokens=prompt_tokens, hit_tokens=0,
+                min_layers=ARCHETYPE_FOLD_MIN_LAYERS, rep_info=rep_info, eval_ctx_box=ctx_box,
+                apply_target_envelope=apply_target_envelope, rewrite_plan=rewrite_plan,
+                allow_unbound_formula=allow_unbound_formula, allow_plan_fallback=False,
+            )
+            feasible = bool(dcp_ok and prefill_hbm_ok and (p_step <= ttft_sla_ms))
+            return _colocated_prefill_only_row(
+                par, used_dies=used_dies, mtp_tokens=mtp_tokens,
+                p_step=p_step, output_tokens=output_tokens, feasible=feasible,
+            )
+
+        _, emit_est = _resolve_speculative_tokens(
+            parsed, output_budget=output_tokens, tokens_per_seq=None, emitted_tokens_per_seq=None,
         )
-    except (ModelingError, ValueError) as exc:
-        if not (prefill_plan_matched and _is_plan_phase_mismatch(exc)):
-            raise
-        d_sla = _solve_sla_archetype_aware(
-            parsed, sla_ms=tpot_sla_ms * max(1.0, float(emit_est)),
-            context=prompt_tokens, output_budget=output_tokens,
-            max_sequences_per_dp=max_sequences_per_dp,
-            workspace_tokens=prefill_ws,
-            rep_info=rep_info, probe_cache=probe_cache,
-            apply_target_envelope=apply_target_envelope,
-            rewrite_plan=None,
-            allow_unbound_formula=allow_unbound_formula,
+        defer_prefill = math.isinf(ttft_sla_ms) and rewrite_plan is None
+        p_step, prefill_plan_matched = (0.0, False) if defer_prefill else _eval_prefill_with_plan(
+            parsed, compute_tokens=prompt_tokens, hit_tokens=0,
+            min_layers=ARCHETYPE_FOLD_MIN_LAYERS, rep_info=rep_info, eval_ctx_box=ctx_box,
+            apply_target_envelope=apply_target_envelope, rewrite_plan=rewrite_plan,
+            allow_unbound_formula=allow_unbound_formula, allow_plan_fallback=True,
         )
-    scen = d_sla["scenarios"][0]
+        try:
+            d_sla = _solve_sla_archetype_aware(
+                parsed, sla_ms=tpot_sla_ms * max(1.0, float(emit_est)),
+                context=prompt_tokens, output_budget=output_tokens,
+                max_sequences_per_dp=max_sequences_per_dp, workspace_tokens=prefill_ws,
+                rep_info=rep_info, probe_cache=probe_cache, eval_ctx_box=ctx_box,
+                apply_target_envelope=apply_target_envelope, rewrite_plan=rewrite_plan,
+                allow_unbound_formula=allow_unbound_formula,
+            )
+        except (ModelingError, ValueError) as exc:
+            if not (prefill_plan_matched and _is_plan_phase_mismatch(exc)):
+                raise
+            d_sla = _solve_sla_archetype_aware(
+                parsed, sla_ms=tpot_sla_ms * max(1.0, float(emit_est)),
+                context=prompt_tokens, output_budget=output_tokens,
+                max_sequences_per_dp=max_sequences_per_dp, workspace_tokens=prefill_ws,
+                rep_info=rep_info, probe_cache=probe_cache, eval_ctx_box=ctx_box,
+                apply_target_envelope=apply_target_envelope, rewrite_plan=None,
+                allow_unbound_formula=allow_unbound_formula,
+            )
+        scen = d_sla["scenarios"][0]
+        if defer_prefill and int(scen["b_feasible"]) >= 1:
+            p_step, _ = _eval_prefill_with_plan(
+                parsed, compute_tokens=prompt_tokens, hit_tokens=0,
+                min_layers=ARCHETYPE_FOLD_MIN_LAYERS, rep_info=rep_info, eval_ctx_box=ctx_box,
+                apply_target_envelope=apply_target_envelope, rewrite_plan=None,
+                allow_unbound_formula=allow_unbound_formula, allow_plan_fallback=True,
+            )
+        ttft_ok = bool(p_step <= ttft_sla_ms)
+    finally:
+        if ctx_box[0] is not None:
+            ctx_box[0] = None
+            if len(parsed.machine.dies) >= GC_RECLAIM_MIN_WORLD_SIZE or int(par.dp) > 1:
+                _reclaim_sweep_memory()
     emitted = float(d_sla["emitted_tokens_per_seq"])
     b_feasible = int(scen["b_feasible"])
     b_vram = int(scen.get("b_vram_max", b_feasible) or 0)
@@ -1759,7 +1784,7 @@ def _prepare_target_records(
     eff_case: CaseSpec,
     timeline_rows: Sequence[Mapping[str, Any]],
     spec_by_id: Mapping[str, Any],
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], frozenset[OpOccurrence]]:
     width = max(1, int(eff_case.runtime.parallel.tp) * int(eff_case.runtime.parallel.pcp))
     raw_recs: list[dict[str, Any]] = []
     occ_by_node: dict[str, OpOccurrence] = {}
@@ -1789,23 +1814,13 @@ def _prepare_target_records(
             "raw_preds": tuple(row.get("predecessors") or ()),
             "start_us": start_us, "end_us": end_us,
         })
-    barrier_preds: dict[OpOccurrence, tuple[OpOccurrence, ...]] = {}
-    kept: list[dict[str, Any]] = []
     for rec in raw_recs:
-        preds = tuple(occ_by_node[p_id] for p_id in rec["raw_preds"] if p_id in occ_by_node)
-        dur = max(0.0, float(rec["end_us"]) - float(rec["start_us"]))
-        if str(rec["family"]).lower() == "barrier" and dur <= OVERLAP_BARRIER_EPS_US:
-            barrier_preds[rec["occurrence"]] = preds
-            continue
-        rewired: list[OpOccurrence] = []
-        for pred in preds:
-            if pred in barrier_preds:
-                rewired.extend(barrier_preds[pred])
-            else:
-                rewired.append(pred)
-        rec["predecessors"] = tuple(dict.fromkeys(rewired))
-        kept.append(rec)
-    return kept
+        rec["predecessors"] = tuple(occ_by_node[p_id] for p_id in rec.pop("raw_preds", ()) if p_id in occ_by_node)
+    tail_closure = compute_acceptance_tail_closure(raw_recs)
+    kept = resolve_barrier_predecessors(
+        raw_recs, protected_occurrences=tail_closure, barrier_eps_us=OVERLAP_BARRIER_EPS_US,
+    )
+    return kept, tail_closure
 
 
 _REWRITE_PLAN_ERROR_TOKENS = (
@@ -1868,7 +1883,7 @@ def _solve_target_step_ms(
     scenario_case: CaseSpec | None = None,
 ) -> float:
     """Evaluate rewritten target graph via ``solve_target_graph`` and return exposed step ms."""
-    kept = _prepare_target_records(eff_case, timeline_rows, spec_by_id)
+    kept, tail_closure = _prepare_target_records(eff_case, timeline_rows, spec_by_id)
     if not kept:
         return 0.0
     peaks_by_stage: dict[int, dict[str, Any]] = {}
@@ -1884,7 +1899,10 @@ def _solve_target_step_ms(
         oid = rec["op_id"]
         is_draft = _is_draft_op(spec, rec)
         lyr = spec.layer if (spec is not None and spec.layer is not None) else rec["row_layer"]
-        if is_draft:
+        if occ in tail_closure:
+            arch_id = "target_tail"
+            rep_count = max(1, int(layer_weights.get(int(lyr), 1))) if (lyr is not None and int(lyr) >= 0) else 1
+        elif is_draft:
             arch_id = "draft_arch_0" if (lyr is not None and int(lyr) >= 0) else "draft_misc"
             rep_count = max(1, int(round(draft_scale))) if (lyr is not None and int(lyr) >= 0) else 1
         elif lyr is not None and int(lyr) >= 0:
@@ -1952,6 +1970,7 @@ def _expand_reduced_timeline_ms(
     draft_scale: float,
     *,
     draft_op_ids: frozenset[str] = frozenset(),
+    tail_op_ids: frozenset[str] = frozenset(),
 ) -> float:
     stage_layer_end: dict[int, dict[int, float]] = {}
     stage_layer_dep_start: dict[int, dict[int, float]] = {}
@@ -1959,6 +1978,7 @@ def _expand_reduced_timeline_ms(
     draft_dep_start: float | None = None
     draft_any_start: float | None = None
     draft_end: float | None = None
+    extra_tail = 0.0
     for occ in timeline_rows:
         if not isinstance(occ, Mapping) or int(occ.get("replica", 0) or 0) != 0:
             continue
@@ -1975,6 +1995,10 @@ def _expand_reduced_timeline_ms(
             draft_end = en if draft_end is None else max(draft_end, en)
             continue
         lyr = occ.get("layer")
+        if op_id in tail_op_ids:
+            if lyr is not None and int(lyr) >= 0:
+                extra_tail += float(max(0, int(layer_weights.get(int(lyr), 1)) - 1)) * max(0.0, en - st)
+            continue
         if lyr is None or int(lyr) < 0:
             continue
         stage_id = int(occ.get("stage", 0) or 0)
@@ -2011,7 +2035,7 @@ def _expand_reduced_timeline_ms(
         (draft_scale - 1.0) * max(0.0, draft_end - draft_start)
         if (draft_scale > 1.0 and draft_start is not None and draft_end is not None) else 0.0
     )
-    return rep_total + extra_target + extra_draft
+    return rep_total + extra_target + extra_tail + extra_draft
 
 
 def _archetype_weighted_step_ms(
@@ -2079,7 +2103,7 @@ def _archetype_weighted_step_ms(
         if isinstance(graphs, TargetGraphSet) else {0: graphs[0]}
     ) if rank_zero_graph_reuse(eff_case.runtime.parallel, len(graphs), has_kg) else graphs
     draft_op_ids = frozenset(op.op_id for op in graphs[0] if _is_draft_op(op)) if reduced else frozenset()
-    spec_by_id = {op.op_id: op for op in graphs[0]} if use_target else {}
+    spec_by_id = {op.op_id: op for op in graphs[0]} if need_timeline else {}
     rebound_pt = eval_ctx.bindings.primitive_table if use_target else None
     try:
         graph = graph_costs(
@@ -2095,10 +2119,14 @@ def _archetype_weighted_step_ms(
             del eval_ctx
             if reclaim_on_exit and (len(parsed.machine.dies) >= GC_RECLAIM_MIN_WORLD_SIZE or int(parsed.runtime.parallel.dp) > 1):
                 _reclaim_sweep_memory()
+    tail_op_ids: frozenset[str] = frozenset()
+    if reduced and timeline_rows:
+        _, tc = _prepare_target_records(eff_case, timeline_rows, spec_by_id)
+        tail_op_ids = frozenset(occ.op_id for occ in tc)
     baseline_ms = (
         _expand_reduced_timeline_ms(
             rep_total, timeline_rows, layer_weights, draft_scale,
-            draft_op_ids=draft_op_ids,
+            draft_op_ids=draft_op_ids, tail_op_ids=tail_op_ids,
         )
         if reduced else rep_total
     )
@@ -2116,9 +2144,7 @@ def _archetype_weighted_step_ms(
         step_request=StepRequest(phase=phase, tokens=tokens, context=context, sequences=sequences, scope=scope),
         scenario_case=parsed,
     )
-    if ext_plan is not None:
-        return solved_ms if solved_ms > 0.0 else baseline_ms
-    return min(baseline_ms, solved_ms) if solved_ms > 0.0 else baseline_ms
+    return solved_ms if solved_ms > 0.0 else baseline_ms
 
 
 def _free_hbm_gib_for_batch(memory: Memory, kv_by_stage: Sequence[float], batch: int) -> float:
