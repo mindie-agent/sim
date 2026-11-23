@@ -565,3 +565,76 @@ def test_collective_algorithm_and_hccs_k8_alltoall_staging_independent_of_calibr
         links = {k: v for k, v in serviced.items() if k.startswith("link:")}
         assert len(links) == 3 and all(v == pytest.approx(1048576.0) for v in links.values())
         assert serviced.get("memory@r0:s0", 0.0) == pytest.approx(16 * 1048576.0)
+
+
+def test_superpod_optical_alltoall_bands_and_startup_boundaries():
+    """Verify A3 SuperPoD 32-die optical AllToAll/AllToAllV direct AIV band matching and route counts."""
+    from _support.axes import REPRESENTATIVE_SKUS
+    from mindie_sim.compose import compose_case
+    from mindie_sim.prediction.collectives.protocol import lower_collective, select_band
+    from mindie_sim.prediction.collectives.topology import Topology
+    from mindie_sim.prediction.structure import parse_case
+
+    raw = compose_case(
+        "qwen3.5-397b-a17b", REPRESENTATIVE_SKUS["a3"], topology_preset="a3_superpod",
+        tp=16, dp=2, ep=32, layers=1, quant="w8a8",
+    )
+    parsed = parse_case(raw)
+    topo = Topology(parsed.machine, parsed.runtime.parallel, primitive_table=None)
+    ep32 = tuple(range(32))
+
+    # 1. Default and explicit AIV select direct_mesh with 1 phase startup (3.5 us) across all 3 band boundaries.
+    for coll in ("alltoall", "alltoallv"):
+        for exp in (None, "aiv"):
+            for payload, proto in (
+                (65536, "hccs_optical_small"),
+                (65537, "hccs_optical_mid"),
+                (2097151, "hccs_optical_mid"),
+                (2097152, "hccs_optical_large"),
+            ):
+                band = select_band(coll, ep32, topo, payload, expansion_mode=exp)
+                assert band.algorithm == "direct_mesh"
+                assert band.expansion_mode == "aiv"
+                assert band.protocol == proto
+                assert band.startup_scope == "phase"
+                assert band.startup_us == pytest.approx(3.5)
+
+    # 2. Explicit ring retains 31 serialized rounds on balanced alltoall; forced-ring allreduce preserved.
+    ring_band = select_band("alltoall", ep32, topo, 65536, expansion_mode="ring")
+    assert ring_band.algorithm == "ring"
+    low_ring = lower_collective("alltoall", ep32, topo, 65536, expansion_mode="ring")
+    assert len(low_ring.phases) == 1 and low_ring.phases[0].rounds == 31
+    ar_ring = select_band("allreduce", ep32, topo, 65536, expansion_mode="ring")
+    assert ar_ring.algorithm == "ring"
+
+    # 3. Balanced EP32 matrix routes 32 SIO, 448 intra-node HCCS, 512 optical pairs in 1 round (3.5 us startup).
+    matrix = tuple(tuple(0 if r == c else 1024 for c in range(32)) for r in range(32))
+    splits = tuple(sum(row) for row in matrix)
+    low_ep = lower_collective(
+        "alltoallv", ep32, topo, float(max(splits)),
+        peer_matrix=matrix, send_splits=splits, recv_splits=splits,
+    )
+    assert low_ep.band.algorithm == "direct_mesh"
+    assert len(low_ep.phases) == 1 and low_ep.phases[0].rounds == 1
+    assert low_ep.phases[0].startup_us == pytest.approx(3.5)
+    tier_counts = {"d2d_intra_package": 0, "d2d_intra_node": 0, "d2d_inter_node": 0}
+    for tr in low_ep.phases[0].transfers:
+        assert len(tr.hops) == 1
+        ch = topo.links[tr.hops[0].link_name].channel
+        tier_counts[ch] += 1
+    assert tier_counts == {"d2d_intra_package": 32, "d2d_intra_node": 448, "d2d_inter_node": 512}
+
+    # 4. Zero remote traffic yields 0 phases; both TP16 communicators stay intra-node (0 optical bytes).
+    zero_m = tuple(tuple(0 for _ in range(32)) for _ in range(32))
+    low_zero = lower_collective(
+        "alltoallv", ep32, topo, 0.0,
+        peer_matrix=zero_m, send_splits=(0,) * 32, recv_splits=(0,) * 32,
+    )
+    assert low_zero.phases == ()
+    for tp_group in (tuple(range(16)), tuple(range(16, 32))):
+        low_tp = lower_collective("allreduce", tp_group, topo, 65536)
+        optical_transfers = [
+            tr for ph in low_tp.phases for tr in ph.transfers
+            for hop in tr.hops if topo.links[hop.link_name].channel == "d2d_inter_node"
+        ]
+        assert optical_transfers == []

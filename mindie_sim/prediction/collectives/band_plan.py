@@ -359,6 +359,113 @@ class BandCollectivePlan:
 
         return KernelProgram(tuple(out), minimum_ms=context.minimum_ms)
 
+    def split_local_programs(
+        self, context, base_program, *, extra_link_names: frozenset[str] = frozenset(),
+    ):
+        """Split a collective program into link-stripped ``(pre_program, post_program)``.
+
+        Used by cohort-wide scheduling so each replica executes its local pack
+        stages before ONE shared ``BandCollectivePlan`` network submission and
+        runs its local HBM/unpack stages once its rank completions resolve.
+        """
+        from ..program import KernelProgram, Stage
+
+        link_names = frozenset(self.accounting().wire_by_resource) | frozenset(extra_link_names)
+        stages_in = base_program.stages
+        if (len(stages_in) == TWO_PHASES
+                and stages_in[0].name == "setup"
+                and isinstance(stages_in[1].program, KernelProgram)):
+            stages_in = stages_in[1].program.stages
+
+        def _strip_links(stg: Stage, after: tuple[str, ...]) -> Stage | None:
+            local_work = {k: v for k, v in stg.work.items() if k not in link_names}
+            local_caps = {k: v for k, v in stg.caps.items() if k not in link_names}
+            local_place = {k: v for k, v in stg.placement.items() if k not in link_names}
+            local_units = {k: v for k, v in stg.work_units.items() if k not in link_names}
+            local_widened = tuple(k for k in stg.cohort_widened if k not in link_names)
+            local_members = {k: v for k, v in stg.cohort_members.items() if k not in link_names}
+            local_deliv = tuple((k, v) for k, v in stg.deliveries if k not in link_names)
+            has_local = bool(
+                local_work or stg.metadata or local_deliv or stg.acquire
+                or stg.free or stg.latency > 0.0
+                or (stg.program is not None and not isinstance(stg.program, BandCollectivePlan))
+                or stg.fragment is not None
+            )
+            if not has_local:
+                return None
+            return replace(
+                stg,
+                work=local_work,
+                caps=local_caps,
+                placement=local_place,
+                work_units=local_units,
+                cohort_widened=local_widened,
+                cohort_members=local_members,
+                deliveries=local_deliv,
+                coupled=stg.coupled and bool(local_work),
+                after=after,
+                keep_empty=True,
+            )
+
+        def _remap_after(raw: tuple[str, ...], inherited: dict[str, tuple[str, ...]], valid: set[str]) -> tuple[str, ...]:
+            deps: list[str] = []
+            for dep in raw:
+                for target in inherited.get(dep, (dep,)):
+                    if target in valid and target not in deps:
+                        deps.append(target)
+            return tuple(deps)
+
+        pre_out: list[Stage] = []
+        pre_valid: set[str] = set()
+        pre_inherited: dict[str, tuple[str, ...]] = {}
+        for stg in stages_in:
+            if stg.name == "unpack_store" or stg.name == "band_collective:local_hbm" or isinstance(stg.program, BandCollectivePlan):
+                continue
+            eff_after = _remap_after(stg.after, pre_inherited, pre_valid)
+            kept = _strip_links(stg, eff_after)
+            if kept is None:
+                pre_inherited[stg.name] = eff_after
+                continue
+            pre_out.append(kept)
+            pre_valid.add(kept.name)
+
+        post_out: list[Stage] = []
+        post_valid: set[str] = set()
+        post_inherited: dict[str, tuple[str, ...]] = {}
+        local_hbm = max(
+            (float(g.lowered.local_hbm_bytes_per_rank) for g in self.groups),
+            default=0.0,
+        )
+        op_hbm = float(getattr(getattr(context, "op", None), "hbm_bytes", 0.0) or 0.0)
+        bind_fn = getattr(context, "bind", None)
+        res_names = getattr(context, "resource_names", ()) or ()
+        hbm_root: tuple[str, ...] = ()
+        if local_hbm > 0.0 and op_hbm <= 0.0 and callable(bind_fn) and "hbm" in res_names:
+            hbm_stage_name = "band_collective:local_hbm"
+            post_out.append(Stage(
+                hbm_stage_name,
+                work=bind_fn(Work(resources={"hbm": local_hbm})),
+                after=(),
+            ))
+            post_valid.add(hbm_stage_name)
+            hbm_root = (hbm_stage_name,)
+
+        for stg in stages_in:
+            if stg.name != "unpack_store":
+                continue
+            internal = _remap_after(stg.after, post_inherited, post_valid)
+            eff_after = tuple(dict.fromkeys((*hbm_root, *internal)))
+            kept = _strip_links(stg, eff_after)
+            if kept is None:
+                post_inherited[stg.name] = eff_after
+                continue
+            post_out.append(kept)
+            post_valid.add(kept.name)
+
+        pre_prog = KernelProgram(tuple(pre_out), minimum_ms=0.0) if pre_out else None
+        post_prog = KernelProgram(tuple(post_out), minimum_ms=0.0) if post_out else None
+        return pre_prog, post_prog
+
 
 def build_band_collective_plan(
     topology,

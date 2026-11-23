@@ -24,11 +24,29 @@ FAMILY = "paged_mla"
 CONTRACT_KEY = "paged_mla_contract"
 FIA_ABI = "aclnnFusedInferAttentionScore"
 FLASH_ABI = "aclnnFlashMla"
+FLASH_ENTRY = "cann_ops_transformer.ops.flash_mla"
 DSL_FLASH_ABI = "cannbot_dsl.flash_mla_with_kvcache"
 MQS_ABI = "aclnnMixedQuantSparseFlashMla"
+MQS_ENTRY = "cann_ops_transformer.ops.mixed_quant_sparse_flash_mla"
 DSL_MQS_ABI = "cannbot_dsl.mixed_quant_sparse_flash_mla"
+SPARSE_FLASH_MLA_ABI = "aclnnSparseFlashMla"
+SPARSE_FLASH_MLA_ENTRY = "cann_ops_transformer.ops.sparse_flash_mla"
+ARCH35_ID = "npu_arch_3510"
 MQS_ABIS = frozenset({MQS_ABI, DSL_MQS_ABI})
 SUPPORTED_ABIS = frozenset({FIA_ABI, FLASH_ABI, DSL_FLASH_ABI}) | MQS_ABIS
+ABI_PUBLIC_IDENTITY: Mapping[str, tuple[str, str, str]] = {
+    FLASH_ABI: ("FlashMla", FLASH_ENTRY, "aclnn"),
+    DSL_FLASH_ABI: ("FlashMla", DSL_FLASH_ABI, "cann_kernel"),
+    MQS_ABI: ("MixedQuantSparseFlashMla", MQS_ENTRY, "aclnn"),
+    DSL_MQS_ABI: ("MixedQuantSparseFlashMla", DSL_MQS_ABI, "cann_kernel"),
+    SPARSE_FLASH_MLA_ABI: ("SparseFlashMla", SPARSE_FLASH_MLA_ENTRY, "aclnn"),
+    FIA_ABI: ("FusedInferAttentionScore", "torch_npu.npu_fused_infer_attention_score", "aclnn"),
+}
+
+
+def default_dense_abi(arch_id: str) -> str:
+    """Select the architecture's default dense MLA ABI (FlashMla on Arch35)."""
+    return FLASH_ABI if str(arch_id or "") == ARCH35_ID else FIA_ABI
 DEFAULT_LATENT_DIM = 512
 DEFAULT_ROPE_DIM = 64
 DEFAULT_PAGE_SIZE = 128
@@ -387,7 +405,8 @@ def contract_for(op: OpSpec, ctx: OperatorPlanningContext) -> PagedMlaContract:
     requested = ctx.requested_abi or metadata.get("requested_abi")
     if requested and "abi" in raw and requested != raw["abi"]:
         raise capability_gap("paged_mla_abi_conflict", requested, ctx.compute_arch.arch_id)
-    c = _from_mapping({**raw, **({"abi": requested} if requested else {})})
+    effective_abi = requested or raw.get("abi") or default_dense_abi(ctx.compute_arch.arch_id)
+    c = _from_mapping({**raw, "abi": effective_abi})
     spans = planning_sequence_spans(ctx, c.kv_layout or "PA_BLK_BSND")
     if not spans:
         return validate_contract(c)

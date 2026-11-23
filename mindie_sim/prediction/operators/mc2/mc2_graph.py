@@ -62,7 +62,12 @@ def select_common(runtime, features=None, *, tokens, top_k, experts, ep):
     if chosen not in {MC2, FUSED_MC2}:
         return None
     fused_level = int(radditional.get("enable_fused_mc2", 0) or 0)
-    return mc2.common_native_protocol(chosen, fused_level, config.to_items())
+    arch_family = str(
+        config.arch_family or rmeta.get("arch_family") or ""
+    ).strip().upper()
+    return mc2.common_native_protocol(
+        chosen, fused_level, config.to_items(), arch_family=arch_family,
+    )
 
 
 def lower(ops, *, runtime, prefix, tokens, top_k, width, experts, ep,

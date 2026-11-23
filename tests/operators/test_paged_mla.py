@@ -620,3 +620,125 @@ def test_arch22_paged_mla_l0a_reloads_scale_with_key_tile_and_dv():
         assert qk_mte1 == pytest.approx(heads * q_reloads * dqk * elem + keys * dqk * elem)
         assert pv_mte1 == pytest.approx(heads * keys * elem * p_reloads + keys * dv * elem)
         _execute(op, plan, geometry)
+
+
+def test_arch_aware_mla_and_mc2_native_binding_projection():
+    """Verify single-source arch-aware operator identity across producers, rewrite, and export."""
+    from mindie_sim.compose import compose_case
+    from mindie_sim.export.bundle import build_export_bundle, compose_export_case
+    from mindie_sim.export.kernel_catalog import resolve_ascend_kernel_identity
+    from mindie_sim.export.trace_exporter import export_msprof_trace
+    from mindie_sim.prediction.operators import mc2
+    from mindie_sim.prediction.operators.mc2 import arch22 as mc2_arch22
+    from mindie_sim.prediction.operators.paged_mla.common import default_dense_abi
+    from mindie_sim.prediction.structure import parse_case
+    from mindie_sim.rewrite.algebra import (
+        SHIPPING_ABI_PREDICATES, discover_algebraic_rewrites_for_ops, resolve_shipping_moe_predicate,
+    )
+    from mindie_sim.schema.operators import OpSpec
+
+    # 1. Producer default dense MLA ABI: Arch35 -> FlashMla, Arch22 -> FIA.
+    a5_geom = _governed_geom(DIRECT_SKU)
+    a3_geom = _governed_geom(GM_SKU)
+    assert default_dense_abi(a5_geom.datapath.compute_arch.arch_id) == FLASH_ABI
+    assert default_dense_abi(a3_geom.datapath.compute_arch.arch_id) == FIA_ABI
+    a5_plan = governed.build(governed.make_op(governed.PagedMlaContract(
+        ((1, 512),), 64, 64, abi=FLASH_ABI, latent_dim=LATENT, rope_dim=ROPE, splits=1,
+    )), a5_geom)
+    assert a5_plan.metadata["native_kind"] == "FlashMla"
+    assert a5_plan.metadata["native_entry"] == "cann_ops_transformer.ops.flash_mla"
+
+    # 2. MC2 arch dispatch & Arch22 W8A8/W4A8/MegaMoE native binding.
+    proto_a5 = mc2.common_native_protocol("fused_mc2", 2, (), arch_family="A5")
+    proto_a3 = mc2.common_native_protocol("fused_mc2", 1, (), arch_family="A3")
+    assert proto_a5["kind"] == "arch35_fullmesh"
+    assert proto_a3["kind"] == "arch22_v2_caller"
+    assert mc2_arch22.fused_mc2_native_binding("int8", fused_level=1)["public_name"] == "dispatch_ffn_combine"
+    assert mc2_arch22.fused_mc2_native_binding("int4", fused_level=1)["public_name"] == "dispatch_ffn_combine_w4_a8"
+    assert mc2_arch22.fused_mc2_native_binding("int8", fused_level=2)["public_name"] == "aclnnMegaMoe"
+    with pytest.raises(ModelingError, match="arch22_fused_mc2_mode3_requires_arch35"):
+        mc2_arch22.fused_mc2_native_binding("int8", fused_level=3)
+
+    # 3. Rewrite SHIPPING_ABI_PREDICATES: arch-qualified, complete MoE frame required, situglu rejected.
+    assert resolve_shipping_moe_predicate("A5").abi_id == "aclnnMegaMoe"
+    assert resolve_shipping_moe_predicate("A3", weight_dtype="int8").abi_id == "dispatch_ffn_combine"
+    assert resolve_shipping_moe_predicate("A3", weight_dtype="int4").abi_id == "dispatch_ffn_combine_w4_a8"
+    assert not SHIPPING_ABI_PREDICATES["aclnnMegaMoe"].supports_activation("situglu")
+
+    a5_case = parse_case(compose_case("deepseek-v3.2", DIRECT_SKU, dp=1, tp=2, ep=2, layers=4, quant="mxfp8_mxfp4"))
+    a3_case = parse_case(compose_case("deepseek-v3.2", GM_SKU, dp=1, tp=2, ep=2, layers=4, quant="w4a8_dynamic"))
+    _sh = dict(requests=("r",), semantic_shape=(1, 16), local_shape=(1, 16), padded_shape=(1, 16), launch_shape=(1, 16))
+    partial_chain = (
+        OpSpec(op_id="l0.expert_up", deps=(), stage=0, layer=0, phase="decode",
+               family="grouped_gemm", recipe="grouped_gate_up", dtype="bf16", **_sh,
+               metadata=(("activation_format", "fp8_e4m3"), ("weight_format", "mxfp4"))),
+        OpSpec(op_id="l0.expert_act", deps=("l0.expert_up",), stage=0, layer=0, phase="decode",
+               family="swiglu", recipe="grouped_swiglu", dtype="bf16", **_sh, metadata=(("activation_kind", "swiglu"),)),
+        OpSpec(op_id="l0.expert_down", deps=("l0.expert_act",), stage=0, layer=0, phase="decode",
+               family="grouped_gemm", recipe="grouped_down", dtype="bf16", **_sh,
+               metadata=(("activation_format", "fp8_e4m3"), ("weight_format", "mxfp4"))),
+    )
+    partial_res = discover_algebraic_rewrites_for_ops(partial_chain, allow_mc2=True, arch_family="A5")
+    assert not any(c.fused_recipe == "megamoe_arch35" for c in partial_res.candidates)
+
+    situ_frame = (
+        OpSpec(op_id="l0.dispatch", deps=(), stage=0, layer=0, phase="decode",
+               family="alltoall", recipe="expert_dispatch", dtype="bf16", **_sh, metadata=(("group_axis", "ep"),)),
+        replace(partial_chain[0], deps=("l0.dispatch",)),
+        OpSpec(op_id="l0.expert_act", deps=("l0.expert_up",), stage=0, layer=0, phase="decode",
+               family="situ", recipe="grouped_situ", dtype="bf16", **_sh, metadata=(("activation_kind", "situ"),)),
+        partial_chain[2],
+        OpSpec(op_id="l0.combine", deps=("l0.expert_down",), stage=0, layer=0, phase="decode",
+               family="alltoall", recipe="expert_combine", dtype="bf16", **_sh, metadata=(("group_axis", "ep"),)),
+    )
+    a5_res = discover_algebraic_rewrites_for_ops(situ_frame, allow_mc2=True, arch_family="A5")
+    a3_res = discover_algebraic_rewrites_for_ops(situ_frame, allow_mc2=True, arch_family="A3")
+    assert any(t.candidate_abi == "aclnnMegaMoe_situ_ext" for t in a5_res.semantic_audit_triggers)
+    assert not any("dispatch_ffn_combine" in (t.candidate_abi or "") for t in a5_res.semantic_audit_triggers)
+    assert any(t.candidate_abi == "dispatch_ffn_combine_situ_ext" for t in a3_res.semantic_audit_triggers)
+
+    # 4. Direct NativeCallBinding projection: recipe-rename invariant + empty ascend_kernel for logical-only ops.
+    bound_op = OpSpec(
+        op_id="l0.attn", family="attention", recipe="arbitrary_renamed_recipe_xyz",
+        phase="decode", stage=0, layer=0, dtype="bf16", **_sh,
+        metadata=(("native_call", {
+            "api": {"namespace": "aclnn", "entry": "cann_ops_transformer.ops.flash_mla", "aclnn_symbol": FLASH_ABI},
+            "kernels": ({"name": "FlashMla", "role": "attention", "evidence": "source_declared"},),
+            "source": {"repository": "cann-ops-transformer", "relative_path": "ops/flash_mla.h", "source_sha256": "abc"},
+        }),),
+    )
+    desc_a = resolve_ascend_kernel_identity("l0.attn", bound_op, "attention", "arbitrary_renamed_recipe_xyz", (1, 64, 512), "bf16", a5_case, None, ())
+    desc_b = resolve_ascend_kernel_identity("l0.attn", replace(bound_op, recipe="totally_different_name"), "attention", "totally_different_name", (1, 64, 512), "bf16", a5_case, None, ())
+    assert desc_a.ascend_kernel == "FlashMla" == desc_b.ascend_kernel
+    assert "ops/flash_mla.h" in desc_a.source_ref
+
+    unbound_op = OpSpec(op_id="l0.custom_logical_stage", family="logical_helper", recipe="internal_stage", phase="decode", stage=0, layer=0, dtype="bf16", **_sh)
+    desc_unbound = resolve_ascend_kernel_identity("l0.custom_logical_stage", unbound_op, "logical_helper", "internal_stage", (1, 16), "bf16", a5_case, None, ())
+    assert desc_unbound.ascend_kernel == ""
+    assert desc_unbound.source_ref == ""
+
+    # 5. Full export bundle projection across A5 (kimi, qwen-flash) & A3 W4A8+C8: zero cross-gen leaks.
+    for model_name, hw, preset, quant, kv in (
+        ("kimi-k3.1", DIRECT_SKU, "a5_pod", "mxfp8_mxfp4", "fp8_e4m3"),
+        ("qwen3.8-flash-next", DIRECT_SKU, "a5_pod", "mxfp8_mxfp4", "fp8_e4m3"),
+        ("kimi-k3.1", GM_SKU, "a3_superpod", "w4a8_dynamic", "int8"),
+    ):
+        raw, req = compose_export_case(
+            model_name, hw, topology_preset=preset,
+            dp=1, tp=2, ep=2, dcp=1, prompt_tokens=1024, output_tokens=32, concurrency=1,
+            quant=quant, kv_cache_dtype=kv,
+        )
+        bundle = build_export_bundle(raw, request=req)
+        kernels = [o.ascend_kernel for o in bundle.operators]
+        assert not any(k.startswith("step5_") for k in kernels)
+        assert not any("AIV/CCU" in k for k in kernels)
+        assert not any(k in {"aclnnCustomOp", "aclnnAdd / VectorOp"} for k in kernels)
+        if hw == DIRECT_SKU:
+            assert not any("dispatch_ffn_combine" in k for k in kernels)
+            mla_kernels = [
+                o.ascend_kernel for o in bundle.operators
+                if o.family == "attention" and o.submodule in {"Latent Attention Core", "Draft / Speculative Layers"}
+            ]
+            assert not any("FusedInferAttentionScore" in k for k in mla_kernels)
+    assert a3_case.machine.arch_family == "A3"
+    assert callable(export_msprof_trace)

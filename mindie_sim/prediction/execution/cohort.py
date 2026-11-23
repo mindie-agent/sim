@@ -119,6 +119,8 @@ class _CohortMixin(_CohortNativeMixin):
                        for program in programs.values()):
                     if self._start_native_cohort(key, participants, programs):
                         continue
+            if self._try_start_cohort_band_collective(key, participants):
+                continue
             source_stage = int(dict(participants[0].context.op.metadata).get(
                 "source_stage", participants[0].context.op.stage))
             local_ready_by_rank = {}
@@ -275,6 +277,11 @@ class _CohortMixin(_CohortNativeMixin):
                     }
                     if self._start_native_cohort(key, synth, progs):
                         continue
+            synth_band = self._synthesize_cohort_participants(item0, works, peer_replicas)
+            if self._try_start_cohort_band_collective(
+                key, synth_band, symmetric_canonical_only=can_r0_only,
+            ):
+                continue
             if can_r0_only:
                 comp0 = self._start_program(
                     item0.context, item0.recipe, item0.name, item0.ready,
@@ -633,6 +640,158 @@ class _CohortMixin(_CohortNativeMixin):
                 owner=f"replica:{item.replica}", on_complete=cohort_complete,
                 native_hook=True)
         return completions
+
+    def _try_start_cohort_band_collective(
+        self, key, participants, *, symmetric_canonical_only: bool = False,
+    ) -> bool:
+        """Bind ONE cohort-wide BandCollectivePlan over all participating ranks.
+
+        Preserves per-replica local pack/unpack stages while routing the network
+        phase once across the complete communicator so cross-DP collectives (e.g.
+        32-die A3 SuperPoD EP AllToAll/AllToAllV) select direct optical bands
+        instead of falling back to per-replica legacy ring startup.
+        """
+        first = participants[0]
+        op = first.context.op
+        meta = dict(op.metadata)
+        if isinstance(meta.get("megamoe_geometry"), _AbcMapping):
+            return False
+        participants_vol = {
+            item.replica: item.context.native_work.get("link", 0)
+            for item in participants
+        }
+        if not any(participants_vol.values()) and "peer_traffic" not in meta:
+            return False
+        try:
+            band_plan = self.topology.band_collective_plan(
+                op, participants_vol, algorithm="auto",
+            )
+        except ModelingError as exc:
+            if str(exc).startswith("joint_collective_group_membership"):
+                return False
+            raise
+        if band_plan is None:
+            return False
+        if not set(band_plan.accounting().wire_by_resource).issubset(self.engine.resources):
+            return False
+
+        active_items = (first,) if symmetric_canonical_only else tuple(participants)
+        pre_by_replica, post_by_replica = {}, {}
+        for item in active_items:
+            base_prog = self.lower_program(item.context, item.recipe)
+            if not hasattr(base_prog, "stages"):
+                return False
+            local_res = frozenset(item.context.resource_names.values())
+            extra_links = frozenset(k for k in item.context.work if k not in local_res)
+            pre_prog, post_prog = band_plan.split_local_programs(
+                item.context, base_prog, extra_link_names=extra_links,
+            )
+            pre_by_replica[item.replica] = pre_prog
+            post_by_replica[item.replica] = post_prog
+
+        source_stage = int(meta.get("source_stage", op.stage))
+        net_ready_by_replica = {}
+        for item in active_items:
+            timing = item.context.invocation_timing
+            start_ready = item.ready
+            if timing is not None and timing.startup_ms:
+                start_ready = self.engine.submit(
+                    item.name + ":device_startup", after=(start_ready,),
+                    latency=timing.startup_ms, owner=f"replica:{item.replica}",
+                )
+            pre_prog = pre_by_replica[item.replica]
+            net_ready_by_replica[item.replica] = (
+                pre_prog.start(self.engine, item.name + ":pack", start_ready,
+                               owner=f"replica:{item.replica}")
+                if pre_prog is not None else start_ready
+            )
+
+        if symmetric_canonical_only:
+            r0_ready = net_ready_by_replica[first.replica]
+            ready_by_rank = {rank: r0_ready for rank in band_plan.ranks}
+        else:
+            ready_by_rank = {
+                rank: net_ready_by_replica[item.replica]
+                for item in participants
+                for rank in self.topology.ranks(item.replica, source_stage)
+            }
+
+        completions = band_plan.start_participants(
+            self.engine, first.name + ":cohort_band", ready_by_rank, owner="expert_group",
+        )
+        observation = self._begin_joint_observation(
+            op, key, participants, ready_by_rank, source_stage,
+        )
+        if observation is not None and band_plan.groups:
+            lowered0 = band_plan.groups[0].lowered
+            observation["band_plan"] = {
+                "collective": lowered0.collective,
+                "algorithm": lowered0.band.algorithm,
+                "expansion_mode": lowered0.band.expansion_mode,
+                "protocol": lowered0.band.protocol,
+                "phase_count": len(lowered0.phases),
+                "round_count": sum(p.rounds for p in lowered0.phases),
+                "startup_scope": lowered0.band.startup_scope,
+                "startup_us": lowered0.band.startup_us,
+                "collective_startup_us": lowered0.collective_startup_us,
+                "total_wire_bytes": sum(g.lowered.total_wire_bytes for g in band_plan.groups),
+            }
+        pending = [len(active_items)] if observation is not None else None
+        peer_promises = tuple(p.completion for p in participants if p is not first)
+
+        for item in active_items:
+            ranks = self.topology.ranks(item.replica, source_stage)
+            rank_done = [completions[rank] for rank in ranks if rank in completions]
+            post_prog = post_by_replica[item.replica]
+            if post_prog is not None:
+                band_done = (
+                    rank_done[0] if len(rank_done) == 1
+                    else self.engine.submit(
+                        item.name + ":band_done", after=rank_done,
+                        owner=f"replica:{item.replica}",
+                    )
+                )
+                deps = [post_prog.start(
+                    self.engine, item.name + ":unpack", band_done,
+                    owner=f"replica:{item.replica}",
+                )]
+            else:
+                deps = list(rank_done) or [net_ready_by_replica[item.replica]]
+            timing = item.context.invocation_timing
+            minimum = max(item.context.minimum_ms, timing.minimum_ms if timing else 0)
+            if minimum:
+                deps.append(self.engine.submit(
+                    item.name + ":observation", after=(item.ready,),
+                    latency=minimum, owner=f"replica:{item.replica}",
+                ))
+
+            def _complete(event, item=item, ranks=ranks, observation=observation,
+                          pending=pending, resolve_peers=symmetric_canonical_only):
+                if observation is not None:
+                    r_map = {rk: ready_by_rank[rk].time for rk in ranks if rk in ready_by_rank}
+                    c_map = {rk: completions[rk].time for rk in ranks if rk in completions}
+                    observation["participants"].append({
+                        "replica": item.replica, "ranks": list(ranks),
+                        "ready_ms": r_map, "completion_ms": c_map,
+                        "parent_complete_ms": event.time,
+                    })
+                    observation["ready_ms_by_rank"].update(r_map)
+                    observation["completion_ms_by_rank"].update(c_map)
+                    observation["parent_complete_ms"][item.replica] = event.time
+                    pending[0] -= 1
+                    if pending[0] == 0:
+                        self._finish_joint_collective(observation)
+                self.engine.resolve(item.completion)
+                if resolve_peers:
+                    for peer_ev in peer_promises:
+                        self.engine.resolve(peer_ev)
+
+            self.engine.submit(
+                item.name + ":cohort_band_complete", after=deps,
+                owner=f"replica:{item.replica}", on_complete=_complete,
+                native_hook=True,
+            )
+        return True
 
     def _finish_joint_collective(self, observation: dict) -> None:
         """Reduce one completed cohort to bounded numeric observations."""

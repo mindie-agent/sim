@@ -49,6 +49,9 @@ _MC2_TOKENS_PER_RANK_LIMIT = 512
 _DENSITY_MC2_MAX_EXPERTS_PER_DEVICE = 24
 _DENSITY_MC2_MIN_WORLD_SIZE = 16
 _FUSED_OR_CAPACITY_MAX_FUSED_WORLD_SIZE = 32
+_FUSED_MC2_MODE_DISPATCH_FFN = 1
+_FUSED_MC2_MODE_MEGAMOE_ROUTED = 2
+_FUSED_MC2_MODE_MEGAMOE_SHARED = 3
 NO_DRAFT_TOKENS = 0
 BASE_DECODE_QUERY_LEN = 1
 
@@ -136,6 +139,8 @@ class MoeCommConfig:
     top_k: int
     experts_per_device: int
     enable_fused_mc2: bool = False
+    fused_mc2_level: int = 0
+    arch_family: str = ""
     mega_moe_supported: bool = False
     enable_prefill_mc2: bool = False
     max_num_batched_tokens: int = 0
@@ -161,6 +166,8 @@ class MoeCommConfig:
                 raise ModelingError(f"moe_comm_value_invalid:{name}")
         if self.tp < 1 or self.world_size < 1 or self.top_k < 1:
             raise ModelingError("moe_comm_positive_axes_required")
+        if isinstance(self.fused_mc2_level, bool) or not isinstance(self.fused_mc2_level, int) or self.fused_mc2_level < 0:
+            raise ModelingError("moe_comm_value_invalid:fused_mc2_level")
         object.__setattr__(self, "capture_sizes", tuple(self.capture_sizes))
 
     def select(self, num_tokens: int) -> str:
@@ -213,6 +220,8 @@ class MoeCommConfig:
             ("tp", self.tp), ("top_k", self.top_k),
             ("experts_per_device", self.experts_per_device),
             ("enable_fused_mc2", int(self.enable_fused_mc2)),
+            ("fused_mc2_level", int(self.fused_mc2_level)),
+            ("arch_family", str(self.arch_family)),
             ("mega_moe_supported", int(self.mega_moe_supported)),
             ("enable_prefill_mc2", int(self.enable_prefill_mc2)),
             ("max_num_batched_tokens", self.max_num_batched_tokens),
@@ -236,6 +245,8 @@ class MoeCommConfig:
                 tp=int(values["tp"]), top_k=int(values["top_k"]),
                 experts_per_device=int(values["experts_per_device"]),
                 enable_fused_mc2=bool(int(values.get("enable_fused_mc2", 0))),
+                fused_mc2_level=int(values.get("fused_mc2_level", int(bool(int(values.get("enable_fused_mc2", 0)))))),
+                arch_family=str(values.get("arch_family", "") or ""),
                 mega_moe_supported=bool(int(values.get("mega_moe_supported", 0))),
                 enable_prefill_mc2=bool(int(values.get("enable_prefill_mc2", 0))),
                 max_num_batched_tokens=int(values.get("max_num_batched_tokens", 0)),
@@ -260,13 +271,22 @@ class MoeCommConfig:
         """
         meta = _metadata(features)
         additional = _additional(meta)
-        enable_fused = bool(int(additional.get("enable_fused_mc2", 0) or 0))
+        raw_fused = int(additional.get("enable_fused_mc2", 0) or 0)
+        enable_fused = bool(raw_fused)
         declared_fused = "enable_fused_mc2" in additional
         declared_mode = str(meta.get("moe_comm_mode", "") or "")
         arch = str(meta.get("arch_family", "") or "").strip().upper()
+        # Mode 3 (shared-expert MegaMoE) requires A5; on A3 clamp effective fused level to mode 2 if mega supported.
+        effective_fused_level = raw_fused
+        if arch != "A5" and effective_fused_level >= _FUSED_MC2_MODE_MEGAMOE_SHARED:
+            effective_fused_level = _FUSED_MC2_MODE_MEGAMOE_ROUTED
         mega = bool(int(
             additional.get("enable_mega_moe", 0) or
             meta.get("moe_mega_moe_supported", 0) or 0))
+        if arch == "A3" and effective_fused_level == _FUSED_MC2_MODE_MEGAMOE_ROUTED:
+            mega = True
+        if arch == "A5" and effective_fused_level >= _FUSED_MC2_MODE_MEGAMOE_ROUTED:
+            mega = True
         provenance = bool(meta.get("source_lowerings") or meta.get("image") or
                           meta.get("image_id") or meta.get("moe_comm_mode"))
         if not mode and declared_mode in {DYNAMIC, ALWAYS_MC2}:
@@ -305,7 +325,10 @@ class MoeCommConfig:
         return cls(
             mode=mode, policy=policy, capacity=capacity, world_size=world,
             tp=tp, top_k=max(1, int(top_k)), experts_per_device=max(1, int(experts) // world),
-            enable_fused_mc2=enable_fused, mega_moe_supported=mega,
+            enable_fused_mc2=enable_fused,
+            fused_mc2_level=effective_fused_level,
+            arch_family=arch,
+            mega_moe_supported=mega,
             enable_prefill_mc2=enable_prefill,
             max_num_batched_tokens=max_batched, max_num_reqs=max_num_reqs,
             uniform_decode_query_len=uniform, capture_sizes=capture_sizes,

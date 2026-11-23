@@ -6,7 +6,7 @@
   re-applies a bus factor. A topology-declared direct mesh is consumed as its
   physical plan: ReduceScatter then AllGather for AllReduce, one peer phase for
   ReduceScatter/AllGather, each issuing P/W per directed peer concurrently.
-  Non-mesh collectives retain the ring/NHR/CCU phase split. AllReduce retains
+  Non-mesh collectives retain the ring/NHR/hardware-scheduled phase split. AllReduce retains
   two dependent phases; other collectives retain one peer phase.
 [Timeouts & Locks] Bounded phase count; no I/O or locks.
 [Side-Effect Policy] Submits only to the caller's virtual Engine.

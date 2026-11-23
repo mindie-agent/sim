@@ -790,7 +790,7 @@ class _ContextMixin:
 
     def _route_link_phase(self, phase_op, replica, volume, transport_options, *, algorithm):
         band_plan = None
-        if volume and algorithm in {"ring", "pairwise"}:
+        if volume and algorithm in {"ring", "pairwise", "auto"}:
             try:
                 band_plan = self.topology.band_collective_plan(
                     phase_op, {replica: volume}, algorithm=algorithm,
@@ -873,7 +873,9 @@ class _ContextMixin:
     def _bind_context_work(self, context, op, replica, recipe, work, transport_options):
         meta = _metadata_dict(op)
         is_megamoe = isinstance(meta.get("megamoe_geometry"), _AbcMapping)
-        algorithm = getattr(recipe, "algorithm", "ring")
+        explicit_algorithm = getattr(recipe, "algorithm", None)
+        algorithm = explicit_algorithm or "ring"
+        plan_algorithm = explicit_algorithm or "auto"
         if (not is_megamoe and algorithm == "ring" and getattr(recipe, "mesh_capable", False)
                 and self.topology.declares_direct_mesh(op, replica)):
             algorithm = "direct_mesh"
@@ -888,10 +890,10 @@ class _ContextMixin:
             self.topology.bind_direct_mesh(op, replica, plan)
             plan_binding = _CollectivePlanBinding(algorithm, plan=plan)
         else:
-            if link_vol and algorithm in {"ring", "pairwise"}:
+            if link_vol and plan_algorithm in {"ring", "pairwise", "auto"}:
                 try:
                     band_plan = self.topology.band_collective_plan(
-                        op, {replica: link_vol}, algorithm=algorithm,
+                        op, {replica: link_vol}, algorithm=plan_algorithm,
                         transport=transport_options,
                     )
                 except ModelingError as exc:

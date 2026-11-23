@@ -258,6 +258,23 @@ def make_op(
             megamoe_geo["combine_peer_traffic"] = combine_peer_traffic
     spec_meta = {
         "native_kind": NATIVE_KIND,
+        "aclnn_symbol": NATIVE_KIND,
+        "native_call": {
+            "api": {
+                "namespace": "aclnn",
+                "entry": "cann_ops_transformer.ops.mega_moe",
+                "aclnn_symbol": NATIVE_KIND,
+            },
+            "source": CANN_MEGAMOE_SOURCE,
+            "kernels": [{
+                "name": NATIVE_KIND,
+                "role": "mix",
+                "source_path": CANN_MEGAMOE_SOURCE["relative_path"],
+                "source_sha256": CANN_MEGAMOE_SOURCE["source_sha256"],
+                "evidence": "source_declared",
+            }],
+            "execution_core": "mix",
+        },
         "input_format": output_dtype,
         "output_format": output_dtype,
         "compute_format": compute_dtype,
@@ -577,3 +594,205 @@ def build(op: OpSpec, geometry: Geometry) -> OperatorPlan:
 
 def recipes() -> dict[str, PlannedRecipe]:
     return {RECIPE: PlannedRecipe(build)}
+
+
+_FP4_PAYLOAD_FORMATS = frozenset({"fp4_e2m1", "mxfp4", "mx_fp4", "mxfp4_e2m1"})
+_FLOAT_PAYLOAD_FORMATS = frozenset({"bf16", "fp16", "fp32"})
+
+
+def allow_abi_extension(runtime) -> bool:
+    """Return True when the active feature track or runtime explicitly permits ABI extensions."""
+    rmeta = dict(getattr(runtime, "metadata", ()) or ())
+    if bool(rmeta.get("allow_megamoe_abi_extension", False)) or bool(
+        rmeta.get("allow_extended_activation_abi", False)
+    ):
+        return True
+    report = rmeta.get("feature_track_report")
+    track = (
+        (report.get("feature_track") if isinstance(report, Mapping) else None)
+        or rmeta.get("feature_track")
+        or ""
+    )
+    return str(track).strip().lower() == "expected_ideal"
+
+
+def _payload_dtype(up_meta: Mapping) -> str:
+    act = str(up_meta.get("activation_format") or up_meta.get("compute_format") or "").lower()
+    if act in _FP4_PAYLOAD_FORMATS:
+        return "fp4_e2m1"
+    if act == "int8":
+        return "int8"
+    if act in _FLOAT_PAYLOAD_FORMATS:
+        return act
+    return "fp8_e4m3"
+
+
+def try_lower_fused_frame(
+    ops, by_id, selected, runtime, prefix, tokens, width, top_k, received_assignments,
+    ep, dtype, pack, dispatch, combine, unpack, pack_quant,
+    *, allow_int8_arch22: bool = False,
+):
+    """Lower a complete connected MoE dispatch->GMM1->act->GMM2->combine frame."""
+    e_up = by_id.get(prefix + ".expert_up")
+    e_act = by_id.get(prefix + ".expert_act")
+    e_down = by_id.get(prefix + ".expert_down")
+    up_meta = dict(e_up.metadata) if e_up is not None else {}
+    e_comp = str(up_meta.get("compute_format") or "").lower()
+    e_wfmt = str(up_meta.get("weight_format") or "").lower()
+    e_afmt = str(up_meta.get("activation_format") or "").lower()
+    mx_act = (
+        up_meta.get("activation_group_size") == MX_GROUP_SIZE
+        and up_meta.get("activation_scale_format") in {"fp8_e8m0", "e8m0"}
+    )
+    mxfp_eligible = mx_act and (
+        e_comp in {"fp8_e4m3", "mxfp4", "fp4_e2m1"}
+        or e_wfmt in {"mxfp8", "mxfp4", "fp8_e4m3", "fp4_e2m1"}
+    )
+    int8_eligible = allow_int8_arch22 and e_afmt == "int8" and e_wfmt in {"int8", "int4", "w4a8"}
+    if not (e_up is not None and e_act is not None and e_down is not None
+            and e_up.deps == (dispatch.op_id,)
+            and e_act.deps == (e_up.op_id,)
+            and e_down.deps == (e_act.op_id,)
+            and combine.deps == (e_down.op_id,)
+            and (mxfp_eligible or int8_eligible)):
+        return None
+    act_meta = dict(e_act.metadata)
+    act_kind = str(act_meta.get("activation_kind") or e_act.family or "swiglu").lower()
+    allow_ext = allow_abi_extension(runtime)
+    allowed_acts = ALL_ACTIVATIONS if allow_ext else SUPPORTED_ACTIVATIONS
+    if act_kind not in allowed_acts:
+        return None
+
+    fused_lvl = int(selected.get("fused_mc2_level") or FUSED_MC2_ROUTED_MODE)
+    fused_lvl = (
+        FUSED_MC2_SHARED_MODE
+        if (fused_lvl >= FUSED_MC2_SHARED_MODE and not allow_int8_arch22)
+        else FUSED_MC2_ROUTED_MODE
+    )
+    moe_inter = int(e_down.local_shape[-1])
+    down_meta = dict(e_down.metadata)
+    w13_b = float(up_meta.get("packed_weight_bytes") or max(0.0, e_up.mte2_bytes - received_assignments * width))
+    w2_b = float(down_meta.get("packed_weight_bytes") or max(0.0, e_down.mte2_bytes - received_assignments * moe_inter))
+    sh_ops = [item for item in ops if item.op_id.startswith(prefix + ".shared.")]
+    join_op = by_id.get(prefix + ".join")
+    sh_up = by_id.get(prefix + ".shared.gate_up")
+    sh_down = by_id.get(prefix + ".shared.down")
+    has_latent_moe = (
+        by_id.get(prefix + ".latent_down") is not None
+        or by_id.get(prefix + ".latent_up") is not None
+    )
+    fuse_shared = (
+        fused_lvl == FUSED_MC2_SHARED_MODE
+        and not has_latent_moe
+        and bool(sh_ops) and sh_up is not None
+        and sh_down is not None and join_op is not None
+        and len(join_op.deps) == 2 and unpack.op_id in join_op.deps
+        and any(dep.startswith(prefix + ".shared.") for dep in join_op.deps)
+    )
+    sh_inter = int(sh_up.local_shape[1] // 2) if fuse_shared else 0
+    sh_w13 = float(dict(sh_up.metadata).get("packed_weight_bytes") or 0.0) if fuse_shared else 0.0
+    sh_w2 = float(dict(sh_down.metadata).get("packed_weight_bytes") or 0.0) if fuse_shared else 0.0
+    removed_ids = {
+        pack.op_id, dispatch.op_id, e_up.op_id, e_act.op_id,
+        e_down.op_id, combine.op_id, unpack.op_id,
+    }
+    if pack_quant is not None:
+        removed_ids.add(pack_quant.op_id)
+    target_id = unpack.op_id
+    mega_deps = list(pack.deps)
+    for dep in unpack.deps:
+        if dep not in removed_ids and dep not in mega_deps:
+            mega_deps.append(dep)
+    if fuse_shared:
+        removed_ids.update(item.op_id for item in sh_ops)
+        removed_ids.add(join_op.op_id)
+        target_id = join_op.op_id
+        for item in sh_ops:
+            for dep in item.deps:
+                if dep not in removed_ids and dep not in mega_deps:
+                    mega_deps.append(dep)
+    if any(
+        dep in removed_ids and dep != target_id
+        for item in ops if item.op_id not in removed_ids
+        for dep in item.deps
+    ):
+        return None
+
+    dispatch_meta = dict(dispatch.metadata)
+    combine_meta = dict(combine.metadata)
+    group_axis = str(dispatch_meta.get("group_axis") or combine_meta.get("group_axis") or "ep")
+    collective_family = str(dispatch_meta.get("collective") or dispatch.family or "alltoall")
+    source_stage = dispatch_meta.get("source_stage", combine_meta.get("source_stage"))
+    peer_volume_basis = dispatch_meta.get("peer_volume_basis")
+
+    mega_op = make_op(
+        op_id=target_id, deps=tuple(mega_deps),
+        stage=unpack.stage, layer=unpack.layer,
+        requests=unpack.requests, phase=unpack.phase,
+        tokens=int(tokens), hidden=int(width),
+        moe_inter=moe_inter, top_k=int(top_k),
+        routed_rows=float(received_assignments),
+        w13_bytes=w13_b, w2_bytes=w2_b,
+        enable_fused_mc2=fused_lvl if fuse_shared else FUSED_MC2_ROUTED_MODE,
+        ep=int(ep), activation=act_kind,
+        compute_dtype=_payload_dtype(up_meta), output_dtype=dtype,
+        dispatch_link_bytes=float(dispatch.link_bytes),
+        combine_link_bytes=float(combine.link_bytes),
+        group_axis=group_axis,
+        collective=collective_family,
+        dispatch_peer_traffic=dispatch_meta.get("peer_traffic"),
+        combine_peer_traffic=combine_meta.get("peer_traffic"),
+        source_stage=int(source_stage) if source_stage is not None else None,
+        peer_volume_basis=str(peer_volume_basis) if peer_volume_basis is not None else None,
+        shared_inter=sh_inter, shared_w13_bytes=sh_w13,
+        shared_w2_bytes=sh_w2,
+        shared_compute_dtype=(
+            _payload_dtype(dict(sh_up.metadata)) if fuse_shared else None
+        ),
+        allow_abi_extension=allow_ext,
+        activation_params=act_meta.get("activation_params"),
+        extra_metadata=(
+            ("device_kernel_group", {
+                "id": prefix + ".megamoe",
+                "entry": True,
+                "exit": True,
+                "kernel": NATIVE_KIND,
+            }),
+        ),
+    )
+    rebuilt = []
+    inserted = False
+    absorbed_groups = [
+        dict(group)
+        for item in ops if item.op_id in removed_ids
+        for group in dict(item.metadata).get("structure_subgraphs", ())
+        if isinstance(group, dict) and str(group.get("role", "")).startswith("grouped_gate_up")
+    ]
+    for item in ops:
+        if item.op_id == target_id:
+            rebuilt.append(mega_op)
+            inserted = True
+        elif item.op_id in removed_ids:
+            continue
+        else:
+            rebuilt.append(item)
+    if inserted:
+        if absorbed_groups:
+            from mindie_sim.prediction.structure_groups import declare_group
+            for group in absorbed_groups:
+                impl = dict(group.get("implementation") or {})
+                impl["native_kind"] = NATIVE_KIND
+                declare_group(
+                    rebuilt, key=group["key"], role=group["role"],
+                    family=group.get("family", "moe"),
+                    members=(mega_op.op_id,), entries=(mega_op.op_id,),
+                    anchor=mega_op.op_id, block="ffn", scope_role="body",
+                    view=group.get("tensor_view", {}),
+                    implementation=impl, source=group.get("source"),
+                    coverage=group.get("coverage"),
+                    fusion_status="fused_existing",
+                    fusion_reason="megamoe_arch35_fused_mc2_kernel",
+                    native_fusion_eligible=False,
+                )
+        return rebuilt
+    return None

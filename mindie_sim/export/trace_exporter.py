@@ -383,7 +383,7 @@ def _operator_args(
         "Archetype": op.archetype_title or op.layer_label,
         "Submodule": op.submodule,
         "Logical Role": op.logical_role,
-        "Ascend Kernel": op.ascend_kernel or op.implementation,
+        "Ascend Kernel": op.ascend_kernel,
         "Kernel Backend": op.kernel_backend,
         "Kernel Status": op.kernel_status,
         "Source Ref": op.source_ref,
@@ -556,8 +556,8 @@ def _emit_op_and_pipes(
 ) -> tuple[list[dict[str, Any]], tuple[int, int, float, str], int]:
     pid, tid = _op_pid_tid(op, base_pid)
     cat = "Communication" if op.task_type == "HCCL" else "Kernel"
-    k_name = op.ascend_kernel or op.implementation
-    event_name = f"{k_name} [{op.canonical_op_key}]" if op.canonical_op_key else k_name
+    k_name = op.ascend_kernel or op.logical_role or op.canonical_op_key
+    event_name = f"{k_name} [{op.canonical_op_key}]" if (op.canonical_op_key and op.canonical_op_key != k_name) else k_name
     pipe_info = _compute_physical_pipe_times(op, bundle.hardware_peaks)
     ts_end = ts_start + op.dur_us
     events: list[dict[str, Any]] = [{
@@ -775,7 +775,7 @@ def _iter_scheduled_full_model_trace(
                     launch_name = f"aclGraphLaunch ({entry.scope.upper()})"
                     l_dur = HOST_GRAPH_LAUNCH_US
                 else:
-                    launch_name = f"aclrtLaunchKernel ({op.ascend_kernel})"
+                    launch_name = f"aclrtLaunchKernel ({op.ascend_kernel or op.logical_role or op.op_id})"
                     l_dur = HOST_KERNEL_LAUNCH_US
                 l_events, flow_id = _emit_host_launch_with_flow(
                     name=launch_name, dev_ts=op_ts, dev_pid=dev_pid, dev_tid=dev_tid,

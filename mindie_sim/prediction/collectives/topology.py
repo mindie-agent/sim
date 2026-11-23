@@ -634,7 +634,7 @@ class Topology(_TopologyPlansMixin):
                     for link in links), default=0.0)
 
     def _oneshot_startup_ms(self) -> float:
-        """Hardware-derived AIV/CCU launch floor for a single-round one-shot collective.
+        """Hardware-derived vector launch floor for a single-round one-shot collective.
 
         Derived strictly from the SKU's declared ``kernel_invocations["vector"]``
         minimum launch floor (and calibrated L0 ``P15``/``P16`` sync primitives

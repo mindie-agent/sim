@@ -654,3 +654,75 @@ def test_oneshot_allreduce_replay_accounts_direct_peer_exchange():
     assert sum(topo.accounting(op_tp, 0).useful_by_rank.values()) == pytest.approx(
         ranks * ring_link_bytes
     )
+
+
+def test_superpod_ep32_cohort_band_execution_and_late_arrival():
+    """Verify cohort-wide BandCollectivePlan binding across 2-node 32-die EP32 (asymmetric, zero, late arrival)."""
+    from _support.axes import REPRESENTATIVE_SKUS
+    from mindie_sim.compose import compose_case
+    from mindie_sim.prediction.operators.collectives.topology_collective import TopologyCollectiveRecipe
+    from mindie_sim.prediction.efficiency.cost import CostModel
+    from mindie_sim.schema.operators import IterationPlan, IterationWork, OpSpec
+    from mindie_sim.schema.workload import RequestView
+
+    raw = compose_case(
+        "qwen3.5-397b-a17b", REPRESENTATIVE_SKUS["a3"], topology_preset="a3_superpod",
+        tp=16, dp=2, ep=32, layers=1, quant="w8a8",
+    )
+    parsed = parse_case(raw)
+
+    def _run_ep32(matrix, release_r1_ms: float):
+        ex = Execution(parsed, CostModel(parsed), include_submission=False, trace_limit=64)
+        row_totals = [float(sum(row)) for row in matrix]
+        works = {}
+        for rep in (0, 1):
+            r_vol = row_totals[rep * 16]
+            op_deps = ("r1_gate",) if (rep == 1 and release_r1_ms > 0.0) else ()
+            op_disp = OpSpec(
+                op_id="l0.dispatch", deps=op_deps, family="alltoallv", recipe="expert_dispatch",
+                phase="decode", stage=0, layer=0, stream="main", dtype="bf16",
+                link_bytes=r_vol, link_scope="ep", requests=(f"req{rep}",),
+                semantic_shape=(1, 16), local_shape=(1, 16), padded_shape=(1, 16), launch_shape=(1, 16),
+                metadata=(
+                    ("group_axis", "ep"),
+                    ("collective", "alltoallv"),
+                    ("peer_traffic", {"kind": "matrix", "payload_bytes": matrix, "direction": "forward"}),
+                ),
+            )
+            works[rep] = IterationWork(
+                plan=IterationPlan(iteration=0, requests=(RequestView(f"req{rep}", q_len=1, context=16, samples=True, phase="decode"),)),
+                ops=(op_disp,), stage_count=1, mode="decode", valid_tokens=1, padded_tokens=1,
+                graph_bucket=1, recipe="default", replay_scope="full",
+            )
+        ext = None
+        if release_r1_ms > 0.0:
+            delay_ev = ex.engine.submit("r1_delay", latency=release_r1_ms)
+            ext = {1: {"r1_gate": delay_ev}}
+        steps = ex.add_group(works, 0.0, external_inputs=ext)
+        ex.engine.advance()
+        assert ex.recipes_used
+        return steps, list((ex._joint_collective_trace or {}).values())
+
+    # 1. Asymmetric matrix: replica 0 sends 4 KiB to rank 16, replica 1 sends 2 KiB to rank 0.
+    asym = [[0] * 32 for _ in range(32)]
+    for r in range(16):
+        asym[r][16 + r] = 4096
+    for r in range(16, 32):
+        asym[r][r - 16] = 2048
+    steps_a, obs_a = _run_ep32(asym, 0.0)
+    assert obs_a and obs_a[0]["band_plan"]["algorithm"] == "direct_mesh"
+    assert obs_a[0]["band_plan"]["round_count"] == 1
+    assert obs_a[0]["band_plan"]["startup_us"] == pytest.approx(3.5)
+    # Single direct optical phase must complete far below legacy 31 x 3.5 us = 108.5 us ring setup.
+    assert float(steps_a[0].completion.time) < 0.05
+
+    # 2. Late arrival of replica 1 delays completion causally by >= 2.0 ms.
+    steps_late, _ = _run_ep32(asym, 2.0)
+    assert float(steps_late[0].completion.time) >= 2.0
+    assert float(steps_late[1].completion.time) >= 2.0
+
+    # 3. Zero remote traffic yields 0 phases and 0 network delay.
+    zero = [[0] * 32 for _ in range(32)]
+    steps_z, obs_z = _run_ep32(zero, 0.0)
+    assert obs_z and obs_z[0]["band_plan"]["phase_count"] == 0
+    assert float(steps_z[0].completion.time) == pytest.approx(0.0)

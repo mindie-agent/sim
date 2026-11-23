@@ -29,6 +29,7 @@ from mindie_sim.schema.subgraphs import (
 )
 
 from mindie_sim.prediction.operators.paged_mla import paged_mla
+from .common import ABI_PUBLIC_IDENTITY, FIA_ABI, FLASH_ABI
 from .family_paged_mla_contract import _fragment
 from mindie_sim.prediction.mechanism import PlannedRecipe
 
@@ -38,6 +39,12 @@ _ARCH35_BRANCH = 'arch35_bf16_noquant_mla'
 _ARCH35_RECIPE = 'mindie_sim.prediction.paged_mla.build'
 _LATENT_WIDTH = 512
 _ROPE_WIDTH = 64
+_ARCH22_SOURCE = {
+    'repository': 'cann/ops-transformer',
+    'revision': '2d3f4f6db0231ac2e9e487cf62e94f6e173eb946',
+    'relative_path': 'attention/fused_infer_attention_score/op_kernel/arch22/fia_kernel_nonquant_mla.h',
+    'source_sha256': '47c22ec83a6e771df0185add46c91c4404ce87ad7feee1f9666a129190231e92',
+}
 
 
 def _augment_plan(plan, op):
@@ -341,8 +348,15 @@ def _declaration(*, views, plan, parallel, runtime, padded_tokens=None,
         unresolved.append('kv_request_rank_unresolved')
     if operands['attention_scale'] is None:
         unresolved.append('attention_scale_source_unresolved')
+    selected_abi = FIA_ABI if is_arch22 else FLASH_ABI
+    native_kind, native_entry, native_ns = ABI_PUBLIC_IDENTITY[selected_abi]
+    source_rec = _ARCH22_SOURCE if is_arch22 else paged_mla.SOURCE
+    source_path = str(source_rec.get('relative_path') or source_rec.get('cube') or '')
+    source_sha = str(source_rec.get('source_sha256') or '')
     abi = {
-        'call': 'FusedInferAttentionScore',
+        'call': native_kind,
+        'aclnn_symbol': selected_abi,
+        'entry': native_entry,
         'branch': branch,
         'implementation': implementation,
         'program_recipe': program_recipe,
@@ -399,10 +413,37 @@ def _declaration(*, views, plan, parallel, runtime, padded_tokens=None,
         kv_condition=kv_condition, kv_producer=kv_producer, kv_output=kv_output,
         kv_storage=kv_storage, spans=spans, request_ids=request_ids,
         request_rank=request_rank)
+    metadata['native_kind'] = native_kind
+    metadata['aclnn_symbol'] = selected_abi
+    metadata['native_source'] = source_rec
+    metadata['native_call'] = {
+        'api': {
+            'namespace': native_ns,
+            'entry': native_entry,
+            'aclnn_symbol': selected_abi,
+        },
+        'source': {
+            'repository': source_rec.get('repository'),
+            'revision': source_rec.get('revision'),
+            'relative_path': source_path,
+            'source_sha256': source_sha,
+        },
+        'kernels': [{
+            'name': native_kind,
+            'role': 'mix',
+            'source_path': source_path,
+            'source_sha256': source_sha,
+            'evidence': 'source_declared',
+        }],
+        'execution_core': 'mix',
+    }
     return {
         'geometry': geometry,
         'operands': operands,
         'implementation': implementation,
+        'native_kind': native_kind,
+        'aclnn_symbol': selected_abi,
+        'native_entry': native_entry,
         'branch': branch,
         'program_recipe': program_recipe,
         'metadata': metadata,

@@ -54,16 +54,40 @@ def select_native_protocol(kernels):
     return raw
 
 
+def _protocol_module_for_arch(arch_family: str = "", moe_comm=None):
+    """Select the native MC2 protocol leaf from declared architecture/policy."""
+    arch = str(arch_family or "").strip().upper()
+    if not arch and moe_comm:
+        comm_map = dict(moe_comm)
+        arch = str(comm_map.get("arch_family", "") or "").strip().upper()
+        if not arch:
+            policy = str(comm_map.get("policy", "") or "").strip().lower()
+            if policy in {"fused_or_capacity", "capacity_and_expert_density"}:
+                arch = "A3"
+            elif policy == "capacity_and_world_size":
+                arch = "A5"
+    if arch in {"A2", "A3"}:
+        return arch22
+    return arch35
+
+
 def native_protocol_recipes(kernels):
     """Register recipes for the declared or automatically selected protocol."""
     selected = select_native_protocol(kernels)
-    strategy = _DEFAULT_NATIVE_PROTOCOL if selected is None else _NATIVE_PROTOCOLS[selected["kind"]]
-    return strategy.native_protocol_recipes(selected)
+    if selected is None:
+        return {
+            **arch35.native_protocol_recipes(None),
+            arch22.mc2_local_caller.LOCAL: arch22.mc2_local_caller.PlannedRecipe(
+                arch22.mc2_local_caller.build
+            ),
+        }
+    return _NATIVE_PROTOCOLS[selected["kind"]].native_protocol_recipes(selected)
 
 
-def common_native_protocol(chosen, fused_level, moe_comm):
+def common_native_protocol(chosen, fused_level, moe_comm, *, arch_family: str = ""):
     """Describe the protocol used by common MoE communication selection."""
-    return _DEFAULT_NATIVE_PROTOCOL.common_native_protocol(chosen, fused_level, moe_comm)
+    leaf = _protocol_module_for_arch(arch_family, moe_comm)
+    return leaf.common_native_protocol(chosen, fused_level, moe_comm)
 
 
 def lower_native_protocol(ops, *, selected, **caller):
