@@ -234,6 +234,7 @@ def test_xlsx_before_after_merge_cells_formulas_and_new_kernel_backlog(tmp_path)
         concurrency=4, tpot_slo_ms=30.0, mtp_proposal_tokens=5,
         mtp_acceptance_length=3.5, feature_track="merged",
     )
+    raw_bef["runtime"].get("kernels", {}).get("lowerings", {}).pop("native_fusion", None)
     raw_aft, _ = compose_export_case(
         "kimi-k3.1", REPRESENTATIVE_SKUS["a5"], topology_preset="a5_pod",
         dp=2, tp=2, ep=4, dcp=2, prompt_tokens=2048, output_tokens=64,

@@ -322,7 +322,7 @@ def test_capacity_query_width_and_windowed_mtp_draft_geometry():
     delta = (Memory(drafted).cache_bytes(512)[-1]
              - Memory(plain).cache_bytes(512)[-1])
     assert delta == pytest.approx(expected)
-    assert delta == DRAFT_PAGE_ROWS * (2 * 2 * 16) * 2
+    assert delta == (2 * DRAFT_PAGE_ROWS) * (2 * 2 * 16) * 2
 
 
 def _kda_norm_case():

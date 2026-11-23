@@ -559,8 +559,8 @@ def test_shrunk_fixture_runs_public_graph_and_preserves_work(
         projections = [op for op in ops if op.family == "qkv_projection"]
         assert len(projections) == 2
         assert sum(op.flops for op in projections) == 2 * 2 * tokens * 32 * 8 * width
-        assert len([op for op in ops if op.recipe == "qk_norm"]) == (
-            2 if name.startswith("qwen3") else 0)
+        assert len([op for op in ops if op.recipe in {"q_norm", "k_norm"}]) == (
+            4 if name.startswith("qwen3") else 0)
         assert all(op.dtype == "bf16" for op in ops if op.family == "router")
         assert not any(op.op_id.endswith("router_cast") for op in ops)
     else:

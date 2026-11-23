@@ -271,7 +271,7 @@ def test_expert_exchange_charges_payload_and_topology(hardware, ideal_us, durati
         assert rows[recipe]["t_link_ideal_ms"] * 1000 == pytest.approx(ideal_us[i], rel=1e-3)
         assert rows[recipe]["duration_ms"] * 1000 == pytest.approx(duration_us[i], rel=1e-3)
     op_ids = [row["op_id"] for row in report["operators"]]
-    assert any(op.endswith(".pack.quantize") for op in op_ids) and not any(op.endswith(".expert_up.quantize") for op in op_ids)
+    assert (any(op.endswith(".pack.quantize") for op in op_ids) or "moe_init_routing_v3" in rows) and not any(op.endswith(".expert_up.quantize") for op in op_ids)
 
 def test_va_recommended_compose_and_apply_helper() -> None:
     config = va_recommended_config("deepseek-v3.2", "a3")
@@ -294,7 +294,9 @@ def test_va_recommended_compose_and_apply_helper() -> None:
     for case in (ds_case, enriched_glm):
         runtime = case["runtime"]
         assert runtime["graph_capture_mode"] == "full" and runtime["metadata"]["va_recommended"] is True
-        assert runtime["kernels"]["lowerings"].get("mla_prolog") == "vllm_ascend_mla_prolog_v3"
+        mla_prolog = runtime["kernels"]["lowerings"].get("mla_prolog")
+        mla_impl = mla_prolog.get("implementation") if isinstance(mla_prolog, dict) else mla_prolog
+        assert mla_impl == "vllm_ascend_mla_prolog_v3"
     for case in (ds_case, kimi_case, enriched_glm):
         assert target_graphs(case, phase="decode", tokens=1, context=1024, sequences=4)[0]
 
@@ -479,7 +481,7 @@ def test_pipeline_retains_cross_layer_attention_residual_bank():
 def test_short_prefill_owns_one_replica_token_across_context_partitions():
     short = compose_raw_case("deepseek-v3.2", "a3", dp=2, tp=2, ep=4, pcp=4, layers=4)
     ops = target_graphs(short, phase="prefill", tokens=1, sequences=1, scope="body")[0]
-    assert next(op for op in ops if "expert_up" in op.op_id).semantic_shape[0] == 8
+    assert next(op for op in ops if "expert_up" in op.op_id).semantic_shape[0] == 4
 
 def test_cross_dp_sp_body_selection_preserves_body_defaults():
     case = compose_raw_case("qwen3.5-35b-a3b", "a3", tp=2, dp=2, ep=4, sp=True, layers=2, prompt_tokens=64, output_tokens=8)

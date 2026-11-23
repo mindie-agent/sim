@@ -421,9 +421,9 @@ def _local_cache_rows(
     return float(rows) if cp <= 1 else rows / cp
 
 
-def _window_cache_rows(seq: int, window: int, *, padded: bool, block: int) -> int:
+def _window_cache_rows(seq: int, window: int | None, *, padded: bool, block: int) -> int:
     """Sliding-window row count, adding +1 active write page when padded and seq > window."""
-    if window <= 0:
+    if not window or window <= 0:
         return seq
     if padded and seq > window:
         blk = max(1, int(block))

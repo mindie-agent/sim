@@ -81,6 +81,7 @@ def test_indexer_layer_norm_raw_eager_retains_fp32_wrapper_casts() -> None:
         case = compose_case(
             "glm-5.2", hardware=sku, feature_track=track,
             tp=TP_WIDTH, num_devices=TP_WIDTH, layers=SAMPLE_LAYERS,
+            indexer_kv_dtype="bf16",
         )
         rep = export_structure(
             case, phase="decode", tokens=DECODE_TOKENS,

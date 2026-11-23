@@ -66,7 +66,7 @@ def catalog_case(**overrides):
                 layers=4, prompt_tokens=2048, output_tokens=64, concurrency=1)
     base.update(overrides)
     return compose_case(**base)
-def tight_case(gpu_memory_utilization=0.03, **overrides):
+def tight_case(gpu_memory_utilization=0.032, **overrides):
     case = catalog_case(**overrides); case["runtime"]["gpu_memory_utilization"] = gpu_memory_utilization; case["runtime"]["max_model_len"] = 131072
     return case
 def with_offload(case_spec, *, ddr=0.5, ssd=0.25, ddr_bw_gbps=200.0, ssd_bw_gbps=14.0):

@@ -121,6 +121,34 @@ def _resolve_cube_peak(hw: Mapping[str, Any], dtype: str, default_dtype: str = "
             return min(float(d.peak(target)) for d in (hw.get("dies") or (hw["die"],)))
 
 
+def _link_effective_bps(lnk: Any, active_width: int) -> float:
+    """Effective per-die link bandwidth (B/s) aligned with causal_tail link supply."""
+    raw_bps = float(getattr(lnk, "capacity_bytes_per_ms", 0.0) or 0.0) * 1000.0
+    if raw_bps <= 0.0:
+        return 0.0
+    sem = str(getattr(lnk, "semantics", "") or "").strip().lower()
+    members = getattr(lnk, "members", ()) or ()
+    width = max(1, int(active_width))
+    span = min(width, len(members)) if members else width
+    if sem == "per_pair":
+        eff = raw_bps * float(max(1, span - 1))
+        ep_rates = [
+            float(r) * 1000.0
+            for _, r in (getattr(lnk, "endpoint_rates", ()) or ())
+            if float(r) > 0.0
+        ]
+        if ep_rates:
+            eff = min(eff, max(ep_rates))
+    elif sem == "shared":
+        eff = raw_bps / float(max(1, span))
+    else:
+        eff = raw_bps
+    sw_cap = getattr(lnk, "switch_capacity_bytes_per_ms", None)
+    if sw_cap is not None and float(sw_cap) > 0.0:
+        eff = min(eff, float(sw_cap) * 1000.0)
+    return eff
+
+
 def extract_hardware_peaks(case: CaseSpec | Mapping[str, Any], *, stage: int = DEFAULT_STAGE, replica: int = DEFAULT_REPLICA) -> dict[str, Any]:
     """Extract conservative stage-level Cube, Vector, HBM, MTE, and Link peak rates in SI units (/s)."""
     parsed = parse_case(case)
@@ -140,13 +168,13 @@ def extract_hardware_peaks(case: CaseSpec | Mapping[str, Any], *, stage: int = D
                    if "intra_package" in lnk.channel
                    or "intra_node" in lnk.channel
                    or len(lnk.members) <= parsed.machine.dies_per_package]
-    intra_bw = max((
-        lnk.capacity_bytes_per_ms * 1000.0 * (
-            max(1, min(active_width, len(lnk.members)) - 1)
-            if lnk.semantics == "per_pair" else 1.0)
-        for lnk in intra_links), default=0.0)
-    inter_bw = min((lnk.capacity_bytes_per_ms * 1000.0 for lnk in links),
-                   default=0.0)
+    inter_links = [lnk for lnk in links if lnk not in intra_links]
+    intra_bw = max((_link_effective_bps(lnk, active_width) for lnk in intra_links), default=0.0)
+    inter_bw = (
+        min((bw for lnk in inter_links if (bw := _link_effective_bps(lnk, active_width)) > 0.0),
+            default=0.0)
+        or intra_bw
+    )
     link_peak = (
         intra_bw if (active_width <= max(parsed.machine.dies_per_package,
                                          parsed.machine.ranks_per_node)

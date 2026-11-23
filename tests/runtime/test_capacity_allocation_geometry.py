@@ -515,7 +515,7 @@ def test_grant_decision_names_waitable_release_and_permanent_deficit():
 
 
 @pytest.mark.parametrize("filename,tail,weight_scales", [
-    ("qwen38-a5.json", 0, True), ("glm53-a5.json", 2_883_584, False),
+    ("qwen38-a5.json", 0, True), ("glm53-a5.json", 3_063_808, False),
 ])
 def test_catalog_rank_plan_conserves_weight_and_cache_bytes(filename, tail, weight_scales):
     memory = Memory(parse_case(json.loads((EXAMPLE_CASES / filename).read_text(encoding="utf-8"))))

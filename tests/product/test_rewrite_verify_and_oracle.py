@@ -77,7 +77,7 @@ def _with_die(scenario, die):
 def test_structure_gate_rejects_unproved_dependencies(real_graph, defect, reason):
     scenario, applied = real_graph
     assert verify_plan(scenario, applied).gates[0].passed
-    qkv, norm, rope = (f"s0.l0.{suffix}" for suffix in ("qkv", "qk_norm", "rope"))
+    qkv, norm, rope = (f"s0.l0.{suffix}" for suffix in ("qkv", "q_norm", "rope"))
     if defect == "region":
         changed = replace(applied, absorbed_atoms=((rope, (qkv, rope)),))
     elif defect == "credits":
@@ -161,7 +161,7 @@ def lane_graph(real_graph):
     by_id = {op.op_id: op for op in rank.ops}
     mixed = replace(by_id["s0.l0.attention"], op_id="mixed", deps=(), metadata=())
     vector = replace(by_id["s0.l0.norm1"], op_id="vector", deps=(), metadata=())
-    comm = replace(by_id["s0.l0.qkv.value"], op_id="comm", deps=(), metadata=())
+    comm = replace(by_id["s0.l0.cache"], op_id="comm", deps=(), flops=0.0, vector_ops=0.0, metadata=())
     assert mixed.flops and mixed.vector_ops and vector.vector_ops and not vector.flops
     assert comm.flops == comm.vector_ops == 0
     scenario = replace(scenario, atomic_ops=(replace(rank, ops=(mixed, vector, comm)),))

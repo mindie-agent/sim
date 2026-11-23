@@ -475,7 +475,7 @@ def test_shared_value_projection_keeps_two_cache_planes_and_qkv_widths() -> None
     widths = {layer: {op.local_shape[1] for op in operators
                       if op.layer == layer and op.recipe == "qkv_projection"}
               for layer in (0, 5)}
-    assert widths == {0: {8192}, 5: {9216}}
+    assert widths == {0: {8192}, 5: {10240}}
 
 def test_customize_model_spec_conserves_parameters_layers_and_router_groups() -> None:
     from mindie_sim.schema.common import ModelingError

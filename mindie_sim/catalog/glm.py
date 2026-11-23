@@ -160,6 +160,31 @@ def _glm_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
     return plans
 
 
+def _glm_kda_plan(
+    index: int, kda_heads: int, kda_dim: int, conv_k: int, conv_width: int,
+    ffn_fields: Mapping[str, Any],
+) -> LayerPlan:
+    return LayerPlan(
+        index=index, attention="kda", architecture="kda",
+        linear_heads=kda_heads, linear_head_dim=kda_dim,
+        linear_key_heads=kda_heads, linear_key_head_dim=kda_dim,
+        linear_value_heads=kda_heads, packed_input_projection=True,
+        gate_rank=kda_dim, projection_dtype="bf16",
+        conv_kernel=conv_k, conv_width=conv_width,
+        recurrent_state_elements=kda_heads * kda_dim * kda_dim,
+        recurrent_state_dtype="fp32",
+        conv_state_elements=conv_width * (conv_k - 1),
+        conv_state_dtype="bf16",
+        kda_gate_lower_bound=GLM_KDA_GATE_LOWER_BOUND,
+        kda_batch_chunk_norm=True,
+        state_bytes=float(
+            kda_heads * kda_dim * kda_dim * FP32_STATE_BYTES
+            + conv_width * (conv_k - 1) * 2
+        ),
+        kv_owner_layer_id=index, **ffn_fields,
+    )
+
+
 def _glm_hybrid_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
     """Plans for the Flash release: native ``layer_types`` + KDA config.
 
@@ -247,33 +272,7 @@ def _glm_hybrid_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
             native_layer_id=index,
         )
         if kind in {"linear_attention", "kda"}:
-            plans.append(LayerPlan(
-                index=index,
-                attention="kda",
-                architecture="kda",
-                linear_heads=kda_heads,
-                linear_head_dim=kda_dim,
-                linear_key_heads=kda_heads,
-                linear_key_head_dim=kda_dim,
-                linear_value_heads=kda_heads,
-                packed_input_projection=True,
-                gate_rank=kda_dim,
-                projection_dtype="bf16",
-                conv_kernel=conv_k,
-                conv_width=conv_width,
-                recurrent_state_elements=kda_heads * kda_dim * kda_dim,
-                recurrent_state_dtype="fp32",
-                conv_state_elements=conv_width * (conv_k - 1),
-                conv_state_dtype="bf16",
-                kda_gate_lower_bound=GLM_KDA_GATE_LOWER_BOUND,
-                kda_batch_chunk_norm=True,
-                state_bytes=float(
-                    kda_heads * kda_dim * kda_dim * FP32_STATE_BYTES
-                    + conv_width * (conv_k - 1) * 2
-                ),
-                kv_owner_layer_id=index,
-                **ffn_fields,
-            ))
+            plans.append(_glm_kda_plan(index, kda_heads, kda_dim, conv_k, conv_width, ffn_fields))
         elif kind in {"deepseek_sparse_attention", "full_attention", "mla"}:
             plans.append(LayerPlan(
                 index=index,

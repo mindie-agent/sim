@@ -495,7 +495,10 @@ def test_split_pipes_receive_private_refill_service():
     assert attention.mte2_bytes >= traffic["private_refill_bytes"]
     row = operator_costs(case, (attention,), input_ready_ms=7)["operators"][0]
     assert row["serviced"]["mte2_aic@r0:s0"] == pytest.approx(attention.mte2_bytes)
-    norm = next(item for item in operations if item.family in {"rmsnorm", "add_rmsnorm"})
+    norm = next(
+        item for item in operations
+        if item.family in {"rmsnorm", "add_rmsnorm", "rmsnorm_quant", "add_rmsnorm_quant"}
+    )
     norm_row = operator_costs(case, (norm,), input_ready_ms=7)["operators"][0]
     assert norm_row["serviced"].get("mte2_aiv@r0:s0", 0.0) > 0.0
 

@@ -578,7 +578,8 @@ def _compute_cache_ledger_rows(
             if scalable else 0.0
         )
         for st_idx, st_val in enumerate(per_stage):
-            stage_per_req_totals[st_idx] += st_val
+            if comp_name != "c8_static_channel_scale":
+                stage_per_req_totals[st_idx] += st_val
             stage_totals[st_idx] += st_val * float(concurrency)
         if not scalable:
             c_kind = "State (Fixed)"
@@ -1073,6 +1074,7 @@ def _compute_max_hbm_concurrency(
     *,
     phase: str,
     resolved_seq: int,
+    stage_fixed_cache: Sequence[float] = (),
 ) -> int:
     """Binary-search exact per-DP HBM concurrency honoring per-batch workspace growth."""
     static_fixed = [
@@ -1080,6 +1082,7 @@ def _compute_max_hbm_concurrency(
         + st.weight_scale_aux_bytes
         + st.engram_ple_hbm_bytes
         + st.reserve_bytes
+        + (float(stage_fixed_cache[st.stage]) if st.stage < len(stage_fixed_cache) else 0.0)
         for st in stage_budgets
     ]
     ws_1_tok = _resolve_ledger_workspace_tokens(
@@ -1429,9 +1432,14 @@ def compute_memory_quant_ledger(
             resolved_offload=resolved_offload,
         )
     )
+    stage_fixed_cache = [
+        max(0.0, float(stage_cache_bytes[st]) - float(resolved_conc) * float(stage_per_req_cache[st]))
+        for st in range(len(stage_budgets))
+    ]
     max_conc = _compute_max_hbm_concurrency(
         case, stage_budgets, stage_per_req_cache, resolved_conc,
         phase=phase, resolved_seq=resolved_seq,
+        stage_fixed_cache=stage_fixed_cache,
     )
     return MemoryCalculatorLedger(
         model_name=str(case.model.name),

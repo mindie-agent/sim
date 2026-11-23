@@ -745,6 +745,14 @@ def _effective_die_supply(
             service_modes["hbm_rw11_dram"] = ("hbm", overlay.hbm_rw11_bytes_per_s)
         if overlay.hbm_rw21_bytes_per_s is not None:
             service_modes["hbm_rw21_dram"] = ("hbm", overlay.hbm_rw21_bytes_per_s)
+    if orig_hbm_cap > 0.0:
+        cap_updates: dict[str, Any] = {}
+        if float(datapath.hbm_read_bytes_per_s or 0.0) > orig_hbm_cap:
+            cap_updates["hbm_read_bytes_per_s"] = orig_hbm_cap
+        if float(datapath.hbm_write_bytes_per_s or 0.0) > orig_hbm_cap:
+            cap_updates["hbm_write_bytes_per_s"] = orig_hbm_cap
+        if cap_updates:
+            datapath = replace(datapath, **cap_updates)
     link_bps = _resolve_die_link_supply_bps(
         int(die.rank),
         links,

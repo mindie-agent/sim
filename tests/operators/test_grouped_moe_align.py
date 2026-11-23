@@ -372,7 +372,8 @@ def test_in_operator_dbo_rejects_cohort_and_context_shards(dp, ep, pcp, phase, s
     raw = compose_case(
         "qwen3-30b-a3b", hardware="a5", tp=1, dp=dp, ep=ep, pcp=pcp,
         num_devices=dp * pcp, layers=1, enable_dbo=True, prompt_tokens=8,
-        output_tokens=2, max_num_seqs=4 if decode else 2)
+        output_tokens=2, max_num_seqs=4 if decode else 2,
+        exclude_optimizations=("cann_megamoe_fusion",))
     if ep > dp:
         raw["runtime"]["parallel"]["rank_table"] = [[0, 1]]
 
@@ -389,7 +390,10 @@ def test_in_operator_dbo_rejects_cohort_and_context_shards(dp, ep, pcp, phase, s
     raw["runtime"]["enable_dbo"] = False
     for ops in graph().values():
         assert not [op for op in ops if op.op_id.startswith("dbo")]
-        packs = [op.local_shape[0] * op.local_shape[1] for op in ops if op.recipe == "route_pack"]
+        packs = [
+            op.local_shape[0] * op.local_shape[1]
+            for op in ops if op.recipe in {"route_pack", "moe_init_routing_v3"}
+        ]
         gates = [op.local_shape[0] for op in ops if op.recipe == "grouped_gate_up"]
         unpack = [op.local_shape[0] * op.local_shape[1] for op in ops if op.recipe == "route_unpack"]
         assert packs == gates == unpack == [64]

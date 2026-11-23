@@ -79,9 +79,10 @@ SOURCE_INTERFACE = {
     "weight_scale_format": "fp8_e8m0",
     "weight_scale_storage_format": "fp8_e8m0",
     "weight_representation": "fp4_group32_packed",
+    "compute_format": "fp8_e4m3",
     "output_format": "bf16",
-    "compute_format": "bf16",
 }
+_ACCEPTED_COMPUTE_FORMATS = frozenset({"fp8_e4m3", "bf16"})
 SHARED_FAMILIES = ("gate_up_projection", "down_projection")
 
 
@@ -135,7 +136,9 @@ def matches_source_interface(op):
         return False
     if meta.get("native_fusion_group") or meta.get("native_fusion"):
         return False
-    if any(meta.get(key) != value for key, value in SOURCE_INTERFACE.items()):
+    if any(meta.get(key) != value for key, value in SOURCE_INTERFACE.items() if key != "compute_format"):
+        return False
+    if meta.get("compute_format") not in _ACCEPTED_COMPUTE_FORMATS:
         return False
     if meta.get("weight_block") not in (None, MX_SCALE_GROUP):
         return False

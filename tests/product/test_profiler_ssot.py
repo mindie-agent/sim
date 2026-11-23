@@ -60,7 +60,10 @@ DESCRIPTOR_FIELDS = tuple(f"{side}_{field}" for side in ("input", "output") for 
 
 @lru_cache(maxsize=16)
 def _declared_contracts(model, hardware, tp, phase, tokens, context, layers):
-    case = compose_case(model, hardware, tp=tp, prompt_tokens=tokens if phase == "prefill" else 8, output_tokens=4, layers=layers)
+    case = compose_case(
+        model, hardware, tp=tp, prompt_tokens=tokens if phase == "prefill" else 8,
+        output_tokens=4, layers=layers, kv_cache_dtype="bf16", indexer_kv_dtype="bf16",
+    )
     # The captures predate optional native fusions and declare the eager boundary.
     case["runtime"].setdefault("metadata", {})["execution_policy"] = {"automatic_optional_fusions": False}
     report = export_structure(case, phase=phase, tokens=tokens, context=context, sequences=1, scope="body")
@@ -385,10 +388,13 @@ def test_subgraph_efficiency_rejects_invalid_measurement_or_work(work, options, 
 
 def _export(model, *, tokens=128, layers=2, fuse=False):
     case = compose_case(model, "a3", tp=8, prompt_tokens=tokens, output_tokens=4, layers=layers)
+    lowerings = case["runtime"]["kernels"].setdefault("lowerings", {})
     if fuse:
-        case["runtime"]["kernels"].setdefault("lowerings", {})["native_fusion"] = {
+        lowerings["native_fusion"] = {
             "implementation": "declared_native_fusion", "options": {"roles": ["mla_prolog"],
                         "traffic_profile": MLA_SPLIT_PROFILE},}
+    else:
+        lowerings.pop("native_fusion", None)
     return export_structure(case, phase="prefill", tokens=tokens, context=0, sequences=1, scope="body")
 
 MATH_FIELDS = ("algebraic_cube_flops", "algebraic_vector_ops", "minimal_boundary_hbm_bytes")

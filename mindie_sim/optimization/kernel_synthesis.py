@@ -1008,6 +1008,7 @@ def _extract_hardware_supply(
         base_launch = float(stars.issue_interval_us) if stars is not None else 0.0
         launch_vec = launch_cube = base_launch
 
+    orig_hbm_cap = float(rates.get("hbm") or 0.0)
     if primitive_table is not None:
         sku = getattr(die, "sku", "") if die is not None else ""
         overlay = resolve_sim_rate_overlay(primitive_table, datapath, sku=sku)
@@ -1017,14 +1018,31 @@ def _extract_hardware_supply(
         for dt, pk in overlay.compute_peaks:
             if pk > 0.0:
                 peaks[dt] = pk
+        dp_updates: dict[str, Any] = {}
         if overlay.hbm_read_bytes_per_s is not None:
-            service_modes["mte2_aiv_dram"] = ("mte2_aiv" if "mte2_aiv" in rates else "mte2", overlay.hbm_read_bytes_per_s)
+            hbm_r_ov = float(overlay.hbm_read_bytes_per_s)
+            dp_updates["hbm_read_bytes_per_s"] = min(hbm_r_ov, orig_hbm_cap) if orig_hbm_cap > 0.0 else hbm_r_ov
+            service_modes["mte2_aiv_dram"] = ("mte2_aiv" if "mte2_aiv" in rates else "mte2", hbm_r_ov)
         if overlay.hbm_write_bytes_per_s is not None:
-            service_modes["hbm_write_dram"] = ("hbm", overlay.hbm_write_bytes_per_s)
+            hbm_w_ov = float(overlay.hbm_write_bytes_per_s)
+            dp_updates["hbm_write_bytes_per_s"] = min(hbm_w_ov, orig_hbm_cap) if orig_hbm_cap > 0.0 else hbm_w_ov
+            service_modes["hbm_write_dram"] = ("hbm", hbm_w_ov)
+        if overlay.hbm_rw_alpha is not None:
+            dp_updates["hbm_rw_alpha"] = float(overlay.hbm_rw_alpha)
+        if dp_updates:
+            datapath = replace(datapath, **dp_updates)
         if overlay.hbm_rw11_bytes_per_s is not None:
             service_modes["hbm_rw11_dram"] = ("hbm", overlay.hbm_rw11_bytes_per_s)
         if overlay.hbm_rw21_bytes_per_s is not None:
             service_modes["hbm_rw21_dram"] = ("hbm", overlay.hbm_rw21_bytes_per_s)
+    if orig_hbm_cap > 0.0:
+        cap_updates: dict[str, Any] = {}
+        if float(datapath.hbm_read_bytes_per_s or 0.0) > orig_hbm_cap:
+            cap_updates["hbm_read_bytes_per_s"] = orig_hbm_cap
+        if float(datapath.hbm_write_bytes_per_s or 0.0) > orig_hbm_cap:
+            cap_updates["hbm_write_bytes_per_s"] = orig_hbm_cap
+        if cap_updates:
+            datapath = replace(datapath, **cap_updates)
 
     link_bps = float(rates.get("link") or 0.0)
     link_lat_us = 0.0
@@ -1235,7 +1253,28 @@ def _build_formula_engine_inputs(
             raise ModelingError(f"formula_kernel_compute_peak_missing:{dt}")
         cube_ms += MS_PER_SECOND * float(fl) / pk
 
-    hbm_rate = float(rates.get("hbm") or max(datapath.hbm_read_bytes_per_s, datapath.hbm_write_bytes_per_s) or 0.0)
+    fallback_hbm = float(rates.get("hbm") or 0.0)
+    hbm_read_bps = float(getattr(datapath, "hbm_read_bytes_per_s", 0.0) or 0.0) or fallback_hbm
+    hbm_write_bps = float(getattr(datapath, "hbm_write_bytes_per_s", 0.0) or 0.0) or fallback_hbm
+    alpha_rw = max(0.0, min(1.0, float(getattr(datapath, "hbm_rw_alpha", 0.0) or 0.0)))
+    if hbm > 0.0 and hbm_read_bps > 0.0 and hbm_write_bps > 0.0:
+        if mte2 > 0.0 and mte3 > 0.0:
+            r_share = mte2 / (mte2 + mte3)
+            eff_r, eff_w = hbm * r_share, hbm * (1.0 - r_share)
+        elif mte3 > 0.0 and mte2 <= 0.0:
+            eff_r, eff_w = 0.0, hbm
+        else:
+            eff_r, eff_w = hbm, 0.0
+        t_r_s = (eff_r / hbm_read_bps if eff_r > 0.0 else 0.0) + (
+            alpha_rw * eff_w / hbm_write_bps if eff_w > 0.0 else 0.0
+        )
+        t_w_s = (eff_w / hbm_write_bps if eff_w > 0.0 else 0.0) + (
+            alpha_rw * eff_r / hbm_read_bps if eff_r > 0.0 else 0.0
+        )
+        hbm_time_s = max(t_r_s, t_w_s)
+        hbm_rate = (hbm / hbm_time_s) if hbm_time_s > 0.0 else max(hbm_read_bps, hbm_write_bps)
+    else:
+        hbm_rate = max(hbm_read_bps, hbm_write_bps, fallback_hbm)
     vec_rate = float(rates.get("vector") or 0.0) * aiv_scale
     mte2_key = "mte2_aic" if (has_cube and "mte2_aic" in rates) else ("mte2_aiv" if "mte2_aiv" in rates else "mte2")
     mte2_rate = float(rates.get(mte2_key) or hbm_rate or 0.0) * (aic_scale if mte2_key == "mte2_aic" else aiv_scale)
@@ -3405,17 +3444,18 @@ def _apply_pillar_c_tiler_extensions(
         t_after = min(float(node.dur_us), t_target)
         gain = float(node.dur_us) - t_after
         if gain < TARGET_OPT_MIN_GAIN_US or gain < float(node.dur_us) * TARGET_OPT_MIN_RATIO:
-            out.append(replace(node, kernel_status=STATUS_AT_FLOOR))
+            out.append(node if node.needs_new_kernel else replace(node, kernel_status=STATUS_AT_FLOOR))
             continue
 
         eff = min(1.0, l_star / t_after) if (t_after > 0.0 and l_star > 0.0) else None
+        keep_new = bool(node.needs_new_kernel)
         out.append(replace(
             node,
             dur_us=t_after, exposed_dur_us=t_after,
             kernel_backend=BACKEND_CATLASS_LABEL,
-            kernel_status=f"{STATUS_TUNE_PREFIX} -> Catlass/AscendC Tiler]",
-            needs_new_kernel=False,
-            is_shipping_abi=True,
+            kernel_status=node.kernel_status if keep_new else f"{STATUS_TUNE_PREFIX} -> Catlass/AscendC Tiler]",
+            needs_new_kernel=keep_new,
+            is_shipping_abi=False if keep_new else True,
             formula_eval=eval_res,
             l_star_lean_us=l_star,
             gap_us=max(0.0, t_after - l_star),

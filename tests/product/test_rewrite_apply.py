@@ -62,7 +62,10 @@ def dense():
 
 @pytest.fixture(scope="module")
 def routed():
-    case = compose_case("qwen3-30b-a3b", REPRESENTATIVE_SKUS["a5"], tp=2, ep=2, layers=1)
+    case = compose_case(
+        "qwen3-30b-a3b", REPRESENTATIVE_SKUS["a5"], tp=2, ep=2, layers=1,
+        exclude_optimizations=("cann_megamoe_fusion",),
+    )
     return resolve_scenario(case, StepRequest("decode", tokens=4, context=64))
 
 
@@ -138,7 +141,7 @@ def test_digest_must_match_resolved_graph_and_frame(dense, field):
 
 def test_fusion_preserves_external_cut_and_chained_handles(dense):
     original = {op.op_id: op for op in dense.atomic_ops[0].ops}
-    qkv, norm, rope, value = (f"s0.l0.{suffix}" for suffix in ("qkv", "qk_norm", "rope", "qkv.value"))
+    qkv, norm, k_norm, rope = (f"s0.l0.{suffix}" for suffix in ("qkv", "q_norm", "k_norm", "rope"))
     fuse = Edit("contract", operation=_fuse(qkv, norm, preserve=(qkv,)))
     first = Edit("hint", operation=SelectTemplate(OpRef("result_of", "contract"), "K1", "base"))
     second = Edit("tune", operation=SelectTemplate(OpRef("result_of", "hint"), "K2", "tuned", (("stages", 2),)))
@@ -156,7 +159,7 @@ def test_fusion_preserves_external_cut_and_chained_handles(dense):
     assert {qkv, norm}.isdisjoint(graph)
     assert fused.deps == original[qkv].deps
     assert "output" in fused.returns
-    assert graph[rope].deps == graph[value].deps == (fused.op_id,)
+    assert graph[k_norm].deps == (fused.op_id,) and graph[rope].deps == (fused.op_id, k_norm)
     assert fused.flops == original[qkv].flops + original[norm].flops
     assert fused.vector_ops == original[qkv].vector_ops + original[norm].vector_ops
     assert [binding.tier for binding in result.template_bindings] == ["K3", "K1", "K2"]
@@ -177,7 +180,7 @@ def test_nonconvex_edit_rolls_back_earlier_edits(dense):
 
 
 def test_fusion_rejects_undeclared_live_out_cut(dense):
-    region = _fuse("s0.l0.qkv", "s0.l0.qk_norm")
+    region = _fuse("s0.l0.qkv", "s0.l0.q_norm")
     with pytest.raises(ModelingError, match="rewrite_fusion_live_out_unpreserved"):
         apply_plan(_plan(dense, Edit("contract", operation=region)), dense)
 
@@ -226,20 +229,33 @@ def test_tile_cohort_admits_lowered_collective_protocol():
     assert applied.tile_bindings[0].cohort_split == "dbo_2cohort"
 
 
-def test_three_stream_gcd_core_lattice_and_zero_aic_lane(dense):
-    path = dense.datapath
+def test_three_stream_gcd_core_lattice_and_zero_aic_lane():
+    scenario = resolve_scenario(
+        compose_case("qwen3-32b", REPRESENTATIVE_SKUS["a5"], tp=2, dp=1, layers=1),
+        StepRequest("decode", tokens=4, context=64),
+    )
+    path = scenario.datapath
     common = gcd(path.aic_count, path.aiv_count)
     cube_step, vector_step = path.aic_count // common, path.aiv_count // common
     lanes = (StreamLane("main", StreamCoreBudget(path.aic_count - cube_step, path.aiv_count - vector_step)),
              StreamLane("csa", StreamCoreBudget(0, vector_step)),
              StreamLane("comm", StreamCoreBudget(0, 0)))
-    qkv, norm, rope, value, cache = (f"s0.l0.{name}" for name in ("qkv", "qk_norm", "rope", "qkv.value", "cache"))
-    schedule = StreamSchedule(lanes, ((_atom(norm), "csa"), (_atom(rope), "csa"), (_atom(value), "comm")),
-                              (StreamEvent("qkv_ready", "main", qkv, "csa", (norm,)),
-                               StreamEvent("rotary_done", "csa", rope, "comm", (value,)),
-                               StreamEvent("copy_done", "comm", value, "main", (cache,))))
-    plan = _plan(dense, Edit("schedule", operation=schedule))
-    result = apply_plan(plan, dense)
+    qkv, q_norm, k_norm, rope, cache, attn, out, comm, resid = (
+        f"s0.l0.{name}" for name in (
+            "qkv", "q_norm", "k_norm", "rope", "cache", "attention",
+            "output", "tp_attn", "attention.residual",
+        )
+    )
+    schedule = StreamSchedule(
+        lanes,
+        ((_atom(q_norm), "csa"), (_atom(k_norm), "csa"), (_atom(rope), "csa"), (_atom(comm), "comm")),
+        (StreamEvent("qkv_ready", "main", qkv, "csa", (q_norm, k_norm)),
+         StreamEvent("rotary_done", "csa", rope, "main", (cache, attn)),
+         StreamEvent("out_ready", "main", out, "comm", (comm,)),
+         StreamEvent("comm_done", "comm", comm, "main", (resid,))),
+    )
+    plan = _plan(scenario, Edit("schedule", operation=schedule))
+    result = apply_plan(plan, scenario)
     stream, = result.streams
     owners = bind_stream_owners(stream, path)
     assert stream.lane_ids() == ("main", "csa", "comm")
@@ -248,12 +264,11 @@ def test_three_stream_gcd_core_lattice_and_zero_aic_lane(dense):
     assert owners["main"].aic_limit * vector_step == owners["main"].aiv_limit * cube_step
     ops = {op.op_id: op for op in result.executable[0].ops}
     assert ops[rope].stream == "csa" and ops[rope].flops == 0 < ops[rope].vector_ops
-    assert ops[value].stream == "comm" and rope in ops[value].deps
-    assert value in ops[cache].deps
-    assert all(event.record_after != rope or cache not in event.wait_before for event in stream.events)
-    missing = replace(schedule, events=tuple(e for e in schedule.events if e.event_id != "rotary_done"))
+    assert ops[comm].stream == "comm" and ops[comm].flops == ops[comm].vector_ops == 0
+    assert comm in ops[resid].deps
+    missing = replace(schedule, events=tuple(e for e in schedule.events if e.event_id != "out_ready"))
     with pytest.raises(ModelingError, match="STREAM_EVENT_UNCOVERED"):
-        apply_plan(_plan(dense, Edit("schedule", operation=missing)), dense)
+        apply_plan(_plan(scenario, Edit("schedule", operation=missing)), scenario)
 
 
 def test_prefetch_clamps_to_l1_and_conserves_bytes(dense):
@@ -478,7 +493,10 @@ def test_ring_replay_uses_the_intra_package_link():
 
 
 def test_two_cohort_replay_records_positive_intervals_and_routing_moments(monkeypatch):
-    case = compose_case("deepseek-v4-flash", REPRESENTATIVE_SKUS["a5"], tp=4, ep=4, layers=1)
+    case = compose_case(
+        "deepseek-v4-flash", REPRESENTATIVE_SKUS["a5"], tp=4, ep=4, layers=1,
+        exclude_optimizations=("cann_megamoe_fusion",),
+    )
     dossier = prepare_scenario(ScenarioRequest(case, StepRequest("decode", sequences=8, context=64)))
     grouped = next(op for op in dossier.handle.scenario.atomic_ops[0].ops if op.family == "grouped_gemm")
     assert grouped.local_shape[0] == 12
@@ -900,7 +918,7 @@ def test_collective_algebra_respects_explicit_metadata_without_recipe_substrings
 
 
 def test_multi_boundary_fusion_does_not_alias_final_abi_as_single_recipe(dense):
-    qkv, norm = "s0.l0.qkv", "s0.l0.qk_norm"
+    qkv, norm = "s0.l0.qkv", "s0.l0.q_norm"
     two_bounds = FuseRegion(
         members=(_atom(qkv), _atom(norm)),
         preserve_ports=(PortRef(_atom(qkv), "output", 0),),

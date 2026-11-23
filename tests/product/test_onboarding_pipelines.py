@@ -545,7 +545,8 @@ def test_whitebox_runner_l1_l2_l3_gemm_grouped_gemm_and_isolation(tmp_path):
     idx_row = {**base_l1, "case_id": "idx-2048", "point_id": "idx-2048", "context_len": 2049, "topk": 2048, "target_family": "indexer", "target_op_id": "s0.l2.index_quant_lightning", "measured_binding": {"target_op_id": "s0.l2.index_quant_lightning", "family": "indexer", "sparse_count": 2048, "query_dtype": "bf16", "cache_dtype": "bf16"}}
     with pytest.raises(ModelingError, match="topk|query_dtype"):
         score_sealed_gate_cases([{**idx_row, "sim_case": {"compose_model": "deepseek-v4.1-flash", "compose_hardware": A2_SKU}}], sku=A2_SKU, runner=WhiteboxSpineRunner(clock_operator="busy_union"))
-    assert score_sealed_gate_cases([{**idx_row, "sim_case": {"compose_model": "deepseek-v4.1-flash", "compose_hardware": A2_SKU, "model_overrides": {"index_topk": 2048, "index_dtype": "bf16"}}}], sku=A2_SKU, runner=WhiteboxSpineRunner(clock_operator="busy_union"))["residuals"][0]["predicted_ns"] > 0
+    idx_bf16_row = {**idx_row, "target_op_id": "s0.l2.index_lightning", "measured_binding": {**idx_row["measured_binding"], "target_op_id": "s0.l2.index_lightning"}}
+    assert score_sealed_gate_cases([{**idx_bf16_row, "sim_case": {"compose_model": "deepseek-v4.1-flash", "compose_hardware": A2_SKU, "model_overrides": {"index_topk": 2048, "index_dtype": "bf16"}}}], sku=A2_SKU, runner=WhiteboxSpineRunner(clock_operator="busy_union"))["residuals"][0]["predicted_ns"] > 0
 
     wb_r = WhiteboxSpineRunner(clock_operator="busy_union")
     l2_dep = {**base_l1, "case_id": "l2-dep", "point_id": "l2-dep", "level": "L2", "target_family": None, "target_op_ids": ["s0.l0.norm1", "s0.l0.q_proj"]}

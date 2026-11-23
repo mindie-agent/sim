@@ -850,33 +850,12 @@ def _apply_va_profile_lowerings(
     runtime_dict["metadata"] = runtime_meta
 
 
-def _every_pp_stage_has_mla(
-    model_spec: Any,
-    runtime_dict: Mapping[str, Any],
-    pp: int,
-) -> bool:
-    """Return True when every pipeline stage owns at least one eligible MLA layer."""
-    eligible = [
+def _has_eligible_mla(model_spec: Any) -> bool:
+    """Return True when the model owns at least one eligible MLA layer."""
+    return any(
         p.attention == "mla" and p.q_lora_rank > 0 and p.mla_variant != "latent_mqa"
         for p in getattr(model_spec, "layer_plans", ())
-    ]
-    if not any(eligible):
-        return False
-    stages = int(pp)
-    if stages <= 1:
-        return True
-    part = runtime_dict.get("pp_layer_partition")
-    if isinstance(part, Sequence) and len(part) == stages:
-        counts = [int(c) for c in part]
-    else:
-        total = len(eligible)
-        counts = [total // stages + (1 if idx < total % stages else 0) for idx in range(stages)]
-    cursor = 0
-    for count in counts:
-        if not any(eligible[cursor:cursor + count]):
-            return False
-        cursor += count
-    return True
+    )
 
 
 def _attach_mla_prolog_native_fusion(
@@ -906,7 +885,7 @@ def _attach_mla_prolog_native_fusion(
         and "mla_prolog" in lowerings
         and "mla_prolog_fusion" not in set(exclude_optimizations)
         and int(axes.get("pcp", 1)) == 1
-        and _every_pp_stage_has_mla(model_spec, runtime_dict, int(axes.get("pp", 1)))
+        and _has_eligible_mla(model_spec)
     ):
         return
     prolog_cfg = lowerings["mla_prolog"]

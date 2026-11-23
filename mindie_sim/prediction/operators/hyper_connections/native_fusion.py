@@ -393,7 +393,7 @@ def _lower_traffic_profile(
     return fused, op_id
 
 
-def _check_required_roles(roles, matched_roles, original, groups, local_tokens):
+def _check_required_roles(roles, matched_roles, original, groups, local_tokens, *, pp=1):
     # A receive-only EP rank still executes expert kernels and transport but
     # has no local residual, dense or shared-expert activation stream. The
     # frontend establishes those calls are absent; routed expert fusion stays
@@ -409,6 +409,13 @@ def _check_required_roles(roles, matched_roles, original, groups, local_tokens):
                   if not any(d["role"] == role and d.get("native_fusion_eligible", True) is not False
                              for d, _ in groups)}
         required_roles = required_roles - absent
+    if (pp > 1 and "mla_prolog" in required_roles
+            and "mla_prolog" not in matched_roles
+            and not any(op.recipe in {"q_a", "kv_a", "q_b", "q_absorb", "latent_attention0"}
+                        for op in original)):
+        # Hybrid PP stages (e.g. KDA-only stages) own zero MLA layers while
+        # peer stages own and fuse MLA prolog normally.
+        required_roles = required_roles - {"mla_prolog"}
     realized_rows = None
     for op in original:
         if not any(k in {"routing_realization", "source_token_mask"} for k, _ in op.metadata):
@@ -566,7 +573,8 @@ def lower_native_fusions(ops, runtime, *, local_tokens=None, public_outputs=()):
                                for value in external["values"]})
         matched_roles.add(declaration["role"])
         replacements[members[0].op_id] = fused
-    _check_required_roles(roles, matched_roles, original, groups, local_tokens)
+    pp_stages = max(1, int(getattr(getattr(runtime, "parallel", None), "pp", 1) or 1))
+    _check_required_roles(roles, matched_roles, original, groups, local_tokens, pp=pp_stages)
     from mindie_sim.prediction.implementations import rewire_value_graph
     port_map3 = {
         key: (target[0], target[1], value_port_map.get(key, {}))

@@ -392,7 +392,7 @@ def test_glm_flash_nope_mla_row_formats_and_heterogeneous_isolation():
         layer_plans=(replace(mla_layers[0], index=0), rope_plan),
     )
     assert cache_format(hetero, "mla_kv", plan=hetero.layer_plans[0]).row_bytes(512) == NOPE_MLA_FP16_SCALE_ROW
-    assert cache_format(hetero, "mla_kv", plan=hetero.layer_plans[1]).row_bytes(576) == 576
+    assert cache_format(hetero, "mla_kv", plan=hetero.layer_plans[1]).row_bytes(576) == 648
 
     # Trailing alignment padding is tracked separately from numerical scale bytes.
     padded_fmt = CacheFormat("fp8_e4m3", group_size=128, scale_dtype="fp16", alignment=64)

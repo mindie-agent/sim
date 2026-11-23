@@ -405,3 +405,47 @@ def test_strict_baseline_non_regression_sentinel_and_prefill_models() -> None:
         b_bef = build_export_bundle(raw_bef, request=req, apply_target_envelope=False)
         b_aft = build_export_bundle(raw_aft, request=req, apply_target_envelope=True)
         assert b_aft.step_span_us <= b_bef.step_span_us + NON_REGRESSION_TOL_US
+
+
+def test_hbm_sustained_cap_and_multinode_link_supply_eliminate_lower_bound_inversion() -> None:
+    """Clamp raw wire HBM to die sustained rate and align multi-node per_pair link supply."""
+    # 1. Without primitive_table, directional HBM read/write rates stay bounded by die.rates["hbm"].
+    raw_glm = compose_case(
+        "glm-5.3", GEN5_DT_SKU, tp=TP_OCT, ep=TP_OCT, dp=1, layers=FLASH_NEXT_LAYERS,
+    )
+    case_glm = parse_case(raw_glm)
+    dp_glm, rates_glm, _, _, _ = _effective_die_supply(
+        case_glm.machine.dies[0], case_glm.machine.links, case_glm.machine.transfer_channels,
+        primitive_table=None, active_width=TP_OCT, ranks_per_node=case_glm.machine.ranks_per_node,
+        dies_per_package=case_glm.machine.dies_per_package,
+    )
+    read_bps, write_bps, _ = _directional_hbm_bus_params(dp_glm, rates_glm)
+    sustained_hbm = float(dict(case_glm.machine.dies[0].rates)["hbm"])
+    assert read_bps <= sustained_hbm and write_bps <= sustained_hbm
+
+    # 2. Multi-node tp=16 > ranks_per_node=8 aligns peaks.py link_peak with causal_tail supply.
+    raw_ds = compose_case(
+        "deepseek-v3.2", GEN5_DT_SKU, tp=TP_DUAL_NODE, ep=TP_DUAL_NODE, dp=1, layers=FLASH_NEXT_LAYERS,
+    )
+    case_ds = parse_case(raw_ds)
+    pk_ds = extract_hardware_peaks(case_ds, stage=0)
+    _, _, _, _, ct_link_bps = _effective_die_supply(
+        case_ds.machine.dies[0], case_ds.machine.links, case_ds.machine.transfer_channels,
+        primitive_table=None, active_width=TP_DUAL_NODE,
+        ranks_per_node=case_ds.machine.ranks_per_node,
+        dies_per_package=case_ds.machine.dies_per_package,
+    )
+    assert pk_ds["link_peak_bytes_per_s"] == pytest.approx(ct_link_bps, rel=1e-6)
+
+    # 3. End-to-end prefill & decode bundles have zero superluminal lower_bound_inversion.
+    raw_q38 = compose_case(
+        "qwen3.8-2.4t-a95b", GEN5_DT_SKU, tp=TP_DUAL_NODE, ep=TP_DUAL_NODE, dp=1, layers=FLASH_NEXT_LAYERS,
+    )
+    for raw_case in (raw_glm, raw_ds, raw_q38):
+        for req in (
+            StepRequest(phase="prefill", tokens=PREFILL_TOKENS // TP_OCT, context=0, sequences=1, scope="body"),
+            StepRequest(phase="decode", tokens=1, context=PREFILL_TOKENS // TP_DUAL, sequences=1, scope="body"),
+        ):
+            bundle = build_export_bundle(raw_case, request=req, apply_target_envelope=True)
+            assert all(op.dur_us + NON_REGRESSION_TOL_US >= op.l_star_lean_us for op in bundle.operators)
+            assert bundle.step_span_us + NON_REGRESSION_TOL_US >= bundle.step_l_star_lean_us

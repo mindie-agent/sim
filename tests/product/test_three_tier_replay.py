@@ -183,7 +183,7 @@ def test_shipping_regression_reports_measured_leave_one_out_culprit():
     assert report.waterfall.loo_impacts == ()
 
 def test_mainline_seed_screens_against_its_own_faster_wall():
-    case = _case(REPRESENTATIVE_SKUS["a2"], tp=1)
+    case = _case(REPRESENTATIVE_SKUS["a2"], tp=1, quant="bf16")
     step = StepRequest("prefill", tokens=16, context=64)
     dossier = prepare_scenario(ScenarioRequest(case, step))
     assert dossier.m_wall_ns < dossier.u_wall_ns
@@ -196,7 +196,7 @@ def test_mainline_seed_screens_against_its_own_faster_wall():
     assert report.dsl_plan == dossier.mainline_plan
     impact, = report.waterfall.loo_impacts
     assert impact.edit_id == SHIPPING_OVERLAY
-    assert impact.marginal_delta_ns == dossier.u_wall_ns - dossier.m_wall_ns == 103
+    assert impact.marginal_delta_ns == dossier.u_wall_ns - dossier.m_wall_ns == 2500
 
 def test_unmerge_winner_has_empty_leave_one_out_despite_shipping_regression():
     case = _case(REPRESENTATIVE_SKUS["a5"], tp=1)
@@ -207,7 +207,7 @@ def test_unmerge_winner_has_empty_leave_one_out_despite_shipping_regression():
     assert report.waterfall.loo_impacts == ()
     regression = report.waterfall.shipping_regression
     assert regression == report.verification.shipping_regression
-    assert regression.delta_ns == dossier.m_wall_ns - dossier.u_wall_ns == 8937
+    assert regression.delta_ns == dossier.m_wall_ns - dossier.u_wall_ns == 7251
     assert report.ladder.delta_shipping_ns == -regression.delta_ns
     assert regression.loo_culprits == ((SHIPPING_OVERLAY, -regression.delta_ns),)
 

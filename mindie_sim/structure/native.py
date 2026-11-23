@@ -136,7 +136,7 @@ def matrix_comparison_scope(op):
             "This does not infer an additional output epilogue from tensor descriptors.")
     if (meta.get("weight_format") in {"mxfp4", "fp4", "fp4_e2m1"}
             and meta.get("dequant_before_compute")
-            and meta.get("compute_format") == "bf16"):
+            and meta.get("compute_format") in {"bf16", "fp8_e4m3", "fp8_e5m2"}):
         scope["prediction_coverage"] = mxfp4_reference_coverage()
     return scope
 

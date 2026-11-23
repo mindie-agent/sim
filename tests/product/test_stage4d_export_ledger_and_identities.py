@@ -96,6 +96,7 @@ def test_prepared_op_spec_resolves_execution_precision_and_eliminates_superlumin
         "model": {**raw["model"], "layers": TEST_CONCURRENCY, "layer_plans": raw["model"]["layer_plans"][:TEST_CONCURRENCY]},
     }
     case = parse_case(raw)
+    bf16_peak = float(case.machine.dies[0].peak("bf16"))
     fp8_peak = float(case.machine.dies[0].peak("fp8_e4m3"))
 
     prefill_bundle = build_export_bundle(
@@ -111,9 +112,13 @@ def test_prepared_op_spec_resolves_execution_precision_and_eliminates_superlumin
     ]
     assert superluminal == []
     by_id = {row.op_id: row for row in prefill_bundle.operators}
-    for oid in ("s0.l0.linear_qkvz", "s0.l3.qkv", "s0.l0.expert_up"):
+    for oid, expected_peak in (
+        ("s0.l0.linear_qkvz", bf16_peak),
+        ("s0.l3.qkv", fp8_peak),
+        ("s0.l0.expert_up", fp8_peak),
+    ):
         row = by_id[oid]
-        assert row.cube_peak_flops_per_s == pytest.approx(fp8_peak, rel=1e-6)
+        assert row.cube_peak_flops_per_s == pytest.approx(expected_peak, rel=1e-6)
         assert row.dur_us + SUPERLUMINAL_EPS_US >= row.l_star_lean_us
 
     # Persisted prepared_ops from EvaluationContext take precedence over pre-prep catalog specs.

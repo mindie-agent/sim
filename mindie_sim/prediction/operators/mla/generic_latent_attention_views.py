@@ -186,6 +186,35 @@ def unique_index_key_rows(views, *, query_tile=INDEX_QUERY_TILE, noncausal=False
     return private_rows + sum(groups.values()), refills
 
 
+def _prefix_reuse_meta(private_rows, hbm_rows, refill_rows, row_b, divisor, *, include_component=False):
+    head = (("component", "index_k"),) if include_component else ()
+    return head + (
+        ("prefix_read_reuse_applied", True),
+        ("prefix_read_mode", "tile"),
+        ("prefix_read_logical_bytes", private_rows * row_b / divisor),
+        ("prefix_read_hbm_bytes", hbm_rows * row_b / divisor),
+        ("prefix_read_l2_core_bytes", refill_rows * row_b / divisor),
+    )
+
+
+def _resolve_native_indexer_mode(runtime, machine, quant, model) -> tuple[bool, bool]:
+    if runtime is None:
+        return False, False
+    # Imported lazily: the epilog module imports this builder for the
+    # shared index representation, so a module-level edge would cycle.
+    from mindie_sim.prediction.implementations import select
+    from .mla_epilogs import native_fusion_active
+    lowerings = dict(getattr(runtime, "kernels", {}).get("lowerings", {}) or {})
+    native_sel = select(lowerings, "native_fusion")
+    claimed_role = (native_sel is not None
+                    and "lightning_indexer" in (native_sel.options.get("roles") or ()))
+    native_eligible = (native_fusion_active(runtime, machine)
+                       and not claimed_role
+                       and select(lowerings, "lightning_indexer") is None
+                       and select(lowerings, "quant_lightning_indexer") is None)
+    return native_eligible, index_operands_quantized(quant, model)
+
+
 def semantic_index_selection(b, *, deps, views, plan, model, quant, parallel,
                             shard, prefix, padded_tokens, runtime=None,
                             score_rows=None, l2_bytes=None, machine=None):
@@ -198,13 +227,12 @@ def semantic_index_selection(b, *, deps, views, plan, model, quant, parallel,
     ratio = max(1, plan.compress_ratio)
     block_size = max(
         1, int(getattr(runtime, "kv_block_size", DEFAULT_BLOCK_SIZE) or DEFAULT_BLOCK_SIZE))
-    pairs_by_view: list[int] = []
-    for view in views:
-        parts = visible_parts(view)
-        v_rows = int(selected_pairs(
-            parts, ratio, cand_window,
+    pairs_by_view = [
+        int(selected_pairs(
+            visible_parts(view), ratio, cand_window,
             noncausal=bool(plan.noncausal_attention), kv_len=view.kv_len))
-        pairs_by_view.append(v_rows)
+        for view in views
+    ]
     # The TopK publisher's selected rows are the rows its consumers attend,
     # not the full per-query score plane that feeds the reducer.
     selected_by_view = [
@@ -238,23 +266,7 @@ def semantic_index_selection(b, *, deps, views, plan, model, quant, parallel,
         if working > float(l2_bytes):
             spill = max(0.0, 1 - float(l2_bytes) / working)
             hbm_rows += max(0.0, float(refill_rows) - hbm_rows) * spill
-    native_fused = False
-    native_bf16_indexer = False
-    if runtime is not None:
-        # Imported lazily: the epilog module imports this builder for the
-        # shared index representation, so a module-level edge would cycle.
-        from mindie_sim.prediction.implementations import select
-        from .mla_epilogs import native_fusion_active
-        lowerings = dict(getattr(runtime, "kernels", {}).get("lowerings", {}) or {})
-        native_sel = select(lowerings, "native_fusion")
-        claimed_role = (native_sel is not None
-                        and "lightning_indexer" in (native_sel.options.get("roles") or ()))
-        native_eligible = (native_fusion_active(runtime, machine)
-                           and not claimed_role
-                           and select(lowerings, "lightning_indexer") is None
-                           and select(lowerings, "quant_lightning_indexer") is None)
-        quantized_index = index_operands_quantized(quant, model)
-        native_fused = native_eligible
+    native_fused, quantized_index = _resolve_native_indexer_mode(runtime, machine, quant, model)
     # Query and head-weight operands are real reads in both lowerings.
     by_id = {op.op_id: op for op in b.ops}
     operand_bytes = sum(float(by_id[dep].mte3_bytes)
@@ -293,13 +305,8 @@ def semantic_index_selection(b, *, deps, views, plan, model, quant, parallel,
                       ("index_head_reduction", "complete_local")))
         if shared_reads and union_rows < private_rows:
             fused_op = b.ops[-1]
-            b.ops[-1] = replace(fused_op, metadata=fused_op.metadata + (
-                ("prefix_read_reuse_applied", True),
-                ("prefix_read_mode", "tile"),
-                ("prefix_read_logical_bytes", private_rows * row_b / divisor),
-                ("prefix_read_hbm_bytes", hbm_rows * row_b / divisor),
-                ("prefix_read_l2_core_bytes", refill_rows * row_b / divisor),
-            ))
+            b.ops[-1] = replace(fused_op, metadata=fused_op.metadata + _prefix_reuse_meta(
+                private_rows, hbm_rows, refill_rows, row_b, divisor))
         declare_indexer(b.ops, prefix=prefix, plan=plan, parallel=parallel,
                         model=model, quant=quant, views=views,
                         padded_tokens=padded_tokens, scores=fused, topk=fused)
@@ -319,13 +326,8 @@ def semantic_index_selection(b, *, deps, views, plan, model, quant, parallel,
         # The HBM union is already charged. Do not apply a second prefix plan
         # based on per-token score arithmetic to these per-tile key reads.
         op = b.ops[-1]
-        b.ops[-1] = replace(op, recipe=BATCH_INDEXER_RECIPE, metadata=op.metadata + (
-            ("component", "index_k"), ("prefix_read_reuse_applied", True),
-            ("prefix_read_mode", "tile"),
-            ("prefix_read_logical_bytes", private_rows * row_b / divisor),
-            ("prefix_read_hbm_bytes", hbm_rows * row_b / divisor),
-            ("prefix_read_l2_core_bytes", refill_rows * row_b / divisor),
-        ))
+        b.ops[-1] = replace(op, recipe=BATCH_INDEXER_RECIPE, metadata=op.metadata + _prefix_reuse_meta(
+            private_rows, hbm_rows, refill_rows, row_b, divisor, include_component=True))
     topk = b.work("index_topk", (scores,), (valid, plan.index_topk),
                  vector=rows * math.log2(max(MIN_LOG_TOPK, plan.index_topk)) / divisor,
                  read=rows * FP32_BYTES / divisor,
