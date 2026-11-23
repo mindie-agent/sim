@@ -304,7 +304,7 @@ def _resolve_va_lowerings(
             }],
             "otherwise": "analytical",
         }
-    if any(p.residual_block_size > 0 for p in model_spec.layer_plans) and p_cfg.pp >= 1:
+    if is_a5 and any(p.residual_block_size > 0 for p in model_spec.layer_plans) and p_cfg.pp >= 1:
         lowerings["attention_residual"] = "vllm_ascend_attn_res_prefix"
     if any(p.attention == "gdn" for p in model_spec.layer_plans) and p_cfg.pcp >= 1:
         opts = {"recurrent_implementation": "arch35_fp32"} if is_a5 else {}

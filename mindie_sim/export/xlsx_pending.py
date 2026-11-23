@@ -16,7 +16,7 @@
 [Invariants] Waterfall is always emitted on comparison workbooks, including
   identical bundles and zero-card reports; all formulas use bounded visible
   ranges and guarded denominators so zero Excel formula errors occur; Sheet 4
-  populated columns never exceed ``14`` (``N``); zero ``cannbot`` strings.
+  populated columns never exceed ``14`` (``N``); zero legacy DSL strings.
 [Timeouts & Locks] Pure in-memory OOXML cell assembly; no I/O or locks.
 [Side-Effect Policy] Mutates only the caller-provided ``Worksheet``.
 """
@@ -160,7 +160,7 @@ STD_NEXT_SECTION_NUM = 2
 
 WF_RECON_TOL_MS = 1e-4
 PRIMARY_KERNEL_BACKENDS = f"{BACKEND_TILELANG} / {BACKEND_ASCENDC} / {BACKEND_CATLASS}"
-_LEGACY_BACKEND_RE = re.compile(r"cannbot[-_]?dsl|cannbot", re.IGNORECASE)
+_LEGACY_BACKEND_RE = re.compile(r"legacy[-_]?dsl", re.IGNORECASE)
 _STAGES_ORDERED = (WF_STAGE_CONFIG, WF_STAGE_FRAMEWORK, WF_STAGE_KERNEL, WF_STAGE_RESIDUAL)
 _STAGE_META: dict[str, tuple[int, str, str]] = {
     WF_STAGE_CONFIG: (

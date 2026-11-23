@@ -558,3 +558,50 @@ def test_exposed_observer_stream0_conservation_and_replica_filtering() -> None:
     assert g_filt["timeline"][0]["replica"] == 0
     assert g_filt["operator_occurrences"] == g_full["operator_occurrences"]
     assert g_filt["duration_ms"] == pytest.approx(g_full["duration_ms"])
+
+
+def test_attnres_requires_a5_hardware_ple_conv_honors_speculative_k_and_zero_cannbot_sourcerefs() -> None:
+    """AttnRes is strictly A5-only; PLE conv honors speculative K; operator SourceRefs have zero cannbot."""
+    import importlib
+    from mindie_sim.catalog.qwen4_exp import ple_conv_state_bytes, qwen4_exp_pool_breakdown
+    from mindie_sim.prediction.operators.hyper_connections import family_attnres
+    from mindie_sim.prediction.structure import parse_case
+
+    # 1. AttnRes is blocked on A2/A3 even when explicitly bound in runtime.kernels.lowerings.
+    for hw_key, expect_active in (("a2", False), ("a3", False), ("a5", True)):
+        raw = compose_case("kimi-k3.1", REPRESENTATIVE_SKUS[hw_key], layers=4, tp=1, ep=1)
+        case = parse_case(raw)
+        lows = dict(case.runtime.kernels.get("lowerings") or {})
+        if not expect_active:
+            assert "attention_residual" not in lows
+        explicit_rt = replace(
+            case.runtime,
+            kernels={**dict(case.runtime.kernels), "lowerings": {**lows, "attention_residual": "vllm_ascend_attn_res_prefix"}},
+        )
+        sel = family_attnres.selection(explicit_rt, model=case.model, phase="decode", machine=case.machine)
+        assert (sel is not None) is expect_active
+
+    # 2. Qwen4 PLE conv state honors speculative proposal count (+61,440 B/req at K=3) via runtime & query_tokens.
+    q4_raw = compose_case(
+        "qwen3.8-flash-next", REPRESENTATIVE_SKUS["a5"], layers=4, tp=8, ep=8, mtp_proposal_tokens=3,
+    )
+    q4_case = parse_case(q4_raw)
+    b_k0 = ple_conv_state_bytes(q4_case.model, query_tokens=1)
+    b_k3_rt = ple_conv_state_bytes(q4_case.model, q4_case.runtime)
+    b_k3_q = ple_conv_state_bytes(q4_case.model, query_tokens=4)
+    assert b_k3_rt - b_k0 == pytest.approx(61_440.0)
+    assert b_k3_rt == b_k3_q == pytest.approx(245_760.0)
+    pool_k1 = qwen4_exp_pool_breakdown(q4_case.model, q4_case.runtime.parallel, 512, runtime=q4_case.runtime, query_tokens=1)
+    pool_k4 = qwen4_exp_pool_breakdown(q4_case.model, q4_case.runtime.parallel, 512, runtime=q4_case.runtime, query_tokens=4)
+    assert pool_k1 is not None and pool_k4 is not None
+    assert pool_k4["private_ple_bytes"] - pool_k1["private_ple_bytes"] == pytest.approx(61_440.0)
+    assert pool_k4["private_ple_bytes"] == pytest.approx(245_760.0)
+
+    # 3. Every governed arch*.py SourceRef repository is free of cannbot labels.
+    ops_root = Path(__file__).resolve().parents[2] / "mindie_sim" / "prediction" / "operators"
+    for arch_py in sorted(ops_root.glob("*/arch*.py")):
+        mod_name = "mindie_sim.prediction.operators." + ".".join(arch_py.relative_to(ops_root).with_suffix("").parts)
+        mod = importlib.import_module(mod_name)
+        for ref in getattr(mod, "SOURCES", ()):
+            assert "cannbot" not in ref.repository.lower(), (mod_name, ref.repository)
+            assert "cannbot" not in ref.relative_path.lower(), (mod_name, ref.relative_path)

@@ -19,18 +19,26 @@ from dataclasses import dataclass, field, fields, is_dataclass
 from fractions import Fraction
 import math
 from pathlib import Path
-from typing import Literal, TypeAlias
+from typing import TYPE_CHECKING, Literal, TypeAlias
 
 from mindie_sim.schema.case import Case
+from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.datapath import SourceRef
-from mindie_sim.schema.scenario import ExecutionStage
-from mindie_sim.schema.workload import RequestView
+from mindie_sim.schema.operators import OpSpec
+from mindie_sim.schema.scenario import ExecutionStage, ScenarioContract
+from mindie_sim.schema.stack import RuntimeQuantPlan, StackLoweringPlan
+from mindie_sim.schema.workload import IterationPlan, RequestView
 from .streams import MAIN_STREAM, StreamId, StreamPlan, validate_stream_id
+
+if TYPE_CHECKING:
+    from mindie_sim.feature_mechanisms import SoftwareStackSpec
 
 Phase = Literal["prefill", "decode"]
 Scope = Literal["body", "model"]
 Tier = Literal["unmerge", "mainline", "should_achieve"]
 WorkUnit = Literal["bytes", "flop", "op", "instruction"]
+OriginKind = Literal["caller", "stack_profile", "body_default"]
+DEFAULT_STACK_NAME = "vllm-ascend"
 
 JsonValue: TypeAlias = (
     "None | bool | int | float | str | tuple[JsonValue, ...] "
@@ -466,6 +474,69 @@ def coerce_stream(value: str | None) -> StreamId:
     return validate_stream_id(value, "stream")
 
 
+@dataclass(frozen=True, slots=True)
+class RankOps:
+    """One replica's immutable operator sequence."""
+
+    replica: int
+    ops: tuple[OpSpec, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class LoweringRequest:
+    """Unified lowering input covering fixed step, serving iterations, or explicit ops."""
+
+    step: StepRequest | None = None
+    iterations: tuple[tuple[int, IterationPlan], ...] = ()
+    declared_ops: tuple[RankOps, ...] = ()
+    tier: Tier = "mainline"
+    apply_body_defaults: bool = True
+    production_capture: bool = False
+    stack: str | None = None
+    scenario_contract: ScenarioContract | None = None
+    runtime_quant_plan: RuntimeQuantPlan | None = None
+    stack_lowering_plan: StackLoweringPlan | None = None
+
+    def __post_init__(self) -> None:
+        active = int(self.step is not None) + int(bool(self.iterations)) + int(bool(self.declared_ops))
+        if active != 1:
+            raise ModelingError(f"lowering_request_requires_exactly_one_input:{active}")
+        if self.tier not in {"unmerge", "mainline", "should_achieve"}:
+            raise ModelingError(f"lowering_request_invalid_tier:{self.tier}")
+        if self.scenario_contract is not None and not isinstance(self.scenario_contract, ScenarioContract):
+            raise ModelingError("lowering_request_invalid_scenario_contract")
+        if self.runtime_quant_plan is not None and not isinstance(self.runtime_quant_plan, RuntimeQuantPlan):
+            raise ModelingError("lowering_request_invalid_runtime_quant_plan")
+        if self.stack_lowering_plan is not None and not isinstance(self.stack_lowering_plan, StackLoweringPlan):
+            raise ModelingError("lowering_request_invalid_stack_lowering_plan")
+        if (
+            self.scenario_contract is not None
+            and self.runtime_quant_plan is not None
+            and self.scenario_contract.quant_plan.plan_digest != self.runtime_quant_plan.plan_digest
+        ):
+            raise ModelingError("lowering_request_quant_plan_mismatch")
+        if (
+            self.scenario_contract is not None
+            and self.stack_lowering_plan is not None
+            and self.scenario_contract.lowering_plan.plan_digest != self.stack_lowering_plan.plan_digest
+        ):
+            raise ModelingError("lowering_request_lowering_plan_mismatch")
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedBase:
+    """Resolved immutable case, stack binding, and provenance ready for rewrite."""
+
+    case: Case
+    request: LoweringRequest
+    stack: SoftwareStackSpec | None
+    recipe_origins: tuple[tuple[str, OriginKind], ...]
+    sources: tuple[SourceRef, ...]
+    scenario_contract: ScenarioContract | None = None
+    runtime_quant_plan: RuntimeQuantPlan | None = None
+    stack_lowering_plan: StackLoweringPlan | None = None
+
+
 def aligned_table_for(
     step: StepEvaluation,
     *,
@@ -483,18 +554,23 @@ def aligned_table_for(
 __all__ = [
     "AlignedSequenceTable",
     "CaseInput",
+    "DEFAULT_STACK_NAME",
     "FrozenJsonMapping",
     "FusedPipelineDescriptor",
     "FusedPipelineSpec",
     "HardwareInput",
     "JsonObject",
     "JsonValue",
+    "LoweringRequest",
     "ModelInput",
     "OpOccurrence",
     "OperatorSequenceRow",
+    "OriginKind",
     "Phase",
     "PipelinePhase",
+    "RankOps",
     "ReplayOptions",
+    "ResolvedBase",
     "Scope",
     "ServiceEvaluation",
     "SlaCandidate",

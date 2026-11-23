@@ -793,7 +793,7 @@ You are contributing incremental Ascend hardware calibration (`A2` / `A3` / `A5`
 
 ## 六、运行时栈接入、四阶特性瀑布与正交编译契约
 
-模拟器严格分离**硬件物理上能达到什么**与**特定推理服务栈当前交付了什么**。每项优化均为框架中立的 Layer-1 `OptimizationMechanism`（[`mindie_sim/feature_mechanisms.py`](mindie_sim/feature_mechanisms.py)），由 Layer-2 `RuntimeStackProfile`（[`mindie_sim/stack_tracks.py`](mindie_sim/stack_tracks.py)）映射到以下**四阶特性状态（4-Rung Feature Tracks）**：
+模拟器严格分离**硬件物理上能达到什么**与**特定推理服务栈当前交付了什么**。每项优化均为框架中立的 Layer-1 `OptimizationMechanism`（[`mindie_sim/feature_mechanisms.py`](mindie_sim/feature_mechanisms.py)），由 Layer-2 `RuntimeStackProfile`（[`mindie_sim/feature_mechanisms.py`](mindie_sim/feature_mechanisms.py)）映射到以下**四阶特性状态（4-Rung Feature Tracks）**：
 
 | 轨道（Track） | 物理与工程语义 | CLI 选择参数 |
 | :--- | :--- | :--- |
@@ -803,7 +803,7 @@ You are contributing incremental Ascend hardware calibration (`A2` / `A3` / `A5`
 | `expected_ideal` | 栈中立第一性原理上界：激活当前 `(model, hardware, parallel)` 结构兼容的全部 `OptimizationMechanism` | `--feature-track expected_ideal` |
 
 - **四阶瀑布与双视角 PR 消融（[`mindie_sim/feature_mechanisms.py`](mindie_sim/feature_mechanisms.py)）**：执行 `mindie-sim feature-tracks --model <name> --hardware a5 --tp 8 --ep 8` 可一次性输出 **`raw_eager` -> `current_merged` -> `current_unmerged_pr` -> `expected_ideal` -> `hardware_roofline`**（调用 `evaluate_target_efficiency(..., mode="exact_target")` 给出 `0.80x` 关键路径目标与 `1.0x` 物理理想下界），自动审计阶梯单调性，并在 `current_unmerged_pr` 下同时给出正向单加 **`single_pr_ablation`**（`merged + {PR}`）与留一剔除 **`leave_one_out_ablation`**（`unmerged_pr - {PR}`）；`compose` 的 `--enable-opt` / `--disable-opt` 支持单机制正交 What-If 对比。
-- **CANN `9.3.0` + `vllm-ascend@405617bae` 栈真源清单**：内置 `RUNTIME_STACKS` 仅保留经逐行源码审计的 `vllm-ascend`（由 [`mindie_sim/stacks/vllm_ascend/manifest.json`](mindie_sim/stacks/vllm_ascend/manifest.json) 与 [`mindie_sim/stack_tracks.py`](mindie_sim/stack_tracks.py) 驱动，精确对齐 `_A5_PROFILE` 中已合入的 `MegaMoE(enable_fused_mc2=3)`、`Chunk64`、`_C_ascend.npu_hc_pre_v3/v2`、`GBSA`、`MlaPrologV4`、缺省的 `GRAPH_QKV_NORM_ROPE_FUSION`，以及 `PR #22147` `Chunk32`、`PR #21794` `text_gated_residual`、`PR #22333` `situglu` MegaMoE、`PR #22467` C8 `KvQuantSFA`、`PR #22235` `msa_index_score_v2` 等 35 个活跃未合入 PR）与框架中立的 `raw_eager`。
+- **CANN `9.3.0` + `vllm-ascend@405617bae` 栈真源清单**：内置 `RUNTIME_STACKS` 仅保留经逐行源码审计的 `vllm-ascend`（由 [`mindie_sim/stacks/vllm_ascend/manifest.json`](mindie_sim/stacks/vllm_ascend/manifest.json) 与 [`mindie_sim/feature_mechanisms.py`](mindie_sim/feature_mechanisms.py) 驱动，精确对齐 `_A5_PROFILE` 中已合入的 `MegaMoE(enable_fused_mc2=3)`、`Chunk64`、`_C_ascend.npu_hc_pre_v3/v2`、`GBSA`、`MlaPrologV4`、缺省的 `GRAPH_QKV_NORM_ROPE_FUSION`，以及 `PR #22147` `Chunk32`、`PR #21794` `text_gated_residual`、`PR #22333` `situglu` MegaMoE、`PR #22467` C8 `KvQuantSFA`、`PR #22235` `msa_index_score_v2` 等 35 个活跃未合入 PR）与框架中立的 `raw_eager`。
 - **`Software` 正交两层编译契约（[`mindie_sim/schema/case.py`](mindie_sim/schema/case.py)）**：`Software` 将外层图捕获 `graph_capture_mode`（`"none"` / `"piecewise"` / `"full"`，对应 `ModelRunner` `NPUGraph` / `FULL_DECODE_ONLY` `ACLGraph`）与内层编译器布尔开关（`enable_torch_compile`、`enable_npugraph_ex`、`enable_static_kernel`、`enable_super_kernel`）正交解耦：模型标记 `do_not_compile=True`（`supports_torch_compile=False`）时**保留 `graph_capture_mode="full"`** 而仅关闭 `enable_torch_compile` / `enable_npugraph_ex`；当 `graph_capture_mode != "full"`（如 `piecewise`）或 `enable_torch_compile=False` 时，自动关闭 `enable_npugraph_ex`、`enable_static_kernel` 与 `enable_super_kernel`。
 
 **严禁将未经验证的第三方推理栈硬编码为内置 Profile。** `mindie-llm`、`sglang`、`xllm` 等外部框架一律通过 `mindie-sim.stack-manifest/1` JSON 清单或调用方显式 `register_runtime_stack(...)` 接入，并如实声明模型支持范围：

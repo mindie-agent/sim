@@ -143,6 +143,17 @@ def _special_layer_keys(model: ModelSpec) -> tuple[set[str], set[str]]:
             native_layers = block.get("native_layers")
             if isinstance(native_layers, Mapping):
                 by_native.update(str(k) for k in native_layers)
+    quant = getattr(model, "quant", None)
+    if quant is not None and getattr(quant, "layer_quant_overrides", ()):
+        q_block = quant.layer_quant_overrides_dict()
+        q_layers = q_block.get("layers")
+        if isinstance(q_layers, Mapping):
+            by_index.update(str(k) for k in q_layers)
+        else:
+            by_index.update(str(k) for k in q_block if k != "native_layers")
+        q_native = q_block.get("native_layers")
+        if isinstance(q_native, Mapping):
+            by_native.update(str(k) for k in q_native)
     return by_index, by_native
 
 

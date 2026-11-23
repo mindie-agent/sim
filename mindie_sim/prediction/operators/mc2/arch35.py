@@ -81,7 +81,7 @@ SOURCES: tuple[SourceRef, ...] = (
         source_sha256="2b4d5fde8c865e54017949ae7618b7c28b40a92ef725253e847fc04113a6cf81",
     ),
     SourceRef(
-        repository="cannbot-skills",
+        repository="cann/ascendc-mc2-best-practice",
         revision=_SKILLS_REVISION,
         relative_path="ops/ascendc-mc2-best-practice/references/requirement-analysis/comm-path-decision.md",
         source_sha256="05a9e0df5d30d32096454a7fa0cdcab23596254ecdf1639f441657ca9a2f9b25",

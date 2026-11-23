@@ -114,8 +114,8 @@ def test_typed_sdk_three_tier_evaluation_and_exports(sku):
 def test_typed_sdk_service_sla_sweep_and_production_capture_resolution():
     import pickle
     from dataclasses import replace
-    from mindie_sim.prediction.results import SlaRequest, SweepRequest
-    from mindie_sim.stack_registry import LoweringRequest, default_stack_registry
+    from mindie_sim.feature_mechanisms import default_stack_registry
+    from mindie_sim.prediction.results import LoweringRequest, SlaRequest, SweepRequest
     options = dict(SDK_DEFAULTS, prompt_tokens=32, output_tokens=2, concurrency=1, ttft_slo_ms=5000.0)
     case = sdk_api.compose_case("qwen3-32b", hardware=REPRESENTATIVE_SKUS["a2"], options=options)
     service = sdk_api.evaluate_service(case)
@@ -471,7 +471,7 @@ def test_composite_quantized_pipeline_preserves_send_and_completion_boundaries(m
 
 def test_pipeline_retains_cross_layer_attention_residual_bank():
     for pp in (1, 2):
-        case = compose_raw_case("kimi-k3", "a3", tp=8, pp=pp, ep=8, layers=4, va_recommended=True)
+        case = compose_raw_case("kimi-k3", "a5", tp=8, pp=pp, ep=8, layers=4, va_recommended=True)
         ops = target_operators(case, **(PREFILL | {"scope": "model"}))
         views = [dict(op.metadata)["attn_res_view"] for op in ops if op.layer == 2 and "attn_res_view" in dict(op.metadata)]
         assert [view["valid_blocks"] for view in views] == [1, 1]
@@ -627,6 +627,7 @@ def test_agent_first_report_and_solve_cli_flags_and_model_target_ceiling(tmp_pat
 
     ceiling = mindie_sim.model_target_ceiling(
         "qwen3-32b", "950dt-96g-pod",
+        deployment_mode="colocated",
         num_devices=4, layers=2, prompt_tokens=512, output_tokens=64,
         tpot_slo_ms=50.0, max_sequences_per_dp=4,
     )

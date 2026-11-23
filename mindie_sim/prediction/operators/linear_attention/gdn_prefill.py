@@ -31,6 +31,11 @@ from mindie_sim.prediction.structure_groups import declare_group, source_referen
 from mindie_sim.prediction.operators.causal_conv import native_causal_conv_prefill
 from mindie_sim.prediction.operators.kda import kda_state_selection as pcp_state_selection
 from mindie_sim.prediction.operators.linear_attention import gdn_recurrent
+from mindie_sim.prediction.operators.recurrent.recover_ssm_work import (
+    emit_commit_op,
+    recover_ssm_enabled,
+    rewrite_gdn_analytical_scan,
+)
 from mindie_sim.prediction.tensors import TensorLowering
 
 DECODE_QK_L2NORM_OPS_PER_ELEMENT = 5
@@ -695,6 +700,7 @@ def _lower_idle_pcp_peer(
 def _lower_mixed_decode_branch(
     b, tensors, *, prefix, plan, model, ordered, decode, decode_tokens,
     qkv, gate_values, heads, keys, dk, dv, chunk, cache_indices, state_rows, index_source,
+    runtime=None,
 ):
     decode_active = tuple(view for view in decode if not view.padding)
     decode_offsets, cursor = [], 0
@@ -729,18 +735,34 @@ def _lower_mixed_decode_branch(
     decode_contract, decode_outputs = gdn_recurrent.bind_state_ports(
         decode_contract, scan.op_id, heads=heads, head_shards=1,
         value_outputs=None)
-    b.ops[-1] = replace(scan, metadata=tuple({**scan_meta,
+    updated_scan = replace(scan, metadata=tuple({**scan_meta,
         "state_ready": scan.op_id,
         "state_value_inputs": decode_value_inputs,
         "state_value_outputs": decode_outputs,
         "gdn_state_contract": decode_contract,
         "gdn_state_effects": decode_effects,
         "padding_slots": decode_contract["padding_slots"],
+        "recurrent_attention_kind": "gdn",
         "state_checkpoint_versions": tuple(
-            None if count <= 0 else (context + 1,)
+            None if count <= 0 else tuple(context + offset + 1 for offset in range(count))
             for context, count in zip(decode_contract["contexts"],
                                       decode_contract["checkpoints"]))}.items()))
-    dec_ops = b.ops[decode_start_index:]
+    speculative_decode = any(int(view.q_len) > 1 for view in decode_active)
+    use_recover_ssm = recover_ssm_enabled(runtime) and speculative_decode
+    if use_recover_ssm:
+        updated_scan = rewrite_gdn_analytical_scan(
+            updated_scan, active_views=decode_active, heads=heads, dk=dk, dv=dv,
+            state_dtype=plan.recurrent_state_dtype, kg_dtype=model.activation_dtype,
+            attention_kind="gdn",
+        )
+    b.ops[-1] = updated_scan
+    if use_recover_ssm:
+        emit_commit_op(
+            b, name="recover_ssm_commit", deps=(updated_scan.op_id,), views=decode_active,
+            heads=heads, dk=dk, dv=dv, state_dtype=plan.recurrent_state_dtype,
+            kg_dtype=model.activation_dtype, runtime=runtime, attention_kind="gdn",
+        )
+    dec_ops = [op for op in b.ops[decode_start_index:] if not dict(op.metadata).get("recover_ssm_intent")]
     dec_ids = {op.op_id for op in dec_ops}
     declare_group(
         b.ops, key=prefix + ".gdn_recurrent", role="gdn_recurrent", family="gdn",
@@ -837,7 +859,7 @@ def lower(*, prefix, plan, views, stage, deps, model, parallel, mode,
             b, tensors, prefix=prefix, plan=plan, model=model, ordered=ordered,
             decode=decode, decode_tokens=decode_tokens, qkv=qkv, gate_values=gate_values,
             heads=heads, keys=keys, dk=dk, dv=dv, chunk=chunk, cache_indices=cache_indices,
-            state_rows=state_rows, index_source=index_source))
+            state_rows=state_rows, index_source=index_source, runtime=runtime))
     prefill_slots = (None if cache_indices is None else
                      tuple(cache_indices[len(decode) + index]
                            for index in range(len(prefill))))

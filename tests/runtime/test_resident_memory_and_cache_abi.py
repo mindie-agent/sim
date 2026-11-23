@@ -765,3 +765,28 @@ def test_resize_per_request_verify_width_and_recover_ssm_snapshot_ring_headroom(
         delta_step_ms=-0.25,
     )
     assert tradeoff_over.feasible_under_hbm_and_sla is False
+
+
+def test_projected_resident_memory_receipt_cache_matches_memory_cache_bytes_to_the_byte():
+    """Projected ResidentMemoryReceipt cache pools include page-group reserve & metadata exactly."""
+    paired_case = _load_full_case(
+        "kimi-k3.1", tp=8, ep=8, layers=4, mtp_proposal_tokens=3, num_devices=8,
+    )
+    mem = Memory(paired_case, MemoryPolicy(derive_workspace=False))
+    seq_tokens, batch_per_dp, q_tokens = 100, 4, 4
+    expected_stage0 = int(round(batch_per_dp * mem.cache_bytes(seq_tokens, padded=True, query_tokens=q_tokens)[0]))
+    receipt = mem.resident_memory_receipt(
+        scenario="projected_cache_parity",
+        phase="decode",
+        sequence_tokens=seq_tokens,
+        batch_per_dp=batch_per_dp,
+        query_tokens=q_tokens,
+    )
+    die0 = receipt.die_receipt(0, 0, 0)
+    projected_total = (
+        die0.kv_cache_allocated_bytes
+        + die0.index_cache_allocated_bytes
+        + die0.recurrent_state_bytes
+        + die0.draft_cache_bytes
+    )
+    assert projected_total == expected_stage0

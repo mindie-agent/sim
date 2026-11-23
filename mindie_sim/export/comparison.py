@@ -659,7 +659,12 @@ def _index_target_layer_archetypes(
             continue
         handled_aids.add(arch.archetype_id)
         distinct_layers = {int(o.layer) for o in ops if o.layer is not None}
-        if all(int(o.repeat_count) == len(arch.layer_indices) for o in ops) and len(distinct_layers) <= 1:
+        max_rep = max((int(o.repeat_count) for o in ops), default=0)
+        if (
+            len(distinct_layers) <= 1
+            and max_rep == len(arch.layer_indices)
+            and all(1 <= int(o.repeat_count) <= len(arch.layer_indices) for o in ops)
+        ):
             for phys_idx in arch.layer_indices:
                 layer_map[int(phys_idx)] = (arch.archetype_id, arch.title, ops)
             continue
@@ -678,7 +683,7 @@ def _build_target_layer_slices(
     before_bundle: ExportBundle, after_bundle: ExportBundle,
     b_layer_map: Mapping[int, tuple[str, str, tuple[OperatorExportRow, ...]]],
     a_layer_map: Mapping[int, tuple[str, str, tuple[OperatorExportRow, ...]]],
-) -> list[tuple[str, str, int, int, tuple[OperatorExportRow, ...], tuple[OperatorExportRow, ...]]]:
+) -> list[tuple[str, str, int, int, tuple[OperatorExportRow, ...], tuple[OperatorExportRow, ...], bool]]:
     b_arch_meta = {a.archetype_id: a for a in before_bundle.archetypes}
     a_arch_meta = {a.archetype_id: a for a in after_bundle.archetypes}
     grouped: dict[tuple[str | None, str | None], list[int]] = {}
@@ -718,7 +723,7 @@ def _build_target_layer_slices(
             rng_txt = _format_slice_layer_range(idxs)
             slice_title = f"{clean_title} (×{rep}, {rng_txt})" if rng_txt else f"{clean_title} (×{rep})"
         used_ids.add(slice_aid)
-        slices.append((slice_aid, slice_title, rep if b_ops else 0, rep if a_ops else 0, b_ops, a_ops))
+        slices.append((slice_aid, slice_title, rep if b_ops else 0, rep if a_ops else 0, b_ops, a_ops, same_unsplit))
     return slices
 
 
@@ -747,19 +752,14 @@ def align_before_after_operators(before_bundle: ExportBundle, after_bundle: Expo
                 continue
             seen_arch.add(aid)
             b_ops, a_ops = tuple(before_by_arch.get(aid, ())), tuple(after_by_arch.get(aid, ()))
-            entry = (aid, op.archetype_title or op.layer_label, max(1, int(b_ops[0].repeat_count)) if b_ops else 0, max(1, int(a_ops[0].repeat_count)) if a_ops else 0, b_ops, a_ops)
+            entry = (aid, op.archetype_title or op.layer_label, max(1, int(b_ops[0].repeat_count)) if b_ops else 0, max(1, int(a_ops[0].repeat_count)) if a_ops else 0, b_ops, a_ops, True)
             (pre_slices if (not seen_target and target_slices) else post_slices).append(entry)
 
     b_ntok = max(float(before_bundle.n_tok_per_die or 1.0), MIN_DENOM_EPS)
     a_ntok = max(float(after_bundle.n_tok_per_die or 1.0), MIN_DENOM_EPS)
     receipts = tuple(after_bundle.applied_edit_receipts or ())
     aligned: list[AlignedComparisonRow] = []
-    tagged_slices = (
-        *((item, True) for item in pre_slices),
-        *((item, False) for item in target_slices),
-        *((item, True) for item in post_slices),
-    )
-    for (aid, title, b_rep, a_rep, b_ops, a_ops), use_op_rep in tagged_slices:
+    for aid, title, b_rep, a_rep, b_ops, a_ops, use_op_rep in (*pre_slices, *target_slices, *post_slices):
         aligned.extend(_align_archetype_bipartite(
             aid, title, a_rep or b_rep or 1, b_ops, a_ops,
             before_ntok=b_ntok, after_ntok=a_ntok, before_rep=b_rep or 1, after_rep=a_rep or 1,

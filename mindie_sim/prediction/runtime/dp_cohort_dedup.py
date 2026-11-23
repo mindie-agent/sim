@@ -294,8 +294,6 @@ def _rank_topology_profile(topology: Any, engine: Any, ranks: tuple[int, ...]) -
 
 def _has_unsynced_peer_die_overlap(execution: Any, w0: Any, r0: int) -> bool:
     """True when multi-stream r0 ops contend asymmetrically with synthesized peer cohorts."""
-    if getattr(execution, "_fast_span_only", False):
-        return False
     ops0 = w0.ops
     if len({op.stream for op in ops0}) <= 1:
         return False
@@ -315,8 +313,7 @@ def _has_unsynced_peer_die_overlap(execution: Any, w0: Any, r0: int) -> bool:
                 elif key == "source_stage" and value is not None:
                     source_stage = int(value)
         is_mc2 = op.family in _NATIVE_MC2_FAMILIES or has_mc2_phase
-        if (is_mc2 and len(execution.topology.ranks(r0, source_stage)) > 1
-                and not getattr(execution, "_fast_span_only", False)):
+        if is_mc2 and len(execution.topology.ranks(r0, source_stage)) > 1:
             return True
         if not can_r0_only and (is_mc2 or has_group_axis):
             return True

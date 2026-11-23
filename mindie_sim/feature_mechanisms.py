@@ -1,15 +1,24 @@
-"""Optimization mechanism registry, catalog applicators and 4-track feature waterfall.
+"""Optimization mechanism registry, stack profiles, software stack registry and 4-track waterfall.
 
 [Role] Own optimization mechanism declarations, structural applicability rules,
-  and 4-track (raw_eager -> merged -> unmerged_pr -> expected_ideal) waterfall evaluation.
+  pluggable ``RuntimeStackProfile`` / ``SoftwareStackRegistry`` resolution, and
+  4-track (raw_eager -> merged -> unmerged_pr -> expected_ideal) waterfall evaluation.
 [Invariants] Mechanisms apply strictly by model/hardware structural capability,
-  never by hardcoded model names.
-[Timeouts & Locks] Delegates step evaluation to canonical Engine; no locks.
-[Side-Effect Policy] Pure planning and read-only simulation."""
+  never by hardcoded model names. ``SoftwareStackRegistry.resolve_base`` never
+  mutates caller ``Case`` objects or ``Software.kernels`` dictionaries.
+[Timeouts & Locks] Bounded JSON manifest reads (< 50 MiB); delegates step
+  evaluation to canonical Engine; no locks.
+[Side-Effect Policy] Pure planning and read-only simulation; returns new frozen
+  ``ResolvedBase`` and ``Case`` records."""
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from collections import defaultdict
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from copy import deepcopy
+from dataclasses import dataclass, field, replace
+from functools import lru_cache
+import json
+from pathlib import Path
 from typing import Any
 
 from mindie_sim.prediction.efficiency import analyze_network_efficiency
@@ -17,8 +26,18 @@ from mindie_sim.prediction.operators.linear_attention.gdn_domain import (
     GDN_CHUNK32_TOKENS,
     model_supports_gdn_chunk32,
 )
+from mindie_sim.prediction.results import (
+    DEFAULT_STACK_NAME,
+    LoweringRequest,
+    OriginKind,
+    ResolvedBase,
+)
+from mindie_sim.schema.case import Case, Software
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.schema.model import ModelSpec
+from mindie_sim.schema.speculative import SpeculativeSpec
+from mindie_sim.stacks.vllm_ascend.profiles import VA_RECOMMENDED_PROFILES
 
 MX_SCALE_GROUP_SIZE = 32
 MSA_MIN_BLOCK_SIZE = 64
@@ -919,7 +938,8 @@ for _item in (
     OptimizationMechanism(
         id="attn_res_prefix_fusion", category="residual_fusion", phases=("prefill", "decode"),
         summary="Fused AttentionResidual prefix accumulator (AttnResFwd)",
-        eligible=lambda ctx: any(p.residual_block_size > 0 for p in ctx.model.layer_plans),
+        eligible=lambda ctx: (ctx.arch == "a5"
+                              and any(p.residual_block_size > 0 for p in ctx.model.layer_plans)),
         apply=_apply_attn_res,
     ),
     OptimizationMechanism(
@@ -1314,3 +1334,670 @@ def compare_feature_tracks(
                   "sequences": sequences, "scope": scope},
         pr_ablations=pr_ablations, loo_ablations=loo_ablations,
     )
+
+
+# --- Layer 2 RuntimeStackProfile Registry & JSON Manifest Loader ------------
+
+STACK_MANIFEST_SCHEMA = "mindie-sim.stack-manifest/1"
+VLLM_ASCEND_MANIFEST_PATH = (
+    Path(__file__).resolve().parent / "stacks" / "vllm_ascend" / "manifest.json"
+)
+MAX_MANIFEST_BYTES = 50 * 1024 * 1024
+MIN_CAPTURE_SEQS = 16
+
+TRACK_ALIASES: dict[str, str] = {
+    "raw_eager": "raw_eager",
+    "eager": "raw_eager",
+    "merged": "merged",
+    "current_merged": "merged",
+    "unmerged_pr": "unmerged_pr",
+    "current_unmerged_pr": "unmerged_pr",
+    "expected_ideal": "expected_ideal",
+    "ideal": "expected_ideal",
+}
+
+_MECHANISM_LOWERING_SELECTORS: dict[str, tuple[str, ...]] = {
+    "add_rmsnorm_quant_fusion": (
+        "add_rmsnorm", "add_rmsnorm_quant", "rmsnorm_quant"),
+    "mla_prolog_fusion": ("mla_prolog",),
+    "attn_res_prefix_fusion": ("attention_residual",),
+    "recurrent_decode_native_kernels": ("kda", "gdn_decode"),
+    "gdn_chunk64_prefill": ("gdn_prefill",),
+}
+_MECHANISM_LOWERING_PASSES: dict[str, tuple[str, ...]] = {
+    "add_rmsnorm_quant_fusion": ("residual_norm",),
+    "mhc_boundary_fusion_overlap": ("mhc_boundary_pr", "mhc_boundary_ideal"),
+    "gdn_projection_multistream_overlap": ("gdn_projection_overlap",),
+    "kda_in_kernel_l2norm": ("kda_in_kernel_l2norm",),
+    "qkv_norm_rope_fusion": ("qkv_norm_rope",),
+    "indexer_online_ub_topk": ("indexer_online_topk",),
+    "activation_quant_fusion": ("activation_quant",),
+    "gmm_swiglu_quant_fusion": ("gmm_swiglu_quant",),
+    "moe_tail_residual_fusion": ("moe_tail_residual",),
+    "tp_mc2_overlap": ("tp_mc2_overlap",),
+}
+
+
+def excluded_lowering_bindings(
+    exclude_optimizations: Sequence[str] = (),
+) -> tuple[frozenset[str], frozenset[str]]:
+    """Resolve excluded mechanism IDs into installed selectors and passes."""
+    excluded = frozenset(
+        str(value).strip() for value in exclude_optimizations if str(value).strip()
+    )
+    for mechanism_id in excluded:
+        if mechanism_id not in MECHANISM_CATALOG:
+            raise ModelingError(f"unknown_optimization_mechanism:{mechanism_id}")
+    selectors = frozenset(
+        selector for mechanism_id in excluded
+        for selector in _MECHANISM_LOWERING_SELECTORS.get(mechanism_id, ())
+    )
+    passes = frozenset(
+        name for mechanism_id in excluded
+        for name in _MECHANISM_LOWERING_PASSES.get(mechanism_id, ())
+    )
+    return selectors, passes
+
+
+@dataclass(frozen=True)
+class StackMechanismBinding:
+    """Binds one universal mechanism ID to a stack's merge state and PR ref."""
+
+    mechanism_id: str
+    state: str  # "merged" | "unmerged_pr"
+    ref: str | None = None
+    models: tuple[str, ...] = ()
+    archs: tuple[str, ...] = ()
+    phases: tuple[str, ...] = ()
+    options: Mapping[str, Any] = field(default_factory=dict)
+    notes: str = ""
+
+    def __post_init__(self) -> None:
+        if self.mechanism_id not in MECHANISM_CATALOG:
+            raise ModelingError(f"unknown_optimization_mechanism:{self.mechanism_id}")
+        if self.state not in {"merged", "unmerged_pr"}:
+            raise ModelingError(f"invalid_stack_binding_state:{self.state}")
+
+    def matches(self, model_key: str, arch: str, phase: str | None = None) -> bool:
+        if self.models and model_key not in self.models:
+            return False
+        if self.archs and arch not in self.archs:
+            return False
+        if phase and self.phases and phase.lower() not in self.phases:
+            return False
+        return True
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "mechanism_id": self.mechanism_id,
+            "state": self.state,
+            "ref": self.ref,
+            "models": list(self.models),
+            "archs": list(self.archs),
+            "phases": list(self.phases),
+            "options": dict(self.options),
+            "notes": self.notes,
+        }
+
+
+@dataclass(frozen=True)
+class RuntimeStackProfile:
+    """Complete feature-track declaration for one serving runtime stack."""
+
+    name: str
+    repository: str
+    description: str = ""
+    model_defaults: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
+    bindings: tuple[StackMechanismBinding, ...] = ()
+    supported_models: tuple[str, ...] = ()
+    unmerged_pr_models: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema": STACK_MANIFEST_SCHEMA,
+            "name": self.name,
+            "repository": self.repository,
+            "description": self.description,
+            "supported_models": list(self.supported_models),
+            "unmerged_pr_models": list(self.unmerged_pr_models),
+            "bindings": [b.to_dict() for b in self.bindings],
+        }
+
+
+RUNTIME_STACKS: dict[str, RuntimeStackProfile] = {}
+
+
+def normalize_feature_track(track: str) -> str:
+    key = str(track or "").strip().lower()
+    if key not in TRACK_ALIASES:
+        raise ModelingError(f"unknown_feature_track:{track}")
+    return TRACK_ALIASES[key]
+
+
+def register_runtime_stack(profile: RuntimeStackProfile) -> RuntimeStackProfile:
+    if not isinstance(profile, RuntimeStackProfile) or not profile.name.strip():
+        raise ModelingError("invalid_runtime_stack_profile")
+    RUNTIME_STACKS[profile.name.strip().lower()] = profile
+    return profile
+
+
+def load_runtime_stack_manifest(source: str | Path | Mapping[str, Any]) -> RuntimeStackProfile:
+    """Load a ``RuntimeStackProfile`` from a JSON file or plain Python dict."""
+    if isinstance(source, (str, Path)):
+        path = Path(source).expanduser()
+        if not path.is_file():
+            raise ModelingError(f"stack_manifest_not_found:{path}")
+        if path.stat().st_size > MAX_MANIFEST_BYTES:
+            raise ModelingError(f"stack_manifest_exceeds_50_mib:{path}")
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    elif isinstance(source, Mapping):
+        raw = dict(source)
+    else:
+        raise ModelingError("stack_manifest_requires_path_or_mapping")
+    if not isinstance(raw, Mapping):
+        raise ModelingError("stack_manifest_invalid_mapping")
+    schema = raw.get("schema", STACK_MANIFEST_SCHEMA)
+    if schema != STACK_MANIFEST_SCHEMA:
+        raise ModelingError(f"stack_manifest_schema_unsupported:{schema}")
+    bindings = tuple(
+        StackMechanismBinding(
+            mechanism_id=str(item["mechanism_id"]),
+            state=str(item["state"]),
+            ref=item.get("ref"),
+            models=tuple(str(m) for m in (item.get("models") or ())),
+            archs=tuple(str(a).lower() for a in (item.get("archs") or ())),
+            phases=tuple(str(p).lower() for p in (item.get("phases") or ())),
+            options=dict(item.get("options") or {}),
+            notes=str(item.get("notes") or ""),
+        )
+        for item in (raw.get("bindings") or ())
+    )
+    return RuntimeStackProfile(
+        name=str(raw["name"]).strip(),
+        repository=str(raw.get("repository") or ""),
+        description=str(raw.get("description") or ""),
+        model_defaults=dict(raw.get("model_defaults") or {}),
+        bindings=bindings,
+        supported_models=tuple(str(m).strip() for m in (raw.get("supported_models") or ())),
+        unmerged_pr_models=tuple(str(m).strip() for m in (raw.get("unmerged_pr_models") or ())),
+    )
+
+
+def resolve_runtime_stack(
+    stack: str | Path | Mapping[str, Any] | RuntimeStackProfile,
+) -> RuntimeStackProfile:
+    if isinstance(stack, RuntimeStackProfile):
+        return stack
+    if isinstance(stack, (Mapping, Path)):
+        return load_runtime_stack_manifest(stack)
+    key = str(stack or "").strip()
+    lower = key.lower()
+    if lower in RUNTIME_STACKS:
+        return RUNTIME_STACKS[lower]
+    candidate = Path(key).expanduser()
+    if candidate.is_file():
+        return load_runtime_stack_manifest(candidate)
+    raise ModelingError(f"unknown_runtime_stack:{stack}")
+
+
+def _collapse_binding_group(
+    mid: str, state: str, group: Sequence[StackMechanismBinding],
+) -> dict[str, Any]:
+    merged_options: dict[str, Any] = {}
+    refs: list[str] = []
+    notes: list[str] = []
+    for item in group:
+        merged_options.update(dict(item.options))
+        if item.ref and item.ref not in refs:
+            refs.append(item.ref)
+        if item.notes and item.notes not in notes:
+            notes.append(item.notes)
+    primary_ref = refs[0] if len(refs) == 1 else (", ".join(refs) if refs else None)
+    entry: dict[str, Any] = {
+        "id": mid,
+        "state": state,
+        "ref": primary_ref,
+        "options": merged_options,
+        "notes": "; ".join(notes),
+    }
+    if len(refs) > 1:
+        entry["refs"] = refs
+    return entry
+
+
+def resolve_stack_track(
+    stack_profile: RuntimeStackProfile,
+    *,
+    track: str,
+    model_key: str,
+    ctx: MechanismContext,
+    optimizations: Sequence[str] = (),
+    exclude_optimizations: Sequence[str] = (),
+) -> dict[str, Any]:
+    """Resolve active mechanisms, PR provenance, and unimplemented gaps."""
+    canonical_track = normalize_feature_track(track)
+    if stack_profile.supported_models or stack_profile.unmerged_pr_models:
+        if canonical_track == "merged" and model_key not in stack_profile.supported_models:
+            raise ModelingError(
+                f"model_not_supported_by_runtime_stack:{stack_profile.name}:{model_key}:merged")
+        if (canonical_track == "unmerged_pr"
+                and model_key not in stack_profile.supported_models
+                and model_key not in stack_profile.unmerged_pr_models):
+            raise ModelingError(
+                f"model_not_supported_by_runtime_stack:{stack_profile.name}:{model_key}:unmerged_pr")
+
+    include_ids = tuple(str(x).strip() for x in optimizations if str(x).strip())
+    exclude_ids = frozenset(str(x).strip() for x in exclude_optimizations if str(x).strip())
+    for mid in (*include_ids, *exclude_ids):
+        if mid not in MECHANISM_CATALOG:
+            raise ModelingError(f"unknown_optimization_mechanism:{mid}")
+    overlap_conflict = set(include_ids) & exclude_ids
+    if overlap_conflict:
+        raise ModelingError(
+            "optimization_include_exclude_conflict:" + ",".join(sorted(overlap_conflict)))
+
+    model_cfg = dict(stack_profile.model_defaults.get(model_key) or {})
+    ctx_phase = str((ctx.options or {}).get("phase") or "").strip().lower() or None
+    eligible_ids = [
+        mech.id for mech in MECHANISM_CATALOG.values()
+        if mech.eligible(ctx) and (not ctx_phase or not mech.phases or ctx_phase in mech.phases)
+    ]
+    eligible_set = set(eligible_ids)
+    merged_list: list[StackMechanismBinding] = []
+    pr_list: list[StackMechanismBinding] = []
+    merged_by_id: dict[str, list[StackMechanismBinding]] = defaultdict(list)
+    pr_by_id: dict[str, list[StackMechanismBinding]] = defaultdict(list)
+    for binding in stack_profile.bindings:
+        if not binding.matches(model_key, ctx.arch, phase=ctx_phase):
+            continue
+        if binding.mechanism_id not in eligible_set:
+            continue
+        if binding.state == "merged":
+            if binding.mechanism_id == "sequence_parallel" and model_cfg.get("sp") is False:
+                continue
+            merged_list.append(binding)
+            merged_by_id[binding.mechanism_id].append(binding)
+        else:
+            pr_list.append(binding)
+            pr_by_id[binding.mechanism_id].append(binding)
+
+    active: dict[str, dict[str, Any]] = {}
+    if canonical_track in {"merged", "unmerged_pr", "expected_ideal"}:
+        for mid, group in merged_by_id.items():
+            active[mid] = _collapse_binding_group(mid, "merged", group)
+    if canonical_track in {"unmerged_pr", "expected_ideal"}:
+        for mid, group in pr_by_id.items():
+            prev_opts = dict(active[mid]["options"]) if mid in active else {}
+            collapsed = _collapse_binding_group(mid, "unmerged_pr", group)
+            collapsed["options"] = {**prev_opts, **collapsed["options"]}
+            active[mid] = collapsed
+    ideal_eligible_ids: list[str] = eligible_ids
+    if canonical_track == "expected_ideal":
+        ideal_opts = {**dict(ctx.options or {}), "allow_extended_activation_abi": True}
+        if "enable_fused_mc2" not in ctx.caller_explicit and ideal_opts.get("enable_fused_mc2") == 0:
+            ideal_opts.pop("enable_fused_mc2", None)
+        ideal_ctx = MechanismContext(
+            model=ctx.model, sku=ctx.sku, arch=ctx.arch, parallel=ctx.parallel,
+            caller_explicit=ctx.caller_explicit,
+            options=ideal_opts,
+        )
+        ideal_eligible_ids = [
+            mech.id for mech in MECHANISM_CATALOG.values()
+            if mech.eligible(ideal_ctx) and (not ctx_phase or not mech.phases or ctx_phase in mech.phases)
+        ]
+        for mid in ideal_eligible_ids:
+            prev = active.get(mid)
+            opts: dict[str, Any] = {}
+            if mid == "mhc_boundary_fusion_overlap":
+                opts["unbounded_rows"] = True
+            elif mid == "cann_megamoe_fusion":
+                opts["allow_extended_activation_abi"] = True
+            if prev is None:
+                active[mid] = {
+                    "id": mid, "state": "expected_ideal", "ref": None,
+                    "options": opts, "notes": "architectural_ideal",
+                }
+            elif opts:
+                active[mid] = {**prev, "options": {**prev["options"], **opts}}
+
+    for mid in include_ids:
+        mech = MECHANISM_CATALOG[mid]
+        opt_ctx = MechanismContext(
+            model=ctx.model, sku=ctx.sku, arch=ctx.arch, parallel=ctx.parallel,
+            caller_explicit=ctx.caller_explicit,
+            options={**dict(ctx.options or {}), "explicit_opt_in": True},
+        )
+        if not mech.eligible(opt_ctx):
+            continue
+        group = pr_by_id.get(mid) or merged_by_id.get(mid)
+        if group:
+            collapsed = _collapse_binding_group(mid, group[0].state, group)
+            collapsed["notes"] = "caller_enabled"
+            active[mid] = collapsed
+        else:
+            active[mid] = {
+                "id": mid, "state": "explicit_override", "ref": None,
+                "options": {}, "notes": "caller_enabled",
+            }
+    for mid in exclude_ids:
+        active.pop(mid, None)
+
+    gap_pool = ideal_eligible_ids if canonical_track == "expected_ideal" else eligible_ids
+    unimplemented_gaps = [
+        mid for mid in gap_pool
+        if mid not in merged_by_id and mid not in pr_by_id
+    ]
+    return {
+        "stack": stack_profile.name,
+        "repository": stack_profile.repository,
+        "feature_track": canonical_track,
+        "eligible_mechanisms": eligible_ids,
+        "active_mechanisms": [active[key] for key in MECHANISM_CATALOG if key in active],
+        "merged_mechanisms": [b.to_dict() for b in merged_list],
+        "unmerged_pr_mechanisms": [b.to_dict() for b in pr_list],
+        "unimplemented_gaps": unimplemented_gaps,
+        "explicit_included": list(include_ids),
+        "explicit_excluded": sorted(exclude_ids),
+    }
+
+
+def apply_resolved_mechanisms(
+    runtime_dict: dict[str, Any],
+    resolved_track: Mapping[str, Any],
+    base_ctx: MechanismContext,
+) -> None:
+    """Apply every active mechanism in deterministic catalog order."""
+    active = {entry["id"]: entry for entry in resolved_track["active_mechanisms"]}
+    for mid, mech in MECHANISM_CATALOG.items():
+        entry = active.get(mid)
+        if entry is None:
+            continue
+        opts = {**dict(base_ctx.options or {}), **dict(entry.get("options") or {})}
+        if entry.get("notes") == "caller_enabled":
+            opts["explicit_opt_in"] = True
+        ctx = MechanismContext(
+            model=base_ctx.model,
+            sku=base_ctx.sku,
+            arch=base_ctx.arch,
+            parallel=base_ctx.parallel,
+            caller_explicit=base_ctx.caller_explicit,
+            options=opts,
+        )
+        if mech.eligible(ctx):
+            mech.apply(runtime_dict, ctx)
+
+
+def _vllm_ascend_profile() -> RuntimeStackProfile:
+    profile = load_runtime_stack_manifest(VLLM_ASCEND_MANIFEST_PATH)
+    model_defaults = {
+        key: {
+            "quant": dict(value.get("quant") or {}),
+            "sp": value.get("sp", True),
+            "mlapo": "VLLM_ASCEND_ENABLE_MLAPO" in (value.get("env") or {}),
+            "kv_block_size": value.get("kv_block_size"),
+            "mtp_proposal_tokens": value.get("mtp_proposal_tokens", 0),
+            "graph_capture_mode": value.get("graph_capture_mode", "full"),
+            "multistream_overlap_shared_expert": bool(
+                value.get("multistream_overlap_shared_expert", False)
+            ),
+            "engram_cpu_offload": bool(value.get("engram_cpu_offload", False)),
+            "tutorial_flags": dict(value.get("tutorial_flags") or {}),
+        }
+        for key, value in VA_RECOMMENDED_PROFILES.items()
+    }
+    return replace(
+        profile,
+        description="vLLM-Ascend main baseline and audited open performance PRs",
+        model_defaults=model_defaults,
+        bindings=profile.bindings,
+    )
+
+
+register_runtime_stack(_vllm_ascend_profile())
+
+register_runtime_stack(RuntimeStackProfile(
+    name="raw_eager",
+    repository="eager-baseline",
+    description="Unfused eager PyTorch/ATen execution baseline with zero optional fusions",
+    bindings=(),
+))
+
+
+# --- Unified Software Stack Registry & Lowering-Base Resolver ---------------
+
+
+@dataclass(frozen=True, slots=True)
+class SoftwareStackSpec:
+    """Declarative specification of one registered inference software stack."""
+
+    name: str
+    repository: str
+    description: str
+    profile: RuntimeStackProfile
+    sources: tuple[SourceRef, ...] = ()
+    default_track: str = "merged"
+    decode_capture_mode: str = "full"
+
+
+def _extract_origins(metadata: Mapping[str, object]) -> tuple[tuple[str, OriginKind], ...]:
+    raw = metadata.get("recipe_binding_origins")
+    if not isinstance(raw, Mapping):
+        return ()
+    entries: list[tuple[str, OriginKind]] = []
+    for section, mapping in sorted(raw.items()):
+        if not isinstance(mapping, Mapping):
+            continue
+        for key, origin in sorted(mapping.items()):
+            label = str(origin)
+            if label in {"caller", "stack_profile", "body_default"}:
+                entries.append((f"{section}.{key}", label))  # type: ignore[arg-type]
+    return tuple(entries)
+
+
+def _stack_name_for_case(case: Case, requested: str | None) -> str:
+    if requested:
+        return str(requested).strip()
+    meta = dict(case.runtime.metadata)
+    report = meta.get("feature_track_report")
+    if isinstance(report, Mapping) and report.get("stack"):
+        return str(report["stack"]).strip()
+    return DEFAULT_STACK_NAME
+
+
+def _mtp_proposal_tokens(case: Case) -> int:
+    """Resolve draft/MTP proposal token count matching ``scheduler.py``."""
+    dspark = getattr(case.runtime, "dspark", None)
+    if dspark is not None:
+        step_spec = dspark.step_spec()
+        if getattr(step_spec, "draft_len", 0):
+            return int(step_spec.draft_len)
+    meta = dict(case.runtime.metadata)
+    raw_spec = meta.get("speculative")
+    if raw_spec:
+        if isinstance(raw_spec, SpeculativeSpec):
+            spec_obj = raw_spec
+        else:
+            parsed = json.loads(raw_spec) if isinstance(raw_spec, str) else raw_spec
+            spec_obj = SpeculativeSpec.from_mapping(parsed) if isinstance(parsed, Mapping) else None
+        if spec_obj is not None and spec_obj.draft_len:
+            return int(spec_obj.draft_len)
+    if meta.get("draft_proposal_tokens"):
+        return int(meta["draft_proposal_tokens"])
+    aux = getattr(case.model, "auxiliary", None)
+    mtp = getattr(aux, "mtp", None) if aux is not None else None
+    if mtp is not None and getattr(mtp, "proposal_tokens", 0):
+        return int(mtp.proposal_tokens)
+    model_spec = getattr(case.model, "speculative", None)
+    if model_spec is not None and getattr(model_spec, "proposal_tokens", 0):
+        return int(model_spec.proposal_tokens)
+    return 0
+
+
+def _apply_production_decode_capture(
+    case: Case,
+    request: LoweringRequest,
+    stack: SoftwareStackSpec,
+) -> Case:
+    if not request.production_capture or request.step is None or request.step.phase != "decode":
+        return case
+    target_mode = (
+        stack.decode_capture_mode
+        if stack.decode_capture_mode and stack.decode_capture_mode != "none"
+        else "full"
+    )
+    if case.runtime.graph_capture_mode == target_mode and case.runtime.graph_capture_keys:
+        return case
+    from mindie_sim.compose.runtime import capture_keys
+
+    max_seqs = max(
+        MIN_CAPTURE_SEQS,
+        int(case.runtime.max_num_seqs or MIN_CAPTURE_SEQS),
+        request.step.sequences if isinstance(request.step.sequences, int)
+        else max(request.step.sequences, default=1),
+    )
+    mtp = _mtp_proposal_tokens(case)
+    keys = tuple(case.runtime.graph_capture_keys or capture_keys(max_seqs, mtp))
+    runtime = replace(
+        case.runtime,
+        graph_capture_mode=target_mode,
+        graph_capture_keys=keys,
+    )
+    return replace(case, runtime=runtime)
+
+
+def _apply_tier_policy(
+    case: Case,
+    request: LoweringRequest,
+    stack: SoftwareStackSpec,
+) -> Case:
+    if request.tier == "mainline":
+        return case
+    if request.tier == "unmerge":
+        kernels = deepcopy(dict(case.runtime.kernels))
+        meta = dict(case.runtime.metadata)
+        origins = meta.get("recipe_binding_origins")
+        lowerings = dict(kernels.get("lowerings") or {})
+        if isinstance(origins, Mapping) and isinstance(origins.get("lowerings"), Mapping):
+            low_origins = origins["lowerings"]
+            lowerings = {
+                key: value for key, value in lowerings.items()
+                if low_origins.get(key) == "caller"
+            }
+        else:
+            lowerings = {}
+        kernels["lowerings"] = lowerings
+        policy = dict(meta.get("execution_policy") or {})
+        policy["automatic_optional_fusions"] = False
+        meta["execution_policy"] = policy
+        runtime = replace(
+            case.runtime,
+            kernels=kernels,
+            lowering_passes=(),
+            metadata=tuple(meta.items()),
+        )
+        return replace(case, runtime=runtime)
+
+    from mindie_sim.compose.runtime import finalize_compilation_spine
+
+    rt_dict = case.runtime.to_dict()
+    parallel = case.runtime.parallel
+    phase = request.step.phase if request.step is not None else None
+    arch = str(case.machine.arch_family or "").lower()
+    ctx = MechanismContext(
+        model=case.model,
+        sku=str(case.machine.sku or ""),
+        arch=arch,
+        parallel={
+            "tp": parallel.tp,
+            "dp": parallel.dp,
+            "pp": parallel.pp,
+            "ep": parallel.ep,
+            "pcp": parallel.pcp,
+            "dcp": parallel.dcp,
+        },
+        caller_explicit=frozenset(),
+        options={"phase": phase} if phase else {},
+    )
+    resolved = resolve_stack_track(
+        stack.profile,
+        track="expected_ideal",
+        model_key=str(case.model.name),
+        ctx=ctx,
+    )
+    apply_resolved_mechanisms(rt_dict, resolved, ctx)
+    finalize_compilation_spine(rt_dict, raw_eager=False)
+    new_runtime = Software.from_mapping(rt_dict)
+    return replace(case, runtime=new_runtime)
+
+
+class SoftwareStackRegistry:
+    """Registry of supported inference software stacks and tier resolution."""
+
+    def __init__(self, specs: Iterable[SoftwareStackSpec] = (), /) -> None:
+        self._specs: dict[str, SoftwareStackSpec] = {}
+        for spec in specs:
+            self.register(spec)
+
+    def register(self, spec: SoftwareStackSpec, /) -> SoftwareStackSpec:
+        key = spec.name.strip().lower()
+        if not key:
+            raise ModelingError("software_stack_name_required")
+        self._specs[key] = spec
+        return spec
+
+    def get(self, name: str, /) -> SoftwareStackSpec:
+        key = str(name or "").strip().lower()
+        if key in self._specs:
+            return self._specs[key]
+        profile = resolve_runtime_stack(name)
+        return SoftwareStackSpec(
+            name=profile.name,
+            repository=profile.repository,
+            description=profile.description,
+            profile=profile,
+        )
+
+    def list_stacks(self) -> tuple[str, ...]:
+        return tuple(sorted(self._specs))
+
+    def resolve_base(self, case: Case, request: LoweringRequest, /) -> ResolvedBase:
+        """Resolve stack profile, tier rules, capture policy, and binding origins."""
+        stack = self.get(_stack_name_for_case(case, request.stack))
+        working = replace(
+            case,
+            runtime=replace(
+                case.runtime,
+                kernels=deepcopy(dict(case.runtime.kernels)),
+                metadata=tuple(deepcopy(dict(case.runtime.metadata)).items()),
+            ),
+        )
+        working = _apply_tier_policy(working, request, stack)
+        working = _apply_production_decode_capture(working, request, stack)
+        origins = _extract_origins(dict(working.runtime.metadata))
+        return ResolvedBase(
+            case=working,
+            request=request,
+            stack=stack,
+            recipe_origins=origins,
+            sources=stack.sources,
+        )
+
+
+@lru_cache(maxsize=1)
+def default_stack_registry() -> SoftwareStackRegistry:
+    """Return the built-in ``SoftwareStackRegistry`` populated from audited stacks."""
+    specs = [
+        SoftwareStackSpec(
+            name=profile.name,
+            repository=profile.repository,
+            description=profile.description,
+            profile=profile,
+            default_track="raw_eager" if profile.name == "raw_eager" else "merged",
+            decode_capture_mode="none" if profile.name == "raw_eager" else "full",
+        )
+        for profile in RUNTIME_STACKS.values()
+    ]
+    return SoftwareStackRegistry(specs)
+
+
+StackRegistry = SoftwareStackRegistry

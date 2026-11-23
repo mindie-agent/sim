@@ -33,7 +33,7 @@ from mindie_sim.schema.case import Case
 from mindie_sim.schema.common import ModelingError, dtype_bytes
 from mindie_sim.schema.datapath import DatapathCapabilitySpec, datapath_for_die, ub_peer_edges_for_rank
 from mindie_sim.schema.operators import OpSpec
-from mindie_sim.stack_registry import DEFAULT_STACK_NAME, LoweringRequest, RankOps
+from mindie_sim.prediction.results import DEFAULT_STACK_NAME, LoweringRequest, RankOps
 
 from ._oracle_prefetch import die_placements_for_case, primitive_table_digest_token
 from .schema import (

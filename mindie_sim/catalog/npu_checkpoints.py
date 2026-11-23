@@ -1124,7 +1124,14 @@ def _resolve_local_checkpoint(path: Path, hw_family: str) -> CheckpointMetadataR
         qspec: QuantSpec | None = quant_spec_from_checkpoint_map(qmap, base_config=cfg or None)
         if desc_path.stat().st_size <= MAX_LOCAL_METADATA_BYTES:
             desc = _read_local_json_bounded(desc_path)
-    elif isinstance(cfg.get("quantization_config"), Mapping) and cfg.get("quantization_config"):
+    elif (
+        (isinstance(cfg.get("quantization_config"), Mapping) and cfg.get("quantization_config"))
+        or (
+            isinstance(cfg.get("text_config"), Mapping)
+            and isinstance(cfg["text_config"].get("quantization_config"), Mapping)
+            and cfg["text_config"].get("quantization_config")
+        )
+    ):
         qmap = read_hf_quantization_config(
             cfg, checkpoint_id=f"local://{repo_label or 'checkpoint'}",
         )
@@ -1157,7 +1164,14 @@ def _build_remote_result(
         qspec = quant_spec_from_checkpoint_map(
             qmap, base_config=cfg or None, checkpoint_url=m_url or ms_url or hf_url,
         )
-    elif isinstance(cfg.get("quantization_config"), Mapping) and cfg.get("quantization_config"):
+    elif (
+        (isinstance(cfg.get("quantization_config"), Mapping) and cfg.get("quantization_config"))
+        or (
+            isinstance(cfg.get("text_config"), Mapping)
+            and isinstance(cfg["text_config"].get("quantization_config"), Mapping)
+            and cfg["text_config"].get("quantization_config")
+        )
+    ):
         qmap = read_hf_quantization_config(cfg, checkpoint_id=repo_id or "remote://hf")
         qspec = quant_spec_from_checkpoint_map(
             qmap, base_config=cfg or None, checkpoint_url=m_url or ms_url or hf_url,

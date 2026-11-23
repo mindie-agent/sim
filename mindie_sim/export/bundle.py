@@ -73,13 +73,13 @@ from mindie_sim.prediction.runtime.exposed_observer import (
     ObservedInterval,
     attribute_stream0_intervals,
 )
+from mindie_sim.prediction.results import LoweringRequest
 from mindie_sim.prediction.spine import default_spine
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.case import Case
 from mindie_sim.schema.common import ModelingError, dtype_bytes
 from mindie_sim.schema.datapath import datapath_for_die
 from mindie_sim.schema.operators import OpSpec
-from mindie_sim.stack_registry import LoweringRequest
 
 from .kernel_catalog import (
     classify_stream_index,

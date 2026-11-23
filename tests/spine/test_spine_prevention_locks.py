@@ -50,8 +50,8 @@ from mindie_sim.schema.case import Case
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.compute_arch import ComputeArchSpec
 from mindie_sim.schema.operators import OpSpec
+from mindie_sim.prediction.results import LoweringRequest
 from mindie_sim.schema.workload import RequestView
-from mindie_sim.stack_registry import LoweringRequest
 from scripts._arch_governance_runtime import (
     _NON_DEVICE_INFRA_RECIPES, _OWNER_MODULE_PREFIXES, _binding_module, _is_governed_module,
 )

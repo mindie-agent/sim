@@ -551,3 +551,41 @@ def test_unknown_tags_fail_hard_analytical_reads_are_pure_and_a3_defaults_intact
         built_spec = spec.build_quant_spec()
         assert built_map.checkpoint_id == spec.repo_id
         assert built_spec.name
+
+
+def test_nested_text_config_quantization_and_per_layer_native_overrides() -> None:
+    """Nested VLM text_config.quantization_config parses cleanly and preserves native_layers delta."""
+    from dataclasses import replace
+    from mindie_sim.catalog.weights import stage_weight_bytes
+    from mindie_sim.model_catalog import load_model
+    from mindie_sim.schema.parallel import ParallelSpec
+
+    nested_cfg = {
+        "architectures": ["KimiK25ForConditionalGeneration"],
+        "text_config": {
+            "torch_dtype": "bfloat16",
+            "quantization_config": {
+                "quant_method": "mxfp4",
+                "modules_to_not_convert": ["lm_head"],
+            },
+        },
+    }
+    nested_map = read_hf_quantization_config(nested_cfg, checkpoint_id="fixture/nested-mxfp4")
+    assert nested_map.source_format == "hf_quantization_config"
+    nested_spec = quant_spec_from_checkpoint_map(nested_map)
+    assert nested_spec.weight_format == "mxfp4"
+
+    s5_map = lookup_curated_checkpoint("Eco-Tech/Step-5-Preview-w8a8-mxfp8")
+    assert s5_map is not None
+    s5_spec = quant_spec_from_checkpoint_map(s5_map)
+    overrides = s5_spec.layer_quant_overrides_dict()
+    assert set((overrides.get("native_layers") or {}).keys()) == {"88", "89", "90"}
+
+    s5_model = load_model("step-5-preview")
+    with_overrides = sum(stage_weight_bytes(replace(s5_model, quant=s5_spec), ParallelSpec(tp=1, ep=1)))
+    without_overrides = sum(stage_weight_bytes(
+        replace(s5_model, quant=replace(s5_spec, layer_quant_overrides=())),
+        ParallelSpec(tp=1, ep=1),
+    ))
+    delta_gib = (with_overrides - without_overrides) / (1024**3)
+    assert delta_gib == pytest.approx(18.5625, rel=0.05)

@@ -230,6 +230,7 @@ def physical_recipe_bindings() -> dict[str, object]:
     bindings = {recipe: INDEXER for recipe in INDEXER_TOPK_RECIPES}
     bindings.update({
         "moe_gating_topk": ScopedGatingRecipe(build_moe_gating_topk),
+        "router_topk": ScopedGatingRecipe(build_moe_gating_topk),
         "router": ScopedRouterRecipe(build_router_splitk),
     })
     bindings.update({

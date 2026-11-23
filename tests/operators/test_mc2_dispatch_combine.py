@@ -742,12 +742,13 @@ def test_w4a4_mxfp4_preserves_fp4_payload_and_megamoe_charges_gmm2_activation_wo
     grp, sfmt, _shape, sbytes = activation_scales(preset_q, "fp4_e2m1", 1, 6144)
     assert grp == 32 and sfmt == "fp8_e8m0" and sbytes == pytest.approx(192.0)
 
-    # GLM-5.2 W4A4 checkpoint preserves fp4_e2m1 through dispatch and MegaMoE lowering.
+    # GLM-5.2 W4A4 checkpoint preserves fp4_e2m1 on routed experts through dispatch and MegaMoE lowering.
     raw_w4a4 = compose_case(
         "Eco-Tech/GLM-5.2-w4a4c8-mxfp4", MESH_SKU, dp=1, tp=8, ep=8, layers=4,
         prompt_tokens=2048, output_tokens=64, feature_track="merged", enable_fused_mc2=2,
     )
-    assert raw_w4a4["model"]["quant"]["activation_format"] == "fp4_e2m1"
+    routed_ovr = dict(dict(raw_w4a4["model"]["quant"]["category_overrides"])["routed_expert"])
+    assert routed_ovr["activation_format"] == "fp4_e2m1"
     raw_w4a4["runtime"]["metadata"].setdefault("additional_config", {})["enable_mega_moe"] = 1
     g_w4a4 = target_graphs(raw_w4a4, phase="decode", tokens=1, context=2048, sequences=16, scope="body")[0]
     megas = [op for op in g_w4a4 if op.recipe == "megamoe_arch35"]

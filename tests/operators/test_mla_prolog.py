@@ -38,7 +38,7 @@ from mindie_sim.prediction.operators.mla_prolog.common import (
     ABI_DSL, ABI_V3, ABI_V3_NZ, ABI_V4_NZ, WEIGHT_QUANT_BF16, WEIGHT_QUANT_INT8, WEIGHT_QUANT_MXFP8)
 from mindie_sim.prediction.operators.paged_mla.common import DSL_MQS_ABI, MQS_ABI
 from mindie_sim.prediction.program import RecipeBook, RecipeContext
-from mindie_sim.prediction.results import FusedPipelineDescriptor, OpOccurrence
+from mindie_sim.prediction.results import FusedPipelineDescriptor, LoweringRequest, OpOccurrence, RankOps
 from mindie_sim.prediction.spine import PredictionSpine
 from mindie_sim.prediction.streams import StreamCoreBudget, StreamLane, StreamPlan
 from mindie_sim.prediction.structure import parse_case
@@ -48,7 +48,6 @@ from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.model import LayerPlan, MlaSpec, ModelSpec
 from mindie_sim.schema.operators import OpSpec
 from mindie_sim.schema.parallel import ParallelSpec
-from mindie_sim.stack_registry import LoweringRequest, RankOps
 from mindie_sim.structure import export_structure
 from mindie_sim.structure_subgraphs import subgraph_contract
 

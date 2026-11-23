@@ -447,7 +447,7 @@ def _memory_execution(extra, allocations=(), *, offload=False, duration=1):
 def test_memory_grants_preserve_per_item_bindings_and_admit_atomically(entry):
     slots = tuple(Allocation(name, "hbm", _PAGE) for name in ("k", "v"))
     bindings = {slot.name: dict(owner=f"layer:{slot.name}", storage=f"kv/{slot.name}", generation=3 + i,
-                                ranges=((i * _PAGE, (i + 1) * _PAGE),), rank=1 + i, host_bytes=64 / (i + 1))
+                                ranges=((i * _PAGE, (i + 1) * _PAGE),), rank=0, host_bytes=64 / (i + 1))
                 for i, slot in enumerate(slots)}
     execution = _memory_execution(2 * _PAGE - (entry == "blocked"), slots)
     engine, memory = execution.engine, execution.memory

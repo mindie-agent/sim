@@ -35,7 +35,7 @@ SOURCE = {
 }
 #: Retained prototype alias; explicit selection keeps its own guard rails.
 LEGACY_SOURCE = {
-    "repository": "cannbot-dsl",
+    "repository": "tilelang-ascend/kernels",
     "revision": "4519e5372a8b9306f7d823688c0cb8141ee34fb1",
     "kernel": {
         "path": "samples/mixed_quant_sparse_flash_mla/mixed_quant_sparse_flash_mla.py",

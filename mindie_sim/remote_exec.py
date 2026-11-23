@@ -35,8 +35,14 @@ from typing import TYPE_CHECKING, Literal
 import uuid
 
 if TYPE_CHECKING:
-    from mindie_sim.prediction.results import CaseInput, ReplayOptions, SlaRequest, StepRequest, SweepRequest
-    from mindie_sim.stack_registry import LoweringRequest
+    from mindie_sim.prediction.results import (
+        CaseInput,
+        LoweringRequest,
+        ReplayOptions,
+        SlaRequest,
+        StepRequest,
+        SweepRequest,
+    )
 ExecutionTarget = Literal["auto", "prefer_remote", "remote", "local"]
 PROTOCOL_VERSION = "sim-remote/1"
 MIB = 1024 * 1024
@@ -1077,10 +1083,22 @@ def _step_request(raw):
     return StepRequest(**raw)
 
 
+def _decode_op_spec(raw_op):
+    from mindie_sim.schema.operators import OpSpec, TensorPrecisionABI
+
+    decoded = {k: _thaw(v) for k, v in raw_op.items()}
+    pabi = decoded.get("precision_abi")
+    if isinstance(pabi, Mapping):
+        pabi_fields = dict(pabi)
+        if isinstance(pabi_fields.get("weight_block"), list):
+            pabi_fields["weight_block"] = tuple(pabi_fields["weight_block"])
+        decoded["precision_abi"] = TensorPrecisionABI(**pabi_fields)
+    return OpSpec(**decoded)
+
+
 def _lowering(raw):
-    from mindie_sim.schema.operators import OpSpec
+    from mindie_sim.prediction.results import LoweringRequest, RankOps
     from mindie_sim.schema.workload import IterationPlan, RequestView
-    from mindie_sim.stack_registry import LoweringRequest, RankOps
 
     fields = dict(raw)
     if fields.get("step") is not None:
@@ -1089,7 +1107,7 @@ def _lowering(raw):
         **plan, "requests": tuple(RequestView(**view) for view in plan["requests"]),
     })) for rank, plan in fields.get("iterations", ()))
     fields["declared_ops"] = tuple(
-        RankOps(row["replica"], tuple(OpSpec(**{k: _thaw(v) for k, v in op.items()}) for op in row["ops"]))
+        RankOps(row["replica"], tuple(_decode_op_spec(op) for op in row["ops"]))
         for row in fields.get("declared_ops", ())
     )
     return LoweringRequest(**fields)

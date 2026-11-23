@@ -46,7 +46,7 @@ from mindie_sim.primitives.schema import PrimitiveTable, parse_primitive_table
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.datapath import datapath_for_die, scale_explicit_placement_device
 from mindie_sim.schema.hardware import Hardware
-from mindie_sim.stack_registry import default_stack_registry
+from mindie_sim.feature_mechanisms import default_stack_registry
 
 from .contracts import (
     ARCH_PRESET_22, ARCH_PRESET_35, COLD_RING_L2_MULTIPLIER, DEFAULT_CLEANUP_GRACE_S,

@@ -54,7 +54,7 @@
 ### 3.1 栈真源清单与双硅基标定基线
 
 `Ascend950DT_9582`（`4.0 TB/s, 96 GiB`）与 `Ascend950PR_958b`（`1.4 TB/s, 112 GiB`）已完成五域硅实测与 **CANN `9.3.0-20261112_192141454`（`ATB 9.3.0.B030`、`cann_ops_transformer 1.0.0`、`fla_npu 26.10.0+feature`）+ `vllm-ascend@405617bae` 主干 + 35 个活跃未合入优化 PR** 全矩阵标定：
-- **公开可审计栈清单**：[`mindie_sim/stacks/vllm_ascend/manifest.json`](../../mindie_sim/stacks/vllm_ascend/manifest.json) 与 [`mindie_sim/stack_tracks.py`](../../mindie_sim/stack_tracks.py) 为每一条 `merged` / `unmerged_pr` 机制绑定记录精确的 `{repository, revision, relative_path, source_sha256}` 溯源；
+- **公开可审计栈清单**：[`mindie_sim/stacks/vllm_ascend/manifest.json`](../../mindie_sim/stacks/vllm_ascend/manifest.json) 与 [`mindie_sim/feature_mechanisms.py`](../../mindie_sim/feature_mechanisms.py) 为每一条 `merged` / `unmerged_pr` 机制绑定记录精确的 `{repository, revision, relative_path, source_sha256}` 溯源；
 - **三级无交集盲测 `< 10%` 硅实测精度闭环**：观测包 [`data/observations/a5-cann93-regimes-20261120/`](../../data/observations/a5-cann93-regimes-20261120/) 与验证报告 [`data/verification/a5-cann93-multilevel-accuracy-20261120.json`](../../data/verification/a5-cann93-multilevel-accuracy-20261120.json) 在严格无交集 `train` / `heldout` 切分（`512 -> 409,600` 序列网格，覆盖 `Ascend950DT_9582`、`Ascend950PR_958b` 及 `2P/8P` UB-Mesh 集合通信）下全部达成 **`< 10%` Held-out MAPE 与 MedAPE**：
   - **Level 1（单算子与 `2P/8P` 集合通信，`391` train / `268` heldout）**：Held-out **`MAPE = 9.07%`、`MedAPE = 6.77%`**（Train `MAPE = 7.29%`、`MedAPE = 5.93%`）；
   - **Level 2（FX `piecewise` 子图与周期层块，`16` train / `18` heldout，`14/14` 编译子图数精确匹配）**：Held-out **`MAPE = 9.96%`、`MedAPE = 8.78%`**（Train `MAPE = 6.50%`、`MedAPE = 7.15%`）；
@@ -76,7 +76,7 @@
 
 ### 3.3 四阶特性瀑布与 `Software` 正交编译层
 
-1. **四阶特性叠加瀑布（[`stack_tracks.py`](../../mindie_sim/stack_tracks.py) / [`feature_mechanisms.py`](../../mindie_sim/feature_mechanisms.py)）**：
+1. **四阶特性叠加瀑布（[`feature_mechanisms.py`](../../mindie_sim/feature_mechanisms.py)）**：
    通过 `mindie-sim feature-tracks --model <name> --hardware a5 --tp <tp> --ep <ep>` 在同一套 `compose_case` + `analyze_network_efficiency` 主干上连续评估 **`raw_eager` -> `merged` -> `unmerged_pr` -> `expected_ideal` -> `hardware_roofline`**（`evaluate_target_efficiency(..., mode="exact_target")` 计算 `0.80x` 目标与 `1.0x` 物理下界），自动审计单调性，并同时输出正向单加 **`single_pr_ablation`**（`merged + {PR}`）与留一剔除 **`leave_one_out_ablation`**（`unmerged_pr - {PR}`）。
 2. **正交两层编译开关（[`Software`](../../mindie_sim/schema/case.py) / [`compose/runtime.py`](../../mindie_sim/compose/runtime.py)）**：
    严格解耦外层 `ModelRunner` 图捕获（`graph_capture_mode in {"none", "piecewise", "full"}`）与内层编译器开关（`enable_torch_compile`、`enable_npugraph_ex`、`enable_static_kernel`、`enable_super_kernel`）：

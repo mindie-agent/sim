@@ -34,12 +34,11 @@ from mindie_sim.prediction.operators.rotary import (
     resolve_operator_plan as resolve_rotary_plan,
 )
 from mindie_sim.prediction.program import RecipeBook
-from mindie_sim.prediction.results import OpOccurrence
+from mindie_sim.prediction.results import LoweringRequest, OpOccurrence, RankOps
 from mindie_sim.prediction.spine import PredictionSpine
 from mindie_sim.prediction.streams import MAIN_STREAM
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.operators import OpSpec
-from mindie_sim.stack_registry import LoweringRequest, RankOps
 
 pytestmark = pytest.mark.tier0
 

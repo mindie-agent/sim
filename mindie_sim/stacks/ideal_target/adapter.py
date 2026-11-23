@@ -22,6 +22,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from mindie_sim.catalog.checkpoint_reader import resolve_checkpoint_tensor_tag
 from mindie_sim.schema.checkpoint import CheckpointQuantMap, TensorQuantRule
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.hardware import Hardware
@@ -160,10 +161,14 @@ def _abi_for_raw_tag(
     if upper in {
         "W4A8_MXFP", "W4A8_MXFP4", "W4A8_MXFP4_DYNAMIC", "W4A8_MXFP4_MXFP8",
         "W4A4_MXFP", "W4A4_MXFP4", "W4A4_MXFP4_MXFP4", "W4A4", "W4A4_DYNAMIC",
-        "W4A4F4_DAOS", "MXFP4", "MXFP4_W4A4", "FP4",
+        "W4A4F4_DAOS", "MXFP4", "MXFP4_W4A4", "FP4", "QUARK_MXFP4",
     }:
         blk = rule.group_size if (rule is not None and rule.group_size) else (1, MX_BLOCK_ELEMENTS)
-        act = "fp8_e4m3" if ("A8" in upper or upper == "MXFP4") else "fp4_e2m1"
+        act = (
+            rule.activation_dtype.lower()
+            if (rule is not None and rule.activation_dtype)
+            else ("fp8_e4m3" if ("A8" in upper or upper in {"MXFP4", "QUARK_MXFP4"}) else "fp4_e2m1")
+        )
         return TensorPrecisionABI(
             linear_method="mx_fp4",
             input_dtype=act,
@@ -178,7 +183,7 @@ def _abi_for_raw_tag(
             act_scale_dtype="e8m0",
             act_scale_pack="2",
         )
-    if upper in {"W8A8_FP8", "FP8", "FP8_DYNAMIC", "FP8_E4M3", "FP8_BLOCK"}:
+    if upper in {"W8A8_FP8", "FP8", "FP8_DYNAMIC", "FP8_E4M3", "FP8_BLOCK", "QUARK_FP8"}:
         blk = rule.group_size if (rule is not None and rule.group_size) else (FP8_BLOCK_ELEMENTS, FP8_BLOCK_ELEMENTS)
         scale_dt = (rule.scale_dtype.lower() if rule is not None and rule.scale_dtype else "fp32")
         scale_b = E8M0_SCALE_BYTES if "e8m0" in scale_dt else FP32_SCALE_BYTES
@@ -195,7 +200,7 @@ def _abi_for_raw_tag(
             act_group_size=blk[-1],
             act_scale_dtype=scale_dt,
         )
-    if upper in {"W8A8", "W8A8_INT8", "W8A8_DYNAMIC", "W8A8_MIX", "W8A8_PDMIX", "INT8"}:
+    if upper in {"W8A8", "W8A8_INT8", "W8A8_DYNAMIC", "W8A8_MIX", "W8A8_PDMIX", "INT8", "QUARK_INT8"}:
         return TensorPrecisionABI(
             linear_method="w8a8",
             input_dtype="int8",
@@ -207,7 +212,7 @@ def _abi_for_raw_tag(
             weight_scale_bytes=FP32_SCALE_BYTES,
             act_scale_dtype="fp32",
         )
-    if upper in {"W4A8", "W4A8_DYNAMIC"}:
+    if upper in {"W4A8", "W4A8_DYNAMIC", "W4A8_COMPRESSED"}:
         return TensorPrecisionABI(
             linear_method="w4a8",
             input_dtype="int8",
@@ -219,7 +224,7 @@ def _abi_for_raw_tag(
             weight_scale_bytes=FP32_SCALE_BYTES,
             act_scale_dtype="fp32",
         )
-    if upper in {"W4A16", "INT4", "AWQ", "GPTQ"}:
+    if upper in {"W4A16", "INT4", "AWQ", "GPTQ", "W4A16_AWQ", "W4A16_GPTQ", "W4A16_COMPRESSED"}:
         blk = rule.group_size if (rule is not None and rule.group_size) else (1, INT4_GROUP_ELEMENTS)
         return TensorPrecisionABI(
             linear_method="w4a16",
@@ -674,13 +679,18 @@ class IdealTargetStackAdapter:
                 roles.append(_MOE_EXPERT_ROLE)
             for logical_role in roles:
                 tensor_path = f"model.layers.{native_id}.{logical_role}"
-                raw_tag = checkpoint.resolve_raw_tag(
+                raw_tag = resolve_checkpoint_tensor_tag(
+                    checkpoint,
                     tensor_path,
                     scope="target",
                     source_native_layer_id=native_id,
                     expert_id=0 if "experts." in logical_role else None,
                 )
-                matched_rule = rule_by_pattern.get(f"model.layers.*.{logical_role}")
+                matched_rule = (
+                    rule_by_pattern.get(f"model.layers.*.{logical_role}")
+                    or (rule_by_pattern.get("*.experts.*") if "experts." in logical_role else None)
+                    or rule_by_pattern.get("*")
+                )
                 if raw_tag is None:
                     raw_tag = checkpoint.model_quant_type or "FLOAT"
                 abi = _abi_for_raw_tag(raw_tag, native_dtype, matched_rule)

@@ -450,3 +450,30 @@ def test_ring_buffer_producer_extra_after_roundtrips_through_native_abi() -> Non
     assert any(d.kind == DEP_KIND_EXTRA for d in deps)
     with PreparedTermsRunner() as runner:
         assert runner.roundtrip_ring(ring) == ring.to_c_records()
+
+
+def test_dp_cohort_dedup_fast_span_only_matches_detailed_peer_die_overlap_decision() -> None:
+    """fast_span_only must not alter peer-die MC2 overlap decisions vs detailed execution."""
+    from mindie_sim.prediction.runtime.dp_cohort_dedup import _has_unsynced_peer_die_overlap
+    from mindie_sim.schema.operators import IterationWork, OpSpec
+    from mindie_sim.schema.workload import IterationPlan
+
+    op_main = OpSpec(
+        "s0.l0.mc2", "grouped_gemm", "decode", 0, 0, (), (8, 64), (8, 64), (8, 64), (8, 64),
+        dtype="bf16", stream="main", metadata=(("mc2_phase", "dispatch"), ("group_axis", "ep")),
+    )
+    op_aux = OpSpec(
+        "s0.l0.shared", "gemm", "decode", 0, 0, (), (8, 64), (8, 64), (8, 64), (8, 64),
+        dtype="bf16", stream="aux",
+    )
+    w0 = IterationWork((op_main, op_aux), IterationPlan(()), 1, 8, 8, None, "graph", "declared_graph")
+    base_case = SimpleNamespace(
+        runtime=SimpleNamespace(parallel=SimpleNamespace(dp=2, tp=1, ep=2, pp=1)),
+    )
+    topo = SimpleNamespace(namespace="dp_test", links={}, ranks=lambda _r, _s: (0, 1))
+    eng = SimpleNamespace(resources={})
+    detailed_ex = SimpleNamespace(_fast_span_only=False, case=base_case, topology=topo, engine=eng)
+    fast_ex = SimpleNamespace(_fast_span_only=True, case=base_case, topology=topo, engine=eng)
+    detailed_res = _has_unsynced_peer_die_overlap(detailed_ex, w0, 0)
+    fast_res = _has_unsynced_peer_die_overlap(fast_ex, w0, 0)
+    assert fast_res is detailed_res is True

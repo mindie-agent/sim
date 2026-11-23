@@ -26,10 +26,9 @@ from _support.axes import REPRESENTATIVE_SKUS
 from _support.hardware import sku_case
 from mindie_sim import api, remote_exec as remote, remote_exec as worker, rewrite
 from mindie_sim.optimization.contracts import PrimitiveCapacityEntry, PrimitiveCapacityTable
-from mindie_sim.prediction.results import ReplayOptions, StepRequest, json_payload
+from mindie_sim.prediction.results import LoweringRequest, ReplayOptions, StepRequest, json_payload
 from mindie_sim.prediction.spine import default_spine
 from mindie_sim.primitives.loader import load_primitives
-from mindie_sim.stack_registry import LoweringRequest
 
 pytestmark = pytest.mark.tier0
 
@@ -571,8 +570,8 @@ def test_timeout_preserved_remaining_deadline_sent_and_c11_rebuilds_on_miss(endp
 @pytest.mark.tier1
 def test_multiworker_staged_c11_matches_python_with_positive_native_steps(endpoint_paths, tmp_path, monkeypatch):
     from _support.hardware import MODEL, WORKLOAD
+    from mindie_sim.prediction.results import RankOps
     from mindie_sim.schema.case import Case
-    from mindie_sim.stack_registry import RankOps
     _, cwd, _ = endpoint_paths
     case = Case.from_mapping({
         "machine": {"backend": "ascend", "sku": REPRESENTATIVE_SKUS["a5"], "num_devices": 2},

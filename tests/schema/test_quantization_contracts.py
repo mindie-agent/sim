@@ -653,7 +653,7 @@ def test_production_mxfp8_mxfp4_preset_and_hardware_aware_quant_selection():
 
 
 def test_dynamic_quant_exclusions_mxfp4_all_and_a5_recommended_profiles() -> None:
-    from mindie_sim.runtime_profiles import VA_RECOMMENDED_PROFILES
+    from mindie_sim.stacks.vllm_ascend.profiles import VA_RECOMMENDED_PROFILES
 
     for preset_name in ("w8a8", "w4a8"):
         q = quant_preset(preset_name)
@@ -669,8 +669,12 @@ def test_dynamic_quant_exclusions_mxfp4_all_and_a5_recommended_profiles() -> Non
 
 
 def test_before_baseline_honesty_mc2_megamoe_and_a3_int8_kv_mlapo() -> None:
-    from mindie_sim.feature_mechanisms import MECHANISM_CATALOG, MechanismContext
-    from mindie_sim.stack_tracks import resolve_runtime_stack, resolve_stack_track
+    from mindie_sim.feature_mechanisms import (
+        MECHANISM_CATALOG,
+        MechanismContext,
+        resolve_runtime_stack,
+        resolve_stack_track,
+    )
 
     # A3 INT8-KV MLA enables packed-layout mla_prolog_v3.
     a3_case = compose_case(

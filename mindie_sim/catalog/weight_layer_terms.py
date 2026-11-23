@@ -67,19 +67,26 @@ def _merge_layer_quant_override(base: QuantSpec, raw: Any) -> QuantSpec:
 
 def _lookup_layer_quant_override(model: ModelSpec, plan: LayerPlan) -> Any | None:
     meta = dict(getattr(model, "metadata", ()) or ())
-    overrides = meta.get("layer_quant_overrides")
-    if not isinstance(overrides, Mapping):
-        return None
-    layers_map = overrides.get("layers") if isinstance(overrides.get("layers"), Mapping) else overrides
-    for key in (str(plan.index), plan.index):
-        if key in layers_map and layers_map[key] is not None:
-            return layers_map[key]
-    native_map = overrides.get("native_layers")
+    sources: list[Mapping[str, Any]] = []
+    meta_ov = meta.get("layer_quant_overrides")
+    if isinstance(meta_ov, Mapping):
+        sources.append(meta_ov)
+    quant = getattr(model, "quant", None)
+    if quant is not None and getattr(quant, "layer_quant_overrides", ()):
+        quant_ov = quant.layer_quant_overrides_dict()
+        if quant_ov:
+            sources.append(quant_ov)
     native_id = int(getattr(plan, "native_layer_id", -1))
-    if isinstance(native_map, Mapping) and native_id >= 0:
-        for key in (str(native_id), native_id):
-            if key in native_map and native_map[key] is not None:
-                return native_map[key]
+    for overrides in sources:
+        layers_map = overrides.get("layers") if isinstance(overrides.get("layers"), Mapping) else overrides
+        for key in (str(plan.index), plan.index):
+            if key in layers_map and layers_map[key] is not None:
+                return layers_map[key]
+        native_map = overrides.get("native_layers")
+        if isinstance(native_map, Mapping) and native_id >= 0:
+            for key in (str(native_id), native_id):
+                if key in native_map and native_map[key] is not None:
+                    return native_map[key]
     return None
 
 

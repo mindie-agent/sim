@@ -209,6 +209,7 @@ def _lower_recurrence(b, tensors, *, decode_core, values, gate_values, views,
             metadata=tuple({**dict(scan.metadata), "source": gdn_recurrent.SOURCE,
                             "implementation_scope": "source_resident_qkv_and_state_pipeline",
                             "recurrence_selection": recurrent_implementation,
+                            "recurrent_attention_kind": "gdn",
                             "unmodeled_features": ("scalar_metadata_issue_and_cache_latency",),
                             **extra_meta,
                             }.items())), compact_records=use_recover_ssm)

@@ -538,6 +538,7 @@ def test_directed_quantized_matrix_is_reencoded_on_return_and_binding_is_idempot
 
 def test_quantized_transport_scope_preserves_draft_expert_traffic():
     raw = json.loads((ROOT / "tests/fixtures/verification/v4flash-communication-case.json").read_text())
+    raw["model"]["auxiliary"]["mtp"]["weight_category"] = ""
     view = IterationPlan((RequestView("one", 4, 0, True, "prefill", draft_prepare=True),))
     for scopes in ((), ("body",)):
         raw["runtime"]["kernels"]["moe_transport"] = dict(SELECTOR, layer_scopes=scopes) if scopes else dict(SELECTOR)

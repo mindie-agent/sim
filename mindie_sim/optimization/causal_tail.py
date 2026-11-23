@@ -756,26 +756,9 @@ def _node_physical_demand_and_placement(
         demand[rname], solo_ms[rname] = link_b, (link_b / link_bps) * MS_PER_SECOND
 
     base_dur_ms = max(0.0, float(getattr(node, "dur_us", 0.0) or 0.0)) / US_PER_MS
+    l_star_ms = max(0.0, float(getattr(node, "l_star_lean_us", 0.0) or 0.0)) / US_PER_MS
     floor_ms = max(0.0, float(launch_floor_us)) / US_PER_MS
-    max_pipe_ms = max(solo_ms.values(), default=0.0)
-    dom_bound = str(getattr(node, "dominant_bound", "") or "").lower()
-    if (
-        not has_topology_plan
-        and base_dur_ms > max_pipe_ms + (TIME_EPS_US / US_PER_MS)
-        and base_dur_ms > floor_ms + (TIME_EPS_US / US_PER_MS)
-        and dom_bound != "launch_bound"
-        and solo_ms
-    ):
-        pref = {
-            "cube_bound": (f"matrix@{die_tag}{sfx}",),
-            "vector_bound": (f"vector@{die_tag}{sfx}",),
-            "memory_bound": (f"memory@{die_tag}", f"mte2_aiv@{die_tag}{sfx}", f"mte2_aic@{die_tag}{sfx}", f"mte2@{die_tag}{sfx}"),
-            "link_bound": (f"link@{die_tag}",),
-        }.get(dom_bound, ())
-        dom_res = next((r for r in pref if r in solo_ms and solo_ms[r] > 0.0), None) or max(solo_ms.items(), key=lambda kv: kv[1])[0]
-        if solo_ms[dom_res] > 0.0:
-            demand[dom_res] *= base_dur_ms / solo_ms[dom_res]
-            solo_ms[dom_res] = base_dur_ms
+    is_overlapped = bool(getattr(node, "is_overlapped", False))
 
     if is_disjoint:
         for res_list, kind, full_n, eff_n, core_pref in (
@@ -793,9 +776,16 @@ def _node_physical_demand_and_placement(
                         solo_ms[rname] /= max(frac, TIME_EPS_US)
 
     max_pipe_ms = max(solo_ms.values(), default=0.0)
-    latency_ms = 0.0 if has_topology_plan else (
-        (max(floor_ms, max_pipe_ms) if max_pipe_ms > 0.0 else base_dur_ms) if is_disjoint else max(base_dur_ms, max_pipe_ms)
-    )
+    eff_floor_ms = min(floor_ms, base_dur_ms) if base_dur_ms > 0.0 else 0.0
+    if has_topology_plan:
+        latency_ms = 0.0
+    elif is_disjoint or is_overlapped:
+        if max_pipe_ms > 0.0 or l_star_ms > 0.0:
+            latency_ms = max(eff_floor_ms, l_star_ms, max_pipe_ms)
+        else:
+            latency_ms = base_dur_ms
+    else:
+        latency_ms = max(l_star_ms, base_dur_ms, max_pipe_ms)
     return demand, {}, latency_ms, bool(cube_ms > 0.0 or vec_ops > 0.0 or is_persistent_whole_die_node(node))
 
 
@@ -1020,8 +1010,9 @@ def _submit_scheduled_node(
         plan, min_us = col_entry
         admit_ev = engine.submit(f"a:{idx}", after=(ready_ev,), acquire=acq) if acq else ready_ev
         done_deps: list[Any] = [plan.start(engine, f"c:{idx}:{node.op_id}", admit_ev)]
-        if min_us > 0.0:
-            done_deps.append(engine.submit(f"f:{idx}", after=(admit_ev,), latency=min_us / US_PER_MS))
+        min_floor_us = max(float(min_us), float(getattr(node, "l_star_lean_us", 0.0) or 0.0))
+        if min_floor_us > 0.0:
+            done_deps.append(engine.submit(f"f:{idx}", after=(admit_ev,), latency=min_floor_us / US_PER_MS))
         if demand:
             done_deps.append(engine.submit(f"d:{idx}", work=demand, after=(admit_ev,), placement=placement or None))
         start_ev = admit_ev
@@ -1096,23 +1087,35 @@ def schedule_target_graph_on_engine(
     end_events: dict[int, Any] = {}
     causal_preds: dict[int, tuple[int, ...]] = {}
 
-    for arch_idx, aid in enumerate(arch_order):
-        ordered = sorted(by_arch[aid], key=lambda item: (item[1].ordinal, item[1].start_us))
-        arch_done_evs: list[Any] = []
-        arch_done_idxs: list[int] = []
-        for idx, node in ordered:
+    unaggregated = all(max(1, int(getattr(n, "repeat_count", 1) or 1)) <= 1 for n in nodes)
+    if unaggregated:
+        ordered_all = sorted(enumerate(nodes), key=lambda item: (item[1].ordinal, item[1].start_us))
+        for idx, node in ordered_all:
             s_ev, e_ev, preds = _submit_scheduled_node(
                 engine, observer, idx, node, case=case, supply_by_coord=supply_by_coord,
                 owners_by_coord=owners_by_coord, col_plans=col_plans, occ_to_idx=occ_to_idx,
-                end_by_occ=end_by_occ, queue_tail=queue_tail, arch_barrier=arch_barrier,
-                arch_barrier_idxs=arch_barrier_idxs, launch_floor_us=launch_floor_us,
+                end_by_occ=end_by_occ, queue_tail=queue_tail, arch_barrier=root_ev,
+                arch_barrier_idxs=(), launch_floor_us=launch_floor_us,
             )
             start_events[idx], end_events[idx], causal_preds[idx] = s_ev, e_ev, preds
-            arch_done_evs.append(e_ev)
-            arch_done_idxs.append(idx)
-        if arch_done_evs:
-            arch_barrier = engine.submit(f"arch:{arch_idx}", after=tuple(arch_done_evs))
-            arch_barrier_idxs = arch_done_idxs
+    else:
+        for arch_idx, aid in enumerate(arch_order):
+            ordered = sorted(by_arch[aid], key=lambda item: (item[1].ordinal, item[1].start_us))
+            arch_done_evs: list[Any] = []
+            arch_done_idxs: list[int] = []
+            for idx, node in ordered:
+                s_ev, e_ev, preds = _submit_scheduled_node(
+                    engine, observer, idx, node, case=case, supply_by_coord=supply_by_coord,
+                    owners_by_coord=owners_by_coord, col_plans=col_plans, occ_to_idx=occ_to_idx,
+                    end_by_occ=end_by_occ, queue_tail=queue_tail, arch_barrier=arch_barrier,
+                    arch_barrier_idxs=arch_barrier_idxs, launch_floor_us=launch_floor_us,
+                )
+                start_events[idx], end_events[idx], causal_preds[idx] = s_ev, e_ev, preds
+                arch_done_evs.append(e_ev)
+                arch_done_idxs.append(idx)
+            if arch_done_evs:
+                arch_barrier = engine.submit(f"arch:{arch_idx}", after=tuple(arch_done_evs))
+                arch_barrier_idxs = arch_done_idxs
 
     step_done = engine.submit("step_done", after=tuple(end_events.values()))
     engine.advance(until=(step_done,))

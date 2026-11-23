@@ -40,12 +40,12 @@ from mindie_sim.rewrite import (
     CollectiveTransform, Edit, FuseRegion, KernelBoundary, OpRef, PortRef, ScenarioRequest,
     SelectTemplate, WeightPrefetch, evaluate_rewrites, finalize_plan, prepare_scenario,
 )
+from mindie_sim.prediction.results import LoweringRequest
 from mindie_sim.primitives import load_primitives
 from mindie_sim.rewrite import oracle
 from mindie_sim.schema.hardware import Device
 from mindie_sim.schema.operators import OpSpec
 from mindie_sim.schema.workload import IterationPlan, RequestView
-from mindie_sim.stack_registry import LoweringRequest
 
 pytestmark = pytest.mark.tier0
 

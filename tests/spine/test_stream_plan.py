@@ -51,8 +51,8 @@ from mindie_sim.prediction.streams import (
 )
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.datapath import datapath_for_die
+from mindie_sim.prediction.results import LoweringRequest, RankOps
 from mindie_sim.schema.operators import OpSpec
-from mindie_sim.stack_registry import LoweringRequest, RankOps
 import mindie_sim.structure as structure_mod
 
 pytestmark = pytest.mark.tier0

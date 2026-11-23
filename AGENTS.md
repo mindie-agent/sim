@@ -17,7 +17,7 @@ This repository owns the `mindie_sim` runtime and `mindie-sim` CLI. Product-leve
 | **Fusion, Rewrite & Primal-Dual `L*`** | `RewritePipeline`, `OptimalityCertificate`, `certify_lower_bound` | [`mindie_sim/prediction/fusion/`](mindie_sim/prediction/fusion/), [`mindie_sim/rewrite/`](mindie_sim/rewrite/), [`mindie_sim/optimization/dual_bound.py`](mindie_sim/optimization/dual_bound.py) |
 | **Model Catalog, Quant & Compose** | `load_model`, `QUANTIZATION_PRESETS`, `compose_case` | [`mindie_sim/model_catalog.py`](mindie_sim/model_catalog.py), [`mindie_sim/catalog/`](mindie_sim/catalog/), [`mindie_sim/compose/`](mindie_sim/compose/) |
 | **Deployment Solver & Pareto Sweep** | `solve_deployment`, `solve_optimal_deployment`, `sweep_topologies` | [`mindie_sim/solve.py`](mindie_sim/solve.py) & [`mindie_sim/sweep/`](mindie_sim/sweep/) |
-| **Stack Tracks & Feature Waterfall** | `compare_feature_tracks`, `resolve_runtime_stack` | [`mindie_sim/feature_mechanisms.py`](mindie_sim/feature_mechanisms.py) & [`mindie_sim/stack_tracks.py`](mindie_sim/stack_tracks.py) |
+| **Stack Tracks & Feature Waterfall** | `compare_feature_tracks`, `resolve_runtime_stack` | [`mindie_sim/feature_mechanisms.py`](mindie_sim/feature_mechanisms.py) |
 | **Turnkey CLI, Exporters & Onboarding** | `report`, `quickstart`, `export`, `onboard-sku/operator` | [`mindie_sim/cli/`](mindie_sim/cli/), [`mindie_sim/export/`](mindie_sim/export/), [`mindie_sim/onboarding/`](mindie_sim/onboarding/) |
 | **Observations & Profiler SSOT** | `observed_contracts`, `captures`, `calibration`, `service_fitting` | [`mindie_sim/observed_contracts/`](mindie_sim/observed_contracts/) & [`mindie_sim/observations/`](mindie_sim/observations/) |
 

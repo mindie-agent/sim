@@ -41,12 +41,12 @@ from mindie_sim.prediction.results import (
     ThreeTierEvaluation,
     TopologySweepResult,
 )
+from mindie_sim.prediction.results import LoweringRequest
 from mindie_sim.prediction.spine import DEFAULT_OPTIMIZE_TRIALS, default_spine
 from mindie_sim.prediction.streams import StreamPlan
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.case import Case
 from mindie_sim.schema.common import ModelingError
-from mindie_sim.stack_registry import LoweringRequest
 
 
 def _to_case(case: CaseInput) -> Case:

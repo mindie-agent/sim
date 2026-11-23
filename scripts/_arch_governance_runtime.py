@@ -249,7 +249,8 @@ _AG011_DISPATCH_ROOTS = frozenset({
     "mindie_sim.prediction.operators",
     "mindie_sim.prediction.runtime.engine",
     "mindie_sim.compose.operator_defaults",
-    "mindie_sim.stack_registry",
+    "mindie_sim.feature_mechanisms",
+    "mindie_sim.stacks.registry",
     "mindie_sim.templates.registry",
 })
 #: Ratcheted legacy standalone operator contract modules (budget=3; zero new orphans allowed).

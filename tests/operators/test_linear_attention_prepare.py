@@ -577,8 +577,8 @@ def test_chunk32_requires_exact_primitive_for_each_recurrence():
     assert run(replace(shipped, primitives=cells), 512)[0] - duration == pytest.approx(100e-6)
 
 def test_replay_lowers_mixed_gdn_and_preserves_ragged_attention_per_replica(monkeypatch):
+    from mindie_sim.prediction.results import LoweringRequest
     from mindie_sim.prediction.spine import PredictionSpine
-    from mindie_sim.stack_registry import LoweringRequest
     raw = compose_case("qwen3.5-35b-a3b", NEWEST_SKU, tp=1, dp=2, ep=2, layers=4)
     mixed = (RequestView("prefill", 3, 7, False, "prefill"),
              RequestView("decode", 1, 512, True, "decode"),

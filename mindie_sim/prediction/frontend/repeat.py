@@ -24,23 +24,45 @@ _LAYER_QUANT_INDEX_RE = re.compile(r"(?:^|[.:/_-])layers?[.:/_-]?(\d+)(?:$|[.:/_
 def _layer_quant_signature(model, layer_index: int) -> tuple:
     """Capture any per-layer quant exclusions/overrides targeting ``layer_index``."""
     quant = getattr(model, "quant", None)
-    if quant is None:
-        return ()
     matched: list[str] = []
-    for entry in getattr(quant, "exclusions", ()) or ():
-        text = str(entry)
-        for m in _LAYER_QUANT_INDEX_RE.finditer(text):
-            if int(m.group(1)) == layer_index:
-                matched.append(f"excl:{text}")
-                break
-    overrides = getattr(quant, "category_overrides", ()) or ()
-    items = overrides.items() if isinstance(overrides, dict) else overrides
-    for key, val in items:
-        text = str(key)
-        for m in _LAYER_QUANT_INDEX_RE.finditer(text):
-            if int(m.group(1)) == layer_index:
-                matched.append(f"ovr:{text}={val!r}")
-                break
+    if quant is not None:
+        for entry in getattr(quant, "exclusions", ()) or ():
+            text = str(entry)
+            for m in _LAYER_QUANT_INDEX_RE.finditer(text):
+                if int(m.group(1)) == layer_index:
+                    matched.append(f"excl:{text}")
+                    break
+        overrides = getattr(quant, "category_overrides", ()) or ()
+        items = overrides.items() if isinstance(overrides, dict) else overrides
+        for key, val in items:
+            text = str(key)
+            for m in _LAYER_QUANT_INDEX_RE.finditer(text):
+                if int(m.group(1)) == layer_index:
+                    matched.append(f"ovr:{text}={val!r}")
+                    break
+        lq_overrides = (
+            quant.layer_quant_overrides_dict()
+            if hasattr(quant, "layer_quant_overrides_dict") else {}
+        )
+    else:
+        lq_overrides = {}
+    raw_meta = getattr(model, "metadata", None)
+    meta_dict = dict(raw_meta) if raw_meta else {}
+    meta_lq = meta_dict.get("layer_quant_overrides")
+    if isinstance(meta_lq, dict) and meta_lq:
+        lq_overrides = {**lq_overrides, **meta_lq}
+    if lq_overrides:
+        str_idx = str(layer_index)
+        if str_idx in lq_overrides:
+            matched.append(f"lqo:{str_idx}={lq_overrides[str_idx]!r}")
+        elif layer_index in lq_overrides:
+            matched.append(f"lqo:{str_idx}={lq_overrides[layer_index]!r}")
+        else:
+            native = lq_overrides.get("native_layers")
+            if isinstance(native, (list, tuple, set, frozenset)) and (
+                layer_index in native or str_idx in native
+            ):
+                matched.append(f"lqo:native:{str_idx}")
     return tuple(sorted(matched))
 
 
@@ -48,6 +70,7 @@ class _FrontendRepeat:
     def _resolve_homogeneous_archetypes(
         self, layers, *, model, runtime, mode, local_views, local_tokens, body_global_tokens,
         routing_global_tokens, routing_views, replica, physical_rank, query_position,
+        machine=None,
     ):
         routing_tokens = (
             routing_global_tokens if routing_global_tokens is not None
@@ -66,6 +89,7 @@ class _FrontendRepeat:
             routing_tokens, replica, physical_rank,
             query_position if has_explicit_real else None,
             env_views,
+            str(getattr(machine, "arch_family", "") or ""),
         )
         prev_env = self._prev_homo_env
         if (prev_env is not None and prev_env[0] is model
@@ -92,7 +116,8 @@ class _FrontendRepeat:
                 self._prev_homo_env = (model, runtime, static_env_key, False, None)
                 return None
             if (mode not in {"draft", "draft_prefill"}
-                    and _frontend.family_attnres.selection(runtime, model=model, phase=mode) is not None):
+                    and _frontend.family_attnres.selection(
+                        runtime, model=model, phase=mode, machine=machine) is not None):
                 self._prev_homo_env = (model, runtime, static_env_key, False, None)
                 return None
             stages = _frontend.stage_map(model, runtime)
@@ -533,6 +558,7 @@ class _FrontendRepeat:
             local_tokens=local_tokens, body_global_tokens=body_global_tokens,
             routing_global_tokens=routing_global_tokens, routing_views=routing_views,
             replica=replica, physical_rank=physical_rank, query_position=query_position,
+            machine=machine,
         )
         if archetypes is None:
             return None

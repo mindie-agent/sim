@@ -118,19 +118,19 @@ SOURCES: tuple[SourceRef, ...] = (
         source_sha256="170ae3ebc125ddf56916ed83c37d84ce6bc3b92a0889bfc44a06cb6e30b22729",
     ),
     SourceRef(
-        repository="cann/cannbot-dsl",
+        repository="tilelang-ascend/kernels",
         revision="5e7ace8cdcc16a5b062ba69d8fdf93d4f1d62223",
         relative_path="samples/attention/attn_prologue/attn_prologue_tiling.py",
         source_sha256="1f58dca0d1a7679d0f86b1eea6a1afaf446c2bf1815599954725a2b9104ecb8f",
     ),
     SourceRef(
-        repository="cann/cannbot-dsl",
+        repository="tilelang-ascend/kernels",
         revision="5e7ace8cdcc16a5b062ba69d8fdf93d4f1d62223",
         relative_path="samples/attention/attn_prologue/attn_prologue_kernel.py",
         source_sha256="84f69f4f8d84c4713a80915b95cdfb00dce67a30653b1f9cb494f503db755d7b",
     ),
     SourceRef(
-        repository="cann/cannbot-dsl",
+        repository="tilelang-ascend/kernels",
         revision="5e7ace8cdcc16a5b062ba69d8fdf93d4f1d62223",
         relative_path="samples/attention/attn_prologue/attn_prologue.py",
         source_sha256="80096f1edface568dd8dd9c01f407f40d092d9ecae01b9eaeae3f044c3a27898",
@@ -149,8 +149,8 @@ SOURCES: tuple[SourceRef, ...] = (
     ),
 )
 
-DSL_SOURCES = tuple(ref for ref in SOURCES if ref.repository == "cann/cannbot-dsl")
-ACLNN_SOURCES = tuple(ref for ref in SOURCES if ref.repository != "cann/cannbot-dsl")
+DSL_SOURCES = tuple(ref for ref in SOURCES if ref.repository == "tilelang-ascend/kernels")
+ACLNN_SOURCES = tuple(ref for ref in SOURCES if ref.repository != "tilelang-ascend/kernels")
 
 
 def _largest_aligned_divisor(value: int, limit: int, alignment: int) -> int:

@@ -33,12 +33,11 @@ from mindie_sim.prediction.mechanism import Work
 from mindie_sim.prediction.operators.moe_transport.moe_callers import RoutingPolicy
 from mindie_sim.prediction.program.primitives import PrimitiveStore
 from mindie_sim.prediction.program import KernelProgram, RecipeBook, Stage
-from mindie_sim.prediction.results import ReplayOptions, StepEvaluation, StepRequest
+from mindie_sim.prediction.results import RankOps, ReplayOptions, StepEvaluation, StepRequest
 from mindie_sim.prediction.runtime.tile_solver import TilePipelineSpec
 from mindie_sim.schema.case import Case
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.operators import OpSpec
-from mindie_sim.stack_registry import RankOps
 
 from ._oracle_prefetch import bind_prefetch_ops, bind_prefetch_streams, primitive_table_digest_token
 from .apply import AppliedPlan, DEFAULT_STACK_ID, ResolvedScenario, _solve_tiles, apply_plan, resolve_scenario

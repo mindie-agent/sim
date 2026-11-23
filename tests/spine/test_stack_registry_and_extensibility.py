@@ -27,7 +27,7 @@ import pytest
 from _support.axes import GEN5_DT_SKU
 from mindie_sim.compose import compose_case
 from mindie_sim.prediction.operators.diffusion import MINDIE_SD_CUSTOM_OPS
-from mindie_sim.prediction.results import ReplayOptions, StepRequest
+from mindie_sim.prediction.results import LoweringRequest, ReplayOptions, StepRequest
 from mindie_sim.prediction.spine import PredictionSpine
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.primitives.loader import load_primitives
@@ -68,7 +68,6 @@ from mindie_sim.schema.stack import (
     WaitForEvent,
 )
 from mindie_sim.schema.workload import IterationPlan, RequestView
-from mindie_sim.stack_registry import LoweringRequest
 from mindie_sim.stacks import (
     STACK_MANIFEST_SCHEMA,
     DiffusionNativeStackAdapter,
@@ -780,3 +779,49 @@ def test_stacks_package_obeys_ag010_and_zero_scc_cycles() -> None:
     ]
     ag010.extend(arch_gov._check_ag010_package_sccs(parsed))
     assert ag010 == []
+
+
+def test_wildcard_checkpoint_rules_resolve_across_eager_and_ideal_stacks_and_legacy_modules_deleted() -> None:
+    """Wildcard HF rules resolve cleanly across raw-eager & ideal-target; legacy stack shims are gone."""
+    from dataclasses import replace
+    import importlib.util
+    from mindie_sim.catalog.checkpoint_reader import read_hf_quantization_config
+    from mindie_sim.model_catalog import load_model
+
+    v41_model = load_model("deepseek-v4.1-flash")
+    composite_cfg = {
+        "torch_dtype": "bfloat16",
+        "quantization_config": {
+            "quant_method": "fp8",
+            "modules_to_not_convert": ["lm_head"],
+        },
+    }
+    hf_map = read_hf_quantization_config(composite_cfg, checkpoint_id="fixture/v41-wildcard")
+    # Also verify explicit composite FP8_DYNAMIC+MXFP4_EXPERTS wildcard rule.
+    composite_map = CheckpointQuantMap(
+        provenance=replace(hf_map.provenance, checkpoint_id="fixture/v41-composite"),
+        model_quant_type="FP8_DYNAMIC+MXFP4_EXPERTS",
+        rules=(
+            TensorQuantRule(pattern="*.experts.*", raw_tag="MXFP4", presence=TensorPresenceDomain(scope="target")),
+            TensorQuantRule(pattern="*", raw_tag="FP8_DYNAMIC", presence=TensorPresenceDomain(scope="target")),
+        ),
+        cache_rule=CacheQuantRule(kv_tag="FP8_DYNAMIC"),
+    )
+    case = _minimal_case()
+    for stack_id, track in (("raw-eager", "eager"), ("ideal-target", "target")):
+        adapter = get_stack(stack_id)
+        opts = adapter.resolve_options(
+            v41_model, case.machine, case.runtime.parallel,
+            role="colocated", track=track, requested_options={}, field_origins={},
+        )
+        for ckpt in (hf_map, composite_map):
+            qplan = adapter.resolve_quant_instantiation(
+                v41_model, ckpt, case.machine, case.runtime.parallel, opts,
+                role="colocated", phase="decode",
+            )
+            assert qplan.plan_digest and qplan.port_abis
+
+    repo_root = Path(__file__).resolve().parents[2]
+    for retired in ("stack_registry", "stack_tracks", "runtime_profiles"):
+        assert not (repo_root / "mindie_sim" / f"{retired}.py").exists()
+        assert importlib.util.find_spec(f"mindie_sim.{retired}") is None

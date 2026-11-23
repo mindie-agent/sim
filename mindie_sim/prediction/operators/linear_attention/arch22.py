@@ -49,7 +49,7 @@ SOURCES: tuple[SourceRef, ...] = (
     SourceRef(
         repository="cann/cann-recipes-infer",
         revision="3c9266727c2a25bd17d503ad37d189a134ff364b",
-        relative_path="ops/cannbot_dsl/fused_recurrent_kda.py",
+        relative_path="ops/fused_recurrent_kda.py",
         source_sha256="725d325763e2f248f62f72397f54c55a5006706ee32137b128eb2b3900bda49a",
     ),
 )

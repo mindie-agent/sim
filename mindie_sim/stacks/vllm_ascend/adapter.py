@@ -461,7 +461,7 @@ def _select_recipe_bindings(
         origins.append(("indexer", "vllm-ascend:shipping"))
     if has_kpool:
         bindings.append(("index_kpool", "vllm_ascend_cann_keypool_caller", ()))
-    if has_attn_res:
+    if has_attn_res and hw == "a5":
         bindings.append(("attn_res", "vllm_ascend_attn_res_prefix", ()))
         origins.append(("attn_res", binding_ref.get("attn_res_prefix_fusion", "vllm-ascend:shipping")))
     if has_moe and int(eff_opts.get("enable_fused_mc2") or 0) > FUSED_MC2_DISABLED:

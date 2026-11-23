@@ -589,7 +589,7 @@ owns = ["mindie_sim/prediction/sharding/context_parallel.py"]
 [[module]]
 path = "product/test_parallel_generalization_and_sweeps.py"
 tier = "tier0"
-owns = ["mindie_sim/catalog/context_parallel.py", "mindie_sim/sweep/resize.py", "mindie_sim/runtime_profiles.py"]
+owns = ["mindie_sim/catalog/context_parallel.py", "mindie_sim/sweep/resize.py", "mindie_sim/stacks/vllm_ascend/profiles.py"]
 
 [[module]]
 path = "product/test_onboarding_pipelines.py"

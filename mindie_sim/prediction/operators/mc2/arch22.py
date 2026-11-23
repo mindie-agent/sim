@@ -72,13 +72,13 @@ SOURCES: tuple[SourceRef, ...] = (
         source_sha256="b7eb67de6390df7688ce9f24b4ecbc08172d66fa5e2b2a0f664d2c4f15169466",
     ),
     SourceRef(
-        repository="cannbot-skills",
+        repository="cann/ascendc-mc2-best-practice",
         revision=_SKILLS_REVISION,
         relative_path="ops/ascendc-mc2-best-practice/references/foundations/hccl-matmul/all_gather_matmul/x_all_gather_matmul/op_host/op_tiling/arch22/x_all_gather_matmul_tiling_a2a3.cpp",
         source_sha256="48544c803eb2be74234c99075bb32cf952faefcae9a8848d213dbe3d0cc3aa2f",
     ),
     SourceRef(
-        repository="cannbot-skills",
+        repository="cann/ascendc-mc2-best-practice",
         revision=_SKILLS_REVISION,
         relative_path="ops/ascendc-mc2-best-practice/references/requirement-analysis/comm-path-decision.md",
         source_sha256="05a9e0df5d30d32096454a7fa0cdcab23596254ecdf1639f441657ca9a2f9b25",

@@ -119,7 +119,7 @@ from mindie_sim.schema.scenario import (
     SpaceTimeTradeoffSpec,
     canonical_comparison_stages,
 )
-from mindie_sim.stack_registry import RankOps
+from mindie_sim.prediction.results import RankOps
 from .causal_tail import (
     FUSED_MC2_ROUTED_LEVEL,
     FUSED_MC2_SHARED_LEVEL,
@@ -686,6 +686,7 @@ class KernelSynthesisSpec:
     target_attainment_pct: float
     abi_signature_id: str = ""
     binding_state: BindingState = "unbound_formula_projection"
+    exposed_before_us: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -714,6 +715,9 @@ class KernelSynthesisSpec:
             "sram_verified": bool(self.sram_verified),
             "l_star_us": round(float(self.l_star_us), 3),
             "before_us": round(float(self.before_us), 3),
+            "exposed_before_us": round(
+                float(self.exposed_before_us if self.exposed_before_us is not None else self.before_us), 3
+            ),
             "target_us": round(float(self.target_us), 3),
             "target_attainment_pct": round(float(self.target_attainment_pct), 1),
             "abi_signature_id": self.abi_signature_id,
@@ -2083,6 +2087,7 @@ def synthesize_kernel_spec(
     abi_signature_id: str = "",
     binding_state: BindingState = "unbound_formula_projection",
     preserve_port_ids: Sequence[str] = (),
+    exposed_before_us: float | None = None,
 ) -> KernelSynthesisSpec:
     """Compose symbolic math equations and TileSolver FP32 SRAM residency from true operand DAG."""
     member_ops = tuple(_node_to_op_spec(m, None) for m in members)
@@ -2133,6 +2138,7 @@ def synthesize_kernel_spec(
         target_attainment_pct=round(achieved * PERCENT_SCALE, 1),
         abi_signature_id=abi_signature_id,
         binding_state=binding_state,
+        exposed_before_us=exposed_before_us,
     )
 
 
@@ -2978,6 +2984,7 @@ def _collapse_candidate_group(
         b_state = "unbound_formula_projection"
 
     before_sum_us = sum(n.dur_us for n in group_nodes)
+    exposed_before_sum_us = sum(max(0.0, float(n.exposed_dur_us)) for n in group_nodes)
     t_target = max(projected_us, l_star_us)
     if cand.law == "law3_mc2":
         t_target = max(t_target, floors.mc2_sync_us + float(demand[4]) / NS_PER_US)
@@ -3004,6 +3011,7 @@ def _collapse_candidate_group(
         abi_signature_id=abi_sig,
         binding_state=b_state,
         preserve_port_ids=eff_preserve_ids,
+        exposed_before_us=exposed_before_sum_us,
     )
     if not spec.sram_verified:
         return None
@@ -3120,6 +3128,7 @@ def _materialize_external_fused_op(
         status = f"{STATUS_NEW_OP} {abi} (UB FP32 驻留融合)"
 
     before_sum_us = sum(n.dur_us for n in group_nodes)
+    exposed_before_sum_us = sum(max(0.0, float(n.exposed_dur_us)) for n in group_nodes)
     achieved_eta = min(1.0, l_star_us / dur_us) if dur_us > 0.0 and l_star_us > 0.0 else 1.0
     has_mm_ext = any(t.trait == AlgebraicTrait.BILINEAR_MATMUL for t in member_traits)
     eff_backend = (
@@ -3144,6 +3153,7 @@ def _materialize_external_fused_op(
         abi_signature_id=abi_sig,
         binding_state=b_state,
         preserve_port_ids=preserve_ids,
+        exposed_before_us=exposed_before_sum_us,
     )
     if not spec.sram_verified and b_state == "unbound_formula_projection":
         raise ModelingError(
@@ -3985,12 +3995,102 @@ def _p20_host_h2d_params(case: Case, primitive_table: Any) -> tuple[float, float
     )
 
 
+def _peak_step_int(raw: Any, default: int) -> int:
+    if isinstance(raw, (tuple, list)):
+        vals = [int(x) for x in raw if x is not None]
+        return max(vals) if vals else int(default)
+    return int(raw) if raw is not None else int(default)
+
+
+def _peak_sequences_per_dp(step_request: StepRequest | None, case: Case) -> int:
+    if step_request is not None:
+        return max(1, _peak_step_int(getattr(step_request, "sequences", 1), 1))
+    return max(1, len(case.workload.requests))
+
+
+def _is_recover_ssm_commit_node(node: TargetOpNode) -> bool:
+    """True strictly for post-accept RecoverSSM commit ops (never the [B, K+1] verify scan)."""
+    meta = dict(getattr(node.spec, "metadata", ()) or ()) if node.spec is not None else {}
+    stage = str(meta.get("recover_ssm_stage") or "").strip().lower()
+    if stage:
+        return stage == "commit"
+    op_lower = str(node.op_id or "").lower()
+    rec_lower = str(node.recipe or "").lower()
+    if "verify" in op_lower or "verify" in rec_lower or "recurrent_gated_delta_rule" in rec_lower:
+        return False
+    return (
+        "recover_ssm_commit" in op_lower
+        or "recover_ssm_commit" in rec_lower
+        or "aclnnrecoverssmstate" in rec_lower
+    )
+
+
+def _max_pp_stage_bytes(case: Case, target_plans: Sequence[Any], per_layer_bytes: Any) -> int:
+    """Return the bottleneck single-stage weight byte sum across pipeline stages."""
+    pp = max(1, int(case.runtime.parallel.pp))
+    if pp <= 1:
+        return sum(int(per_layer_bytes(lp)) for lp in target_plans)
+    total_layers = max(1, int(getattr(case.model, "layers", len(case.model.layer_plans)) or 1))
+    custom = tuple(getattr(case.runtime, "pp_layer_partition", ()) or ())
+    if len(custom) == pp and sum(int(x) for x in custom) == total_layers:
+        counts = [int(x) for x in custom]
+    else:
+        base, rem = divmod(total_layers, pp)
+        counts = [base + (1 if idx < rem else 0) for idx in range(pp)]
+    layer_to_stage: dict[int, int] = {}
+    cursor = 0
+    for st, cnt in enumerate(counts):
+        for lyr in range(cursor, cursor + cnt):
+            layer_to_stage[lyr] = st
+        cursor += cnt
+    stage_totals = [0] * pp
+    for lp in target_plans:
+        st = layer_to_stage.get(int(getattr(lp, "index", 0)), 0)
+        stage_totals[st] += int(per_layer_bytes(lp))
+    return max(stage_totals, default=0)
+
+
+def _engram_lookup_h2d_bytes(nodes: Sequence[TargetOpNode]) -> float:
+    """Extract host-link lookup H2D bytes only, excluding device GEMMs like ``engram_gate*``."""
+    rh2d_nodes = [
+        n for n in nodes
+        if str(n.family).lower() == "engram_rh2d"
+        or str(n.recipe).lower() in {"engram_cpu_decode_pinned_staging_h2d", "ple_host_uva_lookup"}
+    ]
+    if rh2d_nodes:
+        total = 0.0
+        for n in rh2d_nodes:
+            meta = dict(getattr(n.spec, "metadata", ()) or ()) if n.spec is not None else {}
+            rwork = meta.get("resource_work")
+            h2d = float(rwork.get("h2d", 0.0)) if isinstance(rwork, Mapping) else 0.0
+            if h2d <= 0.0:
+                h2d = max(float(n.hbm_write_bytes), float(n.mte3_bytes), float(n.hbm_total_bytes))
+            total += h2d * max(1, int(n.repeat_count))
+        return total
+
+    gather_nodes = [
+        n for n in nodes
+        if str(n.family).lower() == "engram_gather"
+        or str(n.recipe).lower() in {"catalog_engram_device_gather", "ple_device_lookup"}
+    ]
+    total = 0.0
+    for n in gather_nodes:
+        meta = dict(getattr(n.spec, "metadata", ()) or ()) if n.spec is not None else {}
+        h2d = float(meta.get("logical_table_read_bytes") or 0.0)
+        if h2d <= 0.0 and meta.get("response_bytes_per_lookup") and meta.get("lookups"):
+            h2d = float(meta["response_bytes_per_lookup"]) * float(meta["lookups"])
+        if h2d <= 0.0:
+            h2d = max(float(n.hbm_read_bytes), float(n.mte2_bytes), float(n.hbm_total_bytes))
+        total += h2d * max(1, int(n.repeat_count))
+    return total
+
+
 def _resident_free_headroom_bytes(case: Case, step_request: StepRequest | None) -> int:
     try:
         mem = Memory(case)
-        seqs = max(1, int(getattr(step_request, "sequences", 1) or 1)) if step_request is not None else max(1, len(case.workload.requests))
-        ctx = int(getattr(step_request, "context", 0) or 0) if step_request is not None else 0
-        q_tok = max(1, int(getattr(step_request, "tokens", 1) or 1)) if step_request is not None else 1
+        seqs = _peak_sequences_per_dp(step_request, case)
+        ctx = max(0, _peak_step_int(getattr(step_request, "context", 0), 0)) if step_request is not None else 0
+        q_tok = max(1, _peak_step_int(getattr(step_request, "tokens", 1), 1)) if step_request is not None else 1
         receipt = mem.resident_memory_receipt(
             phase=str(getattr(step_request, "phase", "decode") or "decode"),
             sequence_tokens=(ctx + q_tok) if ctx > 0 else None,
@@ -4014,14 +4114,14 @@ def _collect_space_time_opportunities(
     meta = dict(getattr(case.runtime, "metadata", ()) or ())
     k_prop = int(meta.get("draft_proposal_tokens", 0) or 0)
     if k_prop <= 0 and step_request is not None and step_request.phase == "decode":
-        k_prop = max(0, int(step_request.tokens) - 1)
-    seqs = max(1, int(getattr(step_request, "sequences", 1) or 1)) if step_request is not None else max(1, len(case.workload.requests))
+        k_prop = max(0, _peak_step_int(getattr(step_request, "tokens", 1), 1) - 1)
+    seqs = _peak_sequences_per_dp(step_request, case)
     plans = tuple(getattr(case.model, "layer_plans", ()) or ())
     linear_plans = [lp for lp in plans if str(getattr(lp, "attention", "")).lower() in {"kda", "gdn"}]
     recover_us = sum(
         float(n.exposed_dur_us) * max(1, int(n.repeat_count))
         for n in nodes
-        if "recover_ssm" in n.op_id.lower() or "recover_ssm" in n.recipe.lower()
+        if _is_recover_ssm_commit_node(n)
     )
     if linear_plans and (k_prop > 0 or recover_us > 0.0):
         eff_k = max(1, k_prop)
@@ -4054,12 +4154,14 @@ def _collect_space_time_opportunities(
     tp = max(1, int(case.runtime.parallel.tp))
     mla_plans = [lp for lp in plans if int(getattr(lp, "kv_lora_rank", 0) or 0) > 0]
     if mla_plans:
-        lp0 = mla_plans[0]
-        kv_r = int(getattr(lp0, "kv_lora_rank", 0) or 0)
-        n_heads = max(1, int(getattr(lp0, "num_heads", 1) or 1))
-        v_dim = max(1, int(getattr(lp0, "v_head_dim", 0) or getattr(lp0, "head_dim", 1) or 1))
-        qk_nope = max(1, int(getattr(lp0, "qk_nope_head_dim", 0) or getattr(lp0, "head_dim", 1) or 1))
-        prep_bytes = (len(mla_plans) * kv_r * n_heads * (qk_nope + v_dim) * DEFAULT_BF16_BYTES) // tp
+        def _mla_absorbed_layer_bytes(lp: Any) -> int:
+            kv_r = int(getattr(lp, "kv_lora_rank", 0) or 0)
+            n_heads = max(1, int(getattr(lp, "num_heads", 1) or 1))
+            v_dim = max(1, int(getattr(lp, "v_head_dim", 0) or getattr(lp, "head_dim", 1) or 1))
+            qk_nope = max(1, int(getattr(lp, "qk_nope_head_dim", 0) or getattr(lp, "head_dim", 1) or 1))
+            return (kv_r * n_heads * (qk_nope + v_dim) * DEFAULT_BF16_BYTES) // tp
+
+        prep_bytes = _max_pp_stage_bytes(case, mla_plans, _mla_absorbed_layer_bytes)
         feasible_mla = bool(prep_bytes <= headroom)
         out.append(CoDesignOpportunity(
             opportunity_id="space_time_absorbed_kv_projection",
@@ -4081,10 +4183,13 @@ def _collect_space_time_opportunities(
         ))
     elif linear_plans:
         hidden = max(1, int(getattr(case.model, "hidden_size", 0) or 1))
-        lp0 = linear_plans[0]
-        lh = max(1, int(getattr(lp0, "linear_heads", 1) or 1))
-        ld = max(1, int(getattr(lp0, "linear_head_dim", 1) or 1))
-        prep_f_bytes = (len(linear_plans) * hidden * lh * ld * DEFAULT_BF16_BYTES) // tp
+
+        def _linear_prep_layer_bytes(lp: Any) -> int:
+            lh = max(1, int(getattr(lp, "linear_heads", 1) or 1))
+            ld = max(1, int(getattr(lp, "linear_head_dim", 1) or 1))
+            return (hidden * lh * ld * DEFAULT_BF16_BYTES) // tp
+
+        prep_f_bytes = _max_pp_stage_bytes(case, linear_plans, _linear_prep_layer_bytes)
         out.append(CoDesignOpportunity(
             opportunity_id="space_time_prepared_weight_materialization",
             kind="space_time_tradeoff",
@@ -4119,7 +4224,7 @@ def _collect_cross_hw_offload_opportunities(
     engram_tables = tuple(getattr(engram_cfg, "tables", ()) or ()) if engram_cfg is not None else ()
     engram_nodes = [
         n for n in nodes
-        if str(n.family).lower() in {"engram_rh2d", "ple", "engram"}
+        if str(n.family).lower() in {"engram_rh2d", "engram_gather", "ple", "engram"}
         or "engram" in n.op_id.lower()
         or "ple_" in n.op_id.lower()
     ]
@@ -4141,10 +4246,7 @@ def _collect_cross_hw_offload_opportunities(
             for n in nodes if n not in engram_nodes
         ) * HALF_SPLIT_RATIO
 
-    xfer_bytes = sum(
-        max(float(n.hbm_read_bytes), float(n.mte2_bytes), float(n.hbm_total_bytes)) * max(1, int(n.repeat_count))
-        for n in engram_nodes
-    )
+    xfer_bytes = _engram_lookup_h2d_bytes(engram_nodes)
     freed_hbm = 0
     if engram_cfg is not None and callable(getattr(engram_cfg, "table_storage_bytes", None)):
         try:
@@ -4200,7 +4302,8 @@ def _collect_codesign_opportunities(
     for spec in specs:
         if not spec.sram_verified or len(spec.constituent_op_ids) < MIN_FUSE_MEMBERS:
             continue
-        before_ms = max(0.0, float(spec.before_us) / US_PER_MS)
+        exposed_us = spec.exposed_before_us if spec.exposed_before_us is not None else spec.before_us
+        before_ms = max(0.0, float(exposed_us) / US_PER_MS)
         tiled_ms = max(0.0, float(spec.target_us) / US_PER_MS)
         l_star_ms = min(tiled_ms, max(0.0, float(spec.l_star_us) / US_PER_MS))
         ub_live = max(0, int(spec.ub_peak_bytes))
@@ -4292,60 +4395,15 @@ def _run_archetype_rewrites(
 
 def _build_stage_waterfall(
     opt_mode: OptimizationMode,
-    base_nodes: Sequence[TargetOpNode],
-    base_dems: Sequence[tuple[int, int, int, int, int]],
-    case: Case,
-    floors: SkuTargetFloors,
-    p0: Mapping[str, Any],
-    datapath: DatapathCapabilitySpec,
-    pricing_ctx: _TargetPricingContext,
-    after_sched: DieScheduleResult,
-    *,
-    phase: str,
-    safe_n_tok: float,
-    primitive_table: Any,
-    topology: Topology | None,
-    has_ext_plan: bool,
-    base_sched: DieScheduleResult | None = None,
+    stage_scheds: Mapping[str, DieScheduleResult],
 ) -> tuple[dict[str, Any], ...]:
-    """Evaluate canonical causal stages on ONE Engine + ONE PrimitiveTable with exact conservation."""
+    """Build canonical stage waterfall strictly from winning Engine schedules (zero scalar clamping)."""
     stage_specs = canonical_comparison_stages(opt_mode)
-    eff_base_sched = base_sched if base_sched is not None else schedule_target_graph_on_engine(
-        base_nodes, case, primitive_table=primitive_table, launch_floor_us=floors.launch_vec_us,
-    )
-    before_us = weighted_step_span_us(eff_base_sched.nodes)
-    cfg_sched, _, _, _ = _select_best_moe_and_die_schedule(
-        base_nodes, base_dems, case, floors, p0, locked_ids=set(),
-        collective_plans={}, topology=topology,
-        primitive_table=primitive_table, allow_unbound_formula=False,
-    )
-    cfg_us = min(before_us, weighted_step_span_us(cfg_sched.nodes))
-    after_us = weighted_step_span_us(after_sched.nodes)
-    if opt_mode == "modeling":
-        fwk_nodes, fwk_dems, _, _, _, fwk_remap = _run_archetype_rewrites(
-            base_nodes, base_dems, set(), set(), floors, p0, case, datapath, pricing_ctx,
-            phase=phase, safe_n_tok=safe_n_tok, primitive_table=primitive_table,
-            allow_unbound_formula=False,
-        )
-        fwk_rewired = _rewire_node_preds(fwk_nodes, fwk_remap)
-        fwk_sched, _, _, _ = _select_best_moe_and_die_schedule(
-            fwk_rewired, fwk_dems, case, floors, p0, locked_ids=set(),
-            collective_plans={}, topology=topology,
-            primitive_table=primitive_table, allow_unbound_formula=False,
-        )
-        fwk_us = min(cfg_us, weighted_step_span_us(fwk_sched.nodes))
-        if not has_ext_plan:
-            after_us = min(fwk_us, after_us)
-        spans = {"before": before_us, "config_only": cfg_us, "framework_rewrite": fwk_us, "after": after_us}
-    else:
-        if not has_ext_plan:
-            after_us = min(cfg_us, after_us)
-        spans = {"before": before_us, "config_only": cfg_us, "after": after_us}
-
+    before_us = weighted_step_span_us(stage_scheds["before"].nodes)
     rows: list[dict[str, Any]] = []
     prev_us = before_us
     for st in stage_specs:
-        cur_us = spans[st.stage]
+        cur_us = weighted_step_span_us(stage_scheds[st.stage].nodes)
         rows.append({
             "stage": st.stage,
             "owner": st.owner,
@@ -4365,6 +4423,9 @@ def _enforce_engine_monotonicity(
     demands: Sequence[tuple[int, int, int, int, int]],
     case: Case,
     floors: SkuTargetFloors,
+    p0: Mapping[str, Any],
+    datapath: DatapathCapabilitySpec,
+    pricing_ctx: _TargetPricingContext,
     die_sched: DieScheduleResult,
     final_dems: list[tuple[int, int, int, int, int]],
     final_plan: RewritePlan,
@@ -4373,11 +4434,15 @@ def _enforce_engine_monotonicity(
     extra_receipts: list[dict[str, Any]],
     moe_dec: MoERouteDecision | None,
     *,
+    opt_mode: OptimizationMode,
+    phase: str,
+    safe_n_tok: float,
     base_sha: str,
     frame_sha: str,
     topology: Topology | None,
     primitive_table: Any,
     has_ext_edits: bool,
+    compute_waterfall: bool,
 ) -> tuple[
     DieScheduleResult,
     list[tuple[int, int, int, int, int]],
@@ -4386,25 +4451,70 @@ def _enforce_engine_monotonicity(
     list[CoDesignOpportunity],
     list[dict[str, Any]],
     MoERouteDecision | None,
-    DieScheduleResult | None,
+    dict[str, DieScheduleResult],
 ]:
-    """Reject net-negative automatic rewrites/routes when slower than baseline on the same Engine."""
-    if has_ext_edits:
-        return die_sched, final_dems, final_plan, all_specs, tiler_opps, extra_receipts, moe_dec, None
-    after_w = weighted_step_span_us(die_sched.nodes)
-    baseline_exposed_w = weighted_step_span_us(nodes)
-    if after_w <= baseline_exposed_w + SAVING_POSITIVE_EPS_US:
-        return die_sched, final_dems, final_plan, all_specs, tiler_opps, extra_receipts, moe_dec, None
+    """Compare stage Engine schedules and return the exact winning (sched, dems, plan, specs) tuple."""
+    if not compute_waterfall and has_ext_edits:
+        return die_sched, final_dems, final_plan, all_specs, tiler_opps, extra_receipts, moe_dec, {}
+
     orig_sched = schedule_target_graph_on_engine(
         nodes, case, collective_plans=None, topology=topology,
         primitive_table=primitive_table, launch_floor_us=floors.launch_vec_us,
     )
-    if after_w > weighted_step_span_us(orig_sched.nodes) + SAVING_POSITIVE_EPS_US:
-        return (
-            orig_sched, list(demands), empty_plan(base_sha, frame_sha),
-            [], [], [], None, orig_sched,
+    orig_bundle = (orig_sched, list(demands), empty_plan(base_sha, frame_sha), [], [], [], None)
+    orig_us = weighted_step_span_us(orig_sched.nodes)
+
+    cfg_sched, cfg_dems, cfg_moe, cfg_receipts = _select_best_moe_and_die_schedule(
+        nodes, demands, case, floors, p0, locked_ids=set(),
+        collective_plans={}, topology=topology,
+        primitive_table=primitive_table, allow_unbound_formula=False,
+    )
+    cfg_bundle = (
+        (cfg_sched, list(cfg_dems), empty_plan(base_sha, frame_sha), [], [], list(cfg_receipts), cfg_moe)
+        if weighted_step_span_us(cfg_sched.nodes) <= orig_us + SAVING_POSITIVE_EPS_US
+        else orig_bundle
+    )
+    stage_scheds: dict[str, DieScheduleResult] = {
+        "before": orig_sched,
+        "config_only": cfg_bundle[0],
+    }
+
+    best_prior = cfg_bundle
+    if opt_mode == "modeling":
+        fwk_nodes, fwk_dems, fwk_specs, _, fwk_edits, fwk_remap = _run_archetype_rewrites(
+            nodes, demands, set(), set(), floors, p0, case, datapath, pricing_ctx,
+            phase=phase, safe_n_tok=safe_n_tok, primitive_table=primitive_table,
+            allow_unbound_formula=False,
         )
-    return die_sched, final_dems, final_plan, all_specs, tiler_opps, extra_receipts, moe_dec, orig_sched
+        fwk_rewired = _rewire_node_preds(fwk_nodes, fwk_remap)
+        fwk_sched, fwk_final_dems, fwk_moe, fwk_receipts = _select_best_moe_and_die_schedule(
+            fwk_rewired, fwk_dems, case, floors, p0, locked_ids=set(),
+            collective_plans={}, topology=topology,
+            primitive_table=primitive_table, allow_unbound_formula=False,
+        )
+        fwk_plan = (
+            RewritePlan(base_graph_sha256=base_sha, framing_sha256=frame_sha, edits=tuple(fwk_edits))
+            if fwk_edits else empty_plan(base_sha, frame_sha)
+        )
+        if weighted_step_span_us(fwk_sched.nodes) <= weighted_step_span_us(best_prior[0].nodes) + SAVING_POSITIVE_EPS_US:
+            best_prior = (
+                fwk_sched, list(fwk_final_dems), fwk_plan, list(fwk_specs), [], list(fwk_receipts), fwk_moe,
+            )
+        stage_scheds["framework_rewrite"] = best_prior[0]
+
+    if has_ext_edits:
+        stage_scheds["after"] = die_sched
+        return die_sched, final_dems, final_plan, all_specs, tiler_opps, extra_receipts, moe_dec, stage_scheds
+
+    after_us = weighted_step_span_us(die_sched.nodes)
+    prior_us = weighted_step_span_us(best_prior[0].nodes)
+    if after_us > prior_us + SAVING_POSITIVE_EPS_US:
+        win_sched, win_dems, win_plan, win_specs, win_tiler, win_rcpts, win_moe = best_prior
+        stage_scheds["after"] = win_sched
+        return win_sched, win_dems, win_plan, win_specs, win_tiler, win_rcpts, win_moe, stage_scheds
+
+    stage_scheds["after"] = die_sched
+    return die_sched, final_dems, final_plan, all_specs, tiler_opps, extra_receipts, moe_dec, stage_scheds
 
 
 def _build_solved_target_graph(
@@ -4558,23 +4668,21 @@ def solve_target_graph(
         collective_plans=collective_plans, topology=topology,
         primitive_table=primitive_table, allow_unbound_formula=eff_allow_unbound,
     )
-    die_sched, final_dems, final_plan, all_specs, tiler_opps, extra_receipts, moe_dec, orig_sched = (
+    die_sched, final_dems, final_plan, all_specs, tiler_opps, extra_receipts, moe_dec, stage_scheds = (
         _enforce_engine_monotonicity(
-            nodes, demands, case, floors, die_sched, final_dems, final_plan,
+            nodes, demands, case, floors, p0, datapath, pricing_ctx,
+            die_sched, final_dems, final_plan,
             all_specs, tiler_opps, extra_receipts, moe_dec,
+            opt_mode=opt_mode, phase=phase, safe_n_tok=safe_n_tok,
             base_sha=base_sha, frame_sha=frame_sha, topology=topology,
             primitive_table=primitive_table, has_ext_edits=bool(executed_ext_edits),
+            compute_waterfall=compute_waterfall_and_codesign,
         )
     )
     indexed = tuple(replace(n, ordinal=idx) for idx, n in enumerate(die_sched.nodes))
     _validate_final_graph_invariants(indexed, final_dems)
     stage_waterfall = (
-        _build_stage_waterfall(
-            opt_mode, nodes, demands, case, floors, p0, datapath, pricing_ctx, die_sched,
-            phase=phase, safe_n_tok=safe_n_tok, primitive_table=primitive_table,
-            topology=topology, has_ext_plan=bool(executed_ext_edits),
-            base_sched=orig_sched,
-        )
+        _build_stage_waterfall(opt_mode, stage_scheds)
         if compute_waterfall_and_codesign else ()
     )
     codesign_opps = (

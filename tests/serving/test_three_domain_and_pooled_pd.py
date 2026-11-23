@@ -27,9 +27,9 @@ from mindie_sim.prediction.offload import (
     resolve_case_offload_policy,
     resolve_sku_host_dma_rates,
 )
+from mindie_sim.feature_mechanisms import resolve_runtime_stack
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.common import ModelingError
-from mindie_sim.stack_tracks import resolve_runtime_stack
 from mindie_sim.sweep import (
     solve_optimal_deployment,
     sweep_pd_disaggregation_ratios,

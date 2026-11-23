@@ -1015,7 +1015,7 @@ def _adapter_track_for(
     return supported_tracks[0] if supported_tracks else "shipping"  # type: ignore[return-value]
 
 
-def _effective_stack_tracks_key(
+def _effective_stack_profile_key(
     runtime_stack: str | Path | Mapping[str, Any] | None,
     stack_id: str,
 ) -> str | Path | Mapping[str, Any]:
@@ -1255,7 +1255,7 @@ def _apply_stack_and_lowerings(
     excluded_selectors: frozenset[str] = frozenset()
     excluded_passes: frozenset[str] = frozenset()
     if ascend_backend and not raw_eager:
-        from mindie_sim.stack_tracks import excluded_lowering_bindings
+        from mindie_sim.feature_mechanisms import excluded_lowering_bindings
         excluded_selectors, excluded_passes = excluded_lowering_bindings(exclude_optimizations)
 
     if va_profile is not None:
@@ -1267,14 +1267,16 @@ def _apply_stack_and_lowerings(
 
     mechanism_track_active = False
     if ascend_backend and (not raw_eager or track_raw_eager):
-        from mindie_sim.feature_mechanisms import MechanismContext
-        from mindie_sim.stack_tracks import (
-            apply_resolved_mechanisms, resolve_runtime_stack, resolve_stack_track,
+        from mindie_sim.feature_mechanisms import (
+            MechanismContext,
+            apply_resolved_mechanisms,
+            resolve_runtime_stack,
+            resolve_stack_track,
         )
         if (track_raw_eager or va_recommended is not False
                 or bool(optimizations) or canonical_track != "merged"):
             mechanism_track_active = not raw_eager
-            stack_key = _effective_stack_tracks_key(runtime_stack, stack_id)
+            stack_key = _effective_stack_profile_key(runtime_stack, stack_id)
             stack_profile = resolve_runtime_stack(stack_key)
             stack_model_key = str((va_profile or {}).get("canonical_model") or model_spec.name)
             ctx_opts: dict[str, Any] = {
@@ -1752,7 +1754,7 @@ def _compose_explicit_case(
         **machine_options,
     )
     ascend_backend = hardware_backend == "ascend"
-    from mindie_sim.stack_tracks import normalize_feature_track
+    from mindie_sim.feature_mechanisms import normalize_feature_track
     canonical_track = normalize_feature_track(feature_track) if ascend_backend else "merged"
     track_raw_eager = canonical_track == "raw_eager"
     if track_raw_eager:

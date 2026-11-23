@@ -94,13 +94,13 @@ SOURCES: tuple[SourceRef, ...] = (
         source_sha256="4b613b72ec6cb36209328b084b74aa76e32ec86ad872976e564d9e4eea60e671",
     ),
     SourceRef(
-        repository="cann/cannbot-dsl",
+        repository="tilelang-ascend/kernels",
         revision="5e7ace8cdcc16a5b062ba69d8fdf93d4f1d62223",
         relative_path="samples/attention/flash_mla_with_kvcache/flash_mla_with_kvcache.py",
         source_sha256="044da876085c5b9b16b2ee2c70654f9ae38c3a2a572b7fcaed1cabdb4ca7faaf",
     ),
     SourceRef(
-        repository="cann/cannbot-dsl",
+        repository="tilelang-ascend/kernels",
         revision="5e7ace8cdcc16a5b062ba69d8fdf93d4f1d62223",
         relative_path="samples/attention/mixed_quant_sparse_flash_mla/mixed_quant_sparse_flash_mla.py",
         source_sha256="9fd0ad943a677e630ffb13df255b73a7b8889de0ed5a032996c2a3be6fc5ee36",
@@ -118,7 +118,7 @@ SOURCES: tuple[SourceRef, ...] = (
         source_sha256="f60e4f44294b0677522bdeec766f6bb66f61fdc3375ac95f547000eff7c10237",
     ),
     SourceRef(
-        repository="cann/cannbot-dsl",
+        repository="tilelang-ascend/kernels",
         revision="5e7ace8cdcc16a5b062ba69d8fdf93d4f1d62223",
         relative_path="samples/attention/mixed_quant_sparse_flash_mla/mixed_quant_sparse_flash_mla_metadata.py",
         source_sha256="51e13bd02d35704f99298dd9fdff36ddd82c941a8106c07d8e668d29664ad40a",

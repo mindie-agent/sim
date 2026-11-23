@@ -23,14 +23,12 @@ from .prediction.call_builders import build_call
 from .compose import compose_case, resolve_hardware_sku
 from .feature_mechanisms import (
     OptimizationMechanism,
-    list_optimization_mechanisms,
-    register_optimization_mechanism,
-)
-from .feature_mechanisms import compare_feature_tracks
-from .stack_tracks import (
     RuntimeStackProfile,
     StackMechanismBinding,
+    compare_feature_tracks,
+    list_optimization_mechanisms,
     load_runtime_stack_manifest,
+    register_optimization_mechanism,
     register_runtime_stack,
 )
 from .hardware_derivation import derive_hardware_sku
@@ -146,7 +144,7 @@ __all__ = [
 ]
 
 _LAZY_SUBMODULES = frozenset({
-    "api", "cli", "cohort_accuracy", "stack_registry", "structure",
+    "api", "cli", "cohort_accuracy", "structure",
 })
 
 

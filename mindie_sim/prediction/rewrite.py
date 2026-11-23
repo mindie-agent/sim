@@ -86,9 +86,9 @@ from typing import Any, Protocol
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.operators import OpSpec
 from mindie_sim.schema.workload import RequestView
-from mindie_sim.stack_registry import RankOps, ResolvedBase
 from .mechanism import OperatorPlan
 from .program import RecipeBook
+from .results import RankOps, ResolvedBase
 from .streams import StreamPlan, lower_stream_edges
 
 

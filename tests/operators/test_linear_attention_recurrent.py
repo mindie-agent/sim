@@ -682,3 +682,45 @@ def test_shard2_verify_lengths_fp32_ub_and_nonzero_compulsory_spec_work():
     ameta = dict(act_op.metadata)
     assert ameta["activation_compute_dtype"] == "fp32" and ameta["ub_working_bytes_per_elem"] == 4
     assert ameta["activation_params"] == {"activation": "situ", "beta": 4.0, "linear_beta": 25.0}
+
+
+def test_gdn_decode_fp32_decay_record_size_and_mixed_prefill_recover_ssm_runtime() -> None:
+    """GDN decode stamps recurrent_attention_kind='gdn' (1,028 B); mixed prefill forwards runtime."""
+    from mindie_sim.compose import compose_case
+    from mindie_sim.prediction.frontend import Frontend
+    from mindie_sim.prediction.operators.recurrent.recover_ssm_work import (
+        gdn_record_head_bytes,
+        record_head_bytes,
+    )
+    from mindie_sim.prediction.structure import parse_case
+    from mindie_sim.schema.workload import IterationPlan, RequestView
+
+    # 1. GDN record is 1,028 B (u:512 + k:256 + g_fp32:4 + v:256) vs KDA 1,024 B.
+    assert gdn_record_head_bytes(128, 128) == 1028
+    assert record_head_bytes(128, 128) == 1024
+
+    raw = compose_case(
+        "qwen3.8-flash-next", REPRESENTATIVE_SKUS["a5"],
+        layers=4, tp=1, dp=1, ep=1, mtp_proposal_tokens=3, feature_track="unmerged_pr",
+    )
+    case = parse_case(raw)
+    rt_meta = dict(case.runtime.metadata)
+    rt_meta["recover_ssm"] = True
+    rec_rt = replace(case.runtime, metadata=tuple(rt_meta.items()))
+
+    # 2. Pure speculative decode stamps recurrent_attention_kind == 'gdn'.
+    dec_plan = IterationPlan((
+        RequestView("d0", 4, 128, True, "decode", draft_proposal_tokens=3, draft_advanced_tokens=2),
+    ))
+    dec_work = Frontend()(dec_plan, case.model, rec_rt, case.machine)
+    dec_scans = [op for op in dec_work.ops if op.op_id.endswith(".decode_recurrent_scan")]
+    assert dec_scans and all(dict(op.metadata).get("recurrent_attention_kind") == "gdn" for op in dec_scans)
+
+    # 3. Mixed prefill + speculative decode forwards runtime and emits recover_ssm_commit.
+    mixed_plan = IterationPlan((
+        RequestView("p0", 64, 64, False, "prefill"),
+        RequestView("d1", 4, 128, True, "decode", draft_proposal_tokens=3, draft_advanced_tokens=2),
+    ))
+    mixed_work = Frontend()(mixed_plan, case.model, rec_rt, case.machine)
+    commit_ops = [op for op in mixed_work.ops if "recover_ssm_commit" in op.op_id]
+    assert commit_ops, "mixed prefill+verify batch must emit RecoverSSM commit op"

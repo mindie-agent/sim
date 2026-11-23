@@ -44,8 +44,8 @@ from mindie_sim.schema.hardware import Hardware
 from mindie_sim.schema.model import RequestSpec, WorkloadSpec
 from mindie_sim.schema.operators import IterationWork, OpSpec
 from mindie_sim.schema.parallel import ParallelSpec
+from mindie_sim.feature_mechanisms import RUNTIME_STACKS
 from mindie_sim.schema.runtime_features import normalize_case_runtime, normalize_runtime_features, split_routing_features
-from mindie_sim.stack_tracks import RUNTIME_STACKS
 from scripts.audit_stack_prs import main as audit_stack_main
 from tools.deployment_generalization import compare_sweep, plan_scheme, scaled_case
 

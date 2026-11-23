@@ -150,6 +150,30 @@ class QuantSpec:
     #: proves storage; the runtime table may declare a deployment-selected cast.
     norm_storage: tuple[tuple[str, str], ...] = ()
     norm_runtime: tuple[tuple[str, str], ...] = ()
+    layer_quant_overrides: tuple[tuple[str, Any], ...] = ()
+
+    @staticmethod
+    def _freeze_override_value(value: Any) -> Any:
+        if isinstance(value, Mapping):
+            return tuple(sorted((str(k), QuantSpec._freeze_override_value(v)) for k, v in value.items()))
+        if isinstance(value, (list, tuple)):
+            return tuple(QuantSpec._freeze_override_value(item) for item in value)
+        return value
+
+    @staticmethod
+    def _thaw_override_value(value: Any) -> Any:
+        if isinstance(value, tuple):
+            if value and all(isinstance(item, tuple) and len(item) == 2 and isinstance(item[0], str) for item in value):
+                return {k: QuantSpec._thaw_override_value(v) for k, v in value}
+            return tuple(QuantSpec._thaw_override_value(item) for item in value)
+        return value
+
+    def layer_quant_overrides_dict(self) -> dict[str, Any]:
+        """Return mutable mapping view of per-layer quant overrides (e.g. ``native_layers``)."""
+        if not self.layer_quant_overrides:
+            return {}
+        thawed = self._thaw_override_value(self.layer_quant_overrides)
+        return dict(thawed) if isinstance(thawed, Mapping) else {}
 
     def __post_init__(self):
         if self.int8_weight_metadata not in {"scale_only", "scale_offset"}:
@@ -217,6 +241,11 @@ class QuantSpec:
                 object.__setattr__(self, "category_overrides", tuple(
                     (category, fields) for category, fields in self.category_overrides
                     if category != "norm"))
+        if self.layer_quant_overrides:
+            frozen_layer_ov = self._freeze_override_value(self.layer_quant_overrides)
+            object.__setattr__(self, "layer_quant_overrides", frozen_layer_ov if isinstance(frozen_layer_ov, tuple) else ())
+        else:
+            object.__setattr__(self, "layer_quant_overrides", ())
 
     def for_category(self, category: str) -> "QuantSpec":
         """Resolve family defaults then progressively more specific roles."""
@@ -472,6 +501,7 @@ class QuantSpec:
             "runtime_int8_weight_metadata": self.runtime_int8_weight_metadata, "output_format": self.output_format,
             "norm_storage": dict(self.norm_storage), "norm_runtime": dict(self.norm_runtime),
             "category_overrides": {cat: dict(fields) for cat, fields in self.category_overrides},
+            **({"layer_quant_overrides": self.layer_quant_overrides_dict()} if self.layer_quant_overrides else {}),
             "source": dict(self.source), "notes": list(self.notes),
         }
 

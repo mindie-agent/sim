@@ -145,7 +145,7 @@ STD_COL_WIDTHS = (
 MEAS_COL_WIDTHS = (
     28.0, 22.0, 24.0, 24.0, 24.0, 28.0, 12.0, 14.0, 14.0, 28.0, 14.0, 14.0, 12.0, 20.0,
 )
-_LEGACY_BACKEND_RE = re.compile(r"cannbot[-_]?dsl|cannbot", re.IGNORECASE)
+_LEGACY_BACKEND_RE = re.compile(r"legacy[-_]?dsl", re.IGNORECASE)
 
 
 @dataclass(frozen=True, slots=True)

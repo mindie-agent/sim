@@ -35,7 +35,7 @@ from mindie_sim.structure.native import (
 
 VALID_BLOCKS = frozenset({"embedding", "attention", "ffn", "logits", "spec_verify"})
 VALID_BACKEND_STACKS = frozenset({
-    "aclnn", "cannbot_dsl", "triton", "torch_npu", "hccl", "mc2", "view_reshape",
+    "aclnn", "tilelang", "triton", "torch_npu", "hccl", "mc2", "view_reshape",
 })
 VALID_READINESS = frozenset({"existing", "framework_enable", "new_kernel_required"})
 BANNED_SUBMODULES = frozenset({"", "other", "unknown", "none", "n/a", "misc"})
@@ -122,7 +122,7 @@ _RECIPE_REGISTRY: dict[tuple[str, str], OperatorRecipeSpec] = _expand_recipes((
     ("elementwise", ("dcp_query_pack", "dcp_output_pack"), _s("attention", "DCP Tensor Pack", "aclnn", ("Cat", "TensorMove"), "vllm-ascend/vllm_ascend/attention/context_parallel/dcp.py")),
     ("elementwise", ("attention_gate", "gated_output"), _s("attention", "Attention Output Gate", "aclnn", ("Mul", "Sigmoid"), "vllm-ascend/vllm_ascend/attention/attention_v1.py")),
     ("elementwise", ("rotary",), _s("attention", "Rotary Position Embedding", "aclnn", ("RotaryPositionEmbedding", "InplacePartialRotaryMul"), "cann/ops-transformer/attention/rope")),
-    ("elementwise", ("compress_pool", "index_compress_pool"), _s("attention", "KV Compression Pooling", "cannbot_dsl", ("Compressor", "KeyPoolCompress"), "vllm-ascend/vllm_ascend/models/deepseek_v4/compressor.py", "framework_enable")),
+    ("elementwise", ("compress_pool", "index_compress_pool"), _s("attention", "KV Compression Pooling", "tilelang", ("Compressor", "KeyPoolCompress"), "vllm-ascend/vllm_ascend/models/deepseek_v4/compressor.py", "framework_enable")),
     ("elementwise", ("index_key_basis_scale", "index_query_basis_scale"), _s("attention", "DSA Indexer Basis Scale", "aclnn", ("Mul", "Muls"), "vllm-ascend/vllm_ascend/attention/sfa_v1.py")),
     ("elementwise", ("qk_l2norm",), _s("attention", "Recurrent QK L2Norm", "triton", ("l2norm_fwd_kernel2",), "vllm-ascend/vllm_ascend/ops/gdn.py", conditions=(("scope", "declared_qk_normalization; native_row_layout_not_selected"),))),
     ("elementwise", ("decode_q_l2norm", "decode_k_l2norm"), _s("attention", "Recurrent QK L2Norm", "triton", ("l2norm_fwd_kernel2", "L2Normalize"), "vllm-ascend/vllm_ascend/ops/gdn.py")),
@@ -145,7 +145,7 @@ _RECIPE_REGISTRY: dict[tuple[str, str], OperatorRecipeSpec] = _expand_recipes((
     ("cache_store", ("kv_store", "compressed_store", "index_store", "cann_keypool_cache_write"), _s("attention", "KV/Index Cache Write", "aclnn", ("ReshapeAndCache", "ScatterPaKvCache"), "cann/ops-transformer/attention/reshape_and_cache")),
     ("kv_compress_epilog", ("kv_store", "compressed_store"), _s("attention", "KV Compress Cache Epilog", "aclnn", ("aclnnKvCompressEpilog", "ReshapeAndCache"), "cann/ops-transformer/attention/kv_compress_epilog")),
     ("indexer", ("index_scores",), _s("attention", "DSA Indexer Score", "aclnn", ("LightningIndexer", "QuantLightningIndexerV2"), "cann/ops-transformer/attention/quant_lightning_indexer_v2")),
-    ("indexer", ("index_online_topk",), _s("attention", "DSA Indexer Online TopK", "cannbot_dsl", ("QuantSparseLightningIndexer", "LightningIndexerTopK"), "cann/cannbot-dsl/samples/attention/lightning_indexer", "framework_enable")),
+    ("indexer", ("index_online_topk",), _s("attention", "DSA Indexer Online TopK", "tilelang", ("QuantSparseLightningIndexer", "LightningIndexerTopK"), "vllm-ascend/vllm_ascend/attention/sfa_v1.py", "framework_enable")),
     ("topk", ("index_topk", "candidate_merge"), _s("attention", "DSA Indexer TopK", "aclnn", ("TopKV2", "LightningIndexer"), "cann/ops-transformer/attention/quant_lightning_indexer_v2")),
     ("sigmoid", ("attention_q_gate_sigmoid", "linear_beta_sigmoid"), _s("attention", "Attention Gate Sigmoid", "aclnn", ("Sigmoid",), "torch_npu/aclnn/sigmoid")),
     ("elementwise", ("residual_add",), _s("ffn", "Residual Connection", "aclnn", ("Add",), "torch_npu/aclnn/add")),
@@ -340,7 +340,7 @@ _FAMILY_REGISTRY: dict[str, OperatorRecipeSpec] = {
     "reduce_scatter": _s("ffn", "HCCL ReduceScatter", "hccl", ("hcom_reduceScatter",), "cann/hccl/reduce_scatter"),
     "release": _s("attention", "Buffer Release Marker", "view_reshape", (), "torch_npu/runtime/memory_release"),
     "relu": _s("ffn", "ReLU Activation", "aclnn", ("Relu",), "torch_npu/aclnn/relu"),
-    "rewrite_fused": _s("attention", "DSL Fused Region", "cannbot_dsl", ("CannbotDslFusedKernel",), "cann/cannbot-dsl/samples", "framework_enable"),
+    "rewrite_fused": _s("attention", "TileLang Fused Region", "tilelang", ("TileLangFusedKernel",), "tilelang-ascend/kernels/fused_regions", "framework_enable"),
     "rmsnorm": _s("attention", "RMSNorm", "aclnn", ("RmsNorm",), "cann/ops-transformer/norm/rms_norm"),
     "rmsnorm_quant": _s("attention", "Fused RMSNorm + Dynamic Quant", "aclnn", ("RmsNormQuant", "AddRmsNormQuant"), "cann/ops-transformer/norm/rms_norm_quant"),
     "rotary": _s("attention", "Rotary Position Embedding", "aclnn", ("InplacePartialRotaryMul", "_triton_rope_siso"), "cann/ops-transformer/attention/rope", conditions=(("native_layout_and_rotary_partition_not_selected", True),)),
@@ -398,8 +398,8 @@ def _infer_backend_stack(kinds: tuple[str, ...], default_stack: str) -> str:
         return "hccl"
     if any(tok in lower for tok in ("moedistribute", "megamoe")):
         return "mc2"
-    if lower.startswith(("dsl.", "cannbot_dsl.")) or first in {"Compressor", "QuantSparseLightningIndexer"}:
-        return "cannbot_dsl"
+    if lower.startswith(("dsl.", "tilelang.")) or first in {"Compressor", "QuantSparseLightningIndexer", "TileLangFusedKernel"}:
+        return "tilelang"
     if (lower.endswith("_kernel") or "_kernel" in lower
             or first.startswith(("ChunkGatedDeltaRule", "ChunkFwd", "ChunkKda", "RecurrentKda",
                                  "RecurrentGatedDeltaRule", "PoolKey", "SolveTril"))):

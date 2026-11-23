@@ -420,6 +420,8 @@ def _attach_checkpoint_quant(
         meta["checkpoint_repo_id"] = repo_id
     if quant_spec is not None:
         meta["checkpoint_quant_declared"] = True
+        if getattr(quant_spec, "layer_quant_overrides", ()) and "layer_quant_overrides" not in meta:
+            meta["layer_quant_overrides"] = quant_spec.layer_quant_overrides_dict()
         return replace(
             spec,
             quant=quant_spec,
@@ -745,11 +747,15 @@ def _apply_quant_override(
     machine: Mapping[str, Any],
 ) -> ModelSpec:
     if isinstance(quant, QuantSpec):
+        meta = dict(model_spec.metadata)
+        if getattr(quant, "layer_quant_overrides", ()) and "layer_quant_overrides" not in meta:
+            meta["layer_quant_overrides"] = quant.layer_quant_overrides_dict()
         updated = replace(
             model_spec,
             quant=quant,
             quantization=str(quant.name),
             kv_dtype=str(quant.kv_dtype),
+            metadata=tuple(sorted(meta.items())),
         )
         _validate_explicit_quant_for_hardware(updated, machine, quant.name)
         return updated

@@ -165,10 +165,9 @@ def _decode_mla_recipe_for_sku(sku: str, *, profile_override: Mapping[str, Any] 
 def _lower_one_layer_cached(sku: str, prof_sha: str, topo: str, phase: str, q_tok: int, ctx_len: int, seqs: int) -> tuple[dict[str, Any], ...]:
     del prof_sha
     from mindie_sim.compose import compose_case as compose_case_dict
-    from mindie_sim.prediction.results import StepRequest
+    from mindie_sim.prediction.results import LoweringRequest, StepRequest
     from mindie_sim.prediction.spine import default_spine
     from mindie_sim.prediction.structure import parse_case
-    from mindie_sim.stack_registry import LoweringRequest
 
     raw = compose_case_dict(model=_DEFAULT_SIM_MODEL, hardware=sku, **parse_topo_options(topo))
     md = dict(raw["model"])

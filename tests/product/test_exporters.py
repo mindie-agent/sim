@@ -885,7 +885,7 @@ def test_exporter_rebound_primitives_horizon_pp_conservation_formulas_and_brief_
 
     # 2. Fixed per-request state buffers stay non-zero in Sheet 3 Excel formulas even with 0 target layers.
     fixed_row = replace(
-        b_target.memory_ledger.cache_rows[0],
+        b_base_pt.memory_ledger.cache_rows[0],
         component="draft_state",
         max_stage_layers=0,
         bytes_per_token_per_layer=0.0,
@@ -893,8 +893,8 @@ def test_exporter_rebound_primitives_horizon_pp_conservation_formulas_and_brief_
         batch_total_bytes=16 * 1024 * 1024,
         scales_with_tokens=False,
     )
-    led_fixed = replace(b_target.memory_ledger, cache_rows=(*b_target.memory_ledger.cache_rows, fixed_row))
-    bun_fixed = replace(b_target, memory_ledger=led_fixed)
+    led_fixed = replace(b_base_pt.memory_ledger, cache_rows=(*b_base_pt.memory_ledger.cache_rows, fixed_row))
+    bun_fixed = replace(b_base_pt, memory_ledger=led_fixed)
     fixed_xlsx = tmp_path / "fixed_state_and_formulas.xlsx"
     b_bef = build_export_bundle(raw_c, request=req, apply_target_envelope=False)
     b_bef_frac = replace(b_bef, n_tok_per_die=0.0546875, us_per_tok_die=b_bef.step_span_us / 0.0546875)

@@ -378,7 +378,7 @@ class _FrontendBody:
             topks = topk_scope
         residual_sources = []
         attnres = (_frontend.family_attnres.selection(
-            runtime, model=model, phase=mode)
+            runtime, model=model, phase=mode, machine=machine)
             if (tokens and mode not in {"draft", "draft_prefill"}) else None)
         attn_state = None
         if attnres is not None:

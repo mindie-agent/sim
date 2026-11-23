@@ -49,7 +49,7 @@ from mindie_sim.schema.datapath import datapath_for_die
 from mindie_sim.schema.hardware import Device
 from mindie_sim.schema.hardware_links import Link
 from mindie_sim.schema.operators import OpSpec
-from mindie_sim.stack_registry import LoweringRequest
+from mindie_sim.prediction.results import LoweringRequest
 from mindie_sim.templates import catlass_lower, compile_fuse_region, registry as templates_registry
 from mindie_sim.templates.catlass_catalog import CatlassProblem, enumerate_catlass_specs
 from _support.axes import REPRESENTATIVE_SKUS

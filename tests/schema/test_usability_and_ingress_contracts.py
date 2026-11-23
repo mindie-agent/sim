@@ -378,8 +378,9 @@ def test_v5_five_content_bugs_regression_locks() -> None:
         demands.append((0, 1000, 0, 0, 0))
     c_rows, c_dems = _collapse_micro_split_ops(rows, demands)
     assert len(c_rows) == 1 and c_rows[0].op_id == "s0.recover_ssm_commit"
-    assert math.isclose(c_rows[0].dur_us, 69.0) and math.isclose(c_rows[0].start_us, 100.0)
-    assert "(×69 layers)" in c_rows[0].logical_role and len(c_dems) == 1
+    assert c_rows[0].repeat_count == 69
+    assert math.isclose(c_rows[0].dur_us * c_rows[0].repeat_count, 69.0) and math.isclose(c_rows[0].start_us, 100.0)
+    assert "RecoverSSM" in c_rows[0].logical_role and "(×69 layers)" not in c_rows[0].logical_role and len(c_dems) == 1
 
     # Bug 3: Sheet 1 [A] effective config hides feature_track & raw moe_route dict while exposing clean scalars.
     pub = _public_effective_config(SimpleNamespace(effective_config={

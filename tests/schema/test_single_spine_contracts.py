@@ -78,8 +78,8 @@ from mindie_sim.schema.stack import (
     StreamSyncEdge,
     WaitForEvent,
 )
+from mindie_sim.prediction.results import LoweringRequest
 from mindie_sim.schema.workload import RequestView
-from mindie_sim.stack_registry import LoweringRequest
 import scripts.check_arch_governance as arch_gov
 
 pytestmark = pytest.mark.tier0

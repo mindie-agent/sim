@@ -620,9 +620,8 @@ class WhiteboxSpineRunner:
         return sim_case
 
     def _run_level(self, case: GateCase, *, expected_level: str) -> EngineInterval:
-        from mindie_sim.prediction.results import StepRequest
+        from mindie_sim.prediction.results import LoweringRequest, StepRequest
         from mindie_sim.prediction.spine import default_spine
-        from mindie_sim.stack_registry import LoweringRequest
 
         payload = dict(case.payload)
         sim_case = self._materialize_case(case, payload)

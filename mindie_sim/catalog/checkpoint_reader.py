@@ -112,7 +112,7 @@ KNOWN_MODELSLIM_TAGS_UPPER = frozenset(
     for tag in (KNOWN_MODELSLIM_WEIGHT_TAGS | KNOWN_MODELSLIM_CACHE_TAGS)
 )
 _SUPPORTED_HF_QUANT_METHODS = frozenset({
-    "fp8", "mxfp8", "compressed-tensors", "awq", "gptq", "quark", "ascend",
+    "fp8", "mxfp8", "mxfp4", "compressed-tensors", "awq", "gptq", "quark", "ascend",
 })
 
 _MX_BASE: dict[str, Any] = {
@@ -910,6 +910,28 @@ def _build_hf_mxfp8_rules(
     return "MXFP8", rules, CacheQuantRule()
 
 
+def _build_hf_mxfp4_rules(
+    qcfg: Mapping[str, Any],
+    native: str,
+) -> tuple[str, tuple[TensorQuantRule, ...], CacheQuantRule]:
+    block = _hf_block_tuple(qcfg.get("weight_block_size"), (1, MXFP_GROUP_SIZE))
+    scale = _hf_scale_dtype(qcfg.get("scale_fmt"), "fp8_e8m0")
+    act_raw = str(qcfg.get("activation_dtype") or qcfg.get("act_dtype") or "").strip().lower()
+    act_dtype = "fp8_e4m3" if "fp8" in act_raw else ("fp4_e2m1" if "fp4" in act_raw else (native or "bf16"))
+    rules = (
+        TensorQuantRule(
+            pattern="*",
+            raw_tag="W4A8_MXFP",
+            weight_dtype="mxfp4",
+            activation_dtype=act_dtype,
+            scale_dtype=scale,
+            group_size=block,
+            symmetric=True,
+        ),
+    )
+    return "MXFP4", rules, CacheQuantRule()
+
+
 def _build_hf_fp8_rules(
     qcfg: Mapping[str, Any],
     base_config: Mapping[str, Any] | None,
@@ -1094,7 +1116,15 @@ def read_hf_quantization_config(
     """Parse HF ``config.json`` / ``quantization_config`` into ``CheckpointQuantMap``."""
     if not isinstance(config_or_qcfg, Mapping):
         raise ModelingError("hf_quantization_config_requires_mapping")
-    if "quantization_config" in config_or_qcfg:
+    text_cfg = config_or_qcfg.get("text_config")
+    nested_q = text_cfg.get("quantization_config") if isinstance(text_cfg, Mapping) else None
+    if isinstance(config_or_qcfg.get("quantization_config"), Mapping) and config_or_qcfg.get("quantization_config"):
+        cfg_root = config_or_qcfg
+        raw_q = config_or_qcfg.get("quantization_config")
+    elif isinstance(nested_q, Mapping) and nested_q:
+        cfg_root = config_or_qcfg
+        raw_q = nested_q
+    elif "quantization_config" in config_or_qcfg:
         cfg_root = config_or_qcfg
         raw_q = config_or_qcfg.get("quantization_config")
     elif "quant_method" in config_or_qcfg:
@@ -1138,6 +1168,8 @@ def read_hf_quantization_config(
 
     if method == "mxfp8":
         mtype, rules, cache_rule = _build_hf_mxfp8_rules(raw_q)
+    elif method == "mxfp4":
+        mtype, rules, cache_rule = _build_hf_mxfp4_rules(raw_q, native)
     elif method == "fp8":
         mtype, rules, cache_rule = _build_hf_fp8_rules(raw_q, cfg_root)
     elif method == "compressed-tensors":
@@ -1874,6 +1906,36 @@ def _quant_spec_from_hf_map(
     )
 
 
+def _layer_quant_overrides_from_exceptions(
+    qmap: CheckpointQuantMap,
+    *,
+    has_mla: bool,
+    has_kda: bool,
+    native: str,
+) -> dict[str, Any]:
+    """Project target-scope per-layer exceptions onto ``layer_quant_overrides.native_layers``."""
+    if not qmap.layer_exceptions:
+        return {}
+    skip_cats = {"norm", "router", "lm_head", "embedding", "vision", "projector"}
+    native_layers: dict[str, dict[str, Any]] = {}
+    for exc in qmap.layer_exceptions:
+        if exc.scope != "target" or not exc.layer_indices:
+            continue
+        cats = [
+            cat for cat in classify_tensor_categories(exc.pattern, has_mla=has_mla, has_kda=has_kda)
+            if cat not in skip_cats
+        ]
+        if not cats:
+            continue
+        fields = _override_fields_for_tag(exc.raw_tag, native)
+        for layer_id in exc.layer_indices:
+            entry = native_layers.setdefault(str(int(layer_id)), {"category_overrides": {}})
+            cat_map = entry["category_overrides"]
+            for cat in cats:
+                cat_map[cat] = dict(fields)
+    return {"native_layers": native_layers} if native_layers else {}
+
+
 def quant_spec_from_checkpoint_map(
     qmap: CheckpointQuantMap,
     *,
@@ -1973,6 +2035,9 @@ def quant_spec_from_checkpoint_map(
         **({"checkpoint": qmap.checkpoint_id} if qmap.checkpoint_id else {}),
         **({"checkpoint_url": checkpoint_url} if checkpoint_url else {}),
     }
+    layer_overrides = _layer_quant_overrides_from_exceptions(
+        qmap, has_mla=has_mla, has_kda=has_kda, native=native,
+    )
     return QuantSpec(
         name=name,
         weight_format=lin_spec["weight_format"] if lin_spec["is_quantized"] else native,
@@ -1990,6 +2055,7 @@ def quant_spec_from_checkpoint_map(
         activation_scale_format=str(lin_spec["activation_scale_format"]),
         activation_scale_pack=int(lin_spec["activation_scale_pack"]),
         category_overrides=overrides,
+        layer_quant_overrides=layer_overrides,
         native_format=native,
         runtime_weight_scale_format=str(lin_spec.get("runtime_weight_scale_format", "")),
         runtime_weight_scale_bytes=float(lin_spec.get("runtime_weight_scale_bytes", 0.0)),

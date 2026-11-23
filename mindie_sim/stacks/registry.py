@@ -27,6 +27,7 @@ from pathlib import Path
 import threading
 from typing import Any
 
+from mindie_sim.catalog.checkpoint_reader import resolve_checkpoint_tensor_tag
 from mindie_sim.schema.checkpoint import CheckpointQuantMap, TensorQuantRule
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.hardware import Hardware
@@ -568,12 +569,17 @@ class ManifestStackAdapter:
             native_id = plan.native_layer_id if plan.native_layer_id >= 0 else plan.index
             for logical_role in roles:
                 tensor_path = f"{prefix}.{native_id}.{logical_role}"
-                raw_tag = checkpoint.resolve_raw_tag(
+                raw_tag = resolve_checkpoint_tensor_tag(
+                    checkpoint,
                     tensor_path,
                     scope="target",
                     source_native_layer_id=native_id,
                 )
-                matched = rule_by_pattern.get(f"{prefix}.*.{logical_role}")
+                matched = (
+                    rule_by_pattern.get(f"{prefix}.*.{logical_role}")
+                    or (rule_by_pattern.get("*.experts.*") if "experts." in logical_role else None)
+                    or rule_by_pattern.get("*")
+                )
                 tag = raw_tag if raw_tag is not None else (checkpoint.model_quant_type or "FLOAT")
                 abi = _manifest_abi_for_tag(tag, native_dtype, matched)
                 port_abis.append((("target", plan.index, logical_role), abi))

@@ -70,7 +70,7 @@ SOURCES: tuple[SourceRef, ...] = (
         source_sha256="140a54a09528a931e89512c4e2bc4c50b75c458c3b05735a256af8b875b7c28d",
     ),
     SourceRef(
-        repository="cann/cannbot-dsl",
+        repository="tilelang-ascend/kernels",
         revision="5e7ace8cdcc16a5b062ba69d8fdf93d4f1d62223",
         relative_path="samples/attention/quant_sparse_lightning_indexer/quant_sparse_lightning_indexer.py",
         source_sha256="a6572f3fd8455b6888f1ffb456ae764db2bbc99cf529f9d7cde6ba76c6927c73",

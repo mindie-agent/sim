@@ -619,3 +619,141 @@ def test_exposed_observer_sweep_line_parity_and_subsecond_93_layer_speed() -> No
     assert big_obs.conservation_delta_ns == 0
     assert sum(big_obs.exposed_ns_by_op.values()) + big_obs.idle_or_wait_ns == big_obs.terminal_ns - big_obs.start_ns
     assert len(big_obs.exposed_ns_by_op) == SYNTHETIC_DEPTH_LAYERS * SYNTHETIC_OPS_PER_LAYER
+
+
+def test_synthesis_dp_tuples_causal_tail_no_byte_inflation_opportunity_bounds_and_clean_backends() -> None:
+    """Verify DP tuple safety, causal-tail conservation, opportunity scoping, and zero cannbot backends."""
+    from mindie_sim import structure_implementations as si_mod
+
+    # 1. DP>=2 tuple StepRequest.sequences never raises TypeError in _peak_sequences_per_dp.
+    raw = compose_case("qwen3-32b", GEN5_DT_SKU, tp=1, dp=2, layers=2, prompt_tokens=32, output_tokens=2)
+    dp2_case = parse_case(raw)
+    dp_req = StepRequest(phase="decode", tokens=(8, 8), context=256, sequences=(8, 8), scope="body")
+    assert ks_mod._peak_sequences_per_dp(dp_req, dp2_case) == 8
+
+    # 2. _node_physical_demand_and_placement never fabricates memory@die bytes from contended dur_us.
+    dp_cap, rates, peaks, svc_modes, link_bps = causal_tail_mod._effective_die_supply(
+        dp2_case.machine.dies[0], dp2_case.machine.links, dp2_case.machine.transfer_channels,
+    )
+    contended_node = replace(
+        _make_target_node(
+            ordinal=0, op_id="s0.l0.v", family="elementwise", recipe="add",
+            dur_us=500.0, l_star_us=12.0, vector_ops=1024.0, hbm_bytes=2048.0,
+        ),
+        exposed_dur_us=50.0, is_overlapped=True,
+        hbm_read_bytes=1024.0, hbm_write_bytes=1024.0, hbm_total_bytes=2048.0,
+    )
+    demand, _place, lat_ms, _act = causal_tail_mod._node_physical_demand_and_placement(
+        contended_node, die_tag="d0", lane_id="main", datapath=dp_cap, rates=rates, peaks=peaks,
+        service_modes=svc_modes, link_bps=link_bps, owners=None, has_topology_plan=False, launch_floor_us=0.0,
+    )
+    hbm_peak = float(rates.get("hbm") or max(dp_cap.hbm_read_bytes_per_s, dp_cap.hbm_write_bytes_per_s))
+    eff_hbm = causal_tail_mod._effective_hbm_rate_bps(1024.0, 1024.0, hbm_peak, svc_modes)
+    assert demand.get("memory@d0", 0.0) == pytest.approx(2048.0 * (hbm_peak / eff_hbm))
+    assert lat_ms == pytest.approx(0.012)
+
+    # 3. Unaggregated hybrid nodes (repeat_count==1) preserve native ordinal order with zero arch_barrier.
+    n0 = replace(
+        _make_target_node(ordinal=0, op_id="l0.gdn", family="elementwise", recipe="add", dur_us=5.0, l_star_us=1.0, vector_ops=1024.0, hbm_bytes=4096.0),
+        archetype_id="gdn", start_us=0.0, end_us=5.0,
+    )
+    n1 = replace(
+        _make_target_node(ordinal=1, op_id="l1.attn", family="elementwise", recipe="add", dur_us=5.0, l_star_us=1.0, vector_ops=1024.0, hbm_bytes=4096.0, preds=(n0.occurrence,)),
+        archetype_id="attn", start_us=5.0, end_us=10.0,
+    )
+    n2 = replace(
+        _make_target_node(ordinal=2, op_id="l2.gdn", family="elementwise", recipe="add", dur_us=5.0, l_star_us=1.0, vector_ops=1024.0, hbm_bytes=4096.0, preds=(n1.occurrence,)),
+        archetype_id="gdn", start_us=10.0, end_us=15.0,
+    )
+    sched = causal_tail_mod.schedule_target_graph_on_engine((n0, n1, n2), dp2_case)
+    assert [n.op_id for n in sched.nodes] == ["l0.gdn", "l1.attn", "l2.gdn"]
+    assert sched.nodes[0].start_us < sched.nodes[1].start_us < sched.nodes[2].start_us
+
+    # 4. RecoverSSM commit-only match, PP-stage MLA split, Engram lookup-only H2D, and MegaFusion exposed_before_ms.
+    verify_node = _make_target_node(
+        ordinal=0, op_id="l0.scan", family="gdn_state", recipe="gdn_arch35_recover_ssm_verify", dur_us=10.0, l_star_us=1.0,
+    )
+    verify_node = replace(
+        verify_node, spec=replace(verify_node.spec, metadata=(("recover_ssm_stage", "verify_compact_record"),)),
+    )
+    commit_node = _make_target_node(
+        ordinal=1, op_id="l0.commit", family="recover_ssm", recipe="aclnnRecoverSsmState", dur_us=10.0, l_star_us=1.0,
+    )
+    commit_node = replace(
+        commit_node, spec=replace(commit_node.spec, metadata=(("recover_ssm_stage", "commit"),)),
+    )
+    assert not ks_mod._is_recover_ssm_commit_node(verify_node)
+    assert ks_mod._is_recover_ssm_commit_node(commit_node)
+
+    pp2_case = replace(dp2_case, runtime=replace(dp2_case.runtime, parallel=replace(dp2_case.runtime.parallel, pp=2)))
+    stage_max = ks_mod._max_pp_stage_bytes(pp2_case, pp2_case.model.layer_plans, lambda _lp: 1000)
+    assert stage_max == 1000
+
+    gate_node = replace(
+        _make_target_node(ordinal=0, op_id="l1.engram_gate_proj", family="matmul", recipe="matmul", dur_us=10.0, l_star_us=1.0, hbm_bytes=999_999.0),
+        hbm_write_bytes=500_000.0,
+    )
+    rh2d_node = _make_target_node(
+        ordinal=1, op_id="l1.rh2d", family="engram_rh2d", recipe="engram_cpu_decode_pinned_staging_h2d",
+        dur_us=5.0, l_star_us=1.0, hbm_bytes=8192.0,
+    )
+    rh2d_node = replace(
+        rh2d_node, spec=replace(rh2d_node.spec, metadata=(("resource_work", {"h2d": 4096.0}),)),
+    )
+    assert ks_mod._engram_lookup_h2d_bytes((gate_node, rh2d_node)) == pytest.approx(4096.0)
+
+    # 4b. MegaFusionBound.exposed_before_ms uses conserved exposed_before_us, and stage waterfall has zero scalar clamping.
+    spec_exp = ks_mod.KernelSynthesisSpec(
+        spec_id="mf_test",
+        kernel_name="tilelang_elem_chain",
+        abi_tier="unbound_formula",
+        suggested_backend=BACKEND_TILELANG_LABEL,
+        status_tag="TO_IMPLEMENT",
+        opt_pillar="kernel_fusion",
+        constituent_op_ids=("l0.a", "l0.b"),
+        constituent_traits=("elementwise", "elementwise"),
+        symbolic_equations=("y = (a + b) * c",),
+        input_tensors=("a", "b", "c"),
+        output_tensors=("y",),
+        elided_intermediates=("tmp",),
+        elided_hbm_bytes=4096,
+        tile_algorithm="row_tile",
+        tile_shape="(16, 128)",
+        ub_precision_mode="fp32_accum",
+        ub_peak_bytes=16384,
+        ub_budget_bytes=262144,
+        l1_peak_bytes=0,
+        l1_budget_bytes=524288,
+        l0_peak_bytes=0,
+        l0_budget_bytes=65536,
+        sram_verified=True,
+        l_star_us=30.0,
+        before_us=120.0,
+        target_us=40.0,
+        target_attainment_pct=75.0,
+        exposed_before_us=55.0,
+    )
+    opps = ks_mod._collect_codesign_opportunities(
+        dp2_case, (), (spec_exp,), (), primitive_table=None, step_request=dp_req,
+    )
+    mf_opps = [o for o in opps if o.mega_fusion is not None]
+    assert mf_opps and mf_opps[0].mega_fusion is not None
+    assert mf_opps[0].mega_fusion.exposed_before_ms == pytest.approx(0.055)
+
+    def _sched_of(span_us: float) -> causal_tail_mod.DieScheduleResult:
+        node = replace(n0, start_us=0.0, end_us=span_us, dur_us=span_us, exposed_dur_us=span_us)
+        return causal_tail_mod.DieScheduleResult((node,), {"gdn": span_us}, 0.0, span_us, span_us, {}, "", 0.0)
+
+    wf = ks_mod._build_stage_waterfall(
+        "modeling",
+        {"before": _sched_of(100.0), "config_only": _sched_of(90.0), "framework_rewrite": _sched_of(80.0), "after": _sched_of(70.0)},
+    )
+    assert [row["step_span_us"] for row in wf] == pytest.approx([100.0, 90.0, 80.0, 70.0])
+
+    # 5. structure_implementations exposes zero cannbot_dsl backends or paths.
+    assert "cannbot_dsl" not in si_mod.VALID_BACKEND_STACKS
+    assert "tilelang" in si_mod.VALID_BACKEND_STACKS
+    for spec in (*si_mod._RECIPE_REGISTRY.values(), *si_mod._FAMILY_REGISTRY.values()):
+        assert "cannbot" not in spec.backend_stack.lower()
+        assert "cannbot" not in spec.source_ref.lower()
+        assert all("cannbot" not in k.lower() for k in spec.native_kinds)

@@ -48,8 +48,8 @@ from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.dspark import DsparkSpec
 from mindie_sim.schema.operators import OpSpec
+from mindie_sim.feature_mechanisms import RUNTIME_STACKS, resolve_stack_track
 from mindie_sim.schema.workload import IterationPlan, RequestView
-from mindie_sim.stack_tracks import RUNTIME_STACKS, resolve_stack_track
 from tools.kimi_call_scopes import SITU_DOWN, SITU_INPUT, SITU_QUANT, situ_reference
 
 pytestmark = pytest.mark.tier0

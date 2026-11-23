@@ -479,7 +479,9 @@ def layer_cache_components(model: Any, plan: Any, parallel: ParallelSpec,
         if plan.engram and seq > 0:
             from mindie_sim.catalog.qwen4_exp import is_qwen4_exp_ple, ple_conv_state_bytes
             if is_qwen4_exp_ple(getattr(model, "engram", None)):
-                result["ple_conv_state"] = ple_conv_state_bytes(model, runtime)
+                result["ple_conv_state"] = ple_conv_state_bytes(
+                    model, runtime, query_tokens=query_tokens,
+                )
         return result
     if plan.attention == "unmodeled" or plan.cache_kind == "none":
         return result
@@ -517,7 +519,9 @@ def layer_cache_components(model: Any, plan: Any, parallel: ParallelSpec,
     if plan.engram and seq > 0:
         from mindie_sim.catalog.qwen4_exp import is_qwen4_exp_ple, ple_conv_state_bytes
         if is_qwen4_exp_ple(getattr(model, "engram", None)):
-            result["ple_conv_state"] = ple_conv_state_bytes(model, runtime)
+            result["ple_conv_state"] = ple_conv_state_bytes(
+                model, runtime, query_tokens=query_tokens,
+            )
     if plan.owns_index_k:
         index_ratio = max(1, plan.compress_ratio, plan.index_kpool)
         rows = completed_rows(seq, index_ratio)
@@ -669,7 +673,9 @@ def request_cache_breakdown(
             totals[key] = totals.get(key, 0.0) + value
     stage_bytes = [float(sum(stage.values())) for stage in stages]
     from mindie_sim.catalog.qwen4_exp import qwen4_exp_pool_breakdown
-    qwen4_pool = qwen4_exp_pool_breakdown(model, parallel, sequence_tokens, runtime=runtime)
+    qwen4_pool = qwen4_exp_pool_breakdown(
+        model, parallel, sequence_tokens, runtime=runtime, query_tokens=query_tokens,
+    )
     out: dict[str, Any] = {
         "sequence_tokens": int(sequence_tokens),
         "by_component": totals,

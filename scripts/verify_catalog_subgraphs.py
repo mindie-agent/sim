@@ -65,14 +65,13 @@ from mindie_sim.observations.multilevel import (  # noqa: E402
 )
 from mindie_sim.prediction.mechanism import Geometry  # noqa: E402
 from mindie_sim.prediction.program import RecipeBook  # noqa: E402
-from mindie_sim.prediction.results import ReplayOptions, StepRequest  # noqa: E402
+from mindie_sim.prediction.results import LoweringRequest, ReplayOptions, StepRequest  # noqa: E402
 from mindie_sim.prediction.spine import PredictionSpine, PreparedStep, default_spine  # noqa: E402
 from mindie_sim.prediction.structure import parse_case  # noqa: E402
 from mindie_sim.primitives import load_primitives  # noqa: E402
 from mindie_sim.schema.common import ModelingError  # noqa: E402
 from mindie_sim.schema.parallel import ParallelSpec  # noqa: E402
 from mindie_sim.schema.workload import IterationPlan, RequestView  # noqa: E402
-from mindie_sim.stack_registry import LoweringRequest  # noqa: E402
 from tools._fleet_400k_reconcile import nearest_rank_p90  # noqa: E402
 
 PHYSICAL_TOL_PCT = 10.0

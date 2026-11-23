@@ -67,17 +67,17 @@ SOURCES: tuple[SourceRef, ...] = (
         source_sha256="812584ad8fd5b8dbb76fa53fb15648a15d2942fec7c6d23a1fa866355fea13c3",
     ),
     SourceRef(
-        repository="cann/cannbot-dsl", revision=DSL_REVISION,
+        repository="tilelang-ascend/kernels", revision=DSL_REVISION,
         relative_path="samples/attention/flash_kda/flash_kda_metadata.py",
         source_sha256="5033e923d9d63602708918691f75fcf8f210a0782e850d7822090362f4242377",
     ),
     SourceRef(
-        repository="cann/cannbot-dsl", revision=DSL_REVISION,
+        repository="tilelang-ascend/kernels", revision=DSL_REVISION,
         relative_path="samples/attention/flash_kda/flash_kda_persistent.py",
         source_sha256="16f01982db4fc4f053f238e353637ac314cdc4d589ed948a32ee391297d50b08",
     ),
     SourceRef(
-        repository="cann/cannbot-dsl", revision=DSL_REVISION,
+        repository="tilelang-ascend/kernels", revision=DSL_REVISION,
         relative_path="samples/attention/flash_kda/flash_kda_staged.py",
         source_sha256="41957c35307c32dc5326278a01e176325f264bd63d414c059166f12bfd47ac17",
     ),
@@ -87,12 +87,12 @@ SOURCES: tuple[SourceRef, ...] = (
         source_sha256="b8c938e623b4207c5f95b39fd4b8c8422b201b32c2b473918c42a11069c5f582",
     ),
     SourceRef(
-        repository="cann/cannbot-dsl", revision=DSL_REVISION,
+        repository="tilelang-ascend/kernels", revision=DSL_REVISION,
         relative_path="samples/attention/fused_recurrent_kda_snapshot/fused_recurrent_kda_snapshot.py",
         source_sha256="e0e78d2a77126389605ea73972eb8c4da5a3727b877c95cbf019ea644a528352",
     ),
     SourceRef(
-        repository="cann/cannbot-dsl", revision=DSL_REVISION,
+        repository="tilelang-ascend/kernels", revision=DSL_REVISION,
         relative_path="samples/attention/commit_recurrent_kda/commit_recurrent_kda.py",
         source_sha256="81e2ff105aba687f5fb6fc8eadae0149365bb85cf8c01e2889c66a6a906973c4",
     ),

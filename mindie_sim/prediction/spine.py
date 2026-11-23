@@ -21,18 +21,15 @@ from dataclasses import dataclass, replace
 from functools import lru_cache
 from typing import Any
 
+from mindie_sim.feature_mechanisms import (
+    SoftwareStackRegistry,
+    default_stack_registry,
+)
 from mindie_sim.schema.case import Case
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.operators import OpSpec
 from mindie_sim.schema.scenario import ScenarioContract
 from mindie_sim.schema.stack import RuntimeQuantPlan, StackLoweringPlan
-from mindie_sim.stack_registry import (
-    LoweringRequest,
-    OriginKind,
-    ResolvedBase,
-    SoftwareStackRegistry,
-    default_stack_registry,
-)
 from .body_defaults import consume_target_declaration
 from .evaluation import ACTIVE_DEADLINE_MONO, EvaluationContext
 from .graph_analysis import graph_costs
@@ -50,9 +47,12 @@ from .program import RecipeBook
 from .results import (
     FusedPipelineDescriptor,
     JsonObject,
+    LoweringRequest,
     OpOccurrence,
     OperatorSequenceRow,
+    OriginKind,
     ReplayOptions,
+    ResolvedBase,
     ServiceEvaluation,
     SlaCandidate,
     SlaEvaluation,

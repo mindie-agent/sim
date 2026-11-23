@@ -1106,8 +1106,19 @@ class _MemoryLedgerMixin:
             int(sequence_tokens), padded=False, skip_covered=True, query_tokens=query_tokens,
         )
         group_parts = (
-            self._group_cache_parts(int(sequence_tokens))
+            self._group_cache_parts(int(sequence_tokens), query_tokens=query_tokens)
             if self.pages.groups else None
+        )
+        group_payload = (
+            self.pages.stage_bytes(int(sequence_tokens), self.case.runtime.max_model_len, p.pp)
+            if self.pages.groups else None
+        )
+        group_metadata = (
+            self.pages.metadata_stage_bytes(int(sequence_tokens), self.case.runtime.max_model_len, p.pp)
+            if self.pages.groups else None
+        )
+        stage_cache_bytes = self.cache_bytes(
+            int(sequence_tokens), padded=True, query_tokens=query_tokens,
         )
         per_stage: list[dict[str, int]] = []
         for stage in range(p.pp):
@@ -1123,20 +1134,35 @@ class _MemoryLedgerMixin:
                 key = _COMPONENT_POOL_MAP.get(name)
                 if key in valid_pools:
                     valid_pools[key] += float(detail["total"])
-            if group_parts is not None:
+            if group_parts is not None and group_payload is not None and group_metadata is not None:
+                known_group = 0.0
                 for name, detail in group_parts[stage]["components"].items():
                     key = _COMPONENT_POOL_MAP.get(name)
+                    part_alloc = float(detail["alloc_payload"]) + float(detail["alloc_scale"])
                     if key in alloc_pools:
-                        alloc_pools[key] += float(detail["alloc_payload"]) + float(detail["alloc_scale"])
+                        alloc_pools[key] += part_alloc
+                        known_group += part_alloc
                     if key in valid_pools:
                         valid_pools[key] += float(detail["valid_payload"]) + float(detail["valid_scale"])
+                group_reserve = max(0.0, float(group_payload[stage]) - known_group)
+                alloc_pools["target_kv_bytes"] += group_reserve + float(group_metadata[stage])
+            idx_a = int(round(b_int * alloc_pools["indexer_k_bytes"]))
+            rec_a = int(round(b_int * alloc_pools["recurrent_state_bytes"]))
+            drf_a = int(round(b_int * (alloc_pools["draft_kv_bytes"] + alloc_pools["draft_state_bytes"])))
+            expected_total = int(round(b_int * float(stage_cache_bytes[stage])))
+            non_kv = idx_a + rec_a + drf_a
+            kv_a = (
+                expected_total - non_kv
+                if expected_total >= non_kv
+                else int(round(b_int * alloc_pools["target_kv_bytes"]))
+            )
             per_stage.append({
-                "kv_alloc": b_int * int(round(alloc_pools["target_kv_bytes"])),
-                "kv_valid": b_int * int(round(valid_pools["target_kv_bytes"])),
-                "idx_alloc": b_int * int(round(alloc_pools["indexer_k_bytes"])),
-                "idx_valid": b_int * int(round(valid_pools["indexer_k_bytes"])),
-                "rec": b_int * int(round(alloc_pools["recurrent_state_bytes"])),
-                "draft": b_int * int(round(alloc_pools["draft_kv_bytes"] + alloc_pools["draft_state_bytes"])),
+                "kv_alloc": kv_a,
+                "kv_valid": int(round(b_int * valid_pools["target_kv_bytes"])),
+                "idx_alloc": idx_a,
+                "idx_valid": int(round(b_int * valid_pools["indexer_k_bytes"])),
+                "rec": rec_a,
+                "draft": drf_a,
             })
         return per_stage
 

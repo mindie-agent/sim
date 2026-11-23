@@ -246,6 +246,8 @@ def raw_selection(*, prefix, plan, logits_input, weight_dtype, weight_bytes,
             metadata=(("input_format", weight_dtype), ("output_format", weight_dtype),
                       ("topk_ids_dtype", "int32"), ("router_weight_dtype", weight_dtype),
                       ("score_function", plan.router_mode),
+                      ("num_experts", int(plan.num_experts)),
+                      ("top_k", int(plan.top_k)),
                       ("hash_table_active_rows", tokens if hash_table else 0)),
         )
         ops = [select]

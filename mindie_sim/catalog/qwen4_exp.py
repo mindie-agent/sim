@@ -721,20 +721,27 @@ def qsa_indexer_terms(plan: LayerPlan, model: ModelSpec) -> list[WeightTerm]:
             _t("indexer_k_norm", plan.index_dim, ONE, "norm")]
 
 
-def ple_conv_state_bytes(model: Any, runtime: Any = None) -> float:
+def ple_conv_state_bytes(
+    model: Any, runtime: Any = None, *, query_tokens: int | None = None,
+) -> float:
     if not is_qwen4_exp_ple(getattr(model, "engram", None)):
         return ZERO_FLOAT
     engram = model.engram
     conv_k = int(dict(engram.source).get("ple_conv_kernel_size", DEFAULT_PLE_CONV_KERNEL))
     conv_state_len = (conv_k - ONE) * engram.max_ngram
-    num_spec = (int(getattr(runtime, "mtp_proposal_tokens", ZERO) or ZERO)
-                if runtime is not None else ZERO)
+    if query_tokens is not None:
+        num_spec = max(ZERO, int(query_tokens) - ONE)
+    elif runtime is not None:
+        num_spec = max(ZERO, resolve_speculative_query_tokens(runtime, phase=PHASE_DECODE) - ONE)
+    else:
+        num_spec = ZERO
     hc = max((p.hc_mult for p in model.layer_plans), default=ONE)
     return float((conv_state_len + num_spec) * hc * model.hidden_size * BF16_BYTES)
 
 
 def qwen4_exp_pool_breakdown(
-    model: Any, parallel: ParallelSpec, sequence_tokens: int, *, runtime: Any = None,
+    model: Any, parallel: ParallelSpec, sequence_tokens: int, *,
+    runtime: Any = None, query_tokens: int | None = None,
 ) -> dict[str, Any] | None:
     facts = dict(getattr(model, "catalog_facts", ()) or ())
     if facts.get("model_type") != "qwen4_exp_text" and not is_qwen4_exp_ple(
@@ -760,11 +767,15 @@ def qwen4_exp_pool_breakdown(
     # A verify window owns ``q`` recurrent checkpoint matrices (or the replay
     # record set); the pool must reserve the full active multiplicity, not one
     # slot per request.
+    eff_query_tokens = (
+        max(ONE, int(query_tokens))
+        if query_tokens is not None
+        else resolve_speculative_query_tokens(runtime, phase=PHASE_DECODE)
+    )
     state_plans = tuple(
         speculative_state_plan(
             model, plan, parallel,
-            query_tokens=resolve_speculative_query_tokens(
-                runtime, phase=PHASE_DECODE),
+            query_tokens=eff_query_tokens,
             recover_ssm=runtime_recover_ssm(runtime),
             capacity_padded=True,
             state_contract=getattr(plan, "state_contract", None),
@@ -801,7 +812,10 @@ def qwen4_exp_pool_breakdown(
     gdn_state_groups = _ceil_div(len(gdn), slot_count)
     raw_blocks = ONE if seq > ZERO else ZERO
     total_pool_blocks = qsa_blocks + raw_blocks + (gdn_state_groups if seq > ZERO else ZERO)
-    private_ple_bytes = ple_conv_state_bytes(model, runtime) if seq > ZERO else ZERO_FLOAT
+    private_ple_bytes = (
+        ple_conv_state_bytes(model, runtime, query_tokens=eff_query_tokens)
+        if seq > ZERO else ZERO_FLOAT
+    )
     return {
         "slot_count": slot_count, "manager_block_size": manager_block_size,
         "state_stride": state_stride, "pool_bytes_per_block": pool_bytes_per_block,

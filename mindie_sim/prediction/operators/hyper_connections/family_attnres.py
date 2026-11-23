@@ -191,14 +191,22 @@ def explicit_generic(kernels):
             or "recurrent_vector" in kernels.get("programs", ()))
 
 
-def selection(runtime, *, model=None, phase=None):
+def selection(runtime, *, model=None, phase=None, machine=None):
     """Return explicit or source-backed options, or None.
 
-    Explicit source binding wins.  A generic explicit recipe/family is not
-    reinterpreted.  Auto selection requires the shared A5 decode domain.
+    Explicit source binding wins on A5 (or synthetic arch-unspecified fixtures)
+    and is rejected on non-A5 hardware (A2/A3) so arch35 kernels are never
+    priced on A2/A3.  Auto selection requires the shared A5 decode domain.
     """
     bindings = runtime.kernels.get("lowerings", {})
+    arch = str(
+        (getattr(machine, "arch_family", "") if machine is not None else "")
+        or dict(runtime.metadata).get("arch_family")
+        or ""
+    ).strip().upper()
     if "attention_residual" in bindings:
+        if arch and arch not in {"A5", "GENERIC", "SYNTHETIC", "CUSTOM"}:
+            return None
         from mindie_sim.prediction.implementations import select
 
         selected = select(bindings, "attention_residual")
@@ -210,7 +218,6 @@ def selection(runtime, *, model=None, phase=None):
         return {"optimize_prefill": value}
     if model is None or phase is None or explicit_generic(runtime.kernels):
         return None
-    arch = dict(runtime.metadata).get("arch_family")
     if not source_image_match(runtime):
         return None
     if not source_eligible(model, arch, phase):
