@@ -341,7 +341,7 @@ def _dispatch_sweep(args: argparse.Namespace) -> object:
             output_tokens=args.output_tokens,
             ttft_sla_ms=args.ttft_sla_ms,
             tpot_sla_ms=args.tpot_sla_ms,
-            deployment=str(getattr(args, "deployment", "auto") or "auto"),
+            deployment=getattr(args, "deployment", None),
             pd_transfer_mode=getattr(args, "pd_transfer_mode", None),
             kv_transfer_bw_gbps=getattr(args, "kv_transfer_bw_gbps", None),
             pool_dram_ratio=getattr(args, "pool_dram_ratio", None),

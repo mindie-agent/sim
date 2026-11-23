@@ -28,6 +28,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from mindie_sim.catalog.speculative_state import speculative_state_plan
 from mindie_sim.schema.checkpoint import (
     CheckpointOrigin,
     CheckpointQuantMap,
@@ -147,17 +148,27 @@ DEFAULT_MLA_LATENT_DIM = 512
 DEFAULT_INDEX_DIM = 128
 DEFAULT_ENGRAM_SLOTS = 65536
 W4A8_SCALE_BIAS_DIM = 16
+W8A16_WEIGHT_BITS = 8
 
 _FLOAT_TAGS = frozenset({"", "NONE", "FLOAT", "BF16", "BFLOAT16", "FP16", "FLOAT16", "FP32", "FLOAT32"})
-_MXFP8_TAGS = frozenset({"W8A8_MXFP8", "MXFP8", "MX_FP8", "W8A8_MXFP"})
-_MXFP4_W4A8_TAGS = frozenset({"W4A8_MXFP", "W4A8_MXFP4", "MXFP4", "MX_FP4", "FP4", "NVFP4"})
+_MXFP8_TAGS = frozenset({"W8A8_MXFP8", "MXFP8", "MX_FP8", "W8A8_MXFP", "MXFP8_DYNAMIC"})
+_MXFP4_W4A8_TAGS = frozenset({
+    "W4A8_MXFP", "W4A8_MXFP4", "W4A8_MXFP4_DYNAMIC",
+    "MXFP4", "MX_FP4", "FP4", "NVFP4", "QUARK_MXFP4",
+})
 _MXFP4_W4A4_TAGS = frozenset({"W4A4_MXFP4", "W4A4_MXFP"})
-_FP8_TAGS = frozenset({"FP8", "FP8_DYNAMIC", "W8A8_FP8", "FP8_E4M3"})
-_W8A8_DYNAMIC_TAGS = frozenset({"W8A8_DYNAMIC", "W8A8D"})
-_W8A8_STATIC_TAGS = frozenset({"W8A8", "W8A8_STATIC"})
+_FP8_TAGS = frozenset({"FP8", "FP8_DYNAMIC", "W8A8_FP8", "FP8_E4M3", "QUARK_FP8"})
+_W8A8_DYNAMIC_TAGS = frozenset({
+    "W8A8_DYNAMIC", "W8A8D", "W8A8_INT8", "INT8_DYNAMIC", "INT8_SYM", "QUARK_INT8",
+})
+_W8A8_STATIC_TAGS = frozenset({"W8A8", "W8A8_STATIC", "INT8"})
 _W8A8_MIX_TAGS = frozenset({"W8A8_MIX", "W8A8_PDMIX"})
-_W4A8_TAGS = frozenset({"W4A8_DYNAMIC", "W4A8"})
-_W4A16_TAGS = frozenset({"W4A16", "W4A16_DYNAMIC"})
+_W4A8_TAGS = frozenset({
+    "W4A8_DYNAMIC", "W4A8", "W4A8_COMPRESSED", "INT4", "W4A4_DYNAMIC", "W4A4",
+})
+_W4A16_TAGS = frozenset({
+    "W4A16", "W4A16_DYNAMIC", "W4A16_AWQ", "W4A16_GPTQ", "W8A16_GPTQ", "W4A16_COMPRESSED",
+})
 
 _MXFP8_KV_TAGS = frozenset({
     "QK_MXFP8_DYNAMIC_V_MXFP8_PER_CHANNEL",
@@ -166,7 +177,11 @@ _MXFP8_KV_TAGS = frozenset({
     "C8_MXFP",
     "MXFP8",
 })
-_FAQUANT_BUFFER_TOKENS = ("fa_q", "fa_k", "fa_v", "faquant")
+_MLA_FP8_KV_TAGS = frozenset({"FP8", "FP8_E4M3", "FP8_DYNAMIC", "MXFP8", "MXFP8_DYNAMIC", "W8A8_MXFP8"})
+_INT8_KV_TAGS = frozenset({"INT8", "C8", "KV_C8", "INT8_DYNAMIC", "INT8_SYM", "FAQUANT", "FAKQUANT"})
+_FP8_INDEX_TAGS = frozenset({"fp8", "fp8_e4m3", "fp8_dynamic", "mxfp8", "mxfp8_dynamic"})
+_INT8_INDEX_TAGS = frozenset({"int8", "c8", "int8_dynamic", "int8_sym"})
+_FAQUANT_BUFFER_TOKENS = ("fa_q", "fa_k", "fa_v", "faquant", "fakquant")
 _KIMI_K3_TYPES = frozenset({"kimi_k3", "kimi_k31"})
 _GLM5_NEXT_TYPES = frozenset({"glm5_next", "glm5_next_text"})
 _QWEN4_EXP_TYPES = frozenset({"qwen4_exp", "qwen4_exp_text"})
@@ -367,10 +382,11 @@ def _resolve_int_tag_to_abi(
         )
     if tag in _W4A16_TAGS:
         blk = group_size if group_size else (1, W4A8_DEFAULT_GROUP_SIZE)
+        is_w8 = tag.startswith("W8A16")
         return TensorPrecisionABI(
             linear_method="w4a16",
             input_dtype=nat,
-            weight_dtype="int4",
+            weight_dtype="int8" if is_w8 else "int4",
             output_dtype=nat,
             compute_dtype=nat,
             accum_dtype="fp32",
@@ -378,7 +394,10 @@ def _resolve_int_tag_to_abi(
             weight_block=blk,
             weight_scale_dtype=nat,
             weight_scale_bytes=SCALE_BYTES_FP16,
-            weight_metadata=(("packed_int4_per_byte", INT4_PACKED_PER_BYTE),),
+            weight_metadata=(
+                (("weight_only_bits", W8A16_WEIGHT_BITS),)
+                if is_w8 else (("packed_int4_per_byte", INT4_PACKED_PER_BYTE),)
+            ),
         )
     return None
 
@@ -437,7 +456,7 @@ def _guard_a5_only(hw: str, method: str, tag: str) -> None:
 
 def _hf_quant_tag_for_role(
     hf_cfg: Mapping[str, Any], *, is_routed_expert: bool,
-) -> tuple[str, tuple[int, ...]]:
+) -> tuple[str, tuple[int, ...]] | None:
     method = str(hf_cfg.get("quant_method") or "").strip().lower()
     scale_fmt = str(hf_cfg.get("scale_fmt") or "").strip().lower()
     expert_dtype = str(hf_cfg.get("expert_dtype") or "").strip().lower()
@@ -447,18 +466,18 @@ def _hf_quant_tag_for_role(
         blk = tuple(int(x) for x in raw_block)
 
     if is_routed_expert and expert_dtype in {"fp4", "mxfp4", "nvfp4"}:
-        return "W4A8_MXFP", blk or (1, MXFP_GROUP_SIZE)
+        return "W4A8_MXFP", (1, MXFP_GROUP_SIZE)
     if method in {"mxfp8", "mx_fp8"} or (method == "fp8" and scale_fmt == "ue8m0"):
         return "W8A8_MXFP8", blk or (1, MXFP_GROUP_SIZE)
     if method in {"mxfp4", "mx_fp4"}:
         return "W4A8_MXFP", blk or (1, MXFP_GROUP_SIZE)
     if method == "fp8":
         return "FP8_DYNAMIC", blk or (FP8_DEFAULT_BLOCK_SIZE, FP8_DEFAULT_BLOCK_SIZE)
-    if method in {"w8a8", "w8a8_dynamic", "ascend"}:
+    if method in {"w8a8", "w8a8_dynamic"}:
         return "W8A8_DYNAMIC", blk
     if method in {"w4a8", "w4a8_dynamic"}:
         return ("W4A8_DYNAMIC" if is_routed_expert else "W8A8_DYNAMIC"), blk
-    return "FLOAT", ()
+    return None
 
 
 def _lookup_modelslim_tag(
@@ -541,6 +560,64 @@ def _lookup_non_wildcard_rule(
     return None
 
 
+def _lookup_hf_rule_tag(
+    checkpoint: CheckpointQuantMap,
+    *,
+    model_type: str,
+    candidate_paths: Sequence[str],
+    scope: ModelScope,
+    layer_ids: Sequence[int],
+    expert_id: int | None = None,
+) -> tuple[str, tuple[int, ...]] | None:
+    specific = _lookup_non_wildcard_rule(
+        checkpoint,
+        model_type=model_type,
+        candidate_paths=candidate_paths,
+        scope=scope,
+        layer_ids=layer_ids,
+        expert_id=expert_id,
+    )
+    if specific is not None:
+        return specific
+    for rule in checkpoint.rules:
+        if rule.pattern != "*":
+            continue
+        if rule.presence is None or any(
+            rule.presence.contains(scope=scope, source_native_layer_id=lid, expert_id=expert_id)
+            for lid in layer_ids
+        ):
+            return rule.raw_tag, rule.group_size
+    return None
+
+
+def _lookup_modelslim_w13_tag(
+    checkpoint: CheckpointQuantMap,
+    *,
+    model_type: str,
+    candidate_paths: Sequence[str],
+    scope: ModelScope,
+    layer_ids: Sequence[int],
+    expert_id: int | None,
+) -> str | None:
+    """Resolve ``mlp.experts.w13`` while enforcing gate/up homogeneity when both exist."""
+    gate_paths = [p for p in candidate_paths if any(tok in p for tok in ("gate_proj", ".w1.", "w13"))]
+    up_paths = [p for p in candidate_paths if any(tok in p for tok in ("up_proj", ".w3."))]
+    gate_tag = _lookup_modelslim_tag(
+        checkpoint, model_type=model_type, candidate_paths=gate_paths or candidate_paths,
+        scope=scope, layer_ids=layer_ids, expert_id=expert_id,
+    )
+    up_tag = (
+        _lookup_modelslim_tag(
+            checkpoint, model_type=model_type, candidate_paths=up_paths,
+            scope=scope, layer_ids=layer_ids, expert_id=expert_id,
+        )
+        if up_paths else None
+    )
+    if gate_tag is not None and up_tag is not None and gate_tag.upper() != up_tag.upper():
+        return "FLOAT"
+    return gate_tag if gate_tag is not None else up_tag
+
+
 def _resolve_role_tag(
     checkpoint: CheckpointQuantMap,
     *,
@@ -556,14 +633,24 @@ def _resolve_role_tag(
     """Return ``(raw_tag, group_size, used_projection)`` for one role."""
     expert_id = 0 if is_routed_expert else None
     if checkpoint.source_format == "modelslim_description":
-        explicit = _lookup_modelslim_tag(
-            checkpoint,
-            model_type=model_type,
-            candidate_paths=candidate_paths,
-            scope=scope,
-            layer_ids=layer_ids,
-            expert_id=expert_id,
-        )
+        if role_name == "mlp.experts.w13":
+            explicit = _lookup_modelslim_w13_tag(
+                checkpoint,
+                model_type=model_type,
+                candidate_paths=candidate_paths,
+                scope=scope,
+                layer_ids=layer_ids,
+                expert_id=expert_id,
+            )
+        else:
+            explicit = _lookup_modelslim_tag(
+                checkpoint,
+                model_type=model_type,
+                candidate_paths=candidate_paths,
+                scope=scope,
+                layer_ids=layer_ids,
+                expert_id=expert_id,
+            )
         if explicit is not None:
             return explicit, (), False
         return "FLOAT", (), False
@@ -584,9 +671,10 @@ def _resolve_role_tag(
 
     if checkpoint.source_format == "hf_quantization_config":
         if hf_cfg:
-            tag, blk = _hf_quant_tag_for_role(hf_cfg, is_routed_expert=is_routed_expert)
-            return tag, blk, False
-        specific = _lookup_non_wildcard_rule(
+            hf_hit = _hf_quant_tag_for_role(hf_cfg, is_routed_expert=is_routed_expert)
+            if hf_hit is not None:
+                return hf_hit[0], hf_hit[1], False
+        rule_hit = _lookup_hf_rule_tag(
             checkpoint,
             model_type=model_type,
             candidate_paths=candidate_paths,
@@ -594,8 +682,10 @@ def _resolve_role_tag(
             layer_ids=layer_ids,
             expert_id=expert_id,
         )
-        if specific is not None:
-            return specific[0], specific[1], False
+        if rule_hit is not None:
+            return rule_hit[0], rule_hit[1], False
+        if hf_cfg and str(hf_cfg.get("quant_method") or "").strip().lower() == "ascend":
+            return "W8A8_DYNAMIC", (), False
         return "FLOAT", (), False
 
     if checkpoint.source_format == "unquantized_native":
@@ -645,15 +735,24 @@ def _layer_role_descriptors(
         packs.append(("fused_ba_proj", ("linear_attn.in_proj_b", "linear_attn.in_proj_a")))
     elif attn == "mla":
         prefix = f"model.layers.{idx}.self_attn"
+        attn_short = f"layers.{idx}.attn"
+        mla_alt: dict[str, tuple[str, ...]] = {
+            "q_a_proj": (f"{attn_short}.wq_a.weight",),
+            "q_b_proj": (f"{attn_short}.wq_b.weight",),
+            "kv_a_proj_with_mqa": (f"{attn_short}.wkv.weight",),
+            "kv_b_proj": (),
+            "o_proj": (f"{attn_short}.wo_a.weight", f"{attn_short}.wo_b.weight"),
+        }
         for r in ("q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj", "o_proj"):
-            roles.append((f"mla.{r}", (f"{prefix}.{r}.weight",), False))
+            roles.append((f"mla.{r}", (f"{prefix}.{r}.weight", *mla_alt[r]), False))
         if plan.mla_output_gate or model_type in _KIMI_K3_TYPES:
             roles.append(("mla.g_proj", (f"{prefix}.g_proj.weight",), False))
         packs.append(("fused_qkv_a_proj", ("mla.q_a_proj", "mla.kv_a_proj_with_mqa")))
         if plan.indexer:
             idx_p = f"{prefix}.indexer"
-            roles.append(("indexer.wk", (f"{idx_p}.wk.weight",), False))
-            roles.append(("indexer.weights_proj", (f"{idx_p}.weights_proj.weight",), False))
+            idx_short = f"{attn_short}.indexer"
+            roles.append(("indexer.wk", (f"{idx_p}.wk.weight", f"{idx_short}.wk.weight"), False))
+            roles.append(("indexer.weights_proj", (f"{idx_p}.weights_proj.weight", f"{idx_short}.weights_proj.weight"), False))
             if model_type in _KIMI_K3_TYPES:
                 packs.append(("wk_weights_proj", ("indexer.wk", "indexer.weights_proj")))
     else:
@@ -690,6 +789,7 @@ def _layer_role_descriptors(
     mlp_p = f"model.layers.{idx}.mlp"
     bsm_p = f"model.layers.{idx}.block_sparse_moe"
     moe_p = f"model.layers.{idx}.moe"
+    ffn_p = f"layers.{idx}.ffn"
     if str(plan.ffn).lower() == "moe":
         if plan.expert_latent_size > 0:
             roles.append((
@@ -702,7 +802,11 @@ def _layer_role_descriptors(
                 ),
                 False,
             ))
-        roles.append(("mlp.gate", (f"{mlp_p}.gate.weight", f"{bsm_p}.gate.weight", f"{moe_p}.gate.weight"), False))
+        roles.append((
+            "mlp.gate",
+            (f"{mlp_p}.gate.weight", f"{bsm_p}.gate.weight", f"{moe_p}.gate.weight", f"{ffn_p}.gate.weight"),
+            False,
+        ))
         roles.append((
             "mlp.experts.w13",
             (
@@ -710,6 +814,10 @@ def _layer_role_descriptors(
                 f"{mlp_p}.experts.w13.weight",
                 f"{bsm_p}.experts.0.w1.weight",
                 f"{moe_p}.experts.w13_weight",
+                f"{ffn_p}.experts.0.w1.weight",
+                f"{ffn_p}.experts.0.w3.weight",
+                f"{moe_p}.gate_proj.weight",
+                f"{moe_p}.up_proj.weight",
             ),
             True,
         ))
@@ -720,14 +828,16 @@ def _layer_role_descriptors(
                 f"{mlp_p}.experts.w2.weight",
                 f"{bsm_p}.experts.0.w2.weight",
                 f"{moe_p}.experts.w2_weight",
+                f"{ffn_p}.experts.0.w2.weight",
+                f"{moe_p}.down_proj.weight",
             ),
             True,
         ))
         if plan.num_shared_experts > 0 or model.num_shared_experts > 0:
             se_p = f"model.layers.{idx}.share_expert"
-            roles.append(("mlp.shared_expert.gate_proj", (f"{mlp_p}.shared_experts.gate_proj.weight", f"{mlp_p}.shared_expert.gate_proj.weight", f"{bsm_p}.shared_experts.gate_proj.weight", f"{se_p}.gate_proj.weight"), False))
-            roles.append(("mlp.shared_expert.up_proj", (f"{mlp_p}.shared_experts.up_proj.weight", f"{mlp_p}.shared_expert.up_proj.weight", f"{bsm_p}.shared_experts.up_proj.weight", f"{se_p}.up_proj.weight"), False))
-            roles.append(("mlp.shared_expert.down_proj", (f"{mlp_p}.shared_experts.down_proj.weight", f"{mlp_p}.shared_expert.down_proj.weight", f"{bsm_p}.shared_experts.down_proj.weight", f"{se_p}.down_proj.weight"), False))
+            roles.append(("mlp.shared_expert.gate_proj", (f"{mlp_p}.shared_experts.gate_proj.weight", f"{mlp_p}.shared_expert.gate_proj.weight", f"{bsm_p}.shared_experts.gate_proj.weight", f"{se_p}.gate_proj.weight", f"{ffn_p}.shared_experts.w1.weight"), False))
+            roles.append(("mlp.shared_expert.up_proj", (f"{mlp_p}.shared_experts.up_proj.weight", f"{mlp_p}.shared_expert.up_proj.weight", f"{bsm_p}.shared_experts.up_proj.weight", f"{se_p}.up_proj.weight", f"{ffn_p}.shared_experts.w3.weight"), False))
+            roles.append(("mlp.shared_expert.down_proj", (f"{mlp_p}.shared_experts.down_proj.weight", f"{mlp_p}.shared_expert.down_proj.weight", f"{bsm_p}.shared_experts.down_proj.weight", f"{se_p}.down_proj.weight", f"{ffn_p}.shared_experts.w2.weight"), False))
             packs.append(("shared_expert.gate_up_proj", ("mlp.shared_expert.gate_proj", "mlp.shared_expert.up_proj")))
     else:
         roles.append(("mlp.gate_proj", (f"{mlp_p}.gate_proj.weight",), False))
@@ -800,25 +910,67 @@ def _resolve_draft_ports(
         ]
         if has_moe_draft:
             role_defs.extend([
-                ("mlp.gate", (f"mtp.layers.{local_idx}.mlp.gate.weight", f"mtp.layers.{offset_id}.mlp.gate.weight"), False),
-                ("mlp.experts.w13", (f"mtp.layers.{local_idx}.mlp.experts.0.gate_proj.weight", f"mtp.layers.{offset_id}.mlp.experts.0.gate_proj.weight", f"mtp.layers.{local_idx}.mlp.experts.w13.weight"), True),
-                ("mlp.experts.w2", (f"mtp.layers.{local_idx}.mlp.experts.0.down_proj.weight", f"mtp.layers.{offset_id}.mlp.experts.0.down_proj.weight", f"mtp.layers.{local_idx}.mlp.experts.w2.weight"), True),
+                (
+                    "mlp.gate",
+                    (
+                        f"mtp.layers.{local_idx}.mlp.gate.weight",
+                        f"mtp.layers.{offset_id}.mlp.gate.weight",
+                        f"model.layers.{offset_id}.mlp.gate.weight",
+                    ),
+                    False,
+                ),
+                (
+                    "mlp.experts.w13",
+                    (
+                        f"mtp.layers.{local_idx}.mlp.experts.0.gate_proj.weight",
+                        f"mtp.layers.{offset_id}.mlp.experts.0.gate_proj.weight",
+                        f"mtp.layers.{local_idx}.mlp.experts.w13.weight",
+                        f"mtp.{local_idx}.ffn.experts.0.w1.weight",
+                        f"model.layers.{offset_id}.mlp.experts.0.gate_proj.weight",
+                    ),
+                    True,
+                ),
+                (
+                    "mlp.experts.w2",
+                    (
+                        f"mtp.layers.{local_idx}.mlp.experts.0.down_proj.weight",
+                        f"mtp.layers.{offset_id}.mlp.experts.0.down_proj.weight",
+                        f"mtp.layers.{local_idx}.mlp.experts.w2.weight",
+                        f"mtp.{local_idx}.ffn.experts.0.w2.weight",
+                        f"model.layers.{offset_id}.mlp.experts.0.down_proj.weight",
+                    ),
+                    True,
+                ),
             ])
         else:
             role_defs.append(("mlp.down_proj", (f"mtp.layers.{local_idx}.mlp.down_proj.weight", f"dspark.layers.{local_idx}.mlp.down_proj.weight"), False))
 
         for role_name, cands, is_expert in role_defs:
-            tag, blk, did_proj = _resolve_role_tag(
-                checkpoint,
-                model_type=model_type,
-                role_name=role_name,
-                candidate_paths=cands,
-                scope="draft",
-                layer_ids=layer_ids,
-                is_routed_expert=is_expert,
-                target_quant_projection="" if model_type in _QWEN4_EXP_TYPES else target_quant_projection,
-                hf_cfg=hf_cfg if model_type not in _QWEN4_EXP_TYPES else {},
-            )
+            if checkpoint.source_format == "modelslim_description":
+                exp_id = 0 if is_expert else None
+                explicit = _lookup_modelslim_tag(
+                    checkpoint, model_type=model_type, candidate_paths=cands,
+                    scope="draft", layer_ids=layer_ids, expert_id=exp_id,
+                )
+                if explicit is None:
+                    # Appended native MTP layers (e.g. DeepSeek-R1 L61) live in target scope.
+                    explicit = _lookup_modelslim_tag(
+                        checkpoint, model_type=model_type, candidate_paths=cands,
+                        scope="target", layer_ids=(offset_id,), expert_id=exp_id,
+                    )
+                tag, blk, did_proj = (explicit if explicit is not None else "FLOAT"), (), False
+            else:
+                tag, blk, did_proj = _resolve_role_tag(
+                    checkpoint,
+                    model_type=model_type,
+                    role_name=role_name,
+                    candidate_paths=cands,
+                    scope="draft",
+                    layer_ids=layer_ids,
+                    is_routed_expert=is_expert,
+                    target_quant_projection="" if model_type in _QWEN4_EXP_TYPES else target_quant_projection,
+                    hf_cfg=hf_cfg if model_type not in _QWEN4_EXP_TYPES else {},
+                )
             used_proj = used_proj or did_proj
             abi = resolve_raw_tag_to_abi(
                 tag, hw_family=hw, native_float_dtype=native_float,
@@ -835,35 +987,67 @@ def _detect_kv_mode(
     model_type: str,
     effective_opts: Mapping[str, Any],
     is_mla: bool,
+    kv_tag_override: str | None = None,
 ) -> tuple[str, str, bool, list[tuple[str, str, str]]]:
     """Resolve effective KV cache mode, scale dtype, FAQuant active flag, and dispositions."""
     disps: list[tuple[str, str, str]] = []
-    raw_kv = str(checkpoint.cache_rule.kv_tag or effective_opts.get("kv_cache_dtype") or "").strip().upper()
+    raw_source = (
+        kv_tag_override
+        if kv_tag_override is not None
+        else (checkpoint.cache_rule.kv_tag or effective_opts.get("kv_cache_dtype") or "")
+    )
+    raw_kv = str(raw_source or effective_opts.get("kv_cache_dtype") or "").strip().upper()
     aux_low = " ".join(checkpoint.auxiliary_buffers).lower()
-    has_faquant = ("FAQUANT" in raw_kv) or any(tok in aux_low for tok in _FAQUANT_BUFFER_TOKENS)
-    is_mxfp_kv = (raw_kv in _MXFP8_KV_TAGS) or (not is_mla and "v_cache_scale" in aux_low and "mxfp" in raw_kv.lower())
+    has_faquant = (
+        ("FAQUANT" in raw_kv)
+        or ("FAKQUANT" in raw_kv)
+        or any(tok in aux_low for tok in _FAQUANT_BUFFER_TOKENS)
+    )
+    is_mxfp_gqa = (not is_mla) and (
+        (raw_kv in _MXFP8_KV_TAGS)
+        or ("v_cache_scale" in aux_low and "mxfp" in raw_kv.lower())
+    )
 
-    if is_mxfp_kv and has_faquant:
+    if is_mxfp_gqa and has_faquant:
         has_faquant = False
         disps.append(("fa_quant", "downgraded", "mxfp8_kv_cache_supersedes_faquant"))
 
-    if is_mxfp_kv:
+    if is_mxfp_gqa:
         if hw in A2_A3_INT_ONLY_FAMILIES:
             raise ModelingError(f"hw_isa_incompatible:{hw}:kv_cache=QK_MXFP8_DYNAMIC_V_MXFP8_PER_CHANNEL")
         return "qk_mxfp8_dynamic_v_mxfp8_per_channel", "e8m0", False, disps
 
-    if raw_kv in {"FP8", "FP8_E4M3"}:
+    if raw_kv in _MLA_FP8_KV_TAGS:
         if hw in A2_A3_INT_ONLY_FAMILIES:
             raise ModelingError(f"hw_isa_incompatible:{hw}:kv_cache={raw_kv}:A2/A3_requires_bf16_or_c8")
         default_scale = "fp16" if model_type in _GLM5_NEXT_TYPES else "fp32"
         scale_dtype = str(checkpoint.cache_rule.kv_scale_dtype or default_scale).strip().lower()
         return "fp8_e4m3", scale_dtype, has_faquant, disps
 
-    if raw_kv in {"INT8", "C8", "KV_C8"}:
+    if raw_kv in _INT8_KV_TAGS:
         scale_dtype = str(checkpoint.cache_rule.kv_scale_dtype or "fp32").strip().lower()
         return "int8", scale_dtype, has_faquant, disps
 
     return "bf16", "", has_faquant, disps
+
+
+def _resolve_index_dtype(
+    raw_tag: str | None,
+    *,
+    hw: str,
+    fallback_kv_mode: str,
+) -> str:
+    norm = str(
+        raw_tag
+        or ("fp8_e4m3" if fallback_kv_mode == "fp8_e4m3" else ("int8" if fallback_kv_mode == "int8" else "bf16"))
+    ).strip().lower()
+    if norm in _FP8_INDEX_TAGS:
+        if hw in A2_A3_INT_ONLY_FAMILIES:
+            raise ModelingError(f"hw_isa_incompatible:{hw}:indexer_kv_dtype={norm}")
+        return "fp8_e4m3"
+    if norm in _INT8_INDEX_TAGS:
+        return "int8"
+    return "bf16"
 
 
 def _build_mxfp_gqa_cache_abi(
@@ -1026,9 +1210,16 @@ def _build_mla_cache_abi(
             write_trigger="append",
             bytes_per_unit=latent_dim,
         ))
-        scale_groups = max(1, latent_dim // MLA_SCALE_GROUP_SIZE)
-        s_dtype = "fp16" if kv_scale_dtype in {"fp16", "bf16", "float16", "bfloat16"} else "fp32"
-        s_bytes = scale_groups * (SCALE_BYTES_FP16 if s_dtype == "fp16" else SCALE_BYTES_FP32)
+        if kv_scale_dtype in {"e8m0", "fp8_e8m0"}:
+            scale_group_ext = MXFP_GROUP_SIZE
+            scale_groups = max(1, latent_dim // MXFP_GROUP_SIZE)
+            s_dtype = "e8m0"
+            s_bytes = scale_groups * SCALE_BYTES_E8M0
+        else:
+            scale_group_ext = MLA_SCALE_GROUP_SIZE
+            scale_groups = max(1, latent_dim // MLA_SCALE_GROUP_SIZE)
+            s_dtype = "fp16" if kv_scale_dtype in {"fp16", "bf16", "float16", "bfloat16"} else "fp32"
+            s_bytes = scale_groups * (SCALE_BYTES_FP16 if s_dtype == "fp16" else SCALE_BYTES_FP32)
         planes.append(CachePlaneABI(
             plane_id="mla_latent_scale",
             plane_kind="scale",
@@ -1038,7 +1229,7 @@ def _build_mla_cache_abi(
             dtype=s_dtype,
             layout="ND",
             group_axes=(0,),
-            group_extents=(MLA_SCALE_GROUP_SIZE,),
+            group_extents=(scale_group_ext,),
             scale_dtype=s_dtype,
             offset_in_page=latent_dim,
             allocation_frequency="token",
@@ -1197,6 +1388,7 @@ def _build_index_cache_abi(
 
 
 def _build_recurrent_cache_abi(
+    model: ModelSpec,
     plan: LayerPlan,
     *,
     native_layer: int,
@@ -1207,7 +1399,7 @@ def _build_recurrent_cache_abi(
     speculative_k: int,
     recoverssm_active: bool,
 ) -> CacheStateABI:
-    """Build exact KDA/GDN conv+recurrent CacheStateABI with exact conv history axis."""
+    """Build exact KDA/GDN conv+recurrent+replay CacheStateABI via ``speculative_state_plan``."""
     attn = str(plan.attention or plan.architecture).lower()
     shard_div = max(1, parallel.tp * parallel.pcp) if (attn == "kda" and parallel.pcp > 1) else max(1, parallel.tp)
     shard_axis = "tp*pcp" if (attn == "kda" and parallel.pcp > 1) else "tp"
@@ -1215,16 +1407,29 @@ def _build_recurrent_cache_abi(
     local_heads = max(1, v_heads // shard_div)
     h_dim = max(1, int(plan.linear_head_dim or DEFAULT_INDEX_DIM))
     rec_dtype = str(plan.recurrent_state_dtype or "fp32").lower()
-    rec_bytes = local_heads * h_dim * h_dim * int(dtype_bytes(rec_dtype))
 
     conv_k = max(2, int(plan.conv_kernel or DEFAULT_CONV_KERNEL_SIZE))
     history_slots = conv_k - 1
+    rollback_slots = max(0, int(speculative_k))
     conv_w = int(plan.conv_width or (plan.conv_state_elements // max(1, history_slots)) or 0)
     local_conv_w = max(1, conv_w // shard_div) if conv_w > 0 else max(1, local_heads * h_dim)
     conv_dtype = str(plan.conv_state_dtype or "bf16").lower()
-    conv_bytes = local_conv_w * history_slots * int(dtype_bytes(conv_dtype))
 
-    planes = (
+    spec_plan = speculative_state_plan(
+        model, plan, parallel,
+        query_tokens=max(1, 1 + rollback_slots),
+        recover_ssm=recoverssm_active,
+        capacity_padded=False,
+    )
+    rec_bytes = int(round(spec_plan.recurrent_bytes)) or (
+        local_heads * h_dim * h_dim * int(dtype_bytes(rec_dtype))
+    )
+    conv_bytes = int(round(spec_plan.conv_bytes)) or (
+        local_conv_w * (history_slots + rollback_slots) * int(dtype_bytes(conv_dtype))
+    )
+    conv_total_slots = history_slots + rollback_slots
+
+    planes: list[CachePlaneABI] = [
         CachePlaneABI(
             plane_id="recurrent_state",
             plane_kind="payload",
@@ -1241,8 +1446,8 @@ def _build_recurrent_cache_abi(
             plane_id="conv_history",
             plane_kind="payload",
             logical_axes=("channel", "history_slot"),
-            logical_shape=(local_conv_w, history_slots),
-            physical_shape=(local_conv_w, history_slots),
+            logical_shape=(local_conv_w, conv_total_slots),
+            physical_shape=(local_conv_w, conv_total_slots),
             dtype=conv_dtype,
             layout="ND",
             offset_in_page=rec_bytes,
@@ -1250,19 +1455,35 @@ def _build_recurrent_cache_abi(
             write_trigger="append",
             bytes_per_unit=conv_bytes,
         ),
-    )
+    ]
+    replay_bytes = int(round(spec_plan.replay_bytes))
+    if replay_bytes > 0:
+        q_slots = max(1, int(spec_plan.query_tokens))
+        planes.append(CachePlaneABI(
+            plane_id="replay_records",
+            plane_kind="payload",
+            logical_axes=("verify_slot", "record_byte"),
+            logical_shape=(q_slots, max(1, replay_bytes // q_slots)),
+            physical_shape=(q_slots, max(1, replay_bytes // q_slots)),
+            dtype="fp32",
+            layout="ND",
+            offset_in_page=rec_bytes + conv_bytes,
+            allocation_frequency="request_slot",
+            write_trigger="verify",
+            bytes_per_unit=replay_bytes,
+        ))
     return CacheStateABI(
         scope="target",
         native_layer=native_layer,
         component_role="recurrent_state",
         producer_key=f"target.L{native_layer}.recurrent_state",
-        planes=planes,
+        planes=tuple(planes),
         phase=phase,
         deployment_role=role,
         checkpoint_digest=checkpoint_digest,
         recipe_abi_id=f"{attn}_recurrent_state",
         history_slots=history_slots,
-        rollback_slots=max(0, int(speculative_k)),
+        rollback_slots=rollback_slots,
         checkpoint_slots=1 if recoverssm_active else 0,
         record_shape=(local_heads, h_dim, h_dim) if recoverssm_active else (),
         record_dtype=rec_dtype if recoverssm_active else "",
@@ -1311,8 +1532,23 @@ def _build_engram_or_ple_abi(
             history_slots=ple_hist,
             placement=CachePlacementRule(token_ownership_axis="none", memory_tier="hbm"),
         )
-    table_slots = int(getattr(model.engram, "vocab_size", DEFAULT_ENGRAM_SLOTS) or DEFAULT_ENGRAM_SLOTS)
-    table_dim = int(getattr(model.engram, "embed_dim", model.hidden_size) or model.hidden_size)
+    engram_spec = model.engram
+    matched_tables = tuple(
+        t for t in (getattr(engram_spec, "tables", ()) or ())
+        if int(getattr(t, "layer_id", -1)) == int(native_layer)
+    )
+    if matched_tables:
+        table_slots = sum(int(t.rows) for t in matched_tables)
+        table_dim = int(matched_tables[0].width)
+        row_b = float(getattr(engram_spec, "row_bytes", 0.0) or (table_dim * int(dtype_bytes("bf16"))))
+        storage_mode = str(getattr(engram_spec, "storage_mode", "device_bf16") or "device_bf16").lower()
+        table_dtype = "fp8_e4m3" if "fp8" in storage_mode else ("int8" if "int8" in storage_mode else "bf16")
+        total_bytes = int(round(float(table_slots) * row_b))
+    else:
+        table_slots = int(getattr(engram_spec, "vocab_size", DEFAULT_ENGRAM_SLOTS) or DEFAULT_ENGRAM_SLOTS)
+        table_dim = int(getattr(engram_spec, "embed_dim", model.hidden_size) or model.hidden_size)
+        table_dtype = "bf16"
+        total_bytes = table_slots * table_dim * int(dtype_bytes("bf16"))
     return CacheStateABI(
         scope="target",
         native_layer=native_layer,
@@ -1324,11 +1560,11 @@ def _build_engram_or_ple_abi(
             logical_axes=("slot", "embed_dim"),
             logical_shape=(table_slots, table_dim),
             physical_shape=(table_slots, table_dim),
-            dtype="bf16",
+            dtype=table_dtype,
             layout="ND",
             allocation_frequency="checkpoint",
             write_trigger="load",
-            bytes_per_unit=table_slots * table_dim * int(dtype_bytes("bf16")),
+            bytes_per_unit=total_bytes,
         ),),
         phase=phase,
         deployment_role=role,
@@ -1371,19 +1607,10 @@ def build_cache_state_abis(
     ckpt_digest = checkpoint.digest()
     engram_offload = bool(effective_opts.get("engram_cpu_offload", False))
 
-    raw_idx_tag = str(
-        checkpoint.cache_rule.index_tag
-        or effective_opts.get("indexer_kv_dtype")
-        or ("fp8_e4m3" if kv_mode == "fp8_e4m3" else ("int8" if kv_mode == "int8" else "bf16"))
-    ).strip().lower()
-    if raw_idx_tag in {"fp8", "fp8_e4m3"}:
-        if hw in A2_A3_INT_ONLY_FAMILIES:
-            raise ModelingError(f"hw_isa_incompatible:{hw}:indexer_kv_dtype={raw_idx_tag}")
-        index_dtype = "fp8_e4m3"
-    elif raw_idx_tag in {"int8", "c8"}:
-        index_dtype = "int8"
-    else:
-        index_dtype = "bf16"
+    default_idx_dtype = _resolve_index_dtype(
+        checkpoint.cache_rule.index_tag or effective_opts.get("indexer_kv_dtype"),
+        hw=hw, fallback_kv_mode=kv_mode,
+    )
     index_scale_dtype = str(checkpoint.cache_rule.index_scale_dtype or "fp32").strip().lower()
 
     long_kv_consumers: dict[int, list[str]] = {}
@@ -1399,29 +1626,44 @@ def build_cache_state_abis(
     idx_abis: list[CacheStateABI] = []
     rec_abis: list[CacheStateABI] = []
     c8_producer_recorded = False
-    is_mxfp_gqa = (kv_mode == "qk_mxfp8_dynamic_v_mxfp8_per_channel")
+    any_faquant = has_faquant
+    any_mxfp_gqa = (kv_mode == "qk_mxfp8_dynamic_v_mxfp8_per_channel")
     token_axis = "dcp_head" if parallel.cp > 1 else ("cp_striped" if parallel.pcp > 1 else "replicated")
     mla_rep = max(1, parallel.tp // max(1, parallel.cp))
+    has_layer_kv = bool(checkpoint.cache_rule.layer_scoped_kv)
+    has_layer_idx = bool(checkpoint.cache_rule.layer_scoped_index)
 
     for p in plans:
         n_id = p.native_layer_id if p.native_layer_id >= 0 else p.index
         attn = str(p.attention or model.attention).lower()
+        layer_kv_mode, layer_kv_scale, layer_faquant = kv_mode, kv_scale_dtype, has_faquant
+        if has_layer_kv and attn not in {"kda", "gdn"}:
+            l_tag = checkpoint.cache_rule.kv_tag_for_layer(n_id)
+            layer_kv_mode, layer_kv_scale, layer_faquant, l_disps = _detect_kv_mode(
+                checkpoint, hw=hw, model_type=model_type, effective_opts=effective_opts,
+                is_mla=(attn == "mla"), kv_tag_override=l_tag,
+            )
+            for item in l_disps:
+                if item not in disps:
+                    disps.append(item)
+            any_faquant = any_faquant or layer_faquant
+            any_mxfp_gqa = any_mxfp_gqa or (layer_kv_mode == "qk_mxfp8_dynamic_v_mxfp8_per_channel")
         if attn in {"kda", "gdn"}:
             rec_abis.append(_build_recurrent_cache_abi(
-                p, native_layer=n_id, parallel=parallel, checkpoint_digest=ckpt_digest,
+                model, p, native_layer=n_id, parallel=parallel, checkpoint_digest=ckpt_digest,
                 phase=phase, role=role, speculative_k=speculative_k, recoverssm_active=recoverssm_active,
             ))
         elif attn == "mla":
             mla_place = CachePlacementRule(token_ownership_axis=token_axis, replication_factor=mla_rep)
             role_name = "window_kv" if p.window > 0 else "mla_latent"
             kv_abis.append(_build_mla_cache_abi(
-                p, native_layer=n_id, kv_mode=kv_mode, kv_scale_dtype=kv_scale_dtype,
+                p, native_layer=n_id, kv_mode=layer_kv_mode, kv_scale_dtype=layer_kv_scale,
                 kv_block_size=kv_block_size, placement=mla_place, checkpoint_digest=ckpt_digest,
                 phase=phase, role=role, component_role=role_name,
             ))
             if p.owns_long_kv:
                 kv_abis.append(_build_mla_cache_abi(
-                    p, native_layer=n_id, kv_mode=kv_mode, kv_scale_dtype=kv_scale_dtype,
+                    p, native_layer=n_id, kv_mode=layer_kv_mode, kv_scale_dtype=layer_kv_scale,
                     kv_block_size=kv_block_size, placement=mla_place, checkpoint_digest=ckpt_digest,
                     phase=phase, role=role, component_role="compressed_kv",
                     consumer_keys=tuple(long_kv_consumers.get(n_id, ())),
@@ -1434,14 +1676,14 @@ def build_cache_state_abis(
             gqa_place = CachePlacementRule(
                 head_range=(0, l_kv), token_ownership_axis=token_axis, replication_factor=rep,
             )
-            if is_mxfp_gqa:
+            if layer_kv_mode == "qk_mxfp8_dynamic_v_mxfp8_per_channel":
                 kv_abis.append(_build_mxfp_gqa_cache_abi(
                     native_layer=n_id, local_heads=l_kv, head_dim=h_dim, kv_block_size=kv_block_size,
                     placement=gqa_place, checkpoint_digest=ckpt_digest, phase=phase, role=role,
                 ))
             else:
-                eff_gqa_mode = kv_mode
-                if kv_mode == "int8" and str(role).lower() == "pd_prefill":
+                eff_gqa_mode = layer_kv_mode
+                if layer_kv_mode == "int8" and str(role).lower() == "pd_prefill":
                     eff_gqa_mode = "bf16"
                     if not c8_producer_recorded:
                         disps.append(("kv_cache_c8_producer", "downgraded", "kv_c8_producer_role_keeps_native_bf16"))
@@ -1449,13 +1691,20 @@ def build_cache_state_abis(
                 kv_abis.append(_build_standard_gqa_cache_abi(
                     native_layer=n_id, local_heads=l_kv, head_dim=h_dim, kv_mode=eff_gqa_mode,
                     kv_block_size=kv_block_size, placement=gqa_place, checkpoint_digest=ckpt_digest,
-                    phase=phase, role=role, has_faquant=has_faquant,
+                    phase=phase, role=role, has_faquant=layer_faquant,
                 ))
 
         if p.indexer and (p.owns_index_k or p.index_k_owner_layer_id < 0 or p.index_k_owner_layer_id == n_id):
+            layer_idx_dtype = (
+                _resolve_index_dtype(
+                    checkpoint.cache_rule.index_tag_for_layer(n_id) or effective_opts.get("indexer_kv_dtype"),
+                    hw=hw, fallback_kv_mode=layer_kv_mode,
+                )
+                if has_layer_idx else default_idx_dtype
+            )
             idx_place = CachePlacementRule(token_ownership_axis=token_axis, replication_factor=mla_rep)
             idx_abis.append(_build_index_cache_abi(
-                p, native_layer=n_id, index_dtype=index_dtype, index_scale_dtype=index_scale_dtype,
+                p, native_layer=n_id, index_dtype=layer_idx_dtype, index_scale_dtype=index_scale_dtype,
                 kv_block_size=kv_block_size, placement=idx_place, checkpoint_digest=ckpt_digest,
                 phase=phase, role=role, consumer_keys=tuple(index_consumers.get(n_id, ())),
             ))
@@ -1465,7 +1714,7 @@ def build_cache_state_abis(
                 checkpoint_digest=ckpt_digest, phase=phase, role=role,
             ))
 
-    return tuple(kv_abis), tuple(idx_abis), tuple(rec_abis), tuple(disps), has_faquant, is_mxfp_gqa
+    return tuple(kv_abis), tuple(idx_abis), tuple(rec_abis), tuple(disps), any_faquant, any_mxfp_gqa
 
 
 def _build_standard_gqa_cache_abi(

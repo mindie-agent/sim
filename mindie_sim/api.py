@@ -241,14 +241,21 @@ def sweep_topology(
         output = int(request.sla.output_budget)
         ttft = parsed.slo.ttft_ms
         tpot = float(request.sla.latency_ms)
+        case_role = str(dict(parsed.runtime.metadata).get("deployment_role") or "").strip().lower()
+        explicit_dep = getattr(request, "deployment_mode", None) or (
+            "pd_disaggregated" if decode_case is not None
+            else (case_role if case_role in {"colocated", "pd_disaggregated", "pd_prefill", "pd_decode"} else "colocated")
+        )
         solved = _solve_optimal(
             parsed.model.to_dict(),
             parsed.machine.to_dict(),
             num_devices=total_dies,
             prompt_tokens=prompt,
             output_tokens=output,
-            ttft_sla_ms=ttft,
-            tpot_sla_ms=tpot,
+            ttft_sla_ms=(None if explicit_dep == "pd_decode" else ttft),
+            tpot_sla_ms=(None if explicit_dep == "pd_prefill" else tpot),
+            deployment_mode=explicit_dep,
+            allow_unconstrained_ttft=(ttft is None),
         )
         frontier: list[TopologyPoint] = []
         for row in solved.get("pareto_frontier", ()):

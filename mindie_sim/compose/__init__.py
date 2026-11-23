@@ -90,10 +90,12 @@ from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.hardware import Hardware
 from mindie_sim.schema.parallel import ParallelSpec
 from mindie_sim.schema.scenario import (
+    DEPLOYMENT_MODES,
     ConcurrencyLimits,
     ReadyStateAssumption,
     SLAContract,
     ScenarioContract,
+    validate_deployment_mode,
 )
 from mindie_sim.schema.stack import StackTrack
 from mindie_sim.stacks.registry import resolve_stack_for_scenario
@@ -121,7 +123,7 @@ DEFAULT_LOCAL_WIDTH = 1
 DEFAULT_REDUNDANT_EXPERTS = 0
 DEFAULT_SPECULATIVE_ACCEPT_RATE = 0.70
 _PARALLEL_AXES = ("tp", "dp", "ep", "pp", "pcp", "dcp")
-_VALID_DEPLOYMENT_MODES = frozenset({"auto", "pd", "pd_disaggregated", "colocated"})
+_VALID_DEPLOYMENT_MODES = DEPLOYMENT_MODES
 _VALID_DEPLOYMENT_ROLES = frozenset({"colocated", "pd_prefill", "pd_decode"})
 _CACHE_DTYPE_ALIASES = {"fp8": "fp8_e4m3", "c8": "int8"}
 _TOPOLOGY_PRESET_ARCH_PREFIXES = {"a2": "a2_", "a3": "a3_", "a5": "a5_"}
@@ -418,8 +420,8 @@ def _resolve_parallel_axes(
     tpot_slo_ms: float | None,
 ) -> tuple[dict[str, int | None], bool]:
     """Resolve explicit parallel axes or detect Domain-3 auto-optimal search."""
-    if deployment is not None and str(deployment).strip().lower() not in _VALID_DEPLOYMENT_MODES:
-        raise ModelingError(f"invalid_deployment_mode:{deployment}")
+    if deployment is not None:
+        validate_deployment_mode(deployment)
     raw_axes: dict[str, int | None] = {
         "tp": tp, "dp": dp, "ep": ep, "pp": pp, "pcp": pcp, "dcp": dcp,
     }
@@ -1704,10 +1706,12 @@ def _prepare_composed_model(
 
 def _compose_auto_deployment(
     model, hardware, axes, *, num_devices, prompt_tokens, output_tokens,
-    ttft_slo_ms, tpot_slo_ms, deployment, **options,
+    ttft_slo_ms, tpot_slo_ms, deployment, role=None, **options,
 ):
     from mindie_sim.sweep.pd import solve_optimal_deployment
 
+    eff_dep = deployment if deployment is not None else role
+    validated_dep = validate_deployment_mode(eff_dep)
     direct_keys = set(_COMPOSE_OPTION_GROUPS["auto"])
     direct_opts = {k: v for k, v in options.items() if k in direct_keys}
     extra_opts = {k: v for k, v in options.items() if k not in direct_keys and v is not None}
@@ -1715,9 +1719,9 @@ def _compose_auto_deployment(
         model=model, hardware=hardware, num_devices=int(num_devices),
         prompt_tokens=int(prompt_tokens), output_tokens=int(output_tokens),
         ttft_sla_ms=(None if ttft_slo_ms is None else float(ttft_slo_ms)),
-        tpot_sla_ms=float(tpot_slo_ms),
+        tpot_sla_ms=(None if tpot_slo_ms is None else float(tpot_slo_ms)),
         allow_unconstrained_ttft=(ttft_slo_ms is None),
-        deployment=str(deployment or "auto"), pinned_parallel=axes,
+        deployment_mode=validated_dep, pinned_parallel=axes,
         compose_overrides=extra_opts or None,
         **direct_opts,
     )
@@ -2171,18 +2175,23 @@ def compose_case(
     exclude_optimizations: Sequence[str] = (),
     parallel: str | Mapping[str, Any] | None = None,
     deployment: str | None = None,
+    deployment_mode: str | None = None,
     role: str | None = None,
     require_scenario: bool = False,
     _stack_phase: str | None = None,
 ) -> dict[str, Any]:
     """Synthesize and validate a complete simulation Case dictionary."""
     args = locals()
+    if deployment is not None and deployment_mode is not None:
+        if str(deployment).strip().lower() != str(deployment_mode).strip().lower():
+            raise ModelingError(f"conflicting_deployment_mode:{deployment_mode!r}!={deployment!r}")
+    eff_deployment = deployment_mode if deployment_mode is not None else deployment
     norm_role = str(role).strip().lower() if role is not None else None
     if norm_role is not None and norm_role not in _VALID_DEPLOYMENT_ROLES:
         raise ModelingError(f"invalid_deployment_role:{role}")
     axes, auto_mode = _resolve_parallel_axes(
         tp=tp, dp=dp, ep=ep, pp=pp, pcp=pcp, dcp=dcp,
-        parallel=parallel, deployment=deployment, num_devices=num_devices,
+        parallel=parallel, deployment=eff_deployment, num_devices=num_devices,
         prompt_tokens=prompt_tokens, output_tokens=output_tokens,
         ttft_slo_ms=ttft_slo_ms, tpot_slo_ms=tpot_slo_ms,
     )
@@ -2191,7 +2200,7 @@ def compose_case(
         return _compose_auto_deployment(
             model, hardware, axes, num_devices=num_devices, prompt_tokens=prompt_tokens,
             output_tokens=output_tokens, ttft_slo_ms=ttft_slo_ms, tpot_slo_ms=tpot_slo_ms,
-            deployment=deployment, **auto_opts,
+            deployment=eff_deployment, role=norm_role, **auto_opts,
         )
     grouped = {
         key: _select_group(args, key)

@@ -269,7 +269,10 @@ def _add_catalog_and_solve_parsers(sub) -> None:
     solve.add_argument("--kv-pooling", dest="kv_pooling", default="auto",
                        help="KV pooling mode: auto|off|pooled_dram_ssd|layerwise_overlap_d2d|direct_blocking_d2d")
     solve.add_argument("--no-kv-pooling", dest="kv_pooling", action="store_const", const="off")
-    solve.add_argument("--deployment", choices=("auto", "pd", "pd_disaggregated", "colocated"), default="auto")
+    solve.add_argument(
+        "--deployment", "--deployment-mode", dest="deployment",
+        choices=("colocated", "pd_disaggregated", "pd_prefill", "pd_decode"), default=None,
+    )
     solve.add_argument("--stack", default=None, help="runtime stack name or manifest path (domain-aware default when omitted)")
     solve.add_argument("--quant", default=None)
     solve.add_argument("--kv-cache-dtype", default=None)
@@ -455,7 +458,10 @@ def _add_compose_and_waterfall_parsers(sub) -> None:
     compose.add_argument("--multistream-overlap-shared-expert", action=argparse.BooleanOptionalAction, default=None)
     compose.add_argument("--enable-shared-expert-dp", action=argparse.BooleanOptionalAction, default=None)
     compose.add_argument("--parallel", choices=("auto", "fixed"), default=None)
-    compose.add_argument("--deployment", choices=("auto", "pd", "pd_disaggregated", "colocated"), default=None)
+    compose.add_argument(
+        "--deployment", "--deployment-mode", dest="deployment",
+        choices=("colocated", "pd_disaggregated", "pd_prefill", "pd_decode"), default=None,
+    )
     compose.add_argument("--role", choices=("colocated", "pd_prefill", "pd_decode"), default=None)
     compose.add_argument("--topology-preset", default=None)
     compose.add_argument("--kv-cache-dtype", default=None)
@@ -510,7 +516,10 @@ def _add_sweep_efficiency_sla_parsers(sub) -> None:
     sweep.add_argument("--prompt-tokens", type=int, default=None)
     sweep.add_argument("--output-tokens", type=int, default=None)
     sweep.add_argument("--output-budget", type=int, default=None)
-    sweep.add_argument("--deployment", choices=("auto", "pd", "pd_disaggregated", "colocated"), default="auto")
+    sweep.add_argument(
+        "--deployment", "--deployment-mode", dest="deployment",
+        choices=("colocated", "pd_disaggregated", "pd_prefill", "pd_decode"), default=None,
+    )
     sweep.add_argument("--pd-transfer-mode",
                        choices=("auto", "direct_blocking_d2d", "layerwise_overlap_d2d", "pooled_dram_ssd"), default=None)
     sweep.add_argument("--kv-transfer-bw-gbps", type=float, default=None)

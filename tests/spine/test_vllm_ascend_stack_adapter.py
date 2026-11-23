@@ -727,3 +727,208 @@ def test_h2a_to_h2b_curated_hf_and_unquantized_checkpoint_seam() -> None:
     assert qwen_ports[("target", 0, "lm_head")].linear_method == "dense"
     assert qwen_ports[("target", 0, "q_proj")].linear_method == "mx_fp8"
     assert qwen_ports[("target", 0, "mlp.gate_proj")].linear_method == "mx_fp8"
+
+
+def test_hf_awq_gptq_compressed_quark_and_all_modelslim_weight_tags() -> None:
+    """Zero silent BF16 degradation on AWQ/GPTQ/Compressed-Tensors/Quark and 100% weight tag coverage."""
+    from mindie_sim.catalog.checkpoint_reader import (
+        KNOWN_MODELSLIM_WEIGHT_TAGS,
+        read_hf_quantization_config,
+    )
+    from mindie_sim.stacks.vllm_ascend.quant_policy import resolve_raw_tag_to_abi
+
+    # Every declared weight tag in checkpoint_reader resolves cleanly on A5 without unknown_checkpoint_quant_tag.
+    for raw_tag in sorted(KNOWN_MODELSLIM_WEIGHT_TAGS):
+        abi = resolve_raw_tag_to_abi(raw_tag, hw_family="a5")
+        if raw_tag not in {"FLOAT", "BF16", "FP16", "NONE"}:
+            assert abi.linear_method != "dense", f"unexpected dense fallback for {raw_tag}"
+
+    adapter = VllmAscendStackAdapter()
+    model = load_model("qwen3-32b")
+    a5_hw = _hw(GEN5_DT_SKU)
+    par = ParallelSpec(tp=4)
+    opts = adapter.resolve_options(
+        model, a5_hw, par, role="colocated", track="shipping", requested_options={}, field_origins={},
+    )
+
+    hf_cases = (
+        ("awq_w4", {"quant_method": "awq", "bits": 4, "group_size": 128}, "w4a16", "int4", (1, 128)),
+        ("gptq_w4", {"quant_method": "gptq", "bits": 4, "group_size": 128}, "w4a16", "int4", (1, 128)),
+        ("gptq_w8", {"quant_method": "gptq", "bits": 8, "group_size": 128}, "w4a16", "int8", (1, 128)),
+        (
+            "ct_w4a16",
+            {
+                "quant_method": "compressed-tensors",
+                "format": "pack-quantized",
+                "config_groups": {"group_0": {"weights": {"type": "int", "num_bits": 4, "group_size": 128}}},
+            },
+            "w4a16", "int4", (1, 128),
+        ),
+        (
+            "ct_w4a8",
+            {
+                "quant_method": "compressed-tensors",
+                "format": "int-quantized",
+                "config_groups": {
+                    "group_0": {
+                        "weights": {"type": "int", "num_bits": 4, "group_size": 128},
+                        "input_activations": {"type": "int", "num_bits": 8},
+                    },
+                },
+            },
+            "w4a8", "int4", (1, 128),
+        ),
+        (
+            "quark_fp8",
+            {"quant_method": "quark", "global_quant_config": {"weight": {"dtype": "fp8_e4m3", "group_size": 128}}},
+            "fp8", "fp8_e4m3", (1, 128),
+        ),
+        (
+            "quark_mxfp4",
+            {
+                "quant_method": "quark",
+                "global_quant_config": {
+                    "weight": {"dtype": "fp4_e2m1", "group_size": 32},
+                    "input_tensors": {"dtype": "fp8_e4m3"},
+                },
+            },
+            "mx_fp4", "fp4_e2m1", (1, 32),
+        ),
+        (
+            "quark_int8",
+            {"quant_method": "quark", "global_quant_config": {"weight": {"dtype": "int8"}}},
+            "w8a8", "int8", (),
+        ),
+    )
+    for label, qcfg, exp_method, exp_wdtype, exp_blk in hf_cases:
+        ckpt = read_hf_quantization_config(
+            {"model_type": "qwen3", "torch_dtype": "bfloat16", "quantization_config": qcfg},
+            checkpoint_id=f"org/{label}",
+        )
+        qplan = adapter.resolve_quant_instantiation(
+            model, ckpt, a5_hw, par, opts, role="colocated", phase="decode",
+        )
+        ports = _port_map(qplan)
+        q_abi = ports[("target", 0, "q_proj")]
+        assert q_abi.linear_method == exp_method, label
+        assert q_abi.weight_dtype == exp_wdtype, label
+        if exp_blk:
+            assert q_abi.weight_block == exp_blk, label
+        # Constructor quant_config=None modules remain native BF16 across all 4 formats.
+        assert ports[("target", 0, "embed_tokens")].linear_method == "dense", label
+        assert ports[("target", 0, "lm_head")].linear_method == "dense", label
+
+
+def test_curated_expert_kv_engram_and_speculative_conv_abi_fidelity() -> None:
+    """Lock curated expert path aliases, dynamic KV/index tags, Engram tables, and speculative conv rollback."""
+    from mindie_sim.catalog.checkpoint_reader import lookup_curated_checkpoint
+
+    adapter = VllmAscendStackAdapter()
+    a5_hw, a3_hw = _hw(GEN5_DT_SKU), _hw(GEN3_SKU)
+    par8 = ParallelSpec(tp=8, ep=8)
+
+    # 1. DeepSeek-V4.1-Flash A3 w4a8 (ffn.experts.*.w1/w2/w3) & HF FP4 (1, 32) expert block + 196.61 GB Engram tables.
+    ds_model = load_model("deepseek-v4.1-flash")
+    ds_w4a8_ckpt = lookup_curated_checkpoint("Eco-Tech/DeepSeek-V4.1-Flash-1017-w4a8")
+    assert ds_w4a8_ckpt is not None
+    ds_a3_opts = adapter.resolve_options(
+        ds_model, a3_hw, par8, role="colocated", track="shipping", requested_options={}, field_origins={},
+    )
+    ds_a3_plan = adapter.resolve_quant_instantiation(
+        ds_model, ds_w4a8_ckpt, a3_hw, par8, ds_a3_opts, role="colocated", phase="decode",
+    )
+    ds_a3_ports = _port_map(ds_a3_plan)
+    assert ds_a3_ports[("target", 0, "mlp.experts.w13")].linear_method == "w4a8"
+    assert ds_a3_ports[("target", 0, "mlp.experts.w2")].linear_method == "w4a8"
+    assert ds_a3_ports[("target", 0, "mlp.shared_expert.gate_proj")].linear_method == "w8a8"
+    assert ds_a3_ports[("target", 0, "mla.q_b_proj")].linear_method == "w8a8"
+    engram_abis = [a for a in ds_a3_plan.recurrent_state_abi if a.component_role == "engram_table"]
+    assert tuple(a.native_layer for a in engram_abis) == (1, 14)
+    assert engram_abis[0].total_plane_bytes() == 196_611_158_016
+    assert engram_abis[1].total_plane_bytes() == 196_616_541_184
+
+    ds_hf_ckpt = lookup_curated_checkpoint("deepseek-ai/DeepSeek-V4.1-Flash-1017")
+    assert ds_hf_ckpt is not None
+    ds_a5_opts = adapter.resolve_options(
+        ds_model, a5_hw, par8, role="colocated", track="shipping", requested_options={}, field_origins={},
+    )
+    ds_a5_ports = _port_map(adapter.resolve_quant_instantiation(
+        ds_model, ds_hf_ckpt, a5_hw, par8, ds_a5_opts, role="colocated", phase="decode",
+    ))
+    assert ds_a5_ports[("target", 3, "mla.q_a_proj")].weight_block == (32, 32)
+    assert ds_a5_ports[("target", 3, "mlp.experts.w13")].weight_block == (1, 32)
+
+    # 2. Step-5 ModelSlim moe.{gate,up,down}_proj resolves MXFP8 on L3..87 and FLOAT on L88..90.
+    step5_model = load_model("step-5-preview")
+    step5_ms_ckpt = lookup_curated_checkpoint("Eco-Tech/Step-5-Preview-w8a8-mxfp8")
+    assert step5_ms_ckpt is not None
+    step5_opts = adapter.resolve_options(
+        step5_model, a5_hw, par8, role="colocated", track="shipping", requested_options={}, field_origins={},
+    )
+    step5_ports = _port_map(adapter.resolve_quant_instantiation(
+        step5_model, step5_ms_ckpt, a5_hw, par8, step5_opts, role="colocated", phase="decode",
+    ))
+    assert step5_ports[("target", 10, "mlp.experts.w13")].linear_method == "mx_fp8"
+    assert step5_ports[("target", 10, "mlp.experts.w2")].linear_method == "mx_fp8"
+    for tail_l in (88, 89, 90):
+        assert step5_ports[("target", tail_l, "mlp.experts.w13")].linear_method == "dense"
+        assert step5_ports[("target", tail_l, "mlp.experts.w2")].linear_method == "dense"
+
+    # 3. GLM-5.3 MXFP8_DYNAMIC/INT8_DYNAMIC KV+index & DeepSeek-R1 QuaRot FAKQuant KV + appended L61 MTP.
+    glm_model = load_model("glm-5.3-flash")
+    glm_mx_ckpt = lookup_curated_checkpoint("Eco-Tech/GLM-5.3-W8A8C8-mxfp8")
+    assert glm_mx_ckpt is not None
+    glm_a5_opts = adapter.resolve_options(
+        glm_model, a5_hw, par8, role="colocated", track="shipping", requested_options={}, field_origins={},
+    )
+    glm_mx_plan = adapter.resolve_quant_instantiation(
+        glm_model, glm_mx_ckpt, a5_hw, par8, glm_a5_opts, role="colocated", phase="decode",
+    )
+    assert glm_mx_plan.kv_cache_abi[0].planes[0].dtype == "fp8_e4m3"
+    assert glm_mx_plan.kv_cache_abi[0].planes[1].dtype == "e8m0"
+    assert glm_mx_plan.index_cache_abi[0].planes[0].dtype == "fp8_e4m3"
+
+    glm_c8_ckpt = lookup_curated_checkpoint("Eco-Tech/GLM-5.3-w8a8c8")
+    assert glm_c8_ckpt is not None
+    glm_a3_opts = adapter.resolve_options(
+        glm_model, a3_hw, par8, role="colocated", track="shipping", requested_options={}, field_origins={},
+    )
+    glm_c8_plan = adapter.resolve_quant_instantiation(
+        glm_model, glm_c8_ckpt, a3_hw, par8, glm_a3_opts, role="colocated", phase="decode",
+    )
+    assert glm_c8_plan.kv_cache_abi[0].planes[0].dtype == "int8"
+    assert glm_c8_plan.index_cache_abi[0].planes[0].dtype == "int8"
+
+    from mindie_sim.compose.inputs import ensure_native_mla_draft
+
+    r1_model = ensure_native_mla_draft(load_model("deepseek-r1"), 1)
+    r1_ckpt = lookup_curated_checkpoint("Eco-Tech/DeepSeek-R1-0528-w4a8c8-mtp-QuaRot")
+    assert r1_ckpt is not None
+    r1_opts = adapter.resolve_options(
+        r1_model, a3_hw, par8, role="colocated", track="shipping", requested_options={}, field_origins={},
+    )
+    r1_plan = adapter.resolve_quant_instantiation(
+        r1_model, r1_ckpt, a3_hw, par8, r1_opts, role="colocated", phase="decode",
+    )
+    assert r1_plan.kv_cache_abi[0].planes[0].dtype == "int8"
+    r1_ports = _port_map(r1_plan)
+    assert r1_ports[("draft", 0, "mlp.experts.w13")].linear_method == "w8a8"
+    assert r1_ports[("draft", 0, "mlp.experts.w2")].linear_method == "w8a8"
+
+    # 4. Qwen3.8 GDN speculative conv rollback residency (122,880 B at K=3 vs 61,440 B at K=0) + replay_records.
+    qwen_model = load_model("qwen3.8-flash-next")
+    qwen_ckpt = lookup_curated_checkpoint("Eco-Tech/Qwen3.8-Flash-Next-w4a8-mxfp")
+    assert qwen_ckpt is not None
+    par1 = ParallelSpec(tp=1, ep=1)
+    qwen_k3_opts = adapter.resolve_options(
+        qwen_model, a5_hw, par1, role="pd_decode", track="proposed",
+        requested_options={"num_speculative_tokens": 3},
+        field_origins={"num_speculative_tokens": "cli_flag"},
+    )
+    qwen_k3_plan = adapter.resolve_quant_instantiation(
+        qwen_model, qwen_ckpt, a5_hw, par1, qwen_k3_opts, role="pd_decode", phase="decode",
+    )
+    gdn0 = next(a for a in qwen_k3_plan.recurrent_state_abi if a.component_role == "recurrent_state")
+    plane_bytes = {p.plane_id: p.bytes_per_unit for p in gdn0.planes}
+    assert plane_bytes["conv_history"] == 122_880
+    assert plane_bytes["replay_records"] == 197_376

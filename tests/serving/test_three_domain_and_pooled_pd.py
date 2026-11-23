@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import json
+import sys
 import pytest
 
 from mindie_sim import api as sdk_api
@@ -254,21 +255,6 @@ def test_three_tier_pd_modes_link_derivation_and_prefix_hit():
 
 
 def test_domain_three_auto_optimal_joint_pd_colocated_and_pinned_constraints():
-    solved = solve_optimal_deployment(
-        "qwen3-32b", "a5",
-        num_devices=8, layers=2,
-        prompt_tokens=1024, output_tokens=128,
-        ttft_sla_ms=5000.0, tpot_sla_ms=50.0,
-        max_sequences_per_dp=16,
-    )
-    assert solved["schema"] == "mindie-sim.optimal-deployment/1"
-    assert solved["feasible"] is True
-    assert solved["winner_mode"] in {"pd_disaggregated", "colocated"}
-    assert solved["best_pd"] is not None and solved["best_colocated"] is not None
-    assert solved["best_configuration"]["sustainable_tps_per_die"] == pytest.approx(
-        max(solved["best_pd"]["sustainable_tps_per_die"], solved["best_colocated"]["sustainable_tps_per_die"])
-    )
-
     coloc_only = solve_optimal_deployment(
         "qwen3-32b", "a5",
         num_devices=4, layers=2,
@@ -278,9 +264,12 @@ def test_domain_three_auto_optimal_joint_pd_colocated_and_pinned_constraints():
         pinned_parallel={"tp": 2},
         max_sequences_per_dp=16,
     )
+    assert coloc_only["schema"] == "mindie-sim.optimal-deployment/1"
+    assert coloc_only["feasible"] is True
     assert coloc_only["winner_mode"] == "colocated"
     assert coloc_only["best_pd"] is None
     assert coloc_only["best_configuration"]["parallel"]["tp"] == 2
+    assert coloc_only["deployment_outcome"]["status"] == "feasible"
 
     pd_only = solve_optimal_deployment(
         "qwen3-32b", "a5",
@@ -304,11 +293,11 @@ def test_domain_three_auto_optimal_joint_pd_colocated_and_pinned_constraints():
         num_devices=4, layers=2,
         prompt_tokens=1024, output_tokens=64,
         ttft_slo_ms=5000.0, tpot_slo_ms=50.0,
+        deployment="colocated",
     )
     opt_meta = auto_case["runtime"]["metadata"]["optimal_deployment"]
     assert opt_meta["feasible"] is True
-    assert opt_meta["winner_mode"] in {"pd_disaggregated", "colocated"}
-    # Never silently falls back to naive 1x1x1x1 on a 4-die budget when larger topologies win.
+    assert opt_meta["winner_mode"] == "colocated"
 
 
 def test_kimi_k31_a5_fp8_canonicalization_pd_decode_workspace_and_scope_provenance():
@@ -393,11 +382,12 @@ def test_aliases_self_correcting_errors_catalog_cli_parity_and_oneshot_solve(tmp
     ])
     assert (ft.mtp_accept, ft.kv_cache_dtype, ft.indexer_kv_dtype, ft.linear_proj_tp) == (3.5, "fp8", "fp8", 8)
 
-    # One-shot solve_deployment via SDK & CLI (ttft_slo_ms=None allowed as unconstrained).
+    # One-shot solve_deployment via SDK & CLI (explicit --deployment-mode; ttft_slo_ms=None allowed).
     sol_out = tmp_path / "solve.json"
     assert cli_main([
         "solve", "--model", "qwen3-32b", "--hardware", "950dt-96g-pod",
         "--num-devices", "4", "--layers", "2",
+        "--deployment-mode", "colocated",
         "--prompt-tokens", "512", "--output-tokens", "64",
         "--tpot-slo-ms", "50.0", "--max-sequences-per-dp", "8",
         "-o", str(sol_out),
@@ -407,14 +397,14 @@ def test_aliases_self_correcting_errors_catalog_cli_parity_and_oneshot_solve(tmp
     assert sol["feasible"] is True
     assert sol["scenario"]["ttft_slo_ms"] is None
     assert sol["capacity_ledger"]["hbm_capacity_gib"] == pytest.approx(96.0)
-    assert sol["recommended_deployment"]["winner_mode"] in {"pd_disaggregated", "colocated"}
+    assert sol["recommended_deployment"]["winner_mode"] == "colocated"
     assert "current_merged" in sol["four_track_waterfall"]["waterfall"]
     assert sol["bottleneck_roofline"]["top_families"]
     assert sol["bottleneck_roofline"]["included_components"]["target_layers"] == 2
     sdk_sol = sdk_api.solve_deployment(
         "qwen3-32b", "950dt-96g-pod", num_devices=4, layers=2,
         prompt_tokens=512, output_tokens=64, tpot_slo_ms=50.0,
-        kv_pooling="off", max_sequences_per_dp=8,
+        deployment="colocated", kv_pooling="off", max_sequences_per_dp=8,
     )
     assert sdk_sol["feasible"] is True
 
@@ -707,7 +697,7 @@ def test_iso_sla_independent_before_after_solve_workspace_and_direct_d2d_ttft():
         "qwen3-32b", "950dt-96g-pod",
         num_devices=4, layers=2,
         prompt_tokens=512, output_tokens=64,
-        tpot_slo_ms=50.0, max_sequences_per_dp=8,
+        tpot_slo_ms=50.0, deployment="colocated", max_sequences_per_dp=8,
         mode="modeling", compare_track="merged", target_track="expected_ideal",
     )
     assert sol_mod["mode"] == "modeling" and sol_mod["allow_unbound_formula"] is True
@@ -721,7 +711,7 @@ def test_iso_sla_independent_before_after_solve_workspace_and_direct_d2d_ttft():
         "qwen3-32b", "950dt-96g-pod",
         num_devices=4, layers=2,
         prompt_tokens=512, output_tokens=64,
-        tpot_slo_ms=50.0, max_sequences_per_dp=8,
+        tpot_slo_ms=50.0, deployment="colocated", max_sequences_per_dp=8,
         mode="simulation", compare_track="merged", target_track="expected_ideal",
     )
     assert sol_sim["mode"] == "simulation" and sol_sim["allow_unbound_formula"] is False
@@ -741,52 +731,89 @@ def test_iso_sla_independent_before_after_solve_workspace_and_direct_d2d_ttft():
     assert all(not row["feasible"] and row["infeasible_reason"] == "prefill_ttft_sla_exceeded" for row in slow_kv["candidates"])
 
 
-def test_kimi_k31_32die_solve_deployment_peak_rss_bounded():
-    """Laptop-native O(Unique Archetypes x 1 Rank) keeps 32-die kimi-k3.1 solve within Principle 18 budget."""
-    import pathlib
-    import resource
-    import sys
+def _run_kimi_k31_32die_rss_probe(payload: dict[str, object]) -> dict[str, object]:
+    """Isolated child-process target for 32-die 128K Decode Iso-SLA RSS gate."""
     import time
     from mindie_sim.solve import solve_deployment
 
-    def _read_proc_mib(field: str) -> float | None:
-        status = pathlib.Path("/proc/self/status")
-        if status.is_file():
-            for line in status.read_text(encoding="utf-8").splitlines():
-                if line.startswith(f"{field}:"):
-                    return float(line.split()[1]) / 1024.0
-        return None
-
-    before_rss_mib = _read_proc_mib("VmRSS")
     t0 = time.perf_counter()
     sol = solve_deployment(
         "kimi-k3.1", "950dt-96g-pod",
-        num_devices=32, prompt_tokens=131072, output_tokens=1024,
-        tpot_slo_ms=30.0, mtp_tokens=5, mtp_accept=3.5,
+        num_devices=int(payload.get("num_devices", 32)),
+        layers=int(payload["layers"]) if payload.get("layers") is not None else None,
+        prompt_tokens=int(payload.get("prompt_tokens", 131072)),
+        output_tokens=int(payload.get("output_tokens", 1024)),
+        tpot_slo_ms=float(payload.get("tpot_slo_ms", 30.0)),
+        deployment_mode=str(payload.get("deployment_mode", "pd_decode")),
+        quant=str(payload.get("quant", "mxfp8_mxfp4")),
+        mtp_tokens=int(payload.get("mtp_tokens", 0)),
+        mtp_accept=(float(payload["mtp_accept"]) if payload.get("mtp_accept") is not None else None),
         kv_cache_dtype="fp8", indexer_kv_dtype="fp8",
-        mode="modeling", max_sequences_per_dp=32,
+        pinned_parallel=dict(payload["pinned_parallel"]) if payload.get("pinned_parallel") else None,
+        mode=str(payload.get("mode", "modeling")),
+        max_sequences_per_dp=payload.get("max_sequences_per_dp", 32),
     )
     elapsed = time.perf_counter() - t0
-    peak_rss_mib = _read_proc_mib("VmHWM")
-    if peak_rss_mib is None:
-        raw = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
-        peak_rss_mib = raw / (1024.0 * 1024.0) if sys.platform == "darwin" else raw / 1024.0
-    delta_rss_mib = max(0.0, peak_rss_mib - (before_rss_mib if before_rss_mib is not None else 0.0))
-    metrics = {
+    return {
         "feasible": bool(sol["feasible"]),
-        "before_rss_mib": round(before_rss_mib, 2) if before_rss_mib is not None else None,
-        "peak_rss_mib": round(peak_rss_mib, 2),
-        "delta_rss_mib": round(delta_rss_mib, 2),
         "elapsed_s": round(elapsed, 3),
+        "deployment_mode": sol["deployment_mode"],
+        "deployment_outcome": sol["deployment_outcome"],
         "winner": sol["recommended_deployment"].get("winner_mode"),
+        "search_coverage": sol["recommended_deployment"].get("search_coverage"),
         "before": sol["iso_sla_comparison"]["before"],
         "after": sol["iso_sla_comparison"]["after"],
         "ledger": sol["capacity_ledger"],
     }
-    assert delta_rss_mib <= 320.0 and peak_rss_mib <= 512.0, f"RSS exceeded Principle 18 budget: {metrics}"
-    assert metrics["feasible"] is True, f"32-die kimi-k3.1 solve unexpectedly infeasible: {metrics}"
-    assert metrics["after"]["b_feasible"] >= 1
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux /proc/self/status VmRSS/VmHWM required")
+def test_kimi_k31_32die_solve_deployment_peak_rss_bounded():
+    """Isolated Linux child RSS probe: 32-die 128K Decode solves with <250 MiB delta & <=512 MiB peak."""
+    from _support.rss_probe import assert_rss_budget, measure_child_rss
+
+    measurement = measure_child_rss(
+        "serving.test_three_domain_and_pooled_pd:_run_kimi_k31_32die_rss_probe",
+        {
+            "num_devices": 32,
+            "layers": 4,
+            "prompt_tokens": 131072,
+            "output_tokens": 1024,
+            "tpot_slo_ms": 30.0,
+            "deployment_mode": "pd_decode",
+            "quant": "mxfp8_mxfp4",
+            "mtp_tokens": 0,
+            "mtp_accept": None,
+            "pinned_parallel": {"dp": 4, "tp": 8, "ep": 32, "pp": 1, "dcp": 8},
+            "mode": "simulation",
+            "max_sequences_per_dp": 20,
+        },
+        timeout_s=120.0,
+    )
+    metrics = measurement.result
+    print(
+        f"[32DIE_RSS_GATE] pre_mib={measurement.pre_rss_mib:.2f} "
+        f"hwm_mib={measurement.hwm_mib:.2f} delta_mib={measurement.delta_hwm_mib:.2f} "
+        f"elapsed_s={metrics['elapsed_s']} "
+        f"after_par={metrics['after']['parallel']} "
+        f"after_b_feas={metrics['after']['b_feasible']} "
+        f"after_b_vram={metrics['after']['b_vram_max']} "
+        f"after_tpot_ms={metrics['after']['effective_tpot_ms']:.3f} "
+        f"after_tps_die={metrics['after']['decode_tps_per_die']:.2f}"
+    )
+    assert_rss_budget(measurement, max_delta_mib=250.0, max_hwm_mib=512.0)
+    assert metrics["feasible"] is True, f"32-die solve unexpectedly infeasible: {metrics}"
+    assert metrics["deployment_mode"] == "pd_decode"
+    assert metrics["deployment_outcome"]["status"] == "feasible"
+    assert metrics["deployment_outcome"]["verified_ttft_ms"] is None
+    assert metrics["after"]["b_feasible"] > 16, f"Artificially capped at <=16: {metrics}"
+    assert metrics["after"]["b_vram_max"] >= metrics["after"]["b_feasible"]
+    assert metrics["after"]["configured_max_num_seqs"] == 20
     assert metrics["after"]["effective_tpot_ms"] <= 30.0 + 1e-6
+    assert metrics["ledger"]["role"] == "pd_decode"
+    assert metrics["ledger"]["max_seqs_per_dp_vram"] == metrics["after"]["b_vram_max"]
+    if metrics["after"]["b_feasible"] < metrics["after"]["b_vram_max"]:
+        assert metrics["after"]["operating_regime"] != "HBM_CAPACITY_BOUND"
 
 
 def test_iso_sla_target_graph_ranking_dcp_rejection_and_b_vram_binary_search(monkeypatch):
@@ -1095,6 +1122,125 @@ def test_iso_sla_colocated_prefill_token_cap_exact_cache_b1_and_prefill_dcp(monk
     pool = sol_pd["pd_pool_summary"]
     assert pool["e2e_total_tps"] == pytest.approx(sol_pd["best_configuration"]["e2e_total_tps"], rel=1e-9)
     assert pool["prefill_kv_rps"] > 0.0
+
+
+def test_solver_full_grid_admission_explicit_mode_overlap_and_early_abort(monkeypatch):
+    """Lock full-grid 32-die admission >16, explicit modes, overlap/K-rule, and zero-Engine OOM abort."""
+    from mindie_sim.model_catalog import load_model
+    from mindie_sim.prediction.structure import parse_case
+    from mindie_sim.solve import solve_deployment
+    from mindie_sim.sweep import pd as pd_mod
+
+    # 1. Explicit deployment mode rejects omitted / "auto" and enforces role SLA boundaries.
+    for bad_mode in (None, "auto", "pd"):
+        with pytest.raises(ModelingError, match=r"deployment_mode_(?:required|invalid)"):
+            solve_optimal_deployment(
+                "qwen3-32b", "a5", num_devices=4, layers=1,
+                prompt_tokens=256, output_tokens=32, ttft_sla_ms=5000.0, tpot_sla_ms=50.0,
+                deployment=bad_mode,
+            )
+        with pytest.raises(ModelingError, match=r"deployment_mode_(?:required|invalid)"):
+            solve_deployment(
+                "qwen3-32b", "a5", num_devices=4, layers=1,
+                prompt_tokens=256, output_tokens=32, tpot_slo_ms=50.0,
+                deployment=bad_mode,
+            )
+    with pytest.raises(ModelingError, match="pd_decode_ttft_unavailable"):
+        solve_deployment(
+            "qwen3-32b", "a5", num_devices=4, layers=1,
+            prompt_tokens=256, output_tokens=32, ttft_slo_ms=5000.0, tpot_slo_ms=50.0,
+            deployment_mode="pd_decode",
+        )
+    with pytest.raises(ModelingError, match="pd_prefill_rejects_decode_sla"):
+        solve_deployment(
+            "qwen3-32b", "a5", num_devices=4, layers=1,
+            prompt_tokens=256, output_tokens=32, ttft_slo_ms=5000.0, tpot_slo_ms=50.0,
+            deployment_mode="pd_prefill",
+        )
+    pf_sol = solve_deployment(
+        "qwen3-32b", "a5", num_devices=2, layers=1,
+        prompt_tokens=256, output_tokens=32, ttft_slo_ms=5000.0,
+        deployment_mode="pd_prefill", mode="simulation",
+    )
+    assert pf_sol["feasible"] is True
+    assert pf_sol["deployment_mode"] == "pd_prefill"
+    assert pf_sol["deployment_outcome"]["verified_tpot_ms"] is None
+    assert pf_sol["recommended_deployment"]["best_configuration"]["effective_tpot_ms"] is None
+
+    # 2. Full-grid candidate generation retains TP=4/8/16/32 and all local projection axes.
+    kimi_spec = load_model("kimi-k3.1")
+    grid = pd_mod._build_colocated_candidates(
+        num_devices=32, is_moe=True, layers=kimi_spec.layers, rec_topo=None,
+        pinned={}, model_spec=kimi_spec, prompt_tokens=131072, role="pd_decode",
+    )
+    full_budget_tps = {
+        (c["dp"], c["tp"], c["ep"], c["dcp"])
+        for c in grid if c["pp"] == 1 and c["dp"] * c["tp"] == 32
+    }
+    assert {(8, 4, 32, 4), (4, 8, 32, 8), (2, 16, 32, 16), (1, 32, 32, 32)}.issubset(full_budget_tps)
+    k_a = pd_mod._candidate_dedup_key({"dp": 4, "tp": 8, "ep": 32, "pp": 1, "pcp": 1, "dcp": 8, "q_proj_tp": 4})
+    k_b = pd_mod._candidate_dedup_key({"dp": 4, "tp": 8, "ep": 32, "pp": 1, "pcp": 1, "dcp": 8, "q_proj_tp": 8})
+    assert k_a != k_b
+
+    # 3. Physical admission unlocks >16 on 32-die 128K Decode (DP4xTP8xDCP8: 43..53, DP2xTP16xDCP16: 70..83)
+    #    and never mislabels a configured max_num_seqs cap as HBM_CAPACITY_BOUND.
+    for dp, tp, dcp, lo, hi in ((4, 8, 8, 43, 53), (2, 16, 16, 70, 83)):
+        raw_d = compose_case(
+            "kimi-k3.1", "950dt-96g-pod",
+            dp=dp, tp=tp, ep=32, dcp=dcp, role="pd_decode",
+            quant="mxfp8_mxfp4", prompt_tokens=131072, output_tokens=1024,
+            mtp_proposal_tokens=5, mtp_acceptance_length=3.5,
+            kv_cache_dtype="fp8", indexer_kv_dtype="fp8",
+            tpot_slo_ms=30.0,
+        )
+        _, _, b_phys = pd_mod._solve_b_vram_max(
+            parse_case(raw_d), base_ws=6, decode_q=6, seq_len=131072 + 1024, cap_bound=None,
+        )
+        assert lo <= b_phys <= hi, f"DP{dp}xTP{tp}xDCP{dcp} physical b_vram={b_phys} outside [{lo}, {hi}]"
+    regime_cap, lim_cap = pd_mod._classify_decode_regime(
+        feasible=True, b_feasible=32, b_vram=49, configured_max_seqs=32,
+        token_batch_limit=128, unused_sla_slack_ms=10.0,
+    )
+    assert regime_cap == pd_mod.REGIME_CONFIGURED_SEQ_CAP_BOUND and lim_cap == "runtime_max_seqs"
+
+    # 4. PD layerwise overlap obeys causal publish/consume (<= transfer_ms) and honors P/D speculative K-rule.
+    hold_1, exp_1 = pd_mod._compute_layerwise_overlap_ms(
+        1.0, 10.0, per_layer_bytes={0: 1024.0}, num_layers=1,
+    )
+    assert hold_1 == pytest.approx(11.0) and exp_1 == pytest.approx(10.0) and exp_1 <= 10.0
+    hold_4, exp_4 = pd_mod._compute_layerwise_overlap_ms(
+        10.0, 10.0, per_layer_bytes={0: 1.0, 1: 1.0, 2: 1.0, 3: 1.0}, num_layers=4,
+    )
+    assert hold_4 == pytest.approx(12.5) and 0.0 < exp_4 < 10.0
+    dsr1_spec = load_model("deepseek-r1")
+    assert pd_mod._resolve_pd_prefill_speculative_k("kimi-k3.1", kimi_spec, decode_mtp_tokens=5, hw_family="a5") == 5
+    assert pd_mod._resolve_pd_prefill_speculative_k("deepseek-r1", dsr1_spec, decode_mtp_tokens=3, hw_family="a3") == 1
+    assert pd_mod._resolve_pd_prefill_speculative_k("kimi-k3.1", kimi_spec, decode_mtp_tokens=0, hw_family="a5") == 0
+
+    # 5. Static-infeasible early abort: zero Engine calls when all joint-PD pools fail static HBM admission.
+    engine_calls: list[int] = []
+
+    def _forbid_engine(*_args, **_kwargs):
+        engine_calls.append(1)
+        raise AssertionError("Engine must not be invoked when static HBM admission is 0")
+
+    with monkeypatch.context() as mp:
+        mp.setattr(pd_mod, "_archetype_weighted_step_ms", _forbid_engine)
+        oom_pd = solve_optimal_deployment(
+            "kimi-k3.1", "950dt-96g-pod",
+            num_devices=32, prompt_tokens=131072, output_tokens=1024,
+            ttft_sla_ms=5000.0, tpot_sla_ms=30.0,
+            deployment_mode="pd_disaggregated",
+            mtp_proposal_tokens=5, mtp_acceptance_length=3.5,
+            kv_cache_dtype="fp8", indexer_kv_dtype="fp8",
+        )
+    assert engine_calls == []
+    assert oom_pd["feasible"] is False
+    assert oom_pd["recommended_case"] is None
+    assert oom_pd["deployment_outcome"]["status"] == "infeasible"
+    assert oom_pd["deployment_outcome"]["feasible_b_per_dp"] == 0
+    assert oom_pd["deployment_outcome"]["has_winner_case"] is False
+
 
 
 

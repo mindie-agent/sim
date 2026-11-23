@@ -1460,9 +1460,9 @@ def test_solve_target_graph_accepts_public_prepare_scenario_sealed_plan_and_reje
         build_export_bundle(raw, request=req, apply_target_envelope=True, rewrite_plan=replace(dossier.unmerge_plan, framing_sha256="a" * 64), allow_unbound_formula=False)
     assert optimize_ladder(case, req, max_trials=1, allow_unbound_formula=True) is not None
     from mindie_sim.sweep.pd import solve_optimal_deployment
-    sol0 = solve_optimal_deployment("qwen3-32b", REPRESENTATIVE_SKUS["a5"], num_devices=1, prompt_tokens=128, output_tokens=1, ttft_sla_ms=5000.0, tpot_sla_ms=100.0, layers=1, feature_track="unmerged_pr", apply_target_envelope=False)
+    sol0 = solve_optimal_deployment("qwen3-32b", REPRESENTATIVE_SKUS["a5"], num_devices=1, prompt_tokens=128, output_tokens=1, ttft_sla_ms=5000.0, tpot_sla_ms=100.0, deployment="colocated", layers=1, feature_track="unmerged_pr", apply_target_envelope=False)
     dos_p = prepare_scenario(ScenarioRequest(case=parse_case(sol0["recommended_case"]), step=StepRequest(phase="prefill", tokens=128, context=0, sequences=1)))
-    sol_p = solve_deployment("qwen3-32b", REPRESENTATIVE_SKUS["a5"], num_devices=1, prompt_tokens=128, output_tokens=1, ttft_slo_ms=5000.0, tpot_slo_ms=100.0, layers=1, mode="simulation", compare_track="unmerged_pr", rewrite_plan=dos_p.unmerge_plan)
+    sol_p = solve_deployment("qwen3-32b", REPRESENTATIVE_SKUS["a5"], num_devices=1, prompt_tokens=128, output_tokens=1, ttft_slo_ms=5000.0, tpot_slo_ms=100.0, deployment="colocated", layers=1, mode="simulation", compare_track="unmerged_pr", rewrite_plan=dos_p.unmerge_plan)
     assert sol_p["feasible"] is True and sol_p["recommended_deployment"]["best_configuration"]["ttft_ms"] > 0.0
 
 

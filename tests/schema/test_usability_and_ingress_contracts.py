@@ -257,17 +257,17 @@ def test_contradictory_solve_inputs_raise_modeling_error() -> None:
     with pytest.raises(ModelingError):
         solve_optimal_deployment(
             "deepseek-v2-lite", "a3", num_devices=8, prompt_tokens=1024, output_tokens=64,
-            ttft_sla_ms=5000.0, tpot_sla_ms=50.0, quant="mxfp4",
+            ttft_sla_ms=5000.0, tpot_sla_ms=50.0, deployment="colocated", quant="mxfp4",
         )
     with pytest.raises(ModelingError):
         solve_optimal_deployment(
             "deepseek-v2-lite", "a5", num_devices=8, prompt_tokens=1024, output_tokens=64,
-            ttft_sla_ms=5000.0, tpot_sla_ms=50.0, pinned_parallel={"tpp": 1},
+            ttft_sla_ms=5000.0, tpot_sla_ms=50.0, deployment="colocated", pinned_parallel={"tpp": 1},
         )
     with pytest.raises(ModelingError):
         solve_optimal_deployment(
             "deepseek-v2-lite", "a5", num_devices=8, prompt_tokens=1024, output_tokens=64,
-            ttft_sla_ms=5000.0, tpot_sla_ms=50.0,
+            ttft_sla_ms=5000.0, tpot_sla_ms=50.0, deployment="pd_disaggregated",
             pd_transfer_mode="layerwise_overlap_d2d", pool_ssd_ratio=0.5,
         )
 
@@ -277,6 +277,7 @@ def test_minimal_sdk_cli_and_infeasible_honesty(tmp_path) -> None:
     solved = api.solve_deployment(
         "deepseek-v2-lite", hardware="a5", num_devices=2, layers=2,
         prompt_tokens=1024, output_tokens=64, ttft_slo_ms=5000.0, tpot_slo_ms=50.0,
+        deployment="colocated",
     )
     assert solved["feasible"] is True
     assert solved["recommended_deployment"]["best_configuration"] is not None
@@ -285,6 +286,7 @@ def test_minimal_sdk_cli_and_infeasible_honesty(tmp_path) -> None:
     auto_tpot = compose_case(
         "deepseek-v2-lite", hardware="a5", num_devices=2, layers=2,
         prompt_tokens=1024, output_tokens=64, tpot_slo_ms=50.0,
+        deployment="colocated",
     )
     assert auto_tpot["machine"]["sku"] == "Ascend950DT_9582"
 
@@ -292,6 +294,7 @@ def test_minimal_sdk_cli_and_infeasible_honesty(tmp_path) -> None:
     infeasible = solve_optimal_deployment(
         "deepseek-v2-lite", "a5", num_devices=1, layers=2,
         prompt_tokens=1024, output_tokens=64, ttft_sla_ms=0.01, tpot_sla_ms=0.01,
+        deployment="colocated",
     )
     assert infeasible["feasible"] is False
     assert infeasible["recommended_case"] is None
