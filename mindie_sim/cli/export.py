@@ -8,7 +8,7 @@
       chip-matched ``auto_va`` production quantization),
   (3) ``export-trace`` (1:1 Ascend ``msprof`` ``trace_view.json`` from a case JSON),
   (4) ``export-xlsx`` (OOXML ``merge_cells`` comparison & Memory/Quant/PP workbook
-      from case JSON(s), with optional ``--kernel-designs-json`` Agent design overlay).
+      from case JSON(s); ``--kernel-designs-json`` is retired in favor of ``--rewrite-plan``).
 [Invariants] ``--out``/``--output``/``-o`` targets the exported trace/xlsx file
   (stored in ``dest="export_output"``) so the top-level CLI JSON emitter never
   overwrites exported artifacts; optional ``--receipt`` writes the structured
@@ -83,14 +83,7 @@ def _read_bounded_json_object(path: str | Path, label: str) -> dict[str, Any]:
 def _load_kernel_designs(path: str | None) -> Mapping[str, Mapping[str, str]] | None:
     if not path:
         return None
-    raw = _read_bounded_json_object(path, "kernel_designs")
-    designs: dict[str, dict[str, str]] = {}
-    for key, val in raw.items():
-        if isinstance(val, Mapping):
-            designs[str(key)] = {str(k): str(v) for k, v in val.items() if v is not None}
-        elif isinstance(val, str):
-            designs[str(key)] = {"design": val}
-    return designs
+    raise ModelingError("kernel_designs_prose_override_retired:use_rewrite_plan_for_verified_receipts")
 
 
 def _add_common_export_args(cmd: argparse.ArgumentParser) -> None:
@@ -155,7 +148,10 @@ def _add_oneshot_export_command(subparsers) -> None:
         default="auto",
         help="deployment mode label for Summary Block 1 (default: auto)",
     )
-    cmd.add_argument("--kernel-designs-json", default=None, help="optional JSON mapping kernel keys to Agent design/acceptance drafts")
+    cmd.add_argument(
+        "--kernel-designs-json", default=None,
+        help="[retired] prose override removed; raises ModelingError — use --rewrite-plan",
+    )
     cmd.add_argument("--observations", "--kernel-csv", dest="observations", default=None)
     cmd.add_argument("--include-submission", action="store_true")
     cmd.add_argument("--no-pipe-lanes", dest="include_pipe_lanes", action="store_false")
@@ -188,7 +184,10 @@ def add_export_commands(subparsers) -> None:
     xlsx_cmd.add_argument("--cache-dtype", default=None)
     xlsx_cmd.add_argument("--engram-offload", dest="engram_offload", action="store_true", default=None)
     xlsx_cmd.add_argument("--no-engram-offload", dest="engram_offload", action="store_false")
-    xlsx_cmd.add_argument("--kernel-designs-json", default=None, help="optional JSON mapping kernel keys to Agent design/acceptance drafts")
+    xlsx_cmd.add_argument(
+        "--kernel-designs-json", default=None,
+        help="[retired] prose override removed; raises ModelingError — use --rewrite-plan",
+    )
 
 
 def _run_oneshot_export(args: argparse.Namespace) -> dict[str, Any]:

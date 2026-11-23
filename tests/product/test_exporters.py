@@ -283,17 +283,20 @@ def test_xlsx_before_after_merge_cells_formulas_and_new_kernel_backlog(tmp_path)
             "acceptance": "Exposed collective attainment >= 75% Link L*",
         },
     }
+    from mindie_sim.schema.common import ModelingError
     xlsx_path = tmp_path / "comparison.xlsx"
     brief_path = tmp_path / "comparison_agent_brief.json"
+    with pytest.raises(ModelingError, match="kernel_designs_prose_override_retired"):
+        export_comparison_xlsx(b_bef, xlsx_path, compare_source=b_aft, agent_kernel_designs=designs)
     summary = export_comparison_xlsx(
-        b_bef, xlsx_path, compare_source=b_aft,
-        agent_kernel_designs=designs, agent_brief_path=brief_path,
+        b_bef, xlsx_path, compare_source=b_aft, agent_brief_path=brief_path,
     )
     assert SHEET_PENDING_KERNELS == "Pending_Kernel_Details" and SHEET_NEW_KERNELS == SHEET_PENDING_KERNELS
     assert summary.sheets == (SHEET_SUMMARY, SHEET_BREAKDOWN, SHEET_MEMORY, SHEET_PENDING_KERNELS)
     assert SHEET_MEASURED not in summary.sheets
     assert summary.has_comparison is True and summary.has_measured is False
-    assert summary.new_kernel_backlog_count >= 1 and summary.to_optimize_kernel_count >= 1
+    # Shipping N->1 (MLAPO) & 1->1 ops never inflate [需新开发融合算子]; shipping tuning cards clear >=0.050 ms.
+    assert summary.new_kernel_backlog_count == 0 and summary.to_optimize_kernel_count >= 1
     assert brief_path.is_file() and brief_path.stat().st_size < 8192
 
     sheet_names, roots, shared = _read_xlsx_sheets(xlsx_path)
@@ -351,32 +354,38 @@ def test_xlsx_before_after_merge_cells_formulas_and_new_kernel_backlog(tmp_path)
     pre_moe_idx = next(i for i, lbl in enumerate(arch1_roles) if "[Pre-MoE/FFN]" in lbl)
     assert pre_attn_idx == 0 and pre_moe_idx > pre_attn_idx + 2
 
-    # Verify 100% 4-view conservation: Step Δ == Sheet 1 Δ == Sheet 2 Δ == Sheet 4 Cards Δ.
+    # Verify 100% end-to-end conservation: Step Δ == Sheet 1 Δ == Sheet 2 Δ == Sheet 4 Waterfall Δ.
+    from mindie_sim.export.action_plan import build_comparison_plan
     macros = build_macro_module_breakdown(b_bef, b_aft)
-    cards = build_pending_kernel_details(aligned, b_aft, before_bundle=b_bef)
+    plan = build_comparison_plan(b_bef, b_aft, aligned)
     step_delta = (b_bef.step_span_us - b_aft.step_span_us) / 1000.0
     s1_delta = sum(m.before_ms - m.after_ms for m in macros)
     s2_delta = sum(
         (sum(b.exposed_dur_us for b in r.before_ops) - sum(a.exposed_dur_us for a in r.after_ops)) * r.repeat_count / 1000.0
         for r in aligned
     )
-    s4_delta = sum(c.expected_gain_ms for c in cards)
     assert s1_delta == pytest.approx(step_delta, abs=1e-4)
     assert s2_delta == pytest.approx(step_delta, abs=1e-4)
-    assert s4_delta == pytest.approx(step_delta, abs=1e-4)
+    assert plan.waterfall.reconciliation_error_ms == pytest.approx(0.0, abs=1e-6)
+    assert plan.waterfall.before_endpoint_error_ms == pytest.approx(0.0, abs=1e-4)
+    assert plan.waterfall.after_endpoint_error_ms == pytest.approx(0.0, abs=1e-4)
 
-    # Sheet 4 — Pending_Kernel_Details: Index + 3-Track Cards + structured overrides.
+    # Sheet 4 — Live Waterfall Ledger + receipt-driven high-signal cards (zero canned prose / env nags).
     s4 = _sheet_cells(roots[SHEET_PENDING_KERNELS], shared)
-    assert any(v == PENDING_KIND_TO_IMPLEMENT for v, _ in s4.values())
+    assert any(v and "Waterfall Ledger" in v for v, _ in s4.values())
+    assert s4["D3"][1] == "Summary!$B$14" and s4["D9"][1] == "Summary!$C$14"
+    assert s4["D10"][1] == "D8-D9"
+    assert any(f and "SUMIF(" in f and SHEET_BREAKDOWN in f for _, f in s4.values())
     assert any(v == PENDING_KIND_TO_OPTIMIZE for v, _ in s4.values())
+    assert not any(v == PENDING_KIND_TO_IMPLEMENT for v, _ in s4.values())
     assert any(v and v.startswith("Card #1 [") for v, _ in s4.values())
-    assert any(v and "① 已有特效开关与通信展开配置" in v for v, _ in s4.values())
-    assert any(v and "③ 推理框架改造要点" in v for v, _ in s4.values())
-    assert any(v and "Single-pass AIV vector tile" in v for v, _ in s4.values())
-    assert any(v and "BF16 abs_err <= 1e-3" in v for v, _ in s4.values())
-    assert any(v and "Register CustomOp in vllm_ascend" in v for v, _ in s4.values())
+    assert not any("① 已有特效开关与通信展开配置" in s for s in shared)
+    assert not any("避免 ACLGraph 图断裂" in s for s in shared)
+    assert not any("AIV/CCU" in s for s in shared)
+    assert not any("HCCL_OP_EXPANSION_MODE" in s for s in shared)
+    assert not any("Register CustomOp in vllm_ascend" in s for s in shared)
+    assert s4["B8"][1] == "SUM(B4:B7)" and s4["D8"][1] == "D3+C8"
     assert any(f and f.startswith("SUM(G") for _, f in s4.values())
-    assert any(f == "G4" for _, f in s4.values())
 
 
 def test_xlsx_conditional_measured_calibration_sheet_and_one_to_many_merges(tmp_path):
@@ -552,12 +561,18 @@ def test_cli_export_commands_oneshot_receipt_isolation_and_error_guards(tmp_path
     oneshot_xlsx = tmp_path / "oneshot.xlsx"
     oneshot_trace = tmp_path / "oneshot_trace.json"
     oneshot_receipt = tmp_path / "oneshot_receipt.json"
+    rc_retired = cli_mod._main([
+        "export", "--model", "qwen3-32b", "--hardware", "a5-pod",
+        "--dp", "1", "--tp", "2", "--ep", "1", "--prompt-tokens", "512", "--output-tokens", "32",
+        "--xlsx", str(oneshot_xlsx), "--kernel-designs-json", str(designs_path),
+    ])
+    assert rc_retired == 2
     rc_one = cli_mod._main([
         "export", "--model", "qwen3-32b", "--hardware", "a5-pod",
         "--dp", "1", "--tp", "2", "--ep", "1", "--prompt-tokens", "512", "--output-tokens", "32",
         "--compare-track", "merged", "--target-track", "expected_ideal",
         "--xlsx", str(oneshot_xlsx), "--trace", str(oneshot_trace),
-        "--kernel-designs-json", str(designs_path), "--receipt", str(oneshot_receipt),
+        "--receipt", str(oneshot_receipt),
     ])
     assert rc_one == 0 and zipfile.is_zipfile(oneshot_xlsx) and oneshot_trace.is_file()
     rec_one = json.loads(oneshot_receipt.read_text(encoding="utf-8"))
@@ -625,7 +640,8 @@ def test_agent_brief_digest_and_static_launch_script_audit(tmp_path):
     opt_sh_path = tmp_path / "optimized_serve.sh"
     opt_text = render_optimized_serve_sh(parsed, after_bundle=b_aft, output_path=opt_sh_path)
     assert opt_sh_path.is_file() and b"\r\n" not in opt_sh_path.read_bytes()
-    assert 'HCCL_OP_EXPANSION_MODE="AIV"' in opt_text and "FULL_DECODE_ONLY" in opt_text
+    assert 'HCCL_OP_EXPANSION_MODE="CCU_SCHED"' in opt_text and "FULL_DECODE_ONLY" in opt_text
+    assert "HCCL_INTRA_PCIE_ENABLE" not in opt_text and "enable_weight_nz_layout" not in opt_text
     assert "--quantization ascend" in opt_text
 
     audit_rep = audit_launch_script(
@@ -638,9 +654,8 @@ def test_agent_brief_digest_and_static_launch_script_audit(tmp_path):
     assert isinstance(cb, dict) and cb.get("calibrated") is True
     assert cb.get("pt_sku") == "Ascend950DT_9582"
     assert cb.get("mode") in {"calibrated_primitive_table", "calibrated_primitive_table_rescaled"}
-    assert brief["kpis_before_vs_after"]["saved_step_ms"] == pytest.approx(
-        brief["kpis_before_vs_after"]["sheet4_cards_total_gain_ms"], abs=0.01,
-    )
+    wf = brief["kpis_before_vs_after"]["waterfall"]
+    assert wf["reconciliation_error_ms"] == pytest.approx(0.0, abs=0.01)
     brief_out = export_agent_brief(brief, tmp_path / "brief.json")
     assert brief_out.stat().st_size < 8192
     digest = format_executive_digest_markdown(brief)
@@ -738,28 +753,36 @@ def test_bipartite_alignment_dual_conservation_zero_saving_guard_draft_kv_and_ag
 
     aligned = align_before_after_operators(b_bun, a_bun)
     rels = [r.relation for r in aligned]
-    assert {"N->1", "fused_into_anchor", "1->1", "eliminated", "added", "2->2"} <= set(rels)
-    # Zero-saving status guard strips [需新开发] on l0.mid_keep (12us -> 12us).
-    mid_row = next(r for r in aligned if r.relation == "1->1")
-    assert mid_row.after_ops[0].needs_new_kernel is False
-    assert mid_row.after_ops[0].kernel_status == KERNEL_STATUS_AT_FLOOR
+    assert "fused_into_anchor" not in set(rels)
+    assert {"N->1", "1->1", "eliminated", "added", "2->2"} <= set(rels)
+    # Zero-saving 1->1 op preserves producer receipt while classifying as at-floor with zero card.
+    from mindie_sim.export.action_plan import build_comparison_plan
+    from mindie_sim.export.models import PENDING_KIND_AT_FLOOR
+    plan_syn = build_comparison_plan(b_bun, a_bun, aligned)
+    mid_idx = next(i for i, r in enumerate(aligned) if r.relation == "1->1")
+    assert plan_syn.group_accounting[mid_idx].category == PENDING_KIND_AT_FLOOR
+    assert plan_syn.group_accounting[mid_idx].card_id == ""
 
-    # Dual-metric conservation across Sheet 2 and Sheet 4.
+    # Dual-metric conservation across Sheet 2 and Sheet 4 Waterfall.
     s2_b_upt = sum(sum(b.exposed_dur_us for b in r.before_ops) * r.repeat_count / 2.0 for r in aligned)
     s2_a_upt = sum(sum(a.exposed_dur_us for a in r.after_ops) * r.repeat_count / 2.0 for r in aligned)
     assert s2_b_upt == pytest.approx(b_bun.us_per_tok_die, abs=1e-6)
     assert s2_a_upt == pytest.approx(a_bun.us_per_tok_die, abs=1e-6)
-    cards = build_pending_kernel_details(aligned, a_bun, before_bundle=b_bun)
-    assert sum(c.saved_us_per_tok_die for c in cards) == pytest.approx(s2_b_upt - s2_a_upt, abs=1e-4)
+    assert len(plan_syn.pending_items) == 1
+    assert plan_syn.pending_items[0].category == PENDING_KIND_TO_IMPLEMENT
+    assert plan_syn.waterfall.reconciliation_error_ms == pytest.approx(0.0, abs=1e-6)
+    assert plan_syn.waterfall.reconciliation_error_upt == pytest.approx(0.0, abs=1e-4)
 
     out_xlsx = tmp_path / "bipartite_dual.xlsx"
     export_comparison_xlsx(b_bun, out_xlsx, compare_source=a_bun)
     _, roots, shared = _read_xlsx_sheets(out_xlsx)
     assert any(BINDING_BADGE_UNBOUND in s for s in shared)
     assert any(BINDING_BADGE_BOUND in s for s in shared)
+    assert not any("[↑ 已并入" in s for s in shared)
     s2_cells = _sheet_cells(roots[SHEET_BREAKDOWN], shared)
     assert s2_cells["X2"][0] == "Before 摊薄耗时 (us/tok·die)"
     assert s2_cells["AA2"][0] == "绑定状态 (Binding State)"
+    assert s2_cells["AB2"][0] == "Waterfall Bucket" and s2_cells["AC2"][0] == "Card Group ID"
 
     # 2b. #446 mixed-precision matrix_flops L* pricing (fp8_e4m3 / mxfp4 flops vs bf16 output dtype).
     from mindie_sim.export.bundle import _die_peaks_for_stage, _op_lean_resource_demands_ns
@@ -951,8 +974,11 @@ def test_exporter_rebound_primitives_horizon_pp_conservation_formulas_and_brief_
     assert sum(m.before_ms for m in pp_macros) == pytest.approx(0.04, abs=1e-6)
     assert sum(m.after_ms for m in pp_macros) == pytest.approx(0.032, abs=1e-6)
     assert all(m.layer_count <= 4 for m in pp_macros)
-    pp_cards = build_pending_kernel_details(aligned_pp, bun_pp2, before_bundle=bun_pp1)
-    assert sum(c.expected_gain_ms for c in pp_cards) == pytest.approx(0.008, abs=1e-6)
+    from mindie_sim.export.action_plan import build_comparison_plan
+    pp_plan = build_comparison_plan(bun_pp1, bun_pp2, aligned_pp)
+    assert pp_plan.pending_items == ()
+    assert pp_plan.waterfall.residual_saved_ms == pytest.approx(0.008, abs=1e-6)
+    assert pp_plan.waterfall.reconciliation_error_ms == pytest.approx(0.0, abs=1e-9)
 
     # 5. Distinct semantic atoms (q_rotary vs kv_rotary) and error propagation in _extract_structure_registry_view.
     assert extract_semantic_atoms("l0.q_rotary", "rope", "rope") == ("q_rotary",)
@@ -1091,9 +1117,10 @@ def test_export_binding_conservation_pp_reconciliation_and_brief_precision(tmp_p
     s4_cells = _sheet_cells(roots[SHEET_PENDING_KERNELS], shared)
     s4_m_formulas = [f for ref, (_, f) in s4_cells.items() if ref.startswith("M") and f]
     s4_n_formulas = [f for ref, (_, f) in s4_cells.items() if ref.startswith("N") and f]
-    assert any(SHEET_BREAKDOWN in f for f in s4_m_formulas)
-    assert any(SHEET_BREAKDOWN in f for f in s4_n_formulas)
-    assert any(v == "Unchanged Operators Exposure Reconciliation" for v, _ in s4_cells.values())
+    assert any(SHEET_BREAKDOWN in f and "SUMIF(" in f for f in s4_m_formulas)
+    assert any(SHEET_BREAKDOWN in f and "SUMIF(" in f for f in s4_n_formulas)
+    assert s4_cells["D3"][1] == "Summary!$B$14" and s4_cells["D9"][1] == "Summary!$C$14"
+    assert s4_cells["D10"][1] == "D8-D9" and float(s4_cells["D10"][0]) == pytest.approx(0.0, abs=1e-6)
 
     # 8. Handoff TPOT flows into agent_brief SLA verdict + full-precision KPIs + CJK summary truncation < 8192 B.
     brief_hf = build_agent_brief(bun_b, bun_a)
@@ -1257,6 +1284,213 @@ def test_export_streams_spec_batch_quant_preset_cache_t4_pd_cluster_and_overlap_
     assert any(ref.startswith("M") and f in {"0", "=0"} and float(v or 0.0) == 0.0 for ref, (v, f) in s2_cells.items())
     s3_cells = _sheet_cells(roots[SHEET_MEMORY], shared)
     assert any(ref.startswith("D") and f and 'IF($T$4="BF16"' in f for ref, (_, f) in s3_cells.items())
+
+
+def test_taxonomy_waterfall_track_b_veto_and_topological_coalescing(tmp_path):
+    from dataclasses import replace
+    from mindie_sim.export.action_plan import (
+        MAX_DISPLAY_CARDS,
+        build_comparison_plan,
+    )
+    from mindie_sim.export.models import (
+        BINDING_STATE_BOUND,
+        BINDING_STATE_UNBOUND_FORMULA,
+        PENDING_KIND_AT_FLOOR,
+        PENDING_KIND_TO_IMPLEMENT,
+        PENDING_KIND_TO_OPTIMIZE,
+        TRACK_FRAMEWORK,
+    )
+    from mindie_sim.prediction.results import OpOccurrence
+    from mindie_sim.schema.common import ModelingError
+
+    raw = _compact_case(tp=2, ep=2, pp=1, layers=1)
+    tmpl = build_export_bundle(raw, request=StepRequest(phase="decode", tokens=1, context=512, sequences=2, scope="model"))
+    proto = tmpl.operators[0]
+
+    def _op(
+        oid: str, kernel: str, us: float, atoms: tuple[str, ...], *,
+        sub: str = "Attention", needs_new: bool = False, shipping: bool = True,
+        absorbed: tuple[str, ...] = (), preds: tuple[str, ...] = (), pillar: str = "",
+        binding: str = BINDING_STATE_BOUND,
+    ) -> OperatorExportRow:
+        return replace(
+            proto,
+            archetype_id="arch_0", archetype_title="Layer (×1)", repeat_count=1,
+            layer_label="L0", submodule=sub, op_id=oid, canonical_op_key=oid, logical_role=oid,
+            family="vector", recipe="vec", implementation=kernel, ascend_kernel=kernel,
+            kernel_backend="CANN", needs_new_kernel=needs_new, is_shipping_abi=shipping,
+            start_us=0.0, dur_us=us, end_us=us, exposed_dur_us=us, l_star_lean_us=us * 0.5,
+            gap_us=us * 0.5, is_overlapped=False, masked_by="", semantic_atoms=atoms,
+            absorbed_source_ops=absorbed, opt_pillar=pillar, binding_state=binding,
+            occurrence=OpOccurrence(0, 0, 0, oid),
+            predecessors=tuple(OpOccurrence(0, 0, 0, p) for p in preds),
+        )
+
+    # 1. Numerical Waterfall conservation (12.0 -> 9.9 ms: config +0.3, new -1.5, tune -1.0, residual +0.1).
+    b_wf = (
+        _op("l0.add_cfg", "AddCfg", 100.0, ("cfg.elim",)),
+        _op("l0.f1", "RmsNorm", 2000.0, ("f.a",)),
+        _op("l0.f2", "DynamicMxQuant", 1500.0, ("f.b",), preds=("l0.f1",)),
+        _op("l0.mm_sub_a", "QuantBatchMatmulV3", 3000.0, ("mm.a",), sub="Attention"),
+        _op("l0.mm_sub_b", "QuantBatchMatmulV3", 4000.0, ("mm.b",), sub="MoE Routed Experts"),
+        _op("l0.res_small", "MatMulV2", 1400.0, ("res.s",)),
+    )
+    a_wf = (
+        _op("l0.added_op", "Fill", 400.0, ("cfg.add",)),
+        _op("l0.fused_f", "CustomFusedNormQuant", 2000.0, ("f.a", "f.b"), needs_new=True, shipping=False,
+            absorbed=("l0.f1", "l0.f2"), binding=BINDING_STATE_UNBOUND_FORMULA),
+        _op("l0.mm_sub_a", "QuantBatchMatmulV3", 2800.0, ("mm.a",), sub="Attention", pillar="pillar2_roofline"),
+        _op("l0.mm_sub_b", "QuantBatchMatmulV3", 3200.0, ("mm.b",), sub="MoE Routed Experts", pillar="pillar2_roofline"),
+        _op("l0.res_small", "MatMulV2", 1500.0, ("res.s",), pillar="pillar2_roofline"),
+    )
+    bun_b = replace(tmpl, operators=b_wf, step_span_us=12000.0, n_tok_per_die=2.0, us_per_tok_die=6000.0)
+    bun_a = replace(
+        tmpl, operators=a_wf, step_span_us=9900.0, n_tok_per_die=2.0, us_per_tok_die=4950.0,
+        applied_edit_receipts=(
+            {"opcode": "FuseRegion", "status": "applied", "edit_id": "e_fuse",
+             "input_occurrences": ("l0.f1", "l0.f2"), "output_occurrences": ("l0.fused_f",)},
+            {"opcode": "FuseRegion", "status": "noop", "edit_id": "e_noop",
+             "input_occurrences": ("l0.mm_sub_a",), "output_occurrences": ("l0.mm_sub_a",)},
+            {"opcode": "CollectiveTransform", "status": "applied", "edit_id": "e_1to1",
+             "input_occurrences": ("l0.mm_sub_a",), "output_occurrences": ("l0.mm_sub_a",)},
+            {"opcode": "StreamCoreBudget", "status": "applied", "edit_id": "e_neg",
+             "input_occurrences": ("l0.res_small",), "output_occurrences": ("l0.res_small",)},
+        ),
+    )
+    al_wf = align_before_after_operators(bun_b, bun_a)
+    plan_wf = build_comparison_plan(bun_b, bun_a, al_wf)
+    wf = plan_wf.waterfall
+    assert wf.config_saved_ms == pytest.approx(-0.3, abs=1e-6)
+    assert wf.new_kernel_saved_ms == pytest.approx(1.5, abs=1e-6)
+    assert wf.tune_kernel_saved_ms == pytest.approx(1.0, abs=1e-6)
+    assert wf.residual_saved_ms == pytest.approx(-0.1, abs=1e-6)
+    assert wf.reconstructed_after_ms == pytest.approx(9.9, abs=1e-6)
+    assert wf.reconciliation_error_ms == pytest.approx(0.0, abs=1e-9)
+    # Max-gain submodule attribution & order invariance under shuffling + zero _2 serial suffix.
+    plan_rev = build_comparison_plan(bun_b, bun_a, tuple(reversed(al_wf)))
+    tune_card = next(c for c in plan_wf.pending_items if c.category == PENDING_KIND_TO_OPTIMIZE)
+    tune_rev = next(c for c in plan_rev.pending_items if c.category == PENDING_KIND_TO_OPTIMIZE)
+    assert tune_card.submodule == "MoE Routed Experts" and tune_rev.submodule == tune_card.submodule
+    assert tune_card.card_id == tune_rev.card_id and not tune_card.card_id.endswith("_2")
+    # Track [B] sign veto rejects negative saved_ms (-0.100 ms), noop, and 1->1 native op.
+    track_b = [r for r in plan_wf.roadmap if r.track == TRACK_FRAMEWORK]
+    assert len(track_b) == 1 and track_b[0].expected_gain_ms == pytest.approx(1.5, abs=1e-6)
+    assert all((r.expected_gain_ms or 0.0) > 0.0 for r in track_b)
+
+    # 2. Exact 0.050 ms threshold boundary & 12-card display cap.
+    b_thr = (
+        _op("l0.exact", "ExactKern", 100.0, ("t.ex",)),
+        _op("l0.below", "BelowKern", 100.0, ("t.lo",)),
+        _op("l0.flag11", "MatMulV2", 500.0, ("t.f11",)),
+        *(_op(f"l0.cap_{i}", f"CapKern{i}", 300.0, (f"cap.{i}",)) for i in range(14)),
+    )
+    a_thr = (
+        _op("l0.exact", "ExactKern", 50.0, ("t.ex",), pillar="pillar2_roofline"),
+        _op("l0.below", "BelowKern", 50.001, ("t.lo",), pillar="pillar2_roofline"),
+        _op("l0.flag11", "MatMulV2", 300.0, ("t.f11",), needs_new=True),
+        *(_op(f"l0.cap_{i}", f"CapKern{i}", 200.0, (f"cap.{i}",), pillar="pillar2_roofline") for i in range(14)),
+    )
+    bun_tb = replace(tmpl, operators=b_thr, step_span_us=sum(o.exposed_dur_us for o in b_thr))
+    bun_ta = replace(tmpl, operators=a_thr, step_span_us=sum(o.exposed_dur_us for o in a_thr))
+    al_thr = align_before_after_operators(bun_tb, bun_ta)
+    plan_thr = build_comparison_plan(bun_tb, bun_ta, al_thr)
+    assert len(plan_thr.pending_items) == MAX_DISPLAY_CARDS
+    acc_by_id = {al_thr[g.row_index].after_ops[0].op_id: g for g in plan_thr.group_accounting}
+    assert acc_by_id["l0.exact"].category == PENDING_KIND_TO_OPTIMIZE
+    assert acc_by_id["l0.below"].category == PENDING_KIND_AT_FLOOR
+    assert acc_by_id["l0.flag11"].category != PENDING_KIND_TO_IMPLEMENT
+
+    # 3. Topological coalescing: interleaved independent branches vs crossing SCC vs raw cycle error.
+    b_inter = (
+        _op("l0.r1", "Gmm1", 50.0, ("r.1",), sub="MoE Routed Experts"),
+        _op("l0.s1", "Shared1", 30.0, ("s.1",), sub="MoE Shared Experts"),
+        _op("l0.r2", "Gmm2", 40.0, ("r.2",), sub="MoE Routed Experts", preds=("l0.r1",)),
+        _op("l0.s2", "Shared2", 20.0, ("s.2",), sub="MoE Shared Experts", preds=("l0.s1",)),
+        _op("l0.join", "AddJoin", 10.0, ("j.0",), sub="Residual", preds=("l0.r2", "l0.s2")),
+    )
+    a_inter = (
+        _op("l0.r_fused", "FusedGmm", 60.0, ("r.1", "r.2"), sub="MoE Routed Experts",
+            needs_new=True, shipping=False, absorbed=("l0.r1", "l0.r2")),
+        _op("l0.s1", "Shared1", 30.0, ("s.1",), sub="MoE Shared Experts"),
+        _op("l0.s2", "Shared2", 20.0, ("s.2",), sub="MoE Shared Experts", preds=("l0.s1",)),
+        _op("l0.join", "AddJoin", 10.0, ("j.0",), sub="Residual", preds=("l0.r_fused", "l0.s2")),
+    )
+    al_inter = align_before_after_operators(replace(tmpl, operators=b_inter), replace(tmpl, operators=a_inter))
+    assert not any(r.relation == "fused_into_anchor" for r in al_inter)
+    assert [r.relation for r in al_inter].count("N->1") == 1
+    assert al_inter[-1].after_ops[0].op_id == "l0.join"
+    # Crossing dependency R1 -> S1 -> R2 with R1+R2 fused condenses cleanly into 3->2 SCC block.
+    b_cross = (
+        _op("l0.r1", "Gmm1", 50.0, ("r.1",)),
+        _op("l0.s1", "Mid", 30.0, ("s.1",), preds=("l0.r1",)),
+        _op("l0.r2", "Gmm2", 40.0, ("r.2",), preds=("l0.s1",)),
+    )
+    a_cross = (
+        _op("l0.r_fused", "FusedGmm", 60.0, ("r.1", "r.2"), needs_new=True, absorbed=("l0.r1", "l0.r2")),
+        _op("l0.s1", "Mid", 30.0, ("s.1",)),
+    )
+    al_cross = align_before_after_operators(replace(tmpl, operators=b_cross), replace(tmpl, operators=a_cross))
+    assert len(al_cross) == 1 and al_cross[0].relation == "3->2"
+    # Raw cycle raises explicit ModelingError witness.
+    b_cyc = (_op("l0.c1", "A", 10.0, ("c.1",), preds=("l0.c2",)), _op("l0.c2", "B", 10.0, ("c.2",), preds=("l0.c1",)))
+    with pytest.raises(ModelingError, match="alignment_source_dag_cycle"):
+        align_before_after_operators(replace(tmpl, operators=b_cyc), replace(tmpl, operators=b_cyc[:1]))
+
+
+def test_script_free_vs_script_audit_cross_generation_isolation(tmp_path):
+    from dataclasses import replace
+    from mindie_sim.export.action_plan import build_comparison_plan
+    from mindie_sim.export.models import TRACK_CONFIG_ENV
+
+    raw_a3, req_a3 = compose_export_case("qwen3-32b", "a3", dp=1, tp=2, ep=1, prompt_tokens=512, output_tokens=32, concurrency=2)
+    bun_a3 = build_export_bundle(raw_a3, request=req_a3)
+    # Script-free identical winners -> 0 [A] rows and zero env-switch nags / CCU in XLSX + JSON.
+    plan_same = build_comparison_plan(bun_a3, bun_a3, align_before_after_operators(bun_a3, bun_a3))
+    assert not any(r.track == TRACK_CONFIG_ENV for r in plan_same.roadmap)
+    brief_sf = build_agent_brief(bun_a3, bun_a3)
+    assert "script_audit" not in brief_sf
+    assert brief_sf["action_plan_3_tracks"]["config_and_env"] == []
+    sf_xlsx = tmp_path / "script_free_a3.xlsx"
+    export_comparison_xlsx(bun_a3, sf_xlsx, compare_source=bun_a3)
+    _, roots_a3, shared_a3 = _read_xlsx_sheets(sf_xlsx)
+    blob_sf = "\n".join(shared_a3) + "\n" + json.dumps(brief_sf, ensure_ascii=False)
+    for forbidden in ("HCCL_OP_EXPANSION_MODE", "开启 ACLGraph", "开启 MLAPO", "未启用生产量化", "AIV/CCU", "CCU"):
+        assert forbidden not in blob_sf, f"leaked {forbidden!r} in script-free A3 artifact"
+    # Sheet 3 A3 format isolation: zero MXFP/FP8 choices on A3.
+    s3_a3_vals = [str(v or "") for v, _ in _sheet_cells(roots_a3[SHEET_MEMORY], shared_a3).values()]
+    assert not any("MXFP" in v for v in s3_a3_vals)
+
+    # Script-free co-design diff -> factual diff row in [A] with blank expected_gain_ms.
+    bun_a3_b4 = replace(bun_a3, memory_ledger=replace(bun_a3.memory_ledger, concurrency=4), cluster_concurrency=4)
+    plan_diff = build_comparison_plan(bun_a3, bun_a3_b4, align_before_after_operators(bun_a3, bun_a3_b4))
+    track_a_diff = [r for r in plan_diff.roadmap if r.track == TRACK_CONFIG_ENV]
+    assert len(track_a_diff) == 1 and track_a_diff[0].expected_gain_ms is None and "B/DP=2" in track_a_diff[0].action_detail
+
+    # Explicit script audits across A3 (foreign CCU sanitized, zero CCU leak) and A2 (zero CCU / SuperPoD / UB).
+    bad_a3_sh = parse_launch_script(
+        "export HCCL_OP_EXPANSION_MODE=CCU\n"
+        'vllm serve /weights/qwen3-32b-w8a8 --tensor-parallel-size 2 --data-parallel-size 1 '
+        '--quantization ascend --kv-cache-dtype int8 '
+        '--compilation-config \'{"cudagraph_mode": "FULL_DECODE_ONLY"}\' '
+        '--additional-config \'{"enable_fused_mc2": 2, "multistream_overlap_shared_expert": true}\'\n'
+    )
+    rep_a3 = audit_launch_script(bad_a3_sh, before_bundle=bun_a3, after_bundle=bun_a3, tuned_bundle=bun_a3)
+    ids_a3 = {i.issue_id for i in rep_a3.issues}
+    assert {"hccl_expansion_mode_suboptimal", "mc2_mso_mutex_conflict"} <= ids_a3
+    assert "missing_mlapo" not in ids_a3  # omitted VLLM_ASCEND_ENABLE_MLAPO defaults True
+    a3_sh_txt = render_optimized_serve_sh(bad_a3_sh, after_bundle=bun_a3, tuned_bundle=bun_a3)
+    assert 'HCCL_OP_EXPANSION_MODE="AIV"' in a3_sh_txt
+    assert "CCU" not in (json.dumps(rep_a3.to_dict(), ensure_ascii=False) + a3_sh_txt)
+    assert not ('"enable_fused_mc2"' in a3_sh_txt and '"multistream_overlap_shared_expert": true' in a3_sh_txt)
+
+    # A2 audit: zero CCU / SuperPoD / UB-Direct; OOM original produces speedup_vs_original=None.
+    bun_a2 = replace(bun_a3, hardware_sku="Ascend910B4", memory_ledger=replace(bun_a3.memory_ledger, fits_hbm=False))
+    rep_a2 = audit_launch_script(bad_a3_sh, before_bundle=bun_a2, after_bundle=bun_a2, tuned_bundle=bun_a2)
+    a2_txt = json.dumps(rep_a2.to_dict(), ensure_ascii=False) + render_optimized_serve_sh(bad_a3_sh, after_bundle=bun_a2, tuned_bundle=bun_a2)
+    for banned in ("CCU", "SuperPoD", "UB-Direct"):
+        assert banned not in a2_txt
+    assert rep_a2.deep_step_summary["speedup_vs_original"] is None and rep_a2.immediate_step_summary["tuned_evaluated"] is True
+
 
 
 

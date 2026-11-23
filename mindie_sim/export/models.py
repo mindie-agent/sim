@@ -14,7 +14,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from mindie_sim.prediction.results import FusedPipelineDescriptor, OpOccurrence
@@ -157,8 +157,9 @@ STRUCTURE_READINESS_MAP: dict[str, tuple[str, bool]] = {
 }
 
 #: Pending kernel categories rendered in Sheet 4 (``Pending_Kernel_Details``).
-PENDING_KIND_TO_IMPLEMENT = "待新开发 / 扩展 (To-Implement)"
-PENDING_KIND_TO_OPTIMIZE = "重点待优化 (Top Gap To-Optimize)"
+PENDING_KIND_TO_IMPLEMENT = "[需新开发融合算子]"
+PENDING_KIND_TO_OPTIMIZE = "[现成算子深度调优]"
+PENDING_KIND_AT_FLOOR = "[已近物理下界 / 无需改动]"
 
 #: Canonical domain-standard Ascend submodule labels (zero "Other").
 SUB_EMBED_TAIL = "Embedding / Logits / Spec Verify"
@@ -177,21 +178,9 @@ SUB_DENSE_FFN = "Dense FFN"
 SUB_ENGRAM_PLE = "Engram / PLE Memory"
 SUB_VISION = "Vision / Multimodal Encoder"
 CANONICAL_EXPORT_SUBMODULES = frozenset({
-    SUB_EMBED_TAIL,
-    SUB_ATTN_RES,
-    SUB_MLA_PROLOG,
-    SUB_DSA_LI,
-    SUB_LATENT_ATTN,
-    SUB_GATED_MLA_O,
-    SUB_KDA,
-    SUB_GDN,
-    SUB_STD_ATTN,
-    SUB_MOE_ROUTER,
-    SUB_MOE_ROUTED,
-    SUB_MOE_SHARED,
-    SUB_DENSE_FFN,
-    SUB_ENGRAM_PLE,
-    SUB_VISION,
+    SUB_EMBED_TAIL, SUB_ATTN_RES, SUB_MLA_PROLOG, SUB_DSA_LI, SUB_LATENT_ATTN,
+    SUB_GATED_MLA_O, SUB_KDA, SUB_GDN, SUB_STD_ATTN, SUB_MOE_ROUTER,
+    SUB_MOE_ROUTED, SUB_MOE_SHARED, SUB_DENSE_FFN, SUB_ENGRAM_PLE, SUB_VISION,
 })
 
 #: Canonical architectural L2 macro-modules for Sheet 1 Block 3.
@@ -253,24 +242,12 @@ MACRO_L1_HIERARCHY: tuple[tuple[str, tuple[str, ...]], ...] = (
 
 #: Display ordering of Sheet 1 Block 3 L2 macro-modules (optional modules appended if present).
 MACRO_MODULE_CORE_ORDER: tuple[str, ...] = (
-    MACRO_MOD_KDA_GDN,
-    MACRO_MOD_MLA_PROLOG,
-    MACRO_MOD_DSA_LI,
-    MACRO_MOD_LATENT_ATTN,
-    MACRO_MOD_GATED_O_PROJ,
-    MACRO_MOD_MOE_ROUTER,
-    MACRO_MOD_MOE_ROUTED,
-    MACRO_MOD_MOE_SHARED,
-    MACRO_MOD_DENSE_FFN,
-    MACRO_MOD_RESIDUAL_NORM,
-    MACRO_MOD_COLLECTIVES,
-    MACRO_MOD_DRAFT_LAYERS,
-    MACRO_MOD_VERIFY_HEAD,
+    MACRO_MOD_KDA_GDN, MACRO_MOD_MLA_PROLOG, MACRO_MOD_DSA_LI, MACRO_MOD_LATENT_ATTN,
+    MACRO_MOD_GATED_O_PROJ, MACRO_MOD_MOE_ROUTER, MACRO_MOD_MOE_ROUTED,
+    MACRO_MOD_MOE_SHARED, MACRO_MOD_DENSE_FFN, MACRO_MOD_RESIDUAL_NORM,
+    MACRO_MOD_COLLECTIVES, MACRO_MOD_DRAFT_LAYERS, MACRO_MOD_VERIFY_HEAD,
 )
-MACRO_MODULE_OPTIONAL_ORDER: tuple[str, ...] = (
-    MACRO_MOD_ENGRAM,
-    MACRO_MOD_VISION,
-)
+MACRO_MODULE_OPTIONAL_ORDER: tuple[str, ...] = (MACRO_MOD_ENGRAM, MACRO_MOD_VISION)
 
 #: Quantization rule tokens for live Excel Sheet 3 formulas.
 QUANT_RULE_FOLLOW_PRESET = "FollowPreset"
@@ -459,6 +436,9 @@ class OperatorExportRow:
     comm_domain_tag: str = ""
     kernel_synthesis_spec: Any = None
     binding_state: str = BINDING_STATE_BOUND
+    is_shipping_abi: bool = True
+    stream_core_budget: str = ""
+    formula_eval: Any = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -474,7 +454,6 @@ class AlignedComparisonRow:
     relation: str
     action_note: str
     added_glue_note: str = ""
-    non_adjacent_anchor_kernel: str = ""
     before_repeat_count: int | None = None
     after_repeat_count: int | None = None
 
@@ -521,9 +500,11 @@ class ActionRoadmapRow:
     track: str
     track_label: str
     title: str
-    expected_gain_ms: float
+    expected_gain_ms: float | None
     action_detail: str
     cross_ref: str = ""
+    before_value: str = ""
+    after_value: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -568,6 +549,11 @@ class NewKernelBacklogItem:
     sram_residency_summary: str = ""
     binding_state: str = BINDING_STATE_BOUND
     source_row_indices: tuple[int, ...] = ()
+    core_budget: str = ""
+    attributable_gain_ms: float | None = None
+    attributable_gain_us_per_tok_die: float | None = None
+    is_prerequisite: bool = False
+    formula_summary: str = ""
 
 
 #: Canonical alias used by Sheet 4 (``Pending_Kernel_Details``).
@@ -797,3 +783,6 @@ class ExportBundle:
     deployment_total_dies: int = 0
     pd_pool_summary: Mapping[str, Any] | None = None
     calibration_basis: Mapping[str, Any] | None = None
+    applied_edit_receipts: tuple[dict[str, Any], ...] = ()
+    effective_config: dict[str, Any] = field(default_factory=dict)
+    serve_script_supplied: bool = False
