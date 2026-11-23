@@ -29,7 +29,7 @@ from mindie_sim.catalog.npu_checkpoints import (
     validate_quant_for_hardware,
 )
 from mindie_sim.catalog.ops import compute_dtype_for
-from mindie_sim.catalog.va_speculative_rules import (
+from mindie_sim.stacks.vllm_ascend.speculative import (
     ASCEND_FIA_MAX_DECODE_TOKENS,
     EP_WEIGHT_FILTER_MIN_EP,
     MAX_SPECULATIVE_TOKENS,

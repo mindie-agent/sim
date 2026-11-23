@@ -3278,7 +3278,7 @@ def solve_optimal_deployment(
     quant: str | Mapping[str, Any] | None = None, layers: int | None = None,
     ranks_per_node: int | None = None, topology_preset: str | None = None,
     va_recommended: bool | None = None, raw_eager: bool = False, feature_track: str = "merged",
-    runtime_stack: str | Mapping[str, Any] = "vllm-ascend", optimizations: Sequence[str] = (),
+    runtime_stack: str | Mapping[str, Any] | None = None, optimizations: Sequence[str] = (),
     exclude_optimizations: Sequence[str] = (), engram_cpu_offload: bool | None = None,
     multistream_overlap_shared_expert: bool | None = None, enable_shared_expert_dp: bool | None = None,
     sp: bool | None = None, graph_capture_mode: str | None = None,

@@ -208,7 +208,7 @@ def compose_case_kwargs(namespace: argparse.Namespace) -> dict[str, Any]:
         "redundant_experts_per_rank": value("redundant_experts_per_rank", CLI_ZERO),
         "collective_startup_mode": getattr(namespace, "collective_startup_mode", None),
         "matrix_compute_policy": getattr(namespace, "matrix_compute_policy", None) or "auto",
-        "recover_ssm": bool(getattr(namespace, "recover_ssm", False)),
+        "recover_ssm": getattr(namespace, "recover_ssm", None),
         "prefix_cache_mode": getattr(namespace, "prefix_cache_mode", None) or "private",
         "prefix_read_mode": getattr(namespace, "prefix_read_mode", None) or "auto",
         "homogeneous_graph_reuse": getattr(namespace, "homogeneous_graph_reuse", None) or "off",
@@ -223,7 +223,7 @@ def compose_case_kwargs(namespace: argparse.Namespace) -> dict[str, Any]:
         "mte2_efficiency": getattr(namespace, "mte2_efficiency", None),
         "block_size": getattr(namespace, "block_size", None),
         "runtime_stack": (getattr(namespace, "stack_manifest", None)
-                          or getattr(namespace, "stack", None) or "vllm-ascend"),
+                          or getattr(namespace, "stack", None)),
         "feature_track": getattr(namespace, "feature_track", None) or "merged",
         "optimizations": tuple(getattr(namespace, "enable_opt", ()) or ()),
         "exclude_optimizations": tuple(getattr(namespace, "disable_opt", ()) or ()),

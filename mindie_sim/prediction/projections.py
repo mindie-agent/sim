@@ -307,10 +307,15 @@ def gdn_input_projections(b, tensors, *, deps, tokens, hidden, conv_width, value
     (e.g. quantized QKV with BF16 Z), split into homogeneous matrices instead
     of mixing precisions in one GEMM.
     """
-    qkv_rep = _representation(b.quant, "gdn.qkv")
-    z_rep = _representation(b.quant, "gdn.z")
+    explicit_keys = (
+        {str(key) for key, _ in getattr(b.quant, "category_overrides", ())}
+        | set(getattr(b.quant, "exclusions", ()))
+    )
+    qkvz_child_declared = bool({"gdn.qkv", "gdn.z"} & explicit_keys)
     qkvz_rep = _representation(b.quant, "gdn.qkvz")
-    if qkv_rep == z_rep == qkvz_rep:
+    qkv_rep = _representation(b.quant, "gdn.qkv") if qkvz_child_declared else qkvz_rep
+    z_rep = _representation(b.quant, "gdn.z") if qkvz_child_declared else qkvz_rep
+    if not qkvz_child_declared or (qkv_rep == z_rep == qkvz_rep):
         qkvz = b.matrix(
             "linear_qkvz", (deps,), tokens, conv_width + value_width, hidden,
             category="gdn.qkvz", metadata=metadata,
@@ -333,10 +338,11 @@ def gdn_input_projections(b, tensors, *, deps, tokens, hidden, conv_width, value
         conv_view = tensors.result(qkv, (tokens, conv_width))
         z_view = tensors.result(z, (tokens, value_width))
 
-    b_rep = _representation(b.quant, "gdn.b")
-    a_rep = _representation(b.quant, "gdn.a")
+    ba_child_declared = bool({"gdn.b", "gdn.a"} & explicit_keys)
     ba_rep = _representation(b.quant, "gdn.beta_alpha")
-    if b_rep == a_rep == ba_rep:
+    b_rep = _representation(b.quant, "gdn.b") if ba_child_declared else ba_rep
+    a_rep = _representation(b.quant, "gdn.a") if ba_child_declared else ba_rep
+    if not ba_child_declared or (b_rep == a_rep == ba_rep):
         gates = b.matrix(
             "linear_beta_alpha", (deps,), tokens, 2 * heads, hidden,
             category="gdn.beta_alpha", metadata=metadata,

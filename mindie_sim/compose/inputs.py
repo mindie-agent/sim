@@ -32,7 +32,7 @@ from mindie_sim.backends.ascend import (
 )
 from mindie_sim.backends.nvidia import profiles as nvidia_profiles
 from mindie_sim.catalog.specs import build_model_spec
-from mindie_sim.catalog.types import AuxiliarySpec, DraftSpec, merge_source
+from mindie_sim.catalog.types import AuxiliarySpec, DraftSpec, QuantSpec, merge_source
 from mindie_sim.model_catalog import (
     ARCHITECTURE_PRESET_ALIASES,
     ARCHITECTURE_PRESET_CATALOG,
@@ -42,9 +42,11 @@ from mindie_sim.model_catalog import (
     customize_model_spec,
     load_model,
 )
+from mindie_sim.schema.checkpoint import CheckpointProvenance, CheckpointQuantMap
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.model import ModelSpec
 from mindie_sim.schema.serialization import apply_model_overrides
+from mindie_sim.schema.stack import WorkUnitKind, WorkloadDomain
 
 MAX_METADATA_MIB = 50
 BYTES_PER_KIB = 1024
@@ -145,6 +147,121 @@ _QUANT_ALIASES: dict[str, str] = {
 
 _SUGGESTION_LIMIT = 5
 _SUGGESTION_CUTOFF = 0.35
+_DIFFUSION_DOMAIN_TOKENS = (
+    "dit", "diffusion", "hunyuan_video", "hunyuan-video",
+    "wan", "flux", "sd3", "cogvideo", "sora",
+)
+_CANONICAL_PROJECTION_PRESETS = frozenset({
+    "mxfp8", "mxfp8_mxfp4", "mxfp4_routed_only", "mxfp4_all", "mxfp4",
+    "w4a8_mxfp", "w4a4_mxfp4", "fp8", "w8a8", "w8a8_dynamic",
+    "w8a8_static", "w8a8_mix", "w4a8", "w4a8_dynamic", "w4a16",
+    "bf16", "fp16", "fp32", "none",
+})
+_MXFP4_FMT_TOKENS = frozenset({"mxfp4", "mx_fp4", "mxfp4_e2m1", "fp4", "fp4_e2m1"})
+_FP8_FMT_TOKENS = frozenset({"fp8", "fp8_e4m3", "fp8_e5m2", "mxfp8", "mx_fp8", "mxfp8_e4m3"})
+_MX_SCALE_FMT_TOKENS = frozenset({"fp8_e8m0", "ue8m0", "e8m0"})
+_INT4_FMT_TOKENS = frozenset({"int4", "int4_weight", "w4a8", "w4a16"})
+_AUTO_VA_QUANT_TOKENS = frozenset({"auto_va", "auto"})
+_CHECKPOINT_NATIVE_QUANT_TOKENS = frozenset({"checkpoint", "native"})
+_UNQUANTIZED_QUANT_TOKENS = frozenset({"bf16", "bfloat16", "fp16", "float16", "fp32", "none"})
+DEFAULT_CONTEXT_TOKENS_FOR_QUANT = 4096
+
+
+def canonical_quant_preset_key(qspec: QuantSpec | Mapping[str, Any] | None) -> str | None:
+    """Derive canonical stack projection preset key from a ``QuantSpec`` or mapping.
+
+    Returns ``None`` for native unquantized float specifications so downstream
+    resolvers classify them as ``unquantized_native`` without passing arbitrary
+    user/test ``QuantSpec.name`` labels as checkpoint quantization tags.
+    """
+    if qspec is None:
+        return None
+    if isinstance(qspec, Mapping):
+        raw_name = str(qspec.get("name") or "").strip().lower()
+        wf = str(qspec.get("weight_format") or "").strip().lower().replace("-", "_")
+        ewf = str(qspec.get("expert_weight_format") or wf).strip().lower().replace("-", "_")
+        af = str(qspec.get("activation_format") or "").strip().lower().replace("-", "_")
+        sf = str(qspec.get("scale_format") or "").strip().lower().replace("-", "_")
+    else:
+        raw_name = str(qspec.name or "").strip().lower()
+        wf = str(qspec.weight_format or "").strip().lower().replace("-", "_")
+        ewf = str(qspec.expert_weight_format or wf).strip().lower().replace("-", "_")
+        af = str(qspec.activation_format or "").strip().lower().replace("-", "_")
+        sf = str(qspec.scale_format or "").strip().lower().replace("-", "_")
+    norm_name = _QUANT_ALIASES.get(raw_name, raw_name)
+    unquant_fmts = _UNQUANTIZED_QUANT_TOKENS | {""}
+    if wf in unquant_fmts and ewf in unquant_fmts:
+        if norm_name in {"w8a8", "w8a8_dynamic", "w8a8_static", "w8a8_mix", "w4a8", "w4a8_dynamic", "w4a16", "fp8", "mxfp8", "mxfp4", "mxfp8_mxfp4", "mxfp4_routed_only", "mxfp4_all"}:
+            return norm_name
+        return None
+    if norm_name in _CANONICAL_PROJECTION_PRESETS and norm_name not in _UNQUANTIZED_QUANT_TOKENS:
+        return norm_name
+    if ewf in _MXFP4_FMT_TOKENS or wf in _MXFP4_FMT_TOKENS:
+        if wf in _MXFP4_FMT_TOKENS:
+            return "mxfp4_all" if af in _FP8_FMT_TOKENS else "w4a4_mxfp4"
+        if wf in _FP8_FMT_TOKENS:
+            return "mxfp8_mxfp4"
+        return "mxfp4_routed_only"
+    if wf in _FP8_FMT_TOKENS or ewf in _FP8_FMT_TOKENS:
+        return "mxfp8" if sf in _MX_SCALE_FMT_TOKENS else "fp8"
+    if ewf in _INT4_FMT_TOKENS or wf in _INT4_FMT_TOKENS:
+        return "w4a8" if af == "int8" else "w4a16"
+    if wf in {"int8", "w8a8"} or ewf in {"int8", "w8a8"} or af == "int8":
+        return "w8a8"
+    return None
+
+
+def synthetic_checkpoint_quant_map(
+    model_spec: ModelSpec,
+    *,
+    canon: str,
+    native_dtype: str = "bf16",
+) -> CheckpointQuantMap:
+    """Build an explicit-preset or unquantized ``CheckpointQuantMap`` from ``model_spec.quant``."""
+    preset = canonical_quant_preset_key(model_spec.quant)
+    if preset is None:
+        return CheckpointQuantMap(
+            provenance=CheckpointProvenance(
+                f"native/{canon or model_spec.name}", "unquantized_native", origin="unquantized_native",
+            ),
+            native_float_dtype=native_dtype,
+        )
+    return CheckpointQuantMap(
+        provenance=CheckpointProvenance(
+            f"explicit-preset/{preset}", "explicit_synthetic_preset", origin="explicit_synthetic_preset",
+        ),
+        native_float_dtype=native_dtype,
+        model_quant_type=preset,
+    )
+
+
+def infer_workload_domain(model_spec: ModelSpec) -> WorkloadDomain:
+    """Classify a ``ModelSpec`` structurally into ``llm`` / ``vlm`` / ``diffusion``."""
+    meta = dict(getattr(model_spec, "metadata", ()) or ())
+    facts = dict(getattr(model_spec, "catalog_facts", ()) or ())
+    explicit = str(meta.get("domain") or facts.get("workload_domain") or "").strip().lower()
+    if explicit in {"llm", "vlm", "diffusion", "custom"}:
+        return explicit  # type: ignore[return-value]
+    for plan in model_spec.layer_plans:
+        arch = str(getattr(plan, "architecture", "") or "").lower()
+        if any(tok in arch for tok in _DIFFUSION_DOMAIN_TOKENS):
+            return "diffusion"
+    model_type = str(facts.get("model_type") or facts.get("family") or "").strip().lower()
+    name_low = str(model_spec.name or "").strip().lower()
+    if any(tok in model_type or tok in name_low for tok in _DIFFUSION_DOMAIN_TOKENS):
+        return "diffusion"
+    if model_spec.vision is not None or bool(facts.get("vision_present")):
+        return "vlm"
+    return "llm"
+
+
+def default_work_unit_for_domain(domain: WorkloadDomain) -> WorkUnitKind:
+    """Return canonical default work-unit kind for one ``WorkloadDomain``."""
+    if domain == "diffusion":
+        return "denoise_timestep"
+    if domain == "custom":
+        return "custom_step"
+    return "prefill_decode_step"
 
 
 def _arch_key(sku: str) -> str:
@@ -318,14 +435,215 @@ def _read_companion_quant_spec(path: Path, raw_config: Mapping[str, Any]) -> Any
     desc_path = base_dir / "quant_model_description.json"
     if not desc_path.is_file():
         return None
-    if desc_path.stat().st_size > MAX_METADATA_MIB * BYTES_PER_KIB * BYTES_PER_KIB:
-        raise ValueError("metadata_input_exceeds_50_MiB")
-    with desc_path.open(encoding="utf-8") as stream:
-        desc_data = json.load(stream)
-    if not isinstance(desc_data, Mapping):
+    from mindie_sim.catalog.checkpoint_reader import (
+        quant_spec_from_checkpoint_map,
+        read_modelslim_description_file,
+    )
+
+    qmap = read_modelslim_description_file(
+        desc_path,
+        checkpoint_id=f"local/{base_dir.name or 'checkpoint'}",
+        base_config=raw_config,
+    )
+    return quant_spec_from_checkpoint_map(qmap, base_config=raw_config)
+
+
+def _canonical_model_id(model_arg: Any, model_spec: ModelSpec) -> str:
+    if isinstance(model_arg, str):
+        key = model_arg.strip()
+        canon = MODEL_ALIASES.get(key, ARCHITECTURE_PRESET_ALIASES.get(key, key))
+        if canon in CATALOG or canon in ARCHITECTURE_PRESET_CATALOG:
+            return canon
+    name_key = str(model_spec.name or "").strip().lower()
+    return MODEL_ALIASES.get(name_key, ARCHITECTURE_PRESET_ALIASES.get(name_key, name_key))
+
+
+def _local_checkpoint_quant_map(
+    model_arg: Any,
+    model_spec: ModelSpec,
+) -> CheckpointQuantMap | None:
+    if not isinstance(model_arg, (Path, str)):
         return None
-    from mindie_sim.catalog.npu_checkpoints import parse_quant_model_description
-    return parse_quant_model_description(desc_data, base_config=raw_config)
+    candidate = Path(model_arg).expanduser() if isinstance(model_arg, str) else model_arg.expanduser()
+    if not candidate.exists():
+        return None
+    from mindie_sim.catalog.checkpoint_reader import (
+        read_hf_quantization_config,
+        read_modelslim_description_file,
+    )
+
+    base_dir = candidate if candidate.is_dir() else candidate.parent
+    cfg_path = base_dir / "config.json" if candidate.is_dir() else candidate
+    raw_cfg: Mapping[str, Any] = _read_config_json(cfg_path) if cfg_path.is_file() else {}
+    ckpt_id = f"local/{base_dir.name or model_spec.name}"
+    desc_path = base_dir / "quant_model_description.json"
+    if desc_path.is_file():
+        return read_modelslim_description_file(desc_path, checkpoint_id=ckpt_id, base_config=raw_cfg)
+    if raw_cfg:
+        return read_hf_quantization_config(raw_cfg, checkpoint_id=ckpt_id)
+    return None
+
+
+def _explicit_checkpoint_quant_map(
+    quant: str | Mapping[str, Any] | QuantSpec,
+    *,
+    canon: str,
+    model_name: str,
+    native_dtype: str,
+    lookup_curated: Any,
+) -> tuple[CheckpointQuantMap, QuantSpec | None, str, str | None, str | None] | None:
+    if isinstance(quant, str):
+        raw_q_str = quant.strip().lower()
+        if raw_q_str in _UNQUANTIZED_QUANT_TOKENS:
+            dtype_val = (
+                "fp16" if raw_q_str in {"fp16", "float16"}
+                else ("fp32" if raw_q_str == "fp32" else "bf16")
+            )
+            return (
+                CheckpointQuantMap(
+                    provenance=CheckpointProvenance(
+                        f"native/{canon or model_name}", "unquantized_native", origin="unquantized_native",
+                    ),
+                    native_float_dtype=dtype_val,
+                ),
+                None, "", None, None,
+            )
+        if raw_q_str and raw_q_str not in (_AUTO_VA_QUANT_TOKENS | _CHECKPOINT_NATIVE_QUANT_TOKENS):
+            norm_key = _QUANT_ALIASES.get(raw_q_str, raw_q_str)
+            return (
+                CheckpointQuantMap(
+                    provenance=CheckpointProvenance(
+                        f"explicit-preset/{norm_key}", "explicit_synthetic_preset", origin="explicit_synthetic_preset",
+                    ),
+                    native_float_dtype=native_dtype,
+                    model_quant_type=norm_key,
+                ),
+                None, "", None, None,
+            )
+        return None
+    if isinstance(quant, QuantSpec):
+        ckpt_ref = dict(getattr(quant, "source", ()) or ()).get("checkpoint")
+        curated = lookup_curated(str(ckpt_ref)) if ckpt_ref else None
+        if curated is not None:
+            return curated, quant, "", None, None
+        preset = canonical_quant_preset_key(quant)
+        if preset is None:
+            return (
+                CheckpointQuantMap(
+                    provenance=CheckpointProvenance(
+                        f"native/{canon or model_name}", "unquantized_native", origin="unquantized_native",
+                    ),
+                    native_float_dtype=native_dtype,
+                ),
+                quant, "", None, None,
+            )
+        return (
+            CheckpointQuantMap(
+                provenance=CheckpointProvenance(
+                    f"explicit-preset/{preset}", "explicit_synthetic_preset", origin="explicit_synthetic_preset",
+                ),
+                native_float_dtype=native_dtype,
+                model_quant_type=preset,
+            ),
+            quant, "", None, None,
+        )
+    if isinstance(quant, Mapping):
+        preset = canonical_quant_preset_key(quant)
+        if preset is None:
+            return (
+                CheckpointQuantMap(
+                    provenance=CheckpointProvenance(
+                        f"native/{canon or model_name}", "unquantized_native", origin="unquantized_native",
+                    ),
+                    native_float_dtype=native_dtype,
+                ),
+                None, "", None, None,
+            )
+        return (
+            CheckpointQuantMap(
+                provenance=CheckpointProvenance(
+                    f"explicit-preset/{preset}", "explicit_synthetic_preset", origin="explicit_synthetic_preset",
+                ),
+                native_float_dtype=native_dtype,
+                model_quant_type=preset,
+            ),
+            None, "", None, None,
+        )
+    return None
+
+
+def resolve_checkpoint_quant_map(
+    model_arg: Any,
+    model_spec: ModelSpec,
+    *,
+    sku: str,
+    hardware_obj: Any,
+    adapter: Any,
+    quant: str | Mapping[str, Any] | QuantSpec | None,
+    context_tokens: int = DEFAULT_CONTEXT_TOKENS_FOR_QUANT,
+) -> tuple[CheckpointQuantMap, QuantSpec | None, str, str | None, str | None]:
+    """Resolve on-disk ``CheckpointQuantMap`` once without bare-string re-expansion.
+
+    Returns ``(checkpoint_map, resolved_quant_spec, target_quant_projection,
+    suggested_kv_dtype, suggested_idx_dtype)``.
+    """
+    from mindie_sim.catalog.checkpoint_reader import (
+        lookup_curated_checkpoint,
+        quant_spec_from_checkpoint_map,
+    )
+    from mindie_sim.catalog.quant import resolve_auto_va_quant
+
+    native_dtype = str(model_spec.weight_dtype or model_spec.activation_dtype or "bf16").strip().lower()
+    if native_dtype not in {"bf16", "fp16", "fp32"}:
+        native_dtype = "bf16"
+    canon = _canonical_model_id(model_arg, model_spec)
+    spec_meta = dict(getattr(model_spec, "metadata", ()) or ())
+    raw_q_str = quant.strip().lower() if isinstance(quant, str) else ""
+
+    if quant is not None:
+        explicit = _explicit_checkpoint_quant_map(
+            quant, canon=canon, model_name=model_spec.name,
+            native_dtype=native_dtype, lookup_curated=lookup_curated_checkpoint,
+        )
+        if explicit is not None:
+            return explicit
+
+    local_map = _local_checkpoint_quant_map(model_arg, model_spec)
+    if local_map is not None:
+        if raw_q_str in _AUTO_VA_QUANT_TOKENS and local_map.source_format == "unquantized_native":
+            proj, auto_kv, auto_idx = resolve_auto_va_quant(model_spec, sku, context_tokens=int(context_tokens))
+            return local_map, None, proj, auto_kv, auto_idx
+        qspec = quant_spec_from_checkpoint_map(local_map) if local_map.source_format != "unquantized_native" else None
+        return local_map, qspec, "", None, None
+
+    for repo_candidate in (spec_meta.get("checkpoint_repo_id"), model_arg if isinstance(model_arg, str) else None):
+        if repo_candidate:
+            curated = lookup_curated_checkpoint(str(repo_candidate))
+            if curated is not None:
+                qspec = quant_spec_from_checkpoint_map(curated) if curated.source_format != "unquantized_native" else None
+                return curated, qspec, "", None, None
+
+    if raw_q_str in _AUTO_VA_QUANT_TOKENS:
+        default_repo = (
+            adapter.default_checkpoint_for(canon, hardware_obj)
+            if adapter is not None and hardware_obj is not None else None
+        )
+        curated = lookup_curated_checkpoint(default_repo) if default_repo else None
+        proj, auto_kv, auto_idx = resolve_auto_va_quant(model_spec, sku, context_tokens=int(context_tokens))
+        if curated is not None and curated.source_format != "unquantized_native":
+            return curated, quant_spec_from_checkpoint_map(curated), "", auto_kv, auto_idx
+        unquant = CheckpointQuantMap(
+            provenance=CheckpointProvenance(
+                f"unquantized/{canon or model_spec.name}", "unquantized_native", origin="unquantized_native",
+            ),
+            native_float_dtype=native_dtype,
+        )
+        return unquant, None, proj, auto_kv, auto_idx
+
+    return (
+        synthetic_checkpoint_quant_map(model_spec, canon=canon, native_dtype=native_dtype),
+        None, "", None, None,
+    )
 
 
 def _resolve_checkpoint_model_spec(key: str, *, hw_family: str = "a5") -> ModelSpec | None:
@@ -423,9 +741,18 @@ def _validate_explicit_quant_for_hardware(
 
 def _apply_quant_override(
     model_spec: ModelSpec,
-    quant: str | Mapping[str, Any] | None,
+    quant: str | Mapping[str, Any] | QuantSpec | None,
     machine: Mapping[str, Any],
 ) -> ModelSpec:
+    if isinstance(quant, QuantSpec):
+        updated = replace(
+            model_spec,
+            quant=quant,
+            quantization=str(quant.name),
+            kv_dtype=str(quant.kv_dtype),
+        )
+        _validate_explicit_quant_for_hardware(updated, machine, quant.name)
+        return updated
     if quant is None:
         peaks = machine.get("device", {}).get("compute_peaks", {})
         has_fp8 = any(k in peaks for k in ("fp8", "fp8_e4m3", "mxfp4"))
@@ -437,6 +764,8 @@ def _apply_quant_override(
         return model_spec
     if isinstance(quant, str):
         raw_key = quant.strip().lower()
+        if raw_key in _CHECKPOINT_NATIVE_QUANT_TOKENS:
+            return model_spec
         qkey = _QUANT_ALIASES.get(raw_key, raw_key)
         try:
             updated = apply_model_overrides(model_spec, {"quantization": qkey})

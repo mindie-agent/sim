@@ -32,11 +32,13 @@ from pathlib import Path
 from typing import Any
 
 from mindie_sim.feature_mechanisms import MECHANISM_CATALOG, MechanismContext
-from mindie_sim.runtime_profiles import VA_RECOMMENDED_PROFILES
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.stacks.vllm_ascend.profiles import VA_RECOMMENDED_PROFILES
 
 STACK_MANIFEST_SCHEMA = "mindie-sim.stack-manifest/1"
-VLLM_ASCEND_MANIFEST_PATH = Path(__file__).resolve().parent / "stack_sources" / "vllm_ascend_cann93.json"
+VLLM_ASCEND_MANIFEST_PATH = (
+    Path(__file__).resolve().parent / "stacks" / "vllm_ascend" / "manifest.json"
+)
 MAX_MANIFEST_BYTES = 50 * 1024 * 1024
 
 TRACK_ALIASES: dict[str, str] = {

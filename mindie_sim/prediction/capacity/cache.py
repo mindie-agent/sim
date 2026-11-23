@@ -247,8 +247,12 @@ class _MemoryCacheMixin:
             owned = self.pages.group_components(group)
             valid_tokens = group.valid_tokens(tokens, case.runtime.max_model_len)
             alloc_tokens = group.allocated_token_slots(tokens, case.runtime.max_model_len)
+            history_pages = max(
+                0,
+                group.pages(tokens, case.runtime.max_model_len) - int(group.recycling_pages),
+            )
             paired_local_alloc = (
-                group.pages(tokens, case.runtime.max_model_len) * block
+                history_pages * block
                 if (self.paired_sfa and not group.auxiliary and group.fixed_pages <= 0)
                 else 0
             )
@@ -348,7 +352,9 @@ class _MemoryCacheMixin:
         p = self.case.runtime.parallel
         draft = optional_draft_spec(self.case.model, self.draft_kind)
         draft_cap = self._draft_context_cap(draft)
-        eff_tokens = min(tokens, draft_cap) if draft_cap > 0 else tokens
+        max_len = int(self.case.runtime.max_model_len or 0)
+        eff_tokens = min(tokens, max_len) if max_len > 0 else tokens
+        eff_tokens = min(eff_tokens, draft_cap) if draft_cap > 0 else eff_tokens
         row_bytes = float(draft_row(self.case.model, draft, tp=p.tp))
         block = max(1, int(self.case.runtime.kv_block_size or cp_interleave(self.case.runtime)))
         sharded = _draft_is_dcp_sharded(

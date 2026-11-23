@@ -96,7 +96,7 @@ def normalize_formats(model):
         or getattr(model.quant, "kv_scale_dtype", "")
         or ""
     ).strip().lower()
-    mla_decls: list[dict[str, object]] = []
+    mla_decls: list[tuple[int, dict[str, object]]] = []
     if dtype_bytes(kv_dtype) == 1:
         for plan in mla_plans:
             rope = int(getattr(plan, "qk_rope_head_dim", 0) or 0)
@@ -110,13 +110,15 @@ def normalize_formats(model):
                 "suffix_elements": rope,
                 "suffix_dtype": "bf16",
             }
-            layer_entry = per_layer.setdefault(str(plan.index), {})
-            layer_entry.setdefault("mla_kv", decl)
-            mla_decls.append(dict(layer_entry["mla_kv"]))
-        if mla_decls and all(d == mla_decls[0] for d in mla_decls):
-            regions.setdefault("mla_kv", mla_decls[0])
+            existing = per_layer.get(str(plan.index), {}).get("mla_kv")
+            mla_decls.append((plan.index, dict(existing) if existing is not None else decl))
+        if mla_decls and all(d == mla_decls[0][1] for _, d in mla_decls):
+            regions.setdefault("mla_kv", mla_decls[0][1])
+        else:
+            for layer_idx, decl in mla_decls:
+                per_layer.setdefault(str(layer_idx), {}).setdefault("mla_kv", decl)
     idx_dtype = str(model.quant.index_dtype).strip().lower()
-    idx_decls: list[dict[str, object]] = []
+    idx_decls: list[tuple[int, dict[str, object]]] = []
     if sparse_plans and dtype_bytes(idx_dtype) == 1:
         idx_scale = (
             model.quant.index_scale_dtype
@@ -128,11 +130,13 @@ def normalize_formats(model):
                 "group_size": int(plan.index_dim),
                 "scale_dtype": idx_scale,
             }
-            layer_entry = per_layer.setdefault(str(plan.index), {})
-            layer_entry.setdefault("index_k", decl)
-            idx_decls.append(dict(layer_entry["index_k"]))
-        if idx_decls and all(d == idx_decls[0] for d in idx_decls):
-            regions.setdefault("index_k", idx_decls[0])
+            existing = per_layer.get(str(plan.index), {}).get("index_k")
+            idx_decls.append((plan.index, dict(existing) if existing is not None else decl))
+        if idx_decls and all(d == idx_decls[0][1] for _, d in idx_decls):
+            regions.setdefault("index_k", idx_decls[0][1])
+        else:
+            for layer_idx, decl in idx_decls:
+                per_layer.setdefault(str(layer_idx), {}).setdefault("index_k", decl)
     metadata["cache_representations"] = regions
     if per_layer:
         metadata["layer_cache_representations"] = per_layer

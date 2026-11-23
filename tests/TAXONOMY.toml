@@ -55,7 +55,7 @@ owns = ["data/primitives", "tools/_bench_l0_bounds.py"]
 [[module]]
 path = "schema/test_usability_and_ingress_contracts.py"
 tier = "tier0"
-owns = ["mindie_sim/api.py", "mindie_sim/backends/ascend_channels.py", "mindie_sim/catalog/npu_checkpoints.py", "mindie_sim/catalog/va_speculative_rules.py", "mindie_sim/cli/report.py", "mindie_sim/compose/__init__.py", "mindie_sim/compose/inputs.py", "mindie_sim/prediction/collectives/protocol.py", "mindie_sim/schema/hardware_links.py", "mindie_sim/sweep/pd.py"]
+owns = ["mindie_sim/api.py", "mindie_sim/backends/ascend_channels.py", "mindie_sim/catalog/npu_checkpoints.py", "mindie_sim/stacks/vllm_ascend/speculative.py", "mindie_sim/cli/report.py", "mindie_sim/compose/__init__.py", "mindie_sim/compose/inputs.py", "mindie_sim/prediction/collectives/protocol.py", "mindie_sim/schema/hardware_links.py", "mindie_sim/sweep/pd.py"]
 
 [[module]]
 path = "schema/test_single_spine_contracts.py"
@@ -419,7 +419,7 @@ owns = ["mindie_sim/structure_implementations.py", "mindie_sim/structure_subgrap
 [[module]]
 path = "spine/test_npu_checkpoints_and_va_speculative.py"
 tier = "tier0"
-owns = ["mindie_sim/catalog/npu_checkpoints.py", "mindie_sim/catalog/va_speculative_rules.py"]
+owns = ["mindie_sim/catalog/npu_checkpoints.py", "mindie_sim/stacks/vllm_ascend/speculative.py"]
 [[module]]
 path = "spine/test_single_spine_yardsticks.py"
 tier = "tier1"

@@ -154,6 +154,8 @@ def normalize_hardware_backend(hardware_family: str | None) -> str | None:
         return None
     if raw in {"ascend", "nvidia", "generic"}:
         return raw
+    if raw == "custom":
+        return "generic"
     tokens = {tok for part in raw.replace("-", "_").split() for tok in part.split("_") if tok}
     if raw in _ASCEND_EXACT_TOKENS or (tokens & _ASCEND_EXACT_TOKENS) or raw.startswith(_ASCEND_HW_PREFIXES):
         return "ascend"
@@ -221,9 +223,14 @@ def _manifest_abi_for_tag(
     if upper in {
         "W4A8_MXFP", "W4A8_MXFP4", "W4A8_MXFP4_DYNAMIC", "W4A4_MXFP",
         "W4A4_MXFP4", "W4A4", "W4A4F4_DAOS", "MXFP4", "FP4",
+        "MXFP4_ROUTED_ONLY", "MXFP4_ALL", "MXFP8_MXFP4",
     }:
         blk = rule.group_size if (rule is not None and rule.group_size) else (1, MX_BLOCK_ELEMENTS)
-        act = "fp8_e4m3" if ("A8" in upper or upper == "MXFP4") else "fp4_e2m1"
+        act = (
+            "fp8_e4m3"
+            if ("A8" in upper or upper in {"MXFP4", "MXFP4_ROUTED_ONLY", "MXFP4_ALL", "MXFP8_MXFP4"})
+            else "fp4_e2m1"
+        )
         return TensorPrecisionABI(
             linear_method="mx_fp4",
             input_dtype=act,
@@ -339,7 +346,7 @@ def _validate_manifest_payload(data: Any, source_label: str) -> dict[str, Any]:
         raise ModelingError(
             f"stack_manifest_schema_invalid:{source_label}:expected={STACK_MANIFEST_SCHEMA}:got={schema!r}"
         )
-    stack_id = str(data.get("stack_id", "")).strip()
+    stack_id = str(data.get("stack_id") or data.get("name") or "").strip()
     if not stack_id:
         raise ModelingError(f"stack_manifest_stack_id_required:{source_label}")
     manifest_rev = str(data.get("manifest_revision", "")).strip()
@@ -703,8 +710,11 @@ class ManifestStackAdapter:
         return None
 
 
-def load_manifest_stack(path: Path | str) -> ManifestStackAdapter:
-    """Load and validate a custom stack plugin from a JSON manifest file."""
+def load_manifest_stack(path: Path | str | Mapping[str, Any]) -> ManifestStackAdapter:
+    """Load and validate a custom stack plugin from a JSON manifest file or mapping."""
+    if isinstance(path, Mapping):
+        validated = _validate_manifest_payload(dict(path), "inline_manifest")
+        return ManifestStackAdapter(validated)
     manifest_path = Path(path)
     try:
         if not manifest_path.is_file():
@@ -858,7 +868,7 @@ class RuntimeStackRegistry:
 
     def resolve_for_scenario(
         self,
-        requested_stack: str | Path | None = None,
+        requested_stack: str | Path | Mapping[str, Any] | None = None,
         workload_domain: WorkloadDomain = "llm",
         work_unit: WorkUnitKind | None = None,
         hardware_family: str | None = None,
@@ -882,7 +892,7 @@ class RuntimeStackRegistry:
                 f"work_unit={effective_unit}:allowed={sorted(DOMAIN_WORK_UNITS[workload_domain])}"
             )
         hw_backend = normalize_hardware_backend(hardware_family)
-        if requested_stack is not None and str(requested_stack).strip():
+        if isinstance(requested_stack, Mapping) or (requested_stack is not None and str(requested_stack).strip()):
             return self._resolve_explicit(
                 requested_stack,
                 workload_domain=workload_domain,
@@ -910,7 +920,7 @@ class RuntimeStackRegistry:
 
     def _resolve_explicit(
         self,
-        requested_stack: str | Path,
+        requested_stack: str | Path | Mapping[str, Any],
         *,
         workload_domain: WorkloadDomain,
         work_unit: WorkUnitKind,
@@ -920,16 +930,19 @@ class RuntimeStackRegistry:
         track: StackTrack | None,
         required_recipes: Sequence[str],
     ) -> RuntimeStackAdapter:
-        is_manifest_path = isinstance(requested_stack, Path)
-        if not is_manifest_path:
-            req_str = str(requested_stack).strip()
-            is_manifest_path = req_str.endswith(".json") or (
-                ("/" in req_str or "\\" in req_str) and Path(req_str).suffix.lower() == ".json"
-            )
-        if is_manifest_path:
+        if isinstance(requested_stack, Mapping):
             adapter: RuntimeStackAdapter = load_manifest_stack(requested_stack)
         else:
-            adapter = self.get(str(requested_stack))
+            is_manifest_path = isinstance(requested_stack, Path)
+            if not is_manifest_path:
+                req_str = str(requested_stack).strip()
+                is_manifest_path = req_str.endswith(".json") or (
+                    ("/" in req_str or "\\" in req_str) and Path(req_str).suffix.lower() == ".json"
+                )
+            if is_manifest_path:
+                adapter = load_manifest_stack(requested_stack)
+            else:
+                adapter = self.get(str(requested_stack))
         cap = adapter.capabilities()
         resolve_default_stack_for_domain(
             workload_domain,
@@ -1008,7 +1021,7 @@ def list_stacks(
 
 
 def resolve_stack_for_scenario(
-    requested_stack: str | Path | None = None,
+    requested_stack: str | Path | Mapping[str, Any] | None = None,
     workload_domain: WorkloadDomain = "llm",
     work_unit: WorkUnitKind | None = None,
     hardware_family: str | None = None,

@@ -27,7 +27,7 @@ import re
 from typing import Any
 
 from mindie_sim.catalog.npu_checkpoints import normalize_hw_family, resolve_default_checkpoint
-from mindie_sim.catalog.va_speculative_rules import build_va_serving_rules
+from mindie_sim.stacks.vllm_ascend.speculative import build_va_serving_rules
 from mindie_sim.optimization.causal_tail import (
     compute_acceptance_tail_closure,
     resolve_arch_family_tag,
@@ -103,7 +103,6 @@ from .models import (
     DEFAULT_SCENARIO_OUTPUT_TOKENS,
     DEFAULT_SCENARIO_PROMPT_TOKENS,
     DEFAULT_TPOT_SLO_MS,
-    DEFAULT_TTFT_SLO_MS,
     DEPLOYMENT_MODE_LABELS,
     EXPORT_BUNDLE_SCHEMA,
     GRAPH_DIGEST_HEX_LEN,
@@ -180,14 +179,16 @@ def compose_export_case(
     output_tokens: int = DEFAULT_SCENARIO_OUTPUT_TOKENS,
     concurrency: int = 1,
     tpot_slo_ms: float = DEFAULT_TPOT_SLO_MS,
-    ttft_slo_ms: float = DEFAULT_TTFT_SLO_MS,
+    ttft_slo_ms: float | None = None,
     mtp_proposal_tokens: int = 0,
     mtp_acceptance_length: float = 1.0,
     feature_track: str = "merged",
     quant: str | None = None,
     kv_cache_dtype: str | None = None,
+    indexer_kv_dtype: str | None = None,
     engram_cpu_offload: bool | None = None,
     deployment_mode: str | None = None,
+    runtime_stack: str | Path | Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, Any], StepRequest]:
     """Zero-boilerplate scenario composer returning ``(case_dict, StepRequest)``."""
     from mindie_sim.compose import compose_case
@@ -215,35 +216,30 @@ def compose_export_case(
         "mtp_proposal_tokens": spec_toks,
         "mtp_acceptance_length": float(mtp_acceptance_length),
         "tpot_slo_ms": float(tpot_slo_ms),
-        "ttft_slo_ms": float(ttft_slo_ms),
         "feature_track": str(feature_track or "merged"),
     }
+    if ttft_slo_ms is not None:
+        compose_kw["ttft_slo_ms"] = float(ttft_slo_ms)
     if resolved_preset:
         compose_kw["topology_preset"] = resolved_preset
-    resolved_quant = quant
-    resolved_kv = kv_cache_dtype
-    if str(quant or "").strip().lower() in {"auto_va", "auto"}:
-        from mindie_sim.catalog.quant import resolve_auto_va_quant
-        from mindie_sim.model_catalog import load_model
-
-        m_spec = load_model(model)
-        auto_w, auto_kv, auto_idx = resolve_auto_va_quant(m_spec, sku, context_tokens=p_tok)
-        resolved_quant = auto_w
-        if resolved_kv is None:
-            resolved_kv = auto_kv
-        if auto_idx and "indexer_kv_dtype" not in compose_kw:
-            compose_kw["indexer_kv_dtype"] = auto_idx
-    if resolved_quant is not None:
-        compose_kw["quant"] = resolved_quant
-    if resolved_kv is not None:
-        compose_kw["kv_cache_dtype"] = resolved_kv
+    if runtime_stack is not None:
+        compose_kw["runtime_stack"] = runtime_stack
+    if quant is not None:
+        compose_kw["quant"] = quant
+    if kv_cache_dtype is not None:
+        compose_kw["kv_cache_dtype"] = kv_cache_dtype
+    if indexer_kv_dtype is not None:
+        compose_kw["indexer_kv_dtype"] = indexer_kv_dtype
     if engram_cpu_offload is not None:
         compose_kw["engram_cpu_offload"] = bool(engram_cpu_offload)
+    norm_dep = str(deployment_mode or "").strip().lower()
+    if norm_dep in {"colocated", "pd_prefill", "pd_decode"}:
+        compose_kw["role"] = norm_dep
     raw = compose_case(model, sku, **compose_kw)
-    if deployment_mode and str(deployment_mode).strip().lower() != "auto":
+    if norm_dep and norm_dep != "auto":
         rt = dict(raw.get("runtime") or {})
         meta = dict(rt.get("metadata") or {})
-        meta["deployment_mode"] = str(deployment_mode).strip()
+        meta["deployment_mode"] = norm_dep
         rt["metadata"] = meta
         raw["runtime"] = rt
     step_req = StepRequest(
@@ -1395,7 +1391,12 @@ def _build_prelim_operator_rows(
 
 def _resolve_deployment_mode(parsed: Case, phase: str) -> str:
     meta = dict(parsed.runtime.metadata)
-    explicit = str(meta.get("deployment_mode") or meta.get("deployment") or "").strip()
+    explicit = str(
+        meta.get("deployment_mode")
+        or meta.get("deployment_role")
+        or meta.get("deployment")
+        or ""
+    ).strip()
     if explicit:
         low = explicit.lower()
         return DEPLOYMENT_MODE_LABELS.get(low, explicit)
@@ -1447,7 +1448,8 @@ def _extract_scenario_meta(
         "sp_gather" in r.op_id or "sp_shard" in r.op_id for r in final_rows
     )
     tpot_slo = float(getattr(parsed.slo, "tpot_ms", None) or DEFAULT_TPOT_SLO_MS)
-    ttft_slo = float(getattr(parsed.slo, "ttft_ms", None) or DEFAULT_TTFT_SLO_MS)
+    raw_ttft = getattr(parsed.slo, "ttft_ms", None)
+    ttft_slo = float(raw_ttft) if raw_ttft is not None else None
     return {
         "topology_preset": topology_preset,
         "deployment_mode": _resolve_deployment_mode(parsed, step_req.phase),
@@ -1837,20 +1839,36 @@ def _build_bundle_memory_and_sla(
         (step_span_us / US_PER_MS / max(1.0, float(scen["avg_accepted_tokens"]))) + eff_handoff
         if step_req.phase == "decode" else (step_span_us / US_PER_MS)
     )
-    sla_target = float(scen["tpot_slo_ms"] if step_req.phase == "decode" else scen["ttft_slo_ms"])
-    sla_slack = sla_target - eff_tpot_ms
+    raw_sla_target = scen["tpot_slo_ms"] if step_req.phase == "decode" else scen["ttft_slo_ms"]
     min_headroom = min((st.headroom_bytes for st in mem_ledger.stage_budgets), default=0.0)
-    macro_wall = evaluate_macro_wall_trigger(
-        tpot_ms=eff_tpot_ms,
-        tpot_slo_ms=sla_target,
-        hbm_used_bytes=mem_ledger.max_stage_hbm_bytes,
-        hbm_usable_bytes=mem_ledger.usable_hbm_bytes,
-        hbm_headroom_bytes=min_headroom,
-    )
-    sla_regime = (
-        "SLA_VIOLATED" if eff_tpot_ms > sla_target
-        else ("HBM_CAPACITY_BOUND" if macro_wall.wall_kind == "HBM_CAPACITY_WALL" else "SLA_LATENCY_BOUND")
-    )
+    if raw_sla_target is None:
+        sla_slack = 0.0
+        macro_wall = evaluate_macro_wall_trigger(
+            tpot_ms=eff_tpot_ms,
+            tpot_slo_ms=max(eff_tpot_ms, 1.0),
+            hbm_used_bytes=mem_ledger.max_stage_hbm_bytes,
+            hbm_usable_bytes=mem_ledger.usable_hbm_bytes,
+            hbm_headroom_bytes=min_headroom,
+        )
+        sla_regime = (
+            "HBM_CAPACITY_BOUND"
+            if macro_wall.wall_kind == "HBM_CAPACITY_WALL"
+            else "UNCONSTRAINED"
+        )
+    else:
+        sla_target = float(raw_sla_target)
+        sla_slack = sla_target - eff_tpot_ms
+        macro_wall = evaluate_macro_wall_trigger(
+            tpot_ms=eff_tpot_ms,
+            tpot_slo_ms=sla_target,
+            hbm_used_bytes=mem_ledger.max_stage_hbm_bytes,
+            hbm_usable_bytes=mem_ledger.usable_hbm_bytes,
+            hbm_headroom_bytes=min_headroom,
+        )
+        sla_regime = (
+            "SLA_VIOLATED" if eff_tpot_ms > sla_target
+            else ("HBM_CAPACITY_BOUND" if macro_wall.wall_kind == "HBM_CAPACITY_WALL" else "SLA_LATENCY_BOUND")
+        )
     return mem_ledger, eff_handoff, sla_slack, sla_regime, macro_wall
 
 

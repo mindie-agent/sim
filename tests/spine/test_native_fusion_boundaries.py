@@ -448,15 +448,18 @@ def test_moe_routing_accounts_for_the_inverse_permutation():
     assert (inverse_bytes, inverse_bytes) == pytest.approx((math.prod(pack.local_shape[:2]) * 4, 4096))
     assert 'inverse_indices' in pack.returns and pack.op_id in unpack.deps
     assert pack.mte3_bytes == pytest.approx(3_674_112 + 4096)
-def pool_case(quant=None, tail_capacity=9, **kwargs):
-    raw = compose_case('glm-5.3-flash', hardware='a3', tp=8, ep=8, num_devices=8, layers=4, quant=quant, **kwargs)
+def pool_case(quant=None, tail_capacity=9, *, hardware='a3', **kwargs):
+    raw = compose_case('glm-5.3-flash', hardware=hardware, tp=8, ep=8, num_devices=8, layers=4, quant=quant, **kwargs)
     raw['runtime'].setdefault('kernels', {}).setdefault('lowerings', {})['pool_key_indexer'] = {
         'implementation': 'vllm_ascend_cann_keypool_caller',
         'options': {'tail_capacity': tail_capacity, 'block_table_columns': 8195}}
     return parse_case(raw)
 pool_prefill = partial(_ops, phase='prefill', tokens=8, context=0)
 def _native_pool_case(scale):
-    return pool_case({'name': 'C8', 'kv_dtype': 'fp8_e4m3', 'index_dtype': 'fp8_e4m3', 'index_scale_dtype': scale})
+    return pool_case(
+        {'name': 'C8', 'kv_dtype': 'fp8_e4m3', 'index_dtype': 'fp8_e4m3', 'index_scale_dtype': scale},
+        hardware='a5',
+    )
 def test_native_keypool_binds_bf16_pool_projections_and_requires_fp32_scales():
     case = _native_pool_case('fp32')
     overrides = dict(case.model.quant.category_overrides)

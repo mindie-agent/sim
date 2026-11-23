@@ -270,6 +270,7 @@ def _add_catalog_and_solve_parsers(sub) -> None:
                        help="KV pooling mode: auto|off|pooled_dram_ssd|layerwise_overlap_d2d|direct_blocking_d2d")
     solve.add_argument("--no-kv-pooling", dest="kv_pooling", action="store_const", const="off")
     solve.add_argument("--deployment", choices=("auto", "pd", "pd_disaggregated", "colocated"), default="auto")
+    solve.add_argument("--stack", default=None, help="runtime stack name or manifest path (domain-aware default when omitted)")
     solve.add_argument("--quant", default=None)
     solve.add_argument("--kv-cache-dtype", default=None)
     solve.add_argument("--indexer-kv-dtype", default=None)
@@ -461,7 +462,7 @@ def _add_compose_and_waterfall_parsers(sub) -> None:
     compose.add_argument("--indexer-kv-dtype", default=None)
     compose.add_argument("--structure-only", action="store_true",
                          help="allow graph/structure composition without serving prompt/output lengths")
-    compose.add_argument("--stack", default="vllm-ascend", help="registered runtime stack name or manifest path")
+    compose.add_argument("--stack", default=None, help="registered runtime stack name or manifest path (domain-aware default when omitted)")
     compose.add_argument("--stack-manifest", default=None, help="explicit JSON stack manifest path")
     compose.add_argument("--feature-track", default="merged",
                          choices=("raw_eager", "merged", "unmerged_pr", "expected_ideal"))
@@ -474,7 +475,7 @@ def _add_compose_and_waterfall_parsers(sub) -> None:
     ft = sub.add_parser("feature-tracks", help="4-level waterfall (merged -> unmerged_pr -> expected_ideal -> roofline)")
     ft.add_argument("--model", required=True)
     ft.add_argument("--hardware", default="a3")
-    ft.add_argument("--stack", default="vllm-ascend")
+    ft.add_argument("--stack", default=None)
     ft.add_argument("--stack-manifest", default=None)
     ft.add_argument("--phase", choices=("decode", "prefill"), default="decode")
     ft.add_argument("--tokens", type=int, default=1)

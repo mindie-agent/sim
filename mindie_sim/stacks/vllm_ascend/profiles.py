@@ -910,6 +910,19 @@ def simulation_config(
         "active_role_topology": deepcopy(selected_topo) if selected_topo else None,
         "tutorial_flags": resolved_flags,
         "source": deepcopy(profile.get("source")),
+        "coverage": "supported_simulation_subset",
+        "quantization_basis": (
+            "documented_format_family_with_simulation_recipe"
+            if quant
+            else "preserve_caller_no_documented_hardware_quantization"
+        ),
+        "execution_controls_basis": "simulation_choices_not_complete_launch_configuration",
+        "limitations": [
+            "checkpoint_category_quantization_and_cache_formats_require_explicit_declaration",
+            "mtp_is_advisory_workload_dependent_and_not_enabled_automatically",
+            "environment_metadata_is_not_applied_to_execution",
+            "source_lowerings_have_independent_supported_domains",
+        ],
     }
 
 

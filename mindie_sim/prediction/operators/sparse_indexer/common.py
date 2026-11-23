@@ -41,8 +41,8 @@ QSA_ABI = "aclnnLightningIndexerQSA"
 # The mounted QSA caller materializes uniform weights at the native boundary.
 QSA_OVERLAY_SOURCE = SourceRef(
     repository="mindie-agent/sim", revision="c1bc55e59facc21a6a775da346e7ad7ae4909cfd",
-    relative_path="mindie_sim/stack_sources/vllm_ascend_cann93.json",
-    source_sha256="dbf3251556cdfeb19c7304235e355fef1c6b99136471db93979eb5b587b82277",
+    relative_path="mindie_sim/stacks/vllm_ascend/manifest.json",
+    source_sha256="3a68c55fe152187f2ac4237622152c6b1be6cd514880ef210e3b6741d9518b7e",
 )
 MSA_ABI = "aclnnMsaIndexScore"
 MSA_V2_ABI = "aclnnMsaIndexScoreV2"

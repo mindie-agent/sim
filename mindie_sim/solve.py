@@ -736,7 +736,7 @@ def solve_deployment(
     pinned_parallel: Mapping[str, int] | None = None,
     pinned_prefill_parallel: Mapping[str, int] | None = None,
     pinned_decode_parallel: Mapping[str, int] | None = None,
-    raw_eager: bool = False, runtime_stack: str | Mapping[str, Any] = "vllm-ascend",
+    raw_eager: bool = False, runtime_stack: str | Mapping[str, Any] | None = None,
     optimizations: Sequence[str] = (), exclude_optimizations: Sequence[str] = (),
     xlsx_path: str | Path | None = None, trace_path: str | Path | None = None,
     compare_track: str = "merged", target_track: str = "expected_ideal",

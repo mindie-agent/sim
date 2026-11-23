@@ -644,6 +644,7 @@ def test_agent_first_report_and_solve_cli_flags_and_model_target_ceiling(tmp_pat
     rec_path = tmp_path / "receipt.json"
     rc = cli_main([
         "report", "--from-script", str(script), "--hardware", "a5",
+        "--deployment-mode", "colocated",
         "--dp", "1", "--tp", "2", "--ep", "1", "--concurrency", "2",
         "--prompt-tokens", "512", "--output-tokens", "32",
         "--out-dir", str(out_dir), "--json", "--receipt", str(rec_path),
@@ -711,6 +712,7 @@ def test_public_graph_mapping_cli_geometry_and_report_parity(tmp_path, capsys):
     rec_path = tmp_path / "rep_bf16_rec.json"
     rc_r = cli_main([
         "report", "--model", "deepseek-v3.2", "--hardware", "a5",
+        "--deployment-mode", "colocated",
         "--dp", "1", "--tp", "8", "--ep", "8", "--concurrency", "1",
         "--prompt-tokens", "256", "--output-tokens", "32",
         "--weight-quant", "bf16", "--cache-dtype", "bf16",
@@ -839,17 +841,17 @@ def test_report_preserves_solved_pd_columns_pooling_phase_and_strict_tracks(tmp_
             model="deepseek-v3.2", sku="Ascend910_9392", topology_preset=None, num_devices=8,
             prompt_tokens=128, output_tokens=32, tpot_slo_ms=50.0, ttft_slo_ms=None,
             quant="w8a8_dynamic", kv_cache_dtype="c8", indexer_kv_dtype=None,
-            deployment_mode="pd_pooled", phase="prefill",
+            deployment_mode="pd_disaggregated", kv_pooling="pooled_dram_ssd", phase="prefill",
         )
         lay_unpool = report_mod._auto_solve_report_layout(
             model="deepseek-v3.2", sku="Ascend910_9392", topology_preset=None, num_devices=8,
             prompt_tokens=128, output_tokens=32, tpot_slo_ms=50.0, ttft_slo_ms=None,
             quant="w8a8_dynamic", kv_cache_dtype="c8", indexer_kv_dtype=None,
-            deployment_mode="pd_unpooled", phase="decode",
+            deployment_mode="pd_disaggregated", kv_pooling="off", phase="decode",
         )
         assert seen_modes == ["pooled_dram_ssd", "layerwise_overlap_d2d"]
-        assert lay_pool["deployment_mode"] == "pd_pooled"
-        assert lay_unpool["deployment_mode"] == "pd_unpooled"
+        assert lay_pool["deployment_mode"] == "pd_disaggregated"
+        assert lay_unpool["deployment_mode"] == "pd_disaggregated"
 
         raw_p, step_p, meta_p = _bundle_inputs_for_solution(
             lay_pool["solved"], model="deepseek-v3.2", hardware="a3", runtime_stack="vllm-ascend",
@@ -865,7 +867,8 @@ def test_report_preserves_solved_pd_columns_pooling_phase_and_strict_tracks(tmp_
         rc = cli_main([
             "report", "--model", "deepseek-v3.2", "--hardware", "a3", "--num-devices", "8",
             "--prompt-tokens", "128", "--output-tokens", "32",
-            "--weight-quant", "w8a8_dynamic", "--deployment-mode", "pd_pooled",
+            "--weight-quant", "w8a8_dynamic",
+            "--deployment-mode", "pd_disaggregated", "--kv-pooling", "pooled_dram_ssd",
             "--mode", "simulation", "--compare-track", "expected_ideal",
             "--no-trace", "--no-xlsx", "--out-dir", str(out_dir), "--json", "--receipt", str(rec_path),
         ])
@@ -875,7 +878,7 @@ def test_report_preserves_solved_pd_columns_pooling_phase_and_strict_tracks(tmp_
         assert kpis["after"]["analysis_mode"] == "simulation"
         assert kpis["after"]["cluster_tps"] == pytest.approx(1200.0, rel=1e-9)
         from mindie_sim.export.bundle import DEPLOYMENT_MODE_LABELS
-        assert rec["agent_brief"]["scenario_and_parallelism"]["deployment_mode"] == DEPLOYMENT_MODE_LABELS["pd_pooled"]
+        assert rec["agent_brief"]["scenario_and_parallelism"]["deployment_mode"] == DEPLOYMENT_MODE_LABELS["pd_disaggregated"]
 
 
 def test_report_shipping_defaults_partial_pins_and_script_free_purity(tmp_path, monkeypatch):
@@ -894,6 +897,7 @@ def test_report_shipping_defaults_partial_pins_and_script_free_purity(tmp_path, 
     bad_designs.write_text("{}", encoding="utf-8")
     assert cli_main([
         "report", "--model", "qwen3-32b", "--hardware", "a3",
+        "--deployment-mode", "colocated",
         "--dp", "1", "--tp", "2", "--ep", "1", "--concurrency", "1",
         "--kernel-designs-json", str(bad_designs), "--out-dir", str(tmp_path / "bad_out"),
     ]) == 2
@@ -926,7 +930,8 @@ def test_report_shipping_defaults_partial_pins_and_script_free_purity(tmp_path, 
         sf_dir = tmp_path / "sf_out"
         sf_rec = tmp_path / "sf_rec.json"
         rc_sf = cli_main([
-            "report", "--model", "qwen3-32b", "--hardware", "a3", "--num-devices", "4", "--tp", "2",
+            "report", "--model", "qwen3-32b", "--hardware", "a3", "--deployment-mode", "colocated",
+            "--num-devices", "4", "--tp", "2",
             "--prompt-tokens", "128", "--output-tokens", "32", "--mode", "simulation",
             "--no-trace", "--out-dir", str(sf_dir), "--json", "--receipt", str(sf_rec),
         ])
@@ -946,7 +951,8 @@ def test_report_shipping_defaults_partial_pins_and_script_free_purity(tmp_path, 
         sa_dir = tmp_path / "sa_out"
         sa_rec = tmp_path / "sa_rec.json"
         rc_sa = cli_main([
-            "report", "--from-script", str(sh_file), "--hardware", "a3", "--num-devices", "4", "--tp", "2",
+            "report", "--from-script", str(sh_file), "--hardware", "a3",
+            "--deployment-mode", "colocated", "--num-devices", "4", "--tp", "2",
             "--prompt-tokens", "128", "--output-tokens", "32", "--mode", "simulation",
             "--no-trace", "--out-dir", str(sa_dir), "--json", "--receipt", str(sa_rec),
         ])

@@ -248,7 +248,7 @@ def test_shipping_score_padding_and_full_width_value_publications():
 @pytest.mark.parametrize("stack_pin", [False, True])
 @pytest.mark.parametrize("dtype", ["bf16", "fp16"])
 def test_history_decode_exchanges_output_and_lse_after_attention(stack_pin, dtype):
-    manifest = REPO_ROOT / "mindie_sim/stack_sources/vllm_ascend_cann93.json"
+    manifest = REPO_ROOT / "mindie_sim/stacks/vllm_ascend/manifest.json"
     revision = json.loads(manifest.read_text())["baseline_revision"] if stack_pin else VLLM_REVISION
     history = governed.ContextParallelPlan(
         revision, HISTORY_DECODE_SITE, "decode", "history_attention",

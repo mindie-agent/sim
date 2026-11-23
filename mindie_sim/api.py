@@ -19,7 +19,10 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
-from mindie_sim.compose import compose_case as _compose_case_dict
+from mindie_sim.compose import (
+    compose_case as _compose_case_dict,
+    resolve_case_contracts as _resolve_case_contracts,
+)
 from mindie_sim.prediction.offload.policy import missing_scenario_error
 from mindie_sim.prediction.program.primitives import PrimitiveStore
 from mindie_sim.prediction.results import (
@@ -90,8 +93,10 @@ def evaluate_step(
 ) -> StepEvaluation:
     """Lower and evaluate one fixed step on ``runtime.Engine``."""
     spine = default_spine()
+    parsed = _to_case(case)
+    _sc, qp, _lp = _resolve_case_contracts(parsed)
     prepared = spine.lower(
-        _to_case(case), LoweringRequest(step=request), streams=streams
+        parsed, LoweringRequest(step=request, runtime_quant_plan=qp), streams=streams
     )
     return spine.run_step(
         prepared, replay, primitives=primitives, primitive_table=primitive_table
@@ -274,7 +279,9 @@ def export_structure(
 ) -> StructureExport:
     """Export canonical hashed structure sealed by ``graph_id`` without timing replay."""
     spine = default_spine()
-    prepared = spine.lower(_to_case(case), LoweringRequest(step=request.step))
+    parsed = _to_case(case)
+    _sc, qp, _lp = _resolve_case_contracts(parsed)
+    prepared = spine.lower(parsed, LoweringRequest(step=request.step, runtime_quant_plan=qp))
     return spine.project_structure(prepared, request)
 
 

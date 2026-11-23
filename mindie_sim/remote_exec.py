@@ -71,7 +71,7 @@ LEASE_TOKEN = re.compile(rf"([1-9][0-9]*)-({UUID_TOKEN.pattern})\.lease\Z")
 BUNDLE_PATTERNS = (
     "mindie_sim/**/*.py", "mindie_sim/prediction/runtime/_engine_accel*.c",
     "mindie_sim/prediction/runtime/_engine_accel*.h", "mindie_sim/backends/profiles/*.json",
-    "mindie_sim/stack_sources/*.json", "mindie_sim/model_configs/*.json",
+    "mindie_sim/stacks/*/manifest.json", "mindie_sim/model_configs/*.json",
     "mindie_sim/catalog/configs/*.json", "data/primitives/*.json",
 )
 PUBLIC_REASONS = frozenset({

@@ -355,7 +355,7 @@ def catalog_case(model, **overrides):
     return parse_case(compose_case(model, **(settings | overrides)))
 
 @pytest.mark.parametrize("model,query,total,draft", [
-    ("deepseek-v4.1-flash", 1, 2207744, 208896), ("glm-5.3-flash", 4, 21844992, None),
+    ("deepseek-v4.1-flash", 1, 2207744, 208896), ("glm-5.3-flash", 4, 21872640, None),
     ("step-5-preview", 1, None, None),
 ])
 def test_draft_cache_allocation_and_batch_ledger_conserve_bytes(model, query, total, draft):
@@ -626,7 +626,10 @@ def test_paired_sfa_caps_draft_kv_pages_at_draft_max_model_len() -> None:
     assert aux_g["recycling_pages"] == 0
     assert main_g["bytes_per_group_page"] < groups_uncapped[0]["bytes_per_group_page"]
 
-    comp_names = {p.index: ("mla_kv", "index_k", "state") for p in capped.model.layer_plans}
+    comp_names = {
+        p.index: ("mla_kv", "index_k", "conv_state", "recurrent_state", "replay_records", "state_transient")
+        for p in capped.model.layer_plans
+    }
     pages_uncapped = CachePages(groups_uncapped, comp_names, layer_stage)
     pages_capped = CachePages(groups_capped, comp_names, layer_stage)
     assert pages_capped.group_components(pages_capped.groups[1]) == {}

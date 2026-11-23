@@ -600,6 +600,7 @@ def _dispatch_solve(args: argparse.Namespace) -> object:
         ssd_bw_gbps=args.ssd_bw_gbps,
         kv_transfer_bw_gbps=args.kv_transfer_bw_gbps,
         raw_eager=bool(args.raw_eager),
+        runtime_stack=getattr(args, "stack", None),
         xlsx_path=getattr(args, "xlsx", None),
         trace_path=getattr(args, "trace", None),
         compare_track=str(getattr(args, "compare_track", None) or "unmerged_pr"),

@@ -160,8 +160,9 @@ def _populate_summary_deployment_block(
     mode_tag = "建模 Modeling" if ref.analysis_mode == MODE_MODELING else "仿真 Simulation"
     track_txt = f"Before({bundle.feature_track or 'base'}) -> After({compare_bundle.feature_track or 'cand'})" if compare_bundle is not None else (bundle.feature_track or "standalone")
     is_decode = ref.phase == "decode"
-    sla_target = ref.tpot_slo_ms if is_decode else ref.ttft_slo_ms
-    sla_detail = f"TPOT <= {ref.tpot_slo_ms:.1f} ms (TTFT <= {ref.ttft_slo_ms:.0f} ms)" if is_decode else f"TTFT <= {ref.ttft_slo_ms:.0f} ms"
+    sla_target = ref.tpot_slo_ms if is_decode else (ref.ttft_slo_ms if ref.ttft_slo_ms is not None else 0.0)
+    ttft_label = f"TTFT <= {ref.ttft_slo_ms:.0f} ms" if ref.ttft_slo_ms is not None else "TTFT=N/A"
+    sla_detail = f"TPOT <= {ref.tpot_slo_ms:.1f} ms ({ttft_label})" if is_decode else ttft_label
     spec_detail = (
         f"Method={ref.spec_method}, Proposals={ref.spec_proposals}, Avg Accepted={ref.avg_accepted_tokens:.2f} tok/step"
         if is_decode and ref.spec_proposals > 0
@@ -246,8 +247,10 @@ def _populate_summary_kpi_block(ws: Worksheet, bundle: ExportBundle, compare_bun
     b_hf = float(getattr(bundle, "handoff_tpot_ms", 0.0) or 0.0) if is_decode else 0.0
     a_hf = float(getattr(after, "handoff_tpot_ms", 0.0) or 0.0) if is_decode else 0.0
     b_tpot, a_tpot = ((b_step / b_acc) + b_hf) if is_decode else b_step, ((a_step / acc) + a_hf) if is_decode else a_step
-    sla = after.tpot_slo_ms if is_decode else after.ttft_slo_ms
-    b_pass, a_pass = b_tpot <= sla, a_tpot <= sla
+    raw_sla = after.tpot_slo_ms if is_decode else after.ttft_slo_ms
+    sla = float(raw_sla) if raw_sla is not None else 0.0
+    b_pass = True if raw_sla is None else (b_tpot <= sla)
+    a_pass = True if raw_sla is None else (a_tpot <= sla)
     b_ctps, a_ctps = bundle.throughput_tokens_per_s, after.throughput_tokens_per_s
     b_dtps, a_dtps = bundle.throughput_per_die_tokens_per_s, after.throughput_per_die_tokens_per_s
     b_lstar, a_lstar = bundle.step_l_star_lean_us / US_PER_MS, after.step_l_star_lean_us / US_PER_MS

@@ -177,8 +177,10 @@ def validate_deployment_mode(mode: Any) -> DeploymentMode:
         raise ModelingError(
             f"deployment_mode_required: explicit --deployment-mode must be one of "
             f"{DEPLOYMENT_MODE_LIST_TEXT}; required inputs: "
-            "colocated (single pool), pd_disaggregated (disjoint P/D pools or split budget + transfer), "
-            "pd_prefill (P pool, no decode TPOT/ITL), pd_decode (D pool + ReadyStateAssumption, TTFT=None)"
+            "colocated (single pool with --ttft-ms + --tpot-ms), "
+            "pd_disaggregated (disjoint P/D pools or split budget + transfer with --ttft-ms + --tpot-ms), "
+            "pd_prefill (P pool with --ttft-ms; no decode TPOT/ITL), "
+            "pd_decode (D pool with --tpot-ms + ReadyStateAssumption; TTFT=None)"
         )
     normalized = mode.strip().lower()
     if normalized not in DEPLOYMENT_MODES:

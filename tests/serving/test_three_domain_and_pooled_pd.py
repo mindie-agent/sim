@@ -531,7 +531,7 @@ def test_kimi_k31_five_live_correctness_regressions():
     contract = validate_contract(conv_op, conv_ctx)
     assert contract.lengths == (6, 6)
     assert _resolve_recover_ssm_accepted({"accepted_tokens": 3.5}, conv_ctx, 6) == 4
-    assert _resolve_recover_ssm_accepted({}, conv_ctx, 6) == 4
+    assert _resolve_recover_ssm_accepted({}, conv_ctx, 6) == (3, 4)
     c_eager = compose_case("kimi-k3.1", "950dt-96g-pod", feature_track="raw_eager", quant="mxfp4", **common)
     step_eval = sdk_api.evaluate_step(c_eager, StepRequest(phase="decode", tokens=6, context=131584, sequences=8, scope="model"))
     assert step_eval.span_ms > 0.0
@@ -554,8 +554,10 @@ def test_memory_hbm_pools_draft_cap_engram_offload_and_pd_runtime_sharding():
         kv_cache_dtype="fp8", indexer_kv_dtype="fp8",
         max_num_seqs=128, max_num_batched_tokens=1024,
     )
-    c_k5 = parse_case(compose_case("kimi-k3.1", "950dt-96g-pod", feature_track="merged", **base_k31))
-    mem_k5 = Memory(c_k5)
+    c_k5_norec = parse_case(compose_case(
+        "kimi-k3.1", "950dt-96g-pod", feature_track="merged", recover_ssm=False, **base_k31,
+    ))
+    mem_k5 = Memory(c_k5_norec)
     seq_len = 131072 + 1024
     bd_k5 = mem_k5.cache_pool_breakdown(seq_len, padded=True)
     assert bd_k5["query_tokens"] == 6
@@ -571,23 +573,28 @@ def test_memory_hbm_pools_draft_cap_engram_offload_and_pd_runtime_sharding():
     )
     assert pool_sum == pytest.approx(bd_k5["total_bytes"])
     assert bd_k5["total_bytes"] == pytest.approx(sum(mem_k5.cache_bytes(seq_len, padded=True)))
-    # Realistic 128K capacity on 950DT-96G (~24-36 seqs/DP, never 75).
-    max_seqs = _vram_max_sequences_per_dp(c_k5, context=131072, tokens_per_seq=6, output_budget=1024)
-    assert 20 <= max_seqs <= 36
-
-    # K+1 speculative SSM state scales up with K=7 and drops sharply under recover_ssm=True.
+    # K+1 speculative SSM state scales up with K=7 (recover_ssm=False) and drops sharply
+    # under shipping vllm-ascend merged recover_ssm=True.
     c_k7 = parse_case(compose_case(
-        "kimi-k3.1", "950dt-96g-pod", feature_track="merged", **{**base_k31, "mtp_proposal_tokens": 7},
+        "kimi-k3.1", "950dt-96g-pod", feature_track="merged", recover_ssm=False,
+        **{**base_k31, "mtp_proposal_tokens": 7},
     ))
     bd_k7 = Memory(c_k7).cache_pool_breakdown(seq_len, padded=True)
     assert bd_k7["query_tokens"] == 8
     assert bd_k7["recurrent_state_bytes"] > bd_k5["recurrent_state_bytes"]
 
     c_rec = parse_case(compose_case(
-        "kimi-k3.1", "950dt-96g-pod", feature_track="unmerged_pr", **base_k31,
+        "kimi-k3.1", "950dt-96g-pod", feature_track="merged", **base_k31,
     ))
+    assert c_rec.runtime.recover_ssm is True
     bd_rec = Memory(c_rec).cache_pool_breakdown(seq_len, padded=True)
     assert bd_rec["recurrent_state_bytes"] < bd_k5["recurrent_state_bytes"]
+    # Realistic 128K capacity on 950DT-96G with shipping recover_ssm=True (~24-36 seqs/DP, never 75),
+    # strictly exceeding the non-recover_ssm K+1 baseline.
+    max_seqs_shipping = _vram_max_sequences_per_dp(c_rec, context=131072, tokens_per_seq=6, output_budget=1024)
+    max_seqs_norec = _vram_max_sequences_per_dp(c_k5_norec, context=131072, tokens_per_seq=6, output_budget=1024)
+    assert 20 <= max_seqs_shipping <= 36
+    assert 12 <= max_seqs_norec < max_seqs_shipping
 
     # 2) Non-paired_sfa draft KV cap (draft_max_model_len=4096) shrinks cache_bytes & conserves rank views.
     raw_uncapped = compose_case(

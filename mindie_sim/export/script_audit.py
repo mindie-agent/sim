@@ -39,7 +39,10 @@ from mindie_sim.catalog.npu_checkpoints import (
     validate_quant_for_hardware,
 )
 from mindie_sim.catalog.quant import LONG_CONTEXT_KV_QUANT_THRESHOLD
-from mindie_sim.catalog.va_speculative_rules import build_va_serving_rules, validate_aclgraph_capture_sizes
+from mindie_sim.stacks.vllm_ascend.speculative import (
+    build_va_serving_rules,
+    validate_aclgraph_capture_sizes,
+)
 
 from .models import GIB_BYTES, US_PER_MS, ExportBundle
 

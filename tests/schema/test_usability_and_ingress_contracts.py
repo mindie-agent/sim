@@ -24,7 +24,7 @@ from mindie_sim.backends.ascend import (
     profiles as ascend_profiles,
 )
 from mindie_sim.catalog.npu_checkpoints import resolve_checkpoint_metadata
-from mindie_sim.catalog.va_speculative_rules import build_va_serving_rules
+from mindie_sim.stacks.vllm_ascend.speculative import build_va_serving_rules
 from mindie_sim.cli import main as cli_main
 from mindie_sim.compose import compose_case
 from mindie_sim.compose.inputs import HARDWARE_ALIASES
@@ -296,10 +296,11 @@ def test_minimal_sdk_cli_and_infeasible_honesty(tmp_path) -> None:
     assert infeasible["feasible"] is False
     assert infeasible["recommended_case"] is None
 
-    # Minimal CLI report smoke (no xlsx/trace to keep Tier-0 fast).
+    # Minimal CLI report smoke (explicit --deployment-mode, no xlsx/trace to keep Tier-0 fast).
     out_dir = tmp_path / "min_report"
     rc = cli_main([
         "report", "--model", "deepseek-v2-lite", "--hardware", "a5",
+        "--deployment-mode", "colocated",
         "--dp", "1", "--tp", "2", "--ep", "2", "--concurrency", "2",
         "--context", "1024", "--output-tokens", "64",
         "--tpot-ms", "50", "--no-xlsx", "--no-trace", "--out-dir", str(out_dir),
@@ -410,3 +411,120 @@ def test_v5_five_content_bugs_regression_locks() -> None:
     eq_rt = _format_dag_equation("s0.l0.router", (32, 256), t_rt, ("h",), "w")
     assert "AllToAllDispatch" in eq_mm and "AllToAllCombine" in eq_mm and "ActMxQuant" in eq_mm
     assert "TopK(softmax/sigmoid" in eq_rt and "softplus" not in eq_rt
+
+
+def test_h3_single_spine_ingress_deployment_mode_domain_routing_and_auto_va(tmp_path) -> None:
+    import json
+    from mindie_sim.cli.parser import build_parser
+    from mindie_sim.cli.report import run_report_command
+    from mindie_sim.compose import resolve_case_contracts
+
+    parser = build_parser()
+
+    # (a) Missing --deployment-mode on report without script hint raises crisp ModelingError listing all 4 modes.
+    missing_args = parser.parse_args([
+        "report", "--model", "deepseek-v2-lite", "--hardware", "a5",
+        "--dp", "1", "--tp", "2", "--ep", "2", "--concurrency", "2",
+        "--context", "1024", "--output-tokens", "64",
+        "--no-xlsx", "--no-trace", "--out-dir", str(tmp_path / "missing_dep"),
+    ])
+    with pytest.raises(ModelingError, match="colocated.*pd_disaggregated.*pd_prefill.*pd_decode"):
+        run_report_command(missing_args, load_designs=lambda _p: None)
+
+    # Script with explicit kv_role=kv_consumer supplies pd_decode via adapter.launch_codec without --deployment-mode.
+    dec_sh = tmp_path / "decode_serve.sh"
+    dec_sh.write_text(
+        'vllm serve /weights/deepseek-v2-lite --tensor-parallel-size 2 --data-parallel-size 1 '
+        '--enable-expert-parallel --kv-transfer-config \'{"kv_connector":"AscendHcclConnector","kv_role":"kv_consumer"}\'\n',
+        encoding="utf-8",
+    )
+    script_rec = tmp_path / "script_pd_decode.json"
+    rc_script = cli_main([
+        "report", "--from-script", str(dec_sh), "--hardware", "a5",
+        "--dp", "1", "--tp", "2", "--ep", "2", "--concurrency", "1",
+        "--context", "512", "--output-tokens", "32", "--mode", "simulation",
+        "--no-xlsx", "--no-trace", "--out-dir", str(tmp_path / "script_dec_out"),
+        "--json", "--receipt", str(script_rec),
+    ])
+    assert rc_script == 0
+    script_payload = json.loads(script_rec.read_text(encoding="utf-8"))
+    assert script_payload["deployment_mode"] == "pd_decode"
+    assert script_payload["ttft_slo_ms"] is None
+    assert script_payload["agent_brief"]["scenario_and_parallelism"]["ttft_slo_ms"] is None
+
+    # (b) pd_decode keeps ttft_slo_ms=None end-to-end (never 5000.0) and rejects explicit --ttft-ms.
+    pd_dec_rec = tmp_path / "pd_dec_rec.json"
+    rc_dec = cli_main([
+        "report", "--model", "deepseek-v2-lite", "--hardware", "a5",
+        "--deployment-mode", "pd_decode", "--dp", "1", "--tp", "2", "--ep", "2", "--concurrency", "1",
+        "--context", "512", "--output-tokens", "32", "--tpot-ms", "30",
+        "--mode", "simulation", "--no-xlsx", "--no-trace",
+        "--out-dir", str(tmp_path / "pd_dec_out"), "--json", "--receipt", str(pd_dec_rec),
+    ])
+    assert rc_dec == 0
+    pd_dec_payload = json.loads(pd_dec_rec.read_text(encoding="utf-8"))
+    assert pd_dec_payload["ttft_slo_ms"] is None
+    assert pd_dec_payload["agent_brief"]["scenario_and_parallelism"]["ttft_slo_ms"] is None
+    bad_pd_dec_args = parser.parse_args([
+        "report", "--model", "deepseek-v2-lite", "--hardware", "a5",
+        "--deployment-mode", "pd_decode", "--ttft-ms", "5000",
+        "--dp", "1", "--tp", "2", "--ep", "2", "--concurrency", "1",
+        "--no-xlsx", "--no-trace", "--out-dir", str(tmp_path / "bad_pd_dec"),
+    ])
+    with pytest.raises(ModelingError, match="pd_decode_ttft_unavailable"):
+        run_report_command(bad_pd_dec_args, load_designs=lambda _p: None)
+
+    # (c) Diffusion/DiT defaults to diffusion-native (zero LLM KV cache) and rejects --stack vllm-ascend.
+    dit_case = compose_case("hunyuan-video-dit", hardware="a5", dp=1, tp=1, parallel="fixed")
+    assert dit_case["runtime"]["metadata"]["stack_id"] == "diffusion-native"
+    assert dit_case["runtime"]["metadata"]["workload_domain"] == "diffusion"
+    _sc_d, qp_d, _lp_d = resolve_case_contracts(dit_case)
+    assert qp_d is not None and qp_d.kv_cache_abi == () and qp_d.index_cache_abi == () and qp_d.recurrent_state_abi == ()
+    with pytest.raises(ModelingError, match="stack_domain_mismatch"):
+        compose_case("hunyuan-video-dit", hardware="a5", dp=1, tp=1, parallel="fixed", runtime_stack="vllm-ascend")
+    bad_dit_args = parser.parse_args([
+        "report", "--model", "hunyuan-video-dit", "--hardware", "a5",
+        "--stack", "vllm-ascend", "--deployment-mode", "colocated",
+        "--dp", "1", "--tp", "1", "--concurrency", "1",
+        "--no-xlsx", "--no-trace", "--out-dir", str(tmp_path / "bad_dit"),
+    ])
+    with pytest.raises(ModelingError, match="stack_domain_mismatch"):
+        run_report_command(bad_dit_args, load_designs=lambda _p: None)
+
+    # (d) Kimi-K3.1 & Qwen3.8-Flash-Next via compose_case(..., quant="auto_va") carry real CheckpointQuantMap -> RuntimeQuantPlan.
+    kimi_raw = compose_case(
+        "kimi-k3.1", hardware="950dt-96g-pod", dp=1, tp=8, dcp=8, ep=8, role="pd_decode",
+        prompt_tokens=131072, output_tokens=1024, mtp_proposal_tokens=5, mtp_acceptance_length=3.5,
+        quant="auto_va",
+    )
+    sc_k, qp_k, lp_k = resolve_case_contracts(kimi_raw)
+    assert sc_k is not None and qp_k is not None and lp_k is not None
+    assert qp_k.provenance == "verified_checkpoint_descriptor"
+    assert sc_k.sla.ttft_ms is None
+    assert kimi_raw["runtime"]["recover_ssm"] is True
+    ports_k = dict(qp_k.port_abis)
+    assert ports_k[("target", 1, "self_attention_res_proj")].linear_method == "dense"
+    assert ports_k[("target", 1, "mlp_res_proj")].linear_method == "dense"
+    assert ports_k[("target", 1, "b_proj")].linear_method == "dense"
+    assert ports_k[("target", 1, "f_a_proj")].linear_method == "dense"
+    assert ports_k[("target", 1, "g_proj")].linear_method == "dense"
+    assert ports_k[("target", 4, "mlp.latent_moe")].linear_method == "mx_fp8"
+    assert ports_k[("target", 4, "mlp.experts.w13")].linear_method == "mx_fp4"
+    assert ports_k[("target", 4, "mlp.experts.w2")].linear_method == "mx_fp4"
+
+    qwen_raw = compose_case(
+        "qwen3.8-flash-next", hardware="950dt-96g-pod", dp=1, tp=8, ep=8,
+        prompt_tokens=32768, output_tokens=256, mtp_proposal_tokens=3, quant="auto_va",
+    )
+    sc_q, qp_q, lp_q = resolve_case_contracts(qwen_raw)
+    assert sc_q is not None and qp_q is not None and lp_q is not None
+    assert qp_q.provenance == "verified_checkpoint_descriptor"
+    ports_q = dict(qp_q.port_abis)
+    assert ports_q[("target", 0, "linear_attn.in_proj_qkv")].linear_method == "dense"
+    assert ports_q[("target", 0, "linear_attn.out_proj")].linear_method == "dense"
+    assert ports_q[("target", 1, "ple.key_proj")].linear_method == "dense"
+    assert ports_q[("target", 1, "ple.conv1d")].linear_method == "dense"
+    assert ports_q[("draft", 0, "self_attn.q_proj")].linear_method == "dense"
+    assert ports_q[("draft", 0, "mlp.experts.w13")].linear_method == "dense"
+    assert ports_q[("target", 0, "mlp.experts.w13")].linear_method == "mx_fp4"
+    assert ports_q[("target", 3, "q_proj")].linear_method == "mx_fp8"

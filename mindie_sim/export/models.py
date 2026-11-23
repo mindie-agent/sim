@@ -264,9 +264,12 @@ AGENT_BRIEF_SCHEMA = "mindie-sim.agent-brief/1"
 
 #: Deployment mode canonical display labels.
 DEPLOYMENT_MODE_LABELS: dict[str, str] = {
+    "colocated": "混部 Colocated",
+    "pd_disaggregated": "PD 分离 [Disaggregated]",
+    "pd_prefill": "PD 仅 Prefill [P-Pool]",
+    "pd_decode": "PD 仅 Decode [D-Pool]",
     "pd_unpooled": "PD 分离 [非池化]",
     "pd_pooled": "PD 分离 [池化]",
-    "colocated": "混部 Colocated",
 }
 
 #: Closed-form storage specification matching post-TP local shapes.
@@ -757,7 +760,7 @@ class ExportBundle:
     prompt_tokens: int = DEFAULT_SCENARIO_PROMPT_TOKENS
     output_tokens: int = DEFAULT_SCENARIO_OUTPUT_TOKENS
     tpot_slo_ms: float = DEFAULT_TPOT_SLO_MS
-    ttft_slo_ms: float = DEFAULT_TTFT_SLO_MS
+    ttft_slo_ms: float | None = None
     spec_method: str = ""
     spec_proposals: int = 0
     avg_accepted_tokens: float = 1.0

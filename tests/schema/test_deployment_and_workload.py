@@ -288,7 +288,9 @@ def test_stack_manifest_support_roundtrip_and_resolution(tmp_path):
     models = ("deepseek-v3.2", "qwen3.8-flash-next", "deepseek-v4.1-flash")
     path = tmp_path / "stack.json"
     path.write_text(json.dumps({
-        "schema": "mindie-sim.stack-manifest/1", "name": "custom-stack", "repository": repo,
+        "schema": "mindie-sim.stack-manifest/1", "stack_id": "custom-stack", "name": "custom-stack",
+        "manifest_revision": "main", "repository": repo,
+        "supported_domains": ["llm", "vlm"],
         "supported_models": [models[0]], "unmerged_pr_models": [models[1]],
         "bindings": [
             {"mechanism_id": "aclgraph_decode_capture", "state": "merged", "ref": repo + "@main"},
@@ -692,7 +694,7 @@ def test_moe_route_policy_enforces_fused_collective_mutex_and_shared_fusion_guar
 def test_architecture_isolation_rejects_cross_generation_presets_and_knobs():
     from _support.axes import REPRESENTATIVE_SKUS
     from mindie_sim.catalog.npu_checkpoints import normalize_hw_family
-    from mindie_sim.catalog.va_speculative_rules import build_va_serving_rules
+    from mindie_sim.stacks.vllm_ascend.speculative import build_va_serving_rules
 
     assert normalize_hw_family("Arch20") == "a2"
     assert normalize_hw_family("Arch22") == "a3"

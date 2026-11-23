@@ -469,7 +469,7 @@ class CheckpointQuantMap:
     def source_format(self) -> CheckpointFormat:
         return self.provenance.source_format
 
-    def resolve_raw_tag(
+    def resolve_exception_or_ignored(
         self,
         tensor_path: str,
         *,
@@ -477,7 +477,7 @@ class CheckpointQuantMap:
         source_native_layer_id: int | None = None,
         expert_id: int | None = None,
     ) -> str | None:
-        """Exact lossless lookup: (1) layer_exceptions -> (2) ignored_modules -> (3) rules."""
+        """Exact lossless lookup over (1) layer_exceptions -> (2) ignored_modules only."""
         if scope not in MODEL_SCOPES:
             raise ModelingError(f"checkpoint_lookup_scope_invalid:{scope!r}")
         matched_exc = [
@@ -496,6 +496,25 @@ class CheckpointQuantMap:
         for ignored in self.ignored_modules:
             if _ignored_module_matches(ignored, tensor_path):
                 return "FLOAT"
+        return None
+
+    def resolve_raw_tag(
+        self,
+        tensor_path: str,
+        *,
+        scope: ModelScope = "target",
+        source_native_layer_id: int | None = None,
+        expert_id: int | None = None,
+    ) -> str | None:
+        """Exact lossless lookup: (1) layer_exceptions -> (2) ignored_modules -> (3) rules."""
+        exc_or_ignored = self.resolve_exception_or_ignored(
+            tensor_path,
+            scope=scope,
+            source_native_layer_id=source_native_layer_id,
+            expert_id=expert_id,
+        )
+        if exc_or_ignored is not None:
+            return exc_or_ignored
         for rule in self.rules:
             if rule.matches(
                 tensor_path,

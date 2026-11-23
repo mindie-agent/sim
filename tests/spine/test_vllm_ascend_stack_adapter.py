@@ -657,3 +657,73 @@ def test_simulation_vs_modeling_tracks_full_and_piecewise_and_plan_iteration() -
         phase="decode",
     )
     assert isinstance(done, SchedulerDone)
+
+
+def test_h2a_to_h2b_curated_hf_and_unquantized_checkpoint_seam() -> None:
+    """Real cross-module H2-A -> H2-B seam: HF quant, Step-5 ignored_modules, and blind-box projection."""
+    from mindie_sim.catalog.checkpoint_reader import (
+        lookup_curated_checkpoint,
+        read_hf_quantization_config,
+    )
+
+    adapter = VllmAscendStackAdapter()
+    a5_hw = _hw(GEN5_DT_SKU)
+    par = ParallelSpec(tp=8, ep=8)
+
+    # 1. DeepSeek-V4.1-Flash-1017 (hf_quantization_config): CONSTRUCTOR_UNQUANTIZED_ROLES stay FLOAT,
+    #    W8A8_MXFP8 + group_size=32 + routed expert MXFP4 survive despite catch-all "*" rule.
+    ds_model = load_model("deepseek-v4.1-flash")
+    ds_ckpt = lookup_curated_checkpoint("deepseek-ai/DeepSeek-V4.1-Flash-1017")
+    assert ds_ckpt is not None and ds_ckpt.source_format == "hf_quantization_config"
+    ds_opts = adapter.resolve_options(
+        ds_model, a5_hw, par, role="colocated", track="shipping", requested_options={}, field_origins={},
+    )
+    ds_plan = adapter.resolve_quant_instantiation(
+        ds_model, ds_ckpt, a5_hw, par, ds_opts, role="colocated", phase="decode",
+    )
+    ds_ports = _port_map(ds_plan)
+    assert ds_ports[("target", 0, "embed_tokens")].linear_method == "dense"
+    assert ds_ports[("target", 0, "lm_head")].linear_method == "dense"
+    assert ds_ports[("target", 3, "mla.kv_b_proj")].linear_method == "dense"
+    assert ds_ports[("target", 3, "mlp.gate")].linear_method == "dense"
+    assert ds_ports[("target", 3, "mla.q_a_proj")].linear_method == "mx_fp8"
+    assert ds_ports[("target", 3, "mla.q_a_proj")].act_group_size == 32
+    assert ds_ports[("target", 3, "mla.q_a_proj")].weight_block == (32, 32)
+    assert ds_ports[("target", 3, "mlp.experts.w13")].linear_method == "mx_fp4"
+    assert ds_ports[("target", 3, "mlp.experts.w2")].linear_method == "mx_fp4"
+
+    # 2. Step-5-Preview (hf_quantization_config + modules_to_not_convert): L88..90 moe.experts stay FLOAT.
+    step5_model = load_model("step-5-preview")
+    step5_ckpt = lookup_curated_checkpoint("stepfun-ai/Step-5-Preview")
+    assert step5_ckpt is not None and step5_ckpt.source_format == "hf_quantization_config"
+    step5_opts = adapter.resolve_options(
+        step5_model, a5_hw, par, role="colocated", track="shipping", requested_options={}, field_origins={},
+    )
+    step5_plan = adapter.resolve_quant_instantiation(
+        step5_model, step5_ckpt, a5_hw, par, step5_opts, role="colocated", phase="decode",
+    )
+    step5_ports = _port_map(step5_plan)
+    assert step5_ports[("target", 4, "mlp.experts.w13")].linear_method == "fp8"
+    assert step5_ports[("target", 4, "mlp.gate")].linear_method == "dense"
+    for tail_layer in (88, 89, 90):
+        assert step5_ports[("target", tail_layer, "mlp.experts.w13")].linear_method == "dense"
+        assert step5_ports[("target", tail_layer, "mlp.experts.w2")].linear_method == "dense"
+
+    # 3. Unquantized native read via read_hf_quantization_config activates target_quant_projection
+    #    with provenance="stack_default_quant_projection" while keeping CONSTRUCTOR_UNQUANTIZED_ROLES FLOAT.
+    qwen_model = load_model("qwen3-32b")
+    unq_ckpt = read_hf_quantization_config({"model_type": "qwen3"}, checkpoint_id="blindbox/qwen3-bf16")
+    assert unq_ckpt.source_format == "unquantized_native"
+    qwen_opts = adapter.resolve_options(
+        qwen_model, a5_hw, ParallelSpec(tp=4), role="colocated", track="shipping",
+        requested_options={"target_quant_projection": "mxfp8"}, field_origins={},
+    )
+    qwen_plan = adapter.resolve_quant_instantiation(
+        qwen_model, unq_ckpt, a5_hw, ParallelSpec(tp=4), qwen_opts, role="colocated", phase="decode",
+    )
+    qwen_ports = _port_map(qwen_plan)
+    assert qwen_plan.provenance == "stack_default_quant_projection"
+    assert qwen_ports[("target", 0, "embed_tokens")].linear_method == "dense"
+    assert qwen_ports[("target", 0, "lm_head")].linear_method == "dense"
+    assert qwen_ports[("target", 0, "q_proj")].linear_method == "mx_fp8"
+    assert qwen_ports[("target", 0, "mlp.gate_proj")].linear_method == "mx_fp8"

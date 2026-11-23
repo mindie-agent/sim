@@ -174,13 +174,18 @@ _DEFAULT_DRAFT_KV_CAP = 0
 
 _PROJECTION_PRESET_TAGS: dict[str, tuple[str, str]] = {
     "mxfp8": ("W8A8_MXFP8", "W8A8_MXFP8"),
+    "w8a8_mxfp8": ("W8A8_MXFP8", "W8A8_MXFP8"),
+    "w8a8_mxfp": ("W8A8_MXFP8", "W8A8_MXFP8"),
     "mxfp8_mxfp4": ("W8A8_MXFP8", "W4A8_MXFP"),
     "mxfp4_routed_only": ("W8A8_MXFP8", "W4A8_MXFP"),
+    "mxfp4_all": ("W4A8_MXFP", "W4A8_MXFP"),
     "mxfp4": ("W8A8_MXFP8", "W4A8_MXFP"),
     "w4a8_mxfp": ("W8A8_MXFP8", "W4A8_MXFP"),
     "w4a4_mxfp4": ("W8A8_MXFP8", "W4A4_MXFP4"),
     "fp8": ("FP8_DYNAMIC", "FP8_DYNAMIC"),
+    "fp8_dynamic": ("FP8_DYNAMIC", "FP8_DYNAMIC"),
     "w8a8": ("W8A8_DYNAMIC", "W8A8_DYNAMIC"),
+    "int8": ("W8A8_DYNAMIC", "W8A8_DYNAMIC"),
     "w8a8_dynamic": ("W8A8_DYNAMIC", "W8A8_DYNAMIC"),
     "w8a8_static": ("W8A8", "W8A8"),
     "w8a8_mix": ("W8A8_MIX", "W8A8_DYNAMIC"),
@@ -189,6 +194,7 @@ _PROJECTION_PRESET_TAGS: dict[str, tuple[str, str]] = {
     "w4a16": ("W4A16", "W4A16"),
     "bf16": ("FLOAT", "FLOAT"),
     "fp16": ("FLOAT", "FLOAT"),
+    "fp32": ("FLOAT", "FLOAT"),
     "none": ("FLOAT", "FLOAT"),
 }
 
@@ -490,6 +496,51 @@ def _project_blind_box_tag(
     return pair[1] if is_routed_expert else pair[0]
 
 
+def _lookup_exception_or_ignored(
+    checkpoint: CheckpointQuantMap,
+    *,
+    model_type: str,
+    candidate_paths: Sequence[str],
+    scope: ModelScope,
+    layer_ids: Sequence[int],
+    expert_id: int | None = None,
+) -> str | None:
+    for path in candidate_paths:
+        mapped = map_quant_prefix(model_type, path)
+        for lid in layer_ids:
+            for cand in mapped:
+                tag = checkpoint.resolve_exception_or_ignored(
+                    cand, scope=scope, source_native_layer_id=lid, expert_id=expert_id,
+                )
+                if tag is not None:
+                    return tag
+    return None
+
+
+def _lookup_non_wildcard_rule(
+    checkpoint: CheckpointQuantMap,
+    *,
+    model_type: str,
+    candidate_paths: Sequence[str],
+    scope: ModelScope,
+    layer_ids: Sequence[int],
+    expert_id: int | None = None,
+) -> tuple[str, tuple[int, ...]] | None:
+    specific_rules = tuple(r for r in checkpoint.rules if r.pattern != "*")
+    if not specific_rules:
+        return None
+    for path in candidate_paths:
+        mapped = map_quant_prefix(model_type, path)
+        for lid in layer_ids:
+            for cand in mapped:
+                for rule in specific_rules:
+                    if rule.matches(
+                        cand, scope=scope, source_native_layer_id=lid, expert_id=expert_id,
+                    ):
+                        return rule.raw_tag, rule.group_size
+    return None
+
+
 def _resolve_role_tag(
     checkpoint: CheckpointQuantMap,
     *,
@@ -503,23 +554,49 @@ def _resolve_role_tag(
     hf_cfg: Mapping[str, Any],
 ) -> tuple[str, tuple[int, ...], bool]:
     """Return ``(raw_tag, group_size, used_projection)`` for one role."""
-    explicit = _lookup_modelslim_tag(
+    expert_id = 0 if is_routed_expert else None
+    if checkpoint.source_format == "modelslim_description":
+        explicit = _lookup_modelslim_tag(
+            checkpoint,
+            model_type=model_type,
+            candidate_paths=candidate_paths,
+            scope=scope,
+            layer_ids=layer_ids,
+            expert_id=expert_id,
+        )
+        if explicit is not None:
+            return explicit, (), False
+        return "FLOAT", (), False
+
+    exc_or_ignored = _lookup_exception_or_ignored(
         checkpoint,
         model_type=model_type,
         candidate_paths=candidate_paths,
         scope=scope,
         layer_ids=layer_ids,
-        expert_id=0 if is_routed_expert else None,
+        expert_id=expert_id,
     )
-    if explicit is not None:
-        return explicit, (), False
+    if exc_or_ignored is not None:
+        return exc_or_ignored, (), False
 
     if role_name in CONSTRUCTOR_UNQUANTIZED_ROLES:
         return "FLOAT", (), False
 
-    if checkpoint.source_format == "hf_quantization_config" and hf_cfg:
-        tag, blk = _hf_quant_tag_for_role(hf_cfg, is_routed_expert=is_routed_expert)
-        return tag, blk, False
+    if checkpoint.source_format == "hf_quantization_config":
+        if hf_cfg:
+            tag, blk = _hf_quant_tag_for_role(hf_cfg, is_routed_expert=is_routed_expert)
+            return tag, blk, False
+        specific = _lookup_non_wildcard_rule(
+            checkpoint,
+            model_type=model_type,
+            candidate_paths=candidate_paths,
+            scope=scope,
+            layer_ids=layer_ids,
+            expert_id=expert_id,
+        )
+        if specific is not None:
+            return specific[0], specific[1], False
+        return "FLOAT", (), False
 
     if checkpoint.source_format == "unquantized_native":
         if target_quant_projection:
@@ -588,7 +665,12 @@ def _layer_role_descriptors(
             for r in ("index_q_proj", "index_k_proj"):
                 roles.append((
                     r,
-                    (f"{prefix}.{r}.weight", f"{prefix}.indexer.{r}.weight", f"{prefix}.index_qk_proj.weight"),
+                    (
+                        f"{prefix}.{r}.weight",
+                        f"{prefix}.indexer.{r}.weight",
+                        f"{prefix}.indexer.index_qk_proj.weight",
+                        f"{prefix}.index_qk_proj.weight",
+                    ),
                     False,
                 ))
             packs.append(("index_qk_proj", ("index_q_proj", "index_k_proj")))
@@ -601,19 +683,51 @@ def _layer_role_descriptors(
         roles.append(("hyper_connection.post_proj", (f"model.layers.{idx}.hyper_connection.post_proj.weight",), False))
     if plan.engram and model_type in _QWEN4_EXP_TYPES:
         roles.append(("ple.embed_proj", (f"model.layers.{idx}.ple.embed_proj.weight",), False))
+        roles.append(("ple.key_proj", (f"model.layers.{idx}.ple.key_proj.weight",), False))
+        roles.append(("ple.value_proj", (f"model.layers.{idx}.ple.value_proj.weight",), False))
         roles.append(("ple.conv1d", (f"model.layers.{idx}.ple.conv1d.weight",), False))
 
     mlp_p = f"model.layers.{idx}.mlp"
+    bsm_p = f"model.layers.{idx}.block_sparse_moe"
+    moe_p = f"model.layers.{idx}.moe"
     if str(plan.ffn).lower() == "moe":
         if plan.expert_latent_size > 0:
-            roles.append(("mlp.latent_moe", (f"{mlp_p}.latent_proj.weight", f"{mlp_p}.latent_moe.weight"), False))
-        roles.append(("mlp.gate", (f"{mlp_p}.gate.weight",), False))
-        roles.append(("mlp.experts.w13", (f"{mlp_p}.experts.0.gate_proj.weight", f"{mlp_p}.experts.w13.weight"), True))
-        roles.append(("mlp.experts.w2", (f"{mlp_p}.experts.0.down_proj.weight", f"{mlp_p}.experts.w2.weight"), True))
+            roles.append((
+                "mlp.latent_moe",
+                (
+                    f"{mlp_p}.latent_proj.weight",
+                    f"{mlp_p}.latent_moe.weight",
+                    f"{bsm_p}.routed_expert_down_proj.weight",
+                    f"{bsm_p}.routed_expert_up_proj.weight",
+                ),
+                False,
+            ))
+        roles.append(("mlp.gate", (f"{mlp_p}.gate.weight", f"{bsm_p}.gate.weight", f"{moe_p}.gate.weight"), False))
+        roles.append((
+            "mlp.experts.w13",
+            (
+                f"{mlp_p}.experts.0.gate_proj.weight",
+                f"{mlp_p}.experts.w13.weight",
+                f"{bsm_p}.experts.0.w1.weight",
+                f"{moe_p}.experts.w13_weight",
+            ),
+            True,
+        ))
+        roles.append((
+            "mlp.experts.w2",
+            (
+                f"{mlp_p}.experts.0.down_proj.weight",
+                f"{mlp_p}.experts.w2.weight",
+                f"{bsm_p}.experts.0.w2.weight",
+                f"{moe_p}.experts.w2_weight",
+            ),
+            True,
+        ))
         if plan.num_shared_experts > 0 or model.num_shared_experts > 0:
-            roles.append(("mlp.shared_expert.gate_proj", (f"{mlp_p}.shared_experts.gate_proj.weight", f"{mlp_p}.shared_expert.gate_proj.weight"), False))
-            roles.append(("mlp.shared_expert.up_proj", (f"{mlp_p}.shared_experts.up_proj.weight", f"{mlp_p}.shared_expert.up_proj.weight"), False))
-            roles.append(("mlp.shared_expert.down_proj", (f"{mlp_p}.shared_experts.down_proj.weight", f"{mlp_p}.shared_expert.down_proj.weight"), False))
+            se_p = f"model.layers.{idx}.share_expert"
+            roles.append(("mlp.shared_expert.gate_proj", (f"{mlp_p}.shared_experts.gate_proj.weight", f"{mlp_p}.shared_expert.gate_proj.weight", f"{bsm_p}.shared_experts.gate_proj.weight", f"{se_p}.gate_proj.weight"), False))
+            roles.append(("mlp.shared_expert.up_proj", (f"{mlp_p}.shared_experts.up_proj.weight", f"{mlp_p}.shared_expert.up_proj.weight", f"{bsm_p}.shared_experts.up_proj.weight", f"{se_p}.up_proj.weight"), False))
+            roles.append(("mlp.shared_expert.down_proj", (f"{mlp_p}.shared_experts.down_proj.weight", f"{mlp_p}.shared_expert.down_proj.weight", f"{bsm_p}.shared_experts.down_proj.weight", f"{se_p}.down_proj.weight"), False))
             packs.append(("shared_expert.gate_up_proj", ("mlp.shared_expert.gate_proj", "mlp.shared_expert.up_proj")))
     else:
         roles.append(("mlp.gate_proj", (f"{mlp_p}.gate_proj.weight",), False))
@@ -1590,12 +1704,12 @@ def instantiate_runtime_quant_plan(
     used_projection = False
 
     # Model-level embedding & LM head (quant_config=None unless explicitly quantized in checkpoint).
-    for top_role, top_path in (
-        ("embed_tokens", "model.embed_tokens.weight"),
-        ("lm_head", "lm_head.weight"),
+    for top_role, top_paths in (
+        ("embed_tokens", ("model.embed_tokens.weight",)),
+        ("lm_head", ("lm_head.weight", "language_model.lm_head.weight")),
     ):
         tag, blk, did_proj = _resolve_role_tag(
-            checkpoint, model_type=model_type, role_name=top_role, candidate_paths=(top_path,),
+            checkpoint, model_type=model_type, role_name=top_role, candidate_paths=top_paths,
             scope="target", layer_ids=(0,), is_routed_expert=False,
             target_quant_projection=target_proj, hf_cfg=hf_cfg,
         )

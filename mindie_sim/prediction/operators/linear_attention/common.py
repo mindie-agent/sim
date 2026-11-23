@@ -854,6 +854,8 @@ def _resolve_recover_ssm_accepted_per_request(
                     raise ModelingError(f"recover_ssm_acceptance_out_of_range:{item}:{q}")
                 parsed.append(int(item))
             return tuple(parsed)
+        if isinstance(raw_a, float) and not isinstance(raw_a, bool) and math.isfinite(raw_a):
+            return max(0, min(q, math.ceil(raw_a)))
         return raw_a
     committed = m.get("committed_tokens")
     if isinstance(committed, (tuple, list)) and committed:

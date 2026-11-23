@@ -250,7 +250,7 @@ def test_qsa_native_weights_and_weight_free_overlay_have_distinct_sources(hardwa
     weighted, unweighted = (scorer.build(op, geometry) for op in (native, overlay))
     for op, plan, repository, path in (
         (native, weighted, "vllm-project/vllm-ascend", "vllm_ascend/models/qwen4_exp/lightning_indexer.py"),
-        (overlay, unweighted, "mindie-agent/sim", "mindie_sim/stack_sources/vllm_ascend_cann93.json"),
+        (overlay, unweighted, "mindie-agent/sim", "mindie_sim/stacks/vllm_ascend/manifest.json"),
     ):
         source, = plan.pipeline_spec.sources
         assert (source.repository, source.relative_path) == (repository, path)

@@ -319,7 +319,7 @@ def _selected(name, **attributes):
 
 
 def test_per_item_grant_bindings_preserve_generation_and_release_identity():
-    memory = budget_memory(4 * PAGE)
+    memory = budget_memory(4 * PAGE, tp=2)
     issue = object()
     grants = [
         _grant("src", "K:page1", 3, storage="K", owner="producer:src", tier="hbm",

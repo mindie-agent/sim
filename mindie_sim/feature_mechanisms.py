@@ -975,6 +975,15 @@ for _item in (
         apply=_apply_recover_ssm,
     ),
     OptimizationMechanism(
+        id="kda_recoverssm_shipping", category="speculative_state", phases=("decode",),
+        summary="Shipping KDA RecoverSSM speculative state verification merged with DSpark (#21549)",
+        eligible=lambda ctx: (
+            any(p.attention == "kda" for p in ctx.model.layer_plans)
+            and int(ctx.parallel.get("pcp", 1)) == 1
+        ),
+        apply=_apply_recover_ssm,
+    ),
+    OptimizationMechanism(
         id="qkv_norm_rope_fusion", category="attention_fusion", phases=("prefill", "decode"),
         summary="Fused QKV split + QK RMSNorm + MRoPE single-launch preparation kernel",
         eligible=lambda ctx: any(p.qk_norm for p in ctx.model.layer_plans),
@@ -1226,7 +1235,7 @@ def compare_feature_tracks(
     model: str | Mapping[str, Any],
     hardware: str | Mapping[str, Any] = "a3",
     *,
-    runtime_stack: str | Mapping[str, Any] = "vllm-ascend",
+    runtime_stack: str | Mapping[str, Any] | None = None,
     phase: str = "decode",
     tokens: int = 1,
     context: int = DEFAULT_WATERFALL_CONTEXT,
@@ -1256,20 +1265,29 @@ def compare_feature_tracks(
         )
 
     eager_kwargs = dict(cleaned_kwargs)
-    va_prof = (cases["merged"]["runtime"]["metadata"] or {}).get("va_profile") or {}
+    merged_meta = cases["merged"]["runtime"]["metadata"] or {}
+    merged_quant = cases["merged"]["model"].get("quant")
+    va_prof = merged_meta.get("va_profile") or {}
     va_flags = dict(va_prof.get("tutorial_flags") or {})
     explicit_quant = eager_kwargs.get("quant")
     unquantized_override = (
         isinstance(explicit_quant, str)
         and explicit_quant.strip().lower() in _UNQUANTIZED_PRESET_NAMES
     )
-    if "quant" not in eager_kwargs and va_prof.get("quant") is not None:
-        eager_kwargs["quant"] = va_prof["quant"]
+    if "quant" not in eager_kwargs:
+        if isinstance(merged_quant, Mapping) and merged_quant:
+            eager_kwargs["quant"] = dict(merged_quant)
+        elif va_prof.get("quant") is not None:
+            eager_kwargs["quant"] = va_prof["quant"]
     if not unquantized_override:
-        if "kv_cache_dtype" not in eager_kwargs and va_flags.get("kv_cache_dtype"):
-            eager_kwargs["kv_cache_dtype"] = str(va_flags["kv_cache_dtype"])
-        if "indexer_kv_dtype" not in eager_kwargs and va_flags.get("indexer_kv_dtype"):
-            eager_kwargs["indexer_kv_dtype"] = str(va_flags["indexer_kv_dtype"])
+        if "kv_cache_dtype" not in eager_kwargs:
+            resolved_kv = (merged_quant.get("kv_dtype") if isinstance(merged_quant, Mapping) else None) or va_flags.get("kv_cache_dtype")
+            if resolved_kv:
+                eager_kwargs["kv_cache_dtype"] = str(resolved_kv)
+        if "indexer_kv_dtype" not in eager_kwargs:
+            resolved_idx = (merged_quant.get("index_dtype") if isinstance(merged_quant, Mapping) else None) or va_flags.get("indexer_kv_dtype")
+            if resolved_idx:
+                eager_kwargs["indexer_kv_dtype"] = str(resolved_idx)
     cases["raw_eager"] = compose_case(
         model, hardware=hardware, runtime_stack=runtime_stack,
         feature_track="raw_eager", _stack_phase=phase, **eager_kwargs,

@@ -32,7 +32,6 @@ from mindie_sim.export import (
     DEFAULT_SCENARIO_OUTPUT_TOKENS,
     DEFAULT_SCENARIO_PROMPT_TOKENS,
     DEFAULT_TPOT_SLO_MS,
-    DEFAULT_TTFT_SLO_MS,
     build_export_bundle,
     compose_export_case,
     export_comparison_xlsx,
@@ -130,9 +129,10 @@ def _add_oneshot_export_command(subparsers) -> None:
     cmd.add_argument("--output-tokens", type=parse_token_shorthand, default=DEFAULT_SCENARIO_OUTPUT_TOKENS)
     cmd.add_argument("--concurrency", type=int, default=1)
     cmd.add_argument("--tpot-ms", type=float, default=DEFAULT_TPOT_SLO_MS)
-    cmd.add_argument("--ttft-ms", type=float, default=DEFAULT_TTFT_SLO_MS)
+    cmd.add_argument("--ttft-ms", type=float, default=None)
     cmd.add_argument("--spec-tokens", "--mtp", dest="spec_tokens", type=int, default=0)
     cmd.add_argument("--accept-len", type=float, default=1.0)
+    cmd.add_argument("--stack", default=None, help="runtime stack (vllm-ascend, ideal-target, raw-eager, diffusion-native, or /path/to/manifest.json)")
     cmd.add_argument("--compare-track", default="merged", help="baseline ('Before') feature track (default: merged)")
     cmd.add_argument("--target-track", default=None, help="optional candidate ('After') feature track (e.g. expected_ideal)")
     cmd.add_argument("--xlsx", dest="xlsx_output", default=None, help="destination path for comparison .xlsx workbook")
@@ -144,9 +144,9 @@ def _add_oneshot_export_command(subparsers) -> None:
     cmd.add_argument("--no-engram-offload", dest="engram_offload", action="store_false")
     cmd.add_argument(
         "--deployment-mode",
-        choices=("auto", "pd_unpooled", "pd_pooled", "colocated"),
-        default="auto",
-        help="deployment mode label for Summary Block 1 (default: auto)",
+        choices=("colocated", "pd_disaggregated", "pd_prefill", "pd_decode"),
+        default=None,
+        help="explicit deployment mode label for Summary Block 1",
     )
     cmd.add_argument(
         "--kernel-designs-json", default=None,
@@ -193,6 +193,11 @@ def add_export_commands(subparsers) -> None:
 def _run_oneshot_export(args: argparse.Namespace) -> dict[str, Any]:
     if not args.xlsx_output and not args.trace_output:
         raise ValueError("export_command_requires_at_least_one_of_xlsx_or_trace")
+    dep_mode = getattr(args, "deployment_mode", None)
+    if dep_mode == "pd_decode" and getattr(args, "ttft_ms", None) is not None:
+        raise ModelingError(
+            "pd_decode_ttft_unavailable: --ttft-ms is unavailable in pd_decode mode (must be omitted/None)"
+        )
     policy = resolve_auto_va_policy(
         args.model,
         args.hardware,
@@ -200,8 +205,10 @@ def _run_oneshot_export(args: argparse.Namespace) -> dict[str, Any]:
         weight_quant=getattr(args, "weight_quant", "auto_va"),
         cache_dtype=getattr(args, "cache_dtype", None),
     )
-    eff_quant = policy["weight_quant"]
+    eff_quant = policy["compose_quant"]
     eff_cache = policy["kv_cache_dtype"]
+    eff_idx = policy["indexer_kv_dtype"]
+    eff_ttft = None if (dep_mode == "pd_decode" or args.ttft_ms is None) else float(args.ttft_ms)
     replay = ReplayOptions(include_submission=bool(getattr(args, "include_submission", False)))
     common_kw = dict(
         topology_preset=args.topology_preset,
@@ -209,12 +216,14 @@ def _run_oneshot_export(args: argparse.Namespace) -> dict[str, Any]:
         ep=int(args.ep), pp=int(args.pp), pcp=int(args.pcp),
         prompt_tokens=int(args.prompt_tokens), output_tokens=int(args.output_tokens),
         concurrency=int(args.concurrency),
-        tpot_slo_ms=float(args.tpot_ms), ttft_slo_ms=float(args.ttft_ms),
+        tpot_slo_ms=float(args.tpot_ms), ttft_slo_ms=eff_ttft,
         mtp_proposal_tokens=int(args.spec_tokens),
         mtp_acceptance_length=float(args.accept_len),
         quant=eff_quant,
         kv_cache_dtype=eff_cache,
-        deployment_mode=getattr(args, "deployment_mode", None),
+        indexer_kv_dtype=eff_idx,
+        deployment_mode=dep_mode,
+        runtime_stack=getattr(args, "stack", None),
     )
     raw_before, auto_req = compose_export_case(
         args.model, args.hardware, feature_track=str(args.compare_track or "merged"), **common_kw,

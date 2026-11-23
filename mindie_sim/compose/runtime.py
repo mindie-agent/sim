@@ -21,6 +21,7 @@
 """
 from __future__ import annotations
 
+from collections import OrderedDict
 from collections.abc import Mapping
 from copy import deepcopy
 from typing import Any
@@ -30,9 +31,11 @@ from mindie_sim.model_catalog import ARCHITECTURE_PRESET_ALIASES, MODEL_ALIASES
 from mindie_sim.prediction.feedforward import resolve_moe_route_policy
 from mindie_sim.prediction.offload.policy import resolve_sku_host_dma_rates
 from mindie_sim.prediction.structure import parse_case
-from mindie_sim.runtime_profiles import simulation_config
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.model import ModelSpec
+from mindie_sim.schema.scenario import ScenarioContract
+from mindie_sim.schema.stack import RuntimeQuantPlan, StackLoweringPlan
+from mindie_sim.stacks.vllm_ascend.profiles import simulation_config
 
 MX_GROUP_SIZE = 32
 MX_SCALE_PACK = 2
@@ -48,6 +51,99 @@ FULL_DECODE_CUDAGRAPH_MODE = "FULL_DECODE_ONLY"
 FULL_CUDAGRAPH_MODES = frozenset({"FULL", FULL_DECODE_CUDAGRAPH_MODE})
 _INT_WEIGHT_FORMATS = frozenset({"int8", "int4"})
 _WEIGHT_NZ_ARCHES = frozenset({"a2", "a3"})
+MAX_CACHED_SINGLE_SPINE_CONTRACTS = 64
+
+_QUANT_PLAN_CACHE: OrderedDict[str, RuntimeQuantPlan] = OrderedDict()
+_LOWERING_PLAN_CACHE: OrderedDict[str, StackLoweringPlan] = OrderedDict()
+_SCENARIO_CONTRACT_CACHE: OrderedDict[str, ScenarioContract] = OrderedDict()
+
+
+def _lru_put(cache: OrderedDict[str, Any], key: str, value: Any) -> None:
+    if not key:
+        return
+    cache[key] = value
+    cache.move_to_end(key)
+    while len(cache) > MAX_CACHED_SINGLE_SPINE_CONTRACTS:
+        cache.popitem(last=False)
+
+
+def register_composed_contracts(
+    *,
+    quant_plan: RuntimeQuantPlan,
+    lowering_plan: StackLoweringPlan,
+    scenario_contract: ScenarioContract | None = None,
+) -> None:
+    """Register resolved frozen single-spine plans in bounded O(Active State) LRU."""
+    _lru_put(_QUANT_PLAN_CACHE, quant_plan.plan_digest, quant_plan)
+    _lru_put(_LOWERING_PLAN_CACHE, lowering_plan.plan_digest, lowering_plan)
+    if scenario_contract is not None:
+        _lru_put(_SCENARIO_CONTRACT_CACHE, scenario_contract.digest(), scenario_contract)
+
+
+def resolve_case_contracts(
+    case_or_dict: Any,
+) -> tuple[ScenarioContract | None, RuntimeQuantPlan | None, StackLoweringPlan | None]:
+    """Retrieve frozen ``(ScenarioContract, RuntimeQuantPlan, StackLoweringPlan)`` for a Case."""
+    meta: Mapping[str, Any] = {}
+    if isinstance(case_or_dict, Mapping):
+        rt = case_or_dict.get("runtime")
+        if isinstance(rt, Mapping) and isinstance(rt.get("metadata"), Mapping):
+            meta = rt["metadata"]
+    else:
+        rt_obj = getattr(case_or_dict, "runtime", None)
+        raw_meta = getattr(rt_obj, "metadata", None)
+        if raw_meta is not None:
+            meta = dict(raw_meta)
+    spine_meta = meta.get("single_spine")
+    if not isinstance(spine_meta, Mapping):
+        return None, None, None
+    sc_digest = str(spine_meta.get("scenario_contract_digest") or "")
+    qp_digest = str(spine_meta.get("quant_plan_digest") or "")
+    lp_digest = str(spine_meta.get("lowering_plan_digest") or "")
+    return (
+        _SCENARIO_CONTRACT_CACHE.get(sc_digest),
+        _QUANT_PLAN_CACHE.get(qp_digest),
+        _LOWERING_PLAN_CACHE.get(lp_digest),
+    )
+
+
+def summarize_single_spine_metadata(
+    *,
+    stack_id: str,
+    stack_track: str,
+    workload_domain: str,
+    work_unit_kind: str,
+    deployment_mode: str,
+    deployment_mode_origin: str,
+    checkpoint_map: Any,
+    quant_plan: RuntimeQuantPlan,
+    lowering_plan: StackLoweringPlan,
+    scenario_contract: ScenarioContract | None = None,
+) -> dict[str, Any]:
+    """Build a compact JSON-serializable summary of the single-spine contracts."""
+    return {
+        "stack_id": stack_id,
+        "stack_track": stack_track,
+        "workload_domain": workload_domain,
+        "work_unit_kind": work_unit_kind,
+        "deployment_mode": deployment_mode,
+        "deployment_mode_origin": deployment_mode_origin,
+        "checkpoint_id": checkpoint_map.checkpoint_id,
+        "checkpoint_digest": checkpoint_map.digest(),
+        "checkpoint_format": checkpoint_map.source_format,
+        "checkpoint_origin": checkpoint_map.provenance.origin,
+        "quant_plan_digest": quant_plan.plan_digest,
+        "quant_provenance": quant_plan.provenance,
+        "kv_cache_abi_count": len(quant_plan.kv_cache_abi),
+        "index_cache_abi_count": len(quant_plan.index_cache_abi),
+        "recurrent_state_abi_count": len(quant_plan.recurrent_state_abi),
+        "prepared_weights": [item.allocation_id for item in quant_plan.prepared_weights],
+        "packed_groups_count": len(quant_plan.packed_groups),
+        "lowering_plan_digest": lowering_plan.plan_digest,
+        "allowed_rewrite_tracks": list(lowering_plan.allowed_rewrite_tracks),
+        "recipe_bindings_count": len(lowering_plan.recipe_bindings),
+        "scenario_contract_digest": scenario_contract.digest() if scenario_contract is not None else "",
+    }
 
 
 def uses_integer_weights(model_spec: ModelSpec) -> bool:

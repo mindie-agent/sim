@@ -483,6 +483,7 @@ def _tag_projection_roles(terms: list[WeightTerm], plan: LayerPlan,
 
 def layer_weight_terms(plan: LayerPlan, model: ModelSpec) -> list[WeightTerm]:
     """Build all tagged weight terms for one model layer with layer-resolved quant."""
+    has_layer_override = _lookup_layer_quant_override(model, plan) is not None
     quant = _layer_resolved_quant(model, plan)
     attention = [replace(term, quant=quant) for term in _attention_terms(plan, model)]
     prepared = dict(model.metadata).get("prepared_mx32_matrix", {}).get("layers", {}).get(str(plan.index), ())
@@ -494,18 +495,21 @@ def layer_weight_terms(plan: LayerPlan, model: ModelSpec) -> list[WeightTerm]:
             if term.name in prepared else term
             for term in attention
         ]
+    indexer = [replace(term, quant=term.quant or quant) for term in _indexer_terms(plan, model)]
+    extra_terms = (
+        _norm_terms(plan, model)
+        + gemma4_ple_layer_terms(plan, model)
+        + _mhc_terms(plan, model)
+        + _compressor_terms(plan, model)
+        + _ffn_terms(plan, model)
+    )
     other = [
         replace(term, quant=term.quant or quant)
-        for term in (
-            _norm_terms(plan, model)
-            + gemma4_ple_layer_terms(plan, model)
-            + _mhc_terms(plan, model)
-            + _indexer_terms(plan, model)
-            + _compressor_terms(plan, model)
-            + _ffn_terms(plan, model)
-        )
+        if (has_layer_override or term.category in {"attn_res_proj", "ple_proj"})
+        else term
+        for term in extra_terms
     ]
-    return _tag_projection_roles(attention + other, plan)
+    return _tag_projection_roles(attention + indexer + other, plan)
 
 
 __all__ = [
