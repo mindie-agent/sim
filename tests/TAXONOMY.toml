@@ -366,6 +366,15 @@ owns = ["mindie_sim/structure_implementations.py", "mindie_sim/structure_subgrap
 path = "spine/test_npu_checkpoints_and_va_speculative.py"
 tier = "tier0"
 owns = ["mindie_sim/catalog/npu_checkpoints.py", "mindie_sim/catalog/va_speculative_rules.py"]
+[[module]]
+path = "spine/test_single_spine_yardsticks.py"
+tier = "tier1"
+owns = [
+  "mindie_sim/onboarding/whitebox_runner.py",
+  "mindie_sim/prediction/execution/layer_runs.py",
+  "mindie_sim/sweep/pd.py",
+  "tests/_support/rss_probe.py",
+]
 # ---------------------------------------------------------------- serving
 [[module]]
 path = "serving/test_service_core.py"

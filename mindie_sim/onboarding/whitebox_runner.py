@@ -647,6 +647,8 @@ class WhiteboxSpineRunner:
         if elapsed_ns <= 0:
             raise ModelingError(f"whitebox_prediction_nonpositive:{case.case_id}")
         target_ns = busy_ns if clock_op == "busy_union" else elapsed_ns
+        if target_ns <= 0:
+            raise ModelingError(f"whitebox_selected_clock_nonpositive:{case.case_id}:{clock_op}")
         lp, ld = _build_executed_witness_program_dag(graphs, obs, target_ns=target_ns)
         diag = (
             ("clock_operator", clock_op), ("busy_union_ns", busy_ns), ("elapsed_span_ns", elapsed_ns),
@@ -822,14 +824,23 @@ def score_sealed_gate_cases(
     residuals, failing, over_budget, held_apes, train_apes = [], [], [], [], []
     for rec in eval_rows:
         src, d, gc = raw_by_id.get(rec.case_id, {}), diag_by_id.get(rec.case_id, {}), case_by_id[rec.case_id]
-        pred_ns = int(d.get("busy_union_ns" if clock_operator == "busy_union" else "elapsed_span_ns") or rec.predicted_ns)
+        eff_clock = str(d.get("clock_operator") or clock_operator)
+        if eff_clock not in VALID_CLOCK_OPERATORS:
+            raise ModelingError(f"clock_operator_invalid:{rec.case_id}:{eff_clock}")
+        if src.get("clock_operator") and eff_clock != str(src["clock_operator"]):
+            raise ModelingError(f"whitebox_clock_operator_mismatch:{rec.case_id}:expected={src['clock_operator']}:got={eff_clock}")
+        clock_key = "busy_union_ns" if eff_clock == "busy_union" else "elapsed_span_ns"
+        raw_pred_ns = d.get(clock_key)
+        if type(raw_pred_ns) is not int or raw_pred_ns <= 0:
+            raise ModelingError(f"whitebox_selected_clock_missing:{rec.case_id}:{clock_key}")
+        pred_ns = raw_pred_ns
         meas_ns = int(rec.measured_ns)
         ape = round(abs(pred_ns - meas_ns) / float(meas_ns) * PERCENT_SCALE, DISPLAY_ROUND_DIGITS) if meas_ns > 0 else PERCENT_SCALE
         over = exceeds_physical_tolerance(pred_ns, meas_ns, threshold_pct=cap_pct, atol_ns=eff_atol)
         residuals.append({
             "case_id": rec.case_id, "level": rec.level, "split": gc.split, "sku": sku,
             "measured_ns": meas_ns, "measured_p99_ns": int(src["measured_p99_ns"]) if src.get("measured_p99_ns") else None,
-            "predicted_ns": pred_ns, "ape_pct": ape, "over_budget": over, "clock_operator": str(d.get("clock_operator") or clock_operator),
+            "predicted_ns": pred_ns, "ape_pct": ape, "over_budget": over, "clock_operator": eff_clock,
             "engine_receipt": str(rec.engine_receipt or ""),
             "program_dag_sha256": str(d.get("program_dag_sha256") or ""),
             "executed_op_families": list(d.get("executed_op_families") or ()), "executed_op_ids": list(d.get("executed_op_ids") or ()),
