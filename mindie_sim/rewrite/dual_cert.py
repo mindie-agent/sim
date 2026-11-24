@@ -869,9 +869,32 @@ class _Demands:
                     egress_bpms = min(egress_bpms, Fraction(link.switch_capacity_bytes_per_ms))
                 total += MS_PER_SECOND * egress_bpms
             return total
+        if pipe.startswith("link_switch:"):
+            link = self.links.get(pipe.removeprefix("link_switch:"))
+            return (
+                MS_PER_SECOND * Fraction(link.switch_capacity_bytes_per_ms)
+                if (link is not None and link.switch_capacity_bytes_per_ms is not None)
+                else 0
+            )
         if pipe.startswith("link:"):
             link = self.links.get(pipe.removeprefix("link:"))
-            return MS_PER_SECOND * Fraction(link.effective_peak_capacity_bytes_per_ms) if link else 0
+            if link is None:
+                return 0
+            die = scope[-1]
+            base_bpms = Fraction(link.effective_peak_capacity_bytes_per_ms)
+            if link.semantics == "per_pair" and die >= 0:
+                ep_rates = [Fraction(r) for rank, r in link.endpoint_rates if rank == die]
+                peers = (
+                    sum(1 for rank in link.members if rank != die)
+                    if link.members else max(1, len(self.devices) - 1)
+                )
+                cap_bpms = base_bpms * max(1, peers)
+                if ep_rates:
+                    cap_bpms = min(cap_bpms, max(ep_rates))
+                if link.switch_capacity_bytes_per_ms is not None:
+                    cap_bpms = min(cap_bpms, Fraction(link.switch_capacity_bytes_per_ms))
+                return MS_PER_SECOND * cap_bpms
+            return MS_PER_SECOND * base_bpms
         device = self.devices.get(scope[-1])
         if device is None:
             return 0
@@ -1070,13 +1093,29 @@ def build_dual_inputs_from_scenario(
         for item in summary.semantic_work:
             add_work(item)
 
+    dies_tuple = tuple(demands.devices)
+    atomic = getattr(scenario, "atomic_step", None)
+    case_obj = getattr(atomic, "case", None) or getattr(scenario, "case", None)
+    parallel_obj = getattr(getattr(case_obj, "runtime", None), "parallel", None)
+    tp_width = (int(parallel_obj.tp) * int(parallel_obj.pcp)) if parallel_obj is not None else 1
+    pp_stages = int(parallel_obj.pp) if parallel_obj is not None else 1
+
     quanta: list[int] = []
     event_ids: dict[tuple[int, str], int] = {}
     for replica, op, meta in operations:
         for item in meta.get("semantic_work", ()):
             add_work(item)
         for link, byte_count in meta.get("mandatory_comm_wire_bytes_by_link", ()):
-            demands.charge((0, 0, -1), f"link:{link}", byte_count)
+            link_spec = demands.links.get(link)
+            if link_spec is not None and link_spec.semantics == "per_pair":
+                stage = int(getattr(op, "stage", 0))
+                die_idx = (replica * pp_stages + stage) * tp_width
+                die = dies_tuple[die_idx] if 0 <= die_idx < len(dies_tuple) else (dies_tuple[0] if dies_tuple else 0)
+                demands.charge((replica, stage, die), f"link:{link}", byte_count)
+                if link_spec.switch_capacity_bytes_per_ms is not None:
+                    demands.charge((0, 0, -1), f"link_switch:{link}", byte_count)
+            else:
+                demands.charge((0, 0, -1), f"link:{link}", byte_count)
         for scope, direction, copy_bytes in meta.get("schedule_dependent_memory", ()):
             hit = defaultdict(Fraction)
             demands.charge(scope, "l2_bw", copy_bytes, rows=hit)

@@ -28,7 +28,7 @@ from mindie_sim.prediction.runtime.ring_buffer import RingBuffer, lower_generati
 from mindie_sim.schema.common import ModelingError
 
 from .catlass_catalog import (
-    GATHER_SCATTER_POLICIES, STREAMK_PARTIAL_SLOTS_PER_CORE, dtype_name,
+    GATHER_SCATTER_POLICIES, MX_SCALE_GROUP, STREAMK_PARTIAL_SLOTS_PER_CORE, dtype_name,
     grouped_start_cores, packed_bytes, streamk_partition,
 )
 from .contracts import (
@@ -279,7 +279,9 @@ def _emit_chunked_ordinary_wave(
                     for rows, dtype, ring, prior in (
                         (tile.m, s.dtype_a, l0a, r1[0]), (tile.n, _compute_b(s), l0b, r1[1]),
                     ):
-                        moved = packed_bytes(rows * micro, dtype) + _scale(s, rows * micro)
+                        moved = packed_bytes(rows * micro, dtype) + (
+                            rows * ceil_div(micro, MX_SCALE_GROUP) if s.mx_scale_group else 0
+                        )
                         load = plan.work(f"{ring.allocation}:g{g}:load", "mte1", moved, owner=core,
                                          after=(prior, ring_credit(ring, g)))
                         r0.append(lower_generation(

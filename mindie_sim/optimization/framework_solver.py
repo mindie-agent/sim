@@ -245,8 +245,8 @@ class _TrialSearch:
             op = edit.operation
             if (
                 isinstance(op, FuseRegion)
-                and op.abi_verdict is None
                 and op.fusion_tier in {"K1_shipping", "K1_proposed_pr"}
+                and op.abi_verdict is None
                 and op.kernel_boundaries
             ):
                 key = (op.kernel_boundaries[0].abi_id, tuple(ref.id for ref in op.members))
@@ -347,8 +347,7 @@ class _TrialSearch:
                 if result is not None and _accepted(result):
                     key = finalized_plan.base_graph_sha256
                     previous = self.frontier.get(key)
-                    strictly_faster = previous is not None and _wall(result) < _wall(previous[1])
-                    if (finalized_plan == plan and previous is None) or strictly_faster:
+                    if previous is None or _wall(result) < _wall(previous[1]):
                         self.frontier[key] = (finalized_plan, result)
                     if _wall(result) < _wall(self.best_eval):
                         self.seed(finalized_plan, result)
@@ -592,38 +591,48 @@ def _verify_mainline_fuse_region(
     ), fresh_verdict
 
 
-def _local_operations(scenario, ops, mainline, *, verdict_sink=None):
+def _local_operations(scenario, ops, mainline, *, verdict_sink=None, track_override=None):
     from mindie_sim.backends.abi_registry import default_abi_registry
     from mindie_sim.rewrite.algebra import DEFAULT_SHIPPING_STACK_PASSES, _resolve_soc_arch
     from mindie_sim.rewrite.schema import FuseRegion, HoistOrDeduplicate, OpRef
 
     groups = defaultdict(list)
-    for op in ops:
-        meta = dict(op.metadata)
-        targets = (OpRef("atom", op.op_id),)
-        key = _op_contract_key(op, meta)
-        if key is not None:
-            groups[key].extend(targets)
-        if meta.get("load_time"):
-            yield HoistOrDeduplicate(targets, "load_time")
-        if meta.get("device_group_list_elide_d2h"):
-            yield HoistOrDeduplicate(targets, "device_group_list_elide_d2h")
-    for targets in groups.values():
-        if len(targets) > 1:
-            yield HoistOrDeduplicate(tuple(targets), "intra_step")
+    if track_override != "proposed":
+        for op in ops:
+            meta = dict(op.metadata)
+            targets = (OpRef("atom", op.op_id),)
+            key = _op_contract_key(op, meta)
+            if key is not None:
+                groups[key].extend(targets)
+            if meta.get("load_time"):
+                yield HoistOrDeduplicate(targets, "load_time")
+            if meta.get("device_group_list_elide_d2h"):
+                yield HoistOrDeduplicate(targets, "device_group_list_elide_d2h")
+        for targets in groups.values():
+            if len(targets) > 1:
+                yield HoistOrDeduplicate(tuple(targets), "intra_step")
     if not mainline.edits:
         return
 
     lowering_plan = _scenario_lowering_plan(scenario)
-    allowed_classes = (
-        lowering_plan.allowed_rewrite_classes if lowering_plan is not None else frozenset({"shipping"})
-    )
     track_spec = lowering_plan.track_spec if lowering_plan is not None else None
-    manifest_bindings = track_spec.active_bindings if track_spec is not None else ()
-    eff_track = (
-        track_spec.track if track_spec is not None
-        else (lowering_plan.track if lowering_plan is not None else "shipping")
-    )
+    if track_override == "shipping":
+        allowed_classes = frozenset({"shipping"})
+        eff_track = "shipping"
+        manifest_bindings = ()
+    elif track_override == "proposed":
+        allowed_classes = frozenset({"proposed_pr"})
+        eff_track = "proposed"
+        manifest_bindings = track_spec.active_bindings if track_spec is not None else ()
+    else:
+        allowed_classes = (
+            lowering_plan.allowed_rewrite_classes if lowering_plan is not None else frozenset({"shipping"})
+        )
+        manifest_bindings = track_spec.active_bindings if track_spec is not None else ()
+        eff_track = (
+            track_spec.track if track_spec is not None
+            else (lowering_plan.track if lowering_plan is not None else "shipping")
+        )
     if eff_track == "eager":
         return
     enabled_passes = (
@@ -854,6 +863,9 @@ def _prefetch_operations(scenario, ops):
 def solve_framework(
     dossier: ScenarioDossier, *, dual_report: DualSubgradientReport | None = None,
     dual_program=None, event_dag=None, dual_certificate=None, max_trials: int = DEFAULT_MAX_TRIALS,
+    track_override: str | None = None,
+    initial_seed: tuple[Any, Any] | None = None,
+    stages: tuple[str, ...] = FRAMEWORK_STAGES,
 ) -> FrameworkSolveResult:
     from mindie_sim.rewrite.verify import SoundnessInversionError
 
@@ -862,28 +874,35 @@ def solve_framework(
     unmerge, mainline = _seed_plans(dossier)
     u_ns = _wall(_field(dossier, "unmerge_eval", "unmerge"))
     m_ns = _wall(_field(dossier, "mainline_eval", "mainline"))
-    seed = mainline if m_ns <= u_ns else unmerge
-    full = search.try_finalize(seed)
-    if full is None or not _accepted(full) or _wall(full) > min(m_ns, u_ns):
+    if initial_seed is not None:
+        seed_plan, seed_eval = initial_seed
+        search.seed(seed_plan, seed_eval)
+    else:
+        seed = mainline if m_ns <= u_ns else unmerge
+        full = search.try_finalize(seed)
+        if full is None or not _accepted(full) or _wall(full) > min(m_ns, u_ns):
+            alternate = unmerge if seed == mainline else mainline
+            full = search.try_finalize(alternate)
+            seed = alternate
+        if full is None or not _accepted(full) or _wall(full) > min(m_ns, u_ns):
+            raise SoundnessInversionError("no fully verified plan meets the fastest baseline")
+        search.seed(seed, full)
         alternate = unmerge if seed == mainline else mainline
-        full = search.try_finalize(alternate)
-        seed = alternate
-    if full is None or not _accepted(full) or _wall(full) > min(m_ns, u_ns):
-        raise SoundnessInversionError("no fully verified plan meets the fastest baseline")
-    search.seed(seed, full)
-    alternate = unmerge if seed == mainline else mainline
-    if alternate != seed:
-        other = search.try_finalize(alternate)
-        if other is not None and _accepted(other):
-            if _wall(other) < _wall(full):
-                search.seed(alternate, other)
-            else:
-                search.frontier[alternate.base_graph_sha256] = (alternate, other)
+        if alternate != seed:
+            other = search.try_finalize(alternate)
+            if other is not None and _accepted(other):
+                if _wall(other) < _wall(full):
+                    search.seed(alternate, other)
+                else:
+                    search.frontier[alternate.base_graph_sha256] = (alternate, other)
 
-    loo_quota = search.remaining // (len(FRAMEWORK_STAGES) + 1)
-    quota = (search.remaining - loo_quota + len(FRAMEWORK_STAGES) - 1) // len(FRAMEWORK_STAGES)
+    active_stages = tuple(stages) or FRAMEWORK_STAGES
+    loo_quota = search.remaining // (len(active_stages) + 1)
+    quota = (search.remaining - loo_quota + len(active_stages) - 1) // len(active_stages)
     before = search.remaining
-    search.loo(mainline, m_ns, quota // 2, consider=True)
+    if initial_seed is None:
+        search.loo(mainline, m_ns, quota // 2, consider=True)
+
     def proposals(base, scenario, stage):
         ops = _unique_ops(op for _, op in _atomic_ops(scenario))
         if stage == "F3_stream_core":
@@ -896,7 +915,10 @@ def solve_framework(
                     yield _stream_plan(base, stage, op)
             return
         operations = tuple(
-            _local_operations(scenario, ops, mainline, verdict_sink=search.register_verdict)
+            _local_operations(
+                scenario, ops, mainline, verdict_sink=search.register_verdict,
+                track_override=track_override,
+            )
             if stage == "F1_local_k1"
             else _collective_operations(ops, dual_report) if stage == "F2_collective_dbo"
             else _prefetch_operations(scenario, ops)
@@ -904,9 +926,9 @@ def solve_framework(
         search.note_eligible(len(operations))
         yield from (_with_operations(base, stage, (op,)) for op in operations)
 
-    for index, stage in enumerate(FRAMEWORK_STAGES):
+    for index, stage in enumerate(active_stages):
         plans = _interleave(proposals(base, scenario, stage) for base, scenario in _search_bases(dossier, search))
-        limit = (search.remaining - loo_quota) // (len(FRAMEWORK_STAGES) - index)
+        limit = (search.remaining - loo_quota) // (len(active_stages) - index)
         if index == 0:
             limit = max(0, quota - (before - search.remaining))
         search.stage(stage, plans, limit)

@@ -20,7 +20,7 @@ from mindie_sim.optimization import (
     EventDagSpec, EvgVisitorNode, FusedRegionSummary, ResourceChoiceProgram,
     SemanticWorkItem, TensorRangeObligation, build_dual_inputs_from_scenario,
     certify_lower_bound, generate_gcd_core_lattice, select_catlass_candidates,
-    select_dsl_candidates, solve_dsl, solve_framework, streamk_crossing_partials,
+    select_dsl_candidates, solve_framework, solve_unified_regions, streamk_crossing_partials,
 )
 from mindie_sim.prediction.results import OpOccurrence, OperatorSequenceRow, StepEvaluation, StepRequest
 from mindie_sim.prediction.runtime.memory_physics import AddressRun
@@ -298,7 +298,7 @@ def test_native_preflight_reports_exact_builtin_coverage_and_fallback(lane_graph
 def _fused_summary(scenario):
     norm, matmul, *_ = scenario.atomic_ops[0].ops
     members = tuple(OpRef("atom", op.op_id) for op in (norm, matmul))
-    edit = Edit("fused", operation=FuseRegion(members, (), (KernelBoundary("test", members),)))
+    edit = Edit("fused", operation=FuseRegion(members, (), (KernelBoundary("test", members),), fusion_tier="K3_dsl_pipeline"))
     applied = apply_plan(replace(_empty(scenario), edits=(edit,)), scenario)
     atoms = (norm, matmul)
     semantic = (
@@ -322,10 +322,10 @@ def test_work_gate_conserves_semantic_work_on_contraction(real_graph):
     rank, = applied.executable
     fused, *rest = rank.ops
     assert (fused.flops, fused.vector_ops) == tuple(item.logical_ops for item in summary.semantic_work)
-    assert verify_plan(scenario, applied, region_summaries=(summary,)).gates[3].passed
+    assert verify_plan(scenario, applied, region_summaries=(summary,), scope="archetype").gates[3].passed
     for mutation in (replace(fused, flops=fused.flops + 1), replace(fused, vector_ops=fused.vector_ops - 1)):
         changed = replace(applied, executable=(replace(rank, ops=(mutation, *rest)),))
-        assert _reason(verify_plan(scenario, changed, region_summaries=(summary,)), 3) == "WORK_CONSERVATION_MISMATCH"
+        assert _reason(verify_plan(scenario, changed, region_summaries=(summary,), scope="archetype"), 3) == "WORK_CONSERVATION_MISMATCH"
 
 
 def test_work_gate_rejects_forged_summary_work(real_graph):
@@ -333,7 +333,7 @@ def test_work_gate_rejects_forged_summary_work(real_graph):
     applied, summary = _fused_summary(scenario)
     matrix, vector = summary.semantic_work
     forged = replace(summary, semantic_work=(replace(matrix, logical_ops=0), vector))
-    receipt = verify_plan(scenario, applied, region_summaries=(forged,))
+    receipt = verify_plan(scenario, applied, region_summaries=(forged,), scope="archetype")
     assert not receipt.gates[3].passed
 
 
@@ -349,7 +349,11 @@ def test_empty_plan_rejects_certificate_for_unbound_cold_read():
     )
     program, dag, _ = build_dual_inputs_from_scenario(scenario, region_summaries=(forged,))
     evidence = _certificate_evidence(program, dag)
-    receipt = verify_plan(scenario, applied, wall_ns=evidence["dual_certificate"].l_star_lean_ns,
+    step_eval = StepEvaluation(
+        "empty", scenario.step, "mainline",
+        evidence["dual_certificate"].l_star_lean_ns / 1_000_000, (), (),
+    )
+    receipt = verify_plan(scenario, applied, step_eval=step_eval,
                           region_summaries=(forged,), **evidence)
     assert not receipt.passed and receipt.l_star_ns is None
     assert _reason(receipt, 3) == "LEDGER_RECONCILIATION_ERROR"
@@ -379,7 +383,7 @@ def test_ledger_gate_rejects_inconsistent_transfer_evidence(real_graph, mutation
     applied, summary = _fused_summary(scenario)
     assert (summary.logical_transfer_bytes, summary.issued_copy_bytes, summary.dram_sector_bytes,
             summary.turnaround_service_bytes) == (32, 64, 64, Fraction(256, 3))
-    receipt = verify_plan(scenario, applied, region_summaries=(replace(summary, **mutation),))
+    receipt = verify_plan(scenario, applied, region_summaries=(replace(summary, **mutation),), scope="archetype")
     assert _reason(receipt, 3) == "LEDGER_RECONCILIATION_ERROR"
 
 
@@ -394,13 +398,13 @@ def test_ledger_gate_requires_strided_cold_sectors(real_graph, runs, logical, dr
     valid = replace(summary, read_obligations=(read,), write_obligations=(),
                     logical_transfer_bytes=logical, issued_copy_bytes=dram,
                     dram_sector_bytes=dram, turnaround_service_bytes=Fraction(dram))
-    assert verify_plan(scenario, applied, region_summaries=(valid,)).gates[3].passed
+    assert verify_plan(scenario, applied, region_summaries=(valid,), scope="archetype").gates[3].passed
     for changes, detail in (
         (dict(dram_sector_bytes=dram - 1), "dram_sector_bytes"),
         (dict(logical_transfer_bytes=logical - 1), "logical_bytes"),
         (dict(issued_copy_bytes=1), "issued_copy_bytes"),
     ):
-        gate = verify_plan(scenario, applied, region_summaries=(replace(valid, **changes),)).gates[3]
+        gate = verify_plan(scenario, applied, region_summaries=(replace(valid, **changes),), scope="archetype").gates[3]
         assert (gate.passed, gate.reason, gate.detail) == (
             False, "LEDGER_RECONCILIATION_ERROR", f"{summary.region_id}:{detail}",
         )
@@ -413,24 +417,28 @@ def test_bound_gate_checks_certificate_and_shipping_threshold(real_graph):
     cert = evidence["dual_certificate"]
     lower = cert.l_star_lean_ns
     assert lower > 0
-    verified = verify_plan(scenario, applied, wall_ns=lower, **evidence)
+
+    def _step_at(ns: int):
+        return StepEvaluation("bound", scenario.step, "mainline", ns / 1_000_000, (), ())
+
+    verified = verify_plan(scenario, applied, step_eval=_step_at(lower), wall_ns=lower, **evidence)
     assert verified.passed and verified.l_star_ns == lower and len(verified.gates) == 5
     with pytest.raises(SoundnessInversionError, match="SOUNDNESS_BUG_LOWER_BOUND_INVERTED"):
-        verify_plan(scenario, applied, wall_ns=lower - 1, **evidence)
+        verify_plan(scenario, applied, step_eval=_step_at(lower - 1), wall_ns=lower - 1, **evidence)
     for forged in (replace(cert, path_edges=(1,)), replace(cert, l_star_lean_ns=lower + 1)):
-        receipt = verify_plan(scenario, applied, wall_ns=lower, **{**evidence, "dual_certificate": forged})
+        receipt = verify_plan(scenario, applied, step_eval=_step_at(lower), wall_ns=lower, **{**evidence, "dual_certificate": forged})
         assert _reason(receipt, 4) == "LEAN_CERTIFICATE_INVALID"
-    receipt = verify_plan(scenario, applied, wall_ns=lower, dual_certificate=cert)
+    receipt = verify_plan(scenario, applied, step_eval=_step_at(lower), wall_ns=lower, dual_certificate=cert)
     assert _reason(receipt, 4) == "LEAN_CERTIFICATE_INVALID"
-    assert _reason(verify_plan(scenario, applied, wall_ns=lower), 4) == "LEAN_CERTIFICATE_INVALID"
+    assert _reason(verify_plan(scenario, applied, step_eval=_step_at(lower), wall_ns=lower), 4) == "LEAN_CERTIFICATE_INVALID"
     with pytest.raises(SoundnessInversionError, match=f"dsl_ns={lower - 1}<l_star_ns={lower}"):
-        verify_plan(scenario, applied, wall_ns=lower, framework_ns=lower, dsl_ns=lower - 1, **evidence)
-    inverted = verify_plan(scenario, applied, wall_ns=lower + 1, framework_ns=lower, dsl_ns=lower + 1, **evidence)
+        verify_plan(scenario, applied, step_eval=_step_at(lower), wall_ns=lower, framework_ns=lower, dsl_ns=lower - 1, **evidence)
+    inverted = verify_plan(scenario, applied, step_eval=_step_at(lower + 1), wall_ns=lower + 1, framework_ns=lower, dsl_ns=lower + 1, **evidence)
     assert _reason(inverted, 4) == "LADDER_MONOTONICITY_VIOLATION"
 
-    near = verify_plan(scenario, applied, wall_ns=lower, baseline_u_ns=lower, baseline_m_ns=lower + 1000, **evidence)
+    near = verify_plan(scenario, applied, step_eval=_step_at(lower), wall_ns=lower, baseline_u_ns=lower, baseline_m_ns=lower + 1000, **evidence)
     assert near.shipping_regression is None
-    slow = verify_plan(scenario, applied, wall_ns=lower, baseline_u_ns=lower, baseline_m_ns=lower + 1001, **evidence)
+    slow = verify_plan(scenario, applied, step_eval=_step_at(lower), wall_ns=lower, baseline_u_ns=lower, baseline_m_ns=lower + 1001, **evidence)
     assert slow.passed and slow.shipping_regression == ShippingRegression(
         delta_ns=1001, baseline_u_ns=lower, baseline_m_ns=lower + 1001,
     )
@@ -490,9 +498,9 @@ def test_constructive_search_keeps_best_fully_replayed_seed(hardware):
     assert seed.best_wall_ns == min(dossier.m_wall_ns, dossier.u_wall_ns)
     assert seed.best_plan in (dossier.unmerge_plan, dossier.mainline_plan)
     framework = solve_framework(dossier, max_trials=4, **options)
-    dsl_seed = solve_dsl(dossier, framework, max_trials=0, **options)
+    dsl_seed = solve_unified_regions(dossier, framework, max_trials=0, **options)
     assert (dsl_seed.best_plan, dsl_seed.best_eval) == (framework.best_plan, framework.best_eval)
-    dsl = solve_dsl(dossier, framework, max_trials=4, **options)
+    dsl = solve_unified_regions(dossier, framework, max_trials=4, **options)
     assert cert.l_star_lean_ns <= dsl.best_wall_ns <= framework.best_wall_ns <= seed.best_wall_ns
     for result in (seed, framework, dsl_seed, dsl):
         assert result.best_eval.verification.passed and result.best_eval.scope == "full"
@@ -572,7 +580,7 @@ def test_catlass_dispatch_requires_native_operand_mode(real_graph, matrix_op):
 def test_dsl_catalog_requires_real_pool_and_owner_capability(real_graph, matrix_op):
     scenario, _ = real_graph
     path = scenario.datapath
-    problem = AttnResProblem(tokens=1)
+    problem = AttnResProblem(tokens=1, hidden_size=7168)
     op = replace(matrix_op, family=ATTN_RES.removeprefix("dsl."), deps=(),
                  metadata=(("dsl_problem", problem),))
     (spec, members), = select_dsl_candidates((op,), path, 4, 8)
@@ -722,371 +730,9 @@ def test_algebraic_rewrite_laws_enforce_port_quant_contracts_and_activation_pred
                flops=float(2 * 16 * 2048 * 2048), hbm_bytes=8388608.0)
     comb = _op("s0.l0.combine", "combine", (16, 2048), deps=("s0.l0.gmm2",), dtype="bf16", link_bytes=65536.0)
     moe_res = discover_algebraic_rewrites_for_ops((disp, gmm1, situ, quant, gmm2, comb), datapath=path)
-    assert any(t.kind == "ABI_UNSUPPORTED_VARIANT" and t.candidate_abi == "aclnnMegaMoe_situ_ext"
+    assert any(t.kind == "ABI_UNSUPPORTED_VARIANT" and t.candidate_abi == "aclnnMegaMoe_situglu_ext"
                for t in moe_res.semantic_audit_triggers)
-    assert any(c.abi_id == "aclnnMegaMoe_situ_ext" and not c.shipping_supported for c in moe_res.candidates)
-
-
-def test_solve_target_graph_enforces_mode_separation_and_whitebox_l0_pricing():
-    from mindie_sim.optimization import TargetOpNode, solve_target_graph
-    from mindie_sim.prediction.results import OpOccurrence
-    from mindie_sim.prediction.structure import parse_case
-    from mindie_sim.schema.operators import OpSpec
-
-    case = parse_case(compose_case("qwen3-32b", REPRESENTATIVE_SKUS["a5"], tp=1, dp=1, layers=1))
-    shape = (16, 4096)
-    tensor_bytes = float(16 * 4096 * 2)
-    op1 = OpSpec(op_id="s0.l0.act", family="activation", phase="decode", stage=0, layer=0, requests=(),
-                 semantic_shape=shape, local_shape=shape, padded_shape=shape, launch_shape=shape,
-                 dtype="bf16", vector_ops=float(16 * 4096 * 6),
-                 mte2_bytes=tensor_bytes, mte3_bytes=tensor_bytes, hbm_bytes=2.0 * tensor_bytes,
-                 metadata=(("activation", "situ"), ("beta", 1.5)))
-    op2 = OpSpec(op_id="s0.l0.quant", family="quantize", phase="decode", stage=0, layer=0, requests=(),
-                 deps=("s0.l0.act",), semantic_shape=shape, local_shape=shape, padded_shape=shape, launch_shape=shape,
-                 dtype="fp8", vector_ops=float(16 * 4096 * 3),
-                 mte2_bytes=tensor_bytes, mte3_bytes=tensor_bytes * 0.5, hbm_bytes=1.5 * tensor_bytes)
-    occ1 = OpOccurrence(replica=0, stage=0, rank=0, op_id="s0.l0.act")
-    occ2 = OpOccurrence(replica=0, stage=0, rank=0, op_id="s0.l0.quant")
-    n1 = TargetOpNode(
-        0, occ1, "s0.l0.act", "arch0", 1, "activation", "situ", "main", 0, "AIV", shape, "bf16", (),
-        0.0, 40.0, 40.0, 40.0, False, "", 0.0, op1.vector_ops, tensor_bytes, tensor_bytes, 2.0 * tensor_bytes,
-        tensor_bytes, tensor_bytes, 0.0, 0.0, "memory_bound", "HBM", 1.0, 39.0, 40.0, 0.025,
-        ("act",), ("act",), "SiTU", "situ", "CANN", "", False, "", "act", spec=op1,
-    )
-    n2 = TargetOpNode(
-        1, occ2, "s0.l0.quant", "arch0", 1, "quantize", "dynamic_quant", "main", 0, "AIV", shape, "fp8", (occ1,),
-        40.0, 80.0, 40.0, 40.0, False, "", 0.0, op2.vector_ops, tensor_bytes, tensor_bytes * 0.5, 1.5 * tensor_bytes,
-        tensor_bytes, tensor_bytes * 0.5, 0.0, 0.0, "memory_bound", "HBM", 1.0, 39.0, 40.0, 0.025,
-        ("quant",), ("quant",), "Quant", "quant", "CANN", "", False, "", "quant", spec=op2,
-    )
-    die = case.machine.dies[0]
-    peaks = {0: {"hbm_peak_bytes_per_s": dict(die.rates)["hbm"]}}
-    dems = ((0, 500, 500, 500, 0), (0, 500, 500, 250, 0))
-
-    sim_res = solve_target_graph((n1, n2), dems, case, peaks, allow_unbound_formula=False)
-    assert sim_res.has_unbound_formula_ops is False
-    assert sim_res.binding_state == "bound_implementation"
-    assert len(sim_res.nodes) == 2
-
-    mod_res = solve_target_graph((n1, n2), dems, case, peaks, allow_unbound_formula=True)
-    assert mod_res.has_unbound_formula_ops is True
-    assert mod_res.binding_state == "unbound_formula_projection"
-    assert len(mod_res.nodes) == 1
-    fused = mod_res.nodes[0]
-    assert fused.dur_us < 80.0 and fused.dur_us >= fused.l_star_lean_us
-    assert mod_res.synthesis_specs[0].sram_verified is True
-    assert any("beta=1.5" in eq for eq in mod_res.synthesis_specs[0].symbolic_equations)
-
-
-def _mk_target_node(
-    ordinal: int,
-    op_spec,
-    *,
-    archetype_id: str = "arch0",
-    repeat_count: int = 1,
-    task_type: str = "AIV",
-    predecessors: tuple = (),
-    start_us: float = 0.0,
-    dur_us: float = 20.0,
-    l_star_us: float = 2.0,
-    bound: str = "memory_bound",
-    kernel: str = "",
-):
-    from mindie_sim.optimization import TargetOpNode
-    from mindie_sim.prediction.results import OpOccurrence
-
-    occ = OpOccurrence(replica=0, stage=op_spec.stage, rank=0, op_id=op_spec.op_id)
-    mte2 = float(op_spec.mte2_bytes)
-    mte3 = float(op_spec.mte3_bytes)
-    hbm = float(op_spec.hbm_bytes)
-    return TargetOpNode(
-        ordinal, occ, op_spec.op_id, archetype_id, repeat_count, op_spec.family, op_spec.recipe or op_spec.family,
-        op_spec.stream or "main", op_spec.stage, task_type, op_spec.local_shape, op_spec.dtype or "bf16",
-        predecessors, start_us, start_us + dur_us, dur_us, dur_us, False, "",
-        float(op_spec.flops), float(op_spec.vector_ops), mte2, mte3, hbm, mte2, mte3, 0.0,
-        float(op_spec.link_bytes), bound, bound, l_star_us, max(0.0, dur_us - l_star_us),
-        (dur_us / l_star_us) if l_star_us > 0.0 else None,
-        min(1.0, l_star_us / dur_us) if dur_us > 0.0 and l_star_us > 0.0 else None,
-        (op_spec.op_id,), (op_spec.op_id,), op_spec.family, kernel or op_spec.family, "CANN",
-        "", False, "", op_spec.op_id, spec=op_spec,
-    )
-
-
-def test_strict_simulation_mode_never_calls_formula_evaluator_and_prices_bound_law2(monkeypatch):
-    import mindie_sim.optimization.kernel_synthesis as ks
-    from mindie_sim.optimization import solve_target_graph
-    from mindie_sim.prediction.structure import parse_case
-    from mindie_sim.rewrite import Edit, FuseRegion, KernelBoundary, OpRef, RewritePlan
-    from mindie_sim.schema.common import ModelingError
-    from mindie_sim.schema.operators import OpSpec
-
-    def _forbid_formula(*args, **kwargs):
-        raise AssertionError("evaluate_formula_kernel must not be called in strict Simulation Mode")
-
-    monkeypatch.setattr(ks, "evaluate_formula_kernel", _forbid_formula)
-
-    case = parse_case(compose_case("qwen3-32b", REPRESENTATIVE_SKUS["a3"], tp=1, dp=1, layers=1))
-    die = case.machine.dies[0]
-    peaks = {0: {"hbm_peak_bytes_per_s": dict(die.rates)["hbm"]}}
-
-    # (A) Positive-duration AIV op keeps its bound duration and never calls formula projection.
-    shape_v = (16, 4096)
-    tb_v = float(16 * 4096 * 2)
-    norm_op = OpSpec(
-        op_id="s0.l0.norm", family="rmsnorm", phase="decode", stage=0, layer=0, requests=(),
-        semantic_shape=shape_v, local_shape=shape_v, padded_shape=shape_v, launch_shape=shape_v,
-        dtype="bf16", vector_ops=float(16 * 4096 * 4),
-        mte2_bytes=tb_v, mte3_bytes=tb_v, hbm_bytes=2.0 * tb_v,
-    )
-    n_norm = _mk_target_node(0, norm_op, dur_us=25.0, l_star_us=2.0)
-    res_aiv = solve_target_graph((n_norm,), ((0, 2000, 1000, 1000, 0),), case, peaks, allow_unbound_formula=False)
-    assert res_aiv.has_unbound_formula_ops is False
-    assert res_aiv.binding_state == "bound_implementation"
-    assert res_aiv.nodes[0].dur_us == pytest.approx(25.0)
-    assert res_aiv.verification_passed is True
-
-    # (B) Law-2 sibling GEMMs sharing PortRef price via bound RecipeBook with exact directional traffic.
-    m_dim, n_dim, k_dim = 1, 4096, 4096
-    act_b = float(m_dim * k_dim * 2)
-    wt_b = float(n_dim * k_dim * 2)
-    out_b = float(m_dim * n_dim * 2)
-    mte2 = act_b + wt_b
-    hbm = mte2 + out_b
-    flops = float(2 * m_dim * n_dim * k_dim)
-    g_meta = (
-        ("typed_inputs", ({"producer": "s0.l0.norm", "port": "out", "version": 0},)),
-        ("activation_format", "bf16"), ("weight_format", "bf16"),
-        ("output_format", "bf16"), ("compute_format", "bf16"),
-    )
-    g1 = OpSpec(
-        op_id="s0.l0.q_proj", family="gemm", recipe="gemm", phase="decode", stage=0, layer=0, requests=(),
-        deps=("s0.l0.norm",), semantic_shape=(m_dim, n_dim, k_dim), local_shape=(m_dim, n_dim, k_dim),
-        padded_shape=(m_dim, n_dim, k_dim), launch_shape=(m_dim, n_dim, k_dim),
-        dtype="bf16", flops=flops, mte2_bytes=mte2, mte3_bytes=out_b, hbm_bytes=hbm, metadata=g_meta,
-    )
-    g2 = replace(g1, op_id="s0.l0.k_proj")
-    n_src = _mk_target_node(0, replace(norm_op, local_shape=(m_dim, k_dim), semantic_shape=(m_dim, k_dim),
-                                       padded_shape=(m_dim, k_dim), launch_shape=(m_dim, k_dim),
-                                       mte2_bytes=act_b, mte3_bytes=act_b, hbm_bytes=2.0 * act_b),
-                            dur_us=10.0, l_star_us=1.0)
-    n_g1 = _mk_target_node(1, g1, task_type="AIC", predecessors=(n_src.occurrence,), start_us=10.0, dur_us=80.0, l_star_us=25.0)
-    n_g2 = _mk_target_node(2, g2, task_type="AIC", predecessors=(n_src.occurrence,), start_us=90.0, dur_us=80.0, l_star_us=25.0)
-    dems = ((0, 500, 500, 500, 0), (1000, 0, 25000, 100, 0), (1000, 0, 25000, 100, 0))
-    res_l2 = solve_target_graph((n_src, n_g1, n_g2), dems, case, peaks, allow_unbound_formula=False)
-    assert res_l2.has_unbound_formula_ops is False
-    assert res_l2.binding_state == "bound_implementation"
-    assert res_l2.verification_passed is True
-    fused_l2 = next(n for n in res_l2.nodes if len(n.absorbed_source_ops) == 2)
-    assert fused_l2.binding_state in {"bound_implementation", "bound_measured"}
-    assert fused_l2.mte2_bytes == pytest.approx(2.0 * mte2 - act_b)
-    assert fused_l2.mte3_bytes == pytest.approx(2.0 * out_b)
-    assert fused_l2.hbm_total_bytes == pytest.approx(2.0 * hbm - act_b)
-    assert fused_l2.synthesis_spec is not None and fused_l2.synthesis_spec.elided_hbm_bytes == int(act_b)
-
-    # (C) Explicit caller unbound FuseRegion fails fast under allow_unbound_formula=False.
-    quant_op = OpSpec(
-        op_id="s0.l0.quant", family="quantize", phase="decode", stage=0, layer=0, requests=(),
-        deps=("s0.l0.norm",), semantic_shape=shape_v, local_shape=shape_v, padded_shape=shape_v, launch_shape=shape_v,
-        dtype="fp8", vector_ops=float(16 * 4096 * 3),
-        mte2_bytes=tb_v, mte3_bytes=tb_v * 0.5, hbm_bytes=1.5 * tb_v,
-    )
-    n_q = _mk_target_node(1, quant_op, predecessors=(n_norm.occurrence,), start_us=25.0, dur_us=25.0, l_star_us=2.0)
-    refs = (OpRef("atom", "s0.l0.norm"), OpRef("atom", "s0.l0.quant"))
-    unbound_plan = RewritePlan(edits=(Edit("u_fuse", operation=FuseRegion(
-        members=refs, preserve_ports=(),
-        kernel_boundaries=(KernelBoundary("UnboundCustomFusion", refs),),
-        fusion_tier="K3_dsl_pipeline",
-    )),))
-    with pytest.raises(ModelingError, match="rewrite_fusion_recipe_unbound"):
-        solve_target_graph(
-            (n_norm, n_q), ((0, 2000, 1000, 1000, 0), (0, 1500, 1000, 500, 0)),
-            case, peaks, rewrite_plan=unbound_plan, allow_unbound_formula=False,
-        )
-
-
-def test_solve_target_graph_executes_all_supported_opcodes_and_rejects_unsupported():
-    from mindie_sim.optimization import solve_target_graph
-    from mindie_sim.prediction.structure import parse_case
-    from mindie_sim.rewrite import CollectiveTransform, Edit, OpRef, PipelineTiles, RewritePlan, SelectTemplate
-    from mindie_sim.schema.common import ModelingError
-    from mindie_sim.schema.operators import OpSpec
-
-    case = parse_case(compose_case("qwen3-32b", REPRESENTATIVE_SKUS["a5"], tp=2, dp=1, layers=1))
-    die = case.machine.dies[0]
-    peaks = {0: {"hbm_peak_bytes_per_s": dict(die.rates)["hbm"]}}
-    route = case.machine.links[0].name
-
-    m_dim, n_dim, k_dim = 16, 2048, 2048
-    wt_b = float(n_dim * k_dim * 2)
-    gemm_op = OpSpec(
-        op_id="s0.l0.gemm", family="gemm", recipe="gemm", phase="decode", stage=0, layer=0, requests=(),
-        semantic_shape=(m_dim, n_dim, k_dim), local_shape=(m_dim, n_dim, k_dim),
-        padded_shape=(m_dim, n_dim, k_dim), launch_shape=(m_dim, n_dim, k_dim),
-        dtype="bf16", flops=float(2 * m_dim * n_dim * k_dim),
-        mte2_bytes=float(m_dim * k_dim * 2) + wt_b,
-        mte3_bytes=float(m_dim * n_dim * 2),
-        hbm_bytes=float(m_dim * k_dim * 2) + wt_b + float(m_dim * n_dim * 2),
-        metadata=(("packed_weight_bytes", wt_b),),
-    )
-    comm_op = OpSpec(
-        op_id="s0.l0.ar", family="allreduce", phase="decode", stage=0, layer=0, requests=(),
-        deps=("s0.l0.gemm",), semantic_shape=(m_dim, n_dim), local_shape=(m_dim, n_dim),
-        padded_shape=(m_dim, n_dim), launch_shape=(m_dim, n_dim),
-        dtype="bf16", link_bytes=float(m_dim * n_dim * 2), link_scope="tp",
-        metadata=(("group_axis", "tp"),),
-    )
-    n_gemm = _mk_target_node(0, gemm_op, task_type="AIC", dur_us=999.0, l_star_us=5.0)
-    n_comm = _mk_target_node(1, comm_op, task_type="HCCL", predecessors=(n_gemm.occurrence,), start_us=999.0, dur_us=500.0, l_star_us=1.0)
-    dems = ((5000, 0, 5000, 500, 0), (0, 0, 0, 0, 1000))
-
-    # SelectTemplate + CollectiveTransform both execute via canonical apply_plan + verify_plan.
-    plan_ok = RewritePlan(edits=(
-        Edit("sel_gemm", operation=SelectTemplate(OpRef("atom", "s0.l0.gemm"), "K1", "balanced_grouped_gate_up")),
-        Edit("col_os", operation=CollectiveTransform(OpRef("atom", "s0.l0.ar"), "oneshot", route)),
-    ))
-    solved = solve_target_graph((n_gemm, n_comm), dems, case, peaks, rewrite_plan=plan_ok, allow_unbound_formula=False)
-    assert solved.verification_passed is True
-    assert len(solved.applied_plan.edits) >= 2
-    g_out = next(n for n in solved.nodes if n.op_id == "s0.l0.gemm")
-    c_out = next(n for n in solved.nodes if n.op_id == "s0.l0.ar")
-    assert g_out.dur_us < 999.0 and g_out.recipe == "balanced_grouped_gate_up"
-    assert c_out.dur_us < 500.0 and "oneshot" in c_out.ascend_kernel
-
-    # Unknown template ID MUST raise ModelingError (never silently ignored).
-    plan_bad_tpl = RewritePlan(edits=(
-        Edit("bad_tpl", operation=SelectTemplate(OpRef("atom", "s0.l0.gemm"), "K1", "nonexistent_recipe_xyz")),
-    ))
-    with pytest.raises(ModelingError, match="rewrite_template_recipe_unbound"):
-        solve_target_graph((n_gemm, n_comm), dems, case, peaks, rewrite_plan=plan_bad_tpl, allow_unbound_formula=False)
-
-    # Unknown topology route MUST raise ModelingError.
-    plan_bad_route = RewritePlan(edits=(
-        Edit("bad_rt", operation=CollectiveTransform(OpRef("atom", "s0.l0.ar"), "oneshot", "nonexistent_link")),
-    ))
-    with pytest.raises(ModelingError, match="rewrite_collective_route_unknown"):
-        solve_target_graph((n_gemm, n_comm), dems, case, peaks, rewrite_plan=plan_bad_route, allow_unbound_formula=False)
-
-    # Unsupported opcode (PipelineTiles) MUST fail explicitly instead of silently returning verification_passed=True.
-    plan_unsupported = RewritePlan(edits=(
-        Edit("pipe_tile", operation=PipelineTiles(OpRef("atom", "s0.l0.gemm"))),
-    ))
-    with pytest.raises(ModelingError, match="REWRITE_PLAN_UNSUPPORTED_OPCODE"):
-        solve_target_graph((n_gemm, n_comm), dems, case, peaks, rewrite_plan=plan_unsupported, allow_unbound_formula=False)
-
-
-def test_oneshot_collective_pricing_respects_switched_egress_wire_demand():
-    from mindie_sim.optimization import solve_target_graph
-    from mindie_sim.optimization.kernel_synthesis import _TargetPricingContext, _price_collective_on_topology
-    from mindie_sim.prediction.structure import parse_case
-    from mindie_sim.schema.operators import OpSpec
-
-    case = parse_case(compose_case("qwen3-32b", REPRESENTATIVE_SKUS["a3"], tp=8, dp=1, layers=1))
-    die = case.machine.dies[0]
-    peaks = {0: {"hbm_peak_bytes_per_s": dict(die.rates)["hbm"]}}
-    ctx = _TargetPricingContext(case)
-
-    # Large 8 MiB AllReduce on TP=8 switched fabric: ring wire = 1.75*M (14 MiB), oneshot egress = 7*M (56 MiB).
-    msg_large = float(8 * 1024 * 1024)
-    ring_link_large = msg_large * (2.0 * 7.0 / 8.0)
-    ar_large = OpSpec(
-        op_id="s0.l0.ar_large", family="allreduce", phase="decode", stage=0, layer=0, requests=(),
-        semantic_shape=(1024, 4096), local_shape=(1024, 4096), padded_shape=(1024, 4096), launch_shape=(1024, 4096),
-        dtype="bf16", link_bytes=ring_link_large, link_scope="tp", metadata=(("group_axis", "tp"),),
-    )
-    ring_us = _price_collective_on_topology(ar_large, ctx, case, mode="ring")
-    oneshot_us = _price_collective_on_topology(ar_large, ctx, case, mode="oneshot")
-    assert ring_us is not None and oneshot_us is not None
-    assert oneshot_us > ring_us * 2.0
-
-    # Target solver MUST NOT falsely credit OneShot gain when OneShot is slower than ring baseline.
-    n_large = _mk_target_node(0, ar_large, task_type="HCCL", dur_us=ring_us, l_star_us=ring_us * 0.8, bound="link_bound")
-    res_large = solve_target_graph(
-        (n_large,), ((0, 0, 0, 0, int(ring_us * 800.0)),), case, peaks, allow_unbound_formula=False,
-    )
-    assert res_large.nodes[0].dur_us == pytest.approx(ring_us)
-    assert "One-Shot" not in res_large.nodes[0].ascend_kernel
-
-    from mindie_sim.rewrite import CollectiveTransform, Edit, OpRef, RewritePlan
-    msg_small = float(4 * 1024)
-    ar_small = replace(ar_large, op_id="s0.l0.ar_small", local_shape=(1, 2048), link_bytes=msg_small * (2.0 * 7.0 / 8.0))
-    ring_small_us = _price_collective_on_topology(ar_small, ctx, case, mode="ring")
-    oneshot_small_us = _price_collective_on_topology(ar_small, ctx, case, mode="oneshot")
-    assert ring_small_us is not None and oneshot_small_us is not None and oneshot_small_us < ring_small_us
-    n_small = _mk_target_node(0, ar_small, task_type="HCCL", dur_us=ring_small_us, l_star_us=0.5, bound="link_bound")
-    res_auto = solve_target_graph((n_small,), ((0, 0, 0, 0, 500),), case, peaks, allow_unbound_formula=False)
-    assert res_auto.nodes[0].dur_us == pytest.approx(ring_small_us) and "One-Shot" not in res_auto.nodes[0].ascend_kernel
-    case_mesh = parse_case(compose_case("qwen3-32b", REPRESENTATIVE_SKUS["a5"], tp=8, dp=1, layers=1))
-    mesh_peaks = {0: {"hbm_peak_bytes_per_s": dict(case_mesh.machine.dies[0].rates)["hbm"]}}
-    ring_m = _price_collective_on_topology(ar_small, _TargetPricingContext(case_mesh), case_mesh, mode="ring")
-    assert ring_m is not None
-    n_m = _mk_target_node(0, ar_small, task_type="HCCL", dur_us=ring_m, l_star_us=0.5, bound="link_bound")
-    plan_small = RewritePlan(edits=(Edit("os_small", operation=CollectiveTransform(OpRef("atom", "s0.l0.ar_small"), "oneshot", case_mesh.machine.links[0].name)),))
-    res_small = solve_target_graph((n_m,), ((0, 0, 0, 0, 500),), case_mesh, mesh_peaks, rewrite_plan=plan_small, allow_unbound_formula=False)
-    assert res_small.nodes[0].dur_us < ring_m and "oneshot" in res_small.nodes[0].ascend_kernel.lower()
-
-    # AllGather on TP=8 splits M/(G-1) per peer so oneshot stays well-defined and finite.
-    ag_op = replace(ar_small, op_id="s0.l0.ag", family="allgather", link_bytes=msg_large * (7.0 / 8.0))
-    ag_os_us = _price_collective_on_topology(ag_op, ctx, case, mode="oneshot")
-    assert ag_os_us is not None and ag_os_us > 0.0
-
-
-def test_solve_target_graph_rejects_ub_infeasible_aiv_projection():
-    from mindie_sim.optimization import solve_target_graph
-    from mindie_sim.prediction.structure import parse_case
-    from mindie_sim.schema.operators import OpSpec
-
-    case = parse_case(compose_case("qwen3-32b", REPRESENTATIVE_SKUS["a5"], tp=1, dp=1, layers=1))
-    die = case.machine.dies[0]
-    peaks = {0: {"hbm_peak_bytes_per_s": dict(die.rates)["hbm"]}}
-    # 32,768-wide BF16 row reduction exceeds 237,568 B usable A5 UB -> sram_verified=False -> no overwrite.
-    shape = (4, 32768)
-    tb = float(4 * 32768 * 2)
-    wide_norm = OpSpec(
-        op_id="s0.l0.wide_norm", family="rmsnorm", phase="decode", stage=0, layer=0, requests=(),
-        semantic_shape=shape, local_shape=shape, padded_shape=shape, launch_shape=shape,
-        dtype="bf16", vector_ops=float(4 * 32768 * 4),
-        mte2_bytes=tb, mte3_bytes=tb, hbm_bytes=2.0 * tb,
-    )
-    n_wide = _mk_target_node(0, wide_norm, dur_us=95.0, l_star_us=5.0)
-    res = solve_target_graph((n_wide,), ((0, 5000, 2000, 2000, 0),), case, peaks, allow_unbound_formula=True)
-    assert res.nodes[0].dur_us == pytest.approx(95.0)
-    assert res.has_unbound_formula_ops is False
-
-
-def test_attribute_node_overlap_conserves_step_time_across_archetypes():
-    from mindie_sim.optimization import attribute_node_overlap
-    from mindie_sim.schema.operators import OpSpec
-
-    op_a = OpSpec(op_id="s0.l0.compute", family="gemm", phase="decode", stage=0, layer=0, requests=(),
-                  semantic_shape=(16, 1024, 1024), local_shape=(16, 1024, 1024),
-                  padded_shape=(16, 1024, 1024), launch_shape=(16, 1024, 1024), dtype="bf16", flops=1e9)
-    op_b = replace(op_a, op_id="s0.l1.prefetch", family="copy", layer=1, flops=0.0)
-    op_c = replace(op_a, op_id="s0.l1.tail", family="rmsnorm", layer=1, flops=0.0)
-
-    # Full containment across different archetypes: [0, 20] + [5, 15] -> total exposed == 20.0 (not 30.0).
-    n0 = _mk_target_node(0, op_a, archetype_id="arch0", start_us=0.0, dur_us=20.0)
-    n1 = _mk_target_node(1, op_b, archetype_id="arch1", start_us=5.0, dur_us=10.0)
-    attributed, spans = attribute_node_overlap((n0, n1))
-    assert attributed[0].exposed_dur_us == pytest.approx(20.0)
-    assert attributed[1].exposed_dur_us == pytest.approx(0.0)
-    assert spans["arch0"] == pytest.approx(20.0)
-    assert spans["arch1"] == pytest.approx(0.0)
-    assert sum(spans.values()) == pytest.approx(20.0)
-
-    # Partial cross-stream overlap (Stream 0 primary witness): [0, 20] + aux [10, 25] -> exposed 20.0 + 5.0 == 25.0 == T_step.
-    n2_aux = replace(_mk_target_node(1, op_c, archetype_id="arch1", start_us=10.0, dur_us=15.0), stream="aux", stream_index=1)
-    attr2, spans2 = attribute_node_overlap((n0, n2_aux))
-    assert attr2[0].exposed_dur_us == pytest.approx(20.0)
-    assert attr2[1].exposed_dur_us == pytest.approx(5.0)
-    assert sum(spans2.values()) == pytest.approx(25.0)
-
-    # Partial same-stream tail-covered overlap (tail node claims first): [0, 20] + [10, 25] -> exposed 10.0 + 15.0 == 25.0.
-    n2 = _mk_target_node(1, op_c, archetype_id="arch1", start_us=10.0, dur_us=15.0)
-    n0_eq = _mk_target_node(0, replace(op_a, flops=0.0), archetype_id="arch0", start_us=0.0, dur_us=20.0)
-    attr3, spans3 = attribute_node_overlap((n0_eq, n2))
-    assert attr3[0].exposed_dur_us == pytest.approx(10.0)
-    assert attr3[1].exposed_dur_us == pytest.approx(15.0)
-    assert sum(spans3.values()) == pytest.approx(25.0)
+    assert any(c.abi_id == "aclnnMegaMoe" and not c.shipping_supported for c in moe_res.candidates)
 
 
 def test_mla_prolog_matching_uses_typed_metadata_without_op_name_heuristics(real_graph):
@@ -1100,7 +746,7 @@ def test_mla_prolog_matching_uses_typed_metadata_without_op_name_heuristics(real
         return OpSpec(op_id=op_id, family=family, phase="decode", stage=0, layer=0, requests=(),
                       semantic_shape=shape, local_shape=shape, padded_shape=shape, launch_shape=shape, **kw)
 
-    # Obfuscated op_ids with ZERO name hints ("q_a"/"kv_a"/"q_b"/"absorb"/"unpack") — matched purely via typed metadata.
+    # Obfuscated op_ids with ZERO name hints — matched purely via typed metadata; draft scope stays excluded.
     x_norm = _op("s0.l0.step0", "rmsnorm", (16, 7168), dtype="bf16", vector_ops=float(16 * 7168 * 4), hbm_bytes=458752.0)
     step1 = _op("s0.l0.step1", "gemm", (16, 1536, 7168), deps=("s0.l0.step0",), dtype="bf16",
                 flops=float(2 * 16 * 1536 * 7168), hbm_bytes=22020096.0,
@@ -1125,26 +771,10 @@ def test_mla_prolog_matching_uses_typed_metadata_without_op_name_heuristics(real
     res = discover_algebraic_rewrites_for_ops(
         (x_norm, step1, step2, step3, step4, step5, step6, draft_step), datapath=path,
     )
-    mla = [c for c in res.candidates if c.abi_id == "aclnnMlaPrologV3"]
-    assert len(mla) == 1
+    mla = [c for c in res.candidates if c.abi_id == "aclnnMlaPrologV3WeightNz"]
+    assert len(mla) == 1 and mla[0].shipping_supported is True
     assert set(mla[0].member_ids) == {"s0.l0.step1", "s0.l0.step2", "s0.l0.step3", "s0.l0.step4", "s0.l0.step5", "s0.l0.step6"}
     assert "s0.l0.step7" not in mla[0].member_ids
-
-
-def test_target_graph_multi_archetype_model_scope_end_to_end():
-    from mindie_sim.export import build_export_bundle, compose_export_case
-
-    raw_after, auto_req = compose_export_case(
-        "qwen3-32b", "a5-pod", feature_track="expected_ideal",
-        dp=1, tp=2, ep=1, prompt_tokens=512, output_tokens=32,
-    )
-    step_req = StepRequest(
-        phase="decode", tokens=auto_req.tokens, context=auto_req.context,
-        sequences=auto_req.sequences, scope="model",
-    )
-    bundle = build_export_bundle(raw_after, request=step_req)
-    assert bundle.rewrite_verification_passed is True
-    assert bundle.step_span_us > 0.0
 
 
 def test_verify_plan_blocks_typed_and_named_producer_non_commutative_fusion():
@@ -1200,276 +830,124 @@ def test_verify_plan_blocks_typed_and_named_producer_non_commutative_fusion():
         )
 
 
-def test_strict_mode_rejects_preexisting_unbound_nodes_multi_boundary_and_stale_digests():
-    from mindie_sim.optimization import solve_target_graph
-    from mindie_sim.prediction.structure import parse_case
-    from mindie_sim.rewrite import Edit, FuseRegion, KernelBoundary, OpRef, RewritePlan
+def test_verify_plan_rejects_eq7_witness_tampering_fake_wall_and_omitted_step_eval():
+    from mindie_sim.backends.abi_registry import default_abi_registry
+    from mindie_sim.rewrite.oracle import finalize_plan
+    from mindie_sim.schema.abi import AbiSupportVerdict
     from mindie_sim.schema.common import ModelingError
+
+    case = compose_case("qwen3-32b", REPRESENTATIVE_SKUS["a5"], tp=1, dp=1, layers=1)
+    dossier = prepare_scenario(ScenarioRequest(case, StepRequest("decode", tokens=4, context=64)))
+    scenario = dossier.handle.scenario
+    full = finalize_plan(dossier.handle, dossier.unmerge_plan)
+    assert full.verification.passed
+
+    # 1. Omitted step_eval under scope="full" MUST be rejected.
+    r_omitted = verify_plan(scenario, full.applied, step_eval=None, scope="full")
+    assert not r_omitted.passed
+    assert any(g.reason == "LEAN_CERTIFICATE_INVALID" and "missing_step_eval" in g.detail for g in r_omitted.gates)
+
+    # 2. Fake wall_ns=10**12 inconsistent with step_eval under scope="full" MUST be rejected.
+    r_fake_wall = verify_plan(scenario, full.applied, step_eval=full.step_eval, wall_ns=10**12, scope="full")
+    assert not r_fake_wall.passed
+    assert any(g.reason == "LEAN_CERTIFICATE_INVALID" and "wall_ns_step_eval_mismatch" in g.detail for g in r_fake_wall.gates)
+
+    # 3. Eq.7 witness tampering: missing verdict under scope="full" and tampered digest/manifest/entry rejected.
+    ops = scenario.atomic_ops[0].ops
+    pair = next((ops[i], ops[i + 1]) for i in range(len(ops) - 1) if ops[i].op_id in ops[i + 1].deps)
+    refs = (OpRef("atom", pair[0].op_id), OpRef("atom", pair[1].op_id))
+    reg = default_abi_registry()
+    snap = reg.get_snapshot("A5")
+    valid_entry = next(e for e in snap.entries if e.available_on_device and e.vllm_ascend_track == "merged")
+    valid_verdict = AbiSupportVerdict(
+        abi_id=valid_entry.abi_id, status="admitted_shipping", available_on_device=True,
+        backend_kind=valid_entry.backend_kind, device_arch="A5",
+        stack_or_cann_version=valid_entry.stack_or_cann_version,
+        act_dtype="bf16", weight_dtype="bf16", quant_mode="dense",
+        probe_manifest_sha256=snap.payload_sha256, engine_speedup_verified=True,
+        query_digest="a" * 64, matched_entry_id=valid_entry.entry_id,
+        symbol_or_kernel=valid_entry.symbol_or_kernel, source_ref=valid_entry.source_ref,
+        device_kernel_expansion=valid_entry.device_kernel_expansion,
+        cann_check_params_ref=valid_entry.cann_check_params_ref,
+        pr_track="shipping",
+    )
+
+    missing_v = FuseRegion(
+        members=refs, preserve_ports=(), kernel_boundaries=(KernelBoundary(valid_entry.abi_id, refs),),
+        fusion_tier="K1_shipping",
+    )
+    with pytest.raises(ModelingError, match="rewrite_fuse_region_query_digest_mismatch"):
+        replace(missing_v, abi_verdict=valid_verdict, abi_query_digest="f" * 64)
+    tampered_manifest = replace(
+        missing_v,
+        abi_verdict=replace(valid_verdict, probe_manifest_sha256="0" * 64),
+        abi_query_digest=valid_verdict.query_digest,
+    )
+    tampered_entry = replace(
+        missing_v,
+        abi_verdict=replace(valid_verdict, matched_entry_id="forged_nonexistent_entry"),
+        abi_query_digest=valid_verdict.query_digest,
+    )
+    for bad_op, expect_frag in (
+        (missing_v, "missing_abi_verdict"),
+        (tampered_manifest, "probe_manifest_sha256_mismatch"),
+        (tampered_entry, "entry_witness_mismatch"),
+    ):
+        plan = replace(dossier.unmerge_plan, edits=(Edit("forged_eq7", operation=bad_op),))
+        app = apply_plan(plan, scenario)
+        rec = verify_plan(scenario, app, step_eval=full.step_eval, wall_ns=full.wall_ns, scope="full")
+        assert not rec.passed
+        assert any(g.reason == "ABI_WITNESS_INVALID" and expect_frag in g.detail for g in rec.gates), rec.gates
+
+
+def test_replica_preserving_dual_bound_never_sums_parallel_replicas():
+    from mindie_sim.prediction.results import RankOps
+    from mindie_sim.prediction.structure import parse_case
+    from mindie_sim.rewrite.oracle import finalize_plan
     from mindie_sim.schema.operators import OpSpec
 
-    case = parse_case(compose_case("qwen3-32b", REPRESENTATIVE_SKUS["a3"], tp=1, dp=1, layers=1))
-    die = case.machine.dies[0]
-    peaks = {0: {"hbm_peak_bytes_per_s": dict(die.rates)["hbm"]}}
-
-    # (A) Pre-existing unbound_formula_projection node MUST fail fast in strict Simulation Mode.
-    shape_v = (16, 4096)
-    tb_v = float(16 * 4096 * 2)
-    norm_op = OpSpec(
-        op_id="s0.l0.norm", family="rmsnorm", phase="decode", stage=0, layer=0, requests=(),
-        semantic_shape=shape_v, local_shape=shape_v, padded_shape=shape_v, launch_shape=shape_v,
-        dtype="bf16", vector_ops=float(16 * 4096 * 4), mte2_bytes=tb_v, mte3_bytes=tb_v, hbm_bytes=2.0 * tb_v,
-    )
-    unbound_in = replace(_mk_target_node(0, norm_op, dur_us=10.0, l_star_us=2.0), binding_state="unbound_formula_projection")
-    with pytest.raises(ModelingError, match="strict_simulation_unbound_formula_ops:s0.l0.norm"):
-        solve_target_graph((unbound_in,), ((0, 1000, 1000, 1000, 0),), case, peaks, allow_unbound_formula=False)
-
-    # (B) 2-boundary FuseRegion with unknown boundary 0 MUST be rejected even if boundary 1 is registered.
-    quant_op = OpSpec(
-        op_id="s0.l0.quant", family="quantize", phase="decode", stage=0, layer=0, requests=(),
-        deps=("s0.l0.norm",), semantic_shape=shape_v, local_shape=shape_v, padded_shape=shape_v, launch_shape=shape_v,
-        dtype="fp8", vector_ops=float(16 * 4096 * 3), mte2_bytes=tb_v, mte3_bytes=tb_v * 0.5, hbm_bytes=1.5 * tb_v,
-    )
-    n_norm = _mk_target_node(0, norm_op, dur_us=25.0, l_star_us=2.0)
-    n_quant = _mk_target_node(1, quant_op, predecessors=(n_norm.occurrence,), start_us=25.0, dur_us=25.0, l_star_us=2.0)
-    two_bound_plan = RewritePlan(edits=(Edit("two_b", operation=FuseRegion(
-        members=(OpRef("atom", "s0.l0.norm"), OpRef("atom", "s0.l0.quant")),
-        preserve_ports=(),
-        kernel_boundaries=(
-            KernelBoundary("UnknownBoundaryZero", (OpRef("atom", "s0.l0.norm"),)),
-            KernelBoundary("balanced_grouped_gate_up", (OpRef("atom", "s0.l0.quant"),)),
-        ),
-        fusion_tier="K2_epilogue",
-    )),))
-    for mode_flag in (False, True):
-        with pytest.raises(ModelingError, match="rewrite_fusion_recipe_unbound"):
-            solve_target_graph(
-                (n_norm, n_quant), ((0, 2000, 1000, 1000, 0), (0, 1500, 1000, 500, 0)),
-                case, peaks, rewrite_plan=two_bound_plan, allow_unbound_formula=mode_flag,
-            )
-
-    # (C) Auto-generated Law-2 plan persists bound 'gemm' ABI + real digests and replays strictly.
-    m_dim, n_dim, k_dim = 1, 4096, 4096
-    act_b = float(m_dim * k_dim * 2)
-    wt_b = float(n_dim * k_dim * 2)
-    out_b = float(m_dim * n_dim * 2)
-    mte2 = act_b + wt_b
-    hbm = mte2 + out_b
-    flops = float(2 * m_dim * n_dim * k_dim)
-    g_meta = (
-        ("typed_inputs", ({"producer": "s0.l0.norm", "port": "out", "version": 0},)),
-        ("activation_format", "bf16"), ("weight_format", "bf16"),
-        ("output_format", "bf16"), ("compute_format", "bf16"),
-    )
-    g1 = OpSpec(
-        op_id="s0.l0.q_proj", family="gemm", recipe="gemm", phase="decode", stage=0, layer=0, requests=(),
-        deps=("s0.l0.norm",), semantic_shape=(m_dim, n_dim, k_dim), local_shape=(m_dim, n_dim, k_dim),
-        padded_shape=(m_dim, n_dim, k_dim), launch_shape=(m_dim, n_dim, k_dim),
-        dtype="bf16", flops=flops, mte2_bytes=mte2, mte3_bytes=out_b, hbm_bytes=hbm, metadata=g_meta,
-    )
-    g2 = replace(g1, op_id="s0.l0.k_proj")
-    n_src = _mk_target_node(0, replace(norm_op, local_shape=(m_dim, k_dim), semantic_shape=(m_dim, k_dim),
-                                       padded_shape=(m_dim, k_dim), launch_shape=(m_dim, k_dim),
-                                       mte2_bytes=act_b, mte3_bytes=act_b, hbm_bytes=2.0 * act_b),
-                            dur_us=10.0, l_star_us=1.0)
-    n_g1 = _mk_target_node(1, g1, task_type="AIC", predecessors=(n_src.occurrence,), start_us=10.0, dur_us=80.0, l_star_us=25.0)
-    n_g2 = _mk_target_node(2, g2, task_type="AIC", predecessors=(n_src.occurrence,), start_us=90.0, dur_us=80.0, l_star_us=25.0)
-    dems = ((0, 500, 500, 500, 0), (1000, 0, 25000, 100, 0), (1000, 0, 25000, 100, 0))
-    auto_res = solve_target_graph((n_src, n_g1, n_g2), dems, case, peaks, allow_unbound_formula=False)
-    assert auto_res.applied_plan.edits
-    assert auto_res.applied_plan.base_graph_sha256 and auto_res.applied_plan.framing_sha256
-    assert auto_res.applied_plan.edits[0].operation.kernel_boundaries[0].abi_id == "gemm"
-
-    replay_res = solve_target_graph(
-        (n_src, n_g1, n_g2), dems, case, peaks,
-        rewrite_plan=auto_res.applied_plan, allow_unbound_formula=False,
-    )
-    assert replay_res.has_unbound_formula_ops is False
-    assert replay_res.verification_passed is True
-    assert any(len(n.absorbed_source_ops) == 2 and n.binding_state in {"bound_implementation", "bound_measured"}
-               for n in replay_res.nodes)
-
-    # (D) Stale/forged framing or base_graph digest MUST be rejected (no tautological digest copy).
-    tampered_frame = replace(auto_res.applied_plan, framing_sha256="f" * 64)
-    with pytest.raises(ModelingError, match="rewrite_digest_mismatch:framing_sha256"):
-        solve_target_graph((n_src, n_g1, n_g2), dems, case, peaks, rewrite_plan=tampered_frame, allow_unbound_formula=False)
-    tampered_base = replace(auto_res.applied_plan, base_graph_sha256="e" * 64)
-    with pytest.raises(ModelingError, match="rewrite_digest_mismatch:base_graph_sha256"):
-        solve_target_graph((n_src, n_g1, n_g2), dems, case, peaks, rewrite_plan=tampered_base, allow_unbound_formula=False)
-
-
-def test_oneshot_collective_rejects_local_work_and_conserves_concurrent_link_contention():
-    from mindie_sim.optimization import solve_target_graph
-    from mindie_sim.optimization.kernel_synthesis import _TargetPricingContext, _price_collective_on_topology
-    from mindie_sim.prediction.structure import parse_case
-    from mindie_sim.rewrite import CollectiveTransform, Edit, OpRef, RewritePlan
-    from mindie_sim.schema.common import ModelingError
-    from mindie_sim.schema.operators import OpSpec
-
-    case = parse_case(compose_case("qwen3-32b", REPRESENTATIVE_SKUS["a5"], tp=4, dp=1, layers=1))
-    die = case.machine.dies[0]
-    peaks = {0: {"hbm_peak_bytes_per_s": dict(die.rates)["hbm"]}}
-    route = case.machine.links[0].name
-    ctx = _TargetPricingContext(case)
-
-    # (A) Op carrying 100 us of local compute/HBM work + 5 us transfer MUST NOT lose local work under OneShot.
-    mixed_op = OpSpec(
-        op_id="s0.l0.mixed_comm", family="allreduce", phase="decode", stage=0, layer=0, requests=(),
-        semantic_shape=(16, 4096), local_shape=(16, 4096), padded_shape=(16, 4096), launch_shape=(16, 4096),
-        dtype="bf16", vector_ops=float(16 * 4096 * 8), mte2_bytes=131072.0, mte3_bytes=131072.0, hbm_bytes=262144.0,
-        link_bytes=8192.0, link_scope="tp", metadata=(("group_axis", "tp"),),
-    )
-    n_mixed = _mk_target_node(0, mixed_op, task_type="HCCL", dur_us=105.0, l_star_us=5.0)
-    res_auto_mixed = solve_target_graph((n_mixed,), ((0, 5000, 1000, 1000, 500),), case, peaks, allow_unbound_formula=False)
-    assert res_auto_mixed.nodes[0].dur_us == pytest.approx(105.0)
-
-    bad_col_plan = RewritePlan(edits=(
-        Edit("mixed_os", operation=CollectiveTransform(OpRef("atom", "s0.l0.mixed_comm"), "oneshot", route)),
-    ))
-    with pytest.raises(ModelingError, match="oneshot_collective_requires_transport_only_work"):
-        solve_target_graph(
-            (n_mixed,), ((0, 5000, 1000, 1000, 500),), case, peaks,
-            rewrite_plan=bad_col_plan, allow_unbound_formula=False,
+    # 1. Exact counterexample: 2 parallel replicas each doing 1,000 ns HBM work (T_feasible = 1,010 ns)
+    #    MUST keep per-replica isolation so L* <= 1,010 ns (never summing across replicas to ~1,994 ns).
+    raw_dp2 = compose_case("qwen3-32b", REPRESENTATIVE_SKUS["a5"], tp=1, dp=2, layers=1)
+    parsed = parse_case(raw_dp2)
+    unit_rate = 1_000_000_000.0  # 1 B/ns => 1,000 B takes exactly 1,000 ns
+    dies = tuple(
+        replace(
+            d, hbm_read_bytes_per_s=unit_rate, hbm_write_bytes_per_s=unit_rate, hbm_rw_alpha=0.0,
+            rates=tuple(dict(d.rates, hbm=unit_rate, vector=1e15).items()),
         )
-
-    # (B) Two concurrent V-byte transfers on separate streams sharing physical links MUST contend (2V/R, not V/R).
-    msg_v = float(8 * 1024 * 1024)
-    ring_link_v = msg_v * (2.0 * 3.0 / 4.0)
-    ar_a = OpSpec(
-        op_id="s0.l0.ar_a", family="allreduce", phase="decode", stage=0, layer=0, requests=(),
-        semantic_shape=(1024, 4096), local_shape=(1024, 4096), padded_shape=(1024, 4096), launch_shape=(1024, 4096),
-        dtype="bf16", stream="comm0", link_bytes=ring_link_v, link_scope="tp", metadata=(("group_axis", "tp"),),
+        for d in parsed.machine.dies
     )
-    ar_b = replace(ar_a, op_id="s0.l0.ar_b", stream="comm1")
-    single_us = _price_collective_on_topology(ar_a, ctx, case, mode="oneshot")
-    assert single_us is not None and single_us > 0.0
-
-    n_a = replace(_mk_target_node(0, ar_a, task_type="HCCL", start_us=0.0, dur_us=single_us, l_star_us=single_us * 0.5), stream="comm0", stream_index=1)
-    n_b = replace(_mk_target_node(1, ar_b, task_type="HCCL", start_us=0.0, dur_us=single_us, l_star_us=single_us * 0.5), stream="comm1", stream_index=2)
-    conc_plan = RewritePlan(edits=(
-        Edit("os_a", operation=CollectiveTransform(OpRef("atom", "s0.l0.ar_a"), "oneshot", route)),
-        Edit("os_b", operation=CollectiveTransform(OpRef("atom", "s0.l0.ar_b"), "oneshot", route)),
-    ))
-    res_conc = solve_target_graph(
-        (n_a, n_b), ((0, 0, 0, 0, int(single_us * 500.0)), (0, 0, 0, 0, int(single_us * 500.0))),
-        case, peaks, rewrite_plan=conc_plan, allow_unbound_formula=False,
+    case_unit = replace(parsed, machine=replace(parsed.machine, dies=dies))
+    op_r0 = OpSpec(
+        op_id="s0.l0.v", family="copy", recipe="copy", phase="decode", stage=0, layer=0,
+        requests=(), semantic_shape=(1, 496), local_shape=(1, 496), padded_shape=(1, 496), launch_shape=(1, 496),
+        dtype="bf16", vector_ops=0.0, mte2_bytes=992.0, mte3_bytes=0.0, hbm_bytes=992.0,
     )
-    total_span_us = sum(res_conc.archetype_spans_us.values())
-    assert total_span_us > single_us * 1.8
-    assert all(n.dur_us > single_us * 1.8 for n in res_conc.nodes)
-
-
-def test_pairwise_alltoall_prices_routed_volume_above_launch_floor():
-    from mindie_sim.optimization.kernel_synthesis import (
-        _TargetPricingContext, _build_collective_plan, _price_collective_on_topology, extract_sku_floors,
+    scen = SimpleNamespace(
+        case=case_unit, machine=case_unit.machine,
+        atomic_ops=(RankOps(replica=0, ops=(op_r0,)), RankOps(replica=1, ops=(op_r0,))),
+        summaries=(), aliases={},
     )
-    from mindie_sim.prediction.structure import parse_case
-    from mindie_sim.schema.operators import OpSpec
+    prog, dag, res_names = build_dual_inputs_from_scenario(scen, primitive_table=None, rate_mode="engine_ceiling")
+    cert, _ = certify_lower_bound(prog, dag)
+    feasible_wall_ns = 1010
+    assert 980 <= cert.l_star_lean_ns <= feasible_wall_ns
+    assert cert.l_star_lean_ns < 1500  # Must NEVER double-sum parallel replicas to ~1,994 ns.
+    assert any("@r0." in r for r in res_names) and any("@r1." in r for r in res_names)
 
-    case = parse_case(compose_case("qwen3-32b", REPRESENTATIVE_SKUS["a5"], tp=4, dp=1, layers=1))
-    route = case.machine.links[0].name
-    ctx = _TargetPricingContext(case)
-    floor_us = float(extract_sku_floors(case).launch_vec_us)
-    a2a = OpSpec(
-        op_id="s0.l0.dispatch", family="alltoall", phase="decode", stage=0, layer=0, requests=(),
-        semantic_shape=(256, 4096), local_shape=(256, 4096), padded_shape=(256, 4096), launch_shape=(256, 4096),
-        dtype="bf16", link_bytes=float(4 * 1024 * 1024), link_scope="tp", metadata=(("group_axis", "tp"),),
-    )
-    # Pairwise groups keep traffic in per-rank volumes; routed messages exist only once rounds start.
-    _, _, plan = _build_collective_plan(a2a, ctx, case, mode="pairwise", topology_route=route)
-    assert plan is not None
-    assert all(not getattr(g, "messages", ()) for g in plan.groups)
-    small_us = _price_collective_on_topology(a2a, ctx, case, mode="pairwise", topology_route=route, minimum_us=floor_us)
-    big_us = _price_collective_on_topology(
-        replace(a2a, link_bytes=4.0 * a2a.link_bytes), ctx, case,
-        mode="pairwise", topology_route=route, minimum_us=floor_us,
-    )
-    assert small_us is not None and small_us > floor_us
-    assert big_us > small_us * 2.0
-    # The automatic path (no explicit route) prices the same work instead of dropping the plan.
-    auto_us = _price_collective_on_topology(a2a, ctx, case, mode="pairwise", minimum_us=floor_us)
-    assert auto_us == pytest.approx(small_us)
-
-
-def test_oneshot_selection_reconciles_link_ledger_with_executed_sends():
-    from mindie_sim.optimization import solve_target_graph
-    from mindie_sim.prediction.structure import parse_case
-    from mindie_sim.rewrite import CollectiveTransform, Edit, OpRef, RewritePlan
-    from mindie_sim.schema.operators import OpSpec
-
-    link_rate = 50.0e9
-
-    def _check(node, dem, expected_tx, useful_tx):
-        assert node.link_bytes == pytest.approx(expected_tx)
-        assert node.link_bytes >= useful_tx
-        assert dem[4] == int(expected_tx * 1.0e9 / link_rate)
-        assert node.l_star_lean_us == pytest.approx(max(dem) / 1000.0)
-        assert node.gap_us == pytest.approx(max(0.0, node.dur_us - node.l_star_lean_us))
-
-    # D6: automatic path preserves baseline ring without After-only pure-comm OneShot promotion;
-    # explicit CollectiveTransform on TP8 reconciles one-shot sends (M to 7 peers).
-    case8 = parse_case(compose_case("qwen3-32b", REPRESENTATIVE_SKUS["a5"], tp=8, dp=1, layers=1))
-    peaks8 = {0: {"hbm_peak_bytes_per_s": dict(case8.machine.dies[0].rates)["hbm"], "link_peak_bytes_per_s": link_rate}}
-    msg = float(4 * 1024)
-    ar = OpSpec(
-        op_id="s0.l0.ar", family="allreduce", phase="decode", stage=0, layer=0, requests=(),
-        semantic_shape=(1, 2048), local_shape=(1, 2048), padded_shape=(1, 2048), launch_shape=(1, 2048),
-        dtype="bf16", link_bytes=msg * (2.0 * 7.0 / 8.0), link_scope="tp", metadata=(("group_axis", "tp"),),
-    )
-    n_ar = _mk_target_node(0, ar, task_type="HCCL", dur_us=200.0, l_star_us=0.5, bound="link_bound")
-    res_auto = solve_target_graph((n_ar,), ((0, 0, 0, 0, 500),), case8, peaks8, allow_unbound_formula=False)
-    assert "One-Shot" not in res_auto.nodes[0].ascend_kernel
-    plan8 = RewritePlan(edits=(Edit("os8", operation=CollectiveTransform(OpRef("atom", "s0.l0.ar"), "oneshot", case8.machine.links[0].name)),))
-    res = solve_target_graph((n_ar,), ((0, 0, 0, 0, 500),), case8, peaks8, rewrite_plan=plan8, allow_unbound_formula=False)
-    assert "oneshot" in res.nodes[0].ascend_kernel.lower()
-    _check(res.nodes[0], res.demands_ns[0], res.nodes[0].link_bytes, 7.0 * msg)
-
-    # Explicit CollectiveTransform: TP4 on framed one-credit link (1,024 B -> 3 x 400 B = 1,200 B wire/peer).
-    raw4 = compose_case("qwen3-32b", REPRESENTATIVE_SKUS["a5"], tp=4, dp=1, layers=1)
-    raw4["machine"]["links"][0].update(transaction_bytes=352, alignment_bytes=64, protocol_overhead_bytes=48)
-    case4 = parse_case(raw4)
-    peaks4 = {0: {"hbm_peak_bytes_per_s": dict(case4.machine.dies[0].rates)["hbm"], "link_peak_bytes_per_s": link_rate}}
-    msg4 = float(1024)
-    ar4 = replace(ar, op_id="s0.l0.ar4", link_bytes=msg4 * (2.0 * 3.0 / 4.0))
-    n_ar4 = _mk_target_node(0, ar4, task_type="HCCL", dur_us=200.0, l_star_us=0.5, bound="link_bound")
-    plan = RewritePlan(edits=(
-        Edit("os4", operation=CollectiveTransform(OpRef("atom", "s0.l0.ar4"), "oneshot", case4.machine.links[0].name)),
-    ))
-    res4 = solve_target_graph(
-        (n_ar4,), ((0, 0, 0, 0, 500),), case4, peaks4, rewrite_plan=plan, allow_unbound_formula=False,
-    )
-    assert res4.nodes[0].link_bytes == pytest.approx(3.0 * 1200.0)
-    assert res4.nodes[0].link_bytes > 3.0 * msg4
-    _check(res4.nodes[0], res4.demands_ns[0], 3.0 * 1200.0, 3.0 * msg4)
-
-
-def test_solve_target_graph_accepts_public_prepare_scenario_sealed_plan_and_rejects_tampered():
-    from mindie_sim.api import optimize_ladder
-    from mindie_sim.export import build_export_bundle
-    from mindie_sim.prediction.results import StepRequest
-    from mindie_sim.prediction.structure import parse_case
-    from mindie_sim.rewrite import ScenarioRequest, prepare_scenario
-    from mindie_sim.schema.common import ModelingError
-    from mindie_sim.solve import solve_deployment
-
-    raw = compose_case("qwen3-32b", REPRESENTATIVE_SKUS["a5"], dp=1, tp=2, ep=1, pp=1, layers=2, prompt_tokens=1024, output_tokens=64, concurrency=1)
-    case, req = parse_case(raw), StepRequest(phase="decode", tokens=1, context=1024, sequences=1)
-    dossier = prepare_scenario(ScenarioRequest(case=case, step=req))
-    assert build_export_bundle(raw, request=req, apply_target_envelope=True, rewrite_plan=dossier.unmerge_plan, allow_unbound_formula=False).step_span_us > 0.0
-    assert build_export_bundle(raw, request=req, apply_target_envelope=True, rewrite_plan=dossier.mainline_plan, allow_unbound_formula=False).step_span_us > 0.0
-    with pytest.raises(ModelingError, match="rewrite_digest_mismatch:framing_sha256"):
-        build_export_bundle(raw, request=req, apply_target_envelope=True, rewrite_plan=replace(dossier.unmerge_plan, framing_sha256="a" * 64), allow_unbound_formula=False)
-    assert optimize_ladder(case, req, max_trials=1, allow_unbound_formula=True) is not None
-    from mindie_sim.sweep.pd import solve_optimal_deployment
-    sol0 = solve_optimal_deployment("qwen3-32b", REPRESENTATIVE_SKUS["a5"], num_devices=1, prompt_tokens=128, output_tokens=1, ttft_sla_ms=5000.0, tpot_sla_ms=100.0, deployment="colocated", layers=1, feature_track="unmerged_pr", apply_target_envelope=False)
-    dos_p = prepare_scenario(ScenarioRequest(case=parse_case(sol0["recommended_case"]), step=StepRequest(phase="prefill", tokens=128, context=0, sequences=1)))
-    sol_p = solve_deployment("qwen3-32b", REPRESENTATIVE_SKUS["a5"], num_devices=1, prompt_tokens=128, output_tokens=1, ttft_slo_ms=5000.0, tpot_slo_ms=100.0, deployment="colocated", layers=1, mode="simulation", compare_track="unmerged_pr", rewrite_plan=dos_p.unmerge_plan)
-    assert sol_p["feasible"] is True and sol_p["recommended_deployment"]["best_configuration"]["ttft_ms"] > 0.0
+    # 2. Live DP=2 scenario end-to-end admissibility: 0 < L* <= T_feasible.
+    d_dp2 = prepare_scenario(ScenarioRequest(raw_dp2, StepRequest("decode", tokens=1, context=64)))
+    full_dp2 = finalize_plan(d_dp2.handle, d_dp2.unmerge_plan)
+    assert full_dp2.verification.passed
+    assert 0 < full_dp2.verification.l_star_ns <= full_dp2.wall_ns
 
 
 def test_formula_sram_sizes_norm_row_by_reduction_width_not_downstream_vocab():
-    from mindie_sim.optimization.kernel_synthesis import FormulaKernelSpec, FormulaTensorSpec, _solve_formula_sram
     from mindie_sim.prediction.structure import parse_case
     from mindie_sim.schema.operators import OpSpec
+    from mindie_sim.templates.contracts import FormulaKernelSpec, FormulaTensorSpec
+    from mindie_sim.templates.fuse_region import solve_formula_sram
 
     # Final RMSNorm (hidden 5,120) feeding a TP2 LM head with 75,968 local logits.
     case = parse_case(compose_case("qwen3-32b", REPRESENTATIVE_SKUS["a3"], tp=2, dp=1, layers=1))
@@ -1492,7 +970,7 @@ def test_formula_sram_sizes_norm_row_by_reduction_width_not_downstream_vocab():
         FormulaKernelSpec.from_ops((norm, head)),
         outputs=(FormulaTensorSpec("logits", (1, vocab), "bf16", role="output"),),
     )
-    _, algo, tile, ub_pk, ub_budget, *_rest, ok = _solve_formula_sram(spec, datapath)
+    _, algo, tile, ub_pk, ub_budget, *_rest, ok = solve_formula_sram(spec, datapath)
     assert "N=5120," in tile
     assert ok is True and 0 < ub_pk <= ub_budget
     assert algo in {"resident_1pass", "online_reduce"}

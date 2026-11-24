@@ -24,7 +24,7 @@ from _support.linear_cases import (
     recipe_context, serpentine, sku_planning_context, template_datapath as _datapath, template_live_bindings, tile_edge as _edge,
     verify_template_declaration, visitor_graph, with_mx_modes,
 )
-from mindie_sim.optimization.reload_bounds import compute_compulsory_hbm_cut
+from mindie_sim.prediction.runtime.reload_bounds import compute_compulsory_hbm_cut
 from mindie_sim.prediction.engine import Allocation, Engine, Resource
 from mindie_sim.prediction.program import Allocation, Stage
 from mindie_sim.prediction.runtime.memory_physics import AddressRun, AddressRunPlan, AdmissionMemoryView, MemoryAccessPattern, ReuseKey
@@ -284,8 +284,8 @@ def test_simt_thread_ceilings_carveout_and_routing_workspace(datapaths, policy, 
 def test_reference_admission_follows_declared_isa(datapaths, arch_id):
     dp = next(path for path in datapaths if path.arch_id == arch_id)
     for name, p in zip(dsl.DSL_KERNEL_IDS, (
-        dsl.FlashKdaProblem((1,)), dsl.MegaRecurrentKdaProblem(1, 4, 4), dsl.CommitRecurrentKdaProblem((1,)),
-        dsl.MlaPrologProblem(1), dsl.AttnResProblem(1), dsl.QsliProblem(1, 32, 8),
+        dsl.FlashKdaProblem((1,)), dsl.MegaRecurrentKdaProblem(1, 4, 4, 96, 7168), dsl.CommitRecurrentKdaProblem((1,)),
+        dsl.MlaPrologProblem(1, 7168), dsl.AttnResProblem(1, 7168), dsl.QsliProblem(1, 32, 8),
         dsl.MixedQuantSparseMlaProblem(1, 1),
     ), strict=True):
         if dp is datapaths[0]:
@@ -336,7 +336,7 @@ def test_flash_kda_cost_threshold_and_saved_output_visibility(direct):
 def test_mega_recurrent_variant_workspace_reads_and_launch_savings(direct, tp, sequence):
     slots, capacity, heads = tuple(range(7, 7 + tp)), sequence + 1, 96 // tp
     stride = heads * capacity * 128 + 128
-    p = dsl.MegaRecurrentKdaProblem(1, tp, sequence, state_indices=slots, replay_capacity=capacity, k_stride0=stride)
+    p = dsl.MegaRecurrentKdaProblem(1, tp, sequence, 96, 7168, state_indices=slots, replay_capacity=capacity, k_stride0=stride)
     spec, result = _reference(dsl.MEGA_KDA, p, direct)
     stages = _stages(result)
     assert spec.template_variant == f"tp{tp}_s{sequence}"
@@ -389,12 +389,12 @@ def test_mla_four_products_workspace_and_quantization_barrier(direct, mode):
             enumerate_dsl_specs(dsl.MLA_PROLOG, replace(packed, cache_layout="PA_NZ"), direct)
 @pytest.mark.parametrize("tokens", (1, 5))
 def test_attention_residual_ub_and_inplace_savings(direct, tokens):
-    p, d = dsl.AttnResProblem(tokens), 7168
+    p, d = dsl.AttnResProblem(tokens, 7168), 7168
     spec, result = _reference(dsl.ATTN_RES, p, direct, aiv_budget=1)
     tile, depth = spec.tile_shape[0], 1 if tokens <= spec.tile_shape[0] else 2
     assert (tile, depth) == (1, 1 if tokens == 1 else 2)
     assert spec.ub_peak_bytes == 6 * d + depth * (10 * d * tile + 12 * 8 * ceil(tile / 8))
-    assert dsl.attn_res_tiling(8190, 1, ub_bytes=2**32) == (1, 8190, 4095, 2)
+    assert dsl.attn_res_tiling(8190, 1, ub_bytes=2**32, hidden_size=d) == (1, 8190, 4095, 2)
     stages, payload = _stages(result), 4 * tokens * d
     assert (_bytes(stages, ":score_reduce", "vec_reduce"), _bytes(stages, ":score_sqrt", "vec_sfu")) == (2 * tokens * d, tokens)
     assert stages["attn_res:inplace_contract"].metadata["saved_logical_bytes"] == payload
@@ -489,7 +489,10 @@ def test_region_routes_admit_only_valid_pools_and_owner_pairs(datapaths):
             _region(direct, edge, edge_owners={"tile": (0, 2) if axes[0] == "aic" else (2, 0)})
 def test_region_cube_rate_and_full_barrier_release_between_tiles(direct):
     direct = replace(direct, buffers=tuple((key, 64 if key == "l0c" else size) for key, size in direct.buffers))
-    make = Stage("make", {"cube": 131_072}, acquire=(Allocation("accumulator", "l0c", 64, (0,)),), placement={"cube": (0,)})
+    make = Stage(
+        "make", {"cube": 131_072}, acquire=(Allocation("accumulator", "l0c", 64, (0,)),),
+        placement={"cube": (0,)}, metadata={"cube_dtype": "bf16"},
+    )
     _, result = _region(direct, replace(_edge(), iter_kind="full_barrier"), tile_count=2,
                         op_stages={"make": make, "take": Stage("take", free=make.acquire)})
     cube, peaks = _stages(result)["p0:t0:make"], dict(machine(REPRESENTATIVE_SKUS["a5"]).dies[0].compute_peaks)

@@ -186,6 +186,19 @@ def _is_non_commuting_pair(tr_a, tr_b) -> bool:
     return (strict_red_a and cube_b) or (cube_a and strict_red_b) or (cube_a and cube_b)
 
 
+_DEP_META_KEYS = frozenset({
+    "fusion_input_ports", "typed_inputs", "input_ports", "input_port_versions",
+    "control_deps", "control_inputs", "barrier_after", "event_deps", "barrier_deps",
+})
+
+
+def _dep_meta(op) -> tuple:
+    return tuple(
+        pair for pair in op.metadata
+        if pair[0] in _DEP_META_KEYS or (isinstance(pair[0], str) and pair[0].endswith("_producer"))
+    )
+
+
 def _check_algebraic_commutativity(
     originals, current_ops, regions, applied, *, orig_stream=None, curr_stream=None,
 ) -> None:
@@ -193,7 +206,8 @@ def _check_algebraic_commutativity(
     if not originals:
         return
     if not regions and orig_stream == curr_stream and len(originals) == len(current_ops) and all(
-        a.op_id == b.op_id and a.deps == b.deps and a.metadata == b.metadata
+        a.op_id == b.op_id and a.deps == b.deps and a.family == b.family
+        and (a.metadata == b.metadata or _dep_meta(a) == _dep_meta(b))
         for a, b in zip(originals, current_ops)
     ):
         return
@@ -344,13 +358,18 @@ class _ReplayEvaluation(StepEvaluation):
     service_intervals: dict = field(default_factory=dict, repr=False)
     cohort_intervals: dict = field(default_factory=dict, repr=False)
     cohort_replicas: dict = field(default_factory=dict, repr=False)
+    scenario_sha256: str = field(default="", repr=False)
+    plan_sha256: str = field(default="", repr=False)
 
 
 def _representative_cohorts(cohorts):
     return {op_id: cohorts[replica, op_id] for replica, op_id in sorted(cohorts, reverse=True)}
 
 
-def _evaluation(scenario, graphs, report, graph_id, tier, prepared=None):
+def _evaluation(
+    scenario, graphs, report, graph_id, tier, prepared=None,
+    *, scenario_sha256: str = "", plan_sha256: str = "",
+):
     index = {(replica, op.op_id): op for replica, ops in graphs.items() for op in ops}
     rows, occurrences = [], {}
     for row in report["timeline"]:
@@ -417,6 +436,8 @@ def _evaluation(scenario, graphs, report, graph_id, tier, prepared=None):
         service_intervals=dict(service),
         cohort_intervals=_representative_cohorts(cohort_replicas),
         cohort_replicas=cohort_replicas,
+        scenario_sha256=scenario_sha256 or getattr(scenario, "scenario_sha256", ""),
+        plan_sha256=plan_sha256,
     )
 
 def _combine_replays(rows):
@@ -702,7 +723,103 @@ def _template_service(scenario, applied, edited, replay):
     return profiles
 
 
-def _verify_fuse_region_witnesses(scenario, applied, scope):
+_ZERO_COPY_VIEW_FAMS = frozenset({"view", "reshape", "slice", "permute", "transpose", "split", "contiguous"})
+_LAW1_ABI_ALLOWED_SYMS: dict[str, tuple[frozenset[str], frozenset[str]]] = {
+    "aclnnAddRmsNormDynamicQuant": (
+        frozenset({"add", "rmsnorm", "add_rmsnorm", "dynamic_quant"}),
+        frozenset({"dynamic_quant"}),
+    ),
+    "aclnnAddRmsNormDynamicMxQuant": (
+        frozenset({"add", "rmsnorm", "add_rmsnorm", "dynamic_mx_quant"}),
+        frozenset({"dynamic_mx_quant"}),
+    ),
+    "aclnnSwiGluQuant": (
+        frozenset({"swiglu", "dynamic_quant", "dynamic_mx_quant"}),
+        frozenset({"swiglu"}),
+    ),
+    "aclnnDequantSituQuant": (
+        frozenset({"situ", "dynamic_quant", "dynamic_mx_quant"}),
+        frozenset({"situ"}),
+    ),
+}
+
+
+def _verify_verdict_matches_absorbed_ops(edit, op, verdict, matched_entry, scenario, applied, registry) -> None:
+    """Ensure a catalog-valid ABI verdict actually matches the region's absorbed ops."""
+    from .algebra import _classify_ub_chain_abi, _norm_abi_dtype
+
+    atomic_by_id = {atom.op_id: atom for atom in (scenario.atomic_ops[0].ops if scenario.atomic_ops else ())}
+    fused_id = f"rewrite:{edit.edit_id}"
+    member_ids = applied.absorbed_atoms.get(fused_id) or tuple(
+        ref.id for ref in op.members if ref.kind == "atom"
+    )
+    absorbed = tuple(atomic_by_id[oid] for oid in member_ids if oid in atomic_by_id)
+    if not absorbed:
+        return
+    traits = {atom.op_id: classify_op_traits(atom) for atom in absorbed}
+    abi_id = verdict.abi_id
+    if abi_id in _LAW1_ABI_ALLOWED_SYMS:
+        allowed_syms, req_syms = _LAW1_ABI_ALLOWED_SYMS[abi_id]
+        material = [
+            atom for atom in absorbed
+            if not (
+                traits[atom.op_id].trait == AlgebraicTrait.VIEW_METADATA
+                and str(atom.family or "").strip().lower() in _ZERO_COPY_VIEW_FAMS
+            )
+        ]
+        mat_syms = [traits[atom.op_id].symbolic_op_kind for atom in material]
+        if (
+            not material
+            or any(traits[atom.op_id].trait in {
+                AlgebraicTrait.BILINEAR_MATMUL, AlgebraicTrait.ASSOCIATIVE_COLLECTIVE, AlgebraicTrait.ATTENTION_CORE,
+            } for atom in material)
+            or any(sym not in allowed_syms for sym in mat_syms)
+            or not (req_syms <= set(mat_syms))
+        ):
+            raise ModelingError(f"ABI_WITNESS_INVALID:absorbed_motif_mismatch:{edit.edit_id}:{abi_id}")
+        re_abi, _, _, _, re_verdict, re_digest, _ = _classify_ub_chain_abi(
+            absorbed, traits,
+            soc_arch=verdict.device_arch,
+            sku_id=str(getattr(scenario.case.machine, "sku", "") or getattr(scenario.case.machine, "name", "") or ""),
+            pr_track=verdict.pr_track,
+            registry=registry,
+        )
+        if re_abi != abi_id or re_verdict is None or re_digest != verdict.query_digest or re_verdict.status != verdict.status:
+            raise ModelingError(f"ABI_WITNESS_INVALID:absorbed_query_mismatch:{edit.edit_id}:{abi_id}")
+        return
+    if abi_id in {"aclnnMatmul", "aclnnQuantMatmulV4"}:
+        if any(traits[atom.op_id].trait != AlgebraicTrait.BILINEAR_MATMUL for atom in absorbed):
+            raise ModelingError(f"ABI_WITNESS_INVALID:absorbed_motif_mismatch:{edit.edit_id}:{abi_id}")
+    elif abi_id in {"aclnnAllGatherMatmulV2", "aclnnMatmulReduceScatterV2"}:
+        tset = {traits[atom.op_id].trait for atom in absorbed}
+        if not ({AlgebraicTrait.ASSOCIATIVE_COLLECTIVE, AlgebraicTrait.BILINEAR_MATMUL} <= tset):
+            raise ModelingError(f"ABI_WITNESS_INVALID:absorbed_motif_mismatch:{edit.edit_id}:{abi_id}")
+    elif abi_id.startswith("aclnnMlaProlog"):
+        if not any(traits[atom.op_id].trait == AlgebraicTrait.BILINEAR_MATMUL for atom in absorbed):
+            raise ModelingError(f"ABI_WITNESS_INVALID:absorbed_motif_mismatch:{edit.edit_id}:{abi_id}")
+    elif abi_id in {"aclnnMegaMoe", "dispatch_ffn_combine", "aclnnGroupedMatmulSwigluQuantV2"}:
+        if not any(traits[atom.op_id].is_grouped_matmul for atom in absorbed):
+            raise ModelingError(f"ABI_WITNESS_INVALID:absorbed_motif_mismatch:{edit.edit_id}:{abi_id}")
+    first_tr = traits[absorbed[0].op_id]
+    if first_tr.input_dtype and verdict.act_dtype and _norm_abi_dtype(first_tr.input_dtype) != _norm_abi_dtype(verdict.act_dtype):
+        # Allow BF16 token input on MXFP8 MLA/MegaMoE prologs where entry op carries weight dtype.
+        if not (abi_id.startswith(("aclnnMlaProlog", "aclnnMegaMoe", "dispatch_ffn_combine")) and verdict.act_dtype == "bf16"):
+            raise ModelingError(f"ABI_WITNESS_INVALID:absorbed_dtype_mismatch:{edit.edit_id}:{abi_id}")
+    constraints = dict(getattr(matched_entry, "shape_constraints", ()) or ())
+    if constraints and absorbed[0].local_shape:
+        hidden = int(absorbed[0].local_shape[-1])
+        h_min = constraints.get("hidden_min")
+        h_max = constraints.get("hidden_max")
+        h_mod = constraints.get("hidden_mod")
+        if (
+            (isinstance(h_min, int) and hidden < h_min)
+            or (isinstance(h_max, int) and hidden > h_max)
+            or (isinstance(h_mod, int) and h_mod > 0 and hidden % h_mod != 0)
+        ):
+            raise ModelingError(f"ABI_WITNESS_INVALID:absorbed_shape_mismatch:{edit.edit_id}:{hidden}")
+
+
+def _verify_fuse_region_witnesses(scenario, applied, scope, *, step_eval=None, baseline_eval=None):
     """Enforce bidirectional Equation 7 exact witness parity on every ``FuseRegion`` edit."""
     soc_arch = _resolve_soc_arch(
         str(getattr(scenario.case.machine, "arch_family", "") or ""),
@@ -739,6 +856,13 @@ def _verify_fuse_region_witnesses(scenario, applied, scope):
         if verdict.matched_lowering_sha256 and op.lowering_sha256 != verdict.matched_lowering_sha256:
             raise ModelingError(f"ABI_WITNESS_INVALID:lowering_sha256_mismatch:{edit.edit_id}")
         if verdict.status in {"admitted_shipping", "admitted_proposed_pr"}:
+            if (
+                scope == "full"
+                and step_eval is not None
+                and baseline_eval is not None
+                and round(step_eval.span_ms * NS_PER_MS) >= round(baseline_eval.span_ms * NS_PER_MS)
+            ):
+                raise ModelingError(f"ABI_WITNESS_INVALID:engine_speedup_not_achieved:{edit.edit_id}")
             registry = registry or default_abi_registry()
             snap = registry.get_snapshot(verdict.device_arch)
             if verdict.probe_manifest_sha256 != snap.payload_sha256:
@@ -755,6 +879,7 @@ def _verify_fuse_region_witnesses(scenario, applied, scope):
                 or (verdict.source_ref is not None and matched_entry.source_ref != verdict.source_ref)
             ):
                 raise ModelingError(f"ABI_WITNESS_INVALID:entry_witness_mismatch:{edit.edit_id}")
+            _verify_verdict_matches_absorbed_ops(edit, op, verdict, matched_entry, scenario, applied, registry)
 
 
 def _verify_summary_lineage_work(summary, atomic_by_site):
@@ -849,13 +974,15 @@ def _executed_service_conservation(scenario, applied, step_eval, baseline_eval, 
     for lease in applied.prefetch_leases:
         if lease.max_bytes > 0:
             leases[lease.target_op] += lease.max_bytes
+    catalog_sites = {(summary.semantic_work[0].replica, summary.region_id) for summary in summaries
+                     if summary.semantic_work}
     catalog = {(summary.semantic_work[0].replica, summary.region_id): summary for summary in summaries
                if summary.semantic_work} if service_replay else {}
     kinds = {type(edit.operation) for edit in edits}
     checks = {"link": ("link:",)}
     if not kinds & {QuantizeContract, HoistOrDeduplicate}:
         checks["matrix"] = _MATRIX_SERVICE_PREFIXES
-    if SelectTemplate in kinds and not catalog:
+    if SelectTemplate in kinds and not catalog_sites:
         checks.update(_TRANSFER_SERVICE)
         if FuseRegion not in kinds:
             checks["vector"] = ("vector@",)
@@ -900,7 +1027,7 @@ def _executed_service_conservation(scenario, applied, step_eval, baseline_eval, 
             detail = "memory" if name == "hbm" else name
             raise ModelingError(f"WORK_CONSERVATION_MISMATCH:executed_{detail}_service_dropped")
     for occurrence, row in base_rows.items():
-        if occurrence in catalog:
+        if occurrence in catalog_sites:
             continue
         _, op_id = occurrence
         actual = Counter()
@@ -923,7 +1050,7 @@ def _executed_service_conservation(scenario, applied, step_eval, baseline_eval, 
 
 def _conservation(scenario, applied, summaries, step_eval=None, baseline_eval=None, baseline_work=None,
                   service_replay=None, *, scope="full"):
-    _verify_fuse_region_witnesses(scenario, applied, scope)
+    _verify_fuse_region_witnesses(scenario, applied, scope, step_eval=step_eval, baseline_eval=baseline_eval)
     _check_region_summary_bindings(scenario, applied, summaries)
     hoists = set(applied.hoisted_load_time)
     cse = {edit.edit_id for edit in applied.plan.edits
@@ -1010,6 +1137,29 @@ def _bound(scenario, applied, summaries, primitive_table, rate_mode, certificate
     return l_star
 
 
+def _verify_step_eval_binding(scenario, applied, step_eval) -> None:
+    """Bind full-step Engine replay strictly to ``scenario``, ``step``, ``applied``, and occurrences."""
+    if getattr(step_eval, "request", None) != scenario.step:
+        raise ModelingError("LEAN_CERTIFICATE_INVALID:step_eval_request_mismatch")
+    eval_scen_sha = getattr(step_eval, "scenario_sha256", "")
+    if eval_scen_sha and eval_scen_sha != scenario.scenario_sha256:
+        raise ModelingError("LEAN_CERTIFICATE_INVALID:step_eval_scenario_mismatch")
+    eval_plan_sha = getattr(step_eval, "plan_sha256", "")
+    if eval_plan_sha and eval_plan_sha != applied.plan_sha256:
+        raise ModelingError("LEAN_CERTIFICATE_INVALID:step_eval_plan_mismatch")
+    rows = getattr(step_eval, "operators", ()) or ()
+    if rows or applied.plan.edits:
+        excluded = set(applied.hoisted_load_time) | set(applied.elided_d2h_ops)
+        row_shapes = {(row.occurrence.replica, row.occurrence.op_id): row.shape for row in rows}
+        for entry in applied.executable:
+            for op in entry.ops:
+                if op.op_id in excluded:
+                    continue
+                site = (entry.replica, op.op_id)
+                if site not in row_shapes or row_shapes[site] != op.local_shape:
+                    raise ModelingError(f"LEAN_CERTIFICATE_INVALID:step_eval_occurrence_mismatch:{op.op_id}")
+
+
 def verify_plan(
     scenario: ResolvedScenario, applied: AppliedPlan, *, step_eval=None, wall_ns=None,
     dual_certificate=None, dual_program=None, event_dag=None, baseline_u_ns=None,
@@ -1052,6 +1202,7 @@ def verify_plan(
         try:
             if step_eval is None:
                 raise ModelingError("LEAN_CERTIFICATE_INVALID:missing_step_eval")
+            _verify_step_eval_binding(scenario, applied, step_eval)
             if wall_mismatch:
                 raise ModelingError("LEAN_CERTIFICATE_INVALID:wall_ns_step_eval_mismatch")
             if region_summaries and not gates[-1].passed:

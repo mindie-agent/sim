@@ -700,7 +700,14 @@ def _resolve_primitive_table_digest(handle: Any, case: Case, explicit_table: Any
     from mindie_sim.rewrite._oracle_prefetch import primitive_table_digest_token
 
     eval_ctx = getattr(handle, "evaluation_context", None)
-    table = getattr(eval_ctx, "primitive_table", None) or explicit_table
+    bindings = getattr(eval_ctx, "bindings", None)
+    cost = getattr(eval_ctx, "cost", None)
+    table = (
+        getattr(bindings, "primitive_table", None)
+        or getattr(cost, "primitives", None)
+        or getattr(eval_ctx, "primitive_table", None)
+        or explicit_table
+    )
     for attr in ("envelope_sha256", "payload_sha256", "digest"):
         val = getattr(table, attr, "")
         if isinstance(val, str) and val.strip():
@@ -711,21 +718,19 @@ def _resolve_primitive_table_digest(handle: Any, case: Case, explicit_table: Any
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def _try_resident_memory_receipt(case: Case, request: StepRequest) -> Any:
-    try:
-        mem = Memory(case)
-        seqs = request.sequences
-        batch = max(seqs) if isinstance(seqs, (tuple, list)) and seqs else int(seqs or 1)
-        ctx = max(0, int(request.context or 0))
-        q_tok = max(1, int(request.tokens or 1))
-        return mem.resident_memory_receipt(
-            phase=request.phase,
-            sequence_tokens=(ctx + q_tok) if ctx > 0 else None,
-            batch_per_dp=max(1, batch),
-            query_tokens=q_tok,
-        )
-    except (ModelingError, ValueError, ZeroDivisionError):
-        return None
+def _compute_resident_memory_receipt(case: Case, request: StepRequest) -> Any:
+    """Compute canonical ``ResidentMemoryReceipt`` directly (fail-loud; zero silent None)."""
+    mem = Memory(case)
+    seqs = request.sequences
+    batch = max(seqs) if isinstance(seqs, (tuple, list)) and seqs else int(seqs or 1)
+    ctx = max(0, int(request.context or 0))
+    q_tok = max(1, int(request.tokens or 1))
+    return mem.resident_memory_receipt(
+        phase=request.phase,
+        sequence_tokens=max(1, ctx + q_tok),
+        batch_per_dp=max(1, batch),
+        query_tokens=q_tok,
+    )
 
 
 def _certify_stage_l_star(
@@ -763,6 +768,11 @@ def _build_stage_receipt(
     rejection_reason: str = "",
 ) -> StageReceipt:
     span_ns = max(0, round(step_eval.span_ms * NS_PER_MS))
+    existing_pt = str(getattr(step_eval, "primitive_table_digest", "") or "").strip()
+    if existing_pt and existing_pt != primitive_table_digest:
+        raise ModelingError(
+            f"stage_receipt_primitive_table_digest_mismatch:{stage_id}:{existing_pt}!={primitive_table_digest}"
+        )
     bound_eval = replace(step_eval, primitive_table_digest=primitive_table_digest)
     by_occ: dict[str, int] = defaultdict(int)
     idle_ns = 0
@@ -834,9 +844,20 @@ def _clone_identity_stage(
     )
 
 
-def _evaluate_stage2_framework(
+def _build_stage_pricing(base_resolved) -> DualSubgradientReport:
+    prog0, dag0, names0 = build_dual_inputs_from_scenario(base_resolved)
+    _, pricing = certify_lower_bound(prog0, dag0)
+    by_idx = dict(zip(pricing.resource_names, names0))
+    return replace(
+        pricing,
+        resource_names=names0,
+        tight_resources=tuple(by_idx[k] for k in pricing.tight_resources),
+    )
+
+
+def _evaluate_stage1_ops_config(
     dossier,
-    stage1: StageReceipt,
+    stage0: StageReceipt,
     *,
     base_resolved,
     base_track: StackTrack,
@@ -847,26 +868,85 @@ def _evaluate_stage2_framework(
     mem_receipt: Any,
     max_trials: int,
 ) -> tuple[StageReceipt, FrameworkSolveResult | None, DualSubgradientReport | None]:
+    """Stage 1: optimize merged shipping stack ops/config/collective/stream/prefetch switches."""
+    from mindie_sim.rewrite.oracle import _baseline
+    from mindie_sim.rewrite.schema import plan_sha256
+
+    if comparison_policy == "simulation_only" or stack_track == "eager":
+        return _clone_identity_stage(stage0, stage_id="stage1_ops_config", stack_track=base_track), None, None
+
+    pricing = _build_stage_pricing(base_resolved)
+    ship_result = solve_framework(
+        dossier,
+        dual_report=pricing,
+        max_trials=max_trials,
+        track_override="shipping",
+    )
+    s1_eval = _step(ship_result.best_eval)
+    s1_span_ns = max(0, round(s1_eval.span_ms * NS_PER_MS))
+    if comparison_policy == "monotonic_optimization" and s1_span_ns > stage0.span_ns:
+        stage1 = _clone_identity_stage(stage0, stage_id="stage1_ops_config", stack_track="shipping")
+        return stage1, ship_result, pricing
+    s1_resolved = _baseline(dossier.handle, ship_result.best_plan).scenario
+    l_star_1 = _certify_stage_l_star(
+        s1_resolved,
+        applied=ship_result.best_eval.applied,
+        region_summaries=ship_result.best_eval.region_summaries,
+        primitive_table=primitive_table,
+    )
+    stage1 = _build_stage_receipt(
+        stage_id="stage1_ops_config",
+        stack_track="shipping",
+        step_eval=s1_eval,
+        scenario_digest=dossier.scenario_digest,
+        primitive_table_digest=pt_digest,
+        plan_digest=plan_sha256(ship_result.best_plan),
+        l_star_ns=l_star_1,
+        memory_receipt=mem_receipt,
+    )
+    return stage1, ship_result, pricing
+
+
+def _evaluate_stage2_framework(
+    dossier,
+    stage1: StageReceipt,
+    *,
+    stage1_result: FrameworkSolveResult | None,
+    pricing: DualSubgradientReport | None,
+    base_resolved,
+    base_track: StackTrack,
+    stack_track: StackTrack,
+    comparison_policy: ComparisonPolicy,
+    primitive_table: CapacityTable | None,
+    pt_digest: str,
+    mem_receipt: Any,
+    max_trials: int,
+) -> tuple[StageReceipt, FrameworkSolveResult | None, DualSubgradientReport | None]:
+    """Stage 2: evaluate unmerged PR ``ManifestBinding`` switches on top of Stage 1."""
     from mindie_sim.rewrite.oracle import _baseline
     from mindie_sim.rewrite.schema import plan_sha256
 
     if comparison_policy == "simulation_only" or stack_track not in {"proposed", "target"}:
-        return _clone_identity_stage(stage1, stage_id="stage2_unmerged_pr", stack_track=base_track), None, None
+        return _clone_identity_stage(stage1, stage_id="stage2_unmerged_pr", stack_track=base_track), stage1_result, pricing
 
-    prog0, dag0, names0 = build_dual_inputs_from_scenario(base_resolved)
-    _, pricing = certify_lower_bound(prog0, dag0)
-    by_idx = dict(zip(pricing.resource_names, names0))
-    pricing = replace(
-        pricing,
-        resource_names=names0,
-        tight_resources=tuple(by_idx[k] for k in pricing.tight_resources),
+    eff_pricing = pricing if pricing is not None else _build_stage_pricing(base_resolved)
+    seed_pair = (
+        (stage1_result.best_plan, stage1_result.best_eval)
+        if stage1_result is not None else None
     )
-    framework_result = solve_framework(dossier, dual_report=pricing, max_trials=max_trials)
+    framework_result = solve_framework(
+        dossier,
+        dual_report=eff_pricing,
+        max_trials=max_trials,
+        track_override="proposed",
+        initial_seed=seed_pair,
+        stages=("F1_local_k1",),
+    )
     fw_eval = _step(framework_result.best_eval)
     fw_span_ns = max(0, round(fw_eval.span_ms * NS_PER_MS))
     if comparison_policy == "monotonic_optimization" and fw_span_ns > stage1.span_ns:
         stage2 = _clone_identity_stage(stage1, stage_id="stage2_unmerged_pr", stack_track="proposed")
-        return stage2, framework_result, pricing
+        return stage2, stage1_result or framework_result, eff_pricing
     fw_resolved = _baseline(dossier.handle, framework_result.best_plan).scenario
     l_star_2 = _certify_stage_l_star(
         fw_resolved,
@@ -884,7 +964,7 @@ def _evaluate_stage2_framework(
         l_star_ns=l_star_2,
         memory_receipt=mem_receipt,
     )
-    return stage2, framework_result, pricing
+    return stage2, framework_result, eff_pricing
 
 
 def _evaluate_stage3_target(
@@ -913,6 +993,14 @@ def _evaluate_stage3_target(
             stack_track=stage2.stack_track,
             status="skipped",
             rejection_reason="simulation_only_forbids_target_synthesis",
+        )
+    if stack_track != "target":
+        return _clone_identity_stage(
+            stage2,
+            stage_id="stage3_target_after",
+            stack_track=stage2.stack_track,
+            status="skipped",
+            rejection_reason=f"non_target_track:{stack_track}",
         )
     if ext_plan is not None:
         ext_eval = finalize_plan(
@@ -950,14 +1038,6 @@ def _evaluate_stage3_target(
             plan_digest=plan_sha256(ext_plan),
             l_star_ns=l_star_3,
             memory_receipt=mem_receipt,
-        )
-    if stack_track != "target":
-        return _clone_identity_stage(
-            stage2,
-            stage_id="stage3_target_after",
-            stack_track=stage2.stack_track,
-            status="skipped",
-            rejection_reason=f"non_target_track:{stack_track}",
         )
     if framework_result is None:
         raise ModelingError("target_stage_requires_framework_seed")
@@ -1022,7 +1102,7 @@ def solve_target_step_receipt(
         allow_unbound_formula=bool(allow_unbound_formula),
     )
     pt_digest = _resolve_primitive_table_digest(dossier.handle, parsed_case, primitive_table)
-    mem_receipt = _try_resident_memory_receipt(parsed_case, request)
+    mem_receipt = _compute_resident_memory_receipt(parsed_case, request)
     unmerge_plan, mainline_plan = _seed_plans(dossier)
 
     base_track: StackTrack = "eager" if stack_track == "eager" else "shipping"
@@ -1044,10 +1124,23 @@ def solve_target_step_receipt(
         l_star_ns=l_star_0,
         memory_receipt=mem_receipt,
     )
-    stage1 = _clone_identity_stage(stage0, stage_id="stage1_ops_config", stack_track=base_track)
+    stage1, stage1_result, pricing = _evaluate_stage1_ops_config(
+        dossier,
+        stage0,
+        base_resolved=base_resolved,
+        base_track=base_track,
+        stack_track=stack_track,
+        comparison_policy=comparison_policy,
+        primitive_table=primitive_table,
+        pt_digest=pt_digest,
+        mem_receipt=mem_receipt,
+        max_trials=max_trials,
+    )
     stage2, framework_result, pricing = _evaluate_stage2_framework(
         dossier,
         stage1,
+        stage1_result=stage1_result,
+        pricing=pricing,
         base_resolved=base_resolved,
         base_track=base_track,
         stack_track=stack_track,

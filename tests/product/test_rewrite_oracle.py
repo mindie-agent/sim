@@ -22,10 +22,11 @@ from mindie_sim.catalog.types import QuantSpec
 from mindie_sim.compose import compose_case
 from mindie_sim.optimization import (
     EventDagSpec, ResourceChoiceProgram, build_dual_inputs_from_scenario, certify_lower_bound,
-    compute_compulsory_hbm_cut, inward_floor_ns, solve_dsl, solve_framework,
+    inward_floor_ns, solve_framework, solve_unified_regions,
 )
 from mindie_sim.optimization import contracts
-from mindie_sim.optimization.dsl_solver import _catlass_proposals, _dsl_proposals
+from mindie_sim.prediction.runtime.reload_bounds import compute_compulsory_hbm_cut
+from mindie_sim.rewrite.catalog_replay import _catlass_proposals, _dsl_proposals
 from mindie_sim.prediction.efficiency.cost import CostLedger, CostModel
 from mindie_sim.prediction.efficiency.analysis import scale_case_hardware
 from mindie_sim.prediction.evaluation import EvaluationContext, ExecutionBindings
@@ -288,7 +289,7 @@ def test_finalize_binds_certificate_to_prepared_scenario():
     assert other_certificate.l_star_lean_ns > accepted.wall_ns
     rejected = finalize_plan(handle, plan, dual_program=other_program, event_dag=other_dag,
                              dual_certificate=other_certificate)
-    direct = verify_plan(handle.scenario, accepted.applied, wall_ns=accepted.wall_ns,
+    direct = verify_plan(handle.scenario, accepted.applied, step_eval=accepted.step_eval, wall_ns=accepted.wall_ns,
                          dual_program=other_program, event_dag=other_dag, dual_certificate=other_certificate)
     for receipt in (rejected.verification, direct):
         *ordinary, bound = receipt.gates
@@ -362,13 +363,14 @@ def test_catalog_matrix_replay_binds_lowered_obligations(geometry):
     assert cut.read_bytes + cut.write_bytes == summary.dram_sector_bytes
     program, dag, _ = build_dual_inputs_from_scenario(scenario, region_summaries=(summary,))
     certificate, _ = certify_lower_bound(program, dag)
-    receipt = verify_plan(scenario, full.applied, wall_ns=full.wall_ns, region_summaries=(summary,),
-                          dual_program=program, event_dag=dag, dual_certificate=certificate)
+    receipt = verify_plan(scenario, full.applied, step_eval=full.step_eval, baseline_eval=dossier.handle.u_eval,
+                          wall_ns=full.wall_ns, region_summaries=(summary,), dual_program=program,
+                          event_dag=dag, dual_certificate=certificate)
     assert receipt.passed and receipt.l_star_ns == full.verification.l_star_ns
 
 
 def test_constructive_search_replays_catalog_vector_kernel(monkeypatch):
-    problem = AttnResProblem(tokens=1)
+    problem = AttnResProblem(tokens=1, hidden_size=7168)
     width = problem.hidden_size
     op = vector_op(op_id="residual", deps=(), stage=0, layer=0, requests=(), elements=width,
                    ops_per_element=18, vector_ops_override=18 * width + 3 + 2 * ATTN_RES_VL,
@@ -389,7 +391,7 @@ def test_constructive_search_replays_catalog_vector_kernel(monkeypatch):
 
     monkeypatch.setattr(oracle, "evaluate_rewrites", record)
     framework = solve_framework(dossier, max_trials=0)
-    solve_dsl(dossier, framework, max_trials=3)
+    solve_unified_regions(dossier, framework, max_trials=3)
     (plan, candidate), = [(plan, result) for plan, result in screened
                           if any(edit.operation == operation for edit in plan.edits)]
     assert candidate.accepted, tuple(g.detail for g in candidate.verification.gates) if candidate.verification else candidate.reason
@@ -497,7 +499,7 @@ def _pointwise(name, *, deps=(), elements=1, **overrides):
 
 @pytest.mark.parametrize("separate_declaring_ops", (False, True))
 def test_attention_residual_fusion_replays_each_declaration(separate_declaring_ops):
-    problem = AttnResProblem(tokens=1)
+    problem = AttnResProblem(tokens=1, hidden_size=7168)
     width = problem.hidden_size
     head = _pointwise("head", elements=width)
     declaration = dict(dsl_kernel=ATTN_RES, dsl_problem=problem, dsl_members=("head", "tail"))
@@ -551,7 +553,7 @@ def test_indexed_catlass_simt_screens_and_finalizes_on_vector_rate():
     width = 32
     problem = CatlassProblem(1, width, width, "fp16", "fp16", "fp16", indices=(1,), physical_m=2)
     op = gemm_op(op_id="gemm", deps=(), requests=(), stage=0, layer=0, m=problem.m, n=problem.n, k=problem.k,
-                 quant=QuantSpec("fp16"), category="dense", phase="decode",
+                 quant=QuantSpec("fp16", "fp16", "fp16", native_format="fp16"), category="dense", phase="decode",
                  metadata=(("catlass_problem", problem),))
     handle, plan, spec = next(trial for trial in _replay_plans(_catalog_case(), (op,), _catlass_proposals)
                               if trial[2].dispatch_policy == "MatmulGatherScatterSimt")
@@ -904,19 +906,16 @@ def test_oracle_cache_separates_disabled_primitive_table_and_formula_mode_digest
 def test_formula_sram_sizes_internal_atomic_ops_and_rejects_unclipped_l0c_overflow():
     from mindie_sim.optimization import (
         FormulaKernelSpec,
-        TargetOpNode,
         evaluate_formula_kernel,
-        synthesize_kernel_spec,
+        solve_formula_sram,
     )
-    from mindie_sim.prediction.results import OpOccurrence
-    from mindie_sim.rewrite.algebra import classify_op_traits
     from mindie_sim.schema.datapath import datapath_for_die
     from mindie_sim.schema.operators import OpSpec
 
     case = parse_case(compose_case("qwen3-32b", REPRESENTATIVE_SKUS["a3"], tp=1, dp=1, layers=1))
     die = case.machine.dies[0]
 
-    # Counterexample A: 4 -> 4096 -> RMSNorm -> 4 with UB=24 KiB (8 KiB usable after 16 KiB SIMT carveout).
+    # Counterexample A: 4 -> 4096 -> RMSNorm -> 4 with UB=24 KiB (A3 has simt_ub_carveout_bytes=0 -> 24 KiB usable).
     tight_ub_buffers = tuple(("ub", 24 * 1024) if k == "ub" else (k, v) for k, v in die.buffers)
     tight_ub_die = replace(die, buffers=tight_ub_buffers)
     op_up = OpSpec(
@@ -940,8 +939,8 @@ def test_formula_sram_sizes_internal_atomic_ops_and_rejects_unclipped_l0c_overfl
     assert narrow_io_spec.outputs[0].shape == (1, 4)
     res_ub = evaluate_formula_kernel(narrow_io_spec, tight_ub_die)
     assert res_ub.sram_verified is False
-    assert res_ub.ub_budget_bytes == 8 * 1024
-    assert res_ub.ub_peak_bytes >= 16 * 1024
+    assert res_ub.ub_budget_bytes == 24 * 1024
+    assert res_ub.ub_peak_bytes >= 48 * 1024
 
     # Counterexample B: 64 KiB L0C accumulator demand MUST NOT be clipped to a 32 KiB L0C budget.
     tight_l0_buffers = tuple(("l0c", 32 * 1024) if k == "l0c" else (k, v) for k, v in die.buffers)
@@ -952,22 +951,8 @@ def test_formula_sram_sizes_internal_atomic_ops_and_rejects_unclipped_l0c_overfl
     assert res_l0.sram_verified is False
     assert res_l0.l0_budget_bytes == 32 * 1024
     assert res_l0.l0_peak_bytes == 64 * 1024
-
-    occ = OpOccurrence(replica=0, stage=0, rank=0, op_id=op_up.op_id)
-    node_up = TargetOpNode(
-        0, occ, op_up.op_id, "arch0", 1, op_up.family, "gemm", "main", 0, "AIC", op_up.local_shape, "bf16", (),
-        0.0, 10.0, 10.0, 10.0, False, "", op_up.flops, 0.0, op_up.mte2_bytes, op_up.mte3_bytes, op_up.hbm_bytes,
-        op_up.mte2_bytes, op_up.mte3_bytes, 0.0, 0.0, "cube_bound", "Cube", 2.0, 8.0, 5.0, 0.2,
-        ("expand",), ("expand",), "GEMM", "gemm", "CANN", "", False, "", "expand", spec=op_up,
-    )
-    kspec = synthesize_kernel_spec(
-        spec_id="l0_check", kernel_name="l0_check", abi_tier="K2_epilogue", suggested_backend="CANN",
-        status_tag="test", opt_pillar="pillar1_fusion", members=(node_up,),
-        member_traits=(classify_op_traits(op_up),), datapath=tight_l0_dp,
-        elided_hbm_bytes=0, l_star_us=2.0, before_us=10.0, target_us=8.0,
-    )
-    assert kspec.sram_verified is False
-    assert kspec.l0_peak_bytes == 64 * 1024 and kspec.l0_budget_bytes == 32 * 1024
+    _tile_spec, _alg, _tile_str, _ub_p, _ub_b, _l1_p, _l1_b, l0_p, l0_b, _depth, sram_ok = solve_formula_sram(cube_only, tight_l0_dp)
+    assert sram_ok is False and l0_p == 64 * 1024 and l0_b == 32 * 1024
 
 
 def test_formula_dag_preserves_duplicate_operands_order_and_independent_cube_stages():

@@ -336,7 +336,7 @@ def test_v5_five_content_bugs_regression_locks() -> None:
     from mindie_sim.export.bundle import _collapse_micro_split_ops
     from mindie_sim.export.kernel_catalog import resolve_ascend_kernel_identity
     from mindie_sim.export.models import OperatorExportRow
-    from mindie_sim.optimization.kernel_synthesis import _format_dag_equation
+    from mindie_sim.templates.contracts import _format_dag_equation
     from mindie_sim.prediction.results import OpOccurrence
     from mindie_sim.prediction.runtime.exposed_observer import ObservedInterval, _pick_stream0_witness
     from mindie_sim.rewrite.algebra import AlgebraicTrait, OpTraitInfo, _resolve_symbolic_kind
@@ -413,8 +413,16 @@ def test_v5_five_content_bugs_regression_locks() -> None:
         activation_params=(), collective_axis="ep", row_working_bytes=0,
     )
     t_rt = replace(t_mm, op_id="s0.l0.router", symbolic_op_kind=k_rt)
-    eq_mm = _format_dag_equation("s0.l0.moe", (32, 4096), t_mm, ("h",), "y")
-    eq_rt = _format_dag_equation("s0.l0.router", (32, 256), t_rt, ("h",), "w")
+    eq_mm = _format_dag_equation(
+        "s0.l0.moe", (32, 4096), k_mm, ("h",), "y",
+        output_dtype=t_mm.output_dtype, activation_kind=t_mm.activation_kind,
+        activation_params=t_mm.activation_params, group_size=t_mm.group_size or 0,
+        collective_axis=t_mm.collective_axis, op_meta={"ep": 4},
+    )
+    eq_rt = _format_dag_equation(
+        "s0.l0.router", (32, 256), k_rt, ("h",), "w",
+        output_dtype=t_rt.output_dtype,
+    )
     assert "AllToAllDispatch" in eq_mm and "AllToAllCombine" in eq_mm and "ActMxQuant" in eq_mm
     assert "TopK(softmax/sigmoid" in eq_rt and "softplus" not in eq_rt
 

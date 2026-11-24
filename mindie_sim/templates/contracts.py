@@ -978,9 +978,14 @@ def _infer_op_symbolic_kind(op: OpSpec) -> tuple[str, bool, bool, str, tuple[tup
     meta = dict(op.metadata) if op.metadata else {}
     act = str(meta.get("activation") or "").strip().lower()
     act_params_raw = meta.get("activation_params") or ()
-    act_params = tuple((str(k), float(v)) for k, v in (
-        act_params_raw.items() if isinstance(act_params_raw, Mapping) else act_params_raw
-    ))
+    if not act and isinstance(act_params_raw, Mapping):
+        act = str(act_params_raw.get("activation") or "").strip().lower()
+    act_params_iter = act_params_raw.items() if isinstance(act_params_raw, Mapping) else act_params_raw
+    act_params = tuple(
+        (str(k), float(v))
+        for k, v in act_params_iter
+        if isinstance(v, (int, float)) and not isinstance(v, bool)
+    )
     has_flops = bool(op.matrix_flops) or float(op.flops or 0.0) > 0.0
     is_matrix = has_flops or fam in _MATMUL_FAMILIES
     is_row_red = (
@@ -1026,12 +1031,13 @@ def _format_megamoe_equation(
 ) -> str:
     ep = int(meta.get("ep", meta.get("ep_size", 1)) or 1)
     has_ep = ep > 1 or bool(meta.get("all_to_all") or meta.get("ep_dispatch"))
-    comp_dt = str(meta.get("compute_dtype") or meta.get("weight_format") or "bf16")
+    comp_dt = str(meta.get("compute_dtype") or meta.get("weight_format") or meta.get("op_dtype") or "").strip()
     act = act_kind or str(meta.get("activation") or "swiglu")
     has_shared = bool(meta.get("has_shared_expert") or int(meta.get("shared_expert_intermediate", 0) or 0) > 0)
     shared_inter = int(meta.get("shared_expert_intermediate", 0) or 0)
     disp_step = f"h_disp = AllToAllDispatch({prev}, ep={ep})" if has_ep else f"h_disp = LocalTokenPermute({prev})"
-    gmm1 = f"u = GroupedMatMul(h_disp, W_gate_up^T [{comp_dt}])"
+    dt_tag = f" [{comp_dt}]" if comp_dt else ""
+    gmm1 = f"u = GroupedMatMul(h_disp, W_gate_up^T{dt_tag})"
     act_step = f"a, s = ActMxQuant({act}(u{param_txt}))"
     gmm2 = "y_loc = GroupedMatMul(a, W_down^T, scales=s)"
     comb_expr = "AllToAllCombine(y_loc, topk_w)" if has_ep else "LocalWeightedCombine(y_loc, topk_w)"
@@ -1468,6 +1474,17 @@ def _compose_dag_equations_and_ports(
             else:
                 in_syms_list.append(ext_sym[(prod_id, pname, ver)])
         meta = dict(op.metadata) if op.metadata else {}
+        if "compute_dtype" not in meta and "weight_format" not in meta:
+            p_abi = getattr(op, "precision_abi", None)
+            resolved_dt = str(
+                (getattr(p_abi, "compute_dtype", "") if p_abi is not None else "")
+                or (getattr(p_abi, "weight_dtype", "") if p_abi is not None else "")
+                or (op.matrix_flops[0][0] if op.matrix_flops else "")
+                or op.dtype
+                or ""
+            ).strip()
+            if resolved_dt:
+                meta["op_dtype"] = resolved_dt
         equations.append(_format_dag_equation(
             op.op_id, op.local_shape, kind, tuple(in_syms_list), sym_by_id[op.op_id],
             output_dtype=str(meta.get("output_format") or op.dtype),

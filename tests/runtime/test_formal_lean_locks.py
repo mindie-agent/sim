@@ -39,9 +39,12 @@ from mindie_sim.compose import compose_case
 from mindie_sim.optimization import (
     BilinearContractionSpec, DagEdge, EventDagSpec,
     FarkasCertificate, OptimalityCertificate, ResourceChoiceProgram, TensorRangeObligation,
-    build_dual_inputs_from_scenario, build_surplus_coupling_sites, certify_lower_bound, check_farkas_dual,
-    check_optimality_certificate, direct_mac_pebble_reload_bound, eval_checked_path,
-    solve_checked_critical_path, solve_farkas_dual, verify_epoch_trace,
+    build_dual_inputs_from_scenario, certify_lower_bound, check_farkas_dual,
+    check_optimality_certificate, eval_checked_path,
+    solve_checked_critical_path, solve_farkas_dual,
+)
+from mindie_sim.prediction.runtime.reload_bounds import (
+    build_surplus_coupling_sites, direct_mac_pebble_reload_bound, verify_epoch_trace,
 )
 from mindie_sim.prediction.collectives.startup import resolve_collective_startup, validate_steps
 from mindie_sim.prediction.efficiency import extract_hardware_peaks

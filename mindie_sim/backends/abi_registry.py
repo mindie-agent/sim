@@ -340,18 +340,40 @@ def _matches_plain_dtype_tuple(
     return False
 
 
+_ACTIVATION_PORT_ROLES = ("x", "x1", "hidden_states")
+_WEIGHT_PORT_ROLES = ("weight1", "w", "x2", "weight")
+
+
+def _resolve_port_by_roles(
+    operands: tuple[OperandPortSig, ...],
+    roles: tuple[str, ...],
+    fallback_idx: int,
+    *,
+    exclude: OperandPortSig | None = None,
+) -> OperandPortSig | None:
+    """Resolve an operand port by canonical role name, falling back to positional index."""
+    for role in roles:
+        for port in operands:
+            if port is not exclude and port.role.strip().lower() == role:
+                return port
+    if 0 <= fallback_idx < len(operands) and operands[fallback_idx] is not exclude:
+        return operands[fallback_idx]
+    return None
+
+
 def _extract_mkn(query: AbiQueryKey) -> tuple[int, int, int]:
     """Derive ``(M, K, N)`` purely from typed operand/output shapes (zero heuristics)."""
     m_dim, k_dim, n_dim = 0, 0, 0
-    if query.operands:
-        first_shape = query.operands[0].shape
-        if len(first_shape) >= 2:
-            m_dim, k_dim = first_shape[0], first_shape[-1]
-        elif len(first_shape) == 1:
-            k_dim = first_shape[0]
-    if len(query.operands) >= 2 and len(query.operands[1].shape) >= 2:
-        w_port = query.operands[1]
-        n_dim = w_port.shape[-2] if w_port.transposed else w_port.shape[-1]
+    act_port = _resolve_port_by_roles(query.operands, _ACTIVATION_PORT_ROLES, 0)
+    wt_port = _resolve_port_by_roles(query.operands, _WEIGHT_PORT_ROLES, 1, exclude=act_port)
+    if act_port is not None:
+        act_shape = act_port.shape
+        if len(act_shape) >= 2:
+            m_dim, k_dim = act_shape[0], act_shape[-1]
+        elif len(act_shape) == 1:
+            k_dim = act_shape[0]
+    if wt_port is not None and len(wt_port.shape) >= 2:
+        n_dim = wt_port.shape[-2] if wt_port.transposed else wt_port.shape[-1]
     elif query.outputs and query.outputs[0].shape:
         n_dim = query.outputs[0].shape[-1]
     return m_dim, k_dim, n_dim
@@ -532,8 +554,12 @@ def _check_shape_constraints(
     has_fp4 = any(_norm_dtype(o.dtype) in _FP4_DTYPES for o in query.operands)
     if sc.require_even_k_for_fp4 and has_fp4 and k_dim > 0 and (k_dim % _EVEN_DIVISOR) != 0:
         return f"rejected_shape_or_align:fp4_odd_k={k_dim}"
+    wt_port = _resolve_port_by_roles(
+        query.operands, _WEIGHT_PORT_ROLES, 1,
+        exclude=_resolve_port_by_roles(query.operands, _ACTIVATION_PORT_ROLES, 0),
+    )
     if (sc.require_even_n_for_fp4_transb and has_fp4
-            and len(query.operands) >= 2 and query.operands[1].transposed
+            and wt_port is not None and wt_port.transposed
             and n_dim > 0 and (n_dim % _EVEN_DIVISOR) != 0):
         return f"rejected_shape_or_align:fp4_transb_odd_n={n_dim}"
     if sc.require_m_divisible_by_ws and m_dim > 0 and (m_dim % query.world_size) != 0:
@@ -580,9 +606,11 @@ def _check_m10_legality(query: AbiQueryKey) -> str | None:
 
 
 def _query_dtype_summary(query: AbiQueryKey) -> tuple[str, str, str]:
-    act_dtype = query.operands[0].dtype if query.operands else "bf16"
-    wt_dtype = query.operands[1].dtype if len(query.operands) >= 2 else act_dtype
-    quant_mode = query.operands[0].quant_mode if query.operands else "dense"
+    act_port = _resolve_port_by_roles(query.operands, _ACTIVATION_PORT_ROLES, 0)
+    wt_port = _resolve_port_by_roles(query.operands, _WEIGHT_PORT_ROLES, 1, exclude=act_port)
+    act_dtype = act_port.dtype if act_port is not None else "bf16"
+    wt_dtype = wt_port.dtype if wt_port is not None else act_dtype
+    quant_mode = act_port.quant_mode if act_port is not None else "dense"
     return act_dtype, wt_dtype, quant_mode
 
 

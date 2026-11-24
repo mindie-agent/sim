@@ -342,13 +342,28 @@ def _resident_free_headroom_bytes(
         q_tok = max(1, _peak_step_int(getattr(step_request, "tokens", 1), 1)) if step_request is not None else 1
         receipt = mem.resident_memory_receipt(
             phase=str(getattr(step_request, "phase", "decode") or "decode"),
-            sequence_tokens=(ctx + q_tok) if ctx > 0 else None,
+            sequence_tokens=max(1, ctx + q_tok),
             batch_per_dp=seqs,
             query_tokens=q_tok,
         )
         return min((int(d.free_hbm_headroom_bytes) for d in receipt.dies), default=0)
     except (ModelingError, ValueError, ZeroDivisionError):
         return 0
+
+
+def _resolved_mtp_proposal_tokens(case: Case) -> int:
+    """Resolve speculative proposal depth strictly from runtime/execution-policy contract (never batch size)."""
+    meta = dict(getattr(case.runtime, "metadata", ()) or ())
+    for key in ("draft_proposal_tokens", "mtp_proposal_tokens"):
+        val = meta.get(key)
+        if isinstance(val, int) and not isinstance(val, bool) and val > 0:
+            return val
+    exec_policy = meta.get("execution_policy")
+    if isinstance(exec_policy, Mapping):
+        val = exec_policy.get("mtp_proposal_tokens")
+        if isinstance(val, int) and not isinstance(val, bool) and val > 0:
+            return val
+    return 0
 
 
 def _collect_space_time_opportunities(
@@ -361,10 +376,7 @@ def _collect_space_time_opportunities(
     """Build typed ``SpaceTimeTradeoffSpec`` records backed by ``ResidentMemoryReceipt``."""
     out: list[CoDesignOpportunity] = []
     headroom = _resident_free_headroom_bytes(case, step_request, memory_receipt=memory_receipt)
-    meta = dict(getattr(case.runtime, "metadata", ()) or ())
-    k_prop = int(meta.get("draft_proposal_tokens", 0) or 0)
-    if k_prop <= 0 and step_request is not None and step_request.phase == "decode":
-        k_prop = max(0, _peak_step_int(getattr(step_request, "tokens", 1), 1) - 1)
+    k_prop = _resolved_mtp_proposal_tokens(case)
     seqs = _peak_sequences_per_dp(step_request, case)
     plans = tuple(getattr(case.model, "layer_plans", ()) or ())
     linear_plans = [lp for lp in plans if str(getattr(lp, "attention", "")).lower() in _LINEAR_ATTENTION_KINDS]
@@ -460,11 +472,24 @@ def _collect_space_time_opportunities(
     return out
 
 
+def _extract_node_layer(node: Any) -> int | None:
+    spec = getattr(node, "spec", None)
+    lyr = getattr(spec, "layer", None) if spec is not None else getattr(node, "layer", None)
+    if isinstance(lyr, int) and not isinstance(lyr, bool) and lyr >= 0:
+        return lyr
+    op_id = _node_attr_str(node, "op_id")
+    for token in op_id.split("."):
+        if len(token) >= 2 and token[0] == "l" and token[1:].isdigit():
+            return int(token[1:])
+    return None
+
+
 def _collect_cross_hw_offload_opportunities(
     case: Case,
     nodes: Sequence[Any],
     *,
     primitive_table: Any,
+    memory_receipt: Any = None,
 ) -> list[CoDesignOpportunity]:
     """Build ``CrossHwOffloadSpec`` for Engram/PLE Host DDR async H2D prefetch vs hide window."""
     plans = tuple(getattr(case.model, "layer_plans", ()) or ())
@@ -485,31 +510,46 @@ def _collect_cross_hw_offload_opportunities(
         else (min((int(t.layer_id) for t in engram_tables), default=1) if engram_tables else 1)
     )
     hide_us = 0.0
+    engram_starts = [
+        float(s) for n in engram_nodes
+        if isinstance((s := getattr(n, "start_ms", None)), (int, float)) and s > 0.0
+    ]
+    first_engram_start_ms = min(engram_starts) if engram_starts else None
     for node in nodes:
-        spec = getattr(node, "spec", None)
-        lyr = getattr(spec, "layer", None) if spec is not None else getattr(node, "layer", None)
-        if lyr is not None and 0 <= int(lyr) < first_k:
-            hide_us += _node_exposed_us(node) * _node_repeat(node)
-    if hide_us <= 0.0:
-        hide_us = sum(
-            _node_exposed_us(n) * _node_repeat(n)
-            for n in nodes if n not in engram_nodes
-        ) * 0.5
+        if node in engram_nodes:
+            continue
+        lyr = _extract_node_layer(node)
+        if lyr is not None:
+            if 0 <= lyr < first_k:
+                hide_us += _node_exposed_us(node) * _node_repeat(node)
+        elif first_engram_start_ms is not None:
+            end_ms = getattr(node, "end_ms", None)
+            if isinstance(end_ms, (int, float)) and end_ms <= first_engram_start_ms:
+                hide_us += _node_exposed_us(node) * _node_repeat(node)
 
     xfer_bytes = _engram_lookup_h2d_bytes(engram_nodes)
-    freed_hbm = 0
+    table_bytes = 0
     if engram_cfg is not None and callable(getattr(engram_cfg, "table_storage_bytes", None)):
         try:
-            freed_hbm = int(round(float(engram_cfg.table_storage_bytes())))
+            table_bytes = int(round(float(engram_cfg.table_storage_bytes())))
         except (ModelingError, ValueError):
-            freed_hbm = 0
-    if freed_hbm <= 0:
+            table_bytes = 0
+    if table_bytes <= 0:
         for tbl in engram_tables:
             rows = max(1, int(getattr(tbl, "rows", 0) or 1))
             width = max(1, int(getattr(tbl, "width", 0) or case.model.hidden_size))
-            freed_hbm += rows * width * _BF16_ELEMENT_BYTES
-    if freed_hbm <= 0:
-        freed_hbm = max(int(round(xfer_bytes)), len(engram_layers) * max(1, case.model.hidden_size) * _BF16_ELEMENT_BYTES)
+            table_bytes += rows * width * _BF16_ELEMENT_BYTES
+    if table_bytes <= 0:
+        table_bytes = max(int(round(xfer_bytes)), len(engram_layers) * max(1, case.model.hidden_size) * _BF16_ELEMENT_BYTES)
+    already_host_bytes = 0
+    if memory_receipt is not None and getattr(memory_receipt, "dies", None):
+        already_host_bytes = max((int(getattr(d, "host_dram_bytes", 0) or 0) for d in memory_receipt.dies), default=0)
+    else:
+        meta = dict(getattr(case.runtime, "metadata", ()) or ())
+        ep = meta.get("execution_policy")
+        if isinstance(ep, Mapping) and ep.get("engram_cpu_offload") is True:
+            already_host_bytes = table_bytes
+    freed_hbm = max(0, table_bytes - already_host_bytes)
     if xfer_bytes <= 0.0:
         xfer_bytes = float(max(1, len(engram_layers)) * max(1, case.model.hidden_size) * _BF16_ELEMENT_BYTES)
 
@@ -544,17 +584,20 @@ def _dual_tier_from_receipt(
     simt_gain_ms: float | None = None
     simd_gain_ms: float | None = None
     ub_warn: str | None = None
-    for outcome in receipt.outcomes:
-        if outcome.ub_band_diagnostic and ub_warn is None:
-            ub_warn = outcome.ub_band_diagnostic
-        if outcome.tier == "tilelang_simt":
-            if outcome.admitted and outcome.signed_delta_ns is not None:
-                simt_gain_ms = float(outcome.signed_delta_ns) / 1_000_000.0
+    predecessor_ns = int(receipt.predecessor_step_ns)
+    for outcome in receipt.tier_outcomes:
+        if outcome.ub_receipt is not None and outcome.ub_receipt.ub_wall_warning and ub_warn is None:
+            ub_warn = outcome.ub_receipt.ub_wall_warning
+        if outcome.tier_kind == "tilelang_simt":
+            if outcome.admitted and outcome.step_ns is not None:
+                simt_gain_ms = float(predecessor_ns - outcome.step_ns) / 1_000_000.0
             else:
-                simt_gain_ms = 0.0
-        elif outcome.tier in {"tilelang_simd", "ascendc"} and outcome.admitted and outcome.signed_delta_ns is not None:
-            cand = float(outcome.signed_delta_ns) / 1_000_000.0
+                simt_gain_ms = None
+        elif outcome.tier_kind in {"tilelang_simd", "ascendc", "catlass"} and outcome.admitted and outcome.step_ns is not None:
+            cand = float(predecessor_ns - outcome.step_ns) / 1_000_000.0
             simd_gain_ms = cand if simd_gain_ms is None else max(simd_gain_ms, cand)
+    if simt_gain_ms is not None and simd_gain_ms is not None and simt_gain_ms > simd_gain_ms:
+        simd_gain_ms = simt_gain_ms
     return simt_gain_ms, simd_gain_ms, ub_warn
 
 
@@ -583,6 +626,9 @@ class _ReceiptOpView:
     recipe: str
     dtype: str
     exposed_dur_us: float
+    layer: int | None = None
+    start_ms: float = 0.0
+    end_ms: float = 0.0
     repeat_count: int = 1
     flops: float = 0.0
     vector_ops: float = 0.0
@@ -611,12 +657,20 @@ def _nodes_from_step_receipt(step_receipt: EngineStepReceipt) -> tuple[_ReceiptO
         hbm_b = sum(w.amount for w in row.work if w.resource in {"memory", "hbm"} and w.unit == "bytes")
         mte2_b = sum(w.amount for w in row.work if w.resource.startswith("mte2") and w.unit == "bytes")
         mte3_b = sum(w.amount for w in row.work if w.resource.startswith("mte3") and w.unit == "bytes")
+        lyr = None
+        for token in str(occ.op_id).split("."):
+            if len(token) >= 2 and token[0] == "l" and token[1:].isdigit():
+                lyr = int(token[1:])
+                break
         out.append(_ReceiptOpView(
             op_id=occ.op_id,
             family=row.family,
             recipe=row.implementation,
             dtype=row.dtype,
             exposed_dur_us=float(exp_ns) / 1000.0,
+            layer=lyr,
+            start_ms=float(row.start_ms) if row.start_ms is not None else 0.0,
+            end_ms=float(row.end_ms) if row.end_ms is not None else 0.0,
             flops=flops,
             vector_ops=vec_ops,
             hbm_bytes=hbm_b,
@@ -727,5 +781,7 @@ def collect_codesign_opportunities(
 
     opps.extend(tiler_opps)
     opps.extend(_collect_space_time_opportunities(case, eff_nodes, step_request=step_request, memory_receipt=eff_mem))
-    opps.extend(_collect_cross_hw_offload_opportunities(case, eff_nodes, primitive_table=primitive_table))
+    opps.extend(_collect_cross_hw_offload_opportunities(
+        case, eff_nodes, primitive_table=primitive_table, memory_receipt=eff_mem,
+    ))
     return tuple(opps)

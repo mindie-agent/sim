@@ -481,20 +481,65 @@ def _resolve_symbolic_kind(
     return fam or "elementwise"
 
 
+def _abi_weight_group_size(p_abi: Any) -> int:
+    if p_abi is None:
+        return 0
+    wb = getattr(p_abi, "weight_block", None)
+    if isinstance(wb, tuple) and wb:
+        vals = [int(x) for x in wb if isinstance(x, int) and not isinstance(x, bool) and x > 0]
+        if vals:
+            return vals[-1]
+    if isinstance(wb, int) and not isinstance(wb, bool) and wb > 0:
+        return wb
+    return 0
+
+
 def classify_op_traits(op: OpSpec) -> OpTraitInfo:
     """Classify an ``OpSpec`` purely by typed operator family, work, and metadata."""
     fam = str(op.family or "").strip().lower()
     rec = str(op.recipe or "").strip().lower()
     meta = dict(op.metadata) if op.metadata else {}
+    p_abi = getattr(op, "precision_abi", None)
 
-    in_dt = str(meta.get("activation_format") or meta.get("input_format") or op.dtype or "").strip().lower()
-    out_dt = str(meta.get("output_format") or op.dtype or "").strip().lower()
-    if not in_dt or not out_dt:
-        raise ModelingError(f"algebra_missing_op_dtype:{op.op_id}")
-    w_dt = str(meta.get("weight_format") or meta.get("weight_dtype") or op.dtype or "").strip().lower()
-    raw_gs = meta.get("activation_group_size", meta.get("quant_group_size"))
+    in_dt = str(
+        (getattr(p_abi, "input_dtype", "") if p_abi is not None else "")
+        or meta.get("activation_format")
+        or meta.get("input_format")
+        or meta.get("comm_dtype")
+        or op.dtype
+        or ""
+    ).strip().lower()
+    out_dt = str(
+        (getattr(p_abi, "output_dtype", "") if p_abi is not None else "")
+        or meta.get("output_format")
+        or meta.get("comm_dtype")
+        or op.dtype
+        or ""
+    ).strip().lower()
+    w_dt = str(
+        (getattr(p_abi, "weight_dtype", "") if p_abi is not None else "")
+        or meta.get("weight_format")
+        or meta.get("weight_dtype")
+        or op.dtype
+        or ""
+    ).strip().lower()
+    abi_gs = (
+        (getattr(p_abi, "act_group_size", 0) or _abi_weight_group_size(p_abi))
+        if p_abi is not None else 0
+    )
+    raw_gs = abi_gs if (isinstance(abi_gs, int) and not isinstance(abi_gs, bool) and abi_gs > 0) else meta.get(
+        "activation_group_size", meta.get("quant_group_size")
+    )
     group_size = int(raw_gs) if isinstance(raw_gs, int) and not isinstance(raw_gs, bool) and raw_gs > 0 else None
-    scale_fmt = str(meta.get("activation_scale_format") or meta.get("quant_scale_dtype") or "").strip().lower()
+    scale_fmt = str(
+        (
+            (getattr(p_abi, "act_scale_dtype", "") or getattr(p_abi, "weight_scale_dtype", ""))
+            if p_abi is not None else ""
+        )
+        or meta.get("activation_scale_format")
+        or meta.get("quant_scale_dtype")
+        or ""
+    ).strip().lower()
     act_kind = _infer_activation_kind(fam, rec, meta)
     act_params = _extract_activation_params(meta)
     col_axis = str(meta.get("group_axis") or "").strip().lower()
@@ -508,12 +553,22 @@ def classify_op_traits(op: OpSpec) -> OpTraitInfo:
     trait, col_op, is_nonlin, red_axis = _resolve_primary_trait(
         op, fam, rec, act_kind, is_stateful=is_stateful, is_opaque=is_opaque,
     )
-    row_bytes = _estimate_row_working_bytes(
-        op.local_shape,
-        in_dt,
-        out_dt,
-        is_reduction=(trait == AlgebraicTrait.ROW_REDUCTION),
-        is_vector_compute=(trait in {AlgebraicTrait.POINTWISE, AlgebraicTrait.ROW_REDUCTION}),
+    if (not in_dt or not out_dt) and not is_opaque and trait not in {
+        AlgebraicTrait.ASSOCIATIVE_COLLECTIVE,
+        AlgebraicTrait.CONTROL_BARRIER,
+        AlgebraicTrait.VIEW_METADATA,
+    }:
+        raise ModelingError(f"algebra_missing_op_dtype:{op.op_id}")
+    row_bytes = (
+        _estimate_row_working_bytes(
+            op.local_shape,
+            in_dt,
+            out_dt,
+            is_reduction=(trait == AlgebraicTrait.ROW_REDUCTION),
+            is_vector_compute=(trait in {AlgebraicTrait.POINTWISE, AlgebraicTrait.ROW_REDUCTION}),
+        )
+        if (in_dt and out_dt)
+        else 0
     )
     sym_kind = _resolve_symbolic_kind(fam, rec, meta, trait, act_kind)
     is_grouped = fam in {"grouped_gemm", "grouped_matmul", "grouped_moe"} or "grouped" in rec
@@ -641,9 +696,14 @@ def _simultaneous_ub_buffers(
             if p_idx is None or c_idx <= p_idx + 1:
                 continue
             p_op = members[p_idx]
-            edge_b = _estimate_row_working_bytes(
-                p_op.local_shape, traits[dep].output_dtype, traits[dep].output_dtype,
-                is_reduction=False, is_vector_compute=False,
+            p_dt = traits[dep].output_dtype
+            edge_b = (
+                _estimate_row_working_bytes(
+                    p_op.local_shape, p_dt, p_dt,
+                    is_reduction=False, is_vector_compute=False,
+                )
+                if p_dt
+                else 0
             )
             if edge_b > 0:
                 buffers.append(LiveBufferSpec(
@@ -678,7 +738,7 @@ def _check_ub_chain_fits(
 
 def _output_shape_bytes(op: OpSpec, tr: OpTraitInfo) -> float:
     """Return logical output tensor bytes for ``op`` (``(M, N)`` for 3D MatMul)."""
-    if not op.local_shape:
+    if not op.local_shape or not tr.output_dtype:
         return 0.0
     if tr.trait == AlgebraicTrait.BILINEAR_MATMUL and len(op.local_shape) == MATMUL_SHAPE_RANK:
         elems = int(op.local_shape[0]) * int(op.local_shape[1])
@@ -1009,6 +1069,86 @@ def _resolve_model_scope(ops: Sequence[OpSpec]) -> Literal["target", "draft"]:
     return "target"
 
 
+def _build_mla_prolog_ports(
+    ordered_m: Sequence[OpSpec],
+    role_of: Mapping[str, str],
+    traits: Mapping[str, OpTraitInfo],
+    *,
+    soc_arch: SocArch | None,
+    rope_dim: int,
+) -> tuple[str, tuple[OperandPortSig, ...], tuple[OperandPortSig, ...]]:
+    """Build independent per-projection MLA prolog operand and output port signatures."""
+    entry_op = next((op for op in ordered_m if role_of[op.op_id] in {"qkv_a", "q_a"}), ordered_m[0])
+    tr = traits[entry_op.op_id]
+    by_role: dict[str, OpSpec] = {}
+    for op_m in ordered_m:
+        r_name = role_of.get(op_m.op_id, "")
+        if r_name and r_name not in by_role:
+            by_role[r_name] = op_m
+    m_dim = int(entry_op.local_shape[0]) if entry_op.local_shape else 1
+    h_dim = int(entry_op.local_shape[-1]) if len(entry_op.local_shape) >= 2 else max(1, m_dim)
+
+    def _weight_port(port_name: str, role_keys: tuple[str, ...]) -> OperandPortSig:
+        src_op = next((by_role[rk] for rk in role_keys if rk in by_role), entry_op)
+        src_tr = traits[src_op.op_id]
+        dt = _norm_abi_dtype(src_tr.weight_dtype)
+        p_abi = getattr(src_op, "precision_abi", None)
+        w_gs = _abi_weight_group_size(p_abi)
+        gs = w_gs if w_gs > 0 else src_tr.group_size
+        sf = (
+            str(p_abi.weight_scale_dtype or "").strip().lower()
+            if p_abi is not None and getattr(p_abi, "weight_scale_dtype", "")
+            else src_tr.scale_format
+        )
+        q_mode, g_sh, s_dt = _quant_contract_for_port(dt, sf, gs, is_weight=True)
+        sh = (
+            (int(src_op.local_shape[2]), int(src_op.local_shape[1]))
+            if len(src_op.local_shape) == MATMUL_SHAPE_RANK else (h_dim, h_dim)
+        )
+        return _port(port_name, dt, sh, layout="FRACTAL_NZ", quant_mode=q_mode, group_shape=g_sh, scale_dtype=s_dt)
+
+    w_dq = _weight_port("weight_dq", ("q_a", "qkv_a"))
+    w_uq_qr = _weight_port("weight_uq_qr", ("q_b",))
+    w_uk = _weight_port("weight_uk", ("q_absorb",))
+    w_dkv_kr = _weight_port("weight_dkv_kr", ("kv_a", "qkv_a"))
+    w_dt = w_dq.dtype
+    in_dt = _norm_abi_dtype(tr.input_dtype)
+    iq, ig, is_dt = _quant_contract_for_port(in_dt, tr.scale_format, tr.group_size, is_weight=False)
+    token_dt = "bf16" if w_dt == "fp8_e4m3fn" else in_dt
+    tok_q, tok_g, tok_s = ("dense", (), "none") if token_dt == "bf16" else (iq, ig, is_dt)
+    all_w_dts = {w_dq.dtype, w_uq_qr.dtype, w_uk.dtype, w_dkv_kr.dtype}
+    abi_id = (
+        "aclnnMlaPrologV4WeightNz"
+        if (soc_arch == "A5" and "fp8_e4m3fn" in all_w_dts)
+        else "aclnnMlaPrologV3WeightNz"
+    )
+    q_norm_op = by_role.get("q_norm")
+    kv_norm_op = by_role.get("kv_norm")
+    kv_store_op = by_role.get("kv_store")
+    q_gamma_dt = _norm_abi_dtype(traits[q_norm_op.op_id].weight_dtype) if q_norm_op is not None else "bf16"
+    kv_gamma_dt = _norm_abi_dtype(traits[kv_norm_op.op_id].weight_dtype) if kv_norm_op is not None else "bf16"
+    kv_cache_dt = _norm_abi_dtype(traits[kv_store_op.op_id].output_dtype) if kv_store_op is not None else "bf16"
+    q_norm_out_dt = "fp8_e4m3fn" if w_dt == "fp8_e4m3fn" else ("int8" if w_dt == "int8" else "bf16")
+    q_norm_scale_dt = "fp8_e8m0" if w_dt == "fp8_e4m3fn" else "fp32"
+    operands = (
+        _port("token_x", token_dt, (m_dim, h_dim), quant_mode=tok_q, group_shape=tok_g, scale_dtype=tok_s),
+        w_dq, w_uq_qr, w_uk, w_dkv_kr,
+        _port("rmsnorm_gamma_cq", q_gamma_dt, _MLA_PROLOG_GAMMA_SHAPE),
+        _port("rmsnorm_gamma_ckv", kv_gamma_dt, _MLA_PROLOG_GAMMA_SHAPE),
+        _port("rope_sin", "bf16", _MLA_PROLOG_ROPE_SHAPE),
+        _port("rope_cos", "bf16", _MLA_PROLOG_ROPE_SHAPE),
+        _port("kv_cache_ref", kv_cache_dt, (m_dim, h_dim)),
+        _port("kr_cache_ref", "bf16", (m_dim, rope_dim)),
+    )
+    outputs = (
+        _port("query_out", "bf16", (m_dim, h_dim)),
+        _port("query_rope_out", "bf16", (m_dim, rope_dim)),
+        _port("query_norm_out", q_norm_out_dt, (m_dim, h_dim)),
+        _port("dequant_scale_q_norm_out", q_norm_scale_dt, (m_dim, 1)),
+    )
+    return abi_id, operands, outputs
+
+
 def _match_law4_mla_prolog(
     ordered: Sequence[OpSpec],
     traits: Mapping[str, OpTraitInfo],
@@ -1029,21 +1169,43 @@ def _match_law4_mla_prolog(
         return []
     by_id = {op.op_id: op for op in ordered}
     role_of = {op.op_id: _typed_mla_role(op) for op in ordered}
+    domain_ops: dict[tuple[Any, ...], list[OpSpec]] = defaultdict(list)
     by_domain: dict[tuple[Any, ...], list[OpSpec]] = defaultdict(list)
     for op in ordered:
-        if op.op_id in claimed or not role_of[op.op_id]:
+        if op.op_id in claimed:
             continue
         scope = str(dict(op.metadata).get("model_scope") or "target").strip().lower()
-        by_domain[(op.stage, op.phase, op.stream or "main", op.layer, scope)].append(op)
+        dom = (op.stage, op.phase, op.stream or "main", op.layer, scope)
+        domain_ops[dom].append(op)
+        if role_of[op.op_id]:
+            by_domain[dom].append(op)
 
+    _interior_mla_fams = frozenset({
+        "rmsnorm", "rotary", "cache_store", "kv_cache_write", "kv_compress_epilog",
+    })
     found: list[AlgebraicCandidate] = []
-    for members in by_domain.values():
-        roles = {role_of[op.op_id] for op in members}
+    for dom, members in by_domain.items():
+        m_ids = {op.op_id for op in members}
+        # Include intervening rmsnorm/rotary/kv_store ops in the same domain fed by MLA anchors.
+        changed = True
+        while changed:
+            changed = False
+            for cand in domain_ops[dom]:
+                if cand.op_id in m_ids:
+                    continue
+                cfam = str(cand.family or "").strip().lower()
+                if cfam in _interior_mla_fams and any(dep in m_ids for dep in cand.deps):
+                    m_ids.add(cand.op_id)
+                    if not role_of[cand.op_id]:
+                        role_of[cand.op_id] = "rotary" if cfam == "rotary" else (
+                            "kv_store" if cfam in {"cache_store", "kv_cache_write", "kv_compress_epilog"} else "q_norm"
+                        )
+                    changed = True
+        roles = {role_of[oid] for oid in m_ids}
         has_entry = "qkv_a" in roles or ({"q_a", "kv_a"} <= roles)
         has_tail = bool({"q_b", "q_absorb", "rotary", "kv_store"} & roles)
-        if not has_entry or not has_tail or len(members) < MIN_MLA_PROLOG_MEMBERS:
+        if not has_entry or not has_tail or len(m_ids) < MIN_MLA_PROLOG_MEMBERS:
             continue
-        m_ids = {op.op_id for op in members}
         if not _convex(ordered, m_ids):
             continue
         ordered_m = [op for op in ordered if op.op_id in m_ids]
@@ -1056,37 +1218,8 @@ def _match_law4_mla_prolog(
             continue
         if any(bool(m.get("sfa_c8_w4a8_bypass")) for m in metas):
             continue
-        entry_op = next((op for op in ordered_m if role_of[op.op_id] in {"qkv_a", "q_a"}), ordered_m[0])
-        tr = traits[entry_op.op_id]
-        m_dim = int(entry_op.local_shape[0]) if entry_op.local_shape else 1
-        h_dim = int(entry_op.local_shape[-1]) if len(entry_op.local_shape) >= 2 else max(1, m_dim)
-        w_dt = _norm_abi_dtype(tr.weight_dtype)
-        in_dt = _norm_abi_dtype(tr.input_dtype)
-        wq, wg, ws = _quant_contract_for_port(w_dt, tr.scale_format, tr.group_size, is_weight=True)
-        iq, ig, is_dt = _quant_contract_for_port(in_dt, tr.scale_format, tr.group_size, is_weight=False)
-        token_dt = "bf16" if w_dt == "fp8_e4m3fn" else in_dt
-        tok_q, tok_g, tok_s = ("dense", (), "none") if token_dt == "bf16" else (iq, ig, is_dt)
-        abi_id = "aclnnMlaPrologV4WeightNz" if (soc_arch == "A5" and w_dt == "fp8_e4m3fn") else "aclnnMlaPrologV3WeightNz"
-        q_norm_out_dt = "fp8_e4m3fn" if w_dt == "fp8_e4m3fn" else ("int8" if w_dt == "int8" else "bf16")
-        q_norm_scale_dt = "fp8_e8m0" if w_dt == "fp8_e4m3fn" else "fp32"
-        operands = (
-            _port("token_x", token_dt, (m_dim, h_dim), quant_mode=tok_q, group_shape=tok_g, scale_dtype=tok_s),
-            _port("weight_dq", w_dt, (h_dim, h_dim), layout="FRACTAL_NZ", quant_mode=wq, group_shape=wg, scale_dtype=ws),
-            _port("weight_uq_qr", w_dt, (h_dim, h_dim), layout="FRACTAL_NZ", quant_mode=wq, group_shape=wg, scale_dtype=ws),
-            _port("weight_uk", w_dt, (h_dim, h_dim), layout="FRACTAL_NZ", quant_mode=wq, group_shape=wg, scale_dtype=ws),
-            _port("weight_dkv_kr", w_dt, (h_dim, h_dim), layout="FRACTAL_NZ", quant_mode=wq, group_shape=wg, scale_dtype=ws),
-            _port("rmsnorm_gamma_cq", "bf16", _MLA_PROLOG_GAMMA_SHAPE),
-            _port("rmsnorm_gamma_ckv", "bf16", _MLA_PROLOG_GAMMA_SHAPE),
-            _port("rope_sin", "bf16", _MLA_PROLOG_ROPE_SHAPE),
-            _port("rope_cos", "bf16", _MLA_PROLOG_ROPE_SHAPE),
-            _port("kv_cache_ref", "bf16", (m_dim, h_dim)),
-            _port("kr_cache_ref", "bf16", (m_dim, rope_dim)),
-        )
-        outputs = (
-            _port("query_out", "bf16", (m_dim, h_dim)),
-            _port("query_rope_out", "bf16", (m_dim, rope_dim)),
-            _port("query_norm_out", q_norm_out_dt, (m_dim, h_dim)),
-            _port("dequant_scale_q_norm_out", q_norm_scale_dt, (m_dim, 1)),
+        abi_id, operands, outputs = _build_mla_prolog_ports(
+            ordered_m, role_of, traits, soc_arch=soc_arch, rope_dim=rope_dim,
         )
         verdict: AbiSupportVerdict | None = None
         q_digest = ""
@@ -1152,8 +1285,20 @@ def _build_mc2_gemm_verdict(
     iq, ig, is_dt = _quant_contract_for_port(in_dt, tr_mm.scale_format, tr_mm.group_size, is_weight=False)
     wq, wg, ws_dt = _quant_contract_for_port(w_dt, tr_mm.scale_format, tr_mm.group_size, is_weight=True)
     w_layout: OperandLayout = "FRACTAL_NZ" if w_dt in _ALLOWED_QUANT_FORMATS else "ND"
-    x1_m = max(0, m_dim // ws) if (is_agmm and m_dim > 0 and m_dim % ws == 0) else m_dim
-    out_m = x1_m * ws if is_agmm else (m_dim // ws)
+    comm_m = int(comm_op.local_shape[0]) if comm_op.local_shape else 0
+    if is_agmm:
+        if comm_m > 0:
+            x1_m = comm_m
+            out_m = m_dim
+        elif m_dim > 0 and m_dim % ws == 0:
+            x1_m = m_dim // ws
+            out_m = m_dim
+        else:
+            x1_m = m_dim
+            out_m = m_dim
+    else:
+        x1_m = m_dim
+        out_m = comm_m if comm_m > 0 else (m_dim // ws if m_dim % ws == 0 else m_dim)
     operands = (
         _port("x1", in_dt, (x1_m, k_dim), layout="ND", quant_mode=iq, group_shape=ig, scale_dtype=is_dt),
         _port("x2", w_dt, (k_dim, n_dim), layout=w_layout, quant_mode=wq, group_shape=wg, scale_dtype=ws_dt),
@@ -1163,6 +1308,8 @@ def _build_mc2_gemm_verdict(
     placement = _resolve_placement(soc_arch, ws, meta)
     axis = str(meta.get("group_axis") or tr_mm.collective_axis or "tp").strip().lower() or "tp"
     has_bias = bool(dict(mm_op.metadata).get("has_bias", False))
+    raw_comm_dt = str(meta.get("comm_dtype") or comm_op.dtype or "").strip()
+    comm_dt = _norm_abi_dtype(raw_comm_dt) if raw_comm_dt else (in_dt if is_agmm else out_dt)
     return _verify_abi_query(
         abi_id=abi_id, soc_arch=soc_arch, sku_id=sku_id,
         graph_motif="all_gather_matmul" if is_agmm else "matmul_reduce_scatter",
@@ -1170,7 +1317,7 @@ def _build_mc2_gemm_verdict(
         manifest_bindings=manifest_bindings, enabled_stack_passes=enabled_stack_passes,
         registry=registry, model_scope=_resolve_model_scope((comm_op, mm_op)),
         rank_placement=placement, world_size=ws, comm_group_id=axis,
-        comm_dtype=in_dt if is_agmm else out_dt,
+        comm_dtype=comm_dt,
         reduction_kind="concat" if is_agmm else "sum",
         has_bias=has_bias,
     )
@@ -1308,16 +1455,12 @@ def _splitv_unabsorbed_bytes(
     traits: Mapping[str, OpTraitInfo],
     succ: Mapping[str, list[str]],
 ) -> int:
-    """Exact read+write HBM traffic for consumers that require materialized contiguous SplitV slices."""
-    total = 0.0
-    for sib in siblings:
-        users = [by_id[u] for u in succ.get(sib.op_id, ()) if u in by_id]
-        if not users:
-            continue
-        if all(_consumer_accepts_strided_view(u) for u in users):
-            continue
-        total += 2.0 * _output_shape_bytes(sib, traits[sib.op_id])
-    return int(round(total))
+    """Delegate SplitV materialization traffic to the single canonical ``apply._unabsorbed_splitv_cost``."""
+    from .apply import _unabsorbed_splitv_cost
+
+    del traits, succ
+    splitv_hbm, _ = _unabsorbed_splitv_cost(siblings, by_id)
+    return int(round(splitv_hbm))
 
 
 def _verify_law2a_matmul_abi(
@@ -1334,9 +1477,10 @@ def _verify_law2a_matmul_abi(
 ) -> tuple[str, AbiSupportVerdict | None, str]:
     first = siblings[0]
     tr = traits[first.op_id]
-    in_dt = _norm_abi_dtype(tr.input_dtype)
-    w_dt = _norm_abi_dtype(tr.weight_dtype)
-    out_dt = _norm_abi_dtype(tr.output_dtype)
+    p_abi = getattr(first, "precision_abi", None)
+    in_dt = _norm_abi_dtype(getattr(p_abi, "input_dtype", "") if p_abi is not None and getattr(p_abi, "input_dtype", "") else tr.input_dtype)
+    w_dt = _norm_abi_dtype(getattr(p_abi, "weight_dtype", "") if p_abi is not None and getattr(p_abi, "weight_dtype", "") else tr.weight_dtype)
+    out_dt = _norm_abi_dtype(getattr(p_abi, "output_dtype", "") if p_abi is not None and getattr(p_abi, "output_dtype", "") else tr.output_dtype)
     is_quant = in_dt in _ALLOWED_QUANT_FORMATS or w_dt in _ALLOWED_QUANT_FORMATS
     abi_id = "aclnnQuantMatmulV4" if is_quant else "aclnnMatmul"
     if soc_arch is None or len(first.local_shape) != MATMUL_SHAPE_RANK:
@@ -1344,9 +1488,15 @@ def _verify_law2a_matmul_abi(
     m_dim = int(first.local_shape[0])
     k_dim = int(first.local_shape[2])
     n_sum = sum(int(s.local_shape[1]) for s in siblings if len(s.local_shape) == MATMUL_SHAPE_RANK)
-    iq, ig, is_dt = _quant_contract_for_port(in_dt, tr.scale_format, tr.group_size, is_weight=False)
-    wq, wg, ws_dt = _quant_contract_for_port(w_dt, tr.scale_format, tr.group_size, is_weight=True)
-    w_layout: OperandLayout = "FRACTAL_NZ" if is_quant else "ND"
+    act_gs = int(p_abi.act_group_size) if p_abi is not None and getattr(p_abi, "act_group_size", 0) > 0 else tr.group_size
+    act_sf = str(p_abi.act_scale_dtype or "").strip().lower() if p_abi is not None and getattr(p_abi, "act_scale_dtype", "") else tr.scale_format
+    abi_wgs = _abi_weight_group_size(p_abi)
+    wt_gs = abi_wgs if abi_wgs > 0 else tr.group_size
+    wt_sf = str(p_abi.weight_scale_dtype or "").strip().lower() if p_abi is not None and getattr(p_abi, "weight_scale_dtype", "") else tr.scale_format
+    iq, ig, is_dt = _quant_contract_for_port(in_dt, act_sf, act_gs, is_weight=False)
+    wq, wg, ws_dt = _quant_contract_for_port(w_dt, wt_sf, wt_gs, is_weight=True)
+    raw_wl = str(getattr(p_abi, "weight_layout", "") if p_abi is not None else "").strip().upper()
+    w_layout: OperandLayout = "FRACTAL_NZ" if (raw_wl == "FRACTAL_NZ" or is_quant) else "ND"
     operands = (
         _port("x1", in_dt, (m_dim, k_dim), layout="ND", quant_mode=iq, group_shape=ig, scale_dtype=is_dt),
         _port("x2", w_dt, (k_dim, n_sum), layout=w_layout, quant_mode=wq, group_shape=wg, scale_dtype=ws_dt),
@@ -1395,6 +1545,11 @@ def _discover_law2b_matmul_epilogue(
             nxt = by_id[nxt_ids[0]]
             nxt_tr = traits[nxt.op_id]
             if not nxt_tr.is_micro_epilogue_eligible or not _same_domain(op, nxt):
+                break
+            if (
+                nxt_tr.trait == AlgebraicTrait.ROW_REDUCTION
+                and nxt_tr.symbolic_op_kind not in {"dynamic_quant", "dynamic_mx_quant"}
+            ):
                 break
             if ep_chain:
                 is_view = str(nxt.family or "").strip().lower() in _ZERO_COPY_VIEW_FAMILIES
@@ -1448,6 +1603,7 @@ def _discover_law2_block_matmul(
     soc_arch: SocArch | None = None,
     sku_id: str = "",
     pr_track: StackTrack = "shipping",
+    epilogue_track: StackTrack | None = None,
     track_spec: StackTrackSpec | None = None,
     manifest_bindings: tuple[ManifestBinding, ...] = (),
     enabled_stack_passes: frozenset[str] = DEFAULT_SHIPPING_STACK_PASSES,
@@ -1459,6 +1615,7 @@ def _discover_law2_block_matmul(
         return [], []
     by_id = {op.op_id: op for op in ordered}
     buckets: dict[Any, list[OpSpec]] = defaultdict(list)
+    coarse_buckets: dict[Any, list[tuple[OpSpec, Any]]] = defaultdict(list)
     rejected: list[tuple[str, str]] = []
     for op in ordered:
         if op.op_id in claimed:
@@ -1470,6 +1627,14 @@ def _discover_law2_block_matmul(
         if key is None:
             continue
         buckets[key].append(op)
+        coarse_buckets[(key[0], key[1], key[2], key[-1])].append((op, key))
+
+    for coarse_entries in coarse_buckets.values():
+        if len({entry_key for _, entry_key in coarse_entries}) >= MIN_FUSE_MEMBERS:
+            rejected.append((
+                ",".join(entry_op.op_id for entry_op, _ in coarse_entries),
+                "quant_or_sharding_contract_mismatch",
+            ))
 
     found: list[AlgebraicCandidate] = []
     for group in buckets.values():
@@ -1495,7 +1660,7 @@ def _discover_law2_block_matmul(
         avoid = _law2_avoidable_read_bytes(independent, traits)
         splitv_cost = _splitv_unabsorbed_bytes(independent, by_id, traits, succ)
         if splitv_cost > 0 and splitv_cost >= avoid:
-            rejected.append((",".join(op.op_id for op in independent), "law2_unabsorbed_splitv_exceeds_saving"))
+            rejected.append((",".join(op.op_id for op in independent), "splitv_unabsorbed_cost_exceeds_activation_savings"))
             continue
         abi_id, verdict, q_digest = _verify_law2a_matmul_abi(
             independent, traits, soc_arch=soc_arch, sku_id=sku_id, pr_track=pr_track,
@@ -1527,7 +1692,9 @@ def _discover_law2_block_matmul(
         ))
     found.extend(_discover_law2b_matmul_epilogue(
         ordered, by_id, traits, claimed, succ, datapath,
-        soc_arch=soc_arch, pr_track=pr_track, include_abi_extensions=include_abi_extensions,
+        soc_arch=soc_arch,
+        pr_track=epilogue_track if epilogue_track is not None else pr_track,
+        include_abi_extensions=include_abi_extensions,
     ))
     return found, rejected
 
@@ -1655,11 +1822,15 @@ def _verify_moe_frame_abi(
     registry: ProbedAbiRegistry | None,
 ) -> tuple[str, AbiSupportVerdict | None, str]:
     tr1 = traits[gmm1.op_id]
+    tr2 = traits[gmm2.op_id]
     act_norm = _norm_moe_activation(traits[act_op.op_id].activation_kind or act_op.family)
-    w_dt = _norm_abi_dtype(tr1.weight_dtype)
+    w1_dt = _norm_abi_dtype(tr1.weight_dtype)
+    w2_dt = _norm_abi_dtype(tr2.weight_dtype)
+    in_dt = _norm_abi_dtype(tr1.input_dtype) if tr1.input_dtype else "bf16"
+    out_dt = _norm_abi_dtype(tr2.output_dtype) if tr2.output_dtype else "bf16"
     use_csrc = (
         soc_arch == "A3"
-        and (enable_fused_mc2 == 1 or (enable_fused_mc2 is None and w_dt in {"int8", "int4"}))
+        and (enable_fused_mc2 == 1 or (enable_fused_mc2 is None and w1_dt in {"int8", "int4"} and w2_dt in {"int8", "int4"}))
     )
     abi_id = "dispatch_ffn_combine" if use_csrc else "aclnnMegaMoe"
     if soc_arch is None:
@@ -1672,40 +1843,45 @@ def _verify_moe_frame_abi(
         gmm1.local_shape[-1] if gmm1.local_shape else 0
     )
     inter_dim = int(gmm1.local_shape[1]) if len(gmm1.local_shape) == MATMUL_SHAPE_RANK else 0
-    wq, wg, ws_dt = _quant_contract_for_port(w_dt, tr1.scale_format, tr1.group_size, is_weight=True)
+    g2_k = int(gmm2.local_shape[2]) if len(gmm2.local_shape) == MATMUL_SHAPE_RANK else inter_dim
+    g2_n = int(gmm2.local_shape[1]) if len(gmm2.local_shape) == MATMUL_SHAPE_RANK else h_dim
+    wq1, wg1, ws1_dt = _quant_contract_for_port(w1_dt, tr1.scale_format, tr1.group_size, is_weight=True)
+    wq2, wg2, ws2_dt = _quant_contract_for_port(w2_dt, tr2.scale_format, tr2.group_size, is_weight=True)
     if abi_id == "dispatch_ffn_combine":
         base_ops = [
-            _port("x", "bf16", (m_dim, h_dim)),
-            _port("weight1", w_dt, (h_dim, inter_dim), layout="FRACTAL_NZ", quant_mode=wq, group_shape=wg, scale_dtype=ws_dt),
-            _port("weight2", w_dt, (inter_dim, h_dim), layout="FRACTAL_NZ", quant_mode=wq, group_shape=wg, scale_dtype=ws_dt),
+            _port("x", in_dt, (m_dim, h_dim)),
+            _port("weight1", w1_dt, (h_dim, inter_dim), layout="FRACTAL_NZ", quant_mode=wq1, group_shape=wg1, scale_dtype=ws1_dt),
+            _port("weight2", w2_dt, (g2_k, g2_n), layout="FRACTAL_NZ", quant_mode=wq2, group_shape=wg2, scale_dtype=ws2_dt),
             _port("expert_idx", "int32", (m_dim, 1), quant_mode="none"),
             _port("scale1", "fp32", (1,)),
             _port("scale2", "fp32", (1,)),
         ]
-        if w_dt == "int4":
+        if w1_dt == "int4" or w2_dt == "int4":
             base_ops.extend((_port("bias1", "fp32", (1,)), _port("bias2", "fp32", (1,))))
         base_ops.append(_port("probs", "fp32", (m_dim, 1)))
         operands = tuple(base_ops)
-        outputs = (_port("out", "bf16", (m_dim, h_dim)), _port("expert_token_nums", "int64", (1,)))
+        outputs = (_port("out", out_dt, (m_dim, g2_n)), _port("expert_token_nums", "int64", (1,)))
     else:
         operands = (
             _port("context", "int8", _MEGAMOE_CONTEXT_BYTES_SHAPE, quant_mode="none"),
-            _port("x", "bf16", (m_dim, h_dim)),
+            _port("x", in_dt, (m_dim, h_dim)),
             _port("topk_ids", "int32", (m_dim, 1), quant_mode="none"),
             _port("topk_weights", "fp32", (m_dim, 1)),
-            _port("weight1", w_dt, (h_dim, inter_dim), layout="FRACTAL_NZ", quant_mode=wq, group_shape=wg, scale_dtype=ws_dt),
-            _port("weight2", w_dt, (inter_dim, h_dim), layout="FRACTAL_NZ", quant_mode=wq, group_shape=wg, scale_dtype=ws_dt),
+            _port("weight1", w1_dt, (h_dim, inter_dim), layout="FRACTAL_NZ", quant_mode=wq1, group_shape=wg1, scale_dtype=ws1_dt),
+            _port("weight2", w2_dt, (g2_k, g2_n), layout="FRACTAL_NZ", quant_mode=wq2, group_shape=wg2, scale_dtype=ws2_dt),
         )
-        outputs = (_port("y", "bf16", (m_dim, h_dim)), _port("expert_token_nums", "int64", (1,)))
+        outputs = (_port("y", out_dt, (m_dim, g2_n)), _port("expert_token_nums", "int64", (1,)))
     top_k = int(meta_disp.get("top_k") or dict(gmm1.metadata).get("top_k") or 0)
     shared = int(meta_disp.get("shared_experts_per_rank") or 0)
+    comm_dt_raw = str(meta_disp.get("comm_dtype") or dispatch_op.dtype or "").strip()
+    comm_dt = _norm_abi_dtype(comm_dt_raw) if comm_dt_raw else in_dt
     verdict, q_digest = _verify_abi_query(
         abi_id=abi_id, soc_arch=soc_arch, sku_id=sku_id, graph_motif="moe_mc2_frame",
         operands=operands, outputs=outputs, pr_track=pr_track, track_spec=track_spec,
         manifest_bindings=manifest_bindings, enabled_stack_passes=enabled_stack_passes,
         registry=registry, model_scope=_resolve_model_scope((dispatch_op, gmm1, gmm2, combine_op)),
         rank_placement=placement, world_size=ws, comm_group_id="ep",
-        comm_dtype="bf16", reduction_kind="permute", activation_kind=act_norm,
+        comm_dtype=comm_dt, reduction_kind="permute", activation_kind=act_norm,
         has_active_mask=bool(meta_disp.get("has_active_mask", True)),
         dispatch_quant_mode=int(meta_disp.get("dispatch_quant_mode", 0)),
         shared_experts_per_rank=shared, top_k=top_k, is_act_and_mul=True,
@@ -1977,13 +2153,34 @@ def _terminal_sink_admissible(
     succ: Mapping[str, list[str]],
 ) -> bool:
     """Enforce Law 1's 6-condition terminal cache-quant sink admission contract."""
-    # Condition 1: cur must feed the data operand (never slot_mapping/cache/cache_scale/x_scale).
-    bindings = getattr(sink, "input_bindings", ()) or ()
-    for binding in bindings:
-        prod_id = getattr(binding, "producer_op", "") or getattr(binding, "source_op", "")
-        role = str(getattr(binding, "role", "") or getattr(binding, "port", "")).strip().lower()
-        if prod_id == cur.op_id and role in _TERMINAL_SINK_NON_DATA_ROLES:
-            return False
+    from mindie_sim.prediction.fusion.ports import input_port_entries
+    from .apply import _named_inputs, _typed_inputs
+
+    # Condition 1: cur must feed a data operand (never slot_mapping/cache/cache_scale/x_scale).
+    matched_roles: list[str] = []
+    saw_declared_ports = False
+    for _, port in _typed_inputs(sink):
+        saw_declared_ports = True
+        prod = str(port.get("producer") or "").strip()
+        if prod == cur.op_id:
+            role = str(
+                port.get("role") or port.get("input") or port.get("name") or port.get("port") or ""
+            ).strip().lower()
+            matched_roles.append(role)
+    for key, prod in _named_inputs(sink).items():
+        saw_declared_ports = True
+        if prod == cur.op_id:
+            matched_roles.append(key.removesuffix("_producer").strip().lower())
+    for dep, port_name in input_port_entries(sink.metadata):
+        saw_declared_ports = True
+        if dep == cur.op_id:
+            matched_roles.append(port_name.removeprefix(dep + ":").strip().lower())
+    if matched_roles:
+        if any(role in _TERMINAL_SINK_NON_DATA_ROLES for role in matched_roles):
+            if not any(role and role not in _TERMINAL_SINK_NON_DATA_ROLES for role in matched_roles):
+                return False
+    elif saw_declared_ports:
+        return False
     # Condition 3: no external alias reader along any path from chain[0] to sink.
     chain_ids = {op.op_id for op in chain} | {sink.op_id}
     sink_meta = dict(sink.metadata) if sink.metadata else {}
@@ -2207,11 +2404,20 @@ def _classify_ub_chain_abi(
             "terminal_sink_fusion_requires_custom_k2", None, "", "tilelang",
         )
 
-    sym_set = set(syms)
-    if ({"add", "rmsnorm"} <= sym_set or "add_rmsnorm" in sym_set) and (
-        "dynamic_mx_quant" in sym_set or "dynamic_quant" in sym_set
-    ):
-        is_mx = "dynamic_mx_quant" in sym_set
+    mat_syms = tuple(
+        traits[op.op_id].symbolic_op_kind for op in chain
+        if not (
+            traits[op.op_id].trait == AlgebraicTrait.VIEW_METADATA
+            and str(op.family or "").strip().lower() in _ZERO_COPY_VIEW_FAMILIES
+        )
+    )
+    if mat_syms in {
+        ("add", "rmsnorm", "dynamic_quant"),
+        ("add_rmsnorm", "dynamic_quant"),
+        ("add", "rmsnorm", "dynamic_mx_quant"),
+        ("add_rmsnorm", "dynamic_mx_quant"),
+    }:
+        is_mx = mat_syms[-1] == "dynamic_mx_quant"
         abi_id = "aclnnAddRmsNormDynamicMxQuant" if is_mx else "aclnnAddRmsNormDynamicQuant"
         if soc_arch is not None:
             operands = (
@@ -2236,7 +2442,7 @@ def _classify_ub_chain_abi(
             return abi_id, tier, shipping, unsup, verdict, q_digest, backend
         return abi_id, "K3_dsl_pipeline", False, "soc_arch_unspecified_for_abi_probe", None, "", "tilelang"
 
-    if "situ" in sym_set and ("dynamic_quant" in sym_set or "dynamic_mx_quant" in sym_set):
+    if mat_syms in {("situ", "dynamic_quant"), ("situ", "dynamic_mx_quant")}:
         abi_id = "aclnnDequantSituQuant"
         if soc_arch is not None:
             verdict, q_digest = _verify_abi_query(
@@ -2253,7 +2459,7 @@ def _classify_ub_chain_abi(
             return abi_id, tier, shipping, unsup, verdict, q_digest, backend
         return abi_id, "K3_dsl_pipeline", False, "soc_arch_unspecified_for_abi_probe", None, "", "tilelang"
 
-    if "swiglu" in sym_set and ("dynamic_quant" in sym_set or "dynamic_mx_quant" in sym_set):
+    if mat_syms in {("swiglu", "dynamic_quant"), ("swiglu", "dynamic_mx_quant")}:
         abi_id = "aclnnSwiGluQuant"
         if soc_arch is not None:
             verdict, q_digest = _verify_abi_query(
@@ -2402,6 +2608,7 @@ def discover_algebraic_rewrites_for_ops(
     law2_cands, rejected = _discover_law2_block_matmul(
         ordered, traits, set(), succ,
         datapath=datapath, soc_arch=soc_arch, sku_id=sku_id, pr_track=cand_track,
+        epilogue_track=eff_track,
         track_spec=track_spec, manifest_bindings=manifest_bindings,
         enabled_stack_passes=passes, include_abi_extensions=include_abi_extensions, registry=registry,
     )
@@ -2439,6 +2646,7 @@ def discover_algebraic_rewrites_for_ops(
                 kernel_boundaries=(KernelBoundary(cand.abi_id, refs),),
                 fusion_tier=cand.fusion_tier,
                 backend_target=cand.backend_target,
+                abi_verdict=None,
                 abi_query_digest=cand.abi_query_digest,
                 lowering_id=cand.lowering_id,
                 lowering_sha256=cand.lowering_sha256,
@@ -2460,14 +2668,32 @@ def discover_algebraic_rewrites_for_ops(
 
 
 def _passes_multi_rank_consensus(cand: AlgebraicCandidate, scenario: ResolvedScenario) -> bool:
-    """Require 100% rank consensus for every collective (Law 3) edit across all replicas."""
+    """Require 100% rank consensus (presence + shape/dtype/precision parity) for collective edits."""
     if not cand.requires_comm_consensus or len(scenario.atomic_ops) <= 1:
         return True
-    required = set(cand.member_ids)
-    for rank_ops in scenario.atomic_ops:
-        present = {op.op_id for op in rank_ops.ops}
-        if not (required <= present):
-            return False
+    required = tuple(cand.member_ids)
+    ref_map = {op.op_id: op for op in scenario.atomic_ops[0].ops}
+    if any(oid not in ref_map for oid in required):
+        return False
+    ref_sigs = {
+        oid: (
+            ref_map[oid].family,
+            ref_map[oid].local_shape,
+            ref_map[oid].dtype,
+            getattr(ref_map[oid], "precision_abi", None),
+            ref_map[oid].link_scope,
+        )
+        for oid in required
+    }
+    for rank_ops in scenario.atomic_ops[1:]:
+        by_id = {op.op_id: op for op in rank_ops.ops}
+        for oid, ref_sig in ref_sigs.items():
+            op = by_id.get(oid)
+            if op is None:
+                return False
+            sig = (op.family, op.local_shape, op.dtype, getattr(op, "precision_abi", None), op.link_scope)
+            if sig != ref_sig:
+                return False
     return True
 
 

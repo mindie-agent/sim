@@ -9,7 +9,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, is_dataclass, replace
 from functools import lru_cache
 from math import prod
 
@@ -269,10 +269,15 @@ class _MatrixLowerer:
                 name=f"{name}:gm_{operand}", allocation=allocation, owner=core, pipe="mte2_aic",
                 after=deps, bypass=cache_bypass,
             ),)
-        scale = _scale(s, rows * cols, l1=True)
-        if scale:
-            deps = (self.plan.access(f"{name}:scale_{operand}", f"{allocation}:scale", scale, owner=core,
-                                     pipe="mte2_aic", after=deps, bypass=cache_bypass),)
+        if s.mx_scale_group:
+            per_row = ceil_div(width, MX_SCALE_GROUP) if a else ceil_div(p.k, MX_SCALE_GROUP)
+            sr, sc = (rows, ceil_div(cols, MX_SCALE_GROUP)) if a else (cols, ceil_div(rows, MX_SCALE_GROUP))
+            off = row * per_row + col // MX_SCALE_GROUP if a else col * per_row + row // MX_SCALE_GROUP
+            deps = (self.plan.access(
+                f"{name}:scale_{operand}", f"{allocation}:scale", sr * sc, owner=core,
+                pipe="mte2_aic", after=deps, bypass=cache_bypass,
+                runs=(AddressRun(off, sr, sc, per_row),),
+            ),)
         return deps
 
     def _expand_b(self, name, tile, row, rows, allocation, after, bypass):
@@ -356,7 +361,9 @@ class _MatrixLowerer:
                 for rows, dtype, ring, prior in (
                     (tile.m, s.dtype_a, l0a, r1[0]), (tile.n, _compute_b(s), l0b, r1[1]),
                 ):
-                    moved = packed_bytes(rows * micro, dtype) + _scale(s, rows * micro)
+                    moved = packed_bytes(rows * micro, dtype) + (
+                        rows * ceil_div(micro, MX_SCALE_GROUP) if s.mx_scale_group else 0
+                    )
                     load = plan.work(f"{ring.allocation}:g{slot_generation}:load", "mte1", moved, owner=core,
                                      after=(prior, ring_credit(ring, slot_generation)))
                     r0.append(lower_generation(
@@ -678,6 +685,23 @@ def _estimated_panel_micros(spec, p) -> int:
 _PURE_LOWER_CACHE: dict[object, object] = {}
 
 
+def _freeze_cache_value(value: object) -> object:
+    if isinstance(value, (str, int, float, bool, bytes)) or value is None:
+        return value
+    if isinstance(value, dict):
+        return tuple(sorted((str(k), _freeze_cache_value(v)) for k, v in value.items()))
+    if isinstance(value, (tuple, list)):
+        return tuple(_freeze_cache_value(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return frozenset(_freeze_cache_value(item) for item in value)
+    if is_dataclass(value) and not isinstance(value, type):
+        return (
+            type(value).__qualname__,
+            tuple(_freeze_cache_value(getattr(value, f.name)) for f in fields(value)),
+        )
+    return value
+
+
 def _datapath_cache_key(datapath) -> object:
     arch = getattr(datapath, "compute_arch", None)
     stars = getattr(datapath, "stars_spec", None)
@@ -691,6 +715,7 @@ def _datapath_cache_key(datapath) -> object:
     ) if stars is not None else None
     return (
         getattr(arch, "arch_id", None),
+        _freeze_cache_value(getattr(arch, "declared", None)),
         getattr(datapath, "aic_count", 0),
         getattr(datapath, "aiv_count", 0),
         getattr(datapath, "buffers", ()),
@@ -702,6 +727,8 @@ def _datapath_cache_key(datapath) -> object:
         getattr(datapath, "simt_ub_carveout_bytes", 0),
         getattr(datapath, "has_l0c_to_ub", False),
         getattr(datapath, "aic_aiv_pairs", ()),
+        _freeze_cache_value(getattr(datapath, "subtile_wave", ())),
+        _freeze_cache_value(getattr(datapath, "routes", ())),
         stars_key,
     )
 

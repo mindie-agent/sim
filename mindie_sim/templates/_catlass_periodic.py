@@ -228,8 +228,12 @@ def _append_panel_micro_stages(
             l0_after_a, l0_after_b, l0_prev = (a_ready,), (b_ready,), (f"mma_0_p{s_idx}",)
         else:
             l0_after_a, l0_after_b, l0_prev = (a_ready, f"mma_0_{prev2}"), (b_ready, f"mma_0_{prev2}"), ()
-        ma = packed_bytes(panel.tile_m * micro, spec.dtype_a) + _scale(spec, panel.tile_m * micro)
-        mb = packed_bytes(panel.tile_n * micro, _compute_b(spec)) + _scale(spec, panel.tile_n * micro)
+        ma = packed_bytes(panel.tile_m * micro, spec.dtype_a) + (
+            panel.tile_m * ceil_div(micro, MX_SCALE_GROUP) if spec.mx_scale_group else 0
+        )
+        mb = packed_bytes(panel.tile_n * micro, _compute_b(spec)) + (
+            panel.tile_n * ceil_div(micro, MX_SCALE_GROUP) if spec.mx_scale_group else 0
+        )
         if context is not None:
             wa, wb = context.bind(Work(resources={"mte1": ma})), context.bind(Work(resources={"mte1": mb}))
             mte1_pl = {k: v for k, v in context.owned(owner, aic_count, ("mte1",)).items() if k in wa or k in wb}
@@ -607,8 +611,12 @@ def _count_wave_compute(tiles, spec, p, datapath, low, plan, resource_work, cube
                 continue
             for start in range(0, k, low.micro_k):
                 micro = min(k - start, low.micro_k)
-                a = packed_bytes(m * micro, spec.dtype_a) + _scale(spec, m * micro)
-                b = packed_bytes(n * micro, _compute_b(spec)) + _scale(spec, n * micro)
+                a = packed_bytes(m * micro, spec.dtype_a) + (
+                    m * ceil_div(micro, MX_SCALE_GROUP) if spec.mx_scale_group else 0
+                )
+                b = packed_bytes(n * micro, _compute_b(spec)) + (
+                    n * ceil_div(micro, MX_SCALE_GROUP) if spec.mx_scale_group else 0
+                )
                 resource_work["mte1"] += (a + b) * repeats
                 plan.cube[cube_dt] += _issued_ops(m, n, micro, spec, datapath) * repeats
     return sum(ceil_div(k, low.micro_k) * repetitions for k, repetitions in panels)

@@ -27,7 +27,13 @@ from _support.linear_cases import (
     template_datapath,
 )
 from mindie_sim.compose import compose_case
-from mindie_sim.optimization import kernel_synthesis as ks_mod
+from mindie_sim.optimization.codesign import collect_codesign_opportunities
+from mindie_sim.templates.contracts import (
+    FormulaKernelSpec,
+    FormulaTensorSpec,
+    KernelSynthesisSpec,
+)
+from mindie_sim.templates.fuse_region import evaluate_formula_kernel
 from mindie_sim.prediction.program.stages import Stage
 from mindie_sim.prediction.results import StepRequest
 from mindie_sim.prediction.runtime.tile_solver import LiveBufferSpec, TileInfeasibleError
@@ -388,16 +394,16 @@ def test_codesign_opportunity_dual_tier_tilelang_gains_and_ub_wall_warning() -> 
     a5_case = parse_case(compose_case("qwen3-32b", GEN5_DT_SKU, layers=1, dp=1, tp=1, ep=1, prompt_tokens=32, output_tokens=1))
     req = StepRequest(phase="decode", tokens=1, context=32, sequences=1, scope="body")
     # Row-reduction width N=19660 -> 19660 * 12 B (in+out+accum FP32) = 235,920 B (~230.4 KiB in (216 KiB, 248 KiB]).
-    f_mid = ks_mod.FormulaKernelSpec(
+    f_mid = FormulaKernelSpec(
         name="fused_rmsnorm_mid_ub",
         family="norm",
         equations=("y = rmsnorm(x + r)",),
-        inputs=(ks_mod.FormulaTensorSpec("x", (1, 19660), "bf16"),),
-        outputs=(ks_mod.FormulaTensorSpec("y", (1, 19660), "bf16"),),
+        inputs=(FormulaTensorSpec("x", (1, 19660), "bf16"),),
+        outputs=(FormulaTensorSpec("y", (1, 19660), "bf16"),),
         row_reduction=True,
         vector_ops_fp32=19660.0 * 8.0,
     )
-    ev_mid = ks_mod.evaluate_formula_kernel(f_mid, a5_case)
+    ev_mid = evaluate_formula_kernel(f_mid, a5_case)
     assert ev_mid.sram_verified is True
     assert 216 * KIB < ev_mid.ub_peak_bytes <= 248 * KIB
     assert ev_mid.ub_budget_bytes == 248 * KIB
@@ -406,20 +412,20 @@ def test_codesign_opportunity_dual_tier_tilelang_gains_and_ub_wall_warning() -> 
     f_over = replace(
         f_mid,
         name="fused_rmsnorm_over_ub",
-        inputs=(ks_mod.FormulaTensorSpec("x", (1, 22000), "bf16"),),
-        outputs=(ks_mod.FormulaTensorSpec("y", (1, 22000), "bf16"),),
+        inputs=(FormulaTensorSpec("x", (1, 22000), "bf16"),),
+        outputs=(FormulaTensorSpec("y", (1, 22000), "bf16"),),
     )
-    ev_over = ks_mod.evaluate_formula_kernel(f_over, a5_case)
+    ev_over = evaluate_formula_kernel(f_over, a5_case)
     assert ev_over.sram_verified is False
     assert ev_over.tile_algorithm == "ub_infeasible"
 
-    # 3) _collect_codesign_opportunities emits dual-tier gains and UB-wall warnings cleanly.
-    base_spec = ks_mod.KernelSynthesisSpec(
+    # 3) collect_codesign_opportunities emits dual-tier gains and UB-wall warnings cleanly.
+    base_spec = KernelSynthesisSpec(
         spec_id="norm_res_fit",
         kernel_name="tilelang_add_rmsnorm",
         abi_tier="K3_mega_fusion",
-        suggested_backend=ks_mod.BACKEND_TILELANG_LABEL,
-        status_tag=ks_mod.STATUS_NEW_OP,
+        suggested_backend="TileLang",
+        status_tag="NEW_OP",
         opt_pillar="pillar1_fusion",
         constituent_op_ids=("l0.add", "l0.rmsnorm"),
         constituent_traits=("elementwise", "row_reduction"),
@@ -450,7 +456,7 @@ def test_codesign_opportunity_dual_tier_tilelang_gains_and_ub_wall_warning() -> 
         ub_peak_bytes=230 * KIB,
         ub_budget_bytes=248 * KIB,
     )
-    opps_a5 = ks_mod._collect_codesign_opportunities(
+    opps_a5 = collect_codesign_opportunities(
         a5_case, (), (base_spec, wall_spec), (), primitive_table=None, step_request=req,
     )
     by_id: dict[str, CoDesignOpportunity] = {o.opportunity_id: o for o in opps_a5}
@@ -472,7 +478,7 @@ def test_codesign_opportunity_dual_tier_tilelang_gains_and_ub_wall_warning() -> 
 
     # Non-A5 hardware receives zero A5 TileLang dual-tier leakage.
     a2_case = parse_case(compose_case("qwen3-32b", REPRESENTATIVE_SKUS["a2"], layers=1, dp=1, tp=1, ep=1, prompt_tokens=32, output_tokens=1))
-    opps_a2 = ks_mod._collect_codesign_opportunities(
+    opps_a2 = collect_codesign_opportunities(
         a2_case, (), (base_spec,), (), primitive_table=None, step_request=req,
     )
     mf_a2 = next(o.mega_fusion for o in opps_a2 if o.opportunity_id == "mega_norm_res_fit")

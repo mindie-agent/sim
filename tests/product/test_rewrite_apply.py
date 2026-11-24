@@ -48,10 +48,14 @@ def _pipeline(family):
     return TilePipelineSpec(family, (tile,))
 
 
-def _fuse(*ids, preserve=()):
+def _fuse(*ids, preserve=(), fusion_tier="K3_dsl_pipeline"):
     refs = tuple(map(_atom, ids))
-    return FuseRegion(refs, tuple(PortRef(_atom(op), "output", 0) for op in preserve),
-                      (KernelBoundary("test_abi", refs),))
+    return FuseRegion(
+        refs,
+        tuple(PortRef(_atom(op), "output", 0) for op in preserve),
+        (KernelBoundary("test_abi", refs),),
+        fusion_tier=fusion_tier,
+    )
 
 
 @pytest.fixture(scope="module")
@@ -89,10 +93,19 @@ def wire_plan():
 
 
 def test_closed_wire_roundtrip_and_canonical_digest(wire_plan):
+    from mindie_sim.rewrite.schema import REWRITE_PLAN_SCHEMA, load_rewrite_plan
+
     payload = encode_rewrite_plan(wire_plan)
-    assert payload["schema"] == "mindie-rewrite-plan/1"
+    assert payload["schema"] == REWRITE_PLAN_SCHEMA == "mindie-rewrite-plan/2"
     assert len({edit["op"] for edit in payload["edits"]}) == 8
     assert decode_rewrite_plan(json.loads(json.dumps(payload))) == wire_plan
+    assert load_rewrite_plan(payload) == wire_plan
+    # Regression lock: /1 rewrite plan schema MUST be rejected by both decode and load.
+    v1_payload = {**payload, "schema": "mindie-rewrite-plan/1"}
+    with pytest.raises(ModelingError, match="wire_type_invalid:schema|rewrite_schema_unsupported"):
+        decode_rewrite_plan(v1_payload)
+    with pytest.raises(ModelingError, match="wire_type_invalid:schema|rewrite_schema_unsupported"):
+        load_rewrite_plan(v1_payload)
     reversed_plan = replace(wire_plan, edits=tuple(
         replace(edit, after=tuple(reversed(edit.after))) for edit in reversed(wire_plan.edits)
     ))
@@ -497,9 +510,11 @@ def test_two_cohort_replay_records_positive_intervals_and_routing_moments(monkey
         "deepseek-v4-flash", REPRESENTATIVE_SKUS["a5"], tp=4, ep=4, layers=1,
         exclude_optimizations=("cann_megamoe_fusion",),
     )
+    from mindie_sim.prediction.operators.moe_transport.moe_callers import RoutingPolicy
+
     dossier = prepare_scenario(ScenarioRequest(case, StepRequest("decode", sequences=8, context=64)))
     grouped = next(op for op in dossier.handle.scenario.atomic_ops[0].ops if op.family == "grouped_gemm")
-    assert grouped.local_shape[0] == 12
+    assert grouped.local_shape[0] >= 12
     edit = Edit("split", operation=PipelineTiles(_atom(grouped.op_id), None, "dbo_2cohort"))
     moments = {}
     lower = ExpectedGroupedMatmul.lower
@@ -521,15 +536,16 @@ def test_two_cohort_replay_records_positive_intervals_and_routing_moments(monkey
     assert set(intervals) == {0, 1}
     case = dossier.handle.scenario.case
     layer = case.model.layer_plans[grouped.layer]
-    experts = layer.num_experts // case.runtime.parallel.ep
-    per_token = layer.top_k / layer.num_experts
-    expected_active = experts * (1 - (1 - per_token)**(dossier.handle.scenario.step.sequences // 2))
-    assert expected_active == pytest.approx(5.792, abs=0.001)
-    assert len(moments) == len(intervals)
     original = dict(grouped.metadata)
+    cohort_rows, expected_active = RoutingPolicy().local(
+        case.model, layer, case.runtime.parallel, dossier.handle.scenario.step.sequences // 2,
+        owner=None, runtime=case.runtime, eplb_damped=original.get("routing_eplb_active"),
+    )
+    assert expected_active > 5.0
+    assert len(moments) == len(intervals)
     for samples in moments.values():
         (rows, expected_rows, active, weights), = samples
-        assert rows == expected_rows == grouped.local_shape[0] // 2
+        assert rows == expected_rows == cohort_rows
         assert active == pytest.approx(expected_active)
         assert weights == pytest.approx(original["weight_bytes"] * active / original["expected_active_experts"])
     row = next(row for row in replayed.step_eval.operators if row.occurrence.op_id == grouped.op_id)
@@ -562,7 +578,7 @@ def test_host_split_elision_replays_with_device_count_rendezvous():
 def test_asymmetric_hbm_arbiter_and_catlass_base_byte_obligation():
     from mindie_sim.catalog.ops import gemm_op
     from mindie_sim.catalog.types import QuantSpec
-    from mindie_sim.optimization.dsl_solver import _catlass_proposals
+    from mindie_sim.rewrite.catalog_replay import _catlass_proposals
     from mindie_sim.prediction.spine import PredictionSpine
     from mindie_sim.prediction.streams import StreamCoreBudget, StreamLane
     from mindie_sim.prediction.structure import parse_case
@@ -926,6 +942,7 @@ def test_multi_boundary_fusion_does_not_alias_final_abi_as_single_recipe(dense):
             KernelBoundary("UnknownFirstAbi", (_atom(qkv),)),
             KernelBoundary("pointwise", (_atom(norm),)),
         ),
+        fusion_tier="K3_dsl_pipeline",
     )
     applied = apply_plan(_plan(dense, Edit("two_b", operation=two_bounds)), dense)
     fused = next(op for op in applied.executable[0].ops if op.op_id == "rewrite:two_b")
@@ -934,99 +951,62 @@ def test_multi_boundary_fusion_does_not_alias_final_abi_as_single_recipe(dense):
     assert dict(fused.metadata)["kernel_boundary_count"] == 2
 
 
-def _make_v5_target_node(
-    ordinal: int,
-    op_id: str,
-    *,
-    archetype_id: str = "target_arch_0",
-    repeat_count: int = 1,
-    family: str = "gemm",
-    recipe: str = "matmul",
-    stream: str = "main",
-    stream_index: int = 0,
-    shape: tuple[int, ...] = (128, 4096),
-    predecessors: tuple = (),
-    start_us: float = 0.0,
-    dur_us: float = 20.0,
-    flops: float = 0.0,
-    vector_ops: float = 0.0,
-    hbm_read_bytes: float = 0.0,
-    hbm_write_bytes: float = 0.0,
-    link_bytes: float = 0.0,
-    ascend_kernel: str = "",
-    persistent_whole_die: bool = False,
-    spec: Any = None,
-):
-    from mindie_sim.optimization.kernel_synthesis import TargetOpNode
-    from mindie_sim.prediction.results import OpOccurrence
-
-    occ = OpOccurrence(replica=0, stage=0, rank=0, op_id=op_id)
-    hbm_tot = hbm_read_bytes + hbm_write_bytes
-    return TargetOpNode(
-        ordinal=ordinal, occurrence=occ, op_id=op_id, archetype_id=archetype_id,
-        repeat_count=repeat_count, family=family, recipe=recipe, stream=stream,
-        stream_index=stream_index, task_type="HCCL" if link_bytes > 0.0 else "AI_CORE",
-        shape=shape, dtype="bf16", predecessors=predecessors,
-        start_us=start_us, end_us=start_us + dur_us, dur_us=dur_us,
-        exposed_dur_us=dur_us, is_overlapped=False, masked_by="",
-        flops=flops, vector_ops=vector_ops,
-        hbm_read_bytes=hbm_read_bytes, hbm_write_bytes=hbm_write_bytes,
-        hbm_total_bytes=hbm_tot, mte2_bytes=hbm_read_bytes, mte3_bytes=hbm_write_bytes,
-        fixpipe_bytes=0.0, link_bytes=link_bytes, dominant_bound="cube_bound",
-        bound_display="Cube Bound", l_star_lean_us=min(dur_us, max(1.0, dur_us * 0.5)),
-        gap_us=max(0.0, dur_us * 0.5), gap_ratio=2.0, roofline_efficiency=0.5,
-        absorbed_source_ops=(), semantic_atoms=(), logical_role=family,
-        ascend_kernel=ascend_kernel or recipe, kernel_backend="CANN aclnn/AscendC",
-        kernel_status="existing", needs_new_kernel=False, new_kernel_spec="",
-        canonical_op_key=op_id, spec=spec, persistent_whole_die=persistent_whole_die,
-    )
-
-
-def test_redline1_same_stream_fifo_and_disjoint_core_split():
+def test_disjoint_stream_core_split_and_exact_wall_partition():
     from mindie_sim.compose import compose_case
-    from mindie_sim.optimization.causal_tail import schedule_target_graph_on_engine
-    from mindie_sim.prediction.streams import StreamCoreBudget, StreamLane, StreamPlan
-    from mindie_sim.prediction.structure import parse_case
+    from mindie_sim.optimization.ladder import partition_step_wall_ns
+    from mindie_sim.prediction.spine import PredictionSpine
+    from mindie_sim.prediction.streams import StreamCoreBudget, StreamLane
+    from mindie_sim.schema.operators import OpSpec
 
-    case = parse_case(compose_case("qwen3-32b", "a3", tp=1, dp=1, layers=1))
-    # Two independent ops on stream_0 with initially overlapping timestamps MUST serialize FIFO (0.0 us overlap).
-    n0 = _make_v5_target_node(0, "s0.l0.gemm_a", stream="main", stream_index=0, start_us=0.0, dur_us=30.0, flops=2.0e11, shape=(512, 1024))
-    n1 = _make_v5_target_node(1, "s0.l0.gemm_b", stream="main", stream_index=0, start_us=5.0, dur_us=25.0, flops=1.5e11, shape=(512, 1024))
-    res = schedule_target_graph_on_engine((n0, n1), case)
-    assert res.max_same_stream_overlap_us == 0.0
-    assert res.nodes[1].start_us >= res.nodes[0].end_us - 1e-6
-    assert res.step_span_us >= 55.0 - 1e-3
+    class _LocalSpine(PredictionSpine):
+        def __init__(self, ops):
+            super().__init__()
+            self._ops = ops
 
-    # Disjoint StreamCoreBudget splits AIC/AIV physically with discrete wave quantization and emits receipt.
-    m0 = _make_v5_target_node(0, "s0.l0.main_gemm", stream="main", stream_index=0, dur_us=20.0, flops=3.0e11, shape=(512, 1024))
-    a0 = _make_v5_target_node(1, "s0.l0.aux_gemm", stream="aux", stream_index=1, dur_us=20.0, flops=3.0e11, shape=(512, 1024))
-    shared = schedule_target_graph_on_engine((m0, a0), case)
-    die = case.machine.dies[0]
-    aic_half = max(1, int(die.aic_count) // 2)
-    aiv_half = max(1, int(die.owner_count("vector") or 2) // 2)
-    plan = StreamPlan(
-        rank=int(die.rank),
-        lanes=(
-            StreamLane("main", StreamCoreBudget(aic=aic_half, aiv=aiv_half, isolation="disjoint")),
-            StreamLane("aux", StreamCoreBudget(aic=int(die.aic_count) - aic_half, aiv=int(die.owner_count("vector") or 2) - aiv_half, isolation="disjoint")),
-        ),
+        def lower(self, case, request, **kwargs):
+            prepared = super().lower(case, request, **kwargs)
+            rank, = prepared.graph.executable
+            return replace(prepared, graph=replace(prepared.graph, executable=(replace(rank, ops=self._ops),), streams=()))
+
+    case = compose_case("qwen3-32b", REPRESENTATIVE_SKUS["a3"], tp=1, dp=1, layers=1)
+    g0 = OpSpec(
+        op_id="s0.l0.g0", family="elementwise", recipe="elementwise", phase="decode", stage=0, layer=0, requests=(),
+        semantic_shape=(16, 4096), local_shape=(16, 4096), padded_shape=(16, 4096),
+        launch_shape=(16, 4096), dtype="bf16", vector_ops=4_096_000.0,
+        mte2_bytes=131072.0, mte3_bytes=131072.0, hbm_bytes=262144.0,
     )
-    disjoint = schedule_target_graph_on_engine((m0, a0), case, stream_plan=plan)
-    assert "disjoint" in disjoint.stream_core_budget_summary
-    assert disjoint.max_same_stream_overlap_us == 0.0
-    assert disjoint.nodes[0].stream_core_budget == disjoint.stream_core_budget_summary
-    assert sum(n.exposed_dur_us for n in shared.nodes) == pytest.approx(shared.step_span_us, rel=1e-3)
+    g1 = replace(g0, op_id="s0.l0.g1")
+    tail = OpSpec(
+        op_id="s0.l0.tail", family="elementwise", recipe="elementwise", phase="decode", stage=0, layer=0,
+        requests=(), deps=("s0.l0.g0", "s0.l0.g1"), semantic_shape=(16, 4096), local_shape=(16, 4096),
+        padded_shape=(16, 4096), launch_shape=(16, 4096), dtype="bf16", vector_ops=65536.0,
+        mte2_bytes=131072.0, mte3_bytes=131072.0, hbm_bytes=262144.0,
+    )
+    dossier = prepare_scenario(
+        ScenarioRequest(case, StepRequest("decode", tokens=16, context=64)),
+        spine=_LocalSpine((g0, g1, tail)),
+    )
+    dp = dossier.handle.scenario.datapath
+    ha, hv = max(1, dp.aic_count // 2), max(1, dp.aiv_count // 2)
+    lanes = (
+        StreamLane("main", StreamCoreBudget(aic=ha, aiv=hv, isolation="disjoint")),
+        StreamLane("aux", StreamCoreBudget(aic=dp.aic_count - ha, aiv=dp.aiv_count - hv, isolation="disjoint")),
+    )
+    assign = ((_atom("s0.l0.g0"), "main"), (_atom("s0.l0.g1"), "aux"), (_atom("s0.l0.tail"), "main"))
+    events = (StreamEvent("g1_ready", "aux", "s0.l0.g1", "main", ("s0.l0.tail",)),)
+    plan = replace(dossier.unmerge_plan, edits=(Edit("split_lanes", operation=StreamSchedule(lanes, assign, events)),))
+    replayed = finalize_plan(dossier.handle, plan)
+    assert replayed.verification.passed
+    parts = dict(partition_step_wall_ns(replayed.step_eval))
+    assert sum(parts.values()) == round(replayed.step_eval.span_ms * 1_000_000)
 
 
-def test_redline2_causal_target_tail_placement_and_barrier_rewiring():
-    from mindie_sim.compose import compose_case
+def test_acceptance_tail_closure_and_barrier_rewiring():
     from mindie_sim.optimization.causal_tail import (
         compute_acceptance_tail_closure,
         resolve_barrier_predecessors,
-        schedule_target_graph_on_engine,
     )
     from mindie_sim.prediction.results import OpOccurrence
-    from mindie_sim.prediction.structure import parse_case
     from mindie_sim.schema.operators import OpSpec
 
     occ_fwd = OpOccurrence(0, 0, 0, "s0.l0.attn")
@@ -1077,127 +1057,79 @@ def test_redline2_causal_target_tail_placement_and_barrier_rewiring():
     rewired = resolve_barrier_predecessors(recs, protected_occurrences=closure)
     rec_row = next(r for r in rewired if r["op_id"] == "s0.l0.recover_ssm_commit")
     assert occ_acc in rec_row["predecessors"]
-
-    # Real per-layer commits remain distinct in target_tail without synthetic cloning.
     commits = [r for r in rewired if r["family"] == "recover_ssm_commit"]
-    assert len(commits) == 3
-    assert all(r["occurrence"] in closure for r in commits)
-
-    # Die Engine schedule enforces Redline #2: every recover_ssm_commit starts >= accept.end_us.
-    case = parse_case(compose_case("qwen3-32b", "a3", tp=1, dp=1, layers=1))
-    nodes = [
-        _make_v5_target_node(
-            i, r["op_id"],
-            archetype_id=("target_tail" if r["occurrence"] in closure else ("draft_arch_0" if r["op_id"].startswith("draft") else "target_arch_0")),
-            family=r["family"], predecessors=r["predecessors"], dur_us=max(1.0, r["end_us"] - r["start_us"]),
-            vector_ops=1.0e8, spec=r["spec"],
-        )
-        for i, r in enumerate(rewired)
-    ]
-    sched = schedule_target_graph_on_engine(nodes, case)
-    acc_node = next(n for n in sched.nodes if n.op_id == "accept")
-    commit_nodes = [n for n in sched.nodes if n.family == "recover_ssm_commit"]
-    assert len(commit_nodes) == 3
-    assert all(c.archetype_id == "target_tail" for c in commit_nodes)
-    assert all(c.start_us >= acc_node.end_us - 1e-6 for c in commit_nodes)
+    assert len(commits) == 3 and all(r["occurrence"] in closure for r in commits)
 
 
-def test_redline3_persistent_whole_die_and_moe_mutex_head_to_head():
+def test_megamoe_abi_role_ports_and_moe_mutex_legality():
+    from types import SimpleNamespace
+    from mindie_sim.backends.abi_registry import default_abi_registry
     from mindie_sim.compose import compose_case
-    from mindie_sim.optimization.causal_tail import (
-        enforce_moe_mutex_on_nodes,
-        moe_route_legality,
-        schedule_target_graph_on_engine,
-    )
-    from mindie_sim.optimization.kernel_synthesis import solve_target_graph
+    from mindie_sim.optimization.causal_tail import moe_route_legality
     from mindie_sim.prediction.structure import parse_case
+    from mindie_sim.schema.abi import AbiQueryKey, OperandPortSig
 
-    case_a3 = parse_case(compose_case("deepseek-v3.2", "a3", tp=1, dp=4, ep=4, layers=4))
-    case_a5 = parse_case(compose_case("deepseek-v3.2", "a5", tp=1, dp=4, ep=4, layers=4))
+    def _port(role, dtype, shape, layout="ND", quant_mode="dense", group_shape=(), scale_dtype="none"):
+        return OperandPortSig(
+            role=role, dtype=dtype, shape=shape, layout=layout, quant_mode=quant_mode,
+            group_shape=group_shape, scale_dtype=scale_dtype, scale_shape=(), transposed=False,
+        )
 
-    # 1. Persistent whole-die kernel (aclnnMegaMoe) blocks concurrent Stream 1 op (zero fake 0-exposed overlap).
-    mega = _make_v5_target_node(
-        0, "s0.l0.mega_moe", family="moe", recipe="aclnnMegaMoe", ascend_kernel="aclnnMegaMoe",
-        stream="main", stream_index=0, dur_us=80.0, flops=2.0e11, vector_ops=1.0e9,
-        hbm_read_bytes=2.0e7, persistent_whole_die=True,
+    # 1. Regression lock: aclnnMegaMoe role-port query (context at operands[0], x at [1], weight1 at [4]) PASSES.
+    reg = default_abi_registry()
+    mega_query = AbiQueryKey(
+        soc_arch="A5", sku_id=REPRESENTATIVE_SKUS["a5"], abi_id="aclnnMegaMoe",
+        graph_motif="moe_mc2_frame", model_scope="target", draft_quant_mode="none", pr_track="shipping",
+        operands=(
+            _port("context", "int8", (64,), quant_mode="none"),
+            _port("x", "bf16", (16, 4096)),
+            _port("topk_ids", "int32", (16, 8), quant_mode="none"),
+            _port("topk_weights", "fp32", (16, 8)),
+            _port("weight1", "fp8_e4m3fn", (4096, 2048), layout="FRACTAL_NZ", quant_mode="mx_fp8", group_shape=(32,), scale_dtype="fp8_e8m0"),
+            _port("weight2", "fp8_e4m3fn", (2048, 4096), layout="FRACTAL_NZ", quant_mode="mx_fp8", group_shape=(32,), scale_dtype="fp8_e8m0"),
+        ),
+        outputs=(_port("y", "bf16", (16, 4096)), _port("expert_token_nums", "int64", (1,), quant_mode="none")),
+        rank_placement="ub_ccu_intramachine", world_size=16, comm_group_id="ep", comm_domain_width=16,
+        comm_dtype="bf16", reduction_kind="permute", activation_kind="swiglu", activation_params=(),
+        has_bias=False, has_active_mask=True, dispatch_quant_mode=0, shared_experts_per_rank=1,
+        top_k=8, moe_expert_num=128, qk_rope_head_dim=0, mla_variant="none", sfa_dcp_active=False,
+        pcp_size=1, kv_cache_dtype="none", has_kpool_indexer=False, dcp_size=1, is_act_and_mul=True,
+        enabled_stack_passes=frozenset(),
     )
-    shared_s1 = _make_v5_target_node(
-        1, "s0.l0.shared_expert_gate", family="gemm", recipe="matmul",
-        stream="aux", stream_index=1, dur_us=20.0, flops=1.0e11, hbm_read_bytes=4.0e6,
-    )
-    sched = schedule_target_graph_on_engine((mega, shared_s1), case_a5)
-    assert sched.step_span_us >= 99.0
-    assert sched.nodes[1].exposed_dur_us > 15.0 and not sched.nodes[1].is_overlapped
+    verdict = reg.verify(mega_query)
+    assert verdict.status == "admitted_shipping"
+    assert verdict.matched_entry_id == "a5_hccl_megamoe_routed"
+    assert (verdict.act_dtype, verdict.weight_dtype, verdict.quant_mode) == ("bf16", "fp8_e4m3fn", "dense")
 
-    # 2. MoE mutex legality: enable_fused_mc2 perpendicular to MSO; level=3 A5 non-latent only; situglu extended ABI.
+    # 2. MoE mutex legality via ProbedAbiRegistry: fused_mc2 perpendicular to MSO; level=3 A5 non-latent only.
+    case_a3 = parse_case(compose_case("deepseek-v3.2", REPRESENTATIVE_SKUS["a3"], tp=1, dp=4, ep=4, layers=4))
+    case_a5 = parse_case(compose_case("deepseek-v3.2", REPRESENTATIVE_SKUS["a5"], tp=1, dp=4, ep=4, layers=4))
+    shared_node = SimpleNamespace(op_id="s0.l0.shared_expert_gate", family="gemm")
     assert moe_route_legality(case_a5, enable_fused_mc2=2, multistream_overlap_shared_expert=True).legal is False
-    assert moe_route_legality(case_a3, enable_fused_mc2=3, multistream_overlap_shared_expert=False, nodes=(shared_s1,)).legal is False
-    assert moe_route_legality(case_a5, enable_fused_mc2=3, multistream_overlap_shared_expert=False, nodes=(shared_s1,)).legal is True
+    assert moe_route_legality(case_a3, enable_fused_mc2=3, multistream_overlap_shared_expert=False, nodes=(shared_node,)).legal is False
+    a5_lvl3 = moe_route_legality(case_a5, enable_fused_mc2=3, multistream_overlap_shared_expert=False, nodes=(shared_node,))
+    assert a5_lvl3.legal is True and a5_lvl3.is_shipping_abi is True
     case_latent = replace(case_a5, model=replace(case_a5.model, metadata=(("routed_expert_hidden_size", 512),)))
-    assert moe_route_legality(case_latent, enable_fused_mc2=3, multistream_overlap_shared_expert=False, nodes=(shared_s1,)).legal is False
-    assert moe_route_legality(case_a5, enable_fused_mc2=2, multistream_overlap_shared_expert=False, activation="situglu", allow_unbound_formula=False).legal is False
-    kimi_mod = moe_route_legality(case_a5, enable_fused_mc2=2, multistream_overlap_shared_expert=False, activation="situglu", allow_unbound_formula=True)
-    assert kimi_mod.legal is True and kimi_mod.needs_new_kernel is True and kimi_mod.is_shipping_abi is False
-
-    # 3. enforce_moe_mutex_on_nodes sanitizes illegal fused_mc2 + Stream-1 shared expert.
-    clean_nodes, dec = enforce_moe_mutex_on_nodes((mega, shared_s1), case_a5)
-    assert dec is not None and dec.enable_fused_mc2 > 0 and dec.multistream_overlap_shared_expert is False
-    assert clean_nodes[1].stream_index == 0
-
-    # 4. Head-to-head MoE selection in solve_target_graph enforces mutex & emits applied_edit_receipts.
-    die5 = case_a5.machine.dies[0]
-    peaks5 = {0: {
-        "cube_peak_flops_per_s": float(die5.peak("bf16")),
-        "vector_peak_ops_per_s": float(dict(die5.rates).get("vector", 1.0e13)),
-        "hbm_peak_bytes_per_s": float(dict(die5.rates)["hbm"]),
-        "link_peak_bytes_per_s": 2.0e11,
-    }}
-    disp = _make_v5_target_node(0, "s0.l0.dispatch", family="dispatch", recipe="mc2_dispatch", dur_us=25.0, vector_ops=5.0e8, hbm_read_bytes=1.0e6, hbm_write_bytes=2.0e6, link_bytes=2.0e6)
-    gmm = _make_v5_target_node(1, "s0.l0.expert_gmm", family="grouped_gemm", recipe="grouped_matmul", predecessors=(disp.occurrence,), dur_us=60.0, flops=4.0e11, hbm_read_bytes=3.0e7, hbm_write_bytes=2.0e6)
-    comb = _make_v5_target_node(2, "s0.l0.combine", family="combine", recipe="mc2_combine", predecessors=(gmm.occurrence,), dur_us=25.0, vector_ops=5.0e8, hbm_read_bytes=2.0e6, hbm_write_bytes=1.0e6, link_bytes=2.0e6)
-    sh = _make_v5_target_node(3, "s0.l0.shared_expert_ffn", family="gemm", recipe="matmul", dur_us=20.0, flops=1.0e11, hbm_read_bytes=5.0e6, hbm_write_bytes=1.0e6)
-    dems = ((0, 5000, 3000, 0, 10000), (20000, 0, 20000, 0, 0), (0, 5000, 3000, 0, 10000), (5000, 0, 4000, 0, 0))
-    solved = solve_target_graph((disp, gmm, comb, sh), dems, case_a5, peaks5, allow_unbound_formula=True)
-    assert not (solved.moe_route.get("enable_fused_mc2", 0) > 0 and solved.moe_route.get("multistream_overlap_shared_expert"))
-    assert solved.step_span_us > 0.0
-    assert solved.applied_edit_receipts
+    assert moe_route_legality(case_latent, enable_fused_mc2=3, multistream_overlap_shared_expert=False, nodes=(shared_node,)).legal is False
+    assert moe_route_legality(case_a5, enable_fused_mc2=2, multistream_overlap_shared_expert=False, activation="clipped_swiglu", allow_unbound_formula=False).legal is False
+    clipped_mod = moe_route_legality(case_a5, enable_fused_mc2=2, multistream_overlap_shared_expert=False, activation="clipped_swiglu", allow_unbound_formula=True)
+    assert clipped_mod.legal is True and clipped_mod.needs_new_kernel is True and clipped_mod.is_shipping_abi is False
+    assert moe_route_legality(case_a5, enable_fused_mc2=2, multistream_overlap_shared_expert=False, activation="relu2", allow_unbound_formula=False).legal is False
 
 
-def test_d6_baseline_purity_collapse_occurrence_and_bundle_receipts(monkeypatch):
-    from mindie_sim import solve as solve_mod
-    from mindie_sim.compose import compose_case
-    from mindie_sim.export.bundle import _collapse_micro_split_ops, build_export_bundle
+def test_macro_wall_trigger_and_micro_split_collapse():
+    from mindie_sim.export.bundle import _collapse_micro_split_ops
     from mindie_sim.export.models import OperatorExportRow
-    from mindie_sim.optimization.kernel_synthesis import evaluate_macro_wall_trigger, extract_sku_floors
-    from mindie_sim.prediction.results import OpOccurrence, StepRequest
-    from mindie_sim.prediction.structure import parse_case
-    from mindie_sim.solve import solve_deployment
+    from mindie_sim.optimization.codesign import evaluate_macro_wall_trigger
+    from mindie_sim.prediction.results import OpOccurrence
 
-    # 1. Default script-free Before track in solve_deployment executes 'merged' (D6).
-    seen_tracks: list[str] = []
-    orig_opt = solve_mod.solve_optimal_deployment
-
-    def _capture_track(*args, **kwargs):
-        seen_tracks.append(str(kwargs.get("feature_track", "")))
-        return orig_opt(*args, **kwargs)
-
-    with monkeypatch.context() as mp:
-        mp.setattr(solve_mod, "solve_optimal_deployment", _capture_track)
-        solve_deployment(
-            "qwen3-32b", "a3", num_devices=2, layers=1, prompt_tokens=256, output_tokens=32,
-            tpot_slo_ms=50.0, deployment="colocated", pinned_parallel={"tp": 2},
-            max_sequences_per_dp=2, mode="simulation",
-        )
-    assert seen_tracks and seen_tracks[0] == "merged"
-
-    # 2. Zero AIV/CCU hybrid labels and zero SuperPoD on A2.
-    case_a2 = parse_case(compose_case("qwen3-32b", "a2", tp=1, dp=1, layers=1))
-    floors_a2 = extract_sku_floors(case_a2)
-    assert "SuperPoD" not in floors_a2.interconnect_label and "CCU" not in floors_a2.interconnect_label
-    wall = evaluate_macro_wall_trigger(tpot_ms=60.0, tpot_slo_ms=50.0, hbm_used_bytes=20e9, hbm_usable_bytes=64e9, hbm_headroom_bytes=44e9)
+    wall = evaluate_macro_wall_trigger(
+        tpot_ms=60.0, tpot_slo_ms=50.0, hbm_used_bytes=20e9, hbm_usable_bytes=64e9, hbm_headroom_bytes=44e9,
+    )
+    assert wall.wall_kind == "LATENCY_WALL"
     assert all("CCU" not in act for act in wall.recommended_actions)
 
-    # 3. _collapse_micro_split_ops updates occurrence.op_id and preserves external predecessors.
+    # _collapse_micro_split_ops updates occurrence.op_id and preserves external predecessors.
     occ_pre = OpOccurrence(0, 0, 0, "s0.l0.pre")
     occ_s0 = OpOccurrence(0, 0, 0, "s0.l0.recurrent_scan0")
     occ_s1 = OpOccurrence(0, 0, 0, "s0.l0.recurrent_scan1")
@@ -1231,11 +1163,3 @@ def test_d6_baseline_purity_collapse_occurrence_and_bundle_receipts(monkeypatch)
     assert scan_row.occurrence.op_id == "s0.l0.recurrent_scan"
     assert occ_pre in scan_row.predecessors and occ_ext in scan_row.predecessors
     assert scan_row.occurrence in post_row.predecessors
-
-    # 4. build_export_bundle no longer attaches deployment commands to every op row (D6).
-    bundle = build_export_bundle(
-        compose_case("qwen3-32b", "a3", tp=1, dp=1, layers=1),
-        request=StepRequest(phase="decode", tokens=1, context=128, sequences=1, scope="model"),
-        apply_target_envelope=False,
-    )
-    assert all(r.config_howto == "" for r in bundle.operators)

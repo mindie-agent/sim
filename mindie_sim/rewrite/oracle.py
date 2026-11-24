@@ -464,20 +464,45 @@ def _cohort_moments(case, op, meta):
         raise ModelingError(f"rewrite_dbo_routing_unbound:{op.op_id}")
     policy = RoutingPolicy()
     ids = meta.get("representative_expert_ids")
+    eplb_damped = meta.get("routing_eplb_active")
+    zero_experts = int(meta.get("zero_experts", 0) or 0)
+    target = (meta["expected_rows"], meta["expected_active_experts"])
 
-    def moments(tokens):
-        if ids:
-            rows, active = policy.expert_moments(model, layer, tokens)
-            return fsum(rows[i] for i in ids), fsum(active[i] for i in ids)
-        return policy.local(model, layer, parallel, tokens, owner=meta.get("ep_rank"))
+    candidates = []
+    if ids:
+        candidates.append(
+            lambda t: tuple(fsum(vals[i] for i in ids) for vals in policy.expert_moments(model, layer, t))
+        )
+    else:
+        owner = meta.get("ep_rank")
+        if owner is not None:
+            candidates.append(
+                lambda t, _o=owner: policy.local(
+                    model, layer, parallel, t, owner=_o, runtime=case.runtime,
+                    eplb_damped=eplb_damped, zero_experts=zero_experts,
+                )
+            )
+        candidates.append(
+            lambda t: policy.local(
+                model, layer, parallel, t, owner=None, runtime=case.runtime,
+                eplb_damped=eplb_damped, zero_experts=zero_experts,
+            )
+        )
 
-    per_token, _ = moments(1)
-    tokens = round(meta["expected_rows"] / per_token) if per_token else 0
-    if tokens < 2 or not all(isclose(a, b) for a, b in zip(
-        moments(tokens), (meta["expected_rows"], meta["expected_active_experts"])
-    )):
-        raise ModelingError(f"rewrite_dbo_routing_unbound:{op.op_id}")
-    return moments(tokens // 2), moments(tokens - tokens // 2)
+    raw_valid = meta.get("routing_valid_tokens")
+    valid_tokens = int(raw_valid) if isinstance(raw_valid, int) and not isinstance(raw_valid, bool) and raw_valid >= 2 else 0
+    for moments in candidates:
+        per_token, _ = moments(1)
+        token_guesses = []
+        if valid_tokens >= 2:
+            token_guesses.append(valid_tokens)
+        inferred = round(meta["expected_rows"] / per_token) if per_token else 0
+        if inferred >= 2 and inferred not in token_guesses:
+            token_guesses.append(inferred)
+        for tokens in token_guesses:
+            if all(isclose(a, b) for a, b in zip(moments(tokens), target)):
+                return moments(tokens // 2), moments(tokens - tokens // 2)
+    raise ModelingError(f"rewrite_dbo_routing_unbound:{op.op_id}")
 
 def _device_counts(ops, targets, book, case, include_submission):
     targets = set(targets)
@@ -564,19 +589,33 @@ def _bind_formula_fused_recipe(scenario, atomic_entry, op, applied):
     )
 
 
+_SHIPPING_ABI_RECIPE_NAMES: dict[str, tuple[str, ...]] = {
+    "aclnnAddRmsNormDynamicQuant": ("add_rmsnorm_quant",),
+    "aclnnAddRmsNormDynamicMxQuant": ("add_rmsnorm_quant",),
+    "aclnnSwiGluQuant": ("swiglu_quantize",),
+    "aclnnDequantSituQuant": ("situ_quantize",),
+    "aclnnAllGatherMatmulV2": ("mc2_all_gather_matmul",),
+    "aclnnMatmulReduceScatterV2": ("mc2_matmul_reduce_scatter",),
+    "aclnnMlaPrologV4WeightNz": ("mla_prolog_v4_arch35",),
+    "aclnnMlaPrologV3WeightNz": ("mla_prolog_v4_arch35",),
+    "aclnnMegaMoe": ("megamoe_arch35",),
+}
+
+
 def _resolve_fused_binding(scenario, atomic_entry, op, applied, book, catalog, handle, registered, *, allow_unbound_formula):
     """Enforce 3-tier resolution: UserProfile > Extension/RecipeBook > FormulaKernelSpec."""
-    boundaries = next(
-        edit.operation.kernel_boundaries for edit in applied.plan.edits
+    edit_op = next(
+        edit.operation for edit in applied.plan.edits
         if op.op_id == f"rewrite:{edit.edit_id}"
     )
+    boundaries = edit_op.kernel_boundaries
     has_measured_store = isinstance(handle.evaluation_context.cost.primitives, PrimitiveStore)
     if len(boundaries) == 1 and (catalog or op.recipe in book.recipes):
         state = "bound_measured" if (has_measured_store and op.recipe in book.recipes) else "bound_implementation"
         return op, state, False
     if (
         len(boundaries) == 1
-        and op.recipe == "gemm"
+        and op.recipe in {"gemm", "aclnnMatmul", "aclnnQuantMatmulV4"}
         and dict(op.metadata).get("law2_block_gemm") is True
         and op.flops > 0
     ):
@@ -586,6 +625,18 @@ def _resolve_fused_binding(scenario, atomic_entry, op, applied, book, catalog, h
             registered[identifier] = selected
             state = "bound_measured" if has_measured_store else "bound_implementation"
             return replace(op, recipe=identifier), state, False
+    if (
+        len(boundaries) == 1
+        and edit_op.fusion_tier in {"K1_shipping", "K1_proposed_pr"}
+        and op.recipe in _SHIPPING_ABI_RECIPE_NAMES
+    ):
+        for candidate_key in _SHIPPING_ABI_RECIPE_NAMES[op.recipe]:
+            selected = book.recipes.get(candidate_key) or book.families.get(candidate_key)
+            if selected is not None and not isinstance(selected, FusedPipelineRecipe):
+                identifier = f"rewrite_k1_abi:{atomic_entry.replica}:{op.op_id}:{candidate_key}"
+                registered[identifier] = selected
+                state = "bound_measured" if has_measured_store else "bound_implementation"
+                return replace(op, recipe=identifier), state, False
     if len(boundaries) != 1 or not allow_unbound_formula:
         raise ModelingError(f"rewrite_fusion_recipe_unbound:{op.op_id}:{op.recipe}")
     identifier = f"rewrite_formula:{atomic_entry.replica}:{op.op_id}:{op.recipe}"
@@ -856,8 +907,13 @@ def finalize_plan(
     report = _report(resolved.atomic_step.case, graphs, scenario.evaluation_context, book, scenario._replay,
                      deadline=deadline, streams=bound_streams,
                      trace_limit=MAX_OVERLAP_TRACE_EVENTS if overlap else 0)
-    step = _evaluation(resolved, graphs, report, applied.plan_sha256, baseline.tier if not plan.edits
-                       else "should_achieve", resolved.atomic_step if not plan.edits else None)
+    step = _evaluation(
+        resolved, graphs, report, applied.plan_sha256,
+        baseline.tier if not plan.edits else "should_achieve",
+        resolved.atomic_step if not plan.edits else None,
+        scenario_sha256=resolved.scenario_sha256,
+        plan_sha256=applied.plan_sha256,
+    )
     wall = round(step.span_ms * NS_PER_MS)
     if dual_certificate is None and dual_program is None and event_dag is None:
         cacheable = (

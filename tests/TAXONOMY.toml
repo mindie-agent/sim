@@ -213,7 +213,7 @@ owns = ["mindie_sim/remote_exec.py", "mindie_sim/prediction/runtime/accel_build.
 [[module]]
 path = "runtime/test_formal_lean_locks.py"
 tier = "tier0"
-owns = ["formal/MindIESimSpec", "formal/AxiomCheck.lean", "mindie_sim/prediction/efficiency/exposed_breakdown.py", "mindie_sim/prediction/execution/weight_prefetch.py", "mindie_sim/prediction/sharding/local_tp.py", "mindie_sim/prediction/operators/recurrent/recover_ssm_work.py", "mindie_sim/prediction/collectives/startup.py", "mindie_sim/prediction/efficiency/roofline_graph.py", "mindie_sim/optimization/dual_bound.py", "mindie_sim/optimization/reload_bounds.py"]
+owns = ["formal/MindIESimSpec", "formal/AxiomCheck.lean", "mindie_sim/prediction/efficiency/exposed_breakdown.py", "mindie_sim/prediction/execution/weight_prefetch.py", "mindie_sim/prediction/sharding/local_tp.py", "mindie_sim/prediction/operators/recurrent/recover_ssm_work.py", "mindie_sim/prediction/collectives/startup.py", "mindie_sim/prediction/efficiency/roofline_graph.py", "mindie_sim/optimization/dual_bound.py", "mindie_sim/prediction/runtime/reload_bounds.py"]
 [[module]]
 path = "runtime/test_stage4a_target_precision_and_links.py"
 tier = "tier0"
@@ -630,7 +630,7 @@ owns = ["mindie_sim/rewrite/schema.py", "mindie_sim/rewrite/apply.py"]
 [[module]]
 path = "product/test_rewrite_verify_and_oracle.py"
 tier = "tier0"
-owns = ["mindie_sim/rewrite/verify.py", "mindie_sim/optimization/framework_solver.py", "mindie_sim/optimization/dsl_solver.py"]
+owns = ["mindie_sim/rewrite/verify.py", "mindie_sim/optimization/framework_solver.py"]
 [[module]]
 path = "product/test_wheel_and_extension_sdk.py"
 tier = "tier1"

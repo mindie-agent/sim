@@ -26,7 +26,7 @@ import weakref
 import pytest
 
 from _support.linear_cases import enumerate_matrix, run_template, template_context, template_datapath
-from mindie_sim.optimization.reload_bounds import compute_compulsory_hbm_cut
+from mindie_sim.prediction.runtime.reload_bounds import compute_compulsory_hbm_cut
 from mindie_sim.prediction.engine import Allocation, Engine, Resource
 from mindie_sim.prediction.runtime.l2_residency import AdmissionMemoryView
 from mindie_sim.prediction.operators.matrix.matrix_cycle import matrix_cycle, periodic_matrix_cycle

@@ -630,10 +630,9 @@ def test_arch_aware_mla_and_mc2_native_binding_projection():
     from mindie_sim.export.trace_exporter import export_msprof_trace
     from mindie_sim.prediction.operators import mc2
     from mindie_sim.prediction.operators.paged_mla.common import default_dense_abi
+    from mindie_sim.backends.abi_registry import default_abi_registry
     from mindie_sim.prediction.structure import parse_case
-    from mindie_sim.rewrite.algebra import (
-        SHIPPING_ABI_PREDICATES, discover_algebraic_rewrites_for_ops, resolve_shipping_moe_predicate,
-    )
+    from mindie_sim.rewrite.algebra import discover_algebraic_rewrites_for_ops
     from mindie_sim.schema.operators import OpSpec
 
     # 1. Producer default dense MLA ABI: Arch35 -> FlashMla, Arch22 -> FIA.
@@ -658,11 +657,13 @@ def test_arch_aware_mla_and_mc2_native_binding_projection():
     with pytest.raises(ModelingError, match="arch22_fused_mc2_mode3_requires_arch35"):
         mc2.fused_mc2_native_binding("int8", fused_level=3, arch_family="A3")
 
-    # 3. Rewrite SHIPPING_ABI_PREDICATES: arch-qualified, complete MoE frame required, situglu rejected.
-    assert resolve_shipping_moe_predicate("A5").abi_id == "aclnnMegaMoe"
-    assert resolve_shipping_moe_predicate("A3", weight_dtype="int8").abi_id == "dispatch_ffn_combine"
-    assert resolve_shipping_moe_predicate("A3", weight_dtype="int4").abi_id == "dispatch_ffn_combine_w4_a8"
-    assert not SHIPPING_ABI_PREDICATES["aclnnMegaMoe"].supports_activation("situglu")
+    # 3. ProbedAbiRegistry & algebraic rewrite: arch-qualified, complete MoE frame required, unsupported act rejected.
+    abi_reg = default_abi_registry()
+    a5_mega_entries = abi_reg.lookup("aclnnMegaMoe", "A5", available_only=True)
+    a3_csrc_entries = abi_reg.lookup("dispatch_ffn_combine", "A3", available_only=True)
+    assert a5_mega_entries and a3_csrc_entries
+    assert all("swiglu" in e.allowed_activations and "relu2" not in e.allowed_activations for e in a5_mega_entries)
+    assert all("swiglu" in e.allowed_activations and "situglu" not in e.allowed_activations for e in a3_csrc_entries)
 
     a5_case = parse_case(compose_case("deepseek-v3.2", DIRECT_SKU, dp=1, tp=2, ep=2, layers=4, quant="mxfp8_mxfp4"))
     a3_case = parse_case(compose_case("deepseek-v3.2", GM_SKU, dp=1, tp=2, ep=2, layers=4, quant="w4a8_dynamic"))
@@ -690,11 +691,18 @@ def test_arch_aware_mla_and_mc2_native_binding_projection():
         OpSpec(op_id="l0.combine", deps=("l0.expert_down",), stage=0, layer=0, phase="decode",
                family="alltoall", recipe="expert_combine", dtype="bf16", **_sh, metadata=(("group_axis", "ep"),)),
     )
+    a3_situ_frame = (
+        situ_frame[0],
+        replace(situ_frame[1], metadata=(("activation_format", "bf16"), ("weight_format", "int8"))),
+        situ_frame[2],
+        replace(situ_frame[3], metadata=(("activation_format", "bf16"), ("weight_format", "int8"))),
+        situ_frame[4],
+    )
     a5_res = discover_algebraic_rewrites_for_ops(situ_frame, allow_mc2=True, arch_family="A5")
-    a3_res = discover_algebraic_rewrites_for_ops(situ_frame, allow_mc2=True, arch_family="A3")
-    assert any(t.candidate_abi == "aclnnMegaMoe_situ_ext" for t in a5_res.semantic_audit_triggers)
+    a3_res = discover_algebraic_rewrites_for_ops(a3_situ_frame, allow_mc2=True, arch_family="A3")
+    assert any(t.candidate_abi == "aclnnMegaMoe_situglu_ext" for t in a5_res.semantic_audit_triggers)
     assert not any("dispatch_ffn_combine" in (t.candidate_abi or "") for t in a5_res.semantic_audit_triggers)
-    assert any(t.candidate_abi == "dispatch_ffn_combine_situ_ext" for t in a3_res.semantic_audit_triggers)
+    assert any(t.candidate_abi == "dispatch_ffn_combine_situglu_ext" for t in a3_res.semantic_audit_triggers)
 
     # 4. Direct NativeCallBinding projection: recipe-rename invariant + empty ascend_kernel for logical-only ops.
     bound_op = OpSpec(

@@ -565,9 +565,10 @@ def _unabsorbed_splitv_cost(
         elem = float(dtype_bytes(out_dt))
         total_slice_bytes += float(m_dim * n_dim) * elem
         unabsorbed_slices += 1
-    if unabsorbed_slices == 0:
+    if total_slice_bytes <= 0.0 or unabsorbed_slices == 0:
         return 0.0, 0
-    return 2.0 * total_slice_bytes, unabsorbed_slices
+    # One physical SplitV launch reads the packed output and writes each contiguous slice.
+    return 2.0 * total_slice_bytes, 1
 
 
 def has_illegal_cross_precision_merge(ops: Sequence[OpSpec]) -> bool:
@@ -663,6 +664,7 @@ def _law2_sibling_key(
     if not act_ports:
         return None
     a_dt, group_size, scale_fmt = _activation_quant_key(op)
+    model_scope = str(dict(op.metadata).get("model_scope") or "target").strip().lower()
     return (
         act_ports,
         int(op.local_shape[0]),
@@ -673,6 +675,7 @@ def _law2_sibling_key(
         _weight_dtype_key(op),
         _sharding_key(op),
         _precision_abi_tuple(op),
+        model_scope,
     )
 
 

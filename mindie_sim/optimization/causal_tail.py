@@ -302,6 +302,56 @@ def _resolve_moe_weight_contract(case: Case) -> tuple[str, str, tuple[int, ...],
     return w_dt, wq, wg, ws_dt
 
 
+def _node_weight_contract(node: Any) -> tuple[str, str, tuple[int, ...], str] | None:
+    p_abi = getattr(node, "precision_abi", None)
+    meta = dict(getattr(node, "metadata", ()) or ())
+    raw_w = str(
+        (getattr(p_abi, "weight_dtype", "") if p_abi is not None else "")
+        or meta.get("weight_format")
+        or meta.get("weight_dtype")
+        or getattr(node, "dtype", "")
+        or ""
+    ).strip().lower()
+    if not raw_w:
+        return None
+    w_dt = _norm_abi_dtype(raw_w)
+    scale_fmt = str(
+        (getattr(p_abi, "weight_scale_dtype", "") if p_abi is not None else "")
+        or meta.get("weight_scale_format")
+        or meta.get("quant_scale_dtype")
+        or ""
+    ).strip().lower()
+    wb = getattr(p_abi, "weight_block", None) if p_abi is not None else None
+    wb_gs = (
+        max((int(x) for x in wb if isinstance(x, int) and not isinstance(x, bool) and x > 0), default=0)
+        if isinstance(wb, tuple)
+        else (int(wb) if isinstance(wb, int) and not isinstance(wb, bool) and wb > 0 else 0)
+    )
+    raw_gs = wb_gs if wb_gs > 0 else meta.get("weight_group_size", meta.get("quant_group_size"))
+    gs = int(raw_gs) if isinstance(raw_gs, int) and not isinstance(raw_gs, bool) and raw_gs > 1 else None
+    wq, wg, ws_dt = _quant_contract_for_port(w_dt, scale_fmt, gs, is_weight=True)
+    return w_dt, wq, wg, ws_dt
+
+
+def _resolve_moe_weight_contracts(
+    case: Case,
+    nodes: Sequence[Any] = (),
+) -> tuple[tuple[str, str, tuple[int, ...], str], tuple[str, str, tuple[int, ...], str]]:
+    base = _resolve_moe_weight_contract(case)
+    gmm_nodes = [
+        n for n in nodes
+        if str(getattr(n, "family", "") or "").strip().lower() in {"grouped_gemm", "grouped_matmul", "grouped_moe"}
+    ]
+    if len(gmm_nodes) >= 2:
+        c1 = _node_weight_contract(gmm_nodes[0]) or base
+        c2 = _node_weight_contract(gmm_nodes[1]) or base
+        return c1, c2
+    if len(gmm_nodes) == 1:
+        c1 = _node_weight_contract(gmm_nodes[0]) or base
+        return c1, c1
+    return base, base
+
+
 def _build_moe_abi_query(
     case: Case,
     *,
@@ -318,7 +368,9 @@ def _build_moe_abi_query(
     wq: str,
     wg: tuple[int, ...],
     ws_dt: str,
+    w2_contract: tuple[str, str, tuple[int, ...], str] | None = None,
 ) -> AbiQueryKey:
+    w2_dt, wq2, wg2, ws2_dt = w2_contract if w2_contract is not None else (w_dt, wq, wg, ws_dt)
     lp = _resolve_moe_layer_plan(case)
     h_dim = int(getattr(case.model, "hidden_size", 0) or 0)
     inter_dim = int(getattr(lp, "moe_intermediate_size", 0) or 0) if lp is not None else 0
@@ -336,12 +388,12 @@ def _build_moe_abi_query(
         base_ops: list[OperandPortSig] = [
             _port("x", "bf16", (1, h_dim)),
             _port("weight1", w_dt, (h_dim, inter_dim), layout="FRACTAL_NZ", quant_mode=wq, group_shape=wg, scale_dtype=ws_dt),
-            _port("weight2", w_dt, (inter_dim, h_dim), layout="FRACTAL_NZ", quant_mode=wq, group_shape=wg, scale_dtype=ws_dt),
+            _port("weight2", w2_dt, (inter_dim, h_dim), layout="FRACTAL_NZ", quant_mode=wq2, group_shape=wg2, scale_dtype=ws2_dt),
             _port("expert_idx", "int32", (1, max(1, top_k)), quant_mode="none"),
             _port("scale1", "fp32", (1,)),
             _port("scale2", "fp32", (1,)),
         ]
-        if w_dt == "int4":
+        if w_dt == "int4" or w2_dt == "int4":
             base_ops.extend((_port("bias1", "fp32", (1,)), _port("bias2", "fp32", (1,))))
         base_ops.append(_port("probs", "fp32", (1, max(1, top_k))))
         operands = tuple(base_ops)
@@ -355,7 +407,7 @@ def _build_moe_abi_query(
             _port("topk_ids", "int32", (1, max(1, top_k)), quant_mode="none"),
             _port("topk_weights", "fp32", (1, max(1, top_k))),
             _port("weight1", w_dt, (h_dim, inter_dim), layout="FRACTAL_NZ", quant_mode=wq, group_shape=wg, scale_dtype=ws_dt),
-            _port("weight2", w_dt, (inter_dim, h_dim), layout="FRACTAL_NZ", quant_mode=wq, group_shape=wg, scale_dtype=ws_dt),
+            _port("weight2", w2_dt, (inter_dim, h_dim), layout="FRACTAL_NZ", quant_mode=wq2, group_shape=wg2, scale_dtype=ws2_dt),
         )
         outputs = (_port("y", "bf16", (1, h_dim)), _port("expert_token_nums", "int64", (1,)))
         motif = "moe_mc2_frame"
@@ -430,7 +482,7 @@ def moe_route_legality(
     pr_track: StackTrack = track_spec.track if track_spec is not None else "shipping"
     eff_bindings = manifest_bindings or (track_spec.active_bindings if track_spec is not None else ())
     placement = _resolve_moe_rank_placement(case, soc_arch, ep)
-    w_dt, wq, wg, ws_dt = _resolve_moe_weight_contract(case)
+    (w_dt, wq, wg, ws_dt), w2_contract = _resolve_moe_weight_contracts(case, nodes)
 
     if lvl == 0:
         if mso and not _model_has_shared_experts(case, nodes):
@@ -479,7 +531,7 @@ def moe_route_legality(
         case, soc_arch=soc_arch, sku_id=sku_id, abi_id=abi_id,
         ep=ep, placement=placement, activation_kind=act_kind, is_act_and_mul=is_act_and_mul,
         shared_experts_per_rank=shared_per_rank, pr_track=pr_track,
-        w_dt=w_dt, wq=wq, wg=wg, ws_dt=ws_dt,
+        w_dt=w_dt, wq=wq, wg=wg, ws_dt=ws_dt, w2_contract=w2_contract,
     )
     verdict = reg.verify(query, track_spec=track_spec, manifest_bindings=eff_bindings)
     if verdict.status in {"admitted_shipping", "admitted_proposed_pr"}:

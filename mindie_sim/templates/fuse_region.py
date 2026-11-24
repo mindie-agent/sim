@@ -1350,7 +1350,9 @@ def _extract_hardware_supply(
 
 
 def _formula_row_sram_bytes(spec: FormulaKernelSpec) -> tuple[bool, bool, int, int, int, int]:
-    """Compute ``(has_cube, has_aiv, tile_n, row_fp32_bytes, l1_tile, l0_tile)`` for ``spec``."""
+    """Compute ``(has_cube, has_aiv, tile_n, row_fp32_bytes, l1_tile, l0_tile)`` with live-value UB tracking."""
+    from .contracts import _extract_op_operand_ports
+
     has_cube = any(fl > 0.0 for _, fl in spec.matrix_flops)
     infos = tuple(_infer_op_symbolic_kind(op) for op in spec.atomic_ops)
     has_row_red = bool(spec.row_reduction) or any(info[2] for info in infos)
@@ -1365,8 +1367,15 @@ def _formula_row_sram_bytes(spec: FormulaKernelSpec) -> tuple[bool, bool, int, i
     out_b = max((formula_elem_bytes(t.dtype) for t in spec.outputs), default=0.0)
     internal_red_widths: list[int] = []
     internal_aiv_widths: list[int] = []
-    internal_row_bytes: list[int] = []
-    for op, (_kind, is_mat, is_red, _act, _params) in zip(spec.atomic_ops, infos):
+    op_work_bytes: list[int] = []
+    op_out_row_bytes: list[int] = []
+    op_is_mat: list[bool] = []
+    idx_by_id = {op.op_id: idx for idx, op in enumerate(spec.atomic_ops)}
+    last_use: dict[int, int] = {}
+    ext_first_use: dict[str, int] = {}
+    ext_last_use: dict[str, int] = {}
+    ext_row_bytes: dict[str, int] = {}
+    for idx, (op, (_kind, is_mat, is_red, _act, _params)) in enumerate(zip(spec.atomic_ops, infos)):
         meta = dict(op.metadata) if op.metadata else {}
         in_dt = str(meta.get("activation_format") or meta.get("input_dtype") or op.dtype)
         out_dt = str(meta.get("output_format") or meta.get("output_dtype") or op.dtype)
@@ -1374,20 +1383,44 @@ def _formula_row_sram_bytes(spec: FormulaKernelSpec) -> tuple[bool, bool, int, i
         op_out_raw = formula_elem_bytes(out_dt)
         in_b = max(in_b, op_in_raw)
         out_b = max(out_b, op_out_raw)
-        if is_mat or not op.local_shape:
-            continue
-        op_n = int(op.local_shape[-1])
-        if op_n <= 0:
+        op_n = int(op.local_shape[-1]) if op.local_shape else 0
+        for prod_id, _, _ in _extract_op_operand_ports(op):
+            if prod_id in idx_by_id:
+                p_idx = idx_by_id[prod_id]
+                last_use[p_idx] = max(last_use.get(p_idx, p_idx), idx)
+            else:
+                ext_first_use.setdefault(prod_id, idx)
+                ext_last_use[prod_id] = max(ext_last_use.get(prod_id, idx), idx)
+                if op_n > 0:
+                    ext_row_bytes[prod_id] = max(ext_row_bytes.get(prod_id, 0), int(op_n * op_in_raw))
+        op_is_mat.append(is_mat)
+        if is_mat or op_n <= 0:
+            op_work_bytes.append(0)
+            op_out_row_bytes.append(int(op_n * op_out_raw) if op_n > 0 else 0)
             continue
         op_in_b = max(op_in_raw, float(FP32_BYTES))
         op_out_b = max(op_out_raw, float(FP32_BYTES))
+        op_out_row_bytes.append(int(op_n * op_out_raw))
         if is_red:
             internal_red_widths.append(op_n)
-            internal_row_bytes.append(int(op_n * (op_in_b + op_out_b + float(FP32_BYTES))))
+            op_work_bytes.append(int(op_n * (op_in_b + op_out_b + float(FP32_BYTES))))
         else:
             internal_aiv_widths.append(op_n)
-            if has_row_red:
-                internal_row_bytes.append(int(op_n * (op_in_b + op_out_b)))
+            op_work_bytes.append(int(op_n * (op_in_b + op_out_b)) if has_row_red else 0)
+
+    internal_peak_bytes = 0
+    for j, work_j in enumerate(op_work_bytes):
+        if op_is_mat[j] or work_j <= 0:
+            continue
+        carried = sum(
+            op_out_row_bytes[k] for k in range(j)
+            if last_use.get(k, -1) > j
+        )
+        carried_ext = sum(
+            ext_row_bytes.get(pid, 0) for pid, f_idx in ext_first_use.items()
+            if f_idx < j < ext_last_use.get(pid, -1)
+        )
+        internal_peak_bytes = max(internal_peak_bytes, work_j + carried + carried_ext)
 
     width_pool = [int(sh[-1]) for sh in all_shapes] + internal_aiv_widths + internal_red_widths
     inner_dim = max(width_pool, default=_CUBE_TILE_MN_ELEMS)
@@ -1401,7 +1434,7 @@ def _formula_row_sram_bytes(spec: FormulaKernelSpec) -> tuple[bool, bool, int, i
         base_row_bytes = int(tile_n * (max(in_b, float(FP32_BYTES)) + max(out_b, float(FP32_BYTES))))
         if has_row_red:
             base_row_bytes += int(tile_n * FP32_BYTES)
-        row_fp32_bytes = max(base_row_bytes, max(internal_row_bytes, default=0))
+        row_fp32_bytes = max(base_row_bytes, internal_peak_bytes)
     else:
         row_fp32_bytes = 0
     if has_cube:
@@ -1431,11 +1464,17 @@ def solve_formula_sram(
     l0_budget = int(bufs.get("l0c", 0) or 0)
     has_cube, has_aiv, tile_n, row_fp32_bytes, l1_tile, l0_tile = _formula_row_sram_bytes(spec)
 
-    has_simd_ub_headroom = bool(has_aiv and carveout > 0 and ub_raw > ub_budget)
-    cand_modes: tuple[tuple[int, bool], ...] = (
-        ((_UB_DOUBLE_BUFFER_SLOTS, True), (1, True), (1, False))
-        if has_simd_ub_headroom else ((_UB_DOUBLE_BUFFER_SLOTS, False), (1, False))
-    )
+    if spec.uses_simt:
+        if has_aiv and carveout <= 0:
+            return (
+                None, "simt_unsupported", f"(M=1, N={tile_n}, K={_CUBE_TILE_K_ELEMS if has_cube else 1})",
+                row_fp32_bytes, 0, l1_tile, l1_budget, l0_tile, l0_budget, 1, False,
+            )
+        cand_modes: tuple[tuple[int, bool], ...] = ((_UB_DOUBLE_BUFFER_SLOTS, True), (1, True))
+        max_ub_budget = ub_budget
+    else:
+        cand_modes = ((_UB_DOUBLE_BUFFER_SLOTS, False), (1, False))
+        max_ub_budget = ub_raw
     candidates: list[TileCandidate] = []
     owner_part = (cube_budget or datapath.aic_count, vec_budget or datapath.aiv_count)
     for slots, cand_simt in cand_modes:
@@ -1467,7 +1506,6 @@ def solve_formula_sram(
         buffer_units={"ub": datapath.aiv_count, "l1": datapath.aic_count, "l0c": datapath.aic_count, "l2": 1},
         stream_owners=None,
     )
-    max_ub_budget = ub_raw if has_simd_ub_headroom else ub_budget
     if has_aiv and ub_raw <= 0:
         return tile_spec, "unbounded", f"(M=1, N={tile_n}, K=1)", 0, 0, l1_tile, l1_budget, l0_tile, l0_budget, 1, False
     try:
@@ -1475,7 +1513,7 @@ def solve_formula_sram(
         peaks = {p.pool: int(p.peak_bytes) for p in solved.pool_peaks}
         caps = {p.pool: int(p.capacity_bytes) for p in solved.pool_peaks}
         ub_pk = peaks.get("ub", row_fp32_bytes) if has_aiv else 0
-        eff_ub_budget = caps.get("ub", ub_budget) if has_aiv else ub_budget
+        eff_ub_budget = caps.get("ub", max_ub_budget) if has_aiv else max_ub_budget
         l1_pk = peaks.get("l1", l1_tile) if has_cube else 0
         l0_pk = peaks.get("l0c", l0_tile) if has_cube else 0
         ok = (
@@ -1515,9 +1553,6 @@ def _resolve_formula_work_bytes(spec: FormulaKernelSpec) -> tuple[float, float, 
     mte3 = float(spec.mte3_bytes_override) if spec.mte3_bytes_override is not None else out_bytes
     hbm = float(spec.hbm_bytes_override) if spec.hbm_bytes_override is not None else (mte2 + mte3)
     vec_ops = float(spec.vector_ops_fp32)
-    if vec_ops <= 0.0 and not spec.matrix_flops and spec.equations:
-        elems = max((t.num_elements for t in (*spec.inputs, *spec.outputs)), default=0)
-        vec_ops = float(elems) * _FORMULA_VEC_OPS_PER_ELEM * float(len(spec.equations))
     return max(0.0, mte2), max(0.0, mte3), max(0.0, hbm), max(0.0, vec_ops)
 
 
@@ -1773,8 +1808,5 @@ def resolve_tilelang_dual_tier_bounds(
             vec_simt_ms = float(vector_ops) / simt_ops_per_ms
         t_quick_ms = max(simd_target_ms, dma_simt_ms, vec_simt_ms, cube_tl_ms, disp_ms)
     raw_simt_gain = before_ms - t_quick_ms
-    if simd_gain_ms >= 0.0:
-        simt_gain_ms = min(simd_gain_ms, max(0.0, raw_simt_gain))
-    else:
-        simt_gain_ms = min(simd_gain_ms, raw_simt_gain)
+    simt_gain_ms = min(simd_gain_ms, raw_simt_gain)
     return simt_gain_ms, simd_gain_ms, ub_warn

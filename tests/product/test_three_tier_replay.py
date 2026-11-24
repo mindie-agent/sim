@@ -21,8 +21,9 @@ from mindie_sim.feature_mechanisms import compare_feature_tracks
 from mindie_sim.optimization.framework_solver import _TrialSearch
 from mindie_sim.optimization import (
     PrimitiveCapacityEntry, PrimitiveCapacityTable, TensorRangeObligation, build_dual_inputs_from_scenario,
-    certify_lower_bound, compute_compulsory_hbm_cut, inward_floor_ns,
+    certify_lower_bound, inward_floor_ns,
 )
+from mindie_sim.prediction.runtime.reload_bounds import compute_compulsory_hbm_cut
 from mindie_sim.optimization.ladder import (
     SHIPPING_OVERLAY, SHIPPING_REGRESSION_TOLERANCE_NS, FiveLevelReport, _shipping_regression,
     partition_step_wall_ns,
@@ -142,7 +143,7 @@ def test_parallel_completion_partitions_one_wall_clock():
     tail = replace(rows[0], occurrence=OpOccurrence(0, 0, 0, "tail"), ordinal=2,
                    predecessors=(rows[1].occurrence,), ready_ms=10, start_ms=11, end_ms=13)
     parts = dict(partition_step_wall_ns(replace(step, span_ms=13, operators=(*rows, tail))))
-    assert parts == {"second": 10 * NS_PER_MS, "step:wait": NS_PER_MS, "tail": 2 * NS_PER_MS}
+    assert parts == {"first": 10 * NS_PER_MS, "step:wait": NS_PER_MS, "tail": 2 * NS_PER_MS}
 
 def test_shipping_regression_reports_measured_leave_one_out_culprit():
     case, step = _case(REPRESENTATIVE_SKUS["a5"], tp=4), StepRequest("prefill", tokens=64)
@@ -363,7 +364,7 @@ def test_pointwise_nd_shape_and_gate4_rejects_matrix_recipe_downgrade():
     dossier = prepare_scenario(ScenarioRequest(case, StepRequest("decode", tokens=4, context=64)))
     refs = (OpRef("atom", "s0.l0.norm1"), OpRef("atom", "s0.l0.qkv"))
     bad_fuse = replace(dossier.unmerge_plan, edits=(
-        Edit("bad_fuse", operation=FuseRegion(refs, (), (KernelBoundary("pointwise", refs),))),
+        Edit("bad_fuse", operation=FuseRegion(refs, (), (KernelBoundary("pointwise", refs),), fusion_tier="K3_dsl_pipeline")),
     ))
     bad_select = replace(dossier.unmerge_plan, edits=(
         Edit("bad_sel", operation=SelectTemplate(OpRef("atom", "s0.l0.qkv"), "K3", "pointwise")),
@@ -524,7 +525,7 @@ def _unit_hbm_case():
 def test_verify_plan_rejects_fabricated_traffic_and_disambiguates_explicit_k3():
     from _support.linear_cases import tile_edge
     from mindie_sim.catalog.ops import vector_op
-    from mindie_sim.optimization.dsl_solver import _dsl_proposals
+    from mindie_sim.rewrite.catalog_replay import _dsl_proposals
     from mindie_sim.prediction.program.stages import Stage
     from mindie_sim.rewrite.schema import decode_rewrite_plan, encode_rewrite_plan, plan_sha256
     from mindie_sim.rewrite.verify import verify_plan
@@ -574,7 +575,7 @@ def test_verify_plan_rejects_fabricated_traffic_and_disambiguates_explicit_k3():
 def test_catalog_and_shipping_hbm_arbiter_and_nonzero_weight_ranges():
     from mindie_sim.catalog.ops import gemm_op
     from mindie_sim.catalog.types import QuantSpec
-    from mindie_sim.optimization.dsl_solver import _catlass_proposals
+    from mindie_sim.rewrite.catalog_replay import _catlass_proposals
     from mindie_sim.prediction.streams import StreamCoreBudget, StreamLane
     from mindie_sim.rewrite.schema import StreamSchedule
 
