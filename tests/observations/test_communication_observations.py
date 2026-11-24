@@ -425,7 +425,12 @@ def test_contention_slowdown_chained_moe_and_followup_manifest(embedded):
 
 
 def test_directory_ingest_chunked_streaming_and_window_isolation(tmp_path, monkeypatch):
-    (tmp_path / "chain-validation.json").write_text(json.dumps([_chain("c1")]), encoding="utf-8")
+    bad_list = tmp_path / "bad-list.json"
+    bad_list.write_text(json.dumps([_chain("c1")]), encoding="utf-8")
+    with pytest.raises(ValueError, match="a5_campaign_source_list_not_a_campaign"):
+        comm.ingest_a5_campaign_data(bad_list)
+    bad_list.unlink()
+    (tmp_path / "chain-validation.json").write_text(json.dumps(_campaign("chain-validation", [], chains=[_chain("c1")])), encoding="utf-8")
     (tmp_path / "comm-lane.json").write_text(json.dumps({"raw_points": [
         {"dtype": "int8", "ep": 2, "link_bytes": 1024, "ms": 0.5},
         {"dtype": "int8", "ep": 2, "link_bytes": 2048, "ms": 0.7}]}), encoding="utf-8")

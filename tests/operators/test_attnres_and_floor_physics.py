@@ -610,3 +610,65 @@ def test_attnres_requires_a5_hardware_ple_conv_honors_speculative_k_and_zero_leg
         for ref in getattr(mod, "SOURCES", ()):
             assert legacy_needle not in ref.repository.lower(), (mod_name, ref.repository)
             assert legacy_needle not in ref.relative_path.lower(), (mod_name, ref.relative_path)
+
+
+def test_layer_runs_disables_skipping_on_dag_mutation_and_l2_fingerprint_change(monkeypatch) -> None:
+    """Adversarial intra-layer DAG mutation or L2 residency drift must disable cohort skipping."""
+    from mindie_sim.prediction.execution import layer_runs
+    from mindie_sim.prediction import graph_analysis
+    from mindie_sim.prediction.operator_analysis import target_graphs
+    from mindie_sim.prediction.structure import parse_case
+    from mindie_sim.schema.operators import OpSpec
+
+    raw = compose_case("qwen3-32b", REPRESENTATIVE_SKUS["a5"], layers=6, tp=1, ep=1, quant="bf16")
+    case = parse_case(raw)
+    graphs = target_graphs(case, phase="decode", tokens=1, context=64, sequences=1, scope="body")
+    r0 = list(graphs[0])
+
+    # 1. Adversarial intra-layer DAG mutation inside layer 2: inject a synthetic
+    #    11.0 ms serial dependency difference on a non-representative layer so
+    #    skipping would return the wrong span; literal == evaluated (11.0 ms).
+    l2_ops = [op for op in r0 if op.layer == 2]
+    assert len(l2_ops) >= 3
+    mutated_op = replace(l2_ops[2], deps=tuple(dict.fromkeys((*l2_ops[2].deps, l2_ops[0].op_id))))
+    mutated_r0 = tuple(mutated_op if op.op_id == mutated_op.op_id else op for op in r0)
+    mutated_graphs = {0: mutated_r0}
+
+    real_graph_costs = graph_analysis.graph_costs
+
+    def fake_costs(_case, gs, **kw):
+        ops_in = gs[0] if isinstance(gs, dict) else gs
+        has_mut = any(op.op_id == mutated_op.op_id and l2_ops[0].op_id in op.deps for op in ops_in)
+        dur = 11.0 if has_mut else 6.0
+        return {
+            "duration_ms": dur, "complete_ms": dur, "input_ready_ms": 0.0,
+            "timeline": [], "operator_occurrences": len(ops_in),
+            "l2_residency_fingerprints": ("fp_same", "fp_same"),
+        }
+
+    monkeypatch.setattr(graph_analysis, "graph_costs", fake_costs)
+    rep_mut, red_mut, _ = layer_runs.execute_native_cohort_graph(
+        case, mutated_graphs, external_inputs={"analysis_input": 0.0}, fast_span_only=True,
+    )
+    assert red_mut is None and rep_mut["duration_ms"] == pytest.approx(11.0)
+
+    # 2. L2 residency fingerprint drift across reduced execution disables skipping.
+    calls = {"n": 0}
+
+    def drift_costs(_case, gs, **kw):
+        calls["n"] += 1
+        is_reduced = kw.get("layer_span_body_ids") is not None
+        if is_reduced:
+            return {
+                "duration_ms": 3.0, "complete_ms": 3.0, "input_ready_ms": 0.0,
+                "layer_bounds": {("target", i): (0, float(i), float(i + 1)) for i in range(6)},
+                "non_body_bounds": [], "l2_residency_fingerprints": ("fp_before", "fp_after_drifted"),
+            }
+        return {"duration_ms": 11.0, "complete_ms": 11.0, "input_ready_ms": 0.0}
+
+    monkeypatch.setattr(graph_analysis, "graph_costs", drift_costs)
+    rep_drift, red_drift, _ = layer_runs.execute_native_cohort_graph(
+        case, {0: tuple(r0)}, external_inputs={"analysis_input": 0.0}, fast_span_only=True,
+    )
+    assert red_drift is None and rep_drift["duration_ms"] == pytest.approx(11.0) and calls["n"] == 2
+    monkeypatch.setattr(graph_analysis, "graph_costs", real_graph_costs)

@@ -733,5 +733,5 @@ def test_splitk_workspace_charges_fixpipe_and_routes_warm_vs_spill_reads():
     )
     ctx_l2 = replace(ctx_l2, work=ctx_l2.bind(plan_l2.work))
     prog_l2 = plan_l2.program(ctx_l2)
-    assert [s.name for s in prog_l2.stages] == ["router_prologue_drain", "split_k"]
+    assert [s.name for s in prog_l2.stages] == ["setup", "splits", "merge"]
     assert eng_l2.serviced["cube"] == pytest.approx(ctx_l2.bind(plan_l2.work)["cube"])

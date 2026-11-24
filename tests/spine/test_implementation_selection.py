@@ -23,7 +23,8 @@ from mindie_sim.prediction.operators.attention.attention import AttentionPolicy
 from mindie_sim.prediction.operators.attention.attention_pipeline import TiledFlashAndPagedAttentionRecipe
 from mindie_sim.prediction.operators.kda.family_kda_recurrent_membase import IMPLEMENTATION as DECODE
 from mindie_sim.prediction.operators.kda.family_kda_state import IMPLEMENTATION as PREFILL
-from mindie_sim.prediction.operators.paged_mla.family_mqsmla import query_rows, query_shape, unsupported_reason
+from mindie_sim.prediction.operators.paged_mla.family_mqsmla import query_shape, unsupported_reason
+from mindie_sim.prediction.operators.paged_mla.mqsmla import query_rows
 from mindie_sim.prediction.frontend import Frontend
 from mindie_sim.prediction.implementation_selection import graph_selections
 from mindie_sim.prediction.operators.mc2.mc2_graph import lower, select_common

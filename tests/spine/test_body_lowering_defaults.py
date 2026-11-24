@@ -159,8 +159,6 @@ def test_dense_mla_body_default_respects_kernel_head_domain(model, sku):
 @pytest.mark.parametrize("sku,expected_kda", KDA_SKUS)
 def test_kda_body_defaults_install_scan_and_attention_residual(sku, expected_kda):
     raw = compose_case("kimi-k3", hardware=sku, tp=8, dp=1, ep=8, num_devices=8, quant="w4a8", layers=8)
-    from mindie_sim.prediction.operators.hyper_connections import family_attnres
-    raw.setdefault("runtime", {}).setdefault("metadata", {})["image_id"] = family_attnres.SOURCE["image_id"]
     for name in ("kda", "attention_residual"): raw["runtime"].setdefault("kernels", {}).setdefault("lowerings", {}).pop(name, None)
     effective, report = attention_defaults(parse_case(raw), "decode", tokens=1); lowerings = effective.runtime.kernels.get("lowerings", {}); kda_entry = lowerings.get("kda")
     assert (kda_entry["implementation"] if isinstance(kda_entry, dict) else kda_entry) == expected_kda

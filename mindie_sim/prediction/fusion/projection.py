@@ -615,6 +615,8 @@ def project_graph(case, ops: tuple[OpSpec, ...], *,
     opaque = frozenset(opaque_ops)
     external_names = frozenset(external_data)
     dtype = str(getattr(getattr(case, "model", None), "activation_dtype", "") or "").strip()
+    if not dtype and case is None and ops and all(getattr(op, "dtype", None) for op in ops):
+        dtype = str(ops[0].dtype).strip()
     if not dtype:
         raise FeasibilityError("projection_model_activation_dtype_missing")
     tensor_parallel = int(getattr(getattr(case, "runtime", None), "parallel", None)

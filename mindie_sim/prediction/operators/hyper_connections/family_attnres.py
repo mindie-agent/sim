@@ -185,6 +185,20 @@ def source_image_match(runtime, *, machine=None) -> bool:
     return _attnres_arch_supported(arch)
 
 
+def is_excluded(runtime) -> bool:
+    """True when runtime exclusions or execution policy disable auto AttnRes prefix fusion."""
+    meta = dict(getattr(runtime, "metadata", ()) or ())
+    report = meta.get("feature_track_report")
+    if isinstance(report, dict):
+        excluded = report.get("explicit_excluded") or ()
+        if "attn_res_prefix_fusion" in excluded:
+            return True
+    policy = meta.get("execution_policy")
+    if isinstance(policy, dict) and policy.get("automatic_optional_fusions") is False:
+        return True
+    return False
+
+
 def explicit_generic(kernels):
     recipes = {"attn_res_fwd", "residual_values_fp32", "rmsnorm",
                "attention_residual_scores", "attention_residual_softmax",
@@ -221,7 +235,7 @@ def selection(runtime, *, model=None, phase=None, machine=None):
         if not isinstance(value, bool):
             raise ModelingError("attn_res_optimize_prefill_must_be_boolean")
         return {"optimize_prefill": value}
-    if model is None or phase is None or explicit_generic(runtime.kernels):
+    if model is None or phase is None or explicit_generic(runtime.kernels) or is_excluded(runtime):
         return None
     if not source_eligible(model, arch, phase):
         return None

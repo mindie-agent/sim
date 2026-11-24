@@ -48,6 +48,7 @@ class Completion:
     done: bool = True
     generation: int = 0
     time: float | None = 0.0
+    runtime_uid: str = "runtime-test"
 
 
 def _fresh(capacity=2 * PAGE):
@@ -711,3 +712,48 @@ def test_replicated_draft_kv_ignores_target_rank_token_owners():
     assert is_sharded0 is True and is_sharded1 is True
     assert draft_b0 == pytest.approx(draft_b1)
     assert draft_b0 == pytest.approx(2048 * 576 * 2 * 2)
+
+
+def test_ledger_cross_engine_isolation_pending_release_and_unknown_domain_ceiling():
+    """Verify runtime_uid event isolation, pending last_use preservation, and strict domain HBM ceilings."""
+    state = LedgerState(uid="rt-A")
+    pool = _pool(state, "memory", 2 * PAGE)
+    ev_a_acq = Completion(sequence=1, done=True, time=0.0, runtime_uid="rt-A")
+    ev_a_use = Completion(sequence=2, done=False, time=None, runtime_uid="rt-A")
+    ev_b_seq2 = Completion(sequence=2, done=True, time=1.0, runtime_uid="rt-B")
+    ev_other_done = Completion(sequence=9, done=True, time=0.5, runtime_uid="rt-A")
+
+    def _rt_key(idx: int) -> AllocationKey:
+        return AllocationKey(
+            occurrence=OccurrenceKey(runtime_uid="rt-A", launch=1, ordinal=idx),
+            scope_kind="invocation", scope_ordinal=idx, symbol=idx, generation=0,
+        )
+
+    alloc_key = _rt_key(1)
+    binding = AllocationBinding(key=alloc_key, pool=pool, amount=float(PAGE), last_use=ev_a_use)
+    res_acq = Ledger.try_acquire(state, (binding,), holder="h0", at=ev_a_acq)
+    assert res_acq.granted is True and Ledger.usage(state)["memory"][pool] == pytest.approx(PAGE)
+
+    # release(after=None) and release(after=done_other) MUST preserve pending last_use (ev_a_use).
+    rel_none = Ledger.release(state, alloc_key, after=None)
+    assert rel_none.released is False and rel_none.deferred is True
+    rel_other = Ledger.release(state, alloc_key, after=ev_other_done)
+    assert rel_other.released is False and rel_other.deferred is True
+    assert Ledger.usage(state)["memory"][pool] == pytest.approx(PAGE)
+
+    # Cross-Engine seq=2 from rt-B MUST NOT settle rt-A's pending seq=2 event.
+    assert Ledger.settle(state, (ev_b_seq2,)) == ()
+    assert Ledger.usage(state)["memory"][pool] == pytest.approx(PAGE)
+
+    # Settling rt-A's own seq=2 event completes the deferred release.
+    ev_a_use_done = Completion(sequence=2, done=True, time=2.0, runtime_uid="rt-A")
+    settled = Ledger.settle(state, (ev_a_use_done,))
+    assert len(settled) == 1 and settled[0].released is True
+    assert Ledger.usage(state)["memory"][pool] == pytest.approx(0.0)
+
+    # Unknown domain MUST fail closed even when 1 domain exists, and registered HBM ceiling MUST block overflow.
+    unknown_pool = PoolKey(physical_domain="unregistered-hbm", rank=0, tier="hbm", name="hbm")
+    with pytest.raises(LedgerError, match="capacity_domain_missing"):
+        Ledger.try_acquire(state, (AllocationBinding(key=_rt_key(2), pool=unknown_pool, amount=float(PAGE)),), holder="h1", at=ev_a_acq)
+    over = Ledger.try_acquire(state, (AllocationBinding(key=_rt_key(3), pool=pool, amount=float(3 * PAGE)),), holder="h2", at=ev_a_acq)
+    assert over.granted is False and over.reason == "capacity_exceeded" and pool in over.blocked_pools

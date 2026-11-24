@@ -1822,7 +1822,7 @@ def _resolve_gqa_kv_planes(
                 write_trigger="append",
             ),
         )
-    if upper in {"QK_MXFP8_DYNAMIC_V_MXFP8_PER_CHANNEL", "MXFP8", "FP8", "FP8_E4M3"}:
+    if upper in {"QK_MXFP8_DYNAMIC_V_MXFP8_PER_CHANNEL", "MXFP8", "FP8", "FP8_E4M3", "FP8_DYNAMIC"}:
         groups = max(1, head_dim // _MX_BLOCK_ELEMENTS)
         return (
             CachePlaneABI(
@@ -1895,7 +1895,7 @@ def _resolve_mla_cache_planes(
                 write_trigger="append",
             )
         )
-    elif upper in {"C8", "FAQUANT", "FAKQUANT", "INT8", "FP8", "FP8_E4M3", "MXFP8"}:
+    elif upper in {"C8", "FAQUANT", "FAKQUANT", "INT8", "FP8", "FP8_E4M3", "FP8_DYNAMIC", "MXFP8"}:
         payload_dt = "int8" if upper in {"C8", "FAQUANT", "FAKQUANT", "INT8"} else "fp8_e4m3"
         raw_scale = str(scale_dtype or "").strip().lower()
         if upper == "MXFP8" or raw_scale in {"e8m0", "fp8_e8m0"}:
@@ -1970,7 +1970,7 @@ def _resolve_index_cache_planes(
                 write_trigger="append",
             ),
         )
-    if upper in {"INT8", "C8", "FP8", "FP8_E4M3", "MXFP8"}:
+    if upper in {"INT8", "C8", "FP8", "FP8_E4M3", "FP8_DYNAMIC", "MXFP8"}:
         idx_dt = "int8" if upper in {"INT8", "C8"} else "fp8_e4m3"
         raw_scale = str(scale_dtype or "").strip().lower()
         if upper == "MXFP8" or raw_scale in {"e8m0", "fp8_e8m0"}:

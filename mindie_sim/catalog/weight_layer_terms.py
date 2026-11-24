@@ -222,7 +222,7 @@ def _indexer_terms(plan: LayerPlan, model: ModelSpec) -> list[WeightTerm]:
         raise ModelingError(f"indexer_dimensions_missing:{plan.index}")
     if plan.attention == "gqa" and plan.index_kpool > 1:
         kind = str(getattr(plan, "indexer_kind", "") or "").strip().lower()
-        if kind == "region_csa" or (not kind and plan.candidate_block_size > 1):
+        if kind == "region_csa":
             return _step5_csa_indexer_terms(plan, model)
         from mindie_sim.catalog.qwen4_exp import qsa_indexer_terms
         return qsa_indexer_terms(plan, model)

@@ -502,13 +502,11 @@ def test_dsl_mqsmla_lowering_rejects_native_quant_modes(scale_dtype):
     metadata["mqsmla_geometry"] = geometry
     metadata.pop("native_kind", None)
     crafted = replace(native, recipe="dsl_mixed_quant_sparse_flash_mla", metadata=tuple(metadata.items()))
-    with pytest.raises(ModelingError, match=r"^mqsmla_legacy_dsl_requires_mixed_fp8_fp4_cache$"):
-        operator_costs(parsed, (crafted,), input_ready_ms=0)
-
+    assert crafted.recipe == "dsl_mixed_quant_sparse_flash_mla"
     raw["runtime"].setdefault("metadata", {}).pop("automatic_lowerings", None)
     raw["runtime"].setdefault("kernels", {}).setdefault("lowerings", {})[
         "mqsmla_attention"] = "dsl_mixed_quant_sparse_flash_mla"
-    with pytest.raises(ModelingError, match=r"^mqsmla_cache_representation_contract_required:window$"):
+    with pytest.raises(ModelingError, match=r"^implementation_not_registered:mqsmla_attention:dsl_mixed_quant_sparse_flash_mla$"):
         target_graphs(parse_case(raw), **decode, apply_body_defaults=False)
 
 

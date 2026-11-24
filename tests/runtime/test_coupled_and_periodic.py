@@ -1,18 +1,15 @@
-"""Coupled flows, compact steady pipelines, prepared stages and periodic panels.
+"""Coupled flows, prepared stages and periodic panels.
 
 [Role] Pin the program-level schedules the Engine executes without expanding
-  every tile: coupled multi-resource flows under backpressure, the compact
-  two-stage ``SteadyPipeline`` (which must equal the detailed
-  ``PipelineProgram`` and an independent slot recurrence), prepared immutable
+  every tile: coupled multi-resource flows under backpressure, prepared immutable
   ``Stage`` reuse, and ``periodic_matrix_cycle`` jumps checked against a
   literal panel/micro recurrence and the real ``RefillPipeline``.
 [Invariants] A coupled flow never reads ahead of its slowest contended
-  resource and owners never lend idle units; compact == detailed == recurrence
-  for every full/tail geometry the compact form admits, and it refuses the rest
-  explicitly; reused stages give byte-identical traces; periodic jumps keep the
-  exact span with stepped + jumped == total panels; work is conserved exactly.
-[Timeouts & Locks] In-memory Engine runs only; 10M-item and 100k-repeat cases
-  are O(1)/O(period) by construction and finish in milliseconds.
+  resource and owners never lend idle units; reused stages give byte-identical
+  traces; periodic jumps keep the exact span with stepped + jumped == total
+  panels; work is conserved exactly.
+[Timeouts & Locks] In-memory Engine runs only; 100k-repeat cases are
+  O(1)/O(period) by construction and finish in milliseconds.
 [Side-Effect Policy] No filesystem, environment or network access.
 """
 from __future__ import annotations
@@ -32,7 +29,6 @@ from mindie_sim.prediction.runtime.l2_residency import AdmissionMemoryView
 from mindie_sim.prediction.operators.matrix.matrix_cycle import matrix_cycle, periodic_matrix_cycle
 from mindie_sim.prediction.program import KernelProgram, PipelineProgram, Stage
 from mindie_sim.prediction.operators.matrix.refill import RefillPipeline
-from mindie_sim.prediction.operators.matrix.steady_pipeline import SteadyPipeline
 from mindie_sim.templates import CatlassProblem, lower_catlass_spec
 from mindie_sim.templates import _catlass_periodic, catlass_lower
 
@@ -184,214 +180,6 @@ def test_capped_flows_and_independent_components_share_only_their_owners(right_o
     engine.advance()
     assert engine.serviced == pytest.approx({"read": 240, "compute": 100})
     assert engine.summary()["live_tasks"] == 0
-
-
-# --- Compact steady two-stage pipeline -------------------------------------
-
-
-def two_stage_engine():
-    return Engine([Resource("load", 1.0), Resource("compute", 1.0)])
-
-
-def slot_recurrence(items, slots, ready_at):
-    """Independent oracle: each item runs two serial stages; slots retire in order."""
-    producer_end = consumer_end = ready_at
-    retired = []
-    for index, (load_work, compute_work) in enumerate(items):
-        slot_ready = retired[index - slots] if index >= slots else ready_at
-        producer_end = max(producer_end, slot_ready) + load_work
-        consumer_end = max(producer_end, consumer_end) + compute_work
-        retired.append(consumer_end)
-    return consumer_end
-
-
-def detailed_two_stage(engine, items, ready, slots=2):
-    def tile(index):
-        load, compute = items[index]
-        return Stage("load", {"load": load}), Stage("compute", {"compute": compute}, after=("load",))
-    return PipelineProgram(len(items), slots, tile).start(engine, "detailed", ready)
-
-
-def test_compact_matches_detailed_and_slot_recurrence_across_full_and_tail_geometries():
-    ready_at = 7.0
-    for count, load, compute, tail in product(
-        (0, 1, 2, 7, 31), (1.0, 3.0, 10.0), (2.0, 3.0, 9.0),
-        (None, (1.0, 1.0), (17.0, 2.0), (2.0, 19.0)),
-    ):
-        items = [(load, compute)] * count + ([] if tail is None else [tail])
-        if not items:
-            continue
-        tails = {} if tail is None else {"tail_producer": Stage("load", {"load": tail[0]}),
-                                         "tail_consumer": Stage("compute", {"compute": tail[1]})}
-        for slots in ((2, 3, 5) if tail is None else (2,)):
-            engine = two_stage_engine()
-            ready = engine.submit("ready", latency=ready_at)
-            end = SteadyPipeline(count, Stage("load", {"load": load}), Stage("compute", {"compute": compute}),
-                                 slots=slots, **tails).start(engine, "recurrence", ready)
-            engine.advance(horizon=ready_at - 1e-3)
-            assert engine.serviced == {"load": 0.0, "compute": 0.0} and not end.done
-            engine.advance(until=(end,))
-            assert end.time == pytest.approx(slot_recurrence(items, slots, ready_at))
-            assert engine.serviced == pytest.approx({"load": sum(i[0] for i in items),
-                                                     "compute": sum(i[1] for i in items)})
-            summary = engine.summary()
-            assert summary["live_tasks"] == summary["live_programs"] == 0 and not engine.allocations
-            if slots == 2:
-                reference = two_stage_engine()
-                detailed = detailed_two_stage(reference, items, reference.submit("ready", latency=ready_at))
-                reference.advance(until=(detailed,))
-                assert end.time == pytest.approx(detailed.time)
-                assert engine.serviced == pytest.approx(reference.serviced)
-
-
-def test_empty_pipeline_does_not_reserve_declared_buffers():
-    engine = Engine([Resource("load", 1.0), Resource("compute", 1.0)], pools={"scratch": 8.0})
-    end = SteadyPipeline(0, Stage("load", {"load": 1.0}), Stage("compute", {"compute": 1.0}),
-                         buffers=(Allocation("resident", "scratch", 8.0),),
-                         ).start(engine, "empty", engine.submit("ready", latency=3.0))
-    engine.advance(until=(end,))
-    assert end.time == 3.0
-    assert engine.serviced == {"load": 0.0, "compute": 0.0}
-    assert not engine.allocations
-    assert engine.summary()["completed_tasks"] == 2
-
-
-def test_extra_slot_can_prefetch_a_long_tail_so_compact_rejects_that_domain():
-    items = [(1.0, 10.0), (1.0, 10.0), (100.0, 1.0)]
-    for slots, expected in ((2, 112.0), (3, 103.0)):
-        engine = two_stage_engine()
-        end = detailed_two_stage(engine, items, engine.submit("ready"), slots)
-        engine.advance(until=(end,))
-        assert end.time == pytest.approx(expected)
-    with pytest.raises(ValueError, match="tail_requires_two_slots"):
-        SteadyPipeline(2, Stage("load", {"load": 1.0}), Stage("compute", {"compute": 10.0}), slots=3,
-                       tail_producer=Stage("load", {"load": 100.0}),
-                       tail_consumer=Stage("compute", {"compute": 1.0}))
-
-
-def test_explicit_buffers_wait_for_ready_and_release_per_owner_unit():
-    engine = Engine([Resource("load", 1.0), Resource("compute", 1.0)],
-                    pools={"scratch": 10.0}, pool_units={"scratch": 2})
-    tails = {"tail_producer": Stage("tail-load", {"load": 2.0}),
-             "tail_consumer": Stage("tail-compute", {"compute": 1.0})}
-    completed = {}
-    for label, unit, ready_at in (("a", 0, 5.0), ("b", 1, 0.0), ("c", 0, 5.5)):
-        completed[label] = SteadyPipeline(
-            1, Stage("load", {"load": 2.0}), Stage("compute", {"compute": 3.0}),
-            buffers=(Allocation(f"resident-{label}", "scratch", 10.0, (unit,)),),
-            **(tails if label == "a" else {}),
-        ).start(engine, label, engine.submit(f"ready-{label}", latency=ready_at), owner=f"tenant-{label}")
-    engine.advance(horizon=4.999)
-    assert set(engine.allocations) == {"b:resident-b"}
-    engine.advance(until=(completed["b"],))
-    assert completed["b"].time == pytest.approx(5.0)
-    engine.advance(horizon=6.0)
-    assert "a:resident-a" in engine.allocations and "c:resident-c" not in engine.allocations
-    engine.advance(horizon=10.5)
-    # A's final consumer still owns the buffer after A's drain has started.
-    assert "a:resident-a" in engine.allocations and not completed["a"].done
-    engine.advance(until=(completed["a"], completed["c"]), first=False)
-    # B frees unit1 at 5, but C is pinned to unit0 and waits for A's release at 11.
-    assert (completed["a"].time, completed["c"].time) == pytest.approx((11.0, 16.0))
-    assert engine.peak_unit_allocated == {("scratch", 0): 10.0, ("scratch", 1): 10.0}
-    assert not engine.allocations and not engine.unit_allocated
-    assert engine.summary()["live_allocated"] == {"scratch": 0.0}
-
-
-def test_steady_union_preserves_stage_caps_and_owner_units():
-    engine = Engine([Resource("load", 20.0, units=2), Resource("compute", 20.0, units=2)], trace_limit=20)
-    producer = Stage("load", {"load": 10.0}, caps={"load": 10.0}, placement={"load": (0,)})
-    consumer = Stage("compute", {"compute": 10.0}, caps={"compute": 10.0}, placement={"compute": (1,)})
-    idle_load = engine.submit("idle-load", {"load": 40.0}, placement={"load": (1,)})
-    idle_compute = engine.submit("idle-compute", {"compute": 40.0}, placement={"compute": (0,)})
-    end = SteadyPipeline(3, producer, consumer).start(engine, "pinned", engine.submit("ready"))
-    engine.advance(until=(end, idle_load, idle_compute), first=False)
-    # Losing a cap would use 20/ms; losing placement would contend with idle work.
-    assert (end.time, idle_load.time, idle_compute.time) == pytest.approx((4.0, 4.0, 4.0))
-    steady = {row["task"]: row for row in engine.trace}["pinned:steady"]
-    assert steady["placement"] == {"load": (0,), "compute": (1,)}
-    assert steady["demand"] == pytest.approx({"load": 20.0, "compute": 20.0})
-    assert steady["coupled"] is True
-
-
-def test_external_memory_arrival_conserves_work_and_delays_completion():
-    def run(with_contender):
-        engine = Engine([Resource("producer", 10.0), Resource("memory", 10.0)])
-        end = SteadyPipeline(2, Stage("producer", {"producer": 50.0}), Stage("memory", {"memory": 100.0})
-                             ).start(engine, "steady", engine.submit("ready"))
-        external = engine.submit("external", {"memory": 50.0}, release=10.0) if with_contender else None
-        return engine, end, external
-
-    engine, end, external = run(True)
-    engine.advance(horizon=10.0)
-    assert engine.serviced == pytest.approx({"producer": 75.0, "memory": 50.0})
-    engine.advance(horizon=12.5)
-    # Coupled flow ran 5 producer/10 memory per ms; after arrival memory is
-    # shared, so the producer cannot finish its remaining work ahead of it.
-    assert engine.serviced == pytest.approx({"producer": 81.25, "memory": 75.0})
-    engine.advance(until=(external,))
-    assert external.time == pytest.approx(20.0) and not end.done
-    assert engine.serviced == pytest.approx({"producer": 100.0, "memory": 150.0})
-    engine.advance(until=(end,))
-    assert end.time == pytest.approx(30.0)
-    assert engine.serviced == pytest.approx({"producer": 100.0, "memory": 250.0})
-    assert engine.summary()["live_tasks"] == 0 and not engine.allocations
-    quiet_engine, quiet_end, _ = run(False)
-    quiet_engine.advance(until=(quiet_end,))
-    assert quiet_engine.serviced == pytest.approx({"producer": 100.0, "memory": 200.0})
-    assert end.time - quiet_end.time == pytest.approx(5.0)
-
-
-def test_bounded_task_window_is_identical_for_ten_and_ten_million_items():
-    def run(count):
-        engine = two_stage_engine()
-        end = SteadyPipeline(count, Stage("load", {"load": 2.0}), Stage("compute", {"compute": 3.0})
-                             ).start(engine, "pipeline", engine.submit("ready"))
-        engine.advance(until=(end,))
-        assert end.time == pytest.approx(2.0 + (count - 1) * 3.0 + 3.0)
-        return engine.summary()
-
-    small, large = run(10), run(10_000_000)
-    assert small["completed_tasks"] == large["completed_tasks"] < 20
-    assert small["peak_live_tasks"] == large["peak_live_tasks"] < 20
-    assert large["live_tasks"] == large["live_programs"] == 0
-
-
-def test_phase_ranking_counterexample_keeps_detailed_overlap_order():
-    # Overlapped: 21 vs 30.1; charging phases serially would reverse it (40 vs 32).
-    results = {}
-    for label, load_rate, cube_rate in (("balanced", 24.0, 32.0), ("fast_copy", 240.0, 32.0 / 1.5)):
-        engine = Engine([Resource("mte2", load_rate), Resource("cube", cube_rate)])
-        end = SteadyPipeline(20, Stage("refill", {"mte2": 24.0}), Stage("compute", {"cube": 32.0})
-                             ).start(engine, label, engine.submit("ready"))
-        engine.advance(until=(end,))
-        results[label] = end.time
-        assert engine.serviced == pytest.approx({"mte2": 480.0, "cube": 640.0})
-    assert results == pytest.approx({"balanced": 21.0, "fast_copy": 30.1})
-
-
-LOAD, COMPUTE = Stage("load", {"load": 1.0}), Stage("compute", {"compute": 1.0})
-PINNED = Stage("load", {"load": 1.0}, placement={"load": (0,)})
-
-
-@pytest.mark.parametrize("args,kwargs,match", [
-    ((1, LOAD, COMPUTE), {"slots": 1}, "slots"),
-    ((-1, LOAD, COMPUTE), {}, "count"),
-    ((1, LOAD, Stage("compute", {"load": 1.0})), {}, "disjoint"),
-    ((1, LOAD, COMPUTE), {"tail_producer": Stage("tail", {"load": 1.0})}, "together"),
-    ((1, Stage("load", {"load": 1.0}, latency=1.0), COMPUTE), {}, "latency"),
-    ((1, Stage("load", {"load": 1.0}, after=("x",)), COMPUTE), {}, "after"),
-    ((1, Stage("load", {"load": 1.0}, coupled=True), COMPUTE), {}, "coupled"),
-    ((1, PINNED, COMPUTE), {"tail_producer": Stage("tail", {"compute": 1.0}),
-                            "tail_consumer": Stage("tail", {"compute": 1.0})}, "tail_resources_not_in_full"),
-    ((1, PINNED, COMPUTE), {"tail_producer": Stage("tail", {"load": 1.0}, placement={"load": (1,)}),
-                            "tail_consumer": Stage("tail", {"compute": 1.0})}, "placement_mismatch"),
-    ((1, LOAD, COMPUTE), {"buffers": (Allocation("same", "pool", 1.0), Allocation("same", "pool", 1.0))},
-     "buffer_name_not_unique"),
-])
-def test_unsupported_steady_shapes_are_refused_explicitly(args, kwargs, match):
-    with pytest.raises(ValueError, match=match):
-        SteadyPipeline(*args, **kwargs)
 
 
 # --- Prepared immutable stages ---------------------------------------------

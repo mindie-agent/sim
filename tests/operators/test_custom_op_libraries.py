@@ -22,7 +22,7 @@ from mindie_sim.prediction.operators.custom_framework import (
     fused_region_contract, lower_op as xllm_lower_op, recipes as xllm_recipes)
 from mindie_sim.prediction.operators.diffusion import (
     MINDIE_SD_CUSTOM_OPS, capabilities as sd_capabilities,
-    compute_mindie_sd_effective_denoising_steps, lower_mindie_sd_custom_op,
+    compute_mindie_sd_effective_denoising_steps,
     lower_op as sd_lower_op, recipes as sd_recipes)
 from mindie_sim.prediction.engine import Engine, ExecutionError, Resource
 from mindie_sim.prediction.implementations import IMPLEMENTATIONS, lower_operators, select
@@ -176,23 +176,23 @@ def test_xllm_declarations_keep_exact_rejection_codes(builder, kwargs, match):
         xllm_lower_op(builder(), **kwargs)
 def test_mindie_sd_lowering_and_denoising_step_cache():
     attn = _make_op("indexed_attention", local_shape=(256, 128), flops=10_000_000.0)
-    rain = lower_mindie_sd_custom_op(attn, op_name="rainfusion", sparsity_ratio=0.75, block_size=64)
-    assert rain["op_name"] == "mindie_sd_rainfusion" and rain["bound"] == "cube" and rain["cube_flops"] == pytest.approx(2_500_000.0)
+    rain = sd_lower_op(attn, op_name="rainfusion", sparsity_ratio=0.75, block_size=64)
+    assert rain.recipe == "mindie_sd_rainfusion" and rain.flops == pytest.approx(2_500_000.0)
     role = (("query_shape", (1, 256, 1, 128)), ("key_shape", (1, 256, 1, 128)),
             ("value_shape", (1, 256, 1, 128)))
-    qbsa = lower_mindie_sd_custom_op(
+    qbsa = sd_lower_op(
         replace(attn, metadata=role + (("k_dtype", "fp8_e4m3"), ("v_dtype", "fp8_e4m3"))),
         op_name="eagle_qbsa", sparsity_ratio=0.5, block_size=64)
-    bsa = lower_mindie_sd_custom_op(
+    bsa = sd_lower_op(
         replace(attn, metadata=role + (("k_dtype", "bf16"), ("v_dtype", "bf16"))),
         op_name="eagle_bsa", sparsity_ratio=0.5, block_size=64)
-    assert qbsa["memory_bytes"] < bsa["memory_bytes"]
-    laurel = lower_mindie_sd_custom_op(_make_op("gemm", local_shape=(128, 1024)),
-                                       op_name="laurel", low_rank=32)
-    assert laurel["cube_flops"] == pytest.approx(4 * 128 * 1024 * 32)
-    q46 = lower_mindie_sd_custom_op(_make_op("quantize", local_shape=(64, 128)),
-                                    op_name="quant_four_over_six_a5", soc_family=SOC_950)
-    assert "mxfp4_scale" in q46["lowered_op"].returns
+    assert qbsa.hbm_bytes < bsa.hbm_bytes
+    laurel = sd_lower_op(_make_op("gemm", local_shape=(128, 1024)),
+                         op_name="laurel", low_rank=32)
+    assert laurel.flops == pytest.approx(4 * 128 * 1024 * 32)
+    q46 = sd_lower_op(_make_op("quantize", local_shape=(64, 128)),
+                      op_name="quant_four_over_six_a5", soc_family=SOC_950)
+    assert "mxfp4_scale" in q46.returns
     sd = lower_operators(
         (_make_op("indexed_attention", local_shape=(128, 128)),
          _make_op("rmsnorm", local_shape=(128, 1024)), _make_op("gemm", local_shape=(128, 1024))),
@@ -201,16 +201,16 @@ def test_mindie_sd_lowering_and_denoising_step_cache():
          "rmsnorm": "mindie_sd_adalayernorm", "gemm": "mindie_sd_eagle_ffn"})
     assert [op.recipe for op in sd] == [
         "mindie_sd_ada_bsa", "mindie_sd_adalayernorm", "mindie_sd_eagle_ffn"]
-    implicit = lower_mindie_sd_custom_op(
+    implicit = sd_lower_op(
         _make_op("ada_bsa", recipe="indexed_attention", local_shape=(128, 128)),
         sparsity_ratio=0.5, block_size=64)
-    assert implicit["op_name"] == "mindie_sd_ada_bsa"
+    assert implicit.recipe == "mindie_sd_ada_bsa"
     steps = compute_mindie_sd_effective_denoising_steps(
         infer_steps=50, warmup_steps=2, cache_interval=2)
     assert (steps["computed_steps"], steps["cached_steps"]) == (26, 24) and steps["speedup_factor"] == pytest.approx(50.0 / 26.0)
     with pytest.raises(ModelingError, match="mindie_sd_custom_op_soc_unsupported"):
-        lower_mindie_sd_custom_op(_make_op("quantize"), op_name="quant_four_over_six_a5",
-                                  soc_family="Ascend910B")
+        sd_lower_op(_make_op("quantize"), op_name="quant_four_over_six_a5",
+                    soc_family="Ascend910B")
 def test_capability_registries_match_registered_implementations():
     for operators, module, implementation_name in (
             (XLLM_CUSTOM_OPS, "mindie_sim.prediction.operators.custom_framework", "xllm_custom_xllm_math"),
@@ -240,21 +240,6 @@ def test_capability_registries_match_registered_implementations():
 def test_mindie_sd_declarations_keep_exact_rejection_codes(run, match):
     with pytest.raises(ModelingError, match=match):
         run()
-def test_mindie_sd_summary_does_not_invent_hardware_rates():
-    op = _make_op("indexed_attention", local_shape=(256, 128), flops=10_000_000.0)
-    missing = lower_mindie_sd_custom_op(op, op_name="rainfusion", sparsity_ratio=0.25,
-                                        block_size=64)
-    assert missing["estimated_us"] is None and missing["estimate_basis"] == "requires_declared_hardware_rates"
-    declared = lower_mindie_sd_custom_op(
-        op, hardware={"cube_tflops": 432.5, "vector_tflops": 27.0,
-                      "hbm_bandwidth_gbps": 4000.0},
-        op_name="rainfusion", sparsity_ratio=0.25, block_size=64)
-    expected_us = max(declared["cube_flops"] / 432.5e6, declared["vector_flops"] / 27.0e6, declared["memory_bytes"] / 4000.0e3)
-    assert declared["estimated_us"] == pytest.approx(expected_us) and declared["estimate_basis"] == "declared_hardware_roofline"
-    incomplete = lower_mindie_sd_custom_op(op, hardware={"cube_tflops": 432.5},
-                                           op_name="rainfusion", sparsity_ratio=0.25,
-                                           block_size=64)
-    assert incomplete["estimated_us"] is None and incomplete["estimate_basis"] == "declared_hardware_rates_incomplete"
 def test_cache_write_family_conserves_valid_rows_and_pages():
     view = {"key_shape": (8, 1, 256), "value_shape": (8, 1, 256), "key_dtype": "bf16",
             "value_dtype": "bf16", "slot_shape": (8,)}

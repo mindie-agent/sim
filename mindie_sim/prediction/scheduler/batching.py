@@ -433,7 +433,7 @@ class Scheduler:
             max_mb = max(1, int(getattr(self.case.runtime, "pipeline_microbatches", 1)))
             local_mb = max(1, min(max_mb, max(1, len(self.in_flight))))
             cur_iter = int(self._in_flight_iteration)
-            matched = any(
+            matched = iter_val == cur_iter or any(
                 cur_iter * count <= iter_val < cur_iter * count + count
                 for count in range(local_mb, max_mb + 1)
             )

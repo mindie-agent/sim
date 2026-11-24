@@ -552,7 +552,8 @@ def test_full_depth_graph_keeps_sp_padding_outside_recurrent_query_loop(full_bod
             by_id = {op.op_id: op for op in ops}; pad = by_id["sp_shard"]; metadata = dict(pad.metadata)
             assert pad.mte2_bytes == q * parsed.model.hidden_size * 2 and pad.mte3_bytes == 8 * parsed.model.hidden_size * 2 and metadata["valid_global"] == q and metadata["physical_global"] == 8 and metadata["valid_per_tp"] == (1,) * q + (0,) * (8 - q)
             packed = by_id.get("s0.l0.linear_q") or next(op for op in ops if str(op.recipe).startswith("linear_qkvbfg_a"))
-            assert packed.local_shape[0] == q and by_id["s0.l0.recurrent_scan0"].local_shape[0] == q and by_id["s0.l0.norm1"].local_shape[0] == 1
+            norm_op = by_id.get("s0.l0.norm1") or by_id["s0.l0.attention.attn_res_fwd"]
+            assert packed.local_shape[0] == q and by_id["s0.l0.recurrent_scan0"].local_shape[0] == q and norm_op.local_shape[0] == 1
             assert by_id["s0.l0.attention.sp_gather"].link_bytes == 7 * parsed.model.hidden_size * 2
             trim = by_id["sp_output_trim"]; assert trim.local_shape == (q, parsed.model.hidden_size) and trim.deps == ("sp_output_gather",) and trim.hbm_bytes == trim.link_bytes == 0
             assert {op.layer for op in ops if op.layer >= 0} == set(range(93))

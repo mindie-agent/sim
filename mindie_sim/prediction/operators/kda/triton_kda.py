@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.datapath import SourceRef
 
 from ...mechanism import OperatorPlan, Work
@@ -132,15 +133,18 @@ def _next_power_of_2(value: int) -> int:
 
 
 def _hbm_burst_granule(ctx: OperatorPlanningContext) -> int:
-    """Return calibrated HBM burst granule in bytes (512B on Arch22, 256B on Arch35)."""
+    """Return HBM burst granule from PrimitiveTable or declared Datapath.memory_access."""
     table = getattr(ctx, "primitive_table", None)
-    if table is None or not hasattr(table, "cell"):
-        raise ModelingError("triton_kda_hbm_burst_granule_requires_primitive_table")
-    params = table.cell("P01_datacopy").parameters or {}
-    gran = int(params.get("hbm_burst_granule_bytes") or 0)
-    if gran <= 0:
-        raise ModelingError("triton_kda_hbm_burst_granule_missing")
-    return gran
+    if table is not None and hasattr(table, "cell"):
+        params = table.cell("P01_datacopy").parameters or {}
+        gran = int(params.get("hbm_burst_granule_bytes") or 0)
+        if gran > 0:
+            return gran
+    mem = getattr(getattr(ctx, "datapath", None), "memory_access", None)
+    gran = int(getattr(mem, "hbm_burst_granule_bytes", 0) or 0) if mem is not None else 0
+    if gran > 0:
+        return gran
+    raise ModelingError("triton_kda_hbm_burst_granule_missing")
 
 
 def _reduce_rate_ratio(rc: RecipeContext) -> float:

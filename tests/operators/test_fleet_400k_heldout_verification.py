@@ -468,7 +468,7 @@ def test_nearest_rank_p90_unrounded_two_tier_and_kda_sfu_conservation() -> None:
     pl_rec = linear_attention.build(op_rec, Geometry.from_devices(c9362.machine.dies))
     rc_rec = SimpleNamespace(
         bind=lambda w: dict(w.resources), resource_names={"vector": "vector", "hbm": "hbm", "mte2_aiv": "mte2_aiv", "mte3": "mte3", "l2": "l2"},
-        rates={"vector": 1e12}, resource_units={}, primitive_table=None, service_rate=lambda *_a, **_k: None,
+        rates={"vector": 1e12}, resource_units={}, primitive_table=load_primitives("Ascend910_9362"), service_rate=lambda *_a, **_k: None,
         physical_role=lambda r: r, read_pipe=lambda aiv=False: "mte2_aiv" if aiv else "mte2_aic",
     )
     prog = pl_rec.program(rc_rec)

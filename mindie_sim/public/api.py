@@ -84,6 +84,8 @@ def simulate_operator(case: Any, ops: Any, *, extensions: Any = None,
                       **kwargs: Any) -> dict[str, Any]:
     """Price isolated operators from a Case or declared hardware environment."""
     allow_unbound = bool(kwargs.pop("allow_unbound_formula", False))
+    if allow_unbound:
+        raise ExtensionError("simulation_mode_forbids_unbound_formula_ops:simulate_operator")
     context = _context(extensions)
     selected = _provider("operator", provider, context)
     environment = _environment(case)
@@ -165,6 +167,8 @@ def simulate_native_call(case: Any, ops: Any, *, extensions: Any = None,
                          **kwargs: Any) -> dict[str, Any]:
     """Compose an already-declared native call through the ordinary engine."""
     allow_unbound = bool(kwargs.pop("allow_unbound_formula", False))
+    if allow_unbound:
+        raise ExtensionError("simulation_mode_forbids_unbound_formula_ops:simulate_native_call")
     context = _context(extensions)
     selected = _provider("native", provider, context)
     environment = _environment(case)
@@ -307,6 +311,8 @@ def simulate_graph(case: Any, ops: Any, *, extensions: Any = None,
                    **kwargs: Any) -> dict[str, Any]:
     """Compose a declared dependency graph on shared device resources."""
     allow_unbound = bool(kwargs.pop("allow_unbound_formula", False))
+    if allow_unbound:
+        raise ExtensionError("simulation_mode_forbids_unbound_formula_ops:simulate_graph")
     context = _context(extensions)
     selected = _provider("graph", provider, context)
     environment = _environment(case)

@@ -160,6 +160,7 @@ def test_sla_solver_exact_threshold_and_speculative_tokens():
     assert same(base["step_ms_at_sla"], at_sla["duration_ms"], EXACT) and at_sla["duration_ms"] <= sla_ms
     assert _decode_costs(parsed, base["b_sla"] + 1)["duration_ms"] > sla_ms
     speculative = _moe_case(layers=2)
+    speculative["model"]["auxiliary"] = {"mtp": {"layers": 1, "num_heads": speculative["model"]["num_heads"], "num_kv_heads": speculative["model"]["num_kv_heads"], "head_dim": speculative["model"]["head_dim"], "hidden_size": speculative["model"]["hidden_size"], "intermediate_size": speculative["model"]["intermediate_size"]}}
     speculative["runtime"]["metadata"] = {"speculative": {"draft_len": 3, "acceptance": [0.7, 0.7, 0.7], "acceptance_mode": "conditional"}}
     resolved = solve_sla_sizing(speculative, sla_ms=30.0, context=4096, max_sequences_per_dp=2, scope="body", scenarios=[{"id": "baseline"}])
     assert resolved["tokens_per_seq"] == 4 and same(resolved["emitted_tokens_per_seq"], 1.0 + 0.7 + 0.49 + 0.343)
@@ -602,3 +603,44 @@ def test_composed_neutral_machine_rejects_invalid_channel_semantics():
     raw["machine"]["transfer_channels"]["d2d_intra_node"]["semantics"] = "invented"
     with pytest.raises(ModelingError, match="transfer_channel_semantics_unsupported"):
         parse_case(raw)
+
+
+def test_sla_certified_search_finds_nonmonotone_b5_and_maximizes_throughput_b4_over_b6(monkeypatch):
+    """Dual-certificate SLA solver finds B=5 when B=1..4 fail and picks B=4 over lower-TPS B=6."""
+    parsed = parse_case(_dense_case(layers=1))
+    empty_graphs = {0: ()}
+
+    def _fake_runner(durations: dict[int, float]):
+        def _run(case_arg, *, sequences, **_kw):
+            dur = float(durations[int(sequences)])
+            return empty_graphs, case_arg, {"duration_ms": dur, "graph_duration_ms": dur}
+        return _run
+
+    def _fake_analysis(durations: dict[int, float]):
+        def _ans(_case, *, sequences, **_kw):
+            dur = float(durations[int(sequences)])
+            return {
+                "graph_duration_ms": dur, "operator_sum_ms": dur,
+                "network_mbu": 0.5, "network_cube_mfu": 0.5, "network_vec_mfu": 0.1,
+                "network_link_util": 0.0, "network_roofline_efficiency": 0.5,
+                "breakdown_by_bound": {k: {"share_of_operator_sum": 0.2} for k in (
+                    "memory_bound", "cube_bound", "vector_bound", "link_bound", "launch_bound")},
+            }
+        return _ans
+
+    # 1. Non-monotone dispatch: B=1..4 fail SLA (45 ms > 30 ms), B=5 passes (20 ms <= 30 ms).
+    durs_nonmono = {1: 45.0, 2: 45.0, 3: 45.0, 4: 45.0, 5: 20.0, 6: 45.0, 7: 45.0, 8: 45.0}
+    monkeypatch.setattr(efficiency_module, "target_graphs", lambda *_a, **_k: empty_graphs)
+    monkeypatch.setattr(efficiency_module, "_lower_and_run_graph", _fake_runner(durs_nonmono))
+    monkeypatch.setattr(efficiency_module, "analyze_network_efficiency", _fake_analysis(durs_nonmono))
+    res_nm = solve_sla_sizing(parsed, sla_ms=30.0, context=128, max_sequences_per_dp=8, scope="body", scenarios=[{"id": "baseline"}])
+    sc_nm = res_nm["scenarios"][0]
+    assert sc_nm["b_sla"] == 5 and sc_nm["b_feasible"] == 5 and sc_nm["search"]["non_monotonic_dispatch_detected"] is True
+
+    # 2. Throughput maximization: B=4 (4/10=0.40 seq/ms) beats B=6 (6/25=0.24 seq/ms) under SLA=30 ms.
+    durs_tps = {1: 8.0, 2: 9.0, 3: 9.5, 4: 10.0, 5: 22.0, 6: 25.0, 7: 40.0, 8: 45.0}
+    monkeypatch.setattr(efficiency_module, "_lower_and_run_graph", _fake_runner(durs_tps))
+    monkeypatch.setattr(efficiency_module, "analyze_network_efficiency", _fake_analysis(durs_tps))
+    res_tps = solve_sla_sizing(parsed, sla_ms=30.0, context=128, max_sequences_per_dp=8, scope="body", scenarios=[{"id": "baseline"}])
+    sc_tps = res_tps["scenarios"][0]
+    assert sc_tps["b_sla"] == 4 and sc_tps["b_feasible"] == 4 and sc_tps["step_ms_at_sla"] == pytest.approx(10.0)

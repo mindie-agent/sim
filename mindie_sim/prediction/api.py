@@ -324,8 +324,11 @@ def _commit_completed_steps(in_flight, schedulers, engine, assembly,
     for replica, step in list(in_flight.items()):
         if not step.completion.done:
             continue
+        had_in_flight = bool(schedulers[replica].in_flight)
         committed = schedulers[replica].commit_batch(step)
-        if not committed and step.mode != "retire":
+        if not committed and step.mode != "retire" and (
+            had_in_flight or bool(getattr(step, "commits", None))
+        ):
             raise ModelingError(
                 f"scheduler_commit_batch_rejected:replica={replica}:iteration={step.iteration}"
             )

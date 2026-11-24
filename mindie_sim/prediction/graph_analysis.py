@@ -1026,9 +1026,17 @@ def _prepare_graphs(case, ops, book, replay_scope, external):
 
 def _make_fast_layer_observer(
     body_key_by_op: Mapping[str, Any],
-) -> tuple[Callable[..., None], dict[Any, list[tuple[int, Any, Any]]], list[tuple[Any, Any]]]:
+    track_op_ids: Sequence[str] | set[str] | frozenset[str] = (),
+) -> tuple[
+    Callable[..., None],
+    dict[Any, list[tuple[int, Any, Any]]],
+    list[tuple[Any, Any]],
+    dict[str, tuple[Any, Any]],
+]:
     events_by_layer: dict[Any, list[tuple[int, Any, Any]]] = {}
     non_body_events: list[tuple[Any, Any]] = []
+    tracked = frozenset(track_op_ids) if track_op_ids else frozenset()
+    tracked_events: dict[str, tuple[Any, Any]] = {}
 
     def _observe(op, replica, _program, ready, complete):
         if replica == 0:
@@ -1037,8 +1045,10 @@ def _make_fast_layer_observer(
                 events_by_layer.setdefault(key, []).append((int(op.stage), ready, complete))
             else:
                 non_body_events.append((ready, complete))
+            if tracked and op.op_id in tracked:
+                tracked_events[op.op_id] = (ready, complete)
 
-    return _observe, events_by_layer, non_body_events
+    return _observe, events_by_layer, non_body_events, tracked_events
 
 
 def _l2_residency_digest(engine) -> str:
@@ -1656,7 +1666,8 @@ def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=Non
                 audit_allocations=False, evaluation=None,
                 fast_span_only=False, stream_plans=None,
                 request_views=None, padded_tokens=0, sequence_layout="",
-                timeline_replicas=None, layer_span_body_ids=None):
+                timeline_replicas=None, layer_span_body_ids=None,
+                fast_track_op_ids=()):
     """Run a declared DAG or replica->DAG mapping without a request scheduler.
 
     External input keys are operator dependency names and values are absolute
@@ -1696,12 +1707,13 @@ def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=Non
         frozenset(int(r) for r in timeline_replicas)
         if timeline_replicas is not None else None
     )
-    fast_observer, fast_layer_events, fast_non_body_events = (
+    fast_observer, fast_layer_events, fast_non_body_events, fast_tracked_events = (
         _make_fast_layer_observer(
             layer_span_body_ids if isinstance(layer_span_body_ids, Mapping)
-            else {oid: ("target", -1) for oid in layer_span_body_ids}
+            else {oid: ("target", -1) for oid in layer_span_body_ids},
+            track_op_ids=fast_track_op_ids,
         )
-        if (fast_span_only and layer_span_body_ids) else (None, None, None)
+        if (fast_span_only and layer_span_body_ids) else (None, None, None, None)
     )
     l2_fingerprints = {} if layer_span_body_ids is not None else None
     execution, engine, records, steps, stream_plans, skipped_occurrences, replica_observer = _run_graph(
@@ -1744,6 +1756,11 @@ def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=Non
                 (float(r.time), float(c.time))
                 for r, c in (fast_non_body_events or ())
             ]
+            if fast_tracked_events:
+                out_fast["tracked_op_elapsed_ms"] = {
+                    oid: float(c.time) - float(r.time)
+                    for oid, (r, c) in fast_tracked_events.items()
+                }
         if l2_fingerprints is not None:
             out_fast["l2_residency_fingerprints"] = (
                 l2_fingerprints.get("before", ""),

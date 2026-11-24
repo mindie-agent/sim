@@ -70,6 +70,7 @@ _REQUIRED_ATTAINMENT_KEYS = (
     "eta_simd_sfu_exp_vs_p08",
 )
 _FP8_DTYPE_NAMES = frozenset({"fp8", "fp8_e4m3", "fp8_e4m3fn", "fp8_e5m2"})
+_INT8_DTYPE_NAMES = frozenset({"int8", "s8", "u8", "uint8"})
 _MXFP8_DTYPE_NAMES = frozenset({"mxfp8", "mxfp8_e4m3", "paired_e8m0"})
 _FP32_DTYPE_NAMES = frozenset({"fp32", "float32"})
 _BF16_FP16_DTYPE_NAMES = frozenset({"bf16", "bfloat16", "fp16", "float16"})
@@ -256,7 +257,7 @@ class TileLangCalibration:
             raise ModelingError(f"tilelang_cube_attainment_epilogue_unsupported:{epi}")
         if blockscaled or dt in _MXFP8_DTYPE_NAMES:
             raw = self.eta_cube_mxfp8_blockscaled
-        elif dt in _FP8_DTYPE_NAMES:
+        elif dt in _FP8_DTYPE_NAMES or dt in _INT8_DTYPE_NAMES:
             if epi == "atomic_add":
                 raise ModelingError(f"tilelang_cube_attainment_unsupported:{dt}:{epi}")
             raw = self.eta_cube_fp8_dualcopy_fp32 if epi == "dual_copy" else self.eta_cube_fp8_fixpipe

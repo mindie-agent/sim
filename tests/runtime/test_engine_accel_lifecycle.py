@@ -552,3 +552,43 @@ def test_installed_pep517_wheel_ships_runtime_resources_and_runs_native():
         assert Path(probe_u.stdout.strip()).is_relative_to(userbase.resolve())
     finally:
         shutil.rmtree(base, ignore_errors=True)
+
+
+def test_cold_cache_auto_builds_native_accelerator_and_degrades_without_compiler(monkeypatch, tmp_path):
+    """Default auto mode compiles into isolated cache and degrades cleanly when no compiler exists."""
+    for label, missing_cc in (("cold_ok", False), ("no_cc", True)):
+        root = tmp_path / label
+        for name in ("home", "config", "cache", "data", "tmp"):
+            (root / name).mkdir(parents=True, exist_ok=True)
+        for key, val in (("HOME", "home"), ("USERPROFILE", "home"), ("MINDIE_CONFIG_HOME", "config"),
+                         ("MINDIE_CACHE_HOME", "cache"), ("MINDIE_DATA_HOME", "data"), ("TMPDIR", "tmp")):
+            monkeypatch.setenv(key, str(root / val))
+        for key in ("MINDIE_SIM_ACCEL", "MINDIE_SIM_ACCEL_CACHE"):
+            monkeypatch.delenv(key, raising=False)
+        if missing_cc:
+            monkeypatch.setenv("MINDIE_SIM_CC", "nonexistent_cc_binary_xyz")
+        else:
+            monkeypatch.delenv("MINDIE_SIM_CC", raising=False)
+        accel_build.reset_build_memo()
+        accel_loader._LOADED.clear()
+        if not missing_cc and accel_build.discover_compiler()[0] is None:
+            continue
+        if missing_cc:
+            assert not accel_loader.toolchain_or_cache_ready()
+        eng = Engine([Resource("r", 100.0)], backend="auto", accel_eager_attach=True)
+        try:
+            for idx in range(32):
+                eng.submit(f"t{idx}", work={"r": 10.0})
+            eng.advance()
+            st = eng.accel_status()
+            if missing_cc:
+                assert st["accel_backend"] == "python_fallback" and st["native_steps"] == 0
+                assert eng.serviced["r"] == pytest.approx(320.0)
+            else:
+                assert st["backend"] == "c_native" and st["native_steps"] > 0
+                assert st["cache_path"] and str(root / "cache") in str(st["cache_path"])
+        finally:
+            if eng._accel is not None and eng._accel.arena is not None:
+                eng._accel.arena.close()
+    accel_build.reset_build_memo()
+    accel_loader._LOADED.clear()

@@ -292,9 +292,6 @@ DEFAULT_MATMUL_CANDIDATES = (
     (16, 128, 256),
     (16, 64, 256),
 )
-LEGACY_MATMUL_CANDIDATES = ((128, 128, 128), (128, 128, 64))
-
-
 def _steady_matmul_default(*, candidates=False, a5=False):
     """The compact finite-K matrix program, including symmetric owner cohorts.
 
@@ -302,9 +299,8 @@ def _steady_matmul_default(*, candidates=False, a5=False):
     128-output narrowing. The mapping still screens L1/L0A/L0B/L0C capacity.
     """
     program = {"kind": "steady_matmul", "owner_cohorts": True}
-    if candidates:
-        tiles = DEFAULT_MATMUL_CANDIDATES if a5 else LEGACY_MATMUL_CANDIDATES
-        program["candidates"] = [list(item) for item in tiles]
+    if candidates and a5:
+        program["candidates"] = [list(item) for item in DEFAULT_MATMUL_CANDIDATES]
     return program
 
 
@@ -599,8 +595,10 @@ def _attnres_default(case, phase, kernels):
                 bool(families & kernels.get("families", {}).keys()))
     source_domain = family_attnres.source_eligible(
         case.model, case.machine.arch_family, phase)
+    excluded = family_attnres.is_excluded(case.runtime)
     pipes = {"hbm", "vector", "mte2_aiv", "mte3"}
     reason = ("explicit_implementation_preserved" if explicit else
+              "excluded_by_runtime_policy" if excluded else
               "attnres_source_domain_unsupported" if not source_domain else
               "attnres_independent_copy_pipes_not_declared" if any(
                   not pipes <= dict(d.rates).keys() or dict(d.buffers).get("ub", 0) <= _ATTNRES_UB_RESERVE_BYTES

@@ -74,11 +74,21 @@ def _lower_and_run_graph(case: CaseSpec, *, phase: str, tokens: int, context: in
         else graphs
     # Submission work is represented by the declared scheduler resource on the
     # ordinary submission path; no duration max() is synthesized here.
-    report = graph_costs(eff_case, sg, external_inputs=ext_in,
-                         include_submission=include_submission, isolated=False,
-                         evaluation=evaluation_context,
-                         fast_span_only=fast_span_only,
-                         timeline_replicas=timeline_replicas)
+    if not include_submission:
+        from ..execution.layer_runs import execute_native_cohort_graph
+        report, _, _ = execute_native_cohort_graph(
+            eff_case, sg, external_inputs=ext_in,
+            include_submission=False, isolated=False,
+            evaluation=evaluation_context,
+            fast_span_only=fast_span_only,
+            timeline_replicas=timeline_replicas,
+        )
+    else:
+        report = graph_costs(eff_case, sg, external_inputs=ext_in,
+                             include_submission=include_submission, isolated=False,
+                             evaluation=evaluation_context,
+                             fast_span_only=fast_span_only,
+                             timeline_replicas=timeline_replicas)
     return graphs, eff_case, report
 
 

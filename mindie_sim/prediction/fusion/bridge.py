@@ -442,12 +442,19 @@ def add_prefetch(plan: CanonicalPlan, decision: PrefetchDecision,
     if prefetch_id in existing or release_id in existing:
         return None
     holder = PoolHolder(prefetch_id)
+    raw_layout = str(consumer.layout or "contiguous").strip().lower()
+    if raw_layout == "fractal_nz":
+        prefetch_layout = "nz"
+    elif raw_layout in {"contiguous", "nd", "nz", "strided", "view"}:
+        prefetch_layout = raw_layout
+    else:
+        prefetch_layout = "contiguous"
     prefetch = OpSpec(
         op_id=prefetch_id, family="prefetch", phase=consumer.phase,
         stage=consumer.stage, layer=consumer.layer, requests=(),
         semantic_shape=(1,), local_shape=(1,), padded_shape=(1,), launch_shape=(1,),
         hbm_bytes=float(decision.target_bytes), matrix_flops=(),
-        dtype=consumer.dtype, layout=consumer.layout, recipe=prefetch_id,
+        dtype=consumer.dtype, layout=prefetch_layout, recipe=prefetch_id,
         coverage="analytical_prototype", stream="prefetch",
         metadata=(("prefetch_target", decision.op_id),
                   ("prefetch_priority", decision.priority),
@@ -464,7 +471,7 @@ def add_prefetch(plan: CanonicalPlan, decision: PrefetchDecision,
         # Hold the L1 grant until both the consumer kernel and the producer
         # copy have retired; the consumer alone can outlive a delayed copy.
         deps=(consumer.op_id, prefetch_id), recipe=release_id, coverage="pool_release",
-        dtype=consumer.dtype, layout=consumer.layout, stream=consumer.stream or "main",
+        dtype=consumer.dtype, layout=prefetch_layout, stream=consumer.stream or "main",
         metadata=(("prefetch_release_for", prefetch_id),
                   ("prefetch_target", decision.op_id),
                   ("prefetch_priority", decision.priority),

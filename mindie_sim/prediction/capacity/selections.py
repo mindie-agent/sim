@@ -23,9 +23,9 @@ class _MemorySelectionsMixin:
         plan.resolve()
         refs = self._selected_refs(replica, stage, items)
         old_names = set(self.selected_items.get((replica, stage), {}))
-        drop = {(replica, stage, "selected", name) for name in old_names}
+        drop = {(replica, "selected", stage, name) for name in old_names}
         extra = [
-            ((replica, stage, "selected", name), (ref,))
+            ((replica, "selected", stage, name), (ref,))
             for name, ref in refs.items()
         ]
         hbm, host = self._state_usage(
@@ -33,9 +33,9 @@ class _MemorySelectionsMixin:
         if not self._usage_budget_ok(hbm, host):
             return False
         for name in old_names - set(refs):
-            self._set_ref((replica, stage, "selected", name), ())
+            self._set_ref((replica, "selected", stage, name), ())
         for name, ref in refs.items():
-            self._set_ref((replica, stage, "selected", name), (ref,))
+            self._set_ref((replica, "selected", stage, name), (ref,))
         self.selected_items[(replica, stage)] = dict(items)
         self.selected_plans[(replica, stage)] = plan
         self.selected_physical = {

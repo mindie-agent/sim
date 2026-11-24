@@ -452,14 +452,19 @@ def primitive_l2_params(context) -> tuple[int, int]:
 
 
 def _primitive_band_ms(context, primitive_id: str, metric: str) -> float:
-    """Calibrated primitive latency band in ms (fail-closed when PrimitiveTable is bound)."""
+    """Calibrated primitive latency band in ms (0.0 when explicitly unmeasured)."""
     pt = getattr(context, "primitive_table", None)
     if pt is None:
         raise ModelingError(f"matrix_primitive_table_required:{primitive_id}:{metric}")
-    cell = pt.cell(primitive_id)
+    cell_fn = getattr(pt, "cell", None)
+    if cell_fn is None:
+        return 0.0
+    cell = cell_fn(primitive_id)
     band = cell.band(metric)
-    if band.p50 is None or float(band.p50) <= 0.0:
-        raise ModelingError(f"matrix_primitive_band_missing:{primitive_id}:{metric}")
+    if band.p50 is None:
+        return 0.0
+    if float(band.p50) <= 0.0:
+        raise ModelingError(f"matrix_primitive_band_invalid:{primitive_id}:{metric}")
     return float(band.p50) / NS_PER_MS
 
 
@@ -708,10 +713,9 @@ def streamk_fixup_latency_ms(
     if clock_hz is not None and clock_hz > 0.0:
         cycles = float(k_splits) * STREAMK_NEG_CYCLES_PER_SPLIT + STREAMK_NEG_BASE_CYCLES
         neg_ms = (cycles / clock_hz) * MS_PER_SECOND * (float(cores) / float(used))
-    sync_ms = (
-        primitive_p13_sync_ms(context, "mode0_aiv_barrier_ns")
-        + primitive_p13_sync_ms(context, "mode4_intra_block_ns")
-    )
+    sync_ms = primitive_p13_sync_ms(context, "mode0_aiv_barrier_ns")
+    if is_arch35_context(context):
+        sync_ms += primitive_p13_sync_ms(context, "mode4_intra_block_ns")
     if sync_ms <= 0.0:
         sync_ms = primitive_p13_sync_ms(context, "mode0_aic_barrier_ns")
     return neg_ms + sync_ms

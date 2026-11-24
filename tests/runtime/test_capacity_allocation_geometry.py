@@ -564,19 +564,19 @@ def test_tile_solver_and_fusion_budget_fp32_ub_upcast_and_simt_carveout():
     from mindie_sim.prediction.fusion.contract import CubeResources, OpNode, TensorValue, TypedGraph, _cube_operands
     from mindie_sim.prediction.fusion.ub import AIV_FP32_UPCAST_KINDS, ub_worksheet
     from mindie_sim.prediction.runtime.tile_solver import (
-        DEFAULT_SIMT_UB_CARVEOUT_BYTES, LiveBufferSpec, TileCandidate,
+        LiveBufferSpec, TileCandidate,
         TileInfeasibleError, TilePipelineSpec, TileShape, solve, ub_working_bytes,
     )
 
-    assert DEFAULT_SIMT_UB_CARVEOUT_BYTES == 16 * 1024 and ub_working_bytes(4096, 2, upcast_fp32=True) == 4096 * 4
+    assert ub_working_bytes(4096, 2, upcast_fp32=True) == 4096 * 4
     cand = TileCandidate(
         "resident_1pass", TileShape(16, 64, 64), 1, (1, 1), 1, 1,
         (LiveBufferSpec("norm_buf", "ub", 46 * 1024, 0, 1, upcast_fp32=True, elements_per_owner=46 * 1024),),
         uses_simt=True,
     )
     with pytest.raises(TileInfeasibleError):
-        solve(TilePipelineSpec("norm_upcast", (cand,)), None, SimpleNamespace(buffers=(("ub", 192 * 1024),), compute_units=1))
-    sol = solve(TilePipelineSpec("norm_upcast", (cand,)), None, SimpleNamespace(buffers=(("ub", 200 * 1024),), compute_units=1))
+        solve(TilePipelineSpec("norm_upcast", (cand,)), None, SimpleNamespace(buffers=(("ub", 192 * 1024),), compute_units=1, simt_ub_carveout_bytes=16 * 1024))
+    sol = solve(TilePipelineSpec("norm_upcast", (cand,)), None, SimpleNamespace(buffers=(("ub", 200 * 1024),), compute_units=1, simt_ub_carveout_bytes=16 * 1024))
     assert next(p for p in sol.pool_peaks if p.pool == "ub").peak_bytes == 46 * 1024 * 4
     assert {"rms_norm", "layer_norm", "l2_norm", "softmax", "silu", "swiglu", "situ", "dynamic_quant"} <= AIV_FP32_UPCAST_KINDS
     vals = {
@@ -726,3 +726,31 @@ def test_simt_ub_carveout_propagates_through_projection_fusion_and_standalone_ad
     fg_simt_180 = project_graph(case_a5, _simt_pair(23040, simt_meta=(("uses_simt", True),)))
     ev_floor = evaluate_plan(baseline_plan(fg_simt_180, hw_floor), hw_floor)
     assert ev_floor.status == "failed" and "single_op_ub_capacity_exceeded" in ev_floor.reason
+
+
+def test_tile_solver_honors_zero_vs_32kib_simt_ub_carveout():
+    """TileSolver honors simt_ub_carveout_bytes=0 verbatim (no hidden 16 KiB clamp) vs 32 KiB -> 216 KiB."""
+    from types import SimpleNamespace
+    from mindie_sim.prediction.runtime.tile_solver import (
+        LiveBufferSpec, TileCandidate, TileInfeasibleError, TilePipelineSpec, TileShape, solve,
+    )
+
+    cand_240k = TileCandidate(
+        "resident_1pass", TileShape(16, 64, 64), 1, (1, 1), 1, 1,
+        (LiveBufferSpec("buf", "ub", 240 * 1024, 0, 1),), uses_simt=True,
+    )
+    cand_216k = TileCandidate(
+        "resident_1pass", TileShape(16, 64, 64), 1, (1, 1), 1, 1,
+        (LiveBufferSpec("buf", "ub", 216 * 1024, 0, 1),), uses_simt=True,
+    )
+    hw_zero = SimpleNamespace(buffers=(("ub", 248 * 1024),), compute_units=1, simt_ub_carveout_bytes=0)
+    sol_zero = solve(TilePipelineSpec("simt_zero", (cand_240k,), simt_ub_carveout_bytes=0), None, hw_zero)
+    ub_zero = next(p for p in sol_zero.pool_peaks if p.pool == "ub")
+    assert ub_zero.capacity_bytes == 248 * 1024 and ub_zero.peak_bytes == 240 * 1024
+
+    hw_32k = SimpleNamespace(buffers=(("ub", 248 * 1024),), compute_units=1, simt_ub_carveout_bytes=32 * 1024)
+    with pytest.raises(TileInfeasibleError):
+        solve(TilePipelineSpec("simt_32k_reject", (cand_240k,), simt_ub_carveout_bytes=32 * 1024), None, hw_32k)
+    sol_32k = solve(TilePipelineSpec("simt_32k_fit", (cand_216k,), simt_ub_carveout_bytes=32 * 1024), None, hw_32k)
+    ub_32k = next(p for p in sol_32k.pool_peaks if p.pool == "ub")
+    assert ub_32k.capacity_bytes == 216 * 1024 and ub_32k.peak_bytes == 216 * 1024
