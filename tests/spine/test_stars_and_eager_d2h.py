@@ -322,7 +322,7 @@ def test_eager_moe_dispatch_wires_split_barriers_and_counts_collective():
     assert b_single["explicit_device_sync"] is True and b_multi["explicit_device_sync"] is False
     # Real 4-layer raw_eager prefill at TP=EP=4 submits per-rank splits (256 B) + counts AllGather
     from mindie_sim import compose_case, parse_case
-    case = parse_case(compose_case(MOE_MODEL_ID, LEGACY_ARCH_SKU, tp=4, ep=4, layers=4, raw_eager=True))
+    case = parse_case(compose_case(MOE_MODEL_ID, LEGACY_ARCH_SKU, tp=4, ep=4, layers=4, quant="w8a8", raw_eager=True))
     gc_eager = graph_costs(
         case, target_graphs(case, phase="prefill", tokens=16, scope="body"),
         external_inputs={"analysis_input": 0}, include_submission=True, isolated=False,

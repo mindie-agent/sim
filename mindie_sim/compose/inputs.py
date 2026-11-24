@@ -303,8 +303,7 @@ def infer_workload_domain(model_spec: ModelSpec) -> WorkloadDomain:
         if any(tok in arch for tok in _DIFFUSION_DOMAIN_TOKENS):
             return "diffusion"
     model_type = str(facts.get("model_type") or facts.get("family") or "").strip().lower()
-    name_low = str(model_spec.name or "").strip().lower()
-    if any(tok in model_type or tok in name_low for tok in _DIFFUSION_DOMAIN_TOKENS):
+    if any(tok in model_type for tok in _DIFFUSION_DOMAIN_TOKENS):
         return "diffusion"
     if model_spec.vision is not None or bool(facts.get("vision_present")):
         return "vlm"
@@ -781,6 +780,41 @@ def _resolve_model_spec(
         raise ModelingError(f"unknown_model:{key} — {_format_model_suggestions(key)}") from exc
 
 
+def _collect_quant_formats(spec: ModelSpec) -> tuple[str, ...]:
+    """Collect every declared weight, activation, KV, index, category, and per-layer format."""
+    formats: list[str] = []
+    q = spec.quant
+    if q is not None:
+        for attr in (
+            "weight_format",
+            "activation_format",
+            "expert_weight_format",
+            "kv_dtype",
+            "index_dtype",
+        ):
+            val = str(getattr(q, attr, "") or "").strip().lower()
+            if val:
+                formats.append(val)
+        for _cat, fmt in tuple(getattr(q, "category_overrides", ()) or ()):
+            val = str(fmt or "").strip().lower()
+            if val:
+                formats.append(val)
+        for _lyr, entry in tuple(getattr(q, "layer_quant_overrides", ()) or ()):
+            if isinstance(entry, Mapping):
+                for val in entry.values():
+                    text = str(val or "").strip().lower()
+                    if text:
+                        formats.append(text)
+            else:
+                text = str(entry or "").strip().lower()
+                if text:
+                    formats.append(text)
+    spec_kv = str(getattr(spec, "kv_dtype", "") or "").strip().lower()
+    if spec_kv:
+        formats.append(spec_kv)
+    return tuple(formats)
+
+
 def _validate_explicit_quant_for_hardware(
     spec: ModelSpec, machine: Mapping[str, Any], raw_quant: Any,
 ) -> None:
@@ -789,18 +823,13 @@ def _validate_explicit_quant_for_hardware(
     sku = str(machine.get("sku") or "")
     arch = _arch_key(sku)
     peaks = machine.get("device", {}).get("compute_peaks", {})
-    has_fp8 = any(k in peaks for k in ("fp8", "fp8_e4m3", "mxfp4"))
-    if arch not in {"a2", "a3"} and has_fp8:
-        return
-    fmts = (
-        str(spec.quant.weight_format or "").lower(),
-        str(spec.quant.activation_format or "").lower(),
-        str(spec.quant.expert_weight_format or "").lower(),
-    )
-    if any(tok in fmt for fmt in fmts for tok in ("fp8", "mxfp4", "fp4")):
-        raise ModelingError(
-            f"quant_unsupported_on_hardware:{sku or arch}:{raw_quant}"
-        )
+    has_fp8 = arch not in {"a2", "a3"} and any(k in peaks for k in ("fp8", "fp8_e4m3"))
+    has_fp4 = arch not in {"a2", "a3"} and any(k in peaks for k in ("mxfp4", "fp4"))
+    fmts = _collect_quant_formats(spec)
+    if not has_fp8 and any("fp8" in fmt for fmt in fmts):
+        raise ModelingError(f"quant_unsupported_on_hardware:{sku or arch}:{raw_quant}")
+    if not has_fp4 and any(("mxfp4" in fmt or "fp4" in fmt) for fmt in fmts):
+        raise ModelingError(f"quant_unsupported_on_hardware:{sku or arch}:{raw_quant}")
 
 
 def _apply_quant_override(
@@ -834,17 +863,13 @@ def _apply_quant_override(
         _validate_explicit_quant_for_hardware(updated, machine, quant.name)
         return updated
     if quant is None:
-        peaks = machine.get("device", {}).get("compute_peaks", {})
-        has_fp8 = any(k in peaks for k in ("fp8", "fp8_e4m3", "mxfp4"))
-        if not has_fp8 and model_spec.quant is not None:
-            wf = str(model_spec.quant.weight_format)
-            ewf = str(model_spec.quant.expert_weight_format)
-            if "fp8" in wf or "fp8" in ewf or "mxfp4" in ewf:
-                return apply_model_overrides(model_spec, {"quantization": "w8a8"})
+        if model_spec.quant is not None:
+            _validate_explicit_quant_for_hardware(model_spec, machine, model_spec.quant.name)
         return model_spec
     if isinstance(quant, str):
         raw_key = quant.strip().lower()
         if raw_key in _CHECKPOINT_NATIVE_QUANT_TOKENS:
+            _validate_explicit_quant_for_hardware(model_spec, machine, raw_key)
             return model_spec
         qkey = _QUANT_ALIASES.get(raw_key, raw_key)
         try:
@@ -908,23 +933,77 @@ def _apply_structural_overrides(
     )
 
 
-def prepare_speculation(model: ModelSpec, proposals: int, *,
-                        allow_synthetic_gqa: bool = False) -> ModelSpec:
-    """Declare a native draft or explicit 1-layer EAGLE/GQA draft when allowed."""
+_NON_NEURAL_PREPARE_SPEC_METHODS = frozenset({"none", "ngram", "ngram_gpu"})
+_EAGLE3_DEFAULT_LOW_TAP_LAYER = 2
+_EAGLE3_DEFAULT_HIGH_TAP_OFFSET = 3
+_EAGLE3_MIN_DISTINCT_TAP_LAYERS = 3
+
+
+def _default_eagle3_aux_layers(num_layers: int) -> tuple[int, ...]:
+    """Return upstream interfaces.py:1506 3-tap default clamped to layer count."""
+    n = max(1, int(num_layers))
+    if n <= _EAGLE3_MIN_DISTINCT_TAP_LAYERS:
+        return tuple(range(n))
+    raw = (_EAGLE3_DEFAULT_LOW_TAP_LAYER, n // 2, n - _EAGLE3_DEFAULT_HIGH_TAP_OFFSET)
+    return tuple(dict.fromkeys(min(n - 1, max(0, idx)) for idx in raw))
+
+
+def prepare_speculation(
+    model: ModelSpec,
+    proposals: int,
+    *,
+    allow_synthetic_gqa: bool = False,
+    spec_method: str | None = None,
+) -> ModelSpec:
+    """Declare a native draft or opt-in synthetic EAGLE3 GQA draft when explicitly allowed."""
+    from mindie_sim.catalog.draft_spec import (
+        draft_compatible_with_spec_method,
+        is_mtp_speculative_method,
+        is_supported_speculative_method,
+        validate_fia_speculative_tokens,
+    )
+
     aux = model.auxiliary
     if aux is not None:
         attached = tuple(d for d in (aux.mtp, aux.dspark) if d is not None)
         if any(bool(getattr(d, "is_synthetic", False)) for d in attached) and not allow_synthetic_gqa:
             raise ModelingError("synthetic_draft_requires_explicit_allow_synthetic_gqa")
-    if proposals <= 0:
+    method = str(spec_method or "").strip().lower() or None
+    if method == "medusa":
+        raise ModelingError("unsupported_speculative_method_on_ascend_v2:medusa")
+    if method is not None and not is_supported_speculative_method(method, allow_none=True):
+        raise ModelingError(f"unsupported_speculative_method:{method}")
+    if proposals < 0:
+        raise ModelingError(f"ascend_fia_speculative_tokens_invalid:{proposals}")
+    if proposals > 0:
+        validate_fia_speculative_tokens(int(proposals))
+    if proposals == 0:
+        return model
+    if method in _NON_NEURAL_PREPARE_SPEC_METHODS:
+        if aux is not None and (aux.mtp is not None or aux.dspark is not None):
+            return replace(model, auxiliary=replace(aux, mtp=None, dspark=None))
         return model
     if aux is not None and aux.standalone_draft:
         raise ModelingError("standalone_draft_requires_target_model")
     if aux is not None and (aux.mtp is not None or aux.dspark is not None):
-        return model
-    if model.attention == "mla":
-        return model
-    if not allow_synthetic_gqa or model.attention != "gqa":
+        if method is None:
+            return model
+        attached_candidates = tuple(d for d in (aux.mtp, aux.dspark) if d is not None)
+        if any(draft_compatible_with_spec_method(d, method) for d in attached_candidates):
+            return model
+        kinds = ",".join(str(d.kind) for d in attached_candidates)
+        raise ModelingError(
+            f"draft_structure_incompatible_for_speculative_method:{method}:{kinds}"
+        )
+    if method is None or is_mtp_speculative_method(method):
+        model = ensure_native_mla_draft(model, proposals)
+        aux = model.auxiliary
+        if aux is not None and (aux.mtp is not None or aux.dspark is not None):
+            return model
+    allow_synth_for_method = method is None or method == "eagle3"
+    if not allow_synthetic_gqa or not allow_synth_for_method or model.attention != "gqa":
+        if method is not None:
+            raise ModelingError(f"draft_structure_required_for_speculative_method:{method}")
         raise ModelingError("draft_structure_required_for_mtp_proposal_tokens")
     from mindie_sim.catalog.draft import declare_native_auxiliary_plans
     gqa_plans = [p for p in model.layer_plans if p.attention == "gqa"]
@@ -956,7 +1035,7 @@ def prepare_speculation(model: ModelSpec, proposals: int, *,
         weight_category="mtp",
         qk_norm=qk_norm,
         q_output_gate=q_gate,
-        target_layer_ids=(model.layers - 1,),
+        target_layer_ids=_default_eagle3_aux_layers(model.layers),
         target_shared_embedding=True,
         target_shared_lm_head=True,
         base_logits=True,
@@ -977,9 +1056,9 @@ def ensure_native_mla_draft(model_spec: ModelSpec, proposals: int) -> ModelSpec:
     aux = model_spec.auxiliary
     facts = dict(model_spec.catalog_facts)
     if aux is not None and aux.mtp is not None:
-        src_kind = dict(getattr(aux.mtp, "source", ()) or ()).get("kind")
+        src_kind = str(dict(getattr(aux.mtp, "source", ()) or ()).get("kind") or "")
         if (
-            src_kind == "standard_deepseek_nextn_mtp"
+            src_kind.endswith("_nextn_mtp")
             and int(facts.get("num_nextn_predict_layers", 0) or 0) <= 0
         ):
             raise ModelingError("fabricated_mla_nextn_draft_contradicts_checkpoint_zero_nextn")
@@ -989,31 +1068,41 @@ def ensure_native_mla_draft(model_spec: ModelSpec, proposals: int) -> ModelSpec:
     from mindie_sim.catalog.draft import declare_native_auxiliary_plans
 
     nextn = int(facts.get("num_nextn_predict_layers", 0) or 0)
-    moe_ref = next((p for p in model_spec.layer_plans if p.ffn == "moe"), None)
-    if nextn > 0 and moe_ref is not None and moe_ref.attention == "mla":
-        qk_dim = moe_ref.qk_nope_head_dim + moe_ref.qk_rope_head_dim
+    mla_plans = [
+        p for p in model_spec.layer_plans
+        if p.attention == "mla"
+        and str(getattr(p, "mla_variant", "latent_mla") or "latent_mla") == "latent_mla"
+    ]
+    donor = next((p for p in reversed(mla_plans) if p.ffn == "moe"), None)
+    if nextn > 0 and donor is not None:
+        qk_dim = donor.qk_nope_head_dim + donor.qk_rope_head_dim
         draft = DraftSpec(
             kind="mtp", layers=nextn, hidden_size=model_spec.hidden_size,
-            intermediate_size=moe_ref.moe_intermediate_size,
-            num_heads=moe_ref.num_heads, num_kv_heads=1,
+            intermediate_size=donor.moe_intermediate_size or model_spec.intermediate_size,
+            num_heads=donor.num_heads, num_kv_heads=1,
             head_dim=qk_dim or NEXTN_DEFAULT_HEAD_DIM,
-            q_width=moe_ref.num_heads * qk_dim, kv_width=qk_dim,
-            attention_kind="mla", kv_cache_elements=moe_ref.kv_cache_elements,
-            weight_category="mtp", q_lora_rank=moe_ref.q_lora_rank,
-            kv_lora_rank=moe_ref.kv_lora_rank,
-            qk_nope_head_dim=moe_ref.qk_nope_head_dim,
-            qk_rope_head_dim=moe_ref.qk_rope_head_dim,
-            v_head_dim=moe_ref.v_head_dim, num_experts=moe_ref.num_experts,
-            top_k=moe_ref.top_k,
-            expert_intermediate_size=moe_ref.moe_intermediate_size,
-            num_shared_experts=moe_ref.num_shared_experts,
+            q_width=donor.num_heads * qk_dim, kv_width=qk_dim,
+            attention_kind="mla", mla_variant=donor.mla_variant,
+            kv_cache_elements=donor.kv_cache_elements,
+            weight_category="mtp", q_lora_rank=donor.q_lora_rank,
+            kv_lora_rank=donor.kv_lora_rank,
+            qk_nope_head_dim=donor.qk_nope_head_dim,
+            qk_rope_head_dim=donor.qk_rope_head_dim,
+            v_head_dim=donor.v_head_dim, num_experts=donor.num_experts,
+            top_k=donor.top_k,
+            expert_intermediate_size=donor.moe_intermediate_size,
+            num_shared_experts=donor.num_shared_experts,
             target_shared_embedding=True, target_shared_lm_head=True,
             base_logits=True, pp_capability=PP_CAP_DEFAULT,
             vocab_size=model_spec.vocab_size,
-            source=merge_source({"kind": "standard_deepseek_nextn_mtp"}),
+            target_layer_ids=(int(donor.index),),
+            mhc_mult=int(donor.hyper_connections),
+            mhc_sinkhorn_iters=int(donor.hc_sinkhorn_iters),
+            mhc_lowrank=int(donor.hc_lowrank),
+            source=merge_source({"kind": "native_mla_nextn_mtp"}),
         )
-        return declare_native_auxiliary_plans(
-            replace(model_spec, auxiliary=AuxiliarySpec(mtp=draft)))
+        next_aux = replace(aux, mtp=draft) if aux is not None else AuxiliarySpec(mtp=draft)
+        return declare_native_auxiliary_plans(replace(model_spec, auxiliary=next_aux))
     return model_spec
 
 

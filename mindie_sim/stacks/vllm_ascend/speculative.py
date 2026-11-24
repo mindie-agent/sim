@@ -18,11 +18,24 @@
 """
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 import json
 from typing import Any
 
+from mindie_sim.catalog.draft_spec import (
+    MTP_SPECULATIVE_METHOD_ALIASES,
+    NGRAM_CPU_PROVENANCE,
+    NO_DRAFT_PROVENANCE,
+    REAL_CHECKPOINT_PROVENANCE,
+    SUPPORTED_SPECULATIVE_METHODS,
+    DraftSpec,
+    SpeculativeExecutionContract,
+    canonical_speculative_method,
+    is_mtp_speculative_method,
+    is_supported_speculative_method,
+)
+from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.model import ModelSpec
 from mindie_sim.schema.parallel import ParallelSpec
 from mindie_sim.schema.stack import (
@@ -70,16 +83,16 @@ QWEN24T_DEFAULT_K = 1
 DEFAULT_RECOVER_SSM_BATCHED_LAUNCHES = 1
 DEFAULT_ACCEPTANCE_PREFIX = 1
 
-SUPPORTED_SPECULATIVE_METHODS = frozenset({
-    "ngram", "medusa", "eagle", "eagle3", "mtp",
-    "deepseek_mtp", "qwen3_5_mtp", "dflash", "dspark", "draft_model",
-})
+ASCEND_V2_REJECTED_SPECULATIVE_METHODS = frozenset({"medusa"})
 NONCAUSAL_BLOCK_DRAFT_METHODS = frozenset({"dspark", "dflash"})
-SERIAL_DRAFT_METHODS = frozenset({
-    "mtp", "deepseek_mtp", "qwen3_5_mtp", "eagle", "eagle3", "draft_model", "medusa",
+SERIAL_DRAFT_METHODS = MTP_SPECULATIVE_METHOD_ALIASES | frozenset({
+    "eagle", "eagle3", "draft_model",
 })
-ZERO_NEURAL_DRAFT_METHODS = frozenset({"ngram"})
+ZERO_NEURAL_DRAFT_METHODS = frozenset({"ngram", "ngram_gpu"})
 FULL_GRAPH_CUDAGRAPH_MODES = frozenset({"FULL", "FULL_DECODE_ONLY", "FULL_AND_PIECEWISE"})
+KDA_DSPARK_ALLOWED_PD_CONNECTORS = frozenset({"MooncakeConnectorV2", "MooncakePullConnector"})
+RECOVER_SSM_ELIGIBLE_FAMILIES = frozenset({"kda", "gdn"})
+ALL_RECURRENT_ATTN_FAMILIES = frozenset({"kda", "gdn", "mamba", "mamba2"})
 
 _CUDAGRAPH_MODE_MAP: dict[str, CaptureMode] = {
     "NONE": "none",
@@ -88,57 +101,6 @@ _CUDAGRAPH_MODE_MAP: dict[str, CaptureMode] = {
     "FULL": "full",
     "FULL_DECODE_ONLY": "full_decode_only",
     "FULL_AND_PIECEWISE": "full_and_piecewise",
-}
-
-HYBRID_RECURRENT_MODELS = frozenset({
-    "qwen3-next-80b-a3b",
-    "qwen3.5-27b", "qwen3.5-35b-a3b", "qwen3.5-122b-a10b", "qwen3.5-397b-a17b", "qwen3.5-moe",
-    "qwen3.6-27b", "qwen3.6-35b-a3b",
-    "qwen3.8-27b", "qwen3.8-2.4t-a95b", "qwen3.8-flash-next",
-    "kimi-k3", "kimi-k3.1",
-    "glm-5.3-flash",
-    "bailing-v3",
-})
-MULTIMODAL_MODELS = frozenset({
-    "kimi-k3", "kimi-k3.1", "kimi-k2.5", "kimi-k2.6",
-    "deepseek-v4.1-flash",
-    "qwen3.5-27b", "qwen3.5-35b-a3b", "qwen3.5-122b-a10b", "qwen3.5-397b-a17b",
-    "qwen3.6-27b", "qwen3.6-35b-a3b",
-    "qwen3.8-27b", "qwen3.8-flash-next",
-    "qwen3-vl-8b", "qwen3-vl-30b-a3b", "qwen3-vl-32b", "qwen3-vl-235b-a22b",
-    "minimax-m3",
-    "gemma-4-31b", "gemma-4-26b-a4b",
-})
-LAZY_LOAD_STRATEGY_MODELS = frozenset({
-    "qwen3.8-2.4t-a95b",
-    "deepseek-v4.1-flash",
-    "qwen3.6-35b-a3b",
-})
-PREFETCH_LOAD_STRATEGY_MODELS = frozenset({
-    "deepseek-v4-flash-0731", "deepseek-v4-pro-0813", "deepseek-v4-10t",
-    "glm-5.3", "glm-5.3-flash", "glm-5.2", "glm-5.1", "glm-5",
-    "kimi-k3", "kimi-k3.1", "kimi-k2.6", "kimi-k2.5",
-    "minimax-m3", "minimax-m3.1-flash",
-    "step-5-preview",
-    "qwen3.5-397b-a17b", "qwen3.8-flash-next",
-})
-
-_SHIPPING_KDA_RECOVERSSM_MODELS = frozenset({"kimi-k3", "kimi-k3.1"})
-_OPT_IN_KDA_RECOVERSSM_MODELS = frozenset({"glm-5.3-flash"})
-_SPEC_MODEL_ALIASES: dict[str, str] = {
-    "meta-llama/meta-llama-3.1-8b-instruct": "llama-3.1-8b",
-    "meta-llama/llama-3.1-8b-instruct": "llama-3.1-8b",
-    "llama-3.1-8b-instruct": "llama-3.1-8b",
-    "meta-llama/llama-3.1-70b-instruct": "llama-3.1-70b",
-    "meta-llama/llama-3.3-70b-instruct": "llama-3.3-70b",
-    "llama3": "llama-3",
-    "llama-3": "llama-3",
-    "qwen/qwen3-8b": "qwen3-8b",
-    "qwen3-8b": "qwen3-8b",
-    "qwen/qwen3-14b": "qwen3-14b",
-    "qwen3-14b": "qwen3-14b",
-    "qwen/qwen3-32b": "qwen3-32b",
-    "qwen/qwen3-30b-a3b": "qwen3-30b-a3b",
 }
 
 
@@ -355,7 +317,7 @@ _BASE_SPECULATIVE_COMPANIONS: dict[str, tuple[SpeculativeCompanion, ...]] = {
     ),
     "kimi-k2.6": (
         _c("kimi-k2.6", "eagle3", "lightseekorg/kimi-k2.6-eagle3", EAGLE3_DEFAULT_K,
-           k_min=1, k_max=DEFAULT_DSPARK_K, draft_tp_policy="one",
+           k_min=1, k_max=DEFAULT_DSPARK_K, draft_tp_policy="match_target",
            doc="tutorials/models/Kimi-K2.6.md"),
         _c("kimi-k2.6", "dflash", "z-lab/Kimi-K2.5-DFlash", DFLASH_MAX_K,
            k_min=1, k_max=DFLASH_MAX_K, no_prefix_cache=True, primary=False,
@@ -363,7 +325,7 @@ _BASE_SPECULATIVE_COMPANIONS: dict[str, tuple[SpeculativeCompanion, ...]] = {
     ),
     "kimi-k2.5": (
         _c("kimi-k2.5", "eagle3", "lightseekorg/kimi-k2.6-eagle3", EAGLE3_DEFAULT_K,
-           k_min=1, k_max=DEFAULT_DSPARK_K, draft_tp_policy="one",
+           k_min=1, k_max=DEFAULT_DSPARK_K, draft_tp_policy="match_target",
            doc="tutorials/models/Kimi-K2.6.md"),
         _c("kimi-k2.5", "dflash", "z-lab/Kimi-K2.5-DFlash", DFLASH_MAX_K,
            k_min=1, k_max=DFLASH_MAX_K, no_prefix_cache=True, primary=False,
@@ -371,7 +333,7 @@ _BASE_SPECULATIVE_COMPANIONS: dict[str, tuple[SpeculativeCompanion, ...]] = {
     ),
     "minimax-m3": (
         _c("minimax-m3", "eagle3", "Inferact/MiniMax-M3-EAGLE3-GQA", EAGLE3_DEFAULT_K,
-           k_min=1, k_max=DEFAULT_DSPARK_K, draft_tp_policy="one",
+           k_min=1, k_max=DEFAULT_DSPARK_K, draft_tp_policy="match_target",
            draft_kv_on_fp8="bfloat16", doc="tutorials/models/MiniMax-M3.md"),
     ),
     "minimax-m3.1-flash": (
@@ -380,12 +342,12 @@ _BASE_SPECULATIVE_COMPANIONS: dict[str, tuple[SpeculativeCompanion, ...]] = {
            pd_match=True, doc="tutorials/models/MiniMax-M3.1-Flash.md",
            notes="Built-in DSpark; keep draft kv_cache_dtype=bfloat16 when target KV is fp8"),
         _c("minimax-m3.1-flash", "eagle3", "Inferact/MiniMax-M3-EAGLE3-GQA", EAGLE3_DEFAULT_K,
-           k_min=1, k_max=DEFAULT_DSPARK_K, draft_tp_policy="one", primary=False,
+           k_min=1, k_max=DEFAULT_DSPARK_K, draft_tp_policy="match_target", primary=False,
            doc="tutorials/models/MiniMax-M3.md"),
     ),
     "qwen3-8b": (
         _c("qwen3-8b", "eagle3", "yuhuili/EAGLE3-Qwen3-8B", EAGLE3_DEFAULT_K,
-           k_min=1, k_max=DEFAULT_DSPARK_K, draft_tp_policy="one", doc="tutorials/models/Qwen3-Dense.md"),
+           k_min=1, k_max=DEFAULT_DSPARK_K, draft_tp_policy="match_target", doc="tutorials/models/Qwen3-Dense.md"),
         _c("qwen3-8b", "dflash", "z-lab/Qwen3-8B-DFlash-b16", DFLASH_DEFAULT_K,
            k_min=1, k_max=DFLASH_MAX_K, no_prefix_cache=True, primary=False, doc=_DOC_SD),
         _c("qwen3-8b", "dspark", "deepseek-ai/dspark_qwen3_8b_block7", DSPARK_LONG_K,
@@ -394,28 +356,28 @@ _BASE_SPECULATIVE_COMPANIONS: dict[str, tuple[SpeculativeCompanion, ...]] = {
     ),
     "qwen3-14b": (
         _c("qwen3-14b", "eagle3", "AngelSlim/Qwen3-14B_eagle3", EAGLE3_DEFAULT_K,
-           k_min=1, k_max=DEFAULT_DSPARK_K, draft_tp_policy="one", doc="tutorials/models/Qwen3-Dense.md"),
+           k_min=1, k_max=DEFAULT_DSPARK_K, draft_tp_policy="match_target", doc="tutorials/models/Qwen3-Dense.md"),
         _c("qwen3-14b", "ngram", "", NGRAM_DEFAULT_K, is_builtin=True,
            k_min=1, k_max=DFLASH_DEFAULT_K, prompt_lookup_max=DEFAULT_PROMPT_LOOKUP_MAX,
            primary=False, doc=_DOC_SD),
     ),
     "qwen3-32b": (
         _c("qwen3-32b", "eagle3", "AngelSlim/Qwen3-32B_eagle3", EAGLE3_DEFAULT_K,
-           k_min=1, k_max=DEFAULT_DSPARK_K, draft_tp_policy="one", doc="tutorials/models/Qwen3-Dense.md"),
+           k_min=1, k_max=DEFAULT_DSPARK_K, draft_tp_policy="match_target", doc="tutorials/models/Qwen3-Dense.md"),
         _c("qwen3-32b", "ngram", "", NGRAM_DEFAULT_K, is_builtin=True,
            k_min=1, k_max=DFLASH_DEFAULT_K, prompt_lookup_max=DEFAULT_PROMPT_LOOKUP_MAX,
            primary=False, doc=_DOC_SD),
     ),
     "qwen3-30b-a3b": (
         _c("qwen3-30b-a3b", "eagle3", "AngelSlim/Qwen3-a3B_eagle3", EAGLE3_DEFAULT_K,
-           k_min=1, k_max=DEFAULT_DSPARK_K, draft_tp_policy="one", doc="tutorials/models/Qwen3-30B-A3B.md"),
+           k_min=1, k_max=DEFAULT_DSPARK_K, draft_tp_policy="match_target", doc="tutorials/models/Qwen3-30B-A3B.md"),
         _c("qwen3-30b-a3b", "ngram", "", NGRAM_DEFAULT_K, is_builtin=True,
            k_min=1, k_max=DFLASH_DEFAULT_K, prompt_lookup_max=DEFAULT_PROMPT_LOOKUP_MAX,
            primary=False, doc=_DOC_SD),
     ),
     "qwen3-235b-a22b": (
         _c("qwen3-235b-a22b", "eagle3", "AngelSlim/Qwen3-235B-A22B_eagle3", EAGLE3_DEFAULT_K,
-           k_min=1, k_max=DEFAULT_DSPARK_K, draft_tp_policy="one", doc="tutorials/models/Qwen3-30B-A3B.md"),
+           k_min=1, k_max=DEFAULT_DSPARK_K, draft_tp_policy="match_target", doc="tutorials/models/Qwen3-30B-A3B.md"),
     ),
     "qwen3.8-27b": (
         _c("qwen3.8-27b", "qwen3_5_mtp", "", DEFAULT_MTP_K, is_builtin=True,
@@ -434,34 +396,34 @@ _BASE_SPECULATIVE_COMPANIONS: dict[str, tuple[SpeculativeCompanion, ...]] = {
     ),
     "llama-3.1-8b": (
         _c("llama-3.1-8b", "eagle3", "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B", EAGLE3_DEFAULT_K,
-           k_min=1, k_max=DEFAULT_DSPARK_K, draft_tp_policy="one", doc=_DOC_SD),
+           k_min=1, k_max=DEFAULT_DSPARK_K, draft_tp_policy="match_target", doc=_DOC_SD),
         _c("llama-3.1-8b", "eagle", "yuhuili/EAGLE-LLaMA3.1-Instruct-8B", EAGLE_DEFAULT_K,
-           k_min=1, k_max=DEFAULT_MTP_K, draft_tp_policy="one", primary=False, doc=_DOC_SD),
+           k_min=1, k_max=DEFAULT_MTP_K, draft_tp_policy="match_target", primary=False, doc=_DOC_SD),
         _c("llama-3.1-8b", "ngram", "", NGRAM_DEFAULT_K, is_builtin=True,
            k_min=1, k_max=DFLASH_DEFAULT_K, prompt_lookup_max=DEFAULT_PROMPT_LOOKUP_MAX,
            primary=False, doc=_DOC_SD),
     ),
     "llama-3.1-70b": (
         _c("llama-3.1-70b", "eagle3", "yuhuili/EAGLE3-LLaMA3.1-Instruct-70B", EAGLE3_DEFAULT_K,
-           k_min=1, k_max=DEFAULT_DSPARK_K, draft_tp_policy="one", doc=_DOC_SD),
+           k_min=1, k_max=DEFAULT_DSPARK_K, draft_tp_policy="match_target", doc=_DOC_SD),
         _c("llama-3.1-70b", "eagle", "yuhuili/EAGLE-LLaMA3.1-Instruct-70B", EAGLE_DEFAULT_K,
-           k_min=1, k_max=DEFAULT_MTP_K, draft_tp_policy="one", primary=False, doc=_DOC_SD),
+           k_min=1, k_max=DEFAULT_MTP_K, draft_tp_policy="match_target", primary=False, doc=_DOC_SD),
         _c("llama-3.1-70b", "ngram", "", NGRAM_DEFAULT_K, is_builtin=True,
            k_min=1, k_max=DFLASH_DEFAULT_K, prompt_lookup_max=DEFAULT_PROMPT_LOOKUP_MAX,
            primary=False, doc=_DOC_SD),
     ),
     "llama-3.3-70b": (
         _c("llama-3.3-70b", "eagle3", "yuhuili/EAGLE3-LLaMA3.3-Instruct-70B", EAGLE3_DEFAULT_K,
-           k_min=1, k_max=DEFAULT_DSPARK_K, draft_tp_policy="one", doc=_DOC_SD),
+           k_min=1, k_max=DEFAULT_DSPARK_K, draft_tp_policy="match_target", doc=_DOC_SD),
         _c("llama-3.3-70b", "ngram", "", NGRAM_DEFAULT_K, is_builtin=True,
            k_min=1, k_max=DFLASH_DEFAULT_K, prompt_lookup_max=DEFAULT_PROMPT_LOOKUP_MAX,
            primary=False, doc=_DOC_SD),
     ),
     "llama-3": (
         _c("llama-3", "eagle3", "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B", EAGLE3_DEFAULT_K,
-           k_min=1, k_max=DEFAULT_DSPARK_K, draft_tp_policy="one", doc=_DOC_SD),
+           k_min=1, k_max=DEFAULT_DSPARK_K, draft_tp_policy="match_target", doc=_DOC_SD),
         _c("llama-3", "eagle", "yuhuili/EAGLE-LLaMA3.1-Instruct-8B", EAGLE_DEFAULT_K,
-           k_min=1, k_max=DEFAULT_MTP_K, draft_tp_policy="one", primary=False, doc=_DOC_SD),
+           k_min=1, k_max=DEFAULT_MTP_K, draft_tp_policy="match_target", primary=False, doc=_DOC_SD),
         _c("llama-3", "ngram", "", NGRAM_DEFAULT_K, is_builtin=True,
            k_min=1, k_max=DFLASH_DEFAULT_K, prompt_lookup_max=DEFAULT_PROMPT_LOOKUP_MAX,
            primary=False, doc=_DOC_SD),
@@ -523,7 +485,7 @@ def _build_speculative_companions() -> dict[str, tuple[SpeculativeCompanion, ...
     for model_key in ("kimi-k2", "kimi-k2-thinking"):
         reg[model_key] = (
             _c(model_key, "eagle3", "lightseekorg/kimi-k2.6-eagle3", EAGLE3_DEFAULT_K,
-               k_min=1, k_max=DEFAULT_DSPARK_K, draft_tp_policy="one",
+               k_min=1, k_max=DEFAULT_DSPARK_K, draft_tp_policy="match_target",
                doc="tutorials/models/Kimi-K2.6.md"),
         )
     return reg
@@ -532,51 +494,69 @@ def _build_speculative_companions() -> dict[str, tuple[SpeculativeCompanion, ...
 SPECULATIVE_COMPANIONS: dict[str, tuple[SpeculativeCompanion, ...]] = _build_speculative_companions()
 
 
+_COMPACT_COMPANION_KEY_MAP: dict[str, str] = {
+    "".join(ch for ch in key.lower() if ch.isalnum()): key
+    for key in SPECULATIVE_COMPANIONS
+}
+
+
 def _resolve_spec_model_key(model_id: str) -> str:
-    raw = str(model_id or "").strip().lower()
-    if raw in _SPEC_MODEL_ALIASES:
-        return _SPEC_MODEL_ALIASES[raw]
-    canon = normalize_canonical_model(model_id)
-    if canon in SPECULATIVE_COMPANIONS:
-        return canon
-    if canon in _SPEC_MODEL_ALIASES:
-        return _SPEC_MODEL_ALIASES[canon]
-    if "llama-3.3" in raw or "llama3.3" in raw:
-        return "llama-3.3-70b"
-    if "llama-3" in raw or "llama3" in raw:
-        return "llama-3.1-70b" if "70b" in raw else ("llama-3.1-8b" if "8b" in raw else "llama-3")
-    return canon
+    norm = normalize_canonical_model(model_id)
+    if norm in SPECULATIVE_COMPANIONS:
+        return norm
+    hyphenated = norm.replace("_", "-")
+    if hyphenated in SPECULATIVE_COMPANIONS:
+        return hyphenated
+    compact = "".join(ch for ch in norm.lower() if ch.isalnum())
+    if compact in _COMPACT_COMPANION_KEY_MAP:
+        return _COMPACT_COMPANION_KEY_MAP[compact]
+    return norm
+
+
+def _load_catalog_model_structurally(model_or_id: ModelSpec | str) -> ModelSpec | None:
+    """Resolve a catalog model name into its structural ModelSpec without name heuristics."""
+    if isinstance(model_or_id, ModelSpec):
+        return model_or_id
+    raw = str(model_or_id or "").strip()
+    if not raw:
+        return None
+    from mindie_sim.model_catalog import load_model
+
+    for candidate in dict.fromkeys((raw, _resolve_spec_model_key(raw), normalize_canonical_model(raw))):
+        if not candidate:
+            continue
+        try:
+            return load_model(candidate)
+        except TimeoutError:
+            raise
+        except (KeyError, FileNotFoundError):
+            continue
+        except ModelingError as exc:
+            if str(exc).startswith("model_catalog_unknown:"):
+                continue
+            raise
+    return None
 
 
 def is_hybrid_recurrent_model(model_or_id: ModelSpec | str) -> bool:
-    """Return True when the model has KDA/GDN/Mamba recurrent layers."""
-    if isinstance(model_or_id, ModelSpec):
-        if any(
-            str(plan.attention).lower() in {"kda", "gdn"}
-            or str(plan.architecture).lower() in {"kda", "gdn"}
-            or plan.recurrent_state_elements > 0
-            for plan in model_or_id.layer_plans
-        ):
-            return True
-        model_id = model_or_id.name
-    else:
-        model_id = str(model_or_id or "")
-    key = _resolve_spec_model_key(model_id)
-    return key in HYBRID_RECURRENT_MODELS or any(
-        tok in key for tok in ("qwen3-next", "qwen3.5", "qwen3.6", "qwen3.8", "kimi-k3", "glm-5.3-flash")
+    """Return True structurally when the model declares KDA/GDN/Mamba recurrent layers."""
+    model = _load_catalog_model_structurally(model_or_id)
+    if model is None:
+        return False
+    return any(
+        str(plan.attention).lower() in ALL_RECURRENT_ATTN_FAMILIES
+        or int(plan.recurrent_state_elements) > 0
+        for plan in model.layer_plans
     )
 
 
 def is_multimodal_model(model_or_id: ModelSpec | str) -> bool:
-    """Return True when the model carries a multimodal/vision tower."""
-    if isinstance(model_or_id, ModelSpec):
-        if model_or_id.vision is not None:
-            return True
-        model_id = model_or_id.name
-    else:
-        model_id = str(model_or_id or "")
-    key = _resolve_spec_model_key(model_id)
-    return key in MULTIMODAL_MODELS or "-vl-" in key
+    """Return True structurally when the model carries a multimodal/vision tower."""
+    model = _load_catalog_model_structurally(model_or_id)
+    if model is None:
+        return False
+    facts = dict(getattr(model, "catalog_facts", ()) or ())
+    return model.vision is not None or bool(facts.get("vision_present"))
 
 
 def draft_invocation_count_for_method(method: str, proposal_count: int) -> int:
@@ -592,9 +572,80 @@ def draft_invocation_count_for_method(method: str, proposal_count: int) -> int:
     return k
 
 
+def validate_fia_speculative_tokens(num_speculative_tokens: int) -> int:
+    """Delegate strict Ascend FIA K <= 15 check to canonical L1 draft_spec validator."""
+    from mindie_sim.catalog.draft_spec import validate_fia_speculative_tokens as _validate
+    return _validate(num_speculative_tokens)
+
+
+def validate_dcp_for_speculative(
+    *,
+    spec_method: str,
+    draft_spec: DraftSpec | None,
+    parallel: ParallelSpec,
+    num_speculative_tokens: int,
+    draft_tp: int | None = None,
+    spec_draft_tp: int | None = None,
+    dynamic_spec_widths: bool = False,
+    use_v2_model_runner: bool = True,
+    optimization_mode: str = "simulation",
+    allow_synthetic_gqa: bool = False,
+) -> None:
+    """Enforce verbatim VA/platform.py:2253-2321,2143 DCP/PCP validation order."""
+    norm = str(spec_method or "none").strip().lower()
+    if norm in ASCEND_V2_REJECTED_SPECULATIVE_METHODS:
+        raise ModelingError(f"unsupported_speculative_method_on_ascend_v2:{norm}")
+    if norm != "none" and not is_supported_speculative_method(norm):
+        raise ModelingError(f"unsupported_speculative_method:{norm}")
+    canonical_method = canonical_speculative_method(norm)
+    archetype = (
+        "none" if canonical_method == "none"
+        else "ngram" if canonical_method in ZERO_NEURAL_DRAFT_METHODS
+        else "dspark" if canonical_method in NONCAUSAL_BLOCK_DRAFT_METHODS
+        else canonical_method
+    )
+    provenance = (
+        NO_DRAFT_PROVENANCE if archetype == "none"
+        else NGRAM_CPU_PROVENANCE if archetype == "ngram"
+        else (
+            draft_spec.draft_provenance
+            if draft_spec is not None and draft_spec.is_synthetic
+            else REAL_CHECKPOINT_PROVENANCE
+        )
+    )
+    eff_k = validate_fia_speculative_tokens(num_speculative_tokens)
+    contract = SpeculativeExecutionContract(
+        archetype=archetype,  # type: ignore[arg-type]
+        spec_method=canonical_method,  # type: ignore[arg-type]
+        num_speculative_tokens=eff_k,
+        requires_draft_spec=archetype not in {"none", "ngram"},
+        draft_tp=int(draft_tp or spec_draft_tp or parallel.tp or 1),
+        draft_dcp=1,
+        neural_draft_forwards=draft_invocation_count_for_method(canonical_method, eff_k),
+        requires_draft_prepare=archetype not in {"none", "ngram"},
+        optimization_mode=optimization_mode,  # type: ignore[arg-type]
+        allow_synthetic_gqa=bool(allow_synthetic_gqa),
+        draft_provenance=provenance,  # type: ignore[arg-type]
+    )
+    contract.validate_dcp_spec_gate(
+        draft_spec,
+        parallel,
+        dynamic_spec_widths=dynamic_spec_widths,
+        use_v2_model_runner=use_v2_model_runner,
+        draft_tp_override=draft_tp,
+        spec_draft_tp=spec_draft_tp,
+    )
+
+
+def _require_int_spec_k(value: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ModelingError(f"ascend_fia_speculative_tokens_invalid:{value!r}")
+    return int(value)
+
+
 def clamp_fia_speculative_tokens(num_speculative_tokens: int) -> tuple[int, str | None]:
     """Clamp speculative token count to Ascend FIA ``(K + 1) <= 16`` ceiling."""
-    requested = int(num_speculative_tokens)
+    requested = _require_int_spec_k(num_speculative_tokens)
     if requested < 0:
         return 0, f"fia_spec_tokens_negative_clamped:{requested}->0"
     if requested + 1 > ASCEND_FIA_MAX_DECODE_TOKENS:
@@ -610,8 +661,12 @@ def normalize_capture_mode(raw_mode: str | None, *, enforce_eager: bool = False)
     """Map vLLM-Ascend cudagraph mode string to canonical L0 ``CaptureMode`` without loss."""
     if enforce_eager:
         return "none"
-    text = str(raw_mode or "FULL_DECODE_ONLY").strip().upper()
-    return _CUDAGRAPH_MODE_MAP.get(text, "full_decode_only")
+    if raw_mode is None or not str(raw_mode).strip():
+        return "full_decode_only"
+    text = str(raw_mode).strip().upper()
+    if text not in _CUDAGRAPH_MODE_MAP:
+        raise ModelingError(f"unsupported_cudagraph_mode:{raw_mode!r}")
+    return _CUDAGRAPH_MODE_MAP[text]
 
 
 def compute_aclgraph_capture_sizes(
@@ -622,7 +677,7 @@ def compute_aclgraph_capture_sizes(
     cudagraph_mode: str = "FULL_DECODE_ONLY",
 ) -> tuple[int, ...]:
     """Generate ACLGraph capture sizes respecting ``n * (K + 1)`` under full-graph modes."""
-    k, _ = clamp_fia_speculative_tokens(max(0, int(num_speculative_tokens)))
+    k = validate_fia_speculative_tokens(_require_int_spec_k(num_speculative_tokens))
     stride = k + 1
     limit = max(1, int(max_num_seqs))
     if batch_sizes is not None:
@@ -644,7 +699,7 @@ def validate_aclgraph_capture_sizes(
     cudagraph_mode: str = "FULL_DECODE_ONLY",
 ) -> tuple[str, ...]:
     """Validate that capture sizes are exact multiples of ``(K + 1)`` under full graph."""
-    k = max(0, int(num_speculative_tokens))
+    k = validate_fia_speculative_tokens(_require_int_spec_k(num_speculative_tokens))
     mode_upper = str(cudagraph_mode or "FULL_DECODE_ONLY").strip().upper()
     if k <= 0 or mode_upper not in FULL_GRAPH_CUDAGRAPH_MODES:
         return ()
@@ -726,6 +781,260 @@ def build_capture_bucket_rule(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class RecoverSsmEligibility:
+    """Typed structural RecoverSSM eligibility and family-specific validation result."""
+
+    enabled: bool
+    explicitly_requested: bool
+    policy_kind: str
+    kda_owner_layers: tuple[int, ...] = ()
+    gdn_owner_layers: tuple[int, ...] = ()
+    readiness: str = "shipping"
+    source_ref: str = ""
+    rejection_reason: str = ""
+
+
+def _infer_recover_ssm_policy_kind(
+    model: ModelSpec,
+    *,
+    kda_owners: tuple[int, ...],
+    gdn_owners: tuple[int, ...],
+    other_rec_owners: tuple[int, ...],
+    spec_method: str,
+) -> str:
+    facts = dict(getattr(model, "catalog_facts", ()) or ())
+    meta = dict(getattr(model, "metadata", ()) or ())
+    declared = str(
+        getattr(model, "recover_ssm_policy_kind", "")
+        or meta.get("recover_ssm_policy_kind", "")
+        or facts.get("recover_ssm_policy_kind", "")
+        or ""
+    ).strip().lower()
+    if declared in {"kda_opt_in", "kda_dspark_mrv2", "gdn_v2", "none"}:
+        if declared in {"kda_opt_in", "kda_dspark_mrv2"} and not kda_owners:
+            raise ModelingError(f"recover_ssm_policy_kind_mismatch_with_layers:{declared}:no_kda_owners")
+        if declared == "gdn_v2" and not gdn_owners:
+            raise ModelingError(f"recover_ssm_policy_kind_mismatch_with_layers:{declared}:no_gdn_owners")
+        return declared
+    if kda_owners:
+        aux = model.auxiliary
+        attached = (aux.dspark or aux.mtp) if aux is not None else None
+        has_dspark = bool(
+            attached is not None
+            and (
+                attached.kind in {"dspark", "mtp_dspark", "dflash"}
+                or bool(getattr(attached, "noncausal_query_block", False))
+                or str(getattr(attached, "execution_mode", "") or "") == "block_dspark"
+            )
+        )
+        return "kda_dspark_mrv2" if has_dspark else "kda_opt_in"
+    if gdn_owners:
+        return "gdn_v2"
+    if other_rec_owners:
+        return "unsupported_recurrent"
+    return "none"
+
+
+def _expected_mamba_cache_mode(enable_prefix_caching: bool) -> str:
+    return "align" if enable_prefix_caching else "none"
+
+
+def _has_active_binding(active_bindings: Sequence[Any], mechanism_id: str) -> bool:
+    for item in active_bindings:
+        mid = str(getattr(item, "mechanism_id", item) or "").strip()
+        if mid == mechanism_id:
+            return True
+    return False
+
+
+def _validate_kda_opt_in_recover_ssm(
+    *,
+    parallel: ParallelSpec,
+    enable_prefix_caching: bool,
+    mamba_cache_mode: str,
+    kv_transfer_config: Mapping[str, Any] | None,
+) -> str:
+    expected = _expected_mamba_cache_mode(enable_prefix_caching)
+    if mamba_cache_mode != expected:
+        return f"mamba_cache_mode_mismatch:{mamba_cache_mode}!=expected_{expected}"
+    if int(parallel.pp) != 1:
+        return f"kda_opt_in_requires_pp1:pp={parallel.pp}"
+    eff_dcp = int(getattr(parallel, "dcp", 0) or getattr(parallel, "cp", 1) or 1)
+    if eff_dcp != 1:
+        return f"kda_opt_in_requires_dcp1:dcp={eff_dcp}"
+    if int(parallel.pcp) > 1:
+        kv_role = str((kv_transfer_config or {}).get("kv_role", "") or "").strip()
+        if kv_transfer_config is None or kv_role != "kv_producer":
+            return f"kda_opt_in_pcp_requires_kv_producer:pcp={parallel.pcp}"
+    return ""
+
+
+def _validate_kda_dspark_recover_ssm(
+    *,
+    track: StackTrack,
+    parallel: ParallelSpec,
+    method: str,
+    enable_prefix_caching: bool,
+    mamba_cache_mode: str,
+    kv_transfer_config: Mapping[str, Any] | None,
+    model_runner_v2: bool,
+    adaptive_verification: bool,
+    conv_state_dim_first: bool,
+    active_bindings: Sequence[Any],
+) -> tuple[str, str, str]:
+    if method and method not in NONCAUSAL_BLOCK_DRAFT_METHODS:
+        return f"kda_dspark_requires_dspark_method:{method}", "shipping", "vllm-project/vllm-ascend#21549"
+    if not model_runner_v2:
+        return "kda_dspark_requires_model_runner_v2", "shipping", "vllm-project/vllm-ascend#21549"
+    if adaptive_verification:
+        return "kda_dspark_forbids_adaptive_verification", "shipping", "vllm-project/vllm-ascend#21549"
+    expected = _expected_mamba_cache_mode(enable_prefix_caching)
+    if mamba_cache_mode != expected:
+        return f"mamba_cache_mode_mismatch:{mamba_cache_mode}!=expected_{expected}", "shipping", "vllm-project/vllm-ascend#21549"
+    if kv_transfer_config is not None:
+        conn = str(kv_transfer_config.get("kv_connector", "") or "").strip()
+        if conn not in KDA_DSPARK_ALLOWED_PD_CONNECTORS:
+            return f"kda_dspark_unsupported_kv_connector:{conn}", "shipping", "vllm-project/vllm-ascend#21549"
+        if conv_state_dim_first:
+            return "kda_dspark_requires_sd_conv_state_layout", "shipping", "vllm-project/vllm-ascend#21549"
+    if int(parallel.pcp) > 1:
+        pcp_ok = track in {"proposed", "target"} or _has_active_binding(active_bindings, "recoverssm_kda_pcp")
+        if not pcp_ok:
+            return "pcp_kda_recoverssm_requires_proposed_pr_22146", "shipping", "vllm-project/vllm-ascend#22146"
+        return "", "proposed_pr", "vllm-project/vllm-ascend#22146"
+    return "", "shipping", "vllm-project/vllm-ascend#21549"
+
+
+def _validate_gdn_recover_ssm(
+    *,
+    track: StackTrack,
+    parallel: ParallelSpec,
+    enable_prefix_caching: bool,
+    mamba_cache_mode: str,
+    active_bindings: Sequence[Any],
+) -> tuple[str, str, str]:
+    binding_ok = track in {"proposed", "target"} or _has_active_binding(active_bindings, "recoverssm_gdn")
+    if not binding_ok:
+        return "gdn_recoverssm_runtime_wiring_requires_pr_22045", "shipping", "vllm-project/vllm-ascend#22045"
+    expected = _expected_mamba_cache_mode(enable_prefix_caching)
+    if mamba_cache_mode != expected:
+        return f"mamba_cache_mode_mismatch:{mamba_cache_mode}!=expected_{expected}", "proposed_pr", "vllm-project/vllm-ascend#22045"
+    eff_dcp = int(getattr(parallel, "dcp", 0) or getattr(parallel, "cp", 1) or 1)
+    if int(parallel.pp) != 1 or eff_dcp != 1 or int(parallel.pcp) != 1:
+        return f"gdn_recoverssm_requires_pp1_dcp1_pcp1:pp={parallel.pp}:dcp={eff_dcp}:pcp={parallel.pcp}", "proposed_pr", "vllm-project/vllm-ascend#22045"
+    return "", "proposed_pr", "vllm-project/vllm-ascend#22045"
+
+
+def validate_recover_ssm_eligibility(
+    model: ModelSpec,
+    *,
+    recover_ssm_arg: bool | None,
+    track: StackTrack,
+    parallel: ParallelSpec,
+    spec_method: str,
+    proposal_count: int,
+    enable_prefix_caching: bool = False,
+    mamba_cache_mode: str | None = None,
+    kv_transfer_config: Mapping[str, Any] | None = None,
+    model_runner_v2: bool = True,
+    adaptive_verification: bool = False,
+    conv_state_dim_first: bool = False,
+    stochastic_rounding: bool = False,
+    raw_eager: bool = False,
+    active_bindings: Sequence[Any] = (),
+) -> RecoverSsmEligibility:
+    """Validate RecoverSSM eligibility per family with zero model-name heuristics."""
+    k = max(0, int(proposal_count))
+    kda_owners = tuple(p.index for p in model.layer_plans if str(p.attention).lower() == "kda")
+    gdn_owners = tuple(p.index for p in model.layer_plans if str(p.attention).lower() == "gdn")
+    other_rec = tuple(
+        p.index for p in model.layer_plans
+        if int(p.recurrent_state_elements) > 0 and str(p.attention).lower() not in RECOVER_SSM_ELIGIBLE_FAMILIES
+    )
+    if kda_owners and gdn_owners:
+        raise ModelingError("recover_ssm_mixed_kda_gdn_unsupported")
+    method = str(spec_method or "").strip().lower()
+    policy_kind = _infer_recover_ssm_policy_kind(
+        model, kda_owners=kda_owners, gdn_owners=gdn_owners,
+        other_rec_owners=other_rec, spec_method=method,
+    )
+    explicit = recover_ssm_arg is True
+    if recover_ssm_arg is False:
+        return RecoverSsmEligibility(False, False, policy_kind, kda_owners, gdn_owners)
+    eff_cache_mode = (
+        _expected_mamba_cache_mode(enable_prefix_caching)
+        if mamba_cache_mode is None else str(mamba_cache_mode).strip().lower()
+    )
+    if explicit:
+        if raw_eager or track == "eager":
+            raise ModelingError("recover_ssm_incompatible_with_raw_eager")
+        if stochastic_rounding:
+            raise ModelingError("recover_ssm_incompatible_with_stochastic_rounding")
+        if policy_kind in {"none", "unsupported_recurrent"}:
+            raise ModelingError("recover_ssm_unsupported_recurrent_family")
+        if k <= 0:
+            raise ModelingError("recover_ssm_requires_positive_spec_k")
+    elif k <= 0 or raw_eager or track == "eager" or stochastic_rounding or policy_kind in {"none", "unsupported_recurrent"}:
+        return RecoverSsmEligibility(
+            False, False, policy_kind, kda_owners, gdn_owners,
+            rejection_reason="no_speculative_recurrent_state_recovery_required",
+        )
+    if policy_kind == "kda_opt_in":
+        if method in NONCAUSAL_BLOCK_DRAFT_METHODS:
+            if explicit:
+                raise ModelingError(f"draft_structure_incompatible_for_speculative_method:{method}:mtp")
+            return RecoverSsmEligibility(
+                False, False, policy_kind, kda_owners, gdn_owners,
+                source_ref="vllm_ascend/models/glm5next/recoverssm_config.py",
+                rejection_reason=f"draft_structure_incompatible_for_speculative_method:{method}:mtp",
+            )
+        if not explicit:
+            return RecoverSsmEligibility(
+                False, False, policy_kind, kda_owners, gdn_owners,
+                source_ref="vllm_ascend/models/glm5next/recoverssm_config.py",
+                rejection_reason="kda_opt_in_replayssm_flag_not_set",
+            )
+        reason = _validate_kda_opt_in_recover_ssm(
+            parallel=parallel, enable_prefix_caching=enable_prefix_caching,
+            mamba_cache_mode=eff_cache_mode, kv_transfer_config=kv_transfer_config,
+        )
+        if reason:
+            raise ModelingError(f"recover_ssm_topology_ineligible:{reason}")
+        return RecoverSsmEligibility(
+            True, True, policy_kind, kda_owners, gdn_owners,
+            readiness="shipping", source_ref="vllm_ascend/models/glm5next/recoverssm_config.py",
+        )
+    if policy_kind == "kda_dspark_mrv2":
+        reason, readiness, ref = _validate_kda_dspark_recover_ssm(
+            track=track, parallel=parallel, method=method,
+            enable_prefix_caching=enable_prefix_caching, mamba_cache_mode=eff_cache_mode,
+            kv_transfer_config=kv_transfer_config, model_runner_v2=model_runner_v2,
+            adaptive_verification=adaptive_verification,
+            conv_state_dim_first=conv_state_dim_first, active_bindings=active_bindings,
+        )
+        if reason:
+            if explicit:
+                raise ModelingError(f"recover_ssm_topology_ineligible:{reason}")
+            return RecoverSsmEligibility(
+                False, False, policy_kind, kda_owners, gdn_owners,
+                readiness=readiness, source_ref=ref, rejection_reason=reason,
+            )
+        return RecoverSsmEligibility(True, explicit, policy_kind, kda_owners, gdn_owners, readiness=readiness, source_ref=ref)
+    reason, readiness, ref = _validate_gdn_recover_ssm(
+        track=track, parallel=parallel, enable_prefix_caching=enable_prefix_caching,
+        mamba_cache_mode=eff_cache_mode, active_bindings=active_bindings,
+    )
+    if reason:
+        if explicit:
+            raise ModelingError(f"recover_ssm_topology_ineligible:{reason}")
+        return RecoverSsmEligibility(
+            False, False, policy_kind, kda_owners, gdn_owners,
+            readiness=readiness, source_ref=ref, rejection_reason=reason,
+        )
+    return RecoverSsmEligibility(True, explicit, policy_kind, kda_owners, gdn_owners, readiness=readiness, source_ref=ref)
+
+
 def resolve_recover_ssm_policy(
     model: ModelSpec,
     *,
@@ -734,126 +1043,64 @@ def resolve_recover_ssm_policy(
     spec_method: str,
     proposal_count: int,
     opt_in_replayssm: bool = False,
+    enable_prefix_caching: bool = False,
+    mamba_cache_mode: str | None = None,
+    kv_transfer_config: Mapping[str, Any] | None = None,
+    active_bindings: Sequence[Any] = (),
+    raw_eager: bool = False,
+    stochastic_rounding: bool = False,
 ) -> RecoverSsmPolicy:
-    """Resolve upstream RecoverSSM policy (merged #21549 on shipping Kimi-K3/K3.1 DSpark)."""
-    k = max(0, int(proposal_count))
-    kda_owners = sum(
-        1 for plan in model.layer_plans
-        if str(plan.attention).lower() == "kda" or str(plan.architecture).lower() == "kda"
-    )
-    gdn_owners = sum(
-        1 for plan in model.layer_plans
-        if str(plan.attention).lower() == "gdn" or str(plan.architecture).lower() == "gdn"
-    )
-    if k <= 0 or (kda_owners == 0 and gdn_owners == 0):
+    """Resolve upstream RecoverSSM policy through the single structural eligibility validator."""
+    kda_owners = tuple(p.index for p in model.layer_plans if str(p.attention).lower() == "kda")
+    gdn_owners = tuple(p.index for p in model.layer_plans if str(p.attention).lower() == "gdn")
+    if kda_owners and gdn_owners:
+        raise ModelingError("recover_ssm_mixed_kda_gdn_unsupported")
+    fam_kind = "kda" if kda_owners else ("gdn" if gdn_owners else "none")
+    owners = kda_owners if kda_owners else gdn_owners
+    method = str(spec_method or "").strip().lower()
+    no_spec_active = max(0, int(proposal_count)) <= 0 and method in {"", "none"}
+    if (not opt_in_replayssm and (max(0, int(proposal_count)) <= 0 or not owners)) or (
+        no_spec_active and not (raw_eager or track == "eager" or stochastic_rounding)
+    ):
         return RecoverSsmPolicy(
-            enabled=False,
-            kind="none",
-            readiness="shipping",
-            source_ref="",
-            owner_count=0,
-            batched_kernel_launches=0,
+            enabled=False, kind="none", readiness="shipping", source_ref="",
+            owner_count=0, batched_kernel_launches=0,
             reason="no_speculative_recurrent_state_recovery_required",
         )
-
-    canon = normalize_canonical_model(model)
-    method = str(spec_method or "").strip().lower()
-    if kda_owners > 0:
-        if canon in _SHIPPING_KDA_RECOVERSSM_MODELS:
-            if parallel.pcp > 1:
-                if track in {"proposed", "target"}:
-                    return RecoverSsmPolicy(
-                        enabled=True,
-                        kind="kda",
-                        readiness="proposed_pr",
-                        source_ref="vllm-project/vllm-ascend#22146",
-                        owner_count=kda_owners,
-                        batched_kernel_launches=DEFAULT_RECOVER_SSM_BATCHED_LAUNCHES,
-                        reason=f"pcp_kda_recoverssm_enabled_on_{track}:method={method or 'dspark'}",
-                    )
-                return RecoverSsmPolicy(
-                    enabled=False,
-                    kind="kda",
-                    readiness="shipping",
-                    source_ref="vllm-project/vllm-ascend#22146",
-                    owner_count=kda_owners,
-                    batched_kernel_launches=0,
-                    reason="pcp_kda_recoverssm_requires_proposed_pr_22146",
-                )
-            if track == "eager":
-                return RecoverSsmPolicy(
-                    enabled=False,
-                    kind="kda",
-                    readiness="shipping",
-                    source_ref="vllm-project/vllm-ascend#21549",
-                    owner_count=kda_owners,
-                    batched_kernel_launches=0,
-                    reason="eager_track_disables_recoverssm_fusion",
-                )
-            return RecoverSsmPolicy(
-                enabled=True,
-                kind="kda",
-                readiness="shipping",
-                source_ref="vllm-project/vllm-ascend#21549",
-                owner_count=kda_owners,
-                batched_kernel_launches=DEFAULT_RECOVER_SSM_BATCHED_LAUNCHES,
-                reason=f"merged_kda_recoverssm_with_{method or 'dspark'}:pr_21549",
-            )
-        if canon in _OPT_IN_KDA_RECOVERSSM_MODELS:
-            if opt_in_replayssm and parallel.pp == 1 and parallel.cp == 1:
-                return RecoverSsmPolicy(
-                    enabled=True,
-                    kind="kda",
-                    readiness="shipping",
-                    source_ref="vllm_ascend/models/glm5next/recoverssm_config.py",
-                    owner_count=kda_owners,
-                    batched_kernel_launches=DEFAULT_RECOVER_SSM_BATCHED_LAUNCHES,
-                    reason="glm5next_opt_in_use_replayssm_pp1_dcp1",
-                )
-            reason = (
-                "glm5next_replayssm_requires_pp1_dcp1"
-                if opt_in_replayssm
-                else "glm5next_replayssm_opt_in_flag_not_set"
-            )
-            return RecoverSsmPolicy(
-                enabled=False,
-                kind="kda",
-                readiness="shipping",
-                source_ref="vllm_ascend/models/glm5next/recoverssm_config.py",
-                owner_count=kda_owners,
-                batched_kernel_launches=0,
-                reason=reason,
-            )
-
-    if gdn_owners > 0:
-        if track in {"proposed", "target"}:
-            return RecoverSsmPolicy(
-                enabled=True,
-                kind="gdn",
-                readiness="proposed_pr",
-                source_ref="vllm-project/vllm-ascend#22045",
-                owner_count=gdn_owners,
-                batched_kernel_launches=DEFAULT_RECOVER_SSM_BATCHED_LAUNCHES,
-                reason=f"gdn_recoverssm_enabled_on_{track}:pr_22045",
-            )
+    recover_arg: bool | None = True if opt_in_replayssm else None
+    elig = validate_recover_ssm_eligibility(
+        model, recover_ssm_arg=recover_arg, track=track, parallel=parallel,
+        spec_method=method, proposal_count=proposal_count,
+        enable_prefix_caching=enable_prefix_caching,
+        mamba_cache_mode=mamba_cache_mode,
+        kv_transfer_config=kv_transfer_config,
+        raw_eager=raw_eager, stochastic_rounding=stochastic_rounding,
+        active_bindings=active_bindings,
+    )
+    if not elig.enabled:
+        reason = elig.rejection_reason or "recoverssm_not_configured_for_model"
+        if track == "eager" and reason == "no_speculative_recurrent_state_recovery_required":
+            reason = "eager_track_disables_recoverssm_fusion"
         return RecoverSsmPolicy(
-            enabled=False,
-            kind="gdn",
-            readiness="shipping",
-            source_ref="vllm-project/vllm-ascend#22045",
-            owner_count=gdn_owners,
-            batched_kernel_launches=0,
-            reason="gdn_recoverssm_runtime_wiring_requires_pr_22045",
+            enabled=False, kind=fam_kind, readiness=elig.readiness,
+            source_ref=elig.source_ref, owner_count=len(owners),
+            batched_kernel_launches=0, reason=reason,
         )
-
+    if elig.policy_kind == "kda_dspark_mrv2":
+        ok_reason = (
+            f"pcp_kda_recoverssm_enabled_on_{track}:method={method or 'dspark'}"
+            if int(parallel.pcp) > 1
+            else f"merged_kda_recoverssm_with_{method or 'dspark'}:pr_21549"
+        )
+    elif elig.policy_kind == "kda_opt_in":
+        ok_reason = "kda_opt_in_use_replayssm_pp1_dcp1"
+    else:
+        ok_reason = f"gdn_recoverssm_enabled_on_{track}:pr_22045"
     return RecoverSsmPolicy(
-        enabled=False,
-        kind="none",
-        readiness="shipping",
-        source_ref="",
-        owner_count=0,
-        batched_kernel_launches=0,
-        reason="recoverssm_not_configured_for_model",
+        enabled=True, kind=fam_kind, readiness=elig.readiness,
+        source_ref=elig.source_ref, owner_count=len(owners),
+        batched_kernel_launches=DEFAULT_RECOVER_SSM_BATCHED_LAUNCHES,
+        reason=ok_reason,
     )
 
 
@@ -899,17 +1146,38 @@ def build_post_accept_commits(
     )
 
 
+def _model_has_builtin_draft(model_id: str, family: str) -> bool:
+    """Return True strictly when the target model structurally carries a real built-in draft."""
+    spec = _load_catalog_model_structurally(model_id)
+    if spec is None:
+        return False
+    aux = spec.auxiliary
+    if aux is not None and bool(getattr(aux, "standalone_draft", False)):
+        return False
+    if family == "dspark":
+        if aux is not None and aux.dspark is not None and not bool(getattr(aux.dspark, "is_synthetic", False)):
+            return True
+        if (
+            aux is not None
+            and aux.mtp is not None
+            and not bool(getattr(aux.mtp, "is_synthetic", False))
+            and str(getattr(aux.mtp, "kind", "") or "") in {"dspark", "mtp_dspark", "dflash"}
+        ):
+            return True
+        return False
+    if family == "mtp":
+        if aux is not None and aux.mtp is not None and not bool(getattr(aux.mtp, "is_synthetic", False)):
+            return True
+        return int(dict(spec.catalog_facts).get("num_nextn_predict_layers", 0) or 0) > 0
+    return False
+
+
 def list_speculative_companions(model_id: str) -> tuple[SpeculativeCompanion, ...]:
-    """List all documented speculative decoding options for ``model_id``."""
+    """List all documented speculative decoding options for ``model_id`` (no fabricated fallback)."""
     key = _resolve_spec_model_key(model_id)
     if key in SPECULATIVE_COMPANIONS:
         return SPECULATIVE_COMPANIONS[key]
-    return (
-        _c(key or "generic", "ngram", "", NGRAM_DEFAULT_K, is_builtin=True,
-           k_min=1, k_max=DFLASH_DEFAULT_K, prompt_lookup_max=DEFAULT_PROMPT_LOOKUP_MAX,
-           doc=_DOC_SD,
-           notes="Generic n-gram fallback when no neural draft checkpoint is registered"),
-    )
+    return ()
 
 
 def resolve_speculative_companion(
@@ -928,32 +1196,78 @@ def resolve_speculative_companion(
     tp = max(1, int(target_tp))
     companions = list_speculative_companions(key)
     warnings: list[str] = []
+    explicit_draft = str(draft_model or "").strip()
 
-    selected = companions[0]
     if method:
         req_m = str(method).strip().lower()
+        if req_m in ASCEND_V2_REJECTED_SPECULATIVE_METHODS:
+            raise ModelingError(f"unsupported_speculative_method_on_ascend_v2:{req_m}")
+        if not is_supported_speculative_method(req_m):
+            raise ModelingError(f"unsupported_speculative_method:{req_m}")
         matched = next((c for c in companions if c.method == req_m), None)
         if matched is not None:
+            if not matched.is_builtin and not explicit_draft and not matched.draft_model_for_hw(hw):
+                raise ModelingError(f"draft_structure_required_for_speculative_method:{req_m}")
             selected = matched
-        else:
-            warnings.append(f"spec_method_not_registered_for_{key}:{req_m}:synthesizing_companion")
+        elif req_m in ZERO_NEURAL_DRAFT_METHODS:
             selected = _c(
-                key, req_m, draft_model or "",
-                num_speculative_tokens if num_speculative_tokens is not None else DEFAULT_MTP_K,
-                is_builtin=req_m in {"mtp", "deepseek_mtp", "qwen3_5_mtp", "ngram"},
-                draft_tp_policy="one" if req_m in {"eagle", "eagle3"} else "auto",
-                pd_match=is_hybrid_recurrent_model(key) or req_m == "dspark",
+                key or str(model_id), req_m, "",
+                num_speculative_tokens if num_speculative_tokens is not None else NGRAM_DEFAULT_K,
+                is_builtin=True, k_min=1, k_max=DFLASH_DEFAULT_K,
+                prompt_lookup_max=DEFAULT_PROMPT_LOOKUP_MAX, doc=_DOC_SD,
             )
+        elif explicit_draft:
+            selected = _c(
+                key or str(model_id), req_m, explicit_draft,
+                num_speculative_tokens if num_speculative_tokens is not None else DEFAULT_MTP_K,
+                is_builtin=False,
+                draft_tp_policy="match_target" if req_m in {"eagle", "eagle3", "draft_model"} else "auto",
+                pd_match=is_hybrid_recurrent_model(key) or req_m in NONCAUSAL_BLOCK_DRAFT_METHODS,
+            )
+        elif is_mtp_speculative_method(req_m) and _model_has_builtin_draft(key or str(model_id), "mtp"):
+            selected = _c(
+                key or str(model_id), req_m, "",
+                num_speculative_tokens if num_speculative_tokens is not None else DEFAULT_MTP_K,
+                is_builtin=True,
+                pd_match=is_hybrid_recurrent_model(key),
+            )
+        elif req_m in NONCAUSAL_BLOCK_DRAFT_METHODS and _model_has_builtin_draft(key or str(model_id), "dspark"):
+            selected = _c(
+                key or str(model_id), req_m, "",
+                num_speculative_tokens if num_speculative_tokens is not None else DEFAULT_DSPARK_K,
+                is_builtin=True,
+                pd_match=True,
+            )
+        else:
+            raise ModelingError(f"draft_structure_required_for_speculative_method:{req_m}")
+    elif companions:
+        selected = companions[0]
+    elif _model_has_builtin_draft(key or str(model_id), "dspark"):
+        selected = _c(
+            key or str(model_id), "dspark", "",
+            num_speculative_tokens if num_speculative_tokens is not None else DEFAULT_DSPARK_K,
+            is_builtin=True, pd_match=True,
+        )
+    elif _model_has_builtin_draft(key or str(model_id), "mtp"):
+        selected = _c(
+            key or str(model_id), "mtp", "",
+            num_speculative_tokens if num_speculative_tokens is not None else DEFAULT_MTP_K,
+            is_builtin=True, pd_match=is_hybrid_recurrent_model(key),
+        )
+    else:
+        raise ModelingError(f"draft_structure_required_for_speculative_companion:{key or model_id}")
 
-    raw_k = selected.num_speculative_tokens if num_speculative_tokens is None else int(num_speculative_tokens)
-    eff_k, clamp_warn = clamp_fia_speculative_tokens(raw_k)
-    if clamp_warn:
-        warnings.append(clamp_warn)
+    if num_speculative_tokens is not None:
+        eff_k = validate_fia_speculative_tokens(_require_int_spec_k(num_speculative_tokens))
+    else:
+        eff_k, clamp_warn = clamp_fia_speculative_tokens(_require_int_spec_k(selected.num_speculative_tokens))
+        if clamp_warn:
+            warnings.append(clamp_warn)
 
     resolved_draft = str(draft_model) if draft_model else selected.draft_model_for_hw(hw)
-    if selected.draft_tp_policy == "one" or selected.method in {"eagle", "eagle3"}:
+    if selected.draft_tp_policy == "one":
         draft_tp: int | None = 1
-    elif selected.draft_tp_policy == "match_target":
+    elif selected.draft_tp_policy == "match_target" or selected.method in {"eagle", "eagle3"}:
         draft_tp = tp
     else:
         draft_tp = None
@@ -1099,11 +1413,8 @@ def build_va_serving_rules(
 
     kv_lower = str(target_kv_dtype or "bf16").strip().lower()
     if hw in A2_A3_INT_ONLY_FAMILIES and kv_lower in {"fp8", "fp8_e4m3", "mxfp8"}:
-        warnings.append(
-            f"a2_a3_fp8_kv_unsupported_using_int8_c8:{hw}:requested={target_kv_dtype}->int8"
-        )
-        eff_kv = "int8"
-    elif kv_lower == "c8":
+        raise ModelingError(f"kv_cache_dtype_unsupported_on_hardware:{hw}:{target_kv_dtype}")
+    if kv_lower == "c8":
         eff_kv = "int8"
     else:
         eff_kv = kv_lower or "bf16"
@@ -1128,6 +1439,8 @@ def build_va_serving_rules(
             p_spec_cfg, d_spec_cfg, pd_rule = build_pd_spec_configs(resolved, is_hybrid=hybrid)
             rules.append(pd_rule)
             role_low = str(pd_role or "decode").strip().lower().removeprefix("pd_")
+            if role_low not in {"prefill", "decode"}:
+                raise ModelingError(f"unsupported_pd_role:{pd_role!r}")
             spec_cfg = dict(p_spec_cfg if role_low == "prefill" else d_spec_cfg)
             eff_k = int(spec_cfg.get("num_speculative_tokens", eff_k))
         else:
@@ -1135,9 +1448,9 @@ def build_va_serving_rules(
 
     if enable_replayssm:
         if pp != 1:
-            warnings.append(f"replayssm_requires_pp_1:got_pp={pp}")
-        if not enable_speculative:
-            warnings.append("replayssm_requires_speculative_decoding")
+            raise ModelingError(f"replayssm_requires_pp_1:got_pp={pp}")
+        if not enable_speculative or eff_k <= 0:
+            raise ModelingError("replayssm_requires_speculative_decoding")
         rules.append("kda_recoverssm_enabled")
 
     capture_sizes = compute_aclgraph_capture_sizes(
@@ -1167,12 +1480,10 @@ def build_va_serving_rules(
 
     if safetensors_load_strategy:
         load_strat = str(safetensors_load_strategy).strip().lower()
-    elif key in LAZY_LOAD_STRATEGY_MODELS:
-        load_strat = "lazy"
-    elif key in PREFETCH_LOAD_STRATEGY_MODELS:
-        load_strat = "prefetch"
     else:
-        load_strat = "prefetch"
+        loaded_model = _load_catalog_model_structurally(key)
+        facts = dict(getattr(loaded_model, "catalog_facts", ()) or ()) if loaded_model is not None else {}
+        load_strat = str(facts.get("safetensors_load_strategy") or "prefetch").strip().lower()
     ep_filter = int(ep) >= EP_WEIGHT_FILTER_MIN_EP
     mm_cache = 0 if (multimodal and text_only_serving) else None
 
@@ -1222,14 +1533,13 @@ __all__ = [
     "DEFAULT_PIECEWISE_TOKEN_TIERS",
     "EP_WEIGHT_FILTER_MIN_EP",
     "FULL_GRAPH_CUDAGRAPH_MODES",
-    "HYBRID_RECURRENT_MODELS",
     "MAX_SPECULATIVE_TOKENS",
-    "MULTIMODAL_MODELS",
     "NONCAUSAL_BLOCK_DRAFT_METHODS",
     "SERIAL_DRAFT_METHODS",
     "SPECULATIVE_COMPANIONS",
     "SUPPORTED_SPECULATIVE_METHODS",
     "ZERO_NEURAL_DRAFT_METHODS",
+    "RecoverSsmEligibility",
     "RecoverSsmPolicy",
     "ResolvedSpeculativeCompanion",
     "SpeculativeCompanion",
@@ -1248,4 +1558,7 @@ __all__ = [
     "resolve_recover_ssm_policy",
     "resolve_speculative_companion",
     "validate_aclgraph_capture_sizes",
+    "validate_dcp_for_speculative",
+    "validate_fia_speculative_tokens",
+    "validate_recover_ssm_eligibility",
 ]

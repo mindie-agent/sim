@@ -91,7 +91,6 @@ RGDR_PRE_ALU_PASSES = 3
 RGDR_ARCH35_VSTEP_ELEMS = 8192  # recurrent_gated_delta_rule_arch35.h:149: vStep_ = 8192 / alignDK_
 RGDR_PIPE_V_PER_VSTEP_TOKEN = 10  # recurrent_gated_delta_rule_arch{22,35}.h: 10 PipeBarrier<PIPE_V> per tile-token
 RGDR_QUEUE_SYNCS_PER_HEAD = 10  # CopyInGamaK/QK/V/State + CopyOutState/Attn EnQue/DeQue handshakes
-RGDR_REDUCE_FALLBACK_RATIO = 2.0
 RGDR_MS_PER_S = 1000.0
 GDN_REF_HEAD_DIM = 128
 GDN_REF_DIM_SUM = float(GDN_REF_HEAD_DIM * 2)
@@ -101,19 +100,19 @@ def _rgdr_reduce_ratio(rc: RecipeContext) -> float:
     """Ratio of calibrated P07 vector ALU rate to P09 vector reduce rate."""
     table = getattr(rc, "primitive_table", None)
     if table is not None and hasattr(table, "cell"):
-        try:
-            alu = table.cell("P07_vec_alu").band("vec_alu_ops_per_s_per_aiv").p50
-            red = table.cell("P09_vec_reduce_cast").band("vec_reduce_ops_per_s_per_aiv").p50
-            if alu and red and red > 0.0:
-                return max(1.0, float(alu) / float(red))
-        except Exception:
-            pass
+        alu_cell = table.cell("P07_vec_alu")
+        red_cell = table.cell("P09_vec_reduce_cast")
+        alu = alu_cell.band("vec_alu_ops_per_s_per_aiv").p50
+        red = red_cell.band("vec_reduce_ops_per_s_per_aiv").p50
+        if alu is None or red is None or float(red) <= 0.0:
+            raise ModelingError("rgdr_missing_calibrated_reduce_primitive_band")
+        return max(1.0, float(alu) / float(red))
     vec_key = rc.resource_names.get("vector", "vector")
     vec_rate = float(rc.rates.get(vec_key, rc.rates.get("vector", 0.0)) or 0.0) * RGDR_MS_PER_S
     red_rate = rc.service_rate("vector_reduce")
     if vec_rate > 0.0 and red_rate and red_rate > 0.0:
         return max(1.0, vec_rate / float(red_rate))
-    return RGDR_REDUCE_FALLBACK_RATIO
+    raise ModelingError("rgdr_missing_calibrated_vector_reduce_rate")
 
 
 def _rgdr_cast_ms_per_aiv(rc: RecipeContext, cast_bytes_per_head: float) -> float:
@@ -122,13 +121,14 @@ def _rgdr_cast_ms_per_aiv(rc: RecipeContext, cast_bytes_per_head: float) -> floa
         return 0.0
     table = getattr(rc, "primitive_table", None)
     if table is not None and hasattr(table, "cell"):
-        try:
-            cast_bps = table.cell("P09_vec_reduce_cast").band("cast_bytes_per_s_per_aiv").p50
-            if cast_bps and cast_bps > 0.0:
-                return (cast_bytes_per_head / float(cast_bps)) * RGDR_MS_PER_S
-        except Exception:
-            pass
-    return 0.0
+        cast_bps = table.cell("P09_vec_reduce_cast").band("cast_bytes_per_s_per_aiv").p50
+        if cast_bps is None or float(cast_bps) <= 0.0:
+            raise ModelingError("rgdr_missing_calibrated_cast_primitive_band")
+        return (cast_bytes_per_head / float(cast_bps)) * RGDR_MS_PER_S
+    cast_rate = rc.service_rate("cast") or rc.service_rate("vector_cast")
+    if cast_rate and float(cast_rate) > 0.0:
+        return (cast_bytes_per_head / float(cast_rate)) * RGDR_MS_PER_S
+    raise ModelingError("rgdr_missing_calibrated_cast_rate")
 
 
 def _cap_vec_stage(st: Stage, rc: RecipeContext, ratio: float) -> Stage:

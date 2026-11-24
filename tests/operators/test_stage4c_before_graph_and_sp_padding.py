@@ -16,7 +16,7 @@ from mindie_sim.model_catalog import load_model
 from mindie_sim.prediction import body_defaults
 from mindie_sim.prediction.execution.layer_runs import discover_layer_cohorts
 from mindie_sim.prediction.feedforward import _absorb_redundant_mc2_unpack, moe
-from mindie_sim.prediction.operator_analysis import target_operators
+from mindie_sim.prediction.operator_analysis import target_graphs, target_operators
 from mindie_sim.prediction.operators.attention.attention_decode import StagedGQADecode
 from mindie_sim.prediction.operators.mc2.megamoe import try_lower_fused_frame
 from mindie_sim.prediction.operators.mc2.moe_comm_selection import (
@@ -310,12 +310,29 @@ def test_gdn_high_tp_replicates_key_heads_and_interleaved_emits_fused_split() ->
         assert any(op.recipe == "gdn_key_head_replicate" for op in ops)
         assert not any(op.op_id.endswith(".qkv_concatenate") for op in ops)
 
-    _, next80_ops = _ops(
-        "qwen3-next-80b-a3b", hardware="a3", phase="decode", tokens=1, sequences=4,
-        context=128, layers=2, tp=4, ep=4, num_devices=4,
+    raw_next = compose_case(
+        "qwen3-next-80b-a3b", hardware="a3", tp=4, ep=4, num_devices=4, layers=2,
+        prompt_tokens=128, output_tokens=16,
     )
+    case_next = parse_case(raw_next)
+    interleaved_model = replace(
+        case_next.model,
+        layer_plans=tuple(
+            replace(p, gdn_layout="interleaved") if p.attention == "gdn" else p
+            for p in case_next.model.layer_plans
+        ),
+    )
+    next80_ops = target_graphs(
+        replace(case_next, model=interleaved_model),
+        phase="decode", tokens=1, context=128, sequences=4, scope="body",
+    )[0]
     assert any(op.recipe == "fused_qkvzba_split_reshape_cat" for op in next80_ops)
     assert not any(op.op_id.endswith(".qkv_concatenate") for op in next80_ops)
+    # Explicit gdn_layout="standard" must never emit fused_qkvzba_split_reshape_cat even on qwen3_next.
+    std_ops = target_graphs(
+        case_next, phase="decode", tokens=1, context=128, sequences=4, scope="body",
+    )[0]
+    assert not any(op.recipe == "fused_qkvzba_split_reshape_cat" for op in std_ops)
 
 
 def test_moe_gating_dispatches_sigmoid_sqrtsoftplus_and_softmax_natives() -> None:
@@ -484,7 +501,7 @@ def test_minimax_index_q_tp_sharding_clamped_swiglu_keypool_pack_and_nextn_norms
     assert key_pool.flops == pytest.approx(4 * 8 * 128 * 4096)
     pack_op = next(op for op in glm53_ops if op.recipe == "index_topk")
     assert pack_op.family == "elementwise"
-    assert dict(pack_op.metadata).get("native_kind") == "glm5_next_cann_keypool_pack"
+    assert dict(pack_op.metadata).get("native_kind") == "cann_keypool_pack"
 
     _, step_ops = _ops(
         "step-5-preview", hardware="a5", phase="decode", tokens=4, sequences=1, context=128,
@@ -536,8 +553,9 @@ def test_mtp_verify_moe_tokens_glm_mean_collapse_minimax_topk_mc2_unpack_and_lay
         )
         assert mm_case.model.layer_plans[idx_layer].index_topk == MINIMAX_TOPK_TOKENS
         topk_op = next(op for op in mm_ops if op.layer == idx_layer and op.op_id.endswith(".index_topk"))
-        assert topk_op.local_shape == (MTP_BATCH_SEQUENCES, MINIMAX_TOPK_BLOCKS)
-        assert topk_op.mte3_bytes == pytest.approx(MINIMAX_TOPK_OUTPUT_BYTES)
+        # MiniMax Block-MSA emits 3D [H_q_local, Q, K_blk] INT32 IDs (H_q_local=1 at TP=8) plus decode counts.
+        assert topk_op.local_shape == (1, MTP_BATCH_SEQUENCES, MINIMAX_TOPK_BLOCKS)
+        assert dict(topk_op.metadata)["msa_id_write_bytes"] == pytest.approx(MINIMAX_TOPK_OUTPUT_BYTES)
 
     # 4. _absorb_redundant_mc2_unpack absorbs route_unpack on MoeDistributeCombine* even when caller is set.
     comb = OpSpec(

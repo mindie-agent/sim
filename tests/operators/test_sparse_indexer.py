@@ -663,6 +663,27 @@ def test_index_cache_writer_enforces_int8_default_fp8_guard_and_l2_slot_hbm():
     with pytest.raises(ModelingError, match=r"^quant_lightning_indexer_v2_.*_requires_"):
         family_quant_indexer._build_arch35(dummy_op, a3_geom)
 
+    # S4-095: region_summary_cache_update credits only summary_rows * 8 B to L2 (not rows * 8 B).
+    reg_op = emit_index_cache_write(mode="region_summary_update", rows=128, completed_rows=1, dim=64, block_size=128, input_dtype="bf16")[0]
+    assert reg_op.recipe == "region_summary_cache_update"
+    reg_plan = build_index_cache_writer(reg_op, l2_geom)
+    assert reg_plan.metadata["l2_slot_table_bytes"] == pytest.approx(8.0)
+
+    # S4-103: select_indexer_source classifies valid C8 FP8 structurally without an OCI image digest.
+    from mindie_sim.prediction.operators.sparse_indexer.indexer_source import SOURCE_FAMILY, select_indexer_source
+    c8_sel = select_indexer_source({
+        "source_family": SOURCE_FAMILY, "q_dtype": "fp8_e4m3", "k_dtype": "fp8_e4m3",
+        "query_scale_present": True, "query_scale_dtype": "fp32",
+        "layout_query": "TND", "layout_key": "PA_BSND",
+        "query_quant_mode": 0, "key_quant_mode": 0,
+    })
+    assert c8_sel["status"] == "c8_fp8"
+
+    # S4-107: _indexer_kernel_binding derives arch_family from geometry and never hardcodes A5/shipping.
+    from mindie_sim.prediction.operators.sparse_indexer.sparse_indexer_pipeline import _indexer_kernel_binding
+    kb = _indexer_kernel_binding("aclnnPoolKeyIndexer", "pool_key_indexer", geometry=a3_geom)
+    assert kb.arch_family == "A3" and kb.readiness == "synthesized_target"
+
 
 def test_sparse_kv_offload_uses_packed_c8_row_bytes_read_role_and_exact_hbm():
     from mindie_sim import compose_case
@@ -823,3 +844,191 @@ def test_internal_indexer_stage_does_not_leak_into_native_binding_or_export():
     )
     assert "step5_" not in desc.ascend_kernel
     assert desc.ascend_kernel not in {"aclnnCustomOp", "aclnnAdd / VectorOp"}
+
+
+def test_minimax_4abi_qsa_fused_step5_region_and_owned_compressed_group_count():
+    """MiniMax 4-ABI FP32 scores, QSA fused LightningIndexerV2, Step-5 region score, O(1) group count."""
+    from dataclasses import replace
+    from mindie_sim.compose import compose_case
+    from mindie_sim.prediction.operators.attention.attention import AttentionPolicy, gqa
+    from mindie_sim.prediction.operators.sparse_indexer import gqa_indexer, index_cache_writer
+    from mindie_sim.prediction.structure import parse_case
+    from mindie_sim.schema.workload import RequestView
+
+    # 1. Exact O(1) owned_compressed_group_count: I=1, R=4, D=2 -> rank 0 owns 0, rank 1 owns 100%.
+    assert gqa_indexer.owned_compressed_group_count(0, 10, ratio=4, dcp=2, interleave=1, rank=0) == 0
+    assert gqa_indexer.owned_compressed_group_count(0, 10, ratio=4, dcp=2, interleave=1, rank=1) == 10
+    # Cross-check against brute force for non-divisible I=3, R=4, D=2.
+    for rk in (0, 1):
+        brute = sum(1 for j in range(5, 29) if (((j + 1) * 4 - 1) // 3) % 2 == rk)
+        assert gqa_indexer.owned_compressed_group_count(5, 29, ratio=4, dcp=2, interleave=3, rank=rk) == brute
+
+    # 2. MiniMax 4-ABI block-score FP32 sizing (Q=4096, W=1024 -> 16 MiB TP8 / 64 MiB TP1) + INT32 ID writes.
+    for tp_val, exp_score_b, exp_id_b in ((8, 16 * 1024 * 1024, 262_144), (1, 64 * 1024 * 1024, 1_048_576)):
+        c_mm = parse_case(compose_case("minimax-m3", "a5", tp=tp_val, ep=tp_val, dp=1, layers=4, prompt_tokens=1024, output_tokens=16))
+        p_mm = next(p for p in c_mm.model.layer_plans if p.indexer)
+        v_pf = (RequestView("r0", 4096, 126_976, False, "prefill"),)
+        r_mm = gqa(
+            prefix="s0.l3", plan=p_mm, views=v_pf, stage=0, deps="in",
+            model=c_mm.model, parallel=c_mm.runtime.parallel, quant=c_mm.model.quant,
+            mode="prefill", padded_tokens=4096, policy=AttentionPolicy(), runtime=c_mm.runtime,
+            machine=c_mm.machine,
+        )
+        sc_op = next(op for op in r_mm.ops if op.recipe == "index_scores")
+        tk_op = next(op for op in r_mm.ops if op.recipe == "index_topk")
+        assert sc_op.mte3_bytes == pytest.approx(exp_score_b)
+        assert dict(tk_op.metadata)["msa_id_write_bytes"] == pytest.approx(exp_id_b)
+
+    # All 4 MiniMax ABIs are supported and distinguish legacy_triton_decode vs ascendc.
+    c_mm8 = parse_case(compose_case("minimax-m3", "a5", tp=8, ep=8, dp=1, layers=4, prompt_tokens=1024, output_tokens=16))
+    p_mm8 = next(p for p in c_mm8.model.layer_plans if p.indexer)
+    for abi_name in ("ascendc", "fp8_triton", "legacy_triton_decode"):
+        rt_abi = replace(c_mm8.runtime, metadata=c_mm8.runtime.metadata + (("minimax_indexer_abi", abi_name),))
+        res_abi = gqa(
+            prefix="s0.l3", plan=p_mm8, views=(RequestView("r0", 1, 2048, False, "decode"),),
+            stage=0, deps="in", model=c_mm8.model, parallel=rt_abi.parallel, quant=c_mm8.model.quant,
+            mode="decode", padded_tokens=1, policy=AttentionPolicy(), runtime=rt_abi, machine=c_mm8.machine,
+        )
+        sc_meta = dict(next(op for op in res_abi.ops if op.recipe == "index_scores").metadata)
+        assert sc_meta["minimax_indexer_abi"] == abi_name
+
+    # 3. Qwen3.8 QSA emits fused aclnnLightningIndexerV2 with ZERO separate index_topk ops.
+    q38 = parse_case(compose_case("qwen3.8-flash-next", "a5", tp=4, ep=4, dp=1, layers=4, prompt_tokens=1024, output_tokens=16))
+    qsa_plan = next(p for p in q38.model.layer_plans if p.indexer)
+    res_qsa = gqa(
+        prefix="s0.l3", plan=qsa_plan, views=(RequestView("r0", 1, 2048, False, "decode"),),
+        stage=0, deps="in", model=q38.model, parallel=q38.runtime.parallel, quant=q38.model.quant,
+        mode="decode", padded_tokens=1, policy=AttentionPolicy(), runtime=q38.runtime, machine=q38.machine,
+    )
+    qsa_sc = next(op for op in res_qsa.ops if op.recipe == "index_scores")
+    assert dict(qsa_sc.metadata)["native_kind"] == "aclnnLightningIndexerV2"
+    assert dict(qsa_sc.metadata)["fused_topk"] is True
+    assert not any(op.recipe == "index_topk" for op in res_qsa.ops)
+
+    # 4. Step-5 Region-CSA uses region_summary_update & npu_indexer_region_score via canonical common predicates.
+    from mindie_sim.prediction.operators.sparse_indexer import common as sparse_common
+    st5 = parse_case(compose_case("step-5-preview", "a5", tp=4, ep=4, dp=1, layers=4, prompt_tokens=1024, output_tokens=16))
+    st5_plan = next(p for p in st5.model.layer_plans if p.indexer)
+    assert sparse_common.is_region_csa_indexer(st5_plan) is True
+    assert sparse_common.is_region_csa_indexer(qsa_plan) is False
+    assert index_cache_writer.is_region_csa_indexer is sparse_common.is_region_csa_indexer
+    assert gqa_indexer.is_block_msa_indexer is sparse_common.is_block_msa_indexer
+    res_st5 = gqa(
+        prefix="s0.l0", plan=st5_plan, views=(RequestView("r0", 1, 2048, False, "decode"),),
+        stage=0, deps="in", model=st5.model, parallel=st5.runtime.parallel, quant=st5.model.quant,
+        mode="decode", padded_tokens=1, policy=AttentionPolicy(), runtime=st5.runtime, machine=st5.machine,
+    )
+    st5_sc = next(op for op in res_st5.ops if op.recipe == "index_scores")
+    assert dict(st5_sc.metadata)["native_kind"] == "npu_indexer_region_score"
+
+
+def test_minimax_rectangular_score_pitch_mixed_phase_split_and_causal_dcp_pairs():
+    """Verify MiniMax rectangular ABI pitch (1024/4096 B), mixed-batch split, and causal DCP compressed pairs."""
+    from mindie_sim.compose import compose_case
+    from mindie_sim.prediction.frontend import Frontend
+    from mindie_sim.prediction.operators.sparse_indexer import gqa_indexer
+    from mindie_sim.prediction.structure import parse_case
+    from mindie_sim.schema.workload import IterationPlan, RequestView
+
+    fe = Frontend()
+    case = parse_case(compose_case("minimax-m3.1-flash", "a3", tp=1, ep=1, dp=1, layers=2, prompt_tokens=128, output_tokens=32))
+    v_a = RequestView("r0", 1, 127, True, "decode")
+    v_b = RequestView("r1", 1, 4095, True, "decode")
+    g2 = fe.program(IterationPlan((v_a, v_b)), case.model, case.runtime, case.machine, assembly="service").work
+    sc2 = next(op for op in g2.ops if "index_scores" in op.op_id)
+    assert sc2.mte3_bytes == pytest.approx(1024.0)
+
+    v_p1 = RequestView("r0", 1, 127, True, "decode", padded_q_len=4)
+    v_p2 = RequestView("r1", 1, 4095, True, "decode", padded_q_len=4)
+    g8 = fe.program(IterationPlan((v_p1, v_p2)), case.model, case.runtime, case.machine, assembly="service").work
+    sc8 = next(op for op in g8.ops if "index_scores" in op.op_id)
+    assert sc8.mte3_bytes == pytest.approx(4096.0)
+
+    v_pf = RequestView("p0", 64, 0, True, "prefill")
+    g_mix = fe.program(IterationPlan((v_pf, v_a)), case.model, case.runtime, case.machine, assembly="service").work
+    mix_ids = [op.op_id for op in g_mix.ops if "l0." in op.op_id and ("index_scores" in op.op_id or "index_topk" in op.op_id)]
+    assert any(oid.endswith(".decode") for oid in mix_ids) and any(oid.endswith(".prefill") for oid in mix_ids)
+
+    # Exact causal compressed pairs under DCP=2 (q=8, ratio=4, interleave=1 -> rank 0: 0, rank 1: 6, not 16).
+    v8 = (RequestView("r0", 8, 0, False, "prefill"),)
+    assert gqa_indexer.causal_owned_compressed_pairs(v8, ratio=4, dcp=2, interleave=1, rank=0) == 0
+    assert gqa_indexer.causal_owned_compressed_pairs(v8, ratio=4, dcp=2, interleave=1, rank=1) == 6
+    # Cross-check with query_ranges against brute force.
+    ranges = ((2, 4), (7, 9))
+    brute = sum(
+        sum(1 for j in range((pos + 1) // 4) if (((j + 1) * 4 - 1) // 1) % 2 == 1)
+        for lo, hi in ranges for pos in range(lo, hi)
+    )
+    vr = (RequestView("r0", 4, 0, False, "prefill", query_ranges=ranges),)
+    assert gqa_indexer.causal_owned_compressed_pairs(vr, ratio=4, dcp=2, interleave=1, rank=1) == brute
+
+    # R2 P1-12: MiniMax mixed prefill+decode preserves query_ranges=((4,8),) -> exact 26 prefill & 17 decode pairs.
+    mm_plan = next(p for p in case.model.layer_plans if p.indexer)
+    v_mm_mix = (
+        RequestView("pf", 4, 0, True, "prefill", query_ranges=((4, 8),)),
+        RequestView("dc", 1, 16, True, "decode"),
+    )
+    ops_mix = []
+    gqa_indexer.lower_gqa_indexer(
+        ops_mix, prefix="s0.l0.", plan=mm_plan, views=v_mm_mix, stage=0, deps="r",
+        model=case.model, parallel=case.runtime.parallel, quant=case.model.quant, mode="mixed",
+        padded_tokens=5, valid=5, pcp_prefill=False, runtime=case.runtime, machine=case.machine,
+    )
+    pf_sc = next(op for op in ops_mix if op.op_id.endswith(".index_scores.prefill"))
+    dc_sc = next(op for op in ops_mix if op.op_id.endswith(".index_scores.decode"))
+    local_idx_heads = max(1, mm_plan.index_heads // case.runtime.parallel.tp)
+    assert pf_sc.flops == pytest.approx(26 * 2 * local_idx_heads * mm_plan.index_dim)
+    assert dc_sc.flops == pytest.approx(17 * 2 * local_idx_heads * mm_plan.index_dim)
+
+    # DCP=2 divisible interleave=128 with ratio=4 & query_ranges=((4,8),) -> exact 5 pairs & 1 owned store row/rank.
+    from dataclasses import replace
+    from mindie_sim.schema.case import Software
+    from mindie_sim.schema.parallel import ParallelSpec
+    rt_dcp2 = Software(parallel=ParallelSpec(tp=8, cp=2), metadata=(("cp_interleave_size", 128),))
+    ops_dcp = []
+    gqa_indexer.lower_gqa_indexer(
+        ops_dcp, prefix="s0.l0.", plan=replace(mm_plan, compress_ratio=4, candidate_block_size=1),
+        views=(v_mm_mix[0],), stage=0, deps="r", model=case.model, parallel=rt_dcp2.parallel,
+        quant=case.model.quant, mode="prefill", padded_tokens=4, valid=4,
+        pcp_prefill=False, runtime=rt_dcp2, machine=case.machine,
+    )
+    sc_dcp = next(op for op in ops_dcp if "index_scores" in op.op_id)
+    st_dcp = next(op for op in ops_dcp if op.op_id.endswith(".index_store"))
+    dcp_idx_heads = max(1, mm_plan.index_heads // rt_dcp2.parallel.tp)
+    assert sc_dcp.flops == pytest.approx(5 * 2 * dcp_idx_heads * mm_plan.index_dim)
+    assert st_dcp.local_shape[0] == 4 and dict(st_dcp.metadata)["compressed_rows"] == 1
+
+    # S4-091: non-owner top-k-only layer (owns_index_k=False, indexer=False) emits zero index_store op.
+    ops_non_owner = []
+    gqa_indexer.lower_gqa_indexer(
+        ops_non_owner, prefix="s0.l1.", plan=replace(mm_plan, indexer=False, owns_index_k=False, owns_topk=True),
+        views=(v_mm_mix[0],), stage=0, deps="r", model=case.model, parallel=rt_dcp2.parallel,
+        quant=case.model.quant, mode="prefill", padded_tokens=4, valid=4,
+        pcp_prefill=False, runtime=rt_dcp2, machine=case.machine,
+    )
+    assert not any(op.op_id.endswith(".index_store") for op in ops_non_owner)
+
+    # Mixed DCP=2 interleave=128 with dcp_indexer_sharded=True executes without AttributeError and preserves exact 26/17 pairs.
+    rt_dcp_sh = Software(parallel=ParallelSpec(tp=1, dcp=2), metadata=(("cp_interleave_size", 128), ("dcp_indexer_sharded", True)))
+    ops_dcp_mix = []
+    gqa_indexer.lower_gqa_indexer(
+        ops_dcp_mix, prefix="s0.l0.", plan=mm_plan, views=v_mm_mix, stage=0, deps="r",
+        model=case.model, parallel=rt_dcp_sh.parallel, quant=case.model.quant, mode="mixed",
+        padded_tokens=5, valid=5, pcp_prefill=False, runtime=rt_dcp_sh, machine=case.machine,
+    )
+    pf_sh = next(op for op in ops_dcp_mix if op.op_id.endswith(".index_scores.prefill"))
+    dc_sh = next(op for op in ops_dcp_mix if op.op_id.endswith(".index_scores.decode"))
+    assert pf_sh.flops == pytest.approx(26 * 2 * mm_plan.index_heads * mm_plan.index_dim)
+    assert dc_sh.flops == pytest.approx(17 * 2 * mm_plan.index_heads * mm_plan.index_dim)
+
+    # legacy_triton_decode TopK reads rectangular padded scores: 4 heads * 2 rows * 32 max_blocks * 4 B = 1,024 B.
+    rt_leg = replace(case.runtime, metadata=case.runtime.metadata + (("minimax_indexer_abi", "legacy_triton_decode"),))
+    v_rag_leg = (RequestView("r0", 1, 64, True, "decode"), RequestView("r1", 1, 4095, True, "decode"))
+    ops_leg = []
+    gqa_indexer.lower_gqa_indexer(
+        ops_leg, prefix="s0.l0.", plan=mm_plan, views=v_rag_leg, stage=0, deps="r",
+        model=case.model, parallel=rt_leg.parallel, quant=case.model.quant, mode="decode",
+        padded_tokens=2, valid=2, pcp_prefill=False, runtime=rt_leg, machine=case.machine,
+    )
+    tk_leg = next(op for op in ops_leg if op.recipe == "index_topk")
+    assert tk_leg.mte2_bytes == pytest.approx(4 * 2 * 32 * 4)

@@ -381,13 +381,24 @@ def test_recover_ssm_commit_prefix_and_checkpoint_savings() -> None:
             assert oid is not None
             bound = bind_recover_ssm_commits(
                 builder.ops, views=(view,), acceptance_events={"r0": "accept0"},
-                state_bindings={f"layer{idx}": "base_state"}, runtime=SimpleNamespace(mtp_acceptance_length=1.0),
+                state_bindings={f"layer{idx}": "base_state"},
+                runtime=SimpleNamespace(mtp_acceptance_length=1.0, metadata=(("recover_ssm_readiness", "shipping"),)),
+                machine=SimpleNamespace(arch_family="A5"),
             )
             op = bound[0]
-            assert dict(op.metadata)["recover_ssm_stage"] == "commit"
-            assert op.mte2_bytes == pytest.approx(state_bytes + accepted * heads * expected_rec)
+            op_meta = dict(op.metadata)
+            assert op_meta["recover_ssm_stage"] == "commit"
+            assert op_meta["unique_record_read_bytes"] == pytest.approx(accepted * heads * expected_rec)
+            expected_phys_rec = (
+                accepted * heads * (op_meta["v_tiles"] * (dk + 1) + dv) * FP32_RECORD_BYTES
+                if family == "gdn"
+                else accepted * heads * (dv * FP32_RECORD_BYTES + op_meta["v_tiles"] * 2 * dk * 2)
+            )
+            assert op_meta["physical_tiled_record_read_bytes"] == pytest.approx(expected_phys_rec)
+            assert op.mte2_bytes == pytest.approx(state_bytes + expected_phys_rec)
             assert op.mte3_bytes == pytest.approx(state_bytes)
-            assert op.vector_ops == pytest.approx(4 * accepted * heads * dk * dv)
+            # Upstream-exact GDN & locked GA-09 KDA reverse accumulation: 2 * (u + 1) * E.
+            assert op.vector_ops == pytest.approx(2 * (accepted + 1) * heads * dk * dv)
             commit_reads[accepted] = op.mte2_bytes
         assert commit_reads[2] < commit_reads[5]
 

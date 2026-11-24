@@ -52,12 +52,13 @@ MIN_OFFLOAD_POOL_REQUESTS = 4
 OFFLOAD_ADDRESS_PAIR_BYTES = 8
 OFFLOAD_INACTIVE_REQUEST = -3
 OFFLOAD_INDEX_ELEMENT_BYTES = 4
-REFERENCE_ARCH22_PCIE_GBPS = 50.0
-REFERENCE_ARCH35_D2H_GBPS = 100.15
-REFERENCE_ARCH35_H2D_GBPS = 100.01
 TOPK_INDEX_BYTES = 4
 WIDE_OFFLOAD_MIN_UB_BYTES = 131072
 WIDE_OFFLOAD_UB_BYTES = 122880
+NS_TO_MS = 1e-6
+US_TO_MS = 1e-3
+BYTES_PER_S_TO_GBPS = 1e-9
+GBPS_TO_BYTES_PER_MS = 1e6
 
 IMPLEMENTATION = "vllm_ascend_sparse_kv_offload"
 HISPARSE_ALIAS = "hisparse_kv_offload"
@@ -71,20 +72,6 @@ MEMFABRIC_SOURCE = {
         "acc_offload_entry_gather.h (OffloadEntryGatherKernel, 120 KiB ping-pong UB)",
     ),
     "caller": "vllm_ascend/attention/sfa_kv_offload.py & sparse_kv_offload_manager.py",
-}
-
-# Calibrated on live Ascend950DT_9582 (A5, 32 AIC / 64 AIV, memfabric_hybrid 1.3.0):
-# - sparse_copy D2H: floor 20.8 us, setup 13.5 us, marginal GVA BW 108.9 GB/s
-# - sparse_copy H2D: floor 20.6 us, setup 14.5 us, marginal GVA BW 95.1 GB/s
-# - kv_exchange H2D (2 AIVs 62..63): floor 20.5 us, setup 9.8 us, marginal GVA BW 87.9 GB/s
-# - kv_exchange D2H (2 AIVs 62..63): floor 20.5 us, setup 8.5 us, marginal GVA BW 99.6 GB/s
-# - entry_gather H2D (64 AIVs, 1024B row): floor 21.1 us, setup 14.8 us, marginal GVA BW 106.8 GB/s
-A5_GVA_CALIBRATION: dict[str, dict[str, float]] = {
-    "sparse_copy_d2h": {"minimum_ms": 0.0208, "setup_ms": 0.0135, "gva_bw_bytes_per_ms": 108.9e6, "reference_uni_bw_gbps": 100.15},
-    "sparse_copy_h2d": {"minimum_ms": 0.0206, "setup_ms": 0.0145, "gva_bw_bytes_per_ms": 95.1e6, "reference_uni_bw_gbps": 100.01},
-    "kv_exchange_h2d": {"minimum_ms": 0.0205, "setup_ms": 0.0098, "gva_bw_bytes_per_ms": 87.9e6, "reference_uni_bw_gbps": 100.01},
-    "kv_exchange_d2h": {"minimum_ms": 0.0205, "setup_ms": 0.0085, "gva_bw_bytes_per_ms": 99.6e6, "reference_uni_bw_gbps": 100.15},
-    "entry_gather": {"minimum_ms": 0.0211, "setup_ms": 0.0148, "gva_bw_bytes_per_ms": 106.8e6, "reference_uni_bw_gbps": 100.01},
 }
 
 DEFAULT_OPTIONS: dict[str, Any] = {
@@ -119,18 +106,61 @@ def _resolve_options(raw_options: Mapping[str, Any] | None) -> dict[str, Any]:
     return opts
 
 
-def _channel_bw_scale(channel_bw_gbps: float | None, profile_key: str) -> float:
-    ref = A5_GVA_CALIBRATION[profile_key]["reference_uni_bw_gbps"]
-    if channel_bw_gbps is None or channel_bw_gbps <= 0:
-        return 1.0
-    return float(channel_bw_gbps) / ref
-
-
-def _machine_channel_bw(machine: Any, channel: str) -> float | None:
+def _machine_channel_spec(machine: Any, channel: str) -> tuple[float | None, float | None]:
     channels = dict(getattr(machine, "transfer_channels", ()) or ())
     entry = dict(channels.get(channel, ()) or ())
-    val = entry.get("effective_uni_bw_gbps")
-    return float(val) if isinstance(val, (int, float)) and val > 0 else None
+    bw = entry.get("effective_uni_bw_gbps")
+    alpha = entry.get("alpha_us")
+    bw_val = float(bw) if isinstance(bw, (int, float)) and bw > 0 else None
+    alpha_val = float(alpha) if isinstance(alpha, (int, float)) and alpha >= 0 else None
+    return bw_val, alpha_val
+
+
+def _primitive_host_dma(table: Any, direction: str) -> tuple[float | None, float]:
+    """Read calibrated host DMA bandwidth (bytes/ms) and setup latency (ms) from PrimitiveTable."""
+    if table is None:
+        return None, 0.0
+    primitives = getattr(table, "primitives", ())
+    bw_bytes_per_ms: float | None = None
+    setup_ms = 0.0
+    if "P20_host_dma_sync" in primitives:
+        metrics = table.cell("P20_host_dma_sync").metrics
+        bw_key = "host_d2h_bytes_per_s" if direction == "d2h" else "host_h2d_bytes_per_s"
+        bw_band = metrics.get(bw_key)
+        if bw_band is not None and bw_band.p50 is not None and bw_band.p50 > 0.0:
+            bw_bytes_per_ms = float(bw_band.p50) * US_TO_MS
+        setup_band = metrics.get("pinned_dma_startup_ns")
+        if setup_band is None and direction == "d2h":
+            setup_band = metrics.get("eager_d2h_sync_ns")
+        if setup_band is not None and setup_band.p50 is not None and setup_band.p50 > 0.0:
+            setup_ms = float(setup_band.p50) * NS_TO_MS
+    return bw_bytes_per_ms, setup_ms
+
+
+def _resolve_host_dma_channel(context: Any, spec: Mapping[str, Any], direction: str) -> tuple[float | None, float]:
+    """Resolve host DMA bandwidth (bytes/ms) and setup latency (ms) from transfer_channels / PrimitiveTable."""
+    table = getattr(context, "primitive_table", None)
+    prim_bw, prim_setup = _primitive_host_dma(table, direction)
+    raw_bw = spec.get("channel_bw_gbps")
+    bw_bytes_per_ms = (
+        float(raw_bw) * GBPS_TO_BYTES_PER_MS
+        if isinstance(raw_bw, (int, float)) and raw_bw > 0
+        else prim_bw
+    )
+    raw_alpha = spec.get("channel_alpha_us")
+    setup_ms = (
+        float(raw_alpha) * US_TO_MS
+        if isinstance(raw_alpha, (int, float)) and raw_alpha >= 0
+        else prim_setup
+    )
+    return bw_bytes_per_ms, setup_ms
+
+
+def _explicit_aiv_units(geometry: Geometry) -> int:
+    units = (geometry.resource_units or {}).get("vector")
+    if units is None or int(units) <= 0:
+        raise ModelingError("sparse_kv_offload_requires_explicit_vector_units")
+    return int(units)
 
 
 def sparse_kv_offload_memory_budget(
@@ -142,27 +172,37 @@ def sparse_kv_offload_memory_budget(
 ) -> dict[str, Any]:
     """Derive NPU HBM vs. MemFabric Host DRAM capacity and static buffer budgets."""
     opts = _resolve_options(options)
-    mla_layers = tuple(p for p in model.layer_plans if p.attention == "mla")
+    mla_layers = tuple(
+        p for p in model.layer_plans
+        if p.attention == "mla" and str(getattr(p, "mla_variant", "") or "") == "latent_mla"
+    )
     indexed_layers = tuple(p for p in mla_layers if p.index_topk > 0)
     layerwise = bool(opts["layerwise_kv_offload"])
     if not indexed_layers and not layerwise:
         raise ModelingError("sparse_kv_offload_requires_indexed_mla_or_layerwise_offload")
 
-    offload_layers = tuple(p.index for p in (mla_layers if layerwise else indexed_layers))
+    offload_plans = mla_layers if layerwise else indexed_layers
+    offload_layers = tuple(p.index for p in offload_plans)
     full_indexer_layers = tuple(p.index for p in indexed_layers if p.owns_index_k)
     shared_indexer_layers = tuple(
         p.index for p in indexed_layers if not p.owns_index_k and p.topk_owner_layer_id >= 0
     )
 
-    sample_plan = (indexed_layers or mla_layers)[0]
-    kv_elements = sample_plan.cache_row_elements or (
-        sample_plan.kv_lora_rank + sample_plan.qk_rope_head_dim
-    )
-    kv_row_bytes = int(packed_region_row_bytes(model, "mla_kv", kv_elements))
-    idx_row_bytes = (
-        int(index_row_bytes(model, sample_plan.index_dim))
-        if sample_plan.index_dim > 0 else 0
-    )
+    kv_row_bytes_by_layer: dict[int, int] = {}
+    index_row_bytes_by_layer: dict[int, int] = {}
+    for layer_plan in offload_plans:
+        kv_elements = layer_plan.cache_row_elements or (
+            layer_plan.kv_lora_rank + layer_plan.qk_rope_head_dim
+        )
+        kv_row_bytes_by_layer[layer_plan.index] = int(
+            packed_region_row_bytes(model, "mla_kv", kv_elements)
+        )
+        index_row_bytes_by_layer[layer_plan.index] = (
+            int(index_row_bytes(model, layer_plan.index_dim))
+            if layer_plan.index_dim > 0 else 0
+        )
+    kv_row_bytes = kv_row_bytes_by_layer[offload_layers[0]]
+    idx_row_bytes = index_row_bytes_by_layer[offload_layers[0]]
 
     block_size = int(runtime.kv_block_size or opts["page_size"])
     max_seqs = int(runtime.max_num_seqs)
@@ -201,7 +241,10 @@ def sparse_kv_offload_memory_budget(
     layer_stage = tuple(stage for stage, count in enumerate(counts) for _ in range(count))
     static_npu_bytes_per_stage = [0.0] * p.pp
     for layer_idx in offload_layers:
-        static_npu_bytes_per_stage[layer_stage[layer_idx]] += float(static_npu_bytes_per_offload_layer)
+        layer_topk = 0 if layerwise else (topk_rows * buffer_width * kv_row_bytes_by_layer[layer_idx])
+        static_npu_bytes_per_stage[layer_stage[layer_idx]] += float(
+            layer_topk + lru_bytes_per_layer + slot_map_bytes_per_layer
+        )
 
     # MemFabric Scene.SHARED Host DRAM pool per DP replica (shared across TP ranks).
     dram_pool_bytes_per_dp = int(float(opts["dram_size_per_dp_gb"]) * (1024 ** GIB_EXPONENT))
@@ -209,7 +252,8 @@ def sparse_kv_offload_memory_budget(
     usable_dram_bytes_per_dp = max(0, dram_pool_bytes_per_dp - dram_alignment_reserve_bytes)
     usable_dram_per_layer = usable_dram_bytes_per_dp // max(1, len(offload_layers))
     dram_block_bytes = block_size * kv_row_bytes
-    dram_limit_blocks = max(0, usable_dram_per_layer // max(1, dram_block_bytes) - 1)
+    total_dram_block_bytes = sum(block_size * kv_row_bytes_by_layer[idx] for idx in offload_layers)
+    dram_limit_blocks = max(0, usable_dram_bytes_per_dp // max(1, total_dram_block_bytes) - 1)
     dram_max_tokens_per_dp = dram_limit_blocks * block_size
 
     workload_blocks = max_seqs * max_blocks_per_req
@@ -231,28 +275,35 @@ def sparse_kv_offload_memory_budget(
     soc_family = opts["soc_family"] or (
         "Ascend950" if arch_family == "A5" else "Ascend910_93" if arch_family == "A3" else "Ascend910B"
     )
-    h2d_bw_gbps = _machine_channel_bw(machine, "h2d") or (REFERENCE_ARCH35_H2D_GBPS if arch_family == "A5" else REFERENCE_ARCH22_PCIE_GBPS)
-    d2h_bw_gbps = _machine_channel_bw(machine, "d2h") or (REFERENCE_ARCH35_D2H_GBPS if arch_family == "A5" else REFERENCE_ARCH22_PCIE_GBPS)
+    h2d_bw_gbps, h2d_alpha_us = _machine_channel_spec(machine, "h2d")
+    d2h_bw_gbps, d2h_alpha_us = _machine_channel_spec(machine, "d2h")
+    if h2d_bw_gbps is None or d2h_bw_gbps is None:
+        raise ModelingError("sparse_kv_offload_host_channel_bw_missing")
 
+    # Step 2: verify exact kernel availability via backends.abi_registry.ProbedAbiRegistry once W1 merges.
     hardware_support = {
         "soc_family": soc_family,
         "arch_family": arch_family,
-        "memfabric_acc_offload": "native_verified_on_a5" if arch_family == "A5" else "native_supported",
-        "npu_lightning_indexer": "native_verified_on_a5" if arch_family == "A5" else "native_supported",
-        "npu_sparse_flash_attention": "native_verified_on_a5" if arch_family == "A5" else "native_supported",
+        "abi_verification": "deferred_to_abi_registry",
+        "memfabric_acc_offload": "host_gva_dma_modeled",
+        "npu_lightning_indexer": "native_indexer_modeled",
+        "npu_sparse_flash_attention": "native_sfa_modeled",
         "fused_lightning_indexer_manage": (
-            "a2_a3_aclnn_binary_analytical_on_a5" if arch_family == "A5" else "native_aclnn_supported"
+            "arch22_aclnn_binary" if arch_family in {"A2", "A3"} else "analytical_model"
         ),
         "copy_sfa_attention": (
-            "a2_a3_aclnn_binary_analytical_on_a5" if arch_family == "A5" else "native_aclnn_supported"
+            "arch22_aclnn_binary" if arch_family in {"A2", "A3"} else "analytical_model"
         ),
-        "fused_sparse_attention_overlap": "native_ascendc_source_available",
+        "fused_sparse_attention_overlap": "ascendc_overlap_modeled",
     }
 
     return {
         "implementation": IMPLEMENTATION, "options": opts, "offload_layers": offload_layers,
         "full_indexer_layers": full_indexer_layers, "shared_indexer_layers": shared_indexer_layers,
-        "kv_row_bytes": kv_row_bytes, "index_row_bytes": idx_row_bytes, "block_size": block_size,
+        "kv_row_bytes": kv_row_bytes, "index_row_bytes": idx_row_bytes,
+        "kv_row_bytes_by_layer": kv_row_bytes_by_layer,
+        "index_row_bytes_by_layer": index_row_bytes_by_layer,
+        "block_size": block_size,
         "topk_buffer_size": topk_buffer_size, "copy_sfa_pool_capacity": pool_cap,
         "topk_buffer_rows": topk_rows, "topk_buffer_width": buffer_width,
         "topk_buffer_bytes_per_layer": topk_buffer_bytes_per_layer,
@@ -268,6 +319,7 @@ def sparse_kv_offload_memory_budget(
         "dram_max_tokens_per_dp": dram_max_tokens_per_dp,
         "workload_limit_blocks": workload_blocks, "active_npu_kv_layers": active_npu_kv_layers,
         "h2d_effective_bw_gbps": h2d_bw_gbps, "d2h_effective_bw_gbps": d2h_bw_gbps,
+        "h2d_alpha_us": h2d_alpha_us, "d2h_alpha_us": d2h_alpha_us,
         "hardware_support": hardware_support, "source": MEMFABRIC_SOURCE,
     }
 
@@ -293,25 +345,24 @@ def prepare_case(model: Any, runtime: Any, machine: Any, workload: Any, binding:
         tuple(memory_cfg.get("cache_page_groups", ())),
     )
     existing_groups = list(base_groups)
-    if not opts["keep_device_kv_cache"] and not opts["layerwise_kv_offload"]:
+    row_by_layer = budget.get("kv_row_bytes_by_layer") or {}
+    target_zero_layers = (
+        offload_layers
+        if (not opts["keep_device_kv_cache"] and not opts["layerwise_kv_offload"])
+        else (offload_layers[max(0, int(opts["num_shared_layers"])):] if opts["layerwise_kv_offload"] else ())
+    )
+    grouped_by_page_bytes: dict[int, list[int]] = {}
+    for layer_idx in target_zero_layers:
+        page_b = budget["block_size"] * int(row_by_layer.get(layer_idx, budget["kv_row_bytes"]))
+        grouped_by_page_bytes.setdefault(page_b, []).append(layer_idx)
+    for page_b, group_layers in grouped_by_page_bytes.items():
         existing_groups.append({
-            "layers": offload_layers,
+            "layers": tuple(group_layers),
             "tokens_per_page": budget["block_size"],
-            "bytes_per_layer_page": budget["dram_block_bytes"],
+            "bytes_per_layer_page": page_b,
             "components": ("mla_kv",),
             "resident_tokens": 0,
         })
-    elif opts["layerwise_kv_offload"]:
-        kept = max(0, int(opts["num_shared_layers"]))
-        offloaded_zero = offload_layers[kept:]
-        if offloaded_zero:
-            existing_groups.append({
-                "layers": offloaded_zero,
-                "tokens_per_page": budget["block_size"],
-                "bytes_per_layer_page": budget["dram_block_bytes"],
-                "components": ("mla_kv",),
-                "resident_tokens": 0,
-            })
     memory_cfg["cache_page_groups"] = tuple(existing_groups)
 
     model_meta = {**dict(model.metadata), "sparse_kv_offload": budget}
@@ -345,7 +396,7 @@ def _build_memfabric_sparse_copy(op: OpSpec, geometry: Geometry, *, direction: s
     spec = dict(meta.get("memfabric_call", {}))
     payload_bytes = float(spec.get("payload_bytes", op.hbm_bytes))
     entries = max(1, int(spec.get("entries", max(1, op.local_shape[0] if op.local_shape else 1))))
-    aiv_units = int(geometry.resource_units.get("vector", max(1, geometry.compute_units * 2)))
+    aiv_units = _explicit_aiv_units(geometry)
     if "ub" not in geometry.buffers or int(geometry.buffers["ub"]) <= 0:
         raise ModelingError("sparse_kv_offload_requires_explicit_ub_bytes")
     ub_capacity = int(geometry.buffers["ub"])
@@ -354,14 +405,6 @@ def _build_memfabric_sparse_copy(op: OpSpec, geometry: Geometry, *, direction: s
     kernel_mode = "OffloadMoeSparseCopyKernel" if entries < aiv_units else "OffloadKVSparseCopyKernel"
     active_owners = min(aiv_units, entries)
     ub_per_owner = min(BASELINE_OFFLOAD_UB_BYTES, ub_capacity)
-
-    profile_key = "sparse_copy_d2h" if direction == "d2h" else "sparse_copy_h2d"
-    cal = A5_GVA_CALIBRATION[profile_key]
-    bw_gbps = spec.get("channel_bw_gbps")
-    scale = _channel_bw_scale(bw_gbps, profile_key)
-    gva_bw_bytes_per_ms = cal["gva_bw_bytes_per_ms"] * scale
-    setup_ms = cal["setup_ms"]
-    minimum_ms = cal["minimum_ms"]
 
     rpipe = read_role(geometry.resource_units or {}, aiv=0)
     work = Work(resources={"hbm": payload_bytes, rpipe: payload_bytes, "mte3": payload_bytes})
@@ -372,8 +415,13 @@ def _build_memfabric_sparse_copy(op: OpSpec, geometry: Geometry, *, direction: s
         pipe = read_role(context.resource_names, aiv=0)
         eff_gva = "mte3" if direction == "d2h" else pipe
         per_owner = payload_bytes / active_owners
+        gva_bw_bytes_per_ms, setup_ms = _resolve_host_dma_channel(context, spec, direction)
         gva_name = context.resource_names.get(eff_gva)
-        per_owner_cap = {gva_name: gva_bw_bytes_per_ms / active_owners} if gva_name else {}
+        per_owner_cap = (
+            {gva_name: gva_bw_bytes_per_ms / active_owners}
+            if (gva_name and gva_bw_bytes_per_ms and gva_bw_bytes_per_ms > 0)
+            else {}
+        )
 
         def owner_prog(owner: int):
             owned = context.owned(owner, aiv_units, ("vector", pipe, "mte3"))
@@ -393,14 +441,11 @@ def _build_memfabric_sparse_copy(op: OpSpec, geometry: Geometry, *, direction: s
             )
             return KernelProgram(stages)
 
-        return KernelProgram(
-            (
-                Stage("gva_aperture_setup", latency=setup_ms),
-                Stage("aiv_dma", after=("gva_aperture_setup",),
-                      program=ParallelProgram(tuple(owner_prog(i) for i in range(active_owners)))),
-            ),
-            minimum_ms=minimum_ms,
-        )
+        return KernelProgram((
+            Stage("gva_aperture_setup", latency=setup_ms),
+            Stage("aiv_dma", after=("gva_aperture_setup",),
+                  program=ParallelProgram(tuple(owner_prog(i) for i in range(active_owners)))),
+        ))
 
     return OperatorPlan(work, program, metadata={
         "execution_class": "memfabric_acc_offload",
@@ -410,9 +455,6 @@ def _build_memfabric_sparse_copy(op: OpSpec, geometry: Geometry, *, direction: s
         "active_aiv_owners": active_owners,
         "physical_aiv_units": aiv_units,
         "ub_bytes_per_owner": ub_per_owner,
-        "gva_bw_gbps": gva_bw_bytes_per_ms / 1e6,
-        "gva_setup_us": setup_ms * 1000.0,
-        "gva_floor_us": minimum_ms * 1000.0,
     })
 
 
@@ -422,7 +464,7 @@ def _build_memfabric_kv_exchange(op: OpSpec, geometry: Geometry) -> OperatorPlan
     direction = str(spec.get("direction", "d2h")).lower()
     payload_bytes = float(spec.get("payload_bytes", op.hbm_bytes))
     pages = max(1, int(spec.get("pages", 1)))
-    aiv_units = int(geometry.resource_units.get("vector", max(2, geometry.compute_units * 2)))
+    aiv_units = _explicit_aiv_units(geometry)
     if "ub" not in geometry.buffers or int(geometry.buffers["ub"]) <= 0:
         raise ModelingError("sparse_kv_offload_requires_explicit_ub_bytes")
     ub_capacity = int(geometry.buffers["ub"])
@@ -430,13 +472,6 @@ def _build_memfabric_kv_exchange(op: OpSpec, geometry: Geometry) -> OperatorPlan
     active_owners = min(2, aiv_units)
     owner_indices = tuple(range(max(0, aiv_units - active_owners), aiv_units))
     ub_per_owner = min(BASELINE_OFFLOAD_UB_BYTES, ub_capacity)
-
-    profile_key = "kv_exchange_d2h" if direction == "d2h" else "kv_exchange_h2d"
-    cal = A5_GVA_CALIBRATION[profile_key]
-    scale = _channel_bw_scale(spec.get("channel_bw_gbps"), profile_key)
-    gva_bw_bytes_per_ms = cal["gva_bw_bytes_per_ms"] * scale
-    setup_ms = cal["setup_ms"]
-    minimum_ms = cal["minimum_ms"]
 
     rpipe = read_role(geometry.resource_units or {}, aiv=0)
     work = Work(resources={"hbm": payload_bytes, rpipe: payload_bytes, "mte3": payload_bytes})
@@ -447,8 +482,13 @@ def _build_memfabric_kv_exchange(op: OpSpec, geometry: Geometry) -> OperatorPlan
         pipe = read_role(context.resource_names, aiv=0)
         eff_gva = "mte3" if direction == "d2h" else pipe
         per_owner = payload_bytes / active_owners
+        gva_bw_bytes_per_ms, setup_ms = _resolve_host_dma_channel(context, spec, direction)
         gva_name = context.resource_names.get(eff_gva)
-        per_owner_cap = {gva_name: gva_bw_bytes_per_ms / active_owners} if gva_name else {}
+        per_owner_cap = (
+            {gva_name: gva_bw_bytes_per_ms / active_owners}
+            if (gva_name and gva_bw_bytes_per_ms and gva_bw_bytes_per_ms > 0)
+            else {}
+        )
 
         def owner_prog(phys_owner: int):
             owned = context.owned(phys_owner, aiv_units, ("vector", pipe, "mte3"))
@@ -467,14 +507,11 @@ def _build_memfabric_kv_exchange(op: OpSpec, geometry: Geometry) -> OperatorPlan
                 Stage("ub_release", after=("double_buffered_dma",), free=alloc),
             ))
 
-        return KernelProgram(
-            (
-                Stage("gva_aperture_setup", latency=setup_ms),
-                Stage("aiv_tail2_dma", after=("gva_aperture_setup",),
-                      program=ParallelProgram(tuple(owner_prog(idx) for idx in owner_indices))),
-            ),
-            minimum_ms=minimum_ms,
-        )
+        return KernelProgram((
+            Stage("gva_aperture_setup", latency=setup_ms),
+            Stage("aiv_tail2_dma", after=("gva_aperture_setup",),
+                  program=ParallelProgram(tuple(owner_prog(idx) for idx in owner_indices))),
+        ))
 
     return OperatorPlan(work, program, metadata={
         "execution_class": "memfabric_acc_offload",
@@ -484,7 +521,6 @@ def _build_memfabric_kv_exchange(op: OpSpec, geometry: Geometry) -> OperatorPlan
         "active_aiv_owners": owner_indices,
         "physical_aiv_units": aiv_units,
         "ub_bytes_per_owner": ub_per_owner,
-        "gva_bw_gbps": gva_bw_bytes_per_ms / 1e6,
     })
 
 
@@ -493,17 +529,13 @@ def _build_memfabric_entry_gather(op: OpSpec, geometry: Geometry) -> OperatorPla
     spec = dict(meta.get("memfabric_call", {}))
     payload_bytes = float(spec.get("payload_bytes", op.hbm_bytes))
     rows = max(1, int(spec.get("rows", max(1, op.local_shape[0] if op.local_shape else 1))))
-    aiv_units = int(geometry.resource_units.get("vector", max(1, geometry.compute_units * 2)))
+    aiv_units = _explicit_aiv_units(geometry)
     if "ub" not in geometry.buffers or int(geometry.buffers["ub"]) <= 0:
         raise ModelingError("sparse_kv_offload_requires_explicit_ub_bytes")
     ub_capacity = int(geometry.buffers["ub"])
     # acc_offload_entry_gather.h: 120 KiB ping-pong UB on >=128 KiB UB, else 88 KiB.
     ub_per_owner = WIDE_OFFLOAD_UB_BYTES if ub_capacity >= WIDE_OFFLOAD_MIN_UB_BYTES else min(BASELINE_OFFLOAD_UB_BYTES, ub_capacity)
     active_owners = min(aiv_units, rows)
-
-    cal = A5_GVA_CALIBRATION["entry_gather"]
-    scale = _channel_bw_scale(spec.get("channel_bw_gbps"), "entry_gather")
-    gva_bw_bytes_per_ms = cal["gva_bw_bytes_per_ms"] * scale
 
     rpipe = read_role(geometry.resource_units or {}, aiv=0)
     work = Work(resources={"hbm": payload_bytes, rpipe: payload_bytes, "mte3": payload_bytes})
@@ -513,8 +545,13 @@ def _build_memfabric_entry_gather(op: OpSpec, geometry: Geometry) -> OperatorPla
             return KernelProgram(())
         pipe = read_role(context.resource_names, aiv=0)
         per_owner = payload_bytes / active_owners
+        gva_bw_bytes_per_ms, setup_ms = _resolve_host_dma_channel(context, spec, "h2d")
         gva_name = context.resource_names.get(pipe)
-        per_owner_cap = {gva_name: gva_bw_bytes_per_ms / active_owners} if gva_name else {}
+        per_owner_cap = (
+            {gva_name: gva_bw_bytes_per_ms / active_owners}
+            if (gva_name and gva_bw_bytes_per_ms and gva_bw_bytes_per_ms > 0)
+            else {}
+        )
 
         def owner_prog(owner: int):
             owned = context.owned(owner, aiv_units, ("vector", pipe, "mte3"))
@@ -533,14 +570,11 @@ def _build_memfabric_entry_gather(op: OpSpec, geometry: Geometry) -> OperatorPla
                 Stage("ub_release", after=("double_buffered_gather",), free=alloc),
             ))
 
-        return KernelProgram(
-            (
-                Stage("gva_aperture_setup", latency=cal["setup_ms"]),
-                Stage("aiv_gather", after=("gva_aperture_setup",),
-                      program=ParallelProgram(tuple(owner_prog(i) for i in range(active_owners)))),
-            ),
-            minimum_ms=cal["minimum_ms"],
-        )
+        return KernelProgram((
+            Stage("gva_aperture_setup", latency=setup_ms),
+            Stage("aiv_gather", after=("gva_aperture_setup",),
+                  program=ParallelProgram(tuple(owner_prog(i) for i in range(active_owners)))),
+        ))
 
     return OperatorPlan(work, program, metadata={
         "execution_class": "memfabric_acc_offload",
@@ -548,7 +582,6 @@ def _build_memfabric_entry_gather(op: OpSpec, geometry: Geometry) -> OperatorPla
         "rows": rows,
         "active_aiv_owners": active_owners,
         "ub_bytes_per_owner": ub_per_owner,
-        "gva_bw_gbps": gva_bw_bytes_per_ms / 1e6,
     })
 
 
@@ -578,10 +611,9 @@ def _build_overlapped_sfa_plan(op: OpSpec, geometry: Geometry) -> OperatorPlan:
     spec = dict(meta.get("sparse_offload_sfa", {}))
     miss_bytes = float(spec.get("miss_h2d_bytes", 0.0))
     attn_hbm_bytes = max(0.0, float(op.hbm_bytes) - miss_bytes)
-    dtype = op.dtype or "bf16"
-    cal = A5_GVA_CALIBRATION["sparse_copy_h2d"]
-    scale = _channel_bw_scale(spec.get("channel_bw_gbps"), "sparse_copy_h2d")
-    gva_bw_bytes_per_ms = cal["gva_bw_bytes_per_ms"] * scale
+    if not op.dtype:
+        raise ModelingError("sparse_kv_offload_op_dtype_required")
+    dtype = op.dtype
     aic_pipe = read_role(geometry.resource_units or {})
     aiv_pipe = read_role(geometry.resource_units or {}, aiv=0)
 
@@ -608,25 +640,26 @@ def _build_overlapped_sfa_plan(op: OpSpec, geometry: Geometry) -> OperatorPlan:
         aic_prog = KernelProgram((Stage("sfa_aic", context.bind(aic_work)),))
         if miss_bytes <= 0:
             return aic_prog
+        gva_bw_bytes_per_ms, setup_ms = _resolve_host_dma_channel(context, spec, "h2d")
         gva_name = context.resource_names.get(v_pipe)
-        cap = {gva_name: gva_bw_bytes_per_ms} if gva_name else {}
-        aiv_prog = KernelProgram(
-            (
-                Stage("gva_setup", latency=cal["setup_ms"]),
-                Stage("gva_h2d_gather", context.bind(Work(resources={v_pipe: miss_bytes})),
-                      after=("gva_setup",), caps=cap),
-                Stage("topk_buffer_write", context.bind(Work(resources={"hbm": miss_bytes, "mte3": miss_bytes})),
-                      after=("gva_h2d_gather",)),
-            ),
-            minimum_ms=cal["minimum_ms"],
+        cap = (
+            {gva_name: gva_bw_bytes_per_ms}
+            if (gva_name and gva_bw_bytes_per_ms and gva_bw_bytes_per_ms > 0)
+            else {}
         )
+        aiv_prog = KernelProgram((
+            Stage("gva_setup", latency=setup_ms),
+            Stage("gva_h2d_gather", context.bind(Work(resources={v_pipe: miss_bytes})),
+                  after=("gva_setup",), caps=cap),
+            Stage("topk_buffer_write", context.bind(Work(resources={"hbm": miss_bytes, "mte3": miss_bytes})),
+                  after=("gva_h2d_gather",)),
+        ))
         return ParallelProgram((aiv_prog, aic_prog))
 
     return OperatorPlan(work, program, metadata={
         "execution_class": "mixed_aiv_aic_overlap",
         "miss_h2d_bytes": miss_bytes,
         "attn_hbm_bytes": attn_hbm_bytes,
-        "gva_h2d_bw_gbps": gva_bw_bytes_per_ms / 1e6,
     })
 
 
@@ -652,14 +685,20 @@ def lower_prefill_offload(
     valid_tokens = sum(v.q_len for v in views)
     page_size = int(budget["block_size"])
     pages = max(1, math.ceil(valid_tokens / page_size))
-    payload_bytes = float(valid_tokens * budget["kv_row_bytes"])
+    layer_kv_row_bytes = int((budget.get("kv_row_bytes_by_layer") or {}).get(plan.index, budget["kv_row_bytes"]))
+    payload_bytes = float(valid_tokens * layer_kv_row_bytes)
+    call_meta: dict[str, Any] = {
+        "direction": "d2h", "pages": pages, "page_size": page_size,
+        "payload_bytes": payload_bytes, "channel_bw_gbps": budget["d2h_effective_bw_gbps"],
+    }
+    if budget.get("d2h_alpha_us") is not None:
+        call_meta["channel_alpha_us"] = budget["d2h_alpha_us"]
     op_id = b.work(
         "memfabric_kv_exchange_d2h", (store_id,), (pages, page_size, plan.cache_row_elements),
         read=payload_bytes, write=payload_bytes, family="kv_offload_exchange", dtype=b.model.kv_dtype,
         metadata=(
             ("kernel", "OffloadKVExchangeKernel"), ("implementation", IMPLEMENTATION),
-            ("memfabric_call", {"direction": "d2h", "pages": pages, "page_size": page_size,
-                                "payload_bytes": payload_bytes, "channel_bw_gbps": budget["d2h_effective_bw_gbps"]}),
+            ("memfabric_call", call_meta),
             ("hardware_support", budget["hardware_support"]),
         ),
     )
@@ -673,21 +712,26 @@ def lower_decode_offload(
     """Lower Decode Sparse KV Offload (D2H new-token writeback + LIM + H2D miss copy)."""
     opts = budget["options"]
     valid_tokens = sum(v.q_len for v in views)
-    kv_row_bytes = int(budget["kv_row_bytes"])
+    kv_row_bytes = int((budget.get("kv_row_bytes_by_layer") or {}).get(plan.index, budget["kv_row_bytes"]))
     topk_buffer_size = int(budget["topk_buffer_size"])
     miss_rate = float(opts["miss_rate"])
 
     # 1. New decode tokens D2H writeback to shared MemFabric Host DRAM (2 entries/token: k_nope + k_pe).
     d2h_bytes = float(valid_tokens * kv_row_bytes)
     d2h_entries = max(1, 2 * valid_tokens)
+    d2h_call: dict[str, Any] = {
+        "direction": "d2h", "entries": d2h_entries, "tokens": valid_tokens,
+        "payload_bytes": d2h_bytes, "channel_bw_gbps": budget["d2h_effective_bw_gbps"],
+    }
+    if budget.get("d2h_alpha_us") is not None:
+        d2h_call["channel_alpha_us"] = budget["d2h_alpha_us"]
     d2h_id = b.work(
         "memfabric_sparse_copy_d2h", (store_id,), (valid_tokens, plan.cache_row_elements),
         read=d2h_bytes, write=d2h_bytes, family="kv_offload_d2h", dtype=b.model.kv_dtype,
         metadata=(
             ("kernel", "OffloadKVSparseCopyKernel" if d2h_entries >= KV_COPY_MIN_ENTRIES else "OffloadMoeSparseCopyKernel"),
             ("implementation", IMPLEMENTATION),
-            ("memfabric_call", {"direction": "d2h", "entries": d2h_entries, "tokens": valid_tokens,
-                                "payload_bytes": d2h_bytes, "channel_bw_gbps": budget["d2h_effective_bw_gbps"]}),
+            ("memfabric_call", d2h_call),
             ("hardware_support", budget["hardware_support"]),
         ),
     )
@@ -738,14 +782,19 @@ def lower_decode_offload(
     if total_miss_tokens > 0 and not opts["use_fused_overlap"]:
         h2d_entries = 2 * total_miss_tokens
         deps = tuple(dict.fromkeys(x for x in (d2h_id, lim_id) if x))
+        h2d_call: dict[str, Any] = {
+            "direction": "h2d", "entries": h2d_entries, "tokens": total_miss_tokens,
+            "payload_bytes": miss_h2d_bytes, "channel_bw_gbps": budget["h2d_effective_bw_gbps"],
+        }
+        if budget.get("h2d_alpha_us") is not None:
+            h2d_call["channel_alpha_us"] = budget["h2d_alpha_us"]
         h2d_id = b.work(
             "memfabric_sparse_copy_h2d", deps, (total_miss_tokens, plan.cache_row_elements),
             read=miss_h2d_bytes, write=miss_h2d_bytes, family="kv_offload_h2d", dtype=b.model.kv_dtype,
             metadata=(
                 ("kernel", "OffloadKVSparseCopyKernel" if h2d_entries >= KV_COPY_MIN_ENTRIES else "OffloadMoeSparseCopyKernel"),
                 ("implementation", IMPLEMENTATION),
-                ("memfabric_call", {"direction": "h2d", "entries": h2d_entries, "tokens": total_miss_tokens,
-                                    "payload_bytes": miss_h2d_bytes, "channel_bw_gbps": budget["h2d_effective_bw_gbps"]}),
+                ("memfabric_call", h2d_call),
                 ("request_states", tuple(request_states)), ("shared_indexer_reuse", is_shared_indexer_layer),
                 ("skip_topk", is_shared_indexer_layer), ("hardware_support", budget["hardware_support"]),
             ),
@@ -771,7 +820,7 @@ def lower_op(op: OpSpec, **options: Any) -> OpSpec:
     meta = dict(op.metadata)
     recipe_name = op.recipe if op.recipe in recipes() else op.family
     if recipe_name not in recipes():
-        recipe_name = "memfabric_sparse_copy_h2d"
+        raise ModelingError(f"unsupported_sparse_kv_offload_recipe:{recipe_name}")
     call = dict(meta.get("memfabric_call", {}))
     call.setdefault("payload_bytes", float(op.hbm_bytes))
     call.setdefault("entries", max(1, int(op.local_shape[0]) * 2 if op.local_shape else 2))
@@ -781,7 +830,7 @@ def lower_op(op: OpSpec, **options: Any) -> OpSpec:
 
 
 __all__ = [
-    "A5_GVA_CALIBRATION", "HISPARSE_ALIAS", "IMPLEMENTATION", "MEMFABRIC_SOURCE",
+    "HISPARSE_ALIAS", "IMPLEMENTATION", "MEMFABRIC_SOURCE",
     "copy_sfa_pool_capacity", "lower_decode_offload", "lower_op", "lower_prefill_offload",
     "prepare_case", "recipes", "sparse_kv_offload_memory_budget", "strip_case",
 ]

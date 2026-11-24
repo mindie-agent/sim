@@ -508,9 +508,11 @@ def test_mtp_shared_selection_consumes_the_producer_geometry():
     graph = target_graphs(case, phase='decode', tokens=6, context=4, scope='model')[0]
     attention = [op for op in graph if op.recipe.startswith('latent_attention')]
     draft0, draft4 = [next(op for op in attention if op.op_id.startswith(prefix)) for prefix in ('draft0.', 'draft4.')]
-    assert find(graph, recipe='index_topk').op_id == 'draft0.s0.l0.index_topk'
+    draft_topks = [op.op_id for op in graph if op.op_id.startswith('draft') and op.recipe == 'index_topk']
+    assert draft_topks == ['draft0.s0.l0.index_topk']
+    # Ascend V2 MTP step 0 runs q_0=1+5=6 at context=4 -> 5+6+7+8+9+10 = 45 causal rows shared across draft steps.
     for op in (draft0, draft4):
-        assert_fields(dict(op.metadata), indexed_gather_rows=5, selection_index_read_bytes=5 * 4)
+        assert_fields(dict(op.metadata), indexed_gather_rows=45, selection_index_read_bytes=45 * 4)
     assert draft4.flops == pytest.approx(draft0.flops)
 def test_packed_compressor_feeds_the_indexer_from_its_latent_port():
     case = _case('deepseek-v4.1-flash', hardware='a5', layers=3)
@@ -598,9 +600,16 @@ def test_sparse_gqa_topk_writes_int32_ids_and_attention_reads_them():
     topk, attention = nodes['s0.l3.index_topk'], nodes['s0.l3.attention']
     plan = case.model.layer_plans[3]
     heads, kv_heads = (max(1, n // case.runtime.parallel.tp) for n in (plan.num_heads, plan.num_kv_heads))
-    valid, selected = topk.local_shape
+    idx_heads, valid, selected = topk.local_shape
     width = plan.head_dim
-    assert (topk.mte2_bytes, topk.mte3_bytes) == pytest.approx((8193 * 4, valid * selected * 4))
+    # MiniMax Block-MSA (D2 §2.2.1): 3D [H_q_local, Q, K_blk] INT32 IDs + align16(ceil(8193/128)=65)=80 FP32 scores.
+    exp_idx_heads = max(1, plan.index_heads // case.runtime.parallel.tp)
+    assert idx_heads == exp_idx_heads and (valid, selected) == (1, 16)
+    assert topk.mte2_bytes == pytest.approx(idx_heads * valid * 80 * 4)
+    assert dict(topk.metadata)['msa_id_write_bytes'] == pytest.approx(idx_heads * valid * selected * 4)
     kv_sweeps = dict(attention.metadata)['kv_sweeps']
     assert attention.mte2_bytes == pytest.approx(
-        kv_sweeps * cache_format(case.model, 'kv').row_bytes(kv_heads * width * 2) + valid * heads * width * 2 + valid * selected * 4)
+        kv_sweeps * cache_format(case.model, 'kv').row_bytes(kv_heads * width * 2)
+        + valid * heads * width * 2
+        + idx_heads * valid * selected * 4
+    )

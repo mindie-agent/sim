@@ -12,11 +12,11 @@ from collections.abc import Mapping
 from dataclasses import asdict, replace
 
 from mindie_sim.schema.common import ModelingError, dtype_bytes
-from mindie_sim.schema.compute_arch import ComputeArchSpec
 from mindie_sim.schema.datapath import ArchId, ComputeArchIdentity, DatapathCapabilitySpec, GENERIC_ARCH_ID
 from mindie_sim.schema.operators import OpSpec
 from ...collectives import PairwiseCollective
-from ...mechanism import Geometry, OperatorPlan, PlannedRecipe
+from ...mechanism import Geometry, OperatorPlan, PlannedRecipe, Work
+from ...program import KernelProgram, Stage
 from ...results import OpOccurrence
 from ..contracts import OperatorFamilySpec, OperatorPlanningContext, ResolvedOperator
 from . import arch22, arch35
@@ -37,7 +37,6 @@ FIA_RECIPE = "fused_infer_attention_score"
 GBSA_RECIPE = "generic_block_sparse_attention_arch35"
 KV_QUANT_SFA_C8_RECIPE = "kv_quant_sfa_c8_arch35"
 SPARSE_FLASH_MLA_NOPE_RECIPE = "sparse_flash_mla_nope_arch35"
-LEGACY_RECIPES = frozenset({GBSA_RECIPE, KV_QUANT_SFA_C8_RECIPE, SPARSE_FLASH_MLA_NOPE_RECIPE})
 RECIPE_BY_ABI = {
     FIA_ABI: FIA_RECIPE, GBSA_ABI: GBSA_RECIPE, C8_ABI: KV_QUANT_SFA_C8_RECIPE,
     C8_V1_ABI: C8_V1_ABI, SFA_V1_ABI: SFA_V1_ABI,
@@ -95,36 +94,6 @@ def _minimum_contract_io(contract: AttentionContract, dtype: str) -> tuple[float
     return q_bytes + kv_hbm + o_bytes, q_bytes + kv_read, o_bytes, vector_ops
 
 
-def _legacy_contract(op: OpSpec, meta: dict) -> AttentionContract:
-    abi = ABI_BY_RECIPE[op.recipe]
-    if abi == GBSA_ABI:
-        raw = dict(meta.get("gbsa_geometry") or {})
-        q = op.local_shape[0] if op.local_shape else 1
-        heads = op.local_shape[1] if len(op.local_shape) > 1 else 1
-        width = op.local_shape[-1] if op.local_shape else FIA_TILE
-        selected = raw.get("selected_tokens", FIA_TILE)
-        return AttentionContract(
-            raw.get("query_tokens", q), raw.get("num_heads", heads), raw.get("num_kv_heads", 1),
-            raw.get("head_dim", width), raw.get("v_head_dim", raw.get("head_dim", width)),
-            selected_tokens=selected, phase=op.phase, abi=abi,
-            block_size=tuple(raw.get("block_shape") or (1, DEFAULT_GBSA_BLOCK_SIZE))[-1],
-            quant_mode=raw.get("quant_mode", QUANT_MODE_BF16), ssmax=raw.get("ssmax", False),
-            metadata_reuse=raw.get("metadata_reuse", False),
-            batch_size=raw.get("batch_size", q), shared_prefix=raw.get("shared_prefix", False),
-        )
-    raw = dict(meta["sfa_geometry"])
-    latent = raw["kv_lora_rank"]
-    return AttentionContract(
-        raw["query_tokens"], raw["num_heads"], 1, latent + raw["rope_dim"], latent,
-        selected_tokens=raw["selected_tokens"], phase=op.phase, abi=abi,
-        kv_layout="PA_BLK_BSND", quant_mode=raw.get("quant_mode",
-            QUANT_MODE_BF16 if abi == NOPE_ABI else QUANT_MODE_FP8_C8),
-        precompute_scale_addr=raw.get("precompute_scale_addr", True),
-        batch_size=raw.get("batch_size", raw["query_tokens"]),
-        shared_prefix=raw.get("shared_prefix", False),
-    )
-
-
 def _contract(op: OpSpec, requested_abi: str | None) -> AttentionContract:
     meta = dict(op.metadata)
     raw = meta.get("attention_contract")
@@ -141,8 +110,6 @@ def _contract(op: OpSpec, requested_abi: str | None) -> AttentionContract:
                 template[key] = tuple(template[key])
             values["fia_template"] = FiaPanelPlan(**template)
         contract = AttentionContract(**values)
-    elif op.recipe in LEGACY_RECIPES:
-        contract = _legacy_contract(op, meta)
     else:
         raise unmodeled("attention_contract_required", "Bind rank-local Q, KV and selection geometry")
     bindings = (requested_abi, meta.get("native_kind"), ABI_BY_RECIPE.get(op.recipe))
@@ -157,8 +124,6 @@ def _planning_context(op: OpSpec, geometry: Geometry) -> OperatorPlanningContext
     datapath = geometry.datapath
     if datapath is None:
         arch = geometry.compute_arch
-        if arch is None and op.recipe in LEGACY_RECIPES:
-            arch = ComputeArchSpec.from_mapping({"preset": ARCH35})
         if arch is None:
             raise unmodeled("attention_datapath_required", "Bind explicit compute architecture and datapath")
         aics = geometry.compute_units
@@ -183,6 +148,8 @@ def build(op: OpSpec, ctx: OperatorPlanningContext | Geometry, /) -> OperatorPla
     """Build the source-bound attention kernel at either planning entrypoint."""
     if op.recipe == RING_UPDATE_RECIPE:
         return build_ring_update(op, ctx)
+    if op.recipe == GBSA_METADATA_RECIPE:
+        return build_gbsa_metadata(op, ctx.geometry if isinstance(ctx, OperatorPlanningContext) else ctx)
     if isinstance(ctx, Geometry):
         ctx = _planning_context(op, ctx)
     ctx = with_sequence_context(op, ctx)
@@ -190,7 +157,9 @@ def build(op: OpSpec, ctx: OperatorPlanningContext | Geometry, /) -> OperatorPla
     strategy = STRATEGIES.get(ctx.compute_arch.arch_id)
     if strategy is None:
         raise unmodeled("attention_arch_unsupported", f"Bind attention for {ctx.compute_arch.arch_id}")
-    normalized = replace(op, dtype=op.dtype or "bf16", metadata=tuple(sorted({
+    if not op.dtype:
+        raise ModelingError("attention_op_dtype_required")
+    normalized = replace(op, dtype=op.dtype, metadata=tuple(sorted({
         **dict(op.metadata), "attention_contract": contract, "native_kind": contract.abi,
     }.items())))
     plan = strategy.build(normalized, ctx)
@@ -212,6 +181,9 @@ def resolve_operator_plan(op: OpSpec, ctx: OperatorPlanningContext, /) -> Resolv
     if op.recipe == RING_UPDATE_RECIPE:
         plan = build_ring_update(op, ctx)
         return ResolvedOperator(ctx.occurrence, op, plan, RING_UPDATE_RECIPE, RING_UPDATE_SOURCES, None)
+    if op.recipe == GBSA_METADATA_RECIPE:
+        plan = build_gbsa_metadata(op, ctx.geometry)
+        return ResolvedOperator(ctx.occurrence, op, plan, GBSA_METADATA_RECIPE, (), None)
     plan = build(op, ctx)
     descriptor = describe(op, ctx, plan)
     return ResolvedOperator(ctx.occurrence, op, plan, descriptor.implementation, descriptor.sources, descriptor)
@@ -219,8 +191,12 @@ def resolve_operator_plan(op: OpSpec, ctx: OperatorPlanningContext, /) -> Resolv
 
 def register_family() -> OperatorFamilySpec:
     """Declare the governed family's exact owned recipe IDs."""
-    return OperatorFamilySpec("attention", frozenset({"attention", "mla"}),
-                              frozenset((*ABI_BY_RECIPE, RING_UPDATE_RECIPE)), resolve_operator_plan)
+    return OperatorFamilySpec(
+        "attention",
+        frozenset({"attention", "mla", "attention_metadata"}),
+        frozenset((*ABI_BY_RECIPE, RING_UPDATE_RECIPE, GBSA_METADATA_RECIPE)),
+        resolve_operator_plan,
+    )
 
 
 def _kernels(op: OpSpec) -> tuple[OpSpec, ...]:
@@ -234,12 +210,57 @@ def _kernels(op: OpSpec) -> tuple[OpSpec, ...]:
     return (*gathers, kernel, *cp_decode_suffix(op, contract))
 
 
+GBSA_METADATA_RECIPE = "generic_block_sparse_attention_metadata"
+GBSA_METADATA_TOTAL_WORDS = 1024
+GBSA_METADATA_WORD_BYTES = 4
+GBSA_METADATA_OUTPUT_BYTES = GBSA_METADATA_TOTAL_WORDS * GBSA_METADATA_WORD_BYTES
+GBSA_METADATA_SERVICE = "aicpu_metadata_call"
+
+
+def build_gbsa_metadata(op: OpSpec, geometry: Geometry) -> OperatorPlan:
+    """AI_CPU GenericBlockSparseAttentionMetadata plan (CANN fixed 1024 int32 words = 4,096 B)."""
+    meta = dict(op.metadata or ())
+    spec = dict(meta.get("metadata_call") or {})
+    read_bytes = int(spec.get("input_read_bytes", int(round(op.mte2_bytes or 0))))
+    write_bytes = int(spec.get("output_write_bytes", GBSA_METADATA_OUTPUT_BYTES))
+    read = Work(resources={"hbm": read_bytes})
+    write = Work(resources={"hbm": write_bytes})
+    priced = GBSA_METADATA_SERVICE in geometry.resource_units
+    controller = Work(resources={GBSA_METADATA_SERVICE: 1}) if priced else Work()
+
+    def program(context):
+        return KernelProgram((
+            Stage("inputs", context.bind(read)),
+            Stage(
+                "controller",
+                context.bind(controller),
+                after=("inputs",),
+                placement={context.resource_names[GBSA_METADATA_SERVICE]: (0,)} if priced else {},
+            ),
+            Stage("metadata_output", context.bind(write), after=("controller",)),
+        ))
+
+    return OperatorPlan(
+        read + controller + write,
+        program,
+        metadata={
+            "execution_class": "aicpu",
+            "count_boundary": "one_source_native_call_not_ISA",
+            "output_words": GBSA_METADATA_TOTAL_WORDS,
+            "output_bytes": write_bytes,
+            "priced_service_work": {GBSA_METADATA_SERVICE: 1} if priced else {},
+            "unpriced_service_work": {} if priced else {GBSA_METADATA_SERVICE: 1},
+        },
+    )
+
+
 def recipes() -> dict[str, PlannedRecipe | PairwiseCollective]:
     """Expose exact recipe bindings through the existing source-recipe entrypoint."""
     planner = PlannedRecipe(build, _kernels)
     return {
         OUTPUT_LSE_EXCHANGE_RECIPE: PairwiseCollective(),
         RING_UPDATE_RECIPE: PlannedRecipe(build_ring_update),
+        GBSA_METADATA_RECIPE: PlannedRecipe(build_gbsa_metadata),
         **{recipe: planner for recipe in ABI_BY_RECIPE},
     }
 

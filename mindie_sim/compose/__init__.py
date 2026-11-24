@@ -1617,10 +1617,7 @@ def _resolve_mtp_policy(
     aux = getattr(model_spec, "auxiliary", None)
     if aux is not None and getattr(aux, "standalone_draft", False):
         return DEFAULT_MTP_TOKENS, DEFAULT_MTP_ACCEPT, "no_structural_draft"
-    probe_spec = ensure_native_mla_draft(
-        prepare_speculation(model_spec, prof_mtp, allow_synthetic_gqa=False),
-        prof_mtp,
-    )
+    probe_spec = ensure_native_mla_draft(model_spec, prof_mtp)
     probe_aux = getattr(probe_spec, "auxiliary", None)
     has_draft = bool(
         probe_aux is not None
@@ -2011,9 +2008,12 @@ def _assemble_composed_case(
     if moe_comm_mode is not None:
         runtime_meta["moe_comm_mode"] = str(moe_comm_mode)
     if mtp_tokens > 0:
-        runtime_meta["draft_mode"] = (
-            "mtp" if getattr(model_spec.auxiliary, "mtp", None) is not None else "dspark"
-        )
+        mtp_draft = getattr(model_spec.auxiliary, "mtp", None)
+        dspark_draft = getattr(model_spec.auxiliary, "dspark", None)
+        if mtp_draft is not None or dspark_draft is not None:
+            runtime_meta["draft_mode"] = "mtp" if mtp_draft is not None else "dspark"
+        if bool(getattr(mtp_draft, "is_synthetic", False)):
+            runtime_meta["allow_synthetic_gqa_draft"] = True
         runtime_meta["draft_proposal_tokens"] = mtp_tokens
     if runtime_options.get("draft_max_model_len") is not None:
         raw_dml = runtime_options["draft_max_model_len"]

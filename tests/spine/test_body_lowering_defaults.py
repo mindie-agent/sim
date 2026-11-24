@@ -272,14 +272,14 @@ def test_model_scope_moe_mtp_preserves_replica_rows_and_target_completion():
     target_head = next(row for row in report["timeline"] if row["replica"] == 0 and row["family"] == "logits")
     assert next(row for row in report["timeline"] if row["replica"] == 0 and row["recipe"] == "draft_features")["ready_ms"] >= target_head["complete_ms"]
     assert report["execution"]["live_tasks"] == report["execution"]["live_programs"] == 0
-    # Each autoregressive proposal owns six assignments; verification owns 18.
+    # Ascend V2 MTP step 0 reuses target verification shape (1 + K = 3 -> 18 assignments); step 1 uses 1 token (6).
     view = RequestView("verify", 1, 32, True, "decode", draft_proposal_tokens=2); assignments = {}
     for rank in range(8):
         work = Frontend()(IterationPlan((view,) if rank == 0 else ()), parsed.model, parsed.runtime, parsed.machine, global_views=(view,), global_tokens=3, replica=rank)
         for op in work.ops:
             if op.recipe == "balanced_grouped_gate_up":
                 key = op.op_id.split(".")[0]; assignments[key] = assignments.get(key, 0) + sum(dict(op.metadata)["routing_realization"]["local_expert_rows"])
-    assert assignments == {"draft0": 6, "draft1": 6, "s0": 18}
+    assert assignments == {"draft0": 18, "draft1": 6, "s0": 18}
 def test_idle_expert_program_uses_actual_mixed_cohort_phase():
     from mindie_sim.prediction.frontend import Frontend
     from mindie_sim.schema.workload import IterationPlan, RequestView
@@ -425,7 +425,8 @@ def test_plain_body_executes_caller_copies_and_separate_source_programs(sku, que
     result = predict(raw, scope="body", tokens=query, context=128, sequences=2); recipes = [row["recipe"] for row in result["timeline"]]
     assert recipes.count("ascend_causal_conv1d_update") == 1 and recipes.count("ascend_gdn_decode_gating") == 1
     assert recipes.count("decode_q_l2norm") == recipes.count("decode_k_l2norm") == 1
-    assert sum(row["family"] == "tensor_copy" for row in result["timeline"]) == 5
+    # Live A3/A5 captures confirm all 5 fake GDN decode TensorMove ops are absent.
+    assert sum(row["family"] == "tensor_copy" for row in result["timeline"]) == 0
     assert result["execution"]["serviced"]["mte2_aiv@r0:s0"] > 0 and result["execution"]["live_tasks"] == result["execution"]["live_programs"] == 0
     assert result["default_mechanisms"]["selections"][0]["selection"] == "default_installed" and raw == before
 def test_explicit_program_and_unsupported_precision_keep_their_existing_execution():

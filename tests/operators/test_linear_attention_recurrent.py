@@ -10,6 +10,7 @@ from dataclasses import replace
 import json
 import math
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -345,33 +346,48 @@ def intent(owner="layer0", version="v0", requests=("r0", "r1")):
 def test_integer_commits_sum_and_publish_after_acceptance():
     ops = (intent(),)
     views = (view("r0", 6, advanced=3), view("r1", 6, advanced=4))
+    rt_ship = SimpleNamespace(metadata=(("recover_ssm_readiness", "shipping"),))
+    # S4-072: missing readiness fails closed instead of defaulting to shipping/proposed_pr.
+    with pytest.raises(ModelingError, match="recover_ssm_readiness_unresolved"):
+        bind_recover_ssm_commits(
+            ops, views=views, acceptance_events={"r0": "accept0", "r1": "accept1"},
+            state_bindings={"layer0": "base0"}, runtime=None,
+            machine=SimpleNamespace(arch_family="A5"))
     bound = bind_recover_ssm_commits(
         ops, views=views, acceptance_events={"r0": "accept0", "r1": "accept1"},
-        state_bindings={"layer0": "base0"}, runtime=None)
+        state_bindings={"layer0": "base0"}, runtime=rt_ship,
+        machine=SimpleNamespace(arch_family="A5"))
     commit = bound[0]
     assert commit.deps == ("x", "accept0", "accept1", "base0")
     metadata = dict(commit.metadata)
     assert metadata["committed_tokens"] == (("r0", 3), ("r1", 4))
-    assert metadata["published_state_version"] == "v7"
+    assert metadata["published_state_version"] == "v1"
     assert metadata["published_state_version"] != metadata["input_state_version"]
     assert commit.kernel_binding is not None
-    assert commit.kernel_binding.kernel_id == "RecoverSSMStateCommit"
+    assert commit.kernel_binding.kernel_id == "kda_recoverssm_commit"
     assert metadata["acceptance_boundary"] == "sampling_acceptance"
     state = 2 * 4 * 8 * 4
-    assert commit.vector_ops == 4 * 7 * 2 * 4 * 8
+    # Locked GA-09 KDA reverse accumulation: 2 * (sum u_i + N_act) * E = 2 * (7 + 2) * E.
+    assert commit.vector_ops == 2 * (7 + 2) * 2 * 4 * 8
     assert commit.mte2_bytes == pytest.approx(2 * state + 7 * 48.0)
     assert commit.mte3_bytes == pytest.approx(2 * state)
 
 def test_missing_acceptance_duplicate_owner_and_ambiguous_mean_fail():
     views = (view("r0", 6, advanced=3),)
+    a5_mach = SimpleNamespace(arch_family="A5")
+    rt_ship = SimpleNamespace(metadata=(("recover_ssm_readiness", "shipping"),))
     with pytest.raises(ModelingError, match="requires_acceptance_event"):
         bind_recover_ssm_commits((intent(requests=("r0",)),), views=views,
                                  acceptance_events={}, state_bindings={},
-                                 runtime=None)
+                                 runtime=rt_ship, machine=a5_mach)
     with pytest.raises(ModelingError, match="duplicate_commit"):
         bind_recover_ssm_commits((intent(), intent()), views=views,
                                  acceptance_events={"r0": "a"},
-                                 state_bindings={}, runtime=None)
+                                 state_bindings={}, runtime=rt_ship, machine=a5_mach)
+    with pytest.raises(ModelingError, match="recover_ssm_arch_family_required"):
+        bind_recover_ssm_commits((intent(requests=("r0",)),), views=views,
+                                 acceptance_events={"r0": "a"},
+                                 state_bindings={}, runtime=rt_ship)
     ambiguous = view("r0", 6)
     with pytest.raises(ModelingError, match="resolved_integer_advancement"):
         commit_tokens_for_view(ambiguous, Software(mtp_acceptance_length=3.5))
@@ -391,11 +407,13 @@ def test_pending_commit_is_rebound_without_duplication():
                   ("state_owner", "layer0"), ("input_state_version", "v1"),
                   ("heads", 2), ("dk", 4), ("dv", 8),
                   ("record_bytes_per_token", 48.0)))
+    rt_ship = SimpleNamespace(metadata=(("recover_ssm_readiness", "shipping"),))
     bound = bind_recover_ssm_commits(
         (pending,), views=(view("r0", 6, advanced=3),),
-        acceptance_events={"r0": "accept"}, state_bindings={}, runtime=None)
+        acceptance_events={"r0": "accept"}, state_bindings={}, runtime=rt_ship,
+        machine=SimpleNamespace(arch_family="A5"))
     commit, = bound
-    assert commit.deps == ("verify", "accept") and dict(commit.metadata)["published_state_version"] == "v4"
+    assert commit.deps == ("verify", "accept") and dict(commit.metadata)["published_state_version"] == "v2"
     op = intent(requests=("r0",))
     marked, = bind_declared_body_commits((op,), views=(view("r0", 6, advanced=2),))
     assert dict(marked.metadata)["acceptance_boundary"] == "declared_body_input"
@@ -516,7 +534,10 @@ def test_recover_verification_and_commit_cover_exact_abi_prefix(family, gated, w
             assert commit.boundary_checkpoints == tuple(n for n in boundaries if n <= a)
             read, written = state * bool(a), state * (bool(a) + (q > 1 and a > 1))
             records = a * heads * record if q > 1 else 0
-            replay_ops = (4 + (family == "gla")) * a * heads * DK * DV if q > 1 else 0
+            if q > 1 and a > 0 and family in {"gdn", "kda"}:
+                replay_ops = 2 * (a + 1) * heads * DK * DV
+            else:
+                replay_ops = (4 + (family == "gla")) * a * heads * DK * DV if q > 1 else 0
             assert (commit.state_read_bytes, commit.state_write_bytes, commit.record_read_bytes) == (read, written, records)
             assert commit.vector_ops == replay.work.resources.get("vector", 0) == replay_ops
             assert replay.work.resources.get("hbm", 0) == read + written + records + 4 * (q == a == 1)
@@ -552,7 +573,8 @@ def test_partitioned_kda_commit_reloads_key_decay_pair_for_each_value_tile(accep
                       q=4, a=accepted, dk=dim, dv=dim, row_partitions=partitions)
     plan = resolve_operator_plan(op, ctx).recipe
     assert plan.metadata["physical_record_read_bytes"] == accepted * (4 * dim + 6 * partitions * dim)
-    assert plan.work.resources.get("vector", 0) == 4 * accepted * dim**2
+    expected_vec = 2 * (accepted + 1) * dim**2 if accepted else 0
+    assert plan.work.resources.get("vector", 0) == expected_vec
     assert plan.metadata["launch_count"] == 1
     phases = plan.pipeline_spec.phases
     assert phases[0].phase_id == "read_acceptance"
@@ -615,7 +637,7 @@ def test_shard2_verify_lengths_fp32_ub_and_nonzero_compulsory_spec_work():
     from mindie_sim.prediction.operators.kda import kda_recurrent_membase
     from mindie_sim.prediction.operators.linear_attention import call_gdn, gdn_chunk32
     from mindie_sim.prediction.operators.linear_attention.common import (
-        LinearAttentionContract, SYNC_SCRATCH_BYTES, _resolve_recover_ssm_accepted, analyze_state_residency,
+        LinearAttentionContract, SYNC_SCRATCH_BYTES, _resolve_recover_ssm_accepted_per_request, analyze_state_residency,
     )
     from mindie_sim.prediction.operators.vector import gated_activation, ring_update
     from mindie_sim.prediction.structure import parse_case
@@ -651,7 +673,7 @@ def test_shard2_verify_lengths_fp32_ub_and_nonzero_compulsory_spec_work():
         RequestView("r0", 4, 128, True, "decode", draft_proposal_tokens=3, draft_accepted_tokens=2),
         RequestView("r1", 4, 128, True, "decode", draft_proposal_tokens=3, draft_accepted_tokens=3),
     ))
-    assert _resolve_recover_ssm_accepted({"committed_tokens": (("r0", 2), ("r1", 3))}, ctx_acc, 4) == (2, 3)
+    assert _resolve_recover_ssm_accepted_per_request({"committed_tokens": (("r0", 2), ("r1", 3))}, ctx_acc, 4, 2) == (2, 3)
 
     # 3. Non-zero compulsory OpSpec work <= plan.work on gdn_chunk32, call_gdn, kda_membase, ring_update.
     c32_params = {"lengths": (64, 64), "heads": 8, "key_heads": 4, "dk": 128, "dv": 128, "chunk": 32}
@@ -724,3 +746,296 @@ def test_gdn_decode_fp32_decay_record_size_and_mixed_prefill_recover_ssm_runtime
     mixed_work = Frontend()(mixed_plan, case.model, rec_rt, case.machine)
     commit_ops = [op for op in mixed_work.ops if "recover_ssm_commit" in op.op_id]
     assert commit_ops, "mixed prefill+verify batch must emit RecoverSSM commit op"
+
+
+def test_recover_ssm_exact_gdn_kda_align_version_triton_and_kda_decode_parity() -> None:
+    """Exact GDN/KDA RecoverSSM math, align guard, version monotonicity, Triton binding & KDA decode."""
+    from types import SimpleNamespace
+    from mindie_sim.compose import compose_case
+    from mindie_sim.prediction.native_binding import NATIVE_CALL_METADATA_KEY, NativeCallBinding
+    from mindie_sim.prediction.operator_analysis import target_graphs
+    from mindie_sim.prediction.operators.recurrent.recover_ssm_commit import bind_recover_ssm_commits
+    from mindie_sim.prediction.structure import parse_case
+    from mindie_sim.schema.common import ModelingError
+    from mindie_sim.schema.operators import OpSpec
+    from mindie_sim.schema.workload import RequestView
+    from mindie_sim.stacks.vllm_ascend.speculative import validate_fia_speculative_tokens
+
+    views = tuple(
+        RequestView(f"r{i}", 6, 128, True, "decode", draft_verify=True, draft_proposal_tokens=5, draft_advanced_tokens=u)
+        for i, u in enumerate((3, 4, 3, 4))
+    )
+    events = {f"r{i}": "accept" for i in range(4)}
+
+    def _intent(family: str, *, v_tiles: int = 1, kg_dtype: str = "bf16", base_v: str = "v1", pub_v: str | None = None, bounds=None) -> OpSpec:
+        meta = [
+            ("recover_ssm_intent", True), ("state_owner", "layer0"), ("recurrent_attention_kind", family),
+            ("heads", 8), ("dk", 128), ("dv", 128), ("state_dtype", "fp32"), ("v_tiles", v_tiles),
+            ("record_kg_dtype", kg_dtype), ("input_state_version", base_v),
+        ]
+        if pub_v is not None:
+            meta.append(("published_state_version", pub_v))
+        if bounds is not None:
+            meta.append(("recover_ssm_boundaries", bounds))
+        return OpSpec("s0.l0.commit", "elementwise", "decode", 0, 0, tuple(f"r{i}" for i in range(4)), (4,), (4,), (4,), (4,), metadata=tuple(meta))
+
+    rt_a5 = SimpleNamespace(metadata=(("arch_family", "dav_3510"), ("single_spine", {"track_spec": {"track": "proposed_pr", "active_bindings": [{"mechanism_id": "recoverssm_gdn", "state": "proposed_pr"}]}})))
+
+    # (a) GDN: 2*(14+4)*8*128*128 = 4,718,592 ops, 1,028 B/head unique, N_v=2 tiled read adds 516 B/head.
+    gdn_t1, = bind_recover_ssm_commits((_intent("gdn", v_tiles=1),), views=views, acceptance_events=events, state_bindings={"layer0": "prev0"}, runtime=rt_a5)
+    gdn_t2, = bind_recover_ssm_commits((_intent("gdn", v_tiles=2),), views=views, acceptance_events=events, state_bindings={"layer0": "prev0"}, runtime=rt_a5)
+    gm1, gm2 = dict(gdn_t1.metadata), dict(gdn_t2.metadata)
+    assert gdn_t1.vector_ops == pytest.approx(4_718_592) and gm1["record_bytes_per_token"] == pytest.approx(8 * 1028)
+    assert gm2["physical_tiled_record_read_bytes"] - gm1["physical_tiled_record_read_bytes"] == pytest.approx(14 * 8 * 516)
+    assert gdn_t1.kernel_binding is not None and gdn_t1.kernel_binding.backend == "Triton"
+    assert gdn_t1.kernel_binding.kernel_id == "gdn_recoverssm_commit" and gdn_t1.kernel_binding.readiness == "proposed_pr"
+    assert NativeCallBinding.from_metadata(gm1).api["namespace"] == "triton"
+    assert "prev0" in gdn_t1.deps and gm1["published_state_version"] == "v2"
+
+    # Locked GA-09 KDA: 2*(14+4)*8*128*128 = 4,718,592 matrix ops, 1,024 B/head (bf16) vs 1,536 B/head (fp32).
+    kda_bf16, = bind_recover_ssm_commits((_intent("kda", kg_dtype="bf16"),), views=views, acceptance_events=events, state_bindings={"layer0": "prev0"}, runtime=rt_a5)
+    kda_fp32, = bind_recover_ssm_commits((_intent("kda", kg_dtype="fp32"),), views=views, acceptance_events=events, state_bindings={"layer0": "prev0"}, runtime=rt_a5)
+    assert kda_bf16.vector_ops == pytest.approx(4_718_592)
+    assert dict(kda_bf16.metadata)["record_bytes_per_token"] == pytest.approx(8 * 1024)
+    assert dict(kda_fp32.metadata)["record_bytes_per_token"] == pytest.approx(8 * 1536)
+    assert kda_bf16.kernel_binding is not None and kda_bf16.kernel_binding.kernel_id == "kda_recoverssm_commit"
+
+    # (b) qwen3.8-flash-next (H_v=48->6 at TP=8, 36L, u in {3, 4}): mean = 884,736/L, 31,850,496 across 36L.
+    e_q38 = 6 * 128 * 128
+    mean_per_l = 0.5 * (2 * (3 + 1) * e_q38 + 2 * (4 + 1) * e_q38)
+    assert mean_per_l == pytest.approx(884_736) and 36 * mean_per_l == pytest.approx(31_850_496)
+
+    # (c) align same-slot shorter prefix executes + 2*(j+1)*E + S; identical j == u suppresses it.
+    v_one = (RequestView("r0", 6, 128, True, "decode", draft_verify=True, draft_proposal_tokens=5, draft_advanced_tokens=4),)
+    b_short = {"r0": {"boundary_state_idx": 5, "final_state_idx": 5, "boundary_tokens": 2}}
+    b_same = {"r0": {"boundary_state_idx": 5, "final_state_idx": 5, "boundary_tokens": 4}}
+    c_short, = bind_recover_ssm_commits((_intent("gdn", bounds=b_short),), views=v_one, acceptance_events={"r0": "accept"}, state_bindings={"layer0": "p"}, runtime=rt_a5)
+    c_same, = bind_recover_ssm_commits((_intent("gdn", bounds=b_same),), views=v_one, acceptance_events={"r0": "accept"}, state_bindings={"layer0": "p"}, runtime=rt_a5)
+    elem = 8 * 128 * 128
+    assert c_short.vector_ops - c_same.vector_ops == pytest.approx(2 * (2 + 1) * elem)
+    assert c_short.mte3_bytes - c_same.mte3_bytes == pytest.approx(elem * 4)
+
+    # (d) Strict monotonic published_version == base + 1 (rejects <= base AND jumps).
+    for bad_ver in ("v1", "v0", "v3"):
+        with pytest.raises(ModelingError, match="recover_ssm_non_monotonic_state_version"):
+            bind_recover_ssm_commits((_intent("gdn", base_v="v1", pub_v=bad_ver),), views=v_one, acceptance_events={"r0": "accept"}, state_bindings={"layer0": "p"}, runtime=rt_a5)
+
+    # (e) FIA ceiling strict validator: K=15 admits, K=16 rejects.
+    assert validate_fia_speculative_tokens(15) == 15
+    with pytest.raises(ModelingError, match="ascend_fia_speculative_tokens_exceeds_limit"):
+        validate_fia_speculative_tokens(16)
+
+    # (f) KDA decode on A3 BF16 and DCP=2 installs RecurrentKda via body_defaults.
+    for hw, dcp in (("a3", 1), ("a5", 2)):
+        kda_case = parse_case(compose_case("glm-5.3-flash", REPRESENTATIVE_SKUS[hw], tp=2, dp=1, ep=2, dcp=dcp, layers=4, quant="none"))
+        ops = target_graphs(kda_case, phase="decode", tokens=1, context=128, sequences=1, scope="body", apply_body_defaults=True)[0]
+        rec_ops = [op for op in ops if op.family == "recurrent_scan"]
+        assert rec_ops and all(dict(op.metadata).get("native_kind") == "RecurrentKda" for op in rec_ops)
+
+
+def test_recover_ssm_planner_parity_version_chaining_and_gdn_tile_derivation():
+    """Verify G4 planner/frontend parity, asymmetric batch bounds, multi-step version chaining, and auto GDN tiling/align."""
+    from mindie_sim.compose import compose_case
+    from mindie_sim.prediction.capacity import Memory
+    from mindie_sim.prediction.scheduler import Scheduler
+    from mindie_sim.prediction.structure import parse_case
+    from mindie_sim.schema.model import RequestSpec
+    from mindie_sim.schema.operators import OpSpec
+    from mindie_sim.schema.workload import IterationPlan, RequestView
+
+    _, ctx_a3 = sku_planning_context(REPRESENTATIVE_SKUS["a3"], "scan")
+    fe = Frontend()
+
+    # 1. GLM-5.3-Flash consecutive scheduler steps chain layer0:v1 -> v2 -> v3 with planner parity & zero iteration_input dep.
+    raw_glm = compose_case(
+        "glm-5.3-flash", "a3", tp=8, ep=8, dp=1, layers=4,
+        prompt_tokens=128, output_tokens=32, concurrency=2,
+        mtp_proposal_tokens=3, mtp_acceptance_length=2.5,
+    )
+    raw_glm["runtime"]["metadata"] = {**raw_glm["runtime"].get("metadata", {}), "recover_ssm": True, "spec_method": "mtp"}
+    case_glm = parse_case(raw_glm)
+    sched = Scheduler(case_glm, [RequestSpec("r0", 0.0, 128, 32), RequestSpec("r1", 0.0, 128, 32)], Memory(case_glm))
+    sched.schedule(0.0)
+    sched.commit(1.0)
+    plan1 = sched.schedule(2.0)
+    g1 = fe.program(plan1, case_glm.model, case_glm.runtime, case_glm.machine, assembly="service").work
+    c1 = next(op for op in g1.ops if op.recipe == "recover_ssm_commit")
+    assert "iteration_input" not in c1.deps
+    sel1 = resolve_operator_plan(c1, ctx_a3).recipe
+    assert sel1.work.resources.get("vector") == c1.vector_ops
+    assert sel1.metadata["published_version"] == 2
+    assert sel1.metadata["kernel_binding"]["backend"] == "Triton"
+    assert sel1.metadata["kernel_binding"]["kernel_id"] == "kda_recoverssm_commit"
+    sched.commit(3.0)
+    plan2 = sched.schedule(4.0)
+    g2 = fe.program(plan2, case_glm.model, case_glm.runtime, case_glm.machine, assembly="service").work
+    c2 = next(op for op in g2.ops if op.recipe == "recover_ssm_commit")
+    assert dict(c1.metadata)["input_state_version"] == "layer0:v1"
+    assert dict(c1.metadata)["published_state_version"] == "layer0:v2"
+    assert dict(c2.metadata)["input_state_version"] == "layer0:v2"
+    assert dict(c2.metadata)["published_state_version"] == "layer0:v3"
+
+    # 2. Asymmetric verify widths (6, 2) with advancements (4, 2) succeed with exact G4 work 1,048,576.
+    op_asym = OpSpec(
+        op_id="test.asym_commit", family="linear_attention", recipe="recover_ssm_commit",
+        phase="decode", stage=0, layer=0, requests=("r0", "r1"),
+        semantic_shape=(8, 128), padded_shape=(8, 128), launch_shape=(8, 128),
+        local_shape=(8, 128), dtype="bf16",
+        metadata=(
+            ("ssm_family", "kda"), ("dk", 128), ("dv", 128), ("hv", 4),
+            ("sequence_lengths", (6, 2)), ("accepted_per_request", (4, 2)),
+            ("base_version", 1), ("input_state_version", "layer0:v1"), ("state_owner", "layer0"),
+        ),
+    )
+    plan_asym = resolve_operator_plan(op_asym, ctx_a3).recipe
+    assert plan_asym.work.resources["vector"] == 2 * ((4 + 1) + (2 + 1)) * 4 * 128 * 128
+    assert plan_asym.metadata["published_version"] == 2
+
+    # 3. Qwen3.8 TP8 auto-derives BV=64, v_tiles=2 (1,544 B/head/tok) and automatic align_mode boundary crossing.
+    v_q38 = RequestView("r0", 1, 126, True, "decode", draft_verify=True, draft_proposal_tokens=3, draft_advanced_tokens=3, state_slot=1, state_version=1)
+    raw_q38 = compose_case("qwen3.8-flash-next", "a3", tp=8, ep=8, dp=1, layers=4, prompt_tokens=128, output_tokens=32, mtp_proposal_tokens=3)
+    raw_q38["runtime"]["metadata"] = {**raw_q38["runtime"].get("metadata", {}), "recover_ssm": True}
+    c_q38_na = parse_case(raw_q38)
+    na_op = next(op for op in fe.program(IterationPlan((v_q38,)), c_q38_na.model, c_q38_na.runtime, c_q38_na.machine, assembly="service").work.ops if op.recipe == "recover_ssm_commit")
+    na_m = dict(na_op.metadata)
+    assert na_m["num_layers"] == 3 and na_m["gdn_v_tile_width"] == 64 and na_m["v_tiles"] == 2
+    assert na_m["physical_tiled_record_read_bytes"] / (na_m["num_layers"] * na_m["heads"] * sum(na_m["accepted_per_request"])) == pytest.approx(1544.0)
+
+    raw_q38_al = compose_case("qwen3.8-flash-next", "a3", tp=8, ep=8, dp=1, layers=4, prompt_tokens=128, output_tokens=32, mtp_proposal_tokens=3)
+    raw_q38_al["runtime"]["metadata"] = {**raw_q38_al["runtime"].get("metadata", {}), "recover_ssm": True, "mamba_cache_mode": "align", "mamba_block_size": 128}
+    c_q38_al = parse_case(raw_q38_al)
+    al_op = next(op for op in fe.program(IterationPlan((v_q38,)), c_q38_al.model, c_q38_al.runtime, c_q38_al.machine, assembly="service").work.ops if op.recipe == "recover_ssm_commit")
+    al_m = dict(al_op.metadata)
+    assert al_m["align_mode"] is True and al_m["align_boundary_triggered"] == 1
+    assert al_m["gdn_v_tile_width"] == 32 and al_m["v_tiles"] == 4
+    assert al_m["boundary_write_bytes"] == pytest.approx(3 * 6 * 128 * 128 * 4)
+
+
+def test_recover_ssm_bounds_barriers_tiling_and_null_boundary() -> None:
+    """Guarded RecoverSSM invariants: acceptance validation, Option A KDA shared launch, tiling, align & null slots."""
+    from mindie_sim.compose import compose_case
+    from mindie_sim.model_catalog import load_model
+    from mindie_sim.prediction.frontend import Frontend
+    from mindie_sim.prediction.graph_analysis import graph_costs
+    from mindie_sim.prediction.operators.linear_attention.common import (
+        _resolve_recover_ssm_accepted_per_request,
+        _validate_per_request_acceptance,
+    )
+    from mindie_sim.prediction.operators.recurrent.recover_ssm_commit import (
+        _advance_published_version,
+        _evaluate_align_boundaries,
+        compute_recover_ssm_commit_work,
+        resolve_commit_tile_geometry,
+    )
+    from mindie_sim.prediction.structure import parse_case
+    from mindie_sim.schema.case import Software
+    from mindie_sim.schema.common import ModelingError
+    from mindie_sim.schema.operators import OpSpec
+    from mindie_sim.schema.parallel import ParallelSpec
+    from mindie_sim.schema.workload import IterationPlan, RequestView
+
+    _, ctx_a3 = sku_planning_context(REPRESENTATIVE_SKUS["a3"], "scan")
+    _, ctx_a5 = sku_planning_context(REPRESENTATIVE_SKUS["a5"], "scan")
+
+    # 1. Strict acceptance normalization & version monotonicity (no float rounding, empty vector, or scalar overflow).
+    with pytest.raises(ModelingError, match="recover_ssm_acceptance_length_mismatch:3:2"):
+        _validate_per_request_acceptance((4, 3, 6), (4, 4), 4)
+    with pytest.raises(ModelingError, match="recover_ssm_acceptance_length_mismatch:0:2"):
+        _resolve_recover_ssm_accepted_per_request({"accepted_per_request": ()}, ctx_a3, 4, 2, per_req_bounds=(4, 4))
+    with pytest.raises(ModelingError, match="recover_ssm_requires_integer_acceptance"):
+        _resolve_recover_ssm_accepted_per_request({"accepted_tokens": 2.5}, ctx_a3, 4, 2, per_req_bounds=(4, 4))
+    with pytest.raises(ModelingError, match="recover_ssm_acceptance_out_of_range:4:2"):
+        _resolve_recover_ssm_accepted_per_request({"a": 4}, ctx_a3, 6, 2, per_req_bounds=(6, 2))
+    ctx_unexp = SimpleNamespace(requests=(RequestView("r0", 1, 128, True, "decode", draft_proposal_tokens=3, draft_advanced_tokens=2),))
+    assert _resolve_recover_ssm_accepted_per_request({}, ctx_unexp, 4, 1, per_req_bounds=(1,)) == (2,)
+    with pytest.raises(ModelingError, match="recover_ssm_non_monotonic_state_version"):
+        _advance_published_version("v1", "layer0", 0, explicit="v2")
+    with pytest.raises(ModelingError, match="recover_ssm_non_monotonic_state_version"):
+        _advance_published_version("v1", "layer0", 3, explicit="r0:v2,r1:v6", per_request_versions=(("r0", 2), ("r1", 5)), selected=(("r0", 2), ("r1", 1)))
+
+    # 2. Option A KDA shared cross-layer launch on 34-layer GLM-5.3-Flash (A3):
+    #    1 plan + 1 conv_compact + 1 shared commit (num_layers=34, active_owners<=48, arch_family=A3) + 34 publish barriers.
+    base_case = parse_case(compose_case(
+        model="glm-5.3-flash", hardware="a3-16p", tp=8, ep=8,
+        prompt_tokens=128, output_tokens=16, concurrency=2,
+    ))
+    glm = load_model("glm-5.3-flash")
+    rt_glm = Software(
+        parallel=ParallelSpec(tp=8, pp=1, dp=1, ep=8, cp=1),
+        metadata=(
+            ("spec_method", "mtp"),
+            ("draft_proposal_tokens", 3),
+            ("recover_ssm", True),
+            ("single_spine", {"stack_track": "shipping"}),
+        ),
+    )
+    views = (
+        RequestView("r0", 1, 128, True, "decode", draft_verify=True, draft_proposal_tokens=3,
+                    draft_advanced_tokens=2, state_version=2, previous_state_publication="layer0:v2"),
+        RequestView("r1", 1, 128, True, "decode", draft_verify=True, draft_proposal_tokens=3,
+                    draft_advanced_tokens=1, state_version=5, previous_state_publication="layer0:v5"),
+    )
+    ops = Frontend()(IterationPlan(requests=views), glm, rt_glm, base_case.machine).ops
+    barriers = {op.op_id for op in ops if op.op_id.startswith("state_input.")}
+    assert barriers == {"state_input.layer0:v2", "state_input.layer0:v5"}
+    plans = [op for op in ops if op.recipe == "kda_prepare_commit_plan"]
+    convs = [op for op in ops if op.recipe == "kda_compact_conv_state"]
+    commits = [op for op in ops if op.recipe == "recover_ssm_commit"]
+    pubs = [op for op in ops if op.recipe == "recover_ssm_state_publish"]
+    verifies = [op for op in ops if op.recipe not in {"recover_ssm_commit", "kda_prepare_commit_plan"} and "state_input.layer0:v2" in op.deps]
+    assert len(plans) == 1 and len(convs) == 1 and len(commits) == 1 and len(pubs) == 34 and len(verifies) >= 34
+    assert {"state_input.layer0:v2", "state_input.layer0:v5"} <= set(plans[0].deps)
+    assert plans[0].op_id in commits[0].deps and convs[0].op_id in commits[0].deps
+    assert all(commits[0].op_id in p.deps for p in pubs)
+    c0 = dict(commits[0].metadata)
+    assert c0["num_layers"] == 34 and c0["v_tiles"] == 2
+    assert c0["heterogeneous_state_versions"] is True and c0["base_version"] is None
+    assert "r0:v2" in c0["input_state_version"] and "r1:v5" in c0["input_state_version"]
+    assert "r0:v3" in c0["published_state_version"] and "r1:v6" in c0["published_state_version"]
+    assert c0["physical_tiled_record_read_bytes"] == pytest.approx(34 * 36864.0)
+    assert commits[0].kernel_binding is not None and commits[0].kernel_binding.arch_family == "A3"
+    assert commits[0].owner_schedule is not None and commits[0].owner_schedule.active_owners <= 48
+    plan_c0 = resolve_operator_plan(commits[0], ctx_a3).recipe
+    assert plan_c0.metadata["base_version"] is None and plan_c0.metadata["heterogeneous_state_versions"] is True
+    assert plan_c0.work.resources["vector"] == pytest.approx(commits[0].vector_ops)
+    costs = graph_costs(replace(base_case, runtime=rt_glm), ops)
+    assert costs and costs["timeline"]
+
+    # 3. Scalar vs vector governed parity, custom record_bytes_per_token override, and A5 exact total_tokens replay.
+    op_sc = OpSpec(
+        "sc.kda", "linear_attention", "decode", 0, 0, ("r0",), (4, 128), (4, 128), (4, 128), (4, 128),
+        recipe="recover_ssm_commit", dtype="bf16",
+        metadata=(("ssm_family", "kda"), ("dk", 128), ("dv", 128), ("hv", 8), ("sequence_lengths", (4,)), ("a", 2), ("base_version", 1)),
+    )
+    op_vec = replace(op_sc, metadata=tuple((k, (2,) if k == "a" else v) for k, v in op_sc.metadata))
+    p_sc, p_vec = resolve_operator_plan(op_sc, ctx_a3).recipe, resolve_operator_plan(op_vec, ctx_a3).recipe
+    assert p_sc.metadata["physical_record_read_bytes"] == p_vec.metadata["physical_record_read_bytes"] == 24576
+    assert p_sc.metadata["owners"] == p_vec.metadata["owners"] == 16
+    op_ov = OpSpec(
+        "ov.kda", "linear_attention", "decode", 0, 0, ("r0",), (4, 8), (4, 8), (4, 8), (4, 8),
+        recipe="recover_ssm_commit", dtype="bf16",
+        metadata=(("ssm_family", "kda"), ("dk", 4), ("dv", 8), ("hv", 2), ("sequence_lengths", (4,)), ("a", 2), ("v_tiles", 1), ("record_bytes_per_token", 48.0)),
+    )
+    assert resolve_operator_plan(op_ov, ctx_a5).recipe.metadata["physical_record_read_bytes"] == 96
+    op_a5 = OpSpec(
+        "a5.kda", "linear_attention", "decode", 0, 0, ("r0", "r1"), (8, 128), (8, 128), (8, 128), (8, 128),
+        recipe="commit_recurrent_kda", dtype="bf16",
+        metadata=(("ssm_family", "kda"), ("dk", 128), ("dv", 128), ("hv", 8), ("sequence_lengths", (4, 4)), ("accepted_per_request", (2, 1)), ("base_version", 1)),
+    )
+    assert resolve_operator_plan(op_a5, ctx_a5).recipe.metadata["physical_record_read_bytes"] == 30720
+
+    # 4. Exact Triton tile geometry (FP32 UB sizing, ordinary vs align boundary split, A5 GDN grouping) + 2D null block 0 guard.
+    assert resolve_commit_tile_geometry(family_kind="kda", dk=128, dv=128, heads=8, arch_family="a3", align_mode=False) == (64, 2, 8)
+    assert resolve_commit_tile_geometry(family_kind="kda", dk=128, dv=128, heads=8, arch_family="a3", align_mode=True) == (32, 4, 8)
+    assert resolve_commit_tile_geometry(family_kind="gdn", dk=128, dv=128, heads=6, arch_family="a5") == (64, 2, 3)
+    v_cross = RequestView("r0", 4, 126, True, "decode", draft_verify=True, draft_proposal_tokens=3, draft_advanced_tokens=3)
+    ord_s, bnd_s, b_ops, b_bytes, b_cnt = _evaluate_align_boundaries(
+        [("r0", 3)], active_views=(v_cross,), metadata={"mamba_block_table": ((0, 12),), "mamba_block_size": 128},
+        runtime=rt_glm, state_elements=8 * 128 * 128, state_bytes=8 * 128 * 128 * 4, align_mode=True,
+    )
+    assert (ord_s, bnd_s, b_ops, b_bytes, b_cnt) == ([("r0", 3)], [], 0, 0.0, 0)
+    ord_n, bnd_n, _, _, b_cnt_n = _evaluate_align_boundaries(
+        [("r0", 3)], active_views=(v_cross,), metadata={"mamba_block_table": ((11, 12),), "mamba_block_size": 128},
+        runtime=rt_glm, state_elements=8 * 128 * 128, state_bytes=8 * 128 * 128 * 4, align_mode=True,
+    )
+    assert ord_n == [] and bnd_n == [("r0", 3)] and b_cnt_n == 1

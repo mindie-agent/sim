@@ -105,22 +105,77 @@ def emit_commit_op(b: Any, *, name: str, deps: Sequence[str], views: Sequence[An
     gdn = str(attention_kind) == "gdn"
     record_head = (gdn_record_head_bytes(dk, dv) if gdn
                    else record_head_bytes(dk, dv, kg_dtype))
+    layer_idx = int(getattr(plan, "index", 0))
+    owner = f"layer{layer_idx}"
+    state_versions = tuple(
+        (str(view.request_id), int(getattr(view, "state_version", 0) or 0))
+        for view in spec_views
+    )
+    state_slots = tuple(
+        (str(view.request_id), getattr(view, "state_slot", None))
+        for view in spec_views
+    )
+    state_generations = tuple(
+        (str(view.request_id), int(getattr(view, "state_generation", 0) or 0))
+        for view in spec_views
+    )
+    prev_publications = tuple(
+        (str(view.request_id), str(getattr(view, "previous_state_publication", "") or ""))
+        for view in spec_views
+        if str(getattr(view, "previous_state_publication", "") or "")
+    )
+    distinct_vers = sorted({ver for _, ver in state_versions})
+    base_version_num = distinct_vers[0] if len(distinct_vers) == 1 else max(distinct_vers, default=0)
+    per_req_inputs = tuple((req_id, f"{owner}:v{ver}") for req_id, ver in state_versions)
+    input_state_ver = (
+        f"{owner}:v{distinct_vers[0]}"
+        if len(distinct_vers) <= 1
+        else f"{owner}:per_request[" + ",".join(f"{r}:v{v}" for r, v in state_versions) + "]"
+    )
+    pub_deps = tuple(dict.fromkeys(f"state_input.{pub}" for _, pub in prev_publications if pub))
+    verify_dep_set = set(deps)
+    if verify_dep_set and hasattr(b, "ops"):
+        state_stamp = (
+            ("state_owner", owner),
+            ("input_state_version", input_state_ver),
+            ("request_input_state_versions", per_req_inputs),
+            ("request_state_versions", state_versions),
+            ("request_state_slots", state_slots),
+            ("request_state_generations", state_generations),
+            ("previous_state_publications", prev_publications),
+        )
+        for idx, existing in enumerate(b.ops):
+            if existing.op_id in verify_dep_set:
+                merged = dict(existing.metadata)
+                for k_item, v_item in state_stamp:
+                    merged.setdefault(k_item, v_item)
+                new_deps = tuple(dict.fromkeys((*existing.deps, *pub_deps)))
+                b.ops[idx] = replace(existing, deps=new_deps, metadata=tuple(merged.items()))
     geometry = {
         "heads": int(heads), "dk": int(dk), "dv": int(dv),
         "state_dtype": str(state_dtype), "kg_dtype": str(kg_dtype),
         "record_bytes_per_token": int(heads) * record_head,
         "scope": str(getattr(plan, "scope", "target")),
-        "layer": int(getattr(plan, "index", 0)),
+        "layer": layer_idx,
+        "attention_kind": str(attention_kind),
     }
     request_ids = tuple(str(view.request_id) for view in spec_views)
     op_id = b.work(
-        name, tuple(deps), (len(spec_views), int(heads), int(dk), int(dv)),
+        name, tuple(dict.fromkeys((*deps, *pub_deps))), (len(spec_views), int(heads), int(dk), int(dv)),
         flops=0, vector=0, read=0, write=0, family="elementwise",
         metadata=(
             ("recover_ssm", True), ("recover_ssm_intent", True),
             ("recover_ssm_stage", COMMIT_INTENT_STAGE),
             ("recover_ssm_pending_acceptance", True),
             ("recover_ssm_geometry", geometry),
+            ("state_owner", owner),
+            ("input_state_version", input_state_ver),
+            ("request_input_state_versions", per_req_inputs),
+            ("base_version", base_version_num),
+            ("request_state_versions", state_versions),
+            ("request_state_slots", state_slots),
+            ("request_state_generations", state_generations),
+            ("previous_state_publications", prev_publications),
             ("record_bytes_per_token", int(heads) * record_head),
             ("recurrent_attention_kind", str(attention_kind)),
             ("requests", request_ids),
