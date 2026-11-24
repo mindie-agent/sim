@@ -34,6 +34,60 @@ from mindie_sim.schema.common import ModelingError
 
 POLICY_BALANCED = "balanced_expectation"
 POLICY_EXPLICIT = "explicit"
+#: Variance damping factor when redundant EPLB slots mitigate EP rank skew.
+EPLB_VARIANCE_DAMPING = 0.35
+#: Expected maximum of two standard normals (sqrt(2 / pi)).
+ORDER_STAT_M2_Z = math.sqrt(2.0 / math.pi)
+#: Precomputed ln(4 * pi) term in the asymptotic normal maximum order statistic.
+ORDER_STAT_LN_FOUR_PI = math.log(4.0 * math.pi)
+
+
+def _normal_max_order_z(rank_count: int) -> float:
+    """Closed-form expected maximum of ``rank_count`` standard normals."""
+    if rank_count <= 1:
+        return 0.0
+    if rank_count == 2:
+        return ORDER_STAT_M2_Z
+    log_m = math.log(float(rank_count))
+    root = math.sqrt(2.0 * log_m)
+    asymptotic = root - (math.log(log_m) + ORDER_STAT_LN_FOUR_PI) / (2.0 * root)
+    return max(ORDER_STAT_M2_Z, asymptotic)
+
+
+def _straggler_slot_weight_bytes(
+    *,
+    probabilities: Sequence[float],
+    weights: Sequence[float],
+    mean_bytes: float,
+    ep: int,
+    total_rows: float,
+    total_active: float,
+    has_redundant: bool,
+) -> float:
+    """Busiest-rank active-slot cold weight read with >=1 bank floor when active."""
+    max_bytes = float(math.fsum(float(w) for w in weights))
+    if max_bytes <= 0.0:
+        return 0.0
+    mu_act = math.fsum(probabilities)
+    damping = EPLB_VARIANCE_DAMPING if has_redundant else 1.0
+    active_ranks = min(ep, max(1, math.ceil(total_rows - 1e-12)))
+    z_order = _normal_max_order_z(active_ranks)
+    var_act = (
+        math.fsum(p * (1.0 - p) for p in probabilities)
+        * (1.0 - 1.0 / float(max(2, ep)))
+        * damping
+    )
+    sigma_act = math.sqrt(max(0.0, var_act))
+    act_lower = max(1.0, float(math.ceil(total_active / float(ep) - 1e-12)))
+    a_max = min(
+        float(len(probabilities)),
+        max(1.0, float(math.ceil(total_rows - 1e-12))),
+        max(act_lower, mu_act + z_order * sigma_act),
+    )
+    unit_bytes = (
+        mean_bytes / mu_act if mu_act > 0.0 else max_bytes / float(len(probabilities))
+    )
+    return min(max_bytes, a_max * unit_bytes)
 
 
 @dataclass(frozen=True)
@@ -56,18 +110,41 @@ class PhysicalSlotWork:
         """Routed weight bytes read by one rank under this realization."""
         rows = self.per_rank_slot_rows[rank]
         probabilities = self.active_probabilities[rank]
-        if self.slot_weight_bytes:
-            weights = self.slot_weight_bytes[rank]
-            return float(math.fsum(
-                float(weights[index]) * probability
-                for index, probability in enumerate(probabilities)))
         if self.routing_mode == POLICY_EXPLICIT:
+            if self.slot_weight_bytes:
+                weights = self.slot_weight_bytes[rank]
+                return float(math.fsum(
+                    float(weights[index]) * probability
+                    for index, probability in enumerate(probabilities)))
             return float(math.fsum(
                 float(self.packed_weight_bytes[index])
                 for index, value in enumerate(rows) if value > 0))
-        return float(math.fsum(
-            float(self.packed_weight_bytes[index]) * probability
+        weights = (
+            self.slot_weight_bytes[rank]
+            if self.slot_weight_bytes
+            else self.packed_weight_bytes[:len(probabilities)]
+        )
+        mean_bytes = float(math.fsum(
+            float(weights[index]) * probability
             for index, probability in enumerate(probabilities)))
+        ep = len(self.per_rank_slot_rows)
+        total_rows = math.fsum(self.expected_rows_by_rank)
+        if ep <= 1 or self.global_tokens <= 0 or total_rows <= 0.0 or not probabilities:
+            return mean_bytes
+        return _straggler_slot_weight_bytes(
+            probabilities=probabilities,
+            weights=weights,
+            mean_bytes=mean_bytes,
+            ep=ep,
+            total_rows=total_rows,
+            total_active=math.fsum(
+                math.fsum(rank_probs) for rank_probs in self.active_probabilities
+            ),
+            has_redundant=(
+                sum(len(rank_rows) for rank_rows in self.per_rank_slot_rows)
+                > len(self.packed_weight_bytes)
+            ),
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -142,6 +219,14 @@ def _balanced(
             rows[rank][position] += expected
             probabilities[rank][position] = max(probabilities[rank][position], active)
             weight_reads[rank][position] = float(weights[expert])
+    ep = len(probabilities)
+    total_rows = math.fsum(math.fsum(row) for row in rows)
+    active_slots = tuple(
+        max(1, int(round(math.fsum(row))))
+        if (tokens > 0 and total_rows > 0.0 and ep > 1 and row and math.fsum(row) > 0.0)
+        else int(round(math.fsum(row)))
+        for row in probabilities
+    )
     return PhysicalSlotWork(
         tuple(tuple(float(value) for value in row) for row in rows),
         tuple(tuple(float(value) for value in row) for row in probabilities),
@@ -149,7 +234,7 @@ def _balanced(
         tuple(float(value) for value in weights),
         POLICY_BALANCED, int(tokens),
         tuple(float(sum(row)) for row in rows),
-        tuple(int(round(sum(row))) for row in probabilities),
+        active_slots,
         slot_bytes,
     )
 

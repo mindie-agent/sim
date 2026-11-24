@@ -43,6 +43,110 @@ _FULL_EAGER_GROUPED = "full_eager_allocation"
 _ROUTING_INDEX_BYTES = int(dtype_bytes("int32"))
 _RAW_EXPERT_COUNT_BYTES = int(dtype_bytes("int32"))
 _CAST_EXPERT_COUNT_BYTES = int(dtype_bytes("int64"))
+#: Variance damping factor when redundant EPLB or force-EPLB mitigates EP skew.
+EPLB_VARIANCE_DAMPING = 0.35
+#: Expected maximum of two standard normals (sqrt(2 / pi)).
+ORDER_STAT_M2_Z = math.sqrt(2.0 / math.pi)
+#: Precomputed ln(4 * pi) term in the asymptotic normal maximum order statistic.
+ORDER_STAT_LN_FOUR_PI = math.log(4.0 * math.pi)
+
+
+def _normal_max_order_z(rank_count: int) -> float:
+    """Closed-form expected maximum of ``rank_count`` standard normals."""
+    if rank_count <= 1:
+        return 0.0
+    if rank_count == 2:
+        return ORDER_STAT_M2_Z
+    log_m = math.log(float(rank_count))
+    root = math.sqrt(2.0 * log_m)
+    asymptotic = root - (math.log(log_m) + ORDER_STAT_LN_FOUR_PI) / (2.0 * root)
+    return max(ORDER_STAT_M2_Z, asymptotic)
+
+
+def _eplb_damping_active(parallel, runtime=None) -> bool:
+    """True when redundant EPLB or force-EPLB dampens EP rank variance."""
+    if int(getattr(parallel, "redundant_experts_per_rank", 0) or 0) > 0:
+        return True
+    if runtime is None:
+        return False
+    if getattr(runtime, "force_eplb", False) or getattr(runtime, "enable_eplb", False):
+        return True
+    kernels = getattr(runtime, "kernels", None) or {}
+    if isinstance(kernels, Mapping) and kernels.get("force_eplb_source"):
+        return True
+    routing = getattr(runtime, "routing", None) or {}
+    if isinstance(routing, Mapping) and (
+        routing.get("force_eplb")
+        or routing.get("enable_eplb")
+        or routing.get("eplb")
+        or routing.get("expert_slot_map")
+    ):
+        return True
+    meta = dict(getattr(runtime, "metadata", ()) or ())
+    if meta.get("force_eplb") or meta.get("enable_eplb"):
+        return True
+    additional = meta.get("additional_config")
+    if isinstance(additional, Mapping):
+        if additional.get("force_eplb") or additional.get("enable_eplb"):
+            return True
+        eplb_cfg = additional.get("eplb_config")
+        if isinstance(eplb_cfg, Mapping) and (
+            eplb_cfg.get("dynamic_eplb")
+            or int(eplb_cfg.get("num_redundant_experts", 0) or 0) > 0
+        ):
+            return True
+    return False
+
+
+def _straggler_rank_moments(
+    *,
+    tokens: int,
+    top_k: int,
+    num_experts: int,
+    ep: int,
+    total_rows: float,
+    total_active: float,
+    mean_rows: float,
+    local_active: Sequence[float],
+    local_expert_count: int,
+    eplb_damped: bool,
+    pool_experts: int | None = None,
+) -> tuple[float, float]:
+    """Closed-form O(E) order-statistic slowest EP rank rows and active banks."""
+    if tokens <= 0 or top_k <= 0 or total_rows <= 0.0 or local_expert_count <= 0:
+        return 0.0, 0.0
+    if ep <= 1:
+        return mean_rows, math.fsum(local_active)
+    pool = max(1, int(pool_experts if pool_experts is not None else num_experts))
+    variance_scale = EPLB_VARIANCE_DAMPING if eplb_damped else 1.0
+    rank_share = min(1.0, max(0.0, mean_rows / max(1.0, total_rows)))
+    fpc = max(0.0, 1.0 - float(top_k - 1) / float(max(1, pool - 1)))
+    sigma_rows = math.sqrt(max(
+        0.0,
+        total_rows * rank_share * (1.0 - rank_share) * fpc * variance_scale,
+    ))
+    active_ranks = min(ep, max(1, math.ceil(total_rows - 1e-12)))
+    z_order = _normal_max_order_z(active_ranks)
+    row_lower = float(math.ceil(total_rows / float(ep) - 1e-12))
+    row_upper = float(tokens * min(top_k, local_expert_count))
+    r_max = float(min(
+        int(row_upper),
+        max(int(row_lower), int(round(mean_rows + z_order * sigma_rows))),
+    ))
+    mu_act = math.fsum(local_active)
+    var_act = (
+        math.fsum(a * (1.0 - a) for a in local_active)
+        * (1.0 - 1.0 / float(max(2, ep)))
+        * variance_scale
+    )
+    sigma_act = math.sqrt(max(0.0, var_act))
+    act_lower = max(1.0, float(math.ceil(total_active / float(ep) - 1e-12)))
+    a_max = min(
+        float(local_expert_count),
+        r_max,
+        max(act_lower, mu_act + z_order * sigma_act),
+    )
+    return r_max, a_max
 
 
 def _category_format(quant, category):
@@ -152,23 +256,80 @@ class RoutingPolicy:
                           if 0 < inclusion < 1 else float(tokens > 0 and inclusion > 0))
         return tuple(rows), tuple(active)
 
-    def local(self, model, layer, parallel, tokens: int, *, owner=None) -> tuple[float, float]:
+    def local(
+        self, model, layer, parallel, tokens: int, *,
+        owner=None, runtime=None, eplb_damped: bool | None = None,
+        zero_experts: int = 0,
+    ) -> tuple[float, float]:
         rows, active = self.expert_moments(model, layer, tokens)
-        if parallel.ep > len(rows) and len(rows) > 0:
+        num_experts = len(rows)
+        pool_experts = num_experts + max(0, int(zero_experts))
+        if zero_experts > 0 and num_experts > 0:
+            real_share = float(num_experts) / float(pool_experts)
+            rows = tuple(value * real_share for value in rows)
+            scaled_active = []
+            for value in rows:
+                inclusion = (value / float(tokens)) if tokens > 0 else 0.0
+                scaled_active.append(
+                    -math.expm1(float(tokens) * math.log1p(-inclusion))
+                    if 0.0 < inclusion < 1.0
+                    else float(tokens > 0 and inclusion > 0.0)
+                )
+            active = tuple(scaled_active)
+        ep = int(parallel.ep)
+        damped = (
+            _eplb_damping_active(parallel, runtime)
+            if eplb_damped is None else bool(eplb_damped)
+        )
+        total_rows = (
+            math.fsum(rows)
+            if zero_experts > 0
+            else float(max(0, int(tokens)) * int(layer.top_k))
+        )
+        if ep > num_experts and num_experts > 0:
             def copies(expert):
-                return 1 + (parallel.ep - 1 - expert) // len(rows)
-            rank_rows = [rows[r % len(rows)] / copies(r % len(rows)) for r in range(parallel.ep)]
-            slowest = max(range(parallel.ep), key=rank_rows.__getitem__) if owner is None else owner
-            expert_idx = slowest % len(rows)
+                return 1 + (ep - 1 - expert) // num_experts
+            rank_rows = [rows[r % num_experts] / copies(r % num_experts) for r in range(ep)]
+            slowest = max(range(ep), key=rank_rows.__getitem__) if owner is None else owner
+            expert_idx = slowest % num_experts
             replicas = copies(expert_idx)
             inclusion = (rows[expert_idx] / tokens) if tokens > 0 else 0.0
             rep_tokens = tokens / replicas
             act_val = (-math.expm1(rep_tokens * math.log1p(-inclusion))
                        if 0 < inclusion < 1 else float(rep_tokens > 0 and inclusion > 0))
-            return rank_rows[slowest], act_val
-        rank_rows = [math.fsum(rows[index::parallel.ep]) for index in range(parallel.ep)]
-        slowest = max(range(parallel.ep), key=rank_rows.__getitem__) if owner is None else owner
-        return rank_rows[slowest], math.fsum(active[slowest::parallel.ep])
+            if owner is not None or tokens <= 0 or ep <= 1:
+                return rank_rows[slowest], act_val
+            return _straggler_rank_moments(
+                tokens=tokens,
+                top_k=int(layer.top_k),
+                num_experts=num_experts,
+                ep=ep,
+                total_rows=total_rows,
+                total_active=math.fsum(active),
+                mean_rows=rank_rows[slowest],
+                local_active=(act_val,),
+                local_expert_count=1,
+                eplb_damped=damped,
+                pool_experts=pool_experts,
+            )
+        rank_rows = [math.fsum(rows[index::ep]) for index in range(ep)]
+        slowest = max(range(ep), key=rank_rows.__getitem__) if owner is None else owner
+        local_active = active[slowest::ep]
+        if owner is not None or tokens <= 0 or ep <= 1:
+            return rank_rows[slowest], math.fsum(local_active)
+        return _straggler_rank_moments(
+            tokens=tokens,
+            top_k=int(layer.top_k),
+            num_experts=num_experts,
+            ep=ep,
+            total_rows=total_rows,
+            total_active=math.fsum(active),
+            mean_rows=rank_rows[slowest],
+            local_active=local_active,
+            local_expert_count=len(local_active),
+            eplb_damped=damped,
+            pool_experts=pool_experts,
+        )
 
 
 @dataclass(frozen=True)
@@ -395,7 +556,7 @@ class LocalExpertReduce:
             )
         return tuple(metadata.items())
 
-    def prepare(self, routing, model, layer, parallel, tokens, realization):
+    def prepare(self, routing, model, layer, parallel, tokens, realization, *, runtime=None):
         bank = self.local_bank
         if realization is None:
             moments = getattr(routing, "expert_moments", None)
@@ -408,9 +569,24 @@ class LocalExpertReduce:
                               for rank in range(self.ep))
             representative = max(range(self.ep), key=rank_rows.__getitem__)
             bank_rows = tuple(expert_rows[representative * bank:(representative + 1) * bank])
-            local_rows = rank_rows[representative]
-            active = math.fsum(
+            bank_active = tuple(
                 expert_active[representative * bank:(representative + 1) * bank])
+            if tokens > 0 and self.ep > 1:
+                local_rows, active = _straggler_rank_moments(
+                    tokens=tokens,
+                    top_k=int(layer.top_k),
+                    num_experts=self.experts,
+                    ep=self.ep,
+                    total_rows=float(tokens * int(layer.top_k)),
+                    total_active=math.fsum(expert_active),
+                    mean_rows=rank_rows[representative],
+                    local_active=bank_active,
+                    local_expert_count=len(bank_active),
+                    eplb_damped=_eplb_damping_active(parallel, runtime),
+                )
+            else:
+                local_rows = rank_rows[representative]
+                active = math.fsum(bank_active)
             if self.allocated_rows > 0 and local_rows <= 0:
                 raise ModelingError("local_expert_reduce_requires_nonempty_representative_bank")
             metadata = self._metadata(

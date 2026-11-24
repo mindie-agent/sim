@@ -360,7 +360,8 @@ def _route_expert_rows(
         # One replicated source owns the complete token selection; the native
         # ledger is projected onto this rank's contiguous expert bank.
         projected = caller.prepare(
-            routing, model, plan, parallel, routing_group_tokens, routing_realization)
+            routing, model, plan, parallel, routing_group_tokens,
+            routing_realization, runtime=runtime)
         routing_realization = projected.routing_realization
         local_rows, active = projected.local_rows, projected.active
         routing_metadata = projected.routing_metadata
@@ -372,24 +373,27 @@ def _route_expert_rows(
                 # Keep the cohort's integer expert counts; only source ownership
                 # changes from implicit replicated assignment division to TP views.
                 routing_realization = replace(routing_realization, source_partitions=1)
-        local_rows, active = (
-            routing.local(model, plan, parallel, routing_group_tokens, owner=price_owner)
-            if routing_realization is None and price_owner is not None and type(routing) is RoutingPolicy
-            else routing.local(model, plan, parallel, routing_group_tokens)
-            if routing_realization is None
-            else (routing_realization.rows, routing_realization.active))
-        if routing_realization is None and zero_experts > 0 and int(plan.num_experts) > 0:
-            total_experts = int(plan.num_experts) + zero_experts
-            local_rows = float(local_rows) * (float(plan.num_experts) / float(total_experts))
-            if routing_group_tokens > 0 and int(plan.top_k) > 0:
-                p_real = min(1.0, float(plan.top_k) / float(total_experts))
-                per_expert = (
-                    -math.expm1(float(routing_group_tokens) * math.log1p(-p_real))
-                    if 0.0 < p_real < 1.0 else float(p_real > 0.0)
-                )
-                active = float(local_experts) * per_expert
-            else:
-                active = 0.0
+        if routing_realization is None and type(routing) is RoutingPolicy:
+            local_rows, active = routing.local(
+                model, plan, parallel, routing_group_tokens,
+                owner=price_owner, runtime=runtime, zero_experts=zero_experts,
+            )
+        elif routing_realization is None:
+            local_rows, active = routing.local(model, plan, parallel, routing_group_tokens)
+            if zero_experts > 0 and int(plan.num_experts) > 0:
+                total_experts = int(plan.num_experts) + zero_experts
+                local_rows = float(local_rows) * (float(plan.num_experts) / float(total_experts))
+                if routing_group_tokens > 0 and int(plan.top_k) > 0:
+                    p_real = min(1.0, float(plan.top_k) / float(total_experts))
+                    per_expert = (
+                        -math.expm1(float(routing_group_tokens) * math.log1p(-p_real))
+                        if 0.0 < p_real < 1.0 else float(p_real > 0.0)
+                    )
+                    active = float(local_experts) * per_expert
+                else:
+                    active = 0.0
+        else:
+            local_rows, active = routing_realization.rows, routing_realization.active
         routing_metadata = (
             (("routing_basis", "probability_moments"), ("expected_rows", local_rows),
              ("expected_active_experts", active))

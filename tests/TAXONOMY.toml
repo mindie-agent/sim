@@ -439,6 +439,15 @@ owns = [
     "mindie_sim/compose/__init__.py",
     "mindie_sim/compose/inputs.py",
 ]
+[[module]]
+path = "operators/test_stage6b_moe_ep_skew_tiles.py"
+tier = "tier0"
+owns = [
+    "mindie_sim/prediction/operators/moe_transport/moe_callers.py",
+    "mindie_sim/prediction/feedforward.py",
+    "mindie_sim/prediction/operators/grouped_moe/expected_grouped.py",
+    "mindie_sim/prediction/operators/moe_routing/expert_slot_work.py",
+]
 # ---------------------------------------------------------------- spine
 [[module]]
 path = "spine/test_stream_plan.py"

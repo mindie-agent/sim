@@ -39,6 +39,7 @@ from mindie_sim.prediction.operators.moe_routing.moe_gating_fusion import (
     TOPK_NATIVE_KIND,
     _native_gating_dispatch,
 )
+from mindie_sim.prediction.operators.moe_transport.moe_callers import RoutingPolicy
 from mindie_sim.prediction.operators.vector.gated_activation import gated_activation
 from mindie_sim.prediction.sharding import sequence_parallel
 from mindie_sim.prediction.structure import parse_case
@@ -91,11 +92,16 @@ def test_sp_right_padding_excludes_dummy_tokens_from_moe_and_shared_work() -> No
         op for op in ops if op.layer == moe_layer.index and op.op_id.endswith(".shared.gate_up")
     )
     # 4 valid tokens (right-padded to 8 for tp=8 SP): routed rows & shared expert use 4, not 8.
-    expected_routed_rows = 4 * moe_layer.top_k
-    expected_up_flops = (
-        2 * expected_routed_rows * (2 * moe_layer.moe_intermediate_size)
-        * case.model.hidden_size / case.runtime.parallel.ep
+    valid_rows, _ = RoutingPolicy().local(
+        case.model, moe_layer, case.runtime.parallel, 4, runtime=case.runtime,
     )
+    padded_rows, _ = RoutingPolicy().local(
+        case.model, moe_layer, case.runtime.parallel, 8, runtime=case.runtime,
+    )
+    expected_up_flops = (
+        2 * valid_rows * (2 * moe_layer.moe_intermediate_size) * case.model.hidden_size
+    )
+    assert valid_rows < padded_rows
     assert up.flops == pytest.approx(expected_up_flops, rel=1e-2)
     assert shared_up.local_shape[0] == 4
     views = tuple(SimpleNamespace(q_len=1, padding=False) for _ in range(4))
@@ -490,17 +496,25 @@ def test_minimax_index_q_tp_sharding_clamped_swiglu_keypool_pack_and_nextn_norms
 
 def test_mtp_verify_moe_tokens_glm_mean_collapse_minimax_topk_mc2_unpack_and_layer_quant() -> None:
     # 1. MTP target verification counts expanded verification tokens (8) while draft stays at 4.
-    _, mtp_ops = _ops(
+    mtp_case, mtp_ops = _ops(
         "deepseek-v4-flash-0731", hardware="a5", phase="decode", tokens=MTP_VERIFY_TOKENS,
         sequences=MTP_BATCH_SEQUENCES, context=MTP_CONTEXT_LEN, tp=2, ep=2, num_devices=2,
         mtp_proposal_tokens=1, scope="model",
     )
     tgt_mega = next(op for op in mtp_ops if op.recipe == "megamoe_arch35" and not op.op_id.startswith("draft"))
     drf_mega = next(op for op in mtp_ops if op.recipe == "megamoe_arch35" and op.op_id.startswith("draft"))
-    assert tgt_mega.flops == pytest.approx(MTP_TARGET_MEGAMOE_FLOPS)
-    assert dict(tgt_mega.metadata)["megamoe_geometry"]["routed_rows"] == pytest.approx(MTP_TARGET_ASSIGNMENTS)
-    assert drf_mega.flops == pytest.approx(MTP_DRAFT_MEGAMOE_FLOPS)
-    assert dict(drf_mega.metadata)["megamoe_geometry"]["routed_rows"] == pytest.approx(MTP_DRAFT_ASSIGNMENTS)
+    tgt_layer = next(p for p in mtp_case.model.layer_plans if p.index == tgt_mega.layer)
+    tgt_rows, _ = RoutingPolicy().local(
+        mtp_case.model, tgt_layer, mtp_case.runtime.parallel,
+        MTP_VERIFY_TOKENS * MTP_BATCH_SEQUENCES, runtime=mtp_case.runtime,
+    )
+    row_flops = MTP_TARGET_MEGAMOE_FLOPS / MTP_TARGET_ASSIGNMENTS
+    assert tgt_rows >= MTP_TARGET_ASSIGNMENTS
+    assert tgt_mega.flops == pytest.approx(tgt_rows * row_flops)
+    assert dict(tgt_mega.metadata)["megamoe_geometry"]["routed_rows"] == pytest.approx(tgt_rows)
+    drf_rows = dict(drf_mega.metadata)["megamoe_geometry"]["routed_rows"]
+    assert MTP_DRAFT_ASSIGNMENTS <= drf_rows < tgt_rows
+    assert drf_mega.flops == pytest.approx(drf_rows * (MTP_DRAFT_MEGAMOE_FLOPS / MTP_DRAFT_ASSIGNMENTS))
 
     # 2. GLM-5.3-Flash uses parameterless mean stream collapse (0 FLOPs) and omits draft collapse.
     _, glm_ops = _ops(
