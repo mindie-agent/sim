@@ -664,22 +664,241 @@ _TARGET_WIDE_MESH_RANKS = 64
 _WIDE_ALL_TO_ALLV_RANKS = frozenset({16, 32})
 
 
+_CONTENTION_PROBE_BYTES = 1024 * 1024
+_CONTENTION_WINDOW_MS = 1.0
+_CONTENTION_WORLD_SIZE = 2
+_BF16_ELEMENT_BYTES = 2
+_US_PER_MS = 1000.0
+_MS_PER_SECOND = 1000.0
+
+
+def _a5_probe_hardware():
+    """Materialize canonical A5 2-rank hardware + Topology + DirectPeerCollective."""
+    from mindie_sim.backends.ascend import materialize
+    from mindie_sim.prediction.collectives.topology import Topology
+    from mindie_sim.prediction.operators.collectives.direct_peer import DirectPeerCollective
+    from mindie_sim.schema.case import ParallelSpec
+    from mindie_sim.schema.hardware import Hardware
+
+    raw = materialize({"sku": A5_SKU, "num_devices": _CONTENTION_WORLD_SIZE})
+    hw = Hardware.from_mapping(raw)
+    topo = Topology(hw, ParallelSpec(tp=_CONTENTION_WORLD_SIZE))
+    peer = DirectPeerCollective(max_inflight_per_rank=1)
+    return hw, topo, peer
+
+
+def _engine_pipe_slowdown(rate_per_ms: float, contending_util: float) -> float:
+    """Measure discrete-event Engine processor-sharing slowdown on one shared pipe."""
+    from mindie_sim.prediction.runtime.engine import Engine, Resource
+
+    if rate_per_ms <= 0.0 or contending_util <= 0.0:
+        return 1.0
+    probe_work = rate_per_ms * _CONTENTION_WINDOW_MS
+    base_engine = Engine((Resource("pipe", rate_per_ms),))
+    base_ev = base_engine.submit("probe", {"pipe": probe_work})
+    base_engine.advance()
+
+    cont_engine = Engine((Resource("pipe", rate_per_ms),))
+    cont_ev = cont_engine.submit("probe", {"pipe": probe_work})
+    cont_engine.submit("concurrent", {"pipe": contending_util * probe_work})
+    cont_engine.advance()
+    return float(cont_ev.time / base_ev.time) if base_ev.time > 0.0 else 1.0
+
+
+def _engine_link_transfer(hw, topo, peer, payload_bytes: int, hbm_slowdown: float) -> tuple[float, float]:
+    """Price 1-hop DirectPeerCollective transfer and startup sync on canonical Engine + Topology."""
+    from mindie_sim.prediction.runtime.engine import Engine, Resource
+
+    route = topo.route(0, 1)
+    if not route:
+        raise ModelingError("a5_contention_topology_route_missing")
+    link = topo.links[route[0][0]]
+    hop_startup_ms = float(link.latency_us) / _US_PER_MS
+    opts = peer.resolve_transport()
+    extra_hop_ms = float(getattr(opts, "hop_startup_us", 0.0) or 0.0) / _US_PER_MS
+    sync_ms = hop_startup_ms + extra_hop_ms
+    cap_per_ms = float(link.capacity_bytes_per_ms)
+    die = hw.dies[0]
+    hbm_per_ms = float(dict(die.rates).get("hbm", 0.0)) / _MS_PER_SECOND
+    engine = Engine((
+        Resource("link", cap_per_ms),
+        Resource("hbm", hbm_per_ms),
+    ))
+    ev = engine.submit(
+        "direct_peer_transfer",
+        {"link": float(payload_bytes), "hbm": float(payload_bytes)},
+        latency=sync_ms,
+    )
+    if hbm_slowdown > 1.0:
+        engine.submit("hbm_contender", {"hbm": (hbm_slowdown - 1.0) * float(payload_bytes)})
+    engine.advance()
+    transfer_ms = max(0.0, float(ev.time) - sync_ms)
+    return transfer_ms, sync_ms
+
+
 def compute_a5_contention_slowdown(expansion_mode, *, concurrent_cube_util=0.0,
                                    concurrent_vector_util=0.0,
                                    concurrent_mte_util=0.0,
                                    active_aiv_blocks=DEFAULT_ACTIVE_AIV_BLOCKS,
                                    total_aiv_units=DEFAULT_TOTAL_AIV_UNITS):
-    """LEGACY_PURGED: unmeasured contention multipliers prohibited; use Engine + Topology."""
-    raise NotImplementedError(
-        "LEGACY_PURGED: wire discrete-event Engine + Topology + DirectPeerCollective instead of compute_a5_contention_slowdown"
+    """Discrete-event Engine + Topology + DirectPeerCollective contention evaluation."""
+    mode = _mode(expansion_mode)
+    if mode not in _EXPANSION_MODES and mode != "unspecified":
+        raise ModelingError(f"a5_expansion_mode_unknown:{expansion_mode}")
+    for name, value in (("concurrent_cube_util", concurrent_cube_util),
+                        ("concurrent_vector_util", concurrent_vector_util),
+                        ("concurrent_mte_util", concurrent_mte_util)):
+        if isinstance(value, bool) or not math.isfinite(float(value)) or float(value) < 0.0:
+            raise ValueError(f"a5_contention_util_invalid:{name}")
+    if isinstance(total_aiv_units, bool) or int(total_aiv_units) < 1:
+        raise ValueError("a5_contention_requires_positive_total_aiv_units")
+    blocks = max(0, int(active_aiv_blocks))
+    units = max(1, int(total_aiv_units))
+    occupancy = min(1.0, float(blocks) / float(units))
+
+    hw, topo, peer = _a5_probe_hardware()
+    rates = dict(hw.dies[0].rates)
+    cube_peaks = dict(hw.dies[0].compute_peaks)
+    r_vec = float(rates["vector"]) / _MS_PER_SECOND
+    r_mte = float(rates.get("mte2_aiv", rates.get("mte2", 0.0))) / _MS_PER_SECOND
+    r_hbm = float(rates["hbm"]) / _MS_PER_SECOND
+    r_cube = float(cube_peaks.get("bf16", cube_peaks.get("fp16", 1.0))) / _MS_PER_SECOND
+
+    u_cube = float(concurrent_cube_util)
+    u_vec = float(concurrent_vector_util)
+    u_mte = float(concurrent_mte_util)
+
+    vec_load = (u_vec * occupancy) if mode == "aiv" else 0.0
+    vector_slowdown = _engine_pipe_slowdown(r_vec, vec_load)
+    mte_slowdown = _engine_pipe_slowdown(r_mte, u_mte)
+    # Shared HBM bus sees concurrent MTE/vector/cube memory traffic on the same die.
+    hbm_load = u_mte + (u_vec * occupancy if mode == "aiv" else 0.0) + u_cube
+    hbm_slowdown = _engine_pipe_slowdown(r_hbm, hbm_load)
+    cube_slowdown = _engine_pipe_slowdown(r_cube, u_cube)
+    total = max(vector_slowdown, mte_slowdown, hbm_slowdown, cube_slowdown)
+    transfer_ms, sync_ms = _engine_link_transfer(
+        hw, topo, peer, _CONTENTION_PROBE_BYTES, hbm_slowdown,
     )
+    return {
+        "expansion_mode": mode,
+        "vector_slowdown": vector_slowdown,
+        "mte_slowdown": mte_slowdown,
+        "hbm_slowdown": hbm_slowdown,
+        "cube_slowdown": cube_slowdown,
+        "contention_slowdown": total,
+        "total_slowdown": total,
+        "overall_slowdown": total,
+        "vector_alu_slowdown": vector_slowdown,
+        "transfer_latency_ms": transfer_ms,
+        "sync_latency_ms": sync_ms,
+        "transfer_ms": transfer_ms,
+        "sync_ms": sync_ms,
+        "active_aiv_blocks": blocks,
+        "total_aiv_units": units,
+        "aiv_occupancy": occupancy,
+        "evaluation_backend": "discrete_event_engine_topology",
+    }
 
 
 def evaluate_a5_mc2_chains(ingested=None):
-    """LEGACY_PURGED: shadow MC2 contention evaluator prohibited; use Engine + Topology."""
-    raise NotImplementedError(
-        "LEGACY_PURGED: wire discrete-event Engine + Topology + DirectPeerCollective instead of evaluate_a5_mc2_chains"
-    )
+    """Evaluate MC2 chain overlap and Engine + Topology + DirectPeerCollective contention."""
+    data = _data_for(ingested)
+    rows = []
+    for chain in data.get("mc2_chains") or ():
+        dtype = _dtype(chain["dtype"])
+        legs = chain.get("legs_ms") or {}
+        chain_ms = float(chain["chain_p50_ms"])
+        sum_ms = float(chain.get("sum_leg_p50_ms") or sum(legs.values()))
+        if not math.isfinite(sum_ms) or sum_ms <= 0.0:
+            raise ModelingError(f"a5_mc2_chain_nonpositive_sum:{chain.get('condition')}")
+        ratio = chain_ms / sum_ms
+        # Physical concurrent overlap fraction derived solely from measured legs vs chain span:
+        #   overlapped_time / chain_span = max(0, sum_ms - chain_ms) / sum_ms = max(0, 1 - ratio).
+        overlap_util = max(0.0, min(1.0, 1.0 - min(1.0, ratio)))
+        if any(key in chain for key in ("observed_expansion_mode",
+                                        "requested_expansion_mode",
+                                        "profiler_evidence")):
+            mode = resolve_expansion_regime(
+                chain.get("requested_expansion_mode"),
+                chain.get("observed_expansion_mode"),
+                profiler_evidence=chain.get("profiler_evidence"))["regime"]
+        else:
+            mode = _mode(chain.get("regime"))
+        # Leg-attributed utilization shares directly from observed leg durations (zero magic weights).
+        quant_ms = float(legs.get("quant", 0.0) or 0.0)
+        gmm_ms = float(legs.get("grouped_matmul", 0.0) or 0.0)
+        comm_ms = (
+            float(legs.get("all_to_allv_dispatch", 0.0) or 0.0)
+            + float(legs.get("all_to_allv_combine", 0.0) or 0.0)
+        )
+        leg_total = quant_ms + gmm_ms + comm_ms
+        if leg_total > 0.0:
+            vec_share = (quant_ms + comm_ms) / leg_total
+            cube_share = gmm_ms / leg_total
+            mte_share = (quant_ms + comm_ms) / leg_total
+        else:
+            vec_share = cube_share = mte_share = 1.0
+        contention = compute_a5_contention_slowdown(
+            mode,
+            concurrent_cube_util=overlap_util * cube_share,
+            concurrent_vector_util=overlap_util * vec_share,
+            concurrent_mte_util=overlap_util * mte_share,
+        )
+        rows.append({
+            **chain,
+            "dtype": dtype,
+            "chain_p50_ms": chain_ms,
+            "sum_leg_p50_ms": sum_ms,
+            "overlap_ratio": ratio,
+            "chain_over_sum": ratio,
+            "expansion_regime": mode,
+            "contention_degradation_multiplier": contention["contention_slowdown"],
+            "vector_slowdown": contention["vector_slowdown"],
+            "mte_slowdown": contention["mte_slowdown"],
+            "hbm_slowdown": contention["hbm_slowdown"],
+            "contended_chain_ms": chain_ms * contention["contention_slowdown"],
+        })
+    by_dtype = {}
+    for dtype in sorted({row["dtype"] for row in rows}):
+        subset = [row for row in rows if row["dtype"] == dtype]
+        ratios = sorted(row["overlap_ratio"] for row in subset)
+        multipliers = sorted(
+            row["contention_degradation_multiplier"] for row in subset)
+        by_dtype[dtype] = {
+            "count": len(subset),
+            "world_sizes": sorted({row["world_size"] for row in subset}),
+            "campaigns": sorted({row["campaign"] for row in subset}),
+            "overlap_ratio": {"min": ratios[0], "max": ratios[-1],
+                              "median": median(ratios),
+                              "mean": sum(ratios) / len(ratios)},
+            "contention_degradation_multiplier": {
+                "min": multipliers[0], "max": multipliers[-1],
+                "median": median(multipliers)},
+        }
+    quantized = [row for row in rows if row["dtype"] in {"int8", "fp8-e4m3"}]
+    ratios = sorted(row["overlap_ratio"] for row in quantized)
+    all_ratios = sorted(row["overlap_ratio"] for row in rows)
+    multipliers = sorted(
+        row["contention_degradation_multiplier"] for row in quantized)
+    return {
+        "schema": "a5-mc2-chain-evaluation/1",
+        "hardware_key": A5_HARDWARE_KEY,
+        "arch_family": A5_ARCH_FAMILY,
+        "chains": rows,
+        "rows": rows,
+        "dtypes": sorted(by_dtype),
+        "by_dtype": by_dtype,
+        "overlap_ratio": ({"min": ratios[0], "max": ratios[-1],
+                           "median": median(ratios),
+                           "mean": sum(ratios) / len(ratios)} if ratios else {}),
+        "all_overlap_ratio": (
+            {"min": all_ratios[0], "max": all_ratios[-1],
+             "median": median(all_ratios),
+             "mean": sum(all_ratios) / len(all_ratios)} if all_ratios else {}),
+        "contention_degradation": (
+            {"min": multipliers[0], "max": multipliers[-1],
+             "median": median(multipliers)} if multipliers else {}),
+    }
 
 
 class _ManifestCell(dict):

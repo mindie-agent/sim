@@ -37,7 +37,6 @@ ALGORITHM_LADDER_RANK: Mapping[str, int] = {
 DEFAULT_POOL_GRANULE_BYTES = 32
 DEFAULT_INST_BLOCK_DIM = 16
 DEFAULT_L2_GRANULE_BYTES = 128
-DEFAULT_SIMT_UB_CARVEOUT_BYTES = 16 * 1024
 AIV_UPCAST_BYTES_PER_ELEM = 4
 CHECKED_POOLS = ("ub", "l1", "l0a", "l0b", "l0c", "l2", "bt", "fb", "ssbuffer")
 _POOL_ALIASES = {"bias_table": "bt", "fixpipe_buffer": "fb"}
@@ -332,11 +331,16 @@ def _available_pool_capacity(
         return g * (avail // (g * max(1, spec.active_l2_streams)))
     if pool == "ub" and uses_simt:
         dp = getattr(hw, "datapath", None)
-        hw_carveout = max(
-            int(getattr(hw, "simt_ub_carveout_bytes", 0) or 0),
-            int(getattr(dp, "simt_ub_carveout_bytes", 0) or 0) if dp is not None else 0,
-        )
-        carveout = max(int(spec.simt_ub_carveout_bytes), hw_carveout, DEFAULT_SIMT_UB_CARVEOUT_BYTES)
+        hw_carveout = int(getattr(hw, "simt_ub_carveout_bytes", 0) or 0)
+        spec_carveout = int(spec.simt_ub_carveout_bytes)
+        if (dp is not None and hasattr(dp, "usable_bytes")
+                and "ub" in dict(getattr(dp, "buffers", {}) or {})):
+            dp_usable = int(dp.usable_bytes("ub", kernel={"simt": True}))
+            dp_carveout = int(getattr(dp, "simt_ub_carveout_bytes", 0) or 0)
+            extra_carveout = max(0, max(spec_carveout, hw_carveout) - dp_carveout)
+            base_usable = min(dp_usable, max(0, raw_cap - dp_carveout))
+            return max(0, base_usable - extra_carveout)
+        carveout = max(spec_carveout, hw_carveout)
         return max(0, raw_cap - carveout)
     return max(0, raw_cap)
 
@@ -533,7 +537,6 @@ __all__ = [
     "CHECKED_POOLS",
     "DEFAULT_INST_BLOCK_DIM",
     "DEFAULT_POOL_GRANULE_BYTES",
-    "DEFAULT_SIMT_UB_CARVEOUT_BYTES",
     "LiveBufferSpec",
     "OwnerPoolPeak",
     "SubtileWaveSpec",

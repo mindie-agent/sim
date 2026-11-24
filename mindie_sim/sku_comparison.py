@@ -220,18 +220,40 @@ def compare_skus(
     base_kwargs = _compose_kwargs(model, compose_options)
     if quant is not None:
         base_kwargs["quant"] = quant
+    from .schema.common import ModelingError
+
     resolved: list[tuple[str, dict[str, Any]]] = []
     for spec in skus:
         label = _resolve_sku_label(spec)
         if isinstance(spec, str):
             hardware_target: Any = spec
-        else:
+        elif isinstance(spec, Mapping):
             base_hw = spec.get("base_hardware")
-            if not base_hw:
-                raise NotImplementedError(
-                    "LEGACY_PURGED: wire explicit HardwareSpec mapping in sku_comparison without silent 'a5' fallback"
+            has_inline_hw = (
+                ("device" in spec and "links" in spec)
+                or any(k in spec for k in (
+                    "archetype", "hbm_gb", "hbm_bw_gbps", "cube_fp16_tflops",
+                ))
+            )
+            if base_hw:
+                extras = {
+                    k: v for k, v in spec.items()
+                    if k not in {"name", "base_hardware"}
+                }
+                if extras:
+                    hardware_target = {**extras, "sku": str(spec.get("sku") or base_hw)}
+                else:
+                    hardware_target = str(base_hw)
+            elif spec.get("sku") or has_inline_hw:
+                hardware_target = dict(spec)
+                if not hardware_target.get("sku"):
+                    hardware_target["sku"] = str(spec.get("name") or "CUSTOM_INLINE_SKU")
+            else:
+                raise ModelingError(
+                    f"sku_comparison_hardware_spec_missing:{label}"
                 )
-            hardware_target = str(base_hw)
+        else:
+            raise ModelingError(f"sku_comparison_invalid_spec:{spec!r}")
         composed = compose_case(hardware=hardware_target, **base_kwargs)
         resolved.append((label, composed))
     geometry = _workload_geometry(parse_case(resolved[0][1]), context=context,
@@ -241,10 +263,9 @@ def compare_skus(
                  else list(DEFAULT_SLA_SCENARIOS))
     has_sla = sla_ms is not None and float(sla_ms) > 0.0
     per_sku_tasks = len(resolved) if has_sla else 0
-    work_units = max(1, per_sku_tasks * max(1, len(scenarios))) + len(resolved)
+    work_units = max(1, per_sku_tasks * max(1, len(scenarios)) + len(resolved))
     workers = runtime_advisor.resolve_jobs(
-        jobs, task_count=max(1, per_sku_tasks * max(1, len(scenarios))
-                             + len(resolved)),
+        jobs, task_count=work_units,
         per_worker_ram_gib=PER_WORKER_RAM_GIB)
     if emit_advisory:
         runtime_advisor.emit_heavy_run_notice(

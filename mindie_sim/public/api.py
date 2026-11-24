@@ -60,6 +60,7 @@ from .api_support import (
     _ops,
     _ops_replay,
     _profile,
+    _profile_environment,
     _provider,
     _report,
     _require_schema,
@@ -104,20 +105,19 @@ def simulate_operator(case: Any, ops: Any, *, extensions: Any = None,
             built_ops, capability="operator", entry="simulate_operator",
             allow_unbound_formula=allow_unbound, has_bound_provider=False,
         )
-        if environment is not None:
+        active_env = environment or (
+            _profile_environment(case, built_ops)
+            if selected_profile is not None else None
+        )
+        if active_env is not None:
             return _core(
-                "operator", "simulate_operator", lambda: environment.operator_report(
+                "operator", "simulate_operator", lambda: active_env.operator_report(
                     _ops(built_ops), profile=selected_profile,
                     service_id=service_id,
                     input_ready_ms=merged.get("input_ready_ms", 0),
                     recipes=merged.get("recipes"),
                     replica=merged.get("replica", 0)),
                 affected_results=affected, minimal_replay_input=replay)
-        if selected_profile is not None:
-            raise NotImplementedError(
-                "LEGACY_PURGED: wire unified ExecutionEnvironment profile binding "
-                "in public/api.py:simulate_operator (S7-SG-05)"
-            )
         recipes = merged.get("recipes")
         call_kwargs = dict(merged)
         call_kwargs.pop("recipes", None)
@@ -137,7 +137,11 @@ def simulate_operator(case: Any, ops: Any, *, extensions: Any = None,
         return dict(_check_operator(_invoke(
             handler, context, case=environment or case, ops=ops,
             **profile_kwargs, **kwargs)))
-    if environment is not None:
+    active_env = environment or (
+        _profile_environment(case, ops)
+        if selected_profile is not None else None
+    )
+    if active_env is not None:
         input_ready_ms = kwargs.pop("input_ready_ms", 0)
         recipes = kwargs.pop("recipes", None)
         replica = kwargs.pop("replica", 0)
@@ -146,15 +150,10 @@ def simulate_operator(case: Any, ops: Any, *, extensions: Any = None,
                 "standalone_operator_unsupported_keywords:"
                 + ",".join(sorted(kwargs)))
         return _core(
-            "operator", "simulate_operator", lambda: environment.operator_report(
+            "operator", "simulate_operator", lambda: active_env.operator_report(
                 _ops(ops), profile=selected_profile, service_id=service_id,
                 input_ready_ms=input_ready_ms, recipes=recipes, replica=replica),
             affected_results=affected, minimal_replay_input=replay)
-    if selected_profile is not None:
-        raise NotImplementedError(
-            "LEGACY_PURGED: wire unified ExecutionEnvironment profile binding "
-            "in public/api.py:simulate_operator (S7-SG-05)"
-        )
     return _core(
         "operator", "simulate_operator", lambda: operator_costs(case, ops, **kwargs),
         affected_results=affected, minimal_replay_input=replay)
@@ -187,7 +186,11 @@ def simulate_native_call(case: Any, ops: Any, *, extensions: Any = None,
             built_ops, capability="native", entry="simulate_native_call",
             allow_unbound_formula=allow_unbound, has_bound_provider=False,
         )
-        if environment is not None:
+        active_env = environment or (
+            _profile_environment(case, built_ops)
+            if selected_profile is not None else None
+        )
+        if active_env is not None:
             options = dict(merged)
             input_ready_ms = options.pop("input_ready_ms", 0)
             recipes = options.pop("recipes", None)
@@ -200,16 +203,11 @@ def simulate_native_call(case: Any, ops: Any, *, extensions: Any = None,
                     + ",".join(sorted(outside)))
             return _core(
                 "native", "simulate_native_call",
-                lambda: environment.call_report(
+                lambda: active_env.call_report(
                     _ops(built_ops), profile=selected_profile,
                     service_id=service_id, input_ready_ms=input_ready_ms,
                     recipes=recipes, replica=replica, **options),
                 affected_results=affected, minimal_replay_input=replay)
-        if selected_profile is not None:
-            raise NotImplementedError(
-                "LEGACY_PURGED: wire unified ExecutionEnvironment profile binding "
-                "in public/api.py:simulate_native_call (S7-SG-05)"
-            )
         recipes = merged.get("recipes")
         call_kwargs = dict(merged)
         call_kwargs.pop("recipes", None)
@@ -230,7 +228,11 @@ def simulate_native_call(case: Any, ops: Any, *, extensions: Any = None,
             handler, context, case=environment or case, ops=ops,
             **profile_kwargs, **kwargs),
             capability="native", schema="mindie-sim.call-costs/1"))
-    if environment is not None:
+    active_env = environment or (
+        _profile_environment(case, ops)
+        if selected_profile is not None else None
+    )
+    if active_env is not None:
         input_ready_ms = kwargs.pop("input_ready_ms", 0)
         recipes = kwargs.pop("recipes", None)
         replica = kwargs.pop("replica", 0)
@@ -240,16 +242,11 @@ def simulate_native_call(case: Any, ops: Any, *, extensions: Any = None,
                 "standalone_native_unsupported_keywords:"
                 + ",".join(sorted(outside)))
         return _core(
-            "native", "simulate_native_call", lambda: environment.call_report(
+            "native", "simulate_native_call", lambda: active_env.call_report(
                 _ops(ops), profile=selected_profile, service_id=service_id,
                 input_ready_ms=input_ready_ms, recipes=recipes,
                 replica=replica, **kwargs),
             affected_results=affected, minimal_replay_input=replay)
-    if selected_profile is not None:
-        raise NotImplementedError(
-            "LEGACY_PURGED: wire unified ExecutionEnvironment profile binding "
-            "in public/api.py:simulate_native_call (S7-SG-05)"
-        )
     return _core(
         "native", "simulate_native_call", lambda: call_costs(case, ops, **kwargs),
         affected_results=affected, minimal_replay_input=replay)
@@ -331,9 +328,13 @@ def simulate_graph(case: Any, ops: Any, *, extensions: Any = None,
             built_ops, capability="graph", entry="simulate_graph",
             allow_unbound_formula=allow_unbound, has_bound_provider=False,
         )
-        if environment is not None:
+        active_env = environment or (
+            _profile_environment(case, built_ops)
+            if selected_profile is not None else None
+        )
+        if active_env is not None:
             return _core(
-                "graph", "simulate_graph", lambda: environment.graph_report(
+                "graph", "simulate_graph", lambda: active_env.graph_report(
                     _ops(built_ops), profile=selected_profile,
                     service_id=service_id,
                     input_ready_ms=merged.get("input_ready_ms", 0),
@@ -342,11 +343,6 @@ def simulate_graph(case: Any, ops: Any, *, extensions: Any = None,
                     replica=merged.get("replica", 0),
                     recipes=merged.get("recipes")),
                 affected_results=affected, minimal_replay_input=replay)
-        if selected_profile is not None:
-            raise NotImplementedError(
-                "LEGACY_PURGED: wire unified ExecutionEnvironment profile binding "
-                "in public/api.py:simulate_graph (S7-SG-05)"
-            )
         recipes = merged.get("recipes")
         call_kwargs = dict(merged)
         call_kwargs.pop("recipes", None)
@@ -367,7 +363,11 @@ def simulate_graph(case: Any, ops: Any, *, extensions: Any = None,
         return dict(_check_graph(_invoke(
             handler, context, case=environment or case, ops=ops,
             **profile_kwargs, **kwargs)))
-    if environment is not None:
+    active_env = environment or (
+        _profile_environment(case, ops)
+        if selected_profile is not None else None
+    )
+    if active_env is not None:
         input_ready_ms = kwargs.pop("input_ready_ms", 0)
         external_inputs = kwargs.pop("external_inputs", None)
         execution = kwargs.pop("execution", None)
@@ -378,16 +378,11 @@ def simulate_graph(case: Any, ops: Any, *, extensions: Any = None,
                 "standalone_graph_unsupported_keywords:"
                 + ",".join(sorted(kwargs)))
         return _core(
-            "graph", "simulate_graph", lambda: environment.graph_report(
+            "graph", "simulate_graph", lambda: active_env.graph_report(
                 _ops(ops), profile=selected_profile, service_id=service_id,
                 input_ready_ms=input_ready_ms, external_inputs=external_inputs,
                 execution=execution, replica=replica, recipes=recipes),
             affected_results=affected, minimal_replay_input=replay)
-    if selected_profile is not None:
-        raise NotImplementedError(
-            "LEGACY_PURGED: wire unified ExecutionEnvironment profile binding "
-            "in public/api.py:simulate_graph (S7-SG-05)"
-        )
     return _core(
         "graph", "simulate_graph", lambda: graph_costs(case, ops, **kwargs),
         affected_results=affected, minimal_replay_input=replay)

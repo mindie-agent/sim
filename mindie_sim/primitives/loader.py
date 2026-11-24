@@ -454,9 +454,9 @@ def resolve_sim_rate_overlay(
             if per_aic is None:
                 gaps.append(f"P06_mmad:{mode}")
                 continue
-            peak = per_aic * aic
+            peak = _cap_cube_peak(datapath, mode, per_aic * aic)
             for dt in dtypes:
-                peaks_map[dt] = _cap_cube_peak(datapath, dt, peak)
+                peaks_map[dt] = peak
     return CalibratedRateOverlay(
         sku=table.sku,
         cann_version=table.cann_version,

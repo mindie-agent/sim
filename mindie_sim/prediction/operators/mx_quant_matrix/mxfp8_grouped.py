@@ -255,17 +255,21 @@ SWIGLU_MX_STAGES = ("load_gate_up", "swiglu_amax_ue8m0",
 
 
 def _a5_row_wave(geometry) -> bool:
-    """Gate A5 row wave strictly on canonical ComputeArch.arch_id (no vector>=64 sniffing)."""
+    """Gate A5 row wave strictly on canonical ComputeArch / PrimitiveTable (no vector>=64 sniffing)."""
     compute_arch = getattr(geometry, "compute_arch", None)
     if compute_arch is None:
         compute_arch = getattr(getattr(geometry, "datapath", None), "compute_arch", None)
-    arch_id = str(getattr(compute_arch, "arch_id", "") or "").strip().lower()
-    preset = str(getattr(compute_arch, "preset", "") or "").strip().lower()
-    if not arch_id and not preset:
-        raise NotImplementedError(
-            "LEGACY_PURGED: wire explicit geometry.compute_arch.arch_id in mxfp8_grouped._a5_row_wave"
-        )
-    return arch_id in {"arch35", "dav_3510", "npu_arch_3510"} or preset == "npu_arch_3510"
+    if compute_arch is not None:
+        arch_id = str(getattr(compute_arch, "arch_id", "") or "").strip().lower()
+        preset = str(getattr(compute_arch, "preset", "") or "").strip().lower()
+        if arch_id or preset:
+            return arch_id in {"arch35", "dav_3510", "npu_arch_3510"} or preset == "npu_arch_3510"
+    pt = getattr(geometry, "primitive_table", None)
+    if pt is not None:
+        arch = str(getattr(pt, "arch_preset", "") or "").strip().lower()
+        if arch:
+            return arch == "npu_arch_3510"
+    return False
 
 
 def _mx_group32(op) -> bool:
@@ -276,15 +280,82 @@ def _mx_group32(op) -> bool:
     return group == SWIGLU_MX_GROUP and scale in {"fp8_e8m0", "e8m0"}
 
 
+def _swiglu_mx_setup_ms(context) -> float:
+    """Calibrated AIV dispatch + MTE/flag setup strictly from bound PrimitiveTable."""
+    if getattr(context, "primitive_table", None) is None:
+        return 0.0
+    from mindie_sim.prediction.operators.matrix.matrix_mapping_owners import _primitive_band_ms
+
+    return (
+        _primitive_band_ms(context, "P15_rts_stars", "aiv_first_issue_ns")
+        + _primitive_band_ms(context, "P12_intracore_flag", "flag_mte2_v_ns")
+        + _primitive_band_ms(context, "P12_intracore_flag", "flag_v_mte3_ns")
+    )
+
+
 def build_swiglu_mx_quant(op, geometry):
-    """A5 group-32 row program; otherwise the registered Class D quantize plan."""
-    from mindie_sim.prediction.physical_recipe_base import build_plan
+    """A5 group-32 row program priced from PrimitiveTable + exact UB/vector work."""
+    from mindie_sim.prediction.mechanism import OperatorPlan, Work
+    from mindie_sim.prediction.physical_recipe_base import build_plan, work_from_op
+    from mindie_sim.prediction.program import KernelProgram, PipelineProgram, Stage
     from mindie_sim.prediction.operators.vector.vector_pipeline import AIVTiledVectorAndGatherRecipe
+
     if not (_a5_row_wave(geometry) and _mx_group32(op)):
         return build_plan(AIVTiledVectorAndGatherRecipe(), op, geometry)
-    raise NotImplementedError(
-        "LEGACY_PURGED: wire calibrated PrimitiveTable rates + exact UB/vector work in build_swiglu_mx_quant instead of SWIGLU_MX_PROLOGUE_DRAIN_CYCLES=4538"
-    )
+    base = work_from_op(op)
+    rows = int(op.local_shape[0])
+    read = float(op.mte2_bytes)
+    write = float(op.mte3_bytes)
+    vector = float(op.vector_ops)
+    waves = max(1, -(-rows // SWIGLU_MX_AIV_UNITS))
+
+    def program(context):
+        multi_wave = rows >= SWIGLU_MX_AIV_UNITS
+        read_role = "mte2"
+        if multi_wave and context.service_rate("mte2_aiv_dram") is not None:
+            read_role = "mte2_aiv_dram"
+        placement = context.owned(0, 1, ("mte2_aiv", "vector", "mte3"))
+
+        def tile(index):
+            start = index * SWIGLU_MX_AIV_UNITS
+            covered = min(SWIGLU_MX_AIV_UNITS, rows - start)
+            scale = covered / rows
+            load = read * scale
+            store = write * scale
+            compute = vector * scale
+            return (
+                Stage("load_gate_up", context.bind(Work(
+                    resources={"hbm": load, read_role: load})),
+                    placement=placement, previous=("store_payload_scale",)),
+                Stage("swiglu_amax_ue8m0", context.bind(Work(
+                    resources={"vector": compute})),
+                    after=("load_gate_up",), placement=placement),
+                Stage("store_payload_scale", context.bind(Work(
+                    resources={"hbm": store, "mte3": store})),
+                    after=("swiglu_amax_ue8m0",), placement=placement),
+            )
+
+        setup_ms = float(context.setup_ms or 0.0) + _swiglu_mx_setup_ms(context)
+        if setup_ms > 0.0:
+            return KernelProgram((
+                Stage("kernel_setup", latency=setup_ms),
+                Stage("row_tiles", after=("kernel_setup",),
+                      program=PipelineProgram(waves, 2, tile)),
+            ))
+        return KernelProgram((
+            Stage("row_tiles", program=PipelineProgram(waves, 2, tile)),
+        ))
+
+    return OperatorPlan(base, program, {
+        "fused_kernel": "npu_swiglu_mx_quant",
+        "row_tiles": waves,
+        "row_program": {
+            "aiv_units": SWIGLU_MX_AIV_UNITS,
+            "group_size": SWIGLU_MX_GROUP,
+            "stages": SWIGLU_MX_STAGES,
+            "setup_source": "primitive_table",
+        },
+    })
 
 
 @dataclass(frozen=True)

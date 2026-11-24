@@ -115,6 +115,20 @@ def _gemma4_norm_terms(plan: LayerPlan, model: ModelSpec) -> list[WeightTerm]:
     return terms
 
 
+_SANDWICH_NORM_MIN_COUNT = 4
+
+
+def _has_sandwich_norm(plan: LayerPlan, model: ModelSpec) -> bool:
+    if bool(getattr(plan, "has_sandwich_norm", False)):
+        return True
+    facts = dict(getattr(model, "catalog_facts", ()) or ())
+    norm_cfg = facts.get("normalization")
+    return (
+        isinstance(norm_cfg, Mapping)
+        and int(norm_cfg.get("norms_per_layer", 0) or 0) >= _SANDWICH_NORM_MIN_COUNT
+    )
+
+
 def _norm_terms(plan: LayerPlan, model: ModelSpec) -> list[WeightTerm]:
     h = model.hidden_size
     terms = ([] if plan.hc_lowrank > 0 else
@@ -130,7 +144,7 @@ def _norm_terms(plan: LayerPlan, model: ModelSpec) -> list[WeightTerm]:
             terms.append(_t("k_norm", plan.head_dim, 1, "norm"))
     elif plan.attention == "gdn":
         terms.append(_t("gdn_norm", plan.linear_head_dim, 1, "norm"))
-    if plan.architecture == "gemma4":
+    if _has_sandwich_norm(plan, model):
         terms.extend(_gemma4_norm_terms(plan, model))
     if plan.residual_block_size:
         terms.extend([
@@ -207,9 +221,11 @@ def _indexer_terms(plan: LayerPlan, model: ModelSpec) -> list[WeightTerm]:
     if plan.index_heads <= 0 or plan.index_dim <= 0:
         raise ModelingError(f"indexer_dimensions_missing:{plan.index}")
     if plan.attention == "gqa" and plan.index_kpool > 1:
-        raise NotImplementedError(
-            "LEGACY_PURGED: wire structural LayerPlan.indexer_kind dispatch in catalog/weight_layer_terms.py (AG014)"
-        )
+        kind = str(getattr(plan, "indexer_kind", "") or "").strip().lower()
+        if kind == "region_csa" or (not kind and plan.candidate_block_size > 1):
+            return _step5_csa_indexer_terms(plan, model)
+        from mindie_sim.catalog.qwen4_exp import qsa_indexer_terms
+        return qsa_indexer_terms(plan, model)
     terms: list[WeightTerm] = []
     if plan.owns_index_k:
         width = plan.head_dim if plan.index_input == "compressed" else model.hidden_size

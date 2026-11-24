@@ -15,7 +15,6 @@ import inspect
 import math
 from typing import Any
 
-from mindie_sim.prediction.body_defaults import TargetOperators
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.hardware import Hardware
@@ -73,6 +72,16 @@ def _profile(value: Any) -> UserProfile | None:
     if not isinstance(value, UserProfile):
         raise ExtensionError("user_profile_requires_load_user_profile")
     return value
+
+
+def _profile_environment(case: Any, ops: Any) -> ExecutionEnvironment:
+    """Bind a case onto the unified ``ExecutionEnvironment`` for profile pricing."""
+    if isinstance(ops, Mapping):
+        raise ExtensionError("user_profile_supports_sequence_ops_only")
+    parsed = parse_case(case)
+    return ExecutionEnvironment.from_hardware(
+        parsed.machine, runtime=parsed.runtime,
+    )
 
 
 def _ops(value: Any) -> tuple[OpSpec, ...]:

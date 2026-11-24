@@ -786,11 +786,24 @@ def _is_raw_eager(runtime) -> bool:
 
 
 def _resolve_recurrent_fusion_status(
-    runtime, *, has_fused_kernel: bool, has_source_binding: bool = False,
+    runtime,
+    *,
+    has_fused_kernel: bool,
+    has_source_binding: bool = False,
+    abi_symbol: str | None = None,
 ) -> tuple[str, bool]:
-    """Derive fusion_status from execution track/readiness (Step 2: ProbedAbiRegistry hook)."""
+    """Derive fusion_status from execution track and sealed ``ProbedAbiRegistry``."""
     if _is_raw_eager(runtime):
         return "unfused_decomposed", False
+    if abi_symbol:
+        rt_meta = dict(getattr(runtime, "metadata", ()) or ())
+        arch = str(rt_meta.get("arch_family") or "").strip().upper()
+        if arch in {"A2", "A3", "A5"}:
+            from mindie_sim.backends.abi_registry import default_abi_registry
+
+            if default_abi_registry().is_shipping_available(abi_symbol, arch):
+                return "fused_existing", False
+            return ("fused_framework_enable" if has_source_binding else "fused_new_kernel_required"), False
     if has_fused_kernel:
         return "fused_existing", False
     if has_source_binding:

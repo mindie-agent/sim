@@ -127,16 +127,27 @@ def _router_recipe(op, geometry):
     compute = str(dict(op.metadata).get("compute_format") or op.dtype or "").strip()
     if not compute:
         raise ModelingError("router_compute_format_missing")
-    if compute not in peaks or float(peaks[compute]) <= 0.0:
-        raise ModelingError(f"router_compute_peak_missing:{compute}")
-    peak = float(peaks[compute])
-    cube = MS_PER_SECOND * float(op.flops) / peak
+    datapath = getattr(geometry, "datapath", None)
+    if datapath is not None and hasattr(datapath, "cube_peak"):
+        peak = float(datapath.cube_peak(compute))
+    else:
+        try:
+            peak = float(peaks[compute])
+        except KeyError as exc:
+            raise ModelingError(f"router_compute_peak_missing:{compute}") from exc
+    try:
+        cube = MS_PER_SECOND * float(op.flops) / peak
+    except ZeroDivisionError as exc:
+        raise ModelingError(f"router_compute_peak_invalid:{compute}") from exc
     context = RecipeContext(
         op, {names["cube"]: cube} if cube else {}, names, rates,
         int(getattr(geometry, "compute_units", A5_AIC_UNITS)),
         resource_units=units, compute_peaks=peaks,
         pool_capacities=dict(getattr(geometry, "buffers", {}) or ()),
-        physical_mechanisms=getattr(geometry, "physical_mechanisms", None))
+        physical_mechanisms=getattr(geometry, "physical_mechanisms", None),
+        compute_arch=getattr(geometry, "compute_arch", None),
+        datapath=getattr(geometry, "datapath", None),
+        primitive_table=getattr(geometry, "primitive_table", None))
     recipe, _record = SteadyMatmul().select(context, include_record=False)
     return recipe
 
@@ -254,8 +265,25 @@ def build_router_splitk(op, geometry):
     plan_work = base + extra
 
     def program(context):
-        raise NotImplementedError(
-            "LEGACY_PURGED: wire calibrated PrimitiveTable P15/P02/P03 setup in build_router_splitk instead of ROUTER_PROLOGUE_DRAIN_CYCLES=8250"
+        extra_demand = context.bind(extra)
+        matrix_demand = {
+            key: value - extra_demand.get(key, 0.0)
+            for key, value in context.work.items()
+        }
+        matrix_demand = {
+            key: value for key, value in matrix_demand.items() if value > 0.0
+        }
+        matrix_op = replace(
+            context.op,
+            mte2_bytes=declared_mte2,
+            hbm_bytes=declared_mte2 + declared_mte3,
+            vector_ops=declared_vector,
+        )
+        return splitk_program(
+            replace(context, op=matrix_op, work=matrix_demand),
+            splits,
+            recipe=recipe,
+            ws_l2_resident=ws_l2,
         )
 
     return OperatorPlan(plan_work, program, {

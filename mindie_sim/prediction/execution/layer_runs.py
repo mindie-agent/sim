@@ -671,10 +671,18 @@ def discover_layer_cohorts(case: Any) -> LayerCohortPlan:
             cohort_by_layer[full_idx] = c_idx
 
     aux = getattr(getattr(case, "model", None), "auxiliary", None)
-    dspark = getattr(aux, "dspark", None) if aux is not None else None
-    mtp_spec = getattr(aux, "mtp", None) if aux is not None else None
-    draft_spec = dspark or mtp_spec
-    draft_layers = max(0, int(getattr(draft_spec, "layers", 0) or 0)) if draft_spec is not None else 0
+    draft_layers = 0
+    if aux is not None:
+        aux_fields = (
+            tuple(f.name for f in dataclass_fields(aux))
+            if is_dataclass(aux) else ("dspark", "mtp", "eagle3")
+        )
+        for field_name in aux_fields:
+            spec = getattr(aux, field_name, None)
+            if spec is not None:
+                layers_val = getattr(spec, "layers", None)
+                if isinstance(layers_val, int) and not isinstance(layers_val, bool) and layers_val > 0:
+                    draft_layers += int(layers_val)
     return LayerCohortPlan(
         cohorts=tuple(cohorts),
         cohort_by_layer=cohort_by_layer,
@@ -939,25 +947,12 @@ def _price_depth_varying_ops(
 
     if not diff_ops_by_key:
         return {}
-    pid_cache: dict[tuple[Any, ...], float] | None = None
-    if evaluation is not None:
-        pid_cache = getattr(evaluation, "_cohort_pkey_dur_cache", None)
-        if pid_cache is None:
-            pid_cache = {}
-            try:
-                setattr(evaluation, "_cohort_pkey_dur_cache", pid_cache)
-            except (AttributeError, TypeError):
-                pid_cache = None
-
     pkey_dur_ms: dict[tuple[Any, ...], float] = {}
     missing_ops: list[Any] = []
     pid_to_pkeys: dict[tuple[int, str], list[tuple[Any, ...]]] = {}
     for pkey, op in diff_ops_by_key.items():
-        if pid_cache is not None and pkey in pid_cache:
-            pkey_dur_ms[pkey] = pid_cache[pkey]
-        else:
-            missing_ops.append(op)
-            pid_to_pkeys.setdefault((int(op.stage), physical_id(op)), []).append(pkey)
+        missing_ops.append(op)
+        pid_to_pkeys.setdefault((int(op.stage), physical_id(op)), []).append(pkey)
     if missing_ops:
         book = recipes or RecipeBook.from_mapping(eff_case.runtime.kernels)
         oc = operator_costs(
@@ -970,8 +965,6 @@ def _price_depth_varying_ops(
             val = float(row["duration_ms"])
             for pkey in pid_to_pkeys.get((row_stage, row_pid), ()):
                 pkey_dur_ms[pkey] = val
-                if pid_cache is not None:
-                    pid_cache[pkey] = val
     return pkey_dur_ms
 
 
@@ -1093,6 +1086,356 @@ def _expand_cohort_timeline(
     return expanded
 
 
+@dataclass(frozen=True)
+class TransitionEquivalenceProof:
+    """Formal soundness certificate authorizing native cohort layer skipping."""
+
+    proven: bool
+    reason: str
+    verified_layers: tuple[tuple[str, int], ...] = ()
+    l2_fingerprint_before: str = ""
+    l2_fingerprint_after: str = ""
+
+
+def _intra_layer_structure(
+    layer_ops: Sequence[Any],
+) -> tuple[dict[str, int], tuple[tuple[int, ...], ...], tuple[int, ...], tuple[int, ...]]:
+    """Return ``(pos_by_id, intra_deps_by_pos, entry_positions, sink_positions)``."""
+    pos_by_id = {op.op_id: pos for pos, op in enumerate(layer_ops)}
+    intra_deps: list[tuple[int, ...]] = []
+    has_intra_succ = [False] * len(layer_ops)
+    for pos, op in enumerate(layer_ops):
+        deps = tuple(sorted({pos_by_id[d] for d in op.deps if d in pos_by_id}))
+        intra_deps.append(deps)
+        for d_pos in deps:
+            has_intra_succ[d_pos] = True
+    entries = tuple(pos for pos, deps in enumerate(intra_deps) if not deps)
+    sinks = tuple(pos for pos, has_succ in enumerate(has_intra_succ) if not has_succ)
+    return pos_by_id, tuple(intra_deps), entries, sinks
+
+
+def _is_serial_articulation_point(
+    intra_deps: Sequence[tuple[int, ...]], target_pos: int,
+) -> bool:
+    """True iff every other op in the layer is a strict ancestor or descendant of ``target_pos``."""
+    n = len(intra_deps)
+    children: list[list[int]] = [[] for _ in range(n)]
+    for pos, deps in enumerate(intra_deps):
+        for d in deps:
+            children[d].append(pos)
+    ancestors: set[int] = set()
+    stack = list(intra_deps[target_pos])
+    while stack:
+        cur = stack.pop()
+        if cur not in ancestors:
+            ancestors.add(cur)
+            stack.extend(intra_deps[cur])
+    descendants: set[int] = set()
+    stack = list(children[target_pos])
+    while stack:
+        cur = stack.pop()
+        if cur not in descendants:
+            descendants.add(cur)
+            stack.extend(children[cur])
+    return (len(ancestors) + len(descendants) + 1) == n
+
+
+def _layer_op_side_effects(op: Any) -> tuple[Any, ...]:
+    return (
+        op.family,
+        op.recipe,
+        op.stream,
+        int(getattr(op, "stage", 0) or 0),
+        float(getattr(op, "link_bytes", 0.0) or 0.0),
+        tuple(getattr(op, "allocations", ()) or ()),
+        tuple(getattr(op, "state_effects", ()) or ()),
+    )
+
+
+def _check_layer_pair_equivalence(
+    rep_ops: Sequence[Any],
+    l_ops: Sequence[Any],
+    diff_positions: Mapping[int, Any],
+    physical_key_fn: Callable[[Any], Any],
+) -> tuple[bool, str, tuple[tuple[int, ...], ...], tuple[int, ...], tuple[int, ...]]:
+    if not rep_ops or len(l_ops) != len(rep_ops):
+        return False, "layer_op_count_mismatch", (), (), ()
+    _, r_intra, r_entries, r_sinks = _intra_layer_structure(rep_ops)
+    _, l_intra, l_entries, l_sinks = _intra_layer_structure(l_ops)
+    if l_intra != r_intra or l_entries != r_entries or l_sinks != r_sinks:
+        return False, "intra_layer_dag_mismatch", (), (), ()
+    for pos, (op_r, op_l) in enumerate(zip(rep_ops, l_ops)):
+        if _layer_op_side_effects(op_l) != _layer_op_side_effects(op_r):
+            return False, "layer_op_side_effect_mismatch", (), (), ()
+        if pos in diff_positions:
+            if not _is_serial_articulation_point(l_intra, pos):
+                return False, "diff_op_not_serial_articulation", (), (), ()
+        elif physical_key_fn(op_l) != physical_key_fn(op_r):
+            return False, "replica_physical_key_mismatch", (), (), ()
+    return True, "ok", l_intra, l_entries, l_sinks
+
+
+def _check_replica_boundary_cuts(
+    r_ops: Sequence[Any],
+    body_key_by_op: Mapping[str, tuple[str, int]],
+    skip_map: Mapping[tuple[str, int], tuple[str, int]],
+    layer_diffs: Mapping[tuple[str, int], Mapping[int, Any]],
+    external_inputs: Mapping[str, float] | None,
+    physical_key_fn: Callable[[Any], Any],
+) -> TransitionEquivalenceProof:
+    r_by_layer: dict[tuple[str, int], list[Any]] = {}
+    op_to_layer: dict[str, tuple[str, int]] = {}
+    for op in r_ops:
+        bkey = body_key_by_op.get(op.op_id)
+        if bkey is not None:
+            r_by_layer.setdefault(bkey, []).append(op)
+            op_to_layer[op.op_id] = bkey
+    scope_layers: dict[str, list[tuple[str, int]]] = {}
+    for bkey in sorted(r_by_layer):
+        scope_layers.setdefault(bkey[0], []).append(bkey)
+    prev_layer: dict[tuple[str, int], tuple[str, int] | None] = {}
+    next_layer: dict[tuple[str, int], tuple[str, int] | None] = {}
+    for ordered in scope_layers.values():
+        for idx, bkey in enumerate(ordered):
+            prev_layer[bkey] = ordered[idx - 1] if idx > 0 else None
+            next_layer[bkey] = ordered[idx + 1] if idx + 1 < len(ordered) else None
+    struct_cache: dict[tuple[str, int], tuple[dict[str, int], tuple[tuple[int, ...], ...], tuple[int, ...], tuple[int, ...]]] = {
+        bkey: _intra_layer_structure(ops_list) for bkey, ops_list in r_by_layer.items()
+    }
+    ext_map = {str(k): float(v) for k, v in (external_inputs or {}).items()}
+    consumers_by_layer: dict[tuple[str, int], list[tuple[Any, tuple[str, int] | None]]] = {}
+    for op in r_ops:
+        src_bkey = op_to_layer.get(op.op_id)
+        for dep in op.deps:
+            dep_bkey = op_to_layer.get(dep)
+            if dep_bkey is not None and dep_bkey != src_bkey:
+                consumers_by_layer.setdefault(dep_bkey, []).append((op, src_bkey))
+
+    for l_key, rep_key in sorted(skip_map.items()):
+        rep_ops = r_by_layer.get(rep_key, ())
+        l_ops = r_by_layer.get(l_key, ())
+        ok, reason, _, l_entries, l_sinks = _check_layer_pair_equivalence(
+            rep_ops, l_ops, layer_diffs.get(l_key, {}), physical_key_fn,
+        )
+        if not ok:
+            return TransitionEquivalenceProof(False, reason)
+        prev_key = prev_layer.get(l_key)
+        if prev_key is None or prev_key not in r_by_layer:
+            return TransitionEquivalenceProof(False, "skipped_layer_missing_predecessor")
+        prev_ops = r_by_layer[prev_key]
+        prev_stage = int(getattr(prev_ops[0], "stage", 0) or 0)
+        l_stage = int(getattr(l_ops[0], "stage", 0) or 0)
+        if prev_stage != l_stage:
+            return TransitionEquivalenceProof(False, "skipped_layer_crosses_stage")
+        prev_pos, _, _, prev_sink_pos = struct_cache[prev_key]
+        prev_sink_ids = {prev_ops[p].op_id for p in prev_sink_pos}
+        l_pos = struct_cache[l_key][0]
+        for op in l_ops:
+            ext_deps = [d for d in op.deps if d not in l_pos]
+            if any(op_to_layer.get(d) != prev_key for d in ext_deps):
+                return TransitionEquivalenceProof(False, "non_adjacent_cross_layer_dependency")
+        for pos in l_entries:
+            if not prev_sink_ids or not prev_sink_ids.issubset(l_ops[pos].deps):
+                return TransitionEquivalenceProof(False, "layer_boundary_not_synchronous_cut")
+        l_sink_ids = {l_ops[p].op_id for p in l_sinks}
+        nxt_key = next_layer.get(l_key)
+        for cons_op, cons_bkey in consumers_by_layer.get(l_key, ()):
+            if nxt_key is not None and cons_bkey != nxt_key:
+                return TransitionEquivalenceProof(False, "skipped_layer_skip_edge_consumer")
+            if nxt_key is None and cons_bkey is not None:
+                return TransitionEquivalenceProof(False, "skipped_layer_cross_scope_consumer")
+        if nxt_key is not None and nxt_key in r_by_layer:
+            nxt_ops = r_by_layer[nxt_key]
+            _, _, nxt_entries, _ = struct_cache[nxt_key]
+            for pos in nxt_entries:
+                if not l_sink_ids or not l_sink_ids.issubset(nxt_ops[pos].deps):
+                    return TransitionEquivalenceProof(False, "next_layer_not_synchronous_cut")
+
+    for rep_key in sorted(set(skip_map.values())):
+        rep_ops = r_by_layer.get(rep_key, ())
+        rep_pos, _, rep_entries, _ = struct_cache[rep_key]
+        prev_rep = prev_layer.get(rep_key)
+        if prev_rep is not None and prev_rep in r_by_layer:
+            prev_ops = r_by_layer[prev_rep]
+            _, _, _, prev_sink_pos = struct_cache[prev_rep]
+            prev_sink_ids = {prev_ops[p].op_id for p in prev_sink_pos}
+            for op in rep_ops:
+                ext_deps = [d for d in op.deps if d not in rep_pos]
+                if any(op_to_layer.get(d) != prev_rep for d in ext_deps):
+                    return TransitionEquivalenceProof(False, "rep_layer_non_adjacent_dependency")
+            for pos in rep_entries:
+                if not prev_sink_ids or not prev_sink_ids.issubset(rep_ops[pos].deps):
+                    return TransitionEquivalenceProof(False, "rep_layer_not_synchronous_cut")
+        else:
+            entry_ext_times = [
+                ext_map[d] for pos in rep_entries for d in rep_ops[pos].deps
+                if d in ext_map
+            ]
+            max_entry_t = max(entry_ext_times, default=0.0)
+            for pos, op in enumerate(rep_ops):
+                if pos in rep_entries:
+                    continue
+                if any(d in ext_map and ext_map[d] > max_entry_t for d in op.deps):
+                    return TransitionEquivalenceProof(False, "rep_layer_late_external_trigger")
+
+    return TransitionEquivalenceProof(True, "structural_verified", tuple(sorted(skip_map)))
+
+
+def _prove_structural_equivalence(
+    graphs: Mapping[int, Sequence[Any]],
+    body_key_by_op: Mapping[str, tuple[str, int]],
+    skip_map: Mapping[tuple[str, int], tuple[str, int]],
+    layer_diffs: Mapping[tuple[str, int], Mapping[int, Any]],
+    *,
+    include_submission: bool,
+    external_inputs: Mapping[str, float] | None,
+) -> TransitionEquivalenceProof:
+    if include_submission:
+        return TransitionEquivalenceProof(False, "host_submission_pipelining_active")
+    from mindie_sim.prediction.program.physical_key import physical_key
+
+    for r_ops in graphs.values():
+        proof = _check_replica_boundary_cuts(
+            r_ops, body_key_by_op, skip_map, layer_diffs, external_inputs, physical_key,
+        )
+        if not proof.proven:
+            return proof
+    return TransitionEquivalenceProof(True, "structural_verified", tuple(sorted(skip_map)))
+
+
+def _has_non_body_overlap(
+    non_body_intervals: Sequence[tuple[float, float]],
+    rep_intervals: Sequence[tuple[float, float]],
+) -> bool:
+    eps = COHORT_CROSS_LAYER_OVERLAP_EPS_MS
+    for nb_lo, nb_hi in non_body_intervals:
+        for rep_lo, rep_hi in rep_intervals:
+            if nb_lo + eps < rep_hi and nb_hi > rep_lo + eps:
+                return True
+    return False
+
+
+def _assemble_fast_cohort_report(
+    red_report: Mapping[str, Any],
+    rep_layers: set[tuple[str, int]],
+    skip_map: Mapping[tuple[str, int], tuple[str, int]],
+) -> dict[str, Any] | None:
+    fp_before, fp_after = red_report.get("l2_residency_fingerprints") or ("", "")
+    if not fp_before or fp_before != fp_after:
+        return None
+    bounds = red_report.get("layer_bounds") or {}
+    prev_by_scope_stage: dict[tuple[str, int], float] = {}
+    rep_intervals: list[tuple[float, float]] = []
+    rep_targets = set(skip_map.values())
+    for l_key in sorted(rep_layers):
+        entry = bounds.get(l_key)
+        if entry is None:
+            return None
+        st_i, lo_ms, hi_ms = entry
+        ss = (l_key[0], st_i)
+        prev_end = prev_by_scope_stage.get(ss)
+        if prev_end is not None and lo_ms + COHORT_CROSS_LAYER_OVERLAP_EPS_MS < prev_end:
+            return None
+        prev_by_scope_stage[ss] = hi_ms
+        if l_key in rep_targets:
+            rep_intervals.append((float(lo_ms), float(hi_ms)))
+    if _has_non_body_overlap(red_report.get("non_body_bounds") or (), rep_intervals):
+        return None
+    total_ms = float(red_report["duration_ms"])
+    for rep_key in skip_map.values():
+        entry = bounds.get(rep_key)
+        if entry is None:
+            return None
+        total_ms += float(entry[2]) - float(entry[1])
+    out = dict(red_report)
+    out.pop("layer_bounds", None)
+    out.pop("non_body_bounds", None)
+    out.pop("l2_residency_fingerprints", None)
+    out["duration_ms"] = total_ms
+    out["complete_ms"] = float(red_report.get("input_ready_ms", 0.0) or 0.0) + total_ms
+    out["fast_span_only"] = True
+    return out
+
+
+def _assemble_full_cohort_report(
+    eff_case: Any,
+    red_report: Mapping[str, Any],
+    body_key_by_op: Mapping[str, tuple[str, int]],
+    by_layer: Mapping[tuple[str, int], Sequence[Any]],
+    rep_layers: set[tuple[str, int]],
+    skip_map: Mapping[tuple[str, int], tuple[str, int]],
+    layer_diffs: Mapping[tuple[str, int], Mapping[int, tuple[tuple[Any, ...], tuple[Any, ...]]]],
+    diff_ops_by_key: Mapping[tuple[Any, ...], Any],
+    *,
+    evaluation: Any,
+    recipes: Any,
+) -> dict[str, Any] | None:
+    fp_before, fp_after = red_report.get("l2_residency_fingerprints") or ("", "")
+    if not fp_before or fp_before != fp_after:
+        return None
+    red_timeline = red_report.get("timeline") or ()
+    tl_by_layer: dict[tuple[str, int], list[Mapping[str, Any]]] = {}
+    non_body_intervals: list[tuple[float, float]] = []
+    for row in red_timeline:
+        bkey = body_key_by_op.get(str(row.get("op_id", "")))
+        if bkey is not None:
+            tl_by_layer.setdefault(bkey, []).append(row)
+        else:
+            non_body_intervals.append((float(row["ready_ms"]), float(row["complete_ms"])))
+    if _has_cross_layer_overlap(tl_by_layer, sorted(rep_layers)):
+        return None
+    rep_intervals = [
+        (
+            min(float(r["ready_ms"]) for r in tl_by_layer[rk]),
+            max(float(r["complete_ms"]) for r in tl_by_layer[rk]),
+        )
+        for rk in sorted(set(skip_map.values()))
+        if tl_by_layer.get(rk)
+    ]
+    if _has_non_body_overlap(non_body_intervals, rep_intervals):
+        return None
+    pid_dur_ms = _price_depth_varying_ops(
+        eff_case, diff_ops_by_key, evaluation=evaluation, recipes=recipes,
+    )
+    if layer_diffs:
+        for l_key, diffs in layer_diffs.items():
+            rep_key = skip_map[l_key]
+            rep_rows_by_id = {str(r["op_id"]): r for r in tl_by_layer.get(rep_key, ())}
+            rep_ops = by_layer[rep_key]
+            for pos, (pid_r, _pid_l) in diffs.items():
+                row_r = rep_rows_by_id.get(rep_ops[pos].op_id)
+                if (row_r is None
+                        or abs(float(row_r["elapsed_ms"]) - float(pid_dur_ms[pid_r]))
+                        > COHORT_CROSS_LAYER_OVERLAP_EPS_MS):
+                    return None
+    total_ms = float(red_report["duration_ms"])
+    for l_key, rep_key in skip_map.items():
+        rows_rep = tl_by_layer.get(rep_key, ())
+        if not rows_rep:
+            return None
+        rep_span = (
+            max(float(r["complete_ms"]) for r in rows_rep)
+            - min(float(r["ready_ms"]) for r in rows_rep)
+        )
+        delta = sum(
+            float(pid_dur_ms[pid_l]) - float(pid_dur_ms[pid_r])
+            for pid_r, pid_l in layer_diffs.get(l_key, {}).values()
+        )
+        total_ms += rep_span + delta
+    out = dict(red_report)
+    out.pop("l2_residency_fingerprints", None)
+    out["duration_ms"] = total_ms
+    out["complete_ms"] = float(red_report.get("input_ready_ms", 0.0) or 0.0) + total_ms
+    expanded = _expand_cohort_timeline(
+        red_timeline, body_key_by_op, by_layer, skip_map, layer_diffs, pid_dur_ms,
+    )
+    out["timeline"] = expanded
+    out["operator_occurrences"] = sum(
+        1 for r in expanded if str(r.get("family", "")) != "barrier"
+    )
+    return out
+
+
 def execute_native_cohort_graph(
     eff_case: Any,
     graphs: Mapping[int, Sequence[Any]],
@@ -1112,11 +1455,12 @@ def execute_native_cohort_graph(
     sequence_layout: str = "",
     timeline_replicas: Sequence[int] | None = (0,),
 ) -> tuple[dict[str, Any], dict[int, tuple[Any, ...]] | None, dict[str, str]]:
-    """Execute native ``0..L-1 + final`` graphs via exact cohort reduction on ONE Engine.
+    """Execute native ``0..L-1 + final`` graphs via certified cohort reduction on ONE Engine.
 
     Never mutates ``model.layers`` or ``layer_plans``.  Falls back cleanly to
-    literal full-depth ``graph_costs`` whenever cross-layer overlap, PP > 1,
-    isolated-pricing requests, or non-standard cross-layer dependencies occur.
+    literal full-depth ``graph_costs`` whenever ``TransitionEquivalenceProof``
+    cannot certify exact intra-layer DAG isomorphism, synchronous layer cuts,
+    invariant L2 residency fingerprints, and zero cross-layer overlap.
     """
     from mindie_sim.prediction.graph_analysis import graph_costs
     from mindie_sim.prediction.operator_analysis import TargetGraphSet
@@ -1139,11 +1483,17 @@ def execute_native_cohort_graph(
     if planned is None:
         return _literal_run()
     body_key_by_op, by_layer, rep_layers, skip_map, op_rep_map, layer_diffs, diff_ops_by_key = planned
-    ext_keys = set(external_inputs or ())
-    reduced_map = _reduce_replica_graphs(graphs, body_key_by_op, rep_layers, ext_keys)
+    struct_proof = _prove_structural_equivalence(
+        graphs, body_key_by_op, skip_map, layer_diffs,
+        include_submission=include_submission, external_inputs=external_inputs,
+    )
+    if not struct_proof.proven:
+        return _literal_run()
+    reduced_map = _reduce_replica_graphs(
+        graphs, body_key_by_op, rep_layers, set(external_inputs or ()),
+    )
     if reduced_map is None:
         return _literal_run()
-
     reduced_arg: Any = (
         TargetGraphSet(
             reduced_map,
@@ -1153,6 +1503,8 @@ def execute_native_cohort_graph(
         if isinstance(graphs, TargetGraphSet) else reduced_map
     )
     if fast_span_only:
+        if layer_diffs:
+            return _literal_run()
         red_report = graph_costs(
             eff_case, reduced_arg, recipes=recipes, external_inputs=external_inputs,
             include_submission=include_submission, isolated=False,
@@ -1162,21 +1514,8 @@ def execute_native_cohort_graph(
             sequence_layout=sequence_layout, timeline_replicas=None,
             layer_span_body_ids=body_key_by_op,
         )
-        bounds = red_report.get("layer_bounds") or {}
-        prev_by_scope_stage: dict[tuple[str, int], float] = {}
-        for l_key in sorted(rep_layers):
-            entry = bounds.get(l_key)
-            if entry is None:
-                continue
-            st_i, lo_ms, hi_ms = entry
-            ss = (l_key[0], st_i)
-            prev_end = prev_by_scope_stage.get(ss)
-            if prev_end is not None and lo_ms + COHORT_CROSS_LAYER_OVERLAP_EPS_MS < prev_end:
-                return _literal_run()
-            prev_by_scope_stage[ss] = hi_ms
-        raise NotImplementedError(
-            "LEGACY_PURGED: wire TransitionEquivalenceProof (intra-layer DAG + L2 residency fingerprint) or literal Engine execution in layer_runs.py"
-        )
+        assembled = _assemble_fast_cohort_report(red_report, rep_layers, skip_map)
+        return (assembled, reduced_map, op_rep_map) if assembled is not None else _literal_run()
 
     red_report = graph_costs(
         eff_case, reduced_arg, recipes=recipes, external_inputs=external_inputs,
@@ -1185,16 +1524,10 @@ def execute_native_cohort_graph(
         fast_span_only=False, stream_plans=stream_plans,
         request_views=request_views, padded_tokens=padded_tokens,
         sequence_layout=sequence_layout, timeline_replicas=(0,),
+        layer_span_body_ids=body_key_by_op,
     )
-    red_timeline = red_report.get("timeline") or ()
-    tl_by_layer: dict[tuple[str, int], list[Mapping[str, Any]]] = {}
-    for row in red_timeline:
-        bkey = body_key_by_op.get(str(row.get("op_id", "")))
-        if bkey is not None:
-            tl_by_layer.setdefault(bkey, []).append(row)
-    if _has_cross_layer_overlap(tl_by_layer, sorted(rep_layers)):
-        return _literal_run()
-
-    raise NotImplementedError(
-        "LEGACY_PURGED: wire TransitionEquivalenceProof (intra-layer DAG + L2 residency fingerprint) or literal Engine execution in layer_runs.py"
+    assembled = _assemble_full_cohort_report(
+        eff_case, red_report, body_key_by_op, by_layer, rep_layers,
+        skip_map, layer_diffs, diff_ops_by_key, evaluation=evaluation, recipes=recipes,
     )
+    return (assembled, reduced_map, op_rep_map) if assembled is not None else _literal_run()

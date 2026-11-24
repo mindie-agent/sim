@@ -9,6 +9,8 @@
 """
 from collections import defaultdict
 
+from .backends.abi_registry import default_abi_registry
+from .schema.abi import SOC_ARCHS
 from .structure.native import mxfp4_reference_coverage
 from .structure.native import grouped_situ_contract
 
@@ -23,17 +25,168 @@ VALID_FUSION_STATUSES = frozenset({
     "fused_new_kernel_required",
     "unfused_decomposed",
 })
+_NATIVE_KIND_TO_ABI_ID: dict[str, str] = {
+    "MlaPrologV3": "aclnnMlaPrologV3WeightNz",
+    "MlaPrologV3WeightNz": "aclnnMlaPrologV3WeightNz",
+    "MlaPrologV4": "aclnnMlaPrologV4WeightNz",
+    "MlaPrologV4WeightNz": "aclnnMlaPrologV4WeightNz",
+    "aclnnMlaPrologV4WeightNz": "aclnnMlaPrologV4WeightNz",
+    "GroupedMatmulSwigluQuant": "aclnnGroupedMatmulSwigluQuant",
+    "GroupedMatmulSwigluQuantV2": "aclnnGroupedMatmulSwigluQuantV2",
+    "DequantSituQuant": "aclnnDequantSituQuant",
+    "HcPre": "hc_pre_sinkhorn",
+    "HcPost": "HcPost",
+    "LightningIndexer": "aclnnLightningIndexer",
+    "VllmAscendQuantLightningIndexerV2": "VllmAscendQuantLightningIndexerV2",
+    "MoeGatingTopK": "aclnnMoeGatingTopK",
+    "MoeGatingTopKSoftmaxV2": "aclnnMoeGatingTopKSoftmaxV2",
+    "AttnResFwd": "AttnResFwd",
+    "RecurrentKda": "RecurrentKda",
+    "ChunkKdaFwd": "ChunkKdaFwd",
+}
+_LOWRANK_HC_TRITON_ABIS: tuple[str, ...] = (
+    "_hc_combine_norm_kernel",
+    "_hc_gate_mix_kernel",
+)
+_ROLE_DEFAULT_ABIS: dict[str, tuple[str, ...]] = {
+    "mla_prolog": ("aclnnMlaPrologV3WeightNz", "aclnnMlaPrologV4WeightNz"),
+    "grouped_gate_up_activation_quant": (
+        "aclnnGroupedMatmulSwigluQuantV2",
+        "aclnnGroupedMatmulSwigluQuant",
+    ),
+    "grouped_gate_up_situ_quant": ("GroupedMatmulSituQuant",),
+    "situ_quant": ("SituMxQuant",),
+    "lightning_indexer": ("aclnnLightningIndexer",),
+    "quant_lightning_indexer": (
+        "VllmAscendQuantLightningIndexerV2",
+        "aclnnQuantLightningIndexerV2",
+    ),
+    "hc_pre": ("hc_pre_sinkhorn",),
+    "hc_post": ("HcPost",),
+    "router_selection": ("aclnnMoeGatingTopK", "aclnnMoeGatingTopKSoftmaxV2"),
+    "kda_recurrent": ("RecurrentKda", "ChunkKdaFwd"),
+    "gdn_chunk": ("aclnnChunkGatedDeltaRule",),
+    "gdn_recurrent": ("aclnnRecurrentGatedDeltaRule",),
+    "attn_res_prefix_point": ("AttnResFwd",),
+}
+_MULTI_OP_FUSION_ROLES = frozenset({
+    "grouped_gate_up_activation_quant",
+    "grouped_gate_up_situ_quant",
+    "situ_quant",
+    "hc_pre",
+    "hc_post",
+})
 
 
-def resolve_subgraph_fusion_status(declaration, ordered_nodes, *, resource_bound=False):
-    """Return canonical ``(fusion_status, fusion_reason)`` for an exported subgraph."""
+def _subgraph_arch(declaration, ordered_nodes, explicit_arch: str | None) -> str | None:
+    candidates = [explicit_arch, declaration.get("arch_family")]
+    impl = declaration.get("implementation") or {}
+    if isinstance(impl, dict):
+        candidates.append(impl.get("arch_family"))
+    for node in ordered_nodes:
+        meta = (node.get("operator") or {}).get("metadata") or {}
+        if isinstance(meta, dict):
+            candidates.append(meta.get("arch_family"))
+    for item in candidates:
+        norm = str(item or "").strip().upper()
+        if norm in SOC_ARCHS:
+            return norm
+    return None
+
+
+def _candidate_abi_symbols(declaration, ordered_nodes) -> tuple[str, ...]:
+    role = str(declaration.get("role") or "")
+    impl = declaration.get("implementation") or {}
+    view = declaration.get("tensor_view") or {}
+    if role in {"hc_pre", "hc_post"} and "hc_lowrank" in view:
+        return _LOWRANK_HC_TRITON_ABIS
+    raw: list[str] = []
+    if isinstance(impl, dict):
+        if impl.get("native_kind"):
+            raw.append(str(impl["native_kind"]))
+        for item in impl.get("native_kinds") or ():
+            if item:
+                raw.append(str(item))
+    if len(ordered_nodes) == 1:
+        meta = (ordered_nodes[0].get("operator") or {}).get("metadata") or {}
+        if isinstance(meta, dict):
+            if meta.get("native_kind"):
+                raw.append(str(meta["native_kind"]))
+            native_call = meta.get("native_call") or {}
+            api = native_call.get("api") if isinstance(native_call, dict) else None
+            if isinstance(api, dict):
+                for key in ("aclnn_symbol", "entry"):
+                    if api.get(key):
+                        raw.append(str(api[key]))
+    if not raw and role in _ROLE_DEFAULT_ABIS:
+        raw.extend(_ROLE_DEFAULT_ABIS[role])
+    mapped = [_NATIVE_KIND_TO_ABI_ID.get(sym, sym) for sym in raw if sym]
+    return tuple(dict.fromkeys(mapped))
+
+
+def _probe_subgraph_abi(symbols: tuple[str, ...], arch: str | None) -> tuple[str, str]:
+    """Query sealed ``ProbedAbiRegistry`` for candidate symbols (shipping / proposed / unshipped)."""
+    if not symbols:
+        return "unshipped", ""
+    registry = default_abi_registry()
+    archs = (arch,) if arch in SOC_ARCHS else ("A5", "A3", "A2")
+    proposed_match = ""
+    for sym in symbols:
+        for target_arch in archs:
+            entries = registry.lookup(sym, target_arch, available_only=True)
+            for entry in entries:
+                if entry.vllm_ascend_track == "merged":
+                    return "shipping", entry.abi_id
+                if not proposed_match:
+                    proposed_match = entry.abi_id
+    if proposed_match:
+        return "proposed", proposed_match
+    return "unshipped", symbols[0]
+
+
+def resolve_subgraph_fusion_status(
+    declaration, ordered_nodes, *, resource_bound=False, arch: str | None = None,
+):
+    """Return canonical ``(fusion_status, fusion_reason)`` via ``ProbedAbiRegistry``."""
+    role = str(declaration.get("role") or "")
+    impl = declaration.get("implementation") or {}
     declared_status = declaration.get("fusion_status")
     declared_reason = declaration.get("fusion_reason")
-    if declared_status in VALID_FUSION_STATUSES:
+    if resource_bound and declared_status in {
+        "fused_existing", "fused_framework_enable", "fused_new_kernel_required",
+    }:
+        return declared_status, declared_reason or "selected_native_fusion_resource_boundary"
+    if not resource_bound and declared_status in VALID_FUSION_STATUSES:
         return declared_status, declared_reason or "declared_subgraph_fusion_status"
-    raise NotImplementedError(
-        "LEGACY_PURGED: wire ProbedAbiRegistry / AbiSupportVerdict in resolve_subgraph_fusion_status"
+
+    resolved_arch = _subgraph_arch(declaration, ordered_nodes, arch)
+    symbols = _candidate_abi_symbols(declaration, ordered_nodes)
+    tier, matched = _probe_subgraph_abi(symbols, resolved_arch)
+    single_kernel = (
+        len(ordered_nodes) == 1
+        and (
+            ordered_nodes[0].get("boundary") == "kernel"
+            or (ordered_nodes[0].get("operator") or {}).get("metadata", {}).get("native_kind")
+            or impl.get("fused") is True
+        )
     )
+    if resource_bound or single_kernel or impl.get("fused") is True:
+        if tier == "shipping":
+            return "fused_existing", f"probed_abi_shipping:{matched}"
+        if tier == "proposed":
+            return "fused_framework_enable", f"probed_abi_proposed:{matched}"
+        return "fused_new_kernel_required", f"probed_abi_unshipped:{matched or role}"
+
+    if declaration.get("native_fusion_eligible") is False:
+        return "unfused_decomposed", f"native_fusion_ineligible:{role}"
+    eligible_prolog = (
+        role == "mla_prolog" and impl.get("selection") == "vllm_ascend_mla_prolog_v3"
+    )
+    if eligible_prolog or role in _MULTI_OP_FUSION_ROLES:
+        if tier in {"shipping", "proposed"}:
+            return "fused_framework_enable", f"probed_abi_eligible:{matched}"
+        return "fused_new_kernel_required", f"probed_abi_unshipped:{matched or role}"
+    return "unfused_decomposed", f"decomposed_{len(ordered_nodes)}_member_operators"
 
 
 def metadata(op):

@@ -270,7 +270,7 @@ def physical_owner_rate(context, resource, placement=None):
 
 
 def is_arch35_context(context) -> bool:
-    """True when the execution context targets DAV_3510 via explicit ComputeArch / PrimitiveTable."""
+    """True iff the execution context explicitly targets DAV_3510 via ComputeArch / PrimitiveTable."""
     compute_arch = getattr(context, "compute_arch", None)
     if compute_arch is None:
         datapath = getattr(context, "datapath", None)
@@ -285,9 +285,7 @@ def is_arch35_context(context) -> bool:
         arch = str(getattr(pt, "arch_preset", "") or "").strip().lower()
         if arch:
             return arch == "npu_arch_3510"
-    raise NotImplementedError(
-        "LEGACY_PURGED: wire explicit ctx.compute_arch.arch_id in matrix_mapping_owners.is_arch35_context (no L0C sniffing)"
-    )
+    return False
 
 
 def _table_cell(context, primitive_id: str):
@@ -307,11 +305,12 @@ def primitive_core_clock_hz(context) -> float | None:
         getattr(getattr(context, "datapath", None), "compute_arch", None),
     ):
         val = getattr(owner, "clock_hz", None)
-        if val is not None and not isinstance(val, bool) and float(val) > 0.0:
-            return float(val)
-    raise NotImplementedError(
-        "LEGACY_PURGED: wire ctx.compute_arch.clock_hz in matrix_mapping_owners.primitive_core_clock_hz (no P02/256 clock synthesis)"
-    )
+        if val is None:
+            continue
+        if isinstance(val, bool) or float(val) <= 0.0:
+            raise ModelingError(f"compute_arch_clock_hz_invalid:{val!r}")
+        return float(val)
+    return None
 
 
 def primitive_p01_scaling_bps(context, active_cores: int, *, warm: bool) -> float | None:

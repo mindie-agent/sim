@@ -319,6 +319,7 @@ def _gemma4(key: str, config: Mapping[str, Any]) -> ModelSpec:
             kv_cache_elements=0 if shares_kv else factor * layer_kv * layer_hd,
             kv_owner_layer_id=kv_owner, owns_long_kv=not shares_kv,
             k_eq_v=bool(full and k_eq_v),
+            has_sandwich_norm=True,
             native_layer_id=index, scope="body",
         ))
     norms_per_layer = GEMMA4_MOE_LAYER_NORMS if moe else GEMMA4_DENSE_LAYER_NORMS
@@ -556,6 +557,7 @@ def _step5(key: str, config: Mapping[str, Any]) -> ModelSpec:
             swiglu_limit=limit, swiglu_shared_limit=shared_limit,
             indexer=sparse_layer,
             indexer_type="full" if sparse_layer else "none",
+            indexer_kind="region_csa" if sparse_layer else "",
             owns_index_k=sparse_layer,
             index_k_owner_layer_id=index if sparse_layer else (-1),
             owns_topk=sparse_layer,

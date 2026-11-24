@@ -515,7 +515,8 @@ def _execute_asymmetric_cohort_splits(engine, to_split: list[int]) -> bool:
                 for r, units in task.placement.items()
             }
             engine._sequence += 1
-            m_ev = Event(engine._sequence, f"{task.event.name}#member{idx}", started=task.start)
+            m_ev = Event(engine._sequence, f"{task.event.name}#member{idx}",
+                         started=task.start, runtime_uid=engine.uid)
             m_prep = engine._prepare(
                 m_ev.name, m_rem, latency=task.latency, caps=m_caps,
                 placement=m_place, coupled=task.coupled, priority=task.priority,

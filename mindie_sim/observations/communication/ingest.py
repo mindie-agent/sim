@@ -976,11 +976,19 @@ def _parent_document(path, document):
         "boundary", "single",
     )
     defaults = {key: document[key] for key in inherited_keys if key in document}
-    for rank_document, rank_origin in chain(
+    rank_sources = list(chain(
         ((_load_json(item), str(item)) for item in rank_files), reports
-    ):
+    ))
+    for report_idx, (rank_document, rank_origin) in enumerate(rank_sources):
         rank_document = _merge_obs(defaults, rank_document)
         _validate_campaign(rank_document, rank_origin)
+        raw_rank = rank_document.get("rank")
+        if isinstance(raw_rank, int) and not isinstance(raw_rank, bool):
+            rank_token: Any = raw_rank
+        elif rank_origin != origin:
+            rank_token = rank_origin
+        else:
+            rank_token = f"report:{report_idx}"
         rank_rows = _rank_rows(
             rank_document, rank_origin, pair, default_run_id=parent_run,
             default_repeat=document.get("repeat_index", 0))
@@ -991,13 +999,12 @@ def _parent_document(path, document):
                 row["regime"], row.get("boundary"), row["run_id"],
                 row["repeat_index"], row.get("stack"), row.get("cann"),
                 row.get("algorithm"), _protocol_key(row.get("protocol")),
-            )].append(row)
+            )].append((rank_token, row))
     rows = []
-    for _key, group in sorted(grouped.items(), key=str):
-        if len(group) < int(world):
-            raise NotImplementedError(
-                "LEGACY_PURGED: verify complete rank coverage before stamping all_ranks_matched in communication/ingest.py"
-            )
+    expected_ranks = max(1, int(world))
+    for _key, tagged_group in sorted(grouped.items(), key=str):
+        distinct_ranks = {tok for tok, _ in tagged_group}
+        group = [row for _, row in tagged_group]
         med = median(row["per_op_ms"] for row in group)
         base = {k: v for k, v in group[0].items()
                 if k not in {"_repeats", "_weights"} or len(group) == 1}
@@ -1005,12 +1012,17 @@ def _parent_document(path, document):
             {"_weights": [(med, sum(w for _, w in group[0]["_weights"]))]}
             if len(group) > 1 and "_weights" in group[0] else {}
         )
+        complete_coverage = len(distinct_ranks) >= expected_ranks
+        canary_value = "all_ranks_matched" if complete_coverage else base.get("canary")
         rows.append({
             **base,
             "campaign": document.get("label") or stem,
             "per_op_ms": med,
             **extra,
-            "canary": "all_ranks_matched",
+            "canary": canary_value,
+            "all_ranks_matched": complete_coverage,
+            "observed_ranks": len(distinct_ranks),
+            "expected_ranks": expected_ranks,
             "source": origin,
         })
     return [({**document, "conditions": rows,

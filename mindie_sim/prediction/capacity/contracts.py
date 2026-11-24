@@ -12,17 +12,12 @@ import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 
+from ..runtime.contracts import LocalBoundaryToken
+
 
 @dataclass(frozen=True)
-class _LedgerBoundary:
+class _LedgerBoundary(LocalBoundaryToken):
     """A real completed boundary token for legacy name-based grant/reader calls."""
-
-    sequence: int
-    time: float = 0.0
-
-    @property
-    def done(self) -> bool:
-        return True
 
 
 @dataclass(frozen=True)

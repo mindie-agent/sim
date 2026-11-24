@@ -1026,16 +1026,25 @@ def _prepare_graphs(case, ops, book, replay_scope, external):
 
 def _make_fast_layer_observer(
     body_key_by_op: Mapping[str, Any],
-) -> tuple[Callable[..., None], dict[Any, list[tuple[int, Any, Any]]]]:
+) -> tuple[Callable[..., None], dict[Any, list[tuple[int, Any, Any]]], list[tuple[Any, Any]]]:
     events_by_layer: dict[Any, list[tuple[int, Any, Any]]] = {}
+    non_body_events: list[tuple[Any, Any]] = []
 
     def _observe(op, replica, _program, ready, complete):
         if replica == 0:
             key = body_key_by_op.get(op.op_id)
             if key is not None:
                 events_by_layer.setdefault(key, []).append((int(op.stage), ready, complete))
+            else:
+                non_body_events.append((ready, complete))
 
-    return _observe, events_by_layer
+    return _observe, events_by_layer, non_body_events
+
+
+def _l2_residency_digest(engine) -> str:
+    view = getattr(engine, "admission_memory_view", None)
+    fn = getattr(view, "residency_fingerprint", None)
+    return str(fn()) if callable(fn) else ""
 
 
 def _run_graph(
@@ -1043,6 +1052,7 @@ def _run_graph(
     include_submission, trace_limit, fast_span_only, stream_plans, request_views,
     padded_tokens, sequence_layout, timeline_replicas=None, compact=False,
     isolated=False, group_for=None, fast_observer=None,
+    l2_fingerprints: dict[str, str] | None = None,
 ):
     from .runtime.exposed_observer import ExposedObserver
 
@@ -1126,6 +1136,8 @@ def _run_graph(
     execution._active_padded_tokens = eff_padded
     execution._active_layout = eff_layout
     engine = execution.engine
+    if l2_fingerprints is not None:
+        l2_fingerprints["before"] = _l2_residency_digest(engine)
     engine.now = input_ready_ms
     inputs = {r: {key: engine.submit(
         _name(r, "input:" + key), release=max(value, input_ready_ms),
@@ -1162,6 +1174,8 @@ def _run_graph(
                 steps[r] = execution.add(work, r, input_ready_ms, external_inputs=inputs[r])
     unique_completions = tuple(dict.fromkeys(step.completion for step in steps.values()))
     engine.advance(until=unique_completions, first=False)
+    if l2_fingerprints is not None:
+        l2_fingerprints["after"] = _l2_residency_digest(engine)
     skipped_occurrences = filtered_non_barrier
     if not fast_span_only and getattr(execution, "_dedup_cohorts", None):
         from .runtime.dp_cohort_dedup import expand_dedup_graph_artifacts
@@ -1682,20 +1696,22 @@ def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=Non
         frozenset(int(r) for r in timeline_replicas)
         if timeline_replicas is not None else None
     )
-    fast_observer, fast_layer_events = (
+    fast_observer, fast_layer_events, fast_non_body_events = (
         _make_fast_layer_observer(
             layer_span_body_ids if isinstance(layer_span_body_ids, Mapping)
             else {oid: ("target", -1) for oid in layer_span_body_ids}
         )
-        if (fast_span_only and layer_span_body_ids) else (None, None)
+        if (fast_span_only and layer_span_body_ids) else (None, None, None)
     )
+    l2_fingerprints = {} if layer_span_body_ids is not None else None
     execution, engine, records, steps, stream_plans, skipped_occurrences, replica_observer = _run_graph(
         case, ops, graphs, scopes, groups, ctx, book, external, input_ready_ms,
         include_submission=include_submission, trace_limit=trace_limit,
         fast_span_only=fast_span_only, stream_plans=stream_plans,
         request_views=request_views, padded_tokens=padded_tokens, sequence_layout=sequence_layout,
         timeline_replicas=keep_replicas, compact=compact, isolated=isolated,
-        group_for=group_for, fast_observer=fast_observer)
+        group_for=group_for, fast_observer=fast_observer,
+        l2_fingerprints=l2_fingerprints)
     end = max((step.completion.time for step in steps.values()), default=input_ready_ms)
     duration = end - input_ready_ms
     if fast_span_only:
@@ -1724,6 +1740,15 @@ def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=Non
                 )
                 for lyr, evs in fast_layer_events.items() if evs
             }
+            out_fast["non_body_bounds"] = [
+                (float(r.time), float(c.time))
+                for r, c in (fast_non_body_events or ())
+            ]
+        if l2_fingerprints is not None:
+            out_fast["l2_residency_fingerprints"] = (
+                l2_fingerprints.get("before", ""),
+                l2_fingerprints.get("after", ""),
+            )
         return out_fast
     joins = _bind_collective_readiness(case, records, group_for, execution, replica_observer=replica_observer)
     costs, durations, isolated_sum, cohort_cache = [], {}, 0.0, {}
@@ -1762,7 +1787,7 @@ def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=Non
             record["op"].family != "barrier" and not record.get("_peer_only")
             for record in records) + skipped_occurrences,
     }
-    return _assemble_graph_result(
+    assembled = _assemble_graph_result(
         case, graphs, records, steps, execution, engine, rows, profile,
         resources, head, compact=compact, isolated=isolated, costs=costs,
         isolated_sum=isolated_sum, isolated_profile=isolated_profile,
@@ -1770,3 +1795,9 @@ def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=Non
         input_ready_ms=input_ready_ms, duration=duration,
         audit_allocations=audit_allocations,
     )
+    if l2_fingerprints is not None:
+        assembled["l2_residency_fingerprints"] = (
+            l2_fingerprints.get("before", ""),
+            l2_fingerprints.get("after", ""),
+        )
+    return assembled

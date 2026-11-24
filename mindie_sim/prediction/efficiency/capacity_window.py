@@ -346,9 +346,18 @@ def _resolve_speculative_tokens(case: CaseSpec, *, output_budget: int, tokens_pe
 
 
 def select_jointly_feasible_candidate(records: Sequence[Mapping[str, Any]]) -> Mapping[str, Any] | None:
-    """Return the highest-B candidate that passed both SLA and capacity in its own evaluation."""
+    """Return the throughput-maximizing candidate that passed both SLA and capacity."""
     feasible = [record for record in records if record and bool(record.get("feasible"))]
-    return max(feasible, key=lambda record: int(record["b"])) if feasible else None
+    if not feasible:
+        return None
+
+    def _objective(record: Mapping[str, Any]) -> tuple[float, int]:
+        b = int(record["b"])
+        step_ms = float(record.get("step_ms") or 0.0)
+        tps = (float(b) / step_ms) if step_ms > 0.0 else math.inf
+        return (tps, b)
+
+    return max(feasible, key=_objective)
 
 
 def apply_sla_baseline_gains(results: Sequence[dict[str, Any]],

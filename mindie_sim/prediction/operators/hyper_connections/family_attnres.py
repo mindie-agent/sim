@@ -175,9 +175,14 @@ def source_eligible(model, arch, phase):
     return not any(p.engram or p.hyper_connections for p in model.layer_plans)
 
 
-def source_image_match(runtime):
-    """LEGACY_PURGED: container image_id routing gate prohibited by DEV-READONLY-PATH."""
-    raise NotImplementedError("LEGACY_PURGED: wire ProbedAbiRegistry ArchId gating without container image_id")
+def source_image_match(runtime, *, machine=None) -> bool:
+    """Gate AttnResFwd availability strictly on ``ProbedAbiRegistry`` ``ArchId`` (no image_id)."""
+    arch = str(
+        (getattr(machine, "arch_family", "") if machine is not None else "")
+        or dict(getattr(runtime, "metadata", ()) or ()).get("arch_family")
+        or ""
+    ).strip().upper()
+    return _attnres_arch_supported(arch)
 
 
 def explicit_generic(kernels):

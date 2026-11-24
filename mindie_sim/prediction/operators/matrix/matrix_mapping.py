@@ -788,9 +788,13 @@ class MappedMatmul:
         )
         rows_key = tuple(int(v) for v in group_rows) if group_rows is not None else None
         compute_arch = getattr(host_ctx, "compute_arch", None)
+        if compute_arch is None:
+            compute_arch = getattr(getattr(host_ctx, "datapath", None), "compute_arch", None)
         arch_key = (
             getattr(compute_arch, "arch_id", None),
             getattr(compute_arch, "preset", None),
+            getattr(compute_arch, "clock_hz", None),
+            is_arch35_context(host_ctx),
         )
         cache_key = (
             _matmul_recipe_key(self), _op_matrix_key(host_ctx.op), host_ctx.core_count,

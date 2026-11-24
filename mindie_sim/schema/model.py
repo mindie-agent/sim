@@ -155,6 +155,7 @@ class LayerPlan:
     #: ``mla``/``mla_dsa``, ``swa``/``csa``/``csa2``/``hca``, ``gdn``/``kda``.
     architecture: str = "gqa"
     indexer_type: str = "none"          # none | c4 | full | shared
+    indexer_kind: str = ""              # "" | region_csa | qsa | lightning | msa
     candidate_filter: bool = False
     o_lora_rank: int = 0
     o_groups: int = 0
