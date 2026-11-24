@@ -245,7 +245,6 @@ ACLNN_MATRIX_DTYPES = frozenset({"bf16", "bfloat16", "fp16", "float16",
                                  "int4", "w4a8", "mxfp4"})
 ACLNN_VECTOR_DTYPES = frozenset({"bf16", "bfloat16", "fp16", "float16",
                                  "fp32", "float32"})
-ACLNN_ATTENTION_DTYPES = frozenset({"bf16", "bfloat16", "fp16", "float16"})
 ACLNN_ATTENTION_QUERY_DTYPES = ACLNN_VECTOR_DTYPES | frozenset({
     "fp8", "fp8_e4m3", "fp8_e5m2", "int8",
 })

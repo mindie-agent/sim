@@ -101,6 +101,7 @@ from mindie_sim.schema.scenario import (
     validate_deployment_mode,
 )
 from mindie_sim.schema.stack import StackTrack
+from mindie_sim.schema.workload import SpeculativeWorkloadPolicy
 from mindie_sim.stacks.registry import resolve_stack_for_scenario
 from mindie_sim.stacks.vllm_ascend.profiles import (
     VA_RECOMMENDED_PROFILES,
@@ -109,7 +110,6 @@ from mindie_sim.stacks.vllm_ascend.profiles import (
 from mindie_sim.schema.common import ModelingError
 
 BYTES_PER_GB = 1_000_000_000.0
-A3_DEFAULT_RANKS_PER_NODE = 16
 DEFAULT_RANKS_PER_NODE = 8
 DEFAULT_MAX_MODEL_LEN = 32768
 MIN_DEFAULT_MAX_SEQS = 16
@@ -126,7 +126,6 @@ DEFAULT_LOCAL_WIDTH = 1
 DEFAULT_REDUNDANT_EXPERTS = 0
 DEFAULT_SPECULATIVE_ACCEPT_RATE = 0.70
 _PARALLEL_AXES = ("tp", "dp", "ep", "pp", "pcp", "dcp")
-_VALID_DEPLOYMENT_MODES = DEPLOYMENT_MODES
 _VALID_DEPLOYMENT_ROLES = frozenset({"colocated", "pd_prefill", "pd_decode"})
 _CACHE_DTYPE_ALIASES = {"fp8": "fp8_e4m3", "c8": "int8"}
 _TOPOLOGY_PRESET_ARCH_PREFIXES = {"a2": "a2_", "a3": "a3_", "a5": "a5_"}
@@ -1067,6 +1066,7 @@ def _resolve_single_spine_contracts(
             "max_num_seqs": int(resolved_max_seqs),
             "kv_block_size": int(resolved_block_size),
             "num_speculative_tokens": int(mtp_tokens),
+            "speculative_k": int(mtp_tokens),
             "optimization_mode": "modeling" if canonical_track == "expected_ideal" else "simulation",
         })
         kv_dtype = model_options.get("kv_cache_dtype") or getattr(model_spec, "kv_dtype", None)
@@ -1111,6 +1111,7 @@ def _resolve_single_spine_contracts(
         tpot_slo_ms=scenario_options.get("tpot_slo_ms"),
         resolved_max_seqs=resolved_max_seqs, concurrency=scenario_options.get("concurrency"),
         canonical_track=canonical_track,
+        mtp_tokens=mtp_tokens,
     )
     register_composed_contracts(
         quant_plan=quant_plan, lowering_plan=lowering_plan, scenario_contract=scenario_contract,
@@ -1123,6 +1124,61 @@ def _resolve_single_spine_contracts(
         lowering_plan=lowering_plan, scenario_contract=scenario_contract,
     )
     return resolved_opts, quant_plan, lowering_plan, scenario_contract, summary
+
+
+_STACK_SPEC_METHOD_TO_CANONICAL: dict[str, str] = {
+    "none": "none",
+    "mtp": "mtp",
+    "deepseek_mtp": "mtp",
+    "qwen3_5_mtp": "mtp",
+    "dspark": "dspark",
+    "dflash": "dspark",
+    "eagle": "eagle",
+    "eagle3": "eagle3",
+    "ngram": "ngram",
+    "ngram_gpu": "ngram_gpu",
+}
+
+
+def _build_speculative_policy(
+    workload_domain: str,
+    model_spec: Any,
+    mtp_tokens: int,
+    resolved_opts: Any,
+    lowering_plan: Any,
+) -> SpeculativeWorkloadPolicy | None:
+    if workload_domain == "diffusion":
+        return None
+    sched_k = int(getattr(getattr(lowering_plan, "scheduling", None), "speculative_proposal_count", 0) or 0)
+    plan_stack_id = str(getattr(lowering_plan, "stack_id", "") or "")
+    eff_k = sched_k if (sched_k > 0 or plan_stack_id in {"raw-eager", "ideal-target"}) else int(mtp_tokens)
+    if eff_k <= 0:
+        return SpeculativeWorkloadPolicy(
+            spec_method="none", num_speculative_tokens=0, allow_synthetic_gqa=False,
+        )
+    aux = getattr(model_spec, "auxiliary", None)
+    dspark = getattr(aux, "dspark", None) if aux is not None else None
+    mtp = getattr(aux, "mtp", None) if aux is not None else None
+    draft = mtp if mtp is not None else dspark
+    is_synth = bool(getattr(draft, "is_synthetic", False)) if draft is not None else False
+    eff_map = dict(getattr(resolved_opts, "effective_mechanisms", ()) or ())
+    stack_method = _STACK_SPEC_METHOD_TO_CANONICAL.get(str(eff_map.get("spec_method") or "").strip().lower(), "")
+    if is_synth:
+        spec_method = "eagle3"
+    elif stack_method and stack_method != "none":
+        spec_method = stack_method
+    elif dspark is not None or (draft is not None and draft.kind in {"dspark", "mtp_dspark", "standalone_draft"}):
+        spec_method = "dspark"
+    elif draft is not None and (draft.kind == "eagle3" or draft.execution_mode == "eagle3_serial"):
+        spec_method = "eagle3"
+    else:
+        spec_method = "mtp"
+    return SpeculativeWorkloadPolicy(
+        spec_method=spec_method,
+        num_speculative_tokens=eff_k,
+        allow_synthetic_gqa=is_synth,
+        synthetic_draft_provenance=str(getattr(draft, "draft_provenance", "")) if is_synth else "",
+    )
 
 
 def _build_scenario_contract(
@@ -1145,6 +1201,7 @@ def _build_scenario_contract(
     resolved_max_seqs: int,
     concurrency: int | None,
     canonical_track: str,
+    mtp_tokens: int = 0,
 ) -> ScenarioContract | None:
     if eff_role not in {"colocated", "pd_disaggregated", "pd_prefill", "pd_decode"}:
         return None
@@ -1207,6 +1264,9 @@ def _build_scenario_contract(
         ready_state=ready,
         pd_transfer=lowering_plan.scheduling.pd_kv_transfer if eff_role == "pd_disaggregated" else None,
         provenance=(("role_arg", str(norm_role or "default_colocated")),),
+        speculative_policy=_build_speculative_policy(
+            workload_domain, model_spec, mtp_tokens, resolved_opts, lowering_plan,
+        ),
     )
 
 
@@ -1752,6 +1812,15 @@ def _compose_auto_deployment(
     return winner_case
 
 
+def _effective_mtp_from_plan(
+    lowering_plan: Any, mtp_tokens: int, resolved_mtp_accept: float,
+) -> tuple[int, float]:
+    sched_k = int(getattr(getattr(lowering_plan, "scheduling", None), "speculative_proposal_count", 0) or 0)
+    eff_k = sched_k if (sched_k > 0 and mtp_tokens > 0) else mtp_tokens
+    eff_accept = min(float(resolved_mtp_accept), float(1 + eff_k)) if eff_k > 0 else float(resolved_mtp_accept)
+    return eff_k, eff_accept
+
+
 def _compose_explicit_case(
     model, hardware, axes, norm_role, *, graph_capture_mode, raw_eager, feature_track,
     va_recommended, machine_options, model_options, mtp_options, scenario_options,
@@ -1805,11 +1874,13 @@ def _compose_explicit_case(
         max_model_len=scenario_options["max_model_len"],
         **mtp_options,
     )
-    allow_gqa_draft = (
-        bool(allow_synthetic_gqa_draft)
-        if allow_synthetic_gqa_draft is not None
-        else (mtp_source == "explicit")
-    )
+    optimization_mode = "modeling" if canonical_track == "expected_ideal" else "simulation"
+    allow_gqa_draft = bool(allow_synthetic_gqa_draft)
+    if allow_gqa_draft and optimization_mode != "modeling":
+        raise ModelingError(
+            "simulation_mode_forbids_synthetic_gqa_draft:"
+            "actual_deployment_requires_real_speculative_checkpoint"
+        )
     model_spec = prepare_speculation(
         model_spec, mtp_tokens, allow_synthetic_gqa=allow_gqa_draft,
     )
@@ -1882,6 +1953,7 @@ def _compose_explicit_case(
     model_dict["n_routed_experts"] = int(model_spec.num_experts)
     model_dict["num_experts_per_tok"] = int(model_spec.top_k)
 
+    eff_mtp_tokens, eff_mtp_accept = _effective_mtp_from_plan(_lowering_plan, mtp_tokens, resolved_mtp_accept)
     return _assemble_composed_case(
         model_spec, model_dict, machine, requests, slo_dict,
         resolved_axes=resolved_axes, sku=sku, hardware_backend=hardware_backend,
@@ -1889,7 +1961,7 @@ def _compose_explicit_case(
         stack_id=stack_id, single_spine_meta=single_spine_meta,
         norm_role=norm_role, scenario_declared=scenario_declared,
         policy_out=policy_out, raw_eager=raw_eager, moe_comm_mode=moe_comm_mode,
-        mtp_tokens=mtp_tokens, resolved_mtp_accept=resolved_mtp_accept,
+        mtp_tokens=eff_mtp_tokens, resolved_mtp_accept=eff_mtp_accept,
         resolved_max_seqs=resolved_max_seqs, resolved_max_batched=resolved_max_batched,
         resolved_max_model_len=resolved_max_model_len, resolved_block_size=resolved_block_size,
         graph_capture_mode=graph_capture_mode, canonical_track=canonical_track,

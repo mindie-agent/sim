@@ -272,7 +272,7 @@ def draft_terms(
         if draft.mhc_lowrank > ZERO:
             from mindie_sim.catalog.qwen4_exp import lowrank_hc_draft_head_terms
             terms.extend(lowrank_hc_draft_head_terms(draft))
-    if draft.kind == "mtp" and draft.target_shared_lm_head:
+    if draft.kind in {"mtp", "eagle3"} and draft.target_shared_lm_head:
         terms.append(WeightTerm(
             "target_lm_head_alias", draft.vocab_size, h,
             "target_alias_lm_head", "replicated", 1, 0, 0, 0, True, False,

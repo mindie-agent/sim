@@ -18,7 +18,6 @@ from mindie_sim.schema.common import ModelingError, dtype_bytes
 from mindie_sim.schema.physical_mechanisms import (MatrixPolicySpec,
                                                    MemoryHierarchySpec)
 
-CACHE_LINE = 128
 MAX_OWNERS = 32
 FP32_BYTES = 4
 

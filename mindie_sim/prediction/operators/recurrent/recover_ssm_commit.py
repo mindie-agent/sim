@@ -43,7 +43,6 @@ COMMIT_OWNER_CAPACITY_DEFAULT = 64
 COMMIT_KERNEL_ID = "RecoverSSMStateCommit"
 
 
-VERIFY_STAGE = "verify_compact_record"
 INTENT_STAGE = "commit_intent"
 BODY_BOUNDARY = "declared_body_input"
 ACCEPTANCE_BOUNDARY = "sampling_acceptance"

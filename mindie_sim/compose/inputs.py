@@ -9,9 +9,11 @@
   * Hardware SKUs resolve strictly against registered Ascend, NVIDIA, or custom
     profiles; unknown identifiers raise ``ModelingError("unknown_hardware_sku:...")``.
   * Local JSON metadata reads are capped at 50 MiB.
-  * Direct ``prepare_speculation`` synthesis of a 1-layer EAGLE/GQA draft
-    requires explicit ``allow_synthetic_gqa=True``; ``compose_case`` enables it
-    only for explicit ``mtp_proposal_tokens > 0`` on GQA models unless opted out.
+  * Direct ``prepare_speculation`` synthesis of a 1-layer EAGLE3/GQA draft
+    requires explicit ``allow_synthetic_gqa=True`` and stamps mandatory
+    ``is_synthetic=True`` + ``draft_provenance="synthetic_eagle3_gqa"``;
+    ``compose_case`` forbids synthetic draft synthesis in simulation mode and
+    never silently enables it in modeling mode.
 
 [Timeouts & Locks]
   Bounded local JSON config reads (< 50 MiB); no network, devices, or locks.
@@ -49,12 +51,11 @@ from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.model import ModelSpec
 from mindie_sim.schema.serialization import apply_model_overrides
 from mindie_sim.schema.stack import WorkUnitKind, WorkloadDomain
+from mindie_sim.schema.workload import SYNTHETIC_EAGLE3_GQA_PROVENANCE
 
 MAX_METADATA_MIB = 50
 BYTES_PER_KIB = 1024
 BYTES_PER_GIB = BYTES_PER_KIB * BYTES_PER_KIB * BYTES_PER_KIB
-MX_EXPERT_BLOCK_GROUP = 32
-MX_SCALE_PACK = 2
 NEXTN_DEFAULT_HEAD_DIM = 192
 from mindie_sim.backends.ascend import (
     A5_DT_144_GIB,
@@ -910,9 +911,13 @@ def _apply_structural_overrides(
 def prepare_speculation(model: ModelSpec, proposals: int, *,
                         allow_synthetic_gqa: bool = False) -> ModelSpec:
     """Declare a native draft or explicit 1-layer EAGLE/GQA draft when allowed."""
+    aux = model.auxiliary
+    if aux is not None:
+        attached = tuple(d for d in (aux.mtp, aux.dspark) if d is not None)
+        if any(bool(getattr(d, "is_synthetic", False)) for d in attached) and not allow_synthetic_gqa:
+            raise ModelingError("synthetic_draft_requires_explicit_allow_synthetic_gqa")
     if proposals <= 0:
         return model
-    aux = model.auxiliary
     if aux is not None and aux.standalone_draft:
         raise ModelingError("standalone_draft_requires_target_model")
     if aux is not None and (aux.mtp is not None or aux.dspark is not None):
@@ -941,7 +946,7 @@ def prepare_speculation(model: ModelSpec, proposals: int, *,
         or model.hidden_size
     )
     draft = DraftSpec(
-        kind="mtp", layers=1, hidden_size=model.hidden_size,
+        kind="eagle3", layers=1, hidden_size=model.hidden_size,
         intermediate_size=inter, num_heads=num_heads,
         num_kv_heads=num_kv_heads, head_dim=head_dim,
         q_width=(2 if q_gate else 1) * num_heads * head_dim,
@@ -958,6 +963,8 @@ def prepare_speculation(model: ModelSpec, proposals: int, *,
         vocab_size=model.vocab_size,
         activation_dtype=model.activation_dtype,
         execution_mode="eagle3_serial",
+        is_synthetic=True,
+        draft_provenance=SYNTHETIC_EAGLE3_GQA_PROVENANCE,
         source=(("kind", "explicit_synthetic_gqa_mtp"),),
     )
     return declare_native_auxiliary_plans(
@@ -966,19 +973,23 @@ def prepare_speculation(model: ModelSpec, proposals: int, *,
 
 
 def ensure_native_mla_draft(model_spec: ModelSpec, proposals: int) -> ModelSpec:
-    """Synthesize standard NextN MLA MTP when an MLA MoE model requests proposals."""
+    """Attach NextN MLA MTP only when the checkpoint declares ``num_nextn_predict_layers > 0``."""
     aux = model_spec.auxiliary
+    facts = dict(model_spec.catalog_facts)
+    if aux is not None and aux.mtp is not None:
+        src_kind = dict(getattr(aux.mtp, "source", ()) or ()).get("kind")
+        if (
+            src_kind == "standard_deepseek_nextn_mtp"
+            and int(facts.get("num_nextn_predict_layers", 0) or 0) <= 0
+        ):
+            raise ModelingError("fabricated_mla_nextn_draft_contradicts_checkpoint_zero_nextn")
     needs_draft = aux is None or (aux.mtp is None and aux.dspark is None)
     if proposals <= 0 or not needs_draft:
         return model_spec
     from mindie_sim.catalog.draft import declare_native_auxiliary_plans
 
-    facts = dict(model_spec.catalog_facts)
     nextn = int(facts.get("num_nextn_predict_layers", 0) or 0)
     moe_ref = next((p for p in model_spec.layer_plans if p.ffn == "moe"), None)
-    if (nextn <= 0 and moe_ref is not None and moe_ref.attention == "mla"
-            and moe_ref.q_lora_rank > 0):
-        nextn = 1
     if nextn > 0 and moe_ref is not None and moe_ref.attention == "mla":
         qk_dim = moe_ref.qk_nope_head_dim + moe_ref.qk_rope_head_dim
         draft = DraftSpec(

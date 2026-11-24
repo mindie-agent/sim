@@ -36,7 +36,6 @@ from mindie_sim.schema.model import ModelSpec
 from mindie_sim.schema.parallel import ParallelSpec
 
 _DEFAULT_MT = 128
-_DEFAULT_NT = 128
 _DEFAULT_KV_TILE = 128
 _DEFAULT_MC2_CHUNKS = 4
 _SUMMARY_CACHE_LIMIT = 32

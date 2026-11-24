@@ -96,8 +96,6 @@ C8_ACCUM_PASS_OPS = 2
 C8_FP32_BYTES = 4
 C8_BF16_BYTES = 2
 C8_HEAD_ALIGN = 16
-#: Source scalar/softmax state per owner: FP32 sinks, two accumulators, scores.
-C8_UB_PER_OWNER = 4 * 128 * C8_FP32_BYTES + 2 * C8_HEAD_ALIGN * 512 * C8_FP32_BYTES
 
 
 def packed_row_bytes(rope):

@@ -217,13 +217,6 @@ class _Grant:
     deferred: bool = False
 
 
-@dataclass(slots=True)
-class _Deferred:
-    allocation: AllocationKey
-    after: EventKey
-    generation: int
-    released_at: EventKey | None = None
-
 
 class Ledger:
     """Canonical ledger algorithms operating on ``RuntimeState``.

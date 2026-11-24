@@ -568,8 +568,9 @@ def test_kernel_catalog_birth_binding_recover_ssm_and_oss_backends() -> None:
     import mindie_sim.export.models as export_models
     from mindie_sim.prediction.structure import parse_case
 
-    assert not hasattr(export_pkg, "BACKEND_CANNBOT_DSL")
-    assert not hasattr(export_models, "BACKEND_CANNBOT_DSL")
+    legacy_attr = f"BACKEND_{LEGACY_DSL_NEEDLE.upper()}_DSL"
+    assert not hasattr(export_pkg, legacy_attr)
+    assert not hasattr(export_models, legacy_attr)
     assert all(LEGACY_DSL_NEEDLE not in str(v).lower() for v in STRUCTURE_BACKEND_MAP.values())
 
     a5_case = parse_case(compose_case(

@@ -779,3 +779,40 @@ owns = [
   "mindie_sim/export/models.py",
   "mindie_sim/cli/report.py",
 ]
+
+# ---------------------------------------------------------------- observations (reserved W1)
+[[module]]
+path = "observations/test_live_npu_subgraphs.py"
+tier = "live_npu"
+reserved = true
+owns = [
+  "tools/live_subgraph_parity_gate.py",
+  "mindie_sim/observations/subgraph_parity.py",
+]
+
+# ---------------------------------------------------------------- hygiene (Wave D0)
+[[module]]
+path = "hygiene/test_ag014_zero_model_name_branches.py"
+tier = "tier0"
+owns = [
+  "scripts/check_arch_governance.py",
+  "scripts/_arch_governance_runtime.py",
+]
+
+[[module]]
+path = "hygiene/test_d0_contracts.py"
+tier = "tier0"
+owns = [
+  "mindie_sim/schema/abi.py",
+  "mindie_sim/schema/common.py",
+  "mindie_sim/schema/stack.py",
+  "mindie_sim/schema/workload.py",
+  "mindie_sim/schema/scenario.py",
+  "mindie_sim/schema/model.py",
+  "mindie_sim/schema/operators.py",
+  "mindie_sim/catalog/draft_spec.py",
+  "mindie_sim/templates/contracts.py",
+  "mindie_sim/prediction/results.py",
+  "mindie_sim/prediction/native_binding.py",
+  "data/abi/abi_schema_manifest.json",
+]

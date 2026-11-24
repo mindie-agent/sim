@@ -42,8 +42,6 @@ CLOCK_ABS_TOLERANCE_MS: float = 1e-12
 #: into a bucket.  Only float summation residue below it is disclosed.
 CLOCK_GAP_LIMIT_FRACTION: float = 1e-3
 CLOCK_GAP_ABS_FLOOR_MS: float = 0.001
-VECTOR_BUCKET = "vector"
-MEMORY_BUCKET = "memory"
 METHOD = "ordered_critical_span_v1"
 OVERLAP_PRIORITY = ("cube", "vector", "memory", "communication")
 BUCKETS = OVERLAP_PRIORITY

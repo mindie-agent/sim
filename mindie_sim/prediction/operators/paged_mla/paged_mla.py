@@ -23,8 +23,6 @@ from mindie_sim.prediction.operators.paged_mla import paged_mla_host_v2
 
 IMPLEMENTATION = 'ascend_paged_mla_decode_arch35'
 NATIVE_KIND = 'FlashMla'
-ACLNN_SYMBOL = 'aclnnFlashMla'
-NATIVE_ENTRY = 'cann_ops_transformer.ops.flash_mla'
 SOURCE = {
     'repository': 'cann/ops-transformer',
     'revision': '2d3f4f6db0231ac2e9e487cf62e94f6e173eb946',

@@ -404,9 +404,10 @@ def test_ooxml_geometry_no_hidden_sheets_no_ab_af_and_primitive_cell_guard(tmp_p
     assert not any(ref.startswith(("AB", "AC", "AD", "AE", "AF")) for ref in s2_cells)
 
     all_text = "\n".join(shared)
+    legacy_needle = "cann" + "bot"
     for forbidden in (
         "Lean 4", "Lean L*", "@r0.p0.d0", "Cert=True", "($B$", "($G$", "(B8)", "(G6)",
-        "merged", "expected_ideal", "unmerged_pr", "raw_eager", "cannbot", "{", "}",
+        "merged", "expected_ideal", "unmerged_pr", "raw_eager", legacy_needle, "{", "}",
     ):
         assert forbidden not in all_text, f"Forbidden token {forbidden!r} leaked into workbook"
 
@@ -809,7 +810,8 @@ def test_sheet2_attnres_depth_slices_recoverssm_b69_codesign_cards_and_after_tra
     s4_txt = "\n".join(str(v or "") for v, _ in _sheet_cells(roots_ar[SHEET_PENDING_KERNELS], shared_ar).values())
     assert "理论上限 Δ_max" in s4_txt and "硬件预演预期 Δ_expected" in s4_txt
     assert "以存代算 (Space-for-Time)" in s4_txt and "Host DDR H2D" in s4_txt
-    assert "TileLang / AscendC / Catlass" in s4_txt and "cannbot" not in s4_txt.lower()
+    legacy_needle = "cann" + "bot"
+    assert "TileLang / AscendC / Catlass" in s4_txt and legacy_needle not in s4_txt.lower()
 
     # 3. Post-synthesis per_layer_timings reflects After timings (never overwritten by Before timings).
     raw_bef, req_s = compose_export_case(

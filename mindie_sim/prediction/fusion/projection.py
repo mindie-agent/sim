@@ -53,9 +53,6 @@ _QUANT_KINDS = frozenset({"dynamic_quant", "quant", "rms_norm_quant",
 _CUBE_FAMILIES = frozenset({"gemm", "gate_up_projection", "down_projection",
                             "shared_expert", "grouped_gemm", "attention",
                             "indexer", "native_fusion"})
-_WEIGHT_FAMILIES = frozenset({"gemm", "gate_up_projection", "down_projection",
-                              "shared_expert", "grouped_gemm", "attention",
-                              "native_fusion"})
 _STATE_FAMILIES = frozenset({"recurrent_vector", "short_convolution",
                              "cache_store", "kv_compress_epilog",
                              "indexer_quant_cache", "state_update",

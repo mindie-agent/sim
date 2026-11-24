@@ -917,10 +917,6 @@ class _MemoryLedgerMixin:
         hbm, _host = self._state_usage()
         return float(sum(max(row) for row in hbm[replica]))
 
-    def _update_combined_peak(self, replica: int, stage: int) -> None:
-        """Compatibility wrapper: peaks are committed-state only."""
-        self._sync_usage()
-
     # ------------------------------------------------------------------
     # Prepared weights, authoritative per-die receipt & HBM headroom
     # ------------------------------------------------------------------

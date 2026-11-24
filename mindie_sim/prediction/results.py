@@ -26,12 +26,13 @@ from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.schema.operators import OpSpec
 from mindie_sim.schema.scenario import ExecutionStage, ScenarioContract
-from mindie_sim.schema.stack import RuntimeQuantPlan, StackLoweringPlan
+from mindie_sim.schema.stack import STACK_TRACKS, RuntimeQuantPlan, StackLoweringPlan, StackTrack
 from mindie_sim.schema.workload import IterationPlan, RequestView
 from .streams import MAIN_STREAM, StreamId, StreamPlan, validate_stream_id
 
 if TYPE_CHECKING:
     from mindie_sim.feature_mechanisms import SoftwareStackSpec
+    from mindie_sim.prediction.capacity.ledger import ResidentMemoryReceipt
 
 Phase = Literal["prefill", "decode"]
 Scope = Literal["body", "model"]
@@ -39,6 +40,29 @@ Tier = Literal["unmerge", "mainline", "should_achieve"]
 WorkUnit = Literal["bytes", "flop", "op", "instruction"]
 OriginKind = Literal["caller", "stack_profile", "body_default"]
 DEFAULT_STACK_NAME = "vllm-ascend"
+NS_PER_MS = 1_000_000
+
+CANONICAL_STAGE_IDS: tuple[str, ...] = (
+    "before_merged",
+    "stage1_ops_config",
+    "stage2_unmerged_pr",
+    "stage3_target_after",
+)
+CANONICAL_STAGE_DELTA_COUNT = len(CANONICAL_STAGE_IDS) - 1
+StageId = Literal[
+    "before_merged",
+    "stage1_ops_config",
+    "stage2_unmerged_pr",
+    "stage3_target_after",
+]
+STAGE_COMMIT_STATUSES: frozenset[str] = frozenset({
+    "committed", "infeasible", "rejected_by_policy", "skipped",
+})
+StageCommitStatus = Literal["committed", "infeasible", "rejected_by_policy", "skipped"]
+COMPARISON_POLICIES: frozenset[str] = frozenset({
+    "monotonic_optimization", "diagnostic_unconstrained", "simulation_only",
+})
+ComparisonPolicy = Literal["monotonic_optimization", "diagnostic_unconstrained", "simulation_only"]
 
 JsonValue: TypeAlias = (
     "None | bool | int | float | str | tuple[JsonValue, ...] "
@@ -537,6 +561,270 @@ class ResolvedBase:
     stack_lowering_plan: StackLoweringPlan | None = None
 
 
+def _exact_int(value: object, code: str, *, minimum: int | None = None) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ModelingError(f"{code}:{value!r}")
+    if minimum is not None and value < minimum:
+        raise ModelingError(f"{code}:{value!r}")
+    return int(value)
+
+
+def _req_nonempty_str(value: object, code: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ModelingError(code)
+    return value.strip()
+
+
+@dataclass(frozen=True, slots=True)
+class SubStageReceipt:
+    """One named sub-stage exposed-time attribution entry inside a ``StageReceipt``."""
+
+    substage_id: str
+    owner: str
+    exposed_ns: int
+    stream: StreamId = MAIN_STREAM
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "substage_id", _req_nonempty_str(self.substage_id, "substage_receipt_id_required"))
+        object.__setattr__(self, "owner", _req_nonempty_str(self.owner, "substage_receipt_owner_required"))
+        object.__setattr__(self, "exposed_ns", _exact_int(self.exposed_ns, "substage_receipt_exposed_ns_invalid", minimum=0))
+        object.__setattr__(self, "stream", coerce_stream(self.stream))
+
+
+@dataclass(frozen=True, slots=True)
+class StageReceipt:
+    """Exact integer-nanosecond execution and conservation receipt for one canonical stage."""
+
+    stage_id: StageId
+    stack_track: StackTrack
+    start_tick_ns: int
+    end_tick_ns: int
+    span_ns: int
+    l_star_ns: int
+    l_star_valid: bool
+    execution_key_sha256: str
+    plan_sha256: str
+    idle_or_wait_ns: int
+    exposed_ns_by_occ: tuple[tuple[str, int], ...] = ()
+    committed_case_digest: str = ""
+    status: StageCommitStatus = "committed"
+    primitive_table_digest: str = ""
+    step_eval: StepEvaluation | None = None
+    memory_receipt: ResidentMemoryReceipt | None = None
+    sub_stage_receipts: tuple[SubStageReceipt, ...] = ()
+    rejection_reason: str = ""
+
+    def __post_init__(self) -> None:
+        if self.stage_id not in CANONICAL_STAGE_IDS:
+            raise ModelingError(f"stage_receipt_stage_id_invalid:{self.stage_id!r}")
+        if self.stack_track not in STACK_TRACKS:
+            raise ModelingError(f"stage_receipt_stack_track_invalid:{self.stack_track!r}")
+        if self.status not in STAGE_COMMIT_STATUSES:
+            raise ModelingError(f"stage_receipt_status_invalid:{self.status!r}")
+        start_ns = _exact_int(self.start_tick_ns, "stage_receipt_start_tick_invalid", minimum=0)
+        end_ns = _exact_int(self.end_tick_ns, "stage_receipt_end_tick_invalid", minimum=0)
+        span_ns = _exact_int(self.span_ns, "stage_receipt_span_ns_invalid", minimum=0)
+        l_star_ns = _exact_int(self.l_star_ns, "stage_receipt_l_star_ns_invalid", minimum=0)
+        idle_ns = _exact_int(self.idle_or_wait_ns, "stage_receipt_idle_ns_invalid", minimum=0)
+        if not isinstance(self.l_star_valid, bool):
+            raise ModelingError("stage_receipt_l_star_valid_flag_invalid")
+        if end_ns < start_ns or span_ns != end_ns - start_ns:
+            raise ModelingError(
+                f"stage_receipt_tick_span_mismatch:start={start_ns}:end={end_ns}:span={span_ns}"
+            )
+        occ_rows = tuple(
+            (_req_nonempty_str(occ_id, "stage_receipt_occ_id_required"),
+             _exact_int(ns, "stage_receipt_occ_ns_invalid", minimum=0))
+            for occ_id, ns in self.exposed_ns_by_occ
+        )
+        sub_rows = tuple(self.sub_stage_receipts)
+        if not all(isinstance(row, SubStageReceipt) for row in sub_rows):
+            raise ModelingError("stage_receipt_sub_stage_receipts_invalid")
+        object.__setattr__(self, "exposed_ns_by_occ", occ_rows)
+        object.__setattr__(self, "sub_stage_receipts", sub_rows)
+        if self.step_eval is not None and not isinstance(self.step_eval, StepEvaluation):
+            raise ModelingError("stage_receipt_step_eval_invalid")
+        if self.status == "committed":
+            _req_nonempty_str(self.execution_key_sha256, "stage_receipt_execution_key_required")
+            _req_nonempty_str(self.primitive_table_digest, "stage_receipt_primitive_table_digest_required")
+            if (
+                self.step_eval is not None
+                and self.step_eval.primitive_table_digest != self.primitive_table_digest
+            ):
+                raise ModelingError("stage_receipt_primitive_table_digest_mismatch")
+            if not self.l_star_valid:
+                raise ModelingError(f"stage_receipt_committed_requires_valid_l_star:{self.stage_id}")
+            if l_star_ns > span_ns:
+                raise ModelingError(
+                    f"stage_receipt_l_star_exceeds_span:l_star={l_star_ns}>span={span_ns}"
+                )
+            accounted = sum(ns for _, ns in occ_rows) + idle_ns
+            if accounted != span_ns:
+                raise ModelingError(
+                    f"stage_receipt_observer_conservation_failed:stage={self.stage_id}:"
+                    f"accounted={accounted}!=span={span_ns}:residual={span_ns - accounted}"
+                )
+        else:
+            if (
+                self.step_eval is not None
+                and self.step_eval.primitive_table_digest
+                and self.primitive_table_digest
+                and self.step_eval.primitive_table_digest != self.primitive_table_digest
+            ):
+                raise ModelingError("stage_receipt_primitive_table_digest_mismatch")
+            if not isinstance(self.rejection_reason, str) or not self.rejection_reason.strip():
+                raise ModelingError(f"stage_receipt_non_committed_requires_reason:{self.stage_id}:{self.status}")
+
+    @property
+    def span_ms(self) -> float:
+        return self.span_ns / float(NS_PER_MS)
+
+    @property
+    def l_star_ms(self) -> float:
+        return self.l_star_ns / float(NS_PER_MS)
+
+    @property
+    def headroom_ns(self) -> int:
+        return self.span_ns - self.l_star_ns
+
+
+@dataclass(frozen=True, slots=True)
+class EngineStepReceipt:
+    """Single-Engine 4-stage causal waterfall receipt with exact 0 ns integer telescoping."""
+
+    scenario_digest: str
+    primitive_table_digest: str
+    comparison_policy: ComparisonPolicy
+    stages: tuple[StageReceipt, ...]
+    telescoping_deltas_ns: tuple[int, ...] = ()
+    endpoints: tuple[tuple[str, int], ...] = ()
+    final_bound_ns: int = 0
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "scenario_digest", _req_nonempty_str(self.scenario_digest, "engine_receipt_scenario_digest_required"))
+        object.__setattr__(
+            self, "primitive_table_digest", _req_nonempty_str(self.primitive_table_digest, "engine_receipt_primitive_digest_required")
+        )
+        if self.comparison_policy not in COMPARISON_POLICIES:
+            raise ModelingError(f"engine_receipt_comparison_policy_invalid:{self.comparison_policy!r}")
+        stages = tuple(self.stages)
+        if not stages or not all(isinstance(s, StageReceipt) for s in stages):
+            raise ModelingError("engine_receipt_stages_invalid")
+        stage_ids = [s.stage_id for s in stages]
+        if len(set(stage_ids)) != len(stage_ids):
+            raise ModelingError("engine_receipt_duplicate_stage_id")
+        order_indices = [CANONICAL_STAGE_IDS.index(sid) for sid in stage_ids]
+        if order_indices != sorted(order_indices) or stage_ids[0] != CANONICAL_STAGE_IDS[0]:
+            raise ModelingError(f"engine_receipt_stage_order_invalid:{stage_ids!r}")
+        for stage in stages:
+            if stage.status == "committed" and stage.primitive_table_digest != self.primitive_table_digest:
+                raise ModelingError(
+                    f"engine_receipt_shared_primitive_table_violated:{stage.stage_id}"
+                )
+            if stage.primitive_table_digest and stage.primitive_table_digest != self.primitive_table_digest:
+                raise ModelingError(
+                    f"engine_receipt_shared_primitive_table_violated:{stage.stage_id}"
+                )
+            if (
+                stage.step_eval is not None
+                and (
+                    stage.status == "committed"
+                    or bool(stage.step_eval.primitive_table_digest)
+                )
+                and stage.step_eval.primitive_table_digest != self.primitive_table_digest
+            ):
+                raise ModelingError(
+                    f"engine_receipt_step_eval_primitive_table_violated:{stage.stage_id}"
+                )
+        object.__setattr__(self, "stages", stages)
+        if self.comparison_policy == "simulation_only":
+            stage3 = self.stage_for("stage3_target_after")
+            if stage3 is not None and stage3.status == "committed":
+                raise ModelingError("engine_receipt_simulation_forbids_committed_stage3_target")
+        self._finalize_telescoping_and_bounds()
+        self.assert_zero_ns_empty_identity()
+        if self.comparison_policy == "monotonic_optimization":
+            self.assert_stage_monotonicity()
+
+    def _finalize_telescoping_and_bounds(self) -> None:
+        by_id = {s.stage_id: s for s in self.stages}
+        base = by_id[CANONICAL_STAGE_IDS[0]]
+        if base.status != "committed":
+            raise ModelingError("engine_receipt_before_merged_must_be_committed")
+        spans: list[int] = [base.span_ns]
+        last_committed = base
+        for sid in CANONICAL_STAGE_IDS[1:]:
+            rec = by_id.get(sid)
+            if rec is not None and rec.status == "committed":
+                spans.append(rec.span_ns)
+                last_committed = rec
+            else:
+                spans.append(spans[-1])
+        expected_deltas = tuple(spans[idx] - spans[idx + 1] for idx in range(CANONICAL_STAGE_DELTA_COUNT))
+        if not self.telescoping_deltas_ns:
+            object.__setattr__(self, "telescoping_deltas_ns", expected_deltas)
+        else:
+            provided = tuple(_exact_int(d, "engine_receipt_delta_invalid") for d in self.telescoping_deltas_ns)
+            if len(provided) != CANONICAL_STAGE_DELTA_COUNT or provided != expected_deltas:
+                raise ModelingError(
+                    f"engine_receipt_telescoping_mismatch:got={provided}:expected={expected_deltas}"
+                )
+            object.__setattr__(self, "telescoping_deltas_ns", provided)
+        if sum(self.telescoping_deltas_ns) != spans[0] - spans[-1]:
+            raise ModelingError("engine_receipt_telescoping_sum_mismatch")
+        expected_endpoints = tuple((s.stage_id, s.span_ns) for s in self.stages)
+        if not self.endpoints:
+            object.__setattr__(self, "endpoints", expected_endpoints)
+        else:
+            pts = tuple((_req_nonempty_str(k, "engine_receipt_endpoint_key_invalid"), _exact_int(v, "engine_receipt_endpoint_ns_invalid", minimum=0)) for k, v in self.endpoints)
+            if pts != expected_endpoints:
+                raise ModelingError(
+                    f"engine_receipt_endpoints_mismatch:got={pts}:expected={expected_endpoints}"
+                )
+            object.__setattr__(self, "endpoints", pts)
+        bound = _exact_int(self.final_bound_ns, "engine_receipt_final_bound_invalid", minimum=0)
+        if bound == 0 and last_committed.l_star_ns > 0:
+            bound = last_committed.l_star_ns
+            object.__setattr__(self, "final_bound_ns", bound)
+        if bound > last_committed.span_ns:
+            raise ModelingError(
+                f"engine_receipt_final_bound_exceeds_span:bound={bound}>span={last_committed.span_ns}"
+            )
+
+    def stage_for(self, stage_id: StageId) -> StageReceipt | None:
+        for stage in self.stages:
+            if stage.stage_id == stage_id:
+                return stage
+        return None
+
+    def assert_stage_monotonicity(self) -> bool:
+        """Verify non-increasing integer span_ns across committed stages and valid L* bounds."""
+        committed = [s for s in self.stages if s.status == "committed"]
+        for prev, curr in zip(committed, committed[1:]):
+            if curr.span_ns > prev.span_ns:
+                raise ModelingError(
+                    f"engine_receipt_stage_monotonicity_violated:"
+                    f"{prev.stage_id}({prev.span_ns})<{curr.stage_id}({curr.span_ns})"
+                )
+        for stage in committed:
+            if not stage.l_star_valid or stage.l_star_ns > stage.span_ns:
+                raise ModelingError(f"engine_receipt_stage_l_star_invalid:{stage.stage_id}")
+        return True
+
+    def assert_zero_ns_empty_identity(self) -> bool:
+        """Verify identical execution keys and plans yield an exact 0 ns span delta."""
+        committed = [s for s in self.stages if s.status == "committed"]
+        for prev, curr in zip(committed, committed[1:]):
+            same_key = prev.execution_key_sha256 == curr.execution_key_sha256
+            same_plan = prev.plan_sha256 == curr.plan_sha256
+            if same_key and same_plan and prev.span_ns != curr.span_ns:
+                raise ModelingError(
+                    f"engine_receipt_empty_identity_nonzero_delta:"
+                    f"{prev.stage_id}({prev.span_ns})!={curr.stage_id}({curr.span_ns})"
+                )
+        return True
+
+
 def aligned_table_for(
     step: StepEvaluation,
     *,
@@ -553,8 +841,13 @@ def aligned_table_for(
 
 __all__ = [
     "AlignedSequenceTable",
+    "CANONICAL_STAGE_DELTA_COUNT",
+    "CANONICAL_STAGE_IDS",
+    "COMPARISON_POLICIES",
     "CaseInput",
+    "ComparisonPolicy",
     "DEFAULT_STACK_NAME",
+    "EngineStepReceipt",
     "FrozenJsonMapping",
     "FusedPipelineDescriptor",
     "FusedPipelineSpec",
@@ -563,6 +856,7 @@ __all__ = [
     "JsonValue",
     "LoweringRequest",
     "ModelInput",
+    "NS_PER_MS",
     "OpOccurrence",
     "OperatorSequenceRow",
     "OriginKind",
@@ -571,15 +865,20 @@ __all__ = [
     "RankOps",
     "ReplayOptions",
     "ResolvedBase",
+    "STAGE_COMMIT_STATUSES",
     "Scope",
     "ServiceEvaluation",
     "SlaCandidate",
     "SlaEvaluation",
     "SlaRequest",
+    "StageCommitStatus",
+    "StageId",
+    "StageReceipt",
     "StepEvaluation",
     "StepRequest",
     "StructureExport",
     "StructureRequest",
+    "SubStageReceipt",
     "SweepRequest",
     "ThreeTierComparison",
     "ThreeTierEvaluation",

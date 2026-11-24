@@ -186,7 +186,6 @@ _FAQUANT_BUFFER_TOKENS = ("fa_q", "fa_k", "fa_v", "faquant", "fakquant")
 _KIMI_K3_TYPES = frozenset({"kimi_k3", "kimi_k31"})
 _GLM5_NEXT_TYPES = frozenset({"glm5_next", "glm5_next_text"})
 _QWEN4_EXP_TYPES = frozenset({"qwen4_exp", "qwen4_exp_text"})
-_DEFAULT_DRAFT_KV_CAP = 0
 PORT_ABI_PLAN_CACHE_MAX = 64
 _PORT_ABI_PLAN_CACHE: OrderedDict[
     tuple[Any, ...],

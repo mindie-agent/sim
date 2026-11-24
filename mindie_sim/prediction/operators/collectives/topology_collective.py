@@ -20,14 +20,9 @@ from mindie_sim.prediction.physical_recipe_base import (IO_HBM_CATEGORY, Phase, 
 from mindie_sim.prediction.program import KernelProgram, Stage
 
 HALF_SHARE = 0.5
-PACK_READ_SHARE = 0.25
-UNPACK_WRITE_SHARE = 0.25
 REDUCE_VECTOR_SHARE = 0.50
 MESH_ALGORITHM = "direct_mesh"
 ALLREDUCE_FAMILIES = frozenset({"allreduce", "tp_allreduce"})
-SINGLE_PHASE_FAMILIES = frozenset({
-    "allgather", "reduce_scatter", "alltoall", "engram_broadcast", "engram_ids",
-})
 
 
 def _pack_phase(read_share):

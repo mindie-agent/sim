@@ -64,7 +64,6 @@ _VECTOR_LANES_UINT8 = 256
 # And, one pairwise Max and one ReduceMaxWithDataBlock.  ComputeData loads two
 # vectors, two Multiply, one Interleave, two Cast and two packed stores.
 _MAX_EXP_OPS_PER_256 = 6
-_DATA_OPS_PER_256 = 9
 _SCALE_OPS_PER_GROUP = 15
 _FP16_MAX_EXP_CALLS_PER_LOOP = 14
 _FP16_DATA_CALLS_PER_LOOP = 19

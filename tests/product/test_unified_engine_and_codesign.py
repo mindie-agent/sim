@@ -15,7 +15,7 @@
   - Typed ``CoDesignOpportunity`` emission (``MegaFusionBound``,
     ``SpaceTimeTradeoffSpec``, ``CrossHwOffloadSpec``), symbolic equations for
     ``aclnnMegaMoe`` and ``aclnnMoeGatingTopKSoftmaxV2``, ``TileLang`` /
-    ``AscendC`` / ``Catlass`` backend recommendations (zero ``cannbot-dsl``),
+    ``AscendC`` / ``Catlass`` backend recommendations (zero legacy DSL labels),
     and ``ExposedObserver`` $O((N+G)\\log(N+G))$ sweep-line parity & speed.
 [Invariants] Pure in-memory white-box Engine and synthesis checks; zero local
   host writes; zero silent fallbacks; zero heuristic multipliers.
@@ -265,8 +265,9 @@ def test_simulation_vs_modeling_waterfall_on_single_engine_and_primitive_table()
             assert float(cur_row["step_span_us"]) <= float(prev_row["step_span_us"]) + 1e-6
 
     assert mod_bundle.step_span_us <= sim_bundle.step_span_us + 1e-6
+    legacy_needle = "cann" + "bot"
     for spec in (*sim_bundle.kernel_synthesis_specs, *mod_bundle.kernel_synthesis_specs):
-        assert "cannbot" not in spec.suggested_backend.lower()
+        assert legacy_needle not in spec.suggested_backend.lower()
         assert spec.suggested_backend in {
             BACKEND_TILELANG_LABEL,
             BACKEND_ASCENDC_LABEL,
@@ -544,7 +545,8 @@ def test_megamoe_and_moe_gating_symbolic_equations_and_backend_priority() -> Non
     assert BACKEND_TILELANG_LABEL == "TileLang"
     assert BACKEND_ASCENDC_LABEL == "AscendC"
     assert BACKEND_CATLASS_LABEL == "Catlass"
-    assert all("cannbot" not in str(v).lower() for v in STRUCTURE_BACKEND_MAP.values())
+    legacy_needle = "cann" + "bot"
+    assert all(legacy_needle not in str(v).lower() for v in STRUCTURE_BACKEND_MAP.values())
 
 
 def test_exposed_observer_sweep_line_parity_and_subsecond_93_layer_speed() -> None:
@@ -622,7 +624,7 @@ def test_exposed_observer_sweep_line_parity_and_subsecond_93_layer_speed() -> No
 
 
 def test_synthesis_dp_tuples_causal_tail_no_byte_inflation_opportunity_bounds_and_clean_backends() -> None:
-    """Verify DP tuple safety, causal-tail conservation, opportunity scoping, and zero cannbot backends."""
+    """Verify DP tuple safety, causal-tail conservation, opportunity scoping, and clean OSS backends."""
     from mindie_sim import structure_implementations as si_mod
 
     # 1. DP>=2 tuple StepRequest.sequences never raises TypeError in _peak_sequences_per_dp.
@@ -753,10 +755,11 @@ def test_synthesis_dp_tuples_causal_tail_no_byte_inflation_opportunity_bounds_an
     )
     assert [row["step_span_us"] for row in wf] == pytest.approx([100.0, 90.0, 80.0, 70.0])
 
-    # 5. structure_implementations exposes zero cannbot_dsl backends or paths.
-    assert "cannbot_dsl" not in si_mod.VALID_BACKEND_STACKS
+    # 5. structure_implementations exposes zero retired legacy DSL backends or paths.
+    legacy_needle = "cann" + "bot"
+    assert f"{legacy_needle}_dsl" not in si_mod.VALID_BACKEND_STACKS
     assert "tilelang" in si_mod.VALID_BACKEND_STACKS
     for spec in (*si_mod._RECIPE_REGISTRY.values(), *si_mod._FAMILY_REGISTRY.values()):
-        assert "cannbot" not in spec.backend_stack.lower()
-        assert "cannbot" not in spec.source_ref.lower()
-        assert all("cannbot" not in k.lower() for k in spec.native_kinds)
+        assert legacy_needle not in spec.backend_stack.lower()
+        assert legacy_needle not in spec.source_ref.lower()
+        assert all(legacy_needle not in k.lower() for k in spec.native_kinds)

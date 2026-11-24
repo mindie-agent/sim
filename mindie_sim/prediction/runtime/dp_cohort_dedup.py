@@ -38,7 +38,6 @@ _NATIVE_MC2_FAMILIES = frozenset({"mc2_protocol", "mc2_transport"})
 _RANK_LABEL_METADATA_KEYS = frozenset({"ep_rank", "dp_rank", "replica", "rank_id"})
 _PAIR_RE = re.compile(r"^(?P<pfx>.+):pair(?P<src>\d+)>(?P<dst>\d+)$")
 _PORT_RE = re.compile(r"^(?P<pfx>.+):(?P<dir>tx|rx):port(?P<rk>\d+)$")
-_REPLICA_TAG_RE = re.compile(r"@r(\d+):")
 
 
 def dp_dedup_enabled() -> bool:

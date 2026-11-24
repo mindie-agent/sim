@@ -249,13 +249,14 @@ def test_sequence_parallel_close_output_replicated_vs_fail_fast_contracts():
 
 
 def test_gqa_explicit_mtp_synthesizes_eagle_draft_and_replays_at_long_context():
-    """Explicit mtp_proposal_tokens on a GQA model without native MTP builds 1-layer EAGLE draft."""
+    """Explicit modeling opt-in on a GQA model builds a tagged 1-layer synthetic EAGLE3 draft."""
     raw_128k = compose_case(
         "qwen3-32b", "a3",
         tp=QWEN_TP, dp=1, layers=QWEN_REPLAY_LAYERS,
         prompt_tokens=CONTEXT_128K, output_tokens=OUTPUT_1K,
         max_model_len=EXTENDED_MAX_MODEL_LEN,
         mtp_proposal_tokens=MTP_PROPOSALS, mtp_acceptance_length=MTP_ACCEPT_LEN,
+        feature_track="expected_ideal", allow_synthetic_gqa_draft=True,
     )
     case = parse_case(raw_128k)
     assert case.machine.sku == resolve_hardware_sku("a3")
@@ -267,7 +268,9 @@ def test_gqa_explicit_mtp_synthesizes_eagle_draft_and_replays_at_long_context():
 
     assert case.model.auxiliary is not None and case.model.auxiliary.mtp is not None
     mtp = case.model.auxiliary.mtp
-    assert mtp.kind == "mtp"
+    assert mtp.kind == "eagle3"
+    assert mtp.is_synthetic is True
+    assert mtp.draft_provenance == "synthetic_eagle3_gqa"
     assert mtp.layers == 1
     assert mtp.attention_kind == "gqa"
     assert mtp.execution_mode == "eagle3_serial"
@@ -306,18 +309,19 @@ def test_gqa_explicit_mtp_synthesizes_eagle_draft_and_replays_at_long_context():
         assert not any(report["execution"]["live_allocated"].values())
     assert dec_report["included_components"]["draft_layers"] == 1
 
-    # Native 32K horizon also composes cleanly without needing max_model_len override.
+    # Native 32K horizon also composes cleanly with explicit modeling opt-in.
     raw_32k = compose_case(
         "qwen3-32b", "a3",
         tp=QWEN_TP, dp=1, layers=QWEN_REPLAY_LAYERS,
         prompt_tokens=NATIVE_PROMPT_32K, output_tokens=OUTPUT_1K,
         mtp_proposal_tokens=MTP_PROPOSALS, mtp_acceptance_length=MTP_ACCEPT_LEN,
+        feature_track="expected_ideal", allow_synthetic_gqa_draft=True,
     )
     assert raw_32k["runtime"]["metadata"]["draft_proposal_tokens"] == MTP_PROPOSALS
 
 
 def test_gqa_synthetic_draft_preserves_fail_fast_and_profile_opt_out_contracts():
-    """Direct prepare_speculation default, explicit opt-out, non-GQA, and horizon guards stay strict."""
+    """Simulation never fabricates drafts; modeling requires explicit opt-in; horizon stays strict."""
     qwen_model = load_model("qwen3-32b")
     with pytest.raises(ModelingError, match="draft_structure_required_for_mtp_proposal_tokens"):
         prepare_speculation(qwen_model, MTP_PROPOSALS)
@@ -327,7 +331,22 @@ def test_gqa_synthetic_draft_preserves_fail_fast_and_profile_opt_out_contracts()
             "qwen3-32b", "a3", tp=QWEN_TP, dp=1, layers=QWEN_REPLAY_LAYERS,
             prompt_tokens=NATIVE_PROMPT_32K, output_tokens=OUTPUT_1K,
             mtp_proposal_tokens=MTP_PROPOSALS, mtp_acceptance_length=MTP_ACCEPT_LEN,
-            allow_synthetic_gqa_draft=False,
+        )
+
+    with pytest.raises(ModelingError, match="simulation_mode_forbids_synthetic_gqa_draft"):
+        compose_case(
+            "qwen3-32b", "a3", tp=QWEN_TP, dp=1, layers=QWEN_REPLAY_LAYERS,
+            prompt_tokens=NATIVE_PROMPT_32K, output_tokens=OUTPUT_1K,
+            mtp_proposal_tokens=MTP_PROPOSALS, mtp_acceptance_length=MTP_ACCEPT_LEN,
+            allow_synthetic_gqa_draft=True,
+        )
+
+    with pytest.raises(ModelingError, match="draft_structure_required_for_mtp_proposal_tokens"):
+        compose_case(
+            "qwen3-32b", "a3", tp=QWEN_TP, dp=1, layers=QWEN_REPLAY_LAYERS,
+            prompt_tokens=NATIVE_PROMPT_32K, output_tokens=OUTPUT_1K,
+            mtp_proposal_tokens=MTP_PROPOSALS, mtp_acceptance_length=MTP_ACCEPT_LEN,
+            feature_track="expected_ideal",
         )
 
     non_gqa = replace(qwen_model, attention="linear")
@@ -351,4 +370,5 @@ def test_gqa_synthetic_draft_preserves_fail_fast_and_profile_opt_out_contracts()
             "qwen3-32b", "a3", tp=QWEN_TP, dp=1, layers=QWEN_REPLAY_LAYERS,
             prompt_tokens=CONTEXT_128K, output_tokens=OUTPUT_1K,
             mtp_proposal_tokens=MTP_PROPOSALS, mtp_acceptance_length=MTP_ACCEPT_LEN,
+            feature_track="expected_ideal", allow_synthetic_gqa_draft=True,
         )

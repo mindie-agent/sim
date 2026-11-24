@@ -1053,6 +1053,506 @@ def _check_ag013_anti_hardcoding(rel: PurePosixPath, tree: ast.Module) -> list[V
     return violations
 
 
+_AG014_CONFIG_EXEMPT_FILES = frozenset({
+    "mindie_sim/model_catalog.py",
+    "mindie_sim/catalog/hf_config.py",
+    "mindie_sim/catalog/specs.py",
+    "mindie_sim/catalog/checkpoint_reader.py",
+    "mindie_sim/catalog/npu_checkpoints.py",
+    "mindie_sim/stacks/vllm_ascend/checkpoint_registry.py",
+    "mindie_sim/export/script_audit.py",
+})
+_AG014_CONFIG_EXEMPT_PREFIXES = ("mindie_sim/catalog/configs/",)
+_AG014_ALLOWED_TIER_TOKENS = frozenset({
+    "K1", "K2", "K3", "K1_shipping", "K1_proposed_pr", "K2_epilogue", "K3_dsl_pipeline",
+})
+_AG014_CAMEL_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
+_AG014_MODEL_TOKEN_RE = re.compile(
+    r"(?:^|[^a-z0-9])("
+    r"kimi(?:[-_]?k\d*(?:\.\d+)?)?"
+    r"|k3(?:\.\d+|_\d+)?"
+    r"|qwen(?:\d\w*)?"
+    r"|deepseek\w*"
+    r"|glm(?:[-_]?\d\w*)?"
+    r"|minimax\w*"
+    r"|step[-_]?5\w*"
+    r"|gemma(?:[-_]?\d\w*)?"
+    r"|longcat\w*"
+    r"|bailing\w*"
+    r"|nemotron\w*"
+    r"|llama(?:[-_]?\d\w*)?"
+    r"|mistral\w*|mixtral\w*|internlm\w*|baichuan\w*"
+    r")(?:[^a-z0-9]|$)",
+    re.IGNORECASE,
+)
+_AG014_IDENTITY_NAMES = frozenset({
+    "model_name", "model_id", "canonical_model", "model_type",
+    "architecture", "architectures", "case_id", "model_family", "family_name",
+})
+_AG014_IDENTITY_OWNERS = frozenset({
+    "model", "model_spec", "spec", "target_model", "case", "config", "cfg",
+})
+_AG014_STR_METHODS = frozenset({"startswith", "endswith", "find", "index"})
+_AG014_REGEX_METHODS = frozenset({"search", "match", "fullmatch"})
+_AG014_MANIFEST_REL = PurePosixPath("mindie_sim/stacks/vllm_ascend/manifest.json")
+_AG014_NATIVE_OP_ABI_RE = re.compile(
+    r"^[A-Z][A-Za-z0-9]*(?:RmsNorm|LayerNorm|Norm|Attention|Attn|Rope|RoPE|Mla|Matmul|Gemm|Conv|Quant|Kernel|Op|Linear|Projection|Prolog)$"
+)
+
+
+def _ag014_match_token(raw: str, *, allow_native_abi: bool = False) -> str | None:
+    stripped = raw.strip()
+    if not stripped or stripped in _AG014_ALLOWED_TIER_TOKENS:
+        return None
+    if allow_native_abi and _AG014_NATIVE_OP_ABI_RE.fullmatch(stripped):
+        return None
+    normalized = _AG014_CAMEL_RE.sub("_", stripped)
+    match = _AG014_MODEL_TOKEN_RE.search(normalized)
+    if match is None:
+        return None
+    token = match.group(1)
+    if token.lower() == "k3" and stripped in _AG014_ALLOWED_TIER_TOKENS:
+        return None
+    return token.lower()
+
+
+def _ag014_docstring_ids(tree: ast.Module) -> set[int]:
+    ids: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            if (
+                node.body
+                and isinstance(node.body[0], ast.Expr)
+                and isinstance(node.body[0].value, ast.Constant)
+                and isinstance(node.body[0].value.value, str)
+            ):
+                ids.add(id(node.body[0].value))
+    return ids
+
+
+def _ag014_in_source_ref(node: ast.AST, parents: Mapping[ast.AST, ast.AST]) -> bool:
+    cur: ast.AST | None = node
+    while cur is not None:
+        if isinstance(cur, ast.Call):
+            fn = cur.func.id if isinstance(cur.func, ast.Name) else (
+                cur.func.attr if isinstance(cur.func, ast.Attribute) else ""
+            )
+            if fn in {"SourceRef", "TemplateSourceRef"}:
+                return True
+        cur = parents.get(cur)
+    return False
+
+
+def _ag014_fold_str(node: ast.AST, str_consts: Mapping[str, str]) -> str | None:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.Name):
+        return str_consts.get(node.id)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = _ag014_fold_str(node.left, str_consts)
+        right = _ag014_fold_str(node.right, str_consts)
+        return None if left is None or right is None else left + right
+    return None
+
+
+def _ag014_extract_literal_tokens(
+    node: ast.AST, str_consts: Mapping[str, str], *, allow_native_abi: bool = False,
+) -> set[str]:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        tok = _ag014_match_token(node.value, allow_native_abi=allow_native_abi)
+        return {tok} if tok else set()
+    if isinstance(node, ast.Name) and node.id in str_consts:
+        tok = _ag014_match_token(str_consts[node.id], allow_native_abi=allow_native_abi)
+        return {tok} if tok else set()
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        folded = _ag014_fold_str(node, str_consts)
+        tok = _ag014_match_token(folded, allow_native_abi=allow_native_abi) if folded is not None else None
+        return {tok} if tok else set()
+    if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+        out: set[str] = set()
+        for elt in node.elts:
+            out.update(_ag014_extract_literal_tokens(elt, str_consts, allow_native_abi=allow_native_abi))
+        return out
+    if isinstance(node, ast.Dict):
+        out = set()
+        for key in node.keys:
+            if key is not None:
+                out.update(_ag014_extract_literal_tokens(key, str_consts, allow_native_abi=allow_native_abi))
+        return out
+    if isinstance(node, ast.Call):
+        fn = node.func.id if isinstance(node.func, ast.Name) else (
+            node.func.attr if isinstance(node.func, ast.Attribute) else ""
+        )
+        if fn in {"frozenset", "set", "tuple", "list", "dict", "MappingProxyType"} and len(node.args) == 1:
+            return _ag014_extract_literal_tokens(node.args[0], str_consts, allow_native_abi=allow_native_abi)
+    return set()
+
+
+def _ag014_extract_any_str_literals(node: ast.AST, str_consts: Mapping[str, str]) -> set[str]:
+    folded = _ag014_fold_str(node, str_consts)
+    if folded is not None:
+        stripped = folded.strip()
+        return {stripped} if stripped else set()
+    if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+        out: set[str] = set()
+        for elt in node.elts:
+            out.update(_ag014_extract_any_str_literals(elt, str_consts))
+        return out
+    if isinstance(node, ast.Dict):
+        out = set()
+        for key in node.keys:
+            if key is not None:
+                out.update(_ag014_extract_any_str_literals(key, str_consts))
+        return out
+    if isinstance(node, ast.Call):
+        fn = node.func.id if isinstance(node.func, ast.Name) else (
+            node.func.attr if isinstance(node.func, ast.Attribute) else ""
+        )
+        if fn in {"frozenset", "set", "tuple", "list", "dict", "MappingProxyType"} and len(node.args) == 1:
+            return _ag014_extract_any_str_literals(node.args[0], str_consts)
+    return set()
+
+
+def _ag014_is_identity_expr(node: ast.AST, tainted: set[str]) -> bool:
+    if isinstance(node, ast.Name):
+        return node.id in tainted or node.id in _AG014_IDENTITY_NAMES
+    if isinstance(node, ast.Attribute):
+        if node.attr in _AG014_IDENTITY_NAMES:
+            return True
+        owner_is_model = (
+            (isinstance(node.value, ast.Name) and node.value.id in _AG014_IDENTITY_OWNERS)
+            or (isinstance(node.value, ast.Attribute) and node.value.attr in _AG014_IDENTITY_OWNERS)
+        )
+        return node.attr == "name" and owner_is_model
+    if isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Constant):
+        return isinstance(node.slice.value, str) and (
+            node.slice.value in _AG014_IDENTITY_NAMES or node.slice.value == "name"
+        )
+    if isinstance(node, ast.Call):
+        return _ag014_call_is_identity(node, tainted)
+    return False
+
+
+def _ag014_call_is_identity(node: ast.Call, tainted: set[str]) -> bool:
+    if isinstance(node.func, ast.Attribute):
+        if node.func.attr in {"lower", "upper", "strip", "replace"}:
+            return _ag014_is_identity_expr(node.func.value, tainted)
+        if node.func.attr == "get" and node.args and isinstance(node.args[0], ast.Constant):
+            key = node.args[0].value
+            return isinstance(key, str) and (key in _AG014_IDENTITY_NAMES or key == "name")
+        return False
+    if isinstance(node.func, ast.Name):
+        if node.func.id == "str" and node.args:
+            return _ag014_is_identity_expr(node.args[0], tainted)
+        if node.func.id == "getattr" and len(node.args) >= 2 and isinstance(node.args[1], ast.Constant):
+            key = node.args[1].value
+            return isinstance(key, str) and (key in _AG014_IDENTITY_NAMES or key == "name")
+    return False
+
+
+def _ag014_scope_stmts(body: Sequence[ast.stmt]):
+    stack: list[ast.AST] = list(reversed(body))
+    while stack:
+        node = stack.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        yield node
+        children = [
+            c for c in ast.iter_child_nodes(node)
+            if not isinstance(c, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        ]
+        stack.extend(reversed(children))
+
+
+def _ag014_collect_tables(
+    nodes: Sequence[ast.AST],
+    base_strs: Mapping[str, str],
+    base_tables: Mapping[str, frozenset[str]],
+    base_str_sets: Mapping[str, frozenset[str]],
+) -> tuple[dict[str, str], dict[str, frozenset[str]], dict[str, frozenset[str]]]:
+    str_consts = dict(base_strs)
+    tables = dict(base_tables)
+    str_sets = dict(base_str_sets)
+    for node in nodes:
+        if isinstance(node, ast.Assign):
+            targets, value = node.targets, node.value
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            targets, value = (node.target,), node.value
+        else:
+            continue
+        folded = _ag014_fold_str(value, str_consts)
+        tokens = _ag014_extract_literal_tokens(value, str_consts, allow_native_abi=True)
+        all_strs = _ag014_extract_any_str_literals(value, str_consts)
+        for target in targets:
+            if not isinstance(target, ast.Name):
+                continue
+            if folded is not None:
+                str_consts[target.id] = folded
+            if tokens:
+                tables[target.id] = frozenset(tokens)
+            if all_strs and not isinstance(value, ast.Constant):
+                str_sets[target.id] = frozenset(all_strs)
+    return str_consts, tables, str_sets
+
+
+def _ag014_collect_taint(nodes: Sequence[ast.AST], init: set[str]) -> set[str]:
+    tainted = set(init)
+    for node in nodes:
+        if isinstance(node, ast.Assign):
+            targets, value = node.targets, node.value
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            targets, value = (node.target,), node.value
+        else:
+            continue
+        if _ag014_is_identity_expr(value, tainted):
+            for target in targets:
+                if isinstance(target, ast.Name):
+                    tainted.add(target.id)
+    return tainted
+
+
+def _ag014_tokens_of_operand(
+    node: ast.AST,
+    str_consts: Mapping[str, str],
+    tables: Mapping[str, frozenset[str]],
+    *,
+    allow_native_abi: bool = False,
+) -> set[str]:
+    if isinstance(node, ast.Name) and node.id in tables:
+        return set(tables[node.id])
+    return _ag014_extract_literal_tokens(node, str_consts, allow_native_abi=allow_native_abi)
+
+
+def _ag014_any_strs_of_operand(
+    node: ast.AST,
+    str_consts: Mapping[str, str],
+    str_sets: Mapping[str, frozenset[str]],
+) -> set[str]:
+    if isinstance(node, ast.Name) and node.id in str_sets:
+        return set(str_sets[node.id])
+    return _ag014_extract_any_str_literals(node, str_consts)
+
+
+def _ag014_check_match(
+    rel: PurePosixPath,
+    node: ast.Match,
+    lineno: int,
+    tainted: set[str],
+    emit: Callable[[int, str, str, str], None],
+) -> None:
+    subject_is_id = _ag014_is_identity_expr(node.subject, tainted)
+    for case in node.cases:
+        for sub in ast.walk(case.pattern):
+            if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+                tok = (sub.value.strip() or None) if subject_is_id else _ag014_match_token(sub.value, allow_native_abi=True)
+                if tok is not None:
+                    emit(
+                        int(getattr(sub, "lineno", lineno)), "model_name_match", tok,
+                        f"hardcoded model-name match pattern {sub.value!r} forbidden in {rel.as_posix()}",
+                    )
+
+
+def _ag014_check_lookup(
+    rel: PurePosixPath,
+    container: ast.AST,
+    key_expr: ast.AST | None,
+    lineno: int,
+    str_consts: Mapping[str, str],
+    tables: Mapping[str, frozenset[str]],
+    str_sets: Mapping[str, frozenset[str]],
+    tainted: set[str],
+    emit: Callable[[int, str, str, str], None],
+) -> None:
+    key_is_id = key_expr is not None and _ag014_is_identity_expr(key_expr, tainted)
+    if isinstance(container, ast.Name):
+        if container.id in tables:
+            for tok in sorted(tables[container.id]):
+                emit(
+                    lineno, "model_name_table_lookup", f"{container.id}:{tok}",
+                    f"model-name dispatch lookup {container.id} ({tok}) forbidden in {rel.as_posix()}",
+                )
+        elif key_is_id and container.id in str_sets:
+            for tok in sorted(str_sets[container.id]):
+                emit(
+                    lineno, "model_name_table_lookup", f"{container.id}:{tok}",
+                    f"model-name dispatch lookup {container.id} ({tok}) forbidden in {rel.as_posix()}",
+                )
+    elif isinstance(container, ast.Dict):
+        keys = (
+            _ag014_extract_any_str_literals(container, str_consts)
+            if key_is_id else _ag014_extract_literal_tokens(container, str_consts, allow_native_abi=True)
+        )
+        for tok in sorted(keys):
+            emit(
+                lineno, "model_name_table_lookup", f"inline_dict:{tok}",
+                f"inline model-name dict dispatch ({tok!r}) forbidden in {rel.as_posix()}",
+            )
+
+
+def _ag014_check_call(
+    rel: PurePosixPath,
+    node: ast.Call,
+    lineno: int,
+    str_consts: Mapping[str, str],
+    tables: Mapping[str, frozenset[str]],
+    str_sets: Mapping[str, frozenset[str]],
+    tainted: set[str],
+    emit: Callable[[int, str, str, str], None],
+) -> None:
+    if not isinstance(node.func, ast.Attribute):
+        return
+    method = node.func.attr
+    if method in _AG014_STR_METHODS:
+        recv_is_id = _ag014_is_identity_expr(node.func.value, tainted)
+        for arg in node.args:
+            tokens = (
+                _ag014_any_strs_of_operand(arg, str_consts, str_sets)
+                if recv_is_id else _ag014_tokens_of_operand(arg, str_consts, tables, allow_native_abi=True)
+            )
+            for tok in sorted(tokens):
+                emit(
+                    lineno, "model_name_str_method", tok,
+                    f"hardcoded model-name .{method}({tok!r}) check forbidden in {rel.as_posix()}; use structural predicates",
+                )
+    elif method in _AG014_REGEX_METHODS:
+        pat_arg = node.args[0] if node.args else next(
+            (kw.value for kw in node.keywords if kw.arg == "pattern"), None,
+        )
+        if pat_arg is None:
+            return
+        target_arg = node.args[1] if len(node.args) >= 2 else next(
+            (kw.value for kw in node.keywords if kw.arg == "string"), None,
+        )
+        target_is_id = target_arg is not None and _ag014_is_identity_expr(target_arg, tainted)
+        tokens = (
+            _ag014_any_strs_of_operand(pat_arg, str_consts, str_sets)
+            if target_is_id else _ag014_tokens_of_operand(pat_arg, str_consts, tables, allow_native_abi=True)
+        )
+        for tok in sorted(tokens):
+            emit(
+                lineno, "model_name_regex", tok,
+                f"hardcoded model-name regex .{method}({tok!r}) forbidden in {rel.as_posix()}; use structural predicates",
+            )
+    elif method == "get":
+        key_arg = node.args[0] if node.args else None
+        _ag014_check_lookup(rel, node.func.value, key_arg, lineno, str_consts, tables, str_sets, tainted, emit)
+
+
+def _ag014_scan_scope(
+    rel: PurePosixPath,
+    body: Sequence[ast.stmt],
+    init_tainted: set[str],
+    base_strs: Mapping[str, str],
+    base_tables: Mapping[str, frozenset[str]],
+    base_str_sets: Mapping[str, frozenset[str]],
+    docs: set[int],
+    parents: Mapping[ast.AST, ast.AST],
+    emit: Callable[[int, str, str, str], None],
+) -> None:
+    nodes = list(_ag014_scope_stmts(body))
+    str_consts, tables, str_sets = _ag014_collect_tables(nodes, base_strs, base_tables, base_str_sets)
+    tainted = _ag014_collect_taint(nodes, init_tainted)
+    for node in nodes:
+        if id(node) in docs or _ag014_in_source_ref(node, parents):
+            continue
+        lineno = int(getattr(node, "lineno", 1))
+        if isinstance(node, ast.Compare):
+            operands = (node.left, *node.comparators)
+            has_id = any(_ag014_is_identity_expr(op, tainted) for op in operands)
+            for operand in operands:
+                tokens = (
+                    _ag014_any_strs_of_operand(operand, str_consts, str_sets)
+                    if has_id else _ag014_tokens_of_operand(operand, str_consts, tables, allow_native_abi=True)
+                )
+                for tok in sorted(tokens):
+                    emit(
+                        lineno, "model_name_compare", tok,
+                        f"hardcoded model-name comparison ({tok!r}) forbidden in {rel.as_posix()}; use structural predicates",
+                    )
+        elif isinstance(node, ast.Call):
+            _ag014_check_call(rel, node, lineno, str_consts, tables, str_sets, tainted, emit)
+        elif isinstance(node, ast.Match):
+            _ag014_check_match(rel, node, lineno, tainted, emit)
+        elif isinstance(node, ast.Subscript):
+            _ag014_check_lookup(rel, node.value, node.slice, lineno, str_consts, tables, str_sets, tainted, emit)
+
+
+def _check_ag014_zero_model_name_branches(rel: PurePosixPath, tree: ast.Module) -> list[Violation]:
+    """Enforce full-package AG014: zero per-model-name branching in executable ``mindie_sim/``."""
+    pos = rel.as_posix()
+    if (
+        len(rel.parts) < 2
+        or rel.parts[0] != "mindie_sim"
+        or pos in _AG014_CONFIG_EXEMPT_FILES
+        or pos.startswith(_AG014_CONFIG_EXEMPT_PREFIXES)
+    ):
+        return []
+    docs = _ag014_docstring_ids(tree)
+    parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+    mod_strs, mod_tables, mod_str_sets = _ag014_collect_tables(list(_ag014_scope_stmts(tree.body)), {}, {}, {})
+    violations: list[Violation] = []
+    seen: set[tuple[int, str, str]] = set()
+
+    def _emit(line: int, kind: str, token: str, detail: str) -> None:
+        key = (line, kind, token.lower())
+        if key not in seen:
+            seen.add(key)
+            violations.append(Violation("AG014", rel, line, f"AG014:{kind}:{pos}:{key[2]}", detail))
+
+    _ag014_scan_scope(rel, tree.body, set(), mod_strs, mod_tables, mod_str_sets, docs, parents, _emit)
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            arg_names = {
+                a.arg for a in (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs)
+                if a.arg in _AG014_IDENTITY_NAMES
+            }
+            _ag014_scan_scope(rel, node.body, arg_names, mod_strs, mod_tables, mod_str_sets, docs, parents, _emit)
+    return violations
+
+
+def check_ag014_manifest(root: Path, *, manifest_text: str | None = None) -> list[Violation]:
+    """Flag any mechanism binding in ``stacks/vllm_ascend/manifest.json`` with non-empty ``models``."""
+    if manifest_text is None:
+        disk = root / _AG014_MANIFEST_REL
+        if not disk.is_file():
+            return []
+        manifest_text = disk.read_text(encoding="utf-8")
+    try:
+        payload = json.loads(manifest_text)
+    except json.JSONDecodeError as exc:
+        return [Violation(
+            "AG014", _AG014_MANIFEST_REL, int(getattr(exc, "lineno", 1)),
+            f"AG014:manifest_json_invalid:{_AG014_MANIFEST_REL.as_posix()}",
+            f"manifest.json is invalid JSON: {exc.msg}",
+        )]
+    if not isinstance(payload, Mapping):
+        return []
+    lines = manifest_text.splitlines()
+    violations: list[Violation] = []
+    entries = list(payload.get("bindings") or ()) + list(payload.get("mechanisms") or ())
+    for idx, entry in enumerate(entries):
+        if not isinstance(entry, Mapping):
+            continue
+        models = entry.get("models")
+        has_models = (
+            (isinstance(models, list) and any(str(m).strip() for m in models))
+            or (isinstance(models, Mapping) and any(str(k).strip() for k in models))
+            or (isinstance(models, str) and bool(models.strip()))
+        )
+        if not has_models:
+            continue
+        mech_id = str(entry.get("mechanism_id") or f"entry_{idx}")
+        marker = f'"mechanism_id": "{mech_id}"'
+        line_no = next((n for n, ln in enumerate(lines, start=1) if marker in ln), 1)
+        violations.append(Violation(
+            "AG014", _AG014_MANIFEST_REL, line_no,
+            f"AG014:manifest_models:{mech_id}",
+            f"manifest.json binding {mech_id!r} specifies non-empty models={models!r}; "
+            "use structural capability_predicates instead",
+        ))
+    return violations
+
+
 def _binding_module(recipe) -> str:
     def module_of(builder):
         # functools.wraps copies __module__ even when the wrapper runs elsewhere.

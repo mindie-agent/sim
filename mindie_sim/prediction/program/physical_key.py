@@ -48,11 +48,6 @@ IDENTITY_VERSION = "physical-key/4"
 #: (``s<stage>.pre_forward.<name>``, intentionally omitting ``.l<layer>.``).
 HOISTED_PROLOGUE_PREFIX = "pre_forward."
 
-#: Fields excluded from physical identity.  They name one occurrence, not work.
-OCCURRENCE_FIELDS = frozenset({
-    "op_id", "deps", "stage", "layer", "requests", "stream", "notes",
-})
-
 #: Metadata keys whose values name other occurrences and must be normalized.
 REFERENCE_KEYS = frozenset({
     "absorbed_source_ops",

@@ -158,7 +158,7 @@ def verify_decode_mechanisms(run, root, work):
     report = graph(raw, "graph-mixed-quant-cache-and-grouped-source", batch=1)
     assert len(report["replicas"]) == 8
     operators = [row["operator"] for row in report["isolated"]["operators"]]
-    attention = [op for op in operators if op["recipe"] == "cannbot_mixed_quant_sparse_flash_mla"]
+    attention = [op for op in operators if op["recipe"] == "dsl_mixed_quant_sparse_flash_mla"]
     assert attention and all(op["source_boundary"] == "kernel" for op in attention)
     assert {op["metadata"]["mqsmla_geometry"]["ratio"] for op in attention} == {0, 2}
     assert all(op["metadata"]["attention_tensor_view"]["compressed_cache_row_bytes"] == 320

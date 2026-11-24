@@ -115,9 +115,6 @@ CP_DECODE_COMM_STREAM = "cp_decode_comm_stream"
 CP_CHUNKED_PREFILL_STREAM = "cp_chunkedprefill_comm_stream"
 CP_WEIGHT_STREAM = "cp_weight_stream"
 CAUSAL_SPARSE_MODE = 3
-QUANTIZED_ALLGATHER_DTYPES = frozenset({
-    "int8", "fp8", "fp8_e4m3", "fp8_e5m2", "w8a8", "w4a8",
-})
 
 
 def _is_power_of_two(value: int) -> bool:

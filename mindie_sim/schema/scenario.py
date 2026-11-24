@@ -48,6 +48,7 @@ from .stack import (
     WorkUnitKind,
     WorkloadDomain,
 )
+from .workload import SYNTHETIC_EAGLE3_GQA_PROVENANCE, SpeculativeWorkloadPolicy
 
 DeploymentMode = Literal["colocated", "pd_disaggregated", "pd_prefill", "pd_decode"]
 DEPLOYMENT_MODES = frozenset({"colocated", "pd_disaggregated", "pd_prefill", "pd_decode"})
@@ -633,6 +634,7 @@ class ScenarioContract:
     pinned_parallel: tuple[tuple[str, int], ...] = ()
     vision_accounting: VisionAccountingScope = "text_backbone"
     provenance: tuple[tuple[str, str], ...] = ()
+    speculative_policy: SpeculativeWorkloadPolicy | None = None
 
     def __post_init__(self) -> None:
         mode = validate_deployment_mode(self.deployment_mode)
@@ -647,7 +649,7 @@ class ScenarioContract:
         validate_scenario_contract(self)
 
     def digest(self) -> str:
-        payload = {
+        payload: dict[str, Any] = {
             "deployment_mode": self.deployment_mode,
             "workload_domain": self.workload_domain,
             "work_unit_kind": self.work_unit_kind,
@@ -665,6 +667,8 @@ class ScenarioContract:
             "pinned_parallel": list(self.pinned_parallel),
             "vision_accounting": self.vision_accounting,
         }
+        if self.speculative_policy is not None:
+            payload["speculative_policy"] = self.speculative_policy.to_dict()
         return hashlib.sha256(
             json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
         ).hexdigest()
@@ -822,6 +826,35 @@ def _validate_domain_and_modes(contract: ScenarioContract) -> None:
             raise ModelingError(
                 f"config_only_stage_forbids_new_kernels:{sorted(plan.allowed_rewrite_classes)}"
             )
+    aux = getattr(contract.model, "auxiliary", None)
+    attached_drafts = (
+        tuple(d for d in (getattr(aux, "mtp", None), getattr(aux, "dspark", None)) if d is not None)
+        if aux is not None else ()
+    )
+    has_synthetic_draft = any(bool(getattr(d, "is_synthetic", False)) for d in attached_drafts)
+    if has_synthetic_draft and contract.optimization_mode != "modeling":
+        raise ModelingError(
+            "simulation_mode_forbids_synthetic_gqa_draft:"
+            "actual_deployment_requires_real_speculative_checkpoint"
+        )
+    if has_synthetic_draft and (
+        contract.speculative_policy is None or not contract.speculative_policy.allow_synthetic_gqa
+    ):
+        raise ModelingError("scenario_synthetic_draft_requires_policy_opt_in")
+    if contract.speculative_policy is not None:
+        if not isinstance(contract.speculative_policy, SpeculativeWorkloadPolicy):
+            raise ModelingError("scenario_speculative_policy_invalid")
+        if contract.speculative_policy.allow_synthetic_gqa:
+            if contract.optimization_mode != "modeling":
+                raise ModelingError(
+                    "simulation_mode_forbids_synthetic_gqa_draft:"
+                    "actual_deployment_requires_real_speculative_checkpoint"
+                )
+            if contract.speculative_policy.synthetic_draft_provenance != SYNTHETIC_EAGLE3_GQA_PROVENANCE:
+                raise ModelingError(
+                    f"synthetic_gqa_requires_explicit_provenance:"
+                    f"{contract.speculative_policy.synthetic_draft_provenance!r}"
+                )
 
 
 def validate_scenario_contract(contract: ScenarioContract) -> None:

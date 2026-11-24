@@ -34,6 +34,7 @@ include = ["mindie_sim*"]
 ]
 
 [tool.setuptools.data-files]
+"data/abi" = ["data/abi/*.json"]
 "data/primitives" = ["data/primitives/*.json"]
 "data/primitives/captures" = ["data/primitives/captures/*.capture.json"]
 

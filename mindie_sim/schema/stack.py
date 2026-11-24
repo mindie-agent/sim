@@ -18,8 +18,9 @@
 """
 from __future__ import annotations
 
+import ast
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, is_dataclass
 import hashlib
 import json
 import math
@@ -28,6 +29,7 @@ from typing import Any, Literal, Protocol, TypeAlias, runtime_checkable
 
 from .checkpoint import CheckpointOrigin, CheckpointQuantMap, CHECKPOINT_ORIGINS
 from .common import ModelingError, dtype_bytes
+from .datapath import SourceRef
 from .hardware import Hardware
 from .model import ModelSpec
 from .operators import (
@@ -65,6 +67,14 @@ WORK_UNIT_KINDS = frozenset({
 
 StackTrack = Literal["eager", "shipping", "proposed", "target"]
 STACK_TRACKS = frozenset({"eager", "shipping", "proposed", "target"})
+
+ManifestBindingState = Literal["merged", "unmerged_pr"]
+MANIFEST_BINDING_STATES = frozenset({"merged", "unmerged_pr"})
+
+StackOptimizationMode = Literal["simulation", "modeling"]
+STACK_OPTIMIZATION_MODES = frozenset({"simulation", "modeling"})
+
+SYNTHESIS_READINESS_CLASSES = frozenset({"synthesized_target", "tiler_extension"})
 
 RewriteTrack = Literal["config", "framework", "kernel_new", "kernel_tune"]
 REWRITE_TRACKS = frozenset({"config", "framework", "kernel_new", "kernel_tune"})
@@ -1192,6 +1202,229 @@ class ResolvedStackOptions:
             object.__setattr__(self, "options_digest", digest)
 
 
+def _digest_value(value: Any) -> Any:
+    if is_dataclass(value) and not isinstance(value, type):
+        return _digest_value(asdict(value))
+    if isinstance(value, Mapping):
+        return {str(k): _digest_value(v) for k, v in sorted(value.items(), key=lambda kv: str(kv[0]))}
+    if isinstance(value, (frozenset, set)):
+        return sorted((_digest_value(v) for v in value), key=repr)
+    if isinstance(value, (list, tuple)):
+        return [_digest_value(v) for v in value]
+    return value
+
+
+def _eval_pred_node(node: ast.AST, capabilities: Mapping[str, Any]) -> Any:
+    if isinstance(node, ast.Constant):
+        return node.value
+    if isinstance(node, ast.Name):
+        if node.id not in capabilities:
+            raise KeyError(node.id)
+        return capabilities[node.id]
+    if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+        return tuple(_eval_pred_node(elt, capabilities) for elt in node.elts)
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+        return not bool(_eval_pred_node(node.operand, capabilities))
+    if isinstance(node, ast.BoolOp):
+        if isinstance(node.op, ast.And):
+            for val_node in node.values:
+                if not bool(_eval_pred_node(val_node, capabilities)):
+                    return False
+            return True
+        for val_node in node.values:
+            if bool(_eval_pred_node(val_node, capabilities)):
+                return True
+        return False
+    if isinstance(node, ast.Compare):
+        left = _eval_pred_node(node.left, capabilities)
+        for op, comp in zip(node.ops, node.comparators, strict=True):
+            right = _eval_pred_node(comp, capabilities)
+            ok = (
+                left == right if isinstance(op, ast.Eq) else
+                left != right if isinstance(op, ast.NotEq) else
+                left < right if isinstance(op, ast.Lt) else
+                left <= right if isinstance(op, ast.LtE) else
+                left > right if isinstance(op, ast.Gt) else
+                left >= right if isinstance(op, ast.GtE) else
+                left in right if isinstance(op, ast.In) else
+                left not in right if isinstance(op, ast.NotIn) else False
+            )
+            if not ok:
+                return False
+            left = right
+        return True
+    raise ModelingError("manifest_binding_predicate_unsupported_syntax")
+
+
+def _eval_capability_predicate(predicate: str, capabilities: Mapping[str, Any]) -> bool:
+    try:
+        expr = ast.parse(predicate, mode="eval").body
+        return bool(_eval_pred_node(expr, capabilities))
+    except (SyntaxError, KeyError, TypeError):
+        return False
+
+
+@dataclass(frozen=True, slots=True)
+class ManifestBinding:
+    """One verified stack manifest entry binding a mechanism to an executable lowering pass."""
+
+    mechanism_id: str
+    state: ManifestBindingState
+    ref: str
+    lowering_pass_id: str = ""
+    provenance: SourceRef = field(default_factory=lambda: SourceRef("", "", "", ""))
+    archs: tuple[str, ...] = ()
+    models: tuple[str, ...] = ()
+    options: tuple[tuple[str, Any], ...] = ()
+    capability_predicates: tuple[str, ...] = ()
+    phase_scope: tuple[str, ...] = ()
+    notes: str = ""
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "mechanism_id", _req_str(self.mechanism_id, "manifest_binding_mechanism_id_required"))
+        if self.state not in MANIFEST_BINDING_STATES:
+            raise ModelingError(f"manifest_binding_state_invalid:{self.state!r}")
+        object.__setattr__(self, "ref", _req_str(self.ref, "manifest_binding_ref_required"))
+        if not isinstance(self.lowering_pass_id, str):
+            raise ModelingError("manifest_binding_lowering_pass_id_invalid")
+        object.__setattr__(self, "lowering_pass_id", self.lowering_pass_id.strip())
+        if not isinstance(self.provenance, SourceRef):
+            raise ModelingError("manifest_binding_provenance_must_be_source_ref")
+        object.__setattr__(self, "archs", tuple(str(a).strip().lower() for a in self.archs if str(a).strip()))
+        object.__setattr__(self, "models", tuple(str(m).strip() for m in self.models if str(m).strip()))
+        object.__setattr__(self, "options", _freeze_pairs(self.options, "manifest_binding_options_invalid"))
+        object.__setattr__(
+            self,
+            "capability_predicates",
+            tuple(_req_str(p, "manifest_binding_predicate_invalid") for p in self.capability_predicates),
+        )
+        object.__setattr__(
+            self,
+            "phase_scope",
+            tuple(str(p).strip().lower() for p in self.phase_scope if str(p).strip()),
+        )
+        if not isinstance(self.notes, str):
+            raise ModelingError("manifest_binding_notes_invalid")
+
+    @property
+    def phases(self) -> tuple[str, ...]:
+        """Alias for ``phase_scope`` used by manifest-binding consumers."""
+        return self.phase_scope
+
+    def matches(
+        self,
+        canonical_model: str,
+        arch: str,
+        phase: str | None = None,
+        *,
+        capabilities: Mapping[str, Any] | None = None,
+    ) -> bool:
+        """Return whether this binding applies to ``(canonical_model, arch, phase, capabilities)``."""
+        if self.models and canonical_model not in self.models:
+            return False
+        if self.archs and arch.strip().lower() not in self.archs:
+            return False
+        if phase and self.phase_scope and phase.strip().lower() not in self.phase_scope:
+            return False
+        if self.capability_predicates:
+            if capabilities is None:
+                return False
+            if not all(_eval_capability_predicate(pred, capabilities) for pred in self.capability_predicates):
+                return False
+        return True
+
+    def matches_arch_and_phase(self, arch: str, phase: str) -> bool:
+        """Return whether this binding applies to the requested architecture and phase."""
+        arch_ok = not self.archs or arch.strip().lower() in self.archs
+        phase_ok = not self.phase_scope or phase.strip().lower() in self.phase_scope
+        return arch_ok and phase_ok
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "mechanism_id": self.mechanism_id,
+            "state": self.state,
+            "ref": self.ref,
+            "lowering_pass_id": self.lowering_pass_id,
+            "provenance": {
+                "repository": self.provenance.repository,
+                "revision": self.provenance.revision,
+                "relative_path": self.provenance.relative_path,
+                "source_sha256": self.provenance.source_sha256,
+            },
+            "archs": list(self.archs),
+            "models": list(self.models),
+            "options": [list(pair) for pair in self.options],
+            "capability_predicates": list(self.capability_predicates),
+            "phase_scope": list(self.phase_scope),
+            "notes": self.notes,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class StackTrackSpec:
+    """Resolved 4-track stack capability contract coupling active manifest bindings to readiness."""
+
+    stack_id: str
+    track: StackTrack
+    optimization_mode: StackOptimizationMode
+    active_bindings: tuple[ManifestBinding, ...] = ()
+    allowed_readiness: frozenset[KernelReadiness] = frozenset({"shipping"})
+    allows_target_synthesis: bool = False
+    spec_digest: str = field(init=False, default="")
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "stack_id", _req_str(self.stack_id, "stack_track_spec_stack_id_required"))
+        if self.track not in STACK_TRACKS:
+            raise ModelingError(f"stack_track_spec_track_invalid:{self.track!r}")
+        if self.optimization_mode not in STACK_OPTIMIZATION_MODES:
+            raise ModelingError(f"stack_track_spec_optimization_mode_invalid:{self.optimization_mode!r}")
+        bindings = tuple(self.active_bindings)
+        if not all(isinstance(item, ManifestBinding) for item in bindings):
+            raise ModelingError("stack_track_spec_active_bindings_invalid")
+        if len({(item.mechanism_id, item.state) for item in bindings}) != len(bindings):
+            raise ModelingError("stack_track_spec_duplicate_mechanism_id")
+        readiness = frozenset(self.allowed_readiness)
+        if not readiness or any(item not in KERNEL_READINESS_VALUES for item in readiness):
+            raise ModelingError(f"stack_track_spec_readiness_invalid:{sorted(readiness)!r}")
+        if not isinstance(self.allows_target_synthesis, bool):
+            raise ModelingError("stack_track_spec_allows_target_synthesis_invalid")
+        if self.track != "target":
+            if self.allows_target_synthesis:
+                raise ModelingError(f"stack_track_spec_target_synthesis_requires_target_track:{self.track}")
+            if readiness & SYNTHESIS_READINESS_CLASSES:
+                raise ModelingError(f"stack_track_spec_non_target_forbids_synthesis_readiness:{sorted(readiness)}")
+        if self.allows_target_synthesis and self.optimization_mode != "modeling":
+            raise ModelingError("stack_track_spec_target_synthesis_requires_modeling_mode")
+        if self.optimization_mode == "simulation" and (readiness & SYNTHESIS_READINESS_CLASSES):
+            raise ModelingError(f"stack_track_spec_simulation_forbids_synthesis_readiness:{sorted(readiness)}")
+        if self.track == "shipping" and any(item.state != "merged" for item in bindings):
+            raise ModelingError("stack_track_spec_shipping_requires_merged_bindings_only")
+        if self.track == "eager" and bindings:
+            raise ModelingError("stack_track_spec_eager_forbids_active_bindings")
+        object.__setattr__(self, "active_bindings", bindings)
+        object.__setattr__(self, "allowed_readiness", readiness)
+        digest = _sha256_payload({
+            "stack_id": self.stack_id,
+            "track": self.track,
+            "optimization_mode": self.optimization_mode,
+            "active_bindings": [item.to_dict() for item in bindings],
+            "allowed_readiness": sorted(readiness),
+            "allows_target_synthesis": self.allows_target_synthesis,
+        })
+        object.__setattr__(self, "spec_digest", digest)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "stack_id": self.stack_id,
+            "track": self.track,
+            "optimization_mode": self.optimization_mode,
+            "active_bindings": [item.to_dict() for item in self.active_bindings],
+            "allowed_readiness": sorted(self.allowed_readiness),
+            "allows_target_synthesis": self.allows_target_synthesis,
+            "spec_digest": self.spec_digest,
+        }
+
+
 @dataclass(frozen=True, slots=True)
 class StackLoweringPlan:
     """Frozen effective lowering and scheduling directives injected into Core PredictionSpine."""
@@ -1207,6 +1440,7 @@ class StackLoweringPlan:
     tensor_layouts: tuple[tuple[str, str, str], ...] = ()
     binding_origins: tuple[tuple[str, str], ...] = ()
     plan_digest: str = ""
+    track_spec: StackTrackSpec | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "stack_id", _req_str(self.stack_id, "lowering_plan_stack_id_required"))
@@ -1227,6 +1461,17 @@ class StackLoweringPlan:
             raise ModelingError("lowering_plan_kernel_tune_requires_tiler_extension_readiness")
         if not isinstance(self.scheduling, SchedulingContract):
             raise ModelingError("lowering_plan_scheduling_invalid")
+        if self.track_spec is not None:
+            if not isinstance(self.track_spec, StackTrackSpec):
+                raise ModelingError("lowering_plan_track_spec_invalid")
+            if self.track_spec.stack_id != self.stack_id:
+                raise ModelingError("lowering_plan_track_spec_stack_id_mismatch")
+            if self.track_spec.track != self.track:
+                raise ModelingError("lowering_plan_track_spec_track_mismatch")
+            if not readiness.issubset(self.track_spec.allowed_readiness):
+                raise ModelingError("lowering_plan_readiness_exceeds_track_spec")
+            if not self.track_spec.allows_target_synthesis and (set(tracks) & {"kernel_new", "kernel_tune"}):
+                raise ModelingError("lowering_plan_synthesis_track_forbidden_by_track_spec")
         bindings = tuple(
             (str(sel), str(rec_id), _freeze_pairs(opts, "lowering_plan_recipe_opts_invalid"))
             for sel, rec_id, opts in self.recipe_bindings
@@ -1242,18 +1487,21 @@ class StackLoweringPlan:
         object.__setattr__(
             self, "binding_origins", tuple((str(k), str(v)) for k, v in self.binding_origins)
         )
-        if not self.plan_digest:
-            digest = _sha256_payload({
-                "stack_id": self.stack_id,
-                "track": self.track,
-                "recipe_bindings": [[s, r, list(o)] for s, r, o in bindings],
-                "lowering_passes": list(self.lowering_passes),
-                "allowed_rewrite_classes": sorted(readiness),
-                "allowed_rewrite_tracks": list(tracks),
-                "allowed_framework_rewrites": list(fw_rewrites),
-                "tensor_layouts": [list(x) for x in self.tensor_layouts],
-            })
-            object.__setattr__(self, "plan_digest", digest)
+        payload: dict[str, Any] = {
+            "stack_id": self.stack_id,
+            "track": self.track,
+            "recipe_bindings": [[s, r, list(o)] for s, r, o in bindings],
+            "lowering_passes": list(self.lowering_passes),
+            "allowed_rewrite_classes": sorted(readiness),
+            "allowed_rewrite_tracks": list(tracks),
+            "allowed_framework_rewrites": list(fw_rewrites),
+            "scheduling": _digest_value(self.scheduling),
+            "tensor_layouts": [list(x) for x in self.tensor_layouts],
+            "binding_origins": [list(x) for x in self.binding_origins],
+        }
+        if self.track_spec is not None:
+            payload["track_spec_digest"] = self.track_spec.spec_digest
+        object.__setattr__(self, "plan_digest", _sha256_payload(payload))
 
 
 @dataclass(frozen=True, slots=True)
@@ -1367,13 +1615,16 @@ __all__ = [
     "CAPTURE_MODES",
     "CAPTURE_UNITS",
     "FRAMEWORK_REWRITE_KINDS",
+    "MANIFEST_BINDING_STATES",
     "MEMORY_TIERS",
     "PD_TRANSFER_MODES",
     "PD_TRANSPORT_KINDS",
     "PREEMPTION_POLICIES",
     "REWRITE_TRACKS",
     "STACK_ADAPTER_PROTOCOL_VERSION",
+    "STACK_OPTIMIZATION_MODES",
     "STACK_TRACKS",
+    "SYNTHESIS_READINESS_CLASSES",
     "TOKEN_OWNERSHIP_AXES",
     "WORKLOAD_DOMAINS",
     "WORK_UNIT_KINDS",
@@ -1394,6 +1645,8 @@ __all__ = [
     "IterationSchedulerState",
     "LaunchConfigCodec",
     "LaunchConfigIngress",
+    "ManifestBinding",
+    "ManifestBindingState",
     "MemoryTier",
     "PdKvTransferSpec",
     "PdLayerTransferEdge",
@@ -1411,7 +1664,9 @@ __all__ = [
     "SchedulingContract",
     "StackCapabilitySpec",
     "StackLoweringPlan",
+    "StackOptimizationMode",
     "StackTrack",
+    "StackTrackSpec",
     "StarsSubmitPolicy",
     "StreamLaneBudget",
     "StreamOverlapPolicy",

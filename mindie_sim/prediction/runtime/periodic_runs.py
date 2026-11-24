@@ -220,16 +220,6 @@ def _two_color_periodic(runs) -> tuple[tuple, tuple] | None:
     return tuple(group_a), tuple(group_b)
 
 
-def _periodic_subrun(sub, sup) -> bool:
-    """True when every row of ``sub`` is an exact row of ``sup``."""
-    if sub == sup:
-        return True
-    if (sub.stride_bytes != sup.stride_bytes or sub.stride_bytes <= 0
-            or sub.row_bytes != sup.row_bytes or sub.sector_bytes != sup.sector_bytes):
-        return False
-    delta = sub.base_byte - sup.base_byte
-    return delta >= 0 and delta % sup.stride_bytes == 0 and (delta // sup.stride_bytes) + sub.rows <= sup.rows
-
 
 def _prune_periodic_subruns(runs: tuple) -> tuple:
     """Drop periodic descriptors completely covered by another run in O(N log N)."""

@@ -33,7 +33,6 @@ TAIL_CLASS = 1
 STATE_SLOTS = 1
 OUTPUT_ORDINAL = 0
 PANEL_SLOT = 0
-INDEXED_ABI_PANELS = 1
 
 
 @dataclass(frozen=True)

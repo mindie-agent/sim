@@ -23,10 +23,6 @@ MAX_TILES = 64
 MIN_TILE_BYTES = 4096
 DEFAULT_PIPELINE_SLOTS = 2
 IO_HBM_CATEGORY = "hbm"
-IO_READ_CATEGORY = "mte2"
-IO_WRITE_CATEGORY = "mte3"
-COMPUTE_CATEGORIES = ("cube", "vector")
-LINK_CATEGORY = "link"
 
 
 @dataclass(frozen=True)

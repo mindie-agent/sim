@@ -152,7 +152,6 @@ SIMT_UB_CARVEOUT_BYTES = 16384
 BindingState = Literal["bound_measured", "bound_implementation", "unbound_formula_projection"]
 
 #: Small/medium superpod collective payload threshold (8 MiB).
-UB_ONESHOT_SMALL_MSG_BYTES = 8 * 1024 * 1024
 #: Minimum operator saving (us) and improvement ratio (3%) to stamp a tuning badge.
 TARGET_OPT_MIN_GAIN_US = 0.25
 TARGET_OPT_MIN_RATIO = 0.03
@@ -161,11 +160,9 @@ SAVING_POSITIVE_EPS_US = 1e-6
 #: Overlap exposed duration threshold (us).
 OVERLAP_EXPOSED_EPS_US = 1e-3
 #: Causal timestamp epsilon (us) for detecting original same-stream overlap.
-ORIG_OVERLAP_EPS_US = 1e-3
 #: Maximum character length for compact ``masked_by`` labels.
 MAX_MASKED_BY_LEN = 48
 #: Minimum secondary overlap share (25%) to show dual maskers.
-SECONDARY_MASKER_SHARE = 0.25
 #: Time conversion factors.
 MS_PER_SECOND = 1000.0
 US_PER_MS = 1000.0
@@ -190,7 +187,6 @@ CUBE_TILE_MN_ELEMS = 128
 #: Default tile count ceiling for white-box ``FusedPipelineRecipe`` lowering.
 FORMULA_TILE_CAP = 64
 #: Minimum tile byte granule for white-box pipeline wave sizing.
-FORMULA_MIN_TILE_BYTES = 4096
 #: HBM read/write asymmetry threshold for selecting calibrated DRAM modes.
 HBM_RW_ASYMMETRY_RATIO = 1.5
 #: Number of FP32 bytes per element in L0C accumulator.
@@ -215,7 +211,6 @@ BACKEND_CANN_LABEL = "CANN aclnn/AscendC"
 BACKEND_TILELANG_LABEL = "TileLang"
 BACKEND_ASCENDC_LABEL = "AscendC"
 BACKEND_CATLASS_LABEL = "Catlass"
-BACKEND_TRITON_LABEL = "Triton-Ascend"
 BACKEND_HCCL_LABEL = "HCCL / MC2"
 FLOAT_PREC_DTYPES = frozenset({"bf16", "bfloat16", "fp16", "float16", "fp32", "float32"})
 QUANT_PREC_DTYPES = frozenset({"fp8", "fp8_e4m3", "fp8_e5m2", "int8", "mxfp4", "fp4", "int4"})
@@ -234,11 +229,6 @@ P20_FALLBACK_STARTUP_NS = 5_000.0
 DEFAULT_BF16_BYTES = 2
 L_STAR_INVERSION_TOL_US = 1e-2
 
-_COLLECTIVE_FAMILIES = frozenset({
-    "allreduce", "allgather", "reducescatter", "reduce_scatter", "alltoall",
-    "alltoallv", "mc2", "mc2_transport", "mc2_protocol", "dispatch", "combine",
-    "collective", "hccl", "p2p", "tp_allreduce", "engram_ids", "engram_broadcast",
-})
 _COLLECTIVE_FAMILY_ALIASES = {
     "all_reduce": "allreduce",
     "tp_allreduce": "allreduce",

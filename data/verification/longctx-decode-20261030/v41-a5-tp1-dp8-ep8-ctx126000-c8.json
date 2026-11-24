@@ -2084,7 +2084,7 @@
       "q_rotary": 320,
       "kv_rotary": 320,
       "kv_store": 320,
-      "cannbot_mixed_quant_sparse_flash_mla": 320,
+      "dsl_mixed_quant_sparse_flash_mla": 320,
       "output_inverse_rotary": 320,
       "router": 320,
       "router_topk": 320,

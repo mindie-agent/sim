@@ -46,42 +46,6 @@ def _aligned_intervals_bytes(
     return total + (cur_hi - cur_lo if cur_hi > cur_lo else 0)
 
 
-def _merge_canonical_with_footprint(
-    left: tuple[tuple[int, int], ...],
-    right: tuple[tuple[int, int], ...],
-    left_fp: int | None,
-    line_bytes: int,
-) -> tuple[tuple[tuple[int, int], ...], int]:
-    """Merge canonical interval tuples and update ``line_bytes`` footprint in O(|right|)."""
-    if not right:
-        fp = _aligned_intervals_bytes(left, line_bytes) if left_fp is None else left_fp
-        return left, fp
-    if not left:
-        return right, _aligned_intervals_bytes(right, line_bytes)
-    nl, nr = len(left), len(right)
-    if left_fp is None or nl <= nr * _HALF_MOD_DIVISOR:
-        merged = _merge_canonical_pairs(left, right)
-        return merged, _aligned_intervals_bytes(merged, line_bytes)
-    r_min, r_max = right[0][0], right[-1][1]
-    lo_idx = bisect_left(left, (r_min, 0))
-    if lo_idx > 0 and left[lo_idx - 1][1] >= r_min:
-        lo_idx -= 1
-    hi_idx = bisect_left(left, (r_max + 1, 0), lo_idx)
-    if lo_idx == 0 and hi_idx == nl:
-        merged = _merge_canonical_pairs(left, right)
-        return merged, _aligned_intervals_bytes(merged, line_bytes)
-    lo_fp = bisect_left(left, (max(0, r_min - line_bytes), 0))
-    if lo_fp > 0 and left[lo_fp - 1][1] + line_bytes >= r_min:
-        lo_fp -= 1
-    hi_fp = bisect_left(left, (r_max + line_bytes + 1, 0), hi_idx)
-    sub_left = left[lo_idx:hi_idx]
-    merged_mid = right if not sub_left else _merge_canonical_pairs(sub_left, right)
-    old_win = left[lo_fp:hi_fp]
-    new_win = left[lo_fp:lo_idx] + merged_mid + left[hi_idx:hi_fp]
-    old_sub_fp = _aligned_intervals_bytes(old_win, line_bytes)
-    new_sub_fp = _aligned_intervals_bytes(new_win, line_bytes)
-    return left[:lo_idx] + merged_mid + left[hi_idx:], left_fp - old_sub_fp + new_sub_fp
-
 
 def _merge_interval_slices(
     left: Sequence[tuple[int, int]], right: Sequence[tuple[int, int]],

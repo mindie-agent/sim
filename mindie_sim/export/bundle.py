@@ -44,7 +44,6 @@ from mindie_sim.optimization.dual_bound import (
 )
 from mindie_sim.optimization.kernel_synthesis import (
     TargetOpNode,
-    attribute_node_overlap,
     evaluate_macro_wall_trigger,
     load_rewrite_plan,
     solve_target_graph,
@@ -1368,24 +1367,6 @@ def _apply_node_to_row(
         **extra_fields,
     )
 
-
-def _attribute_rows_overlap(
-    rows: Sequence[OperatorExportRow],
-    archetypes: Sequence[LayerArchetypeSpec],
-    *,
-    eff_case: Case | None = None,
-    primitive_table: Any = None,
-    op_spec_by_key: Mapping[tuple[int, str], OpSpec] | None = None,
-    use_die_engine: bool = False,
-) -> tuple[list[OperatorExportRow], tuple[LayerArchetypeSpec, ...]]:
-    """Attribute Stream 0 exposed intervals via ``ExposedObserver`` (no second Engine scheduler)."""
-    del eff_case, primitive_table, use_die_engine
-    spec_map = op_spec_by_key or {}
-    nodes = [_row_to_target_node(r, spec_map.get((0, r.op_id))) for r in rows]
-    attributed, spans = attribute_node_overlap(nodes)
-    updated_rows = [_apply_node_to_row(r, n) for r, n in zip(rows, attributed)]
-    updated_archs = tuple(replace(a, single_span_us=spans.get(a.archetype_id, 0.0)) for a in archetypes)
-    return updated_rows, updated_archs
 
 
 def _attribute_full_bundle_stream0(

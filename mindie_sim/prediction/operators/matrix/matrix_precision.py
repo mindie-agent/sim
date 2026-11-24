@@ -52,9 +52,7 @@ EXPLICIT_METADATA_KEYS = frozenset({
 })
 REASON_UNAVAILABLE = "fp8_unavailable"
 REASON_FP4_UNAVAILABLE = "fp4_unavailable"
-REASON_ACTIVATION = "activation_not_fp8"
 REASON_SOURCE = "explicit_compute_identity"
-REASON_E5M2_CONVERSION = "fp8_e5m2_conversion_unsupported"
 REASON_GENERIC_FP8 = "generic_fp8_dequant"
 REASON_NATIVE_FP4 = "native_fp4_mmad"
 

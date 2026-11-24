@@ -36,8 +36,6 @@ from mindie_sim.prediction.efficiency.roofline_graph import (
     physical_graph_order,
 )
 
-DEFAULT_CUBE_COVER = 1.0
-DEFAULT_VECTOR_COVER = 1.0
 EXPOSURE_RECONCILE_FRACTION = 1e-3
 EXPOSURE_RECONCILE_FLOOR_MS = 1e-6
 

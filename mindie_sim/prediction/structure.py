@@ -251,6 +251,19 @@ def _normalize_parsed_case(case: Case) -> Case:
         validate_local_projection_tp(case)
     case.workload.validate_model(model, runtime)
     metadata = dict(runtime.metadata)
+    aux = getattr(model, "auxiliary", None)
+    if aux is not None and any(
+        bool(getattr(d, "is_synthetic", False)) for d in (aux.mtp, aux.dspark) if d is not None
+    ):
+        spine = metadata.get("single_spine")
+        if isinstance(spine, Mapping) and (
+            spine.get("optimization_mode") == "simulation"
+            or spine.get("stack_track") in {"eager", "shipping", "proposed"}
+        ):
+            raise ModelingError(
+                "simulation_mode_forbids_synthetic_gqa_draft:"
+                "actual_deployment_requires_real_speculative_checkpoint"
+            )
     # Carry the unaltered case machine/model identity with the parsed runtime so
     # every ordinary FeatureConfig/compiled feature record receives it.  This is
     # the deployment identity, not a measured supply or model-label branch.

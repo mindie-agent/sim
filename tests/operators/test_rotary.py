@@ -400,7 +400,7 @@ def test_complete_source_variant_preserves_geometry_and_prepares_real_programs(p
     assert len(graphs) == 8
     rank0 = graphs[0]
     attention = [
-        op for op in rank0 if op.recipe == "cannbot_mixed_quant_sparse_flash_mla"
+        op for op in rank0 if op.recipe == "dsl_mixed_quant_sparse_flash_mla"
     ]
     assert len(attention) == 2
     assert {op.local_shape[0] for op in attention} == {
@@ -424,6 +424,6 @@ def test_complete_source_variant_preserves_geometry_and_prepares_real_programs(p
     assert prepared.flops > 0
     for rank in range(1, 8):
         assert not any(
-            op.recipe == "cannbot_mixed_quant_sparse_flash_mla" for op in graphs[rank]
+            op.recipe == "dsl_mixed_quant_sparse_flash_mla" for op in graphs[rank]
         )
         assert len([op for op in graphs[rank] if op.recipe == "expert_combine"]) == 2

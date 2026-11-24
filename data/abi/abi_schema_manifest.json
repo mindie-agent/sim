@@ -1,0 +1,20 @@
+{
+  "schema": "mindie-sim.abi-catalog/1",
+  "description": "Schema index for sealed Ascend hardware-usable operator ABI catalogs (CANN and non-CANN backends).",
+  "soc_archs": ["A2", "A3", "A5"],
+  "hardware_usable_backends": [
+    "cann_aclnn",
+    "hccl_mc2",
+    "vllm_ascend_csrc",
+    "triton",
+    "torch_npu",
+    "catlass",
+    "third_party_wheel"
+  ],
+  "open_synthesis_backends": [
+    "tilelang",
+    "ascendc",
+    "catlass"
+  ],
+  "arch_manifest_pattern": "cann93_shipping_abi_{arch}.json"
+}

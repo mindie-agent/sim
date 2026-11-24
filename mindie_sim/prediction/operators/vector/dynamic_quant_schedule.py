@@ -76,13 +76,11 @@ _REPEAT_BYTES = 256
 _COMPARE_INT = 255
 
 # The two existing inventory terms, one per source VF.  Not a fitted split.
-VECTOR_SPLIT = "helper_1024_per_256_tile_then_round_H_59_8"
 _SCALE_VF_TILE_ELEMENTS = 256
 _Y_VF_INVENTORY_OPS = 59.0
 _Y_VF_INVENTORY_ELEMENTS = 8.0
 _TIMELINE_CACHE_SIZE = 48
 # Host coreNum pins one AIV.  Idle units are not a share coefficient.
-OCCUPANCY = "pinned_block_idx_unit_rate_over_resource_units"
 # c09d3e20 model_runner_v1._pad_for_sequence_parallelism.
 ROW_SOURCE = "c09d3e20_pad_for_sequence_parallelism"
 

@@ -23,6 +23,7 @@ from mindie_sim.prediction.runtime.l2_residency import (
     _coalesce_runs, _coverage_runs, _partition_runs, _range_run, _residency_runs, _run_end,
 )
 from mindie_sim.prediction.runtime.tile_solver import AlgorithmKind, TileSolution
+from mindie_sim.schema.abi import SOC_ARCHS, SocArch
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.datapath import SourceRef
 
@@ -41,6 +42,12 @@ TileLangCubeEpilogue = Literal["fixpipe", "dual_copy", "atomic_add"]
 FuseRegionBackend = Literal[
     "catlass_evg", "dsl_mix", "dsl_vec", "tla_simt", "tilelang_simt", "tilelang_simd",
 ]
+LoweringTierKind = Literal[
+    "tier1_shipping_abi", "tilelang_simt", "tilelang_simd", "ascendc", "catlass",
+]
+LOWERING_TIER_KINDS: frozenset[str] = frozenset({
+    "tier1_shipping_abi", "tilelang_simt", "tilelang_simd", "ascendc", "catlass",
+})
 
 EvgKind = Literal[
     "acc_load", "aux_load", "row_broadcast", "col_broadcast", "exp", "relu",
@@ -509,6 +516,169 @@ class TemplateLoweringResult:
     @property
     def dram_miss_bytes(self) -> int:
         return self.summary.l2_miss_bytes
+
+
+def _strict_int(value: object, code: str, *, minimum: int = 0) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        raise ModelingError(f"{code}:{value!r}")
+    return int(value)
+
+
+@dataclass(frozen=True, slots=True)
+class UbAdmissionReceipt:
+    """Simultaneous single-counted UB/L1/L0C/L2 admission receipt for one tier trial."""
+
+    region_id: str
+    soc_arch: SocArch
+    tier_kind: LoweringTierKind
+    algorithm: str
+    peak_ub_bytes: int
+    ub_wall_bytes: int
+    admitted: bool
+    working_ub_at_peak_bytes: int = 0
+    ring_ub_at_peak_bytes: int = 0
+    l1_peak_bytes: int = 0
+    l0c_peak_bytes: int = 0
+    l2_reserved_bytes: int = 0
+    ub_wall_warning: str = ""
+    rejection_reason: str = ""
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.region_id, str) or not self.region_id.strip():
+            raise ModelingError("ub_admission_region_id_required")
+        if self.soc_arch not in SOC_ARCHS:
+            raise ModelingError(f"ub_admission_soc_arch_invalid:{self.soc_arch!r}")
+        if self.tier_kind not in LOWERING_TIER_KINDS:
+            raise ModelingError(f"ub_admission_tier_kind_invalid:{self.tier_kind!r}")
+        if not isinstance(self.algorithm, str) or not self.algorithm.strip():
+            raise ModelingError("ub_admission_algorithm_required")
+        peak = _strict_int(self.peak_ub_bytes, "ub_admission_peak_ub_invalid", minimum=0)
+        wall = _strict_int(self.ub_wall_bytes, "ub_admission_ub_wall_invalid", minimum=1)
+        working = _strict_int(self.working_ub_at_peak_bytes, "ub_admission_working_ub_invalid", minimum=0)
+        ring = _strict_int(self.ring_ub_at_peak_bytes, "ub_admission_ring_ub_invalid", minimum=0)
+        _strict_int(self.l1_peak_bytes, "ub_admission_l1_invalid", minimum=0)
+        _strict_int(self.l0c_peak_bytes, "ub_admission_l0c_invalid", minimum=0)
+        _strict_int(self.l2_reserved_bytes, "ub_admission_l2_invalid", minimum=0)
+        if not isinstance(self.admitted, bool):
+            raise ModelingError("ub_admission_admitted_flag_invalid")
+        if (working > 0 or ring > 0) and peak != working + ring:
+            raise ModelingError(
+                f"ub_admission_peak_must_equal_working_plus_ring:peak={peak}!=working({working})+ring({ring})"
+            )
+        if self.admitted and peak > wall:
+            raise ModelingError(f"ub_admission_admitted_exceeds_ub_wall:peak={peak}>wall={wall}")
+        if not self.admitted and (not isinstance(self.rejection_reason, str) or not self.rejection_reason.strip()):
+            raise ModelingError("ub_admission_rejection_reason_required")
+
+    @property
+    def headroom_bytes(self) -> int:
+        return self.ub_wall_bytes - self.peak_ub_bytes
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass(frozen=True, slots=True)
+class TierLoweringOutcome:
+    """Independent per-tier lowering and full-step Engine evaluation outcome."""
+
+    tier_kind: LoweringTierKind
+    backend_target: str
+    admitted: bool
+    step_ns: int | None
+    lowering_id: str = ""
+    lowering_sha256: str = ""
+    ub_receipt: UbAdmissionReceipt | None = None
+    rejection_reason: str = ""
+
+    def __post_init__(self) -> None:
+        if self.tier_kind not in LOWERING_TIER_KINDS:
+            raise ModelingError(f"tier_lowering_outcome_tier_invalid:{self.tier_kind!r}")
+        if not isinstance(self.backend_target, str) or not self.backend_target.strip():
+            raise ModelingError("tier_lowering_outcome_backend_required")
+        if not isinstance(self.admitted, bool):
+            raise ModelingError("tier_lowering_outcome_admitted_invalid")
+        if self.ub_receipt is not None:
+            if not isinstance(self.ub_receipt, UbAdmissionReceipt):
+                raise ModelingError("tier_lowering_outcome_ub_receipt_invalid")
+            if self.ub_receipt.tier_kind != self.tier_kind:
+                raise ModelingError(
+                    f"tier_lowering_outcome_ub_tier_mismatch:{self.ub_receipt.tier_kind}!={self.tier_kind}"
+                )
+        if self.admitted:
+            _strict_int(self.step_ns, "tier_lowering_outcome_step_ns_required", minimum=0)
+            if self.ub_receipt is not None and not self.ub_receipt.admitted:
+                raise ModelingError("tier_lowering_outcome_admitted_with_rejected_ub")
+        else:
+            if self.step_ns is not None:
+                _strict_int(self.step_ns, "tier_lowering_outcome_step_ns_invalid", minimum=0)
+            if not isinstance(self.rejection_reason, str) or not self.rejection_reason.strip():
+                raise ModelingError("tier_lowering_outcome_rejection_reason_required")
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass(frozen=True, slots=True)
+class DualTierLoweringReceipt:
+    """Combined receipt across independent shipping/synthesis tier trials selecting strict min ns."""
+
+    region_id: str
+    predecessor_step_ns: int
+    tier_outcomes: tuple[TierLoweringOutcome, ...]
+    best_feasible_tier: LoweringTierKind | None = None
+    best_lowering_id: str = ""
+    best_lowering_sha256: str = ""
+    best_step_ns: int | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.region_id, str) or not self.region_id.strip():
+            raise ModelingError("dual_tier_receipt_region_id_required")
+        _strict_int(self.predecessor_step_ns, "dual_tier_receipt_predecessor_ns_invalid", minimum=0)
+        outcomes = tuple(self.tier_outcomes)
+        if not outcomes or not all(isinstance(o, TierLoweringOutcome) for o in outcomes):
+            raise ModelingError("dual_tier_receipt_outcomes_invalid")
+        if len({o.tier_kind for o in outcomes}) != len(outcomes):
+            raise ModelingError("dual_tier_receipt_duplicate_tier_kind")
+        for outcome in outcomes:
+            if outcome.ub_receipt is not None and outcome.ub_receipt.region_id != self.region_id:
+                raise ModelingError(
+                    f"dual_tier_receipt_ub_region_mismatch:{outcome.ub_receipt.region_id}!={self.region_id}"
+                )
+        object.__setattr__(self, "tier_outcomes", outcomes)
+        admitted = [o for o in outcomes if o.admitted]
+        if not admitted:
+            if (
+                self.best_feasible_tier is not None
+                or self.best_step_ns is not None
+                or bool(self.best_lowering_id)
+                or bool(self.best_lowering_sha256)
+            ):
+                raise ModelingError("dual_tier_receipt_best_forbidden_when_none_admitted")
+            return
+        min_ns = min(int(o.step_ns) for o in admitted if o.step_ns is not None)
+        if self.best_feasible_tier is None:
+            best = min(admitted, key=lambda item: int(item.step_ns if item.step_ns is not None else 0))
+            object.__setattr__(self, "best_feasible_tier", best.tier_kind)
+            object.__setattr__(self, "best_lowering_id", best.lowering_id)
+            object.__setattr__(self, "best_lowering_sha256", best.lowering_sha256)
+            object.__setattr__(self, "best_step_ns", best.step_ns)
+            return
+        matched = next((o for o in admitted if o.tier_kind == self.best_feasible_tier), None)
+        if matched is None:
+            raise ModelingError(f"dual_tier_receipt_selected_tier_not_admitted:{self.best_feasible_tier}")
+        best_ns = _strict_int(self.best_step_ns, "dual_tier_receipt_best_step_ns_required", minimum=0)
+        if best_ns != matched.step_ns or best_ns > min_ns:
+            raise ModelingError(
+                f"dual_tier_receipt_best_step_ns_not_minimal:selected={best_ns}:matched={matched.step_ns}:min={min_ns}"
+            )
+        if self.best_lowering_id and self.best_lowering_id != matched.lowering_id:
+            raise ModelingError("dual_tier_receipt_lowering_id_mismatch")
+        if self.best_lowering_sha256 and self.best_lowering_sha256 != matched.lowering_sha256:
+            raise ModelingError("dual_tier_receipt_lowering_sha256_mismatch")
+
+    def to_dict(self) -> dict:
+        return asdict(self)
 
 
 def _obligation_runs(entry):

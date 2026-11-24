@@ -20,54 +20,6 @@ _DYNAMIC_TASK_FIELDS = 4
 _STATIC_TASK_NODE_OVERHEAD = 4
 
 
-def _check_engine_dynamic(value: Any, counter: list[int] | None = None) -> None:
-    """Fast restricted validator for the known Engine dynamic residue.
-
-    This validates every changed remaining/waiting/release/start field and the
-    small runs/allocations/pools/releases tail.  It is intentionally strict:
-    only the immutable scalar/container shapes emitted by the T04 adapter pass.
-    Any other shape keeps the generic recursive validator.
-    """
-    if type(value) is not tuple or len(value) != _ENGINE_STATE_FIELDS:
-        raise PeriodicContractError("periodic_engine_dynamic_shape_invalid")
-    task_dynamic, runs, allocations, pools, releases = value
-    for part in (task_dynamic, runs, allocations, pools, releases):
-        if type(part) is not tuple:
-            raise PeriodicContractError("periodic_engine_dynamic_part_invalid")
-    if counter is not None:
-        counter[0] += _ENGINE_STATE_FIELDS
-    for entry in task_dynamic:
-        if type(entry) is not tuple or len(entry) != _DYNAMIC_TASK_FIELDS:
-            raise PeriodicContractError("periodic_engine_task_dynamic_invalid")
-        remaining, waiting, release, start = entry
-        if type(remaining) is not tuple:
-            raise PeriodicContractError("periodic_engine_remaining_invalid")
-        for pair in remaining:
-            if type(pair) is not tuple or len(pair) != 2:
-                raise PeriodicContractError("periodic_engine_remaining_pair_invalid")
-            key, amount = pair
-            if type(key) is not str:
-                raise PeriodicContractError("periodic_engine_remaining_key_invalid")
-            if type(amount) is not int and type(amount) is not float:
-                raise PeriodicContractError("periodic_engine_remaining_value_invalid")
-            if type(amount) is float and not math.isfinite(amount):
-                raise PeriodicContractError("periodic_engine_remaining_value_invalid")
-            if counter is not None:
-                counter[0] += 2
-        if type(waiting) is not int or waiting < 0:
-            raise PeriodicContractError("periodic_engine_waiting_invalid")
-        for offset in (release, start):
-            if offset is None:
-                continue
-            if type(offset) is not int and type(offset) is not float:
-                raise PeriodicContractError("periodic_engine_offset_invalid")
-            if type(offset) is float and not math.isfinite(offset):
-                raise PeriodicContractError("periodic_engine_offset_invalid")
-        if counter is not None:
-            counter[0] += _DYNAMIC_TASK_FIELDS
-    for part in (runs, allocations, pools, releases):
-        _check_structural(part, path="engine_dynamic_tail", counter=counter)
-
 
 def _freeze_engine_dynamic(
     value: Any, counter: list[int] | None = None,

@@ -211,9 +211,6 @@ def _record_binding(record, op, binding: BatchBinding, scheduler) -> Mapping:
     return data
 
 
-_REBIND_META_KEYS = frozenset({
-    "state_accesses", "memory_accesses", "memory_bindings", "memory_binding",
-})
 _LAST_NO_MB_OPS: list[tuple] = [()]
 _LAST_NO_REV_OPS: list[tuple] = [()]
 

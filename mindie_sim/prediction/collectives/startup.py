@@ -34,7 +34,6 @@ from mindie_sim.schema.common import ModelingError
 
 
 ALLTOALL_FAMILIES = frozenset({"alltoall", "alltoallv"})
-STARTUP_MODES = frozenset({"legacy", "ring", "log2", "concurrent", "topology"})
 MODE_ALIASES = {
     "legacy": "legacy",
     "ring": "ring",
@@ -47,7 +46,6 @@ ORIGIN_EXPLICIT = "explicit_steps"
 ORIGIN_OPERATOR = "operator_metadata"
 ORIGIN_RUNTIME = "runtime"
 ORIGIN_TOPOLOGY = "topology_protocol"
-ORIGIN_LEGACY = "legacy_default"
 
 
 @dataclass(frozen=True)

@@ -68,26 +68,6 @@ from .kv import (
 )
 
 
-_ATTENTION_FAMILIES = frozenset({
-    "attention", "qkv_projection", "output_projection", "rotary", "cache_store",
-    "gdn_gating", "short_convolution", "recurrent_vector",
-})
-_FFN_FAMILIES = frozenset({
-    "grouped_gemm", "moe_ffn", "gate_up_projection", "down_projection", "swiglu",
-    "situ", "router", "topk", "routing", "alltoall", "alltoallv", "projection",
-})
-_ATTENTION_RECIPES = frozenset({
-    "q_a", "q_b", "kv_a", "kv_b", "qkv", "qkv_projection", "linear_qkvz",
-    "linear_output", "q_proj", "kv_proj", "q_absorb", "v_expand", "q_flat",
-    "k_flat", "v_flat", "qkv_concatenate", "qkv_split_materialize",
-})
-_ATTENTION_NORMS = frozenset({"q_norm", "kv_norm", "qk_norm", "q_a_norm", "kv_a_norm"})
-_ATTENTION_COMMS = frozenset({"linear_reduce", "catalog_tp_allreduce", "output_reduce"})
-_FFN_TOKENS = (
-    "expert", "grouped", "moe", "ffn", "router", "route_", "topk", "gate_up",
-    "dense_down", "dense_gate_up", "swiglu", "situ", "latent", "shared",
-)
-
 
 __all__ = [
     "OffloadPolicy",

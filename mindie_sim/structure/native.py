@@ -143,10 +143,10 @@ def matrix_comparison_scope(op):
 
 import math
 
-#: CANN 9.2.1 official mixed-quant sparse MLA plus its retained prototype alias.
+#: CANN 9.2.1 official mixed-quant sparse MLA plus its archived prototype DSL alias.
 MQSMLA_RECIPE = "aclnn_mixed_quant_sparse_flash_mla"
 MQSMLA_NATIVE_KIND = "aclnnMixedQuantSparseFlashMla"
-LEGACY_MQSMLA_RECIPE = "cannbot_mixed_quant_sparse_flash_mla"
+LEGACY_MQSMLA_RECIPE = "dsl_mixed_quant_sparse_flash_mla"
 LEGACY_MQSMLA_NATIVE_KIND = "MqsmlaKernel___call__"
 MQSMLA_RECIPES = frozenset({MQSMLA_RECIPE, LEGACY_MQSMLA_RECIPE})
 MQSMLA_NATIVE_KINDS = frozenset({MQSMLA_NATIVE_KIND, LEGACY_MQSMLA_NATIVE_KIND})

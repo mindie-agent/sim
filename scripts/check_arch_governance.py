@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""Architecture governance gate (AG001..AG013) for ``mindie_sim``.
+"""Architecture governance gate (AG001..AG014) for ``mindie_sim``.
 
 [Role] Enforce governed ``mindie_sim/prediction/operators/<family>/`` package
   boundaries, forbid flat ISA/CANN filename sprawl under ``mindie_sim/**/*.py``,
   block direct leaf imports, block ``service_modes`` / ``compute_peaks``
   capability sniffing, verify ISA provenance, check dispatched recipe ownership
   and physical work conservation, reject silent physical hardware defaults,
-  enforce unidirectional layer imports, and ensure operator Engine reachability.
+  enforce unidirectional layer imports, ensure operator Engine reachability,
+  and detect per-model-name branching across executable ``mindie_sim/`` +
+  ``manifest.json`` (AG014).
 [Invariants] ``AG001`` scans strictly ``mindie_sim/**/*.py`` so model catalog
   JSON files (e.g. ``qwen3.5-35b-a3b.json``) are never flagged. Governed
   ``operators/<family>/**`` modules allow zero violations in every mode.
@@ -39,7 +41,8 @@ if __package__:
         _check_ag009_silent_physical_defaults, _check_ag010_layer_dag,
         _check_ag010_package_sccs, _check_ag011_operator_reachability,
         _check_ag013_anti_hardcoding as _base_ag013_anti_hardcoding,
-        _is_governed_family_path, scan_runtime,
+        _check_ag014_zero_model_name_branches,
+        _is_governed_family_path, check_ag014_manifest, scan_runtime,
         verify_ag007_discrimination, verify_ag011_engine_reachability,
     )
 else:
@@ -52,7 +55,8 @@ else:
         _check_ag009_silent_physical_defaults, _check_ag010_layer_dag,
         _check_ag010_package_sccs, _check_ag011_operator_reachability,
         _check_ag013_anti_hardcoding as _base_ag013_anti_hardcoding,
-        _is_governed_family_path, scan_runtime,
+        _check_ag014_zero_model_name_branches,
+        _is_governed_family_path, check_ag014_manifest, scan_runtime,
         verify_ag007_discrimination, verify_ag011_engine_reachability,
     )
 
@@ -126,11 +130,27 @@ CANONICAL_CONCEPT_OWNERS: Mapping[str, tuple[str, ...]] = MappingProxyType({
     "CacheStateABI": ("mindie_sim/schema/stack.py",),
     "RuntimeQuantPlan": ("mindie_sim/schema/stack.py",),
     "StackLoweringPlan": ("mindie_sim/schema/stack.py",),
+    "ManifestBinding": ("mindie_sim/schema/stack.py",),
     "RuntimeStackAdapter": ("mindie_sim/schema/stack.py",),
     "ScenarioContract": ("mindie_sim/schema/scenario.py",),
     "SLAContract": ("mindie_sim/schema/scenario.py",),
     "DeploymentOutcome": ("mindie_sim/schema/scenario.py",),
     "CoDesignOpportunity": ("mindie_sim/schema/scenario.py",),
+    "AbiQueryKey": ("mindie_sim/schema/abi.py",),
+    "ProbedAbiEntry": ("mindie_sim/schema/abi.py",),
+    "AbiSupportVerdict": ("mindie_sim/schema/abi.py",),
+    "AbiCatalogSnapshot": ("mindie_sim/schema/abi.py",),
+    "StackTrackSpec": ("mindie_sim/schema/stack.py",),
+    "SpeculativeWorkloadPolicy": ("mindie_sim/schema/workload.py",),
+    "DSparkPreparePlan": ("mindie_sim/catalog/draft_spec.py",),
+    "DraftStepSchedule": ("mindie_sim/catalog/draft_spec.py",),
+    "SpeculativeExecutionContract": ("mindie_sim/catalog/draft_spec.py",),
+    "UbAdmissionReceipt": ("mindie_sim/templates/contracts.py",),
+    "TierLoweringOutcome": ("mindie_sim/templates/contracts.py",),
+    "DualTierLoweringReceipt": ("mindie_sim/templates/contracts.py",),
+    "StageReceipt": ("mindie_sim/prediction/results.py",),
+    "EngineStepReceipt": ("mindie_sim/prediction/results.py",),
+    "NativeCallBinding": ("mindie_sim/prediction/native_binding.py",),
 })
 
 def _is_allowed_isa_leaf(rel: PurePosixPath) -> bool:
@@ -1210,9 +1230,39 @@ def _check_ag013_anti_hardcoding(rel: PurePosixPath, tree: ast.Module) -> list[V
     return violations
 
 
+def _ag014_manifest_for_revision(root: Path, revision: str | None) -> list[Violation]:
+    manifest_text: str | None = None
+    if revision is not None:
+        manifest_rel = "mindie_sim/stacks/vllm_ascend/manifest.json"
+        try:
+            manifest_text = _git(root, "show", f"{revision}:{manifest_rel}")
+        except RuntimeError:
+            manifest_text = None
+    if revision is None or manifest_text is not None:
+        return check_ag014_manifest(root, manifest_text=manifest_text)
+    return []
+
+
+def scan_ag014(
+    root: Path, /, *, revision: str | None = None,
+) -> tuple[Violation, ...]:
+    """Scan executable ``mindie_sim/**/*.py`` and ``manifest.json`` for AG014 model-name branches."""
+    violations: list[Violation] = []
+    for rel, text in _enumerate_py_files(root, revision=revision):
+        try:
+            tree = ast.parse(text, filename=rel.as_posix())
+        except SyntaxError:
+            continue
+        violations.extend(_check_ag014_zero_model_name_branches(rel, tree))
+    violations.extend(_ag014_manifest_for_revision(root, revision))
+    violations.sort(key=lambda v: (v.path.as_posix(), v.line, v.rule, v.message))
+    return tuple(violations)
+
+
 def scan_repository(
     root: Path, /, *, revision: str | None = None,
     refs_root: Path | None = None, repo_map: Mapping[str, Path] | None = None,
+    include_ag014: bool = False,
 ) -> tuple[Violation, ...]:
     """Return the sorted static findings under ``mindie_sim/**/*.py``."""
     violations: list[Violation] = []
@@ -1241,9 +1291,13 @@ def scan_repository(
         violations.extend(_check_ag009_silent_physical_defaults(rel, tree))
         violations.extend(_check_ag010_layer_dag(rel, tree))
         violations.extend(_check_ag013_anti_hardcoding(rel, tree))
+        if include_ag014:
+            violations.extend(_check_ag014_zero_model_name_branches(rel, tree))
     violations.extend(_check_ag008_repo_bounds([rel for rel, _ in files], texts=texts))
     violations.extend(_check_ag010_package_sccs(parsed_files))
     violations.extend(_check_ag011_operator_reachability(parsed_files))
+    if include_ag014:
+        violations.extend(_ag014_manifest_for_revision(root, revision))
     violations.sort(key=lambda v: (v.path.as_posix(), v.line, v.rule, v.message))
     return tuple(violations)
 
@@ -1284,6 +1338,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--root", default=".", help="repository root")
     parser.add_argument("--base", default=None, help="git base ref for differential scan")
     parser.add_argument("--strict", action="store_true", help="run live checks and ignore legacy allowlist")
+    parser.add_argument(
+        "--strict-ag014",
+        action="store_true",
+        help="promote AG014 zero model-name branching checks from staged observation to hard failure",
+    )
     parser.add_argument("--refs-root", default=None, help="local upstream repos root for SHA-256 check")
     parser.add_argument(
         "--repo-map",
@@ -1297,20 +1356,33 @@ def main(argv: Sequence[str] | None = None) -> int:
     refs_root = Path(args.refs_root).resolve() if args.refs_root else None
     try:
         repo_map = _parse_repo_map(args.repo_map)
-        current = scan_repository(root, refs_root=refs_root, repo_map=repo_map or None)
+        all_current = scan_repository(
+            root, refs_root=refs_root, repo_map=repo_map or None, include_ag014=True,
+        )
+        current = tuple(v for v in all_current if v.rule != "AG014")
+        ag014_findings = tuple(v for v in all_current if v.rule == "AG014")
         if args.base is not None:
-            active = new_violations(current, scan_repository(root, revision=args.base))
+            all_base = scan_repository(root, revision=args.base, include_ag014=args.strict_ag014)
+            base_non_ag014 = tuple(v for v in all_base if v.rule != "AG014")
+            active = new_violations(current, base_non_ag014)
+            if args.strict_ag014:
+                base_ag014 = tuple(v for v in all_base if v.rule == "AG014")
+                ag014_findings = new_violations(ag014_findings, base_ag014)
         elif args.strict:
             active = current
         else:
             active = filter_allowlisted(current)
         if args.strict:
             active += scan_runtime(root) + tuple(check_ag012(root))
+        if args.strict_ag014:
+            active += ag014_findings
     except RuntimeError as exc:
         print(str(exc), file=sys.stderr)
         return EXIT_USAGE
     for item in active:
         print(f"{item.path.as_posix()}:{item.line}: {item.rule} {item.message}")
+    if not args.strict_ag014 and ag014_findings:
+        print(f"arch governance AG014 staged warnings: {len(ag014_findings)}")
     print(f"arch governance violations: {len(active)}")
     return EXIT_VIOLATIONS if active else EXIT_OK
 

@@ -72,8 +72,6 @@ MIN_FUSE_MEMBERS = 2
 MIN_TRIGGER_AVOIDABLE_BYTES = 4096
 #: Standard GEMM tensor shape rank ``(M, N, K)``.
 MATMUL_SHAPE_RANK = 3
-#: Default UB tile row block size for row-wise reductions.
-DEFAULT_UB_TILE_ROWS = 16
 #: Default UB alignment granule (bytes).
 UB_ALIGN_BYTES = DEFAULT_POOL_GRANULE_BYTES
 #: Maximum chain length for Law 1 UB pointwise/reduction composition.

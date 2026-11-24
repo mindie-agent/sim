@@ -239,16 +239,6 @@ def structural_difference(first: Any, second: Any) -> str | None:
     return _first_difference(first, second)
 
 
-def _bounded_repr(value: Any) -> str:
-    """Bound diagnostic text; display text is never used as identity."""
-    try:
-        text = repr(value)
-    except Exception:  # pragma: no cover - builtin state only
-        return "<unrepresentable>"
-    if len(text) > _TEMPLATE_REPR_LIMIT:
-        return text[:_TEMPLATE_REPR_LIMIT] + "..."
-    return text
-
 
 def _measure_retained(value: Any, *, seen: set[int] | None = None) -> int:
     """Approximate bytes owned by a validated value graph.

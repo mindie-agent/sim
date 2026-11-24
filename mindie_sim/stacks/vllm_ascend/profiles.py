@@ -17,7 +17,6 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from copy import deepcopy
-from dataclasses import dataclass
 from functools import lru_cache
 import json
 from pathlib import Path
@@ -25,10 +24,11 @@ import re
 from typing import Any
 
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.schema.hardware import Hardware
 from mindie_sim.schema.model import ModelSpec
 from mindie_sim.schema.parallel import ParallelSpec
-from mindie_sim.schema.stack import StackTrack, WorkloadDomain
+from mindie_sim.schema.stack import ManifestBinding, StackTrack, WorkloadDomain
 
 VLLM_ASCEND_STACK_ID = "vllm-ascend"
 VLLM_ASCEND_REPO = "vllm-project/vllm-ascend"
@@ -209,29 +209,6 @@ DEFAULT_CHECKPOINTS_BY_MODEL_HW: dict[tuple[str, str], str] = {
     ("bailing-v3", "a3"): "Eco-Tech/Ling-3.1-flash-w4a8",
     ("bailing-v3", "a2"): "Eco-Tech/Ling-3.1-flash-w4a8",
 }
-
-
-@dataclass(frozen=True, slots=True)
-class ManifestBinding:
-    """One audited mechanism binding loaded from ``manifest.json``."""
-
-    mechanism_id: str
-    state: str
-    ref: str
-    models: tuple[str, ...] = ()
-    archs: tuple[str, ...] = ()
-    phases: tuple[str, ...] = ()
-    options: tuple[tuple[str, Any], ...] = ()
-    notes: str = ""
-
-    def matches(self, canonical_model: str, arch: str, phase: str | None = None) -> bool:
-        if self.models and canonical_model not in self.models:
-            return False
-        if self.archs and arch not in self.archs:
-            return False
-        if phase and self.phases and phase.strip().lower() not in self.phases:
-            return False
-        return True
 
 
 def _p(
@@ -692,15 +669,26 @@ def load_manifest_bindings() -> tuple[ManifestBinding, ...]:
     raw = load_vllm_ascend_manifest()
     bindings: list[ManifestBinding] = []
     for item in raw.get("bindings") or ():
+        prov_raw = item.get("provenance") or {}
+        prov = SourceRef(
+            repository=str(prov_raw.get("repository") or VLLM_ASCEND_REPO),
+            revision=str(prov_raw.get("revision") or raw.get("manifest_revision") or ""),
+            relative_path=str(prov_raw.get("relative_path") or "manifest.json"),
+            source_sha256=str(prov_raw.get("source_sha256") or ""),
+        )
+        mech_id = str(item["mechanism_id"])
         bindings.append(
             ManifestBinding(
-                mechanism_id=str(item["mechanism_id"]),
-                state=str(item["state"]),
+                mechanism_id=mech_id,
+                state=str(item["state"]),  # type: ignore[arg-type]
                 ref=str(item.get("ref") or ""),
+                lowering_pass_id=str(item.get("lowering_pass_id") or ""),
+                provenance=prov,
                 models=tuple(str(m) for m in (item.get("models") or ())),
                 archs=tuple(str(a).lower() for a in (item.get("archs") or ())),
-                phases=tuple(str(p).lower() for p in (item.get("phases") or ())),
+                phase_scope=tuple(str(p).lower() for p in (item.get("phases") or item.get("phase_scope") or ())),
                 options=tuple(sorted((str(k), v) for k, v in (item.get("options") or {}).items())),
+                capability_predicates=tuple(str(p) for p in (item.get("capability_predicates") or ())),
                 notes=str(item.get("notes") or ""),
             )
         )

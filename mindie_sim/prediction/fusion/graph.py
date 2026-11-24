@@ -22,10 +22,6 @@ DTYPE_BYTES = {"bf16": 2, "fp16": 2, "fp32": 4, "tf32": 4, "int64": 8,
                "fp8_e4m3": 1, "fp8_e5m2": 1, "int4": 1, "fp4": 1}
 TILE_ROWS = (1, 2, 4, 8, 16, 32, 64)
 UB_ALIGNMENT = 32
-VECTOR_KINDS = frozenset({"add", "rms_norm", "add_rms_norm", "rms_norm_quant",
-                          "add_rms_norm_quant", "cast", "dynamic_quant", "quant",
-                          "rope", "kv_cast", "swiglu", "silu", "mul",
-                          "elementwise", "bias", "topk", "dispatch"})
 CUBE_KINDS = frozenset({"matmul", "grouped_matmul", "attention", "mla_prolog"})
 REDUCTION_KINDS = frozenset({"rms_norm", "add_rms_norm", "rms_norm_quant",
                              "add_rms_norm_quant", "reduce", "softmax",

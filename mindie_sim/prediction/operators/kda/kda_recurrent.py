@@ -69,7 +69,6 @@ SOURCE = {
     "scope": "selected_source_kernel_not_capture_binary_identity",
 }
 _BYTES = {"bf16": 2, "fp16": 2, "fp32": 4}
-ZERO_WORK = 0.0
 A5_AIC_UNITS = 32
 A5_AIV_UNITS = 64
 A5_UB_BYTES = 253952

@@ -120,6 +120,7 @@ KV_CACHE_PLANES = 2
 DEFAULT_NORM_EPS = 1e-6
 Q_GATE_PROJECTIONS = frozenset({"packed_q", "separate"})
 HC_FINAL_COLLAPSE_MODES = frozenset({"learned", "mean", "none"})
+GDN_LAYOUTS = frozenset({"standard", "interleaved"})
 ACCOUNTING_SCOPES = frozenset({"text_backbone", "full_checkpoint"})
 
 @dataclass(frozen=True)
@@ -250,6 +251,11 @@ class LayerPlan:
     k_eq_v: bool = False
     kda_batch_chunk_norm: bool = False
     zero_expert_num: int = 0
+    #: Structural norm/attention/linear-attention traits replacing model-name checks (AG014).
+    has_sandwich_norm: bool = False
+    norm_unit_offset: bool = False
+    v_norm: bool = False
+    gdn_layout: str = "standard"
 
     def __post_init__(self) -> None:
         # Normalise the declared indexer role once, so every downstream reader
@@ -282,6 +288,11 @@ class LayerPlan:
             raise ModelingError(f"layer_plan_hc_final_collapse_unknown:{collapse}")
         if collapse != self.hc_final_collapse:
             object.__setattr__(self, "hc_final_collapse", collapse)
+        layout = str(self.gdn_layout or "standard").strip().lower()
+        if layout not in GDN_LAYOUTS:
+            raise ModelingError(f"layer_plan_gdn_layout_unknown:{layout}")
+        if layout != self.gdn_layout:
+            object.__setattr__(self, "gdn_layout", layout)
 
     def q_projection_width(self, local_heads: int, head_dim: int) -> int:
         if self.q_gate_separate:

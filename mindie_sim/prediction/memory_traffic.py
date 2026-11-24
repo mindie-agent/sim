@@ -20,8 +20,6 @@ from mindie_sim.schema.physical_mechanisms import MemoryHierarchySpec
 
 
 DEFAULT_QUERY_TILE = 128
-BYTES_PER_ELEMENT = {"bf16": 2, "fp16": 2, "fp32": 4, "int8": 1,
-                     "fp8": 1, "fp8_e4m3": 1, "fp8_e5m2": 1}
 
 
 #: Declared attention traffic phases.  A speculative draft step reads and

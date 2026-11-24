@@ -741,8 +741,6 @@ ROLE_VECTOR = "vector"
 ROLE_MEMORY = "memory"
 ROLE_COMMUNICATION = "communication"
 ROLE_CONTROL = "control"
-NON_COMMUNICATION_ROLES = frozenset({
-    ROLE_CUBE, ROLE_VECTOR, ROLE_MEMORY, ROLE_CONTROL})
 
 
 def _dominant_role(op, *, stage_rates: Mapping[str, Any] | None = None) -> str:

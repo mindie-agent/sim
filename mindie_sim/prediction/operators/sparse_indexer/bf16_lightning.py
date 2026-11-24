@@ -64,9 +64,6 @@ _PAGED_KEY_CACHE_RANK = 4
 _CAUSAL_MASK_MODE = 3
 WEIGHT_DTYPES = frozenset({"fp32", "bf16", "fp16"})
 _DTYPE_ALIASES = {"bfloat16": "bf16", "float32": "fp32", "float16": "fp16"}
-NATIVE_INPUTS = ("query", "key_cache", "weights", "query_lengths",
-                 "key_lengths", "block_table")
-NATIVE_OUTPUTS = ("indices",)
 
 
 def recipes():
@@ -182,49 +179,6 @@ def _topk_comparisons(pairs, topk, kv_heads, spans, compression):
         return max(0, pairs - _visible_rows(spans, compression)) * kv_heads
     return pairs * kv_heads * math.log2(topk)
 
-
-def _exchange_counts(spans, compression, topk, units, kv_heads=1):
-    """Local TopK lists and their merge cost per (query row, KV head).
-
-    Keys are partitioned over at most ``units`` vector owners.  Every owner
-    keeps up to ``topk`` candidates (the correctness capacity of a global
-    TopK merge), so a row needs ``min(units, ceil(visible / topk))`` local
-    lists.  One list needs no exchange.  Each KV head owns an independent
-    selection domain and therefore its own lists and merge.
-    """
-    if units <= 1:
-        # One owner keeps a single local list per row that owns a key; no list
-        # is ever exchanged.
-        lists = _visible_rows(spans, compression)
-        return 0, lists * kv_heads, 0.0
-    list_bytes = 0
-    list_sum = 0
-    merge_ops = 0.0
-    for q, c in spans:
-        for lists in range(1, units + 1):
-            # visible(i) = floor((c + i + 1) / compression); this bucket holds
-            # rows whose ceil(visible / topk) is exactly ``lists``.
-            first = max(0, ((lists - 1) * topk + 1) * compression - c - 1)
-            last = (q if lists == units
-                    else min(q, (lists * topk + 1) * compression - c - 1))
-            count = max(0, last - first)
-            if not count:
-                continue
-            list_sum += count * lists
-            if lists == 1:
-                continue
-            # Every owner keeps min(topk, its share) candidates, so the union
-            # actually exchanged is min(visible, lists * topk).  For interior
-            # buckets that is the visible count; the last bucket can saturate.
-            if lists == units:
-                cut = max(first, min(last, (units * topk + 1) * compression - c - 1))
-                entries = _floor_sum(max(0, cut - first), compression, 1, c + first + 1)
-                entries += max(0, last - cut) * units * topk
-            else:
-                entries = _floor_sum(count, compression, 1, c + first + 1)
-            list_bytes += entries * LOCAL_LIST_ELEMENT_BYTES
-            merge_ops += entries * max(1.0, math.log2(lists))
-    return (list_bytes * kv_heads, list_sum * kv_heads, merge_ops * kv_heads)
 
 
 def _descriptor(value, name, rank, dtypes, layouts):

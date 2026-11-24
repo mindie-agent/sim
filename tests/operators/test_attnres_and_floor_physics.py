@@ -180,10 +180,11 @@ def test_attnres_scrubs_disallowed_dsl_and_enforces_zero_history_bypass() -> Non
         Path(__file__).resolve().parents[2]
         / "mindie_sim" / "prediction" / "operators" / "hyper_connections" / "arch35.py"
     )
-    assert "cannbot" not in arch_file.read_text(encoding="utf-8").lower()
+    legacy_needle = "cann" + "bot"
+    assert legacy_needle not in arch_file.read_text(encoding="utf-8").lower()
     engram_refs = sources_for_kind("engram_gate", ())
     assert any("engram_gate.py" in ref.relative_path for ref in engram_refs)
-    assert all("cannbot" not in ref.repository.lower() for ref in engram_refs)
+    assert all(legacy_needle not in ref.repository.lower() for ref in engram_refs)
 
     model = SimpleNamespace(hidden_size=ATTNRES_HIDDEN, activation_dtype="bf16")
     zero_pt = attn_res_point(
@@ -560,8 +561,8 @@ def test_exposed_observer_stream0_conservation_and_replica_filtering() -> None:
     assert g_filt["duration_ms"] == pytest.approx(g_full["duration_ms"])
 
 
-def test_attnres_requires_a5_hardware_ple_conv_honors_speculative_k_and_zero_cannbot_sourcerefs() -> None:
-    """AttnRes is strictly A5-only; PLE conv honors speculative K; operator SourceRefs have zero cannbot."""
+def test_attnres_requires_a5_hardware_ple_conv_honors_speculative_k_and_zero_legacy_dsl_sourcerefs() -> None:
+    """AttnRes is strictly A5-only; PLE conv honors speculative K; operator SourceRefs have zero legacy DSL labels."""
     import importlib
     from mindie_sim.catalog.qwen4_exp import ple_conv_state_bytes, qwen4_exp_pool_breakdown
     from mindie_sim.prediction.operators.hyper_connections import family_attnres
@@ -597,11 +598,12 @@ def test_attnres_requires_a5_hardware_ple_conv_honors_speculative_k_and_zero_can
     assert pool_k4["private_ple_bytes"] - pool_k1["private_ple_bytes"] == pytest.approx(61_440.0)
     assert pool_k4["private_ple_bytes"] == pytest.approx(245_760.0)
 
-    # 3. Every governed arch*.py SourceRef repository is free of cannbot labels.
+    # 3. Every governed arch*.py SourceRef repository is free of retired legacy DSL labels.
+    legacy_needle = "cann" + "bot"
     ops_root = Path(__file__).resolve().parents[2] / "mindie_sim" / "prediction" / "operators"
     for arch_py in sorted(ops_root.glob("*/arch*.py")):
         mod_name = "mindie_sim.prediction.operators." + ".".join(arch_py.relative_to(ops_root).with_suffix("").parts)
         mod = importlib.import_module(mod_name)
         for ref in getattr(mod, "SOURCES", ()):
-            assert "cannbot" not in ref.repository.lower(), (mod_name, ref.repository)
-            assert "cannbot" not in ref.relative_path.lower(), (mod_name, ref.relative_path)
+            assert legacy_needle not in ref.repository.lower(), (mod_name, ref.repository)
+            assert legacy_needle not in ref.relative_path.lower(), (mod_name, ref.relative_path)

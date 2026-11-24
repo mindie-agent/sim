@@ -118,11 +118,6 @@ def _catalog_identity(catalog: ProgramCatalog) -> str:
 # Stage / allocation translation
 
 
-@dataclass(frozen=True)
-class _Symbols:
-    ids: Mapping[str, int]
-    specifications: tuple[AllocationSpec, ...]
-
 
 def _template_scopes(template: PipelineTemplate | None,
                      producer_bindings: Any) -> dict[str, str]:

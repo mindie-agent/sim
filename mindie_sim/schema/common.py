@@ -61,6 +61,40 @@ _PEAK_DTYPE_ALIASES = {
 
 _BASE_PEAK_DTYPES = frozenset({"bf16", "bfloat16", "fp16", "float16"})
 
+#: Expected maximum deviation of a 2-rank zero-sum normal split (E[|Z|] = sqrt(2 / pi)).
+ORDER_STAT_M2_Z = math.sqrt(2.0 / math.pi)
+#: Precomputed ln(4 * pi) term in the Cramér-Leadbetter normal maximum order statistic.
+ORDER_STAT_LN_FOUR_PI = math.log(4.0 * math.pi)
+#: Variance damping factor when redundant EPLB slots mitigate EP rank skew.
+EPLB_VARIANCE_DAMPING = 0.35
+
+
+def normal_max_order_z(rank_count: int) -> float:
+    """Closed-form expected maximum of ``rank_count`` standard normals."""
+    m = int(rank_count)
+    if m <= 1:
+        return 0.0
+    if m == 2:
+        return ORDER_STAT_M2_Z
+    log_m = math.log(float(m))
+    root = math.sqrt(2.0 * log_m)
+    asymptotic = root - (math.log(log_m) + ORDER_STAT_LN_FOUR_PI) / (2.0 * root)
+    return max(ORDER_STAT_M2_Z, asymptotic)
+
+
+def inclusion_probability(draws: float, hit_prob: float) -> float:
+    """Exact ``1 - (1 - hit_prob) ** draws`` with zero-draw guard checked first."""
+    n = float(draws)
+    if not math.isfinite(n) or n <= 0.0:
+        return 0.0
+    p = float(hit_prob)
+    if not math.isfinite(p) or p <= 0.0:
+        return 0.0
+    if p >= 1.0:
+        return 1.0
+    return -math.expm1(n * math.log1p(-p))
+
+
 class ModelingError(ValueError):
     """Invalid or unsupported modeling input."""
 

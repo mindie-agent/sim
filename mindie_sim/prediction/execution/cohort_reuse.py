@@ -566,10 +566,6 @@ def _request_ids(graph: Sequence[Any]) -> tuple[str, ...]:
         for request in (getattr(op, "requests", ()) or ())))
 
 
-def _template_rank(case: Any, replica: int, *, topology: Any = None) -> int:
-    mapping = _rank_map(case, replica, topology=topology)
-    return min(mapping.values()) if mapping else int(replica)
-
 
 def prepare_cohort_graphs(
     case: Any, plans: Mapping[int, Any], *, reuse: str,

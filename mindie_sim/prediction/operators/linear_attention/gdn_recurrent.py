@@ -30,8 +30,6 @@ from ..contracts import OperatorPlanningContext
 from .common import executed_request_lengths, owner_units, request_layout_metadata
 
 IMPLEMENTATION = "ascend_recurrent_gdn_fp32_state"
-STATE_CONTRACT_KEY = "gdn_state_contract"
-STATE_EFFECTS_KEY = "gdn_state_effects"
 SOURCE = {
     "repository": "Ascend/ops-transformer",
     "path": "attention/recurrent_gated_delta_rule/op_kernel/arch35/recurrent_gated_delta_rule_arch35.h",

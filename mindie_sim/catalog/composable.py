@@ -404,6 +404,7 @@ def build_composable(key, config, family="generic"):
     params, weights, draft_params, draft_weights = _model_weight_totals(model)
     _set_facts(model, (
         ("profile", family), ("model_type", c.get("model_type", "")),
+        ("num_nextn_predict_layers", int(c.get("num_nextn_predict_layers", 0) or 0)),
         ("parameter_count_body", params), ("resident_weight_bytes_body", weights),
         ("parameter_count_optional_draft", draft_params), ("optional_draft_weight_bytes", draft_weights),
         ("cache_row_bytes_by_layer", cache_row_bytes_by_layer(model)),

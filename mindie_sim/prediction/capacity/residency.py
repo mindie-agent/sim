@@ -126,19 +126,6 @@ def _routed_expert_bytes_by_stage(
     return result, payload, staging
 
 
-def _resident_weight_parallel(
-    term, parallel, enable_shared_expert_dp: bool,
-    enable_pcp_o_proj_weight_sharding: bool = False,
-    dcp_q_replicate: bool = False,
-):
-    """Delegate to the weight ledger's single-source placement rule."""
-    from mindie_sim.catalog.weights import _resident_parallel
-    return _resident_parallel(
-        term, parallel, enable_shared_expert_dp,
-        pcp_o_proj_weight_sharding=enable_pcp_o_proj_weight_sharding,
-        dcp_q_replicate=dcp_q_replicate,
-    )
-
 
 def _weight_ledger_by_stage(
     case: CaseSpec, layer_stage: tuple[int, ...], *, draft_kind: str,

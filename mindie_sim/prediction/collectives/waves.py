@@ -38,7 +38,6 @@ REL_TOL = 1e-12
 ABS_TOL = 1e-9
 OFFSET_FIRST = 1
 DEFAULT_MAX_INFLIGHT: int | None = None
-GENERIC_RECIPE = "startup_waves"
 ALLTOALL_FAMILIES = frozenset({"alltoall", "alltoallv"})
 NONLEGACY_STARTUP_MODES = frozenset({"ring", "log2", "concurrent", "topology"})
 

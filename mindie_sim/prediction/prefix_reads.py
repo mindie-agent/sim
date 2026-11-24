@@ -42,7 +42,6 @@ MODE_BATCH_SHARED = "batch_shared"
 MODES = frozenset({MODE_AUTO, MODE_PER_SEQUENCE, MODE_BATCH_SHARED})
 REUSE_TILE = "tile"
 REUSE_PAGED_L2 = "paged_l2"
-REUSE_NONE = "none"
 REUSE_PER_SEQUENCE = "per_sequence"
 SUPPORTED_BATCH_SHARED_REUSE = frozenset({REUSE_TILE, "batch_tile"})
 SUPPORTED_AUTO_REUSE = frozenset({REUSE_TILE, "batch_tile", REUSE_PAGED_L2})
@@ -104,13 +103,6 @@ class PrefixReadPlan:
             "reason": self.reason,
         }
 
-
-def _access_tokens(access: CacheAccess) -> int:
-    context = max(0, int(access.context_tokens))
-    q = max(1, int(access.q_len))
-    if q <= 1:
-        return context + 1
-    return context + q
 
 
 def _logical_rows(access: CacheAccess) -> float:

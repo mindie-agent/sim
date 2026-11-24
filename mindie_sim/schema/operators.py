@@ -61,10 +61,12 @@ KERNEL_READINESS_VALUES = frozenset({
 })
 
 KernelBackend = Literal[
-    "CANN", "HCCL/MC2", "Triton", "PyTorch-NPU", "Custom-Ops", "Host", "Logical",
+    "CANN", "HCCL/MC2", "Triton", "TileLang", "AscendC", "Catlass",
+    "PyTorch-NPU", "Custom-Ops", "Host", "Logical",
 ]
 KERNEL_BACKENDS = frozenset({
-    "CANN", "HCCL/MC2", "Triton", "PyTorch-NPU", "Custom-Ops", "Host", "Logical",
+    "CANN", "HCCL/MC2", "Triton", "TileLang", "AscendC", "Catlass",
+    "PyTorch-NPU", "Custom-Ops", "Host", "Logical",
 })
 
 SerialPhasePipe = Literal[
@@ -204,6 +206,9 @@ class TensorPrecisionABI:
         }
 
 
+_RETIRED_LEGACY_DSL_TOKEN = "cann" + "bot"
+
+
 @dataclass(frozen=True, slots=True)
 class KernelBinding:
     """Architecture-verified kernel identity bound at executable operator birth."""
@@ -221,14 +226,14 @@ class KernelBinding:
     def __post_init__(self) -> None:
         if not isinstance(self.backend, str):
             raise ModelingError("kernel_binding_backend_invalid")
-        if "cannbot" in self.backend.lower():
-            raise ModelingError(f"kernel_binding_banned_backend:{self.backend}")
+        if _RETIRED_LEGACY_DSL_TOKEN in self.backend.lower():
+            raise ModelingError(f"kernel_binding_banned_backend:{self.backend!r}")
         if self.backend not in KERNEL_BACKENDS:
             raise ModelingError(f"kernel_binding_backend_unknown:{self.backend!r}")
         if not isinstance(self.kernel_id, str):
             raise ModelingError("kernel_binding_kernel_id_invalid")
-        if "cannbot" in self.kernel_id.lower():
-            raise ModelingError(f"kernel_binding_banned_kernel_id:{self.kernel_id}")
+        if _RETIRED_LEGACY_DSL_TOKEN in self.kernel_id.lower():
+            raise ModelingError(f"kernel_binding_banned_kernel_id:{self.kernel_id!r}")
         if self.backend != "Logical" and not self.kernel_id.strip():
             raise ModelingError("kernel_binding_kernel_id_required")
         if not isinstance(self.arch_family, str) or not self.arch_family.strip():

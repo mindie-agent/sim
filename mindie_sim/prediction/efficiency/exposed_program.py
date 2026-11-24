@@ -40,7 +40,6 @@ ROLES = frozenset({
 })
 MEMORY_RESOURCES = frozenset({"hbm", "mte2", "mte2_aic", "mte2_aiv", "mte3"})
 COMMUNICATION_RESOURCES = frozenset({"link"})
-CUBE_RESOURCES = frozenset({"cube"})
 VECTOR_RESOURCES = frozenset({"vector", "scalar"})
 
 

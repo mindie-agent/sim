@@ -12,10 +12,17 @@
 """
 from __future__ import annotations
 
+import re
+
 from mindie_sim.schema.common import ModelingError
 
 #: Evidence values that positively resolve a callable or kernel identity.
 _POSITIVE_EVIDENCE = frozenset(("established", "source_declared"))
+_SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _is_sha256_hex(value) -> bool:
+    return isinstance(value, str) and bool(_SHA256_HEX_RE.fullmatch(value))
 
 
 def _positive_callable(evidence):
@@ -27,8 +34,13 @@ def _bound_state(evidence, source_sha256, typed, kernels=None):
     """True bound = callable/entry OR resolved kernel, plus source and typed ABI."""
     has_callable = _positive_callable(evidence)
     has_resolved_kernel = (
-        any(isinstance(kernel, dict) and kernel.get("evidence") in _POSITIVE_EVIDENCE
-            for kernel in kernels) if kernels is not None
+        any(
+            isinstance(kernel, dict)
+            and isinstance(kernel.get("name"), str)
+            and bool(kernel["name"].strip())
+            and kernel.get("evidence") in _POSITIVE_EVIDENCE
+            for kernel in kernels
+        ) if kernels is not None
         else evidence.get("kernels") in _POSITIVE_EVIDENCE)
     has_kernels = (evidence.get("kernels") in (_POSITIVE_EVIDENCE | {"partial"})
                    and has_resolved_kernel)
@@ -36,9 +48,9 @@ def _bound_state(evidence, source_sha256, typed, kernels=None):
     reasons = []
     if not has_call:
         reasons.append("no_bound_entry_or_kernel")
-    if not source_sha256:
+    if not _is_sha256_hex(source_sha256):
         reasons.append("source_sha256_unresolved")
-    if not isinstance(typed, dict) or not typed.get("signature_hash"):
+    if not isinstance(typed, dict) or not _is_sha256_hex(typed.get("signature_hash")):
         reasons.append("typed_abi_unresolved")
     return has_call and not reasons, reasons
 

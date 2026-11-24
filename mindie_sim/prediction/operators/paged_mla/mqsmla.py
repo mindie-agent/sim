@@ -35,7 +35,7 @@ SOURCE = {
 }
 #: Retained prototype alias; explicit selection keeps its own guard rails.
 LEGACY_SOURCE = {
-    "repository": "tilelang-ascend/kernels",
+    "repository": "archived-prototype-dsl",
     "revision": "4519e5372a8b9306f7d823688c0cb8141ee34fb1",
     "kernel": {
         "path": "samples/mixed_quant_sparse_flash_mla/mixed_quant_sparse_flash_mla.py",
@@ -48,7 +48,7 @@ LEGACY_SOURCE = {
     "capture_binary_identity": "not_established",
 }
 RECIPE = "aclnn_mixed_quant_sparse_flash_mla"
-LEGACY_RECIPE = "cannbot_mixed_quant_sparse_flash_mla"
+LEGACY_RECIPE = "dsl_mixed_quant_sparse_flash_mla"
 NATIVE_KIND = "aclnnMixedQuantSparseFlashMla"
 LEGACY_NATIVE_KIND = "MqsmlaKernel___call__"
 SUPPORTED_PHASES = frozenset({"decode", "draft"})

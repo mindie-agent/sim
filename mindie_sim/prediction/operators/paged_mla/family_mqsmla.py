@@ -99,7 +99,7 @@ def declared_quant_mode(op):
 
 
 def recipes():
-    """The official CANN recipe, its source-name alias and the legacy prototype."""
+    """The official CANN recipe, its source-name alias and the archived prototype DSL."""
     return {RECIPE: PlannedRecipe(build), SOURCE_RECIPE: PlannedRecipe(build),
             LEGACY_RECIPE: PlannedRecipe(build)}
 

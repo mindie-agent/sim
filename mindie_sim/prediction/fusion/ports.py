@@ -25,7 +25,6 @@ from typing import Any, Mapping
 
 INPUT_PORTS_KEY = "fusion_input_ports"
 RETAINED_PORTS_KEY = "retained_ports"
-RETAINED_MAP_KEY = "retained_port_map"
 CONTROL_METADATA_KEYS = ("control_deps", "control_inputs", "barrier_after",
                          "event_deps", "barrier_deps")
 _CONTROL_FAMILIES = frozenset({"event", "barrier"})

@@ -27,10 +27,6 @@ _PLAN_LAUNCH_MS = 0.002
 _PLAN_DEVICE_MIN_MS = 0.003
 _MAX_PLAN_STREAMS = 3
 
-CAPABILITY_NAMES = ("aclgraph_capture", "aclgraph_prefetch", "fixpipe_epilogue",
-                    "cube_prologue", "weight_prefetch", "ub_to_l1", "l0c_to_ub",
-                    "fixpipe")
-
 
 @dataclass(frozen=True)
 class HardwareProfile:
@@ -288,9 +284,6 @@ def conserved_fusion_work(member_nodes: tuple,
     return _work(totals)
 
 
-def _present(names: Iterable[str]) -> set[str]:
-    return set(names)
-
 
 def _resource_phase(resource: str, names: set[str], last: str) -> str:
     candidates = {
@@ -437,44 +430,6 @@ def _stream_predecessor(order: tuple[PlanNode, ...]) -> dict[str, str]:
         tails[node.stream] = node.node_id
     return previous
 
-
-def _stable_topological(nodes: tuple[PlanNode, ...],
-                        external: tuple[str, ...] = ()) -> tuple[PlanNode, ...]:
-    """Topological order stable in the caller's declared tuple order.
-
-    The detailed ``Execution`` submission path walks physical operators in
-    declaration order and appends same-stream predecessors as it goes.  Its
-    effective DAG therefore preserves that order among ready nodes; a FIFO
-    frontier would export ``aa -> cc -> bb`` for ``aa, bb, cc``.
-    """
-    by_id = {n.node_id: n for n in nodes}
-    if len(by_id) != len(nodes):
-        raise ValueError("plan_duplicate_node")
-    missing = {dep for node in nodes for dep in node.deps
-               if dep not in by_id and dep not in external}
-    if missing:
-        raise ValueError("plan_dependency_unavailable:" + ",".join(sorted(missing)))
-    rank = {n.node_id: idx for idx, n in enumerate(nodes)}
-    in_degree: dict[str, int] = {}
-    children: dict[str, list[PlanNode]] = {n.node_id: [] for n in nodes}
-    for node in nodes:
-        deps = {d for d in node.deps if d in by_id}
-        in_degree[node.node_id] = len(deps)
-        for dep in deps:
-            children[dep].append(node)
-    heap = [(rank[n.node_id], n) for n in nodes if not in_degree[n.node_id]]
-    heapq.heapify(heap)
-    ordered: list[PlanNode] = []
-    while heap:
-        _, node = heapq.heappop(heap)
-        ordered.append(node)
-        for other in children[node.node_id]:
-            in_degree[other.node_id] -= _DEGREE_STEP
-            if not in_degree[other.node_id]:
-                heapq.heappush(heap, (rank[other.node_id], other))
-    if len(ordered) != len(nodes):
-        raise ValueError("plan_dependency_cycle")
-    return tuple(ordered)
 
 
 def _pools(hardware: HardwareProfile) -> tuple[dict[str, float], dict[str, int]]:

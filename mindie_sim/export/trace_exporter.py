@@ -115,7 +115,6 @@ TID_METRICS_COUNTER = 0
 PIPE_MIN_SUBSPAN_US = 0.001
 HOST_GRAPH_LAUNCH_US = 12.0
 HOST_KERNEL_LAUNCH_US = 1.5
-FLOW_CAUSAL_EPSILON_US = 1e-6
 
 #: Canonical ``msprof`` process and thread specification exported for introspection.
 MSPROF_PROCESS_SPEC: dict[str, tuple[tuple[int, str], ...]] = {

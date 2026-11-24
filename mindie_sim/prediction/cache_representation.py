@@ -376,13 +376,6 @@ def load(b, name, deps, rows, width, region, *, state=None, geometry=None,
     )
 
 
-def _op_output(op):
-    outputs = getattr(op, "outputs", None) or ()
-    if not outputs:
-        return ""
-    first = outputs[0]
-    return first if isinstance(first, str) else str(first)
-
 
 def _typed_view(model, op, fmt, rows, width, row_bytes, region, identity, deps=()):
     """Actual producer/output/view of one declared cache row operation.
