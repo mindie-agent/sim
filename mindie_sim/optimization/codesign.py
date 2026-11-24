@@ -20,6 +20,10 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from mindie_sim.catalog.cache_pools import LINEAR_ATTENTION_KINDS
+from mindie_sim.catalog.types import QuantSpec
+from mindie_sim.catalog.weight_terms import term_bytes
+from mindie_sim.catalog.weights import engram_table_terms
 from mindie_sim.prediction.capacity import Memory
 from mindie_sim.prediction.capacity.ledger import recover_ssm_snapshot_ring_breakdown
 from mindie_sim.prediction.offload.policy import resolve_sku_host_dma_rates
@@ -56,7 +60,6 @@ GIB_BYTES = 1024 * 1024 * 1024
 MIN_FUSE_MEMBERS = 2
 _BF16_ELEMENT_BYTES = int(dtype_bytes("bf16"))
 _HOST_LINK_MARKERS = ("h2d", "host", "pcie")
-_LINEAR_ATTENTION_KINDS = frozenset({"kda", "gdn"})
 _ENGRAM_RH2D_RECIPES = frozenset({"engram_cpu_decode_pinned_staging_h2d", "ple_host_uva_lookup"})
 _ENGRAM_GATHER_RECIPES = frozenset({"catalog_engram_device_gather", "ple_device_lookup"})
 _ENGRAM_FAMILIES = frozenset({"engram_rh2d", "engram_gather", "ple", "engram"})
@@ -288,13 +291,16 @@ def _engram_lookup_h2d_bytes(nodes: Sequence[Any]) -> float:
         n for n in nodes
         if _node_attr_str(n, "family").lower() == "engram_rh2d"
         or _node_attr_str(n, "recipe", "implementation").lower() in _ENGRAM_RH2D_RECIPES
+        or float(getattr(n, "h2d_bytes", 0.0) or 0.0) > 0.0
     ]
     if rh2d_nodes:
         total = 0.0
         for n in rh2d_nodes:
-            meta = _node_meta(n)
-            rwork = meta.get("resource_work")
-            h2d = float(rwork.get("h2d", 0.0)) if isinstance(rwork, Mapping) else 0.0
+            h2d = float(getattr(n, "h2d_bytes", 0.0) or 0.0)
+            if h2d <= 0.0:
+                meta = _node_meta(n)
+                rwork = meta.get("resource_work")
+                h2d = float(rwork.get("h2d", 0.0)) if isinstance(rwork, Mapping) else 0.0
             if h2d <= 0.0:
                 h2d = max(
                     float(getattr(n, "hbm_write_bytes", 0.0) or 0.0),
@@ -379,7 +385,7 @@ def _collect_space_time_opportunities(
     k_prop = _resolved_mtp_proposal_tokens(case)
     seqs = _peak_sequences_per_dp(step_request, case)
     plans = tuple(getattr(case.model, "layer_plans", ()) or ())
-    linear_plans = [lp for lp in plans if str(getattr(lp, "attention", "")).lower() in _LINEAR_ATTENTION_KINDS]
+    linear_plans = [lp for lp in plans if str(getattr(lp, "attention", "")).lower() in LINEAR_ATTENTION_KINDS]
     recover_us = sum(
         _node_exposed_us(n) * _node_repeat(n)
         for n in nodes
@@ -387,11 +393,8 @@ def _collect_space_time_opportunities(
     )
     if linear_plans and (k_prop > 0 or recover_us > 0.0):
         eff_k = max(1, k_prop)
-        try:
-            bd = recover_ssm_snapshot_ring_breakdown(case, seqs, eff_k)
-            delta_b = int(bd.delta_hbm_vs_recover_ssm_bytes)
-        except (ModelingError, ValueError):
-            delta_b = 0
+        bd = recover_ssm_snapshot_ring_breakdown(case, seqs, eff_k)
+        delta_b = int(bd.delta_hbm_vs_recover_ssm_bytes)
         direction = "space_for_time" if delta_b >= 0 else "time_for_space"
         feasible = bool(delta_b <= headroom) if delta_b > 0 else True
         out.append(CoDesignOpportunity(
@@ -484,6 +487,113 @@ def _extract_node_layer(node: Any) -> int | None:
     return None
 
 
+def _is_engram_rh2d_node(node: Any) -> bool:
+    return (
+        _node_attr_str(node, "family").lower() == "engram_rh2d"
+        or _node_attr_str(node, "recipe", "implementation").lower() in _ENGRAM_RH2D_RECIPES
+        or float(getattr(node, "h2d_bytes", 0.0) or 0.0) > 0.0
+    )
+
+
+def _node_interval_ms(node: Any) -> tuple[float, float] | None:
+    s = getattr(node, "start_ms", None)
+    e = getattr(node, "end_ms", None)
+    if isinstance(s, (int, float)) and isinstance(e, (int, float)) and float(e) > float(s):
+        return float(s), float(e)
+    return None
+
+
+def _interval_union_ms(intervals: Sequence[tuple[float, float]]) -> float:
+    if not intervals:
+        return 0.0
+    ordered = sorted(intervals)
+    cur_lo, cur_hi = ordered[0]
+    total = 0.0
+    for lo, hi in ordered[1:]:
+        if lo <= cur_hi:
+            if hi > cur_hi:
+                cur_hi = hi
+        else:
+            total += cur_hi - cur_lo
+            cur_lo, cur_hi = lo, hi
+    return total + (cur_hi - cur_lo)
+
+
+def _compute_engram_hide_window_ms(
+    nodes: Sequence[Any],
+    engram_nodes: Sequence[Any],
+    first_k: int,
+) -> float:
+    """Intersect eligible compute intervals with ``[prefetch_ready, consumer_start]`` per occurrence."""
+    engram_ids = {id(n) for n in engram_nodes}
+    by_rep: dict[int, list[Any]] = {}
+    for n in nodes:
+        rep = int(getattr(n, "replica", 0) or 0)
+        by_rep.setdefault(rep, []).append(n)
+    timed_hides: list[float] = []
+    for rep_nodes in by_rep.values():
+        rep_engram = [n for n in rep_nodes if id(n) in engram_ids]
+        rep_rh2d = [n for n in rep_engram if _is_engram_rh2d_node(n)]
+        rep_cons = [n for n in rep_engram if not _is_engram_rh2d_node(n)] or rep_engram
+        cons_starts = [
+            float(s) for n in rep_cons
+            if isinstance((s := getattr(n, "start_ms", None)), (int, float)) and float(s) >= 0.0
+            and (_node_interval_ms(n) is not None or float(s) > 0.0)
+        ]
+        if not cons_starts:
+            cons_starts = [
+                float(e) for n in rep_rh2d
+                if isinstance((e := getattr(n, "end_ms", None)), (int, float)) and float(e) > 0.0
+            ]
+        if not cons_starts:
+            continue
+        win_end = min(cons_starts)
+        if rep_rh2d:
+            rh2d_ready = [
+                float(r) for n in rep_rh2d
+                if isinstance((r := getattr(n, "ready_ms", None)), (int, float))
+                and not isinstance(r, bool)
+                and float(r) >= 0.0
+            ]
+            rh2d_starts = [
+                float(s) for n in rep_rh2d
+                if isinstance((s := getattr(n, "start_ms", None)), (int, float)) and float(s) >= 0.0
+                and (_node_interval_ms(n) is not None or float(s) > 0.0)
+            ]
+            win_start = min(rh2d_ready) if rh2d_ready else (min(rh2d_starts) if rh2d_starts else 0.0)
+        else:
+            win_start = 0.0
+        if win_end <= win_start:
+            timed_hides.append(0.0)
+            continue
+        clipped: list[tuple[float, float]] = []
+        for n in rep_nodes:
+            if id(n) in engram_ids:
+                continue
+            lyr = _extract_node_layer(n)
+            if lyr is not None and lyr >= first_k:
+                continue
+            span = _node_interval_ms(n)
+            if span is None:
+                continue
+            lo = max(span[0], win_start)
+            hi = min(span[1], win_end)
+            if hi > lo:
+                clipped.append((lo, hi))
+        timed_hides.append(_interval_union_ms(clipped))
+    if timed_hides:
+        return max(0.0, min(timed_hides))
+    # Fallback for untimed abstract node lists (no start_ms/end_ms timeline).
+    hide_us = 0.0
+    for node in nodes:
+        if id(node) in engram_ids:
+            continue
+        lyr = _extract_node_layer(node)
+        if lyr is not None and 0 <= lyr < first_k:
+            hide_us += _node_exposed_us(node) * _node_repeat(node)
+    return max(0.0, hide_us / 1000.0)
+
+
 def _collect_cross_hw_offload_opportunities(
     case: Case,
     nodes: Sequence[Any],
@@ -509,27 +619,17 @@ def _collect_cross_hw_offload_opportunities(
         min(engram_layers) if engram_layers
         else (min((int(t.layer_id) for t in engram_tables), default=1) if engram_tables else 1)
     )
-    hide_us = 0.0
-    engram_starts = [
-        float(s) for n in engram_nodes
-        if isinstance((s := getattr(n, "start_ms", None)), (int, float)) and s > 0.0
-    ]
-    first_engram_start_ms = min(engram_starts) if engram_starts else None
-    for node in nodes:
-        if node in engram_nodes:
-            continue
-        lyr = _extract_node_layer(node)
-        if lyr is not None:
-            if 0 <= lyr < first_k:
-                hide_us += _node_exposed_us(node) * _node_repeat(node)
-        elif first_engram_start_ms is not None:
-            end_ms = getattr(node, "end_ms", None)
-            if isinstance(end_ms, (int, float)) and end_ms <= first_engram_start_ms:
-                hide_us += _node_exposed_us(node) * _node_repeat(node)
+    hide_ms = _compute_engram_hide_window_ms(nodes, engram_nodes, first_k)
 
     xfer_bytes = _engram_lookup_h2d_bytes(engram_nodes)
     table_bytes = 0
-    if engram_cfg is not None and callable(getattr(engram_cfg, "table_storage_bytes", None)):
+    if engram_cfg is not None:
+        quant = case.model.quant or QuantSpec("bf16")
+        table_bytes = int(round(sum(
+            term_bytes(term, quant, case.runtime.parallel, case.machine.ranks_per_node)
+            for term in engram_table_terms(case.model)
+        )))
+    if table_bytes <= 0 and engram_cfg is not None and callable(getattr(engram_cfg, "table_storage_bytes", None)):
         try:
             table_bytes = int(round(float(engram_cfg.table_storage_bytes())))
         except (ModelingError, ValueError):
@@ -541,21 +641,13 @@ def _collect_cross_hw_offload_opportunities(
             table_bytes += rows * width * _BF16_ELEMENT_BYTES
     if table_bytes <= 0:
         table_bytes = max(int(round(xfer_bytes)), len(engram_layers) * max(1, case.model.hidden_size) * _BF16_ELEMENT_BYTES)
-    already_host_bytes = 0
-    if memory_receipt is not None and getattr(memory_receipt, "dies", None):
-        already_host_bytes = max((int(getattr(d, "host_dram_bytes", 0) or 0) for d in memory_receipt.dies), default=0)
-    else:
-        meta = dict(getattr(case.runtime, "metadata", ()) or ())
-        ep = meta.get("execution_policy")
-        if isinstance(ep, Mapping) and ep.get("engram_cpu_offload") is True:
-            already_host_bytes = table_bytes
-    freed_hbm = max(0, table_bytes - already_host_bytes)
+    already_offloaded = bool(getattr(case.runtime, "engram_cpu_offload", False))
+    freed_hbm = 0 if already_offloaded else table_bytes
     if xfer_bytes <= 0.0:
         xfer_bytes = float(max(1, len(engram_layers)) * max(1, case.model.hidden_size) * _BF16_ELEMENT_BYTES)
 
     h2d_bps, startup_ns = _resolve_host_h2d_params(case, primitive_table)
     transfer_ms = (startup_ns / 1_000_000.0) + (xfer_bytes / h2d_bps) * 1000.0
-    hide_ms = max(0.0, hide_us / 1000.0)
     net_exposed_ms = max(0.0, transfer_ms - hide_ms)
     return [CoDesignOpportunity(
         opportunity_id="cross_hw_engram_ple_host_ddr_prefetch",
@@ -596,8 +688,6 @@ def _dual_tier_from_receipt(
         elif outcome.tier_kind in {"tilelang_simd", "ascendc", "catlass"} and outcome.admitted and outcome.step_ns is not None:
             cand = float(predecessor_ns - outcome.step_ns) / 1_000_000.0
             simd_gain_ms = cand if simd_gain_ms is None else max(simd_gain_ms, cand)
-    if simt_gain_ms is not None and simd_gain_ms is not None and simt_gain_ms > simd_gain_ms:
-        simd_gain_ms = simt_gain_ms
     return simt_gain_ms, simd_gain_ms, ub_warn
 
 
@@ -627,6 +717,8 @@ class _ReceiptOpView:
     dtype: str
     exposed_dur_us: float
     layer: int | None = None
+    replica: int = 0
+    ready_ms: float | None = None
     start_ms: float = 0.0
     end_ms: float = 0.0
     repeat_count: int = 1
@@ -635,6 +727,7 @@ class _ReceiptOpView:
     hbm_bytes: float = 0.0
     mte2_bytes: float = 0.0
     mte3_bytes: float = 0.0
+    h2d_bytes: float = 0.0
 
 
 def _nodes_from_step_receipt(step_receipt: EngineStepReceipt) -> tuple[_ReceiptOpView, ...]:
@@ -657,6 +750,7 @@ def _nodes_from_step_receipt(step_receipt: EngineStepReceipt) -> tuple[_ReceiptO
         hbm_b = sum(w.amount for w in row.work if w.resource in {"memory", "hbm"} and w.unit == "bytes")
         mte2_b = sum(w.amount for w in row.work if w.resource.startswith("mte2") and w.unit == "bytes")
         mte3_b = sum(w.amount for w in row.work if w.resource.startswith("mte3") and w.unit == "bytes")
+        h2d_b = sum(w.amount for w in row.work if w.unit == "bytes" and "h2d" in w.resource.lower())
         lyr = None
         for token in str(occ.op_id).split("."):
             if len(token) >= 2 and token[0] == "l" and token[1:].isdigit():
@@ -669,6 +763,8 @@ def _nodes_from_step_receipt(step_receipt: EngineStepReceipt) -> tuple[_ReceiptO
             dtype=row.dtype,
             exposed_dur_us=float(exp_ns) / 1000.0,
             layer=lyr,
+            replica=int(occ.replica),
+            ready_ms=float(row.ready_ms) if row.ready_ms is not None else None,
             start_ms=float(row.start_ms) if row.start_ms is not None else 0.0,
             end_ms=float(row.end_ms) if row.end_ms is not None else 0.0,
             flops=flops,
@@ -676,6 +772,7 @@ def _nodes_from_step_receipt(step_receipt: EngineStepReceipt) -> tuple[_ReceiptO
             hbm_bytes=hbm_b,
             mte2_bytes=mte2_b,
             mte3_bytes=mte3_b,
+            h2d_bytes=h2d_b,
         ))
     return tuple(out)
 
@@ -727,9 +824,9 @@ def collect_codesign_opportunities(
         exposed_us = spec.exposed_before_us if spec.exposed_before_us is not None else spec.before_us
         before_ms = max(0.0, float(exposed_us) / 1000.0)
         tiled_ms = max(0.0, float(spec.target_us) / 1000.0)
-        l_star_ms = min(tiled_ms, max(0.0, float(spec.l_star_us) / 1000.0))
+        l_star_ms = max(0.0, float(spec.l_star_us) / 1000.0)
         ub_live = max(0, int(spec.ub_peak_bytes))
-        ub_cap = max(int(spec.ub_budget_bytes), ub_live)
+        ub_cap = max(0, int(spec.ub_budget_bytes))
         matched = node_by_spec_id.get(spec.spec_id)
         has_cube = (
             AlgebraicTrait.BILINEAR_MATMUL.value in spec.constituent_traits

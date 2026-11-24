@@ -593,8 +593,12 @@ def _verify_mainline_fuse_region(
 
 def _local_operations(scenario, ops, mainline, *, verdict_sink=None, track_override=None):
     from mindie_sim.backends.abi_registry import default_abi_registry
-    from mindie_sim.rewrite.algebra import DEFAULT_SHIPPING_STACK_PASSES, _resolve_soc_arch
-    from mindie_sim.rewrite.schema import FuseRegion, HoistOrDeduplicate, OpRef
+    from mindie_sim.rewrite.algebra import (
+        DEFAULT_SHIPPING_STACK_PASSES,
+        _resolve_soc_arch,
+        discover_algebraic_rewrites_for_ops,
+    )
+    from mindie_sim.rewrite.schema import FuseRegion, HoistOrDeduplicate, KernelBoundary, OpRef
 
     groups = defaultdict(list)
     if track_override != "proposed":
@@ -611,8 +615,6 @@ def _local_operations(scenario, ops, mainline, *, verdict_sink=None, track_overr
         for targets in groups.values():
             if len(targets) > 1:
                 yield HoistOrDeduplicate(tuple(targets), "intra_step")
-    if not mainline.edits:
-        return
 
     lowering_plan = _scenario_lowering_plan(scenario)
     track_spec = lowering_plan.track_spec if lowering_plan is not None else None
@@ -620,20 +622,30 @@ def _local_operations(scenario, ops, mainline, *, verdict_sink=None, track_overr
         allowed_classes = frozenset({"shipping"})
         eff_track = "shipping"
         manifest_bindings = ()
+        eff_track_spec = None
     elif track_override == "proposed":
         allowed_classes = frozenset({"proposed_pr"})
         eff_track = "proposed"
-        manifest_bindings = track_spec.active_bindings if track_spec is not None else ()
+        manifest_bindings = tuple(track_spec.active_bindings) if track_spec is not None else ()
+        eff_track_spec = None
     else:
         allowed_classes = (
             lowering_plan.allowed_rewrite_classes if lowering_plan is not None else frozenset({"shipping"})
         )
-        manifest_bindings = track_spec.active_bindings if track_spec is not None else ()
+        manifest_bindings = tuple(track_spec.active_bindings) if track_spec is not None else ()
         eff_track = (
             track_spec.track if track_spec is not None
             else (lowering_plan.track if lowering_plan is not None else "shipping")
         )
+        eff_track_spec = track_spec
     if eff_track == "eager":
+        return
+    need_proposed_discovery = (
+        "proposed_pr" in allowed_classes
+        and eff_track in {"proposed", "target"}
+        and bool(manifest_bindings)
+    )
+    if not mainline.edits and not need_proposed_discovery:
         return
     enabled_passes = (
         frozenset(lowering_plan.lowering_passes)
@@ -652,6 +664,7 @@ def _local_operations(scenario, ops, mainline, *, verdict_sink=None, track_overr
     ep_size = int(parallel.ep) if parallel is not None else None
     ops_by_id = {op.op_id: op for op in ops}
     registry = default_abi_registry()
+    yielded_keys: set[tuple[str, tuple[str, ...]]] = set()
 
     for edit in mainline.edits:
         if edit.after or _operation_dependencies(edit.operation):
@@ -662,7 +675,7 @@ def _local_operations(scenario, ops, mainline, *, verdict_sink=None, track_overr
             scenario, ops_by_id, edit.operation,
             allowed_classes=allowed_classes,
             eff_track=eff_track,
-            track_spec=track_spec,
+            track_spec=eff_track_spec,
             manifest_bindings=manifest_bindings,
             enabled_passes=enabled_passes,
             soc_arch=soc_arch,
@@ -674,13 +687,53 @@ def _local_operations(scenario, ops, mainline, *, verdict_sink=None, track_overr
         )
         if verified_pair is not None:
             verified_region, raw_verdict = verified_pair
-            if verdict_sink is not None and verified_region.kernel_boundaries:
-                verdict_sink(
-                    verified_region.kernel_boundaries[0].abi_id,
-                    tuple(ref.id for ref in verified_region.members),
-                    raw_verdict,
-                )
+            if verified_region.kernel_boundaries:
+                key = (verified_region.kernel_boundaries[0].abi_id, tuple(ref.id for ref in verified_region.members))
+                yielded_keys.add(key)
+                if verdict_sink is not None:
+                    verdict_sink(key[0], key[1], raw_verdict)
             yield verified_region
+
+    if need_proposed_discovery:
+        atomic_ops = tuple(op for op in ops if not str(op.op_id).startswith("rewrite:"))
+        if len(atomic_ops) >= 2:
+            discovered = discover_algebraic_rewrites_for_ops(
+                atomic_ops,
+                datapath=getattr(scenario, "datapath", None),
+                include_abi_extensions=False,
+                arch_family=arch_family,
+                sku_id=sku_id,
+                tp_size=tp_size,
+                ep_size=ep_size,
+                pr_track=eff_track,
+                track_spec=eff_track_spec,
+                manifest_bindings=manifest_bindings,
+                enabled_stack_passes=enabled_passes,
+                registry=registry,
+            )
+            for cand in discovered.candidates:
+                verdict = cand.abi_verdict
+                if verdict is None or verdict.status != "admitted_proposed_pr":
+                    continue
+                if any(str(oid).startswith("rewrite:") for oid in cand.member_ids):
+                    continue
+                key = (cand.abi_id, tuple(cand.member_ids))
+                if key in yielded_keys:
+                    continue
+                yielded_keys.add(key)
+                refs = tuple(OpRef("atom", oid) for oid in cand.member_ids)
+                region = FuseRegion(
+                    members=refs,
+                    preserve_ports=(),
+                    kernel_boundaries=(KernelBoundary(cand.abi_id, refs),),
+                    fusion_tier="K1_proposed_pr",
+                    abi_verdict=None,
+                    abi_query_digest=verdict.query_digest,
+                    backend_target=verdict.backend_kind,  # type: ignore[arg-type]
+                )
+                if verdict_sink is not None:
+                    verdict_sink(key[0], key[1], verdict)
+                yield region
 
 def _collective_operations(ops, dual_report):
     from mindie_sim.rewrite.schema import CollectiveTransform, OpRef, PipelineTiles
@@ -904,7 +957,12 @@ def solve_framework(
         search.loo(mainline, m_ns, quota // 2, consider=True)
 
     def proposals(base, scenario, stage):
-        ops = _unique_ops(op for _, op in _atomic_ops(scenario))
+        entry = search.frontier.get(base.base_graph_sha256)
+        base_applied = getattr(entry[1], "applied", None) if entry is not None else None
+        if base_applied is not None and getattr(base_applied, "executable", None):
+            ops = _unique_ops(op for rank in base_applied.executable for op in rank.ops)
+        else:
+            ops = _unique_ops(op for _, op in _atomic_ops(scenario))
         if stage == "F3_stream_core":
             stream_iter = _stream_candidates(scenario, ops)
             first = next(stream_iter, None)

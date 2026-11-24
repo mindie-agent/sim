@@ -744,20 +744,72 @@ _LAW1_ABI_ALLOWED_SYMS: dict[str, tuple[frozenset[str], frozenset[str]]] = {
 }
 
 
-def _verify_verdict_matches_absorbed_ops(edit, op, verdict, matched_entry, scenario, applied, registry) -> None:
-    """Ensure a catalog-valid ABI verdict actually matches the region's absorbed ops."""
-    from .algebra import _classify_ub_chain_abi, _norm_abi_dtype
+def _extract_scenario_abi_context(scenario, verdict, matched_entry):
+    from mindie_sim.schema.stack import ManifestBinding
+    from .algebra import DEFAULT_SHIPPING_STACK_PASSES
 
-    atomic_by_id = {atom.op_id: atom for atom in (scenario.atomic_ops[0].ops if scenario.atomic_ops else ())}
-    fused_id = f"rewrite:{edit.edit_id}"
-    member_ids = applied.absorbed_atoms.get(fused_id) or tuple(
-        ref.id for ref in op.members if ref.kind == "atom"
+    sku_id = str(getattr(scenario.case.machine, "sku", "") or getattr(scenario.case.machine, "name", "") or "")
+    lowering_plan = (
+        getattr(scenario, "stack_lowering_plan", None)
+        or getattr(getattr(scenario, "mainline_step", None), "stack_lowering_plan", None)
+        or getattr(getattr(scenario, "atomic_step", None), "stack_lowering_plan", None)
     )
-    absorbed = tuple(atomic_by_id[oid] for oid in member_ids if oid in atomic_by_id)
-    if not absorbed:
-        return
-    traits = {atom.op_id: classify_op_traits(atom) for atom in absorbed}
-    abi_id = verdict.abi_id
+    track_spec = getattr(lowering_plan, "track_spec", None)
+    manifest_bindings = tuple(getattr(track_spec, "active_bindings", ()) or ())
+    if (
+        verdict.status == "admitted_proposed_pr"
+        and track_spec is None
+        and not manifest_bindings
+        and matched_entry.required_mechanism_id
+        and verdict.proposed_pr_ref
+    ):
+        manifest_bindings = (
+            ManifestBinding(
+                mechanism_id=matched_entry.required_mechanism_id,
+                state="proposed_pr",
+                ref=verdict.proposed_pr_ref,
+            ),
+        )
+    enabled_passes = (
+        frozenset(lowering_plan.lowering_passes)
+        if (lowering_plan is not None and getattr(lowering_plan, "lowering_passes", ()))
+        else DEFAULT_SHIPPING_STACK_PASSES
+    )
+    parallel = getattr(getattr(scenario.case, "runtime", None), "parallel", None)
+    tp_size = int(parallel.tp) if parallel is not None else None
+    ep_size = int(parallel.ep) if parallel is not None else None
+    return sku_id, manifest_bindings, enabled_passes, tp_size, ep_size
+
+
+def _rerun_canonical_law_abi_query(
+    edit_id: str,
+    abi_id: str,
+    absorbed,
+    traits,
+    verdict,
+    *,
+    sku_id: str,
+    manifest_bindings,
+    enabled_passes,
+    tp_size,
+    ep_size,
+    registry,
+):
+    """Rerun the canonical law-specific registry query on ``absorbed`` ops; return ``(re_abi, re_verdict, re_digest)`` or ``None``."""
+    from .algebra import (
+        DEFAULT_MLA_ROPE_HEAD_DIM,
+        _build_mc2_gemm_verdict,
+        _build_mla_prolog_ports,
+        _classify_ub_chain_abi,
+        _resolve_model_scope,
+        _resolve_world_size,
+        _typed_mla_role,
+        _verify_abi_query,
+        _verify_gmm_act_quant_abi,
+        _verify_law2a_matmul_abi,
+        _verify_moe_frame_abi,
+    )
+
     if abi_id in _LAW1_ABI_ALLOWED_SYMS:
         allowed_syms, req_syms = _LAW1_ABI_ALLOWED_SYMS[abi_id]
         material = [
@@ -776,47 +828,148 @@ def _verify_verdict_matches_absorbed_ops(edit, op, verdict, matched_entry, scena
             or any(sym not in allowed_syms for sym in mat_syms)
             or not (req_syms <= set(mat_syms))
         ):
-            raise ModelingError(f"ABI_WITNESS_INVALID:absorbed_motif_mismatch:{edit.edit_id}:{abi_id}")
+            raise ModelingError(f"ABI_WITNESS_INVALID:absorbed_motif_mismatch:{edit_id}:{abi_id}")
         re_abi, _, _, _, re_verdict, re_digest, _ = _classify_ub_chain_abi(
-            absorbed, traits,
-            soc_arch=verdict.device_arch,
-            sku_id=str(getattr(scenario.case.machine, "sku", "") or getattr(scenario.case.machine, "name", "") or ""),
-            pr_track=verdict.pr_track,
-            registry=registry,
+            absorbed, traits, soc_arch=verdict.device_arch, sku_id=sku_id,
+            pr_track=verdict.pr_track, manifest_bindings=manifest_bindings,
+            enabled_stack_passes=enabled_passes, registry=registry,
         )
-        if re_abi != abi_id or re_verdict is None or re_digest != verdict.query_digest or re_verdict.status != verdict.status:
-            raise ModelingError(f"ABI_WITNESS_INVALID:absorbed_query_mismatch:{edit.edit_id}:{abi_id}")
-        return
+        return re_abi, re_verdict, re_digest
     if abi_id in {"aclnnMatmul", "aclnnQuantMatmulV4"}:
         if any(traits[atom.op_id].trait != AlgebraicTrait.BILINEAR_MATMUL for atom in absorbed):
-            raise ModelingError(f"ABI_WITNESS_INVALID:absorbed_motif_mismatch:{edit.edit_id}:{abi_id}")
-    elif abi_id in {"aclnnAllGatherMatmulV2", "aclnnMatmulReduceScatterV2"}:
-        tset = {traits[atom.op_id].trait for atom in absorbed}
-        if not ({AlgebraicTrait.ASSOCIATIVE_COLLECTIVE, AlgebraicTrait.BILINEAR_MATMUL} <= tset):
-            raise ModelingError(f"ABI_WITNESS_INVALID:absorbed_motif_mismatch:{edit.edit_id}:{abi_id}")
-    elif abi_id.startswith("aclnnMlaProlog"):
-        if not any(traits[atom.op_id].trait == AlgebraicTrait.BILINEAR_MATMUL for atom in absorbed):
-            raise ModelingError(f"ABI_WITNESS_INVALID:absorbed_motif_mismatch:{edit.edit_id}:{abi_id}")
-    elif abi_id in {"aclnnMegaMoe", "dispatch_ffn_combine", "aclnnGroupedMatmulSwigluQuantV2"}:
-        if not any(traits[atom.op_id].is_grouped_matmul for atom in absorbed):
-            raise ModelingError(f"ABI_WITNESS_INVALID:absorbed_motif_mismatch:{edit.edit_id}:{abi_id}")
-    first_tr = traits[absorbed[0].op_id]
-    if first_tr.input_dtype and verdict.act_dtype and _norm_abi_dtype(first_tr.input_dtype) != _norm_abi_dtype(verdict.act_dtype):
-        # Allow BF16 token input on MXFP8 MLA/MegaMoE prologs where entry op carries weight dtype.
-        if not (abi_id.startswith(("aclnnMlaProlog", "aclnnMegaMoe", "dispatch_ffn_combine")) and verdict.act_dtype == "bf16"):
+            raise ModelingError(f"ABI_WITNESS_INVALID:absorbed_motif_mismatch:{edit_id}:{abi_id}")
+        return _verify_law2a_matmul_abi(
+            absorbed, traits, soc_arch=verdict.device_arch, sku_id=sku_id,
+            pr_track=verdict.pr_track, track_spec=None, manifest_bindings=manifest_bindings,
+            enabled_stack_passes=enabled_passes, registry=registry,
+        )
+    if abi_id in {"aclnnAllGatherMatmulV2", "aclnnMatmulReduceScatterV2"}:
+        comm_ops = [a for a in absorbed if traits[a.op_id].trait == AlgebraicTrait.ASSOCIATIVE_COLLECTIVE]
+        mm_ops = [a for a in absorbed if traits[a.op_id].trait == AlgebraicTrait.BILINEAR_MATMUL]
+        if len(comm_ops) != 1 or len(mm_ops) != 1:
+            raise ModelingError(f"ABI_WITNESS_INVALID:absorbed_motif_mismatch:{edit_id}:{abi_id}")
+        ws = _resolve_world_size(comm_ops[0], tp_size, collective=True)
+        re_verdict, re_digest = _build_mc2_gemm_verdict(
+            abi_id, mm_ops[0], comm_ops[0], traits[mm_ops[0].op_id],
+            soc_arch=verdict.device_arch, sku_id=sku_id, ws=ws,
+            pr_track=verdict.pr_track, track_spec=None, manifest_bindings=manifest_bindings,
+            enabled_stack_passes=enabled_passes, registry=registry,
+            is_agmm=(abi_id == "aclnnAllGatherMatmulV2"),
+        )
+        return abi_id, re_verdict, re_digest
+    if abi_id.startswith("aclnnMlaProlog"):
+        role_of = {a.op_id: _typed_mla_role(a) for a in absorbed}
+        for atom in absorbed:
+            if not role_of[atom.op_id]:
+                fam = str(atom.family or "").strip().lower()
+                if fam == "rotary":
+                    role_of[atom.op_id] = "rotary"
+                elif fam in {"cache_store", "kv_cache_write", "kv_compress_epilog"}:
+                    role_of[atom.op_id] = "kv_store"
+                elif fam == "rmsnorm":
+                    role_of[atom.op_id] = "q_norm"
+        rope_dims = [int(m["qk_rope_head_dim"]) for a in absorbed if isinstance((m := dict(a.metadata)).get("qk_rope_head_dim"), int)]
+        rope_dim = rope_dims[0] if rope_dims else DEFAULT_MLA_ROPE_HEAD_DIM
+        built = _build_mla_prolog_ports(absorbed, role_of, traits, soc_arch=verdict.device_arch, rope_dim=rope_dim)
+        if built is None:
+            raise ModelingError(f"ABI_WITNESS_INVALID:absorbed_motif_mismatch:{edit_id}:{abi_id}")
+        re_abi, operands, outputs = built
+        re_verdict, re_digest = _verify_abi_query(
+            abi_id=re_abi, soc_arch=verdict.device_arch, sku_id=sku_id, graph_motif="mla_prolog",
+            operands=operands, outputs=outputs, pr_track=verdict.pr_track, track_spec=None,
+            manifest_bindings=manifest_bindings, enabled_stack_passes=enabled_passes,
+            registry=registry, model_scope=_resolve_model_scope(absorbed),
+            qk_rope_head_dim=rope_dim, mla_variant="latent_mla",
+        )
+        return re_abi, re_verdict, re_digest
+    if abi_id in {"aclnnMegaMoe", "dispatch_ffn_combine"}:
+        gmms = [a for a in absorbed if traits[a.op_id].is_grouped_matmul]
+        disp = next((a for a in absorbed if "dispatch" in str(a.family or "").lower() or "dispatch" in str(a.op_id).lower()), None)
+        comb = next((a for a in absorbed if "combine" in str(a.family or "").lower() or "combine" in str(a.op_id).lower()), None)
+        act_op = next((a for a in absorbed if traits[a.op_id].activation_kind or traits[a.op_id].symbolic_op_kind in {"swiglu", "situ", "gelu", "silu"}), None)
+        if disp is None or comb is None or act_op is None or len(gmms) < 2:
+            raise ModelingError(f"ABI_WITNESS_INVALID:absorbed_motif_mismatch:{edit_id}:{abi_id}")
+        return _verify_moe_frame_abi(
+            disp, gmms[0], act_op, gmms[1], comb, traits,
+            soc_arch=verdict.device_arch, sku_id=sku_id, ep_size=ep_size,
+            enable_fused_mc2=(1 if abi_id == "dispatch_ffn_combine" else None),
+            pr_track=verdict.pr_track, track_spec=None, manifest_bindings=manifest_bindings,
+            enabled_stack_passes=enabled_passes, registry=registry,
+        )
+    if abi_id == "aclnnGroupedMatmulSwigluQuantV2":
+        gmm_op = next((a for a in absorbed if traits[a.op_id].is_grouped_matmul), None)
+        act_op = next((a for a in absorbed if traits[a.op_id].activation_kind or traits[a.op_id].symbolic_op_kind in {"swiglu", "situ", "gelu", "silu"}), None)
+        quant_op = next((a for a in absorbed if traits[a.op_id].symbolic_op_kind in {"dynamic_quant", "dynamic_mx_quant"}), None)
+        if gmm_op is None or act_op is None or quant_op is None:
+            raise ModelingError(f"ABI_WITNESS_INVALID:absorbed_motif_mismatch:{edit_id}:{abi_id}")
+        return _verify_gmm_act_quant_abi(
+            gmm_op, act_op, quant_op, traits, soc_arch=verdict.device_arch, sku_id=sku_id,
+            pr_track=verdict.pr_track, track_spec=None, manifest_bindings=manifest_bindings,
+            enabled_stack_passes=enabled_passes, registry=registry,
+        )
+    return None
+
+
+def _check_entry_hidden_constraints(edit_id: str, matched_entry, absorbed) -> None:
+    sc = getattr(matched_entry, "shape_constraints", None)
+    if sc is None or not absorbed[0].local_shape:
+        return
+    hidden = int(absorbed[0].local_shape[-1])
+    h_set = getattr(sc, "hidden_allowed_set", frozenset())
+    if h_set and hidden not in h_set:
+        raise ModelingError(f"ABI_WITNESS_INVALID:absorbed_shape_mismatch:{edit_id}:{hidden}")
+    h_lo, h_hi = getattr(sc, "hidden_range", (0, 0))
+    if (h_lo > 0 and hidden < h_lo) or (h_hi > 0 and hidden > h_hi):
+        raise ModelingError(f"ABI_WITNESS_INVALID:absorbed_shape_mismatch:{edit_id}:{hidden}")
+    h_div = int(getattr(sc, "hidden_divisibility", 0) or 0)
+    if h_div > 0 and hidden % h_div != 0:
+        raise ModelingError(f"ABI_WITNESS_INVALID:absorbed_shape_mismatch:{edit_id}:{hidden}")
+
+
+def _verify_verdict_matches_absorbed_ops(edit, op, verdict, matched_entry, scenario, applied, registry) -> None:
+    """Ensure a catalog-valid ABI verdict matches the actual absorbed ops per replica."""
+    from .algebra import _norm_abi_dtype
+
+    absorbed_map = dict(applied.absorbed_atoms)
+    fused_id = f"rewrite:{edit.edit_id}"
+    member_ids = absorbed_map.get(fused_id) or tuple(
+        ref.id for ref in op.members if ref.kind == "atom"
+    )
+    if not member_ids:
+        return
+    sku_id, manifest_bindings, enabled_passes, tp_size, ep_size = _extract_scenario_abi_context(
+        scenario, verdict, matched_entry,
+    )
+    exec_by_replica = {entry.replica: {o.op_id for o in entry.ops} for entry in applied.executable}
+    abi_id = verdict.abi_id
+    for rank_ops in scenario.atomic_ops:
+        if rank_ops.replica in exec_by_replica and fused_id not in exec_by_replica[rank_ops.replica]:
+            continue
+        atomic_by_id = {atom.op_id: atom for atom in rank_ops.ops}
+        absorbed = tuple(atomic_by_id[oid] for oid in member_ids if oid in atomic_by_id)
+        if len(absorbed) != len(member_ids) or not absorbed:
+            raise ModelingError(f"ABI_WITNESS_INVALID:absorbed_members_missing:{edit.edit_id}:r{rank_ops.replica}")
+        traits = {atom.op_id: classify_op_traits(atom) for atom in absorbed}
+        rerun = _rerun_canonical_law_abi_query(
+            edit.edit_id, abi_id, absorbed, traits, verdict,
+            sku_id=sku_id, manifest_bindings=manifest_bindings, enabled_passes=enabled_passes,
+            tp_size=tp_size, ep_size=ep_size, registry=registry,
+        )
+        if rerun is not None:
+            re_abi, re_verdict, re_digest = rerun
+            if (
+                re_abi != abi_id
+                or re_verdict is None
+                or re_digest != verdict.query_digest
+                or re_verdict.status != verdict.status
+                or re_verdict.matched_entry_id != verdict.matched_entry_id
+            ):
+                raise ModelingError(f"ABI_WITNESS_INVALID:absorbed_query_mismatch:{edit.edit_id}:{abi_id}")
+            continue
+        first_tr = traits[absorbed[0].op_id]
+        if first_tr.input_dtype and verdict.act_dtype and _norm_abi_dtype(first_tr.input_dtype) != _norm_abi_dtype(verdict.act_dtype):
             raise ModelingError(f"ABI_WITNESS_INVALID:absorbed_dtype_mismatch:{edit.edit_id}:{abi_id}")
-    constraints = dict(getattr(matched_entry, "shape_constraints", ()) or ())
-    if constraints and absorbed[0].local_shape:
-        hidden = int(absorbed[0].local_shape[-1])
-        h_min = constraints.get("hidden_min")
-        h_max = constraints.get("hidden_max")
-        h_mod = constraints.get("hidden_mod")
-        if (
-            (isinstance(h_min, int) and hidden < h_min)
-            or (isinstance(h_max, int) and hidden > h_max)
-            or (isinstance(h_mod, int) and h_mod > 0 and hidden % h_mod != 0)
-        ):
-            raise ModelingError(f"ABI_WITNESS_INVALID:absorbed_shape_mismatch:{edit.edit_id}:{hidden}")
+        _check_entry_hidden_constraints(edit.edit_id, matched_entry, absorbed)
 
 
 def _verify_fuse_region_witnesses(scenario, applied, scope, *, step_eval=None, baseline_eval=None):
@@ -1141,22 +1294,23 @@ def _verify_step_eval_binding(scenario, applied, step_eval) -> None:
     """Bind full-step Engine replay strictly to ``scenario``, ``step``, ``applied``, and occurrences."""
     if getattr(step_eval, "request", None) != scenario.step:
         raise ModelingError("LEAN_CERTIFICATE_INVALID:step_eval_request_mismatch")
+    require_digests = isinstance(step_eval, _ReplayEvaluation) or bool(applied.plan.edits)
     eval_scen_sha = getattr(step_eval, "scenario_sha256", "")
-    if eval_scen_sha and eval_scen_sha != scenario.scenario_sha256:
+    if (require_digests or eval_scen_sha) and eval_scen_sha != scenario.scenario_sha256:
         raise ModelingError("LEAN_CERTIFICATE_INVALID:step_eval_scenario_mismatch")
     eval_plan_sha = getattr(step_eval, "plan_sha256", "")
-    if eval_plan_sha and eval_plan_sha != applied.plan_sha256:
+    if (require_digests or eval_plan_sha) and eval_plan_sha != applied.plan_sha256:
         raise ModelingError("LEAN_CERTIFICATE_INVALID:step_eval_plan_mismatch")
     rows = getattr(step_eval, "operators", ()) or ()
     if rows or applied.plan.edits:
         excluded = set(applied.hoisted_load_time) | set(applied.elided_d2h_ops)
-        row_shapes = {(row.occurrence.replica, row.occurrence.op_id): row.shape for row in rows}
+        row_meta = {(row.occurrence.replica, row.occurrence.op_id): (row.shape, row.family) for row in rows}
         for entry in applied.executable:
             for op in entry.ops:
                 if op.op_id in excluded:
                     continue
                 site = (entry.replica, op.op_id)
-                if site not in row_shapes or row_shapes[site] != op.local_shape:
+                if site not in row_meta or row_meta[site] != (op.local_shape, op.family):
                     raise ModelingError(f"LEAN_CERTIFICATE_INVALID:step_eval_occurrence_mismatch:{op.op_id}")
 
 

@@ -818,7 +818,15 @@ class ProbedAbiRegistry:
             binding = _find_manifest_binding(entry, manifest_bindings)
             if binding is None:
                 return f"rejected_unmerged_pr:missing_manifest_binding:{entry.required_mechanism_id}", ""
-            return None, binding.pr_url or binding.revision
+            prov = getattr(binding, "provenance", None)
+            pr_ref = (
+                str(getattr(binding, "ref", "") or "").strip()
+                or str(getattr(prov, "revision", "") or "").strip()
+                or str(getattr(binding, "pr_url", "") or "").strip()
+                or str(getattr(binding, "revision", "") or "").strip()
+                or f"{binding.mechanism_id}:{getattr(binding, 'state', 'proposed_pr')}"
+            )
+            return None, pr_ref
         return None, ""
 
     def verify(
@@ -840,9 +848,20 @@ class ProbedAbiRegistry:
         if not candidates:
             return self._reject(query, snapshot, f"rejected_unprobed:{query.soc_arch}:{query.abi_id}")
 
+        eff_bindings = (
+            tuple(manifest_bindings)
+            if manifest_bindings
+            else (tuple(getattr(track_spec, "active_bindings", ()) or ()) if track_spec is not None else ())
+        )
         enabled_passes = set(query.enabled_stack_passes)
+        for binding in eff_bindings:
+            lp_id = str(getattr(binding, "lowering_pass_id", "") or "").strip()
+            if lp_id:
+                enabled_passes.add(lp_id)
         if track_spec is not None:
-            enabled_passes.update(track_spec.enabled_passes)
+            for pass_id in getattr(track_spec, "enabled_passes", ()) or ():
+                if str(pass_id).strip():
+                    enabled_passes.add(str(pass_id).strip())
         pass_set = frozenset(enabled_passes)
 
         admitted: list[tuple[ProbedAbiEntry, str]] = []
@@ -856,7 +875,7 @@ class ProbedAbiRegistry:
                 entry, query,
                 effective_track=effective_track,
                 enabled_passes=pass_set,
-                manifest_bindings=manifest_bindings,
+                manifest_bindings=eff_bindings,
             )
             if err is None:
                 admitted.append((entry, pr_ref))

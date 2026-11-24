@@ -279,8 +279,9 @@ def _emit_chunked_ordinary_wave(
                     for rows, dtype, ring, prior in (
                         (tile.m, s.dtype_a, l0a, r1[0]), (tile.n, _compute_b(s), l0b, r1[1]),
                     ):
+                        from .catlass_lower import _mx_scale_group_span
                         moved = packed_bytes(rows * micro, dtype) + (
-                            rows * ceil_div(micro, MX_SCALE_GROUP) if s.mx_scale_group else 0
+                            rows * _mx_scale_group_span(k_start + start, micro)[1] if s.mx_scale_group else 0
                         )
                         load = plan.work(f"{ring.allocation}:g{g}:load", "mte1", moved, owner=core,
                                          after=(prior, ring_credit(ring, g)))

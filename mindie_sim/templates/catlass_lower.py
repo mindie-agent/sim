@@ -51,6 +51,15 @@ def _is_simt_matrix(spec):
     return spec.simt_thread_block_dim is not None and spec.dispatch_policy != "GroupedMxMatmulFinalizeRoutingTla"
 
 
+def _mx_scale_group_span(k0: int, k_len: int) -> tuple[int, int]:
+    """Return ``(first_group, group_count)`` touched by ``[k0, k0 + k_len)``."""
+    if k_len <= 0:
+        return 0, 0
+    g_lo = k0 // MX_SCALE_GROUP
+    g_hi = (k0 + k_len - 1) // MX_SCALE_GROUP
+    return g_lo, g_hi - g_lo + 1
+
+
 def _scale(spec, elements, *, l1=False):
     if not spec.mx_scale_group:
         return 0
@@ -271,8 +280,9 @@ class _MatrixLowerer:
             ),)
         if s.mx_scale_group:
             per_row = ceil_div(width, MX_SCALE_GROUP) if a else ceil_div(p.k, MX_SCALE_GROUP)
-            sr, sc = (rows, ceil_div(cols, MX_SCALE_GROUP)) if a else (cols, ceil_div(rows, MX_SCALE_GROUP))
-            off = row * per_row + col // MX_SCALE_GROUP if a else col * per_row + row // MX_SCALE_GROUP
+            g_lo, sc = _mx_scale_group_span(col, cols) if a else _mx_scale_group_span(row, rows)
+            sr = rows if a else cols
+            off = row * per_row + g_lo if a else col * per_row + g_lo
             deps = (self.plan.access(
                 f"{name}:scale_{operand}", f"{allocation}:scale", sr * sc, owner=core,
                 pipe="mte2_aic", after=deps, bypass=cache_bypass,
@@ -362,7 +372,7 @@ class _MatrixLowerer:
                     (tile.m, s.dtype_a, l0a, r1[0]), (tile.n, _compute_b(s), l0b, r1[1]),
                 ):
                     moved = packed_bytes(rows * micro, dtype) + (
-                        rows * ceil_div(micro, MX_SCALE_GROUP) if s.mx_scale_group else 0
+                        rows * _mx_scale_group_span(k_start + start, micro)[1] if s.mx_scale_group else 0
                     )
                     load = plan.work(f"{ring.allocation}:g{slot_generation}:load", "mte1", moved, owner=core,
                                      after=(prior, ring_credit(ring, slot_generation)))
@@ -703,34 +713,9 @@ def _freeze_cache_value(value: object) -> object:
 
 
 def _datapath_cache_key(datapath) -> object:
-    arch = getattr(datapath, "compute_arch", None)
-    stars = getattr(datapath, "stars_spec", None)
-    stars_key = (
-        getattr(stars, "queue_scope", None),
-        getattr(stars, "queue_depth", None),
-        getattr(stars, "lanes", None),
-        getattr(stars, "issue_interval_us", None),
-        getattr(stars, "first_issue_us", None),
-        getattr(stars, "release_policy", None),
-    ) if stars is not None else None
-    return (
-        getattr(arch, "arch_id", None),
-        _freeze_cache_value(getattr(arch, "declared", None)),
-        getattr(datapath, "aic_count", 0),
-        getattr(datapath, "aiv_count", 0),
-        getattr(datapath, "buffers", ()),
-        getattr(datapath, "compute_peaks", ()),
-        getattr(datapath, "memory_access", None),
-        getattr(datapath, "hbm_read_bytes_per_s", None),
-        getattr(datapath, "hbm_write_bytes_per_s", None),
-        getattr(datapath, "hbm_rw_alpha", None),
-        getattr(datapath, "simt_ub_carveout_bytes", 0),
-        getattr(datapath, "has_l0c_to_ub", False),
-        getattr(datapath, "aic_aiv_pairs", ()),
-        _freeze_cache_value(getattr(datapath, "subtile_wave", ())),
-        _freeze_cache_value(getattr(datapath, "routes", ())),
-        stars_key,
-    )
+    if is_dataclass(datapath) and not isinstance(datapath, type):
+        return _freeze_cache_value(datapath)
+    return _freeze_cache_value(vars(datapath)) if hasattr(datapath, "__dict__") else datapath
 
 
 def lower_catlass_spec(
@@ -739,7 +724,7 @@ def lower_catlass_spec(
     """Lower a concrete specialization and return its executable audit record."""
     p = matrix_problem(problem)
     if context is None and memory_view is None and not live_admission:
-        key = (spec, p, _datapath_cache_key(datapath), die, region_id)
+        key = (_freeze_cache_value(spec), _freeze_cache_value(p), _datapath_cache_key(datapath), die, region_id)
         try:
             cached = _PURE_LOWER_CACHE.get(key)
         except TypeError:
@@ -766,7 +751,7 @@ def _lower_catlass_impl(
                                 spec.splitk_factor, spec.dispatch_policy, spec.epilogue_kind)
     if spec.workspace_bytes != expected:
         raise ModelingError(f"catlass_workspace_mismatch:{spec.workspace_bytes}:{expected}")
-    if _estimated_panel_micros(spec, p) > STREAMING_PANEL_MICRO_THRESHOLD:
+    if _estimated_panel_micros(spec, p) >= STREAMING_PANEL_MICRO_THRESHOLD:
         return lower_catlass_streaming(
             spec, p, datapath, solution,
             context=context, memory_view=memory_view, die=die,

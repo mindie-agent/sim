@@ -652,13 +652,14 @@ def solve_five_level_ladder(
 
     verification = _verification(dsl.best_eval)
     plan = dsl.best_plan
-    search = _TrialSearch(dossier, len(plan.edits))
+    loo_budget = min(len(plan.edits), max(1, int(max_trials))) if plan.edits else 0
+    search = _TrialSearch(dossier, loo_budget)
     search.seed(plan, dsl.best_eval)
     regression = _shipping_regression(verification, u, m)
     if regression is not None and verification is not None:
         verification = replace(verification, shipping_regression=regression)
     impacts = framework.loo_impacts if plan == framework.best_plan else ()
-    if len(impacts) < len(plan.edits):
+    if len(impacts) < loo_budget:
         impacts = search.loo(plan, a_dsl, search.remaining)
     opcodes = {edit.edit_id: type(edit.operation).__name__ for edit in plan.edits}
     loo = tuple(LooMarginalImpact(edit_id, opcodes[edit_id], impact) for edit_id, impact in impacts)
@@ -718,17 +719,94 @@ def _resolve_primitive_table_digest(handle: Any, case: Case, explicit_table: Any
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _accumulate_die_cache_pools(base_die: Any, delta_die: Any, zero_die: Any) -> Any:
+    """Add dynamic cache-pool deltas from ``delta_die - zero_die`` onto ``base_die``."""
+    d_kv_a = int(delta_die.kv_cache_allocated_bytes) - int(zero_die.kv_cache_allocated_bytes)
+    d_kv_v = int(delta_die.kv_cache_valid_bytes) - int(zero_die.kv_cache_valid_bytes)
+    d_idx_a = int(delta_die.index_cache_allocated_bytes) - int(zero_die.index_cache_allocated_bytes)
+    d_idx_v = int(delta_die.index_cache_valid_bytes) - int(zero_die.index_cache_valid_bytes)
+    d_rec = int(delta_die.recurrent_state_bytes) - int(zero_die.recurrent_state_bytes)
+    d_drf = int(delta_die.draft_cache_bytes) - int(zero_die.draft_cache_bytes)
+    d_live = d_kv_a + d_idx_a + d_rec + d_drf
+    new_live = int(base_die.simultaneous_live_hbm_bytes) + d_live
+    new_peak = max(new_live, int(base_die.simultaneous_peak_hbm_bytes) + d_live)
+    load_delta = int(base_die.load_peak_hbm_bytes) - int(base_die.simultaneous_peak_hbm_bytes)
+    return replace(
+        base_die,
+        kv_cache_allocated_bytes=int(base_die.kv_cache_allocated_bytes) + d_kv_a,
+        kv_cache_valid_bytes=int(base_die.kv_cache_valid_bytes) + d_kv_v,
+        index_cache_allocated_bytes=int(base_die.index_cache_allocated_bytes) + d_idx_a,
+        index_cache_valid_bytes=int(base_die.index_cache_valid_bytes) + d_idx_v,
+        recurrent_state_bytes=int(base_die.recurrent_state_bytes) + d_rec,
+        draft_cache_bytes=int(base_die.draft_cache_bytes) + d_drf,
+        simultaneous_live_hbm_bytes=new_live,
+        simultaneous_peak_hbm_bytes=new_peak,
+        load_peak_hbm_bytes=new_peak + max(0, load_delta),
+        free_hbm_headroom_bytes=int(base_die.usable_hbm_bytes) - new_peak,
+    )
+
+
 def _compute_resident_memory_receipt(case: Case, request: StepRequest) -> Any:
-    """Compute canonical ``ResidentMemoryReceipt`` directly (fail-loud; zero silent None)."""
+    """Compute canonical ``ResidentMemoryReceipt`` from resolved request views / per-replica batches."""
     mem = Memory(case)
-    seqs = request.sequences
-    batch = max(seqs) if isinstance(seqs, (tuple, list)) and seqs else int(seqs or 1)
+    raw_views = tuple(getattr(request, "requests", ()) or ())
+    if raw_views:
+        views = tuple(v for v in raw_views if not getattr(v, "padding", False))
+        if not views:
+            return mem.resident_memory_receipt(
+                phase=request.phase, sequence_tokens=1, batch_per_dp=0, query_tokens=1,
+            )
+        buckets: dict[tuple[int, int], int] = {}
+        for view in views:
+            q_v = max(1, int(view.q_len) + int(getattr(view, "draft_proposal_tokens", 0) or 0))
+            seq_v = max(1, max(0, int(view.context)) + q_v)
+            buckets[(seq_v, q_v)] = buckets.get((seq_v, q_v), 0) + 1
+        if len(buckets) == 1:
+            (seq_v, q_v), count = next(iter(buckets.items()))
+            return mem.resident_memory_receipt(
+                phase=request.phase, sequence_tokens=seq_v, batch_per_dp=count, query_tokens=q_v,
+            )
+        zero_rec = mem.resident_memory_receipt(
+            phase=request.phase, sequence_tokens=1, batch_per_dp=0, query_tokens=1,
+        )
+        acc_dies = list(zero_rec.dies)
+        for (seq_v, q_v), count in buckets.items():
+            sub_rec = mem.resident_memory_receipt(
+                phase=request.phase, sequence_tokens=seq_v, batch_per_dp=count, query_tokens=q_v,
+            )
+            acc_dies = [
+                _accumulate_die_cache_pools(cur, sub_d, z_d)
+                for cur, sub_d, z_d in zip(acc_dies, sub_rec.dies, zero_rec.dies, strict=True)
+            ]
+        return replace(zero_rec, dies=tuple(acc_dies))
+
     ctx = max(0, int(request.context or 0))
     q_tok = max(1, int(request.tokens or 1))
+    seq_len = max(1, ctx + q_tok)
+    seqs = request.sequences
+    if isinstance(seqs, (tuple, list)) and seqs:
+        per_rep = tuple(max(0, int(s)) for s in seqs)
+        if len(set(per_rep)) == 1:
+            return mem.resident_memory_receipt(
+                phase=request.phase, sequence_tokens=seq_len, batch_per_dp=per_rep[0], query_tokens=q_tok,
+            )
+        by_batch = {
+            b: mem.resident_memory_receipt(
+                phase=request.phase, sequence_tokens=seq_len, batch_per_dp=b, query_tokens=q_tok,
+            )
+            for b in set(per_rep)
+        }
+        template = by_batch[per_rep[0]]
+        dies = []
+        for idx, die in enumerate(template.dies):
+            rep_b = per_rep[die.replica] if 0 <= die.replica < len(per_rep) else per_rep[-1]
+            dies.append(by_batch[rep_b].dies[idx])
+        return replace(template, dies=tuple(dies))
+    batch = max(0, int(seqs)) if seqs is not None else 1
     return mem.resident_memory_receipt(
         phase=request.phase,
-        sequence_tokens=max(1, ctx + q_tok),
-        batch_per_dp=max(1, batch),
+        sequence_tokens=seq_len,
+        batch_per_dp=batch,
         query_tokens=q_tok,
     )
 

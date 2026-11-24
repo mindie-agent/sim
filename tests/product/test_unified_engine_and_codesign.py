@@ -241,8 +241,10 @@ def test_typed_codesign_opportunities_mega_fusion_space_time_and_cross_hw() -> N
         dp=1, tp=1, ep=1, mtp_proposal_tokens=3, engram_cpu_offload=False,
         prompt_tokens=32, output_tokens=1, concurrency=1,
     )
+    parsed_gdn_hbm = parse_case(raw_gdn_hbm)
+    rec_gdn_hbm = solve_target_step_receipt(parsed_gdn_hbm, req_spec, stack_track="target", max_trials=2)
     opps_hbm = collect_codesign_opportunities(
-        parse_case(raw_gdn_hbm), step_request=req_spec, step_receipt=rec_gdn,
+        parsed_gdn_hbm, step_request=req_spec, step_receipt=rec_gdn_hbm,
     )
     xhw_hbm = [o.cross_hw for o in opps_hbm if o.kind == "cross_hw_offload_multistream" and o.cross_hw is not None]
     assert xhw_hbm and xhw_hbm[0].freed_hbm_bytes > 0
@@ -384,3 +386,195 @@ def test_exposed_observer_sweep_line_parity_and_subsecond_93_layer_speed() -> No
     assert big_obs.conservation_delta_ns == 0
     assert sum(big_obs.exposed_ns_by_op.values()) + big_obs.idle_or_wait_ns == big_obs.terminal_ns - big_obs.start_ns
     assert len(big_obs.exposed_ns_by_op) == SYNTHETIC_DEPTH_LAYERS * SYNTHETIC_OPS_PER_LAYER
+
+
+def test_dual_cert_port_links_abi_bindings_and_algebra_port_honesty() -> None:
+    """Verify seed digest binding, per-port/switch dual_cert rows, ABI bindings, and algebra ports."""
+    from types import SimpleNamespace
+    from mindie_sim.backends.abi_registry import ProbedAbiRegistry, default_abi_registry
+    from mindie_sim.optimization.causal_tail import _resolve_moe_weight_contracts
+    from mindie_sim.optimization.dual_bound import build_dual_inputs_from_scenario
+    from mindie_sim.prediction.results import RankOps
+    from mindie_sim.rewrite.algebra import (
+        _build_mla_prolog_ports,
+        _law1_quant_output_ports,
+        _resolve_declared_weight_layout,
+        _verify_abi_query,
+        classify_op_traits,
+    )
+    from mindie_sim.rewrite.apply import apply_plan
+    from mindie_sim.rewrite.oracle import ScenarioRequest, prepare_scenario
+    from mindie_sim.rewrite.schema import empty_plan
+    from mindie_sim.rewrite.verify import _verify_step_eval_binding
+    from mindie_sim.schema.abi import AbiShapeConstraints, OperandPortSig
+    from mindie_sim.schema.common import ModelingError
+    from mindie_sim.schema.hardware import Link
+    from mindie_sim.schema.stack import ManifestBinding, SourceRef, StackTrackSpec
+
+    case = parse_case(compose_case("qwen3-32b", "Ascend910_9391", tp=4, dp=1, layers=1))
+    dossier = prepare_scenario(ScenarioRequest(case, StepRequest("decode", tokens=1, context=64)))
+    handle = dossier.handle
+    ep = empty_plan(handle.scenario.base_graph_sha256, handle.scenario.framing_sha256)
+    applied_u = apply_plan(ep, handle.scenario)
+    assert handle.u_eval.scenario_sha256 == handle.scenario.scenario_sha256
+    assert handle.u_eval.plan_sha256 == applied_u.plan_sha256
+    assert handle.m_eval.plan_sha256 == apply_plan(dossier.mainline_plan, handle._mainline.scenario).plan_sha256
+    _verify_step_eval_binding(handle.scenario, applied_u, handle.u_eval)
+    with pytest.raises(ModelingError, match="step_eval_plan_mismatch"):
+        _verify_step_eval_binding(handle.scenario, applied_u, replace(handle.u_eval, plan_sha256="0" * 64))
+
+    def _op(op_id: str, family: str, shape: tuple[int, ...] = (4, 128), **kw) -> OpSpec:
+        return OpSpec(
+            op_id=op_id, family=family, stage=0, layer=0, phase="decode", requests=("r0",),
+            semantic_shape=shape, local_shape=shape, padded_shape=shape, launch_shape=shape, **kw,
+        )
+
+    case_port = replace(case, machine=replace(case.machine, links=(
+        Link(name="hccs_port", capacity_bytes_per_ms=200_000_000.0, members=(0, 1, 2, 3), semantics="per_port"),
+    )))
+    comm_ops = tuple(
+        RankOps(replica=r, ops=(_op(
+            f"ar_{r}", "allreduce",
+            metadata=(
+                ("source_die", r), ("destination_die", (r + 1) % 4),
+                ("mandatory_comm_wire_bytes_by_link", (("hccs_port", 1_000_000),)),
+            ),
+        ),))
+        for r in range(4)
+    )
+    _, _, names_port = build_dual_inputs_from_scenario(
+        SimpleNamespace(case=case_port, machine=case_port.machine, atomic_ops=comm_ops, summaries=(), aliases={}),
+        rate_mode="engine_ceiling",
+    )
+    tx_rows = [n for n in names_port if n.startswith("link:hccs_port@")]
+    rx_rows = [n for n in names_port if n.startswith("link_rx:hccs_port@")]
+    assert len(tx_rows) == 4 and len(rx_rows) == 4 and all(".d-1" not in n for n in (*tx_rows, *rx_rows))
+
+    case_sw = replace(case, machine=replace(case.machine, links=(
+        Link(
+            name="sw_fabric", capacity_bytes_per_ms=100_000_000.0, members=(0, 1, 2, 3),
+            semantics="per_port", switch_capacity_bytes_per_ms=150_000_000.0,
+        ),
+    )))
+    _, _, names_sw = build_dual_inputs_from_scenario(
+        SimpleNamespace(
+            case=case_sw, machine=case_sw.machine,
+            atomic_ops=(RankOps(replica=0, ops=(_op("c0", "allreduce", link_bytes=2_000_000),)),),
+            summaries=(), aliases={},
+        ),
+        rate_mode="engine_ceiling",
+    )
+    assert any(n.startswith("link_switch:sw_fabric@") for n in names_sw)
+
+    snap = default_abi_registry().get_snapshot("A3")
+    base_unmerged = next(e for e in snap.entries if e.vllm_ascend_track == "unmerged_pr")
+    ref = SourceRef(repository="vllm-ascend", revision="pr-999", relative_path="ops/custom.py", source_sha256="a" * 64)
+    syn = replace(
+        base_unmerged, entry_id="syn_unmerged_test", abi_id="aclnnSyntheticProposed",
+        symbol_or_kernel="aclnnSyntheticProposed", available_on_device=True,
+        dtype_tuple=(("bf16",),), allowed_output_tuples=(("bf16",),),
+        allowed_rank_placements=frozenset({"local"}), allowed_world_sizes=frozenset({1}),
+        shape_constraints=AbiShapeConstraints(), vllm_ascend_track="unmerged_pr",
+        required_mechanism_id="mech_syn_pr", required_stack_pass_id="pass_syn_pr",
+        source_ref=ref, device_kernel_expansion=("k_syn",),
+    )
+    snap2_raw = replace(snap, entries=snap.entries + (syn,), payload_sha256="")
+    reg2 = ProbedAbiRegistry({"A3": replace(snap2_raw, payload_sha256=snap2_raw._compute_payload_sha256())})
+    mb = ManifestBinding(
+        mechanism_id="mech_syn_pr", state="unmerged_pr",
+        ref="https://gitcode.com/vllm-ascend/pull/999", lowering_pass_id="pass_syn_pr", provenance=ref,
+    )
+    track = StackTrackSpec(
+        stack_id="vllm_ascend_proposed", track="proposed", optimization_mode="simulation",
+        active_bindings=(mb,), allowed_readiness=frozenset({"shipping", "proposed_pr"}),
+    )
+    verdict, _ = _verify_abi_query(
+        abi_id="aclnnSyntheticProposed", soc_arch="A3", sku_id="a3", graph_motif="custom",
+        operands=(OperandPortSig("x", "bf16", "ND", False, (4, 128), "dense", (), "none", ()),),
+        outputs=(OperandPortSig("y", "bf16", "ND", False, (4, 128), "dense", (), "none", ()),),
+        model_scope=next(iter(syn.allowed_model_scopes)), rank_placement="local", world_size=1,
+        pr_track="proposed", track_spec=track, manifest_bindings=(), enabled_stack_passes=frozenset(), registry=reg2,
+    )
+    assert verdict.status == "admitted_proposed_pr" and verdict.proposed_pr_ref == mb.ref
+
+    q_op = _op("l0.quant", "quant", dtype="fp8_e4m3", metadata=(
+        ("quant_mode", "mxfp8"), ("scale_dtype", "ue8m0"), ("group_size", 32), ("output_dtype", "fp8_e4m3"),
+    ))
+    q_ports = _law1_quant_output_ports(q_op, classify_op_traits(q_op), 4, 128, y_name="y", scale_name="scale")
+    assert any(p.dtype == "fp8_e4m3fn" and p.group_shape == (32,) for p in q_ports)
+    assert any(p.role == "scale" and p.dtype == "ue8m0" and p.shape == (4, 4) for p in q_ports)
+    assert _resolve_declared_weight_layout(_op("l0.mm", "gemm", (4, 128, 256), metadata=(("weight_layout", "ND"),)), None) == "ND"
+    qa_op = _op("l0.q_a", "gemm", (4, 1536, 7168), dtype="bf16")
+    assert _build_mla_prolog_ports([qa_op], {qa_op.op_id: "q_a"}, {qa_op.op_id: classify_op_traits(qa_op)}, soc_arch="A3", rope_dim=64) is None
+    up1 = _op("l0.moe_gate_proj", "grouped_gemm", (16, 2048, 4096), dtype="fp8_e4m3", metadata=(("weight_dtype", "fp8_e4m3"),))
+    up2 = _op("l0.moe_up_proj", "grouped_gemm", (16, 2048, 4096), dtype="fp8_e4m3", metadata=(("weight_dtype", "fp8_e4m3"),))
+    down = _op("l0.moe_down_proj", "grouped_gemm", (16, 4096, 2048), dtype="bf16", deps=("l0.moe_act",), metadata=(("weight_dtype", "int8"),))
+    assert _resolve_moe_weight_contracts(case, [up1, up2, down]) == _resolve_moe_weight_contracts(case, [down, up2, up1])
+
+
+def test_catlass_mx_span_resident_requests_and_codesign_honesty() -> None:
+    """Verify MX scale group spans, cache key sensitivity, RequestView memory, and codesign bounds."""
+    from mindie_sim.catalog.cache_pools import LINEAR_ATTENTION_KINDS
+    from mindie_sim.optimization.codesign import (
+        _ReceiptOpView,
+        _compute_engram_hide_window_ms,
+        _dual_tier_from_receipt,
+        _engram_lookup_h2d_bytes,
+    )
+    from mindie_sim.optimization.ladder import _compute_resident_memory_receipt
+    from mindie_sim.rewrite.apply import resolve_scenario
+    from mindie_sim.schema.workload import RequestView
+    from mindie_sim.templates.catlass_lower import _datapath_cache_key, _mx_scale_group_span
+    from mindie_sim.templates.contracts import DualTierLoweringReceipt, TierLoweringOutcome
+
+    assert _mx_scale_group_span(0, 32) == (0, 1)
+    assert _mx_scale_group_span(16, 32) == (0, 2)
+    assert _mx_scale_group_span(31, 2) == (0, 2)
+
+    case = parse_case(compose_case("qwen3-32b", "Ascend910_9391", tp=1, dp=1, layers=1))
+    dp = resolve_scenario(case, StepRequest("decode", tokens=1, context=64)).datapath
+    if dp.usable_paths:
+        assert _datapath_cache_key(dp) != _datapath_cache_key(replace(dp, usable_paths=dp.usable_paths[:-1]))
+
+    req_pad = StepRequest(
+        phase="decode", tokens=1, context=16, sequences=1, scope="model",
+        requests=(
+            RequestView("r0", 1, 64, True, "decode", padding=False),
+            RequestView("pad", 1, 8192, False, "decode", padding=True),
+        ),
+    )
+    req_real = StepRequest(
+        phase="decode", tokens=2, context=16, sequences=1, scope="model",
+        requests=(
+            RequestView("r0", 1, 4096, True, "decode", padding=False),
+            RequestView("r1", 1, 4096, True, "decode", padding=False),
+        ),
+    )
+    assert (
+        _compute_resident_memory_receipt(case, req_real).dies[0].kv_cache_allocated_bytes
+        > _compute_resident_memory_receipt(case, req_pad).dies[0].kv_cache_allocated_bytes * 10
+    )
+
+    rh2d = _ReceiptOpView(
+        "s0.l2.engram_rh2d", "engram_rh2d", "engram_rh2d", "bf16", 10.0,
+        layer=2, replica=0, ready_ms=0.0, start_ms=0.4, end_ms=0.8, h2d_bytes=16384.0,
+    )
+    cons = _ReceiptOpView(
+        "s0.l2.engram_gate", "engram", "engram", "bf16", 5.0,
+        layer=2, replica=0, ready_ms=0.8, start_ms=1.0, end_ms=1.1,
+    )
+    early = _ReceiptOpView("s0.l0.qkv", "gemm", "gemm", "bf16", 500.0, layer=0, replica=0, start_ms=0.0, end_ms=0.5)
+    mid = _ReceiptOpView("s0.l1.qkv", "gemm", "gemm", "bf16", 500.0, layer=1, replica=0, start_ms=0.3, end_ms=0.9)
+    assert _engram_lookup_h2d_bytes([rh2d, cons]) == pytest.approx(16384.0)
+    assert _compute_engram_hide_window_ms([early, mid, rh2d, cons], [rh2d, cons], first_k=2) == pytest.approx(0.9)
+
+    r_dual = DualTierLoweringReceipt(
+        region_id="r0", predecessor_step_ns=1_000_000,
+        tier_outcomes=(
+            TierLoweringOutcome("tilelang_simt", "tilelang", True, step_ns=600_000, ub_receipt=None),
+            TierLoweringOutcome("tilelang_simd", "tilelang", True, step_ns=700_000, ub_receipt=None),
+        ),
+    )
+    simt_g, simd_g, _ = _dual_tier_from_receipt(r_dual)
+    assert simt_g == pytest.approx(0.4) and simd_g == pytest.approx(0.3)
+    assert len(LINEAR_ATTENTION_KINDS) >= 6

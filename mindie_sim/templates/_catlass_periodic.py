@@ -101,6 +101,7 @@ class _PanelDescriptor:
     scale_a: _AccessRecord | None
     gm_b: _AccessRecord
     scale_b: _AccessRecord | None
+    k_start_mod: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -228,12 +229,10 @@ def _append_panel_micro_stages(
             l0_after_a, l0_after_b, l0_prev = (a_ready,), (b_ready,), (f"mma_0_p{s_idx}",)
         else:
             l0_after_a, l0_after_b, l0_prev = (a_ready, f"mma_0_{prev2}"), (b_ready, f"mma_0_{prev2}"), ()
-        ma = packed_bytes(panel.tile_m * micro, spec.dtype_a) + (
-            panel.tile_m * ceil_div(micro, MX_SCALE_GROUP) if spec.mx_scale_group else 0
-        )
-        mb = packed_bytes(panel.tile_n * micro, _compute_b(spec)) + (
-            panel.tile_n * ceil_div(micro, MX_SCALE_GROUP) if spec.mx_scale_group else 0
-        )
+        from .catlass_lower import _mx_scale_group_span
+        sc_groups = _mx_scale_group_span(panel.k_start_mod + start, micro)[1] if spec.mx_scale_group else 0
+        ma = packed_bytes(panel.tile_m * micro, spec.dtype_a) + panel.tile_m * sc_groups
+        mb = packed_bytes(panel.tile_n * micro, _compute_b(spec)) + panel.tile_n * sc_groups
         if context is not None:
             wa, wb = context.bind(Work(resources={"mte1": ma})), context.bind(Work(resources={"mte1": mb}))
             mte1_pl = {k: v for k, v in context.owned(owner, aic_count, ("mte1",)).items() if k in wa or k in wb}
@@ -420,9 +419,12 @@ def _make_scale_pattern(
     p, die: int, sector: int, tensor: str, row: int, col: int, rows: int, cols: int,
     width: int, owner: int, *, is_a: bool, bypass: bool = False,
 ) -> MemoryAccessPattern:
+    from .catlass_lower import _mx_scale_group_span
+
     per_row = ceil_div(width, MX_SCALE_GROUP) if is_a else ceil_div(p.k, MX_SCALE_GROUP)
-    sr, sc = (rows, ceil_div(cols, MX_SCALE_GROUP)) if is_a else (cols, ceil_div(rows, MX_SCALE_GROUP))
-    off = row * per_row + col // MX_SCALE_GROUP if is_a else col * per_row + row // MX_SCALE_GROUP
+    g_lo, sc = _mx_scale_group_span(col, cols) if is_a else _mx_scale_group_span(row, rows)
+    sr = rows if is_a else cols
+    off = row * per_row + g_lo if is_a else col * per_row + g_lo
     tid = tensor + ":scale"
     key = None if bypass else ReuseKey(die, tid, 0, reuse_stream=f"{tid}:0")
     return MemoryAccessPattern(
@@ -659,7 +661,10 @@ def _lower_periodic_wave(
                     admit(pattern) if pattern is not None else None
                     for pattern in _panel_patterns(spec, p, tile, ks, kl, die, plan.sector)
                 )
-                encoder.append(_PanelDescriptor(tile.m, tile.n, kl, *records))
+                encoder.append(_PanelDescriptor(
+                    tile.m, tile.n, kl, *records,
+                    k_start_mod=(ks % MX_SCALE_GROUP if spec.mx_scale_group else 0),
+                ))
     cohorts = {}
     for tile, encoder in zip(tiles, encoders):
         drain = admit(_make_output_pattern(spec, p, tile, die, plan.sector))

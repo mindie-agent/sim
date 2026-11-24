@@ -598,6 +598,7 @@ def _route_region_edges(
 ):
     routed = []
     source_buffers = {}
+    source_slots: dict[tuple, int] = {}
     for idx, edge in enumerate(edges):
         size = edge_bytes.get(edge.view_id, 0)
         if type(size) is not int or size <= 0:
@@ -613,12 +614,24 @@ def _route_region_edges(
             key = (edge.src_op, edge.producer_version, src_pool, edge.src_owner_axis)
             source_buffers[key] = max(source_buffers.get(key, 0), size)
             if route is not None:
+                source_slots.setdefault(key, 1)
                 buffers += (LiveBufferSpec(
                     f"edge:{idx}", dest_pool, size, 0, 1, owner_kind=edge.dst_owner_axis,
                     slots=tile_count if edge.iter_kind == "full_barrier" else edge.ring_depth,
                 ),)
-    buffers += tuple(LiveBufferSpec(f"producer:{op}:{version}", pool, size, 0, 1, owner_kind=axis)
-                     for (op, version, pool, axis), size in source_buffers.items())
+            else:
+                needed_slots = (
+                    tile_count if edge.iter_kind == "full_barrier"
+                    else max(1, min(tile_count, int(edge.ring_depth)))
+                )
+                source_slots[key] = max(source_slots.get(key, 1), needed_slots)
+    buffers += tuple(
+        LiveBufferSpec(
+            f"producer:{op}:{version}", pool, size, 0, 1,
+            owner_kind=axis, slots=source_slots.get((op, version, pool, axis), 1),
+        )
+        for (op, version, pool, axis), size in source_buffers.items()
+    )
     return routed, buffers
 
 
@@ -1349,8 +1362,29 @@ def _extract_hardware_supply(
     return datapath, rates, peaks, service_modes, launch_vec, launch_cube, fabric_rate, fabric_lat_us
 
 
+_MATMUL_SHAPE_RANK = 3
+
+
+def _typed_port_row_bytes(entries: Any, default_elem_bytes: float) -> dict[tuple[str, str, int], int]:
+    """Extract explicit ``(producer, port, version) -> row_bytes`` from typed port metadata."""
+    out: dict[tuple[str, str, int], int] = {}
+    if not isinstance(entries, (tuple, list)):
+        return out
+    for item in entries:
+        if not isinstance(item, Mapping):
+            continue
+        prod = str(item.get("producer") or "").strip()
+        port = str(item.get("port") or item.get("name") or "out").strip()
+        ver = int(item.get("version", 0) or 0)
+        shape = item.get("shape")
+        if isinstance(shape, (tuple, list)) and shape and isinstance(shape[-1], int) and shape[-1] > 0:
+            eb = formula_elem_bytes(str(item.get("dtype"))) if item.get("dtype") else default_elem_bytes
+            out[(prod, port, ver)] = int(shape[-1] * eb)
+    return out
+
+
 def _formula_row_sram_bytes(spec: FormulaKernelSpec) -> tuple[bool, bool, int, int, int, int]:
-    """Compute ``(has_cube, has_aiv, tile_n, row_fp32_bytes, l1_tile, l0_tile)`` with live-value UB tracking."""
+    """Compute ``(has_cube, has_aiv, tile_n, row_fp32_bytes, l1_tile, l0_tile)`` with port-keyed UB liveness."""
     from .contracts import _extract_op_operand_ports
 
     has_cube = any(fl > 0.0 for _, fl in spec.matrix_flops)
@@ -1371,10 +1405,12 @@ def _formula_row_sram_bytes(spec: FormulaKernelSpec) -> tuple[bool, bool, int, i
     op_out_row_bytes: list[int] = []
     op_is_mat: list[bool] = []
     idx_by_id = {op.op_id: idx for idx, op in enumerate(spec.atomic_ops)}
-    last_use: dict[int, int] = {}
-    ext_first_use: dict[str, int] = {}
-    ext_last_use: dict[str, int] = {}
-    ext_row_bytes: dict[str, int] = {}
+    int_last_use: dict[tuple[int, str, int], int] = {}
+    int_port_bytes: dict[tuple[int, str, int], int] = {}
+    int_out_ports: dict[tuple[int, str], int] = {}
+    ext_first_use: dict[tuple[str, str, int], int] = {}
+    ext_last_use: dict[tuple[str, str, int], int] = {}
+    ext_row_bytes: dict[tuple[str, str, int], int] = {}
     for idx, (op, (_kind, is_mat, is_red, _act, _params)) in enumerate(zip(spec.atomic_ops, infos)):
         meta = dict(op.metadata) if op.metadata else {}
         in_dt = str(meta.get("activation_format") or meta.get("input_dtype") or op.dtype)
@@ -1383,42 +1419,62 @@ def _formula_row_sram_bytes(spec: FormulaKernelSpec) -> tuple[bool, bool, int, i
         op_out_raw = formula_elem_bytes(out_dt)
         in_b = max(in_b, op_in_raw)
         out_b = max(out_b, op_out_raw)
-        op_n = int(op.local_shape[-1]) if op.local_shape else 0
-        for prod_id, _, _ in _extract_op_operand_ports(op):
+        is_3d_mat = is_mat and len(op.local_shape) == _MATMUL_SHAPE_RANK
+        op_in_n = int(op.local_shape[2]) if is_3d_mat else (int(op.local_shape[-1]) if op.local_shape else 0)
+        op_out_n = int(op.local_shape[1]) if is_3d_mat else (int(op.local_shape[-1]) if op.local_shape else 0)
+        explicit_in = _typed_port_row_bytes(meta.get("typed_inputs"), op_in_raw)
+        for (_, p_name, _), p_bytes in _typed_port_row_bytes(meta.get("typed_outputs"), op_out_raw).items():
+            int_out_ports[(idx, p_name)] = p_bytes
+        for prod_id, port_name, ver in _extract_op_operand_ports(op):
+            port_key = (prod_id, port_name, ver)
+            cons_bytes = explicit_in.get(port_key, int(op_in_n * op_in_raw) if op_in_n > 0 else 0)
             if prod_id in idx_by_id:
                 p_idx = idx_by_id[prod_id]
-                last_use[p_idx] = max(last_use.get(p_idx, p_idx), idx)
+                int_key = (p_idx, port_name, ver)
+                int_last_use[int_key] = max(int_last_use.get(int_key, p_idx), idx)
+                if cons_bytes > 0:
+                    int_port_bytes[int_key] = max(int_port_bytes.get(int_key, 0), cons_bytes)
             else:
-                ext_first_use.setdefault(prod_id, idx)
-                ext_last_use[prod_id] = max(ext_last_use.get(prod_id, idx), idx)
-                if op_n > 0:
-                    ext_row_bytes[prod_id] = max(ext_row_bytes.get(prod_id, 0), int(op_n * op_in_raw))
+                ext_first_use.setdefault(port_key, idx)
+                ext_last_use[port_key] = max(ext_last_use.get(port_key, idx), idx)
+                if cons_bytes > 0:
+                    ext_row_bytes[port_key] = max(ext_row_bytes.get(port_key, 0), cons_bytes)
         op_is_mat.append(is_mat)
-        if is_mat or op_n <= 0:
+        if is_mat or op_out_n <= 0:
             op_work_bytes.append(0)
-            op_out_row_bytes.append(int(op_n * op_out_raw) if op_n > 0 else 0)
+            op_out_row_bytes.append(int(op_out_n * op_out_raw) if op_out_n > 0 else 0)
             continue
         op_in_b = max(op_in_raw, float(FP32_BYTES))
         op_out_b = max(op_out_raw, float(FP32_BYTES))
-        op_out_row_bytes.append(int(op_n * op_out_raw))
+        op_out_row_bytes.append(int(op_out_n * op_out_raw))
         if is_red:
-            internal_red_widths.append(op_n)
-            op_work_bytes.append(int(op_n * (op_in_b + op_out_b + float(FP32_BYTES))))
+            internal_red_widths.append(op_out_n)
+            op_work_bytes.append(int(op_out_n * (op_in_b + op_out_b + float(FP32_BYTES))))
         else:
-            internal_aiv_widths.append(op_n)
-            op_work_bytes.append(int(op_n * (op_in_b + op_out_b)) if has_row_red else 0)
+            internal_aiv_widths.append(op_out_n)
+            op_work_bytes.append(int(op_out_n * (op_in_b + op_out_b)) if has_row_red else 0)
 
+    ports_per_prod: dict[int, int] = defaultdict(int)
+    for p_idx, _, _ in int_last_use:
+        ports_per_prod[p_idx] += 1
     internal_peak_bytes = 0
     for j, work_j in enumerate(op_work_bytes):
         if op_is_mat[j] or work_j <= 0:
             continue
-        carried = sum(
-            op_out_row_bytes[k] for k in range(j)
-            if last_use.get(k, -1) > j
-        )
+        carried = 0
+        for (p_idx, port_name, ver), l_idx in int_last_use.items():
+            if not (p_idx < j < l_idx):
+                continue
+            explicit_out = int_out_ports.get((p_idx, port_name), 0)
+            if explicit_out > 0:
+                carried += explicit_out
+            elif ports_per_prod[p_idx] > 1:
+                carried += int_port_bytes.get((p_idx, port_name, ver), 0) or op_out_row_bytes[p_idx]
+            else:
+                carried += op_out_row_bytes[p_idx] or int_port_bytes.get((p_idx, port_name, ver), 0)
         carried_ext = sum(
-            ext_row_bytes.get(pid, 0) for pid, f_idx in ext_first_use.items()
-            if f_idx < j < ext_last_use.get(pid, -1)
+            ext_row_bytes.get(pkey, 0) for pkey, f_idx in ext_first_use.items()
+            if f_idx < j < ext_last_use.get(pkey, -1)
         )
         internal_peak_bytes = max(internal_peak_bytes, work_j + carried + carried_ext)
 
@@ -1470,11 +1526,20 @@ def solve_formula_sram(
                 None, "simt_unsupported", f"(M=1, N={tile_n}, K={_CUBE_TILE_K_ELEMS if has_cube else 1})",
                 row_fp32_bytes, 0, l1_tile, l1_budget, l0_tile, l0_budget, 1, False,
             )
+        cal = try_load_tilelang_calibration(str(datapath.arch_id))
+        if cal is not None:
+            simt_prof, _ = resolve_tilelang_profile(datapath, uses_simt=True, calibration=cal)
+            max_ub_budget = simt_prof.ub_ceiling_bytes
+        else:
+            max_ub_budget = ub_budget
         cand_modes: tuple[tuple[int, bool], ...] = ((_UB_DOUBLE_BUFFER_SLOTS, True), (1, True))
-        max_ub_budget = ub_budget
+        eff_bufs = {**bufs, "ub": max_ub_budget + carveout}
+        eff_dp = replace(datapath, buffers=tuple(eff_bufs.items()))
     else:
         cand_modes = ((_UB_DOUBLE_BUFFER_SLOTS, False), (1, False))
         max_ub_budget = ub_raw
+        eff_bufs = bufs
+        eff_dp = datapath
     candidates: list[TileCandidate] = []
     owner_part = (cube_budget or datapath.aic_count, vec_budget or datapath.aiv_count)
     for slots, cand_simt in cand_modes:
@@ -1501,8 +1566,8 @@ def solve_formula_sram(
         ))
     tile_spec = TilePipelineSpec(spec.family or "formula_kernel", tuple(candidates), simt_ub_carveout_bytes=carveout)
     hw = SimpleNamespace(
-        datapath=datapath,
-        buffers=bufs,
+        datapath=eff_dp,
+        buffers=eff_bufs,
         buffer_units={"ub": datapath.aiv_count, "l1": datapath.aic_count, "l0c": datapath.aic_count, "l2": 1},
         stream_owners=None,
     )
@@ -1777,11 +1842,14 @@ def resolve_tilelang_dual_tier_bounds(
     simd_target_ms = max(l_star_ms, tiled_ms)
     ceil_gain_ms = before_ms - l_star_ms
     simd_gain_ms = min(ceil_gain_ms, before_ms - simd_target_ms)
+    simt_prof, _ = resolve_tilelang_profile(datapath, uses_simt=True, calibration=cal)
+    simt_ub_ceiling = simt_prof.ub_ceiling_bytes
     ub_warn = (
         cal.simt_vs_simd_ub_wall_warning(ub_live_bytes)
         if (is_vector_or_norm_region or has_aiv) else None
     )
-    if (is_vector_or_norm_region or has_aiv) and ub_live_bytes > cal.simt_usable_ub_bytes:
+    if (is_vector_or_norm_region or has_aiv) and (simt_ub_ceiling <= 0 or ub_live_bytes > simt_ub_ceiling):
+        ub_warn = ub_warn or f"simt_ub_ceiling_exceeded:{ub_live_bytes}>{simt_ub_ceiling}"
         return min(0.0, simd_gain_ms), simd_gain_ms, ub_warn
 
     disp_ms = cal.aclgraph_issue_us / _US_PER_MS

@@ -333,6 +333,32 @@ def _node_weight_contract(node: Any) -> tuple[str, str, tuple[int, ...], str] | 
     return w_dt, wq, wg, ws_dt
 
 
+_MATMUL_SHAPE_RANK = 3
+
+
+def _classify_moe_gmm_role(node: Any, hidden_size: int, inter_size: int) -> str:
+    """Classify a grouped-MoE GEMM node into ``'w1'`` (gate/up) or ``'w2'`` (down) by role/shape."""
+    meta = dict(getattr(node, "metadata", ()) or ())
+    tokens = " ".join((
+        str(meta.get("role") or ""),
+        str(meta.get("projection") or ""),
+        str(meta.get("quant_category") or ""),
+        str(getattr(node, "op_id", "") or ""),
+    )).lower()
+    if any(tok in tokens for tok in ("down", "w2", "fc2", "proj_down")):
+        return "w2"
+    if any(tok in tokens for tok in ("gate", "up", "w13", "w1", "fc1", "proj_up")):
+        return "w1"
+    shape = getattr(node, "local_shape", ()) or ()
+    if len(shape) == _MATMUL_SHAPE_RANK and hidden_size > 0:
+        _, n_dim, k_dim = (int(shape[0]), int(shape[1]), int(shape[2]))
+        if n_dim == hidden_size and (inter_size <= 0 or k_dim != hidden_size):
+            return "w2"
+        if k_dim == hidden_size and (inter_size <= 0 or n_dim != hidden_size):
+            return "w1"
+    return ""
+
+
 def _resolve_moe_weight_contracts(
     case: Case,
     nodes: Sequence[Any] = (),
@@ -342,14 +368,49 @@ def _resolve_moe_weight_contracts(
         n for n in nodes
         if str(getattr(n, "family", "") or "").strip().lower() in {"grouped_gemm", "grouped_matmul", "grouped_moe"}
     ]
-    if len(gmm_nodes) >= 2:
-        c1 = _node_weight_contract(gmm_nodes[0]) or base
-        c2 = _node_weight_contract(gmm_nodes[1]) or base
+    if not gmm_nodes:
+        return base, base
+    lp = _resolve_moe_layer_plan(case)
+    hidden_size = int(getattr(case.model, "hidden_size", 0) or 0)
+    inter_size = int(getattr(lp, "moe_intermediate_size", 0) or 0) if lp is not None else 0
+    w1_contracts: list[tuple[str, str, tuple[int, ...], str]] = []
+    w2_contracts: list[tuple[str, str, tuple[int, ...], str]] = []
+    unknown_nodes: list[Any] = []
+    for n in gmm_nodes:
+        role = _classify_moe_gmm_role(n, hidden_size, inter_size)
+        contract = _node_weight_contract(n) or base
+        if role == "w1":
+            w1_contracts.append(contract)
+        elif role == "w2":
+            w2_contracts.append(contract)
+        else:
+            unknown_nodes.append(n)
+    if unknown_nodes:
+        # Order-invariant DAG disambiguation: nodes feeding another grouped GEMM are w1, sinks are w2.
+        gmm_ids = {str(getattr(n, "op_id", "") or "") for n in gmm_nodes}
+        fed_ids = {
+            dep for n in gmm_nodes
+            for dep in (getattr(n, "deps", ()) or ())
+            if dep in gmm_ids
+        }
+        for n in unknown_nodes:
+            oid = str(getattr(n, "op_id", "") or "")
+            contract = _node_weight_contract(n) or base
+            if oid and oid in fed_ids:
+                w1_contracts.append(contract)
+            else:
+                w2_contracts.append(contract)
+    # Canonical order-invariant representative (sort distinct contracts so list permutation cannot flip verdict).
+    c1_set = sorted(set(w1_contracts))
+    c2_set = sorted(set(w2_contracts))
+    if c1_set and c2_set:
+        # If multiple up/gate projections disagree, prefer the non-base/stricter contract deterministically.
+        c1 = next((c for c in c1_set if c != base), c1_set[0])
+        c2 = next((c for c in c2_set if c != base), c2_set[0])
         return c1, c2
-    if len(gmm_nodes) == 1:
-        c1 = _node_weight_contract(gmm_nodes[0]) or base
-        return c1, c1
-    return base, base
+    only = c1_set or c2_set
+    rep = next((c for c in only if c != base), only[0]) if only else base
+    return rep, rep
 
 
 def _build_moe_abi_query(

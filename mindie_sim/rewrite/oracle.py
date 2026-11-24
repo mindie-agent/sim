@@ -377,7 +377,12 @@ def prepare_scenario(
         report = _report(prepared.case, graphs, context, recipes, request.replay, deadline=deadline,
                          streams=prepared.graph.streams,
                          trace_limit=MAX_OVERLAP_TRACE_EVENTS if prepared.graph.streams else 0)
-        evaluation = _evaluation(resolved, graphs, report, prepared.graph_id, tier, prepared)
+        seed_plan_sha = plan_sha256(empty_plan(resolved.base_graph_sha256, resolved.framing_sha256))
+        evaluation = _evaluation(
+            resolved, graphs, report, prepared.graph_id, tier, prepared,
+            scenario_sha256=resolved.scenario_sha256,
+            plan_sha256=seed_plan_sha,
+        )
         archetypes = intern_step_archetypes(next(iter(graphs.values()), ()))
         layers, sites, reference = {}, defaultdict(set), {}
         for replica, ops in graphs.items():

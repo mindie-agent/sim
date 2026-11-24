@@ -92,6 +92,37 @@ _COLD_WEIGHT_FAMILIES = frozenset({
 _WEIGHT_ID_KEYS = ("weight_allocation_id", "allocation_id")
 _ENGINE_PIPE_MAP = {"cube": "cube", "aiv_simd": "vector", "aiv_simt": "simt"}
 _PAIR_LEN = 2
+_PORT_LINK_SEMANTICS = frozenset({"per_port", "fully_connected", "mesh"})
+
+
+def _resolve_comm_endpoint_die(
+    meta: dict,
+    keys: tuple[str, ...],
+    default_die: int | None,
+    dies_tuple: tuple[int, ...],
+) -> int | None:
+    for key in keys:
+        val = meta.get(key)
+        if isinstance(val, int) and not isinstance(val, bool) and (not dies_tuple or val in dies_tuple):
+            return val
+    return default_die
+
+
+def _link_switch_pipe(link_spec) -> str | None:
+    if getattr(link_spec, "switch_capacity_bytes_per_ms", None) is None:
+        return None
+    sw_id = str(getattr(link_spec, "switch_id", "") or "").strip()
+    return f"link_switch_id:{sw_id}" if sw_id else f"link_switch:{link_spec.name}"
+
+
+def _eligible_links_for_op(demands, die: int, op) -> tuple:
+    eligible = [lnk for lnk in demands.links.values() if not lnk.members or die in lnk.members]
+    scope = str(getattr(op, "link_scope", "") or "").strip().lower()
+    if scope and scope not in {"any", "undeclared"}:
+        scoped = [lnk for lnk in eligible if str(getattr(lnk, "scope", "") or "").strip().lower() == scope]
+        if scoped:
+            eligible = scoped
+    return tuple(eligible)
 
 __all__ = (
     "ResourceChoiceProgram", "FarkasCertificate", "EpochAccount", "DagEdge",
@@ -708,6 +739,8 @@ def derive_default_obligations(scenario, demands, aliases, covered, rank_ops_fn)
     matrix_work: dict[tuple[int, int, int, str], int] = defaultdict(int)
     vector_work: dict[tuple[int, int, int], int] = defaultdict(int)
     link_work: dict[tuple[int, int, int], int] = defaultdict(int)
+    switch_work: dict[str, int] = defaultdict(int)
+    shared_link_work: dict[str, int] = defaultdict(int)
     mte2_copy_work: dict[tuple[int, int, int], int] = defaultdict(int)
     write_copy_work: dict[tuple[int, int, int], int] = defaultdict(int)
     read_obs: list[TensorRangeObligation] = []
@@ -722,7 +755,12 @@ def derive_default_obligations(scenario, demands, aliases, covered, rank_ops_fn)
         meta = dict(op.metadata)
         stage = int(getattr(op, "stage", 0))
         die_idx = (replica * pp_stages + stage) * tp_width
-        die = dies[die_idx] if 0 <= die_idx < len(dies) else (dies[0] if dies else 0)
+        default_die = dies[die_idx] if 0 <= die_idx < len(dies) else (dies[0] if dies else 0)
+        die = _resolve_comm_endpoint_die(
+            meta, ("source_die", "src_die", "source_rank", "src_rank", "source", "die", "rank"),
+            default_die, dies,
+        )
+        assert die is not None
         placements.setdefault(die, (replica, stage))
         key = (replica, stage, op.op_id)
         has_explicit_work = bool(meta.get("semantic_work"))
@@ -762,6 +800,14 @@ def derive_default_obligations(scenario, demands, aliases, covered, rank_ops_fn)
                 if demands.engine_rate((replica, stage, die), "link_egress", "") > 0:
                     link_work[replica, stage, die] += link_bytes
                     has_link = True
+                eligible = _eligible_links_for_op(demands, die, op)
+                sw_pipes = {_link_switch_pipe(lnk) for lnk in eligible}
+                if len(eligible) >= 1 and len(sw_pipes) == 1:
+                    only_sw = next(iter(sw_pipes))
+                    if only_sw is not None:
+                        switch_work[only_sw] += link_bytes
+                if len(eligible) == 1 and eligible[0].semantics not in {"per_pair", *_PORT_LINK_SEMANTICS}:
+                    shared_link_work[f"link:{eligible[0].name}"] += link_bytes
 
         has_explicit_mem = "read_obligations" in meta or "write_obligations" in meta
         if "read_obligations" in meta:
@@ -784,6 +830,10 @@ def derive_default_obligations(scenario, demands, aliases, covered, rank_ops_fn)
 
     for (replica, stage, die), byte_count in link_work.items():
         demands.charge((replica, stage, die), "link_egress", byte_count)
+    for sw_pipe, byte_count in switch_work.items():
+        demands.charge((0, 0, -1), sw_pipe, byte_count)
+    for lnk_pipe, byte_count in shared_link_work.items():
+        demands.charge((0, 0, -1), lnk_pipe, byte_count)
     for (replica, stage, die), byte_count in mte2_copy_work.items():
         demands.charge((replica, stage, die), "mte2_total", byte_count)
     for (replica, stage, die), byte_count in write_copy_work.items():
@@ -863,12 +913,23 @@ class _Demands:
                     egress_bpms = base_bpms * max(1, peers)
                     if ep_rates:
                         egress_bpms = min(egress_bpms, max(ep_rates))
+                elif link.semantics in _PORT_LINK_SEMANTICS:
+                    egress_bpms = max(ep_rates) if ep_rates else base_bpms
                 else:
                     egress_bpms = max((base_bpms, *ep_rates))
                 if link.switch_capacity_bytes_per_ms is not None:
                     egress_bpms = min(egress_bpms, Fraction(link.switch_capacity_bytes_per_ms))
                 total += MS_PER_SECOND * egress_bpms
             return total
+        if pipe.startswith("link_switch_id:"):
+            sw_id = pipe.removeprefix("link_switch_id:")
+            caps = [
+                Fraction(lnk.switch_capacity_bytes_per_ms)
+                for lnk in self.links.values()
+                if str(getattr(lnk, "switch_id", "") or "").strip() == sw_id
+                and lnk.switch_capacity_bytes_per_ms is not None
+            ]
+            return MS_PER_SECOND * max(caps) if caps else 0
         if pipe.startswith("link_switch:"):
             link = self.links.get(pipe.removeprefix("link_switch:"))
             return (
@@ -876,14 +937,25 @@ class _Demands:
                 if (link is not None and link.switch_capacity_bytes_per_ms is not None)
                 else 0
             )
+        if pipe.startswith("link_rx:"):
+            link = self.links.get(pipe.removeprefix("link_rx:"))
+            if link is None:
+                return 0
+            die = scope[-1]
+            base_bpms = Fraction(link.effective_peak_capacity_bytes_per_ms)
+            ep_rates = [Fraction(r) for rank, r in link.endpoint_rates if rank == die]
+            cap_bpms = max(ep_rates) if ep_rates else base_bpms
+            if link.switch_capacity_bytes_per_ms is not None:
+                cap_bpms = min(cap_bpms, Fraction(link.switch_capacity_bytes_per_ms))
+            return MS_PER_SECOND * cap_bpms
         if pipe.startswith("link:"):
             link = self.links.get(pipe.removeprefix("link:"))
             if link is None:
                 return 0
             die = scope[-1]
             base_bpms = Fraction(link.effective_peak_capacity_bytes_per_ms)
+            ep_rates = [Fraction(r) for rank, r in link.endpoint_rates if rank == die]
             if link.semantics == "per_pair" and die >= 0:
-                ep_rates = [Fraction(r) for rank, r in link.endpoint_rates if rank == die]
                 peers = (
                     sum(1 for rank in link.members if rank != die)
                     if link.members else max(1, len(self.devices) - 1)
@@ -894,7 +966,15 @@ class _Demands:
                 if link.switch_capacity_bytes_per_ms is not None:
                     cap_bpms = min(cap_bpms, Fraction(link.switch_capacity_bytes_per_ms))
                 return MS_PER_SECOND * cap_bpms
-            return MS_PER_SECOND * base_bpms
+            if link.semantics in _PORT_LINK_SEMANTICS and die >= 0:
+                cap_bpms = max(ep_rates) if ep_rates else base_bpms
+                if link.switch_capacity_bytes_per_ms is not None:
+                    cap_bpms = min(cap_bpms, Fraction(link.switch_capacity_bytes_per_ms))
+                return MS_PER_SECOND * cap_bpms
+            cap_bpms = base_bpms
+            if link.switch_capacity_bytes_per_ms is not None:
+                cap_bpms = min(cap_bpms, Fraction(link.switch_capacity_bytes_per_ms))
+            return MS_PER_SECOND * cap_bpms
         device = self.devices.get(scope[-1])
         if device is None:
             return 0
@@ -1107,15 +1187,32 @@ def build_dual_inputs_from_scenario(
             add_work(item)
         for link, byte_count in meta.get("mandatory_comm_wire_bytes_by_link", ()):
             link_spec = demands.links.get(link)
-            if link_spec is not None and link_spec.semantics == "per_pair":
+            if link_spec is not None and (link_spec.semantics == "per_pair" or link_spec.semantics in _PORT_LINK_SEMANTICS):
                 stage = int(getattr(op, "stage", 0))
                 die_idx = (replica * pp_stages + stage) * tp_width
-                die = dies_tuple[die_idx] if 0 <= die_idx < len(dies_tuple) else (dies_tuple[0] if dies_tuple else 0)
-                demands.charge((replica, stage, die), f"link:{link}", byte_count)
-                if link_spec.switch_capacity_bytes_per_ms is not None:
-                    demands.charge((0, 0, -1), f"link_switch:{link}", byte_count)
+                default_die = dies_tuple[die_idx] if 0 <= die_idx < len(dies_tuple) else (dies_tuple[0] if dies_tuple else 0)
+                src_die = _resolve_comm_endpoint_die(
+                    meta, ("source_die", "src_die", "source_rank", "src_rank", "source", "die", "rank"),
+                    default_die, dies_tuple,
+                )
+                assert src_die is not None
+                demands.charge((replica, stage, src_die), f"link:{link}", byte_count)
+                if link_spec.semantics in _PORT_LINK_SEMANTICS:
+                    dst_die = _resolve_comm_endpoint_die(
+                        meta, ("destination_die", "dst_die", "destination_rank", "dst_rank", "destination"),
+                        None, dies_tuple,
+                    )
+                    if dst_die is not None:
+                        demands.charge((replica, stage, dst_die), f"link_rx:{link}", byte_count)
+                sw_pipe = _link_switch_pipe(link_spec)
+                if sw_pipe is not None:
+                    demands.charge((0, 0, -1), sw_pipe, byte_count)
             else:
                 demands.charge((0, 0, -1), f"link:{link}", byte_count)
+                if link_spec is not None:
+                    sw_pipe = _link_switch_pipe(link_spec)
+                    if sw_pipe is not None:
+                        demands.charge((0, 0, -1), sw_pipe, byte_count)
         for scope, direction, copy_bytes in meta.get("schedule_dependent_memory", ()):
             hit = defaultdict(Fraction)
             demands.charge(scope, "l2_bw", copy_bytes, rows=hit)

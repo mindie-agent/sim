@@ -132,6 +132,8 @@ _ABI_DTYPE_CANON = {
     "bfloat16": "bf16",
     "float16": "fp16",
     "float32": "fp32",
+    "e8m0": "fp8_e8m0",
+    "fp8_e8m0": "fp8_e8m0",
 }
 _DEFAULT_SKU_BY_ARCH: dict[SocArch, str] = {
     "A2": "ascend910b4",
@@ -904,21 +906,107 @@ def _quant_contract_for_port(
     is_weight: bool,
 ) -> tuple[str, tuple[int, ...], str]:
     dt = _norm_abi_dtype(dtype)
+    sf = _norm_abi_dtype(scale_format) if scale_format else ""
     if dt in {"bf16", "fp16", "fp32"}:
         return "dense", (), "none"
     if dt == "fp4_e2m1":
-        return "mx_fp4", (MX_GROUP_SIZE,), "fp8_e8m0"
+        return "mx_fp4", (group_size or MX_GROUP_SIZE,), (sf or "fp8_e8m0")
     if dt == "hifloat8":
-        return "hif8_mx", (MX_GROUP_SIZE,), "fp8_e8m0"
+        return "hif8_mx", (group_size or MX_GROUP_SIZE,), (sf or "fp8_e8m0")
     if dt in {"fp8_e4m3fn", "fp8_e5m2"}:
-        if group_size == BLOCK_QUANT_GROUP_SIZE and scale_format != "fp8_e8m0":
-            return "per_block_128", (BLOCK_QUANT_GROUP_SIZE,), "fp32"
-        return "mx_fp8", (MX_GROUP_SIZE,), "fp8_e8m0"
+        if group_size == BLOCK_QUANT_GROUP_SIZE and sf != "fp8_e8m0":
+            return "per_block_128", (BLOCK_QUANT_GROUP_SIZE,), (sf or "fp32")
+        if sf and sf != "fp8_e8m0":
+            return "per_group_fp8", ((group_size,) if group_size else ()), sf
+        return "mx_fp8", (group_size or MX_GROUP_SIZE,), "fp8_e8m0"
     if dt == "int4":
-        return "w4a8_int", (), "fp32"
+        return "w4a8_int", (), (sf or "fp32")
     if dt == "int8":
-        return ("per_channel_int8" if is_weight else "per_token_int8"), (), "fp32"
+        return ("per_channel_int8" if is_weight else "per_token_int8"), (), (sf or "fp32")
     return "none", (), "none"
+
+
+def _resolve_declared_weight_layout(
+    op: OpSpec,
+    p_abi: Any,
+    *,
+    default_when_undeclared: OperandLayout = "ND",
+) -> OperandLayout:
+    meta = dict(op.metadata) if op.metadata else {}
+    explicit_meta = str(meta.get("weight_layout") or meta.get("weight_representation") or "").strip().upper()
+    if explicit_meta:
+        if "FRACTAL_NZ" in explicit_meta or explicit_meta == "NZ":
+            return "FRACTAL_NZ"
+        if "FRACTAL_Z" in explicit_meta:
+            return "FRACTAL_Z"
+        return "ND"
+    if p_abi is not None:
+        abi_wl = str(getattr(p_abi, "weight_layout", "") or "").strip().upper()
+        if "FRACTAL_NZ" in abi_wl or abi_wl == "NZ":
+            return "FRACTAL_NZ"
+        if "FRACTAL_Z" in abi_wl:
+            return "FRACTAL_Z"
+        return "ND"
+    return default_when_undeclared
+
+
+def _resolve_op_weight_port_contract(
+    op: OpSpec,
+    tr: OpTraitInfo,
+    *,
+    default_layout: OperandLayout = "ND",
+) -> tuple[str, str, tuple[int, ...], str, OperandLayout]:
+    p_abi = getattr(op, "precision_abi", None)
+    meta = dict(op.metadata) if op.metadata else {}
+    raw_w = (
+        getattr(p_abi, "weight_dtype", "") if (p_abi is not None and getattr(p_abi, "weight_dtype", ""))
+        else tr.weight_dtype
+    )
+    w_dt = _norm_abi_dtype(raw_w)
+    abi_wgs = _abi_weight_group_size(p_abi)
+    raw_wgs = meta.get("weight_group_size", meta.get("quant_group_size"))
+    w_gs = (
+        abi_wgs if abi_wgs > 0
+        else (int(raw_wgs) if isinstance(raw_wgs, int) and not isinstance(raw_wgs, bool) and raw_wgs > 0 else tr.group_size)
+    )
+    w_sf = str(
+        (getattr(p_abi, "weight_scale_dtype", "") if p_abi is not None else "")
+        or meta.get("weight_scale_format")
+        or meta.get("weight_scale_dtype")
+        or tr.scale_format
+        or ""
+    ).strip().lower()
+    wq, wg, ws_dt = _quant_contract_for_port(w_dt, w_sf, w_gs, is_weight=True)
+    w_layout = _resolve_declared_weight_layout(op, p_abi, default_when_undeclared=default_layout)
+    return w_dt, wq, wg, ws_dt, w_layout
+
+
+def _resolve_op_act_port_contract(
+    op: OpSpec,
+    tr: OpTraitInfo,
+) -> tuple[str, str, tuple[int, ...], str]:
+    p_abi = getattr(op, "precision_abi", None)
+    meta = dict(op.metadata) if op.metadata else {}
+    raw_in = (
+        getattr(p_abi, "input_dtype", "") if (p_abi is not None and getattr(p_abi, "input_dtype", ""))
+        else tr.input_dtype
+    )
+    in_dt = _norm_abi_dtype(raw_in)
+    abi_ags = int(getattr(p_abi, "act_group_size", 0) or 0) if p_abi is not None else 0
+    raw_ags = meta.get("activation_group_size", meta.get("quant_group_size"))
+    a_gs = (
+        abi_ags if abi_ags > 0
+        else (int(raw_ags) if isinstance(raw_ags, int) and not isinstance(raw_ags, bool) and raw_ags > 0 else tr.group_size)
+    )
+    a_sf = str(
+        (getattr(p_abi, "act_scale_dtype", "") if p_abi is not None else "")
+        or meta.get("activation_scale_format")
+        or meta.get("act_scale_dtype")
+        or tr.scale_format
+        or ""
+    ).strip().lower()
+    aq, ag, as_dt = _quant_contract_for_port(in_dt, a_sf, a_gs, is_weight=False)
+    return in_dt, aq, ag, as_dt
 
 
 def _port(
@@ -1076,41 +1164,47 @@ def _build_mla_prolog_ports(
     *,
     soc_arch: SocArch | None,
     rope_dim: int,
-) -> tuple[str, tuple[OperandPortSig, ...], tuple[OperandPortSig, ...]]:
+) -> tuple[str, tuple[OperandPortSig, ...], tuple[OperandPortSig, ...]] | None:
     """Build independent per-projection MLA prolog operand and output port signatures."""
     entry_op = next((op for op in ordered_m if role_of[op.op_id] in {"qkv_a", "q_a"}), ordered_m[0])
     tr = traits[entry_op.op_id]
     by_role: dict[str, OpSpec] = {}
+    packed_by_role: dict[str, OpSpec] = {}
     for op_m in ordered_m:
         r_name = role_of.get(op_m.op_id, "")
         if r_name and r_name not in by_role:
             by_role[r_name] = op_m
+        packed_roles = dict(op_m.metadata).get("packed_weight_roles") if op_m.metadata else None
+        if isinstance(packed_roles, (tuple, list, set, frozenset)):
+            for pr in packed_roles:
+                pr_tok = str(pr or "").strip().lower()
+                if pr_tok and pr_tok not in packed_by_role:
+                    packed_by_role[pr_tok] = op_m
     m_dim = int(entry_op.local_shape[0]) if entry_op.local_shape else 1
     h_dim = int(entry_op.local_shape[-1]) if len(entry_op.local_shape) >= 2 else max(1, m_dim)
 
-    def _weight_port(port_name: str, role_keys: tuple[str, ...]) -> OperandPortSig:
-        src_op = next((by_role[rk] for rk in role_keys if rk in by_role), entry_op)
-        src_tr = traits[src_op.op_id]
-        dt = _norm_abi_dtype(src_tr.weight_dtype)
-        p_abi = getattr(src_op, "precision_abi", None)
-        w_gs = _abi_weight_group_size(p_abi)
-        gs = w_gs if w_gs > 0 else src_tr.group_size
-        sf = (
-            str(p_abi.weight_scale_dtype or "").strip().lower()
-            if p_abi is not None and getattr(p_abi, "weight_scale_dtype", "")
-            else src_tr.scale_format
+    def _weight_port(port_name: str, role_keys: tuple[str, ...]) -> OperandPortSig | None:
+        src_op = next((by_role[rk] for rk in role_keys if rk in by_role), None)
+        if src_op is None:
+            src_op = next((packed_by_role[rk] for rk in (*role_keys, port_name) if rk in packed_by_role), None)
+        if src_op is None:
+            return None
+        w_dt, q_mode, g_sh, s_dt, w_layout = _resolve_op_weight_port_contract(
+            src_op, traits[src_op.op_id], default_layout="FRACTAL_NZ",
         )
-        q_mode, g_sh, s_dt = _quant_contract_for_port(dt, sf, gs, is_weight=True)
         sh = (
             (int(src_op.local_shape[2]), int(src_op.local_shape[1]))
             if len(src_op.local_shape) == MATMUL_SHAPE_RANK else (h_dim, h_dim)
         )
-        return _port(port_name, dt, sh, layout="FRACTAL_NZ", quant_mode=q_mode, group_shape=g_sh, scale_dtype=s_dt)
+        return _port(port_name, w_dt, sh, layout=w_layout, quant_mode=q_mode, group_shape=g_sh, scale_dtype=s_dt)
 
     w_dq = _weight_port("weight_dq", ("q_a", "qkv_a"))
     w_uq_qr = _weight_port("weight_uq_qr", ("q_b",))
     w_uk = _weight_port("weight_uk", ("q_absorb",))
     w_dkv_kr = _weight_port("weight_dkv_kr", ("kv_a", "qkv_a"))
+    if any(p is None for p in (w_dq, w_uq_qr, w_uk, w_dkv_kr)):
+        return None
+    assert w_dq is not None and w_uq_qr is not None and w_uk is not None and w_dkv_kr is not None
     w_dt = w_dq.dtype
     in_dt = _norm_abi_dtype(tr.input_dtype)
     iq, ig, is_dt = _quant_contract_for_port(in_dt, tr.scale_format, tr.group_size, is_weight=False)
@@ -1218,9 +1312,12 @@ def _match_law4_mla_prolog(
             continue
         if any(bool(m.get("sfa_c8_w4a8_bypass")) for m in metas):
             continue
-        abi_id, operands, outputs = _build_mla_prolog_ports(
+        built = _build_mla_prolog_ports(
             ordered_m, role_of, traits, soc_arch=soc_arch, rope_dim=rope_dim,
         )
+        if built is None:
+            continue
+        abi_id, operands, outputs = built
         verdict: AbiSupportVerdict | None = None
         q_digest = ""
         if soc_arch is not None:
@@ -1279,12 +1376,13 @@ def _build_mc2_gemm_verdict(
     if soc_arch is None or len(mm_op.local_shape) != MATMUL_SHAPE_RANK:
         return None, ""
     m_dim, n_dim, k_dim = (int(mm_op.local_shape[0]), int(mm_op.local_shape[1]), int(mm_op.local_shape[2]))
-    in_dt = _norm_abi_dtype(tr_mm.input_dtype)
-    w_dt = _norm_abi_dtype(tr_mm.weight_dtype)
-    out_dt = _norm_abi_dtype(tr_mm.output_dtype)
-    iq, ig, is_dt = _quant_contract_for_port(in_dt, tr_mm.scale_format, tr_mm.group_size, is_weight=False)
-    wq, wg, ws_dt = _quant_contract_for_port(w_dt, tr_mm.scale_format, tr_mm.group_size, is_weight=True)
-    w_layout: OperandLayout = "FRACTAL_NZ" if w_dt in _ALLOWED_QUANT_FORMATS else "ND"
+    in_dt, iq, ig, is_dt = _resolve_op_act_port_contract(mm_op, tr_mm)
+    w_dt, wq, wg, ws_dt, w_layout = _resolve_op_weight_port_contract(mm_op, tr_mm, default_layout="ND")
+    p_abi = getattr(mm_op, "precision_abi", None)
+    out_dt = _norm_abi_dtype(
+        getattr(p_abi, "output_dtype", "") if (p_abi is not None and getattr(p_abi, "output_dtype", ""))
+        else tr_mm.output_dtype
+    )
     comm_m = int(comm_op.local_shape[0]) if comm_op.local_shape else 0
     if is_agmm:
         if comm_m > 0:
@@ -1478,9 +1576,12 @@ def _verify_law2a_matmul_abi(
     first = siblings[0]
     tr = traits[first.op_id]
     p_abi = getattr(first, "precision_abi", None)
-    in_dt = _norm_abi_dtype(getattr(p_abi, "input_dtype", "") if p_abi is not None and getattr(p_abi, "input_dtype", "") else tr.input_dtype)
-    w_dt = _norm_abi_dtype(getattr(p_abi, "weight_dtype", "") if p_abi is not None and getattr(p_abi, "weight_dtype", "") else tr.weight_dtype)
-    out_dt = _norm_abi_dtype(getattr(p_abi, "output_dtype", "") if p_abi is not None and getattr(p_abi, "output_dtype", "") else tr.output_dtype)
+    in_dt, iq, ig, is_dt = _resolve_op_act_port_contract(first, tr)
+    w_dt, wq, wg, ws_dt, w_layout = _resolve_op_weight_port_contract(first, tr, default_layout="ND")
+    out_dt = _norm_abi_dtype(
+        getattr(p_abi, "output_dtype", "") if (p_abi is not None and getattr(p_abi, "output_dtype", ""))
+        else tr.output_dtype
+    )
     is_quant = in_dt in _ALLOWED_QUANT_FORMATS or w_dt in _ALLOWED_QUANT_FORMATS
     abi_id = "aclnnQuantMatmulV4" if is_quant else "aclnnMatmul"
     if soc_arch is None or len(first.local_shape) != MATMUL_SHAPE_RANK:
@@ -1488,15 +1589,6 @@ def _verify_law2a_matmul_abi(
     m_dim = int(first.local_shape[0])
     k_dim = int(first.local_shape[2])
     n_sum = sum(int(s.local_shape[1]) for s in siblings if len(s.local_shape) == MATMUL_SHAPE_RANK)
-    act_gs = int(p_abi.act_group_size) if p_abi is not None and getattr(p_abi, "act_group_size", 0) > 0 else tr.group_size
-    act_sf = str(p_abi.act_scale_dtype or "").strip().lower() if p_abi is not None and getattr(p_abi, "act_scale_dtype", "") else tr.scale_format
-    abi_wgs = _abi_weight_group_size(p_abi)
-    wt_gs = abi_wgs if abi_wgs > 0 else tr.group_size
-    wt_sf = str(p_abi.weight_scale_dtype or "").strip().lower() if p_abi is not None and getattr(p_abi, "weight_scale_dtype", "") else tr.scale_format
-    iq, ig, is_dt = _quant_contract_for_port(in_dt, act_sf, act_gs, is_weight=False)
-    wq, wg, ws_dt = _quant_contract_for_port(w_dt, wt_sf, wt_gs, is_weight=True)
-    raw_wl = str(getattr(p_abi, "weight_layout", "") if p_abi is not None else "").strip().upper()
-    w_layout: OperandLayout = "FRACTAL_NZ" if (raw_wl == "FRACTAL_NZ" or is_quant) else "ND"
     operands = (
         _port("x1", in_dt, (m_dim, k_dim), layout="ND", quant_mode=iq, group_shape=ig, scale_dtype=is_dt),
         _port("x2", w_dt, (k_dim, n_sum), layout=w_layout, quant_mode=wq, group_shape=wg, scale_dtype=ws_dt),
@@ -1824,10 +1916,16 @@ def _verify_moe_frame_abi(
     tr1 = traits[gmm1.op_id]
     tr2 = traits[gmm2.op_id]
     act_norm = _norm_moe_activation(traits[act_op.op_id].activation_kind or act_op.family)
-    w1_dt = _norm_abi_dtype(tr1.weight_dtype)
-    w2_dt = _norm_abi_dtype(tr2.weight_dtype)
-    in_dt = _norm_abi_dtype(tr1.input_dtype) if tr1.input_dtype else "bf16"
-    out_dt = _norm_abi_dtype(tr2.output_dtype) if tr2.output_dtype else "bf16"
+    w1_dt, wq1, wg1, ws1_dt, w1_layout = _resolve_op_weight_port_contract(gmm1, tr1, default_layout="FRACTAL_NZ")
+    w2_dt, wq2, wg2, ws2_dt, w2_layout = _resolve_op_weight_port_contract(gmm2, tr2, default_layout="FRACTAL_NZ")
+    in_dt, iq, ig, is_dt = _resolve_op_act_port_contract(gmm1, tr1)
+    if not in_dt:
+        in_dt, iq, ig, is_dt = "bf16", "dense", (), "none"
+    p_abi2 = getattr(gmm2, "precision_abi", None)
+    out_dt = _norm_abi_dtype(
+        getattr(p_abi2, "output_dtype", "") if (p_abi2 is not None and getattr(p_abi2, "output_dtype", ""))
+        else (tr2.output_dtype or "bf16")
+    )
     use_csrc = (
         soc_arch == "A3"
         and (enable_fused_mc2 == 1 or (enable_fused_mc2 is None and w1_dt in {"int8", "int4"} and w2_dt in {"int8", "int4"}))
@@ -1845,33 +1943,32 @@ def _verify_moe_frame_abi(
     inter_dim = int(gmm1.local_shape[1]) if len(gmm1.local_shape) == MATMUL_SHAPE_RANK else 0
     g2_k = int(gmm2.local_shape[2]) if len(gmm2.local_shape) == MATMUL_SHAPE_RANK else inter_dim
     g2_n = int(gmm2.local_shape[1]) if len(gmm2.local_shape) == MATMUL_SHAPE_RANK else h_dim
-    wq1, wg1, ws1_dt = _quant_contract_for_port(w1_dt, tr1.scale_format, tr1.group_size, is_weight=True)
-    wq2, wg2, ws2_dt = _quant_contract_for_port(w2_dt, tr2.scale_format, tr2.group_size, is_weight=True)
+    top_k = int(meta_disp.get("top_k") or dict(gmm1.metadata).get("top_k") or 0)
+    tk_dim = max(1, top_k)
     if abi_id == "dispatch_ffn_combine":
         base_ops = [
-            _port("x", in_dt, (m_dim, h_dim)),
-            _port("weight1", w1_dt, (h_dim, inter_dim), layout="FRACTAL_NZ", quant_mode=wq1, group_shape=wg1, scale_dtype=ws1_dt),
-            _port("weight2", w2_dt, (g2_k, g2_n), layout="FRACTAL_NZ", quant_mode=wq2, group_shape=wg2, scale_dtype=ws2_dt),
-            _port("expert_idx", "int32", (m_dim, 1), quant_mode="none"),
+            _port("x", in_dt, (m_dim, h_dim), quant_mode=iq, group_shape=ig, scale_dtype=is_dt),
+            _port("weight1", w1_dt, (h_dim, inter_dim), layout=w1_layout, quant_mode=wq1, group_shape=wg1, scale_dtype=ws1_dt),
+            _port("weight2", w2_dt, (g2_k, g2_n), layout=w2_layout, quant_mode=wq2, group_shape=wg2, scale_dtype=ws2_dt),
+            _port("expert_idx", "int32", (m_dim, tk_dim), quant_mode="none"),
             _port("scale1", "fp32", (1,)),
             _port("scale2", "fp32", (1,)),
         ]
         if w1_dt == "int4" or w2_dt == "int4":
             base_ops.extend((_port("bias1", "fp32", (1,)), _port("bias2", "fp32", (1,))))
-        base_ops.append(_port("probs", "fp32", (m_dim, 1)))
+        base_ops.append(_port("probs", "fp32", (m_dim, tk_dim)))
         operands = tuple(base_ops)
         outputs = (_port("out", out_dt, (m_dim, g2_n)), _port("expert_token_nums", "int64", (1,)))
     else:
         operands = (
             _port("context", "int8", _MEGAMOE_CONTEXT_BYTES_SHAPE, quant_mode="none"),
-            _port("x", in_dt, (m_dim, h_dim)),
-            _port("topk_ids", "int32", (m_dim, 1), quant_mode="none"),
-            _port("topk_weights", "fp32", (m_dim, 1)),
-            _port("weight1", w1_dt, (h_dim, inter_dim), layout="FRACTAL_NZ", quant_mode=wq1, group_shape=wg1, scale_dtype=ws1_dt),
-            _port("weight2", w2_dt, (g2_k, g2_n), layout="FRACTAL_NZ", quant_mode=wq2, group_shape=wg2, scale_dtype=ws2_dt),
+            _port("x", in_dt, (m_dim, h_dim), quant_mode=iq, group_shape=ig, scale_dtype=is_dt),
+            _port("topk_ids", "int32", (m_dim, tk_dim), quant_mode="none"),
+            _port("topk_weights", "fp32", (m_dim, tk_dim)),
+            _port("weight1", w1_dt, (h_dim, inter_dim), layout=w1_layout, quant_mode=wq1, group_shape=wg1, scale_dtype=ws1_dt),
+            _port("weight2", w2_dt, (g2_k, g2_n), layout=w2_layout, quant_mode=wq2, group_shape=wg2, scale_dtype=ws2_dt),
         )
         outputs = (_port("y", out_dt, (m_dim, g2_n)), _port("expert_token_nums", "int64", (1,)))
-    top_k = int(meta_disp.get("top_k") or dict(gmm1.metadata).get("top_k") or 0)
     shared = int(meta_disp.get("shared_experts_per_rank") or 0)
     comm_dt_raw = str(meta_disp.get("comm_dtype") or dispatch_op.dtype or "").strip()
     comm_dt = _norm_abi_dtype(comm_dt_raw) if comm_dt_raw else in_dt
@@ -2370,6 +2467,51 @@ def _discover_law1_and_law4_chains(
     return found, triggers
 
 
+def _law1_quant_output_ports(
+    quant_op: OpSpec,
+    tr_q: OpTraitInfo,
+    m_dim: int,
+    n_dim: int,
+    *,
+    y_name: str,
+    scale_name: str,
+) -> tuple[OperandPortSig, OperandPortSig]:
+    p_abi = getattr(quant_op, "precision_abi", None)
+    meta = dict(quant_op.metadata) if quant_op.metadata else {}
+    is_mx_op = tr_q.symbolic_op_kind == "dynamic_mx_quant"
+    raw_out = (
+        getattr(p_abi, "output_dtype", "") if (p_abi is not None and getattr(p_abi, "output_dtype", ""))
+        else (meta.get("output_dtype") or meta.get("quant_dtype") or tr_q.output_dtype or "")
+    )
+    out_dt = _norm_abi_dtype(str(raw_out)) if raw_out else ("fp8_e4m3fn" if is_mx_op else "int8")
+    if is_mx_op and out_dt not in _MX_DTYPES:
+        out_dt = "fp8_e4m3fn"
+    raw_sf = str(
+        (getattr(p_abi, "act_scale_dtype", "") if p_abi is not None else "")
+        or meta.get("scale_dtype")
+        or meta.get("quant_scale_dtype")
+        or tr_q.scale_format
+        or ""
+    ).strip().lower()
+    abi_gs = int(getattr(p_abi, "act_group_size", 0) or 0) if p_abi is not None else 0
+    raw_gs_val = meta.get("quant_group_size", meta.get("group_size"))
+    raw_gs = (
+        abi_gs if abi_gs > 0
+        else (int(raw_gs_val) if isinstance(raw_gs_val, int) and not isinstance(raw_gs_val, bool) and raw_gs_val > 0 else tr_q.group_size)
+    )
+    q_mode, g_shape, s_dt = _quant_contract_for_port(out_dt, raw_sf, raw_gs, is_weight=False)
+    if s_dt == "none":
+        s_dt = "fp8_e8m0" if (out_dt in _MX_DTYPES or is_mx_op) else "fp32"
+    out_m = int(quant_op.local_shape[0]) if quant_op.local_shape else m_dim
+    out_n = int(quant_op.local_shape[-1]) if len(quant_op.local_shape) >= 2 else n_dim
+    grp = g_shape[0] if g_shape else (int(raw_gs) if raw_gs and int(raw_gs) > 1 else 0)
+    scale_cols = max(1, (out_n + grp - 1) // grp) if (grp > 1 and (out_dt in _MX_DTYPES or is_mx_op)) else 1
+    return (
+        _port(y_name, out_dt, (out_m, out_n), quant_mode=q_mode, group_shape=g_shape, scale_dtype=s_dt),
+        _port(scale_name, s_dt, (out_m, scale_cols)),
+    )
+
+
 def _classify_ub_chain_abi(
     chain: Sequence[OpSpec],
     traits: Mapping[str, OpTraitInfo],
@@ -2383,7 +2525,6 @@ def _classify_ub_chain_abi(
     registry: ProbedAbiRegistry | None = None,
 ) -> tuple[str, FusionTier, bool, str, AbiSupportVerdict | None, str, RegionBackendTarget]:
     """Classify a Law 1 UB chain strictly against ``ProbedAbiRegistry`` (zero fake defaults)."""
-    syms = [traits[op.op_id].symbolic_op_kind for op in chain]
     first, last = chain[0], chain[-1]
     in_dt = _norm_abi_dtype(traits[first.op_id].input_dtype)
     m_dim = int(first.local_shape[0]) if first.local_shape else 1
@@ -2404,13 +2545,16 @@ def _classify_ub_chain_abi(
             "terminal_sink_fusion_requires_custom_k2", None, "", "tilelang",
         )
 
-    mat_syms = tuple(
-        traits[op.op_id].symbolic_op_kind for op in chain
+    material = [
+        op for op in chain
         if not (
             traits[op.op_id].trait == AlgebraicTrait.VIEW_METADATA
             and str(op.family or "").strip().lower() in _ZERO_COPY_VIEW_FAMILIES
         )
-    )
+    ]
+    mat_syms = tuple(traits[op.op_id].symbolic_op_kind for op in material)
+    term_op = material[-1] if material else last
+    term_tr = traits[term_op.op_id]
     if mat_syms in {
         ("add", "rmsnorm", "dynamic_quant"),
         ("add_rmsnorm", "dynamic_quant"),
@@ -2425,11 +2569,13 @@ def _classify_ub_chain_abi(
                 _port("x2", in_dt, (m_dim, n_dim)),
                 _port("gamma", in_dt, (n_dim,)),
             )
-            outputs = (
-                (_port("y", "fp8_e4m3fn", (m_dim, n_dim)), _port("x_out", in_dt, (m_dim, n_dim)), _port("scale", "fp8_e8m0", (m_dim, 1)))
-                if is_mx else
-                (_port("y1", "int8", (m_dim, n_dim)), _port("y2", in_dt, (m_dim, n_dim)), _port("scale", "fp32", (m_dim, 1)))
+            y_port, sc_port = _law1_quant_output_ports(
+                term_op, term_tr, m_dim, n_dim,
+                y_name="y" if is_mx else "y1",
+                scale_name="scale",
             )
+            x_out = _port("x_out" if is_mx else "y2", in_dt, (m_dim, n_dim))
+            outputs = (y_port, x_out, sc_port)
             verdict, q_digest = _verify_abi_query(
                 abi_id=abi_id, soc_arch=soc_arch, sku_id=sku_id, graph_motif="add_rmsnorm_quant",
                 operands=operands, outputs=outputs, pr_track=pr_track, track_spec=track_spec,
@@ -2445,10 +2591,13 @@ def _classify_ub_chain_abi(
     if mat_syms in {("situ", "dynamic_quant"), ("situ", "dynamic_mx_quant")}:
         abi_id = "aclnnDequantSituQuant"
         if soc_arch is not None:
+            y_port, sc_port = _law1_quant_output_ports(
+                term_op, term_tr, m_dim, n_dim, y_name="y", scale_name="y_scale",
+            )
             verdict, q_digest = _verify_abi_query(
                 abi_id=abi_id, soc_arch=soc_arch, sku_id=sku_id, graph_motif="situ_quant",
                 operands=(_port("x", in_dt, (m_dim, n_dim)),),
-                outputs=(_port("y", "int8", (m_dim, n_dim)), _port("y_scale", "fp32", (m_dim, 1))),
+                outputs=(y_port, sc_port),
                 pr_track=pr_track, track_spec=track_spec, manifest_bindings=manifest_bindings,
                 enabled_stack_passes=enabled_stack_passes, registry=registry,
                 model_scope=_resolve_model_scope(chain), activation_kind="situglu", is_act_and_mul=True,
@@ -2462,10 +2611,13 @@ def _classify_ub_chain_abi(
     if mat_syms in {("swiglu", "dynamic_quant"), ("swiglu", "dynamic_mx_quant")}:
         abi_id = "aclnnSwiGluQuant"
         if soc_arch is not None:
+            y_port, sc_port = _law1_quant_output_ports(
+                term_op, term_tr, m_dim, n_dim, y_name="y", scale_name="scale",
+            )
             verdict, q_digest = _verify_abi_query(
                 abi_id=abi_id, soc_arch=soc_arch, sku_id=sku_id, graph_motif="swiglu_quant",
                 operands=(_port("x", in_dt, (m_dim, n_dim)),),
-                outputs=(_port("y", "int8", (m_dim, n_dim)), _port("scale", "fp32", (m_dim, 1))),
+                outputs=(y_port, sc_port),
                 pr_track=pr_track, track_spec=track_spec, manifest_bindings=manifest_bindings,
                 enabled_stack_passes=enabled_stack_passes, registry=registry,
                 model_scope=_resolve_model_scope(chain), activation_kind="swiglu", is_act_and_mul=True,

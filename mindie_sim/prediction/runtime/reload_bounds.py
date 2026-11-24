@@ -217,13 +217,17 @@ def compute_compulsory_hbm_cut(
         raise ValueError("sector size must be positive")
     reads: dict[tuple[int, str, int], _SectorSet] = defaultdict(_SectorSet)
     writes: dict[tuple[int, str, int], _SectorSet] = defaultdict(_SectorSet)
+    produced: set[tuple[int, str, int]] = set()
     for summary in summaries:
         for item in summary.read_obligations:
-            if item.initial_residency == "hbm_cold" and item.tensor_version == 0:
-                reads[item.die, item.allocation_id, item.tensor_version].add(item, sector_bytes)
+            key = (item.die, item.allocation_id, item.tensor_version)
+            if item.initial_residency == "hbm_cold" and key not in produced:
+                reads[key].add(item, sector_bytes)
         for item in summary.write_obligations:
+            key = (item.die, item.allocation_id, item.tensor_version)
+            produced.add(key)
             if item.required_final_visibility in {"device", "host"}:
-                writes[item.die, item.allocation_id, item.tensor_version].add(item, sector_bytes)
+                writes[key].add(item, sector_bytes)
 
     totals: dict[int, CompulsoryHbmCut] = {}
     for (die, _, _), sectors in reads.items():
