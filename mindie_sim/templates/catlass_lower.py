@@ -220,10 +220,60 @@ class _MatrixLowerer:
         return self.plan.access(kwargs.pop("name"), kwargs.pop("allocation", tensor), width * rows, runs=(run,), **kwargs)
 
     def _fill(self, name, tile, k_start, k_len, operand, after, ring, generation):
-        del name, tile, k_start, k_len, operand, after, ring, generation
-        raise NotImplementedError(
-            "LEGACY_PURGED: validate spec/problem dtype parity before lowering in _MatrixLowerer._fill"
+        p, s, core = self.p, self.spec, tile.owner
+        for field_name in ("dtype_a", "dtype_b", "dtype_c", "dtype_acc"):
+            if dtype_name(getattr(s, field_name)) != dtype_name(getattr(p, field_name)):
+                raise ModelingError(f"catlass_spec_problem_{field_name}_mismatch")
+        if bool(s.has_bias) != bool(p.has_bias):
+            raise ModelingError("catlass_spec_problem_bias_mismatch")
+        a = operand == "a"
+        tensor, dtype, row, col, rows, cols, width = (
+            (p.a_id, p.dtype_a, tile.row, k_start, tile.m, k_len, p.k) if a else
+            (p.b_id, p.dtype_b, k_start, tile.col, k_len, tile.n, p.n)
         )
+        allocation = tensor if a or not p.groups else f"{tensor}:expert:{tile.group}"
+        cache_bypass = not a and (s.l2_cache_hint_b == "disable" or (
+            s.scheduler == "grouped_slice_m" and ceil_div(tile.group_rows, self.tm) == 1
+        ))
+        location = (allocation, row, col, rows, cols)
+        lane = (core, operand)
+        slot = self.l1_generations[lane] % ring.depth
+        self.l1_generations[lane] += 1
+        previous = self.resident.get((*lane, slot))
+        credit = ring_credit(ring, generation)
+        deps = (*after, credit)
+        elide = previous is not None and should_elide_l1_reload(
+            previous[0], previous[1:], location[0], location[1:], s.enable_l1_resident,
+        )
+        if elide:
+            return deps
+        self.resident[*lane, slot] = location
+        if a and s.dispatch_policy == GATHER_SCATTER_FULL_LOAD_A:
+            vector = self._aiv(tile, direct=True)
+            indices = self._index_read(f"{name}:gather", tile, deps, vector)
+            aiv_gather = p.k <= GATHER_SCATTER_AIV_MAX_K
+            stride = packed_bytes(k_len, dtype)
+            read = self.plan.access(
+                f"{name}:gm_a", tensor, tile.m * stride, after=(indices,),
+                owner=vector if aiv_gather else core, pipe="mte2_aiv" if aiv_gather else "mte2_aic",
+                runs=tuple(AddressRun(i * stride, 1, stride, stride) for i in self._physical_rows(tile)),
+            )
+            if aiv_gather:
+                read = self.plan.work(f"{name}:gather_to_l1", "mte3", tile.m * stride, after=(read,), owner=vector)
+            return (read,)
+        if not a and s.prologue_b == "DecompressFp4ToFp8":
+            deps = self._expand_b(name, tile, row, rows, allocation, deps, cache_bypass)
+        else:
+            deps = (self._rect(
+                tensor, dtype, row, col, rows, cols, width,
+                name=f"{name}:gm_{operand}", allocation=allocation, owner=core, pipe="mte2_aic",
+                after=deps, bypass=cache_bypass,
+            ),)
+        scale = _scale(s, rows * cols, l1=True)
+        if scale:
+            deps = (self.plan.access(f"{name}:scale_{operand}", f"{allocation}:scale", scale, owner=core,
+                                     pipe="mte2_aic", after=deps, bypass=cache_bypass),)
+        return deps
 
     def _expand_b(self, name, tile, row, rows, allocation, after, bypass):
         plan, spec = self.plan, self.spec
@@ -629,9 +679,30 @@ _PURE_LOWER_CACHE: dict[object, object] = {}
 
 
 def _datapath_cache_key(datapath) -> object:
-    del datapath
-    raise NotImplementedError(
-        "LEGACY_PURGED: include full stars_spec / launch latency fields in _datapath_cache_key"
+    arch = getattr(datapath, "compute_arch", None)
+    stars = getattr(datapath, "stars_spec", None)
+    stars_key = (
+        getattr(stars, "queue_scope", None),
+        getattr(stars, "queue_depth", None),
+        getattr(stars, "lanes", None),
+        getattr(stars, "issue_interval_us", None),
+        getattr(stars, "first_issue_us", None),
+        getattr(stars, "release_policy", None),
+    ) if stars is not None else None
+    return (
+        getattr(arch, "arch_id", None),
+        getattr(datapath, "aic_count", 0),
+        getattr(datapath, "aiv_count", 0),
+        getattr(datapath, "buffers", ()),
+        getattr(datapath, "compute_peaks", ()),
+        getattr(datapath, "memory_access", None),
+        getattr(datapath, "hbm_read_bytes_per_s", None),
+        getattr(datapath, "hbm_write_bytes_per_s", None),
+        getattr(datapath, "hbm_rw_alpha", None),
+        getattr(datapath, "simt_ub_carveout_bytes", 0),
+        getattr(datapath, "has_l0c_to_ub", False),
+        getattr(datapath, "aic_aiv_pairs", ()),
+        stars_key,
     )
 
 

@@ -38,9 +38,13 @@ from mindie_sim.prediction.runtime.tile_solver import TilePipelineSpec
 from mindie_sim.schema.case import Case
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.operators import OpSpec
+from mindie_sim.templates.contracts import FormulaKernelSpec
+from mindie_sim.templates.fuse_region import FusedPipelineRecipe, solve_formula_sram
 
 from ._oracle_prefetch import bind_prefetch_ops, bind_prefetch_streams, primitive_table_digest_token
 from .apply import AppliedPlan, DEFAULT_STACK_ID, ResolvedScenario, _solve_tiles, apply_plan, resolve_scenario
+from .catalog_replay import _replay_ops, catalog_recipe_id, replay_catalog_binding
+from .dual_cert import build_dual_inputs_from_scenario, solve_dual_lower_bound
 from .schema import (
     FuseRegion, PipelineTiles, QuantizeContract, RewritePlan, SelectTemplate, WeightPrefetch, _digest_default,
     _json_digest, _references, empty_plan, plan_sha256,
@@ -281,10 +285,19 @@ def _check_budget(budget, deadline):
     if budget.cancelled is not None and budget.cancelled():
         raise TimeoutError("rewrite_oracle_cancelled")
 def _report(case, graphs, context, book, replay, *, deadline=None, fast=False, trace_limit=0, streams=(), cut=False):
-    del case, graphs, context, book, replay, deadline, fast, trace_limit, streams, cut
-    raise NotImplementedError(
-        "LEGACY_PURGED: wire canonical rewrite/catalog_replay.py (zero optimization imports)"
-    )
+    external = {dep: 0.0 for ops in graphs.values()
+                for dep in _external_dependencies(ops) if cut or dep == "analysis_input"}
+    token = ACTIVE_DEADLINE_MONO.set(deadline)
+    try:
+        return graph_costs(
+            case, {rank: _replay_ops(ops) for rank, ops in graphs.items()},
+            recipes=book, external_inputs=external, evaluation=context,
+            isolated=replay.isolated and not cut, include_submission=replay.include_submission,
+            trace_limit=max(trace_limit, replay.event_limit) if not fast else 0,
+            fast_span_only=fast, stream_plans=streams or None,
+        )
+    finally:
+        ACTIVE_DEADLINE_MONO.reset(token)
 def _cut_layer_key(graph, book, streams, need_eval):
     ranks = []
     for rank, ops in sorted(graph.items()):
@@ -525,26 +538,139 @@ def _bind_collective_op(op, replica, binding, topology, registered):
 
 
 def _bind_formula_fused_recipe(scenario, atomic_entry, op, applied):
-    """Build a white-box L0-pipe formula fused recipe from absorbed atomic ops."""
-    del scenario, atomic_entry, op, applied
-    raise NotImplementedError(
-        "LEGACY_PURGED: wire templates.contracts + prediction.runtime.ub_admission (zero optimization imports)"
+    """Build a white-box L0-pipe ``FusedPipelineRecipe`` from absorbed atomic ops."""
+    by_id = {atom.op_id: atom for atom in atomic_entry.ops}
+    absorbed_ids = dict(applied.absorbed_atoms).get(op.op_id, ())
+    absorbed_ops = tuple(by_id[oid] for oid in absorbed_ids if oid in by_id) or (op,)
+    formula = FormulaKernelSpec.from_ops(absorbed_ops, name=op.recipe or op.op_id)
+    datapath = scenario.datapath
+    if datapath is None:
+        raise ModelingError(f"MULTI_POOL_CAPACITY:{op.op_id}:ub_datapath_missing")
+    _, algo, _, ub_pk, ub_cap, l1_pk, l1_cap, l0_pk, l0_cap, solved_depth, sram_ok = (
+        solve_formula_sram(formula, datapath)
+    )
+    if not sram_ok:
+        raise ModelingError(
+            f"MULTI_POOL_CAPACITY:{op.op_id}:{algo}:ub={ub_pk}>{ub_cap}"
+            f":l1={l1_pk}/{l1_cap}:l0={l0_pk}/{l0_cap}"
+        )
+    depth = max(1, int(solved_depth))
+    return FusedPipelineRecipe(
+        slots=depth,
+        row_reduction=formula.row_reduction,
+        abi_signature_id=formula.resolved_abi_signature(),
+        binding_state="unbound_formula_projection",
+        pipe_stages=formula.pipe_stages,
     )
 
 
 def _resolve_fused_binding(scenario, atomic_entry, op, applied, book, catalog, handle, registered, *, allow_unbound_formula):
     """Enforce 3-tier resolution: UserProfile > Extension/RecipeBook > FormulaKernelSpec."""
-    del scenario, atomic_entry, op, applied, book, catalog, handle, registered, allow_unbound_formula
-    raise NotImplementedError(
-        "LEGACY_PURGED: wire templates.contracts + ProbedAbiRegistry (zero optimization imports)"
+    boundaries = next(
+        edit.operation.kernel_boundaries for edit in applied.plan.edits
+        if op.op_id == f"rewrite:{edit.edit_id}"
     )
+    has_measured_store = isinstance(handle.evaluation_context.cost.primitives, PrimitiveStore)
+    if len(boundaries) == 1 and (catalog or op.recipe in book.recipes):
+        state = "bound_measured" if (has_measured_store and op.recipe in book.recipes) else "bound_implementation"
+        return op, state, False
+    if (
+        len(boundaries) == 1
+        and op.recipe == "gemm"
+        and dict(op.metadata).get("law2_block_gemm") is True
+        and op.flops > 0
+    ):
+        selected = book.select(replace(op, family="gemm", recipe="gemm"))
+        if not isinstance(selected, FusedPipelineRecipe):
+            identifier = f"rewrite_law2_gemm:{atomic_entry.replica}:{op.op_id}"
+            registered[identifier] = selected
+            state = "bound_measured" if has_measured_store else "bound_implementation"
+            return replace(op, recipe=identifier), state, False
+    if len(boundaries) != 1 or not allow_unbound_formula:
+        raise ModelingError(f"rewrite_fusion_recipe_unbound:{op.op_id}:{op.recipe}")
+    identifier = f"rewrite_formula:{atomic_entry.replica}:{op.op_id}:{op.recipe}"
+    registered[identifier] = _bind_formula_fused_recipe(scenario, atomic_entry, op, applied)
+    return replace(op, recipe=identifier), "unbound_formula_projection", True
 
 
 def _bind_replay(scenario, applied, book, handle, *, allow_unbound_formula: bool = False):
     """Bind the selected executable recipes and collect catalog audit summaries."""
-    del scenario, applied, book, handle, allow_unbound_formula
-    raise NotImplementedError(
-        "LEGACY_PURGED: wire canonical rewrite/catalog_replay.py & replica-scoped prefetch (zero optimization imports)"
+    templates = {binding.target_op: binding for binding in applied.template_bindings}
+    atomic = {entry.replica: entry for entry in scenario.atomic_ops}
+    summaries, unbound_ops, binding_states = [], [], []
+    tiles = {binding.target_op: binding for binding in applied.tile_bindings}
+    streams = {stream.rank: stream for stream in applied.streams}
+    registered, graphs = {}, {}
+    topology = handle.evaluation_context.bindings.topology
+    collective = {binding.target_op: binding for binding in applied.collective_rewrites}
+    for entry in applied.executable:
+        bound = []
+        ops, book = (_device_counts(entry.ops, applied.elided_d2h_ops, book,
+                                    scenario.atomic_step.case, handle._replay.include_submission)
+                     if applied.elided_d2h_ops else (entry.ops, book))
+        for op in ops:
+            template = templates.get(op.op_id)
+            catalog = replay_catalog_binding(scenario, atomic[entry.replica], op, template,
+                                             applied, streams.get(entry.replica))
+            if catalog:
+                identifier = catalog_recipe_id(entry.replica, op, template, catalog[1])
+                registered[identifier], summary = catalog
+                summaries.append(summary)
+                op = replace(op, recipe=identifier)
+            elif template:
+                is_law2_gemm_tpl = (
+                    template.template_id == "gemm"
+                    and op.family == "rewrite_fused"
+                    and dict(op.metadata).get("law2_block_gemm") is True
+                )
+                if template.template_id not in book.recipes and not is_law2_gemm_tpl:
+                    raise ModelingError(f"rewrite_template_recipe_unbound:{op.op_id}:{template.template_id}")
+                op = replace(op, recipe=template.template_id)
+            if (col_binding := collective.get(op.op_id)) is not None:
+                op = _bind_collective_op(op, entry.replica, col_binding, topology, registered)
+            if op.family == "rewrite_fused":
+                op, state, is_unbound = _resolve_fused_binding(
+                    scenario, atomic[entry.replica], op, applied, book, catalog, handle, registered,
+                    allow_unbound_formula=allow_unbound_formula,
+                )
+                binding_states.append((op.op_id, state))
+                if is_unbound:
+                    unbound_ops.append(op.op_id)
+            binding = tiles.get(op.op_id)
+            tile = binding.tile_spec if binding else None
+            if binding is None:
+                bound.append(op)
+                continue
+            recipe = registered.get(op.recipe) or book.select(op)
+            if isinstance(tile, TilePipelineSpec):
+                shape, _ = _solve_tiles(scenario, entry.replica, op, tile, streams.get(entry.replica))
+                matrix = recipe.matrix if isinstance(recipe, ExpectedGroupedMatmul) else recipe
+                if not all(hasattr(matrix, name) for name in ("tile_m", "tile_n", "tile_k", "slots")):
+                    raise ModelingError(f"rewrite_tile_recipe_unbound:{op.op_id}")
+                m, n, k = shape.tile_shape.m, shape.tile_shape.n, shape.tile_shape.k
+                matrix = replace(matrix, tile_m=m, tile_n=n, tile_k=k, slots=shape.depth)
+                recipe = replace(recipe, matrix=matrix) if isinstance(recipe, ExpectedGroupedMatmul) else matrix
+            if binding.cohort_split == "dbo_2cohort":
+                meta = dict(op.metadata)
+                if (not isinstance(recipe, ExpectedGroupedMatmul) or len(op.local_shape) != GROUPED_MATRIX_RANK
+                        or op.local_shape[0] < 2 or meta.get("expert_rows") or meta.get("rows_by_expert")):
+                    raise ModelingError(f"rewrite_dbo_recipe_unbound:{op.op_id}")
+                recipe = _DboGrouped(recipe, _cohort_moments(scenario.atomic_step.case, op, meta))
+            identifier = f"rewrite_tile:{entry.replica}:{op.op_id}"
+            # Register the base matrix; selection will apply its grouped adapter once.
+            registered[identifier] = recipe.matrix if isinstance(recipe, ExpectedGroupedMatmul) else recipe
+            bound.append(replace(op, recipe=identifier))
+        graphs[entry.replica] = tuple(bound)
+    for identifier, recipe in registered.items():
+        book = register_recipe(book, identifier, recipe)
+    if applied.prefetch_leases:
+        for replica, ops in graphs.items():
+            graphs[replica], book = bind_prefetch_ops(scenario.atomic_step.case, replica, ops, book,
+                                                      applied.prefetch_leases, handle._prefetch_hardware)
+    bound_streams = bind_prefetch_streams(graphs, applied.streams, applied.prefetch_leases)
+    return (
+        graphs, book, tuple(summaries), bound_streams,
+        tuple(dict.fromkeys(unbound_ops)), tuple(dict.fromkeys(binding_states)),
     )
 def _cut_plans(graphs, streams):
     plans = []
@@ -734,9 +860,26 @@ def finalize_plan(
                        else "should_achieve", resolved.atomic_step if not plan.edits else None)
     wall = round(step.span_ms * NS_PER_MS)
     if dual_certificate is None and dual_program is None and event_dag is None:
-        raise NotImplementedError(
-            "LEGACY_PURGED: wire canonical rewrite/dual_cert.py (zero optimization imports)"
+        cacheable = (
+            not applied.plan.edits
+            and not summaries
+            and primitive_table is None
+            and rate_mode == "engine_ceiling"
         )
+        cached = scenario._certificate.get(resolved.base_graph_sha256) if cacheable else None
+        if cached is None:
+            dual_program, event_dag, _ = build_dual_inputs_from_scenario(
+                resolved, applied=applied, region_summaries=summaries,
+                primitive_table=primitive_table, rate_mode=rate_mode,
+            )
+            dual_certificate, _ = solve_dual_lower_bound(dual_program, event_dag)
+            if cacheable:
+                with scenario._cache_lock:
+                    scenario._certificate[resolved.base_graph_sha256] = (
+                        dual_program, event_dag, dual_certificate,
+                    )
+        else:
+            dual_program, event_dag, dual_certificate = cached
     _check_budget(budget, deadline)
     verification = verify_plan(resolved, applied, step_eval=step, wall_ns=wall,
                                dual_certificate=dual_certificate, dual_program=dual_program,

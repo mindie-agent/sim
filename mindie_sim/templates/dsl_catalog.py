@@ -16,32 +16,56 @@ from mindie_sim.schema.common import ModelingError
 
 from .catlass_catalog import dtype_name, unmodeled
 from .contracts import (
-    ATTN_RES_UB_BYTES, BF16_BYTES, DIRECT_MATRIX_ARCH_IDS, FP32_BYTES, KDA_HEAD_DIM, KDA_STATE_HALF,
-    DslKernelSpec, TemplateSourceRef, attn_res_tiling, attn_res_ub_footprint, ceil_div, commit_replay_bytes, commit_rows, flash_kda_rounds,
+    ATTN_RES_BF16_ALIGN, ATTN_RES_UB_BYTES, BF16_BYTES, DIRECT_MATRIX_ARCH_IDS, FP32_BYTES, KDA_HEAD_DIM,
+    KDA_STATE_HALF, DslKernelSpec, TemplateSourceRef, attn_res_tiling, attn_res_ub_footprint, ceil_div,
+    commit_replay_bytes, commit_rows, flash_kda_rounds,
 )
 from .fuse_region import solve_template_tile
 
-_DSL_SOURCE_REFS_PURGED_MSG = (
-    "LEGACY_PURGED: rebuild independently verified TileLang/AscendC SourceRef table"
+DSL_REPOSITORY = "Ascend/ops-transformer (tilelang-0.1.15)"
+DSL_REVISION = "2d3f4f6db0231ac2e9e487cf62e94f6e173eb946"
+DSL_SOURCE_REFS = (
+    TemplateSourceRef(
+        DSL_REPOSITORY, DSL_REVISION, "attention/flash_kda/op_dsl/arch35/flash_kda_metadata.py",
+        "78daefe5a42d384557ef3f78ff4716b583edb7b6189e308fa9a78750b5e54572", "_select_template_on_host", (561, 660),
+    ),
+    TemplateSourceRef(
+        DSL_REPOSITORY, DSL_REVISION, "attention/flash_kda/op_dsl/arch35/flash_kda_metadata.py",
+        "78daefe5a42d384557ef3f78ff4716b583edb7b6189e308fa9a78750b5e54572", "_DT_ROUTE_PARAMETERS", (1538, 1562),
+    ),
+    TemplateSourceRef(
+        DSL_REPOSITORY, DSL_REVISION, "attention/flash_kda/op_dsl/arch35/flash_kda_persistent.py",
+        "20ca2cb501778657240dce4fbaeb2a72ee2cc7dfab56008b619a572f4eb0c313", "CHUNK_SIZE", (82, 160),
+    ),
+    TemplateSourceRef(
+        DSL_REPOSITORY, DSL_REVISION, "attention/flash_kda/op_dsl/arch35/flash_kda_staged.py",
+        "6d700560384b670fa08acb71642e6c147b7252a61a7ac1d02aa875254f4fa54f", "_L2_CACHE_DISABLE", (68, 130),
+    ),
+    TemplateSourceRef(
+        DSL_REPOSITORY, DSL_REVISION, "experimental/attention/mega_recurrent_kda/op_dsl/arch35/mega_recurrent_kda_backend.py",
+        "ed6987f093cb6cd3ad529bd85ab7f3a583495a428d76a9e62ff15618cb8da5c4", "RecurrentKDAStage", (553, 720),
+    ),
+    TemplateSourceRef(
+        DSL_REPOSITORY, DSL_REVISION, "attention/recurrent_kda/op_host/op_api/aclnn_recurrent_kda.cpp",
+        "7a1b6b43921ed6f7b4c0c760ad2a865aac739ec90a2d820be18b7830de5077c7", "aclnnRecurrentKdaGetWorkspaceSize", (503, 590),
+    ),
+    TemplateSourceRef(
+        DSL_REPOSITORY, DSL_REVISION, "attention/mla_prolog_v3/examples/arch35/test_aclnn_mla_prolog_v4_weight_nz_fqkvq.cpp",
+        "eacd138b302594199e390ea59a9c7a7898233d113ddfae9d009b10e66059f71a", "aclnnMlaPrologV4WeightNz", (380, 440),
+    ),
+    TemplateSourceRef(
+        DSL_REPOSITORY, DSL_REVISION, "attention/block_attn_res_update/op_api/aclnn_block_attn_res_update.cpp",
+        "1ae707c1a16982aee33ca756c2d83b888c1387ae426fa39e46daa51cbd774826", "aclnnBlockAttnResUpdateGetWorkspaceSize", (36, 120),
+    ),
+    TemplateSourceRef(
+        DSL_REPOSITORY, DSL_REVISION, "attention/quant_sparse_lightning_indexer/op_dsl/quant_sparse_lightning_indexer.py",
+        "2e1500889ac1ec292d1cba0c3f3c8ca876f52d346152a127df1f5289212e60f0", "QsliCube", (1005, 1110),
+    ),
+    TemplateSourceRef(
+        DSL_REPOSITORY, DSL_REVISION, "attention/mixed_quant_sparse_flash_mla/op_api/aclnn_mixed_quant_sparse_flash_mla.cpp",
+        "25299f4b4f35b01f007962d49eb3821fd7c184fd2a2564f78c7261f88261725a", "aclnnMixedQuantSparseFlashMlaGetWorkspaceSize", (43, 85),
+    ),
 )
-
-
-class _PurgedDslSourceRefs:
-    def __iter__(self):
-        raise NotImplementedError(_DSL_SOURCE_REFS_PURGED_MSG)
-
-    def __len__(self) -> int:
-        raise NotImplementedError(_DSL_SOURCE_REFS_PURGED_MSG)
-
-    def __getitem__(self, item):
-        del item
-        raise NotImplementedError(_DSL_SOURCE_REFS_PURGED_MSG)
-
-    def __bool__(self) -> bool:
-        raise NotImplementedError(_DSL_SOURCE_REFS_PURGED_MSG)
-
-
-DSL_SOURCE_REFS = _PurgedDslSourceRefs()
 FLASH_KDA = "dsl.flash_kda"
 MEGA_KDA = "dsl.mega_recurrent_kda"
 COMMIT_KDA = "dsl.commit_recurrent_kda"
@@ -49,6 +73,12 @@ MLA_PROLOG = "dsl.mla_prolog_v4"
 ATTN_RES = "dsl.block_attn_res_update_rms_norm"
 QSLI = "dsl.quant_sparse_lightning_indexer"
 MQSMLA = "dsl.mixed_quant_sparse_flash_mla"
+_FLASH_SOURCE_COUNT = 4
+_DSL_SOURCES = dict(zip(
+    (FLASH_KDA, MEGA_KDA, COMMIT_KDA, MLA_PROLOG, ATTN_RES, QSLI, MQSMLA),
+    (DSL_SOURCE_REFS[:_FLASH_SOURCE_COUNT], *(DSL_SOURCE_REFS[i:i + 1] for i in range(_FLASH_SOURCE_COUNT, len(DSL_SOURCE_REFS)))),
+    strict=True,
+))
 DSL_KERNEL_IDS = (FLASH_KDA, MEGA_KDA, COMMIT_KDA, MLA_PROLOG, ATTN_RES, QSLI, MQSMLA)
 INT32_BYTES = 4
 KDA_CHUNK = 64
@@ -78,6 +108,25 @@ _ROUTE_SCHEMA = 13
 _ROUTE_SCHEMAS = {6, 7}
 _INT64_MAX = (1 << 63) - 1
 _MAX_SCALED_QUANTITY = _INT64_MAX // ROUTE_COST_SCALE
+_ARCH35_BASE_ROUTE_PARAMETERS = (
+    0, 2711857704, 699286307, 16555661144, 28359460, 94263834, 94263834, 12013349865,
+    1045656019, 84358156, 12842477, 2527878117, 181898838, 6, 8441, 0,
+    0, 692059912, 851406583, 21510815509, 73490570, 81791118, 166178779, 12029971961,
+    2552246171, 459139222, 45086212, 2303638937, 143977434, 6, 18992, 0,
+)
+_ARCH35_HIGH_BW_ROUTE_PARAMETERS = (
+    4135271144, 193981546, 366448654, 12881511041, 29417161, 4351059785, 158980371, 10652650460,
+    3206978745, 332321804, 0, 419242242, 29945874, 7, 0, 0,
+    20317858430, 1160598799, 1018161115, 1015361233, 14389959, 933231823, 115749683, 11499084207,
+    4373896639, 413928806, 41555011, 0, 0, 7, 0, 0,
+)
+_FLASH_ROUTE_PROFILES: Mapping[str, tuple[int, ...]] = {
+    "arch35_high_bw": _ARCH35_HIGH_BW_ROUTE_PARAMETERS,
+    "arch35_base": _ARCH35_BASE_ROUTE_PARAMETERS,
+}
+_HIGH_BW_HBM_THRESHOLD_BPS = 2_500_000_000_000.0
+_ARCH35_BASE_SKU_TAGS = frozenset({"ascend950pr", "ascend950pr_9579", "arch35_base"})
+_ARCH35_HIGH_BW_SKU_TAGS = frozenset({"ascend950dt", "ascend950dt_9582", "ascend950dt_9589", "arch35_high_bw"})
 MLA_COLUMN_TILE = 96
 MLA_K_TILE = 128
 MLA_TOKEN_PROFILES = ((1, 1, 1), (8, 2, 8), (16, 9, 16), (32, 17, 32), (64, 33, 64), (128, 65, 128))
@@ -161,6 +210,8 @@ class MegaRecurrentKdaProblem:
     batch: int
     tp: int
     sequence: int
+    num_heads: int
+    hidden_size: int
     unfused_launches: tuple[str, ...] = (
         "input_projection", "causal_conv", "recurrent_kda", "output_gate", "output_projection",
     )
@@ -283,7 +334,7 @@ def dsl_problem(kernel_id, problem):
     return name, normalized
 
 
-def flash_kda_lane_tasks(p, spec):
+def flash_kda_lane_tasks(p, spec, *, datapath=None):
     chunks = tuple(ceil_div(length, KDA_CHUNK) for length in p.lengths)
     if spec.template_variant == "persistent":
         loads = [0] * spec.aic_budget
@@ -293,7 +344,7 @@ def flash_kda_lane_tasks(p, spec):
                 loads[owner] += chunks[batch]
                 yield tuple((batch, head, chunk, owner, 0) for chunk in range(chunks[batch]))
         return
-    _, group = flash_kda_schedule(p, spec.aic_budget)
+    _, group = flash_kda_schedule(p, spec.aic_budget, datapath=datapath)
     consumed = [0] * len(chunks)
     for first, batch_counts in flash_kda_rounds(chunks, p.value_heads, p.workspace_slots, group):
         tasks = []
@@ -306,14 +357,37 @@ def flash_kda_lane_tasks(p, spec):
         yield tuple(tasks)
 
 
-def flash_kda_schedule(problem: FlashKdaProblem, core_count: int) -> tuple[str, int]:
+def flash_kda_schedule(problem: FlashKdaProblem, core_count: int, *, datapath=None) -> tuple[str, int]:
     p = problem
     return resolve_flash_kda_route(
         p.lengths, p.value_heads, core_count, requested_template=p.requested_template,
         device_name=p.device_name, route_coefficients=p.route_coefficients, layout_kind=p.layout_kind,
         workspace_slots=p.workspace_slots, max_chunk_group=p.max_chunk_group, metadata_word_capacity=p.metadata_word_capacity,
         has_cu=p.has_cu, calibration_enabled=p.calibration_enabled, enable_grad=p.enable_grad, query_heads=p.query_heads,
+        datapath=datapath,
     )
+
+
+def _select_flash_route_parameters(*, datapath=None, route_profile: str | None = None, device_name: str = "") -> tuple[int, ...]:
+    if route_profile is not None:
+        if route_profile not in _FLASH_ROUTE_PROFILES:
+            raise ModelingError(f"flash_kda_route_profile_unknown:{route_profile}")
+        return _FLASH_ROUTE_PROFILES[route_profile]
+    if datapath is not None:
+        if datapath.arch_id not in DIRECT_MATRIX_ARCH_IDS:
+            raise unmodeled(FLASH_KDA, "flash_kda_requires_arch35")
+        hbm_r = float(getattr(datapath, "hbm_read_bytes_per_s", 0.0) or 0.0)
+        if 0.0 < hbm_r < _HIGH_BW_HBM_THRESHOLD_BPS:
+            return _ARCH35_BASE_ROUTE_PARAMETERS
+        return _ARCH35_HIGH_BW_ROUTE_PARAMETERS
+    if device_name:
+        tok = device_name.strip().lower()
+        if tok in _ARCH35_BASE_SKU_TAGS:
+            return _ARCH35_BASE_ROUTE_PARAMETERS
+        if tok in _ARCH35_HIGH_BW_SKU_TAGS:
+            return _ARCH35_HIGH_BW_ROUTE_PARAMETERS
+        return _ARCH35_BASE_ROUTE_PARAMETERS
+    return _ARCH35_HIGH_BW_ROUTE_PARAMETERS
 
 
 def resolve_flash_kda_route(
@@ -322,21 +396,105 @@ def resolve_flash_kda_route(
     layout_kind: int = 0, workspace_slots: int = KDA_DEFAULT_WORKSPACE_SLOTS, max_chunk_group: int | None = None,
     metadata_word_capacity: int | None = None, has_cu: bool = False, calibration_enabled: bool = True,
     enable_grad: bool = False, query_heads: int | None = None,
+    datapath=None, route_profile: str | None = None,
 ) -> tuple[str, int]:
     """Replay the pinned launcher and host route comparison in integer units."""
-    del lengths, value_heads, core_count, requested_template, device_name, route_coefficients
-    del layout_kind, workspace_slots, max_chunk_group, metadata_word_capacity
-    del has_cu, calibration_enabled, enable_grad, query_heads
-    raise NotImplementedError(
-        "LEGACY_PURGED: dispatch flash_kda route via structured ComputeArch capability (zero device-name string check or silent 'staged' fallback)"
+    if (
+        not lengths or min(lengths) < 1 or not 1 <= value_heads <= KDA_MAX_VALUE_HEADS
+        or not 1 <= core_count <= KDA_AIC_CORE_LIMIT or layout_kind not in {0, 1}
+        or workspace_slots < value_heads
+    ):
+        raise ModelingError("flash_kda_workspace_or_layout_invalid")
+    if query_heads is None:
+        query_heads = value_heads
+    if query_heads < 1:
+        raise ModelingError("flash_kda_workspace_or_layout_invalid")
+    if max_chunk_group is None:
+        short_training = (
+            enable_grad and layout_kind == 0 and not has_cu and len(lengths) == 1
+            and query_heads == value_heads == core_count == KDA_AIC_CORE_LIMIT
+            and lengths[0] >= KDA_SHORT_TRAIN_MIN_LENGTH and lengths[0] % KDA_CHUNK == 0
+        )
+        max_chunk_group = KDA_SHORT_TRAIN_GROUP if short_training else KDA_MAX_CHUNK_GROUP
+    if not 1 <= max_chunk_group <= KDA_MAX_CHUNK_GROUP:
+        raise ModelingError("flash_kda_workspace_or_layout_invalid")
+    if requested_template in {"persistent", "staged"}:
+        return requested_template, max_chunk_group
+    if requested_template != "auto":
+        raise ModelingError("flash_kda_requested_template_invalid")
+    if not calibration_enabled:
+        return "staged", max_chunk_group
+    chunks = tuple(ceil_div(length, KDA_CHUNK) for length in lengths)
+    if (
+        layout_kind == 1 and core_count == KDA_AIC_CORE_LIMIT
+        and len(chunks) == 1 and KDA_AIC_CORE_LIMIT < value_heads
+        and chunks[0] in KDA_CALIBRATED_CHUNK_RANGE
+    ):
+        max_chunk_group = min(max_chunk_group, KDA_CALIBRATED_GROUP_LIMIT)
+    if has_cu and len(chunks) > 1 and max(chunks) <= 2:
+        return "persistent", max_chunk_group
+    params = tuple(route_coefficients) if route_coefficients else _select_flash_route_parameters(
+        datapath=datapath, route_profile=route_profile, device_name=device_name,
     )
+    start = layout_kind * _ROUTE_PARAMS_STRIDE
+    if len(params) == _ROUTE_PARAMS_STRIDE and layout_kind == 0:
+        selected_coeffs = params
+    elif len(params) >= start + _ROUTE_PARAMS_STRIDE:
+        selected_coeffs = params[start:start + _ROUTE_PARAMS_STRIDE]
+    else:
+        raise ModelingError("flash_kda_route_coefficients_invalid")
+    route = _flash_route(
+        lengths, chunks, value_heads, query_heads, core_count, workspace_slots,
+        max_chunk_group, metadata_word_capacity, selected_coeffs,
+    )
+    return route, max_chunk_group
 
 
 def _flash_route(lengths, chunks, heads, q_heads, cores, slots, max_group, metadata_capacity, coefficients):
-    del lengths, chunks, heads, q_heads, cores, slots, max_group, metadata_capacity, coefficients
-    raise NotImplementedError(
-        "LEGACY_PURGED: remove silent 'staged' fallbacks in _flash_route and use structured ComputeArch route parameters"
+    if len(coefficients) != _ROUTE_PARAMS_STRIDE:
+        raise ModelingError("flash_kda_route_coefficients_invalid")
+    (s0, s_parallel, s_peak, s_round, s_query, s_compute, s_mem, p0, p_peak, p_heads,
+     p_query, p_compute, p_mem, schema, margin, _) = coefficients
+    if schema not in _ROUTE_SCHEMAS or not 0 <= margin < PARTS_PER_MILLION or min(coefficients[:_ROUTE_SCHEMA]) < 0:
+        raise ModelingError("flash_kda_route_coefficients_invalid")
+    cyc, lpt, core_rows = [0] * cores, [0] * cores, [0] * cores
+    head_count = heads * len(chunks)
+    min_metadata = KDA_HEADER_WORDS + KDA_AIC_CORE_LIMIT + KDA_CHUNK_TASK_WORDS * head_count + len(chunks)
+    if metadata_capacity is not None and min_metadata > metadata_capacity:
+        return "staged"
+    query_rows, total_rows = q_heads * sum(lengths), heads * sum(lengths)
+    parallel = ceil_div(heads * sum(chunks), cores)
+    if max(query_rows, total_rows) > _INT64_MAX or parallel > _MAX_SCALED_QUANTITY:
+        raise ModelingError("flash_kda_route_cost_overflow")
+    for batch, count in enumerate(chunks):
+        for head in range(heads):
+            cyc[(batch * heads + head) % cores] += count
+    for batch in sorted(range(len(chunks)), key=lambda index: (-chunks[index], index)):
+        for _ in range(heads):
+            owner = min(range(cores), key=lpt.__getitem__)
+            lpt[owner] += chunks[batch]
+            core_rows[owner] += lengths[batch]
+    staged_peak, persistent_peak = max(cyc), max(lpt)
+    rounds = sum(1 for _ in flash_kda_rounds(chunks, heads, slots, max_group))
+    if max(parallel, staged_peak, persistent_peak, rounds, head_count) > _MAX_SCALED_QUANTITY:
+        raise ModelingError("flash_kda_route_cost_overflow")
+    staged = (
+        (s0 + s_parallel * parallel + s_peak * staged_peak + s_round * rounds) * ROUTE_COST_SCALE
+        + s_query * query_rows + max(s_compute * parallel * ROUTE_COST_SCALE, s_mem * total_rows)
     )
+    persistent = (p0 + p_peak * persistent_peak + p_heads * head_count) * ROUTE_COST_SCALE + p_query * query_rows
+    previous = 0
+    for rows in sorted(set(core_rows) - {0}):
+        active = sum(length > previous for length in core_rows)
+        mem = p_mem * active
+        if mem > _INT64_MAX:
+            raise ModelingError("flash_kda_route_cost_overflow")
+        persistent += max(p_compute, mem) * (rows - previous)
+        previous = rows
+    if max(persistent, staged) > _INT64_MAX:
+        raise ModelingError("flash_kda_route_cost_overflow")
+    required_gain = staged * margin // PARTS_PER_MILLION
+    return "persistent" if persistent < staged - required_gain else "staged"
 
 
 def select_flash_kda_template(lengths, core_count, requested_template="auto", cost_coefficients=(), **limits):
@@ -407,7 +565,7 @@ def _buf(name, pool, size, slots=1, *, start=0, end=1, scale=0):
 
 
 def _flash(p, aic, aiv, datapath, variant):
-    route, _ = flash_kda_schedule(p, aic)
+    route, _ = flash_kda_schedule(p, aic, datapath=datapath)
     route = variant or route
     if route not in {"persistent", "staged"}:
         raise ModelingError("flash_kda_variant_invalid")
@@ -441,17 +599,42 @@ def _flash(p, aic, aiv, datapath, variant):
 
 
 def _mega(p, aic, aiv, datapath, variant):
-    del p, aic, aiv, datapath, variant
-    raise NotImplementedError(
-        "LEGACY_PURGED: parameterize mega_recurrent_kda strictly from problem.num_heads and problem.hidden_size (zero hardcoded 96/7168)"
+    if (
+        p.tp not in MEGA_TP_DEGREES or p.sequence not in MEGA_SEQUENCE_LENGTHS
+        or not 1 <= p.batch <= MEGA_MODEL_BATCH_LIMIT
+        or p.num_heads < 1 or p.num_heads % p.tp != 0 or p.hidden_size < 1
+        or aic not in MEGA_AIC_QUOTAS or aiv < 2 * aic
+    ):
+        raise ModelingError("mega_kda_schedule_unsupported")
+    _validate_kda_slots(p, p.batch * p.tp, p.sequence)
+    heads = p.num_heads // p.tp
+    rows = p.batch * p.tp * p.sequence
+    workspace = mega_workspace_sizes(p)
+    buffers = (
+        _buf("state_ring", "ub", KDA_HEAD_DIM * KDA_STATE_HALF * FP32_BYTES, 2),
+        _buf("replay", "ub", KDA_HEAD_DIM * BF16_BYTES, 2),
+        _buf("a_l1", "l1", KDA_HEAD_DIM**2 * BF16_BYTES, 2),
+        _buf("b_l1", "l1", KDA_HEAD_DIM**2 * BF16_BYTES, 2),
+        _buf("l0a", "l0a", KDA_HEAD_DIM**2 * BF16_BYTES),
+        _buf("l0b", "l0b", KDA_HEAD_DIM**2 * BF16_BYTES),
+        _buf("l0c", "l0c", KDA_HEAD_DIM**2 * FP32_BYTES),
     )
+    return (f"tp{p.tp}_s{p.sequence}", (p.sequence, KDA_HEAD_DIM, KDA_HEAD_DIM), buffers,
+            sum(workspace.values()), (), (), rows * heads)
 
 
 def mega_workspace_sizes(p):
-    del p
-    raise NotImplementedError(
-        "LEGACY_PURGED: parameterize mega_workspace_sizes strictly from problem.num_heads (zero hardcoded 96)"
-    )
+    if p.num_heads < 1 or p.num_heads % p.tp != 0:
+        raise ModelingError("mega_kda_geometry_invalid")
+    heads = p.num_heads // p.tp
+    rows = p.batch * p.tp * p.sequence
+    head_bytes = rows * heads * KDA_HEAD_DIM * BF16_BYTES
+    return {
+        **dict.fromkeys(("Q", "K", "V", "decay", "output_gate"), head_bytes),
+        "beta": rows * _aligned(heads, KDA_BETA_TILE) * BF16_BYTES,
+        "fa": rows * KDA_HEAD_DIM * BF16_BYTES,
+        "norm": KDA_HEAD_DIM**2 * FP32_BYTES,
+    }
 
 
 def _commit(p, aic, aiv, datapath, variant):
@@ -478,11 +661,13 @@ def _validate_kda_slots(p, batch, required):
         len(slots) != batch or len(set(slots)) != batch or any(type(i) is not int or i < 0 for i in slots)
     )):
         raise ModelingError("recurrent_kda_paged_state_geometry_invalid")
-    if not isinstance(p, CommitRecurrentKdaProblem):
-        raise NotImplementedError(
-            "LEGACY_PURGED: derive KDA heads from explicit problem.num_heads (zero hardcoded 96)"
-        )
-    replay_pool_strides(p, p.heads, capacity)
+    if isinstance(p, CommitRecurrentKdaProblem):
+        heads = p.heads
+    else:
+        if p.num_heads < 1 or p.num_heads % p.tp != 0:
+            raise ModelingError("mega_kda_geometry_invalid")
+        heads = p.num_heads // p.tp
+    replay_pool_strides(p, heads, capacity)
 
 
 def replay_pool_strides(p, heads, capacity):
@@ -529,10 +714,17 @@ def _mla(p, aic, aiv, datapath, variant):
 
 
 def _attn_res(p, aic, aiv, datapath, variant):
-    del p, aic, aiv, datapath, variant
-    raise NotImplementedError(
-        "LEGACY_PURGED: parameterize _attn_res strictly from problem.hidden_size (zero hardcoded 7168 fingerprint)"
+    if p.hidden_size < 1 or p.hidden_size % ATTN_RES_BF16_ALIGN != 0 or dtype_name(p.dtype) != "bf16":
+        raise ModelingError("attn_res_requires_fixed_bf16_width")
+    if p.tokens < 0:
+        raise ModelingError("attn_res_token_count_negative")
+    if p.tokens == 0:
+        return "inplace", (1, p.hidden_size, 1), (), 0, (), (), 0
+    _, _, rows, depth = attn_res_tiling(
+        p.tokens, aiv, min(ATTN_RES_UB_BYTES, datapath.usable_bytes("ub")), p.hidden_size,
     )
+    buffers = (_buf("query_gamma_tile_and_stats", "ub", attn_res_ub_footprint(p.hidden_size, rows, depth)),)
+    return "inplace", (rows, p.hidden_size, 1), buffers, 0, (), (), p.tokens
 
 
 def qsli_workspace_sizes(p, aic):
@@ -660,7 +852,13 @@ def describe_dsl_kernel(kernel_id, problem, datapath, *, aic_budget=None, aiv_bu
         ceil_div(items, aiv if owner == "aiv" else aic), buffers, owner_axis=owner,
     ), state=memory_view, die=die)
     peaks = {peak.pool: peak.peak_bytes for peak in solution.pool_peaks}
-    raise NotImplementedError(_DSL_SOURCE_REFS_PURGED_MSG)
+    spec = DslKernelSpec(
+        name + "." + selected, "vector_only" if owner == "aiv" else "mix_cube_vector", algo, selected,
+        dims, tuple((b.name, b.pool, b.slots) for b in buffers), routes, cache, workspace,
+        name in {FLASH_KDA, QSLI, MQSMLA}, name == FLASH_KDA and bool(p.eager_d2h_bytes or p.eager_d2h_ms),
+        False, aic, aiv, peaks.get("ub", 0), peaks.get("l1", 0), peaks.get("l0c", 0), _DSL_SOURCES[name],
+    )
+    return spec, solution
 
 
 def enumerate_dsl_specs(kernel_id, problem, datapath, *, all_variants=False, **options):

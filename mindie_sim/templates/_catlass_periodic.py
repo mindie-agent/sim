@@ -321,6 +321,7 @@ class _PeriodicCatlassProgram:
     burst_rules: tuple[Any, ...]
     summary: FusedRegionSummary
     resource_work: tuple[tuple[str, float], ...] = ()
+    initial_state: Any = None
 
     def with_context(self, datapath, context) -> "_PeriodicCatlassProgram":
         """Rebind the compact wave/phase descriptors to ``context`` in O(unique phases)."""
@@ -330,9 +331,14 @@ class _PeriodicCatlassProgram:
             or datapath.memory_access != self.datapath.memory_access
             or probe.burst_rules != self.burst_rules
         ):
-            raise NotImplementedError(
-                "LEGACY_PURGED: forward initial_state / warm memory_view into lower_catlass_periodic on rebind"
-            )
+            from .catlass_lower import solve_catlass_tile
+
+            warm_view = deepcopy(self.initial_state) if self.initial_state is not None else None
+            sol = solve_catlass_tile(self.spec, self.problem, datapath, memory_view=warm_view, die=self.die)
+            return lower_catlass_periodic(
+                self.spec, self.problem, datapath, sol,
+                context=context, memory_view=warm_view, die=self.die, region_id=self.summary.region_id,
+            ).program
         return replace(self, datapath=datapath, context=context, hbm_bus=probe.hbm_bus)
 
     def start(self, engine, name: str, ready, *, owner: str = ""):
@@ -663,6 +669,7 @@ def lower_catlass_periodic(
     """Lower an eligible double-buffered ``dataparallel`` CATLASS matmul into exact periodic waves."""
     from .catlass_lower import _MatrixLowerer, _compute_b, _cube_dtype, _scale
 
+    saved_initial = deepcopy(memory_view) if memory_view is not None else None
     plan = Lowering(datapath, context=context, memory_view=memory_view, die=die, live_admission=False)
     entry_state = deepcopy(plan.state)
     low = _MatrixLowerer(plan, spec, p)
@@ -718,10 +725,10 @@ def lower_catlass_periodic(
         _union_obligations(plan.reads), _union_obligations(plan.writes),
         plan.logical, plan.copied, plan.sectors, plan.service, plan.hits, (), plan.launches,
         plan.metadata_ms, tuple((peak.pool, peak.peak_bytes) for peak in solution.pool_peaks), spec,
-        float(plan.service), plan.misses,
+        float(plan.sectors), plan.misses, float(plan.service),
     )
     program = _PeriodicCatlassProgram(
         spec, p, datapath, context, die, plan.hbm_bus, tuple(compiled_waves), slot_sizes,
-        plan.burst_rules, summary, tuple(sorted(resource_work.items())),
+        plan.burst_rules, summary, tuple(sorted(resource_work.items())), saved_initial,
     )
     return TemplateLoweringResult(program, summary, total_stages)

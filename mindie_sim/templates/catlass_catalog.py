@@ -286,9 +286,11 @@ def validate_catlass_spec(spec: CatlassKernelSpec, p: CatlassProblem, datapath: 
         if (spec.layout_a, spec.layout_b, spec.layout_c) != ("RowMajor",) * _MATRIX_SHAPE_RANK:
             raise ModelingError("catlass_gather_scatter_requires_row_major")
     else:
-        raise NotImplementedError(
-            "LEGACY_PURGED: validate exact dtype_{a,b,c,acc} and has_bias parity between spec and problem for non-indexed CATLASS templates"
-        )
+        for field_name in ("dtype_a", "dtype_b", "dtype_c", "dtype_acc"):
+            if dtype_name(getattr(spec, field_name)) != dtype_name(getattr(p, field_name)):
+                raise ModelingError(f"catlass_spec_problem_{field_name}_mismatch")
+        if bool(spec.has_bias) != bool(p.has_bias):
+            raise ModelingError("catlass_spec_problem_bias_mismatch")
     if spec.dispatch_policy == GATHER_SCATTER_FULL_LOAD_A and (
         name != "catlass.full_load_a_gather_scatter" or spec.simt_thread_block_dim is not None
         or not full_load_a_eligible(p, datapath) or spec.l1_tile_shape[-1] != p.k or not spec.aiv_budget

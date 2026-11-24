@@ -100,6 +100,7 @@ class PrefetchLease:
     window_anchor_op: str
     pool: Literal["l1"]
     max_bytes: int
+    replica: int = 0
 @dataclass(frozen=True, slots=True)
 class TemplateBinding:
     edit_id: str
@@ -527,11 +528,90 @@ def _unabsorbed_splitv_cost(
     siblings: Sequence[OpSpec],
     all_ops: Mapping[str, OpSpec] | None,
 ) -> tuple[float, int]:
-    """Price physical unabsorbed SplitV / DataCopyPad HBM R+W and launch count."""
-    del siblings, all_ops
-    raise NotImplementedError(
-        "LEGACY_PURGED: require accepts_strided_view=True on every consumer before exempting SplitV materialization and fail fast on unknown dtype"
-    )
+    """Price physical unabsorbed SplitV / DataCopyPad HBM R+W and launch count.
+
+    Single-row outputs (``M <= 1``) slice contiguously with zero copy.
+    Multi-row outputs (``M > 1``) require physical contiguous slice
+    materialization (``SplitV`` / ``DataCopyPad``) unless EVERY downstream
+    consumer explicitly declares ``accepts_strided_view=True`` or
+    ``packed_view_compatible=True``. Unknown output dtypes fail fast.
+    """
+    if not all_ops or len(siblings) < 2:
+        return 0.0, 0
+    sib_ids = {op.op_id for op in siblings}
+    m_dim = int(siblings[0].local_shape[0]) if len(siblings[0].local_shape) >= 2 else 0
+    if m_dim <= 1:
+        return 0.0, 0
+    consumers_by_sib: dict[str, set[str]] = {op.op_id: set() for op in siblings}
+    for cand in all_ops.values():
+        if cand.op_id in sib_ids:
+            continue
+        meta = dict(cand.metadata) if cand.metadata else {}
+        if bool(meta.get("accepts_strided_view")) or bool(meta.get("packed_view_compatible")):
+            continue
+        for dep in cand.deps:
+            if dep in consumers_by_sib:
+                consumers_by_sib[dep].add(cand.op_id)
+    total_slice_bytes = 0.0
+    unabsorbed_slices = 0
+    for op in siblings:
+        if not consumers_by_sib[op.op_id]:
+            continue
+        n_dim = int(op.local_shape[1]) if len(op.local_shape) >= 2 else 0
+        meta = dict(op.metadata) if op.metadata else {}
+        out_dt = str(meta.get("output_format") or op.dtype or "").strip()
+        if not out_dt:
+            raise ModelingError(f"rewrite_splitv_dtype_missing:{op.op_id}")
+        elem = float(dtype_bytes(out_dt))
+        total_slice_bytes += float(m_dim * n_dim) * elem
+        unabsorbed_slices += 1
+    if unabsorbed_slices == 0:
+        return 0.0, 0
+    return 2.0 * total_slice_bytes, unabsorbed_slices
+
+
+def has_illegal_cross_precision_merge(ops: Sequence[OpSpec]) -> bool:
+    """Return True if matrix ops mix FLOAT and quantized precisions without explicit cast."""
+    matrix_ops = [op for op in ops if float(op.flops or 0.0) > 0.0 or bool(op.matrix_flops)]
+    if len(matrix_ops) < 2:
+        return False
+    classes: set[str] = set()
+    abis = []
+    for op in matrix_ops:
+        meta = dict(op.metadata) if op.metadata else {}
+        abi = getattr(op, "precision_abi", None)
+        if abi is not None:
+            has_cast = bool(abi.explicit_cast_on_entry or abi.explicit_cast_on_exit)
+            dts = {
+                str(abi.input_dtype).strip().lower(),
+                str(abi.weight_dtype).strip().lower(),
+                str(abi.compute_dtype).strip().lower(),
+            }
+            abis.append(abi)
+        else:
+            has_cast = bool(meta.get("explicit_cast_on_entry") or meta.get("explicit_cast_on_exit"))
+            dts = {
+                str(meta.get(k) or "").strip().lower()
+                for k in ("activation_format", "weight_format", "compute_format")
+                if meta.get(k)
+            }
+            if not dts:
+                raw_dt = str(op.dtype or "").strip().lower()
+                if not raw_dt:
+                    raise ModelingError(f"rewrite_missing_precision_dtype:{op.op_id}")
+                dts.add(raw_dt)
+        if not has_cast:
+            if dts & _QUANT_PRECISION_DTYPES:
+                classes.add("quant")
+            elif dts & _FLOAT_PRECISION_DTYPES:
+                classes.add("float")
+    if "float" in classes and "quant" in classes:
+        return True
+    if len(abis) >= 2:
+        base = abis[0]
+        if any(not base.is_fusion_compatible(other) for other in abis[1:]):
+            return True
+    return False
 
 
 def _has_cross_precision_sibling_gemm(
@@ -918,6 +998,22 @@ class _RankDraft:
             ("gm_round_trip_eliminated_bytes", read + write),
             ("fusion_route", "resident" if read or write else "gm_spill"),
         ]
+        if spec.backend_target is not None:
+            extra_meta.append(("backend_target", spec.backend_target))
+        if spec.abi_query_digest:
+            extra_meta.append(("abi_query_digest", spec.abi_query_digest))
+        if spec.lowering_id:
+            extra_meta.append(("lowering_id", spec.lowering_id))
+        if spec.lowering_sha256:
+            extra_meta.append(("lowering_sha256", spec.lowering_sha256))
+        if spec.ub_peak_bytes > 0:
+            extra_meta.append(("ub_peak_bytes", spec.ub_peak_bytes))
+        if spec.ub_wall_bytes > 0:
+            extra_meta.append(("ub_wall_bytes", spec.ub_wall_bytes))
+        if spec.abi_verdict is not None:
+            extra_meta.append(("abi_verdict_status", spec.abi_verdict.status))
+            extra_meta.append(("abi_verdict_entry_id", spec.abi_verdict.matched_entry_id))
+            extra_meta.append(("abi_verdict_manifest_sha256", spec.abi_verdict.probe_manifest_sha256))
         if splitv_hbm > 0.0:
             extra_meta.append(("splitv_unabsorbed_hbm_bytes", splitv_hbm))
             extra_meta.append(("splitv_launch_count", splitv_launches))
@@ -1102,8 +1198,10 @@ def _prefetch(draft, edit, scenario):
     limit = cap if spec.max_bytes is None else min(cap, spec.max_bytes)
     amount = min(int(weight), int(target.hbm_bytes), limit)
     if amount:
-        draft.leases.append(PrefetchLease(edit.edit_id, target.op_id, spec.target_port.name,
-                                          anchor.op_id, spec.pool, amount))
+        draft.leases.append(PrefetchLease(
+            edit.edit_id, target.op_id, spec.target_port.name,
+            anchor.op_id, spec.pool, amount, replica=draft.replica,
+        ))
         # The replay moves these bytes only when a physical DMA/lease is bound.
         draft.ops[target.op_id] = _annotate(target, weight_prefetch_pool=spec.pool,
                                              weight_prefetch_bytes=amount,

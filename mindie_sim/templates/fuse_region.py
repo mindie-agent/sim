@@ -8,17 +8,22 @@
 """
 from __future__ import annotations
 
-from collections import Counter
+from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from fractions import Fraction
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Literal
 
 from mindie_sim.prediction.mechanism import Work
+from mindie_sim.prediction.physical_recipe_base import (
+    IO_HBM_CATEGORY, Phase, _resource_categories, io_weight, phased_program, tiled_phased_program,
+)
 from mindie_sim.prediction.program.binding import RecipeContext
 from mindie_sim.prediction.program.stages import KernelProgram, Stage
+from mindie_sim.prediction.runtime.engine import Engine
+from mindie_sim.prediction.runtime.engine_types import Resource
 from mindie_sim.prediction.runtime.l2_residency import _access_plan, cache_policy_for_arch, primitive_working_set_sweep
 from mindie_sim.prediction.runtime.memory_physics import (
     AddressRun, AddressRunPlan, AdmissionMemoryView, BoundAccess, BurstTurnRule, ByteLedger,
@@ -27,25 +32,32 @@ from mindie_sim.prediction.runtime.memory_physics import (
 )
 from mindie_sim.prediction.runtime.ring_buffer import RingBuffer, lower_generation
 from mindie_sim.prediction.runtime.tile_solver import (
-    AIC_POOLS, LiveBufferSpec, TileCandidate, TilePipelineSpec, TileShape, solve,
+    AIC_POOLS, LiveBufferSpec, TileCandidate, TileInfeasibleError, TilePipelineSpec, TileShape, solve,
 )
+from mindie_sim.primitives.loader import resolve_dispatch_envelope, resolve_sim_rate_overlay
 from mindie_sim.primitives.tilelang import (
     TILELANG_DMA_STAGE_DOUBLE,
     TILELANG_OPS_PER_GOP,
     TileLangCalibration,
     load_tilelang_calibration,
+    try_load_tilelang_calibration,
 )
+from mindie_sim.schema.case import Case
 from mindie_sim.schema.common import ModelingError
-from mindie_sim.schema.datapath import DatapathCapabilitySpec
-from mindie_sim.schema.hardware import NATIVE_WORK_UNITS
+from mindie_sim.schema.datapath import DatapathCapabilitySpec, datapath_for_die, ub_peer_edges_for_rank
+from mindie_sim.schema.hardware import NATIVE_WORK_UNITS, Device, Hardware
+from mindie_sim.schema.operators import OpSpec
 
 from .contracts import (
+    FP32_BYTES,
     TILELANG_BACKENDS,
-    EdgeRouteBinding, FuseRegionSpec, FusedRegionSummary, SemanticWorkItem,
-    TemplateLoweringResult, TensorRangeObligation, TileLangLoweringProfile,
-    _external_reads, _logical_obligation, _obligation_runs,
+    BindingState,
+    EdgeRouteBinding, FormulaKernelEvaluation, FormulaKernelSpec, FuseRegionSpec, FusedRegionSummary,
+    PipeStageSpec, SemanticWorkItem, TemplateLoweringResult, TensorRangeObligation, TileLangLoweringProfile,
+    _derive_pipe_stages_from_equations, _derive_pipe_stages_from_ops, _external_reads,
+    _infer_op_symbolic_kind, _logical_obligation, _obligation_runs,
     _record_produced, _region_order, _run_end, _split_entry_residency, _topological,
-    _union_obligations, ceil_div,
+    _union_obligations, ceil_div, formula_elem_bytes,
 )
 from .fuse_region_live import _BoundTemplateProgram, _LiveAccess, _ReuseLifetimes, _rational_service
 
@@ -507,7 +519,8 @@ class Lowering:
             tuple(sorted(self.vector.items())), _union_obligations(self.reads), _union_obligations(self.writes),
             self.logical, self.copied, self.sectors, self.service, self.hits, tuple(comm), launches,
             self.metadata_ms, tuple((peak.pool, peak.peak_bytes) for peak in solution.pool_peaks), spec,
-            None if self.live_state is not None else float(self.service), self.misses,
+            None if self.live_state is not None else float(self.sectors), self.misses,
+            None if self.live_state is not None else float(self.service),
         )
         program = (
             _BoundTemplateProgram(stages, hbm_bus=self.hbm_bus, live_state=self.live_state,
@@ -984,3 +997,784 @@ def _tile_address_run(run, tile, tiles):
         yield AddressRun(run.base_byte + first * stride, last - first, width, stride)
     if tail:
         yield AddressRun(run.base_byte + last * stride, 1, tail, tail)
+
+
+# ---------------------------------------------------------------------------
+# White-Box Formula Pipeline Lowering, Dual-Tier SRAM Admission & Evaluation
+# ---------------------------------------------------------------------------
+
+_MS_PER_SECOND = 1000.0
+_US_PER_MS = 1000.0
+_US_PER_SECOND = 1_000_000.0
+_HALF_SPLIT_RATIO = 0.5
+_HBM_RW_ASYMMETRY_RATIO = 1.5
+_UB_DOUBLE_BUFFER_SLOTS = 2
+_FORMULA_TILE_CAP = 64
+_CUBE_TILE_MN_ELEMS = 128
+_CUBE_TILE_K_ELEMS = 64
+_FORMULA_VEC_OPS_PER_ELEM = 4.0
+_FORMULA_MIN_ROW_WORK_BYTES = 2
+_PEAK_DTYPE_ALIASES: Mapping[str, str] = {
+    "bfloat16": "bf16",
+    "float16": "fp16",
+    "float32": "fp32",
+    "fp8_e4m3fn": "fp8",
+    "fp8_e4m3": "fp8",
+    "fp8_e5m2": "fp8",
+    "fp4_e2m1": "fp4",
+}
+
+
+@dataclass(frozen=True, slots=True)
+class FusedPipelineRecipe:
+    """White-box L0-pipe recipe executing composed kernels directly on ``Engine``."""
+
+    slots: int = _UB_DOUBLE_BUFFER_SLOTS
+    tile_cap: int = _FORMULA_TILE_CAP
+    row_reduction: bool = False
+    tile_count: int = 0
+    abi_signature_id: str = ""
+    binding_state: BindingState = "unbound_formula_projection"
+    traffic_rewrite_capable: bool = True
+    pipe_stages: tuple[PipeStageSpec, ...] = ()
+
+    def bind_context(self, context: RecipeContext) -> RecipeContext:
+        """Bind calibrated L0 HBM R:W asymmetry rates when supplied by ``PrimitiveTable``."""
+        op = context.op
+        hbm_bytes = float(getattr(op, "hbm_bytes", 0.0) or 0.0)
+        read_bytes = float(getattr(op, "mte2_bytes", 0.0) or 0.0)
+        write_bytes = float(getattr(op, "mte3_bytes", 0.0) or 0.0)
+        if hbm_bytes <= 0.0 or "hbm" not in context.resource_names:
+            return context
+        hbm_read = max(0.0, hbm_bytes - write_bytes)
+        hbm_write = min(hbm_bytes, write_bytes)
+        if hbm_read <= 0.0 or hbm_write > _HBM_RW_ASYMMETRY_RATIO * hbm_read:
+            dram_rate = context.service_rate("hbm_write_dram") or context.service_rate("mte2_aiv_dram")
+        elif hbm_write <= 0.0:
+            dram_rate = context.service_rate("mte2_aiv_dram")
+        elif read_bytes > _HBM_RW_ASYMMETRY_RATIO * write_bytes:
+            dram_rate = context.service_rate("hbm_rw21_dram") or context.service_rate("mte2_aiv_dram")
+        else:
+            dram_rate = (
+                context.service_rate("hbm_rw11_dram")
+                or context.service_rate("hbm_rw21_dram")
+                or context.service_rate("mte2_aiv_dram")
+            )
+        if dram_rate is None or dram_rate <= 0.0:
+            return context
+        hbm_peak = float(context.rates[context.resource_names["hbm"]]) * _MS_PER_SECOND
+        updated_modes = dict(context.service_modes)
+        updated_modes["hbm"] = ("hbm", min(dram_rate, hbm_peak))
+        return replace(context, service_modes=updated_modes)
+
+    def _lower_dag_pipe_stages(
+        self, categories: set[str], has_load: bool,
+    ) -> tuple[list[Phase], tuple[str, ...]]:
+        """Emit compute/communication ``Phase`` DAG preserving true operand-DAG order."""
+        active_kinds: set[str] = set()
+        if categories & {"cube", "mte1"}:
+            active_kinds.add("cube")
+        if "vector" in categories:
+            active_kinds.add("vector")
+        if "link" in categories:
+            active_kinds.add("link")
+        if not active_kinds:
+            return [], ("mte2_load",) if has_load else ()
+
+        raw_stages: list[PipeStageSpec] = list(self.pipe_stages)
+        if not raw_stages:
+            prev_name: tuple[str, ...] = ()
+            if "cube" in active_kinds:
+                raw_stages.append(PipeStageSpec("cube_mma", "cube", 1.0, prev_name))
+                prev_name = ("cube_mma",)
+            if "vector" in active_kinds:
+                raw_stages.append(PipeStageSpec("aiv_fp32", "vector", 1.0, prev_name, self.row_reduction))
+                prev_name = ("aiv_fp32",)
+            if "link" in active_kinds:
+                raw_stages.append(PipeStageSpec("link_pipe", "link", 1.0, prev_name))
+
+        active_names = {st.name for st in raw_stages if st.pipe_kind in active_kinds}
+        eff_preds: dict[str, tuple[str, ...]] = {}
+        for st in raw_stages:
+            preds: list[str] = []
+            for p_name in st.after:
+                if p_name in active_names:
+                    preds.append(p_name)
+                elif p_name in eff_preds:
+                    preds.extend(eff_preds[p_name])
+            eff_preds[st.name] = tuple(dict.fromkeys(preds))
+
+        active_stages = [st for st in raw_stages if st.name in active_names]
+        covered_kinds = {st.pipe_kind for st in active_stages}
+        tail_names = tuple(
+            st.name for st in active_stages
+            if not any(st.name in eff_preds[other.name] for other in active_stages)
+        )
+        for kind, default_name in (("cube", "cube_mma"), ("vector", "aiv_fp32"), ("link", "link_pipe")):
+            if kind in active_kinds and kind not in covered_kinds:
+                st_extra = PipeStageSpec(
+                    default_name, kind, 1.0, tail_names,
+                    row_reduction=(self.row_reduction if kind == "vector" else False),
+                )
+                active_stages.append(st_extra)
+                eff_preds[st_extra.name] = tail_names
+                tail_names = (st_extra.name,)
+
+        share_totals: dict[str, float] = defaultdict(float)
+        for st in active_stages:
+            share_totals[st.pipe_kind] += max(0.0, float(st.share))
+
+        phases: list[Phase] = []
+        term_name: dict[str, str] = {}
+        used_as_pred: set[str] = set()
+        for st in active_stages:
+            total = share_totals[st.pipe_kind]
+            norm_share = (max(0.0, float(st.share)) / total) if total > 0.0 else (1.0 / len(active_stages))
+            preds = tuple(dict.fromkeys(term_name[p] for p in eff_preds.get(st.name, ()) if p in term_name))
+            used_as_pred.update(p for p in eff_preds.get(st.name, ()) if p in term_name)
+            if not preds and has_load:
+                preds = ("mte2_load",)
+            if st.pipe_kind == "cube":
+                cube_w = {role: norm_share for role in ("cube", "mte1") if role in categories}
+                phases.append(Phase(st.name, cube_w, after=preds))
+                term_name[st.name] = st.name
+            elif st.pipe_kind == "vector":
+                if st.row_reduction:
+                    r_name = "aiv_reduce" if st.name == "aiv_fp32" else f"{st.name}_reduce"
+                    e_name = "aiv_epilogue" if st.name == "aiv_fp32" else f"{st.name}_epilogue"
+                    phases.append(Phase(r_name, {"vector": norm_share * _HALF_SPLIT_RATIO}, after=preds))
+                    phases.append(Phase(e_name, {"vector": norm_share * _HALF_SPLIT_RATIO}, after=(r_name,)))
+                    term_name[st.name] = e_name
+                else:
+                    phases.append(Phase(st.name, {"vector": norm_share}, after=preds))
+                    term_name[st.name] = st.name
+            elif st.pipe_kind == "link":
+                phases.append(Phase(st.name, {"link": norm_share}, after=preds))
+                term_name[st.name] = st.name
+        sinks = tuple(dict.fromkeys(term_name[st.name] for st in active_stages if st.name not in used_as_pred))
+        return phases, sinks or (("mte2_load",) if has_load else ())
+
+    def lower(self, context: RecipeContext) -> KernelProgram:
+        """Lower declared physical work into a finite multi-pipe tile pipeline."""
+        categories = set(_resource_categories(context).values())
+        if not categories:
+            return KernelProgram((Stage("empty", keep_empty=True),), minimum_ms=context.minimum_ms)
+        read_share = io_weight(context, "hbm_read")
+        write_share = io_weight(context, "hbm_write")
+        if read_share + write_share <= 0.0:
+            read_share = write_share = _HALF_SPLIT_RATIO
+        phases: list[Phase] = []
+        has_load = bool(categories & {"hbm", "mte2"}) and (read_share > 0.0 or "mte2" in categories)
+        has_store = bool(categories & {"hbm", "mte3", "fixpipe"}) and (
+            write_share > 0.0 or bool(categories & {"mte3", "fixpipe"})
+        )
+        if has_load:
+            load_w: dict[str, float] = {}
+            if "hbm" in categories and read_share > 0.0:
+                load_w[IO_HBM_CATEGORY] = read_share if has_store else 1.0
+            if "mte2" in categories:
+                load_w["mte2"] = 1.0
+            phases.append(Phase("mte2_load", load_w))
+        pipe_phases, store_preds = self._lower_dag_pipe_stages(categories, has_load)
+        phases.extend(pipe_phases)
+        if has_store:
+            store_w: dict[str, float] = {}
+            if "hbm" in categories:
+                hbm_w = write_share if has_load else 1.0
+                if hbm_w > 0.0:
+                    store_w[IO_HBM_CATEGORY] = hbm_w
+            if "mte3" in categories:
+                store_w["mte3"] = 1.0
+            if "fixpipe" in categories:
+                store_w["fixpipe"] = 1.0
+            if store_w:
+                phases.append(Phase("mte3_store", store_w, after=store_preds))
+        if not phases:
+            return phased_program(context, ())
+        cap = self.tile_count if self.tile_count > 0 else self.tile_cap
+        return tiled_phased_program(context, tuple(phases), slots=max(1, int(self.slots)), cap=cap)
+
+
+def _die_launch_us(die: Device, datapath: DatapathCapabilitySpec, primitive_table: Any = None) -> tuple[float, float, float]:
+    """Read L0 kernel completion minimums from PrimitiveTable or Device declaration."""
+    inv = dict(getattr(die, "kernel_invocations", ()) or ())
+
+    def _inv_us(key: str) -> float:
+        entry = inv.get(key)
+        if isinstance(entry, Mapping) and entry.get("minimum_ms") is not None:
+            val = float(entry["minimum_ms"]) * _US_PER_MS
+            if val > 0.0:
+                return val
+        launch = float(getattr(die, "launch_us", 0.0) or 0.0)
+        return max(0.0, launch)
+
+    launch_vec = _inv_us("vector")
+    launch_cube = _inv_us("cube")
+    launch_norm = _inv_us("norm") or launch_vec
+    env = resolve_dispatch_envelope(primitive_table, datapath) if primitive_table is not None else None
+    if env is not None:
+        aiv_us = float(env.aiv_full_die_floor_ms) * _US_PER_MS
+        if aiv_us > 0.0:
+            launch_vec = max(launch_vec, aiv_us) if launch_vec > 0.0 else aiv_us
+            launch_norm = max(launch_norm, aiv_us)
+        if launch_cube <= 0.0:
+            launch_cube = float(env.mix_aic_floor_ms(0.0)) * _US_PER_MS
+    return launch_vec, launch_cube, launch_norm
+
+
+def _resolve_die_fabric_rate(
+    rank: int,
+    links: Sequence[Any],
+    *,
+    active_width: int | None,
+    ranks_per_node: int,
+    dies_per_package: int,
+    fallback_rate: float,
+) -> float:
+    """Resolve effective per-die link bytes/s strictly from declared ``Hardware.links``."""
+    candidates: list[float] = []
+    for lnk in links:
+        members = tuple(getattr(lnk, "members", ()) or ())
+        if members and rank not in members:
+            continue
+        cap_bpms = float(getattr(lnk, "capacity_bytes_per_ms", 0.0) or 0.0)
+        if cap_bpms <= 0.0:
+            continue
+        sem = str(getattr(lnk, "semantics", "") or "").lower()
+        bw_bps = cap_bpms * _MS_PER_SECOND
+        if sem == "shared" and len(members) > 1:
+            bw_bps /= float(len(members))
+        elif sem == "per_pair" and active_width is not None and active_width > 1:
+            bw_bps *= float(min(active_width - 1, max(1, len(members) - 1)))
+        candidates.append(bw_bps)
+    del ranks_per_node, dies_per_package
+    return max(candidates) if candidates else fallback_rate
+
+
+def _extract_hardware_supply(
+    hardware: Case | Hardware | Device | DatapathCapabilitySpec,
+    primitive_table: Any = None,
+) -> tuple[DatapathCapabilitySpec, dict[str, float], dict[str, float], dict[str, tuple[str, float]], float, float, float, float]:
+    """Resolve ``(datapath, rates_per_s, peaks, service_modes, launch_vec_us, launch_cube_us, fabric_bps, fabric_lat_us)``."""
+    links: tuple[Any, ...] = ()
+    channels: tuple[Any, ...] = ()
+    die: Device | None = None
+    mac: Hardware | None = None
+    if isinstance(hardware, Case):
+        mac = hardware.machine
+        die = mac.dies[0]
+        links = tuple(mac.links)
+        channels = tuple(mac.transfer_channels)
+    elif isinstance(hardware, Hardware):
+        mac = hardware
+        die = mac.dies[0]
+        links = tuple(mac.links)
+        channels = tuple(mac.transfer_channels)
+    elif isinstance(hardware, Device):
+        die = hardware
+    elif isinstance(hardware, DatapathCapabilitySpec):
+        datapath = hardware
+    else:
+        raise ModelingError(f"formula_kernel_unsupported_hardware:{type(hardware).__name__}")
+
+    if die is not None:
+        ub_edges = ub_peer_edges_for_rank(die.rank, links, channels)
+        datapath = datapath_for_die(die, ub_peer_edges=ub_edges)
+        rates = dict(die.rates)
+        peaks = dict(die.compute_peaks)
+        service_modes = dict(die.service_modes)
+        launch_vec, launch_cube, _ = _die_launch_us(die, datapath, primitive_table)
+    else:
+        rates = {}
+        hbm_rate = max(float(datapath.hbm_read_bytes_per_s or 0.0), float(datapath.hbm_write_bytes_per_s or 0.0))
+        if hbm_rate > 0.0:
+            rates["hbm"] = hbm_rate
+            rates["mte2"] = hbm_rate
+            rates["mte3"] = hbm_rate
+        peaks = dict(datapath.compute_peaks)
+        service_modes = {}
+        stars = datapath.stars
+        base_launch = float(stars.issue_interval_us) if stars is not None else 0.0
+        launch_vec = launch_cube = base_launch
+
+    orig_hbm_cap = float(rates.get("hbm") or 0.0)
+    if primitive_table is not None:
+        sku = getattr(die, "sku", "") if die is not None else ""
+        overlay = resolve_sim_rate_overlay(primitive_table, datapath, sku=sku)
+        for role, val in overlay.rates:
+            if val > 0.0:
+                rates[role] = min(val, rates[role]) if rates.get(role, 0.0) > 0.0 else val
+        for dt, pk in overlay.compute_peaks:
+            if pk > 0.0:
+                peaks[dt] = pk
+        dp_updates: dict[str, Any] = {}
+        if overlay.hbm_read_bytes_per_s is not None:
+            hbm_r_ov = float(overlay.hbm_read_bytes_per_s)
+            dp_updates["hbm_read_bytes_per_s"] = min(hbm_r_ov, orig_hbm_cap) if orig_hbm_cap > 0.0 else hbm_r_ov
+            service_modes["mte2_aiv_dram"] = ("mte2_aiv" if "mte2_aiv" in rates else "mte2", hbm_r_ov)
+        if overlay.hbm_write_bytes_per_s is not None:
+            hbm_w_ov = float(overlay.hbm_write_bytes_per_s)
+            dp_updates["hbm_write_bytes_per_s"] = min(hbm_w_ov, orig_hbm_cap) if orig_hbm_cap > 0.0 else hbm_w_ov
+            service_modes["hbm_write_dram"] = ("hbm", hbm_w_ov)
+        if overlay.hbm_rw_alpha is not None:
+            dp_updates["hbm_rw_alpha"] = float(overlay.hbm_rw_alpha)
+        if dp_updates:
+            datapath = replace(datapath, **dp_updates)
+        if overlay.hbm_rw11_bytes_per_s is not None:
+            service_modes["hbm_rw11_dram"] = ("hbm", overlay.hbm_rw11_bytes_per_s)
+        if overlay.hbm_rw21_bytes_per_s is not None:
+            service_modes["hbm_rw21_dram"] = ("hbm", overlay.hbm_rw21_bytes_per_s)
+    if orig_hbm_cap > 0.0:
+        cap_updates: dict[str, Any] = {}
+        if float(datapath.hbm_read_bytes_per_s or 0.0) > orig_hbm_cap:
+            cap_updates["hbm_read_bytes_per_s"] = orig_hbm_cap
+        if float(datapath.hbm_write_bytes_per_s or 0.0) > orig_hbm_cap:
+            cap_updates["hbm_write_bytes_per_s"] = orig_hbm_cap
+        if cap_updates:
+            datapath = replace(datapath, **cap_updates)
+
+    fabric_rate = float(rates.get("link") or 0.0)
+    fabric_lat_us = 0.0
+    if links:
+        active_w = max(1, int(hardware.runtime.parallel.tp)) if isinstance(hardware, Case) else None
+        fabric_rate = _resolve_die_fabric_rate(
+            int(die.rank) if die is not None else 0,
+            links,
+            active_width=active_w,
+            ranks_per_node=int(getattr(mac, "ranks_per_node", 0) or 0),
+            dies_per_package=int(getattr(mac, "dies_per_package", 1) or 1),
+            fallback_rate=fabric_rate,
+        )
+        fabric_lat_us = min((float(getattr(lnk, "latency_us", 0.0) or 0.0) for lnk in links), default=0.0)
+    return datapath, rates, peaks, service_modes, launch_vec, launch_cube, fabric_rate, fabric_lat_us
+
+
+def _formula_row_sram_bytes(spec: FormulaKernelSpec) -> tuple[bool, bool, int, int, int, int]:
+    """Compute ``(has_cube, has_aiv, tile_n, row_fp32_bytes, l1_tile, l0_tile)`` for ``spec``."""
+    has_cube = any(fl > 0.0 for _, fl in spec.matrix_flops)
+    infos = tuple(_infer_op_symbolic_kind(op) for op in spec.atomic_ops)
+    has_row_red = bool(spec.row_reduction) or any(info[2] for info in infos)
+    has_aiv = (
+        any(not info[1] for info in infos)
+        or spec.vector_ops_fp32 > 0.0
+        or has_row_red
+        or not has_cube
+    )
+    all_shapes = [t.shape for t in (*spec.inputs, *spec.outputs) if t.shape]
+    in_b = max((formula_elem_bytes(t.dtype) for t in spec.inputs), default=0.0)
+    out_b = max((formula_elem_bytes(t.dtype) for t in spec.outputs), default=0.0)
+    internal_red_widths: list[int] = []
+    internal_aiv_widths: list[int] = []
+    internal_row_bytes: list[int] = []
+    for op, (_kind, is_mat, is_red, _act, _params) in zip(spec.atomic_ops, infos):
+        meta = dict(op.metadata) if op.metadata else {}
+        in_dt = str(meta.get("activation_format") or meta.get("input_dtype") or op.dtype)
+        out_dt = str(meta.get("output_format") or meta.get("output_dtype") or op.dtype)
+        op_in_raw = formula_elem_bytes(in_dt)
+        op_out_raw = formula_elem_bytes(out_dt)
+        in_b = max(in_b, op_in_raw)
+        out_b = max(out_b, op_out_raw)
+        if is_mat or not op.local_shape:
+            continue
+        op_n = int(op.local_shape[-1])
+        if op_n <= 0:
+            continue
+        op_in_b = max(op_in_raw, float(FP32_BYTES))
+        op_out_b = max(op_out_raw, float(FP32_BYTES))
+        if is_red:
+            internal_red_widths.append(op_n)
+            internal_row_bytes.append(int(op_n * (op_in_b + op_out_b + float(FP32_BYTES))))
+        else:
+            internal_aiv_widths.append(op_n)
+            if has_row_red:
+                internal_row_bytes.append(int(op_n * (op_in_b + op_out_b)))
+
+    width_pool = [int(sh[-1]) for sh in all_shapes] + internal_aiv_widths + internal_red_widths
+    inner_dim = max(width_pool, default=_CUBE_TILE_MN_ELEMS)
+    if internal_red_widths:
+        tile_n = max(internal_red_widths)
+    elif has_row_red:
+        tile_n = inner_dim
+    else:
+        tile_n = min(inner_dim, _CUBE_TILE_MN_ELEMS)
+    if has_aiv:
+        base_row_bytes = int(tile_n * (max(in_b, float(FP32_BYTES)) + max(out_b, float(FP32_BYTES))))
+        if has_row_red:
+            base_row_bytes += int(tile_n * FP32_BYTES)
+        row_fp32_bytes = max(base_row_bytes, max(internal_row_bytes, default=0))
+    else:
+        row_fp32_bytes = 0
+    if has_cube:
+        a_bytes = in_b if in_b > 0.0 else formula_elem_bytes(spec.matrix_flops[0][0])
+        b_bytes = out_b if out_b > 0.0 else a_bytes
+        l1_tile = int(_CUBE_TILE_MN_ELEMS * _CUBE_TILE_K_ELEMS * (a_bytes + b_bytes) * _UB_DOUBLE_BUFFER_SLOTS)
+        l0_tile = int(_CUBE_TILE_MN_ELEMS * _CUBE_TILE_MN_ELEMS * FP32_BYTES)
+    else:
+        l1_tile = 0
+        l0_tile = 0
+    return has_cube, has_aiv, tile_n, row_fp32_bytes, l1_tile, l0_tile
+
+
+def solve_formula_sram(
+    spec: FormulaKernelSpec,
+    datapath: DatapathCapabilitySpec,
+    *,
+    cube_budget: int | None = None,
+    vec_budget: int | None = None,
+) -> tuple[TilePipelineSpec | None, str, str, int, int, int, int, int, int, int, bool]:
+    """Solve Ascend ``FP32`` UB/L1/L0 tiling for ``FormulaKernelSpec`` strictly from ``datapath``."""
+    bufs = dict(datapath.buffers)
+    carveout = max(0, int(datapath.simt_ub_carveout_bytes or 0))
+    ub_raw = int(bufs.get("ub", 0) or 0)
+    ub_budget = max(0, ub_raw - carveout)
+    l1_budget = int(bufs.get("l1", 0) or 0)
+    l0_budget = int(bufs.get("l0c", 0) or 0)
+    has_cube, has_aiv, tile_n, row_fp32_bytes, l1_tile, l0_tile = _formula_row_sram_bytes(spec)
+
+    has_simd_ub_headroom = bool(has_aiv and carveout > 0 and ub_raw > ub_budget)
+    cand_modes: tuple[tuple[int, bool], ...] = (
+        ((_UB_DOUBLE_BUFFER_SLOTS, True), (1, True), (1, False))
+        if has_simd_ub_headroom else ((_UB_DOUBLE_BUFFER_SLOTS, False), (1, False))
+    )
+    candidates: list[TileCandidate] = []
+    owner_part = (cube_budget or datapath.aic_count, vec_budget or datapath.aiv_count)
+    for slots, cand_simt in cand_modes:
+        live: list[LiveBufferSpec] = []
+        if has_aiv and row_fp32_bytes > 0:
+            live.append(LiveBufferSpec("ub_fp32_work", "ub", row_fp32_bytes, 0, 1, owner_kind="aiv", slots=slots))
+        if has_cube and l1_tile > 0:
+            live.append(LiveBufferSpec("l1_cube_tile", "l1", l1_tile, 0, 1, owner_kind="aic", slots=1))
+        if has_cube and l0_tile > 0:
+            live.append(LiveBufferSpec("l0c_fp32_accum", "l0c", l0_tile, 0, 1, owner_kind="aic", slots=1))
+        algo: Literal["resident_1pass", "online_reduce"] = (
+            "resident_1pass" if slots == _UB_DOUBLE_BUFFER_SLOTS else "online_reduce"
+        )
+        candidates.append(TileCandidate(
+            algorithm=algo,
+            tile_shape=TileShape(1, max(1, tile_n), _CUBE_TILE_K_ELEMS if has_cube else 1),
+            depth=slots,
+            owner_partition=owner_part,
+            work_items=1,
+            tiles_per_owner=1,
+            buffers=tuple(live),
+            uses_simt=cand_simt,
+            owner_axis="aic" if (has_cube and not has_aiv) else "aiv",
+        ))
+    tile_spec = TilePipelineSpec(spec.family or "formula_kernel", tuple(candidates), simt_ub_carveout_bytes=carveout)
+    hw = SimpleNamespace(
+        datapath=datapath,
+        buffers=bufs,
+        buffer_units={"ub": datapath.aiv_count, "l1": datapath.aic_count, "l0c": datapath.aic_count, "l2": 1},
+        stream_owners=None,
+    )
+    max_ub_budget = ub_raw if has_simd_ub_headroom else ub_budget
+    if has_aiv and ub_raw <= 0:
+        return tile_spec, "unbounded", f"(M=1, N={tile_n}, K=1)", 0, 0, l1_tile, l1_budget, l0_tile, l0_budget, 1, False
+    try:
+        solved = solve(tile_spec, None, hw)
+        peaks = {p.pool: int(p.peak_bytes) for p in solved.pool_peaks}
+        caps = {p.pool: int(p.capacity_bytes) for p in solved.pool_peaks}
+        ub_pk = peaks.get("ub", row_fp32_bytes) if has_aiv else 0
+        eff_ub_budget = caps.get("ub", ub_budget) if has_aiv else ub_budget
+        l1_pk = peaks.get("l1", l1_tile) if has_cube else 0
+        l0_pk = peaks.get("l0c", l0_tile) if has_cube else 0
+        ok = (
+            (not has_aiv or ub_pk <= eff_ub_budget)
+            and (not has_cube or (l1_pk <= l1_budget and l0_pk <= l0_budget))
+        )
+        sh = solved.tile_shape
+        return (
+            tile_spec, solved.algorithm, f"(M={sh.m}, N={sh.n}, K={sh.k})",
+            ub_pk, eff_ub_budget, l1_pk, l1_budget, l0_pk, l0_budget, solved.depth, ok,
+        )
+    except TileInfeasibleError:
+        fail_algo = "ub_infeasible" if (has_aiv and row_fp32_bytes > max_ub_budget) else "sram_infeasible"
+        return (
+            tile_spec, fail_algo, f"(M=1, N={tile_n}, K={_CUBE_TILE_K_ELEMS if has_cube else 1})",
+            row_fp32_bytes, max_ub_budget, l1_tile, l1_budget, l0_tile, l0_budget, 1, False,
+        )
+
+
+def _compute_peak_for_dtype(peaks: Mapping[str, float], dtype: str) -> float:
+    tok = str(dtype or "").strip().lower()
+    if not tok:
+        raise ModelingError("formula_kernel_compute_dtype_missing")
+    canon = _PEAK_DTYPE_ALIASES.get(tok, tok)
+    for key in (tok, canon):
+        val = float(peaks.get(key, 0.0) or 0.0)
+        if val > 0.0:
+            return val
+    raise ModelingError(f"formula_kernel_compute_peak_missing:{dtype}")
+
+
+def _resolve_formula_work_bytes(spec: FormulaKernelSpec) -> tuple[float, float, float, float]:
+    """Return ``(mte2_bytes, mte3_bytes, hbm_bytes, vector_ops_fp32)`` for ``spec``."""
+    in_bytes = sum(t.byte_size for t in (*spec.inputs, *spec.weights) if t.hbm_resident)
+    out_bytes = sum(t.byte_size for t in spec.outputs if t.hbm_resident)
+    mte2 = float(spec.mte2_bytes_override) if spec.mte2_bytes_override is not None else in_bytes
+    mte3 = float(spec.mte3_bytes_override) if spec.mte3_bytes_override is not None else out_bytes
+    hbm = float(spec.hbm_bytes_override) if spec.hbm_bytes_override is not None else (mte2 + mte3)
+    vec_ops = float(spec.vector_ops_fp32)
+    if vec_ops <= 0.0 and not spec.matrix_flops and spec.equations:
+        elems = max((t.num_elements for t in (*spec.inputs, *spec.outputs)), default=0)
+        vec_ops = float(elems) * _FORMULA_VEC_OPS_PER_ELEM * float(len(spec.equations))
+    return max(0.0, mte2), max(0.0, mte3), max(0.0, hbm), max(0.0, vec_ops)
+
+
+def _build_formula_engine_inputs(
+    spec: FormulaKernelSpec,
+    rates: Mapping[str, float],
+    peaks: Mapping[str, float],
+    datapath: DatapathCapabilitySpec,
+    *,
+    mte2: float,
+    mte3: float,
+    hbm: float,
+    vec_ops: float,
+    fabric_rate: float,
+    aic_eff: int,
+    aiv_eff: int,
+) -> tuple[list[Resource], dict[str, str], dict[str, float], dict[str, int], dict[str, float], dict[str, float], dict[str, float], float]:
+    has_cube = any(fl > 0.0 for _, fl in spec.matrix_flops)
+    total_flops = sum(float(fl) for _, fl in spec.matrix_flops if fl > 0.0)
+    aic_scale = float(aic_eff) / float(max(1, datapath.aic_count))
+    aiv_scale = float(aiv_eff) / float(max(1, datapath.aiv_count))
+    cube_ms = 0.0
+    for dt, fl in spec.matrix_flops:
+        if fl <= 0.0:
+            continue
+        pk = _compute_peak_for_dtype(peaks, dt) * aic_scale
+        cube_ms += _MS_PER_SECOND * float(fl) / pk
+
+    fallback_hbm = float(rates.get("hbm") or 0.0)
+    hbm_read_bps = float(getattr(datapath, "hbm_read_bytes_per_s", 0.0) or 0.0) or fallback_hbm
+    hbm_write_bps = float(getattr(datapath, "hbm_write_bytes_per_s", 0.0) or 0.0) or fallback_hbm
+    alpha_rw = max(0.0, min(1.0, float(getattr(datapath, "hbm_rw_alpha", 0.0) or 0.0)))
+    if hbm > 0.0 and hbm_read_bps > 0.0 and hbm_write_bps > 0.0:
+        if mte2 > 0.0 and mte3 > 0.0:
+            r_share = mte2 / (mte2 + mte3)
+            eff_r, eff_w = hbm * r_share, hbm * (1.0 - r_share)
+        elif mte3 > 0.0 and mte2 <= 0.0:
+            eff_r, eff_w = 0.0, hbm
+        else:
+            eff_r, eff_w = hbm, 0.0
+        t_r_s = (eff_r / hbm_read_bps if eff_r > 0.0 else 0.0) + (
+            alpha_rw * eff_w / hbm_write_bps if eff_w > 0.0 else 0.0
+        )
+        t_w_s = (eff_w / hbm_write_bps if eff_w > 0.0 else 0.0) + (
+            alpha_rw * eff_r / hbm_read_bps if eff_r > 0.0 else 0.0
+        )
+        hbm_time_s = max(t_r_s, t_w_s)
+        hbm_rate = (hbm / hbm_time_s) if hbm_time_s > 0.0 else max(hbm_read_bps, hbm_write_bps)
+    else:
+        hbm_rate = max(hbm_read_bps, hbm_write_bps, fallback_hbm)
+    vec_rate = float(rates.get("vector") or 0.0) * aiv_scale
+    mte2_key = "mte2_aic" if (has_cube and "mte2_aic" in rates) else ("mte2_aiv" if "mte2_aiv" in rates else "mte2")
+    mte2_rate = float(rates.get(mte2_key) or hbm_rate or 0.0) * (aic_scale if mte2_key == "mte2_aic" else aiv_scale)
+    mte3_rate = float(rates.get("mte3") or hbm_rate or 0.0) * aiv_scale
+    if hbm > 0.0 and hbm_rate <= 0.0:
+        raise ModelingError("formula_kernel_hbm_rate_missing")
+    if vec_ops > 0.0 and vec_rate <= 0.0:
+        raise ModelingError("formula_kernel_vector_rate_missing")
+    if spec.link_bytes > 0.0 and fabric_rate <= 0.0:
+        raise ModelingError("formula_kernel_link_rate_missing")
+
+    res_list: list[Resource] = [Resource("matrix@0", 1.0, "peak_ms", "fair", aic_eff)]
+    res_names: dict[str, str] = {"cube": "matrix@0"}
+    res_rates: dict[str, float] = {"matrix@0": 1.0}
+    res_units: dict[str, int] = {"cube": aic_eff}
+    work_map: dict[str, float] = {}
+    native_work: dict[str, float] = {}
+    if cube_ms > 0.0:
+        work_map["matrix@0"] = cube_ms
+        native_work["cube"] = total_flops
+    pipe_rows = (
+        ("hbm", "memory@0", hbm_rate, "bytes", 1, hbm),
+        ("mte2", "mte2@0", mte2_rate, "bytes", aic_eff if has_cube else aiv_eff, mte2),
+        ("mte3", "mte3@0", mte3_rate, "bytes", aiv_eff, mte3),
+        ("vector", "vector@0", vec_rate, "ops", aiv_eff, vec_ops),
+        ("link", "link:0", fabric_rate, "bytes", 1, float(spec.link_bytes)),
+    )
+    for role, rname, rate_s, unit, units, amount in pipe_rows:
+        if rate_s <= 0.0 or (role == "link" and amount <= 0.0):
+            continue
+        res_list.append(Resource(rname, rate_s / _MS_PER_SECOND, unit, "fair", units))
+        res_names[role] = rname
+        res_rates[rname] = rate_s / _MS_PER_SECOND
+        res_units[role] = units
+        if amount > 0.0:
+            work_map[rname] = amount
+            native_work[role] = amount
+
+    pipe_times_us = {
+        "cube": cube_ms * _US_PER_MS,
+        "vector": (vec_ops / vec_rate) * _US_PER_SECOND if (vec_ops > 0.0 and vec_rate > 0.0) else 0.0,
+        "hbm": (hbm / hbm_rate) * _US_PER_SECOND if (hbm > 0.0 and hbm_rate > 0.0) else 0.0,
+        "mte2": (mte2 / mte2_rate) * _US_PER_SECOND if (mte2 > 0.0 and mte2_rate > 0.0) else 0.0,
+        "mte3": (mte3 / mte3_rate) * _US_PER_SECOND if (mte3 > 0.0 and mte3_rate > 0.0) else 0.0,
+        "link": (float(spec.link_bytes) / fabric_rate) * _US_PER_SECOND if (spec.link_bytes > 0.0 and fabric_rate > 0.0) else 0.0,
+    }
+    return res_list, res_names, res_rates, res_units, work_map, native_work, pipe_times_us, hbm_rate
+
+
+def evaluate_formula_kernel(
+    spec: FormulaKernelSpec,
+    hardware: Case | Hardware | Device | DatapathCapabilitySpec,
+    *,
+    primitive_table: Any = None,
+    active_aic: int | None = None,
+    active_aiv: int | None = None,
+) -> FormulaKernelEvaluation:
+    """Evaluate a Layer-1 ``FormulaKernelSpec`` through ``TileSolver`` + ``Engine`` L0 pipes."""
+    datapath, rates, peaks, service_modes, launch_vec, launch_cube, fabric_rate, fabric_lat_us = (
+        _extract_hardware_supply(hardware, primitive_table=primitive_table)
+    )
+    (
+        tile_spec, algo, shape_str, ub_pk, ub_cap, l1_pk, l1_cap, l0_pk, l0_cap, depth, sram_ok,
+    ) = solve_formula_sram(spec, datapath, cube_budget=active_aic, vec_budget=active_aiv)
+    mte2, mte3, hbm, vec_ops = _resolve_formula_work_bytes(spec)
+    has_cube = any(fl > 0.0 for _, fl in spec.matrix_flops)
+    total_flops = sum(float(fl) for _, fl in spec.matrix_flops if fl > 0.0)
+    aic_raw = active_aic if active_aic is not None else datapath.aic_count
+    aiv_raw = active_aiv if active_aiv is not None else datapath.aiv_count
+    if aic_raw <= 0 or aiv_raw <= 0:
+        raise ModelingError(f"formula_kernel_invalid_core_counts:aic={aic_raw}:aiv={aiv_raw}")
+    aic_eff = int(aic_raw)
+    aiv_eff = int(aiv_raw)
+    res_list, res_names, res_rates, res_units, work_map, native_work, pipe_times_us, hbm_rate = (
+        _build_formula_engine_inputs(
+            spec, rates, peaks, datapath,
+            mte2=mte2, mte3=mte3, hbm=hbm, vec_ops=vec_ops,
+            fabric_rate=fabric_rate, aic_eff=aic_eff, aiv_eff=aiv_eff,
+        )
+    )
+    launch_us = launch_cube if has_cube else launch_vec
+    setup_ms = (fabric_lat_us / _US_PER_MS) if spec.link_bytes > 0.0 else 0.0
+    op_shape = spec.outputs[0].shape if spec.outputs else (spec.inputs[0].shape if spec.inputs else ())
+    op_dtype = (
+        spec.outputs[0].dtype if spec.outputs
+        else (spec.inputs[0].dtype if spec.inputs else (spec.matrix_flops[0][0] if spec.matrix_flops else ""))
+    )
+    if not op_dtype:
+        raise ModelingError("formula_kernel_dtype_missing")
+    op_stub = OpSpec(
+        op_id=spec.name, family=spec.family, phase="decode", stage=0, layer=0,
+        requests=(), semantic_shape=op_shape, local_shape=op_shape,
+        padded_shape=op_shape, launch_shape=op_shape,
+        dtype=op_dtype,
+        flops=total_flops, matrix_flops=spec.matrix_flops, vector_ops=vec_ops,
+        hbm_bytes=hbm, mte2_bytes=mte2, mte3_bytes=mte3, link_bytes=float(spec.link_bytes),
+    )
+    abi_id = spec.resolved_abi_signature()
+    resolved_stages = spec.pipe_stages
+    if not resolved_stages and spec.atomic_ops:
+        resolved_stages = _derive_pipe_stages_from_ops(spec.atomic_ops)
+    elif not resolved_stages and spec.equations:
+        resolved_stages = _derive_pipe_stages_from_equations(
+            spec.equations,
+            has_cube=has_cube,
+            has_vector=(vec_ops > 0.0),
+            has_link=(spec.link_bytes > 0.0),
+            row_reduction=spec.row_reduction,
+        )
+    recipe = FusedPipelineRecipe(
+        slots=depth,
+        row_reduction=spec.row_reduction,
+        abi_signature_id=abi_id,
+        binding_state="unbound_formula_projection",
+        pipe_stages=resolved_stages,
+    )
+    ctx = RecipeContext(
+        op=op_stub, work=work_map, resource_names=res_names, rates=res_rates,
+        core_count=aic_eff if has_cube else aiv_eff,
+        minimum_ms=launch_us / _US_PER_MS, setup_ms=setup_ms,
+        resource_units=res_units, compute_peaks=peaks, service_modes=service_modes,
+        native_work=native_work, datapath=datapath, primitive_table=primitive_table,
+    )
+    bound_ctx = recipe.bind_context(ctx)
+    if bound_ctx.service_modes.get("hbm") != ctx.service_modes.get("hbm") and "memory@0" in work_map:
+        _, eff_hbm_bps = bound_ctx.service_modes["hbm"]
+        if eff_hbm_bps > 0.0:
+            work_map = {**work_map, "memory@0": hbm * (hbm_rate / eff_hbm_bps)}
+            bound_ctx = replace(bound_ctx, work=work_map)
+
+    dom_pipe, l_star_us = max(pipe_times_us.items(), key=lambda kv: kv[1])
+    if l_star_us <= 0.0:
+        dom_pipe = "launch"
+
+    engine = Engine(res_list, backend="python")
+    ready = engine.submit("ready")
+    done = recipe.lower(bound_ctx).start(engine, spec.name, ready)
+    engine.advance(until=(done,))
+    projected_us = max(float(done.time) * _US_PER_MS, l_star_us)
+    return FormulaKernelEvaluation(
+        name=spec.name, abi_signature_id=abi_id, composed_equations=spec.equations,
+        projected_us=projected_us, l_star_us=l_star_us, tile_spec=tile_spec,
+        ub_peak_bytes=ub_pk, ub_budget_bytes=ub_cap, l1_peak_bytes=l1_pk, l0_peak_bytes=l0_pk,
+        sram_verified=sram_ok, binding_state="unbound_formula_projection",
+        has_unbound_formula_ops=True, dominant_pipe=dom_pipe,
+        hbm_bytes=hbm, mte2_bytes=mte2, mte3_bytes=mte3, launch_us=launch_us,
+        tile_algorithm=algo, tile_shape_str=shape_str,
+        l1_budget_bytes=l1_cap, l0_budget_bytes=l0_cap,
+    )
+
+
+simulate_formula_kernel = evaluate_formula_kernel
+
+
+def resolve_tilelang_dual_tier_bounds(
+    *,
+    datapath: DatapathCapabilitySpec,
+    before_ms: float,
+    l_star_ms: float,
+    tiled_ms: float,
+    ub_live_bytes: int,
+    has_cube: bool,
+    has_aiv: bool,
+    cube_dtype: str = "",
+    vector_ops: float = 0.0,
+    is_vector_or_norm_region: bool = True,
+) -> tuple[float | None, float | None, str | None]:
+    """Compute calibrated TileLang ``T.SimtVF`` quick-win vs ``T.SimdVF / AscendC`` ceiling gains."""
+    cal = try_load_tilelang_calibration(str(datapath.arch_id))
+    if cal is None:
+        return None, None, None
+    simd_target_ms = max(l_star_ms, tiled_ms)
+    ceil_gain_ms = before_ms - l_star_ms
+    simd_gain_ms = min(ceil_gain_ms, before_ms - simd_target_ms)
+    ub_warn = (
+        cal.simt_vs_simd_ub_wall_warning(ub_live_bytes)
+        if (is_vector_or_norm_region or has_aiv) else None
+    )
+    if (is_vector_or_norm_region or has_aiv) and ub_live_bytes > cal.simt_usable_ub_bytes:
+        return min(0.0, simd_gain_ms), simd_gain_ms, ub_warn
+
+    disp_ms = cal.aclgraph_issue_us / _US_PER_MS
+    cube_tl_ms = 0.0
+    if has_cube:
+        if not cube_dtype:
+            raise ModelingError("tilelang_dual_tier_cube_dtype_missing")
+        eta_cube = cal.cube_attainment(
+            cube_dtype, blockscaled=(cube_dtype.strip().lower() == "mxfp8"),
+        )
+        cube_tl_ms = tiled_ms / eta_cube
+    if has_cube and not has_aiv:
+        t_quick_ms = max(simd_target_ms, cube_tl_ms, disp_ms)
+    else:
+        dma_simt_ms = tiled_ms / cal.dma_attainment(uses_simt=True, rw_pattern="rw21")
+        vec_simt_ms = 0.0
+        if vector_ops > 0.0:
+            aiv_count = max(1, int(datapath.aiv_count))
+            simt_ops_per_ms = (
+                float(aiv_count)
+                * cal.vector_ops_per_s_per_aiv(uses_simt=True, op_kind="ub_fma")
+                / _MS_PER_SECOND
+            )
+            vec_simt_ms = float(vector_ops) / simt_ops_per_ms
+        t_quick_ms = max(simd_target_ms, dma_simt_ms, vec_simt_ms, cube_tl_ms, disp_ms)
+    raw_simt_gain = before_ms - t_quick_ms
+    if simd_gain_ms >= 0.0:
+        simt_gain_ms = min(simd_gain_ms, max(0.0, raw_simt_gain))
+    else:
+        simt_gain_ms = min(simd_gain_ms, raw_simt_gain)
+    return simt_gain_ms, simd_gain_ms, ub_warn

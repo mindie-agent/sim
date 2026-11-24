@@ -14,19 +14,22 @@ from hashlib import sha256
 from heapq import heapify, heappop, heappush
 import json
 from math import isfinite
+from pathlib import Path
 from types import UnionType
-from typing import Any, Literal, TypeAlias, get_args, get_origin, get_type_hints
+from typing import Any, Literal, TypeAlias, Union, get_args, get_origin, get_type_hints
 
 from mindie_sim.prediction.program.primitives import PrimitiveStore
 from mindie_sim.prediction.runtime.tile_solver import TilePipelineSpec
 from mindie_sim.prediction.streams import (
     MAIN_STREAM, StreamCoreBudget, StreamEvent, StreamId, StreamLane,
 )
+from mindie_sim.schema.abi import (
+    AbiSupportVerdict, FusionTier, RegionBackendTarget, validate_fusion_tier_verdict,
+)
 from mindie_sim.schema.common import ModelingError
 
 REWRITE_PLAN_SCHEMA = "mindie-rewrite-plan/2"
 TemplateTier: TypeAlias = Literal["K1", "K2", "K3"]
-FusionTier: TypeAlias = Literal["K1_shipping", "K1_proposed_pr", "K2_epilogue", "K3_dsl_pipeline"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +64,29 @@ class FuseRegion:
     preserve_ports: tuple[PortRef, ...]
     kernel_boundaries: tuple[KernelBoundary, ...]
     fusion_tier: FusionTier
+    backend_target: RegionBackendTarget | None = None
+    abi_verdict: AbiSupportVerdict | None = None
+    abi_query_digest: str = ""
+    lowering_id: str = ""
+    lowering_sha256: str = ""
+    ub_peak_bytes: int = 0
+    ub_wall_bytes: int = 0
+
+    def __post_init__(self) -> None:
+        if self.ub_peak_bytes < 0 or self.ub_wall_bytes < 0:
+            raise ModelingError("rewrite_fuse_region_ub_bytes_negative")
+        if self.abi_verdict is not None:
+            validate_fusion_tier_verdict(self.fusion_tier, self.abi_verdict)
+            if self.abi_query_digest and self.abi_query_digest != self.abi_verdict.query_digest:
+                raise ModelingError("rewrite_fuse_region_query_digest_mismatch")
+            if self.lowering_id and self.abi_verdict.matched_lowering_id and (
+                self.lowering_id != self.abi_verdict.matched_lowering_id
+            ):
+                raise ModelingError("rewrite_fuse_region_lowering_id_mismatch")
+            if self.lowering_sha256 and self.abi_verdict.matched_lowering_sha256 and (
+                self.lowering_sha256 != self.abi_verdict.matched_lowering_sha256
+            ):
+                raise ModelingError("rewrite_fuse_region_lowering_sha256_mismatch")
 
 
 @dataclass(frozen=True, slots=True)
@@ -212,6 +238,26 @@ def _wire(value: Any) -> Any:
     if is_dataclass(value):
         if isinstance(value, KernelBoundary) and not value.params:
             return {"abi_id": value.abi_id, "members": _wire(value.members)}
+        if isinstance(value, FuseRegion):
+            out = {
+                "members": _wire(value.members),
+                "preserve_ports": _wire(value.preserve_ports),
+                "kernel_boundaries": _wire(value.kernel_boundaries),
+                "fusion_tier": _wire(value.fusion_tier),
+            }
+            for fname, empty in (
+                ("backend_target", None),
+                ("abi_verdict", None),
+                ("abi_query_digest", ""),
+                ("lowering_id", ""),
+                ("lowering_sha256", ""),
+                ("ub_peak_bytes", 0),
+                ("ub_wall_bytes", 0),
+            ):
+                fval = getattr(value, fname)
+                if fval != empty:
+                    out[fname] = _wire(fval)
+            return out
         return {field.name: _wire(getattr(value, field.name)) for field in fields(value)}
     if isinstance(value, tuple):
         return [_wire(item) for item in value]
@@ -251,7 +297,7 @@ def _record(value: Any, cls: type, path: str):
 def _typed(value: Any, annotation: Any, path: str) -> Any:
     origin = get_origin(annotation)
     args = get_args(annotation)
-    if origin is UnionType:
+    if origin in {UnionType, Union}:
         for option in args:
             try:
                 return _typed(value, option, path)
@@ -316,6 +362,26 @@ def decode_rewrite_plan(payload: Mapping[str, Any]) -> RewritePlan:
     return RewritePlan(base_graph_sha256=_typed(payload["base_graph_sha256"], str, "base_graph_sha256"),
                        framing_sha256=_typed(payload["framing_sha256"], str, "framing_sha256"),
                        edits=tuple(edits))
+
+
+def load_rewrite_plan(
+    rewrite_plan: RewritePlan | Mapping[str, Any] | str | Path | None,
+) -> RewritePlan | None:
+    """Load and strictly validate a ``mindie-rewrite-plan/2`` plan (file, mapping, or object)."""
+    if rewrite_plan is None:
+        return None
+    if isinstance(rewrite_plan, RewritePlan):
+        if rewrite_plan.schema != REWRITE_PLAN_SCHEMA:
+            raise ModelingError(f"rewrite_schema_unsupported:{rewrite_plan.schema}")
+        return decode_rewrite_plan(_encode(rewrite_plan))
+    if isinstance(rewrite_plan, (str, Path)):
+        raw = json.loads(Path(rewrite_plan).read_text(encoding="utf-8"))
+        if not isinstance(raw, Mapping):
+            raise ModelingError("rewrite_wire_object_required:plan")
+        return decode_rewrite_plan(raw)
+    if isinstance(rewrite_plan, Mapping):
+        return decode_rewrite_plan(rewrite_plan)
+    raise ModelingError(f"unsupported_rewrite_plan_type:{type(rewrite_plan).__name__}")
 
 
 def _digest_default(value):

@@ -7,14 +7,18 @@
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from collections import Counter, defaultdict
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from fractions import Fraction
 from graphlib import CycleError, TopologicalSorter
-from math import isfinite, lcm
-from typing import Iterable, Literal
+from math import isfinite, lcm, prod
+from typing import Any, Iterable, Literal
 
+from mindie_sim.prediction.fusion.ports import input_port_entries
 from mindie_sim.prediction.program.stages import KernelProgram
 from mindie_sim.prediction.runtime.memory_physics import (
     AddressRun, SectorCoverage, _MAX_EXPLICIT_SECTOR_INTERVALS, _merge_byte_intervals,
@@ -22,10 +26,11 @@ from mindie_sim.prediction.runtime.memory_physics import (
 from mindie_sim.prediction.runtime.l2_residency import (
     _coalesce_runs, _coverage_runs, _partition_runs, _range_run, _residency_runs, _run_end,
 )
-from mindie_sim.prediction.runtime.tile_solver import AlgorithmKind, TileSolution
+from mindie_sim.prediction.runtime.tile_solver import AlgorithmKind, TilePipelineSpec, TileSolution
 from mindie_sim.schema.abi import SOC_ARCHS, SocArch
-from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.common import ModelingError, dtype_bytes
 from mindie_sim.schema.datapath import SourceRef
+from mindie_sim.schema.operators import OpSpec
 
 COMMIT_HEX_LENGTH = 40
 SHA256_HEX_LENGTH = 64
@@ -97,11 +102,20 @@ def attn_res_ub_footprint(d, tile_t, depth):
     )
 
 
-def attn_res_tiling(tokens, aiv, ub_bytes):
-    del tokens, aiv, ub_bytes
-    raise NotImplementedError(
-        "LEGACY_PURGED: pass explicit hidden_size into attn_res_tiling without hardcoded 7168 fingerprint"
-    )
+def attn_res_tiling(tokens: int, aiv: int, ub_bytes: int, hidden_size: int) -> tuple[int, int, int, int]:
+    """Compute AttnRes UB tiling ``(active_aiv, rows_per_aiv, tile_rows, depth)`` from explicit ``hidden_size``."""
+    if any(type(v) is not int or v < 1 for v in (tokens, aiv, ub_bytes, hidden_size)):
+        raise ModelingError("attn_res_problem_invalid")
+    rows = ceil_div(tokens, aiv)
+    d = hidden_size
+    row_bytes = d * (ATTN_RES_TILE_FP32_ROWS * FP32_BYTES + BF16_BYTES) + ATTN_RES_STAT_COUNT * FP32_BYTES
+    tile = min(ceil_div(rows, 2), ATTN_RES_MAX_TILE_T, (ub_bytes - d * (FP32_BYTES + BF16_BYTES)) // (2 * row_bytes))
+    while tile > 0 and attn_res_ub_footprint(d, tile, 2) > ub_bytes:
+        tile -= 1
+    if tile < 1:
+        raise ModelingError("attn_res_double_buffered_row_does_not_fit")
+    count = ceil_div(rows, tile)
+    return ceil_div(tokens, rows), rows, ceil_div(rows, count), 1 if count == 1 else 2
 
 
 def flash_kda_rounds(chunks, heads, slots, max_group):
@@ -474,9 +488,14 @@ class FusedRegionSummary:
     aicpu_metadata_ms: Fraction
     sram_peaks_bytes: tuple[tuple[str, int], ...]
     spec: CatlassKernelSpec | DslKernelSpec | FuseRegionSpec | None
-    # A live program publishes the latest completed invocation's delivery.
-    realized_hbm_bytes: float | None = field(default=None, compare=False)
+    # A live program publishes the latest completed invocation's directional delivery and bus service separately.
+    realized_hbm_delivered_bytes: float | None = field(default=None, compare=False)
     realized_l2_miss_bytes: int = field(default=0, compare=False)
+    dram_bus_service_bytes: float | None = field(default=None, compare=False)
+
+    @property
+    def realized_hbm_bytes(self) -> float | None:
+        return self.realized_hbm_delivered_bytes
 
     @property
     def l2_hit_bytes(self) -> int:
@@ -489,9 +508,13 @@ class FusedRegionSummary:
     def _record_delivery(self, delivered, reads, writes):
         object.__setattr__(self, "read_obligations", reads)
         object.__setattr__(self, "write_obligations", writes)
-        for name in ("logical_transfer_bytes", "issued_copy_bytes", "dram_sector_bytes", "turnaround_service_bytes",
-                     "realized_l2_hit_bytes", "realized_l2_miss_bytes", "realized_hbm_bytes"):
-            object.__setattr__(self, name, delivered[name])
+        for name in (
+            "logical_transfer_bytes", "issued_copy_bytes", "dram_sector_bytes", "turnaround_service_bytes",
+            "realized_l2_hit_bytes", "realized_l2_miss_bytes",
+            "realized_hbm_delivered_bytes", "dram_bus_service_bytes",
+        ):
+            if name in delivered:
+                object.__setattr__(self, name, delivered[name])
 
 
 @dataclass(frozen=True, slots=True)
@@ -861,3 +884,860 @@ def _region_order(op_ids, dependencies, barriers, edge_routes, waits, numerics, 
     for src, dst in carried - same_tile:
         internal[dst].discard(src)
     return tuple(name for name in order if name in selected), internal
+
+
+# ---------------------------------------------------------------------------
+# Layer-1 Formula Kernel & Synthesis Contracts (Single Source of Truth)
+# ---------------------------------------------------------------------------
+
+ABI_DIGEST_LEN = 12
+KIB_BYTES = 1024
+MXFP_BLOCK_GROUP = 32
+MATMUL_SHAPE_RANK = 3
+BindingState = Literal["bound_implementation", "unbound_formula_projection"]
+
+_FORMULA_DTYPE_BYTES: Mapping[str, float] = {
+    "fp8_e4m3fn": 1.0,
+    "fp8_e4m3": 1.0,
+    "fp8_e5m2": 1.0,
+    "hif8": 1.0,
+    "fp8_e8m0": 1.0,
+    "fp4_e2m1": 0.5,
+    "bfloat16": 2.0,
+    "float16": 2.0,
+    "float32": 4.0,
+    "float64": 8.0,
+}
+_EQUATION_IDENT_RE = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\b")
+_ROW_REDUCTION_FAMILIES = frozenset({
+    "rmsnorm", "layernorm", "add_rmsnorm", "add_rmsnorm_quant", "rmsnorm_quant",
+    "norm_gate", "l2norm", "softmax", "quantize", "dynamic_quant", "dynamic_mx_quant",
+    "attention", "paged_attention", "mla_attention", "flash_attention", "attn_res",
+})
+_COLLECTIVE_FAMILIES = frozenset({
+    "allreduce", "allgather", "reduce_scatter", "all_to_all", "alltoall",
+    "moe_dispatch", "moe_combine", "all_gather_matmul", "matmul_reduce_scatter",
+})
+_MATMUL_FAMILIES = frozenset({
+    "gemm", "matmul", "linear", "grouped_matmul", "grouped_gemm",
+    "all_gather_matmul", "matmul_reduce_scatter", "quant_matmul",
+})
+
+
+def formula_elem_bytes(dtype: str) -> float:
+    """Return exact element byte width for ``dtype``, failing fast if unknown."""
+    tok = str(dtype or "").strip().lower()
+    if not tok:
+        raise ModelingError("formula_dtype_missing")
+    if tok in _FORMULA_DTYPE_BYTES:
+        return _FORMULA_DTYPE_BYTES[tok]
+    return float(dtype_bytes(tok))
+
+
+def _strip_op_prefix(op_id: str) -> str:
+    tail = str(op_id or "").split(".")[-1]
+    return re.sub(r"[^A-Za-z0-9_]+", "_", tail).strip("_")
+
+
+def _extract_op_operand_ports(op: OpSpec) -> list[tuple[str, str, int]]:
+    """Extract ordered ``(producer_id, port_name, version)`` activation operands preserving multiplicity."""
+    ports: list[tuple[str, str, int]] = []
+    meta = dict(op.metadata) if op.metadata else {}
+    for key in ("typed_inputs", "input_ports"):
+        raw = meta.get(key, ())
+        if isinstance(raw, Sequence) and not isinstance(raw, (str, bytes)):
+            for entry in raw:
+                if not isinstance(entry, Mapping):
+                    continue
+                if str(entry.get("role") or "").strip().lower() in {"weight", "control", "barrier", "event"}:
+                    continue
+                prod_id = entry.get("producer")
+                if isinstance(prod_id, str) and prod_id and prod_id != op.op_id:
+                    pname = str(entry.get("port") or entry.get("output") or entry.get("name") or "output")
+                    ver = int(entry.get("version", entry.get("state_version", 0)) or 0)
+                    ports.append((prod_id, "output" if pname == "out" else pname, ver))
+        if ports:
+            break
+    if not ports:
+        for dep, port in input_port_entries(op.metadata):
+            if dep and dep != op.op_id:
+                pname = port.removeprefix(dep + ":")
+                if pname != "weight":
+                    ports.append((dep, "output" if pname == "out" else pname, 0))
+    explicit_producers = {p[0] for p in ports}
+    for dep in op.deps:
+        if dep and dep != op.op_id and dep not in explicit_producers:
+            ports.append((dep, "output", 0))
+    return ports
+
+
+def _infer_op_symbolic_kind(op: OpSpec) -> tuple[str, bool, bool, str, tuple[tuple[str, float], ...]]:
+    """Classify ``op`` locally as ``(kind, is_matrix, is_row_red, activation, act_params)``."""
+    fam = str(op.family or "").strip().lower()
+    rec = str(op.recipe or "").strip().lower()
+    meta = dict(op.metadata) if op.metadata else {}
+    act = str(meta.get("activation") or "").strip().lower()
+    act_params_raw = meta.get("activation_params") or ()
+    act_params = tuple((str(k), float(v)) for k, v in (
+        act_params_raw.items() if isinstance(act_params_raw, Mapping) else act_params_raw
+    ))
+    has_flops = bool(op.matrix_flops) or float(op.flops or 0.0) > 0.0
+    is_matrix = has_flops or fam in _MATMUL_FAMILIES
+    is_row_red = (
+        fam in _ROW_REDUCTION_FAMILIES
+        or any(t in fam or t in rec for t in ("rmsnorm", "layernorm", "softmax", "quant", "attn_res"))
+    )
+    if "megamoe" in fam or "megamoe" in rec:
+        return "megamoe", True, True, act or "swiglu", act_params
+    if "gating" in fam and "topk" in rec:
+        return "moe_router_topk", False, True, act, act_params
+    if fam in {"all_gather_matmul", "matmul_reduce_scatter", "allgather", "reduce_scatter"}:
+        return fam, fam in {"all_gather_matmul", "matmul_reduce_scatter"}, False, act, act_params
+    if fam in {"grouped_matmul", "grouped_gemm"}:
+        return "grouped_matmul", True, False, act, act_params
+    if is_matrix and fam in _MATMUL_FAMILIES:
+        return "matmul", True, False, act, act_params
+    if fam in {"view", "reshape", "split", "splitv", "slice", "transpose"}:
+        return "view_copy", False, False, act, act_params
+    if "situ" in fam or "situ" in rec or act == "situ":
+        return "situ", False, False, "situ", act_params
+    if "swiglu" in fam or "swiglu" in rec or act == "swiglu":
+        return "swiglu", False, False, "swiglu", act_params
+    if "add_rmsnorm" in fam or "add_rmsnorm" in rec:
+        k = "add_rmsnorm_quant" if "quant" in fam or "quant" in rec else "add_rmsnorm"
+        return k, False, True, act, act_params
+    if "rmsnorm" in fam or "rmsnorm" in rec:
+        k = "rmsnorm_quant" if "quant" in fam or "quant" in rec else "rmsnorm"
+        return k, False, True, act, act_params
+    if "mx" in fam and "quant" in fam:
+        return "dynamic_mx_quant", False, True, act, act_params
+    if "quant" in fam:
+        return "dynamic_quant", False, True, act, act_params
+    return fam or "op", is_matrix, is_row_red, act, act_params
+
+
+def _format_megamoe_equation(
+    prev: str,
+    out: str,
+    shape_tag: str,
+    param_txt: str,
+    act_kind: str,
+    meta: Mapping[str, Any],
+) -> str:
+    ep = int(meta.get("ep", meta.get("ep_size", 1)) or 1)
+    has_ep = ep > 1 or bool(meta.get("all_to_all") or meta.get("ep_dispatch"))
+    comp_dt = str(meta.get("compute_dtype") or meta.get("weight_format") or "bf16")
+    act = act_kind or str(meta.get("activation") or "swiglu")
+    has_shared = bool(meta.get("has_shared_expert") or int(meta.get("shared_expert_intermediate", 0) or 0) > 0)
+    shared_inter = int(meta.get("shared_expert_intermediate", 0) or 0)
+    disp_step = f"h_disp = AllToAllDispatch({prev}, ep={ep})" if has_ep else f"h_disp = LocalTokenPermute({prev})"
+    gmm1 = f"u = GroupedMatMul(h_disp, W_gate_up^T [{comp_dt}])"
+    act_step = f"a, s = ActMxQuant({act}(u{param_txt}))"
+    gmm2 = "y_loc = GroupedMatMul(a, W_down^T, scales=s)"
+    comb_expr = "AllToAllCombine(y_loc, topk_w)" if has_ep else "LocalWeightedCombine(y_loc, topk_w)"
+    if has_shared:
+        shared_tag = f", inter={shared_inter}" if shared_inter > 0 else ""
+        tail = f"y_routed = {comb_expr}; y_shared = SharedFFN({prev}{shared_tag}); {out} = y_routed + y_shared"
+    else:
+        tail = f"{out} = {comb_expr}"
+    return f"{disp_step}; {gmm1}; {act_step}; {gmm2}; {tail} [{shape_tag}, Persistent Megakernel]"
+
+
+def _format_moe_gating_equation(
+    prev: str,
+    out: str,
+    shape_tag: str,
+    meta: Mapping[str, Any],
+) -> str:
+    raw_mode = str(meta.get("router_mode") or meta.get("score_function") or "").strip().lower()
+    score_fn = raw_mode if raw_mode in {"softmax", "sigmoid"} else "softmax/sigmoid"
+    noaux = bool(meta.get("noaux_tc"))
+    groups = int(meta.get("groups", 0) or 0)
+    group_topk = int(meta.get("group_topk", 0) or 0)
+    top_k = int(meta.get("top_k", 0) or 0)
+    has_bias = bool(meta.get("correction_bias") or meta.get("bias") or noaux)
+    norm_topk = meta.get("norm_topk")
+    scale = meta.get("routed_scaling_factor")
+    sel_name = "group_limited_topk" if (noaux or groups > 1) else "TopK"
+    score_expr = f"{score_fn}({prev})"
+    if has_bias:
+        score_expr = f"{score_expr} + e_bias"
+    extras: list[str] = []
+    if top_k > 0:
+        extras.append(f"k={top_k}")
+    if groups > 1:
+        extras.append(f"groups={groups}")
+    if group_topk > 0:
+        extras.append(f"group_topk={group_topk}")
+    if norm_topk is not None:
+        extras.append(f"norm={bool(norm_topk)}")
+    if scale is not None and float(scale) != 1.0:
+        extras.append(f"scale={float(scale):g}")
+    extra_txt = (", " + ", ".join(extras)) if extras else ""
+    return f"{out}, topk_ids = {sel_name}({score_expr}{extra_txt}) [{shape_tag}, UB FP32]"
+
+
+def _format_dag_equation(
+    op_id: str,
+    shape: Sequence[int],
+    kind: str,
+    input_syms: Sequence[str],
+    out_sym: str,
+    *,
+    output_dtype: str = "bf16",
+    activation_kind: str = "",
+    activation_params: Sequence[tuple[str, float]] = (),
+    group_size: int = 0,
+    collective_axis: str = "",
+    op_meta: Mapping[str, Any] | None = None,
+) -> str:
+    prev = input_syms[0] if input_syms else "x"
+    rhs_second = input_syms[1] if len(input_syms) > 1 else ""
+    all_args = ", ".join(input_syms) if input_syms else "x"
+    out = out_sym
+    meta = op_meta or {}
+    gs = group_size or MXFP_BLOCK_GROUP
+    shape_tag = "x".join(str(d) for d in shape) if shape else "?"
+    param_txt = (
+        "; " + ", ".join(f"{pk}={pv:g}" for pk, pv in activation_params)
+        if activation_params else ""
+    )
+    w_tag = _strip_op_prefix(op_id)
+    w_sym = f"W_{w_tag}" if w_tag else "W"
+    if kind == "megamoe":
+        return _format_megamoe_equation(prev, out, shape_tag, param_txt, activation_kind, meta)
+    if kind == "moe_router_topk":
+        return _format_moe_gating_equation(prev, out, shape_tag, meta)
+    eq_map = {
+        "view_copy": f"{out} = strided_view({prev}) [zero-copy metadata elision]",
+        "grouped_matmul": f"{out} = GroupedMatMul({prev}, {w_sym}_e^T) [{shape_tag}, L0C FP32]",
+        "matmul": f"{out} = {prev} @ {w_sym}^T [{shape_tag}, L0C FP32]",
+        "allgather": f"{out} = AllGather({prev}, axis={collective_axis or 'tp'})",
+        "reduce_scatter": f"{out} = ReduceScatter({prev}, SUM, axis={collective_axis or 'tp'})",
+        "all_gather_matmul": f"{out} = AllGather({prev}) @ {w_sym}_col^T [MC2 pipelined]",
+        "matmul_reduce_scatter": f"{out} = ReduceScatter({prev} @ {w_sym}_row^T, SUM) [MC2 pipelined]",
+        "add": f"{out} = {prev} + {rhs_second or 'r'} [UB FP32]",
+        "mul": f"{out} = {prev} * {rhs_second or 'g'} [UB FP32]",
+        "rmsnorm": f"{out} = ({prev} / sqrt(mean({prev}^2) + eps)) * gamma [UB FP32]",
+        "layernorm": f"{out} = (({prev} - mu) / sqrt(var + eps)) * gamma + beta [UB FP32]",
+        "add_rmsnorm": f"{out} = RMSNorm({prev} + {rhs_second or 'r'}; gamma) [UB FP32]",
+        "add_rmsnorm_quant": f"{out}, s = DynamicQuant(RMSNorm({prev} + {rhs_second or 'r'}; gamma)) [UB FP32]",
+        "rmsnorm_quant": f"{out}, s = DynamicQuant(RMSNorm({prev}; gamma)) [UB FP32]",
+        "norm_gate": f"{out} = RMSNorm({prev}; gamma) * SiLU({rhs_second or 'z'}) [UB FP32]",
+        "l2norm": f"{out} = {prev} / (||{prev}||_2 + eps) [UB FP32]",
+        "swiglu": f"{out} = SiLU({prev}_gate) * {prev}_up [UB FP32]",
+        "situ": f"{out} = SiTU({prev}_gate, {prev}_up{param_txt}) [UB FP32, custom ABI]",
+        "silu": f"{out} = {prev} * sigmoid({prev}) [UB FP32]",
+        "gelu": f"{out} = GELU({prev}) [UB FP32]",
+        "sigmoid": f"{out} = sigmoid({prev}) [UB FP32]",
+        "dynamic_mx_quant": (
+            f"s_b = 2^floor(log2(max|{prev}_{{b:b+{gs}}}|/448)); "
+            f"{out} = cast_fp8({prev}/s_b) [E8M0 g={gs}, UB FP32]"
+        ),
+        "dynamic_quant": f"s = max|{prev}| / qmax; {out} = cast_{output_dtype}({prev}/s) [UB FP32]",
+        "gating": f"{out} = -exp(A_log) * softplus({prev} + dt_bias) [UB FP32]",
+        "conv1d": f"{out}, S_next = CausalConv1d({prev}, S_conv, W_conv) [rolling UB]",
+        "recurrent_scan": f"{out}, H_next = RecurrentStateUpdate({prev}, H_prev) [FP32 state]",
+        "recover_ssm": "H_commit = AliasSlotSelect(H_slots, accept_idx) [2D slot alias]",
+        "rotary": f"{out} = RoPE({all_args}, cos, sin) [UB FP32]",
+        "kv_scatter": f"KV_cache[slot] = QuantScatter({prev}) [in-place cache write]",
+        "attn_res": f"{out} = Sum_i softmax_i(Norm(h_i) . q_l) * h_i [UB FP32]",
+        "mhc_mix": f"{out} = SinkhornMix({prev}, H_pre, H_post) [UB FP32]",
+        "attention_update": f"{out}, lse = OnlineSoftmaxMerge({prev}, lse_prev) [FP32]",
+        "cast": f"{out} = cast_{output_dtype}({prev})",
+    }
+    return eq_map.get(kind, f"{out} = {kind}({all_args}{param_txt}) [{shape_tag}]")
+
+
+@dataclass(frozen=True, slots=True)
+class FormulaTensorSpec:
+    """Declarative tensor operand for Layer-1 formula-driven modeling."""
+
+    name: str
+    shape: tuple[int, ...]
+    dtype: str
+    role: Literal["input", "output", "weight", "workspace"] = "input"
+    hbm_resident: bool = True
+
+    @property
+    def num_elements(self) -> int:
+        if not self.shape:
+            return 0
+        dims = tuple(int(d) for d in self.shape)
+        if any(d <= 0 for d in dims):
+            return 0
+        return prod(dims)
+
+    @property
+    def byte_size(self) -> float:
+        return float(self.num_elements) * formula_elem_bytes(self.dtype)
+
+
+@dataclass(frozen=True, slots=True)
+class PipeStageSpec:
+    """One causal compute/communication pipe stage derived from the true operand DAG."""
+
+    name: str
+    pipe_kind: Literal["cube", "vector", "link"]
+    share: float = 1.0
+    after: tuple[str, ...] = ()
+    row_reduction: bool = False
+
+
+def _condense_pipe_nodes(
+    elem_nodes: Sequence[tuple[str, Literal["cube", "vector", "link"], float, bool, tuple[str, ...]]],
+) -> tuple[PipeStageSpec, ...]:
+    """Condense elementary pipe DAG without merging nodes whose dependency/consumer sets differ."""
+    if not elem_nodes:
+        return ()
+    node_ids = {eid for eid, _, _, _, _ in elem_nodes}
+    preds_by_id: dict[str, tuple[str, ...]] = {
+        eid: tuple(dict.fromkeys(p for p in preds if p in node_ids and p != eid))
+        for eid, _, _, _, preds in elem_nodes
+    }
+    succs_by_id: dict[str, list[str]] = {eid: [] for eid in node_ids}
+    for eid, plist in preds_by_id.items():
+        for p in plist:
+            succs_by_id[p].append(eid)
+
+    level_by_id: dict[str, int] = {}
+    visiting: set[str] = set()
+
+    def _level(eid: str) -> int:
+        if eid in level_by_id:
+            return level_by_id[eid]
+        if eid in visiting:
+            return 0
+        visiting.add(eid)
+        lvl = max((_level(p) + 1 for p in preds_by_id[eid]), default=0)
+        visiting.discard(eid)
+        level_by_id[eid] = lvl
+        return lvl
+
+    for eid in preds_by_id:
+        _level(eid)
+
+    GroupKey = tuple[int, Literal["cube", "vector", "link"], bool, frozenset[str], frozenset[str]]
+    group_key_by_id: dict[str, GroupKey] = {}
+    group_first_pos: dict[GroupKey, int] = {}
+    group_order: list[GroupKey] = []
+    group_work: dict[GroupKey, float] = defaultdict(float)
+    group_red: dict[GroupKey, bool] = defaultdict(bool)
+    group_preds: dict[GroupKey, list[GroupKey]] = defaultdict(list)
+
+    for pos, (eid, pkind, _work, is_red, _preds) in enumerate(elem_nodes):
+        gk: GroupKey = (
+            level_by_id[eid],
+            pkind,
+            bool(is_red) if pkind == "vector" else False,
+            frozenset(preds_by_id[eid]),
+            frozenset(succs_by_id[eid]),
+        )
+        group_key_by_id[eid] = gk
+        if gk not in group_first_pos:
+            group_first_pos[gk] = pos
+            group_order.append(gk)
+
+    for eid, _pkind, work, is_red, _preds in elem_nodes:
+        gk = group_key_by_id[eid]
+        group_work[gk] += max(0.0, float(work))
+        if is_red:
+            group_red[gk] = True
+        for p in preds_by_id[eid]:
+            pgk = group_key_by_id[p]
+            if pgk != gk and pgk not in group_preds[gk]:
+                group_preds[gk].append(pgk)
+
+    kind_rank = {"link": 0, "vector": 1, "cube": 2}
+    group_order.sort(key=lambda item: (item[0], kind_rank[item[1]], group_first_pos[item]))
+    counts_by_kind: dict[str, int] = defaultdict(int)
+    for gk in group_order:
+        counts_by_kind[gk[1]] += 1
+
+    base_names = {"cube": "cube_mma", "vector": "aiv_fp32", "link": "link_pipe"}
+    seen_kind: dict[str, int] = defaultdict(int)
+    stage_name: dict[GroupKey, str] = {}
+    totals_by_kind: dict[str, float] = defaultdict(float)
+    for gk in group_order:
+        pkind = gk[1]
+        idx = seen_kind[pkind]
+        seen_kind[pkind] += 1
+        stage_name[gk] = base_names[pkind] if counts_by_kind[pkind] == 1 else f"{base_names[pkind]}_{idx}"
+        totals_by_kind[pkind] += group_work[gk]
+
+    stages: list[PipeStageSpec] = []
+    for gk in group_order:
+        pkind = gk[1]
+        tot = totals_by_kind[pkind]
+        share = (group_work[gk] / tot) if tot > 0.0 else (1.0 / float(counts_by_kind[pkind]))
+        after = tuple(stage_name[pgk] for pgk in group_preds[gk] if pgk in stage_name)
+        stages.append(PipeStageSpec(
+            name=stage_name[gk],
+            pipe_kind=pkind,
+            share=share,
+            after=after,
+            row_reduction=bool(group_red[gk]) if pkind == "vector" else False,
+        ))
+    return tuple(stages)
+
+
+def _derive_pipe_stages_from_ops(ops: Sequence[OpSpec]) -> tuple[PipeStageSpec, ...]:
+    """Derive causal ``PipeStageSpec`` DAG strictly from true operand dependencies."""
+    ordered = tuple(ops)
+    if not ordered:
+        return ()
+    member_ids = {op.op_id for op in ordered}
+    elem_nodes: list[tuple[str, Literal["cube", "vector", "link"], float, bool, tuple[str, ...]]] = []
+    exit_eid: dict[str, tuple[str, ...]] = {}
+
+    for op in ordered:
+        ports = _extract_op_operand_ports(op)
+        int_preds = tuple(dict.fromkeys(p[0] for p in ports if p[0] in member_ids))
+        pred_eids = tuple(dict.fromkeys(eid for pid in int_preds for eid in exit_eid.get(pid, ())))
+        fam = str(op.family or "").strip().lower()
+        _, is_matrix, is_red, _, _ = _infer_op_symbolic_kind(op)
+        cube_w = sum(float(fl) for _, fl in op.matrix_flops) if op.matrix_flops else float(op.flops or 0.0)
+        vec_w = float(op.vector_ops or 0.0)
+        link_w = float(op.link_bytes or 0.0)
+
+        if fam == "all_gather_matmul":
+            l_id, c_id = f"{op.op_id}:link", f"{op.op_id}:cube"
+            elem_nodes.append((l_id, "link", max(link_w, 1.0), False, pred_eids))
+            elem_nodes.append((c_id, "cube", max(cube_w, 1.0), False, (l_id,)))
+            exit_eid[op.op_id] = (c_id,)
+            continue
+        if fam == "matmul_reduce_scatter":
+            c_id, l_id = f"{op.op_id}:cube", f"{op.op_id}:link"
+            elem_nodes.append((c_id, "cube", max(cube_w, 1.0), False, pred_eids))
+            elem_nodes.append((l_id, "link", max(link_w, 1.0), False, (c_id,)))
+            exit_eid[op.op_id] = (l_id,)
+            continue
+
+        local_ids: list[str] = []
+        if cube_w > 0.0 or is_matrix:
+            cid = f"{op.op_id}:cube"
+            elem_nodes.append((cid, "cube", max(cube_w, 1.0), False, pred_eids))
+            local_ids.append(cid)
+        if vec_w > 0.0 or (not local_ids and fam not in _COLLECTIVE_FAMILIES and fam not in {"view", "reshape", "split", "splitv"}):
+            vid = f"{op.op_id}:vec"
+            v_preds = tuple(local_ids) if local_ids else pred_eids
+            elem_nodes.append((vid, "vector", max(vec_w, 1.0), is_red, v_preds))
+            local_ids = [vid]
+        if link_w > 0.0 or (not local_ids and fam in _COLLECTIVE_FAMILIES):
+            lid = f"{op.op_id}:link"
+            l_preds = tuple(local_ids) if local_ids else pred_eids
+            elem_nodes.append((lid, "link", max(link_w, 1.0), False, l_preds))
+            local_ids = [lid]
+        exit_eid[op.op_id] = tuple(local_ids) if local_ids else pred_eids
+    return _condense_pipe_nodes(elem_nodes)
+
+
+def _derive_pipe_stages_from_equations(
+    equations: Sequence[str],
+    *,
+    has_cube: bool,
+    has_vector: bool,
+    has_link: bool,
+    row_reduction: bool,
+) -> tuple[PipeStageSpec, ...]:
+    """Infer causal ``PipeStageSpec`` DAG from declarative ``FormulaKernelSpec.equations``."""
+    elem_nodes: list[tuple[str, Literal["cube", "vector", "link"], float, bool, tuple[str, ...]]] = []
+    producer_by_sym: dict[str, str] = {}
+    for idx, eq in enumerate(equations):
+        lhs, sep, rhs = str(eq).partition("=")
+        rhs_txt = rhs if sep else lhs
+        rhs_low = rhs_txt.lower()
+        if any(tok in rhs_low for tok in ("allgather", "reducescatter", "allreduce", "alltoall")):
+            pkind: Literal["cube", "vector", "link"] = "link"
+        elif "@" in rhs_txt or "matmul" in rhs_low:
+            pkind = "cube"
+        else:
+            pkind = "vector"
+        if (pkind == "cube" and not has_cube) or (pkind == "vector" and not has_vector) or (pkind == "link" and not has_link):
+            continue
+        rhs_idents = _EQUATION_IDENT_RE.findall(rhs_txt)
+        preds = tuple(dict.fromkeys(producer_by_sym[tok] for tok in rhs_idents if tok in producer_by_sym))
+        eid = f"eq:{idx}"
+        is_red = pkind == "vector" and (row_reduction or any(t in rhs_low for t in ("norm", "softmax", "quant")))
+        elem_nodes.append((eid, pkind, 1.0, is_red, preds))
+        if sep:
+            for sym in _EQUATION_IDENT_RE.findall(lhs):
+                producer_by_sym[sym] = eid
+    return _condense_pipe_nodes(elem_nodes)
+
+
+def _op_input_shape(op: OpSpec, is_matrix: bool) -> tuple[int, ...]:
+    if not op.local_shape:
+        return ()
+    if is_matrix and len(op.local_shape) == MATMUL_SHAPE_RANK:
+        return (int(op.local_shape[0]), int(op.local_shape[2]))
+    return tuple(int(d) for d in op.local_shape)
+
+
+def _op_output_shape(op: OpSpec, is_matrix: bool) -> tuple[int, ...]:
+    if not op.local_shape:
+        return ()
+    if is_matrix and len(op.local_shape) == MATMUL_SHAPE_RANK:
+        return (int(op.local_shape[0]), int(op.local_shape[1]))
+    return tuple(int(d) for d in op.local_shape)
+
+
+def _compose_dag_equations_and_ports(
+    ops: Sequence[OpSpec],
+    *,
+    preserve_port_ids: Sequence[str] = (),
+) -> tuple[tuple[str, ...], tuple[FormulaTensorSpec, ...], tuple[FormulaTensorSpec, ...], tuple[str, ...]]:
+    """Build composed symbolic equations, input/output tensor specs, and elided intermediates from true DAG."""
+    ordered = tuple(ops)
+    if not ordered:
+        return (), (), (), ()
+    member_ids = {op.op_id for op in ordered}
+    preserve_set = set(preserve_port_ids)
+    infos = tuple(_infer_op_symbolic_kind(op) for op in ordered)
+    operand_ports: dict[str, tuple[tuple[str, str, int], ...]] = {}
+    internal_users: dict[str, list[str]] = {op.op_id: [] for op in ordered}
+    unique_ext: list[tuple[tuple[str, str, int], OpSpec, bool]] = []
+    seen_ext: set[tuple[str, str, int]] = set()
+
+    for op, info in zip(ordered, infos):
+        ports = tuple(_extract_op_operand_ports(op))
+        if not ports:
+            ports = ((f"__ext__:{op.op_id}", "output", 0),)
+        operand_ports[op.op_id] = ports
+        seen_int: set[str] = set()
+        for prod_id, pname, ver in ports:
+            if prod_id in member_ids:
+                if prod_id not in seen_int:
+                    internal_users[prod_id].append(op.op_id)
+                    seen_int.add(prod_id)
+            else:
+                ek = (prod_id, pname, ver)
+                if ek not in seen_ext:
+                    seen_ext.add(ek)
+                    unique_ext.append((ek, op, info[1]))
+
+    ext_sym: dict[tuple[str, str, int], str] = {}
+    in_specs: list[FormulaTensorSpec] = []
+    for idx, (ek, op, is_mat) in enumerate(unique_ext):
+        sym = "x" if len(unique_ext) == 1 else f"x{idx}"
+        ext_sym[ek] = sym
+        sh = _op_input_shape(op, is_mat)
+        if sh:
+            meta = dict(op.metadata) if op.metadata else {}
+            in_dt = str(meta.get("activation_format") or meta.get("input_dtype") or op.dtype)
+            in_specs.append(FormulaTensorSpec(sym, sh, in_dt, "input"))
+
+    live_out_ids = [
+        op.op_id for op in ordered
+        if (not internal_users[op.op_id]) or (op.op_id in preserve_set)
+    ] or [ordered[-1].op_id]
+    live_out_set = set(live_out_ids)
+
+    sym_by_id: dict[str, str] = {}
+    out_specs: list[FormulaTensorSpec] = []
+    temp_idx = 1
+    out_idx = 0
+    for op, info in zip(ordered, infos):
+        if op.op_id in live_out_set:
+            sym = "y" if len(live_out_ids) == 1 else f"y{out_idx}"
+            out_idx += 1
+            sym_by_id[op.op_id] = sym
+            sh = _op_output_shape(op, info[1])
+            if sh:
+                meta = dict(op.metadata) if op.metadata else {}
+                out_dt = str(meta.get("output_format") or meta.get("output_dtype") or op.dtype)
+                out_specs.append(FormulaTensorSpec(sym, sh, out_dt, "output"))
+        else:
+            sym_by_id[op.op_id] = f"t{temp_idx}"
+            temp_idx += 1
+
+    equations: list[str] = []
+    for op, (kind, _is_mat, _is_red, act_kind, act_params) in zip(ordered, infos):
+        in_syms_list: list[str] = []
+        for prod_id, pname, ver in operand_ports[op.op_id]:
+            if prod_id in member_ids:
+                base_sym = sym_by_id[prod_id]
+                if pname != "output" and ver:
+                    in_syms_list.append(f"{base_sym}.{pname}@v{ver}")
+                elif pname != "output":
+                    in_syms_list.append(f"{base_sym}.{pname}")
+                elif ver:
+                    in_syms_list.append(f"{base_sym}@v{ver}")
+                else:
+                    in_syms_list.append(base_sym)
+            else:
+                in_syms_list.append(ext_sym[(prod_id, pname, ver)])
+        meta = dict(op.metadata) if op.metadata else {}
+        equations.append(_format_dag_equation(
+            op.op_id, op.local_shape, kind, tuple(in_syms_list), sym_by_id[op.op_id],
+            output_dtype=str(meta.get("output_format") or op.dtype),
+            activation_kind=act_kind,
+            activation_params=act_params,
+            group_size=int(meta.get("group_size", 0) or 0),
+            collective_axis=str(meta.get("collective_axis") or ""),
+            op_meta=meta,
+        ))
+    elided_ids = tuple(
+        op.op_id for op in ordered
+        if op.op_id not in live_out_set and internal_users[op.op_id]
+    )
+    return tuple(equations), tuple(in_specs), tuple(out_specs), elided_ids
+
+
+@dataclass(frozen=True, slots=True)
+class FormulaKernelSpec:
+    """Layer-1 declarative mathematical formula specification for unbound kernels."""
+
+    name: str
+    equations: tuple[str, ...]
+    inputs: tuple[FormulaTensorSpec, ...] = ()
+    outputs: tuple[FormulaTensorSpec, ...] = ()
+    weights: tuple[FormulaTensorSpec, ...] = ()
+    matrix_flops: tuple[tuple[str, float], ...] = ()
+    vector_ops_fp32: float = 0.0
+    link_bytes: float = 0.0
+    row_reduction: bool = False
+    uses_simt: bool = False
+    atomic_ops: tuple[OpSpec, ...] = ()
+    abi_signature_id: str = ""
+    family: str = "formula_kernel"
+    activation: str = ""
+    activation_params: tuple[tuple[str, float], ...] = ()
+    hbm_bytes_override: float | None = None
+    mte2_bytes_override: float | None = None
+    mte3_bytes_override: float | None = None
+    pipe_stages: tuple[PipeStageSpec, ...] = ()
+
+    def resolved_abi_signature(self) -> str:
+        if self.abi_signature_id:
+            return self.abi_signature_id
+        payload = json.dumps(
+            {
+                "name": self.name,
+                "equations": list(self.equations),
+                "inputs": [(t.name, list(t.shape), t.dtype) for t in self.inputs],
+                "outputs": [(t.name, list(t.shape), t.dtype) for t in self.outputs],
+                "weights": [(t.name, list(t.shape), t.dtype) for t in self.weights],
+                "matrix_flops": [[dt, float(fl)] for dt, fl in self.matrix_flops],
+                "row_reduction": bool(self.row_reduction),
+                "activation": self.activation,
+                "activation_params": [[k, float(v)] for k, v in self.activation_params],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:ABI_DIGEST_LEN]
+        return f"formula:{self.name}:{digest}"
+
+    @classmethod
+    def from_ops(
+        cls,
+        ops: Sequence[OpSpec],
+        *,
+        name: str = "",
+        equations: Sequence[str] = (),
+        saved_read_bytes: float = 0.0,
+        saved_write_bytes: float = 0.0,
+        preserve_port_ids: Sequence[str] = (),
+    ) -> FormulaKernelSpec:
+        """Construct a ``FormulaKernelSpec`` directly from absorbed atomic ``OpSpec``s."""
+        ordered = tuple(ops)
+        if not ordered:
+            raise ModelingError("formula_kernel_spec_empty_ops")
+        infos = tuple(_infer_op_symbolic_kind(op) for op in ordered)
+        kernel_name = name or ordered[-1].recipe or ordered[-1].op_id
+        matrix: dict[str, float] = defaultdict(float)
+        for op in ordered:
+            entries = op.matrix_flops or (((op.dtype, op.flops),) if op.flops else ())
+            for dt, fl in entries:
+                if fl > 0.0:
+                    matrix[str(dt)] += float(fl)
+        raw_mte2 = sum(float(op.mte2_bytes or 0.0) for op in ordered)
+        raw_mte3 = sum(float(op.mte3_bytes or 0.0) for op in ordered)
+        raw_hbm = sum(float(op.hbm_bytes or 0.0) for op in ordered)
+        mte2 = max(0.0, raw_mte2 - max(0.0, float(saved_read_bytes)))
+        mte3 = max(0.0, raw_mte3 - max(0.0, float(saved_write_bytes)))
+        hbm = max(0.0, raw_hbm - max(0.0, float(saved_read_bytes)) - max(0.0, float(saved_write_bytes)))
+        vec_ops = sum(float(op.vector_ops or 0.0) for op in ordered)
+        link_b = sum(float(op.link_bytes or 0.0) for op in ordered)
+        row_red = any(info[2] for info in infos)
+        acts = [info[3] for info in infos if info[3]]
+        act_params = tuple(dict(p for info in infos for p in info[4]).items())
+        dag_eqs, in_specs, out_specs, _elided = _compose_dag_equations_and_ports(
+            ordered, preserve_port_ids=preserve_port_ids,
+        )
+        comp_eqs = tuple(equations) if equations else dag_eqs
+        pipe_stages = _derive_pipe_stages_from_ops(ordered)
+        return cls(
+            name=kernel_name,
+            equations=comp_eqs,
+            inputs=in_specs,
+            outputs=out_specs,
+            matrix_flops=tuple(sorted(matrix.items())),
+            vector_ops_fp32=vec_ops,
+            link_bytes=link_b,
+            row_reduction=row_red,
+            atomic_ops=ordered,
+            family="rewrite_fused",
+            activation=acts[0] if acts else "",
+            activation_params=act_params,
+            hbm_bytes_override=hbm,
+            mte2_bytes_override=mte2,
+            mte3_bytes_override=mte3,
+            pipe_stages=pipe_stages,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class FormulaKernelEvaluation:
+    """White-box Engine + TileSolver evaluation receipt for a ``FormulaKernelSpec``."""
+
+    name: str
+    abi_signature_id: str
+    composed_equations: tuple[str, ...]
+    projected_us: float
+    l_star_us: float
+    tile_spec: TilePipelineSpec | None
+    ub_peak_bytes: int
+    ub_budget_bytes: int
+    l1_peak_bytes: int
+    l0_peak_bytes: int
+    sram_verified: bool
+    binding_state: BindingState = "unbound_formula_projection"
+    has_unbound_formula_ops: bool = True
+    dominant_pipe: str = ""
+    hbm_bytes: float = 0.0
+    mte2_bytes: float = 0.0
+    mte3_bytes: float = 0.0
+    launch_us: float = 0.0
+    tile_algorithm: str = "resident_1pass"
+    tile_shape_str: str = ""
+    l1_budget_bytes: int = 0
+    l0_budget_bytes: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "abi_signature_id": self.abi_signature_id,
+            "composed_equations": list(self.composed_equations),
+            "projected_us": round(float(self.projected_us), 4),
+            "l_star_us": round(float(self.l_star_us), 4),
+            "ub_peak_bytes": int(self.ub_peak_bytes),
+            "ub_budget_bytes": int(self.ub_budget_bytes),
+            "l1_peak_bytes": int(self.l1_peak_bytes),
+            "l0_peak_bytes": int(self.l0_peak_bytes),
+            "sram_verified": bool(self.sram_verified),
+            "binding_state": self.binding_state,
+            "has_unbound_formula_ops": bool(self.has_unbound_formula_ops),
+            "dominant_pipe": self.dominant_pipe,
+            "hbm_bytes": float(self.hbm_bytes),
+            "mte2_bytes": float(self.mte2_bytes),
+            "mte3_bytes": float(self.mte3_bytes),
+            "launch_us": round(float(self.launch_us), 4),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class SkuTargetFloors:
+    """Calibrated L0 launch and interconnect floors extracted from active SKU."""
+
+    launch_vec_us: float
+    launch_cube_us: float
+    launch_norm_us: float
+    oneshot_floor_us: float
+    mc2_sync_us: float
+    is_intra_pod: bool
+    is_a5_ub: bool
+    interconnect_label: str
+
+
+@dataclass(frozen=True, slots=True)
+class KernelSynthesisSpec:
+    """Composed symbolic math equations + Ascend FP32 UB/L1/L0 SRAM spec."""
+
+    spec_id: str
+    kernel_name: str
+    abi_tier: str
+    suggested_backend: str
+    status_tag: str
+    opt_pillar: str
+    constituent_op_ids: tuple[str, ...]
+    constituent_traits: tuple[str, ...]
+    symbolic_equations: tuple[str, ...]
+    input_tensors: tuple[str, ...]
+    output_tensors: tuple[str, ...]
+    elided_intermediates: tuple[str, ...]
+    elided_hbm_bytes: int
+    tile_algorithm: str
+    tile_shape: str
+    ub_precision_mode: str
+    ub_peak_bytes: int
+    ub_budget_bytes: int
+    l1_peak_bytes: int
+    l1_budget_bytes: int
+    l0_peak_bytes: int
+    l0_budget_bytes: int
+    sram_verified: bool
+    l_star_us: float
+    before_us: float
+    target_us: float
+    target_attainment_pct: float
+    abi_signature_id: str = ""
+    binding_state: BindingState = "unbound_formula_projection"
+    exposed_before_us: float | None = None
+    ub_wall_warning: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "spec_id": self.spec_id,
+            "kernel_name": self.kernel_name,
+            "abi_tier": self.abi_tier,
+            "suggested_backend": self.suggested_backend,
+            "status_tag": self.status_tag,
+            "opt_pillar": self.opt_pillar,
+            "constituent_op_ids": list(self.constituent_op_ids),
+            "constituent_traits": list(self.constituent_traits),
+            "symbolic_equations": list(self.symbolic_equations),
+            "input_tensors": list(self.input_tensors),
+            "output_tensors": list(self.output_tensors),
+            "elided_intermediates": list(self.elided_intermediates),
+            "elided_hbm_bytes": int(self.elided_hbm_bytes),
+            "tile_algorithm": self.tile_algorithm,
+            "tile_shape": self.tile_shape,
+            "ub_precision_mode": self.ub_precision_mode,
+            "ub_peak_bytes": int(self.ub_peak_bytes),
+            "ub_budget_bytes": int(self.ub_budget_bytes),
+            "l1_peak_bytes": int(self.l1_peak_bytes),
+            "l1_budget_bytes": int(self.l1_budget_bytes),
+            "l0_peak_bytes": int(self.l0_peak_bytes),
+            "l0_budget_bytes": int(self.l0_budget_bytes),
+            "sram_verified": bool(self.sram_verified),
+            "l_star_us": round(float(self.l_star_us), 3),
+            "before_us": round(float(self.before_us), 3),
+            "exposed_before_us": round(
+                float(self.exposed_before_us if self.exposed_before_us is not None else self.before_us), 3,
+            ),
+            "target_us": round(float(self.target_us), 3),
+            "target_attainment_pct": round(float(self.target_attainment_pct), 1),
+            "abi_signature_id": self.abi_signature_id,
+            "binding_state": self.binding_state,
+        }
+        if self.ub_wall_warning:
+            payload["ub_wall_warning"] = self.ub_wall_warning
+        return payload
+
+    def format_formula_block(self) -> str:
+        eq_txt = " ; ".join(self.symbolic_equations)
+        ub_kb = self.ub_peak_bytes / KIB_BYTES
+        ub_cap_kb = self.ub_budget_bytes / KIB_BYTES
+        l1_kb = self.l1_peak_bytes / KIB_BYTES
+        l1_cap_kb = self.l1_budget_bytes / KIB_BYTES
+        elided_kb = self.elided_hbm_bytes / KIB_BYTES
+        warn_suffix = f" | WARN: {self.ub_wall_warning}" if self.ub_wall_warning else ""
+        return (
+            f"Math: {eq_txt} | "
+            f"Tile: {self.tile_algorithm} {self.tile_shape} ({self.ub_precision_mode}) | "
+            f"UB={ub_kb:.1f}/{ub_cap_kb:.1f}KiB, L1={l1_kb:.1f}/{l1_cap_kb:.1f}KiB "
+            f"({'PASS' if self.sram_verified else 'FAIL'}) | "
+            f"Elided HBM={elided_kb:.1f}KiB{warn_suffix}"
+        )

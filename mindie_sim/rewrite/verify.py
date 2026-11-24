@@ -16,6 +16,7 @@ from itertools import combinations
 from math import fsum, isclose, isfinite
 from typing import Literal
 
+from mindie_sim.backends.abi_registry import default_abi_registry
 from mindie_sim.prediction.evaluation import ACTIVE_DEADLINE_MONO
 from mindie_sim.prediction.execution.operator_replay import operator_costs
 from mindie_sim.prediction.results import OpOccurrence, OperatorSequenceRow, StepEvaluation
@@ -27,12 +28,19 @@ from mindie_sim.prediction.runtime.accel_tables import (
 from mindie_sim.prediction.runtime.tile_solver import TilePipelineSpec
 from mindie_sim.prediction.streams import MAIN_STREAM, bind_stream_owners, proportional_coupled_placement
 from mindie_sim.prediction.execution.weight_prefetch import residency_peak
+from mindie_sim.schema.abi import validate_fusion_tier_verdict
 from mindie_sim.schema.common import ModelingError
 
-from .algebra import AlgebraicTrait, classify_op_traits
+from .algebra import AlgebraicTrait, _resolve_soc_arch, classify_op_traits
 from .apply import (
     AppliedPlan, ResolvedScenario, _check_stream, _convex, _dependencies, _die, _path,
     _solve_tiles, _successors, _topological,
+)
+from .catalog_replay import _replay_ops
+from .dual_cert import (
+    _check_region_summary_bindings,
+    build_dual_inputs_from_scenario,
+    check_optimality_certificate,
 )
 from .schema import FuseRegion, HoistOrDeduplicate, QuantizeContract, SelectTemplate, _flat
 
@@ -671,19 +679,157 @@ def _hbm_service_bytes(service, profile):
 
 
 def _template_service(scenario, applied, edited, replay):
-    del scenario, applied, edited, replay
-    raise NotImplementedError(
-        "LEGACY_PURGED: wire canonical rewrite/catalog_replay.py (zero optimization imports)"
+    graphs, book, baseline_book, context, deadline = replay
+    targets = {op_id for _, op_id in edited}
+    profiles = []
+    token = ACTIVE_DEADLINE_MONO.set(deadline)
+    try:
+        for ranks, recipes, streams in (
+            ({rank.replica: rank.ops for rank in scenario.atomic_ops}, baseline_book, scenario.stream_plans),
+            (graphs, book, applied.streams),
+        ):
+            site_graphs = {op_id: dict.fromkeys(ranks, ()) for op_id in targets}
+            for rank, ops in ranks.items():
+                for op in ops:
+                    if op.op_id in targets:
+                        site_graphs[op.op_id][rank] = _replay_ops((op,))
+            profiles.append({(row["replica"], op_id): row["serviced"]
+                             for op_id, site in site_graphs.items()
+                             for row in operator_costs(scenario.atomic_step.case, site, recipes=recipes,
+                                 evaluation=context, stream_plans=streams or None)["operators"]})
+    finally:
+        ACTIVE_DEADLINE_MONO.reset(token)
+    return profiles
+
+
+def _verify_fuse_region_witnesses(scenario, applied, scope):
+    """Enforce bidirectional Equation 7 exact witness parity on every ``FuseRegion`` edit."""
+    soc_arch = _resolve_soc_arch(
+        str(getattr(scenario.case.machine, "arch_family", "") or ""),
+        scenario.datapath,
+        str(getattr(scenario.case.machine, "sku", "") or getattr(scenario.case.machine, "name", "") or ""),
     )
+    registry = None
+    for edit in applied.plan.edits:
+        op = edit.operation
+        if not isinstance(op, FuseRegion):
+            continue
+        verdict = op.abi_verdict
+        if verdict is None:
+            if scope == "full" and op.fusion_tier in {"K1_shipping", "K1_proposed_pr"}:
+                raise ModelingError(f"ABI_WITNESS_INVALID:missing_abi_verdict:{edit.edit_id}")
+            continue
+        validate_fusion_tier_verdict(op.fusion_tier, verdict)
+        if soc_arch is not None and verdict.device_arch != soc_arch:
+            raise ModelingError(
+                f"ABI_WITNESS_INVALID:arch_mismatch:{edit.edit_id}:{verdict.device_arch}!={soc_arch}"
+            )
+        if op.kernel_boundaries and verdict.abi_id != op.kernel_boundaries[0].abi_id:
+            raise ModelingError(
+                f"ABI_WITNESS_INVALID:abi_id_mismatch:{edit.edit_id}:{verdict.abi_id}!={op.kernel_boundaries[0].abi_id}"
+            )
+        if op.abi_query_digest and op.abi_query_digest != verdict.query_digest:
+            raise ModelingError(f"ABI_WITNESS_INVALID:query_digest_mismatch:{edit.edit_id}")
+        if op.backend_target is not None and op.backend_target != verdict.backend_kind:
+            raise ModelingError(
+                f"ABI_WITNESS_INVALID:backend_kind_mismatch:{edit.edit_id}:{op.backend_target}!={verdict.backend_kind}"
+            )
+        if verdict.matched_lowering_id and op.lowering_id != verdict.matched_lowering_id:
+            raise ModelingError(f"ABI_WITNESS_INVALID:lowering_id_mismatch:{edit.edit_id}")
+        if verdict.matched_lowering_sha256 and op.lowering_sha256 != verdict.matched_lowering_sha256:
+            raise ModelingError(f"ABI_WITNESS_INVALID:lowering_sha256_mismatch:{edit.edit_id}")
+        if verdict.status in {"admitted_shipping", "admitted_proposed_pr"}:
+            registry = registry or default_abi_registry()
+            snap = registry.get_snapshot(verdict.device_arch)
+            if verdict.probe_manifest_sha256 != snap.payload_sha256:
+                raise ModelingError(f"ABI_WITNESS_INVALID:probe_manifest_sha256_mismatch:{edit.edit_id}")
+            matched_entry = next((e for e in snap.entries if e.entry_id == verdict.matched_entry_id), None)
+            expected_track = "merged" if verdict.status == "admitted_shipping" else "unmerged_pr"
+            if (
+                matched_entry is None
+                or not matched_entry.available_on_device
+                or matched_entry.abi_id != verdict.abi_id
+                or matched_entry.backend_kind != verdict.backend_kind
+                or matched_entry.symbol_or_kernel != verdict.symbol_or_kernel
+                or matched_entry.vllm_ascend_track != expected_track
+                or (verdict.source_ref is not None and matched_entry.source_ref != verdict.source_ref)
+            ):
+                raise ModelingError(f"ABI_WITNESS_INVALID:entry_witness_mismatch:{edit.edit_id}")
 
 
-def _executed_service_conservation(scenario, applied, step_eval, baseline_eval, service_replay, summaries):
-    if step_eval is None:
-        raise NotImplementedError(
-            "LEGACY_PURGED: wire canonical Engine full-step verification (never skip executed-service conservation when step_eval is omitted)"
-        )
+def _verify_summary_lineage_work(summary, atomic_by_site):
+    """Enforce per-``(lineage, multiplicity, dtype, unit)`` useful-work conservation."""
+    replicas = {item.replica for item in summary.semantic_work}
+    if len(replicas) != 1:
+        raise ModelingError(f"WORK_CONSERVATION_MISMATCH:{summary.region_id}:mixed_replicas")
+    replica = next(iter(replicas))
+    covered = [op for oid in summary.op_ids if (op := atomic_by_site.get((replica, oid))) is not None]
+    if not covered:
+        return
+    exp_by_unit_dtype: dict[tuple[str, str], float] = defaultdict(float)
+    exp_by_unit: dict[str, float] = defaultdict(float)
+    exp_by_lineage: dict[tuple[str, str, str], float] = defaultdict(float)
+    for op in covered:
+        if op.matrix_flops:
+            for dt, amount in op.matrix_flops:
+                val = float(amount)
+                key_dt = str(dt or op.dtype).strip().lower()
+                exp_by_unit_dtype["matrix_mac", key_dt] += val
+                exp_by_unit["matrix_mac"] += val
+                exp_by_lineage[op.op_id, "matrix_mac", key_dt] += val
+        elif op.flops:
+            val = float(op.flops)
+            key_dt = str(op.dtype).strip().lower()
+            exp_by_unit_dtype["matrix_mac", key_dt] += val
+            exp_by_unit["matrix_mac"] += val
+            exp_by_lineage[op.op_id, "matrix_mac", key_dt] += val
+        if op.vector_ops:
+            val = float(op.vector_ops)
+            key_dt = str(op.dtype).strip().lower()
+            exp_by_unit_dtype["vector", key_dt] += val
+            exp_by_unit["vector"] += val
+            exp_by_lineage[op.op_id, "vector", key_dt] += val
+
+    got_by_unit_dtype: dict[tuple[str, str], float] = defaultdict(float)
+    got_by_unit: dict[str, float] = defaultdict(float)
+    got_by_lineage: dict[tuple[str, str, str], float] = defaultdict(float)
+    covered_ids = {op.op_id for op in covered}
+    all_lineage_exact = True
+    for item in summary.semantic_work:
+        val = float(item.logical_ops)
+        if val < 0:
+            raise ModelingError(f"WORK_CONSERVATION_MISMATCH:{summary.region_id}:negative_work")
+        unit = "matrix_mac" if item.kind == "matrix_mac" else "vector"
+        key_dt = str(item.dtype).strip().lower()
+        got_by_unit_dtype[unit, key_dt] += val
+        got_by_unit[unit] += val
+        if item.work_id in covered_ids:
+            got_by_lineage[item.work_id, unit, key_dt] += val
+        else:
+            all_lineage_exact = False
+
+    for unit in ("matrix_mac", "vector"):
+        if not isclose(exp_by_unit.get(unit, 0.0), got_by_unit.get(unit, 0.0), rel_tol=1e-12, abs_tol=1e-9):
+            raise ModelingError(f"WORK_CONSERVATION_MISMATCH:{summary.region_id}:semantic_work")
+    if all_lineage_exact and exp_by_lineage:
+        for key in exp_by_lineage.keys() | got_by_lineage.keys():
+            if not isclose(exp_by_lineage.get(key, 0.0), got_by_lineage.get(key, 0.0), rel_tol=1e-12, abs_tol=1e-9):
+                raise ModelingError(f"WORK_CONSERVATION_MISMATCH:{summary.region_id}:lineage:{key[0]}:{key[1]}:{key[2]}")
+    else:
+        for key in exp_by_unit_dtype.keys() | got_by_unit_dtype.keys():
+            if key[0] == "matrix_mac" and not isclose(
+                exp_by_unit_dtype.get(key, 0.0), got_by_unit_dtype.get(key, 0.0), rel_tol=1e-12, abs_tol=1e-9,
+            ):
+                raise ModelingError(f"WORK_CONSERVATION_MISMATCH:{summary.region_id}:dtype:{key[0]}:{key[1]}")
+
+
+def _executed_service_conservation(scenario, applied, step_eval, baseline_eval, service_replay, summaries, *, scope="full"):
     edits = applied.plan.edits
     has_rebind = any(isinstance(edit.operation, (FuseRegion, SelectTemplate)) for edit in edits)
+    if step_eval is None:
+        if scope == "full" and has_rebind:
+            raise ModelingError("WORK_CONSERVATION_MISMATCH:missing_step_eval")
+        return
     if not has_rebind:
         return
     exec_by_site = {(entry.replica, op.op_id): op for entry in applied.executable for op in entry.ops}
@@ -776,11 +922,9 @@ def _executed_service_conservation(scenario, applied, step_eval, baseline_eval, 
 
 
 def _conservation(scenario, applied, summaries, step_eval=None, baseline_eval=None, baseline_work=None,
-                  service_replay=None):
-    if summaries:
-        raise NotImplementedError(
-            "LEGACY_PURGED: wire canonical rewrite/catalog_replay.py & rewrite/dual_cert.py region summary binding and per-(lineage, multiplicity, dtype, unit) conservation"
-        )
+                  service_replay=None, *, scope="full"):
+    _verify_fuse_region_witnesses(scenario, applied, scope)
+    _check_region_summary_bindings(scenario, applied, summaries)
     hoists = set(applied.hoisted_load_time)
     cse = {edit.edit_id for edit in applied.plan.edits
            if isinstance(edit.operation, HoistOrDeduplicate) and edit.operation.scope == "intra_step"}
@@ -814,9 +958,7 @@ def _conservation(scenario, applied, summaries, step_eval=None, baseline_eval=No
                 or hits > issued or (issued == hits and (dram or turnaround))):
             raise ModelingError(f"LEDGER_RECONCILIATION_ERROR:{summary.region_id}")
         if summary.op_ids and summary.semantic_work:
-            raise NotImplementedError(
-                "LEGACY_PURGED: enforce per-(lineage, multiplicity, dtype, unit) work conservation + bidirectional Eq.7 witness check"
-            )
+            _verify_summary_lineage_work(summary, atomic_by_site)
         cut = compute_compulsory_hbm_cut((summary,))
         if sum(item.read_bytes + item.write_bytes for item in cut.values()) > dram:
             raise ModelingError(f"LEDGER_RECONCILIATION_ERROR:{summary.region_id}:dram_sector_bytes")
@@ -825,12 +967,12 @@ def _conservation(scenario, applied, summaries, step_eval=None, baseline_eval=No
             raise ModelingError(f"LEDGER_RECONCILIATION_ERROR:{summary.region_id}:logical_bytes")
         if issued < logical:
             raise ModelingError(f"LEDGER_RECONCILIATION_ERROR:{summary.region_id}:issued_copy_bytes")
-    _executed_service_conservation(scenario, applied, step_eval, baseline_eval, service_replay, summaries)
+    _executed_service_conservation(scenario, applied, step_eval, baseline_eval, service_replay, summaries, scope=scope)
 
 
-def _capture(name, check, *args):
+def _capture(name, check, *args, **kwargs):
     try:
-        check(*args)
+        check(*args, **kwargs)
     except ModelingError as error:
         reason, _, detail = str(error).partition(":")
         return GateReceipt(name, False, reason, detail)
@@ -838,10 +980,34 @@ def _capture(name, check, *args):
 
 
 def _bound(scenario, applied, summaries, primitive_table, rate_mode, certificate, program, dag, wall, u, m, framework, dsl):
-    del scenario, applied, summaries, primitive_table, rate_mode, certificate, program, dag, wall, u, m, framework, dsl
-    raise NotImplementedError(
-        "LEGACY_PURGED: wire canonical rewrite/dual_cert.py (zero optimization imports)"
-    )
+    if program is not None or dag is not None:
+        canonical_program, canonical_dag, _ = build_dual_inputs_from_scenario(
+            scenario, applied=applied, region_summaries=summaries, primitive_table=primitive_table, rate_mode=rate_mode,
+        )
+        if (program is not None and program != canonical_program) or (dag is not None and dag != canonical_dag):
+            raise ModelingError("LEAN_CERTIFICATE_INVALID:certificate_unbound_to_scenario")
+    if certificate is None or program is None or dag is None:
+        raise ModelingError("LEAN_CERTIFICATE_INVALID:missing_certificate")
+    if not check_optimality_certificate(canonical_program, canonical_dag, certificate):
+        raise ModelingError("LEAN_CERTIFICATE_INVALID")
+    l_star = certificate.l_star_lean_ns
+    if l_star < 0 or wall is None:
+        raise ModelingError("LEAN_CERTIFICATE_INVALID:missing_or_invalid_bound_evidence")
+    if any(value is not None and type(value) is not int for value in (wall, u, m, framework, dsl)):
+        raise ModelingError("LADDER_MONOTONICITY_VIOLATION:invalid_wall_time")
+    for name, value in (("wall", wall), ("dsl", dsl), ("framework", framework)):
+        if value is not None and value < l_star:
+            raise SoundnessInversionError(
+                f"SOUNDNESS_BUG_LOWER_BOUND_INVERTED:{name}_ns={value}<l_star_ns={l_star}")
+    if any(value is not None and value < 0 for value in (u, m)):
+        raise ModelingError("LADDER_MONOTONICITY_VIOLATION:invalid_wall_time")
+    chain = [value for value in (l_star, dsl, framework) if value is not None]
+    baselines = [value for value in (u, m) if value is not None]
+    if baselines:
+        chain.append(min(baselines))
+    if any(left > right for left, right in zip(chain, chain[1:])):
+        raise ModelingError("LADDER_MONOTONICITY_VIOLATION")
+    return l_star
 
 
 def verify_plan(
@@ -853,12 +1019,16 @@ def verify_plan(
     """Run structural and replay gates for the stated occurrence coverage."""
     if scope not in {"archetype", "full"}:
         raise ModelingError(f"rewrite_verification_scope_invalid:{scope}")
+    replay_wall_ns = round(step_eval.span_ms * NS_PER_MS) if step_eval is not None else None
+    wall_mismatch = False
     if scope == "full":
-        raise NotImplementedError(
-            "LEGACY_PURGED: wire canonical Engine full-step verification (reject caller-supplied wall_ns without step_eval)"
-        )
-    if wall_ns is None and step_eval is not None:
-        wall_ns = round(step_eval.span_ms * NS_PER_MS)
+        if replay_wall_ns is not None:
+            if wall_ns is not None and wall_ns != replay_wall_ns:
+                wall_mismatch = True
+            else:
+                wall_ns = replay_wall_ns
+    elif wall_ns is None and replay_wall_ns is not None:
+        wall_ns = replay_wall_ns
 
     region_summaries = tuple(region_summaries)
     gates = [_capture("convexity_and_acyclicity", _structure, scenario, applied),
@@ -875,11 +1045,15 @@ def verify_plan(
         gates.append(GateReceipt(name, False, reason, detail))
     gates.append(_capture("work_conservation_and_ledgers", _conservation,
                           scenario, applied, region_summaries, step_eval, baseline_eval, baseline_work,
-                          service_replay))
+                          service_replay, scope=scope))
     l_star = regression = None
     if scope == "full":
         name = "lean_bound_and_monotonicity"
         try:
+            if step_eval is None:
+                raise ModelingError("LEAN_CERTIFICATE_INVALID:missing_step_eval")
+            if wall_mismatch:
+                raise ModelingError("LEAN_CERTIFICATE_INVALID:wall_ns_step_eval_mismatch")
             if region_summaries and not gates[-1].passed:
                 raise ModelingError("LEAN_CERTIFICATE_INVALID:certificate_unbound_to_scenario")
             l_star = _bound(scenario, applied, region_summaries, primitive_table, rate_mode,

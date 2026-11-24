@@ -37,33 +37,18 @@ from mindie_sim.schema.case import Case
 from mindie_sim.schema.datapath import DatapathCapabilitySpec
 from mindie_sim.schema.hardware import Device, Hardware, parse_hardware
 from mindie_sim.schema.operators import OpSpec
+from mindie_sim.templates.contracts import (
+    FormulaKernelEvaluation,
+    FormulaKernelSpec,
+    FormulaTensorSpec,
+)
+from mindie_sim.templates.fuse_region import (
+    evaluate_formula_kernel as _canonical_evaluate_formula_kernel,
+)
 
 from .contracts import Extension, Provider
 from .environment import ExecutionEnvironment
 from .errors import CapabilityGap, ExtensionError
-
-_FORMULA_PURGED_MSG = (
-    "LEGACY_PURGED: wire canonical templates.contracts + prediction.runtime.tile_solver + templates.fuse_region"
-)
-
-
-class FormulaTensorSpec:
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        raise NotImplementedError(_FORMULA_PURGED_MSG)
-
-
-class FormulaKernelSpec:
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        raise NotImplementedError(_FORMULA_PURGED_MSG)
-
-
-class FormulaKernelEvaluation:
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        raise NotImplementedError(_FORMULA_PURGED_MSG)
-
-
-def _canonical_evaluate_formula_kernel(*args: Any, **kwargs: Any) -> FormulaKernelEvaluation:
-    raise NotImplementedError(_FORMULA_PURGED_MSG)
 
 BINDING_STATE_BOUND = "bound_implementation"
 BINDING_STATE_UNBOUND_FORMULA = "unbound_formula_projection"
@@ -171,6 +156,26 @@ def _is_unbound_op_item(item: Any) -> str | None:
     return None
 
 
+def _item_has_verified_binding(item: Any, recipes: Any = None, native_bindings: Any = None) -> bool:
+    """Return True only when ``item`` carries a verified concrete binding or recipe."""
+    if isinstance(item, FormulaKernelSpec):
+        return False
+    op_id = item.op_id if isinstance(item, OpSpec) else (
+        str(item.get("op_id") or item.get("name") or "") if isinstance(item, Mapping) else ""
+    )
+    if op_id and isinstance(native_bindings, Mapping) and op_id in native_bindings:
+        return native_bindings[op_id] is not None
+    if op_id and isinstance(recipes, Mapping) and op_id in recipes:
+        rec = recipes[op_id]
+        if rec is not None and getattr(rec, "binding_state", BINDING_STATE_BOUND) != BINDING_STATE_UNBOUND_FORMULA:
+            return True
+    if isinstance(item, OpSpec):
+        meta = dict(item.metadata)
+        if str(meta.get("binding_state") or "") == BINDING_STATE_BOUND and not bool(meta.get("unbound_formula_op")):
+            return True
+    return False
+
+
 def enforce_simulation_binding_guard(
     ops: Any,
     *,
@@ -178,17 +183,20 @@ def enforce_simulation_binding_guard(
     entry: str,
     allow_unbound_formula: bool = False,
     has_bound_provider: bool = False,
+    recipes: Any = None,
+    native_bindings: Any = None,
 ) -> None:
-    """Hard-lock Simulation Mode (``allow_unbound_formula=False``) against unbound Layer-1 ops."""
+    """Hard-lock Simulation Mode (``allow_unbound_formula=False``) against unbound Layer-1 ops.
+
+    Never trusts ``has_bound_provider`` alone; every op must be genuinely bound or carry
+    an explicit non-unbound ``NativeCallBinding`` / concrete recipe.
+    """
+    del has_bound_provider
     if allow_unbound_formula:
         raise ExtensionError(f"simulation_mode_forbids_unbound_formula_ops:{entry}")
-    if has_bound_provider:
-        raise NotImplementedError(
-            "LEGACY_PURGED: validate actual NativeCallBinding on post-builder ops instead of trusting has_bound_provider"
-        )
     for item in _iter_ops_items(ops):
         offender = _is_unbound_op_item(item)
-        if offender is not None:
+        if offender is not None and not _item_has_verified_binding(item, recipes=recipes, native_bindings=native_bindings):
             raise CapabilityGap(
                 capability=capability,
                 entry=entry,

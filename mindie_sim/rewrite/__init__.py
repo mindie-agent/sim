@@ -25,7 +25,7 @@ from .schema import (
     HoistOrDeduplicate, KernelBoundary, OpRef, PipelineTiles, PortRef, QuantizeContract,
     RewriteOp, RewritePlan, SelectTemplate, StreamCoreBudget, StreamEvent, StreamId,
     StreamLane, StreamSchedule, TemplateTier, TilePipelineSpec, VariantRef, WeightPrefetch,
-    decode_rewrite_plan, empty_plan, encode_rewrite_plan, plan_sha256,
+    decode_rewrite_plan, empty_plan, encode_rewrite_plan, load_rewrite_plan, plan_sha256,
 )
 from .verify import (
     ACCEL_MAX_L, ACCEL_MAX_R, ACCEL_MAX_T, ACCEL_MAX_U, FAKE_OVERLAP_THRESHOLD_PCT,
@@ -50,7 +50,7 @@ __all__ = [
     "RewriteOp", "RewritePlan", "SelectTemplate", "StreamCoreBudget", "StreamEvent",
     "StreamId", "StreamLane", "StreamSchedule", "TemplateTier", "TilePipelineSpec",
     "VariantRef", "WeightPrefetch", "decode_rewrite_plan", "empty_plan",
-    "encode_rewrite_plan", "plan_sha256", "ACCEL_MAX_L", "ACCEL_MAX_R", "ACCEL_MAX_T",
+    "encode_rewrite_plan", "load_rewrite_plan", "plan_sha256", "ACCEL_MAX_L", "ACCEL_MAX_R", "ACCEL_MAX_T",
     "ACCEL_MAX_U", "FAKE_OVERLAP_THRESHOLD_PCT", "SHIPPING_REGRESSION_TOLERANCE_NS",
     "GateReceipt", "ShippingRegression",
     "SoundnessInversionError", "VerificationReceipt", "compute_overlap_pct", "verify_plan",

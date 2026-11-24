@@ -493,12 +493,34 @@ class _StreamingCatlassProgram:
     live_state: AdmissionMemoryView | None
     summary: FusedRegionSummary
     resource_work: tuple[tuple[str, float], ...] = ()
+    burst_rules: tuple[Any, ...] = ()
 
     def with_context(self, datapath, context) -> "_StreamingCatlassProgram":
-        """Rebind runtime ``datapath`` and ``context`` without repeating dry-run lowering."""
-        del datapath, context
-        raise NotImplementedError(
-            "LEGACY_PURGED: recompute summary on L2/memory_access/burst_rules change in _StreamingCatlassProgram.with_context"
+        """Rebind runtime ``datapath`` and ``context``; re-lower summary on L2/access/burst change."""
+        probe = Lowering(datapath, context=context, die=self.die)
+        if (
+            dict(datapath.buffers).get("l2", 0) != dict(self.datapath.buffers).get("l2", 0)
+            or datapath.memory_access != self.datapath.memory_access
+            or probe.burst_rules != self.burst_rules
+        ):
+            from .catlass_lower import solve_catlass_tile
+
+            live_adm = self.live_state is not None
+            warm_view = (
+                self.live_state if live_adm
+                else (deepcopy(self.initial_state) if self.initial_state is not None else None)
+            )
+            sol = solve_catlass_tile(self.spec, self.problem, datapath, memory_view=warm_view, die=self.die)
+            return lower_catlass_streaming(
+                self.spec, self.problem, datapath, sol,
+                context=context, memory_view=warm_view, die=self.die,
+                live_admission=live_adm, region_id=self.summary.region_id,
+            ).program
+        return replace(
+            self,
+            datapath=datapath,
+            context=context,
+            hbm_bus=probe.hbm_bus,
         )
 
     def start(self, engine, name: str, ready, *, owner: str = ""):
@@ -683,12 +705,14 @@ def lower_catlass_streaming(
         _union_obligations(plan.writes),
         plan.logical, plan.copied, plan.sectors, plan.service, plan.hits, (), plan.launches,
         plan.metadata_ms, tuple((peak.pool, peak.peak_bytes) for peak in solution.pool_peaks), spec,
-        None if live_admission else float(plan.service), plan.misses,
+        None if live_admission else float(plan.sectors), plan.misses,
+        None if live_admission else float(plan.service),
     )
     program = _StreamingCatlassProgram(
         spec=spec, problem=p, datapath=datapath, context=context,
         initial_state=initial_state, die=die, hbm_bus=plan.hbm_bus,
         live_state=plan.live_state, summary=summary,
         resource_work=tuple(sorted(plan.resource_work.items())),
+        burst_rules=plan.burst_rules,
     )
     return TemplateLoweringResult(program, summary, plan.total_stages)

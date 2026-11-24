@@ -26,17 +26,26 @@ from enum import Enum
 from math import prod
 from typing import Any, Literal
 
+from mindie_sim.backends.abi_registry import ProbedAbiRegistry, default_abi_registry
 from mindie_sim.prediction.runtime import tile_solver
 from mindie_sim.prediction.runtime.tile_solver import (
     DEFAULT_POOL_GRANULE_BYTES,
     LiveBufferSpec,
-    TileCandidate,
-    TilePipelineSpec,
-    TileShape,
+)
+from mindie_sim.schema.abi import (
+    RANK_PLACEMENTS,
+    AbiQueryKey,
+    AbiSupportVerdict,
+    OperandLayout,
+    OperandPortSig,
+    RankPlacement,
+    RegionBackendTarget,
+    SocArch,
 )
 from mindie_sim.schema.common import ModelingError, dtype_bytes
 from mindie_sim.schema.datapath import DatapathCapabilitySpec
 from mindie_sim.schema.operators import OpSpec
+from mindie_sim.schema.stack import ManifestBinding, StackTrack, StackTrackSpec
 
 from .apply import (
     ResolvedScenario,
@@ -47,6 +56,7 @@ from .apply import (
     _law2_sibling_key,
     _successors,
     _topological,
+    has_illegal_cross_precision_merge,
 )
 from .schema import (
     Edit,
@@ -75,6 +85,70 @@ MATMUL_SHAPE_RANK = 3
 UB_ALIGN_BYTES = DEFAULT_POOL_GRANULE_BYTES
 #: Maximum chain length for Law 1 UB pointwise/reduction composition.
 MAX_LAW1_CHAIN_LEN = 12
+#: Microscaling FP8/FP4/HiF8 group size.
+MX_GROUP_SIZE = 32
+#: Per-block FP8 quantization group size.
+BLOCK_QUANT_GROUP_SIZE = 128
+#: Minimum collective domain world size when collective metadata omits explicit ranks.
+DEFAULT_COLLECTIVE_WORLD_SIZE = 2
+#: Exact branch-and-bound ceiling for competing-region conflict components.
+MAX_CONFLICT_EXACT_SIZE = 16
+#: Micro-epilogue duration threshold (us) for Law 2b MatMul epilogue absorption.
+MICRO_EPILOGUE_MAX_US = 2.0
+#: Maximum standalone Law 2b epilogue ops absorbed after one MatMul.
+MAX_LAW2B_EPILOGUE_OPS = 2
+#: Default shipping stack fusion passes enabled on merged shipping/proposed/target tracks.
+DEFAULT_SHIPPING_STACK_PASSES: frozenset[str] = frozenset({
+    "mm_reduce_scatter_fusion",
+    "norm_quant_fusion",
+})
+#: Families eligible as Law 1 terminal cache-quant sinks (excludes rolling conv/SSM state).
+_TERMINAL_SINK_FAMILIES = frozenset({
+    "cache_store",
+    "indexer_quant_cache",
+    "kv_cache_write",
+    "kv_compress_epilog",
+})
+#: Row-reduction families explicitly barred from Law 2b MatMul micro-epilogue absorption.
+_MICRO_EPILOGUE_EXCLUDED_FAMILIES = frozenset({"topk", "moe_init_routing"})
+#: View families proven zero-copy (excludes copy/cat/pad/contiguous materialization).
+_ZERO_COPY_VIEW_FAMILIES = frozenset({"view", "reshape", "slice", "transpose", "permute"})
+#: Input binding roles that indicate a non-data control/state port on terminal sinks.
+_TERMINAL_SINK_NON_DATA_ROLES = frozenset({
+    "slot_mapping", "slots", "cache", "cache_ref", "cache_scale", "cache_scale_ref", "x_scale",
+})
+#: Dtype canonicalization matching ``ProbedAbiRegistry``.
+_ABI_DTYPE_CANON = {
+    "fp8_e4m3": "fp8_e4m3fn",
+    "float8_e4m3fn": "fp8_e4m3fn",
+    "fp8_e4m3fn": "fp8_e4m3fn",
+    "mxfp8": "fp8_e4m3fn",
+    "mxfp4": "fp4_e2m1",
+    "fp4": "fp4_e2m1",
+    "fp4_e2m1": "fp4_e2m1",
+    "hif8": "hifloat8",
+    "hifp8": "hifloat8",
+    "hifloat8": "hifloat8",
+    "bfloat16": "bf16",
+    "float16": "fp16",
+    "float32": "fp32",
+}
+_DEFAULT_SKU_BY_ARCH: dict[SocArch, str] = {
+    "A2": "ascend910b4",
+    "A3": "ascend910_9362",
+    "A5": "ascend950dt",
+}
+_DEFAULT_REMOTE_PLACEMENT_BY_ARCH: dict[SocArch, RankPlacement] = {
+    "A2": "hccs_single_node",
+    "A3": "hccs_supernode_a3",
+    "A5": "ub_ccu_intramachine",
+}
+_ALLOWED_QUANT_FORMATS = frozenset({"int8", "int4", "fp8_e4m3fn", "fp8_e5m2", "fp4_e2m1", "hifloat8"})
+_MX_DTYPES = frozenset({"fp8_e4m3fn", "fp4_e2m1", "hifloat8"})
+_MLA_PROLOG_GAMMA_SHAPE = (1,)
+_MLA_PROLOG_ROPE_SHAPE = (1, 1)
+_MEGAMOE_CONTEXT_BYTES_SHAPE = (1,)
+DEFAULT_MLA_ROPE_HEAD_DIM = 64
 
 
 class AlgebraicTrait(str, Enum):
@@ -196,6 +270,8 @@ class OpTraitInfo:
     row_working_bytes: int = 0
     symbolic_op_kind: str = "elementwise"
     is_grouped_matmul: bool = False
+    is_terminal_sink: bool = False
+    is_micro_epilogue_eligible: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -216,6 +292,14 @@ class AlgebraicCandidate:
     ub_precision_mode: str = "fp32_upcast"
     avoidable_hbm_bytes: int = 0
     traits: tuple[str, ...] = ()
+    abi_verdict: AbiSupportVerdict | None = None
+    abi_query_digest: str = ""
+    backend_target: RegionBackendTarget | None = None
+    lowering_id: str = ""
+    lowering_sha256: str = ""
+    fused_recipe: str = ""
+    preserve_ports: tuple[tuple[str, str, int], ...] = ()
+    requires_comm_consensus: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -433,6 +517,18 @@ def classify_op_traits(op: OpSpec) -> OpTraitInfo:
     )
     sym_kind = _resolve_symbolic_kind(fam, rec, meta, trait, act_kind)
     is_grouped = fam in {"grouped_gemm", "grouped_matmul", "grouped_moe"} or "grouped" in rec
+    is_terminal_sink = fam in _TERMINAL_SINK_FAMILIES
+    is_zero_copy_view = trait == AlgebraicTrait.VIEW_METADATA and fam in _ZERO_COPY_VIEW_FAMILIES
+    is_micro_epilogue = (
+        not is_stateful
+        and not is_opaque
+        and not is_prec_sens
+        and fam not in _MICRO_EPILOGUE_EXCLUDED_FAMILIES
+        and (
+            trait in {AlgebraicTrait.POINTWISE, AlgebraicTrait.ROW_REDUCTION}
+            or is_zero_copy_view
+        )
+    )
     return OpTraitInfo(
         op_id=op.op_id,
         trait=trait,
@@ -453,6 +549,8 @@ def classify_op_traits(op: OpSpec) -> OpTraitInfo:
         row_working_bytes=row_bytes,
         symbolic_op_kind=sym_kind,
         is_grouped_matmul=is_grouped,
+        is_terminal_sink=is_terminal_sink,
+        is_micro_epilogue_eligible=is_micro_epilogue,
     )
 
 
@@ -510,63 +608,72 @@ def _resolve_primary_trait(
     return AlgebraicTrait.CONTROL_BARRIER, "", False, None
 
 
-def _usable_ub_bytes(datapath: DatapathCapabilitySpec | None) -> int:
+def _usable_ub_bytes(
+    datapath: DatapathCapabilitySpec | None, *, uses_simt: bool = False,
+) -> int:
     if datapath is None:
         return 0
     raw = int(dict(datapath.buffers).get("ub", 0) or 0)
-    carveout = int(datapath.simt_ub_carveout_bytes or 0)
+    if raw <= 0:
+        return 0
+    carveout = int(datapath.simt_ub_carveout_bytes or 0) if uses_simt else 0
     return max(0, raw - carveout)
+
+
+def _simultaneous_ub_buffers(
+    members: Sequence[OpSpec],
+    traits: Mapping[str, OpTraitInfo],
+    *,
+    slots: int,
+) -> tuple[LiveBufferSpec, ...]:
+    """Build single-counted simultaneous-lifetime UB buffers (working + skip edges)."""
+    pos_by_id = {op.op_id: idx for idx, op in enumerate(members)}
+    buffers: list[LiveBufferSpec] = []
+    for idx, op in enumerate(members):
+        row_b = traits[op.op_id].row_working_bytes
+        if row_b > 0:
+            buffers.append(LiveBufferSpec(
+                f"stage_{idx}", "ub", row_b, idx, idx + 1, owner_kind="aiv", slots=slots,
+            ))
+    for c_idx, op in enumerate(members):
+        for dep in op.deps:
+            p_idx = pos_by_id.get(dep)
+            if p_idx is None or c_idx <= p_idx + 1:
+                continue
+            p_op = members[p_idx]
+            edge_b = _estimate_row_working_bytes(
+                p_op.local_shape, traits[dep].output_dtype, traits[dep].output_dtype,
+                is_reduction=False, is_vector_compute=False,
+            )
+            if edge_b > 0:
+                buffers.append(LiveBufferSpec(
+                    f"edge_{p_idx}_{c_idx}", "ub", edge_b, p_idx, c_idx + 1,
+                    owner_kind="aiv", slots=1,
+                ))
+    return tuple(buffers)
 
 
 def _check_ub_chain_fits(
     members: Sequence[OpSpec],
     traits: Mapping[str, OpTraitInfo],
     datapath: DatapathCapabilitySpec | None,
+    *,
+    uses_simt: bool = False,
 ) -> tuple[bool, int, int]:
-    """Verify 1-row UB working-set fit via ``TileSolver`` / SRAM budget."""
-    budget = _usable_ub_bytes(datapath)
+    """Verify exact single-counted simultaneous-lifetime UB fit via ``tile_solver``."""
+    budget = _usable_ub_bytes(datapath, uses_simt=uses_simt)
     if budget <= 0 or datapath is None:
         return False, 0, 0
-    max_row = max((traits[op.op_id].row_working_bytes for op in members), default=0)
-    if max_row <= 0:
-        return True, 0, budget
-    peak_single = max_row
-    from types import SimpleNamespace
-
-    hw = SimpleNamespace(
-        datapath=datapath,
-        buffers=dict(datapath.buffers),
-        buffer_units={"ub": datapath.aiv_count, "l2": 1},
-        stream_owners=None,
-    )
-    cands = tuple(
-        TileCandidate(
-            algorithm="resident_1pass" if slots == UB_DOUBLE_BUFFER_SLOTS else "online_reduce",
-            tile_shape=TileShape(1, max(1, max_row // 2), 1),
-            depth=slots,
-            owner_partition=(1, 1),
-            work_items=1,
-            tiles_per_owner=1,
-            buffers=(LiveBufferSpec("ub_chain", "ub", max_row, 0, 1, owner_kind="aiv", slots=slots),),
-            uses_simt=True,
-            owner_axis="aiv",
-        )
-        for slots in (UB_DOUBLE_BUFFER_SLOTS, 1)
-    )
-    try:
-        solved = tile_solver.solve(
-            TilePipelineSpec(
-                "algebra_ub_chain",
-                cands,
-                simt_ub_carveout_bytes=int(datapath.simt_ub_carveout_bytes or 0),
-            ),
-            members[-1],
-            hw,
-        )
-        ub_peak = max((p.peak_bytes for p in solved.pool_peaks if p.pool == "ub"), default=peak_single)
-        return ub_peak <= budget, ub_peak, budget
-    except tile_solver.TileInfeasibleError:
-        return False, peak_single, budget
+    for slots in (UB_DOUBLE_BUFFER_SLOTS, 1):
+        bufs = _simultaneous_ub_buffers(members, traits, slots=slots)
+        if not bufs:
+            return True, 0, budget
+        peak = tile_solver._pool_peak_bytes(bufs, "aiv", "ub", UB_ALIGN_BYTES)
+        if peak <= budget:
+            return True, peak, budget
+    single_bufs = _simultaneous_ub_buffers(members, traits, slots=1)
+    peak_min = tile_solver._pool_peak_bytes(single_bufs, "aiv", "ub", UB_ALIGN_BYTES) if single_bufs else 0
+    return False, peak_min, budget
 
 
 def _output_shape_bytes(op: OpSpec, tr: OpTraitInfo) -> float:
@@ -627,7 +734,13 @@ def _law2_avoidable_read_bytes(siblings: Sequence[OpSpec], traits: Mapping[str, 
 
 
 def _same_domain(a: OpSpec, b: OpSpec) -> bool:
-    return (a.stage, a.phase, a.stream or "main", a.layer) == (b.stage, b.phase, b.stream or "main", b.layer)
+    scope_a = str(dict(a.metadata).get("model_scope") or "target").strip().lower()
+    scope_b = str(dict(b.metadata).get("model_scope") or "target").strip().lower()
+    return (
+        a.stage, a.phase, a.stream or "main", a.layer, scope_a,
+    ) == (
+        b.stage, b.phase, b.stream or "main", b.layer, scope_b,
+    )
 
 
 def _producer_port_key(
@@ -694,17 +807,372 @@ def _typed_mla_role(op: OpSpec) -> str:
     return ""
 
 
+def _resolve_soc_arch(
+    arch_family: str,
+    datapath: DatapathCapabilitySpec | None,
+    sku_id: str = "",
+) -> SocArch | None:
+    raw = str(arch_family or "").strip().upper()
+    if raw in {"A2", "A3", "A5"}:
+        return raw  # type: ignore[return-value]
+    low = f"{raw.lower()} {str(sku_id or '').strip().lower()}"
+    if "arch35" in low or "3510" in low or "950" in low:
+        return "A5"
+    if "910_93" in low or "910c" in low or "a3" in low:
+        return "A3"
+    if "910b" in low or "a2" in low:
+        return "A2"
+    if datapath is not None:
+        arch_id = str(getattr(datapath.compute_arch, "arch_id", "") or "").lower()
+        if "3510" in arch_id or "35" in arch_id:
+            return "A5"
+        if "22" in arch_id:
+            return "A2" if "910b" in low else "A3"
+    return None
+
+
+def _norm_abi_dtype(raw: str) -> str:
+    low = str(raw or "").strip().lower()
+    return _ABI_DTYPE_CANON.get(low, low)
+
+
+def _quant_contract_for_port(
+    dtype: str,
+    scale_format: str,
+    group_size: int | None,
+    *,
+    is_weight: bool,
+) -> tuple[str, tuple[int, ...], str]:
+    dt = _norm_abi_dtype(dtype)
+    if dt in {"bf16", "fp16", "fp32"}:
+        return "dense", (), "none"
+    if dt == "fp4_e2m1":
+        return "mx_fp4", (MX_GROUP_SIZE,), "fp8_e8m0"
+    if dt == "hifloat8":
+        return "hif8_mx", (MX_GROUP_SIZE,), "fp8_e8m0"
+    if dt in {"fp8_e4m3fn", "fp8_e5m2"}:
+        if group_size == BLOCK_QUANT_GROUP_SIZE and scale_format != "fp8_e8m0":
+            return "per_block_128", (BLOCK_QUANT_GROUP_SIZE,), "fp32"
+        return "mx_fp8", (MX_GROUP_SIZE,), "fp8_e8m0"
+    if dt == "int4":
+        return "w4a8_int", (), "fp32"
+    if dt == "int8":
+        return ("per_channel_int8" if is_weight else "per_token_int8"), (), "fp32"
+    return "none", (), "none"
+
+
+def _port(
+    role: str,
+    dtype: str,
+    shape: tuple[int, ...],
+    *,
+    layout: OperandLayout = "ND",
+    transposed: bool = False,
+    quant_mode: str = "dense",
+    group_shape: tuple[int, ...] = (),
+    scale_dtype: str = "none",
+) -> OperandPortSig:
+    return OperandPortSig(
+        role=role,
+        dtype=_norm_abi_dtype(dtype),
+        layout=layout,
+        transposed=transposed,
+        shape=shape,
+        quant_mode=quant_mode,
+        group_shape=group_shape,
+        scale_dtype=scale_dtype,
+        scale_shape=(),
+    )
+
+
+def _resolve_placement(arch: SocArch, world_size: int, meta: Mapping[str, Any]) -> RankPlacement:
+    if world_size <= 1:
+        return "local"
+    explicit = str(meta.get("rank_placement") or "").strip().lower()
+    if explicit in RANK_PLACEMENTS and explicit != "local":
+        return explicit  # type: ignore[return-value]
+    return _DEFAULT_REMOTE_PLACEMENT_BY_ARCH[arch]
+
+
+def _resolve_world_size(
+    op: OpSpec, default_ws: int | None, *, collective: bool = False,
+) -> int:
+    meta = dict(op.metadata) if op.metadata else {}
+    for key in ("comm_world_size", "world_size", "tp_size", "ep_size", "moe_ep_size"):
+        raw = meta.get(key)
+        if isinstance(raw, int) and not isinstance(raw, bool) and raw >= 1:
+            return raw
+    if default_ws is not None and default_ws >= 1:
+        return default_ws
+    return DEFAULT_COLLECTIVE_WORLD_SIZE if collective else 1
+
+
+def _verify_abi_query(
+    *,
+    abi_id: str,
+    soc_arch: SocArch,
+    sku_id: str,
+    graph_motif: str,
+    operands: tuple[OperandPortSig, ...],
+    outputs: tuple[OperandPortSig, ...],
+    pr_track: StackTrack,
+    track_spec: StackTrackSpec | None,
+    manifest_bindings: tuple[ManifestBinding, ...],
+    enabled_stack_passes: frozenset[str],
+    registry: ProbedAbiRegistry | None = None,
+    model_scope: Literal["target", "draft"] = "target",
+    rank_placement: RankPlacement = "local",
+    world_size: int = 1,
+    comm_group_id: str = "local",
+    comm_dtype: str = "none",
+    reduction_kind: str = "none",
+    activation_kind: str = "none",
+    activation_params: tuple[tuple[str, float], ...] = (),
+    has_bias: bool = False,
+    has_active_mask: bool = False,
+    dispatch_quant_mode: int = -1,
+    shared_experts_per_rank: int = 0,
+    top_k: int = 0,
+    moe_expert_num: int = 0,
+    qk_rope_head_dim: int = 0,
+    mla_variant: Literal["none", "latent_mla", "latent_mqa"] = "none",
+    kv_cache_dtype: str = "none",
+    has_kpool_indexer: bool = False,
+    dcp_size: int = 1,
+    pcp_size: int = 1,
+    is_act_and_mul: bool = False,
+) -> tuple[AbiSupportVerdict, str]:
+    reg = registry or default_abi_registry()
+    query = AbiQueryKey(
+        soc_arch=soc_arch,
+        sku_id=sku_id or _DEFAULT_SKU_BY_ARCH[soc_arch],
+        abi_id=abi_id,
+        graph_motif=graph_motif,
+        model_scope=model_scope,
+        draft_quant_mode="none",
+        pr_track=pr_track,
+        operands=operands,
+        outputs=outputs,
+        rank_placement=rank_placement,
+        world_size=world_size,
+        comm_group_id=comm_group_id,
+        comm_domain_width=world_size,
+        comm_dtype=comm_dtype,
+        reduction_kind=reduction_kind,
+        activation_kind=activation_kind,
+        activation_params=activation_params,
+        has_bias=has_bias,
+        has_active_mask=has_active_mask,
+        dispatch_quant_mode=dispatch_quant_mode,
+        shared_experts_per_rank=shared_experts_per_rank,
+        top_k=top_k,
+        moe_expert_num=moe_expert_num,
+        qk_rope_head_dim=qk_rope_head_dim,
+        mla_variant=mla_variant,
+        sfa_dcp_active=False,
+        pcp_size=pcp_size,
+        kv_cache_dtype=kv_cache_dtype,
+        has_kpool_indexer=has_kpool_indexer,
+        dcp_size=dcp_size,
+        is_act_and_mul=is_act_and_mul,
+        enabled_stack_passes=enabled_stack_passes,
+    )
+    verdict = reg.verify(
+        query,
+        track_spec=track_spec,
+        manifest_bindings=manifest_bindings,
+        engine_speedup_verified=False,
+    )
+    return verdict, query.canonical_digest()
+
+
+def _verdict_to_tier(
+    verdict: AbiSupportVerdict | None,
+    *,
+    fallback_tier: FusionTier,
+    fallback_backend: RegionBackendTarget,
+) -> tuple[FusionTier, bool, str, RegionBackendTarget]:
+    if verdict is None:
+        return fallback_tier, False, "soc_arch_unspecified_for_abi_probe", fallback_backend
+    if verdict.status == "admitted_shipping":
+        return "K1_shipping", True, "", verdict.backend_kind  # type: ignore[return-value]
+    if verdict.status == "admitted_proposed_pr":
+        return "K1_proposed_pr", False, "", verdict.backend_kind  # type: ignore[return-value]
+    return fallback_tier, False, verdict.rejection_reason or "rejected_abi", fallback_backend
+
+
+def _resolve_model_scope(ops: Sequence[OpSpec]) -> Literal["target", "draft"]:
+    for op in ops:
+        scope = str(dict(op.metadata).get("model_scope") or "").strip().lower()
+        if scope == "draft":
+            return "draft"
+    return "target"
+
+
 def _match_law4_mla_prolog(
     ordered: Sequence[OpSpec],
     traits: Mapping[str, OpTraitInfo],
     claimed: set[str],
     deps: Mapping[str, set[str]],
     succ: Mapping[str, list[str]],
+    *,
+    soc_arch: SocArch | None = None,
+    sku_id: str = "",
+    pr_track: StackTrack = "shipping",
+    track_spec: StackTrackSpec | None = None,
+    manifest_bindings: tuple[ManifestBinding, ...] = (),
+    enabled_stack_passes: frozenset[str] = DEFAULT_SHIPPING_STACK_PASSES,
+    registry: ProbedAbiRegistry | None = None,
 ) -> list[AlgebraicCandidate]:
-    """Match shipping ``aclnnMlaPrologV3`` via canonical ProbedAbiRegistry."""
-    del ordered, traits, claimed, deps, succ
-    raise NotImplementedError(
-        "LEGACY_PURGED: wire canonical mindie_sim.backends.abi_registry.ProbedAbiRegistry.verify()"
+    """Match shipping ``aclnnMlaPrologV3/V4WeightNz`` strictly via ``ProbedAbiRegistry``."""
+    if pr_track == "eager":
+        return []
+    by_id = {op.op_id: op for op in ordered}
+    role_of = {op.op_id: _typed_mla_role(op) for op in ordered}
+    by_domain: dict[tuple[Any, ...], list[OpSpec]] = defaultdict(list)
+    for op in ordered:
+        if op.op_id in claimed or not role_of[op.op_id]:
+            continue
+        scope = str(dict(op.metadata).get("model_scope") or "target").strip().lower()
+        by_domain[(op.stage, op.phase, op.stream or "main", op.layer, scope)].append(op)
+
+    found: list[AlgebraicCandidate] = []
+    for members in by_domain.values():
+        roles = {role_of[op.op_id] for op in members}
+        has_entry = "qkv_a" in roles or ({"q_a", "kv_a"} <= roles)
+        has_tail = bool({"q_b", "q_absorb", "rotary", "kv_store"} & roles)
+        if not has_entry or not has_tail or len(members) < MIN_MLA_PROLOG_MEMBERS:
+            continue
+        m_ids = {op.op_id for op in members}
+        if not _convex(ordered, m_ids):
+            continue
+        ordered_m = [op for op in ordered if op.op_id in m_ids]
+        metas = [dict(op.metadata) for op in ordered_m]
+        if any(str(m.get("mla_variant") or "").lower() == "latent_mqa" for m in metas):
+            continue
+        rope_dims = [int(m["qk_rope_head_dim"]) for m in metas if isinstance(m.get("qk_rope_head_dim"), int)]
+        rope_dim = rope_dims[0] if rope_dims else DEFAULT_MLA_ROPE_HEAD_DIM
+        if rope_dim <= 0:
+            continue
+        if any(bool(m.get("sfa_c8_w4a8_bypass")) for m in metas):
+            continue
+        entry_op = next((op for op in ordered_m if role_of[op.op_id] in {"qkv_a", "q_a"}), ordered_m[0])
+        tr = traits[entry_op.op_id]
+        m_dim = int(entry_op.local_shape[0]) if entry_op.local_shape else 1
+        h_dim = int(entry_op.local_shape[-1]) if len(entry_op.local_shape) >= 2 else max(1, m_dim)
+        w_dt = _norm_abi_dtype(tr.weight_dtype)
+        in_dt = _norm_abi_dtype(tr.input_dtype)
+        wq, wg, ws = _quant_contract_for_port(w_dt, tr.scale_format, tr.group_size, is_weight=True)
+        iq, ig, is_dt = _quant_contract_for_port(in_dt, tr.scale_format, tr.group_size, is_weight=False)
+        token_dt = "bf16" if w_dt == "fp8_e4m3fn" else in_dt
+        tok_q, tok_g, tok_s = ("dense", (), "none") if token_dt == "bf16" else (iq, ig, is_dt)
+        abi_id = "aclnnMlaPrologV4WeightNz" if (soc_arch == "A5" and w_dt == "fp8_e4m3fn") else "aclnnMlaPrologV3WeightNz"
+        q_norm_out_dt = "fp8_e4m3fn" if w_dt == "fp8_e4m3fn" else ("int8" if w_dt == "int8" else "bf16")
+        q_norm_scale_dt = "fp8_e8m0" if w_dt == "fp8_e4m3fn" else "fp32"
+        operands = (
+            _port("token_x", token_dt, (m_dim, h_dim), quant_mode=tok_q, group_shape=tok_g, scale_dtype=tok_s),
+            _port("weight_dq", w_dt, (h_dim, h_dim), layout="FRACTAL_NZ", quant_mode=wq, group_shape=wg, scale_dtype=ws),
+            _port("weight_uq_qr", w_dt, (h_dim, h_dim), layout="FRACTAL_NZ", quant_mode=wq, group_shape=wg, scale_dtype=ws),
+            _port("weight_uk", w_dt, (h_dim, h_dim), layout="FRACTAL_NZ", quant_mode=wq, group_shape=wg, scale_dtype=ws),
+            _port("weight_dkv_kr", w_dt, (h_dim, h_dim), layout="FRACTAL_NZ", quant_mode=wq, group_shape=wg, scale_dtype=ws),
+            _port("rmsnorm_gamma_cq", "bf16", _MLA_PROLOG_GAMMA_SHAPE),
+            _port("rmsnorm_gamma_ckv", "bf16", _MLA_PROLOG_GAMMA_SHAPE),
+            _port("rope_sin", "bf16", _MLA_PROLOG_ROPE_SHAPE),
+            _port("rope_cos", "bf16", _MLA_PROLOG_ROPE_SHAPE),
+            _port("kv_cache_ref", "bf16", (m_dim, h_dim)),
+            _port("kr_cache_ref", "bf16", (m_dim, rope_dim)),
+        )
+        outputs = (
+            _port("query_out", "bf16", (m_dim, h_dim)),
+            _port("query_rope_out", "bf16", (m_dim, rope_dim)),
+            _port("query_norm_out", q_norm_out_dt, (m_dim, h_dim)),
+            _port("dequant_scale_q_norm_out", q_norm_scale_dt, (m_dim, 1)),
+        )
+        verdict: AbiSupportVerdict | None = None
+        q_digest = ""
+        if soc_arch is not None:
+            verdict, q_digest = _verify_abi_query(
+                abi_id=abi_id, soc_arch=soc_arch, sku_id=sku_id, graph_motif="mla_prolog",
+                operands=operands, outputs=outputs, pr_track=pr_track, track_spec=track_spec,
+                manifest_bindings=manifest_bindings, enabled_stack_passes=enabled_stack_passes,
+                registry=registry, model_scope=_resolve_model_scope(ordered_m),
+                qk_rope_head_dim=rope_dim, mla_variant="latent_mla",
+            )
+        tier, shipping, unsup, backend = _verdict_to_tier(
+            verdict, fallback_tier="K3_dsl_pipeline", fallback_backend="tilelang",
+        )
+        if not shipping and pr_track != "target":
+            continue
+        ext_preserve = tuple(
+            op.op_id for op in ordered_m[:-1]
+            if any(u not in m_ids for u in succ.get(op.op_id, ()) if u in by_id)
+        )
+        ids_tup = tuple(op.op_id for op in ordered_m)
+        found.append(AlgebraicCandidate(
+            candidate_id=f"law4_mla_prolog_{ordered_m[-1].op_id}",
+            law="law4_view_or_abi",
+            abi_id=abi_id,
+            fusion_tier=tier,
+            member_ids=ids_tup,
+            shipping_supported=shipping,
+            preserve_port_ids=ext_preserve,
+            unsupported_reason=unsup,
+            avoidable_hbm_bytes=_avoidable_hbm_bytes(ordered_m, traits),
+            traits=tuple(traits[oid].trait.value for oid in ids_tup),
+            abi_verdict=verdict,
+            abi_query_digest=q_digest,
+            backend_target=backend,
+            fused_recipe="mla_prolog",
+        ))
+    return found
+
+
+def _build_mc2_gemm_verdict(
+    abi_id: str,
+    mm_op: OpSpec,
+    comm_op: OpSpec,
+    tr_mm: OpTraitInfo,
+    *,
+    soc_arch: SocArch | None,
+    sku_id: str,
+    ws: int,
+    pr_track: StackTrack,
+    track_spec: StackTrackSpec | None,
+    manifest_bindings: tuple[ManifestBinding, ...],
+    enabled_stack_passes: frozenset[str],
+    registry: ProbedAbiRegistry | None,
+    is_agmm: bool,
+) -> tuple[AbiSupportVerdict | None, str]:
+    if soc_arch is None or len(mm_op.local_shape) != MATMUL_SHAPE_RANK:
+        return None, ""
+    m_dim, n_dim, k_dim = (int(mm_op.local_shape[0]), int(mm_op.local_shape[1]), int(mm_op.local_shape[2]))
+    in_dt = _norm_abi_dtype(tr_mm.input_dtype)
+    w_dt = _norm_abi_dtype(tr_mm.weight_dtype)
+    out_dt = _norm_abi_dtype(tr_mm.output_dtype)
+    iq, ig, is_dt = _quant_contract_for_port(in_dt, tr_mm.scale_format, tr_mm.group_size, is_weight=False)
+    wq, wg, ws_dt = _quant_contract_for_port(w_dt, tr_mm.scale_format, tr_mm.group_size, is_weight=True)
+    w_layout: OperandLayout = "FRACTAL_NZ" if w_dt in _ALLOWED_QUANT_FORMATS else "ND"
+    x1_m = max(0, m_dim // ws) if (is_agmm and m_dim > 0 and m_dim % ws == 0) else m_dim
+    out_m = x1_m * ws if is_agmm else (m_dim // ws)
+    operands = (
+        _port("x1", in_dt, (x1_m, k_dim), layout="ND", quant_mode=iq, group_shape=ig, scale_dtype=is_dt),
+        _port("x2", w_dt, (k_dim, n_dim), layout=w_layout, quant_mode=wq, group_shape=wg, scale_dtype=ws_dt),
+    )
+    outputs = (_port("y", out_dt, (out_m, n_dim)),)
+    meta = dict(comm_op.metadata)
+    placement = _resolve_placement(soc_arch, ws, meta)
+    axis = str(meta.get("group_axis") or tr_mm.collective_axis or "tp").strip().lower() or "tp"
+    has_bias = bool(dict(mm_op.metadata).get("has_bias", False))
+    return _verify_abi_query(
+        abi_id=abi_id, soc_arch=soc_arch, sku_id=sku_id,
+        graph_motif="all_gather_matmul" if is_agmm else "matmul_reduce_scatter",
+        operands=operands, outputs=outputs, pr_track=pr_track, track_spec=track_spec,
+        manifest_bindings=manifest_bindings, enabled_stack_passes=enabled_stack_passes,
+        registry=registry, model_scope=_resolve_model_scope((comm_op, mm_op)),
+        rank_placement=placement, world_size=ws, comm_group_id=axis,
+        comm_dtype=in_dt if is_agmm else out_dt,
+        reduction_kind="concat" if is_agmm else "sum",
+        has_bias=has_bias,
     )
 
 
@@ -716,12 +1184,258 @@ def _discover_law3_mc2(
     succ: Mapping[str, list[str]],
     *,
     allow_mc2: bool,
+    soc_arch: SocArch | None = None,
+    sku_id: str = "",
+    tp_size: int | None = None,
+    pr_track: StackTrack = "shipping",
+    track_spec: StackTrackSpec | None = None,
+    manifest_bindings: tuple[ManifestBinding, ...] = (),
+    enabled_stack_passes: frozenset[str] = DEFAULT_SHIPPING_STACK_PASSES,
+    include_abi_extensions: bool = True,
+    registry: ProbedAbiRegistry | None = None,
 ) -> list[AlgebraicCandidate]:
-    """Law 3: Bilinear MatMul x Associative Collective Pipelining (MC2)."""
-    del ordered, traits, claimed, deps, succ, allow_mc2
-    raise NotImplementedError(
-        "LEGACY_PURGED: wire canonical mindie_sim.backends.abi_registry.ProbedAbiRegistry.verify()"
+    """Law 3: Bilinear MatMul x Associative Collective Pipelining (AGMM / MMRS) via ``ProbedAbiRegistry``."""
+    del deps
+    if not allow_mc2 or pr_track == "eager":
+        return []
+    by_id = {op.op_id: op for op in ordered}
+    found: list[AlgebraicCandidate] = []
+    for op in ordered:
+        if op.op_id in claimed:
+            continue
+        tr = traits[op.op_id]
+        if tr.trait == AlgebraicTrait.ASSOCIATIVE_COLLECTIVE and tr.collective_op == "CONCAT":
+            users = [by_id[u] for u in succ.get(op.op_id, ()) if u in by_id and u not in claimed]
+            if len(users) != 1 or not _same_domain(op, users[0]):
+                continue
+            mid = users[0]
+            mid_tr = traits[mid.op_id]
+            members: list[OpSpec] = [op, mid]
+            mm_op: OpSpec | None = mid if (mid_tr.trait == AlgebraicTrait.BILINEAR_MATMUL and not mid_tr.is_grouped_matmul) else None
+            # Law 3 AGMM 3-op pattern: AllGather -> Dynamic[Mx]Quant -> QuantMatmul
+            if mm_op is None and mid_tr.symbolic_op_kind in {"dynamic_quant", "dynamic_mx_quant"}:
+                q_users = [by_id[u] for u in succ.get(mid.op_id, ()) if u in by_id and u not in claimed]
+                if len(q_users) == 1 and _same_domain(mid, q_users[0]):
+                    cand_mm = q_users[0]
+                    cand_tr = traits[cand_mm.op_id]
+                    if cand_tr.trait == AlgebraicTrait.BILINEAR_MATMUL and not cand_tr.is_grouped_matmul:
+                        mm_op = cand_mm
+                        members.append(mm_op)
+            if mm_op is None or not _convex(ordered, {m.op_id for m in members}):
+                continue
+            ws = _resolve_world_size(op, tp_size, collective=True)
+            verdict, q_digest = _build_mc2_gemm_verdict(
+                "aclnnAllGatherMatmulV2", mm_op, op, traits[mm_op.op_id],
+                soc_arch=soc_arch, sku_id=sku_id, ws=ws, pr_track=pr_track,
+                track_spec=track_spec, manifest_bindings=manifest_bindings,
+                enabled_stack_passes=enabled_stack_passes, registry=registry, is_agmm=True,
+            )
+            tier, shipping, unsup, backend = _verdict_to_tier(
+                verdict, fallback_tier="K3_dsl_pipeline", fallback_backend="tilelang",
+            )
+            if not shipping and verdict is not None and verdict.status != "admitted_proposed_pr":
+                if not (include_abi_extensions and pr_track == "target"):
+                    continue
+            ids = tuple(m.op_id for m in members)
+            found.append(AlgebraicCandidate(
+                candidate_id=f"law3_agmm_{mm_op.op_id}",
+                law="law3_mc2",
+                abi_id="aclnnAllGatherMatmulV2",
+                fusion_tier=tier,
+                member_ids=ids,
+                shipping_supported=shipping,
+                unsupported_reason=unsup,
+                avoidable_hbm_bytes=_avoidable_hbm_bytes(members, traits),
+                traits=tuple(traits[oid].trait.value for oid in ids),
+                abi_verdict=verdict,
+                abi_query_digest=q_digest,
+                backend_target=backend,
+                fused_recipe="all_gather_matmul",
+                requires_comm_consensus=True,
+            ))
+        elif tr.trait == AlgebraicTrait.BILINEAR_MATMUL and not tr.is_grouped_matmul:
+            users = [by_id[u] for u in succ.get(op.op_id, ()) if u in by_id and u not in claimed]
+            if len(users) != 1 or not _same_domain(op, users[0]):
+                continue
+            col = users[0]
+            col_tr = traits[col.op_id]
+            if col_tr.trait != AlgebraicTrait.ASSOCIATIVE_COLLECTIVE or col_tr.symbolic_op_kind != "reduce_scatter":
+                continue
+            members = [op, col]
+            if not _convex(ordered, {m.op_id for m in members}):
+                continue
+            ws = _resolve_world_size(col, tp_size, collective=True)
+            verdict, q_digest = _build_mc2_gemm_verdict(
+                "aclnnMatmulReduceScatterV2", op, col, tr,
+                soc_arch=soc_arch, sku_id=sku_id, ws=ws, pr_track=pr_track,
+                track_spec=track_spec, manifest_bindings=manifest_bindings,
+                enabled_stack_passes=enabled_stack_passes, registry=registry, is_agmm=False,
+            )
+            tier, shipping, unsup, backend = _verdict_to_tier(
+                verdict, fallback_tier="K3_dsl_pipeline", fallback_backend="tilelang",
+            )
+            if not shipping and verdict is not None and verdict.status != "admitted_proposed_pr":
+                if not (include_abi_extensions and pr_track == "target"):
+                    continue
+            ids = tuple(m.op_id for m in members)
+            found.append(AlgebraicCandidate(
+                candidate_id=f"law3_mmrs_{op.op_id}",
+                law="law3_mc2",
+                abi_id="aclnnMatmulReduceScatterV2",
+                fusion_tier=tier,
+                member_ids=ids,
+                shipping_supported=shipping,
+                unsupported_reason=unsup,
+                avoidable_hbm_bytes=_avoidable_hbm_bytes(members, traits),
+                traits=tuple(traits[oid].trait.value for oid in ids),
+                abi_verdict=verdict,
+                abi_query_digest=q_digest,
+                backend_target=backend,
+                fused_recipe="matmul_reduce_scatter",
+                requires_comm_consensus=True,
+            ))
+    return found
+
+
+def _consumer_accepts_strided_view(consumer: OpSpec) -> bool:
+    meta = dict(consumer.metadata) if consumer.metadata else {}
+    return bool(meta.get("accepts_strided_view") or meta.get("packed_view_compatible"))
+
+
+def _splitv_unabsorbed_bytes(
+    siblings: Sequence[OpSpec],
+    by_id: Mapping[str, OpSpec],
+    traits: Mapping[str, OpTraitInfo],
+    succ: Mapping[str, list[str]],
+) -> int:
+    """Exact read+write HBM traffic for consumers that require materialized contiguous SplitV slices."""
+    total = 0.0
+    for sib in siblings:
+        users = [by_id[u] for u in succ.get(sib.op_id, ()) if u in by_id]
+        if not users:
+            continue
+        if all(_consumer_accepts_strided_view(u) for u in users):
+            continue
+        total += 2.0 * _output_shape_bytes(sib, traits[sib.op_id])
+    return int(round(total))
+
+
+def _verify_law2a_matmul_abi(
+    siblings: Sequence[OpSpec],
+    traits: Mapping[str, OpTraitInfo],
+    *,
+    soc_arch: SocArch | None,
+    sku_id: str,
+    pr_track: StackTrack,
+    track_spec: StackTrackSpec | None,
+    manifest_bindings: tuple[ManifestBinding, ...],
+    enabled_stack_passes: frozenset[str],
+    registry: ProbedAbiRegistry | None,
+) -> tuple[str, AbiSupportVerdict | None, str]:
+    first = siblings[0]
+    tr = traits[first.op_id]
+    in_dt = _norm_abi_dtype(tr.input_dtype)
+    w_dt = _norm_abi_dtype(tr.weight_dtype)
+    out_dt = _norm_abi_dtype(tr.output_dtype)
+    is_quant = in_dt in _ALLOWED_QUANT_FORMATS or w_dt in _ALLOWED_QUANT_FORMATS
+    abi_id = "aclnnQuantMatmulV4" if is_quant else "aclnnMatmul"
+    if soc_arch is None or len(first.local_shape) != MATMUL_SHAPE_RANK:
+        return abi_id, None, ""
+    m_dim = int(first.local_shape[0])
+    k_dim = int(first.local_shape[2])
+    n_sum = sum(int(s.local_shape[1]) for s in siblings if len(s.local_shape) == MATMUL_SHAPE_RANK)
+    iq, ig, is_dt = _quant_contract_for_port(in_dt, tr.scale_format, tr.group_size, is_weight=False)
+    wq, wg, ws_dt = _quant_contract_for_port(w_dt, tr.scale_format, tr.group_size, is_weight=True)
+    w_layout: OperandLayout = "FRACTAL_NZ" if is_quant else "ND"
+    operands = (
+        _port("x1", in_dt, (m_dim, k_dim), layout="ND", quant_mode=iq, group_shape=ig, scale_dtype=is_dt),
+        _port("x2", w_dt, (k_dim, n_sum), layout=w_layout, quant_mode=wq, group_shape=wg, scale_dtype=ws_dt),
     )
+    outputs = (_port("y", out_dt, (m_dim, n_sum)),)
+    verdict, q_digest = _verify_abi_query(
+        abi_id=abi_id, soc_arch=soc_arch, sku_id=sku_id, graph_motif="sibling_block_matmul",
+        operands=operands, outputs=outputs, pr_track=pr_track, track_spec=track_spec,
+        manifest_bindings=manifest_bindings, enabled_stack_passes=enabled_stack_passes,
+        registry=registry, model_scope=_resolve_model_scope(siblings),
+    )
+    return abi_id, verdict, q_digest
+
+
+def _discover_law2b_matmul_epilogue(
+    ordered: Sequence[OpSpec],
+    by_id: Mapping[str, OpSpec],
+    traits: Mapping[str, OpTraitInfo],
+    claimed: set[str],
+    succ: Mapping[str, list[str]],
+    datapath: DatapathCapabilitySpec | None,
+    *,
+    soc_arch: SocArch | None,
+    pr_track: StackTrack,
+    include_abi_extensions: bool,
+) -> list[AlgebraicCandidate]:
+    """Law 2b: ``BILINEAR_MATMUL`` + executable ``<2us`` UB epilogue (excludes topk/routing)."""
+    if pr_track != "target" or not include_abi_extensions:
+        return []
+    found: list[AlgebraicCandidate] = []
+    for op in ordered:
+        if op.op_id in claimed:
+            continue
+        tr = traits[op.op_id]
+        if tr.trait != AlgebraicTrait.BILINEAR_MATMUL or tr.is_grouped_matmul:
+            continue
+        users = [u for u in succ.get(op.op_id, ()) if u in by_id]
+        if len(users) != 1 or users[0] in claimed:
+            continue
+        ep_chain: list[OpSpec] = []
+        cur_id = op.op_id
+        while len(ep_chain) < MAX_LAW2B_EPILOGUE_OPS:
+            nxt_ids = [u for u in succ.get(cur_id, ()) if u in by_id]
+            if len(nxt_ids) != 1 or nxt_ids[0] in claimed:
+                break
+            nxt = by_id[nxt_ids[0]]
+            nxt_tr = traits[nxt.op_id]
+            if not nxt_tr.is_micro_epilogue_eligible or not _same_domain(op, nxt):
+                break
+            if ep_chain:
+                is_view = str(nxt.family or "").strip().lower() in _ZERO_COPY_VIEW_FAMILIES
+                is_quant = nxt_tr.symbolic_op_kind in {"dynamic_quant", "dynamic_mx_quant"}
+                if not (is_view or is_quant):
+                    break
+            ep_chain.append(nxt)
+            cur_id = nxt.op_id
+        if not ep_chain:
+            continue
+        members = [op, *ep_chain]
+        m_ids = {m.op_id for m in members}
+        if not _convex(ordered, m_ids):
+            continue
+        if datapath is not None:
+            fits, ub_pk, ub_cap = _check_ub_chain_fits(ep_chain, traits, datapath, uses_simt=False)
+            if not fits:
+                continue
+        else:
+            ub_pk, ub_cap = 0, 0
+        # Preserve BF16 rounding boundaries on MatMul(BF16) -> Cast(FP32) epilogues.
+        has_quant_ep = any(traits[e.op_id].symbolic_op_kind in {"dynamic_quant", "dynamic_mx_quant"} for e in ep_chain)
+        backend: RegionBackendTarget = "catlass" if (soc_arch == "A5" and has_quant_ep) else "tilelang"
+        abi_id = "catlass_epilogue_dual_level_quant_mx" if backend == "catlass" else "FusedMatmulUbEpilogue"
+        ids_tup = tuple(m.op_id for m in members)
+        found.append(AlgebraicCandidate(
+            candidate_id=f"law2b_ep_{op.op_id}",
+            law="law2_block_matmul",
+            abi_id=abi_id,
+            fusion_tier="K2_epilogue",
+            member_ids=ids_tup,
+            shipping_supported=False,
+            unsupported_reason="custom_k2_matmul_ub_epilogue",
+            ub_peak_bytes=ub_pk,
+            ub_budget_bytes=ub_cap,
+            avoidable_hbm_bytes=_avoidable_hbm_bytes(members, traits),
+            traits=tuple(traits[oid].trait.value for oid in ids_tup),
+            backend_target=backend,
+            fused_recipe="gemm_epilogue",
+        ))
+    return found
 
 
 def _discover_law2_block_matmul(
@@ -729,12 +1443,93 @@ def _discover_law2_block_matmul(
     traits: Mapping[str, OpTraitInfo],
     claimed: set[str],
     succ: Mapping[str, list[str]],
+    *,
+    datapath: DatapathCapabilitySpec | None = None,
+    soc_arch: SocArch | None = None,
+    sku_id: str = "",
+    pr_track: StackTrack = "shipping",
+    track_spec: StackTrackSpec | None = None,
+    manifest_bindings: tuple[ManifestBinding, ...] = (),
+    enabled_stack_passes: frozenset[str] = DEFAULT_SHIPPING_STACK_PASSES,
+    include_abi_extensions: bool = True,
+    registry: ProbedAbiRegistry | None = None,
 ) -> tuple[list[AlgebraicCandidate], list[tuple[str, str]]]:
-    """Law 2: Block-Matrix Right-Distributivity ``x W1, x W2 -> x [W1 | W2]``."""
-    del ordered, traits, claimed, succ
-    raise NotImplementedError(
-        "LEGACY_PURGED: wire canonical mindie_sim.backends.abi_registry.ProbedAbiRegistry.verify() + PrimitiveTable launch cost"
-    )
+    """Law 2a (sibling block-MatMul) + Law 2b (``BILINEAR_MATMUL`` + ``<2us`` UB epilogue)."""
+    if pr_track == "eager":
+        return [], []
+    by_id = {op.op_id: op for op in ordered}
+    buckets: dict[Any, list[OpSpec]] = defaultdict(list)
+    rejected: list[tuple[str, str]] = []
+    for op in ordered:
+        if op.op_id in claimed:
+            continue
+        tr = traits[op.op_id]
+        if tr.trait != AlgebraicTrait.BILINEAR_MATMUL or tr.is_grouped_matmul:
+            continue
+        key = _law2_sibling_key(op, all_ops=by_id)
+        if key is None:
+            continue
+        buckets[key].append(op)
+
+    found: list[AlgebraicCandidate] = []
+    for group in buckets.values():
+        if len(group) < MIN_FUSE_MEMBERS:
+            continue
+        # Filter out pairs with ancestor dependencies or illegal cross-precision merges.
+        independent: list[OpSpec] = []
+        for cand in group:
+            if any(_is_ancestor(prev.op_id, cand.op_id, succ) or _is_ancestor(cand.op_id, prev.op_id, succ)
+                   for prev in independent):
+                rejected.append((cand.op_id, "law2_sibling_dependency"))
+                continue
+            independent.append(cand)
+        if len(independent) < MIN_FUSE_MEMBERS:
+            continue
+        if has_illegal_cross_precision_merge(independent):
+            rejected.append((",".join(op.op_id for op in independent), "law2_cross_precision_merge"))
+            continue
+        m_ids = {op.op_id for op in independent}
+        if not _convex(ordered, m_ids):
+            rejected.append((",".join(op.op_id for op in independent), "law2_non_convex"))
+            continue
+        avoid = _law2_avoidable_read_bytes(independent, traits)
+        splitv_cost = _splitv_unabsorbed_bytes(independent, by_id, traits, succ)
+        if splitv_cost > 0 and splitv_cost >= avoid:
+            rejected.append((",".join(op.op_id for op in independent), "law2_unabsorbed_splitv_exceeds_saving"))
+            continue
+        abi_id, verdict, q_digest = _verify_law2a_matmul_abi(
+            independent, traits, soc_arch=soc_arch, sku_id=sku_id, pr_track=pr_track,
+            track_spec=track_spec, manifest_bindings=manifest_bindings,
+            enabled_stack_passes=enabled_stack_passes, registry=registry,
+        )
+        tier, shipping, unsup, backend = _verdict_to_tier(
+            verdict, fallback_tier="K2_epilogue", fallback_backend="catlass",
+        )
+        if not shipping and verdict is not None and pr_track != "target":
+            rejected.append((",".join(op.op_id for op in independent), unsup))
+            continue
+        ids_tup = tuple(op.op_id for op in independent)
+        found.append(AlgebraicCandidate(
+            candidate_id=f"law2_block_{independent[0].op_id}",
+            law="law2_block_matmul",
+            abi_id=abi_id,
+            fusion_tier=tier,
+            member_ids=ids_tup,
+            shipping_supported=shipping,
+            preserve_port_ids=ids_tup,
+            unsupported_reason=unsup,
+            avoidable_hbm_bytes=max(0, avoid - splitv_cost),
+            traits=tuple(traits[oid].trait.value for oid in ids_tup),
+            abi_verdict=verdict,
+            abi_query_digest=q_digest,
+            backend_target=backend,
+            fused_recipe="gemm",
+        ))
+    found.extend(_discover_law2b_matmul_epilogue(
+        ordered, by_id, traits, claimed, succ, datapath,
+        soc_arch=soc_arch, pr_track=pr_track, include_abi_extensions=include_abi_extensions,
+    ))
+    return found, rejected
 
 
 def _append_audit_trigger(
@@ -778,28 +1573,28 @@ def _append_audit_trigger(
     ))
 
 
-def _has_moe_dispatch_combine_frame(
+def _locate_moe_dispatch_combine_frame(
     op: OpSpec,
     tail: OpSpec,
     by_id: Mapping[str, OpSpec],
     traits: Mapping[str, OpTraitInfo],
     succ: Mapping[str, list[str]],
-) -> bool:
-    """Require a complete connected ``dispatch -> GMM1 -> gate [-> quant] -> GMM2 -> combine`` frame."""
+) -> tuple[OpSpec, OpSpec, OpSpec] | None:
+    """Locate connected ``(dispatch, gmm2, combine)`` around ``op -> ... -> tail``."""
     dispatch_ops = [
         by_id[dep] for dep in op.deps
         if dep in by_id and traits[dep].symbolic_op_kind in {"dispatch", "alltoall"}
         and _same_domain(by_id[dep], op)
     ]
     if not dispatch_ops:
-        return False
+        return None
     disp_axes = {
         str(dict(d.metadata).get("group_axis") or traits[d.op_id].collective_axis or "").strip().lower()
         for d in dispatch_ops
     }
     disp_axes.discard("")
     if disp_axes and disp_axes != {"ep"}:
-        return False
+        return None
     for nxt_id in succ.get(tail.op_id, ()):
         if nxt_id not in by_id or not traits[nxt_id].is_grouped_matmul:
             continue
@@ -819,8 +1614,146 @@ def _has_moe_dispatch_combine_frame(
                 continue
             if disp_axes and comb_axis and comb_axis not in disp_axes:
                 continue
-            return True
-    return False
+            return dispatch_ops[0], gmm2, comb
+    return None
+
+
+def _has_moe_dispatch_combine_frame(
+    op: OpSpec,
+    tail: OpSpec,
+    by_id: Mapping[str, OpSpec],
+    traits: Mapping[str, OpTraitInfo],
+    succ: Mapping[str, list[str]],
+) -> bool:
+    """Require a complete connected ``dispatch -> GMM1 -> gate [-> quant] -> GMM2 -> combine`` frame."""
+    return _locate_moe_dispatch_combine_frame(op, tail, by_id, traits, succ) is not None
+
+
+def _norm_moe_activation(act: str) -> str:
+    low = str(act or "").strip().lower()
+    if low == "situ":
+        return "situglu"
+    return low or "swiglu"
+
+
+def _verify_moe_frame_abi(
+    dispatch_op: OpSpec,
+    gmm1: OpSpec,
+    act_op: OpSpec,
+    gmm2: OpSpec,
+    combine_op: OpSpec,
+    traits: Mapping[str, OpTraitInfo],
+    *,
+    soc_arch: SocArch | None,
+    sku_id: str,
+    ep_size: int | None,
+    enable_fused_mc2: int | None,
+    pr_track: StackTrack,
+    track_spec: StackTrackSpec | None,
+    manifest_bindings: tuple[ManifestBinding, ...],
+    enabled_stack_passes: frozenset[str],
+    registry: ProbedAbiRegistry | None,
+) -> tuple[str, AbiSupportVerdict | None, str]:
+    tr1 = traits[gmm1.op_id]
+    act_norm = _norm_moe_activation(traits[act_op.op_id].activation_kind or act_op.family)
+    w_dt = _norm_abi_dtype(tr1.weight_dtype)
+    use_csrc = (
+        soc_arch == "A3"
+        and (enable_fused_mc2 == 1 or (enable_fused_mc2 is None and w_dt in {"int8", "int4"}))
+    )
+    abi_id = "dispatch_ffn_combine" if use_csrc else "aclnnMegaMoe"
+    if soc_arch is None:
+        return abi_id, None, ""
+    ws = _resolve_world_size(dispatch_op, ep_size, collective=True)
+    meta_disp = dict(dispatch_op.metadata)
+    placement = _resolve_placement(soc_arch, ws, meta_disp)
+    m_dim = int(gmm1.local_shape[0]) if gmm1.local_shape else 1
+    h_dim = int(gmm1.local_shape[2]) if len(gmm1.local_shape) == MATMUL_SHAPE_RANK else int(
+        gmm1.local_shape[-1] if gmm1.local_shape else 0
+    )
+    inter_dim = int(gmm1.local_shape[1]) if len(gmm1.local_shape) == MATMUL_SHAPE_RANK else 0
+    wq, wg, ws_dt = _quant_contract_for_port(w_dt, tr1.scale_format, tr1.group_size, is_weight=True)
+    if abi_id == "dispatch_ffn_combine":
+        base_ops = [
+            _port("x", "bf16", (m_dim, h_dim)),
+            _port("weight1", w_dt, (h_dim, inter_dim), layout="FRACTAL_NZ", quant_mode=wq, group_shape=wg, scale_dtype=ws_dt),
+            _port("weight2", w_dt, (inter_dim, h_dim), layout="FRACTAL_NZ", quant_mode=wq, group_shape=wg, scale_dtype=ws_dt),
+            _port("expert_idx", "int32", (m_dim, 1), quant_mode="none"),
+            _port("scale1", "fp32", (1,)),
+            _port("scale2", "fp32", (1,)),
+        ]
+        if w_dt == "int4":
+            base_ops.extend((_port("bias1", "fp32", (1,)), _port("bias2", "fp32", (1,))))
+        base_ops.append(_port("probs", "fp32", (m_dim, 1)))
+        operands = tuple(base_ops)
+        outputs = (_port("out", "bf16", (m_dim, h_dim)), _port("expert_token_nums", "int64", (1,)))
+    else:
+        operands = (
+            _port("context", "int8", _MEGAMOE_CONTEXT_BYTES_SHAPE, quant_mode="none"),
+            _port("x", "bf16", (m_dim, h_dim)),
+            _port("topk_ids", "int32", (m_dim, 1), quant_mode="none"),
+            _port("topk_weights", "fp32", (m_dim, 1)),
+            _port("weight1", w_dt, (h_dim, inter_dim), layout="FRACTAL_NZ", quant_mode=wq, group_shape=wg, scale_dtype=ws_dt),
+            _port("weight2", w_dt, (inter_dim, h_dim), layout="FRACTAL_NZ", quant_mode=wq, group_shape=wg, scale_dtype=ws_dt),
+        )
+        outputs = (_port("y", "bf16", (m_dim, h_dim)), _port("expert_token_nums", "int64", (1,)))
+    top_k = int(meta_disp.get("top_k") or dict(gmm1.metadata).get("top_k") or 0)
+    shared = int(meta_disp.get("shared_experts_per_rank") or 0)
+    verdict, q_digest = _verify_abi_query(
+        abi_id=abi_id, soc_arch=soc_arch, sku_id=sku_id, graph_motif="moe_mc2_frame",
+        operands=operands, outputs=outputs, pr_track=pr_track, track_spec=track_spec,
+        manifest_bindings=manifest_bindings, enabled_stack_passes=enabled_stack_passes,
+        registry=registry, model_scope=_resolve_model_scope((dispatch_op, gmm1, gmm2, combine_op)),
+        rank_placement=placement, world_size=ws, comm_group_id="ep",
+        comm_dtype="bf16", reduction_kind="permute", activation_kind=act_norm,
+        has_active_mask=bool(meta_disp.get("has_active_mask", True)),
+        dispatch_quant_mode=int(meta_disp.get("dispatch_quant_mode", 0)),
+        shared_experts_per_rank=shared, top_k=top_k, is_act_and_mul=True,
+    )
+    return abi_id, verdict, q_digest
+
+
+def _verify_gmm_act_quant_abi(
+    gmm_op: OpSpec,
+    act_op: OpSpec,
+    quant_op: OpSpec | None,
+    traits: Mapping[str, OpTraitInfo],
+    *,
+    soc_arch: SocArch | None,
+    sku_id: str,
+    pr_track: StackTrack,
+    track_spec: StackTrackSpec | None,
+    manifest_bindings: tuple[ManifestBinding, ...],
+    enabled_stack_passes: frozenset[str],
+    registry: ProbedAbiRegistry | None,
+) -> tuple[str, AbiSupportVerdict | None, str]:
+    tr_g = traits[gmm_op.op_id]
+    act_norm = _norm_moe_activation(traits[act_op.op_id].activation_kind or act_op.family)
+    if quant_op is None:
+        return "FusedGroupedMatmulActivation", None, ""
+    abi_id = "aclnnGroupedMatmulSwigluQuantV2"
+    if soc_arch is None or len(gmm_op.local_shape) != MATMUL_SHAPE_RANK:
+        return abi_id, None, ""
+    m_dim, n_dim, k_dim = (int(gmm_op.local_shape[0]), int(gmm_op.local_shape[1]), int(gmm_op.local_shape[2]))
+    in_dt = _norm_abi_dtype(tr_g.input_dtype)
+    w_dt = _norm_abi_dtype(tr_g.weight_dtype)
+    iq, ig, is_dt = _quant_contract_for_port(in_dt, tr_g.scale_format, tr_g.group_size, is_weight=False)
+    wq, wg, ws_dt = _quant_contract_for_port(w_dt, tr_g.scale_format, tr_g.group_size, is_weight=True)
+    out_dt = _norm_abi_dtype(traits[quant_op.op_id].output_dtype)
+    scale_dt = "fp8_e8m0" if out_dt in _MX_DTYPES else "fp32"
+    operands = (
+        _port("x", in_dt, (m_dim, k_dim), layout="ND", quant_mode=iq, group_shape=ig, scale_dtype=is_dt),
+        _port("w", w_dt, (k_dim, n_dim), layout="FRACTAL_NZ", quant_mode=wq, group_shape=wg, scale_dtype=ws_dt),
+    )
+    outputs = (_port("y", out_dt, (m_dim, n_dim)), _port("y_scale", scale_dt, (m_dim, 1)))
+    verdict, q_digest = _verify_abi_query(
+        abi_id=abi_id, soc_arch=soc_arch, sku_id=sku_id, graph_motif="gmm_act_quant",
+        operands=operands, outputs=outputs, pr_track=pr_track, track_spec=track_spec,
+        manifest_bindings=manifest_bindings, enabled_stack_passes=enabled_stack_passes,
+        registry=registry, model_scope=_resolve_model_scope((gmm_op, act_op, quant_op)),
+        activation_kind=act_norm, is_act_and_mul=True,
+    )
+    return abi_id, verdict, q_digest
 
 
 def _discover_gmm_act_candidates(
@@ -836,13 +1769,123 @@ def _discover_gmm_act_candidates(
     include_abi_extensions: bool,
     arch_family: str = "",
     enable_fused_mc2: int | None = None,
+    soc_arch: SocArch | None = None,
+    sku_id: str = "",
+    ep_size: int | None = None,
+    allow_mc2: bool = True,
+    pr_track: StackTrack = "shipping",
+    track_spec: StackTrackSpec | None = None,
+    manifest_bindings: tuple[ManifestBinding, ...] = (),
+    enabled_stack_passes: frozenset[str] = DEFAULT_SHIPPING_STACK_PASSES,
+    registry: ProbedAbiRegistry | None = None,
 ) -> list[AlgebraicCandidate]:
-    """Match GroupedMatmul -> Activation (-> Quant) via canonical ProbedAbiRegistry."""
-    del ordered, by_id, traits, claimed, succ, datapath, triggers, trigger_keys
-    del include_abi_extensions, arch_family, enable_fused_mc2
-    raise NotImplementedError(
-        "LEGACY_PURGED: wire canonical mindie_sim.backends.abi_registry.ProbedAbiRegistry.verify()"
-    )
+    """Match MoE MC2 frames and ``GroupedMatmul -> Activation [-> Quant]`` via ``ProbedAbiRegistry``."""
+    del datapath
+    if pr_track == "eager":
+        return []
+    eff_arch = soc_arch or _resolve_soc_arch(arch_family, None, sku_id)
+    found: list[AlgebraicCandidate] = []
+    for op in ordered:
+        if op.op_id in claimed or not traits[op.op_id].is_grouped_matmul:
+            continue
+        users = [by_id[u] for u in succ.get(op.op_id, ()) if u in by_id and u not in claimed]
+        if len(users) != 1 or not _same_domain(op, users[0]):
+            continue
+        act_op = users[0]
+        act_tr = traits[act_op.op_id]
+        if not act_tr.activation_kind and act_tr.symbolic_op_kind not in {"swiglu", "situ", "gelu", "silu"}:
+            continue
+        quant_op: OpSpec | None = None
+        tail = act_op
+        act_users = [by_id[u] for u in succ.get(act_op.op_id, ()) if u in by_id and u not in claimed]
+        if len(act_users) == 1 and _same_domain(act_op, act_users[0]):
+            if traits[act_users[0].op_id].symbolic_op_kind in {"dynamic_quant", "dynamic_mx_quant"}:
+                quant_op = act_users[0]
+                tail = quant_op
+
+        # 1) Full MoE MC2 frame (dispatch -> GMM1 -> act [-> quant] -> GMM2 -> combine)
+        frame = _locate_moe_dispatch_combine_frame(op, tail, by_id, traits, succ) if allow_mc2 and enable_fused_mc2 != 0 else None
+        if frame is not None:
+            disp, gmm2, comb = frame
+            frame_ops = [disp, op, act_op, *([quant_op] if quant_op is not None else []), gmm2, comb]
+            if _convex(ordered, {m.op_id for m in frame_ops}):
+                abi_id, verdict, q_digest = _verify_moe_frame_abi(
+                    disp, op, act_op, gmm2, comb, traits,
+                    soc_arch=eff_arch, sku_id=sku_id, ep_size=ep_size,
+                    enable_fused_mc2=enable_fused_mc2, pr_track=pr_track,
+                    track_spec=track_spec, manifest_bindings=manifest_bindings,
+                    enabled_stack_passes=enabled_stack_passes, registry=registry,
+                )
+                tier, shipping, unsup, backend = _verdict_to_tier(
+                    verdict, fallback_tier="K3_dsl_pipeline", fallback_backend="tilelang",
+                )
+                if not shipping:
+                    act_tag = _norm_moe_activation(act_tr.activation_kind or act_op.family)
+                    _append_audit_trigger(
+                        triggers, trigger_keys, traits, "ABI_UNSUPPORTED_VARIANT", frame_ops,
+                        unsup or f"{abi_id} does not admit activation={act_tag} on arch={eff_arch}",
+                        cand_abi=f"{abi_id}_{act_tag}_ext",
+                    )
+                if shipping or (verdict is not None and verdict.status == "admitted_proposed_pr") or (
+                    include_abi_extensions and pr_track == "target"
+                ):
+                    ids_tup = tuple(m.op_id for m in frame_ops)
+                    found.append(AlgebraicCandidate(
+                        candidate_id=f"law3_moe_{op.op_id}",
+                        law="law3_mc2",
+                        abi_id=abi_id,
+                        fusion_tier=tier,
+                        member_ids=ids_tup,
+                        shipping_supported=shipping,
+                        unsupported_reason=unsup,
+                        avoidable_hbm_bytes=_avoidable_hbm_bytes(frame_ops, traits),
+                        traits=tuple(traits[oid].trait.value for oid in ids_tup),
+                        abi_verdict=verdict,
+                        abi_query_digest=q_digest,
+                        backend_target=backend,
+                        fused_recipe="megamoe_arch35" if abi_id == "aclnnMegaMoe" else abi_id,
+                        requires_comm_consensus=True,
+                    ))
+
+        # 2) Inner GMM -> Act [-> Quant] candidate (competes with MoE frame in conflict graph!)
+        inner_ops = [op, act_op, *([quant_op] if quant_op is not None else [])]
+        if not _convex(ordered, {m.op_id for m in inner_ops}):
+            continue
+        abi_id, verdict, q_digest = _verify_gmm_act_quant_abi(
+            op, act_op, quant_op, traits,
+            soc_arch=eff_arch, sku_id=sku_id, pr_track=pr_track,
+            track_spec=track_spec, manifest_bindings=manifest_bindings,
+            enabled_stack_passes=enabled_stack_passes, registry=registry,
+        )
+        tier, shipping, unsup, backend = _verdict_to_tier(
+            verdict, fallback_tier="K3_dsl_pipeline", fallback_backend="tilelang",
+        )
+        if not shipping and quant_op is not None:
+            _append_audit_trigger(
+                triggers, trigger_keys, traits, "ABI_UNSUPPORTED_VARIANT", inner_ops,
+                unsup or f"{abi_id} rejected by ProbedAbiRegistry on arch={eff_arch}",
+                cand_abi=abi_id,
+            )
+        if shipping or (verdict is not None and verdict.status == "admitted_proposed_pr") or (
+            include_abi_extensions and pr_track == "target"
+        ):
+            ids_tup = tuple(m.op_id for m in inner_ops)
+            found.append(AlgebraicCandidate(
+                candidate_id=f"law2_gmm_act_{op.op_id}",
+                law="law1_ub_chain",
+                abi_id=abi_id,
+                fusion_tier=tier,
+                member_ids=ids_tup,
+                shipping_supported=shipping,
+                unsupported_reason=unsup,
+                avoidable_hbm_bytes=_avoidable_hbm_bytes(inner_ops, traits),
+                traits=tuple(traits[oid].trait.value for oid in ids_tup),
+                abi_verdict=verdict,
+                abi_query_digest=q_digest,
+                backend_target=backend,
+                fused_recipe="grouped_matmul_swiglu_quant" if shipping else "custom_gmm_epilogue",
+            ))
+    return found
 
 
 def _collect_semantic_audit_triggers(
@@ -880,7 +1923,7 @@ def _collect_semantic_audit_triggers(
                     cand_abi="FusedAttentionUpdateMatmul",
                 )
             continue
-        if not tr.is_stateful:
+        if not tr.is_stateful or tr.is_terminal_sink:
             continue
         if tr.symbolic_op_kind == "recover_ssm":
             preds = [by_id[p] for p in deps.get(op.op_id, set()) if p in by_id and traits[p].is_stateful]
@@ -926,6 +1969,36 @@ def _pull_single_consumer_views(
     ]
 
 
+def _terminal_sink_admissible(
+    cur: OpSpec,
+    sink: OpSpec,
+    chain: Sequence[OpSpec],
+    by_id: Mapping[str, OpSpec],
+    succ: Mapping[str, list[str]],
+) -> bool:
+    """Enforce Law 1's 6-condition terminal cache-quant sink admission contract."""
+    # Condition 1: cur must feed the data operand (never slot_mapping/cache/cache_scale/x_scale).
+    bindings = getattr(sink, "input_bindings", ()) or ()
+    for binding in bindings:
+        prod_id = getattr(binding, "producer_op", "") or getattr(binding, "source_op", "")
+        role = str(getattr(binding, "role", "") or getattr(binding, "port", "")).strip().lower()
+        if prod_id == cur.op_id and role in _TERMINAL_SINK_NON_DATA_ROLES:
+            return False
+    # Condition 3: no external alias reader along any path from chain[0] to sink.
+    chain_ids = {op.op_id for op in chain} | {sink.op_id}
+    sink_meta = dict(sink.metadata) if sink.metadata else {}
+    cache_name = str(sink_meta.get("cache_buffer") or sink_meta.get("state_buffer") or "").strip().lower()
+    if cache_name:
+        for op in chain:
+            for u in succ.get(op.op_id, ()):
+                if u in chain_ids or u not in by_id:
+                    continue
+                u_meta = dict(by_id[u].metadata)
+                if str(u_meta.get("cache_buffer") or u_meta.get("state_buffer") or "").strip().lower() == cache_name:
+                    return False
+    return True
+
+
 def _discover_ub_chains(
     ordered: Sequence[OpSpec],
     by_id: Mapping[str, OpSpec],
@@ -934,19 +2007,31 @@ def _discover_ub_chains(
     deps: Mapping[str, set[str]],
     succ: Mapping[str, list[str]],
     datapath: DatapathCapabilitySpec | None,
+    *,
+    soc_arch: SocArch | None = None,
+    sku_id: str = "",
+    pr_track: StackTrack = "shipping",
+    track_spec: StackTrackSpec | None = None,
+    manifest_bindings: tuple[ManifestBinding, ...] = (),
+    enabled_stack_passes: frozenset[str] = DEFAULT_SHIPPING_STACK_PASSES,
+    include_abi_extensions: bool = True,
+    registry: ProbedAbiRegistry | None = None,
 ) -> list[AlgebraicCandidate]:
-    """Law 1 + Law 4: connected single-consumer UB chains over View/Pointwise/RowReduction."""
+    """Law 1 + Law 4: connected UB chains over View/Pointwise/RowReduction + terminal cache-quant sinks."""
+    if pr_track == "eager":
+        return []
     eligible_traits = {AlgebraicTrait.VIEW_METADATA, AlgebraicTrait.POINTWISE, AlgebraicTrait.ROW_REDUCTION}
     found: list[AlgebraicCandidate] = []
+    local_seen: set[str] = set()
     for op in ordered:
-        if op.op_id in claimed:
+        if op.op_id in claimed or op.op_id in local_seen:
             continue
         tr = traits[op.op_id]
         if tr.trait not in eligible_traits or tr.is_stateful or tr.is_opaque_custom:
             continue
         in_elig = [
             by_id[p] for p in deps.get(op.op_id, set())
-            if p in by_id and p not in claimed
+            if p in by_id and p not in claimed and p not in local_seen
             and traits[p].trait in eligible_traits
             and not traits[p].is_stateful and not traits[p].is_opaque_custom
             and _same_domain(by_id[p], op)
@@ -957,27 +2042,33 @@ def _discover_ub_chains(
         chain: list[OpSpec] = [op]
         cur = op
         while len(chain) < MAX_LAW1_CHAIN_LEN:
-            users = [u for u in succ.get(cur.op_id, ()) if u in by_id and u not in claimed]
-            if len(users) != 1:
+            # Check COMPLETE graph fan-out (never filter out already-claimed consumers!).
+            all_users = [u for u in succ.get(cur.op_id, ()) if u in by_id]
+            if len(all_users) != 1 or all_users[0] in claimed or all_users[0] in local_seen:
                 break
-            nxt = by_id[users[0]]
+            nxt = by_id[all_users[0]]
             nxt_tr = traits[nxt.op_id]
-            if (
-                nxt_tr.trait not in eligible_traits
-                or nxt_tr.is_stateful
-                or nxt_tr.is_opaque_custom
-                or not _same_domain(cur, nxt)
-            ):
+            if not _same_domain(cur, nxt) or nxt_tr.is_opaque_custom:
                 break
-            extras = _pull_single_consumer_views(nxt, {x.op_id for x in chain}, by_id, traits, claimed, deps, succ)
+            # Law 1 6-condition terminal cache-quant sink absorption (strictly terminates chain).
+            if nxt_tr.is_terminal_sink:
+                if _terminal_sink_admissible(cur, nxt, chain, by_id, succ):
+                    proposed = [*chain, nxt]
+                    fits, _, _ = _check_ub_chain_fits(proposed, traits, datapath, uses_simt=False)
+                    if fits and _convex(ordered, {x.op_id for x in proposed}):
+                        chain = proposed
+                break
+            if nxt_tr.trait not in eligible_traits or nxt_tr.is_stateful:
+                break
+            extras = _pull_single_consumer_views(nxt, {x.op_id for x in chain}, by_id, traits, claimed | local_seen, deps, succ)
             proposed = [*chain, *extras, nxt]
-            fits, _, _ = _check_ub_chain_fits(proposed, traits, datapath)
+            fits, _, _ = _check_ub_chain_fits(proposed, traits, datapath, uses_simt=False)
             if not fits or not _convex(ordered, {x.op_id for x in proposed}):
                 break
             chain = proposed
             cur = nxt
 
-        head_views = _pull_single_consumer_views(chain[0], {x.op_id for x in chain}, by_id, traits, claimed, deps, succ)
+        head_views = _pull_single_consumer_views(chain[0], {x.op_id for x in chain}, by_id, traits, claimed | local_seen, deps, succ)
         if head_views and _convex(ordered, {x.op_id for x in (*head_views, *chain)}):
             chain = [*head_views, *chain]
 
@@ -985,13 +2076,31 @@ def _discover_ub_chains(
             continue
         chain_set = {c.op_id for c in chain}
         chain_ordered = [x for x in ordered if x.op_id in chain_set]
-        fits, ub_pk, ub_cap = _check_ub_chain_fits(chain_ordered, traits, datapath)
+        fits, ub_pk, ub_cap = _check_ub_chain_fits(chain_ordered, traits, datapath, uses_simt=False)
         if not fits:
             continue
-        abi_id, tier, shipping, unsup = _classify_ub_chain_abi(chain_ordered, traits)
+        abi_id, tier, shipping, unsup, verdict, q_digest, backend = _classify_ub_chain_abi(
+            chain_ordered, traits,
+            soc_arch=soc_arch, sku_id=sku_id, pr_track=pr_track,
+            track_spec=track_spec, manifest_bindings=manifest_bindings,
+            enabled_stack_passes=enabled_stack_passes, registry=registry,
+        )
+        if not shipping and verdict is not None and verdict.status != "admitted_proposed_pr":
+            if not (include_abi_extensions and pr_track == "target"):
+                continue
+        if not shipping and verdict is None and not (include_abi_extensions and pr_track == "target"):
+            continue
         m_ids = tuple(x.op_id for x in chain_ordered)
-        elided = tuple(x.op_id for x in chain_ordered if traits[x.op_id].trait == AlgebraicTrait.VIEW_METADATA)
-        claimed.update(m_ids)
+        elided = tuple(
+            x.op_id for x in chain_ordered
+            if traits[x.op_id].trait == AlgebraicTrait.VIEW_METADATA
+            and str(x.family or "").strip().lower() in _ZERO_COPY_VIEW_FAMILIES
+        )
+        ext_preserve = tuple(
+            x.op_id for x in chain_ordered[:-1]
+            if any(u not in chain_set for u in succ.get(x.op_id, ()) if u in by_id)
+        )
+        local_seen.update(m_ids)
         found.append(AlgebraicCandidate(
             candidate_id=f"law1_ub_{chain_ordered[-1].op_id}",
             law="law4_view_or_abi" if len(elided) == len(chain_ordered) else "law1_ub_chain",
@@ -999,12 +2108,16 @@ def _discover_ub_chains(
             fusion_tier=tier,
             member_ids=m_ids,
             shipping_supported=shipping,
+            preserve_port_ids=ext_preserve,
             unsupported_reason=unsup,
             elided_view_ids=elided,
             ub_peak_bytes=ub_pk,
             ub_budget_bytes=ub_cap,
             avoidable_hbm_bytes=_avoidable_hbm_bytes(chain_ordered, traits),
             traits=tuple(traits[oid].trait.value for oid in m_ids),
+            abi_verdict=verdict,
+            abi_query_digest=q_digest,
+            backend_target=backend,
         ))
     return found
 
@@ -1020,8 +2133,17 @@ def _discover_law1_and_law4_chains(
     include_abi_extensions: bool = True,
     arch_family: str = "",
     enable_fused_mc2: int | None = None,
+    soc_arch: SocArch | None = None,
+    sku_id: str = "",
+    ep_size: int | None = None,
+    allow_mc2: bool = True,
+    pr_track: StackTrack = "shipping",
+    track_spec: StackTrackSpec | None = None,
+    manifest_bindings: tuple[ManifestBinding, ...] = (),
+    enabled_stack_passes: frozenset[str] = DEFAULT_SHIPPING_STACK_PASSES,
+    registry: ProbedAbiRegistry | None = None,
 ) -> tuple[list[AlgebraicCandidate], list[SemanticAuditTrigger]]:
-    """Law 1 (UB pointwise/reduction chains) + Law 4 (pure view elision & ABI match)."""
+    """Law 1 (UB pointwise/reduction chains + terminal sinks) + Law 4 (view elision & ABI match)."""
     by_id = {op.op_id: op for op in ordered}
     triggers: list[SemanticAuditTrigger] = []
     trigger_keys: set[tuple[str, tuple[str, ...]]] = set()
@@ -1030,19 +2152,200 @@ def _discover_law1_and_law4_chains(
         include_abi_extensions=include_abi_extensions,
         arch_family=arch_family,
         enable_fused_mc2=enable_fused_mc2,
+        soc_arch=soc_arch,
+        sku_id=sku_id,
+        ep_size=ep_size,
+        allow_mc2=allow_mc2,
+        pr_track=pr_track,
+        track_spec=track_spec,
+        manifest_bindings=manifest_bindings,
+        enabled_stack_passes=enabled_stack_passes,
+        registry=registry,
     )
     _collect_semantic_audit_triggers(ordered, by_id, traits, deps, succ, triggers, trigger_keys)
-    found.extend(_discover_ub_chains(ordered, by_id, traits, claimed, deps, succ, datapath))
+    found.extend(_discover_ub_chains(
+        ordered, by_id, traits, claimed, deps, succ, datapath,
+        soc_arch=soc_arch, sku_id=sku_id, pr_track=pr_track,
+        track_spec=track_spec, manifest_bindings=manifest_bindings,
+        enabled_stack_passes=enabled_stack_passes,
+        include_abi_extensions=include_abi_extensions, registry=registry,
+    ))
     return found, triggers
 
 
 def _classify_ub_chain_abi(
-    chain: Sequence[OpSpec], traits: Mapping[str, OpTraitInfo],
-) -> tuple[str, FusionTier, bool, str]:
-    del chain, traits
-    raise NotImplementedError(
-        "LEGACY_PURGED: wire canonical mindie_sim.backends.abi_registry.ProbedAbiRegistry.verify()"
-    )
+    chain: Sequence[OpSpec],
+    traits: Mapping[str, OpTraitInfo],
+    *,
+    soc_arch: SocArch | None = None,
+    sku_id: str = "",
+    pr_track: StackTrack = "shipping",
+    track_spec: StackTrackSpec | None = None,
+    manifest_bindings: tuple[ManifestBinding, ...] = (),
+    enabled_stack_passes: frozenset[str] = DEFAULT_SHIPPING_STACK_PASSES,
+    registry: ProbedAbiRegistry | None = None,
+) -> tuple[str, FusionTier, bool, str, AbiSupportVerdict | None, str, RegionBackendTarget]:
+    """Classify a Law 1 UB chain strictly against ``ProbedAbiRegistry`` (zero fake defaults)."""
+    syms = [traits[op.op_id].symbolic_op_kind for op in chain]
+    first, last = chain[0], chain[-1]
+    in_dt = _norm_abi_dtype(traits[first.op_id].input_dtype)
+    m_dim = int(first.local_shape[0]) if first.local_shape else 1
+    n_dim = int(first.local_shape[-1]) if len(first.local_shape) >= 2 else max(1, m_dim)
+
+    # Pure zero-copy view elision (never stamped as fake CANN K1_shipping).
+    if all(
+        traits[op.op_id].trait == AlgebraicTrait.VIEW_METADATA
+        and str(op.family or "").strip().lower() in _ZERO_COPY_VIEW_FAMILIES
+        for op in chain
+    ):
+        return "StridedViewElided", "K2_epilogue", False, "logical_view_elision", None, "", "tilelang"
+
+    # Terminal cache-quant sink chain (e.g. LayerNorm -> IndexerQuantCache): K2_epilogue on target track only.
+    if traits[last.op_id].is_terminal_sink:
+        return (
+            "FusedUbTerminalCacheQuantSink", "K2_epilogue", False,
+            "terminal_sink_fusion_requires_custom_k2", None, "", "tilelang",
+        )
+
+    sym_set = set(syms)
+    if ({"add", "rmsnorm"} <= sym_set or "add_rmsnorm" in sym_set) and (
+        "dynamic_mx_quant" in sym_set or "dynamic_quant" in sym_set
+    ):
+        is_mx = "dynamic_mx_quant" in sym_set
+        abi_id = "aclnnAddRmsNormDynamicMxQuant" if is_mx else "aclnnAddRmsNormDynamicQuant"
+        if soc_arch is not None:
+            operands = (
+                _port("x1", in_dt, (m_dim, n_dim)),
+                _port("x2", in_dt, (m_dim, n_dim)),
+                _port("gamma", in_dt, (n_dim,)),
+            )
+            outputs = (
+                (_port("y", "fp8_e4m3fn", (m_dim, n_dim)), _port("x_out", in_dt, (m_dim, n_dim)), _port("scale", "fp8_e8m0", (m_dim, 1)))
+                if is_mx else
+                (_port("y1", "int8", (m_dim, n_dim)), _port("y2", in_dt, (m_dim, n_dim)), _port("scale", "fp32", (m_dim, 1)))
+            )
+            verdict, q_digest = _verify_abi_query(
+                abi_id=abi_id, soc_arch=soc_arch, sku_id=sku_id, graph_motif="add_rmsnorm_quant",
+                operands=operands, outputs=outputs, pr_track=pr_track, track_spec=track_spec,
+                manifest_bindings=manifest_bindings, enabled_stack_passes=enabled_stack_passes,
+                registry=registry, model_scope=_resolve_model_scope(chain),
+            )
+            tier, shipping, unsup, backend = _verdict_to_tier(
+                verdict, fallback_tier="K3_dsl_pipeline", fallback_backend="tilelang",
+            )
+            return abi_id, tier, shipping, unsup, verdict, q_digest, backend
+        return abi_id, "K3_dsl_pipeline", False, "soc_arch_unspecified_for_abi_probe", None, "", "tilelang"
+
+    if "situ" in sym_set and ("dynamic_quant" in sym_set or "dynamic_mx_quant" in sym_set):
+        abi_id = "aclnnDequantSituQuant"
+        if soc_arch is not None:
+            verdict, q_digest = _verify_abi_query(
+                abi_id=abi_id, soc_arch=soc_arch, sku_id=sku_id, graph_motif="situ_quant",
+                operands=(_port("x", in_dt, (m_dim, n_dim)),),
+                outputs=(_port("y", "int8", (m_dim, n_dim)), _port("y_scale", "fp32", (m_dim, 1))),
+                pr_track=pr_track, track_spec=track_spec, manifest_bindings=manifest_bindings,
+                enabled_stack_passes=enabled_stack_passes, registry=registry,
+                model_scope=_resolve_model_scope(chain), activation_kind="situglu", is_act_and_mul=True,
+            )
+            tier, shipping, unsup, backend = _verdict_to_tier(
+                verdict, fallback_tier="K3_dsl_pipeline", fallback_backend="tilelang",
+            )
+            return abi_id, tier, shipping, unsup, verdict, q_digest, backend
+        return abi_id, "K3_dsl_pipeline", False, "soc_arch_unspecified_for_abi_probe", None, "", "tilelang"
+
+    if "swiglu" in sym_set and ("dynamic_quant" in sym_set or "dynamic_mx_quant" in sym_set):
+        abi_id = "aclnnSwiGluQuant"
+        if soc_arch is not None:
+            verdict, q_digest = _verify_abi_query(
+                abi_id=abi_id, soc_arch=soc_arch, sku_id=sku_id, graph_motif="swiglu_quant",
+                operands=(_port("x", in_dt, (m_dim, n_dim)),),
+                outputs=(_port("y", "int8", (m_dim, n_dim)), _port("scale", "fp32", (m_dim, 1))),
+                pr_track=pr_track, track_spec=track_spec, manifest_bindings=manifest_bindings,
+                enabled_stack_passes=enabled_stack_passes, registry=registry,
+                model_scope=_resolve_model_scope(chain), activation_kind="swiglu", is_act_and_mul=True,
+            )
+            tier, shipping, unsup, backend = _verdict_to_tier(
+                verdict, fallback_tier="K3_dsl_pipeline", fallback_backend="tilelang",
+            )
+            return abi_id, tier, shipping, unsup, verdict, q_digest, backend
+        return abi_id, "K3_dsl_pipeline", False, "soc_arch_unspecified_for_abi_probe", None, "", "tilelang"
+
+    return "FusedUbPointwiseChain", "K3_dsl_pipeline", False, "no_shipping_composite_ub_abi", None, "", "tilelang"
+
+
+def _candidate_priority_weight(cand: AlgebraicCandidate) -> tuple[int, int, int]:
+    return (1 if cand.shipping_supported else 0, cand.avoidable_hbm_bytes, len(cand.member_ids))
+
+
+def _resolve_conflict_graph(candidates: Sequence[AlgebraicCandidate]) -> list[AlgebraicCandidate]:
+    """Select maximum-weight non-overlapping candidates across competing conflict components."""
+    n = len(candidates)
+    if n <= 1:
+        return list(candidates)
+    member_sets = [frozenset(c.member_ids) for c in candidates]
+    adj: list[list[int]] = [[] for _ in range(n)]
+    for i in range(n):
+        for j in range(i + 1, n):
+            if member_sets[i] & member_sets[j]:
+                adj[i].append(j)
+                adj[j].append(i)
+    visited = [False] * n
+    selected_indices: list[int] = []
+    for root in range(n):
+        if visited[root]:
+            continue
+        comp: list[int] = []
+        stack = [root]
+        visited[root] = True
+        while stack:
+            node = stack.pop()
+            comp.append(node)
+            for nb in adj[node]:
+                if not visited[nb]:
+                    visited[nb] = True
+                    stack.append(nb)
+        if len(comp) == 1:
+            selected_indices.append(comp[0])
+            continue
+        if len(comp) <= MAX_CONFLICT_EXACT_SIZE:
+            comp.sort()
+            pos = {node: idx for idx, node in enumerate(comp)}
+            conflict_mask = [0] * len(comp)
+            for idx, node in enumerate(comp):
+                mask = 0
+                for nb in adj[node]:
+                    mask |= 1 << pos[nb]
+                conflict_mask[idx] = mask
+            best_score: tuple[int, int, int] = (-1, -1, -1)
+            best_mask = 0
+            for mask in range(1, 1 << len(comp)):
+                valid = True
+                ship_s = avoid_s = len_s = 0
+                for idx in range(len(comp)):
+                    if not (mask & (1 << idx)):
+                        continue
+                    if mask & conflict_mask[idx]:
+                        valid = False
+                        break
+                    w = _candidate_priority_weight(candidates[comp[idx]])
+                    ship_s += w[0]
+                    avoid_s += w[1]
+                    len_s += w[2]
+                if valid and (ship_s, avoid_s, len_s) > best_score:
+                    best_score = (ship_s, avoid_s, len_s)
+                    best_mask = mask
+            for idx in range(len(comp)):
+                if best_mask & (1 << idx):
+                    selected_indices.append(comp[idx])
+        else:
+            ranked = sorted(comp, key=lambda i: _candidate_priority_weight(candidates[i]), reverse=True)
+            chosen_ops: set[str] = set()
+            for idx in ranked:
+                if not (member_sets[idx] & chosen_ops):
+                    selected_indices.append(idx)
+                    chosen_ops.update(member_sets[idx])
+    selected_indices.sort()
+    return [candidates[i] for i in selected_indices]
 
 
 def discover_algebraic_rewrites_for_ops(
@@ -1052,12 +2355,20 @@ def discover_algebraic_rewrites_for_ops(
     allow_mc2: bool = True,
     include_abi_extensions: bool = True,
     arch_family: str = "",
+    sku_id: str = "",
     enable_fused_mc2: int | None = None,
+    tp_size: int | None = None,
+    ep_size: int | None = None,
+    pr_track: StackTrack = "shipping",
+    track_spec: StackTrackSpec | None = None,
+    manifest_bindings: tuple[ManifestBinding, ...] = (),
+    enabled_stack_passes: frozenset[str] | None = None,
     base_graph_sha256: str = "",
     framing_sha256: str = "",
+    registry: ProbedAbiRegistry | None = None,
 ) -> AlgebraicRewriteResult:
     """Run all 4 universal algebraic laws over a rank-local ``OpSpec`` DAG."""
-    if not ops:
+    if not ops or pr_track == "eager":
         return AlgebraicRewriteResult(
             plan=empty_plan(base_graph_sha256, framing_sha256),
             candidates=(),
@@ -1068,25 +2379,45 @@ def discover_algebraic_rewrites_for_ops(
     traits = {op.op_id: classify_op_traits(op) for op in ordered}
     deps = _dependencies(ordered)
     succ = _successors(ordered)
+    soc_arch = _resolve_soc_arch(arch_family, datapath, sku_id)
+    passes = DEFAULT_SHIPPING_STACK_PASSES if enabled_stack_passes is None else frozenset(enabled_stack_passes)
+    eff_track: StackTrack = track_spec.track if track_spec is not None else pr_track
+    # Allow explicit target-synthesis exploration when include_abi_extensions=True on standalone calls.
+    cand_track: StackTrack = "target" if (include_abi_extensions and track_spec is None and eff_track == "shipping") else eff_track
 
-    claimed: set[str] = set()
-    candidates: list[AlgebraicCandidate] = []
-    # Law 4a: Shipping composite MLA Prolog (Target + Draft).
-    candidates.extend(_match_law4_mla_prolog(ordered, traits, claimed, deps, succ))
-    # Law 3: Bilinear MatMul x Associative Collective Pipelining (MC2).
-    candidates.extend(_discover_law3_mc2(ordered, traits, claimed, deps, succ, allow_mc2=allow_mc2))
-    # Law 2: Block-Matrix Right-Distributivity.
-    law2_cands, rejected = _discover_law2_block_matmul(ordered, traits, claimed, succ)
-    candidates.extend(law2_cands)
-    # Law 1 + Law 4b: Single-consumer UB pointwise/reduction chains + view elision + triggers.
+    # Enumerate competing candidates independently across all 4 laws (non-greedy conflict graph).
+    raw_candidates: list[AlgebraicCandidate] = []
+    raw_candidates.extend(_match_law4_mla_prolog(
+        ordered, traits, set(), deps, succ,
+        soc_arch=soc_arch, sku_id=sku_id, pr_track=cand_track, track_spec=track_spec,
+        manifest_bindings=manifest_bindings, enabled_stack_passes=passes, registry=registry,
+    ))
+    raw_candidates.extend(_discover_law3_mc2(
+        ordered, traits, set(), deps, succ,
+        allow_mc2=allow_mc2 and enable_fused_mc2 != 0,
+        soc_arch=soc_arch, sku_id=sku_id, tp_size=tp_size, pr_track=cand_track,
+        track_spec=track_spec, manifest_bindings=manifest_bindings,
+        enabled_stack_passes=passes, include_abi_extensions=include_abi_extensions, registry=registry,
+    ))
+    law2_cands, rejected = _discover_law2_block_matmul(
+        ordered, traits, set(), succ,
+        datapath=datapath, soc_arch=soc_arch, sku_id=sku_id, pr_track=cand_track,
+        track_spec=track_spec, manifest_bindings=manifest_bindings,
+        enabled_stack_passes=passes, include_abi_extensions=include_abi_extensions, registry=registry,
+    )
+    raw_candidates.extend(law2_cands)
     law1_cands, triggers = _discover_law1_and_law4_chains(
-        ordered, traits, claimed, deps, succ, datapath,
+        ordered, traits, set(), deps, succ, datapath,
         include_abi_extensions=include_abi_extensions,
         arch_family=arch_family,
         enable_fused_mc2=enable_fused_mc2,
+        soc_arch=soc_arch, sku_id=sku_id, ep_size=ep_size, allow_mc2=allow_mc2,
+        pr_track=cand_track, track_spec=track_spec,
+        manifest_bindings=manifest_bindings, enabled_stack_passes=passes, registry=registry,
     )
-    candidates.extend(law1_cands)
+    raw_candidates.extend(law1_cands)
 
+    candidates = _resolve_conflict_graph(raw_candidates)
     edits: list[Edit] = []
     used_edit_ids: set[str] = set()
     for idx, cand in enumerate(candidates):
@@ -1095,7 +2426,11 @@ def discover_algebraic_rewrites_for_ops(
             eid = f"{eid}_{idx}"
         used_edit_ids.add(eid)
         refs = tuple(OpRef("atom", oid) for oid in cand.member_ids)
-        preserve = tuple(PortRef(OpRef("atom", oid), "output", 0) for oid in cand.preserve_port_ids)
+        preserve = (
+            tuple(PortRef(OpRef("atom", oid), pname, ver) for oid, pname, ver in cand.preserve_ports)
+            if cand.preserve_ports else
+            tuple(PortRef(OpRef("atom", oid), "output", 0) for oid in cand.preserve_port_ids)
+        )
         edits.append(Edit(
             edit_id=eid,
             operation=FuseRegion(
@@ -1103,6 +2438,12 @@ def discover_algebraic_rewrites_for_ops(
                 preserve_ports=preserve,
                 kernel_boundaries=(KernelBoundary(cand.abi_id, refs),),
                 fusion_tier=cand.fusion_tier,
+                backend_target=cand.backend_target,
+                abi_query_digest=cand.abi_query_digest,
+                lowering_id=cand.lowering_id,
+                lowering_sha256=cand.lowering_sha256,
+                ub_peak_bytes=cand.ub_peak_bytes,
+                ub_wall_bytes=cand.ub_budget_bytes,
             ),
         ))
     plan = RewritePlan(
@@ -1118,6 +2459,18 @@ def discover_algebraic_rewrites_for_ops(
     )
 
 
+def _passes_multi_rank_consensus(cand: AlgebraicCandidate, scenario: ResolvedScenario) -> bool:
+    """Require 100% rank consensus for every collective (Law 3) edit across all replicas."""
+    if not cand.requires_comm_consensus or len(scenario.atomic_ops) <= 1:
+        return True
+    required = set(cand.member_ids)
+    for rank_ops in scenario.atomic_ops:
+        present = {op.op_id for op in rank_ops.ops}
+        if not (required <= present):
+            return False
+    return True
+
+
 def discover_algebraic_rewrites(
     scenario: ResolvedScenario,
     *,
@@ -1125,7 +2478,7 @@ def discover_algebraic_rewrites(
     include_abi_extensions: bool = True,
     verify: bool = True,
 ) -> AlgebraicRewriteResult:
-    """Discover algebraic rewrites on a ``ResolvedScenario`` and verify via ``verify_plan``."""
+    """Discover algebraic rewrites on a ``ResolvedScenario`` with consensus and verification."""
     from .apply import apply_plan
     from .verify import verify_plan
 
@@ -1136,6 +2489,10 @@ def discover_algebraic_rewrites(
     if allow_mc2 is None:
         allow_mc2 = (fused_mc2_level != 0) if fused_mc2_level is not None else True
     arch_family = str(getattr(scenario.case.machine, "arch_family", "") or "")
+    sku_id = str(getattr(scenario.case.machine, "sku", "") or getattr(scenario.case.machine, "name", "") or "")
+    parallel = scenario.case.runtime.parallel
+    raw_track = str(meta.get("stack_track") or meta.get("pr_track") or "shipping").strip().lower()
+    pr_track: StackTrack = raw_track if raw_track in {"eager", "shipping", "proposed", "target"} else "shipping"  # type: ignore[assignment]
 
     rep_ops = scenario.atomic_ops[0].ops if scenario.atomic_ops else ()
     raw_res = discover_algebraic_rewrites_for_ops(
@@ -1144,23 +2501,45 @@ def discover_algebraic_rewrites(
         allow_mc2=bool(allow_mc2),
         include_abi_extensions=include_abi_extensions,
         arch_family=arch_family,
+        sku_id=sku_id,
         enable_fused_mc2=fused_mc2_level,
+        tp_size=int(parallel.tp),
+        ep_size=int(parallel.ep),
+        pr_track=pr_track,
         base_graph_sha256=scenario.base_graph_sha256,
         framing_sha256=scenario.framing_sha256,
     )
+    # Enforce 100% communicator consensus across all ranks for collective edits.
+    consensus_edits: list[Edit] = []
+    consensus_cands: list[AlgebraicCandidate] = []
+    rejected_pairs = list(raw_res.rejected_pairs)
+    for edit, cand in zip(raw_res.plan.edits, raw_res.candidates):
+        if _passes_multi_rank_consensus(cand, scenario):
+            consensus_edits.append(edit)
+            consensus_cands.append(cand)
+        else:
+            rejected_pairs.append((edit.edit_id, "multi_rank_collective_consensus_failed"))
+    consensus_plan = RewritePlan(
+        base_graph_sha256=scenario.base_graph_sha256,
+        framing_sha256=scenario.framing_sha256,
+        edits=tuple(consensus_edits),
+    )
     if not verify:
-        return raw_res
+        return AlgebraicRewriteResult(
+            plan=consensus_plan,
+            candidates=tuple(consensus_cands),
+            semantic_audit_triggers=raw_res.semantic_audit_triggers,
+            rejected_pairs=tuple(rejected_pairs),
+        )
     try:
-        applied = apply_plan(raw_res.plan, scenario)
+        applied = apply_plan(consensus_plan, scenario)
         receipt = verify_plan(scenario, applied, scope="archetype")
     except ModelingError:
         receipt = None
     if receipt is None or not receipt.passed:
-        # Filter down to individually verified edits so the returned plan is always sound.
         safe_edits: list[Edit] = []
         safe_cands: list[AlgebraicCandidate] = []
-        rejected_pairs = list(raw_res.rejected_pairs)
-        for edit, cand in zip(raw_res.plan.edits, raw_res.candidates):
+        for edit, cand in zip(consensus_edits, consensus_cands):
             trial = RewritePlan(
                 base_graph_sha256=scenario.base_graph_sha256,
                 framing_sha256=scenario.framing_sha256,
@@ -1192,10 +2571,10 @@ def discover_algebraic_rewrites(
             verification=final_rec,
         )
     return AlgebraicRewriteResult(
-        plan=raw_res.plan,
-        candidates=raw_res.candidates,
+        plan=consensus_plan,
+        candidates=tuple(consensus_cands),
         semantic_audit_triggers=raw_res.semantic_audit_triggers,
-        rejected_pairs=raw_res.rejected_pairs,
+        rejected_pairs=tuple(rejected_pairs),
         verification=receipt,
     )
 
