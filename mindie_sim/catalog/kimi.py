@@ -340,9 +340,32 @@ def _aux_standard_kimi(config: Mapping[str, Any]) -> AuxiliarySpec:
 
 
 def _standard_kimi_gaps(config: Mapping[str, Any]) -> tuple[str, ...]:
-    """Unplugged W5a socket — AG014 vision model_type branch purged."""
-    del config
-    raise NotImplementedError(
-        "LEGACY_PURGED: replace AG014 model_type vision branch in _standard_kimi_gaps "
-        "with structural vision_config/media predicate"
+    """Shared MLA gaps plus structural vision and hybrid-field visibility."""
+    from mindie_sim.catalog.deepseek import _standard_deepseek_gaps
+
+    c, vision = _standard_kimi_flat(config)
+    gaps = list(_standard_deepseek_gaps(c))
+    has_vision = (
+        vision is not None
+        or bool(config.get("vision_config"))
+        or bool(config.get("vision_tower"))
+        or "media_placeholder_token_id" in config
+        or "media_placeholder_token_id" in c
+        or "image_token_id" in config
+        or "image_token_id" in c
     )
+    if has_vision:
+        gaps.extend(("vision_tower_unmodeled", "vision_projector_unmodeled"))
+    if any(key in c for key in (
+        "linear_attn_config", "kda_layers", "linear_num_key_heads",
+        "linear_key_head_dim", "linear_conv_kernel_dim", "attn_res_block_size",
+    )):
+        gaps.append("kda_fields_present_in_standard_kimi_config")
+    if any(key in c for key in (
+        "routed_expert_hidden_size", "latent_moe_use_norm",
+        "expert_latent_size", "latent_moe_intermediate_size",
+    )):
+        gaps.append("latent_expert_fields_present_in_standard_kimi_config")
+    if any("dspark" in str(key).lower() or "dflash" in str(key).lower() for key in c):
+        gaps.append("dspark_fields_present_in_standard_kimi_config")
+    return tuple(dict.fromkeys(gaps))

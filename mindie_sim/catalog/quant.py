@@ -21,6 +21,7 @@ from typing import Any, Mapping
 from dataclasses import replace
 
 from mindie_sim.catalog.types import QuantSpec, merge_source
+from mindie_sim.schema.common import ModelingError
 
 BF16_SCALE_BYTES = 2.0
 FP32_SCALE_BYTES = 4.0
@@ -254,11 +255,35 @@ def _quant_kimi(c: Mapping[str, Any]) -> QuantSpec:
     )
 
 
-def _legacy_purged_mxfp8_preset() -> QuantSpec:
-    """Unplugged W5a socket replacing Qwen-specific _quant_qwen_mxfp8 generic aliases."""
-    raise NotImplementedError(
-        "LEGACY_PURGED: replace Qwen-specific _quant_qwen_mxfp8 generic aliases "
-        "with model-agnostic MXFP8 preset and checkpoint-derived exclusions"
+def _quant_mxfp8() -> QuantSpec:
+    """Model-agnostic W8A8-MXFP8 preset (FP8 E4M3 weights/activations, E8M0 group-32 scales)."""
+    return QuantSpec(
+        name="W8A8_MXFP8",
+        weight_format="fp8_e4m3",
+        activation_format="fp8_e4m3",
+        expert_weight_format="fp8_e4m3",
+        weight_block=(1, MX_EXPERT_BLOCK),
+        expert_block=MX_EXPERT_BLOCK,
+        scale_format="fp8_e8m0",
+        scale_bytes=1.0,
+        activation_group_size=MX_EXPERT_BLOCK,
+        activation_scale_format="fp8_e8m0",
+        activation_scale_pack=MX_EXPERT_SCALE_PACK,
+        kv_dtype="bf16",
+        index_dtype="bf16",
+        index_scale_dtype="none",
+        exclusions=_STANDARD_MXFP4_EXCLUSIONS,
+        source=merge_source({
+            "quant_method": "mxfp8",
+            "weight_block_size": "1x32",
+            "activation_scheme": "dynamic",
+            "scale_fmt": "ue8m0",
+        }),
+        notes=(
+            "Model-agnostic W8A8-MXFP8 preset (FP8 E4M3 weights/activations, E8M0 group-32 scales)",
+            "Standard non-linear exclusions (norm, router, embedding, LM head, MTP, mHC, "
+            "attn_res_proj, compressor, vision, projector, conv) stay native float",
+        ),
     )
 
 
@@ -502,22 +527,52 @@ def resolve_auto_va_quant(
     *,
     context_tokens: int = 0,
 ) -> tuple[str, str, str]:
-    """Unplugged W5a socket — vendor auto-quant and A3 V4.1 INT8 KV coercion purged."""
-    del model_spec, hardware_sku, context_tokens
-    raise NotImplementedError(
-        "LEGACY_PURGED: move auto-quant policy out of L1 catalog/quant.py into L4 "
-        "stacks/vllm_ascend/quant_policy.py backed by ProbedAbiRegistry "
-        "(zero A3 V4.1 INT8 KV coercion or silent bf16 fallback)"
+    """Resolve chip-matched structural ``(weight_quant, kv_dtype, indexer_dtype)``.
+
+    Window-compressed latent-MQA models (e.g. CSA2 compressed-KV) never coerce
+    target KV to INT8 on A2/A3; they retain their declared native float KV
+    format. K-pool indexers also retain native float on A2/A3. Missing native
+    dtypes fail closed rather than silently coercing to BF16.
+    """
+    from mindie_sim.catalog.npu_checkpoints import normalize_hw_family
+
+    del context_tokens
+    hw = normalize_hw_family(str(hardware_sku or ""))
+    plans = tuple(getattr(model_spec, "layer_plans", ()) or ())
+    raw_native = str(
+        getattr(model_spec, "activation_dtype", None)
+        or getattr(model_spec, "weight_dtype", None)
+        or ""
+    ).strip().lower()
+    if not raw_native:
+        raise ModelingError("auto_quant_native_dtype_missing")
+    is_moe = (
+        int(getattr(model_spec, "num_experts", 0) or 0) > 1
+        or any(str(getattr(lp, "ffn", "")).lower() == "moe" for lp in plans)
     )
+    has_kpool = any(int(getattr(lp, "index_kpool", 1) or 1) > 1 for lp in plans)
+    is_window_compressed = any(
+        str(getattr(lp, "cache_kind", "")).lower() == "window_compressed"
+        or str(getattr(lp, "mla_variant", "")).lower() == "latent_mqa"
+        for lp in plans
+    )
+    if hw == "a5":
+        return ("mxfp8_mxfp4" if is_moe else "mxfp8", "fp8_e4m3", "fp8_e4m3")
+    if hw in {"a2", "a3"}:
+        # Window-compressed latent MQA (CSA2) does NOT support INT8 KV on A2/A3.
+        kv_dtype = raw_native if is_window_compressed else "int8"
+        idx_dtype = raw_native if (has_kpool or is_window_compressed) else "int8"
+        return ("w4a8" if is_moe else "w8a8", kv_dtype, idx_dtype)
+    return (raw_native, raw_native, raw_native)
 
 
 #: Explicit quantization presets a case may declare on a catalog model.
 QUANTIZATION_PRESETS: dict[str, Any] = {
-    "fp8": _legacy_purged_mxfp8_preset,
-    "w8a8_mxfp8": _legacy_purged_mxfp8_preset,
-    "w8a8-mxfp8": _legacy_purged_mxfp8_preset,
-    "mxfp8": _legacy_purged_mxfp8_preset,
-    "fp8_mxfp8": _legacy_purged_mxfp8_preset,
+    "fp8": _quant_mxfp8,
+    "w8a8_mxfp8": _quant_mxfp8,
+    "w8a8-mxfp8": _quant_mxfp8,
+    "mxfp8": _quant_mxfp8,
+    "fp8_mxfp8": _quant_mxfp8,
     "mxfp8_mxfp4": _quant_mxfp8_mxfp4,
     "mxfp8+mxfp4": _quant_mxfp8_mxfp4,
     "quarot_mxfp8_mxfp4": _quant_mxfp8_mxfp4,

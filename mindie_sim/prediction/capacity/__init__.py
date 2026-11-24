@@ -160,18 +160,8 @@ class Memory(
                 query_tokens=self.query_tokens)) for layer in case.model.layer_plans},
             self.layer_stage,
         )
-        _raw_draft_mode = dict(case.runtime.metadata).get("draft_mode")
-        if not _raw_draft_mode and (
-            case.runtime.dspark
-            or case.runtime.mtp_acceptance_length > 1
-            or any(value > 1 for _, value in case.runtime.mtp_acceptance_by_output_tokens)
-            or dict(case.runtime.metadata).get("speculative")
-        ):
-            raise NotImplementedError(
-                "LEGACY_PURGED: read draft_kind strictly from SpeculativeExecutionContract "
-                "(catalog/draft_spec.py); zero silent ngram/speculative->mtp coercion"
-            )
-        self.draft_kind = str(_raw_draft_mode or "")
+        from mindie_sim.catalog.cache_ownership import _active_draft_kind
+        self.draft_kind = _active_draft_kind(case.model, case.runtime)
         draft = bool(self.draft_kind)
         self.offload = _resolve_offload_ratios(case, self.policy)
         self.kvc_hbm_ratio = max(
@@ -202,6 +192,9 @@ class Memory(
                 sparse=has_sparse_mla,
             )
         )
+        self.enable_shared_expert_dp = shared_expert_dp
+        self.enable_pcp_o_proj_weight_sharding = pcp_o_proj_shard
+        self.dcp_q_replicate = dcp_q_rep
         self.slot_plans = None
         if (int(getattr(p, "redundant_experts_per_rank", 0) or 0) > 0
                 or any(plan.ffn == "moe" and int(plan.num_experts) > 0
@@ -285,12 +278,9 @@ class Memory(
             for total, payload in zip(self.weights, self.weights_payload)
         ]
         if case.runtime.engram_cpu_offload and case.model.engram is not None:
+            from mindie_sim.catalog.draft_weights import require_model_quant
             from mindie_sim.catalog.weights import engram_table_terms
-            if case.model.quant is None:
-                raise NotImplementedError(
-                    "LEGACY_PURGED: require normalized case.model.quant instead of silent QuantSpec('bf16')"
-                )
-            quant = case.model.quant
+            quant = require_model_quant(case.model)
             table_bytes = float(sum(
                 term_bytes(term, quant, p, case.machine.ranks_per_node)
                 for term in engram_table_terms(case.model)
@@ -298,6 +288,46 @@ class Memory(
             self.engram_host_dram_bytes = [table_bytes] * p.pp
         else:
             self.engram_host_dram_bytes = [0.0] * p.pp
+        self.c8_static_channel_scale_by_stage = self._resolve_c8_static_channel_scale_by_stage(
+            case, p,
+        )
+
+    def _resolve_c8_static_channel_scale_by_stage(self, case, p) -> tuple[int, ...]:
+        """Resolve fixed per-die checkpoint-frequency GQA C8 static channel scales."""
+        from mindie_sim.catalog.cache import DEFAULT_CACHE_BLOCK_SIZE
+        from mindie_sim.catalog.cache_format import dense_c8_kv_planes, gqa_kv_formats
+
+        model = case.model
+        pp = max(1, int(p.pp))
+        stage_bytes = [0] * pp
+        if not model.layer_plans:
+            return tuple(stage_bytes)
+        block = max(1, int(getattr(case.runtime, "kv_block_size", 0) or DEFAULT_CACHE_BLOCK_SIZE))
+        for plan in model.layer_plans:
+            if plan.attention not in {"gqa", "projection_only"}:
+                continue
+            if 0 <= int(plan.kv_owner_layer_id) < int(plan.index):
+                continue
+            key_fmt, val_fmt, _shared = gqa_kv_formats(model, plan=plan)
+            is_static_c8 = (
+                (key_fmt.dtype == "int8" and key_fmt.scale_dtype == "none")
+                or (val_fmt.dtype == "int8" and val_fmt.scale_dtype == "none")
+            )
+            if not is_static_c8:
+                continue
+            heads = local_kv_heads(int(plan.num_kv_heads or model.kv_heads), int(p.tp))
+            head_dim = int(plan.head_dim or model.head_dim)
+            if heads <= 0 or head_dim <= 0:
+                continue
+            planes = dense_c8_kv_planes(heads, block, head_dim)
+            per_layer = sum(
+                int(pl.bytes_per_unit)
+                for pl in planes
+                if pl.allocation_frequency == "checkpoint"
+            )
+            stage = self.layer_stage[plan.index] if plan.index < len(self.layer_stage) else pp - 1
+            stage_bytes[stage] += per_layer
+        return tuple(stage_bytes)
 
     def _init_workspace_capacity(self, case, p, workspace_tokens):
         async_enabled = bool(case.runtime.async_scheduling)
@@ -358,6 +388,7 @@ class Memory(
         fixed_per_rank = [
             self.weights[stage] + self.policy.reserved + self.workspace[stage]
             + self.temporary_dequant[stage]
+            + float(self.c8_static_channel_scale_by_stage[stage])
             for stage in range(p.pp)
         ]
         self.fixed_per_rank = fixed_per_rank

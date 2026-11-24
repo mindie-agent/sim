@@ -87,11 +87,9 @@ def _glm_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
     qk_nope = int(c.get("qk_nope_head_dim", 0) or 0)
     rope = int(c.get("qk_rope_head_dim", 0) or 0)
     v_dim = int(c.get("v_head_dim", 0) or 0)
-    if bool(c.get("mla_use_nope", False)) or rope == 0:
-        raise NotImplementedError(
-            "LEGACY_PURGED: propagate mla_use_nope=bool(c.get('mla_use_nope', False)) "
-            "and permit qk_rope_head_dim == 0 iff mla_use_nope is True"
-        )
+    mla_use_nope = bool(c.get("mla_use_nope", False))
+    if rope == 0 and not mla_use_nope:
+        raise ModelingError("model_config_glm_mla_rope_missing_without_nope")
     if qk_head <= 0 or qk_nope <= 0 or rope < 0 or v_dim <= 0:
         raise ModelingError("model_config_glm_mla_dims_missing")
     if qk_nope + rope != qk_head:
@@ -130,7 +128,8 @@ def _glm_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
             num_heads=heads, num_kv_heads=int(c.get("num_key_value_heads", heads) or heads),
             head_dim=qk_head, q_lora_rank=q_rank, kv_lora_rank=kv_rank,
             qk_nope_head_dim=qk_nope, qk_rope_head_dim=rope, v_head_dim=v_dim,
-            mla_variant="latent_mla", kv_cache_elements=kv_rank + rope,
+            mla_variant="latent_mla", mla_use_nope=mla_use_nope,
+            kv_cache_elements=kv_rank + rope,
             intermediate_size=dense_i if ffn == "dense" else 0,
             num_experts=experts if ffn == "moe" else 0,
             top_k=top_k if ffn == "moe" else 0,
@@ -204,7 +203,10 @@ def _glm_hybrid_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
     qk_nope = int(c.get("qk_nope_head_dim", 0) or 0)
     rope = int(c.get("qk_rope_head_dim", 0) or 0)
     v_dim = int(c.get("v_head_dim", 0) or 0)
-    if qk_head <= 0 or qk_nope <= 0 or v_dim <= 0:
+    mla_use_nope = bool(c.get("mla_use_nope", False))
+    if rope == 0 and not mla_use_nope:
+        raise ModelingError("model_config_glm_mla_rope_missing_without_nope")
+    if qk_head <= 0 or qk_nope <= 0 or rope < 0 or v_dim <= 0:
         raise ModelingError("model_config_glm_mla_dims_missing")
     if qk_nope + rope != qk_head:
         raise ModelingError(
@@ -275,11 +277,41 @@ def _glm_hybrid_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
         )
         if kind in {"linear_attention", "kda"}:
             plans.append(_glm_kda_plan(index, kda_heads, kda_dim, conv_k, conv_width, ffn_fields))
+        elif kind in {"full_attention", "mla"} or kind.endswith("_sparse_attention"):
+            plans.append(LayerPlan(
+                index=index,
+                attention="mla",
+                architecture="mla_dsa",
+                indexer=True,
+                indexer_type="full",
+                num_heads=heads,
+                num_kv_heads=kv_heads,
+                head_dim=qk_head,
+                q_lora_rank=q_rank,
+                kv_lora_rank=kv_rank,
+                qk_nope_head_dim=qk_nope,
+                qk_rope_head_dim=rope,
+                v_head_dim=v_dim,
+                mla_variant="latent_mla",
+                mla_use_nope=mla_use_nope or rope == 0,
+                mla_output_gate=False,
+                packed_input_projection=True,
+                kv_cache_elements=kv_rank + rope,
+                kv_owner_layer_id=index,
+                index_k_owner_layer_id=index,
+                owns_index_k=True,
+                topk_owner_layer_id=index,
+                owns_topk=True,
+                index_source_layer_id=index,
+                index_source_status="exact_native_full_schedule",
+                index_share_for_mtp_iteration=bool(
+                    c.get("index_share_for_mtp_iteration", True)),
+                **_index_pool(c),
+                **ffn_fields,
+            ))
         else:
-            raise NotImplementedError(
-                "LEGACY_PURGED: wire exact 34 KDA + 11 NoPE DSA "
-                "(mla_use_nope=True, qk_rope_head_dim=0, index_kpool=4, DCP=1, "
-                "patch_mamba_config.py:107 block rewrite; zero AG014 layer kind checks)"
+            raise ModelingError(
+                f"model_config_glm_layer_kind_unsupported:{index}:{kind}"
             )
     return plans
 
@@ -353,13 +385,62 @@ def _glm_rope_split(c: Mapping[str, Any], head_dim: int) -> tuple[int, int]:
     return head_dim - rope, rope
 
 
-def _standard_glm_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
-    """Body plans for standard GQA checkpoints (unplugged pending AG014-free predicates)."""
-    del c
-    raise NotImplementedError(
-        "LEGACY_PURGED: replace AG014 model_type dispatch in _standard_glm_plans "
-        "with structural HF config key predicates"
+def _is_legacy_gqa_schema(c: Mapping[str, Any]) -> bool:
+    """Structural predicate for legacy ChatGLM-style config keys (zero model_type checks)."""
+    return any(
+        key in c
+        for key in (
+            "kv_channels", "ffn_hidden_size", "multi_query_group_num",
+            "rmsnorm", "post_layer_norm", "add_qkv_bias", "add_bias_linear",
+        )
     )
+
+
+def _standard_glm_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
+    """Body plans for modern/legacy standard GQA and MoE-GQA checkpoints."""
+    if _is_legacy_gqa_schema(c):
+        return _standard_legacy_chatglm_plans(c)
+    layers = int(_require(c, "num_hidden_layers"))
+    h = int(_require(c, "hidden_size"))
+    heads = int(_require(c, "num_attention_heads"))
+    kv_heads = int(c.get("num_key_value_heads", heads) or heads)
+    head_dim = int(_require(c, "head_dim"))
+    nope, rope = _glm_rope_split(c, head_dim)
+    dense_i = int(_require(c, "intermediate_size"))
+    if min(layers, h, heads, kv_heads, head_dim, dense_i) <= 0:
+        raise ModelingError("model_config_glm_standard_geometry_invalid")
+    experts_raw = c.get("n_routed_experts")
+    experts = _int(c, "n_routed_experts") if experts_raw is not None else 0
+    top_k = _int(c, "num_experts_per_tok")
+    moe_i = _int(c, "moe_intermediate_size")
+    shared = _int(c, "n_shared_experts")
+    first_dense = _int(c, "first_k_dense_replace")
+    qk_norm = bool(c.get("use_qk_norm", False))
+    plans: list[LayerPlan] = []
+    for index in range(layers):
+        moe = experts_raw is not None and index >= first_dense
+        if moe and (experts <= 0 or top_k <= 0 or moe_i <= 0):
+            raise ModelingError(f"model_config_glm_moe_dims_invalid:{index}")
+        plans.append(LayerPlan(
+            index=index, attention="gqa", architecture="gqa",
+            ffn="moe" if moe else "dense",
+            num_heads=heads, num_kv_heads=kv_heads, head_dim=head_dim,
+            qk_nope_head_dim=nope, qk_rope_head_dim=rope, qk_norm=qk_norm,
+            kv_cache_elements=2 * kv_heads * head_dim,
+            kv_owner_layer_id=index, owns_long_kv=True,
+            intermediate_size=0 if moe else dense_i,
+            num_experts=experts if moe else 0,
+            top_k=top_k if moe else 0,
+            moe_intermediate_size=moe_i if moe else 0,
+            num_shared_experts=shared if moe else 0,
+            shared_intermediate_size=shared * moe_i if moe else 0,
+            router_input_size=h, router_mode="sigmoid", router_dtype="fp32",
+            router_norm_topk=bool(c.get("norm_topk_prob", False)),
+            router_groups=_int(c, "n_group"),
+            router_group_topk=_int(c, "topk_group"),
+            native_layer_id=index, scope="body",
+        ))
+    return plans
 
 
 def _standard_legacy_chatglm_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
@@ -391,8 +472,29 @@ def _aux_standard_glm(c: Mapping[str, Any]) -> AuxiliarySpec | None:
 
 
 def _standard_glm_gaps(c: Mapping[str, Any]) -> tuple[str, ...]:
-    del c
-    raise NotImplementedError(
-        "LEGACY_PURGED: replace AG014 model_type branches in _standard_glm_gaps "
-        "with structural HF config predicates"
-    )
+    gaps: list[str] = []
+    if _is_legacy_gqa_schema(c):
+        head_dim = _glm_alias_int(c, "kv_channels", "head_dim")
+        gaps.append(f"partial_rope_{head_dim // 2}_of_{head_dim}_not_in_attention_plan")
+        if not bool(c.get("rmsnorm", False)):
+            gaps.append("legacy_layernorm_not_rmsnorm_not_modeled")
+        if bool(c.get("add_bias_linear", False)):
+            gaps.append("linear_bias_not_in_layer_plan")
+        if bool(c.get("add_qkv_bias", False)):
+            gaps.append("attention_bias_qkv_not_in_layer_plan")
+        if bool(c.get("apply_residual_connection_post_layernorm", False)):
+            gaps.append("residual_connection_post_layernorm_not_modeled")
+        return tuple(gaps)
+    head_dim = _int(c, "head_dim")
+    _, rope = _glm_rope_split(c, head_dim)
+    if rope != head_dim:
+        gaps.append(f"partial_rope_{rope}_of_{head_dim}_not_in_attention_plan")
+    if bool(c.get("attention_bias", False)):
+        gaps.append("attention_bias_qkv_not_in_layer_plan")
+    if c.get("n_routed_experts") is not None:
+        gaps.append("router_sigmoid_correction_bias_and_routed_scaling_not_in_layer_plan")
+        if _int(c, "num_nextn_predict_layers") > 0:
+            gaps.append("optional_mtp_not_modeled")
+    else:
+        gaps.append("additional_post_self_attn_and_post_mlp_norms_not_in_layer_schema")
+    return tuple(gaps)

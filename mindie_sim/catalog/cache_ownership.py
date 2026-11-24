@@ -156,18 +156,91 @@ def cache_component_ranges(
     prefix_tokens: int, interleave: int, rank: int | None,
     capacity_padded: bool, owner_spans=None, runtime: Any = None,
     query_tokens: int | None = None, block_size: int | None = None,
-    generation: int = 0,
+    generation: int = 0, phase: str = "decode",
 ) -> tuple[CacheRange, ...]:
-    """Unplugged W5a socket — phase-dropping cache_component_ranges purged."""
-    del (
-        model, layer, parallel, sequence_tokens, prefix_tokens, interleave,
-        rank, capacity_padded, owner_spans, runtime, query_tokens, block_size,
-        generation,
+    """Physical shared-prefix and private-suffix ranges for one layer.
+
+    Always computes ``valid_bytes`` from ``capacity_padded=False`` and
+    ``allocated_bytes`` from ``capacity_padded=True`` (when requested), and
+    preserves explicit ``phase`` through every ``layer_cache_components`` call.
+    """
+    length = max(0, int(sequence_tokens))
+    page_tokens = max(
+        1,
+        int(block_size if block_size is not None else (
+            getattr(runtime, "kv_block_size", 0) or interleave
+        )),
     )
-    raise NotImplementedError(
-        "LEGACY_PURGED: thread explicit phase parameter through cache_component_ranges "
-        "into every layer_cache_components call"
+    prefix = max(0, min(int(prefix_tokens), length))
+    prefix = _component_prefix_tokens(layer, prefix)
+    prefix = _block_tokens(prefix, page_tokens)
+    unpadded = layer_cache_components(
+        model, layer, parallel, length, capacity_padded=False,
+        interleave=interleave, block_size=page_tokens, rank=rank,
+        owner_spans=owner_spans, runtime=runtime, query_tokens=query_tokens,
+        phase=phase,
     )
+    if prefix <= 0:
+        prefix_values = {name: 0.0 for name in unpadded}
+    else:
+        prefix_values = layer_cache_components(
+            model, layer, parallel, prefix, capacity_padded=False,
+            interleave=interleave, block_size=page_tokens, rank=rank,
+            owner_spans=owner_spans, runtime=runtime, query_tokens=query_tokens,
+            phase=phase,
+        )
+    if capacity_padded:
+        allocated = layer_cache_components(
+            model, layer, parallel, length, capacity_padded=True,
+            interleave=interleave, block_size=page_tokens, rank=rank,
+            owner_spans=owner_spans, runtime=runtime, query_tokens=query_tokens,
+            phase=phase,
+        )
+    else:
+        allocated = unpadded
+    win = max(0, int(getattr(layer, "window", 0) or 0))
+    gen = int(generation)
+    ranges: list[CacheRange] = []
+    for name, value in unpadded.items():
+        valid = float(value)
+        allocated_value = float(allocated.get(name, valid))
+        if name in STATE_COMPONENTS or valid <= 0.0:
+            component = str(name)
+            ranges.append(CacheRange(
+                int(layer.index), component, str(component), 0, length,
+                "", gen, SHARING_PRIVATE, rank, allocated_value, valid,
+                f"layer{layer.index}:{component}:private:{rank}", (),
+            ))
+            continue
+        if win > 0 and str(name) in WINDOW_BOUND_COMPONENTS:
+            win_start = max(0, length - win)
+            live_len = max(0, length - win_start)
+            live_shared = max(0, min(prefix, length) - win_start)
+            shared = (
+                valid * (float(live_shared) / float(live_len))
+                if live_len > 0 and live_shared > 0 else 0.0
+            )
+            sh_start = win_start
+            sh_end = max(win_start, min(prefix, length))
+        else:
+            shared = min(valid, float(prefix_values.get(name, 0.0)))
+            sh_start = 0
+            sh_end = prefix
+        private = max(0.0, valid - shared)
+        if shared > 0.0:
+            ranges.append(CacheRange(
+                int(layer.index), str(name), str(name), sh_start, sh_end,
+                "", gen, SHARING_SHARED, rank, shared, shared,
+                f"layer{layer.index}:{name}:{sh_start}:{sh_end}:shared",
+                _page_id_span(sh_start, sh_end, page_tokens),
+            ))
+        ranges.append(CacheRange(
+            int(layer.index), str(name), str(name), sh_end, length,
+            "", gen, SHARING_PRIVATE, rank, max(0.0, allocated_value - shared),
+            private, f"layer{layer.index}:{name}:private:{rank}",
+            _page_id_span(sh_end, length, page_tokens),
+        ))
+    return tuple(ranges)
 
 
 def _prefixed(ranges: Sequence[CacheRange], prefix_key: str,
@@ -212,13 +285,58 @@ def draft_cache_components(
     return components
 
 
+_NON_NEURAL_DRAFT_MODES = frozenset({"none", "ngram", "ngram_gpu"})
+
+
 def _active_draft_kind(model: Any, runtime: Any) -> str:
-    """Unplugged W5a socket — heuristic mtp coercion deleted."""
-    del model, runtime
-    raise NotImplementedError(
-        "LEGACY_PURGED: read draft kind strictly from SpeculativeExecutionContract "
-        "in catalog/draft_spec.py"
-    )
+    """Resolve active neural draft kind strictly from SpeculativeExecutionContract / runtime.
+
+    Non-neural methods (``none``, ``ngram``, ``ngram_gpu``) always return ``""``
+    so zero neural draft weights or KV cache are allocated.
+    """
+    aux = getattr(model, "auxiliary", None)
+    if aux is None or runtime is None:
+        return ""
+    meta = dict(getattr(runtime, "metadata", ()) or ())
+    contract = getattr(runtime, "speculative_contract", None) or meta.get("speculative_contract")
+    if contract is not None:
+        method = str(
+            getattr(contract, "spec_method", None)
+            if not isinstance(contract, Mapping)
+            else contract.get("spec_method", "")
+        ).strip().lower()
+        k_val = int(
+            getattr(contract, "num_speculative_tokens", 0)
+            if not isinstance(contract, Mapping)
+            else (contract.get("num_speculative_tokens", 0) or 0)
+        )
+        if method in _NON_NEURAL_DRAFT_MODES or k_val <= 0:
+            return ""
+        return "dspark" if method in {"dspark", "dflash"} else method
+    spine = meta.get("single_spine")
+    spec_method = str(meta.get("spec_method") or "").strip().lower()
+    if not spec_method and isinstance(spine, Mapping):
+        scen = spine.get("scenario_contract")
+        if isinstance(scen, Mapping):
+            pol = scen.get("speculative_policy")
+            if isinstance(pol, Mapping):
+                spec_method = str(pol.get("spec_method") or "").strip().lower()
+    if spec_method in _NON_NEURAL_DRAFT_MODES:
+        return ""
+    declared_mode = str(meta.get("draft_mode") or "").strip().lower()
+    if declared_mode in _NON_NEURAL_DRAFT_MODES:
+        return ""
+    if getattr(runtime, "dspark", None) is not None and (aux.dspark is not None or aux.mtp is not None):
+        return "dspark"
+    if declared_mode:
+        if declared_mode in {"dspark", "dflash", "verify", "draft_verify"}:
+            return "dspark" if (aux.dspark is not None or (aux.mtp is not None and aux.mtp.kind in {"mtp_dspark", "dspark"})) else ""
+        return declared_mode if aux.mtp is not None else ""
+    if spec_method:
+        if spec_method in {"dspark", "dflash"}:
+            return "dspark" if (aux.dspark is not None or (aux.mtp is not None and aux.mtp.kind in {"mtp_dspark", "dspark"})) else ""
+        return spec_method if aux.mtp is not None else ""
+    return ""
 
 
 def _view_generation(view: Any) -> int:
@@ -421,6 +539,7 @@ def batch_cache_footprint(
                 prefix_tokens=declared_prefix, interleave=interleave,
                 block_size=block_size, rank=None, capacity_padded=bool(padded),
                 runtime=runtime, query_tokens=q_tok, generation=generation,
+                phase=phase,
             )
             stage = layer_stages[int(layer.index)]
             for item in _prefixed(ranges, key, generation):

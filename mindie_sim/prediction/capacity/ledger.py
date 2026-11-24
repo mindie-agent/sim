@@ -176,6 +176,57 @@ class ResidentMemoryReceipt:
 
 
 @dataclass(frozen=True)
+class CacheLedgerProjection:
+    """Internal per-die / per-stage / per-component exact integer cache projection.
+
+    Pairs the frozen D0 Contract 3 ``ResidentMemoryReceipt`` with exact integer
+    component allocations per PP stage so ``export/memory_ledger.py`` projects
+    with 0 B multi-key bijection and zero shadow HBM recomputation.
+    """
+
+    receipt: ResidentMemoryReceipt
+    bottleneck_rank_by_stage: tuple[int, ...]
+    per_stage_component_batch_bytes: tuple[dict[str, int], ...]
+    per_stage_component_per_req_bytes: tuple[dict[str, float], ...]
+    active_layers_by_component: dict[str, tuple[int, ...]]
+    cache_kind_by_component: dict[str, str]
+    fixed_per_die_components: frozenset[str]
+    normalized_block_size: int
+    hybrid_pool_receipt: Any = None
+
+
+def _exact_int_bound(value: Any, name: str) -> int:
+    """Validate an exact integer byte bound without float floor/ceil smearing."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name}_invalid")
+    if isinstance(value, float):
+        if not math.isfinite(value) or not value.is_integer():
+            raise ValueError(f"{name}_must_be_integer")
+        return int(value)
+    return int(value)
+
+
+def _exact_half_open_int_ranges(
+    raw_ranges: Any, amount: Any,
+) -> tuple[tuple[int, int], ...]:
+    """Build exact integer half-open ``[lo, hi)`` byte ranges directly."""
+    if raw_ranges:
+        out: list[tuple[int, int]] = []
+        for lo_raw, hi_raw in raw_ranges:
+            lo = _exact_int_bound(lo_raw, "memory_byte_range")
+            hi = _exact_int_bound(hi_raw, "memory_byte_range")
+            if lo < 0 or hi < lo:
+                raise ValueError("memory_byte_range_invalid")
+            if hi > lo:
+                out.append((lo, hi))
+        return tuple(out)
+    amt = _exact_int_bound(amount, "memory_byte_amount")
+    if amt < 0:
+        raise ValueError("memory_byte_amount_negative")
+    return ((0, amt),) if amt > 0 else ()
+
+
+@dataclass(frozen=True)
 class RecoverSsmRingBreakdown:
     """Exact HBM cost of storing ``K`` speculative SSM snapshots vs ``RecoverSSM``."""
 
@@ -370,12 +421,80 @@ class _MemoryLedgerMixin:
         return _LedgerBoundary(self._ledger_serial)
 
     def _typed_spec_bindings(self, replica: int, spec: dict):
-        """Unplugged W5a socket — float-range floor/ceil grant translation shim deleted."""
-        del replica, spec
-        raise NotImplementedError(
-            "LEGACY_PURGED: construct typed integer half-open ByteRange / AllocationSpec "
-            "directly at grant creation (float floor/ceil shim deleted)"
+        """Construct typed ``AllocationBinding`` records with exact integer half-open ranges."""
+        if self.ledger_domain is None:
+            return ()
+        stage = int(spec.get("stage", 0))
+        rank_raw = spec.get("rank")
+        rank = 0 if rank_raw is None else int(rank_raw)
+        account_rank = self._account_rank(rank)
+        amount = float(spec.get("bytes", 0.0))
+        generation = self._ledger_generation(spec.get("generation"))
+        occurrence = self._ledger_occurrence(replica, stage, rank)
+        tier = str(spec.get("tier", "hbm"))
+        backing = BackingKey(
+            physical_domain=self.ledger_domain.domain_id,
+            rank=account_rank,
+            tier=tier,
+            storage_id=str(spec.get("physical_key", "")),
+            generation=generation,
         )
+        ranges = _exact_half_open_int_ranges(spec.get("_ranges"), spec.get("bytes", 0))
+        key = AllocationKey(
+            occurrence=occurrence,
+            scope_kind="invocation",
+            scope_ordinal=stage,
+            symbol=self._ledger_serial,
+            generation=generation,
+        )
+        result = [AllocationBinding(
+            key=key,
+            pool=self.ledger_pool(
+                replica, stage, account_rank, tier=tier,
+                domain=self.ledger_domain.domain_id,
+            ),
+            amount=amount,
+            backing=backing,
+            byte_ranges=ranges,
+            owner=str(spec.get("owner", "")),
+            storage=str(spec.get("storage", "")),
+            access="readwrite",
+        )]
+        host_raw = spec.get("host_bytes", 0)
+        host = float(host_raw)
+        if host > 0.0:
+            host_int = _exact_int_bound(host_raw, "memory_host_bytes")
+            self._ledger_serial += 1
+            host_key = AllocationKey(
+                occurrence=self._ledger_occurrence(replica, stage, -1),
+                scope_kind="external",
+                scope_ordinal=self._ledger_serial,
+                symbol=self._ledger_serial,
+                generation=generation,
+            )
+            result.append(AllocationBinding(
+                key=host_key,
+                pool=PoolKey(
+                    physical_domain=self.ledger_domain.domain_id,
+                    rank=-1,
+                    tier="host",
+                    name="host",
+                    unit=int(replica),
+                ),
+                amount=host,
+                backing=BackingKey(
+                    physical_domain=self.ledger_domain.domain_id,
+                    rank=-1,
+                    tier="host",
+                    storage_id=str(spec.get("physical_key", "")) + "#host",
+                    generation=generation,
+                ),
+                byte_ranges=((0, host_int),),
+                owner=str(spec.get("owner", "")),
+                storage=str(spec.get("storage", "")),
+                access="readwrite",
+            ))
+        return tuple(result)
 
     def bind_runtime(self, state, *, domain_id: str = "memory") -> CapacityDomainState:
         """Adopt a detached ledger domain into the one runtime root.
@@ -972,7 +1091,7 @@ class _MemoryLedgerMixin:
 
     def _resolve_vision_delta_by_stage(self, vision_accounting: str) -> tuple[list[int], list[int]]:
         """Return ``(vision_bytes_by_stage, weight_delta_by_stage)`` for vision scope."""
-        from mindie_sim.catalog.types import QuantSpec
+        from mindie_sim.catalog.draft_weights import require_model_quant
         from mindie_sim.catalog.weight_terms import term_bytes
         from mindie_sim.catalog.weights import vision_weight_terms
 
@@ -981,12 +1100,7 @@ class _MemoryLedgerMixin:
         if vision_accounting not in VISION_ACCOUNTING_SCOPES:
             raise ValueError(f"vision_accounting_invalid:{vision_accounting!r}")
         model = self.case.model
-        if model.quant is None:
-            raise NotImplementedError(
-                "LEGACY_PURGED: require normalized model.quant in _resolve_vision_delta_by_stage "
-                "(silent QuantSpec('bf16') fallback deleted)"
-            )
-        quant = model.quant
+        quant = require_model_quant(model)
         vision_all = int(round(sum(
             term_bytes(term, quant, p, self.case.machine.ranks_per_node)
             for term in vision_weight_terms(model, include_vision=True)
@@ -1004,12 +1118,42 @@ class _MemoryLedgerMixin:
         return vision_stage, delta_stage
 
     def _stage_checkpoint_vs_prepared_split(self, stage: int) -> tuple[int, int]:
-        """Unplugged W5a socket — hardcoded placement-dropping weight split purged."""
-        del stage
-        raise NotImplementedError(
-            "LEGACY_PURGED: project weight split directly from canonical Memory._init_weights "
-            "per-Die resident terms (preserving shared_expert_dp, pcp_o_proj_weight_sharding, dcp_q_replicate)"
+        """Split ``self.weights[stage]`` into source checkpoint vs runtime-only prepared bytes."""
+        from mindie_sim.catalog.draft_weights import require_model_quant
+        from mindie_sim.catalog.weight_terms import term_bytes
+        from mindie_sim.catalog.weights import _expand_resident_terms, stage_weight_terms
+
+        model = self.case.model
+        p = self.case.runtime.parallel
+        quant = require_model_quant(model)
+        include_vision = self.vision_accounting == "full_checkpoint"
+        all_stage_terms = stage_weight_terms(
+            model, p,
+            include_draft=bool(self.draft_kind),
+            draft_kind=self.draft_kind or None,
+            include_engram_tables=not self.case.runtime.engram_cpu_offload,
+            include_vision=include_vision,
+            layer_partition=self.layers,
+            slot_plans=self.slot_plans,
         )
+        shared_dp = bool(getattr(self, "enable_shared_expert_dp", False))
+        pcp_o_proj = bool(getattr(self, "enable_pcp_o_proj_weight_sharding", False))
+        dcp_q_rep = bool(getattr(self, "dcp_q_replicate", False))
+        runtime_only = 0.0
+        for term in all_stage_terms[stage]:
+            if term.source_owned:
+                continue
+            expanded = _expand_resident_terms(
+                term, p, shared_dp,
+                pcp_o_proj_weight_sharding=pcp_o_proj,
+                dcp_q_replicate=dcp_q_rep,
+                model=model,
+            )
+            for t_sub, placed in expanded:
+                runtime_only += term_bytes(t_sub, quant, placed, self.case.machine.ranks_per_node)
+        prep_b = int(round(runtime_only))
+        ckpt_b = max(0, int(round(self.weights[stage])) - prep_b)
+        return ckpt_b, prep_b
 
     def _unified_pool_stride_reserve_by_stage(
         self,
@@ -1017,12 +1161,218 @@ class _MemoryLedgerMixin:
         *,
         query_tokens: int | None = None,
     ) -> list[float]:
-        """Unplugged W5a socket — AG014 qwen4_exp_pool_breakdown residual smear deleted."""
-        del sequence_tokens, query_tokens
-        raise NotImplementedError(
-            "LEGACY_PURGED: delegate uniformly to catalog.cache_pools.HybridPoolReceipt "
-            "(all 4 structural pool regimes; zero AG014 model-gated pool breakdown)"
+        """Per-stage per-request unified hybrid-pool stride alignment reserve (all 4 regimes)."""
+        p = self.case.runtime.parallel
+        seq = int(sequence_tokens)
+        if seq <= 0:
+            return [0.0] * p.pp
+        receipt = self._hybrid_pool_receipt(seq, num_requests=1, query_tokens=query_tokens)
+        if receipt is None:
+            return [0.0] * p.pp
+        return [float(v) for v in receipt.stride_reserve_by_stage]
+
+    def _projected_die_cache_pools(
+        self,
+        sequence_tokens: int,
+        batch_per_dp: int,
+        query_tokens: int | None,
+        *,
+        rank: int | None = None,
+        phase: str = "decode",
+    ) -> tuple[list[dict[str, Any]], Any]:
+        """Exact per-stage integer cache pools and component breakdowns for one physical rank."""
+        from .cache import _COMPONENT_POOL_MAP
+
+        p = self.case.runtime.parallel
+        seq = int(sequence_tokens)
+        b_int = int(batch_per_dp)
+        q_tok = self._effective_cache_query_tokens(query_tokens)
+        hybrid_b = self._hybrid_pool_receipt(seq, num_requests=b_int, query_tokens=q_tok, phase=phase)
+        hybrid_1 = (
+            self._hybrid_pool_receipt(seq, num_requests=1, query_tokens=q_tok, phase=phase)
+            if hybrid_b is not None else None
         )
+        eff_block = hybrid_b.contract.normalized_block_size if hybrid_b is not None else None
+        alloc_stages = self._cache_component_breakdown(
+            seq, padded=True, skip_covered=True, rank=rank, query_tokens=q_tok,
+            block_size_override=eff_block,
+        )
+        valid_stages = self._cache_component_breakdown(
+            seq, padded=False, skip_covered=True, rank=rank, query_tokens=q_tok,
+            block_size_override=eff_block,
+        )
+        group_parts = (
+            self._group_cache_parts(seq, rank=rank, query_tokens=q_tok)
+            if self.pages.groups else None
+        )
+        group_payload = (
+            self.pages.stage_bytes(seq, self.case.runtime.max_model_len, p.pp)
+            if self.pages.groups else None
+        )
+        group_metadata = (
+            self.pages.metadata_stage_bytes(seq, self.case.runtime.max_model_len, p.pp)
+            if self.pages.groups else None
+        )
+        cohort_alloc = self._dp_cohort_extra_by_stage(seq, padded=True, rank=rank, query_tokens=q_tok)
+        cohort_valid = self._dp_cohort_extra_by_stage(seq, padded=False, rank=rank, query_tokens=q_tok)
+        rank_base_per_req = (
+            None if hybrid_b is not None
+            else self._rank_dp_cohort_cache_bytes(seq, padded=True, rank=rank, query_tokens=q_tok)
+        )
+        c8_static_stages = tuple(getattr(self, "c8_static_channel_scale_by_stage", (0,) * p.pp))
+
+        per_stage: list[dict[str, Any]] = []
+        for stage in range(p.pp):
+            entry = self._assemble_stage_die_cache_pool(
+                stage=stage,
+                b_int=b_int,
+                alloc_stage=alloc_stages[stage],
+                valid_stage=valid_stages[stage],
+                group_part=group_parts[stage] if group_parts is not None else None,
+                group_payload_b=float(group_payload[stage]) if group_payload is not None else 0.0,
+                group_meta_b=float(group_metadata[stage]) if group_metadata is not None else 0.0,
+                cohort_alloc_b=float(cohort_alloc[stage]),
+                cohort_valid_b=float(cohort_valid[stage]),
+                hybrid_b=hybrid_b,
+                hybrid_1=hybrid_1,
+                rank_base_per_req_b=float(rank_base_per_req[stage]) if rank_base_per_req is not None else 0.0,
+                c8_static_b=int(c8_static_stages[stage]) if stage < len(c8_static_stages) else 0,
+                pool_map=_COMPONENT_POOL_MAP,
+            )
+            per_stage.append(entry)
+        return per_stage, hybrid_b
+
+    def _assemble_stage_die_cache_pool(
+        self,
+        *,
+        stage: int,
+        b_int: int,
+        alloc_stage: dict[str, Any],
+        valid_stage: dict[str, Any],
+        group_part: dict[str, Any] | None,
+        group_payload_b: float,
+        group_meta_b: float,
+        cohort_alloc_b: float,
+        cohort_valid_b: float,
+        hybrid_b: Any,
+        hybrid_1: Any,
+        rank_base_per_req_b: float,
+        c8_static_b: int,
+        pool_map: dict[str, str],
+    ) -> dict[str, Any]:
+        """Conserve exact integer per-stage cache pools and component breakdowns."""
+        alloc_pools = {
+            "target_kv_bytes": 0.0, "indexer_k_bytes": 0.0,
+            "recurrent_state_bytes": 0.0, "draft_kv_bytes": 0.0,
+            "draft_state_bytes": 0.0,
+        }
+        valid_pools = {"target_kv_bytes": 0.0, "indexer_k_bytes": 0.0}
+        comp_per_req: dict[str, float] = {}
+        comp_batch: dict[str, int] = {}
+
+        for name, detail in alloc_stage["components"].items():
+            val = float(detail["total"])
+            if val <= 0.0:
+                continue
+            comp_per_req[name] = comp_per_req.get(name, 0.0) + val
+            key = pool_map.get(name)
+            if key in alloc_pools:
+                alloc_pools[key] += val
+        for name, detail in valid_stage["components"].items():
+            key = pool_map.get(name)
+            if key in valid_pools:
+                valid_pools[key] += float(detail["total"])
+
+        group_reserve_per_req = 0.0
+        if group_part is not None:
+            known_group = 0.0
+            for name, detail in group_part["components"].items():
+                part_alloc = float(detail["alloc_payload"]) + float(detail["alloc_scale"])
+                part_valid = float(detail["valid_payload"]) + float(detail["valid_scale"])
+                if part_alloc > 0.0:
+                    comp_per_req[name] = comp_per_req.get(name, 0.0) + part_alloc
+                key = pool_map.get(name)
+                if key in alloc_pools:
+                    alloc_pools[key] += part_alloc
+                    known_group += part_alloc
+                if key in valid_pools:
+                    valid_pools[key] += part_valid
+            group_reserve_per_req = max(0.0, group_payload_b - known_group)
+            if group_reserve_per_req > 0.0:
+                comp_per_req["page_group_reserve"] = (
+                    comp_per_req.get("page_group_reserve", 0.0) + group_reserve_per_req
+                )
+            if group_meta_b > 0.0:
+                comp_per_req["page_metadata"] = (
+                    comp_per_req.get("page_metadata", 0.0) + group_meta_b
+                )
+
+        if cohort_alloc_b > 0.0:
+            comp_per_req["dcp_dp_cohort_kv"] = (
+                comp_per_req.get("dcp_dp_cohort_kv", 0.0) + cohort_alloc_b
+            )
+            alloc_pools["target_kv_bytes"] += cohort_alloc_b
+        if cohort_valid_b > 0.0:
+            valid_pools["target_kv_bytes"] += cohort_valid_b
+
+        for name, val in comp_per_req.items():
+            comp_batch[name] = int(round(b_int * val))
+
+        if hybrid_b is not None:
+            stride_res_b = int(hybrid_b.stride_reserve_by_stage[stage])
+            stride_res_1 = float(hybrid_1.stride_reserve_by_stage[stage]) if hybrid_1 is not None else 0.0
+            if stride_res_b > 0:
+                comp_batch["page_group_reserve"] = comp_batch.get("page_group_reserve", 0) + stride_res_b
+            if stride_res_1 > 0.0:
+                comp_per_req["page_group_reserve"] = comp_per_req.get("page_group_reserve", 0.0) + stride_res_1
+            outside_subsumed = (
+                int(hybrid_b.total_pool_bytes_by_stage[stage])
+                + int(hybrid_b.outside_replay_bytes_by_stage[stage])
+            )
+            sub_draft_kv = bool(hybrid_b.contract.subsumed_draft_kv)
+            if not sub_draft_kv:
+                outside_subsumed += comp_batch.get("draft_kv", 0)
+            outside_subsumed += comp_batch.get("draft_state", 0)
+            expected_total = outside_subsumed + c8_static_b
+            page_reserve_total = stride_res_b
+        else:
+            page_reserve_total = int(round(b_int * group_reserve_per_req))
+            expected_total = int(round(b_int * rank_base_per_req_b)) + c8_static_b
+
+        if c8_static_b > 0:
+            comp_batch["c8_static_channel_scale"] = c8_static_b
+            comp_per_req.setdefault("c8_static_channel_scale", 0.0)
+
+        idx_a = sum(comp_batch.get(c, 0) for c, k in pool_map.items() if k == "indexer_k_bytes")
+        rec_a = sum(comp_batch.get(c, 0) for c, k in pool_map.items() if k == "recurrent_state_bytes")
+        drf_a = comp_batch.get("draft_kv", 0) + comp_batch.get("draft_state", 0)
+        non_kv = idx_a + rec_a + drf_a
+        comp_sum = sum(comp_batch.values())
+        residual = expected_total - comp_sum
+        if residual != 0:
+            if hybrid_b is not None or group_part is not None:
+                comp_batch["page_group_reserve"] = max(0, comp_batch.get("page_group_reserve", 0) + residual)
+            else:
+                target_key = next((c for c in ("mla_kv", "gqa_kv", "window", "compressed_kv") if c in comp_batch), "page_group_reserve")
+                comp_batch[target_key] = max(0, comp_batch.get(target_key, 0) + residual)
+        kv_a = (
+            expected_total - non_kv
+            if expected_total >= non_kv
+            else int(round(b_int * alloc_pools["target_kv_bytes"])) + c8_static_b
+        )
+        return {
+            "kv_alloc": kv_a,
+            "kv_valid": int(round(b_int * valid_pools["target_kv_bytes"])) + c8_static_b,
+            "idx_alloc": idx_a,
+            "idx_valid": int(round(b_int * valid_pools["indexer_k_bytes"])),
+            "rec": rec_a,
+            "draft": drf_a,
+            "page_group_reserve": page_reserve_total,
+            "components_batch": {k: v for k, v in comp_batch.items() if v > 0},
+            "components_per_req": {
+                k: v for k, v in comp_per_req.items() if v > 0.0 or k == "c8_static_channel_scale"
+            },
+        }
 
     def _projected_stage_cache_pools(
         self,
@@ -1030,12 +1380,24 @@ class _MemoryLedgerMixin:
         batch_per_dp: int,
         query_tokens: int | None,
     ) -> list[dict[str, int]] | None:
-        """Unplugged W5a socket — stage-broadcast float cache receipt lie deleted."""
-        del sequence_tokens, batch_per_dp, query_tokens
-        raise NotImplementedError(
-            "LEGACY_PURGED: wire per-Die exact integer DieResidentReceipt projected directly "
-            "from rank-local admission bytes (including dcp_dp_width cohort union; zero 48/48 B receipt lie)"
+        """Per-stage projected KV/Index/State/Draft bytes for ``batch_per_dp`` requests."""
+        if sequence_tokens is None or int(batch_per_dp) <= 0:
+            return None
+        stages, _ = self._projected_die_cache_pools(
+            int(sequence_tokens), int(batch_per_dp), query_tokens, rank=None,
         )
+        return [
+            {
+                "kv_alloc": int(st["kv_alloc"]),
+                "kv_valid": int(st["kv_valid"]),
+                "idx_alloc": int(st["idx_alloc"]),
+                "idx_valid": int(st["idx_valid"]),
+                "rec": int(st["rec"]),
+                "draft": int(st["draft"]),
+                "page_group_reserve": int(st["page_group_reserve"]),
+            }
+            for st in stages
+        ]
 
     def _build_die_receipt(
         self,
@@ -1061,9 +1423,11 @@ class _MemoryLedgerMixin:
         usable = int(math.floor(die_obj.hbm_bytes * self.case.runtime.gpu_memory_utilization))
         ws_b = int(round(self.workspace[stage] + self.temporary_dequant[stage]))
         res_b = int(round(self.policy.reserved))
+        c8_stages = tuple(getattr(self, "c8_static_channel_scale_by_stage", ()))
+        c8_static_b = int(c8_stages[stage]) if stage < len(c8_stages) else 0
         dyn_grant_only = max(0, dyn_live_b - req_b - stg_b)
-        kv_a = projected["kv_alloc"] if projected is not None else req_b
-        kv_v = projected["kv_valid"] if projected is not None else req_b
+        kv_a = projected["kv_alloc"] if projected is not None else (req_b + c8_static_b)
+        kv_v = projected["kv_valid"] if projected is not None else (req_b + c8_static_b)
         idx_a = projected["idx_alloc"] if projected is not None else 0
         idx_v = projected["idx_valid"] if projected is not None else 0
         rec_b = projected["rec"] if projected is not None else 0
@@ -1072,6 +1436,7 @@ class _MemoryLedgerMixin:
         ckpt_gid = f"r{replica}:s{stage}:k{rank}:checkpoint_weights"
         vis_gid = f"r{replica}:s{stage}:k{rank}:vision_weights"
         term_gid = f"r{replica}:s{stage}:k{rank}:prepared_terms"
+        c8_gid = f"r{replica}:s{stage}:k{rank}:c8_static_channel_scale"
         raw_entries: list[ResidentGrantEntry] = [
             ResidentGrantEntry(
                 grant_id=ckpt_gid, category="checkpoint_weights",
@@ -1091,10 +1456,16 @@ class _MemoryLedgerMixin:
                 physical_backing_id=term_gid, checkpoint_bytes=0,
                 runtime_bytes=term_prep_b, allocated_bytes=term_prep_b, valid_bytes=term_prep_b,
             ))
+        if c8_static_b > 0:
+            raw_entries.append(ResidentGrantEntry(
+                grant_id=c8_gid, category="c8_static_channel_scale",
+                physical_backing_id=c8_gid, checkpoint_bytes=c8_static_b,
+                runtime_bytes=c8_static_b, allocated_bytes=c8_static_b, valid_bytes=c8_static_b,
+            ))
         raw_entries.extend(stage_prep_grants)
         raw_entries.extend(extra_grants)
         dedup_grants, _ = _deduplicate_grant_entries(raw_entries)
-        base_gids = {ckpt_gid, vis_gid, term_gid}
+        base_gids = {ckpt_gid, vis_gid, term_gid, c8_gid}
         extra_only_billed = sum(
             g.billed_once_bytes for g in dedup_grants
             if g.grant_id not in base_gids and not g.grant_id.startswith("prepared:")
@@ -1104,8 +1475,8 @@ class _MemoryLedgerMixin:
         if projected is not None:
             live_dyn = kv_a + idx_a + rec_b + drf_b + dyn_grant_only + stg_b + extra_only_billed
         else:
-            live_dyn = dyn_live_b + extra_only_billed
-        peak_dyn = max(live_dyn, dyn_peak_b + extra_only_billed)
+            live_dyn = dyn_live_b + c8_static_b + extra_only_billed
+        peak_dyn = max(live_dyn, dyn_peak_b + c8_static_b + extra_only_billed)
         sim_live = fixed_total + live_dyn
         sim_peak = fixed_total + peak_dyn
         return DieResidentReceipt(
@@ -1169,16 +1540,35 @@ class _MemoryLedgerMixin:
             ck, tp_b = self._stage_checkpoint_vs_prepared_split(st)
             ckpt_by_stage.append(max(0, ck + vision_delta[st] - vision_stage[st]))
             term_prep_by_stage.append(tp_b)
-        projected_stages = self._projected_stage_cache_pools(
-            sequence_tokens, batch_per_dp, query_tokens,
-        )
+        projected_by_rank: list[list[dict[str, Any]]] | None = None
+        if sequence_tokens is not None and int(batch_per_dp) > 0:
+            rank_divergent = (
+                self.rank_token_owners is not None or int(getattr(p, "cp", 1) or 1) > 1
+            )
+            if rank_divergent:
+                projected_by_rank = [
+                    self._projected_die_cache_pools(
+                        int(sequence_tokens), int(batch_per_dp), query_tokens,
+                        rank=rk, phase=str(phase),
+                    )[0]
+                    for rk in range(self.width)
+                ]
+            else:
+                uniform_stages, _ = self._projected_die_cache_pools(
+                    int(sequence_tokens), int(batch_per_dp), query_tokens,
+                    rank=None, phase=str(phase),
+                )
+                projected_by_rank = [uniform_stages for _ in range(self.width)]
         dies: list[DieResidentReceipt] = []
         for replica in range(p.dp):
             for stage in range(p.pp):
                 stage_dies = self._stage_dies(replica, stage)
-                projected = projected_stages[stage] if projected_stages is not None else None
                 host_b = int(round(host_live[replica] + self.engram_host_dram_bytes[stage]))
                 for rank in range(self.width):
+                    projected = (
+                        projected_by_rank[rank][stage]
+                        if projected_by_rank is not None else None
+                    )
                     dyn_live_b = int(round(hbm_live[replica][stage][rank]))
                     dyn_peak_b = max(dyn_live_b, int(round(self.peak_rank[replica][stage][rank])))
                     dies.append(self._build_die_receipt(
@@ -1198,6 +1588,143 @@ class _MemoryLedgerMixin:
             occurrence=str(occurrence),
             vision_accounting=vis_scope,
             dies=tuple(dies),
+        )
+
+    def _component_layer_counts_and_kinds(self) -> tuple[dict[str, tuple[int, ...]], dict[str, str]]:
+        """Derive per-stage active layer counts and structural kind labels per component."""
+        model = self.case.model
+        p = self.case.runtime.parallel
+        pp = max(1, int(p.pp))
+        counts: dict[str, list[int]] = {}
+        kinds: dict[str, str] = {}
+
+        def _bump(comp: str, st: int, kind: str) -> None:
+            row = counts.setdefault(comp, [0] * pp)
+            row[st] += 1
+            kinds.setdefault(comp, kind)
+
+        for plan in model.layer_plans:
+            st = self.layer_stage[plan.index] if plan.index < len(self.layer_stage) else pp - 1
+            if plan.attention == "mla" and plan.cache_kind == "dense":
+                _bump("mla_kv", st, "MLA Latent KV")
+            elif plan.attention in {"gqa", "projection_only"} and not (0 <= plan.kv_owner_layer_id < plan.index):
+                _bump("gqa_kv", st, "GQA K/V")
+            if int(plan.window or 0) > 0 and plan.attention == "mla":
+                _bump("window", st, "Sliding-Window KV")
+            if plan.owns_long_kv and plan.cache_kind == "window_compressed":
+                _bump("compressed_kv", st, "Compressed Long KV")
+            if plan.owns_index_k:
+                _bump("index_k", st, "Sparse Indexer K")
+                if int(plan.index_kpool or 0) > 0:
+                    _bump("index_pool_tail", st, "KeyPool Ring Tail")
+            if int(plan.compressor_state_rows or 0) > 0:
+                _bump("compressor_state", st, "C2 Compressor Ring")
+            if plan.attention in {"linear", "kda", "gdn"}:
+                _bump("recurrent_state", st, "Linear Recurrent SSM")
+                _bump("conv_state", st, "Causal Conv1D State")
+                _bump("replay_records", st, "RecoverSSM Replay Records")
+                _bump("state_transient", st, "RecoverSSM Transient")
+        engram = getattr(model, "engram", None)
+        if engram is not None and getattr(engram, "layer_ids", ()):
+            for lid in engram.layer_ids:
+                if 0 <= int(lid) < len(self.layer_stage):
+                    _bump("ple_conv_state", self.layer_stage[int(lid)], "PLE Conv1D State")
+        if self.draft_kind and model.auxiliary is not None:
+            from mindie_sim.catalog.draft import optional_draft_spec
+            draft = optional_draft_spec(model, self.draft_kind)
+            for _ in range(max(1, int(draft.layers))):
+                _bump("draft_kv", pp - 1, f"Draft KV ({draft.attention_kind.upper()})")
+                _bump("draft_state", pp - 1, "Draft Recurrent State")
+        c8_stages = tuple(getattr(self, "c8_static_channel_scale_by_stage", (0,) * pp))
+        for st, val in enumerate(c8_stages):
+            if val > 0:
+                gqa_cnt = counts.get("gqa_kv", [0] * pp)[st]
+                counts.setdefault("c8_static_channel_scale", [0] * pp)[st] = gqa_cnt
+                kinds.setdefault("c8_static_channel_scale", "GQA Static C8 Channel Scales (Fixed/Die)")
+        kinds.setdefault("page_group_reserve", "Hybrid Pool / Page-Group Reserve")
+        kinds.setdefault("page_metadata", "Page Table Metadata")
+        kinds.setdefault("dcp_dp_cohort_kv", "DCP DP-Cohort Shared KV")
+        return {k: tuple(v) for k, v in counts.items()}, kinds
+
+    def cache_ledger_projection(
+        self,
+        *,
+        scenario: str = "",
+        phase: str = "decode",
+        occurrence: str = "steady",
+        sequence_tokens: int,
+        batch_per_dp: int,
+        query_tokens: int | None = None,
+        vision_accounting: str | None = None,
+        prepared_weights: Sequence[PreparedWeightSpec] = (),
+        extra_grants: Sequence[ResidentGrantEntry] = (),
+    ) -> CacheLedgerProjection:
+        """Build authoritative ``ResidentMemoryReceipt`` paired with exact per-component integers."""
+        from mindie_sim.catalog.cache import DEFAULT_CACHE_BLOCK_SIZE
+
+        p = self.case.runtime.parallel
+        seq = max(0, int(sequence_tokens))
+        b_int = max(0, int(batch_per_dp))
+        receipt = self.resident_memory_receipt(
+            scenario=scenario,
+            phase=phase,
+            occurrence=occurrence,
+            sequence_tokens=seq if b_int > 0 else None,
+            batch_per_dp=b_int,
+            query_tokens=query_tokens,
+            vision_accounting=vision_accounting,
+            prepared_weights=prepared_weights,
+            extra_grants=extra_grants,
+        )
+        rank_divergent = self.rank_token_owners is not None or int(getattr(p, "cp", 1) or 1) > 1
+        bottleneck_ranks: list[int] = []
+        stage_comp_batch: list[dict[str, int]] = []
+        stage_comp_per_req: list[dict[str, float]] = []
+        hybrid_receipt: Any = None
+        cached_uniform: list[dict[str, Any]] | None = None
+        for st in range(p.pp):
+            best_rk = max(
+                range(self.width),
+                key=lambda rk: receipt.die_receipt(0, st, rk).simultaneous_live_hbm_bytes,
+            )
+            bottleneck_ranks.append(best_rk)
+            if seq <= 0 or b_int <= 0:
+                c8_b = int(self.c8_static_channel_scale_by_stage[st])
+                stage_comp_batch.append({"c8_static_channel_scale": c8_b} if c8_b > 0 else {})
+                stage_comp_per_req.append({"c8_static_channel_scale": 0.0} if c8_b > 0 else {})
+                continue
+            if rank_divergent:
+                rank_stages, h_rec = self._projected_die_cache_pools(
+                    seq, b_int, query_tokens, rank=best_rk, phase=str(phase),
+                )
+                entry = rank_stages[st]
+                if hybrid_receipt is None and h_rec is not None:
+                    hybrid_receipt = h_rec
+            else:
+                if cached_uniform is None:
+                    cached_uniform, hybrid_receipt = self._projected_die_cache_pools(
+                        seq, b_int, query_tokens, rank=None, phase=str(phase),
+                    )
+                entry = cached_uniform[st]
+            stage_comp_batch.append(dict(entry["components_batch"]))
+            stage_comp_per_req.append(dict(entry["components_per_req"]))
+
+        layer_counts, kinds = self._component_layer_counts_and_kinds()
+        raw_block = max(1, int(getattr(self.case.runtime, "kv_block_size", 0) or DEFAULT_CACHE_BLOCK_SIZE))
+        norm_block = (
+            int(hybrid_receipt.contract.normalized_block_size)
+            if hybrid_receipt is not None else raw_block
+        )
+        return CacheLedgerProjection(
+            receipt=receipt,
+            bottleneck_rank_by_stage=tuple(bottleneck_ranks),
+            per_stage_component_batch_bytes=tuple(stage_comp_batch),
+            per_stage_component_per_req_bytes=tuple(stage_comp_per_req),
+            active_layers_by_component=layer_counts,
+            cache_kind_by_component=kinds,
+            fixed_per_die_components=frozenset({"c8_static_channel_scale"}),
+            normalized_block_size=norm_block,
+            hybrid_pool_receipt=hybrid_receipt,
         )
 
     def evaluate_space_time_tradeoff(

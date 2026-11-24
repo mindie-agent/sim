@@ -28,7 +28,11 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import Any, Mapping, Sequence
 
-from mindie_sim.catalog.draft_weights import draft_terms, draft_weight_summary
+from mindie_sim.catalog.draft_weights import (
+    draft_terms,
+    draft_weight_summary,
+    require_model_quant,
+)
 from mindie_sim.catalog.types import QuantSpec
 from mindie_sim.catalog.weight_layer_terms import (
     _attention_terms,
@@ -58,18 +62,68 @@ from mindie_sim.schema.model import ModelSpec
 from mindie_sim.schema.parallel import ParallelSpec
 
 MHC_HEAD_STREAMS = 4
+DEFAULT_PLE_CONV_KERNEL = 4
+PLE_STORAGE_KIND = "ple_ngram_conv"
 TARGET_ALIAS_CATEGORIES = frozenset({
     "target_alias_embedding", "target_alias_lm_head",
 })
 
 
 def _require_model_quant(model: ModelSpec) -> QuantSpec:
-    if model.quant is None:
-        raise NotImplementedError(
-            "LEGACY_PURGED: require normalized model.quant or native weight_dtype/activation_dtype "
-            "QuantSpec in catalog/weights.py (silent QuantSpec('bf16') fallback deleted)"
-        )
-    return model.quant
+    return require_model_quant(model)
+
+
+def is_ple_engram(engram: Any) -> bool:
+    """Structural predicate distinguishing per-layer n-gram conv PLE from shared Engram."""
+    if engram is None:
+        return False
+    src = dict(getattr(engram, "source", ()) or ())
+    return src.get("storage_kind") == PLE_STORAGE_KIND or "ple_conv_kernel_size" in src
+
+
+def lowrank_hc_head_terms(model: ModelSpec) -> list[WeightTerm]:
+    """Low-rank gated hyper-connection collapse head terms for body output."""
+    hc = max((p.hc_mult for p in model.layer_plans), default=0)
+    lr = max((p.hc_lowrank for p in model.layer_plans), default=0)
+    hc_dim = hc * model.hidden_size
+    return [
+        _t("hc_head_norm", hc_dim, 1, "norm"),
+        _t("hc_head_down", lr, hc_dim, "linear_param_bf16"),
+        _t("hc_head_up", hc_dim, lr, "linear_param_bf16"),
+    ]
+
+
+def ple_table_terms(model: ModelSpec) -> list[WeightTerm]:
+    """TP-sharded per-layer n-gram embedding table weight terms."""
+    engram = model.engram
+    if engram is None:
+        return []
+    return [
+        WeightTerm(f"ple_table_{table.table_id}", table.rows, table.width, "engram_table", "out_tp", 1)
+        for table in engram.tables
+    ]
+
+
+def ple_gate_terms_by_layer(model: ModelSpec) -> dict[int, list[WeightTerm]]:
+    """Per-layer PLE projection, norm, and depthwise conv weight terms."""
+    engram = model.engram
+    if engram is None:
+        return {}
+    hc = max((p.hc_mult for p in model.layer_plans), default=1)
+    h = model.hidden_size
+    hc_h = hc * h
+    embed = engram.columns_per_table * engram.width
+    conv_k = int(dict(engram.source).get("ple_conv_kernel_size", DEFAULT_PLE_CONV_KERNEL))
+    by_layer: dict[int, list[WeightTerm]] = {}
+    for table in engram.tables:
+        by_layer.setdefault(table.layer_id, []).extend([
+            _t("ple_kv_proj", hc_h + h, embed, "ple_proj", count=1),
+            _t("ple_norm_key", hc_h, 1, "norm", count=1),
+            _t("ple_norm_query", hc_h, 1, "norm", count=1),
+            _t("ple_norm_conv", hc_h, 1, "norm", count=1),
+            _t("ple_conv1d", hc_h, conv_k, "conv_weight_bf16", count=1),
+        ])
+    return by_layer
 
 
 def _resident_parallel(
@@ -280,11 +334,32 @@ def vision_weight_terms(
     if vision.norm_type == "layernorm":
         terms.append(_t("vision_final_norm_bias", vision.hidden_size, 1, "norm"))
     aligner_in = vision.aligner_input_width
-    del aligner_in
-    raise NotImplementedError(
-        "LEGACY_PURGED: dispatch vision projector terms by structural VisionSpec.projector_kind "
-        "(AG014 vision.kind model-name branches deleted)"
-    )
+    if vision.aligner_hidden_size > 0 and vision.bias:
+        terms.extend([
+            _t("aligner_norm", aligner_in, 1, "norm"),
+            _t("aligner_w1", vision.out_hidden_size, aligner_in, "projector"),
+            _t("aligner_w1_bias", vision.out_hidden_size, 1, "vision"),
+            _t("aligner_w2", vision.out_hidden_size, vision.out_hidden_size, "projector"),
+            _t("aligner_w2_bias", vision.out_hidden_size, 1, "vision"),
+        ])
+    elif vision.aligner_hidden_size > 0:
+        terms.extend([
+            _t("projector_w0", vision.aligner_hidden_size, aligner_in, "projector"),
+            _t("projector_w2", vision.out_hidden_size, vision.aligner_hidden_size, "projector"),
+            _t("projector_norm", vision.out_hidden_size, 1, "norm"),
+        ])
+    else:
+        terms.extend([
+            _t("merger_norm", aligner_in, 1, "norm"),
+            _t("merger_norm_bias", aligner_in, 1, "norm"),
+            _t("merger_w1", aligner_in, aligner_in, "projector"),
+            _t("merger_w1_bias", aligner_in, 1, "vision"),
+            _t("merger", vision.out_hidden_size, aligner_in, "projector"),
+            _t("merger_bias", vision.out_hidden_size, 1, "vision"),
+        ])
+    for name in ("image_start", "image_end", "image_newline"):
+        terms.append(_t(name, model.hidden_size, 1, "image_token"))
+    return terms
 
 
 def _output_res_quant(model: ModelSpec) -> QuantSpec:
@@ -336,10 +411,7 @@ def body_head_terms(model: ModelSpec) -> list[WeightTerm]:
             replace(_t("output_attn_res_proj", 1, h, "attn_res_proj"), quant=res_quant),
         ])
     if lowrank_hc:
-        raise NotImplementedError(
-            "LEGACY_PURGED: import low-rank HC head terms from structural module "
-            "instead of model-named catalog.qwen4_exp"
-        )
+        terms.extend(lowrank_hc_head_terms(model))
     elif any(
         plan.hyper_connections
         and getattr(plan, "hc_final_collapse", "learned") == "learned"
@@ -357,20 +429,41 @@ def engram_table_terms(model: ModelSpec) -> list[WeightTerm]:
     engram = model.engram
     if engram is None:
         return []
-    raise NotImplementedError(
-        "LEGACY_PURGED: dispatch Engram vs PLE table terms structurally via engram.storage_kind "
-        "(model-named catalog.qwen4_exp import deleted)"
-    )
+    if is_ple_engram(engram):
+        return ple_table_terms(model)
+    return [
+        WeightTerm(f"engram_table_{table.table_id}", table.rows, table.width, "engram_table", "node", 1)
+        for table in engram.tables
+    ]
 
 
 def engram_gate_terms_by_layer(model: ModelSpec) -> dict[int, list[WeightTerm]]:
     engram = model.engram
     if engram is None:
         return {}
-    raise NotImplementedError(
-        "LEGACY_PURGED: dispatch Engram vs PLE gate terms structurally via engram.storage_kind "
-        "without catalog.qwen4_exp import or silent QuantSpec('bf16') fallback"
-    )
+    if is_ple_engram(engram):
+        raw_ple = ple_gate_terms_by_layer(model)
+        plans_by_idx = {int(p.index): p for p in model.layer_plans}
+        base_quant = _require_model_quant(model)
+        resolved_ple: dict[int, list[WeightTerm]] = {}
+        for layer_id, layer_terms in raw_ple.items():
+            plan = plans_by_idx.get(int(layer_id))
+            lquant = _layer_resolved_quant(model, plan) if plan is not None else base_quant
+            resolved_ple[int(layer_id)] = [
+                replace(term, quant=term.quant or lquant) for term in layer_terms
+            ]
+        return resolved_ple
+    hc = max((p.hc_mult for p in model.layer_plans), default=0)
+    columns = engram.columns_per_table
+    by_layer: dict[int, list[WeightTerm]] = {}
+    for table in engram.tables:
+        by_layer.setdefault(table.layer_id, []).extend([
+            _t("engram_gate_wkv", (hc + 1) * model.hidden_size,
+               columns * engram.width, "engram_gate", count=1),
+            _t("engram_q", hc, model.hidden_size, "engram_gate", count=1),
+            _t("engram_k", hc, model.hidden_size, "engram_gate", count=1),
+        ])
+    return by_layer
 
 
 def engram_weight_terms(model: ModelSpec) -> list[WeightTerm]:

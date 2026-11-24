@@ -9,9 +9,16 @@
 from dataclasses import dataclass, replace
 
 from mindie_sim.schema.common import ModelingError, dtype_bytes
+from mindie_sim.schema.parallel import ParallelSpec
 from .cache_format import cache_format
 from .cache_pools import _ceil_div, _draft_is_dcp_sharded, _draft_row_bytes_int, exact_element_bytes
 from .draft_spec import effective_draft_context_cap
+from .speculative_state import (
+    NON_NEURAL_SPEC_METHODS,
+    kda_total_state_shards,
+    resolve_speculative_proposals,
+    speculative_state_plan,
+)
 
 QUANT_GROUP = 128
 NOPE_FP8_DTYPES = frozenset({"fp8", "fp8_e4m3"})
@@ -98,10 +105,26 @@ def normalize_formats(model):
     ).strip().lower()
     mla_decls: list[tuple[int, dict[str, object]]] = []
     if dtype_bytes(kv_dtype) == 1:
-        raise NotImplementedError(
-            "LEGACY_PURGED: gate NoPE FP8 MLA scale dtype on plan.mla_use_nope or rope == 0 "
-            "instead of rope == 0 alone"
-        )
+        for plan in mla_plans:
+            rope = int(getattr(plan, "qk_rope_head_dim", 0) or 0)
+            is_nope = bool(getattr(plan, "mla_use_nope", False)) or rope == 0
+            default_scale = (
+                "fp16" if (is_nope and kv_dtype in NOPE_FP8_DTYPES) else "fp32"
+            )
+            decl = {
+                "dtype": kv_dtype,
+                "group_size": QUANT_GROUP,
+                "scale_dtype": scale_override or default_scale,
+                "suffix_elements": rope,
+                "suffix_dtype": "bf16",
+            }
+            existing = per_layer.get(str(plan.index), {}).get("mla_kv")
+            mla_decls.append((plan.index, dict(existing) if existing is not None else decl))
+        if mla_decls and all(d == mla_decls[0][1] for _, d in mla_decls):
+            regions.setdefault("mla_kv", mla_decls[0][1])
+        else:
+            for layer_idx, decl in mla_decls:
+                per_layer.setdefault(str(layer_idx), {}).setdefault("mla_kv", decl)
     idx_dtype = str(model.quant.index_dtype).strip().lower()
     idx_decls: list[tuple[int, dict[str, object]]] = []
     if sparse_plans and dtype_bytes(idx_dtype) == 1:
@@ -137,18 +160,19 @@ def draft_row(model, draft, *, tp=1):
 
 
 def _kda_state_shards(parallel, metadata) -> int:
-    del parallel, metadata
-    raise NotImplementedError(
-        "LEGACY_PURGED: delegate KDA TPxPCP sharding to single canonical helper "
-        "in catalog/context_parallel.py"
-    )
+    return kda_total_state_shards(None, parallel, metadata)
 
 
 def _kda_state_page_bytes(plan, shards: int, proposals: int) -> int:
-    del plan, shards, proposals
-    raise NotImplementedError(
-        "LEGACY_PURGED: delegate KDA state page sizing to canonical speculative_state_plan"
+    sp = speculative_state_plan(
+        None,
+        plan,
+        ParallelSpec(tp=max(1, int(shards))),
+        query_tokens=1 + max(0, int(proposals)),
+        recover_ssm=True,
+        capacity_padded=True,
     )
+    return int(sp.recurrent_bytes + sp.conv_bytes)
 
 
 def _project_paired_sfa_stage(
@@ -312,10 +336,10 @@ def _paired_sfa_stage_entries(case, layer_stage, query_tokens):
     mode = metadata.get("mamba_cache_mode", "align")
     if mode not in {"align", "none"}:
         raise ModelingError("paired_sfa_state_cache_mode_not_supported")
-    raise NotImplementedError(
-        "LEGACY_PURGED: require explicit proposal count from SpeculativeExecutionContract / "
-        "DraftStepSchedule in _paired_sfa_stage_entries (fallback query_tokens-1 inference deleted)"
-    )
+    if "num_speculative_state_blocks" in metadata and metadata["num_speculative_state_blocks"] is not None:
+        proposals = int(metadata["num_speculative_state_blocks"])
+    else:
+        proposals = resolve_speculative_proposals(runtime)
     extra = int(metadata.get("num_prefill_checkpoint_blocks", 0))
     if min(proposals, extra) < 0:
         raise ModelingError("paired_sfa_negative_state_slots")
@@ -348,7 +372,12 @@ def _paired_sfa_stage_entries(case, layer_stage, query_tokens):
         if _kda_state_page_bytes(plan, kda_shards, proposals) > main_page:
             raise ModelingError("paired_sfa_block_too_small_for_recurrent_page")
 
-    draft_kind = metadata.get("draft_mode") or ("dspark" if runtime.dspark else "")
+    raw_draft_mode = str(metadata.get("draft_mode") or "").strip().lower()
+    raw_spec_method = str(metadata.get("spec_method") or "").strip().lower()
+    if raw_draft_mode in NON_NEURAL_SPEC_METHODS or raw_spec_method in NON_NEURAL_SPEC_METHODS:
+        draft_kind = ""
+    else:
+        draft_kind = raw_draft_mode or ("dspark" if runtime.dspark else "")
     draft = optional_draft_spec(model, draft_kind) if draft_kind else None
     draft_cap = effective_draft_context_cap(draft, runtime) if draft is not None else 0
 
@@ -416,8 +445,15 @@ def minimum_block_size(
     )
     if row_bytes <= 0:
         return 0
-    del tp, proposals, pcp, kda_parallel_axis, row_bytes, recurrent
-    raise NotImplementedError(
-        "LEGACY_PURGED: compute minimum_block_size via canonical speculative_state_plan "
-        "+ single KDA TPxPCP sharding helper"
+    shards = _kda_state_shards(
+        ParallelSpec(tp=max(1, int(tp)), pcp=max(1, int(pcp))),
+        {"kda_parallel_axis": kda_parallel_axis},
     )
+    prop = max(0, int(proposals))
+    required = 0
+    for plan in recurrent:
+        state_page = _kda_state_page_bytes(plan, shards, prop)
+        tokens = _ceil_div(state_page, row_bytes)
+        if tokens > required:
+            required = tokens
+    return ((required + BLOCK_ALIGNMENT - 1) // BLOCK_ALIGNMENT) * BLOCK_ALIGNMENT

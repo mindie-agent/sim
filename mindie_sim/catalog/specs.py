@@ -312,10 +312,7 @@ def _build_model_spec(key: str, config: Mapping[str, Any]) -> ModelSpec:
         engram = replace(engram, storage_mode=storage_mode)
     resolved_intermediate = intermediate or moe_i
     if resolved_intermediate <= 0:
-        raise NotImplementedError(
-            "LEGACY_PURGED: raise ModelingError('model_config_intermediate_size_missing') "
-            "instead of silent intermediate_size=1 placeholder"
-        )
+        raise ModelingError("model_config_intermediate_size_missing")
     model = ModelSpec(
         name=key, layers=body_layers, hidden_size=h, num_heads=heads,
         head_dim=head_dim, intermediate_size=resolved_intermediate,

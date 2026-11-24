@@ -31,19 +31,55 @@ def _draft_scoped_overrides(quant, draft) -> dict[str, dict[str, object]]:
     return kept
 
 
+def _draft_declared_native_dtype(model, draft, quant) -> str:
+    raw = str(
+        getattr(draft, "activation_dtype", "")
+        or getattr(quant, "native_format", "")
+        or getattr(model, "activation_dtype", "")
+        or ""
+    ).strip().lower()
+    if raw not in FLOAT_WEIGHT_FORMATS:
+        raise ModelingError(f"draft_native_dtype_missing_or_invalid:{raw!r}")
+    return raw
+
+
+def _draft_declared_kv_dtype(draft, *, fallback: str) -> str:
+    src = dict(getattr(draft, "source", ()) or ())
+    declared = str(src.get("kv_dtype") or getattr(draft, "kv_dtype", "") or "").strip().lower()
+    return declared if declared else fallback
+
+
 def draft_quant(model, draft):
     """Use the draft's declared representation in both work and residency.
 
     An explicitly all-FLOAT draft clears inherited target expert formats AND
     target role overrides so draft graphs and weights never inherit target
-    quantization onto BF16 MTP blocks (e.g. Qwen3.8 512-expert MTP).
+    quantization onto native float MTP/DSpark blocks. Preserves declared native
+    float activation formats (``fp16`` / ``bf16`` / ``fp32``) and declared
+    draft ``kv_dtype`` without silent BF16 coercion.
     """
     quant = model.quant
+    if quant is None:
+        raise ModelingError("draft_quant_requires_model_quant")
     from .paired_sfa import independent_draft
-    if independent_draft(draft) and not draft.weight_category:
-        raise NotImplementedError(
-            "LEGACY_PURGED: require explicit draft QuantSpec / weight_category from "
-            "checkpoint/catalog metadata (silent bf16 coercion deleted)"
+    is_independent = independent_draft(draft)
+    if is_independent and not draft.weight_category:
+        native = _draft_declared_native_dtype(model, draft, quant)
+        kv_dtype = _draft_declared_kv_dtype(draft, fallback=native)
+        return replace(
+            quant,
+            weight_format=native,
+            expert_weight_format=native,
+            activation_format=native,
+            kv_dtype=kv_dtype,
+            native_format=native,
+            activation_group_size=0,
+            activation_scale_format="",
+            activation_scale_pack=1,
+            scale_format="",
+            scale_bytes=0.0,
+            output_format="",
+            category_overrides=(),
         )
     if not draft.weight_category:
         return quant
@@ -55,11 +91,20 @@ def draft_quant(model, draft):
             for fields in draft_overrides.values()
         )
         if not has_quantized_draft_override:
-            result = replace(
+            native_kv = _draft_declared_kv_dtype(
+                draft,
+                fallback=(
+                    _draft_declared_native_dtype(model, draft, quant)
+                    if is_independent and getattr(draft, "context_projection_mode", "") == "fused_kv_bank"
+                    else str(quant.kv_dtype)
+                ),
+            )
+            return replace(
                 quant,
                 weight_format=fmt,
                 expert_weight_format=fmt,
                 activation_format=fmt,
+                kv_dtype=native_kv,
                 activation_group_size=0,
                 activation_scale_format="",
                 activation_scale_pack=1,
@@ -68,15 +113,22 @@ def draft_quant(model, draft):
                 output_format="",
                 category_overrides=draft_overrides,
             )
-            if independent_draft(draft) and getattr(draft, "context_projection_mode", "") == "fused_kv_bank":
-                raise NotImplementedError(
-                    "LEGACY_PURGED: preserve declared draft kv_dtype for fused_kv_bank "
-                    "(hardcoded kv_dtype='bf16' coercion deleted)"
-                )
-            return result
-    raise NotImplementedError(
-        "LEGACY_PURGED: preserve native fp16/bf16/fp32 activation_format and declared "
-        "kv_dtype in draft_quant (hardcoded bf16 coercions deleted)"
+    expert_fmt = quant.expert_weight_format if draft.num_experts > ZERO_EXPERTS else fmt
+    act_fmt = fmt if fmt in FLOAT_WEIGHT_FORMATS else quant.activation_format
+    kv_dt = _draft_declared_kv_dtype(
+        draft,
+        fallback=(
+            _draft_declared_native_dtype(model, draft, quant)
+            if is_independent and getattr(draft, "context_projection_mode", "") == "fused_kv_bank"
+            else str(quant.kv_dtype)
+        ),
+    )
+    return replace(
+        quant,
+        weight_format=fmt,
+        expert_weight_format=expert_fmt,
+        activation_format=act_fmt,
+        kv_dtype=kv_dt,
     )
 
 
