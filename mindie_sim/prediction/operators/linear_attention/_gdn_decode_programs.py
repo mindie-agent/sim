@@ -32,11 +32,6 @@ CONV_FP32_SCRATCH_SLOTS = 8
 GATING_TILE_ROWS = 64
 GATING_TILE_HEADS = 8
 GATING_PER_ELEMENT_OPS = 13
-#: One AIV resolves `conv_state_indices[b]`, latches the two rolling descriptors
-#: and drains the previous task's MTE3 before `RunSeq` may start.
-CONV_STATE_RESOLVE_US = 2.65
-#: Multi-core launch, `InitSharedBuffersAndEvents` and the final MTE3 drain.
-CONV_CALL_SETUP_US = 6.0
 #: A rolling state ring is single-buffered: token i+1 reads what token i wrote.
 CONV_TOKEN_SLOTS = 1
 #: Per-token vector expression: three window taps, the Silu/bias fixed term and
@@ -44,7 +39,19 @@ CONV_TOKEN_SLOTS = 1
 CONV_TOKEN_TAP_OPS = 3
 CONV_TOKEN_FIXED_OPS = 5
 CONV_TOKEN_BIAS_OPS = 2
-MS_PER_SECOND = 1000
+NS_TO_MS = 1e-6
+
+
+def _primitive_latency_ms(context, primitive_id: str, metric: str) -> float:
+    """Read a calibrated primitive latency in ms from ``context.primitive_table``."""
+    table = getattr(context, "primitive_table", None)
+    if table is None or primitive_id not in getattr(table, "primitives", ()):
+        return 0.0
+    cell = table.cell(primitive_id)
+    band = cell.metrics.get(metric)
+    if band is None or band.p50 is None or band.p50 <= 0.0:
+        return 0.0
+    return float(band.p50) * NS_TO_MS
 CONV_SOURCE = {
     "path": "data/observations/sources/native-causal-conv-a4a7958",
     "revision": "a4a795857868729fbdbb0118c1e06c8655a7b31b",
@@ -265,12 +272,13 @@ def conv_plan(op, geometry, *, compact=True):
                 return tuple(stages)
             history = width - 1 if owns_state else 0
             state_write = (2 + q) if (speculative and owns_state) else history
+            state_resolve_ms = _primitive_latency_ms(context, "P12_intracore_flag", "flag_v_mte3_ns")
             stages = [
                 # `ResolveSeqCacheIndex` + `ResolveSeqTaskWindow` run once per
                 # task on this owner before any tap is issued, so the resolve
                 # latency repeats with every equal-geometry compaction step.
                 Stage("state_resolve", placement=owned,
-                      latency=CONV_STATE_RESOLVE_US * repeat / MS_PER_SECOND),
+                      latency=state_resolve_ms * repeat),
                 Stage("weights_history",
                       memory((width + int(bias) + history) * n * 2, read),
                       after=("state_resolve",), placement=owned),
@@ -321,8 +329,9 @@ def conv_plan(op, geometry, *, compact=True):
         # One program per physical AIV owner, as the convolution contract
         # requires: each demand-carrying task keeps its own single unit. The
         # launch-level setup is finite and precedes every owner's first task.
+        call_setup_ms = _primitive_latency_ms(context, "P15_rts_stars", "aiv_first_issue_ns")
         return KernelProgram((
-            Stage("descriptor_setup", latency=CONV_CALL_SETUP_US / MS_PER_SECOND),
+            Stage("descriptor_setup", latency=call_setup_ms),
             Stage("owners", after=("descriptor_setup",), program=ParallelProgram(
                 tuple(owner_program(owner) for owner in range(blocks)))),
         ))

@@ -438,7 +438,8 @@ def test_decode_floor_escapes_and_recover_ssm_per_request_abi() -> None:
     assert p_skew.metadata["active_sequences"] == 1 and p_even.metadata["active_sequences"] == 2
     assert p_skew.metadata["max_replay_depth"] == 4 and p_even.metadata["max_replay_depth"] == 2
     assert p_skew.work.resources["mte3"] * 2 == pytest.approx(p_even.work.resources["mte3"])
-    assert p_skew.metadata["kernel_binding"]["kernel_id"] == "RecoverSSMStateCommit"
+    assert p_skew.metadata["kernel_binding"]["kernel_id"] == "gdn_recoverssm_commit"
+    assert p_skew.metadata["kernel_binding"]["backend"] == "Triton"
 
     # Reject unresolved/out-of-range advancement; bind_recover_ssm_commits advances version.
     with pytest.raises(ModelingError, match="resolved_integer_advancement"):
@@ -456,10 +457,12 @@ def test_decode_floor_escapes_and_recover_ssm_per_request_abi() -> None:
     bound, = bind_recover_ssm_commits(
         (intent,),
         views=(RequestView("r0", 4, 64, True, "decode", draft_advanced_tokens=3),),
-        acceptance_events={"r0": "acc0"}, state_bindings={}, runtime=None,
+        acceptance_events={"r0": "acc0"}, state_bindings={},
+        runtime=SimpleNamespace(metadata=(("recover_ssm_readiness", "shipping"),)),
+        machine=SimpleNamespace(arch_family="A5"),
     )
-    assert bound.kernel_binding is not None and bound.kernel_binding.kernel_id == "RecoverSSMStateCommit"
-    assert dict(bound.metadata)["published_state_version"] == "v5"
+    assert bound.kernel_binding is not None and bound.kernel_binding.kernel_id == "kda_recoverssm_commit"
+    assert dict(bound.metadata)["published_state_version"] == "v3"
 
 
 def test_cohort_layer_runs_exact_depth_replay_and_state_equivalence_gate() -> None:

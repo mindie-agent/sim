@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import replace
 from typing import Any, Callable, Mapping
 
@@ -19,6 +20,7 @@ from ..capacity import Memory
 from .progress import DraftPolicy, Progress, running_first
 
 _PREEMPTED = object()
+_COMMIT_HISTORY_LIMIT = 2048
 
 
 def _live_ids(by_id: Mapping[str, Progress]) -> set[str]:
@@ -41,10 +43,17 @@ class Scheduler:
         self.drafts = {state.request.request_id: DraftPolicy.for_request(case, state.request)
                        for state in self.states}
         self.iteration = 0
+        self._next_state_slot = 1
+        self._state_slots: dict[str, int] = {}
         self.in_flight: tuple[RequestView, ...] = ()
         #: Plan iteration currently in flight; a stale callback cannot publish
         #: the next batch.
         self._in_flight_iteration: int | None = None
+        #: Completion handles already committed (retaining references prevents
+        #: id() reuse), stopping stale callbacks from advancing a subsequent
+        #: batch without rejecting a new batch whose PP microbatch count shrunk.
+        self._committed_completion_refs: deque[Any] = deque(maxlen=_COMMIT_HISTORY_LIMIT)
+        self._committed_completions: set[int] = set()
         self.blocked = False
         #: Why the last ``schedule`` call produced or withheld a batch.  It is
         #: feedback for an assembler, not a second scheduler state machine.
@@ -111,14 +120,14 @@ class Scheduler:
         minimum KV span exceeds the mounted per-stage budget is permanently
         infeasible; no release callback can change that.
         """
-        if not hasattr(self.memory, "cache_bytes"):
+        if not hasattr(self.memory, "cache_bytes") or not hasattr(self.memory, "capacity"):
             return True
-        try:
-            needed = self.memory.cache_bytes(
-                self._minimum_request_tokens(state))
-            capacity = self.memory.capacity[self.replica]
-        except (AttributeError, IndexError, TypeError, ValueError):
+        capacity_table = self.memory.capacity
+        if not isinstance(capacity_table, (list, tuple)) or self.replica >= len(capacity_table):
             return True
+        needed = self.memory.cache_bytes(
+            self._minimum_request_tokens(state))
+        capacity = capacity_table[self.replica]
         return all(float(need) <= float(cap) + max(1e-9, abs(float(cap)) * 1e-12)
                    for need, cap in zip(needed, capacity))
 
@@ -165,7 +174,7 @@ class Scheduler:
             decode = state.computed >= state.prompt_target
             draft = self.drafts[state.request.request_id]
             remaining = state.request.output_tokens - state.generated
-            proposal = min(draft.proposal, max(0, remaining - 1), budget - 1) if decode else 0
+            proposal = draft.proposal_for_step(state, remaining, budget) if decode else 0
             q = 1 if decode else min(state.prompt_target - state.computed, budget, input_budget)
             if not decode and not runtime.enable_chunked_prefill and q < state.prompt_target - state.computed:
                 continue
@@ -196,18 +205,8 @@ class Scheduler:
                 state.started = True
                 state.admission_ms = now if state.admission_ms is None else state.admission_ms
                 active += 1
-            advance = draft.committed(state, proposal) if proposal else 1
-            views.append(RequestView(
-                request_id=state.request.request_id, q_len=q, context=state.computed,
-                samples=decode or state.computed + q >= state.prompt_target,
-                phase="decode" if decode else "prefill", prefix_tokens=state.request.prefix_tokens,
-                prefix_cache_key=state.request.prefix_cache_key,
-                priority=state.request.priority, media_encoded=state.media_encoded,
-                draft_verify=bool(proposal), draft_proposal_tokens=proposal,
-                draft_prepare=bool(draft.mode) and remaining > 2,
-                draft_advanced_tokens=advance if decode else 0,
-                draft_accepted_tokens=advance - 1 if decode else 0,
-                prompt_tokens=state.request.prompt_tokens,
+            views.append(self._build_scheduled_view(
+                state, draft, decode=decode, q=q, proposal=proposal, remaining=remaining,
             ))
             budget -= allocation
             if not decode:
@@ -227,6 +226,9 @@ class Scheduler:
                 victim.started = False
                 victim.preemptions += 1
                 victim.state_version += 1
+                victim.state_generation += 1
+                victim.last_state_publication = ""
+                self._state_slots.pop(victim.request.request_id, None)
                 victim.pending_context = None
                 victim.reserved_tokens = 0
                 victim.waiting_for_release = bool(
@@ -269,15 +271,68 @@ class Scheduler:
         self.iteration += 1
         return result
 
+    def _build_scheduled_view(
+        self, state: Progress, draft: DraftPolicy, *, decode: bool, q: int, proposal: int, remaining: int,
+    ) -> RequestView:
+        advance = draft.committed(state, proposal) if proposal else 1
+        samples = decode or state.computed + q >= state.prompt_target
+        step_emitted = min(
+            advance if decode else (1 if samples and not state.generated else 0),
+            remaining,
+        )
+        remaining_after = max(0, remaining - step_emitted)
+        next_decode_step = state.decode_steps + (1 if decode else 0)
+        next_proposal = (
+            draft.next_proposal_for_step(next_decode_step, remaining_after)
+            if samples and draft.proposal > 0 else 0
+        )
+        req_id = state.request.request_id
+        slot = self._state_slots.get(req_id)
+        if slot is None:
+            slot = self._next_state_slot
+            self._next_state_slot += 1
+            self._state_slots[req_id] = slot
+        return RequestView(
+            request_id=req_id, q_len=q, context=state.computed, samples=samples,
+            phase="decode" if decode else "prefill", prefix_tokens=state.request.prefix_tokens,
+            prefix_cache_key=state.request.prefix_cache_key,
+            priority=state.request.priority, media_encoded=state.media_encoded,
+            draft_verify=bool(proposal), draft_proposal_tokens=proposal,
+            draft_prepare=(not decode) and draft.requires_draft_prepare and remaining > 2,
+            draft_advanced_tokens=advance if decode else 0,
+            draft_accepted_tokens=advance - 1 if decode else 0,
+            prompt_tokens=state.request.prompt_tokens,
+            state_version=state.state_version, state_slot=slot,
+            state_generation=state.state_generation,
+            previous_state_publication=state.last_state_publication,
+            next_draft_proposal_tokens=next_proposal,
+        )
+
     def commit(self, at_ms: float, times: Mapping[str, float] | None = None) -> None:
         if not self.in_flight:
             return
         self.memory.step_delayed_releases(self.replica)
+        committed_iter = (
+            self._in_flight_iteration
+            if self._in_flight_iteration is not None
+            else max(0, self.iteration - 1)
+        )
         for view in self.in_flight:
             state = self.by_id[view.request_id]
             state.commit(view, (times or {}).get(view.request_id, at_ms))
+            slot = int(view.state_slot or self._state_slots.get(view.request_id, 0))
+            pub_kind = (
+                "recover_ssm_commit"
+                if (view.phase == "decode" and view.draft_verify and view.draft_proposal_tokens > 0)
+                else ("decode_state" if view.phase == "decode" else "prefill_state")
+            )
+            state.last_state_publication = (
+                f"{pub_kind}:iter{committed_iter}:req={view.request_id}"
+                f":slot={slot}:gen={state.state_generation}:v{state.state_version}"
+            )
             if state.done:
                 self._live_ids.discard(view.request_id)
+                self._state_slots.pop(view.request_id, None)
                 if self.memory.async_delayed_release_steps > 0 and not self.done:
                     self.memory.defer_release(self.replica, view.request_id)
                 else:
@@ -361,19 +416,29 @@ class Scheduler:
             return False
         if not self.in_flight or self._in_flight_iteration is None:
             return False
-        iteration = getattr(step, "iteration", None)
-        if iteration is not None:
-            # PP microbatches carry plan_iteration = plan_iteration * count +
-            # microbatch; the service still owns one scheduler transaction per
-            # plan.  Accept only this plan's microbatch range, never a stale
-            # callback from an earlier or later transaction.
-            microbatches = max(1, min(
-                int(getattr(self.case.runtime, "pipeline_microbatches", 1)),
-                max(1, len(self.in_flight))))
-            base = int(self._in_flight_iteration) * microbatches
-            if not base <= int(iteration) < base + microbatches:
-                return False
         completion = getattr(step, "completion", None)
+        if completion is not None and id(completion) in self._committed_completions:
+            return False
+        orig_iter = getattr(step, "original_iteration", None)
+        iteration = getattr(step, "iteration", None)
+        if orig_iter is not None:
+            if int(orig_iter) != int(self._in_flight_iteration):
+                return False
+        elif iteration is not None:
+            iter_val = int(iteration)
+            # PP microbatches carry plan_iteration = original_iteration * cohort_count +
+            # microbatch where cohort_count is the cohort-wide max microbatch count in
+            # [local_microbatches, pipeline_microbatches] (may exceed local len(in_flight)
+            # on asymmetric DP replicas). Accept only this transaction's valid range.
+            max_mb = max(1, int(getattr(self.case.runtime, "pipeline_microbatches", 1)))
+            local_mb = max(1, min(max_mb, max(1, len(self.in_flight))))
+            cur_iter = int(self._in_flight_iteration)
+            matched = any(
+                cur_iter * count <= iter_val < cur_iter * count + count
+                for count in range(local_mb, max_mb + 1)
+            )
+            if not matched:
+                return False
         when = at_ms if at_ms is not None else getattr(completion, "time", None)
         if when is None:
             raise ModelingError("scheduled_batch_has_no_completion_event")
@@ -382,6 +447,15 @@ class Scheduler:
             for request, event in getattr(step, "commits", {}).items()
             if event is not None and event.time is not None
         }
+        in_flight_ids = {view.request_id for view in self.in_flight}
+        if times and not (set(times) <= in_flight_ids):
+            return False
+        if completion is not None:
+            if len(self._committed_completion_refs) >= _COMMIT_HISTORY_LIMIT:
+                evicted = self._committed_completion_refs.popleft()
+                self._committed_completions.discard(id(evicted))
+            self._committed_completion_refs.append(completion)
+            self._committed_completions.add(id(completion))
         self.commit(when, times)
         return True
 

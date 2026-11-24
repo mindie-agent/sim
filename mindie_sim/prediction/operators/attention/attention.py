@@ -73,7 +73,12 @@ from .gqa_contracts import (
     _store_cache,
     uses_mrope_qkv_kernel,
 )
-from mindie_sim.prediction.operators.sparse_indexer.gqa_indexer import lower_gqa_indexer
+from mindie_sim.prediction.operators.sparse_indexer.gqa_indexer import (
+    is_block_msa_indexer,
+    is_qsa_pooled_indexer,
+    is_region_csa_indexer,
+    lower_gqa_indexer,
+)
 from mindie_sim.prediction.implementation_selection import is_caller_pinned_binding
 from mindie_sim.prediction.prefix_reads import _merged_interval_rows, owned_window_intervals
 from mindie_sim.prediction.operators.sparse_indexer.sparse_attention import sparse_attention_traffic
@@ -88,6 +93,200 @@ ROTARY_OPS_PER_ELEMENT = 6
 GATE_SIGMOID_OPS_PER_ELEMENT = 4
 GATE_APPLY_OPS_PER_ELEMENT = 1
 FLOPS_PER_FMA = 2
+GBSA_NATIVE_KIND = "aclnnGenericBlockSparseAttention"
+GBSA_META_NATIVE_KIND = "GenericBlockSparseAttentionMetadata"
+FIA_PREFILL_NATIVE_KIND = "FusedInferAttentionScore"
+QSA_FIA_MAX_LOGICAL_KV_LENGTH = 24 * 1024
+GBSA_METADATA_REUSE_ARCHS = frozenset({"A3", "A5", "DAV_3510", "NPU_ARCH_3510"})
+
+
+def _qsa_view_uses_fia(view) -> bool:
+    """Upstream ``qwen4_exp/attention_dispatch.py:27-46`` request-level FIA predicate."""
+    if getattr(view, "padding", False) or str(getattr(view, "phase", "")) != "prefill":
+        return False
+    # Classify the scheduler's whole chunk (invariant across PCP shards).
+    q_len = max(0, int(getattr(view, "global_q_len", 0) or getattr(view, "q_len", 0) or 0))
+    context = max(0, int(getattr(view, "context", 0) or 0))
+    kv_len = max(q_len, context + q_len, int(getattr(view, "kv_len", 0) or 0))
+    fits = kv_len <= QSA_FIA_MAX_LOGICAL_KV_LENGTH
+    crosses = (
+        kv_len > QSA_FIA_MAX_LOGICAL_KV_LENGTH
+        and (kv_len - q_len) < QSA_FIA_MAX_LOGICAL_KV_LENGTH
+    )
+    return fits or crosses
+
+
+def _supports_gbsa_metadata_reuse(runtime, machine) -> bool:
+    """Upstream ``hardware_profile.py:370,394,487``: A3 and A5 support reuse; A2 does not."""
+    rt_meta = dict(getattr(runtime, "metadata", ()) or ()) if runtime is not None else {}
+    for candidate in (
+        getattr(machine, "arch_family", None),
+        rt_meta.get("arch_family"),
+        getattr(runtime, "arch_family", None),
+    ):
+        text = str(candidate or "").strip().upper()
+        if not text:
+            continue
+        if "A2" in text:
+            return False
+        if text in GBSA_METADATA_REUSE_ARCHS or any(tok in text for tok in ("A3", "A5", "3510", "950")):
+            return True
+        return False
+    return False
+
+
+def _sparse_gqa_native_kind(plan, *, mode: str, eff_topk: int, topk_id: str | None, view=None) -> str:
+    if eff_topk <= 0 or not topk_id:
+        return ""
+    if is_block_msa_indexer(plan) or is_region_csa_indexer(plan):
+        return GBSA_NATIVE_KIND
+    if is_qsa_pooled_indexer(plan):
+        if view is not None:
+            return FIA_PREFILL_NATIVE_KIND if _qsa_view_uses_fia(view) else GBSA_NATIVE_KIND
+        return FIA_PREFILL_NATIVE_KIND if mode == "prefill" else GBSA_NATIVE_KIND
+    return ""
+
+
+GBSA_METADATA_TOTAL_WORDS = 1024
+GBSA_METADATA_WORD_BYTES = 4
+GBSA_METADATA_OUTPUT_BYTES = GBSA_METADATA_TOTAL_WORDS * GBSA_METADATA_WORD_BYTES
+INT64_BYTES = 8
+
+
+def _emit_gbsa_metadata_if_needed(
+    ops, *, prefix: str, stage: int, plan, requests, mode: str,
+    views, topk_id: str | None, eff_topk: int, sel_topk: int, selected,
+    local_heads: int, kv_heads: int, head_dim: int, padded_tokens: int,
+    quant, runtime=None, machine=None, gbsa_metadata_cache: dict | None = None,
+) -> str | None:
+    """Emit AI_CPU ``GenericBlockSparseAttentionMetadata`` (fixed 1024 int32 words = 4,096 B).
+
+    Mirrors CANN ``generic_block_sparse_attention_metadata_tiling.h:21``,
+    upstream ``vllm_ascend/models/minimax_m3/msa_m3.py:838-927`` stage+hardware-gated
+    decode reuse, and ``qwen4_exp/attention_dispatch.py`` request-level QSA dispatch.
+    """
+    if selected or eff_topk <= 0 or not topk_id:
+        return None
+    if is_qsa_pooled_indexer(plan):
+        non_pad_all = tuple(v for v in views if not getattr(v, "padding", False))
+        gbsa_non_pad = tuple(v for v in non_pad_all if not _qsa_view_uses_fia(v))
+        if not gbsa_non_pad:
+            return None
+        meta_views = views if len(gbsa_non_pad) == len(non_pad_all) else gbsa_non_pad
+        eff_padded = padded_tokens if len(meta_views) == len(views) else sum(int(v.physical_q_len) for v in meta_views)
+    elif is_block_msa_indexer(plan) or is_region_csa_indexer(plan):
+        meta_views = views
+        eff_padded = padded_tokens
+    else:
+        return None
+    non_pad = tuple(v for v in meta_views if not getattr(v, "padding", False))
+    q_lens = {int(v.q_len) for v in non_pad}
+    uniform_decode = (
+        mode == "decode"
+        and bool(non_pad)
+        and len(q_lens) <= 1
+        and all(v.phase == "decode" for v in non_pad)
+    )
+    batch = max(1, len(meta_views))
+    phys_q = max(sum(int(v.physical_q_len) for v in meta_views), int(eff_padded))
+    max_q = max((int(v.q_len) for v in non_pad), default=1)
+    raw_kv_dtype = getattr(quant, "kv_dtype", "") if quant is not None else ""
+    if not raw_kv_dtype:
+        raise ModelingError("gbsa_metadata_requires_explicit_kv_dtype")
+    kv_dtype = str(raw_kv_dtype)
+    can_reuse = (
+        gbsa_metadata_cache is not None
+        and uniform_decode
+        and is_block_msa_indexer(plan)
+        and _supports_gbsa_metadata_reuse(runtime, machine)
+    )
+    reuse_key = (
+        (int(stage), local_heads, kv_heads, head_dim, sel_topk, max_q, phys_q, kv_dtype)
+        if can_reuse
+        else None
+    )
+    if reuse_key is not None and reuse_key in gbsa_metadata_cache:
+        return gbsa_metadata_cache[reuse_key]
+    meta_reqs = tuple(v.request_id for v in meta_views) if meta_views else requests
+    # Upstream msa_m3_npu.py:193-258 inputs: select_num_idx[H_kv, M_phys] (int32),
+    # cu_seqlens_q[B+1] (int64), seqused_kv[B] (int32). Output: fixed 1024 int32 words.
+    input_read_bytes = (
+        kv_heads * phys_q * GBSA_METADATA_WORD_BYTES
+        + (batch + 1) * INT64_BYTES
+        + batch * GBSA_METADATA_WORD_BYTES
+    )
+    output_write_bytes = GBSA_METADATA_OUTPUT_BYTES
+    call_spec = {
+        "batch": batch,
+        "rows": phys_q,
+        "valid_rows": sum(int(v.q_len) for v in non_pad),
+        "heads": local_heads,
+        "kv_heads": kv_heads,
+        "head_dim": head_dim,
+        "topk": sel_topk,
+        "max_query": max_q,
+        "max_context": max((int(v.kv_len) for v in non_pad), default=0),
+        "input_read_bytes": input_read_bytes,
+        "output_write_bytes": output_write_bytes,
+        "output_shape": (GBSA_METADATA_TOTAL_WORDS,),
+        "output_dtype": "int32",
+        "query_layout": "TND",
+        "cache_layout": "PA_BBND",
+        "decode_reusable": reuse_key is not None,
+    }
+    meta_op = OpSpec(
+        op_id=f"{prefix}.gbsa_metadata",
+        family="attention_metadata",
+        phase=mode,
+        stage=stage,
+        layer=plan.index,
+        requests=meta_reqs,
+        semantic_shape=(GBSA_METADATA_TOTAL_WORDS,),
+        local_shape=(GBSA_METADATA_TOTAL_WORDS,),
+        padded_shape=(GBSA_METADATA_TOTAL_WORDS,),
+        launch_shape=(GBSA_METADATA_TOTAL_WORDS,),
+        flops=0.0,
+        vector_ops=0.0,
+        hbm_bytes=float(input_read_bytes + output_write_bytes),
+        mte2_bytes=float(input_read_bytes),
+        mte3_bytes=float(output_write_bytes),
+        deps=(topk_id,) if topk_id else (),
+        recipe="generic_block_sparse_attention_metadata",
+        dtype="int32",
+        source_boundary="kernel",
+        metadata=(
+            ("kernel", GBSA_META_NATIVE_KIND),
+            ("native_kind", GBSA_META_NATIVE_KIND),
+            ("execution_core", "aicpu"),
+            ("invocation_class", "aicpu"),
+            ("execution_domain", "AI_CPU"),
+            ("metadata_call", call_spec),
+        ),
+    )
+    ops.append(meta_op)
+    ready_id = meta_op.op_id
+    if reuse_key is not None:
+        publish = vector_op(
+            op_id=f"{prefix}.gbsa_metadata_publish",
+            deps=(meta_op.op_id,),
+            stage=stage,
+            layer=plan.index,
+            requests=requests,
+            elements=GBSA_METADATA_TOTAL_WORDS,
+            ops_per_element=0,
+            dtype="int32",
+            family="copy",
+            phase=mode,
+            recipe="copy",
+            shape=(GBSA_METADATA_TOTAL_WORDS,),
+            read_bytes_override=float(output_write_bytes),
+            write_bytes_override=float(output_write_bytes),
+            metadata=(("metadata_buffer_publication", True), ("decode_reused", True)),
+        )
+        ops.append(publish)
+        ready_id = publish.op_id
+        gbsa_metadata_cache[reuse_key] = ready_id
+    return ready_id
 SOFTMAX_VECTOR_OPS_PER_PAIR = 5
 DEFAULT_CP_INTERLEAVE = 128
 INT32_BYTES = 4
@@ -198,7 +397,8 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         runtime=None, cache_ids=None, stage_of=None, topk_ids=None,
         index_cache_ids=None, candidate_ids=None, machine=None, hierarchy=None,
         dcp_cohort_views_by_member=None, dcp_local_pos=0,
-        physical_rank=None, explicit_physical_rank=False, **_) -> AttentionResult:
+        physical_rank=None, explicit_physical_rank=False,
+        gbsa_metadata_cache=None, **_) -> AttentionResult:
     from mindie_sim.prediction.implementations import add_input_ports, select
 
     cacheless = plan.cache_kind == "none"
@@ -262,23 +462,10 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
             cache_planes, kv_heads, width, quant, cp_interleave_size, cacheless, cache_ids,
             stage_of, shared_format, model, key_fmt, value_fmt)
         eff_topk, sel_topk, block_size, index_store_id, topk_id, candidate_id = lower_gqa_indexer(
-            ops,
-            prefix=prefix,
-            plan=plan,
-            views=views,
-            stage=stage,
-            deps=deps,
-            model=model,
-            parallel=parallel,
-            quant=quant,
-            mode=mode,
-            padded_tokens=padded_tokens,
-            valid=valid,
-            pcp_prefill=pcp_prefill,
-            runtime=runtime,
-            topk_ids=topk_ids,
-            index_cache_ids=index_cache_ids,
-            machine=machine,
+            ops, prefix=prefix, plan=plan, views=views, stage=stage, deps=deps,
+            model=model, parallel=parallel, quant=quant, mode=mode, padded_tokens=padded_tokens,
+            valid=valid, pcp_prefill=pcp_prefill, runtime=runtime, topk_ids=topk_ids,
+            index_cache_ids=index_cache_ids, machine=machine,
         )
         query_producer = rope.op_id
     eff_window = min_positive(plan.window, eff_topk)
@@ -291,10 +478,20 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         tp_gather=tp_gather, dp_width=dp_width, cohort_dec_views=cohort_dec_views,
         peer_dec_rows=peer_dec_rows, local_dp_pos=local_dp_pos,
         idle_dcp_owner=idle_dcp_owner)
-    local_attn_deps = ((*store_ids, topk_id, query_producer) if topk_id
-                       else (*store_ids, query_producer))
-    dcp_attn_deps = ((*store_ids, topk_id, dcp_query_producer) if topk_id
-                     else (*store_ids, dcp_query_producer))
+    gbsa_meta_id = _emit_gbsa_metadata_if_needed(
+        ops, prefix=prefix, stage=stage, plan=plan, requests=requests, mode=mode,
+        views=views, topk_id=topk_id, eff_topk=eff_topk, sel_topk=sel_topk,
+        selected=selected, local_heads=heads, kv_heads=kv_heads, head_dim=width,
+        padded_tokens=padded_tokens, quant=quant,
+        runtime=runtime, machine=machine,
+        gbsa_metadata_cache=gbsa_metadata_cache,
+    )
+    sparse_deps = tuple(dict.fromkeys(dep for dep in (topk_id, gbsa_meta_id) if dep))
+    fia_sparse_deps = (topk_id,) if topk_id else ()
+    local_attn_deps = (*store_ids, *sparse_deps, query_producer)
+    dcp_attn_deps = (*store_ids, *sparse_deps, dcp_query_producer)
+    local_fia_attn_deps = (*store_ids, *fia_sparse_deps, query_producer)
+    dcp_fia_attn_deps = (*store_ids, *fia_sparse_deps, dcp_query_producer)
     streams = kv_heads if policy.reuse_kv_across_query_heads else heads
     kv_row_bytes = (
         key_fmt.row_bytes(streams * (width + v_width))
@@ -306,6 +503,7 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         or is_caller_pinned_binding(runtime, "recipes", attention_recipe)
         or is_caller_pinned_binding(runtime, "recipes", "flash_attention")
     )
+    qsa_dispatch = bool(is_qsa_pooled_indexer(plan) and eff_topk > 0 and topk_id and not selected)
     request_op = partial(
         _gqa_request_op, kv_heads=kv_heads, local_heads=heads, dcp_heads=dcp_heads,
         dp_width=dp_width, width=width,
@@ -313,6 +511,7 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         policy=policy, model=model, sel_topk=sel_topk, topk_id=topk_id,
         eff_topk=eff_topk, prefix=prefix, stage=stage,
         local_attn_deps=local_attn_deps, dcp_attn_deps=dcp_attn_deps,
+        local_fia_attn_deps=local_fia_attn_deps, dcp_fia_attn_deps=dcp_fia_attn_deps,
         attention_recipe=attention_recipe, streams=streams, quant=quant,
         parallel=parallel, eff_window=eff_window, runtime=runtime, cacheless=cacheless,
         selected=selected, query_producer=query_producer,
@@ -327,7 +526,8 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         peer_decode_rows=(peer_dec_rows if dp_width > 1 else None),
         local_dp_pos=local_dp_pos, physical_rank=physical_rank,
         explicit_dp_cohort=(dcp_cohort_views_by_member is not None),
-        explicit_physical_rank=bool(explicit_physical_rank))
+        explicit_physical_rank=bool(explicit_physical_rank),
+        qsa_dispatch=qsa_dispatch)
     if idle_dcp_owner:
         return AttentionResult(ops=ops, last=attention[-1],
                                cache_store_id=None, index_store_id=None,
@@ -467,8 +667,12 @@ def _gqa_projections(
                 heads, projected_kv_heads, width, shared, split_views,
             )
             ops.extend(norm_ops)
-    if (dict(getattr(model, "catalog_facts", ()) or {}).get("gemma4_v_norm")
-            and not shared and projected_kv_heads > 0):
+    norm_cfg = dict(getattr(model, "catalog_facts", ()) or {}).get("normalization")
+    has_v_norm = (
+        bool(getattr(plan, "v_norm", False))
+        or (isinstance(norm_cfg, dict) and bool(norm_cfg.get("v_norm", False)))
+    )
+    if has_v_norm and not shared and projected_kv_heads > 0:
         act_bytes = dtype_bytes(model.activation_dtype)
         v_norm_elems = padded_tokens * projected_kv_heads * v_width
         v_norm = vector_op(
@@ -661,7 +865,11 @@ def _gqa_rank_work(
             v_sweeps = sparse_v_sweeps[pos]
             v_shared = [0] * eff_cp
         else:
-            visible_kv = min(view.kv_len, dense_win) if dense_win > 0 else view.kv_len
+            visible_kv = (
+                min(view.kv_len, dense_win + selected_q) if (plan.noncausal_attention and dense_win > 0)
+                else min(view.kv_len, dense_win) if dense_win > 0
+                else view.kv_len
+            )
             pairs = (
                 float(selected_q * visible_kv) if plan.noncausal_attention else
                 sum(_causal_pairs(end - start, context + start, dense_win)
@@ -689,7 +897,7 @@ def _gqa_rank_work(
                 for start in range(begin, end, policy.query_tile):
                     if plan.noncausal_attention:
                         hi = view.kv_len
-                        lo = max(0, hi - dense_win) if dense_win > 0 else 0
+                        lo = max(0, context - dense_win) if dense_win > 0 else 0
                     else:
                         hi = context + min(end, start + policy.query_tile)
                         lo = max(0, context + start + 1 - dense_win) if dense_win > 0 else 0
@@ -741,13 +949,18 @@ def _gqa_request_op(
     local_attn_deps, dcp_attn_deps, attention_recipe, streams, quant,
     parallel, eff_window, runtime, cacheless, selected, query_producer,
     dcp_query_producer, add_input_ports, chunked_pf_pcp=False,
+    local_fia_attn_deps=None, dcp_fia_attn_deps=None,
 ):
     heads = dcp_heads if eff_cp > 1 else local_heads
     q_eff = (int(getattr(view, "global_q_len", 0) or view.q_len)
              if chunked_pf_pcp else int(view.q_len))
     eff_local_pairs = float(local_pairs)
     q_prod = dcp_query_producer if eff_cp > 1 else query_producer
-    attention_deps = dcp_attn_deps if eff_cp > 1 else local_attn_deps
+    sparse_nk = _sparse_gqa_native_kind(plan, view=view, mode=mode, eff_topk=eff_topk, topk_id=topk_id)
+    if sparse_nk == FIA_PREFILL_NATIVE_KIND and local_fia_attn_deps is not None:
+        attention_deps = dcp_fia_attn_deps if eff_cp > 1 else local_fia_attn_deps
+    else:
+        attention_deps = dcp_attn_deps if eff_cp > 1 else local_attn_deps
     qk_width = width
     v_width = int(getattr(plan, "v_head_dim", 0) or width)
     traffic = plan_attention_traffic(
@@ -775,8 +988,16 @@ def _gqa_request_op(
     element_bytes = dtype_bytes(model.activation_dtype)
     query_bytes = q_eff * heads * qk_width * element_bytes
     output_bytes = q_eff * heads * v_width * element_bytes
-    selection_bytes = (float(q_eff * sel_topk * INT32_BYTES)
-                       if topk_id and eff_topk > 0 else 0.0)
+    idx_q_heads = (
+        local_kv_heads(max(1, int(plan.index_heads or 1)), max(1, int(parallel.tp or 1)))
+        if is_block_msa_indexer(plan)
+        else 1
+    )
+    selection_bytes = (
+        float(q_eff * sel_topk * idx_q_heads * INT32_BYTES)
+        if topk_id and eff_topk > 0 else 0.0
+    )
+    sparse_nk_meta = (("native_kind", sparse_nk),) if (sparse_nk and not selected) else ()
     shape = (q_eff, view.kv_len, heads, qk_width)
     op = OpSpec(
         op_id=f"{prefix}.attention.{orig_idx}", family="attention", phase=mode,
@@ -792,9 +1013,11 @@ def _gqa_request_op(
         metadata=(("query_tile", policy.query_tile), ("causal_pairs", pairs),
                   ("local_pairs", eff_local_pairs), ("kv_streams", streams),
                   ("kv_sweeps", view_sweeps),
+                  ("selection_read_bytes", selection_bytes),
                   ("attention_traffic_plan", traffic.to_dict()),
                   ("cp_per_rank_pairs", tuple(v_pairs)),
                   ("cp_per_rank_sweeps", tuple(v_sweeps)))
+                 + sparse_nk_meta
                  + _decode_contract(
                      (view,), heads, kv_heads, width, model, quant, parallel, plan, mode,
                      window=eff_window, cp=eff_cp)
@@ -894,10 +1117,13 @@ def _gqa_history_pairs(
     return rank_pairs, per_view
 
 
-def _group_gqa_phase_views(views, plan, parallel, *, dp_width, cacheless, cohort_decode_views):
+def _group_gqa_phase_views(
+    views, plan, parallel, *, dp_width, cacheless, cohort_decode_views,
+    qsa_dispatch: bool = False,
+):
     layer_dcp = layer_dcp_degree(plan, parallel)
     phase_groups: list[tuple[int, bool, list[tuple[int, object]]]] = []
-    group_map: dict[tuple[int, bool], list[tuple[int, object]]] = {}
+    group_map: dict[tuple[int, bool, str], list[tuple[int, object]]] = {}
     has_dp_decode = dp_width > 1 and layer_dcp > 1 and bool(cohort_decode_views)
     for index, view in enumerate(views):
         if has_dp_decode and view.phase != "prefill":
@@ -907,7 +1133,11 @@ def _group_gqa_phase_views(views, plan, parallel, *, dp_width, cacheless, cohort
             and layer_dcp > 1 and not cacheless
         )
         eff_cp = layer_dcp if chunked_pf else active_layer_dcp(plan, parallel, view.phase)
-        gkey = (eff_cp, chunked_pf)
+        qsa_branch = (
+            ("fia" if _qsa_view_uses_fia(view) else "gbsa")
+            if qsa_dispatch else ""
+        )
+        gkey = (eff_cp, chunked_pf, qsa_branch)
         if gkey not in group_map:
             bucket: list[tuple[int, object]] = []
             group_map[gkey] = bucket
@@ -936,6 +1166,16 @@ def _lower_gqa_dcp_combine(
             act_dtype=model.activation_dtype,
             stream=("" if chunked_pf else CP_DECODE_COMM_STREAM),
             allow_q1=chunked_pf, window=dense_win)
+    mixed_split_rows = (
+        sum(int(v.q_len) for v in grp_views if int(v.q_len) > 1)
+        if (split_curr and not chunked_pf and any(int(v.q_len) == 1 for v in grp_views))
+        else None
+    )
+    eff_merge_rows = (
+        grp_valid if chunked_pf_pcp
+        else mixed_split_rows if (mixed_split_rows is not None and mixed_split_rows > 0)
+        else None
+    )
     return emit_dcp_output_exchange_combine(
         ops, prefix=grp_prefix, stage=stage, layer=plan.index,
         requests=grp_reqs, mode=mode, deps=tuple(grp_attn),
@@ -946,9 +1186,133 @@ def _lower_gqa_dcp_combine(
         peer_rows=(peer_decode_rows if (dp_width > 1 and not chunked_pf) else None),
         local_dp_pos=local_dp_pos,
         stream=(CP_CHUNKED_PREFILL_STREAM if chunked_pf else ""),
-        merge_rows=(grp_valid if chunked_pf_pcp else None),
+        merge_rows=eff_merge_rows,
         meta_extra=(("cp_interleave", int(cp_interleave_size)),
                     ("gqa_chunked_prefill_dcp", bool(chunked_pf))))
+
+
+def _subtract_current_chunk_history_traffic(
+    indexed_views, per_view_rows, per_view_sweeps, per_view_spans,
+    rank_rows, rank_sweeps, *, eff_cp: int, cp_interleave_size: int, chunked_pf: bool,
+) -> None:
+    """Clip history-only unique/sweep KV spans strictly to ``[0, context)`` (D2 §2.1.1)."""
+    for v_pos, (_, view) in enumerate(indexed_views):
+        if not ((chunked_pf or int(view.q_len) > 1) and int(view.kv_len) > int(view.context)):
+            continue
+        ctx = int(view.context)
+        win_spans, sh_spans = per_view_spans[v_pos]
+        clipped_win = [(lo, min(hi, ctx)) for lo, hi in win_spans if min(hi, ctx) > lo]
+        clipped_sh = [(lo, min(hi, ctx)) for lo, hi in sh_spans if min(hi, ctx) > lo]
+        per_view_spans[v_pos] = (clipped_win, clipped_sh)
+        u_lo = min((lo for lo, _ in clipped_win), default=0)
+        u_hi = max((hi for _, hi in clipped_win), default=0)
+        for r in range(eff_cp):
+            old_rows = per_view_rows[v_pos][r]
+            new_rows = (
+                owned_positions(u_lo, u_hi - 1, eff_cp, cp_interleave_size, r)
+                if u_hi > u_lo else 0
+            )
+            new_rows = min(old_rows, new_rows)
+            per_view_rows[v_pos][r] = new_rows
+            rank_rows[r] = max(0, rank_rows[r] - (old_rows - new_rows))
+            old_sw = per_view_sweeps[v_pos][r]
+            new_sw = sum(
+                owned_positions(lo, hi - 1, eff_cp, cp_interleave_size, r)
+                for lo, hi in clipped_win
+            )
+            new_sw = min(old_sw, new_sw)
+            per_view_sweeps[v_pos][r] = new_sw
+            rank_sweeps[r] = max(0, rank_sweeps[r] - (old_sw - new_sw))
+
+
+def _finalize_gqa_group_batches(
+    ops, batches, *, grp_prefix, grp_reqs, grp_views, grp_hist_valid, indexed_views,
+    sweeps_by_view, shared_sweeps_by_view, unique_win_by_view, shared_iv_by_view,
+    kv_hbm_total, kv_mte2_total, kv_components, rank_pairs, rank_sweeps, rank_rows,
+    sel_r, worst_r, worst_sweeps_r, split_curr, sparse_imb_meta,
+    heads, kv_heads, width, streams, kv_row_bytes, eff_topk, eff_window, eff_cp,
+    policy, model, quant, parallel, plan, mode, hierarchy, runtime, cacheless,
+    selected, user_pinned_attn,
+) -> list[str]:
+    """Fuse or annotate per-group GQA attention batch ops with prefix-read accounting."""
+    if policy.fused_batch and not selected and batches:
+        fields = ("flops", "vector_ops", "hbm_bytes", "mte2_bytes", "mte3_bytes")
+        batched_nk = dict(batches[0].metadata).get("native_kind")
+        batched_nk_meta = (("native_kind", batched_nk),) if batched_nk else ()
+        batched_sel_bytes = sum(float(dict(op.metadata).get("selection_read_bytes", 0.0)) for op in batches)
+        batched = replace(
+            batches[0], op_id=grp_prefix + ".attention", requests=grp_reqs,
+            semantic_shape=(grp_hist_valid, max(v.kv_len for v in grp_views), heads, width),
+            local_shape=(grp_hist_valid, rank_rows[sel_r], heads, width),
+            metadata=(("request_shapes", tuple((v.q_len, v.context) for v in grp_views)),
+                      ("query_tile", policy.query_tile),
+                      ("kv_streams", streams),
+                      ("kv_sweeps", sum(sweeps_by_view)),
+                      ("selection_read_bytes", batched_sel_bytes),
+                      ("cp_per_rank_pairs", tuple(rank_pairs)),
+                      ("cp_per_rank_sweeps", tuple(rank_sweeps)),
+                      ("cp_bottleneck_pairs_rank", worst_r),
+                      ("cp_bottleneck_sweeps_rank", worst_sweeps_r),
+                      ("dcp_mtp_split", "history" if split_curr else "unified"))
+                     + batched_nk_meta
+                     + sparse_imb_meta
+                     + _decode_contract(
+                         grp_views, heads, kv_heads, width, model, quant,
+                         parallel, plan, mode, window=eff_window, cp=eff_cp)
+                     + _prefill_contract(
+                         grp_views, heads, kv_heads, width, model, quant,
+                         parallel, plan, mode, window=eff_window, cp=eff_cp)
+                     + _attention_tensor_view(
+                         grp_views, heads, kv_heads, width, model, quant, parallel,
+                         policy, runtime, causal=not plan.noncausal_attention,
+                         cacheless=cacheless),
+            **{key: sum(getattr(op, key) for op in batches) for key in fields})
+        if eff_topk > 0:
+            batched = annotate_sparse_prefix_unknown(batched, runtime)
+        elif not cacheless:
+            read_mode = str(getattr(runtime, "prefix_read_mode", "auto") or "auto")
+            reuse_kind = (
+                ("native_per_sequence" if read_mode == "batch_shared" else "paged_l2")
+                if user_pinned_attn
+                else "tile"
+            )
+            batched = apply_attention_prefix_reads(
+                batched, views=grp_views, sweeps_by_view=sweeps_by_view,
+                shared_sweeps_by_view=shared_sweeps_by_view, row_bytes=float(kv_row_bytes),
+                layer_index=plan.index, runtime=runtime,
+                kernel_reuse=reuse_kind, allow_recipe_rebind=not user_pinned_attn,
+                kv_hbm_bytes=kv_hbm_total, kv_mte2_bytes=kv_mte2_total,
+                unique_rows_by_view=unique_win_by_view,
+                shared_intervals_by_view=shared_iv_by_view, geometry=hierarchy,
+            )
+        ops.append(batched)
+        return [batched.op_id]
+    if not batches:
+        return []
+    if eff_topk > 0:
+        batches = [
+            annotate_sparse_prefix_unknown(
+                replace(item, metadata=item.metadata + sparse_imb_meta)
+                if sparse_imb_meta else item,
+                runtime,
+            )
+            for item in batches
+        ]
+    elif not cacheless:
+        for pos, item in enumerate(batches):
+            view = indexed_views[pos][1]
+            kv_hbm_b, kv_mte2_b = kv_components[pos]
+            batches[pos] = apply_attention_prefix_reads(
+                item, views=(view,), sweeps_by_view=(sweeps_by_view[pos],),
+                shared_sweeps_by_view=(shared_sweeps_by_view[pos],),
+                row_bytes=float(kv_row_bytes), layer_index=plan.index, runtime=runtime,
+                kernel_reuse="native_per_sequence", allow_recipe_rebind=False,
+                kv_hbm_bytes=kv_hbm_b, kv_mte2_bytes=kv_mte2_b,
+                unique_rows_by_view=(unique_win_by_view[pos],),
+                shared_intervals_by_view=(shared_iv_by_view[pos],),
+            )
+    ops.extend(batches)
+    return [item.op_id for item in batches]
 
 
 def _append_gqa_attention(
@@ -958,10 +1322,11 @@ def _append_gqa_attention(
     user_pinned_attn, request_op, *, pcp_factor, tp_gather, dp_width, local_attn_deps,
     cohort_decode_views=None, peer_decode_rows=None, local_dp_pos=0,
     physical_rank=None, explicit_dp_cohort=False, explicit_physical_rank=False,
+    qsa_dispatch: bool = False,
 ):
     phase_groups = _group_gqa_phase_views(
         views, plan, parallel, dp_width=dp_width, cacheless=cacheless,
-        cohort_decode_views=cohort_decode_views)
+        cohort_decode_views=cohort_decode_views, qsa_dispatch=qsa_dispatch)
     attention: list[str] = []
     multi_group = len(phase_groups) > 1
     v_width = int(getattr(plan, "v_head_dim", 0) or width)
@@ -972,8 +1337,10 @@ def _append_gqa_attention(
         grp_prefix = f"{prefix}.phase{grp_idx}" if multi_group else prefix
         heads = dcp_heads if eff_cp > 1 else local_heads
         split_curr = (
-            chunked_pf
-            or should_split_mtp_dcp(plan, grp_views, layer_dcp=eff_cp, sparse=bool(eff_topk > 0))
+            (chunked_pf and eff_topk <= 0 and not bool(plan.noncausal_attention))
+            or should_split_mtp_dcp(
+                plan, grp_views, layer_dcp=eff_cp, sparse=bool(eff_topk > 0),
+            )
         )
         chunked_pf_pcp = bool(chunked_pf and parallel.pcp > 1)
         grp_hist_valid = (
@@ -988,7 +1355,13 @@ def _append_gqa_attention(
             rank_pairs, per_view_pairs = _gqa_history_pairs(
                 indexed_views, per_view_pairs, eff_cp, cp_interleave_size, dense_win,
                 chunked_pf=chunked_pf, use_global_q=chunked_pf_pcp)
+            _subtract_current_chunk_history_traffic(
+                indexed_views, per_view_rows, per_view_sweeps, per_view_spans,
+                rank_rows, rank_sweeps, eff_cp=eff_cp,
+                cp_interleave_size=cp_interleave_size, chunked_pf=chunked_pf,
+            )
             worst_r = max(range(eff_cp), key=lambda r: (rank_pairs[r], rank_sweeps[r]))
+            worst_sweeps_r = max(range(eff_cp), key=lambda r: (rank_sweeps[r], rank_pairs[r]))
         balanced_pairs = sum(rank_pairs) / float(eff_cp) if eff_cp > 0 else 0.0
         sparse_imb_meta = (
             (("cp_sparse_imbalance",
@@ -1004,89 +1377,26 @@ def _append_gqa_attention(
         sel_r = max(cand_ranks, key=lambda r: (rank_pairs[r], rank_sweeps[r]))
         sel_sweeps_r = max(cand_ranks, key=lambda r: (rank_sweeps[r], rank_pairs[r]))
         (batches, sweeps_by_view, shared_sweeps_by_view, unique_win_by_view,
-         shared_iv_by_view, total_pairs_sum, total_rows_sum, kv_hbm_total,
+         shared_iv_by_view, _total_pairs, _total_rows, kv_hbm_total,
          kv_mte2_total, kv_components) = _build_gqa_requests(
             indexed_views, per_view_pairs, per_view_sweeps, per_view_rows, per_view_spans,
             per_view_shared, sel_r, sel_sweeps_r, eff_cp, cp_interleave_size,
             request_op, chunked_pf_pcp=chunked_pf_pcp)
-        grp_attn: list[str] = []
-        if policy.fused_batch and not selected and batches:
-            fields = ("flops", "vector_ops", "hbm_bytes", "mte2_bytes", "mte3_bytes")
-            batched = replace(
-                batches[0], op_id=grp_prefix + ".attention", requests=grp_reqs,
-                semantic_shape=(grp_hist_valid, max(v.kv_len for v in grp_views), heads, width),
-                local_shape=(grp_hist_valid, rank_rows[sel_r], heads, width),
-                metadata=(("request_shapes", tuple((v.q_len, v.context) for v in grp_views)),
-                          ("query_tile", policy.query_tile),
-                          ("kv_streams", streams),
-                          ("kv_sweeps", sum(sweeps_by_view)),
-                          ("cp_per_rank_pairs", tuple(rank_pairs)),
-                          ("cp_per_rank_sweeps", tuple(rank_sweeps)),
-                          ("cp_bottleneck_pairs_rank", worst_r),
-                          ("cp_bottleneck_sweeps_rank", worst_sweeps_r),
-                          ("dcp_mtp_split", "history" if split_curr else "unified"))
-                         + sparse_imb_meta
-                         + _decode_contract(
-                             grp_views, heads, kv_heads, width, model, quant,
-                             parallel, plan, mode, window=eff_window, cp=eff_cp)
-                         + _prefill_contract(
-                             grp_views, heads, kv_heads, width, model, quant,
-                             parallel, plan, mode, window=eff_window, cp=eff_cp)
-                         + _attention_tensor_view(
-                             grp_views, heads, kv_heads, width, model, quant, parallel,
-                             policy, runtime, causal=not plan.noncausal_attention,
-                             cacheless=cacheless),
-                **{key: sum(getattr(op, key) for op in batches) for key in fields})
-            if eff_topk > 0:
-                batched = annotate_sparse_prefix_unknown(batched, runtime)
-            elif not cacheless:
-                read_mode = str(getattr(runtime, "prefix_read_mode", "auto") or "auto")
-                reuse_kind = (
-                    ("native_per_sequence" if read_mode == "batch_shared" else "paged_l2")
-                    if user_pinned_attn
-                    else "tile"
-                )
-                batched = apply_attention_prefix_reads(
-                    batched, views=grp_views, sweeps_by_view=sweeps_by_view,
-                    shared_sweeps_by_view=shared_sweeps_by_view, row_bytes=float(kv_row_bytes),
-                    layer_index=plan.index, runtime=runtime,
-                    kernel_reuse=reuse_kind,
-                    allow_recipe_rebind=not user_pinned_attn,
-                    kv_hbm_bytes=kv_hbm_total,
-                    kv_mte2_bytes=kv_mte2_total,
-                    unique_rows_by_view=unique_win_by_view,
-                    shared_intervals_by_view=shared_iv_by_view,
-                    geometry=hierarchy,
-                )
-            ops.append(batched)
-            grp_attn = [batched.op_id]
-        elif batches:
-            if eff_topk > 0:
-                batches = [
-                    annotate_sparse_prefix_unknown(
-                        replace(item, metadata=item.metadata + sparse_imb_meta)
-                        if sparse_imb_meta else item,
-                        runtime,
-                    )
-                    for item in batches
-                ]
-            elif not cacheless:
-                for pos, item in enumerate(batches):
-                    view = indexed_views[pos][1]
-                    kv_hbm_b, kv_mte2_b = kv_components[pos]
-                    batches[pos] = apply_attention_prefix_reads(
-                        item, views=(view,), sweeps_by_view=(sweeps_by_view[pos],),
-                        shared_sweeps_by_view=(shared_sweeps_by_view[pos],),
-                        row_bytes=float(kv_row_bytes),
-                        layer_index=plan.index, runtime=runtime,
-                        kernel_reuse="native_per_sequence", allow_recipe_rebind=False,
-                        kv_hbm_bytes=kv_hbm_b,
-                        kv_mte2_bytes=kv_mte2_b,
-                        unique_rows_by_view=(unique_win_by_view[pos],),
-                        shared_intervals_by_view=(shared_iv_by_view[pos],),
-                    )
-            ops.extend(batches)
-            grp_attn = [item.op_id for item in batches]
+        grp_attn = _finalize_gqa_group_batches(
+            ops, batches, grp_prefix=grp_prefix, grp_reqs=grp_reqs, grp_views=grp_views,
+            grp_hist_valid=grp_hist_valid, indexed_views=indexed_views,
+            sweeps_by_view=sweeps_by_view, shared_sweeps_by_view=shared_sweeps_by_view,
+            unique_win_by_view=unique_win_by_view, shared_iv_by_view=shared_iv_by_view,
+            kv_hbm_total=kv_hbm_total, kv_mte2_total=kv_mte2_total, kv_components=kv_components,
+            rank_pairs=rank_pairs, rank_sweeps=rank_sweeps, rank_rows=rank_rows,
+            sel_r=sel_r, worst_r=worst_r, worst_sweeps_r=worst_sweeps_r,
+            split_curr=split_curr, sparse_imb_meta=sparse_imb_meta,
+            heads=heads, kv_heads=kv_heads, width=width, streams=streams,
+            kv_row_bytes=kv_row_bytes, eff_topk=eff_topk, eff_window=eff_window, eff_cp=eff_cp,
+            policy=policy, model=model, quant=quant, parallel=parallel, plan=plan, mode=mode,
+            hierarchy=hierarchy, runtime=runtime, cacheless=cacheless, selected=selected,
+            user_pinned_attn=user_pinned_attn,
+        )
         if eff_cp > 1 and grp_attn:
             grp_attn = [_lower_gqa_dcp_combine(
                 ops, grp_prefix=grp_prefix, stage=stage, plan=plan, grp_reqs=grp_reqs,

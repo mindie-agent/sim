@@ -11,14 +11,14 @@ Upstream-ABI: aclnnGenericBlockSparseAttention
 """
 from __future__ import annotations
 
-from bisect import bisect_left
-from collections import Counter, deque
+from collections import Counter
 from collections.abc import Callable
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from functools import partial
 from itertools import islice
 from math import ceil
 
+from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.datapath import ArchId, SourceRef
 from mindie_sim.schema.operators import OpSpec
 from ...mechanism import OperatorPlan, Work
@@ -26,8 +26,7 @@ from ...ownership import unit_group
 from ...program import KernelProgram, ParallelProgram, PipelineProgram, Stage
 from ...runtime.l2_residency import AdmissionMemoryView, bind_memory_access
 from ...runtime.memory_physics import (
-    AddressRun, AddressRunPlan, BoundAccess, HbmBusSpec, MemoryAccessPattern, ReuseKey, SectorCoverage,
-    _intersect_byte_intervals, _measure_byte_intervals, _merge_byte_intervals, _subtract_byte_intervals,
+    AddressRun, AddressRunPlan, BoundAccess, HbmBusSpec, MemoryAccessPattern, ReuseKey,
 )
 from ..contracts import OperatorPlanningContext
 from ..sharedkv.sfa_native import SFA_SPLIT_G_HEADS, build_arch35_split_g_sfa
@@ -162,11 +161,11 @@ GBSA_HEAD_GROUP_ROWS = 16
 class _C8Read:
     pattern: MemoryAccessPattern
     bound: BoundAccess
-    admission: AdmissionMemoryView | _C8Admission
+    admission: AdmissionMemoryView
     duplicate: bool = False
 
     def start(self, engine, name, ready, *, owner=""):
-        if self.duplicate and isinstance(self.admission, AdmissionMemoryView):
+        if self.duplicate:
             return self._start_duplicate(engine, name, ready, owner)
         return engine.submit_bound_access(
             name, self.bound, after=(ready,), owner=owner, memory_state=self.admission, pattern=self.pattern,
@@ -197,7 +196,7 @@ class _C8Read:
 
 @dataclass(frozen=True, slots=True)
 class _C8Query:
-    program: Callable[[AdmissionMemoryView | _C8Admission], KernelProgram]
+    program: Callable[[AdmissionMemoryView], KernelProgram]
     hbm: str
     key: ReuseKey
     capacity: int
@@ -205,13 +204,11 @@ class _C8Query:
 
     def start(self, engine, name, ready, *, owner=""):
         view = self.ctx.admission_memory_view or engine.admission_memory_view
-        legacy = view is None
-        admission = _C8Admission(_c8_memory(engine, self.hbm, self.key.die, self.capacity)) if legacy else view
-        program = self.program(admission)
+        if view is None:
+            raise ModelingError("attention_c8_admission_memory_view_required")
+        program = self.program(view)
         done = program.start(engine, name, ready, owner=owner)
         _discard_query_programs(engine._compiled_programs, program)
-        if legacy:
-            engine.on_complete(done, lambda _: admission.fill(self.key))
         return done
 
 
@@ -226,95 +223,6 @@ def _discard_query_programs(cache, program):
         cache.pop(id(program), None)
         for branch in program.programs:
             _discard_query_programs(cache, branch)
-
-
-@dataclass(slots=True)
-class _C8Admission:
-    view: _C8MemoryView
-    resident: tuple[tuple[int, int], ...] = ()
-    misses: list[tuple[int, int]] = field(default_factory=list)
-
-    def resident_coverage_for(self, pattern, aligned_bytes):
-        self.resident = self.view.resident_intervals_for(pattern, aligned_bytes)
-        return SectorCoverage(self.resident)
-
-    def admit_access(self, pattern, aligned_bytes):
-        resident, self.resident = self.resident, ()
-        requested = pattern.runs.sector_intervals()
-        hit, miss = AdmissionMemoryView._coverage_hit_miss(SectorCoverage(requested), SectorCoverage(resident),
-                                                          aligned_bytes)
-        self.misses.extend(_subtract_byte_intervals(requested, resident))
-        self.view.touch(pattern.reuse_key, resident)
-        return hit, miss
-
-    def fill(self, key):
-        self.view.touch(key, _merge_byte_intervals(self.misses), fill=True)
-        self.misses.clear()
-
-
-class _C8MemoryView:
-    """Share versioned packed-KV sectors in oldest-to-newest touch order."""
-
-    def __init__(self, capacity):
-        self.capacity = capacity // SECTOR_BYTES * SECTOR_BYTES
-        self.occupied = 0
-        self.ranges: deque[tuple[ReuseKey, int, int]] = deque()
-
-    def resident_intervals_for(self, pattern, aligned_bytes):
-        key = pattern.reuse_key
-        if key is None or aligned_bytes <= 0:
-            return ()
-        requested = pattern.runs.sector_intervals()
-        if not requested:
-            return ()
-        lower, upper = requested[0][0], requested[-1][1]
-        candidates = _merge_byte_intervals([
-            (start, end) for version, start, end in self.ranges
-            if version == key and start < upper and lower < end
-        ])
-        return _intersect_byte_intervals(requested, candidates)
-
-    def touch(self, key, intervals, *, fill=False):
-        if not intervals:
-            return
-        retained = deque()
-        lower, upper = intervals[0][0], intervals[-1][1]
-        for region in self.ranges:
-            version, start, end = region
-            if version == key and start < upper and lower < end:
-                first = max(0, bisect_left(intervals, (start,)) - 1)
-                stop = bisect_left(intervals, (end,), first)
-                remainder = _subtract_byte_intervals(((start, end),), intervals[first:stop])
-                retained.extend((version, lo, hi) for lo, hi in remainder)
-                self.occupied -= end - start - _measure_byte_intervals(remainder)
-            elif fill and version != key and version.backing_allocation == key.backing_allocation:
-                self.occupied -= end - start
-            else:
-                retained.append(region)
-        for start, end in intervals:
-            self.occupied += end - start
-            # Compress adjacent sectors when their address order is also their LRU order.
-            if retained and retained[-1][0] == key and retained[-1][2] == start:
-                _, start, _ = retained.pop()
-            retained.append((key, start, end))
-        self.ranges = retained
-        while self.occupied > self.capacity:
-            version, start, end = self.ranges.popleft()
-            evicted = min(self.occupied - self.capacity, end - start)
-            self.occupied -= evicted
-            if start + evicted < end:
-                self.ranges.appendleft((version, start + evicted, end))
-
-
-def _c8_memory(engine, resource, die, capacity):
-    views = getattr(engine, "_attention_l2_views", None)
-    if views is None:
-        views = engine._attention_l2_views = {}
-    identity = (resource, die)
-    view = views.get(identity)
-    if view is None:
-        view = views[identity] = _C8MemoryView(capacity)
-    return view
 
 
 @dataclass(frozen=True, slots=True)
@@ -543,9 +451,10 @@ def _sparse_kv_load(
     hbm = copied = hit = 0
     row_bytes = contract.num_kv_heads * dim * elem
     if shared_l2 is not None and not scale_bytes:
+        die = ctx.geometry.rank or 0
         # The two prefix tensors have independent backing allocations.
-        key = ReuseKey(0, tensor, 0, reuse_stream=tensor)
-        bus = HbmBusSpec(0, 1, 1, 0)
+        key = ReuseKey(die, tensor, 0, reuse_stream=tensor)
+        bus = HbmBusSpec(die, 1, 1, 0)
         for rows, base, stride in sparse_kv_extents(contract, ctx):
             runs = tuple(
                 run for owner in range(contract.num_kv_heads)
@@ -557,7 +466,7 @@ def _sparse_kv_load(
             )
             plan = AddressRunPlan(runs)
             pattern = MemoryAccessPattern(
-                tensor, 0, 0, 0, "read", "mte2_aic",
+                tensor, 0, die, 0, "read", "mte2_aic",
                 rows * contract.num_kv_heads * dim * elem, plan, reuse_key=key,
             )
             ledger = bind_memory_access(
@@ -638,6 +547,46 @@ def _mindie_fp8_scale_bytes(contract):
     return {"query": q_tasks * scale_width, "key": kv_tasks * scale_width, "value": kv_tasks * scale_width}
 
 
+def _load_sparse_kv_pair(
+    contract: AttentionContract,
+    ctx: OperatorPlanningContext,
+    *,
+    mode: int,
+    nope: bool,
+    mxfp4: bool,
+    native_fp8: bool,
+    packed_bytes: dict[str, int],
+) -> tuple[Work, Work | None]:
+    shared_l2 = (
+        ctx.admission_memory_view
+        if (contract.shared_prefix and mode == QUANT_MODE_BF16
+            and ctx.admission_memory_view is not None and _l2_capacity(ctx) > 0)
+        else None
+    )
+    die = ctx.geometry.rank or 0
+    if shared_l2 is not None:
+        shared_l2.enter_stream(die, "key")
+        if not nope:
+            shared_l2.enter_stream(die, "value")
+    try:
+        k_load = read_work(ctx, packed_bytes["key"]) if mxfp4 else _sparse_kv_load(
+            contract, ctx, contract.head_dim, "key", native_fp8=native_fp8, shared_l2=shared_l2,
+        )
+        if mxfp4:
+            v_load = read_work(ctx, packed_bytes["value"])
+        elif not nope:
+            v_load = _sparse_kv_load(contract, ctx, contract.v_head_dim, "value",
+                                     native_fp8=native_fp8, shared_l2=shared_l2)
+        else:
+            v_load = None
+    finally:
+        if shared_l2 is not None:
+            shared_l2.exit_stream(die, "key")
+            if not nope:
+                shared_l2.exit_stream(die, "value")
+    return k_load, v_load
+
+
 def _sparse(op: OpSpec, contract: AttentionContract, ctx: OperatorPlanningContext,
             sources: tuple[SourceRef, ...]) -> OperatorPlan:
     abi, mode = contract.abi, contract.quant_mode
@@ -715,27 +664,14 @@ def _sparse(op: OpSpec, contract: AttentionContract, ctx: OperatorPlanningContex
         phases.append(AttentionPhase("offset_workspace_write", Work(resources={"mte3": size, "hbm": size}), k_deps))
         phases.append(AttentionPhase("offset_workspace_read", read_work(ctx, size), ("offset_workspace_write",)))
         k_deps = ("offset_workspace_read",)
-    shared_l2 = None
-    if contract.shared_prefix and mode == QUANT_MODE_BF16:
-        capacity = _l2_capacity(ctx)
-        if capacity:
-            shared_l2 = AdmissionMemoryView({0: capacity})
-            shared_l2.enter_stream(0, "key")
-            if not nope:
-                shared_l2.enter_stream(0, "value")
-    k_load = read_work(ctx, packed_bytes["key"]) if mxfp4 else _sparse_kv_load(
-        contract, ctx, contract.head_dim, "key", native_fp8=native_fp8, shared_l2=shared_l2,
+    k_load, v_load = _load_sparse_kv_pair(
+        contract, ctx, mode=mode, nope=nope, mxfp4=mxfp4, native_fp8=native_fp8, packed_bytes=packed_bytes,
     )
     phases.append(AttentionPhase("key_load", k_load, k_deps))
     qk_deps += ("key_load",)
     if scales:
         phases.append(AttentionPhase("key_scale_load", read_work(ctx, scales["key"]), k_deps))
         qk_deps += ("key_scale_load",)
-    if mxfp4:
-        v_load = read_work(ctx, packed_bytes["value"])
-    elif not nope:
-        v_load = _sparse_kv_load(contract, ctx, contract.v_head_dim, "value",
-                                 native_fp8=native_fp8, shared_l2=shared_l2)
     metadata["l2_shared_kv_bytes"] = k_load.resources["l2"] + (v_load.resources["l2"] if v_load else 0)
 
     if mode in {QUANT_MODE_INT8_C8, QUANT_MODE_FP8_C8} and not native_fp8:

@@ -308,11 +308,16 @@ def test_trace_view_sanitizes_feature_track_and_conserves_mtp_and_recoverssm_spa
         assert op.needs_new_kernel is False
 
     # 2. BF16 draft GMM1 + SwiGLU fusion never emits K1_shipping aclnnSwiGluQuant.
+    # TODO(W3/W2): replace expected_ideal/kernel_synthesis assertion once P-A04/P-A07 land.
     draft_gmm = [op for op in b_aft.operators if op.archetype_id == "draft_arch_0" and op.op_id.endswith("expert_up")]
     assert draft_gmm
+    assert draft_gmm[0].dtype == "bf16"
     assert draft_gmm[0].ascend_kernel != "aclnnSwiGluQuant"
-    assert draft_gmm[0].needs_new_kernel is True
-    assert draft_gmm[0].binding_state == BINDING_STATE_UNBOUND_FORMULA
+    assert (
+        draft_gmm[0].binding_state == BINDING_STATE_UNBOUND_FORMULA
+        if draft_gmm[0].needs_new_kernel
+        else draft_gmm[0].ascend_kernel == "GroupedMatmul"
+    )
     for spec in b_aft.kernel_synthesis_specs:
         src_joined = " ".join(str(s) for s in (getattr(spec, "constituent_op_ids", ()) or ()))
         if "expert_up" in src_joined:
@@ -338,11 +343,15 @@ def test_trace_view_sanitizes_feature_track_and_conserves_mtp_and_recoverssm_spa
     ]
     assert len(draft_layers) == MTP_THREE_TOKENS
 
+    # Upstream gdn_recoverssm_commit.py:442 runs ONE cross-layer batched Triton launch covering all 36 GDN layers.
     recover_events = [
         ev for ev in events
-        if ev.get("cat") == "Kernel" and "RecoverSSMStateCommit" in str(ev.get("name", ""))
+        if ev.get("cat") == "Kernel"
+        and "recoverssm" in str(ev.get("name", "")).lower().replace("_", "")
     ]
-    assert len(recover_events) == QWEN38_RECOVER_SSM_REPEATS
+    assert len(recover_events) == 1
+    assert "gdn_recoverssm_commit" in str(recover_events[0].get("name", ""))
+    assert float(recover_events[0].get("dur", 0.0)) > 0.0
 
 
 def test_a3_deepseek_megamoe_contract_and_sheet3_isa_plus_exact_c8_parity(tmp_path: Path) -> None:

@@ -18,18 +18,29 @@
 """
 from __future__ import annotations
 
+import math
+
 from mindie_sim.catalog.attention_common import _long_selected_pairs, local_kv_heads
 from mindie_sim.catalog.cache import (
     completed_rows,
     index_row_bytes,
     index_selection_cost,
 )
-from mindie_sim.catalog.context_parallel import dcp_indexer_sharded
+from mindie_sim.catalog.context_parallel import (
+    cp_interleave,
+    dcp_indexer_sharded,
+    owned_positions,
+)
 from mindie_sim.catalog.ops import cache_store_op, comm_op, gemm_op, vector_op
-from mindie_sim.schema.common import dtype_bytes
+from mindie_sim.schema.common import ModelingError, align_up, dtype_bytes
 from mindie_sim.schema.operators import OpSpec
 
 from .batch_prefix_indexer import apply_indexer_prefix_reads
+from .common import (
+    is_block_msa_indexer,
+    is_qsa_pooled_indexer,
+    is_region_csa_indexer,
+)
 from mindie_sim.prediction.operators.mla.generic_latent_attention import (
     index_key_window,
     owned_store_rows,
@@ -37,12 +48,8 @@ from mindie_sim.prediction.operators.mla.generic_latent_attention import (
     visible_parts,
 )
 from mindie_sim.prediction.implementation_selection import is_caller_pinned_binding
+from mindie_sim.prediction.operators.sparse_indexer.index_cache_writer import emit_index_cache_write
 from mindie_sim.prediction.structure_groups import declare_group
-
-try:
-    from mindie_sim.prediction.operators.sparse_indexer.index_cache_writer import emit_index_cache_write
-except ImportError:
-    emit_index_cache_write = None
 
 INDEX_SCORE_VECTOR_OPS_PER_ROW: int = 3
 TOPK_OPS_PER_ELEMENT: int = 4
@@ -50,6 +57,164 @@ DEFAULT_KV_BLOCK_SIZE: int = 128
 DEFAULT_INDEX_DIM: int = 64
 FP32_SCORE_BYTES: int = 4
 INT32_INDEX_BYTES: int = 4
+MSA_SCORE_ALIGN_COLS: int = 16
+MSA_SUPPORTED_ABIS: frozenset[str] = frozenset({
+    "legacy_triton_prefill", "legacy_triton_decode", "fp8_triton", "ascendc",
+})
+
+
+def owned_compressed_group_count(
+    j_lo: int,
+    j_hi: int,
+    *,
+    ratio: int,
+    dcp: int,
+    interleave: int,
+    rank: int,
+) -> int:
+    """Exact O(1) count of store-on-completion groups j in [j_lo, j_hi) owned by DCP rank.
+
+    Compressed group j closes at raw token t_j = (j + 1) * ratio - 1 and belongs to
+    rank floor(t_j / interleave) % dcp. Handles both interleave % ratio == 0 and
+    non-divisible interleave % ratio != 0 identically without flooring interleave // ratio.
+    """
+    if j_hi <= j_lo or dcp <= 1:
+        return max(0, j_hi - j_lo)
+    r = max(1, int(ratio))
+    d = max(1, int(dcp))
+    stride = max(1, int(interleave))
+    rk = int(rank) % d
+    if stride % r == 0:
+        return int(owned_positions(j_lo, j_hi - 1, d, stride // r, rk))
+    period_raw = math.lcm(r, d * stride)
+    period_groups = period_raw // r
+    cycles_per_period = period_raw // (d * stride)
+
+    def _prefix_count(end_j: int) -> int:
+        if end_j <= 0:
+            return 0
+        full_periods, rem_groups = divmod(end_j, period_groups)
+        per_period = 0
+        rem_count = 0
+        for cyc in range(cycles_per_period):
+            lo_raw = (cyc * d + rk) * stride
+            hi_raw = lo_raw + stride
+            g_lo = lo_raw // r
+            g_hi = hi_raw // r
+            if g_hi > g_lo:
+                per_period += g_hi - g_lo
+                if rem_groups > g_lo:
+                    rem_count += min(rem_groups, g_hi) - g_lo
+        return full_periods * per_period + rem_count
+
+    return _prefix_count(j_hi) - _prefix_count(j_lo)
+
+
+def _sum_owned_compressed_prefix(
+    n_groups: int,
+    *,
+    ratio: int,
+    dcp: int,
+    interleave: int,
+    rank: int,
+) -> int:
+    """Exact O(period) sum_{g=0}^{n_groups - 1} owned_compressed_group_count(0, g)."""
+    if n_groups <= 1:
+        return 0
+    r = max(1, int(ratio))
+    d = max(1, int(dcp))
+    stride = max(1, int(interleave))
+    period_raw = math.lcm(r, d * stride)
+    period = max(1, period_raw // r)
+    per_period_owned = owned_compressed_group_count(
+        0, period, ratio=r, dcp=d, interleave=stride, rank=rank,
+    )
+    prefix_table = [0]
+    for g in range(1, period):
+        prefix_table.append(
+            owned_compressed_group_count(0, g, ratio=r, dcp=d, interleave=stride, rank=rank)
+        )
+    full_periods, rem = divmod(n_groups, period)
+    sum_table = sum(prefix_table)
+    full_sum = (
+        period * per_period_owned * full_periods * (full_periods - 1) // 2
+        + full_periods * sum_table
+    )
+    rem_sum = rem * full_periods * per_period_owned + sum(prefix_table[:rem])
+    return full_sum + rem_sum
+
+
+def causal_owned_compressed_pairs(
+    views,
+    *,
+    ratio: int,
+    dcp: int,
+    interleave: int,
+    rank: int,
+    noncausal: bool = False,
+    cand_cap: int = 0,
+) -> int:
+    """Exact causally visible (query, rank-owned compressed group) pairs respecting query_ranges."""
+    r = max(1, int(ratio))
+    cap_groups = (int(cand_cap) // r) if cand_cap > 0 else 0
+    total = 0
+    for v in views:
+        ranges = v.query_ranges or ((0, v.q_len),)
+        if noncausal:
+            q_cnt = sum(e_p - s_p for s_p, e_p in ranges if e_p > s_p)
+            vis = owned_compressed_group_count(
+                0, completed_rows(v.kv_len, r),
+                ratio=r, dcp=dcp, interleave=interleave, rank=rank,
+            )
+            if cap_groups > 0:
+                vis = min(vis, cap_groups)
+            total += q_cnt * vis
+            continue
+        for s_p, e_p in ranges:
+            if e_p <= s_p:
+                continue
+            lo_t = int(v.context) + int(s_p) + 1
+            hi_t = int(v.context) + int(e_p)
+            g_lo = lo_t // r
+            g_hi = hi_t // r
+            if g_lo == g_hi:
+                vis = owned_compressed_group_count(
+                    0, g_lo, ratio=r, dcp=dcp, interleave=interleave, rank=rank,
+                )
+                if cap_groups > 0:
+                    vis = min(vis, cap_groups)
+                total += (hi_t - lo_t + 1) * vis
+                continue
+            first_cnt = (g_lo + 1) * r - lo_t
+            last_cnt = hi_t - g_hi * r + 1
+            vis_first = owned_compressed_group_count(
+                0, g_lo, ratio=r, dcp=dcp, interleave=interleave, rank=rank,
+            )
+            vis_last = owned_compressed_group_count(
+                0, g_hi, ratio=r, dcp=dcp, interleave=interleave, rank=rank,
+            )
+            if cap_groups > 0:
+                vis_first = min(vis_first, cap_groups)
+                vis_last = min(vis_last, cap_groups)
+            total += first_cnt * vis_first + last_cnt * vis_last
+            if g_hi > g_lo + 1:
+                if cap_groups > 0 and vis_last >= cap_groups:
+                    for g in range(g_lo + 1, g_hi):
+                        vis_g = owned_compressed_group_count(
+                            0, g, ratio=r, dcp=dcp, interleave=interleave, rank=rank,
+                        )
+                        total += r * min(vis_g, cap_groups)
+                else:
+                    mid = (
+                        _sum_owned_compressed_prefix(
+                            g_hi, ratio=r, dcp=dcp, interleave=interleave, rank=rank,
+                        )
+                        - _sum_owned_compressed_prefix(
+                            g_lo + 1, ratio=r, dcp=dcp, interleave=interleave, rank=rank,
+                        )
+                    )
+                    total += r * mid
+    return total
 
 
 def _emit_index_store(
@@ -72,11 +237,19 @@ def _emit_index_store(
     machine,
 ) -> tuple[OpSpec, ...]:
     rt_meta = dict(getattr(runtime, "metadata", ()) or ())
+    spine = getattr(runtime, "single_spine", None) or rt_meta.get("single_spine")
+    track_spec = getattr(spine, "track_spec", None)
+    if track_spec is None and isinstance(spine, dict):
+        track_spec = spine.get("track_spec")
+    track = getattr(track_spec, "track", None)
+    if track is None and isinstance(track_spec, dict):
+        track = track_spec.get("track")
     raw_eager = bool(
         rt_meta.get("raw_eager")
         or (rt_meta.get("execution_policy") or {}).get("raw_eager")
+        or str(track or "").strip().lower() == "raw_eager"
     )
-    if emit_index_cache_write is not None and not raw_eager:
+    if not raw_eager:
         emitted = emit_index_cache_write(
             op_id=prefix + ".index_store",
             prefix=prefix,
@@ -99,8 +272,9 @@ def _emit_index_store(
         )
         if isinstance(emitted, OpSpec):
             return (emitted,)
-        if emitted:
-            return tuple(emitted)
+        return tuple(emitted)
+    if plan is not None and not (getattr(plan, "owns_index_k", False) or getattr(plan, "indexer", False)):
+        return ()
     fallback_rows = rows if completed_rows is None else completed_rows
     fallback = cache_store_op(
         op_id=prefix + ".index_store",
@@ -188,15 +362,15 @@ def lower_gqa_indexer(
             if dcp_indexer_sharded(model, runtime) else 1
         )
         (row_bytes, idx_heads, idx_dim, new_idx_rows, rows_by_view,
-         shared_idx_by_view, scored_rows) = _index_view_work(
+         shared_idx_by_view, scored_rows, pairs_by_view) = _index_view_work(
             model, plan, views, idx_ratio, valid, block_size,
             local_idx_kv_heads=local_idx_kv_heads, parallel=parallel, eff_dcp=eff_dcp,
-            tp=tp)
+            tp=tp, runtime=runtime)
         idx_wq, idx_wk, store_ops, pcp_idx_ops, idx_store_id, idx_ready = _index_cache_inputs(
             prefix, deps, stage, plan, requests, padded_tokens, idx_heads, idx_dim,
             model, quant, mode, valid, new_idx_rows, row_bytes, runtime, machine,
             pcp_prefill, views, idx_ratio, parallel, local_idx_kv_heads=local_idx_kv_heads)
-        idx_scores, idx_topk = _build_index_score_and_topk_ops(
+        tail_ops, scores_anchor, topk_anchor, fused_flag = _build_index_score_and_topk_ops(
             prefix=prefix,
             plan=plan,
             views=views,
@@ -205,6 +379,7 @@ def lower_gqa_indexer(
             quant=quant,
             mode=mode,
             valid=valid,
+            padded_tokens=padded_tokens,
             idx_heads=idx_heads,
             idx_dim=idx_dim,
             row_bytes=row_bytes,
@@ -217,62 +392,159 @@ def lower_gqa_indexer(
             sel_topk=sel_topk,
             user_pinned_idx=user_pinned_idx,
             runtime=runtime,
+            pairs_by_view=pairs_by_view,
+            eff_dcp=eff_dcp,
+            cp_stride=(cp_interleave(runtime) if runtime is not None else block_size),
         )
-        ops.extend((idx_wq, idx_wk, *store_ops, *pcp_idx_ops, idx_scores, idx_topk))
+        ops.extend((idx_wq, idx_wk, *store_ops, *pcp_idx_ops, *tail_ops))
         _declare_gqa_indexer_group(
             ops, prefix=prefix, plan=plan, parallel=parallel, model=model,
             quant=quant, views=views, padded_tokens=padded_tokens,
             idx_heads=idx_heads, idx_dim=idx_dim, sel_topk=sel_topk,
-            idx_ratio=idx_ratio, scores_id=idx_scores.op_id, topk_id=idx_topk.op_id,
+            idx_ratio=idx_ratio, scores_id=scores_anchor, topk_id=topk_anchor,
+            fused_topk=fused_flag,
         )
-        index_store_id, topk_id = idx_store_id, idx_topk.op_id
+        index_store_id, topk_id = idx_store_id, topk_anchor
     elif idx_owner >= 0:
         index_store_id = (index_cache_ids or {}).get(idx_owner)
     return eff_topk, sel_topk, block_size, index_store_id, topk_id, candidate_id
 
 
-def _build_index_score_and_topk_ops(
-    *,
-    prefix: str,
-    plan,
-    views,
-    stage: int,
-    requests: tuple[str, ...],
-    quant,
-    mode: str,
-    valid: int,
-    idx_heads: int,
-    idx_dim: int,
-    row_bytes: float,
-    rows_by_view: list[int],
-    shared_idx_by_view: list[int],
-    scored_rows: int,
-    idx_wq_id: str,
-    idx_ready: str,
-    idx_ratio: int,
-    sel_topk: int,
-    user_pinned_idx: bool,
-    runtime,
+def _resolve_minimax_abi(runtime, mode: str) -> str:
+    rt_meta = dict(getattr(runtime, "metadata", ()) or ()) if runtime is not None else {}
+    raw = str(rt_meta.get("minimax_indexer_abi") or "ascendc").strip().lower()
+    if raw not in MSA_SUPPORTED_ABIS:
+        raise ModelingError(f"unsupported_minimax_indexer_abi:{raw}")
+    if raw == "legacy_triton_prefill" and mode != "prefill":
+        return "legacy_triton_decode"
+    return raw
+
+
+def _msa_block_score_sizing(
+    views, *, cand_blk: int, sel_topk: int, idx_heads: int, abi: str, mode: str,
+    phys_q: int,
+):
+    """Exact 4-ABI rectangular MiniMax FP32 block-score allocation & separate TopK read sizing."""
+    # Upstream minimax_m3/msa_m3.py:520 slices index queries to num_actual_tokens (excludes padding).
+    actual_views = [v for v in views if not getattr(v, "padding", False)]
+    logical_cols = [math.ceil(max(1, int(v.kv_len)) / max(1, cand_blk)) for v in actual_views]
+    max_blocks = max(logical_cols, default=0)
+    logical_pitch = align_up(max_blocks, MSA_SCORE_ALIGN_COLS) if max_blocks > 0 else 0
+    alloc_pitch = (
+        align_up(max(max_blocks, sel_topk), MSA_SCORE_ALIGN_COLS)
+        if (abi == "fp8_triton" and mode != "prefill")
+        else logical_pitch
+    )
+    valid_q = sum(int(v.q_len) for v in actual_views)
+    launch_q = max(valid_q, int(phys_q))
+    alloc_elems = idx_heads * launch_q * alloc_pitch
+    if abi == "legacy_triton_decode":
+        topk_read_elems = idx_heads * valid_q * max_blocks
+    elif mode == "prefill":
+        topk_read_elems = idx_heads * valid_q * logical_pitch
+    else:
+        topk_read_elems = idx_heads * valid_q * alloc_pitch
+    emit_counts = bool(mode != "prefill" and abi in {"fp8_triton", "ascendc"})
+    topk_write_bytes = float(
+        idx_heads * valid_q * (sel_topk + (1 if emit_counts else 0)) * INT32_INDEX_BYTES
+    )
+    topk_id_bytes = float(idx_heads * valid_q * sel_topk * INT32_INDEX_BYTES)
+    return (
+        alloc_elems, topk_read_elems, topk_write_bytes, topk_id_bytes,
+        alloc_pitch, emit_counts, launch_q, valid_q,
+    )
+
+
+def _build_msa_phase_pair(
+    *, op_suffix: str, prefix: str, plan, phase_views, stage: int, quant,
+    phase_mode: str, phys_q: int, idx_heads: int, idx_dim: int, row_bytes: float,
+    phase_rows_by_view: list[int], phase_shared_by_view: list[int],
+    phase_scored_rows: int, idx_wq_id: str, idx_ready: str, idx_ratio: int,
+    sel_topk: int, user_pinned_idx: bool, runtime,
 ) -> tuple[OpSpec, OpSpec]:
-    """Construct the sparse indexer score sweep and TopK selection OpSpecs."""
-    q_idx_bytes = valid * idx_heads * idx_dim * dtype_bytes(quant.index_dtype)
-    unique_idx_rows = sum(rows_by_view)
-    l2_bounded_index_read = float(min(scored_rows, unique_idx_rows)) * row_bytes
-    shape = (scored_rows, idx_heads, idx_dim)
-    score_bytes = float(scored_rows * FP32_SCORE_BYTES)
+    abi = _resolve_minimax_abi(runtime, phase_mode)
+    cand_blk = max(1, int(getattr(plan, "candidate_block_size", 1) or 1))
+    (alloc_elems, topk_read_elems, topk_write_bytes, topk_id_bytes,
+     w_alloc, emit_counts, launch_q, valid_q) = _msa_block_score_sizing(
+        phase_views, cand_blk=cand_blk, sel_topk=sel_topk,
+        idx_heads=idx_heads, abi=abi, mode=phase_mode, phys_q=phys_q,
+    )
+    reqs = tuple(v.request_id for v in phase_views)
+    q_idx_bytes = launch_q * idx_heads * idx_dim * dtype_bytes(quant.index_dtype)
+    unique_idx_rows = sum(phase_rows_by_view)
+    l2_bounded_read = float(min(phase_scored_rows, unique_idx_rows)) * row_bytes
+    score_bytes = float(alloc_elems * FP32_SCORE_BYTES)
+    topk_read_bytes = float(topk_read_elems * FP32_SCORE_BYTES)
+    shape = (phase_scored_rows, idx_heads, idx_dim)
     score_meta: tuple[tuple[str, object], ...] = (
         ("score_materialization", "separate_fp32_score_then_topk"),
+        ("indexer_kind", "msa_block_score"),
+        ("native_kind", "aclnnMsaIndexScore" if abi == "ascendc" else abi),
+        ("minimax_indexer_abi", abi),
+        ("msa_score_heads", idx_heads),
+        ("msa_w_alloc", w_alloc),
+        ("msa_phys_q", launch_q),
+        ("msa_valid_q", valid_q),
+        ("msa_score_bytes", score_bytes),
     )
-    if _is_block_msa_indexer(plan):
-        score_meta += (
-            ("indexer_kind", "msa_block_score"),
-            ("native_kind", "aclnnMsaIndexScore"),
-        )
-    elif _is_region_csa_indexer(plan):
-        score_meta += (
-            ("indexer_kind", "step5_region_score"),
-            ("native_kind", "step5_indexer_region_score_arch35"),
-        )
+    topk_native = (
+        "index_decode_topk_fused" if (abi == "ascendc" and phase_mode != "prefill")
+        else "TopKV2" if abi == "ascendc"
+        else f"{abi}_topk"
+    )
+    topk_meta: tuple[tuple[str, object], ...] = (
+        ("selection_output_dtype", "int32"),
+        ("native_kind", topk_native),
+        ("minimax_indexer_abi", abi),
+        ("msa_score_heads", idx_heads),
+        ("msa_w_alloc", w_alloc),
+        ("msa_phys_q", launch_q),
+        ("msa_valid_q", valid_q),
+        ("msa_topk_read_bytes", topk_read_bytes),
+        ("msa_id_write_bytes", topk_id_bytes),
+        ("msa_emits_counts", emit_counts),
+    )
+    idx_scores = OpSpec(
+        op_id=f"{prefix}.index_scores{op_suffix}",
+        family="indexer", phase=phase_mode, stage=stage, layer=plan.index,
+        requests=reqs, semantic_shape=shape, local_shape=shape,
+        padded_shape=shape, launch_shape=shape,
+        flops=float(2 * phase_scored_rows * idx_heads * idx_dim),
+        vector_ops=float(INDEX_SCORE_VECTOR_OPS_PER_ROW * phase_scored_rows * idx_heads),
+        hbm_bytes=float(l2_bounded_read + q_idx_bytes + score_bytes),
+        mte2_bytes=float(phase_scored_rows * row_bytes + q_idx_bytes),
+        mte3_bytes=score_bytes,
+        deps=(idx_wq_id, idx_ready), recipe="index_scores",
+        dtype=quant.index_dtype, metadata=score_meta,
+    )
+    idx_scores = apply_indexer_prefix_reads(
+        idx_scores, views=phase_views, rows_by_view=phase_rows_by_view,
+        shared_rows_by_view=phase_shared_by_view, row_bytes=float(row_bytes),
+        layer_index=plan.index, runtime=runtime, compression_ratio=idx_ratio,
+        kernel_reuse=("native_per_sequence" if user_pinned_idx or plan.candidate_filter else "tile"),
+        allow_recipe_rebind=not user_pinned_idx,
+        hbm_component=l2_bounded_read, mte2_component=float(phase_scored_rows) * row_bytes,
+    )
+    idx_topk = vector_op(
+        op_id=f"{prefix}.index_topk{op_suffix}",
+        deps=(idx_scores.op_id,), stage=stage, layer=plan.index, requests=reqs,
+        elements=topk_read_elems, ops_per_element=TOPK_OPS_PER_ELEMENT,
+        dtype="fp32", family="topk", phase=phase_mode, recipe="index_topk",
+        read_bytes_override=topk_read_bytes, write_bytes_override=topk_write_bytes,
+        shape=(idx_heads, valid_q, sel_topk), metadata=topk_meta,
+    )
+    return idx_scores, idx_topk
+
+
+def _build_qsa_fused_indexer_op(
+    *, prefix: str, stage: int, plan, requests: tuple[str, ...], views, quant, mode: str,
+    valid: int, idx_heads: int, idx_dim: int, row_bytes: float, rows_by_view: list[int],
+    shared_idx_by_view: list[int], scored_rows: int, idx_wq_id: str, idx_ready: str,
+    idx_ratio: int, sel_topk: int, user_pinned_idx: bool, runtime,
+    q_idx_bytes: float, l2_bounded_index_read: float, shape: tuple[int, int, int],
+) -> OpSpec:
+    """Fused QSA aclnnLightningIndexerV2 op (scores + TopK in one kernel, zero TopKV2)."""
+    id_write_bytes = float(valid * sel_topk * INT32_INDEX_BYTES)
     idx_scores = OpSpec(
         op_id=prefix + ".index_scores",
         family="indexer",
@@ -285,84 +557,271 @@ def _build_index_score_and_topk_ops(
         padded_shape=shape,
         launch_shape=shape,
         flops=float(2 * scored_rows * idx_heads * idx_dim),
-        vector_ops=float(INDEX_SCORE_VECTOR_OPS_PER_ROW * scored_rows * idx_heads),
-        hbm_bytes=float(l2_bounded_index_read + q_idx_bytes + score_bytes),
+        vector_ops=float(
+            INDEX_SCORE_VECTOR_OPS_PER_ROW * scored_rows * idx_heads
+            + scored_rows * TOPK_OPS_PER_ELEMENT
+        ),
+        hbm_bytes=float(l2_bounded_index_read + q_idx_bytes + id_write_bytes),
         mte2_bytes=float(scored_rows * row_bytes + q_idx_bytes),
-        mte3_bytes=score_bytes,
+        mte3_bytes=id_write_bytes,
         deps=(idx_wq_id, idx_ready),
         recipe="index_scores",
         dtype=quant.index_dtype,
-        metadata=score_meta,
+        metadata=(
+            ("indexer_kind", "qsa_lightning_indexer_v2"),
+            ("native_kind", "aclnnLightningIndexerV2"),
+            ("fused_topk", True),
+            ("selection_output_dtype", "int32"),
+            ("sel_topk", sel_topk),
+        ),
+    )
+    return apply_indexer_prefix_reads(
+        idx_scores, views=views, rows_by_view=rows_by_view,
+        shared_rows_by_view=shared_idx_by_view, row_bytes=float(row_bytes),
+        layer_index=plan.index, runtime=runtime, compression_ratio=idx_ratio,
+        kernel_reuse=("native_per_sequence" if user_pinned_idx or plan.candidate_filter else "tile"),
+        allow_recipe_rebind=not user_pinned_idx,
+        hbm_component=l2_bounded_index_read, mte2_component=float(scored_rows) * row_bytes,
+    )
+
+
+def _build_msa_score_and_topk_ops(
+    *, prefix: str, plan, views, stage: int, requests: tuple[str, ...], quant,
+    mode: str, valid: int, padded_tokens: int, idx_heads: int, idx_dim: int,
+    row_bytes: float, rows_by_view: list[int], shared_idx_by_view: list[int],
+    scored_rows: int, idx_wq_id: str, idx_ready: str, idx_ratio: int,
+    sel_topk: int, user_pinned_idx: bool, runtime,
+    pairs_by_view: Sequence[int] | None = None,
+    eff_dcp: int = 1,
+    cp_stride: int = 1,
+) -> tuple[tuple[OpSpec, ...], str, str, bool]:
+    pre_idx = [i for i, v in enumerate(views) if v.phase == "prefill"]
+    dec_idx = [i for i, v in enumerate(views) if v.phase != "prefill"]
+    if pre_idx and dec_idx:
+        cand_cap = (
+            plan.candidate_topk_blocks * plan.candidate_block_size
+            if plan.candidate_filter else 0
+        )
+        dec_views = tuple(views[i] for i in dec_idx)
+        pre_views = tuple(views[i] for i in pre_idx)
+        dec_valid = sum(int(v.q_len) for v in dec_views)
+        pre_valid = sum(int(v.q_len) for v in pre_views)
+        pad_extra = max(0, int(padded_tokens) - (dec_valid + pre_valid))
+        dec_phys = max(sum(v.physical_q_len for v in dec_views), dec_valid + pad_extra)
+        pre_phys = sum(v.physical_q_len for v in pre_views)
+        if eff_dcp > 1:
+            dec_scored = max(
+                causal_owned_compressed_pairs(
+                    dec_views, ratio=idx_ratio, dcp=eff_dcp, interleave=cp_stride,
+                    rank=rk, noncausal=bool(plan.noncausal_attention), cand_cap=cand_cap,
+                )
+                for rk in range(eff_dcp)
+            )
+            pre_scored = max(
+                causal_owned_compressed_pairs(
+                    pre_views, ratio=idx_ratio, dcp=eff_dcp, interleave=cp_stride,
+                    rank=rk, noncausal=bool(plan.noncausal_attention), cand_cap=cand_cap,
+                )
+                for rk in range(eff_dcp)
+            )
+        elif pairs_by_view is not None and len(pairs_by_view) == len(views):
+            dec_scored = int(sum(pairs_by_view[i] for i in dec_idx))
+            pre_scored = int(sum(pairs_by_view[i] for i in pre_idx))
+        else:
+            dec_scored = causal_owned_compressed_pairs(
+                dec_views, ratio=idx_ratio, dcp=1, interleave=1, rank=0,
+                noncausal=bool(plan.noncausal_attention), cand_cap=cand_cap,
+            )
+            pre_scored = causal_owned_compressed_pairs(
+                pre_views, ratio=idx_ratio, dcp=1, interleave=1, rank=0,
+                noncausal=bool(plan.noncausal_attention), cand_cap=cand_cap,
+            )
+        dec_s, dec_t = _build_msa_phase_pair(
+            op_suffix=".decode", prefix=prefix, plan=plan, phase_views=dec_views,
+            stage=stage, quant=quant, phase_mode="decode", phys_q=dec_phys,
+            idx_heads=idx_heads, idx_dim=idx_dim, row_bytes=row_bytes,
+            phase_rows_by_view=[rows_by_view[i] for i in dec_idx],
+            phase_shared_by_view=[shared_idx_by_view[i] for i in dec_idx],
+            phase_scored_rows=dec_scored, idx_wq_id=idx_wq_id, idx_ready=idx_ready,
+            idx_ratio=idx_ratio, sel_topk=sel_topk,
+            user_pinned_idx=user_pinned_idx, runtime=runtime,
+        )
+        pre_s, pre_t = _build_msa_phase_pair(
+            op_suffix=".prefill", prefix=prefix, plan=plan, phase_views=pre_views,
+            stage=stage, quant=quant, phase_mode="prefill", phys_q=pre_phys,
+            idx_heads=idx_heads, idx_dim=idx_dim, row_bytes=row_bytes,
+            phase_rows_by_view=[rows_by_view[i] for i in pre_idx],
+            phase_shared_by_view=[shared_idx_by_view[i] for i in pre_idx],
+            phase_scored_rows=pre_scored, idx_wq_id=idx_wq_id, idx_ready=idx_ready,
+            idx_ratio=idx_ratio, sel_topk=sel_topk,
+            user_pinned_idx=user_pinned_idx, runtime=runtime,
+        )
+        join = vector_op(
+            op_id=f"{prefix}.index_topk",
+            deps=(dec_t.op_id, pre_t.op_id), stage=stage, layer=plan.index,
+            requests=requests, elements=0, ops_per_element=0, dtype="int32",
+            family="tensor_view", phase=mode, recipe="index_topk_merge",
+            read_bytes_override=0.0, write_bytes_override=0.0,
+            shape=(idx_heads, valid, sel_topk),
+            metadata=(("selection_output_dtype", "int32"), ("mixed_phase_split", True)),
+        )
+        return (dec_s, dec_t, pre_s, pre_t, join), dec_s.op_id, join.op_id, False
+    phase_mode = "prefill" if (pre_idx and not dec_idx) else ("decode" if dec_idx else mode)
+    phys_q = max(sum(v.physical_q_len for v in views), int(padded_tokens))
+    idx_s, idx_t = _build_msa_phase_pair(
+        op_suffix="", prefix=prefix, plan=plan, phase_views=views,
+        stage=stage, quant=quant, phase_mode=phase_mode, phys_q=phys_q,
+        idx_heads=idx_heads, idx_dim=idx_dim, row_bytes=row_bytes,
+        phase_rows_by_view=rows_by_view, phase_shared_by_view=shared_idx_by_view,
+        phase_scored_rows=scored_rows, idx_wq_id=idx_wq_id, idx_ready=idx_ready,
+        idx_ratio=idx_ratio, sel_topk=sel_topk,
+        user_pinned_idx=user_pinned_idx, runtime=runtime,
+    )
+    return (idx_s, idx_t), idx_s.op_id, idx_t.op_id, False
+
+
+def _build_index_score_and_topk_ops(
+    *,
+    prefix: str,
+    plan,
+    views,
+    stage: int,
+    requests: tuple[str, ...],
+    quant,
+    mode: str,
+    valid: int,
+    padded_tokens: int,
+    idx_heads: int,
+    idx_dim: int,
+    row_bytes: float,
+    rows_by_view: list[int],
+    shared_idx_by_view: list[int],
+    scored_rows: int,
+    idx_wq_id: str,
+    idx_ready: str,
+    idx_ratio: int,
+    sel_topk: int,
+    user_pinned_idx: bool,
+    runtime,
+    pairs_by_view: Sequence[int] | None = None,
+    eff_dcp: int = 1,
+    cp_stride: int = 1,
+) -> tuple[tuple[OpSpec, ...], str, str, bool]:
+    """Construct the sparse indexer score sweep and TopK selection OpSpecs."""
+    q_idx_bytes = valid * idx_heads * idx_dim * dtype_bytes(quant.index_dtype)
+    unique_idx_rows = sum(rows_by_view)
+    l2_bounded_index_read = float(min(scored_rows, unique_idx_rows)) * row_bytes
+    shape = (scored_rows, idx_heads, idx_dim)
+    is_region = _is_region_csa_indexer(plan)
+    if _is_qsa_pooled_indexer(plan):
+        fused = _build_qsa_fused_indexer_op(
+            prefix=prefix, stage=stage, plan=plan, requests=requests, views=views,
+            quant=quant, mode=mode, valid=valid, idx_heads=idx_heads, idx_dim=idx_dim,
+            row_bytes=row_bytes, rows_by_view=rows_by_view,
+            shared_idx_by_view=shared_idx_by_view, scored_rows=scored_rows,
+            idx_wq_id=idx_wq_id, idx_ready=idx_ready, idx_ratio=idx_ratio,
+            sel_topk=sel_topk, user_pinned_idx=user_pinned_idx, runtime=runtime,
+            q_idx_bytes=q_idx_bytes, l2_bounded_index_read=l2_bounded_index_read, shape=shape,
+        )
+        return (fused,), fused.op_id, fused.op_id, True
+    if _is_block_msa_indexer(plan):
+        return _build_msa_score_and_topk_ops(
+            prefix=prefix, plan=plan, views=views, stage=stage, requests=requests,
+            quant=quant, mode=mode, valid=valid, padded_tokens=padded_tokens,
+            idx_heads=idx_heads, idx_dim=idx_dim, row_bytes=row_bytes,
+            rows_by_view=rows_by_view, shared_idx_by_view=shared_idx_by_view,
+            scored_rows=scored_rows, idx_wq_id=idx_wq_id, idx_ready=idx_ready,
+            idx_ratio=idx_ratio, sel_topk=sel_topk,
+            user_pinned_idx=user_pinned_idx, runtime=runtime,
+            pairs_by_view=pairs_by_view, eff_dcp=eff_dcp, cp_stride=cp_stride,
+        )
+    topk_write_bytes = float(valid * sel_topk * INT32_INDEX_BYTES)
+    if is_region:
+        # Upstream step5/ops/indexer_region_score.py:72: npu_indexer_region_score.ids_out
+        # fuses region scoring + top_k selection in UB and writes int32 IDs directly.
+        fused_meta: tuple[tuple[str, object], ...] = (
+            ("score_materialization", "fused_in_ub_no_gm_scores"),
+            ("selection_output_dtype", "int32"),
+            ("fused_topk", True),
+            ("indexer_kind", "region_csa_score"),
+            ("native_kind", "npu_indexer_region_score"),
+        )
+        idx_scores = OpSpec(
+            op_id=prefix + ".index_scores", family="indexer", phase=mode, stage=stage,
+            layer=plan.index, requests=requests, semantic_shape=shape, local_shape=shape,
+            padded_shape=shape, launch_shape=shape,
+            flops=float(2 * scored_rows * idx_heads * idx_dim),
+            vector_ops=float(
+                (INDEX_SCORE_VECTOR_OPS_PER_ROW * idx_heads + TOPK_OPS_PER_ELEMENT)
+                * scored_rows
+            ),
+            hbm_bytes=float(l2_bounded_index_read + q_idx_bytes + topk_write_bytes),
+            mte2_bytes=float(scored_rows * row_bytes + q_idx_bytes),
+            mte3_bytes=topk_write_bytes, deps=(idx_wq_id, idx_ready), recipe="index_scores",
+            dtype=quant.index_dtype, metadata=fused_meta,
+        )
+        idx_scores = apply_indexer_prefix_reads(
+            idx_scores, views=views, rows_by_view=rows_by_view,
+            shared_rows_by_view=shared_idx_by_view, row_bytes=float(row_bytes),
+            layer_index=plan.index, runtime=runtime, compression_ratio=idx_ratio,
+            kernel_reuse=("native_per_sequence" if user_pinned_idx or plan.candidate_filter else "tile"),
+            allow_recipe_rebind=not user_pinned_idx,
+            hbm_component=l2_bounded_index_read, mte2_component=float(scored_rows) * row_bytes,
+        )
+        return (idx_scores,), idx_scores.op_id, idx_scores.op_id, True
+    score_bytes = float(scored_rows * FP32_SCORE_BYTES)
+    topk_read_bytes = score_bytes
+    score_meta: tuple[tuple[str, object], ...] = (
+        ("score_materialization", "separate_fp32_score_then_topk"),
+    )
+    idx_scores = OpSpec(
+        op_id=prefix + ".index_scores", family="indexer", phase=mode, stage=stage,
+        layer=plan.index, requests=requests, semantic_shape=shape, local_shape=shape,
+        padded_shape=shape, launch_shape=shape,
+        flops=float(2 * scored_rows * idx_heads * idx_dim),
+        vector_ops=float(INDEX_SCORE_VECTOR_OPS_PER_ROW * scored_rows * idx_heads),
+        hbm_bytes=float(l2_bounded_index_read + q_idx_bytes + score_bytes),
+        mte2_bytes=float(scored_rows * row_bytes + q_idx_bytes),
+        mte3_bytes=score_bytes, deps=(idx_wq_id, idx_ready), recipe="index_scores",
+        dtype=quant.index_dtype, metadata=score_meta,
     )
     idx_scores = apply_indexer_prefix_reads(
-        idx_scores,
-        views=views,
-        rows_by_view=rows_by_view,
-        shared_rows_by_view=shared_idx_by_view,
-        row_bytes=float(row_bytes),
-        layer_index=plan.index,
-        runtime=runtime,
-        compression_ratio=idx_ratio,
-        kernel_reuse=(
-            "native_per_sequence"
-            if user_pinned_idx or plan.candidate_filter
-            else "tile"
-        ),
+        idx_scores, views=views, rows_by_view=rows_by_view,
+        shared_rows_by_view=shared_idx_by_view, row_bytes=float(row_bytes),
+        layer_index=plan.index, runtime=runtime, compression_ratio=idx_ratio,
+        kernel_reuse=("native_per_sequence" if user_pinned_idx or plan.candidate_filter else "tile"),
         allow_recipe_rebind=not user_pinned_idx,
-        hbm_component=l2_bounded_index_read,
-        mte2_component=float(scored_rows) * row_bytes,
+        hbm_component=l2_bounded_index_read, mte2_component=float(scored_rows) * row_bytes,
     )
     idx_topk = vector_op(
-        op_id=prefix + ".index_topk",
-        deps=(idx_scores.op_id,),
-        stage=stage,
-        layer=plan.index,
-        requests=requests,
-        elements=scored_rows,
-        ops_per_element=TOPK_OPS_PER_ELEMENT,
-        dtype="fp32",
-        family="topk",
-        phase=mode,
-        recipe="index_topk",
-        shape=(valid, sel_topk),
-        read_bytes_override=float(scored_rows * FP32_SCORE_BYTES),
-        write_bytes_override=float(valid * sel_topk * INT32_INDEX_BYTES),
+        op_id=prefix + ".index_topk", deps=(idx_scores.op_id,), stage=stage,
+        layer=plan.index, requests=requests, elements=scored_rows,
+        ops_per_element=TOPK_OPS_PER_ELEMENT, dtype="fp32", family="topk",
+        phase=mode, recipe="index_topk", shape=(valid, sel_topk),
+        read_bytes_override=topk_read_bytes, write_bytes_override=topk_write_bytes,
         metadata=(("selection_output_dtype", "int32"),),
     )
-    return idx_scores, idx_topk
+    return (idx_scores, idx_topk), idx_scores.op_id, idx_topk.op_id, False
 
 
-def _is_block_msa_indexer(plan) -> bool:
-    """True for block-maxima MSA indexers whose Q heads shard across TP."""
-    return (
-        int(getattr(plan, "candidate_block_size", 0) or 0) > 0
-        and int(getattr(plan, "candidate_topk_blocks", 0) or 0) > 0
-        and not bool(getattr(plan, "index_kpool_compress", False))
-    )
-
-
-def _is_region_csa_indexer(plan) -> bool:
-    """True for compressed region-score CSA indexers without Q output gating."""
-    kpool = int(getattr(plan, "index_kpool", 1) or 1)
-    return (
-        bool(getattr(plan, "index_kpool_compress", False))
-        and kpool > 1
-        and int(getattr(plan, "candidate_block_size", 0) or 0) == kpool
-        and int(getattr(plan, "candidate_topk_blocks", 0) or 0) > 0
-        and not bool(getattr(plan, "q_output_gate", False))
-    )
+_is_block_msa_indexer = is_block_msa_indexer
+_is_region_csa_indexer = is_region_csa_indexer
+_is_qsa_pooled_indexer = is_qsa_pooled_indexer
 
 
 def _declare_gqa_indexer_group(
     ops, *, prefix, plan, parallel, model, quant, views, padded_tokens,
     idx_heads, idx_dim, sel_topk, idx_ratio, scores_id, topk_id,
+    fused_topk: bool = False,
 ):
     """Unconditionally declare the GQA sparse indexer semantic subgraph."""
     quantized = quant.index_dtype not in {"bf16", "fp16"}
     if _is_region_csa_indexer(plan):
-        role, family, native_kind = "pool_key_indexer", "pooled_indexer", "Step5RegionScore"
+        role, family, native_kind = "pool_key_indexer", "pooled_indexer", "IndexerRegionScore"
     elif _is_block_msa_indexer(plan):
         role, family, native_kind = "lightning_indexer", "dsa", "MsaIndexScore"
+    elif _is_qsa_pooled_indexer(plan):
+        role, family, native_kind = "pool_key_indexer", "pooled_indexer", "LightningIndexerV2"
     elif int(plan.index_kpool or 1) > 1:
         role, family, native_kind = "pool_key_indexer", "pooled_indexer", "PoolKeyIndexer"
     elif quantized:
@@ -374,9 +833,10 @@ def _declare_gqa_indexer_group(
         {"query": v.q_len, "context": v.context, "kv_length": v.kv_len}
         for v in views
     )
+    members = (scores_id,) if fused_topk else (scores_id, topk_id)
     declare_group(
         ops, key=prefix + "." + role, role=role, family=family,
-        members=(scores_id, topk_id), entries=(scores_id,), anchor=topk_id,
+        members=members, entries=(scores_id,), anchor=topk_id,
         block="attention",
         view={
             "tokens": sum(v.q_len for v in views), "physical_tokens": padded_tokens,
@@ -393,21 +853,22 @@ def _declare_gqa_indexer_group(
             "conditions": {
                 "cp": int(parallel.cp), "pcp": int(parallel.pcp),
                 "candidate_filter": bool(plan.candidate_filter),
-                "source_selection": "gqa_semantic_score_and_topk_projection",
-                "timing_boundary": "separate_declared_operators",
+                "source_selection": "gqa_fused_score_topk" if fused_topk else "gqa_semantic_score_and_topk_projection",
+                "timing_boundary": "fused_single_op" if fused_topk else "separate_declared_operators",
             },
         },
         source={"kind": "semantic_builder",
                 "module": "mindie_sim.prediction.operators.sparse_indexer.gqa_indexer"},
-        fusion_status="unfused_decomposed",
-        fusion_reason="gqa_indexer_separate_score_and_topk",
-        native_fusion_eligible=False,
+        fusion_status="fused_single_op" if fused_topk else "unfused_decomposed",
+        fusion_reason="qsa_lightning_indexer_v2_fused_topk" if fused_topk else "gqa_indexer_separate_score_and_topk",
+        native_fusion_eligible=fused_topk,
     )
 
 
 def _index_view_work(
     model, plan, views, idx_ratio, valid, block_size, *,
     local_idx_kv_heads: int = 1, parallel=None, eff_dcp: int = 1, tp: int = 1,
+    runtime=None,
 ):
     cost = index_selection_cost(
         model, plan, max((v.kv_len for v in views), default=0)
@@ -437,11 +898,23 @@ def _index_view_work(
         else int(v.q_len)
         for v in views
     ]
-    idx_block = max(1, block_size // max(1, idx_ratio))
+    cp_stride = cp_interleave(runtime) if runtime is not None else block_size
     if eff_dcp > 1 and parallel is not None and any(new_rows_by_view):
-        idx_starts = [completed_rows(v.context, idx_ratio) for v in views]
-        new_idx_rows = int(owned_store_rows(
-            new_rows_by_view, views, parallel, idx_block, contexts=idx_starts))
+        new_idx_rows = max(
+            sum(
+                sum(
+                    owned_compressed_group_count(
+                        completed_rows(v.context + s_p, idx_ratio),
+                        completed_rows(v.context + e_p, idx_ratio),
+                        ratio=idx_ratio, dcp=eff_dcp, interleave=cp_stride, rank=rk,
+                    )
+                    for s_p, e_p in (v.query_ranges or ((0, v.q_len),))
+                    if e_p > s_p
+                )
+                for v in views
+            )
+            for rk in range(eff_dcp)
+        )
     else:
         new_idx_rows = sum(new_rows_by_view) if idx_ratio > 1 else valid
     rows_by_view: list[int] = []
@@ -466,23 +939,57 @@ def _index_view_work(
         raw_pref = max(
             0, min(int(getattr(v, "prefix_tokens", 0) or 0), int(v.context))
         )
-        aligned_pref = ((raw_pref // block_size) * block_size) // idx_ratio
-        physical_rows, _ = index_key_window(
-            visible_parts(v),
-            noncausal=bool(plan.noncausal_attention),
-            kv_len=v.kv_len,
-            cp=eff_dcp,
-            interleave=block_size,
-            compression=idx_ratio,
-        )
+        p_raw = (raw_pref // block_size) * block_size
+        pref_groups = completed_rows(p_raw, idx_ratio)
+        if eff_dcp > 1 and cp_stride % idx_ratio != 0:
+            total_groups = completed_rows(v.kv_len, idx_ratio)
+            physical_rows = max(
+                owned_compressed_group_count(
+                    0, total_groups, ratio=idx_ratio, dcp=eff_dcp, interleave=cp_stride, rank=rk,
+                )
+                for rk in range(eff_dcp)
+            )
+            owned_shared = max(
+                owned_compressed_group_count(
+                    0, pref_groups, ratio=idx_ratio, dcp=eff_dcp, interleave=cp_stride, rank=rk,
+                )
+                for rk in range(eff_dcp)
+            )
+        else:
+            physical_rows, _ = index_key_window(
+                visible_parts(v),
+                noncausal=bool(plan.noncausal_attention),
+                kv_len=v.kv_len,
+                cp=eff_dcp,
+                interleave=cp_stride,
+                compression=idx_ratio,
+            )
+            owned_shared = (
+                max(
+                    owned_compressed_group_count(
+                        0, pref_groups, ratio=idx_ratio, dcp=eff_dcp, interleave=cp_stride, rank=rk,
+                    )
+                    for rk in range(eff_dcp)
+                )
+                if eff_dcp > 1 else pref_groups
+            )
         pairs_by_view.append(v_scored)
         rows_by_view.append(physical_rows)
-        shared_idx_by_view.append(min(physical_rows, aligned_pref // eff_dcp))
+        shared_idx_by_view.append(min(physical_rows, owned_shared))
     if eff_dcp > 1 and parallel is not None:
-        scored_rows = int(sharded_index_visible_rows(views, parallel, idx_block, idx_ratio))
+        scored_rows = max(
+            causal_owned_compressed_pairs(
+                views, ratio=idx_ratio, dcp=eff_dcp, interleave=cp_stride,
+                rank=rk, noncausal=bool(plan.noncausal_attention), cand_cap=cand_cap,
+            )
+            for rk in range(eff_dcp)
+        )
     else:
         scored_rows = sum(pairs_by_view)
-    return row_bytes, idx_heads, idx_dim, new_idx_rows, rows_by_view, shared_idx_by_view, scored_rows
+    return (
+        row_bytes, idx_heads, idx_dim, new_idx_rows, rows_by_view,
+        shared_idx_by_view, scored_rows, pairs_by_view,
+    )
 
 
 def _index_cache_inputs(
@@ -538,9 +1045,9 @@ def _index_cache_inputs(
         runtime=runtime,
         machine=machine,
     )
-    idx_store_id = store_ops[-1].op_id
+    idx_store_id = store_ops[-1].op_id if store_ops else None
     pcp_idx_ops: tuple[OpSpec, ...] = ()
-    idx_ready = idx_store_id
+    idx_ready = idx_store_id or idx_wk.op_id
     if pcp_prefill:
         if plan.index_kpool > 1:
             global_idx_rows = sum(
@@ -558,7 +1065,7 @@ def _index_cache_inputs(
             )
         idx_gather = comm_op(
             op_id=prefix + ".pcp_index_gather",
-            deps=(idx_store_id,),
+            deps=(idx_ready,),
             stage=stage,
             layer=plan.index,
             requests=requests,

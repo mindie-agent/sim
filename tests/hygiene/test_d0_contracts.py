@@ -301,15 +301,20 @@ def test_synthetic_gqa_policy_locked_for_simulation_and_opt_in_for_modeling() ->
     with pytest.raises(ModelingError, match="speculative_contract_draft_dcp_exceeds_target"):
         dcp2.validate_dcp_spec_gate(real_draft, ParallelSpec(tp=1, dcp=1))
 
-    # DSpark prepare FLOPs match GQA fused_kv_bank (kimi-k3), per_layer_qkv (minimax-m3), and MLA mla_prolog (kimi-k3.1).
+    # DSpark prepare FLOPs match GQA fused_kv_bank (kimi-k3), per_layer_qkv (minimax-m3),
+    # MLA mla_prolog (kimi-k3.1), and shared_compressed_kv (V4 Flash / V4 Pro / V4.1).
     k3_prep = sim_contract.build_prepare_plan(16, draft_spec=load_model("kimi-k3").auxiliary.dspark)  # type: ignore[union-attr]
     assert isinstance(k3_prep, DSparkPreparePlan) and k3_prep.exact_gemm_flops == 10_569_646_080
     mm3_prep = sim_contract.build_prepare_plan(16, draft_spec=load_model("minimax-m3").auxiliary.mtp)  # type: ignore[union-attr]
     assert mm3_prep.exact_gemm_flops == 15_099_494_400
     k31_prep = sim_contract.build_prepare_plan(16, draft_spec=load_model("kimi-k3.1").auxiliary.dspark)  # type: ignore[union-attr]
     assert k31_prep.exact_gemm_flops == 10_643_046_400
+    v41_aux = load_model("deepseek-v4.1-flash").auxiliary
+    v41_prep = sim_contract.build_prepare_plan(131_072, draft_spec=(v41_aux.dspark or v41_aux.mtp))  # type: ignore[union-attr]
+    assert v41_prep.exact_gemm_flops == 22_677_427_322_880
 
-    # Schedule: empty/zero-proposal -> 0 steps, pre-expanded q_len not double-counted, heterogeneous (3, 1) -> (6, 1, 1).
+    # Schedule: empty/zero-proposal -> 0 steps, pre-expanded q_len not double-counted,
+    # heterogeneous B=2 (p=3, p=1) -> step 0 verify (6), steps 1..K-1 full proposal batch B=2 -> (6, 2, 2).
     mod_contract = SpeculativeExecutionContract(
         archetype="eagle3", spec_method="eagle3", num_speculative_tokens=3, requires_draft_spec=True,
         optimization_mode="modeling", allow_synthetic_gqa=True, draft_provenance=SYNTHETIC_EAGLE3_GQA_PROVENANCE,
@@ -323,7 +328,22 @@ def test_synthetic_gqa_policy_locked_for_simulation_and_opt_in_for_modeling() ->
     assert mod_contract.build_step_schedule((
         RequestView("r0", 4, 1024, True, "decode", draft_verify=True, draft_proposal_tokens=3),
         RequestView("r1", 2, 1024, True, "decode", draft_verify=True, draft_proposal_tokens=1),
-    )).body_q_len_per_step == (6, 1, 1)
+    )).body_q_len_per_step == (6, 2, 2)
+    # Continuing decode after a miss (p_i=0) with K=3 still runs step 0 with 1 query row: (1, 1, 1).
+    assert mod_contract.build_step_schedule((
+        RequestView("r0", 1, 1024, True, "decode", draft_verify=True, draft_proposal_tokens=0),
+    )).body_q_len_per_step == (1, 1, 1)
+
+    # Strict draft_compatible_with_spec_method: non-neural, unknown, and mismatched archetypes fail closed.
+    from mindie_sim.catalog.draft_spec import draft_compatible_with_spec_method
+    assert draft_compatible_with_spec_method(real_draft, "ngram") is False
+    assert draft_compatible_with_spec_method(real_draft, "ngram_gpu") is False
+    assert draft_compatible_with_spec_method(real_draft, "unknown_method") is False
+    assert draft_compatible_with_spec_method(real_draft, "dspark") is True
+    assert draft_compatible_with_spec_method(real_draft, "eagle3") is False
+    assert draft_compatible_with_spec_method(synth_draft, "eagle3") is True
+    with pytest.raises(ModelingError, match="dspark_prepare_requires_context_projection_mode"):
+        sim_contract.build_prepare_plan(16, draft_spec=replace(real_draft, context_projection_mode="none"))
 
     ngram = SpeculativeExecutionContract(
         archetype="ngram", spec_method="ngram", num_speculative_tokens=4, requires_draft_spec=False,
@@ -381,16 +401,18 @@ def test_synthetic_gqa_policy_locked_for_simulation_and_opt_in_for_modeling() ->
 
     r1_k1 = compose_case("deepseek-r1", "a3", tp=8, ep=8, layers=4, prompt_tokens=128, output_tokens=16, mtp_proposal_tokens=1, mtp_acceptance_length=1.5)
     r1_k5 = compose_case("deepseek-r1", "a3", tp=8, ep=8, layers=4, prompt_tokens=128, output_tokens=16, mtp_proposal_tokens=5, mtp_acceptance_length=3.0)
-    r1_k16 = compose_case("deepseek-r1", "a3", tp=8, ep=8, layers=4, prompt_tokens=128, output_tokens=16, mtp_proposal_tokens=16, mtp_acceptance_length=4.0)
+    r1_k15 = compose_case("deepseek-r1", "a3", tp=8, ep=8, layers=4, prompt_tokens=128, output_tokens=16, mtp_proposal_tokens=15, mtp_acceptance_length=4.0)
+    with pytest.raises(ModelingError, match="ascend_fia_speculative_tokens_exceeds_limit:16>15"):
+        compose_case("deepseek-r1", "a3", tp=8, ep=8, layers=4, prompt_tokens=128, output_tokens=16, mtp_proposal_tokens=16, mtp_acceptance_length=4.0)
     _, _, lp_k1 = resolve_case_contracts(r1_k1)
     _, _, lp_k5 = resolve_case_contracts(r1_k5)
-    sc_k16, _, lp_k16 = resolve_case_contracts(r1_k16)
-    parsed_k16 = parse_case(r1_k16)
+    sc_k15, _, lp_k15 = resolve_case_contracts(r1_k15)
+    parsed_k15 = parse_case(r1_k15)
     assert lp_k1.plan_digest != lp_k5.plan_digest
     assert lp_k1.scheduling.speculative_proposal_count == 1 and lp_k5.scheduling.speculative_proposal_count == 5
-    assert sc_k16 is not None and sc_k16.speculative_policy is not None
-    assert sc_k16.speculative_policy.num_speculative_tokens == lp_k16.scheduling.speculative_proposal_count == 15
-    assert DraftPolicy.for_request(parsed_k16, parsed_k16.workload.requests[0]).proposal == 15
+    assert sc_k15 is not None and sc_k15.speculative_policy is not None
+    assert sc_k15.speculative_policy.num_speculative_tokens == lp_k15.scheduling.speculative_proposal_count == 15
+    assert DraftPolicy.for_request(parsed_k15, parsed_k15.workload.requests[0]).proposal == 15
 
 
 def test_common_math_stack_track_structural_layer_and_kernel_backends() -> None:

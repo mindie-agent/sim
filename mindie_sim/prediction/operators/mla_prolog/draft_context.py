@@ -158,22 +158,35 @@ def owned_scatter_rows(rows, rows_by_view, views, contexts, parallel, block):
     return owned_rows(rows, parallel)
 
 
-def prepare(ops, *, projection, model, draft, rows, query_rows,
-            prefix, stage, requests, parallel=None, rows_by_view=None,
-            views=None, contexts=None, block=UNIT_CONTEXT_PARALLEL,
-            use_prolog_v3=True):
-    proj_mode = str(getattr(draft, "context_projection_mode", "") or "none").strip()
-    if proj_mode == "shared_compressed_kv":
-        common = dict(stage=stage, layer=-1, requests=requests, phase="draft")
+def _emit_context_query_ready(ops, *, deps, rows, query_rows, prefix, draft, common):
+    """Emit query embedding only when query_rows > 0, then return the ready barrier op_id."""
+    if int(query_rows) > 0:
         embedding = vector_op(
             op_id=prefix + "query_embedding", deps=(), elements=query_rows * draft.hidden_size,
             ops_per_element=0, dtype="bf16", family="embedding",
             recipe="draft_query_embedding", **common)
         ready = barrier_op(
-            op_id=prefix + "context_query_ready", deps=(projection.op_id, embedding.op_id),
+            op_id=prefix + "context_query_ready", deps=(*deps, embedding.op_id),
             recipe="draft_context_query_ready", shape=(rows, query_rows), **common)
         ops.extend((embedding, ready))
         return ready.op_id
+    ready = barrier_op(
+        op_id=prefix + "context_query_ready", deps=tuple(deps),
+        recipe="draft_context_query_ready", shape=(rows, 0), **common)
+    ops.append(ready)
+    return ready.op_id
+
+
+def prepare(ops, *, projection, model, draft, rows, query_rows,
+            prefix, stage, requests, parallel=None, rows_by_view=None,
+            views=None, contexts=None, block=UNIT_CONTEXT_PARALLEL,
+            use_prolog_v3=True, layer_slot_valid_rows=None):
+    proj_mode = str(getattr(draft, "context_projection_mode", "") or "none").strip()
+    if proj_mode == "shared_compressed_kv":
+        common = dict(stage=stage, layer=-1, requests=requests, phase="draft")
+        return _emit_context_query_ready(
+            ops, deps=(projection.op_id,), rows=rows, query_rows=query_rows,
+            prefix=prefix, draft=draft, common=common)
     if getattr(draft, "attention_kind", "mla") == "gqa" or proj_mode in {"fused_kv_bank", "per_layer_qkv"}:
         from .draft_context_gqa import prepare_gqa_context
         return prepare_gqa_context(
@@ -206,6 +219,23 @@ def prepare(ops, *, projection, model, draft, rows, query_rows,
     activation_bytes = dtype_bytes(draft.activation_dtype)
     stores = []
     for layer in range(draft.layers):
+        layer_valid = None
+        if layer_slot_valid_rows is not None:
+            layer_valid = (
+                layer_slot_valid_rows[layer]
+                if layer < len(layer_slot_valid_rows)
+                else None
+            )
+            if layer_valid is None:
+                continue
+        if layer_valid is not None:
+            v_rows = max(0, int(layer_valid))
+            layer_rank_rows = (
+                0 if v_rows <= 0
+                else (min(rank_rows, owned_rows(v_rows, parallel)) if v_rows < int(rows) else rank_rows)
+            )
+        else:
+            layer_rank_rows = rank_rows
         name = prefix + f"context_kv{layer}"
         layer_common = {**common, "layer": layer}
         qkv_width = (draft.q_lora_rank + draft.kv_lora_rank
@@ -236,7 +266,7 @@ def prepare(ops, *, projection, model, draft, rows, query_rows,
                           ("fused_members", ("qkv_a", "kv_norm", "kv_rope") if do_rope else ("qkv_a", "kv_norm")),
                           ("context_rows", rows), ("query_rows", query_rows),
                           ("data_parallel_context", int(getattr(parallel, "cp", 1) or 1)),
-                          ("rank_owned_rows", rank_rows),
+                          ("rank_owned_rows", layer_rank_rows),
                           ("kv_row_bytes", row_bytes),
                           ("hidden_read_once", True),
                           ("timing_boundary", "expanded_semantic_operator")),
@@ -266,7 +296,7 @@ def prepare(ops, *, projection, model, draft, rows, query_rows,
                 ops.append(kv_rope)
                 kv_ready = kv_rope.op_id
         stored = cache_store_op(
-            op_id=name + ".kv_scatter", deps=(kv_ready,), rows=rank_rows,
+            op_id=name + ".kv_scatter", deps=(kv_ready,), rows=layer_rank_rows,
             row_bytes=row_bytes, dtype="bf16", kind="draft_context",
             recipe=SCATTER_RECIPE, **layer_common)
         stored = replace(stored, metadata=stored.metadata + (
@@ -274,20 +304,14 @@ def prepare(ops, *, projection, model, draft, rows, query_rows,
             ("cache_epilog", {
                 "kind": SCATTER_NATIVE_KIND,
                 "context_rows": rows,
-                "rank_owned_rows": rank_rows,
+                "rank_owned_rows": layer_rank_rows,
                 "kv_row_bytes": row_bytes,
                 "row_elements": kv_width,
             }),
-            ("dcp_row_shard", rank_rows),
+            ("dcp_row_shard", layer_rank_rows),
             ("dcp_degree", int(getattr(parallel, "cp", 1) or 1))))
         ops.append(stored)
         stores.append(stored.op_id)
-    embedding = vector_op(
-        op_id=prefix + "query_embedding", deps=(), elements=query_rows * draft.hidden_size,
-        ops_per_element=0, dtype="bf16", family="embedding",
-        recipe="draft_query_embedding", **common)
-    ready = barrier_op(
-        op_id=prefix + "context_query_ready", deps=(*stores, embedding.op_id),
-        recipe="draft_context_query_ready", shape=(rows, query_rows), **common)
-    ops.extend((embedding, ready))
-    return ready.op_id
+    return _emit_context_query_ready(
+        ops, deps=tuple(stores) or (norm.op_id,), rows=rows, query_rows=query_rows,
+        prefix=prefix, draft=draft, common=common)

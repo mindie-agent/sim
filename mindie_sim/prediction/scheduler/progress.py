@@ -22,6 +22,8 @@ from mindie_sim.schema.workload import RequestView
 from ..execution.serving_io import TokenTimeline
 
 _DRAFT_ACCEPTANCE_HASH_BITS = 64
+_NON_NEURAL_SPEC_METHODS = frozenset({"ngram", "ngram_gpu"})
+_DSPARK_SPEC_METHODS = frozenset({"dspark", "dflash"})
 
 
 @dataclass
@@ -54,6 +56,10 @@ class Progress:
     #: Monotonic counter of applied state transitions (commit, preemption or
     #: rollback).  It is not a token identity and never replaces ``computed``.
     state_version: int = 0
+    #: Monotonic slot allocation generation (increments on preemption/re-admission).
+    state_generation: int = 0
+    #: Causal handle of the last committed state publication for this request.
+    last_state_publication: str = ""
     #: Context reserved by the batch currently in flight.  Visible only after
     #: ``commit`` so consumers cannot read a candidate state.
     pending_context: int | None = None
@@ -150,20 +156,74 @@ class DraftPolicy:
     basis: str = "disabled"
     distribution: tuple[float, ...] = ()
     seed: int = 0
+    proposal_trace: tuple[int, ...] = ()
+
+    @property
+    def is_neural(self) -> bool:
+        return bool(self.mode) and self.mode not in _NON_NEURAL_SPEC_METHODS
+
+    @property
+    def requires_draft_prepare(self) -> bool:
+        return self.is_neural
+
+    def proposal_for_step(self, state: Progress, remaining: int, budget: int) -> int:
+        cap = min(self.proposal, max(0, remaining - 1), max(0, budget - 1))
+        if cap <= 0:
+            return 0
+        if state.decode_steps < len(self.proposal_trace):
+            return min(cap, max(0, int(self.proposal_trace[state.decode_steps])))
+        return cap
+
+    def next_proposal_for_step(self, next_decode_step: int, remaining_after: int) -> int:
+        """Next-step draft proposal width decoupled from the current step's verify width."""
+        cap = min(self.proposal, max(0, remaining_after - 1))
+        if cap <= 0:
+            return 0
+        if next_decode_step < len(self.proposal_trace):
+            return min(cap, max(0, int(self.proposal_trace[next_decode_step])))
+        return cap
 
     @classmethod
     def for_request(cls, case: CaseSpec, request: RequestSpec) -> DraftPolicy:
+        from mindie_sim.catalog.draft_spec import (
+            is_supported_speculative_method,
+            validate_fia_speculative_tokens,
+        )
+
         runtime, metadata = case.runtime, dict(case.runtime.metadata)
         mtp = getattr(case.model.auxiliary, "mtp", None)
-        mode = str(metadata.get("draft_mode", "") or "")
-        proposal = int(metadata.get("draft_proposal_tokens", getattr(mtp, "proposal_tokens", 0)) or 0)
+        spec_method = str(metadata.get("spec_method", "") or "").strip().lower()
+        mode = str(metadata.get("draft_mode", "") or "").strip().lower()
+        if spec_method == "medusa" or mode == "medusa":
+            from mindie_sim.schema.common import ModelingError
+            raise ModelingError("unsupported_speculative_method_on_ascend_v2:medusa")
+        if spec_method and not is_supported_speculative_method(spec_method, allow_none=True):
+            from mindie_sim.schema.common import ModelingError
+            raise ModelingError(f"unsupported_speculative_method:{spec_method}")
+        if spec_method == "none" or mode == "none":
+            return cls()
+        non_neural = spec_method in _NON_NEURAL_SPEC_METHODS or mode in _NON_NEURAL_SPEC_METHODS
+        if non_neural:
+            mode = spec_method if spec_method in _NON_NEURAL_SPEC_METHODS else mode
+        elif not mode and spec_method:
+            mode = spec_method
+        default_prop = 0 if non_neural else getattr(mtp, "proposal_tokens", 0)
+        proposal = int(
+            metadata.get("draft_proposal_tokens", metadata.get("num_speculative_tokens", default_prop)) or 0
+        )
         mean = dict(runtime.mtp_acceptance_by_output_tokens).get(request.output_tokens,
                                                                   runtime.mtp_acceptance_length)
         if not mode and mtp is not None and mean > 1:
             mode = "mtp"
         basis, distribution = "declared_mean_integer_credit", ()
         raw_spec = metadata.get("speculative")
-        if runtime.dspark is not None:
+        allow_dspark = (
+            runtime.dspark is not None
+            and not non_neural
+            and (not spec_method or spec_method in _DSPARK_SPEC_METHODS)
+            and (not mode or mode in _DSPARK_SPEC_METHODS)
+        )
+        if allow_dspark:
             spec = runtime.dspark.step_spec()
             mode, proposal, mean = "dspark", spec.draft_len, spec.expected_committed_tokens()
             basis = "declared_distribution"
@@ -177,7 +237,7 @@ class DraftPolicy:
             distribution = spec.acceptance_distribution()
         accepted = metadata.get("draft_accept_tokens")
         if accepted is not None:
-            mean, basis = int(accepted) + 1, "declared_acceptance"
+            mean, basis = float(accepted) + 1.0, "declared_acceptance"
             distribution = ()
         trace_raw = metadata.get("draft_accept_trace")
         trace = ()
@@ -186,16 +246,30 @@ class DraftPolicy:
             if isinstance(data, dict):
                 data = data.get(request.request_id, data.get("accepted", []))
             trace, basis = tuple(int(value) for value in data), "declared_trace_then_mean"
+        prop_trace_raw = metadata.get("draft_proposal_trace")
+        proposal_trace: tuple[int, ...] = ()
+        if prop_trace_raw:
+            pdata = json.loads(prop_trace_raw) if isinstance(prop_trace_raw, str) else prop_trace_raw
+            if isinstance(pdata, dict):
+                pdata = pdata.get(request.request_id, pdata.get("proposals", []))
+            proposal_trace = tuple(int(value) for value in pdata)
         if not mode and mean > 1:
             raise ValueError("draft_structure_required_for_speculative_acceptance")
         if not mode:
             return cls()
         if proposal == 0 and distribution == (1.0,):
             return cls(basis="confidence_declined_all_proposals")
-        if proposal <= 0 or not 1 <= mean <= proposal + 1 or any(value < 0 or value > proposal for value in trace):
+        if proposal > 0:
+            proposal = validate_fia_speculative_tokens(proposal)
+        if (
+            proposal <= 0
+            or not 1 <= mean <= proposal + 1
+            or any(value < 0 or value > proposal for value in trace)
+            or any(value < 0 or value > proposal for value in proposal_trace)
+        ):
             raise ValueError("draft_acceptance_exceeds_declared_proposals")
         return cls(mode, proposal, float(mean), trace, basis, distribution,
-                   int(metadata.get("random_seed", 0)))
+                   int(metadata.get("random_seed", 0)), proposal_trace)
 
     def committed(self, state: Progress, proposal: int) -> int:
         if state.decode_steps < len(self.trace):

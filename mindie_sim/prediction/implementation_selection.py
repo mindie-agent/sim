@@ -384,6 +384,7 @@ class LoweringRegion:
     source_dtype: str
     local_tokens: int
     selections: tuple = ()
+    replay_scope: str | None = None
 
 
 def capture_state(ops, graph, runtime, replay_scope):
@@ -464,9 +465,45 @@ def _inherit_capture(ops, state, original):
     return tuple(result)
 
 
+def _mark_eager_region_ops(ops):
+    """Explicitly tag eager-overridden region ops so capture inheritance never flips them captured."""
+    result = []
+    for op in ops:
+        meta = dict(op.metadata)
+        meta["graph_captured"] = False
+        meta["graph_segment"] = None
+        result.append(replace(op, metadata=tuple(meta.items())))
+    return tuple(result)
+
+
+def _offset_segments(ops, offset: int) -> tuple[tuple, int]:
+    if not ops:
+        return (), offset
+    result = []
+    max_seg = offset
+    for op in ops:
+        meta = dict(op.metadata)
+        seg = meta.get("graph_segment")
+        if seg is not None:
+            shifted = int(seg) + offset
+            meta["graph_segment"] = shifted
+            max_seg = max(max_seg, shifted)
+            result.append(replace(op, metadata=tuple(meta.items())))
+        else:
+            result.append(op)
+    return tuple(result), max_seg
+
+
+def _capture_policy_key(scope: str, runtime) -> tuple[str, frozenset[str] | None]:
+    raw_split = getattr(runtime, "splitting_ops", None)
+    if raw_split is None and runtime is not None:
+        raw_split = dict(getattr(runtime, "metadata", ()) or ()).get("splitting_ops")
+    return (str(scope), None if raw_split is None else frozenset(raw_split))
+
+
 def lower_regions(regions, *, graph, replay_scope, runtime, prefix=(),
                   resource_fusion=True, public_outputs=()):
-    """Insert representations, then partition the actual prefix+region DAG once."""
+    """Insert representations, then partition the actual prefix+region DAG per region scope."""
     from .transforms import insert_representations, lower_implementations
     from mindie_sim.prediction.operators.hyper_connections.native_fusion import lower_native_fusions, _ordered
 
@@ -476,25 +513,69 @@ def lower_regions(regions, *, graph, replay_scope, runtime, prefix=(),
         inserted, preactivated = insert_representations(
             region.ops, region.runtime, region.source_dtype)
         inserted_regions.append((inserted, preactivated))
-    actual = tuple(prefix_ops) + tuple(
-        op for ops, _ in inserted_regions for op in ops)
-    annotated_actual = graph.apply(actual, replay_scope, runtime)
-    state = _capture_values(annotated_actual)
-    annotated_iter = iter(annotated_actual)
-    annotated_prefix = tuple(islice(annotated_iter, len(prefix_ops)))
-    annotated_regions = [tuple(islice(annotated_iter, len(ops)))
-                         for ops, _ in inserted_regions]
+    region_scopes = [
+        (region.replay_scope if region.replay_scope is not None else replay_scope)
+        for region in regions
+    ]
+    base_key = _capture_policy_key(replay_scope, runtime)
+    region_keys = [
+        _capture_policy_key(reg_scope, region.runtime)
+        for region, reg_scope in zip(regions, region_scopes)
+    ]
+    heterogeneous_scopes = any(key != base_key for key in region_keys)
+    if not heterogeneous_scopes:
+        actual = tuple(prefix_ops) + tuple(
+            op for ops, _ in inserted_regions for op in ops)
+        annotated_actual = graph.apply(actual, replay_scope, runtime)
+        state = _capture_values(annotated_actual)
+        annotated_iter = iter(annotated_actual)
+        annotated_prefix = tuple(islice(annotated_iter, len(prefix_ops)))
+        annotated_regions = [tuple(islice(annotated_iter, len(ops)))
+                             for ops, _ in inserted_regions]
+    else:
+        annotated_prefix = graph.apply(prefix_ops, replay_scope, runtime) if prefix_ops else ()
+        seg_offset = max(
+            (int(dict(op.metadata).get("graph_segment") or 0) for op in annotated_prefix),
+            default=0,
+        )
+        annotated_regions = [()] * len(regions)
+        idx = 0
+        while idx < len(regions):
+            reg_scope = region_scopes[idx]
+            reg_key = region_keys[idx]
+            if reg_scope == "none":
+                ops_i = inserted_regions[idx][0]
+                annotated_regions[idx] = _mark_eager_region_ops(ops_i) if replay_scope != "none" else tuple(ops_i)
+                idx += 1
+                continue
+            group_end = idx + 1
+            while group_end < len(regions) and region_keys[group_end] == reg_key:
+                group_end += 1
+            group_ops = tuple(op for j in range(idx, group_end) for op in inserted_regions[j][0])
+            ann_group = graph.apply(group_ops, reg_scope, regions[idx].runtime) if group_ops else ()
+            ann_group, seg_offset = _offset_segments(ann_group, seg_offset)
+            g_iter = iter(ann_group)
+            for j in range(idx, group_end):
+                annotated_regions[j] = tuple(islice(g_iter, len(inserted_regions[j][0])))
+            idx = group_end
+        annotated_actual = annotated_prefix + tuple(op for ann in annotated_regions for op in ann)
+        state = _capture_values(annotated_actual)
     lowered = []
-    for region, (_, preactivated), annotated in zip(
-            regions, inserted_regions, annotated_regions):
+    for region, (_, preactivated), annotated, reg_scope in zip(
+            regions, inserted_regions, annotated_regions, region_scopes):
         selected = {op.op_id: state[op.op_id] for op in annotated
                     if op.op_id in state}
-        lowered.append(lower_implementations(
+        lowered_ops = lower_implementations(
             annotated, region.runtime, region.source_dtype,
             resource_fusion=False, local_tokens=region.local_tokens,
-            replay_scope=replay_scope, capture_state=selected,
+            replay_scope=reg_scope, capture_state=selected,
             skip_passes=("activation_quantization",),
-            preactivated=preactivated))
+            preactivated=preactivated)
+        if reg_scope == "none" and replay_scope != "none":
+            lowered_ops = _mark_eager_region_ops(lowered_ops)
+            for op in lowered_ops:
+                selected[op.op_id] = (False, None)
+        lowered.append(lowered_ops)
         state.update(selected)
     lowered = [apply_capture_state(ops, state) for ops in lowered]
     transformed = (*annotated_prefix, *(op for ops in lowered for op in ops))
@@ -515,7 +596,7 @@ def lower_regions(regions, *, graph, replay_scope, runtime, prefix=(),
     else:
         for ops in lowered:
             result.extend(ops)
-    if replay_scope != "none":
+    if replay_scope != "none" or any(sc != "none" for sc in region_scopes):
         result = apply_capture_inheritance(tuple(result), state, annotated_actual)
     selections = selection_delivery(
         tuple(result), tuple(record for region in regions

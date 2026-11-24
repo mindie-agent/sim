@@ -112,17 +112,17 @@ def test_copy_tail_and_inactive_masks_match_source_memory_direction(direction, a
 
 @pytest.mark.parametrize("keys,heads,tokens", ((2, 6, 16), (4, 12, 128)))
 def test_projection_materialization_copies_only_the_strided_gate_payload(keys, heads, tokens):
-    parsed, views, ops = source_case((4,) * (tokens // 4), keys=keys, heads=heads)
-    copy = next(op for op in ops if op.recipe == "z_norm_materialize")
-    meta = dict(copy.metadata)
-    width, value = (2 * keys + heads) * 128, heads * 128
-    assert meta["source_layout"]["strides"] == (width + value, 1)
-    assert meta["source_layout"]["offset"] == width
-    assert copy.mte2_bytes == copy.mte3_bytes == tokens * value * 2
+    """Live A3/A5 captures confirm GDN decode eliminates the 5 fake TensorMove/copy ops."""
+    _, _, ops = source_case((4,) * (tokens // 4), keys=keys, heads=heads)
+    removed = {
+        "z_norm_materialize", "core_output_zero", "core_output_copy",
+        "beta_contiguous", "alpha_contiguous", "convolution_input_contiguous",
+    }
+    assert not any(op.recipe in removed for op in ops)
     norm = next(op for op in ops if op.recipe == "linear_output_norm_gate")
-    assert copy.op_id in norm.deps
-    engine, _ = execute_one(parsed, views, copy)
-    assert engine.serviced["memory@r0:s0"] == pytest.approx(tokens * value * 4)
+    projection = next(op for op in ops if op.recipe == "linear_qkvz")
+    recurrence = next(op for op in ops if op.family == "recurrent_vector")
+    assert projection.op_id in norm.deps and recurrence.op_id in norm.deps
 
 
 @pytest.mark.parametrize("lengths,heads", (((1,), 12), ((4,), 1)))
@@ -137,12 +137,11 @@ def test_singleton_compatible_z_reshape_is_a_view(lengths, heads):
 def test_source_z_reshape_uses_padded_projection_rows_without_padding_recurrence():
     parsed, views, _ = source_case(lengths=(1,), keys=4, heads=12)
     ops, _ = Frontend().body(parsed.model, parsed.runtime, views, mode="decode", tokens=16, machine=parsed.machine)
-    copy = next(op for op in ops if op.recipe == "z_norm_materialize")
-    assert copy.hbm_bytes == 16 * 1536 * 4
+    assert not any(op.recipe in {"z_norm_materialize", "core_output_copy", "core_output_zero"} for op in ops)
     recurrence = next(op for op in ops if op.family == "recurrent_vector")
     assert dict(recurrence.metadata)["tokens"] == 1
-    core_copy = next(op for op in ops if op.recipe == "core_output_copy")
-    assert core_copy.hbm_bytes == 1536 * 4
+    norm = next(op for op in ops if op.recipe == "linear_output_norm_gate")
+    assert recurrence.op_id in norm.deps
 
 
 @pytest.mark.parametrize("model,tp,dim", (("qwen36", 8, 1280), ("qwen38", 4, 2560)))
@@ -371,7 +370,7 @@ def test_recover_ssm_keeps_native_kda_and_accounts_replay_separately():
     text.update(dspark_attention_kind="mla", dspark_block_size=5)
     c = parse_case(compose_case(
         config, hardware="a5", tp=8, dp=4, ep=32, dcp=8, num_devices=32,
-        block_size=1536, max_model_len=140000, graph_capture_mode="none",
+        block_size=1536, max_model_len=140000, graph_capture_mode="none", recover_ssm=False,
         quant={"name": "k31_fp8_cache", "weight_format": "bf16", "activation_format": "bf16",
                "expert_weight_format": "bf16", "kv_dtype": "fp8_e4m3",
                "index_dtype": "fp8_e4m3", "index_scale_dtype": "fp16"},

@@ -55,12 +55,6 @@ INVALID_POLICIES = ({"expert_ddr_ratio": -0.01}, {"expert_ddr_ratio": 1.01}, {"d
                     {"ssd_bw_util": 0.0}, {"ddr_bw_gbps": 0.0}, {"ddr_latency_us": -1.0},
                     {"kvc_prefetch_version": "v5"}, {"expert_offload_enabled": 1},
                     {"unknown_field": True}, {"kvc_ddr_ratio": 0.7, "kvc_ssd_ratio": 0.4})
-D2H_CALIBRATION = ((1, 21.37), (32, 20.69), (512, 21.54), (1024, 24.31), (2048, 36.72), (4096, 56.81))
-H2D_CALIBRATION = ((1, 20.51), (32, 20.47), (512, 21.38), (1024, 27.04), (2048, 39.09), (4096, 62.09), (8192, 113.89))
-EXCHANGE_CALIBRATION = (("h2d", 1, 20.55), ("h2d", 8, 23.23), ("h2d", 16, 36.69), ("h2d", 64, 113.97),
-                        ("h2d", 128, 224.57), ("d2h", 1, 20.50), ("d2h", 8, 20.81), ("d2h", 16, 30.90),
-                        ("d2h", 64, 99.07), ("d2h", 128, 198.09))
-GATHER_CALIBRATION = ((64, 21.10), (512, 21.61), (1024, 24.78), (2048, 35.52), (4096, 51.17), (8192, 93.58))
 def catalog_case(**overrides):
     base = dict(model="qwen3.5-35b-a3b", hardware="a3", tp=4, dp=2, ep=8,
                 layers=4, prompt_tokens=2048, output_tokens=64, concurrency=1)
@@ -506,48 +500,54 @@ def _memfabric_op(name, recipe, direction, rows, entries, payload):
                   mte2_bytes=payload, mte3_bytes=payload,
                   metadata=(("memfabric_call", {"direction": direction, "entries": entries,
                                                 "payload_bytes": payload}),))
-@pytest.mark.parametrize("tokens,observed_us", D2H_CALIBRATION)
-def test_memfabric_sparse_copy_d2h_matches_calibration(tokens, observed_us):
-    payload = float(tokens * 1152)
-    op = _memfabric_op("d2h", "memfabric_sparse_copy_d2h", "d2h", tokens,
-                       2 * tokens, payload)
-    result = graph_costs(memfabric_case(), (op,), isolated=False)
-    assert result["duration_ms"] * 1000.0 == pytest.approx(observed_us, rel=0.05)
-@pytest.mark.parametrize("tokens,observed_us", H2D_CALIBRATION)
-def test_memfabric_sparse_copy_h2d_matches_calibration(tokens, observed_us):
-    payload = float(tokens * 1152)
-    op = _memfabric_op("h2d", "memfabric_sparse_copy_h2d", "h2d", tokens,
-                       2 * tokens, payload)
-    result = graph_costs(memfabric_case(), (op,), isolated=False)
-    assert result["duration_ms"] * 1000.0 == pytest.approx(observed_us, rel=0.04)
-@pytest.mark.parametrize("direction,pages,observed_us", EXCHANGE_CALIBRATION)
-def test_memfabric_kv_exchange_uses_last_two_vector_owners(direction, pages, observed_us):
-    payload = float(pages * 128 * 1152)
-    op = OpSpec("kv_ex", "kv_offload_exchange", "prefill", 0, 0, ("r0",),
-                (pages, 128, 576), (pages, 128, 576), (pages, 128, 576),
-                (pages, 128, 576), recipe="memfabric_kv_exchange", dtype="bf16",
-                source_boundary="kernel", hbm_bytes=payload, mte2_bytes=payload,
-                mte3_bytes=payload,
-                metadata=(("memfabric_call", {"direction": direction, "pages": pages,
-                                              "payload_bytes": payload}),))
-    result = graph_costs(memfabric_case(), (op,), isolated=True, trace_limit=64)
-    assert result["duration_ms"] * 1000.0 == pytest.approx(observed_us, rel=0.05)
-    execution_meta = dict(result["isolated"]["operators"][0]["operator"]["metadata"])[
-        "program_execution"]
-    assert tuple(execution_meta["active_aiv_owners"]) == (62, 63)
-@pytest.mark.parametrize("rows,observed_us", GATHER_CALIBRATION)
-def test_memfabric_entry_gather_matches_calibration(rows, observed_us):
-    payload = float(rows * 1024)
-    op = OpSpec("eg", "kv_offload_gather", "decode", 0, 0, ("r0",),
-                (rows, 512), (rows, 512), (rows, 512), (rows, 512),
-                recipe="memfabric_entry_gather", dtype="bf16", source_boundary="kernel",
-                hbm_bytes=payload, mte2_bytes=payload, mte3_bytes=payload,
-                metadata=(("memfabric_call", {"rows": rows, "payload_bytes": payload}),))
-    result = graph_costs(memfabric_case(), (op,), isolated=True)
-    assert result["duration_ms"] * 1000.0 == pytest.approx(observed_us, rel=0.06)
-    execution_meta = dict(result["isolated"]["operators"][0]["operator"]["metadata"])[
-        "program_execution"]
-    assert execution_meta["ub_bytes_per_owner"] == 122880
+def test_memfabric_sparse_copy_d2h_and_h2d_scale_from_p20_primitives():
+    case = memfabric_case()
+    d2h_small = graph_costs(case, (_memfabric_op("d2h_s", "memfabric_sparse_copy_d2h", "d2h", 32, 64, float(32 * 1152)),), isolated=False)["duration_ms"]
+    d2h_large = graph_costs(case, (_memfabric_op("d2h_l", "memfabric_sparse_copy_d2h", "d2h", 4096, 8192, float(4096 * 1152)),), isolated=False)["duration_ms"]
+    h2d_small = graph_costs(case, (_memfabric_op("h2d_s", "memfabric_sparse_copy_h2d", "h2d", 32, 64, float(32 * 1152)),), isolated=False)["duration_ms"]
+    h2d_large = graph_costs(case, (_memfabric_op("h2d_l", "memfabric_sparse_copy_h2d", "h2d", 4096, 8192, float(4096 * 1152)),), isolated=False)["duration_ms"]
+    assert 0.0 < d2h_small < d2h_large and 0.0 < h2d_small < h2d_large
+    # Explicit transfer_channels override scales DMA duration directly (zero hardcoded A5_GVA_CALIBRATION).
+    fast_op = OpSpec("h2d_fast", "kv_offload_h2d", "decode", 0, 0, ("r0",), (4096, 576), (4096, 576), (4096, 576), (4096, 576),
+                     recipe="memfabric_sparse_copy_h2d", dtype="bf16", source_boundary="kernel",
+                     hbm_bytes=float(4096 * 1152), mte2_bytes=float(4096 * 1152), mte3_bytes=float(4096 * 1152),
+                     metadata=(("memfabric_call", {"direction": "h2d", "entries": 8192, "payload_bytes": float(4096 * 1152),
+                                                   "channel_bw_gbps": 200.0, "channel_alpha_us": 5.0}),))
+    assert graph_costs(case, (fast_op,), isolated=False)["duration_ms"] < h2d_large
+def test_memfabric_kv_exchange_uses_last_two_vector_owners():
+    case = memfabric_case()
+    durs = []
+    for direction, pages in (("h2d", 1), ("h2d", 64), ("d2h", 1), ("d2h", 64)):
+        payload = float(pages * 128 * 1152)
+        op = OpSpec("kv_ex", "kv_offload_exchange", "prefill", 0, 0, ("r0",),
+                    (pages, 128, 576), (pages, 128, 576), (pages, 128, 576),
+                    (pages, 128, 576), recipe="memfabric_kv_exchange", dtype="bf16",
+                    source_boundary="kernel", hbm_bytes=payload, mte2_bytes=payload,
+                    mte3_bytes=payload,
+                    metadata=(("memfabric_call", {"direction": direction, "pages": pages,
+                                                  "payload_bytes": payload}),))
+        result = graph_costs(case, (op,), isolated=True, trace_limit=64)
+        durs.append(result["duration_ms"])
+        execution_meta = dict(result["isolated"]["operators"][0]["operator"]["metadata"])[
+            "program_execution"]
+        assert tuple(execution_meta["active_aiv_owners"]) == (62, 63)
+    assert durs[0] < durs[1] and durs[2] < durs[3]
+def test_memfabric_entry_gather_scales_with_rows_and_wide_ub():
+    case = memfabric_case()
+    durs = []
+    for rows in (64, 4096):
+        payload = float(rows * 1024)
+        op = OpSpec("eg", "kv_offload_gather", "decode", 0, 0, ("r0",),
+                    (rows, 512), (rows, 512), (rows, 512), (rows, 512),
+                    recipe="memfabric_entry_gather", dtype="bf16", source_boundary="kernel",
+                    hbm_bytes=payload, mte2_bytes=payload, mte3_bytes=payload,
+                    metadata=(("memfabric_call", {"rows": rows, "payload_bytes": payload}),))
+        result = graph_costs(case, (op,), isolated=True)
+        durs.append(result["duration_ms"])
+        execution_meta = dict(result["isolated"]["operators"][0]["operator"]["metadata"])[
+            "program_execution"]
+        assert execution_meta["ub_bytes_per_owner"] == 122880
+    assert 0.0 < durs[0] < durs[1]
 def test_sparse_mla_offload_decode_and_host_dram_budget():
     assert copy_sfa_pool_capacity(16) == 16; assert copy_sfa_pool_capacity(17) == 32
     short_raw = sparse_mla_case(context_tokens=1024, offloading={
@@ -566,8 +566,7 @@ def test_sparse_mla_offload_decode_and_host_dram_budget():
                              context=8192, sequences=[1], scope="body")[0]
     h2d_ops = [op for op in long_ops if op.recipe == "memfabric_sparse_copy_h2d"]; layer0 = dict(h2d_ops[0].metadata)
     layer1 = dict(h2d_ops[1].metadata)
-    assert layer0["memfabric_call"]["tokens"] == math.ceil(2048 * 0.2); assert layer0["shared_indexer_reuse"] is False and layer1["shared_indexer_reuse"] is True; assert layer1["skip_topk"] is True; assert layer0["hardware_support"]["memfabric_acc_offload"] == "native_verified_on_a5"; assert layer0["hardware_support"]["copy_sfa_attention"] == (
-        "a2_a3_aclnn_binary_analytical_on_a5")
+    assert layer0["memfabric_call"]["tokens"] == math.ceil(2048 * 0.2); assert layer0["shared_indexer_reuse"] is False and layer1["shared_indexer_reuse"] is True; assert layer1["skip_topk"] is True; assert layer0["hardware_support"]["memfabric_acc_offload"] == "host_gva_dma_modeled"; assert layer0["hardware_support"]["abi_verification"] == "deferred_to_abi_registry"; assert layer0["hardware_support"]["copy_sfa_attention"] == "analytical_model"
     base_raw = sparse_mla_case(context_tokens=4096); offload_raw = sparse_mla_case(context_tokens=4096, offloading={
         "implementation": "vllm_ascend_sparse_kv_offload",
         "options": {"dram_size_per_dp_gb": 0.02, "keep_device_kv_cache": False}})

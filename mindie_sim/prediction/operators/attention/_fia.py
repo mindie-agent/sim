@@ -69,12 +69,6 @@ ARCH22_VEC1_UB_SLICE_BYTES = 3 * 16 * 1024  # fia_block_vec_nonquant.h:483 (3 * 
 AIV_SUBBLOCKS_PER_AIC = 2
 DAV_2201_HBM_BURST_BYTES = 512
 DAV_3510_HBM_BURST_BYTES = 256
-# Arch35 CopyInL1.h:330 scalar blockTableGm.GetValue + DataCopyGmNDToL1 per-page issue (~5x P02.setup_ns).
-ARCH35_FIA_PAGE_CMD_MULT = 5.0
-# Arch35 flash_attention_noquant_kernel_infer.h:119 non-paged ND2NZ DataCopy command setup per K/V load (~4x P02.setup_ns).
-ARCH35_FIA_ND2NZ_SETUP_MULT = 4.0
-# Arch22 attn_copy_gm_to_l1.h:343 scalar GetOffset + CopySingleMatrixNDToNZ per-page issue (~1x P03.setup_ns).
-ARCH22_FIA_PAGE_CMD_FALLBACK_MULT = 10.0
 MS_PER_SECOND_FIA = 1000.0
 
 
@@ -152,6 +146,8 @@ def _fixpipe_bytes(rows: int, columns: int) -> int:
 
 
 def _l2_capacity_bytes(ctx: OperatorPlanningContext) -> int:
+    if ctx.admission_memory_view is not None:
+        return int(ctx.admission_memory_view.effective_l2_bytes(ctx.geometry.rank or 0))
     return int(ctx.geometry.buffers.get("l2", dict(ctx.datapath.buffers).get("l2", 0)))
 
 
@@ -608,9 +604,7 @@ class _FiaLoop:
         )
         paged_kv = self.contract.kv_layout in PAGED_LAYOUTS
         page_cmd_ms = (
-            (p03_fixpipe_setup_ms(context) or (ARCH22_FIA_PAGE_CMD_FALLBACK_MULT * p02_load_setup_ms(context)))
-            if self.gm_workspace
-            else (ARCH35_FIA_PAGE_CMD_MULT * p02_load_setup_ms(context))
+            p03_fixpipe_setup_ms(context) if self.gm_workspace else p02_load_setup_ms(context)
         ) if paged_kv else 0.0
         scatter_open_bytes = (
             p01_hbm_scatter_row_open_bytes(context)
@@ -620,10 +614,7 @@ class _FiaLoop:
         max_q_m = max((q * group for q, _ in self.sequences), default=1)
         is_a35_decode = (not self.gm_workspace) and max_q_m <= ARCH35_DECODE_M_LIMIT
         a35_decode_fix_ms = (p03_fixpipe_setup_ms(context) + p13_mode4_ms(context)) if is_a35_decode else 0.0
-        a35_nd2nz_setup_ms = (
-            (ARCH35_FIA_ND2NZ_SETUP_MULT * p02_load_setup_ms(context))
-            if is_a35_decode else 0.0
-        )
+        a35_nd2nz_setup_ms = p02_load_setup_ms(context) if is_a35_decode else 0.0
 
         def lower_phase(phase, place):
             if phase.name in {"k_page_cmd", "v_page_cmd"}:

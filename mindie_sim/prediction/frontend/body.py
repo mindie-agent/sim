@@ -16,6 +16,19 @@ _SAMPLING_OPS_PER_LOGIT = 5
 _HIDDEN_SELECTION_INDEX_BYTES = 8
 _HC_COLLAPSE_SIGMOID_OPS = 4
 _HC_COLLAPSE_FP32_BYTES = 4
+_SANDWICH_MIN_NORMS_PER_LAYER = 4
+
+
+def _has_sandwich_norm(layer, model) -> bool:
+    """Return True iff the layer declares sandwich (4-norm) post-attention/post-FFN norms."""
+    if bool(getattr(layer, "has_sandwich_norm", False)):
+        return True
+    facts = dict(getattr(model, "catalog_facts", ()) or ())
+    norm_cfg = facts.get("normalization")
+    return (
+        isinstance(norm_cfg, dict)
+        and int(norm_cfg.get("norms_per_layer", 0) or 0) >= _SANDWICH_MIN_NORMS_PER_LAYER
+    )
 
 
 def _mhc_mean_collapse_ops(model, ready, *, prefix, mode, stage, tokens, requests, hc_mult):
@@ -69,10 +82,10 @@ def _mhc_stream_collapse_ops(model, ready, *, prefix, mode, stage, tokens, reque
     return [proj, sig, mix], mix.op_id
 
 
-def _emit_gemma4_post_ffn_norms(
+def _emit_sandwich_post_ffn_norms(
     ops, previous, saved, *, name, layer, stage, index, requests, tokens, model, mode,
 ):
-    """Emit Gemma-4 post-FFN (and MoE parallel branch) RMSNorms on the causal DAG."""
+    """Emit sandwich-norm post-FFN (and MoE parallel branch) RMSNorms on the causal DAG."""
     if layer.ffn == "moe":
         pre_exp = _frontend.norm(
             name=name + ".pre_experts_norm", deps=(saved,), stage=stage, layer=index,
@@ -157,13 +170,73 @@ def _dcp_cohort_context(parallel, replica, views, cohort_views_by_replica):
     return by_member, pos, has_decode
 
 
+def _select_body_sp(runtime, model, views, *, tokens, global_tokens, rank_ledger, cohort_valid, mode):
+    """Resolve sequence-parallel plan, handling pre-W1 draft scope cleanly."""
+    try:
+        return _frontend.sequence_parallel.select(
+            runtime, model, views, tokens=tokens,
+            global_tokens=global_tokens, rank_ledger=rank_ledger,
+            valid_global_tokens=cohort_valid,
+        )
+    except _frontend.ModelingError as exc:
+        # REMOVE-ON-W1-MERGE: pre-W1 sequence_parallel.select checks layer.scope == "body".
+        if mode == "draft" and "sequence_parallel_requires_body_scope" in str(exc):
+            body_scoped = _frontend.replace(
+                model,
+                layer_plans=tuple(_frontend.replace(lp, scope="body") for lp in model.layer_plans),
+            )
+            return _frontend.sequence_parallel.select(
+                runtime, body_scoped, views, tokens=tokens,
+                global_tokens=global_tokens, rank_ledger=rank_ledger,
+                valid_global_tokens=cohort_valid,
+            )
+        raise
+
+
+def _close_body_sp(
+    ops, previous, *, sp, model, stages, prefix, requests, mode,
+    hc_collapse_before_sp_gather: bool,
+):
+    """Emit optional pre-gather mHC collapse, SP output AllGather, and trim."""
+    stage_end = stages[-1] if stages else 0
+    hc_plans = [
+        plan for plan in model.layer_plans
+        if getattr(plan, "hyper_connections", False) and int(getattr(plan, "hc_mult", 1) or 1) > 1
+    ]
+    hc_mult = max((int(getattr(plan, "hc_mult", 1) or 1) for plan in hc_plans), default=1)
+    gather_width = model.hidden_size
+    if hc_mult > 1 and mode == "draft":
+        if hc_collapse_before_sp_gather:
+            c_ops, previous = _mhc_stream_collapse_ops(
+                model, previous, prefix=prefix, mode=mode, stage=stage_end,
+                tokens=sp.tokens_local, requests=requests, hc_mult=hc_mult,
+            )
+            ops.extend(c_ops)
+        else:
+            gather_width = hc_mult * model.hidden_size
+    gathered = _frontend.sequence_parallel.allgather(
+        plan=sp, op_id=prefix + "sp_output_gather", deps=(previous,),
+        stage=stage_end, layer=-1, requests=requests, phase=mode,
+        width=gather_width, dtype=model.activation_dtype)
+    ops.append(gathered)
+    previous = gathered.op_id
+    if sp.physical_global > sp.input_rows:
+        trimmed = _frontend.sequence_parallel.output_trim(
+            plan=sp, op_id=prefix + "sp_output_trim", deps=(previous,),
+            stage=stage_end, layer=-1, requests=requests, phase=mode,
+            width=gather_width, dtype=model.activation_dtype)
+        ops.append(trimmed)
+        previous = trimmed.op_id
+    return previous
+
+
 class _FrontendBody:
     def _lower_body_attention(
         self, ops, previous, *, common, name, layer, stage, index, model, runtime,
         views, mode, tokens, requests, p, sp, attn_state, residual,
         caches, indices, topks, candidates, stages, reuse_index_selection,
         dcp_cohort_views, dcp_local_pos, has_dcp_decode, rank_ledger, physical_rank,
-        explicit_physical_rank, machine,
+        explicit_physical_rank, machine, gbsa_metadata_cache=None,
     ):
         saved = None
         if tokens:
@@ -190,7 +263,8 @@ class _FrontendBody:
                     ops.extend(_frontend._scope((normalization,), "attention"))
                     hidden = normalization.op_id
             attention_ready = hidden
-            if sp:
+            sp_attn = bool(sp and getattr(sp, "applies_to_attention", True))  # REMOVE-ON-W1-MERGE
+            if sp_attn:
                 gathered = _frontend.sequence_parallel.allgather(
                     plan=sp, op_id=name + ".attention.sp_gather",
                     deps=(attention_ready,), stage=stage, layer=index,
@@ -218,17 +292,19 @@ class _FrontendBody:
                     rank_ledger.owner if rank_ledger is not None else physical_rank
                 )
                 selection_kwargs["explicit_physical_rank"] = bool(explicit_physical_rank)
+            if layer.attention == "gqa":
+                selection_kwargs["gbsa_metadata_cache"] = gbsa_metadata_cache
             attention = self.attention[layer.attention](
                 prefix=name, plan=layer, views=views, stage=stage, deps=attention_ready,
                 model=model, parallel=p, quant=model.quant, mode=mode,
-                padded_tokens=sp.attention_tokens if sp else tokens,
+                padded_tokens=sp.attention_tokens if sp_attn else tokens,
                 cache_ids=caches, topk_ids=topks, index_cache_ids=indices,
                 candidate_ids=candidates, stage_of=lambda layer: stages[layer],
                 cp_interleave_size=cp_interleave(runtime), runtime=runtime,
                 policy=self.attention_policy, machine=machine,
                 **selection_kwargs,
             )
-            if sp:
+            if sp_attn:
                 attention_ops, attention_last = _frontend.sequence_parallel.close_output(
                     attention.ops, attention.last, plan=sp, width=model.hidden_size,
                     dtype=model.activation_dtype, input_rows=sp.attention_tokens)
@@ -247,7 +323,7 @@ class _FrontendBody:
                 ops.extend(_frontend._scope(post.ops, "ffn", "residual"))
             else:
                 attn_out = attention.last
-                if layer.architecture == "gemma4":
+                if _has_sandwich_norm(layer, model):
                     post_attn = _frontend.norm(
                         name=name + ".post_attn_norm", deps=(attn_out,), stage=stage,
                         layer=index, requests=requests, tokens=tokens,
@@ -315,20 +391,23 @@ class _FrontendBody:
             # explicit token ledgers match genuine serving request views or
             # an optional target-graph correlation passed by the caller.
             realization_views = routing_views if routing_views is not None else views
+            sp_entry = bool(sp and getattr(sp, "stage_entry_active", True))  # REMOVE-ON-W1-MERGE
+            sp_dense = bool(sp and getattr(sp, "applies_to_dense_ffn", True))  # REMOVE-ON-W1-MERGE
+            sp_moe = bool(sp and getattr(sp, "applies_to_moe", True))  # REMOVE-ON-W1-MERGE
             realization = (_frontend.select_realization(
                 runtime, layer, phase=mode, tokens=tokens,
-                valid_tokens=(rank_ledger.valid[rank_ledger.owner] if rank_ledger and sp else
-                              sp.valid_per_tp[0] if sp else sum(view.logical_q_len for view in views)),
+                valid_tokens=(rank_ledger.valid[rank_ledger.owner] if rank_ledger and sp_entry else
+                              sp.valid_per_tp[0] if sp_entry else sum(view.logical_q_len for view in views)),
                 global_tokens=routing_tokens,
-                token_shards=(p.tp if sp and (rank_ledger is not None or routing_tokens is None
-                                              or routing_tokens >= tokens * p.tp) else 1),
-                valid_source_tokens=sp.valid_global if sp else None, replica=replica,
+                token_shards=(p.tp if sp_entry and (rank_ledger is not None or routing_tokens is None
+                                                    or routing_tokens >= tokens * p.tp) else 1),
+                valid_source_tokens=sp.valid_global if sp_entry else None, replica=replica,
                 views=realization_views, source_geometry=rank_ledger,
                 physical_rank=(rank_ledger.owner if rank_ledger is not None else physical_rank),
                 query_position=query_position)
                 if layer.ffn == "moe" else None)
             ffn_tokens = tokens
-            if sp and layer.ffn == "dense":
+            if sp_dense and layer.ffn == "dense":
                 gathered = _frontend.sequence_parallel.allgather(
                     plan=sp, op_id=name + ".ffn.sp_gather", deps=(hidden,),
                     stage=stage, layer=index, requests=requests, phase=mode,
@@ -341,12 +420,12 @@ class _FrontendBody:
                 routing=self.routing, routing_realization=realization,
                 moe_recipe=runtime.moe_recipe, mc2_chunks=runtime.mc2_chunks,
                 overlap_shared=bool(runtime.multistream_overlap_shared_expert),
-                runtime=runtime, sequence_plan=sp,
+                runtime=runtime, sequence_plan=(sp if (sp_moe if layer.ffn == "moe" else sp_dense) else None),
                 ep_owner=(rank_ledger.owner if rank_ledger is not None else
                           int(physical_rank) % p.ep if physical_rank is not None else None),
                 price_owner=(rank_ledger.owner if rank_ledger is not None else None),
             )
-            if sp and layer.ffn == "dense":
+            if sp_dense and layer.ffn == "dense":
                 ffn_ops, previous = _frontend.sequence_parallel.close_output(
                     ffn_ops, previous, plan=sp, width=model.hidden_size,
                     dtype=model.activation_dtype)
@@ -355,8 +434,8 @@ class _FrontendBody:
             if attn_state is not None:
                 attn_state.defer_mlp(previous)
             else:
-                if layer.architecture == "gemma4":
-                    previous = _emit_gemma4_post_ffn_norms(
+                if _has_sandwich_norm(layer, model):
+                    previous = _emit_sandwich_post_ffn_norms(
                         ops, previous, saved, name=name, layer=layer, stage=stage,
                         index=index, requests=requests, tokens=tokens, model=model, mode=mode,
                     )
@@ -429,7 +508,8 @@ class _FrontendBody:
              query_position=None,
              include_recover_commits: bool = False, machine=None,
              layer_limit: int | None = None,
-             topk_scope=None, reuse_index_selection: bool = False, rank_ledger=None):
+             topk_scope=None, reuse_index_selection: bool = False, rank_ledger=None,
+             hc_collapse_before_sp_gather: bool = False):
         _frontend._reject_unmodeled_dbo(runtime, "frontend.body")
         p = runtime.parallel
         if layer_limit is not None:
@@ -476,12 +556,13 @@ class _FrontendBody:
             )
             if cohort_views_by_replica is not None else None
         )
-        sp = _frontend.sequence_parallel.select(
+        sp = _select_body_sp(
             runtime, model, views, tokens=tokens,
             global_tokens=global_tokens, rank_ledger=rank_ledger,
-            valid_global_tokens=cohort_valid,
+            cohort_valid=cohort_valid, mode=mode,
         )
-        if sp:
+        sp_entry = bool(sp and getattr(sp, "stage_entry_active", True))  # REMOVE-ON-W1-MERGE
+        if sp_entry:
             if runtime.moe_recipe != "alltoall":
                 raise ValueError("sequence_parallel_requires_unchunked_alltoall")
             tokens, global_tokens = sp.tokens_local, sp.cohort_tokens
@@ -493,6 +574,7 @@ class _FrontendBody:
                 ops.append(shard)
                 previous = shard.op_id
         caches, indices, topks, candidates = {}, {}, {}, {}
+        gbsa_metadata_cache: dict = {}
         if topk_scope is not None:
             # Reuse a TopK selection produced by an earlier proposal step.
             topks = topk_scope
@@ -530,7 +612,7 @@ class _FrontendBody:
                 dcp_cohort_views=dcp_cohort_views, dcp_local_pos=dcp_local_pos,
                 has_dcp_decode=has_dcp_decode, rank_ledger=rank_ledger,
                 physical_rank=physical_rank, explicit_physical_rank=explicit_physical_rank,
-                machine=machine,
+                machine=machine, gbsa_metadata_cache=gbsa_metadata_cache,
             )
             previous = self._lower_body_ffn(
                 ops, previous, hidden, saved, common=common, name=name, layer=layer,
@@ -554,20 +636,12 @@ class _FrontendBody:
                                      stage=stages[last.index])
             ops.extend(_frontend._scope(final.ops, "ffn", "residual"))
             previous = final.hidden_id
-        if sp and tokens:
-            gathered = _frontend.sequence_parallel.allgather(
-                plan=sp, op_id=prefix + "sp_output_gather", deps=(previous,),
-                stage=stages[-1] if stages else 0, layer=-1, requests=requests, phase=mode,
-                width=model.hidden_size, dtype=model.activation_dtype)
-            ops.append(gathered)
-            previous = gathered.op_id
-            if sp.physical_global > sp.input_rows:
-                trimmed = _frontend.sequence_parallel.output_trim(
-                    plan=sp, op_id=prefix + "sp_output_trim", deps=(previous,),
-                    stage=stages[-1] if stages else 0, layer=-1, requests=requests, phase=mode,
-                    width=model.hidden_size, dtype=model.activation_dtype)
-                ops.append(trimmed)
-                previous = trimmed.op_id
+        if sp_entry and tokens:
+            previous = _close_body_sp(
+                ops, previous, sp=sp, model=model, stages=stages,
+                prefix=prefix, requests=requests, mode=mode,
+                hc_collapse_before_sp_gather=hc_collapse_before_sp_gather,
+            )
         from mindie_sim.prediction.operators.sparse_indexer.sparse_mla_metadata import before_forward
         ops = before_forward(ops, ready)
         if not include_recover_commits:
@@ -575,7 +649,10 @@ class _FrontendBody:
         return ops, previous
 
     @staticmethod
-    def final_mixer(model, ready, *, prefix, mode, stage, tokens, requests):
+    def final_mixer(
+        model, ready, *, prefix, mode, stage, tokens, requests,
+        already_hc_collapsed: bool = False,
+    ):
         """Emit low-rank or full-stream mHC collapse before final norm, or plain final norm."""
         if any(getattr(plan, "hc_lowrank", 0) > 0 for plan in model.layer_plans):
             return _frontend.lowrank_hyper_final_mixer(
@@ -596,7 +673,7 @@ class _FrontendBody:
             else "learned"
         )
         prefix_ops = []
-        if hc_mult > 1 and tokens > 0:
+        if hc_mult > 1 and tokens > 0 and not already_hc_collapsed:
             if collapse_mode == "mean":
                 if mode not in {"draft", "draft_prefill"}:
                     prefix_ops, ready = _mhc_mean_collapse_ops(
@@ -614,32 +691,60 @@ class _FrontendBody:
         return [*prefix_ops, final], final.op_id
 
     def logits(self, model, runtime, views, ready, *, prefix="", mode="decode", stage=None, sample=True,
-               input_tokens=None, normalized=False):
+               input_tokens=None, normalized=False, selected_logit_rows: int | None = None,
+               vocab_padding_size: int = 0, lmhead_pad_rows: int = 0,
+               hc_collapsed: bool = False):
         p = runtime.parallel
         stage = p.pp - 1 if stage is None else stage
         sampled = tuple(view for view in views if view.samples)
-        rows = sum(view.q_len if view.phase == "decode" else 1 for view in sampled)
+        rows = (
+            int(selected_logit_rows)
+            if selected_logit_rows is not None
+            else sum(view.q_len if view.phase == "decode" else 1 for view in sampled)
+        )
         input_tokens = sum(view.q_len for view in views) if input_tokens is None else input_tokens
         requests = tuple(view.request_id for view in sampled)
         ops, last = [], ready
         if not normalized and runtime.final_norm_scope == "all" and input_tokens:
-            finals, last = self.final_mixer(model, last, prefix=prefix, mode=mode,
-                stage=stage, tokens=input_tokens, requests=tuple(view.request_id for view in views))
+            finals, last = self.final_mixer(
+                model, last, prefix=prefix, mode=mode,
+                stage=stage, tokens=input_tokens, requests=tuple(view.request_id for view in views),
+                already_hc_collapsed=hc_collapsed,
+            )
             ops.extend(finals)
         if not rows:
             return ops, last
         if rows != input_tokens:
-            select = self.select_hidden(model, views, last, prefix=prefix, mode=mode, stage=stage)
+            select = self.select_hidden(
+                model, views, last, prefix=prefix, mode=mode, stage=stage, selected_rows=rows,
+            )
             ops.append(select)
             last = select.op_id
         if not normalized and runtime.final_norm_scope == "selected":
-            finals, last = self.final_mixer(model, last, prefix=prefix, mode=mode,
-                stage=stage, tokens=rows, requests=requests)
+            finals, last = self.final_mixer(
+                model, last, prefix=prefix, mode=mode,
+                stage=stage, tokens=rows, requests=requests,
+                already_hc_collapsed=hc_collapsed,
+            )
             ops.extend(finals)
+        head_rows = max(rows, int(lmhead_pad_rows or 0))
+        if vocab_padding_size > 0:
+            cols_per_rank = (
+                _frontend.math.ceil(model.vocab_size / (p.tp * vocab_padding_size))
+                * vocab_padding_size
+            )
+            eff_vocab = p.tp * cols_per_rank
+        else:
+            cols_per_rank = _frontend.math.ceil(model.vocab_size / p.tp)
+            eff_vocab = model.vocab_size
         logits = _frontend.gemm_op(
             op_id=prefix + "logits", deps=(last,), stage=stage, layer=-1, requests=requests,
-            m=rows, n=_frontend.math.ceil(model.vocab_size / p.tp), k=model.hidden_size, quant=model.quant,
+            m=head_rows, n=cols_per_rank, k=model.hidden_size, quant=model.quant,
             category="lm_head", phase=mode, family="logits", recipe="vocab_logits",
+            metadata=(
+                (("vocab_padded_size", eff_vocab), ("vocab_cols_per_rank", cols_per_rank))
+                if vocab_padding_size > 0 else ()
+            ) + ((("lmhead_padded_rows", head_rows), ("lmhead_valid_rows", rows)) if head_rows > rows else ()),
         )
         ops.append(logits)
         last = logits.op_id
@@ -647,8 +752,8 @@ class _FrontendBody:
             gather = _frontend.comm_op(
                 op_id=prefix + "logits_gather", deps=(last,), stage=stage, layer=-1, requests=requests,
                 family="allgather", phase=mode, recipe="ring_allgather",
-                link_bytes=rows * model.vocab_size * 2 * (p.tp - 1) / p.tp,
-                shape=(rows, model.vocab_size),
+                link_bytes=head_rows * eff_vocab * _frontend.dtype_bytes(model.activation_dtype) * (p.tp - 1) / p.tp,
+                shape=(head_rows, eff_vocab),
                 metadata=(("group_axis", "tp"), ("steps", p.tp - 1)),
             )
             ops.append(gather)
@@ -664,9 +769,13 @@ class _FrontendBody:
         return ops, sample.op_id
 
     @staticmethod
-    def select_hidden(model, views, ready, *, prefix="", mode="decode", stage=0):
+    def select_hidden(model, views, ready, *, prefix="", mode="decode", stage=0, selected_rows: int | None = None):
         sampled = tuple(view for view in views if view.samples)
-        rows = sum(view.q_len if view.phase == "decode" else 1 for view in sampled)
+        rows = (
+            int(selected_rows)
+            if selected_rows is not None
+            else sum(view.q_len if view.phase == "decode" else 1 for view in sampled)
+        )
         payload = rows * model.hidden_size * _frontend.dtype_bytes(model.activation_dtype)
         return _frontend.vector_op(
             op_id=prefix + "select_hidden", deps=(ready,), stage=stage, layer=-1,
@@ -680,7 +789,7 @@ class _FrontendBody:
 def _representative_attention(
     frontend, residual, *, layer, rep_idx, local_views, local_requests, local_tokens,
     mode, model, runtime, parallel, features, source_rows_by_replica, machine, ready,
-    attention_state,
+    attention_state, physical_rank=None,
 ):
     """Build the attention portion of a representative layer, including residuals."""
     caches, indices_map, topks, candidates = attention_state
@@ -703,6 +812,10 @@ def _representative_attention(
         requests=local_requests, tokens=local_tokens,
         width=model.hidden_size, model=model, mode=mode,
     )
+    attn_kwargs: dict = {}
+    if physical_rank is not None:
+        attn_kwargs["physical_rank"] = int(physical_rank)
+        attn_kwargs["explicit_physical_rank"] = True
     attn = frontend.attention[lyr.attention](
         prefix=name, plan=lyr, views=local_views, stage=0,
         deps=norm1.op_id, model=model, parallel=p, quant=model.quant,
@@ -711,15 +824,27 @@ def _representative_attention(
         candidate_ids=candidates, stage_of=lambda _l: 0,
         cp_interleave_size=cp_interleave(runtime), runtime=runtime,
         policy=frontend.attention_policy, machine=machine,
+        **attn_kwargs,
     )
+    attn_out = attn.last
+    extra_norms: list = []
+    if _has_sandwich_norm(lyr, model):
+        post_attn = _frontend.norm(
+            name=name + ".post_attn_norm", deps=(attn_out,), stage=0,
+            layer=rep_idx, requests=local_requests, tokens=local_tokens,
+            width=model.hidden_size, model=model, mode=mode,
+        )
+        extra_norms.append(post_attn)
+        attn_out = post_attn.op_id
     post_a, cur_prev = residual.after(
         {**common, "prefix": name + ".attention", "structure_block": "attention"},
-        attn.last, saved,
+        attn_out, saved,
     )
     attn_sub_raw = [
         *_frontend._scope(pre_r, "attention", "residual"),
         *_frontend._scope((norm1,), "attention"),
         *_frontend._scope(attn.ops, "attention"),
+        *_frontend._scope(tuple(extra_norms), "attention"),
         *_frontend._scope(post_a, "attention", "residual"),
     ]
     return attn_sub_raw, cur_prev, common
@@ -747,7 +872,7 @@ def _build_representative_body(
             local_requests=local_requests, local_tokens=local_tokens, mode=mode, model=model,
             runtime=runtime, parallel=p, features=features,
             source_rows_by_replica=source_rows_by_replica, machine=machine,
-            ready=in_id, attention_state=attention_state,
+            ready=in_id, attention_state=attention_state, physical_rank=physical_rank,
         )
         name = common["prefix"]
         if lyr.attention not in {"gdn", "kda", "projection_only", "unmodeled"}:
@@ -776,6 +901,12 @@ def _build_representative_body(
                       else None),
         )
         ops.extend(_frontend._scope(ffn_ops, "ffn"))
+        if _has_sandwich_norm(lyr, model):
+            cur_prev = _emit_sandwich_post_ffn_norms(
+                ops, cur_prev, saved, name=name, layer=lyr, stage=0,
+                index=rep_idx, requests=local_requests, tokens=local_tokens,
+                model=model, mode=mode,
+            )
         post_f, cur_prev = residual.after(
             {**common, "prefix": name + ".ffn", "structure_block": "ffn"},
             cur_prev, saved,

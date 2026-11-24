@@ -416,7 +416,7 @@ def test_kimi_k31_five_live_correctness_regressions():
     from types import SimpleNamespace
     from mindie_sim.prediction.efficiency import analyze_network_efficiency, solve_sla_sizing
     from mindie_sim.prediction.operators.linear_attention.common import (
-        _resolve_recover_ssm_accepted,
+        _resolve_recover_ssm_accepted_per_request,
         validate_contract,
     )
     from mindie_sim.prediction.results import StepRequest
@@ -523,8 +523,9 @@ def test_kimi_k31_five_live_correctness_regressions():
     )
     contract = validate_contract(conv_op, conv_ctx)
     assert contract.lengths == (6, 6)
-    assert _resolve_recover_ssm_accepted({"accepted_tokens": 3.5}, conv_ctx, 6) == 4
-    assert _resolve_recover_ssm_accepted({}, conv_ctx, 6) == (3, 4)
+    with pytest.raises(ModelingError, match="recover_ssm_requires_integer_acceptance"):
+        _resolve_recover_ssm_accepted_per_request({"accepted_tokens": 3.5}, conv_ctx, 6, 2)
+    assert _resolve_recover_ssm_accepted_per_request({}, conv_ctx, 6, 2) == (3, 4)
     c_eager = compose_case("kimi-k3.1", "950dt-96g-pod", feature_track="raw_eager", quant="mxfp4", **common)
     step_eval = sdk_api.evaluate_step(c_eager, StepRequest(phase="decode", tokens=6, context=131584, sequences=8, scope="model"))
     assert step_eval.span_ms > 0.0

@@ -15,7 +15,7 @@ from mindie_sim.catalog.attention_common import _floor_sum
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.prediction.mechanism import OperatorPlan, PlannedRecipe, Work
 from mindie_sim.prediction.operators.vector.mixed_core import split_reads
-from mindie_sim.prediction.program import KernelProgram, Stage
+from mindie_sim.prediction.program import KernelProgram, ParallelProgram, Stage
 from .sparse_indexer_pipeline import (
     INDEXER_WAVE_ROWS, QUANT_LEDGER, Arch35QuantIndexerRecipe,
     arch35_indexer_work, indexer_waves, key_blocks,
@@ -75,19 +75,96 @@ def recipes():
 
 def _build(op, geometry):
     ledger = dict(op.metadata)["quant_indexer_work"]
+    aic_read = float(ledger["aic_read_bytes"])
+    aiv_read = float(ledger["aiv_read_bytes"])
     work = split_reads(Work(dict(op.matrix_flops), {
         "hbm": op.hbm_bytes,
         "mte1": ledger["mte1_bytes"],
-        "mte2": ledger["aic_read_bytes"] + ledger["aiv_read_bytes"],
+        "mte2": aic_read + aiv_read,
         "mte3": op.mte3_bytes,
         "vector": op.vector_ops, "fixpipe": ledger["fixpipe_bytes"],
-    }), ledger["aic_read_bytes"], geometry.resource_units)
-    return OperatorPlan(work, lambda context: KernelProgram((
-        Stage("complete_indexer_service", context.work),)), {
-            "execution_abstraction": "complete_kernel_resource_envelope",
-            "native_dispatch_reconstructed": False,
-            "cross_owner_topk_traffic": "not_selected_without_owner_metadata",
-        })
+    }), aic_read, geometry.resource_units)
+    query_rows = max(0, int(ledger.get("query_rows", 0)))
+    aic_units = max(1, int(getattr(geometry, "compute_units", 0) or 1))
+    active_owners = min(aic_units, query_rows) if query_rows > 0 else 0
+
+    weight_ws = float(ledger.get("weight_workspace_read_write_bytes", 0.0)) / 2.0
+    score_ws = float(ledger.get("reduced_score_workspace_read_write_bytes", 0.0)) / 2.0
+    scale_w_read = max(0.0, aiv_read - score_ws)
+    score_aiv_read = max(0.0, aiv_read - scale_w_read)
+    mte1_total = float(ledger["mte1_bytes"])
+    qk_mte1 = min(mte1_total, float(ledger.get("query_bytes", 0.0)) + float(ledger.get("key_bytes", 0.0)))
+    reduce_mte1 = max(0.0, mte1_total - qk_mte1)
+    fixpipe_total = float(ledger["fixpipe_bytes"])
+    reduce_fixpipe = min(fixpipe_total, score_ws)
+    qk_fixpipe = max(0.0, fixpipe_total - reduce_fixpipe)
+    mte3_total = float(op.mte3_bytes)
+    reduce_mte3 = min(mte3_total, weight_ws)
+    topk_mte3 = max(0.0, mte3_total - reduce_mte3)
+    hbm_total = float(op.hbm_bytes)
+    load_hbm = min(hbm_total, aic_read + scale_w_read)
+    rem_hbm = max(0.0, hbm_total - load_hbm)
+    reduce_hbm = min(rem_hbm, reduce_mte3 + reduce_fixpipe)
+    topk_hbm = max(0.0, rem_hbm - reduce_hbm)
+    vec_total = float(op.vector_ops)
+    topk_vec = min(
+        vec_total,
+        float(ledger.get("topk_comparisons", 0.0))
+        + float(ledger.get("sentinel_fill_elements", 0.0))
+        + 2.0 * float(ledger.get("query_key_pairs", 0.0)),
+    )
+    reduce_vec = max(0.0, vec_total - topk_vec)
+    matrix_map = dict(op.matrix_flops)
+    int8_flops = float(matrix_map.get("int8", 0.0))
+    fp16_flops = float(matrix_map.get("fp16", 0.0))
+
+    def program(context):
+        if active_owners <= 0:
+            return KernelProgram((Stage("empty_quant_indexer", keep_empty=True),))
+        has_split_mte2 = ("mte2_aic" in context.resource_names and "mte2_aiv" in context.resource_names)
+        read_roles = ("mte2_aic", "mte2_aiv") if has_split_mte2 else ("mte2",)
+        owned_roles = ("cube", "mte1", "fixpipe", "vector", "mte3", *read_roles)
+        base_rows, rem_rows = divmod(query_rows, active_owners)
+        owner_programs = []
+        for owner in range(active_owners):
+            my_rows = base_rows + (1 if owner < rem_rows else 0)
+            share = float(my_rows) / float(query_rows)
+            placement = context.owned(owner, aic_units, owned_roles)
+            load_res = {"hbm": load_hbm * share}
+            if has_split_mte2:
+                load_res["mte2_aic"] = aic_read * share
+                load_res["mte2_aiv"] = scale_w_read * share
+            else:
+                load_res["mte2"] = (aic_read + scale_w_read) * share
+            topk_res = {
+                "hbm": topk_hbm * share,
+                "mte3": topk_mte3 * share,
+                "vector": topk_vec * share,
+                ("mte2_aiv" if has_split_mte2 else "mte2"): score_aiv_read * share,
+            }
+            owner_programs.append(KernelProgram((
+                Stage("load_inputs", context.bind(Work(resources=load_res)), placement=placement),
+                Stage("qk_int8_cube", context.bind(Work(
+                    {"int8": int8_flops * share} if int8_flops else {},
+                    {"mte1": qk_mte1 * share, "fixpipe": qk_fixpipe * share},
+                )), after=("load_inputs",), placement=placement),
+                Stage("head_reduce_fp16", context.bind(Work(
+                    {"fp16": fp16_flops * share} if fp16_flops else {},
+                    {"mte1": reduce_mte1 * share, "fixpipe": reduce_fixpipe * share,
+                     "mte3": reduce_mte3 * share, "hbm": reduce_hbm * share,
+                     "vector": reduce_vec * share},
+                )), after=("qk_int8_cube",), placement=placement),
+                Stage("topk_select", context.bind(Work(resources=topk_res)),
+                      after=("head_reduce_fp16",), placement=placement),
+            )))
+        return ParallelProgram(tuple(owner_programs))
+
+    return OperatorPlan(work, program, {
+        "execution_abstraction": "tiled_cube_vector_service_pipeline",
+        "active_aic_owners": active_owners,
+        "native_dispatch_reconstructed": False,
+        "cross_owner_topk_traffic": "not_selected_without_owner_metadata",
+    })
 
 
 def _owned_spans(view):
@@ -154,35 +231,7 @@ def _selection_comparisons(pairs, topk, visible_rows):
     return pairs * math.log2(topk)
 
 
-def generic_work(*, spans, heads, dim, topk, ratio):
-    """Representation-agnostic indexer work for legal unsampled geometry.
-
-    This does not claim the arch22 native binary; it lets the analytic path
-    predict arbitrary positive head/width/TopK/compression combinations that
-    the source formula can express.
-    """
-    normalized = []
-    for q, c in spans:
-        if (isinstance(q, bool) or not isinstance(q, int) or q < 1
-                or isinstance(c, bool) or not isinstance(c, int) or c < 0):
-            raise ModelingError("quant_indexer_generic_geometry_invalid")
-        normalized.append((q, c))
-    for name, value in (("heads", heads), ("dim", dim),
-                        ("topk", topk), ("ratio", ratio)):
-        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-            raise ModelingError("quant_indexer_generic_geometry_invalid")
-    pairs = sum(_floor_sum(q, ratio, 1, c + 1) for q, c in normalized)
-    visible = _visible_rows(normalized, ratio)
-    return {
-        "query_key_pairs": pairs,
-        "qk_int8_flops": 2 * pairs * heads * dim,
-        "weighted_head_reduce_fp16_flops": 2 * pairs * heads * HEAD_REDUCTION_CUBE_TILE_ROWS,
-        "topk_comparisons": _selection_comparisons(pairs, topk, visible),
-        "selection_output_bytes": sum(q for q, _ in normalized) * topk * INDEX_ELEMENT_BYTES,
-    }
-
-
-ARCH22_PRESET = "npu_arch_2201"
+ARCH35_PRESET = "npu_arch_3510"
 
 
 def _build_arch35(op, geometry):
@@ -191,7 +240,7 @@ def _build_arch35(op, geometry):
         getattr(geometry, "datapath", None), "compute_arch", None
     )
     preset = str(getattr(compute_arch, "preset", "") or getattr(compute_arch, "arch_id", "") or "")
-    if preset == ARCH22_PRESET:
+    if preset != ARCH35_PRESET:
         raise ModelingError("quant_lightning_indexer_v2_arch35_requires_arch35")
     ledger = dict(dict(op.metadata)[QUANT_LEDGER])
     plan = Arch35QuantIndexerRecipe().build(op, geometry)
@@ -487,5 +536,5 @@ def declare(builder, *, deps, views, plan, quant, parallel, block_size=None,
     # contribute to HBM and Fixpipe traffic without consuming MTE3 stores.
     builder.ops[-1] = replace(builder.ops[-1], matrix_flops=tuple(matrix.items()),
         hbm_bytes=read_bytes + mte3_write_bytes + score_workspace_bytes,
-        source_boundary="kernel", coverage="complete_quantized_indexer_resource_envelope")
+        source_boundary="kernel", coverage="tiled_quantized_indexer_service_pipeline")
     return result

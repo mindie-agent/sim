@@ -383,35 +383,51 @@ def test_speculative_companions_draft_tp_and_kv_dtype_rules() -> None:
     assert k31.speculative_config["kv_cache_dtype"] == "bfloat16"
     assert k31.speculative_config["draft_tensor_parallel_size"] == 8
 
-    # Kimi-K2.6: EAGLE3 primary (draft_tp=1) + DFlash alternative (K=15).
+    # Kimi-K2.6: EAGLE3 primary (draft_tp == target_tp) + DFlash alternative (K=15).
     k26_e3 = resolve_speculative_companion("kimi-k2.6", target_tp=16)
     assert k26_e3.method == "eagle3"
     assert k26_e3.draft_model == "lightseekorg/kimi-k2.6-eagle3"
-    assert k26_e3.draft_tensor_parallel_size == 1
+    assert k26_e3.draft_tensor_parallel_size == 16
     assert k26_e3.num_speculative_tokens == 3
     k26_df = resolve_speculative_companion("kimi-k2.6", target_tp=16, method="dflash")
     assert k26_df.method == "dflash"
     assert k26_df.draft_model == "z-lab/Kimi-K2.5-DFlash"
     assert k26_df.num_speculative_tokens == 15
 
-    # MiniMax-M3: EAGLE3 (draft_tp=1, BF16 draft KV on FP8 target).
+    # MiniMax-M3: EAGLE3 (draft_tp == target_tp, BF16 draft KV on FP8 target).
     mm3 = resolve_speculative_companion("minimax-m3", target_tp=8, target_kv_dtype="fp8")
-    assert mm3.method == "eagle3" and mm3.draft_tensor_parallel_size == 1
+    assert mm3.method == "eagle3" and mm3.draft_tensor_parallel_size == 8
     assert mm3.draft_kv_cache_dtype == "bfloat16"
 
     # Qwen3-8B / Qwen3-30B-A3B / Qwen3.8-27B / Llama-3* companions.
     assert resolve_speculative_companion("qwen3-8b", method="dflash").draft_model == "z-lab/Qwen3-8B-DFlash-b16"
     assert resolve_speculative_companion("qwen3-8b", method="dspark").draft_model == "deepseek-ai/dspark_qwen3_8b_block7"
-    assert resolve_speculative_companion("qwen3-30b-a3b", target_tp=4).draft_tensor_parallel_size == 1
+    assert resolve_speculative_companion("qwen3-30b-a3b", target_tp=4).draft_tensor_parallel_size == 4
+    assert resolve_speculative_companion("qwen3-30b-a3b", target_tp=8).draft_tensor_parallel_size == 8
     q27_opts = list_speculative_companions("qwen3.8-27b")
     assert q27_opts[0].method == "qwen3_5_mtp"
     assert any(c.draft_model == "z-lab/Qwen3.8-27B-DFlash2" and c.num_speculative_tokens == 8 for c in q27_opts)
     assert any(c.draft_model == "niannianxu/Qwen3.8-27B-LiLiCorr-block8-epoch0" and c.enforce_eager_draft for c in q27_opts)
 
     llama = resolve_speculative_companion("meta-llama/Meta-Llama-3.1-8B-Instruct", target_tp=4)
-    assert llama.method == "eagle3" and llama.draft_tensor_parallel_size == 1
+    assert llama.method == "eagle3" and llama.draft_tensor_parallel_size == 4
     assert "yuhuili/" in llama.draft_model
     assert any(c.method == "ngram" for c in llama.alternatives)
+
+    # Explicit K=16 fails fast (never silently clamped to 15).
+    with pytest.raises(ModelingError, match="ascend_fia_speculative_tokens_exceeds_limit"):
+        resolve_speculative_companion("glm-5.3", target_tp=8, num_speculative_tokens=16)
+
+    # Unregistered model returns empty companion list, rejects method=None & draft-less neural methods, admits explicit ngram.
+    assert list_speculative_companions("unregistered-custom-model-99") == ()
+    with pytest.raises(ModelingError, match="draft_structure_required_for_speculative_companion"):
+        resolve_speculative_companion("unregistered-custom-model-99", target_tp=8)
+    with pytest.raises(ModelingError, match="draft_structure_required_for_speculative_method:dspark"):
+        resolve_speculative_companion("unregistered-custom-model-99", target_tp=8, method="dspark")
+    with pytest.raises(ModelingError, match="ascend_fia_speculative_tokens_invalid"):
+        resolve_speculative_companion("glm-5.3", target_tp=8, num_speculative_tokens=True)
+    ng_explicit = resolve_speculative_companion("unregistered-custom-model-99", target_tp=8, method="ngram")
+    assert ng_explicit.method == "ngram" and ng_explicit.draft_model == ""
 
     # Built-in DeepSeek-V4 / V3 / GLM-5 companions exist.
     assert "deepseek-v4-pro-0813" in SPECULATIVE_COMPANIONS
@@ -437,6 +453,10 @@ def test_fia_ceiling_and_aclgraph_capture_multiples() -> None:
     bad_warns = validate_aclgraph_capture_sizes([1, 4, 8], num_speculative_tokens=4)
     assert len(bad_warns) == 1 and "not_multiples_of_5" in bad_warns[0]
 
+    from mindie_sim.stacks.vllm_ascend.speculative import normalize_capture_mode
+    with pytest.raises(ModelingError, match="unsupported_cudagraph_mode"):
+        normalize_capture_mode("INVALID_GRAPH_MODE")
+
 
 def test_pd_disaggregation_rules_and_serving_cli_guards() -> None:
     """PD rules enforce hybrid matching-K vs pure-attention P=1/D=K, plus host-RAM & ISA guards."""
@@ -460,28 +480,37 @@ def test_pd_disaggregation_rules_and_serving_cli_guards() -> None:
     assert "--safetensors-load-strategy prefetch" in hybrid_pd.cli_flags
     assert hybrid_pd.additional_config["enable_cpu_binding"] is True
 
-    # Pure-attention model under PD disaggregation: P=1, D=K.
+    # Pure-attention model under PD disaggregation: A3 fails closed on FP8 KV (zero silent INT8 coercion).
+    with pytest.raises(ModelingError, match="kv_cache_dtype_unsupported_on_hardware:a3:fp8"):
+        build_va_serving_rules(
+            "glm-5.2", hw_family="a3", tp=8, ep=EP_WEIGHT_FILTER_MIN_EP,
+            target_kv_dtype="fp8", pd_disaggregated=True, pd_role="decode",
+            num_speculative_tokens=5,
+        )
+    # Explicit INT8 C8 KV on A3 passes with P=1, D=K + weight NZ layout + dual-Die HCCS guidance.
     pure_pd = build_va_serving_rules(
         "glm-5.2", hw_family="a3", tp=8, ep=EP_WEIGHT_FILTER_MIN_EP,
-        target_kv_dtype="fp8", pd_disaggregated=True, pd_role="decode",
+        target_kv_dtype="int8", pd_disaggregated=True, pd_role="decode",
         num_speculative_tokens=5,
     )
     assert pure_pd.prefill_speculative_config["num_speculative_tokens"] == 1
     assert pure_pd.decode_speculative_config["num_speculative_tokens"] == 5
-    # A3 rejects FP8 KV and normalizes to C8 int8 + enables weight NZ layout + dual-Die HCCS guidance.
     assert pure_pd.effective_kv_cache_dtype == "int8"
-    assert any("a2_a3_fp8_kv_unsupported_using_int8_c8" in w for w in pure_pd.warnings)
     assert "--kv-cache-dtype int8" in pure_pd.cli_flags
     assert pure_pd.additional_config["enable_weight_nz_layout"] is True
     assert "HCCS" in pure_pd.collective_guidance and "SIO" in pure_pd.collective_guidance
 
-    # A2 cross-node RoCE guidance + FIA clamp warning.
+    # A2 cross-node RoCE guidance + strict FIA ceiling (K=20 fails fast, K=15 admits).
+    with pytest.raises(ModelingError, match="ascend_fia_speculative_tokens_exceeds_limit:20>15"):
+        build_va_serving_rules(
+            "kimi-k2.6", hw_family="a2", tp=16, ep=4, spec_method="dflash",
+            num_speculative_tokens=20,
+        )
     a2_rules = build_va_serving_rules(
         "kimi-k2.6", hw_family="a2", tp=16, ep=4, spec_method="dflash",
-        num_speculative_tokens=20,
+        num_speculative_tokens=15,
     )
     assert a2_rules.speculative_config["num_speculative_tokens"] == 15
-    assert any("fia_16_token_limit_clamped" in w for w in a2_rules.warnings)
     assert "RoCE" in a2_rules.collective_guidance
     assert "--no-enable-prefix-caching" in a2_rules.cli_flags
     assert a2_rules.enable_ep_weight_filter is False
@@ -493,14 +522,15 @@ def test_draft_kv_clamps_to_draft_spec_and_guards_mla_prolog() -> None:
     from dataclasses import replace
     from types import SimpleNamespace
     from mindie_sim import compose_case, parse_case
-    from mindie_sim.prediction.frontend.speculation import _draft_mla_prolog_eligible, _effective_draft_context_cap
+    from mindie_sim.catalog.draft_spec import effective_draft_context_cap
+    from mindie_sim.prediction.frontend.speculation import _draft_mla_prolog_eligible
 
     raw = compose_case("kimi-k3.1", hardware="Ascend910_9362", layers=2, tp=1, dp=1)
     case = parse_case(raw)
-    assert _effective_draft_context_cap(SimpleNamespace(max_position_embeddings=2048), case.runtime) == 2048
-    assert _effective_draft_context_cap(SimpleNamespace(max_position_embeddings=0), case.runtime) == 0
+    assert effective_draft_context_cap(SimpleNamespace(max_position_embeddings=2048), case.runtime) == 2048
+    assert effective_draft_context_cap(SimpleNamespace(max_position_embeddings=0), case.runtime) == 0
     rt_meta = replace(case.runtime, metadata=(("draft_max_model_len", 3072),))
-    assert _effective_draft_context_cap(SimpleNamespace(max_position_embeddings=0), rt_meta) == 3072
+    assert effective_draft_context_cap(SimpleNamespace(max_position_embeddings=0), rt_meta) == 3072
 
     bad_plan = replace(case.model.layer_plans[0], attention="mla", qk_rope_head_dim=0)
     bad_mla = replace(case.model, layer_plans=(bad_plan,))
@@ -544,3 +574,185 @@ def test_calibrated_dispatch_floor_preserves_explicit_device_override() -> None:
     )
     rep = graph_costs(cs_custom, {0: [op]}, evaluation=ev, include_submission=False, isolated=True)
     assert rep["duration_ms"] == pytest.approx(0.01, rel=1e-4)
+
+
+def test_eagle3_draft_tp_replicated_fc_reduced_vocab_and_d2t_drop() -> None:
+    """EAGLE3 draft_tp==target_tp, replicated 3-tap fc, reduced-vocab scratch & eagle3-only d2t drop."""
+    from dataclasses import replace
+    from mindie_sim import compose_case, parse_case
+    from mindie_sim.catalog.draft_geometry import native_draft_layer_plans
+    from mindie_sim.catalog.draft_spec import DraftSpec
+    from mindie_sim.prediction.frontend import Frontend
+    from mindie_sim.schema.model import AuxiliarySpec
+    from mindie_sim.schema.workload import IterationPlan, RequestView
+
+    raw = compose_case("qwen3-32b", "a3", tp=8, dp=1, layers=4, prompt_tokens=128, output_tokens=16)
+    case = parse_case(raw)
+    target_v = case.model.vocab_size
+    base_e3 = DraftSpec(
+        kind="eagle3", layers=1, hidden_size=case.model.hidden_size,
+        intermediate_size=case.model.intermediate_size, num_heads=64, num_kv_heads=8, head_dim=128,
+        q_width=64 * 128, kv_width=8 * 128, vocab_size=32000, attention_kind="gqa",
+        execution_mode="eagle3_serial", target_layer_ids=(0, 1, 2),
+        target_shared_embedding=True, target_shared_lm_head=False,
+    )
+    e3_red = replace(base_e3, layer_plans=native_draft_layer_plans(case.model, base_e3))
+    e3_full = replace(base_e3, vocab_size=target_v, layer_plans=native_draft_layer_plans(case.model, replace(base_e3, vocab_size=target_v)))
+    e1_full = replace(base_e3, kind="eagle", vocab_size=target_v, target_layer_ids=(), layer_plans=native_draft_layer_plans(case.model, replace(base_e3, kind="eagle", vocab_size=target_v, target_layer_ids=())))
+
+    view = RequestView("r0", 1, 128, True, "decode", draft_verify=True, draft_proposal_tokens=3, draft_advanced_tokens=2)
+    rt = replace(case.runtime, metadata=case.runtime.metadata + (("spec_method", "eagle3"), ("draft_mode", "eagle3"), ("draft_proposal_tokens", 3)))
+
+    ops_red = Frontend().program(IterationPlan((view,)), replace(case.model, auxiliary=AuxiliarySpec(mtp=e3_red)), rt, case.machine).work.ops
+    fc_op = next(op for op in ops_red if op.op_id == "draft0.features")
+    assert dict(fc_op.metadata)["replicated_fc"] is True and fc_op.local_shape[1] == case.model.hidden_size
+    assert any(op.recipe == "draft_d2t_scatter" and op.local_shape == (1, target_v) for op in ops_red)
+
+    ops_full_e3 = Frontend().program(IterationPlan((view,)), replace(case.model, auxiliary=AuxiliarySpec(mtp=e3_full)), rt, case.machine).work.ops
+    assert not any(op.recipe == "draft_d2t_scatter" for op in ops_full_e3)
+    assert dict(next(op for op in ops_full_e3 if op.op_id == "draft0.sample").metadata)["d2t_dropped"] is True
+
+    ops_full_e1 = Frontend().program(IterationPlan((view,)), replace(case.model, auxiliary=AuxiliarySpec(mtp=e1_full)), rt, case.machine).work.ops
+    assert dict(next(op for op in ops_full_e1 if op.op_id == "draft0.sample").metadata)["d2t_dropped"] is False
+
+    # Unspecified eagle3 draft_tp defaults to target_tp (no hardcoded draft_tp=1 override).
+    res_unspec = resolve_speculative_companion(
+        "qwen3-32b", target_tp=8, method="eagle3", draft_model="custom/eagle3-ckpt",
+    )
+    assert res_unspec.draft_tensor_parallel_size == 8
+    res_new = resolve_speculative_companion(
+        "step-5-preview", target_tp=8, method="eagle3", draft_model="custom/step5-eagle3",
+    )
+    assert res_new.draft_tensor_parallel_size == 8
+
+
+def test_dcp_pcp_speculative_precedence_matrix() -> None:
+    """Verbatim VA/platform.py:2253-2321,2143 DCP/PCP precedence matrix."""
+    from mindie_sim.catalog.draft_spec import DraftSpec
+    from mindie_sim.schema.common import ModelingError
+    from mindie_sim.schema.parallel import ParallelSpec
+    from mindie_sim.stacks.vllm_ascend.speculative import validate_dcp_for_speculative
+
+    def _gqa_draft(hq: int, hkv: int) -> DraftSpec:
+        return DraftSpec(
+            kind="eagle3", layers=1, hidden_size=4096, intermediate_size=8192,
+            num_heads=hq, num_kv_heads=hkv, head_dim=128,
+            q_width=hq * 128, kv_width=hkv * 128, attention_kind="gqa", execution_mode="eagle3_serial",
+        )
+
+    d_hkv8 = _gqa_draft(64, 8)
+    with pytest.raises(ModelingError, match="eagle_gqa_draft_dcp_incompatible"):
+        validate_dcp_for_speculative(spec_method="eagle3", draft_spec=d_hkv8, parallel=ParallelSpec(tp=8, dcp=2, pcp=1), num_speculative_tokens=3)
+    validate_dcp_for_speculative(spec_method="eagle3", draft_spec=d_hkv8, parallel=ParallelSpec(tp=8, dcp=2, pcp=2), num_speculative_tokens=3)
+    with pytest.raises(ModelingError, match="eagle_gqa_draft_dcp_incompatible:pcp=4!=dcp=2"):
+        validate_dcp_for_speculative(spec_method="eagle3", draft_spec=d_hkv8, parallel=ParallelSpec(tp=8, dcp=2, pcp=4), num_speculative_tokens=3)
+
+    d_hkv4 = _gqa_draft(64, 4)
+    validate_dcp_for_speculative(spec_method="eagle3", draft_spec=d_hkv4, parallel=ParallelSpec(tp=8, dcp=2, pcp=1), num_speculative_tokens=3)
+    validate_dcp_for_speculative(spec_method="eagle3", draft_spec=d_hkv4, parallel=ParallelSpec(tp=8, dcp=2, pcp=2), num_speculative_tokens=3)
+    with pytest.raises(ModelingError, match="eagle_gqa_draft_dcp_incompatible:pcp=4!=dcp=2"):
+        validate_dcp_for_speculative(spec_method="eagle3", draft_spec=d_hkv4, parallel=ParallelSpec(tp=8, dcp=2, pcp=4), num_speculative_tokens=3)
+
+    # TP=12, H_q=24, H_kv=4, DCP=2, PCP=1: T_d=12 > 4, D_dcp=2 <= 12//4=3, (24//4)%2 == 0 -> ADMIT.
+    d_tp12 = _gqa_draft(24, 4)
+    validate_dcp_for_speculative(spec_method="eagle3", draft_spec=d_tp12, parallel=ParallelSpec(tp=12, dcp=2, pcp=1), num_speculative_tokens=3)
+
+
+def test_recover_ssm_structural_eligibility_matrix() -> None:
+    """Per-family RecoverSSM structural matrix (KDA opt-in, KDA DSpark, GDN, mixed, mamba2)."""
+    from dataclasses import replace
+    from mindie_sim.model_catalog import load_model
+    from mindie_sim.schema.common import ModelingError
+    from mindie_sim.schema.parallel import ParallelSpec
+    from mindie_sim.stacks.vllm_ascend.speculative import validate_recover_ssm_eligibility
+
+    glm = load_model("glm-5.3-flash")
+    # Valid KDA opt-in decode -> 34 KDA owners; valid P-side kv_producer prefill admits cleanly.
+    ok_dec = validate_recover_ssm_eligibility(glm, recover_ssm_arg=True, track="merged", parallel=ParallelSpec(tp=8), spec_method="deepseek_mtp", proposal_count=5)
+    assert ok_dec.enabled is True and len(ok_dec.kda_owner_layers) == 34
+    ok_p = validate_recover_ssm_eligibility(glm, recover_ssm_arg=True, track="merged", parallel=ParallelSpec(tp=8, pcp=2), spec_method="deepseek_mtp", proposal_count=5, kv_transfer_config={"kv_role": "kv_producer"})
+    assert ok_p.enabled is True
+
+    # Invalid topologies, BOTH cache-mode mismatches, raw_eager, stochastic, K=0 -> FAIL-FAST.
+    invalid_cases = (
+        dict(parallel=ParallelSpec(tp=8, pp=2)),
+        dict(parallel=ParallelSpec(tp=8, dcp=2)),
+        dict(parallel=ParallelSpec(tp=8, pcp=2)),
+        dict(parallel=ParallelSpec(tp=8), enable_prefix_caching=True, mamba_cache_mode="none"),
+        dict(parallel=ParallelSpec(tp=8), enable_prefix_caching=False, mamba_cache_mode="align"),
+        dict(parallel=ParallelSpec(tp=8), stochastic_rounding=True),
+        dict(parallel=ParallelSpec(tp=8), raw_eager=True),
+        dict(parallel=ParallelSpec(tp=8), proposal_count=0),
+    )
+    for kw in invalid_cases:
+        params = dict(recover_ssm_arg=True, track="merged", spec_method="deepseek_mtp", proposal_count=5)
+        params.update(kw)
+        with pytest.raises(ModelingError):
+            validate_recover_ssm_eligibility(glm, **params)
+
+    # KDA+DSpark: non-allowlisted connector & dim-first conv layout fail fast with structural reason tags.
+    kimi = load_model("kimi-k3.1")
+    with pytest.raises(ModelingError, match="kda_dspark_unsupported_kv_connector"):
+        validate_recover_ssm_eligibility(kimi, recover_ssm_arg=True, track="merged", parallel=ParallelSpec(tp=8), spec_method="dspark", proposal_count=5, kv_transfer_config={"kv_connector": "BogusConnector"})
+    with pytest.raises(ModelingError, match="kda_dspark_requires_sd_conv_state_layout"):
+        validate_recover_ssm_eligibility(kimi, recover_ssm_arg=True, track="merged", parallel=ParallelSpec(tp=8), spec_method="dspark", proposal_count=5, kv_transfer_config={"kv_connector": "MooncakeConnectorV2"}, conv_state_dim_first=True)
+
+    # Deterministic mixed KDA+GDN & mamba2 fail-fast.
+    mixed = replace(glm, layer_plans=(replace(glm.layer_plans[0], attention="kda"), replace(glm.layer_plans[1], attention="gdn")))
+    with pytest.raises(ModelingError, match="recover_ssm_mixed_kda_gdn_unsupported"):
+        validate_recover_ssm_eligibility(mixed, recover_ssm_arg=True, track="proposed", parallel=ParallelSpec(tp=1), spec_method="mtp", proposal_count=3)
+    mamba_model = replace(glm, layer_plans=(replace(glm.layer_plans[0], attention="mamba2", recurrent_state_elements=1024),))
+    with pytest.raises(ModelingError, match="recover_ssm_unsupported_recurrent_family"):
+        validate_recover_ssm_eligibility(mamba_model, recover_ssm_arg=True, track="proposed", parallel=ParallelSpec(tp=1), spec_method="mtp", proposal_count=3)
+
+
+def test_renamed_model_invariance_for_speculative_and_recover_ssm() -> None:
+    """Cloning a model under a synthetic alias yields identical RecoverSSM & speculative receipts."""
+    from dataclasses import replace
+    from mindie_sim.model_catalog import load_model
+    from mindie_sim.schema.parallel import ParallelSpec
+    from mindie_sim.stacks.vllm_ascend.speculative import (
+        is_hybrid_recurrent_model,
+        is_multimodal_model,
+        resolve_recover_ssm_policy,
+        validate_recover_ssm_eligibility,
+    )
+
+    for model_name, alias, method in (
+        ("glm-5.3-flash", "synthetic-alpha-99", "deepseek_mtp"),
+        ("kimi-k3.1", "synthetic-beta-77", "dspark"),
+    ):
+        orig = load_model(model_name)
+        cloned = replace(orig, name=alias)
+        assert is_hybrid_recurrent_model(orig) == is_hybrid_recurrent_model(cloned)
+        assert is_multimodal_model(orig) == is_multimodal_model(cloned)
+        p_orig = resolve_recover_ssm_policy(orig, track="merged", parallel=ParallelSpec(tp=8), spec_method=method, proposal_count=5, opt_in_replayssm=True)
+        p_clone = resolve_recover_ssm_policy(cloned, track="merged", parallel=ParallelSpec(tp=8), spec_method=method, proposal_count=5, opt_in_replayssm=True)
+        assert p_orig == p_clone
+        e_orig = validate_recover_ssm_eligibility(orig, recover_ssm_arg=True, track="merged", parallel=ParallelSpec(tp=8), spec_method=method, proposal_count=5)
+        e_clone = validate_recover_ssm_eligibility(cloned, recover_ssm_arg=True, track="merged", parallel=ParallelSpec(tp=8), spec_method=method, proposal_count=5)
+        assert e_orig == e_clone
+
+    # Policy resolver fails fast (never silently swallows ModelingError) when opt_in_replayssm=True is illegal,
+    # even when proposal_count=0 (S2-W4-06).
+    with pytest.raises(ModelingError, match="recover_ssm_incompatible_with_raw_eager"):
+        resolve_recover_ssm_policy(
+            load_model("glm-5.3-flash"), track="eager", parallel=ParallelSpec(tp=8, ep=8),
+            spec_method="mtp", proposal_count=3, opt_in_replayssm=True,
+        )
+    with pytest.raises(ModelingError, match="recover_ssm_incompatible_with_raw_eager"):
+        resolve_recover_ssm_policy(
+            load_model("glm-5.3-flash"), track="eager", parallel=ParallelSpec(tp=8, ep=8),
+            spec_method="mtp", proposal_count=0, opt_in_replayssm=True,
+        )
+    with pytest.raises(ModelingError, match="kda_opt_in_requires_pp1:pp=2"):
+        resolve_recover_ssm_policy(
+            load_model("glm-5.3-flash"), track="shipping", parallel=ParallelSpec(tp=8, pp=2, ep=8),
+            spec_method="mtp", proposal_count=3, opt_in_replayssm=True,
+        )
+    # Without opt_in_replayssm, non-dspark KDA stays cleanly disabled on eager/PP=2.
+    pol_default = resolve_recover_ssm_policy(
+        load_model("glm-5.3-flash"), track="eager", parallel=ParallelSpec(tp=8, pp=2, ep=8),
+        spec_method="mtp", proposal_count=3, opt_in_replayssm=False,
+    )
+    assert pol_default.enabled is False

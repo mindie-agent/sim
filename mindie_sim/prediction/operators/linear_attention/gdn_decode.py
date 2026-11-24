@@ -41,15 +41,20 @@ OUTPUT_NORM_GATE_OPS_PER_ELEMENT = 9
 FUSED_QKVZBA_RECIPE = "fused_qkvzba_split_reshape_cat"
 FUSED_QKVZBA_OUTPUT_COUNT = 4
 FUSED_QKVZBA_OPS_PER_ELEMENT = 1
-INTERLEAVED_GDN_MODEL_TYPES = frozenset({"qwen3_next"})
 
 
-def _is_interleaved_qkvzba(model) -> bool:
-    """True when the model uses interleaved QKVZ/BA packing (e.g. Qwen3-Next)."""
+def _is_interleaved_qkvzba(model, plan=None) -> bool:
+    """True strictly when the layer or model declares interleaved QKVZ/BA layout."""
+    if plan is not None:
+        layout = str(getattr(plan, "gdn_layout", "") or "").strip().lower()
+        if layout == "interleaved":
+            return True
+        if layout and layout != "standard":
+            return False
     facts = dict(getattr(model, "catalog_facts", ()) or {})
     if "gdn_interleaved_qkvzba" in facts:
         return bool(facts["gdn_interleaved_qkvzba"])
-    return str(facts.get("model_type") or "").strip().lower() in INTERLEAVED_GDN_MODEL_TYPES
+    return False
 
 
 def _split_conv_qkv(tensors, conv, tokens, heads, key_heads, dk, dv):
@@ -404,7 +409,7 @@ def _lower_gdn_inputs(b, tensors, *, deps, model, plan, tp: int, tokens: int, co
                       ("gdn_key_head_replication", key_replication)),
         )
         conv_view = tensors.result(rep_id, (tokens, width))
-    if _is_interleaved_qkvzba(model):
+    if _is_interleaved_qkvzba(model, plan):
         elem_bytes = dtype_bytes(model.activation_dtype)
         split_elems = tokens * (width + value_width + 2 * heads)
         split_deps = tuple(dict.fromkeys((
@@ -429,13 +434,10 @@ def _lower_gdn_inputs(b, tensors, *, deps, model, plan, tp: int, tokens: int, co
             tensors.result(split_id, (tokens, heads), output="alpha"),
         ]
     else:
-        gate_inputs = [
-            tensors.contiguous(view, name + "_contiguous", reason="gdn_split_ba.contiguous")
-            for view, name in ((beta_view, "beta"), (alpha_view, "alpha"))
-        ]
-        conv_input = tensors.contiguous(
-            conv_view.narrow(0, 0, core_tokens),
-            "convolution_input_contiguous", reason="causal_conv1d_update.contiguous")
+        # Live A3+A5 GDN decode captures confirm zero standalone contiguous
+        # TensorMoves for beta, alpha, or causal_conv1d input views.
+        gate_inputs = [beta_view, alpha_view]
+        conv_input = conv_view.narrow(0, 0, core_tokens)
     return keys, heads, dk, dv, width, value_width, conv_input, z_view, gate_inputs
 
 
@@ -512,9 +514,6 @@ def lower(*, prefix, plan, views, stage, deps, model, parallel, mode,
      gate_inputs) = _lower_gdn_inputs(
         b, tensors, deps=deps, model=model, plan=plan, tp=tp,
         tokens=tokens, core_tokens=core_tokens)
-    zero = b.work("core_output_zero", (deps,), (tokens, heads, dv),
-                  vector=tokens * value_width, write=tokens * value_width * 2,
-                  family="tensor_fill", dtype="bf16")
     conv = _lower_convolution(
         b, tensors, conv_input=conv_input, deps=deps, views=views, active=active,
         active_rows=active_rows, core_tokens=core_tokens, lengths=lengths,
@@ -542,15 +541,11 @@ def lower(*, prefix, plan, views, stage, deps, model, parallel, mode,
         core_tokens=core_tokens, lengths=lengths, padding_slots=padding_slots,
         contract=contract, recurrent_effects=recurrent_effects, speculative=speculative,
         runtime=runtime, recurrent_implementation=recurrent_implementation)
-    copied = tensors.copy_into(core, tensors.result(zero, (tokens, heads, dv)).narrow(0, 0, core_tokens),
-                               "core_output_copy")
-    # gdn.py flattens token and head axes before norm. This crosses the
-    # QKVZ row gap for multi-token/multi-head z and needs a materialization;
-    # singleton/view-compatible layouts remain free through TensorLowering.
+    # Live A3+A5 captures confirm layer_norm_gated consumes recurrence output
+    # and gate z directly without core_output_copy or z_norm_materialize moves.
     gate = z_view
-    gate = tensors.reshape(gate, (tokens * heads, dv), name="z_norm_materialize")
     normalized = b.vector(
-        "linear_output_norm_gate", (copied.producer, gate.producer), tokens * value_width,
+        "linear_output_norm_gate", (core.producer, gate.producer), tokens * value_width,
         OUTPUT_NORM_GATE_OPS_PER_ELEMENT,
         shape=(tokens * heads, dv), read_bytes_override=(2 * tokens * value_width + dv) * 2,
         write_bytes_override=tokens * value_width * 2,
