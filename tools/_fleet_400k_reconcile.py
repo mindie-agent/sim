@@ -192,12 +192,17 @@ def dcp_reference_verified(record: Mapping[str, Any]) -> tuple[bool, str]:
         return False, str(record.get("error") or "blocked")
     if not record.get("total_us") or not record.get("fia_us") or not record.get("comm_us") or not record.get("merge_us"):
         return False, "dcp_pcp_missing_component_timings"
-    tot_kv = int(record.get("total_kv", 0))
+    raw_tot_kv = record.get("total_kv")
+    if isinstance(raw_tot_kv, bool) or not isinstance(raw_tot_kv, (int, float)) or not math.isfinite(float(raw_tot_kv)) or int(raw_tot_kv) <= 0:
+        return False, f"dcp_pcp_invalid_total_kv:{raw_tot_kv!r}"
+    tot_kv = int(raw_tot_kv)
     raw_err = record.get("max_abs_err")
-    err_val = float(raw_err) if isinstance(raw_err, (int, float)) else MIN_POSITIVE
+    if isinstance(raw_err, bool) or not isinstance(raw_err, (int, float)) or not math.isfinite(float(raw_err)) or float(raw_err) < 0.0:
+        return False, f"dcp_pcp_invalid_max_abs_err:{raw_err!r}"
+    err_val = float(raw_err)
     if tot_kv > DCP_MAX_VERIFIED_KV and err_val <= MIN_POSITIVE:
         return False, "dcp_pcp_reference_not_executed_L_gt_32768"
-    if not bool(record.get("verified")) or err_val > DCP_MAX_ABS_ERR:
+    if type(record.get("verified")) is not bool or not record["verified"] or err_val > DCP_MAX_ABS_ERR:
         return False, f"dcp_pcp_reference_failed:err={err_val}"
     return True, ""
 

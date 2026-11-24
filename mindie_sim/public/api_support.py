@@ -187,25 +187,6 @@ def _core(capability: str, entry: str, call: Any, *,
             fallback="not_attempted", cause=exc) from exc
 
 
-def _legacy_profiled(case: Any, ops: Any, profile: UserProfile | None,
-                     service_id: str | None):
-    if profile is None:
-        return ops, None
-    if isinstance(ops, Mapping):
-        raise ExtensionError("user_profile_supports_sequence_ops_only")
-    parsed = parse_case(case)
-    environment = ExecutionEnvironment.from_hardware(
-        parsed.machine, runtime=parsed.runtime)
-    probe = environment.execution(recipes=None)
-    normalized, recipes = environment._profiled(
-        _ops(ops), profile, service_id, probe)
-    if isinstance(ops, TargetOperators):
-        normalized = TargetOperators(
-            normalized, kernels=ops.effective_kernels,
-            selection=ops.default_selection)
-    return normalized, recipes
-
-
 def _context(value: Any) -> ExtensionContext | None:
     if value is None:
         return None

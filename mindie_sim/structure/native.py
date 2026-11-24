@@ -143,13 +143,11 @@ def matrix_comparison_scope(op):
 
 import math
 
-#: CANN 9.2.1 official mixed-quant sparse MLA plus its archived prototype DSL alias.
+#: CANN 9.2.1 official mixed-quant sparse MLA.
 MQSMLA_RECIPE = "aclnn_mixed_quant_sparse_flash_mla"
 MQSMLA_NATIVE_KIND = "aclnnMixedQuantSparseFlashMla"
-LEGACY_MQSMLA_RECIPE = "dsl_mixed_quant_sparse_flash_mla"
-LEGACY_MQSMLA_NATIVE_KIND = "MqsmlaKernel___call__"
-MQSMLA_RECIPES = frozenset({MQSMLA_RECIPE, LEGACY_MQSMLA_RECIPE})
-MQSMLA_NATIVE_KINDS = frozenset({MQSMLA_NATIVE_KIND, LEGACY_MQSMLA_NATIVE_KIND})
+MQSMLA_RECIPES = frozenset({MQSMLA_RECIPE})
+MQSMLA_NATIVE_KINDS = frozenset({MQSMLA_NATIVE_KIND})
 MIXED_QUANT_NATIVE_KIND = "MixedQuantSparseFlashMla"
 SPARSE_FLASH_ATTENTION_NATIVE = "SparseFlashAttention"
 SPARSE_MLA_NATIVE_KIND = "SparseFlashMla"
@@ -231,158 +229,6 @@ def add_rmsnorm_bias_contract(op):
     beta = affine if meta.get("norm_has_bias") else ((), None, None)
     return ("native_tensor_abi", "AddRmsNormBias", (x, x, affine, beta),
             (x, ((shape[0], 1), "fp32", "ND"), x))
-
-
-_ADD_RMSNORM_ABI_TENSORS = {
-    "x": ("input", "bf16"),
-    "residual": ("input", "bf16"),
-    "gamma": ("weight", "bf16"),
-    "output": ("output", "bf16"),
-    "rstd": ("output", "fp32"),
-    "residual_out": ("output", "bf16"),
-}
-_ABI_DTYPE_ALIASES = {
-    "bfloat16": "bf16", "float32": "fp32", "float16": "fp16",
-    "int8": "int8", "int32": "int32", "int64": "int64",
-}
-
-
-def _abi_field(raw, name, default=None):
-    if isinstance(raw, dict):
-        return raw.get(name, default)
-    return getattr(raw, name, default)
-
-
-def _abi_dtype(value):
-    text = str(value or "").strip().lower()
-    return _ABI_DTYPE_ALIASES.get(text, text)
-
-
-def _abi_positive_shape(raw):
-    shape = _abi_field(raw, "shape", None)
-    if not isinstance(shape, (list, tuple)) or not shape:
-        return None
-    values = []
-    for item in shape:
-        if isinstance(item, bool) or not isinstance(item, int) or item < 1:
-            return None
-        values.append(item)
-    return tuple(values)
-
-
-def _add_rmsnorm_abi(tensors, attrs, *, sequence_rows="", sequence_ranks=1):
-    """Validate the BF16 AddRmsNorm tensor/attr ABI without pricing it."""
-    reasons = []
-    if not isinstance(tensors, dict):
-        return None, ("tensors_requires_mapping",)
-    if sequence_rows not in {"", "shard", "selected"}:
-        reasons.append("sequence_rows_invalid")
-    if (isinstance(sequence_ranks, bool) or not isinstance(sequence_ranks, int)
-            or sequence_ranks < 1):
-        reasons.append("sequence_ranks_invalid")
-    values = {}
-    for name, (role, dtype) in _ADD_RMSNORM_ABI_TENSORS.items():
-        raw = tensors.get(name)
-        if raw is None or _abi_field(raw, "present", True) is False:
-            reasons.append(f"tensor_missing:{name}")
-            continue
-        shape = _abi_positive_shape(raw)
-        if shape is None:
-            reasons.append(f"tensor_shape_invalid:{name}")
-            continue
-        actual_role = str(_abi_field(raw, "role", role) or role)
-        actual_dtype = _abi_dtype(_abi_field(raw, "dtype", dtype))
-        layout = str(_abi_field(raw, "layout", "ND") or "ND").upper()
-        if actual_role != role:
-            reasons.append(f"tensor_role_mismatch:{name}")
-        if actual_dtype != dtype:
-            reasons.append(f"tensor_dtype_mismatch:{name}")
-        if layout != "ND":
-            reasons.append(f"tensor_layout_mismatch:{name}")
-        values[name] = shape
-    epsilon = None
-    if isinstance(attrs, dict) and attrs.get("epsilon") is not None:
-        raw_eps = attrs["epsilon"]
-        if (isinstance(raw_eps, bool) or not isinstance(raw_eps, (int, float))
-                or not math.isfinite(float(raw_eps)) or float(raw_eps) <= 0):
-            reasons.append("epsilon_invalid")
-        else:
-            epsilon = float(raw_eps)
-    if reasons:
-        return None, tuple(dict.fromkeys(reasons))
-    if len(values["x"]) != 2:
-        return None, ("tensor_rank_mismatch:x",)
-    rows, hidden = values["x"]
-    if values["residual"] != (rows, hidden):
-        return None, ("tensor_shape_mismatch:residual",)
-    if len(values["gamma"]) != 1 or values["gamma"][0] != hidden:
-        return None, ("tensor_shape_mismatch:gamma",)
-    if values["output"] != (rows, hidden):
-        return None, ("tensor_shape_mismatch:output",)
-    if len(values["residual_out"]) != 2 or values["residual_out"] != (rows, hidden):
-        return None, ("tensor_shape_mismatch:residual_out",)
-    rstd = values["rstd"]
-    if not (rstd == (rows, 1) or rstd == (rows,)):
-        return None, ("tensor_shape_mismatch:rstd",)
-    binding_shapes = {
-        "x": [hidden], "residual": [hidden], "gamma": [hidden],
-        "output": [hidden], "rstd": [1], "residual_out": [hidden],
-    }
-    binding_attrs = {
-        "hidden": hidden,
-        "sequence_rows": sequence_rows,
-        "sequence_ranks": sequence_ranks,
-        "input_layout": "ND",
-        "rstd_dtype": "fp32",
-        "output_dtype": "bf16",
-        "residual_dtype": "bf16",
-        "call_name": "aclnnAddRmsNorm",
-        "kernel_name": "AddRmsNorm",
-    }
-    occurrence_shapes = {
-        "x": [rows, hidden], "residual": [rows, hidden], "gamma": [hidden],
-        "output": [rows, hidden], "rstd": [rows, 1],
-        "residual_out": [rows, hidden],
-    }
-    return {
-        "kind": "add_rmsnorm",
-        "family": "elementwise",
-        "recipe": "norm",
-        "rows": rows,
-        "hidden": hidden,
-        "act_bytes": 2.0,
-        "dtype": "bf16",
-        "layout": "ND",
-        "members": ("residual_add", "rmsnorm"),
-        "inputs": ("x", "residual", "gamma"),
-        "outputs": ("output", "rstd", "residual_out"),
-        "binding_shapes": binding_shapes,
-        "binding_attrs": binding_attrs,
-        "occurrence_shapes": occurrence_shapes,
-        "epsilon": epsilon,
-    }, ()
-
-
-def add_rmsnorm_abi_region(tensors, attrs=None, *, sequence_rows="",
-                           sequence_ranks=1):
-    """Inverse tensor contract: a concrete AddRmsNorm ABI -> semantic region.
-
-    Returns ``None`` when the ABI is not this fused residual+RMSNorm call.
-    The result carries no duration, work rate or target observation.
-    """
-    region, _reasons = _add_rmsnorm_abi(
-        tensors, attrs, sequence_rows=sequence_rows,
-        sequence_ranks=sequence_ranks)
-    return region
-
-
-def add_rmsnorm_abi_reasons(tensors, attrs=None, *, sequence_rows="",
-                            sequence_ranks=1):
-    """Typed rejection reasons for the inverse AddRmsNorm ABI contract."""
-    _region, reasons = _add_rmsnorm_abi(
-        tensors, attrs, sequence_rows=sequence_rows,
-        sequence_ranks=sequence_ranks)
-    return reasons
 
 
 def layer_norm_contract(op):
@@ -477,8 +323,6 @@ def _mqsmla_attention_contract(op, view):
             or view.get("output_dtype") != "bf16"
             or type(orig_bytes) is not int
             or orig_bytes not in MQSMLA_ORIGINAL_ROW_WIDTHS
-            or (native_kind == LEGACY_MQSMLA_NATIVE_KIND
-                and orig_bytes != MQSMLA_WINDOW_ROW_BYTES)
             or type(view.get("compressed_cache")) is not bool):
         return None
     compressed = ((), None, None)

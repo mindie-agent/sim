@@ -171,26 +171,13 @@ def _dcp_cohort_context(parallel, replica, views, cohort_views_by_replica):
 
 
 def _select_body_sp(runtime, model, views, *, tokens, global_tokens, rank_ledger, cohort_valid, mode):
-    """Resolve sequence-parallel plan, handling pre-W1 draft scope cleanly."""
-    try:
-        return _frontend.sequence_parallel.select(
-            runtime, model, views, tokens=tokens,
-            global_tokens=global_tokens, rank_ledger=rank_ledger,
-            valid_global_tokens=cohort_valid,
-        )
-    except _frontend.ModelingError as exc:
-        # REMOVE-ON-W1-MERGE: pre-W1 sequence_parallel.select checks layer.scope == "body".
-        if mode == "draft" and "sequence_parallel_requires_body_scope" in str(exc):
-            body_scoped = _frontend.replace(
-                model,
-                layer_plans=tuple(_frontend.replace(lp, scope="body") for lp in model.layer_plans),
-            )
-            return _frontend.sequence_parallel.select(
-                runtime, body_scoped, views, tokens=tokens,
-                global_tokens=global_tokens, rank_ledger=rank_ledger,
-                valid_global_tokens=cohort_valid,
-            )
-        raise
+    """Resolve sequence-parallel plan directly through canonical W1 selector."""
+    return _frontend.sequence_parallel.select(
+        runtime, model, views, tokens=tokens,
+        global_tokens=global_tokens, rank_ledger=rank_ledger,
+        valid_global_tokens=cohort_valid,
+        allow_draft_scope=(mode == "draft"),
+    )
 
 
 def _close_body_sp(
@@ -263,7 +250,7 @@ class _FrontendBody:
                     ops.extend(_frontend._scope((normalization,), "attention"))
                     hidden = normalization.op_id
             attention_ready = hidden
-            sp_attn = bool(sp and getattr(sp, "applies_to_attention", True))  # REMOVE-ON-W1-MERGE
+            sp_attn = bool(sp and sp.applies_to_attention)
             if sp_attn:
                 gathered = _frontend.sequence_parallel.allgather(
                     plan=sp, op_id=name + ".attention.sp_gather",
@@ -391,9 +378,9 @@ class _FrontendBody:
             # explicit token ledgers match genuine serving request views or
             # an optional target-graph correlation passed by the caller.
             realization_views = routing_views if routing_views is not None else views
-            sp_entry = bool(sp and getattr(sp, "stage_entry_active", True))  # REMOVE-ON-W1-MERGE
-            sp_dense = bool(sp and getattr(sp, "applies_to_dense_ffn", True))  # REMOVE-ON-W1-MERGE
-            sp_moe = bool(sp and getattr(sp, "applies_to_moe", True))  # REMOVE-ON-W1-MERGE
+            sp_entry = bool(sp and sp.stage_entry_active)
+            sp_dense = bool(sp and sp.applies_to_dense_ffn)
+            sp_moe = bool(sp and sp.applies_to_moe)
             realization = (_frontend.select_realization(
                 runtime, layer, phase=mode, tokens=tokens,
                 valid_tokens=(rank_ledger.valid[rank_ledger.owner] if rank_ledger and sp_entry else
@@ -561,7 +548,7 @@ class _FrontendBody:
             global_tokens=global_tokens, rank_ledger=rank_ledger,
             cohort_valid=cohort_valid, mode=mode,
         )
-        sp_entry = bool(sp and getattr(sp, "stage_entry_active", True))  # REMOVE-ON-W1-MERGE
+        sp_entry = bool(sp and sp.stage_entry_active)
         if sp_entry:
             if runtime.moe_recipe != "alltoall":
                 raise ValueError("sequence_parallel_requires_unchunked_alltoall")

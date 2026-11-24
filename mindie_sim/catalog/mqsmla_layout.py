@@ -23,11 +23,11 @@ def packed_scale_type(window, compressed):
         "bf16" if window.scale_dtype == "bf16" else None)
 
 
-def packed_row_parts(model, region, width):
+def packed_row_parts(model, region, width, *, plan=None, phase=None):
     if region not in {"window", "compressed_kv"} or width != HEAD_WIDTH:
         return None
-    fmt = cache_format(model, "window")
-    kind = packed_scale_type(fmt, cache_format(model, "compressed_kv"))
+    fmt = cache_format(model, "window", plan=plan, phase=phase)
+    kind = packed_scale_type(fmt, cache_format(model, "compressed_kv", plan=plan, phase=phase))
     if kind is None:
         return None
     from mindie_sim.schema.common import dtype_bytes

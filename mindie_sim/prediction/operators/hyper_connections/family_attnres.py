@@ -51,13 +51,9 @@ RECIPE = "attn_res_fwd"
 NATIVE_KIND = "AttnResFwd"
 GROUP_ROLE = "attn_res_prefix_point"
 
-# Retained image identity. This is a source-compatible declaration; it does not
-# prove the captured events loaded this library or these scalar flags.
-IMAGE_SHA256 = "883670fcc91cbd75a7070b00501be0ecd81a266b81366a21bf02139d8e6a33e1"
 CALLER_SHA256 = "be9adc792774f919f443caf483eb2e04e4453617465381f47a482dd4736ec63f"
 SOURCE = {
     "repository": "vllm-ascend",
-    "image_id": "sha256:" + IMAGE_SHA256,
     "caller_sha256": CALLER_SHA256,
     "caller": {
         "path": "vllm_ascend/models/kimi_k3.py",
@@ -180,12 +176,8 @@ def source_eligible(model, arch, phase):
 
 
 def source_image_match(runtime):
-    """True only when the retained source image is actually declared.
-
-    A matching model shape/flag is not an image/source authentication.
-    """
-    image = dict(runtime.metadata).get("image_id")
-    return image == SOURCE["image_id"]
+    """LEGACY_PURGED: container image_id routing gate prohibited by DEV-READONLY-PATH."""
+    raise NotImplementedError("LEGACY_PURGED: wire ProbedAbiRegistry ArchId gating without container image_id")
 
 
 def explicit_generic(kernels):
@@ -225,8 +217,6 @@ def selection(runtime, *, model=None, phase=None, machine=None):
             raise ModelingError("attn_res_optimize_prefill_must_be_boolean")
         return {"optimize_prefill": value}
     if model is None or phase is None or explicit_generic(runtime.kernels):
-        return None
-    if not source_image_match(runtime):
         return None
     if not source_eligible(model, arch, phase):
         return None

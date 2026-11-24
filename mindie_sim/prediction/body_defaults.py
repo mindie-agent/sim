@@ -597,12 +597,11 @@ def _attnres_default(case, phase, kernels):
     explicit = ("attention_residual" in kernels.get("lowerings", {}) or
                 bool(recipes & kernels.get("recipes", {}).keys()) or
                 bool(families & kernels.get("families", {}).keys()))
-    source_domain = (family_attnres.source_eligible(
+    source_domain = family_attnres.source_eligible(
         case.model, case.machine.arch_family, phase)
-        and family_attnres.source_image_match(case.runtime))
     pipes = {"hbm", "vector", "mte2_aiv", "mte3"}
     reason = ("explicit_implementation_preserved" if explicit else
-              "attnres_source_image_or_domain_unsupported" if not source_domain else
+              "attnres_source_domain_unsupported" if not source_domain else
               "attnres_independent_copy_pipes_not_declared" if any(
                   not pipes <= dict(d.rates).keys() or dict(d.buffers).get("ub", 0) <= _ATTNRES_UB_RESERVE_BYTES
                   for d in case.machine.dies) else "")

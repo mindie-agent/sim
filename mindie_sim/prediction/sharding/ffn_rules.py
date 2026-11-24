@@ -449,13 +449,10 @@ def declare_gate_up_fusion_group(*, ops, runtime, prefix, activation, gate_ops,
                            else "complete_subgraph"),
                   "limitations": ["native_binary_and_scalar_flags_not_established",
                                   "expected_expert_counts_are_not_observed_routing"]},
-        fusion_status=("fused_new_kernel_required"
-                       if activation.family == "situ" else "fused_framework_enable"),
-        fusion_reason=("situ_mx_grouped_gate_up_target_fusion"
-                       if activation.family == "situ"
-                       else "grouped_matmul_swiglu_quant_eligible"),
     )
-    return True
+    raise NotImplementedError(
+        "LEGACY_PURGED: wire ProbedAbiRegistry.verify() for grouped MoE fusion_status in sharding/ffn_rules.py"
+    )
 
 
 def routed_expert_work(op, *, n, k, weights, weight_kind, local_rows,

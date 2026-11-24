@@ -171,27 +171,9 @@ def extract_model_geometry(
                     if isinstance(raw_model.get("metadata"), Mapping) else {})
         mla_replicate = bool(raw_model.get("mla_replicate", False)
                              or raw_meta.get("mla_replicate", False))
-        try:
-            info = extract_model_geometry(ModelSpec.from_mapping(raw_model))
-            info["mla_replicate"] = info["mla_replicate"] or mla_replicate
-            return info
-        except (ModelingError, ValueError, TypeError, KeyError):
-            canon = ModelSpec.canonical_fields(raw_model)
-            heads = int(canon.get("num_heads", 0) or 0)
-            kv_heads = int(canon.get("num_kv_heads",
-                                     canon.get("num_heads", 0)) or 0)
-            experts = int(canon.get("num_experts", 0) or 0)
-            attention = str(
-                canon.get("attention")
-                or ("mla" if ("mla" in canon or "kv_lora_rank" in canon)
-                    else "gqa")).strip().lower()
-            return {
-                "num_heads": heads, "num_kv_heads": kv_heads,
-                "num_experts": experts, "attention": attention,
-                "attention_types": {attention},
-                "layers": int(canon.get("layers", 1) or 1),
-                "mla_replicate": mla_replicate,
-            }
+        info = extract_model_geometry(ModelSpec.from_mapping(raw_model))
+        info["mla_replicate"] = info["mla_replicate"] or mla_replicate
+        return info
     raise TypeError(
         f"unsupported_case_or_model_type:{type(case_or_model).__name__}")
 

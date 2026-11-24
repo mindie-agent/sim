@@ -20,7 +20,7 @@ from mindie_sim.prediction.operators.grouped_moe.gmmsq_quant_typed import work a
 from mindie_sim.prediction.program import KernelProgram, ParallelProgram, Stage, RecipeBook
 from mindie_sim.prediction.operators.grouped_moe import grouped_gemm
 from mindie_sim.prediction.operators.mx_quant_matrix import mxfp4_supply
-from mindie_sim.prediction.operators.matrix.matrix_traffic import FP32_BYTES
+FP32_BYTES = 4
 
 DEFAULT_L1_K = 256
 BASE_TILE_M = 128

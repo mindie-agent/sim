@@ -114,13 +114,21 @@ def _abi_for_raw_tag(
     rule: TensorQuantRule | None = None,
 ) -> TensorPrecisionABI:
     upper = raw_tag.strip().upper().replace("-", "_")
-    if upper in {"", "FLOAT", "BF16", "BFLOAT16"}:
+    if upper in {"", "FLOAT"}:
         return TensorPrecisionABI(
             linear_method="dense",
             input_dtype=native_dtype,
             weight_dtype=native_dtype,
             output_dtype=native_dtype,
             compute_dtype=native_dtype,
+        )
+    if upper in {"BF16", "BFLOAT16"}:
+        return TensorPrecisionABI(
+            linear_method="dense",
+            input_dtype="bf16",
+            weight_dtype="bf16",
+            output_dtype="bf16",
+            compute_dtype="bf16",
         )
     if upper in {"FP16", "FLOAT16"}:
         return TensorPrecisionABI(
@@ -299,9 +307,18 @@ def _eager_cache_abis(
             )
             continue
         kv_tag = checkpoint.cache_rule.kv_tag_for_layer(native_id).strip().upper()
-        kv_dt = "int8" if kv_tag in {"C8", "FAQUANT", "INT8"} else (
-            "fp8_e4m3" if "FP8" in kv_tag else ("fp16" if kv_tag == "FP16" else native_dtype)
-        )
+        if kv_tag in {"", "FLOAT"}:
+            kv_dt = native_dtype
+        elif kv_tag in {"BF16", "BFLOAT16"}:
+            kv_dt = "bf16"
+        elif kv_tag in {"FP16", "FLOAT16"}:
+            kv_dt = "fp16"
+        elif kv_tag in {"C8", "FAQUANT", "INT8", "FP8", "FP8_E4M3", "MXFP8", "QK_MXFP8_DYNAMIC_V_MXFP8_PER_CHANNEL"}:
+            raise NotImplementedError(
+                f"LEGACY_PURGED: wire canonical quantized KV/scale CacheStateABI resolver in raw_eager/adapter.py for {kv_tag!r}"
+            )
+        else:
+            raise ModelingError(f"unknown_checkpoint_kv_cache_tag:{kv_tag}")
         if plan.attention == "mla":
             latent_dim = max(1, plan.kv_lora_rank)
             planes: list[CachePlaneABI] = [
@@ -373,6 +390,19 @@ def _eager_cache_abis(
             )
         if plan.indexer:
             idx_dim = max(1, plan.index_dim)
+            idx_tag = checkpoint.cache_rule.index_tag_for_layer(native_id).strip().upper()
+            if idx_tag in {"", "FLOAT"}:
+                idx_dt = native_dtype
+            elif idx_tag in {"BF16", "BFLOAT16"}:
+                idx_dt = "bf16"
+            elif idx_tag in {"FP16", "FLOAT16"}:
+                idx_dt = "fp16"
+            elif idx_tag == "INT8":
+                idx_dt = "int8"
+            elif idx_tag in {"FP8", "FP8_E4M3", "MXFP8"}:
+                idx_dt = "fp8_e4m3"
+            else:
+                raise ModelingError(f"unknown_checkpoint_index_cache_tag:{idx_tag}")
             idx_abis.append(
                 CacheStateABI(
                     scope="target",
@@ -386,7 +416,7 @@ def _eager_cache_abis(
                             logical_axes=("dim",),
                             logical_shape=(idx_dim,),
                             physical_shape=(idx_dim,),
-                            dtype=native_dtype,
+                            dtype=idx_dt,
                             allocation_frequency="page",
                             write_trigger="append",
                         ),

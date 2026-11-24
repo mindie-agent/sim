@@ -841,31 +841,12 @@ def compose_custom_case(
             "custom_hardware_num_devices_is_derived_from_parallelism"
         )
     num_devices = int(dp) * int(pp) * int(tp) * int(pcp)
-    machine = build_custom_hardware_machine(
+    _ = build_custom_hardware_machine(
         spec, num_devices=num_devices, **hardware_overrides,
     )
-    # ``compose_case`` validates hardware SKUs against public profiles. Feed it
-    # the already-built neutral resources under a registered placeholder name,
-    # then replace the machine with the private SKU identity.
-    compose_hardware = {**machine, "sku": "Ascend910_9392"}
-    from mindie_sim.compose import compose_case
-
-    case = compose_case(
-        model=model,
-        hardware=compose_hardware,
-        tp=int(tp), dp=int(dp), ep=int(ep), pp=int(pp), pcp=int(pcp),
-        dcp=int(cp), num_devices=num_devices,
-        quant=quantization,
-        prompt_tokens=int(prompt_tokens), output_tokens=int(output_tokens),
-        concurrency=int(num_requests),
-        max_num_seqs=int(max_num_seqs),
-        max_num_batched_tokens=int(max_num_batched_tokens),
-        max_model_len=int(max_model_len),
-        async_scheduling=bool(async_scheduling),
+    raise NotImplementedError(
+        "LEGACY_PURGED: wire neutral/custom HardwareSpec directly through compose_case without Ascend910_9392 SKU spoofing"
     )
-    case["machine"] = machine
-    parse_case(case)
-    return case
 
 
 __all__ = [

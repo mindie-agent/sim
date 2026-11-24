@@ -121,10 +121,14 @@ def _event_key(state, event, *, generation: int = 0) -> EventKey:
     sequence = getattr(event, "sequence", None)
     if isinstance(sequence, bool) or not isinstance(sequence, int):
         raise LedgerError("event_sequence_invalid")
-    runtime_uid = str(getattr(state, "uid", "")
-                      or getattr(state, "runtime_uid", "") or "runtime")
+    event_uid = getattr(event, "runtime_uid", None)
+    if not event_uid:
+        raise NotImplementedError(
+            "LEGACY_PURGED: wire event-origin runtime_uid on Event/RuntimeState "
+            "in prediction/runtime/ledger.py:_event_key (S6-SG-03)"
+        )
     return EventKey(
-        runtime_uid=runtime_uid, sequence=sequence,
+        runtime_uid=str(event_uid), sequence=sequence,
         generation=int(getattr(event, "generation", generation) or generation),
     )
 
@@ -132,11 +136,8 @@ def _event_key(state, event, *, generation: int = 0) -> EventKey:
 def _event_done(event) -> bool:
     if event is None:
         return False
-    try:
-        if bool(event.done):
-            return True
-    except Exception:  # pragma: no cover - defensive duck typing
-        pass
+    if bool(getattr(event, "done", False)):
+        return True
     return getattr(event, "time", None) is not None
 
 
@@ -295,8 +296,6 @@ class Ledger:
         exact = domains.get(pool.physical_domain)
         if exact is not None:
             return exact
-        if len(domains) == 1:
-            return next(iter(domains.values()))
         raise LedgerError("capacity_domain_missing")
 
     @staticmethod
@@ -390,6 +389,8 @@ class Ledger:
                             holders=dict(live.holders),
                             segments=live.segments, parent=live.parent)
                     backings[item.backing] = record
+                elif record.pool != item.pool:
+                    raise LedgerError("backing_pool_mismatch")
                 if record.parent is not None and item.reservation_parent != record.parent:
                     raise LedgerError("backing_parent_mismatch")
                 if item.reservation_parent is not None:
@@ -403,7 +404,6 @@ class Ledger:
                     if new_bytes:
                         # A slice inside its parent must never add pool bytes.
                         raise LedgerError("reservation_not_backed")
-                    parent.children.add(key)
                     grant.ranges = ranges
                 elif grant.acquire:
                     if not ranges and amount > 0:
@@ -530,7 +530,7 @@ class Ledger:
         del domain.readers[reader]
         grant.readers.discard(reader)
         result = ReleaseResult(released=False, epoch=domain.epoch)
-        if (grant.deferred and not grant.readers
+        if (grant.deferred and not grant.readers and not grant.children
                 and (grant.last_use is None or grant.last_use_done)):
             result = cls._complete_release(state, domain, grant)
         return result
@@ -544,7 +544,7 @@ class Ledger:
         results: list[ReleaseResult] = []
         for domain in cls.domains(state).values():
             for grant in tuple(domain.grants.values()):
-                if not grant.deferred or grant.readers:
+                if not grant.deferred or grant.readers or grant.children:
                     continue
                 if grant.last_use is not None and grant.last_use not in done:
                     continue
@@ -574,17 +574,11 @@ class Ledger:
             raise LedgerError("generation_mismatch")
         if grant.released:
             return ReleaseResult(released=False, epoch=domain.epoch)
-        if grant.children:
-            grant.deferred = True
-            return ReleaseResult(released=False, deferred=True,
-                                 epoch=domain.epoch)
-        grant.last_use = _event_key(state, after) if after is not None else None
-        grant.last_use_done = _event_done(after)
-        if grant.readers:
-            grant.deferred = True
-            return ReleaseResult(released=False, deferred=True,
-                                 epoch=domain.epoch)
-        if after is not None and not _event_done(after):
+        if after is not None:
+            grant.last_use = _event_key(state, after)
+            grant.last_use_done = _event_done(after)
+        if (grant.children or grant.readers
+                or (grant.last_use is not None and not grant.last_use_done)):
             grant.deferred = True
             return ReleaseResult(released=False, deferred=True,
                                  epoch=domain.epoch)

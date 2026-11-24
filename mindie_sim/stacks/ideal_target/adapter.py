@@ -118,13 +118,21 @@ def _abi_for_raw_tag(
 ) -> TensorPrecisionABI:
     tag = raw_tag.strip()
     upper = tag.upper().replace("-", "_")
-    if upper in {"", "FLOAT", "BF16", "BFLOAT16"}:
+    if upper in {"", "FLOAT"}:
         return TensorPrecisionABI(
             linear_method="dense",
             input_dtype=native_dtype,
             weight_dtype=native_dtype,
             output_dtype=native_dtype,
             compute_dtype=native_dtype,
+        )
+    if upper in {"BF16", "BFLOAT16"}:
+        return TensorPrecisionABI(
+            linear_method="dense",
+            input_dtype="bf16",
+            weight_dtype="bf16",
+            output_dtype="bf16",
+            compute_dtype="bf16",
         )
     if upper in {"FP16", "FLOAT16"}:
         return TensorPrecisionABI(
@@ -397,7 +405,18 @@ def _build_llm_cache_abis(
             continue
         if plan.attention == "mla":
             latent_dim = max(1, plan.kv_lora_rank)
-            latent_dtype = "int8" if kv_tag.strip().upper() in {"C8", "INT8"} else native_dtype
+            kv_upper = kv_tag.strip().upper()
+            if kv_upper in {"", "FLOAT", "BF16", "BFLOAT16", "FP16", "FLOAT16"}:
+                latent_dtype = (
+                    "bf16" if kv_upper in {"BF16", "BFLOAT16"}
+                    else ("fp16" if kv_upper in {"FP16", "FLOAT16"} else native_dtype)
+                )
+            elif kv_upper in {"C8", "INT8", "FP8", "FP8_E4M3", "MXFP8"}:
+                raise NotImplementedError(
+                    f"LEGACY_PURGED: wire canonical MLA quantized cache/scale CacheStateABI resolver for {kv_tag!r}"
+                )
+            else:
+                raise ModelingError(f"unknown_checkpoint_kv_cache_tag:{kv_tag}")
             planes: list[CachePlaneABI] = [
                 CachePlaneABI(
                     plane_id="mla_latent",
@@ -457,9 +476,19 @@ def _build_llm_cache_abis(
         if plan.indexer:
             idx_dim = max(1, plan.index_dim)
             idx_tag = checkpoint.cache_rule.index_tag_for_layer(native_id)
-            idx_dt = "int8" if idx_tag.strip().upper() == "INT8" else (
-                "fp8_e4m3" if "FP8" in idx_tag.strip().upper() else native_dtype
-            )
+            idx_upper = idx_tag.strip().upper()
+            if idx_upper in {"", "FLOAT"}:
+                idx_dt = native_dtype
+            elif idx_upper in {"BF16", "BFLOAT16"}:
+                idx_dt = "bf16"
+            elif idx_upper in {"FP16", "FLOAT16"}:
+                idx_dt = "fp16"
+            elif idx_upper == "INT8":
+                idx_dt = "int8"
+            elif idx_upper in {"FP8", "FP8_E4M3", "MXFP8"}:
+                idx_dt = "fp8_e4m3"
+            else:
+                raise ModelingError(f"unknown_checkpoint_index_cache_tag:{idx_tag}")
             idx_abis.append(
                 CacheStateABI(
                     scope="target",
@@ -523,11 +552,12 @@ def _schedule_one_step(
             break
         ctx, rem = progress.get(rid, (0, 1))
         if phase == "decode":
-            q_len = 1 + speculative_k
+            q_len = 1
         else:
             raw_q = max(1, rem)
             q_len = min(raw_q, budget - used_tokens) if state.chunked_prefill else raw_q
-        if used_tokens + q_len > budget:
+        step_tokens = q_len + (speculative_k if phase == "decode" else 0)
+        if used_tokens + step_tokens > budget:
             continue
         views.append(
             RequestView(
@@ -541,7 +571,7 @@ def _schedule_one_step(
                 draft_proposal_tokens=speculative_k if phase == "decode" else 0,
             )
         )
-        used_tokens += q_len
+        used_tokens += step_tokens
     if not views:
         return WaitForEvent(reason="grant_release", until_ms=state.now_ms)
     return IterationPlan(

@@ -189,13 +189,21 @@ def _manifest_abi_for_tag(
     rule: TensorQuantRule | None = None,
 ) -> TensorPrecisionABI:
     upper = raw_tag.strip().upper().replace("-", "_")
-    if upper in {"", "FLOAT", "BF16", "BFLOAT16"}:
+    if upper in {"", "FLOAT"}:
         return TensorPrecisionABI(
             linear_method="dense",
             input_dtype=native_dtype,
             weight_dtype=native_dtype,
             output_dtype=native_dtype,
             compute_dtype=native_dtype,
+        )
+    if upper in {"BF16", "BFLOAT16"}:
+        return TensorPrecisionABI(
+            linear_method="dense",
+            input_dtype="bf16",
+            weight_dtype="bf16",
+            output_dtype="bf16",
+            compute_dtype="bf16",
         )
     if upper in {"FP16", "FLOAT16"}:
         return TensorPrecisionABI(
@@ -590,37 +598,9 @@ class ManifestStackAdapter:
             _manifest_abi_for_tag(exc.raw_tag, native_dtype)
         kv_abis: list[CacheStateABI] = []
         if not is_diffusion:
-            ckpt_digest = checkpoint.digest()
-            for plan in layers:
-                native_id = plan.native_layer_id if plan.native_layer_id >= 0 else plan.index
-                total_kv = plan.num_kv_heads or plan.num_heads or 1
-                local_kv = local_kv_heads(total_kv, parallel.tp)
-                h_dim = plan.head_dim or 1
-                kv_abis.append(
-                    CacheStateABI(
-                        scope="target",
-                        native_layer=native_id,
-                        component_role="kv_combined",
-                        producer_key=f"target.l{native_id}.kv_combined",
-                        planes=(
-                            CachePlaneABI(
-                                plane_id="kv_payload",
-                                plane_kind="payload",
-                                logical_axes=("kv", "head", "dim"),
-                                logical_shape=(KV_CACHE_PLANES, local_kv, h_dim),
-                                physical_shape=(KV_CACHE_PLANES, local_kv, h_dim),
-                                dtype=native_dtype,
-                                allocation_frequency="page",
-                                write_trigger="append",
-                            ),
-                        ),
-                        phase=phase,
-                        deployment_role=role,
-                        checkpoint_digest=ckpt_digest,
-                        kv_block_size=DEFAULT_KV_BLOCK_SIZE,
-                        placement=CachePlacementRule(head_range=(0, local_kv), state_shard_axis="tp"),
-                    )
-                )
+            raise NotImplementedError(
+                "LEGACY_PURGED: wire canonical CheckpointQuantMap cache_rule/index/recurrent ABI resolver in stacks/registry.py"
+            )
         return RuntimeQuantPlan(
             checkpoint_digest=checkpoint.digest(),
             stack_id=self._capabilities.stack_id,
@@ -781,12 +761,7 @@ class RuntimeStackRegistry:
             self._discover_entry_points_locked()
 
     def _discover_entry_points_locked(self) -> None:
-        try:
-            eps = importlib_metadata.entry_points(group=STACK_ENTRY_POINT_GROUP)
-        except TimeoutError:
-            raise
-        except Exception:
-            return
+        eps = importlib_metadata.entry_points(group=STACK_ENTRY_POINT_GROUP)
         for ep in eps:
             loaded = ep.load()
             adapter = loaded() if callable(loaded) else loaded

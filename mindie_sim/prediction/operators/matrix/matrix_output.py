@@ -14,7 +14,7 @@ from mindie_sim.schema.common import ModelingError, dtype_bytes
 from mindie_sim.prediction.mechanism import Work
 from mindie_sim.prediction.ownership import read_role
 from mindie_sim.prediction.program import KernelProgram, ParallelProgram, PipelineProgram, Stage
-from .matrix_traffic import FP32_BYTES
+FP32_BYTES = 4
 
 DEFAULT_OUTPUT_CHUNKS = 4
 DEFAULT_OUTPUT_BUFFER_ALIGNMENT = 32

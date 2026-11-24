@@ -659,37 +659,9 @@ from .schema import _EXPANSION_MODES, _dtype, _mode, resolve_expansion_regime
 from .binding import DEFAULT_ACTIVE_AIV_BLOCKS
 
 DEFAULT_TOTAL_AIV_UNITS = 64
-_CONTENTION_UTIL_CAP = 4.0
-# Diagnostic-only contention weighting coefficients for offline MC2 chain
-# summaries (``compute_a5_contention_slowdown`` / ``evaluate_a5_mc2_chains``).
-# Never consumed by production Engine simulation or roofline pricing; pending
-# live A5 multi-stream contention sweeps (see ``contention:live_sweeps`` in
-# ``build_a5_followup_manifest``).
-_MTE_SELF_CONTENTION = 0.55
-_MTE_VECTOR_CONTENTION = 0.10
-_MTE_CUBE_CONTENTION = 0.05
-_HBM_MTE_CONTENTION = 0.45
-_HBM_VECTOR_CONTENTION = 0.15
-_HBM_CUBE_CONTENTION = 0.20
-_CUBE_SELF_CONTENTION = 0.35
-_CUBE_MTE_CONTENTION = 0.05
-_AIV_VECTOR_BASE_CONTENTION = 0.55
-_AIV_VECTOR_OCCUPANCY_CONTENTION = 0.45
-_AIV_CUBE_CONTENTION = 0.10
-_TRANSFER_BASE_MS = 0.012
-_TRANSFER_MTE_MS = 0.05
-_TRANSFER_VECTOR_MS = 0.01
-_SYNC_BASE_MS = 0.008
-_SYNC_UTIL_MS = 0.02
-_SYNC_PER_AIV_BLOCK_MS = 0.0005
-
-_MIN_MC2_CONCURRENT_UTIL = 0.01
-_MC2_CUBE_UTIL_WEIGHT = 0.40
-_MC2_VECTOR_UTIL_WEIGHT = 0.75
 
 _TARGET_WIDE_MESH_RANKS = 64
 _WIDE_ALL_TO_ALLV_RANKS = frozenset({16, 32})
-
 
 
 def compute_a5_contention_slowdown(expansion_mode, *, concurrent_cube_util=0.0,
@@ -697,153 +669,17 @@ def compute_a5_contention_slowdown(expansion_mode, *, concurrent_cube_util=0.0,
                                    concurrent_mte_util=0.0,
                                    active_aiv_blocks=DEFAULT_ACTIVE_AIV_BLOCKS,
                                    total_aiv_units=DEFAULT_TOTAL_AIV_UNITS):
-    """Shared-vector / MTE / HBM contention for an expansion execution mode."""
-    mode = _mode(expansion_mode)
-    if mode not in _EXPANSION_MODES and mode != "unspecified":
-        raise ModelingError(f"a5_expansion_mode_unknown:{expansion_mode}")
-    for name, value in (("concurrent_cube_util", concurrent_cube_util),
-                        ("concurrent_vector_util", concurrent_vector_util),
-                        ("concurrent_mte_util", concurrent_mte_util)):
-        if not math.isfinite(float(value)) or float(value) < 0:
-            raise ValueError(f"a5_contention_util_invalid:{name}")
-    if int(total_aiv_units) < 1:
-        raise ValueError("a5_contention_requires_positive_total_aiv_units")
-    blocks = max(0, int(active_aiv_blocks))
-    units = max(1, int(total_aiv_units))
-    occupancy = min(1.0, blocks / units)
-    cube = min(_CONTENTION_UTIL_CAP, float(concurrent_cube_util))
-    vector_demand = min(_CONTENTION_UTIL_CAP, float(concurrent_vector_util))
-    mte = min(_CONTENTION_UTIL_CAP, float(concurrent_mte_util))
-    mte_slowdown = (
-        1.0 + _MTE_SELF_CONTENTION * mte
-        + _MTE_VECTOR_CONTENTION * vector_demand
-        + _MTE_CUBE_CONTENTION * cube
+    """LEGACY_PURGED: unmeasured contention multipliers prohibited; use Engine + Topology."""
+    raise NotImplementedError(
+        "LEGACY_PURGED: wire discrete-event Engine + Topology + DirectPeerCollective instead of compute_a5_contention_slowdown"
     )
-    hbm_slowdown = (
-        1.0 + _HBM_MTE_CONTENTION * mte
-        + _HBM_VECTOR_CONTENTION * vector_demand
-        + _HBM_CUBE_CONTENTION * cube
-    )
-    cube_slowdown = (
-        1.0 + _CUBE_SELF_CONTENTION * cube
-        + _CUBE_MTE_CONTENTION * mte
-    )
-    vector_slowdown = 1.0
-    if mode == "aiv":
-        # AIV owns the vector pipe; more resident blocks and more concurrent
-        # vector demand extend the same ALU service time.
-        vector_slowdown = (
-            1.0
-            + vector_demand * (
-                _AIV_VECTOR_BASE_CONTENTION
-                + _AIV_VECTOR_OCCUPANCY_CONTENTION * occupancy
-            )
-            + _AIV_CUBE_CONTENTION * cube
-        )
-    total = max(vector_slowdown, mte_slowdown, hbm_slowdown, cube_slowdown)
-    transfer = (
-        _TRANSFER_BASE_MS
-        + _TRANSFER_MTE_MS * mte
-        + _TRANSFER_VECTOR_MS * vector_demand
-    )
-    sync = (
-        _SYNC_BASE_MS
-        + _SYNC_UTIL_MS * max(mte, vector_demand, cube)
-        + _SYNC_PER_AIV_BLOCK_MS * blocks
-    )
-    return {
-        "expansion_mode": mode,
-        "vector_slowdown": vector_slowdown,
-        "mte_slowdown": mte_slowdown,
-        "hbm_slowdown": hbm_slowdown,
-        "cube_slowdown": cube_slowdown,
-        "contention_slowdown": total,
-        "total_slowdown": total,
-        "overall_slowdown": total,
-        "vector_alu_slowdown": vector_slowdown,
-        "transfer_latency_ms": transfer, "sync_latency_ms": sync,
-        "transfer_ms": transfer, "sync_ms": sync,
-        "active_aiv_blocks": blocks,
-        "total_aiv_units": units,
-        "aiv_occupancy": occupancy,
-    }
 
 
 def evaluate_a5_mc2_chains(ingested=None):
-    """Summarize decomposed MC2 chain overlap and resolved expansion regime."""
-    data = _data_for(ingested)
-    rows = []
-    for chain in data.get("mc2_chains") or ():
-        dtype = _dtype(chain["dtype"])
-        legs = chain.get("legs_ms") or {}
-        chain_ms = float(chain["chain_p50_ms"])
-        sum_ms = float(chain.get("sum_leg_p50_ms") or sum(legs.values()))
-        if not math.isfinite(sum_ms) or sum_ms <= 0.0:
-            raise ModelingError(f"a5_mc2_chain_nonpositive_sum:{chain.get('condition')}")
-        ratio = chain_ms / sum_ms
-        concurrent = max(_MIN_MC2_CONCURRENT_UTIL, min(1.0, 1.0 - min(1.0, ratio)))
-        if any(key in chain for key in ("observed_expansion_mode",
-                                        "requested_expansion_mode",
-                                        "profiler_evidence")):
-            mode = resolve_expansion_regime(
-                chain.get("requested_expansion_mode"),
-                chain.get("observed_expansion_mode"),
-                profiler_evidence=chain.get("profiler_evidence"))["regime"]
-        else:
-            mode = _mode(chain.get("regime"))
-        contention = compute_a5_contention_slowdown(
-            mode,
-            concurrent_cube_util=_MC2_CUBE_UTIL_WEIGHT * concurrent,
-            concurrent_vector_util=_MC2_VECTOR_UTIL_WEIGHT * concurrent,
-            concurrent_mte_util=concurrent)
-        rows.append({
-            **chain, "dtype": dtype, "chain_p50_ms": chain_ms,
-            "sum_leg_p50_ms": sum_ms, "overlap_ratio": ratio,
-            "chain_over_sum": ratio,
-            "expansion_regime": mode,
-            "contention_degradation_multiplier": contention["contention_slowdown"],
-            "vector_slowdown": contention["vector_slowdown"],
-            "mte_slowdown": contention["mte_slowdown"],
-            "hbm_slowdown": contention["hbm_slowdown"],
-            "contended_chain_ms": chain_ms * contention["contention_slowdown"],
-        })
-    by_dtype = {}
-    for dtype in sorted({row["dtype"] for row in rows}):
-        subset = [row for row in rows if row["dtype"] == dtype]
-        ratios = sorted(row["overlap_ratio"] for row in subset)
-        multipliers = sorted(
-            row["contention_degradation_multiplier"] for row in subset)
-        by_dtype[dtype] = {
-            "count": len(subset),
-            "world_sizes": sorted({row["world_size"] for row in subset}),
-            "campaigns": sorted({row["campaign"] for row in subset}),
-            "overlap_ratio": {"min": ratios[0], "max": ratios[-1],
-                              "median": median(ratios),
-                              "mean": sum(ratios) / len(ratios)},
-            "contention_degradation_multiplier": {
-                "min": multipliers[0], "max": multipliers[-1],
-                "median": median(multipliers)},
-        }
-    quantized = [row for row in rows if row["dtype"] in {"int8", "fp8-e4m3"}]
-    ratios = sorted(row["overlap_ratio"] for row in quantized)
-    all_ratios = sorted(row["overlap_ratio"] for row in rows)
-    multipliers = sorted(
-        row["contention_degradation_multiplier"] for row in quantized)
-    return {
-        "schema": "a5-mc2-chain-evaluation/1", "hardware_key": A5_HARDWARE_KEY,
-        "arch_family": A5_ARCH_FAMILY, "chains": rows, "rows": rows,
-        "dtypes": sorted(by_dtype), "by_dtype": by_dtype,
-        "overlap_ratio": ({"min": ratios[0], "max": ratios[-1],
-                           "median": median(ratios),
-                           "mean": sum(ratios) / len(ratios)} if ratios else {}),
-        "all_overlap_ratio": (
-            {"min": all_ratios[0], "max": all_ratios[-1],
-             "median": median(all_ratios),
-             "mean": sum(all_ratios) / len(all_ratios)} if all_ratios else {}),
-        "contention_degradation": (
-            {"min": multipliers[0], "max": multipliers[-1],
-             "median": median(multipliers)} if multipliers else {}),
-    }
+    """LEGACY_PURGED: shadow MC2 contention evaluator prohibited; use Engine + Topology."""
+    raise NotImplementedError(
+        "LEGACY_PURGED: wire discrete-event Engine + Topology + DirectPeerCollective instead of evaluate_a5_mc2_chains"
+    )
 
 
 class _ManifestCell(dict):
@@ -1139,9 +975,12 @@ def _native_service_conditions(summary, path, groups):
             continue
         if str(row.get("collective")) not in _NATIVE_LOCAL_COLLECTIVE_SET:
             continue
-        if str(row.get("dtype") or "bf16").lower() not in {"bf16", "bfloat16"}:
+        raw_dtype = str(row.get("dtype") or "").strip().lower()
+        if not raw_dtype:
+            raise ValueError("native_service_condition_dtype_missing")
+        if raw_dtype not in {"bf16", "bfloat16"}:
             continue
-        if str(row.get("status") or "ok") != "ok":
+        if str(row.get("status") or "") != "ok":
             raise ValueError("native_service_condition_status_not_ok")
         active, call_samples = [], []
         payload = int(row.get("input_bytes") or 0)
@@ -1153,11 +992,11 @@ def _native_service_conditions(summary, path, groups):
                         or f"{row['collective']}:g{group}:{payload}")
         for rank_key, rank in sorted((int(key), value) for key, value in
                                      (row.get("per_rank") or {}).items()):
-            if (rank.get("canary_before_ok") is False
-                    or rank.get("canary_after_ok") is False
-                    or rank.get("mapping_ok") is False):
+            if (rank.get("canary_before_ok") is not True
+                    or rank.get("canary_after_ok") is not True
+                    or rank.get("mapping_ok") is not True):
                 raise ValueError("native_service_rank_evidence_failed")
-            if (rank.get("actual_bytes_match") is False
+            if (rank.get("actual_bytes_match") is not True
                     or int(rank.get("actual_input_bytes") or 0) != payload):
                 raise ValueError("native_service_actual_input_mismatch")
             calls = rank.get("calls") or ()
@@ -1203,9 +1042,14 @@ def _native_service_conditions(summary, path, groups):
                 active.append(median(samples))
             elif rank_values:
                 active.append(median(rank_values))
-        if not active or payload <= 0:
-            continue
-        split = str(row.get("split") or "train")
+            else:
+                raise ValueError(f"native_service_rank_timing_missing:{native_id}:{rank_key}")
+        if len(active) != len(rank_keys) or payload <= 0:
+            raise ValueError(f"native_service_incomplete_rank_coverage:{native_id}")
+        raw_split = str(row.get("split") or "").strip().lower()
+        if raw_split not in {"train", "heldout"}:
+            raise ValueError(f"native_service_split_missing_or_invalid:{native_id}:{raw_split!r}")
+        split = raw_split
         if split == "heldout":
             heldout.add(payload)
         conditions.append({

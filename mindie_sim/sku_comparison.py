@@ -78,11 +78,15 @@ def _workload_geometry(parsed, *, context: int | None,
                         else max(prompts or [0]))
     resolved_query = (int(query_tokens) if query_tokens is not None
                       else DEFAULT_QUERY_TOKENS)
+    dp_replicas = max(1, int(parallel.dp))
+    per_dp_requests = (
+        (len(prompts) + dp_replicas - 1) // dp_replicas
+        if prompts else int(parsed.runtime.max_num_seqs)
+    )
     return {
         "context": resolved_context,
         "query_tokens_per_sequence": resolved_query,
-        "sequences_per_dp": max(1, min(int(parsed.runtime.max_num_seqs),
-                                      int(parallel.dp))),
+        "sequences_per_dp": max(1, min(int(parsed.runtime.max_num_seqs), per_dp_requests)),
     }
 
 
@@ -219,9 +223,16 @@ def compare_skus(
     resolved: list[tuple[str, dict[str, Any]]] = []
     for spec in skus:
         label = _resolve_sku_label(spec)
-        composed = compose_case(hardware=spec if isinstance(spec, str) else
-                                str(spec.get("base_hardware") or "a5"),
-                                **base_kwargs)
+        if isinstance(spec, str):
+            hardware_target: Any = spec
+        else:
+            base_hw = spec.get("base_hardware")
+            if not base_hw:
+                raise NotImplementedError(
+                    "LEGACY_PURGED: wire explicit HardwareSpec mapping in sku_comparison without silent 'a5' fallback"
+                )
+            hardware_target = str(base_hw)
+        composed = compose_case(hardware=hardware_target, **base_kwargs)
         resolved.append((label, composed))
     geometry = _workload_geometry(parse_case(resolved[0][1]), context=context,
                                   query_tokens=query_tokens_per_sequence)
@@ -249,15 +260,16 @@ def compare_skus(
     reports = _run_tasks(baseline_tasks, workers)
     hints = {row["sku"]: int(row.get("base_b_hint") or 1) for row in reports}
     follow_tasks = []
-    for label, case_dict in resolved:
-        for scenario in scenarios[1:]:
-            follow_tasks.append((_evaluate_scenario, {
-                "sku": label, "case": case_dict, "sla_ms": sla_ms,
-                "context": geometry["context"],
-                "query_tokens_per_sequence": geometry["query_tokens_per_sequence"],
-                "max_batch": max_batch, "phase": phase, "scope": scope,
-                "scenario": scenario, "sensitivity": sensitivity,
-                "base_b_hint": hints.get(label, 1)}))
+    if has_sla:
+        for label, case_dict in resolved:
+            for scenario in scenarios[1:]:
+                follow_tasks.append((_evaluate_scenario, {
+                    "sku": label, "case": case_dict, "sla_ms": sla_ms,
+                    "context": geometry["context"],
+                    "query_tokens_per_sequence": geometry["query_tokens_per_sequence"],
+                    "max_batch": max_batch, "phase": phase, "scope": scope,
+                    "scenario": scenario, "sensitivity": sensitivity,
+                    "base_b_hint": hints.get(label, 1)}))
     extra = _run_tasks(follow_tasks, workers) if follow_tasks else []
     by_sku = {row["sku"]: row for row in reports}
     for row in extra:

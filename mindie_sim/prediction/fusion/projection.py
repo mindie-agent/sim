@@ -21,7 +21,7 @@ from typing import Any, Mapping
 from mindie_sim.schema.operators import OpSpec
 
 from mindie_sim.prediction.fusion.graph import (
-    DTYPE_BYTES, FeasibilityError, OpNode, TensorValue, TypedGraph, dtype_bytes,
+    FeasibilityError, OpNode, TensorValue, TypedGraph, dtype_bytes,
 )
 from mindie_sim.prediction.fusion.ports import (
     control_dependency_names, declared_control_names, full_operand_ports,
@@ -148,8 +148,9 @@ def _activation_bytes(op: OpSpec, meta: dict) -> int:
         if isinstance(value, (int, float)) and value > 0:
             return int(value)
     shape, _ = _shapes(op, _family_kind(op.family))
-    dtype = op.dtype or "bf16"
-    return max(0, int(math.prod(shape)) * dtype_bytes(dtype))
+    if not op.dtype:
+        raise FeasibilityError(f"projection_activation_dtype_missing:{op.op_id}")
+    return max(0, int(math.ceil(int(math.prod(shape)) * dtype_bytes(op.dtype))))
 
 
 def _declared_state(meta: dict) -> tuple[dict[str, int | None], dict[str, int | None]]:
@@ -225,8 +226,10 @@ def _weight_identity(op: OpSpec, kind: str, in_shape: tuple[int, ...],
         base, basis = int(packed), "packed_weight_bytes"
     elif kind in {"matmul", "grouped_matmul"} and len(in_shape) >= 2 \
             and len(out_shape) >= 2 and op.family != "native_fusion":
-        element = DTYPE_BYTES.get(str(meta.get("weight_dtype", op.dtype or "bf16")), 2)
-        base = int(in_shape[-1]) * int(out_shape[-1]) * element
+        weight_dt = str(meta.get("weight_dtype") or op.dtype or "").strip()
+        if not weight_dt:
+            raise FeasibilityError(f"projection_weight_dtype_missing:{op.op_id}")
+        base = int(math.ceil(int(in_shape[-1]) * int(out_shape[-1]) * dtype_bytes(weight_dt)))
         basis = "shape_k_times_n"
     else:
         return 0, "no_static_weight"
@@ -475,27 +478,32 @@ def _project_weights(op, meta, kind, in_shape, out_shape, dtype,
             meta.get("weight_format")
             or meta.get("weight_dtype")
             or (abi.weight_dtype if abi is not None else dtype)
-        )
-        element = int(DTYPE_BYTES.get(weight_dtype, 2))
+            or ""
+        ).strip()
+        if not weight_dtype:
+            raise FeasibilityError(f"projection_weight_dtype_missing:{op.op_id}")
+        element = dtype_bytes(weight_dtype)
         if kind in {"matmul", "grouped_matmul"} and len(in_shape) >= 2:
             weight_shape = (int(in_shape[-1]), int(out_shape[-1]))
         else:
-            weight_shape = (1, weight_bytes // max(1, element))
-        layout = str(
+            weight_shape = (1, int(weight_bytes / element))
+        raw_layout = str(
             meta.get("weight_layout")
-            or (abi.weight_layout.lower() if abi is not None else "contiguous")
-        )
+            or (abi.weight_layout if abi is not None else "contiguous")
+        ).strip().lower()
+        layout = "nz" if raw_layout == "fractal_nz" else raw_layout
+        if layout not in {"contiguous", "nd", "nz"}:
+            raise FeasibilityError(f"projection_weight_layout_unsupported:{op.op_id}:{raw_layout}")
         values[weight_id] = TensorValue(
             weight_id, weight_dtype, weight_shape, role="weight",
-            storage_bytes=weight_bytes, sharded=True, layout=layout
-            if layout in {"contiguous", "nd", "nz"} else "contiguous")
+            storage_bytes=weight_bytes, sharded=True, layout=layout)
         input_ids.append(weight_id)
     if kind in _NORM_KINDS and meta.get("norm_has_weight") is not False:
         gamma_id = f"{op.op_id}:gamma"
         hidden = int(in_shape[-1]) if in_shape else 1
         values[gamma_id] = TensorValue(
             gamma_id, dtype, (hidden,), role="weight",
-            storage_bytes=hidden * dtype_bytes(dtype), sharded=True)
+            storage_bytes=int(math.ceil(hidden * dtype_bytes(dtype))), sharded=True)
         input_ids.append(gamma_id)
 
 
@@ -504,7 +512,7 @@ def _project_outputs(op, meta, dtype, out_dtype, out_shape, values):
         value_id = f"{op.op_id}:return:{index}"
         values[value_id] = TensorValue(
             value_id, dtype, (1,), role="scale", producer=op.op_id,
-            storage_bytes=dtype_bytes(dtype), sharded=True)
+            storage_bytes=int(math.ceil(dtype_bytes(dtype))), sharded=True)
     output_ids: list[str] = []
     primary_id = f"{op.op_id}:out"
     port_records = projected_ports(op.metadata)
@@ -512,17 +520,18 @@ def _project_outputs(op, meta, dtype, out_dtype, out_shape, values):
         (record for record in port_records if record.port_id == primary_id),
         None)
     if primary_record is not None:
+        raw_prim = str(primary_record.layout or "").strip().lower()
+        prim_layout = "nz" if raw_prim == "fractal_nz" else raw_prim
         values[primary_id] = TensorValue(
             primary_id, primary_record.dtype, primary_record.shape,
             role=("output" if primary_record.public or not op.deps
                   else "activation"),
             producer=op.op_id, storage_bytes=primary_record.storage_bytes,
             sharded=True,
-            layout=(primary_record.layout
-                    if primary_record.layout in
-                    {"contiguous", "nd", "nz", "strided", "view"}
-                    else "contiguous"), public=primary_record.public)
+            layout=prim_layout, public=primary_record.public)
     else:
+        raw_op_layout = str(op.layout or "contiguous").strip().lower()
+        op_layout = "nz" if raw_op_layout == "fractal_nz" else raw_op_layout
         values[primary_id] = TensorValue(
             primary_id, out_dtype, out_shape,
             role="output" if not op.deps else "activation",
@@ -531,21 +540,19 @@ def _project_outputs(op, meta, dtype, out_dtype, out_shape, values):
                            if int(meta.get("write_bytes", 0) or 0) > 0
                            else None),
             sharded=True,
-            layout=(op.layout if op.layout in
-                    {"contiguous", "nd", "nz", "strided", "view"}
-                    else "contiguous"))
+            layout=op_layout)
     output_ids.append(primary_id)
     for record in port_records:
         if record.port_id == primary_id:
             continue
+        raw_rec = str(record.layout or "").strip().lower()
+        rec_layout = "nz" if raw_rec == "fractal_nz" else raw_rec
         values[record.port_id] = TensorValue(
             record.port_id, record.dtype, record.shape,
             role="output" if record.public else "activation",
             producer=op.op_id, storage_bytes=record.storage_bytes,
             sharded=True,
-            layout=(record.layout if record.layout in
-                    {"contiguous", "nd", "nz", "strided", "view"}
-                    else "contiguous"), public=record.public)
+            layout=rec_layout, public=record.public)
         output_ids.append(record.port_id)
     return output_ids
 
@@ -607,7 +614,9 @@ def project_graph(case, ops: tuple[OpSpec, ...], *,
     external: list[str] = []
     opaque = frozenset(opaque_ops)
     external_names = frozenset(external_data)
-    dtype = str(getattr(getattr(case, "model", None), "activation_dtype", "bf16"))
+    dtype = str(getattr(getattr(case, "model", None), "activation_dtype", "") or "").strip()
+    if not dtype:
+        raise FeasibilityError("projection_model_activation_dtype_missing")
     tensor_parallel = int(getattr(getattr(case, "runtime", None), "parallel", None)
                           and getattr(case.runtime.parallel, "tp", 1) or 1)
     state_outputs: dict[tuple[str, int], str] = {}

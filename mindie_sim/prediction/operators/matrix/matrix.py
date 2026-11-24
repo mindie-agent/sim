@@ -20,7 +20,7 @@ from mindie_sim.prediction.program import (KernelProgram, ParallelProgram, Pipel
 from .refill import RefillPipeline
 from .matrix_epilogue import MatrixEpilogue
 from mindie_sim.prediction.ownership import read_role
-from .matrix_traffic import FP32_BYTES
+FP32_BYTES = 4
 
 DEFAULT_TILE_EDGE = 128
 DEFAULT_REFILL_TILE_MN = 256

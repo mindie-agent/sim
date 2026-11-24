@@ -36,7 +36,7 @@ from mindie_sim.prediction.mechanism import OperatorPlan, Work
 from mindie_sim.prediction.ownership import read_role
 from mindie_sim.prediction.program import KernelProgram, Stage
 from .w4a8_matrix import matrix_program, matrix_work
-from mindie_sim.prediction.operators.matrix.matrix_traffic import FP32_BYTES
+FP32_BYTES = 4
 from .w4a8_schedule import (
     MSD_FLOPS_PER_K_STEP, MSD_WORKSPACE_BYTES_PER_OUTPUT, NZ_N_ALIGNMENT,
     POST_DEQUANT_OPS_PER_OUTPUT, PRE_OPS_PER_INPUT, QUANT_OPS_PER_OUTPUT,

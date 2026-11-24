@@ -1174,24 +1174,9 @@ def execute_native_cohort_graph(
             if prev_end is not None and lo_ms + COHORT_CROSS_LAYER_OVERLAP_EPS_MS < prev_end:
                 return _literal_run()
             prev_by_scope_stage[ss] = hi_ms
-        pid_dur_ms = _price_depth_varying_ops(
-            eff_case, diff_ops_by_key, evaluation=evaluation, recipes=recipes,
+        raise NotImplementedError(
+            "LEGACY_PURGED: wire TransitionEquivalenceProof (intra-layer DAG + L2 residency fingerprint) or literal Engine execution in layer_runs.py"
         )
-        total_ms = float(red_report["duration_ms"])
-        for l_key, rep_key in skip_map.items():
-            entry = bounds.get(rep_key)
-            rep_span = (float(entry[2]) - float(entry[1])) if entry is not None else 0.0
-            delta = sum(
-                float(pid_dur_ms[pid_l]) - float(pid_dur_ms[pid_r])
-                for pid_r, pid_l in layer_diffs.get(l_key, {}).values()
-            )
-            total_ms += rep_span + delta
-        out = dict(red_report)
-        out.pop("layer_bounds", None)
-        out["duration_ms"] = total_ms
-        out["complete_ms"] = float(red_report.get("input_ready_ms", 0.0) or 0.0) + total_ms
-        out["fast_span_only"] = True
-        return out, reduced_map, op_rep_map
 
     red_report = graph_costs(
         eff_case, reduced_arg, recipes=recipes, external_inputs=external_inputs,
@@ -1210,30 +1195,6 @@ def execute_native_cohort_graph(
     if _has_cross_layer_overlap(tl_by_layer, sorted(rep_layers)):
         return _literal_run()
 
-    pid_dur_ms = _price_depth_varying_ops(
-        eff_case, diff_ops_by_key, evaluation=evaluation, recipes=recipes,
+    raise NotImplementedError(
+        "LEGACY_PURGED: wire TransitionEquivalenceProof (intra-layer DAG + L2 residency fingerprint) or literal Engine execution in layer_runs.py"
     )
-    total_ms = float(red_report["duration_ms"])
-    for l_key, rep_key in skip_map.items():
-        rows_rep = tl_by_layer.get(rep_key, ())
-        rep_span = (
-            max(float(r["complete_ms"]) for r in rows_rep) - min(float(r["ready_ms"]) for r in rows_rep)
-            if rows_rep else 0.0
-        )
-        delta = sum(
-            float(pid_dur_ms[pid_l]) - float(pid_dur_ms[pid_r])
-            for pid_r, pid_l in layer_diffs.get(l_key, {}).values()
-        )
-        total_ms += rep_span + delta
-
-    out = dict(red_report)
-    out["duration_ms"] = total_ms
-    out["complete_ms"] = float(red_report.get("input_ready_ms", 0.0) or 0.0) + total_ms
-    expanded = _expand_cohort_timeline(
-        red_timeline, body_key_by_op, by_layer, skip_map, layer_diffs, pid_dur_ms,
-    )
-    out["timeline"] = expanded
-    out["operator_occurrences"] = sum(
-        1 for r in expanded if str(r.get("family", "")) != "barrier"
-    )
-    return out, reduced_map, op_rep_map

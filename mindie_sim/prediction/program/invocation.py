@@ -229,75 +229,11 @@ def _constraints(context, timing):
     return tuple(constraints)
 
 
-#: arch3510 FP32 vector lanes and owners per die; both are declaration inputs.
-FP32_LANES = 64
-A5_VECTOR_UNITS = 64
-#: The 32x32-block FP8 NZ projection form needs a dedicated L1 permutation and
-#: tiling setup on every AIC before its declared matrix pipeline may start.
-#: Its cycles are fixed by the kernel prologue and drain, so the total duration
-#: stays monotonic in work: adding a tile never removes the setup span.
-NZ_BLOCK32_WEIGHT_REPRESENTATION = "fp8_block32x32_fp8_e8m0"
-NZ_BLOCK32_RECIPES = frozenset({"kv_a", "wkv_kv_a", "kv_a_proj"})
-NZ_BLOCK32_PROLOGUE_CYCLES = 12375
-
-
-def _arch35(context) -> bool:
-    """A5 ``DAV_3510`` capability, read from the declared physical mechanism."""
-    mechanisms = getattr(context, "physical_mechanisms", None)
-    hierarchy = getattr(mechanisms, "memory_hierarchy", None)
-    arch = dict(getattr(hierarchy, "provenance", {}) or {}).get("arch")
-    if arch:
-        return str(arch).startswith("DAV_3510")
-    units = getattr(context, "resource_units", {}) or {}
-    return int(units.get("vector", 0)) >= A5_VECTOR_UNITS
-
-
-def _clock_per_ms(context) -> float:
-    """Declared vector clock in cycles per millisecond."""
-    names = context.resource_names
-    vector = names.get("vector")
-    if vector is not None and vector in context.rates:
-        units = max(1, int(context.resource_units.get("vector", A5_VECTOR_UNITS)))
-        return float(context.rates[vector]) / (units * FP32_LANES)
-    cube = names.get("cube")
-    return float(context.rates.get(cube, 1.0)) if cube else 1.0
-
-
-def _block32_prologue_ms(context):
-    """A5 32x32-block NZ matrix setup span, or ``None`` outside that domain."""
-    if context.service_boundary != "device_kernel" or not _arch35(context):
-        return None
-    op = context.op
-    if str(getattr(op, "recipe", "")) not in NZ_BLOCK32_RECIPES:
-        return None
-    metadata = dict(getattr(op, "metadata", ()) or ())
-    if metadata.get("weight_representation") != NZ_BLOCK32_WEIGHT_REPRESENTATION:
-        return None
-    return NZ_BLOCK32_PROLOGUE_CYCLES / _clock_per_ms(context)
-
-
-@dataclass(frozen=True)
-class _PrologueProgram:
-    """One declared kernel prologue/drain around an already-prepared body."""
-
-    body: Program
-    latency_ms: float
-
-    def start(self, engine, name, ready, *, owner=""):
-        prologue = engine.submit(name + ":prologue", after=(ready,),
-                                 latency=self.latency_ms, owner=owner)
-        return self.body.start(engine, name + ":body", prologue, owner=owner)
-
-
 def lower_invocation(recipe, context):
     timing = context.invocation_timing
-    prologue = _block32_prologue_ms(context)
     if timing is None:
-        body = recipe.lower(context)
-        return _PrologueProgram(body, prologue) if prologue else body
+        return recipe.lower(context)
     body = recipe.lower(replace(context, minimum_ms=0, invocation_timing=None))
-    if prologue:
-        body = _PrologueProgram(body, prologue)
     constraints = _constraints(context, timing)
     # Keep ``timing`` as the invocation's own declaration; the merged floor
     # stays in ``constraints`` so its provenance is never overwritten.

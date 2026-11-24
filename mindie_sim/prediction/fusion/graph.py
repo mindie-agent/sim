@@ -17,9 +17,8 @@ from dataclasses import dataclass
 import math
 from typing import Any, Iterable, Mapping
 
-DTYPE_BYTES = {"bf16": 2, "fp16": 2, "fp32": 4, "tf32": 4, "int64": 8,
-               "int32": 4, "int16": 2, "int8": 1, "uint8": 1, "fp8": 1,
-               "fp8_e4m3": 1, "fp8_e5m2": 1, "int4": 1, "fp4": 1}
+from mindie_sim.schema.common import ModelingError, dtype_bytes as _canonical_dtype_bytes
+
 TILE_ROWS = (1, 2, 4, 8, 16, 32, 64)
 UB_ALIGNMENT = 32
 CUBE_KINDS = frozenset({"matmul", "grouped_matmul", "attention", "mla_prolog"})
@@ -49,10 +48,10 @@ def _numel(shape: tuple[int, ...]) -> int:
     return total
 
 
-def dtype_bytes(dtype: str) -> int:
+def dtype_bytes(dtype: str) -> float:
     try:
-        return DTYPE_BYTES[dtype]
-    except KeyError as exc:
+        return _canonical_dtype_bytes(dtype)
+    except ModelingError as exc:
         raise FeasibilityError(f"dtype_storage_unknown:{dtype}") from exc
 
 
@@ -99,7 +98,7 @@ class TensorValue:
     @property
     def nbytes(self) -> int:
         return (int(self.storage_bytes) if self.storage_bytes is not None
-                else _numel(self.shape) * dtype_bytes(self.dtype))
+                else int(math.ceil(_numel(self.shape) * dtype_bytes(self.dtype))))
 
     @property
     def materialized(self) -> bool:

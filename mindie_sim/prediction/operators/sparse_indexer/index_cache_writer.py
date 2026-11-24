@@ -35,7 +35,6 @@ from mindie_sim.prediction.ownership import read_role, unit_group
 from mindie_sim.prediction.program import KernelProgram, ParallelProgram, Stage
 
 C8_INDEXER_CACHE_RECIPE = "cann_indexer_quant_cache_c8"
-LEGACY_INDEXER_CACHE_RECIPE = "indexer_quant_cache"
 SCATTER_PA_KV_RECIPE = "scatter_pa_kv_cache"
 QSA_DUAL_CACHE_RECIPE = "qsa_index_cache_write"
 REGION_SUMMARY_RECIPE = "region_summary_cache_update"
@@ -374,7 +373,6 @@ def recipes() -> dict[str, PlannedRecipe]:
     planner = PlannedRecipe(build_index_cache_writer)
     return {
         C8_INDEXER_CACHE_RECIPE: planner,
-        LEGACY_INDEXER_CACHE_RECIPE: planner,  # REMOVE-ON-W1-MERGE (mla/mla_epilogs.py:44)
         SCATTER_PA_KV_RECIPE: planner,
         QSA_DUAL_CACHE_RECIPE: planner,
         REGION_SUMMARY_RECIPE: planner,
@@ -383,7 +381,6 @@ def recipes() -> dict[str, PlannedRecipe]:
 
 __all__ = [
     "C8_INDEXER_CACHE_RECIPE",
-    "LEGACY_INDEXER_CACHE_RECIPE",
     "QSA_DUAL_CACHE_RECIPE",
     "REGION_SUMMARY_RECIPE",
     "SCATTER_PA_KV_RECIPE",

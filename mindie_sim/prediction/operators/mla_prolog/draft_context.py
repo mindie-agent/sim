@@ -100,7 +100,7 @@ def _prolog_work(op):
 
 
 def _prolog_program(context):
-    read_share = io_weight(context, "hbm")
+    read_share = io_weight(context, "hbm_read")
     write_share = io_weight(context, "hbm_write")
     return tiled_phased_program(context, (
         Phase("context_load", {"hbm": read_share, "mte2": PROLOG_MEMORY_SHARE}),
@@ -112,7 +112,7 @@ def _prolog_program(context):
 
 
 def _scatter_program(context):
-    read_share = io_weight(context, "hbm")
+    read_share = io_weight(context, "hbm_read")
     write_share = io_weight(context, "hbm_write")
     return tiled_phased_program(context, (
         Phase("gather_rank_rows", {"hbm": read_share, "mte2": PROLOG_MEMORY_SHARE}),

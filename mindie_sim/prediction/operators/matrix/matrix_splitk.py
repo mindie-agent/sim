@@ -48,7 +48,6 @@ ROUTER_TILE_N = 256
 #: Split-K slices are nonempty integer K elements; a split grid may never price
 #: more partials than the K extent can populate.
 ROUTER_K_GRANULE = 1
-ROUTER_PROLOGUE_DRAIN_CYCLES = 8250
 A5_AIC_UNITS = 32
 
 
@@ -125,13 +124,13 @@ def _router_recipe(op, geometry):
     rates = {names[role]: float(rate) / MS_PER_SECOND
              for role, rate in declared_rates.items() if role in names}
     peaks = dict(getattr(geometry, "compute_peaks", ()))
-    compute = str(dict(op.metadata).get("compute_format", op.dtype or "bf16"))
-    try:
-        peak = float(peaks[compute])
-    except KeyError:
-        cube = 0.0
-    else:
-        cube = MS_PER_SECOND * float(op.flops) / peak
+    compute = str(dict(op.metadata).get("compute_format") or op.dtype or "").strip()
+    if not compute:
+        raise ModelingError("router_compute_format_missing")
+    if compute not in peaks or float(peaks[compute]) <= 0.0:
+        raise ModelingError(f"router_compute_peak_missing:{compute}")
+    peak = float(peaks[compute])
+    cube = MS_PER_SECOND * float(op.flops) / peak
     context = RecipeContext(
         op, {names["cube"]: cube} if cube else {}, names, rates,
         int(getattr(geometry, "compute_units", A5_AIC_UNITS)),
@@ -152,10 +151,12 @@ def router_matrix_operand_bytes(op, geometry, *, recipe=None) -> float:
     """
     m, n, k = (int(value) for value in op.local_shape[-LOCAL_SHAPE_DIMS:])
     meta = dict(op.metadata)
-    input_bytes = float(m * k * dtype_bytes(
-        meta.get("input_format", op.dtype or "bf16")))
-    weight_bytes = float(n * k * dtype_bytes(
-        meta.get("weight_format", op.dtype or "bf16")))
+    input_fmt = str(meta.get("input_format") or op.dtype or "").strip()
+    weight_fmt = str(meta.get("weight_format") or op.dtype or "").strip()
+    if not input_fmt or not weight_fmt:
+        raise ModelingError("router_operand_format_missing")
+    input_bytes = float(m * k * dtype_bytes(input_fmt))
+    weight_bytes = float(n * k * dtype_bytes(weight_fmt))
     recipe = _router_recipe(op, geometry) if recipe is None else recipe
     return (input_bytes * -(-n // recipe.tile_n)
             + weight_bytes * -(-m // recipe.tile_m))
@@ -221,7 +222,9 @@ def build_router_splitk(op, geometry):
     resources["mte2"] = matrix_mte2
     matrix = dict(base.matrix)
     if not any(float(val) > 0.0 for val in matrix.values()) and float(op.flops) > 0.0:
-        compute_fmt = str(dict(op.metadata).get("compute_format") or "bf16")
+        compute_fmt = str(dict(op.metadata).get("compute_format") or op.dtype or "").strip()
+        if not compute_fmt:
+            raise ModelingError("router_compute_format_missing")
         matrix = {compute_fmt: float(op.flops)}
     base = Work(matrix=matrix, resources=resources)
     m, n, k = (int(value) for value in op.local_shape[-LOCAL_SHAPE_DIMS:])
@@ -251,24 +254,9 @@ def build_router_splitk(op, geometry):
     plan_work = base + extra
 
     def program(context):
-        clock_ms = _require_clock_hz(context, geometry) / MS_PER_SECOND
-        extra_demand = context.bind(extra)
-        matrix_demand = {key: value - extra_demand.get(key, 0)
-                         for key, value in context.work.items()}
-        matrix_demand = {key: value for key, value in matrix_demand.items()
-                         if value > 0}
-        matrix_op = replace(
-            context.op, mte2_bytes=declared_mte2,
-            hbm_bytes=declared_mte2 + declared_mte3,
-            vector_ops=declared_vector)
-        body = splitk_program(
-            replace(context, op=matrix_op, work=matrix_demand), splits,
-            recipe=recipe, ws_l2_resident=ws_l2)
-        return KernelProgram((
-            Stage("router_prologue_drain",
-                  latency=ROUTER_PROLOGUE_DRAIN_CYCLES / clock_ms),
-            Stage("split_k", after=("router_prologue_drain",), program=body),
-        ))
+        raise NotImplementedError(
+            "LEGACY_PURGED: wire calibrated PrimitiveTable P15/P02/P03 setup in build_router_splitk instead of ROUTER_PROLOGUE_DRAIN_CYCLES=8250"
+        )
 
     return OperatorPlan(plan_work, program, {
         "execution_abstraction": "finite_split_k_workspace",
@@ -657,8 +645,10 @@ def splitk_program(context, split_count: int, *, recipe=None, geometry=None,
     vector_merge = (float(splits - 1) * total_m * n
                     if vector is not None else 0)
     pt = getattr(context, "primitive_table", None)
-    elem_bytes = int(dtype_bytes(dict(context.op.metadata).get(
-        "compute_format", context.op.dtype or "bf16")))
+    compute_fmt = str(dict(context.op.metadata).get("compute_format") or context.op.dtype or "").strip()
+    if not compute_fmt:
+        raise ModelingError("splitk_compute_format_missing")
+    elem_bytes = int(dtype_bytes(compute_fmt))
     tile_m_dim = min(total_m, float(recipe.tile_m)) if recipe is not None else total_m
     tile_n_dim = min(n, float(recipe.tile_n)) if recipe is not None else n
     tile_k_dim = int(recipe.tile_k) if recipe is not None else 0

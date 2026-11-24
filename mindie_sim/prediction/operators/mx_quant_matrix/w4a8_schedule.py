@@ -34,7 +34,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from mindie_sim.prediction.mechanism import Work
-from mindie_sim.prediction.operators.matrix.matrix_traffic import FP32_BYTES
+FP32_BYTES = 4
 
 NZ_N_ALIGNMENT = 64
 COLUMN_SCALE_BYTES = 8

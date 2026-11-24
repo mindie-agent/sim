@@ -89,8 +89,6 @@ TRITON_CHUNK_LAUNCH_COUNT = 11  # 7 Triton kernels + 4 eager ops (Mul, 3x ZerosL
 CV_ROUNDTRIP_PAIRED_SYNCS = 1  # p13_paired_ms already measures one AIC<->AIV roundtrip
 STATE_MASK_CAST_PASSES = 6  # chunk_delta_h.py:161-244: b_w/b_k masks+casts, b_v mask+cast, gk exp2
 REC_FLAGS_PER_TOKEN = 16  # 6 MTE2 + 2 l2norm V_S/S_V + 6 PIPE_V barriers + 2 MTE3 stores
-ARCH22_REDUCE_DIVISOR = 8.0
-ARCH22_SFU_DIVISOR = 4.0
 SOLVE_TRIL_ROW_OPS_MULT = 4  # solve_tril.py:221-236: neg-load, bcast+mul, reduce, where
 INTER_AIV_WRITTEN_K_TILES = 3  # kda.py:736-746: AIV writes b_q, b_k_i, b_k_j to CV workspace
 INTER_AIC_READ_K_TILES = 4  # kda.py:745-746: 2 FP32 dots read 2 LHS + 2 RHS K tiles
@@ -124,7 +122,6 @@ TRITON_OUT_CV_HANDOFFS = 1  # chunk_gla_fwd_kernel_o num_stages=4 fuses 3 dots b
 MS_PER_S_KDA = 1000.0
 COMPACT_THRESHOLD = 4
 COMPACT_WINDOW = 2
-HBM_BURST_FALLBACK_BYTES = 512
 
 
 def _next_power_of_2(value: int) -> int:
@@ -137,48 +134,41 @@ def _next_power_of_2(value: int) -> int:
 def _hbm_burst_granule(ctx: OperatorPlanningContext) -> int:
     """Return calibrated HBM burst granule in bytes (512B on Arch22, 256B on Arch35)."""
     table = getattr(ctx, "primitive_table", None)
-    if table is not None and hasattr(table, "cell"):
-        try:
-            params = table.cell("P01_datacopy").parameters or {}
-            gran = int(params.get("hbm_burst_granule_bytes") or 0)
-            if gran > 0:
-                return gran
-        except Exception:
-            pass
-    return HBM_BURST_FALLBACK_BYTES
+    if table is None or not hasattr(table, "cell"):
+        raise ModelingError("triton_kda_hbm_burst_granule_requires_primitive_table")
+    params = table.cell("P01_datacopy").parameters or {}
+    gran = int(params.get("hbm_burst_granule_bytes") or 0)
+    if gran <= 0:
+        raise ModelingError("triton_kda_hbm_burst_granule_missing")
+    return gran
 
 
 def _reduce_rate_ratio(rc: RecipeContext) -> float:
     """Ratio of vector ALU rate to calibrated P09 reduce rate (or vector_reduce service rate)."""
     table = getattr(rc, "primitive_table", None)
     if table is not None and hasattr(table, "cell"):
-        try:
-            alu = table.cell("P07_vec_alu").band("vec_alu_ops_per_s_per_aiv").p50
-            red = table.cell("P09_vec_reduce_cast").band("vec_reduce_ops_per_s_per_aiv").p50
-            if alu and red and red > 0.0:
-                return max(1.0, float(alu) / float(red))
-        except Exception:
-            pass
+        alu = table.cell("P07_vec_alu").band("vec_alu_ops_per_s_per_aiv").p50
+        red = table.cell("P09_vec_reduce_cast").band("vec_reduce_ops_per_s_per_aiv").p50
+        if alu and red and red > 0.0:
+            return max(1.0, float(alu) / float(red))
     vec_key = rc.resource_names.get("vector", "vector")
     vec_rate = float(rc.rates.get(vec_key, rc.rates.get("vector", 0.0)) or 0.0) * MS_PER_S_KDA
     red_rate = rc.service_rate("vector_reduce")
     if vec_rate > 0.0 and red_rate and red_rate > 0.0:
         return max(1.0, vec_rate / float(red_rate))
-    return ARCH22_REDUCE_DIVISOR
+    raise ModelingError("triton_kda_reduce_rate_ratio_requires_primitive_table_or_service_rate")
 
 
 def _sfu_rate_ratio(rc: RecipeContext) -> float:
     """Ratio of vector ALU rate to calibrated P08 SFU rate when bound."""
     table = getattr(rc, "primitive_table", None)
-    if table is not None and hasattr(table, "cell"):
-        try:
-            alu = table.cell("P07_vec_alu").band("vec_alu_ops_per_s_per_aiv").p50
-            sfu = table.cell("P08_vec_sfu").band("vec_sfu_ops_per_s_per_aiv").p50
-            if alu and sfu and sfu > 0.0:
-                return max(1.0, float(alu) / float(sfu))
-        except Exception:
-            pass
-    return ARCH22_SFU_DIVISOR
+    if table is None or not hasattr(table, "cell"):
+        raise ModelingError("triton_kda_sfu_rate_ratio_requires_primitive_table")
+    alu = table.cell("P07_vec_alu").band("vec_alu_ops_per_s_per_aiv").p50
+    sfu = table.cell("P08_vec_sfu").band("vec_sfu_ops_per_s_per_aiv").p50
+    if alu and sfu and sfu > 0.0:
+        return max(1.0, float(alu) / float(sfu))
+    raise ModelingError("triton_kda_sfu_rate_ratio_missing")
 
 
 def _fixed_stage(name: str, duration_ms: float, after: tuple[str, ...] = ()) -> Stage:

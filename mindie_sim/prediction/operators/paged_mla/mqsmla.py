@@ -34,24 +34,8 @@ SOURCE = {
     "symbol": "mixed_quant_sparse_flash_mla",
     "scope": "independent_source_semantics; not_capture_binary_identity",
 }
-#: Retained prototype alias; explicit selection keeps its own guard rails.
-LEGACY_SOURCE = {
-    "repository": "archived-prototype-dsl",
-    "revision": "4519e5372a8b9306f7d823688c0cb8141ee34fb1",
-    "kernel": {
-        "path": "samples/mixed_quant_sparse_flash_mla/mixed_quant_sparse_flash_mla.py",
-        "sha256": "40b5b14ced15bb7c3d3687ab7387d508a19065eb5353dfb0675348e0de22fa3f",
-    },
-    "metadata": {
-        "path": "samples/mixed_quant_sparse_flash_mla_metadata/mixed_quant_sparse_flash_mla_metadata.py",
-        "sha256": "a62295be0fdf6acc7c0c606e60424e3fbc03310bee4e1effa2a384ccd6415b65",
-    },
-    "capture_binary_identity": "not_established",
-}
 RECIPE = "aclnn_mixed_quant_sparse_flash_mla"
-LEGACY_RECIPE = "dsl_mixed_quant_sparse_flash_mla"
 NATIVE_KIND = "aclnnMixedQuantSparseFlashMla"
-LEGACY_NATIVE_KIND = "MqsmlaKernel___call__"
 SUPPORTED_PHASES = frozenset({"decode", "draft"})
 
 # Source Channel depths. BF16 output aliases the FP32 accumulator. The P NZ
@@ -92,12 +76,6 @@ SOFTMAX_ROW_REDUCE_OPS = 26
 ACCUM_NONFIRST_OPS = 3
 # Declared AIC ownership bounds of the source wrapper.
 MAX_MQSMLA_AIC_CORES = 36
-# The retained SELECTIVE_FD_72 wrapper is a distinct split-reduction geometry
-# that this whole-row program does not model.
-SELECTIVE_FD_AIC_CORES = 32
-SELECTIVE_FD_QUERY_ROWS = 72
-SELECTIVE_FD_ORIGINAL_ROWS = 128
-SELECTIVE_FD_COMPRESSED_ROWS = 512
 #: ``aclnnMixedQuantSparseFlashMla`` packed-KV modes of the arch35 kernel.
 KV_QUANT_BF16 = 0
 KV_QUANT_FP8 = 1
@@ -136,18 +114,6 @@ def supported_heads(heads):
 
 def _phase_key(stream, head_counts, index):
     return (*stream.key(index), head_counts[bisect_right(stream.ends, index)])
-
-
-def selective_fd_excluded(cores, rows):
-    """True for the retained SELECTIVE_FD_72 wrapper geometry.
-
-    One predicate is shared by the builder and by automatic binding preflight
-    so a policy can never select a geometry the planner would reject.
-    """
-    return (cores == SELECTIVE_FD_AIC_CORES
-            and len(rows) == SELECTIVE_FD_QUERY_ROWS
-            and all(tuple(row) == (SELECTIVE_FD_ORIGINAL_ROWS,
-                                  SELECTIVE_FD_COMPRESSED_ROWS) for row in rows))
 
 
 def query_rows(shape):
@@ -400,16 +366,6 @@ def build(op, geometry):
     meta = dict(op.metadata)
     shape = meta["mqsmla_geometry"]
     requested = str(shape.get("addressing", "scalar"))
-    implementation = str(shape.get("implementation", op.recipe or RECIPE))
-    legacy = (implementation == LEGACY_RECIPE
-              or op.recipe == LEGACY_RECIPE
-              or meta.get("native_kind") == LEGACY_NATIVE_KIND)
-    view = dict(meta.get("attention_tensor_view") or {})
-    if legacy and (
-            shape.get("packed_row_bytes") is not None
-            or view.get("original_cache_row_bytes", ORIGINAL_CACHE_ROW_BYTES) != ORIGINAL_CACHE_ROW_BYTES
-            or view.get("compressed_cache_row_bytes", COMPRESSED_CACHE_ROW_BYTES) != COMPRESSED_CACHE_ROW_BYTES):
-        raise ModelingError("mqsmla_legacy_dsl_requires_mixed_fp8_fp4_cache")
     heads = int(shape["heads"])
     if (not supported_heads(heads) or shape["width"] != MQSMLA_HEAD_WIDTH
             or shape["metadata_support_fd"]):
@@ -422,10 +378,6 @@ def build(op, geometry):
     cores = geometry.compute_units
     if not rows or not 1 <= cores <= MAX_MQSMLA_AIC_CORES:
         raise ModelingError("mqsmla_requires_positive_rows_and_at_most36_aic")
-    # The retired custom-DSL wrapper's SELECTIVE_FD_72 split reduction is
-    # not the official CANN program. Keep the guard only for its explicit alias.
-    if legacy and selective_fd_excluded(cores, rows):
-        raise ModelingError("mqsmla_selective_72_row_fd_branch_not_modeled")
     head_groups = tuple(min(DEFAULT_MQSMLA_HEADS, heads - start)
                         for start in range(HEAD_GROUP_START, heads, DEFAULT_MQSMLA_HEADS))
     row_heads = tuple(group for _ in rows for group in head_groups)
@@ -444,7 +396,7 @@ def build(op, geometry):
         if preset not in _ARCH35_PRESETS:
             raise ModelingError(f"mqsmla_fp8_fp4_requires_arch35:{preset or 'unset'}")
     if quant_mode is not None:
-        if legacy or quant_mode not in KV_QUANT_MODES:
+        if quant_mode not in KV_QUANT_MODES:
             raise ModelingError("mqsmla_kv_quant_mode_unsupported")
         return _quant_plan(shape, streams, int(quant_mode), addressing)
     for pool, amount in BUFFERS.items():
@@ -474,8 +426,8 @@ def build(op, geometry):
 
     return OperatorPlan(total, program, {
         "source_execution_domain": "mixed",
-        "source_program": LEGACY_SOURCE if legacy else SOURCE,
-        "native_kind": LEGACY_NATIVE_KIND if legacy else NATIVE_KIND,
+        "source_program": SOURCE,
+        "native_kind": NATIVE_KIND,
         "mqsmla_owner_ranges": ownership, "mqsmla_buffers_per_owner": BUFFERS,
         "mqsmla_schedule": "whole_query_rows;metadata_SUPPORT_FD_false;two_live_phase_tiles",
         "mqsmla_approximation": "coarse_source_phase_DAG;register_operations_not_instruction_latency",

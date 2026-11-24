@@ -31,6 +31,7 @@ from mindie_sim.prediction.graph_analysis import graph_costs
 from mindie_sim.prediction.mechanism import OperatorPlan, PlannedRecipe, Work
 from mindie_sim.prediction.program import RecipeBook
 from mindie_sim.prediction.structure import parse_case
+from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.operators import OpSpec
 
 from mindie_sim.prediction.execution.capture_barriers import normalized_capture_metadata
@@ -118,7 +119,7 @@ def _opaque_ids(ops: tuple[OpSpec, ...], book: RecipeBook) -> tuple[str, ...]:
             recipe = book.select(op)
         except TimeoutError:
             raise
-        except Exception:
+        except ModelingError:
             continue
         if isinstance(recipe, PlannedRecipe) and not getattr(
             recipe, "traffic_rewrite_capable", False
@@ -215,7 +216,9 @@ def fused_op_spec(candidate, *, phase: str | None = None,
         link += dict(op.work).get("link", 0.0)
     declared_matrix = sum(matrix.values())
     if cube > declared_matrix:
-        dtype = first.dtype or "bf16"
+        if not first.dtype:
+            raise ModelingError(f"fused_op_missing_dtype:{first.op_id}")
+        dtype = first.dtype
         matrix[dtype] = matrix.get(dtype, 0.0) + (cube - declared_matrix)
     flops = sum(matrix.values())
     allocations = tuple(analysis.worksheet.allocations) + tuple(
@@ -303,7 +306,8 @@ def fused_op_spec(candidate, *, phase: str | None = None,
     )
     return OpSpec(
         op_id=fused_id, family="native_fusion",
-        phase=phase or first.phase, stage=first.stage, layer=first.stage,
+        phase=phase or first.phase, stage=first.stage,
+        layer=(leader.layer if leader is not None else int(first.param("layer", 0))),
         requests=(), semantic_shape=semantic_shape,
         local_shape=local_shape, padded_shape=padded_shape,
         launch_shape=launch_shape,

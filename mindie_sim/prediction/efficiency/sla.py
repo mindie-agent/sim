@@ -36,9 +36,6 @@ from .peaks import DEFAULT_OUTPUT_BUDGET, _BOUNDS, _SCALE_KEYS, _check_pos_float
 DEFAULT_SLA_MS = 30.0
 DEFAULT_SLA_CONTEXT = 126000
 DEFAULT_MAX_SEQUENCES = 256
-NON_MONOTONIC_PROBE_CAP = 4
-SLA_HEADROOM_PROBE_STEPS = 3
-SLA_HEADROOM_MULTIPLIER = 3.0
 #: Counterfactual-set selectors for :func:`solve_sla_sizing`.
 SLA_SENSITIVITY_BASELINE = "baseline"
 SLA_SENSITIVITY_FULL = "full"
@@ -329,11 +326,8 @@ class _SLASizingRun:
         except UnmodeledCapabilityError:
             # An unmodeled core is not an infeasible candidate.
             raise
-        except ModelingError as exc:
-            if b <= 1:
-                raise
-            self.domain_cap, self.domain_reason = min(self.domain_cap, b - 1), str(exc)
-            return False
+        except ModelingError:
+            raise
 
     def memory_for(self, tokens: int, async_scheduling: bool | None, scale: float) -> Memory:
         parsed, memory_cache = self.parsed, self.memory_cache
@@ -460,86 +454,10 @@ class _SLASizingRun:
         self, s_key, b1_ms, eff_max, bucket_keys, candidate_checks, evaluated_b,
         b_joint, candidate_windows,
     ):
-        b_max, sla_ms, base_b_hint = self.b_max, self.sla_ms, self.base_b_hint
-        eval_at = self.eval_at
-        try_step_ok = partial(self.try_step_ok, window_for=candidate_windows)
-        bounded_probes = []
-        secant_estimate = None
-        secant_ok: bool | None = None
-        if (0 < base_b_hint <= eff_max and eff_max >= 2 and b1_ms <= sla_ms):
-            b2_ms = float(eval_at(s_key, 2, full=False)["step_ms"])
-            marginal = b2_ms - b1_ms
-            if math.isfinite(marginal) and marginal > SECANT_MIN_SLOPE_MS:
-                estimate = 1 + int((sla_ms - b1_ms) / marginal)
-                estimate = max(2, min(int(estimate), int(eff_max)))
-                if estimate not in evaluated_b:
-                    secant_ok = try_step_ok(
-                        s_key, estimate, seen=evaluated_b,
-                        checks=candidate_checks, capacity_max=b_joint,
-                    )
-                    secant_estimate = estimate
-        if b1_ms > sla_ms:
-            probe_ceiling = min(eff_max, NON_MONOTONIC_PROBE_CAP)
-            probe_results = {probe: try_step_ok(s_key, probe, seen=evaluated_b, checks=candidate_checks, capacity_max=b_joint) for probe in range(2, probe_ceiling + 1)}
-            bounded_probes = list(probe_results)
-            feasible_above = [probe for probe, ok in probe_results.items() if ok]
-            if feasible_above:
-                b_sla = max(feasible_above)
-                eval_sla = eval_at(s_key, b_sla, full=True)
-            else:
-                b_sla, eval_sla = 0, eval_at(s_key, 1, full=True)
-        elif eff_max > 1 and (b1_ms * SLA_HEADROOM_MULTIPLIER <= sla_ms or base_b_hint == eff_max) and try_step_ok(s_key, eff_max, seen=evaluated_b, checks=candidate_checks, capacity_max=b_joint):
-            b_sla, eval_sla = eff_max, eval_at(s_key, eff_max, full=True)
-        else:
-            eff_max = min(b_max, self.domain_cap)
-            low, high = 1, eff_max
-            if secant_estimate is not None and secant_ok is not None:
-                if secant_ok:
-                    low = max(low, secant_estimate)
-                else:
-                    high = min(high, self.domain_cap, secant_estimate - 1)
-            elif base_b_hint > 1 and all(x >= 1.0 for x in s_key[:-1]):
-                hint_probe = min(eff_max, base_b_hint)
-                if try_step_ok(s_key, hint_probe, seen=evaluated_b, checks=candidate_checks, capacity_max=b_joint):
-                    low = max(low, hint_probe)
-                else:
-                    high = min(high, self.domain_cap, hint_probe - 1)
-            best_b, lo_i, hi_i = low, low + 1, min(high, self.domain_cap)
-            while lo_i <= hi_i:
-                mid = (lo_i + hi_i) // 2
-                if try_step_ok(s_key, mid, seen=evaluated_b, checks=candidate_checks, capacity_max=b_joint):
-                    best_b, lo_i = mid, mid + 1
-                else:
-                    hi_i = min(hi_i, self.domain_cap, mid - 1)
-            while best_b > 1 and not try_step_ok(s_key, best_b, seen=evaluated_b, checks=candidate_checks, capacity_max=b_joint):
-                best_b -= 1
-            b_sla = best_b if try_step_ok(s_key, best_b, seen=evaluated_b, checks=candidate_checks, capacity_max=b_joint) else 0
-            eval_sla = eval_at(s_key, max(1, b_sla), full=True)
-
-        if b_sla > 0 and b_sla < min(b_max, self.domain_cap) and bucket_keys:
-            ceiling = min(min(b_max, self.domain_cap), b_sla + SLA_HEADROOM_PROBE_STEPS)
-            probe_results = {probe: try_step_ok(s_key, probe, seen=evaluated_b, checks=candidate_checks, capacity_max=b_joint) for probe in range(b_sla + 1, ceiling + 1)}
-            bounded_probes.extend(probe_results)
-            feasible_above = [probe for probe, ok in probe_results.items() if ok]
-            if feasible_above:
-                b_sla = max(feasible_above)
-                eval_sla = eval_at(s_key, b_sla, full=True)
-        # A latency-feasible batch still has to pass both capacity windows.
-        # Bound the exact window first (memory-only) and price only its
-        # capacity-feasible ceiling, so a near-limit answer does not force one
-        # graph evaluation per candidate.
-        if b_sla > 0 and b_joint > 0:
-            ceiling = min(int(b_sla), int(b_joint), int(b_max), int(self.domain_cap))
-            for probe in range(ceiling, 0, -1):
-                current_window, lifecycle_window = candidate_windows(probe)
-                if current_window["fits"] and lifecycle_window["fits"]:
-                    if try_step_ok(s_key, probe, seen=evaluated_b,
-                                   checks=candidate_checks,
-                                   capacity_max=b_joint):
-                        break
-        if b_sla > 0:
-            evaluated_b.add(b_sla)
-        return b_sla, eval_sla, bounded_probes, secant_estimate
+        raise NotImplementedError(
+            "LEGACY_PURGED: wire dual-certificate certified SLA sizing solver "
+            "maximizing throughput objective in prediction/efficiency/sla.py (G7/GA-16)"
+        )
 
     def _candidate_record(
         self, b, evaluation, *, scen, s_key, b_joint, b_vram, b_lifecycle,

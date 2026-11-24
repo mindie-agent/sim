@@ -337,11 +337,12 @@ class PeriodicSectorRun:
         if hi <= lo or self.rows <= 0 or self.row_bytes <= 0 or self.stride_bytes <= 0:
             return ()
         sec, stride = self.sector_bytes, self.stride_bytes
-        num_lo = lo - sec - self.base_byte - self.row_bytes
-        k_lo = 0 if num_lo < 0 else (num_lo // stride) + 1
-        if hi - 1 < self.base_byte:
+        num_lo = lo - self.base_byte - self.row_bytes - sec + 1
+        k_lo = 0 if num_lo <= 0 else (num_lo + stride - 1) // stride
+        num_hi = hi + sec - 2 - self.base_byte
+        if num_hi < 0:
             return ()
-        k_hi = min(self.rows - 1, (hi - 1 - self.base_byte) // stride)
+        k_hi = min(self.rows - 1, num_hi // stride)
         if k_lo > k_hi:
             return ()
         ivs = []

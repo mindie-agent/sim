@@ -233,13 +233,21 @@ def _abi_for_diffusion_tag(
     rule: TensorQuantRule | None = None,
 ) -> TensorPrecisionABI:
     upper = raw_tag.strip().upper().replace("-", "_")
-    if upper in {"", "FLOAT", "BF16", "BFLOAT16"}:
+    if upper in {"", "FLOAT"}:
         return TensorPrecisionABI(
             linear_method="dense",
             input_dtype=native_dtype,
             weight_dtype=native_dtype,
             output_dtype=native_dtype,
             compute_dtype=native_dtype,
+        )
+    if upper in {"BF16", "BFLOAT16"}:
+        return TensorPrecisionABI(
+            linear_method="dense",
+            input_dtype="bf16",
+            weight_dtype="bf16",
+            output_dtype="bf16",
+            compute_dtype="bf16",
         )
     if upper in {"FP16", "FLOAT16"}:
         return TensorPrecisionABI(

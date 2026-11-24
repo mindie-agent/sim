@@ -994,6 +994,10 @@ def _parent_document(path, document):
             )].append(row)
     rows = []
     for _key, group in sorted(grouped.items(), key=str):
+        if len(group) < int(world):
+            raise NotImplementedError(
+                "LEGACY_PURGED: verify complete rank coverage before stamping all_ranks_matched in communication/ingest.py"
+            )
         med = median(row["per_op_ms"] for row in group)
         base = {k: v for k, v in group[0].items()
                 if k not in {"_repeats", "_weights"} or len(group) == 1}
@@ -1017,16 +1021,6 @@ def _list_document(values, origin):
     if not values:
         return []
     if all(isinstance(value, Mapping) for value in values):
-        keys = set(values[0])
-        base = {
-            "label": Path(origin).stem, "status": "completed",
-            "canary_ok": True, "hardware_key": A5_HARDWARE_KEY,
-            "arch_family": A5_ARCH_FAMILY,
-        }
-        if {"condition", "legs_ms"} <= keys or {"chain_ms", "legs_ms"} <= keys:
-            return [({**base, "chains": values}, origin)]
-        if {"payload_bytes", "per_op_ms"} <= keys or {"size_bytes", "median_ms"} <= keys:
-            return [({**base, "conditions": values}, origin)]
         if any({"label", "conditions", "series", "chains", "families"} & set(value)
                for value in values):
             return [(value, origin) for value in values]

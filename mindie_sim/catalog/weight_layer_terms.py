@@ -186,15 +186,6 @@ def _mhc_terms(plan: LayerPlan, model: ModelSpec) -> list[WeightTerm]:
     return terms
 
 
-def _model_profile_name(model: ModelSpec) -> str:
-    facts = dict(getattr(model, "catalog_facts", ()) or ())
-    profile = str(facts.get("profile", "") or "").strip().lower()
-    if profile:
-        return profile
-    meta = dict(getattr(model, "metadata", ()) or ())
-    return str(meta.get("source_model_type", "") or "").strip().lower()
-
-
 def _step5_csa_indexer_terms(plan: LayerPlan, model: ModelSpec) -> list[WeightTerm]:
     """Step-5 CSA indexer weights: Q, K, Z, W projections plus norms and ssmax."""
     h = model.hidden_size
@@ -215,12 +206,10 @@ def _indexer_terms(plan: LayerPlan, model: ModelSpec) -> list[WeightTerm]:
         return []
     if plan.index_heads <= 0 or plan.index_dim <= 0:
         raise ModelingError(f"indexer_dimensions_missing:{plan.index}")
-    profile = _model_profile_name(model)
     if plan.attention == "gqa" and plan.index_kpool > 1:
-        if "step5" in profile:
-            return _step5_csa_indexer_terms(plan, model)
-        from mindie_sim.catalog.qwen4_exp import qsa_indexer_terms
-        return qsa_indexer_terms(plan, model)
+        raise NotImplementedError(
+            "LEGACY_PURGED: wire structural LayerPlan.indexer_kind dispatch in catalog/weight_layer_terms.py (AG014)"
+        )
     terms: list[WeightTerm] = []
     if plan.owns_index_k:
         width = plan.head_dim if plan.index_input == "compressed" else model.hidden_size
@@ -248,7 +237,7 @@ def _indexer_terms(plan: LayerPlan, model: ModelSpec) -> list[WeightTerm]:
                     _t("indexer_pool_ape", plan.index_kpool, plan.index_dim, "param_fp32"),
                 ])
     if plan.indexer or plan.owns_topk or plan.index_query_per_layer:
-        wq_sharded = plan.attention == "gqa" and ("minimax" in profile or plan.candidate_block_size > 1)
+        wq_sharded = plan.attention == "gqa" and plan.candidate_block_size > 1
         wq_term = (
             _t("indexer_wq", plan.index_heads * plan.index_dim,
                plan.q_lora_rank or model.hidden_size, "indexer.wq", "kv_out",

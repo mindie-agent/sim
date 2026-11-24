@@ -350,9 +350,9 @@ def _effective_owners(hw: Any, axis: Literal["aic", "aiv"]) -> int:
     if declared is not None:
         return int(declared)
     if axis == "aic":
-        return max(1, int(getattr(hw, "compute_units", 1)))
+        return int(getattr(hw, "compute_units", 0))
     res_units = dict(getattr(hw, "resource_units", {}) or {})
-    return max(1, int(res_units.get("vector", getattr(hw, "compute_units", 1))))
+    return int(res_units.get("vector", getattr(hw, "compute_units", 0)))
 
 
 def _issued_flops_for(

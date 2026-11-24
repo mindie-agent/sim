@@ -19,7 +19,7 @@ from mindie_sim.schema.common import ModelingError, dtype_bytes
 
 from mindie_sim.prediction.mechanism import OperatorPlan, PlannedRecipe, Work
 from mindie_sim.prediction.program import KernelProgram, Stage
-from mindie_sim.prediction.operators.matrix.matrix_traffic import FP32_BYTES
+FP32_BYTES = 4
 
 INT32_BYTES = 4
 GENERIC_EPILOGUE_SCALE_WIDTHS = frozenset({2, 2.0, FP32_BYTES, float(FP32_BYTES)})
