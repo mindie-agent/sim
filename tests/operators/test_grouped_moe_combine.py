@@ -20,7 +20,7 @@ from mindie_sim.catalog.quant import quant_preset
 from mindie_sim.prediction.operators.moe_transport import deepep
 from mindie_sim.prediction.implementations import produced_values
 from mindie_sim.prediction.mechanism import Geometry, Work
-from mindie_sim.prediction.operators.moe_transport.moe_callers import LOCAL_EXPERT_REDUCE
+from mindie_sim.prediction.operators.moe_transport.moe_callers import LOCAL_EXPERT_REDUCE, RoutingPolicy
 from mindie_sim.prediction.operators import grouped_moe
 from mindie_sim.prediction.operators.grouped_moe.lowering import StageDemand
 from mindie_sim.prediction.streams import StreamOwners
@@ -198,6 +198,11 @@ def test_deepep_forward_and_inverse_transport_share_integer_row_cut(ep, node_wid
     plain = target_graphs(raw, phase="prefill", tokens=4, scope="model")[0]
     raw["runtime"]["metadata"] = {"enable_deepep": True, "deepep_overlap_ratio": 0.25,
                                   "deepep_ranks_per_node": node_width}
+    parsed = parse_case(raw)
+    received = int(RoutingPolicy().local(
+        parsed.model, parsed.model.layer_plans[0], parsed.runtime.parallel,
+        4 * ep, runtime=parsed.runtime)[0])
+    main_rows, tail_rows = deepep.overlap_row_cut(received, 0.25)
     chunks = target_graphs(raw, phase="prefill", tokens=4, scope="model")[0]
     tokens, width, top_k = 4, 32, 2
     flat = tokens * width * 2 * top_k * (ep - 1) / ep
@@ -206,8 +211,9 @@ def test_deepep_forward_and_inverse_transport_share_integer_row_cut(ep, node_wid
         recipe = f"expert_{kind}"
         full, tail = one(chunks, recipe), one(chunks, recipe + "_overlap")
         assert one(plain, recipe).link_bytes == pytest.approx(flat)
-        assert (full.link_bytes, tail.link_bytes) == pytest.approx((two_stage * 0.75, two_stage * 0.25))
-        assert dict(one(chunks, "expert_dispatch").metadata)["deepep_row_cut"] == (6, 2)
+        assert (full.link_bytes, tail.link_bytes) == pytest.approx(
+            (two_stage * (main_rows / received), two_stage * (tail_rows / received)))
+        assert dict(one(chunks, "expert_dispatch").metadata)["deepep_row_cut"] == (main_rows, tail_rows)
         assert tail.stream == "deepep_comm_stream"
     ids = {op.op_id for op in chunks} | {"analysis_input"}
     assert all(set(op.deps) <= ids for op in chunks)
@@ -331,21 +337,26 @@ def test_tp_reduction_rejects_invalid_reordering(ep, latent, reason):
         target_operators(raw, phase="prefill", tokens=8)
 
 
-@pytest.mark.parametrize("overlap,cut", [(0.5, 4), (0.4, 5)])
-def test_deepep_receive_views_alias_and_wait_for_their_chunks(overlap, cut):
+@pytest.mark.parametrize("overlap", [0.5, 0.4])
+def test_deepep_receive_views_alias_and_wait_for_their_chunks(overlap):
     tokens = 8
     raw = moe_case(dp=2, ep=2, tokens=tokens, top_k=1)
     raw["model"]["quant"] = asdict(quant_preset("w8a8_int8"))
     raw["runtime"]["metadata"] = {"enable_deepep": True, "deepep_overlap_ratio": overlap}
+    parsed = parse_case(raw)
+    received = int(RoutingPolicy().local(
+        parsed.model, parsed.model.layer_plans[0], parsed.runtime.parallel,
+        2 * tokens, runtime=parsed.runtime)[0])
+    cut, _ = deepep.overlap_row_cut(received, overlap)
     ops = target_graphs(raw, phase="prefill", tokens=tokens, scope="model")[0]
     dispatch, tail = (one(ops, recipe) for recipe in ("expert_dispatch", "expert_dispatch_overlap"))
     by_id = {op.op_id: op for op in ops}
-    for start, stop, ready in ((0, cut, (dispatch.op_id,)), (cut, tokens, (dispatch.op_id, tail.op_id))):
+    for start, stop, ready in ((0, cut, (dispatch.op_id,)), (cut, received, (dispatch.op_id, tail.op_id))):
         view = by_id[f"s0.l0.expert_up.rows{start}_{stop}"]
         (value,) = produced_values(view)
         assert view.deps == ready and dict(view.metadata)["byte_offset"] == start * 64
         assert tuple(value["logical_shape"]) == (stop - start, 32)
-        assert tuple(value["storage_shape"]) == (tokens, 32)
+        assert tuple(value["storage_shape"]) == (received, 32)
         assert value["alias_of"] == dispatch.op_id and value["write_bytes"] == 0
         conversion = next(op for op in ops if op.family == "quantize" and op.deps == (view.op_id,))
         assert conversion.mte3_bytes == (stop - start) * (32 + 4)

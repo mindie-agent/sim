@@ -509,11 +509,11 @@ def test_quant_producers_scales_and_rejections():
     raw = quant_case()
     raw["model"].update(ffn="moe", num_experts=4, top_k=2, moe_intermediate_size=32,
                         expert_routing_histogram=[.8, .1, .05, .05])
-    raw["runtime"].update(tp=2, ep=2)
+    raw["runtime"].update(tp=2, ep=2, parallel={"tp": 2, "dp": 1, "ep": 2, "rank_table": [[0, 1]]})
     raw["machine"]["num_devices"] = 2
     raw["machine"]["links"][0]["members"] = [0, 1]
     with pytest.raises(ModelingError, match="integer_per_row_int8_fp32_scale"):
-        target_operators(raw, phase="prefill", tokens=3)
+        target_graphs(raw, phase="prefill", tokens=3)
 def sort_machine(sku="Ascend950DT_9581", clock=None, owners=4):
     arch = {"presets": ["ascend_sort32_spec"]}
     if clock is not None:

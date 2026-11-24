@@ -17,7 +17,42 @@ from mindie_sim.prediction.operators.matrix.matrix_mapping_owners import (
 )
 
 ROW_TILE = 128
-FRACTAL = 16
+FRACTAL_M = 16
+FRACTAL = FRACTAL_M
+
+
+def _dispersed_group_rows(rows: float, banks: int) -> tuple[int, ...]:
+    """Binomially dispersed positive per-bank row counts for probability moments."""
+    bank_count = max(1, int(banks))
+    if rows <= 0.0:
+        return (1,) * bank_count
+    if bank_count == 1:
+        return (max(1, math.ceil(rows)),)
+    if rows <= float(bank_count):
+        return (1,) * bank_count
+    mean_m = float(rows) / float(bank_count)
+    spread = min(
+        mean_m - 1.0,
+        math.sqrt(mean_m * (1.0 - 1.0 / float(bank_count))),
+    )
+    low_m = max(1, math.floor(mean_m - spread))
+    high_m = max(1, math.ceil(mean_m + spread))
+    half = bank_count // 2
+    if bank_count % 2 == 0:
+        return (low_m,) * half + (high_m,) * half
+    mid_m = max(1, int(round(mean_m)))
+    return (low_m,) * half + (mid_m,) + (high_m,) * half
+
+
+def _per_group_padded_m(group_rows: tuple[int, ...]) -> tuple[tuple[int, ...], int]:
+    """Pad each active expert group independently to Cube FRACTAL_M = 16."""
+    padded_groups = tuple(
+        math.ceil(group_m / FRACTAL_M) * FRACTAL_M
+        for group_m in group_rows if group_m > 0
+    )
+    if not padded_groups:
+        return (FRACTAL_M,), FRACTAL_M
+    return padded_groups, sum(padded_groups)
 
 
 def _apply_grouped_weight_cache_policy(
@@ -100,7 +135,9 @@ class ExpectedGroupedMatmul:
         _, n, k = op.local_shape[(-3):]
         explicit_hist = meta.get("expert_rows") or meta.get("rows_by_expert")
         aclnn_hist = meta.get("aclnn_group_list")
+        is_exact_histogram = False
         if explicit_hist:
+            is_exact_histogram = True
             group_rows = tuple(max(0, int(value)) for value in explicit_hist)
             active_rows = tuple(value for value in group_rows if value > 0)
             active = len(active_rows)
@@ -108,6 +145,7 @@ class ExpectedGroupedMatmul:
             banks = len(group_rows)
             per_bank = max(group_rows, default=0)
             slots = max(1, rows)
+            _, padded_m = _per_group_padded_m(active_rows)
             declared_groups = max(banks, int(meta.get("matrix_weight_bank_groups", 0) or 0))
             meta["declared_group_count"] = declared_groups
             _apply_grouped_weight_cache_policy(
@@ -116,6 +154,7 @@ class ExpectedGroupedMatmul:
                 dtype=op.dtype,
             )
         elif aclnn_hist:
+            is_exact_histogram = True
             full_rows = tuple(max(0, int(value)) for value in aclnn_hist)
             active_rows = tuple(value for value in full_rows if value > 0)
             declared_groups = len(full_rows)
@@ -125,6 +164,7 @@ class ExpectedGroupedMatmul:
             banks = max(1, active)
             per_bank = max(group_rows, default=0)
             slots = max(1, rows)
+            _, padded_m = _per_group_padded_m(active_rows)
             meta["declared_group_count"] = declared_groups
             _apply_grouped_weight_cache_policy(
                 context, meta, active_rows=active_rows,
@@ -134,28 +174,43 @@ class ExpectedGroupedMatmul:
         else:
             active = meta["expected_active_experts"]
             rows = meta["expected_rows"]
-            group_rows = None
-            # These are scheduling slots, not a realized routing histogram. A
-            # final fractional bank and fractional conditional row are
-            # represented by the unchanged expected work over a rounded grid.
-            banks = math.ceil(active)
-            per_bank = math.ceil(rows / active)
-            slots = banks * per_bank
+            # Each active expert bank pads along M to Cube FRACTAL_M = 16
+            # independently, with binomial row-count dispersion across banks,
+            # while logical op.flops stays unpadded.
+            banks = max(1, math.ceil(active))
+            dispersed_rows = _dispersed_group_rows(float(rows), banks)
+            padded_group_rows, padded_m = _per_group_padded_m(dispersed_rows)
+            group_rows = padded_group_rows
+            per_bank = max(padded_group_rows)
+            slots = padded_m
             declared_groups = max(banks, int(meta.get("matrix_weight_bank_groups", 0) or 0))
             meta["declared_group_count"] = declared_groups
+            meta["expected_dispersed_group_rows"] = dispersed_rows
+            meta["expected_padded_group_rows"] = padded_group_rows
+            meta["expected_padded_m"] = padded_m
             _apply_grouped_weight_cache_policy(
-                context, meta, active_rows=(per_bank,) * banks,
+                context, meta, active_rows=dispersed_rows,
                 declared_groups=declared_groups, rows=rows, n=n, k=k,
                 dtype=op.dtype,
             )
+        from mindie_sim.prediction.operators.matrix.matrix_steady import SteadyMatmul
+        use_group_rows = group_rows is not None and isinstance(self.matrix, SteadyMatmul)
+        if not use_group_rows and banks > 0 and slots % banks:
+            per_bank = math.ceil(slots / banks)
+            slots = banks * per_bank
         meta.update(matrix_groups=banks, matrix_mapping_domain="expected_expert_banks")
         if "matrix_epilogue" in meta:
             epilogue = dict(meta["matrix_epilogue"])
             epilogue["operations_per_output"] = op.vector_ops / (slots * n)
             meta["matrix_epilogue"] = epilogue
         shape = (slots, n, k)
+        padded_shape = (
+            padded_m,
+            math.ceil(n / FRACTAL_M) * FRACTAL_M,
+            math.ceil(k / FRACTAL_M) * FRACTAL_M,
+        )
         mapped = replace(op, local_shape=shape, launch_shape=shape,
-                         padded_shape=tuple(math.ceil(v / FRACTAL) * FRACTAL for v in shape),
+                         padded_shape=padded_shape,
                          metadata=tuple(meta.items()))
         if context.record_mapping is not None:
             context.record_mapping({
@@ -164,17 +219,16 @@ class ExpectedGroupedMatmul:
                 "conditional_mean_rows": (rows / active) if active else 0.0,
                 "bank_slots": banks, "rows_per_bank_slot": per_bank,
                 "semantic_rows": op.local_shape[(-3)], "scheduling_rows": slots,
+                "padded_m": padded_m,
                 "work_policy": "preserve_semantic_arithmetic_and_payload_moments",
                 "private_service_policy": "derive_owner_copies_and_compute_width_from_rounded_grid",
-                "schedule": ("exact_histogram_owner_tail" if group_rows is not None
+                "schedule": ("exact_histogram_owner_tail" if is_exact_histogram
                              else "capacity_rounded_conditional_mean_not_sampled_histogram"),
                 "outer_invocations": 1,
             })
         mapped_context = replace(context, op=mapped)
-        if group_rows is not None:
-            from mindie_sim.prediction.operators.matrix.matrix_steady import SteadyMatmul
-            if isinstance(self.matrix, SteadyMatmul):
-                return self.matrix.lower(mapped_context, group_rows=group_rows)
+        if use_group_rows:
+            return self.matrix.lower(mapped_context, group_rows=group_rows)
         return self.matrix.lower(mapped_context)
 
 
