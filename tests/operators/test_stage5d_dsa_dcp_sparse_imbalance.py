@@ -359,3 +359,245 @@ def test_end_to_end_kimi_and_qwen_dcp_sparse_imbalance_and_latency():
     assert meta_qwen["cp_sparse_imbalance"] > 1.0
     assert sum(meta_qwen["cp_per_rank_pairs"]) == pytest.approx(64.0 * 2048.0)
     assert _attention_elapsed_ms(r_qwen_s) > _attention_elapsed_ms(r_qwen_u)
+
+
+def test_g1_sp_padding_p_eq_w_sharded_sort_m1_m1b_m5_and_m10():
+    """Verify G1 SP laws, P==W switch, sharded tiling/A5 zero-Cast, M1/M1b/M5/M10, and AI_CPU."""
+    from types import SimpleNamespace
+    from mindie_sim.prediction.memory_traffic import (
+        AttentionAccessSpec,
+        AttentionSchedule,
+        plan_attention_traffic,
+    )
+    from mindie_sim.prediction.operators.hyper_connections import family_attnres
+    from mindie_sim.prediction.operators.mla.generic_latent_attention_views import (
+        _owned_completed_rows_for_rank,
+        unique_index_key_rows,
+    )
+    from mindie_sim.prediction.operators.mla.mla_epilogs import (
+        SMLA_METADATA_SIZE_A5,
+        SMLA_METADATA_SIZE_A23,
+        validate_m10_mla_legality,
+    )
+    from mindie_sim.prediction.operators.mla_prolog import resolve_mla_preprocess_mode
+    from mindie_sim.prediction.sharding import context_parallel as cp_mod
+    from mindie_sim.prediction.sharding import sequence_parallel as sp_mod
+    from mindie_sim.schema.common import ModelingError
+    from mindie_sim.schema.parallel import ParallelSpec
+    from mindie_sim.schema.physical_mechanisms import MemoryHierarchySpec
+
+    # G1: per-occurrence SP padding law + draft scope + mc2_mask + MMRS + directional bytes.
+    rt = SimpleNamespace(
+        parallel=ParallelSpec(tp=4, ep=4, dp=1, pp=1),
+        kernels={"sequence_parallel": {
+            **sp_mod.DECLARATION, "padding": "right_to_tp", "mc2_active_mask_active": True,
+        }},
+    )
+    draft_model = SimpleNamespace(layer_plans=(
+        SimpleNamespace(scope="draft", ffn="moe", residual_block_size=0, hyper_connections=False, hc_mult=0),
+    ))
+    plan = sp_mod.select(rt, draft_model, (SimpleNamespace(q_len=3, phase="decode", padding=False),), tokens=3)
+    assert plan.reduce_scatter_pad_rows(4) == 0
+    assert plan.reduce_scatter_pad_rows(3) == 1
+    assert plan.directional_remote_link_bytes("allgather", 4, 7168, 2) == 4 * 7168 * 2 * 3 // 4
+    pad_op = sp_mod.emit_reduce_scatter_pad(
+        plan=plan, op_id="l0.shared.sp_scatter.pad", deps=("x",), stage=0, layer=0,
+        requests=("r0",), phase="decode", width=7168, dtype="bf16", source_rows=3,
+    )
+    assert pad_op is not None and dict(pad_op.metadata)["aclnn_symbol"] == "aclnnConstantPadNd"
+    assert sp_mod.emit_reduce_scatter_pad(
+        plan=plan, op_id="l0.dense.pad", deps=("x",), stage=0, layer=0,
+        requests=("r0",), phase="decode", width=7168, dtype="bf16", source_rows=4,
+    ) is None
+    mask_pad = sp_mod.emit_mc2_mask_pad(
+        plan=plan, op_id="l0.mc2_mask.pad", deps=("m",), stage=0, layer=0,
+        requests=("r0",), phase="decode",
+    )
+    assert mask_pad is not None and dict(mask_pad.metadata)["mc2_mask_cast_launches"] == 3
+    assert sp_mod.mmrs_eligible(tp=4, dtype="bf16", has_bias=False, k_dim=4096, enable_mmrs_fusion=True)
+    assert not sp_mod.mmrs_eligible(tp=4, dtype="bf16", has_bias=True, k_dim=4096, enable_mmrs_fusion=True)
+
+    # G1: sp_scope="off" returns None; bucket=16/tp=8/valid=1 pad matches scatter shape (16, 7168).
+    rt_off = SimpleNamespace(
+        parallel=ParallelSpec(tp=8, ep=8, dp=1, pp=1),
+        kernels={"sequence_parallel": {**sp_mod.DECLARATION, "padding": "right_to_tp", "sp_scope": "off"}},
+    )
+    assert sp_mod.select(rt_off, draft_model, (SimpleNamespace(q_len=1, phase="decode", padding=False),), tokens=1) is None
+
+    rt_b16 = SimpleNamespace(
+        parallel=ParallelSpec(tp=8, ep=8, dp=1, pp=1),
+        kernels={"sequence_parallel": {
+            **sp_mod.DECLARATION, "padding": "right_to_tp", "capture_bucket_rows": 16,
+        }},
+    )
+    plan_b16 = sp_mod.select(rt_b16, draft_model, (SimpleNamespace(q_len=1, phase="decode", padding=False),), tokens=1)
+    assert plan_b16 is not None and plan_b16.tokens_global == 16
+    b16_pad = sp_mod.emit_reduce_scatter_pad(
+        plan=plan_b16, op_id="l0.shared.sp_scatter.pad", deps=("x",), stage=0, layer=0,
+        requests=("r0",), phase="decode", width=7168, dtype="bf16", source_rows=1,
+        target_rows=plan_b16.tokens_global,
+    )
+    assert b16_pad is not None and b16_pad.local_shape == (16, 7168)
+
+    # P==W>1 (no spurious GatherV3), mixed-prefill bypass, sharded tiling + 75% occupancy, A3 vs A5 Cast diff.
+    pw_plan = cp_mod.build_dcp_layer_execution_plan(
+        layer_id=0, rank_id=0, request_phase="decode", pcp_factor=2, tp_gather=1, dp_width=1,
+        sharded_indexer=False, arch="A3", num_prod_rows=4, topk=2048,
+    )
+    assert pw_plan.runs_query_allgather is False
+    assert pw_plan.output_exchange_collective == "pcp_allgather_only"
+    assert "hcom_alltoall_" not in pw_plan.native_calls and "GatherV3" not in pw_plan.native_calls
+    pw_ops: list = []
+    cp_mod.emit_dcp_output_exchange_combine(
+        pw_ops, prefix="l0", stage=0, layer=0, requests=("r0",), mode="decode",
+        deps=("attn",), rows=4, local_heads=16, v_dim=512, act_dtype="bf16",
+        pcp_factor=2, tp_gather=1, dp_width=1,
+    )
+    assert not any("pcp_hidden_restore" in op.op_id for op in pw_ops)
+
+    bypass = cp_mod.build_dcp_layer_execution_plan(
+        layer_id=0, rank_id=0, request_phase="mixed", pcp_factor=1, tp_gather=4, dp_width=1,
+        sharded_indexer=False, arch="A5", is_global_mixed_prefill=True,
+    )
+    assert bypass.runs_query_allgather is False and bypass.output_exchange_collective == "none"
+
+    assert cp_mod.sharded_indexer_tile_rows(4, 2048) == 4096
+    assert cp_mod.sharded_candidate_allgather_tiles(0, 4, 2048) == 0
+    assert cp_mod.sharded_candidate_allgather_tiles(4097, 4, 2048) == 2
+    assert cp_mod.sharded_fused_sort_eligible(world_size=6, topk=2048) is False
+    assert cp_mod.sharded_fused_sort_eligible(world_size=7, topk=2048) is True
+    assert cp_mod.sharded_fused_sort_eligible(world_size=7, topk=2048, rows=10, vector_cores=48) is False
+    assert cp_mod.sharded_fused_sort_eligible(world_size=7, topk=2048, rows=36, vector_cores=48) is True
+    p_a3 = cp_mod.build_dcp_layer_execution_plan(
+        layer_id=0, rank_id=0, request_phase="decode", pcp_factor=1, tp_gather=4, dp_width=1,
+        sharded_indexer=True, arch="A3", num_prod_rows=4097, topk=2048,
+    )
+    p_a5 = cp_mod.build_dcp_layer_execution_plan(
+        layer_id=0, rank_id=0, request_phase="decode", pcp_factor=1, tp_gather=4, dp_width=1,
+        sharded_indexer=True, arch="A5", num_prod_rows=4, topk=2048,
+    )
+    # 1 query AllGather + 2 tiled candidate AllGathers for 4097 rows at W=4, K=2048.
+    assert p_a3.native_calls.count("hcom_allGather_") == 3
+    assert "Cast" in p_a3.native_calls and "Cast" not in p_a5.native_calls
+    p_k128 = cp_mod.build_dcp_layer_execution_plan(
+        layer_id=0, rank_id=0, request_phase="decode", pcp_factor=1, tp_gather=4, dp_width=1,
+        sharded_indexer=True, arch="A5", num_prod_rows=4, topk=128,
+    )
+    assert p_k128.native_calls.index("_pack_candidates") < p_k128.native_calls.index("Sort")
+    assert "_unpack_candidates" in p_k128.native_calls and "_select_local_candidates" in p_k128.native_calls
+
+    # M1 5-branch MLA preprocess selector (BF16 required per mla_v1.py:1919; strided adapter requires A5 draft).
+    assert resolve_mla_preprocess_mode(arch="A5", phase="decode", num_tokens=4, q_lora_rank=1536, kv_lora_rank=512, qk_rope_head_dim=64, weight_quant="bf16") == "prolog_v3"
+    assert resolve_mla_preprocess_mode(arch="A5", phase="decode", num_tokens=4, q_lora_rank=1536, kv_lora_rank=512, qk_rope_head_dim=64, act_dtype="fp16", weight_quant="fp16") == "native_decomposed"
+    assert resolve_mla_preprocess_mode(arch="A3", phase="decode", num_tokens=4, q_lora_rank=1536, kv_lora_rank=512, qk_rope_head_dim=64, weight_quant="bf16") == "prolog_v3"
+    assert resolve_mla_preprocess_mode(arch="A3", phase="decode", num_tokens=4, q_lora_rank=1536, kv_lora_rank=512, qk_rope_head_dim=64, weight_quant="mxfp8") == "native_decomposed"
+    assert resolve_mla_preprocess_mode(arch="A3", phase="decode", num_tokens=4, q_lora_rank=1536, kv_lora_rank=512, qk_rope_head_dim=64, enable_mlapo=True) == "mlapo"
+    assert resolve_mla_preprocess_mode(arch="A5", phase="decode", num_tokens=4, q_lora_rank=1536, kv_lora_rank=512, qk_rope_head_dim=64, is_strided_kv_cache=True, is_draft_model=True, input_size=14336) == "strided_kv_adapter"
+    assert resolve_mla_preprocess_mode(arch="A5", phase="decode", num_tokens=4, q_lora_rank=1536, kv_lora_rank=512, qk_rope_head_dim=64, is_strided_kv_cache=True, is_draft_model=True, input_size=7168) == "native_decomposed"
+    assert resolve_mla_preprocess_mode(arch="A5", phase="decode", num_tokens=4, q_lora_rank=1536, kv_lora_rank=512, qk_rope_head_dim=64, is_strided_kv_cache=False, is_draft_model=True) == "native_decomposed"
+    assert resolve_mla_preprocess_mode(arch="A5", phase="decode", num_tokens=4, q_lora_rank=1536, kv_lora_rank=512, qk_rope_head_dim=64, has_learned_rope_tail=True) == "prolog_v3_learned_rope_tail"
+
+    # M1b zero-row sentinel & M5 store-on-completion (I % R != 0) & prefix_block_size vs CP interleave.
+    hier = MemoryHierarchySpec(l2_capacity_bytes=64 * 1024 * 1024, l2_effective_fraction=0.8, cache_line_bytes=128, write_allocate=True)
+    zero_tp = plan_attention_traffic(
+        AttentionAccessSpec(q_lengths=(1,), context_lengths=(4096,), unique_rows=0, refill_rows=0,
+                            unique_rows_known=True, refill_rows_known=True, row_bytes=1152.0),
+        hier, AttentionSchedule(),
+    )
+    assert zero_tp.hbm_read_bytes == 0.0 and zero_tp.logical_read_bytes == 0.0
+    assert _owned_completed_rows_for_rank(12, 3, 2, 4, 0) == 3
+    assert _owned_completed_rows_for_rank(12, 3, 2, 4, 1) == 1
+    v_m5_a = SimpleNamespace(q_len=1, context=127, kv_len=128, prefix_tokens=64, prefix_key="k0", query_ranges=())
+    v_m5_b = SimpleNamespace(q_len=1, context=127, kv_len=128, prefix_tokens=64, prefix_key="k0", query_ranges=())
+    u_m5, r_m5 = unique_index_key_rows((v_m5_a, v_m5_b), cp=2, interleave=128, compression=4, prefix_block_size=64)
+    assert (u_m5, r_m5) == (48, 64)
+
+    # M10 legality guards + AttnResFwd on A3 & A5 + SMLA metadata size constants + unmodeled structure fallback.
+    from mindie_sim.structure_implementations import operator_birth_certificate
+    for fam in ("elementwise", "attention", "unregistered_fam"):
+        unknown_cert = operator_birth_certificate({"op_id": "x", "family": fam, "recipe": "no_such_recipe", "local_shape": (1, 1), "dtype": "bf16", "metadata": {}})
+        assert unknown_cert.backend_stack == "unmodeled" and unknown_cert.native_kinds == () and unknown_cert.readiness == "unmodeled"
+
+    assert SMLA_METADATA_SIZE_A23 == 1024 and SMLA_METADATA_SIZE_A5 == 2048
+    assert family_attnres._attnres_arch_supported("A3") and family_attnres._attnres_arch_supported("A5")
+    with pytest.raises(ModelingError, match="m10_kpool_requires_dcp_eq_1"):
+        validate_m10_mla_legality(
+            plan=SimpleNamespace(index_kpool=4, mla_variant="latent_mla", cache_kind="dense", indexer=True),
+            eff_dcp=2, quant_kv_dtype="bf16", arch="A5", cp_interleave_size=128,
+        )
+    with pytest.raises(ModelingError, match="m10_sparse_flash_mla_a23_forbids_int8_kv"):
+        validate_m10_mla_legality(
+            plan=SimpleNamespace(index_kpool=1, mla_variant="latent_mqa", cache_kind="window_compressed", indexer=True),
+            eff_dcp=1, quant_kv_dtype="int8", arch="A3", cp_interleave_size=128,
+        )
+
+    # Noncausal SWA trailing-window + current-block law & CP2 exact conservation (665 = 25 + 640).
+    from mindie_sim.prediction.memory_traffic import _causal_pairs as mt_causal_pairs
+    from mindie_sim.prediction.operators.mla.generic_latent_attention_views import (
+        _noncausal_window_rank_pairs,
+        window_tile_rows,
+    )
+    swa_plan = SimpleNamespace(window=128, noncausal_attention=True)
+    assert window_tile_rows(swa_plan, context=256, query=5, start=0, query_tile=128, kv_len=261) == 133
+    assert window_tile_rows(swa_plan, context=256, query=6, start=0, query_tile=128, kv_len=262) == 134
+    assert mt_causal_pairs(5, 256, 128, True, 0) == 665.0
+    assert mt_causal_pairs(6, 256, 128, True, 0) == 804.0
+    cp2_pairs = _noncausal_window_rank_pairs(5, 256, 128, 2, 128)
+    assert cp2_pairs == [25.0, 640.0] and sum(cp2_pairs) == 665.0
+
+    # P1-7: PCP lane_views preserves global_q_len=5 -> 266+399=665 == 25+640.
+    from mindie_sim.prediction.execution.rank_ledger import lane_views
+    from mindie_sim.prediction.operators.mla.generic_latent_attention_views import attention_view_record, window_cache_read_by_rank
+    from mindie_sim.schema.workload import RequestView
+    from mindie_sim.catalog.types import QuantSpec
+    lv0, lv1 = lane_views((RequestView("r0", 5, 251, False, "prefill"),), 2, 0)[0], lane_views((RequestView("r0", 5, 251, False, "prefill"),), 2, 1)[0]
+    p_nc = SimpleNamespace(cache_kind="dense", window=128, noncausal_attention=True, index_topk=0, index_kpool=1, index_kpool_always_select_tail=False, compress_ratio=1, qk_rope_head_dim=64)
+    m_nc = SimpleNamespace(activation_dtype="bf16", compute_dtype="bf16", quant=QuantSpec("bf16"), kv_cache_formats=(), metadata=())
+    rr0 = attention_view_record(lv0, plan=p_nc, model=m_nc, quant=QuantSpec("bf16"), query_tile=128, eff_cp=2, block=128, interleave=128, tp=1, dsa=False, topk_present=False, heads=16, latent_dim=512)
+    rr1 = attention_view_record(lv1, plan=p_nc, model=m_nc, quant=QuantSpec("bf16"), query_tile=128, eff_cp=2, block=128, interleave=128, tp=1, dsa=False, topk_present=False, heads=16, latent_dim=512)
+    assert rr0["pairs"] == 266.0 and rr1["pairs"] == 399.0 and [rr0["v_pairs"][i] + rr1["v_pairs"][i] for i in range(2)] == [25.0, 640.0]
+
+    # P1-9: packed SFA interleave-boundary horizon conservation (256==256, 384==384, 513==513).
+    from mindie_sim.prediction.operators.paged_mla.indexed_quant_attention import _row_partition, tile_stream
+    sfa_p = SimpleNamespace(index_topk=2048, kv_lora_rank=512, qk_rope_head_dim=64, cache_row_elements=576, index_kpool=1, index_kpool_always_select_tail=False)
+    for vs, exp_k in (((RequestView("r0", 2, 127, False, "decode"),), 256), ((RequestView("r0", 3, 127, False, "decode"),), 384)):
+        g_sfa = cp_mod.packed_sfa_geometry({}, 96, sfa_p, vs, 2, cache_dtype="int8", interleave=128)
+        _, sts = tile_stream(g_sfa["sequences"], g_sfa["topk"], 2, 128, 1, False, per_sequence_topk=g_sfa["per_sequence_topk"])
+        assert sum(k for parts in sts for _, ts in parts for k, _, _ in ts) == exp_k == sum(map(sum, _row_partition(g_sfa, g_sfa["sequences"], g_sfa["topk"])[1]))
+
+    # P1-5 & P1-8 M1b: per-tile fused sort (2049 rows -> tail unfused), valid=0, K=128, & production [1,0] M1b (128B / 0B + per-layer 64B).
+    from mindie_sim.prediction.lowering import Builder
+    from mindie_sim.prediction.operators.mla.mla import _plan_rank_attention_traffic
+    from mindie_sim.prediction.operators.mla.mla_epilogs import _emit_sharded_candidate_merge
+    m_stub = SimpleNamespace(activation_dtype="bf16", compute_dtype="bf16", quant=QuantSpec("bf16"), kv_cache_formats=(), metadata=(("layer_cache_representations", {0: {"compressed_kv": {"dtype": "int8"}}}),))
+    p_stub = SimpleNamespace(index=0, scope="target", cache_kind="window_compressed", window=128,
+                             cache_row_elements=64, index_topk=0, index_kpool=1, index_kpool_always_select_tail=False, noncausal_attention=False, compress_ratio=4, qk_rope_head_dim=0)
+    mach48 = SimpleNamespace(dies=(SimpleNamespace(aiv_count=48, aic_count=24),))
+    b_t = Builder("s0", p_stub, 0, (SimpleNamespace(request_id="r0", q_len=2049, context=2049, phase="prefill"),), m_stub, "prefill")
+    _emit_sharded_candidate_merge(b_t, "topk", valid=2049, index_topk=2048, eff_dcp=8, runtime=SimpleNamespace(metadata=(("device_arch", "A3"),)), machine=mach48)
+    packs_t = [o for o in b_t.ops if o.recipe.startswith("candidate_pack")]
+    assert len(packs_t) == 2 and dict(packs_t[0].metadata)["sharded_fused_sort"] is True and dict(packs_t[1].metadata)["sharded_fused_sort"] is False
+    b_zero = Builder("s0", p_stub, 0, (), m_stub, "prefill")
+    assert _emit_sharded_candidate_merge(b_zero, "topk", valid=0, index_topk=2048, eff_dcp=8, runtime=SimpleNamespace(metadata=(("device_arch", "A3"),)), machine=mach48) == "topk" and not b_zero.ops
+    b_k128 = Builder("s0", p_stub, 0, (SimpleNamespace(request_id="r0", q_len=64, context=64, phase="prefill"),), m_stub, "prefill")
+    _emit_sharded_candidate_merge(b_k128, "topk", valid=64, index_topk=128, eff_dcp=8, runtime=SimpleNamespace(metadata=(("device_arch", "A3"),)), machine=mach48)
+    assert dict(b_k128.ops[0].metadata)["native_kinds"] == ("_pack_candidates",)
+    assert dict(b_k128.ops[-1].metadata)["native_kinds"] == (
+        "_unpack_candidates", "Sort", "Cast", "GatherElementsV2", "Sort", "Cast", "GatherElementsV2", "_select_local_candidates",
+    )
+    b_k128_a5 = Builder("s0", p_stub, 0, (SimpleNamespace(request_id="r0", q_len=64, context=64, phase="prefill"),), m_stub, "prefill")
+    _emit_sharded_candidate_merge(b_k128_a5, "topk", valid=64, index_topk=128, eff_dcp=8, runtime=SimpleNamespace(metadata=(("device_arch", "A5"),)), machine=mach48)
+    assert dict(b_k128_a5.ops[0].metadata)["native_kinds"] == ("_pack_candidates",)
+    assert dict(b_k128_a5.ops[-1].metadata)["native_kinds"] == (
+        "_unpack_candidates", "Sort", "GatherElements", "Sort", "GatherElements", "_select_local_candidates",
+    )
+    assert "Cast" not in dict(b_k128_a5.ops[-1].metadata)["native_kinds"]
+
+    m1b_view = RequestView("r0", 1, 0, False, "decode")
+    m1b_rec = attention_view_record(m1b_view, plan=p_stub, model=m_stub, quant=QuantSpec("bf16"), query_tile=128, eff_cp=2, block=128, interleave=128, tp=1, dsa=False, topk_present=False, heads=16, latent_dim=64)
+    assert m1b_rec["v_sweeps"] == [1, 0] and m1b_rec["v_rows"] == [1, 0]
+    _, r0_bytes = _plan_rank_attention_traffic(plan=p_stub, model=m_stub, view=m1b_view, parts=((1, 0),), rec=m1b_rec, eff_cp=2, worst_pairs_r=0, worst_sweeps_r=0, kv_row_b=128.0, query_tile=128, hierarchy=hier, mode="decode", topk=None, latent=True, interleave=128)
+    _, r1_bytes = _plan_rank_attention_traffic(plan=p_stub, model=m_stub, view=m1b_view, parts=((1, 0),), rec=m1b_rec, eff_cp=2, worst_pairs_r=1, worst_sweeps_r=1, kv_row_b=128.0, query_tile=128, hierarchy=hier, mode="decode", topk=None, latent=True, interleave=128)
+    assert r0_bytes == 128.0 and r1_bytes == 0.0
+    by_r_pl = window_cache_read_by_rank(p_stub, RequestView("r0", 1, 7, False, "decode"), ((1, 7),), [10, 0], [10, 0], 2, 128, 64, m_stub, 128)
+    assert by_r_pl[0][4] == 128.0 and by_r_pl[0][5] == 64.0

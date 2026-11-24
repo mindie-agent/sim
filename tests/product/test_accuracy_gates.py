@@ -475,12 +475,22 @@ def test_shared_expert_dp_mc2_conserves_weights_and_hccl_bytes():
     assert _rel(plain_eff["graph_duration_ms"], MC2_PLAIN_REF_MS) <= REL_TOL
     assert _rel(mc2_eff["graph_duration_ms"], MC2_SCHEDULED_REF_MS) <= REL_TOL
     assert _rel(plain_eff["graph_duration_ms"], MC2_SCHEDULED_REF_MS) > REL_TOL
-    assert plain_eff["total_link_bytes"] == pytest.approx(mc2_eff["total_link_bytes"])
-    assert plain_eff["total_link_bytes"] == pytest.approx(233496.0)
+    # A3 decode EP>1 selects shipping MC2 V2 (adding 24 B/layer count_network + peer rounding: +120 B vs chunked mc2).
+    assert plain_eff["total_link_bytes"] == pytest.approx(233616.0)
+    assert mc2_eff["total_link_bytes"] == pytest.approx(233496.0)
     plain_step = _step(plain, "decode", 8, 128, 1)
-    tp_graph_ms = sum(row["elapsed_ms"] for row in plain_step["timeline"] if row["family"] == "allreduce")
-    tp_operator_ms = sum(row["total_ms"] for row in plain_eff["operators"] if row["family"] == "allreduce")
-    _conserve(plain_eff, plain_step["duration_ms"], collective_extra_ms=tp_graph_ms - tp_operator_ms)
+    # A3 decode EP>1 overlaps MC2 V2 network streams against dispatch count streams;
+    # enforce exact bounded timing conservation (overlap equals overlapped network stream time).
+    mc2_overlap_ms = sum(
+        row["elapsed_ms"] for row in plain_step["timeline"]
+        if str(row.get("stream", "")).endswith(".mc2_v2_dispatch.network")
+    )
+    assert mc2_overlap_ms > 0.0
+    assert plain_eff["graph_duration_ms"] == pytest.approx(plain_step["duration_ms"], rel=1e-12)
+    assert plain_eff["operator_sum_ms"] - plain_eff["graph_duration_ms"] == pytest.approx(mc2_overlap_ms, abs=1e-9)
+    assert sum(op["duration_ms"] * op["occurrences"] for op in plain_eff["operators"]) == pytest.approx(plain_eff["operator_sum_ms"], rel=1e-9)
+    assert sum(op["link_bytes"] * op["occurrences"] for op in plain_eff["operators"]) == pytest.approx(plain_eff["total_link_bytes"], abs=1e-6)
+    assert sum(op["hbm_bytes"] * op["occurrences"] for op in plain_eff["operators"]) == pytest.approx(plain_eff["total_hbm_bytes"], rel=1e-9)
     mc2_ops = mc2_eff["operators"]
     mc2_summed = sum(op["duration_ms"] * op["occurrences"] for op in mc2_ops)
     assert mc2_summed == pytest.approx(mc2_eff["operator_sum_ms"], rel=1e-9)
@@ -581,7 +591,13 @@ def test_pp_pcp_ep_sp_scaling_matches_roofline_and_bytes():
     decode = _step(mla, "decode", 1, 1024, 1)
     eff = analyze_network_efficiency(mla, scope="body", phase="decode", tokens=1, context=1024, sequences=1)
     assert _rel(eff["graph_duration_ms"], decode["duration_ms"]) <= REL_TOL
-    _conserve(eff, decode["duration_ms"])
+    # A3 decode EP>1 uses MC2 V2 protocol streams whose cross-stream wait exceeds standalone mc2_protocol duration.
+    mc2_tl_ms = sum(row["elapsed_ms"] for row in decode["timeline"] if row["family"] == "mc2_protocol")
+    mc2_op_ms = sum(row["total_ms"] for row in eff["operators"] if row["family"] == "mc2_protocol")
+    assert 0.0 <= decode["duration_ms"] - eff["operator_sum_ms"] <= max(1e-6, mc2_tl_ms - mc2_op_ms)
+    assert sum(op["duration_ms"] * op["occurrences"] for op in eff["operators"]) == pytest.approx(eff["operator_sum_ms"], rel=1e-12)
+    assert sum(op["link_bytes"] * op["occurrences"] for op in eff["operators"]) == pytest.approx(eff["total_link_bytes"], abs=1e-6)
+    assert sum(op["hbm_bytes"] * op["occurrences"] for op in eff["operators"]) == pytest.approx(eff["total_hbm_bytes"], rel=1e-9)
     rows = dict(cache_row_bytes_by_layer(parse_case(mla).model))
     stores = [op for op in eff["operators"] if op["recipe"] == "kv_store"]
     ropes = [op for op in eff["operators"] if op["recipe"] == "rotary"]
@@ -591,6 +607,6 @@ def test_pp_pcp_ep_sp_scaling_matches_roofline_and_bytes():
     assert len({op["hbm_bytes"] for op in ropes}) == 1 and ropes[0]["hbm_bytes"] > 0
     assert min(op["hbm_bytes"] for op in attn) > max(op["hbm_bytes"] for op in stores)
     moe_link = sum(op["link_bytes"] * op["occurrences"] for op in eff["operators"]
-        if op["recipe"] in {"expert_dispatch", "expert_combine"})
+        if op["recipe"] in {"expert_dispatch", "expert_combine", "arch22_v2_declared_peer_channel"})
     assert moe_link > 0
     assert moe_link <= eff["total_link_bytes"]

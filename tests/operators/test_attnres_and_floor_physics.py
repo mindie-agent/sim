@@ -568,19 +568,19 @@ def test_attnres_requires_a5_hardware_ple_conv_honors_speculative_k_and_zero_leg
     from mindie_sim.prediction.operators.hyper_connections import family_attnres
     from mindie_sim.prediction.structure import parse_case
 
-    # 1. AttnRes is blocked on A2/A3 even when explicitly bound in runtime.kernels.lowerings.
-    for hw_key, expect_active in (("a2", False), ("a3", False), ("a5", True)):
+    # 1. AttnRes is shipping-available on A2/A3/A5 via ProbedAbiRegistry (live A3/A5 verified)
+    #    and rejected only on unsupported/non-Ascend architectures.
+    for hw_key in ("a2", "a3", "a5"):
         raw = compose_case("kimi-k3.1", REPRESENTATIVE_SKUS[hw_key], layers=4, tp=1, ep=1)
         case = parse_case(raw)
         lows = dict(case.runtime.kernels.get("lowerings") or {})
-        if not expect_active:
-            assert "attention_residual" not in lows
         explicit_rt = replace(
             case.runtime,
             kernels={**dict(case.runtime.kernels), "lowerings": {**lows, "attention_residual": "vllm_ascend_attn_res_prefix"}},
         )
         sel = family_attnres.selection(explicit_rt, model=case.model, phase="decode", machine=case.machine)
-        assert (sel is not None) is expect_active
+        assert sel is not None
+    assert family_attnres._attnres_arch_supported("GPU") is False
 
     # 2. Qwen4 PLE conv state honors speculative proposal count (+61,440 B/req at K=3) via runtime & query_tokens.
     q4_raw = compose_case(

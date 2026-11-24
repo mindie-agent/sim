@@ -15,7 +15,14 @@ from dataclasses import dataclass, replace
 import math
 from typing import Any, Mapping, Sequence
 
-from mindie_sim.schema.common import ModelingError, dtype_bytes
+from mindie_sim.schema.common import (
+    EPLB_VARIANCE_DAMPING,
+    ORDER_STAT_M2_Z,
+    ModelingError,
+    dtype_bytes,
+    normal_max_order_z,
+    normal_max_order_z as _normal_max_order_z,
+)
 from .moe_callers_receipts import (
     ExpertReceipt,
     _build_expert_receipt,
@@ -43,24 +50,7 @@ _FULL_EAGER_GROUPED = "full_eager_allocation"
 _ROUTING_INDEX_BYTES = int(dtype_bytes("int32"))
 _RAW_EXPERT_COUNT_BYTES = int(dtype_bytes("int32"))
 _CAST_EXPERT_COUNT_BYTES = int(dtype_bytes("int64"))
-#: Variance damping factor when redundant EPLB or force-EPLB mitigates EP skew.
-EPLB_VARIANCE_DAMPING = 0.35
-#: Expected maximum of two standard normals (sqrt(2 / pi)).
-ORDER_STAT_M2_Z = math.sqrt(2.0 / math.pi)
-#: Precomputed ln(4 * pi) term in the asymptotic normal maximum order statistic.
-ORDER_STAT_LN_FOUR_PI = math.log(4.0 * math.pi)
-
-
-def _normal_max_order_z(rank_count: int) -> float:
-    """Closed-form expected maximum of ``rank_count`` standard normals."""
-    if rank_count <= 1:
-        return 0.0
-    if rank_count == 2:
-        return ORDER_STAT_M2_Z
-    log_m = math.log(float(rank_count))
-    root = math.sqrt(2.0 * log_m)
-    asymptotic = root - (math.log(log_m) + ORDER_STAT_LN_FOUR_PI) / (2.0 * root)
-    return max(ORDER_STAT_M2_Z, asymptotic)
+_STRAGGLER_ORDER_EPS = 1e-12
 
 
 def _eplb_damping_active(parallel, runtime=None) -> bool:
@@ -125,14 +115,25 @@ def _straggler_rank_moments(
         0.0,
         total_rows * rank_share * (1.0 - rank_share) * fpc * variance_scale,
     ))
-    active_ranks = min(ep, max(1, math.ceil(total_rows - 1e-12)))
-    z_order = _normal_max_order_z(active_ranks)
-    row_lower = float(math.ceil(total_rows / float(ep) - 1e-12))
-    row_upper = float(tokens * min(top_k, local_expert_count))
-    r_max = float(min(
-        int(row_upper),
-        max(int(row_lower), int(round(mean_rows + z_order * sigma_rows))),
-    ))
+    active_ranks = min(ep, max(1, math.ceil(total_rows - _STRAGGLER_ORDER_EPS)))
+    z_order = normal_max_order_z(active_ranks)
+    row_cap = float(tokens * min(top_k, local_expert_count))
+    if total_rows < 1.0:
+        # Exact indicator lower bound when zero_experts shrinks N_eff < 1.0:
+        # E[max_r R_r] >= P(at least one real assignment) = 1 - (1 - p_real)^(tokens * top_k).
+        n_draws = max(1, int(tokens) * int(top_k))
+        p_real = min(1.0, max(0.0, total_rows / float(n_draws)))
+        p_any = 1.0 - (1.0 - p_real) ** n_draws
+        row_lower = max(mean_rows, p_any)
+        row_upper = min(total_rows, row_cap)
+        r_max = min(row_upper, max(row_lower, mean_rows + z_order * sigma_rows))
+    else:
+        row_lower = float(math.ceil(total_rows / float(ep) - _STRAGGLER_ORDER_EPS))
+        row_upper = min(float(math.ceil(total_rows - _STRAGGLER_ORDER_EPS)), row_cap)
+        r_max = float(min(
+            int(row_upper),
+            max(int(row_lower), int(round(mean_rows + z_order * sigma_rows))),
+        ))
     mu_act = math.fsum(local_active)
     var_act = (
         math.fsum(a * (1.0 - a) for a in local_active)
@@ -140,7 +141,13 @@ def _straggler_rank_moments(
         * variance_scale
     )
     sigma_act = math.sqrt(max(0.0, var_act))
-    act_lower = max(1.0, float(math.ceil(total_active / float(ep) - 1e-12)))
+    if total_active < 1.0:
+        n_draws = max(1, int(tokens) * int(top_k))
+        p_real = min(1.0, max(0.0, total_rows / float(n_draws)))
+        p_any = 1.0 - (1.0 - p_real) ** n_draws
+        act_lower = min(r_max, max(mu_act, p_any))
+    else:
+        act_lower = max(1.0, float(math.ceil(total_active / float(ep) - _STRAGGLER_ORDER_EPS)))
     a_max = min(
         float(local_expert_count),
         r_max,

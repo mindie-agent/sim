@@ -54,6 +54,8 @@ class AttentionAccessSpec:
     window: int = 0
     noncausal: bool = False
     selected_rows_known: bool = False
+    unique_rows_known: bool = False
+    refill_rows_known: bool = False
 
     def __post_init__(self):
         if len(self.q_lengths) != len(self.context_lengths):
@@ -177,7 +179,8 @@ def _causal_pairs(q_len: int, context: int, window: int, noncausal: bool,
         if topk > 0:
             return float(q_len * min(horizon, topk))
         if window > 0:
-            return float(q_len * min(horizon, window))
+            # Upstream dsa_v41.py:1523,1684: trailing context window + whole current draft block.
+            return float(q_len * min(horizon, window + q_len))
         return float(q_len * horizon)
     total = 0
     for index in range(q_len):
@@ -202,15 +205,22 @@ def plan_attention_traffic(access: AttentionAccessSpec,
     pairs = math.fsum(
         _causal_pairs(int(q), int(c), access.window, access.noncausal, access.topk)
         for q, c in zip(access.q_lengths, access.context_lengths))
-    if access.unique_rows > 0:
-        unique_rows = int(access.unique_rows)
+    if access.unique_rows_known or access.unique_rows > 0:
+        unique_rows = max(0, int(access.unique_rows))
     else:
         unique_rows = sum(int(c) + int(q)
                           for q, c in zip(access.q_lengths, access.context_lengths))
-        if access.window > 0 and not access.noncausal:
-            unique_rows = sum(min(int(c) + int(q), access.window)
-                              for q, c in zip(access.q_lengths, access.context_lengths))
-    logical_rows = float(access.refill_rows) if access.refill_rows > 0 else pairs
+        if access.window > 0:
+            if access.noncausal:
+                unique_rows = sum(min(int(c) + int(q), access.window + int(q))
+                                  for q, c in zip(access.q_lengths, access.context_lengths))
+            else:
+                unique_rows = sum(min(int(c) + int(q), access.window)
+                                  for q, c in zip(access.q_lengths, access.context_lengths))
+    if access.refill_rows_known or access.refill_rows > 0:
+        logical_rows = float(max(0, access.refill_rows))
+    else:
+        logical_rows = pairs
     if access.selected_rows > 0:
         logical_rows = float(access.selected_rows)
     logical = logical_rows * row_bytes
@@ -281,20 +291,6 @@ def plan_index_key_traffic(access: IndexAccessSpec,
         scale_bytes=float(access.scale_bytes),
         working_set_bytes=hbm,
         residency_basis=basis,
-    )
-
-
-def apply_traffic_plan(op, traffic: TrafficPlan):
-    """Replace one operator's external traffic with a typed physical plan."""
-    metadata = dict(getattr(op, "metadata", ()) or ())
-    metadata["traffic_plan"] = traffic.to_dict()
-    metadata["traffic_plan_basis"] = traffic.residency_basis
-    return replace(
-        op,
-        hbm_bytes=traffic.hbm_read_bytes + traffic.hbm_write_bytes,
-        mte2_bytes=traffic.private_refill_bytes + traffic.index_bytes
-        + traffic.scale_bytes,
-        metadata=tuple(sorted(metadata.items())),
     )
 
 

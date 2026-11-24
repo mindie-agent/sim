@@ -591,19 +591,22 @@ _FLOAT_PAYLOAD_FORMATS = frozenset({"bf16", "fp16", "fp32"})
 
 
 def allow_abi_extension(runtime) -> bool:
-    """Return True when the active feature track or runtime explicitly permits ABI extensions."""
+    """Return True iff canonical ``stack_track`` is ``target`` or runtime explicitly opts in."""
     rmeta = dict(getattr(runtime, "metadata", ()) or ())
     if bool(rmeta.get("allow_megamoe_abi_extension", False)) or bool(
         rmeta.get("allow_extended_activation_abi", False)
     ):
         return True
-    report = rmeta.get("feature_track_report")
-    track = (
-        (report.get("feature_track") if isinstance(report, Mapping) else None)
-        or rmeta.get("feature_track")
+    single_spine = rmeta.get("single_spine")
+    raw_track = (
+        rmeta.get("stack_track")
+        or (single_spine.get("stack_track") if isinstance(single_spine, Mapping) else None)
         or ""
     )
-    return str(track).strip().lower() == "expected_ideal"
+    track = str(raw_track).strip().lower()
+    if track and track not in {"eager", "shipping", "proposed", "target"}:
+        raise ModelingError(f"megamoe_invalid_stack_track:{track!r}")
+    return track == "target"
 
 
 def _payload_dtype(up_meta: Mapping) -> str:

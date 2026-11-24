@@ -51,7 +51,7 @@ explicit `right_to_tp` AllToAll branch:
 
 ```json
 {
-  "implementation": "vllm_ascend_kimi_sequence_parallel",
+  "implementation": "vllm_ascend_sequence_parallel",
   "enable_expert_parallel": true,
   "padding": "none",
   "attention_output": "separate_reduce_scatter",

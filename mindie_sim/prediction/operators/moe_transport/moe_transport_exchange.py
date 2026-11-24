@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import replace
 import math
 
 from mindie_sim.catalog.ops import comm_op
@@ -225,30 +226,33 @@ def combine(*, prefix, plan, stage, requests, deps, transport, rows, width, ep,
             ("traffic_model", getattr(payload_dispatch, "basis", "")),
             ("peer_source_rank", getattr(payload_dispatch, "rank", 0)),
         )
-    return comm_op(
-        op_id=prefix + ".expert_combine", deps=(deps,), stage=stage,
-        layer=plan.index, requests=requests, family="alltoall", phase=mode,
-        recipe="expert_combine",
-        link_bytes=link_bytes,
-        shape=(_ceil_rows(rows), width),
-        metadata=(("group_axis", "ep"),
-                  ("source_assignment_partitions", partitions),
-                  ("traffic_model", "transpose_dispatch_peer_rows"),
-                  ("collective_id", prefix + ".expert_combine"),
-                  *reverse,
-                  ("payload_kind", "bf16_return_rows"),
-                  ("payload_dtype", "bf16"),
-                  ("combine_dtype", "bf16"),
-                  ("row_elements", width),
-                  ("row_bytes", width * transport.return_bytes),
-                  ("dispatch_dtype", transport.dispatch_dtype),
-                  ("eplb_peak_to_avg", transport.eplb_peak_to_avg),
-                  (_EXPERT_ROW_FORMAT, (
-                      {"forward_bytes": int(transport.row_bytes(width)),
-                       "reverse_bytes": int(width * transport.return_bytes)}
-                      if transport.inline_scales else
-                      {"elements": width,
-                       "forward_dtype": transport.payload_dtype,
-                       "reverse_dtype": "bf16"})),
-                  *peer_metadata),
+    return replace(
+        comm_op(
+            op_id=prefix + ".expert_combine", deps=(deps,), stage=stage,
+            layer=plan.index, requests=requests, family="alltoall", phase=mode,
+            recipe="expert_combine",
+            link_bytes=link_bytes,
+            shape=(_ceil_rows(rows), width),
+            metadata=(("group_axis", "ep"),
+                      ("source_assignment_partitions", partitions),
+                      ("traffic_model", "transpose_dispatch_peer_rows"),
+                      ("collective_id", prefix + ".expert_combine"),
+                      *reverse,
+                      ("payload_kind", "bf16_return_rows"),
+                      ("payload_dtype", "bf16"),
+                      ("combine_dtype", "bf16"),
+                      ("row_elements", width),
+                      ("row_bytes", width * transport.return_bytes),
+                      ("dispatch_dtype", transport.dispatch_dtype),
+                      ("eplb_peak_to_avg", transport.eplb_peak_to_avg),
+                      (_EXPERT_ROW_FORMAT, (
+                          {"forward_bytes": int(transport.row_bytes(width)),
+                           "reverse_bytes": int(width * transport.return_bytes)}
+                          if transport.inline_scales else
+                          {"elements": width,
+                           "forward_dtype": transport.payload_dtype,
+                           "reverse_dtype": "bf16"})),
+                      *peer_metadata),
+        ),
+        dtype="bf16",
     )

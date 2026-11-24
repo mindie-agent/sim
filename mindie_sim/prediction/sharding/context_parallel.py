@@ -29,7 +29,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import replace
+from dataclasses import dataclass, replace
 import math
 from typing import Any, Sequence
 
@@ -45,6 +45,7 @@ from mindie_sim.catalog.context_parallel import (
     pcp_rank_chunk_ranges,
     runtime_cp_flag as _runtime_flag,
     split_sparse_dcp_batch,
+    split_sparse_dcp_batch_per_sequence,
 )
 from mindie_sim.catalog.ops import comm_op, vector_op
 from mindie_sim.catalog.paired_sfa import SOURCE as PAIRED_SFA_SOURCE
@@ -115,6 +116,201 @@ CP_DECODE_COMM_STREAM = "cp_decode_comm_stream"
 CP_CHUNKED_PREFILL_STREAM = "cp_chunkedprefill_comm_stream"
 CP_WEIGHT_STREAM = "cp_weight_stream"
 CAUSAL_SPARSE_MODE = 3
+SHARDED_INDEXER_MIN_TILE_ROWS = 256
+SHARDED_INDEXER_TILE_BUDGET_BYTES = 256 * 1024 * 1024
+SHARDED_INDEXER_CANDIDATE_ENTRY_BYTES = 8
+SHARDED_FUSED_SORT_TOPK = 2048
+SHARDED_SORT_VECTOR_OPS = 8
+SHARDED_A3_CAST_OPS_PER_SORT = 2
+SHARDED_SORT_STAGES_PER_LAYER = 2
+_FUSED_SORT_BITONIC_HALF = 0.5
+_MIN_SHARDED_WORLD_FOR_FUSED_SORT = 2
+
+
+@dataclass(frozen=True, slots=True)
+class DcpLayerExecutionPlan:
+    """Authoritative per-layer DCP/PCP execution contract (UML-2a)."""
+
+    layer_id: int
+    rank_id: int
+    request_phase: str
+    kv_owner_layer: int
+    index_owner_layer: int
+    candidate_owner_layer: int
+    preprocess_mode: str
+    runs_query_allgather: bool
+    candidate_allgather_tiles: int
+    indexer_merge_kind: str
+    output_exchange_collective: str
+    output_pack_kernel: str
+    native_calls: tuple[str, ...] = ()
+
+
+def sharded_indexer_tile_rows(world_size: int, k_loc: int) -> int:
+    """Upstream ``sharded_indexer.py`` candidate AllGather tile height ``R_tile``."""
+    denom = SHARDED_INDEXER_CANDIDATE_ENTRY_BYTES * max(1, int(world_size)) * max(1, int(k_loc))
+    return max(SHARDED_INDEXER_MIN_TILE_ROWS, SHARDED_INDEXER_TILE_BUDGET_BYTES // denom)
+
+
+def sharded_candidate_allgather_tiles(num_prod: int, world_size: int, k_loc: int) -> int:
+    """Number of tiled candidate ``hcom_allGather_`` rounds (0 when ``num_prod == 0``)."""
+    n_rows = max(0, int(num_prod))
+    if n_rows <= 0 or int(world_size) <= 1:
+        return 0
+    r_tile = sharded_indexer_tile_rows(world_size, k_loc)
+    return (n_rows + r_tile - 1) // r_tile
+
+
+_MIN_FUSED_SORT_ROW_PERCENT = 75
+_FUSED_SORT_PERCENT_BASE = 100
+
+
+def sharded_fused_sort_eligible(
+    *,
+    world_size: int,
+    topk: int,
+    sort_candidates: bool = True,
+    fuse_sort: bool = True,
+    rows: int | None = None,
+    vector_cores: int | None = None,
+) -> bool:
+    """Exact upstream fused-sort predicate (``sharded_indexer.py:502``: ``W >= 7`` + >=75% core occupancy)."""
+    if (not sort_candidates or not fuse_sort
+            or int(topk) != SHARDED_FUSED_SORT_TOPK
+            or int(world_size) < _MIN_SHARDED_WORLD_FOR_FUSED_SORT):
+        return False
+    if rows is not None and vector_cores is not None and int(vector_cores) > 0:
+        if int(rows) * _FUSED_SORT_PERCENT_BASE < int(vector_cores) * _MIN_FUSED_SORT_ROW_PERCENT:
+            return False
+    log_k = math.log2(float(topk))
+    return float(world_size - 1) * log_k >= _FUSED_SORT_BITONIC_HALF * log_k * (log_k + 1.0)
+
+
+def build_dcp_layer_execution_plan(
+    *,
+    layer_id: int,
+    rank_id: int,
+    request_phase: str,
+    pcp_factor: int,
+    tp_gather: int,
+    dp_width: int,
+    sharded_indexer: bool,
+    arch: str,
+    num_prod_rows: int = 0,
+    topk: int = 0,
+    local_heads: int = 1,
+    v_dim: int = PACKED_C8_LATENT,
+    act_dtype: str = "bf16",
+    is_global_mixed_prefill: bool = False,
+    use_local_topk_output: bool = False,
+    sort_candidates: bool = True,
+    fuse_sort: bool = True,
+    preprocess_mode: str = "native_decomposed",
+    kv_owner_layer: int | None = None,
+    index_owner_layer: int | None = None,
+    candidate_owner_layer: int | None = None,
+) -> DcpLayerExecutionPlan:
+    """Build deterministic ``DcpLayerExecutionPlan`` covering P==W, mixed-prefill, and sharded sort."""
+    pcp_w = max(1, int(pcp_factor))
+    tp_w = max(1, int(tp_gather))
+    dp_w = max(1, int(dp_width))
+    dcp_world = pcp_w * tp_w * dp_w
+    a2a_degree = tp_w * dp_w
+    kv_owner = layer_id if kv_owner_layer is None else int(kv_owner_layer)
+    idx_owner = layer_id if index_owner_layer is None else int(index_owner_layer)
+    cand_owner = layer_id if candidate_owner_layer is None else int(candidate_owner_layer)
+
+    # Global/local mixed-prefill KV-gather bypass (replicated indexer): 0 Q-AG, 0 remap, 0 LSE exchange.
+    if is_global_mixed_prefill and not sharded_indexer:
+        return DcpLayerExecutionPlan(
+            layer_id=layer_id, rank_id=rank_id, request_phase=request_phase,
+            kv_owner_layer=kv_owner, index_owner_layer=idx_owner, candidate_owner_layer=cand_owner,
+            preprocess_mode=preprocess_mode, runs_query_allgather=False,
+            candidate_allgather_tiles=0, indexer_merge_kind="none",
+            output_exchange_collective="none", output_pack_kernel="none",
+            native_calls=(),
+        )
+
+    # Exact P == W > 1 switch: a2a_degree == 1 -> 0 Q AllGather, 0 hcom_alltoall_, PCP AllGather directly into LSE combine.
+    runs_q_ag = a2a_degree > 1
+    calls: list[str] = []
+    if runs_q_ag:
+        calls.extend(("_q_gather_prep_head_major_kernel", "hcom_allGather_"))
+
+    tiles = 0
+    merge_kind = "none"
+    if dcp_world > 1 and topk > 0:
+        if sharded_indexer:
+            k_loc = max(1, int(topk))
+            tiles = sharded_candidate_allgather_tiles(num_prod_rows, dcp_world, k_loc)
+            fused = (not use_local_topk_output) and sharded_fused_sort_eligible(
+                world_size=dcp_world, topk=topk, sort_candidates=sort_candidates, fuse_sort=fuse_sort,
+            )
+            merge_kind = "sharded_fused_sort" if fused else "sharded_unfused_sort"
+            is_a5 = str(arch or "").strip().upper() == "A5"
+            presorted = (
+                int(topk) == SHARDED_FUSED_SORT_TOPK
+                and bool(sort_candidates)
+            )
+            calls.append("_prepare_local_sort_inputs")
+            if not use_local_topk_output:
+                if presorted:
+                    if is_a5:
+                        calls.extend(("Sort", "GatherElements"))
+                    else:
+                        calls.extend(("Sort", "Cast", "GatherElementsV2"))
+                    calls.append("_pack_candidates")
+                    if tiles > 0:
+                        calls.extend(["hcom_allGather_"] * tiles)
+                    calls.append("_merge_candidates" if fused else "_merge_owner_prefix")
+                else:
+                    calls.append("_pack_candidates")
+                    if tiles > 0:
+                        calls.extend(["hcom_allGather_"] * tiles)
+                    calls.append("_unpack_candidates")
+                    if is_a5:
+                        calls.extend(("Sort", "GatherElements", "Sort", "GatherElements"))
+                    else:
+                        calls.extend(("Sort", "Cast", "GatherElementsV2", "Sort", "Cast", "GatherElementsV2"))
+                    calls.append("_select_local_candidates")
+        else:
+            merge_kind = "replicated_remap"
+            calls.append("_remap_sort")
+
+    if dcp_world <= 1:
+        out_coll = "none"
+        pack_k = "none"
+    else:
+        fast = is_fast_sfa_dcp_exchange(
+            pcp_factor=pcp_w, dp_width=dp_w, tp_gather=tp_w,
+            local_heads=local_heads, v_dim=v_dim, act_dtype=act_dtype,
+            defer_combine=False,
+        )
+        pack_k = (
+            "_pack_t1_peer" if (fast and num_prod_rows == 1)
+            else "_pack_token_peer" if fast
+            else "_pack_dcp_output_lse_kernel"
+        )
+        calls.append(pack_k)
+        if a2a_degree > 1 and pcp_w > 1:
+            out_coll = "alltoall_then_pcp_allgather"
+            calls.extend(("hcom_alltoall_", "hcom_allGather_"))
+        elif a2a_degree > 1:
+            out_coll = "alltoall"
+            calls.append("hcom_alltoall_")
+        else:
+            out_coll = "pcp_allgather_only"
+            calls.append("hcom_allGather_")
+        calls.append("_fused_merge_kernel" if fast else "_fused_dcp_lse_combine_kernel")
+
+    return DcpLayerExecutionPlan(
+        layer_id=layer_id, rank_id=rank_id, request_phase=request_phase,
+        kv_owner_layer=kv_owner, index_owner_layer=idx_owner, candidate_owner_layer=cand_owner,
+        preprocess_mode=preprocess_mode, runs_query_allgather=runs_q_ag,
+        candidate_allgather_tiles=tiles, indexer_merge_kind=merge_kind,
+        output_exchange_collective=out_coll, output_pack_kernel=pack_k,
+        native_calls=tuple(calls),
+    )
 
 
 def _is_power_of_two(value: int) -> bool:
@@ -319,7 +515,9 @@ def rewrite_quantized_allreduce(ops: Sequence[Any], runtime: Any, source_dtype: 
         op_meta = dict(getattr(op, "metadata", ()) or ())
         group_axis = str(op_meta.get("group_axis") or "tp")
         group_size = _allreduce_group_size(op, op_meta, parallel, bf16_bytes)
-        dtype_in = str(op.dtype or source_dtype or "bf16").strip().lower()
+        dtype_in = str(op.dtype or source_dtype or "").strip().lower()
+        if not dtype_in:
+            raise ModelingError(f"quantized_allreduce_dtype_required:{op.op_id}")
         if not quantized_allreduce_eligible(
             runtime, arch=arch, tp=group_size, act_dtype=dtype_in, rows=rows, hidden=hidden,
         ):
@@ -545,7 +743,9 @@ def emit_dcp_query_gather(
                     padded_shape=(rows, local_heads, head_width),
                     launch_shape=(rows, local_heads, head_width),
                     hbm_bytes=2.0 * size, mte2_bytes=size, mte3_bytes=size,
-                    dtype=act_dtype, stream=stream, metadata=stream_meta,
+                    dtype=act_dtype, stream=stream,
+                    metadata=(("kernel", "_q_gather_prep_head_major_kernel"),
+                              ("native_kinds", ("_q_gather_prep_head_major_kernel",))) + stream_meta,
                 )
                 ops.append(pack_op)
                 cur_deps = (pack_op.op_id,)
@@ -613,7 +813,7 @@ def emit_sfa_index_remap(
         phase=mode, recipe="sparse_index_remap", shape=(rows, topk),
         read_bytes_override=nbytes, write_bytes_override=nbytes,
         metadata=(("dcp_degree", int(layer_dcp)), ("cp_interleave", int(interleave)),
-                  ("kernel", "remap_sparse_indices_triton")),
+                  ("kernel", "_remap_sort"), ("native_kinds", ("_remap_sort",))),
     )
     ops.append(remap)
     return remap.op_id
@@ -639,7 +839,10 @@ def emit_sfa_prefill_kv_gather(
                   ("stream", CP_DECODE_COMM_STREAM),
                   ("sfa_prefill_compact_kv", recipe == "sfa_dcp_prefill_kv_gather")),
     )
-    gather = replace(gather, dtype=str(kv_dtype or "bf16"), stream=CP_DECODE_COMM_STREAM)
+    kv_dt = str(kv_dtype or "").strip()
+    if not kv_dt:
+        raise ModelingError("sfa_prefill_kv_gather_dtype_required")
+    gather = replace(gather, dtype=kv_dt, stream=CP_DECODE_COMM_STREAM)
     ops.append(gather)
     return gather.op_id
 
@@ -696,6 +899,50 @@ def emit_mtp_current_attention(
     return current.op_id
 
 
+def _emit_dcp_lse_merge(
+    ops: list[OpSpec], *, prefix: str, stage: int, layer: int,
+    requests: tuple[str, ...], mode: str, merge_deps: tuple[str, ...],
+    out_rows: int, local_heads: int, v_dim: int, act_dtype: str,
+    dcp_total: int, partial_count: int, row_packed_bytes: float,
+    elem_bytes: float, fast: bool, lse_wire: int,
+    pcp_factor: int, tp_gather: int, dp_width: int,
+    local_current_dep: str | None, meta_extra: tuple[tuple[str, Any], ...],
+) -> str:
+    elements = float(out_rows * local_heads * v_dim)
+    merge_read = float(dcp_total * out_rows * local_heads) * row_packed_bytes
+    if local_current_dep is not None:
+        merge_read += float(out_rows * local_heads) * (float(v_dim) * elem_bytes + float(FP32_BYTES))
+    merge_write = elements * elem_bytes
+    merge_kernel = "_fused_merge_kernel" if fast else "_fused_dcp_lse_combine_kernel"
+    merge_op = OpSpec(
+        op_id=f"{prefix}.dcp_lse_merge", deps=merge_deps,
+        stage=stage, layer=layer, requests=requests, phase=mode,
+        family="attention_merge", recipe="dcp_lse_merge",
+        semantic_shape=(out_rows, local_heads, v_dim),
+        local_shape=(out_rows, local_heads, v_dim),
+        padded_shape=(out_rows, local_heads, v_dim),
+        launch_shape=(out_rows, local_heads, v_dim),
+        vector_ops=float(MERGE_OPS) * elements * float(partial_count),
+        hbm_bytes=merge_read + merge_write, mte2_bytes=merge_read, mte3_bytes=merge_write,
+        dtype=act_dtype,
+        metadata=(
+            ("cp", int(dcp_total)),
+            ("cp_strategy", CP_STRATEGY),
+            ("dcp_exchange_path", "sfa_dcp_exchange_int32" if fast else "dcp_a2a_fused"),
+            ("dcp_factors", (int(pcp_factor), int(tp_gather), int(dp_width))),
+            ("lse_wire_bytes", int(lse_wire)),
+            ("partial_count", int(partial_count)),
+            ("partial_reduction", "logsumexp"),
+            ("merge_dtype", "fp32"),
+            ("defer_combine", local_current_dep is not None),
+            ("kernel", merge_kernel),
+            ("native_kinds", (merge_kernel,)),
+        ) + tuple(meta_extra),
+    )
+    ops.append(merge_op)
+    return merge_op.op_id
+
+
 def emit_dcp_output_exchange_combine(
     ops: list[OpSpec], *, prefix: str, stage: int, layer: int,
     requests: tuple[str, ...], mode: str, deps: tuple[str, ...],
@@ -735,6 +982,11 @@ def emit_dcp_output_exchange_combine(
     pack_read = float(packed_rows * packed_heads) * (float(v_dim) * elem_bytes + float(lse_in_bytes))
     pack_write = float(packed_rows * packed_heads) * row_packed_bytes
     stream_meta = (("stream", stream),) if stream else ()
+    pack_kernel = (
+        "_pack_t1_peer" if (fast and packed_rows == 1)
+        else "_pack_token_peer" if fast
+        else "_pack_dcp_output_lse_kernel"
+    )
     pack_op = OpSpec(
         op_id=f"{prefix}.dcp_output_pack", deps=deps,
         stage=stage, layer=layer, requests=requests, phase=mode,
@@ -747,7 +999,9 @@ def emit_dcp_output_exchange_combine(
         hbm_bytes=pack_read + pack_write, mte2_bytes=pack_read, mte3_bytes=pack_write,
         dtype=act_dtype, stream=stream,
         metadata=(("dcp_exchange_path", "sfa_dcp_exchange_int32" if fast else "dcp_a2a_fused"),
-                  ("lse_wire_bytes", int(lse_wire))) + stream_meta,
+                  ("lse_wire_bytes", int(lse_wire)),
+                  ("kernel", pack_kernel),
+                  ("native_kinds", (pack_kernel,))) + stream_meta,
     )
     ops.append(pack_op)
     cur_dep = pack_op.op_id
@@ -812,36 +1066,14 @@ def emit_dcp_output_exchange_combine(
         return cur_dep
     merge_deps = (cur_dep, local_current_dep) if local_current_dep is not None else (cur_dep,)
     partial_count = dcp_total + (1 if local_current_dep is not None else 0)
-    elements = float(out_rows * local_heads * v_dim)
-    merge_read = float(dcp_total * out_rows * local_heads) * row_packed_bytes
-    if local_current_dep is not None:
-        merge_read += float(out_rows * local_heads) * (float(v_dim) * elem_bytes + float(FP32_BYTES))
-    merge_write = elements * elem_bytes
-    merge_op = OpSpec(
-        op_id=f"{prefix}.dcp_lse_merge", deps=merge_deps,
-        stage=stage, layer=layer, requests=requests, phase=mode,
-        family="attention_merge", recipe="dcp_lse_merge",
-        semantic_shape=(out_rows, local_heads, v_dim),
-        local_shape=(out_rows, local_heads, v_dim),
-        padded_shape=(out_rows, local_heads, v_dim),
-        launch_shape=(out_rows, local_heads, v_dim),
-        vector_ops=float(MERGE_OPS) * elements * float(partial_count),
-        hbm_bytes=merge_read + merge_write, mte2_bytes=merge_read, mte3_bytes=merge_write,
-        dtype=act_dtype,
-        metadata=(
-            ("cp", int(dcp_total)),
-            ("cp_strategy", CP_STRATEGY),
-            ("dcp_exchange_path", "sfa_dcp_exchange_int32" if fast else "dcp_a2a_fused"),
-            ("dcp_factors", (int(pcp_factor), int(tp_gather), int(dp_width))),
-            ("lse_wire_bytes", int(lse_wire)),
-            ("partial_count", int(partial_count)),
-            ("partial_reduction", "logsumexp"),
-            ("merge_dtype", "fp32"),
-            ("defer_combine", bool(defer_combine)),
-        ) + tuple(meta_extra),
+    return _emit_dcp_lse_merge(
+        ops, prefix=prefix, stage=stage, layer=layer, requests=requests, mode=mode,
+        merge_deps=merge_deps, out_rows=out_rows, local_heads=local_heads, v_dim=v_dim,
+        act_dtype=act_dtype, dcp_total=dcp_total, partial_count=partial_count,
+        row_packed_bytes=row_packed_bytes, elem_bytes=elem_bytes, fast=fast,
+        lse_wire=lse_wire, pcp_factor=pcp_factor, tp_gather=tp_gather, dp_width=dp_width,
+        local_current_dep=local_current_dep, meta_extra=meta_extra,
     )
-    ops.append(merge_op)
-    return merge_op.op_id
 
 
 def emit_v41_pcp_c2_ring_gather(
@@ -934,10 +1166,12 @@ def emit_pcp_restore_unpermute(
     elems = max(1, int(round(float(global_rows) * float(row_bytes) / eb)))
     nbytes = float(global_rows) * float(row_bytes)
     stream_meta = (("stream", stream),) if stream else ()
+    if not str(dtype or "").strip():
+        raise ModelingError(f"pcp_restore_dtype_required:{name}")
     restore = vector_op(
         op_id=f"{prefix}.{name}", deps=(dep,), stage=stage, layer=layer,
         requests=requests, elements=elems, ops_per_element=UNPERMUTE_VECTOR_OPS,
-        dtype=str(dtype or "bf16"), family="elementwise", phase=mode,
+        dtype=str(dtype).strip(), family="elementwise", phase=mode,
         recipe=name, shape=(global_rows, max(1, int(round(row_bytes / eb)))),
         read_bytes_override=nbytes, write_bytes_override=nbytes,
         metadata=(("pcp_restore_idx", True),) + tuple(meta_extra) + stream_meta,
@@ -986,8 +1220,10 @@ def emit_pcp_hidden_gather_restore(
                    ("comm_group_size", int(pcp)), ("pcp_quantized_wire", True),
                    ("scale_bytes_per_peer", float(per_peer * FP32_BYTES))) + src_meta + stream_meta
     else:
+        if not str(act_dtype or "").strip():
+            raise ModelingError(f"pcp_hidden_gather_dtype_required:{gather_name}")
         wire = float(per_peer * hidden) * elem_bytes * float(pcp - 1)
-        wire_dtype = str(act_dtype or "bf16")
+        wire_dtype = str(act_dtype).strip()
         ag_meta = (("group_axis", "pcp"), ("comm_axis", "pcp"),
                    ("comm_group_size", int(pcp))) + src_meta + stream_meta
     ag = comm_op(
@@ -999,13 +1235,15 @@ def emit_pcp_hidden_gather_restore(
     ops.append(ag)
     cur = ag.op_id
     if quantized:
+        if not str(act_dtype or "").strip():
+            raise ModelingError(f"pcp_hidden_dequant_dtype_required:{gather_name}")
         g_in = float(per_peer * pcp * hidden * INT8_BYTES + per_peer * pcp * FP32_BYTES)
         g_out = float(per_peer * pcp * hidden) * elem_bytes
         dq_op = vector_op(
             op_id=f"{prefix}.{gather_name}_dequant", deps=(cur,),
             stage=stage, layer=layer, requests=requests,
             elements=per_peer * pcp * hidden, ops_per_element=DEQUANT_VECTOR_OPS,
-            dtype=str(act_dtype or "bf16"), family="vector", phase=mode,
+            dtype=str(act_dtype).strip(), family="vector", phase=mode,
             recipe=f"{gather_name}_dequant", shape=(per_peer * pcp, hidden),
             read_bytes_override=g_in, write_bytes_override=g_out,
             metadata=(("input_format", "int8"), ("output_format", act_dtype),
@@ -1039,7 +1277,10 @@ def emit_pcp_o_proj_weight_allgather(
                   ("comm_group_size", int(pcp)), ("stream", CP_WEIGHT_STREAM),
                   ("source", "weight_switch/o_proj.py")),
     )
-    ag = replace(ag, dtype=str(weight_dtype or "bf16"), stream=CP_WEIGHT_STREAM)
+    wt_dt = str(weight_dtype or "").strip()
+    if not wt_dt:
+        raise ModelingError("pcp_o_proj_weight_dtype_required")
+    ag = replace(ag, dtype=wt_dt, stream=CP_WEIGHT_STREAM)
     ops.append(ag)
     return ag.op_id
 
@@ -1049,6 +1290,151 @@ def paired_sfa_calls(heads: int) -> tuple[int, ...]:
     if heads < PAIRED_SFA_CALLS or heads % PAIRED_SFA_CALLS:
         raise ModelingError("paired_sfa_requires_even_gathered_heads")
     return (heads // PAIRED_SFA_CALLS,) * PAIRED_SFA_CALLS
+
+
+def _round_per_query_selected_rows(
+    owned_per_q: Sequence[int], raw_sel_per_q: Sequence[float],
+) -> list[int]:
+    """Largest-remainder integer rounding capped by ``owned_per_q`` conserving sequence total."""
+    qv = len(owned_per_q)
+    target_total = min(sum(owned_per_q), int(round(sum(raw_sel_per_q))))
+    sel_ints = [min(owned_per_q[i], int(math.floor(raw_sel_per_q[i]))) for i in range(qv)]
+    rem = target_total - sum(sel_ints)
+    if rem > 0:
+        order = sorted(
+            range(qv),
+            key=lambda i: (raw_sel_per_q[i] - sel_ints[i], owned_per_q[i] - sel_ints[i]),
+            reverse=True,
+        )
+        for idx_r in order:
+            if rem <= 0:
+                break
+            if sel_ints[idx_r] < owned_per_q[idx_r]:
+                sel_ints[idx_r] += 1
+                rem -= 1
+    return sel_ints
+
+
+def _packed_sfa_dcp_critical_sequences(
+    views: Sequence[Any],
+    *,
+    degree: int,
+    raw_topk: int,
+    eff_interleave: int,
+    pool_size: int,
+    pool_tail: bool,
+    runtime: Any,
+) -> tuple[
+    int, int, float, tuple[tuple[int, int], ...], tuple[int, ...],
+    tuple[int, ...], tuple[str, ...], tuple[tuple[tuple[int, float], ...], ...],
+]:
+    """Compute exact per-rank sparse DCP selection and critical-rank local horizons.
+
+    Pools all active queries across ``views`` into one batch-level
+    ``split_sparse_dcp_batch_per_sequence`` call so variance pooling matches
+    ``pool_sparse_view_records`` (P1-9).
+    """
+    per_rank_totals = [0.0] * degree
+    per_rank_by_seq: list[list[float]] = [[0.0] * len(views) for _ in range(degree)]
+    per_seq_q_counts: list[int] = []
+    per_seq_query_horizons: list[list[int]] = []
+    per_seq_query_selected: list[list[tuple[float, ...]]] = []
+    active_coords: list[tuple[int, int]] = []
+    batch_seqs: list[SparseDcpSequence] = []
+    for seq_idx, v in enumerate(views):
+        qv = max(0, int(v.q_len))
+        per_seq_q_counts.append(qv)
+        q_horizons: list[int] = []
+        q_sels: list[tuple[float, ...]] = []
+        for offset in range(qv):
+            horizon = min(int(v.kv_len), int(v.context) + offset + 1)
+            q_horizons.append(horizon)
+            q_sels.append((0.0,) * degree)
+            if horizon > 0:
+                tail_rows = horizon % pool_size if pool_size > 1 and pool_tail else 0
+                active_coords.append((seq_idx, offset))
+                batch_seqs.append(SparseDcpSequence(
+                    kv_len=horizon,
+                    selected_rows=float(min(horizon, raw_topk)),
+                    q_weight=1.0,
+                    compress_ratio=1,
+                    always_select_tail=tail_rows,
+                ))
+        per_seq_query_horizons.append(q_horizons)
+        per_seq_query_selected.append(q_sels)
+    if batch_seqs:
+        _, per_query_splits = split_sparse_dcp_batch_per_sequence(
+            batch_seqs, degree, eff_interleave, runtime=runtime, unit="rows",
+        )
+        for (seq_idx, offset), split_vals in zip(active_coords, per_query_splits):
+            vals = tuple(float(split_vals[r]) for r in range(degree))
+            per_seq_query_selected[seq_idx][offset] = vals
+            for r in range(degree):
+                per_rank_by_seq[r][seq_idx] += vals[r]
+                per_rank_totals[r] += vals[r]
+    total_q = sum(per_seq_q_counts)
+    r_star = max(range(degree), key=lambda r: per_rank_totals[r])
+    mean_rank = sum(per_rank_totals) / float(degree)
+    cp_sparse_imb = (per_rank_totals[r_star] / mean_rank) if mean_rank > 0.0 else 1.0
+    sharded_topk = (
+        max(1, math.ceil(per_rank_totals[r_star] / float(total_q)))
+        if total_q > 0 and per_rank_totals[r_star] > 0.0
+        else (0 if per_rank_totals[r_star] == 0.0 else max(1, -(-raw_topk // degree)))
+    )
+    per_query_selected_rows_by_rank = tuple(
+        tuple(
+            (per_seq_q_counts[idx], round(per_rank_by_seq[r][idx], 4))
+            for idx in range(len(views))
+        )
+        for r in range(degree)
+    )
+    seq_entries: list[tuple[int, int]] = []
+    topk_entries: list[int] = []
+    extent_entries: list[int] = []
+    key_entries: list[str] = []
+    for seq_idx, v in enumerate(views):
+        qv = per_seq_q_counts[seq_idx]
+        prefix_cap = min(int(v.prefix_tokens or 0), int(v.context))
+        ext = (
+            owned_positions(0, prefix_cap - 1, degree, eff_interleave, r_star)
+            if prefix_cap > 0 else 0
+        )
+        pkey = str(v.prefix_cache_key or "")
+        if qv <= 0:
+            seq_entries.append((0, 0))
+            topk_entries.append(0)
+            extent_entries.append(ext)
+            key_entries.append(pkey)
+            continue
+        owned_per_q = [
+            owned_positions(0, h - 1, degree, eff_interleave, r_star) if h > 0 else 0
+            for h in per_seq_query_horizons[seq_idx]
+        ]
+        raw_sel_per_q = [per_seq_query_selected[seq_idx][off][r_star] for off in range(qv)]
+        sel_ints = _round_per_query_selected_rows(owned_per_q, raw_sel_per_q)
+        step_one = all(owned_per_q[j] == owned_per_q[0] + j for j in range(qv))
+        max_sel = max(sel_ints, default=0)
+        exact_compact = (
+            step_one
+            and owned_per_q[0] >= 1
+            and all(min(owned_per_q[j], max_sel) == sel_ints[j] for j in range(qv))
+        )
+        if exact_compact:
+            seq_entries.append((qv, max(0, owned_per_q[0] - 1)))
+            topk_entries.append(max_sel)
+            extent_entries.append(ext)
+            key_entries.append(pkey)
+        else:
+            for off in range(qv):
+                seq_entries.append((1, max(0, owned_per_q[off] - 1)))
+                topk_entries.append(sel_ints[off])
+                extent_entries.append(ext)
+                key_entries.append(pkey)
+    return (
+        r_star, sharded_topk, cp_sparse_imb,
+        tuple(seq_entries), tuple(topk_entries), tuple(extent_entries),
+        tuple(key_entries), per_query_selected_rows_by_rank,
+    )
 
 
 def packed_sfa_geometry(
@@ -1081,57 +1467,30 @@ def packed_sfa_geometry(
         )
         pool_size = max(1, int(getattr(plan, "index_kpool", 1) or 1))
         pool_tail = bool(getattr(plan, "index_kpool_always_select_tail", False))
-        seqs = tuple(
-            SparseDcpSequence(
-                kv_len=int(v.kv_len),
-                selected_rows=float(min(int(v.kv_len), raw_topk)),
-                q_weight=float(max(0, int(v.q_len))),
-                compress_ratio=1,
-                always_select_tail=(
-                    int(v.kv_len) % pool_size if pool_size > 1 and pool_tail else 0
-                ),
-            )
-            for v in views
-        )
-        split = split_sparse_dcp_batch(
-            seqs, degree, eff_interleave, runtime=runtime, unit="pairs",
-        )
-        total_q = sum(max(0, int(v.q_len)) for v in views)
-        r_star = max(range(degree), key=lambda r: split.per_rank[r])
-        sharded_topk = (
-            max(1, math.ceil(split.per_rank[r_star] / float(total_q)))
-            if total_q > 0 and split.per_rank[r_star] > 0.0
-            else max(1, -(-raw_topk // degree))
-        )
-        cp_sparse_imb = float(split.imbalance)
-        sequences = tuple(
-            (
-                int(v.q_len),
-                max(
-                    0,
-                    owned_positions(0, int(v.kv_len) - 1, degree, eff_interleave, r_star)
-                    - int(v.q_len),
-                ),
-            )
-            for v in views
-        )
-        extents = tuple(
-            owned_positions(
-                0, min(int(v.prefix_tokens or 0), int(v.context)) - 1,
-                degree, eff_interleave, r_star,
-            )
-            if min(int(v.prefix_tokens or 0), int(v.context)) > 0 else 0
-            for v in views
+        (
+            r_star, sharded_topk, cp_sparse_imb, sequences,
+            per_sequence_topk, extents, keys, per_query_selected_rows_by_rank,
+        ) = _packed_sfa_dcp_critical_sequences(
+            views,
+            degree=degree,
+            raw_topk=raw_topk,
+            eff_interleave=eff_interleave,
+            pool_size=pool_size,
+            pool_tail=pool_tail,
+            runtime=runtime,
         )
     else:
+        r_star = 0
         sharded_topk = max(1, -(-raw_topk // degree)) if raw_topk > 0 else 0
         cp_sparse_imb = 1.0
+        per_sequence_topk = tuple(min(int(v.kv_len), sharded_topk) for v in views)
+        per_query_selected_rows_by_rank = ()
         sequences = tuple((int(v.q_len), max(0, -(-int(v.context) // degree))) for v in views)
         extents = tuple(
             max(0, -(-min(int(v.prefix_tokens or 0), int(v.context)) // degree))
             for v in views)
+        keys = tuple(str(v.prefix_cache_key or "") for v in views)
     shared = getattr(runtime, "prefix_cache_mode", "private") == "shared" and any(extents)
-    keys = tuple(str(v.prefix_cache_key or "") for v in views)
     # Upstream ``device_op.py:660-667`` executes packed INT8 QSFA in one single
     # kernel call over all gathered query heads (e.g. 96 gathered heads).
     return {
@@ -1143,6 +1502,9 @@ def packed_sfa_geometry(
             "prefix_cache_keys": keys} if shared else {"prefix_cache_mode": "private"}),
         "paired_calls": SINGLE_SFA_CALL, "dcp_peer_exchange": int(cp),
         "cp_sparse_imbalance": cp_sparse_imb,
+        "critical_rank": int(r_star),
+        "per_sequence_topk": per_sequence_topk,
+        "per_query_selected_rows_by_rank": per_query_selected_rows_by_rank,
     }
 
 
@@ -1286,10 +1648,59 @@ def _bind_dcp_merge_dram(context: Any) -> Any:
     return replace(context, service_modes={**context.service_modes, "hbm": ("hbm", ceiling)})
 
 
+def _dcp_lse_admit_bytes(
+    view: Any,
+    *,
+    buf_id: str,
+    nbytes: int,
+    direction: str,
+    private_workspace: bool,
+    live_out: bool,
+) -> float:
+    """Admit one contiguous LSE chain access through canonical ``AdmissionMemoryView``."""
+    from mindie_sim.prediction.runtime.memory_physics import (
+        DEFAULT_SECTOR_BYTES,
+        AddressRun,
+        AddressRunPlan,
+        MemoryAccessPattern,
+        ReuseKey,
+        VisibilityContract,
+    )
+    nbytes_int = int(round(nbytes))
+    if nbytes_int <= 0:
+        return 0.0
+    plan = AddressRunPlan(
+        (AddressRun(0, 1, nbytes_int, nbytes_int),),
+        alignment_bytes=1,
+        sector_bytes=DEFAULT_SECTOR_BYTES,
+    )
+    pattern = MemoryAccessPattern(
+        tensor_id=buf_id,
+        version=0,
+        die=0,
+        owner=0,
+        direction=direction,  # type: ignore[arg-type]
+        pipe="mte2_aiv" if direction == "read" else "mte3",
+        logical_bytes=nbytes_int,
+        runs=plan,
+        reuse_key=ReuseKey(0, buf_id, 0, "dcp_lse_eager"),
+        visibility=VisibilityContract(
+            live_out=live_out,
+            private_workspace=private_workspace,
+        ),
+    )
+    _, miss = view.admit_access(pattern, nbytes_int)
+    evicted_wb = sum(wb.bytes for wb in view.drain_writebacks(0))
+    return float(miss + evicted_wb)
+
+
 def expand_dcp_lse_eager_kernels(
     op: OpSpec, *, l2_bytes: int, include_stack: bool = False, local_ids: bool = False,
 ) -> tuple[OpSpec, ...]:
     """Expand a ``dcp_lse_merge`` call into the 9-kernel eager LSE combine chain."""
+    from mindie_sim.prediction.runtime.l2_residency import AdmissionMemoryView
+    from mindie_sim.prediction.runtime.memory_physics import ReuseKey
+
     meta = dict(op.metadata)
     cp = max(2, int(meta.get("partial_count") or meta.get("cp") or 2))
     shape = tuple(int(d) for d in (op.local_shape or op.semantic_shape or (1, 1, 1)))
@@ -1299,7 +1710,10 @@ def expand_dcp_lse_eager_kernels(
         rows, heads, dim = 1, max(1, shape[0]), max(1, shape[1])
     else:
         rows, heads, dim = 1, 1, max(1, shape[0])
-    out_bytes = dtype_bytes(op.dtype or "bf16")
+    op_dtype = str(op.dtype or "").strip()
+    if not op_dtype:
+        raise ModelingError("dcp_lse_merge_dtype_required")
+    out_bytes = dtype_bytes(op_dtype)
     n_lse = cp * rows * heads
     n_out = cp * rows * heads * dim
     lse_b = n_lse * FP32_BYTES
@@ -1309,58 +1723,92 @@ def expand_dcp_lse_eager_kernels(
     res_fp32_b = rows * heads * dim * FP32_BYTES
     res_out_b = rows * heads * dim * out_bytes
 
-    def _hbm_bytes(rd: int, wr: int, l2_in: int, *, writeback_l2: bool = False) -> float:
-        fits_l2 = l2_bytes > 0 and (rd + wr) <= l2_bytes
-        hit = min(rd, l2_in) if fits_l2 else 0
-        # Ephemeral chain intermediates whose inputs and outputs fit in L2 stay
-        # in write-back L2 until consumed by the next kernel (zero HBM spill).
-        hbm_wr = 0 if (writeback_l2 and fits_l2 and hit >= rd) else wr
-        return float(max(0, rd - hit) + hbm_wr)
-
     def _cid(suffix: str) -> str:
         return suffix if local_ids else f"{op.op_id}.{suffix}"
 
     base_deps = () if local_ids else tuple(op.deps)
-    specs: list[tuple[str, tuple[str, ...], str, int, int, int, int, int, str]] = []
+    # Each tuple: (suffix, deps, dt, numel, vops, reads, write_spec, retire_bufs, vsub)
+    # reads: tuple[(buf_id, bytes)]; write_spec: (buf_id, bytes, private_workspace, live_out)
+    specs: list[tuple[
+        str, tuple[str, ...], str, int, int,
+        tuple[tuple[str, int], ...], tuple[str, int, bool, bool],
+        tuple[str, ...], str,
+    ]] = []
     if include_stack:
-        specs.append(("lse_stack", base_deps, "fp32", n_lse, n_lse, lse_b, lse_b, 0, ""))
-        amax_deps, amax_l2 = (_cid("lse_stack"),), lse_b
+        specs.append((
+            "lse_stack", base_deps, "fp32", n_lse, n_lse,
+            (("lse_in", lse_b),), ("lse_buf", lse_b, True, False), (), "",
+        ))
+        amax_deps, lse_key = (_cid("lse_stack"),), "lse_buf"
     else:
-        amax_deps, amax_l2 = base_deps, 0
+        amax_deps, lse_key = base_deps, "lse_in"
     specs.extend((
-        ("amax", amax_deps, "fp32", n_lse, n_lse, lse_b, red_lse_b, amax_l2, ""),
-        ("sub", (_cid("amax"),), "fp32", n_lse, n_lse, lse_b + red_lse_b, lse_b, lse_b + red_lse_b, ""),
-        ("exp", (_cid("sub"),), "fp32", n_lse, ATTENTION_UPDATE_LSE_EXP_OPS * n_lse, lse_b, lse_b, lse_b, ""),
-        ("wsum", (_cid("exp"),), "fp32", n_lse, n_lse, lse_b, red_lse_b, lse_b, ""),
-        ("wdiv", (_cid("wsum"),), "fp32", n_lse, n_lse, lse_b + red_lse_b, lse_b, lse_b + red_lse_b, ""),
-        ("cast32", (_cid("wdiv"),), "fp32", n_out, n_out, ol_in_b, ol_fp32_b, 0, ""),
+        ("amax", amax_deps, "fp32", n_lse, n_lse,
+         ((lse_key, lse_b),), ("red_lse", red_lse_b, True, False), (), ""),
+        ("sub", (_cid("amax"),), "fp32", n_lse, n_lse,
+         ((lse_key, lse_b), ("red_lse", red_lse_b)), ("sub_lse", lse_b, True, False),
+         ("red_lse", *(() if lse_key == "lse_in" else ("lse_buf",))), ""),
+        ("exp", (_cid("sub"),), "fp32", n_lse, ATTENTION_UPDATE_LSE_EXP_OPS * n_lse,
+         (("sub_lse", lse_b),), ("exp_lse", lse_b, True, False), ("sub_lse",), ""),
+        ("wsum", (_cid("exp"),), "fp32", n_lse, n_lse,
+         (("exp_lse", lse_b),), ("wsum_lse", red_lse_b, True, False), (), ""),
+        ("wdiv", (_cid("wsum"),), "fp32", n_lse, n_lse,
+         (("exp_lse", lse_b), ("wsum_lse", red_lse_b)), ("weights", lse_b, True, False),
+         ("exp_lse", "wsum_lse"), ""),
+        ("cast32", (_cid("wdiv"),), "fp32", n_out, n_out,
+         (("ol_in", ol_in_b),), ("ol_fp32", ol_fp32_b, True, False), (), ""),
     ))
     if include_stack:
-        specs.append(("o_stack", (_cid("cast32"),), "fp32", n_out, n_out, ol_fp32_b, ol_fp32_b, ol_fp32_b, ""))
-        mul_deps = (_cid("o_stack"),)
+        specs.append((
+            "o_stack", (_cid("cast32"),), "fp32", n_out, n_out,
+            (("ol_fp32", ol_fp32_b),), ("ol_stacked", ol_fp32_b, True, False),
+            ("ol_fp32",), "",
+        ))
+        mul_deps, ol_key = (_cid("o_stack"),), "ol_stacked"
     else:
-        mul_deps = (_cid("cast32"),)
+        mul_deps, ol_key = (_cid("cast32"),), "ol_fp32"
     specs.extend((
-        ("mul", mul_deps, "fp32", n_out, n_out, ol_fp32_b + lse_b, ol_fp32_b, ol_fp32_b + lse_b, "broadcast_elementwise"),
-        ("osum", (_cid("mul"),), "fp32", n_out, n_out, ol_fp32_b, res_fp32_b, ol_fp32_b, "outer_axis_reduction"),
-        ("cast16", (_cid("osum"),), op.dtype or "bf16", rows * heads * dim, rows * heads * dim, res_fp32_b, res_out_b, res_fp32_b, ""),
+        ("mul", mul_deps, "fp32", n_out, n_out,
+         ((ol_key, ol_fp32_b), ("weights", lse_b)), ("mul_out", ol_fp32_b, True, False),
+         (ol_key, "weights"), "broadcast_elementwise"),
+        ("osum", (_cid("mul"),), "fp32", n_out, n_out,
+         (("mul_out", ol_fp32_b),), ("res_fp32", res_fp32_b, True, False),
+         ("mul_out",), "outer_axis_reduction"),
+        ("cast16", (_cid("osum"),), op_dtype, rows * heads * dim, rows * heads * dim,
+         (("res_fp32", res_fp32_b),), ("res_out", res_out_b, False, True),
+         ("res_fp32",), ""),
     ))
+    l2_view = AdmissionMemoryView({0: max(0, int(l2_bytes))})
     child_meta = (("execution_class", "aiv_only"), ("cp", cp), ("partial_reduction", "logsumexp"))
-    return tuple(
-        OpSpec(
+    emitted: list[OpSpec] = []
+    for suffix, deps, dt, numel, vops, reads, write_spec, retire_bufs, vsub in specs:
+        rd_total = sum(nb for _, nb in reads)
+        wr_buf, wr_total, priv_ws, live_out = write_spec
+        hbm_total = 0.0
+        for r_buf, r_nb in reads:
+            hbm_total += _dcp_lse_admit_bytes(
+                l2_view, buf_id=r_buf, nbytes=r_nb, direction="read",
+                private_workspace=False, live_out=False,
+            )
+        hbm_total += _dcp_lse_admit_bytes(
+            l2_view, buf_id=wr_buf, nbytes=wr_total, direction="write",
+            private_workspace=priv_ws, live_out=live_out,
+        )
+        for dead_buf in retire_bufs:
+            l2_view.retire_workspace(ReuseKey(0, dead_buf, 0, "dcp_lse_eager"))
+        emitted.append(OpSpec(
             _cid(suffix), "vector", op.phase, op.stage, op.layer, op.requests,
             (numel,), (numel,), (numel,), (numel,),
             deps=deps, dtype=dt, stream=op.stream,
-            vector_ops=float(vops), mte2_bytes=float(rd), mte3_bytes=float(wr),
-            hbm_bytes=_hbm_bytes(rd, wr, l2_in, writeback_l2=bool(vsub)),
+            vector_ops=float(vops), mte2_bytes=float(rd_total), mte3_bytes=float(wr_total),
+            hbm_bytes=hbm_total,
             metadata=(
                 ("program_execution", {"execution_class": "aiv_only"}),
                 *child_meta,
                 *((("vector_submode", vsub),) if vsub else ()),
             ),
-        )
-        for suffix, deps, dt, numel, vops, rd, wr, l2_in, vsub in specs
-    )
+        ))
+    return tuple(emitted)
 
 
 def _expand_dcp_lse_merge_kernels(op: OpSpec) -> tuple[OpSpec, ...]:

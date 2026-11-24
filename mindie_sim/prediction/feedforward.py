@@ -12,8 +12,9 @@ from __future__ import annotations
 from dataclasses import replace
 import math
 
+from mindie_sim.backends.abi_registry import default_abi_registry
 from mindie_sim.catalog.ops import gemm_op, vector_op, comm_op, barrier_op
-from mindie_sim.schema.common import ModelingError, dtype_bytes
+from mindie_sim.schema.common import ModelingError, dtype_bytes, inclusion_probability
 from mindie_sim.prediction.operators.vector.gated_activation import (
     declare_situ_quant,
     gated_activation,
@@ -209,7 +210,7 @@ def _resolve_alltoall_moe_route(model, plan, parallel, runtime, *, overlap_share
         requested_mso=raw_mso,
         tp=int(getattr(parallel, "tp", 1) or 1),
         enable_shared_expert_dp=bool(meta.get("enable_shared_expert_dp", False)),
-        strict_level3=False,
+        strict_level3=(not _is_raw_eager(runtime) and raw_fused == FUSED_MC2_MEGAMOE_SHARED),
         mega_moe_requested=mega_req,
     )
     eff_mso = bool(route["effective_multistream_overlap_shared_expert"])
@@ -251,6 +252,235 @@ def _is_raw_eager(runtime) -> bool:
     )
 
 
+def _runtime_arch_upper(runtime) -> str:
+    if runtime is None:
+        return ""
+    meta = dict(getattr(runtime, "metadata", ()) or ())
+    return _normalize_arch_family(meta.get("arch_family")).upper()
+
+
+def validate_m10_moe_activation_legality(plan) -> None:
+    """Enforce hardware-verified M10 MoE ``is_act_and_mul=False`` guard (e.g. ``relu2``)."""
+    act = str(getattr(plan, "ffn_activation", "") or "").strip().lower()
+    is_act_and_mul = getattr(plan, "is_act_and_mul", None)
+    if (getattr(plan, "ffn", "") == "moe"
+            and (act in {"relu2", "relu_squared"} or is_act_and_mul is False)):
+        raise ModelingError(f"m10_moe_requires_is_act_and_mul:activation={act!r}")
+
+
+_CLIPPED_CLAMP_OPS_PER_ELEM = 3
+_CLIPPED_CLAMP_GATE_UP_FACTOR = 2
+_FLOAT_LINEAR_FORMATS = frozenset({"bf16", "bfloat16", "fp16", "float16", "fp32", "float32"})
+_SITU_UNFUSED_CLIPPED_KERNELS: tuple[str, ...] = (
+    "Cast", "Slice", "RealDiv", "Tanh", "Mul", "Slice", "Sigmoid", "Mul",
+    "Slice", "RealDiv", "Tanh", "Mul", "Mul", "Cast",
+)
+_SITU_UNFUSED_PLAIN_KERNELS: tuple[str, ...] = (
+    "Cast", "Slice", "RealDiv", "Tanh", "Mul", "Slice", "Sigmoid", "Mul",
+    "Slice", "Mul", "Cast",
+)
+
+
+def _is_unquantized_linear(layer_quant, category: str) -> bool:
+    """Return True iff both weight and activation formats for ``category`` are unquantized floats."""
+    if layer_quant is None:
+        return True
+    from mindie_sim.catalog.ops import compute_dtype_for
+
+    q = layer_quant.for_category(category)
+    wf = str(q.format_for(category) or "").strip().lower().replace("-", "_")
+    _, act_raw = compute_dtype_for(q, category)
+    af = str(act_raw or "").strip().lower().replace("-", "_")
+    return wf in _FLOAT_LINEAR_FORMATS and af in _FLOAT_LINEAR_FORMATS
+
+
+def _clipped_swiglu_eager_chain(
+    *, plan, rows: int, width: int, op_id: str, deps: tuple[str, ...],
+    stage: int, requests: tuple[str, ...], dtype: str, phase: str, recipe: str,
+) -> tuple[Any, ...]:
+    """Emit upstream A5 unfused ``clipped_swiglu`` (``ClipByValue`` + SwiGLU; ``device_op.py:1525``).
+
+    Conserves the exact total clamped expression vector ops across the two ops:
+    ``clamp_gate_up`` charges ``SWIGLU_CLAMP_OPS_PER_ELEMENT = 3`` ops per output
+    element (``min(gate, limit)`` + two-sided ``clamp(up, -limit, limit)``), and
+    the downstream SwiGLU op charges the remaining non-clamp expression ops so
+    nothing is double-counted.
+    """
+    elem_b = dtype_bytes(dtype)
+    out_elems = max(0, int(rows)) * max(0, int(width))
+    gate_up_elems = out_elems * _CLIPPED_CLAMP_GATE_UP_FACTOR
+    clamp = vector_op(
+        op_id=op_id + ".clamp_gate_up",
+        deps=deps,
+        stage=stage,
+        layer=plan.index,
+        requests=requests,
+        elements=out_elems,
+        ops_per_element=_CLIPPED_CLAMP_OPS_PER_ELEM,
+        dtype=dtype,
+        family="elementwise",
+        phase=phase,
+        recipe="clipped_swiglu_clamp",
+        shape=(int(rows), int(width) * _CLIPPED_CLAMP_GATE_UP_FACTOR),
+        read_bytes_override=gate_up_elems * elem_b,
+        write_bytes_override=gate_up_elems * elem_b,
+        metadata=(
+            ("native_kinds", ("ClipByValue",)),
+            ("clipped_swiglu_stage", "clamp_gate_up"),
+        ),
+    )
+    act = gated_activation(
+        plan=plan, rows=rows, width=width, op_id=op_id, deps=(clamp.op_id,),
+        stage=stage, requests=requests, dtype=dtype, phase=phase, recipe=recipe,
+    )
+    act = replace(act, vector_ops=max(0.0, float(act.vector_ops) - float(clamp.vector_ops)))
+    return (clamp, act)
+
+
+def _linear_act_dtype(layer_quant, category: str) -> str:
+    """Return normalized activation format for ``category``."""
+    if layer_quant is None:
+        return "bf16"
+    from mindie_sim.catalog.ops import compute_dtype_for
+
+    q = layer_quant.for_category(category)
+    _, act_raw = compute_dtype_for(q, category)
+    return str(act_raw or "").strip().lower().replace("-", "_")
+
+
+_SITU_ABI_PROBE_DEFAULT_WIDTH = 256
+
+
+def _verify_dequant_situ_quant_abi(
+    reg, arch: str, *, width: int = _SITU_ABI_PROBE_DEFAULT_WIDTH,
+) -> bool:
+    """Verify full input+output ``aclnnDequantSituQuant`` tuple via ``ProbedAbiRegistry.verify``."""
+    from mindie_sim.schema.abi import AbiQueryKey, OperandPortSig
+
+    sku_map = {"A2": "ascend910b2", "A3": "ascend910_9362", "A5": "ascend950dt_9582"}
+    even_w = max(2, int(width) if int(width) % 2 == 0 else int(width) + 1)
+    query = AbiQueryKey(
+        soc_arch=arch,  # type: ignore[arg-type]
+        sku_id=sku_map[arch],
+        abi_id="aclnnDequantSituQuant",
+        graph_motif="dequant_situ_quant",
+        model_scope="target",
+        draft_quant_mode="none",
+        pr_track="shipping",
+        operands=(OperandPortSig(
+            role="x", dtype="bf16", layout="ND", transposed=False,
+            shape=(1, even_w), quant_mode="dense", group_shape=(),
+            scale_dtype="none", scale_shape=(),
+        ),),
+        outputs=(
+            OperandPortSig(
+                role="y", dtype="int8", layout="ND", transposed=False,
+                shape=(1, even_w // 2), quant_mode="per_token_int8", group_shape=(),
+                scale_dtype="fp32", scale_shape=(1,),
+            ),
+            OperandPortSig(
+                role="y_scale", dtype="fp32", layout="ND", transposed=False,
+                shape=(1,), quant_mode="none", group_shape=(),
+                scale_dtype="none", scale_shape=(),
+            ),
+        ),
+        rank_placement="local",
+        world_size=1,
+        comm_group_id="none",
+        comm_domain_width=1,
+        comm_dtype="none",
+        reduction_kind="none",
+        activation_kind="situ",
+        activation_params=(),
+        has_bias=False,
+        has_active_mask=False,
+        dispatch_quant_mode=0,
+        shared_experts_per_rank=0,
+        top_k=0,
+        moe_expert_num=0,
+        qk_rope_head_dim=0,
+        mla_variant="none",
+        sfa_dcp_active=False,
+        pcp_size=1,
+        kv_cache_dtype="bf16",
+        has_kpool_indexer=False,
+        dcp_size=1,
+        is_act_and_mul=True,
+        enabled_stack_passes=frozenset(),
+    )
+    return reg.verify(query).status == "admitted_shipping"
+
+
+def _activation_abi_lowering(
+    plan, runtime, layer_quant, category: str,
+) -> tuple[bool, bool, tuple[tuple[str, object], ...]]:
+    """Resolve shipping CANN vs unfused activation lowering strictly via ``ProbedAbiRegistry``.
+
+    Returns ``(unfuse_situ, unfuse_clipped, extra_metadata)``.
+    ``aclnnDequantSituQuant`` requires INT8 + FP32 quantized output ports
+    (``dequant_situ_quant_def.cpp:61``) verified via ``ProbedAbiRegistry.verify()``
+    and is NEVER claimed on BF16 dense or non-INT8 (MXFP4/FP8) down projections.
+    """
+    act = str(getattr(plan, "ffn_activation", "") or "").strip().lower()
+    arch = _runtime_arch_upper(runtime)
+    if not arch:
+        return False, False, ()
+    if arch not in {"A2", "A3", "A5"}:
+        raise ModelingError(f"unsupported_activation_abi_arch:{arch!r}")
+    reg = default_abi_registry()
+    is_unquantized = _is_unquantized_linear(layer_quant, category)
+    act_fmt = _linear_act_dtype(layer_quant, category)
+    if act == "situ":
+        inter_w = int(
+            getattr(plan, "moe_intermediate_size", 0)
+            or getattr(plan, "intermediate_size", 0)
+            or _SITU_ABI_PROBE_DEFAULT_WIDTH
+        )
+        if (not is_unquantized
+                and act_fmt == "int8"
+                and _verify_dequant_situ_quant_abi(reg, arch, width=inter_w * 2)):
+            return False, False, (
+                ("aclnn_symbol", "aclnnDequantSituQuant"),
+                ("native_kinds", ("DequantSituQuant",)),
+                ("activation_output_dtypes", ("int8", "fp32")),
+                ("activation_abi_shipping", True),
+            )
+        extra: tuple[tuple[str, object], ...] = (
+            ("activation_abi_shipping", False),
+            ("situ_bf16_unfused", bool(is_unquantized)),
+        )
+        if is_unquantized:
+            has_linear_beta = getattr(plan, "activation_situ_linear_beta", None) is not None
+            kernels = (
+                _SITU_UNFUSED_CLIPPED_KERNELS
+                if has_linear_beta
+                else _SITU_UNFUSED_PLAIN_KERNELS
+            )
+            extra += (("native_kinds", kernels),)
+        return False, False, extra
+    has_clip = (
+        act == "swigluoai"
+        or (act == "silu" and float(getattr(plan, "swiglu_limit", 0) or 0) > 0.0)
+    )
+    if has_clip:
+        if reg.is_shipping_available("aclnnClippedSwiglu", arch, activation="clipped_swiglu"):
+            return False, False, (
+                ("aclnn_symbol", "aclnnClippedSwiglu"),
+                ("native_kinds", ("ClippedSwiglu",)),
+                ("clipped_swiglu_unfused", False),
+                ("activation_abi_shipping", True),
+            )
+        # When unfused into (clamp_gate_up + act), clamp_gate_up owns ClipByValue;
+        # act owns only the remaining SwiGLU tail kernels (no double-counted ClipByValue).
+        tail_kinds = ("Sigmoid", "Mul", "Add") if is_unquantized else ("ClipByValue", "Sigmoid", "Mul", "Add")
+        return False, is_unquantized, (
+            ("clipped_swiglu_unfused", bool(is_unquantized)),
+            ("native_kinds", tail_kinds),
+            ("activation_abi_shipping", False),
+        )
+    return False, False, ()
+
+
 def _activation_params_meta(plan) -> tuple[tuple[str, object], ...]:
     """Export canonical ``activation_params`` mapping for rewrite/algebra consumers."""
     act = str(getattr(plan, "ffn_activation", "") or "")
@@ -283,16 +513,29 @@ def dense(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mode,
         metadata=(("ffn_role", "gate_up"), ("ffn_category", category)),
     )
     act_id = prefix + (".situ" if plan.ffn_activation == "situ" else ".swiglu")
+    unfuse_situ, unfuse_clipped, abi_act_meta = _activation_abi_lowering(plan, runtime, layer_quant, category)
     act_extra_meta = (
         ("ffn_role", "activation"),
         ("ffn_category", category),
         *_activation_params_meta(plan),
+        *abi_act_meta,
     )
-    if plan.ffn_activation == "situ" and _is_raw_eager(runtime):
+    if plan.ffn_activation == "situ" and (_is_raw_eager(runtime) or unfuse_situ):
         act_ops = list(situ_eager_chain(
             plan=plan, rows=tokens, width=width, op_id=act_id,
             deps=(gate.op_id,), stage=stage, requests=requests,
             dtype=model.activation_dtype, phase=mode,
+        ))
+        # situ_eager_chain already emits every individual kernel op; strip collapsed native_kinds
+        # so the final Cast op is not expanded a second time into 14 additional launches.
+        eager_extra_meta = tuple(item for item in act_extra_meta if item[0] != "native_kinds")
+        act_ops[-1] = replace(act_ops[-1], metadata=act_ops[-1].metadata + eager_extra_meta)
+        activation = act_ops[-1]
+    elif unfuse_clipped:
+        act_ops = list(_clipped_swiglu_eager_chain(
+            plan=plan, rows=tokens, width=width, op_id=act_id,
+            deps=(gate.op_id,), stage=stage, requests=requests,
+            dtype=model.activation_dtype, phase=mode, recipe="swiglu",
         ))
         act_ops[-1] = replace(act_ops[-1], metadata=act_ops[-1].metadata + act_extra_meta)
         activation = act_ops[-1]
@@ -315,12 +558,15 @@ def dense(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mode,
     declare_situ_quant(ops, key=prefix + ".situ_quant", activation=activation,
                        consumer=down, runtime=runtime, rows=tokens, width=width)
     if parallel.tp > 1 and reduce_output:
-        reduction = comm_op(
-            op_id=prefix + ".tp", deps=(last,), stage=stage, layer=plan.index,
-            requests=requests, family="allreduce", phase=mode, recipe="ring_allreduce",
-            link_bytes=2 * (parallel.tp - 1) / parallel.tp * tokens * model.hidden_size
-                       * dtype_bytes(model.activation_dtype), shape=(tokens, model.hidden_size),
-            metadata=(("group_axis", "tp"), ("steps", 2 * (parallel.tp - 1))),
+        reduction = replace(
+            comm_op(
+                op_id=prefix + ".tp", deps=(last,), stage=stage, layer=plan.index,
+                requests=requests, family="allreduce", phase=mode, recipe="ring_allreduce",
+                link_bytes=2 * (parallel.tp - 1) / parallel.tp * tokens * model.hidden_size
+                           * dtype_bytes(model.activation_dtype), shape=(tokens, model.hidden_size),
+                metadata=(("group_axis", "tp"), ("steps", 2 * (parallel.tp - 1))),
+            ),
+            dtype=model.activation_dtype,
         )
         ops.append(reduction)
         last = reduction.op_id
@@ -383,23 +629,27 @@ def _route_expert_rows(
             if zero_experts > 0 and int(plan.num_experts) > 0:
                 total_experts = int(plan.num_experts) + zero_experts
                 local_rows = float(local_rows) * (float(plan.num_experts) / float(total_experts))
-                if routing_group_tokens > 0 and int(plan.top_k) > 0:
-                    p_real = min(1.0, float(plan.top_k) / float(total_experts))
-                    per_expert = (
-                        -math.expm1(float(routing_group_tokens) * math.log1p(-p_real))
-                        if 0.0 < p_real < 1.0 else float(p_real > 0.0)
-                    )
-                    active = float(local_experts) * per_expert
-                else:
-                    active = 0.0
+                p_real = (
+                    min(1.0, float(plan.top_k) / float(total_experts))
+                    if int(plan.top_k) > 0 else 0.0
+                )
+                active = float(local_experts) * inclusion_probability(float(routing_group_tokens), p_real)
         else:
             local_rows, active = routing_realization.rows, routing_realization.active
+        from mindie_sim.prediction.operators.moe_transport.moe_callers import _eplb_damping_active
         routing_metadata = (
             (("routing_basis", "probability_moments"), ("expected_rows", local_rows),
              ("expected_active_experts", active))
             if routing_realization is None else
             (("routing_basis", routing_realization.basis),
              ("routing_realization", routing_realization.to_dict())))
+        routing_metadata += (
+            ("routing_valid_tokens", int(routing_group_tokens)),
+            ("routing_policy_kind", getattr(routing, "kind", type(routing).__name__)),
+            ("routing_price_owner", int(price_owner) if price_owner is not None else 0),
+            ("routing_bank_ids", tuple(range(local_experts))),
+            ("routing_eplb_active", bool(_eplb_damping_active(parallel, runtime))),
+        )
         if zero_experts > 0:
             routing_metadata += (("zero_expert_num", zero_experts),)
     if token_partition:
@@ -518,8 +768,9 @@ def _pack_routed_inputs(
                 prefix, source, stage, plan, requests, tokens, latent, model, mode)
             ops.append(latent_norm)
             source = latent_norm.op_id
-    pack_read = payload_tokens * (latent * 2 + plan.top_k * _PACK_ROUTING_INDEX_BYTES)
-    pack_write = payload_tokens * plan.top_k * (latent * 2 + _PACK_ROUTING_INDEX_BYTES)
+    act_elem_bytes = dtype_bytes(model.activation_dtype)
+    pack_read = payload_tokens * (latent * act_elem_bytes + plan.top_k * _PACK_ROUTING_INDEX_BYTES)
+    pack_write = payload_tokens * plan.top_k * (latent * act_elem_bytes + _PACK_ROUTING_INDEX_BYTES)
     pack_ops = pack_extra = None
     if caller is not None:
         pack_read, pack_write, pack_ops = caller.pack_work(
@@ -571,12 +822,13 @@ def _dispatch_routed_inputs(
     ops, packing, last, *, prefix, plan, stage, requests, model, parallel, mode, runtime,
     transport, transport_rows, transport_histogram_gather, latent, tokens, payload_tokens,
     partitions, routing_realization, source_traffic, exchange, exchange_options,
-    exchange_factor, local_rows, receive_rows,
+    exchange_factor, local_rows, receive_rows, mc2_mask_pad_id=None,
 ):
     transport_scale = transport_payload = transport_quantized = None
     dispatch_overlap_id = None
     dispatch_source = None
     gate_row_cut = None
+    mask_pad_consumed = False
     if transport is not None:
         transport_quantized = moe_transport.quantize(
             prefix=prefix, plan=plan, stage=stage, requests=requests,
@@ -591,6 +843,13 @@ def _dispatch_routed_inputs(
             partitions=partitions, mode=mode,
             hist_gather=transport_histogram_gather)
         for exchange_op in exchange_ops:
+            if mc2_mask_pad_id is not None and not mask_pad_consumed:
+                exchange_op = replace(
+                    exchange_op,
+                    deps=tuple(dict.fromkeys((*exchange_op.deps, mc2_mask_pad_id))),
+                    metadata=exchange_op.metadata + (("mc2_active_mask_producer", mc2_mask_pad_id),),
+                )
+                mask_pad_consumed = True
             if exchange_op.recipe == "expert_quantized_dispatch":
                 exchange_op = scale_exchange_operator(
                     exchange_op, exchange_factor * exchange_options["eplb"],
@@ -602,6 +861,14 @@ def _dispatch_routed_inputs(
                 ops.extend(split_ops)
             else:
                 ops.append(exchange_op)
+        if mc2_mask_pad_id is not None and not mask_pad_consumed:
+            transport_quantized = replace(
+                transport_quantized,
+                deps=tuple(dict.fromkeys((*transport_quantized.deps, mc2_mask_pad_id))),
+                metadata=transport_quantized.metadata + (("mc2_active_mask_producer", mc2_mask_pad_id),),
+            )
+            ops[-1] = transport_quantized
+            mask_pad_consumed = True
         if transport_payload is not None:
             last = transport_payload
         else:
@@ -625,8 +892,12 @@ def _dispatch_routed_inputs(
                 dispatch_owns_quant=dispatch_quantizes_internally(runtime))
             if cann_native_active(runtime) else (packing, None))
         if retired is not None:
+            pack_idx = next(
+                (i for i in range(len(ops) - 1, -1, -1) if ops[i].op_id == packing.op_id),
+                len(ops) - 1,
+            )
             packing = absorbed_pack
-            ops[-1] = packing
+            ops[pack_idx] = packing
             last = packing.op_id
             absorbed_routing = packing
             absorbed_routing_meta = dict(packing.metadata)
@@ -650,8 +921,20 @@ def _dispatch_routed_inputs(
         gate_row_cut = deepep.overlap_row_cut(
             max(0, int(math.ceil(local_rows))), exchange_options["overlap"])
     if parallel.ep > 1 and transport is None and exchange:
+        dispatch_deps = (
+            tuple(dict.fromkeys((last, mc2_mask_pad_id)))
+            if (mc2_mask_pad_id is not None and not mask_pad_consumed)
+            else (last,)
+        )
+        mask_meta = (
+            (("mc2_active_mask_producer", mc2_mask_pad_id),)
+            if (mc2_mask_pad_id is not None and not mask_pad_consumed)
+            else ()
+        )
+        if mc2_mask_pad_id is not None and not mask_pad_consumed:
+            mask_pad_consumed = True
         dispatch = comm_op(
-            op_id=prefix + ".dispatch", deps=(last,), stage=stage, layer=plan.index,
+            op_id=prefix + ".dispatch", deps=dispatch_deps, stage=stage, layer=plan.index,
             requests=requests, family="alltoall", phase=mode, recipe="expert_dispatch",
             link_bytes=dispatch_exchange_bytes,
             shape=(int(tokens) * int(plan.top_k), latent),
@@ -659,7 +942,7 @@ def _dispatch_routed_inputs(
                 ("collective_id", prefix + ".dispatch"),
                 ("moe_num_experts", int(plan.num_experts)),
                 ("moe_ep_size", int(parallel.ep)),
-            ) + dispatch_quant_meta,
+            ) + dispatch_quant_meta + mask_meta,
         )
         dispatch = _masked_collective(
             dispatch, source_traffic, dispatch_row_bytes, parallel.ep)
@@ -684,7 +967,81 @@ def _dispatch_routed_inputs(
     return (packing, last, transport_scale, transport_payload, transport_quantized,
             dispatch_overlap_id, dispatch_source, gate_row_cut, absorbed_routing,
             dispatch_quant_meta, combine_quant_meta, combine_row_bytes,
-            combine_exchange_bytes, collective_meta)
+            combine_exchange_bytes, collective_meta, mask_pad_consumed)
+
+
+def _emit_routed_activation(
+    *, plan, runtime, layer_quant, activation_rows, expert_width, prefix,
+    act_deps, stage, requests, model, mode, gate_segments, token_partition,
+    caller, local_rows,
+):
+    """Build routed MoE activation op chain with ABI lowering and segment metadata."""
+    unfuse_situ, unfuse_clipped, abi_act_meta = _activation_abi_lowering(plan, runtime, layer_quant, "routed_expert")
+    is_eager_situ = plan.ffn_activation == "situ" and (_is_raw_eager(runtime) or unfuse_situ)
+    if is_eager_situ:
+        act_ops = list(situ_eager_chain(
+            plan=plan, rows=activation_rows, width=expert_width,
+            op_id=prefix + ".expert_act", deps=act_deps, stage=stage,
+            requests=requests, dtype=model.activation_dtype, phase=mode,
+        ))
+    elif unfuse_clipped:
+        act_ops = list(_clipped_swiglu_eager_chain(
+            plan=plan, rows=activation_rows, width=expert_width,
+            op_id=prefix + ".expert_act", deps=act_deps, stage=stage,
+            requests=requests, dtype=model.activation_dtype, phase=mode,
+            recipe="grouped_swiglu",
+        ))
+    else:
+        act_ops = [gated_activation(
+            plan=plan, rows=activation_rows, width=expert_width,
+            op_id=prefix + ".expert_act", deps=act_deps,
+            stage=stage, requests=requests, dtype=model.activation_dtype,
+            phase=mode, recipe="grouped_swiglu",
+        )]
+    filtered_abi_meta = (
+        tuple(item for item in abi_act_meta if item[0] != "native_kinds")
+        if is_eager_situ else abi_act_meta
+    )
+    act_params_meta = _activation_params_meta(plan) + filtered_abi_meta
+    if act_params_meta:
+        act_ops[-1] = replace(act_ops[-1], metadata=act_ops[-1].metadata + act_params_meta)
+    if gate_segments:
+        gate_consumer = act_ops[0]
+        gate_consumer = replace(gate_consumer, metadata=gate_consumer.metadata + (
+            ("memory_accesses", tuple({
+                "producer": op.op_id,
+                "output": dict(op.metadata).get("primary_output") or "output",
+                "direction": "read", "position": "local",
+                "storage": f"moe.act:{op.op_id}",
+                "bytes": float(int(op.local_shape[0]) * int(op.local_shape[1])
+                               * dtype_bytes(dict(op.metadata).get("output_format") or model.activation_dtype)),
+                "span": ((0, int(op.local_shape[0])),),
+                "last_use": prefix + ".expert_down",
+                "purpose": "gate_output_rows",
+            } for op in gate_segments)),))
+        segment_meta = tuple(
+            (op.op_id, dict(op.metadata).get("deepep_physical_row_start"),
+             dict(op.metadata).get("deepep_physical_row_stop"),
+             int(op.local_shape[0]), int(op.local_shape[1]))
+            for op in gate_segments)
+        gate_consumer = replace(gate_consumer, metadata=gate_consumer.metadata + (
+            ("activation_input_segments", segment_meta),
+            ("activation_input_bytes", sum(
+                int(op.local_shape[0]) * int(op.local_shape[1])
+                * dtype_bytes(dict(op.metadata).get("output_format") or model.activation_dtype)
+                for op in gate_segments)),
+        ))
+        act_ops[0] = gate_consumer
+    activation = act_ops[-1]
+    if token_partition is not None and token_partition.activation_owners:
+        activation = replace(activation, metadata=activation.metadata + (
+            ("activation_owners", token_partition.activation_owners),
+            ("activation_tensor_rows", activation_rows),
+            ("activation_capacity_basis", "declared_unmasked_tensor_capacity")))
+    if caller is not None:
+        activation = caller.tag_activation(activation, local_rows)
+    act_ops[-1] = activation
+    return act_ops, activation
 
 
 def _run_routed_experts(
@@ -758,63 +1115,13 @@ def _run_routed_experts(
         row_cut=gate_row_cut, activation_id=prefix + ".expert_act")
     gate_segments = tuple(op for op in gate_ops if op.family == "grouped_gemm")
     act_deps = tuple(op.op_id for op in gate_segments) or (gate_last,)
-    if plan.ffn_activation == "situ" and _is_raw_eager(runtime):
-        act_ops = list(situ_eager_chain(
-            plan=plan, rows=activation_rows, width=expert_width,
-            op_id=prefix + ".expert_act", deps=act_deps, stage=stage,
-            requests=requests, dtype=model.activation_dtype, phase=mode,
-        ))
-        activation = act_ops[-1]
-    else:
-        activation = gated_activation(
-            plan=plan, rows=activation_rows, width=expert_width,
-            op_id=prefix + ".expert_act", deps=act_deps,
-            stage=stage, requests=requests, dtype=model.activation_dtype,
-            phase=mode, recipe="grouped_swiglu",
-        )
-        act_ops = [activation]
-    act_params_meta = _activation_params_meta(plan)
-    if act_params_meta:
-        act_ops[-1] = replace(act_ops[-1], metadata=act_ops[-1].metadata + act_params_meta)
-    if gate_segments:
-        # The first op of a multi-kernel activation chain (e.g. situ_eager_chain's
-        # cast_in) consumes the gate_up segments; for a single fused op act_ops[0]
-        # and act_ops[-1] are the same op.
-        gate_consumer = act_ops[0]
-        gate_consumer = replace(gate_consumer, metadata=gate_consumer.metadata + (
-            ("memory_accesses", tuple({
-                "producer": op.op_id,
-                "output": dict(op.metadata).get("primary_output") or "output",
-                "direction": "read", "position": "local",
-                "storage": f"moe.act:{op.op_id}",
-                "bytes": float(int(op.local_shape[0]) * int(op.local_shape[1])
-                               * dtype_bytes(dict(op.metadata).get("output_format") or "bf16")),
-                "span": ((0, int(op.local_shape[0])),),
-                "last_use": prefix + ".expert_down",
-                "purpose": "gate_output_rows",
-            } for op in gate_segments)),))
-        segment_meta = tuple(
-            (op.op_id, dict(op.metadata).get("deepep_physical_row_start"),
-             dict(op.metadata).get("deepep_physical_row_stop"),
-             int(op.local_shape[0]), int(op.local_shape[1]))
-            for op in gate_segments)
-        gate_consumer = replace(gate_consumer, metadata=gate_consumer.metadata + (
-            ("activation_input_segments", segment_meta),
-            ("activation_input_bytes", sum(
-                int(op.local_shape[0]) * int(op.local_shape[1])
-                * dtype_bytes(dict(op.metadata).get("output_format") or "bf16")
-                for op in gate_segments)),
-        ))
-        act_ops[0] = gate_consumer
-    activation = act_ops[-1]
-    if token_partition is not None and token_partition.activation_owners:
-        activation = replace(activation, metadata=activation.metadata + (
-            ("activation_owners", token_partition.activation_owners),
-            ("activation_tensor_rows", activation_rows),
-            ("activation_capacity_basis", "declared_unmasked_tensor_capacity")))
-    if caller is not None:
-        activation = caller.tag_activation(activation, local_rows)
-    act_ops[-1] = activation
+    act_ops, activation = _emit_routed_activation(
+        plan=plan, runtime=runtime, layer_quant=layer_quant,
+        activation_rows=activation_rows, expert_width=expert_width,
+        prefix=prefix, act_deps=act_deps, stage=stage, requests=requests,
+        model=model, mode=mode, gate_segments=gate_segments,
+        token_partition=token_partition, caller=caller, local_rows=local_rows,
+    )
     ops.extend((*gate_ops, *act_ops, down))
     declare_gate_up_fusion_group(
         ops=ops, runtime=runtime, prefix=prefix, activation=activation,
@@ -826,14 +1133,18 @@ def _run_routed_experts(
         ops.pop(), exchange_options)
     ops.extend(down_ops)
     if parallel.etp > 1 and not reduce_after_join:
-        reduce = comm_op(
-            op_id=prefix + ".expert_reduce", deps=(last,), stage=stage, layer=plan.index,
-            requests=requests, family="allreduce", phase=mode, recipe="expert_tensor_reduce",
-            link_bytes=2 * (parallel.etp - 1) / parallel.etp * local_rows * latent
-                       * dtype_bytes(model.activation_dtype),
-            shape=(math.ceil(local_rows), latent),
-            metadata=(("group_axis", "etp"), ("comm_axis", "etp"),
-                      ("comm_group_size", int(parallel.etp))))
+        reduce = replace(
+            comm_op(
+                op_id=prefix + ".expert_reduce", deps=(last,), stage=stage, layer=plan.index,
+                requests=requests, family="allreduce", phase=mode, recipe="expert_tensor_reduce",
+                link_bytes=2 * (parallel.etp - 1) / parallel.etp * local_rows * latent
+                           * dtype_bytes(model.activation_dtype),
+                shape=(math.ceil(local_rows), latent),
+                metadata=(("group_axis", "etp"), ("comm_axis", "etp"),
+                          ("comm_group_size", int(parallel.etp))),
+            ),
+            dtype=model.activation_dtype,
+        )
         ops.append(reduce)
         last = reduce.op_id
         down_mid_id = reduce.op_id
@@ -857,12 +1168,15 @@ def _combine_routed_outputs(
                 ep=parallel.ep, partitions=partitions,
                 mode=mode, payload_dispatch=transport_payload)
         else:
-            combine = comm_op(
-                op_id=prefix + ".combine", deps=(last,), stage=stage, layer=plan.index,
-                requests=requests, family="alltoall", phase=mode, recipe="expert_combine",
-                link_bytes=combine_exchange_bytes, shape=(tokens * plan.top_k, latent),
-                metadata=collective_meta + (("collective_id", prefix + ".combine"),
-                                           ("reverse_of_collective", prefix + ".dispatch")) + combine_quant_meta,
+            combine = replace(
+                comm_op(
+                    op_id=prefix + ".combine", deps=(last,), stage=stage, layer=plan.index,
+                    requests=requests, family="alltoall", phase=mode, recipe="expert_combine",
+                    link_bytes=combine_exchange_bytes, shape=(tokens * plan.top_k, latent),
+                    metadata=collective_meta + (("collective_id", prefix + ".combine"),
+                                               ("reverse_of_collective", prefix + ".dispatch")) + combine_quant_meta,
+                ),
+                dtype=model.activation_dtype,
             )
         if transport is None:
             combine = _masked_collective(
@@ -890,7 +1204,7 @@ def _combine_routed_outputs(
     if routing_realization is not None:
         unpack_metadata.append(("input_rows", int(local_rows)))
     act_bytes = dtype_bytes(model.activation_dtype)
-    unpack_read = tokens * plan.top_k * (latent * act_bytes + dtype_bytes("fp32"))
+    unpack_read = tokens * plan.top_k * (latent * act_bytes + weight_bytes)
     if absorbed_routing is not None:
         # The native pack wrote one INT32 inverse slot per assignment.
         inverse_index_bytes = tokens * plan.top_k * dtype_bytes(INVERSE_INDEX_DTYPE)
@@ -949,7 +1263,9 @@ def _join_routed_and_shared(
         shared_dp = bool(dict(runtime.metadata).get("enable_shared_expert_dp", False)) if runtime is not None else False
         shared_input, shared_tokens, shared_prefix = deps, tokens, []
         if sequence_plan and not shared_dp:
-            from .sharding.sequence_parallel import allgather, reduce_scatter
+            from .sharding.sequence_parallel import (
+                allgather, emit_reduce_scatter_pad, reduce_scatter,
+            )
             gathered = allgather(
                 plan=sequence_plan, op_id=prefix + ".shared.sp_gather", deps=(deps,),
                 stage=stage, layer=plan.index, requests=requests, phase=mode,
@@ -976,8 +1292,19 @@ def _join_routed_and_shared(
         )
         shared = shared_prefix + shared
         if sequence_plan and not shared_dp:
+            scatter_deps = (shared_last,)
+            shared_pad = emit_reduce_scatter_pad(
+                plan=sequence_plan, op_id=prefix + ".shared.sp_scatter.pad",
+                deps=scatter_deps, stage=stage, layer=plan.index,
+                requests=requests, phase=mode, width=hidden,
+                dtype=model.activation_dtype, source_rows=shared_tokens,
+                target_rows=sequence_plan.tokens_global,
+            )
+            if shared_pad is not None:
+                shared.append(shared_pad)
+                scatter_deps = (shared_pad.op_id,)
             scattered = reduce_scatter(
-                plan=sequence_plan, op_id=prefix + ".shared.sp_scatter", deps=(shared_last,),
+                plan=sequence_plan, op_id=prefix + ".shared.sp_scatter", deps=scatter_deps,
                 stage=stage, layer=plan.index, requests=requests, phase=mode,
                 width=hidden, dtype=model.activation_dtype)
             shared.append(scattered)
@@ -1012,14 +1339,17 @@ def _join_routed_and_shared(
         ops.append(join)
         last = join.op_id
     if reduce_after_join and parallel.tp > 1 and tokens:
-        reduction = comm_op(
-            op_id=prefix + ".moe_output_reduce", deps=(last,), stage=stage, layer=plan.index,
-            requests=requests, family="allreduce", phase=mode, recipe="moe_output_reduce",
-            link_bytes=2 * (parallel.tp - 1) / parallel.tp * tokens * hidden
-                       * dtype_bytes(model.activation_dtype),
-            shape=(tokens, hidden),
-            metadata=(("group_axis", "tp"), ("steps", 2 * (parallel.tp - 1)),
-                      ("reduction_boundary", "token_rows_after_routed_shared_join")),
+        reduction = replace(
+            comm_op(
+                op_id=prefix + ".moe_output_reduce", deps=(last,), stage=stage, layer=plan.index,
+                requests=requests, family="allreduce", phase=mode, recipe="moe_output_reduce",
+                link_bytes=2 * (parallel.tp - 1) / parallel.tp * tokens * hidden
+                           * dtype_bytes(model.activation_dtype),
+                shape=(tokens, hidden),
+                metadata=(("group_axis", "tp"), ("steps", 2 * (parallel.tp - 1)),
+                          ("reduction_boundary", "token_rows_after_routed_shared_join")),
+            ),
+            dtype=model.activation_dtype,
         )
         if caller is not None:
             reduction = caller.tag_reduce(reduction)
@@ -1034,6 +1364,7 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
         caller=None, sp_tokens=None, features=None,
         source_rows_by_replica=None, destination_rows_by_rank=None,
         ep_owner=None, price_owner=None, **_):
+    validate_m10_moe_activation_legality(plan)
     pre_sp_tokens = tokens
     if sp_tokens is not None:
         tokens = sp_tokens
@@ -1073,10 +1404,22 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
         routing_realization=routing_realization, local_rows=local_rows, partitions=partitions,
         caller=caller, routing_metadata=routing_metadata, ep_owner=ep_owner,
     )
+    mc2_mask_pad_id = None
+    # Only emit mc2_mask_pad when an EP dispatch/transport consumer will actually receive it.
+    if (parallel.ep > 1 and (transport is not None or exchange)
+            and sequence_plan is not None and sequence_plan.mc2_active_mask_active):
+        from .sharding.sequence_parallel import emit_mc2_mask_pad
+        mask_pad = emit_mc2_mask_pad(
+            plan=sequence_plan, op_id=prefix + ".mc2_mask_pad", deps=(deps,),
+            stage=stage, layer=plan.index, requests=requests, phase=mode,
+        )
+        if mask_pad is not None:
+            ops.append(mask_pad)
+            mc2_mask_pad_id = mask_pad.op_id
     (packing, last, transport_scale, transport_payload, transport_quantized,
      dispatch_overlap_id, dispatch_source, gate_row_cut, absorbed_routing,
      dispatch_quant_meta, combine_quant_meta, combine_row_bytes,
-     combine_exchange_bytes, collective_meta) = _dispatch_routed_inputs(
+     combine_exchange_bytes, collective_meta, _mask_pad_consumed) = _dispatch_routed_inputs(
         ops, packing, last, prefix=prefix, plan=plan, stage=stage, requests=requests,
         model=model, parallel=parallel, mode=mode, runtime=runtime,
         transport=transport, transport_rows=transport_rows,
@@ -1085,6 +1428,7 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
         routing_realization=routing_realization, source_traffic=source_traffic,
         exchange=exchange, exchange_options=exchange_options, exchange_factor=exchange_factor,
         local_rows=local_rows, receive_rows=receive_rows,
+        mc2_mask_pad_id=mc2_mask_pad_id,
     )
     last, down_mid_id = _run_routed_experts(
         ops, last, prefix=prefix, plan=plan, stage=stage, requests=requests,

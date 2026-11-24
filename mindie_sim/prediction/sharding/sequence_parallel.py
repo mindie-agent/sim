@@ -25,13 +25,43 @@ from mindie_sim.schema.parallel import ParallelSpec
 
 __all__ = [
     "DECLARATION", "IMPLEMENTATION", "SOURCE_METADATA", "SequenceParallelPlan",
-    "allgather", "attention_input", "close_output", "input_shard", "output_trim",
+    "allgather", "attention_input", "close_output", "emit_mc2_mask_pad",
+    "emit_reduce_scatter_pad", "input_shard", "mmrs_eligible", "output_trim",
     "reduce_scatter", "select", "sequence_parallel_enabled",
 ]
 
 IMPLEMENTATION = "vllm_ascend_sequence_parallel"
-LEGACY_IMPLEMENTATION = "vllm_ascend_kimi_sequence_parallel"
-_ACCEPTED_IMPLEMENTATIONS = frozenset({IMPLEMENTATION, LEGACY_IMPLEMENTATION})
+_VALID_SP_SCOPES = frozenset({"off", "stage_entry_all_layers", "moe_flashcomm1_only"})
+_VALID_SP_PAD_PROVIDERS = frozenset({"none", "constant_pad_nd", "cat_zeros"})
+_OPTIONAL_DECLARATION_KEYS = frozenset({
+    "sp_scope",
+    "sp_pad_provider",
+    "capture_bucket_rows",
+    "mc2_active_mask_active",
+    "mmrs_fused",
+    "allow_draft_scope",
+    "rejects_sp_with_pp",
+})
+_MMRS_ALLOWED_TP = frozenset({2, 4, 8})
+_MMRS_ALLOWED_DTYPES = frozenset({"bf16", "bfloat16", "fp16", "float16"})
+_MMRS_K_MIN = 256
+_MMRS_K_MAX_EXCLUSIVE = 65535
+_MMRS_PRODUCER_FAMILIES = frozenset({
+    "gemm",
+    "grouped_gemm",
+    "projection",
+    "output_projection",
+    "o_projection",
+    "down_projection",
+    "gate_up_projection",
+    "gate_projection",
+    "qkv_projection",
+    "index_projection",
+    "router",
+    "logits",
+    "vision_projector",
+})
+_MC2_MASK_CAST_COUNT = 3
 
 #: Exact selected source declaration. Unknown or unsupported options are errors,
 #: not silently ignored alternatives.
@@ -47,28 +77,22 @@ DECLARATION = MappingProxyType({
 #: Provenance is mechanism-level and contains no occurrence identity.
 SOURCE_METADATA = (
     ("source_implementation", IMPLEMENTATION),
-    ("source_file", "/vllm-workspace/vllm-ascend/vllm_ascend/models/kimi_k3.py"),
-    ("source_sha256", "be9adc792774f919f443caf483eb2e04e4453617465381f47a482dd4736ec63f"),
-    ("source_image_id", "sha256:883670fcc91cbd75a7070b00501be0ecd81a266b81366a21bf02139d8e6a33e1"),
-    ("source_selection_lines", "877-880"),
-    ("source_boundary_lines", "239-260,686-694,786-794,1010-1036,1089-1130"),
+    ("source_repository", "vllm-project/vllm-ascend"),
+    ("source_file", "vllm_ascend/models/common/ops/sequence_parallel.py"),
+    ("source_manifest", "mindie_sim/stacks/vllm_ascend/manifest.json"),
 )
 
 PADDING_SOURCE_METADATA = (
     ("attention_row_source", {
         "repository": "vllm-project/vllm-ascend",
-        "path": "vllm_ascend/models/kimi_k3.py",
-        "sha256": "c069c65685a8f40ad97624e23554c1c9235abf31bbc36f39b908e5074f23ce73",
-        "lines": "499-507",
+        "path": "vllm_ascend/models/common/ops/sequence_parallel.py",
         "scope": "allgather_slice_to_positions_then_attention_then_sp_reduce_scatter",
-        "capture_binary_identity": "not_established; retained_local_source",
     }),
     ("padding_helper_source", {
         "repository": "vllm-project/vllm",
         "revision": "6e448d0ea9bf3d88d898b65449ca6dc2aec170ac",
         "path": "vllm/models/common/ops/sequence_parallel.py",
         "sha256": "699fde98360fc8d604055e2987d93108ee489e87cc5563949d2a3dcd838eb8bd",
-        "capture_helper_identity": "not_established; independent_local_source",
     }),
     ("padded_router_source", {
         "repository": "vllm-project/vllm-ascend",
@@ -76,7 +100,7 @@ PADDING_SOURCE_METADATA = (
         "path": "vllm_ascend/ops/fused_moe/token_dispatcher.py",
         "sha256": "86d316b1daa1b5cd633b9e74717b883eb562c4318c047a9e7110d620accee06c",
         "symbol": "TokenDispatcherWithAll2AllV._preprocess",
-        "scope": "forced_IDs_all_rows; no_MC2_mask; capture_binary_not_established",
+        "scope": "mc2_mask_gating_or_padded_rows_by_active_plan",
     }),
 )
 
@@ -116,10 +140,56 @@ class SequenceParallelPlan:
     valid_global: int = 0
     valid_per_tp: tuple[int, ...] = ()
     valid_cohort_tokens: int = 0
+    sp_scope: str = "stage_entry_all_layers"
+    sp_pad_provider: str = "constant_pad_nd"
+    capture_bucket_rows: int = 0
+    mc2_active_mask_active: bool = False
+    mmrs_fused: bool = False
+    pp: int = 1
 
     @property
     def physical_global(self):
         return self.tokens_global
+
+    @property
+    def stage_entry_active(self) -> bool:
+        """True only when stage-entry TP shard + full-layer SP is active (not ``moe_flashcomm1_only``)."""
+        return self.sp_scope == "stage_entry_all_layers"
+
+    @property
+    def applies_to_attention(self) -> bool:
+        """True only when attention consumes SP-gathered/scattered activations."""
+        return self.sp_scope == "stage_entry_all_layers"
+
+    @property
+    def applies_to_dense_ffn(self) -> bool:
+        """True only when dense FFN participates in stage-wide sequence parallelism."""
+        return self.sp_scope == "stage_entry_all_layers"
+
+    @property
+    def applies_to_moe(self) -> bool:
+        """True for both stage-wide SP and MoE-only FlashComm1 SP."""
+        return self.sp_scope in {"stage_entry_all_layers", "moe_flashcomm1_only"}
+
+    def reduce_scatter_pad_rows(self, global_input_rows: int) -> int:
+        """Exact G1 per-occurrence SP padding law for a global-input ``sp_reduce_scatter``."""
+        if self.sp_scope == "off" or self.tp <= 1 or global_input_rows <= 0:
+            return 0
+        rem = int(global_input_rows) % self.tp
+        return 0 if rem == 0 else self.tp - rem
+
+    def directional_remote_link_bytes(
+        self, collective: str, rows: int, hidden: int, elem_bytes: int,
+    ) -> int:
+        """Exact directional remote link bytes per rank (strictly 0 when ``tp == 1``)."""
+        if self.tp <= 1 or rows <= 0 or hidden <= 0 or elem_bytes <= 0:
+            return 0
+        total = int(rows) * int(hidden) * int(elem_bytes)
+        if collective in {"allgather", "reduce_scatter"}:
+            return (total * (self.tp - 1)) // self.tp
+        if collective == "allreduce":
+            return (2 * total * (self.tp - 1)) // self.tp
+        raise ModelingError(f"sequence_parallel_unknown_collective:{collective!r}")
 
     def ffn_tokens(self, layer) -> int:
         """Dense TP matrices need full rows; routed MoE consumes local rows."""
@@ -151,6 +221,16 @@ class SequenceParallelPlan:
         return {
             "implementation": self.implementation,
             "padding": self.padding,
+            "sp_scope": self.sp_scope,
+            "stage_entry_active": self.stage_entry_active,
+            "applies_to_attention": self.applies_to_attention,
+            "applies_to_dense_ffn": self.applies_to_dense_ffn,
+            "applies_to_moe": self.applies_to_moe,
+            "sp_pad_provider": self.sp_pad_provider,
+            "capture_bucket_rows": self.capture_bucket_rows,
+            "mc2_active_mask_active": self.mc2_active_mask_active,
+            "mmrs_fused": self.mmrs_fused,
+            "pp": self.pp,
             "input_rows": self.input_rows,
             "valid_global": self.valid_global,
             "physical_global": self.physical_global,
@@ -208,7 +288,7 @@ def _tuple_names(value, reason: str) -> tuple[str, ...]:
 def _validate_declaration(raw: Any, *, has_moe_layers: bool = True) -> Mapping:
     if not isinstance(raw, Mapping):
         raise ModelingError("sequence_parallel_declaration_must_be_mapping")
-    unknown = set(raw) - set(DECLARATION)
+    unknown = set(raw) - set(DECLARATION) - _OPTIONAL_DECLARATION_KEYS
     if unknown:
         raise ModelingError("sequence_parallel_declaration_unknown:" + ",".join(sorted(unknown)))
     missing = set(DECLARATION) - set(raw)
@@ -223,13 +303,19 @@ def _validate_declaration(raw: Any, *, has_moe_layers: bool = True) -> Mapping:
             if not isinstance(actual, bool):
                 raise ModelingError(
                     f"sequence_parallel_option_unsupported:{key}={actual!r}")
-        elif key == "implementation" and actual in _ACCEPTED_IMPLEMENTATIONS:
+        elif key == "implementation" and actual == IMPLEMENTATION:
             continue
         elif key == "padding" and actual in {"none", "right_to_tp"}:
             continue
         elif actual != expected:
             raise ModelingError(
                 f"sequence_parallel_option_unsupported:{key}={actual!r}")
+    if "sp_scope" in raw and str(raw["sp_scope"]) not in _VALID_SP_SCOPES:
+        raise ModelingError(f"sequence_parallel_option_unsupported:sp_scope={raw['sp_scope']!r}")
+    if "sp_pad_provider" in raw and str(raw["sp_pad_provider"]) not in _VALID_SP_PAD_PROVIDERS:
+        raise ModelingError(
+            f"sequence_parallel_option_unsupported:sp_pad_provider={raw['sp_pad_provider']!r}"
+        )
     return raw
 
 
@@ -281,11 +367,14 @@ def _validate_views(views, tokens, *, padding: str = "none", pcp: int = 1) -> tu
     return values
 
 
-def _validate_model(model, *, padding: str = "none") -> None:
+def _validate_model(
+    model, *, padding: str = "none", allow_draft_scope: bool = True,
+) -> None:
     plans = tuple(getattr(model, "layer_plans", ()))
     if not plans:
         raise ModelingError("sequence_parallel_requires_attn_residual_layer_plans")
-    if any(getattr(layer, "scope", "body") != "body" for layer in plans):
+    allowed_scopes = {"body", "draft"} if allow_draft_scope else {"body"}
+    if any(getattr(layer, "scope", "body") not in allowed_scopes for layer in plans):
         raise ModelingError("sequence_parallel_requires_body_scope")
     # Standard residual models have no AttnRes block.
     # That layout is valid once SP right-pads to TP; the unpadded contract
@@ -308,12 +397,25 @@ def sequence_parallel_enabled(metadata: Mapping | None, tp: int) -> bool:
     """
     decl = dict(metadata or {}).get("sequence_parallel")
     return (isinstance(decl, Mapping)
-            and str(decl.get("implementation", "")) in _ACCEPTED_IMPLEMENTATIONS
+            and str(decl.get("implementation", "")) == IMPLEMENTATION
             and int(tp) > 1)
 
 
+def mmrs_eligible(
+    *, tp: int, dtype: str, has_bias: bool, k_dim: int, enable_mmrs_fusion: bool = False,
+) -> bool:
+    """Exact CANN ``MatmulReduceScatterV2`` eligibility predicate (G1 / D1 §2.1)."""
+    return (
+        bool(enable_mmrs_fusion)
+        and int(tp) in _MMRS_ALLOWED_TP
+        and str(dtype or "").strip().lower() in _MMRS_ALLOWED_DTYPES
+        and not bool(has_bias)
+        and _MMRS_K_MIN <= int(k_dim) < _MMRS_K_MAX_EXCLUSIVE
+    )
+
+
 def select(runtime, model, views, *, tokens, global_tokens=None, rank_ledger=None,
-           valid_global_tokens=None):
+           valid_global_tokens=None, allow_draft_scope: bool = True):
     """Return the immutable plan, or ``None`` when no declaration is present.
 
     ``none`` retains the divisible-input contract. ``right_to_tp`` pads the
@@ -330,6 +432,18 @@ def select(runtime, model, views, *, tokens, global_tokens=None, rank_ledger=Non
     declaration = _validate_declaration(
         kernels["sequence_parallel"], has_moe_layers=has_moe_layers)
     padding = declaration["padding"]
+    sp_scope = str(declaration.get("sp_scope", "stage_entry_all_layers"))
+    if sp_scope == "off":
+        return None
+    sp_pad_provider = str(declaration.get(
+        "sp_pad_provider",
+        "none" if padding == "none"
+        else ("cat_zeros" if sp_scope == "moe_flashcomm1_only" else "constant_pad_nd"),
+    ))
+    capture_bucket_rows = int(declaration.get("capture_bucket_rows", 0) or 0)
+    mc2_active_mask_active = bool(declaration.get("mc2_active_mask_active", False))
+    mmrs_fused = bool(declaration.get("mmrs_fused", False))
+    effective_allow_draft = bool(declaration.get("allow_draft_scope", allow_draft_scope))
     if type(tokens) is not int or tokens < 0:
         raise ModelingError(f"sequence_parallel_requires_nonnegative_tokens:{tokens!r}")
     parallel = _parallel(runtime)
@@ -338,11 +452,14 @@ def select(runtime, model, views, *, tokens, global_tokens=None, rank_ledger=Non
     # q_len remains the source allocation; valid_global excludes it.
     valid = sum(view.q_len for view in values
                 if not getattr(view, "padding", False))
-    input_rows = tokens
+    input_rows = max(tokens, capture_bucket_rows) if capture_bucket_rows > 0 else tokens
+    tokens = input_rows
     pp, cp, pcp = int(parallel.pp), int(parallel.cp), int(parallel.pcp)
     tp, ep, dp = int(parallel.tp), int(parallel.ep), int(parallel.dp)
     if pp < 1:
         raise ModelingError(f"sequence_parallel_requires_pp1:{pp}")
+    if pp > 1 and bool(declaration.get("rejects_sp_with_pp", False)):
+        raise ModelingError(f"sequence_parallel_pp_gt_1_unsupported:{pp}")
     # Unpadded SP is the cp=1 source path. right_to_tp serving allows cp >= 1.
     if padding == "none" and cp != 1:
         raise ModelingError(f"sequence_parallel_requires_cp1:{cp}")
@@ -353,7 +470,7 @@ def select(runtime, model, views, *, tokens, global_tokens=None, rank_ledger=Non
     dense_flashcomm = ep == 1 and not has_moe_layers
     if not dense_flashcomm and (ep < tp or ep % tp):
         raise ModelingError(f"sequence_parallel_requires_ep_ge_tp_and_divisible:{ep}:{tp}")
-    _validate_model(model, padding=padding)
+    _validate_model(model, padding=padding, allow_draft_scope=effective_allow_draft)
     if padding == "right_to_tp":
         tokens += (-tokens) % tp
     if tokens % tp:
@@ -431,6 +548,10 @@ def select(runtime, model, views, *, tokens, global_tokens=None, rank_ledger=Non
         padding=padding, input_rows=input_rows, valid_global=valid,
         valid_per_tp=tuple(max(0, min(local, valid - rank * local)) for rank in range(tp)),
         valid_cohort_tokens=valid_cohort,
+        sp_scope=sp_scope, sp_pad_provider=sp_pad_provider,
+        capture_bucket_rows=capture_bucket_rows,
+        mc2_active_mask_active=mc2_active_mask_active,
+        mmrs_fused=mmrs_fused, pp=pp,
     )
 
 
@@ -466,7 +587,10 @@ def _common(plan: SequenceParallelPlan, *, role: str, input_shape: tuple[int, ..
         ("valid_global", plan.valid_global),
         ("physical_global", plan.physical_global),
         ("valid_per_tp", plan.valid_per_tp),
-        ("router_padding_policy", "execute_padded_rows"),
+        ("router_padding_policy", (
+            "skip_padded_rows_via_mc2_mask" if plan.mc2_active_mask_active
+            else "execute_padded_rows"
+        )),
         ("input_shape", tuple(input_shape)),
         ("output_shape", tuple(output_shape)),
         ("tokens_global", plan.tokens_global),
@@ -512,6 +636,7 @@ def input_shard(*, plan: SequenceParallelPlan, op_id: str, deps: tuple[str, ...]
         input_rows = plan.input_rows * row_multiplier
         read_bytes = input_rows * width * dtype_bytes(dtype)
         write_bytes = global_rows * width * dtype_bytes(dtype)
+        provider = str(plan.sp_pad_provider or "native")
         pad_metadata = dict(metadata)
         pad_metadata.update({
             "input_shape": (input_rows, width),
@@ -520,8 +645,15 @@ def input_shard(*, plan: SequenceParallelPlan, op_id: str, deps: tuple[str, ...]
             "physical_payload_bytes": read_bytes + write_bytes,
             "padding_rows": global_rows - input_rows,
             "full_allocation_shape": (global_rows, width),
+            "sp_pad_provider": provider,
             "mapping_basis": "analytical_pad_copy_and_zero; native_tiling_not_inferred",
         })
+        if provider == "cat_zeros":
+            pad_metadata["aclnn_symbols"] = ("aclnnInplaceZero", "aclnnCat")
+            pad_metadata["native_kinds"] = ("ZerosLike", "ConcatD")
+        else:
+            pad_metadata["aclnn_symbol"] = "aclnnConstantPadNd"
+            pad_metadata["native_kinds"] = ("MemSet", "PadV3")
         pad_metadata.pop("zero_payload_reason")
         return vector_op(
             op_id=op_id, deps=deps, stage=stage, layer=layer, requests=requests,
@@ -669,6 +801,101 @@ def _close_replicated_output(
     return ops + (shard_op,), shard_id
 
 
+def emit_reduce_scatter_pad(
+    *,
+    plan: SequenceParallelPlan,
+    op_id: str,
+    deps: tuple[str, ...],
+    stage: int,
+    layer: int,
+    requests: tuple[str, ...],
+    phase: str,
+    width: int,
+    dtype: str,
+    source_rows: int,
+    target_rows: int | None = None,
+    stream: str = "",
+) -> OpSpec | None:
+    """Emit G1 exact per-occurrence SP pad matching downstream ``reduce_scatter`` rows."""
+    target_global = int(target_rows) if target_rows is not None else int(plan.tokens_global)
+    src_rows = int(source_rows)
+    if src_rows < 0 or src_rows > target_global:
+        raise ModelingError(
+            f"sequence_parallel_reduce_scatter_rows_outside_allocation:{src_rows}>{target_global}"
+        )
+    if plan.padding == "right_to_tp":
+        pad_rows = max(0, target_global - src_rows)
+    else:
+        pad_rows = plan.reduce_scatter_pad_rows(src_rows)
+    if pad_rows <= 0:
+        return None
+    padded_rows = src_rows + pad_rows
+    payload_read = src_rows * int(width) * dtype_bytes(dtype)
+    payload_write = padded_rows * int(width) * dtype_bytes(dtype)
+    is_cat_zeros = plan.sp_pad_provider == "cat_zeros"
+    recipe = "sequence_parallel_cat_zeros_pad" if is_cat_zeros else "sequence_parallel_reduce_scatter_pad"
+    expansion = ("ZerosLike", "ConcatD") if is_cat_zeros else ("MemSet", "PadV3")
+    abi_meta: tuple[tuple[str, Any], ...] = (
+        (("aclnn_symbols", ("aclnnInplaceZero", "aclnnCat")),)
+        if is_cat_zeros else (("aclnn_symbol", "aclnnConstantPadNd"),)
+    )
+    pad = vector_op(
+        op_id=op_id, deps=deps, stage=stage, layer=layer, requests=requests,
+        phase=phase, dtype=str(dtype), family="pad", recipe=recipe,
+        shape=(padded_rows, int(width)), elements=pad_rows * int(width), ops_per_element=1,
+        read_bytes_override=payload_read, write_bytes_override=payload_write,
+        metadata=_common(
+            plan, role="reduce_scatter_pad", input_shape=(src_rows, int(width)),
+            output_shape=(padded_rows, int(width)), payload=0.0,
+        ) + abi_meta + (
+            ("materialization", "cat_zeros" if is_cat_zeros else "right_padding"),
+            ("sp_pad_provider", plan.sp_pad_provider),
+            ("native_kinds", expansion),
+            ("padding_rows", pad_rows),
+            ("physical_payload_bytes", payload_read + payload_write),
+            ("mapping_basis", "analytical_F_pad_copy_and_zero"),
+        ),
+    )
+    return replace(pad, stream=stream) if stream else pad
+
+
+def emit_mc2_mask_pad(
+    *,
+    plan: SequenceParallelPlan,
+    op_id: str,
+    deps: tuple[str, ...],
+    stage: int,
+    layer: int,
+    requests: tuple[str, ...],
+    phase: str,
+    stream: str = "",
+) -> OpSpec | None:
+    """Emit G1 ``mc2_mask`` boolean pad (``3xCast + MemSet + PadV3``) when ``Q_bucket % T != 0``."""
+    if not plan.mc2_active_mask_active:
+        return None
+    pad_rows = plan.reduce_scatter_pad_rows(plan.input_rows)
+    if pad_rows <= 0:
+        return None
+    padded_rows = int(plan.input_rows) + pad_rows
+    mask_kernels = ("Cast", "MemSet", "PadV3", "Cast", "Cast")
+    op = vector_op(
+        op_id=op_id, deps=deps, stage=stage, layer=layer, requests=requests,
+        phase=phase, dtype="int8", family="pad", recipe="sequence_parallel_reduce_scatter_pad",
+        shape=(padded_rows,), elements=padded_rows * _MC2_MASK_CAST_COUNT, ops_per_element=1,
+        read_bytes_override=int(plan.input_rows), write_bytes_override=padded_rows,
+        metadata=_common(
+            plan, role="mc2_mask_pad", input_shape=(int(plan.input_rows),),
+            output_shape=(padded_rows,), payload=0.0,
+        ) + (
+            ("aclnn_symbols", ("aclnnCast", "aclnnConstantPadNd", "aclnnCast", "aclnnCast")),
+            ("native_kinds", mask_kernels),
+            ("mc2_mask_cast_launches", _MC2_MASK_CAST_COUNT),
+            ("padding_rows", pad_rows),
+        ),
+    )
+    return replace(op, stream=stream) if stream else op
+
+
 def close_output(ops, last, *, plan: SequenceParallelPlan, width: int, dtype: str,
                  op_id: str | None = None, row_multiplier: int = 1,
                  channel_multiplier: int = 1,
@@ -700,35 +927,22 @@ def close_output(ops, last, *, plan: SequenceParallelPlan, width: int, dtype: st
     if any(op.op_id == replacement_id for op in ops[:-1]):
         raise ModelingError(f"sequence_parallel_close_output_duplicate_id:{replacement_id}")
     prefix, dependencies = ops[:-1], tail.deps
+    pad = None
     if input_rows is not None:
         _, global_rows, physical_width = _shape(
             plan, width, row_multiplier=row_multiplier,
             channel_multiplier=channel_multiplier)
         source_rows = input_rows * row_multiplier
-        if source_rows != global_rows:
-            # sp_reduce_scatter materializes F.pad before either custom or
-            # ordinary collective; it copies live rows and zeroes the tail.
-            if source_rows < 0 or source_rows > global_rows:
-                raise ModelingError("sequence_parallel_reduce_scatter_rows_outside_allocation")
-            payload_read = source_rows * physical_width * dtype_bytes(dtype)
-            payload_write = global_rows * physical_width * dtype_bytes(dtype)
-            pad = vector_op(
-                op_id=replacement_id + ".pad", deps=dependencies,
-                stage=tail.stage, layer=tail.layer, requests=tail.requests,
-                phase=tail.phase, dtype=str(dtype), family="pad",
-                recipe="sequence_parallel_reduce_scatter_pad",
-                shape=(global_rows, physical_width),
-                elements=(global_rows - source_rows) * physical_width, ops_per_element=1,
-                read_bytes_override=payload_read, write_bytes_override=payload_write,
-                metadata=_common(
-                    plan, role="reduce_scatter_pad", input_shape=(source_rows, physical_width),
-                    output_shape=(global_rows, physical_width), payload=0.0) + (
-                        ("materialization", "right_padding"),
-                        ("padding_rows", global_rows - source_rows),
-                        ("physical_payload_bytes", payload_read + payload_write),
-                        ("mapping_basis", "analytical_F_pad_copy_and_zero")),
-            )
-            prefix += (replace(pad, stream=tail.stream),)
+        if source_rows < 0 or source_rows > global_rows:
+            raise ModelingError("sequence_parallel_reduce_scatter_rows_outside_allocation")
+        pad = emit_reduce_scatter_pad(
+            plan=plan, op_id=replacement_id + ".pad", deps=dependencies,
+            stage=tail.stage, layer=tail.layer, requests=tail.requests,
+            phase=tail.phase, width=physical_width, dtype=dtype,
+            source_rows=source_rows, target_rows=global_rows, stream=tail.stream,
+        )
+        if pad is not None:
+            prefix += (pad,)
             dependencies = (pad.op_id,)
     replacement = reduce_scatter(
         plan=plan, op_id=replacement_id, deps=dependencies, stage=tail.stage,
@@ -736,4 +950,62 @@ def close_output(ops, last, *, plan: SequenceParallelPlan, width: int, dtype: st
         width=width, dtype=dtype, row_multiplier=row_multiplier,
         channel_multiplier=channel_multiplier,
     )
+    if plan.mmrs_fused:
+        producer_idx = next(
+            (i for i, op in enumerate(prefix) if op.op_id == tail.deps[0]),
+            None,
+        )
+        producer_op = prefix[producer_idx] if producer_idx is not None else None
+        prod_is_matmul = (
+            producer_op is not None and producer_op.family in _MMRS_PRODUCER_FAMILIES
+        )
+        has_other_consumer = (
+            producer_op is not None
+            and any(
+                producer_op.op_id in op.deps
+                for i, op in enumerate(prefix)
+                if i != producer_idx
+            )
+        )
+        prod_meta = dict(producer_op.metadata) if producer_op is not None else {}
+        has_bias = bool(prod_meta.get("has_bias", metadata.get("has_bias", False)))
+        raw_k = prod_meta.get("k")
+        if raw_k is None and producer_op is not None:
+            for shp in (producer_op.local_shape, producer_op.semantic_shape):
+                if len(shp) >= 3:
+                    raw_k = shp[2]
+                    break
+        k_dim = int(raw_k or 0)
+        mmrs_ok = (
+            pad is None
+            and prod_is_matmul
+            and not has_other_consumer
+            and k_dim > 0
+            and mmrs_eligible(
+                tp=plan.tp, dtype=dtype, has_bias=has_bias, k_dim=k_dim,
+                enable_mmrs_fusion=True,
+            )
+        )
+        rep_meta = dict(replacement.metadata)
+        rep_meta["mmrs_fused"] = mmrs_ok
+        if mmrs_ok and producer_op is not None and producer_idx is not None:
+            rep_meta["abi_symbol"] = "aclnnMatmulReduceScatterV2"
+            rep_meta["aclnn_symbol"] = "aclnnMatmulReduceScatterV2"
+            rep_meta["native_kinds"] = ("MatmulReduceScatter",)
+            rep_meta["fused_producer_op_id"] = producer_op.op_id
+            # Replace the unfused producer GEMM directly so it does not remain alongside MMRS.
+            prefix = prefix[:producer_idx] + prefix[producer_idx + 1:]
+            replacement = replace(
+                replacement,
+                deps=producer_op.deps,
+                flops=producer_op.flops,
+                matrix_flops=producer_op.matrix_flops,
+                hbm_bytes=producer_op.hbm_bytes + replacement.hbm_bytes,
+                mte2_bytes=producer_op.mte2_bytes + replacement.mte2_bytes,
+                mte3_bytes=producer_op.mte3_bytes + replacement.mte3_bytes,
+                recipe="matmul_reduce_scatter_v2",
+                metadata=tuple(rep_meta.items()),
+            )
+        else:
+            replacement = replace(replacement, metadata=tuple(rep_meta.items()))
     return prefix + (replace(replacement, stream=tail.stream),), replacement_id

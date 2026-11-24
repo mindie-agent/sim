@@ -292,13 +292,15 @@ def cached_tile(keys, heads, latent, rope, first, last, private_hbm=0):
                               private_hbm=private_hbm)
 
 
-def tile_stream(sequences, topk, compute_units, tile_size, pool_size, pool_tail):
+def tile_stream(sequences, topk, compute_units, tile_size, pool_size, pool_tail,
+                *, per_sequence_topk=None):
     """One finite owner -> query row -> key tile stream for every owner."""
     rows = sum(query for query, _ in sequences)
     owners = min(rows, compute_units)
     return owners, tuple(
         tuple(owner_row_tiles(owner, sequences, compute_units, topk, tile_size,
-                              pool_size=pool_size, pool_tail=pool_tail))
+                              pool_size=pool_size, pool_tail=pool_tail,
+                              per_sequence_topk=per_sequence_topk))
         for owner in range(owners))
 
 
@@ -309,16 +311,23 @@ def _row_partition(shape, sequences, topk):
     )
     pool = shape.get("index_pool_size", 1)
     tail = shape.get("index_pool_tail", False)
+    per_seq_topk = shape.get("per_sequence_topk")
     by_key, private, maximum = {}, [], 0
-    for (query, context), (key, extent) in zip(sequences, prefix_members(shape, sequences)):
+    for seq_idx, ((query, context), (key, extent)) in enumerate(
+            zip(sequences, prefix_members(shape, sequences))):
+        seq_topk = (
+            int(per_seq_topk[seq_idx])
+            if isinstance(per_seq_topk, (tuple, list)) and seq_idx < len(per_seq_topk)
+            else int(topk)
+        )
         row_counts = []
         for offset in range(query):
             visible = context + offset + 1
-            selected = selected_tokens(visible, topk, pool, tail)
+            selected = selected_tokens(visible, seq_topk, pool, tail)
             # The calibrated estimate samples historical complete pools. Any
             # selected causal tail is a known interval, including its identity.
             history = visible // pool
-            picked = min(history, topk // pool)
+            picked = min(history, seq_topk // pool)
             prefix_pools, rest = divmod(extent, pool)
             population = context // pool
             whole = selected_prefix_count(picked, prefix_pools, history, population)
@@ -330,7 +339,7 @@ def _row_partition(shape, sequences, topk):
             if shared:
                 by_key.setdefault(key, []).append((extent, shared))
             maximum = max(maximum, shared)
-            row_counts.append(selected - shared)
+            row_counts.append(max(0, selected - shared))
         private.append(tuple(row_counts))
     return sum(nested_prefix_union(g) for g in by_key.values()), tuple(private), maximum
 
@@ -355,7 +364,7 @@ def _priced_streams(streams, sequences, units, private):
             start = 0
             for keys, first, last in tiles:
                 stop = start + keys
-                owned = stop * count // selected - start * count // selected
+                owned = (stop * count // selected - start * count // selected) if selected > 0 else 0
                 priced.append((keys, first, last, owned))
                 start = stop
         result.append(tuple(priced))
@@ -396,7 +405,8 @@ def arch35_plan(shape, geometry, *, tile_size=None, slots=None):
     owner_units = (compute_units // 2) if split_g else compute_units
     _owners, streams = tile_stream(
         sequences, topk, owner_units, tile_size,
-        shape.get("index_pool_size", 1), shape.get("index_pool_tail", False))
+        shape.get("index_pool_size", 1), shape.get("index_pool_tail", False),
+        per_sequence_topk=shape.get("per_sequence_topk"))
     kv_slot_bytes = tile_size * (latent + rope) * C8_BF16_BYTES
     accumulator_bytes = _align(max(head_splits), C8_HEAD_ALIGN) * latent * C8_FP32_BYTES
     if (geometry.buffer_units.get("l1", 0) < compute_units

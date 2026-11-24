@@ -62,7 +62,7 @@ def batched_matrix_metadata(*, tokens, heads, input_width, output_width, role):
 
 
 NATIVE_LAYER_NORM_KIND = "aclnnLayerNorm"
-NATIVE_LAYER_NORM_KINDS = ("LayerNormV3", "aclnnLayerNorm")
+NATIVE_LAYER_NORM_KINDS = ("LayerNormV3",)
 NATIVE_LAYER_NORM_OPS = 8
 FP32_BYTES = int(dtype_bytes("fp32"))
 
@@ -96,6 +96,7 @@ def index_layer_norm(builder, *, source, rows, width, input_dtype=None,
                       ("parameter_read_bytes", parameters),
                       ("norm_gamma_runtime_bytes", parameters["gamma"]),
                       ("output_format", output_dtype),
+                      ("aclnn_symbol", NATIVE_LAYER_NORM_KIND),
                       ("native_kind", NATIVE_LAYER_NORM_KIND),
                       ("native_kinds", NATIVE_LAYER_NORM_KINDS),
                       ("zero_external_casts", True),

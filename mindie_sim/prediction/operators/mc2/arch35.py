@@ -246,6 +246,36 @@ def common_native_protocol(chosen, fused_level, moe_comm):
             "fused_mc2_level": fused_level, "moe_comm": moe_comm}
 
 
+_ARCH35_MEGAMOE_SUPPORTED_WEIGHT_DTYPES = frozenset({
+    "bf16", "fp16", "int8", "w8a8", "fp8", "fp8_e4m3", "fp8_e4m3fn",
+    "mxfp8", "mx_fp8", "fp4", "fp4_e2m1", "mxfp4", "mx_fp4", "int4", "w4a8", "w4a16",
+})
+
+
+def fused_mc2_native_binding(weight_dtype: str = "bf16", *, fused_level: int = FUSED_MC2_ROUTED_MODE) -> dict:
+    """Resolve the Arch35 (A5) fused MoE MC2 identity and ACLNN symbol (modes 2 & 3 only)."""
+    level = int(fused_level)
+    if level not in {FUSED_MC2_ROUTED_MODE, FUSED_MC2_SHARED_MODE}:
+        raise ModelingError(f"arch35_fused_mc2_level_unsupported:{level}")
+    w_norm = str(weight_dtype or "").strip().lower().replace("-", "_")
+    if not w_norm:
+        raise ModelingError("arch35_fused_mc2_weight_dtype_required")
+    if w_norm not in _ARCH35_MEGAMOE_SUPPORTED_WEIGHT_DTYPES:
+        raise ModelingError(f"arch35_fused_mc2_weight_dtype_unsupported:{weight_dtype!r}")
+    return {
+        "public_name": "aclnnMegaMoe",
+        "api": {
+            "namespace": "aclnn",
+            "entry": "cann_ops_transformer.ops.mega_moe",
+            "aclnn_symbol": "aclnnMegaMoe",
+        },
+        "fused_level": level,
+        "shared_expert_fused": level == FUSED_MC2_SHARED_MODE,
+        "source": SOURCE,
+        "execution_core": "mix",
+    }
+
+
 def _absorbed_quant_mode(routing):
     """Dispatch payload mode declared by one absorbed init-routing pack."""
     payload = str(routing.get("payload_format") or "")

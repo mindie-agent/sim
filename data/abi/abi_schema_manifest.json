@@ -1,20 +1,40 @@
 {
   "schema": "mindie-sim.abi-catalog/1",
   "description": "Schema index for sealed Ascend hardware-usable operator ABI catalogs (CANN and non-CANN backends).",
-  "soc_archs": ["A2", "A3", "A5"],
+  "soc_archs": [
+    "A2",
+    "A3",
+    "A5"
+  ],
   "hardware_usable_backends": [
     "cann_aclnn",
-    "hccl_mc2",
-    "vllm_ascend_csrc",
-    "triton",
-    "torch_npu",
     "catlass",
-    "third_party_wheel"
+    "hccl_mc2",
+    "third_party_wheel",
+    "torch_npu",
+    "triton",
+    "vllm_ascend_csrc"
+  ],
+  "cann_package_backends": [
+    "cann_aclnn",
+    "hccl_mc2"
+  ],
+  "non_cann_backends": [
+    "catlass",
+    "third_party_wheel",
+    "torch_npu",
+    "triton",
+    "vllm_ascend_csrc"
   ],
   "open_synthesis_backends": [
-    "tilelang",
     "ascendc",
-    "catlass"
+    "catlass",
+    "tilelang"
   ],
-  "arch_manifest_pattern": "cann93_shipping_abi_{arch}.json"
+  "arch_manifest_pattern": "cann93_shipping_abi_{arch}.json",
+  "sealed_sha256": {
+    "A2": "63ba2a5886a5b9ac4a77ac28c4e9193a135cf2d748f7cd028a64524121343dff",
+    "A3": "d97770f65cf0a01bf244f37f5c23be767d3f546cb4cd2912de0e1cdb8bb0826c",
+    "A5": "fe8cbaf6673b0ab9b446601dd15f639fc9ecd081568d5e3c8f179e7827819932"
+  }
 }

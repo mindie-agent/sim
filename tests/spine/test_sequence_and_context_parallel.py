@@ -175,6 +175,11 @@ def test_hybrid_pcp_prefill_with_ple_host_offload_and_dcp_decode():
 @pytest.mark.parametrize("model", ["deepseek-v3.2", "glm-5.3-flash"])
 def test_pooled_indexer_and_hybrid_kda_decode_context_parallelism(model):
     case = compose_case(model, hardware="a5", tp=4, ep=4, dcp=2, layers=4); assert int(case["runtime"]["parallel"]["cp"]) == 2
+    if model == "glm-5.3-flash":
+        # M10 shipping legality: Glm5NextKPoolIndexerBackend forbids DCP > 1 (indexer_kpool.py:789).
+        with pytest.raises(ModelingError, match="m10_kpool_requires_dcp_eq_1"):
+            _recipes(case, phase="decode", tokens=1, context=1024)
+        case = compose_case(model, hardware="a5", tp=4, ep=4, dcp=2, layers=4, va_recommended=False)
     _graph, recipes = _recipes(case, phase="decode", tokens=1, context=1024); assert {"dcp_lse_merge", "catalog_dcp_lse_merge"} & recipes
     if model == "deepseek-v3.2":
         mtp_case = compose_case(model, hardware="a5", tp=4, ep=4, layers=4, mtp_proposal_tokens=3); auxiliary = mtp_case["model"]["auxiliary"]; assert auxiliary is not None; mtp = auxiliary["mtp"]
@@ -405,7 +410,8 @@ def test_declaration_and_structural_domain_reject_unsupported_rows():
     hyper = replace(parsed.model, layer_plans=tuple(replace(layer, hyper_connections=True) for layer in parsed.model.layer_plans))
     with pytest.raises(ModelingError, match="hyperconnections_unsupported"): select(parsed.runtime, hyper, _views(8), tokens=8)
     draft = replace(parsed.model, layer_plans=(replace(parsed.model.layer_plans[0], scope="draft"),))
-    with pytest.raises(ModelingError, match="requires_body_scope"): select(parsed.runtime, draft, _views(8), tokens=8)
+    assert select(parsed.runtime, draft, _views(8), tokens=8) is not None
+    with pytest.raises(ModelingError, match="requires_body_scope"): select(parsed.runtime, draft, _views(8), tokens=8, allow_draft_scope=False)
     with pytest.raises(ModelingError, match="no_padding_domain"): select(parsed.runtime, parsed.model, (replace(_views(8)[0], padding=True),), tokens=8)
     with pytest.raises(ModelingError, match="speculative_field_unsupported"): select(parsed.runtime, parsed.model, (replace(_views(8)[0], draft_proposal_tokens=1),), tokens=8)
     with pytest.raises(ModelingError, match="tokens_must_equal_sum_q_len"): select(parsed.runtime, parsed.model, _views(8), tokens=9)
@@ -489,8 +495,12 @@ def test_complete_source_graph_slices_attention_and_preserves_padded_ffn(batch):
         sliced = by_id.get(prefix + ".attention.sp_input_view"); pad = [op for op in ops if op.recipe == "sequence_parallel_reduce_scatter_pad"]
         if batch < physical:
             assert sliced.local_shape == (batch, 7168) and sliced.deps == (gather.op_id,) and first.deps == (sliced.op_id,) and sliced.hbm_bytes == sliced.link_bytes == 0
-            assert len(pad) == 1 and pad[0].mte2_bytes == batch * 7168 * 2 and pad[0].mte3_bytes == physical * 7168 * 2 and pad[0].vector_ops == (physical - batch) * 7168
-            scatter = next(op for op in ops if op.deps == (pad[0].op_id,)); assert scatter.family == "reduce_scatter" and scatter.link_bytes == gather.link_bytes
+            has_shared_scatter = any(op.op_id == prefix + ".shared.sp_scatter" for op in ops)
+            expected_pads = 2 if has_shared_scatter else 1
+            assert len(pad) == expected_pads
+            for pad_op in pad:
+                assert pad_op.mte2_bytes == batch * 7168 * 2 and pad_op.mte3_bytes == physical * 7168 * 2 and pad_op.vector_ops == (physical - batch) * 7168
+                scatter = next(op for op in ops if op.deps == (pad_op.op_id,)); assert scatter.family == "reduce_scatter" and scatter.link_bytes == gather.link_bytes
         else: assert sliced is None and pad == [] and first.deps == (gather.op_id,)
     # FFN and residual tensors are still SP-local, while shared/dense TP matrices execute their physical allgather rows.
     assert by_id["s0.l0.gate_up"].local_shape[0] == physical and by_id["s0.l1.router"].local_shape[0] == physical // 8

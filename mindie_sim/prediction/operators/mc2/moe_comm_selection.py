@@ -188,9 +188,11 @@ class MoeCommConfig:
                 return MC2
             return ALLGATHER
         if self.policy == FUSED_OR_CAPACITY:
-            if self.mega_moe_supported:
+            if self.mega_moe_supported and allow_plain_mc2:
                 return FUSED_MC2
-            if self.enable_fused_mc2 and self.world_size <= _FUSED_OR_CAPACITY_MAX_FUSED_WORLD_SIZE:
+            if (allow_plain_mc2
+                    and self.enable_fused_mc2
+                    and self.world_size <= _FUSED_OR_CAPACITY_MAX_FUSED_WORLD_SIZE):
                 return FUSED_MC2
             if allow_plain_mc2 and num_tokens <= self.capacity:
                 return MC2
@@ -288,12 +290,11 @@ class MoeCommConfig:
             mega = True
         if arch == "A5" and effective_fused_level >= _FUSED_MC2_MODE_MEGAMOE_ROUTED:
             mega = True
-        provenance = bool(meta.get("source_lowerings") or meta.get("image") or
-                          meta.get("image_id") or meta.get("moe_comm_mode"))
+        provenance = bool(meta.get("source_lowerings") or meta.get("moe_comm_mode"))
         if not mode and declared_mode in {DYNAMIC, ALWAYS_MC2}:
             mode = declared_mode
         if not mode:
-            if (arch == "A5" and int(ep) > 1
+            if (arch in {"A2", "A3", "A5"} and int(ep) > 1
                     and (declared_fused or mega or provenance)):
                 mode = DYNAMIC
         if not mode:
@@ -323,6 +324,8 @@ class MoeCommConfig:
             max_num_batched_tokens=max_batched,
             enable_fused_mc2=enable_fused or mode == ALWAYS_MC2,
             mega_moe_supported=mega)
+        raw_draft_quant = meta.get("draft_quant_supported")
+        draft_quant_ok = True if raw_draft_quant is None else bool(int(raw_draft_quant))
         return cls(
             mode=mode, policy=policy, capacity=capacity, world_size=world,
             tp=tp, top_k=max(1, int(top_k)), experts_per_device=max(1, int(experts) // world),
@@ -335,32 +338,9 @@ class MoeCommConfig:
             uniform_decode_query_len=uniform, capture_sizes=capture_sizes,
             lora=bool(int(meta.get("lora", 0) or 0)),
             is_draft_model=bool(int(meta.get("is_draft_model", 0) or 0)),
-            draft_quant_supported=bool(int(meta.get("draft_quant_supported", 1) or 1)),
+            draft_quant_supported=draft_quant_ok,
         )
 
     def for_static_mc2(self) -> "MoeCommConfig":
         return replace(self, mode=ALWAYS_MC2)
-
-
-def local_tokens(geometry: Any) -> int:
-    """This rank's pre-cohort request rows; never the EP-expanded total."""
-    local_batch = int(getattr(geometry, "local_batch", 0) or 0) or int(
-        getattr(geometry, "batch", 0) or 0)
-    return sum(int(request.q_len) for request in geometry.requests[:local_batch])
-
-
-def selection_bindings(config: MoeCommConfig | None, geometry: Any) -> dict[str, Any]:
-    """Environment used by the ordinary family ``active`` guards."""
-    if config is None:
-        return {}
-    tokens = local_tokens(geometry)
-    selected = config.select(tokens)
-    return {
-        "MOE_LOCAL_TOKENS": tokens,
-        "MOE_COMM_CAPACITY": config.capacity,
-        "MOE_COMM_SELECTED_ALLTOALL": int(selected == ALLTOALL),
-        "MOE_COMM_SELECTED_MC2": int(selected == MC2),
-        "MOE_COMM_SELECTED_FUSED": int(selected == FUSED_MC2),
-        "MOE_COMM_SELECTED_ALLGATHER": int(selected == ALLGATHER),
-    }
 

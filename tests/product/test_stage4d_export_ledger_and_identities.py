@@ -447,7 +447,8 @@ def test_shipping_kernel_identities_route_unpack_sparse_attn_mrope_and_mx_quant(
         assert "Quant" in d128.ascend_kernel and "MxQuant" not in d128.ascend_kernel
 
     # 3. kimi-k3.1 @ A3 C8: preserve npu_kv_quant_sparse_flash_attention_vllm (NOT SparseFlashMla),
-    #    generic alltoall -> HcclAlltoAllV, plain BF16 SiTU -> SiTU, while A5 MC2 keeps MoeDistributeCombineV3.
+    #    A3 decode EP>1 selects shipping MC2 V2 (MoeDistributeDispatchV2/CombineV2) per live A3 M2,
+    #    plain BF16 SiTU -> SiTU, while A5 MC2 keeps MoeDistributeCombineV3.
     raw_k3_a3, _ = compose_export_case(
         "kimi-k3.1", REPRESENTATIVE_SKUS["a3"], topology_preset="a3_superpod",
         tp=8, ep=32, dp=4, dcp=8, quant="w4a8", kv_cache_dtype="int8",
@@ -455,8 +456,9 @@ def test_shipping_kernel_identities_route_unpack_sparse_attn_mrope_and_mx_quant(
     b_k3_a3 = build_export_bundle(raw_k3_a3, request=req)
     k3_a3_ops = {o.op_id: o for o in b_k3_a3.operators}
     assert k3_a3_ops["s0.l3.latent_attention_batch"].ascend_kernel == "npu_kv_quant_sparse_flash_attention_vllm"
-    assert k3_a3_ops["s0.l3.combine"].ascend_kernel == "HcclAlltoAllV"
-    assert k3_a3_ops["s0.l3.unpack"].ascend_kernel == "aclnnFinalizeRoutingV2"
+    assert k3_a3_ops["s0.l3.dispatch"].ascend_kernel == "MoeDistributeDispatchV2"
+    assert k3_a3_ops["s0.l3.combine"].ascend_kernel == "MoeDistributeCombineV2"
+    assert k3_a3_ops["s0.l3.unpack"].ascend_kernel == "MoeDistributeCombineV2"
     assert k3_a3_ops["s0.l1.expert_act"].ascend_kernel == "SiTU"
     assert k3_a3_ops["s0.l1.shared.situ"].ascend_kernel == "SiTU"
 
@@ -513,8 +515,8 @@ def test_sparse_mla_a3_situ_wo_a_w4a16_parity_and_gemma4_decode_read_conservatio
     b_g53_c8 = build_export_bundle(raw_g53_c8, request=req)
     g53_c8_ops = {o.op_id: o for o in b_g53_c8.operators}
     assert g53_c8_ops["s0.l0.latent_attention_batch"].ascend_kernel == "npu_kv_quant_sparse_flash_attention_vllm"
-    assert g53_c8_ops["s0.l3.dispatch"].ascend_kernel == "HcclAlltoAllV"
-    assert g53_c8_ops["s0.l3.combine"].ascend_kernel == "HcclAlltoAllV"
+    # A3 glm-5.3 decode with enable_fused_mc2=1 selects shipping A3 dispatch_ffn_combine (M2).
+    assert g53_c8_ops["s0.l3.unpack"].ascend_kernel == "dispatch_ffn_combine"
 
     case_g53_bf16 = parse_case(raw_g53_c8)
     case_g53_bf16 = replace(

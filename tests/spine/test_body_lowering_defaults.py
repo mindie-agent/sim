@@ -166,7 +166,7 @@ def test_kda_body_defaults_install_scan_and_attention_residual(sku, expected_kda
     assert (kda_entry["implementation"] if isinstance(kda_entry, dict) else kda_entry) == expected_kda
     by_fam = {row["family"]: row for row in report["selections"]}
     assert by_fam["kda_decode"]["selection"] == "default_installed"
-    if sku == "Ascend950DT_9582":
+    if sku in {"Ascend950DT_9582", "Ascend910_9392"}:
         assert lowerings.get("attention_residual") == "vllm_ascend_attn_res_prefix" and by_fam["attention_residual"]["selection"] == "default_installed"
     else:
         assert "attention_residual" not in lowerings and by_fam["attention_residual"]["selection"] == "preserved"

@@ -475,16 +475,24 @@ def lower_native_fusions(ops, runtime, *, local_tokens=None, public_outputs=()):
     for op in original:
         for dep in op.deps:
             users[dep].add(op.op_id)
-    values_by_id = {}
-    for op in original:
-        try:
-            values_by_id[op.op_id] = produced_values(op)
-        except ModelingError:
-            values_by_id[op.op_id] = ()
+    from mindie_sim.prediction.program.implementation_audit import _audit_outputs
+    groups = list(_groups(original))
+    group_member_ids = {op.op_id for _, members in groups for op in members}
+    values_by_id = {
+        op.op_id: (
+            produced_values(op)
+            if (
+                op.op_id in group_member_ids
+                or bool(_audit_outputs(op))
+                or bool(op.dtype or dict(op.metadata).get("output_format") or dict(op.metadata).get("output_dtype"))
+            )
+            else ()
+        )
+        for op in original
+    }
     aliases, replacements, matched_roles = {}, {}, set()
     port_map, primary_ports, value_port_map = {}, {}, {}
     consumer_map = consumer_index(original)
-    groups = list(_groups(original))
     for declaration, members in groups:
         if declaration["role"] not in roles or declaration.get("native_fusion_eligible", True) is False:
             continue
@@ -502,9 +510,9 @@ def lower_native_fusions(ops, runtime, *, local_tokens=None, public_outputs=()):
             config = mxfp4_supply.config_from_group(declaration, members)
             gate = gate_members[0]
             from mindie_sim.prediction.operators.grouped_moe.gmmsq_quant_typed import work as gmmsq_work
-            groups = (sum(config.group_rows) * 2 * config.output_width
-                      * config.k // 2) // _MXFP4_PACKED_GROUP_BYTES
-            typed_work, _, _ = gmmsq_work(groups)
+            packed_groups = (sum(config.group_rows) * 2 * config.output_width
+                             * config.k // 2) // _MXFP4_PACKED_GROUP_BYTES
+            typed_work, _, _ = gmmsq_work(packed_groups)
             typed_resources = dict(typed_work.resources)
             gate = replace(
                 gate, recipe=family_gate_up_situ_mxfp4.RECIPE,

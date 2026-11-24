@@ -623,7 +623,6 @@ def test_rank_group_indexing_comm_axis_and_unfused_sp_mc2():
     from mindie_sim.prediction.sharding.sequence_parallel import (
         DECLARATION as SP_DECL,
         IMPLEMENTATION as SP_IMPL,
-        LEGACY_IMPLEMENTATION as SP_LEGACY_IMPL,
         sequence_parallel_enabled,
     )
     from mindie_sim.schema.parallel import ParallelSpec
@@ -668,12 +667,12 @@ def test_rank_group_indexing_comm_axis_and_unfused_sp_mc2():
     topo_dcp_tp = Topology(base_8.machine, p_dcp_tp)
     assert topo_dcp_tp.groups("dcp", 0, 0) == topo_dcp_tp.groups("tp", 0, 0) == ((0, 1, 2, 3),)
 
-    # 4) Sequence-parallel backward-compat implementation name + structured comm_axis + unfused MC2.
+    # 4) Sequence-parallel canonical implementation name + structured comm_axis + unfused MC2.
     assert SP_IMPL == "vllm_ascend_sequence_parallel"
     assert sequence_parallel_enabled({"sequence_parallel": dict(SP_DECL)}, 4) is True
     assert sequence_parallel_enabled(
-        {"sequence_parallel": {**SP_DECL, "implementation": SP_LEGACY_IMPL}}, 4
-    ) is True
+        {"sequence_parallel": {**SP_DECL, "implementation": "unknown_legacy_sp"}}, 4
+    ) is False
 
     raw_sp = compose_case(
         "kimi-k3.1", hardware=REPRESENTATIVE_SKUS["a5"], layers=4,

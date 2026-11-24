@@ -90,12 +90,14 @@ def common_native_protocol(chosen, fused_level, moe_comm, *, arch_family: str = 
     return leaf.common_native_protocol(chosen, fused_level, moe_comm)
 
 
-def fused_mc2_native_binding(weight_dtype: str, *, fused_level: int = 1, arch_family: str = "A3"):
-    """Return arch-dispatched native MC2 kernel identity binding."""
-    leaf = _protocol_module_for_arch(arch_family)
-    if hasattr(leaf, "fused_mc2_native_binding"):
-        return leaf.fused_mc2_native_binding(weight_dtype, fused_level=fused_level)
-    return arch22.fused_mc2_native_binding(weight_dtype, fused_level=fused_level)
+def fused_mc2_native_binding(weight_dtype: str, *, fused_level: int = 1, arch_family: str = ""):
+    """Return arch-dispatched native MC2 kernel identity binding without cross-ISA fallback."""
+    arch = str(arch_family or "").strip().upper()
+    if arch in {"A2", "A3"}:
+        return arch22.fused_mc2_native_binding(weight_dtype, fused_level=fused_level)
+    if arch == "A5":
+        return arch35.fused_mc2_native_binding(weight_dtype, fused_level=fused_level)
+    raise ModelingError(f"mc2_fused_native_binding_arch_unsupported:{arch_family!r}")
 
 
 def lower_native_protocol(ops, *, selected, **caller):
@@ -106,11 +108,6 @@ def lower_native_protocol(ops, *, selected, **caller):
 
 def resolve_operator_plan(op: OpSpec, ctx: OperatorPlanningContext, /) -> ResolvedOperator:
     """Resolve the caller and attach the occurrence-bound pipeline descriptor."""
-    if op.recipe == "arch22_v2_caller_local" and "mc2_v2_local" in dict(op.metadata):
-        from mindie_sim.prediction.operators.mc2.mc2_local_caller import LOCAL, SOURCE as LOCAL_SOURCE, build as build_local_caller
-
-        plan = build_local_caller(op, ctx.geometry)
-        return ResolvedOperator(ctx.occurrence, op, plan, LOCAL, (LOCAL_SOURCE,), None)
     strategy = _STRATEGIES.get(ctx.compute_arch.arch_id)
     if strategy is None:
         raise capability_gap(op, ctx, "unsupported_compute_architecture")

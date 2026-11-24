@@ -530,6 +530,8 @@ def test_tensor_partition_preserves_full_router_expert_work_and_one_gather(tp, r
 def test_native_joint_calls_charge_each_channel_once_and_gate_consumer(protocol, width, sequences):
     legacy = protocol == V2_NATIVE
     raw = caller_case(protocol=protocol)
+    if legacy:
+        raw["machine"]["device"]["compute_arch"] = {"preset": "npu_arch_2201"}
     if protocol is None:
         raw["machine"].update(architecture="A5", sku=MESH_SKU)
         raw["runtime"].update(max_num_seqs=64, max_num_batched_tokens=8192, graph_buckets=[1, 2, 4, 8, 16, 32, 64],

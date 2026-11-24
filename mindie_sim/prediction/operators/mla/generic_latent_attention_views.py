@@ -141,13 +141,45 @@ def selected_pairs(parts, ratio, topk, *, noncausal=False, kv_len=None):
     )
 
 
-def _index_owner_rows(tokens, compression, cp, interleave):
+def _owned_completed_rows_for_rank(tokens, compression, cp, interleave, rank):
+    """Exact store-on-completion ownership for compressed rows (handles ``I % R != 0``)."""
     ratio = max(INDEX_IDENTITY_COMPRESSION, int(compression))
+    degree = max(INDEX_IDENTITY_COMPRESSION, int(cp))
+    stride = max(INDEX_IDENTITY_COMPRESSION, int(interleave))
     rows = completed_rows(tokens, ratio)
-    block = max(INDEX_IDENTITY_COMPRESSION, int(interleave) // ratio)
-    return max(owned_positions(INDEX_NO_ROWS, rows - INDEX_IDENTITY_COMPRESSION,
-                               cp, block, rank)
-               for rank in range(cp))
+    if rows <= 0:
+        return INDEX_NO_ROWS
+    if degree <= 1:
+        return rows
+    if ratio == 1:
+        return owned_positions(INDEX_NO_ROWS, rows - 1, degree, stride, rank)
+    if stride % ratio == 0:
+        block = stride // ratio
+        return owned_positions(INDEX_NO_ROWS, rows - 1, degree, block, rank)
+    # General store-on-completion owner(j) = (((j + 1) * R - 1) // I) % D.
+    # Use periodic cycle LCM(I * D, R) // R to remain O(1) for huge contexts.
+    cycle_raw = math.lcm(stride * degree, ratio)
+    cycle_rows = cycle_raw // ratio
+    full_cycles, rem_rows = divmod(rows, cycle_rows)
+    rem_owned = sum(
+        1 for j in range(rem_rows)
+        if (((j + 1) * ratio - 1) // stride) % degree == rank
+    )
+    if full_cycles == 0:
+        return rem_owned
+    cycle_owned = sum(
+        1 for j in range(cycle_rows)
+        if (((j + 1) * ratio - 1) // stride) % degree == rank
+    )
+    return full_cycles * cycle_owned + rem_owned
+
+
+def _index_owner_rows(tokens, compression, cp, interleave):
+    degree = max(INDEX_IDENTITY_COMPRESSION, int(cp))
+    return max(
+        _owned_completed_rows_for_rank(tokens, compression, degree, interleave, rank)
+        for rank in range(degree)
+    )
 
 
 def index_key_window(parts, *, query_tile=INDEX_QUERY_TILE, noncausal=False,
@@ -173,8 +205,17 @@ def index_key_window(parts, *, query_tile=INDEX_QUERY_TILE, noncausal=False,
 def unique_index_key_rows(views, *, query_tile=INDEX_QUERY_TILE, noncausal=False,
                           cp=INDEX_IDENTITY_COMPRESSION,
                           interleave=INDEX_QUERY_TILE,
-                          compression=INDEX_IDENTITY_COMPRESSION, share_prefix=True):
-    """Deduplicate HBM prefixes only; private suffixes and tile refills add."""
+                          compression=INDEX_IDENTITY_COMPRESSION, share_prefix=True,
+                          prefix_block_size: int | None = None):
+    """Deduplicate HBM prefixes only; private suffixes and tile refills add.
+
+    Aligns raw prefix once using ``prefix_block_size`` (falling back to
+    ``interleave``) before mapping to store-on-completion compressed rows.
+    """
+    align_block = max(
+        INDEX_IDENTITY_COMPRESSION,
+        int(prefix_block_size) if prefix_block_size is not None else int(interleave),
+    )
     groups: dict[object, int] = {}
     private_rows = refills = INDEX_NO_ROWS
     for view in views:
@@ -186,7 +227,7 @@ def unique_index_key_rows(views, *, query_tile=INDEX_QUERY_TILE, noncausal=False
         prefix = min(int(getattr(view, "prefix_tokens", INDEX_NO_ROWS)
                          or INDEX_NO_ROWS),
                      int(view.context)) if share_prefix else INDEX_NO_ROWS
-        prefix = max(INDEX_NO_ROWS, prefix) // interleave * interleave
+        prefix = (max(INDEX_NO_ROWS, prefix) // align_block) * align_block
         shared = min(union_rows,
                      _index_owner_rows(prefix, compression, cp, interleave))
         key = str(getattr(view, "prefix_key", "")
@@ -227,7 +268,8 @@ def _resolve_native_indexer_mode(runtime, machine, quant, model) -> tuple[bool, 
 
 def semantic_index_selection(b, *, deps, views, plan, model, quant, parallel,
                             shard, prefix, padded_tokens, runtime=None,
-                            score_rows=None, l2_bytes=None, machine=None):
+                            score_rows=None, l2_bytes=None, machine=None,
+                            cp_interleave_size=None):
     """Declare the indexer score/TopK pair with local sharded row accounting."""
     valid = sum(view.q_len for view in views)
     cand_window = (
@@ -237,6 +279,12 @@ def semantic_index_selection(b, *, deps, views, plan, model, quant, parallel,
     ratio = max(1, plan.compress_ratio)
     block_size = max(
         1, int(getattr(runtime, "kv_block_size", DEFAULT_BLOCK_SIZE) or DEFAULT_BLOCK_SIZE))
+    eff_interleave = max(
+        1,
+        int(cp_interleave_size)
+        if cp_interleave_size is not None
+        else int(getattr(runtime, "cp_interleave_size", DEFAULT_BLOCK_SIZE) or DEFAULT_BLOCK_SIZE),
+    )
     pairs_by_view = [
         int(selected_pairs(
             visible_parts(view), ratio, cand_window,
@@ -265,7 +313,8 @@ def semantic_index_selection(b, *, deps, views, plan, model, quant, parallel,
     shared_reads = (runtime is not None and runtime.prefix_cache_mode == "shared"
                     and runtime.prefix_read_mode != "per_sequence" and not pinned)
     read_args = dict(noncausal=bool(plan.noncausal_attention), cp=cp,
-                     interleave=block_size, compression=ratio)
+                     interleave=eff_interleave, compression=ratio,
+                     prefix_block_size=block_size)
     private_rows, refill_rows = unique_index_key_rows(
         views, share_prefix=False, **read_args)
     union_rows, _ = unique_index_key_rows(
@@ -384,19 +433,28 @@ def view_causal_pairs(view, query, context, window):
     return counted
 
 
-def window_tile_rows(plan, context, query, start, query_tile, kv_len):
-    """Distinct KV rows one causal tile reads from the first query's window.
+def _view_noncausal_window_q(view, eff_q: int) -> int:
+    """Global block query count governing a noncausal SWA window under PCP splitting."""
+    return max(int(eff_q), int(getattr(view, "global_q_len", 0) or 0))
 
-    A tile can contain several queries; their sliding windows overlap, so the
-    span runs from the first query's window start through the last query's end
-    rather than charging only ``min(horizon, window)`` rows.
+
+def window_tile_rows(plan, context, query, start, query_tile, kv_len, *, global_q=None):
+    """Distinct KV rows one tile reads from the first query's window.
+
+    For causal attention, a tile can contain several queries whose sliding
+    windows overlap, so the span runs from the first query's window start
+    through the last query's end. For noncausal sliding-window attention
+    (upstream ``dsa_v41.py:1523,1684``: ``min(seq_lens, query_lens + window)``),
+    every query attends to the trailing context window plus the whole current
+    query/draft block (preserving global block width under PCP query splits).
     """
     hi = int(kv_len) if plan.noncausal_attention else context + min(
         query, start + query_tile)
     if plan.window <= 0:
         return hi
     if plan.noncausal_attention:
-        return min(hi, plan.window)
+        span_q = query if global_q is None else max(int(query), int(global_q))
+        return min(hi, plan.window + span_q)
     low = max(0, context + start + 1 - plan.window)
     return max(0, hi - low)
 
@@ -406,6 +464,7 @@ def kv_sweeps(parts, plan, view, query_tile, *, dense, topk):
     sweeps = 0
     long_cap = plan.index_topk if topk else view.kv_len
     dense_cap = min_positive(plan.window, plan.index_topk if topk else 0)
+    view_global_q = int(getattr(view, "global_q_len", 0) or 0) or None
     for query, context in parts:
         for start in range(0, query, query_tile):
             horizon = (view.kv_len if plan.noncausal_attention
@@ -415,12 +474,14 @@ def kv_sweeps(parts, plan, view, query_tile, *, dense, topk):
                     sweeps += horizon
                 elif plan.window > 0 and dense_cap == plan.window:
                     sweeps += window_tile_rows(
-                        plan, context, query, start, query_tile, view.kv_len)
+                        plan, context, query, start, query_tile, view.kv_len,
+                        global_q=view_global_q)
                 else:
                     sweeps += min(horizon, dense_cap)
             else:
                 window_rows = (window_tile_rows(
-                    plan, context, query, start, query_tile, view.kv_len)
+                    plan, context, query, start, query_tile, view.kv_len,
+                    global_q=view_global_q)
                     if plan.window else 0)
                 sweeps += window_rows + min(
                     completed_rows(horizon, plan.compress_ratio), long_cap)
@@ -449,12 +510,14 @@ def sparse_over_parts(parts, plan, query_tile, *, dense, kv_len=None, topk=None)
 
 def _dense_window_tile_spans(parts, view, plan, query_tile):
     """Yield ``(lo, hi)`` visible KV intervals for each dense query tile."""
+    view_global_q = int(getattr(view, "global_q_len", 0) or 0)
     for q_part, c_part in parts:
+        span_q = max(q_part, view_global_q)
         for start in range(0, q_part, query_tile):
             hi = (view.kv_len if plan.noncausal_attention
                   else c_part + min(q_part, start + query_tile))
             lo = (
-                (max(0, hi - plan.window) if plan.noncausal_attention
+                (max(0, hi - (plan.window + span_q)) if plan.noncausal_attention
                  else max(0, c_part + start + 1 - plan.window))
                 if plan.window > 0 else 0
             )
@@ -476,14 +539,34 @@ def _window_unique_rows(win_spans, view, plan, eff_cp, interleave):
     return [math.ceil(view.kv_len / eff_cp)] * eff_cp
 
 
+def _noncausal_window_rank_pairs(
+    eff_q: int, kv_len: int, window: int, eff_cp: int, interleave: int,
+    *, window_q: int | None = None,
+) -> list[float]:
+    """Exact rank-owned noncausal SWA pairs conserving ``eff_q * min(kv_len, window + window_q)``."""
+    if eff_q <= 0 or kv_len <= 0:
+        return [0.0] * eff_cp
+    span_q = int(eff_q) if window_q is None else max(int(eff_q), int(window_q))
+    lo = max(0, kv_len - (window + span_q)) if window > 0 else 0
+    hi = kv_len - 1
+    if hi < lo:
+        return [0.0] * eff_cp
+    return [
+        float(eff_q * owned_positions(lo, hi, eff_cp, interleave, rank))
+        for rank in range(eff_cp)
+    ]
+
+
 def _sparse_window_partition(parts, view, plan, query_tile, eff_cp, interleave):
     """Exact per-rank dense-window pairs and sweeps for window_compressed sparse layers."""
     if plan.cache_kind == "dense" or plan.window <= 0:
         return [0.0] * eff_cp, [0] * eff_cp
     if plan.noncausal_attention:
-        win_pairs = list(split_causal_pairs(
-            sum(q_part for q_part, _ in parts), view.kv_len - sum(q_part for q_part, _ in parts),
-            eff_cp, interleave, window=plan.window, noncausal=True).per_rank)
+        eff_q_parts = sum(q_part for q_part, _ in parts)
+        win_pairs = _noncausal_window_rank_pairs(
+            eff_q_parts, view.kv_len, plan.window, eff_cp, interleave,
+            window_q=_view_noncausal_window_q(view, eff_q_parts),
+        )
     else:
         win_pairs = [
             sum(split_causal_pairs(
@@ -527,7 +610,22 @@ def _partition_sparse_view(
     v_pairs = [win_pairs[r] + p_split.per_rank[r] for r in range(eff_cp)]
     v_sweeps = [win_sweeps[r] + s_ints[r] for r in range(eff_cp)]
     v_shared = [0] * eff_cp
-    v_rows = [owned_positions(0, view.kv_len - 1, eff_cp, interleave, rank) for rank in range(eff_cp)]
+    if plan.cache_kind == "window_compressed":
+        win_spans_wc = [
+            (lo, hi) for lo, hi in _dense_window_tile_spans(parts, view, plan, query_tile)
+            if hi > lo
+        ] if plan.window else []
+        win_rows_wc = (
+            _window_unique_rows(win_spans_wc, view, plan, eff_cp, interleave)
+            if win_spans_wc else [0] * eff_cp
+        )
+        comp_rows_wc = [
+            _owned_completed_rows_for_rank(view.kv_len, ratio, eff_cp, interleave, rank)
+            for rank in range(eff_cp)
+        ]
+        v_rows = [win_rows_wc[r] + comp_rows_wc[r] for r in range(eff_cp)]
+    else:
+        v_rows = [owned_positions(0, view.kv_len - 1, eff_cp, interleave, rank) for rank in range(eff_cp)]
     spec = {
         "pairs_seq": pairs_seq,
         "sweeps_seq": sweeps_seq,
@@ -567,6 +665,71 @@ def pool_sparse_view_records(
         view_records[rec_idx]["v_sweeps"] = [win_s[r] + sweeps_matrix[pos][r] for r in range(eff_cp)]
 
 
+def _partition_unindexed_window_compressed_view(
+    view, plan, parts, eff_q, pairs, eff_cp, query_tile, interleave,
+) -> tuple[list[float], list[int], list[int], list[int]]:
+    """Exact rank-owned window + store-on-completion compressed rows for unindexed CP>1."""
+    win_pairs, win_sweeps = _sparse_window_partition(
+        parts, view, plan, query_tile, eff_cp, interleave)
+    ratio = max(1, int(plan.compress_ratio or 1))
+    win_spans_wc = [
+        (lo, hi) for lo, hi in _dense_window_tile_spans(parts, view, plan, query_tile)
+        if hi > lo
+    ] if plan.window else []
+    win_rows_wc = (
+        _window_unique_rows(win_spans_wc, view, plan, eff_cp, interleave)
+        if win_spans_wc else [0] * eff_cp
+    )
+    comp_sweeps = [0] * eff_cp
+    for q_part, c_part in parts:
+        for start in range(0, q_part, query_tile):
+            horizon = (view.kv_len if plan.noncausal_attention
+                       else c_part + min(q_part, start + query_tile))
+            for rank in range(eff_cp):
+                comp_sweeps[rank] += _owned_completed_rows_for_rank(
+                    horizon, ratio, eff_cp, interleave, rank,
+                )
+    comp_rows = [
+        _owned_completed_rows_for_rank(view.kv_len, ratio, eff_cp, interleave, rank)
+        for rank in range(eff_cp)
+    ]
+    comp_pairs_total = max(0.0, float(pairs) - sum(win_pairs))
+    comp_rows_sum = sum(comp_rows)
+    if plan.noncausal_attention:
+        comp_pairs = [float(eff_q * comp_rows[r]) for r in range(eff_cp)]
+    elif comp_rows_sum > 0:
+        comp_pairs = [
+            comp_pairs_total * (float(comp_rows[r]) / float(comp_rows_sum))
+            for r in range(eff_cp)
+        ]
+    else:
+        comp_pairs = [0.0] * eff_cp
+    v_pairs = [win_pairs[r] + comp_pairs[r] for r in range(eff_cp)]
+    v_sweeps = [win_sweeps[r] + comp_sweeps[r] for r in range(eff_cp)]
+    v_rows = [win_rows_wc[r] + comp_rows[r] for r in range(eff_cp)]
+    return v_pairs, v_sweeps, [0] * eff_cp, v_rows
+
+
+def _single_rank_view_rows(
+    view, plan, parts, dense_unindexed, win_spans_single, eff_cp, query_tile, interleave,
+):
+    """Unique row counts for the single-CP or fallback branch."""
+    if dense_unindexed:
+        return _window_unique_rows(win_spans_single, view, plan, eff_cp, interleave)
+    if plan.cache_kind == "window_compressed":
+        win_spans_wc1 = [
+            (lo, hi) for lo, hi in _dense_window_tile_spans(parts, view, plan, query_tile)
+            if hi > lo
+        ] if plan.window else []
+        win_u1 = (
+            _window_unique_rows(win_spans_wc1, view, plan, eff_cp, interleave)
+            if win_spans_wc1 else [0] * eff_cp
+        )
+        comp_u1 = completed_rows(view.kv_len, max(1, int(plan.compress_ratio or 1)))
+        return [win_u1[r] + comp_u1 for r in range(eff_cp)]
+    return [math.ceil(view.kv_len / eff_cp)] * eff_cp
+
+
 def attention_view_record(view, *, plan, model, quant, query_tile, eff_cp, block,
                           interleave, tp, dsa, topk_present, heads, latent_dim,
                           shared_selection=None, runtime=None):
@@ -577,6 +740,7 @@ def attention_view_record(view, *, plan, model, quant, query_tile, eff_cp, block
              if dsa and view.phase == "prefill" else query)
     selected_rows = (shared_selection.rows_for(view.request_id)
                      if shared_selection is not None else None)
+    window_q = _view_noncausal_window_q(view, eff_q)
     dense_cap = min_positive(plan.window, plan.index_topk if topk_present else 0)
     if plan.cache_kind == "dense":
         if topk_present:
@@ -584,7 +748,7 @@ def attention_view_record(view, *, plan, model, quant, query_tile, eff_cp, block
                 parts, 1, dense_cap,
                 noncausal=bool(plan.noncausal_attention), kv_len=view.kv_len)
         elif plan.noncausal_attention:
-            vis_kv = (min(view.kv_len, plan.window)
+            vis_kv = (min(view.kv_len, plan.window + window_q)
                       if plan.window > 0 else view.kv_len)
             pairs = float(eff_q * vis_kv)
         elif dsa and view.phase == "prefill":
@@ -598,7 +762,7 @@ def attention_view_record(view, *, plan, model, quant, query_tile, eff_cp, block
         if plan.noncausal_attention:
             long_cap = plan.index_topk if topk_present else view.kv_len
             pairs = float(eff_q * (
-                (min(view.kv_len, plan.window) if plan.window else 0)
+                (min(view.kv_len, plan.window + window_q) if plan.window else 0)
                 + min(completed_rows(view.kv_len, plan.compress_ratio), long_cap)
             ))
         else:
@@ -659,9 +823,10 @@ def attention_view_record(view, *, plan, model, quant, query_tile, eff_cp, block
     dense_unindexed = plan.cache_kind == "dense" and not topk_present
     if eff_cp > 1 and dense_unindexed:
         if plan.noncausal_attention:
-            v_pairs = list(split_causal_pairs(
-                eff_q, view.kv_len - eff_q, eff_cp, interleave,
-                window=plan.window, noncausal=True).per_rank)
+            v_pairs = _noncausal_window_rank_pairs(
+                eff_q, view.kv_len, plan.window, eff_cp, interleave,
+                window_q=window_q,
+            )
         else:
             v_pairs = [
                 sum(split_causal_pairs(
@@ -685,6 +850,9 @@ def attention_view_record(view, *, plan, model, quant, query_tile, eff_cp, block
     elif eff_cp > 1 and topk_present:
         v_pairs, v_sweeps, v_shared, v_rows, sparse_dcp_spec = _partition_sparse_view(
             view, plan, parts, eff_q, pairs, sweeps, eff_cp, query_tile, interleave, runtime)
+    elif eff_cp > 1 and plan.cache_kind == "window_compressed":
+        v_pairs, v_sweeps, v_shared, v_rows = _partition_unindexed_window_compressed_view(
+            view, plan, parts, eff_q, pairs, eff_cp, query_tile, interleave)
     else:
         v_pairs = [float(pairs) / eff_cp] * eff_cp
         v_sweeps = [math.ceil(sweeps / eff_cp)] * eff_cp
@@ -699,11 +867,8 @@ def attention_view_record(view, *, plan, model, quant, query_tile, eff_cp, block
                     shared_base += sh_hi - lo
         shared = math.ceil(shared_base / eff_cp) if eff_cp else shared_base
         v_shared = [shared] * eff_cp
-        v_rows = (
-            _window_unique_rows(win_spans_single, view, plan, eff_cp, interleave)
-            if dense_unindexed
-            else [math.ceil(view.kv_len / eff_cp)] * eff_cp
-        )
+        v_rows = _single_rank_view_rows(
+            view, plan, parts, dense_unindexed, win_spans_single, eff_cp, query_tile, interleave)
     return {
         "view": view, "parts": parts, "query": query, "eff_q": eff_q,
         "pairs": float(pairs), "sweeps": sweeps, "v_pairs": v_pairs,
@@ -712,6 +877,43 @@ def attention_view_record(view, *, plan, model, quant, query_tile, eff_cp, block
         "selection_metadata": selection_metadata,
         **({"sparse_dcp_spec": sparse_dcp_spec} if sparse_dcp_spec is not None else {}),
     }
+
+
+def window_cache_read_by_rank(
+    plan, view, parts, v_sweeps, v_rows, eff_cp, query_tile, elements, model, interleave,
+) -> list[tuple[int, int, int, int, float, float]] | None:
+    """Per-rank ``(win_sweeps, comp_sweeps, win_unique, comp_unique, win_row_b, comp_row_b)``."""
+    if plan.cache_kind != "window_compressed":
+        return None
+    degree = max(1, int(eff_cp))
+    stride = max(1, int(interleave))
+    phase = getattr(view, "phase", None)
+    win_row_b = float(packed_region_row_bytes(model, "window", elements, plan=plan, phase=phase))
+    comp_row_b = float(packed_region_row_bytes(model, "compressed_kv", elements, plan=plan, phase=phase))
+    win_sweeps_by_rank = [0] * degree
+    win_spans: list[tuple[int, int]] = []
+    if plan.window:
+        for lo, hi in _dense_window_tile_spans(parts, view, plan, query_tile):
+            if hi > lo:
+                win_spans.append((lo, hi))
+                for rank in range(degree):
+                    win_sweeps_by_rank[rank] += owned_positions(
+                        lo, hi - 1, degree, stride, rank,
+                    )
+    win_unique_by_rank = (
+        _window_unique_rows(win_spans, view, plan, degree, stride)
+        if win_spans else [0] * degree
+    )
+    out: list[tuple[int, int, int, int, float, float]] = []
+    for rank in range(degree):
+        w_sw = int(win_sweeps_by_rank[rank])
+        tot_sw = int(v_sweeps[rank]) if rank < len(v_sweeps) else w_sw
+        c_sw = max(0, tot_sw - w_sw)
+        w_uniq = int(win_unique_by_rank[rank])
+        tot_uniq = int(v_rows[rank]) if rank < len(v_rows) else w_uniq
+        c_uniq = max(0, tot_uniq - w_uniq)
+        out.append((w_sw, c_sw, w_uniq, c_uniq, win_row_b, comp_row_b))
+    return out
 
 
 def window_cache_read(plan, view, parts, sweeps, eff_cp, query_tile, elements, model):
@@ -723,10 +925,11 @@ def window_cache_read(plan, view, parts, sweeps, eff_cp, query_tile, elements, m
         for q_part, c_part in parts
         for start in range(0, q_part, query_tile)
     ) if plan.window else 0
+    phase = getattr(view, "phase", None)
     full = (
-        original_rows * packed_region_row_bytes(model, "window", elements)
+        original_rows * packed_region_row_bytes(model, "window", elements, plan=plan, phase=phase)
         + (sweeps - original_rows) * packed_region_row_bytes(
-            model, "compressed_kv", elements))
+            model, "compressed_kv", elements, plan=plan, phase=phase))
     return full / eff_cp
 
 

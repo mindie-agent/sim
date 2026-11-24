@@ -82,7 +82,7 @@
             }
           },
           "sequence_parallel": {
-            "implementation": "vllm_ascend_kimi_sequence_parallel",
+            "implementation": "vllm_ascend_sequence_parallel",
             "enable_expert_parallel": true,
             "padding": "right_to_tp",
             "attention_output": "separate_reduce_scatter",
@@ -815,7 +815,7 @@
             }
           },
           "sequence_parallel": {
-            "implementation": "vllm_ascend_kimi_sequence_parallel",
+            "implementation": "vllm_ascend_sequence_parallel",
             "enable_expert_parallel": true,
             "padding": "right_to_tp",
             "attention_output": "separate_reduce_scatter",
@@ -1551,7 +1551,7 @@
             }
           },
           "sequence_parallel": {
-            "implementation": "vllm_ascend_kimi_sequence_parallel",
+            "implementation": "vllm_ascend_sequence_parallel",
             "enable_expert_parallel": true,
             "padding": "right_to_tp",
             "attention_output": "separate_reduce_scatter",
@@ -2287,7 +2287,7 @@
             }
           },
           "sequence_parallel": {
-            "implementation": "vllm_ascend_kimi_sequence_parallel",
+            "implementation": "vllm_ascend_sequence_parallel",
             "enable_expert_parallel": true,
             "padding": "right_to_tp",
             "attention_output": "separate_reduce_scatter",
@@ -3020,7 +3020,7 @@
             }
           },
           "sequence_parallel": {
-            "implementation": "vllm_ascend_kimi_sequence_parallel",
+            "implementation": "vllm_ascend_sequence_parallel",
             "enable_expert_parallel": true,
             "padding": "right_to_tp",
             "attention_output": "separate_reduce_scatter",
@@ -3625,7 +3625,7 @@
             }
           },
           "sequence_parallel": {
-            "implementation": "vllm_ascend_kimi_sequence_parallel",
+            "implementation": "vllm_ascend_sequence_parallel",
             "enable_expert_parallel": true,
             "padding": "right_to_tp",
             "attention_output": "separate_reduce_scatter",
@@ -4230,7 +4230,7 @@
             }
           },
           "sequence_parallel": {
-            "implementation": "vllm_ascend_kimi_sequence_parallel",
+            "implementation": "vllm_ascend_sequence_parallel",
             "enable_expert_parallel": true,
             "padding": "right_to_tp",
             "attention_output": "separate_reduce_scatter",
@@ -4835,7 +4835,7 @@
             }
           },
           "sequence_parallel": {
-            "implementation": "vllm_ascend_kimi_sequence_parallel",
+            "implementation": "vllm_ascend_sequence_parallel",
             "enable_expert_parallel": true,
             "padding": "right_to_tp",
             "attention_output": "separate_reduce_scatter",

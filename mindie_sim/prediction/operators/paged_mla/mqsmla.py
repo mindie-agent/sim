@@ -12,6 +12,7 @@ from collections import Counter
 from dataclasses import dataclass
 from functools import lru_cache
 
+from mindie_sim.primitives.loader import resolve_dispatch_envelope
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.prediction.mechanism import OperatorPlan, Work
 from mindie_sim.prediction.program import KernelProgram, ParallelProgram, PipelineProgram, Stage
@@ -121,12 +122,10 @@ KV_QUANT_DEQUANT_OPS = {
 }
 #: Live KV/P/alpha slots of the double-buffered inter-tile pipeline.
 QUANT_TILE_SLOTS = 2
-#: Source AICPU metadata program plus kernel launch/drain before the tile loop
-#: (paired-silicon intercept; the tile pipeline is fitted separately).
-METADATA_PROGRAM_MS = 0.020
 # Distinct (branch, rows, first, last, addressing, heads) phase payloads.
 TILE_PHASE_CACHE_SIZE = 512
 OWNER_STAGE_CACHE_SIZE = 16
+_ARCH35_PRESETS = frozenset({"npu_arch_3510", "DAV_3510"})
 
 
 def supported_heads(heads):
@@ -173,42 +172,6 @@ def owner_ranges(rows, cores):
             result.append((core, start, start + count))
         start += count
     return tuple(result)
-
-
-def addr_tab_w(k):
-    """Source pads address-table columns to 16."""
-    return ((int(k) + (CUBE_FRACTAL_ROWS - 1)) // CUBE_FRACTAL_ROWS) * CUBE_FRACTAL_ROWS
-
-
-def _addr_pool_eligible(pool):
-    page = pool.get("page_size")
-    row = pool.get("cache_row_bytes")
-    bt = pool.get("bt_width")
-    idx = pool.get("idx_width")
-    ub = pool.get("addr_ub_bytes")
-    if not all(isinstance(v, int) and v > 0 for v in (page, row, bt, idx, ub)):
-        return False
-    if page < MIN_MQS_PAGE_ROWS or page & (page - 1):
-        return False
-    if pool.get("cache_stride_bytes") != page * row:
-        return False
-    return OFFSET_ENTRY_BYTES * (addr_tab_w(bt) + 2 * addr_tab_w(idx)) <= ub
-
-
-def addr_vec_eligible(shape):
-    """Source eligibility must hold for both ORI and CMP pools.
-
-    No global single-pool shortcut: ORI and CMP run sequentially through the
-    same arena and both are tested before vector addressing is selected.
-    """
-    pools = shape.get("address_pools") or {}
-    original = pools.get("original")
-    compressed = pools.get("compressed")
-    if not original or not compressed:
-        return False
-    if not (_addr_pool_eligible(original) and _addr_pool_eligible(compressed)):
-        return False
-    return bool(compressed.get("present", True))
 
 
 @lru_cache(maxsize=TILE_PHASE_CACHE_SIZE)
@@ -453,11 +416,6 @@ def build(op, geometry):
         raise ModelingError("mqsmla_source_geometry_or_branch_unsupported")
     if requested == "scalar":
         addressing = "scalar"
-    elif requested in {"auto", "vector"}:
-        # The source vector prepass is an AIV-pair/AIC-relay publication once
-        # per invocation; it is not a per-tile table read and is not recovered
-        # here. Do not invent that work; retain the declared generic path.
-        addressing = "generic_analytical"
     else:
         raise ModelingError("mqsmla_addressing_mode_unsupported")
     rows = tuple(query_rows(shape))
@@ -479,9 +437,12 @@ def build(op, geometry):
     compute_arch = getattr(geometry, "compute_arch", None) or getattr(
         getattr(geometry, "datapath", None), "compute_arch", None
     )
-    preset = str(getattr(compute_arch, "preset", "") or getattr(compute_arch, "arch_id", "") or "")
-    if preset == ARCH22_PRESET and quant_mode != KV_QUANT_BF16:
-        raise ModelingError("mqsmla_fp8_fp4_unsupported_on_arch22")
+    preset = str(getattr(compute_arch, "preset", "") or getattr(compute_arch, "arch_id", "") or "").strip()
+    if quant_mode is not None and quant_mode != KV_QUANT_BF16:
+        if preset == ARCH22_PRESET:
+            raise ModelingError("mqsmla_fp8_fp4_unsupported_on_arch22")
+        if preset not in _ARCH35_PRESETS:
+            raise ModelingError(f"mqsmla_fp8_fp4_requires_arch35:{preset or 'unset'}")
     if quant_mode is not None:
         if legacy or quant_mode not in KV_QUANT_MODES:
             raise ModelingError("mqsmla_kv_quant_mode_unsupported")
@@ -611,28 +572,45 @@ def _quant_plan(shape, streams, quant_mode, addressing):
                 (2 * owner, 2 * owner + 1) if pool == "ub" else (owner,))
                 for pool, amount in BUFFERS.items())
             query_bytes = sum(head_counts) * MQSMLA_HEAD_WIDTH * BF16_ELEMENT_BYTES
-            pipeline = KernelProgram((Stage(
-                "tiles", program=PipelineProgram(
+            q_load = Stage("q_load", context.bind(Work(
+                resources={"hbm": query_bytes, "mte2_aic": query_bytes})),
+                after=("reserve",),
+                placement=context.owned(owner, context.core_count, {"mte2_aic"}))
+            tiles = Stage(
+                "tiles", after=("q_load",),
+                program=PipelineProgram(
                     stream.count, QUANT_TILE_SLOTS,
-                    lambda index: stages(_phase_key(stream, head_counts, index)))),))
-            # The query read and output write are one double-buffered DMA stream
-            # per owner: they contend on the shared bus and never lengthen the
-            # tile chain, exactly as the source prefetches the next row's Q.
-            stream_io = KernelProgram((Stage("qo_stream", context.bind(Work(
-                resources={"hbm": 2 * query_bytes, "mte2_aic": query_bytes,
-                           "mte3": query_bytes}))),))
+                    lambda index: stages(_phase_key(stream, head_counts, index))),
+            )
+            # Output MTE3 store strictly follows tile accumulation completion.
+            output_store = Stage("output_store", context.bind(Work(
+                resources={"hbm": query_bytes, "mte3": query_bytes})),
+                after=("tiles",),
+                placement=context.owned(owner, context.core_count, {"mte3"}))
             return KernelProgram((
                 Stage("reserve", acquire=allocations),
-                Stage("work", after=("reserve",),
-                      program=ParallelProgram((pipeline, stream_io))),
-                Stage("release", after=("work",), free=allocations)))
+                q_load,
+                tiles,
+                output_store,
+                Stage("release", after=("output_store",), free=allocations)))
 
         owners = ParallelProgram(tuple(one(owner, stream, head_counts)
                                        for owner, stream, head_counts in streams))
-        return KernelProgram((
-            Stage("metadata", latency=METADATA_PROGRAM_MS),
-            Stage("prefix_fill", after=("metadata",), work=context.bind(fill)),
-            Stage("owners", after=("prefix_fill",), program=owners)))
+        tbl = getattr(context, "primitive_table", None)
+        dp = getattr(context, "datapath", None)
+        env = resolve_dispatch_envelope(tbl, dp) if (tbl is not None and dp is not None) else None
+        meta_launch_ms = float(env.aiv_min_block_floor_ms) if env is not None else 0.0
+        stages_root = [
+            Stage("prefix_fill", work=context.bind(fill)),
+            Stage("owners", after=("prefix_fill",), program=owners),
+        ]
+        if meta_launch_ms > 0.0:
+            stages_root = [
+                Stage("metadata_launch", latency=meta_launch_ms),
+                Stage("prefix_fill", after=("metadata_launch",), work=context.bind(fill)),
+                Stage("owners", after=("prefix_fill",), program=owners),
+            ]
+        return KernelProgram(tuple(stages_root))
 
     return OperatorPlan(total + fill + stream_work, program, {
         "source_execution_domain": "mixed",
@@ -646,7 +624,6 @@ def _quant_plan(shape, streams, quant_mode, addressing):
         "mqsmla_kv_quant_mode": quant_mode,
         "mqsmla_packed_row_bytes": row_bytes,
         "mqsmla_dequant_ops_per_element": KV_QUANT_DEQUANT_OPS[quant_mode],
-        "mqsmla_metadata_program_ms": METADATA_PROGRAM_MS,
         "mqsmla_prefix_partition": {
             "external_kv_bytes": external,
             "shared_unique_rows": shared_rows,

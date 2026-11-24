@@ -18,7 +18,13 @@ from mindie_sim.catalog.context_parallel import dcp_indexer_sharded, layer_dcp_d
 from mindie_sim.catalog.ops import compute_dtype_for
 from mindie_sim.prediction.sharding.context_parallel import (
     CP_DECODE_COMM_STREAM,
+    SHARDED_A3_CAST_OPS_PER_SORT,
+    SHARDED_FUSED_SORT_TOPK,
+    SHARDED_SORT_STAGES_PER_LAYER,
     emit_pcp_hidden_gather_restore,
+    sharded_candidate_allgather_tiles,
+    sharded_fused_sort_eligible,
+    sharded_indexer_tile_rows,
 )
 from mindie_sim.schema.common import ModelingError, dtype_bytes
 
@@ -41,7 +47,7 @@ KV_COMPRESS_EPILOG_FAMILY = "kv_compress_epilog"
 INDEXER_QUANT_CACHE_FAMILY = "indexer_quant_cache"
 BLOCK_QUANT_KIND = "aclnnDynamicBlockQuant"
 BLOCK_QUANT_TILE = 128
-INDEXER_QUANT_CACHE_RECIPE = "indexer_quant_cache"
+INDEXER_QUANT_CACHE_RECIPE = "cann_indexer_quant_cache_c8"
 FP32_BYTES = int(dtype_bytes("fp32"))
 FP16_BYTES = int(dtype_bytes("fp16"))
 FP32_WEIGHT_DTYPE = "fp32"
@@ -49,6 +55,215 @@ INT32_BYTES = int(dtype_bytes("int32"))
 ROPE_OPS = 6
 CANDIDATE_BYTES = 8
 MIN_LOG_TOPK = 2
+M10_INTERLEAVE_ALIGN = 128
+SMLA_METADATA_SIZE_A23 = 1024
+SMLA_METADATA_SIZE_A5 = 2048
+AI_CPU_METADATA_DEFAULT_ELEMS = 512
+AI_CPU_METADATA_OPS_PER_ELEM = 4
+
+
+def validate_m10_mla_legality(
+    *,
+    plan,
+    eff_dcp: int,
+    quant_kv_dtype: str,
+    arch: str,
+    cp_interleave_size: int,
+    sharded_indexer: bool = False,
+    enforce_shipping_kpool: bool = True,
+) -> None:
+    """Enforce hardware-verified M10 MLA/SFA structural legality guards."""
+    dcp = max(1, int(eff_dcp))
+    arch_norm = str(arch or "").strip().upper()
+    kv_dt = str(quant_kv_dtype or "").strip().lower()
+    if enforce_shipping_kpool and int(getattr(plan, "index_kpool", 1) or 1) > 1 and dcp > 1:
+        raise ModelingError(f"m10_kpool_requires_dcp_eq_1:dcp={dcp}")
+    if (getattr(plan, "mla_variant", "") == "latent_mqa"
+            and getattr(plan, "cache_kind", "") == "window_compressed"):
+        if dcp > 1:
+            raise ModelingError(f"m10_compressed_csa2_requires_dcp_eq_1:dcp={dcp}")
+        if arch_norm in {"A2", "A3"} and kv_dt == "int8":
+            raise ModelingError(
+                f"m10_sparse_flash_mla_a23_forbids_int8_kv:arch={arch_norm}:kv={kv_dt}"
+            )
+    if (dcp > 1 and bool(getattr(plan, "indexer", False))
+            and not sharded_indexer
+            and int(cp_interleave_size) % M10_INTERLEAVE_ALIGN != 0):
+        raise ModelingError(
+            f"m10_replicated_sfa_dcp_requires_interleave_multiple_128:{cp_interleave_size}"
+        )
+
+
+def _machine_vector_cores(machine) -> int | None:
+    if machine is None:
+        return None
+    dies = getattr(machine, "dies", ()) or ()
+    if dies:
+        die0 = dies[0]
+        aiv = int(getattr(die0, "aiv_count", 0) or 0)
+        if aiv > 0:
+            return aiv
+        units = dict(getattr(die0, "resource_units", None) or ())
+        u_aiv = int(units.get("vector", 0) or 0)
+        if u_aiv > 0:
+            return u_aiv
+    aiv = int(getattr(machine, "aiv_count", 0) or getattr(machine, "vector_cores", 0) or 0)
+    return aiv if aiv > 0 else None
+
+
+def _emit_sharded_candidate_merge(
+    b, topk: str, *, valid: int, index_topk: int, eff_dcp: int, runtime, machine,
+) -> str:
+    """Emit executable per-tile sharded-indexer pack -> (A3 Cast) -> AllGather -> merge.
+
+    Matches upstream ``sharded_indexer.py:36-65`` and ``ops/triton/sharded_indexer.py:489-656``:
+      * ``valid <= 0`` returns immediately with zero tiles, zero AllGathers, zero Casts.
+      * Presorting and fused merge (``_merge_candidates`` / ``_merge_owner_prefix``) are
+        enabled only when ``index_topk == SHARDED_FUSED_SORT_TOPK`` (2048).
+      * Other K values (e.g. K=128) run unsorted ``_pack_candidates`` -> AllGather ->
+        ``_unpack_candidates`` + 2×(``Sort`` + ``GatherElements[V2]``) +
+        ``_select_local_candidates`` (with A3 ``Cast`` before ``GatherElementsV2``,
+        0 ``Cast`` on A5).
+      * Fused-sort occupancy (>=75% vector cores) is evaluated PER TILE on ``tile_rows``,
+        not on the aggregate ``valid`` row count.
+    """
+    n_valid = int(valid)
+    if n_valid <= 0:
+        return topk
+    is_a5 = _is_a5_runtime(runtime, machine)
+    r_tile = sharded_indexer_tile_rows(eff_dcp, index_topk)
+    cand_tiles = sharded_candidate_allgather_tiles(n_valid, eff_dcp, index_topk)
+    if cand_tiles <= 0:
+        return topk
+    vector_cores = _machine_vector_cores(machine)
+    presorted = int(index_topk) == SHARDED_FUSED_SORT_TOPK
+    remaining = n_valid
+    dep = topk
+    last_merge = topk
+    for tile_idx in range(cand_tiles):
+        tile_rows = min(r_tile, remaining)
+        remaining -= tile_rows
+        tile_fused_sort = presorted and sharded_fused_sort_eligible(
+            world_size=eff_dcp, topk=index_topk, rows=tile_rows, vector_cores=vector_cores,
+        )
+        if not presorted:
+            sort_kernels: tuple[str, ...] = ("_pack_candidates",)
+            merge_kernels: tuple[str, ...] = (
+                ("_unpack_candidates", "Sort", "GatherElements", "Sort", "GatherElements", "_select_local_candidates")
+                if is_a5 else
+                ("_unpack_candidates", "Sort", "Cast", "GatherElementsV2", "Sort", "Cast", "GatherElementsV2", "_select_local_candidates")
+            )
+            cast_launches = 0 if is_a5 else (2 * SHARDED_A3_CAST_OPS_PER_SORT)
+        elif tile_fused_sort:
+            sort_kernels = ("_pack_sorted_candidates",)
+            merge_kernels = ("_merge_candidates",)
+            cast_launches = 0
+        elif is_a5:
+            sort_kernels = ("_prepare_local_sort_inputs", "Sort", "GatherElements")
+            merge_kernels = ("_merge_owner_prefix",)
+            cast_launches = 0
+        else:
+            sort_kernels = ("_prepare_local_sort_inputs", "Sort", "Cast", "GatherElementsV2")
+            merge_kernels = ("_merge_owner_prefix",)
+            cast_launches = SHARDED_SORT_STAGES_PER_LAYER * SHARDED_A3_CAST_OPS_PER_SORT
+        suffix = "" if tile_idx == 0 else f"_t{tile_idx}"
+        packed = b.work(
+            f"candidate_pack{suffix}", (dep if tile_idx == 0 else last_merge,),
+            (tile_rows, index_topk),
+            read=tile_rows * index_topk * CANDIDATE_BYTES,
+            write=tile_rows * index_topk * CANDIDATE_BYTES,
+            family="elementwise",
+            metadata=(
+                ("sharded_indexer_tile_rows", int(r_tile)),
+                ("candidate_allgather_tiles", int(cand_tiles)),
+                ("candidate_tile_index", int(tile_idx)),
+                ("candidate_tile_rows", int(tile_rows)),
+                ("sharded_presorted", bool(presorted)),
+                ("sharded_fused_sort", bool(tile_fused_sort)),
+                ("sort_cast_launches", int(cast_launches if presorted else 0)),
+                ("native_kinds", sort_kernels),
+                ("kernel", sort_kernels[0]),
+            ),
+        )
+        gather_dep = packed
+        if presorted and not is_a5 and not tile_fused_sort:
+            # Explicit A3 INT32/FP32 Cast launches before GatherElementsV2 (0 Cast on A5).
+            gather_dep = b.vector(
+                f"candidate_sort_cast{suffix}", (packed,),
+                tile_rows * index_topk * SHARDED_A3_CAST_OPS_PER_SORT,
+                1.0,
+                dtype="fp32", family="cast",
+                metadata=(
+                    ("native_kinds", ("Cast",)),
+                    ("kernel", "Cast"),
+                    ("sort_cast_launches", int(SHARDED_A3_CAST_OPS_PER_SORT)),
+                    ("candidate_tile_index", int(tile_idx)),
+                ),
+            )
+        gathered = b.communicate(
+            f"candidate_gather{suffix}", (gather_dep,),
+            tile_rows * index_topk * CANDIDATE_BYTES * (eff_dcp - 1),
+            "allgather", "cp", dtype="fp32",
+            comm_group_size=int(eff_dcp), dcp_degree=int(eff_dcp),
+            candidate_allgather_tiles=int(cand_tiles),
+            candidate_tile_index=int(tile_idx),
+            sharded_indexer_tile_rows=int(r_tile),
+        )
+        last_merge = b.vector(
+            f"candidate_merge{suffix}", (gathered,),
+            tile_rows * index_topk * eff_dcp,
+            math.log2(max(MIN_LOG_TOPK, index_topk)),
+            dtype="fp32", family="topk",
+            metadata=(
+                ("sharded_presorted", bool(presorted)),
+                ("sharded_fused_sort", bool(tile_fused_sort)),
+                ("candidate_allgather_tiles", int(cand_tiles)),
+                ("candidate_tile_index", int(tile_idx)),
+                ("sort_cast_launches", int(cast_launches if not presorted else 0)),
+                ("native_kinds", merge_kernels),
+                ("kernel", merge_kernels[0]),
+            ),
+        )
+    return last_merge
+
+
+def emit_ai_cpu_metadata_op(
+    b,
+    *,
+    kind: str,
+    deps: tuple[str, ...],
+    rows: int,
+    arch: str,
+) -> str:
+    """Emit explicit ``AI_CPU`` sparse metadata op (A3=1024 / A5=2048 for SMLA)."""
+    arch_norm = str(arch or "").strip().upper()
+    if arch_norm and arch_norm not in (ASCEND_ARCH_FAMILIES | frozenset({"GENERIC", "SYNTHETIC"})):
+        raise ModelingError(f"ai_cpu_metadata_arch_unresolved:{arch!r}")
+    if kind == "SparseFlashMlaMetadata":
+        meta_elems = SMLA_METADATA_SIZE_A5 if arch_norm == "A5" else SMLA_METADATA_SIZE_A23
+    else:
+        meta_elems = max(AI_CPU_METADATA_DEFAULT_ELEMS, int(rows))
+    meta_bytes = float(meta_elems * INT32_BYTES)
+    return b.work(
+        f"ai_cpu_meta_{kind}",
+        deps,
+        (max(1, int(rows)), meta_elems),
+        vector=0.0,
+        read=meta_bytes,
+        write=meta_bytes,
+        dtype="int32",
+        family="elementwise",
+        recipe=kind,
+        metadata=(
+            ("execution_core", "aicpu"),
+            ("execution_domain", "AI_CPU"),
+            ("invocation_class", "aicpu"),
+            ("task_type", "AI_CPU"),
+            ("metadata_buffer_elems", int(meta_elems)),
+            ("native_kinds", (kind,)),
+            ("kernel", kind),
+        ),
+    )
 
 
 class SharedSelectionRef(str):
@@ -129,17 +344,22 @@ def raw_eager_requested(runtime):
 
 def _is_a5_runtime(runtime, machine=None) -> bool:
     if machine is not None:
-        m_fam = str(getattr(machine, "arch_family", "") or "").upper()
+        m_fam = str(getattr(machine, "arch_family", "") or "").strip().upper()
         if m_fam:
             return m_fam == "A5"
+        dies = getattr(machine, "dies", ()) or ()
+        if dies:
+            ca = getattr(dies[0], "compute_arch", None)
+            arch_id = str(getattr(ca, "arch_id", "") or getattr(ca, "preset", "") or "").strip().lower()
+            if arch_id:
+                return "3510" in arch_id or arch_id == "a5"
     if runtime is None:
         return False
     meta = dict(getattr(runtime, "metadata", ()) or ())
-    fam = str(meta.get("arch_family") or "").upper()
+    fam = str(meta.get("arch_family") or meta.get("device_arch") or "").strip().upper()
     if fam:
         return fam == "A5"
-    hw = str(getattr(runtime, "hardware", "") or "").lower()
-    return hw.startswith(("a5", "ascend950"))
+    return False
 
 
 NATIVE_LIGHTNING_INDEXER_IMPLEMENTATIONS = frozenset({
@@ -463,22 +683,12 @@ def lower_index_path(builder, *, plan, model, quant, parallel, views, deps, runt
         topk = _select_index_rows(
             b, plan, pool_binding, views, model, quant, q_index, weights, index_store, q,
             runtime, hierarchy, shard_sizes, selection_deps, parallel, stage, ratio, shard,
-            score_rows, machine=machine)
+            score_rows, machine=machine, cp_interleave_size=idx_block)
         if shard > 1 and not dsa_prefill:
-            topk = b.work(
-                "candidate_pack", (topk,), (valid, plan.index_topk),
-                read=valid * plan.index_topk * CANDIDATE_BYTES,
-                write=valid * plan.index_topk * CANDIDATE_BYTES,
-                family="elementwise")
-            gathered = b.communicate(
-                "candidate_gather", (topk,),
-                valid * plan.index_topk * CANDIDATE_BYTES * (eff_dcp - 1),
-                "allgather", "cp", dtype="fp32",
-                comm_group_size=int(eff_dcp), dcp_degree=int(eff_dcp))
-            topk = b.vector("candidate_merge", (gathered,),
-                            valid * plan.index_topk * eff_dcp,
-                            math.log2(max(MIN_LOG_TOPK, plan.index_topk)),
-                            dtype="fp32", family="topk")
+            topk = _emit_sharded_candidate_merge(
+                b, topk, valid=valid, index_topk=plan.index_topk,
+                eff_dcp=eff_dcp, runtime=runtime, machine=machine,
+            )
         if plan.owns_candidate_blocks:
             candidate = b.vector("candidate_blocks", (topk,),
                                  valid * plan.index_topk, CANDIDATE_BLOCK_OPS,
@@ -630,7 +840,7 @@ def _produce_index_cache(
 def _select_index_rows(
     b, plan, pool_binding, views, model, quant, q_index, weights, index_store, q, runtime,
     hierarchy, shard_sizes, selection_deps, parallel, stage, ratio, shard, score_rows,
-    *, machine=None,
+    *, machine=None, cp_interleave_size=None,
 ):
     if plan.index_kpool > 1:
         from mindie_sim.prediction.operators.sparse_indexer import index_pool
@@ -703,5 +913,6 @@ def _select_index_rows(
                 b, deps=selection_deps, views=views, plan=plan, model=model,
                 quant=quant, parallel=parallel, shard=shard, prefix=b.prefix,
                 padded_tokens=q, runtime=runtime, score_rows=score_rows,
-                l2_bytes=getattr(b, "l2_bytes", None), machine=machine)
+                l2_bytes=getattr(b, "l2_bytes", None), machine=machine,
+                cp_interleave_size=cp_interleave_size)
     return topk

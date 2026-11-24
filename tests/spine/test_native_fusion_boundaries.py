@@ -515,9 +515,11 @@ def test_mtp_shared_selection_consumes_the_producer_geometry():
 def test_packed_compressor_feeds_the_indexer_from_its_latent_port():
     case = _case('deepseek-v4.1-flash', hardware='a5', layers=3)
     ops = by_id(_ops(case, phase='decode', tokens=2, context=2048))
-    assert outputs(produced_values(ops['s0.l2.compress_compress'])) == {'output', 'latent'}
-    assert 'latent' in outputs(input_ports(ops['s0.l2.index_k.quantize']))
-    assert 'latent' not in outputs(input_ports(ops['s0.l2.compressed_store']))
+    assert 's0.l2.compress_compress' not in ops
+    assert dict(ops['s0.l2.compress_pool'].metadata)['native_kinds'] == ('ZerosLike', '_pool_kernel')
+    assert 's0.l2.compress_norm' in ops['s0.l2.index_k.quantize'].deps
+    assert 's0.l2.compress_rotary' in ops['s0.l2.compressed_store'].deps
+    assert 's0.l2.compress_norm' not in ops['s0.l2.compressed_store'].deps
 @pytest.mark.parametrize('ranges,completed', [(((0, 1), (3, 4)), 1), (((0, 2),), 0)])
 def test_pcp_group_completions_follow_owned_query_ranges(ranges, completed):
     assert owned_completed_rows(SimpleNamespace(context=0, q_len=2, query_ranges=ranges), 4) == completed
@@ -556,7 +558,9 @@ def test_shared_prefix_union_merges_absolute_disjoint_swa_intervals():
     res = gqa(prefix='s0.l0', plan=case.model.layer_plans[0], views=views, stage=0, deps='in', model=case.model, parallel=case.runtime.parallel, quant=case.model.quant, mode='prefill', policy=AttentionPolicy(), runtime=case.runtime, hierarchy=_memory_hierarchy(case.machine), padded_tokens=512)
     meta = dict(find(res.ops, family='attention').metadata)
     assert (meta['prefix_read_hbm_bytes'], meta['prefix_read_logical_bytes']) == pytest.approx((3_143_680, 9_428_992))
-@pytest.mark.parametrize('noncausal,rows', [(False, 255), (True, 128)])
+# Noncausal SWA attends to trailing context window plus the whole current block
+# (vllm-ascend/vllm_ascend/attention/dsa_v41.py:1523,1684: min(kv_len, window + q)).
+@pytest.mark.parametrize('noncausal,rows', [(False, 255), (True, 256)])
 def test_window_tile_span_covers_every_query_in_the_tile(noncausal, rows):
     plan = SimpleNamespace(window=128, noncausal_attention=noncausal)
     assert window_tile_rows(plan, context=128, query=128, start=0, query_tile=128, kv_len=256) == rows

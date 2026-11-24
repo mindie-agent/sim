@@ -20,6 +20,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from typing import Any, NamedTuple
 
+from mindie_sim.backends.abi_registry import default_abi_registry
 from mindie_sim.schema.common import ModelingError, dtype_bytes
 from mindie_sim.schema.operators import (
     KernelBinding,
@@ -136,7 +137,6 @@ ATTNRES_SFU_STRIP_OPS = 4
 ATTNRES_RESIDENT_STRIP_STALL_CYCLES = 3
 ATTNRES_RELOAD_STRIP_STALL_CYCLES = 5
 ATTNRES_RELOAD_PIPELINE_SLOTS = 2
-ATTNRES_NOMINAL_UB_COPY_BPS_PER_AIV = 422_400_000_000.0
 ATTNRES_COOP_CORE_GAIN = 2
 ATTNRES_COOP_LOW_OCCUPANCY_DIV = 4
 ATTNRES_COOP_MIN_HIDDEN = 512
@@ -159,9 +159,17 @@ def _align(value, multiple):
     return _ceil_div(value, multiple) * multiple
 
 
+def _attnres_arch_supported(arch: str) -> bool:
+    """Verify ``AttnResFwd`` availability via sealed ``ProbedAbiRegistry`` (fail-closed)."""
+    norm = str(arch or "").strip().upper()
+    if norm not in {"A2", "A3", "A5"}:
+        return False
+    return default_abi_registry().is_shipping_available("AttnResFwd", norm)
+
+
 def source_eligible(model, arch, phase):
     """Shared source-domain gate for target graph and ordinary serving."""
-    if arch != "A5" or phase != "decode":
+    if not _attnres_arch_supported(arch) or phase != "decode":
         return False
     if model.activation_dtype != "bf16":
         return False
@@ -205,7 +213,7 @@ def selection(runtime, *, model=None, phase=None, machine=None):
         or ""
     ).strip().upper()
     if "attention_residual" in bindings:
-        if arch and arch not in {"A5", "GENERIC", "SYNTHETIC", "CUSTOM"}:
+        if arch and arch not in {"GENERIC", "SYNTHETIC"} and not _attnres_arch_supported(arch):
             return None
         from mindie_sim.prediction.implementations import select
 
@@ -437,14 +445,34 @@ def _attnres_precision_abi() -> TensorPrecisionABI:
     )
 
 
-def _attnres_kernel_binding(arch_family: str = "A5", *, resident: bool = True) -> KernelBinding:
+def _geometry_arch_family(geometry) -> str:
+    if geometry is None:
+        return ""
+    dp_arch = getattr(getattr(geometry, "datapath", None), "compute_arch", None)
+    ca = dp_arch or getattr(geometry, "compute_arch", None)
+    arch_id = str(getattr(ca, "arch_id", "") or getattr(ca, "preset", "") or "").strip().lower()
+    if "3510" in arch_id or arch_id == "a5":
+        return "A5"
+    if "910b" in arch_id or arch_id == "a2":
+        return "A2"
+    if "2201" in arch_id or arch_id == "a3":
+        return "A3"
+    return ""
+
+
+def _attnres_kernel_binding(arch_family: str = "", *, resident: bool = True) -> KernelBinding:
+    arch_norm = str(arch_family or "").strip().upper()
+    shipping = (
+        arch_norm in {"A2", "A3", "A5"}
+        and default_abi_registry().is_shipping_available(NATIVE_KIND, arch_norm)
+    )
     return KernelBinding(
         kernel_id=NATIVE_KIND,
         backend="CANN",
-        arch_family=arch_family or "A5",
+        arch_family=arch_norm or "unresolved",
         submodule="attention_residual",
         macro_module="residual",
-        readiness="shipping",
+        readiness="shipping" if shipping else "proposed_pr",
         source_ref=ATTNRES_CALLER_SOURCES[0],
         recipe_id=RECIPE,
         template_id="tk_resident" if resident else "tk_reload",
@@ -528,7 +556,7 @@ def _build_owner_schedule(
     )
 
 
-def point_metrics(view, ub_bytes, aiv):
+def point_metrics(view, ub_bytes, aiv, *, arch_family: str = ""):
     """Independent traffic/vector arithmetic and owner schedule for one native point.
 
     ``T`` rows use ``launched=min(T,AIV)`` contiguous owners, ``q=ceil(T/launched)``
@@ -575,7 +603,10 @@ def point_metrics(view, ub_bytes, aiv):
                           fuse_add=view["fuse_add"], output_norm=view["output_norm"])
     ready["vector_work_basis"] = vector
     cores = []
+    seen_token_starts: set[int] = set()
     for start, count in ranges:
+        writes_output = start not in seen_token_starts
+        seen_token_starts.add(start)
         read = (_BF16_BYTES * count * hidden
                 + (_BF16_BYTES * count * hidden if view["fuse_add"] else 0)
                 + ((_BF16_BYTES if resident else 2 * _BF16_BYTES) * count * valid * hidden
@@ -583,11 +614,15 @@ def point_metrics(view, ub_bytes, aiv):
                 + (2 * _BF16_BYTES * hidden if mixing else 0)
                 + (_BF16_BYTES * hidden if ready["output_norm_cached"]
                    else (_BF16_BYTES * count * hidden if view["output_norm"] else 0)))
-        write = _BF16_BYTES * count * hidden * (
-            1 + int(view["fuse_add"]) + int(view["block_write_idx"] >= 0)
-            + int(view["save_materialized"]))
+        write = (
+            _BF16_BYTES * count * hidden * (
+                1 + int(view["fuse_add"]) + int(view["block_write_idx"] >= 0)
+                + int(view["save_materialized"]))
+            if writes_output else 0
+        )
         cores.append({
             "token_start": start, "token_count": count,
+            "writes_output": writes_output,
             "read_bytes": read, "write_bytes": write,
             "vector_ops": count * vector["per_token"] + vector["per_owner"],
         })
@@ -611,7 +646,7 @@ def point_metrics(view, ub_bytes, aiv):
         "output_gamma_read": gamma,
         "write_bytes": writes,
         "owner_schedule": owner_schedule,
-        "kernel_binding": _attnres_kernel_binding(resident=resident),
+        "kernel_binding": _attnres_kernel_binding(arch_family=arch_family, resident=resident),
         "precision_abi": _attnres_precision_abi(),
     }
 
@@ -869,7 +904,8 @@ def _physical_metrics(op, geometry):
         raise ModelingError("attn_res_requires_declared_ub_buffer")
     aiv = geometry.resource_units.get("vector", geometry.compute_units)
     role = read_role(geometry.resource_units, 0)
-    metrics = point_metrics(view, ub, aiv)
+    arch_family = _geometry_arch_family(geometry)
+    metrics = point_metrics(view, ub, aiv, arch_family=arch_family)
     return metrics, role, aiv
 
 
@@ -877,10 +913,7 @@ def _primitive_p50_ns(table: Any, pid: str, metric: str) -> float | None:
     cell_fn = getattr(table, "cell", None)
     if not callable(cell_fn):
         return None
-    try:
-        band = cell_fn(pid).band(metric)
-    except ModelingError:
-        return None
+    band = cell_fn(pid).band(metric)
     val = getattr(band, "p50", None)
     if val is None or float(val) <= 0.0:
         return None
@@ -921,11 +954,12 @@ def _attnres_phase_timings(context: Any, view: dict[str, Any], role: str, aiv: i
         ub_copy_ms = float(ub_read_rate) / float(max(1, aiv))
     else:
         ub_copy_bps = context.service_rate("ub_copy")
-        ub_copy_ms = (
-            (float(ub_copy_bps) / (MS_PER_SECOND * float(max(1, aiv))))
-            if ub_copy_bps is not None and float(ub_copy_bps) > 0.0
-            else (ATTNRES_NOMINAL_UB_COPY_BPS_PER_AIV / MS_PER_SECOND)
-        )
+        if ub_copy_bps is not None and float(ub_copy_bps) > 0.0:
+            ub_copy_ms = float(ub_copy_bps) / (MS_PER_SECOND * float(max(1, aiv)))
+        elif p09_cast_ms > 0.0:
+            ub_copy_ms = p09_cast_ms
+        else:
+            raise ModelingError("attn_res_ub_copy_rate_missing")
     p12_flag_ns = _primitive_p50_ns(tbl, "P12_intracore_flag", "flag_ns")
     p12_mte2_v_ns = _primitive_p50_ns(tbl, "P12_intracore_flag", "flag_mte2_v_ns")
     clock_hz = getattr(getattr(context, "compute_arch", None), "clock_hz", None)
@@ -1068,6 +1102,8 @@ class _AttnResPrefixProgram:
         context: Any,
         placement: dict[str, tuple[int, ...]],
         timings: dict[str, Any],
+        *,
+        writes_output: bool = True,
     ) -> tuple[Stage, ...]:
         view = self.view
         hidden = int(view["hidden"])
@@ -1172,12 +1208,13 @@ class _AttnResPrefixProgram:
                 latency=timings["norm_row_ms"], after=(prev,), placement=placement,
             ))
             prev = "output_norm"
-        write_bytes = float(write_mult) * row_bytes
-        stages.append(Stage(
-            "output_store",
-            context.bind(Work({}, {"hbm": write_bytes, "mte3": write_bytes})),
-            after=(prev,), placement=placement, caps=write_caps, coupled=True,
-        ))
+        if writes_output:
+            write_bytes = float(write_mult) * row_bytes
+            stages.append(Stage(
+                "output_store",
+                context.bind(Work({}, {"hbm": write_bytes, "mte3": write_bytes})),
+                after=(prev,), placement=placement, caps=write_caps, coupled=True,
+            ))
         return tuple(stages)
 
     def __call__(self, context: Any) -> ParallelProgram | KernelProgram:
@@ -1214,7 +1251,10 @@ class _AttnResPrefixProgram:
                     latency=timings["setup_ms"], after=(prev,), placement=placement,
                 ))
                 prev = "weight_setup"
-            token_stages = self._build_token_stages(context, placement, timings)
+            token_stages = self._build_token_stages(
+                context, placement, timings,
+                writes_output=bool(core.get("writes_output", True)),
+            )
             count = int(core["token_count"])
             stages.append(Stage(
                 "tokens", after=(prev,),

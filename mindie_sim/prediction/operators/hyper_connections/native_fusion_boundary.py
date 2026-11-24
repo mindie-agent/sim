@@ -65,18 +65,17 @@ def hc_native_call(declaration, traffic, view):
         "kernels": [
             {
                 "name": "HcPre" if role == "hc_pre" else "HcPost",
-                "role": "mix" if arch35_pre else "vector",
+                "role": "mix" if role == "hc_pre" else "vector",
                 "source_path": kernel.get("path"),
                 "source_sha256": kernel.get("sha256"),
                 "evidence": "source_declared",
             }
         ],
-        "execution_core": "mix" if arch35_pre else None,
+        "execution_core": "mix" if role == "hc_pre" else "aiv",
         "unresolved": [
             "installed_selected_binary_not_established",
             "dispatch_source_sha256_unresolved",
             "hc_optional_B4_tensor_abi_unresolved",
-            *(() if arch35_pre else ("execution_core_not_declared",)),
         ],
     }
 

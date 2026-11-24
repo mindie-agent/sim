@@ -405,7 +405,7 @@ def test_cohort_reuse_rebinds_nested_commit_request_identities():
 def test_physical_key_groups_identical_fused_layer_occurrences():
     raw = compose_case("deepseek-v4-pro", hardware="a5", tp=8, ep=8, num_devices=8, layers=61, prompt_tokens=8, output_tokens=2)
     graphs = target_graphs(parse_case(raw), phase="decode", tokens=1, context=4096, sequences=1, scope="model")
-    assert len(by_recipe(graphs[0], "indexer_quant_cache")) == 30
+    assert len(by_recipe(graphs[0], "cann_indexer_quant_cache_c8")) == 30
     rows = [row for row in operator_costs(parse_case(raw), graphs)["operators"] if row["operator"].get("family") == "indexer_quant_cache"]
     assert len(rows) == 1 and rows[0]["occurrences"] == 30
 def test_independent_bf16_draft_strips_target_packed_prolog():

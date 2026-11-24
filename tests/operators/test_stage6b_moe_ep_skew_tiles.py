@@ -262,7 +262,11 @@ def test_physical_slot_work_enforces_bank_floor_at_small_batch_and_conserves_row
     )
     assert math.fsum(work.expected_rows_by_rank) == pytest.approx(8.0)
     assert all(slots >= 1 for slots in work.active_slots_by_rank)
-    assert all(work.weight_read_bytes(rank) >= EXPERT_WEIGHT_UNIT for rank in range(64))
+    assert work.weight_read_bytes(0) == pytest.approx(work.rank_mean_weight_read_bytes(0))
+    assert work.critical_rank_weight_read_bytes() >= EXPERT_WEIGHT_UNIT
+    assert math.fsum(work.weight_read_bytes(rank) for rank in range(64)) == pytest.approx(
+        math.fsum(work.rank_mean_weight_read_bytes(rank) for rank in range(64))
+    )
 
     sat = physical_slot_work(
         slot_plan=plan, logical_inclusions=inclusions, global_tokens=10**9,
@@ -369,3 +373,136 @@ def test_catalog_high_ep_graph_produces_integer_straggler_and_valid_banks():
     meta = dict(gate.metadata)
     assert meta["expected_rows"] == float(gate.local_shape[0])
     assert meta["expected_active_experts"] >= 1.0
+
+
+def test_g2_zero_demand_fractal_m16_and_m2b_m2_abi_activations():
+    """Verify G2 zero-safe FRACTAL_M=16, M2b weight-read separation, A3 MC2, and ABI activations."""
+    from mindie_sim.prediction.feedforward import (
+        _activation_abi_lowering,
+        validate_m10_moe_activation_legality,
+    )
+    from mindie_sim.prediction.operators.grouped_moe.expected_grouped import (
+        _per_group_padded_m,
+        inclusion_probability,
+    )
+    from mindie_sim.prediction.operators.mc2.megamoe import allow_abi_extension
+    from mindie_sim.prediction.operators.mc2.moe_comm_selection import MC2, MoeCommConfig
+    from mindie_sim.prediction.operators.moe_transport.moe_callers import _straggler_rank_moments
+    from mindie_sim.schema.common import ModelingError
+
+    # G2: zero demand returns () and padded_m=0; M>0, B=0 raises; sum conserved.
+    assert _dispersed_group_rows(0.0, 4) == ()
+    assert _per_group_padded_m(()) == ((), 0)
+    with pytest.raises(ModelingError, match="grouped_moe_zero_banks_nonzero_rows"):
+        _dispersed_group_rows(4.0, 0)
+    assert _dispersed_group_rows(3.0, 6) == (1, 1, 1)
+    disp_101 = _dispersed_group_rows(101.0, 7)
+    assert sum(disp_101) == 101 and len(disp_101) == 7
+    _, pad_101 = _per_group_padded_m(disp_101)
+    assert max(101, 16 * 7) <= pad_101 <= 101 + 15 * 7
+
+    # L0 inclusion_probability: tokens=0 with p=1.0 MUST be 0.0.
+    assert inclusion_probability((1.0, 0.5, 0.0), tokens=0) == (0.0, 0.0, 0.0)
+
+    # Exact 1-token expectation when zero_experts shrinks total_rows < 1.0: E[max_r R_r] = 0.5 for any EP!
+    for ep_w in (1, 2, 4, 8):
+        r_max, a_max = _straggler_rank_moments(
+            tokens=1, top_k=1, num_experts=16, ep=ep_w, total_rows=0.5, total_active=0.5,
+            mean_rows=0.5 / ep_w, local_active=(0.5 / 16,) * (16 // ep_w),
+            local_expert_count=16 // ep_w, eplb_damped=False,
+        )
+        assert r_max == pytest.approx(0.5) and a_max == pytest.approx(0.5)
+
+    # Impossible p == 0.0 bank NEVER contributes cold weight bytes!
+    from mindie_sim.prediction.operators.moe_routing.expert_slot_work import _straggler_slot_weight_bytes
+    assert _straggler_slot_weight_bytes(
+        probabilities=(1.0, 0.0), weights=(1.0, 1000.0), mean_bytes=1.0,
+        ep=2, total_rows=2.0, total_active=2.0, has_redundant=False,
+    ) == pytest.approx(1.0)
+    assert _straggler_slot_weight_bytes(
+        probabilities=(0.0, 0.0), weights=(100.0, 1000.0), mean_bytes=0.0,
+        ep=2, total_rows=0.0, total_active=0.0, has_redundant=False,
+    ) == 0.0
+
+    # M2b: rank_mean_weight_read_bytes stays additive while critical_rank >= mean.
+    layer = SimpleNamespace(num_experts=64, index=0)
+    par = ParallelSpec(tp=8, ep=8, redundant_experts_per_rank=1)
+    slot_p = expert_slot_plan(None, layer, par)
+    work = physical_slot_work(
+        slot_plan=slot_p, logical_inclusions=(4.0 / 64.0,) * 64,
+        global_tokens=2, packed_weight_bytes=EXPERT_WEIGHT_UNIT,
+    )
+    assert work.critical_rank_weight_read_bytes() >= work.rank_mean_weight_read_bytes(0)
+    assert all(isinstance(pairs, tuple) for _, pairs in work.logical_to_copies)
+
+    # M2: A3 decode dynamically selects MC2 (fused_level=0) AND FUSED_MC2 before capacity (fused_level=1, tokens=33 > cap=32).
+    from mindie_sim.prediction.operators.mc2.moe_comm_selection import ALLTOALL, FUSED_MC2
+    feats_a3 = SimpleNamespace(
+        tp=4, graph_buckets=(1, 4, 8),
+        metadata=(("arch_family", "A3"), ("additional_config", {"enable_fused_mc2": 0})),
+    )
+    cfg_a3 = MoeCommConfig.from_features(feats_a3, ep=4, top_k=8, experts=64)
+    assert cfg_a3 is not None and cfg_a3.select(4, phase="decode") == MC2
+
+    feats_a3_fused = SimpleNamespace(
+        tp=4, graph_buckets=(32,),
+        metadata=(("arch_family", "A3"), ("additional_config", {"enable_fused_mc2": 1})),
+    )
+    cfg_a3_fused = MoeCommConfig.from_features(feats_a3_fused, ep=8, top_k=8, experts=64)
+    assert cfg_a3_fused is not None and cfg_a3_fused.select(33, phase="decode") == FUSED_MC2
+    assert cfg_a3_fused.select(33, phase="prefill") == ALLTOALL
+
+    # megamoe.allow_abi_extension honors normalized stack_track=='target'.
+    assert allow_abi_extension(SimpleNamespace(metadata=(("stack_track", "target"),))) is True
+    assert allow_abi_extension(SimpleNamespace(metadata=(("stack_track", "shipping"),))) is False
+
+    # ProbedAbiRegistry-backed activation lowering: typed QuantSpec("bf16") resolves to "none" -> A3 SiTU unfuses;
+    # quantized A3 uses DequantSituQuant; A5 clipped unfuses & conserves exact 5632 vector_ops.
+    from mindie_sim.catalog.quant import quant_preset
+    from mindie_sim.prediction.operators.vector.gated_activation import gated_activation
+    plan_situ = SimpleNamespace(ffn_activation="situ", swiglu_limit=0.0, activation_situ_linear_beta=25)
+    u_a3_bf16, _, m_a3_bf16 = _activation_abi_lowering(plan_situ, SimpleNamespace(metadata=(("arch_family", "A3"),)), QuantSpec("bf16"), "routed_expert")
+    u_a3_q, _, m_a3_q = _activation_abi_lowering(plan_situ, SimpleNamespace(metadata=(("arch_family", "A3"),)), quant_preset("w8a8_int8"), "routed_expert")
+    u_a5, _, m_a5 = _activation_abi_lowering(plan_situ, SimpleNamespace(metadata=(("arch_family", "A5"),)), QuantSpec("bf16"), "routed_expert")
+    assert u_a3_bf16 is False and "aclnn_symbol" not in dict(m_a3_bf16) and dict(m_a3_bf16).get("situ_bf16_unfused") is True and len(dict(m_a3_bf16).get("native_kinds", ())) == 14
+    assert u_a3_q is False and dict(m_a3_q).get("aclnn_symbol") == "aclnnDequantSituQuant"
+    assert u_a5 is False and "aclnn_symbol" not in dict(m_a5) and dict(m_a5).get("situ_bf16_unfused") is True and len(dict(m_a5).get("native_kinds", ())) == 14
+
+    plan_clip = SimpleNamespace(ffn_activation="swigluoai", swiglu_limit=7.0, index=0, swiglu_alpha=1.702, swiglu_beta=1.0)
+    _, uc_a3, cm_a3 = _activation_abi_lowering(plan_clip, SimpleNamespace(metadata=(("arch_family", "A3"),)), QuantSpec("bf16"), "routed_expert")
+    _, uc_a5, cm_a5 = _activation_abi_lowering(plan_clip, SimpleNamespace(metadata=(("arch_family", "A5"),)), QuantSpec("bf16"), "routed_expert")
+    assert uc_a3 is False and dict(cm_a3).get("aclnn_symbol") == "aclnnClippedSwiglu"
+    assert uc_a5 is True and dict(cm_a5).get("clipped_swiglu_unfused") is True
+    from mindie_sim.prediction.feedforward import _clipped_swiglu_eager_chain
+    eager_clip = _clipped_swiglu_eager_chain(
+        plan=plan_clip, rows=4, width=128, op_id="l0.expert_act", deps=("up",),
+        stage=0, requests=("r0",), dtype="bf16", phase="decode", recipe="grouped_swiglu",
+    )
+    ref_clip = gated_activation(
+        plan=plan_clip, rows=4, width=128, op_id="l0.expert_act", deps=("up",),
+        stage=0, requests=("r0",), dtype="bf16", phase="decode", recipe="grouped_swiglu",
+    )
+    assert len(eager_clip) == 2 and eager_clip[0].recipe == "clipped_swiglu_clamp" and eager_clip[1].deps == (eager_clip[0].op_id,)
+    assert sum(op.vector_ops for op in eager_clip) == pytest.approx(ref_clip.vector_ops) == pytest.approx(5632.0)
+
+    # P1-10: exact single-token physical_slot_work expectations (500.5, 1.000999, 1.0) + sub-unit ExpectedGroupedMatmul (8 rows).
+    slot_2e = expert_slot_plan(None, SimpleNamespace(num_experts=2, index=0), ParallelSpec(tp=2, ep=2))
+    assert physical_slot_work(slot_plan=slot_2e, logical_inclusions=(0.5, 0.5), global_tokens=1, packed_weight_bytes=(1.0, 1000.0)).critical_rank_weight_read_bytes() == pytest.approx(500.5)
+    assert physical_slot_work(slot_plan=slot_2e, logical_inclusions=(0.999999, 0.000001), global_tokens=1, packed_weight_bytes=(1.0, 1000.0)).critical_rank_weight_read_bytes() == pytest.approx(1.000999)
+    assert physical_slot_work(slot_plan=slot_2e, logical_inclusions=(1.0, 0.0), global_tokens=1, packed_weight_bytes=(1.0, 1000.0)).critical_rank_weight_read_bytes() == pytest.approx(1.0)
+    op_half = gemm_op(
+        op_id="g_half", deps=(), stage=0, layer=0, requests=(), m=1, n=CUBE_N, k=CUBE_K,
+        quant=QuantSpec("bf16"), category="routed_expert", phase="decode", family="grouped_gemm", recipe="grouped_gate_up",
+        metadata=(("routing_basis", "probability_moments"), ("matrix_mapping_domain", "aggregate_experts"), ("matrix_weight_bank_groups", 2), ("expected_rows", 0.5), ("expected_active_experts", 0.5)),
+    )
+    seen_half: list = []
+    class _CapHalf(SteadyMatmul):
+        def lower(self, context, **kwargs):
+            seen_half.append((context.op, kwargs.get("group_rows")))
+            return super().lower(context, **kwargs)
+    ExpectedGroupedMatmul(_CapHalf()).lower(_recipe_context(op_half))
+    assert seen_half[-1][0].padded_shape[0] == 16 and seen_half[-1][1] == (16,)
+    assert dict(seen_half[-1][0].metadata)["expected_padded_m"] == pytest.approx(8.0)
+
+    with pytest.raises(ModelingError, match="m10_moe_requires_is_act_and_mul"):
+        validate_m10_moe_activation_legality(SimpleNamespace(ffn="moe", ffn_activation="relu2", is_act_and_mul=False))

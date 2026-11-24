@@ -563,7 +563,7 @@ def model_text_gate(graph: PhaseGraph, t: TextGatedResidualContract, decision: T
 
 
 def model_attnres(graph: PhaseGraph, t: AttnResContract, ub: int, physical_cap: int | None,
-                  *, regbase: bool, bank_write: bool = False) -> dict:
+                  *, regbase: bool, bank_write: bool = False, save_materialized: bool = False) -> dict:
     m, h, j = t.tokens, t.hidden_size, t.valid_history
     limit = attnres_max_resident_rows(h, ub, fuse_add=t.fuse_add,
                                      ub_overhead_bytes=t.ub_overhead_bytes, physical_capacity_cap=physical_cap,
@@ -590,6 +590,26 @@ def model_attnres(graph: PhaseGraph, t: AttnResContract, ub: int, physical_cap: 
         previous = ()
         for token in range(start, min(m, start + per_owner)):
             prefix = f"token_{token}"
+            if j == 0:
+                # Zero-history bypass matches attnres_spec_terms: no score weights,
+                # no scoring/softmax/mixing; optional fused add + BF16->FP32->BF16 + optional norm.
+                prefix_bytes = row * (1 + int(t.fuse_add))
+                deps = previous
+                if prefix_bytes:
+                    deps = (graph.transfer(f"{prefix}_prefix_input", prefix_bytes, deps, owners=owners),)
+                if t.output_norm:
+                    deps += (graph.transfer(f"{prefix}_output_gamma", row, owners=owners),)
+                fuse = (2 + 2) * h if t.fuse_add else 0
+                norm = (2 + 2) * h + 2 * h + h + RMS_SCALAR_OPS if t.output_norm else 0
+                bypass = graph.vector(f"{prefix}_zero_history_bypass", fuse + 2 * h + norm, deps, owners=owners)
+                output = graph.transfer(
+                    f"{prefix}_output",
+                    row * (1 + int(t.fuse_add) + int(bank_write) + int(save_materialized)),
+                    (bypass,), write=True, owners=owners,
+                )
+                graph.end_token()
+                previous = (output,)
+                continue
             prefix_bytes = row * (1 + int(t.fuse_add) + (2 if token == start else 0)) - prefix_reload_bytes
             deps = previous
             if prefix_bytes:
@@ -623,8 +643,11 @@ def model_attnres(graph: PhaseGraph, t: AttnResContract, ub: int, physical_cap: 
                 deps += (graph.transfer(f"{prefix}_output_gamma", row, owners=owners),)
             norm = (2 + 2) * h + 2 * h + h + RMS_SCALAR_OPS if t.output_norm else 0
             weighted = graph.vector(f"{prefix}_pass2_weighted", 2 * (j + 1) * h + norm, deps, owners=owners)
-            output = graph.transfer(f"{prefix}_output", row * (1 + int(t.fuse_add) + int(bank_write)),
-                                    (weighted,), write=True, owners=owners)
+            output = graph.transfer(
+                f"{prefix}_output",
+                row * (1 + int(t.fuse_add) + int(bank_write) + int(save_materialized)),
+                (weighted,), write=True, owners=owners,
+            )
             graph.end_token()
             previous = (output,)
     return metadata
@@ -741,6 +764,7 @@ class HyperConnectionsStrategy:
             attn_options = {
                 "physical_cap": options.get("physical_cap"),
                 "bank_write": bool(options.get("bank_write", False)),
+                "save_materialized": bool(options.get("save_materialized", False)),
             }
             metadata = model_attnres(graph, contract, ub, regbase=self.arch_id == ARCH35, **attn_options)
         else:

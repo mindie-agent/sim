@@ -490,19 +490,28 @@ def test_compressor_prunes_gate_at_unit_ratio_and_fuses_valid_rows(ratio):
     plan = _layer(compress_ratio=ratio)
     model = ModelSpec("contract", 1, 4096, 8, 576, 1024, 1024, attention="mla", ffn="dense", layer_plans=(plan,), quant=QuantSpec("bf16"))
     builder = Builder("s0.l0", plan, 0, (), model, "decode")
+    if ratio > 1:
+        with pytest.raises(ModelingError, match="compressor_fused_abi_unavailable"):
+            compressor(builder, name="compress", source="hidden", tokens=8, padded_tokens=8,
+                       valid_rows=2, width=576, plan=plan, model=model,
+                       fused=True, return_latent=True)
+        assert not builder.ops
     ready = compressor(builder, name="compress", source="hidden", tokens=8, padded_tokens=8,
                        valid_rows=2, width=576, plan=plan, model=model,
-                       fused=ratio > 1, return_latent=ratio > 1)
+                       fused=False, return_latent=ratio > 1)
     if ratio == 1:
         assert not {"compressor_gate", "compressor_ape"} & {term.name for term in layer_weight_terms(plan, model)}
         assert [op.recipe for op in builder.ops] == ["compress_values", "compress_norm", "compress_rotary"]
         assert ready == builder.ops[-1].op_id and builder.ops[0].flops == 2 * 8 * 576 * 4096
     else:
-        op, = builder.ops
-        assert ready == (op.op_id, op.op_id) and op.returns == ("latent",)
-        assert op.flops == 4 * 8 * 576 * 4096 and op.vector_ops == 6 * 8 * 576 + 5 * 2 * 576 + 6 * 2 * 64
-        assert op.mte2_bytes == 8 * 4096 * 2 + 4 * 576 * 4096 + (8 + ratio) * 576 * 4 + 576 * 2 + 2 * 64 * 4 * 2
-        assert op.mte3_bytes == 2 * 2 * 576 * 2 + 8 * 576 * 4
+        assert [op.recipe for op in builder.ops] == [
+            "compress_values", "compress_gates", "compress_pool", "compress_norm", "compress_rotary"
+        ]
+        assert ready == (builder.ops[3].op_id, builder.ops[4].op_id)
+        pool_meta = dict(builder.ops[2].metadata)
+        assert pool_meta["native_kinds"] == ("ZerosLike", "_pool_kernel")
+        assert sum(op.flops for op in builder.ops) == 4 * 8 * 576 * 4096
+        assert sum(op.vector_ops for op in builder.ops) == 6 * 8 * 576 + 5 * 2 * 576 + 6 * 2 * 64
 def test_native_indexer_epilogs_keep_parameters_and_remove_intermediate_bytes():
     model = parse_case(_caller_case()).model
     plan = model.layer_plans[3]

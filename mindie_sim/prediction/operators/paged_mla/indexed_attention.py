@@ -405,11 +405,17 @@ def build_pipeline(shape, geometry, *, scratch_policy, key_tile=INDEXED_KEY_TILE
                 or geometry.buffers.get("l2", 0) < owners * per_owner_scratch):
             raise ModelingError("indexed_attention_resident_scratch_requires_shared_cache_capacity")
 
+    per_seq_topk = shape.get("per_sequence_topk")
+    per_seq_tuple = (
+        tuple(int(v) for v in per_seq_topk)
+        if isinstance(per_seq_topk, (tuple, list)) and len(per_seq_topk) == len(sequences)
+        else None
+    )
     return _plan(sequences, topk, heads, latent, rope, geometry.compute_units,
                  scratch_policy, key_tile, slots, compact, operand_modes,
                  phase_factory, source_items, tuple(paired_vector_stages), vector_buffer_bytes,
                  phase_unit_weights, shape.get("index_pool_size", 1),
-                 shape.get("index_pool_tail", False))
+                 shape.get("index_pool_tail", False), per_seq_tuple)
 
 
 def query_positions(owner, query, compute_units):
@@ -431,7 +437,7 @@ def sequence_query_positions(owner, sequences, compute_units):
 
 
 def owner_row_tiles(owner, sequences, compute_units, topk, tile_size, *,
-                    pool_size=1, pool_tail=False):
+                    pool_size=1, pool_tail=False, per_sequence_topk=None):
     """Yield one AIC owner's contiguous query rows and their key tiles.
 
     The arch35 sparse kernel assigns every query row to one ``1c2v`` group and
@@ -443,7 +449,12 @@ def owner_row_tiles(owner, sequences, compute_units, topk, tile_size, *,
         raise ModelingError("indexed_attention_requires_positive_key_tile")
     for sequence, position in sequence_query_positions(owner, sequences, compute_units):
         context = sequences[sequence][1]
-        count = selected_tokens(context + position + 1, topk, pool_size, pool_tail)
+        seq_topk = (
+            int(per_sequence_topk[sequence])
+            if per_sequence_topk is not None and sequence < len(per_sequence_topk)
+            else int(topk)
+        )
+        count = selected_tokens(context + position + 1, seq_topk, pool_size, pool_tail)
         tiles = []
         for start in range(0, count, tile_size):
             keys = min(tile_size, count - start)
@@ -474,7 +485,8 @@ def bind_sustained_dram(context):
 def _plan(sequences, topk, heads, latent, rope, compute_units,
           scratch_policy, key_tile, slots, compact, operand_modes,
           phase_factory, source_items, paired_vector_stages, vector_buffer_bytes,
-          phase_unit_weights, index_pool_size, index_pool_tail):
+          phase_unit_weights, index_pool_size, index_pool_tail,
+          per_sequence_topk=None):
     # Repeated model layers share geometry, never dependencies or Engine state.
     # Cache only bounded phase histograms and pure nominal timing calculations.
     query = sum(row[0] for row in sequences)
@@ -485,7 +497,12 @@ def _plan(sequences, topk, heads, latent, rope, compute_units,
     def tile_keys(owner):
         for sequence, position in sequence_query_positions(owner, sequences, compute_units):
             context = sequences[sequence][1]
-            count = selected_tokens(context + position + 1, topk,
+            seq_topk = (
+                int(per_sequence_topk[sequence])
+                if per_sequence_topk is not None and sequence < len(per_sequence_topk)
+                else int(topk)
+            )
+            count = selected_tokens(context + position + 1, seq_topk,
                                     index_pool_size, index_pool_tail)
             for start in range(0, count, key_tile):
                 keys = min(key_tile, count - start)
