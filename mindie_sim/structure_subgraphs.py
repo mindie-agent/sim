@@ -10,7 +10,8 @@
 from collections import defaultdict
 
 from .backends.abi_registry import default_abi_registry
-from .schema.abi import SOC_ARCHS
+from .schema.abi import AbiQueryKey, OperandPortSig, SOC_ARCHS
+from .schema.stack import ManifestBinding, StackTrackSpec
 from .structure.native import mxfp4_reference_coverage
 from .structure.native import grouped_situ_contract
 
@@ -124,24 +125,344 @@ def _candidate_abi_symbols(declaration, ordered_nodes) -> tuple[str, ...]:
     return tuple(dict.fromkeys(mapped))
 
 
-def _probe_subgraph_abi(symbols: tuple[str, ...], arch: str | None) -> tuple[str, str]:
-    """Query sealed ``ProbedAbiRegistry`` for candidate symbols (shipping / proposed / unshipped)."""
+_SUBGRAPH_DTYPE_ALIASES: dict[str, str] = {
+    "fp8_e4m3": "fp8_e4m3fn",
+    "fp8_e4m3fn": "fp8_e4m3fn",
+    "float8_e4m3fn": "fp8_e4m3fn",
+    "bfloat16": "bf16",
+    "float16": "fp16",
+    "float32": "fp32",
+    "float": "fp32",
+    "fp4": "fp4_e2m1",
+    "mxfp4": "fp4_e2m1",
+    "fp4_e2m1": "fp4_e2m1",
+    "hifp8": "hifloat8",
+    "hif8": "hifloat8",
+}
+_SUBGRAPH_DENSE_DTYPES = frozenset({"bf16", "fp16", "fp32"})
+_SUBGRAPH_INPUT_ACT_ROLES = frozenset({
+    "x", "token_x", "query", "q", "k", "v", "key", "value", "beta",
+    "hidden_states", "residual", "prefix_sum", "block_residual",
+})
+_SUBGRAPH_WEIGHT_ROLES = frozenset({
+    "w", "weight", "weight_dq", "weight_uq_qr", "weight_uk", "weight_dkv_kr",
+    "proj_weight",
+})
+_SUBGRAPH_PRIMARY_OUT_ROLES = frozenset({
+    "y", "out", "attn_out", "hidden_states",
+})
+_SUBGRAPH_SCALE_OUT_ROLES = frozenset({"y_scale", "scale"})
+_SUBGRAPH_STATE_ROLES = frozenset({"initial_state", "state", "final_state"})
+_SUBGRAPH_ROLE_ACTIVATION: dict[str, str] = {
+    "grouped_gate_up_activation_quant": "swiglu",
+    "grouped_gate_up_situ_quant": "situ",
+    "situ_quant": "situ",
+}
+_SUBGRAPH_MX_GROUP = 32
+_SUBGRAPH_DEFAULT_ROWS = 16
+_SUBGRAPH_DEFAULT_DIM = 128
+
+
+def _norm_subgraph_dtype(raw) -> str:
+    low = str(raw or "").strip().lower()
+    return _SUBGRAPH_DTYPE_ALIASES.get(low, low)
+
+
+def _first_present(*values):
+    for val in values:
+        if val is not None and val != "":
+            return val
+    return None
+
+
+def _derive_port_quant(dtype: str, *, is_weight: bool, group_size: int,
+                       scale_dtype: str, explicit_qmode: str | None) -> tuple[str, tuple[int, ...], str]:
+    if explicit_qmode:
+        grp = (group_size,) if group_size > 0 else ()
+        return explicit_qmode, grp, scale_dtype or "none"
+    if dtype in _SUBGRAPH_DENSE_DTYPES:
+        return "dense", (), "none"
+    if dtype == "int4":
+        return "w4a8_int", (), scale_dtype or "fp32"
+    if dtype == "int8":
+        return ("per_channel_int8" if is_weight else "per_token_int8"), (), scale_dtype or "fp32"
+    if dtype == "fp8_e4m3fn":
+        if group_size == _SUBGRAPH_MX_GROUP or scale_dtype in {"fp8_e8m0", "e8m0", "uint8"}:
+            return "mx_fp8", (_SUBGRAPH_MX_GROUP,), scale_dtype or "fp8_e8m0"
+        return ("per_channel_fp8" if is_weight else "per_token_fp8"), (), scale_dtype or "fp32"
+    if dtype == "fp4_e2m1":
+        return "mx_fp4", (_SUBGRAPH_MX_GROUP,), scale_dtype or "fp8_e8m0"
+    return "dense", (), scale_dtype or "none"
+
+
+def _extract_subgraph_contract(declaration, ordered_nodes) -> dict:
+    view = declaration.get("tensor_view") or {}
+    impl = declaration.get("implementation") or {}
+    role = str(declaration.get("role") or "")
+    node_ops = [(node.get("operator") or {}) for node in ordered_nodes]
+    node_metas = [(op.get("metadata") or {}) for op in node_ops]
+    first_meta = node_metas[0] if node_metas else {}
+    last_meta = node_metas[-1] if node_metas else {}
+
+    in_raw = _first_present(
+        view.get("input_dtype"), view.get("activation_dtype"), view.get("dtype"),
+        declaration.get("input_dtype"), declaration.get("activation_dtype"), declaration.get("dtype"),
+        impl.get("input_dtype"), impl.get("activation_dtype"), impl.get("dtype"),
+        first_meta.get("activation_format"), first_meta.get("input_dtype"),
+        first_meta.get("input_format"), first_meta.get("dtype"),
+        node_ops[0].get("dtype") if node_ops else None,
+    )
+    wt_raw = _first_present(
+        view.get("weight_dtype"), declaration.get("weight_dtype"), impl.get("weight_dtype"),
+        *(meta.get("weight_format") for meta in node_metas),
+        *(meta.get("weight_dtype") for meta in node_metas),
+    )
+    out_raw = _first_present(
+        view.get("output_dtype"), declaration.get("output_dtype"), impl.get("output_dtype"),
+        last_meta.get("output_format"), last_meta.get("output_dtype"),
+        node_ops[-1].get("dtype") if node_ops else None,
+        in_raw,
+    )
+    in_dt = _norm_subgraph_dtype(in_raw)
+    wt_dt = _norm_subgraph_dtype(wt_raw if wt_raw is not None else in_raw)
+    out_dt = _norm_subgraph_dtype(out_raw)
+    state_dt = _norm_subgraph_dtype(_first_present(view.get("state_dtype"), first_meta.get("state_dtype")))
+
+    group_raw = _first_present(
+        view.get("group_size"), view.get("activation_group_size"),
+        declaration.get("group_size"), impl.get("group_size"),
+        first_meta.get("activation_group_size"), first_meta.get("group_size"),
+    )
+    group_size = int(group_raw) if group_raw is not None else 0
+    in_scale_raw = _first_present(
+        view.get("scale_dtype"), view.get("activation_scale_format"),
+        declaration.get("scale_dtype"), impl.get("scale_dtype"),
+        first_meta.get("activation_scale_format"), first_meta.get("scale_dtype"),
+    )
+    out_scale_raw = _first_present(
+        view.get("output_scale_dtype"), declaration.get("output_scale_dtype"),
+        last_meta.get("output_scale_dtype"), last_meta.get("activation_scale_format"),
+    )
+    in_scale = _norm_subgraph_dtype(in_scale_raw)
+    out_scale = _norm_subgraph_dtype(out_scale_raw)
+    qmode_raw = _first_present(
+        view.get("quant_mode"), declaration.get("quant_mode"),
+        impl.get("quant_mode"), first_meta.get("quant_mode"),
+    )
+    in_qmode, in_grp, in_sc = _derive_port_quant(
+        in_dt, is_weight=False, group_size=group_size,
+        scale_dtype=in_scale, explicit_qmode=str(qmode_raw) if qmode_raw else None,
+    )
+    wt_qmode, wt_grp, wt_sc = _derive_port_quant(
+        wt_dt, is_weight=True, group_size=group_size,
+        scale_dtype=in_scale, explicit_qmode=None,
+    )
+    act_raw = _first_present(
+        view.get("activation"), view.get("activation_kind"),
+        declaration.get("activation"), declaration.get("activation_kind"),
+        impl.get("activation"), impl.get("activation_kind"),
+        first_meta.get("activation"), first_meta.get("ffn_activation"),
+        _SUBGRAPH_ROLE_ACTIVATION.get(role),
+    )
+    act_kind = str(act_raw or "none").strip().lower()
+    has_bias = bool(
+        view.get("has_bias") or declaration.get("has_bias") or impl.get("has_bias")
+        or any(meta.get("has_bias") for meta in node_metas)
+    )
+    shape0 = (node_ops[0].get("local_shape") or ()) if node_ops else ()
+    rows_raw = _first_present(
+        view.get("tokens"), shape0[0] if len(shape0) >= 2 else None,
+    )
+    in_w_raw = _first_present(
+        view.get("input_width"), view.get("hidden"), view.get("width"),
+        shape0[-1] if len(shape0) >= 2 else None,
+    )
+    out_w_raw = _first_present(
+        view.get("intermediate_width"), view.get("output_width"), in_w_raw,
+    )
+    rows = int(rows_raw) if rows_raw is not None else _SUBGRAPH_DEFAULT_ROWS
+    in_w = int(in_w_raw) if in_w_raw is not None else _SUBGRAPH_DEFAULT_DIM
+    out_w = int(out_w_raw) if out_w_raw is not None else in_w
+    experts = max(1, int(_first_present(view.get("local_experts"), first_meta.get("local_experts"), 1)))
+    world_size = max(1, int(_first_present(
+        view.get("world_size"), declaration.get("world_size"),
+        first_meta.get("world_size"), 1,
+    )))
+    is_draft = declaration.get("model_scope") == "draft" or any(_is_draft_node(n) for n in ordered_nodes)
+    return {
+        "role": role,
+        "in_dt": in_dt, "wt_dt": wt_dt, "out_dt": out_dt, "state_dt": state_dt,
+        "in_layout": _first_present(view.get("input_layout"), view.get("layout"), declaration.get("layout"), impl.get("layout")),
+        "wt_layout": _first_present(view.get("weight_layout"), declaration.get("weight_layout"), impl.get("weight_layout")),
+        "out_layout": _first_present(view.get("output_layout"), declaration.get("output_layout")),
+        "in_qmode": in_qmode, "in_grp": in_grp, "in_sc": in_sc,
+        "wt_qmode": wt_qmode, "wt_grp": wt_grp, "wt_sc": wt_sc,
+        "out_scale": out_scale,
+        "act_kind": act_kind, "has_bias": has_bias,
+        "rows": rows, "in_w": in_w, "out_w": out_w, "experts": experts,
+        "world_size": world_size,
+        "rank_placement": str(_first_present(
+            view.get("rank_placement"), declaration.get("rank_placement"), "local",
+        )),
+        "model_scope": "draft" if is_draft else "target",
+        "enabled_passes": frozenset(declaration.get("enabled_stack_passes") or ()),
+    }
+
+
+def _parse_port_template(token: str) -> tuple[str, str, str, str, tuple[int, ...], str]:
+    parts = token.split(":")
+    role = parts[0] if len(parts) >= 2 else "x"
+    dtype = _norm_subgraph_dtype(parts[1] if len(parts) >= 2 else parts[0])
+    layout = parts[2] if len(parts) >= 3 and parts[2] else "ND"
+    qmode = parts[3] if len(parts) >= 4 and parts[3] else "dense"
+    grp = tuple(int(v) for v in parts[4].split("x") if v) if len(parts) >= 5 and parts[4] else ()
+    scale = _norm_subgraph_dtype(parts[5]) if len(parts) >= 6 and parts[5] else "none"
+    return role, dtype, layout, qmode, grp, scale
+
+
+def _build_subgraph_abi_query(entry, target_arch: str, contract: dict) -> AbiQueryKey:
+    in_template = entry.dtype_tuple[0] if entry.dtype_tuple else ()
+    out_template = entry.allowed_output_tuples[0] if entry.allowed_output_tuples else ()
+    rows, in_w, out_w = contract["rows"], contract["in_w"], contract["out_w"]
+    operands: list[OperandPortSig] = []
+    for token in in_template:
+        role, tpl_dt, tpl_lay, tpl_qm, tpl_grp, tpl_sc = _parse_port_template(token)
+        low_role = role.lower()
+        is_weight = low_role in _SUBGRAPH_WEIGHT_ROLES or (
+            low_role.startswith("weight") and "scale" not in low_role
+        )
+        if is_weight:
+            dt = contract["wt_dt"] or tpl_dt
+            lay = str(contract["wt_layout"] or tpl_lay or "FRACTAL_NZ")
+            qm = contract["wt_qmode"] if contract["wt_dt"] else tpl_qm
+            grp = contract["wt_grp"] if contract["wt_dt"] else tpl_grp
+            sc = contract["wt_sc"] if contract["wt_dt"] else tpl_sc
+            shape = (in_w, out_w)
+            sc_shape = (out_w,) if sc != "none" else ()
+        elif low_role in _SUBGRAPH_INPUT_ACT_ROLES:
+            dt = contract["in_dt"] or tpl_dt
+            lay = str(contract["in_layout"] or tpl_lay or "ND")
+            qm = contract["in_qmode"] if contract["in_dt"] else tpl_qm
+            grp = contract["in_grp"] if contract["in_dt"] else tpl_grp
+            sc = contract["in_sc"] if contract["in_dt"] else tpl_sc
+            shape = (rows, in_w)
+            sc_shape = (rows,) if sc != "none" else ()
+        elif low_role == "weight_scale" and contract["wt_dt"] == "int4":
+            dt, lay, qm, grp, sc = "uint64", tpl_lay, "none", (), "none"
+            shape, sc_shape = (out_w,), ()
+        elif low_role in _SUBGRAPH_STATE_ROLES and contract["state_dt"]:
+            dt, lay, qm, grp, sc = contract["state_dt"], tpl_lay, "dense", (), "none"
+            shape, sc_shape = (rows, in_w), ()
+        else:
+            dt, lay, qm, grp, sc = tpl_dt, tpl_lay, tpl_qm, tpl_grp, tpl_sc
+            shape = (contract["experts"],) if low_role == "group_list" else (rows,)
+            sc_shape = ()
+        operands.append(OperandPortSig(
+            role=role, dtype=dt, layout=lay, transposed=False, shape=shape,
+            quant_mode=qm, group_shape=grp, scale_dtype=sc, scale_shape=sc_shape,
+        ))
+    outputs: list[OperandPortSig] = []
+    for token in out_template:
+        role, tpl_dt, tpl_lay, _, _, _ = _parse_port_template(token)
+        low_role = role.lower()
+        if low_role in _SUBGRAPH_PRIMARY_OUT_ROLES:
+            dt = contract["out_dt"] or tpl_dt
+            lay = str(contract["out_layout"] or tpl_lay or "ND")
+            shape = (rows, out_w)
+        elif low_role == "query_norm_out" and contract["out_dt"]:
+            dt, lay, shape = contract["out_dt"], str(contract["out_layout"] or tpl_lay or "ND"), (rows, out_w)
+        elif low_role in _SUBGRAPH_SCALE_OUT_ROLES:
+            dt = contract["out_scale"] or tpl_dt
+            lay, shape = tpl_lay, (rows,)
+        elif low_role in _SUBGRAPH_STATE_ROLES and contract["state_dt"]:
+            dt, lay, shape = contract["state_dt"], tpl_lay, (rows, in_w)
+        else:
+            dt, lay, shape = tpl_dt, tpl_lay, (rows, out_w)
+        outputs.append(OperandPortSig(
+            role=role, dtype=dt, layout=lay, transposed=False, shape=shape,
+            quant_mode="dense" if dt in _SUBGRAPH_DENSE_DTYPES else "none",
+            group_shape=(), scale_dtype="none", scale_shape=(),
+        ))
+    act_kind = contract["act_kind"]
+    if act_kind == "none" and entry.allowed_activations and "none" not in entry.allowed_activations:
+        act_kind = entry.allowed_activations[0]
+    return AbiQueryKey(
+        soc_arch=target_arch,  # type: ignore[arg-type]
+        sku_id="generic_sku",
+        abi_id=entry.abi_id,
+        graph_motif=contract["role"] or "subgraph",
+        model_scope=contract["model_scope"],
+        draft_quant_mode="none",
+        pr_track="shipping",
+        operands=tuple(operands),
+        outputs=tuple(outputs),
+        rank_placement=contract["rank_placement"],
+        world_size=contract["world_size"],
+        comm_group_id="local",
+        comm_domain_width=1,
+        comm_dtype="none",
+        reduction_kind="none",
+        activation_kind=act_kind,
+        activation_params=(),
+        has_bias=contract["has_bias"],
+        has_active_mask=False,
+        dispatch_quant_mode=0,
+        shared_experts_per_rank=0,
+        top_k=0,
+        moe_expert_num=contract["experts"],
+        qk_rope_head_dim=0,
+        mla_variant="none",
+        sfa_dcp_active=False,
+        pcp_size=1,
+        kv_cache_dtype="none",
+        has_kpool_indexer=False,
+        dcp_size=1,
+        is_act_and_mul=True,
+        enabled_stack_passes=contract["enabled_passes"],
+    )
+
+
+def _probe_subgraph_abi(
+    symbols: tuple[str, ...],
+    arch: str | None,
+    declaration=None,
+    ordered_nodes=(),
+) -> tuple[str, str]:
+    """Verify candidate symbols against sealed ``ProbedAbiRegistry.verify()``."""
     if not symbols:
         return "unshipped", ""
     registry = default_abi_registry()
     archs = (arch,) if arch in SOC_ARCHS else ("A5", "A3", "A2")
+    contract = _extract_subgraph_contract(declaration or {}, ordered_nodes or ())
     proposed_match = ""
+    last_rejection = ""
     for sym in symbols:
         for target_arch in archs:
             entries = registry.lookup(sym, target_arch, available_only=True)
             for entry in entries:
-                if entry.vllm_ascend_track == "merged":
-                    return "shipping", entry.abi_id
-                if not proposed_match:
-                    proposed_match = entry.abi_id
+                query = _build_subgraph_abi_query(entry, target_arch, contract)
+                verdict = registry.verify(query)
+                if verdict.status == "admitted_shipping":
+                    return "shipping", verdict.matched_entry_id or entry.abi_id
+                if entry.vllm_ascend_track == "unmerged_pr" and not proposed_match:
+                    track_spec = StackTrackSpec(
+                        track="proposed", enabled_passes=query.enabled_stack_passes,
+                    )
+                    bindings = (
+                        (ManifestBinding(
+                            mechanism_id=entry.required_mechanism_id,
+                            pr_url="proposed", revision="proposed",
+                        ),)
+                        if entry.required_mechanism_id else ()
+                    )
+                    prop = registry.verify(query, track_spec=track_spec, manifest_bindings=bindings)
+                    if prop.status == "admitted_proposed_pr":
+                        proposed_match = prop.matched_entry_id or entry.abi_id
+                elif verdict.rejection_reason:
+                    last_rejection = verdict.rejection_reason
     if proposed_match:
         return "proposed", proposed_match
-    return "unshipped", symbols[0]
+    return "unshipped", last_rejection or symbols[0]
 
 
 def resolve_subgraph_fusion_status(
@@ -161,7 +482,7 @@ def resolve_subgraph_fusion_status(
 
     resolved_arch = _subgraph_arch(declaration, ordered_nodes, arch)
     symbols = _candidate_abi_symbols(declaration, ordered_nodes)
-    tier, matched = _probe_subgraph_abi(symbols, resolved_arch)
+    tier, matched = _probe_subgraph_abi(symbols, resolved_arch, declaration, ordered_nodes)
     single_kernel = (
         len(ordered_nodes) == 1
         and (

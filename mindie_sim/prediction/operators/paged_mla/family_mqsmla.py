@@ -173,6 +173,17 @@ def validate(*, views, plan, parallel, model, padded_tokens,
         raise ModelingError(reason)
 
 
+def _matches_dsl_formats(op) -> bool:
+    view = dict(getattr(op, "metadata", ()) or ()).get("attention_tensor_view") or {}
+    regions = view.get("cache_representations")
+    if not isinstance(regions, dict) or not regions:
+        return True
+    return all(
+        _region_format(regions.get(region)) == CacheFormat(**declaration)
+        for region, declaration in FORMATS.items()
+    )
+
+
 def lower_attention(ops, outputs, *, selection, views, plan, topk_present, prefix,
                     parallel=None, runtime=None):
     ids = set(outputs)
@@ -186,6 +197,8 @@ def lower_attention(ops, outputs, *, selection, views, plan, topk_present, prefi
                        else NO_COMPRESSED_ROWS)
     implementation = str(getattr(selection, "name", RECIPE))
     quant_mode = declared_quant_mode(members[0])
+    if quant_mode is None and not _matches_dsl_formats(members[0]):
+        raise ModelingError("mqsmla_cache_representation_contract_required")
     shape = {"sequences": rows, "window": plan.window, "ratio": effective_ratio,
              "topk": plan.index_topk if topk_present else 0, "heads": heads,
              "width": MQSMLA_HEAD_WIDTH, "metadata_support_fd": False,
@@ -203,6 +216,12 @@ def lower_attention(ops, outputs, *, selection, views, plan, topk_present, prefi
             "implementation_binding": {
                 "selector": "mqsmla_attention", "implementation": implementation,
                 "capture_binary_identity": "not_established",
+                "abi_registry_verified": False,
+                "layout_contract": (
+                    "aclnn_packed_kv_mode"
+                    if quant_mode in {KV_QUANT_FP8, KV_QUANT_MXFP8}
+                    else "mixed_fp8_fp4_544_320"
+                ),
                 "source": SOURCE,
                 "coverage": "conditional_source_program",
                 "caller_unmodeled": ["separate_aicpu_metadata_generation",

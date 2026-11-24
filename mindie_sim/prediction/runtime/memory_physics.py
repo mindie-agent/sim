@@ -489,17 +489,11 @@ class AddressRunPlan:
 
     def dram_sector_and_service(self, burst_rules: Sequence[BurstTurnRule] = ()) -> tuple[int, float]:
         """Exact integer 32 B sector bytes and burst-adjusted DRAM service bytes (D_f)."""
-        seen_aliases: set[str] = set()
+        ordered = _canonical_dram_runs(self, burst_rules)
         covered = SectorCoverage()
         sector_total, service_total = 0, 0.0
-        single_run = len(self.runs) == 1
-        for run in self.runs:
-            if run.rows == 0 or run.row_bytes == 0:
-                continue
-            if run.proven_alias_group is not None:
-                if run.proven_alias_group in seen_aliases:
-                    continue
-                seen_aliases.add(run.proven_alias_group)
+        single_run = len(ordered) == 1
+        for run in ordered:
             if single_run:
                 sec_bytes = run.sector_union_bytes(self.sector_bytes)
             else:
@@ -796,7 +790,8 @@ class HbmBusSpec:
 
 
 from .l2_residency import (
-    AdmissionMemoryView, DirtyWriteback, _burst_service_bytes, bind_memory_access, cache_policy_for_arch,
+    AdmissionMemoryView, DirtyWriteback, _burst_service_bytes, _canonical_dram_runs,
+    bind_memory_access, cache_policy_for_arch,
 )
 
 

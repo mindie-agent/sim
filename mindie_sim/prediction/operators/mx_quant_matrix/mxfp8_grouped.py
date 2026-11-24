@@ -307,18 +307,19 @@ def build_swiglu_mx_quant(op, geometry):
     read = float(op.mte2_bytes)
     write = float(op.mte3_bytes)
     vector = float(op.vector_ops)
-    waves = max(1, -(-rows // SWIGLU_MX_AIV_UNITS))
+    aiv_units = max(1, int((getattr(geometry, "resource_units", None) or {}).get("vector") or SWIGLU_MX_AIV_UNITS))
+    waves = max(1, -(-rows // aiv_units))
 
     def program(context):
-        multi_wave = rows >= SWIGLU_MX_AIV_UNITS
+        multi_wave = rows >= aiv_units
         read_role = "mte2"
         if multi_wave and context.service_rate("mte2_aiv_dram") is not None:
             read_role = "mte2_aiv_dram"
         placement = context.owned(0, 1, ("mte2_aiv", "vector", "mte3"))
 
         def tile(index):
-            start = index * SWIGLU_MX_AIV_UNITS
-            covered = min(SWIGLU_MX_AIV_UNITS, rows - start)
+            start = index * aiv_units
+            covered = min(aiv_units, rows - start)
             scale = covered / rows
             load = read * scale
             store = write * scale
@@ -350,7 +351,7 @@ def build_swiglu_mx_quant(op, geometry):
         "fused_kernel": "npu_swiglu_mx_quant",
         "row_tiles": waves,
         "row_program": {
-            "aiv_units": SWIGLU_MX_AIV_UNITS,
+            "aiv_units": aiv_units,
             "group_size": SWIGLU_MX_GROUP,
             "stages": SWIGLU_MX_STAGES,
             "setup_source": "primitive_table",

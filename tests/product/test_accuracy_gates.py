@@ -247,18 +247,11 @@ class _HeldoutTimingMismatch(AssertionError):
     """Raised strictly when a heldout step prediction misses the 10% p50 gate."""
 
 
-A3_SPECIALIST_PENDING = pytest.mark.xfail(
-    strict=True,
-    raises=_HeldoutTimingMismatch,
-    reason="Pending Tier-1/Tier-2 A3-03 GroupedMatmul + A3-05 MC2 specialist closure "
-           "after Vol.8 I-01/I-02 (mindie_sim/backends/profiles/ascend.json:8613) "
-           "removed 1.2T/32B-cyc error cancellation",
-)
 HELDOUT_CASES = (
     pytest.param("v41-new6/a3_v41_w8a8_tp4_dp4_ep16_dspark7_c32.json",
                  "a3_v41_w8a8_tp4_dp4_ep16_dspark7_c32:q8_b9_m72"),
     pytest.param("glm-source-accepted-26/glm53flash-a3-tp16-c4.json",
-                 "glm53flash-a3-tp16-c4:q6_b4_m24", marks=A3_SPECIALIST_PENDING),
+                 "glm53flash-a3-tp16-c4:q6_b4_m24"),
     pytest.param("glm-source-accepted-26/a3_glm53flash_tp16_aclgraph_c16.json",
                  "a3_glm53flash_tp16_aclgraph_c16:q6_b16_m96"),
 )

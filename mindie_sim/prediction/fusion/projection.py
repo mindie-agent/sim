@@ -16,12 +16,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 import math
+import re
 from typing import Any, Mapping
 
 from mindie_sim.schema.operators import OpSpec
 
 from mindie_sim.prediction.fusion.graph import (
-    FeasibilityError, OpNode, TensorValue, TypedGraph, dtype_bytes,
+    FeasibilityError, NATIVE_AXIS_LAYOUTS, OpNode, TensorValue, TypedGraph, dtype_bytes,
 )
 from mindie_sim.prediction.fusion.ports import (
     control_dependency_names, declared_control_names, full_operand_ports,
@@ -29,6 +30,28 @@ from mindie_sim.prediction.fusion.ports import (
 )
 
 _STATE_SCALAR_BYTES = 4
+_PACKED_LINEAR_LAYOUTS = frozenset({
+    "bf16", "bfloat16", "fp16", "float16", "fp32", "float32",
+    "int8_per_channel", "int4_packed_per_channel", "fp8_rowwise",
+})
+_PACKED_BLOCK_LAYOUT_RE = re.compile(
+    r"^(?:fp8_block\d+x\d+_[a-z0-9_]+|(?:fp4|int4)_group\d+_packed)$"
+)
+
+
+def _normalize_tensor_layout(raw: str, *, op_id: str, allow_strided: bool = False) -> str:
+    """Map canonical physical or catalog-packed weight/op layouts to ``TensorValue.layout``."""
+    text = str(raw or "").strip().lower()
+    if text in {"nz", "fractal_nz"} or "fractal_nz" in text:
+        return "nz"
+    if text in {"contiguous", "nd"} or text in NATIVE_AXIS_LAYOUTS:
+        return text
+    if allow_strided and text in {"strided", "view"}:
+        return text
+    if text in _PACKED_LINEAR_LAYOUTS or _PACKED_BLOCK_LAYOUT_RE.match(text):
+        return "contiguous"
+    kind = "output" if allow_strided else "weight"
+    raise FeasibilityError(f"projection_{kind}_layout_unsupported:{op_id}:{text}")
 
 _FAMILY_KIND = {
     "rmsnorm": "rms_norm", "layernorm": "rms_norm", "norm": "rms_norm",
@@ -205,6 +228,20 @@ def _state_target(op: OpSpec, meta: dict) -> str:
     return f"{op.op_id}:state"
 
 
+def _resolve_weight_dtype(op: OpSpec, meta: Mapping, fallback_dtype: str = "") -> str:
+    """Resolve one canonical physical weight dtype from metadata or typed precision ABI."""
+    abi = getattr(op, "precision_abi", None)
+    weight_dt = str(
+        meta.get("weight_format")
+        or meta.get("weight_dtype")
+        or (abi.weight_dtype if abi is not None else fallback_dtype)
+        or ""
+    ).strip()
+    if not weight_dt:
+        raise FeasibilityError(f"projection_weight_dtype_missing:{op.op_id}")
+    return weight_dt
+
+
 def _weight_identity(op: OpSpec, kind: str, in_shape: tuple[int, ...],
                      out_shape: tuple[int, ...], meta: Mapping) -> tuple[int, str]:
     """Local static weight bytes from declared identity, never ``hbm - read``.
@@ -226,9 +263,7 @@ def _weight_identity(op: OpSpec, kind: str, in_shape: tuple[int, ...],
         base, basis = int(packed), "packed_weight_bytes"
     elif kind in {"matmul", "grouped_matmul"} and len(in_shape) >= 2 \
             and len(out_shape) >= 2 and op.family != "native_fusion":
-        weight_dt = str(meta.get("weight_dtype") or op.dtype or "").strip()
-        if not weight_dt:
-            raise FeasibilityError(f"projection_weight_dtype_missing:{op.op_id}")
+        weight_dt = _resolve_weight_dtype(op, meta, op.dtype or "")
         base = int(math.ceil(int(in_shape[-1]) * int(out_shape[-1]) * dtype_bytes(weight_dt)))
         basis = "shape_k_times_n"
     else:
@@ -474,14 +509,7 @@ def _project_weights(op, meta, kind, in_shape, out_shape, dtype,
     if weight_bytes:
         weight_id = f"{op.op_id}:weight"
         abi = getattr(op, "precision_abi", None)
-        weight_dtype = str(
-            meta.get("weight_format")
-            or meta.get("weight_dtype")
-            or (abi.weight_dtype if abi is not None else dtype)
-            or ""
-        ).strip()
-        if not weight_dtype:
-            raise FeasibilityError(f"projection_weight_dtype_missing:{op.op_id}")
+        weight_dtype = _resolve_weight_dtype(op, meta, dtype)
         element = dtype_bytes(weight_dtype)
         if kind in {"matmul", "grouped_matmul"} and len(in_shape) >= 2:
             weight_shape = (int(in_shape[-1]), int(out_shape[-1]))
@@ -490,10 +518,8 @@ def _project_weights(op, meta, kind, in_shape, out_shape, dtype,
         raw_layout = str(
             meta.get("weight_layout")
             or (abi.weight_layout if abi is not None else "contiguous")
-        ).strip().lower()
-        layout = "nz" if raw_layout == "fractal_nz" else raw_layout
-        if layout not in {"contiguous", "nd", "nz"}:
-            raise FeasibilityError(f"projection_weight_layout_unsupported:{op.op_id}:{raw_layout}")
+        )
+        layout = _normalize_tensor_layout(raw_layout, op_id=op.op_id, allow_strided=False)
         values[weight_id] = TensorValue(
             weight_id, weight_dtype, weight_shape, role="weight",
             storage_bytes=weight_bytes, sharded=True, layout=layout)
@@ -520,8 +546,9 @@ def _project_outputs(op, meta, dtype, out_dtype, out_shape, values):
         (record for record in port_records if record.port_id == primary_id),
         None)
     if primary_record is not None:
-        raw_prim = str(primary_record.layout or "").strip().lower()
-        prim_layout = "nz" if raw_prim == "fractal_nz" else raw_prim
+        prim_layout = _normalize_tensor_layout(
+            primary_record.layout, op_id=op.op_id, allow_strided=True,
+        )
         values[primary_id] = TensorValue(
             primary_id, primary_record.dtype, primary_record.shape,
             role=("output" if primary_record.public or not op.deps
@@ -530,8 +557,9 @@ def _project_outputs(op, meta, dtype, out_dtype, out_shape, values):
             sharded=True,
             layout=prim_layout, public=primary_record.public)
     else:
-        raw_op_layout = str(op.layout or "contiguous").strip().lower()
-        op_layout = "nz" if raw_op_layout == "fractal_nz" else raw_op_layout
+        op_layout = _normalize_tensor_layout(
+            op.layout or "contiguous", op_id=op.op_id, allow_strided=True,
+        )
         values[primary_id] = TensorValue(
             primary_id, out_dtype, out_shape,
             role="output" if not op.deps else "activation",
@@ -545,8 +573,9 @@ def _project_outputs(op, meta, dtype, out_dtype, out_shape, values):
     for record in port_records:
         if record.port_id == primary_id:
             continue
-        raw_rec = str(record.layout or "").strip().lower()
-        rec_layout = "nz" if raw_rec == "fractal_nz" else raw_rec
+        rec_layout = _normalize_tensor_layout(
+            record.layout, op_id=op.op_id, allow_strided=True,
+        )
         values[record.port_id] = TensorValue(
             record.port_id, record.dtype, record.shape,
             role="output" if record.public else "activation",

@@ -739,15 +739,21 @@ def _engine_link_transfer(hw, topo, peer, payload_bytes: int, hbm_slowdown: floa
 def compute_a5_contention_slowdown(expansion_mode, *, concurrent_cube_util=0.0,
                                    concurrent_vector_util=0.0,
                                    concurrent_mte_util=0.0,
+                                   concurrent_hbm_util=None,
                                    active_aiv_blocks=DEFAULT_ACTIVE_AIV_BLOCKS,
                                    total_aiv_units=DEFAULT_TOTAL_AIV_UNITS):
     """Discrete-event Engine + Topology + DirectPeerCollective contention evaluation."""
     mode = _mode(expansion_mode)
     if mode not in _EXPANSION_MODES and mode != "unspecified":
         raise ModelingError(f"a5_expansion_mode_unknown:{expansion_mode}")
-    for name, value in (("concurrent_cube_util", concurrent_cube_util),
-                        ("concurrent_vector_util", concurrent_vector_util),
-                        ("concurrent_mte_util", concurrent_mte_util)):
+    util_checks = [
+        ("concurrent_cube_util", concurrent_cube_util),
+        ("concurrent_vector_util", concurrent_vector_util),
+        ("concurrent_mte_util", concurrent_mte_util),
+    ]
+    if concurrent_hbm_util is not None:
+        util_checks.append(("concurrent_hbm_util", concurrent_hbm_util))
+    for name, value in util_checks:
         if isinstance(value, bool) or not math.isfinite(float(value)) or float(value) < 0.0:
             raise ValueError(f"a5_contention_util_invalid:{name}")
     if isinstance(total_aiv_units, bool) or int(total_aiv_units) < 1:
@@ -771,11 +777,13 @@ def compute_a5_contention_slowdown(expansion_mode, *, concurrent_cube_util=0.0,
     vec_load = (u_vec * occupancy) if mode == "aiv" else 0.0
     vector_slowdown = _engine_pipe_slowdown(r_vec, vec_load)
     mte_slowdown = _engine_pipe_slowdown(r_mte, u_mte)
-    # Shared HBM bus sees concurrent MTE/vector/cube memory traffic on the same die.
-    hbm_load = u_mte + (u_vec * occupancy if mode == "aiv" else 0.0) + u_cube
+    # Charge HBM contention strictly from declared shared HBM/MTE demand — never
+    # invent HBM pressure from on-chip Cube or UB vector utilization alone.
+    hbm_load = float(concurrent_hbm_util) if concurrent_hbm_util is not None else u_mte
     hbm_slowdown = _engine_pipe_slowdown(r_hbm, hbm_load)
     cube_slowdown = _engine_pipe_slowdown(r_cube, u_cube)
-    total = max(vector_slowdown, mte_slowdown, hbm_slowdown, cube_slowdown)
+    # Communication legs do not execute on AIC Cube units.
+    total = max(vector_slowdown, mte_slowdown, hbm_slowdown)
     transfer_ms, sync_ms = _engine_link_transfer(
         hw, topo, peer, _CONTENTION_PROBE_BYTES, hbm_slowdown,
     )
@@ -800,6 +808,38 @@ def compute_a5_contention_slowdown(expansion_mode, *, concurrent_cube_util=0.0,
     }
 
 
+def _chain_stage_durations_ms(chain: Mapping) -> tuple[float, float, float]:
+    """Return ``(quant_ms, gmm_ms, comm_ms)`` from canonical stage or raw leg maps."""
+    stage_legs = chain.get("stage_legs_ms") or {}
+    legs = chain.get("legs_ms") or {}
+    quant_ms = float(
+        stage_legs.get("quant", 0.0)
+        or legs.get("quant", 0.0)
+        or legs.get("swiglu_quant", 0.0)
+        or legs.get("swiglu", 0.0)
+        or 0.0
+    )
+    gmm_ms = float(
+        stage_legs.get("grouped_matmul", 0.0)
+        or legs.get("grouped_matmul", 0.0)
+        or (float(legs.get("gate_up", 0.0) or 0.0) + float(legs.get("down", 0.0) or 0.0))
+        or 0.0
+    )
+    comm_ms = float(
+        (float(stage_legs.get("all_to_allv_dispatch", 0.0) or 0.0)
+         + float(stage_legs.get("all_to_allv_combine", 0.0) or 0.0))
+        or (float(legs.get("all_to_allv_dispatch", 0.0) or 0.0)
+            + float(legs.get("all_to_allv_combine", 0.0) or 0.0))
+        or (float(legs.get("dispatch", 0.0) or 0.0)
+            + float(legs.get("combine", 0.0) or 0.0))
+        or 0.0
+    )
+    return quant_ms, gmm_ms, comm_ms
+
+
+_MIN_CHAIN_SPAN_MS = 1e-12
+
+
 def evaluate_a5_mc2_chains(ingested=None):
     """Evaluate MC2 chain overlap and Engine + Topology + DirectPeerCollective contention."""
     data = _data_for(ingested)
@@ -812,9 +852,7 @@ def evaluate_a5_mc2_chains(ingested=None):
         if not math.isfinite(sum_ms) or sum_ms <= 0.0:
             raise ModelingError(f"a5_mc2_chain_nonpositive_sum:{chain.get('condition')}")
         ratio = chain_ms / sum_ms
-        # Physical concurrent overlap fraction derived solely from measured legs vs chain span:
-        #   overlapped_time / chain_span = max(0, sum_ms - chain_ms) / sum_ms = max(0, 1 - ratio).
-        overlap_util = max(0.0, min(1.0, 1.0 - min(1.0, ratio)))
+        observed_overlap_ms = max(0.0, sum_ms - chain_ms)
         if any(key in chain for key in ("observed_expansion_mode",
                                         "requested_expansion_mode",
                                         "profiler_evidence")):
@@ -824,26 +862,37 @@ def evaluate_a5_mc2_chains(ingested=None):
                 profiler_evidence=chain.get("profiler_evidence"))["regime"]
         else:
             mode = _mode(chain.get("regime"))
-        # Leg-attributed utilization shares directly from observed leg durations (zero magic weights).
-        quant_ms = float(legs.get("quant", 0.0) or 0.0)
-        gmm_ms = float(legs.get("grouped_matmul", 0.0) or 0.0)
-        comm_ms = (
-            float(legs.get("all_to_allv_dispatch", 0.0) or 0.0)
-            + float(legs.get("all_to_allv_combine", 0.0) or 0.0)
-        )
-        leg_total = quant_ms + gmm_ms + comm_ms
-        if leg_total > 0.0:
-            vec_share = (quant_ms + comm_ms) / leg_total
-            cube_share = gmm_ms / leg_total
-            mte_share = (quant_ms + comm_ms) / leg_total
+        quant_ms, gmm_ms, comm_ms = _chain_stage_durations_ms(chain)
+        # Price contention strictly from shared-resource demand:
+        # - AIV vector contention exists only when AIV comm overlaps vector compute
+        #   (or explicit vector demand is supplied).
+        # - MTE/HBM contention is priced only when explicit shared MTE/HBM demand
+        #   is declared; when only leg medians & chain span exist, report observed
+        #   overlap without inventing HBM contention.
+        explicit_vec = chain.get("concurrent_vector_util", chain.get("shared_vector_util"))
+        explicit_mte = chain.get("concurrent_mte_util", chain.get("shared_mte_util"))
+        explicit_hbm = chain.get("concurrent_hbm_util", chain.get("shared_hbm_util"))
+        if explicit_vec is not None:
+            vec_util = float(explicit_vec)
+        elif mode == "aiv" and quant_ms > 0.0 and comm_ms > 0.0 and observed_overlap_ms > 0.0:
+            vec_util = min(1.0, min(quant_ms, comm_ms, observed_overlap_ms) / max(chain_ms, _MIN_CHAIN_SPAN_MS))
         else:
-            vec_share = cube_share = mte_share = 1.0
+            vec_util = 0.0
+        mte_util = float(explicit_mte) if explicit_mte is not None else 0.0
+        hbm_util = float(explicit_hbm) if explicit_hbm is not None else mte_util
+        cube_util = (
+            min(1.0, min(gmm_ms, comm_ms, observed_overlap_ms) / max(chain_ms, _MIN_CHAIN_SPAN_MS))
+            if gmm_ms > 0.0 and comm_ms > 0.0 and observed_overlap_ms > 0.0
+            else 0.0
+        )
         contention = compute_a5_contention_slowdown(
             mode,
-            concurrent_cube_util=overlap_util * cube_share,
-            concurrent_vector_util=overlap_util * vec_share,
-            concurrent_mte_util=overlap_util * mte_share,
+            concurrent_cube_util=cube_util,
+            concurrent_vector_util=vec_util,
+            concurrent_mte_util=mte_util,
+            concurrent_hbm_util=hbm_util,
         )
+        has_shared_demand = (vec_util > 0.0 and mode == "aiv") or mte_util > 0.0 or hbm_util > 0.0
         rows.append({
             **chain,
             "dtype": dtype,
@@ -851,7 +900,11 @@ def evaluate_a5_mc2_chains(ingested=None):
             "sum_leg_p50_ms": sum_ms,
             "overlap_ratio": ratio,
             "chain_over_sum": ratio,
+            "observed_overlap_ms": observed_overlap_ms,
             "expansion_regime": mode,
+            "contention_basis": (
+                "shared_resource_demand" if has_shared_demand else "observed_overlap_only"
+            ),
             "contention_degradation_multiplier": contention["contention_slowdown"],
             "vector_slowdown": contention["vector_slowdown"],
             "mte_slowdown": contention["mte_slowdown"],

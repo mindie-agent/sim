@@ -174,10 +174,15 @@ def router_matrix_operand_bytes(op, geometry, *, recipe=None) -> float:
 
 
 def _geometry_partials_l2_resident(geometry, partial_bytes: float) -> bool:
-    """True when the die declares an L2 resource large enough for FP32 partials."""
+    """True when the die's live available L2 budget fits the FP32 partials."""
     units = getattr(geometry, "resource_units", None) or {}
     if "l2" not in units or partial_bytes <= 0.0:
         return False
+    view = getattr(geometry, "admission_memory_view", None)
+    if view is not None:
+        rank = int(getattr(geometry, "rank", 0) or 0)
+        avail = int(view.effective_l2_bytes(rank))
+        return avail > 0 and partial_bytes <= float(avail)
     l2_bytes = int((getattr(geometry, "buffers", None) or {}).get("l2", 0) or 0)
     if l2_bytes <= 0:
         hierarchy = getattr(getattr(geometry, "physical_mechanisms", None), "memory_hierarchy", None)
@@ -186,10 +191,15 @@ def _geometry_partials_l2_resident(geometry, partial_bytes: float) -> bool:
 
 
 def _partials_l2_resident(context, partial_bytes: float) -> bool:
-    """True when FP32 Split-K partials fit die L2 and the Engine exposes an L2 pipe."""
+    """True when FP32 Split-K partials fit live available die L2 and L2 pipe exists."""
     names = getattr(context, "resource_names", None) or {}
     if "l2" not in names or partial_bytes <= 0.0:
         return False
+    view = getattr(context, "admission_memory_view", None)
+    if view is not None:
+        rank = int(getattr(context, "rank", 0) or 0)
+        avail = int(view.effective_l2_bytes(rank))
+        return avail > 0 and partial_bytes <= float(avail)
     from .matrix_mapping_owners import primitive_l2_params
     l2_bytes, _ = primitive_l2_params(context)
     if l2_bytes <= 0:
@@ -279,11 +289,16 @@ def build_router_splitk(op, geometry):
             hbm_bytes=declared_mte2 + declared_mte3,
             vector_ops=declared_vector,
         )
+        live_l2 = (
+            _partials_l2_resident(context, partial)
+            if getattr(context, "admission_memory_view", None) is not None
+            else ws_l2
+        )
         return splitk_program(
             replace(context, op=matrix_op, work=matrix_demand),
             splits,
             recipe=recipe,
-            ws_l2_resident=ws_l2,
+            ws_l2_resident=live_l2,
         )
 
     return OperatorPlan(plan_work, program, {

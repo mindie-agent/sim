@@ -125,8 +125,11 @@ def _event_key(state, event, *, generation: int = 0) -> EventKey:
     event_uid = getattr(event, "runtime_uid", None)
     if not isinstance(event_uid, str) or not event_uid:
         if isinstance(event, LocalBoundaryToken):
-            event_uid = str(getattr(state, "uid", "") or "")
-        if not event_uid:
+            state_uid = str(getattr(state, "uid", "") or "")
+            if not state_uid:
+                raise LedgerError("event_runtime_uid_missing")
+            event_uid = f"local_boundary:{state_uid}"
+        else:
             raise LedgerError("event_runtime_uid_missing")
     return EventKey(
         runtime_uid=str(event_uid), sequence=sequence,
@@ -317,6 +320,7 @@ class Ledger:
         amount: float,
         backings: dict[BackingKey, BackingRecord],
         deltas: dict[tuple[str, PoolKey], float],
+        prepared: Sequence[tuple[CapacityDomainState, _Grant]] = (),
     ) -> None:
         if item.backing is None:
             if item.reservation_parent is not None:
@@ -347,10 +351,17 @@ class Ledger:
             raise LedgerError("backing_parent_mismatch")
         if item.reservation_parent is not None:
             parent = domain.grants.get(item.reservation_parent)
+            if parent is None:
+                parent = next(
+                    (g for d, g in prepared if d is domain and g.key == item.reservation_parent),
+                    None,
+                )
             if parent is None or parent.backing != item.backing:
                 raise LedgerError("reservation_parent_invalid")
             if not ranges:
                 raise LedgerError("reservation_slice_empty")
+            if union_ranges((*parent.ranges, *ranges)) != parent.ranges:
+                raise LedgerError("reservation_not_backed")
             record.holders[grant.key] = ranges
             if record.rebuild():
                 # A slice inside its parent must never add pool bytes.
@@ -439,7 +450,7 @@ class Ledger:
                 pending_uses=pending_uses,
             )
             cls._stage_backing_delta(
-                domain, item, grant, ranges, amount, backings, deltas,
+                domain, item, grant, ranges, amount, backings, deltas, prepared,
             )
             prepared.append((domain, grant))
 
@@ -567,10 +578,15 @@ class Ledger:
                     grant.pending_uses.difference_update(done)
                 if not grant.pending_uses and grant.last_use is not None:
                     grant.last_use_done = True
-                if (not grant.deferred or grant.readers or grant.children
-                        or grant.pending_uses):
-                    continue
-                results.append(cls._complete_release(state, domain, grant))
+            progressed = True
+            while progressed:
+                progressed = False
+                for grant in tuple(domain.grants.values()):
+                    if (not grant.deferred or grant.readers or grant.children
+                            or grant.pending_uses):
+                        continue
+                    results.append(cls._complete_release(state, domain, grant))
+                    progressed = True
         return tuple(results)
 
     # -------------------------------------------------------------- release

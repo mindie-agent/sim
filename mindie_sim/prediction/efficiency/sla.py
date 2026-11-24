@@ -464,6 +464,55 @@ class _SLASizingRun:
             candidate_checks, evaluated_b, b_sla, eval_sla, bounded_probes,
             secant_estimate, certified_optimal=certified_optimal, hi_cut=hi_cut)
 
+    @staticmethod
+    def _hardware_floor_caps(eff_case: CaseSpec):
+        dies = getattr(getattr(eff_case, "machine", None), "dies", ()) or ()
+        max_hbm_ms = 0.0
+        max_vec_ms = 0.0
+        max_l2_bytes = 0.0
+        cube_peaks_ms: dict[str, float] = {}
+        custom_inv = bool((getattr(eff_case.runtime, "kernels", None) or {}).get("invocations"))
+        cube_invs: list[float] = []
+        vec_invs: list[float] = []
+        for die in dies:
+            rates = dict(getattr(die, "rates", ()) or ())
+            for fmt, val in dict(die.compute_peaks).items():
+                f_ms = float(val or 0.0) / 1000.0
+                if f_ms > cube_peaks_ms.get(str(fmt).lower(), 0.0):
+                    cube_peaks_ms[str(fmt).lower()] = f_ms
+            max_vec_ms = max(max_vec_ms, float(rates.get("vector", 0.0) or 0.0) / 1000.0)
+            hbm_s = float(rates.get("hbm", 0.0) or 0.0)
+            dp = getattr(die, "datapath", None)
+            hbm_r = float(getattr(dp, "hbm_read_bytes_per_s", 0.0) or 0.0) if dp is not None else 0.0
+            hbm_w = float(getattr(dp, "hbm_write_bytes_per_s", 0.0) or 0.0) if dp is not None else 0.0
+            max_hbm_ms = max(max_hbm_ms, max(hbm_s, hbm_r, hbm_w) / 1000.0)
+            max_l2_bytes = max(max_l2_bytes, float(dict(getattr(die, "buffers", ()) or ()).get("l2", 0.0) or 0.0))
+            if not custom_inv:
+                invs = dict(getattr(die, "kernel_invocations", ()) or ())
+                cube_invs.append(float(getattr(invs.get("cube"), "minimum_ms", 0.0) or 0.0))
+                vec_invs.append(float(getattr(invs.get("vector"), "minimum_ms", 0.0) or 0.0))
+        min_cube_inv = min(cube_invs, default=0.0) if (not custom_inv and len(cube_invs) == len(dies)) else 0.0
+        min_vec_inv = min(vec_invs, default=0.0) if (not custom_inv and len(vec_invs) == len(dies)) else 0.0
+        links = getattr(getattr(eff_case, "machine", None), "links", ()) or ()
+        per_rank_egress: dict[int, float] = {}
+        min_link_lat_ms = math.inf
+        for lk in links:
+            cap = float(getattr(lk, "capacity_bytes_per_ms", 0.0) or 0.0)
+            lat_us = float(getattr(lk, "latency_us", 0.0) or 0.0)
+            if lat_us > 0.0:
+                min_link_lat_ms = min(min_link_lat_ms, lat_us / 1000.0)
+            members = tuple(getattr(lk, "members", ()) or ())
+            sem = str(getattr(lk, "semantics", "") or "").lower()
+            mult = max(1, len(members) - 1) if (sem == "per_pair" or not sem) and len(members) > 1 else 1
+            for r in (members or (0,)):
+                per_rank_egress[int(r)] = per_rank_egress.get(int(r), 0.0) + cap * float(mult)
+        max_link_ms = max(per_rank_egress.values(), default=0.0)
+        hop_lat_ms = 0.0 if not math.isfinite(min_link_lat_ms) else min_link_lat_ms
+        return (
+            max_hbm_ms, max_vec_ms, cube_peaks_ms, max(cube_peaks_ms.values(), default=0.0),
+            max_link_ms, hop_lat_ms, max_l2_bytes, min_cube_inv, min_vec_inv, links,
+        )
+
     def _work_floor_rays(
         self, s_key: tuple[float, ...], b: int, step_ms: float,
     ) -> tuple[tuple[float, float], ...]:
@@ -478,34 +527,21 @@ class _SLASizingRun:
         dies = getattr(getattr(eff_case, "machine", None), "dies", ()) or ()
         if not ops_0 or not dies:
             return ()
-        max_hbm_ms = 0.0
-        max_vec_ms = 0.0
-        cube_peaks_ms: dict[str, float] = {}
-        for die in dies:
-            rates = dict(getattr(die, "rates", ()) or ())
-            for fmt, val in dict(die.compute_peaks).items():
-                f_ms = float(val or 0.0) / 1000.0
-                if f_ms > cube_peaks_ms.get(str(fmt).lower(), 0.0):
-                    cube_peaks_ms[str(fmt).lower()] = f_ms
-            max_vec_ms = max(max_vec_ms, float(rates.get("vector", 0.0) or 0.0) / 1000.0)
-            hbm_s = float(rates.get("hbm", 0.0) or 0.0)
-            dp = getattr(die, "datapath", None)
-            hbm_r = float(getattr(dp, "hbm_read_bytes_per_s", 0.0) or 0.0) if dp is not None else 0.0
-            hbm_w = float(getattr(dp, "hbm_write_bytes_per_s", 0.0) or 0.0) if dp is not None else 0.0
-            max_hbm_ms = max(max_hbm_ms, max(hbm_s, hbm_r, hbm_w) / 1000.0)
-        max_cube_ms = max(cube_peaks_ms.values(), default=0.0)
-        links = getattr(getattr(eff_case, "machine", None), "links", ()) or ()
-        max_link_ms = max((float(getattr(lk, "capacity_bytes_per_ms", 0.0) or 0.0) for lk in links), default=0.0)
-        from ..topology import Topology
-        topo = Topology(eff_case.machine, eff_case.runtime.parallel) if links else None
+        (
+            max_hbm_ms, max_vec_ms, cube_peaks_ms, max_cube_ms,
+            max_link_ms, hop_lat_ms, max_l2_bytes, min_cube_inv, min_vec_inv, _links,
+        ) = self._hardware_floor_caps(eff_case)
         stage_wb: dict[int, float] = {}
+        stage_gg: dict[int, float] = {}
         stage_kv: dict[int, float] = {}
         stage_cube: dict[int, float] = {}
         stage_vec: dict[int, float] = {}
         stage_link: dict[int, float] = {}
         dp_val: dict[str, float] = {}
         dp_ray: dict[str, tuple[float, float]] = {}
+        dag_used_gg = False
         attn_fams = {"attention", "mla_attention", "indexed_attention", "paged_mla_attention"}
+        non_kernel_fams = {"collective", "barrier", "token_commit", "prefetch", "pool_release"}
         inv_b = 1.0 / float(b)
         for op in ops_0:
             st = int(getattr(op, "stage", 0) or 0)
@@ -519,14 +555,21 @@ class _SLASizingRun:
             md = dict(getattr(op, "metadata", ()) or ())
             op_hbm = float(getattr(op, "hbm_bytes", 0.0) or 0.0)
             wb = float(md.get("packed_weight_bytes") or md.get("weight_bytes") or 0.0)
+            fam = str(getattr(op, "family", "") or "")
             a_op, c_op = 0.0, 0.0
             if op_hbm > 0.0 and wb > 0.0:
                 w_eff = min(wb, op_hbm)
                 stage_wb[st] = stage_wb.get(st, 0.0) + w_eff
                 if max_hbm_ms > 0.0:
                     a_op = w_eff / max_hbm_ms
+            elif op_hbm > 0.0 and wb <= 0.0 and fam == "grouped_gemm":
+                gg_eff = op_hbm * sem_scale
+                stage_gg[st] = stage_gg.get(st, 0.0) + gg_eff
+                if max_hbm_ms > 0.0:
+                    a_op = gg_eff / max_hbm_ms
+                    dag_used_gg = True
             elif (op_hbm > 0.0 and wb <= 0.0 and self.phase == "decode"
-                  and self.context > 0 and getattr(op, "family", "") in attn_fams):
+                  and self.context > 0 and fam in attn_fams):
                 kv_b = min(float(md.get("kv_read_bytes") or op_hbm), op_hbm) * sem_scale
                 stage_kv[st] = stage_kv.get(st, 0.0) + kv_b
                 if max_hbm_ms > 0.0:
@@ -553,18 +596,20 @@ class _SLASizingRun:
                 stage_vec[st] = stage_vec.get(st, 0.0) + (vops * sem_scale / max_vec_ms)
             lbytes = float(getattr(op, "link_bytes", 0.0) or 0.0)
             if lbytes > 0.0 and max_link_ms > 0.0:
-                stage_link[st] = stage_link.get(st, 0.0) + (lbytes * sem_scale / max_link_ms)
-                if topo is not None:
-                    acc = topo.accounting(op, 0)
-                    wire_ms = max(
-                        (amt * sem_scale / acc.capacity_by_resource[lk]
-                         for lk, amt in acc.wire_by_resource.items()
-                         if acc.capacity_by_resource.get(lk, 0.0) > 0.0),
-                        default=0.0,
-                    )
-                    plat = float(getattr(acc, "path_latency_ms", 0.0) or 0.0)
-                    if plat + wire_ms > a_op + c_op * float(b):
-                        a_op, c_op = plat, wire_ms * inv_b
+                # Full-duplex compulsory send volume across all incident peer links of a die.
+                compulsory_link_ms = (0.5 * lbytes * sem_scale) / max_link_ms
+                stage_link[st] = stage_link.get(st, 0.0) + compulsory_link_ms
+                if hop_lat_ms + compulsory_link_ms > a_op + c_op * float(b):
+                    a_op, c_op = hop_lat_ms, compulsory_link_ms * inv_b
+            if (lbytes <= 0.0 and fam not in non_kernel_fams
+                    and getattr(op, "coverage", "") != "pool_release"
+                    and getattr(op, "source_boundary", "") != "host"
+                    and not md.get("invocation_class")
+                    and not (isinstance(md.get("program_execution"), Mapping)
+                             and md["program_execution"].get("execution_class"))):
+                inv_min = min_cube_inv if c_ms > 0.0 else (min_vec_inv if vops > 0.0 else 0.0)
+                if inv_min > a_op + c_op * float(b):
+                    a_op, c_op = inv_min, 0.0
             best_v, best_r = 0.0, (0.0, 0.0)
             for dep in getattr(op, "deps", ()) or ():
                 dv = dp_val.get(dep, 0.0)
@@ -575,8 +620,10 @@ class _SLASizingRun:
             dp_val[op.op_id] = cur_r[0] + cur_r[1] * float(b)
         rays: list[tuple[float, float]] = []
         if max_hbm_ms > 0.0:
-            for st in set(stage_wb) | set(stage_kv):
-                fixed = stage_wb.get(st, 0.0) / max_hbm_ms
+            for st in set(stage_wb) | set(stage_gg) | set(stage_kv):
+                gg_b = stage_gg.get(st, 0.0)
+                fixed_b = stage_wb.get(st, 0.0) + max(0.0, gg_b - max_l2_bytes) if gg_b > 0.0 else stage_wb.get(st, 0.0)
+                fixed = fixed_b / max_hbm_ms
                 lin = (stage_kv.get(st, 0.0) / max_hbm_ms) * inv_b
                 if fixed > 0.0 or lin > 0.0:
                     rays.append((fixed, lin))
@@ -586,9 +633,11 @@ class _SLASizingRun:
                 rays.append((0.0, top * inv_b))
         if dp_val:
             top_id = max(dp_val, key=dp_val.__getitem__)
-            dag_r = dp_ray[top_id]
-            if dag_r[0] > 0.0 or dag_r[1] > 0.0:
-                rays.append(dag_r)
+            dag_a, dag_c = dp_ray[top_id]
+            if dag_used_gg and max_hbm_ms > 0.0:
+                dag_a = max(0.0, dag_a - max_l2_bytes / max_hbm_ms)
+            if dag_a > 0.0 or dag_c > 0.0:
+                rays.append((dag_a, dag_c))
         if not rays:
             return ()
         at_b = max(a + c * float(b) for a, c in rays)
@@ -611,29 +660,47 @@ class _SLASizingRun:
         """Return tightest integer ``b' <= hi_cut`` not certified SLA-infeasible by ``rays``."""
         sla_ms = float(self.sla_ms)
         cut = int(hi_cut)
+        domain_floor = max(0, int(b_eval) - 1)
         for fixed, lin in rays:
             if fixed > sla_ms:
-                return min(cut, max(0, b_eval - 1))
+                return min(cut, domain_floor)
             if lin > 0.0:
-                max_b = int(math.floor((sla_ms - fixed) / lin + 1e-12))
+                max_b = max(domain_floor, int(math.floor((sla_ms - fixed) / lin + 1e-12)))
                 if max_b < cut:
-                    cut = max(0, max_b)
+                    cut = max_b
         return cut
 
     def _certified_upper_cutoff(
         self, eval_b, floors: dict[int, float], rays_map: dict[int, tuple[tuple[float, float], ...]],
-        eff_max: int, b_joint: int, bucket_keys: Sequence[int],
+        eff_max: int, b_joint: int,
     ) -> int:
         """Theorem 1: find largest ``b <= eff_max`` not certified SLA-infeasible by ``work_floor``."""
         sla_ms = float(self.sla_ms)
-        q_tokens = max(1, int(self.q_tokens))
         hi_cut = self._ray_sla_cutoff(rays_map.get(1, ()), 1, int(eff_max))
         if floors[1] > sla_ms:
-            if eff_max >= 2:
-                eval_b(2)
             return 0
         prev_p = 1
         probe = 2
+        anchor_hi = min(hi_cut, int(b_joint)) if b_joint >= 2 else 0
+        if anchor_hi >= 2:
+            _, fl_a = eval_b(anchor_hi)
+            hi_cut = self._ray_sla_cutoff(rays_map.get(anchor_hi, ()), anchor_hi, hi_cut)
+            if fl_a <= sla_ms:
+                if anchor_hi >= hi_cut:
+                    return hi_cut
+                prev_p = anchor_hi
+                probe = anchor_hi * 2
+            else:
+                lo_c, hi_c = 1, anchor_hi
+                while hi_c - lo_c > 1:
+                    mid_c = (lo_c + hi_c) // 2
+                    _, fl_m = eval_b(mid_c)
+                    hi_cut = self._ray_sla_cutoff(rays_map.get(mid_c, ()), mid_c, hi_cut)
+                    if fl_m > sla_ms:
+                        hi_c = mid_c
+                    else:
+                        lo_c = mid_c
+                return min(hi_cut, lo_c)
         while probe <= hi_cut:
             _, fl_p = eval_b(probe)
             hi_cut = self._ray_sla_cutoff(rays_map.get(probe, ()), probe, hi_cut)
@@ -652,28 +719,11 @@ class _SLASizingRun:
             prev_p = probe
             probe *= 2
         if hi_cut >= 1 and hi_cut not in floors:
-            _, fl_hi = eval_b(hi_cut)
-            hi_cut = self._ray_sla_cutoff(rays_map.get(hi_cut, ()), hi_cut, hi_cut)
+            probe_hi = hi_cut
+            _, fl_hi = eval_b(probe_hi)
+            hi_cut = self._ray_sla_cutoff(rays_map.get(probe_hi, ()), probe_hi, hi_cut)
             if fl_hi > sla_ms:
-                hi_cut = max(0, hi_cut - 1)
-        anchors: set[int] = set()
-        if hi_cut >= 2:
-            anchors.add(2)
-            for cand in (b_joint - 1, b_joint, b_joint + 1, self.base_b_hint):
-                if 2 <= cand <= hi_cut:
-                    anchors.add(int(cand))
-            for bk in bucket_keys:
-                for raw_b in (bk, bk // q_tokens, bk // q_tokens - 1, bk // q_tokens + 1):
-                    if 2 <= raw_b <= hi_cut:
-                        anchors.add(int(raw_b))
-        for anchor in sorted(anchors):
-            if anchor > hi_cut:
-                break
-            _, fl_a = eval_b(anchor)
-            hi_cut = self._ray_sla_cutoff(rays_map.get(anchor, ()), anchor, hi_cut)
-            if fl_a > sla_ms:
-                hi_cut = min(hi_cut, anchor - 1)
-                break
+                hi_cut = min(hi_cut, max(0, probe_hi - 1))
         return hi_cut
 
     def _search_concurrency(
@@ -730,8 +780,15 @@ class _SLASizingRun:
         floors[1] = min(self._eval_rays(rays_1, 1), float(b1_ms)) if rays_1 else 0.0
         _record_best(1)
         hi_cut = self._certified_upper_cutoff(
-            _eval_b, floors, rays_map, eff_max, b_joint, bucket_keys,
+            _eval_b, floors, rays_map, eff_max, b_joint,
         )
+        q_tokens = max(1, int(self.q_tokens))
+        split_anchors = sorted({
+            int(raw_b)
+            for bk in bucket_keys
+            for raw_b in (bk, bk // q_tokens)
+            if 2 <= raw_b < hi_cut
+        } | ({int(self.base_b_hint)} if 2 <= self.base_b_hint < hi_cut else set()))
 
         def _interval_ub(lo_i: int, hi_i: int) -> float:
             b_top = hi_i - 1
@@ -781,6 +838,9 @@ class _SLASizingRun:
             if lo_i >= hi_cut or _is_dominated(lo_i, hi_eff):
                 continue
             mid = (lo_i + hi_eff) // 2
+            inner_anchors = [a for a in split_anchors if lo_i < a < hi_eff]
+            if inner_anchors:
+                mid = min(inner_anchors, key=lambda a: (abs(a - mid), a))
             _, fl_m = _eval_b(mid)
             hi_cut = self._ray_sla_cutoff(rays_map.get(mid, ()), mid, hi_cut)
             if fl_m > sla_ms:

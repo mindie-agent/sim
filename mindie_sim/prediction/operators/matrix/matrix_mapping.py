@@ -781,20 +781,30 @@ class MappedMatmul:
         steady path (a caller that has no mapping observer).  Selection itself
         is identical: the same cached recipe object is returned either way.
         """
-        host_ctx = (
-            replace(context, primitive_table=None)
-            if getattr(context, "primitive_table", None) is not None
-            else context
-        )
-        rows_key = tuple(int(v) for v in group_rows) if group_rows is not None else None
-        compute_arch = getattr(host_ctx, "compute_arch", None)
+        is_arch35 = is_arch35_context(context)
+        compute_arch = getattr(context, "compute_arch", None)
         if compute_arch is None:
-            compute_arch = getattr(getattr(host_ctx, "datapath", None), "compute_arch", None)
+            compute_arch = getattr(getattr(context, "datapath", None), "compute_arch", None)
+        pt = getattr(context, "primitive_table", None)
+        if compute_arch is None and pt is not None:
+            arch_preset = str(getattr(pt, "arch_preset", "") or "").strip()
+            if arch_preset:
+                from mindie_sim.schema.compute_arch import ComputeArchSpec
+                compute_arch = ComputeArchSpec(preset=arch_preset)
+        if pt is not None:
+            host_ctx = (
+                replace(context, primitive_table=None, compute_arch=compute_arch)
+                if getattr(context, "compute_arch", None) is None and compute_arch is not None
+                else replace(context, primitive_table=None)
+            )
+        else:
+            host_ctx = context
+        rows_key = tuple(int(v) for v in group_rows) if group_rows is not None else None
         arch_key = (
             getattr(compute_arch, "arch_id", None),
             getattr(compute_arch, "preset", None),
             getattr(compute_arch, "clock_hz", None),
-            is_arch35_context(host_ctx),
+            is_arch35,
         )
         cache_key = (
             _matmul_recipe_key(self), _op_matrix_key(host_ctx.op), host_ctx.core_count,

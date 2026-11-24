@@ -160,7 +160,13 @@ def test_sla_solver_exact_threshold_and_speculative_tokens():
     assert same(base["step_ms_at_sla"], at_sla["duration_ms"], EXACT) and at_sla["duration_ms"] <= sla_ms
     assert _decode_costs(parsed, base["b_sla"] + 1)["duration_ms"] > sla_ms
     speculative = _moe_case(layers=2)
-    speculative["model"]["auxiliary"] = {"mtp": {"layers": 1, "num_heads": speculative["model"]["num_heads"], "num_kv_heads": speculative["model"]["num_kv_heads"], "head_dim": speculative["model"]["head_dim"], "hidden_size": speculative["model"]["hidden_size"], "intermediate_size": speculative["model"]["intermediate_size"]}}
+    sm = speculative["model"]
+    speculative["model"]["auxiliary"] = {"mtp": {
+        "kind": "mtp", "layers": 1, "hidden_size": sm["hidden_size"],
+        "intermediate_size": sm["intermediate_size"], "num_heads": sm["num_heads"],
+        "num_kv_heads": sm["num_kv_heads"], "head_dim": sm["head_dim"],
+        "q_width": sm["num_heads"] * sm["head_dim"], "kv_width": sm["num_kv_heads"] * sm["head_dim"],
+    }}
     speculative["runtime"]["metadata"] = {"speculative": {"draft_len": 3, "acceptance": [0.7, 0.7, 0.7], "acceptance_mode": "conditional"}}
     resolved = solve_sla_sizing(speculative, sla_ms=30.0, context=4096, max_sequences_per_dp=2, scope="body", scenarios=[{"id": "baseline"}])
     assert resolved["tokens_per_seq"] == 4 and same(resolved["emitted_tokens_per_seq"], 1.0 + 0.7 + 0.49 + 0.343)

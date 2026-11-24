@@ -495,18 +495,7 @@ def _build_moe_abi_query(
 ):
     from mindie_sim.schema.abi import AbiQueryKey, OperandPortSig
 
-    if abi_id == "aclnnDequantSituQuant":
-        x_qmode = "per_token_int8" if in_dt in {"int8", "int32"} else "dense"
-        x_scale = "fp32" if x_qmode == "per_token_int8" else "none"
-        operands = (
-            OperandPortSig(
-                role="x", dtype=in_dt, layout="ND", transposed=False,
-                shape=(rows, 2 * expert_width), quant_mode=x_qmode,
-                group_shape=(), scale_dtype=x_scale,
-                scale_shape=(rows,) if x_scale != "none" else (),
-            ),
-        )
-    elif abi_id == "aclnnGroupedMatmulSwigluQuant":
+    if abi_id == "aclnnGroupedMatmulSwigluQuant":
         w_qmode = "w4a8_int" if w_dt == "int4" else "per_channel_int8"
         ws_dt = "uint64" if w_dt == "int4" else "fp32"
         ws_qmode = "none" if w_dt == "int4" else "dense"
@@ -542,6 +531,8 @@ def _build_moe_abi_query(
             x_qmode, w_qmode = "mx_fp8", ("mx_fp4" if w_dt == "fp4_e2m1" else "mx_fp8")
         elif in_dt == "fp4_e2m1":
             x_qmode, w_qmode = "mx_fp4", "mx_fp4"
+        elif in_dt in {"bf16", "fp16", "fp32"}:
+            x_qmode, w_qmode = "dense", "dense"
         else:
             x_qmode = "per_token_int8"
             w_qmode = "w4a8_int" if w_dt == "int4" else "per_channel_int8"
@@ -639,9 +630,12 @@ def _probe_grouped_moe_fusion_status(
         if int(gate_meta.get("activation_group_size") or 0) == MX32_SCALE_GROUP
         else ()
     )
+    del situ_mx_domain
     act_kind = "situ" if activation.family == "situ" else "swiglu"
+    # Grouped gate-up + activation fusion strictly requires an ABI with both
+    # input and weight ports (never activation-only ``aclnnDequantSituQuant``).
     candidates = (
-        (("GroupedMatmulSituQuant",) if situ_mx_domain else ("aclnnDequantSituQuant",))
+        ("GroupedMatmulSituQuant",)
         if activation.family == "situ"
         else ("aclnnGroupedMatmulSwigluQuantV2", "aclnnGroupedMatmulSwigluQuant")
     )
@@ -720,31 +714,71 @@ def routed_expert_work(op, *, n, k, weights, weight_kind, local_rows,
                    metadata=tuple(metadata.items()) + routing_metadata)
 
 
+_MX_QUANT_DTYPES = frozenset({"fp8_e4m3fn", "fp4_e2m1"})
+_MX_SCALE_DTYPES = frozenset({"fp8_e8m0", "e8m0", "uint8"})
+_SWIGLU_INT8_INPUT_DTYPES = frozenset({"bf16", "fp16"})
+_SITU_INT8_INPUT_DTYPES = frozenset({"int8", "int32"})
+
+
+def _resolve_activation_quant_abi(
+    act, quant, source_dtype: str,
+) -> tuple[str, dict | None] | None:
+    """Return ``(fused_kernel, row_program_or_none)`` strictly when ABI matches."""
+    q_meta = dict(quant.metadata)
+    in_fmt = _normalize_abi_dtype(str(act.dtype or source_dtype or ""))
+    out_fmt = _normalize_abi_dtype(str(q_meta.get("output_format") or quant.dtype or ""))
+    scale_fmt = _normalize_abi_dtype(str(
+        q_meta.get("activation_scale_format") or q_meta.get("scale_format") or ""
+    ))
+    group_size = int(q_meta.get("activation_group_size") or 0)
+    if act.family == "swiglu":
+        if (out_fmt in _MX_QUANT_DTYPES
+                and group_size == SWIGLU_MX_GROUP
+                and scale_fmt in _MX_SCALE_DTYPES):
+            return (
+                "npu_swiglu_mx_quant",
+                {"aiv_units": SWIGLU_MX_AIV_UNITS,
+                 "group_size": SWIGLU_MX_GROUP,
+                 "stages": SWIGLU_MX_STAGES},
+            )
+        if out_fmt == "int8" and in_fmt in _SWIGLU_INT8_INPUT_DTYPES and scale_fmt in {"fp32", ""}:
+            return ("aclnnSwiGluQuant", None)
+        return None
+    if act.family == "situ":
+        if out_fmt == "int8" and in_fmt in _SITU_INT8_INPUT_DTYPES and scale_fmt in {"fp32", ""}:
+            return ("aclnnDequantSituQuant", None)
+        return None
+    return None
+
+
 def activation_quant_fusion(ops, source_dtype):
-    """Fuse ``swiglu``/``situ``/``geglu`` + ``dynamic_quantize`` into one vector op."""
-    del source_dtype
+    """Fuse activation + ``dynamic_quantize`` only when activation & quant ABI match."""
     by_id, users = {op.op_id: op for op in ops}, users_map(ops)
     replacements, removed, aliases = {}, set(), {}
     for quant in ops:
         if quant.plan_required or quant.family != "quantize" or len(quant.deps) != 1:
             continue
         act = by_id.get(quant.deps[0])
-        if (act is None or act.plan_required or act.family not in {"swiglu", "situ", "geglu"}
+        if (act is None or act.plan_required or act.family not in {"swiglu", "situ"}
                 or float(dict(act.metadata).get("activation_limit", 0.0) or 0.0) > 0.0
                 or act.stage != quant.stage or act.stream != quant.stream):
             continue
         if users[act.op_id] != [quant.op_id]:
             continue
+        abi_match = _resolve_activation_quant_abi(act, quant, source_dtype)
+        if abi_match is None:
+            continue
+        fused_kernel, row_program = abi_match
         read = float(act.mte2_bytes)
         write = float(quant.mte3_bytes)
-        meta = dict(merge_meta(act, quant, extra=(
+        extra_meta = [
             ("fused_from", (act.family, "quantize")),
             ("primary_output", "payload"),
-            ("fused_kernel", "npu_swiglu_mx_quant"),
-            ("row_program", {"aiv_units": SWIGLU_MX_AIV_UNITS,
-                             "group_size": SWIGLU_MX_GROUP,
-                             "stages": SWIGLU_MX_STAGES}),
-        )))
+            ("fused_kernel", fused_kernel),
+        ]
+        if row_program is not None:
+            extra_meta.append(("row_program", row_program))
+        meta = dict(merge_meta(act, quant, extra=tuple(extra_meta)))
         append_audit(
             meta, kind="transform_boundary", op_id=quant.op_id,
             boundary={

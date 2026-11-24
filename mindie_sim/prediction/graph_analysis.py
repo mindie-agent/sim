@@ -1029,26 +1029,28 @@ def _make_fast_layer_observer(
     track_op_ids: Sequence[str] | set[str] | frozenset[str] = (),
 ) -> tuple[
     Callable[..., None],
-    dict[Any, list[tuple[int, Any, Any]]],
-    list[tuple[Any, Any]],
-    dict[str, tuple[Any, Any]],
+    dict[int, dict[Any, list[tuple[int, Any, Any]]]],
+    dict[int, list[tuple[Any, Any]]],
+    dict[tuple[int, str], tuple[Any, Any]],
 ]:
-    events_by_layer: dict[Any, list[tuple[int, Any, Any]]] = {}
-    non_body_events: list[tuple[Any, Any]] = []
+    events_by_replica: dict[int, dict[Any, list[tuple[int, Any, Any]]]] = {}
+    non_body_by_replica: dict[int, list[tuple[Any, Any]]] = {}
     tracked = frozenset(track_op_ids) if track_op_ids else frozenset()
-    tracked_events: dict[str, tuple[Any, Any]] = {}
+    tracked_by_replica: dict[tuple[int, str], tuple[Any, Any]] = {}
 
     def _observe(op, replica, _program, ready, complete):
-        if replica == 0:
-            key = body_key_by_op.get(op.op_id)
-            if key is not None:
-                events_by_layer.setdefault(key, []).append((int(op.stage), ready, complete))
-            else:
-                non_body_events.append((ready, complete))
-            if tracked and op.op_id in tracked:
-                tracked_events[op.op_id] = (ready, complete)
+        rep_i = int(replica)
+        key = body_key_by_op.get(op.op_id)
+        if key is not None:
+            events_by_replica.setdefault(rep_i, {}).setdefault(key, []).append(
+                (int(op.stage), ready, complete),
+            )
+        else:
+            non_body_by_replica.setdefault(rep_i, []).append((ready, complete))
+        if tracked and op.op_id in tracked:
+            tracked_by_replica[(rep_i, op.op_id)] = (ready, complete)
 
-    return _observe, events_by_layer, non_body_events, tracked_events
+    return _observe, events_by_replica, non_body_by_replica, tracked_by_replica
 
 
 def _l2_residency_digest(engine) -> str:
@@ -1057,12 +1059,253 @@ def _l2_residency_digest(engine) -> str:
     return str(fn()) if callable(fn) else ""
 
 
+def _replica_l2_digest(engine, die_ids: Sequence[int]) -> str:
+    view = getattr(engine, "admission_memory_view", None)
+    fn = getattr(view, "residency_fingerprint", None)
+    if not callable(fn):
+        return ""
+    if not die_ids:
+        return str(fn())
+    return "|".join(f"{int(d)}:{fn(int(d))}" for d in sorted(set(die_ids)))
+
+
+def _capture_engine_snapshot(engine, execution=None) -> dict[str, Any]:
+    return {
+        "l2_fp": _l2_residency_digest(engine),
+        "serviced": dict(engine.serviced),
+        "busy_ms": dict(engine.busy_ms),
+        "completed_tasks": int(getattr(engine, "completed_count", 0) or 0),
+        "work": dict(getattr(execution, "work", {}) or {}) if execution is not None else {},
+        "recipes": dict(getattr(execution, "recipes_used", {}) or {}) if execution is not None else {},
+    }
+
+
+def _finalize_cohort_layer_deltas(
+    execution,
+    engine,
+    cohort_probe_order: Sequence[tuple[Any, Any | None]],
+    replica_snaps: Mapping[tuple[int, Any], Mapping[str, Any]],
+    global_snaps: Mapping[Any, Mapping[str, Any]],
+    initial_snap: Mapping[str, Any],
+    observed_reps: Sequence[int],
+    *,
+    fast_span_only: bool,
+) -> dict[Any, dict[str, Any]]:
+    """Build per-representative-layer L2 invariance and work deltas from boundary probes."""
+    if not cohort_probe_order:
+        return {}
+    dedup_meta = getattr(execution, "_dedup_cohorts", None) or ()
+    deltas: dict[Any, dict[str, Any]] = {}
+    eps = 1e-9
+    for rep_key, prev_key in cohort_probe_order:
+        if prev_key is None:
+            continue
+        rep_present = [r for r in observed_reps if (r, rep_key) in replica_snaps and (r, prev_key) in replica_snaps]
+        if not rep_present:
+            continue
+        prev_times = [float(replica_snaps[(r, prev_key)]["now"]) for r in rep_present]
+        rep_times = [float(replica_snaps[(r, rep_key)]["now"]) for r in rep_present]
+        aligned = (
+            len(rep_present) <= 1
+            or (
+                (max(prev_times) - min(prev_times)) <= eps
+                and (max(rep_times) - min(rep_times)) <= eps
+            )
+        )
+        after_g = global_snaps.get(rep_key)
+        before_g = global_snaps.get(prev_key)
+        if aligned and after_g is not None and before_g is not None:
+            fp_before = str(before_g["l2_fp"])
+            fp_after = str(after_g["l2_fp"])
+            l2_steady = bool(fp_before) and fp_before == fp_after
+        else:
+            per_rep_ok = all(
+                bool(replica_snaps[(r, prev_key)]["die_l2_fp"])
+                and replica_snaps[(r, prev_key)]["die_l2_fp"] == replica_snaps[(r, rep_key)]["die_l2_fp"]
+                for r in rep_present
+            )
+            fp_before = "|".join(str(replica_snaps[(r, prev_key)]["die_l2_fp"]) for r in rep_present)
+            fp_after = "|".join(str(replica_snaps[(r, rep_key)]["die_l2_fp"]) for r in rep_present)
+            l2_steady = bool(per_rep_ok)
+        serviced_delta: dict[str, float] = {}
+        busy_delta: dict[str, float] = {}
+        work_delta: dict[str, float] = {}
+        recipes_delta: dict[str, int] = {}
+        completed_delta = 0
+        if aligned and after_g is not None and before_g is not None:
+            serviced_delta = {
+                k: float(after_g["serviced"][k]) - float(before_g["serviced"].get(k, 0.0))
+                for k in after_g["serviced"]
+                if float(after_g["serviced"][k]) != float(before_g["serviced"].get(k, 0.0))
+            }
+            busy_delta = {
+                k: float(after_g["busy_ms"][k]) - float(before_g["busy_ms"].get(k, 0.0))
+                for k in after_g["busy_ms"]
+                if float(after_g["busy_ms"][k]) != float(before_g["busy_ms"].get(k, 0.0))
+            }
+            work_delta = {
+                k: float(after_g["work"][k]) - float(before_g["work"].get(k, 0.0))
+                for k in after_g["work"]
+                if float(after_g["work"][k]) != float(before_g["work"].get(k, 0.0))
+            }
+            recipes_delta = {
+                k: int(after_g["recipes"][k]) - int(before_g["recipes"].get(k, 0))
+                for k in after_g["recipes"]
+                if int(after_g["recipes"][k]) != int(before_g["recipes"].get(k, 0))
+            }
+            completed_delta = int(after_g["completed_tasks"]) - int(before_g["completed_tasks"])
+            if not fast_span_only and dedup_meta:
+                from types import SimpleNamespace
+                from .runtime.dp_cohort_dedup import _mirror_replica_resources
+                pp = max(1, int(execution.case.runtime.parallel.pp))
+                proxy = SimpleNamespace(
+                    serviced={k: float(serviced_delta.get(k, 0.0)) for k in engine.serviced},
+                    busy_ms={k: float(busy_delta.get(k, 0.0)) for k in engine.busy_ms},
+                    resources=engine.resources,
+                )
+                for entry in dedup_meta:
+                    _mirror_replica_resources(
+                        proxy, execution.topology, entry["canonical"], entry["peers"], pp,
+                        mirror_links=entry["mirror_links"],
+                    )
+                serviced_delta = {k: v for k, v in proxy.serviced.items() if v}
+                busy_delta = {k: v for k, v in proxy.busy_ms.items() if v}
+        deltas[rep_key] = {
+            "prev_key": prev_key,
+            "fp_before": fp_before,
+            "fp_after": fp_after,
+            "l2_steady": l2_steady,
+            "aligned": aligned,
+            "serviced": serviced_delta,
+            "busy_ms": busy_delta,
+            "work": work_delta,
+            "recipes": recipes_delta,
+            "completed_tasks": completed_delta,
+        }
+    return deltas
+
+
+def _build_cohort_probe_observer(
+    base_observer: Callable[..., None] | None,
+    body_id_map: Mapping[str, Any],
+    cohort_probe_order: Sequence[tuple[Any, Any | None]],
+) -> tuple[Callable[..., None], list[Any], dict[tuple[int, Any], dict[str, Any]], dict[Any, dict[str, Any]]]:
+    """Wrap ``on_operator`` to snapshot L2 & work counters at exact layer exit boundaries."""
+    probe_keys = {k for pair in cohort_probe_order for k in pair if k is not None}
+    ctx_ref: list[Any] = [None, None]
+    pending_rep: dict[tuple[int, Any], int] = {}
+    pending_global: dict[Any, int] = {}
+    replica_die_ids: dict[int, set[int]] = {}
+    replica_snaps: dict[tuple[int, Any], dict[str, Any]] = {}
+    global_snaps: dict[Any, dict[str, Any]] = {}
+
+    def _on_op(op, replica, program, ready, complete):
+        if base_observer is not None:
+            base_observer(op, replica, program, ready, complete)
+        lk = body_id_map.get(op.op_id)
+        if lk not in probe_keys:
+            return
+        execution, engine = ctx_ref[0], ctx_ref[1]
+        if engine is None:
+            return
+        rep_i = int(replica)
+        die_set = replica_die_ids.setdefault(rep_i, set())
+        if execution is not None and hasattr(execution, "topology"):
+            die_set.update(int(d) for d in execution.topology.ranks(rep_i, int(op.stage)))
+        rk = (rep_i, lk)
+        pending_rep[rk] = pending_rep.get(rk, 0) + 1
+        pending_global[lk] = pending_global.get(lk, 0) + 1
+
+        def _on_done(_ev, _rep_i=rep_i, _lk=lk, _rk=rk):
+            pending_rep[_rk] -= 1
+            if pending_rep[_rk] == 0:
+                replica_snaps[_rk] = {
+                    "now": float(engine.now),
+                    "die_l2_fp": _replica_l2_digest(engine, tuple(replica_die_ids.get(_rep_i, ()))),
+                }
+            pending_global[_lk] -= 1
+            if pending_global[_lk] == 0:
+                global_snaps[_lk] = _capture_engine_snapshot(engine, execution)
+
+        engine.on_complete(complete, _on_done, native_hook=True)
+
+    return _on_op, ctx_ref, replica_snaps, global_snaps
+
+
+def _finalize_run_graph_artifacts(
+    case, execution, engine, records, graphs, *, fast_span_only, timeline_replicas,
+    cp_spans, non_observed_peer_events, group_for, replica_observer,
+    layer_events_by_replica, non_body_by_replica,
+    cohort_probe_order, replica_snaps, global_snaps, initial_snap,
+    cohort_layer_deltas_out, filtered_non_barrier,
+):
+    skipped_occurrences = filtered_non_barrier
+    dedup_cohorts = getattr(execution, "_dedup_cohorts", None)
+    if not fast_span_only and dedup_cohorts:
+        from .runtime.dp_cohort_dedup import expand_dedup_graph_artifacts
+        skipped_occurrences += expand_dedup_graph_artifacts(
+            execution, records, graphs, timeline_replicas=timeline_replicas,
+        )
+    if dedup_cohorts and layer_events_by_replica is not None:
+        for entry in dedup_cohorts:
+            r0 = int(entry["canonical"])
+            r0_layers = layer_events_by_replica.get(r0)
+            r0_nb = non_body_by_replica.get(r0) if non_body_by_replica is not None else None
+            for peer in entry["peers"]:
+                peer_i = int(peer)
+                if r0_layers is not None and peer_i not in layer_events_by_replica:
+                    layer_events_by_replica[peer_i] = r0_layers
+                if non_body_by_replica is not None and r0_nb is not None and peer_i not in non_body_by_replica:
+                    non_body_by_replica[peer_i] = r0_nb
+    if cohort_probe_order and cohort_layer_deltas_out is not None:
+        obs_reps = sorted({r for r, _ in replica_snaps})
+        cohort_layer_deltas_out.update(_finalize_cohort_layer_deltas(
+            execution, engine, cohort_probe_order, replica_snaps, global_snaps,
+            initial_snap, obs_reps, fast_span_only=fast_span_only,
+        ))
+    if non_observed_peer_events and group_for is not None:
+        from .topology import Topology
+        topology = Topology(case.machine, case.runtime.parallel) if cp_spans else None
+        for op, replica, ready, axis in non_observed_peer_events:
+            meta = dict(op.metadata) if op.metadata else {}
+            if axis == "ep":
+                grp = group_for[replica]
+            elif axis == "local_tp":
+                grp = tuple(meta.get("group_ranks") or group_for[replica])
+            else:
+                grp = _dcp_replica_subgroup(topology, axis, replica, op.stage, meta, group_for[replica])
+            replica_observer.record_peer_readiness((grp, op.op_id), replica, ready.time)
+    return skipped_occurrences
+
+
+def _submit_graph_steps(execution, works, groups, input_ready_ms, inputs):
+    steps = {}
+    if len(works) > 1 and len(groups) > 1:
+        from .runtime.dp_cohort_dedup import is_symmetric_dp_cohort
+        if is_symmetric_dp_cohort(execution, works, external_inputs=inputs):
+            steps.update(execution.add_group(works, input_ready_ms, external_inputs=inputs))
+    if not steps:
+        for group in groups:
+            selected = {r: works[r] for r in group if r in works}
+            if len(selected) > 1:
+                steps.update(execution.add_group(selected, input_ready_ms, external_inputs=inputs))
+            elif selected:
+                r, work = next(iter(selected.items()))
+                steps[r] = execution.add(work, r, input_ready_ms, external_inputs=inputs[r])
+    return steps
+
+
 def _run_graph(
     case, ops, graphs, scopes, groups, ctx, book, external, input_ready_ms, *,
     include_submission, trace_limit, fast_span_only, stream_plans, request_views,
     padded_tokens, sequence_layout, timeline_replicas=None, compact=False,
     isolated=False, group_for=None, fast_observer=None,
     l2_fingerprints: dict[str, str] | None = None,
+    cohort_probe_order: Sequence[tuple[Any, Any | None]] = (),
+    body_id_map: Mapping[str, Any] | None = None,
+    layer_events_by_replica: dict[int, dict[Any, list[tuple[int, Any, Any]]]] | None = None,
+    non_body_by_replica: dict[int, list[tuple[Any, Any]]] | None = None,
+    cohort_layer_deltas_out: dict[Any, dict[str, Any]] | None = None,
 ):
     from .runtime.exposed_observer import ExposedObserver
 
@@ -1095,8 +1338,6 @@ def _run_graph(
                 axis = meta.get("group_axis")
                 if axis in cross_dp_axes:
                     if isolated:
-                        # Isolated joint-collective pricing needs peer descriptors;
-                        # keep only cross-DP collective records when isolated=True.
                         key = _name(replica, op.op_id)
                         records.append({
                             "id": key, "op": op, "replica": replica, "program": program,
@@ -1126,26 +1367,41 @@ def _run_graph(
         stream_plans = validate_stream_plan_ranks(stream_plans, set(graphs))
     from .efficiency.cost import CostLedger
     from .implementation_selection import graph_selections
-    cost = ctx.cost
     op_count = (sum(len(group) for group in ops.values())
                 if isinstance(ops, Mapping) else len(ops))
-    execution = Execution(case, cost, recipes=book, bindings=ctx.bindings,
+    if fast_span_only:
+        on_op = fast_observer
+    elif fast_observer is not None:
+        def on_op(op, replica, program, ready, complete):
+            fast_observer(op, replica, program, ready, complete)
+            observe(op, replica, program, ready, complete)
+    else:
+        on_op = observe
+    probe_ctx_ref: list[Any] | None = None
+    replica_snaps: dict[tuple[int, Any], dict[str, Any]] = {}
+    global_snaps: dict[Any, dict[str, Any]] = {}
+    if cohort_probe_order and body_id_map is not None:
+        on_op, probe_ctx_ref, replica_snaps, global_snaps = _build_cohort_probe_observer(
+            on_op, body_id_map, cohort_probe_order,
+        )
+    execution = Execution(case, ctx.cost, recipes=book, bindings=ctx.bindings,
                           ledger=CostLedger(), include_submission=include_submission,
-                          on_operator=(fast_observer if fast_span_only else observe),
+                          on_operator=on_op,
                           trace_limit=trace_limit, evaluation=ctx,
                           accel_eager_attach=op_count >= EAGER_GRAPH_MIN_OPS,
                           stream_plans=stream_plans)
-    # Physical-work coalescing is exact; only an explicit legacy diagnostic run
-    # keeps the uncoalesced per-tile shape.
     execution._compact_step = not execution.legacy_diagnostics
     execution.engine._compact_step = execution._compact_step
     execution._fast_span_only = bool(fast_span_only)
     views_source = request_views if request_views is not None else getattr(ops, "request_views", None)
     eff_padded = int(padded_tokens or getattr(ops, "padded_tokens", 0) or 0)
-    eff_layout = str(sequence_layout or getattr(ops, "sequence_layout", "") or "")
     execution._active_padded_tokens = eff_padded
-    execution._active_layout = eff_layout
+    execution._active_layout = str(sequence_layout or getattr(ops, "sequence_layout", "") or "")
     engine = execution.engine
+    if probe_ctx_ref is not None:
+        probe_ctx_ref[0] = execution
+        probe_ctx_ref[1] = engine
+    initial_snap = _capture_engine_snapshot(engine, execution) if cohort_probe_order else {}
     if l2_fingerprints is not None:
         l2_fingerprints["before"] = _l2_residency_digest(engine)
     engine.now = input_ready_ms
@@ -1157,9 +1413,7 @@ def _run_graph(
     def _views_for(replica: int) -> tuple:
         if isinstance(views_source, Mapping):
             return tuple(views_source.get(replica, ()))
-        if views_source:
-            return tuple(views_source)
-        return ()
+        return tuple(views_source) if views_source else ()
 
     works = {r: IterationWork(
         items, IterationPlan(_views_for(r)), case.runtime.parallel.pp,
@@ -1169,41 +1423,23 @@ def _run_graph(
         "graph", "declared_graph", replay_scope=scopes[r],
         implementation_selections=graph_selections(items),
     ) for r, items in graphs.items()}
-    steps = {}
-    if len(works) > 1 and len(groups) > 1:
-        from .runtime.dp_cohort_dedup import is_symmetric_dp_cohort
-        if is_symmetric_dp_cohort(execution, works, external_inputs=inputs):
-            steps.update(execution.add_group(works, input_ready_ms, external_inputs=inputs))
-    if not steps:
-        for group in groups:
-            selected = {r: works[r] for r in group if r in works}
-            if len(selected) > 1:
-                steps.update(execution.add_group(selected, input_ready_ms, external_inputs=inputs))
-            elif selected:
-                r, work = next(iter(selected.items()))
-                steps[r] = execution.add(work, r, input_ready_ms, external_inputs=inputs[r])
+    steps = _submit_graph_steps(execution, works, groups, input_ready_ms, inputs)
     unique_completions = tuple(dict.fromkeys(step.completion for step in steps.values()))
     engine.advance(until=unique_completions, first=False)
     if l2_fingerprints is not None:
         l2_fingerprints["after"] = _l2_residency_digest(engine)
-    skipped_occurrences = filtered_non_barrier
-    if not fast_span_only and getattr(execution, "_dedup_cohorts", None):
-        from .runtime.dp_cohort_dedup import expand_dedup_graph_artifacts
-        skipped_occurrences += expand_dedup_graph_artifacts(
-            execution, records, graphs, timeline_replicas=timeline_replicas,
-        )
-    if non_observed_peer_events and group_for is not None:
-        from .topology import Topology
-        topology = Topology(case.machine, case.runtime.parallel) if cp_spans else None
-        for op, replica, ready, axis in non_observed_peer_events:
-            meta = dict(op.metadata) if op.metadata else {}
-            if axis == "ep":
-                grp = group_for[replica]
-            elif axis == "local_tp":
-                grp = tuple(meta.get("group_ranks") or group_for[replica])
-            else:
-                grp = _dcp_replica_subgroup(topology, axis, replica, op.stage, meta, group_for[replica])
-            replica_observer.record_peer_readiness((grp, op.op_id), replica, ready.time)
+    skipped_occurrences = _finalize_run_graph_artifacts(
+        case, execution, engine, records, graphs, fast_span_only=fast_span_only,
+        timeline_replicas=timeline_replicas, cp_spans=cp_spans,
+        non_observed_peer_events=non_observed_peer_events, group_for=group_for,
+        replica_observer=replica_observer,
+        layer_events_by_replica=layer_events_by_replica,
+        non_body_by_replica=non_body_by_replica,
+        cohort_probe_order=cohort_probe_order, replica_snaps=replica_snaps,
+        global_snaps=global_snaps, initial_snap=initial_snap,
+        cohort_layer_deltas_out=cohort_layer_deltas_out,
+        filtered_non_barrier=filtered_non_barrier,
+    )
     return execution, engine, records, steps, stream_plans, skipped_occurrences, replica_observer
 
 
@@ -1660,6 +1896,91 @@ def _assemble_graph_result(
     return result
 
 
+def _build_fast_span_result(
+    case, execution, engine, graphs, replay_scope, *,
+    include_submission, input_ready_ms, end, duration,
+    replica_bounds_map, replica_non_body_map, replica_complete_map,
+    tracked_by_rep, l2_fingerprints, cohort_layer_deltas,
+):
+    summary = execution.summary()
+    out_fast = {
+        "schema": "mindie-sim.graph/1", **model_coverage(case.model),
+        "boundary": ("submitted_device_graph" if include_submission else "device_graph"),
+        "input_ready_ms": input_ready_ms, "complete_ms": end,
+        "duration_ms": duration, "replicas": list(graphs),
+        "replay_scope": replay_scope,
+        "operator_occurrences": 0, "resources": [],
+        "execution": summary,
+        "engine_backend": summary.get("accel_backend"),
+        "accel_status": accel_status(engine.accel_status()),
+        "fast_span_only": True,
+    }
+    if replica_bounds_map is not None:
+        r0 = min(replica_bounds_map, default=0)
+        out_fast["layer_bounds"] = replica_bounds_map.get(r0, {})
+        out_fast["replica_layer_bounds"] = replica_bounds_map
+        out_fast["non_body_bounds"] = (replica_non_body_map or {}).get(r0, [])
+        out_fast["replica_non_body_bounds"] = replica_non_body_map or {}
+        out_fast["replica_complete_ms"] = replica_complete_map
+        if tracked_by_rep:
+            out_fast["tracked_op_elapsed_ms"] = {
+                oid: float(c.time) - float(r.time)
+                for (rep_i, oid), (r, c) in tracked_by_rep.items()
+                if rep_i == r0
+            }
+            out_fast["replica_tracked_op_elapsed_ms"] = {
+                (rep_i, oid): float(c.time) - float(r.time)
+                for (rep_i, oid), (r, c) in tracked_by_rep.items()
+            }
+    if l2_fingerprints is not None:
+        out_fast["l2_residency_fingerprints"] = (
+            l2_fingerprints.get("before", ""),
+            l2_fingerprints.get("after", ""),
+        )
+    if cohort_layer_deltas:
+        out_fast["cohort_layer_deltas"] = cohort_layer_deltas
+    return out_fast
+
+
+def _attach_cohort_graph_metadata(
+    assembled, graphs, records, execution, body_id_map,
+    l2_fingerprints, replica_bounds_map, replica_non_body_map,
+    replica_complete_map, cohort_layer_deltas,
+):
+    if l2_fingerprints is not None:
+        assembled["l2_residency_fingerprints"] = (
+            l2_fingerprints.get("before", ""),
+            l2_fingerprints.get("after", ""),
+        )
+    if replica_bounds_map is not None:
+        assembled["replica_layer_bounds"] = replica_bounds_map
+        assembled["replica_non_body_bounds"] = replica_non_body_map or {}
+        assembled["replica_complete_ms"] = replica_complete_map
+    if not cohort_layer_deltas:
+        return assembled
+    observed_reps = {record["replica"] for record in records if not record.get("_peer_only")}
+    exposed_rep = min(graphs) if (not observed_reps or min(graphs) in observed_reps) else min(observed_reps)
+    stage_rates = _stage_role_rates(execution)
+    for rep_key, delta_info in cohort_layer_deltas.items():
+        rep_recs = [
+            rec for rec in records
+            if rec["replica"] == exposed_rep and not rec.get("_peer_only")
+            and body_id_map is not None and body_id_map.get(rec["op"].op_id) == rep_key
+        ]
+        if rep_recs:
+            r_lo = min(float(rec.get("collective_ready_ms", rec["ready"].time)) for rec in rep_recs)
+            r_hi = max(float(rec["complete"].time) for rec in rep_recs)
+            eb = _exposed_breakdown(
+                rep_recs, max(0.0, r_hi - r_lo), r_lo, exposed_rep,
+                stage_rates_by_key=stage_rates,
+            )
+            delta_info["exposed_breakdown_ms"] = dict(eb.get("exposed_breakdown_ms") or {})
+            delta_info["exposed_breakdown_basis"] = dict(eb.get("exposed_breakdown_basis") or {})
+            delta_info["exposed_available"] = bool((eb.get("exposed_breakdown_basis") or {}).get("available"))
+    assembled["cohort_layer_deltas"] = cohort_layer_deltas
+    return assembled
+
+
 def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=None,
                 input_ready_ms=0, include_submission=False, replay_scope=None,
                 isolated=True, trace_limit=0, compact=False,
@@ -1667,31 +1988,12 @@ def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=Non
                 fast_span_only=False, stream_plans=None,
                 request_views=None, padded_tokens=0, sequence_layout="",
                 timeline_replicas=None, layer_span_body_ids=None,
-                fast_track_op_ids=()):
-    """Run a declared DAG or replica->DAG mapping without a request scheduler.
-
-    External input keys are operator dependency names and values are absolute
-    virtual ready times, shared across selected replicas. A sequence selects
-    replica 0. Cross-DP expert collectives require their complete cohort mapping.
-
-    ``compact=True`` is additive: it omits the per-event ``timeline`` and
-    ``events`` lists and returns the same duration, operator events and
-    readiness/completion boundaries as bounded ``profile``/``event_profile``
-    reductions. No synthetic time histogram is built; each replica's declared
-    identity and source ready/complete boundaries are retained.
-
-    This is the generic execution-graph entry: sampling, token commit and
-    acceptance are ordinary declared nodes here. A pure-model business entry
-    excludes them by selecting an assembly scope, never by a family blacklist.
-    """
+                fast_track_op_ids=(), cohort_probe_order=()):
+    """Run a declared DAG or replica->DAG mapping without a request scheduler."""
     from .body_defaults import consume_target_declaration
     case = consume_target_declaration(parse_case(case), ops)
     if input_ready_ms < 0 or not math.isfinite(input_ready_ms):
         raise ValueError("graph_input_ready_time_must_be_finite_and_nonnegative")
-    # A cut dependency is a declared input, never an implicit body default.
-    # Callers that intentionally cut a body graph provide the boundary
-    # explicitly (efficiency/body entry points pass ``{"analysis_input": 0}``);
-    # an undeclared cut raises ``graph_dependency_unavailable`` below.
     external = {} if external_inputs is None else dict(external_inputs)
     if any(value < 0 or not math.isfinite(value) for value in external.values()):
         raise ValueError("graph_external_input_time_must_be_finite_and_nonnegative")
@@ -1707,15 +2009,17 @@ def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=Non
         frozenset(int(r) for r in timeline_replicas)
         if timeline_replicas is not None else None
     )
-    fast_observer, fast_layer_events, fast_non_body_events, fast_tracked_events = (
-        _make_fast_layer_observer(
-            layer_span_body_ids if isinstance(layer_span_body_ids, Mapping)
-            else {oid: ("target", -1) for oid in layer_span_body_ids},
-            track_op_ids=fast_track_op_ids,
-        )
-        if (fast_span_only and layer_span_body_ids) else (None, None, None, None)
+    body_id_map = (
+        (layer_span_body_ids if isinstance(layer_span_body_ids, Mapping)
+         else {oid: ("target", -1) for oid in layer_span_body_ids})
+        if layer_span_body_ids is not None else None
+    )
+    fast_observer, layer_events_by_rep, non_body_by_rep, tracked_by_rep = (
+        _make_fast_layer_observer(body_id_map, track_op_ids=fast_track_op_ids)
+        if body_id_map is not None else (None, None, None, None)
     )
     l2_fingerprints = {} if layer_span_body_ids is not None else None
+    cohort_layer_deltas: dict[Any, dict[str, Any]] = {}
     execution, engine, records, steps, stream_plans, skipped_occurrences, replica_observer = _run_graph(
         case, ops, graphs, scopes, groups, ctx, book, external, input_ready_ms,
         include_submission=include_submission, trace_limit=trace_limit,
@@ -1723,50 +2027,39 @@ def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=Non
         request_views=request_views, padded_tokens=padded_tokens, sequence_layout=sequence_layout,
         timeline_replicas=keep_replicas, compact=compact, isolated=isolated,
         group_for=group_for, fast_observer=fast_observer,
-        l2_fingerprints=l2_fingerprints)
+        l2_fingerprints=l2_fingerprints,
+        cohort_probe_order=cohort_probe_order,
+        body_id_map=body_id_map,
+        layer_events_by_replica=layer_events_by_rep,
+        non_body_by_replica=non_body_by_rep,
+        cohort_layer_deltas_out=cohort_layer_deltas)
     end = max((step.completion.time for step in steps.values()), default=input_ready_ms)
     duration = end - input_ready_ms
-    if fast_span_only:
-        # Same Engine, same declared work, same virtual timestamps: only the
-        # per-operator timeline and the isolated pricing pass are omitted.
-        summary = execution.summary()
-        out_fast = {
-            "schema": "mindie-sim.graph/1", **model_coverage(case.model),
-            "boundary": ("submitted_device_graph" if include_submission
-                         else "device_graph"),
-            "input_ready_ms": input_ready_ms, "complete_ms": end,
-            "duration_ms": duration, "replicas": list(graphs),
-            "replay_scope": replay_scope,
-            "operator_occurrences": 0, "resources": [],
-            "execution": summary,
-            "engine_backend": summary.get("accel_backend"),
-            "accel_status": accel_status(engine.accel_status()),
-            "fast_span_only": True,
-        }
-        if fast_layer_events is not None:
-            out_fast["layer_bounds"] = {
-                lyr: (
-                    evs[0][0],
-                    min(float(r.time) for _, r, _ in evs),
-                    max(float(c.time) for _, _, c in evs),
-                )
-                for lyr, evs in fast_layer_events.items() if evs
+    replica_bounds_map = (
+        {
+            rep_i: {
+                lyr: (evs[0][0], min(float(r.time) for _, r, _ in evs), max(float(c.time) for _, _, c in evs))
+                for lyr, evs in rep_map.items() if evs
             }
-            out_fast["non_body_bounds"] = [
-                (float(r.time), float(c.time))
-                for r, c in (fast_non_body_events or ())
-            ]
-            if fast_tracked_events:
-                out_fast["tracked_op_elapsed_ms"] = {
-                    oid: float(c.time) - float(r.time)
-                    for oid, (r, c) in fast_tracked_events.items()
-                }
-        if l2_fingerprints is not None:
-            out_fast["l2_residency_fingerprints"] = (
-                l2_fingerprints.get("before", ""),
-                l2_fingerprints.get("after", ""),
-            )
-        return out_fast
+            for rep_i, rep_map in layer_events_by_rep.items()
+        }
+        if layer_events_by_rep is not None else None
+    )
+    replica_non_body_map = (
+        {rep_i: [(float(r.time), float(c.time)) for r, c in evs]
+         for rep_i, evs in non_body_by_rep.items()}
+        if non_body_by_rep is not None else None
+    )
+    replica_complete_map = {int(r): float(step.completion.time) for r, step in steps.items()}
+    if fast_span_only:
+        return _build_fast_span_result(
+            case, execution, engine, graphs, replay_scope,
+            include_submission=include_submission, input_ready_ms=input_ready_ms,
+            end=end, duration=duration, replica_bounds_map=replica_bounds_map,
+            replica_non_body_map=replica_non_body_map, replica_complete_map=replica_complete_map,
+            tracked_by_rep=tracked_by_rep, l2_fingerprints=l2_fingerprints,
+            cohort_layer_deltas=cohort_layer_deltas,
+        )
     joins = _bind_collective_readiness(case, records, group_for, execution, replica_observer=replica_observer)
     costs, durations, isolated_sum, cohort_cache = [], {}, 0.0, {}
     if isolated:
@@ -1776,8 +2069,7 @@ def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=Non
         [record for record in records if not record.get("_peer_only") and record["replica"] in keep_replicas]
         if (keep_replicas is not None and not compact) else records
     )
-    rows, profile = _graph_operator_rows(
-        row_records, duration, compact, isolated, durations, stream_plans)
+    rows, profile = _graph_operator_rows(row_records, duration, compact, isolated, durations, stream_plans)
     isolated_profile = None
     if compact and isolated:
         isolated_profile = _isolated_operator_profile(costs, isolated_sum)
@@ -1787,34 +2079,29 @@ def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=Non
         "capacity_per_ms": engine.resources[name].rate,
         "capacity_bound_ms": amount / engine.resources[name].rate,
         "busy_ms": engine.busy_ms[name],
-    } for name, amount in engine.serviced.items()
-        if amount and "stream_quota@" not in name]
+    } for name, amount in engine.serviced.items() if amount and "stream_quota@" not in name]
     resources.sort(key=lambda row: row["capacity_bound_ms"], reverse=True)
     accel_view = engine.accel_status()
     head = {
-        "schema": "mindie-sim.graph/1",
-        **model_coverage(case.model),
+        "schema": "mindie-sim.graph/1", **model_coverage(case.model),
         "engine_backend": accel_view.get("accel_backend"),
         "accel_status": accel_status(accel_view),
         "boundary": "submitted_device_graph" if include_submission else "device_graph",
         "input_ready_ms": input_ready_ms, "complete_ms": end, "duration_ms": duration,
-        "replicas": list(graphs), "replay_scope": replay_scope,
-        "replay_scope_by_replica": scopes,
+        "replicas": list(graphs), "replay_scope": replay_scope, "replay_scope_by_replica": scopes,
         "operator_occurrences": sum(
-            record["op"].family != "barrier" and not record.get("_peer_only")
-            for record in records) + skipped_occurrences,
+            record["op"].family != "barrier" and not record.get("_peer_only") for record in records
+        ) + skipped_occurrences,
     }
     assembled = _assemble_graph_result(
         case, graphs, records, steps, execution, engine, rows, profile,
         resources, head, compact=compact, isolated=isolated, costs=costs,
         isolated_sum=isolated_sum, isolated_profile=isolated_profile,
         cohort_cache=cohort_cache, external_times=external_times,
-        input_ready_ms=input_ready_ms, duration=duration,
-        audit_allocations=audit_allocations,
+        input_ready_ms=input_ready_ms, duration=duration, audit_allocations=audit_allocations,
     )
-    if l2_fingerprints is not None:
-        assembled["l2_residency_fingerprints"] = (
-            l2_fingerprints.get("before", ""),
-            l2_fingerprints.get("after", ""),
-        )
-    return assembled
+    return _attach_cohort_graph_metadata(
+        assembled, graphs, records, execution, body_id_map,
+        l2_fingerprints, replica_bounds_map, replica_non_body_map,
+        replica_complete_map, cohort_layer_deltas,
+    )

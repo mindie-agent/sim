@@ -28,7 +28,12 @@ REDUCTION_KINDS = frozenset({"rms_norm", "add_rms_norm", "rms_norm_quant",
 STATE_KINDS = frozenset({"state_update", "recurrent", "cache_write"})
 PARAM_ROLES = frozenset({"weight", "state", "parameter", "index"})
 STATE_ROLES = frozenset({"state"})
-LAYOUTS = frozenset({"contiguous", "nd", "nz", "strided", "view"})
+NATIVE_AXIS_LAYOUTS = frozenset({
+    "bnsd", "bsnd", "nbsd", "tnd", "tn", "bsh", "shd", "flat",
+    "pa_nz", "pa_bsnd", "pa_blk_bsnd", "pa_bbnd", "tnd/pa_bbnd",
+    "nchw", "nhwc",
+})
+LAYOUTS = frozenset({"contiguous", "nd", "nz", "strided", "view"}) | NATIVE_AXIS_LAYOUTS
 
 
 class FeasibilityError(ValueError):
