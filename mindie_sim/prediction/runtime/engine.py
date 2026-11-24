@@ -444,12 +444,9 @@ class _EnginePeriodicMixin:
                 start_before - cycle_dt, start_before,
             )
             if not svc_pat:
-                cycle_busy = (
-                    dict(per_cycle.busy_by_resource)
-                    if per_cycle is not None else dict(total.busy_by_resource)
-                )
-                svc_pat = tuple(
-                    (rname, 0.0, float(busy)) for rname, busy in cycle_busy.items() if busy > 0.0
+                raise NotImplementedError(
+                    "LEGACY_PURGED: deleted synthetic 0.0-offset waveform fallback; require "
+                    "non-empty proved cycle pattern from WaveRecorder before periodic skip (S6-W5-24)"
                 )
             wave_rec.on_period(
                 start_before, cycle_dt, cycle_count,

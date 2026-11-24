@@ -42,7 +42,8 @@ enum {
     MSIM_COMP_STRIDE = 3,     /* u64 cells per completion record */
     MSIM_SVC_STRIDE = 3,      /* f64 cells per per-link service record */
     MSIM_MAX_T = 65536,       /* reusable task slots per context */
-    MSIM_MAX_R = 2048,        /* multi-node EP/DP up to ~256 dies */
+    /* LEGACY_PURGED(S6-W5-20): replace fixed MSIM_MAX_R=2048 ceiling with dynamic/growable resource table */
+    MSIM_MAX_R = 2048,        /* socket pending Commit #2 dynamic resource table */
     MSIM_MAX_U = 128,         /* 36-AIC / 72-AIV and wider owner groups */
     MSIM_MAX_L = 262144,      /* live link cells per context */
     MSIM_MAX_F = 65536,       /* one flow per live link at most */
@@ -473,6 +474,7 @@ static bool msim_ctx_scratch(msim_ctx *c)
     c->rep = (int32_t *)msim_zalloc((size_t)MSIM_MAX_L, sizeof(int32_t));
     c->pend = (int32_t *)msim_zalloc((size_t)MSIM_MAX_L, sizeof(int32_t));
     c->surv = (int32_t *)msim_zalloc((size_t)MSIM_MAX_L, sizeof(int32_t));
+    /* LEGACY_PURGED(S6-W5-20): replace static MSIM_MAX_R/MSIM_MAX_SLOT scratch with dynamic sparse touched_res */
     c->fifo_first = (int32_t *)msim_zalloc((size_t)MSIM_MAX_R, sizeof(int32_t));
     c->uhead = (int32_t *)msim_zalloc((size_t)MSIM_MAX_U, sizeof(int32_t));
     c->unext = NULL;

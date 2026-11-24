@@ -86,39 +86,33 @@ _SCOPE_PRIORITY = {
     "node": 1,
     "cross_node": 2,
     "any": UNDECLARED_SCOPE_PRIORITY,
-    "undeclared": UNDECLARED_SCOPE_PRIORITY,
 }
 _ROUTABLE_EXPLICIT_SCOPES = frozenset({"package", "node", "cross_node", "any"})
 _NON_FABRIC_EXPLICIT_SCOPES = frozenset({"host", "device_local"})
 
 _PORT_SEMANTICS = {"per_port", "fully_connected", "mesh"}
-_CROSS_NODE_MARKERS = (
-    "inter_node", "inter_pod", "roce", "rdma", "scaleout", "scale_out",
-)
-_PACKAGE_MARKERS = ("intra_package", "package", "die_to_die")
-_NODE_MARKERS = ("intra_node", "intra_4p", "intra_8p", "node_mesh")
 
 
 def _link_text(link) -> str:
-    return (f"{getattr(link, 'channel', '')} {getattr(link, 'name', '')}"
-            .lower().replace("-", "_"))
+    del link
+    raise NotImplementedError(
+        "LEGACY_PURGED: deleted substring link-name guessing helper _link_text; "
+        "read explicit typed LinkSpec.scope (S5-045)"
+    )
 
 
 def _is_cross_node_link(link) -> bool:
     explicit = getattr(link, "scope", None)
     if explicit is not None:
         return str(explicit).strip().lower() == "cross_node"
-    text = _link_text(link)
-    return any(marker in text for marker in _CROSS_NODE_MARKERS)
+    raise NotImplementedError(
+        "LEGACY_PURGED: deleted substring link-name guessing; require explicit typed "
+        "LinkSpec.scope on every physical link (S5-045)"
+    )
 
 
 def _link_scope(link, channel_decl: Mapping | None = None) -> str:
-    """Resolve link scope from explicit ``link.scope`` or channel metadata.
-
-    Rejects unknown explicit scopes on either the link or its declared
-    ``transfer_channels`` entry; falls back to channel/name markers only when
-    neither declares ``scope``.
-    """
+    """Resolve link scope strictly from explicit ``link.scope`` or channel metadata."""
     explicit = getattr(link, "scope", None)
     if explicit is None and channel_decl is not None:
         explicit = channel_decl.get("scope")
@@ -127,14 +121,10 @@ def _link_scope(link, channel_decl: Mapping | None = None) -> str:
         if normalized in _ROUTABLE_EXPLICIT_SCOPES or normalized in _NON_FABRIC_EXPLICIT_SCOPES:
             return normalized
         raise ModelingError(f"link_scope_unknown:{getattr(link, 'name', '')}:{explicit}")
-    text = _link_text(link)
-    if any(marker in text for marker in _CROSS_NODE_MARKERS):
-        return "cross_node"
-    if any(marker in text for marker in _PACKAGE_MARKERS):
-        return "package"
-    if any(marker in text for marker in _NODE_MARKERS):
-        return "node"
-    return "undeclared"
+    raise NotImplementedError(
+        "LEGACY_PURGED: deleted substring link-name guessing and 'undeclared' pass-through; "
+        "require explicit typed LinkSpec.scope (S5-045)"
+    )
 
 
 @dataclass(frozen=True)
@@ -228,7 +218,12 @@ class Topology(_TopologyPlansMixin):
             for name, link in self.links.items()
         }
         if self._p18_link_bytes_per_ms > 0.0:
-            p18_scope = self._p18_measured_scope or ("package" if self._dies_per_package >= 2 else "node")
+            if not self._p18_measured_scope:
+                raise NotImplementedError(
+                    "LEGACY_PURGED: deleted covert _dies_per_package >= 2 P18 scope fingerprint; "
+                    "bind P18 scope explicitly from Hardware/PrimitiveTable (S5-044)"
+                )
+            p18_scope = self._p18_measured_scope
             for name, link in list(self.links.items()):
                 if (
                     self._link_scope.get(name) == p18_scope
@@ -493,15 +488,12 @@ class Topology(_TopologyPlansMixin):
         return bool(self._matches_p18_scope(group))
 
     def single_peer_flow_cap_bytes_per_ms(self, link_name: str) -> float | None:
-        """Per-die SDMA rate cap on A3 switched HCCS_SW links without mutating link capacity."""
-        if self._p18_link_bytes_per_ms <= 0.0 or self._dies_per_package < 2:
-            return None
-        if self._link_scope.get(link_name) != "node":
-            return None
-        link = self.links.get(link_name)
-        if link is None or link.capacity_bytes_per_ms <= self._p18_link_bytes_per_ms:
-            return None
-        return float(self._p18_link_bytes_per_ms)
+        """Per-die SDMA rate cap bound explicitly from Hardware/PrimitiveTable declarations."""
+        del link_name
+        raise NotImplementedError(
+            "LEGACY_PURGED: deleted covert _dies_per_package >= 2 per-peer flow cap; "
+            "bind per-peer flow ceilings explicitly from Hardware/PrimitiveTable (S5-044)"
+        )
 
     def link_protocol_bands(self, link_name: str):
         """Return piecewise ``CollectiveBandSpec``s declared on link or channel."""
@@ -564,12 +556,9 @@ class Topology(_TopologyPlansMixin):
         if family not in DIRECT_MESH_FAMILIES or "peer_traffic" in metadata:
             return family, ()
         axis = metadata.get("group_axis", "tp")
-        try:
-            stage = int(metadata.get("source_stage", op.stage))
-        except (TypeError, ValueError):
-            return family, ()
+        stage = int(metadata.get("source_stage", op.stage))
         if not 0 <= stage < self.parallel.pp:
-            return family, ()
+            raise ModelingError(f"direct_mesh_source_stage_out_of_range:{stage}:pp={self.parallel.pp}")
         phases = DIRECT_MESH_PHASES[family]
         local = set(self.ranks(replica, stage))
         groups = tuple(self.groups(axis, replica, stage, metadata=metadata))
@@ -590,10 +579,7 @@ class Topology(_TopologyPlansMixin):
                 for destination in ranks:
                     if source == destination:
                         continue
-                    try:
-                        path = self.route(source, destination)
-                    except ValueError:
-                        return family, ()
+                    path = self.route(source, destination)
                     if len(path) != 1:
                         return family, ()
                     if self.links[path[0][0]].semantics != "per_pair":
@@ -833,7 +819,7 @@ class Topology(_TopologyPlansMixin):
             return self._same_node(left, right)
         if scope == "cross_node":
             return not self._same_node(left, right)
-        if scope in {"any", "undeclared"}:
+        if scope == "any":
             return True
         if scope in _NON_FABRIC_EXPLICIT_SCOPES:
             return False
@@ -867,7 +853,9 @@ class Topology(_TopologyPlansMixin):
                 self.machine, p, stage=stage, width=width, stride=stride)
             selected = tuple(group for group in all_groups
                              if any(rank in sources for rank in group))
-            return selected or all_groups
+            if not selected:
+                raise ModelingError(f"local_tp_group_unmatched:replica={replica}:stage={stage}")
+            return selected
         if axis in {"cp", "dcp"}:
             pcp_w = int(declared.get("dcp_pcp_factor") or p.dcp_pcp_factor)
             tp_w = int(declared.get("dcp_tp_gather") or p.dcp_tp_gather)
@@ -1034,7 +1022,14 @@ class Topology(_TopologyPlansMixin):
         if not volume:
             return
         if family == "pp_p2p" or axis == "pp":
-            stage = int(metadata.get("destination_stage", min(op.stage + 1, p.pp - 1)))
+            if "destination_stage" in metadata:
+                stage = int(metadata["destination_stage"])
+            else:
+                stage = int(op.stage) + 1
+            if not 0 <= stage < p.pp or stage == int(op.stage):
+                raise ModelingError(
+                    f"pp_p2p_invalid_terminal_stage:source={op.stage}:dest={stage}:pp={p.pp}"
+                )
             for source, destination in zip(sources, self.ranks(replica, stage)):
                 if source != destination:
                     yield MessageFlow(source, destination, volume), 1

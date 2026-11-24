@@ -49,7 +49,6 @@ AUTO_MIN_TASKS = 64
 AUTO_GRAPH_MIN_TASKS = 16
 #: Bounded prepared-stage compatibility memo and ``auto`` overhead guards.
 _PREP_CACHE_MAX = 2048
-_AUTO_LARGE_RES_LIMIT = 1024
 _AUTO_CHURN_MIN_CALLS = 512
 _AUTO_CHURN_MIN_RESOURCES = 64
 _AUTO_CHURN_MIN_STEPS_PER_CALL = 4
@@ -77,31 +76,6 @@ _TRANSIENT_C_REASONS = frozenset({"alloc_boundary"})
 EPOCH_ENABLED = os.environ.get("MINDIE_SIM_ACCEL_EPOCH", "1") != "0"
 
 
-def _coupled_explicit_placement_proportional(engine, task) -> bool:
-    """True when explicitly placed multi-unit resources on a coupled task match width ratios.
-
-    Unplaced multi-unit resources (e.g. a shared die HBM bus ``memory@r0:s0``
-    with ``placement=None``) span all declared units identically in both
-    Python ``coupled.py`` and C11 ``rates_coupled``.
-    """
-    if not (task.coupled and task.placement and len(task.remaining) > 1):
-        return True
-    first_u = first_tot = 0
-    for name in task.remaining:
-        units = task.placement.get(name)
-        if units is None:
-            continue
-        res_obj = engine.resources[name]
-        if res_obj.units <= 1:
-            continue
-        u_len = len(units)
-        if first_tot == 0:
-            first_u, first_tot = u_len, res_obj.units
-        elif u_len * first_tot != first_u * res_obj.units:
-            return False
-    return True
-
-
 def _remaining_shapes_valid(engine, task) -> bool:
     """Validate remaining work, caps and unit placements for C11 mirroring."""
     resources = engine.resources
@@ -124,7 +98,13 @@ def _remaining_shapes_valid(engine, task) -> bool:
             return False
         if any(type(unit) is not int or unit < 0 or unit >= limit for unit in units):
             return False
-    return _coupled_explicit_placement_proportional(engine, task)
+    if task.coupled and task.placement and len(task.remaining) > 1:
+        raise NotImplementedError(
+            "LEGACY_PURGED: deleted divergent _coupled_explicit_placement_proportional; "
+            "wire single canonical C11 eligibility predicate in accel_tables/accel_terms "
+            "treating units=None == all units (S6-W5-19)"
+        )
+    return True
 
 
 def _task_c11_compatible(
@@ -254,11 +234,6 @@ class NativeBackend:
             return True
         if self.mode == "auto" and engine._sequence < self.min_tasks:
             self.disabled_reason = "auto_tiny_workload"
-            return False
-        if self.mode == "auto" and len(engine.resources) > _AUTO_LARGE_RES_LIMIT:
-            self.disabled_reason = "auto_large_resource_table"
-            self.dormant = True
-            self.recoverable = False
             return False
         reuse_config = False
         if self.arena is None:

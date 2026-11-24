@@ -25,10 +25,8 @@ import dataclasses
 import os
 import re
 from typing import Any
-import weakref
 
 _ENV_TOGGLE = "MINDIE_SIM_DP_DEDUP"
-_ENGINES_REQUIRE_PEER_COLLECTIVES: weakref.WeakSet[Any] = weakref.WeakSet()
 _FALSE_TOKENS = frozenset({"0", "off", "false", "no"})
 _SYMMETRIC_LINK_SEMANTICS = frozenset({"per_pair", "per_port", "fully_connected", "mesh"})
 _PORT_SEMANTICS = frozenset({"per_port", "fully_connected", "mesh"})
@@ -447,15 +445,11 @@ def is_symmetric_dp_cohort(
     w0 = works[r0]
     if w0.mode != "graph":
         return False
-    requires_peer_collectives = _has_megamoe_cross_dp_group(w0.ops)
-    try:
-        if requires_peer_collectives:
-            _ENGINES_REQUIRE_PEER_COLLECTIVES.add(engine)
-        else:
-            _ENGINES_REQUIRE_PEER_COLLECTIVES.discard(engine)
-    except TypeError:
-        if requires_peer_collectives:
-            return False
+    if _has_megamoe_cross_dp_group(w0.ops):
+        raise NotImplementedError(
+            "LEGACY_PURGED: deleted module-global WeakSet _ENGINES_REQUIRE_PEER_COLLECTIVES "
+            "side-channel; return explicit typed cohort eligibility result object (S6-W5-29)"
+        )
     if _has_unsynced_peer_die_overlap(execution, w0, r0):
         return False
 
@@ -524,11 +518,6 @@ def is_symmetric_native_program(program: Any, peer_count: int) -> bool:
 
 def can_dedup_collective_to_canonical(topology: Any, engine: Any) -> bool:
     """True when all topology links are symmetric full-duplex port/directed-pair."""
-    try:
-        if engine in _ENGINES_REQUIRE_PEER_COLLECTIVES:
-            return False
-    except TypeError:
-        pass
     if getattr(topology, "_shared_switches", None):
         return False
     if getattr(topology, "_link_shared_ports", None):
@@ -621,7 +610,6 @@ def _mirror_replica_resources(
         for rep in (r0, *peers)
     }
     port_by_class: dict[tuple[str, str, int, float], tuple[float, float]] = {}
-    tx_by_class: dict[tuple[str, int, float], tuple[float, float]] = {}
     pair_by_class: dict[tuple[str, float], tuple[float, float]] = {}
     intra_pair_by_pos: dict[tuple[str, int, int, float], tuple[float, float]] = {}
     resources = engine.resources
@@ -641,8 +629,6 @@ def _mirror_replica_resources(
                 lclass = pfx.rsplit(":", 1)[0] if ":" in pfx else pfx
                 pair_val = (amt, busy.get(res_name, 0.0))
                 port_by_class[(lclass, direction, pos, rate_val)] = pair_val
-                if direction == "tx":
-                    tx_by_class[(lclass, pos, rate_val)] = pair_val
             continue
         m_pair = _PAIR_RE.match(res_name)
         if m_pair:
@@ -662,7 +648,7 @@ def _mirror_replica_resources(
         for rep, rk_list in all_ranks_by_rep.items()
         for pos, rk in enumerate(rk_list)
     }
-    if port_by_class or tx_by_class or pair_by_class or intra_pair_by_pos:
+    if port_by_class or pair_by_class or intra_pair_by_pos:
         for res_name in list(serviced):
             if "link:" not in res_name:
                 continue
@@ -678,8 +664,6 @@ def _mirror_replica_resources(
                     _, pos = info
                     lclass = pfx.rsplit(":", 1)[0] if ":" in pfx else pfx
                     val = port_by_class.get((lclass, direction, pos, rate_val))
-                    if val is None and direction == "rx":
-                        val = tx_by_class.get((lclass, pos, rate_val))
                     if val is not None:
                         serviced[res_name], busy[res_name] = val
                 continue

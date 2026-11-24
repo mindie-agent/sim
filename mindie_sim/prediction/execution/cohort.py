@@ -211,7 +211,9 @@ class _CohortMixin(_CohortNativeMixin):
                 out.append(item0)
                 continue
             wr = works[rep]
-            op_r = next((op for op in wr.ops if op.op_id == op_id), item0.context.op)
+            op_r = next((op for op in wr.ops if op.op_id == op_id), None)
+            if op_r is None:
+                raise ModelingError(f"cohort_peer_context_missing:{rep}:{op_id}")
             ctx_r = self._context(op_r, rep, wr.replay_scope)
             name_r = f"{self.namespace}r{rep}:i{wr.plan.iteration}:{op_r.op_id}"
             comp_r = self.engine.future(name_r + ":collective")
@@ -355,138 +357,12 @@ class _CohortMixin(_CohortNativeMixin):
         self, key, item0, prog0, peer_replicas, *, defer: bool = False,
     ) -> bool:
         """Launch canonical rank-0 MC2 program with full-cohort peer fan-out."""
-        source_stage = int(dict(item0.context.op.metadata).get(
-            "source_stage", item0.context.op.stage))
-        rank0 = self.participant_rank_index(item0.replica, source_stage)
-        if rank0 is None:
-            return False
-        inner = prog0.program
-        peer_count = int(getattr(inner, "peer_count", 0) or len(peer_replicas))
-        if peer_count <= 0 or not 0 <= rank0 < peer_count:
-            return False
-        res_names = self.native_resource_names(
-            item0.context, prog0, rank=rank0, replica=item0.replica)
-        transport = dict(self.native_transport(item0.context.op, item0.replica))
-        r0_ranks = tuple(self.topology.ranks(item0.replica, source_stage))
-        if r0_ranks and transport.get("destination_memory"):
-            r0_mems = tuple(
-                self.destination_window_resource(int(rk), source_stage)
-                for rk in r0_ranks
-            )
-            group_ranks = tuple(transport.get("group") or ())
-            if group_ranks and any(r0_mems):
-                transport["destination_memory"] = {
-                    int(rk): r0_mems[idx % len(r0_mems)]
-                    for idx, rk in enumerate(group_ranks)
-                }
-        bound = _bind_native_resource_view(prog0, res_names, self.engine)
-        source_view = getattr(bound.program, "view", None)
-        if source_view is None:
-            return False
-        labels = tuple(i for i in range(peer_count) if i != rank0)
-        node = int(getattr(self.case.machine, "ranks_per_node", 0))
-        frames_for = getattr(bound.program, "frames_for", None)
-        frames_raw = frames_for(rank0) if callable(frames_for) else getattr(source_view, "payload_frames", None)
-        if isinstance(frames_raw, _AbcMapping):
-            p_frames = tuple(sorted((int(p), int(f)) for p, f in frames_raw.items() if int(f) > 0))
-        elif frames_raw:
-            p_frames = tuple(sorted((int(x[0]), int(x[1])) for x in frames_raw if int(x[1]) > 0))
-        else:
-            p_frames = ()
-        basis_for = getattr(bound.program, "payload_basis_for", None)
-        p_basis = str(basis_for(rank0) if callable(basis_for)
-                      else getattr(source_view, "payload_basis", "unknown"))
-        local_for = getattr(bound.program, "local_frames_for", None)
-        p_local = int((local_for(rank0) if callable(local_for)
-                       else getattr(source_view, "payload_local_frames", 0)) or 0)
-        view = replace(
-            source_view,
-            rank=rank0, peer_labels=labels,
-            peer_classes=tuple(getattr(source_view, "peer_classes", ()) if source_view.rank == rank0 else ()),
-            peer_weights=tuple(getattr(source_view, "peer_weights", ()) if source_view.rank == rank0 else ()),
-            node_ranks=node,
-            intra_latency_ms=getattr(source_view, "intra_latency_ms", 0),
-            inter_latency_ms=getattr(source_view, "inter_latency_ms", 0),
-            resource_names=tuple(sorted((str(k), str(v)) for k, v in dict(res_names).items())),
-            payload_frames=p_frames,
-            payload_packet_bytes=int(getattr(source_view, "payload_packet_bytes", 0) or 0),
-            payload_basis=p_basis,
-            payload_local_frames=p_local,
+        del key, item0, prog0, peer_replicas, defer
+        raise NotImplementedError(
+            "LEGACY_PURGED: deleted reverse future aliasing (peer, rank0, pname)=ev_p, "
+            "forced pending-future resolution, and rank-0 destination-map cloning; preserve "
+            "true directed (src, dst) arrival events or run full cohort (S5-041, P-A10)"
         )
-        name0 = f"group:{key}:r{item0.replica}"
-        phase_names = tuple(p.name for p in getattr(bound.program, "phases", ()))
-
-        def _launch(_event=None):
-            placeholders = {}
-            owned_futures = []
-            for pname in phase_names:
-                for peer in range(peer_count):
-                    if peer == rank0:
-                        continue
-                    ev_p = self.engine.future(
-                        f"{name0}:sym_send:{rank0}->{peer}:{pname}")
-                    owned_futures.append(ev_p)
-                    placeholders[(rank0, peer, pname)] = ev_p
-                    placeholders[(peer, rank0, pname)] = ev_p
-            rank_eng = _RankEngine(self.engine, res_names)
-            finish, _handles = bound.start_with_handles(
-                rank_eng, name0, item0.ready,
-                launch=view, send_placeholders=placeholders, transport=transport,
-            )
-
-            def _complete_canonical(_e, promise=item0.completion, pending=tuple(owned_futures)):
-                for ev_p in pending:
-                    if not ev_p.done:
-                        self.engine.resolve(ev_p)
-                self.engine.resolve(promise)
-
-            self.engine.on_complete(finish, _complete_canonical, native_hook=True)
-
-        if defer:
-            self.engine.submit(
-                name0 + ":begin", after=(item0.ready,),
-                owner="expert_group", on_complete=_launch, native_hook=True,
-            )
-        else:
-            _launch()
-
-        payload, count = (bound.program.transport_account(transport)
-                          if hasattr(bound.program, "transport_account") else ({}, {}))
-        n_peers = len(peer_replicas)
-        phases_set = {p.name for p in getattr(bound.program, "phases", ())}
-        p_edges = int(payload.get("edges", 0)) * n_peers
-        c_edges = (int(count.get("edges", 0)) * n_peers) if "count_status_exchange" in phases_set else 0
-        p_frames_tot = int(payload.get("frames", 0)) * n_peers
-        c_frames_tot = (int(count.get("frames", 0)) * n_peers) if "count_status_exchange" in phases_set else 0
-        tx_b = (float(payload.get("tx_bytes", 0.0)) + (float(count.get("tx_bytes", 0.0)) if "count_status_exchange" in phases_set else 0.0)) * n_peers
-        rx_b = (float(payload.get("rx_bytes", 0.0)) + (float(count.get("rx_bytes", 0.0)) if "count_status_exchange" in phases_set else 0.0)) * n_peers
-        raw = dict(item0.context.op.metadata).get("mc2_phase", {})
-        self.native_group_launches[key] = {
-            "op_id": key,
-            "kind": str(raw.get("kind", "")),
-            "launch_mode": "cohort",
-            "ranks": tuple(range(n_peers)),
-            "payload_basis": {f"group:{key}:r{r}": p_basis for r in peer_replicas},
-            "payload_packet_bytes": {f"group:{key}:r{r}": view.payload_packet_bytes for r in peer_replicas},
-            "payload_frames": {f"group:{key}:r{r}": dict(p_frames) for r in peer_replicas},
-            "link_by_phase_by_rank": {},
-            "work_by_rank": {},
-            "transport_by_rank": {},
-            "transport_work_by_rank": {},
-            "transport_tx_bytes": tx_b,
-            "transport_rx_bytes": rx_b,
-            "transport_frames": p_frames_tot + c_frames_tot,
-            "transport_edges": p_edges,
-            "total_edges": p_edges + c_edges,
-            "payload_edges": p_edges,
-            "count_edges": c_edges,
-            "directed_edges": p_edges,
-            "directed_frames": p_frames_tot,
-            "protocol_edges": 0,
-            "unresolved_edges": 0,
-            "partial": (),
-        }
-        return True
 
     def _begin_joint_observation(self, op, key, participants, ready_by_rank,
                                  source_stage):
@@ -685,11 +561,6 @@ class _CohortMixin(_CohortNativeMixin):
                 return False
             raise
         if band_plan is None or not set(band_plan.accounting().wire_by_resource).issubset(self.engine.resources):
-            return False
-        if not any(
-            g.lowered.band.protocol.startswith(("hccs_optical", "ub_superpod"))
-            for g in band_plan.groups
-        ):
             return False
         active_items = (first,) if symmetric_canonical_only else tuple(participants)
         pre_by_replica, post_by_replica = self._split_cohort_band_programs(band_plan, active_items)

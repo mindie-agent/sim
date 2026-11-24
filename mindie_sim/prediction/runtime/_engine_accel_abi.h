@@ -92,6 +92,7 @@ MSIM_EXPORT int32_t msim_ctx_config(void *ctx, const double *rates, const int32_
     size_t i;
     if (st != NULL && nst >= 2) { st[0] = 0; st[1] = 0; }
     if (!ctx_ok(c)) return reject(st, nst, MSIM_E_STATE);
+    /* LEGACY_PURGED(S6-W5-20): replace MSIM_MAX_R cap with dynamic/growable resource table */
     if (nres < 1 || nres > (size_t)MSIM_MAX_R) return reject(st, nst, MSIM_E_RANGE);
     if (rates == NULL || units == NULL || policy == NULL) return reject(st, nst, MSIM_E_RANGE);
     for (i = 0; i < nres; i++) {
@@ -677,58 +678,11 @@ drain_compl_snapshot:
                     boundary = MSIM_B_OUTPUT; goto done;
                 }
             }
-            if (c->nres > 0) memset(c->res_seen, 0, (size_t)c->nres);
-            for (a = 0; a < c->act_n; a++) {
-                msim_task *t = &c->task[c->act[a]];
-                if (t->state != 1) continue;
-                for (k = 0; k < (int32_t)t->nlink; k++) {
-                    msim_link *l = &c->link[t->lstart + k];
-                    if (is_consumer(c, l) && !c->res_seen[l->res]) {
-                        c->res_seen[l->res] = 1;
-                        c->busy[l->res] += dt;
-                        c->act_res[n_act_res++] = l->res;
-                    }
-                }
-            }
-            for (i = 1; i < n_act_res; i++) {
-                int32_t key = c->act_res[i], j = i - 1;
-                while (j >= 0 && c->act_res[j] > key) {
-                    c->act_res[j + 1] = c->act_res[j];
-                    j--;
-                }
-                c->act_res[j + 1] = key;
-            }
-            for (i = 0; i < n_act_res; i++) {
-                int32_t r = c->act_res[i], n = 0, k2;
-                rc = build_order(c, r, &n);
-                if (rc != 0) goto fail;
-                for (k2 = 0; k2 < n; k2++) {
-                    msim_link *l = &c->link[c->idx[k2]];
-                    double remaining, scaled, used, residual;
-                    if (l->rate <= 0.0 || l->rem <= 0.0) continue;
-                    remaining = l->rem;
-                    scaled = dt * l->rate;
-                    if (scaled >= remaining) { used = remaining; residual = 0.0; }
-                    else {
-                        residual = remaining - scaled;
-                        if (residual <= 4.0 * msim_ulp(remaining)) {
-                            used = remaining; residual = 0.0;
-                        } else used = scaled;
-                    }
-                    l->svc += used;
-                    c->serv[l->res] += used;
-                    l->rem = residual;
-                    if (c->obs_buf != NULL && dt > 0.0) {
-                        uint32_t owner_u = l->plen > 0 ? c->units[l->pstart] : 0u;
-                        msim_emit_obs_service(
-                            c, now, next_time, c->task[l->task].seq,
-                            (uint32_t)l->res, owner_u, used);
-                    }
-                }
-            }
-            now = next_time;
-            io[2] = dt;
-            steps++;
+            /* LEGACY_PURGED(S6-W5-21): deleted dense memset(res_seen, 0, nres) & O(nres) scan;
+             * implement sparse touched_res list with amortized O(1) generation-tag epoch reset */
+            (void)n_act_res;
+            rc = MSIM_E_STATE;
+            goto fail;
         }
     }
 done:

@@ -144,41 +144,13 @@ static bool is_consumer(const msim_ctx *c, const msim_link *l)
 
 static int32_t build_order(msim_ctx *c, int32_t r, int32_t *n_out)
 {
-    msim_res *res = &c->res[r];
-    int32_t *order = c->idx, n = 0, a, k, j;
-    for (a = 0; a < c->act_n; a++) {
-        msim_task *t = &c->task[c->act[a]];
-        if (t->state != 1) continue;
-        for (k = 0; k < (int32_t)t->nlink; k++) {
-            int32_t li = (int32_t)t->lstart + k;
-            msim_link *l = &c->link[li];
-            if (l->res != r || !is_consumer(c, l)) continue;
-            j = n;
-            while (j > 0) {
-                msim_link *p = &c->link[order[j - 1]];
-                bool less;
-                if (res->mode == 4 || res->mode == 3) {
-                    less = c->task[p->task].seq > c->task[l->task].seq;
-                } else if (res->mode == 2) {
-                    int32_t gp = p->mode >= 0 ? p->mode : 0;
-                    int32_t gl = l->mode >= 0 ? l->mode : 0;
-                    if (gp != gl) less = gp > gl;
-                    else if (p->cap != l->cap) less = p->cap > l->cap;
-                    else less = c->task[p->task].seq > c->task[l->task].seq;
-                } else {
-                    if (p->cap != l->cap) less = p->cap > l->cap;
-                    else less = c->task[p->task].seq > c->task[l->task].seq;
-                }
-                if (!less) break;
-                order[j] = order[j - 1];
-                j--;
-            }
-            order[j] = li;
-            n++;
-        }
-    }
-    *n_out = n;
-    return 0;
+    /* LEGACY_PURGED(S6-W5-23): deleted per-resource O(nres*nactive) active-task scan
+     * and insertion-sort order rebuild; implement incremental sparse active-resource
+     * order buckets updated on task admission/completion */
+    (void)c;
+    (void)r;
+    *n_out = 0;
+    return MSIM_E_STATE;
 }
 
 #include "_engine_accel_submit.h"

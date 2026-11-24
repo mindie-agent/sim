@@ -5,8 +5,8 @@
   (2) Optimal Deployment recommendation (PD Disaggregated vs Colocated, winning
       P/D parallel tuples, P:D split, KV transfer/pool ms, B*, TTFT, TPOT,
       cluster tok/s, tok/s/die, and top runner-ups);
-  (3) 4-Track Software Waterfall (raw_eager -> merged -> unmerged_pr ->
-      expected_ideal -> hardware roofline);
+  (3) 4-Track Software Waterfall (eager -> shipping -> proposed ->
+      target -> hardware roofline);
   (4) Top Bottleneck Operator Families & 4D Roofline (Cube MFU, Vec MFU, MBU,
       Link Util, CV Overlap) with explicit ``included_components`` provenance.
 [Invariants] Strictly enforces Domain-1 fail-fast on omitted scenario/SLA/SSD
@@ -26,14 +26,7 @@ from typing import Any
 
 from mindie_sim.compose import compose_case
 from mindie_sim.feature_mechanisms import (
-    MONOTONIC_TOLERANCE_MS,
-    MS_PRECISION_DIGITS,
-    PCT_PRECISION_DIGITS,
-    RATIO_PRECISION_DIGITS,
-    WATERFALL_SCHEMA,
     _network,
-    _pct_delta,
-    _speedup,
     compare_feature_tracks,
 )
 from mindie_sim.prediction.body_defaults import TargetGraphSet, consume_target_declaration
@@ -106,69 +99,11 @@ def _instance_capacity_ledger(
     b_feasible: int = 1,
 ) -> dict[str, Any]:
     """Compute one instance's HBM ledger from the single physical admission + receipt."""
-    parsed = parse_case(raw_case)
-    role_norm = str(role or "colocated").strip().lower()
-    prefill_ws = _prefill_workspace_tokens(parsed, int(prompt_tokens))
-    if role_norm == "pd_prefill":
-        ws_tokens = max(1, prefill_ws)
-        seq_len = int(prompt_tokens) + 1
-        mem = Memory(parsed, workspace_tokens=ws_tokens)
-        kv_by_stage = tuple(float(v) for v in mem.cache_bytes(seq_len, padded=True))
-        if not all(float(cap) >= 0.0 for row in mem.capacity for cap in row):
-            max_seqs_vram = 0
-        else:
-            stage_limits = [
-                int(max(0.0, float(cap)) // kv)
-                for row in mem.capacity
-                for cap, kv in zip(row, kv_by_stage)
-                if kv > 0.0
-            ]
-            max_seqs_vram = min(stage_limits) if stage_limits else int(parsed.runtime.max_num_seqs)
-        receipt = mem.resident_memory_receipt(
-            phase="prefill", sequence_tokens=seq_len, batch_per_dp=1, query_tokens=ws_tokens,
-        )
-    else:
-        decode_q, _ = _resolve_speculative_tokens(
-            parsed, output_budget=output_tokens,
-            tokens_per_seq=None, emitted_tokens_per_seq=None,
-        )
-        base_ws = max(1, prefill_ws) if role_norm == "colocated" else max(1, int(decode_q))
-        seq_len = int(prompt_tokens) + int(output_tokens)
-        _, kv_by_stage, max_seqs_vram = _solve_b_vram_max(
-            parsed, base_ws=base_ws, decode_q=max(1, int(decode_q)),
-            seq_len=seq_len, cap_bound=None,
-        )
-        op_batch = max(1, int(b_feasible))
-        ws_tokens = max(base_ws, op_batch * max(1, int(decode_q)))
-        mem = Memory(parsed, workspace_tokens=ws_tokens)
-        receipt = mem.resident_memory_receipt(
-            phase="decode", sequence_tokens=seq_len, batch_per_dp=op_batch,
-            query_tokens=max(1, int(decode_q)),
-        )
-    hbm_bytes = min(float(die.memory_bytes) for die in parsed.machine.dies) if parsed.machine.dies else 0.0
-    weights_bytes = max(
-        (float(d.checkpoint_weight_bytes + d.prepared_weight_bytes + d.vision_weight_bytes) for d in receipt.dies),
-        default=max((float(v) for v in mem.weights), default=0.0),
+    del raw_case, prompt_tokens, output_tokens, role, b_feasible
+    raise NotImplementedError(
+        "LEGACY_PURGED: deleted shadow scalar capacity division int(cap // kv); "
+        "consume integer Memory.admissible_tokens / DieResidentReceipt from prediction.capacity.ledger (S1-017)"
     )
-    workspace_bytes = max(
-        (float(d.workspace_bytes) for d in receipt.dies),
-        default=max((float(v) for v in mem.workspace), default=0.0),
-    )
-    kv_per_seq_bytes = max(kv_by_stage, default=0.0)
-    headroom_bytes = min((float(cap) for row in mem.capacity for cap in row), default=0.0)
-    return {
-        "role": role_norm,
-        "parallel": parsed.runtime.parallel.to_dict(),
-        "workspace_tokens": int(ws_tokens),
-        "hbm_capacity_gib": round(hbm_bytes / BYTES_PER_GIB, GIB_DIGITS),
-        "weights_gib": round(weights_bytes / BYTES_PER_GIB, GIB_DIGITS),
-        "workspace_gib": round(workspace_bytes / BYTES_PER_GIB, GIB_DIGITS),
-        "kv_per_seq_gib": round(kv_per_seq_bytes / BYTES_PER_GIB, GIB_DIGITS),
-        "kv_pool_headroom_gib": round(max(0.0, headroom_bytes) / BYTES_PER_GIB, GIB_DIGITS),
-        "max_seqs_per_dp_vram": int(max_seqs_vram),
-        "configured_max_num_seqs": int(parsed.runtime.max_num_seqs),
-        "feasible": bool(headroom_bytes >= 0.0 and max_seqs_vram >= 1),
-    }
 
 
 def _build_capacity_ledger(
@@ -357,137 +292,16 @@ def _compare_feature_tracks_bounded(
     bottleneck_out: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Evaluate the 4-track waterfall with bounded concurrency and replica-0 memory caps."""
-    del use_archetype_folding
-    skip_keys = {"feature_track", "optimizations", "exclude_optimizations", "raw_eager", "_stack_phase"}
-    cleaned = {k: v for k, v in compose_kwargs.items() if k not in skip_keys}
-    summaries: dict[str, dict[str, Any]] = {}
-    summary_cache: dict[str, dict[str, Any]] = {
-        k: dict(v) for k, v in (precomputed_summaries or {}).items()
-    }
-    meta_info: dict[str, Any] = {}
-    va_quant: Any = None
-    track_entries: list[tuple[str, str, dict[str, Any]]] = []
-    uncached_tasks: list[tuple[Any, ...]] = []
-    queued_fps: set[str] = set()
-    eff_workers = resolve_granted_workers(granted_workers)
-    bn_fp: str | None = None
-    if bottleneck_case is not None:
-        bn_fp = _case_execution_fingerprint(bottleneck_case)
-        if eff_workers <= 1:
-            eff_bn = _analyze_case_bounded(
-                bottleneck_case, phase=phase, tokens=tokens,
-                context=(0 if phase == "prefill" else context),
-                sequences=max(1, int(sequences)), scope=scope,
-            )
-            summary_cache[bn_fp] = _track_summary_from_eff(eff_bn)
-            if bottleneck_out is not None:
-                bottleneck_out.update(_bottleneck_payload_from_eff(eff_bn))
-            del eff_bn
-            _reclaim_sweep_memory()
-        else:
-            queued_fps.add(bn_fp)
-            uncached_tasks.append((
-                bn_fp, bottleneck_case, phase, tokens,
-                (0 if phase == "prefill" else context),
-                max(1, int(sequences)), scope, True,
-            ))
-    for track in ("merged", "unmerged_pr", "expected_ideal", "raw_eager"):
-        kw = dict(cleaned)
-        if track == "raw_eager" and kw.get("quant") is None and va_quant is not None:
-            kw["quant"] = va_quant
-        case = compose_case(
-            model, hardware=hardware, runtime_stack=runtime_stack,
-            feature_track=track, _stack_phase=phase, **kw,
-        )
-        if track == "merged":
-            va_quant = ((case["runtime"]["metadata"] or {}).get("va_profile") or {}).get("quant")
-            meta_info.update(model=case["model"]["name"], sku=case["machine"]["sku"])
-        rep_meta = case["runtime"]["metadata"]["feature_track_report"]
-        fp = _case_execution_fingerprint(case)
-        track_entries.append((track, fp, rep_meta))
-        if fp not in summary_cache and fp not in queued_fps:
-            if eff_workers <= 1:
-                eff_t = _analyze_case_bounded(
-                    case, phase=phase, tokens=tokens, context=context, sequences=sequences, scope=scope,
-                )
-                summary_cache[fp] = _track_summary_from_eff(eff_t)
-                del eff_t, case
-                _reclaim_sweep_memory()
-            else:
-                queued_fps.add(fp)
-                uncached_tasks.append((fp, case, phase, tokens, context, sequences, scope, False))
-        else:
-            del case
-    if uncached_tasks:
-        for fp, base_summary, bn_payload in map_ordered(
-            _analyze_track_worker, uncached_tasks, granted_workers=granted_workers,
-        ):
-            summary_cache[fp] = base_summary
-            if bn_payload is not None and bottleneck_out is not None and fp == bn_fp:
-                bottleneck_out.update(bn_payload)
-        _reclaim_sweep_memory()
-    for track, fp, rep_meta in track_entries:
-        summaries[track] = {**summary_cache[fp], "report": rep_meta}
-
-    eager, merged, pr_s, ideal = (summaries[k] for k in ("raw_eager", "merged", "unmerged_pr", "expected_ideal"))
-    e_ms, m_ms, p_ms, i_ms, roof_ms = (
-        eager["step_ms"], merged["step_ms"], pr_s["step_ms"], ideal["step_ms"], ideal["roof_1p0_ms"],
+    del (
+        model, hardware, runtime_stack, phase, tokens, context, sequences, scope,
+        compose_kwargs, use_archetype_folding, precomputed_summaries, granted_workers,
+        bottleneck_case, bottleneck_out,
     )
-
-    def _base_row(entry: Mapping[str, Any]) -> dict[str, Any]:
-        return {
-            "step_ms": round(entry["step_ms"], MS_PRECISION_DIGITS),
-            "operator_sum_ms": round(entry["operator_sum_ms"], MS_PRECISION_DIGITS),
-            "hbm_bytes": entry["hbm_bytes"], "network": entry["network"],
-        }
-
-    return {
-        "schema": WATERFALL_SCHEMA, "model": meta_info["model"], "hardware_sku": meta_info["sku"],
-        "runtime_stack": merged["report"]["stack"], "repository": merged["report"]["repository"],
-        "geometry": {"phase": phase, "tokens": tokens, "context": context, "sequences": sequences, "scope": scope},
-        "monotonic_verified": bool(
-            m_ms + MONOTONIC_TOLERANCE_MS >= p_ms
-            and p_ms + MONOTONIC_TOLERANCE_MS >= i_ms
-            and i_ms + MONOTONIC_TOLERANCE_MS >= roof_ms
-        ),
-        "eager_vs_merged_monotonic": bool(e_ms + MONOTONIC_TOLERANCE_MS >= m_ms),
-        "waterfall": {
-            "raw_eager": {**_base_row(eager), "active_mechanisms": [m["id"] for m in eager["report"]["active_mechanisms"]]},
-            "current_merged": {
-                **_base_row(merged),
-                "delta_vs_raw_eager_ms": round(m_ms - e_ms, MS_PRECISION_DIGITS),
-                "delta_vs_raw_eager_pct": round(_pct_delta(e_ms, m_ms), PCT_PRECISION_DIGITS),
-                "speedup_vs_raw_eager": round(_speedup(e_ms, m_ms), RATIO_PRECISION_DIGITS),
-                "active_mechanisms": [m["id"] for m in merged["report"]["active_mechanisms"]],
-            },
-            "current_unmerged_pr": {
-                **_base_row(pr_s),
-                "delta_vs_merged_ms": round(p_ms - m_ms, MS_PRECISION_DIGITS),
-                "delta_vs_merged_pct": round(_pct_delta(m_ms, p_ms), PCT_PRECISION_DIGITS),
-                "speedup_vs_merged": round(_speedup(m_ms, p_ms), RATIO_PRECISION_DIGITS),
-                "active_open_prs": [
-                    {"mechanism_id": m["mechanism_id"], "ref": m["ref"], "notes": m["notes"]}
-                    for m in pr_s["report"]["unmerged_pr_mechanisms"]
-                ],
-                "single_pr_ablation": [], "leave_one_out_ablation": [],
-            },
-            "expected_ideal": {
-                **_base_row(ideal),
-                "delta_vs_unmerged_pr_ms": round(i_ms - p_ms, MS_PRECISION_DIGITS),
-                "delta_vs_unmerged_pr_pct": round(_pct_delta(p_ms, i_ms), PCT_PRECISION_DIGITS),
-                "delta_vs_merged_ms": round(i_ms - m_ms, MS_PRECISION_DIGITS),
-                "delta_vs_merged_pct": round(_pct_delta(m_ms, i_ms), PCT_PRECISION_DIGITS),
-                "speedup_vs_merged": round(_speedup(m_ms, i_ms), RATIO_PRECISION_DIGITS),
-                "unimplemented_architectural_gaps": ideal["report"]["unimplemented_gaps"],
-                "active_mechanisms": [m["id"] for m in ideal["report"]["active_mechanisms"]],
-            },
-            "hardware_roofline": {
-                "physical_ideal_1p0x_ms": round(roof_ms, MS_PRECISION_DIGITS),
-                "remaining_kernel_micro_gap_to_1p0x_ms": round(max(0.0, i_ms - roof_ms), MS_PRECISION_DIGITS),
-            },
-        },
-        "efficiency_reference": {"physical_ideal_ms": round(roof_ms, MS_PRECISION_DIGITS), "basis": "physical_1p0x_critical_path_roofline"},
-    }
+    raise NotImplementedError(
+        "LEGACY_PURGED: deleted parallel duplicate waterfall builder using expected_ideal & "
+        "MONOTONIC_TOLERANCE_MS; wire canonical PredictionSpine + EngineStepReceipt "
+        "4-track StackTrack (eager/shipping/proposed/target) (S1-015, S1-016)"
+    )
 
 
 def _extract_bottleneck_roofline(
@@ -571,7 +385,7 @@ def _bundle_inputs_for_solution(
     winner_mode = str(solved.get("winner_mode") or solved.get("deployment_mode") or "")
     is_prefill_only = (
         phase == "prefill" if phase is not None
-        else (winner_mode == "pd_prefill" or int(output_tokens) <= 1)
+        else (winner_mode == "pd_prefill" or (winner_mode == "colocated" and int(output_tokens) <= 0))
     )
     best = solved.get("best_configuration") or {}
     rec_case = (
@@ -627,59 +441,15 @@ def _export_solution_artifacts(
     rewrite_plan: Any = None,
 ) -> dict[str, Any]:
     """Lazily delegate ``--xlsx`` / ``--trace`` emission with independent Before/After (Parallel, B)."""
-    try:
-        export_mod = importlib.import_module("mindie_sim.export")
-    except ModuleNotFoundError as exc:
-        raise ModelingError(
-            "solve_export_requires_mindie_sim_export_package"
-        ) from exc
-    has_target_after = (mode == "modeling") or (rewrite_plan is not None)
-    after_track = target_track if mode == "modeling" else compare_track
-    before_case, before_req, before_meta = _bundle_inputs_for_solution(
-        before_solved, model=model, hardware=hardware, runtime_stack=runtime_stack,
-        base_kw=wf_kw, feature_track=compare_track, prompt_tokens=prompt_tokens,
-        output_tokens=output_tokens, scope=scope,
+    del (
+        model, hardware, runtime_stack, wf_kw, before_solved, after_solved,
+        prompt_tokens, output_tokens, scope, xlsx_path, trace_path,
+        compare_track, target_track, mode, rewrite_plan,
     )
-    after_case, after_req, after_meta = _bundle_inputs_for_solution(
-        after_solved, model=model, hardware=hardware, runtime_stack=runtime_stack,
-        base_kw=wf_kw, feature_track=after_track, prompt_tokens=prompt_tokens,
-        output_tokens=output_tokens, scope=scope,
+    raise NotImplementedError(
+        "LEGACY_PURGED: deleted inverted bidirectional compare_source calls; wire explicit "
+        "(before_bundle, after_bundle, comparison_request) + 3-arg assert_comparison_polarity (S1-014)"
     )
-    before_bundle = export_mod.build_export_bundle(
-        before_case, request=before_req, apply_target_envelope=False,
-        handoff_tpot_ms=before_meta["handoff_tpot_ms"],
-        deployment_total_dies=before_meta["deployment_total_dies"] or None,
-        pd_pool_summary=before_meta["pd_pool_summary"],
-    )
-    after_bundle = export_mod.build_export_bundle(
-        after_case, request=after_req,
-        apply_target_envelope=has_target_after,
-        rewrite_plan=rewrite_plan if has_target_after else None,
-        allow_unbound_formula=(mode == "modeling"),
-        handoff_tpot_ms=after_meta["handoff_tpot_ms"],
-        deployment_total_dies=after_meta["deployment_total_dies"] or None,
-        pd_pool_summary=after_meta["pd_pool_summary"],
-        compare_source=before_bundle if has_target_after else None,
-    )
-    out: dict[str, Any] = {
-        "mode": mode,
-        "compare_track": compare_track,
-        "target_track": after_track,
-        "phase": after_req.phase,
-    }
-    if after_meta["pd_pool_summary"]:
-        out["pd_pool_summary"] = dict(after_meta["pd_pool_summary"])
-    if xlsx_path is not None:
-        receipt = export_mod.export_comparison_xlsx(
-            before_bundle, xlsx_path,
-            compare_source=after_bundle if has_target_after else None,
-        )
-        out["xlsx"] = receipt.to_dict() if hasattr(receipt, "to_dict") else str(xlsx_path)
-    if trace_path is not None:
-        trace_target = after_bundle if has_target_after else before_bundle
-        receipt = export_mod.export_msprof_trace(trace_target, trace_path)
-        out["trace"] = receipt.to_dict() if hasattr(receipt, "to_dict") else str(trace_path)
-    return out
 
 
 def _evaluate_winner_analysis(
@@ -718,7 +488,7 @@ def _evaluate_winner_analysis(
     parsed_rec = parse_case(rec_case)
     win_mtp = int((best or {}).get("mtp_proposal_tokens", 0) or 0)
     winner_mode = str(solved.get("winner_mode") or solved.get("deployment_mode") or "colocated")
-    is_prefill_only = winner_mode == "pd_prefill" or int(output) <= 1
+    is_prefill_only = winner_mode == "pd_prefill" or (winner_mode == "colocated" and int(output) <= 0)
     win_phase = "prefill" if is_prefill_only else "decode"
     win_seq = 1 if is_prefill_only else max(1, int((best or {}).get("b_feasible", 1) or 1))
     win_tokens = max(1, int(prompt)) if is_prefill_only else (1 + win_mtp)
@@ -918,7 +688,7 @@ def solve_deployment(
     raw_eager: bool = False, runtime_stack: str | Mapping[str, Any] | None = None,
     optimizations: Sequence[str] = (), exclude_optimizations: Sequence[str] = (),
     xlsx_path: str | Path | None = None, trace_path: str | Path | None = None,
-    compare_track: str = "merged", target_track: str = "expected_ideal",
+    compare_track: str = "shipping", target_track: str = "target",
     mode: str = "modeling", rewrite_plan: Any = None,
     granted_workers: int | None = None,
 ) -> dict[str, Any]:
@@ -947,11 +717,7 @@ def solve_deployment(
         indexer_kv_dtype=indexer_kv_dtype, allow_unconstrained_ttft=(ttft_slo_ms is None),
         granted_workers=eff_workers,
     )
-    before_track = (
-        "merged"
-        if (solve_mode == "simulation" and str(compare_track).strip().lower() == "expected_ideal")
-        else str(compare_track)
-    )
+    before_track = str(compare_track)
     before_solved = solve_optimal_deployment(
         model, hardware, feature_track=before_track,
         apply_target_envelope=False, **shared_kw,
