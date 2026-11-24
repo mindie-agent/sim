@@ -430,6 +430,15 @@ owns = [
     "mindie_sim/prediction/operators/vector/gated_activation.py",
     "mindie_sim/prediction/operators/vector/transform_norm_quant.py",
 ]
+[[module]]
+path = "operators/test_stage5c_128k_spec5_landmines.py"
+tier = "tier0"
+owns = [
+    "mindie_sim/prediction/sharding/sequence_parallel.py",
+    "mindie_sim/prediction/operators/mla/mla.py",
+    "mindie_sim/compose/__init__.py",
+    "mindie_sim/compose/inputs.py",
+]
 # ---------------------------------------------------------------- spine
 [[module]]
 path = "spine/test_stream_plan.py"

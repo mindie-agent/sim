@@ -1513,6 +1513,12 @@ def _project_mla_output(
                     2 * (parallel.pcp - 1) / parallel.pcp * q * h
                     * dtype_bytes(model.activation_dtype), "allreduce", "pcp",
                     shape=(q, h))
+        if not group_parallel and parallel.tp > 1:
+            tail = b.ops[-1]
+            b.ops[-1] = replace(
+                tail,
+                metadata=tail.metadata + (("tp_output_placement", "replicated"),),
+            )
     else:
         if pcp_shard_o:
             if pcp_is_prefill:

@@ -629,21 +629,70 @@ def reduce_scatter(*, plan: SequenceParallelPlan, op_id: str, deps: tuple[str, .
     )
 
 
+def _close_replicated_output(
+    ops: tuple[OpSpec, ...], tail: OpSpec, *, plan: SequenceParallelPlan,
+    width: int, dtype: str, op_id: str | None, row_multiplier: int,
+    channel_multiplier: int, input_rows: int | None,
+) -> tuple[tuple[OpSpec, ...], str]:
+    """Slice an already TP-replicated output into local SP rows without reduction."""
+    if not plan.tokens_local:
+        raise ModelingError("sequence_parallel_empty_replica_has_no_tp_collective")
+    shard_id = op_id or tail.op_id + ".sp_shard"
+    if any(op.op_id == shard_id for op in ops):
+        raise ModelingError(f"sequence_parallel_close_output_duplicate_id:{shard_id}")
+    _, global_rows, _ = _shape(
+        plan, width, row_multiplier=row_multiplier,
+        channel_multiplier=channel_multiplier)
+    source_rows = (
+        input_rows * row_multiplier if input_rows is not None
+        else plan.input_rows * row_multiplier
+    )
+    if source_rows < 0 or source_rows > global_rows:
+        raise ModelingError("sequence_parallel_reduce_scatter_rows_outside_allocation")
+    shard_plan = (
+        plan if input_rows is None or input_rows == plan.input_rows
+        else replace(plan, input_rows=input_rows)
+    )
+    shard_op = input_shard(
+        plan=shard_plan, op_id=shard_id, deps=(tail.op_id,), stage=tail.stage,
+        layer=tail.layer, requests=tail.requests, phase=tail.phase,
+        width=width, dtype=dtype, row_multiplier=row_multiplier,
+        channel_multiplier=channel_multiplier,
+    )
+    shard_meta = dict(shard_op.metadata)
+    shard_meta["sequence_parallel_role"] = "output_shard"
+    shard_meta["input_dependency"] = "replicated_tp_output"
+    shard_meta["tp_output_placement"] = "replicated"
+    shard_op = replace(
+        shard_op, stream=tail.stream, metadata=tuple(shard_meta.items()),
+    )
+    return ops + (shard_op,), shard_id
+
+
 def close_output(ops, last, *, plan: SequenceParallelPlan, width: int, dtype: str,
                  op_id: str | None = None, row_multiplier: int = 1,
                  channel_multiplier: int = 1,
                  input_rows: int | None = None) -> tuple[tuple[OpSpec, ...], str]:
-    """Replace only the exact current tail TP allreduce with reduce-scatter.
+    """Close a TP-sharded attention/MLP output into SP-local rows.
 
-    The tail must be the last record, an ``allreduce`` on ``group_axis=tp``,
-    with its sole producer dependency. No operator-id prefix is inspected.
+    Replaces an exact trailing TP ``allreduce`` (sole producer) with
+    ``reduce_scatter``, or appends a local row-shard view/right-pad when the
+    tail explicitly declares ``tp_output_placement="replicated"`` (e.g. grouped
+    MLA output projection when ``o_groups`` is not divisible by TP).
     """
     ops = tuple(ops)
     if not ops or ops[-1].op_id != last:
         raise ModelingError("sequence_parallel_close_output_requires_exact_tail")
     tail = ops[-1]
     metadata = dict(tail.metadata)
-    if tail.family != "allreduce" or metadata.get("group_axis") != "tp":
+    is_tp_allreduce = tail.family == "allreduce" and metadata.get("group_axis") == "tp"
+    if not is_tp_allreduce:
+        if metadata.get("tp_output_placement") == "replicated":
+            return _close_replicated_output(
+                ops, tail, plan=plan, width=width, dtype=dtype, op_id=op_id,
+                row_multiplier=row_multiplier, channel_multiplier=channel_multiplier,
+                input_rows=input_rows,
+            )
         raise ModelingError("sequence_parallel_close_output_requires_tp_allreduce_tail")
     if len(tail.deps) != 1:
         raise ModelingError("sequence_parallel_close_output_requires_sole_producer")
