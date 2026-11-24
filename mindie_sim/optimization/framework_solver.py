@@ -21,7 +21,7 @@ from mindie_sim.prediction.streams import (
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.datapath import datapath_for_die
 
-from .dual_bound import NS_PER_MS, DualSubgradientReport, _atomic_ops, _machine, _op_contract_key
+from .dual_bound import NS_PER_MS, DualSubgradientReport, _atomic_ops, _machine, _op_contract_key, _unique_ops
 
 if TYPE_CHECKING:
     from mindie_sim.rewrite.oracle import FullPlanEvaluation, ScenarioDossier
@@ -228,6 +228,41 @@ class _TrialSearch:
         self.history = []
         self.seen = set()
         self.frontier = {}
+        self.pending_verdicts: dict[tuple[str, tuple[str, ...]], object] = {}
+
+    def register_verdict(self, abi_id: str, member_ids: tuple[str, ...], verdict) -> None:
+        if verdict is not None:
+            self.pending_verdicts[abi_id, tuple(member_ids)] = verdict
+
+    def _bind_verified_plan(self, plan):
+        from mindie_sim.rewrite.schema import FuseRegion
+
+        if not self.pending_verdicts:
+            return plan
+        changed = False
+        new_edits = []
+        for edit in plan.edits:
+            op = edit.operation
+            if (
+                isinstance(op, FuseRegion)
+                and op.abi_verdict is None
+                and op.fusion_tier in {"K1_shipping", "K1_proposed_pr"}
+                and op.kernel_boundaries
+            ):
+                key = (op.kernel_boundaries[0].abi_id, tuple(ref.id for ref in op.members))
+                verdict = self.pending_verdicts.get(key)
+                if verdict is not None and verdict.status in {"admitted_shipping", "admitted_proposed_pr"}:
+                    sealed = replace(verdict, engine_speedup_verified=True)
+                    op = replace(
+                        op,
+                        abi_verdict=sealed,
+                        abi_query_digest=sealed.query_digest,
+                        backend_target=sealed.backend_kind,
+                    )
+                    edit = replace(edit, operation=op)
+                    changed = True
+            new_edits.append(edit)
+        return replace(plan, edits=tuple(new_edits)) if changed else plan
 
     def stats(self) -> CandidateSearchStats:
         return CandidateSearchStats(
@@ -307,14 +342,16 @@ class _TrialSearch:
                 ranked.append((estimated_wall, plan_sha256(plan), plan))
             for _, _, plan in sorted(ranked):
                 self.replayed += 1
-                result = self.try_finalize(plan)
+                finalized_plan = self._bind_verified_plan(plan)
+                result = self.try_finalize(finalized_plan)
                 if result is not None and _accepted(result):
-                    key = plan.base_graph_sha256
+                    key = finalized_plan.base_graph_sha256
                     previous = self.frontier.get(key)
-                    if previous is None or _wall(result) < _wall(previous[1]):
-                        self.frontier[key] = (plan, result)
+                    strictly_faster = previous is not None and _wall(result) < _wall(previous[1])
+                    if (finalized_plan == plan and previous is None) or strictly_faster:
+                        self.frontier[key] = (finalized_plan, result)
                     if _wall(result) < _wall(self.best_eval):
-                        self.seed(plan, result)
+                        self.seed(finalized_plan, result)
                 else:
                     if result is not None:
                         self.rejection_reasons["finalize_gate_failed"] += 1
@@ -368,8 +405,197 @@ def _search_bases(dossier, search):
 def _interleave(proposals):
     return (plan for wave in zip_longest(*proposals) for plan in wave if plan is not None)
 
-def _local_operations(scenario, ops, mainline):
-    from mindie_sim.rewrite.schema import HoistOrDeduplicate, OpRef
+def _scenario_lowering_plan(scenario):
+    for owner in (scenario, getattr(scenario, "mainline_step", None), getattr(scenario, "atomic_step", None)):
+        plan = getattr(owner, "stack_lowering_plan", None)
+        if plan is not None:
+            return plan
+    return None
+
+
+def _build_direct_region_abi_query(
+    scenario,
+    member_ops,
+    region,
+    *,
+    soc_arch,
+    sku_id: str,
+    eff_track,
+    enabled_passes,
+):
+    from mindie_sim.rewrite.algebra import (
+        _norm_abi_dtype,
+        _port,
+        _quant_contract_for_port,
+        _resolve_model_scope,
+        _resolve_placement,
+        _resolve_world_size,
+        classify_op_traits,
+    )
+    from mindie_sim.schema.abi import AbiQueryKey
+
+    abi_id = region.kernel_boundaries[0].abi_id
+    first, last = member_ops[0], member_ops[-1]
+    tr_first = classify_op_traits(first)
+    tr_last = classify_op_traits(last)
+    in_dt = _norm_abi_dtype(tr_first.input_dtype or first.dtype)
+    out_dt = _norm_abi_dtype(tr_last.output_dtype or last.dtype)
+    in_shape = tuple(int(d) for d in first.local_shape) if first.local_shape else (1,)
+    out_shape = tuple(int(d) for d in last.local_shape) if last.local_shape else in_shape
+    iq, ig, is_dt = _quant_contract_for_port(in_dt, tr_first.scale_format, tr_first.group_size, is_weight=False)
+    is_comm = any(op.link_bytes > 0 for op in member_ops)
+    case = getattr(scenario, "case", None)
+    parallel = getattr(getattr(case, "runtime", None), "parallel", None)
+    default_ws = int(getattr(parallel, "tp", 1) or 1) if is_comm else 1
+    ws = _resolve_world_size(first, default_ws, collective=is_comm)
+    placement = _resolve_placement(soc_arch, ws, dict(first.metadata))
+    act_kind = next((classify_op_traits(op).activation_kind for op in member_ops if classify_op_traits(op).activation_kind), "none")
+    return AbiQueryKey(
+        soc_arch=soc_arch,
+        sku_id=sku_id,
+        abi_id=abi_id,
+        graph_motif=str(getattr(region.abi_verdict, "abi_id", "") or abi_id),
+        model_scope=_resolve_model_scope(member_ops),
+        draft_quant_mode="none",
+        pr_track=eff_track,
+        operands=(_port("x", in_dt, in_shape, quant_mode=iq, group_shape=ig, scale_dtype=is_dt),),
+        outputs=(_port("y", out_dt, out_shape),),
+        rank_placement=placement,
+        world_size=ws,
+        comm_group_id="tp" if is_comm and ws > 1 else "local",
+        comm_domain_width=ws,
+        comm_dtype=in_dt if is_comm and ws > 1 else "none",
+        reduction_kind="none",
+        activation_kind=act_kind or "none",
+        activation_params=(),
+        has_bias=any(bool(dict(op.metadata).get("has_bias")) for op in member_ops),
+        has_active_mask=any(bool(dict(op.metadata).get("has_active_mask")) for op in member_ops),
+        dispatch_quant_mode=-1,
+        shared_experts_per_rank=0,
+        top_k=0,
+        moe_expert_num=0,
+        qk_rope_head_dim=0,
+        mla_variant="none",
+        sfa_dcp_active=False,
+        pcp_size=max(1, int(getattr(parallel, "pcp", 1) or 1)),
+        kv_cache_dtype="none",
+        has_kpool_indexer=False,
+        dcp_size=max(1, int(getattr(parallel, "dcp", 1) or 1)),
+        is_act_and_mul=bool(act_kind and act_kind != "none"),
+        enabled_stack_passes=enabled_passes,
+    )
+
+
+def _verify_mainline_fuse_region(
+    scenario,
+    ops_by_id,
+    region,
+    *,
+    allowed_classes,
+    eff_track,
+    track_spec,
+    manifest_bindings,
+    enabled_passes,
+    soc_arch,
+    sku_id: str,
+    arch_family: str,
+    tp_size: int | None,
+    ep_size: int | None,
+    registry,
+):
+    from mindie_sim.rewrite.algebra import discover_algebraic_rewrites_for_ops
+    from mindie_sim.schema.abi import validate_fusion_tier_verdict
+
+    if region.fusion_tier == "K1_shipping":
+        if "shipping" not in allowed_classes:
+            return None
+        expected_status = "admitted_shipping"
+    elif region.fusion_tier == "K1_proposed_pr":
+        if "proposed_pr" not in allowed_classes or eff_track not in {"proposed", "target"}:
+            return None
+        expected_status = "admitted_proposed_pr"
+    else:
+        return None
+    if not region.kernel_boundaries or not region.kernel_boundaries[0].abi_id:
+        return None
+    abi_id = region.kernel_boundaries[0].abi_id
+    snap = registry.get_snapshot(soc_arch)
+    if region.abi_verdict is not None:
+        try:
+            validate_fusion_tier_verdict(region.fusion_tier, region.abi_verdict)
+        except ModelingError:
+            return None
+        if (
+            region.abi_verdict.probe_manifest_sha256 != snap.payload_sha256
+            or region.abi_verdict.device_arch != soc_arch
+            or region.abi_verdict.abi_id != abi_id
+        ):
+            return None
+
+    member_ops = tuple(ops_by_id[ref.id] for ref in region.members if ref.kind == "atom" and ref.id in ops_by_id)
+    if not member_ops:
+        return None
+
+    fresh_verdict = None
+    if len(member_ops) >= 2:
+        discovered = discover_algebraic_rewrites_for_ops(
+            member_ops,
+            datapath=getattr(scenario, "datapath", None),
+            include_abi_extensions=False,
+            arch_family=arch_family,
+            sku_id=sku_id,
+            tp_size=tp_size,
+            ep_size=ep_size,
+            pr_track=eff_track,
+            track_spec=track_spec,
+            manifest_bindings=manifest_bindings,
+            enabled_stack_passes=enabled_passes,
+            registry=registry,
+        )
+        for cand in discovered.candidates:
+            if cand.abi_id == abi_id and cand.abi_verdict is not None:
+                fresh_verdict = cand.abi_verdict
+                break
+    if fresh_verdict is None:
+        try:
+            query = _build_direct_region_abi_query(
+                scenario, member_ops, region,
+                soc_arch=soc_arch, sku_id=sku_id, eff_track=eff_track, enabled_passes=enabled_passes,
+            )
+            fresh_verdict = registry.verify(
+                query, track_spec=track_spec, manifest_bindings=manifest_bindings,
+            )
+        except ModelingError:
+            return None
+
+    if fresh_verdict.status != expected_status:
+        return None
+    if (
+        region.abi_verdict is not None
+        and region.abi_verdict.matched_entry_id
+        and fresh_verdict.matched_entry_id != region.abi_verdict.matched_entry_id
+    ):
+        return None
+    if region.abi_verdict is not None and region.abi_verdict.engine_speedup_verified:
+        verified_verdict = replace(fresh_verdict, engine_speedup_verified=True)
+        return replace(
+            region,
+            abi_verdict=verified_verdict,
+            abi_query_digest=verified_verdict.query_digest,
+            backend_target=verified_verdict.backend_kind,  # type: ignore[arg-type]
+        ), fresh_verdict
+    return replace(
+        region,
+        abi_verdict=None,
+        abi_query_digest=fresh_verdict.query_digest,
+        backend_target=fresh_verdict.backend_kind,  # type: ignore[arg-type]
+    ), fresh_verdict
+
+
+def _local_operations(scenario, ops, mainline, *, verdict_sink=None):
+    from mindie_sim.backends.abi_registry import default_abi_registry
+    from mindie_sim.rewrite.algebra import DEFAULT_SHIPPING_STACK_PASSES, _resolve_soc_arch
+    from mindie_sim.rewrite.schema import FuseRegion, HoistOrDeduplicate, OpRef
 
     groups = defaultdict(list)
     for op in ops:
@@ -385,10 +611,67 @@ def _local_operations(scenario, ops, mainline):
     for targets in groups.values():
         if len(targets) > 1:
             yield HoistOrDeduplicate(tuple(targets), "intra_step")
-    if mainline.edits:
-        raise NotImplementedError(
-            "LEGACY_PURGED: filter edits via StackLoweringPlan.allowed_rewrite_classes + ProbedAbiRegistry.verify()"
+    if not mainline.edits:
+        return
+
+    lowering_plan = _scenario_lowering_plan(scenario)
+    allowed_classes = (
+        lowering_plan.allowed_rewrite_classes if lowering_plan is not None else frozenset({"shipping"})
+    )
+    track_spec = lowering_plan.track_spec if lowering_plan is not None else None
+    manifest_bindings = track_spec.active_bindings if track_spec is not None else ()
+    eff_track = (
+        track_spec.track if track_spec is not None
+        else (lowering_plan.track if lowering_plan is not None else "shipping")
+    )
+    if eff_track == "eager":
+        return
+    enabled_passes = (
+        frozenset(lowering_plan.lowering_passes)
+        if (lowering_plan is not None and lowering_plan.lowering_passes)
+        else DEFAULT_SHIPPING_STACK_PASSES
+    )
+    machine = _machine(scenario)
+    arch_family = str(getattr(machine, "arch_family", "") or "")
+    sku_id = str(getattr(machine, "sku", "") or getattr(machine, "name", "") or "")
+    soc_arch = _resolve_soc_arch(arch_family, getattr(scenario, "datapath", None), sku_id)
+    if soc_arch is None or not sku_id:
+        return
+    case = getattr(scenario, "case", None)
+    parallel = getattr(getattr(case, "runtime", None), "parallel", None)
+    tp_size = int(parallel.tp) if parallel is not None else None
+    ep_size = int(parallel.ep) if parallel is not None else None
+    ops_by_id = {op.op_id: op for op in ops}
+    registry = default_abi_registry()
+
+    for edit in mainline.edits:
+        if edit.after or _operation_dependencies(edit.operation):
+            continue
+        if not isinstance(edit.operation, FuseRegion):
+            continue
+        verified_pair = _verify_mainline_fuse_region(
+            scenario, ops_by_id, edit.operation,
+            allowed_classes=allowed_classes,
+            eff_track=eff_track,
+            track_spec=track_spec,
+            manifest_bindings=manifest_bindings,
+            enabled_passes=enabled_passes,
+            soc_arch=soc_arch,
+            sku_id=sku_id,
+            arch_family=arch_family,
+            tp_size=tp_size,
+            ep_size=ep_size,
+            registry=registry,
         )
+        if verified_pair is not None:
+            verified_region, raw_verdict = verified_pair
+            if verdict_sink is not None and verified_region.kernel_boundaries:
+                verdict_sink(
+                    verified_region.kernel_boundaries[0].abi_id,
+                    tuple(ref.id for ref in verified_region.members),
+                    raw_verdict,
+                )
+            yield verified_region
 
 def _collective_operations(ops, dual_report):
     from mindie_sim.rewrite.schema import CollectiveTransform, OpRef, PipelineTiles
@@ -602,7 +885,7 @@ def solve_framework(
     before = search.remaining
     search.loo(mainline, m_ns, quota // 2, consider=True)
     def proposals(base, scenario, stage):
-        ops = _atomic_ops(scenario)
+        ops = _unique_ops(op for _, op in _atomic_ops(scenario))
         if stage == "F3_stream_core":
             stream_iter = _stream_candidates(scenario, ops)
             first = next(stream_iter, None)
@@ -612,9 +895,12 @@ def solve_framework(
                 for op in stream_iter:
                     yield _stream_plan(base, stage, op)
             return
-        operations = tuple(_local_operations(scenario, ops, mainline) if stage == "F1_local_k1"
-                           else _collective_operations(ops, dual_report) if stage == "F2_collective_dbo"
-                           else _prefetch_operations(scenario, ops))
+        operations = tuple(
+            _local_operations(scenario, ops, mainline, verdict_sink=search.register_verdict)
+            if stage == "F1_local_k1"
+            else _collective_operations(ops, dual_report) if stage == "F2_collective_dbo"
+            else _prefetch_operations(scenario, ops)
+        )
         search.note_eligible(len(operations))
         yield from (_with_operations(base, stage, (op,)) for op in operations)
 
