@@ -80,15 +80,12 @@ KDA_PARALLEL_AXIS = "tp_x_pcp"
 
 
 def _kda_shards(layer: Any, parallel: Any, runtime: Any) -> int:
-    """The KDA TP x PCP history shard count, or one every other family uses."""
-    if str(getattr(layer, "attention", "")) != "kda":
-        return 1
-    pcp = max(1, int(getattr(parallel, "pcp", 1) or 1))
-    if pcp <= 1:
-        return 1
-    metadata = dict(getattr(runtime, "metadata", ()) or ()) if runtime is not None else {}
-    axis = str(metadata.get("kda_parallel_axis", "")).strip().lower()
-    return 1 if axis == "tp" else pcp
+    """Unplugged W5a socket — duplicate KDA TP x PCP calculator deleted."""
+    del layer, parallel, runtime
+    raise NotImplementedError(
+        "LEGACY_PURGED: delegate KDA TPxPCP sharding to single canonical helper "
+        "in catalog/context_parallel.py"
+    )
 
 
 def _local_heads(layer: Any, parallel: Any, shards: int = 1) -> int:
@@ -113,31 +110,15 @@ def record_head_bytes(dk: int, dv: int, kg_dtype: str = DEFAULT_RECORD_KG_DTYPE)
 
 
 def _conv_slice_width(layer: Any, total_shards: int, local_conv: int, kernel: int) -> int:
-    """Exact per-token convolution channel width on this shard.
-
-    Catalog models store ``conv_width * (kernel - 1)`` history elements and
-    declare ``conv_width > 0`` explicitly. Legacy synthetic layers with
-    ``conv_width == 0`` fall back cleanly to ``kernel - 1`` (or ``kernel`` when
-    the declared buffer is an exact ``kernel``-multiple synthetic fixture).
-    """
+    """Exact per-token convolution channel width on this shard."""
+    del local_conv, kernel
     conv_width = int(getattr(layer, "conv_width", 0) or 0)
     if conv_width > 0:
         return _ceil_div(conv_width, total_shards)
-    if local_conv <= 0:
-        return 0
-    history_slots = max(1, kernel - 1)
-    if kernel > 1 and local_conv % history_slots != 0 and local_conv % kernel == 0:
-        return local_conv // kernel
-    return _ceil_div(local_conv, history_slots)
-
-
-def _conv_geometry(layer: Any, parallel: Any, shards: int = 1) -> tuple[int, int, str]:
-    total_shards = max(1, int(parallel.tp)) * max(1, int(shards))
-    local_conv = _ceil_div(int(getattr(layer, "conv_state_elements", 0) or 0), total_shards)
-    kernel = max(1, int(getattr(layer, "conv_kernel", 0) or 1))
-    width = _conv_slice_width(layer, total_shards, local_conv, kernel)
-    dtype = str(getattr(layer, "conv_state_dtype", "") or "bf16")
-    return int(width), kernel, dtype
+    raise NotImplementedError(
+        "LEGACY_PURGED: require explicit conv_width > 0 on every linear-attention LayerPlan "
+        "(legacy synthetic conv_width==0 fallback deleted)"
+    )
 
 
 def speculative_state_plan(
@@ -157,7 +138,11 @@ def speculative_state_plan(
     shards = _kda_shards(layer, parallel, runtime)
     heads = _local_heads(layer, parallel, shards)
     dk, dv = _head_geometry(layer)
-    state_dtype = str(getattr(layer, "recurrent_state_dtype", "") or "fp32")
+    state_dtype = str(getattr(layer, "recurrent_state_dtype", "") or "").strip()
+    if not state_dtype:
+        raise NotImplementedError(
+            "LEGACY_PURGED: require explicit recurrent_state_dtype on linear-attention LayerPlan"
+        )
     kg_dtype = str(contract.get("record_kg_dtype", DEFAULT_RECORD_KG_DTYPE))
     total_shards = max(1, int(parallel.tp)) * shards
     recurrent_elements = _ceil_div(
@@ -167,7 +152,11 @@ def speculative_state_plan(
     conv_raw = int(getattr(layer, "conv_state_elements", 0) or 0)
     local_conv = _ceil_div(conv_raw, total_shards)
     kernel = max(1, int(getattr(layer, "conv_kernel", 0) or 1))
-    conv_dtype = str(getattr(layer, "conv_state_dtype", "") or "bf16")
+    conv_dtype = str(getattr(layer, "conv_state_dtype", "") or "").strip()
+    if not conv_dtype:
+        raise NotImplementedError(
+            "LEGACY_PURGED: require explicit conv_state_dtype on linear-attention LayerPlan"
+        )
     slice_width = _conv_slice_width(layer, total_shards, local_conv, kernel)
     default_history = max(1, kernel - 1) if (
         int(getattr(layer, "conv_width", 0) or 0) > 0
@@ -193,10 +182,10 @@ def speculative_state_plan(
             q, slots, state_bytes * float(slots), conv_bytes, 0,
             transient, MODE_CHECKPOINT)
     if kind == "gdn":
-        # Qwen GDN keeps ``(Dk + Dv + 1)`` FP32 elements per head, distinct
-        # from the KDA correction+kg record.
-        from mindie_sim.prediction.operators.recurrent.recover_ssm_work import gdn_record_head_bytes
-        record = gdn_record_head_bytes(dk, dv) * float(heads)
+        raise NotImplementedError(
+            "LEGACY_PURGED: define gdn_record_head_bytes in L1 catalog/speculative_state.py "
+            "(L1->L3 upward import from prediction.operators deleted)"
+        )
     else:
         record = record_head_bytes(dk, dv, kg_dtype) * float(heads)
     override = contract.get("record_bytes_per_token")
@@ -241,9 +230,7 @@ def resolve_speculative_query_tokens(
     if dspark is not None:
         # DSpark verifies the confidence-truncated proposal prefix plus the bonus token.
         return ONE + int(dspark.step_spec().draft_len)
-    metadata = dict(getattr(runtime, "metadata", ()) or ())
-    proposals = int(metadata.get("draft_proposal_tokens", ZERO) or ZERO)
-    if int(getattr(runtime, "mtp_acceptance_length", ONE) or ONE) <= ONE and proposals <= ZERO:
-        return ONE
-    # MTP and metadata-only DSpark both declare a proposal count: verify width is ``[K+1]``.
-    return max(ONE, proposals + ONE)
+    raise NotImplementedError(
+        "LEGACY_PURGED: read verify width directly from SpeculativeExecutionContract / "
+        "DraftStepSchedule (ad-hoc metadata draft_proposal_tokens/mtp_acceptance_length purged)"
+    )

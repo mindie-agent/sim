@@ -98,25 +98,10 @@ def normalize_formats(model):
     ).strip().lower()
     mla_decls: list[tuple[int, dict[str, object]]] = []
     if dtype_bytes(kv_dtype) == 1:
-        for plan in mla_plans:
-            rope = int(getattr(plan, "qk_rope_head_dim", 0) or 0)
-            default_scale = (
-                "fp16" if (rope == 0 and kv_dtype in NOPE_FP8_DTYPES) else "fp32"
-            )
-            decl = {
-                "dtype": kv_dtype,
-                "group_size": QUANT_GROUP,
-                "scale_dtype": scale_override or default_scale,
-                "suffix_elements": rope,
-                "suffix_dtype": "bf16",
-            }
-            existing = per_layer.get(str(plan.index), {}).get("mla_kv")
-            mla_decls.append((plan.index, dict(existing) if existing is not None else decl))
-        if mla_decls and all(d == mla_decls[0][1] for _, d in mla_decls):
-            regions.setdefault("mla_kv", mla_decls[0][1])
-        else:
-            for layer_idx, decl in mla_decls:
-                per_layer.setdefault(str(layer_idx), {}).setdefault("mla_kv", decl)
+        raise NotImplementedError(
+            "LEGACY_PURGED: gate NoPE FP8 MLA scale dtype on plan.mla_use_nope or rope == 0 "
+            "instead of rope == 0 alone"
+        )
     idx_dtype = str(model.quant.index_dtype).strip().lower()
     idx_decls: list[tuple[int, dict[str, object]]] = []
     if sparse_plans and dtype_bytes(idx_dtype) == 1:
@@ -152,25 +137,18 @@ def draft_row(model, draft, *, tp=1):
 
 
 def _kda_state_shards(parallel, metadata) -> int:
-    tp = max(1, int(getattr(parallel, "tp", 1) or 1))
-    pcp = max(1, int(getattr(parallel, "pcp", 1) or 1))
-    axis = str(metadata.get("kda_parallel_axis", "")).strip().lower()
-    return tp * (1 if axis == "tp" else pcp)
+    del parallel, metadata
+    raise NotImplementedError(
+        "LEGACY_PURGED: delegate KDA TPxPCP sharding to single canonical helper "
+        "in catalog/context_parallel.py"
+    )
 
 
 def _kda_state_page_bytes(plan, shards: int, proposals: int) -> int:
-    rec_elems = _ceil_div(int(plan.recurrent_state_elements), shards)
-    rec_bytes = exact_element_bytes(rec_elems, str(plan.recurrent_state_dtype))
-    conv_width = int(getattr(plan, "conv_width", 0) or 0)
-    kernel = max(1, int(getattr(plan, "conv_kernel", 1) or 1))
-    if conv_width > 0:
-        conv_elems = _ceil_div(conv_width * (kernel - 1 + proposals), shards)
-    else:
-        base_conv = _ceil_div(int(plan.conv_state_elements), shards)
-        slice_w = _ceil_div(base_conv, max(1, kernel - 1)) if base_conv else 0
-        conv_elems = base_conv + proposals * slice_w
-    conv_bytes = exact_element_bytes(conv_elems, str(plan.conv_state_dtype))
-    return rec_bytes + conv_bytes
+    del plan, shards, proposals
+    raise NotImplementedError(
+        "LEGACY_PURGED: delegate KDA state page sizing to canonical speculative_state_plan"
+    )
 
 
 def _project_paired_sfa_stage(
@@ -334,14 +312,10 @@ def _paired_sfa_stage_entries(case, layer_stage, query_tokens):
     mode = metadata.get("mamba_cache_mode", "align")
     if mode not in {"align", "none"}:
         raise ModelingError("paired_sfa_state_cache_mode_not_supported")
-    fallback = max(0, int(query_tokens) - 1)
-    draft_len = getattr(runtime.dspark, "draft_len", None)
-    if draft_len is not None and "draft_proposal_tokens" not in metadata:
-        fallback = max(0, int(draft_len))
-    proposals = int(metadata.get(
-        "num_speculative_state_blocks",
-        metadata.get("draft_proposal_tokens", fallback),
-    ))
+    raise NotImplementedError(
+        "LEGACY_PURGED: require explicit proposal count from SpeculativeExecutionContract / "
+        "DraftStepSchedule in _paired_sfa_stage_entries (fallback query_tokens-1 inference deleted)"
+    )
     extra = int(metadata.get("num_prefill_checkpoint_blocks", 0))
     if min(proposals, extra) < 0:
         raise ModelingError("paired_sfa_negative_state_slots")
@@ -442,13 +416,8 @@ def minimum_block_size(
     )
     if row_bytes <= 0:
         return 0
-    axis = str(kda_parallel_axis or "").strip().lower()
-    shards = max(1, int(tp)) * (1 if axis == "tp" else max(1, int(pcp)))
-    prop = max(0, int(proposals))
-    required = 0
-    for plan in recurrent:
-        state_page = _kda_state_page_bytes(plan, shards, prop)
-        tokens = _ceil_div(state_page, row_bytes)
-        if tokens > required:
-            required = tokens
-    return ((required + BLOCK_ALIGNMENT - 1) // BLOCK_ALIGNMENT) * BLOCK_ALIGNMENT
+    del tp, proposals, pcp, kda_parallel_axis, row_bytes, recurrent
+    raise NotImplementedError(
+        "LEGACY_PURGED: compute minimum_block_size via canonical speculative_state_plan "
+        "+ single KDA TPxPCP sharding helper"
+    )

@@ -98,7 +98,12 @@ def exact_element_bytes(elements: int, dtype: str) -> int:
     count = int(elements)
     if count <= 0:
         return 0
-    key = str(dtype or "bf16").strip().lower()
+    if not dtype or not str(dtype).strip():
+        raise NotImplementedError(
+            "LEGACY_PURGED: fail closed with ModelingError('cache_dtype_missing') "
+            "instead of silent bf16 coercion in exact_element_bytes"
+        )
+    key = str(dtype).strip().lower()
     if key in MXFP8_DTYPES:
         return count + _ceil_div(count, MX_GROUP_SIZE)
     if key in MXFP4_DTYPES:
@@ -119,34 +124,11 @@ def gbsa_cache_layout(runtime: Any) -> str:
 def _packed_mla_row_parts(
     model: Any, plan: Any, *, phase: str | None = None,
 ) -> tuple[int, int] | None:
-    """Return ``(payload_bytes, scale_bytes)`` for implicit packed INT8 MLA rows."""
-    from mindie_sim.catalog.cache_format import _lookup_region_decl
-
-    width = int(plan.cache_row_elements)
-    metadata = dict(getattr(model, "metadata", ()) or ())
-    if _lookup_region_decl(metadata, "mla_kv", plan=plan, phase=phase) is not None:
-        return None
-    quant = getattr(model, "quant", None)
-    kv_dtype = str(getattr(quant, "kv_dtype", "") or "").strip().lower()
-    latent = int(getattr(plan, "kv_lora_rank", 0) or 0)
-    rope = int(getattr(plan, "qk_rope_head_dim", 0) or 0)
-    if kv_dtype in INT8_PACKED_KV_DTYPES and latent > 0 and latent + rope == width:
-        scale_dtype = str(
-            metadata.get("kv_scale_dtype")
-            or (getattr(quant, "kv_scale_dtype", "") if quant is not None else "")
-            or "fp32"
-        ).strip().lower()
-        scales = exact_element_bytes(_ceil_div(latent, C8_SCALE_GROUP), scale_dtype)
-        return int(latent + rope * BF16_BYTES), int(scales)
-    if kv_dtype in FP8_PACKED_KV_DTYPES and latent > 0 and rope > 0 and latent + rope == width:
-        scale_dtype = str(
-            metadata.get("kv_scale_dtype")
-            or (getattr(quant, "kv_scale_dtype", "") if quant is not None else "")
-            or FP8_MLA_DEFAULT_SCALE_DTYPE
-        ).strip().lower()
-        scales = exact_element_bytes(_ceil_div(latent, C8_SCALE_GROUP), scale_dtype)
-        return int(latent + rope * BF16_BYTES), int(scales)
-    return None
+    """Unplugged W5a socket — duplicate packed MLA row calculator deleted."""
+    del model, plan, phase
+    raise NotImplementedError(
+        "LEGACY_PURGED: delegate MLA row parts to canonical CacheStateABI / catalog.cache_format"
+    )
 
 
 def _packed_mla_row_bytes(
@@ -188,31 +170,12 @@ def target_mla_page_bytes(model: Any, block_size: int, *,
 
 def _state_page_bytes(model: Any, parallel: Any, block_size: int,
                       runtime: Any = None) -> int:
-    """Per-rank integer recurrent+convolution state pitch for one request slot.
-
-    Each sharded state tensor uses exact integer ceiling division per rank
-    (``ceil(elements / shards)`` elements converted via ``exact_element_bytes``)
-    so indivisible tails are never silently truncated.
-    """
-    del block_size
-    plans = [plan for plan in getattr(model, "layer_plans", ())
-             if plan.attention in LINEAR_ATTENTION_KINDS]
-    if not plans:
-        return 0
-    tp = max(1, int(getattr(parallel, "tp", 1) or 1))
-    pcp = max(1, int(getattr(parallel, "pcp", 1) or 1))
-    axis = str(dict(getattr(runtime, "metadata", ()) or ()).get(
-        "kda_parallel_axis", "")).strip().lower()
-    # KDA under PCP shards heads (and state) across tp * pcp by default.
-    kda_pcp = 1 if axis == "tp" else pcp
-    total_bytes = 0
-    for plan in plans:
-        shards = tp * (kda_pcp if plan.attention == "kda" else 1)
-        local_rec = _ceil_div(int(plan.recurrent_state_elements), shards)
-        local_conv = _ceil_div(int(plan.conv_state_elements), shards)
-        total_bytes += exact_element_bytes(local_rec, str(plan.recurrent_state_dtype))
-        total_bytes += exact_element_bytes(local_conv, str(plan.conv_state_dtype))
-    return total_bytes
+    """Unplugged W5a socket — duplicate KDA TPxPCP state page calculator deleted."""
+    del model, parallel, block_size, runtime
+    raise NotImplementedError(
+        "LEGACY_PURGED: delegate state page bytes to speculative_state_plan "
+        "+ single canonical KDA TPxPCP sharding helper"
+    )
 
 
 def _draft_row_bytes_int(model: Any, draft: Any, *, tp: int) -> int:

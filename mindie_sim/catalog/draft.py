@@ -41,12 +41,9 @@ def draft_quant(model, draft):
     quant = model.quant
     from .paired_sfa import independent_draft
     if independent_draft(draft) and not draft.weight_category:
-        return replace(
-            quant, weight_format="bf16", expert_weight_format="bf16",
-            activation_format="bf16", kv_dtype="bf16",
-            activation_group_size=0, activation_scale_format="",
-            activation_scale_pack=1, scale_format="", scale_bytes=0.0,
-            output_format="", category_overrides=(),
+        raise NotImplementedError(
+            "LEGACY_PURGED: require explicit draft QuantSpec / weight_category from "
+            "checkpoint/catalog metadata (silent bf16 coercion deleted)"
         )
     if not draft.weight_category:
         return quant
@@ -72,16 +69,15 @@ def draft_quant(model, draft):
                 category_overrides=draft_overrides,
             )
             if independent_draft(draft) and getattr(draft, "context_projection_mode", "") == "fused_kv_bank":
-                result = replace(result, kv_dtype="bf16")
+                raise NotImplementedError(
+                    "LEGACY_PURGED: preserve declared draft kv_dtype for fused_kv_bank "
+                    "(hardcoded kv_dtype='bf16' coercion deleted)"
+                )
             return result
-    expert_fmt = quant.expert_weight_format if draft.num_experts > ZERO_EXPERTS else fmt
-    result = replace(
-        quant, weight_format=fmt, expert_weight_format=expert_fmt,
-        activation_format="bf16" if fmt == "bf16" else quant.activation_format,
+    raise NotImplementedError(
+        "LEGACY_PURGED: preserve native fp16/bf16/fp32 activation_format and declared "
+        "kv_dtype in draft_quant (hardcoded bf16 coercions deleted)"
     )
-    if independent_draft(draft) and getattr(draft, "context_projection_mode", "") == "fused_kv_bank":
-        result = replace(result, kv_dtype="bf16")
-    return result
 
 
 def optional_draft_spec(model: ModelSpec, kind: str) -> DraftSpec:

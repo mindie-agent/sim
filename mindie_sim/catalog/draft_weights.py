@@ -168,8 +168,10 @@ def _draft_ffn_terms(
             _t("draft_down", h, i, "dense_mlp", "dense_down"),
         ])
     if draft.mhc_lowrank > ZERO:
-        from mindie_sim.catalog.qwen4_exp import lowrank_hc_draft_terms
-        terms.extend(lowrank_hc_draft_terms(draft))
+        raise NotImplementedError(
+            "LEGACY_PURGED: import low-rank HC draft terms from structural module "
+            "instead of model-named catalog.qwen4_exp"
+        )
     elif draft.mhc_mult:
         mix = (2 + draft.mhc_mult) * draft.mhc_mult
         hc_dim = draft.mhc_mult * h
@@ -212,7 +214,12 @@ def draft_terms(
     ep: int = ONE,
 ) -> list[WeightTerm]:
     h = draft.hidden_size
-    dq = draft_quant(model, draft) if getattr(model, "quant", None) is not None else QuantSpec("bf16")
+    if getattr(model, "quant", None) is None:
+        raise NotImplementedError(
+            "LEGACY_PURGED: require normalized model.quant or native weight_dtype/activation_dtype "
+            "QuantSpec in draft_terms (silent QuantSpec('bf16') fallback deleted)"
+        )
+    dq = draft_quant(model, draft)
     terms: list[WeightTerm] = []
     if standalone_heads_only and draft.kind == "standalone_draft":
         # The standalone draft always consumes concatenated target features.
@@ -270,8 +277,10 @@ def draft_terms(
                         "draft_output_head", draft.vocab_size, h, "lm_head",
                         "out_tp", ONE, 0, 0, 0, False, True))
         if draft.mhc_lowrank > ZERO:
-            from mindie_sim.catalog.qwen4_exp import lowrank_hc_draft_head_terms
-            terms.extend(lowrank_hc_draft_head_terms(draft))
+            raise NotImplementedError(
+                "LEGACY_PURGED: import low-rank HC draft head terms from structural module "
+                "instead of model-named catalog.qwen4_exp"
+            )
     if draft.kind in {"mtp", "eagle3"} and draft.target_shared_lm_head:
         terms.append(WeightTerm(
             "target_lm_head_alias", draft.vocab_size, h,
@@ -297,7 +306,12 @@ def draft_weight_summary(
 ) -> tuple[float, float]:
     if model.auxiliary is None:
         return 0.0, 0.0
-    quant = model.quant or QuantSpec("bf16")
+    if model.quant is None:
+        raise NotImplementedError(
+            "LEGACY_PURGED: require normalized model.quant or native weight_dtype/activation_dtype "
+            "QuantSpec in draft_weight_summary (silent QuantSpec('bf16') fallback deleted)"
+        )
+    quant = model.quant
     parallel = ParallelSpec()
     drafts: list[DraftSpec] = []
     aux = model.auxiliary

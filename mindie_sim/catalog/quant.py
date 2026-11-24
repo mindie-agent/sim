@@ -167,7 +167,7 @@ def _quant_deepseek(c: Mapping[str, Any], *, v41: bool) -> QuantSpec:
     scale_fmt = str(q.get("scale_fmt", "ue8m0")).lower()
     scale_bytes = 1.0 if "e8m0" in scale_fmt else 4.0
     return QuantSpec(
-        name="fp8_dynamic+mxfp4_experts" if v41 else "fp8_dynamic+mxfp4_experts",
+        name="fp8_dynamic+mxfp4_experts",
         weight_format="fp8_e4m3", activation_format="fp8_e4m3",
         expert_weight_format="mxfp4",
         weight_block=block, expert_block=MX_EXPERT_BLOCK,
@@ -254,46 +254,11 @@ def _quant_kimi(c: Mapping[str, Any]) -> QuantSpec:
     )
 
 
-def _quant_qwen_mxfp8() -> QuantSpec:
-    """Declared W8A8-MXFP8 recipe the A5 950DT Qwen3.8 serving row used.
-
-    The checkpoint publishes ``W8A8_MXFP8`` (FP8 E4M3 weights and dynamic
-    activations, E8M0 block-32 scales).  Only the full-attention q/k/v/o
-    projections and the dense MLP gate/up/down matrices are quantized.  The
-    checkpoint's safetensors headers show the rest is BF16/FP32: norm,
-    embedding, LM head, vision, the depthwise conv weights, the 48 GDN
-    ``linear_attn`` projections (``in_proj_qkv/qkvz``, ``in_proj_z/ba``,
-    ``out_proj``) and the MTP draft layer (``mtp.layers.0.*``).  This is the
-    *declared* runtime representation, not a kernel claim: the FP8 GEMM is
-    priced through the measured MXFP8/fp8 dense row when the artifact
-    publishes one.
-    """
-    return QuantSpec(
-        name="W8A8_MXFP8",
-        weight_format="fp8_e4m3", activation_format="fp8_e4m3",
-        expert_weight_format="fp8_e4m3",
-        weight_block=(1, MX_EXPERT_BLOCK), expert_block=MX_EXPERT_BLOCK,
-        scale_format="fp8_e8m0", scale_bytes=1.0,
-        activation_group_size=MX_EXPERT_BLOCK, activation_scale_format="fp8_e8m0", activation_scale_pack=2,
-        kv_dtype="bf16", index_dtype="bf16", index_scale_dtype="none",
-        # ``gdn``: every GDN linear_attn projection is stored BF16 in this
-        # checkpoint; ``mtp``: the draft/MTP layer is BF16 too.  Leaving them
-        # unexcluded priced 1 872 GDN projection calls at p4096 on the FP8 row.
-        exclusions=("gdn", "mtp", "norm", "lm_head", "embedding", "attn_res_proj", "vision",
-                    "projector", "conv_weight_f32", "conv_weight_bf16"),
-        source=merge_source({
-            "quant_method": "mxfp8",
-            "weight_block_size": "1x32",
-            "activation_scheme": "dynamic",
-            "scale_fmt": "ue8m0",
-            "checkpoint": "Eco-Tech/Qwen3.8-27B-w8a8-mxfp8",
-        }),
-        notes=(
-            "measured A5 recipe: W8A8-MXFP8 (FP8 E4M3 / E8M0 block-32)",
-            "only full-attention q/k/v/o and dense MLP gate/up/down are quantized",
-            "GDN linear_attn projections + conv, MTP layer, norms, embedding, "
-            "LM head and vision stay BF16/FP32",
-        ),
+def _legacy_purged_mxfp8_preset() -> QuantSpec:
+    """Unplugged W5a socket replacing Qwen-specific _quant_qwen_mxfp8 generic aliases."""
+    raise NotImplementedError(
+        "LEGACY_PURGED: replace Qwen-specific _quant_qwen_mxfp8 generic aliases "
+        "with model-agnostic MXFP8 preset and checkpoint-derived exclusions"
     )
 
 
@@ -537,37 +502,22 @@ def resolve_auto_va_quant(
     *,
     context_tokens: int = 0,
 ) -> tuple[str, str, str]:
-    """Resolve chip-matched ``vllm-ascend`` production ``(weight_quant, kv_dtype, indexer_dtype)``."""
-    from mindie_sim.catalog.npu_checkpoints import normalize_hw_family
-
-    del context_tokens  # Production target KV quantization stays active across prompt lengths.
-    hw = normalize_hw_family(str(hardware_sku or ""))
-    plans = tuple(getattr(model_spec, "layer_plans", ()) or ())
-    is_moe = (
-        int(getattr(model_spec, "num_experts", 0) or 0) > 1
-        or any(str(getattr(lp, "ffn", "")).lower() == "moe" for lp in plans)
+    """Unplugged W5a socket — vendor auto-quant and A3 V4.1 INT8 KV coercion purged."""
+    del model_spec, hardware_sku, context_tokens
+    raise NotImplementedError(
+        "LEGACY_PURGED: move auto-quant policy out of L1 catalog/quant.py into L4 "
+        "stacks/vllm_ascend/quant_policy.py backed by ProbedAbiRegistry "
+        "(zero A3 V4.1 INT8 KV coercion or silent bf16 fallback)"
     )
-    has_kpool = any(int(getattr(lp, "index_kpool", 1) or 1) > 1 for lp in plans)
-    if hw == "a5":
-        return ("mxfp8_mxfp4" if is_moe else "mxfp8", "fp8_e4m3", "fp8_e4m3")
-    if hw in {"a2", "a3"}:
-        # K-pool index caches reject INT8 storage; keep BF16 indexer KV for K-pool on A2/A3.
-        idx_dtype = "bf16" if has_kpool else "int8"
-        return ("w4a8" if is_moe else "w8a8", "int8", idx_dtype)
-    native = str(getattr(model_spec, "activation_dtype", None) or "bf16")
-    return (native, native, native)
 
 
 #: Explicit quantization presets a case may declare on a catalog model.
 QUANTIZATION_PRESETS: dict[str, Any] = {
-    # Short names are explicit representation declarations, not dispatch claims.
-    # The FP8 short name intentionally selects the retained MXFP8 checkpoint
-    # policy, including its GDN/MTP exclusions; it is not every FP8 format.
-    "fp8": _quant_qwen_mxfp8,
-    "w8a8_mxfp8": _quant_qwen_mxfp8,
-    "w8a8-mxfp8": _quant_qwen_mxfp8,
-    "mxfp8": _quant_qwen_mxfp8,
-    "fp8_mxfp8": _quant_qwen_mxfp8,
+    "fp8": _legacy_purged_mxfp8_preset,
+    "w8a8_mxfp8": _legacy_purged_mxfp8_preset,
+    "w8a8-mxfp8": _legacy_purged_mxfp8_preset,
+    "mxfp8": _legacy_purged_mxfp8_preset,
+    "fp8_mxfp8": _legacy_purged_mxfp8_preset,
     "mxfp8_mxfp4": _quant_mxfp8_mxfp4,
     "mxfp8+mxfp4": _quant_mxfp8_mxfp4,
     "quarot_mxfp8_mxfp4": _quant_mxfp8_mxfp4,
@@ -596,31 +546,12 @@ QUANTIZATION_PRESETS: dict[str, Any] = {
 
 def quant_preset(name: str, *, model=None) -> QuantSpec:
     """Resolve a case-declared quantization preset; unknown names are refused."""
+    del model
     key = str(name or "").strip().lower()
     builder = QUANTIZATION_PRESETS.get(key)
     if builder is None:
         raise ValueError(f"quantization_preset_unknown:{name}")
-    quant = builder()
-    if (builder is _quant_qwen_mxfp8 and model is not None
-            and dict(model.metadata).get("source_model_type") == "glm5_next_text"):
-        native = {"weight_format": "bf16", "activation_format": "bf16"}
-        quant = replace(
-            quant,
-            exclusions=("norm", "lm_head", "embedding", "vision", "projector",
-                        "router", "conv_weight_f32", "conv_weight_bf16"),
-            category_overrides={
-                "kda": native, "mla_absorb": native, "indexer": native,
-                "indexer_fp8": native, "dspark_input": native,
-                "mla": {"weight_format": "fp8_e4m3", "activation_format": "fp8_e4m3"},
-            },
-            source=merge_source({
-                "quant_method": "mxfp8",
-                "checkpoint": "Eco-Tech/GLM-5.3-Flash-w8a8-mxfp8",
-                "weight_block_size": "1x32", "scale_fmt": "ue8m0",
-            }),
-            notes=("MLA projections and body/MTP experts use MXFP8; "
-                   "KDA, absorbed MLA, indexer and MTP input stay FLOAT",))
-    return quant
+    return builder()
 
 
 def _quant_bf16(c: Mapping[str, Any], *, name: str) -> QuantSpec:

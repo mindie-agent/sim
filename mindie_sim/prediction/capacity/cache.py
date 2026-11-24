@@ -138,53 +138,21 @@ class _MemoryCacheMixin:
         return tuple(result)
 
     def _draft_context_cap(self, draft) -> int:
-        try:
-            from mindie_sim.catalog.draft_spec import effective_draft_context_cap
-        except ImportError:
-            candidates: list[int] = []
-            spec_cap = int(getattr(draft, "max_position_embeddings", 0) or 0)
-            if spec_cap > 0:
-                candidates.append(spec_cap)
-            meta = dict(getattr(self.case.runtime, "metadata", ()) or ())
-            rt_cap = int(meta.get("draft_max_model_len") or 0)
-            if rt_cap > 0:
-                candidates.append(rt_cap)
-            spec_cfg = meta.get("speculative_config")
-            if isinstance(spec_cfg, Mapping):
-                for key in ("draft_max_model_len", "max_model_len", "max_position_embeddings"):
-                    cfg_cap = int(spec_cfg.get(key) or 0)
-                    if cfg_cap > 0:
-                        candidates.append(cfg_cap)
-            return min(candidates) if candidates else 0
-        return effective_draft_context_cap(draft, self.case.runtime)
+        del draft
+        raise NotImplementedError(
+            "LEGACY_PURGED: delegate unconditionally to catalog.draft_spec.effective_draft_context_cap "
+            "(duplicate except ImportError fallback shim deleted)"
+        )
 
     def _non_inherited_draft_cache_bytes(
         self, model, tokens: int, *, padded: bool, rank: int | None = None,
     ) -> tuple[float, bool]:
-        """Return ``(draft_kv_bytes, draft_is_dcp_sharded)`` honoring draft quant & cap."""
-        from mindie_sim.catalog.draft import optional_draft_spec
-
-        case, p = self.case, self.case.runtime.parallel
-        draft = optional_draft_spec(model, self.draft_kind)
-        draft_cap = self._draft_context_cap(draft)
-        eff_tokens = min(tokens, draft_cap) if draft_cap > 0 else tokens
-        block = max(1, int(cp_interleave(case.runtime)))
-        row_bytes = float(_draft_row_bytes_int(model, draft, tp=p.tp))
-        draft_sharded = _draft_is_dcp_sharded(
-            model, p, self.draft_kind,
-            dcp=int(getattr(p, "cp", 1) or 1),
-            draft_page=block * int(row_bytes),
+        """Unplugged W5a socket — target-TP assumption and float CP division purged."""
+        del model, tokens, padded, rank
+        raise NotImplementedError(
+            "LEGACY_PURGED: use SpeculativeExecutionContract.draft_tp and exact integer "
+            "CP token ownership in catalog/cache_pools.py"
         )
-        if draft_sharded and rank is not None and self.rank_token_owners is not None:
-            base_tokens = block_round(eff_tokens, block) if padded else eff_tokens
-            rows = float(owned_token_rows(base_tokens, self.rank_token_owners, int(rank)))
-        else:
-            draft_cp = int(p.cp) if draft_sharded else 1
-            rows = (
-                float(_context_shard_blocks(eff_tokens, block, draft_cp))
-                if padded else float(eff_tokens) / float(draft_cp)
-            )
-        return rows * row_bytes * float(draft.layers), draft_sharded
 
     def _uses_inherited_draft_cache(self, model) -> bool:
         """True when draft KV/state follows the declared draft LayerPlans."""
@@ -345,42 +313,12 @@ class _MemoryCacheMixin:
     def _paired_draft_bytes(
         self, tokens: int, *, rank: int | None = None, padded: bool = False,
     ) -> float:
-        """Draft KV bytes inside paired SFA honoring draft TP, draft DCP, and cap."""
-        from mindie_sim.catalog.draft import optional_draft_spec
-        from mindie_sim.catalog.paired_sfa import draft_row
-
-        p = self.case.runtime.parallel
-        draft = optional_draft_spec(self.case.model, self.draft_kind)
-        draft_cap = self._draft_context_cap(draft)
-        max_len = int(self.case.runtime.max_model_len or 0)
-        eff_tokens = min(tokens, max_len) if max_len > 0 else tokens
-        eff_tokens = min(eff_tokens, draft_cap) if draft_cap > 0 else eff_tokens
-        row_bytes = float(draft_row(self.case.model, draft, tp=p.tp))
-        block = max(1, int(self.case.runtime.kv_block_size or cp_interleave(self.case.runtime)))
-        sharded = _draft_is_dcp_sharded(
-            self.case.model, p, self.draft_kind,
-            dcp=int(getattr(p, "cp", 1) or 1),
-            draft_page=block * int(row_bytes),
+        """Unplugged W5a socket — target-TP assumption and float CP division purged."""
+        del tokens, rank, padded
+        raise NotImplementedError(
+            "LEGACY_PURGED: use SpeculativeExecutionContract.draft_tp and exact integer "
+            "CP token ownership in _paired_draft_bytes"
         )
-        draft_cp = int(p.cp) if sharded else 1
-        if rank is not None and sharded:
-            if self.rank_token_owners is not None:
-                base_tokens = block_round(eff_tokens, block) if padded else eff_tokens
-                rows = float(owned_token_rows(base_tokens, self.rank_token_owners, int(rank)))
-            elif eff_tokens > 0:
-                from mindie_sim.catalog.context_parallel import owned_positions
-                exact = owned_positions(
-                    0, eff_tokens - 1, draft_cp,
-                    cp_interleave(self.case.runtime), int(rank) % draft_cp,
-                )
-                rows = float(block_round(exact, block) if padded else exact)
-            else:
-                rows = 0.0
-        elif padded:
-            rows = float(_context_shard_blocks(eff_tokens, block, draft_cp))
-        else:
-            rows = float(eff_tokens) / float(draft_cp)
-        return rows * row_bytes * float(draft.layers)
 
     def _group_token_component(
         self, model, layer, parallel, group, name: str, valid_tokens: int,

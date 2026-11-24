@@ -370,69 +370,12 @@ class _MemoryLedgerMixin:
         return _LedgerBoundary(self._ledger_serial)
 
     def _typed_spec_bindings(self, replica: int, spec: dict):
-        """Translate one legacy grant spec onto canonical typed identities.
-
-        The declared ``rank`` is a storage-holder identity, not a new physical
-        die: a producer may name a KV owner rank that the placed envelope does
-        not enumerate (for example a TP1 case whose binding still names the
-        source rank).  Byte accounting already normalises that legacy value
-        through ``_account_rank``; the canonical pool/backing identity must use
-        the same accounting rank so a grant cannot fail with
-        ``memory_rank_out_of_range`` while the legacy ledger admits it.  The
-        raw declared rank stays in ``grant_records``/``grant_bindings``.
-        """
-        if self.ledger_domain is None:
-            return ()
-        stage = int(spec.get("stage", 0))
-        rank = spec.get("rank")
-        rank = 0 if rank is None else int(rank)
-        account_rank = self._account_rank(rank)
-        amount = float(spec.get("bytes", 0.0))
-        generation = self._ledger_generation(spec.get("generation"))
-        occurrence = self._ledger_occurrence(replica, stage, rank)
-        backing = BackingKey(
-            physical_domain=self.ledger_domain.domain_id, rank=account_rank,
-            tier=str(spec.get("tier", "hbm")),
-            storage_id=str(spec.get("physical_key", "")),
-            generation=generation)
-        ranges = tuple(
-            (int(math.floor(lo)), int(math.ceil(hi)))
-            for lo, hi in (spec.get("_ranges") or ()))
-        if not ranges and amount > 0:
-            ranges = ((0, int(math.floor(amount))),)
-        key = AllocationKey(
-            occurrence=occurrence, scope_kind="invocation",
-            scope_ordinal=int(spec.get("stage", 0)), symbol=self._ledger_serial,
-            generation=generation)
-        result = [AllocationBinding(
-            key=key, pool=self.ledger_pool(
-                replica, stage, account_rank, tier=str(spec.get("tier", "hbm")),
-                domain=self.ledger_domain.domain_id),
-            amount=amount, backing=backing, byte_ranges=ranges,
-            owner=str(spec.get("owner", "")),
-            storage=str(spec.get("storage", "")), access="readwrite")]
-        host = float(spec.get("host_bytes", 0.0))
-        if host > 0:
-            self._ledger_serial += 1
-            host_key = AllocationKey(
-                occurrence=self._ledger_occurrence(replica, stage, -1),
-                scope_kind="external", scope_ordinal=self._ledger_serial,
-                symbol=self._ledger_serial, generation=generation)
-            result.append(AllocationBinding(
-                key=host_key,
-                pool=PoolKey(
-                    physical_domain=self.ledger_domain.domain_id, rank=-1,
-                    tier="host", name="host", unit=int(replica)),
-                amount=host,
-                backing=BackingKey(
-                    physical_domain=self.ledger_domain.domain_id, rank=-1,
-                    tier="host",
-                    storage_id=str(spec.get("physical_key", "")) + "#host",
-                    generation=generation),
-                byte_ranges=((0, int(math.floor(host))),),
-                owner=str(spec.get("owner", "")),
-                storage=str(spec.get("storage", "")), access="readwrite"))
-        return tuple(result)
+        """Unplugged W5a socket — float-range floor/ceil grant translation shim deleted."""
+        del replica, spec
+        raise NotImplementedError(
+            "LEGACY_PURGED: construct typed integer half-open ByteRange / AllocationSpec "
+            "directly at grant creation (float floor/ceil shim deleted)"
+        )
 
     def bind_runtime(self, state, *, domain_id: str = "memory") -> CapacityDomainState:
         """Adopt a detached ledger domain into the one runtime root.
@@ -1038,7 +981,12 @@ class _MemoryLedgerMixin:
         if vision_accounting not in VISION_ACCOUNTING_SCOPES:
             raise ValueError(f"vision_accounting_invalid:{vision_accounting!r}")
         model = self.case.model
-        quant = model.quant or QuantSpec("bf16")
+        if model.quant is None:
+            raise NotImplementedError(
+                "LEGACY_PURGED: require normalized model.quant in _resolve_vision_delta_by_stage "
+                "(silent QuantSpec('bf16') fallback deleted)"
+            )
+        quant = model.quant
         vision_all = int(round(sum(
             term_bytes(term, quant, p, self.case.machine.ranks_per_node)
             for term in vision_weight_terms(model, include_vision=True)
@@ -1056,31 +1004,12 @@ class _MemoryLedgerMixin:
         return vision_stage, delta_stage
 
     def _stage_checkpoint_vs_prepared_split(self, stage: int) -> tuple[int, int]:
-        """Split ``self.weights[stage]`` into source checkpoint vs runtime-only prepared bytes."""
-        from mindie_sim.catalog.types import QuantSpec
-        from mindie_sim.catalog.weight_terms import term_bytes
-        from mindie_sim.catalog.weights import _expand_resident_terms, stage_weight_terms
-
-        model = self.case.model
-        p = self.case.runtime.parallel
-        quant = model.quant or QuantSpec("bf16")
-        include_vision = self.vision_accounting == "full_checkpoint"
-        all_stage_terms = stage_weight_terms(
-            model, p, include_draft=bool(self.draft_kind),
-            draft_kind=self.draft_kind or None,
-            include_engram_tables=not self.case.runtime.engram_cpu_offload,
-            include_vision=include_vision, layer_partition=self.layers,
-            slot_plans=self.slot_plans,
+        """Unplugged W5a socket — hardcoded placement-dropping weight split purged."""
+        del stage
+        raise NotImplementedError(
+            "LEGACY_PURGED: project weight split directly from canonical Memory._init_weights "
+            "per-Die resident terms (preserving shared_expert_dp, pcp_o_proj_weight_sharding, dcp_q_replicate)"
         )
-        runtime_only = 0.0
-        for term in all_stage_terms[stage]:
-            if term.source_owned:
-                continue
-            for t_sub, placed in _expand_resident_terms(term, p, False, model=model):
-                runtime_only += term_bytes(t_sub, quant, placed, self.case.machine.ranks_per_node)
-        prep_b = int(round(runtime_only))
-        ckpt_b = max(0, int(round(self.weights[stage])) - prep_b)
-        return ckpt_b, prep_b
 
     def _unified_pool_stride_reserve_by_stage(
         self,
@@ -1088,53 +1017,12 @@ class _MemoryLedgerMixin:
         *,
         query_tokens: int | None = None,
     ) -> list[float]:
-        """Per-stage per-request unified hybrid-pool stride alignment reserve."""
-        p = self.case.runtime.parallel
-        zeros = [0.0] * p.pp
-        seq = int(sequence_tokens)
-        if seq <= 0:
-            return zeros
-        from mindie_sim.catalog.qwen4_exp import qwen4_exp_pool_breakdown
-
-        q_tok = self._effective_cache_query_tokens(query_tokens)
-        cp = max(1, int(getattr(p, "cp", 1) or 1))
-        eff_seq = (seq + cp - 1) // cp if cp > 1 else seq
-        qwen4_pool = qwen4_exp_pool_breakdown(
-            self.case.model, p, eff_seq,
-            runtime=self.case.runtime, query_tokens=q_tok,
+        """Unplugged W5a socket — AG014 qwen4_exp_pool_breakdown residual smear deleted."""
+        del sequence_tokens, query_tokens
+        raise NotImplementedError(
+            "LEGACY_PURGED: delegate uniformly to catalog.cache_pools.HybridPoolReceipt "
+            "(all 4 structural pool regimes; zero AG014 model-gated pool breakdown)"
         )
-        if not qwen4_pool:
-            return zeros
-        alloc_stages = self._cache_component_breakdown(
-            seq, padded=True, skip_covered=True, query_tokens=q_tok,
-        )
-        target_base = 0.0
-        for st in range(p.pp):
-            for name, detail in alloc_stages[st]["components"].items():
-                if not name.startswith("draft_"):
-                    target_base += float(detail.get("total", 0.0) or 0.0)
-        if self.pages.groups:
-            group_payload = self.pages.stage_bytes(seq, self.case.runtime.max_model_len, p.pp)
-            group_parts = self._group_cache_parts(seq, query_tokens=q_tok)
-            for st in range(p.pp):
-                target_base += max(
-                    float(group_payload[st]),
-                    float(group_parts[st]["alloc_payload"]) + float(group_parts[st]["alloc_scale"]),
-                )
-        stride_reserve = max(0.0, float(qwen4_pool["total_pool_bytes"]) - target_base)
-        if stride_reserve <= 0.0:
-            return zeros
-        qsa_per_stage = [0] * p.pp
-        for lp in self.case.model.layer_plans:
-            if lp.attention == "gqa" and lp.indexer:
-                st = self.layer_stage[lp.index]
-                if 0 <= st < p.pp:
-                    qsa_per_stage[st] += 1
-        total_qsa = sum(qsa_per_stage)
-        if total_qsa <= 0:
-            zeros[0] = stride_reserve
-            return zeros
-        return [stride_reserve * (float(cnt) / float(total_qsa)) for cnt in qsa_per_stage]
 
     def _projected_stage_cache_pools(
         self,
@@ -1142,87 +1030,12 @@ class _MemoryLedgerMixin:
         batch_per_dp: int,
         query_tokens: int | None,
     ) -> list[dict[str, int]] | None:
-        """Per-stage projected KV/Index/State/Draft bytes for ``batch_per_dp`` requests."""
-        if sequence_tokens is None or int(batch_per_dp) <= 0:
-            return None
-        from .cache import _COMPONENT_POOL_MAP
-
-        p = self.case.runtime.parallel
-        b_int = int(batch_per_dp)
-        alloc_stages = self._cache_component_breakdown(
-            int(sequence_tokens), padded=True, skip_covered=True, query_tokens=query_tokens,
+        """Unplugged W5a socket — stage-broadcast float cache receipt lie deleted."""
+        del sequence_tokens, batch_per_dp, query_tokens
+        raise NotImplementedError(
+            "LEGACY_PURGED: wire per-Die exact integer DieResidentReceipt projected directly "
+            "from rank-local admission bytes (including dcp_dp_width cohort union; zero 48/48 B receipt lie)"
         )
-        valid_stages = self._cache_component_breakdown(
-            int(sequence_tokens), padded=False, skip_covered=True, query_tokens=query_tokens,
-        )
-        group_parts = (
-            self._group_cache_parts(int(sequence_tokens), query_tokens=query_tokens)
-            if self.pages.groups else None
-        )
-        group_payload = (
-            self.pages.stage_bytes(int(sequence_tokens), self.case.runtime.max_model_len, p.pp)
-            if self.pages.groups else None
-        )
-        group_metadata = (
-            self.pages.metadata_stage_bytes(int(sequence_tokens), self.case.runtime.max_model_len, p.pp)
-            if self.pages.groups else None
-        )
-        stage_cache_bytes = self.cache_bytes(
-            int(sequence_tokens), padded=True, query_tokens=query_tokens,
-        )
-        stride_reserves = self._unified_pool_stride_reserve_by_stage(
-            int(sequence_tokens), query_tokens=query_tokens,
-        )
-        per_stage: list[dict[str, int]] = []
-        for stage in range(p.pp):
-            alloc_pools = {"target_kv_bytes": 0.0, "indexer_k_bytes": 0.0,
-                           "recurrent_state_bytes": 0.0, "draft_kv_bytes": 0.0,
-                           "draft_state_bytes": 0.0}
-            valid_pools = {"target_kv_bytes": 0.0, "indexer_k_bytes": 0.0}
-            for name, detail in alloc_stages[stage]["components"].items():
-                key = _COMPONENT_POOL_MAP.get(name)
-                if key in alloc_pools:
-                    alloc_pools[key] += float(detail["total"])
-            for name, detail in valid_stages[stage]["components"].items():
-                key = _COMPONENT_POOL_MAP.get(name)
-                if key in valid_pools:
-                    valid_pools[key] += float(detail["total"])
-            group_reserve = 0.0
-            if group_parts is not None and group_payload is not None and group_metadata is not None:
-                known_group = 0.0
-                for name, detail in group_parts[stage]["components"].items():
-                    key = _COMPONENT_POOL_MAP.get(name)
-                    part_alloc = float(detail["alloc_payload"]) + float(detail["alloc_scale"])
-                    if key in alloc_pools:
-                        alloc_pools[key] += part_alloc
-                        known_group += part_alloc
-                    if key in valid_pools:
-                        valid_pools[key] += float(detail["valid_payload"]) + float(detail["valid_scale"])
-                group_reserve = max(0.0, float(group_payload[stage]) - known_group)
-                alloc_pools["target_kv_bytes"] += group_reserve + float(group_metadata[stage])
-            stride_reserve = float(stride_reserves[stage]) if stage < len(stride_reserves) else 0.0
-            if stride_reserve > 0.0:
-                alloc_pools["target_kv_bytes"] += stride_reserve
-            idx_a = int(round(b_int * alloc_pools["indexer_k_bytes"]))
-            rec_a = int(round(b_int * alloc_pools["recurrent_state_bytes"]))
-            drf_a = int(round(b_int * (alloc_pools["draft_kv_bytes"] + alloc_pools["draft_state_bytes"])))
-            expected_total = int(round(b_int * (float(stage_cache_bytes[stage]) + stride_reserve)))
-            non_kv = idx_a + rec_a + drf_a
-            kv_a = (
-                expected_total - non_kv
-                if expected_total >= non_kv
-                else int(round(b_int * alloc_pools["target_kv_bytes"]))
-            )
-            per_stage.append({
-                "kv_alloc": kv_a,
-                "kv_valid": int(round(b_int * valid_pools["target_kv_bytes"])),
-                "idx_alloc": idx_a,
-                "idx_valid": int(round(b_int * valid_pools["indexer_k_bytes"])),
-                "rec": rec_a,
-                "draft": drf_a,
-                "page_group_reserve": int(round(b_int * (group_reserve + stride_reserve))),
-            })
-        return per_stage
 
     def _build_die_receipt(
         self,

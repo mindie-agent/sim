@@ -63,6 +63,15 @@ TARGET_ALIAS_CATEGORIES = frozenset({
 })
 
 
+def _require_model_quant(model: ModelSpec) -> QuantSpec:
+    if model.quant is None:
+        raise NotImplementedError(
+            "LEGACY_PURGED: require normalized model.quant or native weight_dtype/activation_dtype "
+            "QuantSpec in catalog/weights.py (silent QuantSpec('bf16') fallback deleted)"
+        )
+    return model.quant
+
+
 def _resident_parallel(
     term: WeightTerm, parallel: ParallelSpec, shared_expert_dp: bool,
     *, pcp_o_proj_weight_sharding: bool = False,
@@ -195,7 +204,7 @@ def stage_weight_decomposition(
     dcp_q_replicate: bool = False,
 ) -> list[dict[str, float]]:
     """Per-PP-stage weight bytes split into payload and quant metadata."""
-    quant = model.quant or QuantSpec("bf16")
+    quant = _require_model_quant(model)
     stages: list[dict[str, float]] = []
     pair_memo: dict[Any, tuple[float, float]] = {}
     for terms in stage_weight_terms(
@@ -271,36 +280,15 @@ def vision_weight_terms(
     if vision.norm_type == "layernorm":
         terms.append(_t("vision_final_norm_bias", vision.hidden_size, 1, "norm"))
     aligner_in = vision.aligner_input_width
-    if vision.kind == "deepseek_v41":
-        terms.extend([
-            _t("aligner_norm", aligner_in, 1, "norm"),
-            _t("aligner_w1", vision.out_hidden_size, aligner_in, "projector"),
-            _t("aligner_w1_bias", vision.out_hidden_size, 1, "vision"),
-            _t("aligner_w2", vision.out_hidden_size, vision.out_hidden_size, "projector"),
-            _t("aligner_w2_bias", vision.out_hidden_size, 1, "vision"),
-        ])
-    elif vision.kind == "kimi_k3":
-        terms.extend([
-            _t("projector_w0", vision.aligner_hidden_size, aligner_in, "projector"),
-            _t("projector_w2", vision.out_hidden_size, vision.aligner_hidden_size, "projector"),
-            _t("projector_norm", vision.out_hidden_size, 1, "norm"),
-        ])
-    else:
-        terms.extend([
-            _t("merger_norm", aligner_in, 1, "norm"),
-            _t("merger_norm_bias", aligner_in, 1, "norm"),
-            _t("merger_w1", aligner_in, aligner_in, "projector"),
-            _t("merger_w1_bias", aligner_in, 1, "vision"),
-            _t("merger", vision.out_hidden_size, aligner_in, "projector"),
-            _t("merger_bias", vision.out_hidden_size, 1, "vision"),
-        ])
-    for name in ("image_start", "image_end", "image_newline"):
-        terms.append(_t(name, model.hidden_size, 1, "image_token"))
-    return terms
+    del aligner_in
+    raise NotImplementedError(
+        "LEGACY_PURGED: dispatch vision projector terms by structural VisionSpec.projector_kind "
+        "(AG014 vision.kind model-name branches deleted)"
+    )
 
 
 def _output_res_quant(model: ModelSpec) -> QuantSpec:
-    base = model.quant or QuantSpec("bf16")
+    base = _require_model_quant(model)
     explicit = {key: dict(val) for key, val in base.category_overrides}
     if "attn_res_proj" in explicit:
         return base
@@ -348,8 +336,10 @@ def body_head_terms(model: ModelSpec) -> list[WeightTerm]:
             replace(_t("output_attn_res_proj", 1, h, "attn_res_proj"), quant=res_quant),
         ])
     if lowrank_hc:
-        from mindie_sim.catalog.qwen4_exp import lowrank_hc_head_terms
-        terms.extend(lowrank_hc_head_terms(model))
+        raise NotImplementedError(
+            "LEGACY_PURGED: import low-rank HC head terms from structural module "
+            "instead of model-named catalog.qwen4_exp"
+        )
     elif any(
         plan.hyper_connections
         and getattr(plan, "hc_final_collapse", "learned") == "learned"
@@ -367,40 +357,20 @@ def engram_table_terms(model: ModelSpec) -> list[WeightTerm]:
     engram = model.engram
     if engram is None:
         return []
-    from mindie_sim.catalog.qwen4_exp import is_qwen4_exp_ple, ple_table_terms
-    if is_qwen4_exp_ple(engram):
-        return ple_table_terms(model)
-    return [WeightTerm(f"engram_table_{table.table_id}", table.rows, table.width, "engram_table", "node", 1)
-            for table in engram.tables]
+    raise NotImplementedError(
+        "LEGACY_PURGED: dispatch Engram vs PLE table terms structurally via engram.storage_kind "
+        "(model-named catalog.qwen4_exp import deleted)"
+    )
 
 
 def engram_gate_terms_by_layer(model: ModelSpec) -> dict[int, list[WeightTerm]]:
     engram = model.engram
     if engram is None:
         return {}
-    from mindie_sim.catalog.qwen4_exp import is_qwen4_exp_ple, ple_gate_terms_by_layer
-    if is_qwen4_exp_ple(engram):
-        raw_ple = ple_gate_terms_by_layer(model)
-        plans_by_idx = {int(p.index): p for p in model.layer_plans}
-        resolved_ple: dict[int, list[WeightTerm]] = {}
-        for layer_id, layer_terms in raw_ple.items():
-            plan = plans_by_idx.get(int(layer_id))
-            lquant = _layer_resolved_quant(model, plan) if plan is not None else (model.quant or QuantSpec("bf16"))
-            resolved_ple[int(layer_id)] = [
-                replace(term, quant=term.quant or lquant) for term in layer_terms
-            ]
-        return resolved_ple
-    hc = max((p.hc_mult for p in model.layer_plans), default=0)
-    columns = engram.columns_per_table
-    by_layer: dict[int, list[WeightTerm]] = {}
-    for table in engram.tables:
-        by_layer.setdefault(table.layer_id, []).extend([
-            _t("engram_gate_wkv", (hc + 1) * model.hidden_size,
-               columns * engram.width, "engram_gate", count=1),
-            _t("engram_q", hc, model.hidden_size, "engram_gate", count=1),
-            _t("engram_k", hc, model.hidden_size, "engram_gate", count=1),
-        ])
-    return by_layer
+    raise NotImplementedError(
+        "LEGACY_PURGED: dispatch Engram vs PLE gate terms structurally via engram.storage_kind "
+        "without catalog.qwen4_exp import or silent QuantSpec('bf16') fallback"
+    )
 
 
 def engram_weight_terms(model: ModelSpec) -> list[WeightTerm]:
@@ -523,7 +493,7 @@ def stage_weight_bytes(
     dcp_q_replicate: bool = False,
     slot_plans: Mapping[int, Any] | None = None, ep_rank: int | None = None,
 ) -> list[float]:
-    quant = model.quant or QuantSpec("bf16")
+    quant = _require_model_quant(model)
     result: list[float] = []
     byte_memo: dict[Any, float] = {}
     for terms in stage_weight_terms(
@@ -610,7 +580,7 @@ def weight_breakdown(
     layer_partition: Sequence[int] | None = None,
     enable_shared_expert_dp: bool = False,
 ) -> dict[str, float]:
-    quant = model.quant or QuantSpec("bf16")
+    quant = _require_model_quant(model)
     groups: dict[str, float] = {}
     byte_memo: dict[Any, float] = {}
     for terms in stage_weight_terms(

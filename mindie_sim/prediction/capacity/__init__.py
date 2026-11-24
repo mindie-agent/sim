@@ -84,21 +84,16 @@ __all__ = [
     "CaseSpec",
     "DieResidentReceipt",
     "EventKey",
-    "FIRST",
     "Ledger",
     "Mapping",
     "Memory",
     "MemoryPolicy",
-    "ONE",
-    "ONE_FLOAT",
     "OccurrenceKey",
     "PoolKey",
     "QuantSpec",
     "RecoverSsmRingBreakdown",
     "ResidentGrantEntry",
     "ResidentMemoryReceipt",
-    "ZERO",
-    "ZERO_FLOAT",
     "annotations",
     "cache_component_split",
     "cache_row_split",
@@ -118,20 +113,6 @@ __all__ = [
     "term_bytes",
     "term_payload_bytes",
 ]
-
-
-def __getattr__(name: str):
-    """Resolve numeric aliases exposed by the original module's import surface."""
-    match name:
-        case "FIRST" | "ZERO":
-            return 0
-        case "ONE":
-            return 1
-        case "ZERO_FLOAT":
-            return 0.0
-        case "ONE_FLOAT":
-            return 1.0
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def __dir__() -> list[str]:
@@ -179,12 +160,18 @@ class Memory(
                 query_tokens=self.query_tokens)) for layer in case.model.layer_plans},
             self.layer_stage,
         )
-        self.draft_kind = (dict(case.runtime.metadata).get("draft_mode") or
-                           ("dspark" if case.runtime.dspark else "mtp" if
-                            case.runtime.mtp_acceptance_length > 1 or any(
-                                value > 1 for _, value in case.runtime.mtp_acceptance_by_output_tokens)
-                            or dict(case.runtime.metadata).get("speculative")
-                            else ""))
+        _raw_draft_mode = dict(case.runtime.metadata).get("draft_mode")
+        if not _raw_draft_mode and (
+            case.runtime.dspark
+            or case.runtime.mtp_acceptance_length > 1
+            or any(value > 1 for _, value in case.runtime.mtp_acceptance_by_output_tokens)
+            or dict(case.runtime.metadata).get("speculative")
+        ):
+            raise NotImplementedError(
+                "LEGACY_PURGED: read draft_kind strictly from SpeculativeExecutionContract "
+                "(catalog/draft_spec.py); zero silent ngram/speculative->mtp coercion"
+            )
+        self.draft_kind = str(_raw_draft_mode or "")
         draft = bool(self.draft_kind)
         self.offload = _resolve_offload_ratios(case, self.policy)
         self.kvc_hbm_ratio = max(
@@ -299,7 +286,11 @@ class Memory(
         ]
         if case.runtime.engram_cpu_offload and case.model.engram is not None:
             from mindie_sim.catalog.weights import engram_table_terms
-            quant = case.model.quant or QuantSpec("bf16")
+            if case.model.quant is None:
+                raise NotImplementedError(
+                    "LEGACY_PURGED: require normalized case.model.quant instead of silent QuantSpec('bf16')"
+                )
+            quant = case.model.quant
             table_bytes = float(sum(
                 term_bytes(term, quant, p, case.machine.ranks_per_node)
                 for term in engram_table_terms(case.model)
@@ -372,7 +363,7 @@ class Memory(
         self.fixed_per_rank = fixed_per_rank
         self.rank_capacity = [
             [
-                [die.hbm_bytes * case.runtime.gpu_memory_utilization
+                [math.floor(die.hbm_bytes * case.runtime.gpu_memory_utilization)
                  - fixed_per_rank[stage] for die in self._stage_dies(replica, stage)]
                 for stage in range(p.pp)
             ]

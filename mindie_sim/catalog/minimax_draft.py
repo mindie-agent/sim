@@ -12,8 +12,8 @@
     preserving the checkpoint's ``swigluoai`` clamping scalars and ``qk_norm``.
   * Parallel multi-module DSpark (``num_mtp_modules > 0``) executes as a single
     non-causal query block pass and shares the target embedding and LM head.
-  * Optional ``DraftSpec`` context-preparation flags are forwarded dynamically
-    via ``DraftSpec.__dataclass_fields__`` without ``inspect.signature``.
+  * Optional ``DraftSpec`` context-preparation flags are passed directly to
+    frozen ``DraftSpec`` fields.
 
 [Timeouts & Locks]
   Pure in-memory dataclass construction bounded by ``num_mtp_modules``; no I/O,
@@ -48,11 +48,6 @@ MINIMAX_DSPARK_SOURCE: dict[str, str] = {
     "relative_path": "vllm_ascend/models/minimax_m3/minimax_m3_dspark.py",
     "source_sha256": "124448ab8840d1c07636b65d89b344e0a280fff1ef3d3782e58c407313d18b32",
 }
-
-
-def _draft_compat_kwargs(**candidates: Any) -> dict[str, Any]:
-    declared = DraftSpec.__dataclass_fields__
-    return {key: value for key, value in candidates.items() if key in declared}
 
 
 def build_minimax_auxiliary(
@@ -169,11 +164,9 @@ def build_minimax_auxiliary(
             },
         ),
         notes=("MiniMax-M3 dense GQA DSpark modules; PR #20167",),
-        **_draft_compat_kwargs(
-            independent_context=True,
-            context_projection_mode="per_layer_qkv",
-            dcp_sharded=False,
-        ),
+        independent_context=True,
+        context_projection_mode="per_layer_qkv",
+        dcp_sharded=False,
     )
     return AuxiliarySpec(
         mtp=spec,

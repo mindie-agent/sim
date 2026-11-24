@@ -158,86 +158,16 @@ def cache_component_ranges(
     query_tokens: int | None = None, block_size: int | None = None,
     generation: int = 0,
 ) -> tuple[CacheRange, ...]:
-    """Physical shared-prefix and private-suffix ranges for one layer.
-
-    Always computes ``valid_bytes`` from ``capacity_padded=False`` and
-    ``allocated_bytes`` from ``capacity_padded=True`` (when requested) so
-    padded page tails are never misclassified as valid content.
-    """
-    length = max(0, int(sequence_tokens))
-    page_tokens = max(
-        1,
-        int(block_size if block_size is not None else (
-            getattr(runtime, "kv_block_size", 0) or interleave
-        )),
+    """Unplugged W5a socket — phase-dropping cache_component_ranges purged."""
+    del (
+        model, layer, parallel, sequence_tokens, prefix_tokens, interleave,
+        rank, capacity_padded, owner_spans, runtime, query_tokens, block_size,
+        generation,
     )
-    prefix = max(0, min(int(prefix_tokens), length))
-    prefix = _component_prefix_tokens(layer, prefix)
-    prefix = _block_tokens(prefix, page_tokens)
-    unpadded = layer_cache_components(
-        model, layer, parallel, length, capacity_padded=False,
-        interleave=interleave, block_size=page_tokens, rank=rank,
-        owner_spans=owner_spans, runtime=runtime, query_tokens=query_tokens,
+    raise NotImplementedError(
+        "LEGACY_PURGED: thread explicit phase parameter through cache_component_ranges "
+        "into every layer_cache_components call"
     )
-    if prefix <= 0:
-        prefix_values = {name: 0.0 for name in unpadded}
-    else:
-        prefix_values = layer_cache_components(
-            model, layer, parallel, prefix, capacity_padded=False,
-            interleave=interleave, block_size=page_tokens, rank=rank,
-            owner_spans=owner_spans, runtime=runtime, query_tokens=query_tokens,
-        )
-    if capacity_padded:
-        allocated = layer_cache_components(
-            model, layer, parallel, length, capacity_padded=True,
-            interleave=interleave, block_size=page_tokens, rank=rank,
-            owner_spans=owner_spans, runtime=runtime, query_tokens=query_tokens,
-        )
-    else:
-        allocated = unpadded
-    win = max(0, int(getattr(layer, "window", 0) or 0))
-    gen = int(generation)
-    ranges: list[CacheRange] = []
-    for name, value in unpadded.items():
-        valid = float(value)
-        allocated_value = float(allocated.get(name, valid))
-        if name in STATE_COMPONENTS or valid <= 0.0:
-            component = str(name)
-            ranges.append(CacheRange(
-                int(layer.index), component, str(component), 0, length,
-                "", gen, SHARING_PRIVATE, rank, allocated_value, valid,
-                f"layer{layer.index}:{component}:private:{rank}", (),
-            ))
-            continue
-        if win > 0 and str(name) in WINDOW_BOUND_COMPONENTS:
-            win_start = max(0, length - win)
-            live_len = max(0, length - win_start)
-            live_shared = max(0, min(prefix, length) - win_start)
-            shared = (
-                valid * (float(live_shared) / float(live_len))
-                if live_len > 0 and live_shared > 0 else 0.0
-            )
-            sh_start = win_start
-            sh_end = max(win_start, min(prefix, length))
-        else:
-            shared = min(valid, float(prefix_values.get(name, 0.0)))
-            sh_start = 0
-            sh_end = prefix
-        private = max(0.0, valid - shared)
-        if shared > 0.0:
-            ranges.append(CacheRange(
-                int(layer.index), str(name), str(name), sh_start, sh_end,
-                "", gen, SHARING_SHARED, rank, shared, shared,
-                f"layer{layer.index}:{name}:{sh_start}:{sh_end}:shared",
-                _page_id_span(sh_start, sh_end, page_tokens),
-            ))
-        ranges.append(CacheRange(
-            int(layer.index), str(name), str(name), sh_end, length,
-            "", gen, SHARING_PRIVATE, rank, max(0.0, allocated_value - shared),
-            private, f"layer{layer.index}:{name}:private:{rank}",
-            _page_id_span(sh_end, length, page_tokens),
-        ))
-    return tuple(ranges)
 
 
 def _prefixed(ranges: Sequence[CacheRange], prefix_key: str,
@@ -283,19 +213,12 @@ def draft_cache_components(
 
 
 def _active_draft_kind(model: Any, runtime: Any) -> str:
-    if getattr(model, "auxiliary", None) is None or runtime is None:
-        return ""
-    meta = dict(getattr(runtime, "metadata", ()) or ())
-    declared = str(meta.get("draft_mode") or "")
-    if declared:
-        return declared
-    if getattr(runtime, "dspark", None):
-        return "dspark"
-    if (float(getattr(runtime, "mtp_acceptance_length", ONE) or ONE) > ONE
-            or any(val > ONE for _, val in getattr(runtime, "mtp_acceptance_by_output_tokens", ()))
-            or meta.get("speculative")):
-        return "mtp"
-    return ""
+    """Unplugged W5a socket — heuristic mtp coercion deleted."""
+    del model, runtime
+    raise NotImplementedError(
+        "LEGACY_PURGED: read draft kind strictly from SpeculativeExecutionContract "
+        "in catalog/draft_spec.py"
+    )
 
 
 def _view_generation(view: Any) -> int:
@@ -536,17 +459,3 @@ def batch_cache_footprint(
         tuple(float(value) for value in boundary),
         tuple(float(value) for value in total),
         requests=len(requests), stages=stages)
-
-
-def physical_union(
-    values: Sequence[float], owner_keys: Sequence[str] | None = None,
-) -> float:
-    """Reference-counted interval union helper for callers with known keys."""
-    if owner_keys is not None and len(owner_keys) != len(values):
-        raise ModelingError("cache_union_owner_keys_mismatch")
-    if owner_keys is None:
-        return float(math.fsum(float(value) for value in values))
-    union: dict[str, float] = {}
-    for key, value in zip(owner_keys, values):
-        union[str(key)] = max(union.get(str(key), ZERO), float(value))
-    return float(math.fsum(union.values()))

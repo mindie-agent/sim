@@ -205,11 +205,6 @@ DSV4_DSPARK_SOURCE: dict[str, str] = {
 }
 
 
-def _draft_compat_kwargs(**candidates: Any) -> dict[str, Any]:
-    declared = DraftSpec.__dataclass_fields__
-    return {key: value for key, value in candidates.items() if key in declared}
-
-
 def _aux_deepseek(c: Mapping[str, Any], *, v41: bool, d: Mapping[str, Any]) -> AuxiliarySpec:
     h = int(c["hidden_size"])
     experts = _int(c, "n_routed_experts")
@@ -276,10 +271,8 @@ def _aux_deepseek(c: Mapping[str, Any], *, v41: bool, d: Mapping[str, Any]) -> A
             },
         ),
         notes=("native se-tools MTP uses dspark expert geometry; one selected mode",),
-        **_draft_compat_kwargs(
-            independent_context=False,
-            context_projection_mode="shared_compressed_kv",
-        ),
+        independent_context=False,
+        context_projection_mode="shared_compressed_kv",
     )
     if dspark_mode:
         # The declared auxiliary for a multi-token block IS the native DSpark
