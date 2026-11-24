@@ -111,10 +111,8 @@ TID_OVERLAP_FREE = 3
 #: Counter thread ID inside the ``Ascend Metrics`` process.
 TID_METRICS_COUNTER = 0
 
-#: Minimum visible sub-pipe span (1 ns = 0.001 us) and host launch submission duration (us).
+#: Minimum visible sub-pipe span (1 ns = 0.001 us).
 PIPE_MIN_SUBSPAN_US = 0.001
-HOST_GRAPH_LAUNCH_US = 12.0
-HOST_KERNEL_LAUNCH_US = 1.5
 
 #: Canonical ``msprof`` process and thread specification exported for introspection.
 MSPROF_PROCESS_SPEC: dict[str, tuple[tuple[int, str], ...]] = {
@@ -275,38 +273,12 @@ def _iter_metadata_events(
 def _compute_physical_pipe_times(
     op: OperatorExportRow, peaks: Mapping[str, float],
 ) -> dict[str, float]:
-    """Compute true physical pipe busy durations (us) & ``msprof`` ratios from HW peaks."""
-    cube_rate = op.cube_peak_flops_per_s or float(peaks.get("cube_peak_flops_per_s") or 0.0)
-    vec_rate = float(peaks.get("vector_peak_ops_per_s") or 0.0)
-    hbm_rate = float(peaks.get("hbm_peak_bytes_per_s") or 0.0)
-    mte2_rate = float(peaks.get("mte2_peak_bytes_per_s") or hbm_rate)
-    mte3_rate = float(peaks.get("mte3_peak_bytes_per_s") or hbm_rate)
-    fp_rate = float(peaks.get("fixpipe_peak_bytes_per_s") or hbm_rate)
-
-    fp_bytes = (
-        op.fixpipe_bytes if op.fixpipe_bytes > 0.0
-        else (op.hbm_write_bytes if (op.flops > 0.0 and op.mte3_bytes <= 0.0) else 0.0)
+    """Unplugged socket: shadow peak-division pipe times deleted."""
+    raise NotImplementedError(
+        "LEGACY_PURGED: _compute_physical_pipe_times shadow peak-division + HBM-rate fallback "
+        "+ synthetic minimum span clamping deleted; project true pipe service intervals directly "
+        "from canonical EngineStepReceipt."
     )
-    t_cube = (op.flops / cube_rate) * US_PER_SECOND if (op.flops > 0.0 and cube_rate > 0.0) else 0.0
-    t_vec = (op.vector_ops / vec_rate) * US_PER_SECOND if (op.vector_ops > 0.0 and vec_rate > 0.0) else 0.0
-    t_mte2 = (op.mte2_bytes / mte2_rate) * US_PER_SECOND if (op.mte2_bytes > 0.0 and mte2_rate > 0.0) else 0.0
-    t_mte3 = (op.mte3_bytes / mte3_rate) * US_PER_SECOND if (op.mte3_bytes > 0.0 and mte3_rate > 0.0) else 0.0
-    t_fp = (fp_bytes / fp_rate) * US_PER_SECOND if (fp_bytes > 0.0 and fp_rate > 0.0) else 0.0
-
-    dur = max(op.dur_us, PIPE_MIN_SUBSPAN_US)
-    return {
-        "cube_us": min(op.dur_us, t_cube) if t_cube > 0.0 else 0.0,
-        "vec_us": min(op.dur_us, t_vec) if t_vec > 0.0 else 0.0,
-        "mte2_us": min(op.dur_us, t_mte2) if t_mte2 > 0.0 else 0.0,
-        "mte3_us": min(op.dur_us, t_mte3) if t_mte3 > 0.0 else 0.0,
-        "fp_us": min(op.dur_us, t_fp) if t_fp > 0.0 else 0.0,
-        "fp_bytes": fp_bytes,
-        "aic_mac_ratio": round(min(1.0, t_cube / dur), RATIO_DECIMALS) if op.dur_us > 0.0 else 0.0,
-        "aiv_vec_ratio": round(min(1.0, t_vec / dur), RATIO_DECIMALS) if op.dur_us > 0.0 else 0.0,
-        "mte2_ratio": round(min(1.0, t_mte2 / dur), RATIO_DECIMALS) if op.dur_us > 0.0 else 0.0,
-        "mte3_ratio": round(min(1.0, t_mte3 / dur), RATIO_DECIMALS) if op.dur_us > 0.0 else 0.0,
-        "fixpipe_ratio": round(min(1.0, t_fp / dur), RATIO_DECIMALS) if op.dur_us > 0.0 else 0.0,
-    }
 
 
 def _physical_pipe_spans(
@@ -465,47 +437,21 @@ def _subtract_intervals(
 
 
 def _op_in_entry_repeats(op: OperatorExportRow, sched_count: int) -> int:
-    """Return consecutive calls of ``op`` inside a single schedule entry (e.g. RecoverSSM ×36)."""
-    rep = max(1, int(op.repeat_count))
-    cnt = max(1, int(sched_count))
-    return max(1, int(round(rep / float(cnt)))) if rep > cnt else 1
+    """Unplugged socket: heuristic draft repeat multiplier deleted."""
+    raise NotImplementedError(
+        "LEGACY_PURGED: heuristic _op_in_entry_repeats / _expand_effective_trace_schedule "
+        "draft repeat multiplier deleted; emit explicit schedule directly from EngineStepReceipt."
+    )
 
 
 def _expand_effective_trace_schedule(
     bundle: ExportBundle,
 ) -> tuple[tuple[TraceScheduleEntry, ...], dict[str, int]]:
-    """Expand multi-step draft schedule entries whenever draft ops repeat across MTP steps."""
-    raw_sched = tuple(bundle.full_trace_schedule)
-    if not raw_sched:
-        return (), {}
-    max_rep_by_arch: dict[str, int] = {}
-    for op in bundle.operators:
-        aid = op.archetype_id or op.layer_label
-        max_rep_by_arch[aid] = max(max_rep_by_arch.get(aid, 0), max(1, int(op.repeat_count)))
-    raw_counts = Counter(e.archetype_id for e in raw_sched)
-    expanded: list[TraceScheduleEntry] = []
-    idx = 0
-    while idx < len(raw_sched):
-        entry = raw_sched[idx]
-        aid = entry.archetype_id
-        cnt = raw_counts.get(aid, 1)
-        target_rep = max_rep_by_arch.get(aid, 0)
-        if entry.scope == "draft" and aid in {"draft_arch_0", "draft_context_kv"} and target_rep > cnt and cnt > 0 and (target_rep % cnt == 0):
-            block = [entry]
-            scan = idx + 1
-            while scan < len(raw_sched) and raw_sched[scan].archetype_id == aid:
-                block.append(raw_sched[scan])
-                scan += 1
-            steps = target_rep // len(block)
-            for step_i in range(steps):
-                for blk_e in block:
-                    lbl = f"{blk_e.label} [Step {step_i}]" if steps > 1 else blk_e.label
-                    expanded.append(TraceScheduleEntry(blk_e.archetype_id, blk_e.scope, lbl, blk_e.full_layer_index))
-            idx = scan
-            continue
-        expanded.append(entry)
-        idx += 1
-    return tuple(expanded), dict(Counter(e.archetype_id for e in expanded))
+    """Unplugged socket: heuristic draft schedule expansion deleted."""
+    raise NotImplementedError(
+        "LEGACY_PURGED: heuristic _expand_effective_trace_schedule deleted; "
+        "read explicit full schedule directly from EngineStepReceipt."
+    )
 
 
 def _build_archetype_templates(
@@ -755,12 +701,11 @@ def _resolve_host_launch_spec(
     is_graph_mode: bool,
     is_h2d_op: bool,
 ) -> tuple[str, float]:
-    if is_h2d_op:
-        return f"aclrtMemcpyAsync (PLE/Engram H2D: {op_eff.op_id})", HOST_KERNEL_LAUNCH_US
-    if is_graph_mode:
-        return f"aclGraphLaunch ({entry.scope.upper()})", HOST_GRAPH_LAUNCH_US
-    label = op_eff.ascend_kernel or op_eff.logical_role or op_eff.op_id
-    return f"aclrtLaunchKernel ({label})", HOST_KERNEL_LAUNCH_US
+    """Unplugged socket: hardcoded HOST_GRAPH_LAUNCH_US / HOST_KERNEL_LAUNCH_US deleted."""
+    raise NotImplementedError(
+        "LEGACY_PURGED: magic HOST_GRAPH_LAUNCH_US=12.0 / HOST_KERNEL_LAUNCH_US=1.5 deleted; "
+        "read calibrated STARS/host launch durations from PrimitiveTable."
+    )
 
 
 def _entry_layer_span(
@@ -985,14 +930,11 @@ def _iter_direct_trace(
         d_idx = die_map.get(coord, 0)
         base = _pid_base(d_idx)
         if not launched:
-            dev_pid, dev_tid = _op_pid_tid(op, base)
-            l_events, flow_id = _emit_host_launch_with_flow(
-                name=f"aclGraphLaunch ({bundle.phase.upper()})", dev_ts=op.start_us,
-                dev_pid=dev_pid, dev_tid=dev_tid, launch_dur_us=HOST_GRAPH_LAUNCH_US,
-                flow_id=flow_id, extra_args={"phase": bundle.phase},
+            raise NotImplementedError(
+                "LEGACY_PURGED: flat-trace unconditional aclGraphLaunch (even in eager mode) with "
+                "magic HOST_GRAPH_LAUNCH_US=12.0 deleted (Astra P1); respect graph_capture_mode "
+                "and read launch duration from PrimitiveTable."
             )
-            yield from l_events
-            launched = True
         lbl = op.archetype_title or op.layer_label
         events, placement, flow_id = _emit_op_and_pipes(
             bundle, op, ts_start=op.start_us, task_id=task_id, layer_label=lbl,
@@ -1129,7 +1071,7 @@ def export_msprof_trace(
     concurrency: int = 1,
     mtp_proposal_tokens: int = 0,
     mtp_acceptance_length: float = 1.0,
-    feature_track: str = "merged",
+    feature_track: str = "shipping",
 ) -> TraceExportSummary:
     """Stream a 1:1 ``msprof`` ``trace_view.json`` to ``output_path`` atomically."""
     if not str(output_path):

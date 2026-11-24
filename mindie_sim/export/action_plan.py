@@ -31,11 +31,11 @@ import math
 import re
 from typing import Any, Literal
 
-from mindie_sim.schema.scenario import canonical_comparison_stages
+from mindie_sim.schema.common import ModelingError
 
 from .models import (
-    BINDING_STATE_BOUND, BINDING_STATE_MEASURED, BINDING_STATE_UNBOUND_FORMULA,
-    DEFAULT_TOP_OPTIMIZE_KERNELS, KIB_BYTES, MIN_DENOM_EPS, MODE_MODELING,
+    BINDING_STATE_MEASURED, BINDING_STATE_UNBOUND_FORMULA,
+    DEFAULT_TOP_OPTIMIZE_KERNELS, KIB_BYTES, MIN_DENOM_EPS,
     OVERLAP_EXPOSED_EPS_US,
     PENDING_KIND_AT_FLOOR, PENDING_KIND_TO_IMPLEMENT, PENDING_KIND_TO_OPTIMIZE,
     TRACK_CONFIG_ENV, TRACK_FRAMEWORK, TRACK_KERNEL, US_PER_MS,
@@ -47,7 +47,6 @@ from .public_view import (
     THREE_TRACK_LABELS,
     diff_public_scenario_configs,
     is_same_public_config,
-    normalize_public_backend,
     project_public_effective_config,
     sanitize_public_text,
     sanitize_source_ref,
@@ -72,9 +71,6 @@ STRUCTURAL_EDIT_OPCODES = frozenset({
 })
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
-_ARCH_FAMILY_A5_TOKENS = ("950", "a5", "3510")
-_ARCH_FAMILY_A3_TOKENS = ("910_93", "910c", "a3", "9392", "9382", "9372", "9362", "9391", "9381")
-_ARCH_FAMILY_A2_TOKENS = ("910b", "a2", "310p", "300i")
 
 
 @dataclass(frozen=True, slots=True)
@@ -154,15 +150,13 @@ def format_signed_gain_text(saved_ms: float) -> str:
     return f"{saved_ms * US_PER_MS:.2f} us" if 0.0 < abs(saved_ms) < SUB_MS_DISPLAY_THRESHOLD else f"{saved_ms:.3f} ms"
 
 
-def _arch_tag_from_sku(hardware_sku: str) -> str:
-    low = str(hardware_sku or "").strip().lower()
-    if any(tok in low for tok in _ARCH_FAMILY_A5_TOKENS):
-        return "arch35"
-    if any(tok in low for tok in _ARCH_FAMILY_A3_TOKENS):
-        return "arch22"
-    if any(tok in low for tok in _ARCH_FAMILY_A2_TOKENS):
-        return "arch20"
-    return _SLUG_RE.sub("_", low).strip("_") or "generic"
+def _arch_tag_from_bundle(bundle: ExportBundle) -> str:
+    """Read structured architecture family strictly from ExportBundle.effective_config."""
+    eff = bundle.effective_config if isinstance(bundle.effective_config, Mapping) else {}
+    raw = str(eff.get("arch_family") or "").strip().lower()
+    if not raw:
+        raise ModelingError(f"missing_structured_arch_family_on_bundle:{bundle.hardware_sku!r}")
+    return _SLUG_RE.sub("_", raw).strip("_")
 
 
 def _short_arch_name(title: str) -> str:
@@ -199,94 +193,11 @@ def anchor_stage_waterfall(
     config_stage_saved_us: float | None = None,
     framework_stage_saved_us: float | None = None,
 ) -> tuple[dict[str, Any], ...]:
-    """Anchor 4-stage Engine waterfall onto ``before_bundle.step_span_us -> after_bundle.step_span_us``.
-
-    Bridges cross-track pairs (e.g. ``merged`` -> ``expected_ideal``) so Stage 0
-    is always ``before_bundle.step_span_us``, Stage 1 is the config/parallel bridge
-    (or ``before`` when deployment config is identical), Stage 2 is ``after_bundle``'s
-    pre-synthesis / framework-rewrite span, and Stage 3 is ``after_bundle.step_span_us``
-    with zero telescoping gap. When Sheet 4's exact classified stage savings
-    ``(config_stage_saved_us, framework_stage_saved_us)`` are provided, Stages 1 & 2
-    match Sheet 4 ``D4`` and ``D5`` identically.
-    """
-    before_us = max(0.0, float(before_bundle.step_span_us))
-    after_us = max(0.0, float(after_bundle.step_span_us))
-    raw_wf = tuple(dict(item) for item in (after_bundle.stage_waterfall or ()) if isinstance(item, Mapping))
-    raw_by_stage = {str(item.get("stage") or ""): item for item in raw_wf}
-    raw_before_us = float(raw_by_stage["before"]["step_span_us"]) if "before" in raw_by_stage else None
-    raw_cfg_us = float(raw_by_stage["config_only"]["step_span_us"]) if "config_only" in raw_by_stage else None
-    raw_fwk_us = float(raw_by_stage["framework_rewrite"]["step_span_us"]) if "framework_rewrite" in raw_by_stage else None
-
-    has_fwk_delta = (
-        framework_stage_saved_us is not None
-        and abs(float(framework_stage_saved_us)) > OVERLAP_EXPOSED_EPS_US
+    """Unplugged socket: shadow waterfall clamping deleted."""
+    raise NotImplementedError(
+        "LEGACY_PURGED: anchor_stage_waterfall shadow clamping deleted; "
+        "consume single immutable 4-stage EngineStepReceipt (int ns exact telescope)."
     )
-    is_modeling = (
-        "framework_rewrite" in raw_by_stage
-        or after_bundle.analysis_mode == MODE_MODELING
-        or bool(after_bundle.target_envelope_applied)
-        or has_fwk_delta
-    )
-    stage_specs = canonical_comparison_stages("modeling" if is_modeling else "simulation")
-    same_cfg = _is_same_deployment_config(before_bundle, after_bundle)
-    fwk_raw = (
-        raw_fwk_us if raw_fwk_us is not None
-        else (raw_before_us if raw_before_us is not None else after_us)
-    )
-
-    if config_stage_saved_us is not None and framework_stage_saved_us is not None:
-        s1 = max(0.0, before_us - float(config_stage_saved_us))
-        s2 = max(0.0, s1 - float(framework_stage_saved_us))
-    elif before_us >= after_us:
-        s2 = min(before_us, max(after_us, fwk_raw))
-        if same_cfg:
-            s1 = before_us
-        elif config_bridge_span_us is not None:
-            s1 = min(before_us, max(s2, float(config_bridge_span_us)))
-        elif config_saved_us is not None:
-            s1 = min(before_us, max(s2, before_us - float(config_saved_us)))
-        elif (
-            raw_cfg_us is not None
-            and raw_before_us is not None
-            and abs(raw_before_us - before_us) <= OVERLAP_EXPOSED_EPS_US
-        ):
-            s1 = min(before_us, max(s2, raw_cfg_us))
-        else:
-            s1 = before_us
-    else:
-        s2 = fwk_raw if (raw_fwk_us is not None or raw_before_us is not None) else after_us
-        if same_cfg:
-            s1 = before_us
-        elif config_bridge_span_us is not None:
-            s1 = max(0.0, float(config_bridge_span_us))
-        elif config_saved_us is not None:
-            s1 = max(0.0, before_us - float(config_saved_us))
-        else:
-            s1 = before_us
-
-    span_by_stage = {
-        "before": before_us,
-        "config_only": s1,
-        "framework_rewrite": s2,
-        "after": after_us,
-    }
-    rows: list[dict[str, Any]] = []
-    prev_us = before_us
-    for idx, st in enumerate(stage_specs):
-        cur_us = float(span_by_stage[st.stage])
-        existing = raw_by_stage.get(st.stage, {})
-        rows.append({
-            "stage": st.stage,
-            "owner": str(existing.get("owner") or st.owner),
-            "step_span_us": cur_us,
-            "delta_from_prev_us": 0.0 if idx == 0 else (cur_us - prev_us),
-            "cumulative_saved_us": before_us - cur_us,
-            "allowed_readiness": tuple(existing.get("allowed_readiness") or sorted(st.allowed_readiness)),
-            "allowed_rewrite_tracks": tuple(existing.get("allowed_rewrite_tracks") or st.allowed_rewrite_tracks),
-            "engine_uid": str(existing.get("engine_uid") or "unified_die_engine"),
-        })
-        prev_us = cur_us
-    return tuple(rows)
 
 
 def _row_exposed_metrics(row: AlignedComparisonRow, before_ntok: float, after_ntok: float) -> tuple[float, float, float, float, float, float]:
@@ -390,16 +301,11 @@ def _applied_fuse_outputs(after_bundle: ExportBundle) -> set[str]:
 
 
 def _is_verified_new_fusion(row: AlignedComparisonRow, *, is_comparison: bool, saved_ms: float, fuse_outputs: set[str]) -> bool:
-    if len(row.after_ops) != 1 or not bool(row.after_ops[0].needs_new_kernel):
-        return False
-    a_op = row.after_ops[0]
-    if is_comparison:
-        if len(row.before_ops) < MIN_FUSION_MEMBERS:
-            return False
-        return saved_ms > CONSERVATION_EPS_MS or a_op.kernel_synthesis_spec is not None or a_op.op_id in fuse_outputs
-    kspec = a_op.kernel_synthesis_spec
-    constituents = getattr(kspec, "constituent_op_ids", ()) if kspec is not None else ()
-    return len(a_op.absorbed_source_ops) >= MIN_FUSION_MEMBERS or len(constituents) >= MIN_FUSION_MEMBERS
+    """Unplugged socket: require real VerifyReceipt before declaring verified new fusion."""
+    raise NotImplementedError(
+        "LEGACY_PURGED: unverified op-count-drop + positive-savings fusion auto-pass deleted (Astra P1); "
+        "require real VerifyReceipt + explicit applied FuseRegion receipt."
+    )
 
 
 def _is_masking_only_change(row: AlignedComparisonRow) -> bool:
@@ -497,7 +403,7 @@ def _add_row_to_group(
         entry = {
             "kernel_key": key, "stem": stem, "category": category,
             "target_kernel": sanitize_public_text(raw_target),
-            "backend": normalize_public_backend(a_op.kernel_backend or "CANN aclnn/AscendC"),
+            "backend": sanitize_public_text(a_op.kernel_backend),
             "status": sanitize_public_text(a_op.kernel_status),
             "submodule": sanitize_public_text(a_op.submodule),
             "logical_role": sanitize_public_text(a_op.logical_role or a_op.op_id),
@@ -513,7 +419,7 @@ def _add_row_to_group(
             "core_budget": sanitize_public_text(a_op.stream_core_budget),
             "opt_pillar": a_op.opt_pillar or ("pillar1_fusion" if category == PENDING_KIND_TO_IMPLEMENT else "pillar2_roofline"),
             "synthesis_spec": kspec, "math_formula": math_formula, "sram_residency_summary": sram_sum,
-            "formula_summary": _format_formula_eval_receipt(fe), "binding_state": a_op.binding_state or BINDING_STATE_BOUND,
+            "formula_summary": _format_formula_eval_receipt(fe), "binding_state": a_op.binding_state,
             "source_row_indices": [], "best_member_rank": (gain_ms, gain_upt), "best_member_occ": occ_tie,
         }
         groups[key] = entry
@@ -614,7 +520,7 @@ def _materialize_card(prio: int, entry: Mapping[str, Any], card_id: str, fw_by_c
         after_us_per_tok_die=float(entry["after_upt"]), saved_us_per_tok_die=gain_upt,
         synthesis_spec=entry["synthesis_spec"], math_formula=str(entry["math_formula"] or ""),
         sram_residency_summary=str(entry["sram_residency_summary"] or ""),
-        binding_state=str(entry.get("binding_state") or BINDING_STATE_BOUND),
+        binding_state=str(entry.get("binding_state") or ""),
         source_row_indices=tuple(sorted(int(i) for i in entry.get("source_row_indices", ()))),
         core_budget=str(entry.get("core_budget") or ""),
         attributable_gain_ms=(float(entry["attr_gain_ms"]) if entry.get("has_split") else None),
@@ -783,7 +689,7 @@ def build_comparison_plan(
     after = after_bundle or before_bundle
     b_ntok, a_ntok = max(float(before_bundle.n_tok_per_die or 1.0), MIN_DENOM_EPS), max(float(after.n_tok_per_die or 1.0), MIN_DENOM_EPS)
     same_config = (not is_comparison) or _is_same_deployment_config(before_bundle, after)
-    arch_tag, fuse_outputs = _arch_tag_from_sku(after.hardware_sku), _applied_fuse_outputs(after)
+    arch_tag, fuse_outputs = _arch_tag_from_bundle(after), _applied_fuse_outputs(after)
 
     prelim_rows: list[dict[str, Any]] = []
     new_groups: dict[str, dict[str, Any]] = {}
@@ -904,10 +810,13 @@ def build_comparison_plan(
         )
         for item in final_cards[:MAX_ROADMAP_KERNEL_ITEMS]
     ]
-    anchored_stage_wf = (
-        anchor_stage_waterfall(before_bundle, after, config_saved_us=totals["cfg_ms"] * US_PER_MS)
-        if is_comparison
-        else tuple(dict(item) for item in (before_bundle.stage_waterfall or ()) if isinstance(item, Mapping))
+    if is_comparison:
+        raise NotImplementedError(
+            "LEGACY_PURGED: comparison stage_waterfall must read canonical 4-stage "
+            "EngineStepReceipt.stages (int ns exact telescope), not anchor_stage_waterfall."
+        )
+    anchored_stage_wf = tuple(
+        dict(item) for item in (before_bundle.stage_waterfall or ()) if isinstance(item, Mapping)
     )
     return ComparisonPlan(
         aligned_rows=tuple(aligned_rows), group_accounting=tuple(accounting), waterfall=waterfall,

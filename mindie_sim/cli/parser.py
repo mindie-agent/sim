@@ -209,7 +209,7 @@ def _add_sdk_step_parsers(sub) -> None:
     pred_step.add_argument("--tokens", type=int, default=1)
     pred_step.add_argument("--context", type=int, default=0)
     pred_step.add_argument("--sequences", type=int, default=1)
-    pred_step.add_argument("--scope", choices=("body", "model"), default="body")
+    pred_step.add_argument("--scope", choices=("body", "model"), default="model")
     pred_step.add_argument("--media-tokens-per-sequence", type=int)
     pred_step.add_argument("--draft-prepare", action="store_true")
     pred_step.add_argument("--view", choices=("step", "operators", "graph", "efficiency"), default="step")
@@ -229,7 +229,7 @@ def _add_sdk_step_parsers(sub) -> None:
     pred_tiers.add_argument("--tokens", type=int, default=1)
     pred_tiers.add_argument("--context", type=int, default=0)
     pred_tiers.add_argument("--sequences", type=int, default=1)
-    pred_tiers.add_argument("--scope", choices=("body", "model"), default="body")
+    pred_tiers.add_argument("--scope", choices=("body", "model"), default="model")
     pred_tiers.add_argument("--isolated", action="store_true")
     pred_tiers.add_argument("--event-limit", type=int, default=0)
     pred_tiers.add_argument("--primitives")
@@ -242,7 +242,7 @@ def _add_sdk_step_parsers(sub) -> None:
     opt.add_argument("--tokens", type=int, default=1)
     opt.add_argument("--context", type=int, default=0)
     opt.add_argument("--sequences", type=int, default=1)
-    opt.add_argument("--scope", choices=("body", "model"), default="body")
+    opt.add_argument("--scope", choices=("body", "model"), default="model")
     opt.add_argument("--stack", default="cann93_va_main")
     opt.add_argument("--max-trials", type=int, default=DEFAULT_OPTIMIZE_MAX_TRIALS)
     opt.add_argument("--isolated", action="store_true")
@@ -291,10 +291,10 @@ def _add_catalog_and_solve_parsers(sub) -> None:
     solve.add_argument("--ablate-prs", action="store_true")
     solve.add_argument("--xlsx", default=None, help="optional Before-vs-After comparison .xlsx output path")
     solve.add_argument("--trace", default=None, help="optional msprof trace_view.json output path")
-    solve.add_argument("--compare-track", default="unmerged_pr",
-                       choices=("raw_eager", "merged", "unmerged_pr", "expected_ideal"))
-    solve.add_argument("--target-track", default="expected_ideal",
-                       choices=("raw_eager", "merged", "unmerged_pr", "expected_ideal"))
+    solve.add_argument("--compare-track", default="shipping",
+                       choices=("eager", "shipping", "proposed", "target"))
+    solve.add_argument("--target-track", default="target",
+                       choices=("eager", "shipping", "proposed", "target"))
     solve.add_argument("--mode", choices=("modeling", "simulation"), default="modeling",
                        help="modeling (Before sim vs After SLA target ceiling) or simulation (Layer-2 bound ops only)")
     solve.add_argument("--rewrite-plan", default=None,
@@ -330,7 +330,7 @@ def _add_eval_and_obs_parsers(sub) -> None:
     operators.add_argument("--phase", choices=("prefill", "decode"), required=True)
     operators.add_argument("--tokens", type=int, required=True)
     operators.add_argument("--sequences", type=int, default=1)
-    operators.add_argument("--scope", choices=("body", "model"), default="body")
+    operators.add_argument("--scope", choices=("body", "model"), default="model")
     operators.add_argument("--context", type=int, default=0)
     operators.add_argument("--media-tokens-per-sequence", type=int)
     operators.add_argument("--draft-prepare", action="store_true",
@@ -470,15 +470,15 @@ def _add_compose_and_waterfall_parsers(sub) -> None:
                          help="allow graph/structure composition without serving prompt/output lengths")
     compose.add_argument("--stack", default=None, help="registered runtime stack name or manifest path (domain-aware default when omitted)")
     compose.add_argument("--stack-manifest", default=None, help="explicit JSON stack manifest path")
-    compose.add_argument("--feature-track", default="merged",
-                         choices=("raw_eager", "merged", "unmerged_pr", "expected_ideal"))
+    compose.add_argument("--feature-track", default="shipping",
+                         choices=("eager", "shipping", "proposed", "target"))
     compose.add_argument("--enable-opt", action="append", default=[], help="enable individual OptimizationMechanism ID")
     compose.add_argument("--disable-opt", action="append", default=[], help="exclude individual OptimizationMechanism ID")
     compose.add_argument("--block-size", type=int, default=None, help="explicit KV block size (auto-resolved when omitted)")
     compose.add_argument("--output", "-o")
     add_runtime_arguments(compose, command="compose")
 
-    ft = sub.add_parser("feature-tracks", help="4-level waterfall (merged -> unmerged_pr -> expected_ideal -> roofline)")
+    ft = sub.add_parser("feature-tracks", help="4-level waterfall (eager -> shipping -> proposed -> target -> roofline)")
     ft.add_argument("--model", required=True)
     ft.add_argument("--hardware", default="a3")
     ft.add_argument("--stack", default=None)
@@ -487,7 +487,7 @@ def _add_compose_and_waterfall_parsers(sub) -> None:
     ft.add_argument("--tokens", type=int, default=1)
     ft.add_argument("--context", type=int, default=DEFAULT_WATERFALL_CONTEXT)
     ft.add_argument("--sequences", type=int, default=DEFAULT_WATERFALL_SEQUENCES)
-    ft.add_argument("--scope", choices=("body", "model"), default="body")
+    ft.add_argument("--scope", choices=("body", "model"), default="model")
     for flag in ("--tp", "--dp", "--ep", "--pp", "--pcp", "--dcp",
                  "--num-devices", "--ranks-per-node", "--layers", "--mtp-tokens",
                  "--q-proj-tp", "--o-proj-tp", "--linear-proj-tp", "--kda-proj-tp",
@@ -561,7 +561,7 @@ def _add_sweep_efficiency_sla_parsers(sub) -> None:
     eff.add_argument("--tokens", type=int, default=1)
     eff.add_argument("--context", type=int, default=DEFAULT_EFF_CONTEXT)
     eff.add_argument("--sequences", type=int, default=1)
-    eff.add_argument("--scope", choices=("body", "model"), default="body")
+    eff.add_argument("--scope", choices=("body", "model"), default="model")
     eff.add_argument("--fit-targets", action="store_true")
     eff.add_argument("--observed-durations")
     eff.add_argument("--pmu")

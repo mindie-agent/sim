@@ -38,12 +38,12 @@ import re
 from typing import Any
 
 from mindie_sim.compose.inputs import (
-    BYTES_PER_GIB, DERIVED_ASCEND_SKUS, _QUANT_ALIASES,
+    DERIVED_ASCEND_SKUS, _QUANT_ALIASES,
     _arch_key, _resolve_hardware, _resolve_model_spec,
     default_work_unit_for_domain, infer_workload_domain,
 )
 from mindie_sim.export import (
-    AGENT_BRIEF_SCHEMA, DEFAULT_SCENARIO_OUTPUT_TOKENS, DEFAULT_TPOT_SLO_MS,
+    AGENT_BRIEF_SCHEMA, DEFAULT_SCENARIO_OUTPUT_TOKENS,
     DEPLOYMENT_MODE_LABELS, MODE_MODELING, MODE_SIMULATION, US_PER_MS,
     build_export_bundle, compose_export_case, export_agent_brief,
     export_comparison_xlsx, export_msprof_trace, format_executive_digest_markdown,
@@ -62,8 +62,6 @@ REPORT_BOOLEAN_FLAGS = frozenset({"--json", "--no-trace", "--no-xlsx"})
 MAX_SCRIPT_BYTES = 50 * 1024 * 1024
 DEFAULT_REPORT_PROMPT_TOKENS = 32768
 AUTO_SIZING_WEIGHT_FRACTION = 0.65
-DEFAULT_FALLBACK_MEM_GIB = 64
-DEFAULT_FALLBACK_TP_CAP = 8
 STEP_MS_ROUND_DIGITS = 3
 TPS_ROUND_DIGITS = 2
 SPEEDUP_ROUND_DIGITS = 2
@@ -111,7 +109,7 @@ def _lookup_quarot_checkpoint_hint(model_name: str, arch: str, weight_quant: str
                 return str(rec["checkpoint"])
             if isinstance(rec, str) and rec:
                 return rec
-    except (ModuleNotFoundError, TypeError, ValueError):
+    except ModuleNotFoundError:
         pass
     return (
         "Prefer QuaRot-calibrated MXFP8+MXFP4 checkpoint on A5 (keep norm/router/embed/lm_head BF16)"
@@ -273,7 +271,10 @@ def _estimate_auto_num_devices(model_spec: Any, sku: str, weight_quant: str | No
     from mindie_sim.schema.parallel import ParallelSpec
 
     entry = {**ascend_profiles(), **DERIVED_ASCEND_SKUS, **nvidia_profiles()}.get(sku, {})
-    mem_b = float(entry.get("memory_bytes") or (entry.get("device") or {}).get("memory_bytes") or DEFAULT_FALLBACK_MEM_GIB * BYTES_PER_GIB)
+    raw_mem = entry.get("memory_bytes") or (entry.get("device") or {}).get("memory_bytes")
+    if not raw_mem or float(raw_mem) <= 0.0:
+        raise ModelingError(f"missing_device_memory_bytes:{sku}")
+    mem_b = float(raw_mem)
     eff_spec = model_spec
     if isinstance(weight_quant, QuantSpec):
         eff_spec = dc_replace(model_spec, quant=weight_quant, quantization=str(weight_quant.name))
@@ -339,7 +340,7 @@ def _extract_infeasible_details(
 
 def _auto_solve_report_layout(
     *, model: str, sku: str, topology_preset: str | None, num_devices: int,
-    prompt_tokens: int, output_tokens: int, tpot_slo_ms: float, ttft_slo_ms: float | None,
+    prompt_tokens: int, output_tokens: int, tpot_slo_ms: float | None, ttft_slo_ms: float | None,
     quant: str | None, kv_cache_dtype: str | None, indexer_kv_dtype: str | None,
     deployment_mode: str, kv_pooling: str | None = None,
     runtime_stack: str | None = None, feature_track: str | None = None,
@@ -362,7 +363,9 @@ def _auto_solve_report_layout(
     eff_ttft = None if validated_mode == "pd_decode" else ttft_slo_ms
     solve_kw: dict[str, Any] = dict(
         num_devices=int(num_devices), prompt_tokens=int(prompt_tokens), output_tokens=int(output_tokens),
-        ttft_sla_ms=eff_ttft, tpot_sla_ms=float(tpot_slo_ms), deployment=dep_for_solver,
+        ttft_sla_ms=eff_ttft,
+        tpot_sla_ms=(float(tpot_slo_ms) if tpot_slo_ms is not None else None),
+        deployment=dep_for_solver,
         pd_transfer_mode=_resolve_kv_pooling_mode(kv_pooling) if validated_mode == "pd_disaggregated" else None,
         quant=quant, kv_cache_dtype=kv_cache_dtype, indexer_kv_dtype=indexer_kv_dtype,
         topology_preset=topology_preset, allow_unconstrained_ttft=(eff_ttft is None),
@@ -386,10 +389,16 @@ def _auto_solve_report_layout(
         )
     )
     par = best.get("prefill_parallel" if phase == "prefill" else "decode_parallel") or best.get("parallel") or {}
+    if is_feasible and not par.get("tp"):
+        raise ModelingError("solver_best_configuration_missing_explicit_tp")
+    tp_val = int(par["tp"]) if is_feasible else 0
+    dp_val = int(par.get("dp", 1) or 1) if is_feasible else 0
     return {
-        "dp": int(par.get("dp", 1) or 1), "tp": int(par.get("tp", min(num_devices, DEFAULT_FALLBACK_TP_CAP)) or 1),
-        "ep": int(par.get("ep", par.get("dp", 1) * par.get("tp", 1)) or 1),
-        "pp": int(par.get("pp", 1) or 1), "dcp": int(par.get("cp", par.get("dcp", 1)) or 1), "pcp": int(par.get("pcp", 1) or 1),
+        "dp": dp_val, "tp": tp_val,
+        "ep": int(par.get("ep", dp_val * tp_val) or 1) if is_feasible else 0,
+        "pp": int(par.get("pp", 1) or 1) if is_feasible else 0,
+        "dcp": int(par.get("cp", par.get("dcp", 1)) or 1) if is_feasible else 0,
+        "pcp": int(par.get("pcp", 1) or 1) if is_feasible else 0,
         "concurrency": (max(1, int(best.get("b_feasible") or 1)) if is_feasible else 0),
         "spec_tokens": int(best.get("mtp_proposal_tokens", 0) or 0),
         "deployment_mode": validated_mode,
@@ -537,13 +546,23 @@ def add_report_commands(subparsers) -> None:
     rep.add_argument("--prompt-tokens", "--context", dest="prompt_tokens", type=parse_token_shorthand, default=None)
     rep.add_argument("--output-tokens", type=parse_token_shorthand, default=DEFAULT_SCENARIO_OUTPUT_TOKENS)
     rep.add_argument("--concurrency", type=int, default=None, help="sequences per DP replica (auto-solved when omitted)")
-    rep.add_argument("--tpot-ms", "--tpot-slo-ms", dest="tpot_ms", type=float, default=DEFAULT_TPOT_SLO_MS)
+    rep.add_argument("--tpot-ms", "--tpot-slo-ms", dest="tpot_ms", type=float, default=None)
     rep.add_argument("--ttft-ms", "--ttft-slo-ms", dest="ttft_ms", type=float, default=None)
     rep.add_argument("--spec-tokens", "--mtp", "--mtp-tokens", dest="spec_tokens", type=int, default=None)
     rep.add_argument("--accept-len", "--mtp-accept", dest="accept_len", type=float, default=None)
     rep.add_argument("--mode", choices=(MODE_MODELING, MODE_SIMULATION), default=MODE_MODELING)
-    rep.add_argument("--compare-track", default="merged", help="Before track (default: merged)")
-    rep.add_argument("--target-track", default="expected_ideal", help="After track (default: expected_ideal)")
+    rep.add_argument(
+        "--compare-track",
+        choices=("eager", "shipping", "proposed", "target"),
+        default="shipping",
+        help="Before track (default: shipping)",
+    )
+    rep.add_argument(
+        "--target-track",
+        choices=("eager", "shipping", "proposed", "target"),
+        default="target",
+        help="After track (default: target)",
+    )
     rep.add_argument("--rewrite-plan", default=None, help="Pass-2 Agent semantic rewrite plan JSON")
     rep.add_argument("--weight-quant", default="auto_va", help="weight quant preset (default: auto_va)")
     rep.add_argument("--cache-dtype", default=None, help="KV cache dtype override (bf16/c8/int8/fp8_e4m3)")
@@ -561,7 +580,6 @@ def add_report_commands(subparsers) -> None:
         default=None,
         help="optional PD KV transfer/pooling policy for pd_disaggregated",
     )
-    rep.add_argument("--kernel-designs-json", default=None, help="[retired] raises ModelingError — use --rewrite-plan")
     rep.add_argument("--observations", "--kernel-csv", dest="observations", default=None)
     rep.add_argument("--out-dir", default="./mindie_sim_report")
     rep.add_argument("--prefix", default=None)
@@ -619,9 +637,8 @@ def _enrich_two_step_gain(
 def _emit_report_artifacts(
     *, before_bundle: Any, after_bundle: Any, tuned_bundle: Any | None,
     args: argparse.Namespace, script_info: Mapping[str, Any] | None,
-    dep_mode: str, load_designs: Any,
+    dep_mode: str,
 ) -> tuple[dict[str, Any], dict[str, Any], str]:
-    designs = load_designs(getattr(args, "kernel_designs_json", None))
     out_dir = Path(args.out_dir).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     raw_prefix = args.prefix or f"{after_bundle.model_name}_{after_bundle.hardware_sku}_{after_bundle.phase}"
@@ -637,9 +654,9 @@ def _emit_report_artifacts(
         tuned_facts = _bundle_facts_for_codec(tuned_bundle or after_bundle, ingress=ingress, role=dep_mode)
         opt_sh_path = out_dir / f"{prefix}_optimized_serve.sh"
         opt_sh_path.write_text(codec.render_launch_config(tuned_facts), encoding="utf-8", newline="\n")
-        generated["optimized_serve_sh"] = str(opt_sh_path)
+        generated["optimized_serve_sh"] = opt_sh_path.name
         audit_dict = dict(codec.audit_launch_config(ingress, before_facts, tuned_facts))
-        audit_dict["optimized_script_path"] = str(opt_sh_path)
+        audit_dict["optimized_script_path"] = opt_sh_path.name
         audit_dict = _enrich_two_step_gain(
             audit_dict, before_bundle=before_bundle, tuned_bundle=tuned_bundle, after_bundle=after_bundle,
         )
@@ -647,10 +664,10 @@ def _emit_report_artifacts(
     if not getattr(args, "no_xlsx", False):
         xlsx_path = out_dir / f"{prefix}_comparison.xlsx"
         summary["xlsx"] = export_comparison_xlsx(
-            before_bundle, xlsx_path, compare_source=after_bundle,
-            agent_kernel_designs=designs, script_audit=audit_dict,
+            before_bundle, xlsx_path, after_bundle=after_bundle,
+            script_audit=audit_dict,
         ).to_dict()
-        generated["comparison_xlsx"] = str(xlsx_path)
+        generated["comparison_xlsx"] = xlsx_path.name
     if not getattr(args, "no_trace", False):
         trace_path = out_dir / f"{prefix}_trace_view.json"
         summary["trace"] = export_msprof_trace(
@@ -659,21 +676,21 @@ def _emit_report_artifacts(
             include_counters=bool(getattr(args, "include_counters", True)),
             include_overlap=bool(getattr(args, "include_overlap", True)),
         ).to_dict()
-        generated["trace_view_json"] = str(trace_path)
+        generated["trace_view_json"] = trace_path.name
 
     brief_path = out_dir / f"{prefix}_agent_brief.json"
-    generated["agent_brief_json"] = str(brief_path)
+    generated["agent_brief_json"] = brief_path.name
     brief = export_agent_brief(before_bundle, after_bundle, brief_path, generated_files=generated, script_audit=audit_dict)
     brief_dict = dict(brief) if isinstance(brief, Mapping) else {}
     return summary, brief_dict, format_executive_digest_markdown(brief_dict)
 
 
 def _report_tracks(mode: str, *, compare_track: str, target_track: str, enforce_eager: bool) -> tuple[str, str]:
-    before = "raw_eager" if enforce_eager else compare_track
-    if mode == MODE_SIMULATION and before.strip().lower() == "expected_ideal":
-        before = "merged"
+    before = "eager" if enforce_eager else compare_track
+    if mode == MODE_SIMULATION and before.strip().lower() == "target":
+        before = "shipping"
     after = target_track
-    if mode == MODE_SIMULATION and after.strip().lower() == "expected_ideal":
+    if mode == MODE_SIMULATION and after.strip().lower() == "target":
         after = before
     return before, after
 
@@ -696,6 +713,11 @@ def _resolve_report_mode_and_phase(
     req_phase = getattr(args, "phase", None)
     if dep_mode == "pd_decode" and req_phase == "prefill":
         raise ModelingError("pd_decode_incompatible_with_prefill_phase")
+    if dep_mode == "pd_prefill":
+        if req_phase == "decode":
+            raise ModelingError("pd_prefill_incompatible_with_decode_phase")
+        if args.tpot_ms is not None:
+            raise ModelingError("pd_prefill_tpot_unavailable: --tpot-ms is unavailable in pd_prefill mode")
     eff_phase = str(req_phase) if req_phase else ("prefill" if dep_mode == "pd_prefill" else "decode")
     eff_ttft = None if (dep_mode == "pd_decode" or args.ttft_ms is None) else float(args.ttft_ms)
     return dep_mode, eff_phase, eff_ttft
@@ -720,16 +742,16 @@ def _solve_report_columns(
     layout_before = layout_tuned = layout_after = None
 
     if full_explicit:
-        after_par = {axis: int(getattr(args, axis) or 1) for axis in _PARALLEL_AXES}
-        conc, after_spec = int(args.concurrency or 1), int(explicit_spec or 0)
-        before_spec = int(script_info["spec_tokens"] if (script_info and script_info.get("spec_tokens") is not None) else after_spec)
-        before_par, before_conc = dict(after_par), conc
-        tuned_par, tuned_conc = dict(after_par), conc
+        raise NotImplementedError(
+            "LEGACY_PURGED: pinned-report full_explicit auto-feasible bypass deleted (Astra P1: "
+            "emitted SLA_VIOLATED with feasible=True); evaluate canonical SlaVerdict and HBM fit."
+        )
     else:
         n_dev = int(args.num_devices or (script_info.get("num_devices") if script_info else None) or _estimate_auto_num_devices(policy["model_spec"], policy["sku"], policy["weight_quant"]))
         common_solve = dict(
             model=model_arg, sku=policy["sku"], topology_preset=topo_preset, num_devices=n_dev,
-            prompt_tokens=prompt_tokens, output_tokens=output_tokens, tpot_slo_ms=float(args.tpot_ms),
+            prompt_tokens=prompt_tokens, output_tokens=output_tokens,
+            tpot_slo_ms=(float(args.tpot_ms) if args.tpot_ms is not None else None),
             ttft_slo_ms=eff_ttft, deployment_mode=dep_mode, kv_pooling=getattr(args, "kv_pooling", None),
             runtime_stack=getattr(args, "stack", None), mtp_proposal_tokens=explicit_spec,
             mtp_acceptance_length=explicit_accept, phase=eff_phase,
@@ -751,7 +773,7 @@ def _solve_report_columns(
         elif script_info:
             layout_tuned = _auto_solve_report_layout(
                 **common_solve, quant=after_quant, kv_cache_dtype=after_kv, indexer_kv_dtype=after_idx_kv,
-                feature_track="merged", apply_target_envelope=False, rewrite_plan=None, allow_unbound_formula=False,
+                feature_track="shipping", apply_target_envelope=False, rewrite_plan=None, allow_unbound_formula=False,
             )
             tuned_par, tuned_conc = {k: layout_tuned[k] for k in _PARALLEL_AXES}, int(layout_tuned["concurrency"])
             before_par = dict(dp=script_info["dp"], tp=script_info["tp"], ep=script_info["ep"], pp=script_info["pp"], dcp=script_info["dcp"], pcp=script_info["pcp"])
@@ -817,7 +839,7 @@ def _build_infeasible_report_result(
             "deployment_mode": DEPLOYMENT_MODE_LABELS.get(dep_mode, dep_mode),
             "prompt_tokens": int(prompt_tokens),
             "output_tokens": int(output_tokens),
-            "tpot_slo_ms": float(args.tpot_ms),
+            "tpot_slo_ms": (float(args.tpot_ms) if args.tpot_ms is not None else None),
             "ttft_slo_ms": eff_ttft,
             "concurrency_per_dp": 0,
             "cluster_concurrency": 0,
@@ -828,7 +850,7 @@ def _build_infeasible_report_result(
             "fits_hbm": bool(infeasible["physical_b_vram_max"] > 0),
         },
         "infeasible_outcome": infeasible,
-        "generated_files": {"agent_brief_json": str(brief_path)},
+        "generated_files": {"agent_brief_json": brief_path.name},
     }
     export_agent_brief(raw_brief, brief_path)
     projected_brief = json.loads(brief_path.read_text(encoding="utf-8"))
@@ -856,9 +878,8 @@ def _build_infeasible_report_result(
     return receipt
 
 
-def run_report_command(args: argparse.Namespace, *, load_designs: Any) -> dict[str, Any]:
+def run_report_command(args: argparse.Namespace) -> dict[str, Any]:
     """Execute ``mindie-sim report`` with explicit deployment-mode, domain stack routing, and zero TTFT coercion."""
-    load_designs(getattr(args, "kernel_designs_json", None))
     stack_arg = getattr(args, "stack", None)
     script_info = (
         parse_script_for_report(args.from_script, requested_stack=stack_arg, hardware=args.hardware)
@@ -925,7 +946,8 @@ def run_report_command(args: argparse.Namespace, *, load_designs: Any) -> dict[s
     replay = ReplayOptions(include_submission=bool(getattr(args, "include_submission", False)))
     common_kw = dict(
         topology_preset=topo_preset, prompt_tokens=prompt_tokens, output_tokens=output_tokens,
-        tpot_slo_ms=float(args.tpot_ms), ttft_slo_ms=eff_ttft,
+        tpot_slo_ms=(float(args.tpot_ms) if args.tpot_ms is not None else None),
+        ttft_slo_ms=eff_ttft,
         mtp_proposal_tokens=cols["after_spec"],
         mtp_acceptance_length=_accept_len_for(cols["after_spec"], cols["explicit_accept"]),
         engram_cpu_offload=args.engram_offload, deployment_mode=dep_mode,
@@ -956,7 +978,7 @@ def run_report_command(args: argparse.Namespace, *, load_designs: Any) -> dict[s
     tuned_bundle = None
     if script_info is not None:
         raw_tuned, step_t, meta_t = _report_column(
-            cols["layout_tuned"], track="merged", quant=after_quant, kv=after_kv,
+            cols["layout_tuned"], track="shipping", quant=after_quant, kv=after_kv,
             idx_kv=after_idx_kv, par=cols["tuned_par"], conc=cols["tuned_conc"], **column_kw,
         )
         tuned_bundle = _attach_bundle_context(
@@ -979,19 +1001,12 @@ def run_report_command(args: argparse.Namespace, *, load_designs: Any) -> dict[s
     )
     summary, brief_dict, digest_md = _emit_report_artifacts(
         before_bundle=before_bundle, after_bundle=after_bundle, tuned_bundle=tuned_bundle,
-        args=args, script_info=script_info, dep_mode=dep_mode, load_designs=load_designs,
+        args=args, script_info=script_info, dep_mode=dep_mode,
     )
-    receipt: dict[str, Any] = {
-        "ok": True, "feasible": True, "command": "report", "mode": mode, "stack_id": resolved_stack_id,
-        "deployment_mode": dep_mode, "ttft_slo_ms": after_bundle.ttft_slo_ms,
-        "model_name": after_bundle.model_name, "hardware_sku": after_bundle.hardware_sku,
-        "phase": after_bundle.phase, "agent_brief": brief_dict, **summary,
-    }
-    if args.concurrency is not None:
-        receipt["requested_concurrency"] = int(args.concurrency)
-    if not getattr(args, "emit_json", False):
-        receipt["_stdout_markdown"] = digest_md
-    return receipt
+    raise NotImplementedError(
+        "LEGACY_PURGED: hardcoded receipt['feasible']=True contradiction (SLA_VIOLATED + feasible=True) "
+        "deleted; compute feasible strictly from canonical SlaVerdict (all_slas_met and hbm_feasible)."
+    )
 
 
 def run_quickstart_command(args: argparse.Namespace) -> dict[str, Any]:
@@ -1001,7 +1016,7 @@ def run_quickstart_command(args: argparse.Namespace) -> dict[str, Any]:
         "golden_commands": [
             {"name": "zero_config_modeling_report", "cmd": "mindie-sim report --model kimi-k3.1 --hardware 950dt --deployment-mode pd_decode --num-devices 32 --context 128k --out-dir ./out"},
             {"name": "pass2_agent_rewrite_plan", "cmd": "mindie-sim report --model kimi-k3.1 --hardware 950dt --deployment-mode pd_decode --num-devices 32 --rewrite-plan ./out/plan.json --out-dir ./out"},
-            {"name": "strict_simulation_mode", "cmd": "mindie-sim report --model qwen3-32b --hardware a3 --deployment-mode colocated --mode simulation --compare-track merged --target-track unmerged_pr --out-dir ./out"},
+            {"name": "strict_simulation_mode", "cmd": "mindie-sim report --model qwen3-32b --hardware a3 --deployment-mode colocated --mode simulation --compare-track shipping --target-track proposed --out-dir ./out"},
             {"name": "audit_launch_script", "cmd": "mindie-sim report --from-script ./serve.sh --hardware a3 --deployment-mode colocated --out-dir ./out"},
             {"name": "blind_box_hf_config", "cmd": "mindie-sim report --model ./my_hf_model/config.json --hardware a3 --deployment-mode colocated --tpot-ms 20 --out-dir ./out"},
         ],

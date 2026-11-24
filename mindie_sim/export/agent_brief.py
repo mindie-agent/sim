@@ -52,7 +52,6 @@ from .models import (
 from .public_view import (
     THREE_TRACK_LABELS,
     format_track_label,
-    normalize_public_backend,
     project_agent_brief_mapping,
     project_artifacts,
     project_codesign_opportunities,
@@ -102,8 +101,8 @@ def _bundle_track_label(bundle: ExportBundle) -> str:
         if isinstance(bundle.effective_config, Mapping) else ""
     )
     if not raw and bundle.target_envelope_applied:
-        raw = "expected_ideal"
-    return format_track_label(raw or "merged")
+        raw = "target"
+    return format_track_label(raw or "shipping")
 
 
 def _bundle_kpi_dict(bundle: ExportBundle) -> dict[str, Any]:
@@ -343,7 +342,7 @@ def _build_brief_action_items(
             "prio": f"P{item.priority}",
             "cat": "new" if item.category == PENDING_KIND_TO_IMPLEMENT else "tune",
             "kernel": _trim_text(item.target_kernel, BRIEF_KERNEL_LIMIT),
-            "backend": normalize_public_backend(item.suggested_backend),
+            "backend": sanitize_public_text(item.suggested_backend),
             "submodule": _trim_text(item.submodule, BRIEF_KERNEL_LIMIT),
             "saved_ms": round(item.expected_gain_ms, 3),
             "saved_us_per_tok_die": round(item.saved_us_per_tok_die, 2),
@@ -400,13 +399,6 @@ def _build_brief_scenario_block(after: ExportBundle, par_short: str, par_detail:
     pd_pool = project_pd_pool(after.pd_pool_summary)
     if pd_pool is not None:
         scen_block["pd_pool"] = pd_pool
-    if isinstance(after.calibration_basis, Mapping) and after.calibration_basis:
-        scen_block["calibration_basis"] = {
-            "mode": sanitize_public_text(after.calibration_basis.get("mode") or ""),
-            "calibrated": bool(after.calibration_basis.get("calibrated")),
-            "pt_sku": sanitize_public_text(after.calibration_basis.get("primitive_table_sku") or ""),
-            "cann": sanitize_public_text(after.calibration_basis.get("cann_version") or ""),
-        }
     return scen_block
 
 
@@ -615,10 +607,10 @@ def format_executive_digest_markdown(brief: Mapping[str, Any]) -> str:
     aft = kp.get("after") or {}
     plan = clean_brief.get("action_plan_3_tracks") or {}
     is_modeling = str(aft.get("analysis_mode") or "") == MODE_MODELING or bool(aft.get("has_unbound_formula_ops"))
-    bef_track = format_track_label(bef.get("track_label") or "merged")
-    aft_track = format_track_label(aft.get("track_label") or ("expected_ideal" if is_modeling else "merged"))
+    bef_track = format_track_label(bef.get("track_label") or "shipping")
+    aft_track = format_track_label(aft.get("track_label") or ("target" if is_modeling else "shipping"))
     aft_col = f"After [{aft_track} · 卡SLA目标建模终态]" if is_modeling else f"After [{aft_track}]"
-    bind_badge = format_binding_badge(str(aft.get("binding_state") or BINDING_STATE_BOUND))
+    bind_badge = format_binding_badge(str(aft.get("binding_state") or ""))
     sla_target = aft.get("sla_target_ms")
     sla_cell = (
         f"SLA <= {sla_target} ms ({aft.get('sla_regime')})"

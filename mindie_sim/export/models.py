@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from mindie_sim.prediction.results import FusedPipelineDescriptor, OpOccurrence
+from mindie_sim.schema.common import ModelingError
 
 #: Export bundle schema version and binary/decimal unit divisors.
 EXPORT_BUNDLE_SCHEMA = "mindie-sim.export-bundle/2"
@@ -45,17 +46,12 @@ P50_QUANTILE = 0.5
 P90_QUANTILE = 0.9
 #: Minimum semantic token length for automated kernel_details.csv matching.
 MIN_MATCH_TOKEN_LEN = 2
-#: Default context, batching, model-length, scenario, and SLO parameters.
-DEFAULT_EXPORT_CONTEXT_TOKENS = 1024
+#: Default batching, model-length, and scenario prompt/output parameters.
 DEFAULT_MIN_BATCHED_TOKENS = 768
 DEFAULT_MODEL_LEN_HEADROOM = 1024
 DEFAULT_MIN_MODEL_LEN = 4096
 DEFAULT_SCENARIO_PROMPT_TOKENS = 4096
 DEFAULT_SCENARIO_OUTPUT_TOKENS = 128
-DEFAULT_TPOT_SLO_MS = 50.0
-DEFAULT_TTFT_SLO_MS = 5000.0
-#: Default sparse DSA Lightning Indexer top-k fallback when unspecified on layer plan.
-DEFAULT_SPARSE_INDEX_TOPK = 2048
 #: Fallback sort key for any unrecognized archetype ordering.
 ARCHETYPE_ORDER_FALLBACK = 999
 #: Maximum character length for compact concatenated source-ref strings in Sheet 4.
@@ -97,9 +93,12 @@ MODE_MODELING = "modeling"
 
 def format_binding_badge(binding_state: str) -> str:
     """Map canonical ``binding_state`` to its human-readable provenance badge."""
-    if str(binding_state or "").strip() == BINDING_STATE_UNBOUND_FORMULA:
+    state = str(binding_state or "").strip()
+    if state in {BINDING_STATE_BOUND, BINDING_STATE_MEASURED}:
+        return BINDING_BADGE_BOUND
+    if state == BINDING_STATE_UNBOUND_FORMULA:
         return BINDING_BADGE_UNBOUND
-    return BINDING_BADGE_BOUND
+    raise ModelingError(f"unknown_binding_state:{binding_state!r}")
 
 
 #: Strictly banned internal Python simulator recipe class names (never exported).
@@ -196,13 +195,9 @@ MACRO_MOD_MOE_ROUTED = "MoE Routed Experts (GMM1 / Act / GMM2)"
 MACRO_MOD_MOE_SHARED = "MoE Shared Experts (MSO Overlapped vs Exposed)"
 MACRO_MOD_DENSE_FFN = "Dense FFN"
 MACRO_MOD_RESIDUAL_NORM = "Block AttnRes / mHC / RMSNorm"
-#: Backward-compatible alias for ``MACRO_MOD_RESIDUAL_NORM``.
-MACRO_MOD_DENSE_NORM = MACRO_MOD_RESIDUAL_NORM
 MACRO_MOD_COLLECTIVES = "Exposed TP/SP/DCP Collectives"
 MACRO_MOD_DRAFT_LAYERS = "Draft Layers (DSpark / MTP)"
 MACRO_MOD_VERIFY_HEAD = "Verify & LM Head / Embedding"
-#: Backward-compatible alias for ``MACRO_MOD_VERIFY_HEAD``.
-MACRO_MOD_SPEC_HEAD = MACRO_MOD_VERIFY_HEAD
 MACRO_MOD_ENGRAM = "Engram / PLE Memory"
 MACRO_MOD_VISION = "Vision / Multimodal Encoder"
 
@@ -273,20 +268,6 @@ DEPLOYMENT_MODE_LABELS: dict[str, str] = {
     "pd_decode": "PD 仅 Decode [D-Pool]",
     "pd_unpooled": "PD 分离 [非池化]",
     "pd_pooled": "PD 分离 [池化]",
-}
-
-#: Closed-form storage specification matching post-TP local shapes.
-WEIGHT_QUANT_FORMATS: dict[str, dict[str, float | int]] = {
-    "BF16": {"bytes": 2.0, "group": 0, "scale": 0, "aux": 0},
-    "FP32": {"bytes": 4.0, "group": 0, "scale": 0, "aux": 0},
-    "FP8": {"bytes": 1.0, "group": 0, "scale": 0, "aux": 0},
-    "W8A8": {"bytes": 1.0, "group": 0, "scale": 0, "aux": INT8_CHANNEL_AUX_BYTES},
-    "W4A8": {"bytes": 0.5, "group": 0, "scale": 0, "aux": INT4_CHANNEL_AUX_BYTES},
-    "W4A16": {"bytes": 0.5, "group": MXFP_GROUP_SIZE, "scale": 2 * BF16_BYTES, "aux": 0},
-    "MXFP8": {"bytes": 1.0, "group": MXFP_GROUP_SIZE, "scale": 1, "aux": 0},
-    "MXFP4": {"bytes": 0.5, "group": MXFP_GROUP_SIZE, "scale": 1, "aux": 0},
-    "INT8": {"bytes": 1.0, "group": 0, "scale": 0, "aux": INT8_CHANNEL_AUX_BYTES},
-    "INT4": {"bytes": 0.5, "group": 0, "scale": 0, "aux": INT4_CHANNEL_AUX_BYTES},
 }
 
 SUPPORTED_WEIGHT_QUANTS = ("BF16", "W8A8", "W4A8", "MXFP8", "MXFP4")
@@ -422,8 +403,8 @@ class OperatorExportRow:
     repeat_count: int = 1
     logical_role: str = ""
     ascend_kernel: str = ""
-    kernel_backend: str = BACKEND_CANN
-    kernel_status: str = KERNEL_STATUS_EXISTING
+    kernel_backend: str = ""
+    kernel_status: str = ""
     source_ref: str = ""
     tensor_contract: str = ""
     is_overlapped: bool = False
@@ -442,8 +423,8 @@ class OperatorExportRow:
     semantic_atoms: tuple[str, ...] = ()
     comm_domain_tag: str = ""
     kernel_synthesis_spec: Any = None
-    binding_state: str = BINDING_STATE_BOUND
-    is_shipping_abi: bool = True
+    binding_state: str = ""
+    is_shipping_abi: bool = False
     stream_core_budget: str = ""
     formula_eval: Any = None
 
@@ -554,7 +535,7 @@ class NewKernelBacklogItem:
     synthesis_spec: Any = None
     math_formula: str = ""
     sram_residency_summary: str = ""
-    binding_state: str = BINDING_STATE_BOUND
+    binding_state: str = ""
     source_row_indices: tuple[int, ...] = ()
     core_budget: str = ""
     attributable_gain_ms: float | None = None
@@ -765,7 +746,7 @@ class ExportBundle:
     deployment_mode: str = ""
     prompt_tokens: int = DEFAULT_SCENARIO_PROMPT_TOKENS
     output_tokens: int = DEFAULT_SCENARIO_OUTPUT_TOKENS
-    tpot_slo_ms: float = DEFAULT_TPOT_SLO_MS
+    tpot_slo_ms: float | None = None
     ttft_slo_ms: float | None = None
     spec_method: str = ""
     spec_proposals: int = 0
@@ -781,11 +762,11 @@ class ExportBundle:
     semantic_audit_triggers: tuple[Any, ...] = ()
     macro_wall_trigger: Any = None
     rewrite_plan_sha256: str = ""
-    rewrite_verification_passed: bool = True
+    rewrite_verification_passed: bool = False
     recommended_checkpoint: Mapping[str, Any] | None = None
     va_serving_rules_summary: Mapping[str, Any] | None = None
     analysis_mode: str = MODE_SIMULATION
-    binding_state: str = BINDING_STATE_BOUND
+    binding_state: str = ""
     has_unbound_formula_ops: bool = False
     handoff_tpot_ms: float = 0.0
     cluster_concurrency: int = 0

@@ -40,6 +40,7 @@ from .models import (
     MIN_DENOM_EPS, OVERLAP_EXPOSED_EPS_US, US_PER_MS, AlignedComparisonRow,
     ExportBundle, MacroModuleRow, OperatorExportRow,
 )
+from .public_view import format_track_label, is_same_public_config
 
 SLICE_MAX_EXPLICIT_LAYERS = 4
 MIN_GROUP_SIZE = 2
@@ -62,27 +63,13 @@ _FRAMEWORK_REASONS = frozenset({
     "shipping_route_switch",
     "framework_graph_edit",
 })
-_PUBLIC_TRACK_LABELS: dict[str, str] = {
-    "merged": "当前栈基线",
-    "unmerged_pr": "提案版本",
-    "expected_ideal": "目标架构预演",
-    "raw_eager": "Eager 基线",
-}
 _UNBOUND_PROJECTION_BADGE = "[未绑定实现 · 硬件物理预演]"
 
 
 def format_public_track_label(bundle: ExportBundle, *, role: str = "") -> str:
-    """Map internal track tokens to clean Chinese public display labels."""
+    """Delegate strictly to canonical ``public_view.format_track_label`` (C-1 StackTrack)."""
     raw = str(getattr(bundle, "feature_track", "") or "").strip()
-    low = raw.lower()
-    if low in _PUBLIC_TRACK_LABELS:
-        base = _PUBLIC_TRACK_LABELS[low]
-    elif not raw:
-        base = "基线配置" if role == "before" else "优化方案"
-    else:
-        base = raw
-        for token, zh in _PUBLIC_TRACK_LABELS.items():
-            base = re.sub(re.escape(token), zh, base, flags=re.IGNORECASE)
+    base = format_track_label(raw) if raw else ("基线配置" if role == "before" else "优化方案")
     has_unbound = bool(getattr(bundle, "has_unbound_formula_ops", False)) or any(
         getattr(op, "binding_state", "") == BINDING_STATE_UNBOUND_FORMULA
         for op in getattr(bundle, "operators", ())
@@ -124,7 +111,7 @@ def _op_exact_key(op: OperatorExportRow) -> str:
 
 def _op_occ_key(op: OperatorExportRow) -> tuple[int, int, int, str]:
     occ = op.occurrence
-    return (int(occ.replica), int(occ.stage), int(occ.rank), str(occ.op_id))
+    return (int(occ.replica), int(occ.stage), (-1 if occ.rank is None else int(occ.rank)), str(occ.op_id))
 
 
 def _op_atoms(op: OperatorExportRow) -> frozenset[str]:
@@ -896,177 +883,16 @@ def build_macro_module_breakdown(
     return tuple(rows)
 
 
-def is_same_deployment_config(before_bundle: ExportBundle, after_bundle: ExportBundle) -> bool:
-    """Return True when Before and After share identical parallel/batch/quant/spec config."""
-    bm, am = before_bundle.memory_ledger, after_bundle.memory_ledger
-    return (
-        bm.dp == am.dp
-        and bm.tp == am.tp
-        and bm.ep == am.ep
-        and bm.pp == am.pp
-        and bm.dcp == am.dcp
-        and bm.pcp == am.pcp
-        and bm.concurrency == am.concurrency
-        and bm.weight_quant == am.weight_quant
-        and bm.cache_dtype == am.cache_dtype
-        and before_bundle.spec_proposals == after_bundle.spec_proposals
-        and before_bundle.sequence_parallel == after_bundle.sequence_parallel
-    )
-
-
-def _row_pre_edit_receipt_ms(
-    row: AlignedComparisonRow,
-    stage_ops_by_key: Mapping[tuple[str, str], float],
-) -> float | None:
-    """Resolve intermediate pre-kernel-edit exposed ms ``C`` before card materiality filtering."""
-    if not row.after_ops:
-        return None
-    a_rep = row.effective_after_repeat
-    vals: list[float] = []
-    for a_op in row.after_ops:
-        fe = a_op.formula_eval
-        raw = (
-            fe.get("after_pre_edit_exposed_us")
-            if isinstance(fe, Mapping)
-            else getattr(fe, "after_pre_edit_exposed_us", None)
-        )
-        if raw is not None:
-            vals.append(float(raw) * a_rep / US_PER_MS)
-            continue
-        key = (row.archetype_id, strip_op_prefix(a_op.op_id).lower())
-        if key in stage_ops_by_key:
-            vals.append(stage_ops_by_key[key] * a_rep / US_PER_MS)
-            continue
-        return None
-    return sum(vals)
-
-
-def _index_intermediate_bundle_ops(bundle: ExportBundle | None) -> dict[tuple[str, str], float]:
-    if bundle is None:
-        return {}
-    out: dict[tuple[str, str], float] = {}
-    for op in bundle.operators:
-        key = (op.archetype_id or op.layer_label, strip_op_prefix(op.op_id).lower())
-        out[key] = 0.0 if op.is_overlapped else float(op.exposed_dur_us)
-    return out
-
-
 def classify_waterfall_stage(
     acc: GroupAccounting,
     before_bundle: ExportBundle,
     after_bundle: ExportBundle,
 ) -> tuple[str, str | None]:
-    """Map one ``GroupAccounting`` row onto ``(primary_stage, pre_edit_stage)`` for Sheet 4."""
-    same_cfg = is_same_deployment_config(before_bundle, after_bundle)
-    if acc.after_pre_edit_ms is not None:
-        pre_stage = WF_STAGE_FRAMEWORK if same_cfg else WF_STAGE_CONFIG
-        post_stage = WF_STAGE_KERNEL if acc.bucket in {"new", "tune"} else WF_STAGE_RESIDUAL
-        return post_stage, pre_stage
-    if acc.bucket in {"new", "tune"}:
-        return WF_STAGE_KERNEL, None
-    if acc.bucket == "config":
-        if same_cfg or acc.reason in _FRAMEWORK_REASONS:
-            return WF_STAGE_FRAMEWORK, None
-        return WF_STAGE_CONFIG, None
-    return WF_STAGE_RESIDUAL, None
-
-
-def enrich_comparison_plan_stage_receipts(
-    plan: ComparisonPlan,
-    before_bundle: ExportBundle,
-    after_bundle: ExportBundle | None,
-    aligned_rows: Sequence[AlignedComparisonRow],
-    *,
-    config_bundle: ExportBundle | None = None,
-    framework_bundle: ExportBundle | None = None,
-) -> ComparisonPlan:
-    """Compute/preserve exact intermediate stage ``C`` receipts BEFORE card filtering."""
-    if after_bundle is None or not plan.group_accounting:
-        return plan
-    a_ntok = max(float(after_bundle.n_tok_per_die or 1.0), MIN_DENOM_EPS)
-    stage_ops = _index_intermediate_bundle_ops(framework_bundle or config_bundle)
-    updated_acc: list[GroupAccounting] = []
-    cfg_ms_tot = cfg_upt_tot = 0.0
-    new_ms_tot = new_upt_tot = 0.0
-    tune_ms_tot = tune_upt_tot = 0.0
-    res_ms_tot = res_upt_tot = 0.0
-    for acc in plan.group_accounting:
-        row = aligned_rows[acc.row_index] if 0 <= acc.row_index < len(aligned_rows) else None
-        pre_c = acc.after_pre_edit_ms
-        if pre_c is None and row is not None:
-            pre_c = _row_pre_edit_receipt_ms(row, stage_ops)
-        if pre_c is not None and acc.bucket in {"new", "tune", "residual"}:
-            c_ms = float(pre_c)
-            c_upt = c_ms * US_PER_MS / a_ntok
-            cfg_ms = acc.before_ms - c_ms
-            cfg_upt = acc.before_upt - c_upt
-            kern_ms = acc.saved_ms - cfg_ms
-            kern_upt = acc.saved_upt - cfg_upt
-            if abs(cfg_ms) <= CONSERVATION_EPS_MS and abs(cfg_upt) <= CONSERVATION_EPS_MS:
-                # Zero pre-edit difference: avoid spurious split terms on identical stages.
-                new_acc = replace(
-                    acc, after_pre_edit_ms=None,
-                    config_share_ms=0.0, config_share_upt=0.0,
-                    kernel_share_ms=acc.saved_ms, kernel_share_upt=acc.saved_upt,
-                )
-            else:
-                new_acc = replace(
-                    acc, after_pre_edit_ms=c_ms,
-                    config_share_ms=cfg_ms, config_share_upt=cfg_upt,
-                    kernel_share_ms=kern_ms, kernel_share_upt=kern_upt,
-                )
-        else:
-            new_acc = acc
-        updated_acc.append(new_acc)
-        if new_acc.bucket == "config":
-            cfg_ms_tot += new_acc.saved_ms
-            cfg_upt_tot += new_acc.saved_upt
-        elif new_acc.bucket == "new":
-            cfg_ms_tot += new_acc.config_share_ms
-            cfg_upt_tot += new_acc.config_share_upt
-            new_ms_tot += new_acc.kernel_share_ms
-            new_upt_tot += new_acc.kernel_share_upt
-        elif new_acc.bucket == "tune":
-            cfg_ms_tot += new_acc.config_share_ms
-            cfg_upt_tot += new_acc.config_share_upt
-            tune_ms_tot += new_acc.kernel_share_ms
-            tune_upt_tot += new_acc.kernel_share_upt
-        else:
-            cfg_ms_tot += new_acc.config_share_ms
-            cfg_upt_tot += new_acc.config_share_upt
-            res_ms_tot += new_acc.kernel_share_ms
-            res_upt_tot += new_acc.kernel_share_upt
-
-    wf = plan.waterfall
-    new_wf = replace(
-        wf,
-        config_saved_ms=cfg_ms_tot,
-        config_saved_upt=cfg_upt_tot,
-        new_kernel_saved_ms=new_ms_tot,
-        new_kernel_saved_upt=new_upt_tot,
-        tune_kernel_saved_ms=tune_ms_tot,
-        tune_kernel_saved_upt=tune_upt_tot,
-        residual_saved_ms=res_ms_tot,
-        residual_saved_upt=res_upt_tot,
-    )
-    stage_ms = {WF_STAGE_CONFIG: 0.0, WF_STAGE_FRAMEWORK: 0.0, WF_STAGE_KERNEL: 0.0, WF_STAGE_RESIDUAL: 0.0}
-    for acc_item in updated_acc:
-        primary_st, pre_st = classify_waterfall_stage(acc_item, before_bundle, after_bundle)
-        if pre_st is None:
-            stage_ms[primary_st] += acc_item.saved_ms
-        else:
-            stage_ms[pre_st] += acc_item.config_share_ms
-            stage_ms[primary_st] += acc_item.kernel_share_ms
-    anchored_stage_wf = anchor_stage_waterfall(
-        before_bundle,
-        after_bundle,
-        config_bridge_span_us=(float(config_bundle.step_span_us) if config_bundle is not None else None),
-        config_saved_us=cfg_ms_tot * US_PER_MS,
-        config_stage_saved_us=stage_ms[WF_STAGE_CONFIG] * US_PER_MS,
-        framework_stage_saved_us=stage_ms[WF_STAGE_FRAMEWORK] * US_PER_MS,
-    )
-    return replace(
-        plan, waterfall=new_wf, group_accounting=tuple(updated_acc), stage_waterfall=anchored_stage_wf,
+    """Unplugged socket: delegate stage attribution strictly to canonical EngineStepReceipt."""
+    raise NotImplementedError(
+        "LEGACY_PURGED: duplicate is_same_deployment_config, heuristic classify_waterfall_stage, "
+        "and third shadow waterfall enrich_comparison_plan_stage_receipts deleted; "
+        "use public_view.is_same_public_config + direct EngineStepReceipt.stages (int ns)."
     )
 
 
@@ -1078,7 +904,7 @@ __all__ = [
     "build_agent_brief", "build_comparison_plan", "build_macro_module_breakdown",
     "build_new_kernel_backlog", "build_parallelism_codesign_note",
     "build_pending_kernel_details", "classify_waterfall_stage",
-    "enrich_comparison_plan_stage_receipts", "export_agent_brief",
+    "export_agent_brief",
     "format_executive_digest_markdown", "format_parallelism_codomain_summary",
-    "format_public_track_label", "is_same_deployment_config",
+    "format_public_track_label",
 ]

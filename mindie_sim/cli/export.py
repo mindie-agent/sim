@@ -21,17 +21,15 @@
 from __future__ import annotations
 
 import argparse
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 import json
 from pathlib import Path
 import sys
 from typing import Any
 
 from mindie_sim.export import (
-    DEFAULT_EXPORT_CONTEXT_TOKENS,
     DEFAULT_SCENARIO_OUTPUT_TOKENS,
     DEFAULT_SCENARIO_PROMPT_TOKENS,
-    DEFAULT_TPOT_SLO_MS,
     build_export_bundle,
     compose_export_case,
     export_comparison_xlsx,
@@ -79,12 +77,6 @@ def _read_bounded_json_object(path: str | Path, label: str) -> dict[str, Any]:
     return data
 
 
-def _load_kernel_designs(path: str | None) -> Mapping[str, Mapping[str, str]] | None:
-    if not path:
-        return None
-    raise ModelingError("kernel_designs_prose_override_retired:use_rewrite_plan_for_verified_receipts")
-
-
 def _add_common_export_args(cmd: argparse.ArgumentParser) -> None:
     cmd.add_argument("case", help="path to MindIE-Sim case JSON file")
     cmd.add_argument(
@@ -93,9 +85,9 @@ def _add_common_export_args(cmd: argparse.ArgumentParser) -> None:
     )
     cmd.add_argument("--phase", choices=("prefill", "decode"), default="decode")
     cmd.add_argument("--tokens", type=int, default=1)
-    cmd.add_argument("--context", type=parse_token_shorthand, default=DEFAULT_EXPORT_CONTEXT_TOKENS)
+    cmd.add_argument("--context", type=parse_token_shorthand, default=None)
     cmd.add_argument("--sequences", type=int, default=1)
-    cmd.add_argument("--scope", choices=("body", "model"), default="body")
+    cmd.add_argument("--scope", choices=("body", "model"), default="model")
     cmd.add_argument(
         "--observations", "--kernel-csv", dest="observations", default=None,
         help="optional msprof kernel_details.csv or observation bundle JSON for 1-to-N reconciliation",
@@ -128,13 +120,23 @@ def _add_oneshot_export_command(subparsers) -> None:
     )
     cmd.add_argument("--output-tokens", type=parse_token_shorthand, default=DEFAULT_SCENARIO_OUTPUT_TOKENS)
     cmd.add_argument("--concurrency", type=int, default=1)
-    cmd.add_argument("--tpot-ms", type=float, default=DEFAULT_TPOT_SLO_MS)
+    cmd.add_argument("--tpot-ms", type=float, default=None)
     cmd.add_argument("--ttft-ms", type=float, default=None)
     cmd.add_argument("--spec-tokens", "--mtp", dest="spec_tokens", type=int, default=0)
     cmd.add_argument("--accept-len", type=float, default=1.0)
     cmd.add_argument("--stack", default=None, help="runtime stack (vllm-ascend, ideal-target, raw-eager, diffusion-native, or /path/to/manifest.json)")
-    cmd.add_argument("--compare-track", default="merged", help="baseline ('Before') feature track (default: merged)")
-    cmd.add_argument("--target-track", default=None, help="optional candidate ('After') feature track (e.g. expected_ideal)")
+    cmd.add_argument(
+        "--compare-track",
+        choices=("eager", "shipping", "proposed", "target"),
+        default="shipping",
+        help="baseline ('Before') stack track (default: shipping)",
+    )
+    cmd.add_argument(
+        "--target-track",
+        choices=("eager", "shipping", "proposed", "target"),
+        default=None,
+        help="optional candidate ('After') stack track (e.g. target)",
+    )
     cmd.add_argument("--xlsx", dest="xlsx_output", default=None, help="destination path for comparison .xlsx workbook")
     cmd.add_argument("--trace", dest="trace_output", default=None, help="destination path for msprof trace_view.json")
     cmd.add_argument("--trace-side", choices=("before", "after"), default="after", help="which track to emit into --trace when comparing")
@@ -147,10 +149,6 @@ def _add_oneshot_export_command(subparsers) -> None:
         choices=("colocated", "pd_disaggregated", "pd_prefill", "pd_decode"),
         default=None,
         help="explicit deployment mode label for Summary Block 1",
-    )
-    cmd.add_argument(
-        "--kernel-designs-json", default=None,
-        help="[retired] prose override removed; raises ModelingError — use --rewrite-plan",
     )
     cmd.add_argument("--observations", "--kernel-csv", dest="observations", default=None)
     cmd.add_argument("--include-submission", action="store_true")
@@ -184,10 +182,6 @@ def add_export_commands(subparsers) -> None:
     xlsx_cmd.add_argument("--cache-dtype", default=None)
     xlsx_cmd.add_argument("--engram-offload", dest="engram_offload", action="store_true", default=None)
     xlsx_cmd.add_argument("--no-engram-offload", dest="engram_offload", action="store_false")
-    xlsx_cmd.add_argument(
-        "--kernel-designs-json", default=None,
-        help="[retired] prose override removed; raises ModelingError — use --rewrite-plan",
-    )
 
 
 def _run_oneshot_export(args: argparse.Namespace) -> dict[str, Any]:
@@ -216,7 +210,8 @@ def _run_oneshot_export(args: argparse.Namespace) -> dict[str, Any]:
         ep=int(args.ep), pp=int(args.pp), pcp=int(args.pcp),
         prompt_tokens=int(args.prompt_tokens), output_tokens=int(args.output_tokens),
         concurrency=int(args.concurrency),
-        tpot_slo_ms=float(args.tpot_ms), ttft_slo_ms=eff_ttft,
+        tpot_slo_ms=(float(args.tpot_ms) if args.tpot_ms is not None else None),
+        ttft_slo_ms=eff_ttft,
         mtp_proposal_tokens=int(args.spec_tokens),
         mtp_acceptance_length=float(args.accept_len),
         quant=eff_quant,
@@ -226,7 +221,7 @@ def _run_oneshot_export(args: argparse.Namespace) -> dict[str, Any]:
         runtime_stack=getattr(args, "stack", None),
     )
     raw_before, auto_req = compose_export_case(
-        args.model, args.hardware, feature_track=str(args.compare_track or "merged"), **common_kw,
+        args.model, args.hardware, feature_track=str(args.compare_track or "shipping"), **common_kw,
     )
     step_req = StepRequest(
         phase=args.phase,
@@ -261,11 +256,9 @@ def _run_oneshot_export(args: argparse.Namespace) -> dict[str, Any]:
         "phase": before_bundle.phase,
     }
     if args.xlsx_output:
-        designs = _load_kernel_designs(getattr(args, "kernel_designs_json", None))
         xlsx_sum = export_comparison_xlsx(
             before_bundle, args.xlsx_output,
-            compare_source=after_bundle,
-            agent_kernel_designs=designs,
+            after_bundle=after_bundle,
         )
         result["xlsx"] = xlsx_sum.to_dict()
     if args.trace_output:
@@ -283,12 +276,14 @@ def _run_oneshot_export(args: argparse.Namespace) -> dict[str, Any]:
 def run_export_command(args: argparse.Namespace) -> dict[str, Any]:
     """Execute ``report``, ``quickstart``, ``export``, ``export-trace``, or ``export-xlsx``."""
     if args.command == "report":
-        return run_report_command(args, load_designs=_load_kernel_designs)
+        return run_report_command(args)
     if args.command == "quickstart":
         return run_quickstart_command(args)
     if args.command == "export":
         return _run_oneshot_export(args)
     case_data = _read_bounded_json_object(args.case, "case")
+    if args.context is None:
+        raise ModelingError("export_command_requires_explicit_context_tokens")
     request = StepRequest(
         phase=args.phase,
         tokens=int(args.tokens),
@@ -314,18 +309,16 @@ def run_export_command(args: argparse.Namespace) -> dict[str, Any]:
             _read_bounded_json_object(args.compare_case, "compare_case")
             if getattr(args, "compare_case", None) else None
         )
-        designs = _load_kernel_designs(getattr(args, "kernel_designs_json", None))
         summary = export_comparison_xlsx(
             case_data,
             args.export_output,
-            compare_source=compare_data,
+            after_bundle=compare_data,
             request=request,
             replay=replay,
             observations_path=args.observations,
             weight_quant=getattr(args, "weight_quant", None),
             cache_dtype=getattr(args, "cache_dtype", None),
             engram_host_offload=getattr(args, "engram_offload", None),
-            agent_kernel_designs=designs,
         )
         return {"ok": True, "command": "export-xlsx", **summary.to_dict()}
     raise ValueError(f"not_an_export_command:{args.command}")

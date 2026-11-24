@@ -15,12 +15,9 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-import re
 
 from .action_plan import GroupAccounting
-from .comparison import format_public_track_label
 from .models import (
-    BACKEND_TILELANG,
     MIN_DENOM_EPS,
     OVERLAP_EXPOSED_EPS_US,
     US_PER_MS,
@@ -29,6 +26,7 @@ from .models import (
     OperatorExportRow,
     format_binding_badge,
 )
+from .public_view import format_track_label
 from .ooxml import (
     STYLE_FLOAT2,
     STYLE_FLOAT3,
@@ -145,7 +143,6 @@ STD_COL_WIDTHS = (
 MEAS_COL_WIDTHS = (
     28.0, 22.0, 24.0, 24.0, 24.0, 28.0, 12.0, 14.0, 14.0, 28.0, 14.0, 14.0, 12.0, 20.0,
 )
-_LEGACY_BACKEND_RE = re.compile(r"legacy[-_]?dsl", re.IGNORECASE)
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,7 +176,7 @@ def _stream_masking_badge(op: OperatorExportRow) -> tuple[str, int]:
 
 
 def _sanitize_backend_text(text: str) -> str:
-    return _LEGACY_BACKEND_RE.sub(BACKEND_TILELANG, str(text or ""))
+    return str(text or "")
 
 
 def _kernel_with_backend(op: OperatorExportRow) -> str:
@@ -437,203 +434,24 @@ def populate_comparison_breakdown_sheet(
     aligned_rows: Sequence[AlignedComparisonRow],
     group_accounting: Sequence[GroupAccounting] = (),
 ) -> BreakdownSheetReceipt:
-    """Populate Sheet 2 in comparison mode strictly within visible columns ``A:AA``."""
-    apply_col_widths(ws, CMP_COL_WIDTHS)
-    ws.freeze_panes(CMP_FREEZE_ROWS, CMP_FREEZE_COLS)
-    b_track_lbl = format_public_track_label(before_bundle, role="before")
-    a_track_lbl = format_public_track_label(after_bundle, role="after")
-    write_banner(
-        ws, 1, CMP_COLS,
-        (
-            f"Before ({b_track_lbl}) vs After ({a_track_lbl}) "
-            f"Topological Operator Breakdown | {before_bundle.model_name} @ {before_bundle.hardware_sku} ({before_bundle.phase.upper()})"
-        ),
-        STYLE_TITLE,
-    )
-    headers = (
-        "Archetype (Scope & Layer Range)", "Repeats (×N)", "Submodule",
-        "Logical Role (带作用域标注)", "并发流与掩盖关系 (Stream & Masking)",
-        "Rank-Local Shapes & Dtype",
-        "Before Ascend Kernel [Backend]", "Before 流内单次 (us)", "Before 单次暴露 (us)",
-        "Before 全网暴露 (ms)", "Before Bound",
-        "After Ascend Kernel [Backend]", "分类 / 算子状态 (Category / Status)",
-        "After 流内单次 (us)", "After 单次暴露 (us)", "After 全网暴露 (ms)",
-        "暴露净省 Δ (ms)", "Speedup", "After Bound",
-        "物理下界 L* (ms)", "Gap vs L* (ms)",
-        "物理收据与变化说明 (Receipt Summary)", "源码出处 / Source Ref",
-        "Before 摊薄耗时 (us/tok·die)", "After 摊薄耗时 (us/tok·die)",
-        "摊薄净省 Δ (us/tok·die)", "绑定状态 (Binding State)",
-    )
-    write_headers(ws, 2, headers)
-
-    b_ntok = max(float(before_bundle.n_tok_per_die or 1.0), MIN_DENOM_EPS)
-    a_ntok = max(float(after_bundle.n_tok_per_die or 1.0), MIN_DENOM_EPS)
-    acc_by_idx = {a.row_index: a for a in group_accounting}
-    by_arch: list[tuple[str, str, int, list[tuple[int, AlignedComparisonRow]]]] = []
-    for row_idx, item in enumerate(aligned_rows):
-        if not by_arch or by_arch[-1][0] != item.archetype_id:
-            by_arch.append((item.archetype_id, item.archetype_title, item.repeat_count, []))
-        by_arch[-1][3].append((row_idx, item))
-
-    row_cursor = CMP_DATA_START_ROW
-    row_spans: dict[int, tuple[int, int]] = {}
-    subtotal_rows: list[int] = []
-    last_detail_row = CMP_DATA_START_ROW - 1
-    tot_bef_ms = tot_aft_ms = tot_lstar_ms = 0.0
-    tot_bef_upt = tot_aft_upt = 0.0
-    for _, arch_title, _, arch_items in by_arch:
-        arch_start = row_cursor
-        sub_spans: list[tuple[str, int, int]] = []
-        arch_bef_ms = arch_aft_ms = arch_lstar_ms = 0.0
-        arch_bef_upt = arch_aft_upt = 0.0
-        for row_idx, item in arch_items:
-            row_count = max(1, len(item.before_ops), len(item.after_ops))
-            r_start = row_cursor
-            r_end = row_cursor + row_count - 1
-            b_ms, a_ms, l_ms, b_u, a_u = _write_comparison_group(
-                ws, r_start, r_end, item, acc_by_idx.get(row_idx), b_ntok, a_ntok,
-            )
-            row_spans[row_idx] = (r_start, r_end)
-            last_detail_row = max(last_detail_row, r_end)
-            arch_bef_ms += b_ms
-            arch_aft_ms += a_ms
-            arch_lstar_ms += l_ms
-            arch_bef_upt += b_u
-            arch_aft_upt += a_u
-            extend_span(sub_spans, item.submodule, r_start, r_end)
-            row_cursor = r_end + 1
-        arch_end = row_cursor - 1
-        ws.set_cell(arch_start, CMP_COL_ARCH, arch_title, style=STYLE_MERGED)
-        ws.merge_range(arch_start, CMP_COL_ARCH, arch_end, CMP_COL_ARCH)
-        for sub_label, s1, s2 in sub_spans:
-            ws.set_cell(s1, CMP_COL_SUB, sub_label, style=STYLE_MERGED)
-            ws.merge_range(s1, CMP_COL_SUB, s2, CMP_COL_SUB)
-        r_sub = row_cursor
-        _write_comparison_subtotal_row(
-            ws, r_sub, arch_title, arch_start, arch_end,
-            arch_bef_ms, arch_aft_ms, arch_lstar_ms, arch_bef_upt, arch_aft_upt,
-        )
-        subtotal_rows.append(r_sub)
-        tot_bef_ms += arch_bef_ms
-        tot_aft_ms += arch_aft_ms
-        tot_lstar_ms += arch_lstar_ms
-        tot_bef_upt += arch_bef_upt
-        tot_aft_upt += arch_aft_upt
-        row_cursor += 1
-    _write_comparison_grand_total(
-        ws, row_cursor, subtotal_rows, tot_bef_ms, tot_aft_ms, tot_lstar_ms, tot_bef_upt, tot_aft_upt,
-    )
-    ws.validate_max_column(CMP_COLS)
-    return BreakdownSheetReceipt(
-        row_spans=row_spans,
-        last_detail_row=last_detail_row,
-        grand_total_row=row_cursor,
+    """Unplugged socket: accumulate exact int ns across Sheet 2 (strictly 27 cols A:AA)."""
+    b_track_lbl = format_track_label(before_bundle.feature_track) if before_bundle.feature_track else "基线配置"
+    a_track_lbl = format_track_label(after_bundle.feature_track) if after_bundle.feature_track else "优化方案"
+    del ws, aligned_rows, group_accounting, b_track_lbl, a_track_lbl
+    raise NotImplementedError(
+        "LEGACY_PURGED: float-ms Sheet 2 breakdown accumulation (tot_bef_ms += arch_bef_ms) deleted; "
+        "accumulate exact int ns from EngineStepReceipt and divide by 1_000_000 only at cell display."
     )
 
 
 def populate_standalone_breakdown_sheet(
     ws: Worksheet, bundle: ExportBundle,
 ) -> BreakdownSheetReceipt:
-    """Populate Sheet 2 in standalone (single-bundle) mode."""
-    apply_col_widths(ws, STD_COL_WIDTHS)
-    ws.freeze_panes(CMP_FREEZE_ROWS, CMP_FREEZE_COLS)
-    write_banner(
-        ws, 1, STD_COLS,
-        f"Layer-Archetype -> Submodule -> Ascend Kernel Breakdown | {bundle.model_name} @ {bundle.hardware_sku} ({bundle.phase.upper()})",
-        STYLE_TITLE,
-    )
-    headers = (
-        "Archetype (Scope & Layer Range)", "Repeats (×N)", "Submodule",
-        "Logical Role (带作用域标注)", "并发流与掩盖关系 (Stream & Masking)",
-        "Rank-Local Shapes & Dtype", "Ascend Kernel [Backend]",
-        "Kernel Status (算子状态)",
-        "流内单次 (us)", "单次暴露 (us)", "全网暴露 (ms)",
-        "物理下界 L* 单次 (us)", "物理下界 L* 全网 (ms)", "Gap vs L* (ms)",
-        "Bottleneck Bound", "源码出处 / Source Ref",
-    )
-    write_headers(ws, 2, headers)
-
-    by_arch: list[tuple[str, str, list[tuple[int, OperatorExportRow]]]] = []
-    for op_idx, op in enumerate(bundle.operators):
-        aid = op.archetype_id or op.layer_label
-        if not by_arch or by_arch[-1][0] != aid:
-            by_arch.append((aid, op.archetype_title or op.layer_label, []))
-        by_arch[-1][2].append((op_idx, op))
-
-    row_cursor = STD_DATA_START_ROW
-    row_spans: dict[int, tuple[int, int]] = {}
-    subtotal_rows: list[int] = []
-    last_detail_row = STD_DATA_START_ROW - 1
-    tot_ms = tot_lstar_ms = 0.0
-    for _, arch_title, ops in by_arch:
-        arch_start = row_cursor
-        sub_spans: list[tuple[str, int, int]] = []
-        arch_ms = arch_lstar_ms = 0.0
-        for op_idx, op in ops:
-            r = row_cursor
-            row_spans[op_idx] = (r, r)
-            last_detail_row = max(last_detail_row, r)
-            ws.set_row_height(r, WRAP_ROW_HEIGHT_PT)
-            rep = max(1, int(op.repeat_count))
-            stream_txt, stream_style = _stream_masking_badge(op)
-            exp_us = 0.0 if op.is_overlapped else op.exposed_dur_us
-            exp_ms = exp_us * rep / US_PER_MS
-            l_ms = 0.0 if op.is_overlapped else (op.l_star_lean_us * rep / US_PER_MS)
-            arch_ms += exp_ms
-            arch_lstar_ms += l_ms
-            ws.set_cell(r, STD_COL_REP, rep, style=STYLE_INT)
-            write_row(ws, r, (
-                (op.logical_role or op.op_id, None, STYLE_TEXT_WRAP),
-                (stream_txt, None, stream_style),
-                (op.tensor_contract, None, STYLE_TEXT_WRAP),
-                (_kernel_with_backend(op), None, STYLE_TEXT_WRAP),
-                (op.kernel_status, None, STYLE_NEW_KERNEL if op.needs_new_kernel else STYLE_TEXT_WRAP),
-                (op.dur_us, None, STYLE_FLOAT3),
-                (exp_us, None, STYLE_FLOAT3),
-                (exp_ms, f"=J{r}*B{r}/1000", STYLE_FLOAT3),
-                (op.l_star_lean_us, None, STYLE_FLOAT3),
-                (l_ms, "=0" if op.is_overlapped else f"=L{r}*B{r}/1000", STYLE_FLOAT3),
-                (max(0.0, exp_ms - l_ms), f"=MAX(0,K{r}-M{r})", STYLE_FLOAT3),
-                (op.bound_display, None, STYLE_OVERLAP if op.is_overlapped else STYLE_TEXT),
-                (op.source_ref or "", None, STYLE_MUTED_TEXT),
-            ), start_col=STD_COL_ROLE)
-            extend_span(sub_spans, op.submodule, r, r)
-            row_cursor += 1
-        arch_end = row_cursor - 1
-        ws.set_cell(arch_start, STD_COL_ARCH, arch_title, style=STYLE_MERGED)
-        ws.merge_range(arch_start, STD_COL_ARCH, arch_end, STD_COL_ARCH)
-        for sub_label, s1, s2 in sub_spans:
-            ws.set_cell(s1, STD_COL_SUB, sub_label, style=STYLE_MERGED)
-            ws.merge_range(s1, STD_COL_SUB, s2, STD_COL_SUB)
-        r_sub = row_cursor
-        ws.set_cell(r_sub, 1, f"Subtotal — {arch_title}", style=STYLE_SUBTOTAL_TEXT)
-        ws.merge_range(r_sub, 1, r_sub, STD_SUBTOTAL_LABEL_END_COL)
-        ws.set_cell(r_sub, STD_COL_EXP_MS, arch_ms, formula=f"=SUM(K{arch_start}:K{arch_end})", style=STYLE_SUBTOTAL_NUM)
-        ws.set_cell(r_sub, STD_COL_LSTAR_US, "", style=STYLE_SUBTOTAL_TEXT)
-        ws.set_cell(r_sub, STD_COL_LSTAR_MS, arch_lstar_ms, formula=f"=SUM(M{arch_start}:M{arch_end})", style=STYLE_SUBTOTAL_NUM)
-        ws.set_cell(r_sub, STD_COL_GAP_MS, max(0.0, arch_ms - arch_lstar_ms), formula=f"=MAX(0,K{r_sub}-M{r_sub})", style=STYLE_SUBTOTAL_NUM)
-        ws.set_cell(r_sub, STD_COL_BOUND, "", style=STYLE_SUBTOTAL_TEXT)
-        ws.merge_range(r_sub, STD_COL_BOUND, r_sub, STD_COL_SOURCE_REF)
-        subtotal_rows.append(r_sub)
-        tot_ms += arch_ms
-        tot_lstar_ms += arch_lstar_ms
-        row_cursor += 1
-
-    ws.set_cell(row_cursor, 1, "WHOLE-MODEL TOTAL (实际暴露耗时合计)", style=STYLE_TOTAL_TEXT)
-    ws.merge_range(row_cursor, 1, row_cursor, STD_SUBTOTAL_LABEL_END_COL)
-    sum_k = "=" + "+".join(f"K{r}" for r in subtotal_rows) if subtotal_rows else "=0"
-    sum_m = "=" + "+".join(f"M{r}" for r in subtotal_rows) if subtotal_rows else "=0"
-    ws.set_cell(row_cursor, STD_COL_EXP_MS, tot_ms, formula=sum_k, style=STYLE_TOTAL_FLOAT3)
-    ws.set_cell(row_cursor, STD_COL_LSTAR_US, "", style=STYLE_TOTAL_TEXT)
-    ws.set_cell(row_cursor, STD_COL_LSTAR_MS, tot_lstar_ms, formula=sum_m, style=STYLE_TOTAL_FLOAT3)
-    ws.set_cell(row_cursor, STD_COL_GAP_MS, max(0.0, tot_ms - tot_lstar_ms), formula=f"=MAX(0,K{row_cursor}-M{row_cursor})", style=STYLE_TOTAL_FLOAT3)
-    ws.set_cell(row_cursor, STD_COL_BOUND, f"{len(bundle.operators)} archetype ops", style=STYLE_TOTAL_TEXT)
-    ws.merge_range(row_cursor, STD_COL_BOUND, row_cursor, STD_COL_SOURCE_REF)
-    ws.validate_max_column(STD_COLS)
-    return BreakdownSheetReceipt(
-        row_spans=row_spans,
-        last_detail_row=last_detail_row,
-        grand_total_row=row_cursor,
+    """Unplugged socket: standalone 16-column Sheet 2 deleted (must emit 27-col A:AA)."""
+    del ws, bundle
+    raise NotImplementedError(
+        "LEGACY_PURGED: 16-column standalone Sheet 2 (STD_COLS=16) with float-ms accumulation deleted "
+        "(Astra P1); emit strict canonical 27-column A:AA Sheet 2 with exact int ns accumulation."
     )
 
 

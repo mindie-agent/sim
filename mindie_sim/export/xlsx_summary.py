@@ -19,12 +19,13 @@ from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from .comparison import format_parallelism_codomain_summary, format_public_track_label
+from .comparison import format_parallelism_codomain_summary
 from .models import (
     BINDING_STATE_BOUND, GIB_BYTES, MACRO_L1_HIERARCHY, MIN_DENOM_EPS, MODE_MODELING,
     OVERLAP_EXPOSED_EPS_US, TRACK_CONFIG_ENV, TRACK_FRAMEWORK, US_PER_MS,
     ActionRoadmapRow, ExportBundle, MacroModuleRow, format_binding_badge,
 )
+from .public_view import format_track_label
 from .ooxml import (
     BACKLOG_ROW_HEIGHT_PT, HEADER_ROW_HEIGHT_PT, STYLE_ALERT_HIGH, STYLE_ALERT_MID,
     STYLE_ALERT_OK, STYLE_FLOAT2, STYLE_FLOAT3, STYLE_HEADER, STYLE_INPUT_NUM, STYLE_INT,
@@ -38,7 +39,6 @@ SHEET_SUMMARY = "Summary"
 SHEET_BREAKDOWN = "Layer_Operator_Breakdown"
 SHEET_MEMORY = "Memory_Quant_Calculator"
 SHEET_PENDING_KERNELS = "Pending_Kernel_Details"
-SHEET_NEW_KERNELS = SHEET_PENDING_KERNELS
 SHEET_MEASURED = "Measured_msprof_Calibration"
 
 PCT_DIVISOR = 100.0
@@ -200,18 +200,22 @@ def _populate_summary_deployment_block(
     mode_tag = "建模 Modeling" if ref.analysis_mode == MODE_MODELING else "仿真 Simulation"
     if compare_bundle is not None:
         track_txt = (
-            f"{format_public_track_label(bundle, role='before')} -> "
-            f"{format_public_track_label(compare_bundle, role='after')}"
+            f"{format_track_label(bundle.feature_track) if bundle.feature_track else '基线配置'} -> "
+            f"{format_track_label(compare_bundle.feature_track) if compare_bundle.feature_track else '优化方案'}"
         )
     else:
-        track_txt = format_public_track_label(bundle, role="before")
+        track_txt = format_track_label(bundle.feature_track) if bundle.feature_track else "基线配置"
     is_decode = ref.phase == "decode"
     raw_sla_target = ref.tpot_slo_ms if is_decode else ref.ttft_slo_ms
     sla_constrained = raw_sla_target is not None
     sla_val: Any = float(raw_sla_target) if sla_constrained else _UNCONSTRAINED_SLA_TEXT
     sla_style = STYLE_FLOAT2 if sla_constrained else STYLE_TEXT
     ttft_label = f"TTFT <= {ref.ttft_slo_ms:.0f} ms" if ref.ttft_slo_ms is not None else f"TTFT: {_UNCONSTRAINED_SLA_TEXT}"
-    sla_detail = f"TPOT <= {ref.tpot_slo_ms:.1f} ms ({ttft_label})" if is_decode else ttft_label
+    if is_decode:
+        tpot_label = f"TPOT <= {ref.tpot_slo_ms:.1f} ms" if ref.tpot_slo_ms is not None else f"TPOT: {_UNCONSTRAINED_SLA_TEXT}"
+        sla_detail = f"{tpot_label} ({ttft_label})"
+    else:
+        sla_detail = ttft_label
     spec_detail = (
         f"Method={ref.spec_method}, Proposals={ref.spec_proposals}, Avg Accepted={ref.avg_accepted_tokens:.2f} tok/step"
         if is_decode and ref.spec_proposals > 0
@@ -242,7 +246,7 @@ def _populate_summary_deployment_block(
     rows = (
         (SUM_ROW_MODEL, "模型与总层数 (Model & Total Layers)", ref.model_name, None, STYLE_MERGED, layers_txt, "总卡数 (Total Dies)", mem.total_dies, None, STYLE_INT, dies_detail),
         (SUM_ROW_HW, "硬件 SKU & 拓扑 (Hardware / Topology)", ref.hardware_sku, None, STYLE_TEXT, f"{topo_txt} | {ref.hardware_die_summary}", "并行切分策略 (Full Parallelism)", par_short, None, STYLE_MERGED, par_detail),
-        (SUM_ROW_MODE, "部署形态 (Deployment Mode)", ref.deployment_mode or "PD 分离 [非池化]", None, STYLE_MERGED, f"Phase={ref.phase.upper()} | Capture={ref.graph_capture_mode} | {mode_tag} {format_binding_badge(ref.binding_state)} | {track_txt}", "单 DP 活跃并发 (Active Concurrency / DP)", mem.concurrency, None, STYLE_INPUT_NUM, f"Active requests per DP replica (DP={mem.dp})"),
+        (SUM_ROW_MODE, "部署形态 (Deployment Mode)", ref.deployment_mode or "Unspecified", None, STYLE_MERGED, f"Phase={ref.phase.upper()} | Capture={ref.graph_capture_mode} | {mode_tag} {format_binding_badge(ref.binding_state)} | {track_txt}", "单 DP 活跃并发 (Active Concurrency / DP)", mem.concurrency, None, STYLE_INPUT_NUM, f"Active requests per DP replica (DP={mem.dp})"),
         (SUM_ROW_LEN, "业务输入/输出长度 (Prompt / Output)", f"{ref.prompt_tokens} / {ref.output_tokens}", None, STYLE_TEXT, f"Context={ref.context_tokens} tok, Output={ref.output_tokens} tok, SeqLen={mem.seq_len}", "集群总并发 (Cluster Total Concurrency)", eff_cc, cc_formula, STYLE_KPI_HIGHLIGHT, f"= 单 DP 活跃并发 × DP ({mem.dp})"),
         (SUM_ROW_SLA, "SLA 约束 (SLA Target ms)", sla_val, None, sla_style, sla_detail, "单卡 HBM 权重占用 (NPU Weight / Die GiB)", weight_gib, None, STYLE_FLOAT2, weight_detail),
         (SUM_ROW_SPEC, "投机解码策略 (Avg Accepted tok/step)", ref.avg_accepted_tokens, None, STYLE_FLOAT2, spec_detail, "单卡最大可承载并发 (Max HBM Concurrency / DP)", mem.max_hbm_concurrency_per_dp, None, STYLE_INT, f"Usable HBM={mem.usable_hbm_bytes / float(GIB_BYTES):.1f} GiB | Fit={'PASS' if mem.fits_hbm else 'OOM'} | Cache={mem.cache_dtype}"),
@@ -634,11 +638,11 @@ def populate_summary_sheet(
     ws.freeze_panes(SUMMARY_FREEZE_ROWS, 0)
     if compare_bundle is not None:
         track_note = (
-            f" | {format_public_track_label(bundle, role='before')} -> "
-            f"{format_public_track_label(compare_bundle, role='after')}"
+            f" | {format_track_label(bundle.feature_track) if bundle.feature_track else '基线配置'} -> "
+            f"{format_track_label(compare_bundle.feature_track) if compare_bundle.feature_track else '优化方案'}"
         )
     elif bundle.feature_track:
-        track_note = f" | {format_public_track_label(bundle, role='before')}"
+        track_note = f" | {format_track_label(bundle.feature_track)}"
     else:
         track_note = ""
     write_banner(ws, 1, SUMMARY_COLS, f"MindIE-Sim Ascend Performance & Optimization Summary | {bundle.model_name} @ {bundle.hardware_sku}{track_note}", STYLE_TITLE)
@@ -665,7 +669,7 @@ def populate_summary_sheet(
 
 __all__ = [
     "MIB_PER_GIB", "PCT_DIVISOR", "SHEET_BREAKDOWN", "SHEET_MEASURED", "SHEET_MEMORY",
-    "SHEET_NEW_KERNELS", "SHEET_PENDING_KERNELS", "SHEET_SUMMARY", "SUMMARY_COLS",
+    "SHEET_PENDING_KERNELS", "SHEET_SUMMARY", "SUMMARY_COLS",
     "SUM_AFT_NTOK_REF", "SUM_AFT_STEP_REF", "SUM_AFT_UPT_REF", "SUM_BEF_NTOK_REF",
     "SUM_BEF_STEP_REF", "SUM_BEF_UPT_REF", "SUM_KPI_AMORTIZED_ROW", "SUM_KPI_NTOK_ROW",
     "SUM_KPI_STEP_ROW", "apply_col_widths", "extend_span", "gap_ratio_style",
