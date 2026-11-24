@@ -68,6 +68,7 @@ from .generic_latent_attention import (
     semantic_index_selection, sparse_over_parts, view_causal_pairs,
     visible_parts, window_cache_read,
 )
+from .generic_latent_attention_views import pool_sparse_view_records
 
 # Historical private names remain importable for source-geometry probes.
 _semantic_index_selection = semantic_index_selection
@@ -1183,7 +1184,7 @@ def _batch_mla_attention(
     pcp_prefill, eff_cp, paired_sfa_mode, pcp_factor, tp_gather, dp_width, policy,
     heads, logical_heads, q, kv_row_b, kv_hbm_total,
     kv_mte2_total, hierarchy, sweeps_by_view, shared_by_view, view_records, kv_components,
-    *, peer_rows=None, local_dp_pos=0,
+    *, peer_rows=None, local_dp_pos=0, cp_interleave_size=None,
 ):
     if mixed_quant:
         grp_outputs = mixed_quant.module.lower_attention(
@@ -1218,7 +1219,8 @@ def _batch_mla_attention(
                 b, grp_outputs, grp_views, plan=plan, heads=heads,
                 local_heads=logical_heads, cp=eff_cp, rows=q, runtime=runtime,
                 pcp_factor=pcp_factor, tp_gather=tp_gather, dp_width=dp_width,
-                peer_rows=peer_rows, local_dp_pos=local_dp_pos)
+                peer_rows=peer_rows, local_dp_pos=local_dp_pos,
+                interleave=cp_interleave_size)
         out_set = ({b.prefix + ".latent_attention_batch"} if paired_sfa_mode
                    else set(grp_outputs))
         for idx_op, op_item in enumerate(b.ops):
@@ -1284,6 +1286,35 @@ def _history_only_pairs(view, eff_cp, interleave, window):
     ]
 
 
+def _attach_mla_dcp_metadata(
+    b, grp_outputs, paired_sfa_mode, rank_pairs, rank_sweeps,
+    worst_pairs_r, worst_sweeps_r, mtp_split, sparse_phase,
+):
+    """Attach per-rank DCP balance and sparse straggler skew metadata."""
+    out_set = ({b.prefix + ".latent_attention_batch"} if paired_sfa_mode
+               else set(grp_outputs))
+    eff_cp = len(rank_pairs)
+    balanced = sum(rank_pairs) / float(eff_cp) if eff_cp > 0 else 0.0
+    cp_sparse_imb = (
+        float(rank_pairs[worst_pairs_r]) / balanced
+        if (sparse_phase and balanced > 0.0)
+        else 1.0
+    )
+    sparse_meta = (("cp_sparse_imbalance", float(cp_sparse_imb)),) if sparse_phase else ()
+    for idx_op, op_item in enumerate(b.ops):
+        if op_item.op_id not in out_set:
+            continue
+        b.ops[idx_op] = replace(
+            op_item,
+            metadata=op_item.metadata + (
+                ("cp_per_rank_pairs", tuple(rank_pairs)),
+                ("cp_per_rank_sweeps", tuple(rank_sweeps)),
+                ("cp_bottleneck_pairs_rank", worst_pairs_r),
+                ("cp_bottleneck_sweeps_rank", worst_sweeps_r),
+                ("dcp_mtp_split", "history" if mtp_split else "unified"),
+            ) + sparse_meta)
+
+
 def _append_mla_attention(
     b, outputs, views, runtime, selected, parallel, dsa_prefill, model, plan, quant, query_tile,
     cp_interleave_size, topk, local_heads, dcp_heads, latent_dim, qk_dim, reuse_index_selection,
@@ -1324,25 +1355,31 @@ def _append_mla_attention(
         rank_sweeps = [0] * eff_cp
         rank_rows = [0] * eff_cp
         view_records: list[dict] = []
+        sparse_phase = bool(topk) or (idle_dcp_owner and is_sparse)
         for orig_idx, view in indexed_views:
             rec = attention_view_record(
                 view, plan=plan, model=model, quant=quant, query_tile=query_tile,
                 eff_cp=eff_cp, block=block_size, interleave=cp_interleave_size,
                 tp=parallel.tp, dsa=grp_dsa,
-                topk_present=bool(topk) or (idle_dcp_owner and is_sparse),
+                topk_present=sparse_phase,
                 heads=grp_heads, latent_dim=latent_dim,
                 shared_selection=(topk if (reuse_index_selection
                                            and isinstance(topk, SharedSelectionRef))
-                                  else None))
+                                  else None),
+                runtime=runtime)
             if mtp_split:
                 hist = _history_only_pairs(view, eff_cp, cp_interleave_size, int(plan.window or 0))
                 if hist is not None:
                     rec = {**rec, "v_pairs": hist, "pairs": float(sum(hist))}
+            view_records.append({"orig_idx": orig_idx, **rec})
+        if eff_cp > 1 and sparse_phase:
+            pool_sparse_view_records(
+                view_records, eff_cp, cp_interleave_size, runtime=runtime)
+        for rec in view_records:
             for rank in range(eff_cp):
                 rank_pairs[rank] += rec["v_pairs"][rank]
                 rank_sweeps[rank] += rec["v_sweeps"][rank]
                 rank_rows[rank] += rec["v_rows"][rank]
-            view_records.append({"orig_idx": orig_idx, **rec})
         worst_pairs_r = max(range(eff_cp),
                             key=lambda rank: (rank_pairs[rank], rank_sweeps[rank]))
         worst_sweeps_r = max(range(eff_cp),
@@ -1378,22 +1415,11 @@ def _append_mla_attention(
             kv_row_b, kv_hbm_total, kv_mte2_total, hierarchy, sweeps_by_view, shared_by_view,
             view_records, kv_components,
             peer_rows=(peer_decode_rows if (dp_width > 1 and eff_cp > 1) else None),
-            local_dp_pos=local_dp_pos)
+            local_dp_pos=local_dp_pos, cp_interleave_size=cp_interleave_size)
         if eff_cp > 1 and grp_outputs:
-            out_set = ({b.prefix + ".latent_attention_batch"} if paired_sfa_mode
-                       else set(grp_outputs))
-            for idx_op, op_item in enumerate(b.ops):
-                if op_item.op_id not in out_set:
-                    continue
-                b.ops[idx_op] = replace(
-                    op_item,
-                    metadata=op_item.metadata + (
-                        ("cp_per_rank_pairs", tuple(rank_pairs)),
-                        ("cp_per_rank_sweeps", tuple(rank_sweeps)),
-                        ("cp_bottleneck_pairs_rank", worst_pairs_r),
-                        ("cp_bottleneck_sweeps_rank", worst_sweeps_r),
-                        ("dcp_mtp_split", "history" if mtp_split else "unified"),
-                    ))
+            _attach_mla_dcp_metadata(
+                b, grp_outputs, paired_sfa_mode, rank_pairs, rank_sweeps,
+                worst_pairs_r, worst_sweeps_r, mtp_split, sparse_phase)
         if eff_cp > 1 and grp_outputs and not paired_sfa_mode:
             current_dep = None
             if mtp_split:

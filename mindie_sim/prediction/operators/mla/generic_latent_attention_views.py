@@ -21,7 +21,17 @@ from mindie_sim.catalog.cache import (
 )
 from mindie_sim.catalog.cache_format import CacheFormat, cache_format
 from mindie_sim.catalog.context_parallel import (
-    dsa_cp_token_ranges, owned_positions, split_causal_pairs, split_pcp_pairs,
+    SparseDcpSequence,
+    dsa_cp_token_ranges,
+    owned_positions,
+    round_sparse_dcp_counts,
+    round_sparse_dcp_matrix,
+    sparse_dcp_capacities,
+    sparse_dcp_sequence_for_total,
+    split_causal_pairs,
+    split_pcp_pairs,
+    split_sparse_dcp_batch,
+    split_sparse_dcp_batch_per_sequence,
 )
 from mindie_sim.schema.common import ModelingError
 
@@ -466,9 +476,100 @@ def _window_unique_rows(win_spans, view, plan, eff_cp, interleave):
     return [math.ceil(view.kv_len / eff_cp)] * eff_cp
 
 
+def _sparse_window_partition(parts, view, plan, query_tile, eff_cp, interleave):
+    """Exact per-rank dense-window pairs and sweeps for window_compressed sparse layers."""
+    if plan.cache_kind == "dense" or plan.window <= 0:
+        return [0.0] * eff_cp, [0] * eff_cp
+    if plan.noncausal_attention:
+        win_pairs = list(split_causal_pairs(
+            sum(q_part for q_part, _ in parts), view.kv_len - sum(q_part for q_part, _ in parts),
+            eff_cp, interleave, window=plan.window, noncausal=True).per_rank)
+    else:
+        win_pairs = [
+            sum(split_causal_pairs(
+                q_part, c_part, eff_cp, interleave,
+                window=plan.window, noncausal=False).per_rank[rank]
+                for q_part, c_part in parts)
+            for rank in range(eff_cp)
+        ]
+    win_sweeps = [0] * eff_cp
+    for lo, hi in _dense_window_tile_spans(parts, view, plan, query_tile):
+        if hi > lo:
+            for rank in range(eff_cp):
+                win_sweeps[rank] += owned_positions(lo, hi - 1, eff_cp, interleave, rank)
+    return win_pairs, win_sweeps
+
+
+def _partition_sparse_view(
+    view, plan, parts, eff_q, pairs, sweeps, eff_cp, query_tile, interleave, runtime,
+):
+    """Per-rank sparse Top-K DCP partition for one view plus pooling descriptor."""
+    ratio = 1 if plan.cache_kind == "dense" else max(1, int(plan.compress_ratio or 1))
+    always_tail = (
+        int(view.kv_len) % int(plan.index_kpool)
+        if int(plan.index_kpool) > 1 and bool(plan.index_kpool_always_select_tail)
+        else 0
+    )
+    win_pairs, win_sweeps = _sparse_window_partition(
+        parts, view, plan, query_tile, eff_cp, interleave)
+    sparse_pairs_total = max(0.0, float(pairs) - sum(win_pairs))
+    sparse_sweeps_total = max(0, int(sweeps) - sum(win_sweeps))
+    pairs_seq = sparse_dcp_sequence_for_total(
+        view.kv_len, sparse_pairs_total, eff_q,
+        compress_ratio=ratio, always_select_tail=always_tail)
+    sweeps_seq = sparse_dcp_sequence_for_total(
+        view.kv_len, sparse_sweeps_total, eff_q,
+        compress_ratio=ratio, always_select_tail=always_tail)
+    p_split = split_sparse_dcp_batch((pairs_seq,), eff_cp, interleave, runtime=runtime, unit="pairs")
+    s_split = split_sparse_dcp_batch((sweeps_seq,), eff_cp, interleave, runtime=runtime, unit="sweeps")
+    s_caps = sparse_dcp_capacities(sweeps_seq, eff_cp, interleave)
+    s_ints = round_sparse_dcp_counts(s_split.per_rank, sparse_sweeps_total, s_caps)
+    v_pairs = [win_pairs[r] + p_split.per_rank[r] for r in range(eff_cp)]
+    v_sweeps = [win_sweeps[r] + s_ints[r] for r in range(eff_cp)]
+    v_shared = [0] * eff_cp
+    v_rows = [owned_positions(0, view.kv_len - 1, eff_cp, interleave, rank) for rank in range(eff_cp)]
+    spec = {
+        "pairs_seq": pairs_seq,
+        "sweeps_seq": sweeps_seq,
+        "sweeps_total": sparse_sweeps_total,
+        "win_pairs": tuple(win_pairs),
+        "win_sweeps": tuple(win_sweeps),
+    }
+    return v_pairs, v_sweeps, v_shared, v_rows, spec
+
+
+def pool_sparse_view_records(
+    view_records: list[dict], eff_cp: int, interleave: int, runtime=None,
+) -> None:
+    """Apply batch-level variance pooling across sparse DCP view records in place."""
+    if eff_cp <= 1 or not view_records:
+        return
+    sparse_indices = [
+        idx for idx, rec in enumerate(view_records) if rec.get("sparse_dcp_spec") is not None
+    ]
+    if not sparse_indices:
+        return
+    specs = [view_records[idx]["sparse_dcp_spec"] for idx in sparse_indices]
+    pairs_seqs: list[SparseDcpSequence] = [spec["pairs_seq"] for spec in specs]
+    sweeps_seqs: list[SparseDcpSequence] = [spec["sweeps_seq"] for spec in specs]
+    _, pairs_per_seq = split_sparse_dcp_batch_per_sequence(
+        pairs_seqs, eff_cp, interleave, runtime=runtime, unit="pairs")
+    _, sweeps_per_seq = split_sparse_dcp_batch_per_sequence(
+        sweeps_seqs, eff_cp, interleave, runtime=runtime, unit="sweeps")
+    seq_totals = [int(spec["sweeps_total"]) for spec in specs]
+    seq_caps = [sparse_dcp_capacities(seq, eff_cp, interleave) for seq in sweeps_seqs]
+    sweeps_matrix = round_sparse_dcp_matrix(sweeps_per_seq, seq_totals, seq_caps)
+    for pos, rec_idx in enumerate(sparse_indices):
+        spec = specs[pos]
+        win_p = spec["win_pairs"]
+        win_s = spec["win_sweeps"]
+        view_records[rec_idx]["v_pairs"] = [win_p[r] + pairs_per_seq[pos][r] for r in range(eff_cp)]
+        view_records[rec_idx]["v_sweeps"] = [win_s[r] + sweeps_matrix[pos][r] for r in range(eff_cp)]
+
+
 def attention_view_record(view, *, plan, model, quant, query_tile, eff_cp, block,
                           interleave, tp, dsa, topk_present, heads, latent_dim,
-                          shared_selection=None):
+                          shared_selection=None, runtime=None):
     """Per-view logical pairs, owned sweeps and batch row vectors."""
     context, query = view.context, view.q_len
     parts = dsa_cp_prefill_parts(view, tp) if dsa else visible_parts(view)
@@ -554,6 +655,7 @@ def attention_view_record(view, *, plan, model, quant, query_tile, eff_cp, block
     raw_pref = max(0, min(
         int(getattr(view, "prefix_tokens", 0) or 0), int(context)))
     aligned_pref = (raw_pref // block) * block
+    sparse_dcp_spec = None
     dense_unindexed = plan.cache_kind == "dense" and not topk_present
     if eff_cp > 1 and dense_unindexed:
         if plan.noncausal_attention:
@@ -580,6 +682,9 @@ def attention_view_record(view, *, plan, model, quant, query_tile, eff_cp, block
                 if sh_hi > lo:
                     v_shared[rank] += owned_positions(lo, sh_hi - 1, eff_cp, interleave, rank)
         v_rows = _window_unique_rows(win_spans, view, plan, eff_cp, interleave)
+    elif eff_cp > 1 and topk_present:
+        v_pairs, v_sweeps, v_shared, v_rows, sparse_dcp_spec = _partition_sparse_view(
+            view, plan, parts, eff_q, pairs, sweeps, eff_cp, query_tile, interleave, runtime)
     else:
         v_pairs = [float(pairs) / eff_cp] * eff_cp
         v_sweeps = [math.ceil(sweeps / eff_cp)] * eff_cp
@@ -605,6 +710,7 @@ def attention_view_record(view, *, plan, model, quant, query_tile, eff_cp, block
         "v_sweeps": v_sweeps, "v_shared": v_shared, "v_rows": v_rows,
         "selection_reads": selection_reads,
         "selection_metadata": selection_metadata,
+        **({"sparse_dcp_spec": sparse_dcp_spec} if sparse_dcp_spec is not None else {}),
     }
 
 
@@ -731,15 +837,30 @@ def owned_store_rows(rows_by_view, views, parallel, block, *, contexts=None):
     return best
 
 
-def sharded_index_visible_rows(views, parallel, block, ratio):
+def sharded_index_visible_rows(views, parallel, block, ratio, *, sharded_dcp=None):
     """Worst-rank visible index rows under a sharded indexer."""
-    degrees = [active_dcp_degree(parallel, view.phase) for view in views]
+    if sharded_dcp is not None:
+        degrees = [max(1, int(sharded_dcp)) for _ in views]
+    else:
+        degrees = [active_dcp_degree(parallel, view.phase) for view in views]
     max_degree = max(degrees, default=1)
     block = max(1, int(block))
     ratio = max(1, int(ratio))
     per_rank = [0] * max_degree
     for view, degree in zip(views, degrees):
-        for offset in range(int(view.q_len)):
+        q_len = max(0, int(view.q_len))
+        if q_len <= 0:
+            continue
+        if ratio == 1:
+            if degree <= 1:
+                rows = int(_causal_pairs(q_len, int(view.context), 0))
+                per_rank = [value + rows for value in per_rank]
+            else:
+                split = split_causal_pairs(q_len, int(view.context), degree, block)
+                for rank in range(degree):
+                    per_rank[rank] += int(split.per_rank[rank])
+            continue
+        for offset in range(q_len):
             horizon = completed_rows(view.context + offset + 1, ratio)
             if horizon <= 0:
                 continue

@@ -439,6 +439,17 @@ owns = [
     "mindie_sim/compose/__init__.py",
     "mindie_sim/compose/inputs.py",
 ]
+[[module]]
+path = "operators/test_stage5d_dsa_dcp_sparse_imbalance.py"
+tier = "tier0"
+owns = [
+    "mindie_sim/catalog/context_parallel.py",
+    "mindie_sim/prediction/operators/mla/generic_latent_attention_views.py",
+    "mindie_sim/prediction/operators/mla/mla.py",
+    "mindie_sim/prediction/operators/mla/mla_epilogs.py",
+    "mindie_sim/prediction/sharding/context_parallel.py",
+    "mindie_sim/prediction/operators/attention/attention.py",
+]
 # ---------------------------------------------------------------- spine
 [[module]]
 path = "spine/test_stream_plan.py"

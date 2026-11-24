@@ -455,7 +455,9 @@ def lower_index_path(builder, *, plan, model, quant, parallel, views, deps, runt
         shard = (parallel.tp if dsa_prefill
                  else eff_dcp if sharded_index else 1)
         score_rows = (
-            sharded_index_visible_rows(views, parallel, idx_block, ratio)
+            sharded_index_visible_rows(
+                views, parallel, idx_block, ratio, sharded_dcp=eff_dcp,
+            )
             if sharded_index else None
         )
         topk = _select_index_rows(

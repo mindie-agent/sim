@@ -41,7 +41,14 @@ from mindie_sim.catalog.cache import local_kv_heads
 from mindie_sim.catalog.cache_format import CacheFormat
 from mindie_sim.catalog.ops import gemm_op, vector_op, comm_op, barrier_op
 from mindie_sim.catalog.context_parallel import (
-    layer_dcp_degree, layer_dcp_factors, owned_positions, split_causal_pairs,
+    layer_dcp_degree,
+    layer_dcp_factors,
+    owned_positions,
+    round_sparse_dcp_matrix,
+    sparse_dcp_capacities,
+    sparse_dcp_sequence_for_total,
+    split_causal_pairs,
+    split_sparse_dcp_batch_per_sequence,
 )
 from mindie_sim.schema.operators import OpSpec
 from mindie_sim.schema.common import dtype_bytes
@@ -570,9 +577,65 @@ def _publish_gqa_cache(
     return valid, pcp_prefill, store_ids
 
 
+def _gqa_sparse_dcp_split(
+    indexed_views, eff_cp, eff_window, plan, policy, cp_interleave_size, runtime,
+):
+    """Batch-pooled sparse Top-K DCP rank partition for GQA views."""
+    pool_size = max(1, int(getattr(plan, "index_kpool", 1) or 1))
+    pool_tail = bool(getattr(plan, "index_kpool_always_select_tail", False))
+    pairs_totals: list[float] = []
+    gathers_totals: list[int] = []
+    pairs_seqs = []
+    sweeps_seqs = []
+    for _, view in indexed_views:
+        q, context = view.q_len, view.context
+        ranges = view.query_ranges or ((0, q),)
+        selected_q = sum(end - start for start, end in ranges if end > start)
+        pairs = float(sum(
+            _long_selected_pairs(
+                end - start, context + start, 1, eff_window,
+                noncausal=bool(plan.noncausal_attention), kv_len=view.kv_len)
+            for start, end in ranges if end > start
+        ))
+        gathers = int(sum(
+            sparse_attention_traffic(
+                end - start, context + start, eff_window,
+                query_tile=policy.query_tile,
+                noncausal=bool(plan.noncausal_attention),
+                kv_len=view.kv_len).gather_rows
+            for start, end in ranges if end > start
+        ))
+        always_tail = int(view.kv_len) % pool_size if pool_size > 1 and pool_tail else 0
+        pairs_totals.append(pairs)
+        gathers_totals.append(gathers)
+        pairs_seqs.append(sparse_dcp_sequence_for_total(
+            view.kv_len, pairs, selected_q, compress_ratio=1,
+            always_select_tail=always_tail))
+        sweeps_seqs.append(sparse_dcp_sequence_for_total(
+            view.kv_len, gathers, selected_q, compress_ratio=1,
+            always_select_tail=always_tail))
+    if eff_cp <= 1:
+        return (
+            pairs_totals,
+            [[p] for p in pairs_totals],
+            [[g] for g in gathers_totals],
+        )
+    _, per_seq_pairs = split_sparse_dcp_batch_per_sequence(
+        pairs_seqs, eff_cp, cp_interleave_size, runtime=runtime, unit="pairs")
+    _, per_seq_sweeps = split_sparse_dcp_batch_per_sequence(
+        sweeps_seqs, eff_cp, cp_interleave_size, runtime=runtime, unit="sweeps")
+    seq_caps = [sparse_dcp_capacities(seq, eff_cp, cp_interleave_size) for seq in sweeps_seqs]
+    sweeps_matrix = round_sparse_dcp_matrix(per_seq_sweeps, gathers_totals, seq_caps)
+    return (
+        pairs_totals,
+        [list(row) for row in per_seq_pairs],
+        sweeps_matrix,
+    )
+
+
 def _gqa_rank_work(
     indexed_views, eff_cp, eff_topk, eff_window, plan, policy, dense_win, cp_interleave_size,
-    block_size,
+    block_size, runtime=None,
 ):
     rank_pairs = [0.0] * eff_cp
     rank_sweeps = [0] * eff_cp
@@ -582,29 +645,20 @@ def _gqa_rank_work(
     per_view_shared: list[list[int]] = []
     per_view_rows: list[list[int]] = []
     per_view_spans: list[tuple[list[tuple[int, int]], list[tuple[int, int]]]] = []
-    for _, view in indexed_views:
+    sparse_totals = sparse_v_pairs = sparse_v_sweeps = None
+    if eff_topk > 0:
+        sparse_totals, sparse_v_pairs, sparse_v_sweeps = _gqa_sparse_dcp_split(
+            indexed_views, eff_cp, eff_window, plan, policy, cp_interleave_size, runtime)
+    for pos, (_, view) in enumerate(indexed_views):
         q, context = view.q_len, view.context
         ranges = view.query_ranges or ((0, q),)
         selected_q = sum(end - start for start, end in ranges if end > start)
         win_spans: list[tuple[int, int]] = []
         sh_spans: list[tuple[int, int]] = []
         if eff_topk > 0:
-            pairs = sum(
-                _long_selected_pairs(
-                    end - start, context + start, 1, eff_window,
-                    noncausal=bool(plan.noncausal_attention), kv_len=view.kv_len)
-                for start, end in ranges if end > start
-            )
-            gathers = sum(
-                sparse_attention_traffic(
-                    end - start, context + start, eff_window,
-                    query_tile=policy.query_tile,
-                    noncausal=bool(plan.noncausal_attention),
-                    kv_len=view.kv_len).gather_rows
-                for start, end in ranges if end > start
-            )
-            v_pairs = [float(pairs) / eff_cp] * eff_cp
-            v_sweeps = [math.ceil(gathers / eff_cp)] * eff_cp
+            pairs = sparse_totals[pos]
+            v_pairs = sparse_v_pairs[pos]
+            v_sweeps = sparse_v_sweeps[pos]
             v_shared = [0] * eff_cp
         else:
             visible_kv = min(view.kv_len, dense_win) if dense_win > 0 else view.kv_len
@@ -929,12 +983,19 @@ def _append_gqa_attention(
         (rank_pairs, rank_sweeps, rank_rows, per_view_pairs, per_view_sweeps,
          per_view_shared, per_view_rows, per_view_spans, worst_r, worst_sweeps_r) = _gqa_rank_work(
             indexed_views, eff_cp, eff_topk, eff_window, plan, policy, dense_win,
-            cp_interleave_size, block_size)
+            cp_interleave_size, block_size, runtime=runtime)
         if split_curr and eff_cp > 1:
             rank_pairs, per_view_pairs = _gqa_history_pairs(
                 indexed_views, per_view_pairs, eff_cp, cp_interleave_size, dense_win,
                 chunked_pf=chunked_pf, use_global_q=chunked_pf_pcp)
             worst_r = max(range(eff_cp), key=lambda r: (rank_pairs[r], rank_sweeps[r]))
+        balanced_pairs = sum(rank_pairs) / float(eff_cp) if eff_cp > 0 else 0.0
+        sparse_imb_meta = (
+            (("cp_sparse_imbalance",
+              float(rank_pairs[worst_r]) / balanced_pairs if balanced_pairs > 0.0 else 1.0),)
+            if eff_cp > 1 and eff_topk > 0
+            else ()
+        )
         cand_ranks = resolve_cp_rank_candidates(
             parallel, eff_cp=eff_cp, pcp_factor=pcp_factor, tp_gather=tp_gather,
             dp_width=dp_width, local_dp_pos=local_dp_pos, physical_rank=physical_rank,
@@ -964,6 +1025,7 @@ def _append_gqa_attention(
                           ("cp_bottleneck_pairs_rank", worst_r),
                           ("cp_bottleneck_sweeps_rank", worst_sweeps_r),
                           ("dcp_mtp_split", "history" if split_curr else "unified"))
+                         + sparse_imb_meta
                          + _decode_contract(
                              grp_views, heads, kv_heads, width, model, quant,
                              parallel, plan, mode, window=eff_window, cp=eff_cp)
@@ -1000,7 +1062,14 @@ def _append_gqa_attention(
             grp_attn = [batched.op_id]
         elif batches:
             if eff_topk > 0:
-                batches = [annotate_sparse_prefix_unknown(item, runtime) for item in batches]
+                batches = [
+                    annotate_sparse_prefix_unknown(
+                        replace(item, metadata=item.metadata + sparse_imb_meta)
+                        if sparse_imb_meta else item,
+                        runtime,
+                    )
+                    for item in batches
+                ]
             elif not cacheless:
                 for pos, item in enumerate(batches):
                     view = indexed_views[pos][1]

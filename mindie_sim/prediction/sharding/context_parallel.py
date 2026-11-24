@@ -36,12 +36,15 @@ from typing import Any, Sequence
 from mindie_sim.catalog.cache_format import cache_format
 from mindie_sim.catalog.context_parallel import (
     CP_STRATEGY,
+    SparseDcpSequence,
+    cp_interleave,
     dcp_q_replicate_enabled,
     layer_dcp_degree,
     layer_dcp_factors,
     owned_positions,
     pcp_rank_chunk_ranges,
     runtime_cp_flag as _runtime_flag,
+    split_sparse_dcp_batch,
 )
 from mindie_sim.catalog.ops import comm_op, vector_op
 from mindie_sim.catalog.paired_sfa import SOURCE as PAIRED_SFA_SOURCE
@@ -1054,6 +1057,7 @@ def paired_sfa_calls(heads: int) -> tuple[int, ...]:
 def packed_sfa_geometry(
     meta: dict[str, Any], heads: int, plan: Any, views: Sequence[Any], cp: int,
     *, cache_dtype: str = "", cache_fmt: Any = None, runtime: Any = None,
+    interleave: int | None = None,
 ) -> dict[str, Any] | None:
     """Packed-C8 geometry of the declared paired calls, or ``None``."""
     view = dict(meta.get("attention_tensor_view") or {})
@@ -1073,12 +1077,62 @@ def packed_sfa_geometry(
             or int(plan.qk_rope_head_dim) not in PACKED_C8_ROPE):
         return None
     degree = max(1, int(cp))
-    sharded_topk = (max(1, -(-int(plan.index_topk) // degree))
-                    if int(plan.index_topk) > 0 else 0)
-    sequences = tuple((int(v.q_len), max(0, -(-int(v.context) // degree))) for v in views)
-    extents = tuple(
-        max(0, -(-min(int(v.prefix_tokens or 0), int(v.context)) // degree))
-        for v in views)
+    raw_topk = int(plan.index_topk)
+    if degree > 1 and raw_topk > 0 and views:
+        eff_interleave = (
+            cp_interleave(runtime) if interleave is None else max(1, int(interleave))
+        )
+        pool_size = max(1, int(getattr(plan, "index_kpool", 1) or 1))
+        pool_tail = bool(getattr(plan, "index_kpool_always_select_tail", False))
+        seqs = tuple(
+            SparseDcpSequence(
+                kv_len=int(v.kv_len),
+                selected_rows=float(min(int(v.kv_len), raw_topk)),
+                q_weight=float(max(0, int(v.q_len))),
+                compress_ratio=1,
+                always_select_tail=(
+                    int(v.kv_len) % pool_size if pool_size > 1 and pool_tail else 0
+                ),
+            )
+            for v in views
+        )
+        split = split_sparse_dcp_batch(
+            seqs, degree, eff_interleave, runtime=runtime, unit="pairs",
+        )
+        total_q = sum(max(0, int(v.q_len)) for v in views)
+        r_star = max(range(degree), key=lambda r: split.per_rank[r])
+        sharded_topk = (
+            max(1, math.ceil(split.per_rank[r_star] / float(total_q)))
+            if total_q > 0 and split.per_rank[r_star] > 0.0
+            else max(1, -(-raw_topk // degree))
+        )
+        cp_sparse_imb = float(split.imbalance)
+        sequences = tuple(
+            (
+                int(v.q_len),
+                max(
+                    0,
+                    owned_positions(0, int(v.kv_len) - 1, degree, eff_interleave, r_star)
+                    - int(v.q_len),
+                ),
+            )
+            for v in views
+        )
+        extents = tuple(
+            owned_positions(
+                0, min(int(v.prefix_tokens or 0), int(v.context)) - 1,
+                degree, eff_interleave, r_star,
+            )
+            if min(int(v.prefix_tokens or 0), int(v.context)) > 0 else 0
+            for v in views
+        )
+    else:
+        sharded_topk = max(1, -(-raw_topk // degree)) if raw_topk > 0 else 0
+        cp_sparse_imb = 1.0
+        sequences = tuple((int(v.q_len), max(0, -(-int(v.context) // degree))) for v in views)
+        extents = tuple(
+            max(0, -(-min(int(v.prefix_tokens or 0), int(v.context)) // degree))
+            for v in views)
     shared = getattr(runtime, "prefix_cache_mode", "private") == "shared" and any(extents)
     keys = tuple(str(v.prefix_cache_key or "") for v in views)
     # Upstream ``device_op.py:660-667`` executes packed INT8 QSFA in one single
@@ -1091,6 +1145,7 @@ def packed_sfa_geometry(
         **({"prefix_cache_mode": "shared", "prefix_tokens": extents,
             "prefix_cache_keys": keys} if shared else {"prefix_cache_mode": "private"}),
         "paired_calls": SINGLE_SFA_CALL, "dcp_peer_exchange": int(cp),
+        "cp_sparse_imbalance": cp_sparse_imb,
     }
 
 
@@ -1099,6 +1154,7 @@ def paired_sfa_attention_batch(
     local_heads: int, cp: int, rows: int, runtime: Any = None,
     pcp_factor: int = 1, tp_gather: int = 1, dp_width: int = 1,
     peer_rows: Sequence[int] | None = None, local_dp_pos: int = 0,
+    interleave: int | None = None,
 ) -> list[str]:
     """Batch paired-SFA decode ops and emit fused DCP output exchange + LSE combine."""
     ids = set(outputs)
@@ -1110,7 +1166,7 @@ def paired_sfa_attention_batch(
     fp8 = resolved.dtype in FP8_FORMATS and plan.indexer
     packed = (packed_sfa_geometry(meta, heads, plan, views, cp,
                                   cache_dtype=resolved.dtype, cache_fmt=resolved,
-                                  runtime=runtime)
+                                  runtime=runtime, interleave=interleave)
               if plan.indexer else None)
     native_packed = fp8 or packed is not None
     if native_packed and (b.model.activation_dtype != "bf16"
