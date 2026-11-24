@@ -4,8 +4,8 @@
   observations are explicit diagnostics, never a production completion floor.
 [Invariants] Physical FLOPs/bytes are never inflated to fit a measured latency.
   Ordinary ``price`` consumes physical work only.  A PrimitiveStore lookup is
-  available only through ``lookup_diagnostic`` and never enters ``OpCost.timing``
-  or ``minimum_ms``.  A normalized T06 profile attached to the Case is exposed
+  available only through ``lookup_diagnostic`` and never enters
+  ``minimum_ms``.  A normalized T06 profile attached to the Case is exposed
   for the executor/recipe owner; this module does not invent a second service.
 [Timeouts & Locks] Pure arithmetic; diagnostic store reads are indexed/cached.
 [Side-Effect Policy] Pricing does not record measurements or start device work.
@@ -22,7 +22,7 @@ if TYPE_CHECKING:
 
 from mindie_sim.schema.operators import OpSpec
 from mindie_sim.schema.case import Case as CaseSpec
-from mindie_sim.prediction.program.primitives import PrimitiveKey, PrimitiveStore, PrimitiveTiming
+from mindie_sim.prediction.program.primitives import PrimitiveKey, PrimitiveStore
 
 MAX_RECORDED_MAPPINGS = 32
 MATRIX_FLOPS_REL_TOL = 1e-9
@@ -33,9 +33,6 @@ class OpCost:
     op: OpSpec
     key: PrimitiveKey | None
     work: Mapping[str, float]
-    #: Always ``None`` in production.  Kept for callers that read the old
-    #: attribute; a diagnostic lookup is returned by ``CostModel.lookup_diagnostic``.
-    timing: PrimitiveTiming | None = None
 
     @property
     def basis(self) -> str:
@@ -418,8 +415,8 @@ class CostModel:
             "execution_basis": "declared_joint_native_service_queue",
             "unmodeled": ["internal_resource_occupancy", "internal_buffer_occupancy"]})
         row["invocations"] += 1
-        has_primitive = reference_cost.timing is not None
-        if not has_primitive and self.primitives is not None:
+        has_primitive = False
+        if self.primitives is not None:
             for scope in dict.fromkeys((self.case.runtime.graph_capture_mode, "none")):
                 if self.primitives.lookup(primitive_key(self.case, reference_cost.op, scope, hardware=self.hardware)) is not None:
                     has_primitive = True
@@ -469,11 +466,10 @@ class CostModel:
         pt_calibrated = bool(
             pt is not None and getattr(getattr(pt, "provenance", None), "calibrated", False)
         )
-        if pt is not None:
+        if pt is not None and pt_calibrated:
             calibration.append(
                 "calibrated_primitive_table_rescaled" if rescaled
-                else "calibrated_primitive_table" if pt_calibrated
-                else "uncalibrated_primitive_table"
+                else "calibrated_primitive_table"
             )
         if ledger.diagnostic_primitive_hits:
             calibration.append("diagnostic_primitive_evidence_not_production")
@@ -496,23 +492,12 @@ class CostModel:
         pt_sku = getattr(pt, "sku", None)
         pt_cann = getattr(pt, "cann_version", None)
         pt_sha = getattr(pt, "envelope_sha256", None)
-        calibration_basis = {
-            "mode": (
-                "calibrated_primitive_table_rescaled" if (pt is not None and rescaled)
-                else "calibrated_primitive_table" if pt_calibrated
-                else "uncalibrated_primitive_table" if pt is not None
-                else "datasheet_declaration"
-            ),
-            "calibrated": pt_calibrated,
-            "rescaled": rescaled,
+        primitive_provenance = {
             "declared_sku": declared_sku,
             "primitive_table_sku": str(pt_sku) if pt_sku is not None else None,
             "cann_version": str(pt_cann) if pt_cann is not None else None,
             "envelope_sha256": str(pt_sha) if pt_sha is not None else None,
-            "warnings": (
-                list(pt_warnings) if pt is not None
-                else (["uncalibrated_datasheet_declaration"] if declared_sku else [])
-            ),
+            "warnings": list(pt_warnings),
         }
         return {
             "operator_occurrences": dict(counts),
@@ -520,7 +505,7 @@ class CostModel:
             "diagnostic_primitive_lookups": ledger.diagnostic_primitive_lookups,
             "diagnostic_primitive_hits": ledger.diagnostic_primitive_hits,
             "calibration": "+".join(calibration) or "none",
-            "calibration_basis": calibration_basis,
+            "primitive_provenance": primitive_provenance,
             "declared_parameter_sources": sources,
             **({"resource_services": [item.service_id
                                       for item in self.resource_services],

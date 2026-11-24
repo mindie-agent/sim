@@ -152,52 +152,11 @@ def _build_injected_base(
     runtime_quant_plan: RuntimeQuantPlan | None,
     stack_lowering_plan: StackLoweringPlan,
 ) -> ResolvedBase:
-    kernels = deepcopy(dict(case.runtime.kernels))
-    meta = deepcopy(dict(case.runtime.metadata))
-    layouts = deepcopy(dict(case.runtime.tensor_layouts))
-    lowerings = dict(kernels.get("lowerings") or {})
-    for selector, recipe_id, _opts in stack_lowering_plan.recipe_bindings:
-        lowerings[selector] = recipe_id
-    if lowerings:
-        kernels["lowerings"] = lowerings
-    for scope_key, role_key, layout_name in stack_lowering_plan.tensor_layouts:
-        layouts[f"{scope_key}.{role_key}" if scope_key else role_key] = layout_name
-    rt_updates: dict[str, Any] = {
-        "kernels": kernels,
-        "tensor_layouts": layouts,
-    }
-    if stack_lowering_plan.lowering_passes:
-        rt_updates["lowering_passes"] = stack_lowering_plan.lowering_passes
-    cap_rule = stack_lowering_plan.scheduling.capture_bucket_rule
-    if cap_rule is not None:
-        graph_mode, raw_mode = _CAPTURE_MODE_TO_CASE[cap_rule.mode]
-        rt_updates["graph_capture_mode"] = graph_mode
-        if cap_rule.full_keys:
-            rt_updates["graph_capture_keys"] = cap_rule.full_keys
-        if cap_rule.piecewise_keys:
-            rt_updates["piecewise_capture_keys"] = cap_rule.piecewise_keys
-        meta["captured_execution_mode"] = raw_mode
-    rt_updates["metadata"] = tuple(sorted(meta.items()))
-    working = replace(case, runtime=replace(case.runtime, **rt_updates))
-    origins: list[tuple[str, OriginKind]] = []
-    for key, origin in stack_lowering_plan.binding_origins:
-        label = origin if origin in {"caller", "stack_profile", "body_default"} else "stack_profile"
-        origins.append((key, label))  # type: ignore[arg-type]
-    eff_req = replace(
-        request,
-        scenario_contract=scenario_contract,
-        runtime_quant_plan=runtime_quant_plan,
-        stack_lowering_plan=stack_lowering_plan,
-    )
-    return ResolvedBase(
-        case=working,
-        request=eff_req,
-        stack=None,
-        recipe_origins=tuple(origins),
-        sources=(),
-        scenario_contract=scenario_contract,
-        runtime_quant_plan=runtime_quant_plan,
-        stack_lowering_plan=stack_lowering_plan,
+    """Unplugged socket: dropped recipe_bindings options, origin coercion, and missing RECIPE_BINDING_ORIGINS_KEY purged."""
+    raise NotImplementedError(
+        "LEGACY_PURGED: preserve full recipe_bindings (selector, recipe_id, options) dicts, "
+        "validate binding_origins strictly against ALLOWED_BINDING_ORIGINS, and write "
+        "RECIPE_BINDING_ORIGINS_KEY into working.runtime.metadata in _build_injected_base"
     )
 
 
@@ -319,7 +278,10 @@ class PredictionSpine:
         start = (int(replica) * p.pp + int(stage)) * width
         dies = case.machine.dies[start : start + width]
         if not dies:
-            dies = case.machine.dies[:1]
+            raise NotImplementedError(
+                "LEGACY_PURGED: raise ModelingError('stage_geometry_dies_out_of_range') "
+                "instead of silently falling back to case.machine.dies[:1]"
+            )
         return Geometry.from_devices(
             dies,
             links=case.machine.links,
@@ -845,34 +807,11 @@ class PredictionSpine:
         from mindie_sim.sweep.engine import compute_pareto_frontier
 
         if request.mode == "pd":
-            total_dies = (
-                int(request.device_counts[0])
-                if request.device_counts else max(len(case.machine.dies), DEFAULT_PD_TOTAL_DIES)
+            raise NotImplementedError(
+                "LEGACY_PURGED: evaluate every budget in request.device_counts (not device_counts[0] only) "
+                "with request.sla.max_sequences_per_dp forwarded to sweep_pd_disaggregation_ratios "
+                "and compute the Pareto frontier across all budgets"
             )
-            report = sweep_pd_disaggregation_ratios(
-                case,
-                decode_case or case,
-                total_dies=total_dies,
-                prompt_tokens=max(1, request.sla.step.context or request.sla.step.tokens),
-                output_tokens=max(1, request.sla.output_budget),
-                tpot_sla_ms=request.sla.latency_ms,
-            )
-            all_rows = report.get("candidates", ())
-            front_rows = report.get("pareto_frontier", ())
-            frontier: list[TopologyPoint] = []
-            for row in front_rows:
-                raw_span = row.get("effective_tpot_ms")
-                if raw_span is None:
-                    raw_span = row.get("decode_step_ms", 0.0)
-                frontier.append(TopologyPoint(
-                    device_count=int(row.get("used_dies", total_dies)),
-                    parallel=(("prefill_dies", int(row.get("prefill_dies", 0))),),
-                    decode_parallel=(("decode_dies", int(row.get("decode_dies", 0))),),
-                    span_ms=float(raw_span or 0.0),
-                    throughput_tokens_s=float(row.get("sustainable_tps", 0.0) or 0.0),
-                    fits_memory=True,
-                ))
-            return TopologySweepResult(evaluated_count=len(all_rows), frontier=tuple(frontier))
 
         grid = list(request.device_counts) if request.device_counts else None
         evaluated_rows = list(sweep_topologies_iter(

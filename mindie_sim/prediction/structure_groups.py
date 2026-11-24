@@ -2,33 +2,58 @@
 
 [Role] Retain fusion membership, scope and evidence at the composing builder.
 [Invariants] Declarations use model/runtime geometry, never captured shapes.
-  A group adds no execution node, work or measured duration.
+  A group adds no execution node, work or measured duration. Zero hardcoded
+  model-name source tables (AG014).
 [Timeouts & Locks] Finite layer metadata updates; no I/O or locks.
 [Side-Effect Policy] Replaces records in the caller-owned operator list.
 """
+from collections.abc import Mapping
 from dataclasses import replace
+from typing import Any
+
+_LEGACY_PURGED_SOURCE_REF_MSG = (
+    "LEGACY_PURGED: resolve portable SourceRef provenance from "
+    "stacks/vllm_ascend/manifest.json without hardcoded _SOURCE_FILES model-name lookup"
+)
 
 
-_SOURCE_FILES = {
-    "vllm_ascend/ops/gdn.py": (
-        "724f43cc24ee4b4d4d01c36e7967d02d95646b5e4ab011940e16bb5374a20c9f", "local_worktree"),
-    "vllm_ascend/models/deepseek_v4/model.py": (
-        "257c415f820f6d203b78b3e1000b5e30c475281db1d99a270c65cba52a3f62ab", "committed"),
-    "vllm_ascend/models/deepseek_v4/compressor.py": (
-        "37ca695e3b9564d95c60f628dbfee8268264885d774b91ac6caeeb97c2375ce9", "committed"),
-    "vllm_ascend/models/kimi_k3.py": (
-        "498839ee000fd1d0731915613de1b98b562474c9da5c5357c686b5ae2cc0922d", "local_worktree"),
-    "vllm_ascend/ops/kimi_kda.py": (
-        "2e9890d18312708875ca2ad0a6dda2116c6b45fd521e9041467c8499ad2da96d", "local_worktree"),
-    "vllm_ascend/ops/fused_moe/moe_mlp.py": (
-        "9a18993599563f7d65c47c06ad9ac5ac406590d779bde2def0d86620e6997656", "local_worktree"),
-}
+class _PurgedSourceReference(Mapping[str, Any]):
+    """Import-safe lazy socket; any runtime dereference fails loudly."""
+
+    __slots__ = ("_path", "_symbol")
+
+    def __init__(self, path: str, symbol: str) -> None:
+        self._path = path
+        self._symbol = symbol
+
+    def _fail(self) -> Any:
+        raise NotImplementedError(_LEGACY_PURGED_SOURCE_REF_MSG)
+
+    def __getitem__(self, key: str) -> Any:
+        return self._fail()
+
+    def __iter__(self):
+        return self._fail()
+
+    def __len__(self) -> int:
+        return self._fail()
+
+    def __bool__(self) -> bool:
+        return self._fail()
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return self._fail()
+
+    def copy(self) -> dict[str, Any]:
+        return self._fail()
 
 
 def declare_group(ops, *, key, role, family, members, entries, anchor, view,
                   implementation, source=None, block="attention", scope_role=None,
                   coverage=None, fusion_status=None, fusion_reason=None,
                   native_fusion_eligible=True):
+    if isinstance(source, _PurgedSourceReference):
+        raise NotImplementedError(_LEGACY_PURGED_SOURCE_REF_MSG)
     declaration = {
         "key": key, "role": role, "family": family,
         "op_ids": tuple(members), "entry_op_ids": tuple(entries),
@@ -62,11 +87,11 @@ def declare_group(ops, *, key, role, family, members, entries, anchor, view,
 
 
 def source_reference(path, symbol):
-    digest, state = _SOURCE_FILES[path]
-    return {
-        "repository": "vllm-ascend",
-        "base_revision": "175ef4d49c2072f9233619636f0309f4f88b4e2c",
-        "source_state": state, "sha256": digest,
-        "path": path, "symbol": symbol,
-        "scope": "independent_source_semantics; not_capture_binary_identity",
-    }
+    """Unplugged socket: hardcoded _SOURCE_FILES model-name lookup purged per AG014.
+
+    Returns an import-safe lazy socket so module-level bindings in external
+    operators do not break ``import mindie_sim``, while any dereference or
+    ``declare_group(..., source=...)`` call raises ``NotImplementedError("LEGACY_PURGED: ...")``.
+    """
+    return _PurgedSourceReference(path, symbol)
+

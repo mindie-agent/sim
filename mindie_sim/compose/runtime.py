@@ -12,6 +12,9 @@
     ``enable_static_kernel``, and ``enable_super_kernel``.
   * Bindings installed by ``compose_case`` / ``apply_va_recommended`` stamp
     ``recipe_binding_origins`` as ``"stack_profile"`` so caller pins stay distinct.
+  * Zero process-wide LRU contract caches, zero ``is_a5``-only AttnRes gates,
+    zero ``except ModelingError -> fallback_note`` swallows, zero missing-SKU
+    defaults.
 
 [Timeouts & Locks]
   Pure in-memory dictionary and metadata resolution; no I/O or locks.
@@ -21,21 +24,15 @@
 """
 from __future__ import annotations
 
-from collections import OrderedDict
 from collections.abc import Mapping
-from copy import deepcopy
 from typing import Any
 
-from mindie_sim.compose.inputs import _arch_key, _resolve_hardware
-from mindie_sim.model_catalog import ARCHITECTURE_PRESET_ALIASES, MODEL_ALIASES
 from mindie_sim.prediction.feedforward import resolve_moe_route_policy
 from mindie_sim.prediction.offload.policy import resolve_sku_host_dma_rates
-from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.model import ModelSpec
 from mindie_sim.schema.scenario import ScenarioContract
 from mindie_sim.schema.stack import RuntimeQuantPlan, StackLoweringPlan
-from mindie_sim.stacks.vllm_ascend.profiles import simulation_config
 
 MX_GROUP_SIZE = 32
 MX_SCALE_PACK = 2
@@ -59,20 +56,6 @@ _NORM_QUANT_FAMILY_CATEGORIES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("router", ("router",)),
 )
 _WEIGHT_NZ_ARCHES = frozenset({"a2", "a3"})
-MAX_CACHED_SINGLE_SPINE_CONTRACTS = 64
-
-_QUANT_PLAN_CACHE: OrderedDict[str, RuntimeQuantPlan] = OrderedDict()
-_LOWERING_PLAN_CACHE: OrderedDict[str, StackLoweringPlan] = OrderedDict()
-_SCENARIO_CONTRACT_CACHE: OrderedDict[str, ScenarioContract] = OrderedDict()
-
-
-def _lru_put(cache: OrderedDict[str, Any], key: str, value: Any) -> None:
-    if not key:
-        return
-    cache[key] = value
-    cache.move_to_end(key)
-    while len(cache) > MAX_CACHED_SINGLE_SPINE_CONTRACTS:
-        cache.popitem(last=False)
 
 
 def register_composed_contracts(
@@ -81,37 +64,22 @@ def register_composed_contracts(
     lowering_plan: StackLoweringPlan,
     scenario_contract: ScenarioContract | None = None,
 ) -> None:
-    """Register resolved frozen single-spine plans in bounded O(Active State) LRU."""
-    _lru_put(_QUANT_PLAN_CACHE, quant_plan.plan_digest, quant_plan)
-    _lru_put(_LOWERING_PLAN_CACHE, lowering_plan.plan_digest, lowering_plan)
-    if scenario_contract is not None:
-        _lru_put(_SCENARIO_CONTRACT_CACHE, scenario_contract.digest(), scenario_contract)
+    """Unplugged socket: 64-entry process-wide mutable LRU caches purged."""
+    raise NotImplementedError(
+        "LEGACY_PURGED: attach frozen ScenarioContract, RuntimeQuantPlan, and "
+        "StackLoweringPlan directly on immutable CaseSpec/RuntimeSpec fields "
+        "instead of process-wide 64-entry LRU caches"
+    )
 
 
 def resolve_case_contracts(
     case_or_dict: Any,
 ) -> tuple[ScenarioContract | None, RuntimeQuantPlan | None, StackLoweringPlan | None]:
-    """Retrieve frozen ``(ScenarioContract, RuntimeQuantPlan, StackLoweringPlan)`` for a Case."""
-    meta: Mapping[str, Any] = {}
-    if isinstance(case_or_dict, Mapping):
-        rt = case_or_dict.get("runtime")
-        if isinstance(rt, Mapping) and isinstance(rt.get("metadata"), Mapping):
-            meta = rt["metadata"]
-    else:
-        rt_obj = getattr(case_or_dict, "runtime", None)
-        raw_meta = getattr(rt_obj, "metadata", None)
-        if raw_meta is not None:
-            meta = dict(raw_meta)
-    spine_meta = meta.get("single_spine")
-    if not isinstance(spine_meta, Mapping):
-        return None, None, None
-    sc_digest = str(spine_meta.get("scenario_contract_digest") or "")
-    qp_digest = str(spine_meta.get("quant_plan_digest") or "")
-    lp_digest = str(spine_meta.get("lowering_plan_digest") or "")
-    return (
-        _SCENARIO_CONTRACT_CACHE.get(sc_digest),
-        _QUANT_PLAN_CACHE.get(qp_digest),
-        _LOWERING_PLAN_CACHE.get(lp_digest),
+    """Unplugged socket: 64-entry process-wide mutable LRU caches purged."""
+    raise NotImplementedError(
+        "LEGACY_PURGED: read ScenarioContract, RuntimeQuantPlan, and "
+        "StackLoweringPlan directly from CaseSpec/RuntimeSpec fields instead of "
+        "process-wide LRU caches"
     )
 
 
@@ -242,42 +210,32 @@ def capture_keys(max_num_seqs: int, mtp_proposal_tokens: int = 0) -> list[int]:
 def va_recommended_config(
     model: str, hardware: str = "a3", *, role: str | None = None,
 ) -> dict[str, Any]:
-    """Return a source-scoped simulation subset, not a complete vLLM launch file."""
-    key = str(model).strip()
-    canonical = MODEL_ALIASES.get(key, ARCHITECTURE_PRESET_ALIASES.get(key, key))
-    sku, _, _ = _resolve_hardware(hardware)
-    return simulation_config(canonical, sku, _arch_key(sku), role=role)
+    """Unplugged socket: model-name profile lookup purged per AG014."""
+    raise NotImplementedError(
+        "LEGACY_PURGED: retire model-name va_recommended_config lookup; derive "
+        "runtime defaults strictly from structural ModelSpec, Hardware, and role"
+    )
 
 
 def _supports_sequence_parallel(
     model_spec: ModelSpec, profile: Mapping[str, Any], *,
     tp: int, ep: int, pp: int, pcp: int, notes: list[dict[str, Any]],
 ) -> bool:
-    """Structural sequence-parallel applicability, never a model-name whitelist."""
+    """Structural sequence-parallel applicability without silent ModelingError swallowing."""
     if profile.get("sp") is False:
         return False
     if not (pcp >= 1 and pp >= 1 and tp > 1 and ep >= tp and ep % tp == 0):
         return False
-    from mindie_sim.prediction.sharding.sequence_parallel import _validate_model
-    try:
-        _validate_model(model_spec, padding="right_to_tp")
-    except ModelingError as exc:
-        from mindie_sim.prediction.implementation_selection import fallback_note
-        notes.append(fallback_note("sequence_parallel", str(exc)))
-        return False
-    return True
+    raise NotImplementedError(
+        "LEGACY_PURGED: evaluate sequence_parallel eligibility structurally without "
+        "swallowing ModelingError into fallback_note"
+    )
 
 
 def filter_fp4_norm_quant_domain(
     kernels: Mapping[str, Any], quant: Any,
 ) -> dict[str, Any]:
-    """Exclude FP4-activation consumers from ``norm_quant`` fusion domains.
-
-    Native Ascend ``RmsNormDynamicMxQuant`` only emits FP8/INT8 outputs; keeping
-    FP4-activation consumers (e.g. Gemma-4-31B W4A4 ``dense_mlp``) out of the
-    norm-quant consumer domain preserves FP8 norm-quant fusion on attention while
-    leaving FP4 activation quantizers cleanly unfused.
-    """
+    """Exclude FP4-activation consumers from ``norm_quant`` fusion domains."""
     out = dict(kernels)
     if quant is None:
         return out
@@ -316,96 +274,11 @@ def _resolve_va_lowerings(
     model_spec: ModelSpec, parallel: Mapping[str, int], sku: str,
     lowering_passes: tuple[str, ...], *, notes: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    from mindie_sim.catalog.paired_sfa import execution
-    from mindie_sim.schema.parallel import ParallelSpec
-
-    is_a5 = _arch_key(sku) == "a5"
-    p_cfg = ParallelSpec(
-        dp=int(parallel.get("dp", 1)), tp=int(parallel.get("tp", 1)),
-        pp=int(parallel.get("pp", 1)), ep=int(parallel.get("ep", 1)),
-        cp=int(parallel.get("cp", parallel.get("dcp", 1))), pcp=int(parallel.get("pcp", 1)),
+    """Unplugged socket: is_a5-only AttnRes, blind MLA Prolog, ModelingError swallow, and CANN compressor hardcode purged."""
+    raise NotImplementedError(
+        "LEGACY_PURGED: wire cross-arch A3/A5 AttnResFwd, canonical M1 5-branch MLA Prolog "
+        "without swallowing ModelingError into fallback_note, and M12 structural KV compressor selection"
     )
-    lowerings: dict[str, Any] = {}
-    kda_layers = [p for p in model_spec.layer_plans if p.attention == "kda"]
-    if (kda_layers and p_cfg.pcp >= 1
-            and (p_cfg.cp == 1 or execution(model_spec).get("recurrent_context_sharded") is False)):
-        kda_binding = ("vllm_ascend_recurrent_kda_arch35" if is_a5
-                       else "vllm_ascend_recurrent_kda_arch22")
-        kda_options = {}
-        if is_a5:
-            from mindie_sim.prediction.operators.kda.kda_source import resolve as resolve_kda_source
-            bounds = {getattr(p, "kda_gate_lower_bound", None) for p in kda_layers}
-            if len(bounds) == 1:
-                kda_options = resolve_kda_source(
-                    kda_layers[0], arch="A5", phase="decode", kernels={},
-                    activation_dtype=model_spec.activation_dtype) or {}
-        lowerings["kda"] = {
-            "cases": [{
-                "domain": {"phases": ["decode"],
-                           "max_query_tokens": {"min": 1, "max": KDA_DECODE_MAX_QUERY_TOKENS}},
-                "binding": {"implementation": kda_binding, "options": kda_options},
-            }],
-            "otherwise": "analytical",
-        }
-    if is_a5 and any(p.residual_block_size > 0 for p in model_spec.layer_plans) and p_cfg.pp >= 1:
-        lowerings["attention_residual"] = "vllm_ascend_attn_res_prefix"
-    if any(p.attention == "gdn" for p in model_spec.layer_plans) and p_cfg.pcp >= 1:
-        opts = {"recurrent_implementation": "arch35_fp32"} if is_a5 else {}
-        binding = {"implementation": "vllm_ascend_gdn_decode", "options": opts}
-        lowerings["gdn_decode"] = {
-            "cases": [
-                {"domain": {"phases": ["decode"], "min_query_tokens": {"min": 1},
-                            "max_query_tokens": {"max": 1}},
-                 "binding": binding},
-                {"domain": {"phases": ["decode"], "min_query_tokens": {"min": 2},
-                            **({"max_query_tokens": {"max": GDN_A5_MAX_QUERY_TOKENS}} if is_a5 else {})},
-                 "binding": binding},
-            ],
-            "otherwise": "analytical",
-        }
-    mla_layers = [p for p in model_spec.layer_plans
-                  if p.attention == "mla" and p.q_lora_rank > 0
-                  and p.mla_variant != "latent_mqa"]
-    if mla_layers:
-        from mindie_sim.prediction.operators.mla_prolog.family_mla_prolog import validate as validate_mla_prolog
-        prolog_options: dict[str, Any] = {}
-        quant = model_spec.quant
-        if _arch_key(sku) in {"a3", "a5"} and quant is not None and quant.kv_dtype == "int8":
-            from mindie_sim.prediction.operators.mla_prolog.mla_prolog_packed import LAYOUT
-            prolog_options["cache_layout"] = LAYOUT
-        try:
-            for plan in mla_layers:
-                validate_mla_prolog(plan=plan, parallel=p_cfg, model=model_spec,
-                                    quant=quant, lowering_passes=lowering_passes,
-                                    **prolog_options)
-            lowerings["mla_prolog"] = (
-                {"implementation": "vllm_ascend_mla_prolog_v3", "options": prolog_options}
-                if prolog_options else "vllm_ascend_mla_prolog_v3")
-        except ModelingError as exc:
-            from mindie_sim.prediction.implementation_selection import fallback_note
-            notes.append(fallback_note("mla_prolog", str(exc)))
-    normalization = dict(model_spec.catalog_facts).get("normalization", {})
-    if (model_spec.activation_dtype == "bf16"
-            and not normalization.get("norm_weight_offset", 0.0)):
-        lowerings["add_rmsnorm"] = "vllm_ascend_native_norm"
-        if "activation_quantization" in lowering_passes and model_spec.quant is not None:
-            q = model_spec.quant
-            is_mx_fp8 = (
-                q.activation_format == "fp8_e4m3"
-                and q.activation_group_size == MX_GROUP_SIZE
-                and q.activation_scale_format == "fp8_e8m0"
-                and q.activation_scale_pack == MX_SCALE_PACK
-            )
-            if q.activation_format == "int8":
-                lowerings["add_rmsnorm_quant"] = "vllm_ascend_native_norm"
-            elif is_mx_fp8:
-                lowerings["add_rmsnorm_quant"] = "vllm_ascend_native_norm"
-                lowerings["rmsnorm_quant"] = "vllm_ascend_native_norm"
-    if any(int(getattr(plan, "compress_ratio", 0) or 0) > 0 for plan in model_spec.layer_plans):
-        lowerings.setdefault("compressor", "vllm_ascend_cann_compressor")
-    if any(int(getattr(plan, "index_kpool", 1) or 1) > 1 for plan in model_spec.layer_plans):
-        lowerings.setdefault("pool_key_indexer", "vllm_ascend_cann_keypool_caller")
-    return lowerings
 
 
 def snapshot_kernel_keys(kernels: Mapping[str, Any] | None) -> dict[str, set[str]]:
@@ -498,11 +371,7 @@ def finalize_compilation_spine(
 def bind_sku_host_dma_rates(
     machine: Mapping[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Bind SKU-calibrated L0/profile PCIe H2D/D2H & host DDR rates onto ``machine``.
-
-    Fails closed when a hardware profile declares neither explicit host DMA rates
-    nor calibrated L0 ``P20_host_dma_sync`` / ``transfer_channels``.
-    """
+    """Bind SKU-calibrated L0/profile PCIe H2D/D2H & host DDR rates onto ``machine``."""
     host_rates = resolve_sku_host_dma_rates(machine)
     missing = [
         name
@@ -556,106 +425,9 @@ def needs_activation_quantization(model_spec: Any) -> bool:
 
 
 def apply_va_recommended(case: Mapping[str, Any]) -> dict[str, Any]:
-    """Apply supported vLLM-Ascend execution subset while preserving quantization."""
-    out = deepcopy(dict(case))
-    parsed = parse_case(out)
-    sku = str(out.get("machine", {}).get("sku", "Ascend910_9392"))
-    va_profile = va_recommended_config(str(parsed.model.name), sku)
-    va_profile["quantization_action"] = "existing_case_preserved"
-    rt = dict(out.get("runtime", {}))
-    prior = snapshot_kernel_keys(rt.get("kernels"))
-    par = dict(rt.get("parallel", {
-        "dp": parsed.runtime.parallel.dp, "tp": parsed.runtime.parallel.tp,
-        "pp": parsed.runtime.parallel.pp, "ep": parsed.runtime.parallel.ep,
-        "cp": parsed.runtime.parallel.cp, "dcp": parsed.runtime.parallel.dcp,
-        "pcp": parsed.runtime.parallel.pcp,
-    }))
-    if rt.get("graph_capture_mode", "none") == "none":
-        rt["graph_mode"] = "full"
-        rt["graph_capture_mode"] = "full"
-        rt.setdefault("compilation_config", {"cudagraph_mode": FULL_DECODE_CUDAGRAPH_MODE})
-        max_seqs = int(rt.get("max_num_seqs", MIN_DEFAULT_MAX_SEQS))
-        rt["graph_capture_keys"] = capture_keys(
-            max_seqs, int(rt.get("mtp_proposal_tokens", 0) or 0))
-    meta = dict(rt.get("metadata", {}))
-    meta["va_recommended"] = True
-    meta["va_profile"] = deepcopy(va_profile)
-    meta["va_env"] = dict(va_profile["env"])
-    if va_profile.get("shipping_collective_policy"):
-        meta["shipping_collective_policy"] = deepcopy(va_profile["shipping_collective_policy"])
-    meta.setdefault("moe_dispatch_quantization", "routed_expert")
-    if (rt.get("multistream_overlap_shared_expert") is not False
-            and va_profile.get("multistream_overlap_shared_expert")):
-        rt["multistream_overlap_shared_expert"] = True
-        meta["multistream_overlap_shared_expert"] = True
-    wants_engram = bool(
-        va_profile.get("engram_cpu_offload")
-        or getattr(parsed.model, "engram", None) is not None
+    """Unplugged socket: missing-SKU default, model-name routing, legacy tracks, and role-blind mutation purged."""
+    raise NotImplementedError(
+        "LEGACY_PURGED: require explicit SKU, deployment role, canonical StackTrack, "
+        "and structural ModelSpec predicates in apply_va_recommended (zero Ascend910_9392 "
+        "fallback, zero ModelingError swallow)"
     )
-    if rt.get("engram_cpu_offload") is not False and wants_engram:
-        rt["engram_cpu_offload"] = True
-        out["machine"], _ = bind_sku_host_dma_rates(out.get("machine") or {})
-    prof_flags = dict(va_profile.get("tutorial_flags") or {})
-    if prof_flags.get("enable_shared_expert_dp") and "enable_shared_expert_dp" not in meta:
-        meta["enable_shared_expert_dp"] = True
-    additional = dict(meta.get("additional_config") or {})
-    track_name = str(
-        (meta.get("feature_track_report") or {}).get("feature_track")
-        or meta.get("feature_track")
-        or "merged"
-    ).strip().lower()
-    allow_merged_workarounds = track_name in {"merged", "unmerged_pr"}
-    for flag_key in ("enable_flashcomm1", "enable_fused_mc2", "enable_prefill_mc2"):
-        if flag_key not in prof_flags or flag_key in additional:
-            continue
-        if flag_key == "enable_fused_mc2" and not allow_merged_workarounds and int(prof_flags[flag_key]) == 0:
-            continue
-        additional[flag_key] = prof_flags[flag_key]
-    apply_arch_weight_nz_policy(additional, arch=_arch_key(sku), model_spec=parsed.model)
-    if additional:
-        meta["additional_config"] = additional
-    rt["metadata"] = meta
-    sync_moe_route_on_runtime(
-        rt, arch=_arch_key(sku), model_spec=parsed.model, tp=int(par.get("tp", 1)),
-    )
-    meta = dict(rt.get("metadata") or {})
-    notes: list[dict[str, Any]] = []
-    kernels = dict(rt.get("kernels", {}))
-    tp, ep = int(par.get("tp", 1)), int(par.get("ep", 1))
-    pp, pcp = int(par.get("pp", 1)), int(par.get("pcp", 1))
-    if (va_profile.get("sp", True) and "sequence_parallel" not in kernels
-            and pcp >= 1 and pp >= 1 and tp > 1 and ep >= tp and (ep % tp == 0)):
-        from mindie_sim.prediction.sharding.sequence_parallel import DECLARATION, _validate_model
-        try:
-            _validate_model(parsed.model, padding="right_to_tp")
-            kernels["sequence_parallel"] = dict(DECLARATION, padding="right_to_tp")
-            meta["sp"] = True
-        except ModelingError as exc:
-            from mindie_sim.prediction.implementation_selection import fallback_note
-            notes.append(fallback_note("sequence_parallel", str(exc)))
-    passes = tuple(rt.get("lowering_passes", ()))
-    if not passes and needs_activation_quantization(parsed.model):
-        passes = ("activation_quantization", "norm_quant")
-        rt["lowering_passes"] = list(passes)
-    lowerings = _resolve_va_lowerings(parsed.model, par, sku, passes, notes=notes)
-    if "add_rmsnorm" in lowerings and "residual_norm" not in passes:
-        passes = (*passes, "residual_norm")
-        rt["lowering_passes"] = list(passes)
-    if lowerings:
-        existing_low = dict(kernels.get("lowerings", {}))
-        kernels["lowerings"] = {**lowerings, **existing_low}
-    if kernels:
-        rt["kernels"] = kernels
-    from mindie_sim.compose.operator_defaults import DECLARATION_PHASE
-    from mindie_sim.prediction.implementation_selection import (
-        merge_selection_summaries, operator_selection_summary,
-    )
-    meta["operator_selection_summary"] = merge_selection_summaries(
-        meta.get("operator_selection_summary"),
-        operator_selection_summary(arch_family=_arch_key(sku),
-                                   phase=DECLARATION_PHASE, notes=notes))
-    rt["metadata"] = meta
-    stamp_stack_profile_origins(rt, prior_keys=prior)
-    out["runtime"] = rt
-    parse_case(out)
-    return out

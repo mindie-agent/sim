@@ -9,17 +9,34 @@
   "cann_ops_transformer_revision": "1.0.0",
   "fla_npu_revision": "26.10.0+feature",
   "description": "vLLM-Ascend@0c99d3fc + CANN 9.3.0 baseline and audited performance PRs",
-  "supported_domains": ["llm", "vlm"],
-  "supported_work_units": ["prefill_decode_step", "vision_encode"],
-  "supported_hardware_backends": ["ascend"],
-  "supported_phases": ["prefill", "decode", "mixed"],
+  "supported_domains": [
+    "llm",
+    "vlm"
+  ],
+  "supported_work_units": [
+    "prefill_decode_step",
+    "vision_encode"
+  ],
+  "supported_hardware_backends": [
+    "ascend"
+  ],
+  "supported_phases": [
+    "prefill",
+    "decode",
+    "mixed"
+  ],
   "supported_checkpoint_formats": [
     "modelslim_description",
     "hf_quantization_config",
     "unquantized_native",
     "explicit_synthetic_preset"
   ],
-  "supported_tracks": ["eager", "shipping", "proposed", "target"],
+  "supported_tracks": [
+    "eager",
+    "shipping",
+    "proposed",
+    "target"
+  ],
   "supported_recipe_ids": [
     "aclnn_mixed_quant_sparse_flash_mla",
     "ascend_attn_res_prefix",
@@ -63,19 +80,58 @@
     "vllm_ascend_sparse_mla_metadata"
   ],
   "promoted_merged_prs": [
-    {"pr": 15851, "summary": "Kimi-K3 5L GQA DSpark dcp_sharded=False"},
-    {"pr": 20167, "summary": "MiniMax-M3 7-token dense DSpark drafter adapter"},
-    {"pr": 20756, "summary": "Qwen3.5/3.6/3.8-27B dense FlashComm sequence parallelism"},
-    {"pr": 20946, "summary": "AscendStep5ForCausalLM, Step5 CSA region score, and 3L NextN MTP"},
-    {"pr": 21510, "summary": "GLM-5.3-Flash KDA TPxPCP head/context sharding"},
-    {"pr": 21549, "summary": "Kimi-K3 KDA RecoverSSM speculative state verification"},
-    {"pr": 21550, "summary": "Step-5 Triton swiglustep clamped-SwiGLU kernel"},
-    {"pr": 21568, "summary": "Qwen GDN RecoverSSM Triton kernels (Part 1)"},
-    {"pr": 21588, "summary": "GLM-5.3-Flash NoPE C16 cann_ops_transformer.sparse_flash_mla"},
-    {"pr": 21751, "summary": "Qwen4Exp pinned host UVA AscendPLEHostEmbedding (BF16/INT8/MXFP8)"},
-    {"pr": 21771, "summary": "Qwen4Exp weight-free QSA native cann_ops_transformer.lightning_indexer"},
-    {"pr": 21941, "summary": "Kimi-K3 KDA TPxPCP sharding (supersedes #21017)"},
-    {"pr": 22048, "summary": "GLM-5.3-Flash chunk_kda(use_qk_l2norm_in_kernel=True)"}
+    {
+      "pr": 15851,
+      "summary": "Kimi-K3 5L GQA DSpark dcp_sharded=False"
+    },
+    {
+      "pr": 20167,
+      "summary": "MiniMax-M3 7-token dense DSpark drafter adapter"
+    },
+    {
+      "pr": 20756,
+      "summary": "Qwen3.5/3.6/3.8-27B dense FlashComm sequence parallelism"
+    },
+    {
+      "pr": 20946,
+      "summary": "AscendStep5ForCausalLM, Step5 CSA region score, and 3L NextN MTP"
+    },
+    {
+      "pr": 21510,
+      "summary": "GLM-5.3-Flash KDA TPxPCP head/context sharding"
+    },
+    {
+      "pr": 21549,
+      "summary": "Kimi-K3 KDA RecoverSSM speculative state verification"
+    },
+    {
+      "pr": 21550,
+      "summary": "Step-5 Triton swiglustep clamped-SwiGLU kernel"
+    },
+    {
+      "pr": 21568,
+      "summary": "Qwen GDN RecoverSSM Triton kernels (Part 1)"
+    },
+    {
+      "pr": 21588,
+      "summary": "GLM-5.3-Flash NoPE C16 cann_ops_transformer.sparse_flash_mla"
+    },
+    {
+      "pr": 21751,
+      "summary": "Qwen4Exp pinned host UVA AscendPLEHostEmbedding (BF16/INT8/MXFP8)"
+    },
+    {
+      "pr": 21771,
+      "summary": "Qwen4Exp weight-free QSA native cann_ops_transformer.lightning_indexer"
+    },
+    {
+      "pr": 21941,
+      "summary": "Kimi-K3 KDA TPxPCP sharding (supersedes #21017)"
+    },
+    {
+      "pr": 22048,
+      "summary": "GLM-5.3-Flash chunk_kda(use_qk_l2norm_in_kernel=True)"
+    }
   ],
   "bindings": [
     {
@@ -154,20 +210,21 @@
       "mechanism_id": "kda_recoverssm_shipping",
       "state": "merged",
       "ref": "vllm-project/vllm-ascend#21549",
-      "models": ["kimi-k3", "kimi-k3.1"],
       "notes": "Kimi-K3/K3.1 KDA RecoverSSM speculative state verification merged with DSpark",
       "provenance": {
         "repository": "vllm-project/vllm-ascend",
         "revision": "405617bae227fe5b097ff163efaa60bb7f22c698",
         "relative_path": "vllm_ascend/ops/triton/kda/recoverssm.py",
-        "source_sha256": "af37687463f9b34ca4797bdcefb14c333d3b70b2956d6aa1f15217815d5fbc10"
+        "source_sha256": ""
       }
     },
     {
       "mechanism_id": "gdn_chunk64_prefill",
       "state": "merged",
       "ref": "vllm-project/vllm-ascend@405617bae227fe5b097ff163efaa60bb7f22c698",
-      "archs": ["a5"],
+      "archs": [
+        "a5"
+      ],
       "notes": "FLA_GDN_PREFILL Chunk64(use_exp2=True) merged on A5 for Hv/Hk in {1,2,3,4}",
       "provenance": {
         "repository": "flash-linear-attention-npu-a5",
@@ -180,8 +237,12 @@
       "mechanism_id": "cann_megamoe_fusion",
       "state": "merged",
       "ref": "vllm-project/vllm-ascend@405617bae227fe5b097ff163efaa60bb7f22c698",
-      "archs": ["a5"],
-      "options": {"enable_fused_mc2": 3},
+      "archs": [
+        "a5"
+      ],
+      "options": {
+        "enable_fused_mc2": 3
+      },
       "notes": "CANN_MEGAMOE + CANN_MEGAMOE_MXFP + CANN_MEGAMOE_SHARED_EXPERT_FUSION (enable_fused_mc2=3) merged structurally on A5 MXFP MoE models",
       "provenance": {
         "repository": "vllm-project/vllm-ascend",
@@ -194,7 +255,6 @@
       "mechanism_id": "kda_in_kernel_l2norm",
       "state": "merged",
       "ref": "vllm-project/vllm-ascend@405617bae227fe5b097ff163efaa60bb7f22c698",
-      "models": ["glm-5.3-flash"],
       "notes": "PR #22048 merged for GLM-5.3-Flash (ops/kda.py passes use_qk_l2norm_in_kernel=True)",
       "provenance": {
         "repository": "vllm-project/vllm-ascend",
@@ -207,7 +267,10 @@
       "mechanism_id": "qkv_norm_rope_fusion",
       "state": "merged",
       "ref": "vllm-project/vllm-ascend@405617bae227fe5b097ff163efaa60bb7f22c698",
-      "archs": ["a2", "a3"],
+      "archs": [
+        "a2",
+        "a3"
+      ],
       "notes": "GRAPH_QKV_NORM_ROPE_FUSION FX pass active on A2/A3",
       "provenance": {
         "repository": "vllm-project/vllm-ascend",
@@ -220,11 +283,8 @@
       "mechanism_id": "qkv_norm_rope_fusion",
       "state": "merged",
       "ref": "vllm-project/vllm-ascend@405617bae227fe5b097ff163efaa60bb7f22c698",
-      "archs": ["a5"],
-      "models": [
-        "qwen3.5-27b", "qwen3.6-27b", "qwen3.8-27b", "qwen3.5-35b-a3b", "qwen3.6-35b-a3b",
-        "qwen3.5-397b-a17b", "qwen3-next-80b-a3b", "qwen3.8-2.4t-a95b", "qwen3.5-moe",
-        "minimax-m3", "minimax-m3.1-flash", "step-5-preview"
+      "archs": [
+        "a5"
       ],
       "notes": "Direct model-level Triton QKNorm+RoPE calls on A5",
       "provenance": {
@@ -238,7 +298,9 @@
       "mechanism_id": "gdn_chunk32_prefill",
       "state": "unmerged_pr",
       "ref": "vllm-project/vllm-ascend#22147",
-      "archs": ["a5"],
+      "archs": [
+        "a5"
+      ],
       "notes": "Switch A5 GDN prefill to fla-npu Chunk32 (Hv/Hk in {1,2,3,4})",
       "provenance": {
         "repository": "vllm-project/vllm-ascend",
@@ -251,9 +313,12 @@
       "mechanism_id": "cann_megamoe_fusion",
       "state": "unmerged_pr",
       "ref": "vllm-project/vllm-ascend#22333",
-      "archs": ["a5"],
-      "models": ["kimi-k3", "kimi-k3.1"],
-      "options": {"enable_fused_mc2": 2},
+      "archs": [
+        "a5"
+      ],
+      "options": {
+        "enable_fused_mc2": 2
+      },
       "notes": "Fix packed MXFP4 uint8 validation in MegaMoE(activation=situglu, enable_fused_mc2=2) on A5",
       "provenance": {
         "repository": "vllm-project/vllm-ascend",
@@ -278,7 +343,6 @@
       "mechanism_id": "mhc_boundary_fusion_overlap",
       "state": "unmerged_pr",
       "ref": "vllm-project/vllm-ascend#22142",
-      "models": ["deepseek-v4.1-flash"],
       "notes": "Fuse DSV4.1 mhc_post_collapse_norm (<=72 rows) and overlap HcPreCoefficients with MoE",
       "provenance": {
         "repository": "vllm-project/vllm-ascend",
@@ -291,7 +355,6 @@
       "mechanism_id": "mhc_boundary_fusion_overlap",
       "state": "unmerged_pr",
       "ref": "vllm-project/vllm-ascend#20824",
-      "models": ["qwen3.8-flash-next"],
       "notes": "Overlap Qwen4Exp low-rank HC injection on auxiliary stream (+ #21901 retiled Triton fallback)",
       "provenance": {
         "repository": "vllm-project/vllm-ascend",
@@ -304,8 +367,9 @@
       "mechanism_id": "text_gated_residual_fusion",
       "state": "unmerged_pr",
       "ref": "vllm-project/vllm-ascend#21794",
-      "archs": ["a5"],
-      "models": ["qwen3.8-flash-next"],
+      "archs": [
+        "a5"
+      ],
       "notes": "Replace 5-op Triton Low-Rank HC chain with CANN 9.3 cann_ops_transformer.text_gated_residual",
       "provenance": {
         "repository": "cann_ops_transformer",
@@ -318,8 +382,9 @@
       "mechanism_id": "qsa_gbsa_prologue_fusion",
       "state": "unmerged_pr",
       "ref": "vllm-project/vllm-ascend#22365",
-      "archs": ["a5"],
-      "models": ["qwen3.8-flash-next"],
+      "archs": [
+        "a5"
+      ],
       "notes": "Port of #21820 (#22372..#22377) + #22351 MXFP8 GBSA + #22278 INT8 GBSA + #21627 union GBSA prefill + #21693 PCP",
       "provenance": {
         "repository": "vllm-project/vllm-ascend",
@@ -332,7 +397,9 @@
       "mechanism_id": "kv_quant_sfa_scale_precompute",
       "state": "unmerged_pr",
       "ref": "vllm-project/vllm-ascend#22467",
-      "archs": ["a5"],
+      "archs": [
+        "a5"
+      ],
       "notes": "Precompute A5 C8 FP8 scale addresses structurally for all indexed MLA/SFA models",
       "provenance": {
         "repository": "vllm-project/vllm-ascend",
@@ -345,8 +412,9 @@
       "mechanism_id": "msa_index_score_v2_topk",
       "state": "unmerged_pr",
       "ref": "vllm-project/vllm-ascend#22235",
-      "archs": ["a5"],
-      "models": ["minimax-m3", "minimax-m3.1-flash"],
+      "archs": [
+        "a5"
+      ],
       "notes": "Enable return_choice=1 in-kernel TopK in CANN 9.3 msa_index_score_v2",
       "provenance": {
         "repository": "vllm-project/vllm-ascend",
@@ -359,7 +427,6 @@
       "mechanism_id": "torch_compile_support",
       "state": "unmerged_pr",
       "ref": "vllm-project/vllm-ascend#22342",
-      "models": ["step-5-preview"],
       "notes": "Remove do_not_compile=True on AscendStep5Model, unlocking npugraph_ex FX passes",
       "provenance": {
         "repository": "vllm-project/vllm-ascend",
@@ -372,7 +439,6 @@
       "mechanism_id": "fp32_residual_norm_fusion",
       "state": "unmerged_pr",
       "ref": "vllm-project/vllm-ascend#22336",
-      "models": ["step-5-preview"],
       "notes": "Fuse Step-5 FP32 residual accumulate + (1+w) RMSNorm + BF16 cast",
       "provenance": {
         "repository": "vllm-project/vllm-ascend",
@@ -385,8 +451,9 @@
       "mechanism_id": "step5_qkvg_indexer_fusion",
       "state": "unmerged_pr",
       "ref": "vllm-project/vllm-ascend#22401",
-      "archs": ["a5"],
-      "models": ["step-5-preview"],
+      "archs": [
+        "a5"
+      ],
       "notes": "Packed SWA qkvg + Triton indexer_qkz_norm_rope + CANN 9.3 FA3",
       "provenance": {
         "repository": "vllm-project/vllm-ascend",
@@ -399,7 +466,9 @@
       "mechanism_id": "tp_mc2_overlap",
       "state": "unmerged_pr",
       "ref": "vllm-project/vllm-ascend#22385",
-      "archs": ["a5"],
+      "archs": [
+        "a5"
+      ],
       "notes": "Dense MLP & MoE TP MC2 AllGatherMatmulV2 + MatmulReduceScatterV2 structurally on TP>1",
       "provenance": {
         "repository": "vllm-project/vllm-ascend",
@@ -412,7 +481,9 @@
       "mechanism_id": "dspark_static_kernel_allowlist",
       "state": "unmerged_pr",
       "ref": "vllm-project/vllm-ascend#22184",
-      "archs": ["a5"],
+      "archs": [
+        "a5"
+      ],
       "notes": "Add dspark to enable_static_kernel speculative method allowlist in platform.py",
       "provenance": {
         "repository": "vllm-project/vllm-ascend",
@@ -425,8 +496,9 @@
       "mechanism_id": "dsv41_indexer_epilogue_fusion",
       "state": "unmerged_pr",
       "ref": "vllm-project/vllm-ascend#21830",
-      "archs": ["a5"],
-      "models": ["deepseek-v4.1-flash"],
+      "archs": [
+        "a5"
+      ],
       "notes": "Fused dsv41_indexer_prologue (#21830), dsv41_attn_epilogue (#21826), Engram overlap (#22328)",
       "provenance": {
         "repository": "vllm-project/vllm-ascend",
@@ -463,7 +535,9 @@
       "mechanism_id": "in_kernel_gdn_decode_gate",
       "state": "unmerged_pr",
       "ref": "vllm-project/vllm-ascend#21720",
-      "archs": ["a5"],
+      "archs": [
+        "a5"
+      ],
       "notes": "Fold GDN gating & Q/K L2Norm into recurrent_gated_delta_rule (#21720)",
       "provenance": {
         "repository": "vllm-project/vllm-ascend",
@@ -473,35 +547,12 @@
       }
     },
     {
-      "mechanism_id": "kda_in_kernel_l2norm",
-      "state": "unmerged_pr",
-      "ref": "vllm-project/vllm-ascend#22048",
-      "notes": "Enable use_qk_l2norm_in_kernel=True structurally across all KDA prefill models",
-      "provenance": {
-        "repository": "vllm-project/vllm-ascend",
-        "revision": "405617bae227fe5b097ff163efaa60bb7f22c698",
-        "relative_path": "vllm_ascend/ops/kimi_kda.py",
-        "source_sha256": "af37687463f9b34ca4797bdcefb14c333d3b70b2956d6aa1f15217815d5fbc10"
-      }
-    },
-    {
-      "mechanism_id": "fused_recover_ssm",
-      "state": "unmerged_pr",
-      "ref": "vllm-project/vllm-ascend#22045",
-      "notes": "End-to-end --use-replayssm GDN Part 2 (#22045) and colocated PCP KDA RecoverSSM (#22146)",
-      "provenance": {
-        "repository": "vllm-project/vllm-ascend",
-        "revision": "fb1826af03",
-        "relative_path": "vllm_ascend/ops/gdn.py",
-        "source_sha256": "b170b30626cf46bc4ec1e47080f9487c1e5443e51add42bb8c67bfd20a79fac4"
-      }
-    },
-    {
       "mechanism_id": "kimi_dspark_c8_mla",
       "state": "unmerged_pr",
       "ref": "vllm-project/vllm-ascend#22115",
-      "archs": ["a5"],
-      "models": ["kimi-k3", "kimi-k3.1"],
+      "archs": [
+        "a5"
+      ],
       "notes": "5L MLA DSpark C8 QuantFlashMLA (#22115), Latent-MoE norm+quant overlap (#22450), KDA decode gate fusion (#22346)",
       "provenance": {
         "repository": "vllm-project/vllm-ascend",
@@ -514,7 +565,9 @@
       "mechanism_id": "keypool_int8_indexer",
       "state": "unmerged_pr",
       "ref": "vllm-project/vllm-ascend#22191",
-      "archs": ["a5"],
+      "archs": [
+        "a5"
+      ],
       "notes": "Dynamic INT8 quant_mode=2 pool_key_indexer structurally on all keypool MLA models",
       "provenance": {
         "repository": "vllm-project/vllm-ascend",
@@ -527,7 +580,10 @@
       "mechanism_id": "activation_quant_fusion",
       "state": "unmerged_pr",
       "ref": "vllm-project/vllm-ascend#21543",
-      "archs": ["a2", "a3"],
+      "archs": [
+        "a2",
+        "a3"
+      ],
       "notes": "Triton INT8 swiglu_quantize fusion scoped strictly to A2/A3",
       "provenance": {
         "repository": "vllm-project/vllm-ascend",
@@ -552,7 +608,9 @@
       "mechanism_id": "shared_expert_multistream_overlap",
       "state": "unmerged_pr",
       "ref": "vllm-project/vllm-ascend#22128",
-      "archs": ["a3"],
+      "archs": [
+        "a3"
+      ],
       "notes": "A3 W4A8 INT MegaMoE shared-expert fusion only (A5 MXFP enable_fused_mc2=3 is already merged)",
       "provenance": {
         "repository": "vllm-project/vllm-ascend",
@@ -661,7 +719,9 @@
       "mechanism_id": "quantized_allreduce",
       "state": "merged",
       "ref": "vllm-project/vllm-ascend@0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
-      "archs": ["a2"],
+      "archs": [
+        "a2"
+      ],
       "notes": "Opt-in INT8 quantized TP AllReduce on A2 (BF16, 2<=TP<=8, >=16,777,216 elements)",
       "provenance": {
         "repository": "vllm-project/vllm-ascend",

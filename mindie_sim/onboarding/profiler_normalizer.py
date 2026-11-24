@@ -80,8 +80,6 @@ _P99_Q = 0.99
 _COORDINATOR_RPC_TIMEOUT_S = 45
 _DEFAULT_LEASE_TTL_S = 600
 _PARTIAL_ABI_EXIT_CODE = 2
-_DEFAULT_SIM_MODEL = "deepseek-v2-lite"
-_INDEXER_SIM_MODEL = "deepseek-v4.1-flash"
 _SUBGRAPH_PLAN_SCHEMA = "mindie-bench-subgraph-plan/1"
 _OBSERVATION_SCHEMA = "mindie-bench-observation/1"
 _RECEIPT_SCHEMA = "mindie-bench-receipt/1"
@@ -96,7 +94,6 @@ _ABI_REJECT_STATUSES = frozenset({"unsupported_binding", "abi_rejected", "unmode
 _BUSY_UNION_MODES = frozenset({"stream_saturated", "busy_union", "event_busy_union", "eager_device", "aclgraph_device"})
 _VALID_LEASE_OUTCOMES = frozenset({"", "success", "ok"})
 _VALID_LEASE_STATUSES = frozenset({"", "ready", "granted", "acquired", "active", "ok"})
-_DTYPE_BYTES: Mapping[str, int] = {"fp32": 4, "float32": 4, "int32": 4, "bf16": 2, "fp16": 2, "float16": 2, "int8": 1, "uint8": 1, "fp8_e4m3": 1, "mxfp8": 1}
 _CAPTURE_SHAPE_KEYS = frozenset({
     "tokens", "sequences", "batch_size", "q_len", "query_tokens", "seq_len", "kv_len", "context_len",
     "page_count", "block_size", "block_table", "heads", "kv_heads", "head_dim", "latent", "rope", "width",
@@ -104,27 +101,6 @@ _CAPTURE_SHAPE_KEYS = frozenset({
     "dtype", "input_dtype", "weight_dtype", "output_dtype", "quant_mode", "quantization", "scale_dtype", "has_scales",
     "query_dtype", "cache_dtype", "query_layout", "input_layout", "paged", "parallel_topology", "batch_x_kv_heads",
 })
-_FAMILY_BINDINGS: Mapping[str, tuple[str, str, str, str]] = {
-    "rmsnorm": ("rmsnorm", "rmsnorm", "rms_norm", "aclnnRmsNorm"),
-    "add_rmsnorm": ("add_rmsnorm", "add_rmsnorm", "add_rms_norm", "aclnnAddRmsNorm"),
-    "layernorm": ("layernorm", "layernorm", "layer_norm", "aclnnLayerNorm"),
-    "attention": ("attention", "ascend_paged_mla_decode_arch22", "absorbed_mla", "aclnnFusedInferAttentionScoreV4"),
-    "sparse_indexer": ("indexer", "quant_lightning_indexer", "lightning_indexer", "aclnnQuantLightningIndexerV2"),
-    "lightning_indexer": ("indexer", "quant_lightning_indexer", "lightning_indexer", "aclnnQuantLightningIndexerV2"),
-    "indexer": ("indexer", "quant_lightning_indexer", "lightning_indexer", "aclnnQuantLightningIndexerV2"),
-    "topk": ("topk", "index_topk", "indexer_topk", "aclnnTopkV2"),
-    "swiglu": ("swiglu", "swiglu", "swiglu", "aclnnSwiGlu"),
-    "geglu": ("geglu", "geglu", "geglu", "aclnnGeGluV2"),
-    "rotary": ("rotary", "rotary", "rotary_embedding", "aclnnApplyRotaryPosEmbV2"),
-    "gemm": ("gemm", "linear", "matmul", "aclnnMatmul"),
-    "matmul": ("gemm", "linear", "matmul", "aclnnMatmul"),
-    "linear": ("gemm", "linear", "matmul", "aclnnMatmul"),
-    "grouped_gemm": ("grouped_gemm", "grouped_matmul", "grouped_matmul", "aclnnGroupedMatmulV5"),
-    "routing": ("moe_init_routing", "moe_init_routing_v3", "moe_init_routing", "aclnnMoeInitRoutingV3"),
-    "moe_init_routing": ("moe_init_routing", "moe_init_routing_v3", "moe_init_routing", "aclnnMoeInitRoutingV3"),
-    "cast": ("cast", "cast", "dtype_cast", "aclnnCast"),
-    "elementwise": ("elementwise", "residual_add", "vector_add", "aclnnAdd"),
-}
 
 
 def parse_topo_options(topo: str) -> dict[str, int]:
@@ -163,37 +139,11 @@ def _decode_mla_recipe_for_sku(sku: str, *, profile_override: Mapping[str, Any] 
 
 @lru_cache(maxsize=_LOWER_CACHE_MAXSIZE)
 def _lower_one_layer_cached(sku: str, prof_sha: str, topo: str, phase: str, q_tok: int, ctx_len: int, seqs: int) -> tuple[dict[str, Any], ...]:
-    del prof_sha
-    from mindie_sim.compose import compose_case as compose_case_dict
-    from mindie_sim.prediction.results import LoweringRequest, StepRequest
-    from mindie_sim.prediction.spine import default_spine
-    from mindie_sim.prediction.structure import parse_case
-
-    raw = compose_case_dict(model=_DEFAULT_SIM_MODEL, hardware=sku, **parse_topo_options(topo))
-    md = dict(raw["model"])
-    md["layers"], md["body_layers"], md["layer_plans"] = 1, 1, list(md["layer_plans"])[:1]
-    prep = default_spine().lower(
-        parse_case({**raw, "model": md}),
-        LoweringRequest(step=StepRequest(phase=phase, tokens=int(q_tok), context=int(ctx_len), sequences=int(seqs), scope="body"), tier="mainline"),  # type: ignore[arg-type]
+    """Unplugged socket: hardcoded default model override and silent bf16 fallback purged."""
+    raise NotImplementedError(
+        "LEGACY_PURGED: lower caller-supplied sim_case directly (never hardcoded default model) "
+        "and require explicit non-empty op.dtype (zero silent bf16 fallback)"
     )
-    out: list[dict[str, Any]] = []
-    for op in prep.graph.executable[0].ops:
-        meta = dict(op.metadata)
-        nabi = meta.get("native_attention_abi") if isinstance(meta.get("native_attention_abi"), Mapping) else {}
-        pgeo = meta.get("paged_mla_geometry") if isinstance(meta.get("paged_mla_geometry"), Mapping) else {}
-        out.append({
-            "op_id": str(op.op_id), "family": str(op.family), "recipe": str(op.recipe),
-            "dtype": str(op.dtype or "bf16"), "quant_mode": str(meta.get("quant_mode") or meta.get("quantization") or "none").strip().lower(),
-            "local_shape": tuple(int(x) if isinstance(x, (int, float)) else x for x in (op.local_shape or ())),
-            "deps": tuple(str(d) for d in (op.deps or ())), "link_bytes": int(round(float(op.link_bytes or 0.0))),
-            "matrix_groups": int(meta.get("matrix_weight_bank_groups") or meta.get("matrix_groups") or 1),
-            "group_axis": str(meta.get("group_axis") or ""),
-            "query_layout": str(nabi.get("query_layout") or ""), "cache_layout": str(nabi.get("cache_layout") or ""),
-            "output_layout": str(nabi.get("output_layout") or ""),
-            "kv_len": int(pgeo["kv_lengths"][0]) if pgeo.get("kv_lengths") else 0,
-            "page_count": int(pgeo["page_counts"][0]) if pgeo.get("page_counts") else 0,
-        })
-    return tuple(out)
 
 
 def _lower_one_layer_step_ops(sku: str, topo: str, phase: str, q_tok: int, ctx_len: int, seqs: int, *, profile_override: Mapping[str, Any] | None = None) -> tuple[dict[str, Any], ...]:
@@ -205,65 +155,12 @@ def _lower_one_layer_step_ops(sku: str, topo: str, phase: str, q_tok: int, ctx_l
 
 
 def _lowered_op_to_profiler_node(pid: str, op_rec: Mapping[str, Any], *, attn_shape: Mapping[str, Any], total_tokens: int, local_heads: int, topo_opts: Mapping[str, int]) -> tuple[dict[str, Any], dict[str, Any]]:
-    oid, fam, rec, loc = str(op_rec["op_id"]), str(op_rec["family"]), str(op_rec["recipe"]), tuple(op_rec["local_shape"])
-    tp, dcp, nid = max(1, int(topo_opts.get("tp", 1))), max(1, int(topo_opts.get("dcp", 1))), f"{pid}:{oid}"
-    if fam == "attention":
-        sh = dict(attn_shape)
-        if op_rec["kv_len"] > 0:
-            sh["seq_len"] = sh["kv_len"] = int(op_rec["kv_len"])
-            sh["page_count"] = int(op_rec["page_count"]) or _page_count(int(op_rec["kv_len"]))
-        if op_rec["query_layout"]:
-            sh["query_layout"] = sh["input_layout"] = op_rec["query_layout"]
-            sh["cache_layout"] = op_rec["cache_layout"] or "PA_BSND"
-            sh["output_layout"] = op_rec["output_layout"] or "NBSD"
-        return (
-            {"node_id": nid, "op_id": oid, "kind": "operator", "op": "absorbed_mla", "builder": "absorbed_mla", "family": "attention", "recipe": rec, "implementation": "aclnnFusedInferAttentionScoreV4", "dtype": "bf16", "paged": True, "layout": sh.get("query_layout", "TND"), "shape": sh},
-            {"op_id": oid, "family": "attention", "recipe": rec, "builder": "absorbed_mla", "paged": True, "heads": sh["heads"], "kv_heads": 1, "latent": _MLA_LATENT_DIM, "rope": _MLA_ROPE_DIM, "kv_len": sh["seq_len"], "page_count": sh["page_count"], "query_layout": sh.get("query_layout", "TND")},
-        )
-    if fam in _GEMM_FAMILIES and len(loc) >= _MIN_GEMM_RANK:
-        m_d, n_d, k_d, mg = int(loc[0]), int(loc[1]), int(loc[2]), max(1, int(op_rec["matrix_groups"]))
-        dt, qm = str(op_rec.get("dtype") or "bf16").lower(), str(op_rec.get("quant_mode") or "none").lower()
-        if mg > 1:
-            return (
-                {"node_id": nid, "op_id": oid, "kind": "operator", "op": "grouped_matmul", "builder": "grouped_matmul", "family": "grouped_gemm", "recipe": "grouped_matmul", "implementation": "aclnnGroupedMatmulV5", "dtype": dt, "group_list": [max(1, m_d // mg)] * mg, "group_list_type": 1, "shape": {"m": m_d, "n": n_d, "k": k_d, "e": mg, "matrix_groups": mg, "dtype": dt}},
-                {"op_id": oid, "family": fam, "recipe": rec, "builder": "grouped_matmul", "dtype": dt, "quant_mode": qm, "m": m_d, "n": n_d, "k": k_d, "matrix_groups": mg},
-            )
-        return (
-            {"node_id": nid, "op_id": oid, "kind": "operator", "op": "matmul", "builder": "matmul", "family": fam, "recipe": rec, "implementation": "aclnnMatmul", "dtype": dt, "shape": {"m": m_d, "n": n_d, "k": k_d, "matrix_groups": 1, "dtype": dt}},
-            {"op_id": oid, "family": fam, "recipe": rec, "builder": "matmul", "dtype": dt, "quant_mode": qm, "m": m_d, "n": n_d, "k": k_d, "matrix_groups": 1},
-        )
-    if fam in {"rmsnorm", "add_rmsnorm", "swiglu"}:
-        toks, width = (int(loc[0]) if len(loc) >= _MIN_2D_RANK else total_tokens), (int(loc[-1]) if loc else _MLA_HIDDEN_WIDTH)
-        bld = {"rmsnorm": "rms_norm", "add_rmsnorm": "add_rms_norm", "swiglu": "swiglu"}[fam]
-        impl = {"rmsnorm": "aclnnRmsNorm", "add_rmsnorm": "aclnnAddRmsNorm", "swiglu": "aclnnSwiGlu"}[fam]
-        return {"node_id": nid, "op_id": oid, "kind": "operator", "op": bld, "builder": bld, "family": fam, "recipe": rec, "implementation": impl, "dtype": "bf16", "shape": {"tokens": toks, "width": width}}, {"op_id": oid, "family": fam, "recipe": rec, "builder": bld, "width": width}
-    if fam == "elementwise" and rec == "rotary":
-        return {"node_id": nid, "op_id": oid, "kind": "operator", "op": "rotary_embedding", "builder": "rotary_embedding", "family": "elementwise", "recipe": "rotary", "implementation": "aclnnApplyRotaryPosEmbV2", "dtype": "bf16", "shape": {"tokens": total_tokens, "heads": local_heads, "head_dim": _MLA_ROPE_DIM}}, {"op_id": oid, "family": "elementwise", "recipe": "rotary", "builder": "rotary_embedding"}
-    if fam == "kv_compress_epilog":
-        toks = int(loc[0]) if len(loc) >= _MIN_2D_RANK else total_tokens
-        dt = str(op_rec["dtype"] or "bf16").lower()
-        bw = int(loc[-1]) if loc else (_MLA_LATENT_DIM + _MLA_ROPE_DIM) * _MLA_BF16_BYTES
-        ew = max(1, bw // _DTYPE_BYTES.get(dt, _MLA_BF16_BYTES))
-        return {"node_id": nid, "op_id": oid, "kind": "operator", "op": "kv_compress_epilog", "builder": "kv_compress_epilog", "family": fam, "recipe": rec, "implementation": "aclnnKvCompressEpilog", "dtype": dt, "shape": {"tokens": toks, "width": ew, "byte_width": bw}}, {"op_id": oid, "family": fam, "recipe": rec, "builder": "kv_compress_epilog", "dtype": dt, "width": ew}
-    if fam in {"dcp_allgather", "allreduce"}:
-        dt, raw_link = str(op_rec["dtype"] or "bf16").lower(), int(op_rec["link_bytes"])
-        grp_axis = "dcp" if fam == "dcp_allgather" else (op_rec["group_axis"] or "tp")
-        grp_sz = dcp if grp_axis in {"dcp", "cp"} else tp
-        if fam == "dcp_allgather":
-            nbytes = max(_MIN_COLLECTIVE_BYTES, (raw_link // max(1, dcp - 1)) if raw_link > 0 else _DEFAULT_COLLECTIVE_BYTES)
-            bld, impl = "all_gather", "hcclAllGather"
-        else:
-            nbytes = max(_MIN_COLLECTIVE_BYTES, ((raw_link * grp_sz) // max(1, _RING_ALLREDUCE_FACTOR * (grp_sz - 1))) if (raw_link > 0 and grp_sz > 1) else (raw_link or _DEFAULT_COLLECTIVE_BYTES))
-            bld, impl = "all_reduce", "hcclAllReduce"
-        return {"node_id": nid, "op_id": oid, "kind": "collective", "op": bld, "builder": bld, "family": fam, "recipe": rec, "implementation": impl, "dtype": dt, "group": grp_axis, "group_size": grp_sz, "nbytes": nbytes, "shape": {"dtype": dt, "nbytes": nbytes, "group_size": grp_sz}}, {"op_id": oid, "family": fam, "recipe": rec, "builder": bld, "dtype": dt, "nbytes": nbytes, "group_size": grp_sz}
-    if fam == "attention_merge":
-        toks = int(loc[0]) if len(loc) >= _MIN_GEMM_RANK else total_tokens
-        heads = int(loc[1]) if len(loc) >= _MIN_GEMM_RANK else local_heads
-        hdim = int(loc[2]) if len(loc) >= _MIN_GEMM_RANK else _MLA_LATENT_DIM
-        dt, partials = str(op_rec["dtype"] or "fp32").lower(), max(_MIN_DCP_PARTIALS, dcp)
-        return {"node_id": nid, "op_id": oid, "kind": "operator", "op": "dcp_lse_attention_merge", "builder": "dcp_lse_attention_merge", "family": fam, "recipe": rec, "implementation": "aclnnRingAttentionUpdate", "dtype": dt, "shape": {"tokens": toks, "heads": heads, "kv_heads": 1, "head_dim": hdim, "partial_count": partials, "dtype": dt}}, {"op_id": oid, "family": fam, "recipe": rec, "builder": "dcp_lse_attention_merge", "dtype": dt, "partial_count": partials}
-    width = int(loc[-1]) if loc else _MLA_HIDDEN_WIDTH
-    return {"node_id": nid, "op_id": oid, "kind": "operator", "op": "vector_add", "builder": "vector_add", "family": "elementwise", "recipe": "residual_add", "implementation": "aclnnAdd", "dtype": "bf16", "shape": {"tokens": total_tokens, "width": width}}, {"op_id": oid, "family": fam, "recipe": rec, "builder": "vector_add"}
+    """Unplugged socket: fake fallback elementwise stub, shadow _DTYPE_BYTES, and silent bf16 fallbacks purged."""
+    raise NotImplementedError(
+        "LEGACY_PURGED: resolve profiler builders strictly via ProbedAbiRegistry / "
+        "resolve_profiler_builder_strict, raise UnmodeledCapabilityError for unknown families "
+        "(zero fake elementwise stub), use schema.common.dtype_bytes, and require explicit dtypes"
+    )
 
 
 def _resolve_family_shape(
@@ -293,128 +190,27 @@ def _resolve_family_shape(
 def resolve_point_binding_and_shape(
     plan_doc: Mapping[str, Any], pt: Mapping[str, Any], *, sku: str, profile_override: Mapping[str, Any] | None = None,
 ) -> tuple[str, str, str, str, str, dict[str, Any], dict[str, Any]]:
-    plan_family = str(plan_doc.get("family") or "rmsnorm").strip()
-    axis, val = str(pt.get("axis") or "context_len").strip(), int(pt["value"])
-    batch, q_tok = max(1, int(pt.get("batch_size", 1))), max(1, int(pt.get("query_tokens", 1)))
-    topo = str(pt.get("parallel_topology") or "tp1").strip()
-    topk_val = int(pt["topk"]) if pt.get("topk") is not None else None
-    is_abi_reject = str(pt.get("split") or "").strip().lower() == "abi_rejection"
-    topo_opts = parse_topo_options(topo)
-    tp, dcp, pcp, ep = max(1, topo_opts.get("tp", 1)), max(1, topo_opts.get("dcp", 1)), max(1, topo_opts.get("pcp", 1)), max(1, topo_opts.get("ep", 1))
-    local_heads = max(1, _DEFAULT_ATTENTION_HEADS // tp)
-    level = assign_plan_point_level(plan_doc, pt)
-    model_overrides: dict[str, Any] = {}
-    if topk_val is not None or plan_family in _SPARSE_INDEXER_FAMILIES:
-        pfam, prec, pbld, impl = _FAMILY_BINDINGS["indexer"]
-        sim_fam, model_name = "indexer", _INDEXER_SIM_MODEL
-        ctx_len = val if axis == "context_len" else max(val, _DEFAULT_CONTEXT_FALLBACK)
-        kv_len = ctx_len if is_abi_reject else (ctx_len + q_tok)
-        shape: dict[str, Any] = {"tokens": max(1, batch * q_tok), "heads": _INDEXER_ATTENTION_HEADS, "kv_heads": 1, "head_dim": _DEFAULT_HEAD_DIM, "seq_len": kv_len, "kv_len": kv_len, "context_len": ctx_len, "batch_size": batch, "sequences": batch, "query_tokens": q_tok, "q_len": q_tok, "query_dtype": "bf16", "cache_dtype": "bf16", "input_layout": "TND", "query_layout": "TND", "parallel_topology": topo}
-        if topk_val is not None:
-            shape.update({"top_k": topk_val, "sparse_count": topk_val, "enforce_exact_topk": True})
-            if not is_abi_reject:
-                model_overrides = {"index_topk": topk_val, "index_dtype": "bf16"}
-    elif (plan_family == "sku_suite" and axis in {"context_len", "batch_x_kv_heads"}) or plan_family == "attention":
-        is_single_q_local = q_tok == 1 and tp == 1 and dcp == 1 and pcp == 1
-        attn_rec = _decode_mla_recipe_for_sku(sku, profile_override=profile_override) if is_single_q_local else "latent_attention0"
-        pfam, prec, pbld, impl = ("attention", attn_rec, "absorbed_mla", "aclnnFusedInferAttentionScoreV4")
-        sim_fam, model_name = "attention", _DEFAULT_SIM_MODEL
-        ctx_len = val if axis == "context_len" else _DEFAULT_CONTEXT_FALLBACK
-        seqs = val if axis == "batch_x_kv_heads" else batch
-        kv_len = ctx_len + q_tok
-        if dcp > 1:
-            la = next((o for o in _lower_one_layer_step_ops(sku, topo, "prefill" if q_tok > 1 else "decode", q_tok, ctx_len, seqs, profile_override=profile_override) if o["family"] == "attention"), None)
-            if la and len(la["local_shape"]) >= _MIN_2D_RANK:
-                kv_len = int(la["local_shape"][1])
-        qlay = "BNSD" if is_single_q_local else "TND"
-        shape = {"tokens": max(1, seqs * q_tok), "sequences": seqs, "batch_size": batch, "query_tokens": q_tok, "q_len": q_tok, "seq_len": kv_len, "kv_len": kv_len, "context_len": ctx_len, "page_count": _page_count(kv_len), "heads": local_heads, "kv_heads": 1, "head_dim": _MLA_LATENT_DIM, "latent": _MLA_LATENT_DIM, "kv_lora_rank": _MLA_LATENT_DIM, "rope": _MLA_ROPE_DIM, "qk_rope_head_dim": _MLA_ROPE_DIM, "block_size": _MLA_BLOCK_SIZE, "paged": True, "query_layout": qlay, "input_layout": qlay, "cache_layout": "PA_BSND", "output_layout": "NBSD" if is_single_q_local else "TND", "parallel_topology": topo}
-        if axis == "batch_x_kv_heads":
-            shape["batch_x_kv_heads"] = val
-        if level == "L3" and plan_family == "sku_suite":
-            model_overrides = {"layers": 1}
-    elif plan_family == "sku_suite":
-        pfam, prec, pbld, impl = _FAMILY_BINDINGS["rmsnorm"]
-        sim_fam, model_name = "rmsnorm", _DEFAULT_SIM_MODEL
-        shape = {"tokens": val, "width": _MLA_HIDDEN_WIDTH, "parallel_topology": topo}
-    elif plan_family in _FAMILY_BINDINGS:
-        pfam, prec, pbld, impl = _FAMILY_BINDINGS[plan_family]
-        sim_fam = pfam
-        model_name = _INDEXER_SIM_MODEL if sim_fam in {"indexer", "layernorm", "rotary"} else _DEFAULT_SIM_MODEL
-        width = _MLA_HIDDEN_WIDTH if model_name == _DEFAULT_SIM_MODEL else _DEFAULT_HIDDEN_WIDTH
-        tok_val = val if axis == "tokens" else max(1, (val if axis == "batch_x_kv_heads" else batch) * q_tok)
-        shape, topo_opts = _resolve_family_shape(
-            pbld, tok_val=tok_val, width=width, tp=tp, ep=ep,
-            local_heads=local_heads, topo=topo, topo_opts=topo_opts,
-        )
-    else:
-        pfam, prec, pbld, impl, sim_fam, model_name = plan_family, plan_family, "", str(plan_doc.get("target_id") or plan_family), plan_family, _DEFAULT_SIM_MODEL
-        shape = {"tokens": val if axis == "tokens" else max(1, batch * q_tok), "width": _MLA_HIDDEN_WIDTH, "parallel_topology": topo}
-    custom_sim = pt.get("sim_case") or plan_doc.get("sim_case")
-    sim_case = dict(custom_sim) if isinstance(custom_sim, Mapping) else {"compose_model": model_name, "compose_hardware": sku, "compose_options": topo_opts, **({"model_overrides": model_overrides} if model_overrides else {})}
-    return pfam, prec, pbld, impl, sim_fam, shape, sim_case
+    """Unplugged socket: AG014 model-name width dispatch, _FAMILY_BINDINGS whitelist, and hardcoded default models purged."""
+    raise NotImplementedError(
+        "LEGACY_PURGED: query canonical ProbedAbiRegistry (schema/abi.py) for (op_family, arch, dtypes), "
+        "derive width structurally from caller-supplied sim_case/plan_doc, and never use hardcoded model defaults"
+    )
 
 
 def _build_case_nodes(pid: str, *, sku: str, pt: Mapping[str, Any], level: str, pfam: str, prec: str, pbld: str, impl: str, shape: Mapping[str, Any], topo_opts: Mapping[str, int]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[str]]:
-    total_tokens = max(1, int(shape.get("tokens", 1)))
-    local_heads = max(1, int(shape.get("heads", _DEFAULT_ATTENTION_HEADS // max(1, int(topo_opts.get("tp", 1))))))
-    if level == "L1" or pbld != "absorbed_mla":
-        node: dict[str, Any] = {"node_id": f"{pid}:op0", "kind": "operator", "op": pbld or prec, "family": pfam, "recipe": prec, "implementation": impl, "dtype": "bf16", "shape": dict(shape)}
-        if pbld:
-            node["builder"] = pbld
-        if pbld in {"absorbed_mla", "fused_infer_attention"}:
-            node["paged"] = True
-        if shape.get("query_layout"):
-            node["layout"] = str(shape["query_layout"])
-        return [node], [], [], []
-    if level == "L2":
-        attn_id = "s0.l0.paged_mla_decode" if prec in {"ascend_paged_mla_decode_arch22", "ascend_paged_mla_decode_arch35"} else "s0.l0.latent_attention0"
-        v_m = total_tokens * local_heads
-        nodes = [
-            {"node_id": f"{pid}:{attn_id}", "op_id": attn_id, "kind": "operator", "op": pbld, "builder": pbld, "family": pfam, "recipe": prec, "implementation": impl, "dtype": "bf16", "paged": True, "layout": str(shape.get("query_layout") or "TND"), "shape": dict(shape)},
-            {"node_id": f"{pid}:s0.l0.v_expand", "op_id": "s0.l0.v_expand", "kind": "operator", "op": "grouped_matmul", "builder": "grouped_matmul", "family": "grouped_gemm", "recipe": "grouped_matmul", "implementation": "aclnnGroupedMatmulV5", "dtype": "bf16", "group_list": [total_tokens] * local_heads, "group_list_type": 1, "shape": {"m": v_m, "n": _MLA_HEAD_DIM, "k": _MLA_LATENT_DIM, "e": local_heads, "matrix_groups": local_heads, "dtype": "bf16"}},
-        ]
-        nbs = [
-            {"op_id": attn_id, "family": "attention", "recipe": prec, "builder": pbld, "paged": True, "heads": local_heads, "kv_heads": 1, "latent": _MLA_LATENT_DIM, "rope": _MLA_ROPE_DIM, "kv_len": int(shape["seq_len"]), "page_count": int(shape["page_count"]), "query_layout": str(shape.get("query_layout") or "TND")},
-            {"op_id": "s0.l0.v_expand", "family": "gemm", "recipe": "v_expand", "builder": "grouped_matmul", "dtype": "bf16", "quant_mode": "none", "m": v_m, "n": _MLA_HEAD_DIM, "k": _MLA_LATENT_DIM, "matrix_groups": local_heads},
-        ]
-        return nodes, [{"from": f"{pid}:{attn_id}", "to": f"{pid}:s0.l0.v_expand", "kind": "data"}], nbs, [attn_id, "s0.l0.v_expand"]
-    lowered = _lower_one_layer_step_ops(sku, str(pt.get("parallel_topology") or "tp1"), "prefill" if int(pt.get("query_tokens", 1)) > 1 else "decode", max(1, int(pt.get("query_tokens", 1))), int(shape.get("context_len", pt["value"])), max(1, int(shape.get("sequences", pt.get("batch_size", 1)))))
-    op_ids = {r["op_id"] for r in lowered}
-    nodes, edges, nbs, tids = [], [], [], []
-    for rec in lowered:
-        nd, nb = _lowered_op_to_profiler_node(pid, rec, attn_shape=shape, total_tokens=total_tokens, local_heads=local_heads, topo_opts=topo_opts)
-        nodes.append(nd)
-        nbs.append(nb)
-        tids.append(rec["op_id"])
-        edges.extend({"from": f"{pid}:{d}", "to": f"{pid}:{rec['op_id']}", "kind": "stream"} for d in rec["deps"] if d in op_ids)
-    return nodes, edges, nbs, tids
+    """Unplugged socket: L3 lowering ignoring caller sim_case purged."""
+    raise NotImplementedError(
+        "LEGACY_PURGED: lower caller-supplied sim_case directly for L3 case nodes and "
+        "require explicit operator dtypes from lowered OpSpec"
+    )
 
 
 def resolve_point_measured_binding(plan_doc: Mapping[str, Any], pt: Mapping[str, Any], *, sku: str, profile_override: Mapping[str, Any] | None = None) -> dict[str, Any]:
-    with temporary_scaffold_profile(sku, profile_override):
-        pfam, prec, pbld, impl, sim_fam, shape, sim_case = resolve_point_binding_and_shape(plan_doc, pt, sku=sku, profile_override=profile_override)
-        level = assign_plan_point_level(plan_doc, pt)
-        topo_opts = parse_topo_options(str(pt.get("parallel_topology") or "tp1"))
-        pid = str(pt.get("point_id") or "pt")
-        target_op_id = (
-            ("s0.l0.paged_mla_decode" if prec in {"ascend_paged_mla_decode_arch22", "ascend_paged_mla_decode_arch35"} else "s0.l0.latent_attention0") if sim_fam == "attention"
-            else ("s0.l0.norm1" if sim_fam == "rmsnorm" else ("s0.l2.index_quant_lightning" if sim_fam == "indexer" else ("s0.l1.expert_up" if pbld == "grouped_matmul" else ("s0.l0.output" if pbld == "matmul" else ""))))
-        )
-        _nodes, _edges, nbs, tids = _build_case_nodes(pid, sku=sku, pt=pt, level=level, pfam=pfam, prec=prec, pbld=pbld, impl=impl, shape=shape, topo_opts=topo_opts)
-    binding: dict[str, Any] = {"builder": pbld, "family": sim_fam, "recipe": prec, "implementation": impl, "target_op_id": target_op_id}
-    for k in ("paged", "heads", "kv_heads", "head_dim", "latent", "rope", "width", "kv_len", "page_count", "query_layout", "input_layout", "query_dtype", "cache_dtype", "sparse_count", "topk", "dtype", "m", "n", "k", "matrix_groups"):
-        if k in shape:
-            binding[k] = shape[k]
-    if pbld in {"matmul", "grouped_matmul"} or sim_fam in _GEMM_FAMILIES:
-        binding.setdefault("dtype", str(shape.get("dtype") or "bf16"))
-        binding.setdefault("weight_dtype", str(shape.get("weight_dtype") or binding["dtype"]))
-        binding.setdefault("quant_mode", str(shape.get("quant_mode") or "none"))
-        binding.setdefault("matrix_groups", int(shape.get("matrix_groups") or shape.get("e") or 1))
-    if nbs:
-        binding["node_bindings"] = nbs
-    if tids:
-        binding["timed_op_ids"] = tids
-    return {"level": level, "phase": "prefill" if int(pt.get("query_tokens", 1)) > 1 else "decode", "target_family": sim_fam, "target_op_id": target_op_id, "target_op_ids": list(tids) if level == "L2" else [], "measured_binding": binding, "sim_case": sim_case, "expected_shape": shape, "profiler_family": pfam, "profiler_recipe": prec, "profiler_builder": pbld, "implementation": impl}
+    """Unplugged socket: depends on purged point binding and silent bf16 GEMM dtype fallback."""
+    raise NotImplementedError(
+        "LEGACY_PURGED: resolve measured binding via ProbedAbiRegistry and caller sim_case "
+        "with explicit non-empty GEMM dtype (zero silent bf16 fallback)"
+    )
 
 
 def build_profiler_subgraph_plan(plan_doc: Mapping[str, Any], *, sku: str, split_tag: str = "", acquisition_id: str = "", profile_override: Mapping[str, Any] | None = None) -> dict[str, Any]:
@@ -650,50 +446,11 @@ def normalize_profiler_records(
                 break
         if plan_pt is not None and binfo is not None:
             verify_actual_geometry_matches_plan(actual_shape, plan_pt, expected_shape=binfo["expected_shape"], cid=cid, measured_binding=binfo["measured_binding"])
-        by_slot: dict[Any, list[int]] = {}
-        ranks_seen: set[int] = set()
-        for idx_g, row in enumerate(group):
-            dur_ms = float(row.get("duration_ms") or 0.0)
-            if dur_ms <= 0.0:
-                raise ModelingError(f"profiler_sample_duration_invalid:{cid}:duration_ms={dur_ms}")
-            ranks_seen.add(int(row["rank"]) if row.get("rank") is not None else 0)
-            by_slot.setdefault(row.get("repeat_index", row.get("trial", idx_g)), []).append(int(round(dur_ms * NS_PER_MS)))
-        durs_ns = sorted(max(vals) for vals in by_slot.values())
-        p50_ns, p99_ns = _quantile_ns(durs_ns, _P50_Q), _quantile_ns(durs_ns, _P99_Q)
-        first = group[0]
-        tmode = str(first.get("timing_mode") or "eager").strip().lower()
-        clock_op = str(first.get("clock_operator") or ("busy_union" if tmode in _BUSY_UNION_MODES else DEFAULT_CLOCK_OPERATOR)).strip()
-        if clock_op not in VALID_CLOCK_OPERATORS:
-            clock_op = DEFAULT_CLOCK_OPERATOR
-        level = binfo["level"] if binfo is not None else str(first.get("level") or "L1").upper()
-        explicit_acq = str(first.get("acquisition_id") or (rcpts[0].get("acquisition_id") if rcpts else "") or "").strip()
-        base_acq = str((plan_doc.get("train_lineage_root") if split == "train" else plan_doc.get("heldout_lineage_root")) or f"acq-{split}")
-        acq_id = explicit_acq or (f"{base_acq}-{level.lower()}" if split == "heldout" else base_acq)
-        base_rid = _TRIAL_SUFFIX_RE.sub("", str(first.get("run_id") or f"run-{cid}"))
-        pub_rid = sanitize_public_run_id(base_rid)
-        timed_nodes = list(next((r["timed_nodes"] for r in (*rcpts, *group) if isinstance(r.get("timed_nodes"), Sequence) and not isinstance(r.get("timed_nodes"), (str, bytes)) and r["timed_nodes"]), ()))
-        dims = extract_shape_dims(actual_shape, {"point_id": cid, "axis": str((plan_pt or {}).get("axis") or "")}, plan_pt=plan_pt, expected_shape=binfo["expected_shape"] if binfo else None, measured_binding=binfo["measured_binding"] if binfo else None, cid=cid)
-        clean_shape = _sanitize_capture_shape(actual_shape)
-        cap_obj = {"schema": "mindie-sim.onboarding-capture/1", "case_id": cid, "sku": sku, "split": split, "level": level, "acquisition_root": acq_id, "run_uid": pub_rid, "endpoint_alias": clean_ep, "clock_operator": clock_op, "measured_ns": p50_ns, "measured_p99_ns": p99_ns, "device_ranks": sorted(ranks_seen), "event_ids": [f"{pub_rid}-s", f"{pub_rid}-e"], "actual_shape": clean_shape, "timed_nodes": timed_nodes}
-        cap_bytes = canonical_json_bytes(cap_obj)
-        raw_sha = sha256_bytes(cap_bytes)
-        if capture_out_dir is not None:
-            write_atomic_bytes(Path(capture_out_dir) / f"{raw_sha}.json", cap_bytes)
-        row_out: dict[str, Any] = {
-            "case_id": cid, "point_id": cid, "sku": sku, "split": split, "level": level, "status": "ok",
-            "acquisition_root": acq_id, "run_uid": pub_rid, "raw_sha256": raw_sha,
-            "capture_uri": sanitize_public_capture_uri("", raw_sha256=raw_sha, default_prefix=f"capture://{split}"),
-            "device_ranks": sorted(ranks_seen), "event_ids": [f"{pub_rid}-s", f"{pub_rid}-e"],
-            "measured_ns": p50_ns, "measured_p99_ns": p99_ns, "clock_operator": clock_op,
-            "busy_union_ns": p50_ns if clock_op == "busy_union" else None,
-            "elapsed_span_ns": p50_ns if clock_op == "elapsed_span" else None,
-            "actual_shape": clean_shape, "timed_nodes": timed_nodes, **dims,
-        }
-        if binfo is not None:
-            row_out.update({"sim_case": binfo["sim_case"], "phase": binfo["phase"], "target_family": binfo["target_family"], "target_op_id": binfo["target_op_id"], "target_op_ids": binfo["target_op_ids"], "measured_binding": binfo["measured_binding"], "implementation": binfo["implementation"]})
-        elif plan_family and plan_family != "sku_suite":
-            row_out["target_family"] = plan_family
-        out_rows.append(row_out)
+        raise NotImplementedError(
+            "LEGACY_PURGED: fail closed in normalize_profiler_records on unrecognized "
+            "clock_operator, missing physical rank identity, or missing event_ids "
+            "(zero silent rank-0 / DEFAULT_CLOCK_OPERATOR / synthetic event_ids)"
+        )
     assert_sanitized_payload(out_rows, field_name="profiler_normalized_rows")
     return out_rows, abi_rows
 
