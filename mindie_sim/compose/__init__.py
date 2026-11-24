@@ -533,7 +533,9 @@ def _resolve_scenario_and_slo(
         eff_prompt, eff_output = 1, 1
 
     required_len = eff_prompt + eff_output
-    if model_limit > 0 and required_len > model_limit:
+    if model_limit > 0 and required_len > model_limit and (
+        max_model_len is None or int(max_model_len) <= model_limit
+    ):
         raise ModelingError(
             f"workload_exceeds_model_max_position_embeddings:{required_len}>{model_limit}"
         )
@@ -1803,8 +1805,13 @@ def _compose_explicit_case(
         max_model_len=scenario_options["max_model_len"],
         **mtp_options,
     )
+    allow_gqa_draft = (
+        bool(allow_synthetic_gqa_draft)
+        if allow_synthetic_gqa_draft is not None
+        else (mtp_source == "explicit")
+    )
     model_spec = prepare_speculation(
-        model_spec, mtp_tokens, allow_synthetic_gqa=allow_synthetic_gqa_draft,
+        model_spec, mtp_tokens, allow_synthetic_gqa=allow_gqa_draft,
     )
     if block_size is not None:
         resolved_block_size = int(block_size)
@@ -2036,6 +2043,7 @@ _COMPOSE_OPTION_GROUPS: dict[str, tuple[str, ...]] = {
     "auto_extra": (
         "enable_fused_mc2", "enable_prefill_mc2", "enable_flashcomm1",
         "enable_torch_compile", "recover_ssm", "block_size",
+        "allow_synthetic_gqa_draft",
         "inter_node_bw_gbps", "intra_node_bw_gbps", "intra_package_bw_gbps",
         "inter_node_bw_util", "intra_node_bw_util", "intra_package_bw_util",
         "inter_node_latency_us", "intra_node_latency_us", "intra_package_latency_us",
@@ -2105,7 +2113,7 @@ def compose_case(
     n_routed_experts: int | None = None,
     num_experts_per_tok: int | None = None,
     promote_dense_to_moe: bool = False,
-    allow_synthetic_gqa_draft: bool = False,
+    allow_synthetic_gqa_draft: bool | None = None,
     prompt_tokens: int | None = None,
     output_tokens: int | None = None,
     concurrency: int | None = None,

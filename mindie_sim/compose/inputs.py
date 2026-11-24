@@ -9,7 +9,9 @@
   * Hardware SKUs resolve strictly against registered Ascend, NVIDIA, or custom
     profiles; unknown identifiers raise ``ModelingError("unknown_hardware_sku:...")``.
   * Local JSON metadata reads are capped at 50 MiB.
-  * Synthetic GQA draft synthesis requires explicit ``allow_synthetic_gqa=True``.
+  * Direct ``prepare_speculation`` synthesis of a 1-layer EAGLE/GQA draft
+    requires explicit ``allow_synthetic_gqa=True``; ``compose_case`` enables it
+    only for explicit ``mtp_proposal_tokens > 0`` on GQA models unless opted out.
 
 [Timeouts & Locks]
   Bounded local JSON config reads (< 50 MiB); no network, devices, or locks.
@@ -907,7 +909,7 @@ def _apply_structural_overrides(
 
 def prepare_speculation(model: ModelSpec, proposals: int, *,
                         allow_synthetic_gqa: bool = False) -> ModelSpec:
-    """Declare a native draft only when the model already owns one."""
+    """Declare a native draft or explicit 1-layer EAGLE/GQA draft when allowed."""
     if proposals <= 0:
         return model
     aux = model.auxiliary
@@ -920,13 +922,42 @@ def prepare_speculation(model: ModelSpec, proposals: int, *,
     if not allow_synthetic_gqa or model.attention != "gqa":
         raise ModelingError("draft_structure_required_for_mtp_proposal_tokens")
     from mindie_sim.catalog.draft import declare_native_auxiliary_plans
+    gqa_plans = [p for p in model.layer_plans if p.attention == "gqa"]
+    full_gqa = [p for p in gqa_plans if p.window <= 0]
+    ref = full_gqa[-1] if full_gqa else (gqa_plans[-1] if gqa_plans else None)
+    num_heads = int(ref.num_heads) if ref is not None else int(model.num_heads)
+    num_kv_heads = int(ref.num_kv_heads) if ref is not None else int(model.num_kv_heads)
+    head_dim = int(ref.head_dim) if ref is not None else int(model.head_dim)
+    qk_norm = bool(ref.qk_norm) if ref is not None else False
+    q_gate = bool(ref.q_output_gate) if ref is not None else False
+    kv_elems = (
+        int(ref.kv_cache_elements)
+        if ref is not None and int(ref.kv_cache_elements) > 0
+        else 2 * num_kv_heads * head_dim
+    )
+    inter = int(
+        model.intermediate_size
+        or (ref.moe_intermediate_size if ref is not None else 0)
+        or model.hidden_size
+    )
     draft = DraftSpec(
         kind="mtp", layers=1, hidden_size=model.hidden_size,
-        intermediate_size=model.intermediate_size, num_heads=model.num_heads,
-        num_kv_heads=model.num_kv_heads, head_dim=model.head_dim,
-        q_width=model.num_heads * model.head_dim,
-        kv_width=2 * model.num_kv_heads * model.head_dim,
-        target_layer_ids=(model.layers - 1,), activation_dtype=model.activation_dtype,
+        intermediate_size=inter, num_heads=num_heads,
+        num_kv_heads=num_kv_heads, head_dim=head_dim,
+        q_width=(2 if q_gate else 1) * num_heads * head_dim,
+        kv_width=num_kv_heads * head_dim,
+        attention_kind="gqa",
+        kv_cache_elements=kv_elems,
+        weight_category="mtp",
+        qk_norm=qk_norm,
+        q_output_gate=q_gate,
+        target_layer_ids=(model.layers - 1,),
+        target_shared_embedding=True,
+        target_shared_lm_head=True,
+        base_logits=True,
+        vocab_size=model.vocab_size,
+        activation_dtype=model.activation_dtype,
+        execution_mode="eagle3_serial",
         source=(("kind", "explicit_synthetic_gqa_mtp"),),
     )
     return declare_native_auxiliary_plans(
