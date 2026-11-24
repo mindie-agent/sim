@@ -16,12 +16,10 @@ from itertools import combinations
 from math import fsum, isclose, isfinite
 from typing import Literal
 
-from mindie_sim.optimization.dsl_solver import _replay_ops
-from mindie_sim.optimization.dual_bound import _check_region_summary_bindings
-from mindie_sim.optimization.reload_bounds import compute_compulsory_hbm_cut, measure_logical_bytes
 from mindie_sim.prediction.evaluation import ACTIVE_DEADLINE_MONO
 from mindie_sim.prediction.execution.operator_replay import operator_costs
 from mindie_sim.prediction.results import OpOccurrence, OperatorSequenceRow, StepEvaluation
+from mindie_sim.prediction.runtime.reload_bounds import compute_compulsory_hbm_cut, measure_logical_bytes
 from mindie_sim.prediction.spine import _parse_occurrence, _wave_breakdown_from_report, _work_items
 from mindie_sim.prediction.runtime.accel_tables import (
     MAX_L as ACCEL_MAX_L, MAX_R as ACCEL_MAX_R, MAX_T as ACCEL_MAX_T, MAX_U as ACCEL_MAX_U,
@@ -33,7 +31,7 @@ from mindie_sim.schema.common import ModelingError
 
 from .algebra import AlgebraicTrait, classify_op_traits
 from .apply import (
-    AppliedPlan, ResolvedScenario, SIMT_UB_CARVEOUT_BYTES, _check_stream, _convex, _dependencies, _die, _path,
+    AppliedPlan, ResolvedScenario, _check_stream, _convex, _dependencies, _die, _path,
     _solve_tiles, _successors, _topological,
 )
 from .schema import FuseRegion, HoistOrDeduplicate, QuantizeContract, SelectTemplate, _flat
@@ -328,7 +326,7 @@ def _capacity(die, pool, simt, path):
         return die.memory_bytes
     raw = dict(die.buffers).get(pool, 0)
     if pool == "ub" and simt:
-        return max(0, raw - max(SIMT_UB_CARVEOUT_BYTES, path.simt_ub_carveout_bytes))
+        return max(0, raw - int(path.simt_ub_carveout_bytes))
     return raw
 
 
@@ -673,32 +671,17 @@ def _hbm_service_bytes(service, profile):
 
 
 def _template_service(scenario, applied, edited, replay):
-    graphs, book, baseline_book, context, deadline = replay
-    targets = {op_id for _, op_id in edited}
-    profiles = []
-    token = ACTIVE_DEADLINE_MONO.set(deadline)
-    try:
-        for ranks, recipes, streams in (
-            ({rank.replica: rank.ops for rank in scenario.atomic_ops}, baseline_book, scenario.stream_plans),
-            (graphs, book, applied.streams),
-        ):
-            site_graphs = {op_id: dict.fromkeys(ranks, ()) for op_id in targets}
-            for rank, ops in ranks.items():
-                for op in ops:
-                    if op.op_id in targets:
-                        site_graphs[op.op_id][rank] = _replay_ops((op,))
-            profiles.append({(row["replica"], op_id): row["serviced"]
-                             for op_id, site in site_graphs.items()
-                             for row in operator_costs(scenario.atomic_step.case, site, recipes=recipes,
-                                 evaluation=context, stream_plans=streams or None)["operators"]})
-    finally:
-        ACTIVE_DEADLINE_MONO.reset(token)
-    return profiles
+    del scenario, applied, edited, replay
+    raise NotImplementedError(
+        "LEGACY_PURGED: wire canonical rewrite/catalog_replay.py (zero optimization imports)"
+    )
 
 
 def _executed_service_conservation(scenario, applied, step_eval, baseline_eval, service_replay, summaries):
     if step_eval is None:
-        return
+        raise NotImplementedError(
+            "LEGACY_PURGED: wire canonical Engine full-step verification (never skip executed-service conservation when step_eval is omitted)"
+        )
     edits = applied.plan.edits
     has_rebind = any(isinstance(edit.operation, (FuseRegion, SelectTemplate)) for edit in edits)
     if not has_rebind:
@@ -794,7 +777,10 @@ def _executed_service_conservation(scenario, applied, step_eval, baseline_eval, 
 
 def _conservation(scenario, applied, summaries, step_eval=None, baseline_eval=None, baseline_work=None,
                   service_replay=None):
-    _check_region_summary_bindings(scenario, applied, summaries)
+    if summaries:
+        raise NotImplementedError(
+            "LEGACY_PURGED: wire canonical rewrite/catalog_replay.py & rewrite/dual_cert.py region summary binding and per-(lineage, multiplicity, dtype, unit) conservation"
+        )
     hoists = set(applied.hoisted_load_time)
     cse = {edit.edit_id for edit in applied.plan.edits
            if isinstance(edit.operation, HoistOrDeduplicate) and edit.operation.scope == "intra_step"}
@@ -828,24 +814,9 @@ def _conservation(scenario, applied, summaries, step_eval=None, baseline_eval=No
                 or hits > issued or (issued == hits and (dram or turnaround))):
             raise ModelingError(f"LEDGER_RECONCILIATION_ERROR:{summary.region_id}")
         if summary.op_ids and summary.semantic_work:
-            replica = summary.semantic_work[0].replica
-            covered = [op for oid in summary.op_ids if (op := atomic_by_site.get((replica, oid))) is not None]
-            if covered:
-                exp_flops = fsum(
-                    fsum(float(fl) for _, fl in op.matrix_flops) if op.matrix_flops else float(op.flops)
-                    for op in covered
-                )
-                exp_vec = fsum(float(op.vector_ops) for op in covered)
-                got_flops = fsum(
-                    float(item.logical_ops) for item in summary.semantic_work if item.kind == "matrix_mac"
-                )
-                got_vec = fsum(
-                    float(item.logical_ops) for item in summary.semantic_work if item.kind != "matrix_mac"
-                )
-                if not isclose(exp_flops, got_flops, rel_tol=1e-12, abs_tol=1e-9) or not isclose(
-                    exp_vec, got_vec, rel_tol=1e-12, abs_tol=1e-9
-                ):
-                    raise ModelingError(f"WORK_CONSERVATION_MISMATCH:{summary.region_id}:semantic_work")
+            raise NotImplementedError(
+                "LEGACY_PURGED: enforce per-(lineage, multiplicity, dtype, unit) work conservation + bidirectional Eq.7 witness check"
+            )
         cut = compute_compulsory_hbm_cut((summary,))
         if sum(item.read_bytes + item.write_bytes for item in cut.values()) > dram:
             raise ModelingError(f"LEDGER_RECONCILIATION_ERROR:{summary.region_id}:dram_sector_bytes")
@@ -867,36 +838,10 @@ def _capture(name, check, *args):
 
 
 def _bound(scenario, applied, summaries, primitive_table, rate_mode, certificate, program, dag, wall, u, m, framework, dsl):
-    from mindie_sim.optimization.dual_bound import build_dual_inputs_from_scenario, check_optimality_certificate
-
-    if program is not None or dag is not None:
-        canonical_program, canonical_dag, _ = build_dual_inputs_from_scenario(
-            scenario, applied=applied, region_summaries=summaries, primitive_table=primitive_table, rate_mode=rate_mode,
-        )
-        if (program is not None and program != canonical_program) or (dag is not None and dag != canonical_dag):
-            raise ModelingError("LEAN_CERTIFICATE_INVALID:certificate_unbound_to_scenario")
-    if certificate is None or program is None or dag is None:
-        raise ModelingError("LEAN_CERTIFICATE_INVALID:missing_certificate")
-    if not check_optimality_certificate(canonical_program, canonical_dag, certificate):
-        raise ModelingError("LEAN_CERTIFICATE_INVALID")
-    l_star = certificate.l_star_lean_ns
-    if l_star < 0 or wall is None:
-        raise ModelingError("LEAN_CERTIFICATE_INVALID:missing_or_invalid_bound_evidence")
-    if any(value is not None and type(value) is not int for value in (wall, u, m, framework, dsl)):
-        raise ModelingError("LADDER_MONOTONICITY_VIOLATION:invalid_wall_time")
-    for name, value in (("wall", wall), ("dsl", dsl), ("framework", framework)):
-        if value is not None and value < l_star:
-            raise SoundnessInversionError(
-                f"SOUNDNESS_BUG_LOWER_BOUND_INVERTED:{name}_ns={value}<l_star_ns={l_star}")
-    if any(value is not None and value < 0 for value in (u, m)):
-        raise ModelingError("LADDER_MONOTONICITY_VIOLATION:invalid_wall_time")
-    chain = [value for value in (l_star, dsl, framework) if value is not None]
-    baselines = [value for value in (u, m) if value is not None]
-    if baselines:
-        chain.append(min(baselines))
-    if any(left > right for left, right in zip(chain, chain[1:])):
-        raise ModelingError("LADDER_MONOTONICITY_VIOLATION")
-    return l_star
+    del scenario, applied, summaries, primitive_table, rate_mode, certificate, program, dag, wall, u, m, framework, dsl
+    raise NotImplementedError(
+        "LEGACY_PURGED: wire canonical rewrite/dual_cert.py (zero optimization imports)"
+    )
 
 
 def verify_plan(
@@ -908,6 +853,10 @@ def verify_plan(
     """Run structural and replay gates for the stated occurrence coverage."""
     if scope not in {"archetype", "full"}:
         raise ModelingError(f"rewrite_verification_scope_invalid:{scope}")
+    if scope == "full":
+        raise NotImplementedError(
+            "LEGACY_PURGED: wire canonical Engine full-step verification (reject caller-supplied wall_ns without step_eval)"
+        )
     if wall_ns is None and step_eval is not None:
         wall_ns = round(step_eval.span_ms * NS_PER_MS)
 
@@ -951,7 +900,7 @@ def verify_plan(
 
 
 __all__ = [
-    "FAKE_OVERLAP_THRESHOLD_PCT", "SHIPPING_REGRESSION_TOLERANCE_NS", "SIMT_UB_CARVEOUT_BYTES",
+    "FAKE_OVERLAP_THRESHOLD_PCT", "SHIPPING_REGRESSION_TOLERANCE_NS",
     "ACCEL_MAX_R", "ACCEL_MAX_U", "ACCEL_MAX_T", "ACCEL_MAX_L", "SoundnessInversionError",
     "GateReceipt", "ShippingRegression", "VerificationReceipt", "compute_overlap_pct", "verify_plan",
 ]

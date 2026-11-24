@@ -39,7 +39,6 @@ from mindie_sim.schema.datapath import DatapathCapabilitySpec
 from mindie_sim.schema.operators import OpSpec
 
 from .apply import (
-    SIMT_UB_CARVEOUT_BYTES,
     ResolvedScenario,
     _activation_port_signature,
     _activation_quant_key,
@@ -175,177 +174,6 @@ _TYPED_MLA_ROLE_MAP = {
 
 
 @dataclass(frozen=True, slots=True)
-class ShippingAbiPredicate:
-    """Typed capability predicate for a shipping Tier-K1 CANN/HCCL composite ABI."""
-
-    abi_id: str
-    fusion_tier: FusionTier
-    pattern: str
-    supported_activations: frozenset[str] = frozenset()
-    supported_dtypes: frozenset[str] = frozenset()
-    supported_weight_dtypes: frozenset[str] = frozenset()
-    supported_arch_families: frozenset[str] = frozenset()
-    supports_draft_scope: bool = True
-
-    def supports_activation(self, activation: str) -> bool:
-        if not self.supported_activations:
-            return True
-        if not activation:
-            return False
-        return activation.strip().lower() in self.supported_activations
-
-    def supports_dtype(self, dtype: str) -> bool:
-        if not self.supported_dtypes:
-            return True
-        if not dtype:
-            return False
-        return dtype.strip().lower() in self.supported_dtypes
-
-    def supports_weight_dtype(self, weight_dtype: str) -> bool:
-        if not self.supported_weight_dtypes:
-            return True
-        if not weight_dtype:
-            return False
-        return weight_dtype.strip().lower() in self.supported_weight_dtypes
-
-    def supports_arch(self, arch_family: str) -> bool:
-        if not self.supported_arch_families:
-            return True
-        if not arch_family:
-            return False
-        return arch_family.strip().upper() in self.supported_arch_families
-
-
-_SHIPPING_STD_DTYPES = frozenset({
-    "bf16", "bfloat16", "fp16", "float16", "int8", "fp8", "fp8_e4m3", "fp8_e5m2", "mxfp8",
-})
-_SHIPPING_STD_ACTIVATIONS = frozenset({"swiglu", "silu", "gelu"})
-_ARCH35_ARCH_ID = "npu_arch_3510"
-_ARCH22_ARCH_ID = "npu_arch_2201"
-_FUSED_MC2_MEGAMOE_MODE = 2
-_INT4_WEIGHT_DTYPES = frozenset({"int4", "w4a8"})
-_INT8_WEIGHT_DTYPES = frozenset({"int8", "w8a8"})
-_MEGAMOE_WEIGHT_DTYPES = frozenset({
-    "fp8", "fp8_e4m3", "fp8_e5m2", "mxfp8", "mxfp4", "mx_fp4", "fp4", "fp4_e2m1", "int8",
-})
-
-#: Typed capability predicates for shipping Tier-K1 composite CANN/HCCL ABIs.
-SHIPPING_ABI_PREDICATES: Mapping[str, ShippingAbiPredicate] = {
-    "aclnnMlaPrologV3": ShippingAbiPredicate(
-        abi_id="aclnnMlaPrologV3",
-        fusion_tier="K1_shipping",
-        pattern="mla_prolog",
-        supported_dtypes=_SHIPPING_STD_DTYPES,
-        supports_draft_scope=True,
-    ),
-    "aclnnSwiGluQuant": ShippingAbiPredicate(
-        abi_id="aclnnSwiGluQuant",
-        fusion_tier="K1_shipping",
-        pattern="act_quant",
-        supported_activations=_SHIPPING_STD_ACTIVATIONS,
-        supported_dtypes=_SHIPPING_STD_DTYPES,
-        supports_draft_scope=True,
-    ),
-    "aclnnAddRmsNormDynamicQuant": ShippingAbiPredicate(
-        abi_id="aclnnAddRmsNormDynamicQuant",
-        fusion_tier="K1_shipping",
-        pattern="add_rmsnorm_quant",
-        supported_dtypes=_SHIPPING_STD_DTYPES,
-        supports_draft_scope=True,
-    ),
-    "aclnnRmsNormDynamicQuant": ShippingAbiPredicate(
-        abi_id="aclnnRmsNormDynamicQuant",
-        fusion_tier="K1_shipping",
-        pattern="rmsnorm_quant",
-        supported_dtypes=_SHIPPING_STD_DTYPES,
-        supports_draft_scope=True,
-    ),
-    "aclnnAllGatherMatmulV2": ShippingAbiPredicate(
-        abi_id="aclnnAllGatherMatmulV2",
-        fusion_tier="K1_shipping",
-        pattern="allgather_matmul",
-        supported_dtypes=_SHIPPING_STD_DTYPES,
-        supports_draft_scope=True,
-    ),
-    "aclnnMatmulReduceScatterV2": ShippingAbiPredicate(
-        abi_id="aclnnMatmulReduceScatterV2",
-        fusion_tier="K1_shipping",
-        pattern="matmul_reducescatter",
-        supported_dtypes=_SHIPPING_STD_DTYPES,
-        supports_draft_scope=True,
-    ),
-    "aclnnMegaMoe": ShippingAbiPredicate(
-        abi_id="aclnnMegaMoe",
-        fusion_tier="K1_shipping",
-        pattern="moe_dispatch_ffn_combine",
-        supported_activations=_SHIPPING_STD_ACTIVATIONS,
-        supported_dtypes=_SHIPPING_STD_DTYPES,
-        supported_weight_dtypes=_MEGAMOE_WEIGHT_DTYPES,
-        supported_arch_families=frozenset({"A5", "A3"}),
-        supports_draft_scope=False,
-    ),
-    "dispatch_ffn_combine": ShippingAbiPredicate(
-        abi_id="dispatch_ffn_combine",
-        fusion_tier="K1_shipping",
-        pattern="moe_dispatch_ffn_combine",
-        supported_activations=_SHIPPING_STD_ACTIVATIONS,
-        supported_dtypes=_SHIPPING_STD_DTYPES,
-        supported_weight_dtypes=_INT8_WEIGHT_DTYPES,
-        supported_arch_families=frozenset({"A3"}),
-        supports_draft_scope=False,
-    ),
-    "dispatch_ffn_combine_w4_a8": ShippingAbiPredicate(
-        abi_id="dispatch_ffn_combine_w4_a8",
-        fusion_tier="K1_shipping",
-        pattern="moe_dispatch_ffn_combine",
-        supported_activations=_SHIPPING_STD_ACTIVATIONS,
-        supported_dtypes=_SHIPPING_STD_DTYPES,
-        supported_weight_dtypes=_INT4_WEIGHT_DTYPES,
-        supported_arch_families=frozenset({"A3"}),
-        supports_draft_scope=False,
-    ),
-}
-
-
-def _resolve_arch_family(
-    datapath: DatapathCapabilitySpec | None, arch_family: str = "",
-) -> str:
-    explicit = str(arch_family or "").strip().upper()
-    if explicit in {"A2", "A3", "A5"}:
-        return explicit
-    arch_id = str(getattr(getattr(datapath, "compute_arch", None), "arch_id", "") or "")
-    if arch_id == _ARCH35_ARCH_ID:
-        return "A5"
-    if arch_id == _ARCH22_ARCH_ID:
-        return "A3"
-    return ""
-
-
-def resolve_shipping_moe_predicate(
-    arch_family: str,
-    *,
-    weight_dtype: str = "",
-    enable_fused_mc2: int | None = None,
-) -> ShippingAbiPredicate | None:
-    """Resolve the architecture-qualified shipping fused-MoE predicate (zero cross-gen leak)."""
-    arch = str(arch_family or "").strip().upper()
-    w_fmt = str(weight_dtype or "").strip().lower()
-    if arch == "A5":
-        return SHIPPING_ABI_PREDICATES["aclnnMegaMoe"]
-    if arch == "A3":
-        if enable_fused_mc2 == _FUSED_MC2_MEGAMOE_MODE:
-            return SHIPPING_ABI_PREDICATES["aclnnMegaMoe"]
-        if w_fmt in _INT4_WEIGHT_DTYPES:
-            return SHIPPING_ABI_PREDICATES["dispatch_ffn_combine_w4_a8"]
-        return SHIPPING_ABI_PREDICATES["dispatch_ffn_combine"]
-    if arch == "A2":
-        return None
-    if w_fmt in _MEGAMOE_WEIGHT_DTYPES - _INT8_WEIGHT_DTYPES:
-        return SHIPPING_ABI_PREDICATES["aclnnMegaMoe"]
-    return None
-
-
-@dataclass(frozen=True, slots=True)
 class OpTraitInfo:
     """Typed algebraic descriptor extracted solely from ``OpSpec`` structure."""
 
@@ -357,8 +185,8 @@ class OpTraitInfo:
     reduction_axis: int | None = None
     activation_kind: str = ""
     activation_params: tuple[tuple[str, float], ...] = ()
-    input_dtype: str = "bf16"
-    output_dtype: str = "bf16"
+    input_dtype: str = ""
+    output_dtype: str = ""
     weight_dtype: str = ""
     group_size: int | None = None
     scale_format: str = ""
@@ -379,8 +207,8 @@ class AlgebraicCandidate:
     abi_id: str
     fusion_tier: FusionTier
     member_ids: tuple[str, ...]
+    shipping_supported: bool
     preserve_port_ids: tuple[str, ...] = ()
-    shipping_supported: bool = True
     unsupported_reason: str = ""
     elided_view_ids: tuple[str, ...] = ()
     ub_peak_bytes: int = 0
@@ -437,16 +265,6 @@ class AlgebraicRewriteResult:
     verification: Any = None
 
 
-def _safe_dtype_bytes(dtype: str) -> float:
-    tok = str(dtype or "bf16").strip().lower()
-    if not tok:
-        return 2.0
-    try:
-        return float(dtype_bytes(tok))
-    except ModelingError:
-        return 2.0
-
-
 def _extract_activation_params(meta: Mapping[str, Any]) -> tuple[tuple[str, float], ...]:
     params: dict[str, float] = {}
     raw = meta.get("activation_params")
@@ -485,8 +303,8 @@ def _estimate_row_working_bytes(
     row_elems = int(shape[-1]) if len(shape) >= 2 else int(shape[0])
     if row_elems <= 0:
         return 0
-    in_b = _safe_dtype_bytes(in_dt)
-    out_b = _safe_dtype_bytes(out_dt)
+    in_b = float(dtype_bytes(in_dt))
+    out_b = float(dtype_bytes(out_dt))
     if is_vector_compute:
         # Ascend AIV upcasts BF16/FP16 to FP32 (4B/elem) inside UB for compute.
         fp32_work = float(FP32_ACCUM_BYTES)
@@ -585,8 +403,10 @@ def classify_op_traits(op: OpSpec) -> OpTraitInfo:
     rec = str(op.recipe or "").strip().lower()
     meta = dict(op.metadata) if op.metadata else {}
 
-    in_dt = str(meta.get("activation_format") or meta.get("input_format") or op.dtype or "bf16").strip().lower()
-    out_dt = str(meta.get("output_format") or op.dtype or "bf16").strip().lower()
+    in_dt = str(meta.get("activation_format") or meta.get("input_format") or op.dtype or "").strip().lower()
+    out_dt = str(meta.get("output_format") or op.dtype or "").strip().lower()
+    if not in_dt or not out_dt:
+        raise ModelingError(f"algebra_missing_op_dtype:{op.op_id}")
     w_dt = str(meta.get("weight_format") or meta.get("weight_dtype") or op.dtype or "").strip().lower()
     raw_gs = meta.get("activation_group_size", meta.get("quant_group_size"))
     group_size = int(raw_gs) if isinstance(raw_gs, int) and not isinstance(raw_gs, bool) and raw_gs > 0 else None
@@ -694,7 +514,7 @@ def _usable_ub_bytes(datapath: DatapathCapabilitySpec | None) -> int:
     if datapath is None:
         return 0
     raw = int(dict(datapath.buffers).get("ub", 0) or 0)
-    carveout = max(SIMT_UB_CARVEOUT_BYTES, int(datapath.simt_ub_carveout_bytes or 0))
+    carveout = int(datapath.simt_ub_carveout_bytes or 0)
     return max(0, raw - carveout)
 
 
@@ -738,7 +558,7 @@ def _check_ub_chain_fits(
             TilePipelineSpec(
                 "algebra_ub_chain",
                 cands,
-                simt_ub_carveout_bytes=max(SIMT_UB_CARVEOUT_BYTES, int(datapath.simt_ub_carveout_bytes or 0)),
+                simt_ub_carveout_bytes=int(datapath.simt_ub_carveout_bytes or 0),
             ),
             members[-1],
             hw,
@@ -757,7 +577,7 @@ def _output_shape_bytes(op: OpSpec, tr: OpTraitInfo) -> float:
         elems = int(op.local_shape[0]) * int(op.local_shape[1])
     else:
         elems = prod(int(d) for d in op.local_shape if int(d) > 0)
-    return float(max(0, elems)) * _safe_dtype_bytes(tr.output_dtype)
+    return float(max(0, elems)) * float(dtype_bytes(tr.output_dtype))
 
 
 def _avoidable_hbm_bytes(members: Sequence[OpSpec], traits: Mapping[str, OpTraitInfo]) -> int:
@@ -790,7 +610,7 @@ def _law2_avoidable_read_bytes(siblings: Sequence[OpSpec], traits: Mapping[str, 
     if m_dim <= 0 or k_dim <= 0:
         return 0
     a_dt, _, _ = _activation_quant_key(first)
-    act_bytes = float(m_dim * k_dim) * _safe_dtype_bytes(a_dt)
+    act_bytes = float(m_dim * k_dim) * float(dtype_bytes(a_dt))
     saved = 0.0
     for sib in siblings[1:]:
         mte2 = float(sib.mte2_bytes or 0.0)
@@ -881,95 +701,11 @@ def _match_law4_mla_prolog(
     deps: Mapping[str, set[str]],
     succ: Mapping[str, list[str]],
 ) -> list[AlgebraicCandidate]:
-    """Match shipping ``aclnnMlaPrologV3`` via typed ABI roles and DAG topology."""
-    by_scope_layer: dict[tuple[str, int, int, str], list[OpSpec]] = defaultdict(list)
-    for op in ordered:
-        if op.op_id in claimed:
-            continue
-        meta = dict(op.metadata) if op.metadata else {}
-        is_draft = (
-            str(meta.get("model_scope") or "").strip().lower() == "draft"
-            or str(meta.get("structure_model_scope") or "").strip().lower() == "draft"
-        )
-        scope = "draft" if is_draft else "target"
-        by_scope_layer[(scope, op.stage, op.layer, op.stream or "main")].append(op)
-
-    pred = SHIPPING_ABI_PREDICATES["aclnnMlaPrologV3"]
-    found: list[AlgebraicCandidate] = []
-    for (scope, stage, layer, _stream), ops in by_scope_layer.items():
-        roles = {op.op_id: _typed_mla_role(op) for op in ops}
-        q_entries = {oid for oid, role in roles.items() if role in {"q_a", "qkv_a"}}
-        kv_entries = {oid for oid, role in roles.items() if role in {"kv_a", "qkv_a"}}
-        q_bs = {oid for oid, role in roles.items() if role == "q_b"}
-        if not (q_entries and kv_entries and q_bs):
-            continue
-        q_norms = {
-            op.op_id for op in ops
-            if roles[op.op_id] == "q_norm" or (
-                traits[op.op_id].symbolic_op_kind in {"rmsnorm", "layernorm"}
-                and bool(deps.get(op.op_id, set()) & q_entries)
-                and bool(set(succ.get(op.op_id, ())) & q_bs)
-            )
-        }
-        kv_norms = {
-            op.op_id for op in ops
-            if op.op_id not in q_norms and (
-                roles[op.op_id] == "kv_norm" or (
-                    traits[op.op_id].symbolic_op_kind in {"rmsnorm", "layernorm"}
-                    and bool(deps.get(op.op_id, set()) & kv_entries)
-                )
-            )
-        }
-        rot_sources = q_bs | q_norms | kv_norms | kv_entries
-        rotaries = {
-            op.op_id for op in ops
-            if roles[op.op_id] == "rotary" or (
-                traits[op.op_id].symbolic_op_kind == "rotary"
-                and bool(deps.get(op.op_id, set()) & rot_sources)
-            )
-        }
-        absorb_sources = q_bs | rotaries | q_norms | q_entries
-        q_absorbs = {
-            op.op_id for op in ops
-            if roles[op.op_id] == "q_absorb"
-            and (not deps.get(op.op_id) or bool(deps.get(op.op_id, set()) & absorb_sources))
-        }
-        store_sources = kv_norms | rotaries | kv_entries
-        kv_stores = {
-            op.op_id for op in ops
-            if roles[op.op_id] == "kv_store" or (
-                traits[op.op_id].symbolic_op_kind == "kv_scatter"
-                and bool(deps.get(op.op_id, set()) & store_sources)
-            )
-        }
-        if not (kv_norms or rotaries):
-            continue
-        member_set = q_entries | kv_entries | q_norms | q_bs | kv_norms | rotaries | q_absorbs | kv_stores
-        members = [op for op in ops if op.op_id in member_set]
-        if len(members) < MIN_MLA_PROLOG_MEMBERS:
-            continue
-        if not all(pred.supports_dtype(traits[op.op_id].input_dtype) for op in members):
-            continue
-        member_ids = tuple(op.op_id for op in members)
-        if not _convex(ordered, member_set):
-            continue
-        preserve = tuple(
-            op.op_id for op in members[:-1]
-            if any(op.op_id in deps[other.op_id] for other in ordered if other.op_id not in member_set)
-        )
-        claimed.update(member_ids)
-        found.append(AlgebraicCandidate(
-            candidate_id=f"law4_mlapo_{scope}_s{stage}_l{layer}",
-            law="law4_view_or_abi",
-            abi_id="aclnnMlaPrologV3",
-            fusion_tier="K1_shipping",
-            member_ids=member_ids,
-            preserve_port_ids=preserve,
-            shipping_supported=True,
-            avoidable_hbm_bytes=_avoidable_hbm_bytes(members, traits),
-            traits=tuple(sorted({traits[oid].trait.value for oid in member_ids})),
-        ))
-    return found
+    """Match shipping ``aclnnMlaPrologV3`` via canonical ProbedAbiRegistry."""
+    del ordered, traits, claimed, deps, succ
+    raise NotImplementedError(
+        "LEGACY_PURGED: wire canonical mindie_sim.backends.abi_registry.ProbedAbiRegistry.verify()"
+    )
 
 
 def _discover_law3_mc2(
@@ -982,73 +718,10 @@ def _discover_law3_mc2(
     allow_mc2: bool,
 ) -> list[AlgebraicCandidate]:
     """Law 3: Bilinear MatMul x Associative Collective Pipelining (MC2)."""
-    if not allow_mc2:
-        return []
-    by_id = {op.op_id: op for op in ordered}
-    found: list[AlgebraicCandidate] = []
-    ag_pred = SHIPPING_ABI_PREDICATES["aclnnAllGatherMatmulV2"]
-    rs_pred = SHIPPING_ABI_PREDICATES["aclnnMatmulReduceScatterV2"]
-
-    for op in ordered:
-        if op.op_id in claimed:
-            continue
-        tr = traits[op.op_id]
-        # Pattern 3a: AllGather(x, TP) -> [optional Quantize] -> MatMul(W_col)
-        if tr.trait == AlgebraicTrait.ASSOCIATIVE_COLLECTIVE and tr.collective_op == "CONCAT":
-            if tr.collective_axis and tr.collective_axis != "tp":
-                continue
-            users = [u for u in succ.get(op.op_id, ()) if u in by_id and u not in claimed]
-            if len(users) != 1:
-                continue
-            nxt = by_id[users[0]]
-            nxt_tr = traits[nxt.op_id]
-            if (
-                nxt_tr.trait == AlgebraicTrait.BILINEAR_MATMUL
-                and not nxt_tr.is_grouped_matmul
-                and _same_domain(op, nxt)
-                and ag_pred.supports_dtype(nxt_tr.input_dtype)
-                and _convex(ordered, {op.op_id, nxt.op_id})
-            ):
-                claimed.update((op.op_id, nxt.op_id))
-                found.append(AlgebraicCandidate(
-                    candidate_id=f"law3_agmm_{nxt.op_id}",
-                    law="law3_mc2",
-                    abi_id="aclnnAllGatherMatmulV2",
-                    fusion_tier="K1_shipping",
-                    member_ids=(op.op_id, nxt.op_id),
-                    shipping_supported=True,
-                    avoidable_hbm_bytes=_avoidable_hbm_bytes((op, nxt), traits),
-                    traits=("ASSOCIATIVE_COLLECTIVE", "BILINEAR_MATMUL"),
-                ))
-        # Pattern 3b: MatMul(W_row) -> ReduceScatter(SUM, TP)
-        elif tr.trait == AlgebraicTrait.BILINEAR_MATMUL and not tr.is_grouped_matmul:
-            users = [u for u in succ.get(op.op_id, ()) if u in by_id and u not in claimed]
-            if len(users) != 1:
-                continue
-            nxt = by_id[users[0]]
-            nxt_tr = traits[nxt.op_id]
-            if (
-                nxt_tr.trait == AlgebraicTrait.ASSOCIATIVE_COLLECTIVE
-                and nxt_tr.collective_op == "SUM"
-                and (not nxt_tr.collective_axis or nxt_tr.collective_axis == "tp")
-                and nxt_tr.symbolic_op_kind == "reduce_scatter"
-                and _same_domain(op, nxt)
-                and rs_pred.supports_dtype(tr.input_dtype)
-                and len(deps.get(nxt.op_id, set())) == 1
-                and _convex(ordered, {op.op_id, nxt.op_id})
-            ):
-                claimed.update((op.op_id, nxt.op_id))
-                found.append(AlgebraicCandidate(
-                    candidate_id=f"law3_mmrs_{op.op_id}",
-                    law="law3_mc2",
-                    abi_id="aclnnMatmulReduceScatterV2",
-                    fusion_tier="K1_shipping",
-                    member_ids=(op.op_id, nxt.op_id),
-                    shipping_supported=True,
-                    avoidable_hbm_bytes=_avoidable_hbm_bytes((op, nxt), traits),
-                    traits=("BILINEAR_MATMUL", "ASSOCIATIVE_COLLECTIVE"),
-                ))
-    return found
+    del ordered, traits, claimed, deps, succ, allow_mc2
+    raise NotImplementedError(
+        "LEGACY_PURGED: wire canonical mindie_sim.backends.abi_registry.ProbedAbiRegistry.verify()"
+    )
 
 
 def _discover_law2_block_matmul(
@@ -1058,80 +731,10 @@ def _discover_law2_block_matmul(
     succ: Mapping[str, list[str]],
 ) -> tuple[list[AlgebraicCandidate], list[tuple[str, str]]]:
     """Law 2: Block-Matrix Right-Distributivity ``x W1, x W2 -> x [W1 | W2]``."""
-    by_id = {op.op_id: op for op in ordered}
-    op_ids = set(by_id)
-    by_producer: dict[tuple[tuple[str, str, int], ...], list[OpSpec]] = defaultdict(list)
-    for op in ordered:
-        if op.op_id in claimed:
-            continue
-        tr = traits[op.op_id]
-        if tr.trait != AlgebraicTrait.BILINEAR_MATMUL or tr.is_grouped_matmul:
-            continue
-        if len(op.local_shape) != MATMUL_SHAPE_RANK:
-            continue
-        prod_port = _producer_port_key(op, op_ids, by_id=by_id)
-        if prod_port is not None:
-            by_producer[prod_port].append(op)
-
-    found: list[AlgebraicCandidate] = []
-    rejected: list[tuple[str, str]] = []
-    for _prod_ports, siblings in by_producer.items():
-        if len(siblings) < MIN_FUSE_MEMBERS:
-            continue
-        buckets: dict[tuple[Any, ...], list[OpSpec]] = defaultdict(list)
-        for op in siblings:
-            sib_key = _law2_sibling_key(op, all_ops=by_id)
-            if sib_key is None:
-                continue
-            key = (op.stage, op.phase, op.stream or "main", op.layer, sib_key)
-            buckets[key].append(op)
-        if len(buckets) > 1:
-            names = [op.op_id for op in siblings]
-            rejected.append((
-                "+".join(names[:2]),
-                "quant_or_sharding_contract_mismatch",
-            ))
-        for bucket in buckets.values():
-            if len(bucket) < MIN_FUSE_MEMBERS:
-                continue
-            independent: list[OpSpec] = []
-            for cand in bucket:
-                if any(
-                    _is_ancestor(cand.op_id, prev.op_id, succ) or _is_ancestor(prev.op_id, cand.op_id, succ)
-                    for prev in independent
-                ):
-                    continue
-                independent.append(cand)
-            if len(independent) < MIN_FUSE_MEMBERS:
-                continue
-            m_ids = tuple(op.op_id for op in independent)
-            if not _convex(ordered, set(m_ids)):
-                continue
-            saved_bytes = _law2_avoidable_read_bytes(independent, traits)
-            from .apply import SPLITV_LAUNCH_OVERHEAD_BYTES, _unabsorbed_splitv_cost
-
-            splitv_hbm, splitv_launches = _unabsorbed_splitv_cost(independent, by_id)
-            splitv_total_penalty = splitv_hbm + float(splitv_launches * SPLITV_LAUNCH_OVERHEAD_BYTES)
-            if splitv_hbm > 0.0 and float(saved_bytes) <= splitv_total_penalty:
-                rejected.append((
-                    "+".join(m_ids[:2]),
-                    "splitv_unabsorbed_cost_exceeds_activation_savings",
-                ))
-                continue
-            net_avoidable = max(0, int(round(float(saved_bytes) - splitv_hbm)))
-            claimed.update(m_ids)
-            found.append(AlgebraicCandidate(
-                candidate_id=f"law2_block_mm_{independent[0].op_id}",
-                law="law2_block_matmul",
-                abi_id="gemm",
-                fusion_tier="K2_epilogue",
-                member_ids=m_ids,
-                preserve_port_ids=m_ids,
-                shipping_supported=True,
-                avoidable_hbm_bytes=net_avoidable,
-                traits=("BILINEAR_MATMUL",),
-            ))
-    return found, rejected
+    del ordered, traits, claimed, succ
+    raise NotImplementedError(
+        "LEGACY_PURGED: wire canonical mindie_sim.backends.abi_registry.ProbedAbiRegistry.verify() + PrimitiveTable launch cost"
+    )
 
 
 def _append_audit_trigger(
@@ -1234,96 +837,12 @@ def _discover_gmm_act_candidates(
     arch_family: str = "",
     enable_fused_mc2: int | None = None,
 ) -> list[AlgebraicCandidate]:
-    """Match GroupedMatmul -> Activation (-> Quant) via arch-qualified ABI capability predicates."""
-    swiglu_pred = SHIPPING_ABI_PREDICATES["aclnnSwiGluQuant"]
-    eff_arch = _resolve_arch_family(datapath, arch_family)
-    found: list[AlgebraicCandidate] = []
-    for op in ordered:
-        if op.op_id in claimed or not traits[op.op_id].is_grouped_matmul:
-            continue
-        users = [u for u in succ.get(op.op_id, ()) if u in by_id and u not in claimed]
-        if len(users) != 1:
-            continue
-        act = by_id[users[0]]
-        act_tr = traits[act.op_id]
-        if act_tr.trait != AlgebraicTrait.POINTWISE or not act_tr.activation_kind or not _same_domain(op, act):
-            continue
-        chain = [op, act]
-        act_users = [u for u in succ.get(act.op_id, ()) if u in by_id and u not in claimed]
-        if len(act_users) == 1 and traits[act_users[0]].symbolic_op_kind in {"dynamic_quant", "dynamic_mx_quant"}:
-            q_op = by_id[act_users[0]]
-            if _same_domain(act, q_op):
-                chain.append(q_op)
-        m_ids = tuple(x.op_id for x in chain)
-        if not _convex(ordered, set(m_ids)):
-            continue
-        op_tr = traits[op.op_id]
-        in_moe_frame = _has_moe_dispatch_combine_frame(op, chain[-1], by_id, traits, succ)
-        moe_pred = (
-            resolve_shipping_moe_predicate(
-                eff_arch, weight_dtype=op_tr.weight_dtype, enable_fused_mc2=enable_fused_mc2,
-            )
-            if in_moe_frame else None
-        )
-        use_moe_abi = in_moe_frame and moe_pred is not None
-        pred = moe_pred if use_moe_abi else swiglu_pred
-        act_supported = pred.supports_activation(act_tr.activation_kind)
-        dtype_supported = pred.supports_dtype(op_tr.input_dtype)
-        weight_supported = (
-            not use_moe_abi or not op_tr.weight_dtype or pred.supports_weight_dtype(op_tr.weight_dtype)
-        )
-        supported = act_supported and dtype_supported and weight_supported
-        fits, ub_pk, ub_cap = _check_ub_chain_fits(chain[1:], traits, datapath)
-        if not supported:
-            ext_abi = (
-                f"{pred.abi_id}_{act_tr.activation_kind}_ext"
-                if use_moe_abi else "GroupedMatmulCustomActQuant"
-            )
-            reason = (
-                f"activation={act_tr.activation_kind!r} not in shipping "
-                f"supported_activations={sorted(pred.supported_activations)}"
-                if not act_supported else
-                f"dtype={op_tr.input_dtype!r}/weight={op_tr.weight_dtype!r} outside shipping {pred.abi_id}"
-            )
-            _append_audit_trigger(
-                triggers,
-                trigger_keys,
-                traits,
-                "ABI_UNSUPPORTED_VARIANT",
-                chain,
-                reason,
-                cand_abi=ext_abi,
-            )
-            if fits and include_abi_extensions:
-                claimed.update(m_ids)
-                found.append(AlgebraicCandidate(
-                    candidate_id=f"law1_gmm_ext_{op.op_id}",
-                    law="law1_ub_chain",
-                    abi_id=ext_abi,
-                    fusion_tier="K3_dsl_pipeline",
-                    member_ids=m_ids,
-                    shipping_supported=False,
-                    unsupported_reason=f"activation={act_tr.activation_kind}_requires_abi_extension",
-                    ub_peak_bytes=ub_pk,
-                    ub_budget_bytes=ub_cap,
-                    avoidable_hbm_bytes=_avoidable_hbm_bytes(chain, traits),
-                    traits=tuple(traits[oid].trait.value for oid in m_ids),
-                ))
-        elif fits:
-            claimed.update(m_ids)
-            found.append(AlgebraicCandidate(
-                candidate_id=f"law1_gmm_act_{op.op_id}",
-                law="law1_ub_chain",
-                abi_id="aclnnSwiGluQuant" if len(chain) == MIN_FUSE_MEMBERS else "GroupedMatmulSwiGLUQuant",
-                fusion_tier="K1_shipping" if len(chain) == MIN_FUSE_MEMBERS else "K2_epilogue",
-                member_ids=m_ids,
-                shipping_supported=True,
-                ub_peak_bytes=ub_pk,
-                ub_budget_bytes=ub_cap,
-                avoidable_hbm_bytes=_avoidable_hbm_bytes(chain, traits),
-                traits=tuple(traits[oid].trait.value for oid in m_ids),
-            ))
-    return found
+    """Match GroupedMatmul -> Activation (-> Quant) via canonical ProbedAbiRegistry."""
+    del ordered, by_id, traits, claimed, succ, datapath, triggers, trigger_keys
+    del include_abi_extensions, arch_family, enable_fused_mc2
+    raise NotImplementedError(
+        "LEGACY_PURGED: wire canonical mindie_sim.backends.abi_registry.ProbedAbiRegistry.verify()"
+    )
 
 
 def _collect_semantic_audit_triggers(
@@ -1520,31 +1039,10 @@ def _discover_law1_and_law4_chains(
 def _classify_ub_chain_abi(
     chain: Sequence[OpSpec], traits: Mapping[str, OpTraitInfo],
 ) -> tuple[str, FusionTier, bool, str]:
-    kinds = [traits[op.op_id].symbolic_op_kind for op in chain if traits[op.op_id].trait != AlgebraicTrait.VIEW_METADATA]
-    has_quant = any(k in {"dynamic_quant", "dynamic_mx_quant"} for k in kinds)
-    has_mx = "dynamic_mx_quant" in kinds
-    acts = [traits[op.op_id].activation_kind for op in chain if traits[op.op_id].activation_kind]
-    if "add" in kinds and "rmsnorm" in kinds and has_quant:
-        return ("AddRmsNormDynamicMxQuant" if has_mx else "aclnnAddRmsNormDynamicQuant"), "K1_shipping", True, ""
-    if "rmsnorm" in kinds and has_quant:
-        return ("RmsNormDynamicMxQuant" if has_mx else "aclnnRmsNormDynamicQuant"), "K1_shipping", True, ""
-    if "norm_gate" in kinds and has_quant:
-        return ("FusedRMSNormGatedMxQuant" if has_mx else "FusedRMSNormGatedQuant"), "K2_epilogue", False, "custom_norm_gate_quant"
-    if acts and has_quant:
-        pred = SHIPPING_ABI_PREDICATES["aclnnSwiGluQuant"]
-        act = acts[0]
-        if pred.supports_activation(act) and not has_mx:
-            return "aclnnSwiGluQuant", "K1_shipping", True, ""
-        return f"Fused{act.capitalize()}{'Mx' if has_mx else ''}Quant", "K3_dsl_pipeline", False, f"activation={act}_abi_extension"
-    if not kinds:
-        return "StridedViewElided", "K1_shipping", True, ""
-    if "gating" in kinds:
-        return "FusedDecayGatingView", "K2_epilogue", False, "view_elided_gating"
-    if "l2norm" in kinds:
-        return "FusedQKL2NormView", "K2_epilogue", False, "view_elided_l2norm"
-    if "layernorm" in kinds and has_quant:
-        return ("FusedLayerNormMxQuant" if has_mx else "FusedLayerNormQuant"), "K2_epilogue", False, "custom_layernorm_quant"
-    return "FusedUBChain", "K2_epilogue", False, "ub_chain_synthesis"
+    del chain, traits
+    raise NotImplementedError(
+        "LEGACY_PURGED: wire canonical mindie_sim.backends.abi_registry.ProbedAbiRegistry.verify()"
+    )
 
 
 def discover_algebraic_rewrites_for_ops(
@@ -1661,6 +1159,7 @@ def discover_algebraic_rewrites(
         # Filter down to individually verified edits so the returned plan is always sound.
         safe_edits: list[Edit] = []
         safe_cands: list[AlgebraicCandidate] = []
+        rejected_pairs = list(raw_res.rejected_pairs)
         for edit, cand in zip(raw_res.plan.edits, raw_res.candidates):
             trial = RewritePlan(
                 base_graph_sha256=scenario.base_graph_sha256,
@@ -1670,11 +1169,15 @@ def discover_algebraic_rewrites(
             try:
                 t_app = apply_plan(trial, scenario)
                 t_rec = verify_plan(scenario, t_app, scope="archetype")
-            except ModelingError:
+            except ModelingError as exc:
+                rejected_pairs.append((edit.edit_id, str(exc)))
                 continue
             if t_rec.passed:
                 safe_edits.append(edit)
                 safe_cands.append(cand)
+            else:
+                failed = ",".join(f"{g.name}:{g.reason}" for g in t_rec.gates if not g.passed) or "verification_failed"
+                rejected_pairs.append((edit.edit_id, failed))
         plan = RewritePlan(
             base_graph_sha256=scenario.base_graph_sha256,
             framing_sha256=scenario.framing_sha256,
@@ -1685,7 +1188,7 @@ def discover_algebraic_rewrites(
             plan=plan,
             candidates=tuple(safe_cands),
             semantic_audit_triggers=raw_res.semantic_audit_triggers,
-            rejected_pairs=raw_res.rejected_pairs,
+            rejected_pairs=tuple(rejected_pairs),
             verification=final_rec,
         )
     return AlgebraicRewriteResult(
@@ -1699,9 +1202,6 @@ def discover_algebraic_rewrites(
 
 __all__ = [
     "AlgebraicTrait",
-    "ShippingAbiPredicate",
-    "SHIPPING_ABI_PREDICATES",
-    "resolve_shipping_moe_predicate",
     "OpTraitInfo",
     "AlgebraicCandidate",
     "SemanticAuditTrigger",

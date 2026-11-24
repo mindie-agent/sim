@@ -146,31 +146,9 @@ class _LiveAccess:
     explicit: bool = False
 
     def start(self, engine, name, ready, *, owner=""):
-        def record(ledger, resident, dirty):
-            pattern = self.pattern
-            if self.delivered is not None:
-                self.delivered.update({
-                    "logical_transfer_bytes": ledger.logical_tensor_bytes,
-                    "issued_copy_bytes": ledger.aligned_transfer_bytes,
-                    "dram_sector_bytes": ledger.dram_sector_bytes + dirty,
-                    "turnaround_service_bytes": dirty + (
-                        _rational_service(pattern.runs, resident, self.bound.bind_config[-2])
-                        if ledger.dram_sector_bytes else 0
-                    ),
-                    "realized_l2_hit_bytes": ledger.l2_hit_bytes,
-                    "realized_l2_miss_bytes": ledger.dram_miss_copy_bytes,
-                    "realized_hbm_bytes": ledger.dram_bus_transaction_bytes + dirty,
-                })
-                entry = self.obligation
-                if self.explicit and not pattern.visibility.private_workspace:
-                    entry = _logical_obligation(pattern)
-                if entry is not None:
-                    self.obligations[pattern.direction].extend(_split_entry_residency(entry, resident))
-            self.lifetimes.complete(pattern.reuse_key)
-
-        return engine.submit_bound_access(
-            name, self.bound, after=(ready,), owner=owner, memory_state=self.state,
-            pattern=lambda: self.lifetimes.resolve(self.pattern), on_delivery=record,
+        del engine, name, ready, owner
+        raise NotImplementedError(
+            "LEGACY_PURGED: separate realized_hbm_delivered_bytes from dram_bus_service_bytes in fuse_region_live.py"
         )
 
 

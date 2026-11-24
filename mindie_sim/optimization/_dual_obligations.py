@@ -20,6 +20,7 @@ from mindie_sim.prediction.operators.matrix.matrix_precision import (
     PACKED_FP4_FORMATS,
     resolve_matrix_precision,
 )
+from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.operators import OpSpec
 from .contracts import FusedRegionSummary, SemanticWorkItem, TensorRangeObligation
 
@@ -65,31 +66,10 @@ def _cold_weight_read(op, meta: Mapping[str, object], die: int) -> TensorRangeOb
 def _pure_copy_boundary(op, meta: Mapping[str, object], die: int, replica: int, stage: int,
                         consumed: set[tuple[int, str]]):
     """Return (read_hbm_ob, write_hbm_ob, mte2_copy_bytes, write_copy_bytes) for an unfused copy."""
-    hbm = int(getattr(op, "hbm_bytes", 0) or 0)
-    mte2 = int(getattr(op, "mte2_bytes", 0) or 0)
-    mte3 = int(getattr(op, "mte3_bytes", 0) or 0)
-    warm = meta.get("initial_residency") == "l2_warm"
-    read_ob = write_ob = None
-    mte2_copy = write_copy = 0
-    if not getattr(op, "deps", ()):
-        if mte2 > 0:
-            mte2_copy = mte2
-        if hbm > 0 and not warm:
-            read_sz = min(mte2, hbm) if mte2 > 0 else hbm
-            if read_sz > 0:
-                read_ob = TensorRangeObligation(
-                    die, f"boundary_in:r{replica}.p{stage}:{op.op_id}", 0, ((0, read_sz),), "hbm_cold", "owner",
-                )
-    if (replica, op.op_id) not in consumed:
-        if mte3 > 0:
-            write_copy = mte3
-        if hbm > 0 and not warm and read_ob is None:
-            write_sz = min(mte3, hbm) if mte3 > 0 else hbm
-            if write_sz > 0:
-                write_ob = TensorRangeObligation(
-                    die, f"boundary_out:r{replica}.p{stage}:{op.op_id}", 0, ((0, write_sz),), "onchip_resident", "device",
-                )
-    return read_ob, write_ob, mte2_copy, write_copy
+    del op, meta, die, replica, stage, consumed
+    raise NotImplementedError(
+        "LEGACY_PURGED: separate read (mte2>0) and terminal-store (mte3>0) boundary obligations"
+    )
 
 
 def _resolve_op_precision(op, stage_devices, policy: str):
@@ -107,7 +87,7 @@ def derive_default_obligations(scenario, demands, aliases, covered, rank_ops_fn)
     parallel = getattr(getattr(case, "runtime", None), "parallel", None)
     tp_width = (int(parallel.tp) * int(parallel.pcp)) if parallel is not None else 1
     pp_stages = int(parallel.pp) if parallel is not None else 1
-    default_dt = str(getattr(getattr(case, "model", None), "compute_dtype", "") or "bf16")
+    default_dt = str(getattr(getattr(case, "model", None), "compute_dtype", "") or "").strip()
     matrix_policy = str(getattr(getattr(case, "runtime", None), "matrix_compute_policy", "auto") or "auto")
 
     rank_ops = tuple(rank_ops_fn(scenario))
@@ -154,10 +134,12 @@ def derive_default_obligations(scenario, demands, aliases, covered, rank_ops_fn)
                     stage_devices = tuple(demands.devices[r] for r in stage_ranks if r in demands.devices)
                     stage_devices_cache[sd_key] = stage_devices
                 resolved_op = _resolve_op_precision(op, stage_devices, matrix_policy)
-            dtype = getattr(resolved_op, "dtype", "") or default_dt
+            dtype = str(getattr(resolved_op, "dtype", "") or default_dt).strip()
             pairs = getattr(resolved_op, "matrix_flops", ()) or ((dtype, getattr(resolved_op, "flops", 0)),)
             for dt, flops in pairs:
                 if flops > 0:
+                    if not str(dt).strip():
+                        raise ModelingError(f"dual_obligations_dtype_missing:{op.op_id}")
                     matrix_work[replica, stage, die, str(dt)] += int(flops)
                     has_matrix = True
             vec_ops = int(getattr(op, "vector_ops", 0) or 0)

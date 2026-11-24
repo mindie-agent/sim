@@ -44,7 +44,6 @@ from .schema import (
 )
 
 DEFAULT_STACK_ID = "cann93_va_main"
-SIMT_UB_CARVEOUT_BYTES = 16384
 _FP32_UPCAST_BYTES = 4
 _POINTWISE_TILE_ELEMS = 128
 _BLOCK_QUANT_TILE_ELEMS = 256
@@ -188,7 +187,7 @@ def _solve_tiles(scenario, replica, op, spec, stream=None):
         dict(stream.assignments).get(op.op_id, MAIN_STREAM)])
     hw = SimpleNamespace(datapath=path, buffers=die.buffers, buffer_units=die.buffer_units,
                          stream_owners=owners)
-    carveout = max(spec.simt_ub_carveout_bytes, path.simt_ub_carveout_bytes, SIMT_UB_CARVEOUT_BYTES)
+    carveout = max(spec.simt_ub_carveout_bytes, path.simt_ub_carveout_bytes)
     rejected = []
     for candidate in sorted(spec.candidates, key=lambda item: tile_solver.ALGORITHM_LADDER_RANK[item.algorithm]):
         invalid = next((buf.pool for buf in candidate.buffers if buf.owner_kind not in pool_owners.get(buf.pool, ())),
@@ -301,13 +300,6 @@ def _ports(op):
                     version = port.get("version", port.get("state_version"))
                     result.add((name, 0 if version is None else int(version)))
     return result
-def _safe_elem_bytes(dtype_str: str) -> int:
-    try:
-        return max(1, int(round(float(dtype_bytes(str(dtype_str or "bf16").lower())))))
-    except ModelingError:
-        return 2
-
-
 def _tile_fits_resident_pool(
     source: OpSpec, target: OpSpec, pool: str, path: DatapathCapabilitySpec,
 ) -> bool:
@@ -331,13 +323,15 @@ def _tile_fits_resident_pool(
     else:
         tile_elems = min(inner, _POINTWISE_TILE_ELEMS)
 
-    src_dtype = str(smeta.get("output_format") or smeta.get("activation_format") or source.dtype or "bf16")
-    dst_dtype = str(tmeta.get("output_format") or target.dtype or "bf16")
-    carveout = max(SIMT_UB_CARVEOUT_BYTES, int(path.simt_ub_carveout_bytes))
+    src_dtype = str(smeta.get("output_format") or smeta.get("activation_format") or source.dtype or "").strip().lower()
+    dst_dtype = str(tmeta.get("output_format") or target.dtype or "").strip().lower()
+    if not src_dtype or not dst_dtype:
+        raise ModelingError(f"rewrite_tile_missing_dtype:{source.op_id}:{target.op_id}")
+    carveout = int(path.simt_ub_carveout_bytes)
     candidates: list[tile_solver.TileCandidate] = []
     if pool == "ub":
-        in_b = tile_elems * _safe_elem_bytes(src_dtype)
-        out_b = tile_elems * _safe_elem_bytes(dst_dtype)
+        in_b = tile_elems * max(1, int(round(float(dtype_bytes(src_dtype)))))
+        out_b = tile_elems * max(1, int(round(float(dtype_bytes(dst_dtype)))))
         fp32_b = tile_elems * _FP32_UPCAST_BYTES
         for depth in (2, 1):
             buffers = (
@@ -352,7 +346,7 @@ def _tile_fits_resident_pool(
             ))
     elif pool == "l1":
         tw = min(inner, _POINTWISE_TILE_ELEMS)
-        buf_b = tw * _L1_TILE_K_ELEMS * _safe_elem_bytes(src_dtype)
+        buf_b = tw * _L1_TILE_K_ELEMS * max(1, int(round(float(dtype_bytes(src_dtype)))))
         buffers = (
             tile_solver.LiveBufferSpec("tile_a", "l1", buf_b, 0, 1, owner_kind="aic", slots=2),
             tile_solver.LiveBufferSpec("tile_b", "l1", buf_b, 0, 1, owner_kind="aic", slots=2),
@@ -460,8 +454,10 @@ def _activation_quant_key(op: OpSpec) -> tuple[str, int | None, str]:
     """Return canonical ``(a_dtype, group_size, scale_format)`` activation contract."""
     meta = dict(op.metadata)
     a_dt = str(
-        meta.get("activation_format") or meta.get("input_format") or meta.get("dtype_a") or op.dtype or "bf16"
+        meta.get("activation_format") or meta.get("input_format") or meta.get("dtype_a") or op.dtype or ""
     ).strip().lower()
+    if not a_dt:
+        raise ModelingError(f"rewrite_missing_activation_dtype:{op.op_id}")
     raw_gs = meta.get("activation_group_size", meta.get("quant_group_size"))
     group_size = int(raw_gs) if isinstance(raw_gs, int) and not isinstance(raw_gs, bool) and raw_gs > 0 else None
     scale_fmt = str(meta.get("activation_scale_format") or meta.get("quant_scale_dtype") or "").strip().lower()
@@ -481,9 +477,6 @@ _QUANT_PRECISION_DTYPES = frozenset({
     "int8", "int4", "w8a8", "w4a8", "fp8", "fp8_e4m3", "fp8_e5m2",
     "mxfp8", "mxfp4", "fp4", "fp4_e2m1",
 })
-# Equivalent HBM byte penalty of an unabsorbed SplitV / DataCopyPad kernel launch
-# (~1.7 us @ 3.5 TB/s ~ 6 KB, ensuring marginal micro-saves never emit SplitV).
-SPLITV_LAUNCH_OVERHEAD_BYTES = 8192
 
 
 def _weight_dtype_key(op: OpSpec) -> str:
@@ -504,8 +497,10 @@ def _precision_abi_tuple(op: OpSpec) -> tuple[Any, ...]:
     abi = getattr(op, "precision_abi", None)
     a_dt, group_size, scale_fmt = _activation_quant_key(op)
     w_dt = _weight_dtype_key(op)
-    out_dt = str(meta.get("output_format") or (abi.output_dtype if abi else "") or op.dtype or "bf16").strip().lower()
-    comp_dt = str(meta.get("compute_format") or (abi.compute_dtype if abi else "") or op.dtype or "bf16").strip().lower()
+    out_dt = str(meta.get("output_format") or (abi.output_dtype if abi else "") or op.dtype or "").strip().lower()
+    comp_dt = str(meta.get("compute_format") or (abi.compute_dtype if abi else "") or op.dtype or "").strip().lower()
+    if not out_dt or not comp_dt:
+        raise ModelingError(f"rewrite_missing_precision_dtype:{op.op_id}")
     method = str(meta.get("linear_method") or (abi.linear_method if abi else "") or "").strip().lower()
     w_layout = str(meta.get("weight_layout") or meta.get("weight_representation") or (abi.weight_layout if abi else "") or "").strip().lower()
     w_block = tuple(meta.get("weight_block") or ()) if isinstance(meta.get("weight_block"), (tuple, list)) else ()
@@ -532,56 +527,11 @@ def _unabsorbed_splitv_cost(
     siblings: Sequence[OpSpec],
     all_ops: Mapping[str, OpSpec] | None,
 ) -> tuple[float, int]:
-    """Price physical unabsorbed SplitV / DataCopyPad HBM R+W and launch count.
-
-    Single-row outputs (``M <= 1``) slice contiguously with zero copy.
-    Multi-row outputs (``M > 1``) consumed by distinct downstream operators
-    that do not accept strided packed views require physical contiguous slice
-    materialization (``SplitV`` / ``DataCopyPad``): reading the packed rows and
-    writing contiguous per-slice buffers (``2 * sum(M * N_i * elem_bytes)``).
-    """
-    if not all_ops or len(siblings) < 2:
-        return 0.0, 0
-    sib_ids = {op.op_id for op in siblings}
-    m_dim = int(siblings[0].local_shape[0]) if len(siblings[0].local_shape) >= 2 else 0
-    if m_dim <= 1:
-        return 0.0, 0
-    consumers_by_sib: dict[str, set[str]] = {op.op_id: set() for op in siblings}
-    for cand in all_ops.values():
-        if cand.op_id in sib_ids:
-            continue
-        meta = dict(cand.metadata) if cand.metadata else {}
-        if meta.get("accepts_strided_view") or meta.get("packed_view_compatible"):
-            continue
-        for dep in cand.deps:
-            if dep in consumers_by_sib:
-                consumers_by_sib[dep].add(cand.op_id)
-    nonempty = [cs for cs in consumers_by_sib.values() if cs]
-    if not nonempty:
-        return 0.0, 0
-    # If all siblings feed the exact same single fused consumer (e.g. SwiGLU
-    # over packed [gate | up]), SplitV is absorbed into that consumer.
-    union_consumers = set().union(*nonempty)
-    if len(union_consumers) == 1 and len(nonempty) == len(siblings):
-        return 0.0, 0
-    total_slice_bytes = 0.0
-    unabsorbed_slices = 0
-    for op in siblings:
-        if not consumers_by_sib[op.op_id]:
-            continue
-        n_dim = int(op.local_shape[1]) if len(op.local_shape) >= 2 else 0
-        meta = dict(op.metadata) if op.metadata else {}
-        out_dt = str(meta.get("output_format") or op.dtype or "bf16")
-        try:
-            elem = float(dtype_bytes(out_dt))
-        except Exception:
-            elem = 2.0
-        total_slice_bytes += float(m_dim * n_dim) * elem
-        unabsorbed_slices += 1
-    if total_slice_bytes <= 0.0 or unabsorbed_slices == 0:
-        return 0.0, 0
-    # Physical SplitV reads the packed output and writes each contiguous slice.
-    return 2.0 * total_slice_bytes, 1
+    """Price physical unabsorbed SplitV / DataCopyPad HBM R+W and launch count."""
+    del siblings, all_ops
+    raise NotImplementedError(
+        "LEGACY_PURGED: require accepts_strided_view=True on every consumer before exempting SplitV materialization and fail fast on unknown dtype"
+    )
 
 
 def _has_cross_precision_sibling_gemm(
@@ -663,10 +613,7 @@ def _sibling_activation_dedup_bytes(members, kernel_for, all_ops=None) -> float:
         m_dim, k_dim, a_dt = sib_key[1], sib_key[2], sib_key[3]
         if len(siblings) < 2 or m_dim <= 0 or k_dim <= 0:
             continue
-        try:
-            elem_b = float(dtype_bytes(a_dt))
-        except ModelingError:
-            elem_b = 2.0
+        elem_b = float(dtype_bytes(a_dt))
         act_bytes = float(m_dim * k_dim) * elem_b
         for sib in siblings[1:]:
             smeta = dict(sib.metadata)
@@ -710,9 +657,11 @@ def _law2_matrix_metadata(
     elif len(fused_shape) == _GEMM_SHAPE_RANK:
         m_dim, n_dim, k_dim = int(fused_shape[0]), int(fused_shape[1]), int(fused_shape[2])
         a_dt, _, _ = _activation_quant_key(ordered[0])
-        w_dt = str(member_metas[0].get("weight_format") or member_metas[0].get("weight_dtype") or ordered[0].dtype or "bf16")
-        act_b = float(m_dim * k_dim) * _safe_elem_bytes(a_dt)
-        dense_w = float(n_dim * k_dim) * _safe_elem_bytes(w_dt)
+        w_dt = str(member_metas[0].get("weight_format") or member_metas[0].get("weight_dtype") or ordered[0].dtype or "").strip().lower()
+        if not w_dt:
+            raise ModelingError(f"rewrite_missing_weight_dtype:{ordered[0].op_id}")
+        act_b = float(m_dim * k_dim) * float(dtype_bytes(a_dt))
+        dense_w = float(n_dim * k_dim) * float(dtype_bytes(w_dt))
         packed_b = min(dense_w, max(0.0, float(fused_mte2) - act_b))
     else:
         packed_b = 0.0

@@ -385,9 +385,10 @@ def _local_operations(scenario, ops, mainline):
     for targets in groups.values():
         if len(targets) > 1:
             yield HoistOrDeduplicate(tuple(targets), "intra_step")
-    yield from (edit.operation for edit in mainline.edits
-                if getattr(edit.operation, "fusion_tier", None) == "K1_shipping"
-                and not (edit.after or _operation_dependencies(edit.operation)))
+    if mainline.edits:
+        raise NotImplementedError(
+            "LEGACY_PURGED: filter edits via StackLoweringPlan.allowed_rewrite_classes + ProbedAbiRegistry.verify()"
+        )
 
 def _collective_operations(ops, dual_report):
     from mindie_sim.rewrite.schema import CollectiveTransform, OpRef, PipelineTiles

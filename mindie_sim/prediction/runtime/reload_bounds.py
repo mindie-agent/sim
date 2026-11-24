@@ -13,11 +13,10 @@ from dataclasses import dataclass, field, replace
 from fractions import Fraction
 from heapq import merge
 from math import gcd, isqrt, lcm
+from typing import Any
 
 from mindie_sim.prediction.runtime.memory_physics import AddressRun
-
-from .contracts import BilinearContractionSpec, FusedRegionSummary, TensorRangeObligation
-from .dual_bound import EpochAccount, verify_epoch_trace
+from mindie_sim.templates.contracts import FusedRegionSummary, TensorRangeObligation
 
 SECTOR_BYTES = 32
 BITS_PER_BYTE = 8
@@ -31,10 +30,26 @@ RANK_ONE_KINDS = frozenset({
 })
 
 __all__ = (
-    "SECTOR_BYTES", "BITS_PER_BYTE", "MAX_EXPLICIT_STRIDED_ROWS", "CompulsoryHbmCut",
-    "PebbleReloadResult", "SurplusCouplingSite", "compute_compulsory_hbm_cut",
-    "direct_mac_pebble_reload_bound", "build_surplus_coupling_sites",
+    "SECTOR_BYTES", "BITS_PER_BYTE", "MAX_EXPLICIT_STRIDED_ROWS", "EpochAccount",
+    "verify_epoch_trace", "CompulsoryHbmCut", "PebbleReloadResult", "SurplusCouplingSite",
+    "compute_compulsory_hbm_cut", "direct_mac_pebble_reload_bound", "build_surplus_coupling_sites",
 )
+
+
+@dataclass(frozen=True, slots=True)
+class EpochAccount:
+    complete_pairs: int
+    split_out_pairs: int
+    epoch_pair_cap: int
+
+
+def verify_epoch_trace(trace: tuple[EpochAccount, ...], total_pairs: int) -> bool:
+    for epoch in trace:
+        accounted = epoch.complete_pairs + epoch.split_out_pairs
+        if accounted > epoch.epoch_pair_cap:
+            return False
+        total_pairs -= accounted
+    return total_pairs <= 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -239,7 +254,7 @@ def _full_epoch(capacity: int, resident: int, denom: int, bits_acc: int) -> Epoc
                key=lambda epoch: epoch.epoch_pair_cap)
 
 
-def direct_mac_pebble_reload_bound(spec: BilinearContractionSpec) -> PebbleReloadResult:
+def direct_mac_pebble_reload_bound(spec: Any) -> PebbleReloadResult:
     pairs = spec.m * spec.n
     if not (spec.distinct_operands and spec.address_injective_across_k):
         return PebbleReloadResult(spec.contraction_id, spec.die, False,

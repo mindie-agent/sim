@@ -24,9 +24,9 @@ from mindie_sim.prediction.streams import (
 )
 from mindie_sim.schema.common import ModelingError
 
-REWRITE_PLAN_SCHEMA = "mindie-rewrite-plan/1"
+REWRITE_PLAN_SCHEMA = "mindie-rewrite-plan/2"
 TemplateTier: TypeAlias = Literal["K1", "K2", "K3"]
-FusionTier: TypeAlias = Literal["K1_shipping", "K2_epilogue", "K3_dsl_pipeline"]
+FusionTier: TypeAlias = Literal["K1_shipping", "K1_proposed_pr", "K2_epilogue", "K3_dsl_pipeline"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,7 +60,7 @@ class FuseRegion:
     members: tuple[OpRef, ...]
     preserve_ports: tuple[PortRef, ...]
     kernel_boundaries: tuple[KernelBoundary, ...]
-    fusion_tier: FusionTier = "K1_shipping"
+    fusion_tier: FusionTier
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,7 +156,7 @@ class Edit:
 
 @dataclass(frozen=True, slots=True)
 class RewritePlan:
-    schema: Literal["mindie-rewrite-plan/1"] = REWRITE_PLAN_SCHEMA
+    schema: Literal["mindie-rewrite-plan/2"] = REWRITE_PLAN_SCHEMA
     base_graph_sha256: str = ""
     framing_sha256: str = ""
     edits: tuple[Edit, ...] = ()
@@ -299,7 +299,7 @@ def decode_rewrite_plan(payload: Mapping[str, Any]) -> RewritePlan:
     """Decode exact JSON types and reject fields outside the current algebra."""
     keys = {"schema", "base_graph_sha256", "framing_sha256", "edits"}
     _object(payload, keys, keys, "plan")
-    _typed(payload["schema"], Literal["mindie-rewrite-plan/1"], "schema")
+    _typed(payload["schema"], Literal["mindie-rewrite-plan/2"], "schema")
     if type(payload["edits"]) is not list:
         raise ModelingError("rewrite_wire_type_invalid:edits")
     edits = []

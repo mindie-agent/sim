@@ -220,61 +220,10 @@ class _MatrixLowerer:
         return self.plan.access(kwargs.pop("name"), kwargs.pop("allocation", tensor), width * rows, runs=(run,), **kwargs)
 
     def _fill(self, name, tile, k_start, k_len, operand, after, ring, generation):
-        p, s, core = self.p, self.spec, tile.owner
-        a = operand == "a"
-        tensor, dtype, row, col, rows, cols, width = (
-            (p.a_id, s.dtype_a, tile.row, k_start, tile.m, k_len, p.k) if a else
-            (p.b_id, s.dtype_b, k_start, tile.col, k_len, tile.n, p.n)
+        del name, tile, k_start, k_len, operand, after, ring, generation
+        raise NotImplementedError(
+            "LEGACY_PURGED: validate spec/problem dtype parity before lowering in _MatrixLowerer._fill"
         )
-        allocation = tensor if a or not p.groups else f"{tensor}:expert:{tile.group}"
-        cache_bypass = not a and (s.l2_cache_hint_b == "disable" or (
-            s.scheduler == "grouped_slice_m" and ceil_div(tile.group_rows, self.tm) == 1
-        ))
-        location = (allocation, row, col, rows, cols)
-        lane = (core, operand)
-        slot = self.l1_generations[lane] % ring.depth
-        self.l1_generations[lane] += 1
-        previous = self.resident.get((*lane, slot))
-        credit = ring_credit(ring, generation)
-        deps = (*after, credit)
-        elide = previous is not None and should_elide_l1_reload(
-            previous[0], previous[1:], location[0], location[1:], s.enable_l1_resident,
-        )
-        if elide:
-            return deps
-        self.resident[*lane, slot] = location
-        if a and s.dispatch_policy == GATHER_SCATTER_FULL_LOAD_A:
-            vector = self._aiv(tile, direct=True)
-            indices = self._index_read(f"{name}:gather", tile, deps, vector)
-            aiv_gather = p.k <= GATHER_SCATTER_AIV_MAX_K
-            stride = packed_bytes(k_len, dtype)
-            read = self.plan.access(
-                f"{name}:gm_a", tensor, tile.m * stride, after=(indices,),
-                owner=vector if aiv_gather else core, pipe="mte2_aiv" if aiv_gather else "mte2_aic",
-                runs=tuple(AddressRun(i * stride, 1, stride, stride) for i in self._physical_rows(tile)),
-            )
-            if aiv_gather:
-                read = self.plan.work(f"{name}:gather_to_l1", "mte3", tile.m * stride, after=(read,), owner=vector)
-            return (read,)
-        if not a and s.prologue_b == "DecompressFp4ToFp8":
-            deps = self._expand_b(name, tile, row, rows, allocation, deps, cache_bypass)
-        else:
-            read = self._rect(
-                tensor, dtype, row, col, rows, cols, width, name=f"{name}:gm_{operand}",
-                allocation=allocation, owner=core, pipe="mte2_aic", after=deps, bypass=cache_bypass,
-            )
-            deps = (read,)
-        if s.mx_scale_group:
-            per_row = ceil_div(width, MX_SCALE_GROUP) if a else ceil_div(p.k, MX_SCALE_GROUP)
-            scale_rows, scale_cols = (rows, ceil_div(cols, MX_SCALE_GROUP)) if a else (cols, ceil_div(rows, MX_SCALE_GROUP))
-            scale_offset = row * per_row + col // MX_SCALE_GROUP if a else col * per_row + row // MX_SCALE_GROUP
-            scale = self.plan.access(
-                f"{name}:scale_{operand}", allocation + ":scale", scale_rows * scale_cols,
-                runs=(AddressRun(scale_offset, scale_rows, scale_cols, per_row),), owner=core,
-                pipe="mte2_aic", after=deps, bypass=cache_bypass,
-            )
-            deps = (scale,)
-        return deps
 
     def _expand_b(self, name, tile, row, rows, allocation, after, bypass):
         plan, spec = self.plan, self.spec
@@ -680,17 +629,9 @@ _PURE_LOWER_CACHE: dict[object, object] = {}
 
 
 def _datapath_cache_key(datapath) -> object:
-    arch = getattr(datapath, "compute_arch", None)
-    return (
-        getattr(arch, "arch_id", None),
-        getattr(datapath, "aic_count", 0),
-        getattr(datapath, "aiv_count", 0),
-        getattr(datapath, "buffers", ()),
-        getattr(datapath, "compute_peaks", ()),
-        getattr(datapath, "memory_access", None),
-        getattr(datapath, "hbm_read_bytes_per_s", None),
-        getattr(datapath, "hbm_write_bytes_per_s", None),
-        getattr(datapath, "hbm_rw_alpha", None),
+    del datapath
+    raise NotImplementedError(
+        "LEGACY_PURGED: include full stars_spec / launch latency fields in _datapath_cache_key"
     )
 
 

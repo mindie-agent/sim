@@ -18,7 +18,7 @@ from mindie_sim.schema.common import ModelingError
 from .contracts import SemanticWorkItem, ceil_div
 from .dsl_catalog import (
     ATTN_RES, ATTN_RES_VL, BF16_BYTES, COMMIT_KDA, FLASH_KDA, FP32_BYTES, INT32_BYTES,
-    KDA_CHUNK, KDA_HEAD_DIM, KDA_HIDDEN_SIZE, KDA_MODEL_HEADS, KV_ROW_BYTES_CMP, KV_ROW_BYTES_ORI,
+    KDA_CHUNK, KDA_HEAD_DIM, KV_ROW_BYTES_CMP, KV_ROW_BYTES_ORI,
     MEGA_KDA, MLA_CACHE_NZ_LANE_BYTES, MLA_PROLOG, MLA_QUANTIZED_QUERY, MQSMLA, MQSMLA_FD_BYTES_PER_CORE, MQSMLA_FD_SLOT_BYTES,
     MQSMLA_KV_DEPTH, MQSMLA_KV_TILE, QSLI, QSLI_HISTOGRAM_BINS, QSLI_MATRIX_DTYPE, QSLI_METADATA_BYTES,
     QSLI_PACKED_D, QSLI_SCALE_ROW_BYTES, QSLI_STAGING_DEPTH, QSLI_TILE_M, QSLI_TILE_N,
@@ -262,89 +262,10 @@ def _lower_flash(lower, p, ready):
 
 
 def _lower_mega(lower, p, ready):
-    spec = lower.spec
-    h = KDA_MODEL_HEADS // p.tp
-    d, batch = KDA_HEAD_DIM, p.batch * p.tp
-    workspaces = mega_workspace_sizes(p)
-    capacity = replay_pool_capacity(p.replay_capacity, p.sequence)
-    u_stride, k_stride, decay_stride, checkpoint_stride = replay_pool_strides(p, h, capacity)
-    if not p.unfused_launches or len(set(p.unfused_launches)) != len(p.unfused_launches):
-        raise ModelingError("mega_kda_unfused_launch_baseline_invalid")
-    ready = lower.stage("mega:unfused_baseline", (ready,), saved_launches=len(p.unfused_launches) - 1)
-    conv_width = (2 + 1) * h * d
-    taps = lower.access("mega:conv_weight", "mega:w_conv", KDA_CONV_TAPS * conv_width * BF16_BYTES, after=(ready,))
-    lane_last = {}
-    for tile in range(batch):
-        core, vector = tile % spec.aic_budget, tile % spec.aiv_budget
-        slot = p.state_indices[tile] if p.state_indices else tile
-        name = f"mega:{tile}"
-        prior = (lane_last.get(core, ready),)
-        hidden = lower.access(name + ":hidden", "hidden_states", p.sequence * KDA_HIDDEN_SIZE * BF16_BYTES,
-                              cube=True, owner=core, after=prior, offset=tile * p.sequence * KDA_HIDDEN_SIZE * BF16_BYTES)
-        conv_bytes = (KDA_CONV_TAPS - 1) * conv_width * BF16_BYTES
-        conv_history = lower.access(name + ":conv_read", "mega:conv_state", conv_bytes, owner=vector, after=prior,
-                                    offset=slot * (p.sequence + KDA_CONV_TAPS - 1) * conv_width * BF16_BYTES)
-        decay_weight = lower.access(name + ":decay_a_weight", "mega:w_decay_a",
-                                    KDA_HIDDEN_SIZE * d * BF16_BYTES, cube=True, owner=core, after=(ready,))
-        decay_a = lower.cube(name + ":decay_a", 2 * p.sequence * KDA_HIDDEN_SIZE * d, (hidden, decay_weight), core)
-        decay_input = lower.spill(
-            name + ":fa_workspace", "fa", p.sequence * d * BF16_BYTES, (decay_a,), owner=core,
-            offset=tile * p.sequence * d * BF16_BYTES, working_set=workspaces["fa"],
-            cube_src=True, cube_dst=True,
-        )
-        projected = {}
-        for tensor in ("Q", "K", "V", "decay", "beta", "output_gate"):
-            width = 1 if tensor == "beta" else d
-            in_width = d if tensor == "decay" else KDA_HIDDEN_SIZE
-            weight_bytes = in_width * h * width * BF16_BYTES
-            load = lower.access(f"{name}:{tensor}:weight", f"mega:w_{tensor}", weight_bytes,
-                                cube=True, owner=core, after=(ready,))
-            operand = decay_input if tensor == "decay" else hidden
-            projection = lower.cube(f"{name}:{tensor}:projection", 2 * p.sequence * in_width * h * width,
-                                    (operand, load), core)
-            amount = p.sequence * h * width * BF16_BYTES
-            if tensor in {"Q", "K", "V"}:
-                vector_dep = lower.vector(f"{name}:{tensor}:causal_conv", 2 * KDA_CONV_TAPS * p.sequence * h * d,
-                                          (projection, conv_history, taps), vector)
-            else:
-                vector_dep = lower.vector(f"{name}:{tensor}:prepare", p.sequence * h * width, (projection,), vector)
-            projected[tensor] = lower.spill(
-                f"{name}:{tensor}:gm", tensor, amount, (vector_dep,), owner=vector,
-                offset=tile * (workspaces[tensor] // batch), working_set=workspaces[tensor],
-            )
-        conv_stride = conv_bytes + p.sequence * conv_width * BF16_BYTES
-        conv_out = lower.access(name + ":conv_write", "mega:conv_state", conv_stride, owner=vector,
-                                after=tuple(projected[t] for t in ("Q", "K", "V")), offset=slot * conv_stride, write=True)
-        state_size = h * d * d * FP32_BYTES
-        indices = lower.access(name + ":state_index", "state_indices", INT32_BYTES,
-                               owner=vector, after=prior, offset=tile * INT32_BYTES)
-        state = lower.access(name + ":state_read", "checkpoint", state_size,
-                             owner=vector, after=(indices,), offset=slot * checkpoint_stride * FP32_BYTES)
-        rec = lower.vector(name + ":recurrent", p.sequence * h * (d * d * KDA_RECURRENT_STATE_OPS + 2 * d),
-                           (state, *(dep for tensor, dep in projected.items() if tensor != "output_gate")), vector)
-        records = []
-        for (tensor, element), pool_stride in zip(_REPLAY_DTYPES, (u_stride, k_stride, decay_stride), strict=True):
-            row_bytes = d * element
-            stride = capacity * row_bytes
-            for token in range(p.sequence):
-                offset = slot * pool_stride * element + token * row_bytes
-                records.append(lower.access(f"{name}:{tensor}:{token}:write", tensor, h * row_bytes, after=(rec,),
-                                            owner=vector, write=True, runs=(AddressRun(offset, h, row_bytes, stride),)))
-        gated = lower.vector(name + ":gate", p.sequence * h * d, (rec, projected["output_gate"]), vector)
-        payload = p.sequence * h * d * BF16_BYTES
-        handoff = lower.access(name + ":gate_workspace", "Q", payload, owner=vector, after=(gated,),
-                               offset=tile * payload, private=True, write=True, working_set=workspaces["Q"])
-        publish = lower.stage(name + ":publish_vector_grid_to_cube", (handoff,), gm_workspace_handoff=True)
-        operand = lower.access(name + ":read_gated_workspace", "Q", payload, cube=True, owner=core,
-                               after=(publish,), offset=tile * payload, private=True, working_set=workspaces["Q"])
-        weight = lower.access(name + ":out_weight", "mega:w_out", h * d * KDA_HIDDEN_SIZE * BF16_BYTES,
-                              cube=True, owner=core, after=(ready,))
-        result = lower.cube(name + ":output_projection", 2 * p.sequence * h * d * KDA_HIDDEN_SIZE,
-                            (operand, weight), core)
-        output = p.sequence * KDA_HIDDEN_SIZE * BF16_BYTES
-        out = lower.access(name + ":output", "mega:output", output, after=(result,), cube=True, owner=core,
-                           write=True, offset=tile * output)
-        lane_last[core] = lower.stage(name + ":done", (conv_out, out, *records))
+    del lower, p, ready
+    raise NotImplementedError(
+        "LEGACY_PURGED: parameterize _lower_mega strictly from problem.num_heads and problem.hidden_size (zero hardcoded 96/7168)"
+    )
 
 
 _REPLAY_DTYPES = (("replay_u", FP32_BYTES), ("replay_k", BF16_BYTES), ("replay_decay", FP32_BYTES))

@@ -33,12 +33,6 @@ from dataclasses import replace
 import re
 from typing import Any
 
-from mindie_sim.optimization.kernel_synthesis import (
-    FormulaKernelEvaluation,
-    FormulaKernelSpec,
-    FormulaTensorSpec,
-    evaluate_formula_kernel as _canonical_evaluate_formula_kernel,
-)
 from mindie_sim.schema.case import Case
 from mindie_sim.schema.datapath import DatapathCapabilitySpec
 from mindie_sim.schema.hardware import Device, Hardware, parse_hardware
@@ -47,6 +41,29 @@ from mindie_sim.schema.operators import OpSpec
 from .contracts import Extension, Provider
 from .environment import ExecutionEnvironment
 from .errors import CapabilityGap, ExtensionError
+
+_FORMULA_PURGED_MSG = (
+    "LEGACY_PURGED: wire canonical templates.contracts + prediction.runtime.tile_solver + templates.fuse_region"
+)
+
+
+class FormulaTensorSpec:
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        raise NotImplementedError(_FORMULA_PURGED_MSG)
+
+
+class FormulaKernelSpec:
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        raise NotImplementedError(_FORMULA_PURGED_MSG)
+
+
+class FormulaKernelEvaluation:
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        raise NotImplementedError(_FORMULA_PURGED_MSG)
+
+
+def _canonical_evaluate_formula_kernel(*args: Any, **kwargs: Any) -> FormulaKernelEvaluation:
+    raise NotImplementedError(_FORMULA_PURGED_MSG)
 
 BINDING_STATE_BOUND = "bound_implementation"
 BINDING_STATE_UNBOUND_FORMULA = "unbound_formula_projection"
@@ -166,7 +183,9 @@ def enforce_simulation_binding_guard(
     if allow_unbound_formula:
         raise ExtensionError(f"simulation_mode_forbids_unbound_formula_ops:{entry}")
     if has_bound_provider:
-        return
+        raise NotImplementedError(
+            "LEGACY_PURGED: validate actual NativeCallBinding on post-builder ops instead of trusting has_bound_provider"
+        )
     for item in _iter_ops_items(ops):
         offender = _is_unbound_op_item(item)
         if offender is not None:

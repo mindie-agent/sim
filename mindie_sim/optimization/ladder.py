@@ -14,7 +14,6 @@ from typing import TYPE_CHECKING, Literal
 from mindie_sim.prediction.results import ReplayOptions, StepEvaluation, StepRequest
 
 from .contracts import CapacityTable, CatlassKernelSpec, DslKernelSpec, FuseRegionSpec
-from .dsl_solver import solve_dsl
 from .dual_bound import (
     NS_PER_MS, DualSubgradientReport, OptimalityCertificate,
     build_dual_inputs_from_scenario, certify_lower_bound,
@@ -119,69 +118,10 @@ def _occurrence_key(occurrence):
 
 
 def _partition(eval_result):
-    wall = round(eval_result.span_ms * NS_PER_MS)
-    if wall < 0:
-        raise ValueError("step span must be nonnegative")
-    endpoints = {}
-
-    def quantize(value):
-        if value not in endpoints:
-            endpoints[value] = min(wall, max(0, round(value * NS_PER_MS)))
-        return endpoints[value]
-
-    rows = {}
-    for row in eval_result.operators:
-        if row.start_ms is None or row.end_ms is None:
-            continue
-        start, end = quantize(row.start_ms), quantize(row.end_ms)
-        if end >= start:
-            rows[row.occurrence] = start, end, row
-
-    def completion(record):
-        _, end, row = record
-        return -end, row.ordinal, _occurrence_key(row.occurrence)
-
-    service = getattr(eval_result, "service_intervals", {})
-    current = min(rows.values(), key=completion, default=None)
-    cursor = wall
-    visited = set()
-    intervals = []
-    while current is not None:
-        start, end, row = current
-        if row.occurrence in visited:
-            raise ValueError("cycle in completion evidence")
-        visited.add(row.occurrence)
-        completion_ns = min(end, cursor)
-        if cursor > completion_ns:
-            intervals.append((None, cursor - completion_ns))
-        if completion_ns > start:
-            owner = row.occurrence
-            spans = service.get((owner.replica, owner.op_id))
-            if spans:
-                consumed = start
-                elementary = []
-                for lo, hi in sorted((max(start, quantize(lo)), min(completion_ns, quantize(hi)))
-                                     for lo, hi in spans):
-                    lo = max(lo, consumed)
-                    if hi <= lo:
-                        continue
-                    if lo > consumed:
-                        elementary.append((None, lo - consumed))
-                    elementary.append((owner, hi - lo))
-                    consumed = hi
-                if completion_ns > consumed:
-                    elementary.append((None, completion_ns - consumed))
-                intervals.extend(reversed(elementary))
-            else:
-                intervals.append((owner, completion_ns - start))
-        cursor = min(start, completion_ns)
-        ready = cursor if row.ready_ms is None else min(cursor, quantize(row.ready_ms))
-        current = min((rows[pred] for pred in row.predecessors
-                       if pred in rows and rows[pred][1] <= ready),
-                      key=completion, default=None)
-    if cursor:
-        intervals.append((None, cursor))
-    return tuple(reversed(intervals))
+    del eval_result
+    raise NotImplementedError(
+        "LEGACY_PURGED: consume canonical exposed/idle intervals from prediction.runtime.exposed_observer"
+    )
 
 
 def partition_step_wall_ns(eval_result: StepEvaluation) -> tuple[tuple[str, int], ...]:
@@ -303,7 +243,9 @@ def solve_five_level_ladder(
     pricing = replace(pricing, resource_names=names,
                       tight_resources=tuple(prices_by_index[key] for key in pricing.tight_resources))
     framework = solve_framework(dossier, dual_report=pricing, max_trials=max_trials)
-    dsl = solve_dsl(dossier, framework, dual_report=pricing, max_trials=max_trials)
+    raise NotImplementedError(
+        "LEGACY_PURGED: wire unified rewrite.algebra + templates.fuse_region + Engine replay"
+    )
     resolved = _baseline(dossier.handle, dsl.best_plan).scenario
     binding = dict(applied=dsl.best_eval.applied, region_summaries=dsl.best_eval.region_summaries)
     program, dag, names = build_dual_inputs_from_scenario(resolved, **binding)

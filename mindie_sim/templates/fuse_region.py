@@ -902,7 +902,7 @@ def _bind_declared_work(plan, stage, semantic):
             if int(raw) != raw or raw <= 0:
                 raise ModelingError("fuse_region_cube_work_requires_integer_flops")
             dtypes = {item.dtype for item in semantic if "cube" in item.admitted_engines}
-            fallback = next(iter(dtypes)) if len(dtypes) == 1 else getattr(context.op if context else None, "dtype", "bf16")
+            fallback = next(iter(dtypes)) if len(dtypes) == 1 else (getattr(context.op, "dtype", "") if context is not None else "")
             dtype = stage.metadata.get("cube_dtype", fallback)
             if not isinstance(dtype, str) or not dtype:
                 raise ModelingError("fuse_region_cube_dtype_invalid")

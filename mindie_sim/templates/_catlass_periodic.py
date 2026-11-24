@@ -330,13 +330,9 @@ class _PeriodicCatlassProgram:
             or datapath.memory_access != self.datapath.memory_access
             or probe.burst_rules != self.burst_rules
         ):
-            from .catlass_lower import solve_catlass_tile
-
-            sol = solve_catlass_tile(self.spec, self.problem, datapath, die=self.die)
-            return lower_catlass_periodic(
-                self.spec, self.problem, datapath, sol,
-                context=context, die=self.die, region_id=self.summary.region_id,
-            ).program
+            raise NotImplementedError(
+                "LEGACY_PURGED: forward initial_state / warm memory_view into lower_catlass_periodic on rebind"
+            )
         return replace(self, datapath=datapath, context=context, hbm_bus=probe.hbm_bus)
 
     def start(self, engine, name: str, ready, *, owner: str = ""):

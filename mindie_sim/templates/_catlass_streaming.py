@@ -496,11 +496,9 @@ class _StreamingCatlassProgram:
 
     def with_context(self, datapath, context) -> "_StreamingCatlassProgram":
         """Rebind runtime ``datapath`` and ``context`` without repeating dry-run lowering."""
-        return replace(
-            self,
-            datapath=datapath,
-            context=context,
-            hbm_bus=Lowering(datapath, context=context, die=self.die).hbm_bus,
+        del datapath, context
+        raise NotImplementedError(
+            "LEGACY_PURGED: recompute summary on L2/memory_access/burst_rules change in _StreamingCatlassProgram.with_context"
         )
 
     def start(self, engine, name: str, ready, *, owner: str = ""):

@@ -16,6 +16,7 @@ from operator import mul
 from time import perf_counter
 from typing import TYPE_CHECKING
 
+from mindie_sim.prediction.runtime.reload_bounds import EpochAccount, verify_epoch_trace
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.datapath import datapath_for_die
 
@@ -55,12 +56,6 @@ class FarkasCertificate:
     lambda_num: tuple[int, ...]
     mu_num: tuple[int, ...]
     lower_bound_ns: int
-
-@dataclass(frozen=True, slots=True)
-class EpochAccount:
-    complete_pairs: int
-    split_out_pairs: int
-    epoch_pair_cap: int
 
 @dataclass(frozen=True, slots=True)
 class DagEdge:
@@ -158,14 +153,6 @@ def check_optimality_certificate(
     return (path is not None and check_farkas_dual(prog, cert.farkas)
             and cert.l_star_lean_ns >= 0
             and cert.l_star_lean_ns == max(cert.farkas.lower_bound_ns, path))
-
-def verify_epoch_trace(trace: tuple[EpochAccount, ...], total_pairs: int) -> bool:
-    for epoch in trace:
-        accounted = epoch.complete_pairs + epoch.split_out_pairs
-        if accounted > epoch.epoch_pair_cap:
-            return False
-        total_pairs -= accounted
-    return total_pairs <= 0
 
 def inward_floor_ns(d_ns: Fraction) -> int:
     if d_ns <= 0:
@@ -396,15 +383,6 @@ def certify_lower_bound(
     assert check_optimality_certificate(prog, dag, cert)
     return cert, report
 
-def _unique_ops(entries):
-    by_id = {}
-    for entry in entries:
-        for op in getattr(entry, "ops", (entry,)):
-            if hasattr(op, "metadata"):
-                by_id.setdefault(op.op_id, op)
-    return tuple(by_id.values())
-
-
 def _scenario_rank_ops(scenario):
     entries = getattr(scenario, "atomic_ops", None)
     if entries is None:
@@ -414,9 +392,6 @@ def _scenario_rank_ops(scenario):
         for op in getattr(entry, "ops", (entry,)):
             if hasattr(op, "metadata"):
                 yield int(getattr(entry, "replica", 0)), op
-
-def _atomic_ops(scenario):
-    return _unique_ops(op for _, op in _scenario_rank_ops(scenario))
 
 def _op_contract_key(op, metadata):
     if (metadata.get("pure") is not True or metadata.get("load_time")
@@ -428,21 +403,13 @@ def _op_contract_key(op, metadata):
         return None
     return op.family, op.stage, op.layer, op.requests, op.local_shape, op.dtype, op.layout, repr(ports), repr(contract)
 
+def _atomic_ops(scenario):
+    del scenario
+    raise NotImplementedError("LEGACY_PURGED: wire replica-preserving dual_bound keying by (replica, op_id)")
+
 def _semantic_ops(scenario):
-    seen, aliases, operations = {}, {}, []
-    for op in _atomic_ops(scenario):
-        metadata = dict(op.metadata)
-        if metadata.get("load_time"):
-            aliases[op.op_id] = None
-            continue
-        key = _op_contract_key(op, metadata)
-        if key is not None and key in seen:
-            aliases[op.op_id] = seen[key]
-            continue
-        if key is not None:
-            seen[key] = op.op_id
-        operations.append((op, metadata))
-    return operations, aliases
+    del scenario
+    raise NotImplementedError("LEGACY_PURGED: wire replica-preserving dual_bound keying by (replica, op_id)")
 
 def _machine(scenario):
     machine = getattr(scenario, "machine", None)
@@ -516,10 +483,7 @@ class _Demands:
         path = self.paths[scope[-1]]
         rates = dict(device.rates)
         if pipe == "cube":
-            try:
-                return device.peak(dtype)
-            except ModelingError:
-                return 0
+            return device.peak(dtype)
         if pipe == "vector":
             return rates.get("vector", 0)
         if pipe == "simt":
@@ -584,14 +548,13 @@ def _engine_modes(demands, item):
         modes.append({})
     path = demands.paths.get(item.die)
     if item.kind == "sort_topk" and path and path.simt_ub_carveout_bytes:
-        radix = defaultdict(Fraction)
-        if "radix_hist256" in item.admissible_schedulers:
-            demands.charge(scope, "vector", item.logical_ops, rate_pipe="radix_hist256", rows=radix)
-        modes.append(radix)
+        raise NotImplementedError(
+            "LEGACY_PURGED: wire admitted-scheduler-only sort_topk dual modes (never synthesize empty 0 ns radix)"
+        )
     return modes
 
 def _memory_demands(demands, scenario, summaries, placements, contractions):
-    from .reload_bounds import (
+    from mindie_sim.prediction.runtime.reload_bounds import (
         SECTOR_BYTES, build_surplus_coupling_sites, compute_compulsory_hbm_cut,
         direct_mac_pebble_reload_bound,
     )
@@ -627,36 +590,8 @@ def _memory_demands(demands, scenario, summaries, placements, contractions):
 def _check_region_summary_bindings(scenario, applied, summaries, *, require_catalog=False):
     if not summaries:
         return
-    from mindie_sim.optimization.dsl_solver import canonical_region_summaries, summary_matches_canonical
-    from mindie_sim.rewrite.apply import _die
-    from mindie_sim.rewrite.schema import FuseRegion
-
-    fusions = {f"rewrite:{edit.edit_id}" for edit in applied.plan.edits if isinstance(edit.operation, FuseRegion)}
-    members = {region: atoms for region, atoms in applied.absorbed_atoms if region in fusions}
-    members.update((binding.target_op, (binding.target_op,)) for binding in applied.template_bindings
-                   if binding.target_op not in members)
-    bound = defaultdict(set)
-    for rank in applied.executable:
-        for op in rank.ops:
-            if op.op_id in members and (op.op_id not in fusions or op.family == "rewrite_fused"):
-                die = _die(scenario, rank.replica, op.stage).rank
-                bound[op.op_id, members[op.op_id]].add((rank.replica, op.stage, die))
-    canonical = canonical_region_summaries(scenario, applied)
-    for summary in summaries:
-        work_sites = {(item.replica, item.pp_stage, item.die) for item in summary.semantic_work}
-        dies = {item.die for group in (summary.read_obligations, summary.write_obligations) for item in group}
-        key = summary.region_id, tuple(summary.op_ids)
-        matches = sorted(site for site in bound.get(key, ())
-                         if (not work_sites or work_sites == {site}) and (not dies or dies == {site[-1]}))
-        chosen = next((
-            site for site in matches
-            if ((expected := canonical.get((site[0], site[1], summary.region_id))) is not None
-                and summary_matches_canonical(summary, expected))
-            or (expected is None and not require_catalog)
-        ), None)
-        if chosen is None:
-            raise ModelingError(f"LEDGER_RECONCILIATION_ERROR:unbound_region_summary:{summary.region_id}")
-        bound[key].remove(chosen)
+    del scenario, applied, require_catalog
+    raise NotImplementedError("LEGACY_PURGED: wire rewrite.catalog_replay canonical region summaries")
 
 
 def build_dual_inputs_from_scenario(
@@ -665,75 +600,5 @@ def build_dual_inputs_from_scenario(
     applied: AppliedPlan | None = None,
 ) -> tuple[ResourceChoiceProgram, EventDagSpec, tuple[str, ...]]:
     """Use only universal work obligations and admitted alternatives for the scenario."""
-    if applied is not None:
-        _check_region_summary_bindings(scenario, applied, region_summaries, require_catalog=True)
-    elif not region_summaries:
-        region_summaries = getattr(scenario, "region_summaries", ())
-    demands = _Demands(scenario, primitive_table, rate_mode)
-    operations, aliases = _semantic_ops(scenario)
-    summaries = tuple(summary for summary in region_summaries
-                      if not any(op_id in aliases for op_id in summary.op_ids))
-    contractions = getattr(scenario, "bilinear_contractions", ())
-    placements = dict(getattr(scenario, "die_placements", ()))
-    covered = {(item.replica, item.pp_stage, op_id) for summary in summaries
-               for item in summary.semantic_work for op_id in summary.op_ids}
-    defaults, derived_places = derive_default_obligations(
-        scenario, demands, aliases, covered, _scenario_rank_ops,
-    )
-    summaries += defaults
-    for die, coord in derived_places.items():
-        placements.setdefault(die, coord)
-    seen = set()
-
-    def add_work(item):
-        key = item.replica, item.pp_stage, item.die, item.work_id
-        if key not in seen:
-            seen.add(key)
-            demands.add_site(_engine_modes(demands, item))
-
-    for summary in summaries:
-        for item in summary.semantic_work:
-            add_work(item)
-
-    quanta = []
-    event_ids = {}
-    for op, meta in operations:
-        for item in meta.get("semantic_work", ()):
-            add_work(item)
-        for link, byte_count in meta.get("mandatory_comm_wire_bytes_by_link", ()):
-            demands.charge((0, 0, -1), f"link:{link}", byte_count)
-        for scope, direction, copy_bytes in meta.get("schedule_dependent_memory", ()):
-            hit = defaultdict(Fraction)
-            demands.charge(scope, "l2_bw", copy_bytes, rows=hit)
-            demands.charge(scope, "mte2_total" if direction == "read" else "write_total",
-                           copy_bytes, rows=hit)
-            miss = defaultdict(Fraction)
-            demands.transfer(scope, direction, copy_bytes, rows=miss)
-            demands.add_site((hit, miss))
-
-        # Stage latency and tile-level service may overlap. Demand a proof of
-        # the mandatory quantum and mandatory event edges before charging them.
-        quantum = meta.get("mandatory_event_quantum_ns")
-        if demands.certified and quantum is not None:
-            certified = meta.get("certified_mandatory_event_quantum_ns")
-            quantum = min(quantum, certified) if certified is not None else None
-        if quantum is not None and not meta.get("independent_prefetch"):
-            event_ids[op.op_id] = len(quanta)
-            quanta.append(inward_floor_ns(Fraction(quantum)))
-
-    edges = []
-    for op, meta in operations:
-        if op.op_id not in event_ids:
-            continue
-        deps = meta.get("mandatory_event_deps", ())
-        if demands.certified:
-            certified_deps = dict(meta.get("certified_mandatory_event_deps", ()))
-            deps = ((pred, min(wire, certified_deps[pred])) for pred, wire in deps if pred in certified_deps)
-        for predecessor, wire_ns in deps:
-            source = aliases.get(predecessor, predecessor)
-            if source in event_ids and source != op.op_id:
-                edges.append(DagEdge(event_ids[source], event_ids[op.op_id],
-                                     inward_floor_ns(Fraction(wire_ns))))
-    _memory_demands(demands, scenario, summaries, placements, contractions)
-    program, names = demands.program()
-    return program, EventDagSpec(tuple(quanta) or (0,), tuple(edges)), names
+    del scenario, region_summaries, primitive_table, rate_mode, applied
+    raise NotImplementedError("LEGACY_PURGED: wire replica-preserving dual_bound")

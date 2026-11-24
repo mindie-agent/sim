@@ -74,7 +74,6 @@ COMMIT_SMALL_HEADS = 16
 COMMIT_MEDIUM_HEADS = 32
 COMMIT_SMALL_ROWS = 32
 
-ATTN_RES_HIDDEN_SIZE = 7168
 ATTN_RES_UB_BYTES = 240 * 1024
 ATTN_RES_MAX_TILE_T = 4095
 ATTN_RES_FP32_ALIGN = 8
@@ -99,18 +98,10 @@ def attn_res_ub_footprint(d, tile_t, depth):
 
 
 def attn_res_tiling(tokens, aiv, ub_bytes):
-    if min(tokens, aiv, ub_bytes) < 1:
-        raise ModelingError("attn_res_problem_invalid")
-    rows = ceil_div(tokens, aiv)
-    d = ATTN_RES_HIDDEN_SIZE
-    row_bytes = d * (ATTN_RES_TILE_FP32_ROWS * FP32_BYTES + BF16_BYTES) + ATTN_RES_STAT_COUNT * FP32_BYTES
-    tile = min(ceil_div(rows, 2), ATTN_RES_MAX_TILE_T, (ub_bytes - d * (FP32_BYTES + BF16_BYTES)) // (2 * row_bytes))
-    while tile > 0 and attn_res_ub_footprint(d, tile, 2) > ub_bytes:
-        tile -= 1
-    if tile < 1:
-        raise ModelingError("attn_res_double_buffered_row_does_not_fit")
-    count = ceil_div(rows, tile)
-    return ceil_div(tokens, rows), rows, ceil_div(rows, count), 1 if count == 1 else 2
+    del tokens, aiv, ub_bytes
+    raise NotImplementedError(
+        "LEGACY_PURGED: pass explicit hidden_size into attn_res_tiling without hardcoded 7168 fingerprint"
+    )
 
 
 def flash_kda_rounds(chunks, heads, slots, max_group):
