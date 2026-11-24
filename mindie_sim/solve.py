@@ -302,13 +302,49 @@ def _track_summary_from_eff(eff: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _analyze_track_worker(task: tuple[Any, ...]) -> tuple[str, dict[str, Any]]:
+def _bottleneck_payload_from_eff(eff: Mapping[str, Any]) -> dict[str, Any]:
+    top_families = [
+        {
+            "family": row["family"],
+            "recipe": row["recipe"],
+            "duration_ms": round(float(row["total_ms"]), MS_DIGITS),
+            "share_of_step": round(float(row["share_of_step"]), RATIO_DIGITS),
+            "mbu": round(float(row["mbu"]), RATIO_DIGITS),
+            "cube_mfu": round(float(row["cube_mfu"]), RATIO_DIGITS),
+            "vec_mfu": round(float(row["vec_mfu"]), RATIO_DIGITS),
+            "link_util": round(float(row["link_util"]), RATIO_DIGITS),
+        }
+        for row in eff["breakdown_by_family"][:TOP_BOTTLENECK_FAMILIES]
+    ]
+    cv_overlap = eff.get("network_cv_overlap")
+    return {
+        "geometry": eff["geometry"],
+        "included_components": eff.get("included_components"),
+        "step_ms": round(float(eff["graph_duration_ms"]), MS_DIGITS),
+        "roofline": {
+            "cube_mfu": round(float(eff["network_cube_mfu"]), RATIO_DIGITS),
+            "vec_mfu": round(float(eff["network_vec_mfu"]), RATIO_DIGITS),
+            "mbu": round(float(eff["network_mbu"]), RATIO_DIGITS),
+            "link_util": round(float(eff["network_link_util"]), RATIO_DIGITS),
+            "cv_overlap": (round(float(cv_overlap), RATIO_DIGITS)
+                           if cv_overlap is not None else None),
+            "roofline_efficiency": round(float(eff["network_roofline_efficiency"]), RATIO_DIGITS),
+        },
+        "top_families": top_families,
+    }
+
+
+def _analyze_track_worker(task: tuple[Any, ...]) -> tuple[str, dict[str, Any], dict[str, Any] | None]:
     """Top-level pickle-safe worker evaluating one feature-track case summary."""
-    fp, raw_case, phase, tokens, context, sequences, scope = task
+    fp, raw_case, phase, tokens, context, sequences, scope, need_bottleneck = task
     eff = _analyze_case_bounded(
         raw_case, phase=phase, tokens=tokens, context=context, sequences=sequences, scope=scope,
     )
-    return fp, _track_summary_from_eff(eff)
+    return (
+        fp,
+        _track_summary_from_eff(eff),
+        _bottleneck_payload_from_eff(eff) if need_bottleneck else None,
+    )
 
 
 def _compare_feature_tracks_bounded(
@@ -317,6 +353,8 @@ def _compare_feature_tracks_bounded(
     compose_kwargs: Mapping[str, Any], use_archetype_folding: bool = False,
     precomputed_summaries: Mapping[str, Mapping[str, Any]] | None = None,
     granted_workers: int | None = None,
+    bottleneck_case: Mapping[str, Any] | None = None,
+    bottleneck_out: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Evaluate the 4-track waterfall with bounded concurrency and replica-0 memory caps."""
     del use_archetype_folding
@@ -331,6 +369,28 @@ def _compare_feature_tracks_bounded(
     track_entries: list[tuple[str, str, dict[str, Any]]] = []
     uncached_tasks: list[tuple[Any, ...]] = []
     queued_fps: set[str] = set()
+    eff_workers = resolve_granted_workers(granted_workers)
+    bn_fp: str | None = None
+    if bottleneck_case is not None:
+        bn_fp = _case_execution_fingerprint(bottleneck_case)
+        if eff_workers <= 1:
+            eff_bn = _analyze_case_bounded(
+                bottleneck_case, phase=phase, tokens=tokens,
+                context=(0 if phase == "prefill" else context),
+                sequences=max(1, int(sequences)), scope=scope,
+            )
+            summary_cache[bn_fp] = _track_summary_from_eff(eff_bn)
+            if bottleneck_out is not None:
+                bottleneck_out.update(_bottleneck_payload_from_eff(eff_bn))
+            del eff_bn
+            _reclaim_sweep_memory()
+        else:
+            queued_fps.add(bn_fp)
+            uncached_tasks.append((
+                bn_fp, bottleneck_case, phase, tokens,
+                (0 if phase == "prefill" else context),
+                max(1, int(sequences)), scope, True,
+            ))
     for track in ("merged", "unmerged_pr", "expected_ideal", "raw_eager"):
         kw = dict(cleaned)
         if track == "raw_eager" and kw.get("quant") is None and va_quant is not None:
@@ -346,13 +406,25 @@ def _compare_feature_tracks_bounded(
         fp = _case_execution_fingerprint(case)
         track_entries.append((track, fp, rep_meta))
         if fp not in summary_cache and fp not in queued_fps:
-            queued_fps.add(fp)
-            uncached_tasks.append((fp, case, phase, tokens, context, sequences, scope))
+            if eff_workers <= 1:
+                eff_t = _analyze_case_bounded(
+                    case, phase=phase, tokens=tokens, context=context, sequences=sequences, scope=scope,
+                )
+                summary_cache[fp] = _track_summary_from_eff(eff_t)
+                del eff_t, case
+                _reclaim_sweep_memory()
+            else:
+                queued_fps.add(fp)
+                uncached_tasks.append((fp, case, phase, tokens, context, sequences, scope, False))
+        else:
+            del case
     if uncached_tasks:
-        for fp, base_summary in map_ordered(
+        for fp, base_summary, bn_payload in map_ordered(
             _analyze_track_worker, uncached_tasks, granted_workers=granted_workers,
         ):
             summary_cache[fp] = base_summary
+            if bn_payload is not None and bottleneck_out is not None and fp == bn_fp:
+                bottleneck_out.update(bn_payload)
         _reclaim_sweep_memory()
     for track, fp, rep_meta in track_entries:
         summaries[track] = {**summary_cache[fp], "report": rep_meta}
@@ -435,35 +507,7 @@ def _extract_bottleneck_roofline(
     )
     if summary_sink is not None:
         summary_sink[_case_execution_fingerprint(raw_case)] = _track_summary_from_eff(eff)
-    top_families = [
-        {
-            "family": row["family"],
-            "recipe": row["recipe"],
-            "duration_ms": round(float(row["total_ms"]), MS_DIGITS),
-            "share_of_step": round(float(row["share_of_step"]), RATIO_DIGITS),
-            "mbu": round(float(row["mbu"]), RATIO_DIGITS),
-            "cube_mfu": round(float(row["cube_mfu"]), RATIO_DIGITS),
-            "vec_mfu": round(float(row["vec_mfu"]), RATIO_DIGITS),
-            "link_util": round(float(row["link_util"]), RATIO_DIGITS),
-        }
-        for row in eff["breakdown_by_family"][:TOP_BOTTLENECK_FAMILIES]
-    ]
-    cv_overlap = eff.get("network_cv_overlap")
-    return {
-        "geometry": eff["geometry"],
-        "included_components": eff.get("included_components"),
-        "step_ms": round(float(eff["graph_duration_ms"]), MS_DIGITS),
-        "roofline": {
-            "cube_mfu": round(float(eff["network_cube_mfu"]), RATIO_DIGITS),
-            "vec_mfu": round(float(eff["network_vec_mfu"]), RATIO_DIGITS),
-            "mbu": round(float(eff["network_mbu"]), RATIO_DIGITS),
-            "link_util": round(float(eff["network_link_util"]), RATIO_DIGITS),
-            "cv_overlap": (round(float(cv_overlap), RATIO_DIGITS)
-                           if cv_overlap is not None else None),
-            "roofline_efficiency": round(float(eff["network_roofline_efficiency"]), RATIO_DIGITS),
-        },
-        "top_families": top_families,
-    }
+    return _bottleneck_payload_from_eff(eff)
 
 
 def _summarize_iso_sla_state(
@@ -686,17 +730,6 @@ def _evaluate_winner_analysis(
         else (winner_mode if winner_mode in {"pd_decode", "pd_prefill"} else "colocated")
     )
     cohort_plan = discover_layer_cohorts(parsed_rec)
-    precomputed_tracks: dict[str, dict[str, Any]] = {}
-    bottleneck = _extract_bottleneck_roofline(
-        rec_case, prompt_tokens=prompt, sequences=win_seq,
-        tokens=win_tokens, scope=win_scope, phase=win_phase,
-        summary_sink=precomputed_tracks,
-    )
-    if isinstance(bottleneck, dict):
-        inc = dict(bottleneck.get("included_components") or {})
-        inc["target_layers"] = int(parsed_rec.model.layers)
-        inc["structural_cohorts"] = len(cohort_plan.cohorts)
-        bottleneck["included_components"] = inc
     par = parsed_rec.runtime.parallel
     full_model_layers = int(parsed_rec.model.layers)
     max_seqs = int(parsed_rec.runtime.max_num_seqs)
@@ -728,6 +761,10 @@ def _evaluate_winner_analysis(
     if win_mtp > 0:
         wf_kw["mtp_acceptance_length"] = float(mtp_accept) if mtp_accept is not None else rec_accept
     if ablate_prs:
+        bottleneck = _extract_bottleneck_roofline(
+            rec_case, prompt_tokens=prompt, sequences=win_seq,
+            tokens=win_tokens, scope=win_scope, phase=win_phase,
+        )
         waterfall = compare_feature_tracks(
             model, hardware=hardware, runtime_stack=runtime_stack,
             phase=win_phase, tokens=win_tokens, context=win_context,
@@ -735,13 +772,19 @@ def _evaluate_winner_analysis(
             **wf_kw,
         )
     else:
+        bottleneck = {}
         waterfall = _compare_feature_tracks_bounded(
             model, hardware=hardware, runtime_stack=runtime_stack,
             phase=win_phase, tokens=win_tokens, context=win_context,
             sequences=win_seq, scope=win_scope, compose_kwargs=wf_kw,
-            precomputed_summaries=precomputed_tracks,
             granted_workers=granted_workers,
+            bottleneck_case=rec_case, bottleneck_out=bottleneck,
         )
+    if isinstance(bottleneck, dict) and bottleneck:
+        inc = dict(bottleneck.get("included_components") or {})
+        inc["target_layers"] = full_model_layers
+        inc["structural_cohorts"] = len(cohort_plan.cohorts)
+        bottleneck["included_components"] = inc
     if isinstance(waterfall, dict):
         waterfall["structural_cohorts"] = len(cohort_plan.cohorts)
         waterfall["full_model_layers"] = full_model_layers

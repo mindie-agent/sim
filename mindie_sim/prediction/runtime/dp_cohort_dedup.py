@@ -20,13 +20,15 @@
 """
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 import dataclasses
 import os
 import re
 from typing import Any
+import weakref
 
 _ENV_TOGGLE = "MINDIE_SIM_DP_DEDUP"
+_ENGINES_REQUIRE_PEER_COLLECTIVES: weakref.WeakSet[Any] = weakref.WeakSet()
 _FALSE_TOKENS = frozenset({"0", "off", "false", "no"})
 _SYMMETRIC_LINK_SEMANTICS = frozenset({"per_pair", "per_port", "fully_connected", "mesh"})
 _PORT_SEMANTICS = frozenset({"per_port", "fully_connected", "mesh"})
@@ -292,13 +294,72 @@ def _rank_topology_profile(topology: Any, engine: Any, ranks: tuple[int, ...]) -
     return tuple(entries)
 
 
+def _dag_reachability_masks(ops: Sequence[Any]) -> tuple[list[int], list[int]]:
+    """Exact ancestor and descendant bitmasks for one replica's op DAG."""
+    n = len(ops)
+    id_to_idx = {op.op_id: idx for idx, op in enumerate(ops)}
+    preds_by_idx: list[list[int]] = [[] for _ in range(n)]
+    succs_by_idx: list[list[int]] = [[] for _ in range(n)]
+    indeg = [0] * n
+    in_order = True
+    for idx, op in enumerate(ops):
+        for dep in op.deps:
+            pred = id_to_idx.get(dep)
+            if pred is None or pred == idx:
+                continue
+            preds_by_idx[idx].append(pred)
+            succs_by_idx[pred].append(idx)
+            indeg[idx] += 1
+            if pred > idx:
+                in_order = False
+    if in_order:
+        order = list(range(n))
+    else:
+        order = [idx for idx in range(n) if indeg[idx] == 0]
+        head = 0
+        while head < len(order):
+            cur = order[head]
+            head += 1
+            for nxt in succs_by_idx[cur]:
+                indeg[nxt] -= 1
+                if indeg[nxt] == 0:
+                    order.append(nxt)
+        if len(order) < n:
+            order = list(range(n))
+    anc = [0] * n
+    for idx in order:
+        bits = 0
+        for pred in preds_by_idx[idx]:
+            bits |= anc[pred] | (1 << pred)
+        anc[idx] = bits
+    desc = [0] * n
+    for idx in reversed(order):
+        d_bits = desc[idx] | (1 << idx)
+        for pred in preds_by_idx[idx]:
+            desc[pred] |= d_bits
+    return anc, desc
+
+
 def _has_unsynced_peer_die_overlap(execution: Any, w0: Any, r0: int) -> bool:
-    """True when multi-stream r0 ops contend asymmetrically with synthesized peer cohorts."""
+    """True when multi-stream r0 ops can genuinely overlap synthesized peer cohorts.
+
+    A multi-stream replica can still deduplicate bit-identically whenever every
+    non-barrier op on another stream in the same PP stage is strictly ordered
+    (ancestor or descendant in the op DAG) with every non-r0-only collective.
+    """
     ops0 = w0.ops
     if len({op.stream for op in ops0}) <= 1:
         return False
     can_r0_only = can_dedup_collective_to_canonical(execution.topology, execution.engine)
-    for op in ops0:
+    stage_non_barrier: dict[int, int] = {}
+    stage_stream_non_barrier: dict[tuple[int, Any], int] = {}
+    candidate_collectives: list[tuple[int, int, Any]] = []
+    for idx, op in enumerate(ops0):
+        if op.family != "barrier":
+            bit = 1 << idx
+            stage_non_barrier[op.stage] = stage_non_barrier.get(op.stage, 0) | bit
+            ss_key = (op.stage, op.stream)
+            stage_stream_non_barrier[ss_key] = stage_stream_non_barrier.get(ss_key, 0) | bit
         meta = op.metadata
         has_mc2_phase = False
         has_group_axis = False
@@ -313,9 +374,43 @@ def _has_unsynced_peer_die_overlap(execution: Any, w0: Any, r0: int) -> bool:
                 elif key == "source_stage" and value is not None:
                     source_stage = int(value)
         is_mc2 = op.family in _NATIVE_MC2_FAMILIES or has_mc2_phase
-        if is_mc2 and len(execution.topology.ranks(r0, source_stage)) > 1:
+        needs_peer_sync = (
+            (is_mc2 and len(execution.topology.ranks(r0, source_stage)) > 1)
+            or (not can_r0_only and (is_mc2 or has_group_axis))
+        )
+        if needs_peer_sync:
+            candidate_collectives.append((idx, source_stage, op.stream))
+    if not candidate_collectives:
+        return False
+    anc, desc = _dag_reachability_masks(ops0)
+    for idx, source_stage, stream in candidate_collectives:
+        other_mask = (
+            stage_non_barrier.get(source_stage, 0)
+            & ~stage_stream_non_barrier.get((source_stage, stream), 0)
+        )
+        if other_mask & ~(anc[idx] | desc[idx] | (1 << idx)):
             return True
-        if not can_r0_only and (is_mc2 or has_group_axis):
+    return False
+
+
+def _has_megamoe_cross_dp_group(ops: Sequence[Any]) -> bool:
+    """Fail-closed on fused MegaMoE ops whose peer RX links require full cohort."""
+    for op in ops:
+        meta = op.metadata
+        if not meta:
+            continue
+        items = meta.items() if isinstance(meta, Mapping) else meta
+        is_megamoe = False
+        has_group_axis = False
+        for key, value in items:
+            if key == "megamoe_geometry" and value:
+                is_megamoe = True
+            elif key == "device_kernel_group" and isinstance(value, Mapping):
+                if value.get("kernel") == "megamoe":
+                    is_megamoe = True
+            elif key == "group_axis" and value is not None:
+                has_group_axis = True
+        if is_megamoe and (has_group_axis or float(getattr(op, "link_bytes", 0.0) or 0.0) > 0.0):
             return True
     return False
 
@@ -353,6 +448,15 @@ def is_symmetric_dp_cohort(
     w0 = works[r0]
     if w0.mode != "graph":
         return False
+    requires_peer_collectives = _has_megamoe_cross_dp_group(w0.ops)
+    try:
+        if requires_peer_collectives:
+            _ENGINES_REQUIRE_PEER_COLLECTIVES.add(engine)
+        else:
+            _ENGINES_REQUIRE_PEER_COLLECTIVES.discard(engine)
+    except TypeError:
+        if requires_peer_collectives:
+            return False
     if _has_unsynced_peer_die_overlap(execution, w0, r0):
         return False
 
@@ -421,6 +525,11 @@ def is_symmetric_native_program(program: Any, peer_count: int) -> bool:
 
 def can_dedup_collective_to_canonical(topology: Any, engine: Any) -> bool:
     """True when all topology links are symmetric full-duplex port/directed-pair."""
+    try:
+        if engine in _ENGINES_REQUIRE_PEER_COLLECTIVES:
+            return False
+    except TypeError:
+        pass
     if getattr(topology, "_shared_switches", None):
         return False
     if getattr(topology, "_link_shared_ports", None):
