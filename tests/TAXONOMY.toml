@@ -729,3 +729,20 @@ owns = [
   "mindie_sim/export/models.py",
   "mindie_sim/prediction/capacity/ledger.py",
 ]
+
+[[module]]
+path = "product/test_stage5a_export_trace_closure.py"
+tier = "tier0"
+owns = [
+  "mindie_sim/export/bundle.py",
+  "mindie_sim/export/comparison.py",
+  "mindie_sim/export/trace_exporter.py",
+  "mindie_sim/export/kernel_catalog.py",
+  "mindie_sim/export/memory_ledger.py",
+  "mindie_sim/export/xlsx_memory.py",
+  "mindie_sim/export/xlsx_pending.py",
+  "mindie_sim/export/action_plan.py",
+  "mindie_sim/export/public_view.py",
+  "mindie_sim/export/models.py",
+  "mindie_sim/cli/report.py",
+]

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 import math
 from typing import Any
 
@@ -64,6 +65,7 @@ from .models import (
     QUANT_RULE_FIXED_FP32,
     QUANT_RULE_FOLLOW_PRESET,
     QUANT_RULE_PRESET_LINEAR_FP8,
+    QUANT_RULE_PRESET_LINEAR_W8A8,
     SUPPORTED_CACHE_DTYPES,
     WEIGHT_QUANT_FORMATS,
     CacheLedgerRow,
@@ -454,114 +456,124 @@ def _add_fixed_cache_stage_values(
         comp_stage_layers[comp_name][st_idx] = max(1, layers_val)
 
 
-def _compute_cache_ledger_rows(
-    case: Case,
-    mem: Memory,
-    alloc_cache: Mapping[str, Any],
-    *,
-    stage_layers: Sequence[int],
-    cache_dtype: str,
-    seq_len: int,
-    concurrency: int,
-    block_size: int,
-    spec_tokens: int,
-) -> tuple[int, tuple[CacheLedgerRow, ...], list[float], list[float]]:
-    """Unify cache ledger rows directly onto ``Memory(case)`` (including Draft KV & page groups)."""
+_CACHE_DTYPE_TO_MODEL_KV: dict[str, str] = {
+    "BF16": "bf16",
+    "C8": "int8",
+    "FP8": "fp8_e4m3",
+    "MXFP8": "mxfp8",
+}
+_A23_HW_FAMILIES = frozenset({"a2", "a3"})
+_MXFP8_KV_TAG = "QK_MXFP8_DYNAMIC_V_MXFP8_PER_CHANNEL"
+
+
+def _case_with_cache_dtype(case: Case, target_dtype: str) -> Case:
+    """Clone ``case`` with canonical KV cache format set to ``target_dtype`` (read-only)."""
+    norm = str(target_dtype or "BF16").strip().upper()
+    kv_raw = _CACHE_DTYPE_TO_MODEL_KV.get(norm, norm.lower())
     model = case.model
-    p = case.runtime.parallel
-    dcp = max(1, int(p.cp))
+    meta = dict(getattr(model, "metadata", ()) or ())
+    meta.pop("kv_cache_tag", None)
+    meta.pop("kv_cache_type", None)
+    raw_reps = meta.get("cache_representations")
+    if isinstance(raw_reps, Mapping):
+        filtered_reps = {k: v for k, v in raw_reps.items() if k not in KV_DTYPE_SENSITIVE_COMPONENTS}
+        if filtered_reps:
+            meta["cache_representations"] = filtered_reps
+        else:
+            meta.pop("cache_representations", None)
+    if norm == "MXFP8":
+        meta["kv_cache_tag"] = _MXFP8_KV_TAG
+    quant = getattr(model, "quant", None)
+    new_quant = replace(quant, kv_dtype=kv_raw) if quant is not None else None
+    new_model = replace(model, kv_dtype=kv_raw, quant=new_quant, metadata=tuple(sorted(meta.items())))
+    return replace(case, model=new_model)
+
+
+def _exact_kv_stage_bytes_for_dtype(
+    case: Case, target_dtype: str, stage_layers: Sequence[int], seq_len: int, spec_tokens: int = 0,
+) -> dict[str, list[float]]:
+    """Evaluate exact per-stage bytes for KV-sensitive components via ``Memory`` or layer cache math."""
     n_stages = len(stage_layers)
-    local_tokens = math.ceil(max(1, seq_len) / (max(1, block_size) * dcp)) * max(1, block_size)
-    layer_stage = [s for s, count in enumerate(stage_layers) for _ in range(count)]
-    comp_stage_bytes: dict[str, list[float]] = defaultdict(lambda: [0.0] * n_stages)
-    comp_stage_layers: dict[str, list[int]] = defaultdict(lambda: [0] * n_stages)
-    comp_scalable: dict[str, bool] = {}
-
-    fixed_state_comps = _FIXED_STATE_CACHE_COMPONENTS
-    # Count active target layers per component so per-token-per-layer rates stay exact.
-    for lp in model.layer_plans:
-        stage = layer_stage[lp.index] if lp.index < len(layer_stage) else 0
-        raw_comps = layer_cache_components(
-            model, lp, p, max(1, seq_len),
-            capacity_padded=True,
-            interleave=INDEX_INTERLEAVE_TOKENS,
-            runtime=case.runtime,
-            query_tokens=max(1, 1 + spec_tokens),
+    alt_case = _case_with_cache_dtype(case, target_dtype)
+    out: dict[str, list[float]] = defaultdict(lambda: [0.0] * n_stages)
+    try:
+        alt_mem = Memory(alt_case)
+    except ModelingError:
+        # Paired-SFA recurrent page constraints may reject a narrower what-if dtype on small blocks;
+        # fall back to canonical layer_cache_components which uses the exact same CacheFormat math.
+        layer_stage = [s for s, count in enumerate(stage_layers) for _ in range(count)]
+        for lp in alt_case.model.layer_plans:
+            st_idx = layer_stage[lp.index] if lp.index < len(layer_stage) else 0
+            raw_comps = layer_cache_components(
+                alt_case.model, lp, alt_case.runtime.parallel, max(1, seq_len),
+                capacity_padded=True, interleave=INDEX_INTERLEAVE_TOKENS,
+                runtime=alt_case.runtime, query_tokens=max(1, 1 + spec_tokens),
+            )
+            for comp_name, val in raw_comps.items():
+                if comp_name in KV_DTYPE_SENSITIVE_COMPONENTS and val > 0.0 and 0 <= st_idx < n_stages:
+                    out[comp_name][st_idx] += float(val)
+        return dict(out)
+    alt_alloc = alt_mem.allocation_report(max(1, seq_len)).get("cache") or {}
+    alt_summary = alt_alloc.get("allocated") or {}
+    alt_reserves = alt_summary.get("reserve_bytes_per_stage_rank") or ()
+    alt_stride = alt_mem._unified_pool_stride_reserve_by_stage(max(1, seq_len))
+    for st_idx in range(n_stages):
+        r_val = (
+            (float(alt_reserves[st_idx] or 0.0) if st_idx < len(alt_reserves) else 0.0)
+            + (float(alt_stride[st_idx] or 0.0) if st_idx < len(alt_stride) else 0.0)
         )
-        for comp_name, val in raw_comps.items():
-            if val > 0.0:
-                comp_stage_layers[comp_name][stage] += 1
-
-    # Read authoritative per-stage component bytes directly from Memory.allocation_report().
-    alloc_summary = alloc_cache.get("allocated") or {}
-    reserves = alloc_summary.get("reserve_bytes_per_stage_rank") or ()
-    metadatas = alloc_summary.get("metadata_bytes_per_stage_rank") or ()
-    comp_entries = alloc_cache.get("components") or ()
-    comp_kv_scaled: dict[str, bool] = {}
+        if r_val > 0.0:
+            out["page_group_reserve"][st_idx] += r_val
+    comp_entries = alt_alloc.get("components") or ()
     for st_idx in range(n_stages):
         entry = comp_entries[st_idx] if st_idx < len(comp_entries) else {}
         for comp_name, detail in (entry.get("allocated") or {}).items():
-            val = float(detail.get("total", 0.0) or 0.0)
-            if val <= 0.0:
-                continue
-            scalable = comp_name not in fixed_state_comps
-            kv_scaled = scalable and (comp_name in KV_DTYPE_SENSITIVE_COMPONENTS)
-            comp_scalable[comp_name] = scalable
-            comp_kv_scaled[comp_name] = kv_scaled
-            ratio = _cache_dtype_override_ratio(model, cache_dtype, component=comp_name) if kv_scaled else 1.0
-            comp_stage_bytes[comp_name][st_idx] += val * ratio
+            if comp_name in KV_DTYPE_SENSITIVE_COMPONENTS:
+                val = float(detail.get("total", 0.0) or 0.0)
+                if val > 0.0:
+                    out[comp_name][st_idx] += val
         for comp_name, detail in (entry.get("group_allocated") or {}).items():
-            val = float(detail.get("alloc_payload", 0.0) or 0.0) + float(detail.get("alloc_scale", 0.0) or 0.0)
-            if val <= 0.0:
-                continue
-            scalable = comp_name not in fixed_state_comps
-            kv_scaled = scalable and (comp_name in KV_DTYPE_SENSITIVE_COMPONENTS)
-            comp_scalable[comp_name] = scalable
-            comp_kv_scaled[comp_name] = kv_scaled
-            ratio = _cache_dtype_override_ratio(model, cache_dtype, component=comp_name) if kv_scaled else 1.0
-            comp_stage_bytes[comp_name][st_idx] += val * ratio
-    _add_fixed_cache_stage_values(
-        "page_group_reserve", reserves, stage_layers,
-        comp_stage_bytes, comp_stage_layers, comp_scalable, comp_kv_scaled,
-    )
-    stride_reserves = mem._unified_pool_stride_reserve_by_stage(max(1, seq_len))
-    _add_fixed_cache_stage_values(
-        "page_group_reserve", stride_reserves, stage_layers,
-        comp_stage_bytes, comp_stage_layers, comp_scalable, comp_kv_scaled,
-    )
-    _add_fixed_cache_stage_values(
-        "page_metadata", metadatas, stage_layers,
-        comp_stage_bytes, comp_stage_layers, comp_scalable, comp_kv_scaled,
-    )
-    if cache_dtype == "C8" and (_GQA_CACHE_COMPONENTS & set(comp_stage_bytes)):
-        c8_static_b, c8_gqa_layers = _gqa_c8_static_scale_bytes_by_stage(case, stage_layers, block_size)
-        amortized_static = [v / float(max(1, concurrency)) for v in c8_static_b]
-        _add_fixed_cache_stage_values(
-            "c8_static_channel_scale", amortized_static, stage_layers,
-            comp_stage_bytes, comp_stage_layers, comp_scalable, comp_kv_scaled,
-            layer_counts=c8_gqa_layers,
-        )
-
-    # Account for DP-cohort DCP amplification when dcp_dp_width > 1 so per-DP cache matches Memory;
-    # the cohort's extra sharded KV bytes take the same cache-dtype width ratio as the local KV.
-    if int(getattr(p, "dcp_dp_width", 1) or 1) > 1:
-        cohort_ratio = _cache_dtype_override_ratio(model, cache_dtype, component="dcp_dp_cohort_kv")
-        cohort_totals = mem.dp_cohort_cache_bytes(max(1, seq_len), padded=True)
-        base_totals = mem.cache_bytes(max(1, seq_len), padded=True)
+            if comp_name in KV_DTYPE_SENSITIVE_COMPONENTS:
+                val = float(detail.get("alloc_payload", 0.0) or 0.0) + float(detail.get("alloc_scale", 0.0) or 0.0)
+                if val > 0.0:
+                    out[comp_name][st_idx] += val
+    if int(getattr(alt_case.runtime.parallel, "dcp_dp_width", 1) or 1) > 1:
+        cohort_totals = alt_mem.dp_cohort_cache_bytes(max(1, seq_len), padded=True)
+        base_totals = alt_mem.cache_bytes(max(1, seq_len), padded=True)
         for st_idx in range(min(n_stages, len(cohort_totals), len(base_totals))):
-            extra = (float(cohort_totals[st_idx]) - float(base_totals[st_idx])) * cohort_ratio
+            extra = float(cohort_totals[st_idx]) - float(base_totals[st_idx])
             if extra > MIN_DENOM_EPS:
-                comp_scalable["dcp_dp_cohort_kv"] = True
-                comp_kv_scaled["dcp_dp_cohort_kv"] = True
-                comp_stage_bytes["dcp_dp_cohort_kv"][st_idx] += extra
-                comp_stage_layers["dcp_dp_cohort_kv"][st_idx] = max(1, int(stage_layers[st_idx]))
+                out["dcp_dp_cohort_kv"][st_idx] += extra
+    return dict(out)
 
-    if "draft_kv" in comp_stage_bytes and sum(comp_stage_layers["draft_kv"]) == 0:
-        aux = getattr(model, "auxiliary", None)
-        draft_obj = getattr(aux, mem.draft_kind, None) if (aux is not None and mem.draft_kind) else None
-        draft_layers = max(1, int(getattr(draft_obj, "layers", 1) or 1))
-        comp_stage_layers["draft_kv"][-1] = draft_layers
 
+def _hw_cache_dtype_options(case: Case, active_dtype: str) -> tuple[str, ...]:
+    hw_fam = normalize_hw_family(str(case.machine.sku or case.machine.name or "a5"))
+    if hw_fam in _A23_HW_FAMILIES:
+        opts = ["BF16", "C8"]
+    elif hw_fam == "a5":
+        opts = ["BF16", "FP8"]
+    else:
+        opts = list(SUPPORTED_CACHE_DTYPES)
+    norm_active = str(active_dtype or "BF16").strip().upper()
+    if norm_active and norm_active not in opts:
+        opts.append(norm_active)
+    return tuple(opts)
+
+
+def _build_cache_ledger_row_list(
+    *,
+    model: Any,
+    comp_stage_bytes: Mapping[str, list[float]],
+    comp_stage_layers: Mapping[str, list[int]],
+    comp_scalable: Mapping[str, bool],
+    comp_kv_scaled: Mapping[str, bool],
+    per_dtype_stage_bytes: Mapping[str, Mapping[str, list[float]]],
+    n_stages: int,
+    local_tokens: int,
+    concurrency: int,
+    cache_dtype: str,
+) -> tuple[tuple[CacheLedgerRow, ...], list[float], list[float]]:
     stage_per_req_totals = [0.0] * n_stages
     stage_totals = [0.0] * n_stages
     rows: list[CacheLedgerRow] = []
@@ -573,10 +585,24 @@ def _compute_cache_ledger_rows(
         max_req_bytes = max(per_stage, default=0.0)
         scalable = comp_scalable.get(comp_name, True) and (max_layers > 0)
         kv_scaled = comp_kv_scaled.get(comp_name, False) and scalable
-        b_per_tok = (
-            max_req_bytes / float(max(1, max_layers * local_tokens))
-            if scalable else 0.0
-        )
+        denom = float(max(1, max_layers * local_tokens))
+        b_per_tok = (max_req_bytes / denom) if scalable else 0.0
+        rates_by_dt: tuple[tuple[str, float], ...] = ()
+        req_by_dt: tuple[tuple[str, float], ...] = ()
+        if kv_scaled and per_dtype_stage_bytes:
+            rates_by_dt = tuple(
+                (dt_opt, max(opt_map[comp_name], default=0.0) / denom)
+                for dt_opt, opt_map in per_dtype_stage_bytes.items()
+                if comp_name in opt_map
+            )
+        elif comp_name == "page_group_reserve" and per_dtype_stage_bytes:
+            cand_reqs = tuple(
+                (dt_opt, max(opt_map[comp_name], default=0.0))
+                for dt_opt, opt_map in per_dtype_stage_bytes.items()
+                if comp_name in opt_map
+            )
+            if len({round(v, 2) for _, v in cand_reqs}) > 1:
+                req_by_dt = cand_reqs
         for st_idx, st_val in enumerate(per_stage):
             if comp_name != "c8_static_channel_scale":
                 stage_per_req_totals[st_idx] += st_val
@@ -601,8 +627,161 @@ def _compute_cache_ledger_rows(
             batch_total_bytes=max_req_bytes * float(concurrency),
             scales_with_tokens=scalable,
             per_stage_bytes=tuple(float(v) for v in per_stage),
+            bytes_per_token_by_dtype=rates_by_dt,
+            per_request_bytes_by_dtype=req_by_dt,
         ))
-    return local_tokens, tuple(rows), stage_totals, stage_per_req_totals
+    return tuple(rows), stage_totals, stage_per_req_totals
+
+
+def _accumulate_alloc_cache_components(
+    model: Any,
+    comp_entries: Sequence[Mapping[str, Any]],
+    *,
+    n_stages: int,
+    cache_dtype: str,
+    exact_override_stage_bytes: Mapping[str, list[float]],
+    comp_stage_bytes: dict[str, list[float]],
+    comp_scalable: dict[str, bool],
+    comp_kv_scaled: dict[str, bool],
+) -> None:
+    fixed_state_comps = _FIXED_STATE_CACHE_COMPONENTS
+    used_exact_override: set[str] = set()
+    for st_idx in range(n_stages):
+        entry = comp_entries[st_idx] if st_idx < len(comp_entries) else {}
+        for section, is_group in (("allocated", False), ("group_allocated", True)):
+            for comp_name, detail in (entry.get(section) or {}).items():
+                val = (
+                    float(detail.get("alloc_payload", 0.0) or 0.0) + float(detail.get("alloc_scale", 0.0) or 0.0)
+                    if is_group else float(detail.get("total", 0.0) or 0.0)
+                )
+                if val <= 0.0:
+                    continue
+                scalable = comp_name not in fixed_state_comps
+                kv_scaled = scalable and (comp_name in KV_DTYPE_SENSITIVE_COMPONENTS)
+                comp_scalable[comp_name] = scalable
+                comp_kv_scaled[comp_name] = kv_scaled
+                if kv_scaled and comp_name in exact_override_stage_bytes:
+                    used_exact_override.add(comp_name)
+                else:
+                    ratio = _cache_dtype_override_ratio(model, cache_dtype, component=comp_name) if kv_scaled else 1.0
+                    comp_stage_bytes[comp_name][st_idx] += val * ratio
+    for comp_name in used_exact_override:
+        comp_stage_bytes[comp_name] = list(exact_override_stage_bytes[comp_name])
+
+
+def _compute_cache_ledger_rows(
+    case: Case,
+    mem: Memory,
+    alloc_cache: Mapping[str, Any],
+    *,
+    stage_layers: Sequence[int],
+    cache_dtype: str,
+    seq_len: int,
+    concurrency: int,
+    block_size: int,
+    spec_tokens: int,
+) -> tuple[int, tuple[CacheLedgerRow, ...], list[float], list[float]]:
+    """Unify cache ledger rows directly onto ``Memory(case)`` (including Draft KV & page groups)."""
+    model = case.model
+    p = case.runtime.parallel
+    dcp = max(1, int(p.cp))
+    n_stages = len(stage_layers)
+    local_tokens = math.ceil(max(1, seq_len) / (max(1, block_size) * dcp)) * max(1, block_size)
+    layer_stage = [s for s, count in enumerate(stage_layers) for _ in range(count)]
+    comp_stage_bytes: dict[str, list[float]] = defaultdict(lambda: [0.0] * n_stages)
+    comp_stage_layers: dict[str, list[int]] = defaultdict(lambda: [0] * n_stages)
+    comp_scalable: dict[str, bool] = {}
+
+    for lp in model.layer_plans:
+        stage = layer_stage[lp.index] if lp.index < len(layer_stage) else 0
+        raw_comps = layer_cache_components(
+            model, lp, p, max(1, seq_len),
+            capacity_padded=True,
+            interleave=INDEX_INTERLEAVE_TOKENS,
+            runtime=case.runtime,
+            query_tokens=max(1, 1 + spec_tokens),
+        )
+        for comp_name, val in raw_comps.items():
+            if val > 0.0:
+                comp_stage_layers[comp_name][stage] += 1
+
+    base_cache_dtype = _normalize_cache_dtype(model)
+    exact_override_stage_bytes = (
+        _exact_kv_stage_bytes_for_dtype(case, cache_dtype, stage_layers, seq_len, spec_tokens)
+        if cache_dtype != base_cache_dtype else {}
+    )
+    alloc_summary = alloc_cache.get("allocated") or {}
+    reserves = alloc_summary.get("reserve_bytes_per_stage_rank") or ()
+    metadatas = alloc_summary.get("metadata_bytes_per_stage_rank") or ()
+    comp_kv_scaled: dict[str, bool] = {}
+    _accumulate_alloc_cache_components(
+        model, alloc_cache.get("components") or (), n_stages=n_stages, cache_dtype=cache_dtype,
+        exact_override_stage_bytes=exact_override_stage_bytes,
+        comp_stage_bytes=comp_stage_bytes, comp_scalable=comp_scalable, comp_kv_scaled=comp_kv_scaled,
+    )
+    _add_fixed_cache_stage_values(
+        "page_group_reserve", reserves, stage_layers,
+        comp_stage_bytes, comp_stage_layers, comp_scalable, comp_kv_scaled,
+    )
+    stride_reserves = mem._unified_pool_stride_reserve_by_stage(max(1, seq_len))
+    _add_fixed_cache_stage_values(
+        "page_group_reserve", stride_reserves, stage_layers,
+        comp_stage_bytes, comp_stage_layers, comp_scalable, comp_kv_scaled,
+    )
+    _add_fixed_cache_stage_values(
+        "page_metadata", metadatas, stage_layers,
+        comp_stage_bytes, comp_stage_layers, comp_scalable, comp_kv_scaled,
+    )
+    if cache_dtype == "C8" and (_GQA_CACHE_COMPONENTS & set(comp_stage_bytes)):
+        c8_static_b, c8_gqa_layers = _gqa_c8_static_scale_bytes_by_stage(case, stage_layers, block_size)
+        amortized_static = [v / float(max(1, concurrency)) for v in c8_static_b]
+        _add_fixed_cache_stage_values(
+            "c8_static_channel_scale", amortized_static, stage_layers,
+            comp_stage_bytes, comp_stage_layers, comp_scalable, comp_kv_scaled,
+            layer_counts=c8_gqa_layers,
+        )
+
+    if int(getattr(p, "dcp_dp_width", 1) or 1) > 1:
+        if "dcp_dp_cohort_kv" in exact_override_stage_bytes:
+            extras: Sequence[float] = exact_override_stage_bytes["dcp_dp_cohort_kv"]
+        else:
+            cohort_ratio = _cache_dtype_override_ratio(model, cache_dtype, component="dcp_dp_cohort_kv")
+            cohort_totals = mem.dp_cohort_cache_bytes(max(1, seq_len), padded=True)
+            base_totals = mem.cache_bytes(max(1, seq_len), padded=True)
+            extras = [
+                (float(cohort_totals[st]) - float(base_totals[st])) * cohort_ratio
+                for st in range(min(n_stages, len(cohort_totals), len(base_totals)))
+            ]
+        for st_idx, extra in enumerate(extras):
+            if extra > MIN_DENOM_EPS:
+                comp_scalable["dcp_dp_cohort_kv"] = True
+                comp_kv_scaled["dcp_dp_cohort_kv"] = True
+                comp_stage_bytes["dcp_dp_cohort_kv"][st_idx] += extra
+                comp_stage_layers["dcp_dp_cohort_kv"][st_idx] = max(1, int(stage_layers[st_idx]))
+
+    if "draft_kv" in comp_stage_bytes and sum(comp_stage_layers["draft_kv"]) == 0:
+        aux = getattr(model, "auxiliary", None)
+        draft_obj = getattr(aux, mem.draft_kind, None) if (aux is not None and mem.draft_kind) else None
+        draft_layers = max(1, int(getattr(draft_obj, "layers", 1) or 1))
+        comp_stage_layers["draft_kv"][-1] = draft_layers
+
+    kv_scaled_comps = {c for c, flag in comp_kv_scaled.items() if flag}
+    per_dtype_stage_bytes: dict[str, dict[str, list[float]]] = {}
+    if kv_scaled_comps:
+        tracked_comps = kv_scaled_comps | ({"page_group_reserve"} if "page_group_reserve" in comp_stage_bytes else set())
+        for dt_opt in _hw_cache_dtype_options(case, cache_dtype):
+            if dt_opt == cache_dtype:
+                per_dtype_stage_bytes[dt_opt] = {c: list(comp_stage_bytes[c]) for c in tracked_comps if c in comp_stage_bytes}
+            else:
+                per_dtype_stage_bytes[dt_opt] = _exact_kv_stage_bytes_for_dtype(case, dt_opt, stage_layers, seq_len, spec_tokens)
+
+    rows, stage_totals, stage_per_req_totals = _build_cache_ledger_row_list(
+        model=model, comp_stage_bytes=comp_stage_bytes, comp_stage_layers=comp_stage_layers,
+        comp_scalable=comp_scalable, comp_kv_scaled=comp_kv_scaled,
+        per_dtype_stage_bytes=per_dtype_stage_bytes, n_stages=n_stages,
+        local_tokens=local_tokens, concurrency=concurrency, cache_dtype=cache_dtype,
+    )
+    return local_tokens, rows, stage_totals, stage_per_req_totals
 
 
 def _is_vision_term(term: WeightTerm) -> bool:
@@ -629,10 +808,15 @@ def _resolve_term_quant_format(
     explicit_override: bool,
     apply_preset_to_ignored: bool = False,
     checkpoint: NpuCheckpointSpec | None = None,
+    hw_family: str = "",
 ) -> tuple[str, bool, str, str]:
     cat = str(term.category or "")
     fam = cat.split(".", 1)[0]
     term_quant = term.runtime_quant or term.quant or model_quant
+    linear_rule = (
+        QUANT_RULE_PRESET_LINEAR_W8A8
+        if hw_family in _A23_HW_FAMILIES else QUANT_RULE_PRESET_LINEAR_FP8
+    )
     if not explicit_override and not apply_preset_to_ignored and term.runtime_dtype:
         rt_fmt = _QUANT_FORMAT_DISPLAY.get(str(term.runtime_dtype).strip().lower(), "BF16")
         rt_rule = QUANT_RULE_FIXED_FP32 if rt_fmt == "FP32" else QUANT_RULE_FIXED_BF16
@@ -685,7 +869,7 @@ def _resolve_term_quant_format(
                             else ("W4A8_DYNAMIC (INT4 Packed Expert)" if mapped == "W4A8"
                                   else ("W8A8_DYNAMIC (INT8 Linear)" if mapped == "W8A8" else mapped))))
             )
-            rule = QUANT_RULE_FOLLOW_PRESET if (is_mxfp4_expert or is_w4_expert) else QUANT_RULE_PRESET_LINEAR_FP8
+            rule = QUANT_RULE_FOLLOW_PRESET if (is_mxfp4_expert or is_w4_expert) else linear_rule
             return mapped, (mapped == "BF16"), note, rule
     elif checkpoint is not None and not explicit_override:
         wt_q = classify_weight_tensor_quant(term.name, checkpoint)
@@ -694,14 +878,14 @@ def _resolve_term_quant_format(
             rule = (
                 QUANT_RULE_CHECKPOINT_IGNORE
                 if not wt_q.is_quantized
-                else (QUANT_RULE_FOLLOW_PRESET if (is_mxfp4_expert or is_w4_expert) else QUANT_RULE_PRESET_LINEAR_FP8)
+                else (QUANT_RULE_FOLLOW_PRESET if (is_mxfp4_expert or is_w4_expert) else linear_rule)
             )
             return mapped, (not wt_q.is_quantized), f"{checkpoint.repo_id} ({wt_q.raw_tag})", rule
 
     if resolved_wq == "W4A8" and not is_w4_expert:
-        return "W8A8", False, "W8A8_DYNAMIC (INT8 Linear under W4A8)", QUANT_RULE_PRESET_LINEAR_FP8
+        return "W8A8", False, "W8A8_DYNAMIC (INT8 Linear under W4A8)", linear_rule
     if resolved_wq == "MXFP4" and not is_mxfp4_expert and explicit_override:
-        return "MXFP8", False, "MXFP8 Linear under MXFP4", QUANT_RULE_PRESET_LINEAR_FP8
+        return "MXFP8", False, "MXFP8 Linear under MXFP4", linear_rule
     note = (
         "MXFP4 (group=32)" if resolved_wq == "MXFP4"
         else ("MXFP8 (group=32 E8M0)" if resolved_wq == "MXFP8"
@@ -709,7 +893,7 @@ def _resolve_term_quant_format(
                     else ("W4A8_DYNAMIC (INT4 Packed Expert)" if resolved_wq == "W4A8"
                           else ("W8A8_DYNAMIC (INT8)" if resolved_wq == "W8A8" else resolved_wq))))
     )
-    rule = QUANT_RULE_FOLLOW_PRESET if (is_mxfp4_expert or is_w4_expert) else QUANT_RULE_PRESET_LINEAR_FP8
+    rule = QUANT_RULE_FOLLOW_PRESET if (is_mxfp4_expert or is_w4_expert) else linear_rule
     return resolved_wq, (resolved_wq == "BF16"), note, rule
 
 
@@ -915,6 +1099,7 @@ def _collect_weight_ledger_rows(
                     explicit_override=explicit_override,
                     apply_preset_to_ignored=apply_preset_to_ignored,
                     checkpoint=default_ckpt,
+                    hw_family=hw_fam,
                 )
                 if use_canonical_bytes:
                     payload_1, scale_1, aux_1, total_1 = _price_evaluated_term(

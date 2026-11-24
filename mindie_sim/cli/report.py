@@ -403,6 +403,7 @@ def _solved_column_inputs(
     layout: Mapping[str, Any], *, model: str, sku: str, runtime_stack: str | None,
     feature_track: str, phase: str, prompt_tokens: int, output_tokens: int,
     compose_kw: Mapping[str, Any], deployment_mode: str,
+    spec_tokens: int | None = None, accept_len: float | None = None,
 ) -> tuple[dict[str, Any], StepRequest, dict[str, Any]]:
     from mindie_sim.solve import _bundle_inputs_for_solution
 
@@ -412,7 +413,13 @@ def _solved_column_inputs(
         prompt_tokens=prompt_tokens, output_tokens=output_tokens, scope="model", phase=phase,
     )
     rt = dict(raw.get("runtime") or {})
-    rt["metadata"] = {**dict(rt.get("metadata") or {}), "deployment_mode": deployment_mode}
+    rt_meta = {**dict(rt.get("metadata") or {}), "deployment_mode": deployment_mode}
+    if spec_tokens is not None and int(spec_tokens) > 0:
+        rt_meta.setdefault("draft_proposal_tokens", int(spec_tokens))
+    if accept_len is not None and float(accept_len) > 0.0:
+        rt.setdefault("mtp_acceptance_length", float(accept_len))
+        rt_meta.setdefault("mtp_acceptance_length", float(accept_len))
+    rt["metadata"] = rt_meta
     raw["runtime"] = rt
     if deployment_mode == "pd_decode":
         slo = dict(raw.get("slo") or {})
@@ -430,19 +437,29 @@ def _report_column(
     prompt_tokens, output_tokens = int(common_kw["prompt_tokens"]), int(common_kw["output_tokens"])
     dep_mode = str(common_kw["deployment_mode"])
     runtime_stack = common_kw.get("runtime_stack")
-    if layout is not None and layout.get("solved") is not None:
+    if layout is not None and layout.get("solver_feasible", True) and layout.get("solved") is not None:
         compose_kw = dict(
             quant=quant, kv_cache_dtype=kv, indexer_kv_dtype=idx_kv,
             topology_preset=common_kw.get("topology_preset"),
             prompt_tokens=prompt_tokens, output_tokens=output_tokens,
             tpot_slo_ms=common_kw.get("tpot_slo_ms"),
             ttft_slo_ms=common_kw.get("ttft_slo_ms"),
+            mtp_proposal_tokens=(
+                int(spec_tokens) if spec_tokens is not None
+                else int(common_kw.get("mtp_proposal_tokens", 0) or 0)
+            ),
+            mtp_acceptance_length=(
+                float(accept_len) if accept_len is not None
+                else float(common_kw.get("mtp_acceptance_length", 1.0) or 1.0)
+            ),
         )
         raw, step, meta = _solved_column_inputs(
             layout, model=model, sku=sku, runtime_stack=runtime_stack,
             feature_track=track, phase=phase, prompt_tokens=prompt_tokens,
             output_tokens=output_tokens,
             compose_kw=compose_kw, deployment_mode=dep_mode,
+            spec_tokens=compose_kw["mtp_proposal_tokens"],
+            accept_len=compose_kw["mtp_acceptance_length"],
         )
         return raw, step, {
             "handoff_tpot_ms": meta.get("handoff_tpot_ms"),
@@ -455,7 +472,7 @@ def _report_column(
     if accept_len is not None:
         col_kw["mtp_acceptance_length"] = float(accept_len)
     raw, req = compose_export_case(
-        model, sku, feature_track=track, concurrency=conc,
+        model, sku, feature_track=track, concurrency=max(1, int(conc)),
         quant=quant, kv_cache_dtype=kv, indexer_kv_dtype=idx_kv, **dict(par), **col_kw,
     )
     step = StepRequest(
@@ -520,10 +537,10 @@ def add_report_commands(subparsers) -> None:
     rep.add_argument("--prompt-tokens", "--context", dest="prompt_tokens", type=parse_token_shorthand, default=None)
     rep.add_argument("--output-tokens", type=parse_token_shorthand, default=DEFAULT_SCENARIO_OUTPUT_TOKENS)
     rep.add_argument("--concurrency", type=int, default=None, help="sequences per DP replica (auto-solved when omitted)")
-    rep.add_argument("--tpot-ms", type=float, default=DEFAULT_TPOT_SLO_MS)
-    rep.add_argument("--ttft-ms", type=float, default=None)
-    rep.add_argument("--spec-tokens", "--mtp", dest="spec_tokens", type=int, default=None)
-    rep.add_argument("--accept-len", type=float, default=None)
+    rep.add_argument("--tpot-ms", "--tpot-slo-ms", dest="tpot_ms", type=float, default=DEFAULT_TPOT_SLO_MS)
+    rep.add_argument("--ttft-ms", "--ttft-slo-ms", dest="ttft_ms", type=float, default=None)
+    rep.add_argument("--spec-tokens", "--mtp", "--mtp-tokens", dest="spec_tokens", type=int, default=None)
+    rep.add_argument("--accept-len", "--mtp-accept", dest="accept_len", type=float, default=None)
     rep.add_argument("--mode", choices=(MODE_MODELING, MODE_SIMULATION), default=MODE_MODELING)
     rep.add_argument("--compare-track", default="merged", help="Before track (default: merged)")
     rep.add_argument("--target-track", default="expected_ideal", help="After track (default: expected_ideal)")

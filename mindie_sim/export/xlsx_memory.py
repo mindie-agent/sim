@@ -30,6 +30,7 @@ from .models import (
     QUANT_RULE_FIXED_BF16,
     QUANT_RULE_FIXED_FP32,
     QUANT_RULE_PRESET_LINEAR_FP8,
+    QUANT_RULE_PRESET_LINEAR_W8A8,
     SUPPORTED_CACHE_DTYPES,
     SUPPORTED_WEIGHT_QUANTS,
     WEIGHT_QUANT_FORMATS,
@@ -225,7 +226,7 @@ def _quant_format_formula(quant_rule: str, eval_fmt: str, arch: str) -> str | No
         linear_expr = f'IF({MEM_CTL_QUANT_REF}="W4A8","W8A8",{MEM_CTL_QUANT_REF})'
     else:
         linear_expr = f'IF({MEM_CTL_QUANT_REF}="W4A8","W8A8",IF({MEM_CTL_QUANT_REF}="MXFP4","MXFP8",{MEM_CTL_QUANT_REF}))'
-    if quant_rule == QUANT_RULE_PRESET_LINEAR_FP8:
+    if quant_rule in {QUANT_RULE_PRESET_LINEAR_FP8, QUANT_RULE_PRESET_LINEAR_W8A8}:
         what_if_expr = linear_expr
     elif quant_rule == QUANT_RULE_CHECKPOINT_IGNORE:
         what_if_expr = f'IF({MEM_CTL_OVERRIDE_IGN_REF}="ON",{linear_expr},"BF16")'
@@ -243,8 +244,46 @@ def _cache_width_factor(dtype_name: str) -> float:
     return C8_CACHE_FACTOR
 
 
+def _cache_rate_formula(row: Any, mem_cache_dtype: str, c_opts: Sequence[str], arch: str) -> str:
+    """Build hardware-scoped exact bytes/tok/layer formula matching ``ResidentMemoryReceipt``."""
+    rates_map = dict(getattr(row, "bytes_per_token_by_dtype", ()) or ())
+    scoped_opts = [opt for opt in c_opts if opt in rates_map]
+    if scoped_opts:
+        ordered = (["BF16"] if "BF16" in scoped_opts else []) + [o for o in scoped_opts if o != "BF16"]
+        if len(ordered) == 1:
+            return f"={rates_map[ordered[0]]!r}"
+        expr = f"{rates_map[ordered[-1]]!r}"
+        for opt in reversed(ordered[:-1]):
+            expr = f'IF({MEM_CTL_CACHE_REF}="{opt}",{rates_map[opt]!r},{expr})'
+        return f"={expr}"
+    base_width = _cache_width_factor(mem_cache_dtype)
+    if arch == "a23":
+        live_width = f'IF({MEM_CTL_CACHE_REF}="BF16",{BF16_BYTES},{C8_CACHE_FACTOR!r})'
+    elif arch == "a5":
+        live_width = f'IF({MEM_CTL_CACHE_REF}="BF16",{BF16_BYTES},{FP8_CACHE_FACTOR!r})'
+    else:
+        live_width = (
+            f'IF({MEM_CTL_CACHE_REF}="BF16",{BF16_BYTES},'
+            f'IF({MEM_CTL_CACHE_REF}="FP8",{FP8_CACHE_FACTOR!r},{C8_CACHE_FACTOR!r}))'
+        )
+    return f"={row.bytes_per_token_per_layer!r}*{live_width}/{base_width!r}"
+
+
+def _cache_fixed_req_mib_formula(row: Any, c_opts: Sequence[str]) -> str | None:
+    """Build hardware-scoped per-request MiB formula for KV-dtype-dependent page-group reserves."""
+    reqs_map = dict(getattr(row, "per_request_bytes_by_dtype", ()) or ())
+    scoped_opts = [opt for opt in c_opts if opt in reqs_map]
+    if len(scoped_opts) < 2:
+        return None
+    ordered = (["BF16"] if "BF16" in scoped_opts else []) + [o for o in scoped_opts if o != "BF16"]
+    expr = f"{reqs_map[ordered[-1]] / float(MIB_BYTES)!r}"
+    for opt in reversed(ordered[:-1]):
+        expr = f'IF({MEM_CTL_CACHE_REF}="{opt}",{reqs_map[opt] / float(MIB_BYTES)!r},{expr})'
+    return f"={expr}"
+
+
 def _populate_cache_block(
-    ws: Worksheet, start_row: int, mem: MemoryCalculatorLedger, c_opts: Sequence[str],
+    ws: Worksheet, start_row: int, mem: MemoryCalculatorLedger, c_opts: Sequence[str], arch: str,
 ) -> int:
     ws.set_cell(start_row, 1, "2. KV / Indexer / KeyPool / Recurrent State Cache Breakdown", style=STYLE_SECTION)
     ws.merge_range(start_row, 1, start_row, MEMORY_TABLE_END_COL)
@@ -257,18 +296,13 @@ def _populate_cache_block(
     ws.merge_range(hdr_row, MEMORY_CACHE_BASIS_START_COL, hdr_row, MEMORY_TABLE_END_COL)
 
     c_start = hdr_row + 1
-    base_width = _cache_width_factor(mem.cache_dtype)
-    live_width = (
-        f'IF({MEM_CTL_CACHE_REF}="BF16",{BF16_BYTES},'
-        f'IF({MEM_CTL_CACHE_REF}="FP8",{FP8_CACHE_FACTOR!r},{C8_CACHE_FACTOR!r}))'
-    )
     opts_txt = "/".join(c_opts)
     for offset, row in enumerate(mem.cache_rows):
         r = c_start + offset
         kv_scaled = row.component in KV_DTYPE_SENSITIVE_COMPONENTS
         if row.scales_with_tokens and row.max_stage_layers > 0 and row.bytes_per_token_per_layer > 0.0:
             if kv_scaled:
-                rate_formula: str | None = f"={row.bytes_per_token_per_layer!r}*{live_width}/{base_width!r}"
+                rate_formula: str | None = _cache_rate_formula(row, mem.cache_dtype, c_opts, arch)
                 basis = f"Scales with Local Cache Tokens & KV Dtype ({opts_txt}, active={mem.cache_dtype})"
             else:
                 rate_formula = None
@@ -276,8 +310,11 @@ def _populate_cache_block(
             req_formula: str | None = f"=C{r}*D{r}*{MEM_CTL_LOCAL_TOK_REF}/{MIB_BYTES}"
         else:
             rate_formula = None
-            req_formula = None
-            basis = "Fixed per-request state buffer (non-token-scaled)"
+            req_formula = _cache_fixed_req_mib_formula(row, c_opts)
+            basis = (
+                f"Page-group reserve scaled with KV Dtype ({opts_txt}, active={mem.cache_dtype})"
+                if req_formula else "Fixed per-request state buffer (non-token-scaled)"
+            )
         write_row(ws, r, (
             (row.component, None, STYLE_TEXT), (row.cache_kind, None, STYLE_TEXT),
             (row.max_stage_layers, None, STYLE_INT), (row.bytes_per_token_per_layer, rate_formula, STYLE_FLOAT2),
@@ -520,12 +557,17 @@ def populate_memory_sheet(ws: Worksheet, bundle: ExportBundle) -> None:
             scale_formula = f'=IF({MEM_CTL_QUANT_REF}="{QUANT_MODE_AS_EVALUATED}",{int(row.scale_bytes)},{vlookup_s})'
             aux_formula = f'=IF({MEM_CTL_QUANT_REF}="{QUANT_MODE_AS_EVALUATED}",{int(row.aux_bytes)},{vlookup_a})'
         native_gib = float(row.native_bf16_bytes) / float(GIB_BYTES)
+        display_rule = (
+            QUANT_RULE_PRESET_LINEAR_W8A8
+            if (arch == "a23" and row.quant_rule == QUANT_RULE_PRESET_LINEAR_FP8)
+            else row.quant_rule
+        )
         write_row(ws, r, (
             (row.name, None, STYLE_TEXT), (row.global_rows, None, STYLE_INT),
             (row.global_cols, None, STYLE_INT), (row.shard_rule, None, STYLE_TEXT),
             (row.local_rows, None, STYLE_INT), (row.local_cols, None, STYLE_INT),
             (row.peak_stage_repeats, None, STYLE_INT),
-            (row.quant_rule, None, STYLE_TEXT),
+            (display_rule, None, STYLE_TEXT),
             (row.quant_format, q_formula, STYLE_INPUT_TEXT if q_formula else STYLE_TEXT),
             (row.payload_bytes, payload_formula, STYLE_INT),
             (row.scale_bytes, scale_formula, STYLE_INT),
@@ -580,7 +622,7 @@ def populate_memory_sheet(ws: Worksheet, bundle: ExportBundle) -> None:
         "切 T7=ON 可计入多模态显存", STYLE_SUBTOTAL_TEXT, STYLE_SUBTOTAL_NUM,
     )
 
-    cache_end = _populate_cache_block(ws, w_tot_vit + 2, mem, c_opts)
+    cache_end = _populate_cache_block(ws, w_tot_vit + 2, mem, c_opts, arch)
     _populate_stage_budget_block(
         ws, cache_end + 2, mem,
         cache_tot_row=cache_end, weight_start_row=w_start, lookup_ref=lookup_ref,

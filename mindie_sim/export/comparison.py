@@ -565,6 +565,8 @@ def _reaggregate_slice_ops(
     bundle: ExportBundle,
     ops: Sequence[OperatorExportRow],
     idxs: Sequence[int],
+    *,
+    full_arch_len: int = 0,
 ) -> tuple[OperatorExportRow, ...]:
     """Reaggregate depth-varying slice operators over their actual physical layer indices."""
     per_layer = getattr(bundle, "per_layer_timings", None)
@@ -578,6 +580,7 @@ def _reaggregate_slice_ops(
         durs: list[float] = []
         exps: list[float] = []
         lstars: list[float] = []
+        matched_idxs: list[int] = []
         block_size = 0
         for lyr in ordered_idxs:
             rec = per_layer.get((op.model_scope, lyr))
@@ -588,6 +591,7 @@ def _reaggregate_slice_ops(
                 continue
             d_val = float(ops_map[site][1])
             durs.append(d_val)
+            matched_idxs.append(lyr)
             exps_map = rec.get("ops_exposed")
             if isinstance(exps_map, Mapping) and site in exps_map:
                 exps.append(float(exps_map[site]))
@@ -601,10 +605,16 @@ def _reaggregate_slice_ops(
             bs = int(rec.get("residual_block_size", 0) or 0)
             if bs > 0:
                 block_size = bs
-        if len(durs) != cnt:
-            reagg.append(op)
+        if not durs:
+            if full_arch_len > 0 and int(op.repeat_count) < full_arch_len:
+                continue
+            reagg.append(replace(op, repeat_count=cnt) if int(op.repeat_count) > cnt else op)
             continue
-        inv = 1.0 / float(cnt)
+        eff_cnt = len(durs)
+        if eff_cnt != cnt and not (full_arch_len > 0 and int(op.repeat_count) < full_arch_len):
+            reagg.append(replace(op, repeat_count=cnt) if int(op.repeat_count) > cnt else op)
+            continue
+        inv = 1.0 / float(eff_cnt)
         mean_dur = sum(durs) * inv
         mean_exp = sum(exps) * inv
         mean_lstar = sum(lstars) * inv
@@ -612,7 +622,7 @@ def _reaggregate_slice_ops(
         eff = min(1.0, mean_lstar / mean_dur) if (mean_dur > 0.0 and mean_lstar > 0.0) else None
         base_contract = _DEPTH_NOTE_STRIP_RE.sub("", op.tensor_contract or "").strip(" |")
         depth_note = format_attnres_depth_note(
-            op.op_id, ordered_idxs, durs, block_size,
+            op.op_id, matched_idxs, durs, block_size,
             total_target_layers=int(getattr(bundle, "total_target_layers", 0) or 0),
             family=op.family,
         )
@@ -623,7 +633,7 @@ def _reaggregate_slice_ops(
         )
         reagg.append(replace(
             op,
-            repeat_count=cnt,
+            repeat_count=eff_cnt,
             end_us=op.start_us + mean_dur,
             dur_us=mean_dur,
             exposed_dur_us=0.0 if fully_hidden else mean_exp,
@@ -635,6 +645,15 @@ def _reaggregate_slice_ops(
             tensor_contract=new_contract,
         ))
     return tuple(reagg)
+
+
+def _strip_trailing_repeat_tag(raw_title: str) -> str:
+    """Strip trailing ``(×N, ...)`` tag including nested parenthesized counts like ``(55L)``."""
+    trimmed = raw_title.strip()
+    marker = " (×"
+    if trimmed.endswith(")") and marker in trimmed:
+        return trimmed[:trimmed.rfind(marker)].strip()
+    return re.sub(r"\s*\(×\d+[^)]*\)\s*$", "", trimmed).strip()
 
 
 def _format_slice_layer_range(indices: Sequence[int]) -> str:
@@ -660,11 +679,11 @@ def _index_target_layer_archetypes(
         handled_aids.add(arch.archetype_id)
         distinct_layers = {int(o.layer) for o in ops if o.layer is not None}
         max_rep = max((int(o.repeat_count) for o in ops), default=0)
-        if (
-            len(distinct_layers) <= 1
-            and max_rep == len(arch.layer_indices)
-            and all(1 <= int(o.repeat_count) <= len(arch.layer_indices) for o in ops)
-        ):
+        n_arch = len(arch.layer_indices)
+        is_unaggregated_per_layer = (
+            n_arch > 1 and max_rep == 1 and len(distinct_layers) > 1
+        )
+        if not is_unaggregated_per_layer and all(1 <= int(o.repeat_count) <= n_arch for o in ops):
             for phys_idx in arch.layer_indices:
                 layer_map[int(phys_idx)] = (arch.archetype_id, arch.title, ops)
             continue
@@ -693,25 +712,21 @@ def _build_target_layer_slices(
     slices, used_ids = [], set()
     for (b_key, a_key), idxs in grouped.items():
         rep = len(idxs)
-        b_needs_reagg = (
-            b_key is not None and b_key in b_arch_meta
-            and rep != len(b_arch_meta[b_key].layer_indices)
-        )
-        a_needs_reagg = (
-            a_key is not None and a_key in a_arch_meta
-            and rep != len(a_arch_meta[a_key].layer_indices)
-        )
+        b_full_len = len(b_arch_meta[b_key].layer_indices) if (b_key is not None and b_key in b_arch_meta) else 0
+        a_full_len = len(a_arch_meta[a_key].layer_indices) if (a_key is not None and a_key in a_arch_meta) else 0
+        b_needs_reagg = b_full_len > 0 and rep != b_full_len
+        a_needs_reagg = a_full_len > 0 and rep != a_full_len
         b_ops = (
-            _reaggregate_slice_ops(before_bundle, b_layer_map[idxs[0]][2], idxs)
+            _reaggregate_slice_ops(before_bundle, b_layer_map[idxs[0]][2], idxs, full_arch_len=b_full_len)
             if b_needs_reagg else (b_layer_map[idxs[0]][2] if b_key is not None else ())
         )
         a_ops = (
-            _reaggregate_slice_ops(after_bundle, a_layer_map[idxs[0]][2], idxs)
+            _reaggregate_slice_ops(after_bundle, a_layer_map[idxs[0]][2], idxs, full_arch_len=a_full_len)
             if a_needs_reagg else (a_layer_map[idxs[0]][2] if a_key is not None else ())
         )
         same_unsplit = (
             b_key is not None and b_key == a_key and b_key in b_arch_meta and b_key in a_arch_meta
-            and rep == len(b_arch_meta[b_key].layer_indices) == len(a_arch_meta[b_key].layer_indices)
+            and rep == b_full_len == a_full_len
         )
         if same_unsplit:
             slice_aid, slice_title = b_key, a_arch_meta[b_key].title
@@ -719,11 +734,12 @@ def _build_target_layer_slices(
             base_aid = a_key or b_key or "target_slice"
             slice_aid = base_aid if base_aid not in used_ids else f"{b_key or 'none'}__{a_key or 'none'}"
             raw_title = a_layer_map[idxs[0]][1] if a_key is not None else b_layer_map[idxs[0]][1]
-            clean_title = re.sub(r"\s*\(×\d+[^)]*\)\s*$", "", raw_title).strip()
+            clean_title = _strip_trailing_repeat_tag(raw_title)
             rng_txt = _format_slice_layer_range(idxs)
             slice_title = f"{clean_title} (×{rep}, {rng_txt})" if rng_txt else f"{clean_title} (×{rep})"
+        has_subset_repeats = any(int(o.repeat_count) < rep for o in b_ops) or any(int(o.repeat_count) < rep for o in a_ops)
         used_ids.add(slice_aid)
-        slices.append((slice_aid, slice_title, rep if b_ops else 0, rep if a_ops else 0, b_ops, a_ops, same_unsplit))
+        slices.append((slice_aid, slice_title, rep if b_ops else 0, rep if a_ops else 0, b_ops, a_ops, same_unsplit or has_subset_repeats))
     return slices
 
 
@@ -949,7 +965,7 @@ def classify_waterfall_stage(
     if acc.bucket in {"new", "tune"}:
         return WF_STAGE_KERNEL, None
     if acc.bucket == "config":
-        if acc.reason in _FRAMEWORK_REASONS or (acc.reason == "eliminated_or_added_op" and same_cfg):
+        if same_cfg or acc.reason in _FRAMEWORK_REASONS:
             return WF_STAGE_FRAMEWORK, None
         return WF_STAGE_CONFIG, None
     return WF_STAGE_RESIDUAL, None
@@ -1033,11 +1049,21 @@ def enrich_comparison_plan_stage_receipts(
         residual_saved_ms=res_ms_tot,
         residual_saved_upt=res_upt_tot,
     )
+    stage_ms = {WF_STAGE_CONFIG: 0.0, WF_STAGE_FRAMEWORK: 0.0, WF_STAGE_KERNEL: 0.0, WF_STAGE_RESIDUAL: 0.0}
+    for acc_item in updated_acc:
+        primary_st, pre_st = classify_waterfall_stage(acc_item, before_bundle, after_bundle)
+        if pre_st is None:
+            stage_ms[primary_st] += acc_item.saved_ms
+        else:
+            stage_ms[pre_st] += acc_item.config_share_ms
+            stage_ms[primary_st] += acc_item.kernel_share_ms
     anchored_stage_wf = anchor_stage_waterfall(
         before_bundle,
         after_bundle,
         config_bridge_span_us=(float(config_bundle.step_span_us) if config_bundle is not None else None),
         config_saved_us=cfg_ms_tot * US_PER_MS,
+        config_stage_saved_us=stage_ms[WF_STAGE_CONFIG] * US_PER_MS,
+        framework_stage_saved_us=stage_ms[WF_STAGE_FRAMEWORK] * US_PER_MS,
     )
     return replace(
         plan, waterfall=new_wf, group_accounting=tuple(updated_acc), stage_waterfall=anchored_stage_wf,

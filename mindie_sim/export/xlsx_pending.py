@@ -550,6 +550,46 @@ def _write_waterfall_ledger(
     ws.merge_range(WF_ROW_ERROR, WF_NOTE_START_COL, WF_ROW_ERROR, PENDING_COLS)
 
 
+def _format_megafusion_tilelang_and_ub(mf: Any) -> tuple[str, str]:
+    """Return ``(dual_tier_note, ub_warning_note)`` for an A5 ``MegaFusionBound``."""
+    simt_ms = getattr(mf, "tilelang_simt_gain_ms", None)
+    simd_ms = getattr(mf, "tilelang_simd_or_ascendc_gain_ms", None)
+    dual_parts: list[str] = []
+    if simt_ms is not None:
+        dual_parts.append(f"TileLang (SimtVF quick-win)={float(simt_ms):+.3f} ms")
+    if simd_ms is not None:
+        dual_parts.append(f"TileLang (SimdVF) / AscendC={float(simd_ms):+.3f} ms")
+    dual_txt = f"A5 双档预估: {' vs '.join(dual_parts)}" if dual_parts else ""
+    ub_warn = _sanitize_backend_text(str(getattr(mf, "ub_wall_warning", "") or "").strip())
+    ub_txt = f"[UB-Wall 预警] {ub_warn}" if ub_warn else ""
+    return dual_txt, ub_txt
+
+
+def _matching_megafusion_notes(item: PendingKernelItem, target_bundle: ExportBundle) -> str:
+    """Surface matching A5 TileLang dual-tier / UB-wall guidance on a Pending Kernel Card."""
+    notes: list[str] = []
+    synth = getattr(item, "synthesis_spec", None)
+    synth_ub = _sanitize_backend_text(str(getattr(synth, "ub_wall_warning", "") or "").strip())
+    if synth_ub:
+        notes.append(f"[UB-Wall 预警] {synth_ub}")
+    item_tokens = {
+        str(item.kernel_key or "").strip().lower(),
+        str(item.target_kernel or "").strip().lower(),
+    }
+    for opp in getattr(target_bundle, "co_design_opportunities", ()) or ():
+        mf = getattr(opp, "mega_fusion", None)
+        if mf is None:
+            continue
+        opp_text = f"{getattr(opp, 'opportunity_id', '')} {getattr(opp, 'title', '')} {' '.join(mf.region_op_ids)}".lower()
+        if any(tok and tok in opp_text for tok in item_tokens):
+            dual_txt, ub_txt = _format_megafusion_tilelang_and_ub(mf)
+            if dual_txt and dual_txt not in notes:
+                notes.append(dual_txt)
+            if ub_txt and ub_txt not in notes:
+                notes.append(ub_txt)
+    return " | ".join(notes)
+
+
 def _write_pending_kernel_card(
     ws: Worksheet,
     card_start: int,
@@ -621,6 +661,9 @@ def _write_pending_kernel_card(
     budget_txt = f" | Core Budget: {item.core_budget}" if item.core_budget else ""
     contract_txt = f"{item.tensor_contract} | {target_bundle.hardware_die_summary}{budget_txt}"
     formula_txt = _sanitize_backend_text(item.sram_residency_summary or item.formula_summary or item.kernel_action)
+    mf_extra = _matching_megafusion_notes(item, target_bundle)
+    if mf_extra:
+        formula_txt = f"{formula_txt} | {mf_extra}" if formula_txt else mf_extra
     fw_txt = _sanitize_backend_text(item.framework_action or "—")
     full_width_rows = (
         (PENDING_CARD_ROW_SHAPE, WRAP_ROW_HEIGHT_PT, "张量契约与硬件几何 (Contract & Geometry)", contract_txt, STYLE_TEXT_WRAP),
@@ -693,6 +736,7 @@ def _write_codesign_opportunity_cards(
         ws.merge_range(r_meta, PENDING_CARD_RIGHT_START, r_meta, PENDING_COLS)
 
         if mf is not None:
+            dual_txt, ub_txt = _format_megafusion_tilelang_and_ub(mf)
             p_lbl = "理论上限 Δ_max vs 硬件预演预期 Δ_expected"
             p_txt = (
                 f"融合区间 ({len(mf.region_op_ids)} ops: {', '.join(mf.region_op_ids[:MAX_CODESIGN_OPS_PREVIEW])}) | "
@@ -700,6 +744,8 @@ def _write_codesign_opportunity_cards(
                 f"硬件预演={mf.tiled_engine_ms:.3f} ms | 理论上限 Δ_max={mf.gain_ceiling_ms:+.3f} ms vs "
                 f"硬件预演预期 Δ_expected={mf.gain_expected_ms:+.3f} ms"
             )
+            if dual_txt:
+                p_txt = f"{p_txt} | {dual_txt}"
             b_lbl = "GM 访存消除 & 片上 UB 约束"
             b_txt = (
                 f"消除 GM 访存={_format_bytes_human(mf.eliminated_gm_bytes).lstrip('+')} | "
@@ -707,7 +753,9 @@ def _write_codesign_opportunity_cards(
                 f"{mf.ub_capacity_bytes / float(KIB_BYTES):.1f} KiB | "
                 f"推荐实现技术栈: {PRIMARY_KERNEL_BACKENDS}"
             )
-            b_style = STYLE_TEXT_WRAP
+            if ub_txt:
+                b_txt = f"{b_txt} | {ub_txt}"
+            b_style = STYLE_ALERT_HIGH if ub_txt else STYLE_TEXT_WRAP
         elif st is not None:
             dir_zh = "以存代算 (Space-for-Time)" if st.direction == "space_for_time" else "以算代存 (Time-for-Space)"
             feas_zh = "可行 (满足 HBM & SLA 预算)" if st.feasible_under_hbm_and_sla else "受限 (超出当前 HBM/SLA 余量)"

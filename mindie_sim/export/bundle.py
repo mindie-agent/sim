@@ -96,6 +96,8 @@ from .kernel_catalog import (
 from .memory_ledger import compute_memory_quant_ledger
 from .models import (
     ARCHETYPE_ORDER_FALLBACK,
+    BACKEND_CANN,
+    BACKEND_CATLASS,
     BINDING_STATE_BOUND,
     BINDING_STATE_MEASURED,
     BINDING_STATE_UNBOUND_FORMULA,
@@ -113,6 +115,7 @@ from .models import (
     DEPLOYMENT_MODE_LABELS,
     EXPORT_BUNDLE_SCHEMA,
     GRAPH_DIGEST_HEX_LEN,
+    KERNEL_STATUS_NEW_OP,
     KIB_BYTES,
     LAUNCH_BOUND_SHORT_US,
     LAUNCH_BOUND_WORK_SHARE,
@@ -124,6 +127,7 @@ from .models import (
     MODE_SIMULATION,
     NS_PER_US,
     OVERLAP_EXPOSED_EPS_US,
+    SUB_MOE_ROUTED,
     TB_BYTES,
     US_PER_MS,
     US_PER_SECOND,
@@ -1170,7 +1174,91 @@ def _row_to_target_node(row: OperatorExportRow, spec: OpSpec | None) -> TargetOp
     )
 
 
-def _apply_node_to_row(base_row: OperatorExportRow, node: TargetOpNode) -> OperatorExportRow:
+_QUANTIZED_COMPUTE_DTYPES = frozenset({
+    "int8", "int4", "fp8", "fp8_e4m3", "fp8_e5m2", "mxfp8", "mxfp4", "w8a8", "w4a8",
+})
+_FUSED_MOE_KERNEL_TOKENS = ("megamoe", "dispatch_ffn_combine")
+_GMM_SWIGLU_SHIPPING_KERNEL = "aclnnGroupedMatmulSwigluQuantV2"
+_GMM_SWIGLU_SYNTH_KERNEL = "FusedGroupedMatmulSwiGLU"
+_SYNTH_TIER_EPILOGUE = "K2_epilogue"
+
+
+def _is_fused_moe_node(node: TargetOpNode) -> bool:
+    kern_low = str(getattr(node, "ascend_kernel", "") or "").strip().lower()
+    return (
+        node.family == "moe"
+        or ".fused_moe_" in str(node.op_id or "")
+        or any(tok in kern_low for tok in _FUSED_MOE_KERNEL_TOKENS)
+    )
+
+
+def _is_gmm_swiglu_fusion(base_row: OperatorExportRow, node: TargetOpNode) -> bool:
+    if str(getattr(node, "ascend_kernel", "") or "").strip() != "aclnnSwiGluQuant":
+        return False
+    if base_row.family in {"grouped_gemm", "grouped_moe"}:
+        return True
+    if any("expert_up" in str(a) or "gmm" in str(a).lower() for a in (node.absorbed_source_ops or ())):
+        return True
+    return "gmm" in str(getattr(node, "logical_role", "") or "").lower()
+
+
+def _resolve_fused_moe_fields(
+    base_row: OperatorExportRow,
+    node: TargetOpNode,
+    member_rows: Sequence[OperatorExportRow],
+) -> dict[str, Any]:
+    """Derive exact MoE routed-expert shape, compute dtype, submodule, and contract."""
+    exp_up = next(
+        (m for m in member_rows if strip_op_prefix(m.op_id) == "expert_up" or m.family in {"grouped_gemm", "grouped_moe"}),
+        None,
+    )
+    exp_down = next((m for m in member_rows if strip_op_prefix(m.op_id) == "expert_down"), None)
+    spec = getattr(node, "spec", None)
+    mflops = tuple(getattr(spec, "matrix_flops", ()) or ()) if spec is not None else ()
+    non_fp32_mf = [
+        (str(dt).strip().lower(), float(val))
+        for dt, val in mflops
+        if str(dt or "").strip().lower() not in {"", "fp32", "float32"} and float(val or 0.0) > 0.0
+    ]
+    if non_fp32_mf:
+        eff_dtype = max(non_fp32_mf, key=lambda kv: kv[1])[0]
+    elif exp_up is not None and str(exp_up.dtype or "").strip().lower() not in {"", "fp32", "float32"}:
+        eff_dtype = exp_up.dtype
+    elif exp_down is not None and str(exp_down.dtype or "").strip().lower() not in {"", "fp32", "float32"}:
+        eff_dtype = exp_down.dtype
+    else:
+        eff_dtype = str(node.dtype or base_row.dtype or "bf16")
+
+    eff_shape = (
+        exp_up.shape if (exp_up is not None and exp_up.shape)
+        else (exp_down.shape if (exp_down is not None and exp_down.shape) else (node.shape or base_row.shape))
+    )
+    if exp_up is not None and exp_down is not None:
+        contract = (
+            f"GMM1: {exp_up.tensor_contract} -> Act -> GMM2: {exp_down.tensor_contract} "
+            f"| Fused Dispatch+Combine ({len(node.absorbed_source_ops)} ops)"
+        )
+    elif exp_up is not None:
+        contract = f"GMM: {exp_up.tensor_contract} | Fused MoE ({len(node.absorbed_source_ops)} ops)"
+    else:
+        contract = base_row.tensor_contract
+    kern_lbl = str(node.ascend_kernel or "aclnnMegaMoe")
+    return {
+        "submodule": SUB_MOE_ROUTED,
+        "logical_role": f"Fused MegaMoE ({kern_lbl}: Dispatch + GMM1 + Act + GMM2 + Combine)",
+        "canonical_op_key": "megamoe",
+        "dtype": eff_dtype,
+        "shape": eff_shape,
+        "tensor_contract": contract,
+    }
+
+
+def _apply_node_to_row(
+    base_row: OperatorExportRow,
+    node: TargetOpNode,
+    *,
+    member_rows: Sequence[OperatorExportRow] = (),
+) -> OperatorExportRow:
     if isinstance(node, OperatorExportRow):
         return node
     synth = getattr(node, "synthesis_spec", None)
@@ -1179,17 +1267,74 @@ def _apply_node_to_row(base_row: OperatorExportRow, node: TargetOpNode) -> Opera
         if getattr(node, "opt_attainment_pct", None) is not None
         else (getattr(synth, "target_attainment_pct", None) if synth is not None else None)
     )
+    ascend_kernel = node.ascend_kernel
+    logical_role = node.logical_role
+    kernel_backend = node.kernel_backend
+    kernel_status = node.kernel_status
+    needs_new = bool(node.needs_new_kernel)
+    is_shipping = bool(getattr(node, "is_shipping_abi", not needs_new))
     b_state = str(getattr(node, "binding_state", "") or "").strip()
     if not b_state:
         b_state = (
             BINDING_STATE_UNBOUND_FORMULA
-            if (getattr(node, "needs_new_kernel", False) or (synth is not None and not getattr(synth, "shipping_supported", True)))
+            if (needs_new or (synth is not None and not getattr(synth, "shipping_supported", True)))
             else base_row.binding_state
         )
+
+    eff_dtype = node.dtype or base_row.dtype
+    eff_shape = node.shape or base_row.shape
+    eff_sub = base_row.submodule
+    eff_contract = base_row.tensor_contract
+    eff_canon = node.canonical_op_key
+
+    if _is_fused_moe_node(node):
+        moe_fields = _resolve_fused_moe_fields(base_row, node, member_rows)
+        eff_sub = moe_fields["submodule"]
+        logical_role = moe_fields["logical_role"]
+        eff_canon = moe_fields["canonical_op_key"]
+        eff_dtype = moe_fields["dtype"]
+        eff_shape = moe_fields["shape"]
+        eff_contract = moe_fields["tensor_contract"]
+    elif _is_gmm_swiglu_fusion(base_row, node):
+        cand_dts = {str(eff_dtype or "").strip().lower(), str(base_row.dtype or "").strip().lower()}
+        cand_dts.update(str(m.dtype or "").strip().lower() for m in member_rows)
+        if cand_dts & _QUANTIZED_COMPUTE_DTYPES:
+            ascend_kernel = _GMM_SWIGLU_SHIPPING_KERNEL
+            kernel_backend = BACKEND_CANN
+            is_shipping = True
+            needs_new = False
+            b_state = BINDING_STATE_BOUND
+            if synth is not None:
+                synth = replace(
+                    synth,
+                    kernel_name=_GMM_SWIGLU_SHIPPING_KERNEL,
+                    abi_signature_id=_GMM_SWIGLU_SHIPPING_KERNEL,
+                    suggested_backend=BACKEND_CANN,
+                    binding_state=BINDING_STATE_BOUND,
+                )
+        else:
+            ascend_kernel = _GMM_SWIGLU_SYNTH_KERNEL
+            logical_role = "Fused Routed Expert GMM1 + SwiGLU"
+            kernel_backend = BACKEND_CATLASS
+            kernel_status = f"{KERNEL_STATUS_NEW_OP} {_GMM_SWIGLU_SYNTH_KERNEL} (BF16 GMM1+SwiGLU Epilogue)"
+            needs_new = True
+            is_shipping = False
+            b_state = BINDING_STATE_UNBOUND_FORMULA
+            if synth is not None:
+                synth = replace(
+                    synth,
+                    kernel_name=_GMM_SWIGLU_SYNTH_KERNEL,
+                    abi_signature_id=_GMM_SWIGLU_SYNTH_KERNEL,
+                    abi_tier=_SYNTH_TIER_EPILOGUE,
+                    suggested_backend=BACKEND_CATLASS,
+                    status_tag=kernel_status,
+                    binding_state=BINDING_STATE_UNBOUND_FORMULA,
+                )
+
     extra_fields = _filter_dataclass_kwargs(
         _OP_ROW_FIELDS,
         {
-            "is_shipping_abi": bool(getattr(node, "is_shipping_abi", not node.needs_new_kernel)),
+            "is_shipping_abi": is_shipping,
             "stream_core_budget": str(getattr(node, "stream_core_budget", "") or ""),
             "formula_eval": getattr(node, "formula_eval", None),
         },
@@ -1197,7 +1342,10 @@ def _apply_node_to_row(base_row: OperatorExportRow, node: TargetOpNode) -> Opera
     return replace(
         base_row,
         ordinal=node.ordinal, occurrence=node.occurrence, op_id=node.op_id,
-        family=node.family, recipe=node.recipe, implementation=node.ascend_kernel or base_row.implementation,
+        repeat_count=int(node.repeat_count or base_row.repeat_count),
+        family=node.family, recipe=node.recipe, implementation=ascend_kernel or base_row.implementation,
+        submodule=eff_sub, shape=eff_shape, dtype=eff_dtype,
+        task_type=node.task_type or base_row.task_type,
         stream=node.stream, stream_index=node.stream_index,
         predecessors=node.predecessors, start_us=node.start_us, end_us=node.end_us,
         dur_us=node.dur_us, exposed_dur_us=node.exposed_dur_us,
@@ -1209,10 +1357,11 @@ def _apply_node_to_row(base_row: OperatorExportRow, node: TargetOpNode) -> Opera
         dominant_bound=node.dominant_bound, bound_display=node.bound_display,
         l_star_lean_us=node.l_star_lean_us, gap_us=node.gap_us, gap_ratio=node.gap_ratio,
         roofline_efficiency=node.roofline_efficiency, absorbed_source_ops=node.absorbed_source_ops,
-        semantic_atoms=node.semantic_atoms, logical_role=node.logical_role,
-        ascend_kernel=node.ascend_kernel, kernel_backend=node.kernel_backend,
-        kernel_status=node.kernel_status, needs_new_kernel=node.needs_new_kernel,
-        new_kernel_spec=node.new_kernel_spec, canonical_op_key=node.canonical_op_key,
+        semantic_atoms=node.semantic_atoms, logical_role=logical_role,
+        ascend_kernel=ascend_kernel, kernel_backend=kernel_backend,
+        kernel_status=kernel_status, needs_new_kernel=needs_new,
+        new_kernel_spec=node.new_kernel_spec, canonical_op_key=eff_canon,
+        tensor_contract=eff_contract,
         opt_pillar=node.opt_pillar, opt_attainment_pct=att_pct,
         source_ref=getattr(node, "source_ref", "") or base_row.source_ref,
         kernel_synthesis_spec=synth, binding_state=b_state,
@@ -1578,6 +1727,53 @@ def _aggregate_bundle_cohort_rows(
     ]
     updated_archs = tuple(replace(a, single_span_us=arch_spans.get(a.archetype_id, a.single_span_us)) for a in archetypes)
     return rewired, out_dems, updated_archs
+
+
+def _reconcile_draft_schedule_repeats(
+    archetypes: Sequence[LayerArchetypeSpec],
+    full_schedule: Sequence[TraceScheduleEntry],
+    rows: Sequence[OperatorExportRow],
+) -> tuple[tuple[LayerArchetypeSpec, ...], tuple[TraceScheduleEntry, ...]]:
+    """Align multi-step MTP draft archetype repeat counts & schedule entries with folded rows."""
+    max_rep_by_arch: dict[str, int] = {}
+    for row in rows:
+        aid = row.archetype_id
+        max_rep_by_arch[aid] = max(max_rep_by_arch.get(aid, 0), max(1, int(row.repeat_count)))
+    updated_archs: list[LayerArchetypeSpec] = []
+    expanded_targets: dict[str, int] = {}
+    for arch in archetypes:
+        if arch.scope == "draft" and arch.archetype_id in {"draft_arch_0", "draft_context_kv"}:
+            actual = max_rep_by_arch.get(arch.archetype_id, arch.repeat_count)
+            if actual > arch.repeat_count:
+                new_title = re.sub(r"\(×\d+\)", f"(×{actual})", arch.title)
+                arch = replace(arch, repeat_count=actual, title=new_title)
+                expanded_targets[arch.archetype_id] = actual
+        updated_archs.append(arch)
+    if not expanded_targets:
+        return tuple(updated_archs), tuple(full_schedule)
+    expanded_sched: list[TraceScheduleEntry] = []
+    idx = 0
+    sched_list = list(full_schedule)
+    while idx < len(sched_list):
+        entry = sched_list[idx]
+        target_rep = expanded_targets.get(entry.archetype_id, 0)
+        if target_rep > 0:
+            block = [entry]
+            scan = idx + 1
+            while scan < len(sched_list) and sched_list[scan].archetype_id == entry.archetype_id:
+                block.append(sched_list[scan])
+                scan += 1
+            if target_rep > len(block) and target_rep % len(block) == 0:
+                steps = target_rep // len(block)
+                for step_i in range(steps):
+                    for blk_e in block:
+                        lbl = f"{blk_e.label} [Step {step_i}]" if steps > 1 else blk_e.label
+                        expanded_sched.append(TraceScheduleEntry(blk_e.archetype_id, blk_e.scope, lbl, blk_e.full_layer_index))
+                idx = scan
+                continue
+        expanded_sched.append(entry)
+        idx += 1
+    return tuple(updated_archs), tuple(expanded_sched)
 
 
 def _reorder_rows_by_archetype(
@@ -1956,6 +2152,72 @@ def _normalize_rollback_waterfall(
     )
 
 
+def _resolve_node_base_and_members(
+    node: TargetOpNode,
+    *,
+    row_by_occ: Mapping[Any, OperatorExportRow],
+    row_by_arch_op: Mapping[tuple[str, str], OperatorExportRow],
+    row_by_op: Mapping[str, OperatorExportRow],
+    row_by_arch: Mapping[str, OperatorExportRow],
+    fallback_row: OperatorExportRow,
+) -> tuple[OperatorExportRow, tuple[OperatorExportRow, ...]]:
+    members: list[OperatorExportRow] = []
+    for src_op in getattr(node, "absorbed_source_ops", ()) or ():
+        hit = row_by_arch_op.get((node.archetype_id, src_op)) or row_by_op.get(src_op)
+        if hit is not None:
+            members.append(hit)
+    base = row_by_occ.get(node.occurrence)
+    if base is None and members:
+        expert_hit = next(
+            (m for m in members if strip_op_prefix(m.op_id) in {"expert_up", "expert_down"} or m.family in {"grouped_gemm", "grouped_moe"}),
+            None,
+        )
+        base = expert_hit or members[0]
+    if base is None:
+        base = row_by_arch.get(node.archetype_id) or fallback_row
+    return base, tuple(members)
+
+
+def _normalize_synthesis_specs(
+    raw_specs: Sequence[Any],
+    out_rows: Sequence[OperatorExportRow],
+) -> tuple[Any, ...]:
+    """Synchronize ``KernelSynthesisSpec`` entries with corrected fused kernel identities."""
+    row_by_spec_id = {
+        str(getattr(r.kernel_synthesis_spec, "spec_id", "")): r
+        for r in out_rows if r.kernel_synthesis_spec is not None and getattr(r.kernel_synthesis_spec, "spec_id", "")
+    }
+    row_by_occ_op = {r.op_id: r for r in out_rows if r.kernel_synthesis_spec is not None}
+    normalized: list[Any] = []
+    for spec in raw_specs:
+        sid = str(getattr(spec, "spec_id", "") or "")
+        if sid and sid in row_by_spec_id:
+            normalized.append(row_by_spec_id[sid].kernel_synthesis_spec)
+            continue
+        tgt_k = str(getattr(spec, "kernel_name", "") or "").strip()
+        if tgt_k == "aclnnSwiGluQuant":
+            src_ops = tuple(getattr(spec, "constituent_op_ids", ()) or ())
+            matched_row = next(
+                (r for op_id, r in row_by_occ_op.items() if op_id in src_ops or any(s in r.absorbed_source_ops for s in src_ops)),
+                None,
+            )
+            if matched_row is not None and matched_row.kernel_synthesis_spec is not None:
+                normalized.append(matched_row.kernel_synthesis_spec)
+                continue
+            if any("expert_up" in str(s) or "gmm" in str(s).lower() for s in src_ops):
+                normalized.append(replace(
+                    spec,
+                    kernel_name=_GMM_SWIGLU_SYNTH_KERNEL,
+                    abi_signature_id=_GMM_SWIGLU_SYNTH_KERNEL,
+                    abi_tier=_SYNTH_TIER_EPILOGUE,
+                    suggested_backend=BACKEND_CATLASS,
+                    binding_state=BINDING_STATE_UNBOUND_FORMULA,
+                ))
+                continue
+        normalized.append(spec)
+    return tuple(normalized)
+
+
 def _apply_target_envelope_to_rows(
     prelim_rows: list[OperatorExportRow],
     demands_ns: list[tuple[int, int, int, int, int]],
@@ -1985,6 +2247,8 @@ def _apply_target_envelope_to_rows(
     tuple[dict[str, Any], ...],
 ]:
     row_by_occ = {r.occurrence: r for r in prelim_rows}
+    row_by_arch_op = {(r.archetype_id, r.op_id): r for r in prelim_rows}
+    row_by_op = {r.op_id: r for r in prelim_rows}
     row_by_arch: dict[str, OperatorExportRow] = {}
     for r in prelim_rows:
         row_by_arch.setdefault(r.archetype_id, r)
@@ -2003,13 +2267,17 @@ def _apply_target_envelope_to_rows(
         step_request=step_req,
         scenario_case=parsed,
     )
-    out_rows = [
-        _apply_node_to_row(
-            row_by_occ.get(node.occurrence) or row_by_arch.get(node.archetype_id) or prelim_rows[0],
+    out_rows: list[OperatorExportRow] = []
+    for node in solved.nodes:
+        base_row, member_rows = _resolve_node_base_and_members(
             node,
+            row_by_occ=row_by_occ,
+            row_by_arch_op=row_by_arch_op,
+            row_by_op=row_by_op,
+            row_by_arch=row_by_arch,
+            fallback_row=prelim_rows[0],
         )
-        for node in solved.nodes
-    ]
+        out_rows.append(_apply_node_to_row(base_row, node, member_rows=member_rows))
     has_ext_edits = ext_plan is not None and bool(getattr(ext_plan, "edits", ()))
     if _should_rollback_to_native_baseline(solved, prelim_rows, out_rows, has_ext_edits=has_ext_edits):
         baseline_exposed_us = sum(r.exposed_dur_us * r.repeat_count for r in prelim_rows)
@@ -2032,9 +2300,10 @@ def _apply_target_envelope_to_rows(
         replace(a, single_span_us=solved.archetype_spans_us.get(a.archetype_id, 0.0))
         for a in archetypes
     )
+    norm_specs = _normalize_synthesis_specs(solved.synthesis_specs, out_rows)
     return (
         out_rows, list(solved.demands_ns), out_archs,
-        solved.synthesis_specs, solved.semantic_audit_triggers,
+        norm_specs, solved.semantic_audit_triggers,
         solved.rewrite_plan_sha256, solved.verification_passed,
         solved.applied_edit_receipts, solved.stream_core_budget_summary, solved.moe_route,
         tuple(getattr(solved, "co_design_opportunities", ()) or ()),
@@ -2157,7 +2426,7 @@ def _resolve_bundle_step_context(
             phase="decode", tokens=1 + spec_tokens,
             context=max(1, min(parsed.runtime.max_model_len, DEFAULT_EXPORT_CONTEXT_TOKENS)),
             sequences=max(1, len(parsed.workload.requests)),
-            scope="model" if spec_tokens > 0 else "body",
+            scope="model",
         )
     )
     dp_width = int(parsed.runtime.parallel.dp)
@@ -2290,6 +2559,7 @@ def build_export_bundle(
         rep_lp_by_idx=rep_lp_by_idx, op_spec_by_key=op_spec_by_key,
     )
     prelim_rows, demands_ns = _collapse_micro_split_ops(prelim_rows, demands_ns)
+    archetypes, full_schedule = _reconcile_draft_schedule_repeats(archetypes, full_schedule, prelim_rows)
     prelim_rows, demands_ns = _reorder_rows_by_archetype(prelim_rows, demands_ns, archetypes)
     final_rows, rank_order, reconcile_summary = _finalize_ranked_rows(prelim_rows, observations_path)
 

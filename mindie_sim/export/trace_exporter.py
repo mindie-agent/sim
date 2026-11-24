@@ -31,7 +31,7 @@
 """
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 import json
@@ -50,7 +50,9 @@ from .models import (
     US_PER_SECOND,
     ExportBundle,
     OperatorExportRow,
+    TraceScheduleEntry,
 )
+from .public_view import format_track_label
 
 #: Schema tag for trace export receipts.
 TRACE_EXPORT_RECEIPT_SCHEMA = "mindie-sim.msprof-trace-receipt/2"
@@ -463,24 +465,73 @@ def _subtract_intervals(
     return result
 
 
-def _build_archetype_templates(bundle: ExportBundle) -> dict[str, _ArchetypeTemplate]:
+def _op_in_entry_repeats(op: OperatorExportRow, sched_count: int) -> int:
+    """Return consecutive calls of ``op`` inside a single schedule entry (e.g. RecoverSSM ×36)."""
+    rep = max(1, int(op.repeat_count))
+    cnt = max(1, int(sched_count))
+    return max(1, int(round(rep / float(cnt)))) if rep > cnt else 1
+
+
+def _expand_effective_trace_schedule(
+    bundle: ExportBundle,
+) -> tuple[tuple[TraceScheduleEntry, ...], dict[str, int]]:
+    """Expand multi-step draft schedule entries whenever draft ops repeat across MTP steps."""
+    raw_sched = tuple(bundle.full_trace_schedule)
+    if not raw_sched:
+        return (), {}
+    max_rep_by_arch: dict[str, int] = {}
+    for op in bundle.operators:
+        aid = op.archetype_id or op.layer_label
+        max_rep_by_arch[aid] = max(max_rep_by_arch.get(aid, 0), max(1, int(op.repeat_count)))
+    raw_counts = Counter(e.archetype_id for e in raw_sched)
+    expanded: list[TraceScheduleEntry] = []
+    idx = 0
+    while idx < len(raw_sched):
+        entry = raw_sched[idx]
+        aid = entry.archetype_id
+        cnt = raw_counts.get(aid, 1)
+        target_rep = max_rep_by_arch.get(aid, 0)
+        if entry.scope == "draft" and aid in {"draft_arch_0", "draft_context_kv"} and target_rep > cnt and cnt > 0 and (target_rep % cnt == 0):
+            block = [entry]
+            scan = idx + 1
+            while scan < len(raw_sched) and raw_sched[scan].archetype_id == aid:
+                block.append(raw_sched[scan])
+                scan += 1
+            steps = target_rep // len(block)
+            for step_i in range(steps):
+                for blk_e in block:
+                    lbl = f"{blk_e.label} [Step {step_i}]" if steps > 1 else blk_e.label
+                    expanded.append(TraceScheduleEntry(blk_e.archetype_id, blk_e.scope, lbl, blk_e.full_layer_index))
+            idx = scan
+            continue
+        expanded.append(entry)
+        idx += 1
+    return tuple(expanded), dict(Counter(e.archetype_id for e in expanded))
+
+
+def _build_archetype_templates(
+    bundle: ExportBundle,
+    sched_counts: Mapping[str, int] | None = None,
+) -> dict[str, _ArchetypeTemplate]:
     grouped: dict[str, list[OperatorExportRow]] = defaultdict(list)
     for op in bundle.operators:
         grouped[op.archetype_id or op.layer_label].append(op)
     span_by_arch = {a.archetype_id: a.single_span_us for a in bundle.archetypes}
+    counts = sched_counts or {}
     templates: dict[str, _ArchetypeTemplate] = {}
     for aid, ops in grouped.items():
         min_s = min((op.start_us for op in ops), default=0.0)
-        max_e = max((op.end_us for op in ops), default=min_s)
-        span = span_by_arch.get(aid, max(0.0, max_e - min_s))
-        if span <= 0.0:
-            span = max(0.0, max_e - min_s)
+        s_cnt = max(1, int(counts.get(aid, 1)))
+        max_e = min_s
         sub_spans: list[tuple[str, float, float]] = []
         comp_iv: list[tuple[float, float]] = []
         comm_iv: list[tuple[float, float]] = []
         for op in ops:
+            in_reps = _op_in_entry_repeats(op, s_cnt)
             r_s = max(0.0, op.start_us - min_s)
-            r_e = max(r_s, op.end_us - min_s)
+            op_span = op.dur_us * float(in_reps) if in_reps > 1 else max(0.0, op.end_us - op.start_us)
+            r_e = max(r_s, r_s + op_span)
+            max_e = max(max_e, min_s + r_e)
             if r_e > r_s:
                 if op.task_type == "HCCL":
                     comm_iv.append((r_s, r_e))
@@ -491,6 +542,9 @@ def _build_archetype_templates(bundle: ExportBundle) -> dict[str, _ArchetypeTemp
                 sub_spans[-1] = (prev_sub, min(p_lo, r_s), max(p_hi, r_e))
             else:
                 sub_spans.append((op.submodule, r_s, r_e))
+        span = span_by_arch.get(aid, max(0.0, max_e - min_s))
+        if span <= 0.0:
+            span = max(0.0, max_e - min_s)
         templates[aid] = _ArchetypeTemplate(
             archetype_id=aid,
             ops=tuple(ops),
@@ -720,6 +774,43 @@ def _entry_layer_span(
     return float(tpl.span_us)
 
 
+def _emit_entry_op_repeats(
+    bundle: ExportBundle,
+    op_eff: OperatorExportRow,
+    *,
+    op_ts: float,
+    in_reps: int,
+    task_id: int,
+    layer_label: str,
+    base_pid: int,
+    flow_id: int,
+    include_pipe_lanes: bool,
+    pipeline_info: tuple[int, tuple[str, ...]] | None,
+    op_placement: dict[Any, tuple[int, int, float, str]],
+) -> tuple[list[dict[str, Any]], int, int]:
+    """Emit one or ``in_reps`` consecutive spans for a collapsed tail/micro-split operator."""
+    out: list[dict[str, Any]] = []
+    placement: tuple[int, int, float, str] | None = None
+    for rep_idx in range(in_reps):
+        rep_ts = op_ts + float(rep_idx) * op_eff.dur_us
+        rep_op = (
+            replace(op_eff, logical_role=f"{op_eff.logical_role} (#{rep_idx + 1}/{in_reps})")
+            if in_reps > 1 else op_eff
+        )
+        events, placement, flow_id = _emit_op_and_pipes(
+            bundle, rep_op,
+            ts_start=rep_ts, task_id=task_id, layer_label=layer_label,
+            base_pid=base_pid, flow_id=flow_id, include_pipe_lanes=include_pipe_lanes,
+            pipeline_info=pipeline_info,
+            op_placement=op_placement if rep_idx == 0 else {},
+        )
+        out.extend(events)
+        task_id += 1
+    if placement is not None:
+        op_placement[op_eff.occurrence] = placement
+    return out, task_id, flow_id
+
+
 def _iter_scheduled_full_model_trace(
     bundle: ExportBundle,
     die_map: Mapping[tuple[int, int, int], int],
@@ -732,12 +823,14 @@ def _iter_scheduled_full_model_trace(
     """Stream full multi-layer Target + Draft schedule using native per-layer timings when recorded."""
     from .kernel_catalog import strip_op_prefix
 
-    templates = _build_archetype_templates(bundle)
+    effective_schedule, sched_counts = _expand_effective_trace_schedule(bundle)
+    templates = _build_archetype_templates(bundle, sched_counts)
     per_layer = dict(getattr(bundle, "per_layer_timings", None) or {})
     total_span_us = sum(
         _entry_layer_span(e, templates[e.archetype_id], per_layer)
-        for e in bundle.full_trace_schedule if e.archetype_id in templates
+        for e in effective_schedule if e.archetype_id in templates
     )
+    track_display = format_track_label(bundle.feature_track, lang="en")
     yield {
         "name": f"ModelRunner.execute_model [{bundle.model_name} | {bundle.phase.upper()} | graph={bundle.graph_capture_mode}]",
         "cat": "Framework", "ph": "X", "ts": 0.0, "dur": _round_us(total_span_us),
@@ -745,7 +838,7 @@ def _iter_scheduled_full_model_trace(
         "args": {
             "Model": bundle.model_name, "Hardware": bundle.hardware_sku,
             "Target Layers": bundle.total_target_layers, "Draft Layers": bundle.total_draft_layers,
-            "Graph Capture": bundle.graph_capture_mode, "Feature Track": bundle.feature_track,
+            "Graph Capture": bundle.graph_capture_mode, "Feature Track": track_display,
         },
     }
 
@@ -760,7 +853,7 @@ def _iter_scheduled_full_model_trace(
     launched_scopes: set[str] = set()
     scope_bounds: dict[str, list[float]] = {}
 
-    for entry in bundle.full_trace_schedule:
+    for entry in effective_schedule:
         tpl = templates.get(entry.archetype_id)
         if tpl is None or not tpl.ops:
             continue
@@ -796,6 +889,7 @@ def _iter_scheduled_full_model_trace(
 
         op_placement: dict[Any, tuple[int, int, float, str]] = {}
         first_op_for_scope = entry.scope not in launched_scopes
+        entry_sched_cnt = max(1, int(sched_counts.get(entry.archetype_id, 1)))
         for op in tpl.ops:
             coord = (op.occurrence.replica, op.occurrence.stage, int(op.occurrence.rank or 0))
             d_idx = die_map.get(coord, 0)
@@ -823,16 +917,15 @@ def _iter_scheduled_full_model_trace(
                     launched_scopes.add(entry.scope)
                     first_op_for_scope = False
 
-            events, placement, flow_id = _emit_op_and_pipes(
-                bundle, op_eff,
-                ts_start=op_ts, task_id=task_id, layer_label=entry.label,
-                base_pid=base, flow_id=flow_id, include_pipe_lanes=include_pipe_lanes,
+            in_reps = _op_in_entry_repeats(op_eff, entry_sched_cnt)
+            events, task_id, flow_id = _emit_entry_op_repeats(
+                bundle, op_eff, op_ts=op_ts, in_reps=in_reps, task_id=task_id,
+                layer_label=entry.label, base_pid=base, flow_id=flow_id,
+                include_pipe_lanes=include_pipe_lanes,
                 pipeline_info=pipeline_by_occ.get(op_eff.occurrence),
                 op_placement=op_placement,
             )
             yield from events
-            op_placement[op_eff.occurrence] = placement
-            task_id += 1
 
         # Accumulate compact per-layer overlap intervals & counter samples (O(1) per layer).
         d0 = die_map.get((tpl.ops[0].occurrence.replica, tpl.ops[0].occurrence.stage, int(tpl.ops[0].occurrence.rank or 0)), 0)

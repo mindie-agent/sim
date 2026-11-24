@@ -254,6 +254,7 @@ MACRO_MODULE_OPTIONAL_ORDER: tuple[str, ...] = (MACRO_MOD_ENGRAM, MACRO_MOD_VISI
 #: Quantization rule tokens for live Excel Sheet 3 formulas.
 QUANT_RULE_FOLLOW_PRESET = "FollowPreset"
 QUANT_RULE_PRESET_LINEAR_FP8 = "PresetLinearFP8"
+QUANT_RULE_PRESET_LINEAR_W8A8 = "PresetLinearW8A8"
 QUANT_RULE_CHECKPOINT_IGNORE = "CheckpointIgnoreBF16"
 QUANT_RULE_FIXED_BF16 = "FixedBF16"
 QUANT_RULE_FIXED_FP32 = "FixedFP32"
@@ -629,6 +630,8 @@ class CacheLedgerRow:
     batch_total_bytes: float
     scales_with_tokens: bool
     per_stage_bytes: tuple[float, ...] = ()
+    bytes_per_token_by_dtype: tuple[tuple[str, float], ...] = ()
+    per_request_bytes_by_dtype: tuple[tuple[str, float], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

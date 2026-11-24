@@ -1400,14 +1400,22 @@ def _project_moe(
         return (role, bound_kernel or mm_kernel, BACKEND_CANN, KERNEL_STATUS_EXISTING, False, "", suffix)
     if suffix == "latent_norm":
         return ("MoE Routed Latent RMSNorm", bound_kernel or "RmsNorm", BACKEND_CANN, KERNEL_STATUS_EXISTING, False, "", "latent_norm")
-    if suffix == "dispatch" or "dispatch" in rec:
+    if suffix == "dispatch" or suffix.startswith("dispatch.") or "dispatch" in rec:
         if fam in {"alltoall", "alltoallv"} and "moedistribute" not in bound_kernel.lower():
+            role = (
+                f"MoE EP Token Dispatch ({suffix})"
+                if suffix.startswith("dispatch.") else "MoE EP Token Dispatch (AllToAllV)"
+            )
             return (
-                "MoE EP Token Dispatch (AllToAllV)",
+                role,
                 "HcclAlltoAllV", BACKEND_HCCL_MC2, KERNEL_STATUS_EXISTING, False, "", "dispatch",
             )
         kern = bound_kernel if (bound_kernel and "Dispatch" in bound_kernel) else "MoeDistributeDispatchV2"
-        return ("MoE EP Token Distribute Dispatch (MC2)", kern, BACKEND_HCCL_MC2, KERNEL_STATUS_EXISTING, False, "", "dispatch")
+        role = (
+            f"MoE EP Token Distribute Dispatch ({suffix})"
+            if suffix.startswith("dispatch.") else "MoE EP Token Distribute Dispatch (MC2)"
+        )
+        return (role, kern, BACKEND_HCCL_MC2, KERNEL_STATUS_EXISTING, False, "", "dispatch")
     is_local_unpermute = (
         rec == "route_unpack"
         or (
@@ -1430,14 +1438,22 @@ def _project_moe(
             "MoE Finalize Routing (Weighted TopK Unpermute)",
             kern, backend, KERNEL_STATUS_EXISTING, False, "", "route_unpack",
         )
-    if suffix in {"unpack", "combine"} or "combine" in rec:
+    if suffix in {"unpack", "combine"} or suffix.startswith("combine.") or "combine" in rec:
         if fam in {"alltoall", "alltoallv"} and "moedistribute" not in bound_kernel.lower():
+            role = (
+                f"MoE EP Token Combine ({suffix})"
+                if suffix.startswith("combine.") else "MoE EP Token Combine (AllToAllV)"
+            )
             return (
-                "MoE EP Token Combine (AllToAllV)",
+                role,
                 "HcclAlltoAllV", BACKEND_HCCL_MC2, KERNEL_STATUS_EXISTING, False, "", "combine",
             )
         kern = bound_kernel if (bound_kernel and "Combine" in bound_kernel) else "MoeDistributeCombineV2"
-        return ("MoE EP Token Distribute Combine (MC2)", kern, BACKEND_HCCL_MC2, KERNEL_STATUS_EXISTING, False, "", "unpack")
+        role = (
+            f"MoE EP Token Distribute Combine ({suffix})"
+            if suffix.startswith("combine.") else "MoE EP Token Distribute Combine (MC2)"
+        )
+        return (role, kern, BACKEND_HCCL_MC2, KERNEL_STATUS_EXISTING, False, "", "unpack")
     if suffix in {"expert_up", "expert_down"} or fam in {"grouped_gemm", "grouped_moe"}:
         is_up = suffix == "expert_up" or "gate_up" in rec
         if is_a2_or_a3:
@@ -1489,9 +1505,32 @@ def _project_moe(
     return (f"MoE Aux ({suffix})", bound_kernel, BACKEND_CANN, KERNEL_STATUS_EXISTING, False, "", suffix)
 
 
+_TRITON_OP_SUBDIR_RE = re.compile(r"ops/triton/([a-z0-9_]+)/", re.I)
+
+
+def _resolve_triton_hc_gate_mix_symbol(
+    meta: Mapping[str, Any],
+    resolved_sources: Sequence[Any] = (),
+    fallback_src: str = "",
+) -> str:
+    """Derive shipping Triton-Ascend ``<subdir>_ascend_hc_gate_mix`` symbol from source metadata."""
+    candidates: list[str] = [fallback_src]
+    for src in resolved_sources:
+        candidates.append(_format_source_record(src))
+    for sg in meta.get("structure_subgraphs") or ():
+        if isinstance(sg, Mapping) and isinstance(sg.get("source"), Mapping):
+            candidates.append(str(sg["source"].get("path") or ""))
+    for path_txt in candidates:
+        match = _TRITON_OP_SUBDIR_RE.search(str(path_txt or ""))
+        if match is not None:
+            return f"{match.group(1).lower()}_ascend_hc_gate_mix"
+    return "ascend_hc_gate_mix"
+
+
 def _project_engram_mhc_indexer(
     suffix: str, fam: str, rec: str, meta: Mapping[str, Any], bound_kernel: str, mm_kernel: str,
     *, is_ideal: bool, is_a2_or_a3: bool, layer_plan: Any | None,
+    resolved_sources: Sequence[Any] = (), fallback_src: str = "",
 ) -> tuple[str, str, str, str, bool, str, str] | None:
     if fam == "mhc" or ".hc_" in f".{suffix}":
         hc_lr = int(getattr(layer_plan, "hc_lowrank", 0) or 0) if layer_plan is not None else 0
@@ -1512,6 +1551,19 @@ def _project_engram_mhc_indexer(
                 BACKEND_ASCENDC if (is_lr and is_ideal) else (BACKEND_CANN if is_lr else BACKEND_TILELANG),
                 KERNEL_STATUS_NEW_OP if (is_lr and is_ideal) else KERNEL_STATUS_FRAMEWORK,
                 bool(is_lr and is_ideal), "UB-resident fused FusedMHCCombine" if (is_lr and is_ideal) else "", suffix,
+            )
+        if rec == "hc_gate_mix" or suffix.endswith("hc_gate_mix") or suffix.endswith("hc_head_gate_mix"):
+            triton_kern = _resolve_triton_hc_gate_mix_symbol(
+                meta, resolved_sources=resolved_sources, fallback_src=fallback_src,
+            )
+            return (
+                f"mHC Low-Rank Gated Residual Mix ({suffix})",
+                triton_kern,
+                BACKEND_TRITON,
+                KERNEL_STATUS_EXISTING,
+                False,
+                "",
+                suffix,
             )
         if is_lr:
             return (
@@ -1576,7 +1628,8 @@ def _project_family_tuple(
     *, suffix: str, fam: str, rec: str, meta: Mapping[str, Any], bound_kernel: str,
     arch_family: str, is_ideal: bool, is_raw_eager: bool, is_quant_mm: bool,
     is_mxfp4_w: bool, is_int4_w: bool, is_c8_kv: bool,
-    ep_degree: int = 1, is_situ_mx: bool = False, layer_plan: Any | None,
+    ep_degree: int = 1, is_situ_mx: bool = False, layer_plan: Any | None = None,
+    resolved_sources: Sequence[Any] = (), fallback_src: str = "",
 ) -> tuple[str, str, str, str, bool, str, str]:
     is_a2_or_a3 = arch_family in {"A2", "A3"}
     mm_kernel = (
@@ -1600,6 +1653,7 @@ def _project_family_tuple(
     special = _project_engram_mhc_indexer(
         suffix, fam, rec, meta, bound_kernel, mm_kernel,
         is_ideal=is_ideal, is_a2_or_a3=is_a2_or_a3, layer_plan=layer_plan,
+        resolved_sources=resolved_sources, fallback_src=fallback_src,
     )
     if special is not None:
         return special
@@ -1754,10 +1808,16 @@ def resolve_ascend_kernel_identity(
         arch_family=arch_family, is_ideal=is_ideal, is_raw_eager=is_raw_eager,
         is_quant_mm=is_quant_mm, is_mxfp4_w=is_mxfp4_w, is_int4_w=is_int4_w,
         is_c8_kv=is_c8_kv, ep_degree=ep_degree, is_situ_mx=is_situ_mx, layer_plan=layer_plan,
+        resolved_sources=resolved_sources, fallback_src=fallback_src,
     )
 
+    is_shipping_hc_gate_mix = (
+        backend == BACKEND_TRITON
+        and kernel.endswith("_hc_gate_mix")
+        and not bool(meta.get("target_rewrite_fused"))
+    )
     # Birth KernelBinding is authoritative first (zero post-hoc kernel/backend override).
-    if has_birth:
+    if has_birth and not is_shipping_hc_gate_mix:
         if birth_readiness in _BIRTH_READINESS_MAP:
             status, needs_new = _BIRTH_READINESS_MAP[birth_readiness]
         if birth_kernel:
@@ -1770,7 +1830,7 @@ def resolve_ascend_kernel_identity(
                 (BACKEND_CATLASS if is_gemm else BACKEND_TILELANG)
                 if is_synth else normalize_public_backend(birth_backend_raw, is_gemm=is_gemm)
             )
-    else:
+    elif not is_shipping_hc_gate_mix:
         preserve_backend = "split_qkv_rmsnorm_mrope" in rec or kernel == "npu_moe_token_unpermute"
         if bound_backend and not needs_new and not (is_raw_eager and fam == "rmsnorm") and not preserve_backend:
             backend = bound_backend
@@ -1795,7 +1855,7 @@ def resolve_ascend_kernel_identity(
                 status = KERNEL_STATUS_NEW_OP
             backend = BACKEND_CATLASS if is_gemm else BACKEND_TILELANG
 
-    if isinstance(subgraph_info, Mapping):
+    if isinstance(subgraph_info, Mapping) and not is_shipping_hc_gate_mix:
         f_status = str(subgraph_info.get("fusion_status") or "").strip().lower()
         if f_status == "fused_new_kernel_required" and not needs_new:
             reason = str(subgraph_info.get("reason") or "").strip()

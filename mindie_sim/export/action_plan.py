@@ -196,14 +196,18 @@ def anchor_stage_waterfall(
     *,
     config_bridge_span_us: float | None = None,
     config_saved_us: float | None = None,
+    config_stage_saved_us: float | None = None,
+    framework_stage_saved_us: float | None = None,
 ) -> tuple[dict[str, Any], ...]:
     """Anchor 4-stage Engine waterfall onto ``before_bundle.step_span_us -> after_bundle.step_span_us``.
 
     Bridges cross-track pairs (e.g. ``merged`` -> ``expected_ideal``) so Stage 0
     is always ``before_bundle.step_span_us``, Stage 1 is the config/parallel bridge
     (or ``before`` when deployment config is identical), Stage 2 is ``after_bundle``'s
-    pre-synthesis / framework-rewrite span (bounded monotonically when latency drops),
-    and Stage 3 is ``after_bundle.step_span_us`` with zero telescoping gap.
+    pre-synthesis / framework-rewrite span, and Stage 3 is ``after_bundle.step_span_us``
+    with zero telescoping gap. When Sheet 4's exact classified stage savings
+    ``(config_stage_saved_us, framework_stage_saved_us)`` are provided, Stages 1 & 2
+    match Sheet 4 ``D4`` and ``D5`` identically.
     """
     before_us = max(0.0, float(before_bundle.step_span_us))
     after_us = max(0.0, float(after_bundle.step_span_us))
@@ -213,10 +217,15 @@ def anchor_stage_waterfall(
     raw_cfg_us = float(raw_by_stage["config_only"]["step_span_us"]) if "config_only" in raw_by_stage else None
     raw_fwk_us = float(raw_by_stage["framework_rewrite"]["step_span_us"]) if "framework_rewrite" in raw_by_stage else None
 
+    has_fwk_delta = (
+        framework_stage_saved_us is not None
+        and abs(float(framework_stage_saved_us)) > OVERLAP_EXPOSED_EPS_US
+    )
     is_modeling = (
         "framework_rewrite" in raw_by_stage
         or after_bundle.analysis_mode == MODE_MODELING
         or bool(after_bundle.target_envelope_applied)
+        or has_fwk_delta
     )
     stage_specs = canonical_comparison_stages("modeling" if is_modeling else "simulation")
     same_cfg = _is_same_deployment_config(before_bundle, after_bundle)
@@ -225,7 +234,10 @@ def anchor_stage_waterfall(
         else (raw_before_us if raw_before_us is not None else after_us)
     )
 
-    if before_us >= after_us:
+    if config_stage_saved_us is not None and framework_stage_saved_us is not None:
+        s1 = max(0.0, before_us - float(config_stage_saved_us))
+        s2 = max(0.0, s1 - float(framework_stage_saved_us))
+    elif before_us >= after_us:
         s2 = min(before_us, max(after_us, fwk_raw))
         if same_cfg:
             s1 = before_us

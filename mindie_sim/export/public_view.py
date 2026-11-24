@@ -736,6 +736,7 @@ def _project_mega_fusion(raw: Any) -> dict[str, Any] | None:
     for key in (
         "exposed_before_ms", "boundary_lower_bound_ms", "tiled_engine_ms",
         "gain_ceiling_ms", "gain_expected_ms",
+        "tilelang_simt_gain_ms", "tilelang_simd_or_ascendc_gain_ms",
     ):
         fval = _coerce_finite_float(_get_field(raw, key))
         if fval is not None:
@@ -744,6 +745,9 @@ def _project_mega_fusion(raw: Any) -> dict[str, Any] | None:
         ival = _coerce_strict_int(_get_field(raw, key))
         if ival is not None:
             out[key] = ival
+    ub_warn = _get_field(raw, "ub_wall_warning")
+    if isinstance(ub_warn, str) and ub_warn.strip():
+        out["ub_wall_warning"] = sanitize_public_text(ub_warn)
     return out
 
 
