@@ -543,6 +543,10 @@ owns = ["mindie_sim/compose/__init__.py", "mindie_sim/compose/runtime.py", "mind
 path = "serving/test_mapreduce_solver_and_export_polish.py"
 tier = "tier1"
 owns = ["mindie_sim/sweep/mapreduce.py", "mindie_sim/sweep/pd.py", "mindie_sim/solve.py", "mindie_sim/export/bundle.py", "mindie_sim/export/action_plan.py", "mindie_sim/export/kernel_catalog.py", "mindie_sim/export/xlsx_summary.py"]
+[[module]]
+path = "serving/test_stage5b_solver_speedup_and_parity.py"
+tier = "tier1"
+owns = ["mindie_sim/prediction/runtime/dp_cohort_dedup.py", "mindie_sim/prediction/runtime/accel_bridge.py", "mindie_sim/sweep/pd.py", "mindie_sim/solve.py"]
 # ---------------------------------------------------------------- observations
 [[module]]
 path = "observations/test_multilevel_gate.py"
