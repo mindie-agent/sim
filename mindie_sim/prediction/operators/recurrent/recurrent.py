@@ -355,12 +355,13 @@ def _emit_gdn_pcp_prefix_scan(b, *, index, view, dep, heads, dk, dv, pcp, chunk)
 def _lower_segmented_gdn_scan(b, *, view, index, views, last, normalized, chunk,
                               heads, dk, dv, state_bytes, value_width, parallel):
     prefix, plan = b.prefix, b.plan
-    version, previous, segment_index = view.context, last, 0
+    previous, segment_index = last, 0
     total_global = view.global_q_len or view.q_len
     for range_index, (start, end) in enumerate(view.query_ranges):
         length = int(end) - int(start)
         if length <= 0:
             continue
+        version = int(view.context) + int(start)
         seg_chunks = math.ceil(length / chunk)
         seg_vec = seg_chunks * 2 * heads * dk * dv + length * heads * (2 + 2 * dv)
         seg_read = seg_chunks * state_bytes + length * heads * (2 * dk + dv) * 2
@@ -392,11 +393,7 @@ def _lower_segmented_gdn_scan(b, *, view, index, views, last, normalized, chunk,
             "state_segment_range": (int(start), int(end)),
             "state_segment_from_version": version,
             "state_segment_to_version": version + length}.items()))
-        previous, version = seg, version + length
-        if range_index < len(view.query_ranges) - 1:
-            gap = int(view.query_ranges[range_index + 1][0]) - int(end)
-            if gap:
-                version += gap
+        previous = seg
         segment_index += 1
     if previous is not None and parallel.pcp > 1:
         previous = _emit_gdn_pcp_prefix_scan(
@@ -604,7 +601,7 @@ def _bind_kda_decode(b, *, decode_source, views, parallel, projection_group, bet
     decode_binder = (getattr(decode_source.module, "bind_decode_scans", None)
                      if decode_source else None)
     if decode_binder is not None and views and all(view.phase == "decode" for view in views):
-        if parallel.cp > 1:
+        if parallel.pcp > 1 and parallel.cp > 1:
             raise ModelingError("kda_source_recurrent_requires_decode_only_pcp1")
         options = dict(decode_source.options)
         # This caller provides raw Q/K and decay. The selected kernel owns
@@ -773,11 +770,32 @@ def _fuse_gdn_decode_scans(b, outputs, *, heads, dk, dv):
 
 
 def _is_raw_eager(runtime) -> bool:
+    if runtime is None:
+        return False
     meta = dict(getattr(runtime, "metadata", ()) or ())
-    return bool(
-        meta.get("raw_eager")
-        or (meta.get("execution_policy") or {}).get("raw_eager")
-    )
+    if meta.get("raw_eager") or (meta.get("execution_policy") or {}).get("raw_eager"):
+        return True
+    spine = getattr(runtime, "single_spine", None) or meta.get("single_spine")
+    track_spec = getattr(spine, "track_spec", None)
+    if track_spec is None and isinstance(spine, dict):
+        track_spec = spine.get("track_spec")
+    track = getattr(track_spec, "track", None)
+    if track is None and isinstance(track_spec, dict):
+        track = track_spec.get("track")
+    return str(track or "").strip().lower() == "raw_eager"
+
+
+def _resolve_recurrent_fusion_status(
+    runtime, *, has_fused_kernel: bool, has_source_binding: bool = False,
+) -> tuple[str, bool]:
+    """Derive fusion_status from execution track/readiness (Step 2: ProbedAbiRegistry hook)."""
+    if _is_raw_eager(runtime):
+        return "unfused_decomposed", False
+    if has_fused_kernel:
+        return "fused_existing", False
+    if has_source_binding:
+        return "fused_framework_enable", False
+    return "unfused_decomposed", False
 
 
 def _lower_output_norm_gate(b, *, outputs, output_gate, tokens, heads, dv, value_width,
@@ -888,6 +906,9 @@ def _lower_output_norm_gate(b, *, outputs, output_gate, tokens, heads, dv, value
                       if projection_group else ()))
     native_kind = ("layer_norm_gated_fwd_kernel" if plan.attention == "kda"
                    else "_layer_norm_fwd_1pass_kernel_npu")
+    norm_fusion_status, norm_native_eligible = _resolve_recurrent_fusion_status(
+        runtime, has_fused_kernel=True,
+    )
     declare_group(
         b.ops, key=b.prefix + ".gated_rmsnorm", role="gated_rmsnorm",
         family="norm_gate", members=(output,), entries=(output,),
@@ -899,9 +920,9 @@ def _lower_output_norm_gate(b, *, outputs, output_gate, tokens, heads, dv, value
         source=source_reference(
             "vllm_ascend/ops/kimi_kda.py" if plan.attention == "kda"
             else "vllm_ascend/ops/gdn.py", "FusedRMSNormGated"),
-        fusion_status="fused_existing",
+        fusion_status=norm_fusion_status,
         fusion_reason="triton_fused_rmsnorm_gated_kernel",
-        native_fusion_eligible=False,
+        native_fusion_eligible=norm_native_eligible,
     )
     return output
 
@@ -909,7 +930,7 @@ def _lower_output_norm_gate(b, *, outputs, output_gate, tokens, heads, dv, value
 def _declare_recurrent_group(b, tensors, *, views, heads, key_heads, dk, dv, chunk,
                              tokens, output_gate, output_gate_view, prefill_source, decode_source,
                              decode_core, kda_caps, gated, normalized,
-                             prefill_scan_ids=(), prepare_ids=()):
+                             prefill_scan_ids=(), prepare_ids=(), runtime=None):
     prefix, plan, model = b.prefix, b.plan, b.model
     if plan.attention == "gdn":
         core = [op for op in b.ops if op.family in {
@@ -1005,6 +1026,11 @@ def _declare_recurrent_group(b, tensors, *, views, heads, key_heads, dk, dv, chu
                 entries = (normalized, gated)
             state_selection = (dict(decode_core.metadata).get("state_selection")
                                if decode_core is not None else None)
+            kda_fusion_status, _ = _resolve_recurrent_fusion_status(
+                runtime,
+                has_fused_kernel=(decode_core is not None),
+                has_source_binding=(phase_source is not None),
+            )
             declare_group(
                 b.ops, key=prefix + ".kda_core", role="kda_chunk" if prefill else "kda_recurrent",
                 family="kda", members=members, entries=entries, anchor=core[-1].op_id,
@@ -1048,10 +1074,9 @@ def _declare_recurrent_group(b, tensors, *, views, heads, key_heads, dk, dv, chu
                         "native_backing_tensor_extent_does_not_identify_active_view",
                         "state_indices_and_gate_flags_not_observed"]),
                 },
-                fusion_status=("fused_existing" if decode_core is not None
-                               else "fused_framework_enable" if phase_source
-                               else "unfused_decomposed"),
-                fusion_reason=("source_selected_kda_recurrent_kernel" if decode_core is not None
+                fusion_status=kda_fusion_status,
+                fusion_reason=("unfused_raw_eager_kda" if kda_fusion_status == "unfused_decomposed" and _is_raw_eager(runtime)
+                               else "source_selected_kda_recurrent_kernel" if decode_core is not None
                                else "source_selected_kda_chunk_kernel" if phase_source
                                else "analytical_kda_decomposition"),
             )
@@ -1351,7 +1376,7 @@ def linear(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         chunk=chunk, tokens=tokens, output_gate=output_gate, output_gate_view=output_gate_view,
         prefill_source=prefill_source, decode_source=decode_source, decode_core=decode_core,
         kda_caps=kda_caps, gated=gated, normalized=normalized,
-        prefill_scan_ids=prefill_scan_ids, prepare_ids=prepare_ids)
+        prefill_scan_ids=prefill_scan_ids, prepare_ids=prepare_ids, runtime=runtime)
     if use_recover_ssm and any(view.phase == "decode" and view.q_len > 1 for view in views):
         emit_commit_op(b, name="recover_ssm_commit", deps=tuple(outputs), views=views,
                        heads=heads, dk=dk, dv=dv, state_dtype=plan.recurrent_state_dtype,

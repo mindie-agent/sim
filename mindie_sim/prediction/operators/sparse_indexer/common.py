@@ -85,6 +85,50 @@ SCORE_SLOT_NAME = "index_score"
 DEFAULT_INDEX_DIM = 128
 
 
+def is_block_msa_indexer(plan) -> bool:
+    """Single source of truth for GQA block-maxima MSA indexers (Q heads sharded across TP)."""
+    if plan is None or str(getattr(plan, "attention", "") or "") != "gqa":
+        return False
+    cand_blk = int(getattr(plan, "candidate_block_size", 0) or 0)
+    cand_topk = int(getattr(plan, "candidate_topk_blocks", 0) or 0)
+    idx_topk = int(getattr(plan, "index_topk", 0) or 0)
+    return (
+        cand_blk > 0
+        and cand_topk > 0
+        and not bool(getattr(plan, "index_kpool_compress", False))
+        and (idx_topk <= 0 or cand_topk < idx_topk)
+    )
+
+
+def is_region_csa_indexer(plan) -> bool:
+    """Single source of truth for compressed region-score CSA indexers (cand_block == kpool)."""
+    if plan is None or str(getattr(plan, "attention", "") or "") != "gqa":
+        return False
+    kpool = int(getattr(plan, "index_kpool", 1) or 1)
+    cand_blk = int(getattr(plan, "candidate_block_size", 0) or 0)
+    cand_topk = int(getattr(plan, "candidate_topk_blocks", 0) or 0)
+    idx_topk = int(getattr(plan, "index_topk", 0) or 0)
+    return (
+        bool(getattr(plan, "index_kpool_compress", False))
+        and kpool > 1
+        and cand_blk == kpool
+        and cand_topk > 0
+        and (idx_topk <= 0 or cand_topk * cand_blk == idx_topk)
+    )
+
+
+def is_qsa_pooled_indexer(plan) -> bool:
+    """Single source of truth for pooled-K QSA indexers (LightningIndexerV2)."""
+    if plan is None or str(getattr(plan, "attention", "") or "") != "gqa":
+        return False
+    kpool = int(getattr(plan, "index_kpool", 1) or 1)
+    return (
+        bool(getattr(plan, "index_kpool_compress", False))
+        and kpool > 1
+        and not is_region_csa_indexer(plan)
+    )
+
+
 def _integer(name: str, value: int, minimum: int = 1) -> None:
     if type(value) is not int or value < minimum:
         raise ModelingError(f"sparse_indexer_invalid_{name}:{value!r}")

@@ -595,9 +595,17 @@ def build_recover_ssm_commit(family: str, dk: int, dv: int, *, q: int, a: int, h
     state = verify.state_read_bytes if a else 0
     checkpoints = tuple(point for point in boundaries if point <= a)
     replay_tokens = a * heads * sequences if q > 1 else 0
+    if family in {"gdn", "kda"}:
+        from ..recurrent.recover_ssm_commit import REVERSE_FMA_OPS_PER_STATE_ELEMENT
+        vec_ops = (
+            REVERSE_FMA_OPS_PER_STATE_ELEMENT * (a + 1) * heads * sequences * dk * dv
+            if (q > 1 and a > 0) else 0
+        )
+    else:
+        vec_ops = (REPLAY_OPS_PER_STATE_ELEMENT + (family == "gla")) * replay_tokens * dk * dv
     return RecoverSsmCommitPlan(
         verify.transition, q, a, state, replay_tokens * verify.transition.record_bytes,
-        (REPLAY_OPS_PER_STATE_ELEMENT + (family == "gla")) * replay_tokens * dk * dv,
+        vec_ops,
         state * (1 + sum(point < a for point in checkpoints)),
         base_version, base_version + int(a > 0), a == 0, checkpoints,
     )
@@ -815,7 +823,7 @@ def _resolve_recover_ssm_window(
         return m["q"]
     if c.operation == "recover_ssm_verify":
         return max(c.lengths)
-    q = min(c.lengths)
+    q = max(c.lengths)
     if q > 1:
         return q
     qt = m.get("query_tokens")
@@ -829,45 +837,49 @@ def _resolve_recover_ssm_window(
     return max(q, 1 + max(proposals)) if proposals and max(proposals) > 0 else q
 
 
+def _validate_per_request_acceptance(
+    items: Sequence[Any], per_req_bounds: Sequence[int], default_q: int,
+) -> tuple[int, ...]:
+    if not items:
+        raise ModelingError(f"recover_ssm_acceptance_length_mismatch:0:{len(per_req_bounds)}")
+    parsed: list[int] = []
+    if per_req_bounds and len(items) != len(per_req_bounds):
+        raise ModelingError(f"recover_ssm_acceptance_length_mismatch:{len(items)}:{len(per_req_bounds)}")
+    use_per_req = len(items) == len(per_req_bounds)
+    for idx, item in enumerate(items):
+        if isinstance(item, bool) or not isinstance(item, int):
+            raise ModelingError("recover_ssm_requires_integer_acceptance")
+        bound = int(per_req_bounds[idx]) if use_per_req else int(default_q)
+        if item < 0 or item > bound:
+            raise ModelingError(f"recover_ssm_acceptance_out_of_range:{item}:{bound}")
+        parsed.append(int(item))
+    return tuple(parsed)
+
+
 def _resolve_recover_ssm_accepted_per_request(
     m: Mapping[str, Any], ctx: OperatorPlanningContext, q: int, sequences: int,
-) -> tuple[int, ...] | Any:
-    """Resolve per-request integer accepted prefixes without averaging across requests."""
-    raw_vec = m.get("accepted_per_request")
-    if isinstance(raw_vec, (tuple, list)) and raw_vec:
-        parsed = []
-        for item in raw_vec:
-            if isinstance(item, bool) or not isinstance(item, int):
-                raise ModelingError("recover_ssm_requires_integer_acceptance")
-            if item < 0 or item > q:
-                raise ModelingError(f"recover_ssm_acceptance_out_of_range:{item}:{q}")
-            parsed.append(int(item))
-        return tuple(parsed)
+    per_req_bounds: Sequence[int] = (),
+) -> tuple[int, ...] | None:
+    """Normalize every acceptance spelling into one validated integer tuple (never averaged or rounded)."""
+    seq_count = len(per_req_bounds) if per_req_bounds else max(1, int(sequences))
+    if "accepted_per_request" in m and m["accepted_per_request"] is not None:
+        raw_vec = m["accepted_per_request"]
+        if not isinstance(raw_vec, (tuple, list)):
+            raise ModelingError("recover_ssm_requires_integer_acceptance")
+        return _validate_per_request_acceptance(raw_vec, per_req_bounds, q)
     raw_a = m.get("a", m.get("accepted", m.get("accepted_tokens")))
     if raw_a is not None:
         if isinstance(raw_a, (tuple, list)):
-            parsed = []
-            for item in raw_a:
-                if isinstance(item, bool) or not isinstance(item, int):
-                    raise ModelingError("recover_ssm_requires_integer_acceptance")
-                if item < 0 or item > q:
-                    raise ModelingError(f"recover_ssm_acceptance_out_of_range:{item}:{q}")
-                parsed.append(int(item))
-            return tuple(parsed)
-        if isinstance(raw_a, float) and not isinstance(raw_a, bool) and math.isfinite(raw_a):
-            return max(0, min(q, math.ceil(raw_a)))
-        return raw_a
-    committed = m.get("committed_tokens")
-    if isinstance(committed, (tuple, list)) and committed:
-        parsed = []
-        for item in committed:
-            val = item[1] if isinstance(item, (tuple, list)) and len(item) >= 2 else item
-            if isinstance(val, bool) or not isinstance(val, int):
-                raise ModelingError("recover_ssm_requires_integer_acceptance")
-            if val < 0 or val > q:
-                raise ModelingError(f"recover_ssm_acceptance_out_of_range:{val}:{q}")
-            parsed.append(int(val))
-        return tuple(parsed)
+            return _validate_per_request_acceptance(raw_a, per_req_bounds, q)
+        if isinstance(raw_a, bool) or not isinstance(raw_a, int):
+            raise ModelingError("recover_ssm_requires_integer_acceptance")
+        return _validate_per_request_acceptance((int(raw_a),) * seq_count, per_req_bounds, q)
+    if "committed_tokens" in m and m["committed_tokens"] is not None:
+        committed = m["committed_tokens"]
+        if not isinstance(committed, (tuple, list)):
+            raise ModelingError("recover_ssm_requires_integer_acceptance")
+        vals = [item[1] if isinstance(item, (tuple, list)) and len(item) >= 2 else item for item in committed]
+        return _validate_per_request_acceptance(vals, per_req_bounds, q)
     views = [
         v for v in (getattr(ctx, "requests", ()) or getattr(ctx, "request_views", ()) or ())
         if not getattr(v, "padding", False)
@@ -877,18 +889,110 @@ def _resolve_recover_ssm_accepted_per_request(
         vals = adv if any(v > 0 for v in adv) else [
             int(getattr(v, "draft_accepted_tokens", 0) or 0) for v in views
         ]
-        for v in vals:
-            if v < 0 or v > q:
-                raise ModelingError(f"recover_ssm_acceptance_out_of_range:{v}:{q}")
-        return tuple(vals)
+        bounds = [
+            max(1, int(getattr(v, "q_len", 1)), 1 + int(getattr(v, "draft_proposal_tokens", 0) or 0))
+            for v in views
+        ]
+        return _validate_per_request_acceptance(vals, bounds, q)
     return None
 
 
-def _resolve_recover_ssm_accepted(
-    m: Mapping[str, Any], ctx: OperatorPlanningContext, q: int,
-) -> Any:
-    """Backward-compatible wrapper returning exact scalar or per-request tuple (never averaged)."""
-    return _resolve_recover_ssm_accepted_per_request(m, ctx, q, 1)
+def _resolve_recover_ssm_commit_totals(
+    c: LinearAttentionContract,
+    *,
+    family: str,
+    q: int,
+    arch_id: str,
+    accepted_raw: tuple[int, ...] | None,
+    base_ver: int,
+    options: Mapping[str, Any],
+    replay_bytes: Callable[[RecoverSsmCommitPlan, int], int] | None,
+) -> tuple[RecoverSsmCommitPlan, tuple[int, ...], int, int, int, int, int, int, int, int, int, int]:
+    """Compute unified G4 RecoverSSM commit work, HBM byte totals, and Triton tile geometry."""
+    from ..recurrent.recover_ssm_commit import compute_recover_ssm_commit_work, resolve_commit_tile_geometry
+
+    m = c.metadata
+    num_layers = max(1, int(m.get("num_layers", 1) or 1))
+    boundary_ops = int(m.get("boundary_matrix_ops", 0) or 0)
+    boundary_write = float(m.get("boundary_write_bytes", 0.0) or 0.0)
+    boundaries = m.get("boundary_checkpoints", m.get("boundaries", ()))
+    if accepted_raw is None:
+        build_recover_ssm_commit(
+            family, c.dk, c.dv, a=None, base_version=base_ver,
+            boundary_checkpoints=boundaries, **options,
+        )
+        raise ModelingError("recover_ssm_commit_requires_accepted_prefix")
+    per_req = accepted_raw
+    max_depth = max(per_req, default=0)
+    active_seqs = sum(1 for a_i in per_req if a_i > 0)
+    commit = build_recover_ssm_commit(
+        family, c.dk, c.dv, a=max_depth, base_version=base_ver,
+        boundary_checkpoints=boundaries, **{**options, "sequences": max(1, active_seqs)},
+    )
+    v_tiles = max(1, ceil_div(c.dv, c.bv))
+    head_groups = max(1, c.hv)
+    rec_override_raw = m.get("record_bytes_per_token", m.get("record_bytes"))
+    rec_override = float(rec_override_raw) if rec_override_raw is not None else None
+    state_override_raw = m.get("state_bytes")
+    state_override = float(state_override_raw) if state_override_raw is not None else None
+    if family in {"gdn", "kda"}:
+        eff_align_tiling = bool(m.get("align_mode", False)) and (
+            family == "gdn" or bool(m.get("recover_ssm_commit_kind") == "boundary")
+        )
+        _, geom_v_tiles, head_groups = resolve_commit_tile_geometry(
+            family_kind=family, dk=c.dk, dv=c.dv, heads=c.hv,
+            arch_family=arch_id, state_dtype=c.state_dtype,
+            align_mode=eff_align_tiling,
+        )
+        explicit_vt = m.get("v_tiles")
+        v_tiles = int(explicit_vt) if (explicit_vt is not None and int(explicit_vt) > 0) else geom_v_tiles
+        work = compute_recover_ssm_commit_work(
+            family_kind=family, accepted_per_request=per_req,
+            heads=c.hv, dk=c.dk, dv=c.dv, state_dtype=c.state_dtype,
+            kg_dtype=str(m.get("record_kg_dtype", m.get("kg_dtype", "bf16"))),
+            v_tiles=v_tiles, boundary_ops=0, boundary_write_bytes=0.0,
+            record_bytes_override=rec_override, state_bytes_override=state_override,
+        )
+        total_replay = int(work["total_tokens"])
+        state_read = int(round(work["state_read_bytes"])) * num_layers
+        state_write = int(round(work["state_write_bytes"])) * num_layers + int(round(boundary_write))
+        record_read = int(round(work["physical_tiled_record_read_bytes"])) * num_layers
+        if replay_bytes and total_replay > 0:
+            record_read = replay_bytes(
+                replace(commit, record_read_bytes=int(round(work["unique_record_read_bytes"]))),
+                total_replay,
+            ) * num_layers
+        vector_ops = (int(work["vector_ops"]) * num_layers + boundary_ops) if q > 1 else 0
+    else:
+        total_replay = sum(per_req)
+        per_seq_state = (
+            int(round(state_override))
+            if state_override is not None
+            else c.hv * c.dk * c.dv * element_bytes(c.state_dtype)
+        )
+        state_read = active_seqs * per_seq_state * num_layers
+        state_write = active_seqs * per_seq_state * num_layers + int(round(boundary_write))
+        per_tok_rec = (
+            int(round(rec_override))
+            if rec_override is not None
+            else c.hv * commit.transition.record_bytes
+        )
+        record_read = total_replay * per_tok_rec * num_layers
+        if replay_bytes and total_replay > 0:
+            record_read = replay_bytes(
+                replace(commit, record_read_bytes=total_replay * per_tok_rec), total_replay,
+            ) * num_layers
+        vector_ops = (
+            (REPLAY_OPS_PER_STATE_ELEMENT + (family == "gla")) * total_replay * c.hv * c.dk * c.dv * num_layers
+            + (boundary_ops if q > 1 else 0)
+            if q > 1 else 0
+        )
+    published_ver = commit.base_version + int(active_seqs > 0)
+    return (
+        commit, per_req, active_seqs, total_replay, max_depth,
+        state_read, state_write, record_read, vector_ops, published_ver,
+        v_tiles, head_groups,
+    )
 
 
 def _build_recover_ssm_commit_phases(
@@ -898,48 +1002,39 @@ def _build_recover_ssm_commit_phases(
     family: str,
     q: int,
     options: Mapping[str, Any],
-    replay_bytes: Callable[[RecoverSsmCommitPlan], int] | None,
+    replay_bytes: Callable[[RecoverSsmCommitPlan, int], int] | None,
 ) -> tuple[list[Phase], dict[str, Any], Any]:
+    from ..recurrent.recover_ssm_commit import (
+        COMMIT_KERNEL_BACKEND,
+        GDN_COMMIT_KERNEL_ID,
+        KDA_COMMIT_KERNEL_ID,
+        _parse_version_number,
+    )
     m = c.metadata
-    accepted_raw = _resolve_recover_ssm_accepted_per_request(m, ctx, q, len(c.lengths))
-    if isinstance(accepted_raw, tuple):
-        per_req = accepted_raw
-        active_seqs = sum(1 for a_i in per_req if a_i > 0)
-        total_replay = sum(per_req)
-        max_depth = max(per_req, default=0)
-        # Validate transition family and base geometry via a single-sequence commit plan.
-        ref_a = max_depth
-        commit = build_recover_ssm_commit(
-            family, c.dk, c.dv, a=ref_a,
-            base_version=m.get("base_version", 0),
-            boundary_checkpoints=m.get("boundary_checkpoints", m.get("boundaries", ())),
-            **{**options, "sequences": max(1, active_seqs)},
-        )
-        per_seq_state = c.hv * c.dk * c.dv * element_bytes(c.state_dtype)
-        state_read = active_seqs * per_seq_state
-        state_write = active_seqs * per_seq_state
-        record_read = total_replay * c.hv * commit.transition.record_bytes
-        if replay_bytes and record_read:
-            scaled_commit = replace(commit, record_read_bytes=record_read)
-            record_read = replay_bytes(scaled_commit)
-        vector_ops = total_replay * REPLAY_OPS_PER_STATE_ELEMENT * c.hv * c.dk * c.dv
-        published_ver = commit.base_version + total_replay
+    accepted_raw = _resolve_recover_ssm_accepted_per_request(
+        m, ctx, q, len(c.lengths), per_req_bounds=c.lengths,
+    )
+    req_transitions = tuple(m.get("request_state_transitions") or ())
+    het_versions = bool(m.get("heterogeneous_state_versions", False)) or (
+        len({str(t[3]) for t in req_transitions if isinstance(t, (tuple, list)) and len(t) >= 5}) > 1
+    )
+    base_ver_raw = m.get("base_version")
+    if het_versions:
+        base_ver = 0
+    elif base_ver_raw is None and m.get("input_state_version"):
+        parsed_v, _ = _parse_version_number(m.get("input_state_version"))
+        base_ver = int(parsed_v or 0)
     else:
-        commit = build_recover_ssm_commit(
-            family, c.dk, c.dv, a=accepted_raw,
-            base_version=m.get("base_version", 0),
-            boundary_checkpoints=m.get("boundary_checkpoints", m.get("boundaries", ())),
-            **options,
-        )
-        per_req = (commit.a,) * len(c.lengths)
-        active_seqs = len(c.lengths) if commit.a > 0 else 0
-        total_replay = commit.a * len(c.lengths)
-        max_depth = commit.a
-        state_read = commit.state_read_bytes
-        state_write = commit.state_write_bytes
-        record_read = replay_bytes(commit) if replay_bytes and commit.record_read_bytes else commit.record_read_bytes
-        vector_ops = commit.vector_ops
-        published_ver = commit.published_version
+        base_ver = 0 if base_ver_raw is None else base_ver_raw
+    arch_id = str(ctx.compute_arch.arch_id)
+    (
+        commit, per_req, active_seqs, total_replay, max_depth,
+        state_read, state_write, record_read, vector_ops, published_ver,
+        v_tiles, head_groups,
+    ) = _resolve_recover_ssm_commit_totals(
+        c, family=family, q=q, arch_id=arch_id, accepted_raw=accepted_raw,
+        base_ver=base_ver, options=options, replay_bytes=replay_bytes,
+    )
 
     phases: list[Phase] = []
     if c.abi == "commit_recurrent_kda" or (q == 1 and total_replay > 0):
@@ -966,35 +1061,54 @@ def _build_recover_ssm_commit_phases(
                 checkpoint = f"publish_boundary_{end}"
                 phases.append(Phase(checkpoint, transfer(ctx, write=state_read), after))
                 after = (checkpoint,)
-        phases.append(Phase("publish", transfer(ctx, write=state_read), after))
-    result = {
+        publish_bytes = state_write if not commit.boundary_checkpoints else state_read
+        phases.append(Phase("publish", transfer(ctx, write=publish_bytes), after))
+    is_triton_family = family in {"gdn", "kda"}
+    kb_id = (
+        (GDN_COMMIT_KERNEL_ID if family == "gdn" else KDA_COMMIT_KERNEL_ID)
+        if is_triton_family else "RecoverSSMStateCommit"
+    )
+    kb_backend = COMMIT_KERNEL_BACKEND if is_triton_family else "CANN"
+    kb_readiness = str(
+        m.get("recover_ssm_readiness")
+        or ("proposed_pr" if family == "gdn" else "shipping")
+    )
+    num_layers = max(1, int(m.get("num_layers", 1) or 1))
+    result: dict[str, Any] = {
         "q": q,
         "a": max_depth,
         "accepted_per_request": per_req,
         "active_sequences": active_seqs,
         "total_replay_tokens": total_replay,
         "max_replay_depth": max_depth,
-        "published_version": published_ver,
-        "base_version": commit.base_version,
+        "published_version": None if het_versions else published_ver,
+        "base_version": None if het_versions else commit.base_version,
+        "heterogeneous_state_versions": het_versions,
+        "request_state_transitions": req_transitions,
         "skipped_zero_accept": total_replay == 0,
         "boundary_checkpoints": commit.boundary_checkpoints,
         "physical_record_read_bytes": record_read,
+        "v_tiles": v_tiles,
+        "head_groups": head_groups,
+        "num_layers": num_layers,
         "kernel_binding": KernelBinding(
-            kernel_id="RecoverSSMStateCommit",
-            backend="CANN",
-            arch_family=str(ctx.compute_arch.arch_id),
+            kernel_id=kb_id,
+            backend=kb_backend,
+            arch_family=arch_id,
             submodule="recurrent_state",
             macro_module="attention",
-            readiness="shipping",
+            readiness=kb_readiness,  # type: ignore[arg-type]
             recipe_id=str(c.abi or c.operation or "recover_ssm_commit"),
         ).to_dict(),
     }
+    if het_versions and m.get("published_state_version"):
+        result["published_state_version"] = str(m["published_state_version"])
     return phases, result, commit.transition
 
 
 def build_recover_ssm_plan(contract: LinearAttentionContract, ctx: OperatorPlanningContext, *,
                            sources: tuple[SourceRef, ...] = (),
-                           replay_bytes: Callable[[RecoverSsmCommitPlan], int] | None = None) -> OperatorPlan:
+                           replay_bytes: Callable[[RecoverSsmCommitPlan, int], int] | None = None) -> OperatorPlan:
     c = contract
     m = c.metadata
     q = _resolve_recover_ssm_window(c, ctx)
@@ -1044,9 +1158,12 @@ def build_recover_ssm_plan(contract: LinearAttentionContract, ctx: OperatorPlann
             c, ctx, family=family, q=q, options=options, replay_bytes=replay_bytes,
         )
         active_seqs = int(result.get("active_sequences", 0))
-        owners = max(1, active_seqs * c.hv * ceil_div(c.dv, c.bv)) if active_seqs > 0 else 0
+        eff_head_groups = int(result.get("head_groups", c.hv) or c.hv)
+        eff_v_tiles = int(result.get("v_tiles", ceil_div(c.dv, c.bv)) or 1)
+        eff_layers = int(result.get("num_layers", 1) or 1)
+        owners = max(1, active_seqs * eff_layers * eff_head_groups * eff_v_tiles) if active_seqs > 0 else 0
     return make_plan(ctx, c.abi or c.operation, phases, sources=sources, family="recover_ssm",
                      launch_count=int(bool(phases)), owners=owners if owners > 0 else None, metadata={
-                         **result, "ssm_family": family, "record_bytes": transition.record_bytes,
+                         **result, "owners": owners, "ssm_family": family, "record_bytes": transition.record_bytes,
                          "upstream_verified": transition.upstream_verified,
                      })

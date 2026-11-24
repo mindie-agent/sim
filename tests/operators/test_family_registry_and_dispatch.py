@@ -144,9 +144,10 @@ def test_attention_recipe_enforces_requested_abi_and_preserves_caller_override(b
     with pytest.raises(UnmodeledCapabilityError, match="attention_abi_conflict"):
         book.prepare(mismatched, geom)
     _, reference = book.prepare(op, geom)
-    for compute_arch in (geom.compute_arch, None):
-        _, synthetic = book.prepare(op, replace(geom, datapath=None, compute_arch=compute_arch))
-        assert synthetic.work == reference.work
+    _, synthetic = book.prepare(op, replace(geom, datapath=None, compute_arch=geom.compute_arch))
+    assert synthetic.work == reference.work
+    with pytest.raises(UnmodeledCapabilityError, match="attention_datapath_required"):
+        book.prepare(op, replace(geom, datapath=None, compute_arch=None))
     _, override = RecipeBook({op.recipe: PlannedRecipe(_products)}).prepare(mismatched, geom)
     assert override.work == _products(op, geom).work
 def test_governed_source_calls_keep_builtin_and_caller_kernel_expanders():

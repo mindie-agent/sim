@@ -95,6 +95,16 @@ class RequestView:
     #: Optional outer physical tensor padding lengths for rectangular BSND/BNSD/BSH layouts.
     padded_q_len: int = 0
     padded_seq_len: int = 0
+    #: Monotonic per-request recurrent/KV state version, slot & prior publication.
+    state_version: int = 0
+    state_slot: int | None = None
+    state_generation: int = 0
+    previous_state_publication: str = ""
+    #: Next-step speculative proposal width decoupled from the current verified width.
+    next_draft_proposal_tokens: int | None = None
+    #: Optional typed Mamba/SSM block table row & boundary descriptor for align-mode RecoverSSM.
+    mamba_block_table: tuple[int, ...] = ()
+    recover_ssm_boundary: tuple[tuple[str, Any], ...] = ()
 
     def __post_init__(self) -> None:
         if not self.semantic_phase:
@@ -156,6 +166,16 @@ class RequestView:
             payload["padded_q_len"] = self.padded_q_len
         if self.padded_seq_len:
             payload["padded_seq_len"] = self.padded_seq_len
+        if self.state_version:
+            payload["state_version"] = self.state_version
+        if self.state_slot is not None:
+            payload["state_slot"] = self.state_slot
+        if self.state_generation:
+            payload["state_generation"] = self.state_generation
+        if self.previous_state_publication:
+            payload["previous_state_publication"] = self.previous_state_publication
+        if self.next_draft_proposal_tokens is not None:
+            payload["next_draft_proposal_tokens"] = self.next_draft_proposal_tokens
         return payload
 
 @dataclass(frozen=True)

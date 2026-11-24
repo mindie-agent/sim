@@ -6,6 +6,7 @@
 [Side-Effect Policy] Pure computation."""
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import replace
 
 from mindie_sim.schema.operators import OpSpec
@@ -414,6 +415,14 @@ class AttentionResidual(Residual):
             write_bytes_override=tokens * model.hidden_size * act_bytes,
             **common)
         ops = [concat, values, normalized, scores, probabilities, mix, cast]
+        features = c.get("features")
+        rt_meta = dict(getattr(features, "metadata", ()) or ()) if features is not None else {}
+        spine = rt_meta.get("single_spine") if isinstance(rt_meta.get("single_spine"), Mapping) else {}
+        track_spec = spine.get("track_spec") if isinstance(spine.get("track_spec"), Mapping) else {}
+        track = str(track_spec.get("track") or "").strip().lower()
+        is_eager = track == "eager" or bool(rt_meta.get("raw_eager"))
+        arch_fam = str(rt_meta.get("arch_family") or "").strip().upper()
+        attn_res_fused = (not is_eager) and arch_fam in {"A3", "A5"}
         declare_group(
             ops, key=c["prefix"] + ".attention_residual_group",
             role="attn_res_prefix_point", family="attn_res_prefix",
@@ -426,9 +435,12 @@ class AttentionResidual(Residual):
             source=source_reference("vllm_ascend/models/kimi_k3.py", "_apply_attention_residual"),
             coverage={"kind": "complete_subgraph",
                       "limitations": ["native_residual_slot_order_requires_descriptor_evidence"]},
-            fusion_status="unfused_decomposed",
-            fusion_reason="decomposed_attention_residual_fp32_chain",
-            native_fusion_eligible=False,
+            fusion_status=("fused_existing" if attn_res_fused else "unfused_decomposed"),
+            fusion_reason=(
+                "shipping_attn_res_fwd_kernel"
+                if attn_res_fused else "decomposed_attention_residual_fp32_chain"
+            ),
+            native_fusion_eligible=not is_eager,
         )
         return ops, cast.op_id, ready
 

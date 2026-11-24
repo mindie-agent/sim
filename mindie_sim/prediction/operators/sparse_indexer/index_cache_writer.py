@@ -38,7 +38,9 @@ C8_INDEXER_CACHE_RECIPE = "cann_indexer_quant_cache_c8"
 LEGACY_INDEXER_CACHE_RECIPE = "indexer_quant_cache"
 SCATTER_PA_KV_RECIPE = "scatter_pa_kv_cache"
 QSA_DUAL_CACHE_RECIPE = "qsa_index_cache_write"
-STEP5_SUMMARY_RECIPE = "step5_csa_summary_update"
+REGION_SUMMARY_RECIPE = "region_summary_cache_update"
+REGION_SUMMARY_MODE = "region_summary_update"
+QKNORM_ROPE_CACHE_KERNEL = "_minimax_qknorm_rope_cache_kernel"
 
 INDEXER_QUANT_CACHE_FAMILY = "indexer_quant_cache"
 KV_CACHE_WRITE_FAMILY = "kv_cache_write"
@@ -48,11 +50,10 @@ QUANT_OPS_PER_ELEMENT = 4
 POOL_REDUCE_OPS_PER_ELEMENT = 3
 SSMAX_OPS_PER_ELEMENT = 6
 DEFAULT_SCALE_GROUP_WIDTH = 128
-DEFAULT_STEP5_REGION_BLOCK = 8
+DEFAULT_REGION_SUMMARY_BLOCK = 8
 DEFAULT_QSA_COMPRESS_RATIO = 4
 MIN_WRITER_UB_BYTES = 16384
 WRITER_AIV_WAVE_UNITS = 64
-L2_DEFAULT_EFFECTIVE_SHARE = 0.75
 
 SFA_INDEXER_CACHE_SOURCE = {
     "repository": "vllm-project/vllm-ascend",
@@ -72,24 +73,28 @@ QSA_CACHE_SOURCE = {
     "relative_path": "vllm_ascend/models/qwen4_exp/qsa.py",
     "source_sha256": "f4881d5e8b3574a39509700eea4b430d357bb7c7e310cf94331953c9cd2069f0",
 }
-STEP5_SUMMARY_SOURCE = {
+REGION_SUMMARY_SOURCE = {
     "repository": "vllm-project/vllm-ascend",
     "revision": "405617bae227fe5b097ff163efaa60bb7f22c698",
     "relative_path": "vllm_ascend/models/step5/sparse_attention.py",
-    "source_sha256": "3fabfbd4f115f296472d9c567fec4d24358711dc503cdad2e32b819f4aef4a6",
+    "source_sha256": "3fabfbd4f115f296472d9c567fec4d243587611dc503cdad2e32b819f4aef4a6",
 }
-# Exact 64-hex SHA256 verified against upstream ledger.
-STEP5_SUMMARY_SOURCE["source_sha256"] = (
-    "3fabfbd4f115f296472d9c567fec4d243587611dc503cdad2e32b819f4aef4a6"
+
+
+from mindie_sim.prediction.operators.sparse_indexer.common import (
+    is_block_msa_indexer,
+    is_region_csa_indexer,
 )
 
 
-def _resolve_mode(mode: str, *, cache_dtype: str, compress_ratio: int, step5_summary: bool = False) -> str:
+def _resolve_mode(mode: str, *, cache_dtype: str, compress_ratio: int, region_summary: bool = False) -> str:
     tag = str(mode or "auto").strip().lower()
     if tag != "auto":
+        if tag.endswith("_summary_update"):
+            return REGION_SUMMARY_MODE
         return tag
-    if step5_summary:
-        return "step5_summary_update"
+    if region_summary:
+        return REGION_SUMMARY_MODE
     if compress_ratio > 1:
         return "qsa_dual_pages"
     return "scatter_pa_kv_cache" if cache_dtype in {"bf16", "fp16", "bfloat16", "float16"} else "c8_indexer_quant_cache"
@@ -160,11 +165,15 @@ def emit_index_cache_write(
     resolved_ratio = int(compress_ratio) if compress_ratio is not None else max(
         1, plan_kpool if getattr(plan, "index_kpool_compress", False) else 1, plan_compress
     )
-    step5_summary = bool(plan is not None and getattr(plan, "index_kpool_compress", False) and getattr(plan, "q_output_gate_kind", "none") == "headwise")
-    resolved_block = int(block_size) if block_size is not None else (plan_kpool if step5_summary and plan_kpool > 1 else DEFAULT_STEP5_REGION_BLOCK)
+    region_summary = is_region_csa_indexer(plan)
+    resolved_block = int(block_size) if block_size is not None else (plan_kpool if region_summary and plan_kpool > 1 else DEFAULT_REGION_SUMMARY_BLOCK)
     in_bytes, out_elem = float(dtype_bytes(resolved_in_dtype)), float(dtype_bytes(resolved_cache_dtype))
     scale_bytes = float(dtype_bytes(resolved_scale_dtype)) if resolved_scale_dtype != "none" else 0.0
-    selected = _resolve_mode(mode, cache_dtype=resolved_cache_dtype, compress_ratio=resolved_ratio, step5_summary=step5_summary)
+    selected = _resolve_mode(mode, cache_dtype=resolved_cache_dtype, compress_ratio=resolved_ratio, region_summary=region_summary)
+    extra_meta = (
+        (("qknorm_rope_cache_kernel", QKNORM_ROPE_CACHE_KERNEL),)
+        if is_block_msa_indexer(plan) else ()
+    )
 
     if selected in {"scatter_pa_kv_cache", "bf16_scatter_pa"}:
         payload, slot_bytes = float(total_rows * head_count * width), float(total_rows * SLOT_INDEX_BYTES)
@@ -174,7 +183,7 @@ def emit_index_cache_write(
             family=KV_CACHE_WRITE_FAMILY, recipe=SCATTER_PA_KV_RECIPE, dtype=resolved_cache_dtype,
             elements=int(payload), ops_per_element=0.0, read_bytes_override=payload * in_bytes + slot_bytes,
             write_bytes_override=write_bytes, shape=(total_rows, head_count, width),
-            metadata=metadata + (
+            metadata=metadata + extra_meta + (
                 ("native_kind", "aclnnScatterPaKvCache"), ("read_pipe", "aiv"),
                 ("slot_table_bytes", slot_bytes), ("zero_external_casts", True), ("native_source", SCATTER_PA_KV_SOURCE),
             ),
@@ -194,13 +203,13 @@ def emit_index_cache_write(
             read_bytes_override=read_bytes, write_bytes_override=write_bytes,
             shape=(max(total_rows, comp_rows), width),
             metadata=metadata + (
-                ("read_pipe", "aiv"), ("compress_ratio", ratio),
+                ("read_pipe", "aiv"), ("slot_table_bytes", slot_bytes), ("compress_ratio", ratio),
                 ("raw_circular_rows", raw_tail_rows), ("compressed_rows", comp_rows), ("native_source", QSA_CACHE_SOURCE),
             ),
         ), slot_bytes)]
 
-    if selected == "step5_summary_update":
-        region = max(1, int(resolved_block or DEFAULT_STEP5_REGION_BLOCK))
+    if selected == REGION_SUMMARY_MODE:
+        region = max(1, int(resolved_block or DEFAULT_REGION_SUMMARY_BLOCK))
         summary_rows = max(0, int(completed_rows)) if completed_rows is not None else (math.ceil(total_rows / region) if total_rows > 0 else 0)
         tail_rows = min(total_rows, region)
         slot_bytes = float(summary_rows * SLOT_INDEX_BYTES)
@@ -208,17 +217,17 @@ def emit_index_cache_write(
         write_bytes = float(summary_rows * head_count * (width * out_elem + scale_bytes) + tail_rows * head_count * width * in_bytes)
         return [_with_l2_slot_hbm(vector_op(
             op_id=resolved_op_id, deps=deps, stage=stage, layer=layer, requests=requests, phase=phase,
-            family=INDEXER_QUANT_CACHE_FAMILY, recipe=STEP5_SUMMARY_RECIPE, dtype=resolved_cache_dtype,
+            family=INDEXER_QUANT_CACHE_FAMILY, recipe=REGION_SUMMARY_RECIPE, dtype=resolved_cache_dtype,
             elements=total_rows * head_count * width, ops_per_element=float(SSMAX_OPS_PER_ELEMENT),
             read_bytes_override=read_bytes, write_bytes_override=write_bytes,
             shape=(max(total_rows, summary_rows), head_count, width),
             metadata=metadata + (
-                ("read_pipe", "aiv"), ("region_block_size", region),
-                ("summary_rows", summary_rows), ("summary_reduction", "ssmax"), ("native_source", STEP5_SUMMARY_SOURCE),
+                ("read_pipe", "aiv"), ("slot_table_bytes", slot_bytes), ("region_block_size", region),
+                ("summary_rows", summary_rows), ("summary_reduction", "ssmax"), ("native_source", REGION_SUMMARY_SOURCE),
             ),
         ), slot_bytes)]
 
-    if selected in {"c8_indexer_quant_cache", "indexer_quant_cache"}:
+    if selected == "c8_indexer_quant_cache":
         group = max(1, int(group_size or width))
         groups = max(1, math.ceil(width / group))
         per_row = float(row_bytes) if row_bytes is not None else head_count * (width * out_elem + groups * scale_bytes)
@@ -229,10 +238,11 @@ def emit_index_cache_write(
             elements=payload, ops_per_element=float(QUANT_OPS_PER_ELEMENT),
             read_bytes_override=float(payload) * in_bytes + slot_bytes,
             write_bytes_override=float(total_rows) * per_row, shape=(total_rows, head_count, width),
-            metadata=metadata + (
+            metadata=metadata + extra_meta + (
                 ("native_kind", "aclnnIndexerQuantCache"), ("read_pipe", "aiv"),
-                ("payload_dtype", resolved_cache_dtype), ("scale_dtype", resolved_scale_dtype),
-                ("group_size", group), ("single_read_single_write", True), ("native_source", SFA_INDEXER_CACHE_SOURCE),
+                ("slot_table_bytes", slot_bytes), ("payload_dtype", resolved_cache_dtype),
+                ("scale_dtype", resolved_scale_dtype), ("group_size", group),
+                ("single_read_single_write", True), ("native_source", SFA_INDEXER_CACHE_SOURCE),
             ),
         ), slot_bytes)]
 
@@ -240,11 +250,14 @@ def emit_index_cache_write(
 
 
 def _effective_l2(geometry: Geometry) -> float:
+    view = getattr(geometry, "admission_memory_view", None)
+    if view is not None:
+        return float(view.effective_l2_bytes(geometry.rank or 0))
     mechanisms = getattr(geometry, "physical_mechanisms", None)
     hierarchy = getattr(mechanisms, "memory_hierarchy", None)
     if hierarchy is not None:
         return float(hierarchy.effective_l2_bytes)
-    return L2_DEFAULT_EFFECTIVE_SHARE * float((geometry.buffers or {}).get("l2", 0))
+    return float((geometry.buffers or {}).get("l2", 0))
 
 
 def build_index_cache_writer(op: OpSpec, geometry: Geometry) -> OperatorPlan:
@@ -280,7 +293,13 @@ def build_index_cache_writer(op: OpSpec, geometry: Geometry) -> OperatorPlan:
     has_l2 = bool((geometry.rates or {}).get("l2", 0.0)
                   or (geometry.resource_units or {}).get("l2", 0))
     l2_cap = _effective_l2(geometry) if has_l2 else 0.0
-    slot_bytes = min(read_bytes, float(rows * SLOT_INDEX_BYTES))
+    declared_slot = meta.get("slot_table_bytes")
+    if declared_slot is not None:
+        slot_bytes = min(read_bytes, max(0.0, float(declared_slot)))
+    elif meta.get("summary_rows") is not None:
+        slot_bytes = min(read_bytes, float(int(meta["summary_rows"]) * SLOT_INDEX_BYTES))
+    else:
+        slot_bytes = min(read_bytes, float(rows * SLOT_INDEX_BYTES))
     l2_read = slot_bytes if (l2_cap > 0.0 and slot_bytes <= l2_cap) else 0.0
     gm_read = max(0.0, read_bytes - l2_read)
     gm_total = gm_read + write_bytes
@@ -342,8 +361,6 @@ def build_index_cache_writer(op: OpSpec, geometry: Geometry) -> OperatorPlan:
             owner_programs.append(KernelProgram(tuple(stages)))
         return ParallelProgram(tuple(owner_programs))
 
-    meta = dict(op.metadata)
-    source = meta.get("native_source") or SFA_INDEXER_CACHE_SOURCE
     return OperatorPlan(total_work, program, {
         "execution_class": "vector",
         "active_aiv_owners": active_owners,
@@ -357,10 +374,10 @@ def recipes() -> dict[str, PlannedRecipe]:
     planner = PlannedRecipe(build_index_cache_writer)
     return {
         C8_INDEXER_CACHE_RECIPE: planner,
-        LEGACY_INDEXER_CACHE_RECIPE: planner,
+        LEGACY_INDEXER_CACHE_RECIPE: planner,  # REMOVE-ON-W1-MERGE (mla/mla_epilogs.py:44)
         SCATTER_PA_KV_RECIPE: planner,
         QSA_DUAL_CACHE_RECIPE: planner,
-        STEP5_SUMMARY_RECIPE: planner,
+        REGION_SUMMARY_RECIPE: planner,
     }
 
 
@@ -368,8 +385,8 @@ __all__ = [
     "C8_INDEXER_CACHE_RECIPE",
     "LEGACY_INDEXER_CACHE_RECIPE",
     "QSA_DUAL_CACHE_RECIPE",
+    "REGION_SUMMARY_RECIPE",
     "SCATTER_PA_KV_RECIPE",
-    "STEP5_SUMMARY_RECIPE",
     "emit_index_cache_write",
     "build_index_cache_writer",
     "recipes",

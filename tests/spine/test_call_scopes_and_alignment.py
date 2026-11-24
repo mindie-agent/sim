@@ -200,16 +200,17 @@ def test_draft_calls_select_their_own_phase_and_q1_geometry_before_target_verifi
     drafts = [record for record in work.implementation_selections if record['model_scope'] == 'draft']
     assert target['implementation'] == 'analytical'
     assert target['geometry']['max_query_tokens'] == 3
-    assert len(drafts) == 2 and all((record['case'] == 1 for record in drafts))
-    assert [record['geometry']['max_context_tokens'] for record in drafts] == [4, 5]
-    assert all((record['geometry']['max_query_tokens'] == 1 for record in drafts))
+    # Ascend V2 MTP step 0 reuses target verification shape (q=3 -> otherwise); step 1 uses q=1 (case 1).
+    assert len(drafts) == 2 and [record['case'] for record in drafts] == ['otherwise', 1]
+    assert [record['geometry']['max_context_tokens'] for record in drafts] == [4, 7]
+    assert [record['geometry']['max_query_tokens'] for record in drafts] == [3, 1]
     selected = [op for op in work.ops if op.recipe.startswith('cuda_norm.')]
     assert selected and all((op.phase == 'draft' for op in selected))
     result = predict_quiet(parsed)
     decisions = selection(result)
     assert {(row['model_scope'], row['case']) for row in decisions} == {('target', 0), ('target', 'otherwise'), ('draft', 1), ('draft', 'otherwise')}
     draft_decodes, = [row for row in decisions if row['model_scope'] == 'draft' and row['case'] == 1]
-    assert draft_decodes['calls'] > draft_decodes['steps']
+    assert draft_decodes['calls'] >= draft_decodes['steps']
     assert result['requests'][0]['generated_tokens'] == 6
     assert result['execution']['live_tasks'] == result['execution']['live_programs'] == 0
 def test_target_mxfp8_routing_does_not_rewrite_explicit_analytical_bf16_draft():
@@ -364,7 +365,7 @@ def native_config(*, dsa_layers=None):
     text.update(model_type='kimi_k31', dspark_attention_kind='mla', dspark_block_size=5)
     return config
 def sparse_alignment_case(cp=8, proposals=3):
-    return parse_case(compose_case(native_config(), hardware='a5', tp=8, dp=4, ep=32, dcp=cp, num_devices=32, block_size=1536, max_model_len=140000, quant={'name': 'k31_fp8_cache', 'weight_format': 'bf16', 'activation_format': 'bf16', 'expert_weight_format': 'bf16', 'kv_dtype': 'fp8_e4m3', 'index_dtype': 'fp8_e4m3', 'index_scale_dtype': 'fp16'}, mtp_proposal_tokens=proposals, mtp_acceptance_length=min(2, proposals + 1), graph_capture_mode='none', prompt_tokens=131072, output_tokens=1024))
+    return parse_case(compose_case(native_config(), hardware='a5', tp=8, dp=4, ep=32, dcp=cp, num_devices=32, block_size=1536, max_model_len=140000, quant={'name': 'k31_fp8_cache', 'weight_format': 'bf16', 'activation_format': 'bf16', 'expert_weight_format': 'bf16', 'kv_dtype': 'fp8_e4m3', 'index_dtype': 'fp8_e4m3', 'index_scale_dtype': 'fp16'}, mtp_proposal_tokens=proposals, mtp_acceptance_length=min(2, proposals + 1), graph_capture_mode='none', recover_ssm=False, prompt_tokens=131072, output_tokens=1024))
 def test_native_sparse_configuration_and_independent_draft_formats():
     c = sparse_alignment_case()
     sparse = [p for p in c.model.layer_plans if p.indexer]

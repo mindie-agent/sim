@@ -700,14 +700,17 @@ def _build_commit(c: LinearAttentionContract, ctx: OperatorPlanningContext) -> O
     if c.metadata.get("ssm_family", c.metadata.get("transition_family", c.metadata.get("family", "kda"))) != "kda":
         raise ModelingError("commit_recurrent_kda_requires_kda_transition")
 
-    def bytes_read(commit: RecoverSsmCommitPlan) -> int:
+    def bytes_read(commit: RecoverSsmCommitPlan, total_tokens: int) -> int:
         # Each value partition reads its correction slice and the whole K16/decay32 pair.
+        rec_override = c.metadata.get("record_bytes_per_token", c.metadata.get("record_bytes"))
         tile_v = min(c.bv, COMMIT_VALUE_TILE)
         parts = int(c.metadata.get("row_partitions", ceil_div(c.dv, tile_v)))
         if parts < 1:
             raise ModelingError("commit_recurrent_kda_row_partitions_invalid")
+        if rec_override is not None and parts <= 1:
+            return int(round(total_tokens * float(rec_override)))
         per_token = FP32_BYTES * c.dv + (LOW_PRECISION_BYTES + FP32_BYTES) * c.dk * parts
-        return commit.a * len(c.lengths) * c.hv * per_token
+        return total_tokens * c.hv * per_token
 
     return build_recover_ssm_plan(c, ctx, sources=SOURCES[-1:], replay_bytes=bytes_read)
 

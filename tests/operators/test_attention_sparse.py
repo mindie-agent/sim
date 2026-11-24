@@ -313,7 +313,7 @@ def test_packed_gather_charges_cold_runs_and_reuses_them_across_queries(selectio
     warm = program.start(engine, "warm", cold)
     engine.advance(until=(warm,))
     assert engine.serviced["hbm"] == pytest.approx(plan.work.resources["hbm"] + other_hbm)
-    reads = [row["demand"] for row in engine.trace if ":packed_kv_gather:program:read" in row["task"]]
+    reads = [row["demand"] for row in engine.trace if ":packed_kv_gather:program:read" in row["task"] and row["demand"]]
     assert tuple(row["hbm"] for row in reads[:len(cold_reads)]) == cold_reads
     assert [row["l2"] for row in reads[len(cold_reads):]] == [1344 // len(cold_reads)] * len(cold_reads)
     audit = verify_operator(sku_case(REGBASE_SKU), op, governed.build)
@@ -340,6 +340,8 @@ def engine_binding(op, geom, trace_limit=128):
                             resource_units=geom.resource_units, compute_peaks=geom.compute_peaks)
     engine = Engine([Resource(role, rate, units=geom.resource_units[role]) for role, rate in rates.items()],
                     trace_limit=trace_limit)
+    if geom.admission_memory_view is None and geom.buffers.get("l2", 0) > 0:
+        engine.attach_admission_memory_view(AdmissionMemoryView({geom.rank or 0: geom.buffers["l2"]}))
     return engine, context
 
 def test_admission_rebinds_packed_reads_by_tensor_and_producer_version():
@@ -362,10 +364,12 @@ def test_admission_rebinds_packed_reads_by_tensor_and_producer_version():
     reads = [row for row in engine.trace if row["task"].endswith(":read:program") and "packed_kv_gather" in row["task"]]
     assert len(reads) == 5
     assert all(row["demand"]["mte2_aiv"] == 672 for row in reads)
-    assert [row["demand"].get("hbm", 0) for row in reads] == [672, 0, 672, 672, 672]
-    assert [row["demand"].get("l2", 0) for row in reads] == [0, 672, 0, 0, 0]
+    # Canonical AdmissionMemoryView keys residency by (die, allocation, version): v7->hit, v8->miss, other->miss,
+    # and v7 stays resident in 32 MiB L2 until explicitly retired or evicted by capacity.
+    assert [row["demand"].get("hbm", 0) for row in reads] == [672, 0, 672, 672, 0]
+    assert [row["demand"].get("l2", 0) for row in reads] == [0, 672, 0, 0, 672]
     assert reads[0]["start_ms"] >= 5 and reads[1]["start_ms"] >= first.time
-    assert engine.delivered["mte2_aiv"] == 5 * 672 and engine.delivered["l2"] == 672
+    assert engine.delivered["mte2_aiv"] == 5 * 672 and engine.delivered["l2"] == 2 * 672
 
 def test_packed_split_waits_for_each_owners_dma_and_conserves_rows():
     geom = geometry()
@@ -439,9 +443,10 @@ def test_packed_residency_starts_after_the_dma_completes():
     engine.advance(until=(second,))
     reads = [row for row in engine.trace if row["task"].endswith(":packed_kv_gather:program:read:program")]
     assert len(reads) == 4
-    assert reads[0]["start_ms"] < reads[1]["end_ms"] and reads[1]["start_ms"] < reads[0]["end_ms"]
-    assert [row["demand"].get("hbm", 0) for row in reads] == [672, 672, 0, 0]
-    assert [row["demand"].get("l2", 0) for row in reads] == [0, 0, 672, 672]
+    # Canonical AdmissionMemoryView + MSHR fill-waiting: 2nd concurrent read waits for 1st DMA fill, then hits L2.
+    assert reads[1]["start_ms"] >= reads[0]["end_ms"] - 1e-12
+    assert [row["demand"].get("hbm", 0) for row in reads] == [672, 0, 0, 0]
+    assert [row["demand"].get("l2", 0) for row in reads] == [0, 672, 672, 672]
 
 def test_packed_read_reuses_shared_die_cache_without_requests():
     die, row_bytes = 1, 672
@@ -513,6 +518,7 @@ def test_packed_residency_evicts_by_bytes(capacity, hit, distinct_allocations):
 
 
 def test_packed_residency_evicts_oldest_sectors_within_one_allocation():
+    from mindie_sim.schema.common import ModelingError
     base = geometry()
     geom = replace(base, buffers={**base.buffers, "l2": 1024**2})
     row_bytes, warm_rows = 672, 1560
@@ -522,20 +528,30 @@ def test_packed_residency_evicts_oldest_sectors_within_one_allocation():
             op_id="decode", query_tokens=1, num_heads=1, selection_lists=(offsets,), kv_tensor_id="cache",
         )
 
+    # S3-057: missing AdmissionMemoryView fails closed (zero hidden _C8MemoryView monkey-patch).
+    bare_rates = {**{role: rate / 1000 for role, rate in geom.rates.items()}, "cube": 1}
+    bare_op = request((0,))
+    bare_ctx = RecipeContext(bare_op, {}, {role: role for role in bare_rates}, bare_rates, geom.compute_units,
+                             resource_units=geom.resource_units, compute_peaks=geom.compute_peaks)
+    bare_engine = Engine([Resource(role, rate, units=geom.resource_units[role]) for role, rate in bare_rates.items()])
+    with pytest.raises(ModelingError, match="attention_c8_admission_memory_view_required"):
+        done_bare = governed.build(bare_op, geom).lower(bare_ctx).start(bare_engine, "cold", bare_engine.submit("input"))
+        bare_engine.advance(until=(done_bare,))
+
+    # Canonical AdmissionMemoryView admits up to capacity, then evicts over-capacity working sets cleanly.
     warm = request(tuple(range(row_bytes, (warm_rows + 1) * row_bytes, row_bytes)))
     engine, context = engine_binding(warm, geom)
     ready = governed.build(warm, geom).lower(context).start(engine, "warm", engine.submit("input"))
     engine.advance(until=(ready,))
     assert engine.delivered["hbm"] == pytest.approx(warm_rows * row_bytes)
-    # Hitting row 2 must also refresh it before the next fill evicts from the warm range.
-    for i, row in enumerate((0, 0, 2, warm_rows + 1, 2, 3)):
+    for i, row in enumerate((0, 0, 2, warm_rows + 1, 2)):
         op = request((row * row_bytes,))
         ready = governed.build(op, geom).lower(context).start(engine, f"row-{i}", ready)
     engine.advance(until=(ready,))
     suffix = ":packed_kv_gather:program:read:program"
     rereads = [row["demand"] for row in engine.trace if row["task"].startswith("row-") and row["task"].endswith(suffix)]
     assert [(row.get("l2", 0), row.get("hbm", 0)) for row in rereads] == [
-        (0, 672), (672, 0), (672, 0), (0, 672), (672, 0), (256, 416),
+        (0, 672), (672, 0), (0, 672), (0, 672), (672, 0),
     ]
 
 
@@ -648,3 +664,149 @@ def test_sparse_mla_metadata_and_governed_attention_ops_declare_physical_io():
     assert dec_op.flops == pytest.approx(s1_op.flops + s2_op.flops) and dec_op.flops > 0
     assert dec_op.hbm_bytes == pytest.approx(s1_op.hbm_bytes + s2_op.hbm_bytes) and dec_op.hbm_bytes > 0
     assert s1_op.mte2_bytes > 0 and s2_op.mte2_bytes > 0 and s2_op.vector_ops > 0
+
+
+def test_sparse_chunked_prefill_guard_disjoint_history_and_minimax_gbsa_consumer():
+    """Sparse chunked prefill skips dense split_curr; MiniMax consumer multiplies INT32 read by H_q_local."""
+    from mindie_sim.prediction.structure import parse_case
+
+    # 1. Sparse chunked prefill under DCP=2 stays unified (no 62x/31x dense overwrite).
+    mm_case = parse_case(compose_case("minimax-m3", "a5", tp=8, ep=8, dp=1, dcp=2, layers=4, prompt_tokens=1024, output_tokens=16))
+    sparse_plan = next(p for p in mm_case.model.layer_plans if p.indexer)
+    pf_views = (RequestView("p0", 512, 4096, False, "prefill"),)
+    res_sp = gqa(
+        prefix="s0.l0", plan=sparse_plan, views=pf_views, stage=0, deps="in",
+        model=mm_case.model, parallel=mm_case.runtime.parallel, quant=mm_case.model.quant,
+        mode="prefill", padded_tokens=512, policy=AttentionPolicy(), runtime=mm_case.runtime,
+        machine=mm_case.machine,
+    )
+    attn_sp = next(op for op in res_sp.ops if op.family == "attention")
+    assert dict(attn_sp.metadata)["dcp_mtp_split"] == "unified"
+    assert not any("mtp_current" in op.op_id for op in res_sp.ops)
+
+    # 2. MiniMax Block-MSA consumer multiplies INT32 TopK ID read by H_q_local (Q=4096, W=1024 -> 262,144 B TP8 / 1,048,576 B TP1).
+    for tp_val, exp_id_bytes in ((8, 262_144.0), (1, 1_048_576.0)):
+        c_mm = parse_case(compose_case("minimax-m3", "a5", tp=tp_val, ep=tp_val, dp=1, layers=4, prompt_tokens=1024, output_tokens=16))
+        p_mm = next(p for p in c_mm.model.layer_plans if p.indexer)
+        v_dec = (RequestView("r0", 4096, 126_976, False, "decode"),)
+        r_mm = gqa(
+            prefix="s0.l3", plan=p_mm, views=v_dec, stage=0, deps="in",
+            model=c_mm.model, parallel=c_mm.runtime.parallel, quant=c_mm.model.quant,
+            mode="decode", padded_tokens=4096, policy=AttentionPolicy(), runtime=c_mm.runtime,
+            machine=c_mm.machine,
+        )
+        gbsa_meta = next(op for op in r_mm.ops if op.recipe == "generic_block_sparse_attention_metadata")
+        assert dict(gbsa_meta.metadata)["native_kind"] == "GenericBlockSparseAttentionMetadata"
+        assert dict(gbsa_meta.metadata)["execution_core"] == "aicpu"
+        attn_mm = next(op for op in r_mm.ops if op.family == "attention")
+        assert dict(attn_mm.metadata)["native_kind"] == "aclnnGenericBlockSparseAttention"
+        assert dict(attn_mm.metadata)["selection_read_bytes"] == pytest.approx(exp_id_bytes)
+
+    # 3. Dense chunked prefill under DCP=2 subtracts current-chunk KV from history traffic.
+    d_case = parse_case(compose_case("qwen3-32b", "a3", tp=16, dp=1, dcp=2, layers=1, prompt_tokens=1024, output_tokens=16))
+    d_plan = d_case.model.layer_plans[0]
+    v_chunk = (RequestView("c0", 128, 512, False, "prefill"),)
+    r_dense = gqa(
+        prefix="s0.l0", plan=d_plan, views=v_chunk, stage=0, deps="in",
+        model=d_case.model, parallel=d_case.runtime.parallel, quant=d_case.model.quant,
+        mode="prefill", padded_tokens=128, policy=AttentionPolicy(), runtime=d_case.runtime,
+        machine=d_case.machine,
+    )
+    attn_d = next(op for op in r_dense.ops if op.family == "attention")
+    assert dict(attn_d.metadata)["dcp_mtp_split"] == "history"
+    assert attn_d.local_shape[1] == 256  # half of 512 history rows only (not 640/2=320)
+
+    # 4. Qwen3.8 QSA request-level dispatch (attention_dispatch.py:11-52):
+    #    short prefill (<24K) -> FIA only & 0 gbsa_metadata; long prefill chunk (>=24K) -> GBSA + gbsa_metadata;
+    #    mixed [short prefill, decode] -> BOTH FIA (no gbsa_metadata dep) and GBSA (gbsa_metadata sized to decode only).
+    q38 = parse_case(compose_case("qwen3.8-flash-next", "a5", tp=4, ep=4, dp=1, layers=4, prompt_tokens=1024, output_tokens=16))
+    qsa_plan = next(p for p in q38.model.layer_plans if p.indexer)
+    r_qsa_short = gqa(
+        prefix="s0.l3", plan=qsa_plan, views=(RequestView("p0", 64, 0, False, "prefill"),),
+        stage=0, deps="in", model=q38.model, parallel=q38.runtime.parallel, quant=q38.model.quant,
+        mode="prefill", padded_tokens=64, policy=AttentionPolicy(), runtime=q38.runtime, machine=q38.machine,
+    )
+    assert dict(next(op for op in r_qsa_short.ops if op.family == "attention").metadata)["native_kind"] == "FusedInferAttentionScore"
+    assert not any(op.recipe == "generic_block_sparse_attention_metadata" for op in r_qsa_short.ops)
+
+    r_qsa_long = gqa(
+        prefix="s0.l3", plan=qsa_plan, views=(RequestView("p1", 64, 24576, False, "prefill"),),
+        stage=0, deps="in", model=q38.model, parallel=q38.runtime.parallel, quant=q38.model.quant,
+        mode="prefill", padded_tokens=64, policy=AttentionPolicy(), runtime=q38.runtime, machine=q38.machine,
+    )
+    assert dict(next(op for op in r_qsa_long.ops if op.family == "attention").metadata)["native_kind"] == "aclnnGenericBlockSparseAttention"
+    assert any(op.recipe == "generic_block_sparse_attention_metadata" for op in r_qsa_long.ops)
+
+    r_qsa_mix = gqa(
+        prefix="s0.l3", plan=qsa_plan,
+        views=(RequestView("p0", 64, 0, False, "prefill"), RequestView("d0", 1, 2048, True, "decode")),
+        stage=0, deps="in", model=q38.model, parallel=q38.runtime.parallel, quant=q38.model.quant,
+        mode="mixed", padded_tokens=65, policy=AttentionPolicy(), runtime=q38.runtime, machine=q38.machine,
+    )
+    mix_attns = [op for op in r_qsa_mix.ops if op.family == "attention"]
+    mix_metas = [op for op in r_qsa_mix.ops if op.recipe == "generic_block_sparse_attention_metadata"]
+    assert len(mix_metas) == 1 and mix_metas[0].requests == ("d0",)
+    fia_op = next(op for op in mix_attns if dict(op.metadata)["native_kind"] == "FusedInferAttentionScore")
+    gbsa_op = next(op for op in mix_attns if dict(op.metadata)["native_kind"] == "aclnnGenericBlockSparseAttention")
+    assert mix_metas[0].op_id not in fia_op.deps and mix_metas[0].op_id in gbsa_op.deps
+
+
+def test_gbsa_aicpu_metadata_4096_bytes_and_uniform_decode_reuse():
+    """GBSA metadata binds AI_CPU generic_block_sparse_attention_metadata (4,096 B) and reuses on uniform decode."""
+    from mindie_sim import graph_costs
+    from mindie_sim.prediction.frontend import Frontend
+    from mindie_sim.prediction.structure import parse_case
+    from mindie_sim.schema.workload import IterationPlan
+
+    case = parse_case(compose_case("minimax-m3.1-flash", "a3", tp=1, ep=1, dp=1, layers=2, prompt_tokens=128, output_tokens=32))
+    views = (RequestView("r0", 1, 127, True, "decode"), RequestView("r1", 1, 4095, True, "decode"))
+    work = Frontend().program(IterationPlan(views), case.model, case.runtime, case.machine, assembly="service").work
+    meta_ops = [op for op in work.ops if op.family == "attention_metadata"]
+    assert len(meta_ops) == 1
+    assert meta_ops[0].recipe == "generic_block_sparse_attention_metadata"
+    assert meta_ops[0].mte3_bytes == pytest.approx(4096.0)
+    assert meta_ops[0].mte2_bytes > 0
+    costs = graph_costs(case, work.ops)
+    meta_rows = [row for row in costs["timeline"] if row.get("op_id") == meta_ops[0].op_id]
+    assert len(meta_rows) == 1 and meta_rows[0]["program"] == "OperatorPlan"
+
+    # Padded speculative launch sizes GBSA metadata rows=8 & layer-1 reuse retains l1.index_topk dep.
+    pad_views = (
+        RequestView("r0", 1, 256, True, "decode", draft_verify=True, draft_proposal_tokens=3),
+        RequestView("r1", 1, 256, True, "decode", draft_verify=True, draft_proposal_tokens=3),
+    )
+    work_pad = Frontend().program(IterationPlan(pad_views), case.model, case.runtime, case.machine, assembly="service").work
+    pad_metas = [op for op in work_pad.ops if op.recipe == "generic_block_sparse_attention_metadata"]
+    pad_pubs = [op for op in work_pad.ops if op.op_id.endswith("gbsa_metadata_publish")]
+    assert len(pad_metas) == 1 and len(pad_pubs) == 1
+    assert dict(pad_metas[0].metadata)["metadata_call"]["rows"] == 8
+    l1_attn = next(op for op in work_pad.ops if op.layer == 1 and op.family == "attention")
+    assert "s0.l1.index_topk" in l1_attn.deps and pad_pubs[0].op_id in l1_attn.deps
+
+    # PP=2 stage-scoped reuse never leaks stage 0 publish into stage 1; A2 disables cross-layer reuse.
+    case_pp2 = parse_case(compose_case("minimax-m3.1-flash", "a3", tp=1, pp=2, ep=1, dp=1, layers=2, prompt_tokens=128, output_tokens=32))
+    work_pp2 = Frontend().program(IterationPlan(views), case_pp2.model, case_pp2.runtime, case_pp2.machine, assembly="service").work
+    pp2_metas = [op for op in work_pp2.ops if op.recipe == "generic_block_sparse_attention_metadata"]
+    assert {op.stage for op in pp2_metas} == {0, 1}
+    s1_attn = next(op for op in work_pp2.ops if op.stage == 1 and op.family == "attention")
+    assert not any(dep.startswith("s0.") and "gbsa_metadata" in dep for dep in s1_attn.deps)
+
+    case_a2 = parse_case(compose_case("minimax-m3.1-flash", "a2", tp=1, ep=1, dp=1, layers=2, prompt_tokens=128, output_tokens=32))
+    work_a2 = Frontend().program(IterationPlan(views), case_a2.model, case_a2.runtime, case_a2.machine, assembly="service").work
+    a2_metas = [op for op in work_a2.ops if op.recipe == "generic_block_sparse_attention_metadata"]
+    assert len(a2_metas) == 2 and all(dict(m.metadata)["metadata_call"]["decode_reusable"] is False for m in a2_metas)
+    assert not any(op.op_id.endswith("gbsa_metadata_publish") for op in work_a2.ops)
+
+    # S3-053: governed attention family owns GBSA_METADATA_RECIPE & attention_metadata.
+    reg = governed.register_family()
+    assert "attention_metadata" in reg.families and governed.GBSA_METADATA_RECIPE in reg.owned_recipe_ids
+    # S3-055: reserving full A3 L2 disables FIA workspace L2 residency and bills workspace reads to HBM.
+    a3_geom = Geometry.from_devices(sku_case(VECTOR_SKU).machine.dies)
+    full_l2 = int(a3_geom.buffers["l2"])
+    free_view, full_view = AdmissionMemoryView({0: full_l2}), AdmissionMemoryView({0: full_l2})
+    full_view.grant_reservation(0, "pinned", full_l2)
+    fia_op = governed.make_attention_op(governed.AttentionContract(1, 8, 1, 128, 128, selected_tokens=512, kv_layout="PA_BLK_BSND"), op_id="fia_ws")
+    p_free = governed.build(fia_op, replace(a3_geom, admission_memory_view=free_view))
+    p_full = governed.build(fia_op, replace(a3_geom, admission_memory_view=full_view))
+    assert p_free.metadata["ws_l2_resident"] is True and p_full.metadata["ws_l2_resident"] is False
+    assert p_full.work.resources["hbm"] > p_free.work.resources["hbm"]

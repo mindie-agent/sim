@@ -316,8 +316,11 @@ def test_deferred_intent_is_uncharged_and_binds_at_acceptance():
     assert (intent.flops, intent.vector_ops, intent.hbm_bytes, intent.mte2_bytes, intent.mte3_bytes) == (0, 0, 0, 0, 0)
     _fields(dict(intent.metadata)["recover_ssm_geometry"], heads=2, dk=4, dv=8, scope="target", layer=0)
     bound, = bind_recover_ssm_commits((intent,), views=(view,), acceptance_events={"r0": "accept"},
-                                      state_bindings=None, runtime=None)
-    assert bound.deps == ("scan", "accept") and bound.vector_ops == pytest.approx(4 * 3 * 2 * 4 * 8)
+                                      state_bindings=None,
+                                      runtime=SimpleNamespace(metadata=(("recover_ssm_readiness", "shipping"),)),
+                                      machine=SimpleNamespace(arch_family="A5"))
+    # Upstream-exact KDA reverse accumulation (GA-09, VA/ops/triton/kda/recoverssm.py:593-615,788): 2*(u+1)*E.
+    assert bound.deps == ("scan", "accept") and bound.vector_ops == pytest.approx(2 * (3 + 1) * 2 * 4 * 8)
     state = 2 * 4 * 8 * 4
     record_bytes = 2 * (8 * 4 + 2 * 4 * 2)
     assert bound.mte2_bytes == pytest.approx(state + 3 * record_bytes)
@@ -331,7 +334,8 @@ def test_prefill_multitoken_query_does_not_emit_or_bind_a_commit():
     intent = OpSpec("intent", "elementwise", "prefill", 0, 0, ("p0",), (1,), (1,), (1,), (1,),
                     metadata=(("recover_ssm_intent", True), ("state_owner", "layer0"), ("heads", 2), ("dk", 4), ("dv", 8)))
     assert bind_recover_ssm_commits((intent,), views=(view,), acceptance_events={},
-                                    state_bindings=None, runtime=None) == (intent,)
+                                    state_bindings=None, runtime=None,
+                                    machine=SimpleNamespace(arch_family="A5")) == (intent,)
 
 def test_recurrent_commit_is_bound_only_between_acceptance_and_service_commit():
     parsed = parse_case(compose_case("glm-5.3-flash", "a5", tp=1, dp=1, ep=1, o_proj_tp=1, linear_proj_tp=1,
@@ -344,12 +348,18 @@ def test_recurrent_commit_is_bound_only_between_acceptance_and_service_commit():
     ops = Frontend().program(IterationPlan((view,)), parsed.model, parsed.runtime,
                              parsed.machine, assembly="service").work.ops
     assert not any(is_recover_ssm_intent(op) for op in ops)
+    plans = [op for op in ops if op.recipe == "kda_prepare_commit_plan"]
+    convs = [op for op in ops if op.recipe == "kda_compact_conv_state"]
     commits = [op for op in ops if dict(op.metadata).get("recover_ssm_stage") == "commit"]
-    assert len(commits) == 2
+    pubs = [op for op in ops if dict(op.metadata).get("recover_ssm_stage") == "state_publish"]
+    assert len(plans) == 1 and len(convs) == 1 and len(commits) == 1 and len(pubs) == 2
+    assert dict(commits[0].metadata)["num_layers"] == 2
     ids = [op.op_id for op in ops]
-    for op in commits:
-        assert ids.index("accept") < ids.index(op.op_id) < ids.index("token_commit") and "accept" in op.deps
-    assert set(next(op for op in ops if op.family == "token_commit").deps) - {"accept"} == {op.op_id for op in commits}
+    for op in plans + convs + commits + pubs:
+        assert ids.index("accept") < ids.index(op.op_id) < ids.index("token_commit")
+    assert "accept" in plans[0].deps and plans[0].op_id in commits[0].deps and convs[0].op_id in commits[0].deps
+    assert all(commits[0].op_id in op.deps for op in pubs)
+    assert set(next(op for op in ops if op.family == "token_commit").deps) - {"accept"} == {op.op_id for op in pubs}
 
 def test_speculative_rejections_preserve_integer_commits_and_real_gaps():
     raw = case(output=6)

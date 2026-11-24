@@ -22,53 +22,70 @@ from mindie_sim.prediction.physical_recipe_base import (IO_HBM_CATEGORY, Phase, 
                                    io_weight, tiled_phased_program)
 from mindie_sim.prediction.program import KernelProgram, ParallelProgram, PipelineProgram, Stage
 from mindie_sim.schema.operators import (
+    KERNEL_READINESS_VALUES,
     KernelBinding,
     OwnerMemoryResidency,
     OwnerScheduleSpec,
     SerialPhaseSpec,
 )
 
-QUERY_LOAD_SHARE = 0.30
-KEY_LOAD_SHARE = 0.70
-SCORE_CUBE_SHARE = 1.0
-SCORE_VECTOR_SHARE = 0.20
-TOPK_VECTOR_SHARE = 0.80
 PIPELINE_SLOTS = 2
 INDEXER_TILE_CAP = 64
 
 MS_PER_SECOND = 1000
+NS_TO_MS = 1e-6
 RATE_INDEX = 1
 DRAM_SERVICE_MODE = "mte2_aic_dram"
 SERIAL_SLOTS = 1
 FP32_ELEMENT_BYTES = 4
 INT32_ELEMENT_BYTES = 4
 POOL_KEY_BLOCK = 1024
-#: One AIC owns one query row per wave; 32 owners split the query rows.
+#: Default Arch35 cube-wave row width (32 AIC owners) when ledger wave_rows is built.
 INDEXER_WAVE_ROWS = 32
 #: 3D `q_descale * k_descale`, per-head weight, ReLU, tree max and accumulate.
 SCORE_REDUCE_OPS = 4
 #: 32-lane bitonic compare/exchange over the running candidate list, two passes.
 TOPK_MERGE_OPS = 64
-#: Per-wave AIC/AIV drain plus next-wave descriptor re-arm (source wave barrier).
-WAVE_HANDOFF_US = 2.7
-#: aclnn multi-core prologue/epilogue floor for a wave-scheduled indexer.
-INDEXER_FLOOR_US = 12.0
-#: Final pool TopK scan per 1024-pool block (per-head reduction to pool ids).
-POOL_SCAN_BLOCK_US = 1.0
 #: Selected-pool to token-index expansion: pool-id multiply, stride add, store.
 SELECTION_OPS = 2
-#: AIC projection -> GM/L2 workspace join barrier before the 64-AIV ring.
-WORKSPACE_SYNC_US = 15.0
-#: Token-serial FP32 state-ring dependency: ape add, LayerNorm, gate, accumulate.
-RING_STEP_US = 5.5
-#: One completed-pool FP32 softmax reduction and cache commit round.
-POOL_COMMIT_US = 8.2
 #: Per-sequence ring normalization: ape add, mean, variance, scale, gate.
 RING_NORM_OPS = 8
 
 POOL_LEDGER = "pool_key_indexer_work"
 QUANT_LEDGER = "quant_indexer_arch35_work"
 KEYPOOL_LEDGER = "cann_key_pool_work"
+_ARCH_PRESET_FAMILY = {
+    "npu_arch_3510": "A5",
+    "npu_arch_2201": "A3",
+}
+
+
+def _primitive_ms(context, primitive_id: str, metric: str) -> float:
+    """Read a calibrated primitive latency in ms from ``context.primitive_table``."""
+    table = getattr(context, "primitive_table", None)
+    if table is None or primitive_id not in getattr(table, "primitives", ()):
+        return 0.0
+    band = table.cell(primitive_id).metrics.get(metric)
+    if band is None or band.p50 is None or band.p50 <= 0.0:
+        return 0.0
+    return float(band.p50) * NS_TO_MS
+
+
+def _geometry_arch_family(geometry) -> str:
+    if geometry is None:
+        return "unknown"
+    compute_arch = getattr(geometry, "compute_arch", None) or getattr(
+        getattr(geometry, "datapath", None), "compute_arch", None
+    )
+    preset = str(
+        getattr(compute_arch, "preset", "")
+        or getattr(compute_arch, "arch_id", "")
+        or ""
+    ).strip()
+    if preset in _ARCH_PRESET_FAMILY:
+        return _ARCH_PRESET_FAMILY[preset]
+    fam = str(getattr(geometry, "arch_family", "") or "").strip()
+    return fam or "unknown"
 
 
 def _geometry_ub_capacity(geometry) -> int:
@@ -133,14 +150,29 @@ def _indexer_owner_schedule(
     )
 
 
-def _indexer_kernel_binding(kernel_id: str, recipe_id: str) -> KernelBinding:
+def _indexer_kernel_binding(
+    kernel_id: str,
+    recipe_id: str,
+    *,
+    geometry=None,
+    op=None,
+) -> KernelBinding:
+    # Step 2: refine readiness via mindie_sim.backends.abi_registry.ProbedAbiRegistry once W1 merges.
+    arch = _geometry_arch_family(geometry)
+    explicit = str(dict(getattr(op, "metadata", ()) or ()).get("readiness") or "").strip() if op is not None else ""
+    if explicit and explicit in KERNEL_READINESS_VALUES:
+        readiness = explicit
+    elif arch == "A5" or (arch in {"A2", "A3"} and recipe_id in {"sparse_indexer", "index_scores"}):
+        readiness = "shipping"
+    else:
+        readiness = "synthesized_target"
     return KernelBinding(
         kernel_id=kernel_id,
         backend="CANN",
-        arch_family="A5",
+        arch_family=arch,
         submodule="sparse_indexer",
         macro_module="attention",
-        readiness="shipping",
+        readiness=readiness,  # type: ignore[arg-type]
         recipe_id=recipe_id,
     )
 
@@ -166,8 +198,9 @@ class TiledSparseIndexerRecipe:
     def build(self, op, geometry):
         plan = build_plan(self, op, geometry)
         total_aic = int(
-            (getattr(geometry, "resource_units", {}) or {}).get("mte2_aic", INDEXER_WAVE_ROWS)
-            or INDEXER_WAVE_ROWS
+            getattr(geometry, "compute_units", 0)
+            or (getattr(geometry, "resource_units", {}) or {}).get("mte2_aic", 0)
+            or 1
         )
         rows = int(op.local_shape[0]) if op.local_shape else 1
         ub_cap = _geometry_ub_capacity(geometry)
@@ -188,30 +221,23 @@ class TiledSparseIndexerRecipe:
         meta["kernel_binding"] = _indexer_kernel_binding(
             str(dict(op.metadata).get("native_kind") or "SparseIndexerScoreTopK"),
             str(op.recipe or "sparse_indexer"),
+            geometry=geometry,
+            op=op,
         ).to_dict()
         return replace(plan, metadata=meta)
 
     def lower(self, context):
-        read_share = io_weight(context, "hbm")
+        read_share = io_weight(context, "hbm_read")
         write_share = io_weight(context, "hbm_write")
         phases = (
-            Phase("query_load", {IO_HBM_CATEGORY: QUERY_LOAD_SHARE * read_share,
-                                 "mte2": QUERY_LOAD_SHARE}),
-            Phase("key_load", {IO_HBM_CATEGORY: KEY_LOAD_SHARE * read_share,
-                               "mte2": KEY_LOAD_SHARE}),
-            Phase("score", {"cube": SCORE_CUBE_SHARE,
-                            "vector": SCORE_VECTOR_SHARE},
-                  after=("query_load", "key_load")),
-            Phase("topk_update", {"vector": TOPK_VECTOR_SHARE},
-                  after=("score",)),
+            Phase("operand_load", {IO_HBM_CATEGORY: read_share, "mte2": 1.0}),
+            Phase("score", {"cube": 1.0}, after=("operand_load",)),
+            Phase("topk_update", {"vector": 1.0}, after=("score",)),
             Phase("store", {IO_HBM_CATEGORY: write_share, "mte3": 1.0},
                   after=("topk_update",)),
         )
         return tiled_phased_program(
             context, phases, slots=self.slots, cap=self.tile_cap)
-
-
-TiledIndexerRecipe = TiledSparseIndexerRecipe
 
 
 def _wave_rows(rows, index, wave_rows):
@@ -321,12 +347,17 @@ class PoolKeyIndexerRecipe:
                                 - kv_component + float(prefix_hbm))
             work = Work(work.matrix, resources)
         ub_cap = _geometry_ub_capacity(geometry)
+        total_owners = int(
+            getattr(geometry, "compute_units", 0)
+            or ledger.get("wave_rows", INDEXER_WAVE_ROWS)
+            or INDEXER_WAVE_ROWS
+        )
         owner_schedule = _indexer_owner_schedule(
             owner_kind="mix",
             tiling_strategy="pool_key_indexer_aic_waves",
             parallel_axis="query_rows",
             work_tiles=max(1, int(ledger.get("query_rows", 1) or 1)),
-            total_owners=int(ledger.get("wave_rows", INDEXER_WAVE_ROWS) or INDEXER_WAVE_ROWS),
+            total_owners=total_owners,
             read_bytes=float(work.resources.get("mte2", 0.0)),
             write_bytes=float(work.resources.get("mte3", 0.0)),
             score_flops=float(sum(work.matrix.values())),
@@ -341,7 +372,9 @@ class PoolKeyIndexerRecipe:
             "waves": ledger.get("waves"),
             "blocks": ledger.get("blocks"),
             "owner_schedule": owner_schedule.to_dict(),
-            "kernel_binding": _indexer_kernel_binding("aclnnPoolKeyIndexer", str(op.recipe or "pool_key_indexer")).to_dict(),
+            "kernel_binding": _indexer_kernel_binding(
+                "aclnnPoolKeyIndexer", str(op.recipe or "pool_key_indexer"), geometry=geometry, op=op,
+            ).to_dict(),
         })
 
     def lower(self, context):
@@ -354,8 +387,11 @@ class PoolKeyIndexerRecipe:
             if prefix_hbm is not None
             else float(ledger["wave_cache_bytes"])
         )
-        floor = INDEXER_FLOOR_US + int(ledger["blocks"]) * POOL_SCAN_BLOCK_US
-        floor /= MS_PER_SECOND
+        handoff_ms = _primitive_ms(context, "P13_crosscore_sync", "mode2_paired_ns")
+        floor = (
+            _primitive_ms(context, "P15_rts_stars", "aic_first_issue_ns")
+            + int(ledger["blocks"]) * _primitive_ms(context, "P13_crosscore_sync", "mode4_intra_block_ns")
+        )
 
         def wave(index):
             parts = _pool_wave_work(ledger, index)
@@ -368,8 +404,7 @@ class PoolKeyIndexerRecipe:
                     {parts["dtype"]: parts["tiles"][parts["dtype"]]},
                     _matrix_free(parts["tiles"], parts["dtype"]))),
                     after=("stream",)),
-                Stage("handoff", after=("tiles",),
-                      latency=WAVE_HANDOFF_US / MS_PER_SECOND),
+                Stage("handoff", after=("tiles",), latency=handoff_ms),
             )
 
         selection = _pool_selection_work(ledger)
@@ -484,12 +519,17 @@ class Arch35QuantIndexerRecipe:
         ledger = dict(dict(op.metadata).get(QUANT_LEDGER, {}))
         work = arch35_indexer_work(ledger)
         ub_cap = _geometry_ub_capacity(geometry)
+        total_owners = int(
+            getattr(geometry, "compute_units", 0)
+            or ledger.get("wave_rows", INDEXER_WAVE_ROWS)
+            or INDEXER_WAVE_ROWS
+        )
         owner_schedule = _indexer_owner_schedule(
             owner_kind="mix",
             tiling_strategy="quant_lightning_indexer_v2_arch35_blocks",
             parallel_axis="query_rows",
             work_tiles=max(1, int(ledger.get("query_rows", 1) or 1)),
-            total_owners=int(ledger.get("wave_rows", INDEXER_WAVE_ROWS) or INDEXER_WAVE_ROWS),
+            total_owners=total_owners,
             read_bytes=float(work.resources.get("mte2_aic", 0.0)) + float(work.resources.get("mte2_aiv", 0.0)),
             write_bytes=float(work.resources.get("mte3", 0.0)),
             score_flops=float(sum(work.matrix.values())),
@@ -503,13 +543,18 @@ class Arch35QuantIndexerRecipe:
             "waves": ledger.get("waves"),
             "blocks": ledger.get("blocks"),
             "owner_schedule": owner_schedule.to_dict(),
-            "kernel_binding": _indexer_kernel_binding("aclnnQuantLightningIndexerV2", str(op.recipe or "quant_lightning_indexer")).to_dict(),
+            "kernel_binding": _indexer_kernel_binding(
+                "aclnnQuantLightningIndexerV2",
+                str(op.recipe or "quant_lightning_indexer"),
+                geometry=geometry,
+                op=op,
+            ).to_dict(),
         })
 
     def lower(self, context):
         ledger = dict(dict(context.op.metadata).get(QUANT_LEDGER, {}))
         tiles = int(ledger["waves"]) * int(ledger["blocks"])
-        floor = INDEXER_FLOOR_US / MS_PER_SECOND
+        floor = _primitive_ms(context, "P15_rts_stars", "aic_first_issue_ns")
         payload = int(ledger.get("payload_keys",
                                  ledger.get("completed_keys", ledger["keys"])))
         fill = float(payload) * int(ledger["key_row_bytes"])
@@ -638,7 +683,9 @@ class KeyPoolRingRecipe:
             "completed_pools": ledger.get("completed_pools"),
             "ring_steps": ledger.get("steps"),
             "owner_schedule": owner_schedule.to_dict(),
-            "kernel_binding": _indexer_kernel_binding("aclnnKeyPool", str(op.recipe or "cann_key_pool")).to_dict(),
+            "kernel_binding": _indexer_kernel_binding(
+                "aclnnKeyPool", str(op.recipe or "cann_key_pool"), geometry=geometry, op=op,
+            ).to_dict(),
         })
 
     def lower(self, context):
@@ -653,6 +700,9 @@ class KeyPoolRingRecipe:
         commit = {name: value / float(max(1, batch))
                   for name, value in commit_total.items()}
         pools = int(ledger["completed_pools"])
+        ring_sync_ms = _primitive_ms(context, "P12_intracore_flag", "flag_v_mte3_ns")
+        pool_commit_ms = _primitive_ms(context, "P12_intracore_flag", "flag_ns")
+        workspace_join_ms = _primitive_ms(context, "P13_crosscore_sync", "mode0_aiv_barrier_ns")
 
         def ring_step(owner_index):
             owned = context.owned(owner_index, owners,
@@ -665,7 +715,7 @@ class KeyPoolRingRecipe:
                 Stage("ring_write", context.bind(Work({}, dict(step["write"]))),
                       after=("ape_norm",), placement=owned),
                 Stage("ring_sync", after=("ring_write",), placement=owned,
-                      latency=RING_STEP_US / MS_PER_SECOND),
+                      latency=ring_sync_ms),
             )
 
         def sequence(owner_index):
@@ -677,7 +727,7 @@ class KeyPoolRingRecipe:
                                       ("vector", "mte2_aiv", "mte3"))
                 stages.append(Stage("pool_commit", context.bind(Work(
                     {}, dict(commit))), after=("steps",), placement=owned,
-                    latency=POOL_COMMIT_US / MS_PER_SECOND))
+                    latency=pool_commit_ms))
             return (Stage("sequence", program=KernelProgram(tuple(stages))),)
 
         def owner_program(owner_index):
@@ -695,7 +745,7 @@ class KeyPoolRingRecipe:
                  "mte2": (float(ledger["hidden_bytes"])
                           + float(ledger["weight_bytes"]))}))),
             Stage("workspace_join", after=("projection",),
-                  latency=WORKSPACE_SYNC_US / MS_PER_SECOND),
+                  latency=workspace_join_ms),
             Stage("ring", after=("workspace_join",), program=ParallelProgram(
                 tuple(owner_program(owner) for owner in range(owners)))),
         ))

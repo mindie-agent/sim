@@ -523,11 +523,10 @@ def _kda_default(case, phase, tokens, kernels):
                            and name[len("recurrent_scan"):].isdigit() for name in recipes)
     raw_bf16 = (case.model.quant.weight_format == "bf16"
                 and "moe_dispatch_quantization" not in dict(case.runtime.metadata))
-    # A5 Kimi K3 decode is an actual native KDA source call even when the
-    # frontend declaration is raw BF16.  Keep raw BF16 as an explicit-generic
-    # guard for non-A5 / foreign KDA domains only.
-    native_a5 = case.machine.arch_family == "A5"
-    raw_bf16_generic = raw_bf16 and not native_a5
+    # Native Ascend A2/A3/A5 KDA decode dispatches RecurrentKda even in BF16.
+    # Keep raw BF16 as an explicit-generic guard for foreign non-Ascend domains only.
+    native_ascend = case.machine.arch_family in {"A2", "A3", "A5"}
+    raw_bf16_generic = raw_bf16 and not native_ascend
     explicit = ("kda" in kernels.get("lowerings", {}) or
                 bool({"short_convolution", "recurrent_vector", "recurrent_scan"}
                      & kernels.get("families", {}).keys()) or
@@ -535,13 +534,11 @@ def _kda_default(case, phase, tokens, kernels):
                      & recipes.keys()) or per_request_scan or
                 "recurrent_vector" in kernels.get("programs", {}) or
                 bool(case.runtime.tensor_layouts) or raw_bf16_generic)
-    from mindie_sim.catalog.paired_sfa import execution
-    recurrent_sharded = execution(case.model).get("recurrent_context_sharded") is not False
     pipes = {"hbm", "vector", "mte2_aiv", "mte3"}
     reason = ("explicit_implementation_preserved" if explicit else
-              # The source recurrence is a decode-only, single-context domain.
-              "kda_source_requires_decode_only_pcp1" if (
-                  parallel.pcp != 1 or parallel.cp != 1 and recurrent_sharded) else
+              # KDA decode is TP-head-sharded (not context-sharded under DCP),
+              # so only PCP > 1 exits the single-context decode source domain.
+              "kda_source_requires_decode_only_pcp1" if parallel.pcp != 1 else
               "partitioned_kda_caller_domain" if phase != "decode" and parallel.pcp != 1 else
               "decode_profile_only" if phase != "decode" or not 1 <= tokens <= KDA_SOURCE_MAX_QUERY_TOKENS else
               "kda_requires_bf16_inputs_and_state" if case.model.activation_dtype != "bf16"

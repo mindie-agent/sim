@@ -35,13 +35,15 @@ REAL_CHECKPOINT_PROVENANCE = "real_checkpoint"
 NGRAM_CPU_PROVENANCE = "ngram_cpu_match"
 NO_DRAFT_PROVENANCE = "none"
 
-SpeculativeArchetype = Literal["none", "mtp", "dspark", "eagle", "eagle3", "ngram"]
+SpeculativeArchetype = Literal["none", "mtp", "dspark", "eagle", "eagle3", "draft_model", "ngram"]
 SPECULATIVE_ARCHETYPES: frozenset[str] = frozenset({
-    "none", "mtp", "dspark", "eagle", "eagle3", "ngram",
+    "none", "mtp", "dspark", "eagle", "eagle3", "draft_model", "ngram",
 })
-SpeculativeMethod = Literal["none", "mtp", "dspark", "eagle", "eagle3", "ngram", "ngram_gpu"]
+SpeculativeMethod = Literal[
+    "none", "mtp", "dspark", "dflash", "eagle", "eagle3", "draft_model", "ngram", "ngram_gpu",
+]
 SPECULATIVE_METHODS: frozenset[str] = frozenset({
-    "none", "mtp", "dspark", "eagle", "eagle3", "ngram", "ngram_gpu",
+    "none", "mtp", "dspark", "dflash", "eagle", "eagle3", "draft_model", "ngram", "ngram_gpu",
 })
 SpeculativeDraftProvenance = Literal[
     "real_checkpoint", "ngram_cpu_match", "synthetic_eagle3_gqa", "none",
@@ -56,8 +58,10 @@ _METHOD_TO_ARCHETYPE: dict[str, SpeculativeArchetype] = {
     "none": "none",
     "mtp": "mtp",
     "dspark": "dspark",
+    "dflash": "dspark",
     "eagle": "eagle",
     "eagle3": "eagle3",
+    "draft_model": "draft_model",
     "ngram": "ngram",
     "ngram_gpu": "ngram",
 }
@@ -65,6 +69,7 @@ ALLOWED_EXECUTION_MODES: frozenset[str] = frozenset({
     "stack",
     "sequential_mtp",
     "cyclic_nextn",
+    "multi_module_mtp",
     "block_dspark",
     "eagle3_serial",
 })
@@ -185,24 +190,6 @@ class DraftSpec:
             )
         if not self.is_synthetic and dict(self.source).get("kind") == "explicit_synthetic_gqa_mtp":
             raise ModelingError("catalog_draft_synthetic_source_requires_synthetic_flag")
-        inferred_external = (
-            not self.independent_context
-            and self.kind == "dspark"
-            and self.noncausal_query_block
-            and self.context_projection_mode == "none"
-        )
-        if inferred_external:
-            object.__setattr__(self, "independent_context", True)
-            if self.attention_kind == "gqa" and self.dcp_sharded:
-                object.__setattr__(self, "dcp_sharded", False)
-        if self.independent_context and self.context_projection_mode == "none":
-            if self.attention_kind == "mla":
-                mode = "mla_prolog"
-            elif self.weight_category:
-                mode = "per_layer_qkv"
-            else:
-                mode = "fused_kv_bank"
-            object.__setattr__(self, "context_projection_mode", mode)
         if self.attention_kind == "gqa" and self.kv_cache_elements == 0:
             if self.num_kv_heads > 0 and self.head_dim > 0 and self.independent_context:
                 object.__setattr__(
@@ -211,7 +198,7 @@ class DraftSpec:
 
     @property
     def input_width(self) -> int:
-        if self.kind in {"dspark", "mtp_dspark", "standalone_draft"} and self.target_layer_ids:
+        if self.kind in {"dspark", "mtp_dspark", "standalone_draft", "eagle3"} and self.target_layer_ids:
             return int(len(self.target_layer_ids) * self.hidden_size)
         return int(2 * self.hidden_size)
 
@@ -556,19 +543,83 @@ class SpeculativeExecutionContract:
                 )
         elif self.draft_provenance == SYNTHETIC_EAGLE3_GQA_PROVENANCE:
             raise ModelingError("speculative_contract_real_draft_conflicts_with_synthetic_provenance")
+        if not draft_compatible_with_spec_method(draft, self.spec_method):
+            raise ModelingError(
+                f"speculative_contract_draft_incompatible_with_method:{self.spec_method}:{draft.kind}"
+            )
+        is_block_draft = bool(
+            draft.kind in {"dspark", "mtp_dspark", "dflash"}
+            or (draft.noncausal_query_block and draft.block_size > 1)
+            or draft.execution_mode == "block_dspark"
+        )
+        if self.archetype == "dspark" and not is_block_draft:
+            raise ModelingError(
+                f"speculative_contract_draft_incompatible_with_archetype:{self.archetype}:{draft.kind}"
+            )
+        if self.archetype == "eagle3" and (draft.kind not in {"eagle", "eagle3"} or is_block_draft):
+            raise ModelingError(
+                f"speculative_contract_draft_incompatible_with_archetype:{self.archetype}:{draft.kind}"
+            )
         draft.validate()
         return draft
 
-    def validate_dcp_spec_gate(self, draft_spec: DraftSpec | None, parallel: Any) -> None:
-        """Validate draft availability and DCP/PCP compatibility before lowering."""
-        checked = self.require_draft_for_execution(draft_spec)
+    def validate_dcp_spec_gate(
+        self,
+        draft_spec: DraftSpec | None,
+        parallel: Any,
+        *,
+        dynamic_spec_widths: bool = False,
+        use_v2_model_runner: bool = True,
+        draft_tp_override: int | None = None,
+        spec_draft_tp: int | None = None,
+    ) -> None:
+        """Validate draft availability and verbatim VA/platform.py:2253-2321,2143 DCP/PCP precedence."""
         dcp = int(getattr(parallel, "dcp", 1) or 1)
+        pcp = int(getattr(parallel, "pcp", 1) or 1)
+        target_tp = int(getattr(parallel, "tp", 1) or 1)
         if dcp < 1:
             raise ModelingError(f"speculative_contract_parallel_dcp_invalid:{dcp}")
+        if dcp > 1 and dynamic_spec_widths:
+            raise ModelingError("dynamic_spec_decode_incompatible_with_dcp")
+        checked = self.require_draft_for_execution(draft_spec)
         if checked is not None and self.draft_dcp > dcp:
             raise ModelingError(f"speculative_contract_draft_dcp_exceeds_target:{self.draft_dcp}>{dcp}")
+        if dcp <= 1:
+            return
+        if self.spec_method in {"ngram", "ngram_gpu"} or self.archetype in {"none", "ngram"} or checked is None:
+            return
+        if use_v2_model_runner and self.archetype == "dspark" and checked.attention_kind != "mla":
+            return
+        if checked.attention_kind == "mla":
+            return
+        if pcp > 1:
+            if pcp != dcp:
+                raise ModelingError(f"eagle_gqa_draft_dcp_incompatible:pcp={pcp}!=dcp={dcp}")
+            return
+        if draft_tp_override is not None and int(draft_tp_override) > 0:
+            eff_draft_tp = int(draft_tp_override)
+        elif spec_draft_tp is not None and int(spec_draft_tp) > 0:
+            eff_draft_tp = int(spec_draft_tp)
+        elif self.draft_tp > 1:
+            eff_draft_tp = int(self.draft_tp)
+        else:
+            eff_draft_tp = target_tp
+        h_kv = int(checked.num_kv_heads)
+        h_q = int(checked.num_heads)
+        if (
+            h_kv <= 0
+            or eff_draft_tp <= h_kv
+            or dcp > (eff_draft_tp // h_kv)
+            or h_q % h_kv != 0
+            or (h_q // h_kv) % dcp != 0
+        ):
+            raise ModelingError(
+                f"eagle_gqa_draft_dcp_incompatible:tp={eff_draft_tp}:h_q={h_q}:h_kv={h_kv}:dcp={dcp}"
+            )
 
-    def build_step_schedule(self, batch_views: Sequence[Any]) -> DraftStepSchedule:
+    def build_step_schedule(
+        self, batch_views: Sequence[Any], *, capture_bucket: int = 0,
+    ) -> DraftStepSchedule:
         """Build the deterministic per-step draft schedule for the active decode batch."""
         if self.archetype in {"none", "ngram"}:
             return DraftStepSchedule(archetype=self.archetype, serial=False, num_steps=0)
@@ -578,37 +629,50 @@ class SpeculativeExecutionContract:
                 archetype=self.archetype, serial=(self.archetype != "dspark"), num_steps=0,
             )
         verify_rows = 0
-        req_budgets: list[int] = []
+        proposing_count = 0
+        dspark_q_valid = 0
+        max_req_k = 0
         for view in active_reqs:
             q_len = int(getattr(view, "q_len", 1) or 1)
             prop = int(getattr(view, "draft_proposal_tokens", 0) or 0)
+            raw_next = getattr(view, "next_draft_proposal_tokens", None)
+            req_k = (
+                int(raw_next)
+                if raw_next is not None
+                else (self.num_speculative_tokens if (prop > 0 or getattr(view, "draft_verify", False)) else 0)
+            )
             if prop > 0:
                 verify_rows += max(q_len, 1 + prop)
-                req_budgets.append(prop)
-            elif getattr(view, "draft_verify", False):
-                verify_rows += max(q_len, 1 + self.num_speculative_tokens)
-                req_budgets.append(self.num_speculative_tokens)
-            else:
-                req_budgets.append(0)
-        steps = max(req_budgets, default=0)
-        if steps <= 0:
+            elif getattr(view, "draft_verify", False) or req_k > 0:
+                verify_rows += max(q_len, 1)
+            if req_k > 0:
+                proposing_count += 1
+                max_req_k = max(max_req_k, req_k)
+                dspark_q_valid += req_k + (0 if self.sample_from_anchor else 1)
+        if proposing_count <= 0 or self.num_speculative_tokens <= 0 or max_req_k <= 0:
             return DraftStepSchedule(
                 archetype=self.archetype, serial=(self.archetype != "dspark"), num_steps=0,
             )
+        cap = _check_nonneg_int(capture_bucket, "draft_step_schedule_capture_bucket_invalid")
         if self.archetype == "dspark":
-            sp_rows = self.draft_tp * ((verify_rows + self.draft_tp - 1) // self.draft_tp)
+            q_valid = dspark_q_valid
+            q_phys = self.draft_tp * ((max(q_valid, cap) + self.draft_tp - 1) // self.draft_tp)
             return DraftStepSchedule(
                 archetype="dspark",
                 serial=False,
                 num_steps=1,
-                body_q_len_per_step=(verify_rows,),
-                physical_draft_sp_rows=(sp_rows,),
-                selected_logit_rows_per_req=(self.num_speculative_tokens,),
+                body_q_len_per_step=(q_valid,),
+                physical_draft_sp_rows=(q_phys,),
+                selected_logit_rows_per_req=(min(self.num_speculative_tokens, max_req_k),),
                 step_replay_scopes=("draft_block",),
-                markov_chain_steps=self.num_speculative_tokens,
+                markov_chain_steps=min(self.num_speculative_tokens, max_req_k),
             )
-        body_q = (verify_rows,) + tuple(sum(1 for b in req_budgets if b > step_idx) for step_idx in range(1, steps))
-        sp_rows_tuple = tuple(self.draft_tp * ((q + self.draft_tp - 1) // self.draft_tp) for q in body_q)
+        steps = min(self.num_speculative_tokens, max_req_k)
+        body_q = (verify_rows,) + (proposing_count,) * (steps - 1)
+        sp_rows_tuple = tuple(
+            self.draft_tp * ((max(q, cap) + self.draft_tp - 1) // self.draft_tp)
+            for q in body_q
+        )
         return DraftStepSchedule(
             archetype=self.archetype,
             serial=True,
@@ -621,7 +685,13 @@ class SpeculativeExecutionContract:
         )
 
     def build_prepare_plan(
-        self, prompt_len: int, *, draft_spec: DraftSpec | None = None,
+        self,
+        prompt_len: int,
+        *,
+        draft_spec: DraftSpec | None = None,
+        page_tokens: int = 0,
+        row_bytes: int = 0,
+        kernel_rows: int = 0,
     ) -> DSparkPreparePlan:
         """Build the DSpark prefill context-initialization plan (zero routed FFN)."""
         checked = self.require_draft_for_execution(draft_spec)
@@ -629,10 +699,16 @@ class SpeculativeExecutionContract:
             raise ModelingError(f"speculative_contract_prepare_plan_requires_dspark:{self.archetype}")
         prompt = _check_nonneg_int(prompt_len, "dspark_prepare_prompt_len_invalid")
         input_flops = GEMM_FLOPS_PER_MAC * prompt * checked.input_width * checked.hidden_size
-        ctx_mode = checked.context_projection_mode
+        ctx_mode = str(checked.context_projection_mode or "").strip()
         if not ctx_mode or ctx_mode == "none":
-            ctx_mode = dict(checked.source).get("context_projection_mode", "none")
-        if ctx_mode == "per_layer_qkv":
+            raise ModelingError("dspark_prepare_requires_context_projection_mode")
+        if ctx_mode == "shared_compressed_kv":
+            proj_width = (
+                checked.kv_lora_rank
+                if checked.kv_lora_rank > 0
+                else (MLA_KV_BANK_MULTIPLIER * checked.kv_width)
+            )
+        elif ctx_mode == "per_layer_qkv":
             proj_width = checked.q_width + GQA_KV_BANK_MULTIPLIER * checked.kv_width
         elif checked.attention_kind == "gqa":
             proj_width = GQA_KV_BANK_MULTIPLIER * checked.kv_width
@@ -640,17 +716,50 @@ class SpeculativeExecutionContract:
             mla_qkv = checked.q_lora_rank + checked.kv_lora_rank + checked.qk_rope_head_dim
             proj_width = mla_qkv if mla_qkv > 0 else (MLA_KV_BANK_MULTIPLIER * checked.kv_width)
         kv_flops = GEMM_FLOPS_PER_MAC * prompt * checked.hidden_size * proj_width * checked.layers
+        rd2h_bytes = (
+            dspark_rd2h_transfer_bytes(
+                prompt, page_tokens=page_tokens, row_bytes=row_bytes, kernel_rows=kernel_rows,
+            )
+            if page_tokens > 0 and row_bytes > 0
+            else 0
+        )
         return DSparkPreparePlan(
             prompt_tokens=prompt,
             draft_tp=self.draft_tp,
             draft_layers=checked.layers,
             zero_ffn_context_init=True,
             skip_write_when_slot_mapping_none=True,
-            rd2h_tail_valid_bytes=0,
+            rd2h_tail_valid_bytes=rd2h_bytes,
             exact_gemm_flops=int(input_flops + kv_flops),
             target_layer_ids=checked.target_layer_ids,
             block_size=checked.block_size,
         )
+
+
+def dspark_rd2h_transfer_bytes(
+    prompt_tokens: int,
+    *,
+    page_tokens: int,
+    row_bytes: int,
+    kernel_rows: int = 0,
+) -> int:
+    """Compute final-page valid-row prorated SFA RD2H transfer length (dspark_kv.py:180-194)."""
+    prompt = _check_nonneg_int(prompt_tokens, "dspark_rd2h_prompt_invalid")
+    page = _check_pos_int(page_tokens, "dspark_rd2h_page_tokens_invalid")
+    row_pitch = _check_nonneg_int(row_bytes, "dspark_rd2h_row_bytes_invalid")
+    if prompt == 0 or row_pitch == 0:
+        return 0
+    sub_rows = _check_pos_int(kernel_rows, "dspark_rd2h_kernel_rows_invalid") if kernel_rows > 0 else page
+    num_pages = (prompt + page - 1) // page
+    total = 0
+    for logical_idx in range(num_pages):
+        remaining = min(page, prompt - logical_idx * page)
+        num_kernels = (page + sub_rows - 1) // sub_rows
+        for kernel_idx in range(num_kernels):
+            rows = min(sub_rows, max(remaining - kernel_idx * sub_rows, 0))
+            if rows > 0:
+                total += rows * row_pitch
+    return int(total)
 
 
 def parse_draft_max_position_embeddings(
@@ -720,17 +829,88 @@ def effective_draft_context_cap(draft: Any, runtime: Any) -> int:
     return min(candidates) if candidates else 0
 
 
+SUPPORTED_SPECULATIVE_METHODS: frozenset[str] = frozenset({
+    "ngram", "ngram_gpu", "eagle", "eagle3", "mtp",
+    "deepseek_mtp", "qwen3_5_mtp", "dflash", "dspark", "draft_model",
+})
+MTP_SPECULATIVE_METHOD_ALIASES: frozenset[str] = frozenset({
+    "mtp", "deepseek_mtp", "qwen3_5_mtp",
+})
+SERIAL_MTP_STRICT_METHODS: frozenset[str] = frozenset({"qwen3_5_mtp"})
+
+
+def canonical_speculative_method(method: str | None) -> str:
+    """Normalize upstream vLLM MTP method enum aliases to canonical family name."""
+    norm = str(method or "none").strip().lower()
+    if norm in MTP_SPECULATIVE_METHOD_ALIASES:
+        return "mtp"
+    return norm or "none"
+
+
+def is_mtp_speculative_method(method: str | None) -> bool:
+    """Return True for any upstream vLLM MTP speculative method enum."""
+    return str(method or "").strip().lower() in MTP_SPECULATIVE_METHOD_ALIASES
+
+
+def is_supported_speculative_method(method: str | None, *, allow_none: bool = False) -> bool:
+    """Return True when ``method`` is a documented Ascend V2 speculative method."""
+    norm = str(method or "").strip().lower()
+    if allow_none and norm == "none":
+        return True
+    return norm in SUPPORTED_SPECULATIVE_METHODS
+
+
+def draft_compatible_with_spec_method(draft: Any, method: str | None) -> bool:
+    """Single source of truth for speculative method vs attached DraftSpec compatibility."""
+    norm = str(method or "").strip().lower()
+    if not norm or norm == "none":
+        return True
+    is_block = bool(
+        draft.kind in {"dspark", "mtp_dspark", "dflash"}
+        or getattr(draft, "noncausal_query_block", False)
+        or getattr(draft, "execution_mode", "") == "block_dspark"
+    )
+    if norm in {"ngram", "ngram_gpu"}:
+        return False
+    if norm in {"dspark", "dflash"}:
+        return is_block
+    if norm in SERIAL_MTP_STRICT_METHODS:
+        return draft.kind == "mtp" and not is_block
+    if norm in MTP_SPECULATIVE_METHOD_ALIASES:
+        return draft.kind in {"mtp", "dspark", "mtp_dspark"}
+    if norm in {"eagle", "eagle3"}:
+        return draft.kind in {"eagle", "eagle3"} and not is_block
+    if norm == "draft_model":
+        return draft.kind in {"draft_model", "standalone_draft"} and not is_block
+    return False
+
+
+def validate_fia_speculative_tokens(num_speculative_tokens: int) -> int:
+    """Strict contract check: reject explicit K < 0 or K > 15 (Ascend FIA 16-token ceiling)."""
+    if isinstance(num_speculative_tokens, bool) or not isinstance(num_speculative_tokens, int):
+        raise ModelingError(f"ascend_fia_speculative_tokens_invalid:{num_speculative_tokens!r}")
+    requested = int(num_speculative_tokens)
+    if requested < 0 or requested > MAX_SPECULATIVE_TOKENS:
+        raise ModelingError(
+            f"ascend_fia_speculative_tokens_exceeds_limit:{requested}>{MAX_SPECULATIVE_TOKENS}"
+        )
+    return requested
+
+
 __all__ = [
     "ALLOWED_CONTEXT_PROJECTION_MODES",
     "ALLOWED_EXECUTION_MODES",
     "DEFAULT_DRAFT_PP_STAGES",
     "MAX_SPECULATIVE_TOKENS",
+    "MTP_SPECULATIVE_METHOD_ALIASES",
     "NGRAM_CPU_PROVENANCE",
     "NO_DRAFT_PROVENANCE",
     "REAL_CHECKPOINT_PROVENANCE",
+    "SERIAL_MTP_STRICT_METHODS",
     "SPECULATIVE_ARCHETYPES",
     "SPECULATIVE_DRAFT_PROVENANCES",
     "SPECULATIVE_METHODS",
+    "SUPPORTED_SPECULATIVE_METHODS",
     "DSparkPreparePlan",
     "DraftSpec",
     "DraftStepSchedule",
@@ -738,6 +918,12 @@ __all__ = [
     "SpeculativeDraftProvenance",
     "SpeculativeExecutionContract",
     "SpeculativeMethod",
+    "canonical_speculative_method",
+    "draft_compatible_with_spec_method",
+    "dspark_rd2h_transfer_bytes",
     "effective_draft_context_cap",
+    "is_mtp_speculative_method",
+    "is_supported_speculative_method",
     "parse_draft_max_position_embeddings",
+    "validate_fia_speculative_tokens",
 ]

@@ -201,6 +201,25 @@ def _source_stat(path: Path) -> tuple[int, int] | None:
     return (stat.st_mtime_ns, stat.st_size)
 
 
+def _stream_checkpoint_quant_keys(path: Path) -> list[str]:
+    """Stream top-level keys of a ModelSlim quant descriptor with bounded memory."""
+    from mindie_sim.catalog.checkpoint_reader import iter_json_object_items
+
+    items, _ = iter_json_object_items(path)
+    return [str(k) for k, _ in items]
+
+
+def _stream_checkpoint_weight_map_keys(path: Path) -> set[str]:
+    """Stream ``weight_map`` keys from a safetensors index file with bounded memory."""
+    from mindie_sim.catalog.checkpoint_reader import iter_json_object_items
+
+    items, _ = iter_json_object_items(path)
+    for key, value in items:
+        if key == "weight_map" and isinstance(value, Mapping):
+            return {str(k) for k in value}
+    return set()
+
+
 def _normal_summary(source_path: Path) -> dict[str, Any]:
     """Parse one real source once and cache only its normalized small summary."""
     quant_path = source_path.parent / "quant_model_description.json"
@@ -212,33 +231,23 @@ def _normal_summary(source_path: Path) -> dict[str, Any]:
     cached = _NORMAL_SUMMARY_CACHE.get(key)
     if cached is not None:
         return cached
-    quant: Any = None
-    index: Any = None
+    quant_keys: list[str] | None = None
+    weight_map_keys: set[str] = set()
     q_status = "ok"
     idx_status = "ok"
     if qstat is None:
         q_status = "unavailable"
     else:
-        try:
-            quant = json.loads(quant_path.read_text(encoding="utf-8"))
-        except TimeoutError:
-            raise
-        except (OSError, ValueError, TypeError):
-            q_status = "unreadable_or_malformed"
+        quant_keys = _stream_checkpoint_quant_keys(quant_path)
     if istat is None:
         idx_status = "unavailable"
     else:
-        try:
-            index = json.loads(index_path.read_text(encoding="utf-8"))
-        except TimeoutError:
-            raise
-        except (OSError, ValueError, TypeError):
-            idx_status = "unreadable_or_malformed"
+        weight_map_keys = _stream_checkpoint_weight_map_keys(index_path)
     summary: dict[str, Any] = {
         "quant_source_status": q_status,
         "weight_index_status": idx_status,
-        "quant_manifest_path": str(quant_path) if qstat is not None else None,
-        "weight_index_path": str(index_path) if istat is not None else None,
+        "quant_manifest_name": quant_path.name if qstat is not None else None,
+        "weight_index_name": index_path.name if istat is not None else None,
         "quant_key_count": None,
         "weight_key_count": None,
         "weight_index_complete": False,
@@ -246,27 +255,21 @@ def _normal_summary(source_path: Path) -> dict[str, Any]:
         "role_bias": {},
         "trained_layernorm_bias": False,
     }
-    if q_status == "ok" and isinstance(quant, Mapping):
-        quant_keys = [str(key) for key in quant]
+    if q_status == "ok" and quant_keys is not None:
         summary["quant_key_count"] = len(quant_keys)
         summary["constructor_wants_bias"] = any(
-            "norm.bias" in key for key in quant_keys)
+            "norm.bias" in qkey for qkey in quant_keys)
         layers: list[int] = []
         for qkey in quant_keys:
             match = re.match(r"model\.layers\.(\d+)\.", qkey)
             if match:
                 layers.append(int(match.group(1)))
         layers = sorted(set(layers))
-        weight_map: dict[str, Any] = {}
-        if idx_status == "ok" and isinstance(index, Mapping):
-            raw_map = index.get("weight_map")
-            if isinstance(raw_map, Mapping):
-                weight_map = {str(key): value for key, value in raw_map.items()}
-        summary["weight_key_count"] = len(weight_map)
-        index_complete = bool(weight_map) and bool(layers) and all(
-            f"model.layers.{layer}.input_layernorm.weight" in weight_map
-            and f"model.layers.{layer}.post_attention_layernorm.weight" in weight_map
-            for layer in layers) and "model.norm.weight" in weight_map
+        summary["weight_key_count"] = len(weight_map_keys)
+        index_complete = bool(weight_map_keys) and bool(layers) and all(
+            f"model.layers.{layer}.input_layernorm.weight" in weight_map_keys
+            and f"model.layers.{layer}.post_attention_layernorm.weight" in weight_map_keys
+            for layer in layers) and "model.norm.weight" in weight_map_keys
         summary["weight_index_complete"] = index_complete
         roles: dict[str, dict[str, Any]] = {}
         specs = {
@@ -281,13 +284,13 @@ def _normal_summary(source_path: Path) -> dict[str, Any]:
                 for layer in layers],
         }
         for role_name, expected in specs.items():
-            loaded = [key for key in expected if key in weight_map]
+            loaded = [ekey for ekey in expected if ekey in weight_map_keys]
             if index_complete:
-                absent = [key for key in expected if key not in weight_map]
+                absent = [ekey for ekey in expected if ekey not in weight_map_keys]
                 unobserved: list[str] = []
             else:
                 absent = []
-                unobserved = [key for key in expected if key not in weight_map]
+                unobserved = [ekey for ekey in expected if ekey not in weight_map_keys]
             if loaded:
                 state = "loaded"
             elif index_complete:
@@ -307,7 +310,6 @@ def _normal_summary(source_path: Path) -> dict[str, Any]:
     if len(_NORMAL_SUMMARY_CACHE) >= _SUMMARY_CACHE_LIMIT:
         _NORMAL_SUMMARY_CACHE.clear()
     _NORMAL_SUMMARY_CACHE[key] = summary
-    del quant, index
     return summary
 
 
@@ -321,11 +323,18 @@ def _normal_source_metadata(model: Any, runtime: Any = None) -> dict[str, Any]:
     source = dict(meta.get("glm51_source") or {}) if isinstance(
         meta.get("glm51_source"), Mapping) else {}
     model_type = str(meta.get("source_model_type") or "")
-    classes = {
-        "qwen3_5_text": ("AscendGemmaRMSNorm", 1.0, "input_layernorm.initial"),
-        "glm_moe_dsa": ("AscendRMSNorm", 0.0, "fused_residual"),
-    }
-    resolved = classes.get(model_type, (None, None, None))
+    facts = dict(getattr(model, "catalog_facts", ()) or ())
+    norm_facts = facts.get("normalization") if isinstance(facts.get("normalization"), Mapping) else {}
+    has_unit_offset = (
+        any(bool(getattr(p, "norm_unit_offset", False)) for p in getattr(model, "layer_plans", ()))
+        or float(norm_facts.get("norm_weight_offset", 0.0) or 0.0) == 1.0
+    )
+    if has_unit_offset:
+        resolved = ("AscendGemmaRMSNorm", 1.0, "input_layernorm.initial")
+    elif norm_facts:
+        resolved = ("AscendRMSNorm", 0.0, "fused_residual")
+    else:
+        resolved = (None, None, None)
     explicit_class = str(meta.get("rms_norm_source_class") or "") or None
     explicit_offset = meta.get("rms_norm_source_weight_offset")
     explicit_role = str(meta.get("rms_norm_source_role") or "") or None
