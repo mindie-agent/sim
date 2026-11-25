@@ -42,16 +42,20 @@ from mindie_sim.prediction.program import KernelProgram, ParallelProgram, Pipeli
 
 
 BASELINE_OFFLOAD_UB_BYTES = 90112
+COPY_SFA_MIN_TOPK_BUFFER_SIZE = 2048
+COPY_SFA_POOL_SLACK = 2
+COPY_SFA_TOPK_BUFFER_ALIGNMENT = 256
 DEVICE_SLOT_INDEX_BYTES = 4
 GIB_EXPONENT = 3
 HOST_BUFFER_POOLS = 3
 HOST_SLOT_INDEX_BYTES = 4
 KV_COPY_MIN_ENTRIES = 64
 LIMIT_SCAN_OPS_PER_ENTRY = 6
-MIN_OFFLOAD_POOL_REQUESTS = 4
 OFFLOAD_ADDRESS_PAIR_BYTES = 8
+OFFLOAD_COLD_FIRST_DECODE = -2
 OFFLOAD_INACTIVE_REQUEST = -3
 OFFLOAD_INDEX_ELEMENT_BYTES = 4
+OFFLOAD_STEADY_LONG_DECODE = -1
 TOPK_INDEX_BYTES = 4
 WIDE_OFFLOAD_MIN_UB_BYTES = 131072
 WIDE_OFFLOAD_UB_BYTES = 122880
@@ -83,16 +87,17 @@ DEFAULT_OPTIONS: dict[str, Any] = {
 
 
 def copy_sfa_pool_capacity(max_num_seqs: int) -> int:
-    """Match vllm-ascend SparseKvOffloadManager._compute_copy_sfa_pool_capacity."""
-    n = max(MIN_OFFLOAD_POOL_REQUESTS, int(max_num_seqs))
-    return 1 << (n - 1).bit_length()
+    """Match vllm-ascend CopySfaTopkSlots capacity: max_num_seqs + 2."""
+    return max(1, int(max_num_seqs)) + COPY_SFA_POOL_SLACK
 
 
 def _resolve_options(raw_options: Mapping[str, Any] | None) -> dict[str, Any]:
-    opts = {**DEFAULT_OPTIONS, **(raw_options or {})}
+    raw = dict(raw_options or {})
+    opts = {**DEFAULT_OPTIONS, **raw}
     if opts["dram_size_per_dp_gb"] <= 0:
         raise ModelingError("sparse_kv_offload_requires_positive_dram_size_per_dp_gb")
-    if int(opts["topk_buffer_size"]) <= 0:
+    topk_buffer_size = int(opts["topk_buffer_size"])
+    if topk_buffer_size <= 0:
         raise ModelingError("sparse_kv_offload_requires_positive_topk_buffer_size")
     miss_rate = float(opts["miss_rate"])
     if not math.isfinite(miss_rate) or miss_rate < 0.0 or miss_rate > 1.0:
@@ -101,8 +106,17 @@ def _resolve_options(raw_options: Mapping[str, Any] | None) -> dict[str, Any]:
         raise ModelingError("sparse_kv_offload_num_shared_layers_must_be_positive")
     if int(opts["page_size"]) < 1:
         raise ModelingError("sparse_kv_offload_page_size_must_be_positive")
+    # Resolve effective decode sparse-offload mode once for validation, budgeting, and lowering.
     if opts["use_fused_overlap"]:
         opts["use_fused_copy_sfa"] = False
+    if opts["layerwise_kv_offload"] and "use_fused_copy_sfa" not in raw:
+        opts["use_fused_copy_sfa"] = False
+    if opts["layerwise_kv_offload"] and "use_fused_overlap" not in raw:
+        opts["use_fused_overlap"] = False
+    if opts["use_fused_copy_sfa"]:
+        if (topk_buffer_size < COPY_SFA_MIN_TOPK_BUFFER_SIZE
+                or topk_buffer_size % COPY_SFA_TOPK_BUFFER_ALIGNMENT != 0):
+            raise ModelingError("sparse_kv_offload_copy_sfa_requires_topk_buffer_ge_2048_aligned_256")
     return opts
 
 
@@ -211,7 +225,8 @@ def sparse_kv_offload_memory_budget(
     topk_buffer_size = int(opts["topk_buffer_size"])
 
     pool_cap = copy_sfa_pool_capacity(max_seqs)
-    if layerwise:
+    decode_hot_buffer = (not layerwise) or bool(opts["use_fused_copy_sfa"]) or bool(opts["use_fused_overlap"])
+    if not decode_hot_buffer:
         topk_rows = 0
         buffer_width = 0
         topk_buffer_bytes_per_layer = 0
@@ -240,11 +255,16 @@ def sparse_kv_offload_memory_budget(
     )
     layer_stage = tuple(stage for stage, count in enumerate(counts) for _ in range(count))
     static_npu_bytes_per_stage = [0.0] * p.pp
+    full_indexer_set = frozenset(full_indexer_layers)
     for layer_idx in offload_layers:
-        layer_topk = 0 if layerwise else (topk_rows * buffer_width * kv_row_bytes_by_layer[layer_idx])
-        static_npu_bytes_per_stage[layer_stage[layer_idx]] += float(
-            layer_topk + lru_bytes_per_layer + slot_map_bytes_per_layer
-        )
+        layer_topk = (topk_rows * buffer_width * kv_row_bytes_by_layer[layer_idx]) if decode_hot_buffer else 0
+        layer_lim = (lru_bytes_per_layer + slot_map_bytes_per_layer) if layer_idx in full_indexer_set else 0
+        static_npu_bytes_per_stage[layer_stage[layer_idx]] += float(layer_topk + layer_lim)
+    die_ranks = tuple(int(d.rank) for d in (getattr(machine, "dies", ()) or ()))
+    tp_groups = (
+        tuple(die_ranks[i:i + max(1, int(p.tp))] for i in range(0, len(die_ranks), max(1, int(p.tp))))
+        if die_ranks else ()
+    )
 
     # MemFabric Scene.SHARED Host DRAM pool per DP replica (shared across TP ranks).
     dram_pool_bytes_per_dp = int(float(opts["dram_size_per_dp_gb"]) * (1024 ** GIB_EXPONENT))
@@ -313,7 +333,8 @@ def sparse_kv_offload_memory_budget(
     }
 
     return {
-        "implementation": IMPLEMENTATION, "options": opts, "offload_layers": offload_layers,
+        "implementation": IMPLEMENTATION, "options": opts, "tp": int(p.tp),
+        "tp_groups": tp_groups, "offload_layers": offload_layers,
         "full_indexer_layers": full_indexer_layers, "shared_indexer_layers": shared_indexer_layers,
         "kv_row_bytes": kv_row_bytes, "index_row_bytes": idx_row_bytes,
         "kv_row_bytes_by_layer": kv_row_bytes_by_layer,
@@ -601,60 +622,128 @@ def _build_memfabric_entry_gather(op: OpSpec, geometry: Geometry) -> OperatorPla
 
 
 def _build_lim_plan(op: OpSpec, geometry: Geometry) -> OperatorPlan:
-    rpipe = read_role(geometry.resource_units or {}, aiv=0)
-    work = Work(
-        matrix={op.dtype: op.flops} if op.flops else {},
-        resources={
-            "hbm": op.hbm_bytes,
-            rpipe: op.mte2_bytes,
-            "mte3": op.mte3_bytes,
-            "vector": op.vector_ops,
-        },
-    )
+    meta = dict(op.metadata)
+    rw = dict(meta.get("resource_work", {}) or {})
+    matrix = dict(op.matrix_flops) if op.matrix_flops else ({op.dtype: op.flops} if op.flops else {})
+    aic_pipe = read_role(geometry.resource_units or {})
+    aiv_pipe = read_role(geometry.resource_units or {}, aiv=0)
+    fused_aic_read = meta.get("fused_indexer_mte2_aic")
+    mte1_bytes = max(0.0, float(meta.get("mte1_bytes", rw.get("mte1", 0.0)) or 0.0))
+    fixpipe_bytes = max(0.0, float(meta.get("fixpipe_bytes", rw.get("fixpipe", 0.0)) or 0.0))
+    resources: dict[str, float] = {
+        "hbm": float(op.hbm_bytes),
+        "mte3": float(op.mte3_bytes),
+        "vector": float(op.vector_ops),
+    }
+    if mte1_bytes > 0.0:
+        resources["mte1"] = mte1_bytes
+    if fixpipe_bytes > 0.0:
+        resources["fixpipe"] = fixpipe_bytes
+    if fused_aic_read is not None and aic_pipe != aiv_pipe:
+        aic_mte2 = min(float(op.mte2_bytes), max(0.0, float(fused_aic_read)))
+        aiv_mte2 = max(0.0, float(op.mte2_bytes) - aic_mte2)
+        resources[aic_pipe] = aic_mte2
+        resources[aiv_pipe] = aiv_mte2
+    else:
+        resources[aiv_pipe] = float(op.mte2_bytes)
+    work = Work(matrix=matrix, resources=resources)
 
     def program(context):
-        return KernelProgram((Stage("lim_slot_map_lru", context.bind(work)),))
+        c_pipe = read_role(context.resource_names)
+        v_pipe = read_role(context.resource_names, aiv=0)
+        if not matrix:
+            return KernelProgram((Stage("lim_slot_map_lru", context.bind(work)),))
+        lim_vec = min(float(op.vector_ops), max(0.0, float(meta.get("lim_vector_ops", 0.0))))
+        li_vec = max(0.0, float(op.vector_ops) - lim_vec)
+        aic_read = (
+            min(float(op.mte2_bytes), max(0.0, float(fused_aic_read)))
+            if fused_aic_read is not None else float(op.mte2_bytes)
+        )
+        aiv_read = max(0.0, float(op.mte2_bytes) - aic_read)
+        li_hbm = min(float(op.hbm_bytes), aic_read)
+        lim_hbm = max(0.0, float(op.hbm_bytes) - li_hbm)
+        li_res: dict[str, float] = {"hbm": li_hbm, c_pipe: aic_read, "vector": li_vec}
+        if mte1_bytes > 0.0:
+            li_res["mte1"] = mte1_bytes
+        if fixpipe_bytes > 0.0:
+            li_res["fixpipe"] = fixpipe_bytes
+        lim_res = {"hbm": lim_hbm, v_pipe: aiv_read, "mte3": float(op.mte3_bytes), "vector": lim_vec}
+        return KernelProgram((
+            Stage("li_cube_score", context.bind(Work(matrix=matrix, resources=li_res))),
+            Stage("lim_slot_map_lru", context.bind(Work(resources=lim_res)), after=("li_cube_score",)),
+        ))
 
     return OperatorPlan(work, program, metadata={
-        "execution_class": "vector",
-        "native_kernel": "npu_fused_lightning_indexer_manage",
+        "execution_class": "mixed_aiv_aic" if matrix else "vector",
+        "native_kernel": str(meta.get("kernel") or "npu_fused_lightning_indexer_manage"),
     })
+
+
+def _resolve_op_sfa_offload(op: OpSpec, spec: Mapping[str, Any]) -> tuple[float, float]:
+    """Resolve H2D miss bytes and attention miss fraction scoped strictly to op.requests."""
+    per_req = spec.get("per_request_offload")
+    op_reqs = tuple(str(r) for r in (getattr(op, "requests", ()) or ()))
+    if isinstance(per_req, Mapping) and op_reqs and all(r in per_req for r in op_reqs):
+        miss_bytes = sum(max(0.0, float(per_req[r].get("miss_h2d_bytes", 0.0))) for r in op_reqs)
+        hit_pairs = sum(max(0.0, float(per_req[r].get("hit_pairs", 0.0))) for r in op_reqs)
+        miss_pairs = sum(max(0.0, float(per_req[r].get("miss_pairs", 0.0))) for r in op_reqs)
+        total_pairs = hit_pairs + miss_pairs
+        miss_frac = (miss_pairs / total_pairs) if total_pairs > 0.0 else (1.0 if miss_bytes > 0.0 else 0.0)
+        return miss_bytes, max(0.0, min(1.0, miss_frac))
+    miss_bytes = max(0.0, float(spec.get("miss_h2d_bytes", 0.0)))
+    raw_miss_frac = spec.get("miss_fraction")
+    attn_mte2 = float(op.mte2_bytes)
+    if raw_miss_frac is not None:
+        miss_frac = max(0.0, min(1.0, float(raw_miss_frac)))
+    elif miss_bytes > 0.0 and attn_mte2 > 0.0:
+        miss_frac = max(0.0, min(1.0, miss_bytes / attn_mte2))
+    else:
+        miss_frac = 1.0 if miss_bytes > 0.0 else 0.0
+    return miss_bytes, miss_frac
 
 
 def _build_overlapped_sfa_plan(op: OpSpec, geometry: Geometry) -> OperatorPlan:
     meta = dict(op.metadata)
     spec = dict(meta.get("sparse_offload_sfa", {}))
-    miss_bytes = float(spec.get("miss_h2d_bytes", 0.0))
-    attn_hbm_bytes = max(0.0, float(op.hbm_bytes) - miss_bytes)
     if not op.dtype:
         raise ModelingError("sparse_kv_offload_op_dtype_required")
     dtype = op.dtype
+    attn_mte2 = float(op.mte2_bytes)
+    attn_mte3 = float(op.mte3_bytes)
+    attn_hbm = float(op.hbm_bytes)
+    attn_vec = float(op.vector_ops)
+    matrix_work = (
+        dict(op.matrix_flops)
+        if op.matrix_flops
+        else ({dtype: float(op.flops)} if op.flops else {})
+    )
+    miss_bytes, miss_frac = _resolve_op_sfa_offload(op, spec)
+    hit_frac = 1.0 - miss_frac
     aic_pipe = read_role(geometry.resource_units or {})
     aiv_pipe = read_role(geometry.resource_units or {}, aiv=0)
 
     res: dict[str, float] = {
-        "hbm": attn_hbm_bytes + miss_bytes,
-        "mte3": float(op.mte3_bytes) + miss_bytes,
-        "vector": float(op.vector_ops),
+        "hbm": attn_hbm + miss_bytes,
+        "mte3": attn_mte3 + miss_bytes,
+        "vector": attn_vec,
     }
     if aic_pipe == aiv_pipe:
-        res[aic_pipe] = attn_hbm_bytes + miss_bytes
+        res[aic_pipe] = attn_mte2 + miss_bytes
     else:
-        res[aic_pipe] = attn_hbm_bytes
+        res[aic_pipe] = attn_mte2
         res[aiv_pipe] = miss_bytes
-    work = Work(matrix={dtype: op.flops} if op.flops else {}, resources=res)
+    work = Work(matrix=matrix_work, resources=res)
 
     def program(context):
         c_pipe = read_role(context.resource_names)
         v_pipe = read_role(context.resource_names, aiv=0)
-        aic_work = Work(
-            matrix={dtype: op.flops} if op.flops else {},
-            resources={"hbm": attn_hbm_bytes, c_pipe: attn_hbm_bytes,
-                       "mte3": float(op.mte3_bytes), "vector": float(op.vector_ops)},
-        )
-        aic_prog = KernelProgram((Stage("sfa_aic", context.bind(aic_work)),))
-        if miss_bytes <= 0:
-            return aic_prog
+        if miss_bytes <= 0.0:
+            full_work = Work(
+                matrix=matrix_work,
+                resources={"hbm": attn_hbm, c_pipe: attn_mte2,
+                           "mte3": attn_mte3, "vector": attn_vec},
+            )
+            return KernelProgram((Stage("sfa_aic", context.bind(full_work)),))
         gva_bw_bytes_per_ms, setup_ms = _resolve_host_dma_channel(context, spec, "h2d")
         gva_name = context.resource_names.get(v_pipe)
         cap = (
@@ -662,19 +751,44 @@ def _build_overlapped_sfa_plan(op: OpSpec, geometry: Geometry) -> OperatorPlan:
             if (gva_name and gva_bw_bytes_per_ms and gva_bw_bytes_per_ms > 0)
             else {}
         )
-        aiv_prog = KernelProgram((
+        attn_hbm_write = min(attn_hbm, attn_mte3)
+        attn_hbm_read = attn_hbm - attn_hbm_write
+        stages = [
             Stage("gva_setup", latency=setup_ms),
             Stage("gva_h2d_gather", context.bind(Work(resources={v_pipe: miss_bytes})),
                   after=("gva_setup",), caps=cap),
             Stage("topk_buffer_write", context.bind(Work(resources={"hbm": miss_bytes, "mte3": miss_bytes})),
                   after=("gva_h2d_gather",)),
-        ))
-        return ParallelProgram((aiv_prog, aic_prog))
+        ]
+        if hit_frac > 0.0:
+            hit_work = Work(
+                matrix={k: v * hit_frac for k, v in matrix_work.items()},
+                resources={
+                    "hbm": attn_hbm_read * hit_frac,
+                    c_pipe: attn_mte2 * hit_frac,
+                    "vector": attn_vec * hit_frac,
+                },
+            )
+            stages.append(Stage("sfa_aic_hit", context.bind(hit_work)))
+        miss_work = Work(
+            matrix={k: v * miss_frac for k, v in matrix_work.items()},
+            resources={
+                "hbm": attn_hbm_read * miss_frac + attn_hbm_write,
+                c_pipe: attn_mte2 * miss_frac,
+                "mte3": attn_mte3,
+                "vector": attn_vec * miss_frac,
+            },
+        )
+        miss_after = ("topk_buffer_write", "sfa_aic_hit") if hit_frac > 0.0 else ("topk_buffer_write",)
+        stages.append(Stage("sfa_aic_miss", context.bind(miss_work), after=miss_after))
+        return KernelProgram(tuple(stages))
 
     return OperatorPlan(work, program, metadata={
         "execution_class": "mixed_aiv_aic_overlap",
         "miss_h2d_bytes": miss_bytes,
-        "attn_hbm_bytes": attn_hbm_bytes,
+        "attn_hbm_bytes": attn_hbm,
+        "attn_mte2_bytes": attn_mte2,
+        "miss_fraction": miss_frac,
     })
 
 
@@ -721,108 +835,398 @@ def lower_prefill_offload(
     return op_id
 
 
+def _resolve_tp_rank(
+    physical_rank: int | None,
+    tp: int,
+    *,
+    tp_group: tuple[int, ...] | None = None,
+    tp_groups: tuple[tuple[int, ...], ...] = (),
+) -> int:
+    """Resolve logical TP lane index from ordered TP group rather than rank % tp."""
+    if physical_rank is None:
+        return 0
+    rank = int(physical_rank)
+    if tp_group is not None:
+        ordered = tuple(int(r) for r in tp_group)
+        if rank in ordered:
+            return ordered.index(rank)
+    for group in tp_groups:
+        ordered = tuple(int(r) for r in group)
+        if rank in ordered:
+            return ordered.index(rank)
+    return rank % max(1, int(tp))
+
+
+def _request_slot_ready(
+    view: Any,
+    *,
+    prefix: int,
+    cache_tokens: int,
+    block_size: int,
+    topk_buffer_size: int,
+    slot_ready_by_request: Mapping[str, bool] | None,
+    slot_residency_by_request: Mapping[str, tuple[int, int]] | None,
+) -> bool:
+    """Match vllm-ascend LIM readiness: prior slot cache == cache and prior prefix <= prefix."""
+    req_id = str(getattr(view, "request_id", "") or "")
+    if slot_residency_by_request is not None and req_id in slot_residency_by_request:
+        last_cache, last_prefix = slot_residency_by_request[req_id]
+        return int(last_cache) == cache_tokens and int(last_prefix) <= prefix
+    if slot_ready_by_request is not None and req_id in slot_ready_by_request:
+        return bool(slot_ready_by_request[req_id])
+    prev_pub = str(getattr(view, "previous_state_publication", "") or "")
+    if prev_pub.startswith("prefill_state:"):
+        return False
+    prompt_tokens = int(getattr(view, "prompt_tokens", 0) or 0)
+    had_prior_decode = (
+        prev_pub.startswith("decode_state:")
+        or (prompt_tokens > 0 and int(getattr(view, "context", 0) or 0) > prompt_tokens)
+        or int(getattr(view, "state_version", 0) or 0) > 1
+    )
+    if not had_prior_decode:
+        return False
+    # Crossing from short (< topk_buffer_size) to long (>= topk_buffer_size) had prior cache == 0.
+    prev_context = max(0, int(getattr(view, "context", 0) or 0) - max(1, int(getattr(view, "q_len", 1) or 1)))
+    prev_prefix = (prev_context // max(1, block_size)) * max(1, block_size)
+    return prev_prefix >= topk_buffer_size
+
+
+def _classify_decode_requests(
+    views: tuple[Any, ...],
+    *,
+    topk_buffer_size: int,
+    topk_width: int,
+    block_size: int,
+    kv_row_bytes: int,
+    miss_rate: float,
+    slot_ready_by_request: Mapping[str, bool] | None,
+    slot_residency_by_request: Mapping[str, tuple[int, int]] | None,
+) -> dict[str, Any]:
+    """Classify decode requests strictly into {-3, -2, -1} with per-request fills & pairs."""
+    short_reqs, long_reqs = 0, 0
+    total_h2d_tokens, total_resident_fill_tokens = 0, 0
+    total_hit_pairs, total_miss_pairs = 0, 0
+    request_states: list[int] = []
+    pool_entries: list[int | None] = []
+    per_request: dict[str, dict[str, Any]] = {}
+    blk = max(1, int(block_size))
+    for v in views:
+        req_id = str(getattr(v, "request_id", "") or "")
+        q_len = max(1, int(getattr(v, "q_len", 1) or 1))
+        ctx = max(0, int(getattr(v, "context", 0) or 0))
+        prefix = (ctx // blk) * blk
+        slot_val = getattr(v, "state_slot", None)
+        pool_entries.append(int(slot_val) if (slot_val is not None and int(slot_val) >= 0) else None)
+        if prefix < topk_buffer_size:
+            short_reqs += 1
+            state = OFFLOAD_INACTIVE_REQUEST
+            hit_pairs = q_len * min(ctx, topk_width)
+            miss_pairs = 0
+            h2d_tokens = 0
+            resident_fill = 0
+        else:
+            long_reqs += 1
+            cache_tokens = min(prefix, topk_buffer_size)
+            active_topk = min(prefix, topk_width)
+            ready = _request_slot_ready(
+                v, prefix=prefix, cache_tokens=cache_tokens, block_size=blk,
+                topk_buffer_size=topk_buffer_size,
+                slot_ready_by_request=slot_ready_by_request,
+                slot_residency_by_request=slot_residency_by_request,
+            )
+            if ready:
+                state = OFFLOAD_STEADY_LONG_DECODE
+                miss_per_q = int(math.ceil(active_topk * miss_rate))
+                miss_pairs = q_len * miss_per_q
+                hit_pairs = max(0, q_len * active_topk - miss_pairs)
+                resident_fill = 0
+                h2d_tokens = min(cache_tokens, miss_pairs)
+            else:
+                state = OFFLOAD_COLD_FIRST_DECODE
+                miss_pairs = q_len * active_topk
+                hit_pairs = 0
+                resident_fill = cache_tokens
+                h2d_tokens = cache_tokens
+        request_states.append(state)
+        total_hit_pairs += hit_pairs
+        total_miss_pairs += miss_pairs
+        total_h2d_tokens += h2d_tokens
+        total_resident_fill_tokens += resident_fill
+        if req_id:
+            req_pairs = hit_pairs + miss_pairs
+            per_request[req_id] = {
+                "request_state": state,
+                "pool_entry": pool_entries[-1],
+                "hit_pairs": hit_pairs,
+                "miss_pairs": miss_pairs,
+                "miss_fraction": (float(miss_pairs) / float(req_pairs)) if req_pairs > 0 else 0.0,
+                "resident_fill_tokens": resident_fill,
+                "h2d_tokens": h2d_tokens,
+                "miss_h2d_bytes": float(h2d_tokens * kv_row_bytes),
+            }
+    return {
+        "short_requests": short_reqs,
+        "long_requests": long_reqs,
+        "total_h2d_tokens": total_h2d_tokens,
+        "total_resident_fill_tokens": total_resident_fill_tokens,
+        "total_hit_pairs": total_hit_pairs,
+        "total_miss_pairs": total_miss_pairs,
+        "request_states": tuple(request_states),
+        "request_pool_entries": tuple(pool_entries),
+        "per_request_offload": per_request,
+    }
+
+
+def _emit_or_fuse_lim(
+    b: Any,
+    *,
+    topk_id: str,
+    long_reqs: int,
+    short_reqs: int,
+    topk_width: int,
+    total_miss_tokens: int,
+    request_states: tuple[int, ...],
+    request_pool_entries: tuple[int | None, ...],
+    budget: Mapping[str, Any],
+    fuse_with_indexer: bool,
+) -> str:
+    lim_read = float(long_reqs * topk_width * (TOPK_INDEX_BYTES + DEVICE_SLOT_INDEX_BYTES + HOST_SLOT_INDEX_BYTES))
+    lim_write = float(
+        long_reqs * topk_width * (TOPK_INDEX_BYTES + OFFLOAD_ADDRESS_PAIR_BYTES)
+        + (short_reqs * topk_width * (TOPK_INDEX_BYTES + DEVICE_SLOT_INDEX_BYTES) if fuse_with_indexer else 0)
+    )
+    lim_vec = float(
+        long_reqs * topk_width * LIMIT_SCAN_OPS_PER_ENTRY
+        + (short_reqs * topk_width if fuse_with_indexer else 0)
+    )
+    if fuse_with_indexer:
+        orig_idx = next((idx for idx, op in enumerate(b.ops) if op.op_id == topk_id), None)
+        if orig_idx is not None:
+            orig = b.ops[orig_idx]
+            orig_meta = dict(orig.metadata)
+            rw = dict(orig_meta.get("resource_work", {}) or {})
+            is_quant = (
+                orig.dtype == "int8"
+                or "int8" in dict(orig.matrix_flops)
+                or "quant" in str(orig.recipe)
+            )
+            lim_kernel = (
+                "npu_fused_quant_lightning_indexer_manage"
+                if is_quant else "npu_fused_lightning_indexer_manage"
+            )
+            orig_mte1 = max(0.0, float(orig_meta.get("mte1_bytes", rw.get("mte1", 0.0)) or 0.0))
+            orig_fixpipe = max(0.0, float(orig_meta.get("fixpipe_bytes", rw.get("fixpipe", 0.0)) or 0.0))
+            q_ledger = orig_meta.get("quant_indexer_work")
+            orig_aic_read = (
+                float(q_ledger["aic_read_bytes"])
+                if isinstance(q_ledger, Mapping) and "aic_read_bytes" in q_ledger
+                else float(orig.mte2_bytes)
+            )
+            active_reqs = long_reqs + short_reqs
+            topk_handoff = min(float(orig.mte3_bytes), float(active_reqs * topk_width * TOPK_INDEX_BYTES))
+            long_handoff = min(topk_handoff, float(long_reqs * topk_width * TOPK_INDEX_BYTES))
+            lim_aiv_read = max(0.0, lim_read - long_handoff)
+            fused_mte2 = float(orig.mte2_bytes) + lim_aiv_read
+            fused_mte3 = float(orig.mte3_bytes) - topk_handoff + lim_write
+            fused_hbm = float(orig.hbm_bytes) - topk_handoff + lim_aiv_read + lim_write
+            orig_meta.update({
+                "kernel": lim_kernel, "implementation": IMPLEMENTATION,
+                "request_states": request_states, "request_pool_entries": request_pool_entries,
+                "long_requests": long_reqs, "short_requests": short_reqs,
+                "miss_tokens": total_miss_tokens, "skip_topk": False,
+                "hardware_support": budget["hardware_support"],
+                "fused_indexer_recipe": orig.recipe,
+                "fused_indexer_mte2_aic": orig_aic_read,
+                "lim_vector_ops": lim_vec,
+            })
+            if orig_mte1 > 0.0:
+                orig_meta["mte1_bytes"] = orig_mte1
+                rw["mte1"] = orig_mte1
+            if orig_fixpipe > 0.0:
+                orig_meta["fixpipe_bytes"] = orig_fixpipe
+                rw["fixpipe"] = orig_fixpipe
+            if rw:
+                orig_meta["resource_work"] = rw
+            b.ops[orig_idx] = replace(
+                orig,
+                recipe="fused_lightning_indexer_manage",
+                vector_ops=float(orig.vector_ops) + lim_vec,
+                mte2_bytes=fused_mte2,
+                mte3_bytes=fused_mte3,
+                hbm_bytes=fused_hbm,
+                source_boundary="kernel",
+                metadata=tuple(orig_meta.items()),
+            )
+            return topk_id
+    lim_meta = (
+        ("kernel", "npu_fused_lightning_indexer_manage"), ("implementation", IMPLEMENTATION),
+        ("request_states", request_states), ("request_pool_entries", request_pool_entries),
+        ("long_requests", long_reqs), ("short_requests", short_reqs),
+        ("miss_tokens", total_miss_tokens), ("skip_topk", False),
+        ("hardware_support", budget["hardware_support"]),
+    )
+    lim_id = b.work(
+        "fused_lightning_indexer_manage", (topk_id,), (max(1, long_reqs + short_reqs), topk_width),
+        vector=lim_vec, read=lim_read, write=lim_write, family="indexer_slot_manage", dtype="int32",
+        metadata=lim_meta,
+    )
+    b.ops[-1] = replace(b.ops[-1], recipe="fused_lightning_indexer_manage", source_boundary="kernel")
+    return lim_id
+
+
 def lower_decode_offload(
-    b: Any, *, plan: Any, views: tuple[Any, ...], store_id: str, topk_id: str | None, budget: Mapping[str, Any]
+    b: Any,
+    *,
+    plan: Any,
+    views: tuple[Any, ...],
+    store_id: str,
+    topk_id: str | None,
+    budget: Mapping[str, Any],
+    parallel: Any = None,
+    physical_rank: int | None = None,
+    tp_group: tuple[int, ...] | None = None,
+    slot_ready_by_request: Mapping[str, bool] | None = None,
+    slot_residency_by_request: Mapping[str, tuple[int, int]] | None = None,
+    fuse_copy_sfa_attention: bool = False,
 ) -> tuple[str, str | None, dict[str, Any]]:
-    """Lower Decode Sparse KV Offload (D2H new-token writeback + LIM + H2D miss copy)."""
+    """Lower Decode Sparse KV Offload (TP0-only D2H writeback + LIM + H2D miss copy)."""
     opts = budget["options"]
     valid_tokens = sum(v.q_len for v in views)
     kv_row_bytes = int((budget.get("kv_row_bytes_by_layer") or {}).get(plan.index, budget["kv_row_bytes"]))
     topk_buffer_size = int(budget["topk_buffer_size"])
+    block_size = int(budget.get("block_size", opts["page_size"]))
     miss_rate = float(opts["miss_rate"])
-
-    # 1. New decode tokens D2H writeback to shared MemFabric Host DRAM (2 entries/token: k_nope + k_pe).
-    d2h_bytes = float(valid_tokens * kv_row_bytes)
-    d2h_entries = max(1, 2 * valid_tokens)
-    d2h_call: dict[str, Any] = {
-        "direction": "d2h", "entries": d2h_entries, "tokens": valid_tokens,
-        "payload_bytes": d2h_bytes, "channel_bw_gbps": budget["d2h_effective_bw_gbps"],
-    }
-    if budget.get("d2h_alpha_us") is not None:
-        d2h_call["channel_alpha_us"] = budget["d2h_alpha_us"]
-    d2h_id = b.work(
-        "memfabric_sparse_copy_d2h", (store_id,), (valid_tokens, plan.cache_row_elements),
-        read=d2h_bytes, write=d2h_bytes, family="kv_offload_d2h", dtype=b.model.kv_dtype,
-        metadata=(
-            ("kernel", "OffloadKVSparseCopyKernel" if d2h_entries >= KV_COPY_MIN_ENTRIES else "OffloadMoeSparseCopyKernel"),
-            ("implementation", IMPLEMENTATION),
-            ("memfabric_call", d2h_call),
-            ("hardware_support", budget["hardware_support"]),
-        ),
+    tp = max(1, int(getattr(parallel, "tp", 0) or budget.get("tp", 1) or 1))
+    tp_rank = _resolve_tp_rank(
+        physical_rank, tp, tp_group=tp_group, tp_groups=tuple(budget.get("tp_groups", ())),
     )
-    b.ops[-1] = replace(b.ops[-1], hbm_bytes=d2h_bytes, recipe="memfabric_sparse_copy_d2h", source_boundary="kernel")
 
-    # 2. Classify request states (-3 short, -1 first long step, -2 steady long decode).
-    short_reqs, long_reqs, total_miss_tokens = 0, 0, 0
-    request_states = []
-    for v in views:
-        if v.context < topk_buffer_size:
-            short_reqs += 1
-            request_states.append(OFFLOAD_INACTIVE_REQUEST)
-        elif v.context < topk_buffer_size + v.q_len:
-            long_reqs += 1
-            request_states.append(-1)
-            total_miss_tokens += min(v.context, plan.index_topk or topk_buffer_size)
-        else:
-            long_reqs += 1
-            request_states.append(-2)
-            active_topk = min(v.context, plan.index_topk or topk_buffer_size)
-            total_miss_tokens += int(math.ceil(active_topk * miss_rate))
-
-    is_shared_indexer_layer = (not plan.indexer and not plan.owns_topk and plan.topk_owner_layer_id >= 0)
-    lim_id = topk_id
-
-    # 3. On full Indexer layers with long requests, emit LIM slot-map lookup & LRU update.
-    #    Shared Indexer layers (GLM-5.x "shared" layers) skip LIM and reuse owner's miss_plan!
-    if long_reqs > 0 and topk_id is not None and not is_shared_indexer_layer and opts["use_fused_copy_sfa"]:
-        topk_width = plan.index_topk or topk_buffer_size
-        lim_read = float(long_reqs * topk_width * (TOPK_INDEX_BYTES + DEVICE_SLOT_INDEX_BYTES + HOST_SLOT_INDEX_BYTES))
-        lim_write = float(long_reqs * topk_width * (TOPK_INDEX_BYTES + OFFLOAD_ADDRESS_PAIR_BYTES))
-        lim_vec = float(long_reqs * topk_width * LIMIT_SCAN_OPS_PER_ENTRY)
-        lim_id = b.work(
-            "fused_lightning_indexer_manage", (topk_id,), (long_reqs, topk_width),
-            vector=lim_vec, read=lim_read, write=lim_write, family="indexer_slot_manage", dtype="int32",
+    # 1. New decode tokens D2H writeback to shared MemFabric Host DRAM (TP0 only per DP replica).
+    d2h_id = store_id
+    d2h_bytes = 0.0
+    if tp_rank == 0:
+        d2h_bytes = float(valid_tokens * kv_row_bytes)
+        d2h_entries = max(1, 2 * valid_tokens)
+        d2h_call: dict[str, Any] = {
+            "direction": "d2h", "entries": d2h_entries, "tokens": valid_tokens,
+            "payload_bytes": d2h_bytes, "channel_bw_gbps": budget["d2h_effective_bw_gbps"],
+        }
+        if budget.get("d2h_alpha_us") is not None:
+            d2h_call["channel_alpha_us"] = budget["d2h_alpha_us"]
+        d2h_id = b.work(
+            "memfabric_sparse_copy_d2h", (store_id,), (valid_tokens, plan.cache_row_elements),
+            read=d2h_bytes, write=d2h_bytes, family="kv_offload_d2h", dtype=b.model.kv_dtype,
             metadata=(
-                ("kernel", "npu_fused_lightning_indexer_manage"), ("implementation", IMPLEMENTATION),
-                ("request_states", tuple(request_states)), ("long_requests", long_reqs),
-                ("short_requests", short_reqs), ("miss_tokens", total_miss_tokens),
-                ("skip_topk", False), ("hardware_support", budget["hardware_support"]),
+                ("kernel", "OffloadKVSparseCopyKernel" if d2h_entries >= KV_COPY_MIN_ENTRIES else "OffloadMoeSparseCopyKernel"),
+                ("implementation", IMPLEMENTATION),
+                ("memfabric_call", d2h_call),
+                ("hardware_support", budget["hardware_support"]),
             ),
         )
-        b.ops[-1] = replace(b.ops[-1], recipe="fused_lightning_indexer_manage", source_boundary="kernel")
+        b.ops[-1] = replace(b.ops[-1], hbm_bytes=d2h_bytes, recipe="memfabric_sparse_copy_d2h", source_boundary="kernel")
 
-    # 4. H2D miss token gather from MemFabric Host DRAM into NPU topk_buffers.
-    miss_h2d_bytes = float(total_miss_tokens * kv_row_bytes)
+    # Pure prefill layerwise offload allocates 0 decode hot-buffer rows: skip decode LIM/H2D.
+    has_decode_hot_buffer = int(budget.get("topk_buffer_rows", 0) or 0) > 0
+    topk_width = int(plan.index_topk or topk_buffer_size)
+    if has_decode_hot_buffer:
+        cls = _classify_decode_requests(
+            views, topk_buffer_size=topk_buffer_size, topk_width=topk_width,
+            block_size=block_size, kv_row_bytes=kv_row_bytes, miss_rate=miss_rate,
+            slot_ready_by_request=slot_ready_by_request,
+            slot_residency_by_request=slot_residency_by_request,
+        )
+    else:
+        cls = {
+            "short_requests": len(views), "long_requests": 0,
+            "total_h2d_tokens": 0, "total_resident_fill_tokens": 0,
+            "total_hit_pairs": sum(max(1, int(v.q_len)) * min(int(v.context), topk_width) for v in views),
+            "total_miss_pairs": 0,
+            "request_states": (OFFLOAD_INACTIVE_REQUEST,) * len(views),
+            "request_pool_entries": (None,) * len(views),
+            "per_request_offload": {},
+        }
+    short_reqs = cls["short_requests"]
+    long_reqs = cls["long_requests"]
+    total_h2d_tokens = cls["total_h2d_tokens"]
+    total_hit_pairs = cls["total_hit_pairs"]
+    total_miss_pairs = cls["total_miss_pairs"]
+    request_states = cls["request_states"]
+    request_pool_entries = cls["request_pool_entries"]
+
+    is_shared_indexer_layer = (not plan.indexer and not plan.owns_topk and plan.topk_owner_layer_id >= 0)
+    is_arch22_copy_sfa = bool(
+        has_decode_hot_buffer
+        and opts["use_fused_copy_sfa"]
+        and budget["hardware_support"].get("copy_sfa_attention") == "arch22_aclnn_binary"
+    )
+    lim_id = topk_id
+
+    # 3. On full Indexer layers, fuse (A2/A3 including all-short identity outputs) or emit (A5 long) LIM.
+    run_lim = (
+        has_decode_hot_buffer
+        and topk_id is not None
+        and not is_shared_indexer_layer
+        and opts["use_fused_copy_sfa"]
+        and (long_reqs > 0 or (is_arch22_copy_sfa and short_reqs > 0))
+    )
+    if run_lim:
+        lim_id = _emit_or_fuse_lim(
+            b, topk_id=topk_id, long_reqs=long_reqs, short_reqs=short_reqs,
+            topk_width=topk_width, total_miss_tokens=total_h2d_tokens,
+            request_states=request_states, request_pool_entries=request_pool_entries,
+            budget=budget, fuse_with_indexer=is_arch22_copy_sfa,
+        )
+
+    # 4. H2D miss / cold-resident fill gather from MemFabric Host DRAM into NPU topk_buffers.
+    #    Use the identical opt-in predicate for standalone-copy suppression and recipe publication.
+    miss_h2d_bytes = float(total_h2d_tokens * kv_row_bytes)
+    fuse_copy_sfa_now = bool(is_arch22_copy_sfa and fuse_copy_sfa_attention)
+    h2d_folded_into_sfa = bool(opts["use_fused_overlap"] or fuse_copy_sfa_now)
     h2d_id = d2h_id
-    if total_miss_tokens > 0 and not opts["use_fused_overlap"]:
-        h2d_entries = 2 * total_miss_tokens
+    if has_decode_hot_buffer and total_h2d_tokens > 0 and not h2d_folded_into_sfa:
+        h2d_entries = 2 * total_h2d_tokens
         deps = tuple(dict.fromkeys(x for x in (d2h_id, lim_id) if x))
         h2d_call: dict[str, Any] = {
-            "direction": "h2d", "entries": h2d_entries, "tokens": total_miss_tokens,
+            "direction": "h2d", "entries": h2d_entries, "tokens": total_h2d_tokens,
             "payload_bytes": miss_h2d_bytes, "channel_bw_gbps": budget["h2d_effective_bw_gbps"],
         }
         if budget.get("h2d_alpha_us") is not None:
             h2d_call["channel_alpha_us"] = budget["h2d_alpha_us"]
         h2d_id = b.work(
-            "memfabric_sparse_copy_h2d", deps, (total_miss_tokens, plan.cache_row_elements),
+            "memfabric_sparse_copy_h2d", deps, (total_h2d_tokens, plan.cache_row_elements),
             read=miss_h2d_bytes, write=miss_h2d_bytes, family="kv_offload_h2d", dtype=b.model.kv_dtype,
             metadata=(
                 ("kernel", "OffloadKVSparseCopyKernel" if h2d_entries >= KV_COPY_MIN_ENTRIES else "OffloadMoeSparseCopyKernel"),
                 ("implementation", IMPLEMENTATION),
                 ("memfabric_call", h2d_call),
-                ("request_states", tuple(request_states)), ("shared_indexer_reuse", is_shared_indexer_layer),
+                ("request_states", request_states), ("request_pool_entries", request_pool_entries),
+                ("shared_indexer_reuse", is_shared_indexer_layer),
                 ("skip_topk", is_shared_indexer_layer), ("hardware_support", budget["hardware_support"]),
             ),
         )
         b.ops[-1] = replace(b.ops[-1], hbm_bytes=miss_h2d_bytes, recipe="memfabric_sparse_copy_h2d", source_boundary="kernel")
 
+    fused_sfa_recipe = (
+        "fused_sparse_attention_overlap"
+        if (has_decode_hot_buffer and opts["use_fused_overlap"])
+        else ("copy_sfa_attention" if fuse_copy_sfa_now else None)
+    )
+    total_pairs = total_hit_pairs + total_miss_pairs
+    miss_fraction = (float(total_miss_pairs) / float(total_pairs)) if total_pairs > 0 else 0.0
     info = {
-        "request_states": tuple(request_states), "short_requests": short_reqs,
-        "long_requests": long_reqs, "miss_tokens": total_miss_tokens,
+        "request_states": request_states, "request_pool_entries": request_pool_entries,
+        "short_requests": short_reqs, "long_requests": long_reqs,
+        "miss_tokens": total_h2d_tokens,
+        "resident_fill_tokens": cls["total_resident_fill_tokens"],
+        "hit_pairs": total_hit_pairs, "miss_pairs": total_miss_pairs,
+        "miss_fraction": miss_fraction,
+        "per_request_offload": cls["per_request_offload"],
         "miss_h2d_bytes": miss_h2d_bytes, "d2h_writeback_bytes": d2h_bytes,
+        "tp_rank": tp_rank, "d2h_owner": tp_rank == 0,
         "shared_indexer_reuse": is_shared_indexer_layer, "skip_topk": is_shared_indexer_layer,
-        "use_fused_overlap": bool(opts["use_fused_overlap"]),
-        "use_fused_copy_sfa": bool(opts["use_fused_copy_sfa"]),
+        "use_fused_overlap": bool(has_decode_hot_buffer and opts["use_fused_overlap"]),
+        "use_fused_copy_sfa": bool(has_decode_hot_buffer and opts["use_fused_copy_sfa"]),
+        "fused_sfa_recipe": fused_sfa_recipe,
         "channel_bw_gbps": budget["h2d_effective_bw_gbps"],
         "hardware_support": budget["hardware_support"],
     }

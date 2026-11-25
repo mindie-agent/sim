@@ -17,7 +17,7 @@ import math
 from mindie_sim.catalog.index_pool import pool_selection
 from mindie_sim.catalog.ops import comm_op, compute_dtype_for
 from mindie_sim.schema.common import ModelingError, dtype_bytes
-from mindie_sim.prediction.operators.attention.batch_prefix_attention import apply_sparse_prefix_reads
+from mindie_sim.prediction.operators.attention.batch_prefix_attention import annotate_sparse_prefix_unknown
 from .index_pool import (
     _row_shard_value, _selection_for, native_shard_sizes, row_shard_tp, row_slice,
 )
@@ -44,8 +44,8 @@ INT32_BYTES = int(dtype_bytes("int32"))
 INT64_BYTES = int(dtype_bytes("int64"))
 INDEX_POOL_SCALES = 1
 SUPPORTED_INDEX_DTYPES = frozenset({"bf16", *FP8_INDEX_DTYPES})
-#: The native caller consumes FP32 scales (or none) for an FP8 pool row.
-SUPPORTED_INDEX_SCALES = frozenset({"fp32", "none"})
+#: The native FP8 caller requires per-pool FP32 scales (`indexer_kpool.py:1036-1042`).
+SUPPORTED_INDEX_SCALES = frozenset({"fp32"})
 #: Checkpoint categories whose native caller keeps BF16 wk/wgate projections.
 POOL_PROJECTION_CATEGORIES = ("indexer.pool_projection", "indexer.pool_gate")
 SUPPORTED_HEAD_WEIGHTS = frozenset({("bf16", "bf16"), ("fp32", "fp32")})
@@ -193,23 +193,31 @@ def _planned(b, name, deps, shape, work, *, kernel, family, dtype,
 
 
 def _keypool_ledger(views, plan, model, count):
+    live_views = tuple(v for v in views if not getattr(v, "padding", False) and int(v.q_len) > 0)
     geometry = tuple(pool_selection(
         v.q_len, v.context, plan.index_topk, plan.index_kpool,
-        always_select_tail=plan.index_kpool_always_select_tail) for v in views)
-    completed = sum(g.completed_pools for g in geometry)
+        always_select_tail=plan.index_kpool_always_select_tail) for v in live_views)
+    query_lengths = tuple(int(v.q_len) for v in live_views)
+    contexts = tuple(int(v.context) for v in live_views)
+    completed_by_request = tuple(int(g.completed_pools) for g in geometry)
+    completed = sum(completed_by_request)
     width = plan.index_dim
+    act_bytes = dtype_bytes(model.activation_dtype)
     return geometry, {
-        "batch": len(views),
-        "steps": max((v.q_len for v in views), default=1),
+        "batch": len(live_views),
+        "steps": max(query_lengths, default=0),
+        "query_lengths": query_lengths,
+        "contexts_by_request": contexts,
+        "completed_pools_by_request": completed_by_request,
         "pool_size": plan.index_kpool,
         "width": width,
         "completed_pools": completed,
         "projection_flops": (float(POOL_PROJECTION_FLOPS) * count * width
                              * model.hidden_size),
-        "hidden_bytes": float(count) * model.hidden_size * dtype_bytes(
-            model.activation_dtype),
-        "weight_bytes": 2.0 * width * model.hidden_size * dtype_bytes(
-            model.activation_dtype),
+        "hidden_bytes": float(count) * model.hidden_size * act_bytes,
+        "weight_bytes": 2.0 * width * model.hidden_size * act_bytes,
+        # KeyPoolBlockCube::CopyOutMm1Res writes FP32 key & gate workspaces via Fixpipe.
+        "projection_output_bytes": 2.0 * float(count) * width * FP32_BYTES,
     }
 
 
@@ -220,9 +228,10 @@ def producer(b, *, source, views, plan, model, quant, padded_tokens, **options):
     completed = ledger["completed_pools"]
     capacity = min(count, count // pool + batch)
     state_bytes = batch * pool * 2 * width * FP32_ELEMENT_BYTES
-    common = _common(valid_query_rows=sum(v.q_len for v in views), padded_query_rows=count,
+    valid_views = tuple(v for v in views if not getattr(v, "padding", False) and int(v.q_len) > 0)
+    common = _common(valid_query_rows=sum(v.q_len for v in valid_views), padded_query_rows=count,
                      pool_size=pool, completed_pools=completed, pooled_capacity=capacity,
-                     query_lengths=tuple(v.q_len for v in views),
+                     query_lengths=tuple(v.q_len for v in valid_views),
                      tail_capacity=declaration["tail_capacity"])
     start = len(b.ops)
     gather = b.work("cann_keypool_state_gather", (source,), (batch, pool, 2 * width),
@@ -340,19 +349,134 @@ def _captured(views, runtime):
     return GraphPolicy().select(views, runtime)[1] != "none"
 
 
+def _view_owned_offsets(view):
+    ranges = tuple((int(start), int(end))
+                   for start, end in (getattr(view, "query_ranges", ()) or ())
+                   if int(end) > int(start))
+    return ranges or ((0, max(0, int(view.q_len))),)
+
+
+def _wave_pool_geometry(views, plan, local_tokens, pool_row_bytes,
+                        wave_rows=INDEXER_WAVE_ROWS, runtime=None):
+    """Per-wave distinct pool-cache bytes and exact scanned pools per wave."""
+    from mindie_sim.schema.runtime_features import canonical_prefix_cache_key
+
+    pool = max(1, int(plan.index_kpool))
+    waves = indexer_waves(local_tokens, wave_rows)
+    shared = (runtime is not None
+              and getattr(runtime, "prefix_cache_mode", "private") == "shared"
+              and getattr(runtime, "prefix_read_mode", "auto") != "per_sequence")
+    wave_reqs: list[dict[int, int]] = [{} for _ in range(waves)]
+    wave_scanned: list[int] = [0 for _ in range(waves)]
+    row_cursor = 0
+    for req_idx, view in enumerate(views):
+        if getattr(view, "padding", False) or int(view.q_len) <= 0:
+            continue
+        for start, end in _view_owned_offsets(view):
+            for offset in range(start, end):
+                visible = (int(view.kv_len) if plan.noncausal_attention
+                           else int(view.context) + offset + 1)
+                req_pools = max(0, visible // pool)
+                wave = min(waves - 1, row_cursor // wave_rows)
+                wave_scanned[wave] += req_pools
+                prev = wave_reqs[wave].get(req_idx, 0)
+                if req_pools > prev:
+                    wave_reqs[wave][req_idx] = req_pools
+                row_cursor += 1
+    mte2_by_wave = []
+    phys_by_wave = []
+    for req_map in wave_reqs:
+        mte2_pools = sum(req_map.values())
+        mte2_by_wave.append(float(mte2_pools * pool_row_bytes))
+        if not shared:
+            phys_by_wave.append(float(mte2_pools * pool_row_bytes))
+            continue
+        shared_groups: dict[str, int] = {}
+        private_pools = 0
+        for req_idx, req_pools in req_map.items():
+            view = views[req_idx]
+            prefix = min(max(0, int(getattr(view, "prefix_tokens", 0) or 0)),
+                         max(0, int(view.context)))
+            shared_pools = min(req_pools, prefix // pool)
+            if shared_pools:
+                key = canonical_prefix_cache_key(
+                    "shared", getattr(view, "prefix_cache_key", ""))
+                shared_groups[key] = max(shared_groups.get(key, 0), shared_pools)
+            private_pools += req_pools - shared_pools
+        phys_by_wave.append(float((sum(shared_groups.values()) + private_pools)
+                                  * pool_row_bytes))
+    return tuple(mte2_by_wave), tuple(phys_by_wave), tuple(wave_scanned)
+
+
+def _apply_pool_prefix_reads(op, *, views, plan, pool_row_bytes, runtime,
+                             hierarchy, kv_hbm_bytes, kv_mte2_bytes):
+    """Apply L2 residency to distinct complete pool rows (no fractional-token drift)."""
+    from mindie_sim.schema.runtime_features import canonical_prefix_cache_key
+
+    runtime_meta = dict(getattr(runtime, "metadata", ()) or ())
+    raw_eager = bool(runtime_meta.get("raw_eager")
+                     or runtime_meta.get("execution_policy", {}).get("raw_eager"))
+    if (getattr(runtime, "prefix_cache_mode", "private") != "shared"
+            or getattr(runtime, "prefix_read_mode", "auto") == "per_sequence"
+            or raw_eager):
+        return annotate_sparse_prefix_unknown(op, runtime)
+    pool = max(1, int(plan.index_kpool))
+    shared_groups: dict[str, int] = {}
+    private_pools = 0
+    for view in views:
+        if getattr(view, "padding", False) or int(view.q_len) <= 0:
+            continue
+        last_offset = max((end for _, end in _view_owned_offsets(view)), default=int(view.q_len))
+        extent = int(view.kv_len) if plan.noncausal_attention else int(view.context) + last_offset
+        complete_pools = max(0, extent // pool)
+        prefix = min(max(0, int(getattr(view, "prefix_tokens", 0) or 0)),
+                     max(0, int(view.context)))
+        shared_pools = min(complete_pools, prefix // pool)
+        if shared_pools:
+            key = canonical_prefix_cache_key("shared", getattr(view, "prefix_cache_key", ""))
+            shared_groups[key] = max(shared_groups.get(key, 0), shared_pools)
+        private_pools += complete_pools - shared_pools
+    working_set = min(float(kv_mte2_bytes),
+                      float(sum(shared_groups.values()) + private_pools) * float(pool_row_bytes))
+    retained = min(working_set, float(hierarchy.effective_l2_bytes))
+    spill = max(0.0, 1.0 - retained / working_set) if working_set else 0.0
+    external = min(float(kv_hbm_bytes),
+                   working_set + max(0.0, float(kv_mte2_bytes) - working_set) * spill)
+    metadata = dict(op.metadata)
+    metadata.update(
+        sparse_selection_unknown=True,
+        prefix_read_reuse_applied=external < kv_hbm_bytes,
+        prefix_read_reason="shared_sparse_candidate_working_set_with_l2_spill",
+        prefix_read_hbm_bytes=external,
+        prefix_read_l2_core_bytes=float(kv_mte2_bytes),
+        prefix_cache_reads={
+            "working_set_bytes": working_set,
+            "l2_capacity_bytes": float(hierarchy.effective_l2_bytes),
+            "spill_fraction": spill,
+        },
+    )
+    return replace(op, hbm_bytes=op.hbm_bytes - kv_hbm_bytes + external,
+                   metadata=tuple(metadata.items()))
+
+
 def _pool_ledger(views, plan, quant, local_tokens, output_width, pool_row_bytes,
-                 visited_pools):
+                 visited_pools, *, runtime=None, hierarchy=None):
     geometry = tuple(_selection_for(v, plan) for v in views)
     heads, width, pool = plan.index_heads, plan.index_dim, plan.index_kpool
     blocks = key_blocks(visited_pools)
+    waves = indexer_waves(local_tokens)
     score_dtype = (
         FP8_INDEX_DTYPE if quant.index_dtype in FP8_INDEX_DTYPES else str(quant.index_dtype)
     )
-    return geometry, {
+    mte2_by_wave, phys_by_wave, scanned_by_wave = _wave_pool_geometry(
+        views, plan, local_tokens, pool_row_bytes, INDEXER_WAVE_ROWS, runtime=runtime)
+    mean_wave_cache = sum(mte2_by_wave) / float(max(1, waves))
+    wave_score_pairs = tuple(float(scanned * heads) for scanned in scanned_by_wave)
+    ledger = {
         "query_rows": int(local_tokens),
         "score_dtype": score_dtype,
         "wave_rows": INDEXER_WAVE_ROWS,
-        "waves": indexer_waves(local_tokens),
+        "waves": waves,
         "blocks": blocks,
         "heads": heads,
         "width": width,
@@ -360,11 +484,18 @@ def _pool_ledger(views, plan, quant, local_tokens, output_width, pool_row_bytes,
         "output_width": int(output_width),
         "pool_row_bytes": int(pool_row_bytes),
         "score_pairs": float(sum(g.scanned_pools for g in geometry) * heads),
-        "wave_cache_bytes": float(blocks * 1024 * pool_row_bytes),
-        "wave_descale_bytes": float(blocks * heads * 1024 * FP32_ELEMENT_BYTES),
+        "wave_score_pairs": wave_score_pairs,
+        "wave_cache_bytes": float(mean_wave_cache),
+        "wave_cache_bytes_by_wave": mte2_by_wave,
+        # BF16 has no descales; FP8 pool scales are already inside pool_row_bytes
+        # and per-query descales are billed per active query row on AIV in _pool_wave_work.
+        "wave_descale_bytes": 0.0,
         "weight_bytes": float(heads * width * int(dtype_bytes(score_dtype)) + heads * FP32_BYTES),
         "output_bytes": float(local_tokens) * output_width * INT32_BYTES,
     }
+    if hierarchy is None and phys_by_wave != mte2_by_wave:
+        ledger["wave_hbm_cache_bytes_by_wave"] = phys_by_wave
+    return geometry, ledger
 
 
 def _emit_row_shard_gather(
@@ -460,7 +591,8 @@ def selection(b, *, query, weights, cache, views, plan, quant, padded_tokens,
     native_rows = local_tokens + 1
     visited_pools = _candidate_pools(owned_views, plan)
     geometry, ledger = _pool_ledger(owned_views, plan, quant, native_rows,
-                                    output_width, pool_row_bytes, visited_pools)
+                                    output_width, pool_row_bytes, visited_pools,
+                                    runtime=runtime, hierarchy=hierarchy)
     # The row-shard gather assembles the complete selection plane, so its
     # declared per-request rows cover every request, not only the local badge.
     global_geometry = tuple(_selection_for(v, plan) for v in valid_views)
@@ -514,11 +646,11 @@ def selection(b, *, query, weights, cache, views, plan, quant, padded_tokens,
         # The physical candidate plane is the wave-deduplicated cache the
         # recipe already priced; a raw scanned-pool row total can exceed the
         # operator's own HBM bytes and drive the shared-prefix delta negative.
-        kv_bytes = float(ledger["waves"] * ledger["wave_cache_bytes"])
-        b.ops[b.ops.index(scored)] = apply_sparse_prefix_reads(
-            scored, views=owned_views,
-            row_bytes=float(pool_row_bytes) / float(max(1, pool)),
-            runtime=runtime, hierarchy=hierarchy, kv_hbm_bytes=kv_bytes,
+        kv_bytes = float(sum(ledger.get("wave_cache_bytes_by_wave", ())))
+        b.ops[b.ops.index(scored)] = _apply_pool_prefix_reads(
+            scored, views=owned_views, plan=plan,
+            pool_row_bytes=pool_row_bytes, runtime=runtime,
+            hierarchy=hierarchy, kv_hbm_bytes=kv_bytes,
             kv_mte2_bytes=kv_bytes)
     # The generic MLA composer creates cache producers first. This caller
     # computes Q/head weights before entering the producer, then gathers state

@@ -20,7 +20,7 @@ from mindie_sim.prediction.operators.vector.mixed_core import split_reads
 from mindie_sim.prediction.program import KernelProgram, ParallelProgram, Stage
 from .sparse_indexer_pipeline import (
     INDEXER_WAVE_ROWS, QUANT_LEDGER, Arch35QuantIndexerRecipe,
-    arch35_indexer_work, indexer_waves, key_blocks,
+    arch35_indexer_work, indexer_waves, key_blocks, wave_key_ranges_from_spans,
 )
 
 
@@ -39,8 +39,8 @@ ARCH35_IMPLEMENTATION = "aclnn_quant_lightning_indexer_v2_arch35"
 ARCH35_RECIPE = "aclnn_quant_lightning_indexer_v2_arch35"
 ARCH35_INDEX_DTYPE = "fp8_e4m3"
 ARCH35_SCALE_DTYPE = "fp32"
-ARCH35_HEAD_COUNTS = (32, 64)
-ARCH35_TOPK_MAX = 2048
+ARCH35_HEAD_COUNT_MAX = 64
+ARCH35_TOPK_MAX = 8192
 ARCH35_COMPRESSION_MAX = 128
 FP32_BYTES = 4
 INT32_BYTES = 4
@@ -269,32 +269,7 @@ def _rle_encode(values):
 
 def _wave_key_ranges_from_spans(request_spans, wave_rows):
     """Derive per-wave distinct interval fragments for an explicit core count."""
-    wave_rows = max(1, int(wave_rows))
-    waves, batch, prefixes, private = [], 0, {}, {}
-
-    def flush():
-        waves.append(tuple((0, n) for n in prefixes.values()) + tuple(private.values()))
-        prefixes.clear()
-        private.clear()
-
-    for request, (runs, extent, key) in enumerate(request_spans):
-        for count, n in runs:
-            rem = int(count)
-            while rem > 0:
-                room = wave_rows - (batch % wave_rows)
-                take = min(rem, room)
-                p = min(n, extent)
-                if p:
-                    prefixes[key] = max(prefixes.get(key, 0), p)
-                if n > p:
-                    private[request] = (extent, max(n, private.get(request, (0, 0))[1]))
-                batch += take
-                rem -= take
-                if batch % wave_rows == 0:
-                    flush()
-    if batch % wave_rows:
-        flush()
-    return tuple(waves)
+    return wave_key_ranges_from_spans(request_spans, wave_rows)
 
 
 def _build_arch35(op, geometry):
@@ -359,11 +334,13 @@ def _check_arch35_domain(plan, quant, parallel, keys, tokens=1):
             or quant.index_dtype != ARCH35_INDEX_DTYPE
             or quant.index_scale_dtype != ARCH35_SCALE_DTYPE):
         raise ModelingError("quant_lightning_indexer_v2_arch35_domain_mismatch")
-    if (plan.index_heads not in ARCH35_HEAD_COUNTS
+    if (plan.index_heads < 1
+            or plan.index_heads > ARCH35_HEAD_COUNT_MAX
             or plan.index_dim != NATIVE_HEAD_DIM
+            or plan.index_topk < 1
             or plan.index_topk > ARCH35_TOPK_MAX
-            or plan.compress_ratio > ARCH35_COMPRESSION_MAX
-            or (plan.compress_ratio & (plan.compress_ratio - 1))):
+            or plan.compress_ratio < 1
+            or plan.compress_ratio > ARCH35_COMPRESSION_MAX):
         raise ModelingError("quant_lightning_indexer_v2_arch35_domain_mismatch")
     if keys < 0 or tokens < 1:
         raise ModelingError("quant_lightning_indexer_v2_arch35_domain_mismatch")
