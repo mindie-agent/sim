@@ -326,19 +326,33 @@ def test_cohort_equivalence_and_whitebox_reject_fabricated_or_missing_predicted_
             ),
         )
 
-    # Missing or zero selected clock in runner diagnostics MUST NOT fall back to rec.predicted_ns.
-    for bad_diag in (
-        (("clock_operator", "busy_union"), ("elapsed_span_ns", 10_000)),
-        (("clock_operator", "busy_union"), ("busy_union_ns", 0), ("elapsed_span_ns", 10_000)),
-        (),
+    # Signed Engine clock mismatches, missing trace for busy_union, and zero busy work MUST fail loudly.
+    with pytest.raises(ModelingError, match="whitebox_clock_operator_mismatch:wb-missing-clock"):
+        score_sealed_gate_cases(
+            [row_busy], sku=A2_SKU, clock_operator="busy_union",
+            runner=_engine_stub_runner(10_000, diagnostics=(("clock_operator", "elapsed_span"),)),
+        )
+
+    def _bad_clock_runner(mode: str) -> Any:
+        class _BadRunner:
+            def _exec(self, case: GateCase) -> EngineInterval:
+                eng = Engine([Resource("device", 1_000_000.0, "ns", "fifo")], trace_limit=0 if mode == "no_trace" else 32)
+                s_ev = eng.submit(case.boundary.start_event, work=None if mode == "zero_busy" else {"device": 100.0})
+                e_ev = eng.submit(case.boundary.end_event, latency=0.01 if mode == "zero_busy" else 0.0, work=None if mode == "zero_busy" else {"device": 10_000.0}, after=(s_ev,))
+                eng.advance(until=(e_ev,))
+                return bind_engine_interval(case, eng, s_ev, e_ev, clock_operator="elapsed_span" if mode == "wrong_op" else None)
+
+            run_l1 = run_l2 = run_l3 = _exec
+
+        return _BadRunner()
+
+    for mode, pattern in (
+        ("no_trace", "busy_union_trace_incomplete:wb-missing-clock"),
+        ("wrong_op", "clock_operator_mismatch:wb-missing-clock:busy_union:elapsed_span"),
+        ("zero_busy", "interval_span_or_duration_invalid:wb-missing-clock"),
     ):
-        with pytest.raises(ModelingError, match="whitebox_selected_clock_missing:wb-missing-clock:busy_union_ns"):
-            score_sealed_gate_cases(
-                [row_busy],
-                sku=A2_SKU,
-                clock_operator="busy_union",
-                runner=_engine_stub_runner(10_000, diagnostics=bad_diag),
-            )
+        with pytest.raises(ModelingError, match=pattern):
+            score_sealed_gate_cases([row_busy], sku=A2_SKU, clock_operator="busy_union", runner=_bad_clock_runner(mode))
 
 
 def test_cohort_equivalence_rejects_mismatched_primitive_table_fingerprint() -> None:

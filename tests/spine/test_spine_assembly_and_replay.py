@@ -445,7 +445,8 @@ def test_finite_cursor_counts_tiles_and_honors_setup_drain_minimum(setup_drain):
         catalog = _finite(3, 2, (_stage(1, "tile"),), lambda i: (0, i + 1, i, 0, i // 2))
     _drain(engine, _submit(engine, catalog, "finite"))
     assert engine.serviced["cpu"] == pytest.approx(3 * 8.0)
-    assert engine.now == pytest.approx(5.0 if setup_drain else 3 * 8.0 / 8.0)
+    # minimum_ms anchors after setup completes (matching PipelineProgram and PipelineTemplate).
+    assert engine.now == pytest.approx((8.0 / 8.0) + 5.0 if setup_drain else 3 * 8.0 / 8.0)
 
 def test_finite_cursor_publishes_only_the_declared_live_window():
     engine = Engine([Resource("cpu", 8.0)])

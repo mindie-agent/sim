@@ -403,9 +403,11 @@ def test_stream_pipeline_template_shared_quota_narrow_tile_and_pp_fifo():
         rates={**CORE_RATES, "l2@0": 100.0},
         stream_id="tail",
     )
-    assert "cube@0" not in bound_unit.placement and "vector@0" not in bound_unit.placement
-    assert bound_unit.caps["cube@0"] == pytest.approx(1.0)
-    assert bound_unit.caps["vector@0"] == pytest.approx(2.0)
+    assert len(bound_unit.placement["cube@0"]) == 1
+    assert set(bound_unit.placement["cube@0"]).issubset(set(disjoint_owners["tail"].aic))
+    assert len(bound_unit.placement["vector@0"]) == 2
+    assert set(bound_unit.placement["vector@0"]).issubset(set(disjoint_owners["tail"].aiv))
+    assert not bound_unit.caps
     eng_u = Engine(
         [
             Resource("cube@0", 24.0, "ms", "fair", units=24),
