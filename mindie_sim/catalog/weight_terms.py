@@ -6,7 +6,8 @@
 [Side-Effect Policy] No I/O.
 """
 from dataclasses import dataclass
-from mindie_sim.schema.common import ModelingError, dtype_bytes
+import math
+from mindie_sim.schema.common import ModelingError, align_up, dtype_bytes
 from mindie_sim.schema.parallel import ParallelSpec
 from mindie_sim.catalog.types import QuantSpec
 
@@ -14,6 +15,9 @@ ZERO = 0
 ONE = 1
 FIRST = 0
 NODE_RANKS_DEFAULT = 1
+#: Upstream vLLM / vLLM-Ascend ``DEFAULT_VOCAB_PADDING_SIZE`` for
+#: ``VocabParallelEmbedding`` and ``ParallelLMHead``.
+VOCAB_PADDING_SIZE = 64
 
 
 @dataclass(frozen=True)
@@ -41,6 +45,18 @@ class WeightTerm:
     #: Runtime residency ownership.  A source-only checkpoint tensor is not a
     #: resident copy; a runtime-only prepared copy is not a logical parameter.
     runtime_owned: bool = True
+    #: Concrete logical expert IDs resident on this rank (for mixed-quant
+    #: per-EP-rank billing via ``QuantSpec.expert_subset_bytes``).
+    expert_ids: tuple[int, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.expert_ids and not isinstance(self.expert_ids, tuple):
+            object.__setattr__(self, "expert_ids", tuple(int(eid) for eid in self.expert_ids))
+        if (self.expert_ids and self.resident_count is not None
+                and len(self.expert_ids) != int(self.resident_count)):
+            raise ModelingError(
+                f"catalog_expert_ids_count_mismatch:{len(self.expert_ids)}!={int(self.resident_count)}"
+            )
 
     @property
     def logical_parameters(self) -> int:
@@ -49,6 +65,24 @@ class WeightTerm:
 
 def _ceil_div(value: int, divisor: int) -> int:
     return (int(value) + int(divisor) - 1) // int(divisor)
+
+
+def vocab_parallel_rows(rows: int, width: int, *, source: bool = False) -> int:
+    """Per-rank vocabulary rows under vocab-parallel sharding.
+
+    Resident shards (``source=False``, ``width > 1``) pad the vocabulary axis
+    to ``lcm(VOCAB_PADDING_SIZE, width)`` before dividing by ``width`` so
+    non-divisible vocabularies shard cleanly instead of falling back to full
+    replication.  Unsharded (``width <= 1``) and checkpoint-source
+    (``source=True``) counts never add runtime padding rows.
+    """
+    rows_i, width_i = int(rows), max(1, int(width))
+    if width_i <= 1:
+        return rows_i
+    if source:
+        return _ceil_div(rows_i, width_i)
+    alignment = math.lcm(VOCAB_PADDING_SIZE, width_i)
+    return int(align_up(rows_i, alignment)) // width_i
 
 
 def _local_groups(groups: int, tp: int) -> tuple[int, bool]:
@@ -60,24 +94,30 @@ def _local_groups(groups: int, tp: int) -> tuple[int, bool]:
 
 
 def _sharded_shape(
-    term: WeightTerm, parallel: ParallelSpec, node_ranks: int,
+    term: WeightTerm, parallel: ParallelSpec, node_ranks: int, *,
+    source: bool = False,
 ) -> tuple[int, int, int]:
     from mindie_sim.catalog.projection_placement import (
-        SHARDED_ROLES, placed_weight_shape, role_width,
+        SHARDED_ROLES, _term_role, placed_weight_shape, role_width,
     )
-    role = term.placement_role
+    role = _term_role(term)
     width = role_width(role, parallel) if role in SHARDED_ROLES else ONE
-    if width > ONE or term.resident_count is not None:
-        rows, cols, count = placed_weight_shape(term, parallel, node_ranks)
-        if term.resident_count is not None and term.shard not in {
+    if width > ONE or term.resident_count is not None or term.expert_ids:
+        rows, cols, count = placed_weight_shape(
+            term, parallel, node_ranks, source=source,
+        )
+        if term.expert_ids:
+            count = len(term.expert_ids)
+        elif term.resident_count is not None and term.shard not in {
                 "expert_gate_up", "expert_down"}:
             count = int(term.resident_count)
         return rows, cols, count
-    return _legacy_sharded_shape(term, parallel, node_ranks)
+    return _legacy_sharded_shape(term, parallel, node_ranks, source=source)
 
 
 def _legacy_sharded_shape(
-    term: WeightTerm, parallel: ParallelSpec, node_ranks: int,
+    term: WeightTerm, parallel: ParallelSpec, node_ranks: int, *,
+    source: bool = False,
 ) -> tuple[int, int, int]:
     rows, cols, count = int(term.rows), int(term.cols), int(term.count)
     tp, ep = max(1, parallel.tp), max(1, parallel.ep)
@@ -88,6 +128,8 @@ def _legacy_sharded_shape(
     if term.shard == "replicated":
         return rows, cols, count
     if term.shard == "out_tp":
+        if term.category == "lm_head" or term.placement_role in {"logits", "draft_logits"}:
+            return vocab_parallel_rows(rows, tp, source=source), cols, count
         return _ceil_div(rows, kda_tp), cols, count
     if term.shard == "in_tp":
         return rows, _ceil_div(cols, kda_tp), count
@@ -105,7 +147,7 @@ def _legacy_sharded_shape(
     if term.shard == "dense_down":
         return rows, _ceil_div(cols, tp), count
     if term.shard == "embedding":
-        return (_ceil_div(rows, tp) if rows % tp == 0 else rows), cols, count
+        return vocab_parallel_rows(rows, tp, source=source), cols, count
     if term.shard == "node":
         return _ceil_div(rows, max(1, node_ranks)), cols, count
     if term.shard == "group_out":
@@ -129,10 +171,15 @@ def term_bytes(
         return 0.0
     if not source and not term.runtime_owned:
         return 0.0
-    rows, cols, count = _sharded_shape(term, parallel, node_ranks)
+    rows, cols, count = _sharded_shape(term, parallel, node_ranks, source=source)
     if not source and term.runtime_dtype:
         return float(rows * cols * count) * dtype_bytes(term.runtime_dtype)
     representation = (term.runtime_quant if not source else None) or term.quant or quant
+    if term.expert_ids:
+        return float(representation.expert_subset_bytes(
+            rows, cols, term.category, term.expert_ids,
+            source=source, include_scales=True,
+        ))
     per_matrix = representation.matrix_bytes(rows, cols, term.category, source=source)
     return float(per_matrix) * float(count)
 
@@ -146,10 +193,15 @@ def term_payload_bytes(
         return 0.0
     if not source and not term.runtime_owned:
         return 0.0
-    rows, cols, count = _sharded_shape(term, parallel, node_ranks)
+    rows, cols, count = _sharded_shape(term, parallel, node_ranks, source=source)
     if not source and term.runtime_dtype:
         return float(rows * cols * count) * dtype_bytes(term.runtime_dtype)
     representation = (term.runtime_quant if not source else None) or term.quant or quant
+    if term.expert_ids:
+        return float(representation.expert_subset_bytes(
+            rows, cols, term.category, term.expert_ids,
+            source=source, include_scales=False,
+        ))
     per_matrix = representation.matrix_payload_bytes(
         rows, cols, term.category, source=source,
     )

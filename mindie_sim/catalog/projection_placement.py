@@ -247,10 +247,31 @@ def _output_local(logical: int, width: int) -> int:
     return (int(logical) + int(width) - ONE) // int(width)
 
 
-def _term_local_output(term: Any, width: int) -> int:
-    """Per-rank output features one packed term contributes on each owner."""
-    if str(getattr(term, "shard", "")) == REPLICATED_SHARD:
+def _kv_out_local_rows(term: Any, width: int) -> int:
+    """Per-rank KV rows preserving whole KV heads (replicating when heads < width)."""
+    units = int(getattr(term, "units", ZERO) or ZERO)
+    unit_width = int(getattr(term, "unit_width", ZERO) or ZERO)
+    if units <= ZERO or unit_width <= ZERO:
+        raise ModelingError(f"catalog_kv_shard_granularity_missing:{term.name}")
+    if width <= ONE:
         return int(term.rows)
+    local_units = max(ONE, (units + int(width) - ONE) // int(width))
+    return local_units * unit_width
+
+
+def _term_local_output(
+    term: Any, width: int, *, role: str = "", source: bool = False,
+) -> int:
+    """Per-rank output features one packed term contributes on each owner."""
+    shard = str(getattr(term, "shard", ""))
+    resolved_role = role or _term_role(term)
+    if resolved_role in {ROLE_LINEAR_INPUT, ROLE_DRAFT_LOGITS} and shard == REPLICATED_SHARD:
+        return int(term.rows)
+    if shard == "kv_out":
+        return _kv_out_local_rows(term, width)
+    if resolved_role in LOGIT_ROLES:
+        from mindie_sim.catalog.weight_terms import vocab_parallel_rows
+        return vocab_parallel_rows(int(term.rows), width, source=source)
     return _output_local(int(term.rows), width)
 
 
@@ -262,25 +283,29 @@ def _term_role(term: Any) -> str:
 
 
 def placed_weight_shape(
-    term: Any, parallel: Any, node_ranks: int,
+    term: Any, parallel: Any, node_ranks: int, *, source: bool = False,
 ) -> tuple[int, int, int]:
     """Per-rank (rows, cols, count) of one weight term under local placement."""
-    del node_ranks
     role = _term_role(term)
     width = role_width(role, parallel) if role in SHARDED_ROLES else ONE
     rows, cols, count = int(term.rows), int(term.cols), int(term.count)
+    expert_ids = getattr(term, "expert_ids", ()) or ()
     resident = getattr(term, "resident_count", None)
-    if resident is not None:
+    if expert_ids:
+        count = len(expert_ids)
+    elif resident is not None:
         count = int(resident)
     if role == ROLE_LINEAR_GATE:
         # Unsharded local execution: every owner keeps the whole matrix.
         return rows, cols, count
     if width <= ONE:
-        return _legacy_shape(term, parallel, count)
+        return _legacy_shape(term, parallel, node_ranks, count, source=source)
     tp = max(ONE, int(getattr(parallel, "tp", ONE) or ONE))
     pcp = max(ONE, int(getattr(parallel, "pcp", ONE) or ONE))
     eff_width = width
-    if str(getattr(term, "shard", "")) != REPLICATED_SHARD and tp > ONE:
+    if (role not in LOGIT_ROLES
+            and str(getattr(term, "shard", "")) != REPLICATED_SHARD
+            and tp > ONE):
         eff_width = max(width, tp)
     if pcp > ONE and str(getattr(term, "name", "")).startswith("kda_") and str(
             getattr(term, "shard", "")) in {"out_tp", "in_tp"}:
@@ -293,25 +318,26 @@ def placed_weight_shape(
             return rows // eff_width, cols, count
         return rows, cols // eff_width, count
     if role == ROLE_ATTENTION_INPUT and str(getattr(term, "shard", "")) == "kv_out":
-        if int(term.units) <= ZERO or int(term.unit_width) <= ZERO:
-            raise ModelingError(f"catalog_kv_shard_granularity_missing:{term.name}")
-        local_units = max(ONE, (int(term.units) + eff_width - ONE) // eff_width)
-        return local_units * int(term.unit_width), cols, count
+        return _kv_out_local_rows(term, eff_width), cols, count
     if role in {ROLE_ATTENTION_OUTPUT, ROLE_LINEAR_OUTPUT, ROLE_DENSE_MLP_DOWN, ROLE_SHARED_EXPERT_DOWN}:
         return rows, _padded_local(cols, eff_width, term), count
-    if role == ROLE_LINEAR_INPUT:
-        return _term_local_output(term, eff_width), cols, count
-    if role in {ROLE_ATTENTION_INPUT, ROLE_DENSE_MLP_UP, ROLE_SHARED_EXPERT_UP,
-                ROLE_LOGITS, ROLE_DRAFT_LOGITS}:
-        return _output_local(rows, eff_width), cols, count
+    if role in {ROLE_LINEAR_INPUT, ROLE_ATTENTION_INPUT, ROLE_DENSE_MLP_UP,
+                ROLE_SHARED_EXPERT_UP, ROLE_LOGITS, ROLE_DRAFT_LOGITS}:
+        return _term_local_output(term, eff_width, role=role, source=source), cols, count
     return _padded_local(rows, eff_width, term), cols, count
 
 
-def _legacy_shape(term: Any, parallel: Any, count: int) -> tuple[int, int, int]:
+def _legacy_shape(
+    term: Any, parallel: Any, node_ranks: int, count: int, *,
+    source: bool = False,
+) -> tuple[int, int, int]:
     """The pre-existing shard contract, with a resolved expert count."""
     from mindie_sim.catalog.weight_terms import _legacy_sharded_shape as legacy
 
-    rows, cols, legacy_count = legacy(term, parallel, ONE)
+    rows, cols, legacy_count = legacy(term, parallel, node_ranks, source=source)
+    expert_ids = getattr(term, "expert_ids", ()) or ()
+    if expert_ids:
+        return rows, cols, len(expert_ids)
     if getattr(term, "resident_count", None) is not None:
         if term.shard in {"expert_gate_up", "expert_down"}:
             return rows, cols, int(term.resident_count)
@@ -354,10 +380,11 @@ def _placement_for_terms(
         raise ModelingError("local_tp_packed_input_dimension_mismatch")
     logical_rows = sum(int(term.rows) for term in terms)
     cols = columns.pop()
-    if role == ROLE_LINEAR_INPUT:
-        # Packed input projections split output features exactly; replicated
-        # low-rank factors keep their full width on every owner rank.
-        physical_rows = sum(_term_local_output(term, width) for term in terms)
+    if role in {ROLE_LINEAR_INPUT, ROLE_ATTENTION_INPUT, ROLE_DENSE_MLP_UP,
+                ROLE_SHARED_EXPERT_UP, ROLE_LOGITS, ROLE_DRAFT_LOGITS}:
+        # Packed column projections split output features per term, preserving
+        # whole KV heads under replication and replicated low-rank factors.
+        physical_rows = sum(_term_local_output(term, width, role=role) for term in terms)
     else:
         physical_rows = _padded_local(logical_rows, width, terms[ZERO])
     return ProjectionPlacement(
@@ -390,10 +417,18 @@ def placed_term_bytes(
 
     if source and not term.source_owned:
         return ZERO_FLOAT
-    rows, cols, count = placed_weight_shape(term, parallel, node_ranks)
+    if not source and not getattr(term, "runtime_owned", True):
+        return ZERO_FLOAT
+    rows, cols, count = placed_weight_shape(term, parallel, node_ranks, source=source)
     if not source and term.runtime_dtype:
         return float(rows * cols * count) * dtype_bytes(term.runtime_dtype)
     representation = (term.runtime_quant if not source else None) or term.quant or quant
+    expert_ids = getattr(term, "expert_ids", ()) or ()
+    if expert_ids:
+        return float(representation.expert_subset_bytes(
+            rows, cols, term.category, expert_ids,
+            source=source, include_scales=True,
+        ))
     return float(representation.matrix_bytes(
         rows, cols, term.category, source=source)) * float(count)
 
@@ -413,8 +448,13 @@ def projection_slices(
     width = max(ONE, placement.width)
     for term in terms:
         logical = int(term.rows)
-        replicated = str(getattr(term, "shard", "")) == REPLICATED_SHARD
-        local = _term_local_output(term, width)
+        shard = str(getattr(term, "shard", ""))
+        local = _term_local_output(term, width, role=placement.role)
+        replicated = (
+            (placement.role in {ROLE_LINEAR_INPUT, ROLE_DRAFT_LOGITS}
+             and shard == REPLICATED_SHARD)
+            or (shard == "kv_out" and width > ONE and local == logical)
+        )
         boundaries = tuple(range(granule, local + ONE, granule)) if granule > ONE else ()
         bytes_per_row = float(quant.matrix_payload_bytes(ONE, int(term.cols), term.category))
         slices.append(ProjectionSlice(

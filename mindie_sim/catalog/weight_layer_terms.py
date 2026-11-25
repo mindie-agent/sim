@@ -375,18 +375,20 @@ def _attention_terms(plan: LayerPlan, model: ModelSpec) -> list[WeightTerm]:
     if plan.attention in {"gqa", "projection_only"}:
         gate_separate = plan.q_gate_separate
         q_width = plan.q_projection_width(heads, plan.head_dim)
+        v_dim = int(getattr(plan, "v_head_dim", 0) or plan.head_dim)
         kv_width = plan.num_kv_heads * plan.head_dim
+        v_width = plan.num_kv_heads * v_dim
         terms.extend([
             _t("q_proj", q_width, h, "attn.qkv", "out_tp"),
             _t("k_proj", kv_width, h, "attn.qkv", "kv_out",
                units=plan.num_kv_heads, unit_width=plan.head_dim),
         ])
-        v_term = _t("v_proj", kv_width, h, "attn.qkv", "kv_out",
-                    units=plan.num_kv_heads, unit_width=plan.head_dim)
+        v_term = _t("v_proj", v_width, h, "attn.qkv", "kv_out",
+                    units=plan.num_kv_heads, unit_width=v_dim)
         terms.append(replace(v_term, source_owned=False) if plan.k_eq_v else v_term)
         if gate_separate:
             terms.append(_t("g_proj", heads, h, "attn.gate", "out_tp"))
-        terms.append(_t("o_proj", h, heads * plan.head_dim, "attn.o", "in_tp"))
+        terms.append(_t("o_proj", h, heads * v_dim, "attn.o", "in_tp"))
         if 0 <= plan.kv_owner_layer_id < plan.index:
             terms = [term for term in terms if term.name not in {"k_proj", "v_proj"}]
         return terms
@@ -437,7 +439,6 @@ def _attention_terms(plan: LayerPlan, model: ModelSpec) -> list[WeightTerm]:
             _t("gdn_o", h, value_w, "gdn.o", "in_tp"),
             _t("gdn_A_log", plan.linear_value_heads, 1, "linear_param_bf16", "out_tp"),
             _t("gdn_dt_bias", plan.linear_value_heads, 1, "linear_param_bf16", "out_tp"),
-            _t("gdn_norm", plan.linear_head_dim, 1, "norm"),
         ])
         return terms
     raise ModelingError(f"catalog_attention_kind_unsupported:{plan.attention}")
