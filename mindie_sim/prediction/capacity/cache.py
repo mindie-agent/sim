@@ -203,9 +203,11 @@ class _MemoryCacheMixin:
     ) -> list[float]:
         """Unified physical-die cache bytes including DP-cohort KV and hybrid pools."""
         base = (
-            list(self.cache_bytes(tokens, padded=padded, query_tokens=query_tokens))
+            list(self.cache_bytes(tokens, padded=padded, query_tokens=query_tokens, phase=phase))
             if rank is None
-            else self._rank_cache_bytes(tokens, padded=padded, rank=int(rank), query_tokens=query_tokens)
+            else self._rank_cache_bytes(
+                tokens, padded=padded, rank=int(rank), query_tokens=query_tokens, phase=phase,
+            )
         )
         extra = self._dp_cohort_extra_by_stage(
             tokens, padded=padded, rank=rank, query_tokens=query_tokens, phase=phase,
@@ -214,11 +216,11 @@ class _MemoryCacheMixin:
 
     def dp_cohort_cache_bytes(
         self, tokens: int, *, padded: bool = True,
-        query_tokens: int | None = None,
+        query_tokens: int | None = None, phase: str = "decode",
     ) -> tuple[float, ...]:
         """Per-DP-sequence HBM bytes on one die conserving DP-cohort DCP capacity."""
         return tuple(self._rank_dp_cohort_cache_bytes(
-            tokens, padded=padded, rank=None, query_tokens=query_tokens,
+            tokens, padded=padded, rank=None, query_tokens=query_tokens, phase=phase,
         ))
 
     def _sum_unsubsumed_stage_bytes(
@@ -229,6 +231,7 @@ class _MemoryCacheMixin:
         rank: int | None,
         query_tokens: int,
         hybrid: HybridPoolReceipt | None,
+        phase: str = "decode",
     ) -> list[float]:
         """Evaluate stage cache bytes via hybrid pool (when active) plus outside allocations."""
         case, model, p = self.case, self.case.model, self.case.runtime.parallel
@@ -256,7 +259,7 @@ class _MemoryCacheMixin:
                     model, layer, p, tokens, capacity_padded=padded,
                     interleave=interleave, block_size=block_override,
                     rank=rank, owner_spans=owner_spans,
-                    runtime=case.runtime, query_tokens=query_tokens,
+                    runtime=case.runtime, query_tokens=query_tokens, phase=phase,
                 )
                 covered = self.pages.covered.get(layer.index, ()) if padded else ()
                 stage = self.layer_stage[layer.index]
@@ -272,7 +275,8 @@ class _MemoryCacheMixin:
         elif mode and model.auxiliary is not None and not self.paired_sfa:
             if self._uses_inherited_draft_cache(model):
                 draft_kv, draft_state = self._inherited_draft_cache_parts(
-                    model, tokens, padded=padded, rank=rank, query_tokens=query_tokens,
+                    model, tokens, padded=padded, rank=rank,
+                    query_tokens=query_tokens, phase=phase,
                 )
                 result[-1] += draft_state + (0.0 if sub_draft_kv else draft_kv)
             elif not sub_draft_kv:
@@ -283,11 +287,17 @@ class _MemoryCacheMixin:
         return result
 
     def cache_bytes(self, tokens: int, *, padded=True,
-                    query_tokens: int | None = None) -> tuple[float, ...]:
-        q_tok = self._effective_cache_query_tokens(query_tokens)
-        hybrid = self._hybrid_pool_receipt(tokens, num_requests=1, query_tokens=q_tok) if padded else None
+                    query_tokens: int | None = None,
+                    phase: str = "decode") -> tuple[float, ...]:
+        is_prefill = str(phase or "decode").strip().lower() == "prefill"
+        q_tok = 1 if is_prefill else self._effective_cache_query_tokens(query_tokens)
+        hybrid = (
+            self._hybrid_pool_receipt(tokens, num_requests=1, query_tokens=q_tok, phase=phase)
+            if padded else None
+        )
         return tuple(self._sum_unsubsumed_stage_bytes(
-            tokens, padded=bool(padded), rank=None, query_tokens=q_tok, hybrid=hybrid,
+            tokens, padded=bool(padded), rank=None, query_tokens=q_tok,
+            hybrid=hybrid, phase=phase,
         ))
 
     def _draft_context_cap(self, draft) -> int:
@@ -409,7 +419,7 @@ class _MemoryCacheMixin:
 
     def _group_cache_parts(
         self, tokens: int, rank: int | None = None,
-        *, query_tokens: int | None = None,
+        *, query_tokens: int | None = None, phase: str = "decode",
     ) -> list[dict]:
         """Known physical and valid components inside declared page groups.
 
@@ -425,7 +435,8 @@ class _MemoryCacheMixin:
              "valid_payload": 0.0, "valid_scale": 0.0, "components": {}}
             for _ in range(p.pp)
         ]
-        q_tok = self._effective_cache_query_tokens(query_tokens)
+        is_prefill = str(phase or "decode").strip().lower() == "prefill"
+        q_tok = 1 if is_prefill else self._effective_cache_query_tokens(query_tokens)
         by_index = {plan.index: plan for plan in model.layer_plans}
         block = max(1, int(getattr(case.runtime, "kv_block_size", 0) or cp_interleave(case.runtime)))
         for group in self.pages.groups:
@@ -447,7 +458,7 @@ class _MemoryCacheMixin:
                     model, layer, p, valid_tokens, capacity_padded=False,
                     interleave=cp_interleave(case.runtime),
                     rank=rank, owner_spans=self.rank_token_owners,
-                    runtime=case.runtime, query_tokens=q_tok,
+                    runtime=case.runtime, query_tokens=q_tok, phase=phase,
                 )
                 stage = stages[self.layer_stage[layer.index]]
                 for name in owned.get(layer_index, ()):
@@ -455,18 +466,18 @@ class _MemoryCacheMixin:
                     if not self.paired_sfa and name in {"gqa_kv", "mla_kv", "window"}:
                         part = self._group_token_component(
                             model, layer, p, group, name, valid_tokens,
-                            alloc_tokens, components,
+                            alloc_tokens, components, phase=phase,
                         )
                     elif self.paired_sfa and name in {"mla_kv", "index_k"} and paired_local_alloc > 0:
                         part = self._paired_group_token_component(
-                            model, layer, p, name, paired_local_alloc, components,
+                            model, layer, p, name, paired_local_alloc, components, phase=phase,
                         )
                     if part is None:
                         value = components.get(name, 0.0)
                         if value <= 0.0:
                             continue
                         payload, scale = cache_component_split(
-                            model, layer, p, name, value)
+                            model, layer, p, name, value, phase=phase)
                         alloc_payload = valid_payload = payload
                         alloc_scale = valid_scale = scale
                     else:
@@ -497,26 +508,26 @@ class _MemoryCacheMixin:
 
     def _paired_group_token_component(
         self, model, layer, parallel, name: str, alloc_local_rows: int,
-        components: dict[str, float],
+        components: dict[str, float], *, phase: str = "decode",
     ) -> tuple[float, float, float, float] | None:
         """Separate allocated local slots from rank-local valid rows in paired SFA."""
         if name == "mla_kv":
             if layer.attention != "mla" or layer.cache_kind != "dense":
                 return None
             payload_b, scale_b = cache_row_split(
-                model, "mla_kv", layer.cache_row_elements, plan=layer,
+                model, "mla_kv", layer.cache_row_elements, plan=layer, phase=phase,
             )
         elif name == "index_k":
             if not layer.owns_index_k:
                 return None
-            p_b, s_b, pad_b = index_row_parts(model, layer.index_dim, plan=layer)
+            p_b, s_b, pad_b = index_row_parts(model, layer.index_dim, plan=layer, phase=phase)
             payload_b, scale_b = float(p_b), float(s_b + pad_b)
         else:
             return None
         valid_value = float(components.get(name, 0.0))
         if valid_value > 0.0:
             valid_payload, valid_scale = cache_component_split(
-                model, layer, parallel, name, valid_value,
+                model, layer, parallel, name, valid_value, phase=phase,
             )
         else:
             valid_payload = valid_scale = 0.0
@@ -554,7 +565,7 @@ class _MemoryCacheMixin:
 
     def _group_token_component(
         self, model, layer, parallel, group, name: str, valid_tokens: int,
-        alloc_tokens: int, components: dict[str, float],
+        alloc_tokens: int, components: dict[str, float], *, phase: str = "decode",
     ):
         """Rows/bytes for a token-paged component inside one group page."""
         del group
@@ -565,10 +576,10 @@ class _MemoryCacheMixin:
             if name not in components and valid_tokens > 0:
                 return None
             heads = local_kv_heads(layer.num_kv_heads, parallel.tp)
-            key_fmt, val_fmt, is_shared = gqa_kv_formats(model, plan=layer)
+            key_fmt, val_fmt, is_shared = gqa_kv_formats(model, plan=layer, phase=phase)
             if is_shared:
                 payload, scale = cache_row_split(
-                    model, "gqa_kv", 2 * heads * layer.head_dim, plan=layer,
+                    model, "gqa_kv", 2 * heads * layer.head_dim, plan=layer, phase=phase,
                 )
             else:
                 side = heads * layer.head_dim
@@ -581,7 +592,7 @@ class _MemoryCacheMixin:
             if name not in components and valid_tokens > 0:
                 return None
             payload, scale = cache_row_split(
-                model, "mla_kv", layer.cache_row_elements, plan=layer,
+                model, "mla_kv", layer.cache_row_elements, plan=layer, phase=phase,
             )
         else:  # window
             if layer.attention != "mla" or not layer.window:
@@ -589,13 +600,13 @@ class _MemoryCacheMixin:
             if name not in components and valid_tokens > 0:
                 return None
             payload, scale = cache_row_split(
-                model, "window", layer.cache_row_elements, plan=layer,
+                model, "window", layer.cache_row_elements, plan=layer, phase=phase,
             )
         alloc_rows = alloc_tokens
         valid_value = components.get(name, 0.0)
         if valid_value > 0.0:
             valid_payload, valid_scale = cache_component_split(
-                model, layer, parallel, name, valid_value)
+                model, layer, parallel, name, valid_value, phase=phase)
         else:
             valid_payload = valid_scale = 0.0
         return (alloc_rows * payload, alloc_rows * scale,
@@ -603,17 +614,20 @@ class _MemoryCacheMixin:
 
     def _kv_residency(
         self, tokens: int, *, query_tokens: int | None = None,
+        phase: str = "decode",
     ) -> tuple[list[float], list[float], list[float]]:
         """(gross, HBM-resident, staging) KV bytes, same basis as resize."""
         gross = self._rank_dp_cohort_cache_bytes(
-            tokens, padded=True, rank=None, query_tokens=query_tokens,
+            tokens, padded=True, rank=None, query_tokens=query_tokens, phase=phase,
         )
         if self.kvc_hbm_ratio == 1.0:
             return gross, list(gross), [0.0] * len(gross)
         resident = [value * self.kvc_hbm_ratio for value in gross]
         staging = [
             value * (1.0 - self.kvc_hbm_ratio)
-            for value in self._max_layer_cache_bytes(tokens, query_tokens=query_tokens)
+            for value in self._max_layer_cache_bytes(
+                tokens, query_tokens=query_tokens, phase=phase,
+            )
         ]
         return gross, resident, staging
 
@@ -648,7 +662,7 @@ class _MemoryCacheMixin:
                 if name in covered:
                     continue
                 payload, scale = cache_component_split(
-                    model, layer, p, name, value)
+                    model, layer, p, name, value, phase=phase)
                 stage["payload"] += payload
                 stage["scale"] += scale
                 stage["total"] += float(value)
@@ -684,7 +698,7 @@ class _MemoryCacheMixin:
 
     def _rank_cache_bytes(
         self, tokens: int, *, padded: bool, rank: int,
-        query_tokens: int | None = None,
+        query_tokens: int | None = None, phase: str = "decode",
     ) -> list[float]:
         """Allocation bytes for one physical rank.
 
@@ -693,29 +707,42 @@ class _MemoryCacheMixin:
         bytes while padded pool quotes retain per-rank shared group pages.
         """
         if self.paired_sfa and padded:
-            return list(self.cache_bytes(tokens, padded=True, query_tokens=query_tokens))
+            return list(self.cache_bytes(
+                tokens, padded=True, query_tokens=query_tokens, phase=phase,
+            ))
         if not self.paired_sfa and (self.rank_token_owners is None and int(self.case.runtime.parallel.cp) <= 1):
-            return list(self.cache_bytes(tokens, padded=padded, query_tokens=query_tokens))
-        q_tok = self._effective_cache_query_tokens(query_tokens)
-        hybrid = self._hybrid_pool_receipt(tokens, num_requests=1, query_tokens=q_tok) if padded else None
+            return list(self.cache_bytes(
+                tokens, padded=padded, query_tokens=query_tokens, phase=phase,
+            ))
+        is_prefill = str(phase or "decode").strip().lower() == "prefill"
+        q_tok = 1 if is_prefill else self._effective_cache_query_tokens(query_tokens)
+        hybrid = (
+            self._hybrid_pool_receipt(tokens, num_requests=1, query_tokens=q_tok, phase=phase)
+            if padded else None
+        )
         return self._sum_unsubsumed_stage_bytes(
-            tokens, padded=bool(padded), rank=int(rank), query_tokens=q_tok, hybrid=hybrid,
+            tokens, padded=bool(padded), rank=int(rank), query_tokens=q_tok,
+            hybrid=hybrid, phase=phase,
         )
 
     def _rank_max_layer_cache_bytes(
         self, tokens: int, rank: int, *, query_tokens: int | None = None,
+        phase: str = "decode",
     ) -> tuple[float, ...]:
         if self.rank_token_owners is None and int(self.case.runtime.parallel.cp) <= 1:
-            return self._max_layer_cache_bytes(tokens, query_tokens=query_tokens)
+            return self._max_layer_cache_bytes(
+                tokens, query_tokens=query_tokens, phase=phase,
+            )
         model, p = self.case.model, self.case.runtime.parallel
-        q_tok = self._effective_cache_query_tokens(query_tokens)
+        is_prefill = str(phase or "decode").strip().lower() == "prefill"
+        q_tok = 1 if is_prefill else self._effective_cache_query_tokens(query_tokens)
         result = [0.0] * p.pp
         for layer in model.layer_plans:
             comps = layer_cache_components(
                 model, layer, p, tokens, capacity_padded=False,
                 interleave=cp_interleave(self.case.runtime),
                 rank=int(rank), owner_spans=self.rank_token_owners,
-                runtime=self.case.runtime, query_tokens=q_tok,
+                runtime=self.case.runtime, query_tokens=q_tok, phase=phase,
             )
             st = self.layer_stage[layer.index]
             result[st] = max(result[st], float(sum(comps.values())))
@@ -723,12 +750,13 @@ class _MemoryCacheMixin:
 
     def _kv_residency_ranks(
         self, tokens: int, *, query_tokens: int | None = None,
+        phase: str = "decode",
     ) -> tuple[list[list[float]], list[list[float]]]:
         """(HBM-resident, staging) per stage and physical rank."""
         p = self.case.runtime.parallel
         if self.rank_token_owners is None and int(getattr(p, "cp", 1) or 1) <= 1:
             _gross, resident, staging = self._kv_residency(
-                tokens, query_tokens=query_tokens,
+                tokens, query_tokens=query_tokens, phase=phase,
             )
             return (
                 [[float(resident[stage])] * self.width for stage in range(p.pp)],
@@ -738,10 +766,10 @@ class _MemoryCacheMixin:
         staging = [[0.0] * self.width for _ in range(p.pp)]
         for rank in range(self.width):
             gross = self._rank_dp_cohort_cache_bytes(
-                tokens, padded=True, rank=rank, query_tokens=query_tokens,
+                tokens, padded=True, rank=rank, query_tokens=query_tokens, phase=phase,
             )
             layer_max = self._rank_max_layer_cache_bytes(
-                tokens, rank, query_tokens=query_tokens,
+                tokens, rank, query_tokens=query_tokens, phase=phase,
             )
             for stage in range(p.pp):
                 if self.kvc_hbm_ratio == 1.0:
@@ -755,6 +783,7 @@ class _MemoryCacheMixin:
 
     def _kv_residency_cohort(
         self, replica: int, tokens: int, *, query_tokens: int | None = None,
+        phase: str = "decode",
     ) -> tuple[list[list[list[float]]], list[list[list[float]]], dict[int, tuple[tuple[float, ...], ...]], dict[int, tuple[tuple[float, ...], ...]]]:
         """Single-request physical (HBM-resident, staging) across its cross-DP DCP cohort."""
         p = self.case.runtime.parallel
@@ -769,18 +798,21 @@ class _MemoryCacheMixin:
             peer_res = [[0.0] * self.width for _ in range(p.pp)]
             peer_stg = [[0.0] * self.width for _ in range(p.pp)]
             for rank in range(self.width):
-                cohort_rk = (peer_rep - cohort_start) * self.width + rank
+                cohort_rk = (peer_rep - cohort_start) * p.pp * self.width + rank
                 if peer_rep == int(replica):
                     gross = self._rank_cache_bytes(
-                        tokens, padded=True, rank=cohort_rk, query_tokens=query_tokens,
+                        tokens, padded=True, rank=cohort_rk,
+                        query_tokens=query_tokens, phase=phase,
                     )
                 else:
                     gross = self._dp_cohort_extra_by_stage(
                         tokens, padded=True, rank=cohort_rk,
-                        query_tokens=query_tokens, peer_count_override=1,
+                        query_tokens=query_tokens, phase=phase, peer_count_override=1,
                     )
                 layer_max = (
-                    self._rank_max_layer_cache_bytes(tokens, cohort_rk, query_tokens=query_tokens)
+                    self._rank_max_layer_cache_bytes(
+                        tokens, cohort_rk, query_tokens=query_tokens, phase=phase,
+                    )
                     if self.kvc_hbm_ratio < 1.0 else (0.0,) * p.pp
                 )
                 for stage in range(p.pp):
@@ -1044,26 +1076,62 @@ class _MemoryCacheMixin:
 
     def _max_layer_cache_bytes(
         self, tokens: int, *, query_tokens: int | None = None,
+        phase: str = "decode",
     ) -> tuple[float, ...]:
         model, p = self.case.model, self.case.runtime.parallel
-        q_tok = self._effective_cache_query_tokens(query_tokens)
+        is_prefill = str(phase or "decode").strip().lower() == "prefill"
+        q_tok = 1 if is_prefill else self._effective_cache_query_tokens(query_tokens)
         result = [0.0] * p.pp
         for layer in model.layer_plans:
             comps = layer_cache_components(
                 model, layer, p, tokens, capacity_padded=False,
                 interleave=cp_interleave(self.case.runtime),
-                runtime=self.case.runtime, query_tokens=q_tok)
+                runtime=self.case.runtime, query_tokens=q_tok, phase=phase)
             st = self.layer_stage[layer.index]
             result[st] = max(result[st], float(sum(comps.values())))
         return tuple(result)
 
-    def host_dram_cache_bytes(self, tokens: int, *, padded=True) -> float:
-        if not self.sparse_offload:
-            return 0.0
-        block_size = int(self.sparse_offload["block_size"])
-        eff_tokens = block_round(tokens, block_size) if padded else tokens
-        offload_layers = len(self.sparse_offload["offload_layers"])
-        return float(eff_tokens * int(self.sparse_offload["kv_row_bytes"]) * offload_layers)
+    def host_dram_cache_bytes(
+        self, tokens: int, *, padded: bool = True, query_tokens: int | None = None,
+        phase: str = "decode",
+    ) -> float:
+        total = 0.0
+        if self.sparse_offload:
+            block_size = int(self.sparse_offload["block_size"])
+            eff_tokens = block_round(tokens, block_size) if padded else tokens
+            offload_layers = len(self.sparse_offload["offload_layers"])
+            total += float(eff_tokens * int(self.sparse_offload["kv_row_bytes"]) * offload_layers)
+        ddr_ratio = float(self.offload.get("kvc_ddr_ratio", 0.0) or 0.0)
+        if ddr_ratio > 0.0:
+            p = self.case.runtime.parallel
+            dp_width = max(1, int(getattr(p, "dcp_dp_width", 1) or 1))
+            if dp_width > 1:
+                cohort_sum = 0.0
+                for peer_idx in range(dp_width):
+                    peer_local = 0.0
+                    for rk in range(self.width):
+                        cohort_rk = peer_idx * p.pp * self.width + rk
+                        st_vals = (
+                            self._rank_cache_bytes(
+                                tokens, padded=padded, rank=cohort_rk,
+                                query_tokens=query_tokens, phase=phase,
+                            )
+                            if peer_idx == 0
+                            else self._dp_cohort_extra_by_stage(
+                                tokens, padded=padded, rank=cohort_rk,
+                                query_tokens=query_tokens, phase=phase,
+                                peer_count_override=1,
+                            )
+                        )
+                        peer_local += float(sum(st_vals))
+                    cohort_sum += peer_local / float(self.width)
+                total += cohort_sum * ddr_ratio
+            else:
+                gross_stages = self.cache_bytes(
+                    tokens, padded=padded, query_tokens=query_tokens, phase=phase,
+                )
+                total += float(sum(gross_stages)) * ddr_ratio
+        return total
 
     def pd_handoff_volume_and_stage_hbm(self, tokens: int) -> tuple[float, tuple[float, ...]]:
         """Compute SfaRemoteD2HConnector wire volume (D2D index_k + 1x RD2H mla_kv) and stage HBM write."""
